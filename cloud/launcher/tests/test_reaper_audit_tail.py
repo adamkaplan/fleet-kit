@@ -484,8 +484,102 @@ class TestRaisingSteps(unittest.TestCase):
             print("S10: copy with the %s timer after the call fails: a raising step lost its seconds" % name)
 
 
-class TestPins(unittest.TestCase):
-    OLD_LINES = ["            return self._renew_locked(pods, now)", '        return last_audit_line(self.audit_path, "renew-git-token", rid)']
+def s11_world(test, mod, gap=0.0, raise_second_read=False):
+    """The fake world of S8; `gap` seconds are added by the fake clock at each boundary before a step; the 2nd activity read may raise."""
+    clock = StepClock()
+    f = LineFixture(test, mod)
+    mod.time = clock
+    L = f.w.L
+    L.reap = types.MethodType(mod.Launcher.reap, L)
+    state = {"boundaries": 0, "steps": 0.0}
+
+    def boundary():
+        clock.t += gap
+        state["boundaries"] += 1
+
+    def step(seconds, answer=None, bound=True):
+        def call(*a, **k):
+            if bound:
+                boundary()
+            clock.t += seconds
+            state["steps"] += seconds
+            return answer
+        return call
+    L.kube.list_pods = step(1.0, f.w.pods, bound=False)
+    L.renew_git_tokens = step(2.0, [])
+    L._note_vanished_pods = step(0.5)
+    L.hard_deadline = lambda pod: T0 + datetime.timedelta(days=1)
+    idle = f.w.pods[2]["metadata"]["name"]
+    reads = []
+
+    def activity(name):
+        reads.append(name)
+        if len(reads) == 1:
+            boundary()
+        clock.t += 0.2
+        state["steps"] += 0.2
+        if raise_second_read and len(reads) == 2:
+            clock.t += 0.5
+            state["steps"] += 0.5
+            raise RuntimeError("fake step failure")
+        return (False, T0 - datetime.timedelta(days=1)) if name == idle else (True, T0)
+    L.activity = activity
+    L.stop = lambda ns, reason: (step(4.0)(), {})[1]
+    L.retire_row = lambda worker, reason: None
+    L.remove_orphan_secrets = step(0.5)
+    L.send_wip_notes = step(1.5)
+    return f, L, clock, state
+
+
+def s11_pass(test, f):
+    err = io.StringIO()
+    with redirect_stderr(err), redirect_stdout(io.StringIO()):
+        try:
+            f.mod._reap_main({"CW_CLOUD_NAMESPACE": "cw"}, types.SimpleNamespace(loop=0), lambda s: None, clock=lambda: T0,
+                             refresher=f.refresher, kube=f.w.L.kube)
+        except RuntimeError:
+            pass
+    return [x for x in err.getvalue().splitlines() if "reaper pass line" in x]
+
+
+def s11_total(test, mod):
+    f, L, clock, state = s11_world(test, mod, gap=0.25, raise_second_read=True)
+    lines = s11_pass(test, f)
+    want = state["steps"] + 0.25 * state["boundaries"]
+    if len(lines) != 1 or (" total=%.1f" % want) not in lines[0]:
+        raise AssertionError("the total left out the seconds between steps")
+    return lines[0], want, state["boundaries"]
+
+
+def s11_early(test, mod):
+    f, L, clock, state = s11_world(test, mod)
+    first = s11_pass(test, f)
+    assert len(first) == 1 and STEP_LINE in first[0], first   # a pass that completed: its numbers are on the launcher
+    def boom():
+        raise RuntimeError("fake clock failure")
+    L.clock = boom
+    lines = s11_pass(test, f)
+    if len(lines) != 1 or " steps " in lines[0] or any(n in lines[0] for n in ("list=1.0", "renew=2.0", "total=10.1")):
+        raise AssertionError("the steps of the pass before were shown")
+    return lines[0]
+
+
+class TestTotalWithGaps(unittest.TestCase):
+    def test_s11_total_and_early_raise(self):
+        line, want, nb = s11_total(self, build_module())   # the controls first
+        early = s11_early(self, build_module())
+        self.assertIn(" total=%.1f" % want, line)
+        self.assertNotIn(" steps ", early)
+        print("S11: control: raise in the 2nd activity read, %d boundaries of 0.25: expected total %.2f; line: %s" % (nb, want, line.split("audit_lines_parsed=", 1)[1]))
+        print("S11: control: early raise line: %s" % early.split("audit_lines_parsed=", 1)[1].strip() + " (no step part)")
+        old = 'st["total"] if st["total"] is not None else time.monotonic() - st["start"]'
+        with self.assertRaisesRegex(AssertionError, "^the total left out the seconds between steps$"):
+            s11_total(self, build_module((old, "done")))
+        print("S11: copy with the total as the sum of the steps fails: the total left out the seconds between steps")
+        old = "                L.step_seconds = None   # the pass line shows the steps of THIS pass only\n"
+        with self.assertRaisesRegex(AssertionError, "^the steps of the pass before were shown$"):
+            s11_early(self, build_module((old, "                pass\n")))
+        print("S11: copy that does not clear the dictionary fails: the steps of the pass before were shown")
 
 
 if __name__ == "__main__":
