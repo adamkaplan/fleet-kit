@@ -220,8 +220,8 @@ class Check(LaunchHarness):
 
     def test_the_local_route_checks_before_it_creates_anything(self):
         src = read("bin/" + PREFIX + "-switchboard")
-        start = src.index("def cmd_launch(")
-        body = src[start:src.index("cmd_launch.ensure_on_use", start)]
+        start = src.index("def _cmd_launch(")
+        body = src[start:src.index("\ndef cmd_launch(", start)]
         check = body.index("check_report_to")
         self.assertLess(check, body.index("launch_agent(engine, args.name"))
         self.assertLess(check, body.index("herdr.workspace_create"))
