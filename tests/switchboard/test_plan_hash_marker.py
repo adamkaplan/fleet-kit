@@ -38,7 +38,7 @@ def real(name):
     return load(name, as_name="t1713_" + name)
 
 
-def mutate(name, old, new):
+def _ph_mutate(name, old, new):
     """The module `name` built from a source copy with `old` replaced by `new`; asserts the mutation applied (never silently a no-op)."""
     source = (BIN / (name + ".py")).read_text(encoding="utf-8")
     assert source.count(old) == 1, "the mutation target is not found exactly once: %r" % old
@@ -176,7 +176,7 @@ class TestReviewRoundInBothForms(unittest.TestCase):
             self.assertIn('"plan_hashes": list(', body, name)
 
 
-class TestMutants(unittest.TestCase):
+class TestPlanHashMarkerMutants(unittest.TestCase):
     """S6, S8, S9: a mutant is applied to a copy and asserted applied; its control passes the same check."""
 
     def setUp(self):
@@ -194,29 +194,29 @@ class TestMutants(unittest.TestCase):
         self.check(real("plan_check"), real("plan_approval"), real("plan_ledger"))
 
     def test_a_mutant_that_hashes_the_marker_fails(self):
-        pc = mutate("plan_check", "    text = _without_trailing_marker(text)\n", "    pass\n")
+        pc = _ph_mutate("plan_check", "    text = _without_trailing_marker(text)\n", "    pass\n")
         with self.assertRaisesRegex(AssertionError, "the marker changes the hash"):
             self.check(pc, real("plan_approval"), real("plan_ledger"))
 
     def test_a_mutant_that_accepts_no_old_hash_fails(self):
-        pc = mutate("plan_check", "    return hashes[0] if hashes and stored in hashes else stored\n", "    return stored\n")
+        pc = _ph_mutate("plan_check", "    return hashes[0] if hashes and stored in hashes else stored\n", "    return stored\n")
         with self.assertRaisesRegex(AssertionError, "an approval at the old hash is refused"):
             self.check(pc, real("plan_approval"), real("plan_ledger"))
 
     def test_a_mutant_that_reads_the_ask_head_at_the_new_form_only_fails(self):
-        pl = mutate("plan_ledger", "        if entry.get(\"plan_hash\") == old or entry.get(\"head\") == old_head:", "        if False:")
+        pl = _ph_mutate("plan_ledger", "        if entry.get(\"plan_hash\") == old or entry.get(\"head\") == old_head:", "        if False:")
         with self.assertRaisesRegex(AssertionError, "an old-head record reads as stale"):
             self.check(real("plan_check"), real("plan_approval"), pl)
 
     def test_a_mutant_that_compares_the_raw_strings_in_a_round_counts_two_of_three(self):
-        pc, pl, rv = real("plan_check"), mutate("plan_ledger", "    if not hashes or len(hashes) < 2:\n        return entries\n", "    return entries\n"), real("plan_review")
+        pc, pl, rv = real("plan_check"), _ph_mutate("plan_ledger", "    if not hashes or len(hashes) < 2:\n        return entries\n", "    return entries\n"), real("plan_review")
         new, old = pc.plan_hashes(self.signed)
         entries = [{"kind": "lane", "lane": l, "verdict": "approve", "plan_hash": h, "objections": []} for l, h in zip("ABC", (old, old, new))]
         entries = pl.as_current(entries, (new, old))
         self.assertNotEqual(rv.decide_consensus(entries, list("ABC"), new, rounds_left=True)[0], "consensus")
 
 
-class TestTheDocumentation(unittest.TestCase):
+class TestPlanHashMarkerDocumentation(unittest.TestCase):
     """S7: one section names the three statements."""
 
     def test_the_template_says_what_the_hash_covers(self):
@@ -230,7 +230,7 @@ class TestTheDocumentation(unittest.TestCase):
         self.assertIn("(#1713)", text)
 
 
-class TestNoSizeTestInThisFile(unittest.TestCase):
+class TestPlanHashMarkerNoSizeTest(unittest.TestCase):
     """U4 (#1676): this file never diffs against a ref or counts a pull request's lines."""
 
     def test_no_such_call(self):
