@@ -177,7 +177,7 @@ TestWeeklyJobRewrite, TestSlice3Modules, TestModuleLoader, TestDeployFromMainSen
 _support_test_cases_08 = importlib.import_module("test_cases_08")   # support import
 FakeActions, TestReds, TestTempJanitorResume, TestAgentRegistry = (_support_test_cases_08.FakeActions, _support_test_cases_08.TestReds, _support_test_cases_08.TestTempJanitorResume, _support_test_cases_08.TestAgentRegistry)   # support import
 TestClosingKeywordWarning, TestPreflightPr, TestFocusedLocalRuns = (_support_test_cases_08.TestClosingKeywordWarning, _support_test_cases_08.TestPreflightPr, _support_test_cases_08.TestFocusedLocalRuns)   # support import
-TestBatchingDocs, FakePullFiles, TestCloudWatchBounds, TestArchTools = (_support_test_cases_08.TestBatchingDocs, _support_test_cases_08.FakePullFiles, _support_test_cases_08.TestCloudWatchBounds, _support_test_cases_08.TestArchTools)   # support import
+TestBatchingDocs, TestCloudWatchBounds, TestArchTools = (_support_test_cases_08.TestBatchingDocs, _support_test_cases_08.TestCloudWatchBounds, _support_test_cases_08.TestArchTools)   # support import
 _support_test_cases_09 = importlib.import_module("test_cases_09")   # support import
 TestItemVerdicts, ReviewCommentLineTests = (_support_test_cases_09.TestItemVerdicts, _support_test_cases_09.ReviewCommentLineTests)   # support import
 _support_test_cases_10 = importlib.import_module("test_cases_10")   # support import
