@@ -8,6 +8,17 @@ LOGIN = "eyJ" + "Qr7Zk9" * 20
 PW = "pw" + "Xy_-9" * 8
 MODEL = '{"provider":"p","key":"sk-' + "k" * 20 + '","base":"http://m.example"}'
 
+import json as _json, random as _random, string as _string
+_R = _random.Random(1783)  # the fixed seed of the fixtures
+_AL = _string.ascii_letters + _string.digits + "-_"
+G34 = "ghs_" + "".join(_R.choice(_string.ascii_letters + _string.digits) for _ in range(36))
+L34 = "eyJ" + "".join(_R.choice(_AL) for _ in range(717))
+P34 = "".join(_R.choice(_AL) for _ in range(43))
+H34 = "".join(_R.choice("0123456789abcdef") for _ in range(64))
+SHORT_KEY = "sk-" + "".join(_R.choice(_string.ascii_lowercase) for _ in range(20))
+M34 = _json.dumps({"provider": "openai", "key": SHORT_KEY, "base": "http://m.example"})
+FIXTURES = (G34, L34, P34, H34, SHORT_KEY, M34)
+
 
 class S(unittest.TestCase):
     def kf(self):
@@ -32,7 +43,7 @@ class S(unittest.TestCase):
         k = self.kf(); fs = set(cw.secret_forms(TOK))
         k.add_forms(fs, ("until", 10.0, "p1"))
         self.assertEqual(k.sweep(99999, {"p1"}), 0)
-        self.assertIn("[redacted", cw.scrub("x " + TOK, k).lower() if False else "[redacted" if all(f in set(k) for f in fs) else "")
+        self.assertNotIn(TOK, cw.scrub("x " + TOK, k), "a form of a running pod was dropped")
         n = k.sweep(99999, set()); self.assertEqual(n, len(fs)); self.assertEqual(len(k), 0)
 
     def test_s4_scrub_same_for_live(self):
@@ -73,6 +84,23 @@ class S(unittest.TestCase):
     def test_no_life_never_leaves(self):
         k = self.kf(); k.add_forms(cw.secret_forms(MODEL)); k.add_forms(cw.secret_forms(MODEL), ("pod", "x"))
         k.sweep(1e12, set()); self.assertEqual(len(k), len(set(cw.secret_forms(MODEL))))
+
+
+class S3More(unittest.TestCase):
+    """S3 as the plan states it: git token and login token past their hour, the pod in the list, then out of it."""
+
+    def test_s3_running_then_left(self):
+        k = cw.KnownForms(); gf, lf = set(cw.secret_forms(G34)), set(cw.secret_forms(L34))
+        k.add_forms(gf, ("until", 3660.0, "p1")); k.add_forms(lf, ("until", 2400.0, "p1"))
+        self.assertEqual(k.sweep(99999, {"p1"}), 0)
+        self.assertTrue((gf | lf) <= set(k), "a form of a running pod was dropped")
+        out = cw.scrub("x " + G34 + " y " + L34, k)
+        self.assertNotIn(G34, out, "a form of a running pod was dropped"); self.assertNotIn(L34, out, "a form of a running pod was dropped")
+        kept = len(gf)
+        gone = k.sweep(99999, set())
+        print("S3 kept %d of %d, redacted 1 of 1, dropped after leaving %d of %d" % (kept, len(gf), gone, len(gf | lf)))
+        self.assertEqual(gone, len(gf | lf)); self.assertEqual(len(k), 0)
+        self.assertEqual((len(gf), len(lf)), (8, 6))
 
 
 class Mutants(unittest.TestCase):
