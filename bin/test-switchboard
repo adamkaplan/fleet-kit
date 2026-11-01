@@ -29199,6 +29199,7 @@ class LedgerBase(Base):
         self.comments = []
         self.pr = {"title": "Add it", "state": "OPEN", "headRefOid": LEDGER_HEAD, "reviewDecision": "", "author": {"login": "shared"},
                    "body": "PLAN: acme/app#7\ncanon: updated the docs", "labels": [], "reviews": [], "comments": [],
+                   "baseRefName": "main",
                    "statusCheckRollup": [{"conclusion": "SUCCESS", "status": "COMPLETED"}]}
         self.gh_down = False
         self.configure()
