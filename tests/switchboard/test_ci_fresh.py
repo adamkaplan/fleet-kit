@@ -1,10 +1,13 @@
 """The pure decision of bin/ci_fresh.py: a green run counts only on the current tip (ask #1755, S5)."""
+import inspect
 import json
 import os
 import subprocess
 import sys
+import textwrap
 import types
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "bin"))
 import ci_fresh  # noqa: E402
@@ -487,6 +490,55 @@ class TestCiFreshReadMutants(FreshCase):
         mod = _copy_of(merge_gate, self.GATE, '""', "merge_gate_nonumber")
         with self.assertRaisesRegex(AssertionError, "17 commits behind"):
             self.refusal(mod)
+
+
+class TestCiFreshSeamMutants(FreshCase):
+    """The fakes of the existing fixtures answer a run list whose base is their `run_base` (default: the tip). A copy of each seam whose run list ignores `run_base` and answers the tip
+    makes the stale test of its family fail with the anchored text of that test's assertion; the unmutated copy passes the same test (the control)."""
+
+    SEAMS = (("LedgerBase", "route", '"base": {"sha": self.run_base}} for n in (9, 11)]}', '"base": {"sha": "t" * 40}} for n in (9, 11)]}',
+              (("TestCiRecordPass", "test_a_stale_run_records_no_verdict_and_says_the_stale_line", "ci-record records no verdict for a stale run"),
+               ("TestPlanGatesCheck", "test_a_stale_run_makes_g4_missing_with_the_stale_line", "the G4 row is missing for a stale run"))),
+             ("BaselineWorld", "route", '"base": {"sha": self.run_base}} for n in self.prs]}', '"base": {"sha": "t" * 40}} for n in self.prs]}',
+              (("TestDecisionBaselineNotices", "test_a_stale_run_reads_stale_in_the_notice_facts", "the panel notice facts read stale: 3 behind"),)),
+             ("FakeGhPr", "__call__", '"base": {"sha": self.run_base}} for n in (7, 8)]}', '"base": {"sha": "t" * 40}} for n in (7, 8)]}',
+              (("TestPrNotices", "test_a_stale_run_reads_stale_in_the_pull_request_notice", "the pull request notice reads stale: 3 behind"),)))
+
+    def seam(self, cls, name, old, new):
+        """The method of the seam as a function built from its source with `old` replaced by `new` (new None: unmutated); the replaced text occurs once."""
+        func = getattr(cls, name)
+        src = textwrap.dedent("".join(inspect.getsourcelines(func)[0]))
+        if new is not None:
+            self.assertEqual(src.count(old), 1, "the mutation applies once: " + old)
+            src = src.replace(old, new)
+        scope = {}
+        exec(compile(src.replace("super().", "super(__cls__, self)."), "seam_" + name, "exec"), dict(func.__globals__, __cls__=cls), scope)   # a copy has no __class__ cell: super is named
+        return scope[name]
+
+    def run_case(self, case, test, cls, name, fn):
+        result = unittest.TestResult()
+        with mock.patch.object(cls, name, fn):
+            getattr(_host(), case)(test).run(result)
+        return result
+
+    def test_the_controls_the_unmutated_seams_pass_the_stale_tests(self):
+        for cls_name, name, old, new, cases in self.SEAMS:
+            cls = getattr(_host(), cls_name)
+            fn = self.seam(cls, name, old, None)
+            for case, test, text in cases:
+                result = self.run_case(case, test, cls, name, fn)
+                self.assertEqual((result.testsRun, result.failures, result.errors), (1, [], []), (case, test))
+
+    def test_a_seam_that_answers_the_tip_for_every_run_fails_the_stale_test_of_each_family(self):
+        for cls_name, name, old, new, cases in self.SEAMS:
+            cls = getattr(_host(), cls_name)
+            fn = self.seam(cls, name, old, new)
+            for case, test, text in cases:
+                result = self.run_case(case, test, cls, name, fn)
+                self.assertEqual((result.testsRun, len(result.failures), result.errors), (1, 1, []), (case, test))
+                with self.assertRaisesRegex(AssertionError, text):
+                    raise AssertionError(result.failures[0][1])
+
 
 if __name__ == "__main__":
     unittest.main()
