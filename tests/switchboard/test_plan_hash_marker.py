@@ -326,7 +326,20 @@ def build():
             """A review round on the marker-bearing plan; `legacy` drops `plan_hashes` from the entries it writes (a round of before the change)."""
             self.signed_plan()
             real_append = sb.plan_ledger.append_checked
-            strip = lambda state, now, build: real_append(state, now, lambda e, s: {k: v for k, v in build(e, s).items() if k != "plan_hashes"})
+            legacy_hash = sb.plan_check.plan_hash_legacy(host.LEDGER_PLAN + "\n" + MARKER)
+
+            def before_the_change(e, s):
+                """The entry as the code before this change wrote it: the OLD hash in `plan_hash`, no `plan_hashes`."""
+                entry = {k: v for k, v in build_entry(e, s).items() if k != "plan_hashes"}
+                if entry.get("kind") == "round" and entry.get("plan_hash"):
+                    entry["plan_hash"] = legacy_hash
+                return entry
+
+            def strip(state, now, build):
+                nonlocal build_entry
+                build_entry = build
+                return real_append(state, now, before_the_change)
+            build_entry = None
             with mock.patch.object(sb.plan_ledger, "append_checked", strip if legacy else real_append):
                 code, got, err = self.start()
             self.assertEqual(code, 0, err)
@@ -446,7 +459,7 @@ def build():
             self.assertNotIn("plan_hashes", rnd)
             old = sb.plan_check.plan_hash_legacy(host.LEDGER_PLAN + "\n" + MARKER)
             for lane in rnd["lanes"]:
-                self.inject(self.lane_entry(got["review"], rnd, lane, old if lane != rnd["lanes"][-1] else got["plan_hash"]))
+                self.inject(self.lane_entry(got["review"], rnd, lane, old if lane != rnd["lanes"][-1] else got["plan_hash"]))   # got["plan_hash"] is the NEW hash: a verdict at each form
             before = len(self.ledger())
             rows = self.six_commands(got["review"], rnd)
             self.assertEqual([r[0] for r in rows], ["verdict", "status", "close", "decide", "respond", "closing"])
