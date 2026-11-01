@@ -1134,6 +1134,8 @@ def triage_pass(engine, decisions, now, errors=()):
     if held is not None and held.unapproved:   # #765: the plans that look unapproved, one status line (a hint: see docs/switchboard.md)
         state.current["plans_unapproved"] = held.unapproved[:load_triage_plan_open().MAX_LISTED]
         state.current["plans_unapproved_more"] = max(0, len(held.unapproved) - load_triage_plan_open().MAX_LISTED)
+    if held is not None and (held.dropped or held.repeats):   # #1784: held plan lines dropped for a replaced hash, and re-offers of a delivered line not delivered
+        state.current["plan_wake_counts"] = {"dropped": held.dropped, "repeats_not_delivered": held.repeats}
     triage_write(engine, state)
     flagged = [(r, ref) for r, ref, _ in findings if r == "OO" and now - state.alarmed.get((r, ref), 0) >= cfg["realarm_hours"] * 3600]
     owner_t6 = triage_owner_tier_t6(engine, decisions)
