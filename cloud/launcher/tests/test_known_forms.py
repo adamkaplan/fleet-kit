@@ -43,7 +43,7 @@ class S(unittest.TestCase):
         k = self.kf(); fs = set(cw.secret_forms(TOK))
         k.add_forms(fs, ("until", 10.0, "p1"))
         self.assertEqual(k.sweep(99999, {"p1"}), 0)
-        self.assertNotIn(TOK, cw.scrub("x " + TOK, k), "a form of a running pod was dropped")
+        self.assertTrue(TOK not in cw.scrub("x " + TOK, k), "a form of a running pod was dropped")
         n = k.sweep(99999, set()); self.assertEqual(n, len(fs)); self.assertEqual(len(k), 0)
 
     def test_s4_scrub_same_for_live(self):
@@ -95,7 +95,7 @@ class S3More(unittest.TestCase):
         self.assertEqual(k.sweep(99999, {"p1"}), 0)
         self.assertTrue((gf | lf) <= set(k), "a form of a running pod was dropped")
         out = cw.scrub("x " + G34 + " y " + L34, k)
-        self.assertNotIn(G34, out, "a form of a running pod was dropped"); self.assertNotIn(L34, out, "a form of a running pod was dropped")
+        self.assertTrue(G34 not in out and L34 not in out, "a form of a running pod was dropped")
         kept = len(gf)
         gone = k.sweep(99999, set())
         print("S3 kept %d of %d, redacted 1 of 1, dropped after leaving %d of %d" % (kept, len(gf), gone, len(gf | lf)))
@@ -215,7 +215,7 @@ class S4Same(unittest.TestCase):
         k.add_forms(cw.secret_forms(M34), None); k.add_forms(cw.secret_forms(H34), ("pod", "p9"))
         k.sweep(1000.0, {"p1", "p9"})  # the five extra tokens are dropped, the rest is live
         live = set(cw.secret_forms(G34)) | set(cw.secret_forms(P34)) | set(cw.secret_forms(M34)) | set(cw.secret_forms(H34))
-        self.assertEqual(set(k), live, "the live set differs from the expected one")
+        self.assertTrue(set(k) == live, "the live set differs from the expected one: %d held, %d expected" % (len(set(k)), len(live)))
         pool = sorted(live)
         ordered = list(k)  # the live forms in the order the new scrub reads them (equal-length forms are tied in the sort, so the order is part of the output)
         rnd = _random.Random(self.SEED); same = 0
@@ -334,6 +334,51 @@ class S8Rounds(unittest.TestCase):
                 same += out[0][0] == OLD_SCRUB(text, out[0][1], 100000)
         print("S8 rounds 200: %d raised, %d of 200 added forms kept, %d of 200 outputs equal to the frozen old function's on their own snapshot" % (raises, kept, same))
         self.assertEqual((raises, kept, same), (0, 200, 200))
+
+
+class S6NoValueInOutput(unittest.TestCase):
+    """S6: every output of the checks, in a pass and in a forced failure, holds no fixture value."""
+    RUNNING = False
+
+    def run_suites(self):
+        import io, contextlib
+        buf = io.StringIO()
+        suites = unittest.TestSuite()
+        for c in (S2Kinds, S3More, S4Same, S5Week, S8Rounds, Mutants):
+            suites.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(c))
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+            res = unittest.TextTestRunner(stream=buf, verbosity=2).run(suites)
+        return buf.getvalue(), res
+
+    def scan(self, text):
+        return sum(text.count(v) for v in FIXTURES + (TOK, LOGIN, PW, MODEL, G34[4:], L34[3:])) + sum(text.count(f) for f in cw.secret_forms(SHORT_KEY) if len(f) >= 8)
+
+    def test_no_value_in_a_pass_or_a_forced_failure(self):
+        if S6NoValueInOutput.RUNNING:
+            return
+        S6NoValueInOutput.RUNNING = True
+        try:
+            out_pass, r1 = self.run_suites()
+            self.assertTrue(r1.wasSuccessful(), "the suites do not pass")
+            def drop_all(self, now, pods):
+                with self._lock:
+                    n = len(self); self._lives.clear(); set.clear(self); return n
+            def never(self, now, pods):
+                return 0
+            outs = []
+            for name, fn in (("drop-all", drop_all), ("never-drop", never)):
+                old = cw.KnownForms.sweep; cw.KnownForms.sweep = fn
+                try:
+                    o, r = self.run_suites()
+                finally:
+                    cw.KnownForms.sweep = old
+                self.assertFalse(r.wasSuccessful(), "the forced failure did not fail (" + name + ")")
+                outs.append((name, o, len(r.failures) + len(r.errors)))
+        finally:
+            S6NoValueInOutput.RUNNING = False
+        hits = self.scan(out_pass) + sum(self.scan(o) for _, o, _ in outs)
+        print("S6 outputs scanned: 1 pass (%d chars) and %d forced failures (%s): %d occurrences of a fixture value" % (len(out_pass), len(outs), ", ".join("%s %d failing checks" % (n, f) for n, _, f in outs), hits))
+        self.assertEqual(hits, 0, "a fixture value appears in an output")
 
 
 class Mutants(unittest.TestCase):
