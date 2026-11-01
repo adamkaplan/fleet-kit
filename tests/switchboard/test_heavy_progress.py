@@ -5,6 +5,7 @@ import unittest
 from unittest import mock
 
 from support.loader import sb
+from support.herdr_world import made_up_pid
 
 
 class Out:
@@ -34,7 +35,7 @@ class Rig:
         rig = self
 
         class FakeChild:
-            pid = 999999999   # no such process: the CPU read fails and the line has no CPU part
+            pid = made_up_pid()   # no such process: the CPU read fails and the line has no CPU part
 
             def __init__(child, argv, **kwargs):
                 rig.starts.append(argv)
