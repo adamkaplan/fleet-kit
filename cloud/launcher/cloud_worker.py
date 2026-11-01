@@ -2596,8 +2596,10 @@ class Launcher:
         finally:
             steps["orphans"] = mono() - t0
         t0 = mono()
-        self.send_wip_notes(live, now)
-        steps["notes"] = mono() - t0
+        try:
+            self.send_wip_notes(live, now)
+        finally:
+            steps["notes"] = mono() - t0
         steps["total"] = mono() - t_pass
         return out
 
