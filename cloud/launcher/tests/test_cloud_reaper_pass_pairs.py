@@ -476,5 +476,113 @@ class TestLostLease(unittest.TestCase):
         self.assertFalse(mode.LeaseGate(gate.store, "mac", lambda: T0)())
 
 
+class WorldKube(RecordingKube):
+    """S21's fake world: one orphan Secret older than the orphan time, one vanished pod (listed in no pass, not found by name)."""
+
+    def __init__(self, env, pods):
+        super().__init__(env, pods)
+        self.deleted = []
+
+    def get_pod(self, name):
+        return None
+
+    def list_secrets(self, selector):
+        if selector == "cw/pod":
+            return [("gone-pod-run", "gone-pod", "", cw.iso(T0 - 120 * MIN))]
+        return []
+
+    def delete_run_secret(self, name):
+        self.deleted.append(name)
+
+
+def s21_pass(module, lose):
+    """lose: None (the control, lease held), "a" (lost before the vanished step) or "b" (lost after the first stop). Returns the counts."""
+    import io
+    state = {"lost": False, "stops": 0, "after": 0, "gone_at_loss": None}
+    err = io.StringIO()
+    with tempfile.TemporaryDirectory() as tmp:
+        env = env_for(tmp)
+        create = {"ts": cw.iso(T0 - 30 * MIN), "action": "create", "ok": True, "runtime_id": "rid-gone", "worker": "gone"}
+        with open(env["CW_CLOUD_AUDIT"], "w") as fh:
+            fh.write(json.dumps(create) + "\n")
+        kube = WorldKube(env, [pod("w0", 120), pod("w1", 120)])
+        L = module.Launcher(kube, env, lambda: T0, lambda s: None)
+
+        def gone_lines():
+            with open(env["CW_CLOUD_AUDIT"]) as fh:
+                return sum(1 for x in fh if '"pod_gone"' in x)
+
+        def stop(args, reason):
+            state["after"] += state["lost"]
+            state["stops"] += 1
+            if lose == "b" and state["stops"] == 1:
+                state["lost"] = True
+                state["gone_at_loss"] = gone_lines()
+            return {}
+        L.stop = stop
+        L.beat = lambda: not state["lost"]
+        if lose == "a":
+            real = L.renew_git_tokens
+
+            def renew(*a, **k):
+                state["lost"] = True   # lost after the renewal step, before the vanished step
+                state["gone_at_loss"] = 0
+                return real(*a, **k)
+            L.renew_git_tokens = renew
+        with mock.patch("sys.stderr", err):
+            L.reap()
+        gone = gone_lines()
+    lines = [x for x in err.getvalue().splitlines() if "lease lost" in x]
+    before = gone if lose is None else state["gone_at_loss"]
+    return {"stops": state["stops"], "after": state["after"], "deletes": len(kube.deleted), "gone": gone,
+            "gone_before": before, "gone_after": gone - before, "lines": len(lines)}
+
+
+def check_s21(module):
+    control, a, b = s21_pass(module, None), s21_pass(module, "a"), s21_pass(module, "b")
+    assert (control["stops"], control["deletes"], control["gone"]) == (2, 1, 1), control
+    got = (a["stops"], a["deletes"], a["gone"], b["stops"], b["after"], b["deletes"], b["gone_before"], b["gone_after"], b["lines"])
+    assert got == (0, 0, 0, 1, 0, 0, 1, 0, 1), "an action after the lease was lost: %r" % (got,)
+    return control, a, b
+
+
+def mutant(guard, replacement=""):
+    import importlib.util
+    with open(cw.__file__) as fh:
+        src = fh.read()
+    assert src.count(guard) == 1, "the guard text must occur once"
+    mutated = src.replace(guard, replacement)
+    assert mutated != src, "the mutation was not applied"
+    d = tempfile.mkdtemp(prefix="s21-", dir="/tmp")
+    path = os.path.join(d, "cloud_worker_mutant.py")
+    with open(path, "w") as fh:
+        fh.write(mutated)
+    spec = importlib.util.spec_from_file_location("cloud_worker_mutant", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class TestNoActionAfterLeaseLost(unittest.TestCase):
+    def test_s21_control_then_the_two_cases(self):
+        control, a, b = check_s21(cw)
+        print("S21: control stops %d deletes %d gone lines %d" % (control["stops"], control["deletes"], control["gone"]))
+        print("S21: (a) stops %d deletes %d gone lines %d" % (a["stops"], a["deletes"], a["gone"]))
+        print("S21: (b) stops %d after loss %d deletes %d gone before %d after %d stderr lines %d" % (
+            b["stops"], b["after"], b["deletes"], b["gone_before"], b["gone_after"], b["lines"]))
+
+    def test_mutant_without_the_orphan_secret_guard_fails(self):
+        guard = '        if not self._beat():\n            return []\n        if not hasattr(self.kube, "list_secrets"):'
+        with self.assertRaises(AssertionError) as ctx:
+            check_s21(mutant(guard, '        if not hasattr(self.kube, "list_secrets"):'))
+        self.assertIn("an action after the lease was lost", str(ctx.exception))
+
+    def test_mutant_without_the_vanished_pod_guard_fails(self):
+        guard = '        if not self._beat():\n            return\n        try:\n            with open(self.audit_path, "rb") as f:'
+        with self.assertRaises(AssertionError) as ctx:
+            check_s21(mutant(guard, '        try:\n            with open(self.audit_path, "rb") as f:'))
+        self.assertIn("an action after the lease was lost", str(ctx.exception))
+
+
 if __name__ == "__main__":
     unittest.main()
