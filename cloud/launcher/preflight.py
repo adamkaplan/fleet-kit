@@ -43,6 +43,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -113,16 +114,44 @@ def _rate_limited(e):
         return True  # cannot tell: refuse
 
 
+MINT_TRIES = 4
+MINT_WAITS = (2, 5, 10)  # seconds between the tries; a Retry-After over the last one ends the retries
+_sleep = time.sleep      # the one wait (tests replace it with a fake clock)
+
+
+def _tries(n):
+    return "%d %s" % (n, "try" if n == 1 else "tries")
+
+
+def _mint_with_retry(target):
+    """app_token.mint, retried only after a PASSING failure (app_token.LAST_FAILURE['transient']); a refusal is raised after one try."""
+    for n in range(1, MINT_TRIES + 1):
+        app_token.LAST_FAILURE.clear()
+        try:
+            return app_token.mint(target)
+        except SystemExit:  # app_token already said why, on stderr
+            fail = dict(app_token.LAST_FAILURE)
+        reason = str(fail.get("reason") or "")
+        if not fail.get("transient"):
+            raise Unreadable("no token could be minted" + (": " + reason if reason else ""))
+        asked = fail.get("retry_after")
+        if n >= MINT_TRIES:
+            raise Unreadable("no token could be minted after %s: %s" % (_tries(n), reason))
+        if asked is not None and asked > MINT_WAITS[-1]:
+            raise Unreadable("no token could be minted after %s: %s (GitHub asked for %d seconds, more than the %d seconds waited: not retried)"
+                             % (_tries(n), reason, asked, MINT_WAITS[-1]))
+        wait = max(MINT_WAITS[n - 1], asked or 0)
+        print("mint try %d of %d failed: %s; trying again in %d seconds" % (n, MINT_TRIES, reason, wait), file=sys.stderr)
+        _sleep(wait)
+
+
 def get_token(target):
     cmd = os.environ.get("CW_PREFLIGHT_TOKEN_CMD")
     if not cmd:
-        try:
-            token = app_token.mint(target)
-            say("token permissions: " + app_token.render_permissions())  # the mint refused anything else
-            say("orchestrator permissions: " + app_token.render_permissions(None, "orchestrator"))  # the set of the other role, from the same table
-            return token
-        except SystemExit:  # app_token already said why, on stderr; a mint that fails is an unreadable answer
-            raise Unreadable("no token could be minted")
+        token = _mint_with_retry(target)
+        say("token permissions: " + app_token.render_permissions())  # the mint refused anything else
+        say("orchestrator permissions: " + app_token.render_permissions(None, "orchestrator"))  # the set of the other role, from the same table
+        return token
     try:
         p = subprocess.run(["sh", "-c", cmd], capture_output=True, text=True, timeout=60)
     except (OSError, subprocess.TimeoutExpired):

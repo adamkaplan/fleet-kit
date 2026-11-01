@@ -140,17 +140,21 @@ class Completeness(unittest.TestCase):
         return "\n".join(ls)
 
     @staticmethod
-    def parts(sec):
+    def parts(sec, names=None):
         mac, ub = sec.split("### macOS (per entry)")[1].split("### Ubuntu (per entry)")
         rows = [{r.split("`")[1] for r in t.split("\n") if r.startswith("| `")} for t in (mac, ub)]
         lines = [sec.split("\n")[i] for i in Completeness.line_idx(sec)]
         assert len(lines) == 1, "the section needs exactly one 'Not yet measured:' line"
-        rest = lines[0].split(":", 1)[1].strip().rstrip(".")
-        return rows[0], rows[1], ([] if rest == "none" else re.findall(r"`([^`]+)`", rest))
+        return rows[0], rows[1], (Completeness.names() if names is None else names)
+
+    @staticmethod
+    def names():
+        with open(os.path.join(base.ROOT, "cloud", "launcher", "tests", "chain_unmeasured.list")) as f:
+            return [l for l in f.read().split("\n") if l]
 
     @classmethod
-    def problems(cls, sec, chain):
-        mac, ub, nym = cls.parts(sec)
+    def problems(cls, sec, chain, names=None):
+        mac, ub, nym = cls.parts(sec, names)
         chain, out = set(chain), []
         if mac != ub:
             out.append("the two tables differ: %s" % sorted(mac ^ ub))
@@ -183,10 +187,10 @@ class Completeness(unittest.TestCase):
 
     def test_s10_mutant_an_entry_in_a_table_and_in_the_line_is_refused(self):
         e = sorted(base.entries())[0]
-        self._mutant(lambda s: self.with_line(s, "Not yet measured: `%s`" % e), e)
+        self.assertTrue(any(e in g for g in self.problems(self.real(), base.entries(), names=[e])), e)
 
     def test_s10_mutant_a_name_in_the_line_that_is_not_in_the_chain_is_refused(self):
-        self._mutant(lambda s: self.with_line(s, "Not yet measured: `cloud/launcher/tests/test_gone.py`"), "test_gone.py")
+        self.assertTrue(any("test_gone.py" in g for g in self.problems(self.real(), base.entries(), names=["cloud/launcher/tests/test_gone.py"])))
     # The code's rule: not exactly one 'Not yet measured:' line is an AssertionError naming the line (neither "none" nor first-only nor a union).
     def test_s11_mutant_a_section_without_the_line_fails_naming_the_line(self):
         sec = self.real()
@@ -211,7 +215,7 @@ class Completeness(unittest.TestCase):
             scratch = self.with_line(sec, v)
             self.assertEqual(len(self.line_idx(scratch)), 1)
             self.assertEqual(self.with_line(scratch, v), scratch)
-            self.assertEqual(self.parts(scratch)[2], re.findall(r"`([^`]+)`", v))
+            self.assertEqual(self.parts(scratch, re.findall(r"`([^`]+)`", v))[2], re.findall(r"`([^`]+)`", v))
             two = self.with_copy(scratch)
             self.assertNotEqual(two, scratch, "the mutation did not apply")
             self.assertEqual(len(self.line_idx(two)), 2)
@@ -220,6 +224,66 @@ class Completeness(unittest.TestCase):
             for bad in (two, none):
                 with self.assertRaisesRegex(AssertionError, "exactly one 'Not yet measured:' line"):
                     self.problems(bad, base.entries())
+
+
+class UnmeasuredList(unittest.TestCase):
+    """Ask #1719: the not-yet-measured names stand one per line in chain_unmeasured.list (check names: list, readme line, merge)."""
+    LIST = os.path.join("cloud", "launcher", "tests", "chain_unmeasured.list")
+
+    def test_a_the_list_is_sorted_unique_and_with_the_tables_equals_the_chain(self):
+        names = Completeness.names()
+        self.assertEqual(names, sorted(set(names)), "the list is not sorted and unique")
+        self.assertEqual(Completeness.problems(Completeness().real(), base.entries()), [])
+
+    def test_b_the_readme_line_holds_no_backticked_name(self):
+        sec = Completeness().real()
+        line = sec.split("\n")[Completeness.line_idx(sec)[0]]
+        self.assertEqual(re.findall(r"`([^`]+)`", line), [], line)
+        self.assertEqual(self.readme_names(sec), [])
+
+    @staticmethod
+    def readme_names(sec):
+        return [n for l in sec.split("\n") if l.startswith("Not yet measured:") for n in re.findall(r"`([^`]+)`", l)]
+
+    def test_c_two_branches_adding_different_names_far_apart_merge_clean(self):
+        import tempfile
+        names = Completeness.names()
+        adds = ["cloud/launcher/tests/test_aaa_first.py", "cloud/worker/tests/test_zzz_last.py"]
+        with tempfile.TemporaryDirectory() as d:
+            def git(*a):
+                return subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "-c", "init.defaultBranch=main"] + list(a),
+                                      cwd=d, capture_output=True, text=True)
+            self.assertEqual(git("init").returncode, 0)
+            f = os.path.join(d, "chain_unmeasured.list")
+            def write(ns):
+                with open(f, "w") as h:
+                    h.write("".join(n + "\n" for n in sorted(ns)))
+            write(names)
+            git("add", "."); self.assertEqual(git("commit", "-m", "base").returncode, 0)
+            for i, a in enumerate(adds):
+                git("checkout", "-q", "-b", "b%d" % i, "main")
+                write(names + [a])
+                git("commit", "-qam", "add %d" % i)
+            git("checkout", "-q", "b0")
+            m = git("merge", "--no-edit", "b1")
+            self.assertEqual(m.returncode, 0, m.stdout + m.stderr)
+            merged = open(f).read()
+            self.assertEqual(sum(1 for a in adds if a in merged.split("\n")), 2)
+            self.assertNotIn("<<<<<<<", merged)
+            parents = git("rev-list", "--parents", "-n1", "HEAD").stdout.split()
+            self.assertEqual(len(parents) - 1, 2, "1 clean merge of 2 branches")
+
+    def test_d_mutants_with_controls(self):
+        real, chain = Completeness().real(), base.entries()
+        names = Completeness.names()
+        self.assertEqual(Completeness.problems(real, chain, names=names), [], "control")
+        line = Completeness.with_line(real, "Not yet measured: `%s`" % names[0])
+        self.assertEqual(UnmeasuredList.readme_names(Completeness.with_line(real, "Not yet measured: none")), [], "control")
+        self.assertEqual(UnmeasuredList.readme_names(line), [names[0]], "the README line holds a name")
+        got = Completeness.problems(real, chain, names=names[1:])
+        self.assertTrue(any(names[0] in g and "neither a row nor named" in g for g in got), got)
+        got = Completeness.problems(real, chain, names=names + ["cloud/launcher/tests/test_gone.py"])
+        self.assertTrue(any("test_gone.py is not in the chain" in g for g in got), got)
 
 
 class Docs(unittest.TestCase):

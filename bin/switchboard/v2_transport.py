@@ -127,6 +127,7 @@ V2_HTTP_OPERATIONS = {   # operation -> (method, path template, path parameters,
     "server.info": ("GET", "/api/info", (), ()),
     "session.active": ("GET", "/api/session/active", (), ()),
     "session.create": ("POST", "/api/session", (), ()),
+    "model.list": ("GET", "/api/model", (), ()),
     "session.get": ("GET", "/api/session/{sessionID}", ("sessionID",), ()),
     "session.remove": ("DELETE", "/api/session/{sessionID}", ("sessionID",), ()),
     "session.list": ("GET", "/api/session", (), ("limit", "order", "search", "parentID", "directory", "project", "subpath", "cursor")),
@@ -690,13 +691,19 @@ class V2Client:
     def server_info(self):
         return self._call("server.info")
 
-    def session_create(self, agent, title, directory, metadata, permissions=None):
+    def model_list(self):
+        """`model.list` (GET /api/model): the LOCAL service's models, `[{providerID, id, variants: [{id}]}]` (#1642). A read of the service, never of a provider."""
+        return self._call("model.list")
+
+    def session_create(self, agent, title, directory, metadata, permissions=None, model=None):
         if not os.path.isabs(directory):
             raise ValueError("directory must be absolute: %r" % directory)
         data = {"agent": agent, "title": title, "location": {"directory": directory},
                 "metadata": metadata}
         if permissions is not None:
             data["permissions"] = permissions
+        if model is not None:   # #1642: {providerID, id[, variant]}, only when a launch chose one
+            data["model"] = model
         return self._call("session.create", data=data)
 
     def session_get(self, session_id):

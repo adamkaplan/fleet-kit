@@ -2053,7 +2053,7 @@ class TestCloudWatchBounds(unittest.TestCase):
 
     def test_every_untrusted_record_parse_is_bounded_and_listed_in_the_docs(self):
         """Completeness: every json.loads in cloud_worker.py of a record file goes through parse_bounded, and the docs table names each reader."""
-        text = self.SRC.read_text()
+        text = self.SRC.read_text() + (REPO / "bin" / "cloud_cluster.py").read_text()   # the text moved out of it (ask #1647)
         loads = [l.strip() for l in text.splitlines() if "json.loads(" in l and not l.lstrip().startswith("#")]
         self.assertEqual(loads, ["return json.loads(text)", "body = json.loads(out) if (out or \"\").strip() else None"])
         import re
@@ -2157,6 +2157,34 @@ class TestCloudWatchBounds(unittest.TestCase):
 class TestArchTools(unittest.TestCase):
     """The two move tools (S0 of #1092): `arch-split-check` reads the surface of the daemon as its own entry assembles it, and `arch-part-cut` never overwrites a part."""
 
+    # The warnings machinery adds __warningregistry__ to a module's globals when a warning is raised from code of that module, so dir(module) can hold a name the tool never reads.
+    INTERPRETER_ADDED = frozenset({"__warningregistry__"})
+
+    def daemon_names(self, module):
+        return sorted(set(dir(module)) - self.INTERPRETER_ADDED)
+
+    def scratch_module(self, *extra):
+        mod = types.ModuleType("daemon_scratch")
+        for n in ("alpha", "beta") + extra:
+            setattr(mod, n, 1)
+        return mod
+
+    def test_the_names_the_interpreter_adds_are_left_out_of_the_daemon_names_and_a_planted_name_is_not(self):
+        expected = sorted(dir(self.scratch_module()))
+        self.assertEqual(self.daemon_names(self.scratch_module()), expected)
+        self.assertEqual(self.daemon_names(self.scratch_module("__warningregistry__")), expected)
+        planted = self.daemon_names(self.scratch_module("daemon_planted_name"))
+        self.assertIn("daemon_planted_name", planted)
+        self.assertEqual(planted, sorted(dir(self.scratch_module("daemon_planted_name"))))
+
+    def test_without_the_rule_the_comparison_with_the_warning_registry_present_fails(self):
+        expected = sorted(dir(self.scratch_module()))
+        self.assertEqual(self.daemon_names(self.scratch_module("__warningregistry__")), expected, "the control: the unmutated rule gives the expected names")
+        with mock.patch.object(type(self), "INTERPRETER_ADDED", frozenset()):
+            with self.assertRaises(AssertionError) as caught:
+                self.assertEqual(self.daemon_names(self.scratch_module("__warningregistry__")), expected)
+        self.assertIn("__warningregistry__", str(caught.exception), "the mutant's failure names the planted name")
+
     def tool(self, name, *args):
         return subprocess.run([sys.executable, "-B", str(REPO / "tools" / name)] + [str(a) for a in args], capture_output=True, text=True)
 
@@ -2167,7 +2195,7 @@ class TestArchTools(unittest.TestCase):
         self.addCleanup(shutil.rmtree, str(out.parent), True)
         done = self.tool("arch-split-check", "--write-surface", out, "--after", *files)
         self.assertEqual(done.returncode, 0, done.stderr[-600:])
-        self.assertEqual(out.read_text().split(), sorted(dir(sb)), "the names the tool reads are the names of the daemon as it loads")
+        self.assertEqual(out.read_text().split(), self.daemon_names(sb), "the names the tool reads are the names of the daemon as it loads, without the names the interpreter adds")
 
     def test_a_cut_refuses_a_part_name_already_listed_and_a_name_given_twice_and_writes_nothing(self):
         root = Path(tempfile.mkdtemp())
