@@ -42065,6 +42065,7 @@ class TestLaunchRefusedMessage(TestLaunchMemoryGate):
             ' > args.new_workspace > problem|raise LaunchError(problem)': (newws, [P("launch_account_problem", return_value="no account")]),
             ' > use_headless > except > except|raise LaunchError("headless refused (%s)': (no_ws, [P("launch_headless", side_effect=sb.HeadlessRefused("no")), P("caller_workspace", side_effect=RuntimeError("none"))]),
             ' > except > created|raise LaunchError("%s (workspace %s was ': (newws, [P("launch_agent", side_effect=sb.LaunchError("the tab did not open"))]),
+            ' > getattr(args, "persistent", Fa|return EXIT_USAGE': (B + ["--persistent"], []),
         }
 
     def run_row(self, argv, patches):
