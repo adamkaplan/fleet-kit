@@ -29274,6 +29274,8 @@ class LedgerBase(Base):
 
     run_base = "t" * 40   # #1755: the base the fake's run list records; a test sets another to make the run stale
 
+    run_base = "t" * 40   # #1755: the base the fake's run list records; a test sets another to make the run stale
+
     def route(self, argv, **kwargs):
         if argv[0] != FAKE_GH:
             return self.world.route(argv, **kwargs)
@@ -29288,10 +29290,12 @@ class LedgerBase(Base):
             return subprocess.CompletedProcess(argv, 0, json.dumps(self.comments if "&page=1" in path else []), "")
         if re.search(r"/issues/7$", path):
             return subprocess.CompletedProcess(argv, 0, json.dumps(self.plan_issue), "")
-        if "/actions/runs" in path:
+                   "pull_requests": [{"number": n, "base": {"sha": self.run_base}} for n in (9, 11)]}
             run = {"id": 1, "head_sha": self.pr["headRefOid"], "status": "completed", "conclusion": "success",
                    "pull_requests": [{"number": n, "base": {"sha": self.run_base}} for n in (9, 11)]}
             return subprocess.CompletedProcess(argv, 0, json.dumps({"workflow_runs": [run]}), "")
+        if "/compare/" in path and path.endswith("..." + "t" * 40):
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"ahead_by": 3}), "")
         if "/git/ref/heads/" in path:
             return subprocess.CompletedProcess(argv, 0, json.dumps({"object": {"sha": "t" * 40}}), "")
         if "/compare/" in path and path.endswith("..." + "t" * 40):
@@ -31619,6 +31623,13 @@ class TestPlanGatesCheck(LedgerBase):
         code, out, err = self.check("merge")
         self.assertEqual((code, out["verdict"], out["mode"]), (0, "allow", "shadow"))
         self.assertTrue(out["failed"])
+    def test_a_stale_run_makes_g4_missing_with_the_stale_line(self):   # #1755; the control is the test below (the default run_base is the tip: it allows)
+        self.all_proven()
+        self.run_base = "s" * 40
+        row = next(r for r in json.loads(self.run_as("coder", "gates", self.PR, "--json")[1])["gates"] if r["gate"] == "G4")
+        self.assertEqual(row["status"], "missing", "the G4 row is missing for a stale run")
+        self.assertEqual(row["missing"], ["stale: 3 commits behind (CI ran on ssssssss, the tip is tttttttt): close and reopen the pull request for a fresh run"], "the G4 row says the stale line")
+
         (event,) = self.events("gate.would_refuse")
         self.assertIn("G1", event["detail"]["failed"])
         self.assertEqual(self.events("gate.refused"), [])
@@ -39159,6 +39170,14 @@ class TestCiRecordPass(LedgerBase):
 
     def test_green_ci_at_the_current_head_records_the_ci_verdicts_without_anyone_running_a_command(self):
         self.go()
+    def test_a_stale_run_records_no_verdict_and_says_the_stale_line(self):   # #1755; the control is the test above (the default run_base is the tip: it records)
+        self.run_base = "s" * 40
+        self.go()
+        self.assertEqual(self.verdicts(), [], "ci-record records no verdict for a stale run")
+        code, out, err = self.run_as("coder", "gates", "ci-record", self.PR)
+        self.assertIn("stale: 3 commits behind (CI ran on ssssssss, the tip is tttttttt): close and reopen the pull request for a fresh run", out + err, "ci-record says the stale line")
+        self.assertEqual(self.verdicts(), [], "ci-record records no verdict for a stale run")
+
         self.assertEqual(self.verdicts(), [("acme/app#9", "S1", "switchboard", LEDGER_HEAD), ("acme/app#9", "U1", "switchboard", LEDGER_HEAD)])
         (event,) = self.events("gate.ci_record")
         self.assertEqual((event["detail"]["ok"], event["detail"]["recorded"]), (True, ["S1", "U1"]))
@@ -78395,9 +78414,11 @@ class TestCiRecordCarry(LedgerBase):
         if argv[0] == FAKE_GH and argv[1] == "api" and argv[2].startswith(self.API) and not argv[2].endswith("/issues/7") and "/comments" not in argv[2]:
             path = argv[2]
             self.reads.append(path)
-            if "/compare/%s...%s" % ("a" * 40, self.NEW) in path:
+                                           "pull_requests": [{"number": n, "base": {"sha": self.run_base}} for n in (9, 11)]}]}
                 body = {"status": self.status, "files": [{"filename": f} for f in self.changed]}
             elif path.endswith("/commits/%s" % self.NEW):
+            elif path.endswith("..." + "t" * 40):
+                body = {"ahead_by": 3}
                 body = {"parents": [{"sha": x} for x in self.parents]}
             elif path.endswith("/check-runs"):
                 body = {"check_runs": [{"status": "completed", "conclusion": "success"}]}
