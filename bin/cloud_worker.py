@@ -966,8 +966,11 @@ def cmd_read(args, runner, now):
     engine, state, config = H["build_engine"](runner, now, "cli", writable=False)
     if record is not None:
         session = _session_of(record)
-        with Cluster() as cluster, tunnel(cluster, record) as live:
-            messages = remote_v2(state, live, config["call_timeout_seconds"]).message_list(session, limit=limit, order="desc") or []
+        try:
+            with Cluster() as cluster, tunnel(cluster, record) as live:
+                messages = remote_v2(state, live, config["call_timeout_seconds"]).message_list(session, limit=limit, order="desc") or []
+        except CloudError as err:
+            return _read_stopped_run(args.name, record, err, state, runner, now)
         for message in reversed([m for m in messages if isinstance(m, dict)]):
             print(message_line(message))
         return H["EXIT_OK"]
