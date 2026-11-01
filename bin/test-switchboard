@@ -79941,12 +79941,12 @@ class TestHoldQueue(Base):
         self.assertEqual(self.queued("nobody") + self.queued("platform"), [])
         self.assertEqual(sb.load_module("queued_sends").recipients(self.world.state), [])
 
-    def test_a_queue_file_nested_deeper_than_the_bound_reads_as_empty(self):
+    def test_a_queue_file_nested_deeper_than_the_bound_is_unreadable_not_empty(self):
         hq = sb.load_module("queued_sends")
         file = Path(self.world.state) / "hold-queue-deep.json"
         depth = sb.load_module("record_json").RECORD_MAX_DEPTH + 5
         file.write_text('{"items": ' + "[" * depth + "]" * depth + "}")
-        self.assertEqual(hq._read(file), {"seq": 0, "items": [], "delivered": []})
+        self.assertIsNone(hq._read(file))   # present but unreadable: never read as an empty queue (#1400)
 
     def test_an_interrupt_send_to_a_held_pane_stays_refused_and_a_plain_send_is_queued(self):
         self.world.add_agent("helper", fleet={"role": "coder", "reports_to": "coder"})
