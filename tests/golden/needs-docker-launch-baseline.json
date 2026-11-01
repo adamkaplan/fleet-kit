@@ -1,0 +1,12 @@
+{
+  "cloud_unmarked_brief": {
+    "exit": 0,
+    "stdout": "{\"cloud\": true, \"name\": \"coder7\", \"runtime_id\": \"pod/coder7-7f9c\", \"session\": \"ses_remote1\", \"url\": \"http://127.0.0.1:PORT\"}\n",
+    "stderr": "fleet-switchboard: cloud settings from environment\npreflight: preflight ok: deletion, non_fast_forward, pull_request\n"
+  },
+  "local_launch": {
+    "exit": 0,
+    "stdout": "{\"name\": \"coder7\", \"pane\": \"p1\", \"session\": \"ses_l\", \"tab\": \"t1\"}\n",
+    "stderr": "fleet-switchboard: memory test not available: launching\nfleet-switchboard: no checkpoint reminders: no --checkpoint/--overdue and the brief's CHECKPOINT line could not be read as 'at <N> minutes ... overdue at <M>'\n"
+  }
+}

@@ -1,0 +1,156 @@
+#!/usr/bin/env python3
+"""new-module-demands: what the guards will demand of a NEW file under bin/, printed before the build starts (#1620).
+
+    tools/new-module-demands [--root DIR] bin/x.py [bin/y.py ...]
+
+One block per file: `guards:` (the classes `preflight-pr` runs for a new bin file), `authority code:` (yes or no, with what was found), `matrix:` (the lines then
+demanded, with the JSON path of each list), `units:` (the row of the Units table of docs/architecture.md) and `closure:` (the state of `tools/derive-closure --check`).
+Exit 0 always for a block (it informs); exit 2 with one plain line for a path that is not under bin/ or cannot be read.
+
+Reads, never types: the guard rows from NEW_BIN_GUARDS (bin/path_suites.py, loaded by path), the vocabulary and the role literals from
+`owner_hold.authority_modules` of docs/review-laws/impact-matrix.json, the list paths from the matrix keys, the units rows from docs/architecture.md.
+It writes nothing, runs no guard and makes no GitHub call; the guard stays the authority and decides. `--root DIR` says where the named bin/ files are
+(default: this repository); every source above is always read from this repository.
+
+The two detection rules are a DOCUMENTED COPY of the authority-modules guard class (tests/switchboard/test_cases_03.py), written with ast:
+  1. a function (def or async def) whose name, split at underscores after stripping them, has a word of the vocabulary;
+  2. a comparison (==, !=, in, not in) with a role literal (a string, or a tuple, list or set of strings) on either side.
+tests/switchboard/test_new_module_demands.py pins that the copy and the guard name the same modules.
+
+When the file has authority code the tool proposes the HELD entries (top tier path of class authority AND a floor glob), never the exempt entry:
+an exemption needs a reason a reviewer can verify, and a gate that refuses merges is authority. Standard library only."""
+import ast
+import importlib.util
+import json
+import os
+import re
+import subprocess
+import sys
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+MATRIX = "docs/review-laws/impact-matrix.json"
+UNITS_HEAD = "| Unit | Layer | Job | Also may use |"
+
+
+class Bad(Exception):
+    pass
+
+
+def load_by_path(path, name):
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _strings(node):
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        yield node.value
+    elif isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+        for item in node.elts:
+            yield from _strings(item)
+
+
+def authority_code(source, vocabulary, literals):
+    """(function names hitting the vocabulary, role literals compared) for one module's source: the two rules of the guard."""
+    words, wanted = set(vocabulary), set(literals)
+    tree = ast.parse(source)
+    names = sorted({n.name for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and words & set(n.name.strip("_").split("_"))})
+    hits = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Compare):
+            for side in [node.left] + list(node.comparators):
+                hits |= wanted & set(_strings(side))
+    return names, sorted(hits)
+
+
+def neighbour(items, entry):
+    """The entry of `items` that would sit just before `entry` in sorted order, for a mid-list suggestion (none: the list is empty)."""
+    before = [i for i in items if isinstance(i, str) and i.startswith("bin/") and i < entry]
+    return max(before) if before else (items[0] if items else None)
+
+
+def unit_rows(text):
+    """The rows of the Units table of docs/architecture.md: [(unit file, the whole row)]."""
+    rows, inside = [], False
+    for line in text.splitlines():
+        if line.strip() == UNITS_HEAD:
+            inside = True
+        elif inside and line.startswith("| `"):
+            rows.append((line.split("`")[1], line))
+        elif inside and not line.startswith("|"):
+            break
+    return rows
+
+
+def unit_row(path):
+    return "| `%s` | <layer 0-6> | <the one job of the module> | |" % os.path.basename(path)
+
+
+def closure_state():
+    done = subprocess.run([sys.executable, os.path.join(ROOT, "tools", "derive-closure"), "--check"], capture_output=True, text=True, cwd=ROOT)
+    first = ((done.stdout or done.stderr).strip().splitlines() or ["(no output)"])[0]
+    word = {0: "ok", 1: "differs"}.get(done.returncode, "could not run")
+    return "derive-closure --check: %s (exit %d): %s" % (word, done.returncode, first)
+
+
+def block(path, source, sources, closure):
+    guards, matrix, units_text = sources
+    names, literals = authority_code(source, matrix["owner_hold"]["authority_modules"]["vocabulary"], matrix["owner_hold"]["authority_modules"]["role_literals"])
+    out = ["%s:" % path, "  guards: %d classes run for a new file under bin/:" % len(guards)]
+    out += ["    - %s: %s" % (g[0], g[4]) for g in guards]
+    found = bool(names or literals)
+    if found:
+        out.append("  authority code: yes (functions: %s; role literals compared: %s)" % (", ".join(names) or "none", ", ".join(literals) or "none"))
+        top = matrix["owner_hold"]["top_tier_paths"]
+        floor_repo = sorted(matrix["owner_hold"]["floor"])[0]
+        floor = matrix["owner_hold"]["floor"][floor_repo]["globs"]
+        out.append("  matrix: two entries are demanded, both (the guard lists the module; a top tier path must also be a floor glob):")
+        out.append("    1. add \"%s\" to owner_hold.top_tier_paths.authority in %s (after \"%s\")" % (path, MATRIX, neighbour(top["authority"], path)))
+        out.append("    2. add \"%s\" to owner_hold.floor[\"%s\"].globs in %s (after \"%s\")" % (path, floor_repo, MATRIX, neighbour(floor, path)))
+        out.append("    (not the owner_hold.authority_modules.exempt entry: a file with authority code is listed, never exempted)")
+    else:
+        out.append("  authority code: no")
+        out.append("  matrix: no matrix line is demanded")
+    rows = unit_rows(units_text)
+    before = [r for r in rows if r[0] < os.path.basename(path)]
+    out.append("  units: add this row to the Units table of docs/architecture.md (header `%s`, rows sorted by name), after the row of `%s`:" % (UNITS_HEAD, max(r[0] for r in before) if before else "(first row)"))
+    out.append("    " + unit_row(path))
+    out.append("  closure: " + closure)
+    return "\n".join(out)
+
+
+def main(argv):
+    args, root = list(argv), ROOT
+    if args[:1] == ["--root"]:
+        if len(args) < 2:
+            print("new-module-demands: --root needs a directory")
+            return 2
+        root, args = args[1], args[2:]
+    if not args:
+        print("usage: new-module-demands [--root DIR] bin/x.py [bin/y.py ...]")
+        return 2
+    sources = {}
+    for path in args:
+        if not re.match(r"^bin/[^/]+$", path) or ".." in path:
+            print("new-module-demands: %s is not a file directly under bin/" % path)
+            return 2
+        try:
+            with open(os.path.join(root, path), encoding="utf-8") as handle:
+                sources[path] = handle.read()
+            ast.parse(sources[path])
+        except (OSError, UnicodeDecodeError, SyntaxError, ValueError):
+            print("new-module-demands: %s cannot be read as a python file" % path)
+            return 2
+    guards = load_by_path(os.path.join(ROOT, "bin", "path_suites.py"), "path_suites_for_demands").NEW_BIN_GUARDS
+    with open(os.path.join(ROOT, MATRIX), encoding="utf-8") as handle:
+        matrix = json.load(handle)
+    with open(os.path.join(ROOT, "docs", "architecture.md"), encoding="utf-8") as handle:
+        units_text = handle.read()
+    closure = closure_state()
+    print("\n".join(block(p, sources[p], (guards, matrix, units_text), closure) for p in args))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

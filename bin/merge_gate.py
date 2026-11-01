@@ -20,9 +20,16 @@ import fcntl
 import json
 import os
 import re
+import sys
 import tempfile
 import time
 from pathlib import Path
+
+try:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+except NameError:   # a test runs the source with no file: the module is then already importable
+    pass
+import size_ceilings   # the one reading of the size ceilings of docs/architecture.md (#1605)
 
 CONFIG_KEY = "merge_gate"   # the module declares its own configuration key (bin/fleet-switchboard config_declarations)
 CONFIG_DEFAULT = None       # None: nothing is enforced and nothing is added to the configuration
@@ -95,7 +102,7 @@ def is_held(labels):
 def read_facts(reading, gh, repo, number, conf):
     """The facts of one pull request, read now. Never raises: a read that failed is in `problems` and the decision refuses on it."""
     facts = {"repo": repo, "number": number, "problems": [], "head": None, "branch": None, "tip": None, "run_base": None, "runs": [], "pr_result": "none",
-             "failing": [], "branch_runs": [], "branch_result": "unknown", "default_branch": None, "state": None, "labels": [], "gated": False}
+             "failing": [], "branch_runs": [], "branch_result": "unknown", "default_branch": None, "state": None, "labels": [], "gated": False, "legs": (False, True, "")}
     try:
         pr = reading.read_pr(gh, repo, number)
         facts.update(head=pr["head"], branch=pr["base"], state=pr["state"], labels=pr["labels"])
@@ -110,6 +117,13 @@ def read_facts(reading, gh, repo, number, conf):
             for run in runs:
                 if reading.run_result(run) == "red":
                     facts["failing"] += ["%s / %s" % (run["workflow"], job) for job in reading.read_failing_jobs(gh, repo, run["id"])]
+        if facts["pr_result"] == "green":   # the legs are jobs of a finished run: read only then (one call per run)
+            states, later = {}, False
+            for run in runs:
+                for job in reading.read_jobs(gh, repo, run["id"]):
+                    states[job["name"]] = job["conclusion"]
+                    later = later or run.get("attempts", 1) > 1
+            facts["legs"] = judge_legs(states, later)
         bases = {r["base"] for r in runs if r["base"]}
         # the oldest base among the deciding runs: a pull request is as current as its least current run
         if runs and all(r["base"] for r in runs):
@@ -120,6 +134,43 @@ def read_facts(reading, gh, repo, number, conf):
     except reading.ReadError as err:
         facts["problems"].append(str(err))
     return facts
+
+
+# ------------------------------------------------------------------------------------------------ the macOS legs (#1235)
+# A pull request push runs the macOS legs only for a platform path or the `needs-mac` label (.github/workflows/test.yml, the `plan` job). The merge still
+# needs them green: the gate pass makes the `reopened` run (every leg, on the merge ref) and reads them here. A leg that is absent, skipped, cancelled or
+# not green is never read as green. The rule applies only where the workflow has the ubuntu legs by these names (another repository is not asked).
+
+UBUNTU_LEGS = ("test (ubuntu-latest)", "test-cloud (ubuntu-latest)")
+MAC_LEGS = ("test (macos-latest)", "test-cloud (macos-latest)")
+
+
+def judge_legs(states, later_run):
+    """(applies, ok, reading): `states` maps a leg name to its conclusion word (`success`, `skipped`, `cancelled`, `failure`, `in_progress`...); a leg not in it is
+    absent. `later_run` is true when the head had an earlier run than the one that carried the macOS legs (the gate pass's merge-ref run), so the reading says which.
+    Not applicable (applies False) when the ubuntu legs are not there at all."""
+    if not any(n in states for n in UBUNTU_LEGS):
+        return False, True, "no macOS rule for this workflow"
+    bad = ["%s %s" % (n, states.get(n) or "absent") for n in MAC_LEGS if states.get(n) != "success"]
+    if bad:
+        return True, False, "the macOS legs are not green (%s): the gate pass's run on the merge ref must report both" % "; ".join(bad)
+    return True, True, "macOS legs green on the gate pass's run on the merge ref of this head" if later_run else "macOS legs green at the head"
+
+
+def rollup_legs(newest, rollup):
+    """The same reading from gh's statusCheckRollup (G4): (applies, ok, reading). `newest` is the caller's `ci_runs.newest(rollup)` (the module the daemon
+    configured: a leg is its NEWEST check); the run id is in the check's URL."""
+    states, runs = {}, {}
+    for check in newest:
+        name = check.get("name")
+        if name in UBUNTU_LEGS + MAC_LEGS:
+            done = check.get("status") in (None, "COMPLETED")
+            states[name] = str(check.get("conclusion") or "").lower() if done else "in_progress"
+            runs[name] = (re.search(r"/runs/(\d+)", str(check.get("detailsUrl") or "")) or [None, None])[1]
+    every = {m.group(1) for c in (rollup if isinstance(rollup, list) else []) if isinstance(c, dict)
+             for m in [re.search(r"/runs/(\d+)", str(c.get("detailsUrl") or ""))] if m}
+    mac_runs = {runs[n] for n in MAC_LEGS if runs.get(n)}
+    return judge_legs(states, bool(mac_runs) and bool(every - mac_runs))
 
 
 def decide(facts, waived=False):
@@ -142,12 +193,15 @@ def decide(facts, waived=False):
         return False, "CI is red at the head %s: failing %s" % (facts["head"][:8], ", ".join(facts["failing"][:3])), None
     if facts["pr_result"] == "pending":
         return False, "CI is still running at the head %s: wait for it" % facts["head"][:8], None
+    applies, legs_ok, legs_said = facts["legs"]
+    if applies and not legs_ok:
+        return False, legs_said, "rerun" if "absent" in legs_said else None
     if not facts["run_base"]:
         return False, "the branch tip the last run was computed on is not recorded: re-run its CI", "rerun"
     if facts["run_base"] != facts["tip"]:
         return False, "%s moved after the last green run (tested on %s, tip now %s): its CI must run again on the current merge ref" % (
             facts["branch"], facts["run_base"][:8], facts["tip"][:8]), "rerun"
-    return True, "green at the head %s on the current tip %s" % (facts["head"][:8], facts["tip"][:8]), None
+    return True, "green at the head %s on the current tip %s%s" % (facts["head"][:8], facts["tip"][:8], "; " + legs_said if applies else ""), None
 
 
 def block(facts, allowed, reason, waived=False):
@@ -388,8 +442,8 @@ def gate_pass(reading, gh, conf, state, repo, number, holder, pid, clock, sleep,
         release(state, repo, facts["branch"], holder)
         return False, lines + ["the branch or the head moved while the gate ran: run it again"]
     record_pass(state, repo, number, head, tip, facts["branch"], holder, clock())
-    return True, lines + ["gate passed for %s#%d at head %s on tip %s; the lock on %s is yours until the merge returns (`merge-gate --release` frees it early)" % (
-        repo, number, head[:8], tip[:8], facts["branch"])]
+    return True, lines + ["gate passed for %s#%d at head %s on tip %s%s; the lock on %s is yours until the merge returns (`merge-gate --release` frees it early)" % (
+        repo, number, head[:8], tip[:8], "; " + facts["legs"][2] if facts["legs"][0] else "", facts["branch"])]
 
 
 def check_merge(reading, gh, conf, state, repo, number, caller, person, waived_head, clock, alive=pid_alive):
@@ -422,6 +476,9 @@ def check_merge(reading, gh, conf, state, repo, number, caller, person, waived_h
     if lock is None or stale or lock.get("holder") != caller:
         who = "nobody holds" if lock is None or stale else "%s holds" % lock.get("holder")
         return False, "merge of %s#%d refused: %s the merge lock on %s; %s" % (repo, number, who, facts["branch"], why), None
+    sizes = size_ceilings.check_merge(os.getcwd(), facts["tip"], facts["head"]) if size_ceilings.available(os.getcwd(), facts["tip"], facts["head"]) else []   # #1605
+    if sizes:
+        return False, "\n".join(["merge of %s#%d refused: it would put a file over its size ceiling in docs/architecture.md" % (repo, number)] + sizes), None
     return True, "%s %s" % (GATE_PASSED, caller), facts["head"]
 
 
