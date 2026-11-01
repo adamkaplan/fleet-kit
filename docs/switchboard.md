@@ -5919,14 +5919,14 @@ While every slot is busy it prints `heavy: waiting for a slot (3 of 3 busy: <nam
 
 The kind is read from the PROGRAM (its basename, after `python3`, `node`, `sh`, `npx`, `timeout N`, `env`, `taskpolicy`, `nice`; `-m module` names the module as the program) and the command's WHOLE option words, never from a substring of an argument: a path, a filter value or a `-c` shell string that merely contains `e2e` or `chrome` changes nothing. One table in `bin/heavy_slots.py` (`KINDS`), first match wins: **e2e** (a program whose name contains playwright, chromium, chrome, cypress, puppeteer, webdriver or e2e, or one of those as a whole word, or `--browser`), **focused** (`-k`, `--filter`, `-run`, a `file.py::name` selector, a single `test_*.py` or `*.test.*` file, `-m unittest <name>`, or `--short`), **full** (a `test-*` script, `pytest`, `-m unittest` bare or `discover`, `make test`, `npm test`, `go test`), else **other** (a shell string given to `sh -c` reads as other: ask for a ceiling by name). The defaults come from measured run times; the sample is stated, and where it is thin it says so:
 
-In a cloud worker pod (the launcher gives every worker pod `CW_AUDIT_RUNTIME_ID` beginning `pod/` and `CW_HARD_DEADLINE`) the command runs without the niceness described above: a pod has no person's machine to protect; on any other machine the command runs as described above.
-
 | Kind | Measured sample | What it showed | Default ceiling (s) |
 |---|---|---|---|
 | full | 25 CI runs (macOS and ubuntu), 7 local full-suite jobs | CI median 815 s, p95 899 s; local jobs 1801 to 7454 s with the queue wait included, a busy shared machine runs a full suite 4 to 8 times slower than CI | 5400 |
 | focused | 25 CI runs of the cloud launcher suite (30 min step limit); 199 other local jobs | launcher p95 720 s; the local p90 of non-full jobs 1020 s (thin: no record keeps a focused run's command) | 1800 |
 | e2e | 0 runs (no sample: this repository has no browser or end-to-end suite in CI) | a judgement, to be revisited when a first run is recorded | 3600 |
 | other | 199 local jobs | median 209 s, maximum 3763 s, queue wait included | 3600 |
+
+In a cloud worker pod (the launcher gives every worker pod `CW_AUDIT_RUNTIME_ID` beginning `pod/` and `CW_HARD_DEADLINE`) the command runs without the niceness described above: a pod has no person's machine to protect; on any other machine the command runs as described above.
 
 Every default is at least the repository's longest CI step limit for that kind. The hard maximum is **14400** s (4 h): it bounds a requested ceiling and every configured one (a configured value above it is refused when the configuration is read, and reads as the default if it is not). The ceiling counts wall-clock time from the slot's `since`: a machine that slept counts the sleep, and a backward clock jump delays the stop.
 
