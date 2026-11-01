@@ -1717,7 +1717,7 @@ class TestNeedsDocker(Base):   # #1488
             return self.main(*argv, *(["--cloud"] if cloud else ["--terminal", "--workspace", "w1", "--dir", str(self.home)]))
 
     def seen(self, res):
-        return {"exit": res[0], "stdout": re.sub(r"(127\.0\.0\.1:)\d+", r"\1PORT", res[1]), "stderr": "".join(l + "\n" for l in res[2].splitlines() if l.startswith(("fleet-switchboard:", "preflight:")))}
+        return {"exit": res[0], "stdout": re.sub(r"(127\.0\.0\.1:)\d+", r"\1PORT", res[1]), "stderr": re.sub(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", "TIME", "".join(l + "\n" for l in res[2].splitlines() if l.startswith(("fleet-switchboard:", "preflight:"))))}
 
     def test_s2_a_docker_brief_without_stack_is_refused_before_any_pod(self):
         code, out, err = self.run_launch("Build.\n" + self.LINE + "\n")
