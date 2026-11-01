@@ -12825,14 +12825,15 @@ class GitHubHub:
                 owner = self._resolve(item.repo, candidates[:], [("issue", candidates[0])], agents, now, seen)
                 if owner:
                     return owner, "reference"
-        if item.key.startswith("github.stage:"):   # #1575: a pull request of a cloud worker's branch goes to the lane that launched it (#1407's table, by name)
+        if item.key.startswith("github.stage:"):   # #1575: a pull request of a cloud worker's branch goes to the lane that launched it (#1740: engine.cloud_watch records)
             for number in item.numbers:
                 pr = seen.get(number)
                 if pr is None:
                     pr = self._read_one(item.repo, "pulls/%d" % number, now)
                 ref = ((pr or {}).get("head") or {}).get("ref") if isinstance(pr, dict) else None
-                for worker, lane, launch_head in (self._push_workers_load(now).get((item.repo, ref)) or []) if isinstance(ref, str) else []:
-                    if lane in agents:
+                for rec in ((getattr(self.engine, "cloud_watch", None) or {}).get("records") or []) if isinstance(ref, str) else []:   # #1740's records: the lane that launched the worker
+                    lane = rec.get("reports_to") if isinstance(rec, dict) else None
+                    if rec.get("repo") == item.repo and rec.get("branch") == ref and isinstance(lane, str) and lane in agents:
                         return lane, "cloud"
         return None, None
 
