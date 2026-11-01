@@ -454,7 +454,7 @@ class TestLockAndRecord(Base):
         def hook():
             def appender():
                 cw.write_audit(self.audit, {"action": "stop", "n": 3000})
-            thread = threading.Thread(target=appender)
+            thread = threading.Thread(target=appender, daemon=True)
             thread.start()
             threads.append(thread)
             time.sleep(0.3)
@@ -585,7 +585,7 @@ class TestLockAndRecord(Base):
             while not stop_flag:
                 n += 1
                 EA._write_count(count_file, {"applied": n, "chain": None})
-        thread = _t.Thread(target=writer)
+        thread = _t.Thread(target=writer, daemon=True)
         thread.start()
         empty = 0
         try:
