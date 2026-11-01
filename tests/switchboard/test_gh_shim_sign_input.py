@@ -1518,7 +1518,9 @@ def reader_failures(source):
 
 
 class TestApiReadersAreViews(unittest.TestCase):
-    source = (SHIM_DIR / "gh").read_text()
+    @classmethod
+    def setUpClass(cls):
+        cls.source = (SHIM_DIR / "gh").read_text()   # at run time, not at import: a copy of the tests without shims/ must still import
 
     def test_every_reader_agrees_with_the_parser(self):
         failures = reader_failures(self.source)
@@ -1660,7 +1662,9 @@ def hold_endpoint_failures(hold_source):
 
 
 class TestGhHoldIsAView(unittest.TestCase):
-    source = (SHIM_DIR / "gh_hold.py").read_text()
+    @classmethod
+    def setUpClass(cls):
+        cls.source = (SHIM_DIR / "gh_hold.py").read_text()
 
     def test_table_forms_through_the_hold_probe(self):
         self.assertEqual(hold_endpoint_failures(self.source), [])
@@ -1811,6 +1815,83 @@ class TestGhShimNestedAndQueryBodies(unittest.TestCase):
         self.addCleanup(rig.close)
         seen = nested_failures(rig)
         self.assertIn("a nested review comment body went out unsigned", seen)
+
+
+def encoded_query_failures(rig):
+    """#1696 S27: the failures seen for a body written in the query string with an encoded or `;`-separated key (empty when each is refused)."""
+    bad = []
+    for path in ("repos/o/r/issues/1/comments?%62ody=zz", "repos/o/r/pulls/1/reviews?comments%5B%5D%5Bbody%5D=zz", "repos/o/r/issues/1/comments?x=1;body=zz"):
+        done, calls = rig.run("api", "-X", "POST", path)
+        lines = [l for l in done.stderr.splitlines() if l.startswith("gh:")]
+        if calls or done.returncode != 1 or len(lines) != 1 or not lines[0].startswith("gh: refused:"):
+            bad.append("an encoded query key went out unsigned")
+    return bad
+
+
+class TestGhShimEncodedQueryAndLabelDelete(unittest.TestCase):
+    """#1696 PC-8: encoded and `;`-separated query keys (S27) and the one allow-listed label delete (S29)."""
+
+    def setUp(self):
+        self.rig = hermetic_rig()
+        self.addCleanup(self.rig.close)
+        self.source = (SHIM_DIR / "gh").read_text()
+
+    def refused(self, done, calls):
+        self.assertEqual(done.returncode, 1)
+        gh_lines = [l for l in done.stderr.splitlines() if l.startswith("gh:")]
+        self.assertEqual(len(gh_lines), 1, done.stderr)
+        self.assertTrue(gh_lines[0].startswith("gh: refused:"), done.stderr)
+        self.assertEqual(calls, [])
+
+    def test_s27_encoded_and_semicolon_query_keys_are_refused(self):
+        refused = 0
+        for path in ("repos/o/r/issues/1/comments?%62ody=zz", "repos/o/r/pulls/1/reviews?comments%5B%5D%5Bbody%5D=zz", "repos/o/r/issues/1/comments?x=1;body=zz"):
+            with self.subTest(path=path):
+                self.refused(*self.rig.run("api", "-X", "POST", path))
+                refused += 1
+        self.assertEqual(refused, 3)
+
+    def test_s27_the_plain_forms_are_still_refused(self):
+        for path in ("repos/o/r/issues/1/comments?body=zz", "repos/o/r/issues/1/comments?x=1&body=zz"):
+            with self.subTest(path=path):
+                self.refused(*self.rig.run("api", "-X", "POST", path))
+
+    def test_s27_a_query_without_a_body_key_passes_signed_once(self):
+        done, calls = self.rig.run("api", "repos/o/r/issues/1/comments?x=1", "-f", "body=hi")
+        self.assertEqual(len(calls), 1, done.stderr)
+        self.assertEqual(sum(a.count(SIGNED) for a in calls[0]["argv"]), 1)
+
+    def test_s27_a_get_with_the_same_query_is_unchanged(self):
+        for path in ("repos/o/r/issues/1/comments?%62ody=zz", "repos/o/r/issues/1/comments?x=1;body=zz"):
+            with self.subTest(path=path):
+                done, calls = self.rig.run("api", path)
+                self.assertEqual(len(calls), 1, done.stderr)
+                self.assertEqual(calls[0]["argv"], ["api", path])
+
+    def test_s27_control_the_unmutated_shim_passes(self):
+        self.assertEqual(encoded_query_failures(self.rig), [])
+
+    def test_s27_a_mutant_that_compares_the_raw_key_is_seen(self):
+        self.assertEqual(encoded_query_failures(self.rig), [])   # control first
+        old = 'urllib.parse.unquote(part.partition("=")[0]) for part in re.split(r"[&;]", query)'
+        self.assertEqual(self.source.count(old), 1, "the mutant's anchor is gone (the query keys of api_decide)")
+        rig = Rig(self.source.replace(old, 'part.partition("=")[0] for part in query.split("&")', 1))
+        self.addCleanup(rig.close)
+        self.assertIn("an encoded query key went out unsigned", encoded_query_failures(rig))
+
+    def test_s29_the_delete_of_a_repository_label_passes_unchanged(self):
+        argv = ("api", "-X", "DELETE", "repos/o/r/labels/NAME")
+        done, calls = self.rig.run(*argv)
+        self.assertEqual(len(calls), 1, done.stderr)
+        self.assertEqual(calls[0]["argv"], list(argv))
+
+    def test_s29_its_neighbours_are_refused(self):
+        refused = 0
+        for method, path in (("PATCH", "repos/o/r/labels/NAME"), ("DELETE", "repos/o/r/labels"), ("DELETE", "repos/o/r/labels/a/b"), ("PUT", "repos/o/r/labels/NAME")):
+            with self.subTest(method=method, path=path):
+                self.refused(*self.rig.run("api", "-X", method, path))
+                refused += 1
+        self.assertEqual(refused, 4)
 
 
 if __name__ == "__main__":
