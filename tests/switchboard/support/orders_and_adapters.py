@@ -80,15 +80,19 @@ class FakeGhPr:
     """A `gh` runner for `pr view`: answers per PR number from `answers` (a (code, stdout, stderr) tuple, or an
     exception); records every call. Reaching for anything else fails the test."""
 
+    run_base = "t" * 40   # #1755: the base the fake's run list records; a test sets another to make the run stale
+
     def __init__(self, answers=None):
         self.answers, self.calls = answers or {}, []
 
     def __call__(self, argv, **kwargs):
         if argv[1] == "api" and "/actions/runs" in argv[2]:   # #1755: the run list and the base's tip of the current-tip rule (not recorded in `calls`)
-            run = {"id": 1, "head_sha": re.search(r"head_sha=(\w+)", argv[2]).group(1), "status": "completed", "conclusion": "success", "pull_requests": [{"number": n, "base": {"sha": "t" * 40}} for n in (7, 8)]}
+            run = {"id": 1, "head_sha": re.search(r"head_sha=(\w+)", argv[2]).group(1), "status": "completed", "conclusion": "success", "pull_requests": [{"number": n, "base": {"sha": self.run_base}} for n in (7, 8)]}
             return subprocess.CompletedProcess(argv, 0, json.dumps({"workflow_runs": [run]}), "")
         if argv[1] == "api" and "/git/ref/heads/" in argv[2]:
             return subprocess.CompletedProcess(argv, 0, json.dumps({"object": {"sha": "t" * 40}}), "")
+        if argv[1] == "api" and argv[2].endswith("..." + "t" * 40):
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"ahead_by": 3}), "")
         self.calls.append((list(argv), kwargs))
         assert argv[1:3] == ["pr", "view"], argv
         answer = self.answers[int(argv[3])]

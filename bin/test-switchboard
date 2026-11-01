@@ -29278,6 +29278,8 @@ class LedgerBase(Base):
 
     run_base = "t" * 40   # #1755: the base the fake's run list records; a test sets another to make the run stale
 
+    run_base = "t" * 40   # #1755: the base the fake's run list records; a test sets another to make the run stale
+
     def route(self, argv, **kwargs):
         if argv[0] != FAKE_GH:
             return self.world.route(argv, **kwargs)
@@ -29288,10 +29290,12 @@ class LedgerBase(Base):
         if argv[1] == "pr" and argv[2] == "view":
             return subprocess.CompletedProcess(argv, 0, json.dumps(self.pr), "")
         path = argv[2]
-        if "/comments" in path:
+                   "pull_requests": [{"number": n, "base": {"sha": self.run_base}} for n in (9, 11)]}
             return subprocess.CompletedProcess(argv, 0, json.dumps(self.comments if "&page=1" in path else []), "")
                    "pull_requests": [{"number": n, "base": {"sha": self.run_base}} for n in (9, 11)]}
             return subprocess.CompletedProcess(argv, 0, json.dumps(self.plan_issue), "")
+        if "/compare/" in path and path.endswith("..." + "t" * 40):
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"ahead_by": 3}), "")
                    "pull_requests": [{"number": n, "base": {"sha": self.run_base}} for n in (9, 11)]}
             run = {"id": 1, "head_sha": self.pr["headRefOid"], "status": "completed", "conclusion": "success",
         if "/compare/" in path and path.endswith("..." + "t" * 40):
@@ -31619,6 +31623,13 @@ class TestPlanGatesCheck(LedgerBase):
 
     def test_a_repo_not_listed_is_not_checked_and_says_nothing(self):
         self.set_gates({"acme/other": {"mode": "enforce"}})
+    def test_a_stale_run_makes_g4_missing_with_the_stale_line(self):   # #1755; the control is the test below (the default run_base is the tip: it allows)
+        self.all_proven()
+        self.run_base = "s" * 40
+        row = next(r for r in json.loads(self.run_as("coder", "gates", self.PR, "--json")[1])["gates"] if r["gate"] == "G4")
+        self.assertEqual(row["status"], "missing", "the G4 row is missing for a stale run")
+        self.assertEqual(row["missing"], ["stale: 3 commits behind (CI ran on ssssssss, the tip is tttttttt): close and reopen the pull request for a fresh run"], "the G4 row says the stale line")
+
         code, out, err = self.check()
         self.assertEqual((code, out["verdict"], out["reason"]), (0, "allow", "not opted in"))
         self.assertEqual(self.events("gate.would_refuse") + self.events("gate.refused"), [])
@@ -39159,6 +39170,14 @@ class TestCiRecordPass(LedgerBase):
         engine = self.world.new_engine("daemon")
         engine.hub, engine.gh_runner = self.hub, self.route
         engine.config = sb.load_config()
+    def test_a_stale_run_records_no_verdict_and_says_the_stale_line(self):   # #1755; the control is the test above (the default run_base is the tip: it records)
+        self.run_base = "s" * 40
+        self.go()
+        self.assertEqual(self.verdicts(), [], "ci-record records no verdict for a stale run")
+        code, out, err = self.run_as("coder", "gates", "ci-record", self.PR)
+        self.assertIn("stale: 3 commits behind (CI ran on ssssssss, the tip is tttttttt): close and reopen the pull request for a fresh run", out + err, "ci-record says the stale line")
+        self.assertEqual(self.verdicts(), [], "ci-record records no verdict for a stale run")
+
         engine.state_dir = self.world.state
         return engine
 
@@ -51146,6 +51165,12 @@ class TestPrNotices(DecisionsBase):
         self.ask_the_boss("Which database?")
         (self.world.state / sb.PR_NOTICES).write_text("{not json")
         decisions, errors = self.decisions()
+    def test_a_stale_run_reads_stale_in_the_pull_request_notice(self):   # #1755; the control is test_a_failed_read_keeps_the_last_facts_marked_stale_and_never_drops_the_notice above (the default run_base is the tip: ci is green)
+        self.gh.run_base = "s" * 40
+        self.notify()
+        (entry,) = self.notices()
+        self.assertEqual(entry["ci"], "stale: 3 behind", "the pull request notice reads stale: 3 behind")
+
         self.assertEqual([d["kind"] for d in decisions], ["report"])
         self.assertEqual([e["source"] for e in errors], ["notices"])
 
@@ -51739,6 +51764,8 @@ BASELINE_NODE_PRESENT = bool(NODE)
 
 def baseline_assign_ids(items, repos=None):
     """ADAPTER: ids for items {seed, ask, agent, bare, since, repo}, in order (today sb.assign_decision_ids)."""
+    run_base = "t" * 40   # #1755: the base the fake's run list records; a test sets another to make the run stale
+
     return sb.assign_decision_ids(items, repos)
 
 
@@ -51753,10 +51780,12 @@ def baseline_attach_hub(engine, runner, now):
     does for its own engine (today a GitHubHub filled by read_awaiting)."""
     hub = sb.GitHubHub(engine.config, engine.state_dir, None, runner, sb.spawn_forwarder, now, "cli")
     hub.engine, engine.hub = engine, hub
-    engine.gh_runner = runner  # the notices' `gh pr view` reads
+            run = {"id": 1, "head_sha": re.search(r"head_sha=(\w+)", argv[2]).group(1), "status": "completed", "conclusion": "success", "pull_requests": [{"number": n, "base": {"sha": self.run_base}} for n in self.prs]}
     for repo in sb.decision_repos(engine):
         hub.read_awaiting(repo, now())
 
+        if argv[0] == FAKE_GH and argv[1] == "api" and argv[2].endswith("..." + "t" * 40):
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"ahead_by": 3}), "")
 
     run_base = "t" * 40   # #1755: the base the fake's run list records; a test sets another to make the run stale
 
@@ -52886,6 +52915,15 @@ class TestDecisionBaselineSourceErrors(BaselineWorld):
 
     def test_a_source_that_raises_is_an_error_entry_and_the_others_still_list(self):
         self.gh.issue(API, 2, "An issue", labels=["me:awaiting-cos"])
+    def test_a_stale_run_reads_stale_in_the_notice_facts(self):   # #1755; the control is test_a_notice_its_facts_and_its_life above (the default run_base is the tip: its golden reads "green")
+        self.run_base = "s" * 40
+        self.prs[7] = pr_view_json()
+        self.step("api-coder", "notice", "pr", "acme/api#7", "ready", "for", "review")
+        self.daemon_pass()
+        (notice,) = [d for d in self.file_body()["decisions"] if d["kind"] == "notice"]
+        self.assertEqual(json.dumps(notice).count("stale: 3 behind"), 1, "the panel notice facts read stale: 3 behind")
+        self.assertNotIn('"ci": "green"', json.dumps(notice), "the panel notice facts do not read green")
+
         self.say("api-orch", "question", "a report")
         self.ask_permission("api-coder")
         self.prs[7] = pr_view_json()
@@ -78395,9 +78433,11 @@ class TestProofNamesFilesByDefault(LedgerBase):
                   {"seq": 2, "kind": "proof", "pr": self.PR, "scenario": "B", "plan_hash": "h", "head": "1" * 40, "result": "fail", "files": ["b.py"]},
                   {"seq": 3, "kind": "carried", "pr": self.PR, "proof": 2, "scenario": "B", "plan_hash": "h", "old_head": "1" * 40, "new_head": self.NEW}]
         for sid in "AB":
-            line = sb.plan_ledger.head_view(sid, "tester", failed, self.PR, "h", self.NEW, lambda old: ["z.py"])
+                                           "pull_requests": [{"number": n, "base": {"sha": self.run_base}} for n in (9, 11)]}]}
             self.assertIn("says fail", line)
             self.assertNotIn("proven", line)
+            elif path.endswith("..." + "t" * 40):
+                body = {"ahead_by": 3}
             self.assertNotIn("carried (", line)
         self.assertIn("A: proven at this head", self.views()["A"])
 
