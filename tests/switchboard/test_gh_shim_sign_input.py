@@ -1689,5 +1689,129 @@ class TestGhHoldIsAView(unittest.TestCase):
         self.assertEqual(hold_endpoint_failures(self.source), [])
 
 
+def nested_failures(rig):
+    """#1696 S23/S26: the failures seen for inline review comment bodies (empty when each is signed or refused)."""
+    bad = []
+    reviews = "repos/o/r/pulls/1/reviews"
+    for flag in ("-f", "-F", "--raw-field"):
+        done, calls = rig.run("api", reviews, flag, "event=COMMENT", flag, "comments[][path]=a", flag, "comments[][body]=x", flag, "comments[][position]=1")
+        lines = [l for l in done.stderr.splitlines() if l.startswith("gh:")]
+        if calls or done.returncode != 1 or len(lines) != 1 or not lines[0].startswith("gh: refused:"):
+            bad.append("a nested review comment body went out unsigned")
+    payload = json.dumps({"event": "COMMENT", "comments": [{"path": "a", "body": "x", "position": 1}, {"path": "b", "body": "y", "position": 2}]})
+    path = rig.home / "nested.json"
+    path.write_text(payload)
+    done, calls = rig.run("api", reviews, "--input", str(path))
+    if len(calls) != 1:
+        bad.append("a nested review comment body went out unsigned")
+    else:
+        data = json.loads(calls[0]["files"][calls[0]["argv"][-1]])
+        if [c["body"].count(SIGNED) for c in data["comments"]] != [1, 1] or data["event"] != "COMMENT" or [c["path"] for c in data["comments"]] != ["a", "b"]:
+            bad.append("a nested review comment body went out unsigned")
+    done, calls = rig.run("api", reviews, "--input", "-", stdin=payload)
+    if len(calls) != 1:
+        bad.append("a nested review comment body went out unsigned")
+    else:
+        data = json.loads(calls[0]["stdin"])
+        if [c["body"].count(SIGNED) for c in data["comments"]] != [1, 1] or data["event"] != "COMMENT":
+            bad.append("a nested review comment body went out unsigned")
+    return bad
+
+
+class TestGhShimNestedAndQueryBodies(unittest.TestCase):
+    """#1696 PC-7: inline review comment bodies (M1), a body in the URL query string (M2), a body key in any case and a non-object --input (L1)."""
+
+    def setUp(self):
+        self.rig = hermetic_rig()
+        self.addCleanup(self.rig.close)
+        self.source = (SHIM_DIR / "gh").read_text()
+
+    def file(self, text, name="in.json"):
+        path = self.rig.home / name
+        path.write_text(text)
+        return str(path)
+
+    def refused(self, done, calls):
+        self.assertEqual(done.returncode, 1)
+        gh_lines = [l for l in done.stderr.splitlines() if l.startswith("gh:")]
+        self.assertEqual(len(gh_lines), 1, done.stderr)
+        self.assertTrue(gh_lines[0].startswith("gh: refused:"), done.stderr)
+        self.assertEqual(calls, [])
+
+    def test_s23_inline_comment_fields_are_refused(self):
+        reviews = "repos/o/r/pulls/1/reviews"
+        refused = 0
+        for flag in ("-f", "-F", "--raw-field"):
+            with self.subTest(flag=flag):
+                self.refused(*self.rig.run("api", reviews, flag, "comments[][path]=a", flag, "comments[][body]=x", flag, "comments[][position]=1"))
+                refused += 1
+        self.assertEqual(refused, 3)
+
+    def test_s23_inline_comment_input_file_and_stdin_are_signed_once_each(self):
+        payload = json.dumps({"event": "COMMENT", "comments": [{"path": "a", "body": "x", "position": 1}, {"path": "b", "body": "y", "position": 2}]})
+        reviews = "repos/o/r/pulls/1/reviews"
+        done, calls = self.rig.run("api", reviews, "--input", self.file(payload))
+        self.assertEqual(len(calls), 1, done.stderr)
+        data = json.loads(calls[0]["files"][calls[0]["argv"][-1]])
+        self.assertEqual([c["body"].count(SIGNED) for c in data["comments"]], [1, 1])
+        self.assertEqual(data["event"], "COMMENT")
+        self.assertEqual([c["path"] for c in data["comments"]], ["a", "b"])
+        done, calls = self.rig.run("api", reviews, "--input", "-", stdin=payload)
+        self.assertEqual(len(calls), 1, done.stderr)
+        data = json.loads(calls[0]["stdin"])
+        self.assertEqual([c["body"].count(SIGNED) for c in data["comments"]], [1, 1])
+        self.assertEqual(data["event"], "COMMENT")
+        self.assertEqual([c["path"] for c in data["comments"]], ["a", "b"])
+
+    def test_s23_control_no_inline_comments_passes_unchanged(self):
+        done, calls = self.rig.run("api", "repos/o/r/pulls/1/reviews", "-f", "event=COMMENT", "-f", "body=x")
+        self.assertEqual(len(calls), 1, done.stderr)
+        self.assertIn("event=COMMENT", calls[0]["argv"])
+        self.assertEqual(sum(a.count(SIGNED) for a in calls[0]["argv"]), 1)
+        done, calls = self.rig.run("api", "repos/o/r/pulls/1/reviews", "--input", "-", stdin='{"event":"APPROVE"}')
+        self.assertEqual(calls[0]["stdin"], '{"event":"APPROVE"}')
+
+    def test_s24_a_query_string_body_on_a_write_is_refused(self):
+        refused = 0
+        for key in ("body", "Body"):
+            with self.subTest(key=key):
+                self.refused(*self.rig.run("api", "-X", "POST", "repos/o/r/issues/1/comments?%s=zz" % key))
+                refused += 1
+        self.assertEqual(refused, 2)
+
+    def test_s24_a_get_with_the_same_query_is_unchanged(self):
+        argv = ("api", "repos/o/r/issues/1/comments?body=zz")
+        done, calls = self.rig.run(*argv)
+        self.assertEqual(len(calls), 1, done.stderr)
+        self.assertEqual(calls[0]["argv"], list(argv))
+
+    def test_s25_a_Body_key_is_signed_under_its_own_key_once(self):
+        done, calls = self.rig.run("api", "repos/o/r/issues/1/comments", "--input", self.file('{"Body":"x"}'))
+        self.assertEqual(len(calls), 1, done.stderr)
+        data = json.loads(calls[0]["files"][calls[0]["argv"][-1]])
+        self.assertEqual(list(data), ["Body"])
+        self.assertEqual(data["Body"].count(SIGNED), 1)
+
+    def test_s25_an_array_and_a_scalar_are_refused(self):
+        for text in ('[{"body":"x"}]', '"x"'):
+            with self.subTest(text=text):
+                self.refused(*self.rig.run("api", "repos/o/r/issues/1/comments", "--input", self.file(text)))
+
+    def test_s25_a_nested_non_string_body_is_refused(self):
+        self.refused(*self.rig.run("api", "repos/o/r/pulls/1/reviews", "--input", self.file('{"comments":[{"path":"a","body":5}]}')))
+
+    def test_s26_control_the_unmutated_shim_passes(self):
+        self.assertEqual(nested_failures(self.rig), [])
+
+    def test_s26_a_mutant_that_ignores_nested_bodies_is_seen(self):
+        self.assertEqual(nested_failures(self.rig), [])   # control first
+        old = "        for item in data[key]:\n"
+        self.assertEqual(self.source.count(old), 1, "the mutant's anchor is gone (the nested handling of input_call)")
+        rig = Rig(self.source.replace(old, "        for item in []:\n", 1))
+        self.addCleanup(rig.close)
+        seen = nested_failures(rig)
+        self.assertIn("a nested review comment body went out unsigned", seen)
+
+
 if __name__ == "__main__":
     unittest.main()
