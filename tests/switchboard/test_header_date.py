@@ -102,3 +102,84 @@ class TestHeaderDate(unittest.TestCase):
 
     def test_u1_without_a_delivery_time_the_text_has_no_header_time(self):
         self.assertNotIn("sent", sb.compose("platform", [header_fact("send:c:1", 0)])[0].splitlines()[0])
+
+
+def mutant_of(function, old, new):
+    """(control, mutant) copies of a function of decision.py: the mutation is one textual replacement, asserted applied."""
+    source = inspect.getsource(function)
+    mutated = source.replace(old, new)
+    assert mutated != source and source.count(old) == 1, "the mutation is applied once: " + old
+    made = []
+    for text in (source, mutated):
+        world = dict(vars(sb))
+        exec(text, world)
+        made.append(world[function.__name__])
+    return made
+
+
+class TestHeaderDateCallSites(unittest.TestCase):
+    D = MID + 86400 + 14 * 3600 + 23 * 60   # 2027-01-16 14:23Z
+    PREV = MID + 15 * 3600 + 15 * 60        # 2027-01-15 15:15Z
+
+    def head(self, compose, facts, delivered=None):
+        return compose("platform", facts, delivered=self.D if delivered is None else delivered)[0].splitlines()[0]
+
+    def check_a(self, compose):
+        facts = [sb.Fact("reminder:1", "platform", "reminder", "r", self.PREV, batch=False),
+                 sb.Fact("reminder:2", "platform", "reminder", "r", self.D - 600, batch=False)]
+        head = self.head(compose, facts)
+        assert "sent 2027-01-15 15:15Z-14:13Z, delivered 14:23Z" in head, "a non-late range dates its oldest member: " + head
+
+    def check_b(self, compose):
+        fact = sb.Fact("send:c:1", "platform", "send", "msg", self.D - 60, batch=False, sender="coder")
+        fact.supersedes = (self.PREV,)
+        head = self.head(compose, [fact])
+        assert "still waiting: sent 2027-01-15 15:15Z)" in head, "the replaced earlier message carries its date: " + head
+
+    def check_c(self, compose):
+        fact = sb.Fact("orders:1:ab:start", "platform", "orders", "approve", self.PREV, issue=1, orders=True)
+        head = self.head(compose, [fact])
+        assert "delayed: sent 2027-01-15 15:15Z, delivered 14:23Z" in head, "the single late note carries the date: " + head
+
+    def run_mutant(self, check, old, new, message):
+        control, mutant = mutant_of(sb.compose, old, new)
+        check(control)   # control first: it passes
+        with self.assertRaisesRegex(AssertionError, "^" + message):
+            check(mutant)
+        return control
+
+    def test_m1a_the_non_late_range_dates_its_oldest_member(self):
+        self.run_mutant(self.check_a, "clock_day(min(sent_at(f) for f in taken), delivered)", "clock_utc(min(sent_at(f) for f in taken))",
+                        "a non-late range dates its oldest member")
+
+    def test_m1b_the_replaced_earlier_messages_carry_their_date(self):
+        self.run_mutant(self.check_b, "clock_day(t, delivered) for t in waiting[:5]", "clock_utc(t) for t in waiting[:5]",
+                        "the replaced earlier message carries its date")
+
+    def test_m1c_the_single_message_late_note_carries_the_date(self):
+        self.run_mutant(self.check_c, "(first.rstrip(\":\"), clock_day(late, delivered)", "(first.rstrip(\":\"), clock_utc(late)",
+                        "the single late note carries the date")
+
+    def test_m2_without_a_delivery_time_the_plain_clock_text_is_returned(self):
+        def check(clock_day):
+            assert clock_day(self.PREV, None) == sb.clock_utc(self.PREV) == "15:15Z", "no delivery time: no date"
+        control, mutant = mutant_of(sb.clock_day, "    if delivered is None:\n        return clock_utc(epoch)\n", "")
+        check(control)
+        with self.assertRaisesRegex(AssertionError, "^no delivery time: no date"):
+            check(mutant)
+
+    def test_l5_boundaries(self):
+        fact = lambda age: sb.Fact("send:c:1", "platform", "send", "msg", NOW - age, batch=False, sender="coder")
+        self.assertIn("held 2 h", self.head(sb.compose, [fact(7200)], NOW))
+        self.assertIn("held 119 min", self.head(sb.compose, [fact(7199)], NOW))
+        day = MID + 86400   # 2027-01-16 00:00:00Z
+        self.assertEqual(sb.clock_day(day - 1, day), "2027-01-15 23:59Z")
+        self.assertEqual(sb.clock_day(day, day), "00:00Z")
+        control, mutant = mutant_of(sb.clock_day, "time.gmtime(delivered)[:3]", "time.gmtime(delivered + 1)[:3]")
+        late = day + 86399   # 23:59:59Z: a delivery one second before midnight; sent 12:00Z the same day prints no date
+        self.assertEqual(control(day + 43200, late), "12:00Z")
+        self.assertEqual(mutant(day + 43200, late), "2027-01-16 12:00Z")   # the mutant (delivered+1) crosses midnight: the check above fails on it
+        self.assertEqual(control(day - 1, day), "2027-01-15 23:59Z")
+        control, mutant = mutant_of(sb.compose, "held >= 7200", "held > 7200")
+        self.assertIn("held 2 h", self.head(control, [fact(7200)], NOW))
+        self.assertIn("held 120 min", self.head(mutant, [fact(7200)], NOW))
