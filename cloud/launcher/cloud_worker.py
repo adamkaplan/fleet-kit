@@ -1282,6 +1282,8 @@ def rotate_audit(path, now=None, dry_run=False, _before_swap=None):
             _ROTATE_SAID[path] = text
             print("cloud-worker: the audit file could not be rotated (%s); it is kept whole" % text, file=sys.stderr)
         return None
+    print("cloud-worker: the audit was rotated: %d lines (%d bytes) to %s; the live file keeps %d bytes" % (result["lines"], result["bytes"], result["archive"], result["kept"]),
+          file=sys.stderr)
     cutoff = stamp.timestamp() - AUDIT_ARCHIVE_DAYS * 86400
     for name in sorted(os.listdir(directory)):
         if name.startswith("audit-") and name.endswith(".jsonl.gz"):

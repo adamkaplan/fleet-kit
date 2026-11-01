@@ -313,9 +313,13 @@ def _follow_rotation(audit_file, state_file, cloud_dir, last_reports, send, pars
         return None
     state = read_small(state_file, parse)
     offset, keys = (state.get("offset"), state.get("sent")) if state else (None, None)
-    if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0 or offset > size or not isinstance(keys, list):
-        return None
     count_file = str(state_file) + ".rotations"
+    if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0 or not isinstance(keys, list):
+        first = _rotation_record(path, parse, size)   # first sight: the current count is taken and nothing moves
+        if first is not None:
+            with os.fdopen(os.open(count_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as handle:
+                handle.write(json.dumps({"applied": first[0], "chain": None}) + "\n")
+        return None
     mine = read_small(count_file, parse) or {}
     applied, chain = mine.get("applied"), mine.get("chain")
     if isinstance(applied, bool) or not isinstance(applied, int) or applied < 0 or not _valid_chain(chain):

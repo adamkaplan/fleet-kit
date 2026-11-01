@@ -256,11 +256,14 @@ def _follow_rotation(sb, path, state, key):
     None when the live file is to be read as always (the offset is translated first)."""
     offsets = state.get("offsets") if isinstance(state.get("offsets"), dict) else {}
     offset = offsets.get(key)
-    if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
-        return None
     try:
         size = os.stat(path).st_size
     except OSError:
+        return None
+    if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+        first = _rotation_record(path, sb.parse_bounded, size)   # first sight: the current count is taken and nothing moves
+        if first is not None:
+            state.setdefault("rotations", {})[key] = {"applied": first[0], "chain": None}
         return None
     mine = state.get("rotations") if isinstance(state.get("rotations"), dict) else {}
     kept = mine.get(key) if isinstance(mine.get(key), dict) else {}
