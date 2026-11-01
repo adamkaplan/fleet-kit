@@ -1474,7 +1474,7 @@ def reader_failures(source):
                 failures.append("%s: merge_route did not refuse the argv: %r" % (label, route))
             if got["named_repos"][1] is not True:
                 failures.append("%s: named_repos did not refuse the argv: %r" % (label, got["named_repos"]))
-            if got["guard"] != why:
+            if got["guard"] != "gh: refused: " + why:
                 failures.append("%s: the hold guard did not refuse the argv: %r" % (label, got["guard"]))
             if not (got["scope"] and got["scope"][0] == "refuse" and got["scope"][1].startswith("gh: refused:")):
                 failures.append("%s: the read-scope gate did not refuse with 'gh: refused:': %r" % (label, got["scope"]))
