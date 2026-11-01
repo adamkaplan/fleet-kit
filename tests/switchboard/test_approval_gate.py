@@ -228,6 +228,7 @@ class TestApprovalGateCommands(unittest.TestCase):
         host_class = type("ApprovalHost", (HOST.TestMergeGateCommand,), {"runTest": lambda self: None, "route": route})
         self.h = host_class("runTest")
         self.h.setUp()
+        self.addCleanup(self.h.doCleanups)   # the host's own cleanups (Base.setUp's os.environ patch.dict) run after its tearDown
         self.addCleanup(self.h.tearDown)
         self.args = types.SimpleNamespace(pr=self.h.PR)
         self.h.pr.update(headRefOid=HOST.MG_HEAD)
