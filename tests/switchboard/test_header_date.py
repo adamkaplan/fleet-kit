@@ -31,7 +31,7 @@ BASELINE = [   # the first header lines the code printed before #1800, for the 2
 ]
 
 
-def fact(key, age, sender="coder"):
+def header_fact(key, age, sender="coder"):
     return sb.Fact(key, "platform", "send", "msg", NOW - age, batch=False, sender=sender)
 
 
@@ -68,9 +68,9 @@ class TestHeaderDate(unittest.TestCase):
         self.assertEqual(previous_day_check(sb.clock_day), "2027-01-15 15:15Z")
 
     def test_s3_a_member_held_5_hours_or_40_minutes_says_how_long(self):
-        self.assertIn("held 5 h", self.header([fact("send:c:1", 5 * 3600 + 120)]))
-        self.assertIn("held 40 min", self.header([fact("send:c:2", 40 * 60 + 5)]))
-        self.assertIn("held 119 min", self.header([fact("send:c:3", 119 * 60 + 5)]))
+        self.assertIn("held 5 h", self.header([header_fact("send:c:1", 5 * 3600 + 120)]))
+        self.assertIn("held 40 min", self.header([header_fact("send:c:2", 40 * 60 + 5)]))
+        self.assertIn("held 119 min", self.header([header_fact("send:c:3", 119 * 60 + 5)]))
 
     def test_s4_twenty_same_day_headers_equal_the_stored_baseline(self):
         self.assertEqual(len(BASELINE), 20)
@@ -101,4 +101,4 @@ class TestHeaderDate(unittest.TestCase):
         self.assertEqual(len(carried), 1)
 
     def test_u1_without_a_delivery_time_the_text_has_no_header_time(self):
-        self.assertNotIn("sent", sb.compose("platform", [fact("send:c:1", 0)])[0].splitlines()[0])
+        self.assertNotIn("sent", sb.compose("platform", [header_fact("send:c:1", 0)])[0].splitlines()[0])
