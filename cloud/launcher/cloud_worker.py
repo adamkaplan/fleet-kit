@@ -2825,7 +2825,7 @@ class Launcher:
             token = run_git_token_cmd(cmd, repo, dict(os.environ, **self.env), register=lambda *v: self.kube.add_secrets(*v, life=secret_life_until(pod=(pod.get("metadata") or {}).get("name"))))
         except CloudError as e:
             raise _NotRenewed("the mint failed: %s" % e) from None
-        self.kube.add_secrets(token)
+        self.kube.add_secrets(token, life=secret_life_until(pod=(pod.get("metadata") or {}).get("name")))
         if re.search(r"\s", token):
             raise _NotRenewed("the mint gave a token with whitespace in it")
         self._require_same_scope(force, token, repo)
