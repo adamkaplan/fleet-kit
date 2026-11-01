@@ -135,7 +135,7 @@ def _persist(state_path, state):
         if not _WARNED:
             _WARNED.append(1)
             number = getattr(err, "errno", None)
-            sys.stderr.write("cloud renewal alarm: the state could not be written (%s %d); it is kept in memory\n" % (type(err).__name__, number if isinstance(number, int) else 0))
+            sys.stderr.write("cloud renewal alarm: the state could not be written (%s %d); it is kept in memory\n" % ("OSError" if isinstance(err, OSError) else type(err).__name__, number if isinstance(number, int) else 0))
 
 
 def _lane(config, discovery, default):
