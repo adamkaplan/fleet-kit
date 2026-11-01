@@ -1587,5 +1587,55 @@ class TestApiReadersAreViews(unittest.TestCase):
         self.assertTrue(any(s.startswith("--repo api api:") for s in seen), seen)
 
 
+HOLD_FORMS = (["-R", "api/x", "api", ISSUE], ["-R", "api", "api", ISSUE])
+
+
+def hold_endpoint_failures(hold_source):
+    """Anchored one-line texts: every HOLD_FORMS argv must be accepted by the hold probe and read by gh_hold's parse_api as the one endpoint ISSUE.
+    gh_hold is loaded from hold_source and handed the shim's parser the way load_hold hands it."""
+    import types
+    space = load_shim((SHIM_DIR / "gh").read_text())
+    module = types.ModuleType("gh_hold_under_test")
+    exec(compile(hold_source, "shims/gh_hold.py", "exec"), module.__dict__)
+    module.API_PARSER[0] = space["api_parsed"]
+    failures = []
+    for argv in HOLD_FORMS:
+        try:
+            got = module.parse_api(argv)
+        except Exception as err:
+            failures.append("hold %s: parse_api raised %s" % (argv[:2], type(err).__name__))
+            continue
+        if got[0] != [ISSUE]:
+            failures.append("hold %s: parse_api endpoints %r, not %r" % (argv[:2], got[0], [ISSUE]))
+    space["load_hold"] = lambda: module
+    os.environ.setdefault("XDG_CONFIG_HOME", "/nonexistent-xdg")
+    for argv in HOLD_FORMS:
+        guard = space["hold_probe"](argv, Lookup(), None, False)[0]
+        if guard is not None:
+            failures.append("hold %s: the hold probe refused: %r" % (argv[:2], guard))
+    return failures
+
+
+class TestGhHoldIsAView(unittest.TestCase):
+    source = (SHIM_DIR / "gh_hold.py").read_text()
+
+    def test_table_forms_through_the_hold_probe(self):
+        self.assertEqual(hold_endpoint_failures(self.source), [])
+
+    def test_real_load_hold_hands_the_parser_over(self):
+        space = load_shim((SHIM_DIR / "gh").read_text())
+        module = space["load_hold"]()
+        self.assertIsNotNone(module)
+        self.assertEqual(module.parse_api(["-R", "api/x", "api", ISSUE])[0], [ISSUE])
+
+    def test_mutant_private_reader_fails_and_control_passes(self):
+        anchor = "    parser = API_PARSER[0]\n"
+        self.assertEqual(self.source.count(anchor), 1, "the mutant's anchor is gone")
+        mutant = self.source.replace(anchor, "    at = args.index(\"api\")\n    return [a for a in args[at + 1:] if not a.startswith(\"-\")][:1], None, [], False\n" + anchor)
+        seen = hold_endpoint_failures(mutant)
+        self.assertTrue(any(t.startswith("hold ['-R', 'api']: parse_api endpoints ['api'], not ") for t in seen), seen)
+        self.assertEqual(hold_endpoint_failures(self.source), [])
+
+
 if __name__ == "__main__":
     unittest.main()
