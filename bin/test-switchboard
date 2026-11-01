@@ -190,7 +190,7 @@ TestScanDriftGuard, TestOwnerClearModule, TestBuilderChecklist, TestEveryReaderO
 TestGithubConfig, TestPlanningSkill, TestCompose, TestOwnMeasurementTester = (_support_test_cases_11.TestGithubConfig, _support_test_cases_11.TestPlanningSkill, _support_test_cases_11.TestCompose, _support_test_cases_11.TestOwnMeasurementTester)   # support import
 _support_test_cases_12 = importlib.import_module("test_cases_12")   # support import
 WorkflowPlanPins, TestAgentShellCalls, TestShimReadCache, TestSameNameAccountsAdd = (_support_test_cases_12.WorkflowPlanPins, _support_test_cases_12.TestAgentShellCalls, _support_test_cases_12.TestShimReadCache, _support_test_cases_12.TestSameNameAccountsAdd)   # support import
-TestSelfRegisteringCli, TestGhShimGateProbe, TestClosedUnmergedLastPr, StubIssueHub = (_support_test_cases_12.TestSelfRegisteringCli, _support_test_cases_12.TestGhShimGateProbe, _support_test_cases_12.TestClosedUnmergedLastPr, _support_test_cases_12.StubIssueHub)   # support import
+TestSelfRegisteringCli, TestGhShimGateProbe, TestClosedUnmergedLastPr = (_support_test_cases_12.TestSelfRegisteringCli, _support_test_cases_12.TestGhShimGateProbe, _support_test_cases_12.TestClosedUnmergedLastPr)   # support import
 _support_test_cases_13 = importlib.import_module("test_cases_13")   # support import
 TestClosedUnmergedDocs, TestUnionCheckLimitsDocs = (_support_test_cases_13.TestClosedUnmergedDocs, _support_test_cases_13.TestUnionCheckLimitsDocs)   # support import
 _support_herdr_world = importlib.import_module("support.herdr_world")   # support import
