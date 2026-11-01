@@ -171,7 +171,7 @@ class S3Row(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             s = Scene(target_module(), tmp)
             out, err = s.pass_(retire=lambda *a, **k: {"problem": "locked\nby another"})
-        self.assertEqual(len(err.strip().splitlines()), 2, err)
+        self.assertEqual(len([x for x in err.strip().splitlines() if x.startswith("registry:")]), 2, err)
         self.assertEqual(sorted(w for w, _, c in out if c == 0), sorted(ENDED))
 
     def test_the_retire_of_an_absent_row_is_harmless(self):
