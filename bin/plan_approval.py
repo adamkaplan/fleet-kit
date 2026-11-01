@@ -230,4 +230,4 @@ def evaluate(value, comments, done_when, plan_check):
         return refuse("the plan declares no clauses block to compare with the Done-when (current %s)" % current, current)
     if not plan_check.verify_declared(declared, done_when):
         return refuse("the plan's clauses no longer equal the current Done-when (current %s)" % current, current)
-    return {"ok": True, "line": "", "plan_hash": current, "done_when_hash": "sha256:" + done_when_hash(done_when)}
+    return {"ok": True, "line": "", "plan_hash": current, "plan_hashes": hashes, "done_when_hash": "sha256:" + done_when_hash(done_when)}
