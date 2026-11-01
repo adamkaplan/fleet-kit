@@ -16,6 +16,7 @@ POD = {"CW_AUDIT_RUNTIME_ID": "pod/x", "CW_HARD_DEADLINE": "2030-01-01T00:00:00Z
 FOUND = (lambda n: "/x/taskpolicy" if n == "taskpolicy" else "/x/nice", lambda n: "/x/nice" if n == "nice" else None, lambda n: None)
 KEPT = (["/x/taskpolicy", "-b"], ["/x/nice", "-n", "10"], [])
 CHECK_TEXT = "the niceness was dropped without the pod marker"
+KEPT_TEXT = "the niceness was kept in a pod"
 
 
 def check_without_marker(module):
@@ -23,6 +24,13 @@ def check_without_marker(module):
     got = [module.command_prefix(which, {}) for which in FOUND]
     if got != list(KEPT):
         raise AssertionError("%s: %r" % (CHECK_TEXT, got))
+
+
+def check_in_pod(module):
+    """The niceness is dropped on a fake environment with the marker: 3 of 3 empty prefixes."""
+    got = [module.command_prefix(which, POD) for which in FOUND]
+    if got != [[], [], []]:
+        raise AssertionError("%s: %r" % (KEPT_TEXT, got))
 
 
 def load(path):
@@ -41,6 +49,12 @@ class TestPodNiceness(unittest.TestCase):
     def test_s2_the_pod_marker_gives_the_empty_prefix_and_its_absence_the_three_answers(self):
         self.assertEqual([self.hs.command_prefix(which, POD) for which in FOUND], [[], [], []])
         check_without_marker(self.hs)
+        check_in_pod(self.hs)
+
+    def test_s9_a_blank_or_zero_deadline_with_the_pod_id_is_the_marker(self):
+        for deadline in (" ", "0"):
+            env = {"CW_AUDIT_RUNTIME_ID": "pod/x", "CW_HARD_DEADLINE": deadline}
+            self.assertEqual(self.hs.command_prefix(FOUND[1], env), [], "a non-empty deadline is the marker: %r gave a prefix" % deadline)
 
     def test_s3_a_part_of_the_marker_keeps_the_niceness(self):
         partial = ({"CW_AUDIT_RUNTIME_ID": "pod/x"}, {"CW_HARD_DEADLINE": "2030-01-01T00:00:00Z"},
@@ -64,6 +78,21 @@ class TestPodNiceness(unittest.TestCase):
         mutant = self.run_mutant(source.replace(marker, "    return []\n" + marker))
         self.assertEqual(mutant.returncode, 1)
         self.assertIn(CHECK_TEXT, mutant.stderr)
+
+    def test_s10_a_mutant_that_never_drops_the_niceness_fails_and_the_control_passes(self):
+        source = HEAVY.read_text()
+        script = "import sys; sys.path.insert(0, %r); import test_pod_niceness as t; t.check_in_pod(t.load(%r))"
+        def run(text):
+            copy = self.home / "heavy_slots.py"
+            copy.write_text(text)
+            return subprocess.run([sys.executable, "-c", script % (str(Path(__file__).parent), str(copy))], capture_output=True, text=True, cwd=str(Path(__file__).parent))
+        control = run(source)
+        self.assertEqual(control.returncode, 0, control.stderr)
+        check = '    if str(environ.get("CW_AUDIT_RUNTIME_ID", "")).startswith("pod/") and str(environ.get("CW_HARD_DEADLINE", "")) != "":\n        return []\n'
+        self.assertEqual(source.count(check), 1)
+        mutant = run(source.replace(check, ""))
+        self.assertEqual(mutant.returncode, 1)
+        self.assertIn(KEPT_TEXT, mutant.stderr)
 
     def wrapper(self, env_more):
         """Run the real wrapper on a child that prints its niceness and the slot record it can see; return (niceness, record count while running)."""
