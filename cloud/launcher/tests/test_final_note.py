@@ -157,7 +157,7 @@ class FinalNote(unittest.TestCase):
                 f.write(FILE % "")
             self.assertEqual(real.parse_settings(FILE % "").get("CW_FINAL_NOTE_MINUTES"), None)
             e, _ = run([pod(left=10)], tempfile.mkdtemp(dir=tmp), env={"CW_FINAL_NOTE_MINUTES": ""})
-            self.assertEqual((e.kube.sent, [l["reason"] for l in e.lines()]), ([], ["unreadable setting"]), "an empty value in the environment is no note, one line")
+            self.assertEqual((len(e.kube.sent), len(e.lines()), "unreadable setting" in e.lines()[0]["reason"]), (1, 1, False), "an empty value in the environment: the note at 10, no mention")
             for good in ("1", "10", "60"):
                 with open(path, "w") as f:
                     f.write(FILE % good)
@@ -193,8 +193,7 @@ class FinalNote(unittest.TestCase):
 
     def test_s7_unreadable_data_no_note_one_audit_line_pass_goes_on(self):
         cases = [("annotation", pod(left=10, hard_text="not a date"), {}, "unreadable annotation"),
-                 ("started", pod(left=10, started="garbage"), {}, "unreadable annotation"),
-                 ("setting", pod(left=10), {"CW_FINAL_NOTE_MINUTES": "abc"}, "unreadable setting")]
+                 ("started", pod(left=10, started="garbage"), {}, "unreadable annotation")]
         for label, p, env, why in cases:
             with self.subTest(label), tempfile.TemporaryDirectory() as tmp:
                 s, outs = run([p], tmp, passes=3, env=env)
@@ -206,6 +205,38 @@ class FinalNote(unittest.TestCase):
                 self.assertIn(why, lines[0]["reason"])
                 self.assertEqual(s.pods[0]["metadata"]["annotations"].get("cw/final-note"), "unreadable")
                 self.assertEqual(outs[0][0], [], "the pass returns its results as before")
+
+    def test_s3_bad_values_use_ten_and_say_so(self):
+        said = 0
+        for bad in ("0", "61", "abc", ""):
+            with self.subTest(bad), tempfile.TemporaryDirectory() as tmp:
+                at10, _ = run([pod(left=10)], tempfile.mkdtemp(dir=tmp), env={"CW_FINAL_NOTE_MINUTES": bad})
+                at11, _ = run([pod(left=11)], tempfile.mkdtemp(dir=tmp), env={"CW_FINAL_NOTE_MINUTES": bad})
+                self.assertEqual((len(at10.kube.sent), len(at11.kube.sent)), (1, 0))
+                lines = at10.lines()
+                self.assertEqual(len(lines), 1, lines)
+                self.assertTrue(lines[0]["ok"])
+                self.assertEqual("unreadable setting" in lines[0]["reason"], bad != "")
+                self.assertEqual(at10.pods[0]["metadata"]["annotations"].get("cw/final-note"), "sent")
+                said += "unreadable setting" in lines[0]["reason"]
+        self.assertEqual(said, 3)
+        with tempfile.TemporaryDirectory() as tmp:
+            u, _ = run([pod(left=10)], tempfile.mkdtemp(dir=tmp))
+            f15, _ = run([pod(left=15)], tempfile.mkdtemp(dir=tmp), env={"CW_FINAL_NOTE_MINUTES": "15"})
+            f16, _ = run([pod(left=16)], tempfile.mkdtemp(dir=tmp), env={"CW_FINAL_NOTE_MINUTES": "15"})
+            self.assertEqual((len(u.kube.sent), len(f15.kube.sent), len(f16.kube.sent)), (1, 1, 0))
+            self.assertNotIn("unreadable setting", u.lines()[0]["reason"])
+
+    def test_u4_the_default_pod_bytes_are_the_fixture(self):
+        from test_cloud_stack import CASES, ENV  # noqa: F401
+        from test_cloud_worker import T0 as FT0
+        mod = target_module()
+        built = {k: mod.render_pod(a, "coder7", mod.pod_name("coder7"), FT0, FT0 + 120 * MIN, ENV, n) for k, (a, n) in CASES.items()}
+        with open(os.path.join(HERE, "fixtures", "default_pod.json"), "rb") as f:
+            stored = f.read()
+        got = (json.dumps(built, indent=2, sort_keys=True) + "\n").encode()
+        self.assertEqual(len(got), len(stored))
+        self.assertEqual(sum(a != b for a, b in zip(got, stored)), 0)
 
     def test_u2_a_failing_send_never_raises_out_of_the_pass(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -232,6 +263,12 @@ def mutant_copy(directory, kind):
     if kind == "twice":
         old = "if not raw_end or ann(pod, \"final-note\"):"
         new = "if not raw_end:"
+    elif kind == "badoff":
+        old = "                if bad_setting:\n                    self.kube.annotate"
+        new = "                if bad_setting:\n                    continue\n                    self.kube.annotate"
+    elif kind == "annotation":
+        old = '"cw/hard-deadline": iso(hard),'
+        new = '"cw/final-note": "x", "cw/hard-deadline": iso(hard),'
     else:
         old = "                self.kube.annotate(name, uid, **{FINAL_NOTE_MARK: \"sent\"})\n                self.send_note(name, FINAL_NOTE_TEXT)\n"
         new = "                self.kube.annotate(name, uid, **{FINAL_NOTE_MARK: \"sent\"})\n"
@@ -243,10 +280,10 @@ def mutant_copy(directory, kind):
 
 
 class Mutants(unittest.TestCase):
-    def failing(self, kind):
+    def failing(self, kind, test="FinalNote"):
         with tempfile.TemporaryDirectory() as tmp:
             path = mutant_copy(tmp, kind)
-            p = subprocess.run([sys.executable, "-m", "unittest", "test_final_note.FinalNote"], cwd=HERE, env=dict(os.environ, **{MODULE_ENV: path}),
+            p = subprocess.run([sys.executable, "-m", "unittest", "test_final_note." + test], cwd=HERE, env=dict(os.environ, **{MODULE_ENV: path}),
                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=90)
         return p
 
@@ -259,6 +296,34 @@ class Mutants(unittest.TestCase):
         p = self.failing("never")
         self.assertEqual(p.returncode, 1, p.stdout)
         self.assertIn("FAIL: test_s2_", p.stdout)
+
+    def test_mutant_bad_value_switches_the_note_off_is_caught(self):
+        with tempfile.TemporaryDirectory() as tmp:   # control first: the unmutated copy passes the S3 test
+            ctl = os.path.join(tmp, "control.py")
+            with open(os.path.join(LAUNCHER, "cloud_worker.py")) as f:
+                src = f.read()
+            with open(ctl, "w") as f:
+                f.write(src)
+            c = subprocess.run([sys.executable, "-m", "unittest", "test_final_note.FinalNote.test_s3_bad_values_use_ten_and_say_so"], cwd=HERE,
+                               env=dict(os.environ, **{MODULE_ENV: ctl}), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=90)
+            self.assertEqual(c.returncode, 0, c.stdout)
+            self.assertIn("Ran 1 test", c.stdout)
+        p = self.failing("badoff", "FinalNote.test_s3_bad_values_use_ten_and_say_so")
+        self.assertEqual(p.returncode, 1, p.stdout)
+        self.assertIn("FAIL: test_s3_bad_values_use_ten_and_say_so", p.stdout)
+        self.assertIn("Tuples differ: (0, 0) != (1, 0)", p.stdout)
+
+    def test_mutant_an_added_annotation_is_caught_by_the_bytes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ctl = os.path.join(tmp, "control.py")
+            with open(os.path.join(LAUNCHER, "cloud_worker.py")) as f, open(ctl, "w") as g:
+                g.write(f.read())
+            c = subprocess.run([sys.executable, "-m", "unittest", "test_final_note.FinalNote.test_u4_the_default_pod_bytes_are_the_fixture"], cwd=HERE,
+                               env=dict(os.environ, **{MODULE_ENV: ctl}), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=90)
+            self.assertEqual(c.returncode, 0, c.stdout)
+        p = self.failing("annotation", "FinalNote.test_u4_the_default_pod_bytes_are_the_fixture")
+        self.assertEqual(p.returncode, 1, p.stdout)
+        self.assertIn("FAIL: test_u4_the_default_pod_bytes_are_the_fixture", p.stdout)
 
 
 if __name__ == "__main__":
