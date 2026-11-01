@@ -196,6 +196,8 @@ class TestApprovalExemptionGuard(unittest.TestCase):
         self.assertEqual(self.offenders(self.real_texts()), [], self.MESSAGE)
 
     def test_mutant_an_import_in_a_closure_module_fails_the_scan(self):
+        if not self.exemption_stands():
+            self.skipTest("the exemption is gone")
         texts = self.real_texts()
         texts["bin/merge_gate.py"] = "import plan_approval\n" + texts["bin/merge_gate.py"]
         self.assertEqual(self.offenders(texts), ["bin/merge_gate.py"], self.MESSAGE)
