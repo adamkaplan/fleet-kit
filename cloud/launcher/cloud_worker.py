@@ -2531,8 +2531,10 @@ class Launcher:
         mono = time.monotonic
         steps = self.step_seconds = {"list": 0.0, "renew": 0.0, "vanished": 0.0, "activity": 0.0, "activity_n": 0, "stops": 0.0, "stops_n": 0, "orphans": 0.0, "notes": 0.0, "total": 0.0}
         t_pass = t0 = mono()
-        pods = self.kube.list_pods()
-        steps["list"] = mono() - t0
+        try:
+            pods = self.kube.list_pods()
+        finally:
+            steps["list"] = mono() - t0
         t0 = mono()
         # The renewal is the FIRST step: a slow activity read or stop below can no longer hold it back (the audit of 29 October).
         renewed = self.renew_git_tokens(self._before_hard_limit(pods, now), now)
