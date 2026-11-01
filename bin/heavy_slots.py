@@ -33,7 +33,7 @@ DEFAULT_SLOTS = 3
 DEFAULT_WAIT_MAX = 1800
 POLL_SECONDS = 0.5
 WAIT_REPORT_SECONDS = 30
-PROGRESS_SECONDS = 60   # one progress line per interval while the command runs; FLEET_HEAVY_PROGRESS_SECONDS shortens it (tests)
+PROGRESS_EVERY = 60   # one progress line per interval while the command runs; FLEET_HEAVY_PROGRESS_SECONDS shortens it (tests)
 EXIT_TEMPFAIL = 75      # no slot within --wait-max
 EXIT_USAGE = 64
 EXIT_NOT_FOUND = 127
@@ -1288,9 +1288,9 @@ def run(command, state_dir, slots=DEFAULT_SLOTS, wait_max=DEFAULT_WAIT_MAX, name
         dog.start()
         progress_stop = threading.Event()
         try:
-            progress_every = float(environ.get("FLEET_HEAVY_PROGRESS_SECONDS") or PROGRESS_SECONDS)
+            progress_every = float(environ.get("FLEET_HEAVY_PROGRESS_SECONDS") or PROGRESS_EVERY)
         except ValueError:
-            progress_every = PROGRESS_SECONDS
+            progress_every = PROGRESS_EVERY
         threading.Thread(target=_progress_loop, args=(child["p"].pid, os.path.basename(command[0]), progress_every, progress_stop, out, clock, clock()), daemon=True).start()
         try:
             while True:

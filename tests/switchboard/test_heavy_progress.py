@@ -167,7 +167,7 @@ class TestHeavyProgress(unittest.TestCase):
 
     def test_u6_the_interval_is_60_and_an_environment_value_shortens_it(self):
         hs = sb.load_heavy_slots()
-        self.assertEqual((hs.PROGRESS_SECONDS, hs.WAIT_REPORT_SECONDS, hs.DEFAULT_WAIT_MAX), (60, 30, 1800))
+        self.assertEqual((hs.PROGRESS_EVERY, hs.WAIT_REPORT_SECONDS, hs.DEFAULT_WAIT_MAX), (60, 30, 1800))
         rig = Rig(self, alive=200)
         self.assertEqual(set(rig.pauses), {60})
         rig = Rig(self, alive=1, env={"FLEET_HEAVY_PROGRESS_SECONDS": "0.3"})
