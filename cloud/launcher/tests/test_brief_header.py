@@ -195,12 +195,12 @@ class Check(LaunchHarness):
     def test_s6_mutant_the_check_replaced_by_a_no_op_is_caught_by_the_refusal_test(self):
         sb, _ = make_state()
         b = sb.load_module("cloud_worker")
-        original = b.unknown_report_to
-        b.unknown_report_to = lambda *a, **k: (None, None)
+        original = b.cloud_cluster.unknown_report_to
+        b.cloud_cluster.unknown_report_to = lambda *a, **k: (None, None)
         try:
             result, _, _ = self.run_launch("lane-nobody")
         finally:
-            b.unknown_report_to = original
+            b.cloud_cluster.unknown_report_to = original
         self.assertEqual(result, "reached", "with the check gone the launch goes on: the refusal test above fails under this mutant")
 
     def test_a_registry_that_cannot_be_read_never_refuses_it_warns(self):
@@ -211,7 +211,7 @@ class Check(LaunchHarness):
         saved = dict(b.H)
         b.bind(sb.__dict__)
         try:
-            refusal, warning = b.unknown_report_to(state, "lane-nobody", {}, NAME_ALIAS)
+            refusal, warning = b.cloud_cluster.unknown_report_to(state, "lane-nobody", {}, NAME_ALIAS)
         finally:
             b.H.clear()
             b.H.update(saved)
@@ -467,9 +467,9 @@ class EveryFreeTextField(OverrideReasonScrub):
         self.assertEqual(self.memory_audit("release fix", sb), "release fix")
 
     def test_s12_the_three_sites_call_the_one_helper(self):
-        src = read("bin/cloud_worker.py")
-        self.assertIn('"reports_to": H["scrubbed_flag_text"](args.reports_to, 60)', src)
-        self.assertIn('"reason": H["scrubbed_flag_text"](reason)', src)
+        src = read("bin/cloud_cluster.py")
+        self.assertIn('"reports_to": D["H"]["scrubbed_flag_text"](args.reports_to, 60)', src)
+        self.assertIn('"reason": D["H"]["scrubbed_flag_text"](reason)', src)
         self.assertIn("scrubbed_flag_text(reason)", inspect.getsource(load_sb().launch_memory_check))
 
     def test_s12_mutant_the_boss_text_cut_without_scrub_leaks(self):
@@ -861,17 +861,17 @@ class EmptyRegistry(LaunchHarness):
         engine = types.SimpleNamespace(actor="t", audit=types.SimpleNamespace(append=lambda actor, kind, name, data: seen.append((kind, data))),
                                        herdr=types.SimpleNamespace(workspace_create=lambda *a, **k: made.append("workspace")))
         args = types.SimpleNamespace(name="tester7", reports_to=boss, boss_unregistered=reason)
-        saved = b.unknown_report_to
+        saved = b.cloud_cluster.unknown_report_to
         if check:
-            b.unknown_report_to = check(saved)
+            b.cloud_cluster.unknown_report_to = check(saved)
         try:
             with redirect_stderr(io.StringIO()):
-                b.check_report_to(engine, state, args, {})
+                b.cloud_cluster.check_report_to(engine, state, args, {})
             return 0, "", seen, made
         except sb.LaunchError as problem:
             return 1, str(problem), seen, made
         finally:
-            b.unknown_report_to = saved
+            b.cloud_cluster.unknown_report_to = saved
 
     def test_s15_both_routes_refuse_against_an_empty_registry_and_name_the_flag(self):
         code, message, audit, made = self.local_route("lane-nobody")
