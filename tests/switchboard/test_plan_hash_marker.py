@@ -624,3 +624,89 @@ def build():
 
     only_own_tests(TestPlanHashMarkerRounds)
     return TestPlanHashMarkerWake, TestPlanHashMarkerRounds
+
+
+def build_late():
+    """The classes whose host classes are defined late in bin/test-switchboard (bound by a line placed after them)."""
+    host = HOST
+    import json
+    from unittest import mock
+    from support.loader import sb
+
+    def only_own_tests(cls):
+        for name in dir(cls):
+            if name.startswith("test") and name not in cls.__dict__:
+                setattr(cls, name, None)
+        return cls
+
+    class TestPlanHashMarkerAsk(host.TestAskIssueSubject):
+        """S8 through the real `prove`, `verdict` and `gates` on an ask issue whose plan comment ends with the marker (the fixtures of TestAskIssueSubject)."""
+
+        def setUp(self):
+            super().setUp()
+            pc = real("plan_check")
+            text = host.LEDGER_PLAN + "\n" + MARKER
+            self.pair = pc.plan_hashes(text)
+            self.new, self.old = self.pair
+            self.edited = pc.plan_hash(text.replace("Commissioning works.", "Commissioning works, edited."))
+            self.hash = self.new
+
+        def plan(self):
+            return dict(super().plan(), plan_hashes=self.pair)
+
+        def g1(self):
+            report = json.loads(self.run_cmd("cmd_gates", json=True)[2])
+            return next(g for g in report["gates"] if g["gate"] == "G1")
+
+        def recorded_at(self, plan_hash):
+            self.hash = plan_hash
+            self.record_all()
+            self.hash = self.new
+
+        def test_control_records_at_the_new_hash_read_as_bound(self):
+            self.recorded_at(self.new)
+            self.assertIn("3 of 3 claimed scenarios proven and judged", self.g1()["detail"])
+
+        def test_records_at_the_old_hash_and_its_head_read_as_bound_through_gates(self):
+            self.recorded_at(self.old)
+            self.assertEqual({e["plan_hash"] for e in self.entries()}, {self.old})
+            self.assertIn("3 of 3 claimed scenarios proven and judged", self.g1()["detail"])
+
+        def test_records_at_the_hash_of_an_edited_text_read_as_stale(self):
+            self.recorded_at(self.edited)
+            self.assertIn("void: plan changed", self.run_cmd("cmd_gates")[2])
+            self.assertNotIn("3 of 3 claimed scenarios proven and judged", self.g1()["detail"])
+
+        def test_a_mutant_that_reads_the_ask_head_without_as_current_fails_through_gates(self):
+            self.recorded_at(self.old)
+            with mock.patch.object(sb.load_plan_ledger(), "as_current", lambda entries, hashes: entries):   # the real module (sb.plan_ledger is a lazy proxy): the read maps nothing, so the head is compared with the new one only
+                with self.assertRaisesRegex(AssertionError, "3 of 3 claimed scenarios proven and judged"):
+                    self.assertIn("3 of 3 claimed scenarios proven and judged", self.g1()["detail"])
+
+    only_own_tests(TestPlanHashMarkerAsk)
+
+    class TestPlanHashMarkerLaunch(host.TestLaunchGate):
+        """The G0b read of a consensus record, through the real `launch`."""
+
+        def signed(self):
+            self.plan_issue["body"] = host.LEDGER_PLAN + "\n" + MARKER
+            return sb.plan_check.plan_hashes(self.plan_issue["body"])
+
+        def would_refuse(self, plan_hash):
+            self.record_consensus(plan_hash)
+            code, out, err = self.launch()
+            self.assertEqual(code, 0, err)
+            return self.events("gate.would_refuse")
+
+        def test_a_consensus_at_the_new_hash_is_quiet(self):
+            self.assertEqual(self.would_refuse(self.signed()[0]), [])
+
+        def test_a_consensus_at_the_old_hash_is_quiet_through_launch(self):
+            self.assertEqual(self.would_refuse(self.signed()[1]), [], "a consensus at the old hash is not read as bound")
+
+        def test_a_consensus_at_the_hash_of_an_edited_text_is_not_quiet(self):
+            pair = self.signed()
+            self.assertEqual(len(self.would_refuse(sb.plan_check.plan_hash(self.plan_issue["body"].replace("Commissioning works.", "Commissioning works, edited.")))), 1)
+
+    only_own_tests(TestPlanHashMarkerLaunch)
+    return TestPlanHashMarkerAsk, TestPlanHashMarkerLaunch
