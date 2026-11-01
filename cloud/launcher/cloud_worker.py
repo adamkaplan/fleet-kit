@@ -1814,7 +1814,8 @@ class Launcher:
 
         def why():   # a stop that wrote a run record names its directory once, here
             text = "%s; run record %s" % (reason, info["record"]) if info.get("record") else reason
-            return "%s; %s" % (text, info["hook_note"]) if text and info.get("hook_note") else (text or info.get("hook_note", ""))
+            out = "%s; %s" % (text, info["hook_note"]) if text and info.get("hook_note") else (text or info.get("hook_note", ""))
+            return "%s; %s" % (out, info["last_event"]) if out and info.get("last_event") else (out or info.get("last_event", ""))
         try:
             result = fn(info)
         except CloudError as e:
@@ -2220,6 +2221,7 @@ class Launcher:
                                              root=getattr(a, "record_dir", None))
                 if where:
                     info["record"] = where
+                    info["last_event"] = (getattr(self.recorder, "last_phrase", "") or "")[:160]   # the kind of the pod's last event, read with the record (ask #1736)
                     print("cloud-worker: run record: %s" % where, file=sys.stderr)
             phase = (pod.get("status") or {}).get("phase")
             if phase == "Failed" and getattr(a, "cause", None):

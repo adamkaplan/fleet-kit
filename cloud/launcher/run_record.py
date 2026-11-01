@@ -150,6 +150,7 @@ class Recorder:
     def __init__(self, kube, env, clock=time.monotonic):
         self.kube, self.env, self.clock = kube, env, clock
         self.deadline = None
+        self.last_phrase = ""
 
     def left(self):
         """Seconds of the record phase that remain; raises RecordTimeout when none. No deadline set: effectively none."""
@@ -330,11 +331,13 @@ class Recorder:
             directory = os.path.join(base, run_id)
             os.mkdir(directory, 0o700)
             self.deadline = self.clock() + record_seconds(self.env)
+            self.last_phrase = "session unreadable"
             try:
                 msgs, why = self.read_messages(pod)
                 if msgs is None:
                     info["reason"] = why
                 else:
+                    self.last_phrase = last_event_phrase(msgs, lambda t: self.kube.scrub(t, limit=PHRASE_MAX))
                     self._write_transcript(directory, msgs, info)
             finally:
                 info["head_sha"] = self.head_sha(pod)
@@ -392,6 +395,47 @@ class Recorder:
         write_private(directory, "tally.json", json.dumps({"tool_calls": tally, "turns": turns, "messages": len(msgs)}, sort_keys=True) + "\n")
         info["transcript"], info["reason"] = "saved", None
         info["transcript_truncated"] = cut or msg_cut
+
+PHRASE_MAX = 160
+REFUSED_RE = re.compile(r"not available in this client|refused|not permitted|permission denied|denied", re.I)
+
+
+def _parts(message):
+    if not isinstance(message, dict):
+        return []
+    out = []
+    for key in ("content", "parts"):
+        if isinstance(message.get(key), list):
+            out += [x for x in message[key] if isinstance(x, dict)]
+    return out
+
+
+def _word(w):
+    return w if re.fullmatch(r"[A-Za-z0-9._:-]{1,30}", w) and "://" not in w else "..."
+
+
+def last_event_phrase(msgs, scrub):
+    """ONE bounded phrase (at most PHRASE_MAX characters) naming the kind of the session's last event: `no session event`,
+    `last tool call refused: <command>` (its first two words, no path, address or value) or `last message`. Never raises."""
+    try:
+        if not msgs:
+            return "no session event"
+        for m in reversed(msgs):
+            for part in reversed(_parts(m)):
+                if part.get("type") != "tool":
+                    continue
+                state = part.get("state") if isinstance(part.get("state"), dict) else {}
+                said = " ".join(str(state.get(k)) for k in ("output", "error") if isinstance(state.get(k), (str, int)))
+                if state.get("status") == "error" or REFUSED_RE.search(said):
+                    given = state.get("input") if isinstance(state.get("input"), dict) else (part.get("input") if isinstance(part.get("input"), dict) else {})
+                    cmd = given.get("command") or given.get("cmd") or part.get("tool") or ""
+                    words = [_word(w) for w in str(cmd).split()[:2]]
+                    text = "last tool call refused: " + (" ".join(words) or "unknown")
+                    return scrub(text)[:PHRASE_MAX]
+            break
+        return "last message"
+    except Exception:
+        return "session unreadable"
 
 
 def prune(root, days, now=None):
