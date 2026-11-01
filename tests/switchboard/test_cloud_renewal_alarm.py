@@ -495,5 +495,140 @@ class TestCloudRenewalAlarmMutants(unittest.TestCase):
             self.assertIn(MUTANT_TEXT[scenario], text_, "the mutant '%s' did not fail with the text of its own check: %s" % (label, text_[-300:]))
 
 
+# ---- #1579, PC-6 continuation: scenarios S24, S25 and S26 (inserted after the earlier tests; nothing above changes) ----
+def s24(module):
+    msg = "a cursor ahead of the clock hid a line"
+    w = AlarmWorld(module, {"worker-0": "lane-a", "worker-1": "lane-a", "worker-2": "lane-a"})
+    try:
+        with open(os.path.join(w.dir, module.STATE_FILE), "w") as handle:   # the clock stepped back: the stored cursor is 10 minutes ahead
+            json.dump({"cursor": T0 + 600, "edge": [], "alarmed": [["worker-0", T0]], "pods": {}}, handle)
+        w.line(T0, "worker-0", False, "alarmed before the step back")
+        w.line(T0 + 300, "worker-1", False, "five minutes ahead")
+        w.line(T0 + 720, "worker-2", False, "twelve minutes ahead")
+
+        def cursor():
+            with open(os.path.join(w.dir, module.STATE_FILE)) as handle:
+                return json.load(handle)["cursor"]
+
+        def told(pod):
+            return len([m for m in w.messages if "pod %s " % pod in m[1]])
+        after = 0
+        counts = []
+        for step in (0, 360, 780):
+            w.tick(T0 + step)
+            if cursor() > T0 + step:
+                after += 1
+            counts.append((told("worker-0"), told("worker-1"), told("worker-2")))
+        assert after == 0, msg
+        assert counts == [(0, 0, 0), (0, 2, 0), (0, 2, 2)], "%s: %s" % (msg, counts)
+        old = []
+        for n, content in enumerate((None, "{corrupt")):
+            v = AlarmWorld(module, {"old-%d" % n: "lane-a", "new-%d" % n: "lane-a"})
+            try:
+                if content is not None:
+                    with open(os.path.join(v.dir, module.STATE_FILE), "w") as handle:
+                        handle.write(content)
+                v.line(T0 - 7200, "old-%d" % n, False, "two hours old")
+                v.line(T0 - 600, "new-%d" % n, False, "ten minutes old")
+                v.tick(T0)
+                old.append(len([m for m in v.messages if "pod old-" in m[1]]))
+                assert len([m for m in v.messages if "pod new-" in m[1]]) == 2, v.messages
+            finally:
+                v.close()
+        assert old == [0, 0], old
+        print("S24: the cursor after the clock in %d of 3 ticks, alarms per tick %s, repeats of the earlier line %d, old failures alarmed after a missing or corrupt state %s" % (after, counts, counts[2][0], old))
+    finally:
+        w.close()
+
+
+def s25(module):
+    msg = "a raising send left no audit entry"
+    w = AlarmWorld(module, {"worker-1": "lane-a"})
+    try:
+        def boom(*args, **more):
+            raise RuntimeError("the send raised")
+        real = w.send
+        w.send = boom
+        w.line(T0 - 5, "worker-1", False, "no network")
+        raised = 0
+        try:
+            w.tick()
+        except Exception:
+            raised = 1
+        assert len(w.entries) == 1, "%s: %d audit entries" % (msg, len(w.entries))
+        assert raised == 0, "a raising send was raised into the pass"
+        assert os.path.exists(os.path.join(w.dir, module.STATE_FILE)), "the state was not written"
+        w.send = real
+        w.tick(T0 + 5)
+        assert w.messages == [], w.messages
+        print("S25: audit entries %d, state written 1, exceptions raised %d, further sends %d" % (len(w.entries), raised, len(w.messages)))
+    finally:
+        w.close()
+
+
+def s26(text):
+    start = text.index("**The alarm on a failed token renewal (#1579).**")
+    section = text[start:text.index("\n", start)]
+    assert "written by a temporary file and a rename" in section, "the document does not say the state is written by a temporary file and a rename"
+    assert "AT LEAST ONCE" in section and "a crash between the send and the write repeats one round" in section, "the document does not say the alarm is at least once"
+    assert "keeps its state in memory" in section and "one line on standard error" in section, "the document does not say an unwritable state is kept in memory"
+    print("S26: sentences found 3 of 3")
+
+
+S24_S25_MUTANTS = {
+    "s24": ("does not clamp the cursor", "clamped = cursor is not None and cursor > now", "clamped = False"),
+}
+
+
+class TestCloudRenewalAlarmContinuation(unittest.TestCase):
+    """The control (the unmutated module) runs FIRST, then the copy with the mutation asserted applied, each in a child process."""
+
+    DOC = TESTS_DIR.parent.parent / "docs" / "switchboard.md"
+
+    def child(self, scenario, path):
+        code = "import sys; sys.path.insert(0, %r); import test_cloud_renewal_alarm as t; t.%s(t.load(%r))" % (str(TESTS_DIR), scenario, str(path))
+        import subprocess
+        proc = subprocess.run([sys.executable, "-B", "-c", code], capture_output=True, text=True, timeout=90)
+        return proc.returncode, proc.stdout + proc.stderr
+
+    def mutant(self, scenario, old, new, text):
+        scratch = Path(tempfile.mkdtemp(prefix="alarm-mutant-"))
+        self.addCleanup(shutil.rmtree, str(scratch), True)
+        source = (BIN / "cloud_renewal_alarm.py").read_text()
+        self.assertEqual(self.child(scenario, BIN / "cloud_renewal_alarm.py")[0], 0, "the control failed")
+        self.assertEqual(source.count(old), 1, "the mutation is not applied: the text is not found once")
+        copy = scratch / "mutant.py"
+        copy.write_text(source.replace(old, new, 1))
+        code, out = self.child(scenario, copy)
+        self.assertEqual(code, 1, out[-300:])
+        self.assertIn(text, out)
+
+    def test_s24_the_cursor_is_clamped_to_the_clock_and_a_line_is_alarmed_once(self):
+        s24(load())
+        self.mutant("s24", *S24_S25_MUTANTS["s24"][1:], "a cursor ahead of the clock hid a line")
+
+    def test_s25_a_raising_send_leaves_its_audit_entry_and_its_state(self):
+        s25(load())
+        source = (BIN / "cloud_renewal_alarm.py").read_text()
+        head = source.index("    except Exception:\n        pass   # nothing raises into the daemon pass")
+        tail = source.index("    return sent\n", head)
+        old = source[head:tail]
+        new = ("    finally:\n        _persist(state_path, state)\n    if engine.audit is not None:\n"
+               "        for pod, (worker, reason) in sorted(alarms.items()):\n"
+               "            engine.audit.append(engine.actor, EVENT, pod, {\"told\": sorted(set(told.get(pod, []))), \"reason\": reason, \"group\": len(by_reason.get(reason, [pod]))})\n")
+        self.mutant("s25", old, new, "a raising send left no audit entry")
+
+    def test_s26_the_document_says_what_the_alarm_writes_and_that_it_is_at_least_once(self):
+        text = self.DOC.read_text()
+        s26(text)
+        sentence_start = text.index("The alarm is AT LEAST ONCE:")
+        sentence_end = text.index("never loses an alarm.", sentence_start) + len("never loses an alarm.")
+        copy = text[:sentence_start] + text[sentence_end:]
+        self.assertNotEqual(copy, text)
+        with self.assertRaises(AssertionError) as raised:
+            s26(copy)
+        self.assertIn("the document does not say the alarm is at least once", str(raised.exception))
+
+
 if __name__ == "__main__":
     unittest.main()
