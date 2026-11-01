@@ -278,6 +278,11 @@ def last_message(directory, state, pod, clock=None):
         name = os.path.basename(str(directory).rstrip("/"))
         if not _LAST_NAME_RE.fullmatch(name):
             return None, "no run record"
+        # PC-7: only a child of the run record root, named `<pod>-<UTC stamp>-<6 hex>` for THIS pod
+        if not _name_ok(pod) or not re.fullmatch(re.escape(pod) + r"-\d{8}T\d{6}Z-[0-9a-f]{6}", name, re.ASCII):
+            return None, "no run record"
+        if os.path.dirname(os.path.abspath(str(directory))) != os.path.abspath(str(_runs_root())):
+            return None, "no run record"
         text, why = _last_worker_text(directory)
         if text is None:
             return None, why.replace("the transcript of the run record holds no text from the worker", "no text from the worker") \

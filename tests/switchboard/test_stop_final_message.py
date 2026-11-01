@@ -176,7 +176,7 @@ class TestStopFinalMessage(unittest.TestCase):
     def retire_run(self, code, reports_to="boss-lane"):
         """(messages sent, exit) of cmd_retire for a fake pod whose stop answers `code`."""
         w = World(self)
-        w.pod("cp-1788r", "my final words", boss=reports_to)
+        rec = w.pod("cp-1788r", "my final words", boss=reports_to)
         cloud = sb.load_module("cloud_worker").bind(sb.__dict__)
         engine = mock.Mock()
         engine.send = lambda sender, to, text: w.sent.append((to, text))
@@ -184,7 +184,7 @@ class TestStopFinalMessage(unittest.TestCase):
         record = {"worker": "cp-1788r", "reports_to": reports_to}
         cluster = mock.MagicMock()
         with mock.patch.dict(cloud.H, {"build_engine": lambda *a, **k: (engine, w.state, None), "gates_caller_kind": lambda *a: ("person",)}), \
-                mock.patch.object(cloud, "run_launcher", lambda *a, **k: (code, {"pushed": True}, "note")), \
+                mock.patch.object(cloud, "run_launcher", lambda *a, **k: (code, {"pushed": True, "record": str(rec)}, "note")), \
                 mock.patch.object(cloud, "Cluster", lambda *a, **k: cluster), mock.patch.object(cloud, "_audit"), \
                 mock.patch.object(cloud, "_registry_note"), mock.patch.object(cloud, "_keep_boss"), mock.patch.object(cloud, "remove_record"):
             try:
