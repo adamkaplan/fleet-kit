@@ -99,6 +99,72 @@ def role_claims(text):
             raise AssertionError("ROLE-MISSING step 1 lacks %s" % need)
 
 
+def run_many(tool, root, prs, diffs):
+    """Run `tool` with a fake `gh` that answers `pr list` with `prs` and `pr diff N --name-only` with diffs[N] = (names, exit status); returns (done, the numbers asked)."""
+    repo = make_repo(tempfile.mkdtemp(dir=root))
+    bindir = Path(tempfile.mkdtemp(dir=root))
+    (bindir / "list.out").write_text(json.dumps(prs))
+    (bindir / "calls").write_text("")
+    for number, (names, rc) in diffs.items():
+        (bindir / ("diff.%s.out" % number)).write_text("\n".join(names))
+        (bindir / ("diff.%s.rc" % number)).write_text(str(rc))
+    gh = bindir / "gh"
+    gh.write_text("#!/bin/sh\ncase \"$2\" in\n  list) cat '%s/list.out'; exit 0;;\n  diff) echo \"$3\" >> '%s/calls'; cat \"%s/diff.$3.out\"; exit $(cat \"%s/diff.$3.rc\");;\nesac\nexit 9\n" % (bindir, bindir, bindir, bindir))
+    gh.chmod(0o755)
+    env = dict(os.environ, PATH="%s:%s" % (bindir, os.environ["PATH"]))
+    done = subprocess.run([sys.executable, str(tool), "--base", "main"], cwd=repo, env=env, capture_output=True, text=True)
+    return done, (bindir / "calls").read_text().split()
+
+
+def cut_pr(number, listed_names, count=139):
+    return {"number": number, "title": "edit f", "files": [{"path": n} for n in listed_names], "changedFiles": count}
+
+
+def plain_names(count, extra=()):
+    return ["src/f%03d.py" % i for i in range(count - len(extra))] + list(extra)
+
+
+def not_whole_numbers(done):
+    lines = [l for l in done.stdout.splitlines() if l.startswith("not whole (")]
+    return [int(n) for n in re.findall(r"#(\d+)", lines[0].split(":", 1)[1])] if lines else []
+
+
+def bound_claims(tool, root):
+    """S10: 25 cut pull requests (100 listed, 139 counted), the fake diff answers 139 names: exactly 20 calls, the first 20 read whole, the last 5 not whole."""
+    prs = [cut_pr(100 + i, plain_names(100)) for i in range(1, 26)]
+    done, calls = run_many(tool, root, prs, {100 + i: (plain_names(139), 0) for i in range(1, 26)})
+    if done.returncode != 0:
+        raise AssertionError("BOUND-RUN the tool failed: %r" % done.stderr)
+    if len(calls) != 20:
+        raise AssertionError("BOUND %d gh pr diff calls where 20 are expected" % len(calls))
+    if not_whole_numbers(done) != list(range(121, 126)):
+        raise AssertionError("BOUND-LIST the not whole line is %r where #121..#125 are expected" % not_whole_numbers(done))
+
+
+def trust_claims(tool, root):
+    """S11: the tool compares the NUMBER of the fetched names with changedFiles, not their content (a stated limit). The fetched names hold the daemon file,
+    so a wrongly trusted answer would put the pull request in the overlap report."""
+    listed = plain_names(100)
+    for what, count in (("138", 138), ("140", 140)):
+        done, calls = run_many(tool, root, [cut_pr(7, listed)], {7: (plain_names(count, [DAEMON]), 0)})
+        if done.returncode != 0 or calls != ["7"] or not_whole_numbers(done) != [7] or "#7 edit f" in done.stdout:
+            raise AssertionError("TRUSTED an answer of %s names for a count of 139 is used: %r %r" % (what, done.stdout, done.stderr))
+    done, calls = run_many(tool, root, [cut_pr(7, listed)], {7: (plain_names(139, [DAEMON]), 0)})
+    if done.returncode != 0 or not_whole_numbers(done) != [] or "#7 edit f" not in done.stdout:
+        raise AssertionError("TRUSTED-NOT an answer of 139 names is not read whole: %r %r" % (done.stdout, done.stderr))
+
+
+def partial_claims(tool, root):
+    """S12: both whole-reads fail. #7 lists the daemon file, #8 lists neither file."""
+    prs = [cut_pr(7, plain_names(100, [DAEMON])), cut_pr(8, plain_names(100))]
+    done, calls = run_many(tool, root, prs, {7: ([], 1), 8: ([], 1)})
+    if done.returncode != 0 or not_whole_numbers(done) != [7, 8]:
+        raise AssertionError("PARTIAL-LINE the not whole line is %r where #7 #8 are expected: %r" % (not_whole_numbers(done), done.stderr))
+    reported = re.findall(r"^#(\d+) edit f$", done.stdout, re.M)
+    if reported != ["7"] or "1 open pull requests touch the daemon or its tests" not in done.stdout:
+        raise AssertionError("PARTIAL %d pull requests in the report where 1 (#7 only) is expected: %r" % (len(reported), done.stdout))
+
+
 def build():
     host = HOST
 
@@ -169,5 +235,39 @@ def build():
                     self.assertEqual(verdict(perms, "shell", command), "allow", (role, command))
                 for command in ("gh pr diff 9 --name-only > out.txt", "gh pr view 9 --json changedFiles >> out"):
                     self.assertEqual(verdict(perms, "shell", command), "deny", (role, command))
+
+        def test_s10_the_bound_of_20_fetches_and_the_rest_are_listed_not_whole(self):
+            """25 pull requests, each cut (100 listed, 139 counted): 20 `gh pr diff` calls, #121..#125 are `not whole`."""
+            bound_claims(TOOL, self.root)   # the unmutated control
+
+        def test_s10_a_tool_with_no_bound_is_caught(self):
+            mutant = self.tool_with("names is None and fetched < WHOLE_FETCH_BOUND:", "names is None:")
+            with self.assertRaisesRegex(AssertionError, r"^BOUND 25 gh pr diff calls where 20 are expected"):
+                bound_claims(mutant, self.root)
+
+        def test_s10_a_tool_with_a_bound_of_21_is_caught(self):
+            mutant = self.tool_with("WHOLE_FETCH_BOUND = 20 ", "WHOLE_FETCH_BOUND = 21 ")
+            with self.assertRaisesRegex(AssertionError, r"^BOUND 21 gh pr diff calls where 20 are expected"):
+                bound_claims(mutant, self.root)
+
+        def test_s11_fetched_names_of_the_wrong_number_are_not_used(self):
+            """The tool compares the NUMBER of the fetched names with changedFiles (138 and 140 against 139 are refused, 139 is read whole), not their
+            content: a stated limit (139 wrong names are trusted)."""
+            trust_claims(TOOL, self.root)   # the unmutated control
+
+        def test_s11_a_tool_that_takes_the_fetched_names_without_comparing_is_caught(self):
+            mutant = self.tool_with("return names if len(names) == total else None", "return names")
+            with self.assertRaisesRegex(AssertionError, r"^TRUSTED an answer of 138 names"):
+                trust_claims(mutant, self.root)
+
+        def test_s12_a_pull_request_not_whole_is_read_from_its_listed_names(self):
+            """KNOWN LIMIT, what the code does today: the overlap of a pull request that is not whole is computed from the names that are listed (a lower
+            bound). Both are named `not whole`; only the one whose listed names hold the daemon file is in the overlap report."""
+            partial_claims(TOOL, self.root)   # the unmutated control
+
+        def test_s12_a_tool_that_reads_a_pull_request_not_whole_as_having_no_names_is_caught(self):
+            mutant = self.tool_with('names = {f.get("path") for f in pr.get("files") or [] if isinstance(f, dict)}', "names = set()")
+            with self.assertRaisesRegex(AssertionError, r"^PARTIAL 0 pull requests in the report where 1 "):
+                partial_claims(mutant, self.root)
 
     return TestChangedFilesWhole
