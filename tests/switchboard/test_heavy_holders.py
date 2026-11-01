@@ -193,23 +193,28 @@ class TestHeavyHolders(unittest.TestCase):
         with mock.patch("os.lstat", lstat), mock.patch("os.listdir", listdir):
             self.assertEqual(self.hs._proc_lock_pids(str(lock), str(root)), {301})
 
-    def test_e_a_lock_deleted_while_held_is_not_found(self):
+    def test_e_a_lock_present_while_held_is_found(self):
         lock = self.tmp / "lock"
         lock.write_text("")
         root = self.tmp / "proc3"
         (root / "401" / "fd").mkdir(parents=True)
         # the fake fd link points directly at the lock: the stat follows it to the lock itself, on any platform
         os.symlink(str(lock), root / "401" / "fd" / "7")
-        self.assertEqual(self.hs._proc_lock_pids(str(lock), str(root)), {401})   # present: found
-        # the deleted-while-held half needs a real process directory: a symlink cannot model a deleted lock
-        # (on macOS /dev/fd/N has another st_dev), so it runs only where /proc/self/fd exists
-        if os.path.isdir("/proc/self/fd"):
-            os.unlink(root / "401" / "fd" / "7")
-            with open(lock) as held:
-                os.symlink("/proc/self/fd/%d" % held.fileno(), root / "401" / "fd" / "7")
-                os.unlink(lock)
-                # the fd link still stats the open inode, but the path stat fails, so nothing is compared: an empty set
-                self.assertEqual(self.hs._proc_lock_pids(str(lock), str(root)), set())
+        self.assertEqual(self.hs._proc_lock_pids(str(lock), str(root)), {401})
+
+    def test_e2_a_lock_deleted_while_held_is_not_found(self):
+        if not os.path.isdir("/proc/self/fd"):
+            self.skipTest("no process directory (/proc/self/fd): the macOS holder read is the lsof route, covered by test_s6/test_s7")
+        lock = self.tmp / "lock"
+        lock.write_text("")
+        root = self.tmp / "proc3"
+        (root / "401" / "fd").mkdir(parents=True)
+        # a symlink cannot model a deleted lock (on macOS /dev/fd/N has another st_dev), so this needs a real process directory
+        with open(lock) as held:
+            os.symlink("/proc/self/fd/%d" % held.fileno(), root / "401" / "fd" / "7")
+            os.unlink(lock)
+            # the fd link still stats the open inode, but the path stat fails, so nothing is compared: an empty set
+            self.assertEqual(self.hs._proc_lock_pids(str(lock), str(root)), set())
 
     def run_wrapper(self, name, stranger):
         """One wrapper run in a world without lsof; returns (merged text and status, stdout, stderr and status of a second, separate run's streams)."""
