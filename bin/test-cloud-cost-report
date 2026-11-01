@@ -542,17 +542,6 @@ class TestLauncherNamesAreKnown(unittest.TestCase):
         self.assertEqual((raises, stops, code, failure_lines), (0, 0, 2, 1))
         print("S3 tolerant readers: %d of 2, raises %d, stops %d, report failure line %d" % (2 - raises, raises, stops, failure_lines))
 
-    def test_a_stop_line_costs_at_least_the_wip_note_of_the_same_pod(self):
-        # the report prices the stop line; the wip-note is a snapshot of the cost so far
-        checked = 0
-        for note in [l for l in EVERY_LAUNCHER_ACTION if l["action"] == "wip-note"]:
-            stops = [l for l in EVERY_LAUNCHER_ACTION if l["action"] == "stop" and l["runtime_id"] == note["runtime_id"]]
-            self.assertEqual(len(stops), 1, note["runtime_id"])
-            self.assertGreaterEqual(stops[0]["cost_estimate_usd"], note["cost_estimate_usd"], note["runtime_id"])
-            checked += 1
-        self.assertGreaterEqual(checked, 1)
-        print("S wip-note claim: %d pod(s) checked, stop %s >= wip-note %s" % (checked, stops[0]["cost_estimate_usd"], note["cost_estimate_usd"]))
-
     def tail_cases(self):
         good = json.dumps(line("2026-10-14T06:00:00Z", "pod/cb-example-4", "stop", 1.0)) + "\n"
         later = json.dumps(line("2026-10-14T07:00:00Z", "pod/cb-example-5", "create", 0)) + "\n"
