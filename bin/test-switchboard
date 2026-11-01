@@ -60,8 +60,6 @@ import uuid
 import urllib.parse
 from unittest import mock
 
-BIN = Path(__file__).resolve().parent
-REPO = BIN.parent
 os.environ["GIT_TERMINAL_PROMPT"] = "0"   # #1050: a test's git never opens a credential dialog
 os.environ["GCM_INTERACTIVE"] = "never"
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tests" / "switchboard"))   # support import
@@ -88,6 +86,7 @@ BLOCKED_GUARD_KILLERS, BLOCKED_TEXT_MUTANTS, OLD_AGENT_SOURCES, _fold, _matches,
 _support_process_and_ci = importlib.import_module("support.process_and_ci")   # support import
 EXEC_CHILD, OLD_SOURCE_ALLOWED, SHELL_HOOK_CASES, USE_COMMANDS, _alive, _zip_with, apply_edit_intent, apply_handoff_step, ci_run, classified_in_audit, light_guard_sites, load_ci_runs, parse_plugin_manifest, s5_issue, tracked_files, watch_parent = (_support_process_and_ci.EXEC_CHILD, _support_process_and_ci.OLD_SOURCE_ALLOWED, _support_process_and_ci.SHELL_HOOK_CASES, _support_process_and_ci.USE_COMMANDS, _support_process_and_ci._alive, _support_process_and_ci._zip_with, _support_process_and_ci.apply_edit_intent, _support_process_and_ci.apply_handoff_step, _support_process_and_ci.ci_run, _support_process_and_ci.classified_in_audit, _support_process_and_ci.light_guard_sites, _support_process_and_ci.load_ci_runs, _support_process_and_ci.parse_plugin_manifest, _support_process_and_ci.s5_issue, _support_process_and_ci.tracked_files, _support_process_and_ci.watch_parent)   # support import
 _support_paths = importlib.import_module("support.paths")   # support import
+BIN, REPO = (_support_paths.BIN, _support_paths.REPO)   # support import
 _support_offline_fakes = importlib.import_module("support.offline_fakes")   # support import
 ClosingRunner, FakeGH, FakeV1, OfflineRun, apply_worker_step, attach_intent_lab, control_play, run_scenario = (_support_offline_fakes.ClosingRunner, _support_offline_fakes.FakeGH, _support_offline_fakes.FakeV1, _support_offline_fakes.OfflineRun, _support_offline_fakes.apply_worker_step, _support_offline_fakes.attach_intent_lab, _support_offline_fakes.control_play, _support_offline_fakes.run_scenario)   # support import
 _support_helper_fakes = importlib.import_module("support.helper_fakes")   # support import
