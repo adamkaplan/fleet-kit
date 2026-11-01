@@ -29286,7 +29286,7 @@ class LedgerBase(Base):
             return subprocess.CompletedProcess(argv, 0, json.dumps(self.plan_issue), "")
         if "/actions/runs" in path:
             run = {"id": 1, "head_sha": self.pr["headRefOid"], "status": "completed", "conclusion": "success",
-                   "pull_requests": [{"number": 9, "base": {"sha": "t" * 40}}]}
+                   "pull_requests": [{"number": n, "base": {"sha": "t" * 40}} for n in (9, 11)]}
             return subprocess.CompletedProcess(argv, 0, json.dumps({"workflow_runs": [run]}), "")
         if "/git/ref/heads/" in path:
             return subprocess.CompletedProcess(argv, 0, json.dumps({"object": {"sha": "t" * 40}}), "")
@@ -78387,7 +78387,7 @@ class TestCiRecordCarry(LedgerBase):
                 body = {"status": "behind"}
             elif "/actions/runs" in path:
                 body = {"workflow_runs": [{"id": 1, "head_sha": self.pr["headRefOid"], "status": "completed", "conclusion": "success",
-                                           "pull_requests": [{"number": 9, "base": {"sha": "t" * 40}}]}]}
+                                           "pull_requests": [{"number": n, "base": {"sha": "t" * 40}} for n in (9, 11)]}]}
             elif "/git/ref/heads/" in path:
                 body = {"object": {"sha": "t" * 40}}
             else:
