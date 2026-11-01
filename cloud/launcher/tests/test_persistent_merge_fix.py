@@ -1,0 +1,188 @@
+"""Ask #1509, the merge fixes (plan 774ab33b): S18 (the refusal table row of the persistent flag without cloud), S19 (the reaper's renewal and the
+wip note know a persistent pod), S20 (the cost figure follows the orchestrator row) and S21 (the created-words entries; part two, the two refusals
+create nothing, is further down). Every printed count is computed and asserted; each mutant is counted as applied and its control runs first.
+Offline; the temp trees live outside the repository and are removed."""
+import datetime as dt
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import unittest
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+sys.path.insert(0, os.path.join(HERE, "..", "..", "worker", "tests"))
+import stub_support  # noqa: E402
+import test_persistent_orchestrator as po  # noqa: E402
+
+cw, mutant, ROOT = po.cw, po.mutant, po.ROOT
+BIN_SWITCHBOARD_TEST = os.path.join(ROOT, "bin", "test-switchboard")
+ROW_LINE = '''            ' > getattr(args, "persistent", Fa|return EXIT_USAGE': (B + ["--persistent"], []),\n'''
+RESULT = "refused before any pod exists: it says nothing was created"
+ENTRY_LINES = ["        '--persistent is only for --age': '%s',\n" % RESULT, "        '--persistent does not combine ': '%s',\n" % RESULT]
+DERIVED = "test_s6_every_refusal_exit_derived_from_the_source_has_a_row_and_sends_exactly_one_message"
+CREATED = "test_s9_no_raise_of_the_launcher_mentions_a_created_worker_in_other_words"
+BLOCK_RENEWAL = '''            if ann(pod, "persistent") is not None:   # a persistent pod has no hard deadline: it is always before its limit
+                if self._persistent_owned(pod):   # only a pod whose own workload is read and owns it is renewed; the reap pass reports the others
+                    out.append(pod)
+                continue
+'''
+BLOCK_NOTE = '''            if ann(pod, "persistent") is not None:   # an always-on orchestrator is not asked to push at minute 40
+                continue
+'''
+FORBIDDEN = 'Error from server (Forbidden): statefulsets.apps "%s" is forbidden: User "cw-operator" cannot get resource "statefulsets" in API group "apps" in the namespace "cw"\n' % po.NAME
+
+
+class CopyRun(unittest.TestCase):
+    """A copy of bin/test-switchboard in a temp tree whose other entries are links to the repository's: it runs ONE test of the class."""
+
+    def run_copy(self, text, k):
+        tmp = tempfile.mkdtemp(prefix="cw-merge-fix-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        os.makedirs(os.path.join(tmp, "bin"))
+        for entry in os.listdir(ROOT):
+            if entry not in ("bin", ".git"):
+                os.symlink(os.path.join(ROOT, entry), os.path.join(tmp, entry))
+        for entry in os.listdir(os.path.join(ROOT, "bin")):
+            if entry != "test-switchboard":
+                os.symlink(os.path.join(ROOT, "bin", entry), os.path.join(tmp, "bin", entry))
+        target = os.path.join(tmp, "bin", "test-switchboard")
+        with open(target, "w") as f:
+            f.write(text)
+        os.chmod(target, 0o755)
+        p = stub_support.start(self, [sys.executable, target, "-k", k], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        out, _ = p.communicate(timeout=90)
+        return p.returncode, out
+
+    def source(self):
+        with open(BIN_SWITCHBOARD_TEST) as f:
+            return f.read()
+
+
+class S18Row(CopyRun):
+    def test_s18_the_control_with_the_row_passes_and_the_table_without_it_fails_with_the_anchored_text(self):
+        src = self.source()
+        self.assertEqual(src.count(ROW_LINE), 1)
+        code, out = self.run_copy(src, DERIVED)
+        self.assertEqual(code, 0, out[-600:])   # the control: 1 of 1
+        mutated = src.replace(ROW_LINE, "")
+        self.assertEqual(len(src) - len(mutated), len(ROW_LINE))   # the mutation applied, counted
+        code, out = self.run_copy(mutated, DERIVED)
+        self.assertNotEqual(code, 0)
+        self.assertIn("a derived exit has no row, or a row no exit", out)
+
+
+class S21Entries(CopyRun):
+    def test_s21_the_control_passes_and_the_copy_without_the_two_entries_names_the_stray_raise(self):
+        src = self.source()
+        for line in ENTRY_LINES:
+            self.assertEqual(src.count(line), 1)
+        code, out = self.run_copy(src, CREATED)
+        self.assertEqual(code, 0, out[-600:])   # the control: 1 of 1
+        mutated = src
+        for line in ENTRY_LINES:
+            mutated = mutated.replace(line, "")
+        self.assertEqual(len(src) - len(mutated), sum(len(x) for x in ENTRY_LINES))   # both mutations applied
+        code, out = self.run_copy(mutated, CREATED)
+        self.assertNotEqual(code, 0)
+        self.assertIn("'--persistent is only for --age'", out)
+        self.assertIn("'--persistent does not combine '", out)
+
+
+class S19Reaper(po.PBase):
+    """The two steps of the reaper that read a deadline, on a persistent pod and on a one-shot pod."""
+
+    def pod(self, name):
+        return self.st()["pods"][name]
+
+    def launcher(self):
+        return self.mod.Launcher(self.mod.Kube(self.env), self.env, self.clock)
+
+    def check_renewal(self):
+        """owned persistent pod seen 1 of 1; its workload unreadable seen 0 of 1; one-shot pod seen before its deadline and not after."""
+        self.launch()
+        pod = self.pod(po.POD)
+        self.assertIsNone(cw.ann(pod, "hard-deadline"))
+        seen = self.launcher()._before_hard_limit([pod], self.clock())
+        self.assertEqual([p["metadata"]["name"] for p in seen], [po.POD], "the owned persistent pod was not renewed")   # renewed 1 of 1
+        self.patch_state(sts_get_stderr=FORBIDDEN)
+        self.assertEqual(self.launcher()._before_hard_limit([pod], self.clock()), [])   # unreadable: renewed 0 of 1
+        self.patch_state(sts_get_stderr="")
+        self.create("one1")
+        one = self.pod(cw.pod_name("one1"))
+        self.assertEqual(len(self.launcher()._before_hard_limit([one], self.clock())), 1)
+        self.clock.advance(hours=3)
+        self.assertEqual(self.launcher()._before_hard_limit([one], self.clock()), [])
+
+    def check_notes(self):
+        """no note and no write for a persistent pod at minute 41; one note for a one-shot pod."""
+        self.launch()
+        self.create("one1")
+        for name in (po.POD, cw.pod_name("one1")):
+            st = self.st()
+            st["pods"][name].setdefault("status", {})["phase"] = "Running"
+            self.write_state(st)
+        self.clock.advance(minutes=41)
+        open(self.env["FAKE_KUBE_CALLS"], "w").close()
+        self.launcher().send_wip_notes([self.pod(po.POD)], self.clock())
+        self.assertEqual(self.writes(), [], "a note or a patch was written to the persistent pod")
+        self.assertEqual([v for v in self.verbs() if v[0] == "exec"], [], "a note was sent to the persistent pod")
+        self.launcher().send_wip_notes([self.pod(cw.pod_name("one1"))], self.clock())
+        self.assertEqual(len([v for v in self.verbs() if v[0] == "exec"]), 1)   # the one-shot pod gets its note
+
+    def test_s19_the_renewal_sees_an_owned_persistent_pod_and_not_an_unreadable_one(self):
+        self.check_renewal()
+
+    def test_s19_a_persistent_pod_gets_no_wip_note_and_a_worker_pod_does(self):
+        self.check_notes()
+
+    def test_s19_the_copy_without_the_renewal_block_fails_the_renewal_check(self):   # its control is the test above (the unmutated file passes)
+        self.mod = mutant(BLOCK_RENEWAL, "")   # applied once (counted by mutant)
+        with self.assertRaises(AssertionError) as caught:
+            self.check_renewal()
+        self.assertIn("the owned persistent pod was not renewed", str(caught.exception))
+
+    def test_s19_the_copy_without_the_note_block_fails_the_no_note_check(self):   # its control is the test above (the unmutated file passes)
+        self.mod = mutant(BLOCK_NOTE, "")
+        with self.assertRaises(AssertionError) as caught:
+            self.check_notes()
+        self.assertIn("a note or a patch was written to the persistent pod", str(caught.exception))
+
+
+class S20Docs(unittest.TestCase):
+    DOCS = {"docs/cloud-operator-quickstart.md": ("(`O`, USD 0.02 an hour) that is USD 0.48 a day", "USD 0.48 a day"),
+            "cloud/launcher/README.md": ("default orchestrator shape `O`: USD 0.48 a day", "USD 0.48 a day")}
+
+    def read(self, rel):
+        with open(os.path.join(ROOT, rel)) as f:
+            return " ".join(f.read().split())
+
+    def check(self, texts):
+        rate = cw.SHAPES[cw.DEFAULT_ORCHESTRATOR_SHAPE]["usd_per_hour"]
+        self.assertEqual(rate, 0.02)
+        figure = "USD %.2f a day" % (24 * rate)
+        self.assertEqual(figure, "USD 0.48 a day")
+        for rel, (sentence, _) in self.DOCS.items():
+            self.assertIn(sentence, texts[rel], rel)
+            self.assertIn(figure, texts[rel], rel)
+        found = re.search(r"USD (\d+\.\d\d) an hour\) that is USD (\d+\.\d\d) a day", texts["docs/cloud-operator-quickstart.md"])
+        self.assertAlmostEqual(float(found.group(2)), 24 * float(found.group(1)), places=2)
+        return len(self.DOCS)
+
+    def test_s20_both_documents_carry_the_figure_of_24_times_the_row(self):
+        self.assertEqual(self.check({rel: self.read(rel) for rel in self.DOCS}), 2)
+
+    def test_s20_a_copy_that_keeps_the_old_figure_fails_and_the_control_passes(self):
+        texts = {rel: self.read(rel) for rel in self.DOCS}
+        self.check(texts)   # the control
+        old = "(`O`, USD 0.02 an hour) that is USD 0.48 a day"
+        self.assertEqual(texts["docs/cloud-operator-quickstart.md"].count(old), 1)
+        texts["docs/cloud-operator-quickstart.md"] = texts["docs/cloud-operator-quickstart.md"].replace(old, "(`S`, USD 0.10 an hour) that is USD 2.40 a day")
+        with self.assertRaises(AssertionError):
+            self.check(texts)
+
+
+if __name__ == "__main__":
+    unittest.main()
