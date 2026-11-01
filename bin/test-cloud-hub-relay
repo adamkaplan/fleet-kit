@@ -396,7 +396,7 @@ class TestBoundsAndCaps(unittest.TestCase):
             self.addCleanup(release_all)
             for i in range(4):          # 4 pods x 4 held waits = 16 held
                 for j in range(4):
-                    t = threading.Thread(target=hub.relay_call, kwargs={"who": "pod-%d" % i, "call_id": "c%d" % j, "pr": "acme-org/r%d#1" % i}); t.start(); threads.append(t)
+                    t = threading.Thread(target=hub.held_call, kwargs={"who": "pod-%d" % i, "call_id": "c%d" % j, "pr": "acme-org/r%d#1" % i}); t.start(); threads.append(t)
             def all_registered():
                 if registered.wait(0.02):
                     return True
