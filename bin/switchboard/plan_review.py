@@ -374,6 +374,7 @@ def review_close(args, runner, now, socket_call=None):
     entries = review_entries(state)
     _refuse_if_abandoned(entries, args.review)
     rnd = _round_of(entries, args.review)
+    _round_pair(rnd)   # #1713: a round that predates the hash pair is refused first, nothing recorded
     if planner != rnd["by"] and planner != "owner":
         raise ReviewError("refused: only the planner who started the review (%s) closes it" % rnd["by"])
     missing = [l for l in rnd["lanes"] if l not in _verdicts_of(entries, args.review, rnd["round"])]
@@ -725,10 +726,13 @@ def review_tick(args, runner, now, socket_call=None):
     review_caller(runner, now, "run the plan review housekeeping")
     engine, state, _ = build_engine(runner, now, "cli", writable=True, socket_call=socket_call)
     entries = review_entries(state)
-    done = {"relaunched": [], "unavailable": [], "reminded": []}
+    done = {"relaunched": [], "unavailable": [], "reminded": [], "skipped": []}
     reviews = sorted({e["review"] for e in entries if e.get("kind") == "round"})
     for review in reviews:
         rnd = _round_of(entries, review)
+        if not rnd.get("plan_hashes"):   # #1713: one round without the pair never aborts the others: skipped and named
+            done["skipped"].append("skipped: %s: this round predates the hash pair" % review)
+            continue
         rnd_stored, _pair = rnd, _round_pair(rnd)   # #1713
         rnd = _canon_round(entries, rnd)[1]
         mine = [e for e in entries if e.get("lineage") == rnd["lineage"]]
