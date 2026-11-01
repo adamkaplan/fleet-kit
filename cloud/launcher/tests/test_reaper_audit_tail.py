@@ -602,8 +602,8 @@ class TestTotalWithGaps(unittest.TestCase):
 
 
 class DipClock(StepClock):
-    """The fake monotonic clock of S8 that returns a value `back` seconds SMALLER at its `at`-th read only (the 3rd read ends the pod list)."""
-    def __init__(self, at=3, back=5.0):
+    """The fake monotonic clock of S8 that returns a value `back` seconds SMALLER at its `at`-th read only (the 2nd read ends the pod list)."""
+    def __init__(self, at=2, back=5.0):
         StepClock.__init__(self)
         self.n, self.at, self.back = 0, at, back
 
