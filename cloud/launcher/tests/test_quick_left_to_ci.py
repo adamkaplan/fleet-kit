@@ -267,7 +267,7 @@ class S10Scope(unittest.TestCase):
     FILES = {"bin/cloud-pr-preflight", "bin/cloud-prepush", "bin/cloud_quick.py", "cloud/README.md",
              "docs/cloud-operator-quickstart.md", "cloud/launcher/tests/test_quick_left_to_ci.py",
              "bin/test-cloud-launcher.chain", "cloud/launcher/tests/chain_unmeasured.list",
-             "cloud/launcher/tests/test_cloud_preflight_quick.py"}
+             "cloud/launcher/tests/test_cloud_preflight_quick.py", "cloud/launcher/tests/test_cloud_quick_scans_run.py"}
 
     def git(self, *a):
         return subprocess.run(["git"] + list(a), cwd=ROOT, capture_output=True, text=True, env=ENV)
