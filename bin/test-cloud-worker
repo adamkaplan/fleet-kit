@@ -106,7 +106,7 @@ tf = os.environ.get("CW_CLOUD_TOKEN_FILE")
 login = {"command": command, "argv": argv, "env": dict(os.environ), "token_ok": bool(tf) and hashlib.sha256(open(tf).read().encode()).hexdigest() == os.environ.get("STUB_TOKEN_SHA"),
          "token_mode": oct(os.stat(tf).st_mode & 0o777) if tf else None}
 open(os.environ["STUB_DIR"] + "/login.log", "a").write(json.dumps(login) + "\\n")
-CREATE_OPTIONS = ("--repo", "--branch", "--idle", "--hard", "--max-hard", "--shape", "--image", "--stack", "--wait", "--pull-secret", "--run-secret-fd", "--run-id", "--password-fd", "--json")   # what the launcher's create knows (main, fb4b9f2)
+CREATE_OPTIONS = ("--repo", "--branch", "--idle", "--hard", "--max-hard", "--shape", "--image", "--stack", "--wait", "--pull-secret", "--run-secret-fd", "--no-commit", "--run-id", "--password-fd", "--json")   # what the launcher's create knows (main, fb4b9f2)
 if command == "create":
     unknown = [a for a in argv[2:] if a.startswith("--") and a not in CREATE_OPTIONS]
     if unknown:
