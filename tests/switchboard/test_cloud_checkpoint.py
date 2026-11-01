@@ -95,4 +95,31 @@ def build(TwoRepoCase, sb, EPOCH, ACME_WEB):
                 code, _, err = self.launch()
             self.assertEqual(code, 0, err)
             self.assertEqual(len([l for l in err.splitlines() if "no checkpoint reminders" in l]), 1)
+
+        def places(self):
+            root = Path(__file__).resolve().parents[2]
+            launch_help = sb.build_parser()._subparsers._group_actions[0].choices["launch"].format_help()
+            doc = (root / "docs/switchboard.md").read_text()
+            return {"the launch help": launch_help,
+                    "skills/fleet-planning/SKILL.md": (root / "skills/fleet-planning/SKILL.md").read_text(),
+                    "skills/fleet-coordination/SKILL.md": (root / "skills/fleet-coordination/SKILL.md").read_text(),
+                    "docs/switchboard.md (Self-wakes)": doc[doc.index("### Self-wakes\n"):]}
+
+        def check_places(self, places):
+            missing = [name for name, text in places.items()
+                       if not ("default" in text and "25m" in text and "40m" in text and "default 25m/40m" in " ".join(text.split()))]
+            self.assertEqual(missing, [], "the derived place lacks the default 25m/40m: %s" % ", ".join(missing))
+            return len(places) - len(missing)
+
+        def test_s7_four_places_say_the_default(self):
+            self.assertEqual(self.check_places(self.places()), 4)
+
+        def test_s7_a_mutant_in_one_place_names_that_place(self):
+            places = self.places()
+            self.check_places(places)   # the control passes first
+            name = "skills/fleet-coordination/SKILL.md"
+            places[name] = places[name].replace("default 25m/40m", "old rule")
+            with self.assertRaises(AssertionError) as failed:
+                self.check_places(places)
+            self.assertIn(name, str(failed.exception))
     return TestCloudLaunchArmsCheckpoint
