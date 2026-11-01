@@ -29276,6 +29276,8 @@ class LedgerBase(Base):
 
     run_base = "t" * 40   # #1755: the base the fake's run list records; a test sets another to make the run stale
 
+    run_base = "t" * 40   # #1755: the base the fake's run list records; a test sets another to make the run stale
+
     def route(self, argv, **kwargs):
         if argv[0] != FAKE_GH:
             return self.world.route(argv, **kwargs)
@@ -29288,10 +29290,12 @@ class LedgerBase(Base):
         path = argv[2]
         if "/comments" in path:
             return subprocess.CompletedProcess(argv, 0, json.dumps(self.comments if "&page=1" in path else []), "")
-        if re.search(r"/issues/7$", path):
+                   "pull_requests": [{"number": n, "base": {"sha": self.run_base}} for n in (9, 11)]}
             return subprocess.CompletedProcess(argv, 0, json.dumps(self.plan_issue), "")
                    "pull_requests": [{"number": n, "base": {"sha": self.run_base}} for n in (9, 11)]}
             run = {"id": 1, "head_sha": self.pr["headRefOid"], "status": "completed", "conclusion": "success",
+        if "/compare/" in path and path.endswith("..." + "t" * 40):
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"ahead_by": 3}), "")
                    "pull_requests": [{"number": n, "base": {"sha": self.run_base}} for n in (9, 11)]}
             return subprocess.CompletedProcess(argv, 0, json.dumps({"workflow_runs": [run]}), "")
         if "/compare/" in path and path.endswith("..." + "t" * 40):
@@ -31618,6 +31622,13 @@ class TestPlanGatesCheck(LedgerBase):
         code, out, err = self.check()
         self.assertEqual((code, out["verdict"], out["reason"]), (0, "allow", "not opted in"))
         self.assertEqual(self.events("gate.would_refuse") + self.events("gate.refused"), [])
+
+    def test_a_stale_run_makes_g4_missing_with_the_stale_line(self):   # #1755; the control is the test below (the default run_base is the tip: it allows)
+        self.all_proven()
+        self.run_base = "s" * 40
+        row = next(r for r in json.loads(self.run_as("coder", "gates", self.PR, "--json")[1])["gates"] if r["gate"] == "G4")
+        self.assertEqual(row["status"], "missing", "the G4 row is missing for a stale run")
+        self.assertEqual(row["missing"], ["stale: 3 commits behind (CI ran on ssssssss, the tip is tttttttt): close and reopen the pull request for a fresh run"], "the G4 row says the stale line")
 
     def test_shadow_allows_and_records_what_enforcement_would_refuse(self):
         code, out, err = self.check("merge")
@@ -39159,6 +39170,14 @@ class TestCiRecordPass(LedgerBase):
 
     def go(self, advance=0):
         if not hasattr(self, "engine_cached"):
+    def test_a_stale_run_records_no_verdict_and_says_the_stale_line(self):   # #1755; the control is the test above (the default run_base is the tip: it records)
+        self.run_base = "s" * 40
+        self.go()
+        self.assertEqual(self.verdicts(), [], "ci-record records no verdict for a stale run")
+        code, out, err = self.run_as("coder", "gates", "ci-record", self.PR)
+        self.assertIn("stale: 3 commits behind (CI ran on ssssssss, the tip is tttttttt): close and reopen the pull request for a fresh run", out + err, "ci-record says the stale line")
+        self.assertEqual(self.verdicts(), [], "ci-record records no verdict for a stale run")
+
             self.engine_cached = self.engine()
         return self.run_pass(self.engine_cached, advance)
 
@@ -51739,6 +51758,8 @@ def baseline_attach_hub(engine, runner, now):
         hub.read_awaiting(repo, now())
 
 
+    run_base = "t" * 40   # #1755: the base the fake's run list records; a test sets another to make the run stale
+
 @contextlib.contextmanager
 def baseline_unreadable_inbox(session_id, failure):
     """ADAPTER: the inbox of one session cannot be read (today V2Client.inbox_list raises)."""
@@ -51753,10 +51774,12 @@ def baseline_unreadable_inbox(session_id, failure):
         yield
 
 
-def baseline_failing_derivation():
+            run = {"id": 1, "head_sha": re.search(r"head_sha=(\w+)", argv[2]).group(1), "status": "completed", "conclusion": "success", "pull_requests": [{"number": n, "base": {"sha": self.run_base}} for n in self.prs]}
     """ADAPTER: the whole derivation raises (today sb.derive_decisions)."""
     return mock.patch.object(sb, "derive_decisions", side_effect=RuntimeError("boom"))
 
+        if argv[0] == FAKE_GH and argv[1] == "api" and argv[2].endswith("..." + "t" * 40):
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"ahead_by": 3}), "")
 
 def baseline_derive(engine, now):
     """ADAPTER: what the derivation lists now and what it could not read, notices included: (decisions, errors)
@@ -52886,6 +52909,15 @@ class TestDecisionBaselineSourceErrors(BaselineWorld):
     def test_a_pass_that_cannot_derive_still_finishes_and_says_so(self):
         with baseline_failing_derivation():
             report = self.world.engine.run_pass()
+    def test_a_stale_run_reads_stale_in_the_notice_facts(self):   # #1755; the control is test_a_notice_its_facts_and_its_life above (the default run_base is the tip: its golden reads "green")
+        self.run_base = "s" * 40
+        self.prs[7] = pr_view_json()
+        self.step("api-coder", "notice", "pr", "acme/api#7", "ready", "for", "review")
+        self.daemon_pass()
+        (notice,) = [d for d in self.file_body()["decisions"] if d["kind"] == "notice"]
+        self.assertEqual(json.dumps(notice).count("stale: 3 behind"), 1, "the panel notice facts read stale: 3 behind")
+        self.assertNotIn('"ci": "green"', json.dumps(notice), "the panel notice facts do not read green")
+
         baseline_golden(self, "source-pass-cannot-derive", [(e["step"], "boom" in str(e)) for e in report["errors"]])
 
 
@@ -78395,9 +78427,11 @@ class TestProofNamesFilesByDefault(LedgerBase):
             self.assertIn(item, section)
 
 
-class TestCiRecordCarry(LedgerBase):
+                                           "pull_requests": [{"number": n, "base": {"sha": self.run_base}} for n in (9, 11)]}]}
     """#1217: the CI-verdict recording step (`gates ci-record`, and the daemon pass through the same `ci_record_core`) carries the proofs the #1213 rule allows, one `carried` line each.
     Fakes only: GitHub's compare, commit and default-branch reads are served here."""
+            elif path.endswith("..." + "t" * 40):
+                body = {"ahead_by": 3}
 
     NEW = LEDGER_NEW_HEAD
     API = "repos/acme/app"
