@@ -896,8 +896,9 @@ def canonical_hash(stored, hashes):
 
 
 def plan_hash(text):
-    """sha256 of the WHOLE plan text, whitespace collapsed. Approval (G0c) and consensus (G0b) bind to this one: an edit
+    """sha256 of the WHOLE plan text, whitespace collapsed, with ONE trailing marker line removed (the last non-blank line, only when it is exactly <!-- fleet-switchboard:from=<name> -->). Approval (G0c) and consensus (G0b) bind to this one: an edit
     to constraints, scope or risks changes it as well as an edit to a scenario."""
+    text = _without_trailing_marker(text)
     return "sha256:" + hashlib.sha256(" ".join((text or "").split()).encode("utf-8")).hexdigest()
 
 
