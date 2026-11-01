@@ -3474,7 +3474,7 @@ class RenewalTicker:
                 if refresh.state == "failed":   # one line per failure, not one per look
                     print("cloud-worker: the login refresh failed: %s" % scrub(getattr(refresh, "reason", ""), (), 200), file=sys.stderr)
                 if self.L.kube is not None and refresh.token:
-                    self.L.kube.add_secrets(refresh.token)
+                    self.L.kube.add_secrets(refresh.token, life=secret_life_until())
                 self.L.renew_git_tokens(self.L._before_hard_limit(self.L.kube.list_pods(), now), now)
         except Exception as e:   # the thread goes on: the next tick tries again
             print("cloud-worker: the renewal thread: %s" % scrub(e, (), 200), file=sys.stderr)
