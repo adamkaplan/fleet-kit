@@ -503,5 +503,42 @@ class TestPushWatch(Case):
         broad = self.mutant("except (OSError, ValueError):   # a corrupt", "except Exception:   # a corrupt")
         self._fails(lambda: self._load_case("{}", broad, boom) and None or (_ for _ in ()).throw(AssertionError("a RuntimeError of the reader was swallowed as an empty state")), "a RuntimeError of the reader was swallowed as an empty state")
 
+    def _launcher_read(self, lines, reader=None, module=None):
+        self.setUp()
+        with open(self.launcher, "w") as handle:
+            handle.write("".join(l + "\n" for l in lines))
+        if reader:
+            self.ns.parse_bounded = reader
+        state = {"workers": {}, "offset": None, "stopped": {}, "reported": {}}
+        (module or self.pw)._read_launcher(self.ns, self.launcher, state, parse_iso)
+        return state
+
+    def _good(self, worker, action):
+        return json.dumps({"worker": worker, "action": action, "ok": True, "ts": "2027-01-15T08:01:00Z"})
+
+    def test_launcher_corrupt_line_between_good_lines_is_skipped_and_the_pass_goes_on(self):
+        state = self._launcher_read([self._good("w-a", "stop"), "{not json", self._good("w-b", "report")])
+        self.assertEqual(sorted(state["stopped"]), ["w-a"])
+        self.assertEqual(sorted(state["reported"]), ["w-b"])
+        self.run_pass(NOW)   # the whole pass over the same file raises nothing
+
+    def test_launcher_too_deep_line_is_skipped_the_same_way(self):
+        deep = lambda t: (_ for _ in ()).throw(ValueError("nested too deep")) if t.startswith("[[") else json.loads(t)
+        state = self._launcher_read([self._good("w-a", "stop"), "[[[[", self._good("w-b", "report")], reader=deep)
+        self.assertEqual(sorted(state["stopped"]), ["w-a"])
+        self.assertEqual(sorted(state["reported"]), ["w-b"])
+
+    def test_launcher_programming_error_propagates_and_the_broad_except_mutant_fails(self):
+        boom = lambda t: (_ for _ in ()).throw(RuntimeError("bug"))
+        with self.assertRaises(RuntimeError):
+            self._launcher_read([self._good("w-a", "stop")], reader=boom)
+        text = (REPO / "bin" / "push_watch.py").read_text()
+        self.assertEqual(text.count("        except ValueError:\n            continue"), 1)
+        mutant = types.ModuleType("push_watch_mutant")
+        exec(compile(text.replace("        except ValueError:\n            continue", "        except Exception:\n            continue"), "push_watch.py", "exec"), mutant.__dict__)
+        self._fails(lambda: self._launcher_read([self._good("w-a", "stop")], reader=boom, module=mutant) and self.fail(
+            "a RuntimeError of the launcher reader was swallowed as a corrupt line"),
+            "a RuntimeError of the launcher reader was swallowed as a corrupt line")
+
 if __name__ == "__main__":
     unittest.main()
