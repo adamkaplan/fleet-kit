@@ -838,6 +838,8 @@ def _launch(args, runner, now, reserve):
                 remove_record(state, name)
             raise
     _registry_note(engine, "upsert", state, name, {"session": session, "repo": repo, "role": args.role, "kind": "cloud", "run_id": run_id, "state": "working"})   # a cloud worker is an agent (#903)
+    if not ((os.environ.get("CW_HUB_CHANNEL_URL") or "").strip() or (os.environ.get("CW_HUB_REGISTRY_SECRET") or "").strip()):   # no hub setting: say so at launch
+        print("%s: this pod has no channel: it cannot report or record a verdict; its last message is saved in its run record when it stops; `read NAME` works only while it runs or after the lane's own retire" % H["PROG"], file=sys.stderr)
     print(json.dumps({"name": name, "session": session, "runtime_id": record["runtime_id"], "url": record["url"], "cloud": True}, sort_keys=True))
     return H["EXIT_OK"]
 
