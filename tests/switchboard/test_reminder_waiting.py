@@ -192,6 +192,44 @@ def build(PR4Base):
             self.assertEqual(counts["lane-a"], 3)
             self.assertEqual(counts["lane-b"], 1)
             self.assertEqual(len(lines), 2)
+        def audit_window_fixture(self):
+            """ONE audit file written once: a junk line, a late lane-a reminder OUTSIDE the window, a pad line, then the last 8 MiB, which start exactly at
+            the first byte of a late lane-b `reminder.add` line. The window holds the lane-b delivery (last), two late lane-a reminders, an array and a
+            broken line. Returns (directory, now)."""
+            import json, tempfile
+            base = 1_800_000_000
+            stamp = lambda e: sb.iso(e)
+            add = lambda lane, n, due: json.dumps({"ts": stamp(due - 60), "event": "reminder.add", "subject": lane, "detail": {"id": n, "at": stamp(due)}})
+            sent = lambda lane, n, due: json.dumps({"ts": stamp(due + 1500), "event": "v2.synthetic", "subject": lane, "detail": {"keys": ["reminder:" + n]}})
+            pad = lambda size: json.dumps({"pad": "x" * (size - 10)})   # a JSON object of exactly `size` characters
+            cap = 8 * 1024 * 1024
+            head = "\n".join(['{"junk": 1}', add("lane-a", "out", base), sent("lane-a", "out", base)]) + "\n"
+            head += pad(1000) + "\n"
+            window = [add("lane-b", "b1", base + 100), add("lane-a", "a1", base + 200), sent("lane-a", "a1", base + 200), add("lane-a", "a2", base + 300),
+                      sent("lane-a", "a2", base + 300), "[1, 2]", "this is not json"]
+            tail = sent("lane-b", "b1", base + 100) + "\n"
+            fixed = "\n".join(window) + "\n"
+            middle = cap - len(fixed) - len(tail) - 1 - 1
+            window_text = fixed + pad(middle) + "\n" + tail
+            text = head + window_text
+            raw = text.encode()
+            assert len(window_text.encode()) == cap and len(raw) <= 8_500_000, (len(window_text.encode()), len(raw))
+            tmp = tempfile.TemporaryDirectory()
+            self.addCleanup(tmp.cleanup)
+            with open(tmp.name + "/audit.jsonl", "wb") as handle:
+                handle.write(raw)
+            return tmp.name, base + 3600
+
+        def test_s14_the_tail_window_drops_its_first_line_and_skips_non_dict_and_broken_lines(self):
+            import tempfile
+            directory, now = self.audit_window_fixture()
+            self.assertEqual(sb.late_reminder_counts(directory, {}, now), {"lane-a": 2})
+            with tempfile.TemporaryDirectory() as empty:
+                self.assertEqual(sb.late_reminder_counts(empty, {}, now), {})                       # a missing audit file
+                import os
+                os.mkdir(empty + "/audit.jsonl")
+                self.assertEqual(sb.late_reminder_counts(empty, {}, now), {})                       # a directory in its place
+
         def unreadable_world(self):
             self.world.add_agent("u-free", fleet={"role": "coder", "reports_to": "platform", "issue": 40})
             self.world.v2.start_turn(self.world.sessions["u-free"], "task", fleet=True, lasts=86400, steps=3)
