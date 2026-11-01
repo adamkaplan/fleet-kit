@@ -573,3 +573,6 @@ minutes) belongs to the launcher.
 - The fixer image is pinned by tag, not digest: pin it for a release (the OpenCode binary is already pinned with its sha256).
 - `cloud/tests/test-cloud` is not yet run by CI (this change is limited to `cloud/`); it needs Docker for the image cases
   (`CLOUD_TEST_SKIP_DOCKER=1` skips them explicitly).
+
+**Retention of the run records (ask #1743).** The reaper runs one maintenance step per UTC day, at the start of the first pass after midnight, in its main thread (never in the renewal thread).
+- Run record: kept while its worker has a pod in the pass's own list and for 30 days after its end (`KEEP_DAYS`, `CW_RECORD_KEEP_DAYS` overrides), then removed; at most 500 directories a run, one log line per removal and one line of counts. A dry run lists what would be removed, with counts and bytes, and removes nothing.
