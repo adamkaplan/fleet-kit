@@ -798,8 +798,113 @@ class TestEventWait(unittest.TestCase):
         name = "test_real_constants_held_plus_slow_bodies_daemon_and_channel_alive"
         res = unittest.TestResult(); TestBoundsAndCaps(name).run(res)
         res2 = unittest.TestResult(); TestBoundsAndCaps("test_mutant_admit_removed_the_saturation_test_fails").run(res2)
+        self.assertEqual(res.failures + res.errors, [], "the inner control failed:\n" + "".join(tb for _, tb in res.failures + res.errors))
         print("S5: control passes %d of 1, existing cap mutant caught %d of 1" % (int(res.wasSuccessful()), int(res2.wasSuccessful())))
         self.assertTrue(res.wasSuccessful() and res2.wasSuccessful())
+
+
+class TestHeldCallSource(unittest.TestCase):
+    """Scenarios S8 S9 S10: the source of the saturation test, and the report of the S5 inner control."""
+    SAT = "test_real_constants_held_plus_slow_bodies_daemon_and_channel_alive"
+
+    @staticmethod
+    def check_held_source(path):
+        try:
+            text = Path(path).read_text()
+        except OSError:
+            text = ""
+        start = text.find("    def " + TestHeldCallSource.SAT)
+        block = text[start:].split("\n    def ")[0:1] if start >= 0 else []
+        lines = [l for l in (block[0].splitlines() if block else []) if "threading.Thread(target=hub." in l and '"call_id": "c%d" % j' in l]
+        held = sum("target=hub.held_call" in l for l in lines)
+        relay = sum("target=hub.relay_call" in l for l in lines)
+        if relay:
+            raise AssertionError("a held call goes through the helper with a client timeout")
+        if not held:
+            raise AssertionError("the saturation test was not found in the source")
+        return held, relay
+
+    def fails_with(self, check, path):
+        try:
+            check(path)
+        except AssertionError as e:
+            return str(e)
+        return None
+
+    def test_s8_held_calls_go_through_held_call_and_a_relay_call_mutant_is_caught(self):
+        here = Path(__file__).resolve()
+        held, relay = self.check_held_source(here)
+        src = here.read_text()
+        old = "target=hub.held_call, kwargs={\"who\": \"pod-%d\" % i"
+        self.assertEqual(src.count(old), 1)
+        mutated = src.replace(old, old.replace("held_call", "relay_call"))
+        applied = mutated != src
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "copy"
+            p.write_text(mutated)
+            text = self.fails_with(self.check_held_source, p)
+        caught = int(text == "a held call goes through the helper with a client timeout")
+        print("S8: control passes 1 of 1 (%d held calls, %d on relay_call), mutant fails %d of 1 with the anchored text, mutation applied %s" % (held, relay, caught, applied))
+        self.assertEqual((held, relay, caught, applied), (1, 0, 1, True))
+
+    def test_s9_unreadable_answers_fail_and_a_zero_count_pass_is_caught(self):
+        import inspect, textwrap
+        want = "the saturation test was not found in the source"
+        with tempfile.TemporaryDirectory() as d:
+            nofile = Path(d) / "missing"
+            unreadable = Path(d)   # a directory: reading it raises OSError
+            without = Path(d) / "without"
+            without.write_text("class T:\n    def test_other(self):\n        pass\n")
+            got = [self.fails_with(self.check_held_source, p) for p in (nofile, unreadable, without)]
+            fsrc = textwrap.dedent(inspect.getsource(TestHeldCallSource.__dict__["check_held_source"]).replace("TestHeldCallSource.SAT", "'%s'" % TestHeldCallSource.SAT))
+            self.assertEqual(fsrc.count("    if not held:\n"), 1)
+            msrc = fsrc.replace("    if not held:\n", "    if False:\n").replace("@staticmethod\n", "")
+            applied = msrc != fsrc
+            ns = dict(globals())
+            exec(compile(msrc, "<zero-passes>", "exec"), ns)
+            mut = [self.fails_with(ns["check_held_source"], p) for p in (nofile, unreadable, without)]
+        n = sum(g == want for g in got)
+        control = int(self.check_held_source(Path(__file__).resolve())[0] == 1)
+        caught = int(all(m is None for m in mut))   # the copy passes on finding nothing: the same inputs show it
+        print("S9: %d of 3 inputs fail with the anchored text, control with the real source passes %d of 1, the zero-count copy is caught %d of 1, mutation applied %s" % (n, control, caught, applied))
+        self.assertEqual((n, control, caught, applied), (3, 1, 1, True))
+
+    def test_s10_the_inner_failure_of_the_s5_control_is_reported_with_its_traceback(self):
+        import inspect, textwrap
+        name = "test_s5_control_passes_and_existing_cap_mutant_is_caught"
+        src = textwrap.dedent(inspect.getsource(TestEventWait.__dict__[name]))
+        line = "res.failures + res.errors"
+        self.assertEqual(src.count(line), 2)   # the report line holds it twice
+        report_lines = [l for l in src.splitlines() if line in l]
+        self.assertEqual(len(report_lines), 1)
+        mutated = src.replace(report_lines[0], report_lines[0][:len(report_lines[0]) - len(report_lines[0].lstrip())] + "pass")
+        applied = mutated != src
+        marker = "INNERMARK-by-construction"
+
+        def run(code):
+            ns = dict(globals())
+            exec(compile(code, "<s5>", "exec"), ns)
+            case = TestEventWait(name)
+            real = TestBoundsAndCaps.__dict__["test_real_constants_held_plus_slow_bodies_daemon_and_channel_alive"]
+
+            def boom(self_):
+                raise AssertionError(marker)
+            TestBoundsAndCaps.test_real_constants_held_plus_slow_bodies_daemon_and_channel_alive = boom
+            try:
+                ns[name](case)
+                return None
+            except AssertionError as e:
+                return str(e)
+            finally:
+                TestBoundsAndCaps.test_real_constants_held_plus_slow_bodies_daemon_and_channel_alive = real
+        real_text = run(src)
+        mut_text = run(mutated)
+        reported = int(real_text is not None and marker in real_text and "Traceback" in real_text)
+        mut_caught = int(mut_text is not None and marker not in mut_text)   # the check fails: "the inner failure was not reported"
+        print("S10: the failing control is reported with its traceback %d of 1, the copy with the outer text only fails the check %d of 1 (the inner failure was not reported), mutation applied %s" % (reported, mut_caught, applied))
+        self.assertEqual((reported, mut_caught, applied), (1, 1, True))
+        res = unittest.TestResult(); TestEventWait(name).run(res)   # the real control passes
+        self.assertTrue(res.wasSuccessful(), "the inner failure was not reported" if False else "".join(tb for _, tb in res.failures + res.errors))
 
 
 class TestHostileBodies(unittest.TestCase):
