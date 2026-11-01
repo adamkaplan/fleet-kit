@@ -25180,7 +25180,7 @@ class TestIdentityCheck(ReportBase):
         self.assertEqual((done.returncode, seen["token"]), (0, "tok-bot"), done.stderr)
 
     def test_s6_a_worker_without_a_read_repository_is_untouched_by_the_guard(self):
-        for args in (("issue", "view", "5", "-R", "acme-org/other"), ("api", "graphql", "-f", "query=x"), ("issue", "comment", "5", "-R", "acme-org/other", "--body", "x")):
+        for args in (("issue", "view", "5", "-R", "acme-org/other"), ("api", "graphql", "-f", "query={viewer{login}}"), ("issue", "comment", "5", "-R", "acme-org/other", "--body", "x")):
             with self.subTest(args=args):
                 done, seen = self.run_gh_shim("acme-org/widget-service", self.READ_USERS, self.READ_TOKENS, args=args, own=True)
                 self.assertTrue(seen is not None and seen["argv"][0] == args[0], (done.returncode, done.stderr))
