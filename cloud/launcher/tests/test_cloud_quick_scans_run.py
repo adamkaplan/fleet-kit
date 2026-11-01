@@ -52,7 +52,7 @@ class TestScansRun(unittest.TestCase):
         env = dict(os.environ, CLOUD_PREFLIGHT_QUICK_TOTAL="1", CLOUD_PREFLIGHT_BASE="HEAD", PYTHONDONTWRITEBYTECODE="1")
         r = subprocess.run([sys.executable, os.path.join(self.wt, "bin", "cloud-pr-preflight"), "--quick"], cwd=self.wt,
                            env=env, capture_output=True, text=True, timeout=140)
-        self.assertEqual(r.returncode, 1, r.stderr[-500:])
+        self.assertEqual(r.returncode, 3, r.stderr[-500:])
         self.assertIn("NOT RUN (budget): quick run exceeded 1 s", r.stdout)
         self.assertNotIn("RESULT: PASS", r.stdout)
 
