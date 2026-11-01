@@ -307,7 +307,7 @@ class S8Snapshot(unittest.TestCase):
                 while not stop.is_set():
                     known.add("added-%d-%d-form" % (rd, k))
                     k += 1
-            th = threading.Thread(target=adder)
+            th = threading.Thread(target=adder, daemon=True)
             th.start()
             try:
                 out = cw.scrub(text, known, 10 ** 6)
