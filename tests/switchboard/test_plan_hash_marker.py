@@ -427,6 +427,89 @@ def build():
                 with self.assertRaisesRegex(AssertionError, "the tally counts the three verdicts together"):
                     self.assertEqual(json.loads(out.getvalue())["tally"], "consensus", "the tally counts the three verdicts together")
 
+        # -- S9: the entry's decide and the two open-reading places, on a round that holds verdicts at both forms
+
+        def escalated_signed(self, obj_lane="L2"):
+            """spent_review on the marker-bearing plan: each revision keeps the marker; the lanes but the objector report at the OLD hash (injected) on
+            the last round and at the NEW one before. Returns (review, round entry)."""
+            self.signed_plan()
+            code, got, err = self.start()
+            self.assertEqual(code, 0, err)
+            review = got["review"]
+            obj = ["- id: O1; severity: blocking; state: open; text: a stub passes"]
+            for number in (8, 9, 10, 11):
+                rnd = [e for e in self.ledger() if e["kind"] == "round" and e["review"] == review][-1]
+                new, old = rnd["plan_hashes"]
+                for i, lane in enumerate(rnd["lanes"]):
+                    if lane == obj_lane:
+                        self.assertEqual(self.verdict_current(review, lane, "iterate", obj)[0], 0)
+                    else:
+                        self.inject(self.lane_entry(review, rnd, lane, old if i % 2 else new))
+                self.plan_issue2 = {"number": number, "state": "open", "title": "p", "body": self.PLAN2 + "\nrevision %d\n" % number + MARKER,
+                                    "updated_at": "2026-01-01T00:00:00Z", "parent_issue_url": "https://api.github.com/repos/acme/app/issues/7"}
+                code, out, err = self.review("orch", "respond", review, "--plan-ref", "acme/app#%d" % number, "--table", self.table("%s/O1: reject, why" % obj_lane), "--json")
+                self.assertEqual(code, 0, err)
+                if "escalated" in json.loads(out):
+                    return review, [e for e in self.ledger() if e["kind"] == "round" and e["review"] == review][-1]
+            self.fail("it never escalated")
+
+        def override(self, review):
+            return self.review("cos", "decide", review, "--objection", "L2/O1", "--override", "--reason", "out of scope for this plan, accepted by the boss", "--json")
+
+        def consensus_entries(self, review):
+            return [e for e in self.ledger() if e["kind"] == "consensus" and e.get("review") == review]
+
+        def test_decide_through_the_entry_on_a_round_with_verdicts_at_both_forms_reaches_the_consensus_once_at_the_new_hash(self):
+            review, rnd = self.escalated_signed()
+            new, old = rnd["plan_hashes"]
+            code, out, err = self.override(review)
+            self.assertEqual(code, 0, err)
+            (consensus,) = self.consensus_entries(review)
+            self.assertEqual((consensus["plan_hash"], consensus.get("overridden_by") is not None), (new, True))
+
+        def test_decide_control_a_consensus_of_the_edited_text_does_not_stand_for_the_round_and_one_is_written(self):
+            review, rnd = self.escalated_signed()
+            edited = sb.plan_check.plan_hash(self.FINAL + "\nan edit\n")
+            self.inject({"kind": "consensus", "result": "pass", "pr": "-", "scenario": "-", "lineage": rnd["lineage"], "review": review, "plan_hash": edited, "by": "plan-review"})
+            self.assertEqual(self.override(review)[0], 0)
+            self.assertEqual([e["plan_hash"] for e in self.consensus_entries(review)], [edited, rnd["plan_hashes"][0]])
+
+        def test_decide_counts_a_consensus_at_the_old_hash_as_reached_and_writes_no_second(self):
+            review, rnd = self.escalated_signed()
+            new, old = rnd["plan_hashes"]
+            self.inject({"kind": "consensus", "result": "pass", "pr": "-", "scenario": "-", "lineage": rnd["lineage"], "review": review, "plan_hash": old, "by": "plan-review"})
+            self.assertEqual(self.override(review)[0], 0)
+            self.assertEqual(len(self.consensus_entries(review)), 1, "decide counts the old-hash consensus as the round's")
+
+        def test_a_mutant_that_compares_the_raw_strings_in_decide_writes_a_second_consensus(self):
+            review, rnd = self.escalated_signed()
+            new, old = rnd["plan_hashes"]
+            self.inject({"kind": "consensus", "result": "pass", "pr": "-", "scenario": "-", "lineage": rnd["lineage"], "review": review, "plan_hash": old, "by": "plan-review"})
+            with tempfile.TemporaryDirectory() as tmp:
+                msb = _entry_copy(tmp, "switchboard/plan_review.py", "        entries, rnd = _canon_round(entries, rnd)   # #1713: both sides in the round's own form\n", "")
+                os.environ["HERDR_PANE_ID"] = self.world.panes["cos"]
+                with captured() as (out, err), mock.patch.object(msb, "owner_terminal_problem", lambda *a, **k: None), mock.patch.object(sys, "stdin", io.StringIO("")):
+                    msb.main(["plan", "review", "decide", review, "--objection", "L2/O1", "--override", "--reason", "out of scope for this plan, accepted by the boss", "--json"],
+                             runner=self.route, now=self.world.clock.now, wait=lambda sock, seconds: False, socket_call=self.world.herdr.socket)
+                with self.assertRaisesRegex(AssertionError, "decide counts the old-hash consensus as the round's"):
+                    self.assertEqual(len(self.consensus_entries(review)), 1, "decide counts the old-hash consensus as the round's")
+
+        def test_the_tick_and_the_lane_send_check_read_a_round_with_verdicts_at_both_forms_as_open(self):
+            got = self.start_round()
+            rnd = self.kinds("round")[-1]
+            new, old = rnd["plan_hashes"]
+            lanes = rnd["lanes"]
+            self.inject(self.lane_entry(got["review"], rnd, lanes[0], old))
+            self.inject(self.lane_entry(got["review"], rnd, lanes[1], new))
+            before = len(self.ledger())
+            code, out, err = self.review("orch", "tick", "--json")
+            self.assertEqual(code, 0, err)
+            done = json.loads(out)
+            self.assertEqual(done.get("skipped", []), [], "the tick handles the round")
+            self.assertTrue(all(e.get("review") == got["review"] for e in self.ledger()[before:]))
+            session = [e["session"] for e in self.ledger() if e["kind"] == "lane_session"][0]
+            self.assertIn("is a reviewer lane", sb.review_lane_send_problem({"plan_review": {"enabled": True}}, session, "orch"), "the send check reads the round as open")
+
         # -- S11: a round without a pair
 
         def refused(self, code, err, before):
