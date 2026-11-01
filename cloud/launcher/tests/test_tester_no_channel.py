@@ -249,5 +249,47 @@ class Documents(unittest.TestCase):
         self.assertIn("cloud testers", str(caught.exception))
 
 
+class CommandWordExceptionOfTheNamesTest(unittest.TestCase):
+    """Scenario S9 (constraint PC-4): the names test allows one command word in one file, and nothing else."""
+    NAMES = Path(__file__).resolve().parent / "test_cw_names.py"
+    REMOVAL = '    text = text.replace(COMMAND_WORD.get(rel, "\\0"), "")\n'
+
+    def load(self, path, name):
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        spec = importlib.util.spec_from_file_location(name, str(path))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def check1(self, mod):
+        real = (Path(__file__).resolve().parents[3] / "cloud/launcher/run_record.py").read_text()
+        got = mod.old_name_in("cloud/launcher/run_record.py", real)
+        self.assertFalse(got, "the command word exception is not applied")
+
+    def test_s9_the_exception_is_one_word_in_one_file(self):
+        import tempfile
+        mod = self.load(self.NAMES, "names_real")
+        P = mod.P
+        self.assertEqual(mod.COMMAND_WORD, {"cloud/launcher/run_record.py": P + "-switchboard"})
+        self.check1(mod)  # the control, run first
+        planted = mod.old_name_in("cloud/launcher/cloud_worker.py", "x " + P + "-switchboard y")
+        other = mod.old_name_in("cloud/launcher/run_record.py", "x " + P + "-other y")
+        self.assertTrue(planted, "the word planted in another file is not named")
+        self.assertTrue(other, "another ending in run_record.py is not named")
+        src = self.NAMES.read_text()
+        self.assertEqual(src.count(self.REMOVAL), 1, "the removal line must occur once")
+        mutant = src.replace(self.REMOVAL, "")
+        self.assertNotEqual(mutant, src, "the mutation is not applied")
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "names_mutant.py"
+            p.write_text(mutant)
+            mm = self.load(p, "names_mutant")
+            with self.assertRaises(AssertionError) as caught:
+                self.check1(mm)
+        self.assertIn("the command word exception is not applied", str(caught.exception))
+        print("S9: real run_record.py named=False; planted cloud_worker.py named=%s; other ending named=%s; "
+              "control passed; mutant failed with the anchored text (applied)" % (planted, other))
+
+
 if __name__ == "__main__":
     unittest.main()
