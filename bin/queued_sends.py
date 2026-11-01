@@ -42,39 +42,34 @@ def _read(file):
     try:
         fd = os.open(str(file), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except FileNotFoundError:
-        return empty
+        return empty, None
     except OSError as err:
-        _read.why = "read error: " + type(err).__name__   # why the last None: the refusal says it (no path, no message text)
-        return None
+        return None, "read error: " + type(err).__name__
     try:
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode):
-            _read.why = "not a regular file"
-            return None
+            return None, "not a regular file"
         if info.st_size > MAX_FILE:
-            _read.why = "larger than the size bound"
-            return None
+            return None, "larger than the size bound"
         with os.fdopen(fd, "r", closefd=False) as handle:
             data = _record_json.parse_bounded(handle.read())
     except _record_json.TooDeep:
-        _read.why = "nested too deep"
-        return None
+        return None, "nested too deep"
     except ValueError:
-        _read.why = "truncated or not JSON"
-        return None
+        return None, "truncated or not JSON"
     except OSError as err:
-        _read.why = "read error: " + type(err).__name__
-        return None
+        return None, "read error: " + type(err).__name__
     finally:
         os.close(fd)
     if not isinstance(data, dict):
-        _read.why = "not a queue (not a dict)"
-        return None
-    items = [i for i in data.get("items") if isinstance(i, dict) and isinstance(i.get("key"), str) and isinstance(i.get("text"), str)
-             and isinstance(i.get("at"), (int, float)) and isinstance(i.get("seq"), int)] if isinstance(data.get("items"), list) else []
-    delivered = [k for k in data.get("delivered") if isinstance(k, str)] if isinstance(data.get("delivered"), list) else []
+        return None, "not a queue (not a dict)"
+    items, delivered = data.get("items"), data.get("delivered")
+    if not isinstance(items, list) or not isinstance(delivered, list) or not all(isinstance(k, str) for k in delivered) or not all(
+            isinstance(i, dict) and isinstance(i.get("key"), str) and isinstance(i.get("text"), str)
+            and isinstance(i.get("at"), (int, float)) and isinstance(i.get("seq"), int) for i in items):
+        return None, "a malformed item"
     seq = data.get("seq") if isinstance(data.get("seq"), int) else 0
-    return {"seq": max([seq] + [i["seq"] for i in items]), "items": items, "delivered": delivered}
+    return {"seq": max([seq] + [i["seq"] for i in items]), "items": items, "delivered": delivered}, None
 
 
 def _write(file, data):
@@ -115,9 +110,9 @@ def enqueue(state_dir, recipient, key, sender, text, sent, issue=None, repo=None
         return False, "the message is %d characters and a held pane's queue takes at most %d" % (len(text), MAX_TEXT)
     try:
         with _Lock(state_dir):
-            queue = _read(file)
+            queue, why = _read(file)
             if queue is None:
-                return False, "the queue file of %s is present but not readable (%s): nothing was queued and the file is untouched" % (recipient, _read.why)
+                return False, "the queue file of %s is present but not readable (%s): nothing was queued and the file is untouched" % (recipient, why)
             if key in queue["delivered"] or any(i["key"] == key for i in queue["items"]):
                 return True, len(queue["items"])
             if len(queue["items"]) >= MAX_MESSAGES:
@@ -138,7 +133,7 @@ def waiting(state_dir, recipient):
     if file is None:
         return []
     with _Lock(state_dir):
-        queue = _read(file)
+        queue, why = _read(file)
         return [] if queue is None else sorted(queue["items"], key=lambda i: (i["at"], i["seq"]))
 
 
@@ -158,7 +153,7 @@ def done(state_dir, recipient, key):
     if file is None:
         return
     with _Lock(state_dir):
-        queue = _read(file)
+        queue, why = _read(file)
         if queue is None:
             return
         queue["items"] = [i for i in queue["items"] if i["key"] != key]

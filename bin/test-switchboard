@@ -79946,7 +79946,7 @@ class TestHoldQueue(Base):
         file = Path(self.world.state) / "hold-queue-deep.json"
         depth = sb.load_module("record_json").RECORD_MAX_DEPTH + 5
         file.write_text('{"items": ' + "[" * depth + "]" * depth + "}")
-        self.assertIsNone(hq._read(file))
+        self.assertEqual(hq._read(file), (None, "nested too deep"))
 
     def test_an_interrupt_send_to_a_held_pane_stays_refused_and_a_plain_send_is_queued(self):
         self.world.add_agent("helper", fleet={"role": "coder", "reports_to": "coder"})
@@ -80132,6 +80132,51 @@ class TestHoldQueueUnreadableFile(Base):
         self.file.chmod(0o600)
         self.assertEqual(self.file.read_bytes(), b"{}")
 
+    def test_every_unreadable_shape_is_refused_whole_and_comes_back_after_the_repair(self):
+        deep = b'{"items": ' + b"[" * 5000 + b"]" * 5000 + b"}"
+        item = {"key": "k1", "text": "one", "at": 1.0, "seq": 1}
+        other = {"key": "k0", "text": "zero", "at": 0.5, "seq": 2}
+        cases = (("truncated or not JSON", None), ("nested too deep", deep), ("larger than the size bound", b" " * (self.hq.MAX_FILE + 1)),
+                 ("not a regular file", "dir"), ("not a queue (not a dict)", b"[]"),
+                 ("a malformed item", json.dumps({"seq": 2, "items": [item, {"key": "kx", "text": "x", "at": 1.0}, other], "delivered": []}).encode()),
+                 ("a malformed item", b"{}"), ("a malformed item", json.dumps({"items": {}, "delivered": []}).encode()),
+                 ("a malformed item", json.dumps({"items": [item], "delivered": {}}).encode()),
+                 ("a malformed item", json.dumps({"items": [item], "delivered": [1]}).encode()),
+                 ("truncated or not JSON", b""), ("read error: PermissionError", "chmod"))
+        for n, (why, bad) in enumerate(cases):
+            with self.subTest(n=n, why=why):
+                if bad == "chmod" and os.geteuid() == 0:
+                    continue   # running as root: chmod 000 does not stop root, so no read error can be provoked (skipped)
+                state = tempfile.mkdtemp()
+                self.addCleanup(shutil.rmtree, state, True)
+                file = self.hq.path(state, "platform")
+                good = json.dumps({"seq": 2, "items": [item, other], "delivered": []}, indent=1, sort_keys=True).encode() + b"\n"
+                if bad is None:
+                    bad = good[:len(good) // 2]
+                file.write_bytes(good)
+                if bad == "dir":
+                    file.unlink()
+                    file.mkdir()
+                elif bad == "chmod":
+                    file.chmod(0)
+                    self.addCleanup(file.chmod, 0o600)
+                else:
+                    file.write_bytes(bad)
+                snapshot = None if bad in ("dir", "chmod") else bad
+                self.assertEqual(self.hq.enqueue(state, "platform", "k2", "coder", "two", 2.0), (False, self.line(why)))
+                if snapshot is not None:
+                    self.assertEqual(file.read_bytes(), snapshot)
+                self.assertEqual(self.hq.waiting(state, "platform"), [])
+                self.hq.done(state, "platform", "k1")
+                if snapshot is not None:
+                    self.assertEqual(file.read_bytes(), snapshot)
+                if bad == "dir":
+                    file.rmdir()
+                else:
+                    file.chmod(0o600)
+                file.write_bytes(good)
+                self.assertEqual([i["key"] for i in self.hq.waiting(state, "platform")], ["k0", "k1"])
+
     def check(self, hq):
         self.assertTrue(hq.enqueue(self.state, "platform", "k1", "coder", "one", 1.0)[0])
         good = self.file.read_bytes()
@@ -80155,7 +80200,7 @@ class TestHoldQueueUnreadableFile(Base):
         src = (Path(sb.__file__).resolve().parent / "queued_sends.py").read_text()
         head, tail = src.split("def _read(file):")
         body, rest = tail.split("def _write(", 1)
-        self.assertIn("        return None", body)
+        self.assertIn("        return None, ", body)
         mutated = head + "def _read(file):" + body.replace("return None", "return empty") + "def _write(" + rest
         self.assertNotEqual(mutated, src, "the mutation applied")
         module = types.ModuleType("queued_sends_mutant")
