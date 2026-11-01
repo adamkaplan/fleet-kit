@@ -40,7 +40,7 @@ class JanitorIdentity(unittest.TestCase):
     def forge(self, target, like):
         """os.lstat that reports `target` with the device, inode and times of `like` and its own mode."""
         real = os.lstat
-        fixed = real(str(like))
+        fixed = like if isinstance(like, os.stat_result) else real(str(like))
         mine = str(target)
 
         def fake(path, *a, **k):
@@ -79,16 +79,13 @@ class JanitorIdentity(unittest.TestCase):
         other = self.root / "outside.txt"
         other.write_text("precious")
         real_scan = self.jan.scan
-        like = self.root / "like"
-        os.link(str(f), str(like))   # keeps the inode alive; same inode, so the forged link can copy it
-        fake = [None]
 
         def scan_then_swap(*a, **k):
             rows = real_scan(*a, **k)
+            before = os.lstat(str(f))   # as the scan saw it
             os.unlink(str(f))
             f.symlink_to(other)
-            fake[0] = self.forge(f, like)
-            os.lstat = fake[0]
+            os.lstat = self.forge(f, before)
             return rows
         real_lstat = os.lstat
         try:
