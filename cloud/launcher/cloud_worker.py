@@ -2490,9 +2490,9 @@ class Launcher:
         out, now, live = [], self.clock(), []
         self.reap_results, self.last_hook = {}, None
         pods = self.kube.list_pods()
-        self.daily_maintenance(pods, now)
         # The renewal is the FIRST step: a slow activity read or stop below can no longer hold it back (the audit of 29 October).
         renewed = self.renew_git_tokens(self._before_hard_limit(pods, now), now)
+        self.daily_maintenance(pods, now)
         self._note_vanished_pods(pods, now)
         for pod in pods:
             worker = ann(pod, "worker")
