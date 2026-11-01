@@ -33,6 +33,7 @@ DEFAULT_SLOTS = 3
 DEFAULT_WAIT_MAX = 1800
 POLL_SECONDS = 0.5
 WAIT_REPORT_SECONDS = 30
+PROGRESS_SECONDS = 60   # one progress line per interval while the command runs; FLEET_HEAVY_PROGRESS_SECONDS shortens it (tests)
 EXIT_TEMPFAIL = 75      # no slot within --wait-max
 EXIT_USAGE = 64
 EXIT_NOT_FOUND = 127
@@ -1094,6 +1095,53 @@ def _stop_orphan(state_dir, index, info, out, clock, watchdog, start_of, decided
         os.close(gate)
 
 
+def _child_cpu_seconds(pid):
+    """CPU seconds (user + system) the process has used, or None when they cannot be read (never raises)."""
+    try:
+        with open("/proc/%d/stat" % pid) as handle:
+            fields = handle.read().rsplit(")", 1)[1].split()
+        return (int(fields[11]) + int(fields[12])) / float(os.sysconf("SC_CLK_TCK"))
+    except Exception:
+        pass
+    try:
+        text = subprocess.run(["ps", "-o", "time=", "-p", str(pid)], capture_output=True, text=True, timeout=5).stdout.strip()
+        days, _, clock_part = text.rpartition("-")
+        parts = [float(x) for x in clock_part.split(":")]
+        total = 0.0
+        for part in parts:
+            total = total * 60 + part
+        return total + (float(days) * 86400 if days else 0)
+    except Exception:
+        return None
+
+
+_progress_pause = None   # tests: a function (stop_event, seconds) that pauses in place of the real wait
+
+
+def _progress_loop(pid, program, interval, stop, out, clock, began):
+    """One line every `interval` seconds until `stop` is set; a failure of its own ends it quietly. Never signals the child."""
+    try:
+        while True:
+            if _progress_pause is not None:
+                _progress_pause(stop, interval)
+            else:
+                stop.wait(interval)
+            if stop.is_set():
+                return
+            elapsed = max(0.0, clock() - began)
+            text = "heavy: %s still running: %d s since the command started" % (_plain(program), int(elapsed))
+            cpu = _child_cpu_seconds(pid)
+            if cpu is not None:
+                text += ", CPU %d s (%d%%)" % (int(cpu), int(100 * cpu / elapsed) if elapsed > 0 else 0)
+            out.write(text + "\n")
+            try:
+                out.flush()
+            except Exception:
+                pass
+    except Exception:
+        return
+
+
 def run(command, state_dir, slots=DEFAULT_SLOTS, wait_max=DEFAULT_WAIT_MAX, name=None, environ=None, out=None, clock=time.time, sleep=time.sleep,
         which=shutil.which, watchdog=None, short=False, line=None, ceiling=None, ceiling_config=None, on_stop=None, worktree=None, started_flag=None):
     """Wait for a slot, run `command` in it, return its exit status. 75 when no slot came within `wait_max` seconds, 127 when the command does not exist.
@@ -1238,6 +1286,12 @@ def run(command, state_dir, slots=DEFAULT_SLOTS, wait_max=DEFAULT_WAIT_MAX, name
         dog = Watchdog(child["p"].pid, command, mem_mb, max_seconds, out, clock(), clock=clock,
                        **dict({"lock_path": lock, "hard_max": ceiling_table(ceiling_config)["max"], "decided": decided}, **(watchdog or {})))
         dog.start()
+        progress_stop = threading.Event()
+        try:
+            progress_every = float(environ.get("FLEET_HEAVY_PROGRESS_SECONDS") or PROGRESS_SECONDS)
+        except ValueError:
+            progress_every = PROGRESS_SECONDS
+        threading.Thread(target=_progress_loop, args=(child["p"].pid, os.path.basename(command[0]), progress_every, progress_stop, out, clock, clock()), daemon=True).start()
         try:
             while True:
                 try:
@@ -1246,6 +1300,7 @@ def run(command, state_dir, slots=DEFAULT_SLOTS, wait_max=DEFAULT_WAIT_MAX, name
                 except InterruptedError:   # a signal during wait: Python retries; this is belt and braces
                     continue
         finally:
+            progress_stop.set()
             dog.finish()
         if dog.reason == "time" and on_stop is not None:   # after the stop; it never changes the exit status
             try:
