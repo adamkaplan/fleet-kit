@@ -74,7 +74,7 @@ class S(unittest.TestCase):
             try:
                 for i in range(200): cw.scrub("text", k)
             except Exception as e: errs.append(type(e).__name__)
-        ts = [threading.Thread(target=f) for f in (adder, sweeper, scr)]
+        ts = [threading.Thread(target=f, daemon=True) for f in (adder, sweeper, scr)]
         [t.start() for t in ts]; [t.join() for t in ts]
         self.assertEqual(errs, [])
 
@@ -327,7 +327,7 @@ class S8Rounds(unittest.TestCase):
                 try:
                     go.wait(); o = cw.scrub(text, k, 100000); out.append((o, list(k.snap)))
                 except Exception as e: errs.append(type(e).__name__)
-            ts = [threading.Thread(target=f) for f in (adder, sweeper, scr)]
+            ts = [threading.Thread(target=f, daemon=True) for f in (adder, sweeper, scr)]
             [t.start() for t in ts]; [t.join() for t in ts]
             raises += bool(errs); kept += added <= set(k)
             if out:
