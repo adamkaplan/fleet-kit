@@ -189,7 +189,7 @@ def scan_audit(audit_file, state_file, cloud_dir, last_reports, send, parse, aud
                 block, why = last_text(raw_dir(reason) if name else "", worker)
             except Exception as err:
                 block, why = None, type(err).__name__
-            boss_text = text + "\n" + (block if block else "last text not read: %s" % plain(why or "unknown", 120))
+            boss_text = text + "\n" + (block if block else "last text not read: %s" % plain((why or "unknown").replace(" ", "_"), 120))
         out.extend((to, text if to == CHIEF else boss_text, worker, label) for to in reversed(to_list))
     save_state(state_file, offset + cut, keys)
     failed = set()
