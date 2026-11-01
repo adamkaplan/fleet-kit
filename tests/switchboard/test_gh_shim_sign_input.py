@@ -1478,8 +1478,24 @@ def reader_failures(source):
                 failures.append("%s: the hold guard did not refuse the argv: %r" % (label, got["guard"]))
             if not (got["scope"] and got["scope"][0] == "refuse" and got["scope"][1].startswith("gh: refused:")):
                 failures.append("%s: the read-scope gate did not refuse with 'gh: refused:': %r" % (label, got["scope"]))
+            try:
+                space["api_parse"](argv[space["api_start"](argv):])
+                failures.append("%s: api_parse accepted a refused argv" % label)
+            except space["Refused"]:
+                pass
+            except Exception as err:
+                failures.append("%s: api_parse raised %s, not Refused" % (label, type(err).__name__))
             continue
         method, write = parsed.method or "GET", bool(parsed.fields or parsed.input)
+        try:
+            old_positionals, old_method, old_fields = space["api_parse"](argv[space["api_start"](argv):])
+        except Exception as err:
+            failures.append("%s: api_parse raised %s on an accepted argv" % (label, type(err).__name__))
+        else:
+            flagmap = {"field": "-F", "raw-field": "-f"}
+            want = ([space["api_endpoint"](p) for _i, p in parsed.positionals], parsed.method, [(i, flagmap[n], j, v) for i, n, j, v in parsed.fields])
+            if (old_positionals, old_method, old_fields) != want:
+                failures.append("%s: api_parse %r differs from the parser's %r" % (label, (old_positionals, old_method, old_fields), want))
         if got["is_write"] != (parsed.effective_method != "GET"):
             failures.append("%s: is_write %r differs from the parser's method %s" % (label, got["is_write"], parsed.effective_method))
         route = got["merge_route"]
@@ -1586,6 +1602,14 @@ class TestApiReadersAreViews(unittest.TestCase):
         self.assertTrue(any(s.startswith("-R api api: the parser refused an argv that is accepted") for s in seen), seen)
         self.assertTrue(any(s.startswith("--repo api api:") for s in seen), seen)
 
+    def test_mutant_api_parse_scanning_words_fails_and_control_passes(self):
+        old = '    parsed = parse_api_argv(args)\n    flagmap = {"field": "-F", "raw-field": "-f"}\n'
+        new = '    at = args.index("api")\n    return [a for a in args[at + 1:] if not a.startswith("-")], None, []\n' + old
+        seen = [t for t in reader_failures(self.mutant(old, new)) if ": api_parse " in t]
+        print("S22 mutant api_parse: %d failures" % len(seen))
+        self.assertTrue(any(t.startswith("-X PUT: api_parse ") and "differs from the parser's" in t for t in seen), seen)
+        self.assertEqual([t for t in reader_failures(self.source) if ": api_parse " in t], [])
+
 
 HOLD_FORMS = (["-R", "api/x", "api", ISSUE], ["-R", "api", "api", ISSUE])
 
@@ -1607,6 +1631,25 @@ def hold_endpoint_failures(hold_source):
             continue
         if got[0] != [ISSUE]:
             failures.append("hold %s: parse_api endpoints %r, not %r" % (argv[:2], got[0], [ISSUE]))
+    for label, (argv, accepted) in API_READER_FORMS.items():
+        why, parsed = parser_verdict(space, argv)
+        if why is not None:
+            try:
+                module.parse_api(argv)
+                failures.append("hold form %s: parse_api accepted a refused argv" % label)
+            except Exception as err:
+                if type(err) is not space["Refused"]:
+                    failures.append("hold form %s: parse_api raised %s, not Refused" % (label, type(err).__name__))
+            continue
+        try:
+            got = module.parse_api(argv)
+        except Exception as err:
+            failures.append("hold form %s: parse_api raised %s on an accepted argv" % (label, type(err).__name__))
+            continue
+        want = ([p for _i, p in parsed.positionals], parsed.method.upper() if parsed.method else None, len(parsed.fields), parsed.input is not None)
+        have = (got[0], got[1].upper() if got[1] else None, len(got[2]), got[3])
+        if have != want:
+            failures.append("hold form %s: parse_api %r differs from the parser's %r" % (label, have, want))
     space["load_hold"] = lambda: module
     os.environ.setdefault("XDG_CONFIG_HOME", "/nonexistent-xdg")
     for argv in HOLD_FORMS:
@@ -1634,6 +1677,15 @@ class TestGhHoldIsAView(unittest.TestCase):
         mutant = self.source.replace(anchor, "    at = args.index(\"api\")\n    return [a for a in args[at + 1:] if not a.startswith(\"-\")][:1], None, [], False\n" + anchor)
         seen = hold_endpoint_failures(mutant)
         self.assertTrue(any(t.startswith("hold ['-R', 'api']: parse_api endpoints ['api'], not ") for t in seen), seen)
+        self.assertEqual(hold_endpoint_failures(self.source), [])
+
+    def test_mutant_private_reader_over_every_form_fails_and_control_passes(self):
+        anchor = "    parser = API_PARSER[0]\n"
+        self.assertEqual(self.source.count(anchor), 1, "the mutant's anchor is gone")
+        mutant = self.source.replace(anchor, "    at = args.index(\"api\")\n    return [a for a in args[at + 1:] if not a.startswith(\"-\")], None, [], False\n" + anchor)
+        seen = hold_endpoint_failures(mutant)
+        print("S22 mutant gh_hold: %d failures" % len(seen))
+        self.assertTrue(any(t.startswith("hold form -X PUT: parse_api ") and "differs from the parser's" in t for t in seen), seen)
         self.assertEqual(hold_endpoint_failures(self.source), [])
 
 
