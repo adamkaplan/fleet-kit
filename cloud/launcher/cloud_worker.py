@@ -3586,6 +3586,8 @@ def _reap_main(env, a, sleep, clock=None, refresher=None, kube=None, ticker_wait
                 ticker = RenewalTicker(L, refresher, clock, ticker_wait)
                 ticker.start()
             began = clock()
+            if L is not None:
+                L.step_seconds = None   # the pass line shows the steps of THIS pass only
             cpu0, parsed0 = time.thread_time(), tail_lines_parsed()
             try:
                 work = L.reap() if L is not None else []   # the pass's own work: the workers' results
