@@ -178,48 +178,122 @@ class Behaviour(TCW.Base):
             self.assertNotIn(SECRET, repr(audit))
 
 
+    PLANTED = ("vault-prod-kv-7", "https://vault.internal.test:8443/v1/x", "/var/lib/secret-store/key")
+
+    def planted_run(self, what):
+        text = "failed with " + " and ".join(self.PLANTED)
+
+        class Raises:
+            upsert = staticmethod(lambda s, n, a: (_ for _ in ()).throw(OSError(text)))
+            retire = staticmethod(lambda s, n, b, r: (_ for _ in ()).throw(OSError(text)))
+        audit = []
+        engine = types.SimpleNamespace(actor="op", audit=types.SimpleNamespace(append=lambda a, ev, n, d: audit.append((ev, n, d))))
+        err = io.StringIO()
+        args = ({"kind": "cloud"},) if what == "upsert" else ("done",)
+        with mock.patch.dict(sbcw.H, {"load_module": lambda name: Raises, "_one_line": lambda t, n: " ".join(str(t).split())[:n]}), contextlib.redirect_stderr(err):
+            sbcw._registry_note(engine, what, str(self.state), "w1", *args, address="")
+        return text, err.getvalue(), audit
+
+    def test_matches_planted_text_never_reaches_the_row_the_audit_or_the_standard_error(self):
+        for what in ("upsert", "retire"):
+            with self.subTest(what):
+                text, err, audit = self.planted_run(what)
+                for planted in self.PLANTED:   # the control: the exception itself shows them, so a leak would be seen
+                    self.assertIn(planted, text)
+                lines = [l for l in err.splitlines() if l.strip()]
+                self.assertEqual(len(lines), 1, err)
+                self.assertIn("the registry write failed (OSError)", lines[0])
+                self.assertEqual(len(audit), 1)
+                written = "".join(p.read_text(errors="replace") for p in self.state.rglob("*") if p.is_file()) if self.state.exists() else ""
+                for planted in self.PLANTED:
+                    self.assertNotIn(planted, err, "the exception text reached the note")
+                    self.assertNotIn(planted, repr(audit), "the exception text reached the note")
+                    self.assertNotIn(planted, written, "the exception text reached the note")
+
+    def test_matches_planted_text_launch_and_stop_still_end_0(self):
+        text = "failed " + " ".join(self.PLANTED)
+        module = TCW.sb.load_module("registry")
+        boom = lambda *a, **k: (_ for _ in ()).throw(OSError(text))
+        with mock.patch.object(module, "upsert", boom):
+            code, out, err = self.launch_at("coder7", self.address("worker-aaa"))
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len([l for l in err.splitlines() if l.startswith("registry: coder7: ")]), 1, err)
+        for planted in self.PLANTED:
+            self.assertNotIn(planted, err, "the exception text reached the note")
+        self.assertEqual(self.launch_at("coder8", self.address("worker-bbb"))[0], 0)
+        with mock.patch.object(module, "retire", boom):
+            code, out, err = self.main("retire", "coder8")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len([l for l in err.splitlines() if l.startswith("registry: coder8: ")]), 1, err)
+        for planted in self.PLANTED:
+            self.assertNotIn(planted, err, "the exception text reached the note")
+
+    def test_matches_a_corrupt_registry_file_goes_on_with_one_line_and_no_row(self):
+        os.makedirs(str(self.state), mode=0o700, exist_ok=True)
+        (self.state / REG.FILE).write_text("this is not json {")
+        code, out, err = self.launch_at("coder7", self.address("worker-aaa"))
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json.loads(out.strip().splitlines()[-1])["name"], "coder7")
+        self.assertEqual(len([l for l in err.splitlines() if l.startswith("registry: coder7: ")]), 1, err)
+        self.assertNotIn("coder7", (self.state / REG.FILE).read_text())
+
+    def test_matches_the_stop_removes_only_the_exact_named_row(self):
+        self.assertEqual(self.launch_at("coder1", self.address("worker-aaa"))[0], 0)
+        self.assertEqual(self.launch_at("coder10", self.address("worker-bbb"))[0], 0)
+        before = json.dumps(self.rows()["coder10"], sort_keys=True)
+        self.assertEqual(self.main("retire", "coder1")[0], 0)
+        rows = self.rows()
+        self.assertNotIn("coder1", rows)
+        self.assertIn("coder10", rows)
+        self.assertEqual(json.dumps(rows["coder10"], sort_keys=True), before)
+
+
 @unittest.skipIf(IN_MUTANT, "a mutant run does not run the mutants")
 class Mutants(unittest.TestCase):
     """A scratch copy of the tree with ONE change asserted applied; the behaviour tests run in it and must exit 1."""
     CASES = (
-        ("the endpoint written again", "bin/cloud_worker.py", '"state": "working"}, address=record["url"])', '"state": "working", "endpoint": record["url"]}, address=record["url"])'),
+        ("the exception text restored in the note", "bin/cloud_worker.py", 'say("the registry write failed (%s)" % type(err).__name__)', "say(str(err))", "AssertionError: .*the exception text reached the note"),
+        ("the endpoint written again", "bin/cloud_worker.py", '"state": "working"}, address=record["url"])', '"state": "working", "endpoint": record["url"]}, address=record["url"])', "^(FAIL|ERROR): test_matches_two_launches_write_one_row_each_with_kind_cloud_and_no_endpoint "),
         ("a row written though the registry is unavailable", "bin/cloud_worker.py",
-         "    except Exception as err:\n        say(str(err))",
-         "    except Exception as err:\n        say(str(err))\n        H[\"load_module\"](\"registry\").upsert(__import__(\"tempfile\").gettempdir(), name, dict(args[0])) if what == \"upsert\" else None"),
-        ("the row left behind at the stop", "bin/cloud_worker.py", '    _registry_note(engine, "retire", state, args.name, reason)', "    pass"),
+         "    except Exception as err:\n        say(\"the registry write failed (%s)\" % type(err).__name__)",
+         "    except Exception as err:\n        say(\"the registry write failed (%s)\" % type(err).__name__)\n        H[\"load_module\"](\"registry\").upsert(__import__(\"tempfile\").gettempdir(), name, dict(args[0])) if what == \"upsert\" else None", "^(FAIL|ERROR): test_matches_a_registry_that_fails_says_one_line_without_endpoint_or_secret "),
+        ("the row left behind at the stop", "bin/cloud_worker.py", '    _registry_note(engine, "retire", state, args.name, reason)', "    pass", "^(FAIL|ERROR): test_matches_stop_retires_the_row_once_and_a_second_run_retires_nothing "),
         ("the row left behind at the clear", "bin/cloud_worker.py",
-         '        _registry_note(engine, "retire", state, name, "cleared: the pod is gone and the hard deadline has passed")', "        pass"),
+         '        _registry_note(engine, "retire", state, name, "cleared: the pod is gone and the hard deadline has passed")', "        pass", "^(FAIL|ERROR): test_matches_the_cloud_sweep_retires_the_row_once_and_a_second_run_retires_nothing "),
         ("the row retired before the stop", "bin/cloud_worker.py",
          "    try:\n        with Cluster() as cluster:\n            code, body, note = run_launcher(runner, \"stop\", args.name, [\"--reason\", reason], STOP_SECONDS, cluster=cluster)",
-         "    _registry_note(engine, \"retire\", state, args.name, reason)\n    try:\n        with Cluster() as cluster:\n            code, body, note = run_launcher(runner, \"stop\", args.name, [\"--reason\", reason], STOP_SECONDS, cluster=cluster)"),
+         "    _registry_note(engine, \"retire\", state, args.name, reason)\n    try:\n        with Cluster() as cluster:\n            code, body, note = run_launcher(runner, \"stop\", args.name, [\"--reason\", reason], STOP_SECONDS, cluster=cluster)", "^(FAIL|ERROR): test_matches_a_failed_stop_leaves_the_row "),
     )
 
-    def run_mutant(self, rel, old, new):
+    def run_tree(self, rel=None, old=None, new=None):
+        """Run Behaviour in a scratch copy; with a mutation, it is asserted applied (counted). Returns (exit code, output, applied)."""
         with tempfile.TemporaryDirectory() as tmp:
             copy = Path(tmp) / "tree"
             shutil.copytree(ROOT, copy, ignore=shutil.ignore_patterns(".git", "__pycache__"))
-            target = copy / rel
-            text = target.read_text()
-            self.assertEqual(text.count(old), 1, "the mutation does not apply once")
-            target.write_text(text.replace(old, new))
-            self.assertNotEqual(target.read_text(), text, "the mutation was not applied")
-            env = dict(os.environ, CW1510_IN_MUTANT="1")
-            done = subprocess.run([sys.executable, "-m", "unittest", "test_registry_endpoint.Behaviour"], cwd=str(copy / "cloud/launcher/tests"),
-                                  env=env, capture_output=True, text=True, timeout=900)
-            return done.returncode
-
-    def test_matches_the_unchanged_copy_passes(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            copy = Path(tmp) / "tree"
-            shutil.copytree(ROOT, copy, ignore=shutil.ignore_patterns(".git", "__pycache__"))
+            applied = False
+            if rel:
+                target = copy / rel
+                text = target.read_text()
+                self.assertEqual(text.count(old), 1, "the mutation does not apply once")
+                target.write_text(text.replace(old, new))
+                applied = target.read_text() != text
+                self.assertTrue(applied, "the mutation was not applied")
             done = subprocess.run([sys.executable, "-m", "unittest", "test_registry_endpoint.Behaviour"], cwd=str(copy / "cloud/launcher/tests"),
                                   env=dict(os.environ, CW1510_IN_MUTANT="1"), capture_output=True, text=True, timeout=900)
-            self.assertEqual(done.returncode, 0, done.stderr[-1500:])
+            return done.returncode, done.stderr, applied
 
-    def test_matches_each_mutant_exits_1(self):
-        for label, rel, old, new in self.CASES:
+    def test_matches_the_unchanged_copy_passes(self):
+        code, output, _ = self.run_tree()
+        self.assertEqual(code, 0, output[-1500:])
+
+    def test_matches_each_mutant_fails_with_the_check_named(self):
+        for label, rel, old, new, anchor in self.CASES:
             with self.subTest(label):
-                self.assertEqual(self.run_mutant(rel, old, new), 1, label)
+                code, output, applied = self.run_tree(rel, old, new)
+                named = bool(re.search(anchor, output, re.M))
+                print("mutant %s: control passes 1 of 1, fails %d of 1 with the check named, mutation applied %s" % (label, int(code == 1 and named), applied))
+                self.assertEqual(code, 1, label)
+                self.assertTrue(named, "%s: the anchored text %r is missing" % (label, anchor))
 
 
 class Docs(unittest.TestCase):
