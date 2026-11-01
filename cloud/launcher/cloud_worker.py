@@ -2357,14 +2357,14 @@ class Launcher:
         for c in (status.get("containerStatuses") or [])[:20]:
             st = c.get("state") or {}
             kind = next((k for k in ("terminated", "waiting", "running") if k in st), "unknown")
-            one = {"name": scrub(c.get("name") or "", 63), "state": kind}
+            one = {"name": mask_addresses(scrub(c.get("name") or "", 63)), "state": kind}
             detail = st.get(kind) or {}
             if detail.get("reason"):
-                one["reason"] = scrub(detail["reason"], 100)
+                one["reason"] = mask_addresses(scrub(detail["reason"], 100))
             if kind == "terminated":
                 one["exit_code"] = detail.get("exitCode")
             containers.append(one)
-        state = {"phase": scrub(phase or "", 30), "containers": containers, "node": scrub(spec.get("nodeName") or "", 253),
+        state = {"phase": scrub(phase or "", 30), "containers": containers, "node": mask_addresses(scrub(spec.get("nodeName") or "", 253)),
                  "events": [], "events_read": "no"}
         if phase == "Running":
             return state

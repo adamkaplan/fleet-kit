@@ -238,6 +238,39 @@ class Stop(unittest.TestCase):
         say("S6 stop: phase Running, events_read no, %d reads of events, %d read of the pod, %d of 8 other fields" % (
             kube.log.count("pod_events"), kube.log.count("get_pod"), len(other)))
 
+    def planted_kube(self):
+        kube = FakeKube(events=[ev(1)])
+        kube.pod["spec"]["nodeName"] = "10.71.8.9"
+        kube.pod["status"]["containerStatuses"] = [
+            {"name": "10.72.5.4", "state": {"waiting": {"reason": "pull 10.73.4.3 failed"}}}]
+        return kube
+
+    def test_an_address_as_node_container_or_reason_reaches_no_file(self):
+        planted = ("10.71.8.9", "10.72.5.4", "10.73.4.3")
+        real = cw.mask_addresses
+        cw.mask_addresses = lambda text: str(text)   # the control: the unmasked build shows all three
+        try:
+            _, _, path = self.stop(self.planted_kube())
+        finally:
+            cw.mask_addresses = real
+        with open(path) as f:
+            body = f.read()
+        shown = [v for v in planted if v in body]
+        self.assertEqual(shown, list(planted))
+        _, rec, path = self.stop(self.planted_kube())
+        with open(path) as f:
+            text = f.read()
+        self.assertEqual([v for v in planted if v in text], [])
+        self.assertEqual(rec["pod_state"]["node"], "[address]")
+        say("S10 stop: control shows %d of 3 planted IPv4 values, the build shows %d (node, container name, reason)" % (len(shown), 0))
+
+    def test_mapped_ipv4_cases(self):
+        masked = ["::ffff:10.1.2.3", "[::ffff:10.1.2.3]:443", "64:ff9b::192.0.2.33"]
+        kept = ["exit code:137", "a clock 10:30:45"]
+        self.assertEqual([m for m in masked if cw.mask_addresses(m) != "[address]"], [])
+        self.assertEqual([k for k in kept if cw.mask_addresses(k) != k], [])
+        say("S10 mapped IPv4: %d of %d masked whole, %d of %d kept" % (len(masked), len(masked), len(kept), len(kept)))
+
     def test_a_pod_that_is_gone_writes_no_pod_state(self):
         kube = FakeKube()
         kube.get_pod = lambda name: None
@@ -290,6 +323,10 @@ def probe():
             bad.append("an unreadable cluster lost the pod state")
         if got and "delete" not in kube.log:
             bad.append("the pod was not deleted")
+        kube = t.planted_kube()
+        got = stopped(kube)
+        if got and any(v in open(got[2]).read() for v in ("10.71.8.9", "10.72.5.4", "10.73.4.3")):
+            bad.append("an address reached the pod state")
     finally:
         t.doCleanups()
     return bad
@@ -299,6 +336,7 @@ LAUNCHER_DIR = os.path.dirname(HERE)
 CALL = '                self._record_pod_state(info["record"], pod, name)\n'
 AFTER_DELETE = '                self._remove(name, nonce, uid)\n                print("cloud-worker: pod was %s; end hook not run; deleted" % phase, file=sys.stderr)\n'
 MUTANTS = [   # (name, [(old text, new text)], the anchored failure text)
+    ("node unmasked", [('"node": mask_addresses(scrub(spec.get("nodeName") or "", 253))', '"node": scrub(spec.get("nodeName") or "", 253)')], "an address reached the pod state"),
     ("read after the delete", [(CALL, "                pass\n"), (AFTER_DELETE, AFTER_DELETE + CALL)], "the pod state was read after the delete"),
     ("events of a running pod", [('        if phase == "Running":\n            return state\n', '        if False:\n            return state\n')], "the events of a running pod were read"),
     ("all events kept", [("items[-POD_EVENTS_MAX:]", "items")], "the events are not 20 of at most 200 characters"),
