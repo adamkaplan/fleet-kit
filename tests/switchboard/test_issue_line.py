@@ -106,6 +106,18 @@ def build():
                     make()
                     self.refused(self.ref, "--next-step", "wait", expect=text)
 
+        def read_that_goes_on(self):
+            """The failed-read mutant: catches the read error, brings the fake up and goes on with a good body, so the command writes (the write is counted)."""
+            original = self.module._read
+
+            def read(sb, repo, number):
+                try:
+                    return original(sb, repo, number)
+                except sb.IntentError:
+                    self.gh.down = False
+                    return BODY
+            return read
+
         def test_s2_each_mutant_that_writes_anyway_is_caught_and_the_control_passes(self):
             for label, make, text in self.case_refusals():
                 with self.subTest(label):
@@ -114,9 +126,7 @@ def build():
                     self.refused(self.ref, "--next-step", "wait", expect=text)   # the control: the unmutated command passes
                     self.gh.__dict__.pop("patches", None)
                     if label == "failed read":
-                        self.gh.down = False   # the failed-read mutant: the read "succeeds" empty and the command writes
-                        self.gh.bodies = {5: ""}
-                        self.mutated("body_problem", lambda body: None, lambda: self.refused(self.ref, "--next-step", "wait"))
+                        self.mutated("_read", self.read_that_goes_on(), lambda: self.refused(self.ref, "--next-step", "wait"))
                     else:
                         self.mutated("body_problem", lambda body: None, lambda: self.refused(self.ref, "--next-step", "wait"))
                     self.gh.__dict__.pop("patches", None)
