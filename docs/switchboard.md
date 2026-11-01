@@ -4589,6 +4589,8 @@ anything yet**: no gate refuses a ready or a merge, and the `gh` shim is unchang
 **The ledger** is `plan-ledger.jsonl` in the state directory (mode 0600), append-only. Each entry carries the hash of the
 one before it, so an edit, a deletion or a reordering is found when the file is read, and a ledger whose chain is broken
 takes no new entry. It is tamper-**evident**, not tamper-proof. The chain finds an edit, a deletion or a reordering. A second file, `plan-ledger.head`, holds the sequence number and hash of the newest entry, so cutting entries off the end is found too; and every `plan.*` audit line carries the chain hash it produced, so a full rewrite with recomputed hashes disagrees with the audit. A process that can write the whole state directory (the ledger, the head file and the audit log) can still forge all three. Entries are bound to the plan's **plan hash** (from `plan check`: editing the plan, even a constraint, voids
+
+**One hash with or without the trailing marker (#1713).** The plan hash is taken with one trailing `<!-- fleet-switchboard:from=<name> -->` line removed (see `docs/plan-template.md`): the ledger entries recorded at the old hash of a marker-bearing comment still read as bound to the plan (`plan_ledger.as_current` for an ask record's head, `plan_check.canonical_hash` at each compare), a review round stores its pair as `plan_hashes`, and an entry of an older revision stays stale. The ledger is never rewritten.
 them) and to the PR's **head** (a push voids them; the view shows them as void, with the reason, rather than hiding them).
 
 | Command | What it records |
