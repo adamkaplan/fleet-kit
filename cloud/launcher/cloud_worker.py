@@ -1337,6 +1337,49 @@ def scan_credentials(spec):
 REGISTRY_KEYS = ("secrets.json", "agents.json")
 
 
+class KnownForms(set):
+    """The forms of the known secrets, each with the lifetimes that hold it; a form with no lifetime never leaves."""
+
+    def __init__(self):
+        super().__init__()
+        self._lock = threading.RLock()
+        self._lives = {}
+
+    def __iter__(self):
+        with self._lock:
+            return iter(list(set.__iter__(self)))
+
+    def add_forms(self, forms, life=None):
+        with self._lock:
+            for f in forms:
+                set.add(self, f)
+                if life is None:
+                    self._lives[f] = None
+                elif self._lives.get(f, 0) is not None:
+                    self._lives.setdefault(f, set()).add(life)
+
+    def sweep(self, now, pods):
+        """Drop each form whose every holder has left: ("pod", name) when the pod is not in pods; ("until", t, name) when now >= t and the pod is not in pods. pods=None drops nothing. Returns the count dropped."""
+        if pods is None:
+            return 0
+        pods = set(pods)
+        gone = 0
+        with self._lock:
+            for f, lives in list(self._lives.items()):
+                if lives is None:
+                    continue
+                lives -= {l for l in lives if (l[0] == "pod" and l[1] not in pods) or (l[0] == "until" and now >= l[1] and l[2] not in pods)}
+                if not lives:
+                    del self._lives[f]
+                    set.discard(self, f)
+                    gone += 1
+        return gone
+
+
+def secret_life_until(seconds=3660, pod=None):
+    return ("until", time.time() + seconds, pod)
+
+
 class Kube:
     """The only door to the cloud: one kubectl call per method. Never puts a secret on a command line."""
 
