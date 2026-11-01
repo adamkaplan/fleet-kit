@@ -1154,9 +1154,11 @@ def write_audit(path, line):
     """One audit line, appended (the file is 0600). It never raises: the action already ran, so a loud warning beats undoing it."""
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
+        lock = _audit_lock(path, fcntl.LOCK_SH)   # the shared lock for one append: it waits for a rotation's swap, without a time bound
         fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
         with os.fdopen(fd, "a") as f:   # one short O_APPEND write: atomic enough for one line, the chosen guarantee
             f.write(json.dumps(line, sort_keys=True) + "\n")
+        _audit_unlock(lock)   # released before the rotation is tried (and by the kernel if the process dies)
         _rotate_if_large(path)
     except OSError as e:
         print("cloud-worker: WARNING: the action ran but its audit line could not be written: %s" % e, file=sys.stderr)
