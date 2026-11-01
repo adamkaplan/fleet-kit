@@ -104,6 +104,26 @@ def read_pr_runs(gh, repo, number, head):
     return out
 
 
+def read_behind(gh, repo, run_base, tip, _seen={}):
+    """`ahead_by` of the compare of a run's base with the tip: one read per pair, kept in memory (ask #1755)."""
+    if (repo, run_base, tip) not in _seen:
+        n = (_json(gh, ["api", "repos/%s/compare/%s...%s" % (repo, run_base, tip)], "the commits behind") or {}).get("ahead_by")
+        if not isinstance(n, int): raise ReadError("the commits behind were not counted")
+        _seen[(repo, run_base, tip)] = n
+    return _seen[(repo, run_base, tip)]
+
+
+def read_fresh(gh, repo, number, head, base_ref):   # (run base of the earliest deciding run, tip, behind); None for what could not be read
+    base = tip = behind = None
+    try:
+        runs = read_pr_runs(gh, repo, number, head) if head else []
+        base = min(runs, key=lambda r: r["created"] or 0)["base"] if runs and all(r["base"] for r in runs) else None
+        tip = read_tip(gh, repo, base_ref) if isinstance(base_ref, str) and base_ref else None
+        behind = read_behind(gh, repo, base, tip) if base and base != tip else None
+    except (ReadError, AttributeError, TypeError): pass
+    return base, tip, behind
+
+
 def run_result(run):
     """`green`, `red` or `pending` for one run: only a completed run with a green conclusion is green; anything unknown is red or pending, never green."""
     if run.get("status") != "completed":
