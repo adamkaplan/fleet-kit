@@ -539,8 +539,6 @@ class TestPushWatch(Case):
         self._fails(lambda: self._launcher_read([self._good("w-a", "stop")], reader=boom, module=mutant) and self.fail(
             "a RuntimeError of the launcher reader was swallowed as a corrupt line"),
             "a RuntimeError of the launcher reader was swallowed as a corrupt line")
-
-class TestWriteOnce(Case):
     def _replaces(self, module):
         self.world.refs = {"w-a/wip": SHA_A}
         self.engine.cloud_watch = {"records": [record("w-a", "lane-a")]}
@@ -570,8 +568,6 @@ class TestWriteOnce(Case):
         self.assertIn("the state file was rewritten on idle passes", str(caught.exception))
 
 
-class TestTickWithoutConfig(unittest.TestCase):
-    """#1740: push_watch_tick reads the configuration defensively."""
 
     def _tick(self, old=False):
         import importlib.machinery
