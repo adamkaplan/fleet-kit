@@ -685,8 +685,12 @@ def _record(fd, name, pid, command, now, extra=None):
         pass
 
 
-def command_prefix(which=shutil.which):
-    """["taskpolicy", "-b"] where macOS's taskpolicy exists, else ["nice", "-n", "10"], else [] (no way to lower the priority: said by the caller)."""
+def command_prefix(which=shutil.which, environ=None):
+    """["taskpolicy", "-b"] where macOS's taskpolicy exists, else ["nice", "-n", "10"], else [] (no way to lower the priority: said by the caller). In a cloud worker pod
+    (#1794: CW_AUDIT_RUNTIME_ID begins "pod/" and CW_HARD_DEADLINE is set and not empty) it is [] at once: a pod has no person's machine to protect, and the niceness slowed a run 8.8 times."""
+    environ = os.environ if environ is None else environ
+    if str(environ.get("CW_AUDIT_RUNTIME_ID", "")).startswith("pod/") and str(environ.get("CW_HARD_DEADLINE", "")) != "":
+        return []
     found = which("taskpolicy")
     if found:
         return [found, "-b"]
