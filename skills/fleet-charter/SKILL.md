@@ -234,3 +234,6 @@ Use plain `gh` for what you say on GitHub. The switchboard tells you about comme
 on your issues, and the harness signs the ones you post (an invisible HTML comment),
 so they do not come back to you as events. `fleet-switchboard comment` does the same
 by hand where the harness has no shim.
+To change one of your own comments that is not your last (a plan, a receipt), use
+`fleet-switchboard comment --edit COMMENT_URL --body-file FILE` (never a `gh api` call); an
+approved plan also needs `--approval ID`, and the approval lapses with the new hash.
