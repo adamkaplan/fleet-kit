@@ -1180,6 +1180,45 @@ def last_audit_line(path, action, runtime_id=None):
     return None
 
 
+_TAIL_COUNT = threading.local()   # audit lines parsed by AuditTail, per thread: a pass or a tick reads its own thread's count
+
+
+def tail_lines_parsed():
+    return getattr(_TAIL_COUNT, "n", 0)
+
+
+class AuditTail:
+    """One read of the audit file's tail (the same 262,144-byte window as last_audit_line), made at the FIRST question and kept: for each
+    (action, runtime id) the newest line's (ok, reason). A line that is not JSON is skipped; the newest line wins. `parsed` counts the lines parsed."""
+
+    def __init__(self, path):
+        self.path, self.parsed, self.newest, self.loaded = path, 0, {}, False
+
+    def _load(self):
+        self.loaded = True
+        try:
+            with open(self.path, "rb") as f:
+                f.seek(0, os.SEEK_END)
+                f.seek(max(0, f.tell() - 262144))
+                lines = f.read().decode(errors="replace").splitlines()
+        except OSError:
+            return
+        for raw in reversed(lines):
+            self.parsed += 1
+            _TAIL_COUNT.n = tail_lines_parsed() + 1
+            try:
+                rec = json.loads(raw)
+            except ValueError:
+                continue
+            if isinstance(rec, dict):
+                self.newest.setdefault((rec.get("action"), rec.get("runtime_id")), (rec.get("ok"), rec.get("reason")))
+
+    def get(self, action, runtime_id):
+        if not self.loaded:
+            self._load()
+        return self.newest.get((action, runtime_id))
+
+
 class TokenRefresh:
     """What one refresh attempt came to: the state, the reason (never a value) and the token that was written."""
 
