@@ -98,6 +98,7 @@ _support_test_cases_02 = importlib.import_module("test_cases_02")   # support im
 TestWorkerRulesInSkills, TestJevClient, TestImportV1Converter, TestPlanCheckFeedback = (_support_test_cases_02.TestWorkerRulesInSkills, _support_test_cases_02.TestJevClient, _support_test_cases_02.TestImportV1Converter, _support_test_cases_02.TestPlanCheckFeedback)   # support import
 TestPlanReceipts, TestDecisionHeadlines, TestExternalAdapterErrors, TestJobTool = (_support_test_cases_02.TestPlanReceipts, _support_test_cases_02.TestDecisionHeadlines, _support_test_cases_02.TestExternalAdapterErrors, _support_test_cases_02.TestJobTool)   # support import
 TestPlanKind, TestAuditRotation, TestAgentsVerify, TestReviewLawsStarterSet = (_support_test_cases_02.TestPlanKind, _support_test_cases_02.TestAuditRotation, _support_test_cases_02.TestAgentsVerify, _support_test_cases_02.TestReviewLawsStarterSet)   # support import
+TestScratchBound = importlib.import_module("test_scratch_command").TestScratchBound
 TestPluginPush, TestReconcileOnRead = (_support_test_cases_02.TestPluginPush, _support_test_cases_02.TestReconcileOnRead)   # support import
 _support_test_cases_03 = importlib.import_module("test_cases_03")   # support import
 TestV2Client, TestStatus, TestPoke = (_support_test_cases_03.TestV2Client, _support_test_cases_03.TestStatus, _support_test_cases_03.TestPoke)   # support import
@@ -67258,6 +67259,7 @@ RelayObeysTheTreeGuard = _relay_tree_guard.RelayObeysTheTreeGuard
 _sent_view = importlib.import_module("test_sent_view")
 _sent_view.World = World
 TestSentView = _sent_view.TestSentView
+TestScratchCommand = importlib.import_module("test_scratch_command").TestScratchCommand
 # The relay-loop tests of #1477, moved under the architecture cap.
 _relay_loop = importlib.import_module("test_relay_loop_cadence")
 RelayLoopCadence, TwoLoopsTrace, TrickleHub, HubFilesUnchanged, OneWorkerAndCancel = _relay_loop.RelayLoopCadence, _relay_loop.TwoLoopsTrace, _relay_loop.TrickleHub, _relay_loop.HubFilesUnchanged, _relay_loop.OneWorkerAndCancel
@@ -67285,6 +67287,7 @@ TestLoadAlertCloudBusy = _load_cloud.TestLoadAlertCloudBusy
 _ci_test_files = importlib.import_module("test_ci_test_files")
 TestCiTestFileList = _ci_test_files.TestCiTestFileList
 TestTempJanitorScratch = importlib.import_module("test_scratch").build(TestTempJanitor)
+TestScratchGuard = importlib.import_module("test_scratch_command").TestScratchGuard
 
 # The delivery-lag tests of #1402.
 _delivery_lag = importlib.import_module("test_delivery_lag")
