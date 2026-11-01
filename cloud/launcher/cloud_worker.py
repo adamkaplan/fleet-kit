@@ -396,7 +396,27 @@ def scrub(text, secrets_known=(), limit=300):
     of this run's secrets and any 8+ character piece of one, token-shaped strings and long base64/hex runs are removed,
     then the text is cut to `limit`. Control characters become '?'."""
     text = str(text)[:SCRUB_INPUT_MAX]
-    for sec in sorted({v for v in secrets_known if v and len(v.strip()) >= MIN_FRAGMENT}, key=len, reverse=True):
+    snap = frozenset(secrets_known)  # ONE C-level copy, taken first: a set that changes during the call cannot raise here
+    built = getattr(scrub, "_built", None)
+    if built is None or built[0] != snap:
+        order = sorted({v for v in snap if v and len(v.strip()) >= MIN_FRAGMENT}, key=lambda v: (-len(v), v))
+        index, always = {}, set()
+        for n, sec in enumerate(order):
+            if "[" in sec or "]" in sec or "redacted" in sec:
+                always.add(n)  # the marker written by a redaction could make a piece of this secret
+            for k in range(len(sec) - MIN_FRAGMENT + 1):
+                index.setdefault(sec[k:k + MIN_FRAGMENT], set()).add(n)
+        built = (snap, order, index, always)
+        scrub._built = built
+    _, order, index, always = built
+    hit = set(always)
+    if index:  # ONE pass over the text: one probe per position
+        for i in range(len(text) - MIN_FRAGMENT + 1):
+            found = index.get(text[i:i + MIN_FRAGMENT])
+            if found:
+                hit |= found
+    for n in sorted(hit):  # `order` is longest first, then by text: index order is that order
+        sec = order[n]
         for v in {sec, sec.strip()}:
             text = text.replace(v, "[redacted]")
         out, i = [], 0
