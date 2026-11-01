@@ -364,7 +364,8 @@ class TestMutantIsCaught(unittest.TestCase):
     def test_s4_the_one_class_per_file_mutant_fails_the_planted_test_with_its_text(self):
         import sys
         name = "test_s3_a_planted_file_with_one_of_two_classes_bound_fails_naming_the_second"
-        self.assertEqual(run_named_cases(sys.modules[__name__], [name]), {name: None})      # the control: the unmutated check
+        this = sys.modules[__name__]
+        self.assertEqual(run_named_cases(this, [name]), {name: None})      # the control: the unmutated check
         got = run_named_cases(self.load_mutant(CLASS_RULE_ORIGINAL, CLASS_RULE_MUTATED), [name])
         self.assertEqual(got, {name: "AssertionError: 0 != 1 : []"})
 
