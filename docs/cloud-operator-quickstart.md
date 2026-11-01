@@ -62,6 +62,7 @@ Each setting's name, whether the file requires it, and its kind (name, https URL
 | `CW_CLUSTER_ADMIN_SECRET` | no | secret-name | the name of the vault secret that holds the cluster administrator kubeconfig (default `cw-cluster-admin-kubeconfig`): 1 to 127 letters, digits and hyphens; the name, never its content |
 | `CW_STACK_MODEL_SECRET` | no | secret-name | with `launch --cloud --stack` only: the name of the vault secret (same vault as the others) that holds the stack-only model credential: 1 to 127 letters, digits and hyphens; the name, never its value. Ignored without `--stack`. See "A stack-only model credential" |
 | `CW_CLUSTER_TOKEN_DURATION` | no | duration | the cluster token's requested life: 1 to 3 digits and `m` or `h`, from `1m` to `60m` (default `20m`; `1h` is the same as `60m`) |
+| `CW_FINAL_NOTE_MINUTES` | no | number | the minutes before a worker's hard limit at which the launcher tells it to send its final message, once: a whole number from `1` to `60` (default `10`) |
 | `CW_GIT_TOKEN_CMD` | no | command | a command that prints the one-hour git token; default is the GitHub App mint beside the launcher (`app_token.py`) |
 | `CW_APP_ID_CMD`, `CW_APP_KEY_CMD` | no | command | commands that print the GitHub App's id and key instead of the vault read (`app_token.py`) |
 | `CW_APP_INSTALLATION_CMD` | no | command | obsolete: accepted and ignored, never run. The installation is looked up per repository (see the next paragraph); the vault no longer needs `cw-app-installation-id` |
