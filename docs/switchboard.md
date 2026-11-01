@@ -4798,6 +4798,8 @@ terminal or under a waiver can move the branch between the check and the merge (
 
 **The loader block of a new test file (#1618).** `tests/switchboard/test_wired_tests.py` derives every `tests/switchboard/test_*.py` from the directory and fails, naming the file, when `bin/test-switchboard` does not import its module (`not imported`) or binds none of its TestCase classes at module level (`no class bound`). A new file adds a loader block of at most 3 lines (comment, `importlib.import_module`, one binding line) at its own anchor, or is a row of `EXEMPT_FILES` in that test with a reason of 20 or more characters.
 
+The same check covers every test class of a file (#1847): a module-level TestCase class that `bin/test-switchboard` does not bind by name fails, naming the file and the class, unless it is a base class (another class of the file derives from it, so its tests run through the subclass) or a row of `EXEMPT_FILES` keyed `file.py::ClassName` with a reason of 20 or more characters.
+
 ## `gates-check`, the gate modes and the kill switches (#107, slice 3a)
 
 This is step (a) of the gate engine in [docs/plan-gate-engine-design.md](plan-gate-engine-design.md). **No shim calls it and
