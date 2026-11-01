@@ -122,12 +122,12 @@ def _rotation_record(path, parse, size):
     finally:
         os.close(fd)
     try:
-        data = parse(raw.decode("utf-8")) if len(raw) <= _ROTATION_RECORD_MAX else None
+        body = parse(raw.decode("utf-8")) if len(raw) <= _ROTATION_RECORD_MAX else None
     except (ValueError, UnicodeDecodeError):
         return None
-    if not isinstance(data, dict):
+    if not isinstance(body, dict):
         return None
-    done, cuts, pending = data.get("done"), data.get("cuts"), data.get("pending")
+    done, cuts, pend = body.get("done"), body.get("cuts"), body.get("pending")
     if isinstance(done, bool) or not isinstance(done, int) or done < 0 or not isinstance(cuts, list) or len(cuts) > _CUTS_KEPT or len(cuts) > done:
         return None
     entries = []
@@ -136,11 +136,11 @@ def _rotation_record(path, parse, size):
         if isinstance(cut, bool) or not isinstance(cut, int) or cut <= 0 or not isinstance(name, str):
             return None
         entries.append((cut, name))
-    if pending is not None:
-        if not isinstance(pending, dict) or any(isinstance(pending.get(k), bool) or not isinstance(pending.get(k), int) or pending.get(k) < 0 for k in ("cut", "old_size")):
+    if pend is not None:
+        if not isinstance(pend, dict) or any(isinstance(pend.get(k), bool) or not isinstance(pend.get(k), int) or pend.get(k) < 0 for k in ("cut", "old_size")):
             return None
-        if size < pending["old_size"]:   # the replacement has happened: one more rotation
-            return done + 1, entries + [(pending["cut"], None)]
+        if size < pend["old_size"]:   # the replacement has happened: one more rotation
+            return done + 1, entries + [(pend["cut"], None)]
     return done, entries
 
 
