@@ -1215,10 +1215,10 @@ class _GaveUp(Exception):
     """The audit file is no longer the one the rotation read: another rotation or a replacement came first."""
 
 
-def _audit_lock(path, how):
+def _audit_lock(path, how, suffix=".lock"):
     """The lock file beside the audit file (0600, no link followed, created when missing), flock'ed; None when it cannot be had (the append goes ahead)."""
     try:
-        fd = os.open(path + ".lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        fd = os.open(path + suffix, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     except OSError:
         return None
     try:
@@ -1234,6 +1234,28 @@ def _audit_unlock(lock):
         lock.close()
 
 
+_RECORD_LOCK_SAID = {}
+
+
+def _record_update(path, change):
+    """ONE read-modify-write of the rotation record under the record lock (<audit>.record.lock, exclusive, held for the whole of it).
+    change(record) returns the record to write or None for no write. The record lock may be taken while the audit lock is held and the audit
+    lock is never requested while it is held. Returns False (said once, class and errno) when the record lock cannot be had."""
+    lock = _audit_lock(path, fcntl.LOCK_EX, ".record.lock")
+    if lock is None:
+        if not _RECORD_LOCK_SAID.get(path):
+            _RECORD_LOCK_SAID[path] = True
+            print("cloud-worker: the audit rotation record lock could not be had (OSError); the record step is skipped", file=sys.stderr)
+        return False
+    try:
+        new = change(read_rotation_record(path))
+        if new is not None:
+            write_rotation_record(path, new)
+        return True
+    finally:
+        _audit_unlock(lock)
+
+
 def _err_text(e):
     return "%s errno=%s" % (type(e).__name__, getattr(e, "errno", None))
 
@@ -1244,21 +1266,19 @@ def _complete_pending(path):
         return
     lock = _audit_lock(path, fcntl.LOCK_EX)
     try:
-        record = read_rotation_record(path)
-        pend = record["pending"]
-        if not isinstance(pend, dict):
-            if pend is not None:
-                write_rotation_record(path, dict(record, pending=None))
-            return
-        try:
-            swapped = os.path.getsize(path) < pend.get("old_size", 0)
-        except OSError:
-            swapped = False
-        if swapped:
-            write_rotation_record(path, {"done": record["done"] + 1, "pending": None,
-                                         "cuts": record["cuts"] + [{"cut": pend.get("cut", 0), "archive": pend.get("archive", "")}]})
-        else:
-            write_rotation_record(path, dict(record, pending=None))
+        def complete(record):
+            pend = record["pending"]
+            if not isinstance(pend, dict):
+                return dict(record, pending=None) if pend is not None else None
+            try:
+                swapped = os.path.getsize(path) < pend.get("old_size", 0)
+            except OSError:
+                swapped = False
+            if swapped:
+                return {"done": record["done"] + 1, "pending": None,
+                        "cuts": record["cuts"] + [{"cut": pend.get("cut", 0), "archive": pend.get("archive", "")}]}
+            return dict(record, pending=None)
+        _record_update(path, complete)
     finally:
         _audit_unlock(lock)
 
@@ -1325,8 +1345,8 @@ def rotate_audit(path, now=None, dry_run=False, _before_swap=None, _before_lock=
         result["archive"] = os.path.basename(archive)
         os.unlink(gz_temp)
         temps.remove(gz_temp)
-        record = read_rotation_record(path)
-        write_rotation_record(path, dict(record, pending={"cut": cut, "old_size": len(data), "archive": os.path.basename(archive)}))
+        mine = os.path.basename(archive)
+        _record_update(path, lambda record: dict(record, pending={"cut": cut, "old_size": len(data), "archive": mine}))   # the record lock is released before the audit lock is requested
         pending = True
         if _before_lock:
             _before_lock()
@@ -1351,17 +1371,19 @@ def rotate_audit(path, now=None, dry_run=False, _before_swap=None, _before_lock=
         pending = False
         for attempt in range(3):   # done is incremented, the cut and its archive are appended, pending is cleared
             try:
-                record = read_rotation_record(path)
-                write_rotation_record(path, {"done": record["done"] + 1, "pending": None,
-                                             "cuts": record["cuts"] + [{"cut": cut, "archive": os.path.basename(archive)}]})
-                break
+                if _record_update(path, lambda record: {"done": record["done"] + 1, "pending": None,
+                                                        "cuts": record["cuts"] + [{"cut": cut, "archive": mine}]}):
+                    break
             except Exception as e:
                 if attempt == 2:
                     print("cloud-worker: the audit rotation record could not be written (%s)" % _err_text(e), file=sys.stderr)
     except Exception as e:
         if pending:   # a failure before the replacement clears pending
             try:
-                write_rotation_record(path, dict(read_rotation_record(path), pending=None))
+                def clear_own(record):   # only this rotation's own pending
+                    pend = record["pending"]
+                    return dict(record, pending=None) if isinstance(pend, dict) and pend.get("archive") == mine else None
+                _record_update(path, clear_own)
             except Exception:
                 pass
         for t in temps:   # a swap that failed leaves the log whole: an archive would be a duplicate of it
