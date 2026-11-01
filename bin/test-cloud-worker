@@ -98,6 +98,7 @@ class FakeRemote:
 STUB = """#!%(python)s
 import json, os, sys
 argv = sys.argv[1:]
+if argv and argv[0] == "capacity": print(json.dumps({"nodes": [], "requests": {}, "pending": None, "nodes_read": False, "pods_read": False, "events_read": False})); sys.exit(0)
 log = os.environ["STUB_DIR"] + "/calls.log"
 open(log, "a").write(json.dumps(argv) + "\\n")
 command, worker = argv[0], argv[1]
