@@ -34,6 +34,8 @@ class TestHeavyHolders(unittest.TestCase):
 
     def fake_proc(self, lock):
         root = self.tmp / "proc"
+        if lock.startswith(str(self.tmp)) and not os.path.lexists(lock):
+            Path(lock).write_text("")   # the lock is matched by device and inode: it must exist
         for pid, target in (("101", lock), ("102", lock), ("103", lock), ("104", lock), ("105", "/elsewhere")):
             fd = root / pid / "fd"
             fd.mkdir(parents=True)
@@ -55,7 +57,7 @@ class TestHeavyHolders(unittest.TestCase):
     def test_s2_the_pids_that_hold_the_path_without_lsof(self):
         lock = str(self.tmp / "heavy-slot-0.lock")
         root = self.fake_proc(lock)
-        real_lstat, real_listdir, real_readlink = os.lstat, os.listdir, os.readlink
+        real_lstat, real_listdir, real_stat = os.lstat, os.listdir, os.stat
 
         def lstat(path, *a, **k):
             got = real_lstat(path, *a, **k)
@@ -70,13 +72,13 @@ class TestHeavyHolders(unittest.TestCase):
                 raise PermissionError(13, "refused")
             return real_listdir(path)
 
-        def readlink(path, *a, **k):
+        def stat(path, *a, **k):
             if str(path).endswith("/102/fd/0"):   # the entry vanishes under the read
                 raise FileNotFoundError(2, "gone")
-            return real_readlink(path, *a, **k)
+            return real_stat(path, *a, **k)
 
         with mock.patch.dict(os.environ, {"PATH": self.no_lsof_path()}), mock.patch("subprocess.run") as run, mock.patch("os.lstat", lstat), \
-                mock.patch("os.listdir", listdir), mock.patch("os.readlink", readlink):
+                mock.patch("os.listdir", listdir), mock.patch("os.stat", stat):
             self.assertEqual(self.hs._proc_lock_pids(lock, str(root)), {101, 102})
             with mock.patch.object(self.hs, "PROC_ROOT", str(root)):
                 self.assertEqual(self.hs.read_lock_holders(lock), {101, 102})
@@ -111,11 +113,97 @@ class TestHeavyHolders(unittest.TestCase):
         with mock.patch("os.listdir", side_effect=PermissionError(13, "refused")):
             self.assertIsNone(self.hs._proc_lock_pids(lock, str(root)))
         for error in (ProcessLookupError, OSError, PermissionError):
-            with mock.patch("os.readlink", side_effect=error(1, "x")):
+            real = os.stat
+            with mock.patch("os.stat", lambda p, *a, e=error, **k: real(p, *a, **k) if "/fd/" not in str(p) else (_ for _ in ()).throw(e(1, "x"))):
                 self.assertEqual(self.hs._proc_lock_pids(lock, str(root)), set())
         with mock.patch.object(self.hs, "PROC_ROOT", str(root)), mock.patch("os.listdir", side_effect=PermissionError(13, "refused")), \
                 mock.patch.dict(os.environ, {"PATH": self.lsof_dir("echo 77\n") + os.pathsep + "/usr/bin" + os.pathsep + "/bin"}):
             self.assertEqual(self.hs.read_lock_holders(lock), {77})
+
+    def entries(self, target, pids=("201", "202")):
+        root = self.tmp / "proc2"
+        for pid in pids:
+            (root / pid / "fd").mkdir(parents=True)
+            os.symlink(target, root / pid / "fd" / "7")
+        return root
+
+    def test_a_symlinked_lock_path_finds_the_holders(self):
+        real = self.tmp / "real" / "lock"
+        real.parent.mkdir()
+        real.write_text("")
+        link = self.tmp / "linked-lock"
+        os.symlink(real, link)
+        root = self.entries(real)
+        self.assertNotEqual(str(link), str(real))
+        self.assertEqual(self.hs._proc_lock_pids(str(link), str(root)), {201, 202})
+
+    def test_b_a_hard_link_or_another_path_of_the_same_file(self):
+        real = self.tmp / "lock"
+        real.write_text("")
+        hard = self.tmp / "hard-lock"
+        os.link(real, hard)
+        root = self.entries(real)
+        self.assertEqual(self.hs._proc_lock_pids(str(hard), str(root)), {201, 202})
+        self.assertEqual(self.hs._proc_lock_pids(str(self.tmp / "." / "lock"), str(root)), {201, 202})
+
+    def test_c_mutant_the_string_compare_fails_a(self):
+        scratch = self.tmp / "scratch-bin"
+        shutil.copytree(BIN, scratch)
+        text = (scratch / "heavy_slots.py").read_text()
+        new = text.replace("if (seen.st_dev, seen.st_ino) == want:", "if os.readlink(os.path.join(root, name, 'fd', fd)) == str(path):")
+        self.assertNotEqual(new, text)
+        script = ("import os,sys,unittest;os.environ['HEAVY_HOLDERS_BIN']=sys.argv[1];sys.path.insert(0,sys.argv[2]);"
+                  "import test_heavy_holders as t;s=unittest.defaultTestLoader.loadTestsFromName('TestHeavyHolders.test_a_symlinked_lock_path_finds_the_holders',t);"
+                  "r=unittest.TextTestRunner(verbosity=0).run(s);sys.exit(0 if r.wasSuccessful() else 1)")
+        here = str(Path(__file__).parent)
+
+        def run(bindir):
+            return subprocess.run([sys.executable, "-c", script, str(bindir), here], capture_output=True, text=True)
+        control = run(scratch)   # the unmutated copy passes first
+        self.assertEqual(control.returncode, 0, control.stderr)
+        (scratch / "heavy_slots.py").write_text(new)
+        mutant = run(scratch)
+        self.assertEqual(mutant.returncode, 1)
+        self.assertIn("AssertionError: Items in the second set but not the first", mutant.stderr)
+
+    def test_d_the_entries_still_skipped(self):
+        lock = self.tmp / "lock"
+        lock.write_text("")
+        other = self.tmp / "other"
+        other.write_text("")
+        root = self.entries(lock, ("301", "302", "303", "304", "305"))
+        os.unlink(root / "302" / "fd" / "7")
+        os.symlink(self.tmp / "gone-file", root / "302" / "fd" / "7")   # vanished: dangling
+        os.unlink(root / "304" / "fd" / "7")
+        os.symlink(other, root / "304" / "fd" / "7")   # unrelated file, other inode
+        real_lstat, real_listdir = os.lstat, os.listdir
+
+        def lstat(path, *a, **k):
+            got = real_lstat(path, *a, **k)
+            if str(path).endswith("/303"):   # another user
+                fields = list(got)
+                fields[4] = os.getuid() + 1
+                return os.stat_result(fields)
+            return got
+
+        def listdir(path="."):
+            if str(path).endswith("/305/fd"):
+                raise PermissionError(13, "refused")
+            return real_listdir(path)
+        with mock.patch("os.lstat", lstat), mock.patch("os.listdir", listdir):
+            self.assertEqual(self.hs._proc_lock_pids(str(lock), str(root)), {301})
+
+    def test_e_a_lock_deleted_while_held_is_not_found(self):
+        lock = self.tmp / "lock"
+        lock.write_text("")
+        with open(lock) as held:
+            root = self.tmp / "proc3"
+            (root / "401" / "fd").mkdir(parents=True)
+            os.symlink("/proc/self/fd/%d" % held.fileno(), root / "401" / "fd" / "7")
+            self.assertEqual(self.hs._proc_lock_pids(str(lock), str(root)), {401})   # present: found
+            os.unlink(lock)
+            # the fd link still stats the open inode, but the path stat fails, so nothing is compared: an empty set
+            self.assertEqual(self.hs._proc_lock_pids(str(lock), str(root)), set())
 
     def run_wrapper(self, name, stranger):
         """One wrapper run in a world without lsof; returns (merged text and status, stdout, stderr and status of a second, separate run's streams)."""
