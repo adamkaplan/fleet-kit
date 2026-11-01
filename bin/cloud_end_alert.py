@@ -130,8 +130,243 @@ def message_text(worker, label, when, pushed, record_name, kept=False, failure=N
     return text
 
 
+# ---- ask #1743: a rotated audit is read through its archives, every line once (the rotation record is written by cloud/launcher/cloud_worker.py) ----
+ROTATION_WORDS = "an audit archive needed to read older stop lines was missing or unreadable"
+_ARCHIVE_NAME = re.compile(r"audit-[0-9T-]+\.jsonl\.gz")
+_ROTATION_RECORD_MAX = 4096
+_ARCHIVE_CUT_MAX = 8 << 20
+_CUTS_KEPT = 16
+
+
+def _open_regular(path):
+    """A file descriptor of a regular file opened without following a link, or None. Never raises."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0))
+    except OSError:
+        return None
+    try:
+        if os.fstat(fd).st_mode & 0o170000 == 0o100000:
+            return fd
+    except OSError:
+        pass
+    os.close(fd)
+    return None
+
+
+def _rotation_record(path, parse, size):
+    """(rotations completed, [(cut, archive name)] oldest first, the last perhaps a begun one with no name yet) from the record beside the audit file;
+    (0, []) when there is no record; None for one that is damaged, of the wrong shape or larger than 4096 bytes (the reader then behaves as before)."""
+    record = path + ".rotations"
+    if not os.path.lexists(record):
+        return 0, []
+    fd = _open_regular(record)
+    if fd is None:
+        return None
+    try:
+        raw = os.read(fd, _ROTATION_RECORD_MAX + 1)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    try:
+        data = parse(raw.decode("utf-8")) if len(raw) <= _ROTATION_RECORD_MAX else None
+    except (ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    done, cuts, pending = data.get("done"), data.get("cuts"), data.get("pending")
+    if isinstance(done, bool) or not isinstance(done, int) or done < 0 or not isinstance(cuts, list) or len(cuts) > _CUTS_KEPT or len(cuts) > done:
+        return None
+    entries = []
+    for item in cuts:
+        cut, name = (item.get("cut"), item.get("archive")) if isinstance(item, dict) else (None, None)
+        if isinstance(cut, bool) or not isinstance(cut, int) or cut <= 0 or not isinstance(name, str):
+            return None
+        entries.append((cut, name))
+    if pending is not None:
+        if not isinstance(pending, dict) or any(isinstance(pending.get(k), bool) or not isinstance(pending.get(k), int) or pending.get(k) < 0 for k in ("cut", "old_size")):
+            return None
+        if size < pending["old_size"]:   # the replacement has happened: one more rotation
+            return done + 1, entries + [(pending["cut"], None)]
+    return done, entries
+
+
+def _archive_stream(directory, name, cut):
+    """The decompressed bytes of one archive as a file object (gzip), or None when the name, the file or the cut is not acceptable."""
+    import gzip
+    if not isinstance(name, str) or not _ARCHIVE_NAME.fullmatch(name) or not isinstance(cut, int) or not 0 < cut <= _ARCHIVE_CUT_MAX:
+        return None
+    fd = _open_regular(os.path.join(directory, name))
+    if fd is None:
+        return None
+    return gzip.GzipFile(fileobj=os.fdopen(fd, "rb"), mode="rb")
+
+
+def _archives_whole(directory, segs):
+    """True when every archive of the chain decompresses to exactly its cut in bytes (read through gzip for at most its cut plus one)."""
+    for name, cut in segs:
+        stream = _archive_stream(directory, name, cut)
+        if stream is None:
+            return False
+        try:
+            with stream:
+                total = 0
+                while total <= cut:
+                    block = stream.read(min(65536, cut + 1 - total))
+                    if not block:
+                        break
+                    total += len(block)
+        except (OSError, EOFError, ValueError):
+            return False
+        if total != cut:
+            return False
+    return True
+
+
+def _archive_chunk(directory, chain, limit):
+    """(complete lines as bytes, the chain after them or None when it is done) for one pass, or None when an archive cannot be read."""
+    name, cut = chain["segs"][chain["i"]]
+    pos = chain["pos"]
+    stream = _archive_stream(directory, name, cut)
+    if stream is None:
+        return None
+    try:
+        with stream:
+            skip = pos
+            while skip > 0:
+                block = stream.read(min(65536, skip))
+                if not block:
+                    return None
+                skip -= len(block)
+            raw = stream.read(min(limit, cut - pos))
+    except (OSError, EOFError, ValueError):
+        return None
+    end = raw.rfind(b"\n") + 1 or len(raw)   # an archive holds complete lines; one longer than the bound is skipped whole
+    pos += end
+    if pos < cut:
+        return raw[:end], dict(chain, pos=pos)
+    following = chain["i"] + 1
+    return raw[:end], (dict(chain, i=following, pos=0) if following < len(chain["segs"]) else None)
+
+
+def _rotation_step(path, parse, size, offset, applied, chain, limit):
+    """One pass of the rotation rule: (offset, rotations applied, chain, archive bytes or None, failed). None for the bytes means the caller reads the live file
+    from `offset` as it always did; a chain still open or just finished gives its complete lines (maybe none) and the caller reads the live file only afterwards."""
+    directory = os.path.dirname(path) or "."
+    if chain is None:
+        rec = _rotation_record(path, parse, size)
+        if rec is None:
+            return offset, applied, None, None, False
+        count, entries = rec
+        if applied is None:
+            return offset, count, None, None, False
+        grown = count - applied
+        if grown <= 0 or grown > len(entries):
+            return offset, applied, None, None, False
+        live, segs, start = offset, [], 0
+        for index, (cut, name) in enumerate(entries[-grown:]):
+            if live >= cut:
+                live -= cut
+            else:
+                segs = [[n, c] for c, n in entries[-grown:][index:]]
+                start, live = live, 0
+                break
+        if not segs:
+            return live, count, None, None, False
+        if not _archives_whole(directory, segs):
+            return 0, count, None, None, True
+        chain = {"segs": segs, "i": 0, "pos": start}
+        offset, applied = 0, count
+    got = _archive_chunk(directory, chain, limit)
+    if got is None:
+        return 0, applied, None, None, True
+    data, chain = got
+    return offset, applied, chain, data, False
+
+
+def _valid_chain(value):
+    """A chain kept in a reader's own state: None or {segs: [[name, cut]], i, pos}, all of the right type; anything else is no chain."""
+    if value is None:
+        return True
+    if not isinstance(value, dict) or not isinstance(value.get("segs"), list) or not 0 < len(value["segs"]) <= _CUTS_KEPT:
+        return False
+    for seg in value["segs"]:
+        if not (isinstance(seg, list) and len(seg) == 2 and isinstance(seg[0], str) and _ARCHIVE_NAME.fullmatch(seg[0])
+                and isinstance(seg[1], int) and not isinstance(seg[1], bool) and 0 < seg[1] <= _ARCHIVE_CUT_MAX):
+            return False
+    i, pos = value.get("i"), value.get("pos")
+    return all(isinstance(x, int) and not isinstance(x, bool) and x >= 0 for x in (i, pos)) and i < len(value["segs"]) and pos < value["segs"][i][1]
+
+
+_IN_ARCHIVE_PASS = []   # set while scan_audit reads a chunk of an archive through itself
+
+
+def _follow_rotation(audit_file, state_file, cloud_dir, last_reports, send, parse, audit):
+    """The audit's rotation rule (ask #1743): the unread archive lines of this pass go through scan_audit itself from a private temporary file, before the live
+    file. None when the live file is to be read as always (its offset is translated first). The reader's count of applied rotations and its place in the chain
+    live in a file of their own beside the state file."""
+    import tempfile
+    path = str(audit_file)
+    try:
+        size = os.stat(path).st_size
+    except OSError:
+        return None
+    state = read_small(state_file, parse)
+    offset, keys = (state.get("offset"), state.get("sent")) if state else (None, None)
+    if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0 or offset > size or not isinstance(keys, list):
+        return None
+    count_file = str(state_file) + ".rotations"
+    mine = read_small(count_file, parse) or {}
+    applied, chain = mine.get("applied"), mine.get("chain")
+    if isinstance(applied, bool) or not isinstance(applied, int) or applied < 0 or not _valid_chain(chain):
+        applied, chain = None, None
+    new_offset, new_applied, new_chain, data, failed = _rotation_step(path, parse, size, offset, applied, chain, READ_BYTES)
+    if (new_offset, new_applied, new_chain) != (offset, applied, chain):
+        temp = "%s.%d.tmp" % (count_file, os.getpid())
+        with os.fdopen(os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as handle:
+            handle.write(json.dumps({"applied": new_applied, "chain": new_chain}) + "\n")
+        os.replace(temp, count_file)
+        if new_offset != offset:
+            save_state(state_file, new_offset, [(str(k[0]), str(k[1])) for k in keys if isinstance(k, list) and len(k) == 2])
+    if failed:
+        try:
+            send(CHIEF, "[cloud worker ended] %s." % ROTATION_WORDS)
+        except Exception:
+            pass
+    if data is None:
+        return None
+    if not data:
+        return []
+    scratch = tempfile.mkdtemp(prefix=".audit-archive-", dir=os.path.dirname(str(state_file)) or ".")
+    try:
+        part, scratch_state = os.path.join(scratch, "part.jsonl"), os.path.join(scratch, "state")
+        with os.fdopen(os.open(part, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb") as handle:
+            handle.write(data)
+        save_state(scratch_state, 0, [(str(k[0]), str(k[1])) for k in keys if isinstance(k, list) and len(k) == 2])
+        _IN_ARCHIVE_PASS.append(1)
+        try:
+            result = scan_audit(part, scratch_state, cloud_dir, last_reports, send, parse, audit)
+        finally:
+            _IN_ARCHIVE_PASS.pop()
+        merged = read_small(scratch_state, parse)
+        if merged and isinstance(merged.get("sent"), list):
+            save_state(state_file, new_offset, [(str(k[0]), str(k[1])) for k in merged["sent"] if isinstance(k, list) and len(k) == 2])
+        return result
+    finally:
+        for name in os.listdir(scratch):
+            try:
+                os.unlink(os.path.join(scratch, name))
+            except OSError:
+                pass
+        os.rmdir(scratch)
+
+
 def scan_audit(audit_file, state_file, cloud_dir, last_reports, send, parse, audit=None):
     """One pass. `send(recipient, text)` is the daemon's own send path. Returns [(recipient, text)] handed to it."""
+    if not _IN_ARCHIVE_PASS:
+        followed = _follow_rotation(audit_file, state_file, cloud_dir, last_reports, send, parse, audit)
+        if followed is not None:
+            return followed
     try:
         size = os.stat(str(audit_file)).st_size
     except OSError:
