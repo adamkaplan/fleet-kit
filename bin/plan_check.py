@@ -947,7 +947,7 @@ def check(text, done_when, plan_done_when=None):
                             "message": "the plan states %d Done-when clause(s) but the ask has %d, or they differ: the ask's "
                                        "Done-when is the authority, copy it exactly" % (len(own), len(clauses))})
     return {"result": "fail" if defects else "pass", "scenario_hash": content_hash(scenarios, clauses, text),
-            "plan_hash": plan_hash(text), "scenarios": len(scenarios), "clauses": clauses, "defects": defects,
+            "plan_hash": plan_hash(text), "plan_hashes": plan_hashes(text), "scenarios": len(scenarios), "clauses": clauses, "defects": defects,
             "warnings": warnings}
 
 
