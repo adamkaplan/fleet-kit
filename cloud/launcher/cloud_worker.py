@@ -3468,6 +3468,7 @@ class RenewalTicker:
         now = self.clock()
         self.last = now
         self.ticks += 1
+        cpu0, parsed0 = time.thread_time(), tail_lines_parsed()
         try:
             with self.L.renew_lock:
                 refresh = self.refresher.run()
@@ -3479,6 +3480,8 @@ class RenewalTicker:
                 self.L.renew_git_tokens(self.L._before_hard_limit(self.L.kube.list_pods(), now), now)
         except Exception as e:   # the thread goes on: the next tick tries again
             print("cloud-worker: the renewal thread: %s" % scrub(e, (), 200), file=sys.stderr)
+        finally:
+            print("cloud-worker: renewal tick line: cpu_seconds=%.3f audit_lines_parsed=%d" % (time.thread_time() - cpu0, tail_lines_parsed() - parsed0), file=sys.stderr)
 
     def _run(self):
         while not self._stop.is_set():
@@ -3541,8 +3544,10 @@ def _reap_main(env, a, sleep, clock=None, refresher=None, kube=None, ticker_wait
                 ticker = RenewalTicker(L, refresher, clock, ticker_wait)
                 ticker.start()
             began = clock()
+            cpu0, parsed0 = time.thread_time(), tail_lines_parsed()
             work = L.reap() if L is not None else []   # the pass's own work: the workers' results
             took = (clock() - began).total_seconds()
+            print("cloud-worker: reaper pass line: cpu_seconds=%.3f audit_lines_parsed=%d" % (time.thread_time() - cpu0, tail_lines_parsed() - parsed0), file=sys.stderr)
             if L is not None:
                 L.note_slow_pass(took)
             res = work
