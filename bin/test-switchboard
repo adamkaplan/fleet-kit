@@ -67330,6 +67330,8 @@ TestNewModuleDemands = importlib.import_module("test_new_module_demands").TestNe
 # The bin-set table test (#1457).
 _bin_set_table = importlib.import_module("test_bin_set_table")
 TestTheBinSetClassesAreAllInTheTable = _bin_set_table.TestTheBinSetClassesAreAllInTheTable
+# The heavy wrapper's progress line (#1762).
+TestHeavyProgress = importlib.import_module("test_heavy_progress").TestHeavyProgress
 # The steer-after-minutes tests of #1540, moved under the line ceiling.
 _steer_long = importlib.import_module("test_steer_long_turn")
 TestSteerLongTurn = _steer_long.build(Base, TestSteerToWorking)

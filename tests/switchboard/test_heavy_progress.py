@@ -1,0 +1,178 @@
+"""#1762: the heavy wrapper prints one progress line a minute while its command runs. A fake clock, a fake slot lock and a fake child: nothing waits for a real minute."""
+import os
+import threading
+import unittest
+from unittest import mock
+
+from support.loader import sb
+
+
+class Out:
+    """The wrapper's error stream: every line with the fake second it was written at."""
+
+    def __init__(self, now):
+        self.now, self.lines, self.text = now, [], ""
+
+    def write(self, text):
+        self.text += text
+        for line in text.splitlines():
+            self.lines.append((self.now[0], line))
+
+    def flush(self):
+        pass
+
+
+class Rig:
+    """run() with a fake slot (or a busy one), a fake child alive `alive` fake seconds and a fake pause for the progress thread."""
+
+    def __init__(self, case, alive=0, status=0, busy=False, wait_max=1800, command=None, env=None, silent=False, table_raises=False):
+        self.hs = sb.load_heavy_slots()
+        self.now = [1000.0]
+        self.out = Out(self.now)
+        self.done = threading.Event()
+        self.pauses, self.signals, self.starts, self.began = [], [], [], []
+        rig = self
+
+        class FakeChild:
+            pid = 999999999   # no such process: the CPU read fails and the line has no CPU part
+
+            def __init__(child, argv, **kwargs):
+                rig.starts.append(argv)
+                rig.began.append(rig.now[0])
+
+            def wait(child):
+                if alive and not rig.done.wait(30):
+                    raise AssertionError("the fake child was never ended")
+                return status
+
+            def send_signal(child, number):
+                rig.signals.append(number)
+
+        def pause(stop, seconds):
+            rig.pauses.append(seconds)
+            rig.now[0] += seconds
+            if rig.now[0] - rig.began[0] > alive:
+                rig.done.set()
+                stop.wait(30)   # the child has ended: the wrapper stops this thread
+
+        def silent_loop(pid, program, interval, stop, out, clock, began):
+            rig.now[0] = rig.began[0] + alive   # the mutant: no line at all
+            rig.done.set()
+
+        def take(state, slots):
+            if busy:
+                return None, None
+            return os.open(os.devnull, os.O_RDWR), 0
+
+        def sleep(seconds):
+            rig.now[0] += 10
+
+        environ = {"PATH": os.environ["PATH"], "FLEET_HEAVY_NAME": "lane-x", "FLEET_HEAVY_REPORT_SECONDS": "30"}
+        environ.update(env or {})
+        patches = [mock.patch.object(self.hs, "_take", take), mock.patch.object(self.hs, "_take_express", lambda state: None), mock.patch.object(self.hs, "holders", lambda s, n=3: []),
+                   mock.patch.object(self.hs.subprocess, "Popen", FakeChild), mock.patch.object(self.hs, "_own_start", lambda: ""), mock.patch.object(self.hs, "_start_of", lambda pid: ""),
+                   mock.patch.object(self.hs, "_progress_pause", pause),
+                   mock.patch.object(self.hs, "_resolve", lambda command, environ: "/bin/true")]
+        if silent:
+            patches.append(mock.patch.object(self.hs, "_progress_loop", silent_loop))
+        if table_raises:
+            def broken(pid):
+                self.done.set()   # the thread ends on this read: the fake child ends with it
+                raise OSError("the process table cannot be read")
+            patches.append(mock.patch.object(self.hs, "_child_cpu_seconds", broken))
+        dog = {"read_table": lambda: [], "pause": lambda seconds: self.done.is_set(), "killpg": lambda *a: self.signals.append(a), "kill": lambda *a: self.signals.append(a),
+               "every": 0.0, "lsof": lambda path: set(), "grace": 0.001, "sweep_pause": lambda s: None}
+        for patcher in patches:
+            patcher.start()
+            case.addCleanup(patcher.stop)
+        try:
+            self.status = self.hs.run(command or ["python3", "/nowhere/tool"], "/state", 3, wait_max, "holder-x", environ=environ, out=self.out, clock=lambda: self.now[0], sleep=sleep,
+                                      watchdog=dog, short=False, ceiling="100000", worktree=lambda cwd: "/work/acme-tree")
+        finally:
+            for patcher in patches:
+                patcher.stop()
+
+    def progress(self):
+        return [line for _t, line in self.out.lines if line.startswith("heavy: ") and "still running" in line]
+
+    def longest_gap(self, end):
+        """The longest silence of the wrapper from the command's start to its end, in fake seconds."""
+        times = [self.began[0]] + [t for t, _l in self.out.lines if t >= self.began[0]] + [end]
+        return max(b - a for a, b in zip(times, times[1:]))
+
+
+class TestHeavyProgress(unittest.TestCase):
+
+    def test_s2_a_child_alive_200_seconds_gets_one_line_at_each_full_minute(self):
+        rig = Rig(self, alive=200)
+        lines = rig.progress()
+        self.assertEqual((rig.status, len(lines)), (0, 3), lines)
+        for line, seconds in zip(lines, (60, 120, 180)):
+            self.assertTrue(line.startswith("heavy: python3 still running: %d s since the command started" % seconds), line)
+
+    def test_s3_a_wait_stops_at_the_bound_with_the_refusal_line_and_75(self):
+        rig = Rig(self, busy=True, wait_max=120)
+        text = [line for _t, line in rig.out.lines]
+        self.assertEqual(rig.status, 75)
+        self.assertEqual(len([l for l in text if l.startswith("heavy: no slot after 120 s")]), 1, text)
+        self.assertEqual(len(rig.starts), 0)
+        self.assertEqual(len([l for l in text if l.startswith("heavy: waiting for a slot")]), 3, text)
+        self.assertEqual(rig.progress(), [])
+
+    def _s4(self, silent):
+        rig = Rig(self, alive=900, status=7, silent=silent)
+        gap = rig.longest_gap(rig.began[0] + 900)
+        self.assertEqual(rig.status, 7)
+        self.assertLessEqual(gap, 60, "the wrapper was silent for %d s" % gap)
+        return rig, gap
+
+    def test_s4_a_child_silent_for_900_seconds_never_leaves_the_wrapper_silent_for_more_than_60(self):
+        rig, gap = self._s4(False)
+        self.assertEqual((len(rig.progress()), gap), (15, 60))
+
+    def test_s5_a_mutant_that_waits_silently_fails_with_the_anchored_text_and_the_control_passes(self):
+        rig, gap = self._s4(False)   # the control passes
+        self.assertEqual(gap, 60)
+        with self.assertRaises(AssertionError) as caught:
+            self._s4(True)
+        self.assertIn("the wrapper was silent for 900 s", str(caught.exception))
+
+    def test_u1_a_run_that_ends_before_the_interval_prints_nothing_of_its_own(self):
+        rig = Rig(self, alive=0, status=5)
+        self.assertEqual((rig.status, rig.progress(), rig.out.text), (5, [], ""))
+        rig = Rig(self, alive=10, status=5)
+        self.assertEqual((rig.status, rig.progress(), rig.out.text), (5, [], ""))
+
+    def test_u2_a_failure_of_the_progress_read_is_quiet_and_never_changes_the_status(self):
+        for raises in (False, True):
+            rig = Rig(self, alive=130, status=3, table_raises=raises)
+            self.assertEqual((rig.status, rig.signals, rig.out.text.count("Traceback")), (3, [], 0))
+            self.assertEqual(len(rig.progress()), 0 if raises else 2)   # unreadable: the line without the CPU part (or, when the read itself raises, the thread ends quietly)
+            for line in rig.progress():
+                self.assertNotIn("CPU", line)
+
+    def test_u3_the_line_names_the_program_by_its_basename_only(self):
+        rig = Rig(self, alive=130, command=["python3", "/secret/dir/tool", "--token", "ghp_aaaaaaaaaaaaaaaaaaaa"])
+        self.assertEqual(len(rig.progress()), 2)
+        for line in rig.progress():
+            self.assertTrue(line.startswith("heavy: python3 still running"), line)
+        for word in ("/secret/dir", "--token", "ghp_"):
+            self.assertEqual(rig.out.text.count(word), 0, word)
+
+    def test_u4_the_niceness_is_as_at_the_base(self):
+        hs = sb.load_heavy_slots()
+        self.assertEqual(hs.command_prefix(lambda name: "/usr/bin/" + name if name == "taskpolicy" else None), ["/usr/bin/taskpolicy", "-b"])
+        self.assertEqual(hs.command_prefix(lambda name: "/usr/bin/nice" if name == "nice" else None), ["/usr/bin/nice", "-n", "10"])
+        self.assertEqual(hs.command_prefix(lambda name: None), [])
+
+    def test_u6_the_interval_is_60_and_an_environment_value_shortens_it(self):
+        hs = sb.load_heavy_slots()
+        self.assertEqual((hs.PROGRESS_SECONDS, hs.WAIT_REPORT_SECONDS, hs.DEFAULT_WAIT_MAX), (60, 30, 1800))
+        rig = Rig(self, alive=200)
+        self.assertEqual(set(rig.pauses), {60})
+        rig = Rig(self, alive=1, env={"FLEET_HEAVY_PROGRESS_SECONDS": "0.3"})
+        self.assertEqual((set(rig.pauses), len(rig.progress())), ({0.3}, 3))
+
+
+if __name__ == "__main__":
+    unittest.main()
