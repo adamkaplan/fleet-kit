@@ -10764,7 +10764,8 @@ def plan_wake_pass(engine, state, repos, now, budget=None):
             plan_hash = check_module.plan_hash(body)
             if consensus is None:
                 consensus = plan_wake_consensus(engine)
-            if (plan_hash in consensus or module.approved_by_comment(plan, plan_hash, by_issue.get(number, []), signed_by_fleet)
+            hashes = check_module.plan_hashes(body)
+            if (check_module.canonical_hash(plan_hash, hashes) in {check_module.canonical_hash(h, hashes) for h in consensus} or module.approved_by_comment(plan, plan_hash, by_issue.get(number, []), signed_by_fleet)
                     or module.cited_by_pr(repo, number, plan, pulls, parse_iso)):
                 continue
             if sends is None:
