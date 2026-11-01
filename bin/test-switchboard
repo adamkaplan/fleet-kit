@@ -79948,6 +79948,543 @@ class ReviewCommentEndToEndTests(Base):
             self.assertIn(name if name != "_unowned_seen" else "review-unowned.json", table)
         self.assertTrue(paths)
 
+class TestHoldQueue(Base):
+    """A message sent to a pane on hold is queued in the recipient's own queue and delivered, in the order sent and once, when the hold ends."""
+
+    def setUp(self):
+        super().setUp()
+        self.world = World(self, agents=("platform", "coder"))
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        os.environ[sb.LAB_ENV] = "1"
+        self.pane = self.world.herdr.panes[self.world.panes["platform"]]
+
+    def main(self, *argv):
+        with captured() as (out, err):
+            code = sb.main(list(argv), runner=self.world.route, now=self.world.clock.now,
+                           wait=lambda sock, seconds: False, socket_call=self.world.herdr.socket)
+        return code, out.getvalue(), err.getvalue()
+
+    def send(self, text, to="platform"):
+        return self.main("send", to, "--from", "coder", text)
+
+    def queued(self, to="platform"):
+        return sb.load_module("queued_sends").waiting(self.world.state, to)
+
+    def release(self, passes=1):
+        out = []
+        for _ in range(passes):
+            out.extend(self.world.engine.release_held(self.world.engine.discover(self.world.clock.now())))
+        return out
+
+    def texts(self):
+        return [a["text"] for a in self.world.admissions("platform")]
+
+    def test_a_message_to_a_blocked_pane_is_queued_and_the_sender_is_told(self):
+        self.pane["status"] = "blocked"
+        code, out, err = self.send("first")
+        self.assertEqual(code, 0, err)
+        self.assertIn("queued (the pane is on hold)", err)
+        self.assertEqual([i["text"] for i in self.queued()], ["first"])
+        self.assertEqual(self.world.v2.writes, [])
+
+    def test_a_gone_and_a_retired_recipient_are_refused_with_their_reason_and_nothing_is_queued(self):
+        code, _, err = self.send("hi", to="nobody")
+        self.assertEqual(code, sb.EXIT_HELD)
+        self.assertIn("not found", err)
+        self.pane["status"] = "blocked"
+        sb._write_small(self.world.state, sb.RETIRED_FILE, {"platform": {"session": self.world.sessions["platform"], "at": self.world.clock.now(), "by": "x", "reason": "done"}})
+        code, _, err = self.send("hi")
+        self.assertEqual(code, sb.EXIT_HELD, err)
+        self.assertEqual(self.queued("nobody") + self.queued("platform"), [])
+        self.assertEqual(sb.load_module("queued_sends").recipients(self.world.state), [])
+
+    def test_a_queue_file_nested_deeper_than_the_bound_is_unreadable_not_empty(self):
+        hq = sb.load_module("queued_sends")
+        file = Path(self.world.state) / "hold-queue-deep.json"
+        depth = sb.load_module("record_json").RECORD_MAX_DEPTH + 5
+        file.write_text('{"items": ' + "[" * depth + "]" * depth + "}")
+        self.assertEqual(hq._read(file), (None, "nested too deep"))
+
+    def test_an_interrupt_send_to_a_held_pane_stays_refused_and_a_plain_send_is_queued(self):
+        self.world.add_agent("helper", fleet={"role": "coder", "reports_to": "coder"})
+        self.world.herdr.panes[self.world.panes["helper"]]["status"] = "blocked"
+        code, _, err = self.main("send", "helper", "--from", "coder", "--interrupt", "stop")
+        self.assertEqual(code, sb.EXIT_HELD, err)
+        self.assertIn("blocked", err)
+        self.assertEqual(sorted(Path(self.world.state).glob("hold-queue-*.json")), [])
+        self.assertEqual(self.queued("helper"), [])
+        code, _, err = self.send("plain", to="helper")
+        self.assertEqual(code, 0, err)
+        self.assertEqual([i["text"] for i in self.queued("helper")], ["plain"])
+
+    def test_a_pane_claimed_by_two_sessions_is_refused_not_queued(self):
+        other = self.world.v2.create_session({"fleet": {"name": "platform", "role": "coder"}})
+        self.world.herdr.add(self.world.herdr.new_pane_id(), other)
+        code, _, err = self.send("hi")
+        self.assertEqual(code, sb.EXIT_HELD, err)
+        self.assertEqual(self.queued(), [])
+
+    def test_three_messages_are_delivered_in_the_order_sent_and_none_twice(self):
+        self.pane["status"] = "blocked"
+        for text in ("A", "B", "C"):
+            self.assertEqual(self.send(text)[0], 0)
+            self.world.tick(5)
+        self.assertEqual(self.release(), [])   # still held: nothing is delivered
+        self.pane["status"] = "idle"
+        delivered = self.release(passes=2)
+        self.assertEqual(len(delivered), 3)
+        sent = [t for t in self.texts()]
+        order = [l for text in sent for l in "ABC" if "send from coder: %s" % l in text or text.rstrip().endswith(": " + l)]
+        self.assertEqual(",".join(order), "A,B,C", sent)
+        self.assertEqual(len(sent), 3)
+        self.assertEqual(self.queued(), [])
+
+    def test_the_order_is_the_sent_time_not_the_order_of_writing(self):
+        queue = sb.load_module("queued_sends")
+        now = self.world.clock.now()
+        for key, at, text in (("send:coder:k2", now - 10, "B"), ("send:coder:k1", now - 20, "A"), ("send:coder:k3", now - 5, "C")):
+            self.assertTrue(queue.enqueue(self.world.state, "platform", key, "coder", text, at)[0])
+        self.release()
+        self.assertEqual([k for a in self.world.admissions("platform") for k in a["keys"]], ["send:coder:k1", "send:coder:k2", "send:coder:k3"])
+
+    def test_only_a_message_older_than_a_day_carries_its_sent_time(self):
+        queue = sb.load_module("queued_sends")
+        now = self.world.clock.now()
+        queue.enqueue(self.world.state, "platform", "send:coder:old", "coder", "old one", now - 25 * 3600)
+        queue.enqueue(self.world.state, "platform", "send:coder:new", "coder", "new one", now - 3600)
+        self.release()
+        marked = [t for t in self.texts() if "sent 2026-" in t or "sent 20" in t]
+        self.assertEqual(len(marked), 1, self.texts())
+        self.assertIn("old one", marked[0])
+        self.assertRegex(marked[0], r"sent \d{4}-\d\d-\d\d \d\d:\d\dZ")
+
+    def test_a_queue_at_its_bound_refuses_the_next_and_keeps_every_earlier_one(self):
+        self.pane["status"] = "blocked"
+        queue = sb.load_module("queued_sends")
+        with mock.patch.object(queue, "MAX_MESSAGES", 2):
+            self.assertEqual(self.send("one")[0], 0)
+            self.assertEqual(self.send("two")[0], 0)
+            code, _, err = self.send("three")
+        self.assertEqual(code, sb.EXIT_HELD, err)
+        self.assertIn("none is dropped", err)
+        self.assertEqual([i["text"] for i in self.queued()], ["one", "two"])
+
+    def test_a_message_over_the_size_cap_is_refused_and_nothing_is_queued(self):
+        self.pane["status"] = "blocked"
+        code, _, err = self.send("x" * 3001)
+        self.assertEqual(code, sb.EXIT_HELD, err)
+        self.assertEqual(self.queued(), [])
+
+    def test_the_queue_file_is_private_and_a_held_report_is_still_refused(self):
+        self.pane["status"] = "blocked"
+        self.send("secret")
+        (path,) = [p for p in Path(self.world.state).glob("hold-queue-*.json")]
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        code, _, err = self.main("report", "done", "--from", "platform", "x")
+        self.assertNotEqual(code, 0)
+        self.assertEqual(len(self.queued("coder")), 0)
+
+    def test_an_idle_pane_still_receives_at_once_and_nothing_is_queued(self):
+        code, _, err = self.send("now")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(self.world.admissions("platform")), 1)
+        self.assertEqual(self.queued(), [])
+
+    def test_a_second_daemon_pass_after_the_release_delivers_nothing_more(self):
+        self.pane["status"] = "blocked"
+        self.send("A")
+        self.pane["status"] = "idle"
+        self.world.engine.run_pass()
+        self.world.engine.run_pass()
+        self.assertEqual(len(self.world.admissions("platform")), 1)
+        self.assertEqual(self.queued(), [], "a delivered message leaves the queue: it is not offered again")
+        self.assertEqual(len([e for e in self.world.audit() if e["event"] == "hold.released"]), 1)
+
+    # -- the mutants: each is a copy of the daemon with one change, and the named test must fail on it
+
+    MUTANTS = {
+        "a held pane's message is dropped": ([("queue.enqueue(self.state_dir, fact.recipient, fact.key, fact.sender, fact.summary, now, fact.issue, fact.repo)", "(True, 1)")],
+                                             "test_a_message_to_a_blocked_pane_is_queued_and_the_sender_is_told"),
+        "delivery out of order": ([("for item in queue.waiting(self.state_dir, name):", "for item in reversed(queue.waiting(self.state_dir, name)):")],
+                                  "test_three_messages_are_delivered_in_the_order_sent_and_none_twice"),
+        "delivered twice": ([("                queue.done(self.state_dir, name, item[\"key\"])\n                out.append", "                out.append"),
+                             ("                    plan = self.plan(name, [fact], discovery, now)\n", "                    plan = decide(name, [fact], discovery.agents[name], now, 0, 0)\n")],
+                            "test_a_second_daemon_pass_after_the_release_delivers_nothing_more"),
+        "a gone pane accepted": ([("if self.state_dir is None or observation is None or observation.conflict or hold_reason(observation) is None:\n            return None", "if self.state_dir is None:\n            return None"),
+                                  ("fact.recipient, observation.session_id):", "fact.recipient, getattr(observation, \"session_id\", None)):"),
+                                  ("if queue_held and fact.kind == \"send\":", "if queue_held and fact.kind == \"send\" or True:")],
+                                 "test_a_gone_and_a_retired_recipient_are_refused_with_their_reason_and_nothing_is_queued"),
+    }
+
+    def test_every_mutant_is_killed_by_its_named_test(self):
+        text = SWITCHBOARD.read_text()
+        for name, (edits, test) in sorted(self.MUTANTS.items()):
+            with self.subTest(mutant=name):
+                mutant = text
+                for old, new in edits:
+                    self.assertEqual(mutant.count(old), 1, old)
+                    mutant = mutant.replace(old, new)
+                module = types.ModuleType("t_fleet_switchboard_holdq_mutant")
+                module.__file__ = str(SWITCHBOARD)
+                sys.modules[module.__name__] = module
+                self.addCleanup(sys.modules.pop, module.__name__, None)
+                exec(compile(mutant, str(SWITCHBOARD), "exec"), module.__dict__)
+                with mock.patch.dict(globals(), {"sb": module}), rebound("sb", module):
+                    result = unittest.TextTestRunner(stream=io.StringIO()).run(unittest.TestSuite([TestHoldQueue(test)]))
+                self.assertTrue(result.failures or result.errors, "the mutant %r survives %s" % (name, test))
+
+
+class TestHoldQueueUnreadableFile(Base):
+    """S12: an unreadable but present queue file is never overwritten: the next send is refused, nothing is lost."""
+
+    def setUp(self):
+        super().setUp()
+        self.state = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.state, True)
+        self.hq = sb.load_module("queued_sends")
+        self.file = self.hq.path(self.state, "platform")
+
+    def corruptions(self):
+        good = self.file.read_bytes()
+        return (("truncated", good[:len(good) // 2]), ("too deep", b'{"items": ' + b"[" * 5000 + b"]" * 5000 + b"}"),
+                ("too large", b" " * (self.hq.MAX_FILE + 1)))
+
+    def line(self, why):
+        return "the queue file of platform is present but not readable (%s): nothing was queued and the file is untouched" % why
+
+    def refused_with(self, why, readable=True):
+        before = self.file.read_bytes() if readable and self.file.is_file() else None
+        self.assertEqual(self.hq.enqueue(self.state, "platform", "k2", "coder", "two", 2.0), (False, self.line(why)))
+        if before is not None:
+            self.assertEqual(self.file.read_bytes(), before)
+
+    def test_truncated_says_so(self):
+        self.file.write_bytes(b'{"seq": 1, "items": [')
+        self.refused_with("truncated or not JSON")
+
+    def test_deep_says_so(self):
+        self.file.write_bytes(b'{"items": ' + b"[" * 5000 + b"]" * 5000 + b"}")
+        self.refused_with("nested too deep")
+
+    def test_too_large_says_so(self):
+        self.file.write_bytes(b" " * (self.hq.MAX_FILE + 1))
+        self.refused_with("larger than the size bound")
+
+    def test_a_directory_says_not_a_regular_file(self):
+        self.file.mkdir()
+        self.refused_with("not a regular file")
+        self.assertTrue(self.file.is_dir())
+
+    def test_not_a_dict_says_so(self):
+        self.file.write_bytes(b"[]")
+        self.refused_with("not a queue (not a dict)")
+
+    def test_a_read_error_names_only_its_class(self):
+        if os.geteuid() == 0:
+            self.skipTest("running as root: chmod 000 does not stop root from reading, so no read error can be provoked")
+        self.file.write_bytes(b"{}")
+        self.file.chmod(0)
+        self.addCleanup(self.file.chmod, 0o600)
+        self.refused_with("read error: PermissionError", readable=False)
+        self.file.chmod(0o600)
+        self.assertEqual(self.file.read_bytes(), b"{}")
+
+    def test_every_unreadable_shape_is_refused_whole_and_comes_back_after_the_repair(self):
+        deep = b'{"items": ' + b"[" * 5000 + b"]" * 5000 + b"}"
+        item = {"key": "k1", "text": "one", "at": 1.0, "seq": 1}
+        other = {"key": "k0", "text": "zero", "at": 0.5, "seq": 2}
+        cases = (("truncated or not JSON", None), ("nested too deep", deep), ("larger than the size bound", b" " * (self.hq.MAX_FILE + 1)),
+                 ("not a regular file", "dir"), ("not a queue (not a dict)", b"[]"),
+                 ("a malformed item", json.dumps({"seq": 2, "items": [item, {"key": "kx", "text": "x", "at": 1.0}, other], "delivered": []}).encode()),
+                 ("a malformed item", b"{}"), ("a malformed item", json.dumps({"items": {}, "delivered": []}).encode()),
+                 ("a malformed item", json.dumps({"items": [item], "delivered": {}}).encode()),
+                 ("a malformed item", json.dumps({"items": [item], "delivered": [1]}).encode()),
+                 ("truncated or not JSON", b""), ("read error: PermissionError", "chmod"))
+        for n, (why, bad) in enumerate(cases):
+            with self.subTest(n=n, why=why):
+                if bad == "chmod" and os.geteuid() == 0:
+                    continue   # running as root: chmod 000 does not stop root, so no read error can be provoked (skipped)
+                state = tempfile.mkdtemp()
+                self.addCleanup(shutil.rmtree, state, True)
+                file = self.hq.path(state, "platform")
+                good = json.dumps({"seq": 2, "items": [item, other], "delivered": []}, indent=1, sort_keys=True).encode() + b"\n"
+                if bad is None:
+                    bad = good[:len(good) // 2]
+                file.write_bytes(good)
+                if bad == "dir":
+                    file.unlink()
+                    file.mkdir()
+                elif bad == "chmod":
+                    file.chmod(0)
+                    self.addCleanup(file.chmod, 0o600)
+                else:
+                    file.write_bytes(bad)
+                snapshot = None if bad in ("dir", "chmod") else bad
+                self.assertEqual(self.hq.enqueue(state, "platform", "k2", "coder", "two", 2.0), (False, self.line(why)))
+                if snapshot is not None:
+                    self.assertEqual(file.read_bytes(), snapshot)
+                self.assertEqual(self.hq.waiting(state, "platform"), [])
+                self.hq.done(state, "platform", "k1")
+                if snapshot is not None:
+                    self.assertEqual(file.read_bytes(), snapshot)
+                if bad == "dir":
+                    file.rmdir()
+                else:
+                    file.chmod(0o600)
+                file.write_bytes(good)
+                self.assertEqual([i["key"] for i in self.hq.waiting(state, "platform")], ["k0", "k1"])
+
+    def check(self, hq):
+        self.assertTrue(hq.enqueue(self.state, "platform", "k1", "coder", "one", 1.0)[0])
+        good = self.file.read_bytes()
+        for _label, bad in self.corruptions():
+            self.file.write_bytes(bad)
+            ok, why = hq.enqueue(self.state, "platform", "k2", "coder", "two", 2.0)
+            self.assertFalse(ok)
+            self.assertIn("present but not readable", why)
+            self.assertNotIn("\n", why)
+            self.assertEqual(self.file.read_bytes(), bad)
+            self.assertEqual(hq.waiting(self.state, "platform"), [])
+            hq.done(self.state, "platform", "k1")
+            self.assertEqual(self.file.read_bytes(), bad)
+            self.file.write_bytes(good)
+            self.assertEqual([i["key"] for i in hq.waiting(self.state, "platform")], ["k1"])
+
+    def test_an_unreadable_present_queue_file_is_refused_and_untouched(self):
+        self.check(self.hq)
+
+    def mutant(self):
+        src = (Path(sb.__file__).resolve().parent / "queued_sends.py").read_text()
+        head, tail = src.split("def _read(file):")
+        body, rest = tail.split("def _write(", 1)
+        self.assertIn("        return None, ", body)
+        mutated = head + "def _read(file):" + body.replace("return None", "return empty") + "def _write(" + rest
+        self.assertNotEqual(mutated, src, "the mutation applied")
+        module = types.ModuleType("queued_sends_mutant")
+        module.__file__ = str(Path(sb.__file__).resolve().parent / "queued_sends.py")
+        exec(compile(mutated, module.__file__, "exec"), module.__dict__)
+        return module
+
+    def test_a_mutant_that_reads_an_unreadable_file_as_empty_is_caught(self):
+        self.check(self.hq)   # the control passes
+        with self.assertRaisesRegex(AssertionError, r"^True is not false"):
+            self.check(self.mutant())
+
+    def test_a_boolean_and_a_symbolic_link_are_refused_whole_and_come_back_after_the_repair(self):
+        item = {"key": "k1", "text": "one", "at": 1.0, "seq": 1}
+        other = {"key": "k0", "text": "zero", "at": 0.5, "seq": 2}
+        good = json.dumps({"seq": 2, "items": [item, other], "delivered": []}, indent=1, sort_keys=True).encode() + b"\n"
+        for label, bad in (("seq", dict(item, seq=True)), ("at", dict(item, at=False))):
+            with self.subTest(label):
+                state = tempfile.mkdtemp()
+                self.addCleanup(shutil.rmtree, state, True)
+                file = self.hq.path(state, "platform")
+                raw = json.dumps({"seq": 2, "items": [bad, other], "delivered": []}).encode()
+                file.write_bytes(raw)
+                self.assertEqual(self.hq.enqueue(state, "platform", "k2", "coder", "two", 2.0), (False, self.line("a malformed item")))
+                self.assertEqual(file.read_bytes(), raw)
+                self.assertEqual(self.hq.waiting(state, "platform"), [])
+                self.hq.done(state, "platform", "k1")
+                self.assertEqual(file.read_bytes(), raw)
+                file.write_bytes(good)
+                self.assertEqual([i["key"] for i in self.hq.waiting(state, "platform")], ["k0", "k1"])
+        for label in ("to another file", "to itself"):
+            with self.subTest(label):
+                state = tempfile.mkdtemp()
+                self.addCleanup(shutil.rmtree, state, True)
+                file = self.hq.path(state, "platform")
+                target = Path(state) / "other.json"
+                if label == "to itself":
+                    target = file
+                else:
+                    target.write_bytes(good)
+                file.symlink_to(target.name)
+                self.assertTrue(file.is_symlink())
+                self.assertEqual(self.hq.enqueue(state, "platform", "k2", "coder", "two", 2.0), (False, self.line("a symbolic link")))
+                self.assertEqual(self.hq.waiting(state, "platform"), [])
+                self.hq.done(state, "platform", "k1")
+                self.assertTrue(file.is_symlink())
+                self.assertEqual(os.readlink(str(file)), target.name)
+                if label == "to another file":
+                    self.assertEqual(target.read_bytes(), good)
+
+
+class HoldQueueRig(Base):
+    """The fixtures of the S13 to S15 classes: a held pane, `send`, `release_held`, and a mutant copy of one function."""
+
+    def setUp(self):
+        super().setUp()
+        self.world = World(self, agents=("platform", "coder"))
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        os.environ[sb.LAB_ENV] = "1"
+        self.pane = self.world.herdr.panes[self.world.panes["platform"]]
+        self.hq = sb.load_module("queued_sends")
+
+    def main(self, *argv):
+        with captured() as (out, err):
+            code = sb.main(list(argv), runner=self.world.route, now=self.world.clock.now,
+                           wait=lambda sock, seconds: False, socket_call=self.world.herdr.socket)
+        return code, out.getvalue(), err.getvalue()
+
+    def release(self, passes=1):
+        out = []
+        for _ in range(passes):
+            out.extend(self.world.engine.release_held(self.world.engine.discover(self.world.clock.now())))
+        return out
+
+    def queued(self):
+        return self.hq.waiting(self.world.state, "platform")
+
+    def mutant_of(self, owner, name, old, new):
+        """The function `owner.name` with ONE textual replacement, exec'd in a copy of its module namespace (production is never edited)."""
+        src = textwrap.dedent(inspect.getsource(getattr(owner, name)))
+        self.assertEqual(src.count(old), 1)
+        mutated = src.replace(old, new)
+        self.assertNotEqual(mutated, src, "the mutation applied")
+        namespace = dict(vars(sb)) if owner is sb.Switchboard else {}
+        namespace["__name__"] = "mutant"
+        exec(compile(mutated, "<mutant of %s>" % name, "exec"), namespace)
+        return namespace[name]
+
+
+class TestHoldQueueCrashBeforeDone(HoldQueueRig):
+    """S13: a message delivered but not marked done (the daemon stopped between the two) is delivered once and leaves the queue at the next release."""
+
+    def check(self):
+        self.pane["status"] = "blocked"
+        self.assertEqual(self.main("send", "platform", "--from", "coder", "one")[0], 0)
+        self.pane["status"] = "idle"
+        real, calls = self.hq.done, []
+
+        def skipped_once(*args):
+            calls.append(args)
+            if len(calls) > 1:
+                return real(*args)
+        with mock.patch.object(self.hq, "done", skipped_once):
+            first = self.release()
+            self.assertEqual(len(first), 1)
+            self.assertEqual(len(self.queued()), 1, "the first done was skipped: the message is still queued")
+            second = self.release()
+        self.assertEqual(len(first) + len(second), 1)
+        self.assertEqual(len(self.world.admissions("platform")), 1, "the transcript holds the key once")
+        self.assertEqual(self.queued(), [], "the delivered message leaves the queue")
+
+    def test_a_delivered_message_is_not_delivered_again_and_leaves_the_queue(self):
+        self.check()
+
+    def test_a_mutant_without_the_transcript_branch_keeps_the_message_queued(self):
+        mutant = self.mutant_of(sb.Switchboard, "release_held", "if plan is None:", "if False:")
+        with mock.patch.object(sb.Switchboard, "release_held", mutant):
+            with self.assertRaisesRegex(AssertionError, "the delivered message leaves the queue"):
+                self.check()
+
+
+class TestHoldQueueLock(HoldQueueRig):
+    """S14: `enqueue`, `waiting` and `done` each take the one lock once, and the lock excludes a second exclusive lock."""
+
+    def counts(self, hq):
+        counted = []
+        enter = hq._Lock.__enter__
+
+        def spy(lock):
+            counted.append(1)
+            return enter(lock)
+        out = {}
+        with mock.patch.object(hq._Lock, "__enter__", spy):
+            for label, call in (("enqueue", lambda: hq.enqueue(self.world.state, "platform", "k1", "coder", "one", 1.0)),
+                                ("waiting", lambda: hq.waiting(self.world.state, "platform")),
+                                ("done", lambda: hq.done(self.world.state, "platform", "k1"))):
+                del counted[:]
+                call()
+                out[label] = len(counted)
+        return out
+
+    def check(self, hq):
+        counts = self.counts(hq)
+        for label in ("enqueue", "waiting", "done"):
+            self.assertEqual(counts[label], 1, label)
+
+    def test_each_function_takes_the_lock_once_and_the_lock_excludes_another(self):
+        self.check(self.hq)
+        with self.hq._Lock(self.world.state):
+            fd = os.open(str(Path(self.world.state) / self.hq.LOCK), os.O_RDWR)
+            self.addCleanup(os.close, fd)
+            with self.assertRaises(BlockingIOError):
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def test_a_mutant_of_done_without_the_lock_is_caught(self):
+        self.check(self.hq)   # the control passes
+        src = (Path(self.hq.__file__)).read_text()
+        head, tail = src.split("def done(", 1)
+        body, rest = tail.split("def marked(", 1)
+        self.assertIn("    with _Lock(state_dir):\n", body)
+        mutated = head + "def done(" + body.replace("    with _Lock(state_dir):\n", "    if file is not None:\n") + "def marked(" + rest
+        self.assertNotEqual(mutated, src, "the mutation applied")
+        module = types.ModuleType("queued_sends_mutant")
+        module.__file__ = self.hq.__file__
+        exec(compile(mutated, module.__file__, "exec"), module.__dict__)
+        with self.assertRaisesRegex(AssertionError, r"^0 != 1"):
+            self.check(module)
+
+
+class TestHoldQueueUnreadableIsVisible(HoldQueueRig):
+    """S15: an unreadable queue file of a recipient whose pane no longer holds is audited once per run and delivers nothing."""
+
+    def check(self):
+        self.assertTrue(self.hq.enqueue(self.world.state, "platform", "k1", "coder", "one", 1.0)[0])
+        file = self.hq.path(self.world.state, "platform")
+        file.write_bytes(b'{"seq": 1, "items": [')
+        before = file.read_bytes()
+        self.pane["status"] = "idle"
+        self.assertEqual(self.release(passes=2), [])
+        lines = [e for e in self.world.audit() if e["event"] == "hold.unreadable"]
+        self.assertEqual(len(lines), 1)
+        self.assertIn("platform", json.dumps(lines[0]))
+        self.assertEqual(lines[0]["detail"]["reason"], "truncated or not JSON")
+        self.assertEqual(self.world.admissions("platform"), [])
+        self.assertEqual(file.read_bytes(), before)
+
+    def test_one_audit_line_names_the_recipient_and_the_reason_and_nothing_is_delivered(self):
+        self.check()
+
+    def test_a_mutant_without_the_audit_write_is_caught(self):
+        mutant = self.mutant_of(sb.Switchboard, "release_held", "self.audit.append(self.actor, \"hold.unreadable\", name, {\"reason\": why})", "pass")
+        with mock.patch.object(sb.Switchboard, "release_held", mutant):
+            with self.assertRaisesRegex(AssertionError, r"^0 != 1"):
+                self.check()
+
+
+class TestHoldQueueIdleAfterProviderError(Base):
+    """An agent idle after a turn that ended on a provider error, with queued messages admitted at the end of its hold, is resumed once (#1337 covers it)."""
+
+    def setUp(self):
+        super().setUp()
+        self.world = World(self, agents=(), config={})
+        for name, fleet in (("cos", {"role": "chief-of-staff"}), ("coder", {"role": "coder", "reports_to": "cos"})):
+            self.world.add_agent(name, fleet=fleet)
+        self.pane = self.world.herdr.panes[self.world.panes["coder"]]
+        self.sid = self.world.sessions["coder"]
+        patch = mock.patch.object(self.world.v2, "_start")   # the turn that ended on the error starts nothing: as in the recorded case
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def test_it_is_resumed_once_with_one_audit_line_after_three_passes(self):
+        self.world.v2.sessions[self.sid]["messages"].append({"id": "msg_err1", "type": "assistant", "error": {"type": "provider", "message": "HTTP 499 client closed request"}})
+        self.pane["status"] = "blocked"
+        queue = sb.load_module("queued_sends")
+        self.assertTrue(queue.enqueue(self.world.state, "coder", "send:cos:one", "cos", "please look", self.world.clock.now())[0])
+        self.world.engine.run_pass()
+        self.assertEqual(len(self.world.admissions("coder")), 0, "held: nothing is delivered")
+        self.pane["status"] = "idle"   # the hold ends; the error left no turn to take the queued message
+        self.world.engine.run_pass()
+        self.assertEqual(len(self.world.admissions("coder")), 1)
+        self.world.tick(16 * 60)
+        for _ in range(3):
+            self.world.engine.run_pass()
+        resumes = [a for a in self.world.admissions("coder") if a["text"] == sb.RESUME_TEXT]
+        self.assertEqual(len(resumes), 1)
+        self.assertEqual(len([e for e in self.world.audit() if e["event"] == "undelivered.resume"]), 1)
+
 
 if __name__ == "__main__":
     # Run directly, the suite takes a CPU slot (`fleet-switchboard heavy`): several full suites at once starve the machine. FLEET_HEAVY=off, a CI run, a run
