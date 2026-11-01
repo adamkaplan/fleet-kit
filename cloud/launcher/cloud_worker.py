@@ -3521,7 +3521,7 @@ def _reap_main(env, a, sleep, clock=None, refresher=None, kube=None, ticker_wait
             for line in getattr(refresher, "notices", []):
                 print(line, file=sys.stderr)   # the stdout line of a pass is the JSON report; the notice names a setting, never a value
             if kube is not None and refresh.token:
-                kube.add_secrets(refresh.token)   # the new token is a secret from now on: the scrubber knows it
+                kube.add_secrets(refresh.token, life=secret_life_until())   # the new token is a secret from now on: the scrubber knows it
             note = "cluster token not refreshed: %s" % refresh.reason if refresh.state in ("failed", "waiting") else ""
             if kube is None:
                 try:
