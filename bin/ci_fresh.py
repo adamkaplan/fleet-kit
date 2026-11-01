@@ -15,8 +15,8 @@ def ci_state(ci, run_base, tip, behind):
     if run_base == tip:
         return "fresh", "fresh: CI ran on the tip %s" % tip[:12]
     if behind is None:
-        return "stale", "stale: the commits behind were not counted (%s, %s)" % (run_base, tip)
-    return "stale", "stale: %d commits behind (CI ran on %s, the tip is %s)" % (behind, run_base[:8], tip[:8])
+        return "stale", "stale: the commits behind were not counted (%s, %s): close and reopen the pull request for a fresh run" % (run_base, tip)
+    return "stale", "stale: %d commits behind (CI ran on %s, the tip is %s): close and reopen the pull request for a fresh run" % (behind, run_base[:8], tip[:8])
 
 
 def apply(facts, run_base, tip, behind):

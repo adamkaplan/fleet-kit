@@ -27,7 +27,7 @@ class TestCiStateDecision(unittest.TestCase):
 
     def test_a_green_run_behind_is_stale_with_the_count_and_the_8_character_bases(self):
         self.assertEqual(ci_fresh.ci_state("green", OLD, TIP, 3),
-                         ("stale", "stale: 3 commits behind (CI ran on bbbbbbbb, the tip is aaaaaaaa)"))
+                         ("stale", "stale: 3 commits behind (CI ran on bbbbbbbb, the tip is aaaaaaaa): close and reopen the pull request for a fresh run"))
 
     def test_the_commits_behind_not_counted_is_still_stale(self):
         state, line = ci_fresh.ci_state("green", OLD, TIP, None)
