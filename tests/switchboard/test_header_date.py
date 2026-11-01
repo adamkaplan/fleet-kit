@@ -1,0 +1,104 @@
+"""The header date and held-time tests of #1800 (S2 to S6, S8, U1)."""
+import inspect
+import time
+import unittest
+from support.loader import sb
+from support.wire_fakes import EPOCH
+
+MID = EPOCH - 8 * 3600   # 2027-01-15 00:00Z
+NOW = EPOCH + 100000   # 2027-01-16 11:46:40Z
+BASELINE = [   # the first header lines the code printed before #1800, for the 20 fixtures of baseline_headers()
+    '[switchboard] 1 for platform (sent 11:46Z, delivered 11:46Z): msg 0',
+    '[switchboard] 2 for platform (sent 11:45Z, delivered 11:46Z): msg 0 [newest first]',
+    '[switchboard] 3 for platform (sent 11:43Z, delivered 11:46Z): msg 0 [newest first]',
+    '[switchboard] 1 for platform (sent 11:42Z, delivered 11:46Z): msg 0',
+    '[switchboard] 2 for platform (sent 11:40Z, delivered 11:46Z): msg 0 [newest first]',
+    '[switchboard] 3 for platform (sent 11:38Z-11:39Z, delivered 11:46Z): msg 0 [newest first]',
+    '[switchboard] 1 for platform (sent 11:37Z, delivered 11:46Z): msg 0',
+    '[switchboard] 2 for platform (sent 11:36Z, delivered 11:46Z): msg 0 [newest first]',
+    '[switchboard] 3 for platform (sent 11:34Z, delivered 11:46Z): msg 0 [newest first]',
+    '[switchboard] 1 for platform (sent 11:33Z, delivered 11:46Z): msg 0',
+    '[switchboard] 2 for platform (sent 11:31Z, delivered 11:46Z): msg 0 [newest first]',
+    '[switchboard] 3 for platform (sent 11:29Z-11:30Z, delivered 11:46Z): msg 0 [newest first]',
+    '[switchboard] 1 for platform (sent 11:28Z, delivered 11:46Z): msg 0',
+    '[switchboard] 2 for platform (sent 11:27Z, delivered 11:46Z): msg 0 [newest first]',
+    '[switchboard] 3 for platform (sent 11:25Z, delivered 11:46Z): msg 0 [newest first]',
+    '[switchboard] 1 for platform (sent 11:24Z, delivered 11:46Z): msg 0',
+    '[switchboard] 2 for platform (sent 11:22Z, delivered 11:46Z): msg 0 [newest first]',
+    '[switchboard] 3 for platform (sent 11:20Z-11:21Z, delivered 11:46Z): msg 0 [newest first]',
+    '[switchboard] 1 for platform (sent 11:19Z, delivered 11:46Z): msg 0',
+    '[switchboard] 2 for platform (sent 11:18Z, delivered 11:46Z): msg 0 [newest first]',
+]
+
+
+def fact(key, age, sender="coder"):
+    return sb.Fact(key, "platform", "send", "msg", NOW - age, batch=False, sender=sender)
+
+
+def baseline_headers():
+    out = []
+    for i in range(20):
+        ages = [i * 90, (i * 90) % 1800]
+        facts = [sb.Fact("send:c:%d" % j, "platform", "send", "msg %d" % j, NOW - (ages[0] if j == 0 else ages[1] + j * 7), batch=False, sender="coder")
+                 for j in range(1 + i % 3)]
+        out.append(sb.compose("platform", facts, delivered=NOW)[0].splitlines()[0])
+    return out
+
+
+def previous_day_check(clock_day):
+    """The S2 date check, on any clock_day function."""
+    sent = MID + 15 * 3600 + 15 * 60   # 2027-01-15 15:15Z
+    delivered = MID + 86400 + 14 * 3600 + 23 * 60   # 2027-01-16 14:23Z
+    text = clock_day(sent, delivered)
+    assert "2027-01-15 15:15Z" in text, "the sent time of the previous day carries its date"
+    return text
+
+
+class TestHeaderDate(unittest.TestCase):
+    def header(self, facts, delivered=NOW):
+        return sb.compose("platform", facts, delivered=delivered)[0].splitlines()[0]
+
+    def test_s2_a_member_of_the_previous_day_carries_its_date(self):
+        delivered = MID + 86400 + 14 * 3600 + 23 * 60   # 2027-01-16 14:23Z
+        created = MID + 15 * 3600 + 15 * 60             # 2027-01-15 15:15Z
+        head = self.header([sb.Fact("send:c:1", "platform", "send", "msg", created, batch=False, sender="coder")], delivered)
+        self.assertIn("2027-01-15 15:15Z", head)
+        self.assertIn("delivered 14:23Z", head)
+        self.assertNotIn("sent 15:15Z", head)
+        self.assertEqual(previous_day_check(sb.clock_day), "2027-01-15 15:15Z")
+
+    def test_s3_a_member_held_5_hours_or_40_minutes_says_how_long(self):
+        self.assertIn("held 5 h", self.header([fact("send:c:1", 5 * 3600 + 120)]))
+        self.assertIn("held 40 min", self.header([fact("send:c:2", 40 * 60 + 5)]))
+        self.assertIn("held 119 min", self.header([fact("send:c:3", 119 * 60 + 5)]))
+
+    def test_s4_twenty_same_day_headers_equal_the_stored_baseline(self):
+        self.assertEqual(len(BASELINE), 20)
+        self.assertEqual(sum(1 for a, b in zip(baseline_headers(), BASELINE) if a != b), 0)
+
+    def test_s5_a_merged_header_of_two_days_dates_the_oldest_once(self):
+        old = MID + 20 * 3600     # 2027-01-15 20:00Z
+        facts = [sb.Fact("send:c:1", "platform", "send", "old", old, batch=False, sender="a"),
+                 sb.Fact("send:d:1", "platform", "send", "new", NOW - 60, batch=False, sender="b")]
+        head = self.header(facts)
+        self.assertEqual(head.count("2027-01-15 20:00Z"), 1)
+        self.assertEqual(head.count("2027-01-16"), 0)   # the newest is on the delivery's day: no date
+
+    def test_s6_a_mutant_without_the_date_fails_the_date_check(self):
+        source = inspect.getsource(sb.clock_day)
+        mutant_source = source.replace('return time.strftime("%Y-%m-%d %H:%MZ", time.gmtime(epoch))', "return clock_utc(epoch)")
+        self.assertNotEqual(mutant_source, source, "the mutation is applied")
+        mutant, control = ({"time": time, "clock_utc": sb.clock_utc} for _ in range(2))
+        exec(mutant_source, mutant)
+        exec(source, control)
+        previous_day_check(control["clock_day"])   # control first: it passes
+        with self.assertRaisesRegex(AssertionError, "^the sent time of the previous day carries its date"):
+            previous_day_check(mutant["clock_day"])
+
+    def test_s8_a_time_that_is_not_a_time_prints_question_marks_and_is_delivered(self):
+        text, carried = sb.compose("platform", [sb.Fact("send:c:1", "platform", "send", "msg", 1e30, batch=False, sender="coder")], delivered=NOW)
+        self.assertIn("??:??Z", text.splitlines()[0])
+        self.assertEqual(len(carried), 1)
+
+    def test_u1_without_a_delivery_time_the_text_has_no_header_time(self):
+        self.assertNotIn("sent", sb.compose("platform", [fact("send:c:1", 0)])[0].splitlines()[0])
