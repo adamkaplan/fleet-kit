@@ -9,6 +9,7 @@ import sys
 import tempfile
 import types
 import unittest
+import datetime
 import io
 from contextlib import redirect_stderr, redirect_stdout
 
@@ -315,6 +316,79 @@ class TestDocs(unittest.TestCase):
         self.assertNotEqual(cut, text)
         with self.assertRaisesRegex(AssertionError, "reaper pass line"):
             self.check(cut)
+
+
+class StepClock:
+    """A fake monotonic clock: a fake step moves it by its own seconds."""
+    def __init__(self):
+        self.t = 0.0
+
+    def monotonic(self):
+        return self.t
+
+    def thread_time(self):
+        return 0.0
+
+    def __getattr__(self, name):
+        return getattr(__import__("time"), name)
+
+
+STEP_NAMES = ("list", "renew", "vanished", "activity", "stops", "orphans", "notes")
+STEP_LINE = "steps list=1.0 renew=2.0 vanished=0.5 activity=0.6 (3) stops=4.0 (1) orphans=0.5 notes=1.5 total=10.1"
+
+
+def step_pass_text(test, mod):
+    clock = StepClock()
+    cls = mod.Launcher
+    f = LineFixture(test, mod)
+    mod.time = clock
+    L = f.w.L
+    L.reap = types.MethodType(cls.reap, L)
+    for i, pod in enumerate(f.w.pods):
+        pod["metadata"]["annotations"]["cw/note"] = PLANTS[1] + " " + PLANTS[2]
+
+    def step(seconds, answer=None):
+        def call(*a, **k):
+            clock.t += seconds
+            return answer
+        return call
+    L.kube.list_pods = step(1.0, f.w.pods)
+    L.renew_git_tokens = step(2.0, [])
+    L._note_vanished_pods = step(0.5)
+    L.hard_deadline = lambda pod: T0 + datetime.timedelta(days=1)
+    idle = f.w.pods[2]["metadata"]["name"]
+
+    def activity(name):
+        clock.t += 0.2
+        return (False, T0 - datetime.timedelta(days=1)) if name == idle else (True, T0)
+    L.activity = activity
+    L.stop = lambda ns, reason: (step(4.0)(), {})[1]
+    L.retire_row = lambda worker, reason: None
+    L.remove_orphan_secrets = step(0.5)
+    L.send_wip_notes = step(1.5)
+    text = f.pass_text()
+    if " steps list=" not in text:
+        raise AssertionError("no step seconds")
+    return text
+
+
+class TestStepSeconds(unittest.TestCase):
+    def test_s8_step_seconds(self):
+        ctext = step_pass_text(self, build_module())   # the control first
+        line = [x for x in ctext.splitlines() if "reaper pass line" in x]
+        self.assertEqual(len(line), 1)
+        self.assertTrue(line[0].endswith(STEP_LINE), line[0])
+        self.assertEqual([p for p in (PLANTS[0], "pod-b", "pod-c") + PLANTS[1:] if p in ctext], [])
+        print("S8: control passes: %s" % line[0].split("audit_lines_parsed=", 1)[1].split(" ", 1)[1])
+        old = 'getattr(L, "step_seconds", None)'
+        mut = build_module((old, "None"))
+        with self.assertRaisesRegex(AssertionError, "^no step seconds$"):
+            step_pass_text(self, mut)
+        with open(os.path.join(ROOT, "cloud", "README.md")) as f:
+            para = TestDocs.paragraph(f.read())
+        found = [n for n in STEP_NAMES if "`%s`" % n in para]
+        self.assertEqual(len(found), 7)
+        print("S8: 7 of 7 step seconds + 2 counts + total equal; 0 of 3 pod names, 0 planted; mutant fails 'no step seconds'; %d of 7 names in README" % len(found))
 
 
 class TestPins(unittest.TestCase):
