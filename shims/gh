@@ -1691,6 +1691,15 @@ def api_gated(args):
 _api_call_now = api_call
 
 
+def api_call(args, namer):
+    """The classes of the endpoint: graphql and UNKNOWN go to graphql_call (the request text decides); a REST shape is checked for a mutation in an inline
+    query field, then handled as before (the signed comment shapes are signed). An endpoint of another host is left alone (the user's own gh)."""
+    if args and args[0] == "api":
+        if api_gated(args):
+            return graphql_call(args)
+    return _api_call_now(args, namer)
+
+
 _graphql_call_old = graphql_call
 
 
