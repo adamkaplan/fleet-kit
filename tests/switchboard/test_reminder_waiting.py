@@ -230,6 +230,26 @@ def build(PR4Base):
                 os.mkdir(empty + "/audit.jsonl")
                 self.assertEqual(sb.late_reminder_counts(empty, {}, now), {})                       # a directory in its place
 
+        def mutant_counts(self, old, new):
+            """`late_reminder_counts` with ONE textual replacement, exec'd into a copy of the module namespace (production is not edited)."""
+            import inspect
+            source = inspect.getsource(sb.late_reminder_counts)
+            self.assertEqual(source.count(old), 1)
+            space = dict(sb.late_reminder_counts.__globals__)
+            exec(source.replace(old, new), space)
+            return space["late_reminder_counts"]
+
+        def test_s15_each_mutant_of_the_tail_read_fails_the_s14_test(self):
+            directory, now = self.audit_window_fixture()
+            self.assertEqual(sb.late_reminder_counts(directory, {}, now), {"lane-a": 2})             # the control
+            mutants = ((("data = data.partition(b\"\\n\")[2]", "data = data"), AssertionError, r"^\{'lane-b': 1, 'lane-a': 2\} != \{'lane-a': 2\}"),
+                       (("if not isinstance(entry, dict):", "if False:"), AttributeError, r"'list' object has no attribute 'get'"),
+                       (("handle.seek(max(0, size - cap))", "handle.seek(0)"), AssertionError, r"^\{'lane-a': 3, 'lane-b': 0\} != \{'lane-a': 2\}"))
+            for (old, new), error, text in mutants:
+                with mock.patch.object(sb, "late_reminder_counts", self.mutant_counts(old, new)):
+                    with self.assertRaisesRegex(error, text):
+                        self.assertEqual(sb.late_reminder_counts(directory, {}, now), {"lane-a": 2})
+
         def unreadable_world(self):
             self.world.add_agent("u-free", fleet={"role": "coder", "reports_to": "platform", "issue": 40})
             self.world.v2.start_turn(self.world.sessions["u-free"], "task", fleet=True, lasts=86400, steps=3)
