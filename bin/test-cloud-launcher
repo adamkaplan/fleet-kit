@@ -69,7 +69,7 @@ run_entry() { # $1 = entry; runs it with the arguments it took in the old chain;
   esac || { echo "FAILED: $e"; return 1; }
   echo "TIME $e $(( $(date +%s) - t0 ))s"
 }
-[ -z "${CHAIN_SERIAL_ENTRY:-}" ] || { run_entry "$CHAIN_SERIAL_ENTRY" "$@"; exit $?; }   # the serial entry, started by the starter below with the default action of SIGINT
+[ -z "${CHAIN_SERIAL_ENTRY:-}" ] || { se=$CHAIN_SERIAL_ENTRY; unset CHAIN_SERIAL_ENTRY; run_entry "$se" "$@"; exit $?; }   # the serial entry, started by the starter below with the default action of SIGINT
 is_parallel() { grep -qx "$1" "$PAR"; }
 while IFS= read -r e; do
   [ -n "$e" ] || continue
