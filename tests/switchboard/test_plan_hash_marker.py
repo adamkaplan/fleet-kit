@@ -69,20 +69,20 @@ class TestPlanHashMarkerPure(unittest.TestCase):
 
     def test_the_old_formula_gives_two_hashes_for_the_two_forms(self):
         self.assertNotEqual(self.pc.plan_hash_legacy(self.plain), self.pc.plan_hash_legacy(self.signed))
-        self.assertEqual(self.pc.plan_hashes(self.signed), (self.pc.plan_hash(self.signed), self.pc.plan_hash_legacy(self.signed)))
-        self.assertEqual(len(self.pc.plan_hashes(self.plain)), 1)
+        self.assertEqual(self.pc.plan_hashes(self.signed), (self.pc.plan_hash(self.signed), self.pc.plan_hash_collapsed(self.signed), self.pc.plan_hash_legacy(self.signed)))
+        self.assertEqual(len(self.pc.plan_hashes(self.plain)), 2)
 
     def test_one_edited_word_and_a_marker_line_elsewhere_change_the_hash_and_whitespace_does_not(self):
         base = self.pc.plan_hash(self.signed)
         edited = self.pc.plan_hash(self.signed.replace("size: S", "size: M"))
         elsewhere = self.pc.plan_hash(plan_text() + MARKER + "\nmore text\n")
-        spaced = self.pc.plan_hash(self.signed.replace("size: S", "size:   S"))
-        self.assertEqual([edited != base, elsewhere != base, spaced == base], [True, True, True])
+        spaced = self.pc.plan_hash(self.signed.replace("size: S", "size: S  \t"))
+        self.assertEqual([edited != base, elsewhere != base, spaced == base, self.pc.plan_hash(self.signed.replace("size: S", "size:   S")) != base, self.pc.plan_hash(self.signed.replace("size: S", " size: S")) != base], [True, True, True, True, True])
 
     def test_only_a_marker_in_the_exact_form_on_the_last_non_blank_line_is_removed(self):
         for odd in ("<!-- fleet-switchboard:from=a b -->", "<!-- fleet-switchboard:from= -->", "text " + MARKER):
             text = self.plain + odd + "\n"
-            self.assertEqual(self.pc.plan_hash(text), self.pc.plan_hash_legacy(text), odd)
+            self.assertEqual(self.pc.plan_hash_collapsed(text), self.pc.plan_hash_legacy(text), odd)
 
     def test_an_approval_at_the_old_hash_and_at_the_new_hash_is_accepted_and_one_of_an_edit_is_not(self):
         for value in self.pc.plan_hashes(self.signed):
@@ -133,7 +133,7 @@ class TestPlanHashMarkerStored(unittest.TestCase):
     def test_a_text_with_no_marker_has_one_hash_and_no_mapping(self):
         pair = self.pc.plan_hashes(plan_text())
         entries = self.entries(pair[0])
-        self.assertIs(self.pl.as_current(entries, pair), entries)
+        self.assertEqual(self.pl.as_current(entries, pair), entries)
 
 
 class TestPlanHashMarkerTally(unittest.TestCase):
@@ -142,7 +142,7 @@ class TestPlanHashMarkerTally(unittest.TestCase):
     def setUp(self):
         self.pc, self.pl, self.rv = real("plan_check"), real("plan_ledger"), real("plan_review")
         self.signed = plan_text() + "\n" + MARKER + "\n"
-        self.new, self.old = self.pc.plan_hashes(self.signed)
+        self.new, _, self.old = self.pc.plan_hashes(self.signed)
         self.lanes = ["L1", "L2", "L3"]
 
     def lanes_at(self, hashes):
@@ -201,7 +201,7 @@ class TestPlanHashMarkerMutants(unittest.TestCase):
 
     def test_a_mutant_that_compares_the_raw_strings_in_a_round_counts_two_of_three(self):
         pc, pl, rv = real("plan_check"), _ph_mutate("plan_ledger", "    if not hashes or len(hashes) < 2:\n        return entries\n", "    return entries\n"), real("plan_review")
-        new, old = pc.plan_hashes(self.signed)
+        new, _, old = pc.plan_hashes(self.signed)
         entries = [{"kind": "lane", "lane": l, "verdict": "approve", "plan_hash": h, "objections": []} for l, h in zip("ABC", (old, old, new))]
         entries = pl.as_current(entries, (new, old))
         self.assertNotEqual(rv.decide_consensus(entries, list("ABC"), new, rounds_left=True)[0], "consensus")
