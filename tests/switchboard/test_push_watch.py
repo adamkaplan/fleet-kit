@@ -540,6 +540,36 @@ class TestPushWatch(Case):
             "a RuntimeError of the launcher reader was swallowed as a corrupt line"),
             "a RuntimeError of the launcher reader was swallowed as a corrupt line")
 
+class TestWriteOnce(Case):
+    def _replaces(self, module):
+        self.world.refs = {"w-a/wip": SHA_A}
+        self.engine.cloud_watch = {"records": [record("w-a", "lane-a")]}
+        real, calls = module.os.replace, []
+        def counted(src, dst):
+            calls.append(str(dst))
+            return real(src, dst)
+        module.os.replace = counted
+        try:
+            for i in range(40):
+                self.run_pass(NOW + i, module)
+        finally:
+            module.os.replace = real
+        return len([c for c in calls if c.endswith("push-watch.json")])
+
+    def test_fix2_idle_passes_write_the_state_file_at_most_twice(self):
+        self.assertLessEqual(self._replaces(self.pw), 2)
+
+    def test_fix2_the_unconditional_save_mutant_fails(self):
+        text = (REPO / "bin" / "push_watch.py").read_text()
+        guard = "            if handle.read(len(text) + 1) == text:"
+        self.assertIn(guard, text)
+        mutant = types.ModuleType("push_watch_mutant")
+        exec(compile(text.replace(guard, "            if False:"), "push_watch.py", "exec"), mutant.__dict__)
+        with self.assertRaises(AssertionError) as caught:
+            self.assertLessEqual(self._replaces(mutant), 2, "the state file was rewritten on idle passes")
+        self.assertIn("the state file was rewritten on idle passes", str(caught.exception))
+
+
 class TestTickWithoutConfig(unittest.TestCase):
     """#1740: push_watch_tick reads the configuration defensively."""
 
