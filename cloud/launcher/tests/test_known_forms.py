@@ -302,6 +302,40 @@ class S5Week(unittest.TestCase):
         self.assertGreater(counts[-1], bound)
 
 
+class S8Rounds(unittest.TestCase):
+    def test_200_rounds(self):
+        class Rec(cw.KnownForms):
+            def __iter__(self):
+                self.snap = list(cw.KnownForms.__iter__(self))
+                return iter(self.snap)
+        raises = kept = same = 0
+        for r in range(200):
+            k = Rec(); k.snap = []
+            for i in range(6):  # forms that the sweep really removes
+                k.add_forms(cw.secret_forms("old%d_%d" % (r, i) + P34[:20]), ("until", 0.0, None))
+            k.add_forms(cw.secret_forms(G34), ("pod", "live"))
+            added = set(cw.secret_forms("new%d" % r + H34)); errs = []; out = []
+            text = "a %s b %s c new%d%s" % (G34, P34[:20], r, H34)
+            go = threading.Barrier(3)
+            def adder():
+                try: go.wait(); k.add_forms(added, ("pod", "live"))
+                except Exception as e: errs.append(type(e).__name__)
+            def sweeper():
+                try: go.wait(); k.sweep(1.0, {"live"})
+                except Exception as e: errs.append(type(e).__name__)
+            def scr():
+                try:
+                    go.wait(); o = cw.scrub(text, k, 100000); out.append((o, list(k.snap)))
+                except Exception as e: errs.append(type(e).__name__)
+            ts = [threading.Thread(target=f) for f in (adder, sweeper, scr)]
+            [t.start() for t in ts]; [t.join() for t in ts]
+            raises += bool(errs); kept += added <= set(k)
+            if out:
+                same += out[0][0] == OLD_SCRUB(text, out[0][1], 100000)
+        print("S8 rounds 200: %d raised, %d of 200 added forms kept, %d of 200 outputs equal to the frozen old function's on their own snapshot" % (raises, kept, same))
+        self.assertEqual((raises, kept, same), (0, 200, 200))
+
+
 class Mutants(unittest.TestCase):
     """S3 and S2 mutants: a scratch copy of the sweep, text asserted once, mutation asserted applied."""
 
