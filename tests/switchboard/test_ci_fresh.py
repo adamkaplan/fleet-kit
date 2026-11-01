@@ -358,5 +358,64 @@ class TestCiFreshRefusalAndEvidence(unittest.TestCase):
             self.assertEqual((again["status"], again["recorded"]), ("not-green", []))
             self.assertEqual(len([e for e in plan_ledger.read_ledger(state)[0] if e.get("kind") == "verdict"]), 1)   # nothing more was recorded
 
+
+def _copy_of(module, old, new, tag):
+    """A module built from a COPY of the source of `module`, with `old` replaced by `new` (None: unmutated); the mutation is asserted applied."""
+    src = open(module.__file__).read()
+    if new is not None:
+        assert src.count(old) == 1, "the mutation did not apply: " + old
+        src = src.replace(old, new)
+    mod = types.ModuleType(tag)
+    mod.__dict__["__file__"] = module.__file__
+    exec(compile(src, tag, "exec"), mod.__dict__)
+    return mod
+
+
+class TestCiFreshReadMutants(unittest.TestCase):
+    """Mutants of `pr_reading.read_fresh` (one per GitHub read it makes) and of the merge gate's `N commits behind` text; each has a control."""
+
+    RUNS = "runs = read_pr_runs(gh, repo, number, head) if head else []"
+    TIP = "tip = read_tip(gh, repo, base_ref) if isinstance(base_ref, str) and base_ref else None"
+    COMPARE = "behind = read_behind(gh, repo, base, tip) if base and base != tip else None"
+
+    def read_all(self, mod):
+        gh = CountingGh()
+        facts = judge(gh, reading=mod)
+        self.assertEqual(gh.kinds(), ["runs", "tip", "compare"], "the three reads are made: runs, tip, compare")
+        self.assertEqual(facts["ci_line"], ci_fresh.ci_state("green", OLD, TIP, 3)[1], "the stale line holds the count of the compare")
+
+    def test_the_control_the_unmutated_copy_makes_all_three_reads(self):
+        self.read_all(_copy_of(pr_reading, self.RUNS, None, "pr_reading_control"))
+
+    def test_a_reader_that_skips_the_run_list_is_caught(self):
+        mod = _copy_of(pr_reading, self.RUNS, "runs = []", "pr_reading_noruns")
+        with self.assertRaisesRegex(AssertionError, "the three reads are made: runs, tip, compare"):
+            self.read_all(mod)
+
+    def test_a_reader_that_skips_the_tip_is_caught(self):
+        mod = _copy_of(pr_reading, self.TIP, "tip = None", "pr_reading_notip")
+        with self.assertRaisesRegex(AssertionError, "the three reads are made: runs, tip, compare"):
+            self.read_all(mod)
+
+    def test_a_reader_that_skips_the_compare_is_caught(self):
+        mod = _copy_of(pr_reading, self.COMPARE, "behind = None", "pr_reading_nocompare")
+        with self.assertRaisesRegex(AssertionError, "the three reads are made: runs, tip, compare"):
+            self.read_all(mod)
+
+    def refusal(self, mod):
+        facts = dict(TestCiFreshRefusalAndEvidence.FACTS, behind=17)
+        why = mod.decide(facts)[1]
+        self.assertIn("tip now aaaaaaaa, 17 commits behind)", why)
+
+    GATE = '", %d commits behind" % facts["behind"] if facts.get("behind") is not None else ""'
+
+    def test_the_control_the_unmutated_merge_gate_says_the_number(self):
+        self.refusal(_copy_of(merge_gate, self.GATE, None, "merge_gate_control"))
+
+    def test_a_merge_gate_that_drops_the_number_is_caught(self):
+        mod = _copy_of(merge_gate, self.GATE, '""', "merge_gate_nonumber")
+        with self.assertRaisesRegex(AssertionError, "17 commits behind"):
+            self.refusal(mod)
+
 if __name__ == "__main__":
     unittest.main()
