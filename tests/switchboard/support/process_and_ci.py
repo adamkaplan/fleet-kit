@@ -9,7 +9,7 @@ import zipfile
 import subprocess
 import threading
 import time
-from support.paths import BIN, REPO
+from support.paths import BIN
 from support.fake_hubs import sweep_issue
 from support.loader import sb, switchboard_source
 from support.paths import BIN
