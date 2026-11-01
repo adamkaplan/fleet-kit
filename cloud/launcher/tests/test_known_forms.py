@@ -103,6 +103,80 @@ class S3More(unittest.TestCase):
         self.assertEqual((len(gf), len(lf)), (8, 6))
 
 
+class S2Kinds(unittest.TestCase):
+    """S2 as the plan states it: each kind gone exactly at its event; a mutant for each drop event by kind."""
+
+    def world(self, cls):
+        k = cls()
+        self.F = {n: set(cw.secret_forms(v)) for n, v in (("git", G34), ("login", L34), ("pw", P34), ("hub", H34), ("model", M34))}
+        k.add_forms(self.F["git"], ("until", 3660.0, None))
+        k.add_forms(self.F["login"], ("until", 2400.0, None))
+        k.add_forms(self.F["pw"], ("pod", "p1"))
+        k.add_forms(self.F["hub"], ("pod", "p2"))
+        k.add_forms(self.F["model"], None); k.add_forms(self.F["model"], ("pod", "p1"))
+        return k
+
+    def check(self, cls):
+        k = self.world(cls); total = len(k); removed = []
+        self.assertEqual(sum(len(v) for v in self.F.values()), total, "the fixtures overlap")
+        # control: no event, 0 of 63 dropped
+        self.assertEqual(k.sweep(0, {"p1", "p2"}), 0, "a form was dropped with no event")
+        self.assertEqual(len(k), total, "a form was dropped with no event")
+        for now, pods, kind in ((2400, {"p1", "p2"}, "login"), (3660, {"p1", "p2"}, "git"), (3660, {"p2"}, "pw"), (3660, set(), "hub")):
+            if kind in ("login", "git"):
+                before = now - 1
+                self.assertEqual(k.sweep(before, pods), 0, "a form was dropped before its event (" + kind + ")")
+            elif kind == "pw":
+                self.assertEqual(k.sweep(now, pods | {"p1"}), 0, "a form was dropped before its event (" + kind + ")")
+            else:
+                self.assertEqual(k.sweep(now, pods | {"p2"}), 0, "a form was dropped before its event (" + kind + ")")
+            n = k.sweep(now, pods)
+            self.assertTrue(self.F["model"] <= set(k), "a model-entry form was dropped")
+            self.assertEqual(n, len(self.F[kind]), "a %s form was not dropped at its event" % kind)
+            self.assertFalse(self.F[kind] & set(k), "a %s form was not dropped at its event" % kind)
+            removed.append(n)
+        self.assertTrue(self.F["model"] <= set(k), "a model-entry form was dropped")
+        self.assertEqual(len(k), len(self.F["model"]), "a model-entry form was dropped")
+        return total, removed, len(self.F["model"])
+
+    def test_control_counts(self):
+        total, removed, m = self.check(cw.KnownForms)
+        print("S2 forms before %d, removed in turn %s, model kept %d of %d, control dropped 0 of %d" % (total, removed, m, m, total))
+        self.assertEqual((total, removed, m), (63, [6, 8, 8, 7], 34))
+
+    def mutant(self, old, new):
+        src = Mutants.SRC
+        self.assertEqual(src.count(old), 1)
+        src = src.replace(old, new)
+        self.assertNotEqual(src, Mutants.SRC)
+        ns = {"__name__": "mut", "__file__": cw.__file__}
+        exec(compile(src, "mut", "exec"), ns)
+        return ns["KnownForms"]
+
+    def test_mutants_by_kind(self):
+        until = '(l[0] == "until" and now >= l[1] and l[2] not in pods)'
+        pod = '(l[0] == "pod" and l[1] not in pods)'
+        cases = (
+            ("never drops by instant", until, "False", "was not dropped at its event"),
+            ("never drops by pod", pod, "False", "was not dropped at its event"),
+            ("drops one step early", 'now >= l[1] and l[2] not in pods', 'now >= l[1] - 1 and l[2] not in pods', "a form was dropped before its event"),
+            ("drops a pod's forms while it runs", 'l[1] not in pods)', 'True)', "a form was dropped with no event"),
+            ("drops every kind by one fixed age", 'if lives is None:\n                    continue\n', 'if False:\n                    continue\n', None),
+        )
+        failed = 0
+        for name, old, new, text in cases:
+            if name.startswith("drops every kind"):
+                new = 'if lives is None and now < 3660:\n                    continue\n                lives = lives or {("pod", "x")}\n'
+                text = "a model-entry form was dropped"
+            bad = self.mutant(old, new)
+            with self.assertRaises(AssertionError, msg=name) as cm:
+                self.check(bad)
+            self.assertIn(text, str(cm.exception), name)
+            failed += 1
+        print("S2 mutants failed %d of %d with their anchored text" % (failed, len(cases)))
+        self.assertEqual(failed, len(cases))
+
+
 class Mutants(unittest.TestCase):
     """S3 and S2 mutants: a scratch copy of the sweep, text asserted once, mutation asserted applied."""
 
