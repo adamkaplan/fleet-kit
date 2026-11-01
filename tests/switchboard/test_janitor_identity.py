@@ -48,8 +48,9 @@ class JanitorIdentity(unittest.TestCase):
             if str(path) != mine:
                 return info
             out = {n: getattr(info, n) for n in dir(info) if n.startswith("st_")}
-            for n in ("st_dev", "st_ino", "st_mtime", "st_atime", "st_ctime", "st_mtime_ns", "st_atime_ns", "st_ctime_ns"):
-                out[n] = getattr(fixed, n)
+            for n in ("st_dev", "st_ino", "st_mtime", "st_atime", "st_ctime", "st_mtime_ns", "st_atime_ns", "st_ctime_ns", "st_birthtime", "st_birthtime_ns"):
+                if hasattr(fixed, n):   # macOS has a birth time that the identity reads (st_birthtime); Linux has none
+                    out[n] = getattr(fixed, n)
             return types.SimpleNamespace(**out)
         return fake
 
