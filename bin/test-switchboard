@@ -80213,6 +80213,189 @@ class TestHoldQueueUnreadableFile(Base):
         with self.assertRaisesRegex(AssertionError, r"^True is not false"):
             self.check(self.mutant())
 
+    def test_a_boolean_and_a_symbolic_link_are_refused_whole_and_come_back_after_the_repair(self):
+        item = {"key": "k1", "text": "one", "at": 1.0, "seq": 1}
+        other = {"key": "k0", "text": "zero", "at": 0.5, "seq": 2}
+        good = json.dumps({"seq": 2, "items": [item, other], "delivered": []}, indent=1, sort_keys=True).encode() + b"\n"
+        for label, bad in (("seq", dict(item, seq=True)), ("at", dict(item, at=False))):
+            with self.subTest(label):
+                state = tempfile.mkdtemp()
+                self.addCleanup(shutil.rmtree, state, True)
+                file = self.hq.path(state, "platform")
+                raw = json.dumps({"seq": 2, "items": [bad, other], "delivered": []}).encode()
+                file.write_bytes(raw)
+                self.assertEqual(self.hq.enqueue(state, "platform", "k2", "coder", "two", 2.0), (False, self.line("a malformed item")))
+                self.assertEqual(file.read_bytes(), raw)
+                self.assertEqual(self.hq.waiting(state, "platform"), [])
+                self.hq.done(state, "platform", "k1")
+                self.assertEqual(file.read_bytes(), raw)
+                file.write_bytes(good)
+                self.assertEqual([i["key"] for i in self.hq.waiting(state, "platform")], ["k0", "k1"])
+        for label in ("to another file", "to itself"):
+            with self.subTest(label):
+                state = tempfile.mkdtemp()
+                self.addCleanup(shutil.rmtree, state, True)
+                file = self.hq.path(state, "platform")
+                target = Path(state) / "other.json"
+                if label == "to itself":
+                    target = file
+                else:
+                    target.write_bytes(good)
+                file.symlink_to(target.name)
+                self.assertTrue(file.is_symlink())
+                self.assertEqual(self.hq.enqueue(state, "platform", "k2", "coder", "two", 2.0), (False, self.line("a symbolic link")))
+                self.assertEqual(self.hq.waiting(state, "platform"), [])
+                self.hq.done(state, "platform", "k1")
+                self.assertTrue(file.is_symlink())
+                self.assertEqual(os.readlink(str(file)), target.name)
+                if label == "to another file":
+                    self.assertEqual(target.read_bytes(), good)
+
+
+class HoldQueueRig(Base):
+    """The fixtures of the S13 to S15 classes: a held pane, `send`, `release_held`, and a mutant copy of one function."""
+
+    def setUp(self):
+        super().setUp()
+        self.world = World(self, agents=("platform", "coder"))
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        os.environ[sb.LAB_ENV] = "1"
+        self.pane = self.world.herdr.panes[self.world.panes["platform"]]
+        self.hq = sb.load_module("queued_sends")
+
+    def main(self, *argv):
+        with captured() as (out, err):
+            code = sb.main(list(argv), runner=self.world.route, now=self.world.clock.now,
+                           wait=lambda sock, seconds: False, socket_call=self.world.herdr.socket)
+        return code, out.getvalue(), err.getvalue()
+
+    def release(self, passes=1):
+        out = []
+        for _ in range(passes):
+            out.extend(self.world.engine.release_held(self.world.engine.discover(self.world.clock.now())))
+        return out
+
+    def queued(self):
+        return self.hq.waiting(self.world.state, "platform")
+
+    def mutant_of(self, owner, name, old, new):
+        """The function `owner.name` with ONE textual replacement, exec'd in a copy of its module namespace (production is never edited)."""
+        src = textwrap.dedent(inspect.getsource(getattr(owner, name)))
+        self.assertEqual(src.count(old), 1)
+        mutated = src.replace(old, new)
+        self.assertNotEqual(mutated, src, "the mutation applied")
+        namespace = dict(vars(sb)) if owner is sb.Switchboard else {}
+        namespace["__name__"] = "mutant"
+        exec(compile(mutated, "<mutant of %s>" % name, "exec"), namespace)
+        return namespace[name]
+
+
+class TestHoldQueueCrashBeforeDone(HoldQueueRig):
+    """S13: a message delivered but not marked done (the daemon stopped between the two) is delivered once and leaves the queue at the next release."""
+
+    def check(self):
+        self.pane["status"] = "blocked"
+        self.assertEqual(self.main("send", "platform", "--from", "coder", "one")[0], 0)
+        self.pane["status"] = "idle"
+        real, calls = self.hq.done, []
+
+        def skipped_once(*args):
+            calls.append(args)
+            if len(calls) > 1:
+                return real(*args)
+        with mock.patch.object(self.hq, "done", skipped_once):
+            first = self.release()
+            self.assertEqual(len(first), 1)
+            self.assertEqual(len(self.queued()), 1, "the first done was skipped: the message is still queued")
+            second = self.release()
+        self.assertEqual(len(first) + len(second), 1)
+        self.assertEqual(len(self.world.admissions("platform")), 1, "the transcript holds the key once")
+        self.assertEqual(self.queued(), [], "the delivered message leaves the queue")
+
+    def test_a_delivered_message_is_not_delivered_again_and_leaves_the_queue(self):
+        self.check()
+
+    def test_a_mutant_without_the_transcript_branch_keeps_the_message_queued(self):
+        mutant = self.mutant_of(sb.Switchboard, "release_held", "if plan is None:", "if False:")
+        with mock.patch.object(sb.Switchboard, "release_held", mutant):
+            with self.assertRaisesRegex(AssertionError, "the delivered message leaves the queue"):
+                self.check()
+
+
+class TestHoldQueueLock(HoldQueueRig):
+    """S14: `enqueue`, `waiting` and `done` each take the one lock once, and the lock excludes a second exclusive lock."""
+
+    def counts(self, hq):
+        counted = []
+        enter = hq._Lock.__enter__
+
+        def spy(lock):
+            counted.append(1)
+            return enter(lock)
+        out = {}
+        with mock.patch.object(hq._Lock, "__enter__", spy):
+            for label, call in (("enqueue", lambda: hq.enqueue(self.world.state, "platform", "k1", "coder", "one", 1.0)),
+                                ("waiting", lambda: hq.waiting(self.world.state, "platform")),
+                                ("done", lambda: hq.done(self.world.state, "platform", "k1"))):
+                del counted[:]
+                call()
+                out[label] = len(counted)
+        return out
+
+    def check(self, hq):
+        counts = self.counts(hq)
+        for label in ("enqueue", "waiting", "done"):
+            self.assertEqual(counts[label], 1, label)
+
+    def test_each_function_takes_the_lock_once_and_the_lock_excludes_another(self):
+        self.check(self.hq)
+        with self.hq._Lock(self.world.state):
+            fd = os.open(str(Path(self.world.state) / self.hq.LOCK), os.O_RDWR)
+            self.addCleanup(os.close, fd)
+            with self.assertRaises(BlockingIOError):
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def test_a_mutant_of_done_without_the_lock_is_caught(self):
+        self.check(self.hq)   # the control passes
+        src = (Path(self.hq.__file__)).read_text()
+        head, tail = src.split("def done(", 1)
+        body, rest = tail.split("def marked(", 1)
+        self.assertIn("    with _Lock(state_dir):\n", body)
+        mutated = head + "def done(" + body.replace("    with _Lock(state_dir):\n", "    if file is not None:\n") + "def marked(" + rest
+        self.assertNotEqual(mutated, src, "the mutation applied")
+        module = types.ModuleType("queued_sends_mutant")
+        module.__file__ = self.hq.__file__
+        exec(compile(mutated, module.__file__, "exec"), module.__dict__)
+        with self.assertRaisesRegex(AssertionError, r"^0 != 1"):
+            self.check(module)
+
+
+class TestHoldQueueUnreadableIsVisible(HoldQueueRig):
+    """S15: an unreadable queue file of a recipient whose pane no longer holds is audited once per run and delivers nothing."""
+
+    def check(self):
+        self.assertTrue(self.hq.enqueue(self.world.state, "platform", "k1", "coder", "one", 1.0)[0])
+        file = self.hq.path(self.world.state, "platform")
+        file.write_bytes(b'{"seq": 1, "items": [')
+        before = file.read_bytes()
+        self.pane["status"] = "idle"
+        self.assertEqual(self.release(passes=2), [])
+        lines = [e for e in self.world.audit() if e["event"] == "hold.unreadable"]
+        self.assertEqual(len(lines), 1)
+        self.assertIn("platform", json.dumps(lines[0]))
+        self.assertEqual(lines[0]["detail"]["reason"], "truncated or not JSON")
+        self.assertEqual(self.world.admissions("platform"), [])
+        self.assertEqual(file.read_bytes(), before)
+
+    def test_one_audit_line_names_the_recipient_and_the_reason_and_nothing_is_delivered(self):
+        self.check()
+
+    def test_a_mutant_without_the_audit_write_is_caught(self):
+        mutant = self.mutant_of(sb.Switchboard, "release_held", "self.audit.append(self.actor, \"hold.unreadable\", name, {\"reason\": why})", "pass")
+        with mock.patch.object(sb.Switchboard, "release_held", mutant):
+            with self.assertRaisesRegex(AssertionError, r"^0 != 1"):
+                self.check()
+
 
 class TestHoldQueueIdleAfterProviderError(Base):
     """An agent idle after a turn that ended on a provider error, with queued messages admitted at the end of its hold, is resumed once (#1337 covers it)."""

@@ -141,6 +141,16 @@ def waiting(state_dir, recipient):
         return [] if queue is None else sorted(queue["items"], key=lambda i: (i["at"], i["seq"]))
 
 
+def unreadable(state_dir, recipient):
+    """Why the queue file of `recipient` is present but unreadable, or None (absent, readable, or not an agent name)."""
+    file = path(state_dir, recipient)
+    if file is None:
+        return None
+    with _Lock(state_dir):
+        queue, why = _read(file)
+        return why if queue is None else None
+
+
 def recipients(state_dir):
     """The names that have a queue file now, sorted."""
     try:

@@ -3539,6 +3539,16 @@ class Switchboard:
             seen = discovery.agents.get(name)
             if seen is None or hold_reason(seen) is not None:
                 continue   # still held, or gone: the queue waits (a gone pane is refused at the send, never here)
+            why = queue.unreadable(self.state_dir, name)
+            if why is not None:   # PC-6: a queue file that cannot be read is seen here, once per recipient and reason per run; nothing is delivered from it
+                audited = getattr(self, "_unreadable_audited", None)
+                if audited is None:
+                    audited = self._unreadable_audited = set()
+                if (name, why) not in audited:
+                    audited.add((name, why))
+                    if self.audit is not None:
+                        self.audit.append(self.actor, "hold.unreadable", name, {"reason": why})
+                continue
             for item in queue.waiting(self.state_dir, name):
                 now = self.now()
                 fact = Fact(item["key"], name, "send", queue.marked(item, now), item["at"], issue=item.get("issue"), batch=False,
