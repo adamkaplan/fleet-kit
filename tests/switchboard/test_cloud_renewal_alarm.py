@@ -256,8 +256,69 @@ def s21(module):
         w.close()
 
 
+def s22(module):
+    w = AlarmWorld(module, {"worker-1": "lane-a"})
+    try:
+        original = module._write_state
+
+        def after_send(path, state):
+            if w.messages:
+                raise OSError(5, "the process ended after the send")
+            return original(path, state)
+        module._write_state = after_send
+        w.line(T0 - 5, "worker-1", False, "no network")
+        first = len(w.tick())
+        module._WARNED[:] = [1]
+        fresh = load()   # a new process: no memory of the first
+        fresh._write_state = original
+        fresh._WARNED[:] = [1]
+        w.module = fresh
+        before = len(w.messages)
+        w.tick(T0 + 5)
+        again = len(w.messages) - before
+        assert again == 2, "an alarm was lost: %d messages in the new process" % again
+        before = len(w.messages)
+        w.tick(T0 + 10)
+        assert len(w.messages) == before, w.messages
+        print("S22: messages in the first process %d, in the new process %d, at the next tick 0" % (first, again))
+    finally:
+        w.close()
+
+
+def s23(module):
+    import contextlib
+    import io
+    w = AlarmWorld(module, {"worker-1": "lane-a"})
+    try:
+        module._WARNED[:] = []
+        w.engine.state_dir = os.path.join(w.dir, "PLANTEDdir-" + PLANT, "state")   # does not exist: the state cannot be written
+        w.line(T0 - 5, "worker-1", False, "no network", detail=PLANT)
+        err = io.StringIO()
+        counts = []
+        with contextlib.redirect_stderr(err):
+            for n in range(3):
+                before = len(w.messages)
+                w.tick(T0 + n)
+                counts.append(len(w.messages) - before)
+        assert counts == [2, 0, 0], counts
+        lines = [l for l in err.getvalue().splitlines() if l]
+        assert len(lines) == 1 and "OSError 2" in lines[0], lines
+        assert "PLANTEDdir" not in err.getvalue() and PLANT not in err.getvalue() and w.dir not in err.getvalue(), err.getvalue()
+        fresh = load()
+        w.module = fresh
+        before = len(w.messages)
+        with contextlib.redirect_stderr(io.StringIO()):
+            w.tick(T0 + 5)
+        assert len(w.messages) - before == 2, w.messages
+        print("S23: messages per tick %s, standard error lines %d (%s), a new process %d" % (counts, len(lines), lines[0].split("(")[1].split(")")[0], 2))
+    finally:
+        w.close()
+
+
 SCENARIOS = {"s16e": s16e, "s16d": s16d, "s16b": s16b, "s16": s16, "s17": s17, "s18": s18, "s19": s19}
 SCENARIOS["s21"] = s21
+SCENARIOS["s22"] = s22
+SCENARIOS["s23"] = s23
 
 
 def run(name, path=None):
@@ -266,6 +327,7 @@ def run(name, path=None):
 
 
 MUTANTS = {
+    "s22": ("writes the state before the send", "    sent = []\n    try:\n", "    _persist(state_path, state)\n    sent = []\n    try:\n"),
     "s21": ("the slack of 300 seconds again", "FUTURE_SLACK_SECONDS = 0 ", "FUTURE_SLACK_SECONDS = 300 "),
     "s16": ("sends nothing", "item = send(engine.state_dir, to, now, now, text, KIND, subject, reason, first=True)", "item = None"),
     "s16d": ("no future guard", "if l[0] <= now + FUTURE_SLACK_SECONDS]", "if True]"),
@@ -289,6 +351,12 @@ class TestCloudRenewalAlarm(unittest.TestCase):
 
     def test_s21_a_line_dated_after_the_clock_is_not_read_and_the_cursor_never_passes_the_clock(self):
         s21(self.module)
+
+    def test_s22_the_state_is_written_after_the_send_and_a_lost_write_repeats_one_round(self):
+        s22(self.module)
+
+    def test_s23_an_unwritable_state_directory_keeps_alarming_with_one_line_on_standard_error(self):
+        s23(self.module)
 
     def test_s16b_a_failing_state_write_and_a_failing_send_never_repeat_an_alarm_and_a_held_lane_is_skipped(self):
         s16b(self.module)

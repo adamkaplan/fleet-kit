@@ -12,6 +12,7 @@ No cluster access and no credential: the file is read, the daemon's own send is 
 import copy
 import json
 import os
+import sys
 import re
 import time
 
@@ -121,6 +122,22 @@ def _write_state(path, state):
         raise
 
 
+_WARNED = []   # one standard error line per process
+
+
+def _persist(state_path, state):
+    try:
+        _write_state(state_path, state)
+        _MEMORY.pop(state_path, None)
+    except Exception:
+        err = sys.exc_info()[1]
+        _MEMORY[state_path] = copy.deepcopy(state)
+        if not _WARNED:
+            _WARNED.append(1)
+            number = getattr(err, "errno", None)
+            sys.stderr.write("cloud renewal alarm: the state could not be written (%s %d); it is kept in memory\n" % (type(err).__name__, number if isinstance(number, int) else 0))
+
+
 def _lane(config, discovery, default):
     named = (config or {}).get(CONFIG_KEY) or CONFIG_DEFAULT
     if named:
@@ -167,43 +184,41 @@ def tick(engine, discovery, send, hold_reason, boss_of, default_lane, env=None):
         alarms[pod] = (worker, reason)
     if len(state["pods"]) > POD_POOL:
         state["pods"] = dict(sorted(state["pods"].items(), key=lambda kv: kv[1])[-POD_POOL:])
-    # The state is written BEFORE the sends: an alarm lost to a crash between the write and the send is accepted, a repeated alarm is not.
-    # A write that fails is kept in memory (_MEMORY), so the process sends at most one round per pod while the write keeps failing.
-    try:
-        _write_state(state_path, state)
-        _MEMORY.pop(state_path, None)
-    except Exception:
-        _MEMORY[state_path] = copy.deepcopy(state)
+    # AT LEAST ONCE: the sends come first and the state after them (in `finally`, so a send that raises still records the recipients told).
+    # A crash between the send and the write repeats one round at the next start. A write that fails is kept in memory (_MEMORY).
     sent = []
-    lane = [n for n in _lane(engine.config, discovery, default_lane) if not hold_reason(discovery.agents[n])]
-    by_reason = {}
-    for pod, (worker, reason) in alarms.items():
-        by_reason.setdefault(reason, []).append(pod)
-    told = {}
+    try:
+        lane = [n for n in _lane(engine.config, discovery, default_lane) if not hold_reason(discovery.agents[n])]
+        by_reason = {}
+        for pod, (worker, reason) in alarms.items():
+            by_reason.setdefault(reason, []).append(pod)
+        told = {}
 
-    def tell(to, text, subject, reason):
-        item = send(engine.state_dir, to, now, now, text, KIND, subject, reason, first=True)
-        if item is not None:
-            sent.append((to, text))
-            told.setdefault(subject, []).append(to)
-    for pod, (worker, reason) in sorted(alarms.items()):
-        boss = boss_of(worker) if worker else None
-        seen = discovery.agents.get(boss) if boss else None
-        if seen is not None and not hold_reason(seen):
-            tell(boss, "Cloud renewal alarm: the git token of pod %s could not be renewed: %s" % (pod, reason or "no reason given"), pod, reason)
-        else:
-            boss = None
-        if len(by_reason[reason]) == 1:
-            for to in lane:
-                if to != boss:
-                    tell(to, "Cloud renewal alarm: the git token of pod %s could not be renewed: %s" % (pod, reason or "no reason given"), pod, reason)
-    for reason, pods in sorted(by_reason.items()):
-        if len(pods) > 1:
-            names = sorted(pods)
-            text = "Cloud renewal alarm: the git token of %d pods could not be renewed, the same reason: %s. Pods: %s%s" % (
-                len(names), reason or "no reason given", ", ".join(names[:NAMES_MAX]), ", and %d more" % (len(names) - NAMES_MAX) if len(names) > NAMES_MAX else "")
-            for to in lane:
-                tell(to, text, "group:" + names[0], reason)
+        def tell(to, text, subject, reason):
+            item = send(engine.state_dir, to, now, now, text, KIND, subject, reason, first=True)
+            if item is not None:
+                sent.append((to, text))
+                told.setdefault(subject, []).append(to)
+        for pod, (worker, reason) in sorted(alarms.items()):
+            boss = boss_of(worker) if worker else None
+            seen = discovery.agents.get(boss) if boss else None
+            if seen is not None and not hold_reason(seen):
+                tell(boss, "Cloud renewal alarm: the git token of pod %s could not be renewed: %s" % (pod, reason or "no reason given"), pod, reason)
+            else:
+                boss = None
+            if len(by_reason[reason]) == 1:
+                for to in lane:
+                    if to != boss:
+                        tell(to, "Cloud renewal alarm: the git token of pod %s could not be renewed: %s" % (pod, reason or "no reason given"), pod, reason)
+        for reason, pods in sorted(by_reason.items()):
+            if len(pods) > 1:
+                names = sorted(pods)
+                text = "Cloud renewal alarm: the git token of %d pods could not be renewed, the same reason: %s. Pods: %s%s" % (
+                    len(names), reason or "no reason given", ", ".join(names[:NAMES_MAX]), ", and %d more" % (len(names) - NAMES_MAX) if len(names) > NAMES_MAX else "")
+                for to in lane:
+                    tell(to, text, "group:" + names[0], reason)
+    finally:
+        _persist(state_path, state)
     if engine.audit is not None:
         for pod, (worker, reason) in sorted(alarms.items()):
             engine.audit.append(engine.actor, EVENT, pod, {"told": sorted(set(told.get(pod, []))), "reason": reason, "group": len(by_reason[reason])})
