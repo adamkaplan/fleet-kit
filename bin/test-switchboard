@@ -80454,6 +80454,96 @@ class TestHoldQueueUnreadableIsVisible(HoldQueueRig):
                 self.check()
 
 
+class TestHoldQueueGuards(HoldQueueRig):
+    """The guards of `queued_sends` a strict read found untested: the delivered-key guard, the duplicate key, the `KEEP_DELIVERED` trim,
+    the agent-name pattern, the byte cap and the tie-break by `seq`. Each has a mutant copy of the module (one textual replacement)."""
+
+    def mutated(self, old, new):
+        src = Path(self.hq.__file__).read_text()
+        self.assertEqual(src.count(old), 1, old)
+        mutated = src.replace(old, new)
+        self.assertNotEqual(mutated, src, "the mutation applied")
+        module = types.ModuleType("queued_sends_guard_mutant")
+        module.__file__ = self.hq.__file__
+        exec(compile(mutated, module.__file__, "exec"), module.__dict__)
+        return module
+
+    def killed(self, check, old, new, pattern):
+        check(self.hq)   # the control passes first
+        for file in Path(self.world.state).glob(self.hq.PREFIX + "*.json"):
+            file.unlink()   # the mutant starts from an empty state
+        with self.assertRaisesRegex(AssertionError, pattern):
+            check(self.mutated(old, new))
+
+    # M2 and M5: a delivered key and a duplicate key
+    def check_delivered(self, hq):
+        state = self.world.state
+        self.assertEqual(hq.enqueue(state, "platform", "k1", "coder", "one", 1.0), (True, 1))
+        hq.done(state, "platform", "k1")
+        hq.enqueue(state, "platform", "k1", "coder", "one", 1.0)
+        self.assertEqual(hq.waiting(state, "platform"), [], msg="a repeat of a delivered key stays out of the queue")
+
+    def check_duplicate(self, hq):
+        state = self.world.state
+        hq.enqueue(state, "platform", "k2", "coder", "two", 1.0)
+        hq.enqueue(state, "platform", "k2", "coder", "two", 1.0)
+        self.assertEqual(len(hq.waiting(state, "platform")), 1, msg="a duplicate key of a queued message is kept once")
+
+    def test_a_delivered_key_sent_again_is_refused_and_a_mutant_that_never_records_it_is_caught(self):
+        self.killed(self.check_delivered, 'if key not in queue["delivered"]:', "if False:", "a repeat of a delivered key stays out of the queue")
+
+    def test_a_duplicate_key_is_kept_once_and_a_mutant_that_accepts_it_is_caught(self):
+        self.killed(self.check_duplicate, 'if key in queue["delivered"] or any(i["key"] == key for i in queue["items"]):', "if False:",
+                    "a duplicate key of a queued message is kept once")
+
+    # the KEEP_DELIVERED trim
+    def check_trim(self, hq):
+        state = self.world.state
+        with mock.patch.object(hq, "KEEP_DELIVERED", 3):
+            for n in range(5):
+                hq.enqueue(state, "platform", "k%d" % n, "coder", "t", float(n))
+                hq.done(state, "platform", "k%d" % n)
+        delivered = hq._read(hq.path(state, "platform"))[0]["delivered"]
+        self.assertEqual(delivered, ["k2", "k3", "k4"], msg="the oldest delivered keys are dropped and the newest kept")
+
+    def test_the_delivered_keys_are_trimmed_to_the_cap_keeping_the_newest(self):
+        self.killed(self.check_trim, '[-KEEP_DELIVERED:]', '[:KEEP_DELIVERED]', "the oldest delivered keys are dropped and the newest kept")
+
+    # M6: the agent-name pattern
+    def check_name(self, hq):
+        self.assertIsNone(hq.path(self.world.state, "../x"), msg="a path-like name has no queue file")
+        ok, why = hq.enqueue(self.world.state, "../x", "k", "coder", "t", 1.0)
+        self.assertFalse(ok, msg="a path-like name is refused")
+        self.assertIn("not an agent name", why)
+
+    def test_a_path_like_agent_name_is_refused_and_a_mutant_without_the_pattern_is_caught(self):
+        self.killed(self.check_name, "NAME.fullmatch(name)", "True", "a path-like name has no queue file")
+
+    # M9: the byte cap (40 messages of 3000 bytes fill 120000)
+    def check_cap(self, hq):
+        state = self.world.state
+        for n in range(40):
+            self.assertTrue(hq.enqueue(state, "platform", "k%d" % n, "coder", "x" * hq.MAX_TEXT, float(n))[0])
+        ok, why = hq.enqueue(state, "platform", "over", "coder", "y", 99.0)
+        self.assertFalse(ok, msg="a message that would pass 120000 bytes is refused")
+        self.assertIn("120000 bytes", why)
+        self.assertEqual(len(hq.waiting(state, "platform")), 40)
+
+    def test_a_message_over_the_byte_cap_is_refused_with_its_reason_and_a_mutant_without_the_cap_is_caught(self):
+        self.killed(self.check_cap, "> MAX_BYTES:", "> 10**12:", "a message that would pass 120000 bytes is refused")
+
+    # M12: the tie-break by seq (the file lists seq 2 before seq 1, both sent at the same time)
+    def check_tie(self, hq):
+        file = hq.path(self.world.state, "platform")
+        item = lambda key, seq: {"key": key, "from": "coder", "at": 5.0, "issue": None, "repo": None, "text": key, "seq": seq}
+        file.write_text(json.dumps({"seq": 2, "items": [item("second", 2), item("first", 1)], "delivered": []}))
+        self.assertEqual([i["key"] for i in hq.waiting(self.world.state, "platform")], ["first", "second"],
+                         msg="two messages with the same time are in seq order")
+
+    def test_two_messages_with_the_same_time_are_in_seq_order_and_a_mutant_without_the_tie_break_is_caught(self):
+        self.killed(self.check_tie, '(i["at"], i["seq"])', '(i["at"],)', "two messages with the same time are in seq order")
+
+
 class TestHoldQueueIdleAfterProviderError(Base):
     """An agent idle after a turn that ended on a provider error, with queued messages admitted at the end of its hold, is resumed once (#1337 covers it)."""
 
