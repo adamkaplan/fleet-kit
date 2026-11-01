@@ -1434,7 +1434,7 @@ class Kube:
     def add_secrets(self, *values, life=None):
         for v in values:
             if v:
-                self.known.update(secret_forms(v))
+                self.known.add_forms(secret_forms(v), life)
 
     def delete_command(self, kind, name):
         """The exact command that removes one object by hand: the configured login flags, never a value."""
