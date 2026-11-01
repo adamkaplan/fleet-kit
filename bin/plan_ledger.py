@@ -278,6 +278,20 @@ def record_identity(entry):
 STALE_PASS_REASON = "a newer fail is recorded at this head: re-test at a new head or waive"
 
 
+def _hin(stored, current):
+    """True when `stored` is the plan's hash; `current` is one hash or a plan_hashes tuple (new first, old after: #1713)."""
+    return stored is not None and (stored in current if isinstance(current, (tuple, list)) else stored == current)
+
+
+def plan_cur(plan):
+    """The hashes a stored binding may carry for `plan` (new first): its plan_hashes, else its one plan_hash."""
+    return tuple(plan.get("plan_hashes") or (plan["plan_hash"],))
+
+
+def _hnew(current):
+    return current[0] if isinstance(current, (tuple, list)) else current
+
+
 def stale_pass(entries, entry):
     """True when `entry` is a pass whose key already holds a pass, with a newer fail after it: writing it would flip the verdict back (#1049)."""
     if entry.get("kind") not in EVIDENCE_KINDS or entry.get("result") != "pass":
@@ -372,7 +386,12 @@ def authors_of(entries, pr, notice_senders=(), github_author=None):
 def ask_head(plan_hash):
     """#1130: the "head" an ask issue's record carries: the first 40 hex digits of the plan hash (`sha256:<hex>`). A revised plan has another hash, so the
     record is void exactly as a pull request's is when its head moves."""
-    return str(plan_hash).split(":", 1)[-1][:40]
+    return str(_hnew(plan_hash)).split(":", 1)[-1][:40]
+
+
+def ask_heads(plan_hash):
+    """Every head an ask record of this plan may carry: the new hash's and the old one's (#1713)."""
+    return [str(h).split(":", 1)[-1][:40] for h in (plan_hash if isinstance(plan_hash, (tuple, list)) else (plan_hash,))]
 
 
 def known_writers(entries, pr, notice_senders=()):
@@ -653,12 +672,12 @@ def scenario_state(scenario, entries, pr, plan_hash, head, authors):
     for kind in ("proof", "verdict"):
         mine = [e for e in entries if e.get("pr") == pr and e.get("scenario") == sid and e.get("kind") == kind
                 and (kind == "proof" or e.get("evaluator") == evaluator)]
-        fresh = [e for e in mine if e.get("plan_hash") == plan_hash and (e.get("head") == head or e.get("seq") in carried)]
+        fresh = [e for e in mine if _hin(e.get("plan_hash"), plan_hash) and (e.get("head") == head or e.get("seq") in carried)]
         newest = fresh[-1] if fresh else None
         if newest and newest.get("head") != head:
             out.setdefault("carried", []).append(carried_view(newest, carried[newest["seq"]]))
         if not newest and mine:
-            why = "plan changed" if mine[-1].get("plan_hash") != plan_hash else "head moved"
+            why = "plan changed" if not _hin(mine[-1].get("plan_hash"), plan_hash) else "head moved"
             out["void"].append("%s #%d void: %s" % (kind if kind == "proof" else evaluator + " verdict", mine[-1]["seq"], why))
         out[kind] = None if not newest else {"seq": newest["seq"], "result": newest["result"], "by": newest.get("by")}
     proof, verdict = out["proof"], out["verdict"]
@@ -689,7 +708,7 @@ def carried_seqs(entries, pr, head, plan_hash=None):
     found = {}
     for entry in entries if head else ():
         if entry.get("kind") == "carried" and entry.get("pr") == pr and entry.get("new_head") == head and isinstance(entry.get("proof"), int) \
-                and (plan_hash is None or entry.get("plan_hash") == plan_hash):
+                and (plan_hash is None or _hin(entry.get("plan_hash"), plan_hash)):
             found[entry["proof"]] = entry
     return found
 
@@ -741,7 +760,7 @@ def head_view(scenario_id, evaluator, entries, pr, plan_hash, head, files_betwee
     """(#1405) The one `gates` line of a scenario's proof at `head`, or None when it has no proof of this plan: `proven at this head`, `carried ...`, or `void: ...` naming the
     first named file that changed, that the proof names no file, or `unknown` when the difference cannot be read. `files_between(old_head)` returns the changed files or None
     (never read as no change). It reuses `carry_decision`'s own reading of the named files."""
-    rows = [e for e in entries if e.get("pr") == pr and e.get("kind") == "proof" and e.get("scenario") == scenario_id and e.get("plan_hash") == plan_hash]
+    rows = [e for e in entries if e.get("pr") == pr and e.get("kind") == "proof" and e.get("scenario") == scenario_id and _hin(e.get("plan_hash"), plan_hash)]
     if not rows:
         return None
     row = rows[-1]
@@ -835,7 +854,7 @@ def carried_rows(carries, entries, facts):
     for s in dep_plan["scenarios_parsed"]:
         if claim_of(s) != "pr":
             continue
-        row = scenario_state(s, entries, dep_pr, dep_plan["plan_hash"], dep_head, authors)
+        row = scenario_state(s, entries, dep_pr, plan_cur(dep_plan), dep_head, authors)
         row["id"] = "%s %s" % (dep_pr, row["id"])
         row["carried_from"] = dep_pr
         rows.append(row)
@@ -920,7 +939,7 @@ def evaluate_gates(plan, entries, ledger_problem, facts, pr, now=None):
                 row.update(status="missing", missing=["the PR head is unknown"])
             else:
                 claimed, left, claim_error = pr_scenarios(plan["scenarios_parsed"], (facts or {}).get("body"))
-                scen_rows = [scenario_state(s, entries, pr, plan["plan_hash"], head, authors) for s in claimed]
+                scen_rows = [scenario_state(s, entries, pr, plan_cur(plan), head, authors) for s in claimed]
                 if carries and not carries.get("refusal") and carries.get("plan") and carries["plan"].get("result") == "pass" and carries.get("head"):
                     dep_rows, carried_reviews = carried_rows(carries, entries, facts)
                     scen_rows = scen_rows + dep_rows
@@ -1353,7 +1372,7 @@ def consensus_at(entries, plan_hash):
     """The newest `consensus` entry of the ledger that passed at exactly `plan_hash` (G0b), or None. A record for an earlier
     hash does not count: editing the plan voids it."""
     for entry in reversed(entries):
-        if entry.get("kind") == "consensus" and entry.get("plan_hash") == plan_hash and entry.get("result") == "pass":
+        if entry.get("kind") == "consensus" and _hin(entry.get("plan_hash"), plan_hash) and entry.get("result") == "pass":
             return entry
     return None
 
@@ -1376,7 +1395,7 @@ def launch_findings(brief, plan, entries):
         return [{"gate": "G0a", "missing": ["the plan the brief links could not be read"]}]
     if plan["result"] != "pass":
         found.append({"gate": "G0a", "missing": ["the plan fails `plan check` (%d defect(s))" % len(plan["defects"])]})
-    if consensus_at(entries, plan["plan_hash"]) is None:
+    if consensus_at(entries, plan_cur(plan)) is None:
         found.append({"gate": "G0b", "missing": ["no consensus record at the plan's current hash %s" % plan["plan_hash"][:19]]})
     return found
 

@@ -868,10 +868,42 @@ def content_hash(scenarios, clauses, text=""):
     return "sha256:" + hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
-def plan_hash(text):
-    """sha256 of the WHOLE plan text, whitespace collapsed. Approval (G0c) and consensus (G0b) bind to this one: an edit
-    to constraints, scope or risks changes it as well as an edit to a scenario."""
+_MARKER_LINE_RE = re.compile(r"^<!-- fleet-switchboard:from=[^\s>]+ -->$")
+
+
+def _strip_marker(text):
+    lines = (text or "").rstrip().split("\n")
+    if lines and _MARKER_LINE_RE.match(lines[-1].strip()):
+        return "\n".join(lines[:-1]), True
+    return text or "", False
+
+
+def plan_hash_legacy(text):
+    """The old formula: sha256 of the whole text, whitespace collapsed, marker line included."""
     return "sha256:" + hashlib.sha256(" ".join((text or "").split()).encode("utf-8")).hexdigest()
+
+
+def plan_hash(text):
+    """sha256 of the plan text, whitespace collapsed, with ONE trailing switchboard marker line removed."""
+    return plan_hash_legacy(_strip_marker(text)[0])
+
+
+def plan_hashes(text):
+    """(new, old) hashes of the text; one value when it has no trailing marker."""
+    new, old = plan_hash(text), plan_hash_legacy(text)
+    return (new,) if new == old else (new, old)
+
+
+def hash_in(stored, current):
+    """True when `stored` is the plan's hash. `current` is one hash or a plan_hashes tuple/list (new first, old after)."""
+    if isinstance(current, (tuple, list)):
+        return stored is not None and stored in current
+    return stored is not None and stored == current
+
+
+def hash_new(current):
+    """The hash to RECORD: `current` itself or the first (new) of a plan_hashes tuple."""
+    return current[0] if isinstance(current, (tuple, list)) else current
 
 
 # ----------------------------------------------------------------------------------- the whole check
@@ -919,7 +951,7 @@ def check(text, done_when, plan_done_when=None):
                             "message": "the plan states %d Done-when clause(s) but the ask has %d, or they differ: the ask's "
                                        "Done-when is the authority, copy it exactly" % (len(own), len(clauses))})
     return {"result": "fail" if defects else "pass", "scenario_hash": content_hash(scenarios, clauses, text),
-            "plan_hash": plan_hash(text), "scenarios": len(scenarios), "clauses": clauses, "defects": defects,
+            "plan_hash": plan_hash(text), "plan_hashes": list(plan_hashes(text)), "scenarios": len(scenarios), "clauses": clauses, "defects": defects,
             "warnings": warnings}
 
 

@@ -216,7 +216,7 @@ def evaluate(value, comments, done_when, plan_check):
         return refuse("the issue has %d plan comments, and an approval needs exactly 1" % len(plans))
     text = plans[0]["body"]
     current = plan_check.plan_hash(text)
-    if "sha256:" + value.lower() != current:
+    if "sha256:" + value.lower() not in plan_check.plan_hashes(text):
         return refuse("the plan has changed (current %s)" % current, current)
     if not (done_when or "").strip():
         return refuse("there is no Done-when on the issue or its ask to check the plan against (current %s)" % current, current)
@@ -228,4 +228,4 @@ def evaluate(value, comments, done_when, plan_check):
         return refuse("the plan declares no clauses block to compare with the Done-when (current %s)" % current, current)
     if not plan_check.verify_declared(declared, done_when):
         return refuse("the plan's clauses no longer equal the current Done-when (current %s)" % current, current)
-    return {"ok": True, "line": "", "plan_hash": current, "done_when_hash": "sha256:" + done_when_hash(done_when)}
+    return {"ok": True, "line": "", "plan_hash": current, "plan_hashes": plan_check.plan_hashes(text), "done_when_hash": "sha256:" + done_when_hash(done_when)}

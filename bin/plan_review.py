@@ -158,6 +158,11 @@ def _undecided(entries):
     return sorted(open_ids)
 
 
+def _hs(plan_hash):
+    """A plan hash argument as a tuple (a plan_hashes tuple keeps its old hash too: #1713)."""
+    return tuple(plan_hash) if isinstance(plan_hash, (tuple, list)) else (plan_hash,)
+
+
 def lineage_state(entries, plan_hash=None):
     """The lineage's state from its entries (every review of the ask, oldest first). Rounds, rounds after an escalation and closing
     rounds are counted SINCE THE LAST CONSENSUS (a consensus ends that window: an edited plan can be reviewed again, with a fresh bounded
@@ -196,7 +201,7 @@ def lineage_state(entries, plan_hash=None):
                            if o.get("severity") == "blocking" and o.get("state") not in CLOSED_STATES)
     return {"rounds": rounds, "post_escalation_rounds": post, "closing_rounds": closing, "closing_hashes": sorted(closing_hashes),
             "escalated": escalated, "open_review": open_review, "undecided": _undecided(entries), "open_blocking": open_blocking,
-            "consensus_hashes": consensus, "overridden": overridden, "consensus_at": bool(plan_hash) and plan_hash in consensus}
+            "consensus_hashes": consensus, "overridden": overridden, "consensus_at": bool(plan_hash) and any(h in consensus for h in _hs(plan_hash))}
 
 
 def _rounds_left(state):
@@ -212,7 +217,7 @@ def may_start(state, plan_hash):
         return False, "the ask has an undecided escalation: decide it first (a new plan issue for the same ask does not change that)"
     if state["open_review"]:
         return False, "a review of this ask is already open: one open review per ask"
-    if state["consensus_at"] or plan_hash in state["consensus_hashes"]:
+    if state["consensus_at"] or any(h in state["consensus_hashes"] for h in _hs(plan_hash)):
         return False, "this plan already has a consensus at its current hash"
     if not _rounds_left(state):
         return False, "the rounds are spent: an objection that survives escalates, it does not restart"
@@ -229,9 +234,9 @@ def may_open_round(state, closing=False, plan_hash=None):
             return False, "an escalation is undecided"
         if state["open_blocking"]:
             return False, "blocking objections are still open: a closing round confirms a text nobody objects to"
-        if plan_hash is not None and (state["consensus_at"] or plan_hash in state["consensus_hashes"]):
+        if plan_hash is not None and (state["consensus_at"] or any(h in state["consensus_hashes"] for h in _hs(plan_hash))):
             return False, "this plan already has a consensus at its current hash"
-        if plan_hash is not None and plan_hash in state["closing_hashes"]:
+        if plan_hash is not None and any(h in state["closing_hashes"] for h in _hs(plan_hash)):
             return False, "a closing round already ran for this exact text"
         if state["closing_rounds"] >= MAX_CLOSING_ROUNDS:
             return False, "the %d closing rounds allowed since the last consensus are spent" % MAX_CLOSING_ROUNDS

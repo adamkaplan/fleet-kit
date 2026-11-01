@@ -213,7 +213,7 @@ def review_start(args, runner, now, socket_call=None):
             if entry.get("kind") == "round" and entry.get("plan_ref") == plan_ref and entry.get("lineage") != lineage:
                 raise ReviewError("%s is already under the review of %s: a plan does not move to another ask's count" % (plan_ref, entry["lineage"]))
         mine = [e for e in entries if e.get("lineage") == lineage]
-        ok, why = plan_review.may_start(plan_review.lineage_state(mine, plan_hash), plan_hash)
+        ok, why = plan_review.may_start(plan_review.lineage_state(mine, result["plan_hashes"]), result["plan_hashes"])
         if not ok:
             raise ReviewError("refused: %s" % why)
         day_ago = now() - 86400
@@ -381,7 +381,7 @@ def review_close(args, runner, now, socket_call=None):
         later = [e for e in ledger if e.get("kind") == "round" and e.get("review") == args.review and e.get("round") > rnd["round"]]
         if later:
             raise ReviewError("refused: round %d of this review is already open" % later[-1]["round"])
-        ok, why = plan_review.may_open_round(plan_review.lineage_state(mine, result["plan_hash"]), closing=True, plan_hash=result["plan_hash"])
+        ok, why = plan_review.may_open_round(plan_review.lineage_state(mine, result["plan_hashes"]), closing=True, plan_hash=result["plan_hashes"])
         if not ok:
             raise ReviewError("refused: %s" % why)
         return {"kind": "round", "lineage": rnd["lineage"], "review": args.review, "round": rnd["round"] + 1, "closing": True,
@@ -492,7 +492,7 @@ def review_respond(args, runner, now, socket_call=None):
     text, label, result = load_plan(ns, runner, now)
     if result["result"] != "pass":
         raise ReviewError("the new revision fails `plan check` (%d defect(s))" % len(result["defects"]))
-    if result["plan_hash"] == rnd["plan_hash"]:
+    if rnd["plan_hash"] in result["plan_hashes"]:
         raise ReviewError("the revision has the same plan hash: a new round needs a changed plan")
     plan_repo, plan_number, _ = parse_plan_source(args.plan_ref, config.get("intent_repo"))
     ask_repo, _, ask_number = rnd["lineage"].rpartition("#")
