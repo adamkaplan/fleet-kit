@@ -858,6 +858,68 @@ class TestEventWait(unittest.TestCase):
         print("S7: mutant fails %d of 1 with over-admitted and %d of 1 with a TimeoutError, control passes %d of 1, dead observation fails %d of 1 with the guard text, mutations applied %s" % (m_over, m_timeout, control, dead, applied))
         self.assertEqual((m_over, m_timeout, control, dead, applied), (1, 0, 1, 1, True))
 
+    def s13_run(self, transform=None, end_one=False):
+        """Run the saturation test (or a copy of its source, changed by `transform`) and return (failure text or None, its standard error, event lines)."""
+        import inspect, textwrap, re, contextlib
+        name = "test_real_constants_held_plus_slow_bodies_daemon_and_channel_alive"
+        src = textwrap.dedent(inspect.getsource(TestBoundsAndCaps.__dict__[name]))
+        ns = dict(globals())
+        if transform:
+            src = transform(src)
+        exec(compile(src, "<s13-copy>", "exec"), ns)
+        case = TestBoundsAndCaps(name)
+        real_held, err, text = Hub.held_call, io.StringIO(), None
+        if end_one:
+            def held(self_, *a, **kw):
+                if kw.get("who") == "pod-0" and kw.get("call_id") == "c0":
+                    return 200, "ended at once by construction"
+                return real_held(self_, *a, **kw)
+            Hub.held_call = held
+        try:
+            with contextlib.redirect_stderr(err):
+                try:
+                    ns[name](case)
+                except AssertionError as e:
+                    text = str(e)
+                finally:
+                    case.doCleanups()
+        finally:
+            Hub.held_call = real_held
+        lines = [l for l in err.getvalue().splitlines() if re.match(r"^\s*\d+\.\d{4} ", l)]
+        return text, err.getvalue(), lines
+
+    @staticmethod
+    def s13_check(text, lines):
+        """The failing copy must say why and print its ordered event log; raises with the anchored text when the log is missing."""
+        starts = [l for l in lines if " start held call " in l]
+        ends = [l for l in lines if " end held call " in l]
+        guard = [l for l in lines if "guard fired: " in l and "waits registered" in l]
+        times = [float(l.split()[0]) for l in lines]
+        if not (len(starts) >= 16 and len(ends) >= 1 and len(guard) == 1 and times == sorted(times)):
+            raise AssertionError("the event log was not printed")
+        if "a held relay call ended before all 16 were registered" not in (text or ""):
+            raise AssertionError("the copy did not fail with the early-end text: %r" % text)
+        return len(lines)
+
+    def test_s13_the_saturation_test_copy_that_ends_a_call_fails_with_its_event_log(self):
+        text, err, lines = self.s13_run()   # the CONTROL: the real test, unmutated, runs first
+        self.assertEqual((text, lines), (None, []), "the control failed or printed log lines:\n" + err)
+        text, err, lines = self.s13_run(end_one=True)
+        n = self.s13_check(text, lines)
+        first = [l for l in lines if "end held call" in l][0]
+        print("S13: copy that ends a call fails with the early-end text 1 of 1, %d ordered event lines (>= 17), guard line with registered waits %d of 1, real test passes %d of 1 with %d log lines, the ended call: %s" % (n, 1, 1, 0, first.strip()))
+        self.assertGreaterEqual(n, 17)
+        import textwrap, inspect
+        src = textwrap.dedent(inspect.getsource(TestBoundsAndCaps.__dict__["test_real_constants_held_plus_slow_bodies_daemon_and_channel_alive"]))
+        drop = r'sys.stderr.write("\n".join(elog[:]) + "\n"); shown[0] = len(elog)'
+        self.assertEqual(src.count(drop), 1)
+        text, err, lines = self.s13_run(lambda s: s.replace(drop, "pass"), end_one=True)
+        self.assertNotEqual(src.replace(drop, "pass"), src)
+        with self.assertRaises(AssertionError) as cm:
+            self.s13_check(text, lines)
+        print("S13 mutant: the copy without the log lines fails the check with %r, mutation applied True" % str(cm.exception))
+        self.assertEqual(str(cm.exception), "the event log was not printed")
+
     def test_s5_control_passes_and_existing_cap_mutant_is_caught(self):
         name = "test_real_constants_held_plus_slow_bodies_daemon_and_channel_alive"
         res = unittest.TestResult(); TestBoundsAndCaps(name).run(res)
