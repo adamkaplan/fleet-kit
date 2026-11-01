@@ -374,15 +374,17 @@ def as_current(entries, hashes):
     (`hashes` is plan_check.plan_hashes(text)); every other value stays as it is, and the ledger itself is never rewritten."""
     if not hashes or len(hashes) < 2:
         return entries
-    new, old = hashes[0], hashes[1]
-    old_head, new_head = ask_head(old), ask_head(new)
+    new = hashes[0]
+    olds = set(hashes[1:]) - {new}
+    old_heads = {ask_head(o) for o in olds}
+    new_head = ask_head(new)
     out = []
     for entry in entries:
-        if entry.get("plan_hash") == old or entry.get("head") == old_head:
+        if entry.get("plan_hash") in olds or entry.get("head") in old_heads:
             entry = dict(entry)
-            if entry.get("plan_hash") == old:
+            if entry.get("plan_hash") in olds:
                 entry["plan_hash"] = new
-            if entry.get("head") == old_head:
+            if entry.get("head") in old_heads:
                 entry["head"] = new_head
         out.append(entry)
     return out
