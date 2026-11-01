@@ -2529,8 +2529,9 @@ class Launcher:
         out, now, live = [], self.clock(), []
         self.reap_results, self.last_hook = {}, None
         mono = time.monotonic
-        steps = self.step_seconds = {"list": 0.0, "renew": 0.0, "vanished": 0.0, "activity": 0.0, "activity_n": 0, "stops": 0.0, "stops_n": 0, "orphans": 0.0, "notes": 0.0, "total": 0.0}
+        steps = self.step_seconds = {"list": 0.0, "renew": 0.0, "vanished": 0.0, "activity": 0.0, "activity_n": 0, "stops": 0.0, "stops_n": 0, "orphans": 0.0, "notes": 0.0, "total": None}
         t_pass = t0 = mono()
+        steps["start"] = t_pass   # a pass that raises is measured from here at its finally
         try:
             pods = self.kube.list_pods()
         finally:
@@ -3538,7 +3539,7 @@ def step_text(st):
     if not st:
         return ""
     done = st["list"] + st["renew"] + st["vanished"] + st["activity"] + st["stops"] + st["orphans"] + st["notes"]
-    total = st["total"] or done   # a pass that raised never set its total: the seconds of the steps done
+    total = st["total"] if st["total"] is not None else time.monotonic() - st["start"]   # a pass that raised never set its total: the wall seconds from its start
     return " steps list=%.1f renew=%.1f vanished=%.1f activity=%.1f (%d) stops=%.1f (%d) orphans=%.1f notes=%.1f total=%.1f" % (
         st["list"], st["renew"], st["vanished"], st["activity"], st["activity_n"], st["stops"], st["stops_n"], st["orphans"], st["notes"], total)
 
