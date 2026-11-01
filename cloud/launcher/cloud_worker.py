@@ -1157,8 +1157,94 @@ def write_audit(path, line):
         fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
         with os.fdopen(fd, "a") as f:   # one short O_APPEND write: atomic enough for one line, the chosen guarantee
             f.write(json.dumps(line, sort_keys=True) + "\n")
+        _rotate_if_large(path)
     except OSError as e:
         print("cloud-worker: WARNING: the action ran but its audit line could not be written: %s" % e, file=sys.stderr)
+
+
+AUDIT_ROTATE_BYTES = 4 << 20   # an append that finds the live audit file larger than this rotates it (ask #1743)
+AUDIT_KEEP_BYTES = 1 << 20     # the live file keeps its newest lines up to this size (four times the window of last_audit_line)
+AUDIT_ARCHIVE_DAYS = 30        # archives (audit-<UTC date>.jsonl.gz) older than this are deleted
+_ROTATE_SAID = {}              # path -> the last rotation failure said (once per change of text)
+
+
+def rotate_audit(path, now=None, dry_run=False, _before_swap=None):
+    """Rotate the audit file when it is over AUDIT_ROTATE_BYTES: every line older than the newest AUDIT_KEEP_BYTES goes to
+    audit-<UTC date>.jsonl.gz (a temporary file and a rename, 0600) and the live file is replaced by its newest lines (a temporary file
+    and a rename); archives older than AUDIT_ARCHIVE_DAYS are deleted. Returns a dict (archive, lines, bytes, kept, pruned) or None when
+    nothing is due. A failure before the swap leaves the old file whole, removes the temporary files and says so once. dry_run writes nothing."""
+    import gzip
+    now = now or dt.datetime.now(dt.timezone.utc)
+    try:
+        if os.path.getsize(path) <= AUDIT_ROTATE_BYTES:
+            return None
+    except OSError:
+        return None
+    directory = os.path.dirname(path) or "."
+    temps = []
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+        pos = max(0, len(data) - AUDIT_KEEP_BYTES)
+        cut = pos if pos == 0 or data[pos - 1:pos] == b"\n" else data.find(b"\n", pos) + 1
+        if cut <= 0 or cut >= len(data):
+            return None
+        old = data[:cut]
+        stamp = now.astimezone(dt.timezone.utc)
+        archive = os.path.join(directory, "audit-%s.jsonl.gz" % stamp.strftime("%Y-%m-%d"))
+        if os.path.exists(archive):
+            archive = os.path.join(directory, "audit-%s.jsonl.gz" % stamp.strftime("%Y-%m-%dT%H%M%S"))
+        result = {"archive": os.path.basename(archive), "lines": old.count(b"\n"), "bytes": len(old), "kept": len(data) - cut, "pruned": 0}
+        if dry_run:
+            return result
+        gz_temp = archive + ".%d.tmp" % os.getpid()
+        temps.append(gz_temp)
+        with os.fdopen(os.open(gz_temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600), "wb") as raw:
+            with gzip.GzipFile(fileobj=raw, mode="wb", filename="", mtime=0) as packed:
+                packed.write(old)
+        keep_temp = os.path.join(directory, ".audit.%d.tmp" % os.getpid())
+        temps.append(keep_temp)
+        with open(path, "rb") as f:
+            f.seek(len(data))
+            late = f.read()   # lines appended while the archive was written travel with the live part
+        with os.fdopen(os.open(keep_temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600), "wb") as out:
+            out.write(data[cut:] + late)
+        os.rename(gz_temp, archive)
+        temps.append(archive)
+        if _before_swap:
+            _before_swap()
+        os.replace(keep_temp, path)
+        temps[:] = []
+    except Exception as e:
+        for t in temps:   # a swap that failed leaves the log whole: an archive would be a duplicate of it
+            try:
+                os.unlink(t)
+            except OSError:
+                pass
+        text = "%s: %s" % (type(e).__name__, e)
+        if _ROTATE_SAID.get(path) != text:
+            _ROTATE_SAID[path] = text
+            print("cloud-worker: the audit file could not be rotated (%s); it is kept whole" % text, file=sys.stderr)
+        return None
+    cutoff = stamp.timestamp() - AUDIT_ARCHIVE_DAYS * 86400
+    for name in sorted(os.listdir(directory)):
+        if name.startswith("audit-") and name.endswith(".jsonl.gz"):
+            try:
+                if os.lstat(os.path.join(directory, name)).st_mtime < cutoff:
+                    os.unlink(os.path.join(directory, name))
+                    result["pruned"] += 1
+            except OSError:
+                pass
+    return result
+
+
+def _rotate_if_large(path):
+    """The append's own check: a cheap size read, and the rotation when due. Never raises."""
+    try:
+        if os.path.getsize(path) > AUDIT_ROTATE_BYTES:
+            rotate_audit(path)
+    except Exception:
+        pass
 
 
 def last_audit_line(path, action, runtime_id=None):
