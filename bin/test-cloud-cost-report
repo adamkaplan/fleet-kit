@@ -426,7 +426,8 @@ def uncovered_names(text, module):
     return sorted(n for n in derive_launcher_names(text) if n not in module.ACTIONS and n not in module.SKIPPED)
 
 
-NOT_COSTED = ("create-attempt", "create.failed", "create.interrupted", "renew-git-token", "refresh-cluster-token", "ignored-setting-notice", "report")
+NOT_COSTED = ("create-attempt", "create.failed", "create.interrupted", "renew-git-token", "refresh-cluster-token", "ignored-setting-notice", "report",
+              "wip-note", "slow-reap-pass", "orphan-secret-removed", "reaper-restart")
 EVERY_LAUNCHER_ACTION = [
     line("2026-10-14T01:00:00Z", "pod/cb-example-1", "create", 0),
     line("2026-10-14T01:01:00Z", "pod/cb-example-1", "create-attempt", 0, ok=False),
@@ -437,6 +438,11 @@ EVERY_LAUNCHER_ACTION = [
     line("2026-10-14T02:30:00Z", "reaper", "refresh-cluster-token", 0, ok=False, worker=""),
     line("2026-10-14T02:31:00Z", "reaper", "ignored-setting-notice", 0, worker=""),
     line("2026-10-14T02:40:00Z", "pod/cb-example-1", "report", 0),
+    line("2026-10-14T02:41:00Z", "pod/cb-example-1", "wip-note", 0.5),
+    line("2026-10-14T02:42:00Z", "reaper", "slow-reap-pass", 0, ok=False, worker=""),
+    line("2026-10-14T02:43:00Z", "reaper", "orphan-secret-removed", 0, worker=""),
+    line("2026-10-14T02:44:00Z", "reaper", "orphan-secret-removed", 0, ok=False, worker=""),
+    line("2026-10-14T02:45:00Z", "reaper", "reaper-restart", 0, worker=""),
     line("2026-10-14T03:00:00Z", "pod/cb-example-1", "extend", 0),
     line("2026-10-14T04:00:00Z", "pod/cb-example-1", "stop", 0.25),
     line("2026-10-14T05:00:00Z", "pod/cb-example-4", "delete", 0, ok=False),
