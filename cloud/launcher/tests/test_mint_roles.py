@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import types
@@ -316,6 +317,9 @@ class LaunchSideMint(unittest.TestCase):
             src = mutated
         mod = types.ModuleType("launch_side_copy")
         mod.__file__ = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(self.mint))), "bin", "cloud_worker.py")
+        os.makedirs(os.path.dirname(mod.__file__), exist_ok=True)
+        for sibling in ("cloud_cluster.py", "path_walk.py"):   # the copy loads its cluster module from beside its own (faked) path: the real ones
+            shutil.copy(os.path.join(ROOT, "bin", sibling), os.path.dirname(mod.__file__))
         exec(compile(src, mod.__file__, "exec"), mod.__dict__)
         mod._capture = lambda argv, env=None: (lambda p: (p.returncode, p.stdout, p.stderr))(
             subprocess.run(argv, env=env, capture_output=True, text=True))   # the module's own capture needs the switchboard's names: a plain run here
