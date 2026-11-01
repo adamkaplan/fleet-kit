@@ -1747,6 +1747,108 @@ class TestNeedsDocker(Base):   # #1488
         self.assertEqual(failing, 1, done.stdout + done.stderr)
 
 
+class TestKeptRetireNamesTheSave(Base):   # #1791
+    SENTENCE = "send the pod one message to commit its tree on a NEW branch and push it there plainly, read the branch from origin, then retire normally"
+    FORCE = "(only if there is nothing to save, `cloud-worker delete coder7 --force` is the explicit last resort: it discards the pod and its work)"
+    GUARD = 'sys.stderr.write(recover + "\\n" + hint + "\\n")'
+
+    def prompts(self):
+        return [b for m, path, b in self.remote.bodies if m == "POST" and path.endswith("/prompt")]
+
+    def kept(self):
+        self.assertEqual(self.launch()[0], 0)
+        before = len(self.prompts())
+        with mock.patch.dict(os.environ, {"STUB_STOP_EXIT": "1"}):
+            res = self.main("retire", "coder7")
+        return res, len(self.prompts()) - before
+
+    def check_order(self, err):
+        lines = [l for l in err.splitlines() if l.startswith("fleet-switchboard:")]   # the launcher's own ResourceWarning noise is not an answer line
+        self.assertEqual(len(lines), 2, err)   # both lines, no more
+        self.assertIn("NEW branch", lines[0], "the recover line must come first: " + err)
+        self.assertIn("--force", lines[1], "the force-delete line must come second, after the recover line: " + err)
+        self.assertLess(err.index("NEW branch"), err.index("--force"), "order of the two lines: recover before force-delete")
+
+    def test_s2_the_recover_line_comes_first_with_the_exact_command(self):
+        (code, out, err), _ = self.kept()
+        self.assertEqual(code, 1)
+        self.check_order(err)
+        first = [l for l in err.splitlines() if l.startswith("fleet-switchboard:")][0]
+        self.assertIn("send", first)
+        self.assertIn('fleet-switchboard send coder7 "', first)
+        self.assertIn("coder7-save", first)
+        self.assertNotIn("--issue", err)
+
+    def test_s3_u1_the_force_delete_sentence_and_the_stdout_line_are_unchanged(self):
+        (code, out, err), _ = self.kept()
+        self.assertEqual(err.count(self.FORCE), 1, "the force-delete hint is missing: " + err)
+        self.assertEqual(out, "coder7: pod kept\n")
+        self.assertEqual(code, 1)
+
+    def test_s4_u2_the_command_is_only_printed(self):
+        (code, out, err), sent = self.kept()
+        self.assertEqual(sent, 0)   # 0 messages sent by the retire call
+        self.assertEqual(err.count('fleet-switchboard send coder7 "'), 1)
+        self.assertGreaterEqual(err.count("coder7-save"), 1)
+        self.assertNotIn("--issue", err)
+
+    def test_s5_a_retire_that_pushed_prints_neither_line(self):
+        self.assertEqual(self.launch()[0], 0)
+        code, out, err = self.main("retire", "coder7")
+        self.assertEqual(code, 0, err)
+        self.assertEqual((err + out).count("NEW branch"), 0, "a retire that pushed printed the recover line")
+        self.assertEqual((err + out).count("--force"), 0, "a retire that pushed printed the force-delete line")
+
+    def test_s6_a_mutant_that_prints_the_force_hint_first_is_caught(self):
+        src = (BIN / "cloud_worker.py").read_text()
+        self.assertEqual(src.count(self.GUARD), 1)
+        scratch = Path(tempfile.mkdtemp(prefix="order-mutant-", dir=str(self.home)))   # a copy outside the repository
+        for sub_dir in ("bin", "cloud"):
+            shutil.copytree(str(BIN.parent / sub_dir), str(scratch / sub_dir), ignore=shutil.ignore_patterns("__pycache__"))
+        test = "TestKeptRetireNamesTheSave.test_s2_the_recover_line_comes_first_with_the_exact_command"
+        control = subprocess.run([sys.executable, str(scratch / "bin" / "test-cloud-worker"), test], capture_output=True, text=True, timeout=600)
+        self.assertEqual(control.returncode, 0, control.stdout + control.stderr)   # the unmutated copy passes first
+        (scratch / "bin" / "cloud_worker.py").write_text(src.replace(self.GUARD, 'sys.stderr.write(hint + "\\n" + recover + "\\n")'))
+        mutant = subprocess.run([sys.executable, str(scratch / "bin" / "test-cloud-worker"), test], capture_output=True, text=True, timeout=600)
+        out = mutant.stdout + mutant.stderr
+        failing = int(mutant.returncode != 0 and "the recover line must come first" in out)
+        print("%d of 1 mutants failing" % failing)
+        self.assertEqual(failing, 1, out)
+
+    def five_places(self, root):
+        norm = lambda t: " ".join(t.split())
+        sw = (root / "bin" / "fleet-switchboard").read_text().splitlines()
+        line = lambda key: norm(" ".join(l for l in sw if key in l))
+        return {"launch epilog": line("launch.epilog ="), "retire epilog": line("retire.epilog ="),
+                "coordination skill": norm((root / "skills" / "fleet-coordination" / "SKILL.md").read_text()),
+                "cloud worker interface": norm((root / "docs" / "cloud-worker-interface.md").read_text()),
+                "run_task.py": norm((root / "cloud" / "launcher" / "run_task.py").read_text())}
+
+    def check_five(self, places, sentence):
+        for name in ("launch epilog", "retire epilog", "coordination skill", "cloud worker interface", "run_task.py"):
+            self.assertIn(sentence, places[name], "the %s lacks the recover sentence" % name)
+
+    def test_s7_the_recover_sentence_is_in_all_five_places(self):
+        sentence = sb.load_module("cloud_worker").RECOVER_SENTENCE
+        self.assertEqual(sentence, self.SENTENCE)
+        self.check_five(self.five_places(BIN.parent), sentence)
+
+    def test_s8_a_sentence_changed_in_one_place_fails_naming_that_place(self):
+        sentence = sb.load_module("cloud_worker").RECOVER_SENTENCE
+        places = self.five_places(BIN.parent)
+        self.check_five(places, sentence)   # control: the unmutated places pass
+        failing = 0
+        for name in places:
+            mutated = dict(places)
+            mutated[name] = places[name].replace("plainly", "quietly")
+            try:
+                self.check_five(mutated, sentence)
+            except AssertionError as e:
+                failing += int(("the %s lacks the recover sentence" % name) in str(e))
+                print("mutant in %s fails with: %s" % (name, str(e).rsplit(" : ", 1)[-1]))
+        self.assertEqual(failing, 5, "each of the five mutants must fail naming its own place")
+
+
 if __name__ == "__main__":
     result = unittest.main(exit=False, verbosity=1).result
     print("RESULT: %s" % ("PASS" if result.wasSuccessful() else "FAIL"))
