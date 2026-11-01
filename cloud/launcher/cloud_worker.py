@@ -3535,13 +3535,20 @@ class RenewalTicker:
 
 
 def step_text(st):
-    """The seconds of the seven steps of a pass, for the pass line: numbers only, no name or value."""
-    if not st:
+    """The seconds of the seven steps of a pass, for the pass line: numbers only, no name or value.
+
+    Never raises (it runs inside a finally) and never prints a negative number: a bad dictionary gives the line without a step part."""
+    try:
+        if not st:
+            return ""
+        def sec(v):
+            return max(0.0, float(v))
+        total = st["total"] if st["total"] is not None else time.monotonic() - st["start"]   # a pass that raised never set its total: the wall seconds from its start
+        return " steps list=%.1f renew=%.1f vanished=%.1f activity=%.1f (%d) stops=%.1f (%d) orphans=%.1f notes=%.1f total=%.1f" % (
+            sec(st["list"]), sec(st["renew"]), sec(st["vanished"]), sec(st["activity"]), int(st["activity_n"]), sec(st["stops"]), int(st["stops_n"]),
+            sec(st["orphans"]), sec(st["notes"]), sec(total))
+    except Exception:
         return ""
-    done = st["list"] + st["renew"] + st["vanished"] + st["activity"] + st["stops"] + st["orphans"] + st["notes"]
-    total = st["total"] if st["total"] is not None else time.monotonic() - st["start"]   # a pass that raised never set its total: the wall seconds from its start
-    return " steps list=%.1f renew=%.1f vanished=%.1f activity=%.1f (%d) stops=%.1f (%d) orphans=%.1f notes=%.1f total=%.1f" % (
-        st["list"], st["renew"], st["vanished"], st["activity"], st["activity_n"], st["stops"], st["stops_n"], st["orphans"], st["notes"], total)
 
 
 def _reap_main(env, a, sleep, clock=None, refresher=None, kube=None, ticker_wait=None, tree=None):
