@@ -76,6 +76,20 @@ class Hub:
         body = {k: v for k, v in body.items() if v is not None}
         return self.call("POST", "/relay", body, who)
 
+    def held_call(self, who="pod-a", **over):
+        """relay_call through a connection with no client socket timeout: a held call is ended by an answer, not by a wall clock."""
+        body = {"call_id": "c1", "command": "prove", "pr": "acme-org/widget-service#12", "head": HEAD, "args": {"scenario": "S1"}}
+        body.update(over)
+        body = {k: v for k, v in body.items() if v is not None}
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=None)
+        h = {"Authorization": "Bearer " + (SECRETS.get(who) or who)} if who else {}
+        try:
+            conn.request("POST", "/relay", body=json.dumps(body).encode(), headers=h)
+            r = conn.getresponse()
+            return r.status, json.loads(r.read() or b"null")
+        finally:
+            conn.close()
+
     def daemon_answer(self, status=200, reason="", record=None):
         """The stub daemon: pull once, answer each pending request."""
         _, got = self.call("GET", "/relay/pending", who="daemon")
@@ -689,7 +703,7 @@ class TestEventWait(unittest.TestCase):
             self.addCleanup(release_all)
             def call(i, j, wait):
                 time.sleep(wait)
-                hub.relay_call(who="pod-%d" % i, call_id="c%d" % j, pr="acme-org/r%d#1" % i)
+                hub.held_call(who="pod-%d" % i, call_id="c%d" % j, pr="acme-org/r%d#1" % i)
             for n in range(16):
                 t = threading.Thread(target=call, args=(n // 4, n % 4, delay if n == 15 else 0)); t.start(); threads.append(t)
             def all_registered():
