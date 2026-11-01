@@ -153,6 +153,15 @@ def _open_regular(path):
     return None
 
 
+def _is_new_file(path, new_id):
+    """True when the live file's device and inode equal the new_id of a pending rotation."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return False
+    return isinstance(new_id, list) and new_id == [st.st_dev, st.st_ino]
+
+
 def _rotation_record(path, parse, size):
     """(rotations completed, [(cut, archive name)] oldest first, the last perhaps a begun one with no name yet) from the record beside the audit file;
     (0, []) when there is no record; None for one that is damaged, of the wrong shape or larger than 4096 bytes (the reader then behaves as before)."""
@@ -186,7 +195,7 @@ def _rotation_record(path, parse, size):
     if pending is not None:
         if not isinstance(pending, dict) or any(isinstance(pending.get(k), bool) or not isinstance(pending.get(k), int) or pending.get(k) < 0 for k in ("cut", "old_size")):
             return None
-        if size < pending["old_size"]:   # the replacement has happened: one more rotation
+        if _is_new_file(path, pending.get("new_id")):   # the replacement has happened (the live file is the file the rotation put in place): one more rotation
             return done + 1, entries + [(pending["cut"], pending.get("archive"))]
     return done, entries
 
