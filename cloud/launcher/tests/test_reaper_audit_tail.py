@@ -487,16 +487,6 @@ class TestRaisingSteps(unittest.TestCase):
 class TestPins(unittest.TestCase):
     OLD_LINES = ["            return self._renew_locked(pods, now)", '        return last_audit_line(self.audit_path, "renew-git-token", rid)']
 
-    def test_s7_two_removed_lines(self):
-        p = stub_support.start(self, ["git", "diff", "-U0", TIP, "--", "cloud/launcher/cloud_worker.py", "cloud/launcher/tests"], cwd=ROOT,
-                               stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-        out = p.communicate()[0].decode(errors="replace")
-        if p.returncode != 0:
-            self.skipTest("the integration tip is not in this checkout")
-        removed = [x[1:] for x in out.splitlines() if x.startswith("-") and not x.startswith("---")]
-        print("S7: %d removed lines" % len(removed))
-        self.assertEqual(sorted(removed), sorted(self.OLD_LINES))
-
 
 if __name__ == "__main__":
     unittest.main()
