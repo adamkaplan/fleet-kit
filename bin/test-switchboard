@@ -80544,6 +80544,28 @@ class TestHoldQueueGuards(HoldQueueRig):
         self.killed(self.check_tie, '(i["at"], i["seq"])', '(i["at"],)', "two messages with the same time are in seq order")
 
 
+class TestHoldQueueOverflowItem(HoldQueueRig):
+    """A queue file whose `at` passes the reader but overflows the age mark is audited once and skipped: it does not starve the next recipient."""
+
+    def setUp(self):
+        super().setUp()
+        self.world.add_agent("aaa", fleet={"role": "coder", "reports_to": "coder"})
+
+    def test_a_bad_at_does_not_starve_the_next_recipient(self):
+        self.hq.path(self.world.state, "aaa").write_text(json.dumps(
+            {"seq": 1, "items": [{"key": "bad", "from": "coder", "at": -1e300, "issue": None, "repo": None, "text": "x", "seq": 1}], "delivered": []}))
+        self.pane["status"] = "blocked"
+        self.assertEqual(self.main("send", "platform", "--from", "coder", "good")[0], 0)
+        self.pane["status"] = "idle"
+        report = {"errors": []}
+        out = self.world.engine.release_held(self.world.engine.discover(self.world.clock.now()), report)
+        self.assertEqual(out and [n for n, _ in out], ["platform"], msg="the next recipient's message is delivered, 1 of 1")
+        self.assertEqual(len(self.world.admissions("platform")), 1)
+        errors = [e for e in self.world.audit() if e["event"] == "error" and e.get("subject") == "aaa"]
+        self.assertEqual(len(errors), 1, msg="the bad one is audited once")
+        self.assertEqual([e["subject"] for e in report["errors"]], ["aaa"])
+
+
 class TestHoldQueueIdleAfterProviderError(Base):
     """An agent idle after a turn that ended on a provider error, with queued messages admitted at the end of its hold, is resumed once (#1337 covers it)."""
 

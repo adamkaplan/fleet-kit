@@ -3551,9 +3551,9 @@ class Switchboard:
                 continue
             for item in queue.waiting(self.state_dir, name):
                 now = self.now()
-                fact = Fact(item["key"], name, "send", queue.marked(item, now), item["at"], issue=item.get("issue"), batch=False,
-                            sender=item.get("from") if isinstance(item.get("from"), str) else None, repo=item.get("repo"))
                 try:
+                    fact = Fact(item["key"], name, "send", queue.marked(item, now), item["at"], issue=item.get("issue"), batch=False,
+                                sender=item.get("from") if isinstance(item.get("from"), str) else None, repo=item.get("repo"))
                     plan = self.plan(name, [fact], discovery, now)
                     if plan is None:   # its key is already in the recipient's transcript: delivered before, never again
                         queue.done(self.state_dir, name, item["key"])
