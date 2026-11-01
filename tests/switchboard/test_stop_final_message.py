@@ -206,6 +206,11 @@ class TestStopFinalMessage(unittest.TestCase):
     def test_U2_a_boss_that_is_not_a_name_gets_nothing(self):
         self.assertEqual(self.retire_run(0, reports_to="Bad Name!")[0], 0)
 
+    def test_U10_the_boss_name_is_the_agent_name_pattern(self):
+        for bad in ("1boss", "a.b", "a" * 33):
+            self.assertEqual(self.retire_run(0, reports_to=bad)[0], 0, "a boss named %r got a message" % bad)
+        self.assertEqual(self.retire_run(0, reports_to="chief-of-staff")[0], 1)
+
 
 class TestStopFinalMessageMutants(unittest.TestCase):
     """S6: the S3 check run on the control and on two mutants of cloud_end_alert.py, each in a fresh process (its exit code and text are read)."""
@@ -326,6 +331,22 @@ class TestStopFinalMessageTwoRuns(unittest.TestCase):
         self.assertEqual(len([t for t in later if "last text not read: no_run_record" in t]), 2, later)
         self.assertEqual(len([t for to, t in w.sent if "PLANTED" in t]), 0)
 
+
+    def test_U9_a_link_in_the_run_root_to_a_directory_outside_is_never_read(self):
+        w = StopWorld(self)
+        (w.cloud / "cb-1788a.json").write_text(json.dumps({"worker": "cb-1788a", "reports_to": "boss-lane"}))
+        outside = make_record(w.root / "elsewhere", "cb-1788a", "20261101T120000Z", "PLANTED through a link")
+        link = w.runs / "cb-1788a-20261101T120000Z-abc123"
+        os.symlink(str(outside), str(link))
+        got = self.retire_path(w, link)
+        self.assertEqual(len(got), 1, got)
+        self.assertTrue(got[0].endswith("\nlast text not read: no_run_record"), got[0])
+        self.assertEqual(sum(t.count("PLANTED through a link") for t in got), 0, got)
+        os.unlink(str(link))
+        real = make_record(w.runs, "cb-1788a", "20261101T120000Z", "its own text")
+        self.assertEqual(real, link)
+        got = self.retire_path(w, real)
+        self.assertEqual((len(got), got[-1].count("its own text")), (2, 1), got)
 
 class TestStopFinalMessageTwoRunsMutant(unittest.TestCase):
     """S10: the S9 check on the control and on a mutant that reads the newest record of the name, each in a fresh process."""
