@@ -6075,6 +6075,7 @@ ADOPT_BY_DAEMON = "the switchboard"
 # Every function that reads a worker's boss from the raw `reports_to` text, and why it may. Anything else must go through `boss_name` (the lookup that
 # resolves the role alias and the boss record). A test scans this file for `reports_to` readers and fails when one is not in this table.
 BOSS_READ_SITES = {
+    "bin/cloud_worker.py:cmd_retire": "a cloud worker's own endpoint record (not a discovered agent): its reports_to is read from the record the retire already holds and validated as an agent name; only the address of the one final message",
     "bin/fleet-switchboard:headless_target": "a retired worker is not discovered: its STORED metadata (boss record applied), resolved through `resolve_boss`, as `reattach_caller_problem` does",
     "bin/lost_worker.py:_losses": "a cloud worker is not discovered: the launching lane is the `reports_to` text of its own cloud record, only the address of an alert (the loss is told to the Chief of Staff too)",
     "bin/switchboard/handoff.py:_boss_of": "the literal text; `boss_name` is built on it",
@@ -9625,7 +9626,8 @@ def cloud_end_tick(engine, discovery):
     return load_module("cloud_end_alert").scan_audit(cloud_audit_path(), Path(state_dir) / CLOUD_END_ALERT_FILE, Path(state_dir) / "cloud",
                                                      _read_small(state_dir, LAST_REPORT_FILE), lambda to, text: engine.send("switchboard", to, text),
                                                      load_module("record_json").parse_bounded,
-                                                     lambda worker, detail: engine.audit is not None and engine.audit.append(engine.actor, "cloud_end_alert.send_failed", worker, detail))
+                                                     lambda worker, detail: engine.audit is not None and engine.audit.append(engine.actor, "cloud_end_alert.send_failed", worker, detail),
+                                                     lambda directory, worker: load_module("cloud_worker").bind(globals())._retired().last_message(directory, state_dir, worker))
 
 
 def cloud_turn_activity(worker):
