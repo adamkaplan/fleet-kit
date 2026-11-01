@@ -422,6 +422,7 @@
         "bin/spotlight_guard.py",
         "bin/triage_digest.py",
         "bin/turn_start.py",
+        "bin/unconsumed_record.py",
         "bin/work_sync.py",
         "bin/switchboard/plan_input.py",
         "bin/switchboard/v2_transport.py",
@@ -452,6 +453,9 @@
           "*"
         ],
         "bin/turn_start.py": [
+          "*"
+        ],
+        "bin/unconsumed_record.py": [
           "*"
         ],
         "bin/awaiting_live.py": [
