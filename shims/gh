@@ -1473,11 +1473,25 @@ def passed_copy(args, index, inline, value, text):
 def input_call(args, name, found):
     index, inline, value = found
     text, data = read_input_json(value)
-    if not isinstance(data, dict) or "body" not in data:
+    if not isinstance(data, dict):
+        raise Refused("the --input JSON is not an object (an array or a scalar), so its body cannot be found and signed: send a JSON object")
+    signed = False
+    for key in [k for k in data if isinstance(k, str) and k.lower() == "body"]:
+        if not isinstance(data[key], str):
+            raise Unsignable("the --input body is not a string")
+        data[key] = sign(data[key], name)
+        signed = True
+    for key in [k for k in data if isinstance(k, str) and k.lower() == "comments"]:
+        if not isinstance(data[key], list) or not all(isinstance(item, dict) for item in data[key]):
+            raise Refused("the --input comments is not a list of objects, so the bodies in it cannot be signed")
+        for item in data[key]:
+            for sub in [k for k in item if isinstance(k, str) and k.lower() == "body"]:
+                if not isinstance(item[sub], str):
+                    raise Unsignable("the --input comment body is not a string")
+                item[sub] = sign(item[sub], name)
+                signed = True
+    if not signed:
         return passed_copy(args, index, inline, value, text)
-    if not isinstance(data["body"], str):
-        raise Unsignable("the --input body is not a string")
-    data["body"] = sign(data["body"], name)
     out = json.dumps(data)
     new = list(args)
     if value == "-":
@@ -2066,6 +2080,11 @@ def api_decide(args, namer, previous):
             api_refuse_unknown(effective or "(no method)", "the endpoint (%s)" % raw[:60])
         if effective not in found[1]:
             api_refuse_unknown(effective or "(no method)", "the endpoint %s (%s allows %s)" % (raw[:60], found[0], "/".join(found[1])))
+        if found[2] and effective in ("POST", "PATCH"):
+            query = raw.partition("#")[0].partition("?")[2]
+            for key in [part.partition("=")[0] for part in query.split("&") if part] + [f.partition("=")[0] for f in fields]:
+                if (key != "body" or key in [part.partition("=")[0] for part in query.split("&")]) and re.search(r"(?i)(^|\[)body\]?$", key):
+                    raise Refused("a body written as %s (a nested key, another case, or the URL query string) on a comment or review endpoint cannot be signed: send it as -f body=... or --input with a JSON object" % key[:40])
         if found[2] and len(api_parse(args)[2]) != len(fields):
             raise Refused("the flags of this gh api call to a comment or review endpoint cannot be read, so its body cannot be signed and nothing was posted")
     if any(api_raw_path(p) == "graphql" for p in raw_positionals):
