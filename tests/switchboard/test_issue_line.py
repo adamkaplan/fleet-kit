@@ -335,4 +335,19 @@ def build():
             self.assertNotIn("old0000.json", names)
             self.assertIn("old0001.json", names)
 
+        # -- S11: the docs and the two skills name the three statements
+
+        STATEMENTS = (r"is the way to change one line of an issue body", r"whole-body write must keep the .{0,30}Intent.{0,60}Done when:.{0,40}gh shim refuses",
+                      r"never changes the Intent or the Done-when")
+
+        def test_s11_the_docs_section_and_the_two_skills_name_the_three_statements(self):
+            docs = (REPO_ROOT / "docs" / "switchboard.md").read_text()
+            section = docs[docs.index("## `issue-line`"):]
+            places = [("docs", section)] + [(name, (REPO_ROOT / "skills" / name / "SKILL.md").read_text()) for name in ("fleet-charter", "fleet-coordination")]
+            for name, text in places:
+                for statement in self.STATEMENTS:
+                    with self.subTest(place=name, statement=statement):
+                        self.assertRegex(" ".join(text.split()), statement)
+                self.assertIn("fleet-switchboard issue-line", text)
+
     return TestIssueLine
