@@ -1404,7 +1404,7 @@ class Kube:
             with open(token_file) as f:
                 body = f.read(65536)
             usable = bool(body.strip())
-            self.add_secrets(body.strip())
+            self.add_secrets(body.strip(), life=secret_life_until())
         except OSError:
             usable = False
         if not usable:
