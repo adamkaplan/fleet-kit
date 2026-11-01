@@ -80077,6 +80077,56 @@ class TestHoldQueue(Base):
                 self.assertTrue(result.failures or result.errors, "the mutant %r survives %s" % (name, test))
 
 
+class TestHoldQueueUnreadableFile(Base):
+    """An unreadable but PRESENT queue file is never overwritten: the next send is refused, the bytes stay, the queue is back when it is repaired (#1400)."""
+
+    CASES = {
+        "truncated": lambda q: b'{"seq": 1, "items": [{"key": "k1", "te',
+        "too_deep": lambda q: b"[" * 5000 + b"]" * 5000,
+        "too_large": lambda q: b" " * (q.MAX_FILE + 1),
+    }
+
+    def setUp(self):
+        super().setUp()
+        self.state = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.state, True)
+
+    def check(self, q):
+        self.assertEqual(q.enqueue(self.state, "platform", "k1", "coder", "one", 1.0), (True, 1))
+        file = q.path(self.state, "platform")
+        good = file.read_bytes()
+        for label, make in self.CASES.items():
+            if True:
+                bad = make(q)
+                file.write_bytes(bad)
+                ok, why = q.enqueue(self.state, "platform", "k2", "coder", "two", 2.0)
+                self.assertFalse(ok)
+                self.assertRegex(why, r"^the queue file of platform is present but not readable \(.*\): nothing was queued and the file is untouched$")
+                self.assertEqual(file.read_bytes(), bad)
+                self.assertEqual(q.waiting(self.state, "platform"), [])
+                q.done(self.state, "platform", "k1")
+                self.assertEqual(file.read_bytes(), bad)
+                file.write_bytes(good)
+                self.assertEqual([i["key"] for i in q.waiting(self.state, "platform")], ["k1"])
+
+    def test_an_unreadable_present_file_is_never_overwritten(self):
+        self.check(sb.load_module("queued_sends"))
+
+    def test_the_mutant_that_reads_it_as_empty_is_caught(self):
+        q = sb.load_module("queued_sends")
+        self.check(q)   # the control passes
+        source = Path(q.__file__).read_text()
+        start = source.index("def _read(file):")
+        end = source.index("def _write(")
+        func = source[start:end]
+        mutant = source[:start] + func.replace("return None", "return empty") + source[end:]
+        module = types.ModuleType("queued_sends_mutant")
+        module.__file__ = q.__file__
+        exec(compile(mutant, q.__file__, "exec"), module.__dict__)
+        with self.assertRaisesRegex(AssertionError, r"^True is not false"):
+            self.check(module)
+
+
 class TestHoldQueueIdleAfterProviderError(Base):
     """An agent idle after a turn that ended on a provider error, with queued messages admitted at the end of its hold, is resumed once (#1337 covers it)."""
 
