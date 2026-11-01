@@ -868,6 +868,33 @@ def content_hash(scenarios, clauses, text=""):
     return "sha256:" + hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
+_TRAILING_MARKER = re.compile(r"<!-- fleet-switchboard:from=[^\s>]+ -->")
+
+
+def plan_hash_legacy(text):
+    """The old formula: sha256 of the WHOLE plan text, whitespace collapsed (the trailing marker line included)."""
+    return "sha256:" + hashlib.sha256(" ".join((text or "").split()).encode("utf-8")).hexdigest()
+
+
+def _without_trailing_marker(text):
+    """(#1713) The text without ONE trailing marker line (the last non-blank line, only when it is exactly the marker)."""
+    lines = (text or "").rstrip().split("\n")
+    if lines and _TRAILING_MARKER.fullmatch(lines[-1].strip()):
+        return "\n".join(lines[:-1])
+    return text or ""
+
+
+def plan_hashes(text):
+    """(new, old) for a text with a trailing marker line; (new,) when it has none."""
+    new, old = plan_hash(text), plan_hash_legacy(text)
+    return (new,) if new == old else (new, old)
+
+
+def canonical_hash(stored, hashes):
+    """The NEW hash when `stored` is a member of `hashes`; `stored` itself otherwise."""
+    return hashes[0] if hashes and stored in hashes else stored
+
+
 def plan_hash(text):
     """sha256 of the WHOLE plan text, whitespace collapsed. Approval (G0c) and consensus (G0b) bind to this one: an edit
     to constraints, scope or risks changes it as well as an edit to a scenario."""
