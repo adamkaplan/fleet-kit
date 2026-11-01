@@ -65924,6 +65924,9 @@ TestEveryTestFileIsWired, TestWiredCheckPlanted, TestMutantIsCaught = (_wm := im
 # The counting tool of the test split (S13a of #1092).
 _count_movable = importlib.import_module("test_count_movable")
 TestCountMovable = _count_movable.TestCountMovable
+# The guard of unused imports in the support modules (#1806).
+_support_imports = importlib.import_module("test_support_imports")
+TestFakeSupportModule, TestSupportImportsMutant, TestSupportImportsScratch, TestSupportImportsReal = _support_imports.TestFakeModule, _support_imports.TestMutant, _support_imports.TestScratchDirectory, _support_imports.TestRealDirectory
 
 # The census of process kinds (#1501).
 _census = importlib.import_module("test_github_census")
