@@ -67344,7 +67344,9 @@ TestCiTestFileList = _ci_test_files.TestCiTestFileList
 TestTempJanitorScratch = importlib.import_module("test_scratch").build(TestTempJanitor)
 # The last message of a stopped pod goes to its boss (#1788).
 _stop_final = importlib.import_module("test_stop_final_message")
-TestStopFinalMessage, TestStopFinalMessageMutants = _stop_final.TestStopFinalMessage, _stop_final.TestStopFinalMessageMutants
+TestStopFinalMessage, TestStopFinalMessageMutants, TestStopFinalMessageTwoRuns, TestStopFinalMessageTwoRunsMutant = (
+    _stop_final.TestStopFinalMessage, _stop_final.TestStopFinalMessageMutants, _stop_final.TestStopFinalMessageTwoRuns,
+    _stop_final.TestStopFinalMessageTwoRunsMutant)
 
 # The delivery-lag tests of #1402.
 _delivery_lag = importlib.import_module("test_delivery_lag")
