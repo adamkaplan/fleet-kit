@@ -192,6 +192,17 @@ class TestLostWorker(unittest.TestCase):
         for kind in load().KINDS:
             self.assertIn("`%s`" % kind, section)
 
+    def test_the_recency_rule_and_its_state_are_documented_and_present(self):
+        import ast
+        tree = ast.parse((REPO / "bin" / "lost_worker.py").read_text())
+        strings = {n.value for n in ast.walk(tree) if isinstance(n, ast.Constant) and isinstance(n.value, str)}
+        text = (REPO / "docs" / "switchboard.md").read_text()
+        section = text[text.index("## A lost worker is announced"):].split("\n## ", 1)[0]
+        for name in ("reaper_outage", "reaper_gap", "catchup", "reaper_new"):
+            self.assertIn(name, strings)
+        for name in ("reaper_outage", "reaper_gap", "catchup", "RECENT_SECONDS", "READ_BYTES"):
+            self.assertIn("`%s`" % name, section)
+
 
 class TestLostWorkerReadRound(unittest.TestCase):
     def rig(self, memory=True):
@@ -273,6 +284,339 @@ class TestLostWorkerReadRound(unittest.TestCase):
         r.passes()
         r.alive.clear()
         self.assertIn("possibly lost", r.passes(at=NOW + 10)[0]["text"])
+
+    def pad(self, path, size, key="launcher"):
+        """Filler lines (no loss in them) until the file grows by at least `size` bytes."""
+        written = 0
+        with open(path, "a") as handle:
+            while written < size:
+                if key == "launcher":
+                    text = json.dumps({"ts": stamp(NOW - 50000), "worker": "fill", "runtime_id": "pod/fill", "action": "send", "ok": True, "reason": "x" * 200}) + "\n"
+                else:
+                    text = json.dumps({"ts": stamp(NOW - 50000), "actor": "x", "event": "x.pad", "subject": "pad", "detail": {"n": "x" * 200}}) + "\n"
+                handle.write(text)
+                written += len(text)
+
+    def failed(self, r, ago, reason="login failed"):
+        line(r.launcher, ts=stamp(NOW - ago), worker="", runtime_id="reaper", action="refresh-cluster-token", ok=False, reason=reason)
+
+    def reaper_texts(self, r):
+        return [m[1] for m in r.engine.sent if "kind=reaper_missed" in m[1] or m[1].startswith("[lost worker] reaper:")]
+
+    def big_old_audit(self, r):
+        """A launcher audit of about 3 MiB: 8 old failed reaper lines in three chunks, then one young failed line."""
+        for n in range(3):
+            self.failed(r, 5 * 3600 + n * 100, "old %d" % n)
+        self.pad(r.launcher, 1 << 20)
+        for n in range(3, 6):
+            self.failed(r, 4 * 3600 + n * 100, "old %d" % n)
+        self.pad(r.launcher, 1 << 20)
+        for n in range(6, 8):
+            self.failed(r, 2 * 3600 + n * 100, "old %d" % n)
+        self.pad(r.launcher, 1 << 20)
+        self.failed(r, 60, "young")
+
+    def test_s2_old_failed_reaper_lines_are_never_alerted_on_any_pass(self):
+        r = self.rig(memory=False)
+        self.big_old_audit(r)
+        self.assertGreater(os.stat(r.launcher).st_size, 3 * self.mod_read_bytes())
+        got = []
+        for _ in range(4):
+            got += r.passes()
+        texts = self.reaper_texts(r)
+        self.assertEqual(len(got), 2)
+        self.assertEqual(len([t for t in texts if t.startswith("[lost worker] reaper:")]), 1)
+        self.assertIn("8 failed reaper line(s)", [t for t in texts if t.startswith("[lost worker] reaper:")][0])
+        own = [t for t in texts if "kind=reaper_missed" in t]
+        self.assertEqual(len(own), 1)
+        self.assertIn("latest reason young", own[0])
+        self.assertNotIn("old", own[0].replace("[lost worker]", ""))
+
+    def mod_read_bytes(self):
+        return load().READ_BYTES
+
+    def test_s3_one_outage_one_message_until_the_reaper_passes_again(self):
+        r = self.rig()
+        for n in range(5):
+            self.failed(r, 500 - n * 100, "login failed %d" % n)
+        got = r.passes()
+        self.assertEqual(len(got), 1)
+        text = got[0]["text"]
+        self.assertIn("5 failed reaper line(s)", text)
+        self.assertIn(stamp(NOW - 500)[:19], text)
+        self.assertIn(stamp(NOW - 100)[:19], text)
+        self.assertIn("latest reason login failed 4", text)
+        self.assertEqual(len(r.engine.sent), 1)
+        self.failed(r, 90)
+        self.failed(r, 80)
+        self.assertEqual(r.passes(), [])
+        self.assertEqual(len(r.engine.sent), 1)
+        line(r.launcher, ts=stamp(NOW - 70), worker="", runtime_id="reaper", action="refresh-cluster-token", ok=True, reason="")
+        self.failed(r, 60, "again")
+        got = r.passes()
+        self.assertEqual(len(got), 1)
+        self.assertIn("1 failed reaper line(s)", got[0]["text"])
+        self.assertEqual(len(r.engine.sent), 2)
+
+    def test_s4_catch_up_applies_the_recency_rule_to_every_kind(self):
+        r = self.rig(memory=False)
+        self.pad(r.engine.audit.path, 2 << 20, "switchboard")
+        self.pad(r.launcher, 1 << 20)
+        r.alive["oldloc"] = {"lane": "boss", "ask": "ask-9"}
+        got = r.passes(at=NOW - 3 * 3600)
+        state_path = os.path.join(r.dir, "lost-workers.json")
+        self.assertTrue(json.load(open(state_path))["catchup"])
+        r.alive.clear()
+        r.alive["newloc"] = {"lane": "boss", "ask": "ask-9"}
+        got += r.passes(at=NOW - 300)
+        r.alive.clear()
+        r.created("oldpod", deadline=NOW - 3 * 3600)
+        line(r.engine.audit.path, ts=stamp(NOW - 300), actor="x", event="cloud.created", subject="newpod", detail={"hard_deadline": stamp(NOW - 60)})
+        line(r.engine.audit.path, ts=stamp(NOW - 3 * 3600), actor="x", event="cloud.create_failed", subject="oldref", detail={})
+        line(r.engine.audit.path, ts=stamp(NOW - 100), actor="x", event="cloud.create_failed", subject="newref", detail={})
+        got += r.passes()
+        self.assertEqual(sorted((x["kind"], x["name"]) for x in got),
+                         [("local_worker", "newloc"), ("pod_no_stop", "newpod"), ("refused_launch", "newref")])
+        self.assertFalse(json.load(open(state_path))["catchup"])
+        line(r.engine.audit.path, ts=stamp(NOW - 3 * 3600), actor="x", event="cloud.created", subject="gap", detail={"hard_deadline": stamp(NOW - 60)})
+        self.assertEqual([x["name"] for x in r.passes()], ["gap"])   # outside a catch-up a restart gap is still alerted
+
+    def test_s6_a_detector_down_for_hours_says_once_how_many_it_missed(self):
+        r = self.rig()
+        for n in range(5):
+            self.failed(r, 3 * 3600 - n * 60, "gap %d" % n)
+        got = r.passes()
+        self.assertEqual(len(got), 1)
+        text = got[0]["text"]
+        self.assertTrue(text.startswith("[lost worker] reaper: 5 failed reaper line(s) while the detector was down or before this pass"))
+        self.assertIn("latest reason gap 4", text)
+        self.assertIn(stamp(NOW - 3 * 3600)[:19], text)
+        self.assertEqual(r.passes(), [])
+        self.failed(r, 30, "recent")
+        got = r.passes()
+        self.assertEqual(len(got), 1)
+        self.assertIn("kind=reaper_missed", got[0]["text"])
+        self.assertEqual(len(r.engine.sent), 2)
+
+    def test_u1_a_memory_written_by_the_old_code_is_never_re_alerted_from(self):
+        r = self.rig()
+        self.failed(r, 100)
+        size = os.stat(r.launcher).st_size
+        key = "refresh-cluster-token@" + stamp(NOW - 100)
+        with open(os.path.join(r.dir, "lost-workers.json"), "w") as handle:
+            json.dump({"offsets": {"launcher": size, "switchboard": 0}, "alerted": {"reaper_missed:" + key: {"ask": "-", "at": NOW}},
+                       "reaper": {key: {"at": NOW - 100, "line": "x"}}}, handle)
+        self.assertEqual(r.passes(2), [])
+        self.assertEqual(r.engine.sent, [])
+
+    def test_malformed_memory_is_dropped_and_alerting_goes_on(self):
+        import ast
+        module = load()
+        outage = {"first": NOW - 200, "latest": NOW - 100, "count": 2, "reason": "r", "sent": False, "closed_by": None}
+        gap = {"first": NOW - 9000, "latest": NOW - 8000, "count": 2, "reason": "r"}
+        bad_numbers = ["x", True, None, float("nan"), -1, 5e12, [1]]
+        table = [("reaper_outage", "wrong type", {"sent": False}), ("reaper_outage", "wrong type", "x"), ("reaper_outage", "wrong type", 5),
+                 ("reaper_gap", "wrong type", {"count": 3}), ("reaper_gap", "wrong type", [1]),
+                 ("reaper_new", "wrong type", 5), ("reaper_new", "wrong type", "x"), ("reaper_new", "wrong type", {"at": 1, "line": "x"}),
+                 ("reaper_new", "wrong type", [{"at": "x", "line": 1}, 7, [1]])]
+        for record, base, fields in (("reaper_outage", outage, ("first", "latest", "count", "reason", "sent", "closed_by")),
+                                     ("reaper_gap", gap, ("first", "latest", "count", "reason"))):
+            for field in fields:
+                for bad in (bad_numbers if field not in ("sent",) else ["x", 1, None]) + ([10 ** 30, 1.5, 0] if field == "count" else []) + ([5, None] if field == "reason" else []):
+                    table.append((record, field, dict(base, **{field: bad})))
+                if field not in ("closed_by",):
+                    table.append((record, field, {k: v for k, v in base.items() if k != field}))
+        # completeness from the code: every field a stored record is built with must be corrupted by some row above
+        tree = ast.parse((REPO / "bin" / "lost_worker.py").read_text())
+        built = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign) and isinstance(node.value, ast.Dict):
+                for target in node.targets:
+                    if isinstance(target, ast.Subscript) and isinstance(target.slice, ast.Constant) and target.slice.value in ("reaper_outage", "reaper_gap"):
+                        built.setdefault(target.slice.value, set()).update(k.value for k in node.value.keys if isinstance(k, ast.Constant))
+        for record, fields in built.items():
+            covered = {f for r, f, shape in table if r == record and f != "wrong type"}
+            self.assertEqual(fields, covered, record)
+        old_memory = [("old", {"reaper": {"k@t": {"at": NOW - 100, "line": "x"}}, "alerted": {"reaper_missed:k@t": {"ask": "-", "at": NOW}}}),
+                      ("old", {"alerted": {"reaper_missed:k@t": 5}})]
+        cases = [(r, shape) for r, f, shape in table] + old_memory
+        for record, shape in cases:
+            r = self.rig()
+            with open(os.path.join(r.dir, "lost-workers.json"), "w") as handle:
+                json.dump({"offsets": {}, "alerted": {}, record if record != "old" else "x": shape} if record != "old" else dict({"offsets": {}, "alerted": {}}, **shape), handle)
+            self.failed(r, 60, "recent")
+            for _ in range(2):
+                got = r.passes()   # a second pass: the memory written by the first must not wedge it either
+                if record != "old":
+                    self.assertTrue(got or self.reaper_texts(r), (record, shape))
+            if record != "old":
+                self.assertTrue(self.reaper_texts(r), (record, shape))
+        r = self.rig()   # a recent failed pod alerts on the same pass as a malformed record
+        with open(os.path.join(r.dir, "lost-workers.json"), "w") as handle:
+            json.dump({"offsets": {}, "alerted": {}, "reaper_outage": {"sent": False}, "reaper_gap": {"count": "x"}, "reaper_new": 5}, handle)
+        r.created("w1")
+        self.assertEqual([x["name"] for x in r.passes()], ["w1"])
+
+    BAD = [None, "x", 5, [1], {"a": 1}, True, 10 ** 30, {"a": {"b": [1]}}]
+    VALID = {"reaper_ok": [5], "catchup": [True], "stop": [{"a": 1}], "report": [{"a": 1}], "gone": [{"a": 1}]}   # the one bad value of the table that is a good value of that key
+    KEYS = ("offsets", "alerted", "created", "stop", "report", "refused", "seen", "gone", "reaper", "reaper_ok", "reaper_outage", "reaper_gap",
+            "reaper_new", "catchup")
+
+    def bad_table(self):
+        return {key: [b for b in self.BAD if not any(type(b) is type(v) and b == v for v in self.VALID.get(key, []))] for key in self.KEYS}
+
+    def keys_read(self):
+        """Every constant key the module reads or writes on the loaded memory (`state` or `data`), from the code."""
+        import ast
+        found = set()
+        for node in ast.walk(ast.parse((REPO / "bin" / "lost_worker.py").read_text())):
+            if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name) and node.value.id in ("state", "data") and isinstance(node.slice, ast.Constant):
+                found.add(node.slice.value)
+            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name) and node.func.value.id in ("state", "data")
+                    and node.func.attr in ("get", "setdefault", "pop") and node.args and isinstance(node.args[0], ast.Constant)):
+                found.add(node.args[0].value)
+            if isinstance(node, ast.Compare) and isinstance(node.left, ast.Constant) and any(isinstance(c, ast.Name) and c.id in ("state", "data") for c in node.comparators):
+                found.add(node.left.value)
+        return {k for k in found if isinstance(k, str)} - {"_gap_ready"}
+
+    def check_every_key(self, module):
+        """Raises when any bad value of any memory key makes a pass raise, is kept in the saved memory, or stops a recent failed reaper line alerting."""
+        global load
+        real, load = load, (lambda: module)
+        try:
+            table = self.bad_table()
+            unlisted = self.keys_read() - set(table)
+            self.assertEqual(unlisted, set(), "a memory key the code reads has no row in the bad-value table: %s" % sorted(unlisted))
+            self.assertEqual(set(module._CLEANERS), set(table))
+            for key, values in table.items():
+                for bad in values:
+                    probe = {key: json.loads(json.dumps(bad))}
+                    module._sanitize(probe)   # the one place the loaded memory is checked: the bad value does not come out of it
+                    self.assertNotEqual(probe.get(key, "<missing>"), bad, (key, bad))
+                    r = self.rig()
+                    with open(os.path.join(r.dir, "lost-workers.json"), "w") as handle:
+                        json.dump({"offsets": {}, "alerted": {}, key: bad}, handle)
+                    line(r.launcher, ts=stamp(NOW - 500), worker="", runtime_id="reaper", action="refresh-cluster-token", ok=True, reason="")
+                    self.failed(r, 60, "recent")
+                    r.created("w1", deadline=NOW + 600)
+                    r.alive["loc"] = {"lane": "boss", "ask": "ask-9"}
+                    for _ in range(2):   # the second pass reads what the first wrote
+                        r.passes()
+                    self.assertTrue(self.reaper_texts(r), (key, bad))
+                    saved = json.load(open(os.path.join(r.dir, "lost-workers.json")))
+                    self.assertNotEqual(saved.get(key, "<missing>"), bad, (key, bad))
+        finally:
+            load = real
+
+    def test_every_memory_key_is_cleaned_in_one_place_and_the_table_is_complete_by_construction(self):
+        self.check_every_key(load())
+
+    def test_skipping_the_check_of_any_one_memory_key_is_caught(self):
+        src = (REPO / "bin" / "lost_worker.py").read_text()
+        for key in self.KEYS:
+            old = '    "%s": ' % key
+            start = src.index(old, src.index("_CLEANERS = {"))
+            end = src.index(",\n", start)
+            mutant = self.mutant(src[start:end + 2], old + "(lambda v: v),\n")
+            with self.assertRaises(Exception, msg=key):
+                self.check_every_key(mutant)
+
+    def test_the_catch_up_flag_is_set_only_with_no_usable_memory(self):
+        r = self.rig()   # a valid memory, an audit more than one chunk behind
+        self.pad(r.engine.audit.path, 3 << 19, "switchboard")
+        state_path = os.path.join(r.dir, "lost-workers.json")
+        self.assertEqual(r.passes(), [])
+        self.assertFalse(json.load(open(state_path))["catchup"])
+        r.created("restart-gap")   # an old loss in the second chunk
+        self.assertEqual([x["name"] for x in r.passes()], ["restart-gap"])
+        self.assertFalse(json.load(open(state_path))["catchup"])
+
+    def test_a_launcher_file_that_exists_but_cannot_be_read_is_not_the_end(self):
+        for make in (lambda p: os.symlink(os.path.join(os.path.dirname(p), "nowhere"), p), os.mkdir):
+            r = self.rig(memory=False)
+            os.unlink(r.launcher)
+            make(r.launcher)
+            state_path = os.path.join(r.dir, "lost-workers.json")
+            r.passes()
+            self.assertTrue(json.load(open(state_path))["catchup"])
+            if os.path.isdir(r.launcher):
+                os.rmdir(r.launcher)
+            else:
+                os.unlink(r.launcher)
+            open(r.launcher, "w").close()
+            r.created("oldpod", deadline=NOW - 3 * 3600)
+            self.assertEqual(r.passes(), [])   # read with the rule still on: the old loss is skipped
+            self.assertFalse(json.load(open(state_path))["catchup"])
+        r = self.rig(memory=False)   # a missing file is the end
+        os.unlink(r.launcher)
+        r.passes()
+        self.assertFalse(json.load(open(os.path.join(r.dir, "lost-workers.json")))["catchup"])
+
+    def mutant(self, old, new, extra=()):
+        src = (REPO / "bin" / "lost_worker.py").read_text()
+        for a, b in ((old, new),) + tuple(extra):
+            self.assertEqual(src.count(a), 1, a)
+            src = src.replace(a, b)
+        path = os.path.join(tempfile.mkdtemp(), "lost_worker_mutant.py")
+        with open(path, "w") as handle:
+            handle.write(src)
+        spec = importlib.util.spec_from_file_location("lost_worker_mutant", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def failing_tests(self, module):
+        """The new tests that fail when they run against `module`."""
+        failed = []
+        for name in ("test_s2_old_failed_reaper_lines_are_never_alerted_on_any_pass", "test_s3_one_outage_one_message_until_the_reaper_passes_again",
+                     "test_s6_a_detector_down_for_hours_says_once_how_many_it_missed", "test_s4_catch_up_applies_the_recency_rule_to_every_kind"):
+            global load
+            real = load
+            load = lambda: module
+            try:
+                case = TestLostWorkerReadRound(name)
+                getattr(case, name)()
+            except AssertionError:
+                failed.append(name)
+            finally:
+                load = real
+        return failed
+
+    def test_the_new_tests_pass_on_the_real_module_and_each_mutant_is_caught(self):
+        self.assertEqual(self.failing_tests(load()), [])
+        mutants = {
+            "recency only on the first pass": self.mutant("    _reaper(state, now)\n", "    _reaper(state, now if first else 0)\n"),
+            "one message per line": self.mutant('"key": "reaper_missed:outage@%s" % outage["first"]', '"key": "reaper_missed:outage@%s:%d" % (outage["first"], outage["count"])',
+                                                (('            outage["count"] += 1\n', '            outage["count"] += 1\n            outage["sent"] = False\n'),)),
+            "one message per old line": self.mutant('    if isinstance(gap, dict) and gap.get("count") and state.get("_gap_ready"):',
+                                                    '    for _i in range(gap["count"] if isinstance(gap, dict) and gap.get("count") and state.get("_gap_ready") else 0):',
+                                                    (('"key": "reaper_gap:%s:%s:%d" % (gap["first"], gap["latest"], gap["count"])',
+                                                      '"key": "reaper_gap:%s:%s:%d:%d" % (gap["first"], gap["latest"], gap["count"], _i)'),)),
+            "old lines dropped with no summary": self.mutant('state["_gap_ready"] = at_end', 'state["_gap_ready"] = False'),
+        }
+        for label, module in mutants.items():
+            self.assertTrue(self.failing_tests(module), label)
+        named = ("test_malformed_memory_is_dropped_and_alerting_goes_on", "test_the_catch_up_flag_is_set_only_with_no_usable_memory",
+                 "test_a_launcher_file_that_exists_but_cannot_be_read_is_not_the_end")
+        self.assertEqual(self.failing_named(load(), named), [])
+        for name, module in (("validation removed", self.mutant("def _sanitize(state):\n", "def _sanitize(state):\n    return\n")),
+                             ("flag set on every pass", self.mutant('(first or state.get("catchup") is True) and not at_end', "not at_end")),
+                             ("unreadable file is the end", self.mutant("return False   # a file that exists", "return True   # a file that exists"))):
+            self.assertTrue(self.failing_named(module, named), name)
+
+    def failing_named(self, module, names):
+        failed = []
+        for name in names:
+            global load
+            real = load
+            load = lambda: module
+            try:
+                getattr(TestLostWorkerReadRound(name), name)()
+            except Exception:
+                failed.append(name)
+            finally:
+                load = real
+        return failed
 
 
 class TestLostWorkerMemoryOnly(unittest.TestCase):

@@ -10,7 +10,7 @@ from support.loader import captured, sb
 from support.wire_fakes import FAKE_HERDR, FAKE_OPENCODE
 
 REPO = Path(__file__).resolve().parents[2]
-World = None   # set by bin/test-switchboard: World lives in the entry file
+from support.herdr_world import World
 
 
 class TestSentView(Base):

@@ -5,7 +5,7 @@ from support.core import Base
 from support.loader import sb
 from support.wire_fakes import EPOCH
 
-World = None   # set by bin/test-switchboard: World lives in the entry file
+from support.herdr_world import World
 
 
 class PresentHub:
