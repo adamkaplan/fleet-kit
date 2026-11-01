@@ -542,6 +542,7 @@ class TestLauncherNamesAreKnown(unittest.TestCase):
         self.assertEqual((raises, stops, code, failure_lines), (0, 0, 2, 1))
         print("S3 tolerant readers: %d of 2, raises %d, stops %d, report failure line %d" % (2 - raises, raises, stops, failure_lines))
 
+    def tail_cases(self):
         good = json.dumps(line("2026-10-14T06:00:00Z", "pod/cb-example-4", "stop", 1.0)) + "\n"
         later = json.dumps(line("2026-10-14T07:00:00Z", "pod/cb-example-5", "create", 0)) + "\n"
         nofield = json.loads(good)
