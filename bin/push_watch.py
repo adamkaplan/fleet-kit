@@ -22,6 +22,7 @@ PASS_WORKERS_MAX = 20   # workers read per pass; the rest wait (rotating)
 DENIED_BRANCHES = ("main", "master", "integration", "HEAD")
 DEFAULTS = {"enabled": True, "interval": 60, "quiet_minutes": 10}
 _LAST_RUN = {}
+_CORRUPT = []   # state paths found unreadable by the last _load (drained by run_pass)
 
 
 def settings(config):
@@ -54,8 +55,10 @@ def _load(sb, path):
             data = sb.parse_bounded(handle.read(READ_BYTES))
         if isinstance(data, dict) and isinstance(data.get("workers"), dict):
             return data
-    except Exception:   # a missing or corrupt file: an empty state, one audit pass, never an error into the daemon
-        pass
+    except FileNotFoundError:
+        return {"workers": {}, "offset": None, "stopped": {}, "reported": {}}
+    except (OSError, ValueError):   # a corrupt or too deep file (parse_bounded raises ValueError only): an empty state, audited by the pass
+        _CORRUPT.append(path)
     return {"workers": {}, "offset": None, "stopped": {}, "reported": {}}
 
 
@@ -88,7 +91,7 @@ def _read_launcher(sb, path, state, parse_iso):
     for chunk in raw[:end + 1].split(b"\n"):
         try:
             item = sb.parse_bounded(chunk.decode("utf-8", "replace"))
-        except Exception:
+        except ValueError:
             continue
         if not isinstance(item, dict) or not isinstance(item.get("worker"), str) or item.get("ok") is not True:
             continue
@@ -134,7 +137,10 @@ def run_pass(sb, engine, now, gh, config=None, launcher_audit=None):
     if now - _LAST_RUN.get(path, -1e18) < cfg["interval"]:
         return []
     _LAST_RUN[path] = now
+    del _CORRUPT[:]
     state = _load(sb, path)
+    if _CORRUPT:
+        engine.audit.append(engine.actor, "push_watch.load_failed", None, {"why": "the state file is not readable JSON: starting from an empty state"})
     for key in ("stopped", "reported"):
         state.setdefault(key, {})
     _read_launcher(sb, launcher_audit or os.environ.get("CW_CLOUD_AUDIT") or os.path.join(

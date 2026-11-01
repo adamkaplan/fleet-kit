@@ -418,6 +418,8 @@ class TestPushWatch(Case):
         self.run_pass(NOW + 700, module)
         self.engine.send = ok
         self.run_pass(NOW + 800, module)
+        self.run_pass(NOW + 900, module)   # told exactly once after the success: nothing more
+        self.run_pass(NOW + 1000, module)
         return [t for t in self.to("lane-a") if "quiet" in t]
 
     def test_fix3_pc4_a_failed_quiet_send_is_retried_at_the_next_pass(self):
@@ -478,6 +480,28 @@ class TestPushWatch(Case):
         mutant = self.mutant('state["cursor"] = live.index(current)', 'pass')
         self._fails(lambda: self.assertEqual(self._rotation(mutant)[:3], ["w2", "w3", "w4"], "the workers after the stop were not read first"), "the workers after the stop were not read first")
 
+
+    def _load_case(self, text, module=None, reader=None):
+        self.setUp()
+        if reader:
+            self.ns.parse_bounded = reader
+        self.world.refs = {"w-a/wip": SHA_A}
+        state = Path(self.tmp.name) / "push-watch.json"
+        state.write_text(text)
+        self.run_pass(NOW, module)
+        return [l for l in self.engine.audit.lines if l[0] == "push_watch.load_failed"]
+
+    def test_fix3_load_corrupt_and_too_deep_give_one_audit_line_and_a_programming_error_propagates(self):
+        deep = lambda t: (_ for _ in ()).throw(ValueError("nested too deep")) if t.startswith("[[") else json.loads(t)
+        self.assertEqual(len(self._load_case("{not json")), 1)
+        self.assertEqual(len(self.to("lane-a")), 1)   # an empty state: audited once, the pass went on
+        self.assertEqual(len(self._load_case("[[[[", reader=deep)), 1)
+        self.assertEqual(len(self.to("lane-a")), 1)
+        boom = lambda t: (_ for _ in ()).throw(RuntimeError("bug"))
+        with self.assertRaises(RuntimeError):
+            self._load_case("{}", reader=boom)
+        broad = self.mutant("except (OSError, ValueError):   # a corrupt", "except Exception:   # a corrupt")
+        self._fails(lambda: self._load_case("{}", broad, boom) and None or (_ for _ in ()).throw(AssertionError("a RuntimeError of the reader was swallowed as an empty state")), "a RuntimeError of the reader was swallowed as an empty state")
 
 if __name__ == "__main__":
     unittest.main()
