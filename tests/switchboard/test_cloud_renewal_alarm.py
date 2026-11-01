@@ -232,7 +232,32 @@ def s16e(module):
         w.close()
 
 
+def s21(module):
+    w = AlarmWorld(module, {"worker-1": "lane-a", "worker-2": "lane-a", "worker-3": "lane-a"})
+    try:
+        w.line(T0 - 5, "worker-1", False, "before the clock")
+        w.line(T0 + 1, "worker-2", False, "one second ahead")
+        w.line(T0 + 240, "worker-3", False, "four minutes ahead")
+
+        def cursor():
+            with open(os.path.join(w.dir, module.STATE_FILE)) as handle:
+                return json.load(handle)["cursor"]
+
+        def told(pod):
+            return len([m for m in w.messages if "pod %s " % pod in m[1]])
+        w.tick(T0)
+        assert cursor() <= T0, "a line ahead of the clock moved the cursor"
+        assert (told("worker-1"), told("worker-2"), told("worker-3")) == (2, 0, 0), w.messages
+        w.tick(T0 + 2)
+        assert cursor() <= T0 + 2, "a line ahead of the clock moved the cursor"
+        assert (told("worker-1"), told("worker-2"), told("worker-3")) == (2, 2, 0), w.messages
+        print("S21: alarms at tick 1 %d, at tick 2 %d for the 1-second line, for the 4-minute line %d" % (2, 2, told("worker-3")))
+    finally:
+        w.close()
+
+
 SCENARIOS = {"s16e": s16e, "s16d": s16d, "s16b": s16b, "s16": s16, "s17": s17, "s18": s18, "s19": s19}
+SCENARIOS["s21"] = s21
 
 
 def run(name, path=None):
@@ -241,6 +266,7 @@ def run(name, path=None):
 
 
 MUTANTS = {
+    "s21": ("the slack of 300 seconds again", "FUTURE_SLACK_SECONDS = 0 ", "FUTURE_SLACK_SECONDS = 300 "),
     "s16": ("sends nothing", "item = send(engine.state_dir, to, now, now, text, KIND, subject, reason, first=True)", "item = None"),
     "s16d": ("no future guard", "if l[0] <= now + FUTURE_SLACK_SECONDS]", "if True]"),
     "s16b": ("keeps no record of a failed write", "_MEMORY[state_path] = copy.deepcopy(state)", "pass"),
@@ -260,6 +286,9 @@ class TestCloudRenewalAlarm(unittest.TestCase):
 
     def test_s16d_a_future_dated_line_is_ignored_and_never_moves_the_cursor(self):
         s16d(self.module)
+
+    def test_s21_a_line_dated_after_the_clock_is_not_read_and_the_cursor_never_passes_the_clock(self):
+        s21(self.module)
 
     def test_s16b_a_failing_state_write_and_a_failing_send_never_repeat_an_alarm_and_a_held_lane_is_skipped(self):
         s16b(self.module)
