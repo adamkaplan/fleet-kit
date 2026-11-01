@@ -315,7 +315,7 @@ class OneReaderDecision(unittest.TestCase):
         env = dict(ENV, CLOUD_PREFLIGHT_BASE="trunk", TMPDIR=self.tmp, CLOUD_PREFLIGHT_QUICK_TOTAL="1")
         p = subprocess.run([sys.executable, tool_dir(self.tmp), "--quick"], cwd=repo, capture_output=True, text=True, env=env, timeout=120)
         self.assertEqual(p.returncode, 1, p.stdout)
-        self.assertRegex(p.stdout, r"NOT RUN: quick run exceeded 1 s \(selected 3 files, ran 2; stopped before ")
+        self.assertRegex(p.stdout, r"NOT RUN \(budget\): quick run exceeded 1 s \(selected 3 files, ran 1\); not run: ")
 
     def test_m3_a_bad_quick_total_is_refused_in_one_line_and_only_in_quick(self):
         repo = make_repo(self.tmp)
