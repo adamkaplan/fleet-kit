@@ -613,7 +613,22 @@ def audit_writes(text):
 
 
 # Writers of the audit file outside the launcher's own file: (file, function) -> reason. A write in any other function still fails.
-ALLOWED_WRITERS = {("bin/cloud_cluster.py", "_audit_refused_preflight"): "a launch refused before any Launcher object exists writes its one create.failed line"}
+# The value is (the one action it may write, the reason).
+ALLOWED_WRITERS = {("bin/cloud_cluster.py", "_audit_refused_preflight"): ("create.failed", "a launch refused before any Launcher object exists writes its one create.failed line")}
+
+
+def writer_actions(text, function):
+    """The action literals of the audit-writing calls (write_audit with a record dict) inside the named function."""
+    found = []
+    for node in ast.walk(ast.parse(text)):
+        if isinstance(node, ast.FunctionDef) and node.name == function:
+            for call in ast.walk(node):
+                if isinstance(call, ast.Call) and getattr(call.func, "attr", getattr(call.func, "id", "")) == "write_audit":
+                    for arg in call.args:
+                        if isinstance(arg, ast.Dict):
+                            found += [v.value if isinstance(v, ast.Constant) else ast.unparse(v)
+                                      for k, v in zip(arg.keys, arg.values) if isinstance(k, ast.Constant) and k.value == "action"]
+    return found
 
 
 def enclosing_function(text, lineno):
@@ -755,6 +770,22 @@ class TestOtherWritersAndCallers(unittest.TestCase):
         for variant in ('f"s{a}"', "a if x else b", "name"):
             again = self.worker_text.replace(old, "return self._audited(worker, %s, go, audit_reason)" % variant)
             self.assertEqual(len(call_findings([(WRITER_FILE, again)])), 1, variant)
+
+    def test_the_allowed_writer_is_pinned_to_its_action(self):
+        cluster = dict(self.files)["bin/cloud_cluster.py"]
+        for (rel, function), (action, _reason) in ALLOWED_WRITERS.items():
+            self.assertEqual(rel, "bin/cloud_cluster.py")
+            self.assertEqual(writer_actions(cluster, function), [action])
+            self.assertTrue(action in REAL.ACTIONS or action in REAL.SKIPPED, action)
+            old = '"action": "%s"' % action
+            self.assertEqual(cluster.count(old), 1)
+            scratch = cluster.replace(old, '"action": "a-new-action"')
+            self.assertNotEqual(scratch, cluster)
+            seen = writer_actions(scratch, function)
+            self.assertEqual(seen, ["a-new-action"])
+            self.assertNotEqual(seen, [action], "the pin catches a new action name: a-new-action")
+            print("S allowed writer %s pinned to %s: read %s, costed or skipped %s, mutant read %s applied %s" % (
+                function, action, writer_actions(cluster, function), action in REAL.SKIPPED or action in REAL.ACTIONS, seen, scratch != cluster))
 
 
 COPY_SAMPLES = {
