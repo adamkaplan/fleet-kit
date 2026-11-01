@@ -128,8 +128,6 @@ class TestImportV1AsAProcess(Base):
         self.assertIn("import-v1", self.run_cli(SWITCHBOARD, "--help").stdout)
 
 
-class MutantSpliceError(Exception):
-    """A mutant whose target is not in the function it names: a broken test, never a caught mutant."""
 
 
 class TestSyncReportFreezePerBoss(unittest.TestCase):
@@ -228,34 +226,10 @@ class TestRealStatusAfterInstallOnLinux(RealStatusAfterInstall, InstallCase):
                 self.assertIn("service    installed (%s)" % self.service_path(), self.installed_status("linux", host))
 
 
-class OrdersReachTheJudgeWhole:
-    """Every path an orders text takes to the judge's input: a charter's (resolve_policy_context), the Chief of Staff's
-    file (context_of) and an owner's agent's inbound answer (judge_inbound_answer). Each is driven through its real code
-    with 30 long orders; the last order must be in the judge's input, whole."""
-
-    @staticmethod
-    def long_orders(prefix, count=30, width=250):
-        return ["%s %02d %s end-%s-%02d" % (prefix, n, "x" * width, prefix, n) for n in range(count)]
-
-    class Spy:
-        def __init__(self):
-            self.seen = []
-
-        def decide(self, state, questions):
-            self.seen.append(state)
-            raise sb.JevError("unreachable", "spy")
 
 
-class Unavailable(Exception):
-    permanent = False
-    retry_after = 3
 
 
-class AlreadyDecidedRefusal(Exception):
-    """What the real adapter raises for a 409 "already decided": a permanent refusal that says it is settled outside."""
-
-    permanent = True
-    settled_outside = True
 
 
 class TestOwnerEvaluatorsAreRare(unittest.TestCase):
@@ -288,24 +262,8 @@ class TestDecisionsStaleBound(unittest.TestCase):
         self.assertGreaterEqual(len([line for line in lines if "180 s" in line and ("stale" in line or "Staleness" in line or "not updating" in line or "older than" in line)]), 4)
 
 
-class StubHub:
-    def __init__(self, entries):
-        self.entries = entries
-
-    def pr_event_snapshot(self):
-        return {ref: dict(entry) for ref, entry in self.entries.items()}
 
 
-class EjectionHub:
-    def __init__(self, owner="orch"):
-        self.owner, self.routed, self.notified = owner, [], {}
-
-    def notice_names(self, repo, number):
-        return self.notified.get((repo, number), [])
-
-    def route_of(self, item, agents, now):
-        self.routed.append(item.numbers)
-        return (self.owner, "closing") if self.owner else (None, None)
 
 
 class TestScratchFileRule(unittest.TestCase):

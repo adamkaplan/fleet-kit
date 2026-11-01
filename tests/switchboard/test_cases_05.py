@@ -48,6 +48,7 @@ from unittest import mock
 from support.core import Base, FakeRunner
 from support.fake_hubs import FakeTriageHub
 from support.fake_jev import FakeJev, FakeOpener, JEV_SETTINGS, KEY_VALUE, SHIM
+from support.helper_fakes2 import PolicyCountingJev
 from support.installs_and_keys import API, DECISIONS_PLUGIN, GOOD_DONE_WHEN, ORDERS_CHARTER_BODY, WEB
 from support.loader import SWITCHBOARD, SWITCHBOARD_SOURCE_FILES, _load, captured, class_source, class_source_fn, sb, sc, switchboard_source
 from support.orders_and_adapters import EXTERNAL_ADAPTER, FakeWorkHost, cos_orders_file, put_cos_orders, report, worker
@@ -587,15 +588,6 @@ class TestBriefParsing(unittest.TestCase):
         self.assertIn("Goal: no intent recorded\n", sb.handoff_markdown(bare, {"done so far": "a", "next steps": "b"}))
 
 
-class PolicyCountingJev:
-    """Wraps a decision model and counts how often it was asked."""
-
-    def __init__(self, inner):
-        self.inner, self.calls = inner, 0
-
-    def decide(self, state, questions):
-        self.calls += 1
-        return self.inner.decide(state, questions)
 
 
 class PolicyRig:
@@ -850,65 +842,8 @@ class TestImportV1Client(Base):
         self.assertEqual(class_source("V2Client").count("self.runner("), 1)
 
 
-# ======================================================================
-# #117: the waiting-on-the-person sweep (S1 to S5), synthetic repos only
-# ======================================================================
-class FakeSweepHub:
-    """read_pages / _read_one over a canned repo: `open` is {number: issue or PR record}, `comments` a list of records;
-    every call is counted."""
-
-    def __init__(self):
-        self.open, self.comments, self.closed, self.reads, self.single = {}, [], set(), [], []
-        self.closed_records = {}   # the closed or merged items the closed-state list read returns
-        self.caps, self.fresh, self.live = [], [], {}   # live: a fresher copy of an item than `open` shows
-
-    def read_pages(self, path, key=None, timeout=None, older=None, cap=None):
-        self.reads.append(path)
-        self.caps.append(cap)
-        match = re.search(r"/issues/(\d+)/comments", path)
-        if match:   # one item's own comments (a fresh re-check)
-            number = int(match.group(1))
-            return [c for c in self.comments if c["issue_url"].endswith("/%d" % number)][::-1], False
-        if "/issues/comments" in path:
-            return list(self.comments), False
-        if "state=closed" in path:
-            return list(self.closed_records.values()), False
-        return list(self.open.values()), False
-
-    def _read_one(self, repo, path, now, fresh=False):
-        self.single.append((repo, path))
-        self.fresh.append(fresh)
-        number = int(path.rsplit("/", 1)[1])
-        data = dict(self.live.get(number, self.open.get(number, self.closed_records.get(number, {}))))
-        data["number"] = number
-        data["state"] = "closed" if number in self.closed else "open"
-        return data
 
 
-class FakeOwnerlessHub(FakeTriageHub):
-    """The triage hub for #605: the open list is paged by `cap` pages of 100 (cut when more remain) and the repository answers its own count of open items."""
-
-    def __init__(self):
-        super().__init__()
-        self.open_total = {}
-
-    def read_pages(self, path, key=None, timeout=None, older=None, cap=None):
-        if "state=open" in path and "/issues?" in path and cap is not None:
-            self.calls.append(path)
-            repo = re.search(r"repos/([^/]+/[^/]+)/", path).group(1)
-            if repo in self.unreadable:
-                raise sb.GitHubUnavailable("HTTP 404: Not Found")
-            everything = list(self.open.get(repo, {}).values())
-            if "direction=asc" in path:   # GitHub sorts by the updated time; the fake does too
-                everything.sort(key=lambda record: record["updated_at"])
-            elif "sort=" not in path:
-                everything.sort(key=lambda record: record["updated_at"], reverse=True)   # the default listing is newest first
-            return everything[:cap * 100], len(everything) > cap * 100
-        return super().read_pages(path, key, timeout, older, cap)
-
-    def open_issues_count(self, repo):
-        self.calls.append("repos/%s" % repo)
-        return self.open_total.get(repo, len(self.open.get(repo, {})))
 
 
 class TestTriageRuleInputs(unittest.TestCase):
@@ -2161,45 +2096,6 @@ class TestGithubWritingRule(unittest.TestCase):
             self.assertTrue(text.startswith("---\n"), rel)
 
 
-class LightProbe:
-    """Makes `Switchboard.light` observable: every read of it records the source line that asked, and a chosen set of lines is told `False` (the guard removed there)
-    while every other line is told `True`. It changes no code: the same engine, the same fake source, one guard at a time."""
-
-    FILE = str(SWITCHBOARD)
-    # the line a file starts at in switchboard_source() (the files are joined with one newline), so a read in a part is told apart by its own file
-    OFFSETS = {}
-    _at = 0
-    for _path in SWITCHBOARD_SOURCE_FILES:
-        OFFSETS[str(_path)] = _at
-        _at += _path.read_text().count("\n") + 1
-
-    def __init__(self, flip=()):
-        self.flip, self.hits = set(flip), collections.Counter()
-
-    def __enter__(self):
-        probe = self
-
-        def get(engine):
-            frame = sys._getframe(1)
-            offset = probe.OFFSETS.get(frame.f_code.co_filename)
-            if offset is not None:
-                line = frame.f_lineno + offset
-                probe.hits[line] += 1
-                if any(lo <= line <= hi for lo, hi in probe.flip):
-                    return False
-            return engine.__dict__["light"]
-
-        def put(engine, value):
-            engine.__dict__["light"] = value
-        self.patch = mock.patch.object(sb.Switchboard, "light", property(get, put), create=True)
-        self.patch.start()
-        return self
-
-    def __exit__(self, *exc):
-        self.patch.stop()
-
-    def touched(self, lo, hi):
-        return sum(n for line, n in self.hits.items() if lo <= line <= hi)
 
 
 class TestOwnReviewLaws(unittest.TestCase):
