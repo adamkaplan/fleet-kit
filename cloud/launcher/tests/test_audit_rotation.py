@@ -601,6 +601,99 @@ class TestLockAndRecord(Base):
               "1 young archive kept, %d empty reads of the count file in 200 polls" % (planted, empty))
 
 
+# ---- S25 and S26: the record lock and the archive of pending (constraint PC-8, pull request 2 continuation) ----
+class TestRecordLockAndPending(Base):
+    def check_s25(self, cw=CW):
+        self.put(lines(0, 3000, 3000))
+        original = cw.read_rotation_record
+        armed, reached, b_done = threading.Event(), threading.Event(), threading.Event()
+        owner = []
+
+        def reading(path):   # the first read of the final write of the first rotator holds, so the second rotator runs inside it
+            rec = original(path)
+            if armed.is_set() and threading.current_thread() is owner[0]:
+                armed.clear()
+                reached.set()
+                b_done.wait(1.5)
+            return rec
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), mock.patch.object(cw, "read_rotation_record", reading):
+            first = threading.Thread(target=lambda: cw.rotate_audit(self.audit, _before_swap=armed.set), daemon=True)
+            owner.append(first)
+            first.start()
+            if not reached.wait(30):
+                raise AssertionError("the first rotation never reached its final write")
+            self.put(lines(3000, 6000, 3000), "a")   # the live file is over the size again
+            cw.rotate_audit(self.audit)
+            b_done.set()
+            first.join(30)
+        record = original(self.audit)
+        names = sorted(n for n in os.listdir(self.dir) if n.startswith("audit-") and n.endswith(".jsonl.gz"))
+        sizes = {}
+        for name in names:
+            with gzip.open(os.path.join(self.dir, name), "rb") as handle:
+                sizes[name] = len(handle.read())
+        cut_names = [c["archive"] for c in record["cuts"]]
+        text, _ = TestLockAndRecord.all_text(self)
+        got = TestLockAndRecord.ids(self, text)
+        if record["done"] != len(names) or sorted(cut_names) != names or sum(c["cut"] for c in record["cuts"]) != sum(sizes.values()):
+            raise AssertionError("a cut was lost: done %d and %d archives, %d cuts" % (record["done"], len(names), len(record["cuts"])))
+        pend = record["pending"]
+        if pend is not None and pend.get("archive") not in names:
+            raise AssertionError("a cut was lost: pending names no archive")
+        if got != list(range(6000)):
+            raise AssertionError("a cut was lost: %d of 6000 lines present" % len(got))
+        return record["done"], len(names), len(record["cuts"]), len(got)
+
+    def test_s25(self):
+        done, archives, cuts, total = self.check_s25()
+        self.assertEqual((done, archives, cuts, total), (2, 2, 2, 6000))
+        self.setUp()
+        mutant = load("cw", 'lock = _audit_lock(path, fcntl.LOCK_EX, ".record.lock")', 'lock = open(os.devnull, "rb")')
+        with self.assertRaises(AssertionError) as caught:
+            self.check_s25(mutant)
+        self.assertIn("a cut was lost", str(caught.exception))
+        print("S25: done %d equals the %d archives and %d cuts in the control, cut bytes equal archive bytes, %d of 6000 lines once and in order, the control passes 1 of 1 "
+              "and the copy without the record lock fails 1 of 1 with the anchored text (%s), the mutation applied" % (done, archives, cuts, total, str(caught.exception)))
+
+    def build(self):
+        name = "audit-2026-01-01.jsonl.gz"
+        old = lines(0, 100, 20).encode()
+        with gzip.open(os.path.join(self.dir, name), "wb") as handle:
+            handle.write(old)
+        live = lines(100, 130, 20)
+        with open(self.audit + ".rotations", "w") as handle:
+            json.dump({"done": 0, "cuts": [], "pending": {"cut": len(old), "old_size": len(old) + len(live.encode()) + 5000, "archive": name}}, handle)
+        self.put(live)
+        return len(old) - len(lines(60, 100, 20).encode())
+
+    def check_s26(self, ea=EA, lw=LW):
+        offset = self.build()
+        end, lost = TestArchiveRead.readers(self, offset, ea, lw)
+        with contextlib.redirect_stderr(io.StringIO()):
+            got = (end.read_all(), lost.read_all())
+        for reader, ids in zip(("end alert", "lost worker"), got):
+            if ids != list(range(60, 130)):
+                raise AssertionError("a line was skipped across a pending rotation: %s delivered %d of 70 lines" % (reader, len(ids)))
+        return len(got[0]), len(got[1])
+
+    def test_s26(self):
+        self.assertEqual(self.check_s26(), (70, 70))
+        self.setUp()
+        old_ea, old_lw = 'entries + [(pending["cut"], pending.get("archive"))]', 'entries + [(pend["cut"], pend.get("archive"))]'
+        mutant_ea = load("ea", old_ea, 'entries + [(pending["cut"], None)]')
+        mutant_lw = load("lw", old_lw, 'entries + [(pend["cut"], None)]')
+        with self.assertRaises(AssertionError) as caught:
+            self.check_s26(mutant_ea, mutant_lw)
+        self.assertIn("a line was skipped across a pending rotation", str(caught.exception))
+        self.setUp()
+        with self.assertRaises(AssertionError) as caught2:
+            self.check_s26(EA, mutant_lw)
+        self.assertIn("lost worker delivered 30 of 70", str(caught2.exception))
+        print("S26: 2 readers x 70 of 70 lines (40 of the archive named by pending, 30 live) read once and in order in the control, the control passes 1 of 1 and the copies fail "
+              "with the anchored text (%s; %s), the mutation applied" % (str(caught.exception), str(caught2.exception)))
+
+
 # ---- S12: the README ----
 class TestReadme(unittest.TestCase):
     @staticmethod
