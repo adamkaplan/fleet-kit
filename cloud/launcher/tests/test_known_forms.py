@@ -61,7 +61,7 @@ class S(unittest.TestCase):
             k.add_forms(cw.secret_forms("l%d" % m + LOGIN), ("until", t + 3660, None))
             k.sweep(t, pods); peak = max(peak, len(k))
         print("peak forms", peak)
-        self.assertLess(peak, 40 * 7 + 12 + 34 + 200, "the known forms grew past the bound")
+        self.assertLessEqual(peak, 40 * 7 + 12 + 34, "the known forms grew past the bound")
 
     def test_s8_threads(self):
         k = self.kf(); errs = []
@@ -251,6 +251,55 @@ class S4Same(unittest.TestCase):
         short = SHORT_KEY not in cw.scrub("x " + SHORT_KEY + " y", k, 5000)
         print("S4 redacted before the drop %d of 4, after it by the shapes %d of 4 with %d of %d forms, short model key kept %d of 1" % (before, after, shaped, nforms, short))
         self.assertEqual((before, after, shaped, nforms, short), (4, 4, 29, 29, 1))
+
+
+def fake_world(cls, seed=1783):
+    """Seven simulated days, one pass a simulated minute: 300 pods launched a day living 5 to 180 minutes, a renewal 30 minutes after each mint of a running pod, a login refresh every 40 minutes, each pod's stop learning its password; one model entry. Returns (count after every pass, the most pods running at once)."""
+    R = _random.Random(seed); k = cls()
+    k.add_forms(cw.secret_forms(M34), None)
+    pods, counts, peak_run, n, last_login, li = {}, [], 0, 0, -99, 0
+    launch = sorted(R.uniform(0, 7 * 1440) for _ in range(300 * 7))
+    for minute in range(7 * 1440):
+        for name in [p for p, v in pods.items() if v[1] <= minute]:  # the stop learns the password, the pod leaves the list
+            k.add_forms(cw.secret_forms("pw%s%s" % (name, "x" * 38)), ("pod", name)); del pods[name]
+        while li < len(launch) and launch[li] <= minute:
+            n += 1; nm = "p%d" % n; pods[nm] = [minute, minute + R.randint(5, 180), minute + 30]; li += 1
+            k.add_forms(cw.secret_forms("ghs_%s%s" % (nm, "T" * (32 - len(nm)))), ("until", minute * 60 + 3660.0, nm))
+        for nm, v in pods.items():
+            if minute >= v[2]:
+                v[2] += 30
+                k.add_forms(cw.secret_forms("ghs_%s_%d%s" % (nm, minute, "U" * 20)), ("until", minute * 60 + 3660.0, nm))
+        if minute - last_login >= 40:
+            last_login = minute
+            k.add_forms(cw.secret_forms("eyJ%d%s" % (minute, "L" * 100)), ("until", minute * 60 + 3660.0, None))
+        k.sweep(minute * 60.0, set(pods))
+        counts.append(len(k)); peak_run = max(peak_run, len(pods))
+    return counts, peak_run
+
+
+class S5Week(unittest.TestCase):
+    def check(self, cls):
+        counts, peak = fake_world(cls)
+        bound = 40 * peak + 34 + 12
+        self.assertEqual(len(counts), 10080)
+        self.assertLessEqual(max(counts), bound, "the known forms grew past the bound")
+        return max(counts), bound, counts[-1]
+
+    def test_control_and_mutant(self):
+        top, bound, last = self.check(cw.KnownForms)
+        print("S5 control: largest count %d, bound %d, %d passes, last %d" % (top, bound, 10080, last))
+        src = Mutants.SRC; old = "        if pods is None:\n            return 0\n"
+        self.assertEqual(src.count(old), 1)
+        mut = src.replace(old, "        if True:\n            return 0\n")
+        self.assertNotEqual(mut, src)
+        ns = {"__name__": "mut", "__file__": cw.__file__}
+        exec(compile(mut, "mut", "exec"), ns)
+        with self.assertRaises(AssertionError) as cm:
+            self.check(ns["KnownForms"])
+        self.assertIn("the known forms grew past the bound", str(cm.exception))
+        counts, _ = fake_world(ns["KnownForms"])
+        print("S5 mutant that never drops: ends the week at %d forms, above the bound %d, fails 1 of 1" % (counts[-1], bound))
+        self.assertGreater(counts[-1], bound)
 
 
 class Mutants(unittest.TestCase):
