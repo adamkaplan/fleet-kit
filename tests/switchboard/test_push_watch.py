@@ -540,5 +540,34 @@ class TestPushWatch(Case):
             "a RuntimeError of the launcher reader was swallowed as a corrupt line"),
             "a RuntimeError of the launcher reader was swallowed as a corrupt line")
 
+class TestTickWithoutConfig(unittest.TestCase):
+    """#1740: push_watch_tick reads the configuration defensively."""
+
+    def _tick(self, old=False):
+        import importlib.machinery
+        path = str(REPO / "bin" / "fleet-switchboard")
+        text = Path(path).read_text()
+        if old:
+            text = text.replace('(getattr(engine, "config", None) or {}).get("push_watch"))', 'engine.config.get("push_watch"))')
+            assert 'engine.config.get("push_watch"))' in text
+        module = types.ModuleType("sb_push_tick")
+        module.__file__ = path
+        exec(compile(text, path, "exec"), module.__dict__)
+        with tempfile.TemporaryDirectory() as tmp:
+            audit = types.SimpleNamespace(append=lambda *a: lines.append(a))
+            lines = []
+            engine = types.SimpleNamespace(audit=audit, actor="daemon", now=lambda: NOW)
+            result = module.push_watch_tick(engine, None)
+            self.assertEqual((result, lines, list(Path(tmp).iterdir())), ([], [], []))
+
+    def test_fix1_an_engine_without_config_runs_the_pass_with_no_audit_line(self):
+        self._tick()
+
+    def test_fix1_the_old_expression_fails_the_check(self):
+        with self.assertRaises(AttributeError) as caught:
+            self._tick(old=True)
+        self.assertIn("has no attribute 'config'", str(caught.exception))
+
+
 if __name__ == "__main__":
     unittest.main()
