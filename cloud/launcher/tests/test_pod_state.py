@@ -25,6 +25,19 @@ class Mask(unittest.TestCase):
         say("S5 mask: %d of %d cases masked as asked" % (len(cases) - len(bad), len(cases)))
         self.assertEqual(bad, [])
 
+    def test_a_word_glued_to_a_colon_and_digits_is_masked_as_a_stated_loss_of_text(self):
+        # The plan's mask over-masks a bare `word:digits` (not only host:port). No secret can
+        # leak through it; the loss is of the event's own words.
+        masked = {"exit code:137 reason:5": "exit [address] [address]", "Reason:5": "[address]",
+                  "pod default/x:8080 failed": "pod default/[address] failed"}
+        kept = ["Warning FailedScheduling: 0/13 nodes are available: 13 Insufficient cpu.",
+                "image pulled in 4:12", "at 10:30 it ended"]
+        n_masked = sum(cw.mask_addresses(k) == v for k, v in masked.items())
+        n_kept = sum(cw.mask_addresses(k) == k for k in kept)
+        say("S5 mask: %d of %d over-masked as stated, %d of %d kept" % (n_masked, len(masked), n_kept, len(kept)))
+        self.assertEqual(n_masked, len(masked))
+        self.assertEqual(n_kept, len(kept))
+
 
 class Writer(unittest.TestCase):
     def setUp(self):
