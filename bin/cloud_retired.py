@@ -210,6 +210,8 @@ def read_run_record(name, retired, state, runner, now, record=None):
     run_seconds, boss_seconds = _stamp_seconds(stamp), _stamp_seconds(boss_end)
     if boss is not None and (run_seconds is None or boss_seconds is None or boss_seconds < run_seconds):
         boss = None   # a boss kept for an earlier run is not the boss of this one
+    if record is not None:
+        boss = record.get("reports_to")   # the boss of the record: the live cloud record of the worker (#1750)
     if not D["_may_retire"](kind, {"reports_to": boss}):
         if boss is None and kind[0] == "agent":
             raise LaunchError("refused: %s was removed with no boss on record: only the operator or the Chief of Staff may read it" % name)
