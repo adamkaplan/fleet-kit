@@ -10,6 +10,8 @@ import re
 import shutil
 import sys
 import tempfile
+import threading
+import time
 import types
 import unittest
 from unittest import mock
@@ -425,6 +427,178 @@ class TestArchiveRead(Base):
         print("S17: 2 readers x 270 of 270 lines delivered once and in order (40 + 100 + 100 + 30), 0 delivered twice, %d of 6 failure inputs (3 inputs x 2 readers) say the words "
               "once and deliver the 30 live lines, the control passes 1 of 1, the copy that skips the archives fails 1 of 1 with the anchored text (%s), the mutation applied"
               % (said, str(caught.exception).split(":")[1].strip()[:60]))
+
+
+# ---- S18 to S21: the lock, two rotators, the pending record and the lows (constraint PC-8) ----
+class TestLockAndRecord(Base):
+    def all_text(self):
+        """The archives (in the order of the record's cuts) and the live file, as one text, and the number of archives."""
+        record = CW.read_rotation_record(self.audit)
+        names = [c["archive"] for c in record["cuts"]]
+        names += sorted(n for n in os.listdir(self.dir) if n.startswith("audit-") and n.endswith(".jsonl.gz") and n not in names)
+        text = ""
+        for name in names:
+            with gzip.open(os.path.join(self.dir, name), "rb") as handle:
+                text += handle.read().decode()
+        with open(self.audit) as handle:
+            return text + handle.read(), len(names)
+
+    def ids(self, text):
+        return [json.loads(x)["n"] for x in text.splitlines()]
+
+    def check_s18(self, cw=CW):
+        self.put(lines(0, 3000, 1500))
+        seen = []
+        threads = []
+
+        def hook():
+            def appender():
+                cw.write_audit(self.audit, {"action": "stop", "n": 3000})
+            thread = threading.Thread(target=appender)
+            thread.start()
+            threads.append(thread)
+            time.sleep(0.3)
+            with open(self.audit) as handle:
+                seen.append(sum('"n": 3000' in x for x in handle))
+        self.rotate(cw, _before_swap=hook)
+        threads[0].join()
+        text, _ = self.all_text()
+        got = self.ids(text)
+        if got != list(range(3001)):
+            raise AssertionError("an appended line was lost: %d of 3001 lines present" % len(got))
+        return seen[0], len(got)
+
+    def test_s18(self):
+        during, total = self.check_s18()
+        self.assertEqual((during, total), (0, 3001))
+        self.setUp()
+        mutant = load("cw", "lock = _audit_lock(path, fcntl.LOCK_SH)", "lock = None")
+        with self.assertRaises(AssertionError) as caught:
+            self.check_s18(mutant)
+        self.assertIn("an appended line was lost", str(caught.exception))
+        print("S18: the control: %d lines of the appender present while the hook waits, %d of 3001 lines present once and in order; the copy without the lock fails 1 of 1 "
+              "with the anchored text (%s), the mutation applied" % (during, total, str(caught.exception).split(": ")[1]))
+
+    def check_s19(self, cw=CW):
+        original = lines(0, 3000, 1500)
+        self.put(original)
+        second = []
+
+        def inner():
+            second.append(cw.rotate_audit(self.audit))
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            cw.rotate_audit(self.audit, _before_lock=inner)
+        text, count = self.all_text()
+        record = CW.read_rotation_record(self.audit)
+        got = self.ids(text)
+        if got != list(range(3000)):
+            raise AssertionError("a line was duplicated: %d lines for 3000" % len(got))
+        temps = [n for n in os.listdir(self.dir) if n.endswith(".tmp") or n.startswith(".audit.")]
+        return count, len(record["cuts"]), len(got), len(temps)
+
+    def test_s19(self):
+        self.assertEqual(self.check_s19(), (1, 1, 3000, 0))
+        self.setUp()
+        mutant = load("cw", "if (now_seen.st_dev, now_seen.st_ino) != (seen.st_dev, seen.st_ino) or now_seen.st_size < len(data):", "if False:")
+        with self.assertRaises(AssertionError) as caught:
+            self.check_s19(mutant)
+        self.assertIn("a line was duplicated", str(caught.exception))
+        print("S19: 1 archive, 1 cut, 3000 of 3000 lines once and in order, 0 temporary files, the control passes 1 of 1, the copy without the check fails 1 of 1 with the "
+              "anchored text (%s), the mutation applied" % str(caught.exception).split(": ")[1])
+
+    def check_s20(self, cw=CW):
+        self.put(lines(0, 3000, 1500))
+        original = cw.write_rotation_record
+
+        def failing(path, rec):
+            if rec.get("pending") is None and rec.get("done") == 1:
+                raise OSError(5, "injected")
+            return original(path, rec)
+        with mock.patch.object(cw, "write_rotation_record", failing):
+            self.rotate(cw)
+        first = cw.read_rotation_record(self.audit)
+        self.assertEqual((first["done"], first["pending"] is not None), (0, True))
+        self.put(lines(3000, 5000, 1500), "a")
+        self.rotate(cw)
+        record = cw.read_rotation_record(self.audit)
+        if record["done"] != 2 or len(record["cuts"]) != 2 or record["pending"] is not None:
+            raise AssertionError("the cut was never recorded: done %d of 2, %d cuts" % (record["done"], len(record["cuts"])))
+        text, _ = self.all_text()
+        self.assertEqual(self.ids(text), list(range(5000)))
+        return first["done"], record["done"], len(record["cuts"]), record["pending"]
+
+    def test_s20(self):
+        self.assertEqual(self.check_s20(), (0, 2, 2, None))
+        self.setUp()
+        mutant = load("cw", "            _complete_pending(path)\n", "            pass\n")
+        with self.assertRaises(AssertionError) as caught:
+            self.check_s20(mutant)
+        self.assertIn("the cut was never recorded", str(caught.exception))
+        print("S20: after the injected failure pending is set and done is 0; after the next rotation done is 2 with 2 cuts recorded and pending null, 5000 lines once and in order; "
+              "the control passes 1 of 1, the copy fails 1 of 1 with the anchored text (%s), the mutation applied" % str(caught.exception).split(": ")[1])
+
+    def test_s21(self):
+        import datetime
+        import threading as _t
+        # (a) the failure line holds the class and the errno and never the text of the error
+        self.big()
+
+        def fail():
+            raise OSError(13, "denied /planted/secret/path")
+        result, err = self.rotate(_before_swap=fail)
+        self.assertIsNone(result)
+        self.assertIn("PermissionError errno=13", err)
+        planted = err.count("planted")
+        self.assertEqual(planted, 0)
+        # (b) a symbolic-link audit path is refused and says so
+        self.setUp()
+        target = os.path.join(self.dir, "real.jsonl")
+        with open(target, "w") as handle:
+            handle.write(lines(0, 6000, 700))
+        os.symlink(target, self.audit)
+        before = snapshot(self.dir)
+        result, err = self.rotate()
+        self.assertIsNone(result)
+        self.assertIn("symbolic link", err)
+        self.assertTrue(os.path.islink(self.audit) and os.readlink(self.audit) == target)
+        self.assertEqual(snapshot(self.dir), before)
+        # (c) archives are pruned by the date in their name, not by their modification time
+        self.setUp()
+        self.big()
+        old_name, young_name = "audit-2026-09-01.jsonl.gz", "audit-2026-10-25.jsonl.gz"
+        for name in (old_name, young_name):
+            with open(os.path.join(self.dir, name), "wb") as handle:
+                handle.write(b"x")
+        os.utime(os.path.join(self.dir, young_name), (1e9, 1e9))
+        result, _ = self.rotate(now=datetime.datetime(2026, 11, 1, 12, tzinfo=datetime.timezone.utc))
+        self.assertEqual(result["pruned"], 1)
+        self.assertFalse(os.path.exists(os.path.join(self.dir, old_name)))
+        self.assertTrue(os.path.exists(os.path.join(self.dir, young_name)))
+        # (d) the end-alert reader's count file is never seen empty
+        count_file = os.path.join(self.dir, "count.json")
+        EA._write_count(count_file, {"applied": 0, "chain": None})
+        stop_flag = []
+
+        def writer():
+            n = 0
+            while not stop_flag:
+                n += 1
+                EA._write_count(count_file, {"applied": n, "chain": None})
+        thread = _t.Thread(target=writer)
+        thread.start()
+        empty = 0
+        try:
+            for _ in range(200):
+                with open(count_file) as handle:
+                    if not handle.read():
+                        empty += 1
+        finally:
+            stop_flag.append(1)
+            thread.join()
+        self.assertEqual(empty, 0)
+        print("S21: 4 of 4 checks pass, %d occurrences of the planted path in the failure line, 1 link refused with link and target unchanged, 1 old archive removed and "
+              "1 young archive kept, %d empty reads of the count file in 200 polls" % (planted, empty))
 
 
 # ---- S12: the README ----
