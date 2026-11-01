@@ -1894,5 +1894,84 @@ class TestGhShimEncodedQueryAndLabelDelete(unittest.TestCase):
         self.assertEqual(refused, 4)
 
 
+def body_key_failures(rig):
+    """#1696 S31: the failures seen for an --input JSON whose key is written Body (empty when it is signed once under that key)."""
+    bad = []
+    path = rig.home / "bodykey.json"
+    path.write_text('{"Body":"x"}')
+    done, calls = rig.run("api", "repos/o/r/issues/1/comments", "--input", str(path))
+    if len(calls) != 1:
+        return ["a body key written Body went out unsigned"]
+    data = json.loads(calls[0]["files"][calls[0]["argv"][-1]])
+    if list(data) != ["Body"] or data["Body"].count(SIGNED) != 1:
+        bad.append("a body key written Body went out unsigned")
+    return bad
+
+
+class TestGhShimDeepBodiesAndInputForms(unittest.TestCase):
+    """#1696 PC-9: bodies below the signed level are refused (S30), the Body key mutant is seen (S31), --input=FILE and repeated -f body (S32)."""
+
+    def setUp(self):
+        self.rig = hermetic_rig()
+        self.addCleanup(self.rig.close)
+        self.source = (SHIM_DIR / "gh").read_text()
+
+    def file(self, text, name="in.json"):
+        path = self.rig.home / name
+        path.write_text(text)
+        return str(path)
+
+    def refused(self, done, calls):
+        self.assertEqual(done.returncode, 1)
+        gh_lines = [l for l in done.stderr.splitlines() if l.startswith("gh:")]
+        self.assertEqual(len(gh_lines), 1, done.stderr)
+        self.assertTrue(gh_lines[0].startswith("gh: refused:"), done.stderr)
+        self.assertEqual(calls, [])
+
+    def test_s30_control_first_a_flat_comment_is_signed_once(self):
+        done, calls = self.rig.run("api", "repos/o/r/pulls/1/reviews", "--input", self.file('{"comments":[{"body":"x","path":"a","line":3}]}'))
+        self.assertEqual(len(calls), 1, done.stderr)
+        data = json.loads(calls[0]["files"][calls[0]["argv"][-1]])
+        self.assertEqual(data["comments"][0]["body"].count(SIGNED), 1)
+
+    def test_s30_a_body_below_the_signed_level_is_refused(self):
+        deep = {"body": "n"}
+        for _ in range(25):
+            deep = {"n": deep}
+        refused = 0
+        for text in ('{"comments":[{"body":"x","replies":[{"body":"n2"}]}]}', '{"body":"x","threads":[{"Body":"n2"}]}', json.dumps({"body": "x", "deep": deep})):
+            with self.subTest(text=text[:40]):
+                self.refused(*self.rig.run("api", "repos/o/r/pulls/1/reviews", "--input", self.file(text)))
+                refused += 1
+        self.assertEqual(refused, 3)
+
+    def test_s31_control_the_unmutated_shim_passes(self):
+        self.assertEqual(body_key_failures(self.rig), [])
+
+    def test_s31_a_mutant_comparing_the_key_in_lower_case_only_is_seen(self):
+        self.assertEqual(body_key_failures(self.rig), [])   # control first
+        old = 'for key in [k for k in data if isinstance(k, str) and k.lower() == "body"]:'
+        self.assertEqual(self.source.count(old), 1, "the mutant's anchor is gone (the first-level body of input_call)")
+        rig = Rig(self.source.replace(old, 'for key in [k for k in data if isinstance(k, str) and k == "body"]:', 1))
+        self.addCleanup(rig.close)
+        self.assertIn("a body key written Body went out unsigned", body_key_failures(rig))
+
+    def test_s32_input_equals_file_is_signed_once_and_keeps_its_spelling(self):
+        reader = (self.rig.bin / "gh")
+        reader.write_text(reader.read_text().replace("(a, a.split(", "(a, a.split(\"=\", 1)[-1], a.split(", 1))
+        done, calls = self.rig.run("api", "repos/o/r/issues/1/comments", "--input=" + self.file('{"body":"x"}'))
+        self.assertEqual(len(calls), 1, done.stderr)
+        arg = calls[0]["argv"][-1]
+        self.assertTrue(arg.startswith("--input="), arg)
+        temp = arg[len("--input="):]
+        self.assertNotEqual(temp, str(self.rig.home / "in.json"))
+        self.assertEqual(json.loads(calls[0]["files"][temp])["body"].count(SIGNED), 1)
+
+    def test_s32_two_body_fields_are_signed_once_each(self):
+        done, calls = self.rig.run("api", "repos/o/r/issues/1/comments", "-f", "body=a", "-f", "body=b")
+        self.assertEqual(len(calls), 1, done.stderr)
+        self.assertEqual(sum(a.count(SIGNED) for a in calls[0]["argv"]), 2)
+
+
 if __name__ == "__main__":
     unittest.main()
