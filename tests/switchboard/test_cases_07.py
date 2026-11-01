@@ -1729,9 +1729,9 @@ class TestHeavySlots(Base):
         env = self.env(PATH="%s:%s" % (fake, os.environ["PATH"]))
         self.assertEqual(self.start("true", env=env).wait(timeout=90), 0)
         self.assertEqual(record.read_text().strip(), "-b", "run as taskpolicy -b <command>")
-        self.assertEqual(self.hs.command_prefix(lambda n: "/x/taskpolicy" if n == "taskpolicy" else "/x/nice"), ["/x/taskpolicy", "-b"])
-        self.assertEqual(self.hs.command_prefix(lambda n: "/x/nice" if n == "nice" else None), ["/x/nice", "-n", "10"])
-        self.assertEqual(self.hs.command_prefix(lambda n: None), [])
+        self.assertEqual(self.hs.command_prefix(lambda n: "/x/taskpolicy" if n == "taskpolicy" else "/x/nice", {}), ["/x/taskpolicy", "-b"])
+        self.assertEqual(self.hs.command_prefix(lambda n: "/x/nice" if n == "nice" else None, {}), ["/x/nice", "-n", "10"])
+        self.assertEqual(self.hs.command_prefix(lambda n: None, {}), [])
         # and with no taskpolicy the real nice runs it at a lower priority
         stub = self.home / "nobin"
         stub.mkdir()
