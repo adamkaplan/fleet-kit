@@ -1168,6 +1168,47 @@ AUDIT_ARCHIVE_DAYS = 30        # archives (audit-<UTC date>.jsonl.gz) older than
 _ROTATE_SAID = {}              # path -> the last rotation failure said (once per change of text)
 
 
+AUDIT_RECORD_MAX = 4096   # the rotation record (<audit file>.rotations) is at most this many bytes
+AUDIT_CUTS_KEPT = 16      # its cuts: the last 16 completed rotations, oldest first
+
+
+def _record_path(path):
+    return path + ".rotations"
+
+
+def read_rotation_record(path):
+    """The rotation record beside the audit file: {done, cuts: [{cut, archive}], pending: None or {cut, old_size}}; a default one when it is missing or damaged."""
+    try:
+        with open(_record_path(path), "rb") as f:
+            raw = f.read(AUDIT_RECORD_MAX + 1)
+        rec = json.loads(raw.decode("utf-8")) if len(raw) <= AUDIT_RECORD_MAX else None
+    except (OSError, ValueError):
+        rec = None
+    if not isinstance(rec, dict) or not isinstance(rec.get("done"), int) or not isinstance(rec.get("cuts"), list):
+        return {"done": 0, "cuts": [], "pending": None}
+    return {"done": rec["done"], "cuts": rec["cuts"], "pending": rec.get("pending")}
+
+
+def write_rotation_record(path, rec):
+    """A temporary file and a rename, 0600, at most AUDIT_RECORD_MAX bytes (the oldest cuts go first when it would be larger)."""
+    rec = dict(rec, cuts=list(rec["cuts"])[-AUDIT_CUTS_KEPT:])
+    text = json.dumps(rec, sort_keys=True) + "\n"
+    while len(text) > AUDIT_RECORD_MAX and rec["cuts"]:
+        rec["cuts"].pop(0)
+        text = json.dumps(rec, sort_keys=True) + "\n"
+    temp = _record_path(path) + ".%d.tmp" % os.getpid()
+    try:
+        with os.fdopen(os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600), "w") as f:
+            f.write(text)
+        os.replace(temp, _record_path(path))
+    except BaseException:
+        try:
+            os.unlink(temp)
+        except OSError:
+            pass
+        raise
+
+
 def rotate_audit(path, now=None, dry_run=False, _before_swap=None):
     """Rotate the audit file when it is over AUDIT_ROTATE_BYTES: every line older than the newest AUDIT_KEEP_BYTES goes to
     audit-<UTC date>.jsonl.gz (a temporary file and a rename, 0600) and the live file is replaced by its newest lines (a temporary file
@@ -1182,6 +1223,7 @@ def rotate_audit(path, now=None, dry_run=False, _before_swap=None):
         return None
     directory = os.path.dirname(path) or "."
     temps = []
+    pending = False
     try:
         with open(path, "rb") as f:
             data = f.read()
@@ -1211,11 +1253,25 @@ def rotate_audit(path, now=None, dry_run=False, _before_swap=None):
             out.write(data[cut:] + late)
         os.rename(gz_temp, archive)
         temps.append(archive)
+        record = read_rotation_record(path)
+        write_rotation_record(path, dict(record, pending={"cut": cut, "old_size": len(data)}))   # the archive is written; the replacement follows
+        pending = True
         if _before_swap:
             _before_swap()
         os.replace(keep_temp, path)
         temps[:] = []
+        pending = False
+        try:   # done is incremented, the cut and its archive are appended, pending is cleared
+            write_rotation_record(path, {"done": record["done"] + 1, "pending": None,
+                                         "cuts": record["cuts"] + [{"cut": cut, "archive": os.path.basename(archive)}]})
+        except Exception as e:
+            print("cloud-worker: the audit rotation record could not be written (%s)" % type(e).__name__, file=sys.stderr)
     except Exception as e:
+        if pending:   # a failure before the replacement clears pending
+            try:
+                write_rotation_record(path, dict(read_rotation_record(path), pending=None))
+            except Exception:
+                pass
         for t in temps:   # a swap that failed leaves the log whole: an archive would be a duplicate of it
             try:
                 os.unlink(t)
