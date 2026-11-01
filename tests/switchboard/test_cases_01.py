@@ -583,11 +583,13 @@ class TestGitShim(Base):
                "XDG_CONFIG_HOME": str(self.home / "xdg-none"), "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "credential.helper", "GIT_CONFIG_VALUE_0": str(self.helper_path)}
         env.update(extra_env or {})   # (the sentinel test points the home variables at its scratch home)
         started = time.time()
-        done = subprocess.run([sys.executable, str(shim), "ls-remote", "http://127.0.0.1:%d/x.git" % port], capture_output=True, text=True, env=env, timeout=30)
+        done = subprocess.run([sys.executable, str(shim), "ls-remote", "http://127.0.0.1:%d/x.git" % port], capture_output=True, text=True, env=env, timeout=self.HANG_GUARD_SECONDS)
         took = time.time() - started
         server.close()
         thread.join(5)
         return done, took, starts.exists() and starts.read_text().count("started")
+
+    HANG_GUARD_SECONDS = 30   # the limit lsremote's subprocess.run uses
 
     def mutant(self, name, old, new):
         text = GIT_SHIM.read_text()
@@ -602,7 +604,10 @@ class TestGitShim(Base):
     def test_s5_a_local_port_url_fails_at_once_and_the_helper_never_starts(self):
         if not (shutil.which("git", path=SAFE_PATH) or shutil.which("git")):
             self.skipTest("no real git")
-        done, took, starts = self.lsremote(GIT_SHIM)
+        try:
+            done, took, starts = self.lsremote(GIT_SHIM)
+        except subprocess.TimeoutExpired:
+            self.fail("hang: git ls-remote to a closed local port did not return within %d s" % self.HANG_GUARD_SECONDS)
         self.assertEqual((done.returncode, starts), (128, 0), done.stderr)
         self.assertNotIn("started", done.stdout + done.stderr)
 
@@ -613,6 +618,7 @@ class TestGitShim(Base):
             "drop-terminal-prompt": ('{"GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "never"}', '{"GCM_INTERACTIVE": "never"}'),
             "drop-gcm-interactive": ('{"GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "never"}', '{"GIT_TERMINAL_PROMPT": "0"}'),
             "interactive-back-on": ('NO_DIALOG_CONFIG = "credential.interactive=false"', 'NO_DIALOG_CONFIG = "credential.interactive=true"'),
+            "no-dialog-wrapping-dropped": ("    return no_dialog(route_credentials(args))", "    return route_credentials(args)"),
             "code-host-only": ("    return no_dialog(route_credentials(args))", "    return no_dialog(route_credentials(args)) if any('github.com' in a for a in args) else route_credentials(args)"),
         }
         for name, (old, new) in mutants.items():
