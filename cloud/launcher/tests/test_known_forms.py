@@ -75,5 +75,48 @@ class S(unittest.TestCase):
         k.sweep(1e12, set()); self.assertEqual(len(k), len(set(cw.secret_forms(MODEL))))
 
 
+class Mutants(unittest.TestCase):
+    """S3 and S2 mutants: a scratch copy of the sweep, text asserted once, mutation asserted applied."""
+
+    SRC = open(cw.__file__).read()
+
+    def mutant(self, old, new):
+        self.assertEqual(self.SRC.count(old), 1)
+        src = self.SRC.replace(old, new)
+        self.assertNotEqual(src, self.SRC)
+        ns = {"__name__": "mut", "__file__": cw.__file__}
+        exec(compile(src, "mut", "exec"), ns)
+        return ns["KnownForms"]
+
+    def check_running(self, cls):
+        k = cls(); fs = set(cw.secret_forms(TOK))
+        k.add_forms(fs, ("until", 10.0, "p1"))
+        k.sweep(99999, {"p1"})
+        self.assertTrue(fs <= set(k), "a form of a running pod was dropped")
+        self.assertNotIn(TOK, cw.scrub("x " + TOK, k))
+        return len(fs)
+
+    def test_s3_control_and_mutant(self):
+        self.assertEqual(self.check_running(cw.KnownForms), 8)
+        bad = self.mutant('l[0] == "until" and now >= l[1] and l[2] not in pods', 'l[0] == "until" and now >= l[1]')
+        with self.assertRaises(AssertionError) as cm:
+            self.check_running(bad)
+        self.assertIn("a form of a running pod was dropped", str(cm.exception))
+
+    def check_model(self, cls):
+        k = cls(); mf = set(cw.secret_forms(MODEL))
+        k.add_forms(mf, None); k.add_forms(mf, ("pod", "p1"))
+        k.sweep(1e12, set())
+        self.assertTrue(mf <= set(k), "a model-entry form was dropped")
+        return len(mf)
+
+    def test_s2_model_control_and_mutant(self):
+        print("model forms kept", self.check_model(cw.KnownForms))
+        bad = self.mutant("                if lives is None:\n                    continue\n", "                if lives is None:\n                    lives = set()\n")
+        with self.assertRaises(AssertionError) as cm:
+            self.check_model(bad)
+        self.assertIn("a model-entry form was dropped", str(cm.exception))
+
+
 if __name__ == "__main__":
     unittest.main()
