@@ -1470,6 +1470,13 @@ def passed_copy(args, index, inline, value, text):
     return new, None, temp
 
 
+def body_below(value, depth=0):
+    if depth > 20:
+        raise Refused("the --input JSON is nested deeper than 20 levels, so its bodies cannot be checked")
+    items = value.items() if isinstance(value, dict) else enumerate(value) if isinstance(value, list) else ()
+    return any((isinstance(k, str) and k.lower() == "body") or body_below(v, depth + 1) for k, v in items)
+
+
 def input_call(args, name, found):
     index, inline, value = found
     text, data = read_input_json(value)
@@ -1490,6 +1497,11 @@ def input_call(args, name, found):
                     raise Unsignable("the --input comment body is not a string")
                 item[sub] = sign(item[sub], name)
                 signed = True
+    rest = [v for k, v in data.items() if not (isinstance(k, str) and k.lower() in ("body", "comments"))]
+    for key in [k for k in data if isinstance(k, str) and k.lower() == "comments"]:
+        rest += [item[sub] for item in data[key] for sub in item if not (isinstance(sub, str) and sub.lower() == "body")]
+    if any(body_below(v) for v in rest):
+        raise Refused("the --input JSON holds a body below the level that is signed, so it cannot be signed: send the comment bodies at the first level")
     if not signed:
         return passed_copy(args, index, inline, value, text)
     out = json.dumps(data)
