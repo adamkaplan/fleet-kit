@@ -1623,6 +1623,17 @@ class TestLaunchStack(Base):
         self.assertNotIn("--stack", self.create_argv())
         self.assertEqual(self.create_argv()[self.create_argv().index("--shape") + 1], "M")
 
+    def test_1771_the_create_call_carries_no_commit_for_the_flag_and_the_two_roles_only(self):
+        base = json.loads((self.FIXTURES / "launch-create-argv.json").read_text())
+        for extra in (("--no-commit",), ("--role", "tester"), ("--role", "reviewer"), ()):
+            with self.subTest(extra=extra):
+                self.state_clean()
+                code, out, err = self.launch_with("--cloud", *extra)
+                self.assertEqual(code, 0, err)
+                argv = self.create_argv()
+                self.assertEqual(argv.count("--no-commit"), 1 if extra else 0)
+                self.assertEqual([x for x in argv if x != "--no-commit"], base)   # the other options are identical
+
     def test_s9_the_fake_launcher_refuses_an_option_it_does_not_know(self):
         text = self.stub.read_text().replace('"--stack", ', "")
         self.stub.write_text(text)
