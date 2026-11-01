@@ -435,6 +435,7 @@ def build():
             pane = [e["pane"] for e in self.ledger() if e["kind"] == "lane_session" and e["review"] == review and e["lane"] == lane][-1]
             rows.append(("verdict",) + self.review(pane, "verdict", review, "--lane", lane, stdin=self.block(lane, rnd["plan_hash"]))[::2])
             rows.append(("status",) + self.review("orch", "status", review)[::2])
+            rows.append(("close",) + self.review("orch", "close", review, "--plan-ref", self.final_plan(), "--json")[::2])   # the same arguments as the existing close tests
             rows.append(("decide",) + self.review("cos", "decide", review, "--objection", "L2/O1", "--accept", "--reason", "the objection is right, revise the plan")[::2])
             rows.append(("respond",) + self.review("orch", "respond", review, "--plan-ref", "acme/app#8", "--table", self.table("L2/O1: accept"))[::2])
             engine, state, _ = sb.build_engine(self.route, self.world.clock.now, "cli", writable=True, socket_call=self.world.herdr.socket)
@@ -454,7 +455,7 @@ def build():
                 self.inject(self.lane_entry(got["review"], rnd, lane, old if lane != rnd["lanes"][-1] else got["plan_hash"]))
             before = len(self.ledger())
             rows = self.six_commands(got["review"], rnd)
-            self.assertEqual([r[0] for r in rows], ["verdict", "status", "decide", "respond", "closing"])
+            self.assertEqual([r[0] for r in rows], ["verdict", "status", "close", "decide", "respond", "closing"])
             for name, code, err in rows:
                 with self.subTest(command=name):
                     self.assertEqual(code, 2, err)
@@ -467,6 +468,51 @@ def build():
             self.assertEqual(len(self.ledger()), before)
             session = [e["session"] for e in self.ledger() if e["kind"] == "lane_session"][0]
             self.assertIn("is a reviewer lane", sb.review_lane_send_problem({"plan_review": {"enabled": True}}, session, "orch"))
+
+        def two_rounds(self):
+            """A round without the pair (rv1) and a round with it (rv2), both with silent lanes; the clock moves past the lane timeout."""
+            legacy = self.start_round(legacy=True)
+            self.plan_issue2["parent_issue_url"] = "https://api.github.com/repos/acme/app/issues/9"   # one open review per ask: the second round serves another ask
+            code, valid, err = self.start("orch", "acme/app#8", "acme/app#9")
+            self.assertEqual(code, 0, err)
+            self.assertTrue(self.kinds("round")[-1].get("plan_hashes"))
+            self.assertNotEqual(legacy["review"], valid["review"])
+            self.world.clock.t += 1000
+            return legacy, valid
+
+        def tick_over(self, module, legacy, valid):
+            os.environ["HERDR_PANE_ID"] = self.world.panes["orch"]
+            with captured() as (out, err), mock.patch.object(module, "owner_terminal_problem", lambda *a, **k: None), mock.patch.object(sys, "stdin", io.StringIO("")):
+                code = module.main(["plan", "review", "tick", "--json"], runner=self.route, now=self.world.clock.now,
+                                   wait=lambda sock, seconds: False, socket_call=self.world.herdr.socket)
+            return code, out.getvalue(), err.getvalue()
+
+        def test_the_tick_over_a_round_without_the_pair_and_a_round_with_it_skips_the_first_and_handles_the_second(self):
+            legacy, valid = self.two_rounds()
+            before = len(self.ledger())
+            code, out, err = self.tick_over(sb, legacy, valid)
+            self.assertEqual(code, 0, err)
+            done = json.loads(out)
+            self.assertEqual(done["skipped"], ["skipped: %s: this round predates the hash pair" % legacy["review"]])
+            self.assertEqual(sorted(done["relaunched"]), sorted(valid["lanes"]), "the round with its pair is handled")
+            added = self.ledger()[before:]
+            self.assertTrue(added and all(e["review"] == valid["review"] for e in added), "nothing is recorded for the skipped round")
+
+        def test_a_mutant_tick_that_raises_on_the_round_without_the_pair_handles_none_of_the_two(self):
+            legacy, valid = self.two_rounds()
+            with tempfile.TemporaryDirectory() as tmp:
+                msb = _entry_copy(tmp, "switchboard/plan_review.py",
+                                  '            done["skipped"].append("skipped: %s: this round predates the hash pair" % review)\n            continue\n',
+                                  '            raise ReviewError("boom")\n')
+                before = len(self.ledger())
+                try:
+                    code, out, err = self.tick_over(msb, legacy, valid)
+                except Exception as exc:
+                    code, out, err = 2, "", repr(exc)
+                relaunched = json.loads(out)["relaunched"] if out.strip().startswith("{") else []
+                with self.assertRaisesRegex(AssertionError, "the round with its pair is handled"):
+                    self.assertEqual(sorted(relaunched), sorted(valid["lanes"]), "the round with its pair is handled")
+                self.assertEqual(len(self.ledger()), before)
 
         def test_the_control_a_round_started_after_the_change_is_accepted_by_the_commands_and_its_lane_send_check_answers_as_before(self):
             got = self.start_round()
