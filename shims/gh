@@ -1286,90 +1286,134 @@ API_FIELD_FLAGS = ("-f", "--raw-field", "-F", "--field")
 API_ENDPOINT_RE = re.compile(r"^/?repos/[^/?#]+/[^/?#]+/(?:%s)/?(?:\?.*)?$" % "|".join(p for _label, p in SIGNED_API))
 
 
-SHORT_VALUE_LETTERS = "XfFHRqtp"   # the value-taking short flags of gh api (API_VALUE_FLAGS and -R); every other short letter (-i, -h) is a boolean
+# ---- #1696 round 6: ONE PARSER of the argv of `gh api`, following gh's flag library (spf13/pflag). Every reader of that argv in this shim (api_parse,
+# api_scan, input_value, the signing positions) is a view of ITS result; nothing else reads the words. PINNED to gh 2.103.3 (2026-10-26): the table below is
+# `gh api --help` of that version; a gh upgrade is a conscious update of this table. (gh api has no -R/--repo of its own: a leading -R is leading_repo_flags.)
+GH_API_PINNED = "2.103.3"
+GH_API_FLAGS = (   # (long name, short letter or "", takes a value)
+    ("allow-escape-sequences", "", False), ("cache", "", True), ("field", "F", True), ("header", "H", True),
+    ("hostname", "", True), ("include", "i", False), ("input", "", True), ("jq", "q", True), ("method", "X", True),
+    ("paginate", "", False), ("preview", "p", True), ("raw-field", "f", True), ("silent", "", False), ("slurp", "", False),
+    ("template", "t", True), ("verbose", "", False), ("help", "h", False))
+GH_API_LONG = {name: (name, short, value) for name, short, value in GH_API_FLAGS}
+GH_API_SHORT = {short: (name, short, value) for name, short, value in GH_API_FLAGS if short}
+BOOL_TRUE, BOOL_FALSE = ("1", "t", "T", "TRUE", "true", "True"), ("0", "f", "F", "FALSE", "false", "False")
 
 
-def short_eq_token(arg):
-    """True when a single-dash argument, walked letter by letter as pflag does, meets an '=' where a flag letter or the joined value should start: boolean
-    letters continue the walk, the first value-taking letter ends it (what follows is its joined value: -fbody=x, -XPOST, -iXPOST are the legal joined forms),
-    and an '=' straight after a letter (-f=body=x, -iX=POST, -ii=) is the form pflag strips and this reader would misread."""
-    if not arg.startswith("-") or arg.startswith("--") or len(arg) < 2:
-        return False
-    for pos in range(1, len(arg)):
-        ch = arg[pos]
-        if ch == "=":
-            return pos > 1
-        if ch in SHORT_VALUE_LETTERS:
-            return arg[pos + 1:pos + 2] == "="
-    return False
+class ApiArgv:
+    """The result of parse_api_argv. flags: [(name, token index, joined text or None, value)] in order; the joined text is the part of the token that holds the
+    value (so args[index][:len-len(joined)] + new rewrites it), None when the value is the next word (index + 1)."""
+    def __init__(self):
+        self.flags, self.positionals = [], []
+
+    def values(self, name):
+        return [f for f in self.flags if f[0] == name]
+
+    @property
+    def method(self):   # the explicit last -X/--method, upper-cased; None when none
+        found = self.values("method")
+        return found[-1][3].upper() if found else None
+
+    @property
+    def fields(self):   # [(token index, flag name, joined, text)] of every field flag; the key/value split is on the FIRST '='
+        return [(f[1], f[0], f[2], f[3]) for f in self.flags if f[0] in ("field", "raw-field")]
+
+    @property
+    def headers(self):   # [(lower-cased name, value)] of every header
+        return [(v.partition(":")[0].strip().lower(), v.partition(":")[2].strip()) for _n, _i, _j, v in self.values("header")]
+
+    @property
+    def input(self):
+        found = self.values("input")
+        return found[-1] if found else None
+
+    @property
+    def hostname(self):
+        found = self.values("hostname")
+        return found[-1][3] if found else None
+
+    @property
+    def effective_method(self):   # gh's own rule: POST when a field or --input is given and no explicit method
+        return self.method or ("POST" if self.fields or self.input else "GET")
 
 
-def refuse_short_eq(args):
-    """#1696 round 6: a short option written with an attached '=' (-f=body=x, -H=NAME:value, -X=POST, -iX=POST, -if=body=x) is refused wherever argv is first read: the
-    real option parser strips the '=' and this reader does not, so the shim does not guess. Long options (--field=body=x) are not affected."""
-    for arg in args[1:]:
-        if arg == "--":
-            break
-        if short_eq_token(arg):
-            raise Refused("the short option %s is written with an attached '=': it is refused because the shim and gh read it differently; write the value as a separate word or use the long form (--field=..., --header=...)" % _clean_reason(arg[:40]))
+def _api_refuse(token, rule):
+    raise Refused("%s: %s (the shim reads gh api's argv as gh's flag library does, and refuses what it cannot classify)" % (_clean_reason(token[:40]), rule))
 
 
-def api_parse(args):
-    """(positionals, method or None, fields) of a `gh api` call; fields are (index, flag, inline, text) of every field flag, in order."""
-    refuse_short_eq(args)
-    positionals, method, fields, i = [], None, [], 1
+def parse_api_argv(args):
+    """Parse args (args[0] == "api") as pflag does. Raises Refused for an unknown flag, a missing value, a boolean with a non-bool value, an unknown short letter,
+    or a second positional. `--` ends the flags; a lone `-` and every word after the first non-flag are positionals (options may follow the endpoint)."""
+    out, i = ApiArgv(), 1
     while i < len(args):
         arg = args[i]
         if arg == "--":
-            positionals.extend(args[i + 1:])
+            out.positionals.extend((j, args[j]) for j in range(i + 1, len(args)))
             break
-        long_inline = arg.startswith("--") and "=" in arg
-        base = arg.split("=", 1)[0] if long_inline else arg
-        if base in API_VALUE_FLAGS and not long_inline:
-            value = args[i + 1] if i + 1 < len(args) else None
-            if base in ("-X", "--method") and value is not None:
-                method = value.upper()
-            if base in API_FIELD_FLAGS and value is not None:
-                fields.append((i, base, None, value))
-            i += 2
-            continue
-        if long_inline and base in API_VALUE_FLAGS:
-            value = arg.split("=", 1)[1]
-            if base == "--method":
-                method = value.upper()
-            if base in API_FIELD_FLAGS:
-                fields.append((i, base, value, value))
-        elif arg.startswith("-") and not arg.startswith("--") and len(arg) > 2 and arg[:2] in API_VALUE_FLAGS:
-            value = arg[2:]
-            if arg[:2] == "-X":
-                method = value.upper()
-            if arg[:2] in API_FIELD_FLAGS:
-                fields.append((i, arg[:2], value, value))
-        elif not arg.startswith("-"):
-            positionals.append(arg)
+        if arg.startswith("--"):
+            name, eq, value = arg[2:].partition("=")
+            spec = GH_API_LONG.get(name)
+            if spec is None:
+                _api_refuse(arg, "unknown flag --%s" % name)
+            if spec[2]:
+                if eq:
+                    out.flags.append((name, i, value, value))
+                elif i + 1 < len(args):
+                    out.flags.append((name, i, None, args[i + 1]))
+                    i += 1
+                else:
+                    _api_refuse(arg, "flag --%s needs a value" % name)
+            elif eq and value not in BOOL_TRUE + BOOL_FALSE:
+                _api_refuse(arg, "boolean flag --%s given the value %r, which is not true or false" % (name, value[:20]))
+            elif not eq or value in BOOL_TRUE:
+                out.flags.append((name, i, None, "true"))
+        elif arg.startswith("-") and len(arg) > 1:
+            rest = arg[1:]
+            while rest:
+                spec = GH_API_SHORT.get(rest[0])
+                if spec is None:
+                    _api_refuse(arg, "unknown short flag -%s" % rest[0])
+                tail = rest[1:]
+                if len(tail) > 1 and tail[0] == "=":
+                    tail = tail[1:]   # pflag strips ONE '=' straight after the letter (only when something follows it)
+                if spec[2]:
+                    if tail:
+                        out.flags.append((spec[0], i, tail, tail))
+                    elif i + 1 < len(args):
+                        out.flags.append((spec[0], i, None, args[i + 1]))
+                        i += 1
+                    else:
+                        _api_refuse(arg, "flag -%s needs a value" % rest[0])
+                    break
+                if rest[1:2] == "=" and len(rest) > 2:   # a boolean short with a joined value ends the cluster; only a bool literal is read
+                    if tail not in BOOL_TRUE + BOOL_FALSE:
+                        _api_refuse(arg, "boolean flag -%s given the value %r, which is not true or false" % (rest[0], tail[:20]))
+                    if tail in BOOL_TRUE:
+                        out.flags.append((spec[0], i, None, "true"))
+                    break
+                out.flags.append((spec[0], i, None, "true"))
+                rest = rest[1:]
+        else:
+            out.positionals.append((i, arg))
         i += 1
-    return positionals, method, fields
-
-
-_api_parse_raw = api_parse
+    if len(out.positionals) > 1:
+        _api_refuse(out.positionals[1][1], "a second positional (gh api takes one endpoint)")
+    return out
 
 
 def api_parse(args):
-    positionals, method, fields = _api_parse_raw(args)
+    """(positionals, method or None, fields) of a `gh api` call: a view of parse_api_argv; fields are (index, flag, inline, text) of every field flag, in order."""
+    parsed = parse_api_argv(args)
+    flagmap = {"field": "-F", "raw-field": "-f"}
+    positionals, method = [p for _i, p in parsed.positionals], parsed.method
+    fields = [(i, flagmap[n], j, v) for i, n, j, v in parsed.fields]
     return [api_endpoint(p) for p in positionals], method, fields
 
 
 def input_value(args):
     """(index, inline, value) of the LAST --input of a `gh api` call, or None."""
-    found = None
-    for i in range(1, len(args)):
-        if args[i] == "--":
-            break
-        if args[i] == "--input":
-            found = (i, None, args[i + 1] if i + 1 < len(args) else "")
-        elif args[i].startswith("--input="):
-            found = (i, args[i][8:], args[i][8:])
-    return found
+    found = parse_api_argv(args).input
+    return None if found is None else (found[1], found[2], found[3])
 
 
 def read_input_json(value):
@@ -1734,50 +1778,12 @@ REST_WRITES = (   # (label, path after repos/OWNER/REPO/, methods): the unsigned
 
 
 def api_scan(args, headers=None):
-    """(method, has_input, field texts, positionals) of a `gh api` call read the way gh (cobra) reads flags: -X/--method any case and joined, bundled short
-    flags (-iXPUT, -ifa=b), `--flag=value`, repeated flags (the last method wins), `--` ends the flags. method is None when none is given, "" when its value is missing."""
-    refuse_short_eq(args)
-    method, has_input, fields, positionals, i = None, False, [], [], 1
-    longs = {"--method": "m", "--raw-field": "f", "--field": "f", "--input": "i", "--header": "x", "--jq": "x", "--template": "x", "--hostname": "x", "--cache": "x", "--preview": "x"}
-    while i < len(args):
-        arg = args[i]
-        i += 1
-        if arg == "--":
-            positionals.extend(args[i:])
-            break
-        if arg.startswith("--"):
-            name, eq, value = arg.partition("=")
-            kind = longs.get(name)
-            if kind is None:
-                continue
-            if not eq:
-                value = args[i] if i < len(args) else None
-                i += 1
-            if kind == "x" and name == "--header" and headers is not None and value is not None:
-                headers.append(value)
-            if kind == "m":
-                method = "" if value is None else value.upper()
-            elif kind == "f" and value is not None:
-                fields.append(value)
-            elif kind == "i":
-                has_input = True
-        elif arg.startswith("-") and len(arg) > 1:
-            for pos, ch in enumerate(arg[1:], 1):
-                if ch in "XHfFqtp":
-                    value = arg[pos + 1:] or None
-                    if value is None:
-                        value = args[i] if i < len(args) else None
-                        i += 1
-                    if ch == "H" and headers is not None and value is not None:
-                        headers.append(value)
-                    if ch == "X":
-                        method = "" if value is None else value.upper()
-                    elif ch in "fF" and value is not None:
-                        fields.append(value)
-                    break
-        else:
-            positionals.append(arg)
-    return method, has_input, fields, positionals
+    """(method, has_input, field texts, positionals) of a `gh api` call: a view of parse_api_argv (method is None when none is given); headers, if a list, receives
+    the header texts."""
+    parsed = parse_api_argv(args)
+    if headers is not None:
+        headers.extend(v for _n, _i, _j, v in parsed.values("header"))
+    return parsed.method, parsed.input is not None, [v for _i, _n, _j, v in parsed.fields], [p for _i, p in parsed.positionals]
 
 
 class GqlError(Exception):

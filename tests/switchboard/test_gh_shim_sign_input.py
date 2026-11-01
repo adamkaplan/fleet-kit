@@ -1102,21 +1102,8 @@ class TestGhShimRawPath(unittest.TestCase):
         self.assertEqual(calls, [])
 
 
-EQ_ANCHOR = "gh: refused: the short option "
 Q_ANCHOR = "gh: refused: a '?' (URL query string) on the graphql endpoint is refused"
 COMMENTS = "repos/o/r/issues/1/comments"
-SHORT_EQ_FORMS = {   # name -> argv after api
-    "-f=": (COMMENTS, "-f=body=x"), "-F=": (COMMENTS, "-F=body=@/dev/null"), "-X=": (COMMENTS, "-X=POST", "-f", "body=x"),
-    "-H=": (COMMENTS, "-H=Accept:x", "-f", "body=x"), "-H= override": ("repos/o/r/issues/1", "-X", "POST", "-H=X-HTTP-Method-Override: PATCH", "-f", "title=x"),
-    "-i=": (COMMENTS, "-i=", "-f", "body=x"), "-R=": (COMMENTS, "-R=o/r", "-f", "body=x"),
-    "-p= (value-taking)": (COMMENTS, "-p=x"), "-q= (value-taking)": (COMMENTS, "-q=x"), "-t= (value-taking)": (COMMENTS, "-t=x"),
-    "-i= (boolean)": ("repos/o/r/issues", "-i="), "-h= (boolean)": ("repos/o/r/issues", "-h="),
-}
-CLUSTER_FORMS = {
-    "-iX=POST": (COMMENTS, "-iX=POST", "-f", "body=x"), "-if=body=x": (COMMENTS, "-if=body=x"),
-    "-iiX=POST": (COMMENTS, "-iiX=POST", "-f", "body=x"), "-iF=body=@f": (COMMENTS, "-iF=body=@/dev/null"),
-    "-iH=override": ("repos/o/r/issues/1", "-X", "POST", "-iH=X-HTTP-Method-Override:PATCH", "-f", "title=x"),
-}
 QUERY_FORMS = {
     "mutation in url query, POST": ("graphql?query=mutation{x}", "-X", "POST", "-f", "query={viewer{login}}"),
     "mutation in url query, bare GET": ("graphql?query=mutation{x}",),
@@ -1146,11 +1133,6 @@ class TestGhShimRound5(unittest.TestCase):
                 bad.append(name)
         return bad
 
-    def test_short_options_with_an_attached_equals_are_refused(self):
-        self.assertEqual(self.failing(self.rig, SHORT_EQ_FORMS, EQ_ANCHOR), [])
-        done, calls = self.rig.run("api", COMMENTS, "-i=")
-        self.assertEqual(gh_err(done).count("\n"), 0)
-        self.assertIn("-i=", gh_err(done))
 
     def test_the_long_forms_and_plain_forms_still_work(self):
         done, calls = self.rig.run("api", COMMENTS, "--field=body=x")
@@ -1171,12 +1153,6 @@ class TestGhShimRound5(unittest.TestCase):
         done, calls = self.rig.run("api", "graphql", "-f", "query=query{viewer{login}}")
         self.assertEqual(len(calls), 1, gh_err(done))
 
-    def test_mutant_short_equals_refusal_removed_is_seen(self):
-        rig = self.mutant_rig('        if short_eq_token(arg):', '        if False:')
-        seen = self.failing(rig, SHORT_EQ_FORMS, EQ_ANCHOR)
-        print("R5 mutant short '=' refusal removed: %d of %d forms fail: %s; control %d" % (len(seen), len(SHORT_EQ_FORMS), seen, len(self.failing(self.rig, SHORT_EQ_FORMS, EQ_ANCHOR))))
-        self.assertEqual(seen, list(SHORT_EQ_FORMS))
-        self.assertEqual(self.failing(self.rig, SHORT_EQ_FORMS, EQ_ANCHOR), [])
 
     def test_mutant_graphql_question_mark_refusal_removed_is_seen(self):
         rig = self.mutant_rig('if "?" in raw and api_endpoint(raw) == "graphql":', 'if False:')
@@ -1186,33 +1162,229 @@ class TestGhShimRound5(unittest.TestCase):
         self.assertEqual(self.failing(self.rig, QUERY_FORMS, Q_ANCHOR), [])
 
 
-    def test_cluster_forms_are_refused(self):
-        self.assertEqual(self.failing(self.rig, CLUSTER_FORMS, EQ_ANCHOR), [])
-        done, calls = self.rig.run("api", COMMENTS, "-H=X-HTTP-Method-Override:PATCH", "-f", "body=x")
-        self.assertEqual(calls, [])
-        self.assertTrue(gh_err(done).startswith(EQ_ANCHOR))
 
-    def test_joined_cluster_forms_still_work(self):
-        done, calls = self.rig.run("api", COMMENTS, "-ifbody=x")   # joined, no '=' after the flag letter: not the '=' rule's; the bundled field is not read by api_parse, so (as before) the call is refused as unreadable, never passed unsigned
-        self.assertEqual(calls, [])
-        self.assertTrue(gh_err(done).startswith("gh: refused: the flags of this gh api call") and not gh_err(done).startswith(EQ_ANCHOR), gh_err(done))
-        done, calls = self.rig.run("api", COMMENTS, "-fbody=x")   # the plain joined form signs once
-        self.assertEqual(len(calls), 1, gh_err(done))
-        self.assertEqual(calls[0]["argv"][-1].count(SIGNED), 1)
-        done, calls = self.rig.run("api", COMMENTS, "-iXPOST", "-f", "body=x")   # a POST on an allow-listed path: signed
-        self.assertEqual(len(calls), 1, gh_err(done))
-        self.assertEqual(calls[0]["argv"][-1].count(SIGNED), 1)
-        done, calls = self.rig.run("api", "repos/o/r/unknownthing", "-iXPOST")   # a write on an unknown path: refused
-        self.assertEqual(calls, [])
-        self.assertTrue(gh_err(done).startswith("gh: refused:") and not gh_err(done).startswith(EQ_ANCHOR), gh_err(done))
-        done, calls = self.rig.run("api", "repos/o/r/issues", "-i")
-        self.assertEqual(len(calls), 1, gh_err(done))
-        done, calls = self.rig.run("api", "repos/o/r/issues", "-ii")
-        self.assertEqual(len(calls), 1, gh_err(done))
 
-    def test_mutant_one_letter_rule_fails_the_cluster_forms(self):
-        rig = self.mutant_rig('        if short_eq_token(arg):', '        if re.match(r"^-[A-Za-z]=", arg):')
-        seen = self.failing(rig, CLUSTER_FORMS, EQ_ANCHOR)
-        print("R6 mutant one-letter rule: %d of %d cluster forms fail: %s; control %d" % (len(seen), len(CLUSTER_FORMS), seen, len(self.failing(self.rig, CLUSTER_FORMS, EQ_ANCHOR))))
-        self.assertEqual(seen, list(CLUSTER_FORMS))
-        self.assertEqual(self.failing(self.rig, CLUSTER_FORMS, EQ_ANCHOR), [])
+
+
+# ---- #1696 round 6: the DIFFERENTIAL TABLE of the one parser of gh api's argv (pflag grammar, gh 2.103.3).
+PARSE_ANCHOR = "gh: refused: "
+COMMENTS = "repos/o/r/issues/1/comments"
+OVERRIDE_NAMES = ("X-HTTP-Method-Override", "X-HTTP-Method", "X-Method-Override")
+
+
+def load_argv_parser(source):
+    """The shim's flag table and parse_api_argv, executed alone."""
+    start, stop = source.index("GH_API_PINNED = "), source.index("def api_parse(")
+    class Refused(Exception):
+        pass
+    space = {"Refused": Refused, "_clean_reason": lambda text: text}
+    exec(source[start:stop], space)
+    return space
+
+
+def old_scan(args):
+    """The OLD reading of the argv (api_scan of ea4298a4, before the parser): (method, field texts, positionals); used as the mutant."""
+    method, fields, positionals, i = None, [], [], 1
+    longs = {"--method": "m", "--raw-field": "f", "--field": "f", "--input": "i", "--header": "x", "--jq": "x", "--template": "x", "--hostname": "x", "--cache": "x", "--preview": "x"}
+    while i < len(args):
+        arg = args[i]
+        i += 1
+        if arg == "--":
+            positionals.extend(args[i:])
+            break
+        if arg.startswith("--"):
+            name, eq, value = arg.partition("=")
+            kind = longs.get(name)
+            if kind is None:
+                continue
+            if not eq:
+                value = args[i] if i < len(args) else None
+                i += 1
+            if kind == "m":
+                method = "" if value is None else value.upper()
+            elif kind == "f" and value is not None:
+                fields.append(value)
+        elif arg.startswith("-") and len(arg) > 1:
+            for pos, ch in enumerate(arg[1:], 1):
+                if ch in "XHfFqtp":
+                    value = arg[pos + 1:] or None
+                    if value is None:
+                        value = args[i] if i < len(args) else None
+                        i += 1
+                    if ch == "X":
+                        method = "" if value is None else value.upper()
+                    elif ch in "fF" and value is not None:
+                        fields.append(value)
+                    break
+        else:
+            positionals.append(arg)
+    return method, fields, positionals
+
+
+def view_new(space, tail):
+    """(method, [field texts], [header lines], [positionals]) from the shim's parser, or None when it refuses."""
+    try:
+        got = space["parse_api_argv"](["api"] + list(tail))
+    except space["Refused"]:
+        return None
+    return got.method, [f[3] for f in got.fields], ["%s:%s" % h for h in got.headers], [p for _i, p in got.positionals]
+
+
+def view_old(tail):
+    method, fields, positionals = old_scan(["api"] + list(tail))
+    return method, fields, None, positionals
+
+
+def table_cases():
+    """(label, argv after api, expected (method, field texts, headers, positionals) or None when refused, effect: signed / pass / refused)."""
+    c = []
+    def add(label, tail, method, fields, headers, pos, effect):
+        c.append((label, tuple(tail), None if method == "refused" else (method, fields, headers, pos), effect))
+    for form in ("-f=body=x", "-ifbody=x", "-fbody=x"):
+        add(form, (COMMENTS, form), None, ["body=x"], [], [COMMENTS], "signed")
+    add("-if=body=x", (COMMENTS, "-if=body=x"), None, ["body=x"], [], [COMMENTS], "signed")
+    add("-f body=x", (COMMENTS, "-f", "body=x"), None, ["body=x"], [], [COMMENTS], "signed")
+    add("-f= (value '=')", (COMMENTS, "-f=", "-f", "body=x"), None, ["=", "body=x"], [], [COMMENTS], "signed")
+    add("-F=body=@file", (COMMENTS, "-F=body=@{FILE}"), None, ["body=@{FILE}"], [], [COMMENTS], "signed")
+    for form in ("-iX=POST", "-XPOST", "-X=POST"):
+        add(form, (COMMENTS, form), "POST", [], [], [COMMENTS], "pass")
+    add("-X POST", (COMMENTS, "-X", "POST"), "POST", [], [], [COMMENTS], "pass")
+    add("--method=POST", (COMMENTS, "--method=POST"), "POST", [], [], [COMMENTS], "pass")
+    add("--method POST", (COMMENTS, "--method", "POST"), "POST", [], [], [COMMENTS], "pass")
+    add("--field=body=x", (COMMENTS, "--field=body=x"), None, ["body=x"], [], [COMMENTS], "signed")
+    add("--field body=x", (COMMENTS, "--field", "body=x"), None, ["body=x"], [], [COMMENTS], "signed")
+    add("--raw-field=body=x", (COMMENTS, "--raw-field=body=x"), None, ["body=x"], [], [COMMENTS], "signed")
+    add("--raw-field body=x", (COMMENTS, "--raw-field", "body=x"), None, ["body=x"], [], [COMMENTS], "signed")
+    add("options after the endpoint", (COMMENTS, "-X", "POST", "-f", "body=x"), "POST", ["body=x"], [], [COMMENTS], "signed")
+    add("options before the endpoint", ("-f", "body=x", COMMENTS), None, ["body=x"], [], [COMMENTS], "signed")
+    add("-X twice, last wins (POST)", (COMMENTS, "-X", "GET", "-X", "POST"), "POST", [], [], [COMMENTS], "pass")
+    add("-X twice, last wins (GET)", (COMMENTS, "-X", "POST", "-X", "GET", "-f", "body=x"), "GET", ["body=x"], [], [COMMENTS], "pass")
+    add("-f twice (stringArray)", (COMMENTS, "-f", "body=a", "-f", "body=b"), None, ["body=a", "body=b"], [], [COMMENTS], "signed")
+    add("-- then a flag-looking positional", ("--", "-f"), None, [], [], ["-f"], "pass")
+    add("-- then the endpoint", ("--", COMMENTS, ), None, [], [], [COMMENTS], "pass")
+    add("-- before a field-looking word", (COMMENTS, "--", "-f"), "refused", None, None, None, "refused")
+    add("lone - is a positional", ("-",), None, [], [], ["-"], "pass")
+    add("-i then -h booleans", (COMMENTS, "-ih"), None, [], [], [COMMENTS], "pass")
+    add("--include=true", (COMMENTS, "--include=true"), None, [], [], [COMMENTS], "pass")
+    add("--include=false", (COMMENTS, "--include=false"), None, [], [], [COMMENTS], "pass")
+    add("-i=true", (COMMENTS, "-i=true"), None, [], [], [COMMENTS], "pass")
+    add("a boolean with a non-bool value", (COMMENTS, "--include=maybe"), "refused", None, None, None, "refused")
+    add("a short boolean with a non-bool value", (COMMENTS, "-i=maybe"), "refused", None, None, None, "refused")
+    add("a missing value (-f)", (COMMENTS, "-f"), "refused", None, None, None, "refused")
+    add("a missing value (--method)", (COMMENTS, "--method"), "refused", None, None, None, "refused")
+    add("an unknown flag", (COMMENTS, "--bogus"), "refused", None, None, None, "refused")
+    add("a long-name abbreviation", (COMMENTS, "--meth=POST"), "refused", None, None, None, "refused")
+    add("an unknown short in a cluster", (COMMENTS, "-iz"), "refused", None, None, None, "refused")
+    add("-R after api", (COMMENTS, "-R", "o/r"), "refused", None, None, None, "refused")
+    add("--repo after api", (COMMENTS, "--repo=o/r"), "refused", None, None, None, "refused")
+    add("two positionals", (COMMENTS, "repos/o/r/issues"), "refused", None, None, None, "refused")
+    for name in OVERRIDE_NAMES:
+        low = name.lower()
+        for label, tail in (("-H joined", ("-H" + name + ":PATCH",)), ("-H separate", ("-H", name + ": PATCH")), ("--header=", ("--header=" + name + ":PATCH",)),
+                            ("--header separate", ("--header", name + ":PATCH")), ("-H=", ("-H=" + name + ":PATCH",)), ("-iH joined", ("-iH" + name + ":PATCH",)),
+                            ("-iH=", ("-iH=" + name + ":PATCH",))):
+            add("%s %s" % (label, name), (COMMENTS,) + tail + ("-f", "body=x"), None, ["body=x"], ["%s:PATCH" % low], [COMMENTS], "refused")
+    return c
+
+
+def decide_effect(rig, tail, tmp):
+    """'signed' | 'pass' | 'refused' for the real shim (and the refusal's anchored one line); 'bad' otherwise."""
+    args = ("api",) + tuple(tail)
+    done, calls = rig.run(*args, stdin="")
+    if not calls:
+        return "refused" if gh_err(done).startswith(PARSE_ANCHOR) and len(gh_err(done).splitlines()) == 1 else "bad: " + gh_err(done)[:80]
+    if len(calls) != 1:
+        return "bad: %d calls" % len(calls)
+    argv = calls[0]["argv"]
+    if argv == list(args):
+        return "pass"
+    words = [w for w in argv if SIGNED in w]
+    if not words and any("body=@" in w for w in argv) and argv[:2] == list(args[:2]):   # -F body=@file: signed text goes to a temp file
+        return "signed"
+    return "signed" if words and all(w.count(SIGNED) == 1 for w in words) else "bad: " + " ".join(argv)[:80]
+
+
+OLD_MISREADS = ('-- before a field-looking word', '--repo after api', '-F=body=@file', '-R after api', '-X=POST', '-f=body=x', '-iX=POST', '-if=body=x', 'a boolean with a non-bool value',
+                'a long-name abbreviation', 'a missing value (--method)', 'a missing value (-f)', 'a short boolean with a non-bool value', 'an unknown flag', 'an unknown short in a cluster', 'two positionals')
+
+
+class TestGhShimArgvParser(unittest.TestCase):
+    def setUp(self):
+        self.rig = hermetic_rig()
+        self.addCleanup(self.rig.close)
+        self.source = (SHIM_DIR / "gh").read_text()
+        self.cases = table_cases()
+        import tempfile
+        self.dir = tempfile.mkdtemp(prefix="argvtable-")
+        self.file = os.path.join(self.dir, "b.txt")
+        with open(self.file, "w") as fh:
+            fh.write("from a file")
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.dir, ignore_errors=True))
+
+    def fill(self, tail):
+        return tuple(t.replace("{FILE}", self.file) for t in tail)
+
+    def parse_failures(self, view, cases=None):
+        bad = []
+        for label, tail, expected, _effect in (cases or self.cases):
+            tail = self.fill(tail)
+            want = None if expected is None else (expected[0], [x.replace("{FILE}", self.file) for x in expected[1]], expected[2], [x.replace("{FILE}", self.file) for x in expected[3]])
+            got = view(tail)
+            if got is not None and want is not None and got[2] is None:   # the old reading has no header list: compare the other three
+                ok = (got[0], got[1], got[3]) == (want[0], want[1], want[3])
+            else:
+                ok = (got is None) == (want is None) and (want is None or tuple(got) == want)
+            if not ok:
+                bad.append("%s: parsed %r, expected %r" % (label, got, want))
+        return bad
+
+    def test_control_the_parser_reads_every_form_as_expected(self):
+        space = load_argv_parser(self.source)
+        self.assertEqual(self.parse_failures(lambda tail: view_new(space, tail)), [])
+
+    def test_control_the_shim_decides_every_form_by_effect(self):
+        bad = []
+        for label, tail, _expected, effect in self.cases:
+            got = decide_effect(self.rig, self.fill(tail), self.dir)
+            if got != effect:
+                bad.append("%s: %s, expected %s" % (label, got, effect))
+        self.assertEqual(bad, [])
+
+    def test_the_flag_table_is_the_pinned_one(self):
+        space = load_argv_parser(self.source)
+        self.assertEqual(space["GH_API_PINNED"], "2.103.3")
+        self.assertEqual(sorted(n for n, _s, _v in space["GH_API_FLAGS"]), sorted(
+            "allow-escape-sequences cache field header hostname include input jq method paginate preview raw-field silent slurp template verbose help".split()))
+        self.assertEqual({n: (s, v) for n, s, v in space["GH_API_FLAGS"] if s}, {"field": ("F", True), "header": ("H", True), "include": ("i", False), "jq": ("q", True), "method": ("X", True),
+                                                                                    "preview": ("p", True), "raw-field": ("f", True), "template": ("t", True), "help": ("h", False)})
+
+    def test_mutant_the_old_reading_fails_the_forms_it_misreads(self):
+        seen = self.parse_failures(view_old)
+        labels = sorted(s.split(": parsed")[0] for s in seen)
+        print("R6 old-reading mutant: %d forms fail: %s" % (len(labels), labels))
+        for s in seen:
+            self.assertIn(": parsed ", s)
+        self.assertEqual(labels, sorted(OLD_MISREADS))
+        self.assertEqual(self.parse_failures(lambda tail: view_new(load_argv_parser(self.source), tail)), [])   # CONTROL: 0 failures
+
+    def mutant_space(self, old, new):
+        self.assertEqual(self.source.count(old), 1, "the mutant's anchor is gone: " + old)
+        return load_argv_parser(self.source.replace(old, new))
+
+    def check_mutant(self, name, space, must):
+        seen = self.parse_failures(lambda tail: view_new(space, tail))
+        print("R6 mutant %s: %d forms fail" % (name, len(seen)))
+        self.assertTrue(seen, name)
+        for label in must:
+            self.assertTrue(any(s.startswith(label + ": parsed") for s in seen), (name, label))
+
+    def test_mutant_f_marked_boolean_is_seen(self):
+        self.check_mutant("-f boolean", self.mutant_space('("raw-field", "f", True)', '("raw-field", "f", False)'), ["-f body=x", "-fbody=x"])
+
+    def test_mutant_double_dash_rule_skipped_is_seen(self):
+        old = '        if arg == "--":\n            out.positionals.extend((j, args[j]) for j in range(i + 1, len(args)))\n            break\n'
+        self.check_mutant("-- skipped", self.mutant_space(old, ""), ["-- then the endpoint", "-- then a flag-looking positional"])
+
+    def test_mutant_unknown_flags_passed_is_seen(self):
+        old = '                _api_refuse(arg, "unknown flag --%s" % name)\n'
+        self.check_mutant("unknown flags passed", self.mutant_space(old, "                i += 1\n                continue\n"), ["an unknown flag"])
