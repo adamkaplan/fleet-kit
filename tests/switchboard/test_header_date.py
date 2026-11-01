@@ -183,3 +183,11 @@ class TestHeaderDateCallSites(unittest.TestCase):
         control, mutant = mutant_of(sb.compose, "held >= 7200", "held > 7200")
         self.assertIn("held 2 h", self.head(control, [fact(7200)], NOW))
         self.assertIn("held 120 min", self.head(mutant, [fact(7200)], NOW))
+
+
+class TestHeaderInfiniteTime(unittest.TestCase):
+    def test_l3_an_infinite_delivery_time_still_delivers_the_message(self):
+        for delivered in (float("inf"), float("nan")):
+            text, carried = sb.compose("platform", [sb.Fact("send:c:1", "platform", "send", "msg", NOW, batch=False, sender="coder")], delivered=delivered)
+            self.assertTrue(text.startswith("[switchboard] 1 for platform"))
+            self.assertEqual(len(carried), 1)

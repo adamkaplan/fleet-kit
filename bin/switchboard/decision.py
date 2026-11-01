@@ -215,7 +215,7 @@ def compose(recipient, facts, cap=MESSAGE_CAP, section=None, repos=None, deliver
             late = delayed_since(taken, delivered)   # #1402: the sent time comes first, and an old alert or digest says so in this first line
             if late is not None:
                 held = delivered - late
-                held = "held %d h" % (held // 3600) if held >= 7200 else "held %d min" % (held // 60)
+                held = "held ??" if not -1e18 < held < 1e18 else "held %d h" % (held // 3600) if held >= 7200 else "held %d min" % (held // 60)   # a time that is not finite never stops a message
                 sent = "delayed: sent %s, %s" % (clock_day(late, delivered), held) + ("" if first == last else ", newest sent %s" % last)
             else:
                 sent = "sent %s" % (first if first == last else "%s-%s" % (first, last))
