@@ -213,3 +213,83 @@ def read_run_record(name, retired, state, runner, now):
     if cut:
         print("[%d characters cut]" % cut)
     return D["EXIT_OK"]
+
+
+# ---- ask #1788: the last text of a stopped pod, cut and scrubbed for sending to its boss ----
+LAST_DIR = "cloud-last"          # <state>/cloud-last/<run record name>.txt: the rest of the text, 0600, the directory 0700
+LAST_HEAD = 3000                 # characters that go in the message
+LAST_FILE = 20000                # characters beyond the head that go in the file
+LAST_KEEP_SECONDS = 7 * 86400
+LAST_SCRUB_MAX = 200000          # the scrub's own input maximum (SCRUB_INPUT_MAX of the launcher): the cut before it
+_ENDPOINT_RE = re.compile(r"https?://worker-[a-z0-9-]+\.[a-z0-9.-]+(:[0-9]+)?")
+_LAST_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,199}", re.ASCII)
+
+
+def clean_last(base, now):
+    """Remove the files of `base` older than 7 days (and the leftovers of a dead write); returns the count removed. Never raises."""
+    removed = 0
+    try:
+        if base.is_symlink():
+            return 0
+        for path in base.iterdir():
+            try:
+                if not path.is_symlink() and path.lstat().st_mtime < now - LAST_KEEP_SECONDS:
+                    path.unlink()
+                    removed += 1
+            except OSError:
+                pass
+    except OSError:
+        pass
+    return removed
+
+
+def _write_last(base, name, text):
+    """One private file: the directory 0700, the file 0600, O_NOFOLLOW, written to a temporary name and renamed (as `_write_private`)."""
+    base.mkdir(parents=True, mode=0o700, exist_ok=True)
+    if base.is_symlink():
+        raise OSError("the directory of the last texts is a link")
+    path = base / (name + ".txt")
+    temp = base / ("%s.txt.%d.tmp" % (name, os.getpid()))
+    fd = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0), 0o600)
+    try:
+        with os.fdopen(fd, "w") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.rename(str(temp), str(path))
+    except BaseException:
+        try:
+            os.unlink(str(temp))
+        except OSError:
+            pass
+        raise
+    return path
+
+
+def last_message(directory, state, pod, clock=None):
+    """(block, None) or (None, why). The block is the framing line `[last message of <pod>, untrusted text]`, the first 3,000 characters of the pod's last
+    assistant text and, when there is more, the path of the file with the next (at most 20,000) characters and the count left out. The text is cut at the
+    scrub's input maximum, the pod's own endpoint address is removed, then the launcher's one scrub runs by shape (no known secrets). Never raises."""
+    try:
+        base = Path(state) / LAST_DIR
+        clean_last(base, time.time() if clock is None else clock)
+        if not directory:
+            return None, "no run record"
+        name = os.path.basename(str(directory).rstrip("/"))
+        if not _LAST_NAME_RE.fullmatch(name):
+            return None, "no run record"
+        text, why = _last_worker_text(directory)
+        if text is None:
+            return None, why.replace("the transcript of the run record holds no text from the worker", "no text from the worker") \
+                if why else "no text from the worker"
+        text = _ENDPOINT_RE.sub("", text)[:LAST_SCRUB_MAX]
+        text = D["_scrub_lib"]()(text, (), LAST_SCRUB_MAX)
+        head, rest = text[:LAST_HEAD], text[LAST_HEAD:]
+        lines = ["[last message of %s, untrusted text]" % pod, head]
+        if rest:
+            kept = rest[:LAST_FILE]
+            path = _write_last(base, name, kept)
+            lines.append("[%d more characters in %s; %d characters left out]" % (len(kept), path, len(rest) - len(kept)))
+        return "\n".join(lines), None
+    except Exception as err:
+        return None, "%s" % type(err).__name__
