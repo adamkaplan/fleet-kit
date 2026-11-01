@@ -487,8 +487,16 @@ class TestLockAndRecord(Base):
         def inner():
             second.append(cw.rotate_audit(self.audit))
         err = io.StringIO()
-        with contextlib.redirect_stderr(err):
-            cw.rotate_audit(self.audit, _before_lock=inner)
+        real = cw._record_update
+        fired = []
+
+        def wrapped(path, change):   # the second rotation runs to its end before the first writes its pending: the first then finds the file is not the one it read
+            if not fired:
+                fired.append(1)
+                inner()
+            return real(path, change)
+        with contextlib.redirect_stderr(err), mock.patch.object(cw, "_record_update", wrapped):
+            cw.rotate_audit(self.audit)
         text, count = self.all_text()
         record = CW.read_rotation_record(self.audit)
         got = self.ids(text)
@@ -531,7 +539,7 @@ class TestLockAndRecord(Base):
     def test_s20(self):
         self.assertEqual(self.check_s20(), (0, 2, 2, None))
         self.setUp()
-        mutant = load("cw", "            _complete_pending(path)\n", "            pass\n")
+        mutant = load("cw", "            _complete_pending(path, now.timestamp())\n", "            pass\n")
         with self.assertRaises(AssertionError) as caught:
             self.check_s20(mutant)
         self.assertIn("the cut was never recorded", str(caught.exception))
@@ -662,9 +670,10 @@ class TestRecordLockAndPending(Base):
         with gzip.open(os.path.join(self.dir, name), "wb") as handle:
             handle.write(old)
         live = lines(100, 130, 20)
-        with open(self.audit + ".rotations", "w") as handle:
-            json.dump({"done": 0, "cuts": [], "pending": {"cut": len(old), "old_size": len(old) + len(live.encode()) + 5000, "archive": name}}, handle)
         self.put(live)
+        with open(self.audit + ".rotations", "w") as handle:
+            json.dump({"done": 0, "cuts": [], "pending": {"cut": len(old), "old_size": len(old) + len(live.encode()) + 5000, "archive": name,
+                                                           "ts": time.time(), "new_id": [os.stat(self.audit).st_dev, os.stat(self.audit).st_ino]}}, handle)
         return len(old) - len(lines(60, 100, 20).encode())
 
     def check_s26(self, ea=EA, lw=LW):
@@ -692,6 +701,285 @@ class TestRecordLockAndPending(Base):
         self.assertIn("lost worker delivered 30 of 70", str(caught2.exception))
         print("S26: 2 readers x 70 of 70 lines (40 of the archive named by pending, 30 live) read once and in order in the control, the control passes 1 of 1 and the copies fail "
               "with the anchored text (%s; %s), the mutation applied" % (str(caught.exception), str(caught2.exception)))
+
+
+# ---- S28 to S31: the idempotent final write, the ownership of pending, the stale age, the failed final write ----
+class Killed(BaseException):
+    """A rotator killed after its swap: nothing after the swap runs."""
+
+
+def fresh(rotate_bytes=None, keep_bytes=None):
+    cw = load("cw")
+    if rotate_bytes:
+        cw.AUDIT_ROTATE_BYTES, cw.AUDIT_KEEP_BYTES = rotate_bytes, keep_bytes
+    return cw
+
+
+class TestIdempotentAndOwned(Base):
+    def reader_ids(self, cw):
+        lost = LostReader(self.audit, LW)
+        lost.state = {"offsets": {"launcher": 0}, "rotations": {"launcher": {"applied": 0, "chain": None}}}
+        with contextlib.redirect_stderr(io.StringIO()):
+            return lost.read_all()
+
+    def archives(self):
+        return sorted(n for n in os.listdir(self.dir) if n.startswith("audit-") and n.endswith(".jsonl.gz"))
+
+    def check_s28(self, cw=None):
+        cw = cw or CW
+        self.put(lines(0, 30000, 0))
+        real = cw._record_update
+        armed, reached, b_done, owner = threading.Event(), threading.Event(), threading.Event(), []
+
+        def wrapped(path, change):   # the first rotator's final write holds until the second has completed its pending record
+            if armed.is_set() and threading.current_thread() is owner[0] and change.__name__ == "final":
+                armed.clear()
+                reached.set()
+                b_done.wait(5)
+            return real(path, change)
+        with contextlib.redirect_stderr(io.StringIO()), mock.patch.object(cw, "_record_update", wrapped):
+            first = threading.Thread(target=lambda: cw.rotate_audit(self.audit, _before_swap=armed.set), daemon=True)
+            owner.append(first)
+            first.start()
+            if not reached.wait(30):
+                raise AssertionError("the first rotation never reached its final write")
+            cw.rotate_audit(self.audit)   # completes the first's pending record in the window
+            b_done.set()
+            first.join(30)
+        record = cw.read_rotation_record(self.audit)
+        names = self.archives()
+        cuts = [c["archive"] for c in record["cuts"]]
+        if len(cuts) != len(set(cuts)) or record["done"] != len(names) or record["pending"] is not None:
+            raise AssertionError("a cut was recorded twice: %d archive, done %d, %d cuts for %d archive, pending %r" % (len(names), record["done"], len(cuts), len(set(cuts)), record["pending"]))
+        got = self.reader_ids(cw)
+        if got != list(range(30000)):
+            raise AssertionError("a cut was recorded twice: the reader read %d of 30000 lines" % len(got))
+        return len(names), record["done"], cuts.count(names[0]), record["pending"], len(got)
+
+    def test_s28(self):
+        self.assertEqual(self.check_s28(), (1, 1, 1, None, 30000))
+        self.setUp()
+        mutant = load("cw", 'if not any(isinstance(c, dict) and c.get("archive") == mine for c in record["cuts"]):', "if True:")
+        with self.assertRaises(AssertionError) as caught:
+            self.check_s28(mutant)
+        self.assertIn("a cut was recorded twice", str(caught.exception))
+        print("S28: 1 archive, done 1, the archive named once in the cuts and pending null in the control, 30000 of 30000 lines once and in order, the control passes 1 of 1 and the "
+              "copy that appends without the check fails 1 of 1 with the anchored text (%s), the mutation applied" % str(caught.exception))
+
+    # ---- S29 ----
+    def schedule(self, cw, seed):
+        import random
+        rng = random.Random(seed)
+        self.put(lines(0, 3000, 0))
+        cond = threading.Condition()
+        parked, go, finished = {}, {}, set()
+        kill_name = "C" if seed % 2 == 0 else None
+        overwritten = []
+        real_update, real_complete, real_write = cw._record_update, cw._complete_pending, cw.write_rotation_record
+
+        def gate(step):
+            me = threading.current_thread().name
+            with cond:
+                parked[me] = step
+                cond.notify_all()
+                cond.wait_for(lambda: go.get(me))
+                go[me] = False
+                del parked[me]
+            if step == "final" and me == kill_name:
+                raise Killed()
+
+        def update(path, change):
+            if change.__name__ in ("put_pending", "final") and threading.current_thread().name in go:
+                gate("pending" if change.__name__ == "put_pending" else "final")
+            return real_update(path, change)
+
+        def complete(path, now_ts=None):
+            if threading.current_thread().name in go:
+                gate("start")
+            return real_complete(path, now_ts)
+
+        def write(path, rec):
+            if rec.get("pending") is not None:
+                held = cw.read_rotation_record(path)["pending"]
+                if held is not None and held != rec["pending"]:
+                    overwritten.append(1)
+            return real_write(path, rec)
+
+        def body(name):
+            def run():
+                try:
+                    with contextlib.redirect_stderr(io.StringIO()):
+                        cw.rotate_audit(self.audit, _before_lock=lambda: gate("lock"), _before_swap=lambda: gate("swap"))
+                except Killed:
+                    pass
+                finally:
+                    with cond:
+                        finished.add(name)
+                        cond.notify_all()
+            return run
+        names = ["A", "B", "C"]
+        threads = [threading.Thread(target=body(n), name=n, daemon=True) for n in names]
+        for n in names:
+            go[n] = False
+        with mock.patch.object(cw, "_record_update", update), mock.patch.object(cw, "_complete_pending", complete), mock.patch.object(cw, "write_rotation_record", write):
+            for t in threads:
+                t.start()
+            deadline = time.time() + 60
+            while len(finished) < 3:
+                with cond:
+                    cond.wait_for(lambda: parked or len(finished) == 3, timeout=1)
+                    ready = sorted(parked)
+                if not ready:
+                    if time.time() > deadline:
+                        raise AssertionError("the schedule deadlocked (seed %d)" % seed)
+                    continue
+                pick = rng.choice(ready)
+                with cond:
+                    go[pick] = True
+                    cond.notify_all()
+                    cond.wait_for(lambda: pick in parked or pick in finished, timeout=0.05)
+            for t in threads:
+                t.join(10)
+        if overwritten:
+            raise AssertionError("a pending was overwritten (seed %d)" % seed)
+        self.put(lines(3000, 3500, 0), "a")
+        with contextlib.redirect_stderr(io.StringIO()):
+            cw.rotate_audit(self.audit)   # the next rotation records the killed rotator's cut
+        record = cw.read_rotation_record(self.audit)
+        names_on_disk = self.archives()
+        cuts = [c["archive"] for c in record["cuts"]]
+        sizes = 0
+        for name in names_on_disk:
+            with gzip.open(os.path.join(self.dir, name), "rb") as handle:
+                sizes += len(handle.read())
+        if sorted(cuts) != names_on_disk or record["done"] != len(names_on_disk) or record["pending"] is not None or sum(c["cut"] for c in record["cuts"]) != sizes:
+            raise AssertionError("a pending was overwritten: schedule %d done %d, %d archives, %d cuts, pending %r" % (seed, record["done"], len(names_on_disk), len(cuts), record["pending"]))
+        text, _ = TestLockAndRecord.all_text(self)
+        got = TestLockAndRecord.ids(self, text)
+        if got != list(range(3500)):
+            raise AssertionError("a pending was overwritten: schedule %d holds %d of 3500 lines" % (seed, len(got)))
+        return len(names_on_disk)
+
+    def run_schedules(self, cw, seed, count=200, stop_at_first=False):
+        failed, rotations = [], 0
+        for i in range(count):
+            self.setUp()
+            try:
+                rotations += self.schedule(cw, seed * 1000 + i)
+            except AssertionError as e:
+                failed.append(str(e))
+                if stop_at_first:
+                    break
+        return failed, rotations
+
+    def test_s29(self):
+        seed = 29
+        print("S29: seed %d" % seed)
+        cw = fresh(300000, 100000)
+        failed, rotations = self.run_schedules(cw, seed)
+        self.assertEqual(failed, [])
+        self.setUp()
+        mutant = load("cw", 'if record["pending"] is not None:\n                return None\n            wrote.append(1)', "wrote.append(1)")
+        mutant.AUDIT_ROTATE_BYTES, mutant.AUDIT_KEEP_BYTES = 300000, 100000
+        failed2, _ = self.run_schedules(mutant, seed, 200, True)
+        self.assertTrue(failed2 and "a pending was overwritten" in failed2[0], failed2)
+        print("S29: seed %d, 200 of 200 schedules pass in the control (%d archives in all), the copy that writes pending whatever the record holds fails at least 1 of the 200 with the anchored "
+              "text (%s), the mutation applied" % (seed, rotations, failed2[0]))
+
+    # ---- S30 ----
+    def check_s30(self, cw=None):
+        import datetime
+        cw = cw or fresh(300000, 100000)
+        T = 1_800_000_000
+        now = lambda extra: datetime.datetime.fromtimestamp(T + extra, datetime.timezone.utc)
+        self.put(lines(0, 3000, 0))
+        name = "audit-2026-01-01.jsonl.gz"
+        orphan = os.path.join(self.dir, name)
+        with gzip.open(orphan, "wb") as handle:
+            handle.write(b"x\n")
+        pend = {"cut": 2, "old_size": 99, "archive": name, "ts": T, "new_id": [0, 0]}
+        with open(self.audit + ".rotations", "w") as handle:
+            json.dump({"done": 0, "cuts": [], "pending": pend}, handle)
+        lost = LostReader(self.audit, LW)
+        with contextlib.redirect_stderr(io.StringIO()):
+            lost.once()   # first sight
+        def tree():
+            return {k: v for k, v in snapshot(self.dir).items() if not k.endswith(".lock")}
+        before = tree()
+        result, _ = self.rotate(cw, now=now(10))
+        record = cw.read_rotation_record(self.audit)
+        if record["pending"] != pend or result is not None or tree() != before:
+            raise AssertionError("a live rotator's pending was cleared: pending %r, rotation %r" % (record["pending"], result))
+        self.put(lines(3000, 3003, 0), "a")
+        with contextlib.redirect_stderr(io.StringIO()):
+            polled = lost.once()
+        if polled != [3000, 3001, 3002]:
+            raise AssertionError("the reader polling before the swap read %r" % polled)
+        shutil_size = os.path.getsize(self.audit)
+        cw.AUDIT_ROTATE_BYTES = shutil_size + 1_000_000   # the stale case clears and does not rotate
+        self.rotate(cw, now=now(121))
+        record = cw.read_rotation_record(self.audit)
+        if record["pending"] is not None or record["cuts"] or not os.path.exists(orphan):
+            raise AssertionError("the stale pending was not cleared with its archive left: %r" % (record,))
+        return 1, 1, len(polled)
+
+    def test_s30(self):
+        self.assertEqual(self.check_s30(), (1, 1, 3))
+        self.setUp()
+        mutant = load("cw", 'if not isinstance(ts, (int, float)) or now_ts - ts > AUDIT_PENDING_STALE:', "if True:")
+        mutant.AUDIT_ROTATE_BYTES, mutant.AUDIT_KEEP_BYTES = 300000, 100000
+        with self.assertRaises(AssertionError) as caught:
+            self.check_s30(mutant)
+        self.assertIn("a live rotator's pending was cleared", str(caught.exception))
+        print("S30: the young pending is left untouched in 1 of 1 case and no rotation is made, the stale one (121 s on a fake clock) is cleared in 1 of 1 case with its archive left, the reader "
+              "reads 3 of 3 new lines, the control passes 1 of 1 and the copy that clears an unswapped pending fails 1 of 1 with the anchored text (%s), the mutation applied" % str(caught.exception).split(":")[0])
+
+    # ---- S31 ----
+    def check_s31(self, cw=None):
+        cw = cw or fresh(300000, 100000)
+        self.put(lines(0, 3000, 0))
+        original = cw.write_rotation_record
+
+        def failing(path, rec):
+            if rec.get("pending") is None and rec.get("done") == 1:
+                raise OSError(5, "injected")
+            return original(path, rec)
+        with mock.patch.object(cw, "write_rotation_record", failing):
+            self.rotate(cw)
+        first = cw.read_rotation_record(self.audit)
+        if first["pending"] is None:
+            raise AssertionError("the cut of a failed final write was lost: pending was cleared by the failed write")
+        old_size = first["pending"].get("old_size")
+        self.put(lines(3000, 9500, 0), "a")
+        grown = os.path.getsize(self.audit)
+        if not old_size or grown < 2 * old_size:
+            raise AssertionError("the fixture did not regrow: %r %r" % (old_size, grown))
+        cw._complete_pending(self.audit)
+        record = cw.read_rotation_record(self.audit)
+        names = self.archives()
+        if record["done"] != 1 or [c["archive"] for c in record["cuts"]] != names or record["pending"] is not None:
+            raise AssertionError("the cut of a failed final write was lost: done %d, %d cuts, %d archives, pending %r (old_size %d, live %d)"
+                                 % (record["done"], len(record["cuts"]), len(names), record["pending"], old_size, grown))
+        got = self.reader_ids(cw)
+        if got != list(range(9500)):
+            raise AssertionError("the cut of a failed final write was lost: the reader read %d of 9500 lines" % len(got))
+        return old_size, grown, record["done"], len(got)
+
+    def test_s31(self):
+        old_size, grown, done, total = self.check_s31()
+        self.assertEqual((done, total), (1, 9500))
+        texts = []
+        for old, new in (("                if attempt == 2:\n", "                if attempt == 2:\n                    _record_update(path, lambda r: dict(r, pending=None))\n"),
+                         ('swapped = list(pend.get("new_id") or []) == [st.st_dev, st.st_ino]', 'swapped = st.st_size < pend.get("old_size", 0)')):
+            self.setUp()
+            mutant = load("cw", old, new)
+            mutant.AUDIT_ROTATE_BYTES, mutant.AUDIT_KEEP_BYTES = 300000, 100000
+            with self.assertRaises(AssertionError) as caught:
+                self.check_s31(mutant)
+            self.assertIn("the cut of a failed final write was lost", str(caught.exception))
+            texts.append(str(caught.exception))
+        print("S31: the cut recorded once in the control with the live file grown to %d bytes for an old_size of %d, %d of 9500 lines once and in order, the control passes 1 of 1 and each of the "
+              "2 copies fails 1 of 1 with the anchored text (%s | %s), the mutations applied" % (grown, old_size, total, texts[0], texts[1]))
 
 
 # ---- S12: the README ----
