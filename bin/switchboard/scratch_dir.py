@@ -85,7 +85,7 @@ class ScratchBoundFacts:
         day = time.strftime("%Y-%m-%d", time.gmtime(now))
         try:
             with open(str(Path(engine.state_dir) / SCRATCH_BOUND_FILE)) as handle:
-                seen = json.loads(handle.read(65536))
+                seen = load_module("record_json").parse_bounded(handle.read(65536))
         except (OSError, ValueError):
             seen = {}
         if not isinstance(seen, dict):
