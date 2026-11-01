@@ -277,6 +277,20 @@ class TestScratchGuard(ScratchWorld):
     def test_s13_lookup_valueerror_keeps_the_directory(self):
         self.check_lookup_fails_closed(ValueError("embedded null byte"))
 
+    def test_s15_a_link_from_outside_to_the_state_directory_is_not_covered_but_one_inside_scratch_is(self):
+        jan = sb.load_disk_janitor()
+        outside = self.world.state.parent / "outside-link"
+        os.symlink(str(self.world.state), str(outside))
+        inside_dir = self.private(self.base / self.NAME)
+        inside = inside_dir / "inner-link"
+        os.symlink(str(self.world.state.parent), str(inside))
+        plain = self.world.state.parent / "plain-dir"
+        plain.mkdir()
+        self.assertFalse(jan.covers_scratch(plain, self.world.state), "control: an unrelated directory is not covered")
+        self.assertFalse(jan.covers_scratch(outside, self.world.state))
+        self.assertTrue(jan.covers_scratch(inside, self.world.state))
+        self.assertTrue(jan.covers_scratch(self.world.state, self.world.state), "control: the state directory itself is covered")
+
 
 class TestScratchBound(ScratchWorld):
     """S11: the daemon records one audit line a day while a scratch directory stays over the bound, and removes nothing."""

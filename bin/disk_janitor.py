@@ -410,9 +410,13 @@ def remove_entry(path):
 
 def covers_scratch(path, state_dir):
     """True when removing `path` would remove or empty a scratch directory (#1456): `path` is the state directory, one of its parents, or the scratch tree itself or
-    anything inside it. A scratch directory is never swept; the check is by real path, so a link into it counts."""
+    anything inside it. A scratch directory is never swept; the check is by real path, so a link INSIDE a scratch directory counts and a link to it from outside does not (a link is judged by its parent's real path plus its own name, not followed)."""
     try:
-        target, scratch = os.path.realpath(str(path)), os.path.realpath(os.path.join(str(state_dir), "scratch"))
+        if os.path.islink(str(path)):
+            target = os.path.join(os.path.realpath(os.path.dirname(str(path))), os.path.basename(str(path)))
+        else:
+            target = os.path.realpath(str(path))
+        scratch = os.path.realpath(os.path.join(str(state_dir), "scratch"))
     except (OSError, ValueError):
         return True
     return scratch == target or scratch.startswith(target + os.sep) or target.startswith(scratch + os.sep)
