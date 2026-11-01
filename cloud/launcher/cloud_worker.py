@@ -2559,9 +2559,11 @@ class Launcher:
             else:
                 live.append(pod)   # before its hard limit and not stopped below: the git token renewal's candidates
                 t0 = mono()
-                act = self.activity(pod["metadata"]["name"])
-                steps["activity"] += mono() - t0
-                steps["activity_n"] += 1
+                try:
+                    act = self.activity(pod["metadata"]["name"])
+                finally:
+                    steps["activity"] += mono() - t0
+                    steps["activity_n"] += 1
                 if act is None:
                     # Fail mode, decided: an unreadable activity is not a reason to kill work, so the pod runs until
                     # its hard limit; it is reported so it is not silent.
