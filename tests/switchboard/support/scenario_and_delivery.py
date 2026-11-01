@@ -1,7 +1,7 @@
 """Shared fakes and helpers of bin/test-switchboard (moved text, unchanged): scenario_and_delivery."""
 import calendar
 import json
-from support.paths import BIN, REPO
+from support.paths import REPO
 from support.delivery_measure import REPO
 from support.fake_hubs import LEDGER_PLAN
 from support.scenario_roles import JEV_REPLAY
