@@ -22522,8 +22522,8 @@ def run_new_bin_guards(ps, runner, root, added, now):
 
 
 def run_new_test_checks(runner, root, now):
-    if not os.path.exists(tool := os.path.join(root, "tools", "new-test-checks")): return print("SKIP new-test-checks: tools/new-test-checks is not in this tree") or 0   # #1967: a new or changed tests/switchboard/test_*.py is read before the push
     if (d := runner(["git", "diff", "--name-only", "--diff-filter=AM", "origin/HEAD...HEAD", "--", "tests/switchboard/"], cwd=root, capture_output=True, text=True)).returncode == 0 and not any(n.startswith("tests/switchboard/test_") for n in d.stdout.split()): return 0
+    if not os.path.exists(tool := os.path.join(root, "tools", "new-test-checks")): return print("SKIP new-test-checks: tools/new-test-checks is not in this tree") or 0   # #1967: a new or changed tests/switchboard/test_*.py is read before the push
     started, done = now(), runner([sys.executable, os.path.abspath(__file__), "heavy", "--", sys.executable, tool, "--preflight"], cwd=root, capture_output=True, text=True)
     if done.returncode == 0 and not done.stdout.strip(): return 0   # no such file against the base: nothing is printed
     print("%s new-test-checks (%ds)" % ("PASS" if done.returncode == 0 else "FAIL", max(0, int(now() - started)))); sys.stderr.write(done.stdout if done.returncode else ""); return int(done.returncode != 0)

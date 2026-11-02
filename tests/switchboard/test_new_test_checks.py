@@ -288,6 +288,15 @@ class TestNewTestChecksInPreflightPr(unittest.TestCase):
             code, out, err = ntc_preflight(sb, self.planted(NTC_BINDS, None, tool=False), merged)
             self.assertEqual((code, out.count(NTC_SKIPLINE)), (0, 1), (merged, out, err))
 
+    def test_s15_no_test_file_and_no_tool_prints_nothing(self):
+        for merged in (False, True):
+            for outside in (None, "X = 1\n"):
+                root = self.planted(None, outside, tool=False)
+                ntc_git(root, "update-ref", "refs/remotes/origin/main", "main")
+                ntc_git(root, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+                code, out, err = ntc_preflight(sb, root, merged)
+                self.assertEqual((code, len((out + err).splitlines()), "new-test-checks" in out + err), (0, 0, False), (merged, out, err))
+
 
 class TestNewTestChecksInCloudPreflight(unittest.TestCase):
     """S16: bin/cloud-pr-preflight, full and quick mode, its test files stubbed as passing."""
@@ -338,6 +347,12 @@ class TestNewTestChecksInCloudPreflight(unittest.TestCase):
             before.write_text(source[:start] + source[stop:])
             root = self.planted(None)
             self.assertEqual(self.run_script(root, False, before), self.run_script(root, False))
+
+    def test_s16_no_test_file_and_no_tool_prints_nothing(self):
+        for quick in (False, True):
+            code, out = self.run_script(self.planted(None, tool=False), quick)
+            self.assertNotIn("new-test-checks", out)
+            self.assertNotIn("SKIP", out)
 
 
 class TestNewTestChecksMutants(unittest.TestCase):
