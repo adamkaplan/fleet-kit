@@ -324,6 +324,29 @@ class TestHeavyProgress(unittest.TestCase):
         self.assertEqual(results["mutant"].returncode, 1, results["mutant"].stdout)
         self.assertIn("a zero interval was accepted", results["mutant"].stdout)
 
+    def test_s15_inner_a_bad_interval_setting_falls_back_to_60_with_one_line(self):
+        if not os.environ.get("FLEET_TEST_INNER"):
+            self.skipTest("run by test_s15 in a child process")
+        for value in ("1e308", "86401", "abc", "0", "-5", "nan", "inf"):
+            rig = Rig(self, alive=1, env={"FLEET_HEAVY_PROGRESS_SECONDS": value})
+            read = set(rig.pauses)
+            self.assertEqual(read, {60}, "an out-of-range interval was accepted (value %r read as %r)" % (value, read))
+            said = [line for _t, line in rig.out.lines if "out of range" in line]
+            self.assertEqual(said, ["heavy: FLEET_HEAVY_PROGRESS_SECONDS=%s is out of range, using 60" % value], "a bad setting was silent (value %r: %r)" % (value, said))
+        for value, expected in ((None, 60), ("", 60), ("86400", 86400), ("0.05", 0.05)):
+            env = {} if value is None else {"FLEET_HEAVY_PROGRESS_SECONDS": value}
+            rig = Rig(self, alive=1, env=env)
+            self.assertEqual(set(rig.pauses), {expected}, "value %r" % (value,))
+            self.assertEqual([l for _t, l in rig.out.lines if "out of range" in l], [], "a valid or empty setting printed a line (value %r)" % (value,))
+
+    def test_s15_a_bad_setting_falls_back_with_one_line_and_each_mutant_fails_with_its_text(self):
+        for old, new, text in (("<= 86400:", "<= float(\"inf\"):", "an out-of-range interval was accepted"),
+                               ('out.write("heavy: FLEET_HEAVY_PROGRESS_SECONDS=%s is out of range, using 60\\n" % raw[:40])', "pass", "a bad setting was silent")):
+            results = self._scratch([(old, new)], "test_s15_inner_a_bad_interval_setting_falls_back_to_60_with_one_line")
+            self.assertEqual(results["control"].returncode, 0, results["control"].stdout)
+            self.assertEqual(results["mutant"].returncode, 1, results["mutant"].stdout)
+            self.assertIn(text, results["mutant"].stdout)
+
     def test_s14_inner_a_blocked_write_does_not_hold_the_return(self):
         if not os.environ.get("FLEET_TEST_INNER"):
             self.skipTest("run by test_s14 in a child process")
