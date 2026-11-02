@@ -182,7 +182,7 @@ R3_GRAPHQL = ("./graphql", "repos/x/../graphql", "/repos/x/../graphql", "https:/
               "%2fgraphql", "gra%70hql", "gra%2570hql", "graphql;x", "graphql\t", "graphql\n", "\tgraphql", "graphql ", "//api.github.com/graphql",
               "https://api.github.com:443./graphql", "graphql\\", "\\graphql", "http://api.github.com/graphql", "https://api.github.com:443/graphql")
 R3_COMMENTS = ("./repos/o/r/issues/1/comments", "repos/o/x/../r/issues/1/comments", "/repos/o/r/issues/1/comments", "repos/o/r/issues/1/comments/.",
-               "repos%2fo%2fr%2fissues%2f1%2fcomments", "repos/o/r/issues/1/comm%65nts", "repos/o/r/issues/1/comments;x", "repos/o/r/issues/1/comments?a=b%20c",
+               "repos%2fo%2fr%2fissues%2f1%2fcomments", "repos/o/r/issues/1/comm%65nts", "repos/o/r/issues/1/comments;x", "repos/o/r/issues/1/comments?path=b%20c",
                "https://api.github.com/./repos/o/r/issues/1/comments", "http://api.github.com/repos/o/r/issues/1/comments",
                "//api.github.com/repos/o/r/issues/1/comments", "repos\\o\\r\\issues\\1\\comments", "Repos/o/r/issues/1/comments", "repos/o/r/issues/1/comm%2565nts")
 R3_UNKNOWN = ("foo/bar", "%zz/graphql", "repos%", "x%e9", "weird")
@@ -191,7 +191,7 @@ R3_READ = "query { viewer { login } }"
 RAW_LINE = ("the endpoint would change if cleaned: the shim matches the raw path only; write it plainly as repos/OWNER/REPO/... "
             "(one optional leading slash, no backslash, %-escape, dot segment, semicolon, space, #, double or trailing slash)")
 R5_RAW_OK_GRAPHQL = ("//api.github.com/graphql", "http://api.github.com/graphql")   # r5 (OLD: all 21 spellings reached the graphql parser): only these two are raw-valid
-R5_RAW_OK_COMMENTS = ("/repos/o/r/issues/1/comments", "repos/o/r/issues/1/comments?a=b%20c", "http://api.github.com/repos/o/r/issues/1/comments", "//api.github.com/repos/o/r/issues/1/comments")
+R5_RAW_OK_COMMENTS = ("/repos/o/r/issues/1/comments", "repos/o/r/issues/1/comments?path=b%20c", "http://api.github.com/repos/o/r/issues/1/comments", "//api.github.com/repos/o/r/issues/1/comments")
 R5_RAW_OK_UNKNOWN = ("foo/bar", "weird")
 R3_NOT_GRAPHQL = ("repos/x/../graphql", "/repos/x/../graphql", "graphql\t", "graphql\n", "\tgraphql", "graphql ", "https://api.github.com:443./graphql")   # r4: their meaning is not the graphql endpoint (or cannot be read): a body is refused
 
@@ -402,7 +402,7 @@ class TestGhShimSignInput(unittest.TestCase):
         self.assertEqual(len(calls), 1, done.stderr)
 
     def test_h1_no_body_input_is_passed_as_a_temp_copy_of_the_bytes_read(self):
-        text = '{"event":"COMMENT",\n "n": "\u00e9"}'
+        text = '{"event":"COMMENT",\n "side": "\u00e9"}'
         original = self.file(text)
         for spelling in (lambda p: ("--input", p), lambda p: ("--input=" + p,)):
             with self.subTest(spelling=spelling(original)):
@@ -1857,7 +1857,7 @@ class TestGhShimEncodedQueryAndLabelDelete(unittest.TestCase):
                 self.refused(*self.rig.run("api", "-X", "POST", path))
 
     def test_s27_a_query_without_a_body_key_passes_signed_once(self):
-        done, calls = self.rig.run("api", "repos/o/r/issues/1/comments?x=1", "-f", "body=hi")
+        done, calls = self.rig.run("api", "repos/o/r/issues/1/comments?line=1", "-f", "body=hi")
         self.assertEqual(len(calls), 1, done.stderr)
         self.assertEqual(sum(a.count(SIGNED) for a in calls[0]["argv"]), 1)
 
