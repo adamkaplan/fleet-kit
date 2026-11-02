@@ -192,13 +192,13 @@ def class_problems(tests_dir, source, exempt):
                     todo.extend(parents.get(parent, []))
         for cls in sorted(classes - bound.get(mod, set()) - hidden):
             if "%s::%s" % (name, cls) not in exempt:
-                below = sorted(c for c in classes if c != cls and cls in _ancestors(c, parents))
+                below = sorted(c for c in classes if c != cls and cls in _lineage_of(c, parents))
                 out.append("%s: class %s is not bound at module level by bin/test-switchboard%s"
                            % (name, cls, " (subclasses: %s)" % ", ".join(below) if below else ""))
     return out
 
 
-def _ancestors(cls, parents):
+def _lineage_of(cls, parents):
     seen, todo = set(), list(parents.get(cls, []))
     while todo:
         parent = todo.pop()
