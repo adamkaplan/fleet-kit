@@ -21,12 +21,16 @@ BASE_TEST = ('import unittest\nfrom acme import compute_widget_total, announce\n
 
 
 def count_re_bindings(source):
-    """(line, form) of every binding of `re` or its functions: module-level ones (nested in module-level if/try/with/for/while/class, never in a
-    function body) have the form 'module-level ...'; function-local `import re` statements are the designed form and read 'function-local import re'."""
+    """(line, form) of every use of `re` that runs at import, read from the ast: every module-level statement (nested in module-level
+    if/try/with/for/while/match/class bodies, never in a function body) plus the parts of a def that run at import (decorators, defaults,
+    annotations) and of a class (bases, keywords, decorators) are read for an import of re (any form), any ast.Name `re`, and a call of
+    __import__ / importlib.import_module / import_module with the constant 're'; these read 'module-level ...', and the designed function-body
+    `import re` statements read 'function-local import re'; a binding made by code that is none of these (for example getattr(sys.modules, 're'))
+    is not seen, the honest limit of an ast read (the file has no such code, shown by the control)."""
     import ast
     found = []
 
-    def forms(node, where):
+    def import_forms(node):
         if isinstance(node, ast.Import):
             for a in node.names:
                 if a.name == "re" or a.name.startswith("re."):
@@ -35,22 +39,71 @@ def count_re_bindings(source):
             if node.module == "re" and not node.level:
                 for a in node.names:
                     yield "from re import *" if a.name == "*" else "from re import %s%s" % (a.name, " as " + a.asname if a.asname else "")
-        elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)) and node.value is not None and not where:
-            if any(isinstance(n, ast.Name) and n.id == "re" for n in ast.walk(node.value)):
-                yield "assignment using re.*"
 
-    def walk(stmts, local):
+    def expr_forms(node, label):
+        for n in ast.walk(node):
+            if isinstance(n, ast.Name) and n.id == "re":
+                found.append((n.lineno, "module-level reference to re in " + label))
+            elif isinstance(n, ast.NamedExpr) and any(isinstance(m, ast.Name) and m.id == "re" for m in ast.walk(n.value)):
+                found.append((n.lineno, "module-level walrus using re"))
+            elif isinstance(n, ast.Call) and n.args and isinstance(n.args[0], ast.Constant) and n.args[0].value == "re":
+                f = n.func
+                name = f.id if isinstance(f, ast.Name) else f.attr if isinstance(f, ast.Attribute) else None
+                if name in ("__import__", "import_module"):
+                    found.append((n.lineno, "module-level call of %s('re')" % name))
+
+    def exprs(nodes, label):
+        for n in nodes:
+            if n is not None:
+                expr_forms(n, label)
+
+    def local(stmts):
+        for node in stmts:
+            for form in import_forms(node):
+                found.append((node.lineno, "function-local " + form))
+            for field in ("body", "orelse", "finalbody"):
+                local(getattr(node, field, None) or [])
+            for h in getattr(node, "handlers", []):
+                local(h.body)
+            for c in getattr(node, "cases", []):
+                local(c.body)
+
+    def walk(stmts):
         for node in stmts:
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                walk(node.body, True)
+                a = node.args
+                exprs(node.decorator_list, "def decorator")
+                exprs(a.defaults + a.kw_defaults, "def default")
+                every = a.posonlyargs + a.args + a.kwonlyargs + [x for x in (a.vararg, a.kwarg) if x]
+                exprs([x.annotation for x in every], "def annotation")
+                exprs([node.returns], "def return annotation")
+                local(node.body)
                 continue
-            for form in forms(node, local):
-                found.append((node.lineno, ("function-local " if local else "module-level ") + form))
-            for field in ("body", "orelse", "finalbody"):
-                walk(getattr(node, field, None) or [], local)
-            for h in getattr(node, "handlers", []):
-                walk(h.body, local)
-    walk(ast.parse(source).body, False)
+            for form in import_forms(node):
+                found.append((node.lineno, "module-level " + form))
+            label = type(node).__name__
+            if isinstance(node, ast.ClassDef):
+                exprs(node.decorator_list, "class decorator")
+                exprs(node.bases, "class base")
+                exprs([k.value for k in node.keywords], "class keyword")
+            for field, value in ast.iter_fields(node):
+                if field in ("body", "orelse", "finalbody") and isinstance(value, list):
+                    walk(value)
+                elif field == "handlers":
+                    for h in value:
+                        exprs([h.type], label)
+                        walk(h.body)
+                elif field == "cases":
+                    for c in value:
+                        exprs([c.pattern, c.guard], "match case")
+                        walk(c.body)
+                elif field in ("decorator_list", "bases", "keywords", "name"):
+                    continue
+                elif isinstance(value, ast.AST):
+                    expr_forms(value, label)
+                elif isinstance(value, list):
+                    exprs([v for v in value if isinstance(v, ast.AST) and not isinstance(v, ast.stmt)], label)
+    walk(ast.parse(source).body)
     return sorted(found)
 
 
@@ -427,28 +480,46 @@ class TestPinsReview(PinsRepo):
     def test_pins_binds_re_at_no_module_level_and_imports_it_in_two_functions(self):   # guard on the L1 guard
         self.assert_no_module_level_re(self.PINS_SRC.read_text())
 
+    RE_CASES = [
+        ("import re", "import re\n", r"module-level import re"),
+        ("import re as regex", "import re as regex\n", r"module-level import re as regex"),
+        ("from re import compile", "from re import compile\n", r"module-level from re import compile"),
+        ("from re import compile as c", "from re import compile as c\n", r"module-level from re import compile as c"),
+        ("from re import *", "from re import *\n", r"module-level from re import \*"),
+        ("assignment", 'compiled = re.compile("x")\n', r"module-level reference to re in Assign"),
+        ("try block", "try:\n    import re\nexcept ImportError:\n    pass\n", r"module-level import re"),
+        ("walrus", 'if (w := re.compile("a")):\n    pass\n', r"module-level walrus using re"),
+        ("def default", 'def f_default(x=re.compile("a")):\n    pass\n', r"module-level reference to re in def default"),
+        ("decorator", "@re.sub\ndef f_decorated():\n    pass\n", r"module-level reference to re in def decorator"),
+        ("class base", "class C_base(re.Pattern):\n    pass\n", r"module-level reference to re in class base"),
+        ("bare statement", 're.compile("a")\n', r"module-level reference to re in Expr"),
+        ("for loop", "for r in [re]:\n    pass\n", r"module-level reference to re in For"),
+        ("import in match", "match 1:\n    case 1:\n        import re\n", r"module-level import re"),
+        ("__import__", '__import__("re")\n', r"module-level call of __import__\('re'\)"),
+        ("import_module", 'import importlib\nimportlib.import_module("re")\n', r"module-level call of import_module\('re'\)"),
+    ]
+
     def test_a_module_level_binding_of_re_is_caught_in_every_form(self):   # L1 guard mutants
         text = self.PINS_SRC.read_text()
         self.assert_no_module_level_re(text)   # control first
         first_def = text.index("\ndef ")
         local_import = "    import re\n"
-        cases = [
-            ("import re", "import re\n", r"module-level import re$"),
-            ("import re as regex", "import re as regex\n", r"module-level import re as regex$"),
-            ("from re import compile", "from re import compile\n", r"module-level from re import compile$"),
-            ("from re import compile as c", "from re import compile as c\n", r"module-level from re import compile as c$"),
-            ("from re import *", "from re import *\n", r"module-level from re import \*$"),
-            ("assignment", 'compiled = re.compile("x")\n', r"module-level assignment using re\.\*$"),
-            ("try block", "try:\n    import re\nexcept ImportError:\n    pass\n", r"module-level import re$"),
-        ]
+        cases = self.RE_CASES
+        messages = {}
         for name, add, form in cases:
             with self.subTest(name):
                 mutant = text[:first_def] + "\n" + add + text[first_def:]
                 self.assertEqual(mutant.count("\n" + add), 1, "the mutation is applied exactly once")
                 with self.assertRaises(AssertionError) as caught:
                     self.assert_no_module_level_re(mutant)
-                self.assertRegex(str(caught.exception),
-                                 r"module-level binding of re \(the scan-bound test cannot see it\): line \d+: " + form.replace("$", "") )
+                messages[name] = str(caught.exception).split("cannot see it): ", 1)[-1]
+                self.assertRegex(messages[name], r"line \d+: " + form + r"(?:;|$)")
+        forms = {n: f for n, _, f in cases}
+        for name, add, form in cases:
+            for other, message in messages.items():
+                if forms[other] != form:   # try block / match / plain import are the same form
+                    with self.subTest("anchor of %s does not match the message of %s" % (name, other)):
+                        self.assertNotRegex(message, r"line \d+: " + form + r"(?:;|$)")
         with self.subTest("a third function-local import"):
             at = text.index(local_import)
             mutant = text[:at] + local_import + text[at:]
