@@ -555,7 +555,7 @@ def s25(module):
             w.tick()
         except Exception:
             raised = 1
-        assert len(w.entries) == 1, "%s: %d audit entries" % (msg, len(w.entries))
+        assert len([e for e in w.entries if e[0] == "cloud.renewal.alarm-unsent"]) == 1, "%s: %d audit entries" % (msg, len(w.entries))
         assert raised == 0, "a raising send was raised into the pass"
         assert os.path.exists(os.path.join(w.dir, module.STATE_FILE)), "the state was not written"
         w.send = real
@@ -662,6 +662,71 @@ def s27(module):
     print("S27: delivered alarms for the failing pod %d per recipient over 4 ticks, cursor after tick 1 not after the line, second pod alarmed %d per recipient, dropped entries %d once, retries of the old line %d" % (delivered, len(second) // 2, dropped, len(tries) - before))
 
 
+def s28(module):
+    msg = "an unsent attempt was audited once per tick"
+    w = AlarmWorld(module, {"worker-1": "lane-a"})
+    try:
+        mode = ["raise"]
+        real = w.send
+
+        def sender(state_dir, to, at, created, text, kind, subject, state, first=False, **more):
+            if mode[0] == "raise":
+                raise RuntimeError("the send raised")
+            if mode[0] == "nothing":
+                return None
+            return real(state_dir, to, at, created, text, kind, subject, state, first=first, **more)
+        w.send = sender
+        unsent = lambda: [e for e in w.entries if e[0] == "cloud.renewal.alarm-unsent"]
+        alarm = lambda: [e for e in w.entries if e[0] == "cloud.renewal.alarm"]
+        w.line(T0 - 5, "worker-1", False, "no network")
+        w.tick(T0)
+        assert len(unsent()) == 1 and len(alarm()) == 0, "%s: %d unsent, %d alarm after tick 1" % (msg, len(unsent()), len(alarm()))
+        assert unsent()[0][1] == "worker-1" and unsent()[0][2]["reason"] == "no network" and "text" not in unsent()[0][2], unsent()
+        mode[0] = "nothing"
+        w.tick(T0 + 60)
+        assert len(unsent()) == 1 and len(alarm()) == 0, "%s: %d unsent entries after tick 2, %d alarm" % (msg, len(unsent()), len(alarm()))
+        mode[0] = "deliver"
+        w.tick(T0 + 120)
+        assert len(unsent()) == 1 and len(alarm()) == 1 and alarm()[0][2]["told"], "%s: %s" % (msg, w.entries)
+        w.tick(T0 + 180)
+        assert len(unsent()) == 1 and len(alarm()) == 1, "%s: a fourth tick wrote an entry" % msg
+        empty = len([e for e in alarm() if not e[2]["told"]])
+        assert empty == 0, "%s: an alarm entry with an empty told" % msg
+        print("S28: unsent entries %d, alarm entries %d, empty told %d" % (len(unsent()), len(alarm()), empty))
+    finally:
+        w.close()
+
+
+def s29(module):
+    msg = "a boss-only alarm was not sent"
+    w = AlarmWorld(module, {"worker-1": "boss-a", "worker-2": "boss-b"})
+    try:
+        w.agents.pop("cos-1")   # a lane with no member
+        phase = [0]
+        real = w.send
+
+        def sender(state_dir, to, at, created, text, kind, subject, state, first=False, **more):
+            if to == "boss-a" and phase[0] == 0:
+                raise RuntimeError("the send raised")
+            return real(state_dir, to, at, created, text, kind, subject, state, first=first, **more)
+        w.send = sender
+        w.line(T0 - 5, "worker-1", False, "no network")
+        w.line(T0 - 4, "worker-2", False, "no disk")
+        w.tick(T0)
+        assert [m[0] for m in w.messages] == ["boss-b"], "%s: %d boss messages, %s" % (msg, len(w.messages), w.messages)
+        state = json.load(open(os.path.join(w.dir, module.STATE_FILE)))
+        assert "worker-1" not in state["pods"] and "worker-2" in state["pods"], state
+        phase[0] = 1
+        w.tick(T0 + 60)
+        assert sorted(m[0] for m in w.messages) == ["boss-a", "boss-b"] and len(w.to("boss-a")) == 1, "%s: %s" % (msg, w.messages)
+        w.tick(T0 + 120)
+        assert len(w.messages) == 2, "%s: the third tick sent more" % msg
+        assert all(not m[3].startswith("group:") for m in w.messages) and len(w.to("cos-1")) == 0
+        print("S29: alarms %d, boss messages %d, lane messages %d, group messages 0" % (len(w.messages), len(w.to("boss-a")) + len(w.to("boss-b")), len(w.to("cos-1"))))
+    finally:
+        w.close()
+
+
 S27_MUTANT = ("writes the cursor and the state before it knows whether the send reached anyone",
               '        unsent = sorted((state["pods"][pod], pod) for pod in alarms if pod not in reached)\n',
               '        unsent = []\n')
@@ -724,6 +789,14 @@ class TestCloudRenewalAlarmContinuation(unittest.TestCase):
     def test_s27_a_failed_send_does_not_lose_the_alarm_and_a_line_past_the_hour_is_dropped_once(self):
         s27(load())
         self.mutant("s27", *S27_MUTANT[1:], "a failed send lost the alarm")
+
+    def test_s28_an_unsent_attempt_is_audited_once_per_line(self):
+        s28(load())
+        self.mutant("s28", "if [pod, alarms_at[pod]] not in was_unsent:", "if True:", "an unsent attempt was audited once per tick")
+
+    def test_s29_a_boss_only_alarm_is_sent_to_its_boss_and_a_failed_one_is_retried(self):
+        s29(load())
+        self.mutant("s29", "if seen is not None and not hold_reason(seen):", "if False:", "a boss-only alarm was not sent")
 
 
 if __name__ == "__main__":
