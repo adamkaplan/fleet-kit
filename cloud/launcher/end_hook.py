@@ -250,13 +250,15 @@ def no_checkout(workdir):
 
 
 MAX_UNTRACKED = 10
+MAX_PATH_SHOWN = 200   # a path longer than this is shown cut to its first 200 characters and "..."; the count is not changed by it
 
 
 def untracked_report(status_entries):
     """The untracked (`??`) paths among the status entries that the save stages (secret-looking ones are not), sorted: the first
     MAX_UNTRACKED and the count of the rest. Names only, never content. Taken from the same list that decides the save."""
     names = sorted(e[3:] for e in status_entries if e.startswith("?? ") and not is_secret(e[3:]))
-    return {"untracked": names[:MAX_UNTRACKED], "untracked_more": max(0, len(names) - MAX_UNTRACKED)}
+    shown = [n if len(n) <= MAX_PATH_SHOWN else n[:MAX_PATH_SHOWN] + "..." for n in names[:MAX_UNTRACKED]]
+    return {"untracked": shown, "untracked_more": max(0, len(names) - MAX_UNTRACKED)}
 
 
 def run(workdir, worker, prestop=False, repo=None, ctx=None):

@@ -222,10 +222,10 @@ class Report(unittest.TestCase):
 
 
 MUTANTS = {
-    "names nothing": ("    return {\"untracked\": names[:MAX_UNTRACKED], \"untracked_more\": max(0, len(names) - MAX_UNTRACKED)}",
+    "names nothing": ("    return {\"untracked\": shown, \"untracked_more\": max(0, len(names) - MAX_UNTRACKED)}",
                       "    return {\"untracked\": [], \"untracked_more\": 0}"),
     "names a secret path as saved": (" and not is_secret(e[3:]))", ")"),
-    "drops the cap": ("\"untracked\": names[:MAX_UNTRACKED]", "\"untracked\": names"),
+    "drops the cap": ("for n in names[:MAX_UNTRACKED]]", "for n in names]"),
     "no count of the rest": ("max(0, len(names) - MAX_UNTRACKED)}", "0}"),
     "unsorted": ("names = sorted(e[3:] for e in", "names = list(e[3:] for e in"),
 }
@@ -291,6 +291,47 @@ class PrintedCounts(unittest.TestCase):
         self.assertIs(applied, True)
         self.assertEqual(failing, 1)
         print("S14: lines carrying both keys %d of 1, mutants failing %d of 1, mutation applied %s" % (lines, failing, applied))
+
+
+LONG_DIRS = ["d%d" % i + "x" * 97 for i in range(4)]   # four directories of 99 characters
+LONG_PATH = "/".join(["a" + d for d in LONG_DIRS] + ["f" + "y" * 98])   # 4 * 100 + 3 + 99 = 502 characters
+LONG_ANCHOR = "the longest listed path is 203 characters"
+
+
+def long_path_case(tc, mod, prestop):
+    """S16: a 500-character path and ten short ones: the long one is shown cut to 200 characters and three dots, the line is one
+    line of valid JSON, and the count of the rest is right (11 paths, ten listed, one more)."""
+    t = Tree(prestop)
+    tc.addCleanup(t.close)
+    t.put(LONG_PATH)
+    for i in range(10):
+        t.put("s%d.txt" % i)
+    res = t.run_hook(mod)
+    longest = max(len(n) for n in res["untracked"])
+    tc.assertEqual(longest, 203, "%s, got %d" % (LONG_ANCHOR, longest))
+    tc.assertIn(LONG_PATH[:200] + "...", res["untracked"])
+    tc.assertEqual(res["untracked_more"], 1)
+    if prestop:
+        tc.assertEqual(len(res["line"].strip().split("\n")), 1)
+    return longest
+
+
+class LongPath(unittest.TestCase):
+    def test_s16_the_long_path_is_cut_on_both_hooks_and_the_uncapped_copy_fails(self):
+        self.assertGreaterEqual(len(LONG_PATH), 500)
+        old = 'n if len(n) <= MAX_PATH_SHOWN else n[:MAX_PATH_SHOWN] + "..."'
+        uncapped = mutant(old, "n")   # mutant() raises if the text is not found once: mutation applied
+        cases = controls = refused = 0
+        for prestop in (False, True):
+            self.assertEqual(long_path_case(self, end_hook, prestop), 203)
+            cases += 1
+            controls += 1
+            with self.assertRaises(AssertionError) as cm:
+                long_path_case(self, uncapped, prestop)
+            self.assertIn(LONG_ANCHOR, str(cm.exception))
+            refused += 1
+        print("S16: longest listed path 203 characters in %d of 2 cases, uncapped mutant fails %d of 2 with the anchored text, "
+              "control passes %d of 2, mutations applied True" % (cases, refused, controls))
 
 
 class Docs(unittest.TestCase):
