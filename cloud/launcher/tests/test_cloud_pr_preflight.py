@@ -173,8 +173,8 @@ class T(unittest.TestCase):
         self.assertIn("test_b.py  +", self.r.run()[1])
 
 
-def leftovers(before):
-    return [x for x in set(os.listdir(tempfile.gettempdir())) - before if x.startswith("cloud-preflight-")]
+def leftovers(tmpdir):
+    return [x for x in os.listdir(tmpdir) if x.startswith("cloud-preflight-")]
 
 
 SLEEP = "import os, time\nos.environ.get(\"CLOUD_PREFLIGHT_STARTED\") and open(os.environ[\"CLOUD_PREFLIGHT_STARTED\"], \"w\").close()\ntime.sleep(60)\n"
@@ -187,10 +187,10 @@ class Signals(unittest.TestCase):
         self.r.put("cloud/launcher/tests/test_a.py", SLEEP); self.r.commit("sleepy")
 
     def go(self, sig, script=SCRIPT):
-        before = set(os.listdir(tempfile.gettempdir()))
+        own_tmp = tempfile.mkdtemp(prefix="preflight-tmp-"); self.addCleanup(shutil.rmtree, own_tmp, ignore_errors=True)
         marker_dir = tempfile.mkdtemp(prefix="preflight-marker-"); self.addCleanup(shutil.rmtree, marker_dir, ignore_errors=True)
         marker = os.path.join(marker_dir, "started")
-        e = dict(os.environ, CLOUD_PREFLIGHT_TIMEOUT="30", CLOUD_PREFLIGHT_BASE="main", CLOUD_PREFLIGHT_STARTED=marker)
+        e = dict(os.environ, CLOUD_PREFLIGHT_TIMEOUT="30", CLOUD_PREFLIGHT_BASE="main", CLOUD_PREFLIGHT_STARTED=marker, TMPDIR=own_tmp)
         p = stub_support.start(self, [sys.executable, script], cwd=self.r.d, env=e, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, preexec_fn=lambda: signal.signal(signal.SIGINT, signal.SIG_DFL))
         deadline = _clock() + START_WAIT_LIMIT
         while not os.path.exists(marker):   # the sleeping test file writes the marker when it has STARTED: an event, not a guess
@@ -200,16 +200,16 @@ class Signals(unittest.TestCase):
                 p.kill(); p.wait()
                 raise AssertionError("the preflight script did not start its test file within 60 seconds (hung)")
             time.sleep(0.02)
-        self.assertTrue(leftovers(before), "no temp copy appeared")
+        self.assertTrue(leftovers(own_tmp), "no temp copy appeared")
         p.send_signal(sig)
         try:
             rc = p.wait(timeout=20)   # a hang guard only: it never decides the verdict
         except subprocess.TimeoutExpired:
             p.kill(); p.wait()
             raise AssertionError("the preflight script did not end within 20 seconds after the signal (hung)")
-        left = leftovers(before)
+        left = leftovers(own_tmp)
         for x in left:
-            shutil.rmtree(os.path.join(tempfile.gettempdir(), x), ignore_errors=True)
+            shutil.rmtree(os.path.join(own_tmp, x), ignore_errors=True)
         return rc, left
 
     def test_sigterm_cleans_up(self):
