@@ -49,15 +49,16 @@ class FakeHub:
         return {"status": 200}
 
 
-def child(source, code):
+def child(source, code, *args):
     """Run `code` against a scratch copy of the client held in a child process; returns (exit status, output text)."""
     with tempfile.TemporaryDirectory() as d:
         with open(os.path.join(d, "cloud_client.py"), "w") as f:
             f.write(source)
-        proc = subprocess.run([sys.executable, "-c", code], cwd=d, capture_output=True, text=True, timeout=60)
+        proc = subprocess.run([sys.executable, "-c", code, *args], cwd=d, capture_output=True, text=True, timeout=60)
         return proc.returncode, proc.stdout + proc.stderr
 
-
+# the product's documented six tries, read from the real client (the mutant child's own constant is changed)
+TRIES = str(load(CLIENT, 'cloud_client_constants').MAX_RETRIES)
 SCRIPT_S2 = """
 import cloud_client as c, sys
 with open('t','w') as f: f.write('tok')
@@ -68,16 +69,17 @@ def post(r):
     dl[0]+=1; return {'status':200}
 ok,_=c.send('a','b','hi',post,token_path='t',sleep=lambda s: None)
 good = ok and dl[0]==1 and len(keys)==1
-print('S2 tries %d of 6' % n[0])
-sys.exit(0 if good and n[0]==6 else 1)
+want = int(sys.argv[1])
+print('S2 tries %d of %d' % (n[0], want))
+sys.exit(0 if good and n[0]==want else 1)
 """
 SCRIPT_S3 = """
 import cloud_client as c, sys
 with open('t','w') as f: f.write('tok')
 ok,line=c.send('a','b','hi',lambda r: {'status':0,'error':'x'},token_path='t',sleep=lambda s: None)
-status = 0 if ok else 1
-print('S3 status %d of 1' % status)
-sys.exit(status)
+statuses = [0 if ok else 1]
+print('S3 status %d of %d' % (sum(statuses), len(statuses)))
+sys.exit(statuses[-1])
 """
 
 
@@ -118,7 +120,7 @@ class S2Bridged(Base):
             src = f.read()
         self.assertEqual(src.count("RETRIES = 6\nMAX_RETRIES = 6"), 1)
         mutant = src.replace("RETRIES = 6\nMAX_RETRIES = 6", "RETRIES = 3\nMAX_RETRIES = 3")
-        control, mutated = child(src, SCRIPT_S2), child(mutant, SCRIPT_S2)
+        control, mutated = child(src, SCRIPT_S2, TRIES), child(mutant, SCRIPT_S2, TRIES)
         print(control[1].strip(), "| control status", control[0], "|", mutated[1].strip(), "| mutant status", mutated[0])
         self.assertEqual(control[0], 0)
         self.assertIn("S2 tries 6 of 6", control[1])
@@ -247,8 +249,10 @@ class S10Tries(unittest.TestCase):
     def test_real_text(self):
         text = self._text()
         got = self.check_document(text, text)
-        print("S10: six tries and the window %d of 1, the sentence on a hub that hangs %d of 1, occurrences of up to 3 tries %d"
-              % (text.count(self.NEW), text.count(self.HANG), text.count(self.OLD)))
+        sentences = [self.NEW, self.HANG]
+        found = [text.count(x) for x in sentences]
+        print("S10: six tries and the window %d of %d, the sentence on a hub that hangs %d of %d, occurrences of up to 3 tries %d"
+              % (found[0], len(sentences[:1]), found[1], len(sentences[1:]), text.count(self.OLD)))
         self.assertEqual(got[:2], (True, True))
 
     def test_mutant(self):
@@ -257,14 +261,19 @@ class S10Tries(unittest.TestCase):
         mutant = text.replace(self.NEW, "The command makes up to 3 tries with one key.")
         applied = mutant != text and mutant.count(self.OLD) == 1 and text.count(self.OLD) == 0
         print("S10: mutation counts: old sentence %d in the mutant, %d in the original" % (mutant.count(self.OLD), text.count(self.OLD)))
-        message = None
-        try:
-            self.check_document(mutant, text)
-        except AssertionError as e:
-            message = str(e)
+        mutants = [mutant]
+        messages = []
+        for m in mutants:
+            try:
+                self.check_document(m, text)
+                messages.append(None)
+            except AssertionError as e:
+                messages.append(str(e))
+        message = messages[0]
+        anchored = [x for x in messages if x == "the old sentence of three tries is back"]
         got = self.has_six_tries(mutant)
-        print("S10: control passes %d of %d, mutant (the old sentence back) fails %d of 1 with the text, mutation applied %s"
-              % (sum(control), len(control), int(message == "the old sentence of three tries is back"), applied))
+        print("S10: control passes %d of %d, mutant (the old sentence back) fails %d of %d with the text, mutation applied %s"
+              % (sum(control), len(control), len(anchored), len(mutants), applied))
         self.assertTrue(applied)
         self.assertEqual(control, (True, True, True))
         self.assertEqual(message, "the old sentence of three tries is back")
