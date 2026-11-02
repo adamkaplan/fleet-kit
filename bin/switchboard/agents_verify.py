@@ -439,7 +439,7 @@ REHEARSE_MAX_GUARDS_BYTES = 200000
 def rehearse_guards():
     path = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "docs", REHEARSE_GUARDS_FILE)
     with open(path) as handle:
-        return json.loads(handle.read(REHEARSE_MAX_PLAN_BYTES))
+        return load_module("record_json").parse_bounded(handle.read(REHEARSE_MAX_PLAN_BYTES))
 
 
 def rehearse_text(path):
