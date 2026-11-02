@@ -82,6 +82,43 @@ class TestClaimLegacy(unittest.TestCase):
                 with self.assertRaises(AssertionError, msg=name):
                     self.checks()
 
+    def test_s6_three_source_copy_mutants_are_each_applied_once_and_caught_by_the_check_naming_the_rule(self):
+        """The entry is copied with ONE replaced text (asserted to occur once); the copy's plan_peers is the one the gate runs."""
+        import importlib.machinery
+        import importlib.util
+        import shutil
+        import tempfile
+        from tests.switchboard.support.loader import copy_entry
+        rule = "if not found and merged is not None and merged <= CLAIM_LEDGER_SINCE:"
+        mutants = (
+            ("the rule deleted", rule, "if False:", "has no recorded claim at or before its merge"),
+            ("the cutoff ignored", "merged <= CLAIM_LEDGER_SINCE:", "merged <= CLAIM_LEDGER_SINCE or True:", "unexpectedly None"),
+            ("the cutoff 30 days late", "CLAIM_LEDGER_SINCE = %d " % CUTOFF, "CLAIM_LEDGER_SINCE = %d " % (CUTOFF + 2592000), "unexpectedly None"),
+        )
+        for name, old, new, anchor in mutants:
+            with self.subTest(name):
+                directory = Path(tempfile.mkdtemp(prefix="legacy-mutant-"))
+                self.addCleanup(shutil.rmtree, str(directory), True)
+                for module in (REPO / "bin").glob("*.py"):
+                    shutil.copy(str(module), str(directory / module.name))
+                copy_entry(directory)
+                text = (directory / "fleet-switchboard").read_text()
+                self.assertEqual(text.count(old), 1, "the mutant applies exactly once")
+                for label, source in (("control", text), (name, text.replace(old, new, 1))):
+                    (directory / "fleet-switchboard").write_text(source)
+                    loader = importlib.machinery.SourceFileLoader("sb_legacy_%s_%d" % (label.replace(" ", "_"), id(directory)), str(directory / "fleet-switchboard"))
+                    copy = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+                    with mock.patch.object(sys, "dont_write_bytecode", True):   # a cached bytecode of the same size and second would hide the mutant
+                        loader.exec_module(copy)
+                    copy.ClaimUnknown = self.sb.ClaimUnknown   # the gate catches the host's class
+                    with mock.patch.object(self.sb, "plan_peers", copy.plan_peers):
+                        if label == "control":
+                            self.checks()
+                            continue
+                        with self.assertRaises(AssertionError) as caught:
+                            self.checks()
+                        self.assertIn(anchor, str(caught.exception), name)
+
     def test_s7_the_docs_state_the_cutoff_its_reason_and_the_two_cases(self):
         docs = (REPO / "docs" / "switchboard.md").read_text()
         item = [p for p in docs.split("\n- **") if p.startswith("A sibling merged before the claim ledger")]
