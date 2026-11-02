@@ -13546,7 +13546,7 @@ class TestCharterSetGuard(CharterRig, Base):
             reads.clear()
             with mock.patch.object(sb.IntentReader, "__init__", init):
                 code, out, err = self.run_as("cos", "charter", "set", "orch-b", "3")
-        self.assertEqual(len([r for r in reads if not r.endswith("/parent")]), 1)
+        self.assertEqual(len([r for r in reads if not r.endswith("/parent")]), 2)   # the strict parent read's own fresh issue read, then the label read (never from the cache)
         self.assertEqual(code, 2, err)
         self.assertIsNone(self.row("orch-b")["charter"])
 
