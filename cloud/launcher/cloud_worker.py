@@ -391,6 +391,20 @@ SCRUB_OUTPUT_MAX = 2 * SCRUB_INPUT_MAX   # a limit above the input maximum: reda
 MIN_FRAGMENT = 8
 
 
+_H = r"[0-9A-Fa-f]{1,4}"
+_V4 = r"[0-9]{1,3}(?:\.[0-9]{1,3}){3}"
+MASK_IPV6 = True   # the capacity answer masks the IPv6 and the IPv4-mapped forms too (PC-10)
+_ADDRESS_V6 = (r"(?<![0-9A-Fa-f:])(?:(?:%(h)s:){6}%(v4)s|(?:%(h)s(?::%(h)s){0,5})?::(?:ffff:)?%(v4)s|(?:%(h)s:){7}%(h)s"
+               r"|(?:%(h)s(?::%(h)s){0,6})?::(?:%(h)s(?::%(h)s){0,6})?)(?![0-9A-Fa-f:])|") % {"h": _H, "v4": _V4}
+_ADDRESS_RE = re.compile((_ADDRESS_V6 if MASK_IPV6 else "") + _V4)
+
+
+def _mask_addresses(text):
+    """The capacity answer's own masking, after the launcher's one scrub: a dotted IPv4, an IPv6 in any written form (at most one `::`) and an
+    IPv4-mapped IPv6 become `[address]`; a name such as `node-a` and a time such as `12:30:45` are kept."""
+    return _ADDRESS_RE.sub("[address]", text) if isinstance(text, str) else text
+
+
 def _quantity(value, scale):
     """A Kubernetes quantity ('4', '3920m', '8Gi', '16000Ki') as a whole number: `scale` 1000 gives millicores, 1 gives bytes. Unreadable is 0."""
     text = str(value if value is not None else "0")
@@ -2531,6 +2545,10 @@ class Launcher:
                 out["last_event"] = self.kube.scrub("FailedScheduling %s%s" % (who + ": " if who else "", last.get("message") or ""), 200)[:200]
         except CloudError as e:
             out["events_read"], out["events_error"] = False, self.kube.scrub(e, 120)
+        # PC-10: after the one scrub, every name and the event line lose an address of the three forms
+        out["nodes"] = [dict(n, name=_mask_addresses(n["name"])) for n in out["nodes"]]
+        out["requests"] = {_mask_addresses(k): v for k, v in out["requests"].items()}
+        out["last_event"] = _mask_addresses(out["last_event"])[:200] if out["last_event"] else out["last_event"]
         return out
 
     def hard_deadline(self, pod):
