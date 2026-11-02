@@ -78,6 +78,17 @@ def run(body, rule=LINE_RULE, **kw):
 
 
 class TestBodyCheck(unittest.TestCase):
+    def test_s8_the_documentation_sentence_and_the_unit_row_each_once(self):
+        doc = (REPO / "docs" / "switchboard.md").read_text()
+        sentences = [l for l in doc.splitlines() if "preflight-pr --body" in l]
+        self.assertEqual(len(sentences), 1, "docs/switchboard.md: the sentence naming 'preflight-pr --body' occurs %d times, expected 1" % len(sentences))
+        arch = (REPO / "docs" / "architecture.md").read_text()
+        head, _, known = arch.partition("\n## Known violations")
+        unit = [l for l in head.splitlines() if l.startswith("| `switchboard/body_check.py` |")]
+        self.assertEqual(len(unit), 1, "docs/architecture.md: the unit-table row of switchboard/body_check.py occurs %d times, expected 1" % len(unit))
+        rows = [l for l in known.splitlines() if l.startswith("|") and "switchboard/body_check.py" in l]
+        self.assertEqual(len(rows), 0, "docs/architecture.md: %d Known-violations rows name switchboard/body_check.py, expected 0" % len(rows))
+
     def test_s2_the_why_block_first_is_refused_by_name(self):
         for shape in (WHY_FIRST, HEADING_ORDER):
             code, out = run(shape)
