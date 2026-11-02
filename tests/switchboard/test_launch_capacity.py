@@ -663,7 +663,11 @@ for _ in range(20000):
     for text in put:
         assert accepted(text), text    # the planted addresses are checked with ipaddress on the planted text
     out = lib._mask_addresses(line)
-    found = [t for t in put if t in out] + [t for t in keep if t not in out]
+    rest = out
+    for text in keep:
+        rest = rest.replace(text, " ", 1)    # the planted non-addresses are set aside before a planted address is looked for
+    rest = rest.replace("[address]", " ")
+    found = [t for t in put if t in rest] + [t for t in keep if t not in out]
     if found:
         bad.append((line, out, found))
         if len(bad) >= 5:
