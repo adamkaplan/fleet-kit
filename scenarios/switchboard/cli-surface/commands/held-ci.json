@@ -1,0 +1,4 @@
+{
+ "command": "held-ci",
+ "help": "usage: fleet-switchboard held-ci [-h] [--repo REPO] [--refresh PR [PR ...]] Read-only: for each open pull request labelled merge-captain, its head, the base tip its latest run was computed on, and `current` or `stale: N commits behind`. With --refresh <pr> (exactly one, never a draft, never a pull request that is not held) it closes and reopens that pull request so GitHub builds a new merge commit, checks that the head and the labels are unchanged, and writes one audit line. Refresh only a pull request that is about to go to the owner. Nothing refreshes by itself. options: -h, --help show this help message and exit --repo REPO OWNER/REPO (default: the intent repo) --refresh PR [PR ...] Close and reopen this ONE pull request"
+}
