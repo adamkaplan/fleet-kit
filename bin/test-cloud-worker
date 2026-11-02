@@ -1610,6 +1610,15 @@ class TestLaunchStack(Base):
                 self.assertEqual(self.create_argv(), expected)
                 self.assertEqual(self.create_argv().count("--stack"), 1)
 
+    def test_s14_a_stack_launch_arms_the_default_once(self):
+        code, out, err = self.launch_with("--cloud", "--stack")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.create_argv().count("--stack"), 1)
+        lines = [l for l in err.splitlines() if l.startswith("fleet-switchboard: default 25m/40m")]
+        self.assertEqual(len(lines), 1, err)
+        self.assertIn("worker reminder in 25 min", lines[0])
+        self.assertIn("overdue reminder in 40 min", lines[0])
+
     def state_clean(self):
         """Between two launches of one test: the fakes' call logs and the worker records start empty."""
         for name in ("calls.log", "kubectl.log", "login.log"):

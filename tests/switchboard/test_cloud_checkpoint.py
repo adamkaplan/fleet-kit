@@ -130,16 +130,18 @@ def build(TwoRepoCase, sb, EPOCH, ACME_WEB):
             with mock.patch.object(sb, "run_cloud", fake):
                 return self.main("launch", "web-new", "--cloud", "--repo", ACME_WEB, "--reports-to", "web-orch", "--issue", "acme/web#2")
 
-        def check_failed_launch_arms_nothing(self):
-            for how, status in (("exit", 1), ("raise", 1)):
-                sb.write_reminders(self.world.state, [])
-                code, _, err = self.failing_launch(how)
-                self.assertEqual(len(sb.read_reminders(self.world.state)), 0, "a failed launch (%s) armed reminders" % how)
-                self.assertEqual(code, status, err)
-                self.assertNotIn("default 25m/40m", err)
+        def check_failed_launch_arms_nothing(self, how):
+            sb.write_reminders(self.world.state, [])
+            code, _, err = self.failing_launch(how)
+            self.assertEqual(len(sb.read_reminders(self.world.state)), 0, "a failed launch (%s) armed reminders" % how)
+            self.assertEqual(code, 1, err)
+            self.assertNotIn("default 25m/40m", err)
 
-        def test_a_failed_cloud_launch_arms_nothing(self):
-            self.check_failed_launch_arms_nothing()
+        def test_a_failed_cloud_launch_exit_arms_nothing(self):
+            self.check_failed_launch_arms_nothing("exit")
+
+        def test_a_raised_launch_error_arms_nothing(self):
+            self.check_failed_launch_arms_nothing("raise")
 
         def test_a_stack_launch_arms_the_default_once(self):
             code, _, err = self.launch("--stack")
