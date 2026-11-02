@@ -1875,7 +1875,9 @@ class TestGhShimEncodedQueryAndLabelDelete(unittest.TestCase):
         self.assertEqual(encoded_query_failures(self.rig), [])   # control first
         old = 'urllib.parse.unquote(part.partition("=")[0]) for part in re.split(r"[&;]", query)'
         self.assertEqual(self.source.count(old), 1, "the mutant's anchor is gone (the query keys of api_decide)")
-        rig = Rig(self.source.replace(old, 'part.partition("=")[0] for part in query.split("&")', 1))
+        check = '"%" in key or not key_known(key) or (key.lower() == "body" and key in query_keys)'
+        self.assertEqual(self.source.count(check), 1, "the mutant's anchor is gone (the key check of api_decide)")
+        rig = Rig(self.source.replace(old, 'part.partition("=")[0] for part in query.split("&")', 1).replace(check, '(key != "body" or key in query_keys) and re.search(r"(?i)(^|\\[)body(\\]|\\[\\])*$", key)', 1))
         self.addCleanup(rig.close)
         self.assertIn("an encoded query key went out unsigned", encoded_query_failures(rig))
 
@@ -1950,9 +1952,9 @@ class TestGhShimDeepBodiesAndInputForms(unittest.TestCase):
 
     def test_s31_a_mutant_comparing_the_key_in_lower_case_only_is_seen(self):
         self.assertEqual(body_key_failures(self.rig), [])   # control first
-        old = 'for key in [k for k in data if isinstance(k, str) and k.lower() == "body"]:'
+        old = 'for key in [k for k in data if k.lower() == "body"]:'
         self.assertEqual(self.source.count(old), 1, "the mutant's anchor is gone (the first-level body of input_call)")
-        rig = Rig(self.source.replace(old, 'for key in [k for k in data if isinstance(k, str) and k == "body"]:', 1))
+        rig = Rig(self.source.replace(old, 'for key in [k for k in data if k == "body"]:', 1))
         self.addCleanup(rig.close)
         self.assertIn("a body key written Body went out unsigned", body_key_failures(rig))
 
@@ -2064,18 +2066,18 @@ class TestGhShimBracketBodyKeys(unittest.TestCase):
 
     def test_s36_a_mutant_with_the_old_key_pattern_is_seen(self):
         self.assertEqual(bracket_body_failures(self.rig), [])   # control first
-        new = r'(?i)(^|\[)body(\]|\[\])*$'
-        old = r'(?i)(^|\[)body\]?$'
-        self.assertEqual(self.source.count(new), 2, "the mutant's anchor is gone (the two body key patterns of api_decide)")
+        new = '    return key.lower() == "body" or key in ALLOWED_KEYS'
+        old = '    return key.lower() == "body" or not re.search(r"(?i)(^|\[)body\]?$", key)'
+        self.assertEqual(self.source.count(new), 1, "the mutant's anchor is gone (the allowlist check of the shim)")
         rig = Rig(self.source.replace(new, old))
         self.addCleanup(rig.close)
         self.assertIn("a body[] field went out unsigned", bracket_body_failures(rig), "a body[] field went out unsigned")
 
     def test_s36_a_mutant_dropping_the_percent_check_is_seen(self):
         self.assertEqual(bracket_body_failures(self.rig), [])   # control first
-        old = '"%" in key or '
+        old = '"%" in key or not key_known(key)'
         self.assertEqual(self.source.count(old), 1, "the mutant's anchor is gone (the percent check of api_decide)")
-        rig = Rig(self.source.replace(old, "", 1))
+        rig = Rig(self.source.replace(old, 'not (key_known(key) or "%" in key)', 1))
         self.addCleanup(rig.close)
         self.assertIn("a key with a percent sign went out unsigned", bracket_body_failures(rig), "a key with a percent sign went out unsigned")
 
