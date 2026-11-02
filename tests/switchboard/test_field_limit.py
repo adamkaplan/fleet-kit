@@ -13,7 +13,10 @@ from support.loader import sb, class_source_fn
 from support.paths import BIN, REPO
 
 sys.path.insert(0, str(BIN))
-import plan_ledger  # noqa: E402
+# ONE rule: never use a plan_ledger module this file imported itself (the whole run loads it more than once).
+# sb.plan_ledger: the module of bin/fleet-switchboard (sb-side tests: caught LedgerError, ledger file, claim_line, limits, bounded_text).
+# relay.plan_ledger: only the relay-side ledger read (test_..relay..), where cloud_relay_daemon is the code under test.
+relay_pl = lambda: fl_relay.plan_ledger
 import cloud_relay_daemon as fl_relay  # noqa: E402
 import test_evidence_limit as fl_ev  # noqa: E402  (the fakes of ask #1901's relay tests)
 
@@ -92,12 +95,12 @@ def build():
                     contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                 try:
                     return sb.cmd_item_prove(self.args(scenario=["S1"], command=text), None, self.now), None
-                except (sb.LedgerCommandError, plan_ledger.LedgerError) as err:
+                except (sb.LedgerCommandError, sb.plan_ledger.LedgerError) as err:
                     return None, str(err)
 
         def test_item_prove_refuses_201_and_records_200(self):
             self.register()
-            ledger = self.state / plan_ledger.LEDGER_FILE
+            ledger = self.state / sb.plan_ledger.LEDGER_FILE
             before, audits = ledger.read_bytes(), len(self.audit)
             code, why = self.item_prove(FL_LONG)
             self.assertIsNone(code)
@@ -142,7 +145,7 @@ def build():
             self.assertEqual(len(self.refusals()), 1)
             got = self.call(FL_WHOLE)   # the same call id after the refusal
             self.assertEqual(got["status"], 200, got)
-            self.assertEqual([e["command"] for e in plan_ledger.read_ledger(self.state)[0]], [FL_WHOLE])
+            self.assertEqual([e["command"] for e in relay_pl().read_ledger(self.state)[0]], [FL_WHOLE])
             self.assertEqual(len(self.refusals()), 1)
 
     class TestFieldLimitCounting(FieldBase):
@@ -254,9 +257,9 @@ def build():
             text = "S1 " * 299 + "S1"
             self.assertEqual(len(text), 899)
             body = "PLAN: acme/app#7\nCLAIMS: " + text
-            line = plan_ledger.claim_line(self.PR, host.LEDGER_HEAD, body)
+            line = sb.plan_ledger.claim_line(self.PR, host.LEDGER_HEAD, body)
             self.assertEqual(line["claim_text"], text)
-            longer = plan_ledger.claim_line(self.PR, host.LEDGER_HEAD, "PLAN: acme/app#7\nCLAIMS: " + "s" * 1001)["claim_text"]
+            longer = sb.plan_ledger.claim_line(self.PR, host.LEDGER_HEAD, "PLAN: acme/app#7\nCLAIMS: " + "s" * 1001)["claim_text"]
             self.assertEqual((len(longer), longer[-1]), (1000, "\u2026"))
 
     class TestFieldLimitDocsAndCode(unittest.TestCase):
@@ -268,10 +271,10 @@ def build():
             self.assertEqual(text.count('--reason "<at least 20 and at most 200 characters; a longer reason is refused, never cut>"'), 1)
 
         def test_the_ledger_module_has_the_one_rule_and_the_limits_are_unchanged(self):
-            self.assertEqual((plan_ledger.EVIDENCE_LIMIT, plan_ledger.FIELD_LIMIT, plan_ledger.CLAIM_TEXT_LIMIT), (500, 200, 1000))
-            self.assertEqual(plan_ledger.bounded_text("a" * 200, plan_ledger.FIELD_LIMIT, "command"), "a" * 200)
-            with self.assertRaises(plan_ledger.LedgerError):
-                plan_ledger.bounded_text("a" * 201, plan_ledger.FIELD_LIMIT, "command")
+            self.assertEqual((sb.plan_ledger.EVIDENCE_LIMIT, sb.plan_ledger.FIELD_LIMIT, sb.plan_ledger.CLAIM_TEXT_LIMIT), (500, 200, 1000))
+            self.assertEqual(sb.plan_ledger.bounded_text("a" * 200, sb.plan_ledger.FIELD_LIMIT, "command"), "a" * 200)
+            with self.assertRaises(sb.plan_ledger.LedgerError):
+                sb.plan_ledger.bounded_text("a" * 201, sb.plan_ledger.FIELD_LIMIT, "command")
 
         def test_this_file_makes_no_size_measure(self):
             text = Path(__file__).read_text()
