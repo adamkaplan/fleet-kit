@@ -115,6 +115,14 @@ def clip(text, limit=FIELD_LIMIT):
     return text if len(text) <= limit else text[:limit - 1] + "\u2026"
 
 
+def evidence_text(text):
+    """The evidence as recorded: whitespace collapsed as `clip` does; over EVIDENCE_LIMIT it is REFUSED, never cut."""
+    text = " ".join(str(text or "").split())
+    if len(text) > EVIDENCE_LIMIT:
+        raise LedgerError("the evidence is %d characters and the limit is %d: nothing was recorded; put the long text in one comment or a file and give the link, or shorten it" % (len(text), EVIDENCE_LIMIT))
+    return text
+
+
 def read_ledger(state_dir):
     """(entries, problem): every line parsed, and None when the chain holds, else a sentence naming the first break
     (the entries before it are still returned: they are intact, the ones from the break on are not trusted)."""

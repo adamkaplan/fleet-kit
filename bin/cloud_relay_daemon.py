@@ -424,8 +424,11 @@ class Executor:
             return 200, "recorded", record
         except Replay as rep:
             first = rep.record   # rebuilt from the ledger entry: no digest, so compare what the entry holds
-            clipped = plan_ledger.clip(str(args.get("evidence") or "").strip(), plan_ledger.EVIDENCE_LIMIT)
-            if (not _same_call(first, command, pr, call.get("head")) or first.get("scenario") != args.get("scenario")
+            try:
+                clipped = plan_ledger.evidence_text(str(args.get("evidence") or "").strip())
+            except plan_ledger.LedgerError:
+                clipped = None   # over the limit: it cannot be the recorded call
+            if (clipped is None or not _same_call(first, command, pr, call.get("head")) or first.get("scenario") != args.get("scenario")
                     or first.get("result") != args.get("result") or first.get("evidence") != clipped):
                 backend.audit("relay.refused", clean_text(pr, 80), {"by": clean_text(pod, 80), "status": 409, "why": "call_id reused for a different call"})
                 return 409, "call_id reused for a different call", None
@@ -459,7 +462,10 @@ class Executor:
         result = args.get("result")
         if result not in plan_ledger.RESULTS:
             raise Refuse(400, "result must be pass or fail")
-        evidence = plan_ledger.clip(str(args.get("evidence") or "").strip(), plan_ledger.EVIDENCE_LIMIT)
+        try:
+            evidence = plan_ledger.evidence_text(str(args.get("evidence") or "").strip())
+        except plan_ledger.LedgerError as err:
+            raise Refuse(400, str(err))
         if not evidence:
             raise Refuse(400, "evidence is required")
         base = {"pr": pr, "scenario": sid, "plan_ref": plan["source"], "plan_hash": plan["hash"], "head": head,
