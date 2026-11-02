@@ -2075,9 +2075,9 @@ class TestGhShimBracketBodyKeys(unittest.TestCase):
 
     def test_s36_a_mutant_dropping_the_percent_check_is_seen(self):
         self.assertEqual(bracket_body_failures(self.rig), [])   # control first
-        old = '"%" in key or not key_known(key)'
+        old = '"%" in key or key not in ALLOWED_KEYS'
         self.assertEqual(self.source.count(old), 1, "the mutant's anchor is gone (the percent check of api_decide)")
-        rig = Rig(self.source.replace(old, 'not (key_known(key) or "%" in key)', 1))
+        rig = Rig(self.source.replace(old, 'key not in ALLOWED_KEYS and "%" not in key', 1))
         self.addCleanup(rig.close)
         self.assertIn("a key with a percent sign went out unsigned", bracket_body_failures(rig), "a key with a percent sign went out unsigned")
 
