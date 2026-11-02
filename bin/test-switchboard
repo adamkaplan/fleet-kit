@@ -45136,7 +45136,7 @@ class TestASlowCatchUpDoesNotFreezeThePass(Base):
         rig.hub.catch_up(rig.watch(), rig.world.clock.now())
         self.assertLessEqual(len(rig.hub.queue), sb.GITHUB_PAGE_CAP * sb.GITHUB_PAGE_SIZE)
         took = self.pass_seconds(rig)
-        self.assertLessEqual(took, sb.GITHUB_ROUTE_SECONDS + sb.GITHUB_ROUTE_READ_TIMEOUT, took)
+        self.assertLessEqual(took, sb.GITHUB_ROUTE_SECONDS + sb.GITHUB_ROUTE_READ_TIMEOUT + (sb.OPEN_LIST_PAGES - sb.SWEEP_LIST_PAGES), took)   # #1886: the extra pages of one open-item read over the old cap, 1 s each in this rig
         self.assertGreater(len(rig.hub.queue), 0, "what did not fit waits for the next pass")
 
     def test_the_decisions_file_is_never_stale_because_of_it(self):
