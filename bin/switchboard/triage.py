@@ -563,8 +563,6 @@ def triage_read_unit(hub, repo, unit, now, budget):
     if unit == "issues":
         path = "repos/%s/issues?state=open&per_page=100" % repo
         records, cut = hub.read_open_pages(path)
-        if cut:
-            note_open_cut(repo)
     elif unit == "merged":   # #384: ONE page of the recently closed pull requests; those with a merge date name the issues they implemented
         records, cut = hub.read_pages("repos/%s/pulls?state=closed&sort=updated&direction=desc&per_page=%d" % (repo, TRIAGE_MERGED_PER_PAGE), cap=1)
     elif unit == "comments":

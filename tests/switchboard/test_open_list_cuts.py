@@ -18,6 +18,23 @@ def full_api(path, repo=None, meta=None):
     return [{"number": 1, "state": "open", "labels": [], "title": "t", "body": ""}] * 100
 
 
+def real_hub(total, requests=None):
+    """The REAL GitHubHub paging (read_pages, read_open_pages) over a fake gh_api: a clamp at 5 pages shows here."""
+    hub = sb.GitHubHub.__new__(sb.GitHubHub)
+    items = [{"number": n, "state": "open", "title": "t", "body": "", "labels": [], "user": {"login": "u"}, "created_at": "2026-10-01T00:00:00Z",
+              "updated_at": "2026-10-01T00:00:00Z", "comments": 0} for n in range(total, 0, -1)]
+
+    def gh_api(path, paginate=True, timeout=None):
+        if requests is not None:
+            requests.append(path)
+        if "state=open" not in path:
+            return []
+        number = int(re.search(r"[?&]page=(\d+)", path).group(1))
+        return [items[(number - 1) * 100:number * 100]]
+    hub.gh_api = gh_api
+    return hub
+
+
 class CutsBase(Base):
     def setUp(self):
         super().setUp()
@@ -42,11 +59,11 @@ class CutsBase(Base):
             sb.open_list_alert(self.engine, repo, now)
 
     def five_reads(self, total=2000, repo="acme/api"):
-        hub = PagedHub(total)
+        hub = real_hub(total)
         sb.sweep_read_repo(hub, repo, NOW, 7, sb.sweep_phrase_re(["Alex"]), [100], sb.SweepState().strong)
         sb.triage_read_unit(hub, repo, "issues", NOW, [100])
         engine = types.SimpleNamespace(config={"plan_gates": {"repos": {repo: {}}}}, state_dir=str(self.state_dir), audit=self.engine.audit,
-                                       hub=types.SimpleNamespace(read_pages=lambda path, key=None, timeout=None, older=None, cap=None: hub.read_pages(path, cap=cap)),
+                                       hub=hub,
                                        now=lambda: NOW)
         sb.ci_record_pass(engine, NOW)
         sb.open_pages(lambda page: full_api("labels"), repo)
@@ -74,7 +91,7 @@ class TestOpenListCuts(CutsBase):
         self.five_reads()
         self.end_of_pass(NOW)
         self.assertEqual(len(self.reminders), 1)
-        sb.sweep_read_repo(PagedHub(300), "acme/api", NOW + 900, 7, sb.sweep_phrase_re(["Alex"]), [100], sb.SweepState().strong)
+        sb.sweep_read_repo(real_hub(300), "acme/api", NOW + 900, 7, sb.sweep_phrase_re(["Alex"]), [100], sb.SweepState().strong)
         self.assertEqual(sb.take_open_cuts(), [], msg="the set is empty after the second pass")
         self.end_of_pass(NOW + 900)
         self.end_of_pass(NOW + DAY)
@@ -122,9 +139,11 @@ class TestOpenListPagesRead(CutsBase):
         self.assertEqual(sb.open_pages(lambda page: "boom", "acme/api"), "boom")
 
     def test_s14_the_hub_reads_ten_pages_for_1001_items(self):
-        hub = PagedHub(1001)
+        requests = []
+        hub = real_hub(1001, requests)
         records, cut = hub.read_open_pages("repos/acme/api/issues?state=open&per_page=100")
-        self.assertEqual((len(records), cut, len(hub.open_requests())), (1000, True, 10))
+        self.assertEqual((len(records), cut, len(requests)), (1000, True, 10), msg="a clamp at 5 pages fails here")
+        self.assertEqual(sb.take_open_cuts(), ["acme/api"])
 
 
 class TestOpenListDerivedText(Base):

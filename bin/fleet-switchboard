@@ -13163,7 +13163,11 @@ class GitHubHub:
                 self._markers_dirty = True  # a cursor that could not be written is written next pass
 
     def read_open_pages(self, path):
-        return self.read_pages(path, cap=OPEN_LIST_PAGES)
+        records, cut = self.read_pages(path, cap=OPEN_LIST_PAGES)
+        named = re.match(r"^repos/([^/]+/[^/]+)/", path)   # the repository, read the way gh_api reads it
+        if cut and named:
+            note_open_cut(named.group(1))
+        return records, cut
 
     def read_pages(self, path, key=None, timeout=None, older=None, cap=None):
         """One list read, at most `cap` (default GITHUB_PAGE_CAP) pages of GITHUB_PAGE_SIZE. Returns (records, truncated). `older`
