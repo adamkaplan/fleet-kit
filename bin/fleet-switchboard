@@ -9181,11 +9181,6 @@ def publish_decisions(engine):
         triage_pass(engine, decisions, now, errors)  # #130: audits and counts; writes nothing to GitHub; never raises
     except Exception as err:
         engine._note("triage.error", None, {"error": _one_line("%s: %s" % (type(err).__name__, err), 200)})
-    try:   # #1886: the daily alert for every read of this pass that stopped at the ceiling
-        for repo in take_open_cuts():
-            open_list_alert(engine, repo, now)
-    except Exception as err:
-        engine._note("open_list.error", None, {"error": _one_line("%s: %s" % (type(err).__name__, err), 200)})
     try:
         pr_events_pass(engine, now)   # #354: folds the webhook events into the pr-state picture and writes it, for watched repos too; no GitHub call
     except Exception as err:
@@ -9194,6 +9189,11 @@ def publish_decisions(engine):
         ci_record_pass(engine, now)   # #107: records ci verdicts for open PRs under a plan; reads GitHub, writes only the ledger and audit
     except Exception as err:
         engine._note("ci_record.error", None, {"error": _one_line("%s: %s" % (type(err).__name__, err), 200)})
+    try:   # #1886: the daily alert for every read of this pass that stopped at the ceiling
+        for repo in take_open_cuts():
+            open_list_alert(engine, repo, now)
+    except Exception as err:
+        engine._note("open_list.error", None, {"error": _one_line("%s: %s" % (type(err).__name__, err), 200)})
     try:
         pane_health_pass(engine, now)   # the control plane: detached or dead panes, reads only, wakes the Chief of Staff
     except Exception as err:

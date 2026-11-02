@@ -120,6 +120,22 @@ class TestOpenListCuts(CutsBase):
             self.end_of_pass(NOW)
         self.assertEqual((len(self.reminders), len(self.lines("open_list.marker_failed"))), (1, 1))
 
+    def test_a_cut_noted_by_the_recorder_is_raised_in_the_same_pass_of_the_real_publish_decisions(self):
+        """The REAL publish_decisions and the REAL ci_record_pass over the real paging (a fake gh_api); the passes before it (derive, sweep, triage) and after it are replaced by no-ops (the other passes are not under test: each is a fake)."""
+        hub = real_hub(2000)
+        engine = types.SimpleNamespace(config={"plan_gates": {"repos": {"acme/api": {}}}, "github_repos": ["acme/api"]}, state_dir=str(self.state_dir), actor="daemon",
+                                       discovery=types.SimpleNamespace(agents=self.cos), audit=types.SimpleNamespace(append=lambda *a: self.audit.append(a)),
+                                       hub=hub, now=lambda: NOW, _note=lambda *a, **k: None)
+        quiet = lambda *a, **k: None
+        with mock.patch.object(sb, "derive_decisions", lambda e, n: ([], [])), mock.patch.object(sb, "sweep_decisions", lambda e, d, n, errs: d), \
+                mock.patch.object(sb, "triage_pass", quiet), mock.patch.object(sb, "pr_events_pass", quiet), mock.patch.object(sb, "pane_health_pass", quiet), \
+                mock.patch.object(sb, "decision_store", lambda e: types.SimpleNamespace(publish=lambda *a, **k: True)), \
+                mock.patch.object(sb, "chat_clear_pass", quiet), mock.patch.object(sb, "apply_notice_effects", quiet), mock.patch.object(sb, "prune_escalations_pass", quiet), \
+                mock.patch.object(sb, "sync_external", lambda *a, **k: []), mock.patch.object(sb, "work_sync_external", quiet):
+            sb.publish_decisions(engine)
+        self.assertEqual(len(self.lines("open_list.cut")), 1, msg="the recorder's cut is raised in the pass that read it")
+        self.assertEqual(sb.take_open_cuts(), [])
+
 
 class TestOpenListPagesRead(CutsBase):
     def test_s14_the_boundaries_and_a_failed_later_page(self):
