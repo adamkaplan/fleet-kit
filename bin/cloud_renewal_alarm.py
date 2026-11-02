@@ -22,6 +22,7 @@ CONFIG_MAX = 20
 ACTION = "renew-git-token"
 KIND = "cloud-renewal-alarm"
 EVENT = "cloud.renewal.alarm"
+EVENT_UNSENT = "cloud.renewal.alarm-unsent"
 STATE_FILE = "cloud-renewal-alarm.json"
 READ_BYTES = 262144
 SERIES_SECONDS = 30 * 60
@@ -182,6 +183,7 @@ def tick(engine, discovery, send, hold_reason, boss_of, default_lane, env=None):
     state["cursor"] = newest
     alarmed = set((a[0], a[1]) for a in state["alarmed"])
     state["unsent"] = [u for u in state.get("unsent", []) if isinstance(u, list) and len(u) == 2]
+    was_unsent = [list(u) for u in state["unsent"]]   # the lines already unsent at the start of this tick
     dropped = []
     failed = {}   # pod -> (seconds, worker, reason) of its newest failure in this tick, after the last success
     for at, pod, worker, ok, reason in sorted(fresh, key=lambda l: l[0]):
@@ -246,6 +248,7 @@ def tick(engine, discovery, send, hold_reason, boss_of, default_lane, env=None):
     except Exception:
         pass   # nothing raises into the daemon pass; the entry and the state are still written below
     finally:
+        alarms_at = {pod: state["pods"][pod] for pod in alarms}
         unsent = sorted((state["pods"][pod], pod) for pod in alarms if pod not in reached)
         for at, pod in unsent:   # a pod whose alarm reached nobody is not entered: no series, no alarmed line, the cursor stays at its line
             if before[pod] is None:
@@ -262,6 +265,10 @@ def tick(engine, discovery, send, hold_reason, boss_of, default_lane, env=None):
                 for pod, at in dropped:
                     engine.audit.append(engine.actor, "renewal-alarm-dropped", pod, {"reason": "dropped unsent: older than one hour"})
                 for pod, (worker, reason) in sorted(alarms.items()):
+                    if pod not in reached:
+                        if [pod, alarms_at[pod]] not in was_unsent:
+                            engine.audit.append(engine.actor, EVENT_UNSENT, pod, {"reason": reason, "group": len(by_reason.get(reason, [pod]))})
+                        continue
                     engine.audit.append(engine.actor, EVENT, pod, {"told": sorted(set(told.get(pod, []))), "reason": reason, "group": len(by_reason.get(reason, [pod]))})
         except Exception:
             pass
