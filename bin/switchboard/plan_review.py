@@ -812,11 +812,11 @@ def cmd_plan_review(args, runner, now, socket_call=None):
     return EXIT_OK
 
 
-def cmd_plan_apply(args, runner, now):
+def cmd_plan_apply(args, runner, now, fleet_mark):
     """`plan apply`: the work is the section `plan apply (#1789)` at the end of plan_input.py; this passes it the caller and the engine's reader, and prints."""
     engine, _, _ = build_engine(runner, now, "cli")
     caller = identify_caller(engine.herdr, engine.v2, os.environ)
-    code, text = apply_run(args, caller, engine.intents._api, str(engine.state_dir), engine.audit)
+    code, text = apply_run(args, caller, engine.intents._api, str(engine.state_dir), engine.audit, fleet_mark)
     if text:
         (sys.stdout if code == 0 else sys.stderr).write(text.rstrip("\n") + "\n")
     return code

@@ -24019,7 +24019,7 @@ def cmd_plan(args, runner, now, socket_call=None):
     if args.plan_action == "template":
         return cmd_plan_template(args, runner, now)
     if args.plan_action == "apply":
-        return cmd_plan_apply(args, runner, now)
+        return cmd_plan_apply(args, runner, now, fleet_mark)
     return cmd_plan_check(args, runner, now)
 
 

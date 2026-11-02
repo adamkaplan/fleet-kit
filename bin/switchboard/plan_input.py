@@ -335,7 +335,7 @@ def declared_clauses(text):
         raise PlanApplyRefused("plan apply: refused: the plan's clauses cannot be read: %s" % one_line(err, 150), 1) from None
 
 
-def receipt_text(name, file_sha, count, why, old_hash, new_hash, caller, checked="pass"):
+def receipt_text(name, file_sha, count, why, old_hash, new_hash, caller, mark, checked="pass"):
     lines = [plan_check.RECEIPT_MARKER, "plan hash: %s" % new_hash,
              "file: %s (sha256 %s)" % (os.path.basename(name), file_sha[:8]),
              "pairs: %d; the old plan hash was %s" % (count, old_hash)]
@@ -343,10 +343,10 @@ def receipt_text(name, file_sha, count, why, old_hash, new_hash, caller, checked
         lines.append(one_line(why.replace("`", "'"), REASON_LIMIT))
     if checked != "pass":
         lines.append("plan check: FAIL")
-    return "\n".join(lines) + "\n\n" + fleet_mark(caller)
+    return "\n".join(lines) + "\n\n" + mark(caller)
 
 
-def apply_run(args, caller, api, state_dir, audit):
+def apply_run(args, caller, api, state_dir, audit, fleet_mark):
     """(exit status, text). Exit 0 applied, 1 a cause (nothing changed unless the text says so), 2 refused. A refusal's text is its one reason."""
     reader = getattr(api, "__self__", None)
     out = []
@@ -411,7 +411,7 @@ def apply_run(args, caller, api, state_dir, audit):
     out.append("applied at %s; live plan hash %s" % (datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%MZ"), new_hash))
     try:
         gh_call(reader, repo, "repos/%s/issues/%d/comments" % (repo, number), "POST",
-                             {"body": receipt_text(args.file, file_sha, len(pairs), why, old_hash, new_hash, caller, checked)})
+                             {"body": receipt_text(args.file, file_sha, len(pairs), why, old_hash, new_hash, caller, fleet_mark, checked)})
     except CommentEditFailed as err:
         out.append("plan apply: the plan is changed and the receipt is not (%s): post the receipt by hand; live plan hash %s" % (one_line(err.detail, 200), new_hash))
         return 1, "\n".join(out)

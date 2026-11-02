@@ -230,7 +230,7 @@ def build(HandoffCase):
             self.run_apply()
             self.gh = FakeIssue(); self.gh.add(1, PLAN)
             real = sb.receipt_text
-            with mock.patch.object(sb, "receipt_text", lambda *a: real(*a[:7])):
+            with mock.patch.object(sb, "receipt_text", lambda *a: real(*a[:8])):
                 with self.assertRaisesRegex(AssertionError, r"plan check: FAIL line missing: patch, receipt, printed, in receipt, exit = \(1, 1, 1, 0, 1\)"):
                     self.check_failed_plan_check_is_in_the_receipt()
 
