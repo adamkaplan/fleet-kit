@@ -683,3 +683,29 @@ class TestTriageHiddenMutants(unittest.TestCase):
         self.assertTrue(helper.run_case(name, []).wasSuccessful(), msg="control failed")
         result = helper.run_case(name, [(sb.TriageFacts, "present_record", ns["TriageFacts"].present_record)])
         self.assertFalse(result.wasSuccessful(), msg="a digest that ignores the mark went unnoticed")
+
+
+class TestPlanKeyHash(unittest.TestCase):
+    """Eighth amendment (6). Real: `pass_subject` and the real `Fact` shape of a plan notice, the key built as the daemon builds it
+    (`"plan:%s:%s" % (key, name)` with the hash `sha256:<hex>`). Fake: nothing."""
+
+    HASH = "sha256:1246ede5201b" + "0" * 52
+
+    def fact(self, key):
+        return types.SimpleNamespace(kind="plan", key=key, recipient="cos")
+
+    def test_a_plan_key_with_sha256_keeps_its_whole_hash(self):
+        key = "plan:%s:%s" % ("acme/api#3:" + self.HASH, "orch")
+        self.assertEqual(sb.PLAN_KEY_RE.match(key).group(3), self.HASH)
+        self.assertEqual(sb.pass_subject(self.fact(key)), ("plan", "acme/api", 3, self.HASH))
+
+    def test_the_old_stand_in_keys_still_match(self):
+        self.assertEqual(sb.pass_subject(self.fact("plan:acme/api#3:h1h1h1h1:cos")), ("plan", "acme/api", 3, "h1h1h1h1"))
+
+    def test_a_mutant_that_restores_the_old_pattern_is_caught(self):
+        helper = TestPassRecheckMutants()
+        name = "TestPlanKeyHash.test_a_plan_key_with_sha256_keeps_its_whole_hash"
+        old = 'PLAN_KEY_RE = re.compile(r"^plan:([^#:\\s]+/[^#:\\s]+)#([0-9]+):(\\S+):[^:\\s]+$")'
+        new = 'PLAN_KEY_RE = re.compile(r"^plan:([^#:\\s]+/[^#:\\s]+)#([0-9]+):([^:\\s]+):")'
+        result = helper.mutate_run("switchboard/reminders.py", old, new, name, [(sb, "pass_subject", "pass_subject")])
+        self.assertFalse(result.wasSuccessful(), msg="the old pattern went unnoticed")

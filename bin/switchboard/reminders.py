@@ -351,7 +351,7 @@ def alert_stale(subject, record, fact, standing):
 
 PASS_SUBJECTS = {"sweep": "sweep_facts", "triage": "triage_facts", "plan": "plan_wake_facts"}   # #1542: the fact source whose pass keeps each kind's present state
 SWEEP_KEY_RE = re.compile(r"^sweep:[0-9a-f]{10}:[0-9]+$")
-PLAN_KEY_RE = re.compile(r"^plan:([^#:\s]+/[^#:\s]+)#([0-9]+):([^:\s]+):")
+PLAN_KEY_RE = re.compile(r"^plan:([^#:\s]+/[^#:\s]+)#([0-9]+):(\S+):[^:\s]+$")
 
 
 def pass_subject(fact):
