@@ -1240,7 +1240,7 @@ def table_cases():
         add(form, (COMMENTS, form), None, ["body=x"], [], [COMMENTS], "signed")
     add("-if=body=x", (COMMENTS, "-if=body=x"), None, ["body=x"], [], [COMMENTS], "signed")
     add("-f body=x", (COMMENTS, "-f", "body=x"), None, ["body=x"], [], [COMMENTS], "signed")
-    add("-f= (value '=')", (COMMENTS, "-f=", "-f", "body=x"), None, ["=", "body=x"], [], [COMMENTS], "signed")
+    add("-f= (value '=')", (COMMENTS, "-f=", "-f", "body=x"), None, ["=", "body=x"], [], [COMMENTS], "refused")
     add("-F=body=@file", (COMMENTS, "-F=body=@{FILE}"), None, ["body=@{FILE}"], [], [COMMENTS], "signed")
     for form in ("-iX=POST", "-XPOST", "-X=POST"):
         add(form, (COMMENTS, form), "POST", [], [], [COMMENTS], "pass")
