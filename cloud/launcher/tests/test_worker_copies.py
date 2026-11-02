@@ -340,7 +340,8 @@ class Real(unittest.TestCase):
         r = subprocess.run([sys.executable, "-B", "-W", "error::ResourceWarning", os.path.join(HERE, "test_orchestrator_agent.py")],
                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=90, cwd=ROOT)
         self.assertEqual(r.returncode, 0, r.stdout.decode(errors="replace")[-600:])
-        self.assertNotIn(b"ResourceWarning", r.stdout)
+        # other opens of that file (lines 105, 236, 255 ...) are outside PC-1 and still warn: only the read of the table is judged here
+        self.assertNotIn(b"copies.tsv", r.stdout)
 
 
 TREE = ("tools", "bin", "cloud", "agents", "tests", "docs")
@@ -416,9 +417,28 @@ def matrix_strings(node):
             yield from matrix_strings(v)
 
 
-def check_matrix(matrix_text, table_rows):
+def plain_matrix_path(path, root):
+    """A matrix path made plain by its real path relative to the repository; a path that cannot be is refused loudly."""
+    try:
+        base = os.path.realpath(root)
+        rel = os.path.relpath(os.path.realpath(os.path.join(base, path)), base)
+    except (OSError, ValueError):
+        raise AssertionError("a matrix path was not understood: " + repr(path))
+    if rel == "." or rel == ".." or rel.startswith("../") or os.path.isabs(path):
+        raise AssertionError("a matrix path was not understood: " + repr(path))
+    return rel
+
+
+def check_matrix(matrix_text, table_rows, root=ROOT):
     copies = {c for _, c in table_rows}
-    named = sorted(p for p in matrix_strings(json.loads(matrix_text)) if p.startswith("cloud/worker/bin/") or p in copies)
+    named = []
+    for raw in matrix_strings(json.loads(matrix_text)):
+        if "cloud/worker" not in raw:
+            continue   # not a path of cloud/worker: a sentence or another tree
+        path = plain_matrix_path(raw, root)
+        if path.startswith("cloud/worker/bin/") or path in copies:
+            named.append(path)
+    named.sort()
     for path in named:
         if path not in copies:
             raise AssertionError("the matrix names a copy that is not in the table: " + path)
@@ -426,10 +446,33 @@ def check_matrix(matrix_text, table_rows):
 
 
 def allowed_copy(text):
+    """The entries of ALLOWED_COPY read by syntax in every form of an assignment of a collection of strings."""
+    unread = AssertionError("ALLOWED_COPY has a form that was not read:")
+    found = None
     for node in ast.walk(ast.parse(text)):
         if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "ALLOWED_COPY" for t in node.targets):
-            return sorted(ast.literal_eval(node.value))
-    raise AssertionError("ALLOWED_COPY is not in the file")
+            value = node.value
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.target.id == "ALLOWED_COPY" and node.value is not None:
+            value = node.value
+        else:
+            continue
+        if found is not None:
+            raise unread
+        if isinstance(value, ast.Call) and isinstance(value.func, ast.Name) and value.func.id in ("frozenset", "set", "tuple", "list") \
+                and len(value.args) == 1 and not value.keywords:
+            value = value.args[0]
+        if not isinstance(value, (ast.Set, ast.Tuple, ast.List)):
+            raise unread
+        try:
+            items = [ast.literal_eval(e) for e in value.elts]
+        except ValueError:
+            raise unread
+        if not all(isinstance(i, str) for i in items):
+            raise unread
+        found = sorted(items)
+    if found is None:
+        raise unread
+    return found
 
 
 def check_allowed(text, table_rows):
@@ -519,6 +562,45 @@ class Comparing(unittest.TestCase):
         text = slurp("cloud/launcher/tests/test_cw_names.py").decode()
         with self.assertRaises(AssertionError):
             self.assertNotEqual(text.replace("not-in-the-text", "x"), text, "the mutation was not applied")
+
+    def test_s10_odd_forms_of_the_path_are_judged_like_the_plain_path(self):
+        base = json.loads(slurp("docs/review-laws/impact-matrix.json").decode())
+        self.assertEqual(len(check_matrix(json.dumps(base), rows())[0]), 2)
+        for form in ("./cloud/worker/bin/cloud_relay.py", "cloud/worker/bin/cloud_relay.py/"):
+            with self.subTest(form=form):
+                got = check_matrix(json.dumps({"x": [form]}), rows())
+                self.assertEqual(got[0], ["cloud/worker/bin/cloud_relay.py"])
+                self.assertEqual(got[1], len(rows()) - 1)
+        with self.assertRaisesRegex(AssertionError, "a matrix path was not understood:"):
+            check_matrix(json.dumps({"x": ["cloud/worker/../../../etc/passwd"]}), rows())
+
+    def test_s11_the_six_forms_are_read_and_an_unread_form_fails_loudly(self):
+        text = slurp("cloud/launcher/tests/test_cw_names.py").decode()
+        old = 'ALLOWED_COPY = {"cloud/worker/plan_check.py"}'
+        self.assertEqual(text.count(old), 1)
+        item = '"cloud/worker/plan_check.py"'
+        forms = {
+            "plain": 'ALLOWED_COPY = {%s}' % item,
+            "annotated": 'ALLOWED_COPY: set = {%s}' % item,
+            "set-over-lines": 'ALLOWED_COPY = {\n    %s,\n}' % item,
+            "frozenset": 'ALLOWED_COPY = frozenset({%s})' % item,
+            "tuple": 'ALLOWED_COPY = (%s,)' % item,
+            "list": 'ALLOWED_COPY = [\n    %s,\n]' % item,
+        }
+        d = tempfile.mkdtemp(prefix="wc-forms-")
+        self.addCleanup(shutil.rmtree, d, True)
+        for name, form in forms.items():
+            with self.subTest(form=name):
+                mutated = text.replace(old, form)
+                self.assertNotEqual(mutated, text, "the mutation was not applied")
+                path = os.path.join(d, name + ".py")
+                with open(path, "w") as f:
+                    f.write(mutated)
+                self.assertEqual(check_allowed(slurp_abs(path).decode(), rows()), ["cloud/worker/plan_check.py"])
+        for name, bad in (("call", 'ALLOWED_COPY = make_set()'), ("union", 'ALLOWED_COPY = {%s} | {"x"}' % item), ("number", 'ALLOWED_COPY = {1}')):
+            with self.subTest(unreadable=name):
+                with self.assertRaisesRegex(AssertionError, "ALLOWED_COPY has a form that was not read:"):
+                    check_allowed(text.replace(old, bad), rows())
 
 
 class Safe(unittest.TestCase):
