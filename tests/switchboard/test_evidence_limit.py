@@ -16,9 +16,14 @@ from support.paths import BIN, REPO
 
 sys.path.insert(0, str(BIN))
 import cloud_relay_daemon as relay  # noqa: E402
-import plan_ledger  # noqa: E402
 
-LIMIT = plan_ledger.EVIDENCE_LIMIT
+# ONE rule: the whole run loads plan_ledger more than once, so never use a module this file imported itself.
+# SBP(): the module bin/fleet-switchboard (sb) uses (sb-side tests, the item helpers' LedgerError, the patch target, constants);
+# RP(): the module cloud_relay_daemon uses (only the relay-side ledger read).
+SBP = lambda: sb.plan_ledger
+RP = lambda: relay.plan_ledger
+
+LIMIT = SBP().EVIDENCE_LIMIT
 LONG, WHOLE = "e" * 501, "e" * 500
 CHECK = re.compile(r"the evidence is 501 characters and the limit is 500: nothing was recorded; put the long text in one comment or a file and give the link, or shorten it")
 RPR, RREPO, RHEAD = "acme-org/widget-service#7", "acme-org/widget-service", "a" * 40
@@ -26,7 +31,7 @@ CODER, TESTER = "widget-api-coder", "widget-api-tester"
 
 
 def ledger_bytes(state):
-    path = Path(state) / plan_ledger.LEDGER_FILE
+    path = Path(state) / SBP().LEDGER_FILE
     return path.read_bytes() if path.exists() else b""
 
 
@@ -155,38 +160,38 @@ def build():
                     contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                 try:
                     return sb.cmd_item_prove(self.args(scenario=["S1"], evidence=text), None, self.now), None
-                except (sb.LedgerCommandError, plan_ledger.LedgerError) as err:
+                except (sb.LedgerCommandError, SBP().LedgerError) as err:
                     return None, str(err)
 
         def one_of(self, call):
-            before = (self.state / plan_ledger.LEDGER_FILE).read_bytes() if (self.state / plan_ledger.LEDGER_FILE).exists() else b""
+            before = (self.state / SBP().LEDGER_FILE).read_bytes() if (self.state / SBP().LEDGER_FILE).exists() else b""
             code, why = call(LONG)
-            after = (self.state / plan_ledger.LEDGER_FILE).read_bytes() if (self.state / plan_ledger.LEDGER_FILE).exists() else b""
+            after = (self.state / SBP().LEDGER_FILE).read_bytes() if (self.state / SBP().LEDGER_FILE).exists() else b""
             self.assertIsNone(code)
             self.assertRegex(why, CHECK)
             return before, after
 
         def test_item_prove_refuses_501_and_records_500(self):
             self.register()
-            before = (self.state / plan_ledger.LEDGER_FILE).read_bytes()
+            before = (self.state / SBP().LEDGER_FILE).read_bytes()
             code, why = self.item_prove(LONG)
             self.assertIsNone(code)
             self.assertRegex(why, CHECK)
-            self.assertEqual((self.state / plan_ledger.LEDGER_FILE).read_bytes(), before)
+            self.assertEqual((self.state / SBP().LEDGER_FILE).read_bytes(), before)
             code, why = self.item_prove(WHOLE)
             self.assertEqual((code, why), (sb.EXIT_OK, None))
             self.assertEqual([e["evidence"] for e in self.entries() if e["kind"] == "proof"], [WHOLE])
 
         def test_item_verdict_refuses_501_and_records_500(self):
             self.register()
-            before = (self.state / plan_ledger.LEDGER_FILE).read_bytes()
+            before = (self.state / SBP().LEDGER_FILE).read_bytes()
             try:
                 code, why = self.verdict("t1", evidence=LONG)
-            except plan_ledger.LedgerError as err:   # the dispatch writes it with exit 2
+            except SBP().LedgerError as err:   # the dispatch writes it with exit 2
                 code, why = None, str(err)
             self.assertIsNone(code)
             self.assertRegex(why, CHECK)
-            self.assertEqual((self.state / plan_ledger.LEDGER_FILE).read_bytes(), before)
+            self.assertEqual((self.state / SBP().LEDGER_FILE).read_bytes(), before)
             code, why = self.verdict("t1", evidence=WHOLE)
             self.assertEqual((code, why), (sb.EXIT_OK, None))
             self.assertEqual([e["evidence"] for e in self.verdicts()], [WHOLE])
@@ -243,7 +248,7 @@ def build():
                 self.assertEqual(len(self.refusals()), audits + 1)
                 got = self.call(pod, command, "r-" + command, WHOLE)   # the same call id after the refusal
                 self.assertEqual(got["status"], 200, got)
-            self.assertEqual([e["evidence"] for e in plan_ledger.read_ledger(self.state)[0]], [WHOLE, WHOLE])
+            self.assertEqual([e["evidence"] for e in RP().read_ledger(self.state)[0]], [WHOLE, WHOLE])
             self.assertEqual(len(self.refusals()), 2)
 
         def test_replay_with_a_longer_text_is_409(self):
@@ -292,7 +297,7 @@ def build():
             self.run_case(TestEvidenceLimitRelay("test_replay_with_a_longer_text_is_409"))
             self.run_case(TestEvidenceLimitRelay("test_replay_with_a_longer_text_and_the_index_gone_is_400_and_writes_nothing"))
             self.local_case(sb._evidence)
-            self.assertEqual(plan_ledger.bounded_text("a" * 500, 500, "evidence"), "a" * 500)
+            self.assertEqual(SBP().bounded_text("a" * 500, 500, "evidence"), "a" * 500)
 
         def mutated_evidence(self):
             src = class_source_fn("_evidence")
@@ -315,9 +320,9 @@ def build():
             self.assertIn("!= (400, None)", str(ctx.exception))   # a relay that clips answers 200 where 400 is the refusal
 
         def test_mutant_bounded_text_refuses_at_the_limit_itself(self):
-            real = plan_ledger.bounded_text
+            real = SBP().bounded_text
             mutant = lambda text, limit, what: real(text, limit - 1, what)
-            with mock.patch.object(plan_ledger, "bounded_text", mutant):
+            with mock.patch.object(SBP(), "bounded_text", mutant):
                 with self.assertRaises(AssertionError) as ctx:
                     self.local_case(sb._evidence)
             self.assertIn("the limit is 499", str(ctx.exception))   # the refusal line names 499, not 500
@@ -372,12 +377,12 @@ def build():
         def test_bounded_text_reads_no_file_calls_no_process_and_the_file_is_short(self):
             import ast
             import inspect
-            tree = ast.parse(inspect.getsource(plan_ledger.bounded_text))
+            tree = ast.parse(inspect.getsource(SBP().bounded_text))
             called = {n.func.attr if isinstance(n.func, ast.Attribute) else getattr(n.func, "id", "") for n in ast.walk(tree) if isinstance(n, ast.Call)}
             self.assertFalse(called & {"open", "read_text", "run", "Popen", "check_output", "system", "read_bytes"}, called)
             self.assertLess(len((BIN / "plan_ledger.py").read_text().splitlines()), 1500)
-            self.assertEqual(plan_ledger.clip("a" * 501, 500), "a" * 499 + "\u2026")
-            self.assertEqual((plan_ledger.EVIDENCE_LIMIT, plan_ledger.FIELD_LIMIT), (500, 200))
+            self.assertEqual(SBP().clip("a" * 501, 500), "a" * 499 + "\u2026")
+            self.assertEqual((SBP().EVIDENCE_LIMIT, SBP().FIELD_LIMIT), (500, 200))
 
         def test_this_file_makes_no_size_measure(self):
             text = Path(__file__).read_text()
