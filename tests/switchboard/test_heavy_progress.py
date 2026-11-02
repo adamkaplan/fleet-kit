@@ -319,7 +319,7 @@ class TestHeavyProgress(unittest.TestCase):
 
     def test_s13_a_zero_or_bad_interval_falls_back_to_60_and_the_old_reading_fails(self):
         old = 'progress_every = float(environ.get("FLEET_HEAVY_PROGRESS_SECONDS") or PROGRESS_EVERY)'
-        results = self._scratch([("progress_every = _progress_interval(environ)", old)], "test_s13_inner_the_interval_variable_falls_back_to_60")
+        results = self._scratch([("progress_every = _progress_interval(environ, out)", old)], "test_s13_inner_the_interval_variable_falls_back_to_60")
         self.assertEqual(results["control"].returncode, 0, results["control"].stdout)
         self.assertEqual(results["mutant"].returncode, 1, results["mutant"].stdout)
         self.assertIn("a zero interval was accepted", results["mutant"].stdout)

@@ -1119,15 +1119,20 @@ _progress_started = None   # tests: an Event the progress thread sets when it ha
 _progress_pause = None   # tests: a function (stop_event, seconds) that pauses in place of the real wait
 
 
-def _progress_interval(environ):
-    """The progress interval: FLEET_HEAVY_PROGRESS_SECONDS when it is a finite number of at least 0.01 (the tests' knob below 1 s), else PROGRESS_EVERY."""
+def _progress_interval(environ, out=None):
+    """The progress interval: FLEET_HEAVY_PROGRESS_SECONDS when it is a number from 0.01 (the tests' knob below 1 s) to 86400, else PROGRESS_EVERY; a non-empty bad value prints one line on `out`."""
+    raw = environ.get("FLEET_HEAVY_PROGRESS_SECONDS") or ""
+    if not raw:
+        return PROGRESS_EVERY
     try:
-        value = float(environ.get("FLEET_HEAVY_PROGRESS_SECONDS") or "")
+        value = float(raw)
     except ValueError:
-        return PROGRESS_EVERY
-    if value != value or value in (float("inf"), float("-inf")) or value < 0.01:
-        return PROGRESS_EVERY
-    return value
+        value = None
+    if value is not None and 0.01 <= value <= 86400:   # nan, inf, zero, negative and above a day fail here
+        return value
+    if out is not None:
+        out.write("heavy: FLEET_HEAVY_PROGRESS_SECONDS=%s is out of range, using 60\n" % raw[:40])
+    return PROGRESS_EVERY
 
 
 def _progress_loop(pid, program, interval, stop, out, clock, began, lock=None):
@@ -1276,6 +1281,7 @@ def run(command, state_dir, slots=DEFAULT_SLOTS, wait_max=DEFAULT_WAIT_MAX, name
             os.set_inheritable(fd, True)   # the command keeps the lock: the slot is busy while it runs, whatever happens to this wrapper
             env[SLOT_ENV] = str(index)    # and a heavy inside it knows it is in a slot: it takes no second one (nested heavy never deadlocks)
         argv = (command_prefix(which) if unslotted not in ("", "inside") else []) + list(command)   # off or nested: the command as it is
+        progress_every = _progress_interval(environ, out)   # before the child starts
         try:
             child["p"] = subprocess.Popen(argv, env=env, pass_fds=(fd,) if fd is not None else ())
         except OSError as err:
@@ -1305,7 +1311,6 @@ def run(command, state_dir, slots=DEFAULT_SLOTS, wait_max=DEFAULT_WAIT_MAX, name
         dog.start()
         progress_stop = threading.Event()
         progress_lock = threading.Lock()
-        progress_every = _progress_interval(environ)
         progress_thread = threading.Thread(target=_progress_loop, args=(child["p"].pid, os.path.basename(command[0]), progress_every, progress_stop, out, clock, clock(), progress_lock), daemon=True)
         progress_thread.start()
         try:
