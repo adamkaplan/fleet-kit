@@ -23122,7 +23122,7 @@ _SECRET_PATTERNS = (
     (re.compile(r"\b(?:sk-[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{20,}"
                 r"|AKIA[0-9A-Z]{12,}|xox[abprs]-[A-Za-z0-9-]{8,})"), "[redacted]"),
     (re.compile(r"(://[^/\s:@]+:)\S{1,256}@"), r"\1[redacted]@"),   # the password may hold a slash or a raw @ (the last @ within 256 characters of one word)
-    # a whole key block (begin marker, body, the block's own first end marker): the body is [^-]* so every scan stops at the next dash (linear)
+    # a whole key block (begin marker, body, the block's own first end marker): the body is any run of characters that does not begin another private-key marker (a tempered pattern), so every scan stops at the next marker (linear); a block with no end marker is redacted to the end of its body
     (re.compile(r"-----BEGIN[A-Z ]*PRIVATE KEY(?: BLOCK)?-----(?:(?!-----BEGIN[A-Z ]{0,40}PRIVATE KEY)(?!-----END[A-Z ]{0,40}PRIVATE KEY)[\s\S])*(?:-----END[A-Z ]{0,40}PRIVATE KEY(?: BLOCK)?-----)?"), "[redacted]"),
     (re.compile(r"-----(?:BEGIN|END)[A-Z ]*PRIVATE KEY(?: BLOCK)?-----"), "[redacted]"),   # a lone marker
     (re.compile(r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}(?:\.[A-Za-z0-9_-]*)?"), "[redacted]"),   # a JWT (#773)
