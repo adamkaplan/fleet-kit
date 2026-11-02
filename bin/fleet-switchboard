@@ -10019,13 +10019,19 @@ def open_list_alert(engine, repo, now):
         return
     discovery = getattr(engine, "discovery", None)
     cos = next((n for n, o in sorted(discovery.agents.items()) if (o.fleet or {}).get("role") == "chief-of-staff"), None) if discovery is not None else None
-    text = ("The open items of %s were cut: 1,000 or more are open and the read stops at %d pages (%d items, OPEN_LIST_PAGES); the oldest are not read by the sweep or the triage."
-            % (repo, OPEN_LIST_PAGES, OPEN_LIST_PAGES * GITHUB_PAGE_SIZE))
-    if cos is not None:
-        add_repeat_reminder(engine.state_dir, cos, now, now, text, "open-list-cut", repo, day, wake_class=WAKE_LOAD)
-    if getattr(engine, "audit", None) is not None:
-        engine.audit.append(engine.actor, "open_list.cut", repo, {"repo": repo, "ceiling": OPEN_LIST_PAGES * GITHUB_PAGE_SIZE, "pages": OPEN_LIST_PAGES})
-    alerts.mark(engine.state_dir, repo, day, load_module("record_json").parse_bounded)
+    ceiling = OPEN_LIST_PAGES * GITHUB_PAGE_SIZE
+    text = ("The open items of %s were cut: %s or more are open and the read stops at %d pages (%s items, OPEN_LIST_PAGES); the oldest are not read by the checks that read this list."
+            % (repo, format(ceiling, ","), OPEN_LIST_PAGES, format(ceiling, ",")))
+    audit = getattr(engine, "audit", None)
+    if cos is None:
+        if audit is not None:
+            audit.append(engine.actor, "open_list.cut_unsent", repo, {"repo": repo})
+        return
+    add_repeat_reminder(engine.state_dir, cos, now, now, text, "open-list-cut", repo, day, wake_class=WAKE_LOAD)
+    if audit is not None:
+        audit.append(engine.actor, "open_list.cut", repo, {"repo": repo, "ceiling": ceiling, "pages": OPEN_LIST_PAGES})
+    if not alerts.mark(engine.state_dir, repo, day, load_module("record_json").parse_bounded) and audit is not None:
+        audit.append(engine.actor, "open_list.marker_failed", repo, {"repo": repo})
 
 
 def sweep_pages_used(records, truncated):
