@@ -9708,6 +9708,10 @@ def finish_pass(engine, discovery, report):
     except Exception as err:
         engine._failed("cloud-turn-end", "cloud-turn-end", err, report)
     try:
+        pod_pr_tick(engine, discovery)   # #1969: a pod's pull request is told once to its launching lane
+    except Exception as err:
+        engine._failed("pod-pr", "pod-pr", err, report)
+    try:
         lost_worker_tick(engine, discovery)   # #1481: a lost worker is told once to its lane and the Chief of Staff
     except Exception as err:
         engine._failed("lost-worker", "lost-worker", err, report)
