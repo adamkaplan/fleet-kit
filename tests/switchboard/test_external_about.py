@@ -12,6 +12,7 @@ REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / "bin"))
 import decision_core as core  # noqa: E402
 import decision_sync  # noqa: E402
+from support.loader import sb  # noqa: E402
 from support.orders_and_adapters import EA, FakeDoorServer, fake_mapping  # noqa: E402
 
 REPO_NAME = "acme/api"
@@ -128,6 +129,98 @@ class TestAboutCarried(unittest.TestCase):
         self.assertNotEqual((copy / "external_adapter.py").read_text(), text, "the mutation was not applied")
         with self.assertRaisesRegex(AssertionError, ANCHOR):
             check_about(self, load())
+
+
+class RefusingDoor(FakeDoorServer):
+    """A receiver that refuses every raise for good."""
+
+    def op_raise(self, args, ident, seat):
+        return 400, {"code": "bad", "message": "Invalid arguments for tool raise"}, {}
+
+
+def lines_of(rig, needle, now=2.0):
+    config = {"external_decisions": dict(SETTINGS, enabled=True)}
+    text = sb.external_status_line(config, str(rig.tmp), now) or ""
+    return [l for l in text.splitlines() if needle in l]
+
+
+def about_less(n):
+    return entry(n, about=None)
+
+
+class TestAboutGate(unittest.TestCase):
+    def test_decisions_with_no_about_are_not_sent_and_are_shown(self):   # S2b
+        rig = AboutRig(self)
+        rig.run([about_less(1), dict(about_less(2), kind="report"), entry(3)])
+        self.assertEqual(len(rig.door.items), 1)
+        shown = lines_of(rig, "needs an About")
+        self.assertEqual(len(shown), 2, shown)
+        self.assertTrue(shown[0].endswith("D1") and shown[1].endswith("D2"), shown)
+        self.assertEqual(rig.engine.failed, {}, "never refused for good")
+
+    def test_a_refused_raise_is_audited_with_its_display_id_and_title(self):   # S4
+        rig = AboutRig(self, door=RefusingDoor)
+        rig.run([entry(1), entry(2)])
+        found = [d for e, k, d in rig.host.events if e == "external.permanent_failure"]
+        self.assertEqual(len(found), 2)
+        self.assertEqual(sorted((d["display_id"], d["title"]) for d in found), [("D1", "Decision 1"), ("D2", "Decision 2")])
+
+    def test_a_refused_raise_is_shown_with_its_decision(self):   # S5
+        rig = AboutRig(self, door=RefusingDoor)
+        rig.run([entry(1), entry(2)])
+        shown = lines_of(rig, "raise refused")
+        self.assertEqual(len(shown), 2, shown)
+        self.assertTrue(all(("D%d" % n) in l for n, l in ((1, shown[0]), (2, shown[1]))), shown)
+        self.assertIn("2 permanent failure(s)", sb.external_status_line({"external_decisions": dict(SETTINGS, enabled=True)}, str(rig.tmp), 2.0))
+        clean = AboutRig(self)
+        clean.run([entry(1)])
+        self.assertEqual(lines_of(clean, "raise refused"), [])
+
+    def failed_table(self, rig, entries):
+        keys = [core.decision_key("seed:%s" % e["id"]) for e in entries]
+        failed = {k: {"op": "raise", "at": 1, "sig": ["old", "x", "y"],
+                      "error": 'MCP error -32602: Input validation error: Invalid arguments for tool raise path ["about"] expected string'}
+                  for k in keys}
+        (rig.tmp / decision_sync.LINKS_FILE).write_text(json.dumps({"links": {}, "failed": failed}))
+        return decision_sync.SyncEngine(SETTINGS, rig.tmp, rig.adapter, rig.host)
+
+    def test_the_failed_raises_are_sent_again_once_when_each_has_an_about(self):   # S6
+        entries = [entry(n) for n in range(1, 16)]
+        rig = AboutRig(self)
+        rig.engine = self.failed_table(rig, entries)
+        rig.run(entries, passes=1)
+        self.assertEqual((len(rig.door.items), len(rig.engine.failed), len(rig.engine.links)), (15, 0, 15))
+        bare = [about_less(n) for n in range(1, 16)]
+        other = AboutRig(self)
+        other.engine = self.failed_table(other, bare)
+        other.run(bare, passes=1)
+        self.assertEqual((len(other.door.items), len(lines_of(other, "needs an About"))), (0, 15))
+
+    def test_linked_decisions_are_not_revised_when_an_about_arrives(self):   # U1
+        entries = [entry(n, about=None) for n in range(1, 31)]   # linked once, before an About was asked for
+        rig = AboutRig(self)
+        rig.run([dict(e, about=ABOUT) for e in entries], passes=1)   # linked
+        links = json.dumps(rig.engine.links, sort_keys=True)
+        sent = []
+        real = rig.adapter.push
+        rig.adapter.push = lambda operation, key: (sent.append(operation["op"]), real(operation, key))[1]
+        rig.run([dict(e, about="A different background text.") for e in entries], passes=2)
+        self.assertEqual(sent.count("revise"), 0, sent)
+        self.assertEqual(json.dumps(rig.engine.links, sort_keys=True), links)
+
+
+class TestAboutManifest(unittest.TestCase):
+    def test_the_field_name_defaults_and_a_manifest_may_name_it(self):   # U3
+        class Named(FakeDoorServer):
+            RAISE_OPT = FakeDoorServer.RAISE_OPT | {"background"}
+        plain = AboutRig(self)
+        self.assertNotIn("about", plain.adapter.m.data["fields"]["raise"])
+        plain.run([entry(1)])
+        self.assertEqual([i["_args"].get("about") for i in plain.door.items.values()], [ABOUT])
+        named = AboutRig(self, door=Named, fields={"raise": dict(fake_mapping("http://x")["fields"]["raise"], about="background")})
+        named.run([entry(1)])
+        self.assertEqual([i["_args"].get("background") for i in named.door.items.values()], [ABOUT])
+        self.assertNotIn("about", list(named.door.items.values())[0]["_args"])
 
 
 if __name__ == "__main__":
