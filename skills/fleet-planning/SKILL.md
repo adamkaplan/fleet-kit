@@ -42,19 +42,6 @@ Receipt format: `docs/plan-template.md`.
    **Size** is a T-shirt in AGENT time, never human-days: S under 1 hour, M a few hours, L about a day, XL several days, each with what makes it that
    size. Never pick the smaller option for less work when a larger one simplifies the system. Put `plan-format: 2` and a `size:` line in the plan; `plan check` flags a missing size and days for work under L (a light plan may carry `size: S`).
 
-## Applying an approved plan edit
-
-A plan edit the Chief of Staff approved is applied by one command, never by hand: `fleet-switchboard plan apply <issue> --file F --expect-live <full hash> --expect-result <full hash> --expect-file <sha256 of the file>`. It refuses, with one line naming the expectation, unless the live plan hash, the file's sha256 and the result's plan hash are the ones named and each OLD text occurs once at its turn. The edit file has ONE standard form:
-
-Lines before the first header are a note and are read by nobody.
-Each pair is `===== OLD <n> (verbatim) =====` then the old text, then `===== NEW <n> (verbatim) =====` then the new text.
-The numbers run 1, 2, 3 in order.
-The text of each ends at the line before the next header; its final newline is not part of it.
-The paragraph that starts `Why:` after the last NEW is the receipt's reason.
-The file has no other header.
-
-It never edits the Intent or the Done-when, and it posts the receipt itself.
-
 ## Check it
 
 `fleet-switchboard plan check <owner/repo#N> [--ask <owner/repo#N>] [--json]` prints `PASS` or `FAIL`, one defect per line,
@@ -120,3 +107,4 @@ Link it in every brief (`PLAN: <link>`). The worker proves each scenario with `f
 open. The order does not matter: a coder's only extra step is `prove`. A push voids every proof and
 verdict. The Chief of Staff may waive a hotfix, logged; the plan is then due within a day.
 `CARRIES: #N`: see plan-template.
+Apply an approved plan edit with `fleet-switchboard plan apply` (the form: plan-template).
