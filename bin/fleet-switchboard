@@ -16970,7 +16970,7 @@ def cmd_prove(args, runner, now):
 cmd_prove.ledger = True   # state and GETs only; its own errors are usage errors
 
 
-def launched_testers_for(ctx):
+def launched_testers_for(ctx, role="tester"):
     """({name: launch record}, {name: session id}, {name: metadata.fleet}) from ONE read of the running agents: the testers the launch record makes testers
     of this PR's repo (#372), and what the lane rule needs. Never raises: a discovery that fails gives nothing launched (so only the configured list
     counts, and the lane rule has nobody to apply to); an unreadable retired list counts every launched tester as retired (fail closed)."""
@@ -16985,7 +16985,7 @@ def launched_testers_for(ctx):
     except Exception as err:   # a corrupt retired file could hide a retired tester: no launched tester counts, loudly (audit; `status` says so too)
         ctx.engine._note("testers.retired_unreadable", None, {"error": _one_line(str(err), 160), "effect": "launch-record testers disabled"})
         return {}, sessions, fleets
-    return load_launch_testers().launched(fleets, sessions, ctx.repo, lambda fleet: _fleet_repo(fleet, ctx.config), retired), sessions, fleets
+    return load_launch_testers().launched(fleets, sessions, ctx.repo, lambda fleet: _fleet_repo(fleet, ctx.config), retired, role), sessions, fleets
 
 
 @recording("verdict")
@@ -17031,15 +17031,15 @@ def cmd_verdict(args, runner, now):
                                      "`notice pr`): its author must do that first, so the author can be excluded" % ctx.pr)
         allowed, launch, sessions, fleets = ctx.config.get("plan_evaluators"), {}, {}, {}
         authors = plan_ledger.authors_of(ctx.entries, ctx.pr, senders, ctx.facts.get("author"))
-        if named == "tester":   # #372: the configured list UNION the testers the launch record names for this repo; any trouble reading it is the configured list alone
+        if named in load_launch_testers().LAUNCHABLE:   # #372: the configured list UNION the testers the launch record names for this repo; any trouble reading it is the configured list alone
             record_step("the agent registry (the launched testers)")
-            launch, sessions, fleets = launched_testers_for(ctx)
-            allowed = load_launch_testers().evaluators(allowed, launch)
+            launch, sessions, fleets = launched_testers_for(ctx, named)
+            allowed = load_launch_testers().evaluators(allowed, launch, named)
         ok, why = plan_ledger.may_record_verdict(named, caller, allowed, authors)
         if getattr(ctx, "ask_issue", False) and caller and caller == ctx.facts.get("author"):   # #1130: the author of the ask may not judge it, as a PR's author may not
             ok, why = False, "%s is the author of the ask %s: the author of an ask cannot record a verdict on it (`prove` is the author's step)" % (caller, ctx.pr)
-        if ok and named == "tester" and caller in launch:
-            why = load_launch_testers().lane_refusal(caller, launch, authors, sessions, fleets)
+        if ok and named in load_launch_testers().LAUNCHABLE and caller in launch:
+            why = load_launch_testers().lane_refusal(caller, launch, authors, sessions, fleets, named)
             ok = why is None
     if not ok:
         if ctx.engine.audit is not None:
@@ -17057,6 +17057,10 @@ def cmd_verdict(args, runner, now):
     entries = [{"kind": "verdict", "pr": ctx.pr, "scenario": target["id"], "plan_ref": ctx.source,
                 "plan_hash": ctx.plan["plan_hash"], "head": head, "result": args.result, "by": caller,
                 "evaluator": named, "evidence": evidence, **({"files": sorted(set(args.file))} if getattr(args, "file", None) else {})} for target in targets]
+    right = load_launch_testers().source_of(caller, ctx.config.get("plan_evaluators"), launch, named) if named in load_launch_testers().LAUNCHABLE else None   # #1869: where the right came from
+    for entry in entries:
+        if right:
+            entry["right"] = right
     try:
         done = plan_ledger.append_once(ctx.state, entries, now())   # all of the new ones or none; one already there is not written again
     except plan_ledger.LedgerLockTimeout:
@@ -17070,7 +17074,7 @@ def cmd_verdict(args, runner, now):
             continue
         if ctx.engine.audit is not None:
             detail = {"scenario": entry["scenario"], "result": entry["result"], "seq": one["seq"], "by": entry["by"], "chain": one["hash"]}
-            if named == "tester" and caller in launch and load_launch_testers().source_of(caller, ctx.config.get("plan_evaluators"), launch) == "launch record":
+            if named in load_launch_testers().LAUNCHABLE and caller in launch and load_launch_testers().source_of(caller, ctx.config.get("plan_evaluators"), launch, named) == "launch record":
                 detail["launch_record"] = {k: v for k, v in launch[caller].items() if v is not None}   # #372: the record this verdict relied on
             ctx.engine.audit.append(ctx.engine.actor, "plan.verdict", ctx.pr, detail)
         print("recorded %s verdict #%d: %s %s at %s (%s), bound to plan %s" % (named, one["seq"], entry["scenario"], args.result,
@@ -17293,6 +17297,8 @@ def cmd_gates(args, runner, now):
     bots = bot_review_lines(seen, ctx.facts.get("head")) if isinstance(ctx.facts, dict) else []   # #1625: information only
     shares = overlap_shares_line(read_open_overlap(ctx.engine, ctx.repo, runner), ctx.number) if not ctx.unreadable else None   # #818: information only
     suites_finding = gates_suites_finding(runner, ctx) if not ctx.unreadable else None   # #1045: information only: the verdict below does not read it
+    if args.json and plan_ledger.verdict_lines(report):
+        report["verdict_lines"] = plan_ledger.verdict_lines(report)   # #1869
     if args.json:
         if suites_finding:
             report["suites_finding"] = suites_finding
@@ -17571,6 +17577,8 @@ def cmd_item_verdict(args, runner, now):
     reg = regs[-1] if regs else {}
     entries = [{"kind": "verdict", "pr": ctx.item, "scenario": t["id"], "plan_ref": ctx.source, "plan_hash": ctx.plan["plan_hash"], "head": head, "result": args.result,
                 "by": caller, "evaluator": "tester", "evidence": evidence, "via": "item", "session": sessions.get(caller)} for t in targets]
+    for entry in entries:
+        entry["right"] = "launch record"   # #1869: only a launched tester may use the item path
 
     def recheck(fresh):   # under the ledger's exclusive lock: only what lives in the ledger is re-read (the agents were read above, never under the lock)
         problem = iv.verdict_problem(ctx.item, caller, fresh, writers | iv.ledger_writers(ctx.item, ctx.number, ctx.issue["author"], fresh), sessions.get(caller), now(), head)

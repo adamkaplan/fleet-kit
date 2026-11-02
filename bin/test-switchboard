@@ -67367,6 +67367,7 @@ _changed_file_pages.HOST = sys.modules[__name__]
 TestWholeReadOfALargePullRequest = _changed_file_pages.load()
 
 _lm = importlib.import_module("test_launch_model"); _lm.HOST = sys.modules[__name__]; TestLaunchModel = _lm.build(); TestLaunchModelCloud = _lm.build_cloud()   # #1642
+_lr = importlib.import_module("test_launched_reviewers"); _lr.HOST = sys.modules[__name__]; TestLaunchedReviewerRule, TestLaunchedReviewerGates, TestLaunchedReviewerItems, TestLaunchedReviewerRelay, TestLaunchedReviewerDocs, TestLaunchedReviewerGuards, TestLaunchedReviewerMutants = _lr.build()   # #1869
 TestPlanningDecision, TestConcurrencyGroup, TestGateLegs, TestGatePass, TestPlatformPaths, TestMacDocs = (_ml := importlib.import_module("test_mac_legs")).TestPlanningDecision, _ml.TestConcurrencyGroup, _ml.TestGateLegs, _ml.TestGatePass, _ml.TestPlatformPaths, _ml.TestDocs
 
 class TestTheArchitectureTestIsRun(unittest.TestCase):
@@ -78746,7 +78747,7 @@ class TestAskIssueSubject(unittest.TestCase):
         out, err = io.StringIO(), io.StringIO()
         with mock.patch.object(sb, "build_engine", lambda *a, **k: (engine, self.state, config)), mock.patch.object(sb, "pr_picture", lambda *a: picture), \
                 mock.patch.object(sb, "identify_caller", lambda *a: self.caller), mock.patch.object(sb, "checked_plan", lambda *a, **k: self.plan()), \
-                mock.patch.object(sb, "launched_testers_for", lambda c: ({}, {}, {})), mock.patch.object(sb, "read_open_overlap", lambda *a: None), \
+                mock.patch.object(sb, "launched_testers_for", lambda c, role="tester": ({}, {}, {})), mock.patch.object(sb, "read_open_overlap", lambda *a: None), \
                 contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             try:
                 code = getattr(sb, command)(args, None, self.now)
