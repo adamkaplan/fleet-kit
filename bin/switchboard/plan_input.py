@@ -300,7 +300,7 @@ def parse_ref(text, home_repo):
     found = REF.match((text or "").strip())
     repo = found.group(1) if found and found.group(1) else home_repo
     if not found or not repo:
-        raise PlanApplyRefused("the issue is not owner/repo#N, an issue URL, or N: %s" % one_line(text, 80), 1)
+        raise PlanApplyRefused("the issue is not owner/repo#N, an issue URL, or N: %s" % edit_one_line(text, 80), 1)
     return repo, int(found.group(2))
 
 
@@ -332,7 +332,7 @@ def declared_clauses(text):
     try:
         return plan_check.declared_clauses(text)
     except plan_check.PlanFormatError as err:
-        raise PlanApplyRefused("plan apply: refused: the plan's clauses cannot be read: %s" % one_line(err, 150), 1) from None
+        raise PlanApplyRefused("plan apply: refused: the plan's clauses cannot be read: %s" % edit_one_line(err, 150), 1) from None
 
 
 def receipt_text(name, file_sha, count, why, old_hash, new_hash, caller, mark, checked="pass"):
@@ -340,7 +340,7 @@ def receipt_text(name, file_sha, count, why, old_hash, new_hash, caller, mark, c
              "file: %s (sha256 %s)" % (os.path.basename(name), file_sha[:8]),
              "pairs: %d; the old plan hash was %s" % (count, old_hash)]
     if why:
-        lines.append(one_line(why.replace("`", "'"), REASON_LIMIT))
+        lines.append(edit_one_line(why.replace("`", "'"), REASON_LIMIT))
     if checked != "pass":
         lines.append("plan check: FAIL")
     return "\n".join(lines) + "\n\n" + mark(caller)
@@ -360,7 +360,7 @@ def apply_run(args, caller, api, state_dir, audit, fleet_mark):
                 raw = handle.read()
             text = raw.decode("utf-8")
         except (OSError, UnicodeDecodeError) as err:
-            raise PlanApplyRefused("plan apply: the file cannot be read: %s" % one_line(getattr(err, "strerror", None) or err, 150), 1) from None
+            raise PlanApplyRefused("plan apply: the file cannot be read: %s" % edit_one_line(getattr(err, "strerror", None) or err, 150), 1) from None
         file_sha = hashlib.sha256(raw).hexdigest()
         pairs, why = parse_pairs(text)
         out.extend(describe(pairs))
@@ -368,7 +368,7 @@ def apply_run(args, caller, api, state_dir, audit, fleet_mark):
         try:
             comments = read_comments(api, repo, number)
         except Exception as err:
-            raise PlanApplyRefused("plan apply: the plan comment cannot be read: %s" % one_line(err, 150), 1) from None
+            raise PlanApplyRefused("plan apply: the plan comment cannot be read: %s" % edit_one_line(err, 150), 1) from None
         plan = pick_plan(comments)
         live = plan["body"]
         if marked_name(live) != caller:
@@ -389,9 +389,9 @@ def apply_run(args, caller, api, state_dir, audit, fleet_mark):
         try:
             edit_in_place(reader, caller, url, result, approval, lambda: _audit_tail(state_dir), audited, fleet_mark, getattr(reader, "repo", repo))
         except CommentEditRefused as err:
-            raise PlanApplyRefused("plan apply: refused: %s" % one_line(err, 300), 1) from None
+            raise PlanApplyRefused("plan apply: refused: %s" % edit_one_line(err, 300), 1) from None
         except CommentEditFailed as err:
-            raise PlanApplyRefused("plan apply: the patch failed, nothing is changed: %s" % one_line(err.detail, 300), 1) from None
+            raise PlanApplyRefused("plan apply: the patch failed, nothing is changed: %s" % edit_one_line(err.detail, 300), 1) from None
     except PlanApplyRefused as err:
         return err.code, err.line
     changed = None
@@ -413,6 +413,6 @@ def apply_run(args, caller, api, state_dir, audit, fleet_mark):
         gh_call(reader, repo, "repos/%s/issues/%d/comments" % (repo, number), "POST",
                              {"body": receipt_text(args.file, file_sha, len(pairs), why, old_hash, new_hash, caller, fleet_mark, checked)})
     except CommentEditFailed as err:
-        out.append("plan apply: the plan is changed and the receipt is not (%s): post the receipt by hand; live plan hash %s" % (one_line(err.detail, 200), new_hash))
+        out.append("plan apply: the plan is changed and the receipt is not (%s): post the receipt by hand; live plan hash %s" % (edit_one_line(err.detail, 200), new_hash))
         return 1, "\n".join(out)
     return (0 if checked == "pass" else 1), "\n".join(out)
