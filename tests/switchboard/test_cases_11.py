@@ -1401,6 +1401,8 @@ class TestMutantControlRule(unittest.TestCase):
     SENTENCE = ("A mutant counts as caught only with a passing control (the same command on the unmutated copy exits 0) and an anchored "
                 "failure text (the mutated check is named in the failure); a harness that counts any non-zero exit as a catch proves nothing.")
 
+    NAMES = ["reviewer-architecture", "reviewer-code", "reviewer-impact", "reviewer-security", "reviewer-test"]
+
     def homes(self, root):
         defs = sorted(p.relative_to(root).as_posix() for p in (root / "agents" / "reviewers").glob("*.md"))
         return defs + ["skills/fleet-review/SKILL.md", "docs/review-laws/structural-rule.md", "skills/fleet-coordination/SKILL.md"]
@@ -1430,12 +1432,16 @@ class TestMutantControlRule(unittest.TestCase):
         self.assertEqual(self.problems(REPO), [])
         print("homes %d of %d" % (len(homes) - len(self.problems(REPO)), len(homes)))
         self.assertGreaterEqual(len(homes), 8)
+        named = ["agents/reviewers/%s.md" % n for n in self.NAMES] + ["docs/review-laws/structural-rule.md", "skills/fleet-review/SKILL.md", "skills/fleet-coordination/SKILL.md"]
+        for h in named:
+            self.assertIn(h, homes, "home missing from the derived set: " + h)
 
     def test_a_mutant_removing_it_from_one_home_names_that_file(self):
         import tempfile
         n = 0
         with tempfile.TemporaryDirectory() as tmp:
             root = self.copy(tmp)
+            self.assertEqual(self.problems(root), [], "control: the unmutated copy must have no problem")
             for h in self.homes(root):
                 f = root / h
                 orig = f.read_text()
@@ -1444,6 +1450,7 @@ class TestMutantControlRule(unittest.TestCase):
                 n += 1
                 f.write_text(orig)
         print("mutants %d of %d" % (n, len(self.homes(REPO))))
+        self.assertEqual(n, len(self.homes(REPO)), "mutants caught must equal the homes")
 
     def test_a_new_definition_without_the_sentence_fails(self):
         import tempfile
