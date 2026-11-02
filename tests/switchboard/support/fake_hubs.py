@@ -152,6 +152,9 @@ class FakeTriageHub:
         self.timelines, self.cut = {}, set()   # (repo, number) -> [timeline events] (#576); numbers whose timeline page is not the whole timeline
         self.cut_open = {}                     # #851: repo -> how many open issues its list read returns before it is cut (the read says it is not whole)
 
+    def read_open_pages(self, path):
+        return self.read_pages(path, cap=sb.OPEN_LIST_PAGES)
+
     def read_pages(self, path, key=None, timeout=None, older=None, cap=None):
         self.calls.append(path)
         if any(f in path for f in self.fail):
