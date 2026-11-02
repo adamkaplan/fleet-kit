@@ -47,20 +47,42 @@ def body_cause_scenarios(scenarios, body, plan_ledger):
     return found
 
 
+def body_unfenced(text):
+    """The text with every line inside a fenced code block blanked (same length, so offsets hold). A fence is a line of three or more backticks or
+    tildes, indented up to 3 spaces; it is closed by a line of the same character at least as long, or open to the end of the text."""
+    out, fence = [], None
+    for line in text.splitlines(keepends=True):
+        opened = _body_re(r"^ {0,3}(`{3,}|~{3,})").match(line)
+        if fence is None and opened:
+            fence = opened.group(1)
+            masked = True
+        elif fence is not None:
+            closing = _body_re(r"^ {0,3}(`+|~+)[ \t]*$").match(line.rstrip("\r\n"))
+            if closing and closing.group(1)[0] == fence[0] and len(closing.group(1)) >= len(fence):
+                fence = None
+            masked = True
+        else:
+            masked = False
+        out.append(_body_re(r"[^\r\n]").sub(" ", line) if masked else line)
+    return "".join(out)
+
+
 def body_first_section(body):
-    """(heading, text, before, found): the first `## ` section of the description, the text before it, and whether there is one."""
-    first = _body_re(BODY_SECTION).search(body)
+    """(heading, text, before, found): the first `## ` section of the description, the text before it, and whether there is one.
+    Headings are searched in the unfenced copy; the text of the section is the ORIGINAL (fenced lines included)."""
+    masked = body_unfenced(body)
+    first = _body_re(BODY_SECTION).search(masked)
     if not first:
-        return "", "", body, False
-    after = _body_re(BODY_SECTION).search(body, first.end())
-    return first.group(1).strip(), body[first.end():after.start() if after else len(body)], body[:first.start()], True
+        return "", "", masked, False
+    after = _body_re(BODY_SECTION).search(masked, first.end())
+    return first.group(1).strip(), body[first.end():after.start() if after else len(body)], masked[:first.start()], True
 
 
 def body_check_problems(body, scenario):
     """([refusal items], [not checked reasons]) of one description against one cause-first scenario. Pure: no read, no write."""
     refused, unchecked = [], []
     heading, text, before, found = body_first_section(body)
-    why_at = _body_re(BODY_WHY, "I", "M").search(body)
+    why_at = _body_re(BODY_WHY, "I", "M").search(body_unfenced(body))
     if not found or "cause" not in heading.lower() or _body_re(BODY_WHY, "I", "M").search(before) or (why_at and why_at.start() < body.find(heading)):
         refused.append("the cause section is not first")
     count, form = body_rule_count(str(scenario.get("pass", "")))
