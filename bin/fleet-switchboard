@@ -16946,7 +16946,7 @@ def cmd_prove(args, runner, now):
             files = plan_ledger.proof_files(args.command, evidence, tree_file_exists(runner))
         entry = {"kind": "proof", "pr": ctx.pr, "scenario": sid, "plan_ref": ctx.source,
                  "plan_hash": ctx.plan["plan_hash"], "head": head, "result": args.result, "by": caller,
-                 "evidence": evidence, "command": plan_ledger.clip(redact_command_text(args.command or "")),
+                 "evidence": evidence, "command": plan_ledger.bounded_text(redact_command_text(args.command or ""), plan_ledger.FIELD_LIMIT, "command"),
                  **({"files": files} if files else {}),
                  "env": "%s %s" % (sys.platform, "python%d.%d" % sys.version_info[:2])}
         try:
