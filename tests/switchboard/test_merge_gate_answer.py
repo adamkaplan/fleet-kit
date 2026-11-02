@@ -22,6 +22,8 @@ class AnswerGitHub(FakeMergeGitHub):
         self.merge_answer = (1, "", "gh: boom\nsecond line")
         self.view = {"state": "MERGED", "headRefOid": MG_HEAD, "mergeCommit": {"oid": "f" * 40}}
         self.state_reads, self.events = [], []
+        self.lock_probe, self.lock_held_at_read = None, []
+        self.view_raises = False
 
     def __call__(self, argv, own=True):
         if argv[:2] == ["pr", "merge"]:
@@ -31,6 +33,8 @@ class AnswerGitHub(FakeMergeGitHub):
         if argv[:2] == ["pr", "view"] and STATE_VIEW in argv:
             self.state_reads.append(list(argv))
             self.events.append("read")
+            if self.lock_probe:
+                self.lock_held_at_read.append(self.lock_probe() is not None)
             if self.view is None:
                 return 1, "", "HTTP 502"
             return 0, self.view if isinstance(self.view, str) else json.dumps(self.view), ""
@@ -43,11 +47,17 @@ class AnswerBase(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.dir, True)
         self.gate = sb.load_module("merge_gate")
         self.reading = sb.load_module("pr_reading")
-        self.fake = AnswerGitHub()
+        self.fake = self.fresh()
         self.repo, self.n = self.fake.repo, self.fake.number
         self.state = self.dir / "mg-state"
         self.state.mkdir()
         self.conf = self.gate.settings({"merge_gate": {"repos": {self.repo: {}}}})
+
+    def fresh(self):
+        """A new fake wired to the lock file of this test's state directory."""
+        fake = AnswerGitHub()
+        fake.lock_probe = lambda: self.gate.read_lock(self.state, fake.repo, "main")
+        return fake
 
     def run_real(self, gate=None):
         """The REAL pass_and_merge; the lock releases are logged into the fake's event list."""
@@ -68,6 +78,13 @@ class AnswerBase(unittest.TestCase):
         other = {"state": "MERGED", "headRefOid": "c" * 40, "mergeCommit": None}
         return [{"state": "OPEN", "headRefOid": MG_HEAD, "mergeCommit": None}, other, None, "[1]"]
 
+    def each(self, views):
+        """Yield with a fresh fake per view (no setUp repeat)."""
+        for view in views:
+            self.fake = self.fresh()
+            self.fake.view = view
+            yield view
+
 
 
 class TestMergeGateAnswer(AnswerBase):
@@ -79,15 +96,14 @@ class TestMergeGateAnswer(AnswerBase):
         self.assertEqual((audit["outcome"], audit["merge_exit"], audit["merge_said"]), ("merged", 1, "gh: boom"))
 
     def test_s2_anything_else_is_state_unknown_and_never_merged(self):
-        for view in self.cases():
+        for view in self.each(self.cases() + [[1], {"state": 5, "headRefOid": MG_HEAD}]):
             with self.subTest(view=view):
-                self.setUp()
-                self.fake.view = view
                 code, lines, audit = self.run_real()
                 self.assertEqual(code, 1)
                 self.assertIn("state is unknown at", lines[-1])
                 self.assertIn("read the pull request: gh: boom", lines[-1])
                 self.assertNotIn("merged ", lines[-1].replace("pull request state", ""))
+                self.assertNotIn("nothing merged", lines[-1])
                 self.assertEqual(audit["outcome"], "refused: merge exit 1")
                 self.assertEqual(audit["merge_said"], "gh: boom")
                 self.assertIn("merge_state", audit)
@@ -100,23 +116,28 @@ class TestMergeGateAnswer(AnswerBase):
         self.assertEqual(self.fake.state_reads, [])
 
     def test_s3_one_reread_after_the_release(self):
-        for view in [self.fake.view] + self.cases():
+        for view in self.each([self.fake.view] + self.cases()):
             with self.subTest(view=view):
-                self.setUp()
-                self.fake.view = view
                 self.run_real()
                 self.assertEqual(len(self.fake.state_reads), 1)
+                self.assertEqual(self.fake.lock_held_at_read, [False], "the lock is released at the moment of the read")
                 self.assertEqual(self.fake.events.index("release") < self.fake.events.index("read"), True, self.fake.events)
 
     def test_s4_the_lock_is_released_in_every_case(self):
         released = 0
-        for view in [self.fake.view] + self.cases():
-            self.setUp()
-            self.fake.view = view
+        run = 0
+        for view in self.each([self.fake.view] + self.cases()):
             self.run_real()
+            run += 1
             released += self.fake.events.count("release")
             self.assertIsNone(self.gate.read_lock(self.state, self.repo, "main"))
-        self.assertEqual(released, 5, "the lock is released in 5 of 5 cases")
+        self.fake = self.fresh()
+        self.fake.merge_answer = (10, "", "blocked by shim")
+        self.run_real()
+        run += 1
+        released += self.fake.events.count("release")
+        self.assertIsNone(self.gate.read_lock(self.state, self.repo, "main"))
+        self.assertEqual((released, run), (6, 6), "the lock is released in 6 of 6 cases")
 
 
 class TestMergeGateAnswerMutant(AnswerBase):
@@ -146,8 +167,24 @@ class TestMergeGateAnswerMutant(AnswerBase):
         text = (REPO / "bin" / "merge_gate.py").read_text()
         self.s1_on(self.copy(text))   # the unmutated copy passes first
         self.assertEqual(text.count(self.NEEDLE), 1)   # the mutation is applied: the replaced text occurs once
-        self.setUp()
+        self.fake = self.fresh()
         mutant = self.copy(text.replace(self.NEEDLE, self.SKIPPED))
         with self.assertRaises(AssertionError) as caught:
             self.s1_on(mutant)
         self.assertIn("a failing exit with the pull request merged is reported merged", str(caught.exception))
+
+    def test_s5_head_check_control_then_mutant(self):
+        text = (REPO / "bin" / "merge_gate.py").read_text()
+        needle = 'if mdata.get("state") == "MERGED" and mdata.get("headRefOid") == head:'
+        self.assertEqual(text.count(needle), 1)
+
+        def other_head(gate):
+            self.fake = self.fresh()
+            self.fake.view = {"state": "MERGED", "headRefOid": "c" * 40, "mergeCommit": None}
+            code, lines, audit = self.run_real(gate)
+            self.assertEqual(code, 1, msg="MERGED at another head is not reported merged")
+        other_head(self.copy(text))   # the control passes first
+        mutant = self.copy(text.replace(needle, 'if mdata.get("state") == "MERGED":'))
+        with self.assertRaises(AssertionError) as caught:
+            other_head(mutant)
+        self.assertIn("MERGED at another head is not reported merged", str(caught.exception))
