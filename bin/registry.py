@@ -575,9 +575,9 @@ def no_pane_by_both_rules(row):
 
 
 def evidence_shows_absent(evidence):
-    """THE one test of the evidence for death (#1884): the pane was checked and is not listed AND the process was checked and not found.
+    """THE one test of the evidence for death (#1884): the pane was READ (listed or not: pane_listed is not None) AND the process of the agent was checked and not found.
     An unchecked part (None) is not absence. Called by shows_dead and by the daemon's pane pass."""
-    return isinstance(evidence, dict) and evidence.get("pane_listed") is False and evidence.get("process_found") is False
+    return isinstance(evidence, dict) and evidence.get("pane_listed") is not None and evidence.get("process_found") is False
 
 
 def shows_dead(row, evidence):
