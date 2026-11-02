@@ -4669,7 +4669,7 @@ whose records are later slices; G7 and G8 are epic and deploy gates and show `n/
 
 ## `waive`: the logged override of G0 to G5 (#107)
 
-`fleet-switchboard waive <repo#N> --gates G0a,G1,... --reason "<at least 20 characters>" [--head <sha>]` is the chief of staff's override
+`fleet-switchboard waive <repo#N> --gates G0a,G1,... --reason "<at least 20 and at most 200 characters; a longer reason is refused, never cut>" [--head <sha>]` is the chief of staff's override
 for a hotfix, per `docs/plan-gate-engine-design.md`. Who: the chief of staff, or the owner at a terminal (the one shared check of `gates mode` and
 `verdict --as owner`, `gates_caller_kind`: an unknown session is refused, never read as a person, and a no-session caller must be on a
 controlling terminal with no agent process above it, so `env -u` on a pipe is refused; a strong mistake-guard, not a boundary). Which gates: G0a, G0b, G0c, G1, G2/G3, G4, G5, and `MG` (the merge gate, below).
