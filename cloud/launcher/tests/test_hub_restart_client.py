@@ -232,35 +232,39 @@ class S10Tries(unittest.TestCase):
         with open(os.path.join(ROOT, "docs", "cloud-channel.md")) as f:
             return " ".join(f.read().split())
 
-    def has_six_tries(self, text):
-        return (self.NEW in text, self.HANG in text, "up to 3 tries" not in text)
+    OLD = "up to 3 tries"
 
-    def check_document(self, text):
-        if "up to 3 tries" in text:
+    def has_six_tries(self, text):
+        return (self.NEW in text, self.HANG in text, self.OLD not in text)
+
+    def check_document(self, text, control):
+        # fails on what the text changed against the control, never on a fixed substring:
+        # the control (the unmutated document) always passes against itself.
+        if text.count(self.OLD) > control.count(self.OLD):
             raise AssertionError("the old sentence of three tries is back")
         return self.has_six_tries(text)
 
     def test_real_text(self):
-        got = self.check_document(self._text())
         text = self._text()
+        got = self.check_document(text, text)
         print("S10: six tries and the window %d of 1, the sentence on a hub that hangs %d of 1, occurrences of up to 3 tries %d"
-              % (text.count(self.NEW), text.count(self.HANG), text.count("up to 3 tries")))
-        self.assertEqual(got, (True, True, True))
+              % (text.count(self.NEW), text.count(self.HANG), text.count(self.OLD)))
+        self.assertEqual(got[:2], (True, True))
 
     def test_mutant(self):
         text = self._text()
-        control = self.check_document(text)
-        applied = text.count(self.NEW) == 1
+        control = self.check_document(text, text)
         mutant = text.replace(self.NEW, "The command makes up to 3 tries with one key.")
-        applied = applied and mutant != text
+        applied = mutant != text and mutant.count(self.OLD) == 1 and text.count(self.OLD) == 0
+        print("S10: mutation counts: old sentence %d in the mutant, %d in the original" % (mutant.count(self.OLD), text.count(self.OLD)))
         message = None
         try:
-            self.check_document(mutant)
+            self.check_document(mutant, text)
         except AssertionError as e:
             message = str(e)
         got = self.has_six_tries(mutant)
-        print("S10: control passes %d of 1, mutant (the old sentence back) fails %d of 1 with the text, mutation applied %s"
-              % (control == (True, True, True), message == "the old sentence of three tries is back", applied))
+        print("S10: control passes %d of %d, mutant (the old sentence back) fails %d of 1 with the text, mutation applied %s"
+              % (sum(control), len(control), int(message == "the old sentence of three tries is back"), applied))
         self.assertTrue(applied)
         self.assertEqual(control, (True, True, True))
         self.assertEqual(message, "the old sentence of three tries is back")
