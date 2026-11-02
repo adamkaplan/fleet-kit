@@ -397,6 +397,33 @@ class TestHeavyProgress(unittest.TestCase):
         self.assertEqual(outcome["mutant"][2], True, "the mutant never reached the outer bound: " + outcome["mutant"][1])
         self.assertIn("the stop waited for a blocked write", outcome["mutant"][1])
 
+    def test_s16_inner_a_control_character_is_not_echoed_and_a_broken_stream_does_not_stop_the_child(self):
+        if not os.environ.get("FLEET_TEST_INNER"):
+            self.skipTest("run by test_s16 in a child process")
+        rig = Rig(self, alive=0, env={"FLEET_HEAVY_PROGRESS_SECONDS": "a\nheavy: forged"})
+        said = [line for _t, line in rig.out.lines]
+        self.assertEqual(said, ["heavy: FLEET_HEAVY_PROGRESS_SECONDS=a?heavy: forged is out of range, using 60"], "a control character reached the error stream: %r" % (said,))
+        rig = Rig(self, alive=0, env={"FLEET_HEAVY_PROGRESS_SECONDS": "a\x1b[31mb"})
+        self.assertNotIn("\x1b", rig.out.text, "a control character reached the error stream")
+        for error in (OSError, ValueError):
+            for status in (0, 7):
+                class Broken(Out):
+                    def write(self, text):
+                        raise error("broken")
+                with mock.patch.dict(globals(), {"Out": Broken}):
+                    rig = Rig(self, alive=0, status=status, env={"FLEET_HEAVY_PROGRESS_SECONDS": "abc"})
+                self.assertEqual((len(rig.starts), rig.status), (1, status), "a broken error stream stopped the child (%s, status %d)" % (error.__name__, status))
+
+    def test_s16_a_control_character_and_a_broken_stream_each_mutant_fails_with_its_text(self):
+        shown = '''shown = "".join("?" if ord(c) < 32 or 127 <= ord(c) <= 159 else c for c in raw[:40])'''
+        guard = "except (OSError, ValueError):\n                pass"
+        for old, new, text in ((shown, "shown = raw[:40]", "a control character reached the error stream"),
+                               (guard, "except ZeroDivisionError:\n                pass", "a broken error stream stopped the child")):
+            results = self._scratch([(old, new)], "test_s16_inner_a_control_character_is_not_echoed_and_a_broken_stream_does_not_stop_the_child")
+            self.assertEqual(results["control"].returncode, 0, results["control"].stdout)
+            self.assertEqual(results["mutant"].returncode, 1, results["mutant"].stdout)
+            self.assertIn(text, results["mutant"].stdout)
+
 
 if __name__ == "__main__":
     unittest.main()
