@@ -394,7 +394,7 @@ MIN_FRAGMENT = 8
 _H = r"[0-9A-Fa-f]{1,4}"
 _V4 = r"[0-9]{1,3}(?:\.[0-9]{1,3}){3}"
 MASK_IPV6 = True   # the capacity answer masks the IPv6 and the IPv4-mapped forms too (PC-10)
-_ADDRESS_V6 = (r"(?<![0-9A-Fa-f:])(?:(?:%(h)s:){6}%(v4)s|(?:%(h)s(?::%(h)s){0,5})?::(?:ffff:)?%(v4)s|(?:%(h)s:){7}%(h)s"
+_ADDRESS_V6 = (r"(?<![0-9A-Fa-f:])(?:(?:%(h)s:){6}%(v4)s|(?:%(h)s(?::%(h)s){0,5})?::(?:%(h)s:){0,3}%(v4)s|(?:%(h)s:){7}%(h)s"
                r"|(?:%(h)s(?::%(h)s){0,6})?::(?:%(h)s(?::%(h)s){0,6})?)(?![0-9A-Fa-f:])|") % {"h": _H, "v4": _V4}
 _ADDRESS_RE = re.compile((_ADDRESS_V6 if MASK_IPV6 else "") + _V4)
 
