@@ -1068,6 +1068,56 @@ class TestGiveUpAndBadTs(Base):
         print("S32: the copy of the stale test without the try fails 1 of 1 with the anchored text (%s), control first, mutation applied" % str(caught.exception)[:60])
 
 
+class TestTakenArchiveName(Base):
+    """S33: both archive names taken is an expected give-up that prints nothing; a real failure still prints one line."""
+    NOW = dt.datetime(2026, 1, 5, 10, 0, 0, tzinfo=dt.timezone.utc)
+
+    def check_taken(self, cw=CW):
+        self.big()
+        for name in ("audit-2026-01-05.jsonl.gz", "audit-2026-01-05T100000.jsonl.gz"):
+            with open(os.path.join(self.dir, name), "wb") as handle:
+                handle.write(b"x")
+        with open(self.audit, "rb") as handle:
+            before = handle.read()
+        result, printed = self.rotate(cw, now=self.NOW)
+        with open(self.audit, "rb") as handle:
+            same = handle.read() == before
+        names = sorted(os.listdir(self.dir))
+        record = cw.read_rotation_record(self.audit)
+        pending = record.get("pending") if isinstance(record, dict) else None
+        count = len(printed.splitlines())
+        if count:
+            raise AssertionError("an expected give-up printed an error line: %d printed line" % count)
+        self.assertIsNone(result)
+        temps = [n for n in names if n not in ("audit.jsonl", "audit-2026-01-05.jsonl.gz", "audit-2026-01-05T100000.jsonl.gz")]
+        self.assertEqual(temps, [x for x in temps if x.startswith("audit.jsonl.") and not x.endswith(".tmp")])
+        self.assertFalse([n for n in temps if n.endswith(".tmp") or n.startswith(".audit.")])
+        self.assertTrue(same)
+        self.assertIsNone(pending)
+        return count, len([n for n in names if n.endswith(".tmp") or n.startswith(".audit.")]), same, pending
+
+    def test_taken(self):
+        count, temps, same, pending = self.check_taken()
+        self.assertEqual((count, temps, same, pending), (0, 0, True, None))
+        self.setUp()
+        self.big()
+        def full(*a, **k):
+            raise OSError(28, "No space left on device")
+        with mock.patch.object(gzip, "GzipFile", full):
+            result, printed = self.rotate(now=self.NOW)
+        real = len(printed.splitlines())
+        self.assertEqual(real, 1)
+        self.assertIn("OSError", printed)
+        self.setUp()
+        mutant = load("cw", '            raise _GaveUp()\n        temps.append(archive)', '            raise FileExistsError(0, "no free archive name")\n        temps.append(archive)')
+        with self.assertRaises(AssertionError) as caught:
+            self.check_taken(mutant)
+        self.assertIn("an expected give-up printed an error line", str(caught.exception))
+        shown = str(caught.exception).split(": ")[1]
+        print("S33: both names taken: returned None, %d lines printed, %d temp files, live file equal %s, no pending; real failure printed %d line; control 1 of 1, "
+              "mutant 1 of 1 with the text (%s), mutation applied True" % (count, temps, same, real, shown))
+
+
 class TestReadme(unittest.TestCase):
     @staticmethod
     def check(text):
