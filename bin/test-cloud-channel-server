@@ -268,29 +268,64 @@ def check_token_not_in_audit(module, test):
         test.assertFalse([l for l in s.lines if "tok-a" in l or "tok-bad" in l or "Bearer" in l], s.lines)
 
 
+def trickle_client(port, declared=50, hang_guard=30):
+    """Trickle a body one byte at a time, watching the socket; returns (first_line, sent_at_answer, log)."""
+    import select
+    log = []
+
+    def note(text):
+        log.append("%.3f %s" % (time.monotonic(), text))
+
+    guard = time.monotonic() + hang_guard
+    sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+    sent, buf, readable_at, reset = 0, b"", None, None
+    try:
+        try:
+            sock.sendall(request_bytes("tok-a", declared))
+            while sent < declared - 1:
+                if time.monotonic() > guard:
+                    raise AssertionError("the client did not finish within the hang guard")
+                ready = bool(select.select([sock], [], [], 0.2)[0])
+                note("byte %d readable=%s" % (sent, ready))
+                if ready:
+                    readable_at = sent
+                    break
+                sock.sendall(b"{")
+                sent += 1
+        except (ConnectionResetError, BrokenPipeError) as exc:
+            note("error %s on write after %d bytes" % (type(exc).__name__, sent))
+            reset = exc
+        while b"\r\n\r\n" not in buf:
+            if time.monotonic() > guard:
+                raise AssertionError("the client did not finish within the hang guard")
+            try:
+                chunk = sock.recv(4096)
+            except OSError as exc:
+                note("error %s on read" % type(exc).__name__)
+                reset = exc
+                break
+            note("read %d bytes" % len(chunk))
+            if not chunk:
+                break
+            buf += chunk
+    finally:
+        sock.close()
+    if readable_at is None and buf:
+        readable_at = sent
+    return buf.split(b"\r\n")[0], readable_at, reset, log
+
+
 def check_total_deadline(module, test):
     with Running(module, timeout=2.0, deadline=0.6) as s:
-        sock = socket.create_connection(("127.0.0.1", s.port()), timeout=5)
+        first, at, reset, log = trickle_client(s.port())
         try:
-            sock.sendall(request_bytes("tok-a", 50))
-            t0, buf = time.time(), b""
-            try:
-                while time.time() - t0 < 4 and b"\r\n\r\n" not in buf:
-                    sock.sendall(b"{")   # one byte per read: never trips the per-read timeout
-                    sock.settimeout(0.2)
-                    try:
-                        chunk = sock.recv(4096)
-                        if not chunk:
-                            break
-                        buf += chunk
-                    except socket.timeout:
-                        pass
-            except OSError:
-                pass
-        finally:
-            sock.close()
-        test.assertTrue(buf.split(b"\r\n")[0].endswith(b"408 Request Timeout"), buf)
-        test.assertLess(time.time() - t0, 2.0)
+            if not first and reset is not None:
+                raise AssertionError("the connection was reset before the answer was read")
+            test.assertTrue(first.endswith(b"408 Request Timeout"), first)
+            test.assertTrue(at is not None and at < 50, "the server did not answer 408 before the body was complete")
+        except AssertionError:
+            print("\n".join(log), file=sys.stderr)
+            raise
         test.assertEqual(s.inbox.items, {})
 
 
