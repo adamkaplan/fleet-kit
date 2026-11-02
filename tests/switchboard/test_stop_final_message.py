@@ -752,7 +752,9 @@ class TestStopFinalMessageBareMutant(unittest.TestCase):
         "    scratch=tempfile.mkdtemp()\n",
         "    top=tempfile.mkdtemp(); scratch=os.path.join(top,'bin'); os.mkdir(scratch); os.symlink(os.path.join(os.path.dirname(os.path.dirname(real)),'cloud'), os.path.join(top,'cloud'))\n")
     CASES = (
-        ("cloud_retired", "test_U18_a_bare_endpoint_host_is_in_neither_the_message_nor_the_file", '(?:https?://)?worker-', "https?://worker-",
+        ("cloud_retired", "test_U18_a_bare_endpoint_host_is_in_neither_the_message_nor_the_file", "        start = j\n",
+         "        start = j\n        if not (low.startswith(\"https://\", j - 8) and j >= 8 or low.startswith(\"http://\", j - 7) and j >= 7):\n"
+         "            i = k\n            continue\n",
          "a bare endpoint host reached a lane"),
         ("cloud_worker", "test_U19_a_token_straddling_the_120_character_cut_leaves_no_prefix", "_one(_scrub_lib()(reason, (), 200), 120)",
          "_scrub_lib()(_one(reason, 120), (), 200)", "part of a token in the retire reason reached a lane"),
