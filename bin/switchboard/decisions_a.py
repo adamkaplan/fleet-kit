@@ -605,7 +605,7 @@ def facts_text(entry):
 LABEL_HOLD_KEEP_SECONDS = 86400   # a row kept because its list is cut or gone is dropped after a day (a pull request that merged meanwhile does not stay)
 
 
-LABEL_HOLD_LIST_CUT = 200   # the daemon's open-pull-request list is read to 2 pages of 100: a list this long may be cut
+LABEL_HOLD_LIST_CUT = OPEN_LIST_PAGES * GITHUB_PAGE_SIZE   # the daemon's open-pull-request list is read to OPEN_LIST_PAGES pages of GITHUB_PAGE_SIZE: a list this long may be cut
 
 
 def label_hold_entries(engine, now, noticed, escalated, in_play):
