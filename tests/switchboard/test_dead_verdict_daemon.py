@@ -462,3 +462,39 @@ class TestUndecidableStreak(Base):
         with mock.patch.object(sb, "undecidable_streak", func or sb.undecidable_streak):
             rig = self.streak(6)
         return [] if len(rig.undecidable_lines()) == 1 else ["pane.undecidable is written more than once for one streak"]
+
+
+class TestPaneStateRace(Base):
+    """S4 (the readers' race test): through `pane_state` itself, `pane_get` saying "not found" is `dead` only when the evidence shows absence; a mutant that drops the guard fails."""
+    GUARD = 'if not daemon_shows_absent(engine, name, {"pane": pane, "session": session_id}):'
+
+    def answers(self):
+        """pane_state's answer to the race (listed pane, the agent's process runs, pane_get says not found) and to an unreadable pane list."""
+        race = Rig(self, DEAD_CASES["pane_get not found, still listed, process runs"])
+        race.arrange()
+        self.assertIn(race.pane, race.herdr.panes)   # the pane is listed and its process runs the session
+        unreadable = Rig(self, DEAD_CASES["list cannot be read"])
+        unreadable.arrange()
+        return race.pane_state(), unreadable.pane_state()
+
+    def test_S4_the_race_and_an_unreadable_pane_list_are_unknown(self):
+        self.assertEqual(self.answers(), (sb.PANE_UNKNOWN, sb.PANE_UNKNOWN))
+
+    def test_S4_the_gone_pane_is_still_dead(self):
+        gone = Rig(self, DEAD_CASES["pane gone"])
+        gone.arrange()
+        self.assertEqual(gone.pane_state(), sb.PANE_DEAD)
+
+    def failures(self, func=None):
+        with mock.patch.object(sb, "pane_state", func or sb.pane_state):
+            race, unreadable = self.answers()
+        return (["pane_state answers dead for a pane_get race (the pane is listed and its process runs)"] if race == sb.PANE_DEAD else []) + \
+               (["pane_state answers dead for an unreadable pane list"] if unreadable == sb.PANE_DEAD else [])
+
+    def test_S4_mutant_the_pane_state_guard_replaced_by_if_false(self):
+        self.assertEqual(self.failures(), [], "control: the check must pass on the unmutated daemon")
+        func, count = source_copy_function("pane_state", self.GUARD, "if False:")
+        self.assertEqual(count, 1, "the mutation must be applied exactly once")
+        found = self.failures(func)
+        self.assertTrue(any("pane_state answers dead for a pane_get race" in f for f in found), found)
+        self.assertTrue(any("pane_state answers dead for an unreadable pane list" in f for f in found), found)
