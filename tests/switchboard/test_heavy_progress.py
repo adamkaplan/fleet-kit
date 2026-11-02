@@ -200,7 +200,7 @@ class TestHeavyProgress(unittest.TestCase):
         self.assertEqual(len(rig.out.lines) - lines, 0, "a line was written after the wrapper returned")
 
     def test_s11_a_read_that_outlasts_the_join_writes_no_line_after_the_return(self):
-        results = self._scratch([("# stopped after the read", "if False:  # mutant")], "test_s11_inner_a_slow_read_writes_nothing_after_the_return")
+        results = self._scratch([("if stop.is_set():   # stopped after the read, before the write", "if False:")], "test_s11_inner_a_slow_read_writes_nothing_after_the_return")
         self.assertEqual(results["control"].returncode, 0, results["control"].stdout)
         self.assertEqual(results["mutant"].returncode, 1, results["mutant"].stdout)
         self.assertIn("a line was written after the wrapper returned", results["mutant"].stdout)

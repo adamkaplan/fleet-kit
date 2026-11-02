@@ -1119,7 +1119,7 @@ _progress_started = None   # tests: an Event the progress thread sets when it ha
 _progress_pause = None   # tests: a function (stop_event, seconds) that pauses in place of the real wait
 
 
-def _progress_loop(pid, program, interval, stop, out, clock, began):
+def _progress_loop(pid, program, interval, stop, out, clock, began, lock=None):
     """One line every `interval` seconds until `stop` is set; a failure of its own ends it quietly. Never signals the child."""
     try:
         if _progress_started is not None:
@@ -1136,11 +1136,14 @@ def _progress_loop(pid, program, interval, stop, out, clock, began):
             cpu = _child_cpu_seconds(pid)
             if cpu is not None:
                 text += ", CPU %d s (%d%%)" % (int(cpu), int(100 * cpu / elapsed) if elapsed > 0 else 0)
-            out.write(text + "\n")
-            try:
-                out.flush()
-            except Exception:
-                pass
+            with (lock or threading.Lock()):   # `run` takes this lock to set `stop`: once it is set no write begins
+                if stop.is_set():   # stopped after the read, before the write
+                    return
+                out.write(text + "\n")
+                try:
+                    out.flush()
+                except Exception:
+                    pass
     except Exception:
         return
 
@@ -1290,11 +1293,12 @@ def run(command, state_dir, slots=DEFAULT_SLOTS, wait_max=DEFAULT_WAIT_MAX, name
                        **dict({"lock_path": lock, "hard_max": ceiling_table(ceiling_config)["max"], "decided": decided}, **(watchdog or {})))
         dog.start()
         progress_stop = threading.Event()
+        progress_lock = threading.Lock()
         try:
             progress_every = float(environ.get("FLEET_HEAVY_PROGRESS_SECONDS") or PROGRESS_EVERY)
         except ValueError:
             progress_every = PROGRESS_EVERY
-        progress_thread = threading.Thread(target=_progress_loop, args=(child["p"].pid, os.path.basename(command[0]), progress_every, progress_stop, out, clock, clock()), daemon=True)
+        progress_thread = threading.Thread(target=_progress_loop, args=(child["p"].pid, os.path.basename(command[0]), progress_every, progress_stop, out, clock, clock(), progress_lock), daemon=True)
         progress_thread.start()
         try:
             while True:
@@ -1304,7 +1308,8 @@ def run(command, state_dir, slots=DEFAULT_SLOTS, wait_max=DEFAULT_WAIT_MAX, name
                 except InterruptedError:   # a signal during wait: Python retries; this is belt and braces
                     continue
         finally:
-            progress_stop.set()
+            with progress_lock:
+                progress_stop.set()
             if progress_thread.is_alive():
                 progress_thread.join(2)   # bounded: no progress line after run returns
             dog.finish()
