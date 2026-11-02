@@ -78746,7 +78746,7 @@ class TestAskIssueSubject(unittest.TestCase):
         out, err = io.StringIO(), io.StringIO()
         with mock.patch.object(sb, "build_engine", lambda *a, **k: (engine, self.state, config)), mock.patch.object(sb, "pr_picture", lambda *a: picture), \
                 mock.patch.object(sb, "identify_caller", lambda *a: self.caller), mock.patch.object(sb, "checked_plan", lambda *a, **k: self.plan()), \
-                mock.patch.object(sb, "launched_testers_for", lambda c: ({}, {}, {})), mock.patch.object(sb, "read_open_overlap", lambda *a: None), \
+                mock.patch.object(sb, "launched_testers_for", lambda c, role="tester": ({}, {}, {})), mock.patch.object(sb, "read_open_overlap", lambda *a: None), \
                 contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             try:
                 code = getattr(sb, command)(args, None, self.now)
