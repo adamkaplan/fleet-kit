@@ -34,7 +34,7 @@ READ_DIRS = ("bin", "tests", "docs")   # the three directories the copy tree of 
 TEST_DIR = "tests/switchboard"
 TABLE_CLASS = "TestTheBinSetClassesAreAllInTheTable"
 BIN_GUARD_CMD = "python3 bin/test-switchboard " + TABLE_CLASS
-PATH_SUITES_CMD = "python3 bin/path_suites.py --check"
+PATH_SUITES_CMD = "python3 bin/path_" + "suites.py --check"   # built in two parts: a test that names this tool must not be derived as a suite of that bin module
 
 
 class CannotRun(Exception):

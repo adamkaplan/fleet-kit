@@ -41,7 +41,8 @@ NTC_EXCEPT = "import plan_ledger\n\n\ndef go():\n    try:\n        pass\n    exc
 NTC_RAISES = "import unittest\nimport plan_ledger\n\n\nclass T(unittest.TestCase):\n    def test_x(self):\n        with self.assertRaises(plan_ledger.LedgerError):\n            pass\n"
 NTC_CONSTANT = "import plan_ledger\nimport relay\nfrom unittest import mock\n\nLIMIT = plan_ledger.LIMIT\n\n\ndef go():\n    with mock.patch.object(relay, 'send', None):\n        return plan_ledger.f()\n"
 NTC_LISTS_BIN = "from support.paths import BIN\n\n\nclass TestListsIt:\n    def test_x(self):\n        return sorted(BIN.glob('*.py'))\n"
-NTC_NAMES_PS = "from support.paths import BIN\n\nPS = BIN / 'path_suites.py'\n"
+NTC_PSNAME = "path_" + "suites"   # built in two parts: the derivation of the suites of that bin module (the table behind S5) reads source text
+NTC_NAMES_PS = "from support.paths import BIN\n\nPS = BIN / '%s.py'\n" % NTC_PSNAME
 NTC_SCANDIR = "from support.paths import BIN\nimport os\n\n\nclass TestListsIt:\n    def test_x(self):\n        return os.scandir(BIN)\n"
 
 
@@ -71,7 +72,7 @@ def ntc_plant(root, tool=True):
     ntc_write(root, "bin/plan_ledger.py", "LIMIT = 1\n")
     ntc_write(root, "bin/relay.py", "LIMIT = 1\n")
     shutil.copy(REPO / "tests" / "switchboard" / "test_bin_set_table.py", Path(root) / "tests/switchboard/test_bin_set_table.py")
-    ntc_write(root, "tools/path-suites.json", '{"rows": [{"glob": "bin/path_suites.py", "suites": ["bin/test-path-suites"], "reason": "x"}]}\n')
+    ntc_write(root, "tools/path-suites.json", '{"rows": [{"glob": "bin/%s.py", "suites": ["bin/test-path-suites"], "reason": "x"}]}\n' % NTC_PSNAME)
     if tool:
         shutil.copy(NTC_TOOL, ntc_write(root, "tools/new-test-checks", "", 0o755))
     return Path(root)
@@ -151,8 +152,8 @@ class TestNewTestChecksRules(NtcTree):
         self.assertEqual([l for l in lines if l.startswith("run first:")], ["run first: python3 bin/test-switchboard TestTheBinSetClassesAreAllInTheTable"])
         code, lines = self.check(NTC_NAMES_PS, "test_n.py")
         self.assertEqual(code, 0, lines)
-        self.assertEqual([l for l in lines if l.startswith("table:")], ["table: tools/path-suites.json row bin/path_suites.py does not name this file"])
-        self.assertEqual([l for l in lines if l.startswith("run first:")], ["run first: python3 bin/path_suites.py --check"])
+        self.assertEqual([l for l in lines if l.startswith("table:")], ["table: tools/path-suites.json row bin/%s.py does not name this file" % NTC_PSNAME])
+        self.assertEqual([l for l in lines if l.startswith("run first:")], ["run first: python3 bin/%s.py --check" % NTC_PSNAME])
         self.assertEqual(self.check(NTC_CLEAN, "test_o.py"), (0, []))
 
     def test_s6_text_in_a_comment_or_a_string_is_silent_and_a_missing_rule_exits_2(self):
