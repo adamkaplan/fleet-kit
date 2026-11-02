@@ -16,11 +16,19 @@ bin/fleet-heartbeat
 bin/heartbeat-ack
 INSTALL.md
 templates/**
+# the installer runs launchctl print, bootstrap and bootout
+bin/switchboard/installer.py
 
 # group: heavy-slot
 bin/heavy_slots.py
 bin/cpu_guard.py
 bin/disk_janitor.py
+# github_census picks the /proc reader or the ps/lsof reader by sys.platform
+bin/github_census.py
+# guard_alert has a sys.platform branch and calls osascript and notify-send
+bin/guard_alert.py
+# spotlight_guard builds an mdfind command and branches on sys.platform
+bin/spotlight_guard.py
 
 # group: workflow
 .github/workflows/**
