@@ -927,7 +927,7 @@ class TestIdempotentAndOwned(Base):
     def test_s30(self):
         self.assertEqual(self.check_s30(), (1, 1, 3))
         self.setUp()
-        mutant = load("cw", 'if not isinstance(ts, (int, float)) or now_ts - ts > AUDIT_PENDING_STALE:', "if True:")
+        mutant = load("cw", 'if isinstance(ts, bool) or not isinstance(ts, (int, float)) or not math.isfinite(ts) or ts > now_ts or now_ts - ts > AUDIT_PENDING_STALE:', "if True:")
         mutant.AUDIT_ROTATE_BYTES, mutant.AUDIT_KEEP_BYTES = 300000, 100000
         with self.assertRaises(AssertionError) as caught:
             self.check_s30(mutant)
