@@ -115,8 +115,8 @@ def build():
         def refused(self, call, text):
             before = self.state_listing()
             code, out, err = call(text)
-            self.assertEqual(code, 2, out + err)
-            self.assertRegex(err, CHECK)
+            self.assertEqual(code, 2, "the evidence over the limit must be refused and nothing recorded: the command exited %s, not 2" % code)
+            self.assertRegex(err, CHECK, "the refusal line must name the 501 characters and the limit of 500: " + err)
             self.assertIn("501", err)
             self.assertIn("500", err)
             self.assertEqual(self.state_listing(), before, "a refusal writes no byte: no entry, no head pointer")
@@ -242,7 +242,8 @@ def build():
             for pod, command in ((CODER, "prove"), (TESTER, "verdict")):
                 before, audits = ledger_bytes(self.state), len(self.refusals())
                 got = self.call(pod, command, "r-" + command, LONG)
-                self.assertEqual((got["status"], got["record"]), (400, None))
+                self.assertEqual((got["status"], got["record"]), (400, None),
+                                 "the relay must refuse the evidence over the limit with 400 and record nothing: it answered %s" % ((got["status"], got["record"]),))
                 self.assertRegex(got["reason"], CHECK)
                 self.assertEqual(ledger_bytes(self.state), before)
                 self.assertEqual(len(self.refusals()), audits + 1)
@@ -308,23 +309,28 @@ def build():
             return scope["_evidence"]
 
         def test_mutant_evidence_clips_again(self):
+            self.local_case(sb._evidence)   # control first: the unmutated copy passes the same check
             with self.assertRaises(AssertionError) as ctx:
                 self.local_case(self.mutated_evidence())
-            self.assertIn("0 != 2", str(ctx.exception))   # a command that clips records and exits 0 where 2 is the refusal
+            self.assertIn("the evidence over the limit must be refused and nothing recorded: the command exited 0, not 2", str(ctx.exception))
 
         def test_mutant_relay_write_clips_again(self):
             mod = source_copy("        evidence = _checked_evidence(args)\n",
                               '        evidence = plan_ledger.clip(str(args.get("evidence") or "").strip(), plan_ledger.EVIDENCE_LIMIT)\n')
+            self.run_case(self.relay_case(relay))   # control first: the unmutated relay passes the same check
+            self.assertEqual(mod.__name__, "cloud_relay_daemon_mut1901")
             with self.assertRaises(AssertionError) as ctx:
                 self.run_case(self.relay_case(mod))
-            self.assertIn("!= (400, None)", str(ctx.exception))   # a relay that clips answers 200 where 400 is the refusal
+            self.assertIn("the relay must refuse the evidence over the limit with 400 and record nothing: it answered (200,", str(ctx.exception))
 
         def test_mutant_bounded_text_refuses_at_the_limit_itself(self):
             real = SBP().bounded_text
             mutant = lambda text, limit, what: real(text, limit - 1, what)
+            self.local_case(sb._evidence)   # control first: the real bounded_text passes the same check
             with mock.patch.object(SBP(), "bounded_text", mutant):
                 with self.assertRaises(AssertionError) as ctx:
                     self.local_case(sb._evidence)
+            self.assertIn("the refusal line must name the 501 characters and the limit of 500: ", str(ctx.exception))
             self.assertIn("the limit is 499", str(ctx.exception))   # the refusal line names 499, not 500
 
     class TestEvidenceLimitUnchanged(LocalBase):
