@@ -86,7 +86,7 @@ class S3Launch(bin_tests.Base):
         brief.write_text("Build the thing.\n")
         code, out, err = self.main("launch", "main2", "--cloud", "--agent", "coder", "--repo", "acme-org/widget-service", "--branch", "main2",
                                    "--role", "coder", "--reports-to", "orch", "--brief-file", str(brief))
-        if code == 0:
+        if "have the same name" not in err:   # past the check: accepted (a later stop of the fake cluster is not the refusal)
             raise AssertionError("a launch with the worker's name as its branch was accepted")
         return code, [l for l in err.splitlines() if l.strip()]
 
