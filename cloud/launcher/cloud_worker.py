@@ -1840,8 +1840,21 @@ class Launcher:
         hours = (self.clock() - parse_iso(ann(pod, "started"))).total_seconds() / 3600
         return round(max(hours, 0) * SHAPES.get(ann(pod, "shape", "S"), SHAPES["S"])["usd_per_hour"], 4)
 
+    def _tick(self, info, step, began):
+        """Add the seconds since `began` (the launcher's own clock) to one step of a stop's `steps`; a step that did not run is never added."""
+        steps = info.setdefault("steps", {})
+        steps[step] = steps.get(step, 0.0) + (self.clock() - began).total_seconds()
+
+    def _close_stop(self, info, began):
+        """The whole stop in `seconds`, and `other` (the total minus the named steps, never negative) whenever there are steps."""
+        total = (self.clock() - began).total_seconds()
+        info["seconds"] = total
+        if info.get("steps"):
+            info["steps"]["other"] = max(0.0, total - sum(v for k, v in info["steps"].items() if k != "other"))
+
     def _audited(self, worker, action, fn, reason="", runtime_id=""):
         info = {"rid": runtime_id, "cost": 0.0}
+        stop_began = self.clock() if action == "stop" else None
 
         def why():   # a stop that wrote a run record names its directory once, here
             text = "%s; run record %s" % (reason, info["record"]) if info.get("record") else reason
@@ -1849,13 +1862,19 @@ class Launcher:
         try:
             result = fn(info)
         except CloudError as e:
+            if stop_began is not None:
+                self._close_stop(info, stop_began)
             if not e.audited:
                 # the failure is never dropped: a caller's own reason (a stop reason, the run-secret names) comes first
                 self.audit(worker, info["rid"], action, info["cost"], False, "%s; %s" % (why(), e) if why() else str(e), info.get("refresh"), info.get("cause"), info.get("steps"), info.get("seconds"))
             raise
         except (ValueError, TypeError, KeyError) as e:  # a bad annotation or reply still writes its ok:false line
+            if stop_began is not None:
+                self._close_stop(info, stop_began)
             self.audit(worker, info["rid"], action, info["cost"], False, why() or str(e)[:300], info.get("refresh"), info.get("cause"), info.get("steps"), info.get("seconds"))
             raise CloudError("unexpected cloud data: %s" % self.kube.scrub(e, 200))
+        if stop_began is not None:
+            self._close_stop(info, stop_began)
         self.audit(worker, info["rid"], action, info["cost"], True, why(), info.get("refresh"), info.get("cause"), info.get("steps"), info.get("seconds"))
         return result
 
@@ -2236,7 +2255,9 @@ class Launcher:
                 if getattr(a, "cause", None):   # only the reaper's own stop names a cause; a by-name stop carries none
                     info["cause"] = "pod_gone"
                 if nonce:   # no pod: this run's own Secrets (carrying the nonce) may remain from a cut-off create; another's are left whole
+                    began = self.clock()
                     self._remove(name, nonce)
+                    self._tick(info, "delete", began)
                 # The pod read said NotFound (an operator deleted it); any other read error raised in _need above and never reaches here.
                 removed = []
                 if not nonce:   # by name, pod NotFound: only this worker's own two Secrets (exact names) may be left over; nothing else is touched
@@ -2247,8 +2268,10 @@ class Launcher:
                 return {"worker": worker, "runtime_id": "", "pushed": False, "wip_branch": None, "pod_gone": True, "secrets_removed": removed}
             info["rid"], info["cost"] = "pod/" + name, self.cost(pod)
             if not getattr(a, "no_record", False):   # BEFORE the hook and the delete; never raises, never holds the stop back
+                began = self.clock()
                 where = self.recorder.record(worker, name, reason or "stop", repo=_pod_repo(pod), started=ann(pod, "started") or "",
                                              root=getattr(a, "record_dir", None))
+                self._tick(info, "record", began)
                 if where:
                     info["record"] = where
                     print("cloud-worker: run record: %s" % where, file=sys.stderr)
@@ -2258,26 +2281,36 @@ class Launcher:
             if phase in ("Failed", "Succeeded") and ann(pod, "kept") != "true":  # a pod kept for unpushed work is never deleted here
                 # No container is running, so no hook can run and a kept pod would only linger: delete it and its
                 # Secrets, and say so.
+                began = self.clock()
                 self._remove(name, nonce, uid)
+                self._tick(info, "delete", began)
                 print("cloud-worker: pod was %s; end hook not run; deleted" % phase, file=sys.stderr)
                 self._hook_record(info, {"ran": False, "pushed": False, "wip_branch": None, "skipped": [], "note": "pod was %s; end hook not run" % phase})
                 return {"worker": worker, "runtime_id": "pod/" + name, "pushed": False, "wip_branch": None,
                         "skipped": [], "note": "pod was %s; end hook not run" % phase, "record": info.get("record", "")}
             info["refresh"] = REFRESH_NONE
+            began = self.clock()
             try:
                 res = self.run_hook(name)
             except CloudError as e:
                 res = {"pushed": False, "wip_branch": None, "error": str(e)}
+            self._tick(info, "hook", began)
             if res.get("refresh") == "needed" and res.get("error") and not res.get("pushed"):
                 # The push was refused because the token had ended: ONE refresh here, on the stop side (the pod holds no minter credential),
                 # and ONE more run of the hook. A refused refresh means no second attempt; the second answer is never refreshed again.
+                began = self.clock()
                 info["refresh"] = self.refresh_for_stop(pod, self.clock())
+                self._tick(info, "refresh", began)
                 if info["refresh"] == REFRESH_USED:
+                    began = self.clock()
                     try:
                         res = self.run_hook(name)
                     except CloudError as e:
                         res = {"pushed": False, "wip_branch": None, "error": str(e)}
+                    self._tick(info, "hook", began)
+            began = self.clock()
             view = self._hook_view(res)   # every field text from the pod: a string, scrubbed, short
+            self._tick(info, "scrub", began)
             no_repo = res.get("no_repository") is True and not view["error"]   # no checkout in the pod: the launcher's own words, not the pod's
             if no_repo:
                 view["note"] = NO_REPOSITORY_NOTE
@@ -2291,16 +2324,20 @@ class Launcher:
             try:
                 note = self._mark(name, uid, hook_ran="true")
             finally:
+                began = self.clock()
                 self._remove(name, nonce, uid)  # the hook succeeded: whatever happens next, the pod and its Secrets go (that pod only)
+                self._tick(info, "delete", began)
             if note:
                 raise CloudError(note, EXIT_REFUSED)
             skipped, note = [], ""
+            began = self.clock()
             try:
                 raw = res.get("skipped")
                 skipped = [self.kube.scrub(x, 200) for x in raw][:50] if isinstance(raw, list) else []
                 note = NO_REPOSITORY_NOTE if no_repo else self.kube.scrub(res.get("note") or "")
             except Exception:  # output handling never undoes the stop
                 pass
+            self._tick(info, "scrub", began)
             if no_repo:
                 print("cloud-worker: end hook: %s" % note, file=sys.stderr)
             elif note:
