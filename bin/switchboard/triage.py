@@ -1106,7 +1106,9 @@ def triage_pass(engine, decisions, now, errors=()):
             entry["other_owner"] += rule == "OO"
             entry["oldest"] = max(entry["oldest"], now - state.verified.get(pair, state.first_seen[pair]))
     findings.sort()
-    state.present = {(r, ref) for r, ref, _ in findings} | held   # #1542: what the delivery re-check reads; absent until a pass has run
+    seen_all = (not any(unchecked_units.values()) and not state.unreadable and not truncated and unchecked == 0
+                and all((state.units.get((r, u)) or {}).get("error", True) is None and now - state.units[(r, u)]["at"] < TRIAGE_TTL for r in repos for u in units))   # every unit of every repository read this pass (a failed refresh keeps the old copy with an error; one not refreshed is past its TTL)
+    state.present = ({(r, ref) for r, ref, _ in findings} | held) if seen_all else None   # #1542: what the delivery re-check reads, only after a pass that saw every unit it judges; else None (the item is kept, marked unverified)
     day = int(now // 86400)
     counts, other_owner = {}, 0
     for rule, ref, evidence in findings:

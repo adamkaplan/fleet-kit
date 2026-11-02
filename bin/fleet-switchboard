@@ -10593,7 +10593,9 @@ def sweep_decisions(engine, decisions, now, errors=()):
                 engine._note("sweep.dismissed", pair[1], {"kind": pair[0], "ref": pair[1],
                                                           "why": "a fresh read does not bear it out"})
     findings.sort()
-    state.present = set(findings) | held   # #1542: what the delivery re-check reads; absent until a pass has run
+    seen_all = (unchecked == 0 and whole_list and not defer and not state.s5_unchecked
+                and all(r in state.repos and not state.repos[r].get("truncated") and not state.repos[r].get("error") for r in repos))
+    state.present = (set(findings) | held) if seen_all else None   # #1542: what the delivery re-check reads, only after a pass that saw everything it judges; else None (the item is kept, marked unverified)
     day = int(now // 86400)
     due = [(k, r) for k, r in findings
            if cfg["enabled"] and now - state.alarmed.get((k, r), 0) >= cfg["realarm_hours"] * 3600]   # what is queued this pass

@@ -221,6 +221,101 @@ class TestDropStaleOnce(RealPasses):
         self.assertEqual([len(keys) for keys in self.offered], [1, 0], msg="the dropped digest was offered again")
 
 
+class TestUnreadUnitKeepsTheItem(RealPasses):
+    """Sixth amendment (2): a pass that did not see everything it judges holds no present state, so the item is delivered marked unverified, never dropped as cleared."""
+
+    UNVERIFIED = "[unverified: its present state could not be read]"
+
+    def sweep_fact_then_a_pass_that_cannot_read(self, readable):
+        self.hub.open = {1: sweep_issue(1, "intro\n## Decision required\nPick one")}
+        self.sweep_pass()
+        self.assertEqual(len(self.engine.sweep.facts), 1, msg="the real sweep made no fact")
+        self.hub.open = {}   # the finding is gone ...
+        self.engine.sweep.confirmed.clear()
+        if not readable:   # ... and the next pass cannot read the repository to see it
+            def down(*args, **kwargs):
+                raise sb.GitHubUnavailable("HTTP 502: down")
+            self.hub.read_pages = down
+        self.sweep_pass(tick=sb.SWEEP_TTL + 1)
+
+    def test_a_sweep_pass_that_could_not_read_a_repository_keeps_its_fact_marked_unverified(self):
+        self.sweep_fact_then_a_pass_that_cannot_read(readable=False)
+        self.assertTrue(self.engine.sweep.repos["acme/api"].get("error"), msg="the pass did not see the repository as unreadable")
+        self.assertIsNone(self.engine.sweep.present)
+        self.deliver()
+        self.assertEqual(self.dropped(), [], msg="a fact was dropped on a pass that read nothing")
+        self.assertEqual(len(self.texts()), 1)
+        self.assertIn(self.UNVERIFIED, self.texts()[0])
+
+    def test_a_sweep_pass_that_read_everything_still_drops_the_cleared_fact(self):   # the control of the case above
+        self.sweep_fact_then_a_pass_that_cannot_read(readable=True)
+        self.assertEqual(self.engine.sweep.present, set())
+        self.deliver()
+        self.assertEqual(self.texts(), [])
+        self.assertEqual([e["detail"]["kind"] for e in self.dropped()], ["sweep"])
+
+
+class TestUnreadUnitKeepsTheDigest(RealPasses):
+    """The same for the triage: the REAL triage_pass, its REAL digest, a unit that cannot be read."""
+
+    def setUp(self):
+        super().setUp()
+        self.world = World(self, agents=(), config={"github_repos": ["acme/api"]})
+        self.world.add_agent("cos", fleet={"role": "chief-of-staff"})
+        self.world.add_agent("orch", fleet={"role": "orchestrator", "charter": 1, "repo": "acme/api"})
+        self.hub = FakeTriageHub()
+        self.hub.present_record = lambda *a: {}
+        self.engine = self.world.engine
+        self.engine.hub = self.hub
+        self.engine.config["awaiting_label"], self.engine.config["awaiting_cos_label"] = self.USER, self.COS
+        self.engine.config["triage"] = dict(sb.TRIAGE_DEFAULTS, repos=["acme/api"], our_logins=["bot"], enabled=True)
+        self.engine.discover(self.world.clock.now())
+        self.hub.open["acme/api"] = {}
+        self.add(1, created=30, updated=0.1, labels=["x:orchestrator", "kind"], assignees=["bot"], body="## Decision required\nx")
+        self.add(2, created=20, updated=0.1, parent=1, labels=["kind"], body="Next: go")
+        self.add(10, created=2, labels=["kind"])   # no assignee, no chain: T1
+
+    def add(self, number, **kw):
+        self.hub.open["acme/api"][number] = tri_issue(self.world.clock.now(), number, **kw)
+
+    def go(self, passes=10, tick=1):
+        for _ in range(passes):
+            self.world.tick(tick)
+            sb.decisions_from_notices(self.engine, self.world.clock.now())
+            sb.triage_pass(self.engine, [], self.world.clock.now(), ())
+
+    def make_digest(self):
+        self.go()
+        for key in [k for k in self.engine.triage.facts if "summary" in k]:
+            del self.engine.triage.facts[key]   # the daily summary is another fact: not the one under test
+        digests = list(self.engine.triage.facts)
+        self.assertTrue(digests, msg="the real triage pass made no digest: %r" % sorted(self.engine.triage.facts))
+        return digests
+
+    def test_a_triage_pass_with_a_unit_it_could_not_read_keeps_the_digest_marked_unverified(self):
+        self.make_digest()
+        self.assertIsNotNone(self.engine.triage.present, msg="a whole pass holds no present state")
+        del self.hub.open["acme/api"][10]   # the finding is resolved ...
+        self.hub.fail = ["/issues/comments"]   # ... and the comments unit cannot be read any more
+        self.go(passes=3, tick=sb.TRIAGE_TTL + 1)
+        self.assertIsNone(self.engine.triage.present)
+        self.deliver()
+        self.assertEqual(self.dropped(), [], msg="a digest was dropped on a pass that did not read a unit")
+        self.assertEqual(len(self.texts()), 1)
+        self.assertIn(self.UNVERIFIED, self.texts()[0])
+
+    UNVERIFIED = "[unverified: its present state could not be read]"
+
+    def test_a_triage_pass_that_read_every_unit_drops_the_cleared_digest(self):   # the control of the case above
+        self.make_digest()
+        del self.hub.open["acme/api"][10]
+        self.go(passes=3, tick=sb.TRIAGE_TTL + 1)
+        self.assertEqual(self.engine.triage.present & {("T1", "acme/api#10")}, set())
+        self.deliver()
+        self.assertEqual(self.texts(), [])
+        self.assertEqual([e["detail"]["kind"] for e in self.dropped()], ["triage"])
+
+
 class TestPassRecheckMutants(unittest.TestCase):
     """S9: three wrong builds, each caught by a test above (control first, the textual replacement asserted applied)."""
 
@@ -281,6 +376,37 @@ class TestPassRecheckMutants(unittest.TestCase):
             return text + "\nPLAN_DELAYED_AFTER = 1800\n" if path.name == "decision.py" else text
         result = self.run_case(name, [(Path, "read_text", second)])
         self.assertFalse(result.wasSuccessful(), msg="a second age constant went unnoticed")
+
+    def test_a_sweep_pass_that_sets_present_anyway_is_caught(self):
+        text = (Path(sb.__file__).resolve()).read_text()
+        start = text.index("def sweep_decisions(")
+        end = text.index("\n\n\ndef sweep_queue_fact")
+        old = "if seen_all else None"
+        self.assertEqual(text[start:end].count(old), 1, msg="the mutation target moved")
+        mutated = text[start:end].replace(old, "if True else None")
+        self.assertNotEqual(mutated, text[start:end], msg="the mutation was not applied")
+        ns = dict(vars(sb))
+        exec(compile(mutated, "sweep_decisions.py", "exec"), ns)
+        name = "TestUnreadUnitKeepsTheItem.test_a_sweep_pass_that_could_not_read_a_repository_keeps_its_fact_marked_unverified"
+        self.assertTrue(self.run_case(name, []).wasSuccessful(), msg="control failed")
+        result = self.run_case(name, [(sb, "sweep_decisions", ns["sweep_decisions"])])
+        self.assertFalse(result.wasSuccessful(), msg="a pass that sets present after an unread repository went unnoticed")
+
+    def test_a_triage_pass_that_sets_present_anyway_is_caught(self):
+        reminders = Path(sb.__file__).resolve().parent / "switchboard" / "triage.py"
+        text = reminders.read_text()
+        start = text.index("def triage_pass(")
+        end = text.index("\n\n\ndef triage_queue_fact")
+        old = "if seen_all else None"
+        self.assertEqual(text[start:end].count(old), 1, msg="the mutation target moved")
+        mutated = text[start:end].replace(old, "if True else None")
+        self.assertNotEqual(mutated, text[start:end], msg="the mutation was not applied")
+        ns = dict(vars(sb))
+        exec(compile(mutated, "triage_pass.py", "exec"), ns)
+        name = "TestUnreadUnitKeepsTheDigest.test_a_triage_pass_with_a_unit_it_could_not_read_keeps_the_digest_marked_unverified"
+        self.assertTrue(self.run_case(name, []).wasSuccessful(), msg="control failed")
+        result = self.run_case(name, [(sb, "triage_pass", ns["triage_pass"])])
+        self.assertFalse(result.wasSuccessful(), msg="a pass that sets present after an unread unit went unnoticed")
 
     def test_a_source_that_does_not_forget_a_dropped_fact_is_caught(self):
         name = "TestDropStaleOnce.test_a_dropped_sweep_fact_is_not_offered_again_and_has_one_audit_line_over_two_deliveries"
