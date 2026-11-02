@@ -366,7 +366,7 @@ class TestAgentShellCalls(Base):
         self.assertEqual((done.returncode, done.stdout.strip()), (7, "real gh out"))
 
     def test_s7_only_the_account_the_class_and_the_time_are_stored(self):
-        done = self.shim("api", "repos/acme/app/issues/5?token=queryvalue", "-f", "body=secretbody", env={"GH_TOKEN": "secrettoken"})
+        done = self.shim("api", "repos/acme/app/issues/5?token=queryvalue", "-f", "title=secretbody", env={"GH_TOKEN": "secrettoken"})
         text = (self.state / "agent-calls.jsonl").read_text()
         for leak in ("secrettoken", "faketoken", "secretbody", "queryvalue", "acme/app"):
             self.assertNotIn(leak, text)
