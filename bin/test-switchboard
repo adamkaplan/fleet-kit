@@ -29930,7 +29930,7 @@ class TestPlanLedger(LedgerBase):
 
     def test_evidence_is_redacted_and_clipped(self):
         secret = "ghp_" + "0123456789abcdefABCDEF0123"
-        code, out, err = self.run_as("coder", "prove", "S1", "--pr", self.PR, "--evidence", "token %s and %s" % (secret, "x" * 900))
+        code, out, err = self.run_as("coder", "prove", "S1", "--pr", self.PR, "--evidence", "token %s and %s" % (secret, "x" * 400))
         self.assertEqual(code, 0, err)
         evidence = self.ledger()[0]["evidence"]
         self.assertNotIn(secret, evidence)
@@ -67369,6 +67369,8 @@ TestWholeReadOfALargePullRequest = _changed_file_pages.load()
 
 _lm = importlib.import_module("test_launch_model"); _lm.HOST = sys.modules[__name__]; TestLaunchModel = _lm.build(); TestLaunchModelCloud = _lm.build_cloud()   # #1642
 TestPlanningDecision, TestConcurrencyGroup, TestGateLegs, TestGatePass, TestPlatformPaths, TestMacDocs = (_ml := importlib.import_module("test_mac_legs")).TestPlanningDecision, _ml.TestConcurrencyGroup, _ml.TestGateLegs, _ml.TestGatePass, _ml.TestPlatformPaths, _ml.TestDocs
+_el = importlib.import_module("test_evidence_limit"); _el.HOST = sys.modules[__name__]; TestEvidenceLimitLocal, TestEvidenceLimitItems, TestEvidenceLimitCounting, TestEvidenceLimitRelay, TestEvidenceLimitMutants, TestEvidenceLimitUnchanged, TestEvidenceLimitItemCi, TestEvidenceLimitDocsAndCode = _el.build()   # #1901
+_fl = importlib.import_module("test_field_limit"); _fl.HOST = sys.modules[__name__]; TestFieldLimitLocal, TestFieldLimitItems, TestFieldLimitRelay, TestFieldLimitCounting, TestFieldLimitMutants, TestFieldLimitUnchanged, TestFieldLimitDocsAndCode = _fl.build()   # #1905
 
 class TestTheArchitectureTestIsRun(unittest.TestCase):
     """CI runs this file and nothing else of the switchboard's tests: if the two lines above are removed, the architecture test would drop out of CI without a

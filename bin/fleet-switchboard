@@ -16904,7 +16904,7 @@ def tree_file_exists(runner=None):
 
 
 def _evidence(args):
-    text = plan_ledger.clip(redact_command_text(args.evidence), plan_ledger.EVIDENCE_LIMIT)
+    text = plan_ledger.bounded_text(redact_command_text(args.evidence), plan_ledger.EVIDENCE_LIMIT, "evidence")
     if not text:
         raise LedgerCommandError("--evidence is required: a link, or what you ran and saw")
     return text
@@ -16946,7 +16946,7 @@ def cmd_prove(args, runner, now):
             files = plan_ledger.proof_files(args.command, evidence, tree_file_exists(runner))
         entry = {"kind": "proof", "pr": ctx.pr, "scenario": sid, "plan_ref": ctx.source,
                  "plan_hash": ctx.plan["plan_hash"], "head": head, "result": args.result, "by": caller,
-                 "evidence": evidence, "command": plan_ledger.clip(redact_command_text(args.command or "")),
+                 "evidence": evidence, "command": plan_ledger.bounded_text(redact_command_text(args.command or ""), plan_ledger.FIELD_LIMIT, "command"),
                  **({"files": files} if files else {}),
                  "env": "%s %s" % (sys.platform, "python%d.%d" % sys.version_info[:2])}
         try:
@@ -17127,7 +17127,7 @@ def cmd_waive(args, runner, now):
     if who in writers:
         _gates_audit(engine, "gate.waiver.refused", pr, {"by": who, "why": "a writer of the PR"})
         raise LedgerCommandError("refused: %s wrote this PR (recorded its proof or sent its notice): a writer cannot waive its own gates" % who)
-    reason = plan_ledger.clip(redact_command_text(" ".join(args.reason.split())), plan_ledger.FIELD_LIMIT)
+    reason = plan_ledger.bounded_text(redact_command_text(" ".join(args.reason.split())), plan_ledger.FIELD_LIMIT, "reason")
     expires = int(now()) + plan_ledger.WAIVER_SECONDS
     entry = {"kind": "waiver", "pr": pr, "head": head, "gates": gates, "reason": reason, "by": who, "result": "pass",
              "expires": expires, "evidence": reason}
@@ -17516,7 +17516,7 @@ def cmd_item_prove(args, runner, now):
             print("already recorded proof #%d: %s %s at %s (%s)" % (found["seq"], sid, args.result, pin[:8], ctx.item))
             continue
         entry = {"kind": "proof", "pr": ctx.item, "scenario": sid, "plan_ref": ctx.source, "plan_hash": ctx.plan["plan_hash"], "head": pin, "result": args.result,
-                 "by": caller, "evidence": evidence, "command": plan_ledger.clip(redact_command_text(args.command or "")), "via": "item",
+                 "by": caller, "evidence": evidence, "command": plan_ledger.bounded_text(redact_command_text(args.command or ""), plan_ledger.FIELD_LIMIT, "command"), "via": "item",
                  "env": "%s %s" % (sys.platform, "python%d.%d" % sys.version_info[:2])}
         stored = plan_ledger.append_entry(ctx.state, entry, now())
         _item_audit(ctx, "plan.item.proof", {"scenario": sid, "result": args.result, "by": caller, "reference_commit": pin, "seq": stored["seq"]})
