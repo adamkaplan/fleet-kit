@@ -70,6 +70,25 @@ def check_s2(sbm):
     assert err is None and got == 1, "an issue that has a parent returns it"
 
 
+def check_fresh(sbm):
+    """An earlier issue() read left a cache entry that would answer "exists"; the issue now answers 404."""
+    answers = {"issue": ISSUE, "parent": sbm.IntentError("not_found", "gh: No parent issue found (HTTP 404)")}
+    paths = []
+    rd, stop = reader(sbm, answers, paths)
+    try:
+        rd.issue(3, REPO)
+        answers["issue"] = sbm.IntentError("not_found", "HTTP 404")
+        del paths[:]
+        try:
+            rd.parent(3, REPO, strict=True)
+            err = None
+        except sbm.IntentError as exc:
+            err = exc
+    finally:
+        stop()
+    assert err is not None and err.reason == "not_found" and not [p for p in paths if p.endswith("/parent")], "the issue read of the strict parent read is fresh (%r, %r)" % (err, paths)
+
+
 ENTRY_OLD = '''                if err.reason == "not_found":
                     return None
                 raise
@@ -104,6 +123,9 @@ class TestCharterNoParent(unittest.TestCase):
     def test_s2_the_missing_issue_and_every_other_failure_is_refused(self):
         check_s2(sb)
 
+    def test_the_issue_read_of_the_strict_parent_read_is_fresh(self):
+        check_fresh(sb)
+
     def test_s4_the_control_passes_and_each_mutant_fails_its_test(self):
         with tempfile.TemporaryDirectory() as tmp:
             control = mutant(tmp, "control", ENTRY_OLD, ENTRY_OLD)   # control first: the same text, unmutated
@@ -119,6 +141,10 @@ class TestCharterNoParent(unittest.TestCase):
                 check_s2(lines)
             self.assertIn("the missing issue is refused before the parent is asked", str(got.exception))
             check_s1(lines)
+            check_fresh(control)
+            with self.assertRaises(AssertionError, msg="the issue read of the strict parent read is fresh") as got:
+                check_fresh(lines)
+            self.assertIn("the issue read of the strict parent read is fresh", str(got.exception))
 
 
 def build(CharterRig, Base, TestCharterSetGuard):
