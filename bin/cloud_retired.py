@@ -230,9 +230,10 @@ class StepLimit(Exception):
 
 
 def _remove_hosts(text, steps=None):
-    """Remove a pod's host of the shape `worker-<=63 of [a-z0-9-]>.<=253 of [a-z0-9.-]>[:<=5 digits]`, with an optional `https://` or `http://` in front,
-    case-insensitively, by ONE linear scan (no backtracking, no step goes back). A start that does not complete is skipped by one character. Every
-    character examined adds one to `steps.n` (an object with `n` and `limit`; `n > limit` raises StepLimit): at most 330 per start."""
+    """Remove a pod's host `worker-<run of [a-z0-9-]>.<run of [a-z0-9.-]>[:<digits>]`, with an optional `https://` or `http://` in front, case-insensitively,
+    by ONE linear scan: exactly what the old regular expression removed, without its backtracking. Each run is read whole; a start that does not
+    complete JUMPS to the end of the run it read (every start inside that run would fail the same way), so a character is read a bounded number of
+    times. Every character examined adds one to `steps.n` (an object with `n` and `limit`; `n > limit` raises StepLimit)."""
     low, n, out, i, keep = text.lower(), len(text), [], 0, 0
 
     def tick(count):
@@ -247,34 +248,29 @@ def _remove_hosts(text, steps=None):
             tick(n - i)
             break
         tick(j - i + 1)
-        p = j + 7
-        k = p
-        while k < n and k - p < 63 and low[k] in _HOST_LABEL:
-            k += 1
-            tick(1)
+        p = k = j + 7
+        while k < n and low[k] in _HOST_LABEL: k += 1
+        tick(k - p)
         if k == p or k >= n or low[k] != ".":
-            i = j + 1
+            i = max(j + 1, k)
             continue
         k += 1
         q = k
-        while k < n and k - q < 253 and low[k] in _HOST_REST:
-            k += 1
-            tick(1)
+        while k < n and low[k] in _HOST_REST: k += 1
+        tick(k - q)
         if k == q:
-            i = j + 1
+            i = q
             continue
         if k < n and low[k] == ":":
             m = k + 1
-            while m < n and m - k - 1 < 5 and low[m] in "0123456789":
-                m += 1
-                tick(1)
+            while m < n and low[m] in "0123456789": m += 1
+            tick(m - k)
             if m > k + 1:
                 k = m
         start = j
-        tick(8)
-        if low.startswith("https://", j - 8) and j >= 8:
+        if j >= 8 and low.startswith("https://", j - 8):
             start = j - 8
-        elif low.startswith("http://", j - 7) and j >= 7:
+        elif j >= 7 and low.startswith("http://", j - 7):
             start = j - 7
         if start < keep:
             start = keep
