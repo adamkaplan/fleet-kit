@@ -271,7 +271,7 @@ class Entrypoint(unittest.TestCase):
 
 
 # S3: each copy under cloud/worker equals its source when the source is in this checkout; a missing source is skipped by name
-COPIES = [tuple(_l.split("\t")) for _l in open(os.path.join(ROOT, "cloud", "worker", "copies.tsv"), encoding="utf-8").read().splitlines() if _l]
+COPIES = [tuple(_l.split("\t")) for _l in __import__("pathlib").Path(ROOT, "cloud", "worker", "copies.tsv").read_text(encoding="utf-8").splitlines() if _l]
 
 
 def drift(root, source, copy):
