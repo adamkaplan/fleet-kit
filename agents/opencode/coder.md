@@ -1,6 +1,5 @@
 ---
 name: coder
-fleet-roles: coder, tester
 description: Ephemeral worker. One assignment, one git worktree. Writes the code, commits it, opens a PR, reports back honestly, exits.
 mode: primary
 model: __PROVIDER__/__MODEL_ID__
