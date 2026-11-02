@@ -591,10 +591,10 @@ class TestLauncherNamesAreKnown(unittest.TestCase):
             print("S3 report reader, %s: raises %d, exit %d, stderr lines %d, reason %r, priced lines %d" % (
                 shape, raises, code, len(err.splitlines()), reasons[shape], len(text.splitlines())))
 
-    def test_the_non_object_and_the_huge_audit_line_are_refused_with_one_named_line(self):
+    def test_the_non_object_audit_lines_are_refused_with_one_named_line(self):
         good = json.dumps(line("2026-10-14T06:00:00Z", "pod/cb-example-4", "stop", 1.0)) + "\n"
-        cases = {"non-object lines": good + "[1]\n5\n", "one line of 1 MiB": good + json.dumps({"note": "x" * (1024 * 1024)}) + "\n"}
-        reasons = {"non-object lines": "line 2: not an object", "one line of 1 MiB": "line 2: missing ts"}
+        cases = {"non-object lines": good + "[1]\n5\n"}
+        reasons = {"non-object lines": "line 2: not an object"}
         for shape, raw in cases.items():
             raises, code, err, text = self.run_report_on(REAL, raw)                  # control first
             self.assertEqual((raises, code, len(err.splitlines()), text), (0, 2, 1, ""), shape)
@@ -609,7 +609,23 @@ class TestLauncherNamesAreKnown(unittest.TestCase):
         m_raises, m_code, m_err, _ = self.run_report_on(load(scratch), cases["non-object lines"])
         self.assertEqual((m_raises, m_code), (0, 0), "a non-object line was not refused")
         print("S10 mutant non-object check skipped: raises %d, exit %s (control 2), mutation applied %s" % (m_raises, m_code, scratch != SOURCE))
-        print("S10 huge line: control only, no mutant claim (the reader has no length limit; the 1 MiB line is refused for its missing fields)")
+
+    def test_a_one_mib_valid_audit_line_is_read_and_costed(self):
+        first = json.dumps(line("2026-10-14T01:00:00Z", "pod/cb-example-4", "create", 0)) + "\n"
+        rec = line("2026-10-14T03:00:00Z", "pod/cb-example-4", "stop", 0.25)
+        rec["note"] = ""
+        pad = 1024 * 1024 - len(json.dumps(rec)) - 1
+        rec["note"] = "x" * pad
+        long_line = json.dumps(rec) + "\n"
+        self.assertEqual(len(long_line), 1024 * 1024)
+        raises, code, err, text = self.run_report_on(REAL, first + long_line)       # control first
+        cost_lines = [l for l in text.splitlines() if "pods: 1, pod-hours 2.00" in l]
+        print("S10 measure: 1 MiB valid line: exit %s, stdout lines %d, pod cost lines %d, stderr lines %d, raises %d" % (
+            code, len(text.splitlines()), len(cost_lines), len(err.splitlines()), raises))
+        self.assertEqual((raises, code, err), (0, 0, ""), "a long valid line was not costed")
+        self.assertEqual(len(cost_lines), 1, "a long valid line was not costed")
+        print("S10 a 1 MiB valid line is read and costed: control exit %d, one cost line for the pod; no mutant: the reader has no length rule (it reads whole lines by design; the 64 MB bound counts the file's characters), so any mutant would add a rule, not break a check that exists" % code)
+
 
     def test_a_report_that_skips_a_corrupt_line_is_caught(self):
         raw = self.tail_cases()["corrupt line in the middle"]
