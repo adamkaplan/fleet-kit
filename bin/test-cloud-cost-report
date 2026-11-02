@@ -665,56 +665,91 @@ def audit_scan_files():
     return found
 
 
-def audit_writes(text):
-    """(line, what) of each write_audit(...) call and each write-mode open / os.open / write_text / append whose path holds the audit path.
+# THE READERS: a call that gets the audit path (in any argument, positional or keyword, or as the receiver) is a write unless its callee is
+# on this CLOSED table (test_the_table_of_readers_is_closed lists it: a name added here changes that test).
+STDLIB_READERS = ("open", "Path.open", "os.path.exists", "os.path.isfile", "os.path.getsize", "os.path.join", "os.path.dirname", "os.path.basename",
+                  "os.path.abspath", "os.path.realpath", "os.path.expanduser", "os.stat", "Path.stat", "Path.exists", "Path.is_file",
+                  "Path.read_text", "Path.read_bytes", "Path", "str", "repr", "len", "print")   # open and Path.open only with no write mode
+ENV_LOOKUPS = ("os.environ.get", "os.getenv", "env.get")   # look the NAME of the variable up in the environment: they never open the file
+# The repository's own reading functions at the integration tip 0e4bb895: name -> (file, line of its def at that tip, the one reason).
+REPO_READERS = {
+    "scan_audit": ("bin/cloud_end_alert.py", 133, "reads the new stop lines from a cursor: os.stat and open(..., 'rb') only"),
+    "scan_turns": ("bin/cloud_end_alert.py", 215, "reads the audit tail for a turn pass: os.stat and open(..., 'rb') only"),
+    "_read_new": ("bin/lost_worker.py", 86, "reads new complete lines since a stored offset: os.stat and open(path, 'rb') only"),
+    "_at_end": ("bin/lost_worker.py", 281, "compares a stored offset with os.stat(path).st_size: no open"),
+    "_fold": ("bin/lost_worker.py", 116, "folds the lines already read (it gets the lines the reader returned, never the file)"),
+    "last_audit_line": ("cloud/launcher/cloud_worker.py", 1164, "reads the file's tail with open(path, 'rb') and returns the newest line of an action"),
+}
+READER_NAMES = STDLIB_READERS + ENV_LOOKUPS + tuple(REPO_READERS)
+AUDIT_CALLS = ("audit_path", "launcher_audit_path", "cloud_audit_path", "write_audit")   # calls that return or are the launcher's audit path
 
-    Limits that remain: a path built by a helper function is not followed, and a write by another process is not seen."""
+
+def audit_writes(text, readers=False):
+    """(line, kind) of each call that gets the launcher's audit path, or a variable assigned from it, in ANY argument (positional or
+    keyword) or as its receiver, UNLESS the callee is on the closed table of READERS (STDLIB_READERS, ENV_LOOKUPS, REPO_READERS; an open
+    with a write mode is not a reader). With readers=True the calls it lets pass are returned instead.
+
+    Scope (the one limit): a write by a program the repository's code does not start (an operator, another service) is outside what a
+    scan of source sees; a subprocess the code starts is inside it, since the audit path is in its arguments."""
     try:
         tree = ast.parse(text)
     except SyntaxError:
         return []
     tainted = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Assign) and any(m in ast.unparse(node.value) for m in CLOUD_AUDIT_MARKS):
-            tainted |= {ast.unparse(t) for t in node.targets}
 
     def holds(expr):
-        source = ast.unparse(expr)
-        return any(m in source for m in CLOUD_AUDIT_MARKS) or any(t in source for t in tainted)
+        for x in ast.walk(expr):
+            if isinstance(x, ast.Constant) and isinstance(x.value, str) and ("CW_CLOUD_AUDIT" in x.value or "/cw-cloud" in x.value):
+                return True
+            if isinstance(x, ast.Call) and ast.unparse(x.func).split(".")[-1] in AUDIT_CALLS:
+                return True
+            if isinstance(x, (ast.Name, ast.Attribute)) and ast.unparse(x) in tainted:
+                return True
+        return False
 
-    def write_flag(call, index):
-        modes = [a for a in call.args[index:index + 1] + [k.value for k in call.keywords if k.arg == "mode"]]
-        return any(isinstance(m, ast.Constant) and isinstance(m.value, str) and any(c in m.value for c in "awx+") for m in modes)
+    for _ in range(4):
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign) and holds(node.value):
+                tainted |= {ast.unparse(t) for t in node.targets}
 
-    hits = []
+    def mode_writes(call, index):
+        modes = call.args[index:index + 1] + [k.value for k in call.keywords if k.arg == "mode"]
+        return any(not (isinstance(m, ast.Constant) and isinstance(m.value, str)) or any(c in m.value for c in "awx+") for m in modes)
+
+    hits, passed = [], []
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
+        receiver = node.func.value if isinstance(node.func, ast.Attribute) else None
         name = node.func.attr if isinstance(node.func, ast.Attribute) else getattr(node.func, "id", "")
+        if name != "write_audit" and not any(holds(p) for p in node.args + [k.value for k in node.keywords] + ([receiver] if receiver is not None else [])):
+            continue
         dotted = ast.unparse(node.func)
+        reader = dotted.replace("pathlib.Path", "Path") in READER_NAMES or name in REPO_READERS or (receiver is not None and name in ("stat", "exists", "is_file", "read_text", "read_bytes", "open"))
+        kind = None
         if name == "write_audit":
-            hits.append((node.lineno, "write_audit"))
-        elif dotted == "open" and node.args and holds(node.args[0]) and write_flag(node, 1):
-            hits.append((node.lineno, "open for writing"))
-        elif dotted == "os.open" and node.args and holds(node.args[0]) and "O_" in ast.unparse(node.args[1:2]) and any(
-                f in ast.unparse(node.args[1]) for f in ("WRONLY", "RDWR", "APPEND", "CREAT")):
-            hits.append((node.lineno, "os.open with a write flag"))
-        elif name in ("write_text", "write_bytes") and isinstance(node.func, ast.Attribute) and holds(node.func.value):
-            hits.append((node.lineno, name))
-        elif dotted in ("shutil.copy", "shutil.copyfile", "shutil.copy2", "shutil.move") and len(node.args) > 1 and holds(node.args[1]):  # ext-copy
-            hits.append((node.lineno, "copy or move into the audit path"))  # ext-copy
-        elif (dotted.startswith("subprocess.") or dotted in ("os.system", "os.popen")) and node.args and holds(node.args[0]) and any(  # ext-proc
-                t in ast.unparse(node.args[0]) for t in ("tee", ">>")):  # ext-proc
-            hits.append((node.lineno, "subprocess with tee or >> on the audit path"))  # ext-proc
-        elif (dotted in ("os.rename", "os.replace") and len(node.args) > 1 and holds(node.args[1])) or (name in ("rename", "replace") and dotted not in ("os.rename", "os.replace") and isinstance(node.func, ast.Attribute) and node.args and holds(node.args[0])):  # ext-rename
-            hits.append((node.lineno, "rename or replace onto the audit path"))  # ext-rename
-        elif (dotted == "os.renames" and len(node.args) > 1 and holds(node.args[1])) or (  # ext-kw
-                (dotted in ("os.rename", "os.replace") or (name in ("rename", "replace") and isinstance(node.func, ast.Attribute))) and any(  # ext-kw
-                    k.arg in ("dst", "target") and holds(k.value) for k in node.keywords)):  # ext-kw
-            hits.append((node.lineno, "rename or replace onto the audit path"))  # ext-kw
-        elif name == "open" and isinstance(node.func, ast.Attribute) and holds(node.func.value) and write_flag(node, 0):
-            hits.append((node.lineno, "Path.open for writing"))
-    return hits
+            kind = "write_audit"
+        elif dotted == "open" and mode_writes(node, 1):
+            kind = "open for writing"
+        elif receiver is not None and name == "open" and mode_writes(node, 0):
+            kind = "Path.open for writing"
+        elif dotted == "os.open":
+            kind = "os.open with a write flag"
+        elif name in ("write_text", "write_bytes") and receiver is not None:
+            kind = name
+        elif dotted in ("shutil.copy", "shutil.copyfile", "shutil.copy2", "shutil.move"):  # ext-copy
+            kind = "copy or move into the audit path"  # ext-copy
+        elif dotted.startswith("subprocess.") or dotted in ("os.system", "os.popen"):  # ext-proc
+            kind = "subprocess with tee or >> on the audit path"  # ext-proc
+        elif dotted in ("os.rename", "os.replace", "os.renames", "os.link", "os.symlink") or (receiver is not None and name in ("rename", "replace")):  # ext-rename
+            kind = "rename, replace or link onto the audit path"  # ext-rename
+        elif not reader:
+            kind = "a call that gets the audit path"  # ext-default
+        if kind:
+            hits.append((node.lineno, kind))
+        else:
+            passed.append((node.lineno, dotted))
+    return passed if readers else hits
 
 
 # Writers of the audit file outside the launcher's own file: (file, function) -> reason. A write in any other function still fails.
@@ -898,6 +933,7 @@ COPY_SAMPLES = {
     "shutil.copyfile": "import shutil\nshutil.copyfile('x', '/var/cw-cloud/audit.jsonl')\n",
     "shutil.copy2": "import shutil, os\nshutil.copy2('x', os.environ['CW_CLOUD_AUDIT'])\n",
     "shutil.move": "import shutil, os\nshutil.move('x', os.environ['CW_CLOUD_AUDIT'])\n",
+    "dst= of shutil.move": "import shutil, os\nshutil.move('x', dst=os.environ['CW_CLOUD_AUDIT'])\n",
 }
 PROC_SAMPLES = {
     "tee list": "import subprocess, os\nsubprocess.run(['tee', '-a', os.environ['CW_CLOUD_AUDIT']])\n",
@@ -911,14 +947,71 @@ RENAME_SAMPLES = {
     "Path.replace": "import pathlib, os\npathlib.Path('x').replace(os.environ['CW_CLOUD_AUDIT'])\n",
     "os.renames": "import os\nos.renames('x', os.environ['CW_CLOUD_AUDIT'])\n",
     "dst=": "import os\nos.rename('x', dst=os.environ['CW_CLOUD_AUDIT'])\nos.replace('x', dst=os.environ['CW_CLOUD_AUDIT'])\n",
+    "new=": "import os\nos.renames('x', new=os.environ['CW_CLOUD_AUDIT'])\n",
+    "os.link": "import os\nos.link('x', os.environ['CW_CLOUD_AUDIT'])\n",
+    "os.symlink": "import os\nos.symlink('x', os.environ['CW_CLOUD_AUDIT'])\n",
     "target=": "import pathlib, os\npathlib.Path('x').rename(target=os.environ['CW_CLOUD_AUDIT'])\npathlib.Path('x').replace(target=os.environ['CW_CLOUD_AUDIT'])\n",
 }
-READER_SAMPLES = {
-    "read open": "import os\nopen(os.environ['CW_CLOUD_AUDIT'], 'r')\n",
-    "exists": "import os\nos.path.exists(os.environ['CW_CLOUD_AUDIT'])\n",
-    "rename elsewhere": "import os\nos.rename('x', '/tmp/other')\n",
-}
+AUDIT_EXPR = "os.environ['CW_CLOUD_AUDIT']"
+FROB_SAMPLE = "import os\nfrobnicate(os.environ['CW_CLOUD_AUDIT'])\n"
 HELPER_SAMPLE = "import os\n\ndef path():\n    return os.environ['CW_CLOUD_AUDIT']\n\nopen(path(), 'a')\n"
+READ_TEMPLATES = {
+    "open": "open(A, 'r')", "Path.open": "pathlib.Path('x').open('r', encoding=A)" , "os.path.exists": "os.path.exists(A)", "os.path.isfile": "os.path.isfile(A)",
+    "os.path.getsize": "os.path.getsize(A)", "os.path.join": "os.path.join(A, 'x')", "os.path.dirname": "os.path.dirname(A)",
+    "os.path.basename": "os.path.basename(A)", "os.path.abspath": "os.path.abspath(A)", "os.path.realpath": "os.path.realpath(A)",
+    "os.path.expanduser": "os.path.expanduser(A)", "os.stat": "os.stat(A)", "Path.stat": "pathlib.Path(A).stat()", "Path.exists": "pathlib.Path(A).exists()",
+    "Path.is_file": "pathlib.Path(A).is_file()", "Path.read_text": "pathlib.Path(A).read_text()", "Path.read_bytes": "pathlib.Path(A).read_bytes()",
+    "Path": "pathlib.Path(A)", "str": "str(A)", "repr": "repr(A)", "len": "len(A)", "print": "print(A)",
+    "os.environ.get": "os.environ.get('CW_CLOUD_AUDIT')", "os.getenv": "os.getenv('CW_CLOUD_AUDIT')", "env.get": "env = os.environ\nenv.get('CW_CLOUD_AUDIT')",
+}
+for _name in REPO_READERS:
+    READ_TEMPLATES[_name] = "%s(A, 'x')" % _name
+READER_SAMPLES = {k: "import os, pathlib\n" + v.replace("A", AUDIT_EXPR) + "\n" if k not in ("os.environ.get", "os.getenv", "env.get") else "import os\n" + v + "\n"
+                  for k, v in READ_TEMPLATES.items()}
+# a Path.open sample must not put the path in a mode: the sample above is rewritten to the plain form
+READER_SAMPLES["Path.open"] = "import os, pathlib\npathlib.Path(%s).open('r')\n" % AUDIT_EXPR
+READER_SAMPLES["os.environ.get"] = "import os\nos.environ.get('CW_CLOUD_AUDIT')\n"
+KIND_OF = {"os.rename": "rename, replace or link", "os.replace": "rename, replace or link", "Path.rename": "rename, replace or link",
+           "Path.replace": "rename, replace or link", "os.renames": "rename, replace or link", "dst=": "rename, replace or link",
+           "target=": "rename, replace or link", "new=": "rename, replace or link", "os.link": "rename, replace or link",
+           "os.symlink": "rename, replace or link", "shutil.copy": "copy or move", "shutil.copy2": "copy or move", "shutil.move": "copy or move",
+           "dst= of shutil.move": "copy or move", "tee list": "subprocess", "sh -c redirect": "subprocess", "frobnicate": "a call that gets the audit path"}
+
+
+def writer_samples():
+    out = {k: v for k, v in dict(COPY_SAMPLES, **RENAME_SAMPLES, **{"tee list": PROC_SAMPLES["tee list"], "sh -c redirect": PROC_SAMPLES["sh -c redirect"]}).items() if k != "shutil.copyfile"}
+    return out   # 16 writers
+
+
+def mutation(source, old, new):
+    """The text with `old` replaced by `new`, asserted to occur once; `applied` is computed from the TWO texts and asserted."""
+    assert source.count(old) == 1, "the text to remove must occur once"
+    changed = source.replace(old, new, 1)
+    applied = changed != source and old in source and old not in changed
+    if not applied:
+        raise AssertionError("the mutation was not applied")
+    return changed
+
+
+def load_guard(source):
+    scope = dict(globals())
+    exec(source, scope)
+    return scope["audit_writes"]
+
+
+def check_rule(fn):
+    """S12's check: the 16 writers and frobnicate are flagged (with the kind of their shape), no reader is."""
+    samples = dict(writer_samples(), frobnicate=FROB_SAMPLE)
+    for shape, text in samples.items():
+        hits = fn(text)
+        kinds = [h[1] for h in hits]
+        expected = [n for n, line in enumerate(text.splitlines(), 1) if "(" in line and ("CW_CLOUD_AUDIT" in line or "TARGET" in line)]
+        if [h[0] for h in hits] != expected or not all(KIND_OF.get(shape if shape in KIND_OF else "frobnicate", "") in k for k in kinds):
+            prefix = "a rename onto the audit path was not flagged; " if KIND_OF.get(shape, "").startswith("rename") else ""
+            raise AssertionError("%sa call that gets the audit path was not flagged: %s (shapes missed: %s)" % (prefix, shape, ", ".join(KIND_OF.get(shape, "") and [KIND_OF[shape]] or ["none named"])))
+    for name, text in READER_SAMPLES.items():
+        if fn(text):
+            raise AssertionError("a reader was flagged: %s" % name)
 
 
 class TestWriterGuardShapes(unittest.TestCase):
@@ -935,7 +1028,7 @@ class TestWriterGuardShapes(unittest.TestCase):
             self.assertIn("subprocess", hits[0][1])
         self.assertEqual(audit_writes("import subprocess\nsubprocess.run(['tee', '-a', '/tmp/other'])\n"), [])
 
-    def test_the_extension_mutants_are_not_flagged(self):
+    def test_the_shape_branches_name_their_kind_and_the_default_rule_catches_the_rest(self):
         import inspect
         source = inspect.getsource(audit_writes)
         for mark, samples in (("ext-copy", COPY_SAMPLES), ("ext-proc", PROC_SAMPLES)):
@@ -943,58 +1036,84 @@ class TestWriterGuardShapes(unittest.TestCase):
             kept = [l for l in lines if "# " + mark not in l]
             self.assertLess(len(kept), len(lines))
             scope = dict(globals())
-            exec("\n".join(kept).replace("elif name == \"open\" and", "elif name == \"open\" and", 1), scope)
+            exec("\n".join(kept), scope)
             for shape, text in samples.items():
                 self.assertTrue(audit_writes(text), shape)
-                self.assertEqual(scope["audit_writes"](text), [], "%s: mutant must not flag" % shape)
+                self.assertEqual([h[1] for h in scope["audit_writes"](text)], ["a call that gets the audit path"] * len(audit_writes(text)), shape)
+
+    def test_the_table_of_readers_is_closed(self):
+        self.assertEqual(sorted(READER_NAMES), sorted([
+            "open", "Path.open", "os.path.exists", "os.path.isfile", "os.path.getsize", "os.path.join", "os.path.dirname", "os.path.basename",
+            "os.path.abspath", "os.path.realpath", "os.path.expanduser", "os.stat", "Path.stat", "Path.exists", "Path.is_file", "Path.read_text",
+            "Path.read_bytes", "Path", "str", "repr", "len", "print", "os.environ.get", "os.getenv", "env.get",
+            "scan_audit", "scan_turns", "_read_new", "_at_end", "_fold", "last_audit_line"]))
+        self.assertEqual(len(READER_NAMES), len(set(READER_NAMES)))
+        for name, (rel, line, reason) in REPO_READERS.items():
+            self.assertIn("def %s(" % name, (ROOT / rel).read_text(), name)
+            self.assertTrue(reason and line > 0)
+        self.assertEqual(sorted(READER_SAMPLES), sorted(READ_TEMPLATES))
+        self.assertEqual(len(READER_SAMPLES), len(READER_NAMES))
 
     def test_a_path_built_by_a_helper_function_is_not_seen(self):
-        # a stated limit: the guard is syntactic and does not follow a helper's return value
+        # a stated limit until scenario S14: the guard does not follow a helper's return value
         self.assertEqual(audit_writes(HELPER_SAMPLE), [])
 
 
 class TestRenameOntoTheAuditPath(unittest.TestCase):
-    def test_s11_rename_and_replace_shapes_with_a_mutant(self):
+    def test_s11_s12_s13_the_rule_and_its_mutants(self):
         import inspect
-        writers = dict(COPY_SAMPLES, **RENAME_SAMPLES)
-        writers["shutil.copy2 metadata"] = writers.pop("shutil.copy2")
-        writers["tee list"] = PROC_SAMPLES["tee list"]
-        writers["shell redirect"] = PROC_SAMPLES["sh -c redirect"]
-        del writers["shutil.copyfile"]
-
-        def check(fn):
-            for shape, text in RENAME_SAMPLES.items():
-                hits = fn(text)
-                if [h[0] for h in hits] != list(range(2, text.count("\n") + 1)) or "rename or replace" not in hits[0][1]:
-                    raise AssertionError("a rename onto the audit path was not flagged: " + shape)
-        check(audit_writes)  # control, first
-        source = inspect.getsource(audit_writes)
-        lines = source.splitlines()
-        kept = [l for l in lines if "# ext-rename" not in l]
-        self.assertEqual(len(lines) - len(kept), 2)
-        scope = dict(globals())
-        exec("\n".join(kept), scope)
-        applied = len(kept) < len(lines)
-        with self.assertRaises(AssertionError) as ctx:
-            check(scope["audit_writes"])
-        self.assertIn("a rename onto the audit path was not flagged", str(ctx.exception))
-        kept2 = [l for l in lines if "# ext-kw" not in l]
-        self.assertEqual(len(lines) - len(kept2), 4)
-        scope2 = dict(globals())
-        exec("\n".join(kept2), scope2)
-        applied2 = len(kept2) < len(lines)
-        with self.assertRaises(AssertionError) as ctx2:
-            check(scope2["audit_writes"])
-        self.assertIn("a rename onto the audit path was not flagged: os.renames", str(ctx2.exception))
-        flagged = sum(1 for t in writers.values() if audit_writes(t))
+        writers = writer_samples()
+        self.assertEqual(len(writers), 16)
+        check_rule(audit_writes)  # control, first
+        flagged = sum(1 for t in dict(writers, frobnicate=FROB_SAMPLE).values() if audit_writes(t))
         readers = sum(1 for t in READER_SAMPLES.values() if audit_writes(t))
-        self.assertEqual((len(writers), flagged, readers), (12, 12, 0))
+        self.assertEqual((flagged, readers, len(READER_SAMPLES)), (17, 0, len(READER_NAMES)))
+        source = inspect.getsource(audit_writes)
+        # S13, copy 1: without the default rule
+        old1 = '        elif not reader:\n            kind = "a call that gets the audit path"  # ext-default\n'
+        changed1 = mutation(source, old1, "")
+        applied1 = changed1 != source and old1 in source and old1 not in changed1
+        with self.assertRaises(AssertionError) as c1:
+            check_rule(load_guard(changed1))
+        self.assertIn("a call that gets the audit path was not flagged: frobnicate", str(c1.exception))
+        # copy 2: without the renames and links branch
+        old2 = [l for l in source.splitlines(True) if "# ext-rename" in l]
+        self.assertEqual(len(old2), 2)
+        changed2 = mutation(source, "".join(old2), "")
+        applied2 = changed2 != source and "".join(old2) in source and "".join(old2) not in changed2
+        with self.assertRaises(AssertionError) as c2:
+            check_rule(load_guard(changed2))
+        self.assertIn("a call that gets the audit path was not flagged: ", str(c2.exception))
+        self.assertIn("a rename onto the audit path was not flagged", str(c2.exception))
+        # a no-op mutation fails the computation
+        with self.assertRaises(AssertionError) as c3:
+            mutation(source, old1, old1)
+        self.assertIn("the mutation was not applied", str(c3.exception))
+        self.assertTrue(applied1 and applied2)
         for text in ("import os\nos.renames('x', '/tmp/o')\n", "import os\nos.rename('x', dst='/tmp/o')\n", "import pathlib\npathlib.Path('x').rename(target='/tmp/o')\n"):
             self.assertEqual(audit_writes(text), [])
-        # a rename onto another path with an audit-path source is not a write onto it
-        self.assertEqual(audit_writes("import os\nos.rename(os.environ['CW_CLOUD_AUDIT'], '/tmp/o')\n"), [])
-        print("S11: flagged %d of %d writers, %d of %d readers; control passes 1 of 1, mutant 1 fails 1 of 1, mutant 2 fails 1 of 1 with the text, mutations applied %s" % (
-            flagged, len(writers), readers, len(READER_SAMPLES), applied and applied2))
+        print("S11: flagged %d of %d writers, %d of %d readers; control passes 1 of 1, copy without the rename shapes fails 1 of 1 with the text, mutation applied %s" % (
+            flagged - 1, len(writers), readers, len(READER_SAMPLES), applied2))
+        print("S12: flagged %d of %d writers (the 16 and frobnicate), %d of %d readers flagged (N counted from the table: %d stdlib, %d environment, %d repository readers)" % (
+            flagged, len(writers) + 1, readers, len(READER_NAMES), len(STDLIB_READERS), len(ENV_LOOKUPS), len(REPO_READERS)))
+        print("S13: control passes 1 of 1; copy without the default rule fails 1 of 1 (frobnicate), copy without the renames and links fails 1 of 1, applied %s and %s computed from the two texts, no-op mutation fails the computation 1 of 1" % (applied1, applied2))
+
+    def test_s12_the_tip_has_only_allowed_writers_and_listed_readers(self):
+        files = audit_scan_files()
+        writers = passed = unlisted = 0
+        for rel, text in files:
+            hits = audit_writes(text)
+            if rel == WRITER_FILE:
+                self.assertEqual({h[1] for h in hits}, {"write_audit"}, "the launcher's own writer only writes through write_audit")
+                writers += len(hits)
+                continue
+            allowed = [h for h in hits if (rel, enclosing_function(text, h[0])) in ALLOWED_WRITERS]
+            writers += len(allowed)
+            unlisted += len(hits) - len(allowed)
+            passed += len(audit_writes(text, readers=True))
+        print("S12 tip: %d allowed writers, %d reader calls, %d unlisted" % (writers, passed, unlisted))
+        self.assertEqual(unlisted, 0)
+        self.assertGreater(passed, 0)
 
 
 def mock_stderr(stream):
