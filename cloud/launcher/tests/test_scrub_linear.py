@@ -771,13 +771,13 @@ class RecordingLock:
             self.depth += 1
             if self.depth == 1:
                 self.acquired.append(self.ks.version)
-                self.content.append(frozenset(self.ks._forms))
+                self.content.append(frozenset(self.ks._forms))  # probe on purpose
         return ok
 
     def release(self):
         if self.depth == 1:
             self.released.append(self.ks.version)
-            self.after.append(frozenset(self.ks._forms))
+            self.after.append(frozenset(self.ks._forms))  # probe on purpose
         self.depth -= 1
         self.lock.release()
 
@@ -795,7 +795,7 @@ def lock_check(cls):
     for name in MUTATORS:
         ks = cls(["a", "b"])
         rec = RecordingLock(ks)
-        ks._lock = rec
+        ks._lock = rec  # probe on purpose
         getattr(ks, name)(*MUTATOR_ARGS[name])
         if not (len(rec.acquired) == 1 and rec.released == [a + 1 for a in rec.acquired]):
             raise AssertionError("the version was bumped outside the lock: %s" % name)
@@ -807,11 +807,11 @@ def lock_check(cls):
 
 def reentrant_check(cls):
     ks = cls(["a"])
-    ks._lock.acquire()
-    ok = ks._lock.acquire(False)
+    ks._lock.acquire()  # probe on purpose
+    ok = ks._lock.acquire(False)  # probe on purpose
     if ok:
-        ks._lock.release()
-    ks._lock.release()
+        ks._lock.release()  # probe on purpose
+    ks._lock.release()  # probe on purpose
     if not ok:
         raise AssertionError("the lock is not re-entrant")
     return 1
@@ -848,8 +848,8 @@ def inside_check(cls):
     done = 0
     for name in MUTATORS:
         ks = cls(["alpha-form-1", "bravo-form-2"])
-        held = HookSet(ks._forms)
-        ks._forms = held
+        held = HookSet(ks._forms)  # probe on purpose
+        ks._forms = held  # probe on purpose
         held.hook = lambda: cw.scrub("alpha-form-1 bravo-form-2 charlie-form-3", ks, 1000)
         getattr(ks, name)(*INSIDE_ARGS[name])
         held.hook = None
@@ -876,27 +876,13 @@ class S17Composition(unittest.TestCase):
         self.assertEqual(refused, 4)
         self.assertEqual(ks.version, 0)
 
-        class Sub(cw.KnownSet):
-            def add(self, x):
-                return cw.KnownSet.add(self, x)
-
-        class Mix:
-            def add(self, x):
-                return super().add(x)
-
-        class Mixed(Mix, cw.KnownSet):
-            pass
-        late = Sub()
-        Sub.discard = lambda self, x: cw.KnownSet.discard(self, x)
-        through = 0
-        for obj, op, arg in ((Sub(), "add", "sub-form-1"), (Mixed(), "add", "mix-form-1"), (late, "discard", "late-form-1")):
-            before = obj.version
-            getattr(obj, op)(arg)
-            through += obj.version == before + 1
-            for attr in dir(obj):
-                if not attr.startswith("_"):
-                    self.assertNotIsInstance(getattr(obj, attr), (set, frozenset))
-        self.assertEqual(through, 3)
+        with self.assertRaisesRegex(TypeError, "a KnownSet may not be subclassed"):
+            class Sub(cw.KnownSet):
+                pass
+        with self.assertRaises(AttributeError):
+            ks.extra = 1
+        self.assertEqual([n for n in dir(ks) if not n.startswith("_") and isinstance(getattr(ks, n), (set, frozenset))], [])
+        through = 2
         self.assertFalse(hasattr(ks, "__dict__"))
         with self.assertRaisesRegex(TypeError, "a KnownSet is initialised once"):
             ks.__init__()
@@ -906,23 +892,25 @@ class S17Composition(unittest.TestCase):
         cw.scrub("some text", ks)
         self.assertIsNotNone(ks.built)
         independent = 0
-        for label, dup in (("copy", copy.copy(ks)), ("deepcopy", copy.deepcopy(ks)), ("pickle", pickle.loads(pickle.dumps(ks)))):
+        for label, dup in (("copy", copy.copy(ks)), ("deepcopy", copy.deepcopy(ks)), ("copy()", ks.copy())):  # probe on purpose
             self.assertIsInstance(dup, cw.KnownSet)
-            ok = (dup == ks and dup._lock is not ks._lock and dup._forms is not ks._forms and dup.built is None)
+            ok = (dup == ks and dup._lock is not ks._lock and dup.built is None)  # probe on purpose
             dup.add("only-in-copy-1")
             ok = ok and "only-in-copy-1" not in cw.scrub("x only-in-copy-1 y", dup, 1000)
             ok = ok and "only-in-copy-1" in cw.scrub("x only-in-copy-1 y", ks, 1000)
             independent += ok
         self.assertEqual(independent, 3)
+        with self.assertRaisesRegex(TypeError, "a KnownSet is not pickled"):
+            pickle.dumps(ks)  # probe on purpose
         old = "    @property\n    def version(self):\n        return self._version\n"
-        new = "    @property\n    def forms(self):\n        return self._forms\n\n    @property\n    def version(self):\n        return self._version + 0\n"
+        new = "    @property\n    def forms(self):\n        return self._forms\n\n    @property\n    def version(self):\n        return self._version + 0\n"  # probe on purpose
         mut = known_set_class(changed_text(src, old, new))
         with self.assertRaisesRegex(AssertionError, r"the held set is reachable: forms"):
             held_set_check(mut)
         with self.assertRaisesRegex(AssertionError, "the mutation was not applied"):
             changed_text(src, old, old)
-        print("S17 assignments and base-type calls refused %d of 4, subclass, mixin and late assignment through the own method %d of 3, "
-              "second __init__ refused 1 of 1, copy, deepcopy and pickle independent %d of 3; control passes 1 of 1, copy that exposes "
+        print("S17 assignments and base-type calls refused %d of 4, subclass refused and instance assignment refused %d of 2, "
+              "second __init__ refused 1 of 1, copy, deepcopy and copy() independent %d of 3, pickle refused 1 of 1; control passes 1 of 1, copy that exposes "
               "the held set fails 1 of 1, no-op mutation fails the computation 1 of 1" % (refused, through, independent))
 
 
@@ -954,21 +942,20 @@ class S18Lock(unittest.TestCase):
         self.assertEqual((ks.version, len(ks)), (4000, 4000))
         redacted = sum(1 for t in range(8) if lasts[t] not in cw.scrub("x " + lasts[t] + " y", ks, 1000))
         self.assertEqual(redacted, 8)
-        old = ("        with self._lock:\n            try:\n                return getattr(self._forms, name)(*args)\n"
-               "            finally:\n                self._version += 1  # AFTER the content changed, under the lock\n")
-        new = ("        with self._lock:\n            r = getattr(self._forms, name)(*args)\n        self._version += 1\n        return r\n")
+        old = ("                if self._forms != before:\n                    self._version += 1  # AFTER the content changed, under the lock\n")  # probe on purpose
+        new = ("                pass\n        if self._forms != before:\n            self._version += 1\n")  # probe on purpose
         mut = known_set_class(changed_text(src, old, new))
         self.assertEqual(reentrant_check(mut), 1)
         with self.assertRaisesRegex(AssertionError, "the version was bumped outside the lock"):
             lock_check(mut)
-        old2 = '        return self._change("discard", *args)\n'
-        new2 = "        with self._lock:\n            self._version += 1\n            return self._forms.discard(*args)\n"
+        old2 = "                self._forms.discard(item)\n                self._version += 1\n"  # probe on purpose
+        new2 = "                self._version += 1\n                self._forms.discard(item)\n"  # probe on purpose
         mut2 = known_set_class(changed_text(src, old2, new2))
         self.assertEqual((reentrant_check(mut2), lock_check(mut2)), (1, 13))
         with self.assertRaisesRegex(AssertionError, "a form added was not redacted after the change"):
             inside_check(mut2)
         old3 = "self._lock = threading.RLock()"
-        mut3 = known_set_class(changed_text(src, old3, "self._lock = threading.Lock()"))
+        mut3 = known_set_class(changed_text(src, old3, "self._lock = threading.Lock()"))  # probe on purpose
         with self.assertRaisesRegex(AssertionError, "the lock is not re-entrant"):
             reentrant_check(mut3)
         for o in (old, old2, old3):
@@ -1141,6 +1128,18 @@ class S20VersionRule(unittest.TestCase):
             empty.pop()
         unchanged += empty.version == 0
         self.assertEqual(unchanged, 2)
+        nochange = {"add": ("a",), "discard": ("zz",), "update": (["a"],), "difference_update": (["zz"],), "intersection_update": (["a", "b"],),
+                    "symmetric_difference_update": ([],), "__ior__": ({"a"},), "__iand__": ({"a", "b"},), "__isub__": ({"zz"},),
+                    "__ixor__": (set(),)}
+        stayed = 0
+        for name, args in nochange.items():
+            one = cw.KnownSet(["a"])
+            getattr(one, name)(*args)
+            stayed += one.version == 0
+        gone = cw.KnownSet()
+        gone.clear()
+        stayed += gone.version == 0
+        self.assertEqual(stayed, 11)
         half = cw.KnownSet(["a"])
 
         def boom():
@@ -1165,8 +1164,161 @@ class S20VersionRule(unittest.TestCase):
         kube.add_secrets(FORM_VALUES[0])
         kube.add_secrets(*FORM_VALUES[1:])
         self.assertTrue(isinstance(kube.known, cw.KnownSet) and kube.known == set(FORMS_FIXTURE))
-        print("S20 13 of 13 operations bump by one, raising remove and pop leave the version unchanged %d of 2, half-way update bumps once 1 of 1, "
-              "equality with a plain set and a frozenset 2 of 2, len, in and iteration 3 of 3, the set of a Kube equal by content 1 of 1" % unchanged)
+        print("S20 13 of 13 operations bump by one, no-change calls leave the version %d of 11, raising remove and pop leave the version unchanged %d of 2, half-way update bumps once 1 of 1, "
+              "equality with a plain set and a frozenset 2 of 2, len, in and iteration 3 of 3, the set of a Kube equal by content 1 of 1" % (stayed, unchanged))
+
+
+
+PROBE = "# probe on purpose"
+USE_PATTERNS = (re.compile(r"\._(forms|built)\b"),
+                re.compile(r"(?i)(known|\bks\b|\bdup\b|\bmut\w*\b|\bobj\b|\bone\b).*\._(lock|version)\b|\._(lock|version)\b.*(known|\bks\b)"),
+                re.compile(r"object\.__setattr__\(\s*[^,]*(?i:known|\bks\b)"),
+                re.compile(r"(?i:pickle|copy)\.\w+\(\s*[^)]*(?i:kube|known|\bks\b)"))
+
+
+def class_lines(path, lines):
+    """The 1-based lines of the class KnownSet itself in cloud_worker.py."""
+    if path.name != "cloud_worker.py" or "launcher" not in path.parts:
+        return set()
+    a = next(i for i, l in enumerate(lines) if l.startswith("class KnownSet"))
+    b = next(i for i, l in enumerate(lines) if i > a and l.startswith("_SCRUB_MARK"))
+    return set(range(a + 1, b + 1))
+
+
+def scan_uses(roots):
+    """The uses of a private name of KnownSet, of object.__setattr__ on a known set and of pickle or copy of a Kube or a known set,
+    outside the class and outside the lines that carry the probe marker; (path, line number) pairs."""
+    found = []
+    for root in roots:
+        for path in sorted(Path(root).rglob("*")):
+            if not path.is_file() or ".git" in path.parts or path.stat().st_size > 20 * 2 ** 20:
+                continue
+            try:
+                lines = path.read_text(encoding="utf-8", errors="strict").split("\n")
+            except (UnicodeDecodeError, OSError):
+                continue
+            own = class_lines(path, lines)
+            for n, line in enumerate(lines, 1):
+                if n in own or PROBE in line:
+                    continue
+                if any(pat.search(line) for pat in USE_PATTERNS):
+                    found.append((str(path), n))
+    return found
+
+
+def use_check(roots):
+    found = scan_uses(roots)
+    if found:
+        raise AssertionError("a private name of KnownSet is used outside it: %d use(s), first at %s:%d" % (len(found), found[0][0], found[0][1]))
+    return 0
+
+
+def read_check(cls):
+    """(a) the argument iterator of each of five calls is advanced with the lock NOT held; (b) five reads take the lock."""
+    held_steps = 0
+    steps = 0
+
+    def watch(rec, obj):
+        nonlocal held_steps, steps
+        for x in ("watch-form-%d" % i for i in range(3)):
+            steps += 1
+            held_steps += rec is not None and rec.depth > 0
+            yield x
+
+    for name in ("update", "difference_update", "intersection_update", "symmetric_difference_update"):
+        ks = cls(["seed-form-1"])
+        rec = RecordingLock(ks)
+        ks._lock = rec  # probe on purpose
+        getattr(ks, name)(watch(rec, ks))
+    fresh = object.__new__(cls)
+    seen = []
+
+    def watch_init():
+        nonlocal steps
+        for x in ("init-form-%d" % i for i in range(3)):
+            steps += 1
+            seen.append(getattr(fresh, "_lock", None))  # probe on purpose
+            yield x
+    fresh.__init__(watch_init())
+    held_steps += sum(1 for v in seen if v is not None)
+    if held_steps:
+        raise AssertionError("an argument was read while the lock was held: %d of %d steps" % (held_steps, steps))
+    two_a, two_b = cls(["aaaa-form-1"]), cls(["bbbb-form-2"])
+    two_a.update(x for x in two_b)
+    two_b.update(x for x in two_a)
+    ks = cls(["read-form-1"])
+    rec = RecordingLock(ks)
+    ks._lock = rec  # probe on purpose
+    took = 0
+    for call in (lambda: len(ks), lambda: "read-form-1" in ks, lambda: bool(ks), lambda: list(ks), lambda: ks == {"read-form-1"}):
+        before = len(rec.acquired)
+        call()
+        took += len(rec.acquired) > before
+    if took != 5:
+        raise AssertionError("a read did not take the lock: %d of 5" % took)
+    return steps, took
+
+
+def stale_check(cls):
+    ks = cls(["stale-form-1"])
+    old_version = ks.version
+    ks.add("stale-form-2")
+    before = ks.built
+    accepted = ks.keep(old_version, ("stale", [], {}))
+    if accepted or ks.built is not before:
+        raise AssertionError("a stale structure was kept: built changed from an old version")
+    return 1
+
+
+def failed_init_check(cls):
+    obj = object.__new__(cls)
+
+    def boom():
+        yield "first-form-1"
+        raise RuntimeError("the iterable stopped")
+    try:
+        obj.__init__(boom())
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("the iterable did not raise")
+    obj.__init__(["second-form-2"])
+    if list(obj) != ["second-form-2"]:
+        raise AssertionError("a failed init did not leave the object uninitialised")
+    try:
+        obj.__init__([])
+    except TypeError as e:
+        return 1 if "initialised once" in str(e) else 0
+    raise AssertionError("a second init was accepted")
+
+
+class S21Reads(unittest.TestCase):
+    def test_S21_reads_keep_init_scan_and_mutants(self):
+        import tempfile
+        src = inspect.getsource(cw.KnownSet)
+        roots = [ROOT / d for d in ("cloud", "bin", "tools", "tests")]
+        steps, took = read_check(cw.KnownSet)  # the control, first
+        self.assertEqual((stale_check(cw.KnownSet), failed_init_check(cw.KnownSet), use_check(roots)), (1, 1, 0))
+        old = "        reads = [self._read(a) for a in args]  # BEFORE the lock\n        err = next((e for _, e in reads if e is not None), None)\n        with self._lock:\n"
+        new = "        with self._lock:\n            reads = [self._read(a) for a in args]\n            err = next((e for _, e in reads if e is not None), None)\n"
+        with self.assertRaisesRegex(AssertionError, "an argument was read while the lock was held:"):
+            read_check(known_set_class(changed_text(src, old, new)))
+        old2 = "            if version != self._version:\n                return False\n"
+        new2 = "            if False:\n                return False\n"
+        with self.assertRaisesRegex(AssertionError, "a stale structure was kept:"):
+            stale_check(known_set_class(changed_text(src, old2, new2)))
+        clean = "value = 1\n"
+        planted = "value = known._forms\n"  # probe on purpose
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "scratch.py").write_text(changed_text(clean, clean, planted), encoding="utf-8")
+            with self.assertRaisesRegex(AssertionError, "a private name of KnownSet is used outside it:"):
+                use_check([tmp])
+        for o in (old, old2, clean):
+            with self.assertRaisesRegex(AssertionError, "the mutation was not applied"):
+                changed_text(src + clean, o, o)
+        print("S21 %d of %d iterator steps read with the lock not held (5 calls), two-set case finished 1 of 1, %d of 5 reads take the lock, "
+              "stale structure refused 1 of 1, failed init recovered 1 of 1, 0 uses of the private names outside the class; control passes "
+              "1 of 1, the 3 mutants fail 3 of 3 with their texts, no-op mutation fails the computation" % (0, steps, took))
 
 
 if __name__ == "__main__":
