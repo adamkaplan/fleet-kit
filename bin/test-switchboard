@@ -78475,11 +78475,11 @@ class TestCiRecordCarry(LedgerBase):
         self.proofs()
         before = self.ledger_bytes()
         code, out, err = self.step()
-        self.assertEqual(code, 2, "a stale run carries no proof: " + err)   # the step records nothing for a stale run and exits 2
-        self.assertEqual(self.carried(), [], "a stale run carries no proof")
-        self.assertIn("commits behind", out + err)
-        self.assertIn("close and reopen the pull request for a fresh run", out + err)
-        self.assertEqual(self.ledger_bytes(), before, "the ledger bytes are unchanged by a stale run")
+        self.assertEqual(code, 2, "a stale run carries no proof: exit code: " + err)   # the step records nothing for a stale run and exits 2
+        self.assertEqual(self.carried(), [], "a stale run carries no proof: carried lines")
+        self.assertIn("commits behind", out + err, "the stale line is printed: the count")
+        self.assertIn("close and reopen the pull request for a fresh run", out + err, "the stale line is printed: the way to a fresh run")
+        self.assertEqual(self.ledger_bytes(), before, "the ledger bytes are unchanged")
 
     def test_S2_a_tests_and_documentation_only_head_carries(self):
         self.proofs(files=("src/widget.py",))

@@ -589,7 +589,7 @@ class TestCiFreshSeamMutants(FreshCase):
               (("TestCiRecordPass", "test_a_stale_run_records_no_verdict_and_says_the_stale_line", "ci-record records no verdict for a stale run"),
                ("TestPlanGatesCheck", "test_a_stale_run_makes_g4_missing_with_the_stale_line", "the G4 row is missing for a stale run"))),
              ("TestCiRecordCarry", "route", '"base": {"sha": self.run_base}} for n in (9, 11)]}', '"base": {"sha": "t" * 40}} for n in (9, 11)]}',
-              (("TestCiRecordCarry", "test_a_stale_run_carries_nothing_and_prints_the_stale_line", "a stale run carries no proof"),)),
+              (("TestCiRecordCarry", "test_a_stale_run_carries_nothing_and_prints_the_stale_line", "a stale run carries no proof: exit code"),)),
              ("BaselineWorld", "route", '"base": {"sha": self.run_base}} for n in self.prs]}', '"base": {"sha": "t" * 40}} for n in self.prs]}',
               (("TestDecisionBaselineNotices", "test_a_stale_run_reads_stale_in_the_notice_facts", "the panel notice facts read stale: 3 behind"),)),
              ("FakeGhPr", "__call__", '"base": {"sha": self.run_base}} for n in (7, 8)]}', '"base": {"sha": "t" * 40}} for n in (7, 8)]}',
