@@ -196,5 +196,61 @@ class TestOpenListDerivedText(Base):
         return path
 
 
+class TestOpenListCutsMutants(Base):
+    """S11 and S12 mutants: one textual replacement each in a copy of the entry, control first, the mutation asserted applied."""
+
+    def load(self, edit, tag):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        shutil.copytree(str(Path(__file__).resolve().parents[2] / "bin"), tmp, dirs_exist_ok=True)
+        copy_entry(tmp)
+        entry = Path(tmp) / "fleet-switchboard"
+        edited = edit(entry.read_text())
+        entry.write_text(edited)
+        return edited, _load("t_open_cuts_m_" + tag, entry)
+
+    def reads(self, mod, total):
+        hub = mod.GitHubHub.__new__(mod.GitHubHub)
+        hub.gh_api = lambda path, paginate=True, timeout=None: ([[{"number": n, "state": "open", "labels": [], "title": "t", "body": ""}
+                                                                  for n in range(total - (int(re.search(r"[?&]page=(\d+)", path).group(1)) - 1) * 100, 0, -1)][:100]]
+                                                                if "state=open" in path else [])
+        hub.read_open_pages("repos/acme/api/issues?state=open&per_page=100")
+        mod.triage_read_unit(hub, "acme/api", "issues", NOW, [100])
+
+    def run_pair(self, needle, replacement, tag, check):
+        _, control = self.load(lambda t: t, tag + "_control")
+        check(control)
+        applied = []
+
+        def mutate(text):
+            self.assertEqual(text.count(needle), 1)
+            applied.append(True)
+            return text.replace(needle, replacement, 1)
+        edited, mutant = self.load(mutate, tag)
+        self.assertTrue(applied)
+        self.assertIn(replacement, edited)
+        with self.assertRaises(AssertionError) as caught:
+            check(mutant)
+        return str(caught.exception)
+
+    def test_s11_a_build_that_alerts_at_each_read_fails_with_one_alert_for_five_reads(self):
+        def check(mod):
+            mod.take_open_cuts()
+            self.reads(mod, 2000)
+            self.assertEqual(mod.take_open_cuts(), ["acme/api"], msg="one alert for five reads: the reads note, the end of the pass alerts")
+        text = self.run_pair("    _OPEN_CUTS.add(repo)\n", "    try:\n        open_list_alert(None, repo, 0.0)   # the mutant: an alert at each read\n    except Exception:\n        pass\n", "s11", check)
+        self.assertIn("one alert for five reads", text)
+
+    def test_s12_a_set_never_emptied_fails_with_no_stale_cut(self):
+        def check(mod):
+            mod.take_open_cuts()
+            self.reads(mod, 2000)
+            self.assertEqual(mod.take_open_cuts(), ["acme/api"])
+            self.reads(mod, 300)
+            self.assertEqual(mod.take_open_cuts(), [], msg="no stale cut")
+        text = self.run_pair("    _OPEN_CUTS.clear()\n", "    pass\n", "s12", check)
+        self.assertIn("no stale cut", text)
+
+
 if __name__ == "__main__":
     unittest.main()
