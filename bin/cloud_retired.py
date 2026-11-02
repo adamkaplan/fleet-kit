@@ -221,7 +221,7 @@ LAST_HEAD = 3000                 # characters that go in the message
 LAST_FILE = 20000                # characters beyond the head that go in the file
 LAST_KEEP_SECONDS = 7 * 86400
 LAST_SCRUB_MAX = 200000          # the scrub's own input maximum (SCRUB_INPUT_MAX of the launcher): the cut before it
-_ENDPOINT_RE = re.compile(r"https?://worker-[a-z0-9-]+\.[a-z0-9.-]+(:[0-9]+)?")
+_ENDPOINT_RE = re.compile(r"https?://worker-[a-z0-9-]+\.[a-z0-9.-]+(:[0-9]+)?", re.I)
 _LAST_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,199}", re.ASCII)
 
 
@@ -243,27 +243,91 @@ def clean_last(base, now):
     return removed
 
 
+class _LastUnsafe(OSError):
+    """The directory of the last texts is a link, or not a directory, or not ours."""
+
+
 def _write_last(base, name, text):
-    """One private file: the directory 0700, the file 0600, O_NOFOLLOW, written to a temporary name and renamed (as `_write_private`)."""
+    """One private file: the directory is opened by a descriptor (O_NOFOLLOW|O_DIRECTORY), must be ours, and is tightened to 0700 when wider (PC-9 b);
+    the file 0600, O_NOFOLLOW, written to a temporary name and renamed inside that descriptor (as `_write_private`)."""
     base.mkdir(parents=True, mode=0o700, exist_ok=True)
-    if base.is_symlink():
-        raise OSError("the directory of the last texts is a link")
-    path = base / (name + ".txt")
-    temp = base / ("%s.txt.%d.tmp" % (name, os.getpid()))
-    fd = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0), 0o600)
     try:
-        with os.fdopen(fd, "w") as handle:
-            handle.write(text)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.rename(str(temp), str(path))
-    except BaseException:
+        dfd = os.open(str(base), os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0))
+    except OSError:
+        raise _LastUnsafe("the directory of the last texts is a link or not a directory") from None
+    try:
+        st = os.fstat(dfd)
+        if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
+            raise _LastUnsafe("the directory of the last texts is not ours")
+        if stat.S_IMODE(st.st_mode) & ~0o700:
+            os.fchmod(dfd, 0o700)
+        path = base / (name + ".txt")
+        temp = "%s.txt.%d.tmp" % (name, os.getpid())
+        fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0), 0o600, dir_fd=dfd)
         try:
-            os.unlink(str(temp))
-        except OSError:
-            pass
-        raise
+            with os.fdopen(fd, "w") as handle:
+                handle.write(text)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.rename(temp, name + ".txt", src_dir_fd=dfd, dst_dir_fd=dfd)
+        except BaseException:
+            try:
+                os.unlink(temp, dir_fd=dfd)
+            except OSError:
+                pass
+            raise
+    finally:
+        os.close(dfd)
     return path
+
+
+def _last_worker_text_at(directory, ident):
+    """As `_last_worker_text`, but the directory is opened ONCE (O_NOFOLLOW|O_DIRECTORY), its (device, inode) must be `ident` (the directory the check saw),
+    and the transcript is read through that descriptor (dir_fd, O_NOFOLLOW): a directory swapped for a link after the check is never followed."""
+    try:
+        dfd = os.open(str(directory), os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0))
+    except OSError:
+        return None, "no run record"
+    try:
+        st = os.fstat(dfd)
+        if (st.st_dev, st.st_ino) != tuple(ident):
+            return None, "no run record"
+        try:
+            fd = os.open("transcript.jsonl", os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0), dir_fd=dfd)
+        except FileNotFoundError:
+            return None, "the run record holds no transcript"
+        except OSError:
+            return None, "the transcript of the run record cannot be read"
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                return None, "the transcript of the run record cannot be read"
+            raw = b""
+            while len(raw) <= TRANSCRIPT_READ_MAX:
+                chunk = os.read(fd, TRANSCRIPT_READ_MAX + 1 - len(raw))
+                if not chunk:
+                    break
+                raw += chunk
+        except OSError:
+            return None, "the transcript of the run record cannot be read"
+        finally:
+            os.close(fd)
+    finally:
+        os.close(dfd)
+    if len(raw) > TRANSCRIPT_READ_MAX:
+        return None, "the transcript of the run record is too large to read"
+    found = None
+    for line in raw.decode("utf-8", "replace").splitlines():
+        try:
+            message = D["parse_bounded"](line)
+        except (ValueError, D["TooDeep"]):
+            continue
+        if isinstance(message, dict) and message.get("type", message.get("role")) == "assistant":
+            text = D["_message_text"](message).strip()
+            if text:
+                found = text
+    if found is None:
+        return None, "the transcript of the run record holds no text from the worker"
+    return found, None
 
 
 def last_message(directory, state, pod, clock=None):
@@ -283,10 +347,17 @@ def last_message(directory, state, pod, clock=None):
             return None, "no run record"
         if os.path.dirname(os.path.abspath(str(directory))) != os.path.abspath(str(_runs_root())):
             return None, "no run record"
+        try:
+            before = os.lstat(str(directory))
+        except OSError:
+            return None, "no run record"
+        if not stat.S_ISDIR(before.st_mode):
+            return None, "no run record"
         # PC-8: a link is refused, and the real path must be a child of the real path of the root
         if os.path.islink(str(directory)) or os.path.dirname(os.path.realpath(str(directory))) != os.path.realpath(str(_runs_root())):
             return None, "no run record"
-        text, why = _last_worker_text(directory)
+        # PC-9 (d): the identity of the directory as the check saw it; it is opened ONCE below, by no link, and must be that same directory
+        text, why = _last_worker_text_at(directory, (before.st_dev, before.st_ino))
         if text is None:
             return None, why.replace("the transcript of the run record holds no text from the worker", "no text from the worker") \
                 if why else "no text from the worker"
@@ -299,5 +370,7 @@ def last_message(directory, state, pod, clock=None):
             path = _write_last(base, name, kept)
             lines.append("[%d more characters in %s; %d characters left out]" % (len(kept), path, len(rest) - len(kept)))
         return "\n".join(lines), None
+    except _LastUnsafe:
+        return None, "cloud last unsafe"
     except Exception as err:
         return None, "%s" % type(err).__name__
