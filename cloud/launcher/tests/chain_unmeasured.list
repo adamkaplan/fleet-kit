@@ -1,4 +1,5 @@
 cloud/launcher/tests/test_chain_all_entries.py
+cloud/launcher/tests/test_chain_live_lanes.py
 cloud/launcher/tests/test_cloud_quick_budget.py
 cloud/launcher/tests/test_end_hook_nothing_to_push.py
 cloud/launcher/tests/test_fixture_root.py

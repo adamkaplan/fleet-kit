@@ -53,21 +53,22 @@ done < "$LIST"
 if [ "$count" -eq 0 ]; then echo "NOT RUN: the chain list holds no entry"; echo "RESULT: FAIL"; exit 1; fi
 # Arguments ("$@") go only to the entries that took them in the old one-line chain; the others run without arguments.
 ARGS_ENTRIES=" test_cloud_worker.py test_cloud_stack.py test_cloud_stack_wait.py test_cw_names.py test_cloud_k1.py test_driver.py test_run_record.py test_cloud_allowlist.py test_cloud_settings.py test_cloud_preflight_wired.py "
-# The PARALLEL list ($PAR, entries also in $LIST) runs in 3 lanes beside the serial loop (#1390): each entry uses its own temporary directory, binds no fixed port, and writes to its own output file, replayed whole after the run.
+# The PARALLEL list ($PAR, entries also in $LIST) runs in 3 lanes beside the serial loop (#1390): each entry uses its own temporary directory, binds no fixed port, and writes to its own output file, replayed whole after the run; its RUN and TIME lines are printed live (#1414), so a lane that hangs shows a RUN line with no TIME line.
 PAR=bin/test-cloud-launcher.parallel
 [ -f "$PAR" ] || PAR=/dev/null   # no parallel list: every entry runs serially
 OUT=$(mktemp -d) || exit 1
 trap 'rm -rf "$OUT"' EXIT
+live() { if [ -n "${LIVE:-}" ]; then echo "$1" >&3; else echo "$1"; fi; }   # a lane (LIVE set) prints its RUN and TIME lines at once on the saved standard output (fd 3), one line each, the entry name on every line (#1414); the rest of its output goes whole to its file
 run_entry() { # $1 = entry; runs it with the arguments it took in the old chain; prints its own RUN and TIME lines
   e=$1; shift
   case "$ARGS_ENTRIES" in *" $(basename "$e") "*) a=1 ;; *) a=0 ;; esac
-  echo "RUN $e"
+  live "RUN $e"
   t0=$(date +%s)
   case "$e" in
     *.py) if [ $a = 1 ]; then python3 "$e" "$@"; else python3 "$e"; fi ;;
     *) if [ $a = 1 ]; then "$e" "$@"; else "$e"; fi ;;
   esac || { echo "FAILED: $e"; return 1; }
-  echo "TIME $e $(( $(date +%s) - t0 ))s"
+  live "TIME $e $(( $(date +%s) - t0 ))s"
 }
 [ -z "${CHAIN_SERIAL_ENTRY:-}" ] || { se=$CHAIN_SERIAL_ENTRY; unset CHAIN_SERIAL_ENTRY; run_entry "$se" "$@"; exit $?; }   # the serial entry, started by the starter below with the default action of SIGINT
 is_parallel() { grep -qx "$1" "$PAR"; }
@@ -82,7 +83,7 @@ lane() { # $1 = lane number: every 3rd entry of $PAR, one after the other, outpu
     n=$((n + 1))
     [ $(( (n - 1) % 3 )) = "$l" ] || continue
     f=$(printf %s "$e" | tr / _)
-    run_entry "$e" "$@" > "$OUT/$f.out" 2>&1
+    LIVE=1 run_entry "$e" "$@" 3>&1 > "$OUT/$f.out" 2>&1
     echo $? > "$OUT/$f.rc"
   done < "$PAR"
 }
