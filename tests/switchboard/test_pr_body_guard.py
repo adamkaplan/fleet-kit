@@ -312,8 +312,11 @@ class TestBodyGuardShim(BodyBase):
 
 class TestBodyGuardMutants(unittest.TestCase):
     """S8: mutants on a SOURCE COPY, each applied exactly once, the control first."""
-    SHIM = (REPO / "shims" / "gh").read_text()
-    GUARD = GUARD_PATH.read_text()
+
+    @classmethod
+    def setUpClass(cls):
+        cls.SHIM = (REPO / "shims" / "gh").read_text()
+        cls.GUARD = GUARD_PATH.read_text()
 
     def run_mutant(self, which, old, new):
         source = self.SHIM if which == "shim" else self.GUARD
