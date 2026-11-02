@@ -256,6 +256,58 @@ class TestHiddenFindings(RealPasses):
         self.assertEqual(len(self.dropped()), 1)
 
 
+class TestMissingCases(RealPasses):
+    """Sixth amendment (5): the cases the reader found missing. Each is a rule of the re-check with a mutant in TestPassRecheckMutants."""
+
+    UNVERIFIED = "[unverified: its present state could not be read]"
+
+    def put_sweep(self, key):
+        """A fact with a key the real queue function never makes, in the REAL sweep state."""
+        state = sb.sweep_state(self.engine)
+        state.facts[key] = ("sweep: odd", self.world.clock.now() - 60)
+        state.present = set()
+
+    def test_a_sweep_fact_whose_key_does_not_parse_is_delivered_as_made(self):
+        self.put_sweep("sweep:not-a-digest")
+        self.deliver()
+        self.assertEqual(self.dropped(), [])
+        self.assertEqual(len(self.texts()), 1)
+        self.assertNotIn("[unverified", self.texts()[0], msg="an unparsed key was judged")
+
+    def test_a_fact_of_a_kind_the_table_does_not_know_is_delivered_as_made(self):
+        wake = self.engine.plan_wake = sb.PlanWakeState(self.world.state)
+        wake.newest[("acme/api", 3)] = "h2h2h2h2"
+        subject = types.SimpleNamespace(key="plan:acme/api#3:h1h1h1h1:cos", kind="other", summary="x")
+        self.assertIsNone(sb.pass_subject(subject), msg="a kind that is not in the table was given a subject")
+        facts = [sb.Fact("plan:acme/api#3:h1h1h1h1:cos", "cos", "other", "an odd fact", self.world.clock.now() - 60, sender="switchboard")]
+        kept, dropped = sb.judge_delivery(facts, self.world.clock.now(), lambda subject: {"hash": "h2h2h2h2"}, lambda *a: None)
+        self.assertEqual((kept, dropped), (facts, []))
+
+    def test_a_sweep_fact_is_offered_to_the_chief_of_staff_only(self):
+        self.world.add_agent("platform", fleet={})
+        self.engine.discover(self.world.clock.now())
+        self.hub.open = {1: sweep_issue(1, "intro\n## Decision required\nPick one")}
+        self.sweep_pass()
+        self.assertEqual({(f.recipient, f.kind) for f in self.engine.collect_facts()[0] if f.kind == "sweep"}, {("cos", "sweep")})
+
+    def test_a_triage_digest_with_an_empty_state_after_a_restart_is_kept_marked_unverified(self):
+        state = self.engine.triage = sb.TriageState()   # a restart: memory rebuilt, no pass has run
+        state.facts["triage:abcdef0123:4"] = ("triage: 1 finding: acme/api#7 T1", self.world.clock.now() - 60)
+        state.fact_pairs["triage:abcdef0123:4"] = [("T1", "acme/api#7")]
+        self.assertIsNone(getattr(state, "present", None))
+        self.deliver()
+        self.assertEqual(self.dropped(), [], msg="an empty state after a restart dropped a digest")
+        self.assertEqual(len(self.texts()), 1)
+        self.assertIn(self.UNVERIFIED, self.texts()[0])
+
+    def test_an_equal_hash_keeps_the_plan_notice_and_an_unknown_hash_is_no_evidence(self):
+        subject = ("plan", "acme/api", 3, "h1h1h1h1")
+        self.assertEqual(sb.pass_stale(subject, {"hash": "h1h1h1h1"}), "")
+        self.assertEqual(sb.pass_stale(subject, {"hash": None}), "", msg="an unknown hash dropped a notice")
+        self.assertEqual(sb.pass_stale(subject, {"hash": 7}), "", msg="an unknown hash dropped a notice")
+        self.assertNotEqual(sb.pass_stale(subject, {"hash": "h2h2h2h2"}), "", msg="a different hash kept a notice")
+
+
 class TestUnreadUnitKeepsTheItem(RealPasses):
     """Sixth amendment (2): a pass that did not see everything it judges holds no present state, so the item is delivered marked unverified, never dropped as cleared."""
 
@@ -454,6 +506,58 @@ class TestPassRecheckMutants(unittest.TestCase):
         self.assertTrue(self.run_case(name, []).wasSuccessful(), msg="control failed")
         result = self.run_case(name, [(sb, "pass_stale", ns["pass_stale"])])
         self.assertFalse(result.wasSuccessful(), msg="a fact that hides findings dropped went unnoticed")
+
+    def mutate_run(self, module_file, old, new, name, patches):
+        text = (Path(sb.__file__).resolve().parent / module_file).read_text()
+        self.assertEqual(text.count(old), 1, msg="the mutation target moved")
+        self.assertNotEqual(text.replace(old, new, 1), text, msg="the mutation was not applied")
+        ns = dict(vars(sb))
+        exec(compile(text.replace(old, new, 1), module_file, "exec"), ns)
+        self.assertTrue(self.run_case(name, []).wasSuccessful(), msg="control failed")
+        return self.run_case(name, [(target, attr, ns[attr_name]) for target, attr, attr_name in patches])
+
+    def test_judging_an_unparsed_sweep_key_is_caught(self):
+        result = self.mutate_run("switchboard/reminders.py", 'if fact.kind == "sweep" and SWEEP_KEY_RE.match(fact.key):', 'if fact.kind == "sweep":',
+                                 "TestMissingCases.test_a_sweep_fact_whose_key_does_not_parse_is_delivered_as_made", [(sb, "pass_subject", "pass_subject")])
+        self.assertFalse(result.wasSuccessful(), msg="judging an unparsed key went unnoticed")
+
+    def test_judging_a_kind_the_table_does_not_know_is_caught(self):
+        result = self.mutate_run("switchboard/reminders.py", 'if fact.kind == "plan" else None', 'if True else None',
+                                 "TestMissingCases.test_a_fact_of_a_kind_the_table_does_not_know_is_delivered_as_made", [(sb, "pass_subject", "pass_subject")])
+        self.assertFalse(result.wasSuccessful(), msg="judging an unknown kind went unnoticed")
+
+    def test_an_empty_triage_state_read_as_cleared_is_caught(self):
+        text = (Path(sb.__file__).resolve().parent / "switchboard" / "alert_labels.py").read_text()
+        old = 'present, pairs = getattr(state, "present", None), getattr(state, "fact_pairs", {}).get(subject[3])\n        return None if present is None or pairs is None else {"pairs": [list(p) for p in pairs], "present"'
+        self.assertEqual(text.count(old), 1, msg="the mutation target moved")
+        new = old.replace('getattr(state, "present", None), getattr', 'getattr(state, "present", None) or set(), getattr')
+        self.assertNotEqual(new, old, msg="the mutation was not applied")
+        ns = dict(vars(sb))
+        exec(compile(text.replace(old, new, 1), "alert_labels.py", "exec"), ns)
+        name = "TestMissingCases.test_a_triage_digest_with_an_empty_state_after_a_restart_is_kept_marked_unverified"
+        self.assertTrue(self.run_case(name, []).wasSuccessful(), msg="control failed")
+        result = self.run_case(name, [(sb.TriageFacts, "present_record", ns["TriageFacts"].present_record)])
+        self.assertFalse(result.wasSuccessful(), msg="an empty state read as cleared went unnoticed")
+
+    def test_an_unknown_hash_read_as_a_newer_plan_is_caught(self):
+        result = self.mutate_run("switchboard/reminders.py", "isinstance(now, str) and now != expected", "now != expected",
+                                 "TestMissingCases.test_an_equal_hash_keeps_the_plan_notice_and_an_unknown_hash_is_no_evidence", [(sb, "pass_stale", "pass_stale")])
+        self.assertFalse(result.wasSuccessful(), msg="an unknown hash read as a newer plan went unnoticed")
+
+    def test_offering_a_sweep_fact_to_every_agent_is_caught(self):
+        text = (Path(sb.__file__).resolve()).read_text()
+        start, end = text.index("class SweepFacts:"), text.index("# ---- #765")
+        old = '(o.fleet or {}).get("role") == "chief-of-staff")'
+        body = text[start:end]
+        self.assertEqual(body.count(old), 1, msg="the mutation target moved")
+        mutated = body.replace(old, '(o.fleet or {}).get("role") != "nobody")')
+        self.assertNotEqual(mutated, body, msg="the mutation was not applied")
+        ns = dict(vars(sb))
+        exec(compile(mutated, "sweep_facts.py", "exec"), ns)
+        name = "TestMissingCases.test_a_sweep_fact_is_offered_to_the_chief_of_staff_only"
+        self.assertTrue(self.run_case(name, []).wasSuccessful(), msg="control failed")
+        result = self.run_case(name, [(sb.SweepFacts, "__call__", ns["SweepFacts"].__call__)])
+        self.assertFalse(result.wasSuccessful(), msg="a sweep fact offered to every agent went unnoticed")
 
     def test_a_source_that_does_not_forget_a_dropped_fact_is_caught(self):
         name = "TestDropStaleOnce.test_a_dropped_sweep_fact_is_not_offered_again_and_has_one_audit_line_over_two_deliveries"
