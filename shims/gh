@@ -2118,7 +2118,7 @@ def api_decide(args, namer, previous):
             query = raw.partition("#")[0].partition("?")[2]
             query_keys = [urllib.parse.unquote(part.partition("=")[0]) for part in re.split(r"[&;]", query) if part]
             for key in query_keys + [f.partition("=")[0] for f in fields]:
-                if "%" in key or not key_known(key) or (key.lower() == "body" and key in query_keys):
+                if "%" in key or key not in ALLOWED_KEYS or (key == "body" and key in query_keys):
                     raise Refused("the key %s (not a known key, or a body in the URL query string) on a comment or review endpoint cannot be signed: send body, event, commit_id, path, position, line, side, start_line, start_side, in_reply_to or subject_type as -f or in an --input JSON object" % repr(key)[:40])
         if found[2] and has_input and any(f.partition("=")[0].lower() == "body" for f in fields):
             raise Refused("a -f or -F body field with --input on a comment or review endpoint is sent by gh as a URL query parameter and cannot be signed: put the body in the --input JSON object")
