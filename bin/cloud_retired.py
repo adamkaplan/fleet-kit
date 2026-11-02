@@ -221,7 +221,7 @@ LAST_HEAD = 3000                 # characters that go in the message
 LAST_FILE = 20000                # characters beyond the head that go in the file
 LAST_KEEP_SECONDS = 7 * 86400
 LAST_SCRUB_MAX = 200000          # the scrub's own input maximum (SCRUB_INPUT_MAX of the launcher): the cut before it
-_ENDPOINT_RE = re.compile(r"https?://worker-[a-z0-9-]+\.[a-z0-9.-]+(:[0-9]+)?", re.I)
+_ENDPOINT_RE = re.compile(r"(?:https?://)?worker-[a-z0-9-]+\.[a-z0-9.-]+(:[0-9]+)?", re.I)
 _LAST_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,199}", re.ASCII)
 
 
