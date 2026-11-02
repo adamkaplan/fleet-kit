@@ -9998,12 +9998,13 @@ def open_pages(read, repo=None):
     return out
 
 
+_UNSENT_DAY = {}   # #1886: repository -> the day its `open_list.cut_unsent` line was written (memory only: a restart may write one more; one entry per repository)
 _OPEN_CUTS = set()   # #1886: the repositories whose read of open items stopped at OPEN_LIST_PAGES in this pass (one entry per repository)
 
 
 def note_open_cut(repo):
     """#1886: a read of open items of `repo` stopped at the ceiling with a full last page."""
-    _OPEN_CUTS.add(repo)
+    _OPEN_CUTS.add(str(repo).lower())   # one spelling per repository
 
 
 def take_open_cuts():
@@ -10026,7 +10027,8 @@ def open_list_alert(engine, repo, now):
             % (repo, format(ceiling, ","), OPEN_LIST_PAGES, ceiling))
     audit = getattr(engine, "audit", None)
     if cos is None:
-        if audit is not None:
+        if audit is not None and _UNSENT_DAY.get(repo) != day:   # at most once per repository and day
+            _UNSENT_DAY[repo] = day
             audit.append(engine.actor, "open_list.cut_unsent", repo, {"repo": repo})
         return
     add_repeat_reminder(engine.state_dir, cos, now, now, text, "open-list-cut", repo, day, wake_class=WAKE_LOAD)

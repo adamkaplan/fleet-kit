@@ -113,6 +113,29 @@ class TestOpenListCuts(CutsBase):
         self.assertEqual(len(self.reminders), 1)
         self.assertTrue((self.state_dir / "open-list-alert.json").exists())
 
+    def test_two_spellings_of_one_repository_are_one_note_and_one_alert(self):
+        sb.note_open_cut("Acme/API")
+        sb.note_open_cut("acme/api")
+        self.assertEqual(sb.take_open_cuts(), ["acme/api"])
+        sb.note_open_cut("Acme/API")
+        sb.note_open_cut("acme/api")
+        self.end_of_pass(NOW)
+        self.assertEqual((len(self.reminders), len(self.lines("open_list.cut"))), (1, 1))
+
+    def test_cut_unsent_is_one_line_a_day_per_repository_and_then_a_chief_of_staff_alerts(self):
+        sb._UNSENT_DAY.clear()
+        self.addCleanup(sb._UNSENT_DAY.clear)
+        saved = dict(self.cos)
+        self.cos.clear()
+        for n in range(3):
+            sb.note_open_cut("acme/api")
+            self.end_of_pass(NOW + n * 900)
+        self.assertEqual(len(self.lines("open_list.cut_unsent")), 1, msg="three passes without a chief of staff write one line")
+        self.cos.update(saved)
+        sb.note_open_cut("acme/api")
+        self.end_of_pass(NOW + 3 * 900)
+        self.assertEqual((len(self.reminders), len(self.lines("open_list.cut"))), (1, 1))
+
     def test_s13_a_failed_marker_write_is_one_audit_line(self):
         sb.note_open_cut("acme/api")
         alerts = sb.load_module("open_list_alert")
@@ -255,7 +278,7 @@ class TestOpenListCutsMutants(Base):
             mod.take_open_cuts()
             self.reads(mod, 2000)
             self.assertEqual(mod.take_open_cuts(), ["acme/api"], msg="one alert for five reads: the reads note, the end of the pass alerts")
-        text = self.run_pair("    _OPEN_CUTS.add(repo)\n", "    try:\n        open_list_alert(None, repo, 0.0)   # the mutant: an alert at each read\n    except Exception:\n        pass\n", "s11", check)
+        text = self.run_pair("    _OPEN_CUTS.add(str(repo).lower())   # one spelling per repository\n", "    try:\n        open_list_alert(None, repo, 0.0)   # the mutant: an alert at each read\n    except Exception:\n        pass\n", "s11", check)
         self.assertIn("one alert for five reads", text)
 
     def test_s12_a_set_never_emptied_fails_with_no_stale_cut(self):
