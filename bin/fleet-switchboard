@@ -5264,6 +5264,7 @@ def pane_health_pass(engine, now):
         if (registered.get(name) or {}).get("kind", "local") != "local":
             continue         # a cloud worker has no pane (#1066): a local session of its name gets none
         missing.pop(name, None)
+        (states.get(name) or {}).pop("undecidable", None)   # #1884: a discovered agent ends the streak
         engine.__dict__.setdefault("pane_held", {}).pop(name, None)
         if name in retired and retired[name].get("session") == obs.session_id:
             states.pop(name, None)       # a retired agent is not judged; it stays listed under its own heading
@@ -5308,6 +5309,8 @@ def pane_health_pass(engine, now):
             states.pop(name, None)
             continue
         missing[name] = int(missing.get(name, 0)) + 1
+        if undecidable_streak(engine, name, agents[name], states, missing[name]):   # #1884: listed pane, no recorded session: unknown, a streak is said once
+            continue
         if missing[name] >= PANE_MISSING_PASSES and agents[name].get("pane") and agents[name].get("session"):
             try:   # #1066: a pane whose process runs the agent's session is never dead, whatever the multiplexer's list says
                 if runs_session(engine.herdr.pane_process_info(agents[name]["pane"]), agents[name]["session"], engine.executable):
@@ -5854,6 +5857,34 @@ def daemon_shows_absent(engine, name, agent):
         return bool(load_module("registry").evidence_shows_absent(evidence))
     except Exception:
         return False
+
+
+def pane_undecidable(engine, name, agent):
+    """#1884 (PC-6): True when the agent's pane is LISTED and its row has no recorded session id: no process to judge, so the one function can
+    say neither dead nor alive (`unknown`, never `dead`). A pane that cannot be read, or that is gone, is not this case."""
+    if agent.get("session") or not agent.get("pane"):
+        return False
+    try:
+        return herdr_live_check(engine.herdr)(name, agent).get("pane") is True
+    except Exception:
+        return False
+
+
+def undecidable_streak(engine, name, agent, states, passes):
+    """#1884 (PC-6): the missing-pass loop's `unknown` for a listed pane with no recorded session. The streak is counted in the agent's own state record
+    (`states[name]["undecidable"]`, kept and reset as the missing-pass counters are); the audit line `pane.undecidable` is written ONCE, when the
+    streak reaches PANE_MISSING_PASSES. Any other pass (a session id, the pane gone, a decision) clears it. True when the pass answered unknown."""
+    record = states.get(name)
+    if passes >= PANE_MISSING_PASSES and pane_undecidable(engine, name, agent):
+        if not isinstance(record, dict):
+            record = states[name] = {"state": PANE_UNKNOWN, "why": "listed pane with no recorded session", "pane": agent.get("pane"), "session": None, "at": 0}
+        record["undecidable"] = int(record.get("undecidable") or 0) + 1
+        if record["undecidable"] == PANE_MISSING_PASSES and engine.audit is not None:
+            engine.audit.append(engine.actor, "pane.undecidable", name, {"pane": agent.get("pane"), "passes": record["undecidable"]})
+        return True
+    if isinstance(record, dict):
+        record.pop("undecidable", None)
+    return False
 
 
 def reconcile_agents_on_read(state_dir, herdr):
