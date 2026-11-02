@@ -1,20 +1,51 @@
 """Ask #1709, scenario S6: no fixture pushes to the default branch (a pod's git wrapper refuses that push). Offline; reads only."""
-import glob, os, re, sys, unittest
+import ast, glob, os, sys, unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(HERE)))
 SELF = os.path.basename(__file__)
-# The pattern is assembled from fragments so this file does not hold it as one string.
-_PUSH = "pu" + "sh"
-_TARGETS = ["HEAD" + ":" + b for b in ("main", "master")] + ["refs/heads/" + b for b in ("main", "master")]
+# A push is found by PARSING the call (ast), not by a list of spellings: the destination of its refspec decides.
+_PUSH = "push"
 # The ONE named exclusion: the guard's list of refusal cases holds such lines as DATA (cases the guard must refuse), not as a push.
 EXCLUDED = "cloud/worker/tests/test_guard.py"
-PATTERN = re.compile(r"[\"']" + _PUSH + r"[\"'].*[\"'](" + "|".join(re.escape(t) for t in _TARGETS) + r")[\"']")
+
+
+def _strings(node):
+    """The string constants of one positional argument (inside a list or tuple literal too); other arguments give none."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return [node.value]
+    if isinstance(node, (ast.List, ast.Tuple)):
+        return [v for e in node.elts for v in _strings(e)]
+    return []
+
+
+def _destination(refspec):
+    d = refspec.split(":", 1)[1] if ":" in refspec else refspec
+    d = d[1:] if d.startswith("+") else d
+    if ":" not in refspec and refspec.startswith("+"):
+        d = refspec[1:]
+    return d[len("refs/heads/"):] if d.startswith("refs/heads/") else d
 
 
 def scan(name, text):
-    """Findings of one file's text, each naming the file and 'line N'."""
-    return ["%s: line %d: %s" % (name, i, l.strip()) for i, l in enumerate(text.splitlines(), 1) if PATTERN.search(l)]
+    """Findings of one file's text, each 'file: line N: <line>'. A text that does not parse is a finding of its own kind."""
+    try:
+        tree = ast.parse(text)
+    except SyntaxError as e:
+        return ["%s: line %s: does not parse" % (name, e.lineno)]
+    lines, out = text.splitlines(), []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        strs = [v for a in node.args for v in _strings(a)]
+        if _PUSH not in strs:
+            continue
+        rest = [v for v in strs[strs.index(_PUSH) + 1:] if not v.startswith("-")]
+        refspecs = rest[1:]   # the first is the remote
+        hit = any(_destination(r) in ("main", "master") for r in refspecs)
+        if hit:
+            out.append("%s: line %d: %s" % (name, node.lineno, lines[node.lineno - 1].strip()))
+    return out
 
 
 def files():
@@ -65,6 +96,48 @@ class S6(unittest.TestCase):
         self.assertEqual(len(f2), 1)
         self.assertIn("test_cloud_worker.py: line %d" % l1, f1[0])
         self.assertIn("test_cloud_prestop.py: line %d" % l2, f2[0])
+
+    def test_spellings_and_other_branches(self):
+        self.assertEqual(self.spellings(), (4, 0))
+
+    def spellings(self):
+        found = [bool(scan("x.py", "f(%s)" % c)) for c in (
+            '"push", "origin", "main"', '"push", "origin", "HEAD:refs/heads/master"',
+            '"push", "-q", "origin", "+HEAD:main"', '"push", "origin", "refs/heads/main"')]
+        other = [bool(scan("x.py", "f(%s)" % c)) for c in (
+            '"push", "origin", "feature"', '"push", "origin", "HEAD:refs/heads/feature"', '"push", "-u", "origin", "HEAD:feature"')]
+        self.assertEqual((sum(found), sum(other)), (4, 0))
+        self.assertEqual(scan("x.py", "def ("), ["x.py: line 1: does not parse"])
+        self.assertEqual(scan("x.py", 'f("push", "origin")'), [])
+        self.assertFalse(scan("x.py", 'f("push", "origin", name)'))
+        self.assertTrue(scan("x.py", 'f(["push", "origin", "main"])'))
+        return sum(found), sum(other)
+
+    def test_guard_reading_one_spelling_fails_the_plain_check(self):
+        counts = self.spellings()
+        def plain(fn):
+            if not fn("x.py", 'f("push", "origin", "main")'):
+                raise AssertionError("a push to main spelled plainly was not found")
+        with open(os.path.abspath(__file__) if False else os.path.join(HERE, SELF), encoding="utf-8") as h:
+            src = h.read()
+        rule = '        hit = any(_destination(r) in ("main", "master") for r in refspecs)'
+        self.assertEqual(src.count("\n" + rule + "\n"), 1)
+        mutated = src.replace(rule, '        hit = any(r == "HEAD:main" for r in refspecs)')
+        applied = mutated != src
+        def load(text):
+            ns = {"__file__": os.path.join(HERE, SELF), "__name__": "scratch_guard"}
+            exec(compile(text, "scratch_guard", "exec"), ns)
+            return ns["scan"]
+        plain(load(src))   # the control, first
+        control = 1
+        msg = ""
+        try:
+            plain(load(mutated))
+        except AssertionError as e:
+            msg = str(e)
+        self.assertEqual(msg, "a push to main spelled plainly was not found")
+        print("S6: spellings found %d of 4, other branches found %d of 3; control passes %d of 1, mutant fails 1 of 1 with the text, mutation applied %s"
+              % (counts[0], counts[1], control, applied))
 
 
 if __name__== "__main__":
