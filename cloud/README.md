@@ -51,6 +51,16 @@ The launcher mounts per-run files read-only under `/run/cw` (`CW_RUN_DIR`). The 
 A file that is absent is skipped (a pod started without per-run secrets). A file that is present but unreadable or empty
 refuses the start with one line naming it; there is no fallback to another source. The tmpfs is `CW_TMP_DIR` (default `/run/cw-tmp`).
 
+## What a pod can run and what it cannot (#1460)
+
+**Cause of the recorded pod-only failures.** The launcher mounts the `scratch` emptyDir at `/work` under `fsGroup: 1000` (`cloud/launcher/cloud_worker.py`, `POD_SECURITY_CONTEXT` and the volume mounts), so `/work` is setgid and group-writable and a checkout made inside it inherits that; the vault-check tests refuse such modes. The wrapper's `env_cfg` (`cloud/worker/guard.sh`) refuses every git command under environment configuration, test helpers' `git init` included. The pod's `/proc/1/environ` holds the launcher's `env` list (the pod spec's `"env"`). The launch tests' login directory is not yet traced to a line (HYPOTHESIS, left open).
+
+**What changed.** `entrypoint.sh` creates `/work/repo` itself (owner worker, mode 0755, no setgid) and sets `umask 022` before the agent starts; if it cannot, it refuses to start with one line. The git wrapper allows exactly one more form under environment configuration: `git init [-q] DIR` or `git -C DIR init [-q]` where DIR resolves (symlinks followed, no `..`) strictly inside `$TMPDIR` (else `/tmp`). Everything else stays refused with the same message. The guard table and the permission file are unchanged. The image is not rebuilt by this change (digest: not built).
+
+**A pod can run:** `bin/test-cloud-worker`, `cloud/launcher/tests/test_cloud_worker.py` and `tests/switchboard/test_cases_12.py` (`bin/test-switchboard -k TestSelfRegisteringCli`); the step `2c` of `cloud/tests/test-cloud` runs the three and fails when any one fails.
+
+**A pod cannot run:** anything that needs the launcher, the hub, the vault, a cluster, or a host-only path (for example a test that asserts the launcher's environment is absent from `/proc`).
+
 ## The worker's rules in the pod (a convenience, not the guard)
 
 A cloud worker holds the same rules a local agent has. The entrypoint writes an OpenCode config (on tmpfs, no secret in it)

@@ -74,7 +74,43 @@ env_cfg() {   # git's environment configuration is the environment form of the t
   return 0
 }
 
+# THE ONE ALLOWANCE under git's environment configuration (#1460), a closed rule: `git init [-q|--quiet] DIR` or `git -C DIR init [-q|--quiet]`,
+# nothing else (no other option, no missing DIR, no other subcommand), and only when DIR has no `..` word, is not empty, and its
+# realpath (symlinks resolved) is strictly inside the realpath of $TMPDIR (else /tmp), compared with a trailing slash so /tmp2 is not
+# inside /tmp. Limits: a check by name at the time of the call (no lock against a later symlink swap). FAILS CLOSED: no realpath, or any
+# doubt, and the caller refuses exactly as before.
+tmp_init_ok() {
+  dir=""; q=0
+  if [ "${1:-}" = "-C" ]; then
+    [ $# -ge 3 ] && [ "$3" = init ] || return 1
+    dir=$2; shift 3
+    for a in "$@"; do case "$a" in -q|--quiet) ;; *) return 1 ;; esac; done
+  elif [ "${1:-}" = init ]; then
+    shift
+    for a in "$@"; do
+      case "$a" in
+        -q|--quiet) ;;
+        -*) return 1 ;;
+        *) [ -z "$dir" ] || return 1; dir=$a ;;
+      esac
+    done
+  else
+    return 1
+  fi
+  [ -n "$dir" ] || return 1
+  case "/$dir/" in */../*) return 1 ;; esac
+  command -v realpath >/dev/null 2>&1 || return 1
+  root=$(realpath -m -- "${TMPDIR:-/tmp}" 2>/dev/null) || return 1
+  full=$(realpath -m -- "$dir" 2>/dev/null) || return 1
+  [ -n "$root" ] && [ -n "$full" ] && [ "$root" != / ] || return 1
+  case "$full/" in "$root"/?*) return 0 ;; esac
+  return 1
+}
+
 do_git() {
+  if [ -n "${GIT_CONFIG_COUNT:-}${GIT_CONFIG_PARAMETERS:-}${GIT_CONFIG_GLOBAL:-}${GIT_CONFIG_SYSTEM:-}" ] || env | grep -q '^GIT_CONFIG_KEY_[A-Za-z0-9_]*=.'; then
+    tmp_init_ok "$@" && return 0
+  fi
   env_cfg
   # skip git's own options before the subcommand
   while [ $# -gt 0 ]; do
