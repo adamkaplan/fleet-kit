@@ -291,6 +291,8 @@ def run(workdir, worker, prestop=False, repo=None, ctx=None):
         git(workdir, "push", "--no-verify", url, "HEAD:refs/heads/" + branch, ctx=ctx)
     else:
         git(workdir, "push", "--force-with-lease", "origin", "HEAD:refs/heads/" + branch)
+    if blocked_by:
+        return {"pushed": True, "wip_branch": branch, "skipped": skipped, "wip_blocked_by": blocked_by}
     return {"pushed": True, "wip_branch": branch, "skipped": skipped}
 
 
@@ -373,6 +375,9 @@ def prestop_main():
         config_refusal(workdir, repo, ctx)
         trusted = True
         res = run(workdir, worker, prestop=True, repo=repo, ctx=ctx)
+        if res["pushed"] and res.get("wip_blocked_by"):
+            print("cw-prestop: saved work to %s (%s/wip is blocked by the branch %s)" % (res["wip_branch"], worker, res["wip_blocked_by"]))
+            return 0
         if res["pushed"]:
             print("cw-prestop: saved work to %s" % res["wip_branch"])
         elif isinstance(res, NothingToPush):
