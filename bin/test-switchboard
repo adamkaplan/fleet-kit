@@ -78470,6 +78470,17 @@ class TestCiRecordCarry(LedgerBase):
         self.assertEqual(sorted(c["scenario"] for c in lines), ["S2", "S2", "S3"])
         self.assertEqual(out.count("carried proof #"), 3)
 
+    def test_a_stale_run_carries_nothing_and_prints_the_stale_line(self):   # #1755; the control is test_S1 above (the default run_base is the tip: one carried line per proof)
+        self.run_base = "s" * 40
+        self.proofs()
+        before = self.ledger_bytes()
+        code, out, err = self.step()
+        self.assertEqual(code, 2, "a stale run carries no proof: " + err)   # the step records nothing for a stale run and exits 2
+        self.assertEqual(self.carried(), [], "a stale run carries no proof")
+        self.assertIn("commits behind", out + err)
+        self.assertIn("close and reopen the pull request for a fresh run", out + err)
+        self.assertEqual(self.ledger_bytes(), before, "the ledger bytes are unchanged by a stale run")
+
     def test_S2_a_tests_and_documentation_only_head_carries(self):
         self.proofs(files=("src/widget.py",))
         self.parents = ["p" * 40]
