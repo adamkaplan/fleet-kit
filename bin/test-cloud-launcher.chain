@@ -84,4 +84,5 @@ cloud/worker/tests/test_root_scanner.py
 cloud/worker/tests/test_scan_allowlist_node.py
 cloud/worker/tests/test_stack_pull.py
 cloud/worker/tests/test_stack_up.py
+cloud/launcher/tests/test_audit_step_seconds.py
 cloud/worker/tests/test_cloud_prepush_preflight.py
