@@ -5835,7 +5835,7 @@ def herdr_live_check(herdr):
         if not any(p["pane_id"] == pane for p in panes):
             return {"pane": False, "process": False}
         try:
-            return {"pane": True, "process": bool(herdr.pane_process_info(pane))}
+            return {"pane": True, "process": runs_session(herdr.pane_process_info(pane), agent.get("session")) if agent.get("session") else None}
         except Exception:
             return {"pane": True, "process": None}
     return check
