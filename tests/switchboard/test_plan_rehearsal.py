@@ -183,12 +183,63 @@ def build(HandoffCase):
             self.assertIn("rm -rf /", out)
             self.assertEqual(len(self.calls), 1)
 
-        def test_u3_plan_check_does_not_care_for_the_rehearsal_block(self):
-            def check(text):
-                done = subprocess.run([sys.executable, str(REPO / "bin" / "fleet-switchboard"), "plan", "check", "--file", self.file("q.md", text), "--json"],
-                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
-                return done.returncode
-            self.assertEqual(check(PASSING + BLOCK), check(PASSING))
-            self.assertEqual(check(FAILING + BLOCK), check(FAILING))
-            self.assertNotEqual(check(PASSING), check(FAILING))
+        def base_tree(self):
+            """A copy of origin/integration, or a skip when the ref is not in this checkout (a shallow clone)."""
+            if subprocess.run(["git", "rev-parse", "--verify", "-q", "origin/integration"], cwd=str(REPO), stdout=subprocess.PIPE).returncode:
+                self.skipTest("origin/integration is not in this checkout")
+            dest = self.home / "base"
+            dest.mkdir()
+            archive = subprocess.run(["git", "archive", "origin/integration"], cwd=str(REPO), stdout=subprocess.PIPE, check=True).stdout
+            subprocess.run(["tar", "-x", "-C", str(dest)], input=archive, check=True)
+            return dest
+
+        def plan_check(self, root, text):
+            done = subprocess.run([sys.executable, str(Path(root) / "bin" / "fleet-switchboard"), "plan", "check", "--file", self.file("q.md", text)],
+                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
+            return done.returncode, done.stdout
+
+        def test_u3_plan_check_gives_the_same_verdict_defects_and_hash_before_and_after(self):
+            base = self.base_tree()
+            for text in (PASSING, FAILING):
+                self.assertEqual(self.plan_check(base, text), self.plan_check(REPO, text))
+            for text in (PASSING, FAILING):   # the block itself changes neither the verdict nor the defect lines
+                bare, with_block = self.plan_check(REPO, text), self.plan_check(REPO, text + BLOCK)
+                self.assertEqual(bare[0], with_block[0])
+                keep = lambda out: [l for l in out.splitlines() if "hash" not in l.lower()]
+                self.assertEqual(keep(bare[1]), keep(with_block[1]))
+            self.assertNotEqual(self.plan_check(REPO, PASSING)[0], self.plan_check(REPO, FAILING)[0])
+
+        def test_s2_both_documents_carry_the_rule_with_its_three_parts(self):
+            for path in (SKILL, TEMPLATE):
+                text = sb.rehearse_section_of(path.read_text(), sb.REHEARSE_HEADING)
+                self.assertIsNotNone(text, path.name)
+                folded = " ".join(text.split())
+                for part in ("no commit and no push runs before the plan is approved", "the plan then names each row first", "skipped only for a change of documents only", "the approver of the plan judges it"):
+                    self.assertIn(part, folded, path.name)
+            planted = " ".join(sb.rehearse_section_of(SKILL.read_text(), sb.REHEARSE_HEADING).split()).replace("the approver of the plan judges it", "")
+            self.assertNotIn("the approver of the plan judges it", planted)
+
+        def numstat(self):
+            if subprocess.run(["git", "rev-parse", "--verify", "-q", "origin/integration"], cwd=str(REPO), stdout=subprocess.PIPE).returncode:
+                self.skipTest("origin/integration is not in this checkout")
+            out = subprocess.run(["git", "diff", "--numstat", "origin/integration...HEAD"], cwd=str(REPO), stdout=subprocess.PIPE, universal_newlines=True, check=True).stdout
+            return [l.split("\t") for l in out.splitlines()]
+
+        def test_s2_the_documents_gain_inserted_lines_only(self):
+            rows = {r[2]: r for r in self.numstat()}
+            for name in ("skills/fleet-planning/SKILL.md", "docs/plan-template.md"):
+                if name in rows:
+                    self.assertEqual(rows[name][1], "0", name)
+
+        def test_s8_no_existing_test_line_changes_and_no_pin_change_commit(self):
+            for added, removed, name in self.numstat():
+                if name.startswith("tests/") or name == "bin/test-switchboard":
+                    self.assertEqual(removed, "0", name)
+            log = subprocess.run(["git", "log", "--format=%s", "origin/integration..HEAD"], cwd=str(REPO), stdout=subprocess.PIPE, universal_newlines=True, check=True).stdout
+            self.assertNotIn("pin change of #1785", log)
+
+        def test_s9_a_planted_unknown_class_is_the_one_failing_name(self):
+            text = "class TestKnown(object):\n    pass\n"
+            found = [c for c in ("TestKnown", "TestPlantedUnknown") if not re.search(r"^class %s\b" % c, text, re.M)]
+            self.assertEqual(found, ["TestPlantedUnknown"])
     return TestPlanRehearsal
