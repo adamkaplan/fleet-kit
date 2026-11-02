@@ -65,6 +65,45 @@ class TestUnconsumedRecord(unittest.TestCase):
         self.assertEqual((data["steered"][0], len(data["steered"]), len(data["reminders"])), ("i10", rec.CAP, rec.CAP))
         self.assertIn("reminder:%d" % (rec.CAP + 9), data["reminders"])
 
+    def mutant(self, old, new):
+        """The module's source with ONE textual replacement (asserted applied), loaded as a module."""
+        import types
+        with open(os.path.join(BIN, "unconsumed_record.py"), encoding="utf-8") as handle:
+            source = handle.read()
+        self.assertEqual(source.count(old), 1, "the mutation did not apply: %r" % old)
+        module = types.ModuleType("unconsumed_record_mutant")
+        exec(compile(source.replace(old, new), "<mutant>", "exec"), module.__dict__)
+        return module
+
+    def cap_case(self, module):
+        ids = ["i%d" % n for n in range(501)]
+        module.write(self.dir, {"steered": ids, "reminders": {}}, record_json.parse_bounded)
+        data, _ = module.read(self.dir, record_json.parse_bounded)
+        self.assertEqual((len(data["steered"]), "i0" in data["steered"]), (500, False), "the cap of 500 is not enforced")
+
+    def shape_case(self, module):
+        self.put(json.dumps({"steered": [], "reminders": {"reminder:a": ["K", "me"], "reminder:b": ["K", "me", None]}}).encode())
+        data, _ = module.read(self.dir, record_json.parse_bounded)
+        self.assertEqual(list(data["reminders"]), ["reminder:b"], "an entry of the wrong shape was kept")
+
+    def test_the_cap_is_500_after_501_entries_the_oldest_is_gone(self):
+        self.cap_case(rec)
+
+    def test_mutant_cap_5000_fails_with_the_anchored_text(self):
+        self.cap_case(self.mutant("CAP = 500\n", "CAP = 500\n"))   # control: the identity replacement passes
+        with self.assertRaises(AssertionError) as caught:
+            self.cap_case(self.mutant("CAP = 500\n", "CAP = 5000\n"))
+        self.assertIn("the cap of 500 is not enforced", str(caught.exception))
+
+    def test_an_entry_of_the_wrong_shape_is_ignored(self):
+        self.shape_case(rec)
+
+    def test_mutant_without_the_shape_check_fails_with_the_anchored_text(self):
+        self.shape_case(self.mutant("CAP = 500\n", "CAP = 500\n"))
+        with self.assertRaises(AssertionError) as caught:
+            self.shape_case(self.mutant(" and len(ident) == 3", ""))
+        self.assertIn("an entry of the wrong shape was kept", str(caught.exception))
+
 
 if __name__ == "__main__":
     unittest.main()

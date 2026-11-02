@@ -324,4 +324,185 @@ def build(Base, TestSteerToWorking):
                 self.assertEqual(engine.unconsumed_lines({"session": observation.session_id}), [])
             self.assertEqual(calls, [], "msg=a session read under v2_light")
 
+        # -- the hand mutants (each: control first, the mutation asserted applied, one anchored text)
+
+        def kills(self, name, old, new, scenario, anchor):
+            """The control passes; the one-replacement mutant fails with `anchor` in its failure."""
+            with mock.patch.object(sb.Switchboard, name, compiled(name)):
+                scenario()
+            with mock.patch.object(sb.Switchboard, name, compiled(name, old, new)):
+                with self.assertRaises(AssertionError) as caught:
+                    scenario()
+            self.assertIn(anchor, str(caught.exception))
+
+        def lane(self, status="working", problem=None, conflict=None):
+            import types
+            return types.SimpleNamespace(name="platform", session_id=self.world.sessions["platform"], status=status,
+                                         conflict=conflict or [], problem=problem)
+
+        def old_item(self, minutes=60):
+            self.build({})
+            self.attach_cancel()
+            self.work(lasts=7200, steps=3)
+            item = self.queue_message("old")
+            self.minutes(minutes)
+            return item
+
+        def steered_ids(self):
+            return [w["id"] for w in self.writes("session.inbox.update")]
+
+        def scenario_held(self):
+            self.old_item()
+            for case in ({"problem": "a real permission request"}, {"conflict": ["ses_other"]}):
+                engine = self.world.engine
+                engine.steer_unconsumed(self.lane(**case), engine.now())
+            self.assertEqual(self.steered_ids(), [], "a held lane was steered")
+
+        def scenario_idle(self):
+            self.old_item()
+            for status in ("idle", "blocked"):
+                engine = self.world.engine
+                engine.steer_unconsumed(self.lane(status=status), engine.now())
+            self.assertEqual(self.steered_ids(), [], "a lane that is not working was steered")
+
+        def scenario_already_steer(self):
+            item = self.old_item()
+            item["delivery"] = "steer"
+            engine = self.world.engine
+            engine.steer_unconsumed(self.lane(), engine.now())
+            tried = self.steered_ids() + self.lines("unconsumed.steer") + self.lines("unconsumed.refused")
+            self.assertEqual(tried, [], "an item already steer was steered again")
+
+        def test_mutant_1_without_the_hold_a_held_lane_is_steered(self):
+            self.kills("steer_unconsumed", "hold_reason(observation) or ", "", self.scenario_held, "a held lane was steered")
+
+        def test_mutant_2_without_the_working_check_an_idle_lane_is_steered(self):
+            self.kills("steer_unconsumed", ' or observation.status != "working"', "", self.scenario_idle,
+                       "a lane that is not working was steered")
+
+        def test_mutant_3_without_the_queue_check_a_steer_item_is_steered_again(self):
+            self.kills("steer_unconsumed", 'and item.get("delivery") == "queue" ', "", self.scenario_already_steer,
+                       "an item already steer was steered again")
+
+        def crash_scenario(self):
+            item = self.old_item()
+            engine = self.world.engine
+            with mock.patch.object(engine.v2, "inbox_update", side_effect=RuntimeError("crash")):
+                try:
+                    engine.steer_unconsumed(self.lane(), engine.now())
+                except RuntimeError:
+                    pass
+            self.new_engine()   # a new process over the same state directory
+            engine = self.world.engine
+            engine.steer_unconsumed(self.lane(), engine.now())
+            self.assertEqual(self.steered_ids(), [], "the item was steered again after a crash before the call")
+            return item
+
+        def test_mutant_4_without_the_save_before_the_steer_call_a_crash_repeats_the_steer(self):
+            self.kills("steer_unconsumed", "self._record_save()   # before inbox_update: a restart never repeats the try", "pass",
+                       self.crash_scenario, "the item was steered again after a crash before the call")
+
+        def rearm_chain(self, crash_cancel):
+            """K delivered, K re-armed (its cancel crashes when asked), a new engine, K re-armed again."""
+            self.build({})
+            self.attach_cancel()
+            self.work(lasts=7200, steps=3)
+            self.remind("platform", "first", key="K")
+            if crash_cancel:
+                with mock.patch.object(self.world.engine.v2, "inbox_cancel", side_effect=RuntimeError("crash")):
+                    self.remind("platform", "second", key="K")
+            else:
+                self.remind("platform", "second", key="K")
+            self.new_engine()
+            self.remind("platform", "third", key="K")
+
+        def scenario_save_before_cancel(self):
+            self.rearm_chain(True)
+            self.assertEqual([i["text"] for i in self.keyed() if "third" in i["text"] or "second" in i["text"] or "first" in i["text"]].__len__(),
+                             1, "a copy whose cancel crashed was forgotten")
+
+        def test_mutant_5_without_the_save_before_the_cancel_a_crashed_copy_is_forgotten(self):
+            self.kills("supersede_queued_reminders", "self._record_save()   # the new ids are recorded before the cancel call", "pass",
+                       self.scenario_save_before_cancel, "a copy whose cancel crashed was forgotten")
+
+        def scenario_save_after_cancel(self):
+            self.rearm_chain(False)
+            with open(os.path.join(str(self.world.state), "unconsumed.json"), encoding="utf-8") as handle:
+                held = json.load(handle)["reminders"]
+            self.assertEqual(len(held), 1, "a cancelled copy stays in the record")
+
+        def test_mutant_6_without_the_save_after_a_cancel_the_record_keeps_a_cancelled_copy(self):
+            self.kills("supersede_queued_reminders", "                " + "self._record_save()\n", "                " + "pass\n",
+                       self.scenario_save_after_cancel, "a cancelled copy stays in the record")
+
+        def scenario_any(self):
+            self.build({})
+            self.attach_cancel()
+            self.work(lasts=7200, steps=3)
+            self.remind("platform", "first", key="K")
+            (older,) = self.keyed()
+            mixed = {"id": "inb_mixed", "sessionID": self.world.sessions["platform"], "type": "synthetic", "text": "x", "resume": True,
+                     "delivery": "queue", "metadata": {"fleet": {"keys": [sb._fleet_keys(older)[0], "lab.fact:9"], "from": "switchboard"}},
+                     "time": {"created": self.world.clock.ms()}}
+            self.inbox().append(mixed)
+            self.remind("platform", "second", key="K")
+            self.assertIn("inb_mixed", [i["id"] for i in self.inbox()], "an item with one unrelated key was cancelled")
+            self.assertNotIn(older["id"], [i["id"] for i in self.inbox()])
+
+        def test_mutant_7_with_any_an_item_holding_one_older_key_is_cancelled(self):
+            self.kills("supersede_queued_reminders", "all(k in older for k in keys)", "any(k in older for k in keys)",
+                       self.scenario_any, "an item with one unrelated key was cancelled")
+
+        def scenario_self_copy(self):
+            import types
+            self.build({})
+            self.attach_cancel()
+            self.work(lasts=7200, steps=3)
+            self.remind("platform", "first", key="K")
+            (copy,) = self.keyed()
+            engine = self.world.engine
+            ident = sb._fleet_keys(copy)[0][len("reminder:"):]
+            now = self.world.clock.now()
+            sb.write_reminders(self.world.state, [{"id": ident, "to": "platform", "at": now, "created": now, "text": "first",
+                                                   "issue": None, "from": "coder", "key": "K"}])   # the same reminder, carried again
+            engine.supersede_queued_reminders(self.lane(), [types.SimpleNamespace(key="reminder:" + ident)])
+            self.assertEqual(self.writes("session.inbox.cancel"), [], "the re-armed copy itself was cancelled")
+            self.assertIn(copy["id"], [i["id"] for i in self.inbox()])
+
+        def test_mutant_8_without_the_new_key_exclusion_the_copy_itself_is_cancelled(self):
+            self.kills("supersede_queued_reminders", "v == ident and k != new_key", "v == ident", self.scenario_self_copy,
+                       "the re-armed copy itself was cancelled")
+
+        def scenario_fresh(self):
+            import types
+            self.build({})
+            self.attach_cancel()
+            self.work(lasts=7200, steps=3)
+            self.remind("platform", "first", key="K")
+            second = sb.add_reminder(self.world.state, "platform", self.world.clock.now(), self.world.clock.now(), "second",
+                                     sender="coder", key="K")
+            engine = self.world.engine
+            seen = []
+            real = engine.reads.inbox
+            with mock.patch.object(engine.reads, "inbox", lambda sid, now, fresh=False: seen.append(fresh) or real(sid, now, fresh=fresh)):
+                engine.supersede_queued_reminders(self.lane(), [types.SimpleNamespace(key="reminder:%s" % second["id"])])
+            self.assertEqual(seen, [True], "the inbox was not read afresh before the cancel")
+
+        def test_mutant_9_without_fresh_a_cached_inbox_is_trusted(self):
+            self.kills("supersede_queued_reminders", "self.reads.inbox(observation.session_id, self.now(), fresh=True) or []",
+                       "self.reads.inbox(observation.session_id, self.now()) or []", self.scenario_fresh,
+                       "the inbox was not read afresh before the cancel")
+
+        def scenario_bound(self):
+            self.old_item(minutes=0)
+            engine = self.world.engine
+            now = self.world.clock.now()
+            exact, younger = self.inbox()[-1], self.queue_message("one second younger")
+            exact["time"]["created"], younger["time"]["created"] = self.world.clock.ms(now - 1200), self.world.clock.ms(now - 1199)
+            self.assertEqual(engine.steer_unconsumed(self.lane(), now), [exact["id"]], "the bound is not inclusive or not exact")
+
+        def test_mutant_10_with_a_looser_bound_the_item_exactly_at_it_is_not_steered(self):
+            self.kills("steer_unconsumed", "now - _created(item) >= bound", "now - _created(item) > bound + 1", self.scenario_bound,
+                       "the bound is not inclusive or not exact")
+
     return TestUnconsumedSteer
