@@ -196,6 +196,27 @@ def build(PR4Base):
             self.mutated_run(sb.ReminderFacts, "drop_older_copies", "self.swept |= gone", "self.swept = set(gone)",
                              lambda: self.accumulate_check("m"), r"(?s)low5: the swept set accumulates over the deliveries of a pass$")
 
+        def keep_newer_check(self, tag):
+            """The delivered copy is the older one (its newer sibling is still in the future): the newer copy of the same key and recipient is kept."""
+            base = self.t + 10
+            delivered = self.add("a", base + 9, base + 20, key=tag)
+            newer = self.add("b", base + 30, base + 5000, key=tag)
+            self.world.v2.start_turn(self.world.sessions["platform"], "fleet task", fleet=True, lasts=400)
+            self.world.tick(base + 100 - self.t)
+            self.t = base + 100
+            self.world.engine.run_pass()
+            self.assertIn(delivered["id"], self.delivered_ids(), msg="low6: the due copy is delivered")
+            self.assertIn(newer["id"], [i["id"] for i in sb.read_reminders(self.world.state)], msg="low6: a copy newer than the delivered one is kept")
+            self.world.tick(500)
+            self.t += 500
+
+        def test_low6_a_newer_copy_of_the_same_key_and_recipient_is_kept(self):
+            self.keep_newer_check("n")
+
+        def test_low6_mutant_not_equal_for_less_than_fails_after_the_control(self):
+            self.mutated_run(sb.ReminderFacts, "drop_older_copies", "< mark", "!= mark",
+                             lambda: self.keep_newer_check("o"), r"(?s)low6: a copy newer than the delivered one is kept$")
+
         def test_s5_a_copy_dropped_in_the_same_pass_is_audited_as_swept(self):
             self.setup_s2()
             self.hold_then_free()
