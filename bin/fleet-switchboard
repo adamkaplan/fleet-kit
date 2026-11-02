@@ -17516,7 +17516,7 @@ def cmd_item_prove(args, runner, now):
             print("already recorded proof #%d: %s %s at %s (%s)" % (found["seq"], sid, args.result, pin[:8], ctx.item))
             continue
         entry = {"kind": "proof", "pr": ctx.item, "scenario": sid, "plan_ref": ctx.source, "plan_hash": ctx.plan["plan_hash"], "head": pin, "result": args.result,
-                 "by": caller, "evidence": evidence, "command": plan_ledger.clip(redact_command_text(args.command or "")), "via": "item",
+                 "by": caller, "evidence": evidence, "command": plan_ledger.bounded_text(redact_command_text(args.command or ""), plan_ledger.FIELD_LIMIT, "command"), "via": "item",
                  "env": "%s %s" % (sys.platform, "python%d.%d" % sys.version_info[:2])}
         stored = plan_ledger.append_entry(ctx.state, entry, now())
         _item_audit(ctx, "plan.item.proof", {"scenario": sid, "result": args.result, "by": caller, "reference_commit": pin, "seq": stored["seq"]})
