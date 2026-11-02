@@ -237,6 +237,31 @@ class TestOpenListDerivedText(Base):
         return path
 
 
+def drain_two_with_a_failing_first(mod, notes_out):
+    """The REAL publish_decisions of `mod` with two repositories noted and open_list_alert raising for a/a only; returns the alert counts."""
+    mod.take_open_cuts()
+    mod.note_open_cut("a/a")
+    mod.note_open_cut("b/b")
+    seen = []
+
+    def alert(engine, repo, now):
+        seen.append(repo)
+        if repo == "a/a":
+            raise RuntimeError("boom")
+    engine = types.SimpleNamespace(config={"plan_gates": {"repos": {}}, "github_repos": []}, state_dir="/nonexistent", actor="daemon",
+                                   discovery=types.SimpleNamespace(agents={}), audit=types.SimpleNamespace(append=lambda *a: None),
+                                   hub=None, now=lambda: NOW, _note=lambda *a, **k: notes_out.append(a))
+    quiet = lambda *a, **k: None
+    with mock.patch.object(mod, "open_list_alert", alert), mock.patch.object(mod, "derive_decisions", lambda e, n: ([], [])), \
+            mock.patch.object(mod, "sweep_decisions", lambda e, d, n, errs: d), mock.patch.object(mod, "triage_pass", quiet), \
+            mock.patch.object(mod, "pr_events_pass", quiet), mock.patch.object(mod, "ci_record_pass", quiet), mock.patch.object(mod, "pane_health_pass", quiet), \
+            mock.patch.object(mod, "decision_store", lambda e: types.SimpleNamespace(publish=lambda *a, **k: True)), \
+            mock.patch.object(mod, "chat_clear_pass", quiet), mock.patch.object(mod, "apply_notice_effects", quiet), mock.patch.object(mod, "prune_escalations_pass", quiet), \
+            mock.patch.object(mod, "sync_external", lambda *a, **k: []), mock.patch.object(mod, "work_sync_external", quiet):
+        mod.publish_decisions(engine)
+    return seen
+
+
 class TestOpenListCutsMutants(Base):
     """S11 and S12 mutants: one textual replacement each in a copy of the entry, control first, the mutation asserted applied."""
 
@@ -291,6 +316,17 @@ class TestOpenListCutsMutants(Base):
             self.assertEqual(mod.take_open_cuts(), [], msg="no stale cut")
         text = self.run_pair("    _OPEN_CUTS.clear()\n", "    pass\n", "s12", check)
         self.assertIn("no stale cut", text)
+
+    def test_one_failing_alert_loses_the_other_cuts_of_the_pass(self):
+        def check(mod):
+            notes = []
+            seen = drain_two_with_a_failing_first(mod, notes)
+            self.assertEqual(seen.count("b/b"), 1, msg="one failing alert loses the other cuts of the pass")
+            self.assertEqual([n for n in notes if n[0] == "open_list.error"].__len__(), 1)
+        loop = '    for repo in take_open_cuts():   # #1886: the daily alert for every read of this pass that stopped at the ceiling\n        try:\n            open_list_alert(engine, repo, now)\n        except Exception as err:\n            engine._note("open_list.error", repo, {"error": _one_line("%s: %s" % (type(err).__name__, err), 200), "repo": repo})\n'
+        mutated = '    try:\n        for repo in take_open_cuts():\n            open_list_alert(engine, repo, now)\n    except Exception as err:\n        engine._note("open_list.error", None, {"error": _one_line("%s: %s" % (type(err).__name__, err), 200)})\n'
+        text = self.run_pair(loop, mutated, "drain", check)
+        self.assertIn("one failing alert loses the other cuts of the pass", text)
 
     def held_rows_after_a_failed_read(self, mod):
         """The REAL ci_record_pass and the REAL label_hold_entries: a cut list (1,200 records) whose held pull request fell beyond the first 1,000, then a failed read."""
