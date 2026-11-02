@@ -23,6 +23,28 @@ UPPER = "room is counted from the pods this login can see: an upper bound"
 MUTANT_TEXT = "a refused read stopped the launch"
 WRITE_VERBS = ("create", "patch", "apply", "delete", "annotate", "replace", "edit")
 
+V4, V6, MAPPED = "10.99.88.77", "fd00:abcd::1", "::ffff:10.99.88.77"
+U11_CHECKER = r"""
+import importlib.util, json, sys
+spec = importlib.util.spec_from_file_location("launcher_u11", sys.argv[1] + "/cloud/launcher/cloud_worker.py")
+lib = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(lib)
+class K:
+    def list_nodes(self):
+        return [{"metadata": {"name": n}, "status": {"allocatable": {"cpu": "4", "memory": "8Gi"}}} for n in ("n1", "host-10.99.88.77")]
+    def list_pods_all(self):
+        return [{"metadata": {"name": "p"}, "status": {"phase": "Running"}, "spec": {"nodeName": "host-fd00:abcd::1", "containers": []}}]
+    def list_events(self):
+        return [{"reason": "FailedScheduling", "message": "at 12:30:45: 10.99.88.77 fd00:abcd::1 ::ffff:10.99.88.77 Insufficient cpu"}]
+    def scrub(self, text, limit=300):
+        return lib.scrub(text, set(), limit)
+text = json.dumps(lib.Launcher.capacity(type("L", (), {"kube": K()})(), None))
+if any(p in text for p in ("10.99.88.77", "fd00:abcd::1", "ffff:10.99.88.77")):
+    sys.exit("an address reached the block: " + text)
+if "12:30:45" not in text or '"n1"' not in text:
+    sys.exit("a clock time or a name was changed: " + text)
+"""
+
 CHECKER = r"""
 WRITE_VERBS = ("create", "patch", "apply", "delete", "annotate", "replace", "edit")
 import ast, importlib.util, re, sys
@@ -397,5 +419,64 @@ def build():
             code, err = self.scratch_check(("bin/cloud_worker.py", "except CloudError:\n            body = None", "except CloudError:\n            raise"))
             self.assertEqual(code, 1, err)
             self.assertIn("a refused read stopped the launch", err)
+
+        # -- U11 (PC-10): an address of the three forms is masked in the event line and in a node name; the block prints the event line, the node names are in the answer
+        def u11_cluster(self, with_addresses):
+            tail = (" addrs %s %s %s" % (V4, V6, MAPPED)) if with_addresses else ""
+            event = dict(EVENT, message="0/13 nodes are available at 12:30:45:" + tail + " Insufficient cpu")
+            names = ["n1", "n2", "n3", "n4"]
+            nodes = [node(n, "8" if n == "n1" else "4") for n in names]
+            if with_addresses:
+                nodes.append(node("host-" + V4, "4"))
+            self.set_cluster(FakeKube(nodes=nodes, events=(event,)))
+            return json.loads((self.stub_dir / "capacity.json").read_text())
+
+        def u11_count(self, block, answer, planted_in_names):
+            text = block + "\n" + json.dumps(answer)
+            plain = {p: text.count(p) for p in (V4, V6, "ffff:" + V4)}
+            return plain, block.count("[address]"), json.dumps(answer["nodes"]).count("[address]")
+
+        def test_u11_control_no_address_prints_none_and_keeps_the_clock_time(self):
+            answer = self.u11_cluster(False)
+            code, out, err = self.launch_with("--cloud")
+            block = self.block(err)
+            self.assertEqual(self.u11_count(block, answer, False)[1:], (0, 0), block)
+            self.assertIn("12:30:45", block)
+            self.assertEqual([n["name"] for n in answer["nodes"]], ["n1", "n2", "n3", "n4"])
+
+        def test_u11_the_three_forms_are_masked_in_the_event_line_and_in_a_node_name(self):
+            answer = self.u11_cluster(True)
+            code, out, err = self.launch_with("--cloud")
+            block = self.block(err)
+            plain, in_block, in_names = self.u11_count(block, answer, True)
+            self.assertEqual(plain, {V4: 0, V6: 0, "ffff:" + V4: 0}, "an address reached the block: " + block)
+            self.assertEqual((in_block, in_names), (3, 1), block)
+            self.assertIn("12:30:45", block)
+            names = [n["name"] for n in answer["nodes"]]
+            self.assertEqual(names[:4], ["n1", "n2", "n3", "n4"])
+            self.assertEqual(names[4], "host-[address]")
+
+        def test_u11_the_control_passes_and_a_mutant_masking_only_ipv4_fails_with_the_text(self):
+            code, err = self.scratch_u11()
+            self.assertEqual((code, err), (0, ""))
+            code, err = self.scratch_u11(("cloud/launcher/cloud_worker.py", "MASK_IPV6 = True", "MASK_IPV6 = False"))
+            self.assertEqual(code, 1, err)
+            self.assertIn("an address reached the block", err)
+
+        def scratch_u11(self, mutate=None):
+            import shutil, subprocess, tempfile
+            root = Path(__file__).resolve().parents[2]
+            with tempfile.TemporaryDirectory(prefix="u11-") as tmp:
+                for src in sorted((root / "cloud" / "launcher").glob("*.py")):
+                    rel = src.relative_to(root)
+                    (Path(tmp) / rel).parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy(src, Path(tmp) / rel)
+                if mutate:
+                    rel, old, new = mutate
+                    text = (Path(tmp) / rel).read_text()
+                    self.assertEqual(text.count(old), 1, "the mutant's text is not in the copy: " + old)
+                    (Path(tmp) / rel).write_text(text.replace(old, new))
+                done = subprocess.run([sys.executable, "-c", U11_CHECKER, tmp], capture_output=True, text=True, timeout=60)
+            return done.returncode, done.stderr
 
     return TestLaunchCapacity
