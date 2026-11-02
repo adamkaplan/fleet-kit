@@ -131,5 +131,34 @@ class Events(unittest.TestCase):
         print(RESULTS["S13"])
 
 
+class HangGuard(unittest.TestCase):
+    def test_s10_script_that_never_starts_raises_under_a_fake_clock(self):
+        sys.path.insert(0, HERE)
+        sys.path.insert(0, os.path.join(ROOT, "cloud", "worker", "tests"))
+        import test_cloud_pr_preflight as m
+        self.assertEqual(m._clock, __import__("time").monotonic)   # the control: the real clock, the signal tests run with it
+        ticks = iter([1000.0])
+        self.addCleanup(setattr, m, "_clock", m._clock)
+        m._clock = lambda: next(ticks, 1000.0 + m.START_WAIT_LIMIT + 1)
+        t = m.Signals("test_sigterm_cleans_up")
+        t.setUp()
+        self.addCleanup(t.doCleanups)
+        script = os.path.join(t.r.d, "sleeper.py")
+        with open(script, "w") as f:
+            f.write("import time\ntime.sleep(30)\n")
+        started = []
+        real = m.stub_support.start
+        def spy(*a, **kw):
+            p = real(*a, **kw); started.append(p); return p
+        self.addCleanup(setattr, m.stub_support, "start", real)
+        m.stub_support.start = spy
+        with self.assertRaises(AssertionError) as c:
+            t.go(signal.SIGTERM, script=script)
+        self.assertIn("did not start its test file within", str(c.exception))
+        dead = started[0].poll() is not None
+        self.assertTrue(dead)
+        print("S10: a script that never starts raises `did not start its test file within` under a fake clock, 1 of 1; child killed %s" % dead)
+
+
 if __name__ == "__main__":
     unittest.main()

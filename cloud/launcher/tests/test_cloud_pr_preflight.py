@@ -6,6 +6,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.a
 SCRIPT = os.path.join(ROOT, "bin", "cloud-pr-preflight")
 sys.path.insert(0, os.path.join(ROOT, "cloud", "worker", "tests"))
 import stub_support  # noqa: E402
+START_WAIT_LIMIT = 60   # a hang guard only: it converts a hang into a failure text and never decides a verdict
+_clock = time.monotonic   # a test replaces it
 PASS = "import sys\nsys.exit(0)\n"
 FAIL = "import sys\nsys.exit(1)\n"
 CHAIN = '#!/bin/sh\nEXCEPTIONS=""\n'
@@ -190,9 +192,13 @@ class Signals(unittest.TestCase):
         marker = os.path.join(marker_dir, "started")
         e = dict(os.environ, CLOUD_PREFLIGHT_TIMEOUT="30", CLOUD_PREFLIGHT_BASE="main", CLOUD_PREFLIGHT_STARTED=marker)
         p = stub_support.start(self, [sys.executable, script], cwd=self.r.d, env=e, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, preexec_fn=lambda: signal.signal(signal.SIGINT, signal.SIG_DFL))
+        deadline = _clock() + START_WAIT_LIMIT
         while not os.path.exists(marker):   # the sleeping test file writes the marker when it has STARTED: an event, not a guess
             if p.poll() is not None:
                 raise AssertionError("the preflight script ended before its test file started (exit %s)" % p.returncode)
+            if _clock() > deadline:
+                p.kill(); p.wait()
+                raise AssertionError("the preflight script did not start its test file within 60 seconds (hung)")
             time.sleep(0.02)
         self.assertTrue(leftovers(before), "no temp copy appeared")
         p.send_signal(sig)
