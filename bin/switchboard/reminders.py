@@ -349,6 +349,44 @@ def alert_stale(subject, record, fact, standing):
     return ""
 
 
+PASS_SUBJECTS = {"sweep": "sweep_facts", "triage": "triage_facts", "plan": "plan_wake_facts"}   # #1542: the fact source whose pass keeps each kind's present state
+SWEEP_KEY_RE = re.compile(r"^sweep:[0-9a-f]{10}:[0-9]+$")
+PLAN_KEY_RE = re.compile(r"^plan:([^#:\s]+/[^#:\s]+)#([0-9]+):([^:\s]+):")
+
+
+def pass_subject(fact):
+    """(kind, repo, number, expected) of a sweep fact, a triage digest or a plan notice, or None: ("sweep" or "triage", "", 0, the fact key) is judged
+    against the pairs its pass holds now; ("plan", repo, n, hash) against the hash of the newest plan on that issue."""
+    if fact.kind == "sweep" and SWEEP_KEY_RE.match(fact.key):
+        return ("sweep", "", 0, fact.key)
+    if is_digest(fact):
+        return ("triage", "", 0, fact.key)
+    found = PLAN_KEY_RE.match(fact.key) if fact.kind == "plan" else None
+    return ("plan", found.group(1), int(found.group(2)), found.group(3)) if found else None
+
+
+def pass_record(read, subject):
+    """The present record of a pass subject, or None when it cannot be read (no pass has run, a failed read): the fact is then kept, marked."""
+    try:
+        record = read(subject)
+    except Exception:
+        return None
+    return record if isinstance(record, dict) else None
+
+
+def pass_stale(subject, record):
+    """Why a sweep, triage or plan fact is no longer true against its pass's present state, or "" when it still is. One pair still present keeps the whole fact. Pure."""
+    kind, _repo, _number, expected = subject
+    if kind == "plan":
+        now = record.get("hash")
+        return "a newer plan (hash %s) replaced it" % str(now)[:12] if isinstance(now, str) and now != expected else ""
+    pairs, present = record.get("pairs"), record.get("present")
+    if not isinstance(pairs, list) or not isinstance(present, list) or not pairs:
+        return ""
+    here = {tuple(p) for p in present}
+    return "" if any(tuple(p) in here for p in pairs) else "none of its %d finding%s is present any more" % (len(pairs), "" if len(pairs) == 1 else "s")
+
+
 def digest_replaced(facts, delivered):
     """{key: the current digest} for each digest older than DIGEST_REPLACE_AFTER that a newer digest for the same recipient replaces."""
     newest = {}
@@ -369,6 +407,16 @@ def judge_delivery(facts, delivered, read, standing):
     for fact in facts:
         if fact.key in replaced:
             dropped.append((fact, "digest", "replaced by the current digest %s" % replaced[fact.key].key))
+            continue
+        mine = pass_subject(fact) if read is not None else None
+        if mine is not None:   # #1542: a sweep fact, a triage digest or a plan notice, judged against its own pass's present state
+            found = pass_record(read, mine)
+            why = pass_stale(mine, found) if found is not None else ""
+            if why:
+                dropped.append((fact, mine[0], why))
+            else:
+                kept.append(fact if found is not None else Fact(fact.key, fact.recipient, fact.kind, UNVERIFIED_MARK + fact.summary, fact.created, issue=fact.issue,
+                                                                batch=fact.batch, sender=fact.sender, rider=fact.rider, repo=fact.repo))
             continue
         subject = alert_subject(fact) if read is not None else None
         if subject is None:

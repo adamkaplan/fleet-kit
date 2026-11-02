@@ -3185,6 +3185,11 @@ class Switchboard:
         seen = {}
         def read(subject):
             kind, repo, number, _expected = subject
+            if kind in PASS_SUBJECTS:   # #1542: a pass's own present state, from the fact source that made the fact: no GitHub read, no budget
+                slot = (kind, repo, number, _expected)
+                if slot not in seen:
+                    seen[slot] = self.pass_state(kind, subject)
+                return seen[slot]
             slot = (SUBJECT_ENDPOINT[kind], repo, number)
             if slot not in seen:
                 if len(seen) >= MAX_PRESENT_READS:
@@ -3195,6 +3200,16 @@ class Switchboard:
                     seen[slot] = None
             return seen[slot]
         return read
+
+    def pass_state(self, kind, subject):
+        """#1542: the present record of a sweep, triage or plan fact, asked of the fact source that made it; None when it cannot be read."""
+        for source in self.sources:
+            if getattr(source, "__name__", "") == PASS_SUBJECTS[kind] and hasattr(source, "present_record"):
+                try:
+                    return source.present_record(subject)
+                except Exception:
+                    return None
+        return None
 
     def drop_stale(self, recipient, dropped):
         """Audit each dropped fact (what, why, when it was sent) and tell the fact sources to forget it, so it does not return."""
@@ -10553,11 +10568,13 @@ def sweep_decisions(engine, decisions, now, errors=()):
     candidates = sweep_findings(engine, state, kept, home, now, cfg, regex, defer, whole_list)
     findings, unchecked = [], 0
     attempts = sorted(candidates, key=lambda c: (state.attempted.get(c, 0), c))  # the longest untried first
+    held = set()   # #1542: candidates this pass could not judge: still present for the delivery re-check
     for pair in attempts:
         if now - state.confirmed.get(pair, 0) < SWEEP_TTL:
             findings.append(pair)
             continue
         if engine.now() - state.started >= SWEEP_PASS_SECONDS:
+            held.add(pair)
             unchecked += 1
             continue
         state.attempted[pair] = now
@@ -10566,6 +10583,7 @@ def sweep_decisions(engine, decisions, now, errors=()):
             state.confirmed[pair] = now
             findings.append(pair)
         elif verdict is None:
+            held.add(pair)
             unchecked += 1
         else:
             state.confirmed.pop(pair, None)
@@ -10574,6 +10592,7 @@ def sweep_decisions(engine, decisions, now, errors=()):
                 engine._note("sweep.dismissed", pair[1], {"kind": pair[0], "ref": pair[1],
                                                           "why": "a fresh read does not bear it out"})
     findings.sort()
+    state.present = set(findings) | held   # #1542: what the delivery re-check reads; absent until a pass has run
     day = int(now // 86400)
     due = [(k, r) for k, r in findings
            if cfg["enabled"] and now - state.alarmed.get((k, r), 0) >= cfg["realarm_hours"] * 3600]   # what is queued this pass
@@ -10625,6 +10644,7 @@ def sweep_queue_fact(state, due, now, cfg):
     for pair in due:
         state.alarmed[pair] = now
     state.facts[key] = (summary, now)
+    state.__dict__.setdefault("fact_pairs", {})[key] = list(shown)   # #1542: the pairs the fact lists, for the delivery re-check
     for old in [k for k, (_, at) in state.facts.items() if now - at > cfg["realarm_hours"] * 7200]:
         del state.facts[old]
     return set(due)   # every due finding is carried (named, or counted in "+N more") and remembered
@@ -10669,6 +10689,11 @@ class SweepFacts:
         chiefs = sorted(n for n, o in discovery.agents.items() if (o.fleet or {}).get("role") == "chief-of-staff")
         return [Fact(key, name, "sweep", summary, created, sender="switchboard")
                 for key, (summary, created) in sorted(state.facts.items()) for name in chiefs]
+
+    def present_record(self, subject):   # #1542: {"pairs", "present"} of this fact, None when the pass has not run or the fact is not known
+        state = getattr(self.engine, "sweep", None) if self.engine else None
+        present, pairs = getattr(state, "present", None), getattr(state, "fact_pairs", {}).get(subject[3])
+        return None if present is None or pairs is None else {"pairs": [list(p) for p in pairs], "present": [list(p) for p in present]}
 
 
 # ---- #765: a posted or edited plan tells its approver once per hash. Reads only what the triage pass already holds (no GitHub read of its own).
@@ -10762,6 +10787,7 @@ def plan_wake_pass(engine, state, repos, now, budget=None):
                 continue
             body = plan["body"]
             plan_hash = check_module.plan_hash(body)
+            wake.__dict__.setdefault("newest", {})[(repo, number)] = plan_hash   # #1542: the present hash, for the delivery re-check
             if consensus is None:
                 consensus = plan_wake_consensus(engine)
             if (plan_hash in consensus or module.approved_by_comment(plan, plan_hash, by_issue.get(number, []), signed_by_fleet)
@@ -10847,6 +10873,11 @@ class PlanWakeFacts:
             return []
         return [Fact(key, name, "plan", text, created, issue=number, sender="switchboard", repo=repo)
                 for key, (text, created, name, repo, number) in sorted(wake.facts.items())]
+
+    def present_record(self, subject):   # #1542: {"hash"} of the newest plan the plan pass saw on the issue; None when it has not seen one
+        wake = getattr(self.engine, "plan_wake", None) if self.engine else None
+        found = getattr(wake, "newest", {}).get((subject[1], subject[2]))
+        return None if found is None else {"hash": found}
 
 
 # ---- the daily friction wake (docs/switchboard.md, "Self-wakes"). Off unless `friction_wake.enabled`; like

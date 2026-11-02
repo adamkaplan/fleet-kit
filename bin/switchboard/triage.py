@@ -1062,6 +1062,7 @@ def triage_pass(engine, decisions, now, errors=()):
     candidates, unchecked_units, truncated = triage_findings(engine, state, repos, decisions, cfg, now, errors)
     findings, unchecked, unchecked_other, oldest = [], 0, 0, 0.0
     why = {}   # #605: repo -> {reason: count}, and its other-owner share and oldest age, for the report
+    held = set()   # #1542: candidates this pass could not judge: still present for the delivery re-check
 
     def verify(rule, ref, evidence):
         """True/False/None for one finding; keeps the confirmed, verified and attempted records."""
@@ -1093,6 +1094,7 @@ def triage_pass(engine, decisions, now, errors=()):
         if verdict:
             findings.append((rule, ref, dict(evidence, **state.enriched.pop(pair, {}))))
         elif verdict is None:
+            held.add(pair)
             unchecked += 1
             unchecked_other += rule == "OO"
             oldest = max(oldest, now - state.verified.get(pair, state.first_seen[pair]))
@@ -1103,6 +1105,7 @@ def triage_pass(engine, decisions, now, errors=()):
             entry["other_owner"] += rule == "OO"
             entry["oldest"] = max(entry["oldest"], now - state.verified.get(pair, state.first_seen[pair]))
     findings.sort()
+    state.present = {(r, ref) for r, ref, _ in findings} | held   # #1542: what the delivery re-check reads; absent until a pass has run
     day = int(now // 86400)
     counts, other_owner = {}, 0
     for rule, ref, evidence in findings:
@@ -1272,6 +1275,7 @@ def triage_queue_fact(state, due, now, cfg, other_owner=0, invalid=()):
     for pair in shown:
         state.alarmed[pair] = now
     state.facts[key] = (summary, now)
+    state.__dict__.setdefault("fact_pairs", {})[key] = list(shown)   # #1542: the items the digest lists, for the delivery re-check
     for old in [k for k, (_, at) in state.facts.items() if now - at > cfg["realarm_hours"] * 7200 and "summary" not in k]:
         del state.facts[old]
     state.carried = set(shown)   # #849: what this digest carried and remembered; an overflow beyond the cap stays due
