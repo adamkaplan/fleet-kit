@@ -59,7 +59,8 @@ class CutsBase(Base):
             sb.open_list_alert(self.engine, repo, now)
 
     def five_reads(self, total=2000, repo="acme/api"):
-        hub = real_hub(total)
+        self.requests = []
+        hub = real_hub(total, self.requests)
         sb.sweep_read_repo(hub, repo, NOW, 7, sb.sweep_phrase_re(["Alex"]), [100], sb.SweepState().strong)
         sb.triage_read_unit(hub, repo, "issues", NOW, [100])
         engine = types.SimpleNamespace(config={"plan_gates": {"repos": {repo: {}}}}, state_dir=str(self.state_dir), audit=self.engine.audit,
@@ -76,6 +77,7 @@ class TestOpenListCuts(CutsBase):
     def test_s11_five_reads_note_five_and_the_pass_raises_one_alert_and_the_next_day_one_more(self):
         self.five_reads()
         self.assertEqual(self.notes, ["acme/api"] * 5, msg="each of the five readers notes the repository once")
+        self.assertEqual(len([r for r in self.requests if "state=open" in r]), 30, msg="ten pages each for the sweep, the triage and the recorder (a clamp at 5 pages reads 15)")
         self.end_of_pass(NOW)
         self.assertEqual((len(self.lines("open_list.cut")), len(self.reminders)), (1, 1))
         self.assertEqual(sb.take_open_cuts(), [])
