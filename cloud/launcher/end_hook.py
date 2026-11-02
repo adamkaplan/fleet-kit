@@ -244,6 +244,16 @@ def no_checkout(workdir):
     return True
 
 
+def wip_branch_for(workdir, worker, ctx):
+    """(branch, blocked_by): <worker>/wip, or <worker>-wip when a remote branch named like the worker (refreshed by the bounded fetch) blocks it."""
+    try:
+        p = subprocess.run([GIT_BIN, "-C", workdir] + (ctx.opts if ctx else []) + ["show-ref", "--verify", "--quiet", "refs/remotes/origin/" + worker],
+                           capture_output=True, env=ctx.env if ctx else None, timeout=FETCH_TIMEOUT_SECONDS)
+    except (subprocess.TimeoutExpired, OSError):
+        return "%s/wip" % worker, None
+    return ("%s-wip" % worker, worker) if p.returncode == 0 else ("%s/wip" % worker, None)
+
+
 def run(workdir, worker, prestop=False, repo=None, ctx=None):
     # Three answers: no checkout at all (see no_checkout: nothing was cloned, nothing can be lost; this answer carries
     # no_repository), a checkout whose push fails (RuntimeError from git: the caller prints `error`, exit 1), and
@@ -275,12 +285,14 @@ def run(workdir, worker, prestop=False, repo=None, ctx=None):
     contained = git(workdir, "branch", "-r", "--contains", "HEAD", ctx=ctx).stdout.strip()
     if contained:
         return {"pushed": False, "wip_branch": None, "skipped": skipped}
-    branch = "%s/wip" % worker
+    branch, blocked_by = wip_branch_for(workdir, worker, ctx)
     # prestop: a plain push to the explicit URL, never forced and no lease: a non-fast-forward answer is a failure, not an overwrite
     if prestop:
         git(workdir, "push", "--no-verify", url, "HEAD:refs/heads/" + branch, ctx=ctx)
     else:
         git(workdir, "push", "--force-with-lease", "origin", "HEAD:refs/heads/" + branch)
+    if blocked_by:
+        return {"pushed": True, "wip_branch": branch, "skipped": skipped, "wip_blocked_by": blocked_by}
     return {"pushed": True, "wip_branch": branch, "skipped": skipped}
 
 
@@ -363,6 +375,9 @@ def prestop_main():
         config_refusal(workdir, repo, ctx)
         trusted = True
         res = run(workdir, worker, prestop=True, repo=repo, ctx=ctx)
+        if res["pushed"] and res.get("wip_blocked_by"):
+            print("cw-prestop: saved work to %s (%s/wip is blocked by the branch %s)" % (res["wip_branch"], worker, res["wip_blocked_by"]))
+            return 0
         if res["pushed"]:
             print("cw-prestop: saved work to %s" % res["wip_branch"])
         elif isinstance(res, NothingToPush):

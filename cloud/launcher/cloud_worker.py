@@ -2251,6 +2251,9 @@ class Launcher:
             if no_repo:
                 view["note"] = NO_REPOSITORY_NOTE
                 info["hook_note"] = NO_REPOSITORY_NOTE
+            blocked = self.kube.scrub(res.get("wip_blocked_by"), 200) if isinstance(res.get("wip_blocked_by"), str) and view["wip_branch"] else ""
+            if blocked:   # a hook of a newer image: the fallback ref was used because <worker>/wip is blocked by the branch <worker>
+                view["wip_blocked_by"] = blocked
             self.last_hook = {k: view[k] for k in ("pushed", "wip_branch", "error")}
             self._hook_record(info, dict(view, ran=True, refresh=info["refresh"]))
             if view["error"]:
@@ -2276,6 +2279,10 @@ class Launcher:
                 print("cloud-worker: end hook: %s; nothing to push" % note, file=sys.stderr)
             if skipped:  # these files were not pushed and went with the pod: say so, loudly
                 print("cloud-worker: WARNING: not saved (secret-looking names): %s" % ", ".join(skipped), file=sys.stderr)
+            if blocked:
+                print("cloud-worker: end hook: saved work to %s (%s/wip is blocked by the branch %s)" % (view["wip_branch"], worker, blocked), file=sys.stderr)
+                return {"worker": worker, "runtime_id": "pod/" + name, "pushed": bool(res.get("pushed")), "wip_blocked_by": blocked,
+                        "wip_branch": view["wip_branch"], "skipped": skipped, "record": info.get("record", "")}
             return {"worker": worker, "runtime_id": "pod/" + name, "pushed": bool(res.get("pushed")),
                     "wip_branch": view["wip_branch"], "skipped": skipped, "record": info.get("record", "")}
         return self._audited(worker, "stop", go, audit_reason)
