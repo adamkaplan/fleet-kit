@@ -38,9 +38,10 @@ def make_tree(testtext=None, scripttext=None):
     return d
 
 
-def run_real(tree, name, sigint_ignored=False, bound=60):
+def run_real(tree, name, sigint_ignored=False, bound=60, tmpdir=None):
     """Run Signals.<name> of the copy as a child; returns (exit status, output)."""
-    kw = {"preexec_fn": lambda: signal.signal(signal.SIGINT, signal.SIG_IGN)} if sigint_ignored else {}
+    kw = {"env": dict(os.environ, TMPDIR=tmpdir)} if tmpdir else {}
+    kw.update({"preexec_fn": lambda: signal.signal(signal.SIGINT, signal.SIG_IGN)} if sigint_ignored else {})
     cwd = os.path.join(tree, "cloud", "launcher", "tests")
     try:
         p = subprocess.run([sys.executable, "-B", "-m", "unittest", "test_cloud_pr_preflight.Signals." + name],
@@ -93,22 +94,28 @@ class Events(unittest.TestCase):
     def test_s13_sigint_condition(self):
         src = read(TESTFILE)
         name = "test_sigint_cleans_up"
-        tmp = tempfile.gettempdir()
-        before_c = set(os.listdir(tmp))
-        rc_c, out_c = run_real(self.tree(), name, sigint_ignored=True)
-        left_c = sorted(x for x in set(os.listdir(tmp)) - before_c if x.startswith("cloud-preflight-"))
-        for x in left_c:
-            shutil.rmtree(os.path.join(tmp, x), ignore_errors=True)
-        control_named = left_c[0] if left_c else ""
-        self.assertEqual(control_named, "", left_c)
+        def seen_run(m_tree):
+            """Run the child with its own TMPDIR root; a watcher records each cloud-preflight-* name the moment it appears (the child removes its own temporary directory when its test ends)."""
+            root = tempfile.mkdtemp(prefix="pf-s13-root-"); self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+            seen, stop = set(), threading.Event()
+            def watch():
+                while not stop.is_set():
+                    seen.update(os.path.basename(x) for x in glob.glob(os.path.join(root, "*", "cloud-preflight-*")) + glob.glob(os.path.join(root, "cloud-preflight-*")))
+                    stop.wait(0.002)
+            t = threading.Thread(target=watch, daemon=True); t.start()
+            try:
+                rc, out = run_real(m_tree, name, sigint_ignored=True, tmpdir=root)
+            finally:
+                stop.set(); t.join()
+            after = glob.glob(os.path.join(root, "*", "cloud-preflight-*")) + glob.glob(os.path.join(root, "cloud-preflight-*"))
+            return rc, out, sorted(seen), after
+        rc_c, out_c, seen_c, after_c = seen_run(self.tree())
+        control_named = after_c[0] if after_c else ""
+        self.assertEqual(control_named, "", after_c)
         control = int(rc_c == 0 and control_named == "")
         self.assertEqual(control, 1, out_c)
         m = once(src, RESTORE, "")
-        before = set(os.listdir(tempfile.gettempdir()))
-        rc_m, out_m = run_real(self.tree(testtext=m), name, sigint_ignored=True)
-        left = sorted(x for x in set(os.listdir(tempfile.gettempdir())) - before if x.startswith("cloud-preflight-"))
-        for x in left:
-            shutil.rmtree(os.path.join(tempfile.gettempdir(), x), ignore_errors=True)
+        rc_m, out_m, left, _after = seen_run(self.tree(testtext=m))
         self.assertNotEqual(rc_m, 0, out_m)
         # the pinned hang guard raises its own text (the script ignores SIGINT and does not end); the temporary copy it leaves is named by the listing
         self.assertIn("AssertionError: the preflight script did not end within 20 seconds after the signal (hung)", out_m)
