@@ -378,6 +378,7 @@ def build():
 
     class TestPlanHashMarkerRounds(host.TestPlanReviewCommands):
         """S9, S11: the commands of a review round, each run through the entry with the fixtures of TestPlanReviewCommands."""
+        S12_CALLS = {}
         PREDATES = "this round predates the hash pair: start a new round"
 
         def setUp(self):
@@ -578,17 +579,26 @@ def build():
 
         # -- S12: abandon and report on a round without the pair
 
-        def count_plan_reads(self):
-            """Wrap the fake's route so every gh read of an issue is counted; returns the list that grows."""
-            reads = []
+        PLAN_ROUTE = re.compile(r"/issues/\d+(/comments)?(\?.*)?$")   # the plan's routes: the issue itself and the comments of the plan's issue
+
+        def count_calls(self):
+            """Wrap the fake's one entry point (self.route: every gh call and the engine's reader pass it) so EVERY call, of every route and method, is recorded."""
+            calls = []
             real_route = self.route
 
             def counting(argv, **kwargs):
-                if argv and argv[0] == host.FAKE_GH and len(argv) > 2 and re.search(r"/issues/\d+$", str(argv[2])):
-                    reads.append(argv[2])
+                calls.append(list(argv))
                 return real_route(argv, **kwargs)
             self.route = counting
-            return reads
+            return calls
+
+        def plan_reads(self, calls):
+            return [c for c in calls if c and c[0] == host.FAKE_GH and any(self.PLAN_ROUTE.search(str(x)) for x in c[1:])]
+
+        def assert_no_plan_reads(self, calls):
+            reads = self.plan_reads(calls)
+            print("S12: %d calls in all, %d plan reads" % (len(calls), len(reads)))
+            self.assertEqual(reads, [], "0 plan reads of %d calls in all" % len(calls))
 
         def abandon_and_report(self, got, rnd, expect_pair):
             """Run report then abandon on the round; assert the S12 pass line and return the report."""
@@ -596,7 +606,7 @@ def build():
             for lane in rnd["lanes"][:2]:
                 self.inject(self.lane_entry(got["review"], rnd, lane, rnd["plan_hash"]))
             before = len(self.ledger())
-            reads = self.count_plan_reads()
+            calls = self.count_calls()
             code, out, err = self.review("orch", "report", got["review"], "--json")
             self.assertEqual(code, 0, err)
             rep = json.loads(out)
@@ -607,7 +617,10 @@ def build():
             self.assertEqual(code, 0, err)
             self.assertEqual(len(self.kinds("abandoned")), 1, "1 abandoned entry written")
             self.assertEqual(json.loads(out)["abandoned"], got["review"])
-            self.assertEqual(reads, [], "0 plan reads")
+            self.assert_no_plan_reads(calls)
+            self.S12_CALLS[expect_pair] = len(calls)
+            if len(self.S12_CALLS) == 2:
+                self.assertEqual(self.S12_CALLS[True], self.S12_CALLS[False], "the control makes the same count of calls")
             added = self.ledger()[before:]
             self.assertTrue(added and all(e["kind"] in ("abandoned", "decision") for e in added))
             self.assertEqual([e for e in added if "plan_hash" in e or "plan_hashes" in e], [], "0 plan hashes written")
@@ -632,6 +645,31 @@ def build():
             rnd = self.kinds("round")[-1]
             self.abandon_and_report(got, rnd, expect_pair=True)
             self.assertEqual(self.start(who="cos")[0], 0)
+
+        def test_a_mutant_abandon_that_reads_the_plan_through_the_comments_route_is_seen_by_the_count(self):
+            got = self.start_round(legacy=True)
+            args = ["plan", "review", "abandon", got["review"], "--reason", "the round predates the pair; closed by the lane", "--json"]
+
+            def run(module):
+                calls = self.count_calls()
+                with captured() as (out, err), mock.patch.object(module, "owner_terminal_problem", lambda *a, **k: None), mock.patch.object(sys, "stdin", io.StringIO("")):
+                    os.environ["HERDR_PANE_ID"] = self.world.panes["cos"]
+                    code = module.main(args, runner=self.route, now=self.world.clock.now, wait=lambda sock, seconds: False, socket_call=self.world.herdr.socket)
+                self.assertEqual(code, 0, err.getvalue() if hasattr(err, "getvalue") else err)
+                return calls
+            self.assert_no_plan_reads(run(sb))   # the control first: the unmutated abandon reads no plan
+            self.assertEqual(len(self.kinds("abandoned")), 1)
+            with tempfile.TemporaryDirectory() as tmp:
+                msb = _entry_copy(tmp, "switchboard/plan_review.py", "    rnd = _round_of(entries, args.review)\n    if _abandoned(entries, args.review):\n",
+                                  "    rnd = _round_of(entries, args.review)\n    runner([load_config()[\"gh\"], \"api\", \"repos/acme/app/issues/7/comments\"])\n    if _abandoned(entries, args.review):\n")
+                # the review is already abandoned by the control: the mutant still reads the plan before it refuses, and the read is counted once
+                calls = self.count_calls()
+                with captured() as (out, err), mock.patch.object(msb, "owner_terminal_problem", lambda *a, **k: None), mock.patch.object(sys, "stdin", io.StringIO("")):
+                    os.environ["HERDR_PANE_ID"] = self.world.panes["cos"]
+                    msb.main(args, runner=self.route, now=self.world.clock.now, wait=lambda sock, seconds: False, socket_call=self.world.herdr.socket)
+                self.assertEqual(len(self.plan_reads(calls)), 1, "the mutant's read is applied exactly once")
+                with self.assertRaisesRegex(AssertionError, "0 plan reads of"):
+                    self.assert_no_plan_reads(calls)
 
         # -- S11: a round without a pair
 
