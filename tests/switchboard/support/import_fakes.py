@@ -3,7 +3,6 @@ import importlib.machinery
 import importlib.util
 import sys
 import importlib
-from support.paths import BIN, REPO
 from support.delivery_measure import REPO
 from support.paths import BIN
 from support.policy_and_import import V1_FIXTURES
