@@ -204,7 +204,11 @@ class TestPlanHashMarkerMutants(unittest.TestCase):
         new, _, old = pc.plan_hashes(self.signed)
         entries = [{"kind": "lane", "lane": l, "verdict": "approve", "plan_hash": h, "objections": []} for l, h in zip("ABC", (old, old, new))]
         entries = pl.as_current(entries, (new, old))
-        self.assertNotEqual(rv.decide_consensus(entries, list("ABC"), new, rounds_left=True)[0], "consensus")
+        verdict, why = rv.decide_consensus(entries, list("ABC"), new, rounds_left=True)
+        with self.assertRaisesRegex(AssertionError, "the marker changes the hash: the round counts 3 of 3 verdicts"):   # the assertion names the mutated check
+            self.assertEqual(verdict, "consensus", "the marker changes the hash: the round counts 3 of 3 verdicts (%s)" % why)
+        control = real("plan_ledger").as_current([{"kind": "lane", "lane": l, "verdict": "approve", "plan_hash": h, "objections": []} for l, h in zip("ABC", (old, old, new))], (new, old))
+        self.assertEqual(rv.decide_consensus(control, list("ABC"), new, rounds_left=True)[0], "consensus")   # the control: the unmutated as_current counts the three
 
 
 class TestPlanHashMarkerDocumentation(unittest.TestCase):
@@ -233,7 +237,7 @@ class TestPlanHashMarkerNoSizeTest(unittest.TestCase):
 
 # ---------------------------------------------------------------------------------------------------- the daemon and the commands, run for real
 
-def _entry_copy(directory, relative, old, new):
+def _entry_copy(directory, relative, old, new, also=()):
     """The whole entry laid out in `directory` with `old` replaced by `new` in the file `relative` (a source COPY; asserted applied), loaded as a module."""
     import shutil
     from support.loader import _load
@@ -244,6 +248,11 @@ def _entry_copy(directory, relative, old, new):
     assert source.count(old) == 1, "the mutation target is not found exactly once: %r" % old
     path.write_text(source.replace(old, new), encoding="utf-8")
     assert path.read_text(encoding="utf-8") != source, "the mutation was not applied"
+    for other, o, n in also:   # further mutations of the same copy, each asserted applied once
+        extra = Path(directory) / other
+        text = extra.read_text(encoding="utf-8")
+        assert text.count(o) == 1, "the mutation target is not found exactly once: %r" % o
+        extra.write_text(text.replace(o, n), encoding="utf-8")
     return _load("t1713_entry_%d" % abs(hash(str(directory))), Path(directory) / "fleet-switchboard")
 
 
@@ -310,7 +319,7 @@ def build():
             with tempfile.TemporaryDirectory() as tmp:
                 msb = _entry_copy(tmp, "fleet-switchboard",
                                   "check_module.canonical_hash(plan_hash, hashes) in {check_module.canonical_hash(h, hashes) for h in consensus}", "plan_hash in consensus")
-                with self.assertRaisesRegex(AssertionError, r"sha256:[0-9a-f]{64}"):   # the announcement the mutated wake sends (its text names the plan hash)
+                with self.assertRaisesRegex(AssertionError, r"plan posted on #3: \S+ sha256:[0-9a-f]{64}, plan check (PASS|FAIL)"):   # the line the mutated wake announces for a plan approved at the old hash (triage_plan_open.line)
                     self.assertEqual(self.scenario(msb.triage_pass, "old"), [])
 
     only_own_tests(TestPlanHashMarkerWake)
@@ -429,7 +438,7 @@ def build():
                         mock.patch.object(sys, "stdin", io.StringIO(self.block(rnd["lanes"][-1], rnd["plan_hash"]))):
                     code = msb.main(["plan", "review", "verdict", review, "--lane", rnd["lanes"][-1], "--json"], runner=self.route, now=self.world.clock.now,
                                     wait=lambda sock, seconds: False, socket_call=self.world.herdr.socket)
-                with self.assertRaisesRegex(AssertionError, r"!= 'consensus'"):   # the assertion on the tally the mutated command printed
+                with self.assertRaisesRegex(AssertionError, r"'(pending|escalate)' != 'consensus'"):   # the tally the mutated command printed (its production `tally` field, not 'consensus')
                     self.assertEqual(json.loads(out.getvalue())["tally"], "consensus")
 
         # -- S9: the entry's decide and the two open-reading places, on a round that holds verdicts at both forms
@@ -582,6 +591,39 @@ def build():
                                    wait=lambda sock, seconds: False, socket_call=self.world.herdr.socket)
             return code, out.getvalue(), err.getvalue()
 
+        def frozen_round(self):
+            """A round as `review_start` of origin/integration wrote it: this literal key set, the legacy hash, no `plan_hashes`. Only the values the
+            ledger itself assigns (review id, lineage, lanes, tier, the plan's ids) are taken from the builder; the keys and the hash are the literal."""
+            self.signed_plan()
+            real_append = sb.plan_ledger.append_checked
+            legacy = sb.plan_check.plan_hash_legacy(host.LEDGER_PLAN + "\n" + MARKER)
+
+            def frozen(state, now, build):
+                def literal(e, s):
+                    b = build(e, s)
+                    return {"kind": "round", "lineage": b["lineage"], "review": b["review"], "round": 1, "closing": False, "start": True,
+                            "ask_number": b["ask_number"], "plan_ref": b["plan_ref"], "plan_hash": legacy, "scenario_hash": b["scenario_hash"],
+                            "tier": b["tier"], "tier_why": b["tier_why"], "lanes": b["lanes"], "held_area": b["held_area"], "by": b["by"]}
+                return real_append(state, now, literal)
+            with mock.patch.object(sb.plan_ledger, "append_checked", frozen):
+                code, got, err = self.start()
+            self.assertEqual(code, 0, err)
+            return got
+
+        def test_a_frozen_literal_round_of_before_the_change_is_refused_by_the_commands(self):
+            got = self.frozen_round()
+            rnd = self.kinds("round")[-1]
+            self.assertNotIn("plan_hashes", rnd)
+            self.assertEqual(rnd["plan_hash"], sb.plan_check.plan_hash_legacy(host.LEDGER_PLAN + "\n" + MARKER))
+            before = len(self.ledger())
+            rows = self.six_commands(got["review"], rnd)
+            for name, code, err in rows:
+                with self.subTest(command=name):
+                    self.assertEqual(code, 2, err)
+                    self.assertIn(self.PREDATES, err)
+                    self.assertEqual(len(err.strip().splitlines()), 1, err)
+            self.assertEqual(len(self.ledger()), before, "0 ledger lines added")
+
         def test_the_tick_over_a_round_without_the_pair_and_a_round_with_it_skips_the_first_and_handles_the_second(self):
             legacy, valid = self.two_rounds()
             before = len(self.ledger())
@@ -634,9 +676,12 @@ def build():
 def build_late():
     """The classes whose host classes are defined late in bin/test-switchboard (bound by a line placed after them)."""
     host = HOST
+    import io
     import json
+    import os
+    import tempfile
     from unittest import mock
-    from support.loader import sb
+    from support.loader import captured, sb
 
     def only_own_tests(cls):
         for name in dir(cls):
@@ -708,6 +753,37 @@ def build_late():
 
         def test_a_consensus_at_the_old_hash_is_quiet_through_launch(self):
             self.assertEqual(self.would_refuse(self.signed()[1]), [], "a consensus at the old hash is not read as bound")
+
+        def launch_in(self, module):
+            os.environ["HERDR_WORKSPACE_ID"] = "w1"
+            os.environ.pop("HERDR_PANE_ID", None)
+            argv = ["launch", "newcoder", "--agent", "coder", "--dir", str(self.work), "--role", "coder", "--reports-to", "own",
+                    "--issue", "7", "--brief-file", "-", "--terminal"]
+            with captured() as (out, err), mock.patch.object(sys, "stdin", io.StringIO("Do the thing.\nPLAN: acme/app#7\n")):
+                code = module.main(argv, runner=self.route, now=self.world.clock.now, socket_call=self.world.herdr.socket)
+            return code, err.getvalue()
+
+        READ = ("                entries, problem = plan_ledger.read_ledger(state)\n"
+                "                entries = plan_ledger.as_current(entries, (plan or {}).get(\"plan_hashes\"))   # #1713\n")
+
+        GATE = "    entries = as_current(entries, plan.get(\"plan_hashes\"))   # #1713\n"   # launch_findings: the G0b read of the pair
+
+        def test_the_control_an_unmutated_copy_of_the_entry_is_quiet_for_the_old_hash(self):
+            self.record_consensus(self.signed()[1])
+            with tempfile.TemporaryDirectory() as tmp:
+                msb = _entry_copy(tmp, "fleet-switchboard", self.READ, self.READ + "                pass\n", also=(("plan_ledger.py", self.GATE, self.GATE + "    pass\n"),))
+                code, err = self.launch_in(msb)
+            self.assertEqual(code, 0, err)
+            self.assertNotIn("would be refused", err)
+
+        def test_a_mutant_that_reads_the_consensus_without_as_current_is_refused_at_the_old_hash(self):
+            self.record_consensus(self.signed()[1])
+            with tempfile.TemporaryDirectory() as tmp:
+                msb = _entry_copy(tmp, "fleet-switchboard", self.READ, self.READ.split("\n")[0] + "\n", also=(("plan_ledger.py", self.GATE, ""),))   # both reads of the launch gate map nothing
+                code, err = self.launch_in(msb)
+            self.assertEqual(code, 0, err)
+            with self.assertRaisesRegex(AssertionError, r"gates: a launch under this brief would be refused \(shadow: .*G0b: "):   # the refusal line the gate prints
+                self.assertNotIn("would be refused", err)
 
         def test_a_consensus_at_the_hash_of_an_edited_text_is_not_quiet(self):
             pair = self.signed()
