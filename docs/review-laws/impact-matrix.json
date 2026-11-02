@@ -410,7 +410,6 @@
         "bin/header_cache.py",
         "bin/heavy_slots.py",
         "bin/item_verdicts.py",
-        "bin/open_list_alert.py",
         "bin/plan_review.py",
         "bin/pr_events.py",
         "bin/queue_ejections.py",
@@ -453,9 +452,6 @@
           "*"
         ],
         "bin/turn_start.py": [
-          "*"
-        ],
-        "bin/open_list_alert.py": [
           "*"
         ],
         "bin/awaiting_live.py": [
@@ -826,6 +822,7 @@
         "bin/launch_brief_check.py": "loaded only by `launch_brief_mismatch`, the launch-time reader of the brief (#1350), which the clear cannot reach",
         "bin/launch_testers.py": "loaded only by the tester launch command, not the clear",
         "bin/merged_labels.py": "loaded only by `publish_decisions` (the decision list), which the clear never calls",
+        "bin/open_list_alert.py": "loaded only by `open_list_alert` (the open-item list cut alert), called only by `publish_decisions` and `sweep_refresh`, which the clear never calls",
         "bin/orders_copy.py": "loaded only by `cmd_orders_copy`, not the clear",
         "bin/path_suites.py": "loaded only by the gates finding (an information line), `heavy --changed`/`--list` and `preflight-pr --merged`: the suite map and its runs, not the clear",
         "bin/plan_approval.py": "loaded only by `check_approval`, the send command's approval check (#951), which the clear never calls",
