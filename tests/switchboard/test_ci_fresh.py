@@ -422,7 +422,7 @@ class TestCiFreshReads(FreshCase):
     def s15_atomic_check(self, mod):
         class Evicted(dict):      # the lookup of a key it just stored fails, as when another thread evicted it
             def __getitem__(self, k):
-                raise KeyError(k)
+                raise KeyError("S15-ANCHOR the lookup of a stored key was evicted")
 
         class PopGone(dict):      # the eviction pop finds the oldest key already gone
             def pop(self, *a):
@@ -432,6 +432,31 @@ class TestCiFreshReads(FreshCase):
                 return super().pop(*a)
 
         self.assertEqual(mod.read_behind(CountingGh(behind=3), "acme/app", OLD, TIP, Evicted()), 3, "the count answers when the stored key is gone")
+        class Grows(dict):    # another thread inserts a key at the moment iteration starts; only an iterator held across a Python step sees it
+            held = None
+
+            def __len__(self):    # list(d) asks for the length right after iter(d) and drains in one C call: no thread can run between
+                if self.held is not None:
+                    self.held.atomic = True
+                return dict.__len__(self)
+
+            def __iter__(self):
+                outer, it, size = self, iter(tuple(dict.keys(self))), dict.__len__(self)
+
+                class Held:
+                    atomic = False
+                    def __iter__(self):
+                        return self
+                    def __next__(self):
+                        if dict.__len__(outer) != size and not self.atomic:
+                            raise RuntimeError("dictionary changed size during iteration")
+                        return next(it)
+                dict.__setitem__(self, ("r", "inserted", "b"), 0)
+                self.held = Held()
+                return self.held
+
+        grown = Grows({("r", "a%d" % i, "b"): i for i in range(256)})
+        self.assertEqual(mod.read_behind(CountingGh(behind=5), "acme/app", OLD, TIP, grown), 5, "the eviction does not raise when a key is inserted as iteration starts")
         full = PopGone({("r", "a%d" % i, "b"): i for i in range(256)})
         self.assertEqual(mod.read_behind(CountingGh(behind=4), "acme/app", OLD, TIP, full), 4, "the count answers when the eviction finds its key gone")
 
@@ -441,7 +466,20 @@ class TestCiFreshReads(FreshCase):
 
     def test_s15_the_mutant_with_the_two_lookup_form_is_caught(self):
         mod = _copy_of(pr_reading, self.RETURN, "        _seen[key] = n\n    return _seen[key]\n", "pr_reading_s15_twolookups")
+        with self.assertRaisesRegex(KeyError, "S15-ANCHOR the lookup of a stored key was evicted"):
+            self.s15_atomic_check(mod)
+
+    POP = "_seen.pop(next(iter(list(_seen)), None), None)"
+
+    def test_s15_the_mutant_with_the_pop_without_a_default_is_caught(self):
+        self.s15_atomic_check(_copy_of(pr_reading, self.POP, None, "pr_reading_s15_pop_control"))   # control first
+        mod = _copy_of(pr_reading, self.POP, "_seen.pop(next(iter(list(_seen)), None))", "pr_reading_s15_popgone")
         with self.assertRaises(KeyError):
+            self.s15_atomic_check(mod)
+
+    def test_s15_the_mutant_with_the_old_iteration_is_caught(self):
+        mod = _copy_of(pr_reading, self.POP, "_seen.pop(next(iter(_seen), None), None)", "pr_reading_s15_olditer")
+        with self.assertRaisesRegex(RuntimeError, "dictionary changed size during iteration"):
             self.s15_atomic_check(mod)
 
     def s14_memory_check(self, mod):
@@ -460,7 +498,7 @@ class TestCiFreshReads(FreshCase):
     def test_s14_300_pairs_the_memory_holds_256_and_a_dropped_pair_costs_one_get(self):
         self.s14_memory_check(pr_reading)
 
-    MEM = "        if len(_seen) >= 256: _seen.pop(next(iter(_seen), None), None)\n"
+    MEM = "        if len(_seen) >= 256: _seen.pop(next(iter(list(_seen)), None), None)\n"
 
     def test_s14_the_control_the_unmutated_copy_bounds_its_memory(self):
         self.s14_memory_check(_copy_of(pr_reading, self.MEM, None, "pr_reading_s14_mem_control"))
