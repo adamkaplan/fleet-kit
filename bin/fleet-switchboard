@@ -16055,7 +16055,6 @@ class IntentReader:
         repo = repo or self.repo
         return self._cached(("orders", repo, number), lambda: fetch_orders(self, number, repo))
 
-
     def parent(self, number, repo=None, strict=False):
         """The parent issue's number, or None when the issue has no parent. `strict` (#1249, charter set): the issue is read first, fresh (it raises when it is missing or unreadable), and then a 404 of its parent, whatever its text, is "no parent"."""
         repo = repo or self.repo
