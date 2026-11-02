@@ -1,10 +1,13 @@
 """#1886: every open item is read (up to OPEN_LIST_PAGES pages), or a named alert says why not."""
 import re
+import sys
+import tempfile
+import unittest
 from pathlib import Path
 import types
 
 from support.core import Base
-from support.loader import sb
+from support.loader import copy_entry, _load, sb
 
 NOW = 1798000000.0
 
@@ -152,3 +155,46 @@ class TestOpenListAlert(Base):
         sb.open_list_alert(self.engine, "acme/api", False, self.DAY1)
         self.assertEqual((self.reminders, self.audit), ([], []))
         self.assertFalse((self.state_dir / "open-list-alert.json").exists())
+
+
+class TestOpenListCeilingMutant(Base):
+    """#1886 S5: a copy of the code with the open lists capped at 2 pages again fails the S2 and S3 tests; the control copy passes first."""
+    NAMES = ("test_s2_the_sweep_reads_all_456_and_the_oldest_held_pull_request", "test_s3_the_triage_reads_all_456")
+
+    def run_against(self, source_edit, tag):
+        me = sys.modules[__name__]
+        with tempfile.TemporaryDirectory() as tmp:
+            for other in (Path(__file__).resolve().parents[2] / "bin").glob("*.py"):
+                (Path(tmp) / other.name).write_bytes(other.read_bytes())   # the flat modules the entry loads by name
+            copy_entry(tmp)
+            entry = Path(tmp) / "fleet-switchboard"
+            text = entry.read_text()
+            edited = source_edit(text)
+            entry.write_text(edited)
+            copy = _load("t_open_list_" + tag, entry)
+        suite = unittest.TestSuite(TestOpenListCeiling(name) for name in self.NAMES)
+        real, me.sb = me.sb, copy
+        try:
+            result = unittest.TestResult()
+            suite.run(result)
+        finally:
+            me.sb = real
+        return edited, result
+
+    def test_s5_the_control_passes_and_the_mutant_fails_with_the_text_of_the_check(self):
+        _, control = self.run_against(lambda t: t, "control")
+        self.assertEqual((len(control.failures), len(control.errors), control.testsRun), (0, 0, 2))
+        line = "OPEN_LIST_PAGES = 10 "
+        applied = []
+
+        def mutate(text):
+            self.assertEqual(text.count(line), 1)
+            applied.append(True)
+            return text.replace(line, "OPEN_LIST_PAGES = 2  ", 1)
+
+        edited, mutant = self.run_against(mutate, "mutant")
+        self.assertTrue(applied)
+        self.assertIn("OPEN_LIST_PAGES = 2 ", edited)
+        self.assertEqual(len(mutant.failures), 2, msg=str(mutant.errors))
+        for _, trace in mutant.failures:
+            self.assertIn("the open items were cut at 200", trace)
