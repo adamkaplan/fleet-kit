@@ -80308,6 +80308,38 @@ class TestHoldQueueUnreadableFile(Base):
                 if label == "to another file":
                     self.assertEqual(target.read_bytes(), good)
 
+    def test_a_non_finite_at_is_refused_whole_and_a_mutant_without_the_check_is_caught(self):
+        item = {"key": "k1", "text": "one", "at": 1.0, "seq": 1}
+        other = {"key": "k0", "text": "zero", "at": 0.5, "seq": 2}
+        good = json.dumps({"seq": 2, "items": [item, other], "delivered": []}, indent=1, sort_keys=True).encode() + b"\n"
+
+        def run(hq):
+            for label, at in (("nan", "NaN"), ("+inf", "Infinity"), ("-inf", "-Infinity")):
+                state = tempfile.mkdtemp()
+                self.addCleanup(shutil.rmtree, state, True)
+                file = hq.path(state, "platform")
+                raw = ('{"seq": 2, "items": [{"key": "k1", "text": "one", "at": %s, "seq": 1}, ' % at
+                       + json.dumps(other) + '], "delivered": []}').encode()
+                file.write_bytes(raw)
+                self.assertEqual(hq.enqueue(state, "platform", "k2", "coder", "two", 2.0), (False, self.line("a malformed item")),
+                                 msg="a non-finite at refuses the whole file")
+                self.assertEqual(file.read_bytes(), raw)
+                self.assertEqual(hq.waiting(state, "platform"), [])
+                file.write_bytes(good)
+                self.assertEqual([i["key"] for i in hq.waiting(state, "platform")], ["k0", "k1"])
+
+        run(self.hq)   # the control passes
+        src = (Path(sb.__file__).resolve().parent / "queued_sends.py").read_text()
+        needle = '            and (not isinstance(i.get("at"), float) or math.isfinite(i.get("at")))\n'
+        self.assertEqual(src.count(needle), 1)
+        mutated = src.replace(needle, "")
+        self.assertNotEqual(mutated, src, "the mutation applied")
+        module = types.ModuleType("queued_sends_mutant")
+        module.__file__ = str(Path(sb.__file__).resolve().parent / "queued_sends.py")
+        exec(compile(mutated, module.__file__, "exec"), module.__dict__)
+        with self.assertRaisesRegex(AssertionError, r"a non-finite at refuses the whole file"):
+            run(module)
+
 
 class HoldQueueRig(Base):
     """The fixtures of the S13 to S15 classes: a held pane, `send`, `release_held`, and a mutant copy of one function."""
