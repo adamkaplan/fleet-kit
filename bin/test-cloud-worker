@@ -1737,7 +1737,16 @@ class TestNeedsDocker(Base):   # #1488
             return self.main(*argv, *(["--cloud"] if cloud else ["--terminal", "--workspace", "w1", "--dir", str(self.home)]))
 
     def seen(self, res):
-        return {"exit": res[0], "stdout": re.sub(r"(127\.0\.0\.1:)\d+", r"\1PORT", res[1]), "stderr": re.sub(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", "TIME", "".join(l + "\n" for l in res[2].splitlines() if l.startswith(("fleet-switchboard:", "preflight:"))))}
+        return {"exit": res[0], "stdout": re.sub(r"(127\.0\.0\.1:)\d+", r"\1PORT", res[1]), "stderr": "".join((re.sub(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", "TIME", l) if l.startswith("fleet-switchboard: default 25m/40m") else l) + "\n" for l in res[2].splitlines() if l.startswith(("fleet-switchboard:", "preflight:")))}
+
+    def test_s16_seen_masks_the_time_of_the_arming_line_only(self):
+        iso = r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ"
+        res = self.seen((0, "{}", "fleet-switchboard: default 25m/40m (no CHECKPOINT line and no flag): checkpoint reminders (now 2026-11-01T22:32:44Z): worker reminder in 25 min, at 2026-11-01T22:57:44Z; overdue reminder in 40 min, at 2026-11-01T23:12:44Z\nfleet-switchboard: another line 2026-11-01T10:00:00Z\n"))
+        arming, other = res["stderr"].splitlines()
+        self.assertIn("TIME", arming)
+        self.assertEqual(len(re.findall(iso, arming)), 0)
+        self.assertEqual(res["stderr"].count("2026-11-01T10:00:00Z"), 1)
+        self.assertEqual(len(re.findall(iso, other)), 1)
 
     def test_s2_a_docker_brief_without_stack_is_refused_before_any_pod(self):
         code, out, err = self.run_launch("Build.\n" + self.LINE + "\n")
