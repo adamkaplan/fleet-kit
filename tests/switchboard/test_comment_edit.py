@@ -1,13 +1,16 @@
 """#1714: `fleet-switchboard comment --edit URL` edits the caller's own comment, signed once; an approved plan needs its approval id.
-build(host) takes the host module of bin/test-switchboard (its HandoffCase and helpers) and returns the test classes."""
+build(HandoffCase) takes the HandoffCase of bin/test-switchboard and returns the test classes."""
 import json
 import re
 import subprocess
 from unittest import mock
 
+from support.loader import captured, sb
+from support.scenario_roles import FAKE_GH, FAKE_REPO
 
-def build(host):
-    sb, REPO_NAME, GH = host.sb, host.FAKE_REPO, host.FAKE_GH
+
+def build(HandoffCase):
+    REPO_NAME, GH = FAKE_REPO, FAKE_GH
     mark = lambda name: "<!-- fleet-switchboard:from=%s -->" % name
     PLAN = "## Plan (scenarios)\n\nsize: S\n\nthe plan text\n\n" + mark("cos")
 
@@ -46,7 +49,7 @@ def build(host):
                 return subprocess.CompletedProcess(argv, 1, "", "gh: Not Found (HTTP 404)\n")
             return subprocess.CompletedProcess(argv, 0, json.dumps(data), "")
 
-    class TestCommentEdit(host.HandoffCase):
+    class TestCommentEdit(HandoffCase):
         def setUp(self):
             super().setUp()
             self.gh = CommentGH()
@@ -59,7 +62,7 @@ def build(host):
         def edit(self, ident, text="new text\n", *extra, issue=7):
             path = self.home / "edit.md"
             path.write_text(text)
-            with host.captured() as (out, err):
+            with captured() as (out, err):
                 code = sb.main(["comment", "--edit", self.url(ident, issue), "--body-file", str(path)] + list(extra), runner=self.route,
                                now=self.world.clock.now, socket_call=self.world.herdr.socket)
             return code, out.getvalue(), err.getvalue()
@@ -140,15 +143,14 @@ def build(host):
             self.check_other_lanes_comment_is_refused()
 
         def test_s6_mutant_a_command_that_skips_the_own_comment_check_fails_with_the_check_named(self):
-            import comment_edit   # the glue has put bin/ on sys.path once an edit ran; the control above ran none, so make sure
-            with mock.patch.object(comment_edit, "marked_name", lambda body: "cos"):
+            with mock.patch.object(sb, "marked_name", lambda body: "cos"):
                 with self.assertRaisesRegex(AssertionError, "own-comment check"):
                     self.check_other_lanes_comment_is_refused()
 
         def test_u5_comment_without_edit_still_posts_a_new_signed_comment(self):
             path = self.home / "c.md"
             path.write_text("hello")
-            with host.captured() as (out, err):
+            with captured() as (out, err):
                 code = sb.main(["comment", "--issue", "2", "--body-file", str(path)], runner=self.route, now=self.world.clock.now,
                                socket_call=self.world.herdr.socket)
             self.assertEqual(code, 0, err.getvalue())

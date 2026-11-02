@@ -17583,7 +17583,7 @@ class TestGitStashGuard(Base):
 
 TestGhShimSign = importlib.import_module("test_gh_shim_sign").TestGhShimSign
 TestGhShimSignRepoFlag = importlib.import_module("test_gh_shim_sign_repo_flag").TestGhShimSignRepoFlag
-TestCommentEdit = importlib.import_module("test_comment_edit").build(sys.modules[__name__])
+TestCommentEdit = importlib.import_module("test_comment_edit").build(HandoffCase)
 TestPlanApply, TestPlanApplyDerivedPlaces = importlib.import_module("test_plan_apply").build(sys.modules[__name__])
 class TestSignedComments(HandoffCase):
     """The trial's agents share the user's GitHub account, so an agent's comment came back to it as a wake.
