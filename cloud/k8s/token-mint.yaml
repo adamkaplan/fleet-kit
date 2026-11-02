@@ -96,7 +96,8 @@ spec:
           type: RuntimeDefault
       containers:
         - name: token-mint
-          image: REPLACE_WITH_THE_PUBLISHED_WORKER_IMAGE
+          # The operator replaces this placeholder by the published image's digest before applying.
+          image: registry.invalid/cw-worker@sha256:0000000000000000000000000000000000000000000000000000000000000000
           command: ["python3", "/opt/cloud/launcher/token_service.py"]
           env:
             - name: CW_ALLOWED_REPOS
