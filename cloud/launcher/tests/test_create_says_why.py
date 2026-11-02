@@ -57,16 +57,16 @@ class World:
         self.last = None
         self.reads = []
 
-    def now(self):
+    def fake_now(self):
         return (self.clock() - T0).total_seconds()
 
     def get_pod(self, kube, name):
         with open(self.state) as f:
             if name not in json.load(f)["pods"]:
                 return None
-        self.first = self.now() if self.first is None else self.first
-        self.last = self.now()
-        ready = self.ready_at is not None and self.now() - self.first >= self.ready_at
+        self.first = self.fake_now() if self.first is None else self.first
+        self.last = self.fake_now()
+        ready = self.ready_at is not None and self.fake_now() - self.first >= self.ready_at
         conds = [{"type": "Ready", "status": "True"}] if ready else (
             [{"type": "PodScheduled", "status": "False", "reason": "Unschedulable"}] if self.unschedulable else [])
         return {"metadata": {"name": name, "uid": "u1"}, "status": {"phase": "Pending" if not ready else "Running", "conditions": conds}}
@@ -250,7 +250,7 @@ class S5Refused(unittest.TestCase):
         self.assertEqual((w.code, w.span()), (cw.EXIT_TIMEOUT, LIMIT))
         self.assertIn(OLD_TEXT, w.err)
         self.assertEqual(w.err.count("events could not be read"), 1)
-        self.assertEqual(len(w.err.strip().splitlines()), 2)
+        self.assertEqual(len(w.err.strip().splitlines()), 1)
         self.assertNotIn("second line of the refusal", w.err)
 
 
@@ -307,13 +307,15 @@ class S8Scan(unittest.TestCase):
     ANCHOR = "        self.assertEqual(w.pods_left(), {})\n"
 
     def test_s8_this_file_has_no_wall_clock_and_no_plain_thread(self):
-        source = open(os.path.abspath(__file__)).read()
+        with open(os.path.abspath(__file__)) as fh:
+            source = fh.read()
         found = scan(source)
         print("S8 findings in this file: %d" % len(found))
         self.assertEqual(found, [])
         self.assertEqual(source.count(self.ANCHOR), 1)
         changed = mutate(source, self.ANCHOR, self.ANCHOR + "        self.assertLess(time.monotonic() - 0, 5)\n")
-        self.assertTrue(applied(source, changed, self.ANCHOR + "        self.assertLess") or changed != source)
+        added = "        self.assertLess(time.monotonic() - 0, 5)\n"
+        self.assertTrue(changed != source and added in changed and added not in source)
         mutant = scan(changed)
         print("S8 the copy fails: %s" % mutant)
         self.assertTrue(any("a test decides by the wall clock" in m for m in mutant))
@@ -336,13 +338,8 @@ class S9Reads(unittest.TestCase):
         for value in (token, node, "third line"):
             self.assertNotIn(value, w.err + w.out)
         self.assertLessEqual(len(cw._one_line(message * 10)), 120)
-        after_apply = []
-        seen = False
-        for c in w.calls():
-            if seen:
-                after_apply.append(c[0])
-            if c[0] in ("apply", "create") and "pod" not in c[:2] and c[:2] != ["create", "secret"]:
-                seen = True
+        verbs = [c[0] for c in w.calls()]
+        after_apply = verbs[len(verbs) - 1 - verbs[::-1].index("create"):][1:]   # everything after the pod was made
         print("S9 kubectl verbs after the pod was made: %s" % after_apply)
         self.assertTrue(all(v in ("get", "delete") for v in after_apply))
         self.assertEqual(sorted(set(w.reads)), ["events", "pods"])

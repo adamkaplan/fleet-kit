@@ -2187,7 +2187,7 @@ class Launcher:
     def _timeout_text(scaling, unread):
         if scaling:
             return "timed out waiting for a node to be added for the worker"
-        return "timed out waiting for the worker" + ("\nevents could not be read" if unread else "")
+        return "timed out waiting for the worker" + ("; events could not be read" if unread else "")
 
     def _why_pending(self, name, pod, scaling):
         """Read why a pod is not Ready (reads only). Returns (a scale-up is under way, the events could not be read). Raises CloudError at once
