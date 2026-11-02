@@ -442,6 +442,62 @@ def _mask_pass(text):
     return "".join(out)
 
 
+_HEX = frozenset("0123456789abcdefABCDEF")
+
+
+def _glue_pass(text):
+    """PC-13, one glue pass on the text the PC-11/PC-12 passes left: in every run of address characters a candidate of at most 64 characters may start at a
+    normal start (run start, or after a colon or a dot) or at an extension start (a hex digit inside a group, 1 to 5 hex characters of the group before it)
+    and end at a normal end or an extension end (the mirror), at least one being an extension; a candidate with a group of more than 4 characters is not
+    tried; the longest that `ipaddress` accepts (ties: the leftmost) becomes `[address]`."""
+    out, last = [], 0
+    for m in _RUN_RE.finditer(text):
+        r, n = m.group(), len(m.group())
+        gs, ge, mark = [0] * n, [0] * n, -1
+        for i, c in enumerate(r):
+            gs[i] = mark + 1
+            if c in ":.":
+                mark = i
+        nxt = n
+        for i in range(n - 1, -1, -1):
+            if r[i] in ":.":
+                nxt = i
+            ge[i] = nxt
+        starts = []
+        for p in range(n):
+            ext = p > 0 and r[p] not in ":." and r[p - 1] in _HEX and 1 <= p - gs[p] <= 5
+            if ext or p == 0 or r[p - 1] in ":.":
+                starts.append((p, ext))
+        ends = []
+        for q in range(1, n + 1):
+            ext = q < n and r[q - 1] in _HEX and r[q] in _HEX and r[q - 1] not in ":." and r[q] not in ":." and 1 <= ge[q] - q <= 5
+            if ext or q == n or r[q] in ":.":
+                ends.append((q, ext))
+        best = None
+        for p, pe in starts:
+            for q, qe in ends:
+                if q - p > SUBSTRING_MAX:
+                    break
+                if q <= p or not (pe or qe):
+                    continue
+                cand = r[p:q]
+                if best is not None and q - p <= best[1] - best[0]:
+                    continue
+                if any(len(g) > 4 for g in re.split(r"[:.]", cand)):
+                    continue
+                try:
+                    ipaddress.ip_address(cand)
+                except ValueError:
+                    continue
+                best = (p, q)
+        if best:
+            out.append(text[last:m.start() + best[0]])
+            out.append("[address]")
+            last = m.start() + best[1]
+    out.append(text[last:])
+    return "".join(out)
+
+
 def _mask_addresses(text):
     """The capacity answer's own masking, before the launcher's one scrub, decided by `ipaddress` (PC-10, PC-11, PC-12): every maximal run of address
     characters (an optional `%zone` stays text) is searched, in windows of 200 that overlap by 64, for substrings that `ipaddress` accepts, the longest
@@ -453,9 +509,19 @@ def _mask_addresses(text):
     for _ in range(MASK_GUARD):
         done = _mask_pass(text)
         if done == text:
-            return text
+            break
         text = done
-    return "[masking_loop]"
+    else:
+        return "[masking_loop]"
+    GLUE_PASS = True
+    if GLUE_PASS:  # PC-13: the glue pass (an address glued to hex letters)
+        for _ in range(MASK_GUARD):
+            done = _glue_pass(text)
+            if done == text:
+                return text
+            text = done
+        return "[masking_loop]"
+    return text
 
 
 def _quantity(value, scale):
