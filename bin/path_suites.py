@@ -285,12 +285,6 @@ def guard_rows(added):
 
 
 
-def shim_guard_rows(added):
-    """The rows of NEW_SHIM_GUARDS (same shape as guard_rows) when `added` holds a new file under shims/; [] otherwise."""
-    shims = [p for p in added or [] if p.startswith("shims/")]
-    return [(g[1], [g[2]] if g[2] else [], guard_command(g), shims) for g in NEW_SHIM_GUARDS] if shims else []
-
-
 def plan(root, paths, files=None, runner=subprocess.run, added=None):
     """([(suite, classes, command, [paths that bring it])], [paths no suite exercises]). `added` (the new files of the diff): a new file under bin/ always brings the four guards of NEW_BIN_GUARDS."""
     files = tracked(root, runner) if files is None else files
