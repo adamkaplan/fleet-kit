@@ -109,7 +109,7 @@ def run_one(root, rel, timeout, selector=None):
 BUDGET_STATUS = 3  # a spent quick budget: not 1 (a failing test or a difference) and not 2 (refused input)
 
 
-def run_files(names, sel_of, root, basedir, timeout, quick, clock=None, run=None, out=print):
+def run_files(names, sel_of, root, basedir, timeout, quick, clock=None, run=None, out=print, secs=None, skipped=None):
     """Run each selected file on the branch; the clean copy only for a file that did not pass on the branch (quick).
     Prints one line per file with its seconds. Returns (verdicts, failed, not_run): not_run lists the files left when the
     quick budget was spent (a spent budget is not a failure of a test)."""
@@ -118,6 +118,7 @@ def run_files(names, sel_of, root, basedir, timeout, quick, clock=None, run=None
     clock = time.monotonic
     run = run or run_one
     verdicts, not_run, failed = [], [], False
+    stop = False  # a check whose recorded seconds do not fit the time left stops the starts; the rest is left to CI
     t_start = clock()
     for i, rel in enumerate(names):
         path, sel = sel_of.get(rel, (rel, None))
@@ -125,9 +126,14 @@ def run_files(names, sel_of, root, basedir, timeout, quick, clock=None, run=None
         if quick and remaining <= 0:
             not_run = list(names[i:])
             break
+        if quick and secs is not None and skipped is not None and not stop and not cloud_quick.fits(path, secs, remaining):
+            stop = True
         if quick and path in cloud_quick.HEAVY:
             out("%-52s %-9s %-9s %s" % (rel, "-", "-", "skipped: memory-heavy " + path))
             verdicts.append((rel, "-", "-", "skipped")); failed = True
+            continue
+        if stop:
+            skipped.append(rel)
             continue
         tmo = min(timeout, max(1, int(remaining))) if quick else timeout  # clamp to the time left
         t0 = clock()
@@ -225,6 +231,7 @@ def main():
         mb = base
     failed = False
     left = []
+    seconds, skipped = None, []
     tmp = tempfile.mkdtemp(prefix="cloud-preflight-")
     try:
         # clean copy of the default branch: archive extracted under the temp dir (no worktree metadata in the repo)
@@ -278,9 +285,14 @@ def main():
                 key = r if s is None else r + "::" + s
                 sel_of[key] = (r, s)
                 names.append(key)
-            names = sorted(names)
+            seconds = cloud_quick.quick_seconds(root)
+            by_key = {k: v for k, v in sel_of.items()}
+            names = [r if s is None else r + "::" + s
+                     for r, s in cloud_quick.order_quick(root, [by_key[k] for k in names], changed_files, reads, seconds)]
             print("\n== 2. quick mode: %s, plus the named scans (timeout %ds each) =="
                   % (cloud_quick.mode_line(len(every), len(changed_files)), timeout))
+            if names:
+                print(cloud_quick.order_line(names))
             if changed_files and not names:
                 print("NOT RUN: quick mode selected no check for a non-empty change; this is not a clean result")
             if reason:
@@ -296,7 +308,8 @@ def main():
             print("\n== 2. every test file, one at a time (timeout %ds each) ==" % timeout)
             names = sorted(set(tests_in(root)) | base_tests)
         print("%-52s %-9s %-9s %s" % ("file", "branch", "default", "verdict"))
-        verdicts, loop_failed, not_run = run_files(names, sel_of, root, basedir, timeout, quick)
+        verdicts, loop_failed, not_run = run_files(names, sel_of, root, basedir, timeout, quick,
+                                                  secs=seconds, skipped=skipped)
         failed |= loop_failed
         print("differ: " + (", ".join(r for r, b, d, v in verdicts if b != d and d != "-") or "none"))
 
@@ -333,6 +346,7 @@ def main():
         if not_run:
             print("NOT RUN (budget): quick run exceeded %d s (selected %d files, ran %d); not run: %s"
                   % (QUICK_TOTAL, len(names), len(verdicts), ", ".join(not_run)))
+        left = list(left) + list(skipped)  # left to CI: readers that cannot run, and checks that do not fit the budget
         if failed:
             print("\nRESULT: FAIL")
             return 1
