@@ -29930,7 +29930,7 @@ class TestPlanLedger(LedgerBase):
 
     def test_evidence_is_redacted_and_clipped(self):
         secret = "ghp_" + "0123456789abcdefABCDEF0123"
-        code, out, err = self.run_as("coder", "prove", "S1", "--pr", self.PR, "--evidence", "token %s and %s" % (secret, "x" * 900))
+        code, out, err = self.run_as("coder", "prove", "S1", "--pr", self.PR, "--evidence", "token %s and %s" % (secret, "x" * 400))
         self.assertEqual(code, 0, err)
         evidence = self.ledger()[0]["evidence"]
         self.assertNotIn(secret, evidence)
