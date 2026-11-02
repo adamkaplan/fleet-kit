@@ -267,13 +267,13 @@ def guard_missing(root, guard):
 
 
 def added_paths(root, base, runner=subprocess.run):
-    """The files under bin/ the head ADDS against the merge-base with `base` (committed, uncommitted or untracked)."""
+    """The files under bin/ or shims/ the head ADDS against the merge-base with `base` (committed, uncommitted or untracked)."""
     mb = _git(root, "merge-base", "HEAD", base, runner=runner)
     if mb.returncode != 0 or not mb.stdout.strip():
         raise PathSuitesError("no common ancestor of HEAD and %s" % base)
     diff = _git(root, "diff", "--name-only", "--no-renames", "--diff-filter=A", mb.stdout.strip(), runner=runner, check=True)
     other = _git(root, "ls-files", "--others", "--exclude-standard", runner=runner)
-    return sorted(p for p in set(diff.stdout.split("\n")) | set(other.stdout.split("\n")) if p.startswith("bin/") and "__pycache__" not in p and not p.endswith(".pyc"))
+    return sorted(p for p in set(diff.stdout.split("\n")) | set(other.stdout.split("\n")) if p.startswith(("bin/", "shims/")) and "__pycache__" not in p and not p.endswith(".pyc"))
 
 
 def guard_rows(added):
