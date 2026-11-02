@@ -522,6 +522,11 @@ OLD_CHECK = '''def old_check(port, test):
 '''
 
 
+def _mutation_applied(original, changed, old):
+    """The mutation is applied when the text changed and the old text left it (computed from the two texts)."""
+    return changed != original and old in original and old not in changed
+
+
 def _check_copy(old=None, new=None):
     """The source of check_total_deadline, optionally mutated once (asserted); returns (function, applied)."""
     import inspect
@@ -529,8 +534,10 @@ def _check_copy(old=None, new=None):
     applied = False
     if old is not None:
         assert text.count(old) == 1, "the text to mutate must occur once"
+        original = text
         text = text.replace(old, new)
-        applied = True
+        applied = _mutation_applied(original, text, old)
+        assert applied, "the mutation was not applied"
     scope = dict(globals())
     exec(text, scope)
     return scope["check_total_deadline"], applied
@@ -550,7 +557,17 @@ class TestTrickleClient(unittest.TestCase):
         scope["Running"] = _Fake(stand)
         fn(None, self)
 
+    def test_applied_helper_control(self):
+        self.assertTrue(_mutation_applied("a b", "a c", "b"))
+        with self.assertRaises(AssertionError) as cm:
+            self.assertTrue(_mutation_applied("a b", "a b", "b"), "the mutation was not applied")
+        self.assertIn("the mutation was not applied", str(cm.exception))
+        with self.assertRaises(AssertionError) as cm:
+            _check_copy("a text that is not there", "x")
+        self.assertIn("occur once", str(cm.exception))
+
     def test_s2_stand_in_server(self):
+        import inspect
         with _Stand(25) as stand:
             first, at, reset, log = trickle_client(stand.port())
         self.assertEqual(first, b"HTTP/1.1 408 Request Timeout")
@@ -562,8 +579,13 @@ class TestTrickleClient(unittest.TestCase):
             with self.assertRaises(AssertionError) as caught:
                 old["old_check"](stand.port(), self)
         self.assertIn("b''", str(caught.exception), "the old client lost the answer")
+        new_text = inspect.getsource(check_total_deadline)
+        applied = (OLD_CHECK != new_text and "while time.time() - t0 < 4" in OLD_CHECK
+                   and "select.select" not in OLD_CHECK and "select.select" in inspect.getsource(trickle_client)
+                   and "while time.time() - t0 < 4" not in inspect.getsource(trickle_client))
+        self.assertTrue(applied, "the mutation was not applied")
         print("S2: answer readable at byte %d of 50, first line 408 Request Timeout, 0 seconds asserted; "
-              "control 1 of 1, old client 1 of 1 fails with the text, mutation applied True" % at)
+              "control 1 of 1, old client 1 of 1 fails with the text, mutation applied %s" % (at, applied))
 
     def _failing_lines(self, fn):
         import contextlib
@@ -593,8 +615,9 @@ class TestTrickleClient(unittest.TestCase):
         copy, applied = _check_copy('print("\\n".join(log), file=sys.stderr)', "kept = log")
         quiet, failed = self._failing_lines(copy)
         self.assertTrue(failed)
-        with self.assertRaises(AssertionError, msg="the event log was not printed"):
+        with self.assertRaises(AssertionError) as cm:
             self.assertGreaterEqual(len(quiet), 5, "the event log was not printed")
+        self.assertIn("the event log was not printed", str(cm.exception))
         print("S4: failing check printed %d ordered event lines (>= 5), passing check 0 lines; "
               "copy fails 1 of 1 with the text, mutation applied %s" % (len(lines), applied))
 
@@ -611,13 +634,16 @@ class TestTrickleClient(unittest.TestCase):
         self.assertEqual(bad, [])
         self.assertEqual(guards, 1)
         mutated = text.replace('        test.assertEqual(s.inbox.items, {})',
-                               '        test.assertLess(time.time() - t0, 2.0)\n        test.assertEqual(s.inbox.items, {})')
+                               '        test.assertLess(time.time() - t0, 2.0)')
         self.assertEqual(text.count('        test.assertEqual(s.inbox.items, {})'), 1)
         bad2, _ = scan(mutated)
-        with self.assertRaises(AssertionError, msg="a verdict rests on seconds"):
+        applied = _mutation_applied(text, mutated, '        test.assertEqual(s.inbox.items, {})')
+        self.assertTrue(applied, "the mutation was not applied")
+        with self.assertRaises(AssertionError) as cm:
             self.assertEqual(bad2, [], "a verdict rests on seconds")
+        self.assertIn("a verdict rests on seconds", str(cm.exception))
         print("U1: 0 assertions on elapsed time and %d hang guard in the changed check; "
-              "copy with assertLess(time.time() - t0, 2.0) fails 1 of 1 with the text, mutation applied True" % guards)
+              "copy with assertLess(time.time() - t0, 2.0) fails 1 of 1 with the text, mutation applied %s" % (guards, applied))
 
     def test_u2_mutants_counted(self):
         names = [m[0] for m in CHECKS]
