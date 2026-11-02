@@ -54,6 +54,9 @@ def scope_imports(scope):
     return found
 
 
+_MATCH = getattr(ast, "Match", None)
+
+
 def branch_paths(scope):
     """For each statement of one scope (by id), the list of (control statement, branch) it sits in."""
     paths = {}
@@ -73,6 +76,8 @@ def branch_paths(scope):
                     inner = path + [(id(node), "handler%d" % i)]
                 elif isinstance(node, ast.Try) and field in ("orelse", "finalbody"):
                     inner = path + [(id(node), "try-" + field)]
+                elif _MATCH is not None and isinstance(node, _MATCH) and field == "cases":
+                    inner = path + [(id(node), "case%d" % i)]
                 paths[id(child)] = inner
                 walk(child, inner)
 
@@ -91,6 +96,10 @@ def exclusive(path_a, path_b):
 
 
 def _exclusive_pair(one, two):
+    if one.startswith("case") and two.startswith("case"):
+        return True
+    if "try-orelse" in (one, two) and (one.startswith("handler") or two.startswith("handler")):
+        return True
     if one.startswith("handler") or two.startswith("handler"):
         return all(b == "body" or b.startswith("handler") for b in (one, two))
     return {one, two} == {"body", "orelse"}
@@ -200,6 +209,31 @@ class TestDuplicateBindings(unittest.TestCase):
         self.assertIn("x", failures[0])
         self.assertIn("from a import x", failures[0])
         failures = check_text("fake.py", "try:\n    import a\n    import a\nexcept ImportError:\n    pass\nprint(a)\n")
+        self.assertEqual(len(failures), 1, RULE % (len(failures), 1, failures))
+
+    def test_a_try_else_against_its_handler_is_one_binding(self):
+        text = "try:\n    pass\nexcept ImportError:\n    import b as a\nelse:\n    import a\nprint(a)\n"
+        failures = check_text("fake.py", text)
+        self.assertEqual(len(failures), 0, RULE % (len(failures), 0, failures))
+
+    @unittest.skipIf(_MATCH is None, "ast.Match needs Python 3.10 or newer")
+    def test_the_arms_of_a_match_are_one_binding(self):
+        text = "match v:\n    case 1:\n        import a\n    case 2:\n        import b as a\nprint(a)\n"
+        failures = check_text("fake.py", text)
+        self.assertEqual(len(failures), 0, RULE % (len(failures), 0, failures))
+
+    def test_a_try_body_and_its_else_are_a_duplicate(self):
+        text = "try:\n    import a\nexcept ImportError:\n    pass\nelse:\n    import a\nprint(a)\n"
+        failures = check_text("fake.py", text)
+        self.assertEqual(len(failures), 1, RULE % (len(failures), 1, failures))
+        self.assertIn("fake.py", failures[0])
+        self.assertIn("a", failures[0])
+        self.assertIn("line 2", failures[0])
+
+    @unittest.skipIf(_MATCH is None, "ast.Match needs Python 3.10 or newer")
+    def test_two_imports_in_one_case_arm_are_a_duplicate(self):
+        text = "match v:\n    case 1:\n        import a\n        import b as a\nprint(a)\n"
+        failures = check_text("fake.py", text)
         self.assertEqual(len(failures), 1, RULE % (len(failures), 1, failures))
 
 
