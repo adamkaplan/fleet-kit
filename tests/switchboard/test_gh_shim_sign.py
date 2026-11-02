@@ -121,7 +121,7 @@ def battery(rig):
     done, calls = rig.run("issue", "close", "1", "--comment", "x " + MARK % "bob")
     if len(calls) != 1 or calls[0]["argv"][-1].count("fleet-switchboard:from=") != 1:
         bad.append("a marked body was signed twice")
-    for args in (("api", "repos/o/r/issues/1", "-X", "PATCH", "-f", "body=x"), ("api", "repos/o/r/issues/1/labels", "-f", "body=x"),
+    for args in (("api", "repos/o/r/issues/1", "-X", "PATCH", "-f", "title=x"), ("api", "repos/o/r/issues/1/labels", "-f", "body=x"),
                  ("api", "repos/o/r/issues/1/comments"), ("api", "repos/o/r/issues/1/comments", "-X", "GET")):
         done, calls = rig.run(*args)
         if len(calls) != 1 or calls[0]["argv"] != list(args):
