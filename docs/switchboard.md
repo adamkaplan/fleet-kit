@@ -1803,7 +1803,7 @@ item) says cut that root.
   line says older events were skipped. Comments and issues use the server's `since`; pulls, newest first, stop
   paging at the first page older than the window; reviews and check suites are read only for pulls updated in the
   window.
-- **Every list read is paged with a hard cap** (`GITHUB_PAGE_CAP`, 5 pages of 100), and one catch-up keeps at
+- **Every list read is paged with a hard cap** (`GITHUB_PAGE_CAP`, 5 pages of 100, unless the caller names its own `cap`: the open-item reads name `OPEN_LIST_PAGES`), and one catch-up keeps at
   most 500 items. A cap that is hit stops the read, audits one `github.catch_up.truncated` line (the capped
   reads, the items skipped) and still advances the marker: forward only, no chasing the rest.
 - **Secondary reads are best-effort**: reviews, check suites and workflow runs that fail are reported once per

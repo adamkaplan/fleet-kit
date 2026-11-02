@@ -13166,7 +13166,7 @@ class GitHubHub:
         return self.read_pages(path, cap=OPEN_LIST_PAGES)
 
     def read_pages(self, path, key=None, timeout=None, older=None, cap=None):
-        """One list read, at most GITHUB_PAGE_CAP pages of GITHUB_PAGE_SIZE. Returns (records, truncated). `older`
+        """One list read, at most `cap` (default GITHUB_PAGE_CAP) pages of GITHUB_PAGE_SIZE. Returns (records, truncated). `older`
         is (field, since): a listing newest first stops at the first page that ends before `since`."""
         joiner = "&" if "?" in path else "?"
         records = []
@@ -13180,7 +13180,7 @@ class GitHubHub:
                 return records, False
             if older and isinstance(page[-1].get(older[0]), str) and page[-1][older[0]] < older[1]:
                 return records, False
-            if bounded and number >= min(GITHUB_PAGE_CAP, cap or GITHUB_PAGE_CAP):
+            if bounded and number >= (cap or GITHUB_PAGE_CAP):
                 return records, True
 
     # -- gh api, and the catch-up read
