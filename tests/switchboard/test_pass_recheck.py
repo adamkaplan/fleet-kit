@@ -709,3 +709,22 @@ class TestPlanKeyHash(unittest.TestCase):
         new = 'PLAN_KEY_RE = re.compile(r"^plan:([^#:\\s]+/[^#:\\s]+)#([0-9]+):([^:\\s]+):")'
         result = helper.mutate_run("switchboard/reminders.py", old, new, name, [(sb, "pass_subject", "pass_subject")])
         self.assertFalse(result.wasSuccessful(), msg="the old pattern went unnoticed")
+
+
+class TestPlanWakeMutants(unittest.TestCase):
+    """Seventh (3): the REAL plan_wake_pass with the line that records the present hash replaced by `pass` (the test is TestPlanWake's, wired by bin/test-switchboard)."""
+
+    def test_a_plan_pass_that_does_not_record_the_present_hash_is_caught(self):
+        name = "TestPlanWake.test_the_plan_pass_records_the_present_hash_so_a_replaced_plan_notice_is_dropped_and_the_new_one_kept"
+        text = Path(sb.__file__).resolve().read_text()
+        start = text.index("def plan_wake_pass(")
+        end = text.index("\n\n\n", start)
+        old = "wake.newest[(repo, number)] = plan_hash"
+        self.assertEqual(text[start:end].count(old), 1, msg="the mutation target moved")
+        mutated = text[start:end].replace(old, "pass", 1)
+        self.assertNotEqual(mutated, text[start:end], msg="the mutation was not applied")
+        ns = dict(vars(sb))
+        exec(compile(mutated, "plan_wake_pass.py", "exec"), ns)
+        helper = TestPassRecheckMutants()
+        self.assertTrue(helper.run_case(name, []).wasSuccessful(), msg="control failed")
+        self.assertFalse(helper.run_case(name, [(sb, "plan_wake_pass", ns["plan_wake_pass"])]).wasSuccessful(), msg="a pass that records no hash went unnoticed")
