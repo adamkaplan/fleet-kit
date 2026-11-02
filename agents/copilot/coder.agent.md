@@ -1,6 +1,7 @@
 ---
 description: Ephemeral worker. One assignment, one git worktree. Writes the code, commits it, opens a PR, reports back honestly, exits.
 name: coder
+fleet-roles: coder, tester
 tools: ['bash', 'view', 'grep', 'glob', 'create', 'edit', 'skill']
 model: __MODEL_ID__
 ---

@@ -124,6 +124,7 @@ The **Holds** column is descriptive: only the layer numbers are enforced.
 | `switchboard/pr_explain.py` | 5 | `pr-explain` and the checks of a held pull request body | |
 | `switchboard/sent_view.py` | 5 | `sent`: a sender's own recent messages with their sent, delivered and picked-up times | |
 | `switchboard/v2_transport.py` | 1 | the OpenCode v2 client and its HTTP transport | |
+| `tester_agent.py` | 0 | the list of agents a `launch --role tester` accepts, read from the `fleet-roles` line of the definitions in the checkout (#1963) | |
 | `switchboard/jev.py` | 1 | the Jev client: the decision model, the classifier and the policy judge's questions | |
 | `switchboard/audit.py` | 2 | the audit log | |
 | `switchboard/facts.py` | 4 | the fact sources: the world read into facts | |

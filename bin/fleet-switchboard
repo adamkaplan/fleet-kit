@@ -14310,6 +14310,11 @@ def _cmd_launch(args, runner, now, socket_call=None):
     if getattr(args, "stack", False) and not getattr(args, "cloud", False):   # before anything is read or called: the option is the cloud launcher's
         sys.stderr.write("%s: --stack needs --cloud: the nested Docker stack is a cloud worker's pod; nothing was created\n" % PROG)
         return EXIT_USAGE
+    if getattr(args, "role", None) == "tester" and getattr(args, "agent", None):   # #1963: before every route; the allowed agents are read from the checkout's definitions (fleet-roles)
+        problem = load_module("tester_agent").line_for(args.agent, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+        if problem:
+            sys.stderr.write(problem + "\n")
+            return EXIT_USAGE
     if getattr(args, "cloud", False):   # a worker in the cloud (#371): its own module; nothing below runs
         return run_cloud("cmd_launch", args, runner, now)
     refuse_cloud_name(args.name)   # a name that has a cloud record is not launched locally (#640)
