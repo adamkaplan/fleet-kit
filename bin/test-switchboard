@@ -50568,6 +50568,10 @@ class TestHeldRowsFromLabels(DecisionsBase):
 
     def lists(self, *records, repo=None, cut=False):
         self.engine.ci_record_state.lists[(repo or self.REPO).lower()] = (self.world.clock.now(), list(records))
+        if cut:
+            self.engine.ci_record_state.good[(repo or self.REPO).lower()] = (self.world.clock.now(), list(records), True)
+        else:   # a list read that was not cut: the recorder's flag is clear (the plan gave no else; the test s4 needs it)
+            self.engine.ci_record_state.good.pop((repo or self.REPO).lower(), None)
 
     def rows(self):
         return [d for d in self.listed() if d.get("number") in range(7, 400) and d.get("kind") in ("captain", "notice")]
@@ -50595,7 +50599,7 @@ class TestHeldRowsFromLabels(DecisionsBase):
         self.lists(self.pr(20, "merge-captain"), self.pr(21, "hold-contract"))
         self.assertEqual(sorted(d["number"] for d in self.rows() if d["number"] in (20, 21)), [20, 21])
         # the list is read again and is CUT (200 records, the held ones beyond it): the rows stay
-        self.lists(*[self.pr(100 + n) for n in range(sb.LABEL_HOLD_LIST_CUT)])
+        self.lists(*[self.pr(100 + n) for n in range(5)], cut=True)
         self.assertEqual(sorted(d["number"] for d in self.rows() if d["number"] in (20, 21)), [20, 21])
         # a complete list without them (they were merged or unlabelled) drops them
         self.lists(self.pr(100))
@@ -50677,10 +50681,10 @@ class TestHeldRowsFromLabels(DecisionsBase):
     def test_a_row_kept_because_its_list_is_cut_expires_after_a_day(self):
         self.lists(self.pr(95, "merge-captain"))
         self.assertEqual([d["number"] for d in self.rows() if d["number"] == 95], [95])
-        self.lists(*[self.pr(100 + n) for n in range(sb.LABEL_HOLD_LIST_CUT)])
+        self.lists(*[self.pr(100 + n) for n in range(5)], cut=True)
         self.assertEqual([d["number"] for d in self.rows() if d["number"] == 95], [95], "kept while the list is cut")
         self.world.tick(sb.LABEL_HOLD_KEEP_SECONDS + 60)
-        self.lists(*[self.pr(100 + n) for n in range(sb.LABEL_HOLD_LIST_CUT)])
+        self.lists(*[self.pr(100 + n) for n in range(5)], cut=True)
         self.assertEqual([d for d in self.rows() if d["number"] == 95], [], "a pull request that merged meanwhile does not stay for ever")
 
     def test_a_pr_with_only_a_merge_automatic_label_is_not_held(self):
