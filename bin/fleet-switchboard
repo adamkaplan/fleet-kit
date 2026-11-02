@@ -9740,6 +9740,7 @@ SWEEP_CALLS_PER_PASS = SWEEP_DEFAULTS["calls_per_pass"]   # default of `sweep.ca
 SWEEP_CALLS_CAP = 100
 SWEEP_CONFIRM_RESERVE = 2     # of them, kept for the single-issue reads (is this decision's issue closed?)
 SWEEP_PASS_SECONDS = 8        # no new read is started once the sweep has spent this long in a pass
+OPEN_LIST_PAGES = 10         # #1886: pages (of 100) every read of OPEN items follows (1,000); beyond it one named alert a day
 SWEEP_LIST_PAGES = 2          # pages one list read follows (200 records); more is shown as capped
 SWEEP_PR_COMMENTS = 5         # the last comments of an item that are searched for the phrases
 SWEEP_FILE = "sweep.json"
