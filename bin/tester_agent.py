@@ -1,7 +1,7 @@
-"""#1963: `launch --role tester` needs an agent whose definition says it can be launched as a tester.
+"""#1963: `launch --role tester` needs an agent whose line in agents/roles.tsv names the role `tester`.
 
-The allowed list is READ from the definitions in agents/opencode/ of the switchboard's own checkout (one front matter line, `fleet-roles: coder, tester`):
-never typed here and never read from ~/.config. The agent's name is the definition's front matter `name:`, or its file name when it has none."""
+The allowed list is READ from agents/roles.tsv of the switchboard's own checkout (one line for each agent: its name, a TAB, its roles separated by commas; a line that
+begins with # is a comment): never typed here and never read from ~/.config. No definition is edited."""
 import os
 
 PROG = "fleet-switchboard"
@@ -9,29 +9,23 @@ PROG = "fleet-switchboard"
 
 def line_for(agent, root):
     """None when `agent` may be launched with --role tester, else the one line to print (no newline). `root` is the checkout (the directory above bin/).
-    Fails closed: an unreadable directory, or one with no tester definition, refuses."""
-    folder = os.path.join(root, "agents", "opencode")
+    Fails closed: an unreadable file, or one with no line naming tester, refuses."""
+    path = os.path.join(root, "agents", "roles.tsv")
     allowed = []
     try:
-        for entry in sorted(os.listdir(folder)):
-            if not entry.endswith(".md"):
-                continue
-            with open(os.path.join(folder, entry), encoding="utf-8") as handle:
-                text = handle.read()
-            front = text.split("\n---", 2)[0].splitlines()[1:] if text.startswith("---\n") else []
-            fields = {}
-            for line in front:
-                key, _, value = line.partition(":")
-                if line and not line.startswith((" ", "#")):
-                    fields[key.strip()] = value.strip()
-            if "tester" in [r.strip() for r in fields.get("fleet-roles", "").split(",")]:
-                allowed.append(fields.get("name") or entry[:-3])
+        with open(path, encoding="utf-8") as handle:
+            for line in handle.read().splitlines():
+                if not line.strip() or line.startswith("#"):
+                    continue
+                name, _, roles = line.partition("\t")
+                if name.strip() and "tester" in [r.strip() for r in roles.split(",")]:
+                    allowed.append(name.strip())
     except (OSError, UnicodeDecodeError) as err:
-        return ("%s: launch: --role tester: cannot read the agent definitions in %s (%s); run fleet-switchboard from the switchboard's checkout; nothing was started"
-                % (PROG, folder, getattr(err, "strerror", None) or err))
+        return ("%s: launch: --role tester: cannot read %s (%s); run fleet-switchboard from the switchboard's checkout; nothing was started"
+                % (PROG, path, getattr(err, "strerror", None) or err))
     if not allowed:
-        return ("%s: launch: --role tester: no definition in %s declares `fleet-roles: ... tester`; run fleet-switchboard from the switchboard's checkout "
-                "(or add the line to the definition); nothing was started" % (PROG, folder))
+        return ("%s: launch: --role tester: no line of %s names tester; run fleet-switchboard from the switchboard's checkout "
+                "(or add the line to the file); nothing was started" % (PROG, path))
     if agent in allowed:
         return None
     return ("%s: launch: --role tester needs an agent that works a brief and records verdicts: %s is not one (allowed: %s); "
