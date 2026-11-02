@@ -508,7 +508,7 @@ class TestStopFinalMessageEdges(unittest.TestCase):
 
     def test_U15_a_rebuilt_endpoint_is_in_neither_the_message_nor_the_file(self):
         w = StopWorld(self)
-        text = "see https://" + ENDPOINT + "worker-x-ab12.example.internal:4096 early " + "words " * 700 + " late"
+        text = "see wor" + ENDPOINT + "ker-x-ab12.example.internal:4096 early " + "words " * 700 + " late"
         w.stop("cb-1788a", "idle", w.pod("cb-1788a", text))
         w.scan()
         everything = w.to("boss-lane")[0] + "".join(p.read_text() for p in (w.state / "cloud-last").iterdir())
