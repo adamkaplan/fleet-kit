@@ -600,4 +600,157 @@ def build():
                                       env=dict(os.environ, PYTHONPATH=tmp + "/bin"))
             return done.returncode, done.stderr
 
+        # -- U21, U22, U23 (PC-11): the masking is decided by `ipaddress`; checked in a subprocess on the real launcher (or on a scratch copy with a mutant)
+        PC11_LOAD = r"""
+import importlib.util, ipaddress, random, re, sys
+spec = importlib.util.spec_from_file_location("launcher_pc11", sys.argv[1] + "/cloud/launcher/cloud_worker.py")
+lib = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(lib)
+def accepted(text):
+    try:
+        ipaddress.ip_address(text)
+        return True
+    except ValueError:
+        return False
+def leaks(out):
+    # a leak: a substring of a run of address characters of the OUTPUT, from a run boundary or a colon or a dot to one, that ipaddress accepts (a zone is set aside)
+    for run in re.findall(r"[0-9A-Fa-f:.]+", out):
+        for i in range(len(run)):
+            if not (i == 0 or run[i - 1] in ":." or run[i] in ":."):
+                continue
+            for j in range(i + 1, min(len(run), i + 64) + 1):
+                if (j == len(run) or run[j] in ":." or run[j - 1] in ":.") and accepted(run[i:j]):
+                    return run[i:j]
+    return None
+"""
+        PC11_U21 = r"""
+rng = random.Random(1793)
+def v4():
+    return ".".join(str(rng.choice((0, 1, 9, 10, 99, 100, 127, 192, 255, rng.randint(0, 255)))) for _ in range(4))
+def groups(n):
+    out = []
+    for _ in range(n):
+        g = "%x" % rng.choice((0, 1, 0xfd00, 0x2001, 0xdb8, rng.randint(0, 65535)))
+        g = g.zfill(rng.choice((1, 4))) if rng.random() < 0.3 else g
+        out.append(g.upper() if rng.random() < 0.3 else g)
+    return out
+def v6():
+    kind = rng.randrange(6)
+    if kind == 0:
+        return ":".join(groups(8))
+    if kind == 1:
+        left = rng.randint(0, 7); right = rng.randint(0, 7 - left)
+        return ":".join(groups(left)) + "::" + ":".join(groups(right))
+    if kind == 2:
+        prefix = rng.choice(("::ffff:", "::FFFF:", "::ffff:0:", "0:0:0:0:0:ffff:", "0:0:0:0:0:FFFF:", "::Ffff:"))
+        return prefix + v4()
+    if kind == 3:
+        return "::"
+    if kind == 4:
+        return "::" + ":".join(groups(rng.randint(1, 3)))
+    return ":".join(groups(rng.randint(1, 3))) + "::"
+def address():
+    form = v4() if rng.random() < 0.3 else v6()
+    return form + ("%eth0" if form.count(":") and rng.random() < 0.1 else "")
+labels = ("", "", "host:", "ip:", "node-a ", "addr=", "[", "to ", "peer=", "x-y:", "pod/c-6152: ", "from (", "'", "\"", "url:", "no route to host:")
+tails = ("", "", ":", ": refused", ":8080", ":80:", "]", "]:80", " text", ",", ".", "=", ")", "; Insufficient cpu", ": connection refused", "/64", ":port")
+bad = []
+for _ in range(20000):
+    line = rng.choice(labels) + address() + rng.choice(tails)
+    if rng.random() < 0.3:
+        line += " " + rng.choice(labels) + address() + rng.choice(tails)
+    out = lib._mask_addresses(line)
+    found = leaks(re.sub(r"%[0-9A-Za-z_-]+", "", out))
+    if found:
+        bad.append((line, out, found))
+        if len(bad) >= 5:
+            break
+if bad:
+    sys.exit("an address leaked past the masking: " + repr(bad))
+for line, want in (("host:fd00::1", "host:[address]"), ("ip:2001:db8::1", "ip:[address]"), ("fd00::1: refused", "[address]: refused"),
+                   ("fd00::1:", "[address]:"), ("::ffff:10.0.0.1:8080", "[address]:8080"),
+                   ("12:30:45", "12:30:45"), ("aa:bb:cc:dd:ee:ff", "aa:bb:cc:dd:ee:ff"), ("123e4567-e89b-12d3-a456-426614174000", "123e4567-e89b-12d3-a456-426614174000"),
+                   ("deadbeefcafe0123", "deadbeefcafe0123"), ("node-a", "node-a"), ("1::2::3", "1::2::3")):
+    if lib._mask_addresses(line) != want:
+        sys.exit("a fixed case differs: %r gave %r, wanted %r" % (line, lib._mask_addresses(line), want))
+"""
+        PC11_U22 = r"""
+rng = random.Random(22)
+real = ipaddress.ip_address
+counts = {}
+for name, alphabet in (("colons and hex digits", "0123456789abcdef:"), ("dots and digits", "0123456789.")):
+    run = "".join(rng.choice(alphabet) for _ in range(20000))
+    calls = [0]
+    def counting(text, calls=calls):
+        calls[0] += 1
+        return real(text)
+    ipaddress.ip_address = counting
+    try:
+        lib._mask_addresses("event " + run + " end")
+    finally:
+        ipaddress.ip_address = real
+    counts[name] = calls[0]
+    if calls[0] > 1280000:
+        sys.exit("the parse count %d of the run of %s is above 1280000" % (calls[0], name))
+print(counts)
+"""
+        PC11_U23 = r"""
+forms = {"v4": "10.99.88.77", "v6": "fd00:abcd:1234:5678:9abc:def0:1234:5678", "mapped": "0:0:0:0:0:ffff:10.99.88.77"}
+split = []
+for name, form in sorted(forms.items()):
+    for offset in range(120, 281):
+        line = "." * offset + form + "." * (400 - offset - len(form))
+        assert len(line) == 400
+        want = "." * offset + "[address]" + "." * (400 - offset - len(form))
+        out = lib._mask_addresses(line)
+        if out != want:
+            split.append((name, offset))
+if split:
+    sys.exit("an address split by a window boundary leaked: %d of 483, first %r" % (len(split), split[:3]))
+"""
+
+        def pc11_run(self, script, mutate=None):
+            import shutil, subprocess, tempfile
+            root = Path(__file__).resolve().parents[2]
+            with tempfile.TemporaryDirectory(prefix="pc11-") as tmp:
+                for src in sorted((root / "cloud" / "launcher").glob("*.py")) + [root / "bin" / "path_walk.py"]:
+                    rel = src.relative_to(root)
+                    (Path(tmp) / rel).parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy(src, Path(tmp) / rel)
+                if mutate:
+                    rel, old, new = mutate
+                    text = (Path(tmp) / rel).read_text()
+                    self.assertEqual(text.count(old), 1, "the mutant's text is not in the copy: " + old)
+                    (Path(tmp) / rel).write_text(text.replace(old, new))
+                done = subprocess.run([sys.executable, "-c", self.PC11_LOAD + script, tmp], capture_output=True, text=True, timeout=600,
+                                      env=dict(os.environ, PYTHONPATH=tmp + "/bin"))
+            return done.returncode, done.stderr, done.stdout
+
+        def test_u21_generated_lines_leak_nothing_and_the_fixed_cases_hold(self):
+            code, err, out = self.pc11_run(self.PC11_U21)
+            self.assertEqual((code, err), (0, ""))
+
+        def test_u21_a_mutant_that_goes_back_to_the_pattern_alone_fails_with_the_text(self):
+            code, err, out = self.pc11_run(self.PC11_U21)
+            self.assertEqual((code, err), (0, ""))
+            code, err, out = self.pc11_run(self.PC11_U21, ("cloud/launcher/cloud_worker.py", "MASK_BY_IPADDRESS = True", "MASK_BY_IPADDRESS = False"))
+            self.assertEqual(code, 1, err)
+            self.assertIn("an address leaked past the masking", err)
+
+        def test_u22_the_number_of_parses_is_bounded_and_only_counted(self):
+            code, err, out = self.pc11_run(self.PC11_U22)
+            self.assertEqual((code, err), (0, ""))
+            print("U22 measured ipaddress.ip_address calls (bound 1280000):", out.strip())
+
+        def test_u23_an_address_at_every_window_boundary_offset_is_masked_whole(self):
+            code, err, out = self.pc11_run(self.PC11_U23)
+            self.assertEqual((code, err), (0, ""))
+
+        def test_u23_a_mutant_whose_windows_do_not_overlap_fails_with_the_text(self):
+            code, err, out = self.pc11_run(self.PC11_U23)
+            self.assertEqual((code, err), (0, ""))
+            code, err, out = self.pc11_run(self.PC11_U23, ("cloud/launcher/cloud_worker.py", "WINDOW_OVERLAP = 64", "WINDOW_OVERLAP = 0"))
+            self.assertEqual(code, 1, err)
+            self.assertIn("an address split by a window boundary leaked", err)
+
     return TestLaunchCapacity
