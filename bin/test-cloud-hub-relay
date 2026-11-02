@@ -808,7 +808,8 @@ class TestEventWait(unittest.TestCase):
         events, failures, t0 = [], [], time.monotonic()   # the event log of the scenario run by `run`, kept by this test
         log = lambda text: events.append((time.monotonic() - t0, text))
 
-        def run(case, meth, remove_admit):
+        DEAD_TEXT = "the observation is dead: the in-flight count is above the cap and over was never set"
+        def run(case, meth, remove_admit, dead_watch=False):
             events.clear(); failures.clear(); log("scenario start (no delayed call in this scenario)")
             real_held, real_wait = Hub.held_call, TestBoundsAndCaps.__dict__["wait_for"]
             def held(self_, *a, **kw):
@@ -818,14 +819,36 @@ class TestEventWait(unittest.TestCase):
                     return real_held(self_, *a, **kw)
                 finally:
                     log("held call %s end" % n)
+            relays, dead_ev, stop = [], threading.Event(), threading.Event()
+            def watch():   # the observed state: in-flight above the cap while the wait's condition (over or refused) is still false
+                while not stop.is_set():
+                    if relays and not cond_box[0]() and relays[0].inflight > relays[0].max_inflight:
+                        dead_ev.set(); return
+                    stop.wait(0.01)
+            cond_box = [None]
+            watcher = threading.Thread(target=watch, daemon=True)
             def waited(cond, limit=10.0):
                 try:
-                    real_wait.__func__(cond, limit); log("wait: the condition ended the wait")
+                    if dead_watch and limit == 30.0:   # the over wait of the copy: the limit stays the hang guard, the state ends the wait
+                        cond_box[0] = cond; watcher.start()
+                        real_wait.__func__(lambda: cond() or dead_ev.is_set(), limit)
+                        if not cond():
+                            log("observed state: in-flight above the cap, over unset, nothing refused"); raise AssertionError(DEAD_TEXT)
+                    else:
+                        real_wait.__func__(cond, limit)
+                    log("wait: the condition ended the wait")
                 except AssertionError:
                     log("guard: the wait limit of %s s ended the wait, it raised" % limit); raise
             Hub.held_call = held; TestBoundsAndCaps.wait_for = staticmethod(waited)
             old = cloud_relay.Relay.admit
-            if remove_admit:
+            if remove_admit and dead_watch:   # the cap removed but the relay still counts, so its in-flight count can be observed above the cap
+                def counting_admit(self):
+                    relays.append(self)
+                    with self.lock:
+                        self.inflight += 1
+                    return True
+                cloud_relay.Relay.admit = counting_admit
+            elif remove_admit:
                 cloud_relay.Relay.admit = lambda self: True
             try:
                 meth()
@@ -835,6 +858,8 @@ class TestEventWait(unittest.TestCase):
                 return e
             finally:
                 cloud_relay.Relay.admit = old
+                stop.set()
+                if watcher.ident is not None: watcher.join(5)
                 case.doCleanups()
                 log("join: the cleanups of the case ran (the handler threads are joined)")
                 Hub.held_call = real_held; TestBoundsAndCaps.wait_for = real_wait
@@ -848,14 +873,14 @@ class TestEventWait(unittest.TestCase):
         src = textwrap.dedent(inspect.getsource(TestBoundsAndCaps.__dict__[name]))
         self.assertEqual(src.count("over.set()"), 1)
         self.assertEqual(src.count("30.0"), 1)
-        dead_src = src.replace("over.set()", "pass").replace("30.0", "2.0")
+        dead_src = src.replace("over.set()", "pass")
         ns = dict(globals())
         exec(compile(dead_src, "<dead-observation>", "exec"), ns)
         case = TestBoundsAndCaps(name)
-        e3 = run(case, lambda: ns[name](case), True)
-        dead = int(isinstance(e3, AssertionError) and "wait_for: the state was not reached" in str(e3))
+        e3 = run(case, lambda: ns[name](case), True, True)
+        dead = int(isinstance(e3, AssertionError) and DEAD_TEXT in str(e3))
         applied = dead_src != src
-        print("S7: mutant fails %d of 1 with over-admitted and %d of 1 with a TimeoutError, control passes %d of 1, dead observation fails %d of 1 with the guard text, mutations applied %s" % (m_over, m_timeout, control, dead, applied))
+        print("S7: mutant fails %d of 1 with over-admitted and %d of 1 with a TimeoutError, control passes %d of 1, dead observation fails %d of 1 with the observed-state text, mutations applied %s" % (m_over, m_timeout, control, dead, applied))
         self.assertEqual((m_over, m_timeout, control, dead, applied), (1, 0, 1, 1, True))
 
     def s13_run(self, transform=None, end_one=False):
