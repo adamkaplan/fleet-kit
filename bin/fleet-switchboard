@@ -19997,7 +19997,7 @@ def ci_record_pass(engine, now):
             break
         key = plan_ledger.normal_repo(repo)
         try:
-            records, cut = hub.read_pages("repos/%s/pulls?state=open&per_page=100" % repo, cap=2)
+            records, cut = hub.read_pages("repos/%s/pulls?state=open&per_page=100" % repo, cap=OPEN_LIST_PAGES)
             budget[0] -= sweep_pages_used(records, cut)
             state.lists[key] = (now, records)
             state.good[key] = (now, records, bool(cut) or len(records) >= LABEL_HOLD_LIST_CUT)
