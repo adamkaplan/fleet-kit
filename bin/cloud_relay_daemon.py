@@ -204,6 +204,14 @@ def _checked_evidence(args):
         raise Refuse(400, str(err))
 
 
+def _checked_command(args):
+    """The command a proof records: refused (Refuse 400 with the two numbers), never cut."""
+    try:
+        return plan_ledger.bounded_text(str(args.get("command") or ""), plan_ledger.FIELD_LIMIT, "command")
+    except plan_ledger.LedgerError as err:
+        raise Refuse(400, str(err))
+
+
 def _bounded(fn, timeout):
     """fn() with a deadline: _TIMEOUT when it does not answer in time, the Refuse itself when it raises one (429 budget/pause: the pod sees the named
     cause), None for any other failure (an unknown head, refused as stale)."""
@@ -474,7 +482,7 @@ class Executor:
                 "result": result, "by": pod, "evidence": evidence, "call_id": cid}
         if command == "prove":
             self._check_holder(pod, req, b)
-            entry = dict(base, kind="proof", command=plan_ledger.clip(str(args.get("command") or "")), env="relay")
+            entry = dict(base, kind="proof", command=_checked_command(args), env="relay")
         else:
             named = scenario.get("evaluator")
             if args.get("evaluator", named) != named:
