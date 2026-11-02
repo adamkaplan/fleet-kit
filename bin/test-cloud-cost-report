@@ -3,7 +3,7 @@
 
 Each rule has a mutant: the module source is changed in one place and the same case must then fail.
 
-The audit writer guard is a syntactic net for the common shapes: it does not see a path built by a helper function, and the first test lists every file that names the audit path so that a new one is seen and read by a reviewer. Limits it does not fully cover: a path returned by a helper function, a copy or move whose destination is built elsewhere, a subprocess whose command text is assembled away from the call.
+The audit writer guard is a syntactic net for the common shapes: it does not see a path built by a helper function, and the first test lists every file that names the audit path so that a new one is seen and read by a reviewer. Limits that remain, inherent to a scan of the source: a path built by a helper function, and a write by another process. Also not covered: a path returned by a helper function, a copy or move whose destination is built elsewhere, a subprocess whose command text is assembled away from the call.
 
     bin/test-cloud-cost-report
 """
@@ -704,6 +704,8 @@ def audit_writes(text):
         elif (dotted.startswith("subprocess.") or dotted in ("os.system", "os.popen")) and node.args and holds(node.args[0]) and any(  # ext-proc
                 t in ast.unparse(node.args[0]) for t in ("tee", ">>")):  # ext-proc
             hits.append((node.lineno, "subprocess with tee or >> on the audit path"))  # ext-proc
+        elif (dotted in ("os.rename", "os.replace") and len(node.args) > 1 and holds(node.args[1])) or (name in ("rename", "replace") and dotted not in ("os.rename", "os.replace") and isinstance(node.func, ast.Attribute) and node.args and holds(node.args[0])):  # ext-rename
+            hits.append((node.lineno, "rename or replace onto the audit path"))  # ext-rename
         elif name == "open" and isinstance(node.func, ast.Attribute) and holds(node.func.value) and write_flag(node, 0):
             hits.append((node.lineno, "Path.open for writing"))
     return hits
@@ -896,6 +898,17 @@ PROC_SAMPLES = {
     "sh -c redirect": "import subprocess, os\nsubprocess.run(['sh', '-c', 'echo x >> ' + os.environ['CW_CLOUD_AUDIT']])\n",
     "os.system redirect": "import os\nos.system('echo x >> /var/cw-cloud/audit.jsonl')\n",
 }
+RENAME_SAMPLES = {
+    "os.rename": "import os\nos.rename('x', os.environ['CW_CLOUD_AUDIT'])\n",
+    "os.replace": "import os\nos.replace('x', os.environ['CW_CLOUD_AUDIT'])\n",
+    "Path.rename": "import pathlib, os\npathlib.Path('x').rename(os.environ['CW_CLOUD_AUDIT'])\n",
+    "Path.replace": "import pathlib, os\npathlib.Path('x').replace(os.environ['CW_CLOUD_AUDIT'])\n",
+}
+READER_SAMPLES = {
+    "read open": "import os\nopen(os.environ['CW_CLOUD_AUDIT'], 'r')\n",
+    "exists": "import os\nos.path.exists(os.environ['CW_CLOUD_AUDIT'])\n",
+    "rename elsewhere": "import os\nos.rename('x', '/tmp/other')\n",
+}
 HELPER_SAMPLE = "import os\n\ndef path():\n    return os.environ['CW_CLOUD_AUDIT']\n\nopen(path(), 'a')\n"
 
 
@@ -929,6 +942,40 @@ class TestWriterGuardShapes(unittest.TestCase):
     def test_a_path_built_by_a_helper_function_is_not_seen(self):
         # a stated limit: the guard is syntactic and does not follow a helper's return value
         self.assertEqual(audit_writes(HELPER_SAMPLE), [])
+
+
+class TestRenameOntoTheAuditPath(unittest.TestCase):
+    def test_s11_rename_and_replace_shapes_with_a_mutant(self):
+        import inspect
+        writers = dict(COPY_SAMPLES, **RENAME_SAMPLES)
+        writers["shutil.copy2 metadata"] = writers.pop("shutil.copy2")
+        writers["tee list"] = PROC_SAMPLES["tee list"]
+        writers["shell redirect"] = PROC_SAMPLES["sh -c redirect"]
+        del writers["shutil.copyfile"]
+
+        def check(fn):
+            for shape, text in RENAME_SAMPLES.items():
+                hits = fn(text)
+                if [h[0] for h in hits] != [text.count("\n")] or "rename or replace" not in hits[0][1]:
+                    raise AssertionError("a rename onto the audit path was not flagged: " + shape)
+        check(audit_writes)  # control, first
+        source = inspect.getsource(audit_writes)
+        lines = source.splitlines()
+        kept = [l for l in lines if "# ext-rename" not in l]
+        self.assertEqual(len(lines) - len(kept), 2)
+        scope = dict(globals())
+        exec("\n".join(kept), scope)
+        applied = len(kept) < len(lines)
+        with self.assertRaises(AssertionError) as ctx:
+            check(scope["audit_writes"])
+        self.assertIn("a rename onto the audit path was not flagged", str(ctx.exception))
+        flagged = sum(1 for t in writers.values() if audit_writes(t))
+        readers = sum(1 for t in READER_SAMPLES.values() if audit_writes(t))
+        self.assertEqual((len(writers), flagged, readers), (9, 9, 0))
+        # a rename onto another path with an audit-path source is not a write onto it
+        self.assertEqual(audit_writes("import os\nos.rename(os.environ['CW_CLOUD_AUDIT'], '/tmp/o')\n"), [])
+        print("S11: flagged %d of %d writers, %d of %d readers; control passes 1 of 1, mutant fails 1 of 1 with the text, mutation applied %s" % (
+            flagged, len(writers), readers, len(READER_SAMPLES), applied))
 
 
 def mock_stderr(stream):
