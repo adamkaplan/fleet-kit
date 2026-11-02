@@ -282,7 +282,7 @@ def _stack_rest_differs(pod):
         or len(ks) != 1 or [k.get("name") for k in ks] != ["worker"]   # one container, named worker: no sidecar, even one with the stack context
         or any(not set(k) <= STACK_CONTAINER_KEYS or not isinstance(k.get("image"), str) or not k.get("image") for k in ks)
         or any(set(e) != {"name", "value"} for k in ks for e in k.get("env", []))   # no valueFrom / secretKeyRef; no envFrom (key allow-list)
-        or any(set((k.get("resources") or {})) != {"limits"} or set(k["resources"]["limits"]) != {"cpu", "memory"} for k in ks)   # limits stay
+        or any((set((k.get("resources") or {})) != {"limits"} and not requests_fit(pod.get("metadata", {}).get("annotations", {}).get("cw/shape"), k.get("resources"))) or set(k["resources"]["limits"]) != {"cpu", "memory"} for k in ks)   # limits stay; requests only the table's
         or any(k.get("readinessProbe") != {"tcpSocket": {"port": 4096}} for k in ks)
         or any(set(m) - {"name", "mountPath", "readOnly"} or {**STACK_MOUNT_PATHS, PULLER_VOLUME_NAME: PULLER_MOUNT_PATH}.get(m.get("name")) != m.get("mountPath")
                for k in ks for m in k.get("volumeMounts", []))
