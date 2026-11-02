@@ -230,7 +230,7 @@ def main(argv=None):
         print("  %s: %s" % (section, " ".join("#%d" % n for n in sorted(numbers))))
     print("\n%d open pull requests touch the daemon or its tests" % len(report))
     if not_whole:
-        print("not whole (the file list is cut: their overlap is unknown): %s" % " ".join("#%s" % n for n in not_whole))
+        print("not whole (the file list is cut: an overlap listed above is a lower bound, and a pull request listed here and not above may still overlap): %s" % " ".join("#%s" % n for n in not_whole))
     return 0
 
 

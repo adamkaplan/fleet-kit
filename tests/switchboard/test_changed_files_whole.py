@@ -242,6 +242,27 @@ def build():
         def test_s2_s9_the_real_tool_passes_every_claim(self):
             overlap_claims(TOOL, self.root)
 
+        def lower_bound_check(self, tool):
+            prs = [cut_pr(7, plain_names(100, [DAEMON]))]
+            done, calls, pages = run_many(tool, self.root, prs, {7: ([], 1)})
+            lines = [l for l in done.stdout.splitlines() if l.startswith("not whole (")]
+            if done.returncode != 0 or len(lines) != 1 or not_whole_numbers(done) != [7]:
+                raise AssertionError("LOWER-LINE the not whole line is missing: %r %r" % (done.stdout, done.stderr))
+            if "#7 edit f" not in done.stdout:
+                raise AssertionError("LOWER-ABOVE the listed names holding the daemon are not reported above: %r" % done.stdout)
+            if "their overlap is unknown" in lines[0] or "an overlap listed above is a lower bound" not in lines[0]:
+                raise AssertionError("LOWER-TEXT the not whole line is false or lacks the lower bound: %r" % lines[0])
+
+        def test_1531_the_not_whole_line_says_the_overlap_above_is_a_lower_bound(self):
+            self.lower_bound_check(TOOL)
+
+        def test_1531_the_old_unknown_overlap_line_is_caught(self):
+            self.lower_bound_check(TOOL)   # the unmutated control
+            mutant = self.tool_with("an overlap listed above is a lower bound, and a pull request listed here and not above may still overlap",
+                                    "their overlap is unknown")
+            with self.assertRaisesRegex(AssertionError, r"^LOWER-TEXT "):
+                self.lower_bound_check(mutant)
+
         def test_s3_a_pull_request_with_a_matching_count_gives_the_stored_baseline(self):
             done = run_tool(TOOL, self.root, json.dumps([pr_of(1, 1)]), diff_rc=1)   # a diff call would list it as not whole
             self.assertEqual((done.returncode, done.stdout), (0, BASELINE), done.stderr)
