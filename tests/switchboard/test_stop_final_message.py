@@ -480,7 +480,7 @@ class TestStopFinalMessageHardeningMutant(unittest.TestCase):
         "r=unittest.TextTestRunner(verbosity=0).run(suite)\n"
         "sys.exit(0 if r.wasSuccessful() else 1)\n")
     CASES = (
-        ("cloud_retired", "test_U11_an_upper_case_endpoint_is_in_neither_the_message_nor_the_file", "low, n, out, i, keep = text.lower(), len(text), [], 0, 0",
+        ("cloud_retired", "test_U11_an_upper_case_endpoint_is_in_neither_the_message_nor_the_file", "low, n, out, i, keep = _fold_case(text), len(text), [], 0, 0",
          "low, n, out, i, keep = text, len(text), [], 0, 0",
          "an upper-case endpoint reached a lane"),
         ("cloud_retired", "test_U12_a_wide_cloud_last_is_tightened_and_a_link_or_a_foreign_one_is_refused", "os.fchmod(dfd, 0o700)", "pass",
@@ -770,8 +770,7 @@ class TestStopFinalMessageBare(unittest.TestCase):
                                               stderr=subprocess.STDOUT, universal_newlines=True, timeout=600)
         done = run("", "")
         self.assertEqual(done.returncode, 0, "control of U23: %s" % done.stdout)
-        line = re.search(r"low, n, out, i, keep = .*, len\(text\), \[\], 0, 0", Path(src).read_text()).group(0)
-        done = run(line, "low, n, out, i, keep = text.lower(), len(text), [], 0, 0")
+        done = run("low, n, out, i, keep = _fold_case(text), len(text), [], 0, 0", "low, n, out, i, keep = text.lower(), len(text), [], 0, 0")
         self.assertEqual(done.returncode, 1, "mutant of U23: %s" % done.stdout)
         self.assertIn("a host was left behind letters whose lower case is longer", done.stdout)
 
