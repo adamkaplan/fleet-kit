@@ -284,4 +284,31 @@ def build(Base, TestSteerToWorking):
             self.assertEqual(len(refusals), 1, json.dumps(refusals))
             self.assertEqual(self.lines("unconsumed.steer"), [])
 
+        # -- the absent record (U4) and light mode
+
+        def scenario_absent(self):
+            self.work(lasts=7200, steps=3)
+            self.assertFalse(os.path.exists(os.path.join(str(self.world.state), "unconsumed.json")))
+            self.new_engine()
+            self.queue_message("needs the record")
+            self.minutes(21)
+            for _ in range(5):
+                self.pass_()
+                self.world.tick(5)
+            self.assertEqual(len(self.lines("unconsumed_record.error")), 0, "msg=an absent record was audited")
+
+        def test_u4_an_absent_record_is_empty_and_writes_nothing_to_the_audit_after_five_passes(self):
+            self.scenario_absent()
+
+        def test_u4_control_the_unmutated_loader_passes_on_the_absent_record(self):
+            with mock.patch.object(sb.Switchboard, "_record_load", compiled("_record_load")):
+                self.scenario_absent()
+
+        def test_u4_the_mutant_that_audits_an_absent_file_fails_with_the_anchored_text(self):
+            mutant = compiled("_record_load", 'reason != "missing" and ', "")
+            with mock.patch.object(sb.Switchboard, "_record_load", mutant):
+                with self.assertRaises(AssertionError) as caught:
+                    self.scenario_absent()
+            self.assertIn("msg=an absent record was audited", str(caught.exception))
+
     return TestUnconsumedSteer

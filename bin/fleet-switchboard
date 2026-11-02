@@ -3309,7 +3309,7 @@ class Switchboard:
             record, reason = load_module("unconsumed_record").read(self.state_dir, load_module("record_json").parse_bounded)
         except Exception as err:
             record, reason = {"steered": [], "reminders": {}}, "unreadable: %s" % type(err).__name__
-        if reason is not None and reason not in self.record_errors:
+        if reason is not None and reason != "missing" and reason not in self.record_errors:   # absent = empty, silent
             self.record_errors.add(reason)
             if self.audit is not None:
                 self.audit.append(self.actor, "unconsumed_record.error", None, {"reason": reason, "phase": "read"})
