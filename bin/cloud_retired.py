@@ -256,7 +256,10 @@ class _LastUnsafe(OSError):
 def _write_last(base, name, text):
     """One private file: the directory is opened by a descriptor (O_NOFOLLOW|O_DIRECTORY), must be ours, and is tightened to 0700 when wider (PC-9 b);
     the file 0600, O_NOFOLLOW, written to a temporary name and renamed inside that descriptor (as `_write_private`)."""
-    base.mkdir(parents=True, mode=0o700, exist_ok=True)
+    try:
+        base.mkdir(parents=True, mode=0o700, exist_ok=True)
+    except FileExistsError:
+        raise _LastUnsafe("the directory of the last texts is a plain file") from None
     try:
         dfd = os.open(str(base), os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0))
     except OSError:
