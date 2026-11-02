@@ -603,6 +603,9 @@ launcher's allowed list and one role, and answers with GitHub's own token, repos
   the service; the answer gets the same checks as the signing route. With it unset the signing route runs as before: that is the rollback.
   `CW_TOKEN_SERVICE_CALLER_TOKEN_CMD` may name a command that prints the cluster token; unset, the launcher's own cluster login is used.
   Preflight note: the child reaches the service only if `CW_TOKEN_SERVICE_CALLER_TOKEN_CMD` prints a cluster token that the launcher holds.
+  The client sends the cluster token in `Authorization` and in `X-Caller-Token` (the API server removes `Authorization` of a proxied request;
+  the service reads and reviews only `X-Caller-Token`), verifies TLS against `CW_CLOUD_CA_FILE` when it is set, and refuses a service URL that is
+  not exactly the one above (the host of `CW_CLOUD_SERVER`, the namespace `CW_CLOUD_NAMESPACE`) before it sends the token.
 - A passing failure of the service (502, a timeout, no connection) exits 75 and the launcher tries again; a refusal exits 1.
 - The owner applies the manifests (`token-mint-review.yaml` holds the one cluster-wide permission), creates the Secret `token-mint-app`
   (keys `app-id`, `app-key`) and publishes the image.
