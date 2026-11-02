@@ -571,6 +571,63 @@ def build():
             session = [e["session"] for e in self.ledger() if e["kind"] == "lane_session"][0]
             self.assertIn("is a reviewer lane", sb.review_lane_send_problem({"plan_review": {"enabled": True}}, session, "orch"), "the send check reads the round as open")
 
+        # -- S12: abandon and report on a round without the pair
+
+        def count_plan_reads(self):
+            """Wrap the fake's route so every gh read of an issue is counted; returns the list that grows."""
+            reads = []
+            real_route = self.route
+
+            def counting(argv, **kwargs):
+                if argv and argv[0] == host.FAKE_GH and len(argv) > 2 and re.search(r"/issues/\d+$", str(argv[2])):
+                    reads.append(argv[2])
+                return real_route(argv, **kwargs)
+            self.route = counting
+            return reads
+
+        def abandon_and_report(self, got, rnd, expect_pair):
+            """Run report then abandon on the round; assert the S12 pass line and return the report."""
+            self.assertEqual("plan_hashes" in rnd, expect_pair)
+            for lane in rnd["lanes"][:2]:
+                self.inject(self.lane_entry(got["review"], rnd, lane, rnd["plan_hash"]))
+            before = len(self.ledger())
+            reads = self.count_plan_reads()
+            code, out, err = self.review("orch", "report", got["review"], "--json")
+            self.assertEqual(code, 0, err)
+            rep = json.loads(out)
+            self.assertEqual([r["round"] for r in rep["rounds"]], [1])
+            self.assertEqual(sorted(rep["rounds"][0]["lanes"]), sorted(rnd["lanes"][:2]), "1 report printed with the round and its lanes")
+            self.assertEqual(len(self.ledger()), before, "report writes nothing")
+            code, out, err = self.review("cos", "abandon", got["review"], "--reason", "the round predates the pair; closed by the lane", "--json")
+            self.assertEqual(code, 0, err)
+            self.assertEqual(len(self.kinds("abandoned")), 1, "1 abandoned entry written")
+            self.assertEqual(json.loads(out)["abandoned"], got["review"])
+            self.assertEqual(reads, [], "0 plan reads")
+            added = self.ledger()[before:]
+            self.assertTrue(added and all(e["kind"] in ("abandoned", "decision") for e in added))
+            self.assertEqual([e for e in added if "plan_hash" in e or "plan_hashes" in e], [], "0 plan hashes written")
+            self.assertEqual(self.kinds("abandoned")[0]["round"], 1)
+            return rep
+
+        def test_abandon_and_report_run_on_a_round_without_the_pair_and_a_new_round_can_start(self):
+            got = self.start_round(legacy=True)
+            rnd = self.kinds("round")[-1]
+            self.abandon_and_report(got, rnd, expect_pair=False)
+            self.assertEqual(self.start(who="cos")[0], 0, "1 new round started after the abandon")
+            self.assertEqual(len(self.kinds("round")), 2)
+
+        def test_abandon_and_report_run_on_the_frozen_literal_round_and_a_new_round_can_start(self):
+            got = self.frozen_round()
+            rnd = self.kinds("round")[-1]
+            self.abandon_and_report(got, rnd, expect_pair=False)
+            self.assertEqual(self.start(who="cos")[0], 0, "1 new round started after the abandon")
+
+        def test_the_control_abandon_and_report_behave_the_same_on_a_round_started_after_the_change(self):
+            got = self.start_round()
+            rnd = self.kinds("round")[-1]
+            self.abandon_and_report(got, rnd, expect_pair=True)
+            self.assertEqual(self.start(who="cos")[0], 0)
+
         # -- S11: a round without a pair
 
         def refused(self, code, err, before):
