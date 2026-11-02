@@ -675,9 +675,9 @@ def waiting_reason(engine, plan, now):
 
 def reminder_bound(config, item):
     """#1728: the bound in SECONDS of a due reminder: `checkpoint_bound_minutes` (default 5) for one a launch checkpoint set (its condition names
-    the worker) or one marked `deadline`, else `reminder_bound_minutes` (default 10)."""
+    the worker, or the overdue one to its boss), else `reminder_bound_minutes` (default 10)."""
     condition = item.get("condition") if isinstance(item.get("condition"), dict) else {}
-    checkpoint = bool(item.get("deadline")) or "while_running" in condition or "unless_report_from" in condition
+    checkpoint = "while_running" in condition or "unless_report_from" in condition
     key, default = ("checkpoint_bound_minutes", 5) if checkpoint else ("reminder_bound_minutes", 10)
     minutes = config.get(key, default)
     return (minutes if _is_number(minutes) and minutes >= 0 else default) * 60
@@ -714,7 +714,7 @@ def late_reminder_counts(state_dir, config, now):
             continue
         detail = entry.get("detail") if isinstance(entry, dict) and isinstance(entry.get("detail"), dict) else {}
         if entry.get("event") == "reminder.add" and detail.get("id") is not None:
-            added[str(detail["id"])] = (entry.get("subject"), epoch(detail.get("at")), {"deadline": bool(detail.get("deadline")), "condition": {"unless_report_from": 1} if detail.get("for") else {}})
+            added[str(detail["id"])] = (entry.get("subject"), epoch(detail.get("at")), {"condition": {"unless_report_from": 1} if detail.get("for") else {}})
         elif entry.get("event") == "v2.synthetic":
             for key in detail.get("keys") or []:
                 if isinstance(key, str) and key.startswith("reminder:"):
