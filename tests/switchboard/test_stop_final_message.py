@@ -646,7 +646,7 @@ class TestStopFinalMessageBare(unittest.TestCase):
         self.assertIn("Ran %d tests" % want, done.stdout, "the file ran no tests")
         self.assertEqual(done.returncode, 0, done.stdout[-2000:])
 
-    U21_TEXTS = (("worker-", 28000), ("worker-a.", 19600), ("worker-" + "a" * 60, 3000), ("http://", 28000))
+    U21_TEXTS = (("worker-", 28000), ("worker-a.", 21700), ("worker-" + "a" * 60, 2900), ("http://", 28000))
     U21_CHILD = (
         "import sys,os,tempfile,importlib.util,glob,shutil\n"
         "real,old,new=sys.argv[1:4]\n"
@@ -658,9 +658,10 @@ class TestStopFinalMessageBare(unittest.TestCase):
         "open(path,'w').write(src.replace(old,new))\n"
         "spec=importlib.util.spec_from_file_location('cloud_retired',path); mod=importlib.util.module_from_spec(spec); sys.modules['cloud_retired']=mod; spec.loader.exec_module(mod)\n"
         "class C: pass\n"
-        "c=C(); c.n=0; c.limit=330*196000\n"
+        "text='worker-'*28000\n"
+        "c=C(); c.n=0; c.limit=330*len(text)\n"
         "try:\n"
-        "    mod._remove_hosts('worker-'*28000, c)\n"
+        "    mod._remove_hosts(text, c)\n"
         "except mod.StepLimit:\n"
         "    print('the host scan is not linear: the counter passed', c.limit); sys.exit(1)\n"
         "print('steps', c.n)\n")
@@ -668,13 +669,14 @@ class TestStopFinalMessageBare(unittest.TestCase):
     def test_U21_the_host_scan_is_linear_and_counted_by_steps_not_by_the_clock(self):
         class Counter:
             n = 0
-            limit = 330 * 196000
+            limit = 0
         mod = sb.load_module("cloud_retired")
         for unit, times in self.U21_TEXTS:
             text = unit * times
-            self.assertEqual(len(text), 196000)
+            self.assertTrue(190000 <= len(text) <= 200000, len(text))
             c = Counter()
             c.n = 0
+            c.limit = 330 * len(text)
             try:
                 got = mod._remove_hosts(text, c)
             except mod.StepLimit:
@@ -682,8 +684,8 @@ class TestStopFinalMessageBare(unittest.TestCase):
             self.assertLessEqual(c.n, c.limit, "the host scan is not linear: %r" % unit)
             if unit == "worker-":
                 self.assertEqual(got, text)
-        # the mutant: a SCRATCH COPY (outside the repository) whose scan reads the token run to its end
-        done = subprocess.run([sys.executable, "-c", self.U21_CHILD, str(BIN / "cloud_retired.py"), "k - p < 63 and ", ""], cwd=str(CHECK_FILE.parent),
+        # the mutant: a SCRATCH COPY (outside the repository) whose scan moves on by one character instead of jumping to the end of its run
+        done = subprocess.run([sys.executable, "-c", self.U21_CHILD, str(BIN / "cloud_retired.py"), "i = max(j + 1, k)", "i = j + 1"], cwd=str(CHECK_FILE.parent),
                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True, timeout=600)
         self.assertEqual(done.returncode, 1, "mutant of U21: %s" % done.stdout)
         self.assertIn("the host scan is not linear", done.stdout)
