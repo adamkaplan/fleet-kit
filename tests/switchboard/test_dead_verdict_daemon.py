@@ -67,8 +67,9 @@ DEAD_CASES = {
     "pane_get not found, still listed, process runs": dict(list="listed", process="runs", get="notfound", missing=False),
     "pane_get fails, not not-found": dict(list="listed", process="runs", get="error", missing=False),
     "row with no pane": dict(list="absent", process="unread", get="notfound", missing=False, nopane=True),
+    "listed, no recorded session": dict(list="listed", process="shell", get="ok", missing=True, nosession=True),   # PC-3 (iv): no session, no process to judge
 }
-CHANGED = ("list cannot be read", "listed, process unread", "pane_get not found, still listed, process runs")
+CHANGED = ("list cannot be read", "listed, process unread", "pane_get not found, still listed, process runs", "listed, no recorded session")
 
 
 def old_pane_state(c):
@@ -101,7 +102,7 @@ class Rig:
         self.pane, self.session = self.world.panes[NAME], self.world.sessions[NAME]
         self.registry = sb.load_module("registry")
         self.reconcile = sb.load_module("agent_reconcile")
-        self.row = {"pane": self.pane, "session": self.session}
+        self.row = {"pane": self.pane, "session": None if case.get("nosession") else self.session}
 
     def pass_once(self, offset=0):
         self.engine.discover(self.world.clock.now())
@@ -109,6 +110,8 @@ class Rig:
 
     def arrange(self, for_pane_state=False):
         c, herdr = self.case, self.herdr
+        if c.get("nosession"):   # the registry row never got a session id; the agent is no longer discovered
+            self.registry.upsert(self.world.state, NAME, {"pane": self.pane, "session": None, "role": None, "workspace": None, "cwd": None})
         if c.get("nopane"):
             self.row = {"pane": None, "session": self.session, "endpoint": "http://acme.invalid/x"}
             return
@@ -174,22 +177,23 @@ class TestDaemonDeadVerdict(Base):
                            "new daemon": "dead" if rig.new_daemon_dead() else "not dead", "shows_dead": "dead" if rig.shows_dead() else "not dead"}
         return rows
 
-    def test_S2_the_table_has_7_cases_by_4_deciders_and_prints_28_answers(self):
+    def test_S2_the_table_has_8_cases_by_4_deciders_and_prints_32_answers(self):
         rows = self.table()
-        self.assertEqual((len(rows), sum(len(r) for r in rows.values())), (7, 28))
+        self.assertEqual((len(rows), sum(len(r) for r in rows.values())), (8, 32))
         for label, row in rows.items():
             self.assertEqual(row["new daemon"], row["shows_dead"], label)   # one function: the daemon and the registry agree on every case
         self.assertEqual({k: v["new daemon"] for k, v in rows.items()},
                          {"pane gone": "dead", "listed bare shell": "dead", "listed, process unread": "not dead", "list cannot be read": "not dead",
-                          "pane_get not found, still listed, process runs": "not dead", "pane_get fails, not not-found": "not dead", "row with no pane": "not dead"})
+                          "pane_get not found, still listed, process runs": "not dead", "pane_get fails, not not-found": "not dead", "row with no pane": "not dead",
+                          "listed, no recorded session": "not dead"})
 
-    def test_S9_exactly_the_three_cases_of_the_plan_differ(self):
+    def test_S9_exactly_the_four_cases_of_the_plan_differ(self):
         rows = self.table()
         differing = sorted(k for k, r in rows.items() if ("dead" in (r["old pane_state"], r["old loop"])) != (r["new daemon"] == "dead"))
         self.assertEqual(differing, sorted(CHANGED))
-        self.assertEqual(len(differing), 3)
+        self.assertEqual(len(differing), 4)
         doc = (BIN.parent / "docs" / "agent-registry.md").read_text().split("## One dead verdict", 1)[1].split("\n## ", 1)[0]
-        for phrase in ("cannot be read", "process that cannot be read", "pane_get"):
+        for phrase in ("cannot be read", "process that cannot be read", "pane_get", "no recorded session", "Changed cases (four)"):
             self.assertIn(phrase, doc)
 
     # -- S3: one function
