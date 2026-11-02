@@ -269,7 +269,7 @@ def build(HandoffCase):
             help_text = self.plain_help()
             skill = (ROOT / "skills/fleet-planning/SKILL.md").read_text()
             template = (ROOT / "docs/plan-template.md").read_text()
-            return {"skill": skill, "template": template, "help": help_text}, sb.STANDARD_FORM
+            return {"template": template, "help": help_text}, sb.STANDARD_FORM, skill
 
         def plain_help(self):
             with captured() as (out, err):
@@ -282,18 +282,20 @@ def build(HandoffCase):
         def missing(self, places, form):
             return {name: [l for l in form if l not in text.splitlines()] for name, text in places.items()}
 
-        def test_s7_three_places_carry_the_six_lines_word_for_word(self):
-            places, form = self.places()
+        def test_s7_two_places_carry_the_six_lines_word_for_word_and_the_skill_points_at_them(self):
+            places, form, skill = self.places()
             found = [n for n, t in places.items() if self.HEADING in t]
-            self.assertEqual(sorted(found), ["help", "skill", "template"])
+            self.assertEqual(sorted(found), ["help", "template"])
             self.assertEqual(len(form), 6)
-            self.assertEqual(self.missing(places, form), {"skill": [], "template": [], "help": []})
+            self.assertEqual(self.missing(places, form), {"template": [], "help": []})
+            self.assertEqual(skill.count("Apply an approved plan edit with `fleet-switchboard plan apply` (the form: plan-template)."), 1)
+            self.assertTrue(skill.rstrip().endswith("(the form: plan-template)."))
 
         def test_s7_a_planted_place_with_one_changed_word_fails_with_the_line_named(self):
-            places, form = self.places()
+            places, form, skill = self.places()
             places["help"] = places["help"].replace("read by nobody", "read by somebody")
             missing = self.missing(places, form)
-            self.assertEqual(missing["skill"], [])
+            self.assertEqual(missing["template"], [])
             self.assertEqual(missing["help"], [form[0]])
 
         def test_u2_no_second_hash_or_plan_selection_and_plan_check_output_is_the_one_renderer(self):
