@@ -54,11 +54,54 @@ def scope_imports(scope):
     return found
 
 
+def branch_paths(scope):
+    """For each statement of one scope (by id), the list of (control statement, branch) it sits in."""
+    paths = {}
+
+    def walk(node, path):
+        for field, value in ast.iter_fields(node):
+            items = value if isinstance(value, list) else [value]
+            for i, child in enumerate(items):
+                if not isinstance(child, ast.AST) or isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+                    continue
+                inner = path
+                if isinstance(node, ast.If) and field in ("body", "orelse"):
+                    inner = path + [(id(node), field)]
+                elif isinstance(node, ast.Try) and field == "body":
+                    inner = path + [(id(node), "body")]
+                elif isinstance(node, ast.Try) and field == "handlers":
+                    inner = path + [(id(node), "handler%d" % i)]
+                elif isinstance(node, ast.Try) and field in ("orelse", "finalbody"):
+                    inner = path + [(id(node), "try-" + field)]
+                paths[id(child)] = inner
+                walk(child, inner)
+
+    walk(scope, [])
+    return paths
+
+
+def exclusive(path_a, path_b):
+    """True when the two paths sit in mutually exclusive branches of one if or try."""
+    branches = dict(path_a)
+    for node, branch in path_b:
+        other = branches.get(node)
+        if other is not None and other != branch:
+            return _exclusive_pair(other, branch)
+    return False
+
+
+def _exclusive_pair(one, two):
+    if one.startswith("handler") or two.startswith("handler"):
+        return all(b == "body" or b.startswith("handler") for b in (one, two))
+    return {one, two} == {"body", "orelse"}
+
+
 def duplicate_bindings(fname, tree):
     """A name bound by more than one import statement of one scope: reported once, with the first binding."""
     failures = []
     scopes = [tree] + [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))]
     for scope in scopes:
+        paths = branch_paths(scope)
         bound = {}
         for stmt in scope_imports(scope):
             for alias in stmt.names:
@@ -66,6 +109,8 @@ def duplicate_bindings(fname, tree):
                 bound.setdefault(name, []).append(stmt)
         for name, stmts in bound.items():
             if len(stmts) < 2:
+                continue
+            if not any(not exclusive(paths[id(a)], paths[id(b)]) for i, a in enumerate(stmts) for b in stmts[i + 1:]):
                 continue
             texts = [ast.unparse(s) for s in stmts]
             submodules = (all(isinstance(s, ast.Import) and not any(a.asname for a in s.names) for s in stmts)
@@ -121,21 +166,41 @@ class TestNestedImports(unittest.TestCase):
         self.assertEqual(check_text("fake.py", used), [])
 
 
+RULE = "the duplicate-binding rule reported %d failure(s), expected %d: %s"
+
+
 class TestDuplicateBindings(unittest.TestCase):
     def test_a_name_bound_twice_is_reported_once(self):
         failures = check_text("fake.py", "from a import x\nfrom b import x\nprint(x)\n")
-        self.assertEqual(len(failures), 1, failures)
+        self.assertEqual(len(failures), 1, RULE % (len(failures), 1, failures))
         self.assertIn("fake.py", failures[0])
         self.assertIn("x", failures[0])
         self.assertIn("from a import x", failures[0])
 
     def test_the_same_import_twice_is_a_duplicate(self):
         failures = check_text("fake.py", "from a import x\nfrom a import x\nprint(x)\n")
-        self.assertEqual(len(failures), 1, failures)
+        self.assertEqual(len(failures), 1, RULE % (len(failures), 1, failures))
 
     def test_submodules_of_one_package_are_one_binding(self):
         text = "import importlib.machinery\nimport importlib.util\nprint(importlib.machinery, importlib.util)\n"
         self.assertEqual(check_text("fake.py", text), [])
+
+    def test_a_try_except_importerror_fallback_is_one_binding(self):
+        failures = check_text("fake.py", "try:\n    import a\nexcept ImportError:\n    import b as a\nprint(a)\n")
+        self.assertEqual(len(failures), 0, RULE % (len(failures), 0, failures))
+
+    def test_an_if_else_pair_is_one_binding(self):
+        failures = check_text("fake.py", "if c:\n    from a import x\nelse:\n    from b import x\nprint(x)\n")
+        self.assertEqual(len(failures), 0, RULE % (len(failures), 0, failures))
+
+    def test_two_imports_in_one_branch_are_a_duplicate(self):
+        failures = check_text("fake.py", "if c:\n    from a import x\n    from b import x\nprint(x)\n")
+        self.assertEqual(len(failures), 1, RULE % (len(failures), 1, failures))
+        self.assertIn("fake.py", failures[0])
+        self.assertIn("x", failures[0])
+        self.assertIn("from a import x", failures[0])
+        failures = check_text("fake.py", "try:\n    import a\n    import a\nexcept ImportError:\n    pass\nprint(a)\n")
+        self.assertEqual(len(failures), 1, RULE % (len(failures), 1, failures))
 
 
 class TestMutant(unittest.TestCase):
