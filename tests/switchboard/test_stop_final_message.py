@@ -519,7 +519,7 @@ class TestStopFinalMessageEdges(unittest.TestCase):
         w = StopWorld(self)
         deep = ENDPOINT
         for _ in range(25):
-            deep = "ht" + deep + "tps://worker-q.example.internal:1"
+            deep = "https://wor" + deep + "ker-q.example.internal:1"
         w.stop("cb-1788a", "idle", w.pod("cb-1788a", "start " + deep + " " + "words " * 700))
         w.scan()
         got = w.to("boss-lane")
