@@ -410,6 +410,8 @@ A reviewer or tester records the verdict as the last step of the review or test 
 
 A tester records verdicts only and never runs `prove`: a proof makes it an author of the PR, and its verdicts are then refused.
 
+In a cloud pod a tester records a proof or a verdict with `cw-cloud relay prove|verdict`, not with `prove` or `verdict` of a clone; `prove` and `verdict` of a clone refuse in a pod with one line naming that command.
+
 A `[switchboard] standing orders` note is the owner's standing instruction for the
 charter (kept in the charter issue's `## Standing orders` section, one bullet per
 order): act on it without asking again, within its words. It covers nothing it
