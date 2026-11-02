@@ -615,7 +615,7 @@ for it in issues:
                 kv[k.strip()]=v.strip()
         if kv.get("status","").lower()!="active": continue
         pane=kv.get("pane","")
-        if not (re.match(r"^w[0-9A-Za-z]+:p[0-9A-Za-z]+$", pane) or re.match(r"^cloud:[A-Za-z0-9][A-Za-z0-9._-]{0,63}$", pane)): continue
+        if not (re.match(r"^w[0-9A-Za-z]+:p[0-9A-Za-z]+$", pane) or re.match(r"^cloud:[A-Za-z0-9][A-Za-z0-9._-]{0,63}$", pane) or re.match(r"^host:[A-Za-z0-9][A-Za-z0-9._-]{0,63}/[A-Za-z0-9][A-Za-z0-9._-]{0,63}$", pane)): continue
         print("%s\t%s" % (it.get("number"), pane))
     except Exception:
         continue' "$TMPDIR_FD/charters.json" >"$TMPDIR_FD/active.txt" 2>/dev/null
