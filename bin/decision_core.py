@@ -953,6 +953,29 @@ def outward_rows(entry):
     return out
 
 
+def parse_about(body):
+    """The author's `## About` section of an issue body: the text up to the next heading (or the end), whitespace
+    folded; the first section when there are two; None when there is none or it is empty."""
+    if not isinstance(body, str):
+        return None
+    found = re.search(r"(?mi)^#{1,6}[ \t]+about[ \t]*#*[ \t]*$", body)
+    if found is None:
+        return None
+    rest = body[found.end():]
+    following = re.search(r"(?m)^#{1,6}[ \t]", rest)
+    text = " ".join((rest[:following.start()] if following else rest).split())
+    return text or None
+
+
+def parse_about_paragraph(text):
+    """The `About:` paragraph of a report's text: from `About:` (at the start or after a space: a sent report is one folded line)
+    to the next blank line or the end, whitespace folded; None when there is none or it is empty."""
+    if not isinstance(text, str):
+        return None
+    found = re.search(r"(?i)(?:^|\s)about:(.*?)(?:\n[ \t]*\n|\Z)", text, re.S)
+    return " ".join(found.group(1).split()) or None if found else None
+
+
 def outward_payload(entry, floor):
     """What is said about a decision outside, from the list entry: text with anything shaped like a credential taken
     out, and the floor tier the mapping assigns its tier. `rows` (a batch) go as options by id."""
