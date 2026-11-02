@@ -2445,7 +2445,7 @@ rather than by an agent's memory. The daemon runs a deterministic sweep (no mode
 findings are audited (`sweep.finding`) and counted in `status`, nobody is woken and nothing is withdrawn. `"enabled": true`
 is the only way to wake the Chief of Staff and withdraw stale decisions. `"sweep": false` turns it fully off (no reads, no
 writes). The audit line's `woken` is true only for a finding the pass's wake carried and remembered: in the sweep, every due finding (named, or counted in the fact's "+N more"); in triage, the findings the digest named (an overflow beyond `max_findings` is not carried and stays due) and the other-owner flags that rode along in its text (alone they never wake). A finding whose wake goes later the same day is logged once more, and a restart does not log again a finding raised inside the re-alarm window (#849). Keys: `enabled` (false), `aged_cos_hours` (2), `comment_window_days` (7), `max_findings` (20, the most one
-fact lists), `realarm_hours` (6, the debounce per item), `person_names` (["the owner"], the names the phrases look for), `calls_per_pass` (12, the most `gh` calls one pass makes, 4 to 100).
+fact lists), `realarm_hours` (6, the debounce per item), `person_names` (["the owner"], the names the phrases look for), `calls_per_pass` (16, the most `gh` calls one pass makes, 4 to 100).
 
 | Kind | Finding |
 |---|---|
@@ -2502,8 +2502,10 @@ S1, S2, S3 and S5 become ONE batched fact for the Chief of Staff, `sweep: N find
 refs and kinds (no text from GitHub reaches it), re-raised for an item at most once per `realarm_hours`; its key names the set
 and the time slot, so a restart is one delivery. The sweep never edits GitHub and never changes a tier: the Chief of Staff
 resolves or escalates. Text in code blocks, inline code and quoted lines is ignored, and a negation just before the phrase (`not`, `no longer`, `never`, ...) cancels it.
-S1 also flags charters and other issues that carry the awaiting label, by design. Reads are bounded: per repo one open issues and PRs list and one recent comments list (at most 2 pages each, a longer one is shown as capped), kept 15 minutes. The sweep makes at most 6 `gh` calls per pass (a list costs its pages, a single-issue read for S4 costs one), 2 of them reserved for the S4 reads; stale repos and unchecked decisions are taken least recently read first, so across passes every one is reached and none starves. A batch issue (row sections, or the older `decision-rows` block) counts as having its decision section, so S1b does not fire for it. `status` shows `sweep` with the
+S1 also flags charters and other issues that carry the awaiting label, by design. Reads are bounded: per repo one open issues and PRs list and one recent comments list (the open list at most OPEN_LIST_PAGES = 10 pages, 1,000 items, beyond it one named alert a day; the comments list at most 2 pages, a longer one is shown as capped), kept 15 minutes. The sweep makes at most 6 `gh` calls per pass (a list costs its pages, a single-issue read for S4 costs one), 2 of them reserved for the S4 reads; stale repos and unchecked decisions are taken least recently read first, so across passes every one is reached and none starves. A batch issue (row sections, or the older `decision-rows` block) counts as having its decision section, so S1b does not fire for it. `status` shows `sweep` with the
 counts by kind and `fleet-doctor` warns when there are findings.
+
+The open-item ceiling (#1886): every read of open items (the sweep, the triage, the CI recorder, the charters and the open asks) follows pages of 100 up to one constant, `OPEN_LIST_PAGES` = 10, so 1,000 items. A repository with more open items than that is still cut at the ceiling, but never silently: once a day the daemon sends the Chief of Staff one alert naming the repository, "1,000 or more" open items and the ceiling, and writes one audit line (`open_list.cut`); the day marker is kept in `open-list-alert.json`. The cost is the pages read: a repository of 456 open items costs 5 requests per read instead of 2, in the sweep and in the triage, each read every 15 minutes, so 16 requests an hour for that repository become 40 (24 more); a repository under 200 items costs the same 2 as before.
 
 ### The triage function (#130, rule family T)
 
@@ -2610,7 +2612,7 @@ Precision rules (from the owners' hand-checks; the sweep and the triage still on
 - **T10** (closed but still labelled awaiting) waits 10 minutes after the close (`TRIAGE_T10_GRACE`): the label comes off minutes later.
 - **S3** (said to wait on the person) ignores a sentence that names a future gate before the phrase (`when`, `once`, `before`, `after`, `later`, `deferred`, `parked`, `not started`) or `deferred`, `parked`, `not started`, `when picked up` after it.
 112 calls an hour (at most 168), plus one or two fresh calls per live finding per 15 minutes (a few dozen an hour at typical
-counts), far under the hourly API limit. The sweep has its own budget, `sweep.calls_per_pass` (default 12, 4 to 100); the two
+counts), far under the hourly API limit. The sweep has its own budget, `sweep.calls_per_pass` (default 16, 4 to 100); the two
 count separately and share the hub's cache but not each other's calls, so neither starves the other, and together on a cold cache
 they use at most the sum.
 
