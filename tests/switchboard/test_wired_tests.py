@@ -1,6 +1,6 @@
 """Every tests/switchboard/test_*.py is wired into bin/test-switchboard (#1618).
 
-A file is wired when bin/test-switchboard (1) imports its module and (2) binds EVERY one of its TestCase classes at module level. (except a base class, whose tests run through its subclass, and a class listed in EXEMPT_FILES as file.py::ClassName with a reason)
+A file is wired when bin/test-switchboard (1) imports its module and (2) binds EVERY one of its TestCase classes at module level (except a base class, whose tests run through a bound subclass, and a class listed in EXEMPT_FILES as file.py::ClassName with a reason).
 A module imported with no class bound runs nothing: the same harm as no import. The files come from the directory, never from a list.
 A file that must stay unwired is a row of EXEMPT_FILES (the only exemption list) with a reason of at least 20 characters.
 Run with `python3 bin/test-switchboard TestEveryTestFileIsWired TestWiredCheckPlanted`. Standard library only.
