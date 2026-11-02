@@ -2,6 +2,7 @@
 import os
 import shutil
 import tempfile
+import unittest
 from pathlib import Path
 from unittest import mock
 from support.core import Base
@@ -103,6 +104,22 @@ class TestPodRefusal(Runs):
             self.assertEqual(str(raised.exception), "a pod command reached the configuration")
 
 
+    def test_s2_each_command_has_its_own_control_then_its_mutant(self):
+        controls = mutants = 0
+        for name, argv in COMMANDS:
+            code, out, err, calls, writes = self.check_refusal(self.copy_without(), name, argv, None)   # its own control, first
+            lines = (out + err).strip().splitlines()
+            self.assertEqual((code, len(lines)), (2, 1))
+            self.assertIn("`cw-cloud relay %s`" % name, lines[0])
+            controls += 1
+            with self.assertRaises(AssertionError) as raised:
+                self.check_refusal(self.copy_without(name), name, argv, None)
+            self.assertEqual(str(raised.exception), "a pod command reached the configuration")
+            mutants += 1
+        print("S2 control %d of %d, mutants %d of %d with the text" % (controls, len(COMMANDS), mutants, len(COMMANDS)))
+        self.assertEqual((controls, mutants), (2, 2))
+
+
 class TestOutsideAPod(Runs):
     def test_s3_without_the_marker_the_tip_prints_what_it_printed(self):
         for name, argv in COMMANDS:
@@ -114,6 +131,34 @@ class TestOutsideAPod(Runs):
                 self.assertEqual(mine[:3], theirs[:3])
                 self.assertIn("'opencode' is not configured", mine[1] + mine[2])
                 self.assertNotIn("cw-cloud relay", mine[1] + mine[2])
+
+    def test_s3_the_empty_marker_behaves_as_unset(self):
+        cases = 0
+        for name, argv in COMMANDS:
+            for config in (None, {}):
+                unset = self.run_cmd(sb, argv, False, config)
+                with mock.patch.dict(os.environ, {"CW_WORKER": ""}):
+                    empty = self.run_cmd_keeping_env(argv, config)
+                self.assertEqual(empty[:3], unset[:3])
+                self.assertIn("'opencode' is not configured", empty[1] + empty[2])
+                cases += 1
+        print("S3 empty marker: %d of 4 cases the same as unset" % cases)
+        self.assertEqual(cases, 4)
+
+    def run_cmd_keeping_env(self, argv, config):
+        """run_cmd's run with the environment as the caller set it (the marker present and empty)."""
+        calls = []
+        if config is None:
+            self.config_file.unlink() if self.config_file.exists() else None
+        else:
+            self.write_config(config)
+        with captured() as (out, err):
+            try:
+                code = sb.main(list(argv), runner=lambda *a, **k: calls.append(a), now=lambda: 1000.0, wait=lambda s, t: False)
+            except SystemExit as stop:
+                code = stop.code
+        self.assertEqual(os.environ.get("CW_WORKER"), "")
+        return code, out.getvalue(), err.getvalue(), len(calls)
 
 
 class TestPodDocuments(Base):
@@ -133,3 +178,6 @@ class TestPodDocuments(Base):
                 missing_pod_command(mutant)
             self.assertEqual(str(raised.exception), "the document does not name the pod command")
         print("S4 mutant: fails with the anchored text")
+
+if __name__ == "__main__":
+    unittest.main()
