@@ -444,7 +444,7 @@ def build():
             obj = ["- id: O1; severity: blocking; state: open; text: a stub passes"]
             for number in (8, 9, 10, 11):
                 rnd = [e for e in self.ledger() if e["kind"] == "round" and e["review"] == review][-1]
-                new, old = rnd["plan_hashes"]
+                new, old = rnd["plan_hashes"][0], rnd["plan_hashes"][-1]
                 for i, lane in enumerate(rnd["lanes"]):
                     if lane == obj_lane:
                         self.assertEqual(self.verdict_current(review, lane, "iterate", obj)[0], 0)
@@ -466,7 +466,7 @@ def build():
 
         def test_decide_through_the_entry_on_a_round_with_verdicts_at_both_forms_reaches_the_consensus_once_at_the_new_hash(self):
             review, rnd = self.escalated_signed()
-            new, old = rnd["plan_hashes"]
+            new, old = rnd["plan_hashes"][0], rnd["plan_hashes"][-1]
             code, out, err = self.override(review)
             self.assertEqual(code, 0, err)
             (consensus,) = self.consensus_entries(review)
@@ -481,14 +481,14 @@ def build():
 
         def test_decide_counts_a_consensus_at_the_old_hash_as_reached_and_writes_no_second(self):
             review, rnd = self.escalated_signed()
-            new, old = rnd["plan_hashes"]
+            new, old = rnd["plan_hashes"][0], rnd["plan_hashes"][-1]
             self.inject({"kind": "consensus", "result": "pass", "pr": "-", "scenario": "-", "lineage": rnd["lineage"], "review": review, "plan_hash": old, "by": "plan-review"})
             self.assertEqual(self.override(review)[0], 0)
             self.assertEqual(len(self.consensus_entries(review)), 1, "decide counts the old-hash consensus as the round's")
 
         def test_a_mutant_that_compares_the_raw_strings_in_decide_writes_a_second_consensus(self):
             review, rnd = self.escalated_signed()
-            new, old = rnd["plan_hashes"]
+            new, old = rnd["plan_hashes"][0], rnd["plan_hashes"][-1]
             self.inject({"kind": "consensus", "result": "pass", "pr": "-", "scenario": "-", "lineage": rnd["lineage"], "review": review, "plan_hash": old, "by": "plan-review"})
             with tempfile.TemporaryDirectory() as tmp:
                 msb = _entry_copy(tmp, "switchboard/plan_review.py", "        entries, rnd = _canon_round(entries, rnd)   # #1713: both sides in the round's own form\n", "")
@@ -502,7 +502,7 @@ def build():
         def test_the_tick_and_the_lane_send_check_read_a_round_with_verdicts_at_both_forms_as_open(self):
             got = self.start_round()
             rnd = self.kinds("round")[-1]
-            new, old = rnd["plan_hashes"]
+            new, old = rnd["plan_hashes"][0], rnd["plan_hashes"][-1]
             lanes = rnd["lanes"]
             self.inject(self.lane_entry(got["review"], rnd, lanes[0], old))
             self.inject(self.lane_entry(got["review"], rnd, lanes[1], new))
@@ -652,7 +652,7 @@ def build_late():
             pc = real("plan_check")
             text = host.LEDGER_PLAN + "\n" + MARKER
             self.pair = pc.plan_hashes(text)
-            self.new, self.old = self.pair
+            self.new, self.old = self.pair[0], self.pair[-1]
             self.edited = pc.plan_hash(text.replace("Commissioning works.", "Commissioning works, edited."))
             self.hash = self.new
 
