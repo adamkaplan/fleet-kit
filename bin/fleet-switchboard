@@ -10028,7 +10028,7 @@ def sweep_read_repo(hub, repo, now, window_days, regex, budget, strong):
 
 def sweep_refresh(engine, state, repos, now, cfg, regex, budget):
     """Read stale repos, the least recently read first, while the pass's call budget (less the reserve for the
-    single-issue reads) allows a whole repo (its two lists, up to SWEEP_LIST_PAGES pages each). Oldest first means
+    single-issue reads) allows a whole repo (its open list up to OPEN_LIST_PAGES pages, its closed list one, its comments up to SWEEP_LIST_PAGES). Oldest first means
     every repo is reached in turn: none starves. A failed read keeps the old picture and is retried after SWEEP_TTL."""
     hub = getattr(engine, "hub", None)
     if hub is None:
