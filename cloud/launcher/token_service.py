@@ -124,11 +124,15 @@ def handle(headers, body_length, read_body, review, env=None, mint_fn=None):
     return 200, ans, "served"
 
 
-def make_server(review, port=8080, host="0.0.0.0", log=None, env=None, mint_fn=None):
+def make_server(review, port=8080, host="0.0.0.0", log=None, env=None, mint_fn=None, timeout=30):
     """A threading server (daemon threads). `log(line)` receives 'METHOD STATUS reason' and nothing else (default: stderr)."""
     emit = log or (lambda line: print(line, file=sys.stderr, flush=True))
 
     class Handler(http.server.BaseHTTPRequestHandler):
+        def setup(self):
+            super().setup()
+            self.connection.settimeout(timeout)   # a request that promises more than it sends is dropped
+
         def log_message(self, *a):
             pass
 
@@ -160,6 +164,9 @@ def make_server(review, port=8080, host="0.0.0.0", log=None, env=None, mint_fn=N
 
     class Server(http.server.ThreadingHTTPServer):
         daemon_threads = True
+
+        def handle_error(self, request, client_address):
+            pass   # silences the standard library's report of an aborted connection: the service's own log line is the only one
 
     return Server((host, port), Handler)
 

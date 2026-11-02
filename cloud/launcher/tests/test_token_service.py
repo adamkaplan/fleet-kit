@@ -1,7 +1,10 @@
 """Ask #2002, scenarios S2 and S8: the token service's handler with a fake GitHub (loopback) and a fake review. No cluster, no network."""
+import contextlib
 import http.client
+import io
 import json
 import os
+import socket
 import subprocess
 import sys
 import tempfile
@@ -191,6 +194,119 @@ class Served(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, "the mutation was not applied"):
             apply_mutation(original, CHECK_BLOCK, CHECK_BLOCK)
         print("S2 mutant: control 1 of 1, the copy fails 1 of 1, the no-op mutation fails 1 of 1")
+
+
+class Mutants(unittest.TestCase):
+    """Ask #2002, scenarios S10 and S11 (e): the handler called directly (no socket), a scratch copy for each of six mutations."""
+    ENV = {"CW_ALLOWED_REPOS": ALLOWED, "CW_CLOUD_NAMESPACE": "cw"}
+    GOOD = {"repo": "acme-org/widget-service", "role": "worker"}
+
+    @staticmethod
+    def call(ns, body=None, header="Bearer " + OPERATOR, review=fake_review, length=None, raw=None):
+        raw = raw if raw is not None else json.dumps(body if body is not None else Mutants.GOOD).encode()
+        headers = {"X-Caller-Token": header} if header is not None else {}
+        return ns["handle"](headers, len(raw) if length is None else length, lambda n: raw[:n].ljust(n, b" "), review, dict(Mutants.ENV),
+                            lambda repo, role: {"token": "synthetic-not-a-token"})[0]
+
+    def test_s10_six_mutants_each_caught_by_its_own_text(self):
+        with open(SERVICE) as f:
+            original = f.read()
+
+        def check_authenticated(ns):
+            if self.call(ns, review=lambda t: ("true", OPERATOR_USER)) == 200:
+                raise AssertionError("a review that answered the string true was accepted:")
+
+        def check_scheme(ns):
+            if self.call(ns, header="bearer " + OPERATOR) == 200:
+                raise AssertionError("a header with the word bearer was accepted:")
+
+        def check_role(ns):
+            if self.call(ns, {"repo": self.GOOD["repo"], "role": "Worker"}) == 200:
+                raise AssertionError("a role of another case was accepted:")
+
+        def check_limit(ns):
+            if self.call(ns, raw=b"{}", length=token_service.MAX_BODY + 1) != 413:
+                raise AssertionError("a body one byte over the limit was read:")
+
+        def check_account(ns):
+            if self.call(ns, header="Bearer " + OTHER) == 200:
+                raise AssertionError("a request of another account was served:")
+
+        def check_allowed(ns):
+            if self.call(ns, {"repo": "evil-org/other", "role": "worker"}) == 200:
+                raise AssertionError("a repository not on the allowed list was served:")
+
+        cases = [
+            ("    if authenticated is not True:\n", "    if not authenticated:\n", check_authenticated),
+            ('    if scheme != "Bearer" or not token:\n', "    if not token:\n", check_scheme),
+            ("    if not isinstance(role, str) or role not in app_token.PERMISSIONS_BY_ROLE:\n", "    if not isinstance(role, str):\n", check_role),
+            ("    if body_length > MAX_BODY:\n", "    if False:\n", check_limit),
+            ('    if user != "system:serviceaccount:%s:cw-operator" % (env.get("CW_CLOUD_NAMESPACE") or "cw"):\n', "    if False:\n", check_account),
+            ("        cloud_worker.check_repo_allowed(repo, env)\n", "        pass\n", check_allowed),
+        ]
+        texts = set()
+        for old, new, check in cases:
+            check(load(original))   # the control, run first
+            try:
+                check(load(apply_mutation(original, old, new)))
+            except AssertionError as e:
+                texts.add(str(e))
+            else:
+                self.fail("the mutant survived: " + old.strip())
+            with self.assertRaisesRegex(AssertionError, "the mutation was not applied"):
+                apply_mutation(original, old, old)
+        self.assertEqual(len(texts), 6)
+        print("S10: %d of 6 mutants fail with %d different anchored texts, 6 controls pass, the no-op fails the computation" % (len(texts), len(texts)))
+
+    def test_s11_e_a_stalled_request_is_dropped_and_nothing_is_reported(self):
+        with open(SERVICE) as f:
+            original = f.read()
+
+        def serve(ns):
+            srv = ns["make_server"](fake_review, port=0, host="127.0.0.1", log=lambda line: None, timeout=1)
+            t = threading.Thread(target=srv.serve_forever, daemon=True)
+            t.start()
+            return srv, t
+
+        def stop(srv, t):
+            srv.shutdown()
+            srv.server_close()
+            t.join(5)
+
+        def check_timeout_is_set(ns):
+            seen = []
+            srv, t = serve(ns)
+            try:
+                cls = srv.RequestHandlerClass
+                cls.handle = lambda self: seen.append(self.connection.gettimeout())
+                with socket.create_connection(("127.0.0.1", srv.server_port), timeout=20) as c:
+                    c.recv(1)   # the server closes after recording
+            finally:
+                stop(srv, t)
+            if seen != [1]:
+                raise AssertionError("a connection has no timeout: %r" % seen)
+
+        check_timeout_is_set(load(original))   # the control, run first
+        old = "            self.connection.settimeout(timeout)   # a request that promises more than it sends is dropped\n"
+        with self.assertRaisesRegex(AssertionError, "a connection has no timeout:"):
+            check_timeout_is_set(load(apply_mutation(original, old, "            pass\n")))
+        with self.assertRaisesRegex(AssertionError, "the mutation was not applied"):
+            apply_mutation(original, old, old)
+        # a request that promises 100 bytes and sends 5 is dropped (EOF, no answer) and the service stays usable; nothing reaches stderr
+        err = io.StringIO()
+        srv, t = serve(vars(token_service))
+        try:
+            with contextlib.redirect_stderr(err):
+                with socket.create_connection(("127.0.0.1", srv.server_port), timeout=30) as c:
+                    c.sendall(b"POST /mint HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\nX-Caller-Token: Bearer " + OPERATOR.encode() + b"\r\n\r\nabcde")
+                    self.assertEqual(c.recv(100), b"")
+                with socket.create_connection(("127.0.0.1", srv.server_port), timeout=30) as c:
+                    c.sendall(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+                    self.assertTrue(c.recv(100).startswith(b"HTTP/1.0 405"))
+        finally:
+            stop(srv, t)
+        self.assertEqual(err.getvalue(), "")
+        print("S11 (e): the stalled request is dropped 1 of 1, the service answers after it, 0 bytes on stderr, the copy without a timeout fails 1 of 1")
 
 
 if __name__ == "__main__":
