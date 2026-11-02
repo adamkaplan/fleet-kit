@@ -279,7 +279,8 @@ def added_paths(root, base, runner=subprocess.run):
 def guard_rows(added):
     """The rows (suite, classes, command, why) of the four guards, when `added` holds a new file under bin/; [] otherwise. Same shape as the rows of `plan`."""
     new = [p for p in added or [] if p.startswith("bin/")]
-    if not new:
+    shims = [p for p in added or [] if p.startswith("shims/")]
+    if not new and not shims:
         return []
     return [(g[1], [g[2]] if g[2] else [], guard_command(g), new) for g in NEW_BIN_GUARDS]
 
