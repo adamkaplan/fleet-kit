@@ -361,7 +361,15 @@ def last_message(directory, state, pod, clock=None):
         if text is None:
             return None, why.replace("the transcript of the run record holds no text from the worker", "no text from the worker") \
                 if why else "no text from the worker"
-        text = _ENDPOINT_RE.sub("", text)[:LAST_SCRUB_MAX]
+        text = text[:LAST_SCRUB_MAX]
+        for _ in range(21):   # PC-10 (a): repeat until the text stops changing (20 passes at most), so a rebuilt address is removed too
+            stripped = _ENDPOINT_RE.sub("", text)
+            changed = stripped != text
+            text = stripped
+            if not changed:
+                break
+        else:
+            return None, "endpoint loop"
         text = D["_scrub_lib"]()(text, (), LAST_SCRUB_MAX)
         head, rest = text[:LAST_HEAD], text[LAST_HEAD:]
         lines = ["[last message of %s, untrusted text]" % pod, head]
