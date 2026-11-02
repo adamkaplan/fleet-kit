@@ -129,7 +129,6 @@ changes it, as editing a scenario does; the scenario hash only says the scenario
 tab in the indentation, too large, GitHub unreadable). It only reads (GET); it never writes GitHub. `--ask` or
 `--done-when` supply the Done-when when the plan issue has none of its own.
 
-
 #### The plan hash and the trailing marker (#1713)
 
 The plan hash covers the whole plan text with whitespace collapsed and **one trailing marker line removed**: the last non-blank line, only when it is exactly `<!-- fleet-switchboard:from=<name> -->` (the line `gh issue comment` adds). A marker line anywhere else is plan text and counts, and any other edit of the text changes the hash, so a plan posted plainly and the same words edited in place have one hash. A binding made at the old hash of a marker-bearing comment (an approval, a proof, a verdict, a consensus, an ask record, a review round) stays valid: `plan check` prints the new hash, the old formula's value is read as the same plan (`plan_check.plan_hashes`), and the ledger is never rewritten. A binding of an older revision of the text stays stale. After a rollback of this change, a binding made at the new hash reads as stale until the plan is edited.
