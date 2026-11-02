@@ -36,7 +36,7 @@ class S(unittest.TestCase):
         self.assertEqual(len(k), total)
         k.sweep(3659, {"p1"}); self.assertTrue(forms["tok"] <= set(k))
         k.sweep(3660, {"p1"}); self.assertFalse(forms["tok"] & set(k) - forms["login"] - forms["pw"] - mf)
-        k.sweep(3661, set()); self.assertFalse(forms["pw"] & set(k) - mf)
+        k.sweep(3661, {"x"}); self.assertTrue(forms["pw"] <= set(k)); k.sweep(3661, {"x"}); self.assertFalse(forms["pw"] & set(k) - mf)
         self.assertTrue(mf <= set(k), "a model-entry form was dropped")
 
     def test_s3_running_pod_kept(self):
@@ -44,11 +44,12 @@ class S(unittest.TestCase):
         k.add_forms(fs, ("until", 10.0, "p1"))
         self.assertEqual(k.sweep(99999, {"p1"}), 0)
         self.assertTrue(TOK not in cw.scrub("x " + TOK, k), "a form of a running pod was dropped")
-        n = k.sweep(99999, set()); self.assertEqual(n, len(fs)); self.assertEqual(len(k), 0)
+        self.assertEqual(k.sweep(99999, {"x"}), 0); self.assertTrue(fs <= set(k))
+        n = k.sweep(99999, {"x"}); self.assertEqual(n, len(fs)); self.assertEqual(len(k), 0)
 
     def test_s4_scrub_same_for_live(self):
         k = self.kf(); k.add_forms(cw.secret_forms(PW), ("pod", "p1")); k.add_forms(cw.secret_forms(TOK), ("pod", "p2"))
-        k.sweep(0, {"p1"})
+        k.sweep(0, {"p1"}); k.sweep(0, {"p1"})
         live = set(cw.secret_forms(PW)); text = "a %s b %s" % (PW, TOK)
         self.assertEqual(cw.scrub(text, k), cw.scrub(text, live))
 
@@ -97,7 +98,8 @@ class S3More(unittest.TestCase):
         out = cw.scrub("x " + G34 + " y " + L34, k)
         self.assertTrue(G34 not in out and L34 not in out, "a form of a running pod was dropped")
         kept = len(gf)
-        gone = k.sweep(99999, set())
+        self.assertEqual(k.sweep(99999, {"x"}), 0); self.assertTrue((gf | lf) <= set(k), "a form of a pod missing from one list was dropped")
+        gone = k.sweep(99999, {"x"})
         print("S3 kept %d of %d, redacted 1 of 1, dropped after leaving %d of %d" % (kept, len(gf), gone, len(gf | lf)))
         self.assertEqual(gone, len(gf | lf)); self.assertEqual(len(k), 0)
         self.assertEqual((len(gf), len(lf)), (8, 6))
@@ -120,9 +122,9 @@ class S2Kinds(unittest.TestCase):
         k = self.world(cls); total = len(k); removed = []
         self.assertEqual(sum(len(v) for v in self.F.values()), total, "the fixtures overlap")
         # control: no event, 0 of 63 dropped
-        self.assertEqual(k.sweep(0, {"p1", "p2"}), 0, "a form was dropped with no event")
+        self.assertEqual(k.sweep(0, {"p1", "p2"}) + k.sweep(0, {"p1", "p2"}), 0, "a form was dropped with no event")
         self.assertEqual(len(k), total, "a form was dropped with no event")
-        for now, pods, kind in ((2400, {"p1", "p2"}, "login"), (3660, {"p1", "p2"}, "git"), (3660, {"p2"}, "pw"), (3660, set(), "hub")):
+        for now, pods, kind in ((2400, {"p1", "p2"}, "login"), (3660, {"p1", "p2"}, "git"), (3660, {"p2"}, "pw"), (3660, {"x"}, "hub")):
             if kind in ("login", "git"):
                 before = now - 1
                 self.assertEqual(k.sweep(before, pods), 0, "a form was dropped before its event (" + kind + ")")
@@ -130,6 +132,8 @@ class S2Kinds(unittest.TestCase):
                 self.assertEqual(k.sweep(now, pods | {"p1"}), 0, "a form was dropped before its event (" + kind + ")")
             else:
                 self.assertEqual(k.sweep(now, pods | {"p2"}), 0, "a form was dropped before its event (" + kind + ")")
+            if kind in ("pw", "hub"):
+                self.assertEqual(k.sweep(now, pods), 0, "a form was dropped before its event (" + kind + ")")
             n = k.sweep(now, pods)
             self.assertTrue(self.F["model"] <= set(k), "a model-entry form was dropped")
             self.assertEqual(n, len(self.F[kind]), "a %s form was not dropped at its event" % kind)
@@ -160,7 +164,7 @@ class S2Kinds(unittest.TestCase):
             ("never drops by instant", until, "False", "was not dropped at its event"),
             ("never drops by pod", pod, "False", "was not dropped at its event"),
             ("drops one step early", 'now >= l[1] and l[2] not in pods', 'now >= l[1] - 1 and l[2] not in pods', "a form was dropped before its event"),
-            ("drops a pod's forms while it runs", 'l[1] not in pods)', 'True)', "a form was dropped with no event"),
+            ("drops at the first absence", ' and (l[1] if l[0] == "pod" else l[2]) in before}', '}', "a form was dropped before its event"),
             ("drops every kind by one fixed age", 'if lives is None:\n                    continue\n', 'if False:\n                    continue\n', None),
         )
         failed = 0
@@ -213,7 +217,7 @@ class S4Same(unittest.TestCase):
             k.add_forms(cw.secret_forms(t), ("until", 100.0 + i, None))
         k.add_forms(cw.secret_forms(G34), ("until", 5000.0, "p1")); k.add_forms(cw.secret_forms(P34), ("pod", "p1"))
         k.add_forms(cw.secret_forms(M34), None); k.add_forms(cw.secret_forms(H34), ("pod", "p9"))
-        k.sweep(1000.0, {"p1", "p9"})  # the five extra tokens are dropped, the rest is live
+        k.sweep(1000.0, {"p1", "p9"}); k.sweep(1000.0, {"p1", "p9"})  # the five extra tokens are dropped, the rest is live
         live = set(cw.secret_forms(G34)) | set(cw.secret_forms(P34)) | set(cw.secret_forms(M34)) | set(cw.secret_forms(H34))
         self.assertTrue(set(k) == live, "the live set differs from the expected one: %d held, %d expected" % (len(set(k)), len(live)))
         pool = sorted(live)
@@ -239,7 +243,7 @@ class S4Same(unittest.TestCase):
         k.add_forms(cw.secret_forms(M34), ("pod", "p1")); k.add_forms(cw.secret_forms(M34), None)
         for _, v, _ in kinds:
             before += v not in cw.scrub("x " + v + " y", k, 5000)
-        k.sweep(99999, set())
+        k.sweep(99999, {"x"}); k.sweep(99999, {"x"})
         for name, v, _ in kinds:
             after += v not in cw.scrub("x " + v + " y", k, 5000)
             for f in cw.secret_forms(v):
@@ -288,7 +292,7 @@ class S5Week(unittest.TestCase):
     def test_control_and_mutant(self):
         top, bound, last = self.check(cw.KnownForms)
         print("S5 control: largest count %d, bound %d, %d passes, last %d" % (top, bound, 10080, last))
-        src = Mutants.SRC; old = "        if pods is None:\n            return 0\n"
+        src = Mutants.SRC; old = "        if not pods:\n            with self._lock:\n                self._absent = set()\n            return 0\n"
         self.assertEqual(src.count(old), 1)
         mut = src.replace(old, "        if True:\n            return 0\n")
         self.assertNotEqual(mut, src)
@@ -321,7 +325,7 @@ class S8Rounds(unittest.TestCase):
                 try: go.wait(); k.add_forms(added, ("pod", "live"))
                 except Exception as e: errs.append(type(e).__name__)
             def sweeper():
-                try: go.wait(); k.sweep(1.0, {"live"})
+                try: go.wait(); k.sweep(1.0, {"live"}); k.sweep(1.0, {"live"})
                 except Exception as e: errs.append(type(e).__name__)
             def scr():
                 try:
@@ -344,7 +348,7 @@ class S6NoValueInOutput(unittest.TestCase):
         import io, contextlib
         buf = io.StringIO()
         suites = unittest.TestSuite()
-        for c in (S2Kinds, S3More, S4Same, S5Week, S8Rounds, Mutants):
+        for c in (S2Kinds, S3More, S4Same, S5Week, S8Rounds, Mutants, S14TwoLists):
             suites.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(c))
         with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
             res = unittest.TextTestRunner(stream=buf, verbosity=2).run(suites)
@@ -404,7 +408,7 @@ class Mutants(unittest.TestCase):
 
     def test_s3_control_and_mutant(self):
         self.assertEqual(self.check_running(cw.KnownForms), 8)
-        bad = self.mutant('l[0] == "until" and now >= l[1] and l[2] not in pods', 'l[0] == "until" and now >= l[1]')
+        bad = self.mutant('(l[0] == "until" and now >= l[1] and l[2] not in pods)) and (l[1] if l[0] == "pod" else l[2]) in before}', '(l[0] == "until" and now >= l[1]))}')
         with self.assertRaises(AssertionError) as cm:
             self.check_running(bad)
         self.assertIn("a form of a running pod was dropped", str(cm.exception))
@@ -412,7 +416,7 @@ class Mutants(unittest.TestCase):
     def check_model(self, cls):
         k = cls(); mf = set(cw.secret_forms(MODEL))
         k.add_forms(mf, None); k.add_forms(mf, ("pod", "p1"))
-        k.sweep(1e12, set())
+        k.sweep(1e12, {"x"}); k.sweep(1e12, {"x"})
         self.assertTrue(mf <= set(k), "a model-entry form was dropped")
         return len(mf)
 
@@ -445,7 +449,7 @@ class S2KindMutants(unittest.TestCase):
     def run_check(self, cls, kind, text):
         k = S2Kinds("test_control_counts").world(cls)
         F = {"git": set(cw.secret_forms(G34)), "login": set(cw.secret_forms(L34)), "pw": set(cw.secret_forms(P34)), "hub": set(cw.secret_forms(H34))}
-        k.sweep(10 ** 9, set())
+        k.sweep(10 ** 9, {"x"}); k.sweep(10 ** 9, {"x"})
         self.assertFalse(F[kind] & set(k), text)
         return len(F[kind])
 
@@ -503,6 +507,7 @@ class S11ReaperPaths(unittest.TestCase):
     def check(self, path, build):
         k = build()
         self.assertEqual(k.sweep(0, {"p1"}), 0, "a form was dropped while its pod ran")
+        self.assertEqual(k.sweep(1, {"other"}), 0, "a form of a pod missing from one list was dropped")
         gone = k.sweep(1, {"other"})
         mf = set(cw.secret_forms(M34))
         self.assertTrue(mf <= set(k), "a model-entry form was dropped on the reaper's path")
@@ -574,9 +579,9 @@ class S12S13Sweep(unittest.TestCase):
         la = self.launcher(mod, pods, k)
         return la, k
 
-    def mod(self, old=None, new=None):
+    def mod(self, old=None, new=None, *more):
         src = Mutants.SRC
-        if old:
+        for old, new in ((((old, new),) if old else ()) + tuple(zip(more[::2], more[1::2]))):
             self.assertEqual(src.count(old), 1)
             m = src.replace(old, new)
             self.assertNotEqual(m, src)
@@ -615,13 +620,15 @@ class S12S13Sweep(unittest.TestCase):
     def check13(self, mod):
         la, k = self.pass_world(mod, [])
         total = len(k)
+        k.sweep(0, {"p9"})   # the two pods are absent once
         try:
-            la.reap()
+            la.reap()   # the empty list
         except Exception:
             pass
         self.assertEqual(len(k), total, "an empty list dropped forms")
         ln = self.lines(la)
-        la.kube.list_pods = lambda: [{"metadata": {"name": "p9"}}]
+        k.sweep(0, {"p9"})   # absent once again, not twice in a row
+        self.assertEqual(len(k), total, "a form of a pod missing from one list was dropped")
         k.sweep(0, {"p9"})
         return total, ln, len(k)
 
@@ -629,11 +636,47 @@ class S12S13Sweep(unittest.TestCase):
         total, ln, after = self.check13(self.mod())
         self.assertEqual(len(ln), 1); self.assertIn("known-forms.sweep-skipped", ln[0]); self.assertIn("empty pod list", ln[0])
         self.assertEqual(after, 34)
-        bad = self.mod('                if not pods:   # an empty', '                if False:   # an empty')
+        bad = self.mod('                if not pods:   # an empty', '                if False:   # an empty', '        if not pods:\n            with self._lock:\n                self._absent = set()\n            return 0\n', '        pods = set(pods or ())\n')
         with self.assertRaises(AssertionError) as cm:
             self.check13(bad)
         self.assertIn("an empty list dropped forms", str(cm.exception))
         print("S13 0 of %d forms dropped on the empty list, 1 audit line, the next non-empty pass left %d (the model entry); the copy failed 1 of 1" % (total, after))
+
+
+class S14TwoLists(unittest.TestCase):
+    """S14: a form is released only when its pod was absent from two sweeps in a row whose lists were not empty."""
+    MSG = "a form of a pod missing from one list was dropped"
+
+    def fresh(self, cls):
+        k = cls(); fs = set(cw.secret_forms(TOK)); k.add_forms(fs, ("pod", "p1")); return k, fs
+
+    def check(self, cls):
+        k, fs = self.fresh(cls)
+        k.sweep(1.0, {"p0", "p1"}); k.sweep(2.0, {"p0"})
+        kept1 = len(fs & set(k))
+        self.assertEqual(kept1, len(fs), self.MSG + " (kept %d of %d)" % (kept1, len(fs)))
+        self.assertNotIn(TOK, cw.scrub("x " + TOK, k), self.MSG)
+        k.sweep(3.0, {"p0"}); gone = len(fs) - len(fs & set(k))
+        k2, _ = self.fresh(cls); kept = []
+        for pods in ({"p0"}, {"p0", "p1"}, {"p0"}):
+            k2.sweep(1.0, pods); kept.append(len(fs & set(k2)))
+        self.assertEqual(kept, [len(fs)] * 3, self.MSG)
+        k2.sweep(1.0, {"p0"}); gone2 = len(fs) - len(fs & set(k2))
+        k3, _ = self.fresh(cls)
+        k3.sweep(1.0, {"p0"}); k3.sweep(1.0, set()); k3.sweep(1.0, {"p0"})
+        across = len(fs & set(k3))
+        self.assertEqual(across, len(fs), self.MSG)
+        return kept1, gone, kept, gone2, across, len(fs)
+
+    def test_s14(self):
+        r = self.check(cw.KnownForms)   # the control first
+        self.assertEqual(r, (8, 8, [8, 8, 8], 8, 8, 8))
+        bad = Mutants("test_s3_control_and_mutant").mutant(' and (l[1] if l[0] == "pod" else l[2]) in before}', '}')
+        with self.assertRaises(AssertionError) as cm:
+            self.check(bad)
+        ok = self.MSG in str(cm.exception)
+        self.assertTrue(ok)
+        print("S14: kept %d of %d after one absence, gone %d of %d after two in a row, kept through absent-present-absent and across a skipped pass; control 1 of 1, mutant 1 of 1 with the text, mutation applied True" % (r[0], r[5], r[1], r[5]))
 
 
 if __name__ == "__main__":
