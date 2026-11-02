@@ -69,20 +69,20 @@ class TestPlanHashMarkerPure(unittest.TestCase):
 
     def test_the_old_formula_gives_two_hashes_for_the_two_forms(self):
         self.assertNotEqual(self.pc.plan_hash_legacy(self.plain), self.pc.plan_hash_legacy(self.signed))
-        self.assertEqual(self.pc.plan_hashes(self.signed), (self.pc.plan_hash(self.signed), self.pc.plan_hash_legacy(self.signed)))
-        self.assertEqual(len(self.pc.plan_hashes(self.plain)), 1)
+        self.assertEqual(self.pc.plan_hashes(self.signed), (self.pc.plan_hash(self.signed), self.pc.plan_hash_collapsed(self.signed), self.pc.plan_hash_legacy(self.signed)))
+        self.assertEqual(len(self.pc.plan_hashes(self.plain)), 2)
 
     def test_one_edited_word_and_a_marker_line_elsewhere_change_the_hash_and_whitespace_does_not(self):
         base = self.pc.plan_hash(self.signed)
         edited = self.pc.plan_hash(self.signed.replace("size: S", "size: M"))
         elsewhere = self.pc.plan_hash(plan_text() + MARKER + "\nmore text\n")
-        spaced = self.pc.plan_hash(self.signed.replace("size: S", "size:   S"))
-        self.assertEqual([edited != base, elsewhere != base, spaced == base], [True, True, True])
+        spaced = self.pc.plan_hash(self.signed.replace("size: S", "size: S  \t"))
+        self.assertEqual([edited != base, elsewhere != base, spaced == base, self.pc.plan_hash(self.signed.replace("size: S", "size:   S")) != base, self.pc.plan_hash(self.signed.replace("size: S", " size: S")) != base], [True, True, True, True, True])
 
     def test_only_a_marker_in_the_exact_form_on_the_last_non_blank_line_is_removed(self):
         for odd in ("<!-- fleet-switchboard:from=a b -->", "<!-- fleet-switchboard:from= -->", "text " + MARKER):
             text = self.plain + odd + "\n"
-            self.assertEqual(self.pc.plan_hash(text), self.pc.plan_hash_legacy(text), odd)
+            self.assertEqual(self.pc.plan_hash_collapsed(text), self.pc.plan_hash_legacy(text), odd)
 
     def test_an_approval_at_the_old_hash_and_at_the_new_hash_is_accepted_and_one_of_an_edit_is_not(self):
         for value in self.pc.plan_hashes(self.signed):
@@ -133,7 +133,7 @@ class TestPlanHashMarkerStored(unittest.TestCase):
     def test_a_text_with_no_marker_has_one_hash_and_no_mapping(self):
         pair = self.pc.plan_hashes(plan_text())
         entries = self.entries(pair[0])
-        self.assertIs(self.pl.as_current(entries, pair), entries)
+        self.assertEqual(self.pl.as_current(entries, pair), entries)
 
 
 class TestPlanHashMarkerTally(unittest.TestCase):
@@ -142,7 +142,7 @@ class TestPlanHashMarkerTally(unittest.TestCase):
     def setUp(self):
         self.pc, self.pl, self.rv = real("plan_check"), real("plan_ledger"), real("plan_review")
         self.signed = plan_text() + "\n" + MARKER + "\n"
-        self.new, self.old = self.pc.plan_hashes(self.signed)
+        self.new, _, self.old = self.pc.plan_hashes(self.signed)
         self.lanes = ["L1", "L2", "L3"]
 
     def lanes_at(self, hashes):
@@ -195,13 +195,13 @@ class TestPlanHashMarkerMutants(unittest.TestCase):
             self.check(pc, real("plan_approval"), real("plan_ledger"))
 
     def test_a_mutant_that_reads_the_ask_head_at_the_new_form_only_fails(self):
-        pl = _ph_mutate("plan_ledger", "        if entry.get(\"plan_hash\") == old or entry.get(\"head\") == old_head:", "        if False:")
+        pl = _ph_mutate("plan_ledger", "        if entry.get(\"plan_hash\") in olds or entry.get(\"head\") in old_heads:", "        if False:")
         with self.assertRaisesRegex(AssertionError, "an old-head record reads as stale"):
             self.check(real("plan_check"), real("plan_approval"), pl)
 
     def test_a_mutant_that_compares_the_raw_strings_in_a_round_counts_two_of_three(self):
         pc, pl, rv = real("plan_check"), _ph_mutate("plan_ledger", "    if not hashes or len(hashes) < 2:\n        return entries\n", "    return entries\n"), real("plan_review")
-        new, old = pc.plan_hashes(self.signed)
+        new, _, old = pc.plan_hashes(self.signed)
         entries = [{"kind": "lane", "lane": l, "verdict": "approve", "plan_hash": h, "objections": []} for l, h in zip("ABC", (old, old, new))]
         entries = pl.as_current(entries, (new, old))
         self.assertNotEqual(rv.decide_consensus(entries, list("ABC"), new, rounds_left=True)[0], "consensus")
@@ -371,13 +371,15 @@ def build():
 
         def test_the_control_all_verdicts_at_the_old_hash_and_a_text_with_no_marker_reach_consensus(self):
             review, rnd = self.closing_round()
-            new, old = rnd["plan_hashes"]
+            new, *older = rnd["plan_hashes"]
+            old = older[-1]
             self.assertEqual(self.tally(review, rnd, [old] * 5)["tally"], "consensus")
 
         def test_verdicts_at_the_old_and_at_the_new_hash_count_together_and_the_consensus_is_reached(self):
             review, rnd = self.closing_round()
-            new, old = rnd["plan_hashes"]
-            self.assertEqual(len(rnd["plan_hashes"]), 2)
+            new, *older = rnd["plan_hashes"]
+            old = older[-1]
+            self.assertEqual(len(rnd["plan_hashes"]), 3)
             done = self.tally(review, rnd, [old, old, new, old, new])
             self.assertEqual(done["tally"], "consensus", done)
             (consensus,) = [e for e in self.ledger() if e["kind"] == "consensus"]
@@ -387,7 +389,8 @@ def build():
 
         def test_a_verdict_at_the_hash_of_an_edited_text_is_not_counted(self):
             review, rnd = self.closing_round()
-            new, old = rnd["plan_hashes"]
+            new, *older = rnd["plan_hashes"]
+            old = older[-1]
             edited = sb.plan_check.plan_hash(self.FINAL + "\nan edit\n")
             done = self.tally(review, rnd, [old, old, new, old, edited])
             self.assertNotEqual(done["tally"], "consensus", done)
@@ -395,7 +398,8 @@ def build():
 
         def test_status_reads_a_consensus_recorded_at_the_old_hash_and_the_other_commands_accept_the_round(self):
             review, rnd = self.closing_round()
-            new, old = rnd["plan_hashes"]
+            new, *older = rnd["plan_hashes"]
+            old = older[-1]
             self.inject({"kind": "consensus", "result": "pass", "pr": "-", "scenario": "-", "lineage": rnd["lineage"], "review": review, "plan_hash": old, "by": "plan-review"})
             self.assertTrue(json.loads(self.review("orch", "status", review, "--json")[1])["consensus"], "status: an old-hash consensus is not read as bound")
             before = len(self.ledger())
@@ -412,7 +416,8 @@ def build():
 
         def test_a_mutant_that_compares_the_raw_strings_of_a_round_fails_the_tally(self):
             review, rnd = self.closing_round()
-            new, old = rnd["plan_hashes"]
+            new, *older = rnd["plan_hashes"]
+            old = older[-1]
             with tempfile.TemporaryDirectory() as tmp:
                 msb = _entry_copy(tmp, "switchboard/plan_review.py", "    return plan_ledger.as_current(entries, pair), dict(rnd, plan_hash=load_plan_check().canonical_hash(rnd[\"plan_hash\"], pair))\n",
                                   "    return entries, rnd\n")
@@ -439,7 +444,7 @@ def build():
             obj = ["- id: O1; severity: blocking; state: open; text: a stub passes"]
             for number in (8, 9, 10, 11):
                 rnd = [e for e in self.ledger() if e["kind"] == "round" and e["review"] == review][-1]
-                new, old = rnd["plan_hashes"]
+                new, old = rnd["plan_hashes"][0], rnd["plan_hashes"][-1]
                 for i, lane in enumerate(rnd["lanes"]):
                     if lane == obj_lane:
                         self.assertEqual(self.verdict_current(review, lane, "iterate", obj)[0], 0)
@@ -461,7 +466,7 @@ def build():
 
         def test_decide_through_the_entry_on_a_round_with_verdicts_at_both_forms_reaches_the_consensus_once_at_the_new_hash(self):
             review, rnd = self.escalated_signed()
-            new, old = rnd["plan_hashes"]
+            new, old = rnd["plan_hashes"][0], rnd["plan_hashes"][-1]
             code, out, err = self.override(review)
             self.assertEqual(code, 0, err)
             (consensus,) = self.consensus_entries(review)
@@ -476,14 +481,14 @@ def build():
 
         def test_decide_counts_a_consensus_at_the_old_hash_as_reached_and_writes_no_second(self):
             review, rnd = self.escalated_signed()
-            new, old = rnd["plan_hashes"]
+            new, old = rnd["plan_hashes"][0], rnd["plan_hashes"][-1]
             self.inject({"kind": "consensus", "result": "pass", "pr": "-", "scenario": "-", "lineage": rnd["lineage"], "review": review, "plan_hash": old, "by": "plan-review"})
             self.assertEqual(self.override(review)[0], 0)
             self.assertEqual(len(self.consensus_entries(review)), 1, "decide counts the old-hash consensus as the round's")
 
         def test_a_mutant_that_compares_the_raw_strings_in_decide_writes_a_second_consensus(self):
             review, rnd = self.escalated_signed()
-            new, old = rnd["plan_hashes"]
+            new, old = rnd["plan_hashes"][0], rnd["plan_hashes"][-1]
             self.inject({"kind": "consensus", "result": "pass", "pr": "-", "scenario": "-", "lineage": rnd["lineage"], "review": review, "plan_hash": old, "by": "plan-review"})
             with tempfile.TemporaryDirectory() as tmp:
                 msb = _entry_copy(tmp, "switchboard/plan_review.py", "        entries, rnd = _canon_round(entries, rnd)   # #1713: both sides in the round's own form\n", "")
@@ -497,7 +502,7 @@ def build():
         def test_the_tick_and_the_lane_send_check_read_a_round_with_verdicts_at_both_forms_as_open(self):
             got = self.start_round()
             rnd = self.kinds("round")[-1]
-            new, old = rnd["plan_hashes"]
+            new, old = rnd["plan_hashes"][0], rnd["plan_hashes"][-1]
             lanes = rnd["lanes"]
             self.inject(self.lane_entry(got["review"], rnd, lanes[0], old))
             self.inject(self.lane_entry(got["review"], rnd, lanes[1], new))
@@ -606,7 +611,7 @@ def build():
 
         def test_the_control_a_round_started_after_the_change_is_accepted_by_the_commands_and_its_lane_send_check_answers_as_before(self):
             got = self.start_round()
-            self.assertEqual(self.kinds("round")[-1]["plan_hashes"], [got["plan_hash"], sb.plan_check.plan_hash_legacy(host.LEDGER_PLAN + "\n" + MARKER)])
+            self.assertEqual(self.kinds("round")[-1]["plan_hashes"], [got["plan_hash"], sb.plan_check.plan_hash_collapsed(host.LEDGER_PLAN + "\n" + MARKER), sb.plan_check.plan_hash_legacy(host.LEDGER_PLAN + "\n" + MARKER)])
             self.assertEqual(self.review("orch", "status", got["review"])[0], 0)
             self.assertEqual(self.review("orch", "tick")[0], 0)
             self.assertEqual(self.lane_verdict(got, "L1")[0], 0)
@@ -647,7 +652,7 @@ def build_late():
             pc = real("plan_check")
             text = host.LEDGER_PLAN + "\n" + MARKER
             self.pair = pc.plan_hashes(text)
-            self.new, self.old = self.pair
+            self.new, self.old = self.pair[0], self.pair[-1]
             self.edited = pc.plan_hash(text.replace("Commissioning works.", "Commissioning works, edited."))
             self.hash = self.new
 
