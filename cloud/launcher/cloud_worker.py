@@ -483,18 +483,25 @@ def scrub(text, secrets_known=(), limit=300):
     of this run's secrets and any 8+ character piece of one, token-shaped strings and long base64/hex runs are removed,
     then the text is cut to `limit`. Control characters become '?'."""
     text = str(text)[:SCRUB_INPUT_MAX]
-    snap = frozenset(secrets_known)  # ONE C-level copy, taken first: a set that changes during the call cannot raise here
-    built = getattr(scrub, "_built", None)
-    if built is None or built[0] != snap:
-        order = sorted({v for v in snap if v and len(v.strip()) >= MIN_FRAGMENT}, key=lambda v: (-len(v), v))
-        index, always = {}, set()
-        for n, sec in enumerate(order):
-            if "[" in sec or "]" in sec or "redacted" in sec:
-                always.add(n)  # the marker written by a redaction could make a piece of this secret
-            for k in range(len(sec) - MIN_FRAGMENT + 1):
-                index.setdefault(sec[k:k + MIN_FRAGMENT], set()).add(n)
-        built = (snap, order, index, always)
-        scrub._built = built
+    version = getattr(secrets_known, "version", None)  # a KnownSet: read its version FIRST
+    built = getattr(secrets_known, "built", None) if version is not None else getattr(scrub, "_built", None)
+    if version is not None and built is not None and built[0] != version:
+        built = None
+    if version is None or built is None:
+        snap = frozenset(secrets_known)  # ONE C-level copy, taken first: a set that changes during the call cannot raise here
+        if version is not None or built is None or built[0] != snap:
+            order = sorted({v for v in snap if v and len(v.strip()) >= MIN_FRAGMENT}, key=lambda v: (-len(v), v))
+            index, always = {}, set()
+            for n, sec in enumerate(order):
+                if "[" in sec or "]" in sec or "redacted" in sec:
+                    always.add(n)  # the marker written by a redaction could make a piece of this secret
+                for k in range(len(sec) - MIN_FRAGMENT + 1):
+                    index.setdefault(sec[k:k + MIN_FRAGMENT], set()).add(n)
+            built = (version if version is not None else snap, order, index, always)
+            if version is not None:
+                secrets_known.built = built  # kept for the version read FIRST
+            else:
+                scrub._built = built
     _, order, index, always = built
     hit = set(always)
     if index:  # ONE pass over the text: one probe per position
