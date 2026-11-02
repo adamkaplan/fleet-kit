@@ -42,6 +42,7 @@ NEW_BIN_GUARDS = (
     ("TestTheReaperOnlyInstall", "bin/test-switchboard", "TestTheReaperOnlyInstall", None, "every function the installer calls is classified (Linux and macOS)"),
     ("TestRecordingCommands", "bin/test-switchboard", "TestRecordingCommands", None, "every command that reaches a ledger append is a recording command or named exempt"),
     ("TestDerivedClosure", "bin/test-switchboard", "TestDerivedClosure", None, "the closure of the delegated clear is derived over the entry and every part (tests/switchboard/test_closure.py)"),
+    ("TestBodyCheck", "bin/test-switchboard", "TestBodyCheck", None, "the source-copy mutant of `preflight-pr --body` copies every file under bin/ into a temporary tree: a new file under bin/ must copy and load there"),
 )
 
 
