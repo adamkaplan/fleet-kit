@@ -467,7 +467,7 @@ def build():
             import shutil, subprocess, tempfile
             root = Path(__file__).resolve().parents[2]
             with tempfile.TemporaryDirectory(prefix="u11-") as tmp:
-                for src in sorted((root / "cloud" / "launcher").glob("*.py")):
+                for src in sorted((root / "cloud" / "launcher").glob("*.py")) + [root / "bin" / "path_walk.py"]:
                     rel = src.relative_to(root)
                     (Path(tmp) / rel).parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy(src, Path(tmp) / rel)
@@ -476,7 +476,8 @@ def build():
                     text = (Path(tmp) / rel).read_text()
                     self.assertEqual(text.count(old), 1, "the mutant's text is not in the copy: " + old)
                     (Path(tmp) / rel).write_text(text.replace(old, new))
-                done = subprocess.run([sys.executable, "-c", U11_CHECKER, tmp], capture_output=True, text=True, timeout=60)
+                done = subprocess.run([sys.executable, "-c", U11_CHECKER, tmp], capture_output=True, text=True, timeout=60,
+                                      env=dict(os.environ, PYTHONPATH=tmp + "/bin"))
             return done.returncode, done.stderr
 
     return TestLaunchCapacity
