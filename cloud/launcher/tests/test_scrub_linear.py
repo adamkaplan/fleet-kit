@@ -360,5 +360,109 @@ class S11NoValues(unittest.TestCase):
         self.assertEqual(found, 0)
 
 
+def tally(fn, calls):
+    """Count, over `calls` (a function that makes the calls), the runs of the lines of `fn` that snapshot the set and that build
+    the structure. A set subclass cannot count its own iterations (a frozenset copy of a set subclass does not call __iter__),
+    so the snapshots are counted by line events. No clock."""
+    src = (inspect.getsource(fn) if fn is cw.scrub else fn.__scrub_src__).splitlines()
+    first = fn.__code__.co_firstlineno
+    n = {"snap": 0, "build": 0}
+
+    def tracer(frame, event, arg):
+        return local if frame.f_code is fn.__code__ else None
+
+    def local(frame, event, arg):
+        if event == "line":
+            line = src[frame.f_lineno - first]
+            n["snap"] += "frozenset(secrets_known)" in line
+            n["build"] += "built = (version if" in line
+        return local
+    sys.settrace(tracer)
+    try:
+        calls()
+    finally:
+        sys.settrace(None)
+    return n["snap"], n["build"]
+
+
+def synthetic_forms(seed, n=5000):
+    r = random.Random(seed)
+    return {rnd(r, r.randint(8, 40), "abcdefghijklmnopqrstuvwxyz0123456789") for _ in range(n)}
+
+
+class S14Version(unittest.TestCase):
+    def _check(self, fn):
+        forms = synthetic_forms(14)
+        ks = cw.KnownSet(forms)
+        text = "abcde"
+
+        def thousand():
+            for _ in range(1000):
+                fn(text, ks)
+        snaps, builds = tally(fn, thousand)
+        if snaps > 1:
+            raise AssertionError("a call read the whole set: %d snapshots in 1000 calls" % snaps)
+        extra = "added-form-" + "q" * 12
+        ks.add(extra)
+        out = []
+        snaps2, builds2 = tally(fn, lambda: out.append(fn("x " + extra + " y", ks, 5000)))
+        self.assertEqual((snaps2, builds2), (1, 1))
+        self.assertNotIn(extra, out[0])
+        other = cw.KnownSet(synthetic_forms(15))
+        fn(text, other)
+        fn(text, ks)
+
+        def alternate():
+            for _ in range(50):
+                fn(text, other)
+                fn(text, ks)
+        _, rebuilds = tally(fn, alternate)
+        self.assertEqual(rebuilds, 0)
+        return snaps, snaps2, rebuilds
+
+    def test_S14_version_stamp_and_mutant(self):
+        got = self._check(cw.scrub)
+        forms = synthetic_forms(14)
+        pick = sorted(forms)[:3]
+        texts = ["a " + pick[0] + " b", pick[1][:20] + " and " + pick[2], "nothing"]
+        equal = 0
+        for kind in (set, frozenset, cw.KnownSet):
+            secs = kind(forms)
+            if all(cw.scrub(t, secs, 5000) == ref(t, secs, 5000) for t in texts):
+                equal += 1
+        self.assertEqual(equal, 3)
+        old = '    version = getattr(secrets_known, "version", None)  # a KnownSet: read its version FIRST\n'
+        src = inspect.getsource(cw.scrub)
+        assert src.count(old) == 1, "the mutation text must occur once"
+        msrc = src.replace(old, old + "    if version is not None:\n        _whole = frozenset(secrets_known)\n")
+        assert msrc != src
+        ns = dict(vars(cw))
+        exec(msrc, ns)
+        m = ns["scrub"]
+        m.__scrub_src__ = msrc
+        with self.assertRaisesRegex(AssertionError, "a call read the whole set"):
+            self._check(m)
+        print("S14 iterations in 1000 calls: %d (not 1000), for the added form %d, rebuilds in 100 alternating calls %d, "
+              "plain set, frozenset and KnownSet equal to the reference %d of 3; control passes 1 of 1, mutant fails 1 of 1"
+              % (got[0], got[1], got[2], equal))
+
+
+FORM_VALUES = ['ghp_Zx9Qw3Er7Ty1Ui5Op2As4Df6Gh8Jk0Lz', '{"name": "synthetic-entry-one", "key": "synthetic-key-0123456789"}', 'plain synthetic value 42']
+FORMS_FIXTURE = ['%7B%22name%22%3A%20%22synthetic-entry-one%22%2C%20%22key%22%3A%20%22synthetic-key-0123456789%22%7D', '%7B%22name%22%3A+%22synthetic-entry-one%22%2C+%22key%22%3A+%22synthetic-key-0123456789%22%7D', '6768705F5A78395177334572375479315569354F70324173344466364768384A6B304C7A', '6768705f5a78395177334572375479315569354f70324173344466364768384a6b304c7a', '706C61696E2073796E7468657469632076616C7565203432', '706c61696e2073796e7468657469632076616c7565203432', '73796E7468657469632D656E7472792D6F6E65', '73796E7468657469632D6B65792D30313233343536373839', '73796e7468657469632d656e7472792d6f6e65', '73796e7468657469632d6b65792d30313233343536373839', '7B226E616D65223A202273796E7468657469632D656E7472792D6F6E65222C20226B6579223A202273796E7468657469632D6B65792D30313233343536373839227D', '7Im5hbWUiOiAic3ludGhldGljLWVudHJ5LW9uZSIsICJrZXkiOiAic3ludGhldGljLWtleS0wMTIzNDU2Nzg5In', '7b226e616d65223a202273796e7468657469632d656e7472792d6f6e65222c20226b6579223a202273796e7468657469632d6b65792d30313233343536373839227d', 'BsYWluIHN5bnRoZXRpYyB2YWx1ZSA0M', 'N5bnRoZXRpYy1lbnRyeS1vbm', 'N5bnRoZXRpYy1rZXktMDEyMzQ1Njc4O', 'Z2hwX1p4OVF3M0VyN1R5MVVpNU9wMkFzNERmNkdoOEprMEx6', 'c3ludGhldGljLWVudHJ5LW9uZ', 'c3ludGhldGljLWVudHJ5LW9uZQ', 'c3ludGhldGljLWVudHJ5LW9uZQ==', 'c3ludGhldGljLWtleS0wMTIzNDU2Nzg5', 'cGxhaW4gc3ludGhldGljIHZhbHVlIDQy', 'docF9aeDlRdzNFcjdUeTFVaTVPcDJBczREZjZHaDhKazBMe', 'eyJuYW1lIjogInN5bnRoZXRpYy1lbnRyeS1vbmUiLCAia2V5IjogInN5bnRoZXRpYy1rZXktMDEyMzQ1Njc4OSJ9', 'ghp_Zx9Qw3Er7Ty1Ui5Op2As4Df6Gh8Jk0Lz', 'naHBfWng5UXczRXI3VHkxVWk1T3AyQXM0RGY2R2g4SmswTH', 'plain synthetic value 42', 'plain%20synthetic%20value%2042', 'plain+synthetic+value+42', 'sibmFtZSI6ICJzeW50aGV0aWMtZW50cnktb25lIiwgImtleSI6ICJzeW50aGV0aWMta2V5LTAxMjM0NTY3ODkif', 'synthetic-entry-one', 'synthetic-key-0123456789', 'wbGFpbiBzeW50aGV0aWMgdmFsdWUgND', 'zeW50aGV0aWMtZW50cnktb25l', 'zeW50aGV0aWMta2V5LTAxMjM0NTY3OD', '{"name": "synthetic-entry-one", "key": "synthetic-key-0123456789"}', '{\\"name\\": \\"synthetic-entry-one\\", \\"key\\": \\"synthetic-key-0123456789\\"}']
+
+
+class U2Fixture(unittest.TestCase):
+    def test_U2_forms_and_set_equal_the_tip(self):
+        derived = sorted(set().union(*[cw.secret_forms(v) for v in FORM_VALUES]))
+        k = cw.Kube({})
+        k.add_secrets(FORM_VALUES[0])
+        k.add_secrets(*FORM_VALUES[1:])
+        k.add_secrets(FORM_VALUES[0], "")
+        self.assertEqual(derived, FORMS_FIXTURE)
+        self.assertIsInstance(k.known, cw.KnownSet)
+        self.assertEqual(k.known, set(FORMS_FIXTURE))
+        print("U2: forms %d of %d, set equal" % (len(derived), len(FORMS_FIXTURE)))
+
+
 if __name__ == "__main__":
     unittest.main()
