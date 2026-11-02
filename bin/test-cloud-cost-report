@@ -666,7 +666,9 @@ def audit_scan_files():
 
 
 def audit_writes(text):
-    """(line, what) of each write_audit(...) call and each write-mode open / os.open / write_text / append whose path holds the audit path."""
+    """(line, what) of each write_audit(...) call and each write-mode open / os.open / write_text / append whose path holds the audit path.
+
+    Limits that remain: a path built by a helper function is not followed, and a write by another process is not seen."""
     try:
         tree = ast.parse(text)
     except SyntaxError:
@@ -706,6 +708,10 @@ def audit_writes(text):
             hits.append((node.lineno, "subprocess with tee or >> on the audit path"))  # ext-proc
         elif (dotted in ("os.rename", "os.replace") and len(node.args) > 1 and holds(node.args[1])) or (name in ("rename", "replace") and dotted not in ("os.rename", "os.replace") and isinstance(node.func, ast.Attribute) and node.args and holds(node.args[0])):  # ext-rename
             hits.append((node.lineno, "rename or replace onto the audit path"))  # ext-rename
+        elif (dotted == "os.renames" and len(node.args) > 1 and holds(node.args[1])) or (  # ext-kw
+                (dotted in ("os.rename", "os.replace") or (name in ("rename", "replace") and isinstance(node.func, ast.Attribute))) and any(  # ext-kw
+                    k.arg in ("dst", "target") and holds(k.value) for k in node.keywords)):  # ext-kw
+            hits.append((node.lineno, "rename or replace onto the audit path"))  # ext-kw
         elif name == "open" and isinstance(node.func, ast.Attribute) and holds(node.func.value) and write_flag(node, 0):
             hits.append((node.lineno, "Path.open for writing"))
     return hits
@@ -903,6 +909,9 @@ RENAME_SAMPLES = {
     "os.replace": "import os\nos.replace('x', os.environ['CW_CLOUD_AUDIT'])\n",
     "Path.rename": "import pathlib, os\npathlib.Path('x').rename(os.environ['CW_CLOUD_AUDIT'])\n",
     "Path.replace": "import pathlib, os\npathlib.Path('x').replace(os.environ['CW_CLOUD_AUDIT'])\n",
+    "os.renames": "import os\nos.renames('x', os.environ['CW_CLOUD_AUDIT'])\n",
+    "dst=": "import os\nos.rename('x', dst=os.environ['CW_CLOUD_AUDIT'])\nos.replace('x', dst=os.environ['CW_CLOUD_AUDIT'])\n",
+    "target=": "import pathlib, os\npathlib.Path('x').rename(target=os.environ['CW_CLOUD_AUDIT'])\npathlib.Path('x').replace(target=os.environ['CW_CLOUD_AUDIT'])\n",
 }
 READER_SAMPLES = {
     "read open": "import os\nopen(os.environ['CW_CLOUD_AUDIT'], 'r')\n",
@@ -956,7 +965,7 @@ class TestRenameOntoTheAuditPath(unittest.TestCase):
         def check(fn):
             for shape, text in RENAME_SAMPLES.items():
                 hits = fn(text)
-                if [h[0] for h in hits] != [text.count("\n")] or "rename or replace" not in hits[0][1]:
+                if [h[0] for h in hits] != list(range(2, text.count("\n") + 1)) or "rename or replace" not in hits[0][1]:
                     raise AssertionError("a rename onto the audit path was not flagged: " + shape)
         check(audit_writes)  # control, first
         source = inspect.getsource(audit_writes)
@@ -969,13 +978,23 @@ class TestRenameOntoTheAuditPath(unittest.TestCase):
         with self.assertRaises(AssertionError) as ctx:
             check(scope["audit_writes"])
         self.assertIn("a rename onto the audit path was not flagged", str(ctx.exception))
+        kept2 = [l for l in lines if "# ext-kw" not in l]
+        self.assertEqual(len(lines) - len(kept2), 4)
+        scope2 = dict(globals())
+        exec("\n".join(kept2), scope2)
+        applied2 = len(kept2) < len(lines)
+        with self.assertRaises(AssertionError) as ctx2:
+            check(scope2["audit_writes"])
+        self.assertIn("a rename onto the audit path was not flagged: os.renames", str(ctx2.exception))
         flagged = sum(1 for t in writers.values() if audit_writes(t))
         readers = sum(1 for t in READER_SAMPLES.values() if audit_writes(t))
-        self.assertEqual((len(writers), flagged, readers), (9, 9, 0))
+        self.assertEqual((len(writers), flagged, readers), (12, 12, 0))
+        for text in ("import os\nos.renames('x', '/tmp/o')\n", "import os\nos.rename('x', dst='/tmp/o')\n", "import pathlib\npathlib.Path('x').rename(target='/tmp/o')\n"):
+            self.assertEqual(audit_writes(text), [])
         # a rename onto another path with an audit-path source is not a write onto it
         self.assertEqual(audit_writes("import os\nos.rename(os.environ['CW_CLOUD_AUDIT'], '/tmp/o')\n"), [])
-        print("S11: flagged %d of %d writers, %d of %d readers; control passes 1 of 1, mutant fails 1 of 1 with the text, mutation applied %s" % (
-            flagged, len(writers), readers, len(READER_SAMPLES), applied))
+        print("S11: flagged %d of %d writers, %d of %d readers; control passes 1 of 1, mutant 1 fails 1 of 1, mutant 2 fails 1 of 1 with the text, mutations applied %s" % (
+            flagged, len(writers), readers, len(READER_SAMPLES), applied and applied2))
 
 
 def mock_stderr(stream):
