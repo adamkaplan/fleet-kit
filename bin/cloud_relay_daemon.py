@@ -196,6 +196,14 @@ def _same_call(known, command, pr, head, digest=None):
 _TIMEOUT = object()
 
 
+def _checked_evidence(args):
+    """The evidence a call records: refused (Refuse 400 with the two numbers), never cut."""
+    try:
+        return plan_ledger.bounded_text(str(args.get("evidence") or "").strip(), plan_ledger.EVIDENCE_LIMIT, "evidence")
+    except plan_ledger.LedgerError as err:
+        raise Refuse(400, str(err))
+
+
 def _bounded(fn, timeout):
     """fn() with a deadline: _TIMEOUT when it does not answer in time, the Refuse itself when it raises one (429 budget/pause: the pod sees the named
     cause), None for any other failure (an unknown head, refused as stale)."""
