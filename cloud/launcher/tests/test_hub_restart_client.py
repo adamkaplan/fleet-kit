@@ -235,8 +235,13 @@ class S10Tries(unittest.TestCase):
     def has_six_tries(self, text):
         return (self.NEW in text, self.HANG in text, "up to 3 tries" not in text)
 
+    def check_document(self, text):
+        if "up to 3 tries" in text:
+            raise AssertionError("the old sentence of three tries is back")
+        return self.has_six_tries(text)
+
     def test_real_text(self):
-        got = self.has_six_tries(self._text())
+        got = self.check_document(self._text())
         text = self._text()
         print("S10: six tries and the window %d of 1, the sentence on a hub that hangs %d of 1, occurrences of up to 3 tries %d"
               % (text.count(self.NEW), text.count(self.HANG), text.count("up to 3 tries")))
@@ -244,14 +249,21 @@ class S10Tries(unittest.TestCase):
 
     def test_mutant(self):
         text = self._text()
-        control = self.has_six_tries(text)
+        control = self.check_document(text)
         applied = text.count(self.NEW) == 1
         mutant = text.replace(self.NEW, "The command makes up to 3 tries with one key.")
+        applied = applied and mutant != text
+        message = None
+        try:
+            self.check_document(mutant)
+        except AssertionError as e:
+            message = str(e)
         got = self.has_six_tries(mutant)
-        print("S10: control passes %d of 1, mutant (the old sentence back) fails %d of 1, mutation applied %s"
-              % (control == (True, True, True), got != (True, True, True), applied))
+        print("S10: control passes %d of 1, mutant (the old sentence back) fails %d of 1 with the text, mutation applied %s"
+              % (control == (True, True, True), message == "the old sentence of three tries is back", applied))
         self.assertTrue(applied)
         self.assertEqual(control, (True, True, True))
+        self.assertEqual(message, "the old sentence of three tries is back")
         self.assertEqual(got, (False, True, False))
 
 
