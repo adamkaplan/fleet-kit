@@ -271,12 +271,14 @@ class Mutants(unittest.TestCase):
             copy = Path(tmp) / "tree"
             shutil.copytree(ROOT, copy, ignore=shutil.ignore_patterns(".git", "__pycache__"))
             applied = False
+            self.occurrences = 0
             if rel:
                 target = copy / rel
                 text = target.read_text()
-                self.assertEqual(text.count(old), 1, "the mutation does not apply once")
+                self.occurrences = text.count(old)
+                self.assertEqual(self.occurrences, 1, "the mutation does not apply once")
                 target.write_text(text.replace(old, new))
-                applied = target.read_text() != text
+                applied = target.read_text() != text and self.occurrences == 1
                 self.assertTrue(applied, "the mutation was not applied")
             done = subprocess.run([sys.executable, "-m", "unittest", "test_registry_endpoint.Behaviour"], cwd=str(copy / "cloud/launcher/tests"),
                                   env=dict(os.environ, CW1510_IN_MUTANT="1"), capture_output=True, text=True, timeout=900)
@@ -286,12 +288,26 @@ class Mutants(unittest.TestCase):
         code, output, _ = self.run_tree()
         self.assertEqual(code, 0, output[-1500:])
 
+    @staticmethod
+    def counts(output):
+        """(tests run, failures plus errors) read from the unittest summary on standard error."""
+        ran = re.search(r"^Ran (\d+) tests?", output, re.M)
+        bad = re.search(r"^FAILED \((.*)\)", output, re.M)
+        failed = sum(int(n) for n in re.findall(r"(?:failures|errors)=(\d+)", bad.group(1))) if bad else 0
+        return (int(ran.group(1)) if ran else 0), failed
+
     def test_matches_each_mutant_fails_with_the_check_named(self):
+        control_code, control_output, _ = self.run_tree()
+        ran, control_failed = self.counts(control_output)
+        control_passed = ran - control_failed if control_code == 0 else 0
+        self.assertEqual(control_code, 0, "the control must pass first: " + control_output[-1500:])
         for label, rel, old, new, anchor in self.CASES:
             with self.subTest(label):
                 code, output, applied = self.run_tree(rel, old, new)
                 named = bool(re.search(anchor, output, re.M))
-                print("mutant %s: control passes 1 of 1, fails %d of 1 with the check named, mutation applied %s" % (label, int(code == 1 and named), applied))
+                _, mutant_failed = self.counts(output)
+                print("mutant %s: control passes %d of %d, mutant fails %d checks (exit %d), anchored check named %s, mutation applied %s (fragment occurs %d time in the original)"
+                      % (label, control_passed, ran, mutant_failed, code, named, applied, self.occurrences))
                 self.assertEqual(code, 1, label)
                 self.assertTrue(named, "%s: the anchored text %r is missing" % (label, anchor))
 
