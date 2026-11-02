@@ -1,6 +1,7 @@
 """Ask #1743 (pull request 2): the audit rotation, the rotation record and the two readers across rotations (scenarios S6 S7 S10 S11 S12 S13 S14 S17).
 Temporary directories only. Mutants are copies of a module's text made in memory: each text is asserted to occur once and the mutation to apply."""
 import contextlib
+import datetime as dt
 import gzip
 import hashlib
 import io
@@ -983,6 +984,58 @@ class TestIdempotentAndOwned(Base):
 
 
 # ---- S12: the README ----
+class TestGiveUpAndBadTs(Base):
+    """S32: a give-up leaks no descriptor; a pending dated after now, without ts or with a word for ts is stale."""
+
+    def fds(self):
+        return len(os.listdir("/proc/self/fd"))
+
+    def check_give_ups(self, cw=CW, count=200):
+        self.put(lines(0, 3000, 1500))
+        before = self.fds()
+        for _ in range(count):
+            def replace():   # another rotation replaces the file between the read and the lock
+                tmp = self.audit + ".other"
+                with open(self.audit, "rb") as src, open(tmp, "wb") as dst:
+                    dst.write(src.read())
+                os.replace(tmp, self.audit)
+            self.rotate(cw, _before_lock=replace)
+        after = self.fds()
+        temps = [n for n in os.listdir(self.dir) if n.endswith(".tmp") or n.startswith(".audit.") or n.endswith(".other")]
+        if after != before:
+            raise AssertionError("a descriptor leaked per give-up: %d more descriptors" % (after - before))
+        return before, after, len(temps)
+
+    def test_give_ups(self):
+        before, after, temps = self.check_give_ups()
+        self.assertEqual((before, temps), (after, 0))
+        self.setUp()
+        mutant = load("cw", "        if keep_fd is not None:   # a give-up or a failure closes the file opened for the replacement, once\n",
+                      "        if False:\n")
+        with self.assertRaises(AssertionError) as caught:
+            self.check_give_ups(mutant)
+        self.assertIn("a descriptor leaked per give-up", str(caught.exception))
+        self.leak = str(caught.exception).split(": ")[1]
+        print("S32: the descriptor count is equal before and after 200 give-ups (%d and %d) in the control, %d temporary files; the copy that does not close its file fails 1 of 1 "
+              "with the anchored text (%s), the mutation applied" % (before, after, temps, self.leak))
+
+    def test_bad_ts(self):
+        for label, ts in (("10 minutes after the clock", 1000 + 600), ("missing", None), ("the word x", "x")):
+            with self.subTest(label):
+                self.setUp()
+                self.put(lines(0, 3000, 1500))
+                pend = {"cut": 5, "old_size": 9, "archive": "audit-2020-01-01.jsonl.gz", "new_id": [0, 0]}
+                if ts is not None:
+                    pend["ts"] = ts
+                CW.write_rotation_record(self.audit, {"done": 0, "cuts": [], "pending": pend})
+                CW._complete_pending(self.audit, 1000)
+                record = CW.read_rotation_record(self.audit)
+                self.assertEqual((record["pending"], record["cuts"], record["done"]), (None, [], 0))
+                result, _ = self.rotate(now=dt.datetime.fromtimestamp(1000, dt.timezone.utc))
+                self.assertEqual(CW.read_rotation_record(self.audit)["done"], 1)
+        print("S32: 3 of 3 stale pendings (10 minutes after the clock, missing ts, ts x) cleared with no cut naming them, and the rotation ran after each (done 1)")
+
+
 class TestReadme(unittest.TestCase):
     @staticmethod
     def check(text):
@@ -991,7 +1044,9 @@ class TestReadme(unittest.TestCase):
             raise AssertionError("the audit rotation line is missing")
         section = match.group(0)
         numbers = [n for n in ("4 MiB", "1 MiB", "30 days") if n in section]
-        if len(numbers) != 3 or "rotation record" not in section or "archive" not in section:
+        if len(numbers) != 3 or "rotation record" not in section or "archive" not in section \
+                or "belongs to the rotation whose archive name it carries" not in section \
+                or "older than 120 seconds or dated after now is stale" not in section:
             raise AssertionError("the audit rotation line is incomplete: %d of 3 numbers" % len(numbers))
         return len(numbers)
 
