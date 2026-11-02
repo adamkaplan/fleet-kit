@@ -17,7 +17,7 @@ EXCEPTIONS = []
 
 def imported_names(tree):
     return [(a.asname or (a.name.split(".")[0] if isinstance(x, ast.Import) else a.name))
-            for x in tree.body if isinstance(x, (ast.Import, ast.ImportFrom)) for a in x.names]
+            for x in ast.walk(tree) if isinstance(x, (ast.Import, ast.ImportFrom)) for a in x.names]
 
 
 def check_text(fname, text, exceptions=()):
@@ -67,6 +67,20 @@ class TestFakeModule(unittest.TestCase):
         failures = check_text("fake.py", FAKE, [("fake.py", "json", "")])
         self.assertTrue(any("has no reader" in f for f in failures), failures)
         self.assertEqual(len([f for f in failures if "has no reader" in f]), 1)
+
+
+class TestNestedImports(unittest.TestCase):
+    def test_unused_imports_below_the_top_level_are_reported(self):
+        text = "import os\n\ndef f():\n    import json\n    return os.name\n\ntry:\n    import csv\nexcept ImportError:\n    pass\n"
+        failures = check_text("fake.py", text)
+        self.assertEqual(len(failures), 2, failures)
+        self.assertIn("fake.py", failures[0])
+        self.assertIn("json", failures[0])
+        self.assertIn("fake.py", failures[1])
+        self.assertIn("csv", failures[1])
+        used = ("import os\n\ndef f():\n    import json\n    return os.name, json.dumps, csv.reader\n\n"
+                "try:\n    import csv\nexcept ImportError:\n    pass\nprint(csv.reader)\n")
+        self.assertEqual(check_text("fake.py", used), [])
 
 
 class TestMutant(unittest.TestCase):
