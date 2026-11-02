@@ -50,29 +50,34 @@ class FakeHub:
 
 
 def child(source, code):
-    """Run `code` against a scratch copy of the client held in a child process; returns the exit status."""
+    """Run `code` against a scratch copy of the client held in a child process; returns (exit status, output text)."""
     with tempfile.TemporaryDirectory() as d:
         with open(os.path.join(d, "cloud_client.py"), "w") as f:
             f.write(source)
-        return subprocess.run([sys.executable, "-c", code], cwd=d, capture_output=True, text=True, timeout=60).returncode
+        proc = subprocess.run([sys.executable, "-c", code], cwd=d, capture_output=True, text=True, timeout=60)
+        return proc.returncode, proc.stdout + proc.stderr
 
 
 SCRIPT_S2 = """
 import cloud_client as c, sys
-open('t','w').write('tok')
+with open('t','w') as f: f.write('tok')
 n=[0]; keys=set(); dl=[0]
 def post(r):
     n[0]+=1; keys.add(r['body'].get('key'))
     if n[0] <= 5: return {'status':0,'error':'x'}
     dl[0]+=1; return {'status':200}
 ok,_=c.send('a','b','hi',post,token_path='t',sleep=lambda s: None)
-sys.exit(0 if ok and dl[0]==1 and n[0]==6 and len(keys)==1 else 1)
+good = ok and dl[0]==1 and len(keys)==1
+print('S2 tries %d of 6' % n[0])
+sys.exit(0 if good and n[0]==6 else 1)
 """
 SCRIPT_S3 = """
 import cloud_client as c, sys
-open('t','w').write('tok')
+with open('t','w') as f: f.write('tok')
 ok,line=c.send('a','b','hi',lambda r: {'status':0,'error':'x'},token_path='t',sleep=lambda s: None)
-sys.exit(1 if ok else 0)
+status = 0 if ok else 1
+print('S3 status %d of 1' % status)
+sys.exit(status)
 """
 
 
@@ -109,11 +114,16 @@ class S2Bridged(Base):
         self.assertEqual((hub.deliveries, len(hub.requests), len(set(hub.keys))), (1, 6, 1))
 
     def test_mutant_three_tries_fails_the_scenario(self):
-        src = open(CLIENT).read()
+        with open(CLIENT) as f:
+            src = f.read()
         self.assertEqual(src.count("RETRIES = 6\nMAX_RETRIES = 6"), 1)
         mutant = src.replace("RETRIES = 6\nMAX_RETRIES = 6", "RETRIES = 3\nMAX_RETRIES = 3")
-        self.assertEqual(child(src, SCRIPT_S2), 0)
-        self.assertEqual(child(mutant, SCRIPT_S2), 1)
+        control, mutated = child(src, SCRIPT_S2), child(mutant, SCRIPT_S2)
+        print(control[1].strip(), "| control status", control[0], "|", mutated[1].strip(), "| mutant status", mutated[0])
+        self.assertEqual(control[0], 0)
+        self.assertIn("S2 tries 6 of 6", control[1])
+        self.assertEqual(mutated[0], 1)
+        self.assertIn("S2 tries 3 of 6", mutated[1])
 
 
 class S3Exhausted(Base):
@@ -146,12 +156,17 @@ class S3Exhausted(Base):
         self.assertNotIn("tok-secret", out.getvalue())
 
     def test_mutant_success_after_exhausting_fails_the_scenario(self):
-        src = open(CLIENT).read()
+        with open(CLIENT) as f:
+            src = f.read()
         old = 'return False, "cloud channel unavailable'
         self.assertEqual(src.count(old), 1)
         mutant = src.replace(old, 'return True, "cloud channel unavailable')
-        self.assertEqual(child(src, SCRIPT_S3), 0)
-        self.assertEqual(child(mutant, SCRIPT_S3), 1)
+        control, mutated = child(src, SCRIPT_S3), child(mutant, SCRIPT_S3)
+        print(control[1].strip(), "| control status", control[0], "|", mutated[1].strip(), "| mutant status", mutated[0])
+        self.assertEqual(control[0], 1)
+        self.assertIn("S3 status 1 of 1", control[1])
+        self.assertEqual(mutated[0], 0)
+        self.assertIn("S3 status 0 of 1", mutated[1])
 
 
 class S4Restart(Base):
