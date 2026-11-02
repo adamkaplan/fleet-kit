@@ -393,115 +393,135 @@ SCRUB_OUTPUT_MAX = 2 * SCRUB_INPUT_MAX   # a limit above the input maximum: reda
 MIN_FRAGMENT = 8
 
 
-KNOWN_SET_MUTATORS = ("add", "update", "discard", "remove", "pop", "clear", "__ior__", "__iand__", "__isub__", "__ixor__", "difference_update", "intersection_update", "symmetric_difference_update")
+class KnownSet:
+    """A set of known secret forms. It HOLDS its forms (it is not a set, and no public attribute exposes them), keeps a
+    `version` (bumped AFTER every change of the content, even one that raises half-way, under an RLock the instance owns)
+    and the structure `scrub` built for it (`built`); both are read-only from outside, and `keep` stores a structure only
+    for the version the set has now. A call whose structure is current never reads the set."""
+    __slots__ = ("_forms", "_lock", "_version", "_built", "__weakref__")
+    __hash__ = None
 
+    def __init__(self, forms=()):
+        if getattr(self, "_lock", None) is not None:
+            raise TypeError("a KnownSet is initialised once")
+        self._lock = threading.RLock()
+        self._forms = set(forms)
+        self._version = 0
+        self._built = None
 
-class KnownSet(set):
-    """A set of known secret forms that keeps a `version` (bumped AFTER every change of its content, even when the change
-    raises half-way, and under `lock`, so two threads never lose a bump) and the structure `scrub` built for it (`built`),
-    so a call whose structure is current never reads the set. A subclass may not override a mutating method."""
-    def __init_subclass__(cls, **kw):
-        super().__init_subclass__(**kw)
-        for name in KNOWN_SET_MUTATORS:
-            if name in cls.__dict__:
-                raise TypeError("a KnownSet subclass may not override %s" % name)
+    @property
+    def version(self):
+        return self._version
 
-    def __init__(self, *args):
-        self.lock = threading.RLock()
-        self.version = 0
-        self.built = None
-        super().__init__(*args)
+    @property
+    def built(self):
+        return self._built
+
+    def keep(self, version, built):
+        """Store the structure built for `version`; refused (False) when the set has moved on."""
+        with self._lock:
+            if version != self._version:
+                return False
+            self._built = built
+            return True
+
+    def _change(self, name, *args):
+        with self._lock:
+            try:
+                return getattr(self._forms, name)(*args)
+            finally:
+                self._version += 1  # AFTER the content changed, under the lock
+
+    @staticmethod
+    def _plain(other):
+        return frozenset(other) if isinstance(other, KnownSet) else other
 
     def add(self, *args):
-        with self.lock:
-            try:
-                return set.add(self, *args)
-            finally:
-                self.version += 1
+        return self._change("add", *args)
 
     def update(self, *args):
-        with self.lock:
-            try:
-                return set.update(self, *args)
-            finally:
-                self.version += 1
+        return self._change("update", *[self._plain(a) for a in args])
 
     def discard(self, *args):
-        with self.lock:
-            try:
-                return set.discard(self, *args)
-            finally:
-                self.version += 1
+        return self._change("discard", *args)
 
     def remove(self, *args):
-        with self.lock:
-            try:
-                return set.remove(self, *args)
-            finally:
-                self.version += 1
+        with self._lock:
+            if args and args[0] not in self._forms:
+                raise KeyError(args[0])  # nothing changed: no bump
+            return self._change("remove", *args)
 
     def pop(self, *args):
-        with self.lock:
-            try:
-                return set.pop(self, *args)
-            finally:
-                self.version += 1
+        with self._lock:
+            if not self._forms:
+                raise KeyError("pop from an empty set")  # nothing changed: no bump
+            return self._change("pop", *args)
 
     def clear(self, *args):
-        with self.lock:
-            try:
-                return set.clear(self, *args)
-            finally:
-                self.version += 1
-
-    def __ior__(self, *args):
-        with self.lock:
-            try:
-                return set.__ior__(self, *args)
-            finally:
-                self.version += 1
-
-    def __iand__(self, *args):
-        with self.lock:
-            try:
-                return set.__iand__(self, *args)
-            finally:
-                self.version += 1
-
-    def __isub__(self, *args):
-        with self.lock:
-            try:
-                return set.__isub__(self, *args)
-            finally:
-                self.version += 1
-
-    def __ixor__(self, *args):
-        with self.lock:
-            try:
-                return set.__ixor__(self, *args)
-            finally:
-                self.version += 1
+        return self._change("clear", *args)
 
     def difference_update(self, *args):
-        with self.lock:
-            try:
-                return set.difference_update(self, *args)
-            finally:
-                self.version += 1
+        return self._change("difference_update", *[self._plain(a) for a in args])
 
     def intersection_update(self, *args):
-        with self.lock:
-            try:
-                return set.intersection_update(self, *args)
-            finally:
-                self.version += 1
+        return self._change("intersection_update", *[self._plain(a) for a in args])
 
     def symmetric_difference_update(self, *args):
-        with self.lock:
-            try:
-                return set.symmetric_difference_update(self, *args)
-            finally:
-                self.version += 1
+        return self._change("symmetric_difference_update", *[self._plain(a) for a in args])
+
+    def _inplace(self, name, other):
+        if not isinstance(other, (set, frozenset, KnownSet)):
+            return NotImplemented
+        self._change(name, self._plain(other))
+        return self
+
+    def __ior__(self, other):
+        return self._inplace("__ior__", other)
+
+    def __iand__(self, other):
+        return self._inplace("__iand__", other)
+
+    def __isub__(self, other):
+        return self._inplace("__isub__", other)
+
+    def __ixor__(self, other):
+        return self._inplace("__ixor__", other)
+
+    def __iter__(self):
+        with self._lock:
+            return iter(frozenset(self._forms))  # ONE C-level copy: a set changed during a scrub never raises
+
+    def __len__(self):
+        return len(self._forms)
+
+    def __contains__(self, item):
+        return item in self._forms
+
+    def __bool__(self):
+        return bool(self._forms)
+
+    def __eq__(self, other):
+        if not isinstance(other, (set, frozenset, KnownSet)):
+            return NotImplemented
+        with self._lock:
+            return frozenset(self._forms) == frozenset(other)
+
+    def __ne__(self, other):
+        r = self.__eq__(other)
+        return r if r is NotImplemented else not r
+
+    def __repr__(self):
+        return "KnownSet(%d forms)" % len(self._forms)  # never the forms
+
+    def __reduce__(self):
+        with self._lock:
+            return (KnownSet, (tuple(self._forms),))  # a lock is not picklable: the state is the forms
+
+    def __copy__(self):
+        return KnownSet(self)
+
+    def __deepcopy__(self, memo):
+        return KnownSet(self)
 
 
 _SCRUB_MARK = "[redacted]"
@@ -527,7 +547,7 @@ def _scrub_built(secrets_known):
                         ranks.append(n)
             built = (version if version is not None else snap, order, index)
             if version is not None:
-                secrets_known.built = built  # kept for the version read FIRST
+                secrets_known.keep(version, built)  # kept for the version read FIRST
             else:
                 _SCRUB_SLOT[0] = built
     return built
