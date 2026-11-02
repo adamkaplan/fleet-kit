@@ -65,6 +65,7 @@ class Rig:
 
     def __init__(self, case, alive=0, status=0, busy=False, wait_max=1800, command=None, env=None, table_raises=False, slow_exit=False, slow_read=False, block_write=False):
         self.hs = load_heavy()
+        self.zero = False
         LAST[0] = self   # the kill handler of S14 reads the events of the rig that is running
         self.started = threading.Event()
         self.now = [1000.0]
@@ -95,6 +96,9 @@ class Rig:
 
         def pause(stop, seconds):
             rig.pauses.append(seconds)
+            if seconds < 0.01:   # a tight loop of lines: end the fake child so the run returns and the test can name it
+                rig.zero = True
+                rig.done.set()
             rig.now[0] += seconds
             if rig.now[0] - rig.began[0] > alive:
                 rig.done.set()
@@ -307,6 +311,7 @@ class TestHeavyProgress(unittest.TestCase):
         for value in ("0", "-5", "abc", "", "nan", "inf"):
             rig = Rig(self, alive=1, env={"FLEET_HEAVY_PROGRESS_SECONDS": value})
             read = set(rig.pauses)
+            self.assertFalse(rig.zero, "a zero interval was accepted (value %r)" % value)
             self.assertNotIn(0.0, read, "a zero interval was accepted (value %r)" % value)
             self.assertEqual(read, {60}, "value %r read as %r" % (value, read))
         rig = Rig(self, alive=1, env={"FLEET_HEAVY_PROGRESS_SECONDS": "0.05"})
@@ -332,7 +337,7 @@ class TestHeavyProgress(unittest.TestCase):
                 sys.stderr.write("write entered: %s, released: %s, returned: %s; the lock is shown by the traces above\n" % (rig.entered.is_set(), rig.release.is_set(), getattr(rig.out, "returned", threading.Event()).is_set()))
             sys.stderr.flush()
             os._exit(1)
-        signal.signal(signal.SIGTERM, killed)
+        signal.signal(signal.SIGUSR1, killed)   # run() takes over INT, TERM and HUP: the job's kill notice here is USR1
         before = set(threading.enumerate())
         rig = Rig(self, alive=100, block_write=True, status=4)
         self.assertEqual(rig.status, 4)   # run returned while the write is still blocked
@@ -362,7 +367,7 @@ class TestHeavyProgress(unittest.TestCase):
                     output, _ = child.communicate(timeout=60)   # the outer bound: only the mutant reaches it
                     outcome[kind] = (child.returncode, output, False)
                 except subprocess.TimeoutExpired:
-                    child.terminate()   # the job's kill: the child names the hang
+                    child.send_signal(signal.SIGUSR1)   # the job's kill notice: the child names the hang and ends
                     output, _ = child.communicate(timeout=30)
                     outcome[kind] = (child.returncode, output, True)
         self.assertEqual(outcome["control"][:1] + outcome["control"][2:], (0, False), outcome["control"][1])
