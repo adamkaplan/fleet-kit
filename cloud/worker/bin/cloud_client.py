@@ -11,7 +11,8 @@ Rules:
       characters. It is not kept after the call returns, never printed, never in an error line (a server reason that
       echoes it is redacted).
     - Retries are min(retries, MAX_RETRIES): six tries by default with waits of 0.5, 1, 2, 4 and 8 seconds, a
-      window of RETRY_WINDOW_SECONDS (15.5), so a restart of the hub's pod shorter than that is bridged. Only on transport failure (status 0) and 5xx, with an injected sleep.
+      window of RETRY_WINDOW_SECONDS (15.5), so a restart of the hub's pod shorter than that is bridged.
+      Retries happen only on transport failure (status 0) and 5xx, with an injected sleep.
       Any other status is returned at once as a one-line error. A duplicate (200 with duplicate true) is delivered.
     - A key is made once per message (or given) and reused on every retry, so the channel delivers it once.
     - 401 and 403 are one-line errors that name the status and the channel's reason, with no token.
