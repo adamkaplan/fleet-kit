@@ -125,11 +125,11 @@ def whole_names(pr):
     return {f.get("path") for f in files if isinstance(f, dict)}
 
 
-WHOLE_PAGE_LIMIT = 30   # pages of 100 files of the files endpoint (3,000 files): a pull request with more is not read
+WHOLE_PAGE_LIMIT = 30   # pages of 100 files of the files endpoint (3,000 files); a pull request of more than 3,000 files is refused by fetch_whole through changedFiles, not by the page loop
 
 
 def endpoint_names(pr, repo):
-    """Every filename of the files endpoint of a pull request (each page of 100, at most WHOLE_PAGE_LIMIT pages) as a list, else None when a page cannot be read."""
+    """Every filename of the files endpoint of a pull request (each page of 100, at most WHOLE_PAGE_LIMIT pages) as a list, else None when a page cannot be read. After 30 full pages the names are returned: a pull request of more than 3,000 files is refused by fetch_whole through changedFiles before any call, and a changedFiles that lies is caught by its comparison with the diff's number."""
     base = "repos/%s" % (repo or "{owner}/{repo}")
     names = []
     for page in range(1, WHOLE_PAGE_LIMIT + 1):
@@ -145,7 +145,7 @@ def endpoint_names(pr, repo):
         names += [e["filename"] for e in entries]
         if len(entries) < 100:
             return names
-    return None
+    return names
 
 
 def fetch_whole(pr, repo):

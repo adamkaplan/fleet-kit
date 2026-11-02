@@ -1,5 +1,7 @@
 """#1531: a reader of a changed-file list reads it whole or says it is not (`tools/arch-overlap` and the impact reviewer's role file).
 
+Counts: 6 not whole cases (138, 140, 139 with the 120th wrong, 139 other files, a failed page read, 3,100 files), 2 read whole (139 equal, exactly 3,000),
+1 lying changedFiles (3,000 for 3,100 names) not whole, 20 diff calls, 40 page reads, 5 not whole by number (S10), 4+3+1 mutants of S11/S5/S12 with controls.
 Neutral names (acme-org/widget-api, acme/api#2). HOST is bin/test-switchboard, set by its loader block. Each mutant is the real file with one
 replacement, applied (asserted), caught by an anchored failure text, and its unmutated control passes the same check. No test measures a pull request's size.
 """
@@ -168,10 +170,13 @@ def trust_claims(tool, root):
     listed = plain_names(100)
     truth = plain_names(139, [DAEMON])
 
+    counted = []
+
     def refused(label, names, files=truth, count=139, calls=("7",)):
         done, asked, pages = run_many(tool, root, [cut_pr(7, listed, count)], {7: (names, 0)}, {7: files})
         if done.returncode != 0 or asked != list(calls) or not_whole_numbers(done) != [7] or "#7 edit f" in done.stdout:
             raise AssertionError("%s the answer is used: %r %r" % (label, done.stdout, done.stderr))
+        counted.append(label)
         return pages
 
     refused("TRUSTED an answer of 138 names for a count of 139", plain_names(138, [DAEMON]))
@@ -184,6 +189,17 @@ def trust_claims(tool, root):
     pages = refused("TRUSTED-3100 a pull request of 3,100 files", plain_names(3100, [DAEMON]), files=plain_names(3100, [DAEMON]), count=3100, calls=())
     if len(pages) > 30:
         raise AssertionError("PAGES-3100 %d page reads where at most 30 are allowed" % len(pages))
+    exact = plain_names(3000, [DAEMON])   # exactly 3,000 files: 30 full pages, the diff answers the same names
+    done, calls, pages = run_many(tool, root, [cut_pr(7, listed, 3000)], {7: (exact, 0)}, {7: exact})
+    if done.returncode != 0 or len(pages) != 30:
+        raise AssertionError("PAGES-3000 %d page reads where 30 are expected: %r" % (len(pages), done.stderr))
+    total = len(counted) + len(not_whole_numbers(done))
+    if total != 6 or "#7 edit f" not in done.stdout:
+        raise AssertionError("TRUSTED-3000 %d not whole where 6 expected: a pull request of exactly 3,000 files is read whole: %r" % (total, done.stdout))
+    lie = plain_names(3100, [DAEMON])   # says 3,000, the diff answers 3,100 names
+    done, calls, pages = run_many(tool, root, [cut_pr(7, listed, 3000)], {7: (lie, 0)}, {7: exact})
+    if done.returncode != 0 or not_whole_numbers(done) != [7] or "#7 edit f" in done.stdout:
+        raise AssertionError("LIED a changedFiles of 3,000 for a diff of 3,100 names is read whole: %r %r" % (done.stdout, done.stderr))
     done, calls, pages = run_many(tool, root, [cut_pr(7, listed)], {7: (truth, 0)}, {7: truth})
     if done.returncode != 0 or not_whole_numbers(done) != [] or "#7 edit f" not in done.stdout:
         raise AssertionError("TRUSTED-NOT an answer of 139 names equal as a set to the endpoint's is not read whole: %r %r" % (done.stdout, done.stderr))
@@ -288,7 +304,8 @@ def build():
         def test_s11_fetched_names_that_differ_from_the_files_endpoint_are_not_used(self):
             """NO limit is left: the whole fetched list is compared as a set with every page of the files endpoint (at most 30 pages) and its number with
             changedFiles. 138, 140, 139 with the 120th wrong, 139 other names, a failed page read and a pull request of 3,100 files are `not whole` by number
-            and their names are not used; 139 names equal as a set are whole."""
+            and their names are not used (6 not whole); 139 names equal as a set and exactly 3,000 files (30 full pages) are whole; a changedFiles of 3,000 for a
+            diff of 3,100 names is `not whole`. Four mutants: no comparison, number only, first 100 names only, stop at 30 full pages (7 where 6)."""
             trust_claims(TOOL, self.root)   # the unmutated control
 
         def test_s11_a_tool_that_takes_the_fetched_names_without_comparing_is_caught(self):
@@ -304,6 +321,12 @@ def build():
         def test_s11_a_tool_that_compares_only_the_first_100_names_is_caught(self):
             mutant = self.tool_with("names == set(pages) else None", "sorted(names)[:100] == sorted(pages)[:100] else None")
             with self.assertRaisesRegex(AssertionError, r"^TRUSTED-120TH 139 names"):
+                trust_claims(mutant, self.root)
+
+        def test_s11_a_tool_that_stops_at_30_full_pages_is_caught(self):
+            trust_claims(TOOL, self.root)   # the control first
+            mutant = self.tool_with("            return names\n    return names\n", "            return names\n    return None\n")
+            with self.assertRaisesRegex(AssertionError, r"^TRUSTED-3000 7 not whole where 6 expected"):
                 trust_claims(mutant, self.root)
 
         def test_s12_a_pull_request_not_whole_is_read_from_its_listed_names(self):
