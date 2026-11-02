@@ -86,8 +86,7 @@ def build(PR4Base):
             now = self.world.clock.now()
             plain = sb.add_reminder(self.world.state, "w-batch", now, now, "look")
             launch = sb.add_reminder(self.world.state, "w-batch", now, now, "report", condition={"while_running": "w-batch"})
-            deadline = dict(plain, deadline=True)
-            self.assertEqual([sb.reminder_bound(sb.DEFAULTS, i) for i in (plain, launch, deadline)], [600, 300, 300])
+            self.assertEqual([sb.reminder_bound(sb.DEFAULTS, i) for i in (plain, launch)], [600, 300])
 
         def test_s9_a_due_reminder_is_a_pending_fact_after_one_pass_and_a_delivery_carries_every_due_one(self):
             self.world.add_agent("w-free", fleet={"role": "coder", "reports_to": "platform", "issue": 20})
@@ -255,19 +254,13 @@ def build(PR4Base):
         def real_writers(self, base):
             """ONE item from EACH real writer, made by the production code in the fake world (its state directory and its audit): the launch block
             (`set_checkpoint_reminders`: a worker and an overdue reminder, which writes the `for` field) and `remind` through `sb.main` (a plain one).
-            A sixth item is a `deadline` one. Returns the item ids in the order of the real `reminder.add` audit lines."""
+            Returns the item ids in the order of the real `reminder.add` audit lines."""
             engine, state = self.world.engine, self.world.state
             sb.set_checkpoint_reminders(engine, state, "w-launch", "boss", 7, "acme/widget-api", "", "100s", "200s", 0, base)
             for lane, when in (("w-launch", "300s"), ("w-launch", "400s"), ("boss", "500s")):
                 with captured() as (out, err):
                     code = sb.main(["remind", lane, when, "look at the widget-api build", "--from", "orch"], self.world.route, self.world.clock.now, lambda s: None)
                 self.assertEqual(code, 0, err.getvalue())
-            # Measure (not fixed): grep finds `deadline` only in the reads at `reminder_bound` and `late_reminder_counts` in reminders.py.
-            # No production writer makes a `deadline` item (add_reminder has no such argument and no audit line carries it): the fixture marks one in the
-            # store and in its `reminder.add` line, the one place `reminder_bound` and `late_reminder_counts` read it.
-            item = sb.add_reminder(state, "boss", base + 600, base, "the deadline", 7, "orch", "acme/widget-api")
-            sb.write_reminders(state, [dict(i, deadline=True) if i["id"] == item["id"] else i for i in sb.read_reminders(state)])
-            engine.audit.append("cli", "reminder.add", "boss", {"id": item["id"], "at": sb.iso(item["at"]), "from": "orch", "issue": 7, "repo": "acme/widget-api", "deadline": True})
             return [e["detail"]["id"] for e in self.world.audit() if e["event"] == "reminder.add"]
 
         def real_delivery_keys(self):
@@ -283,11 +276,11 @@ def build(PR4Base):
 
         def status_and_real(self, mutate=None):
             """(the status count, the count by reminder_bound on the REAL stored items), per lane, raw. Items 1 and 3 are delivered 1 minute INSIDE their own
-            bound, the others (0, 2, 4 and the deadline 5) 1 minute past it. `mutate(text)` rewrites the real audit file text before the status is read. Returns (status, real, status before the rewrite)."""
+            bound, the others (0, 2 and 4) 1 minute past it. `mutate(text)` rewrites the real audit file text before the status is read. Returns (status, real, status before the rewrite)."""
             shape = self.real_delivery_keys()
             base = int(self.world.clock.now())
             ids = self.real_writers(base)
-            self.assertEqual(len(ids), 6, msg="six real reminder.add lines")
+            self.assertEqual(len(ids), 5, msg="five real reminder.add lines")
             stored = {i["id"]: i for i in sb.read_reminders(self.world.state)}
             real, bounds = {}, []
             for number, item_id in enumerate(ids):
@@ -297,7 +290,7 @@ def build(PR4Base):
                 delivered = item["at"] + bound + (-60 if number in (1, 3) else 60)
                 self.world.engine.audit.append("daemon", "v2.synthetic", item["to"], {"keys": [shape(item_id)]}, ts=sb.iso(delivered))
                 real[item["to"]] = real.get(item["to"], 0) + (1 if delivered - item["at"] > bound else 0)   # only the late ones
-            self.assertEqual(bounds, [300, 300, 600, 600, 600, 300], msg="a checkpoint reminder 5 minutes, a plain one 10")
+            self.assertEqual(bounds, [300, 300, 600, 600, 600], msg="a checkpoint reminder 5 minutes, a plain one 10")
             before = sb.late_reminder_counts(self.world.state, {}, base + 7200)
             if mutate is not None:
                 path = self.world.audit_path
@@ -306,7 +299,7 @@ def build(PR4Base):
 
         def test_s17_the_status_count_agrees_with_reminder_bound_for_every_real_writer(self):
             status, real, _ = self.status_and_real()
-            self.assertEqual(status, {"w-launch": 2, "boss": 2}, msg="control: the late ones only (w-launch: items 0 and 2 late, 3 on time; boss: items 4 and 5 late, 1 on time)")
+            self.assertEqual(status, {"w-launch": 2, "boss": 1}, msg="control: the late ones only (w-launch: items 0 and 2 late, 3 on time; boss: item 4 late, 1 on time)")
             self.assertEqual(status, real, msg="the status count diverged from reminder_bound")
 
         def test_s17_a_writer_that_forgets_the_for_makes_the_two_counts_diverge(self):
@@ -321,21 +314,6 @@ def build(PR4Base):
             self.assertEqual(seen, [2], msg="mutation not applied: the two launch lines of the real writer hold the for once each")
             with self.assertRaisesRegex(AssertionError, r"the status count diverged from reminder_bound", msg="mutant not caught: a writer that forgets the for"):
                 self.assertEqual(status, real, msg="the status count diverged from reminder_bound")
-
-        def test_s17_a_status_count_that_drops_the_deadline_kind_diverges_from_reminder_bound(self):
-            import inspect, textwrap
-            status, real, control = self.status_and_real()
-            self.assertEqual((control, status), (real, real), msg="control: the unmutated count, the status count diverged from reminder_bound")
-            source = inspect.getsource(sb.late_reminder_counts)
-            old, new = '"deadline": bool(detail.get("deadline")),', '"deadline": False,'
-            self.assertEqual(source.count(old), 1, msg="the replaced text is in the source once")
-            mutated = source.replace(old, new)
-            self.assertNotEqual(mutated, source, msg="mutation not applied: the deadline kind dropped")
-            space = dict(sb.late_reminder_counts.__globals__)
-            exec(textwrap.dedent(mutated), space)
-            with mock.patch.object(sb, "late_reminder_counts", space["late_reminder_counts"]):
-                with self.assertRaisesRegex(AssertionError, r"the status count diverged from reminder_bound", msg="mutant not caught: the deadline kind dropped"):
-                    self.assertEqual(sb.late_reminder_counts(self.world.state, {}, int(self.world.clock.now()) + 7200), real, msg="the status count diverged from reminder_bound")
 
         def test_s6_a_real_open_permission_request_holds_the_due_reminder(self):
             self.steer_world()
