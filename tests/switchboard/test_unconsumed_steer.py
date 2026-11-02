@@ -549,4 +549,97 @@ def build(Base, TestSteerToWorking):
             self.kills("steer_unconsumed", 'isinstance(item.get("id"), str) and ', "", self.scenario_bad_id,
                        "an item with an unhashable id broke the pass")
 
+        # -- the four Lows of a strict read (tests only)
+
+        def add_item(self, name, created, delivery="queue"):
+            sid = self.world.sessions["platform"]
+            item = {"id": "inb_" + name, "sessionID": sid, "type": "synthetic", "text": "x", "resume": True, "delivery": delivery,
+                    "metadata": {"fleet": {"keys": ["send:coder:" + name], "from": "switchboard"}}, "time": {"created": created}}
+            self.world.v2.sessions[sid]["inbox"].append(item)
+            return item
+
+        def scenario_infinite_created(self):
+            self.build({})
+            self.attach_cancel()
+            self.work(lasts=7200, steps=3)
+            self.minutes(60)
+            for name, value in (("ninf", float("-inf")), ("pinf", float("inf")), ("nan", float("nan"))):
+                self.add_item(name, value)
+            engine = self.world.engine
+            try:
+                steered = engine.steer_unconsumed(self.lane(), engine.now())
+            except OverflowError as problem:
+                self.fail("a non-finite created escaped the pass: %r" % problem)
+            self.assertEqual(steered, [], "a non-finite created was steered")
+            self.assertEqual(self.steered_ids(), [], "a non-finite created was steered")
+
+        def test_low1_a_non_finite_created_steers_nothing_and_raises_nothing(self):
+            self.scenario_infinite_created()
+
+        def test_low1_mutant_without_the_finite_check_the_pass_raises(self):
+            self.kills("steer_unconsumed", " and math.isfinite(_created(item))", "",
+                       self.scenario_infinite_created, "a non-finite created escaped the pass")
+
+        def cap_engine_case(self, cap):
+            """501 distinct steered ids and 501 distinct reminder ids on one engine whose cap is `cap`."""
+            import types
+            self.build({})
+            self.attach_cancel()
+            self.work(lasts=7200, steps=3)
+            self.minutes(60)
+            created = self.world.clock.ms(self.world.clock.now() - 3600)
+            for n in range(501):
+                self.add_item("c%03d" % n, created)
+            engine = self.world.engine
+            with mock.patch.object(sb.Switchboard, "UNCONSUMED_CAP", cap):
+                engine.steer_unconsumed(self.lane(), engine.now())
+                self.assertNotIn("inb_c000", engine.unconsumed_seen, "the steered map is not capped at 500")
+                self.assertEqual(len(engine.unconsumed_seen), 500, "the steered map is not capped at 500")
+                now = self.world.clock.now()
+                ids = [sb.add_reminder(self.world.state, "platform", now, now, "r%d" % n, sender="coder", key="K%d" % n)
+                       for n in range(501)]
+                ids = [i["id"] if isinstance(i, dict) else i for i in ids]
+                engine.supersede_queued_reminders(self.lane(), [types.SimpleNamespace(key="reminder:%s" % i) for i in ids])
+                self.assertNotIn("reminder:%s" % ids[0], engine.reminder_memory, "the reminder map is not capped at 500")
+                self.assertEqual(len(engine.reminder_memory), 500, "the reminder map is not capped at 500")
+
+        def test_low2_the_daemon_cap_is_500_after_501_ids_the_oldest_is_gone(self):
+            self.cap_engine_case(sb.Switchboard.UNCONSUMED_CAP)
+
+        def test_low2_mutant_cap_5000_keeps_the_oldest(self):
+            with open(SOURCE, encoding="utf-8") as handle:
+                text = handle.read()
+            old = "    UNCONSUMED_CAP = 500\n"
+            self.assertEqual(text.count(old), 1, "the mutation did not apply")
+            self.assertEqual(sb.Switchboard.UNCONSUMED_CAP, 500, "the control cap is not 500")
+            self.cap_engine_case(sb.Switchboard.UNCONSUMED_CAP)   # control first
+            mutated = int(old.replace("500", "5000").split("=")[1])
+            with self.assertRaises(AssertionError) as caught:
+                self.cap_engine_case(mutated)
+            self.assertIn("is not capped at 500", str(caught.exception))
+
+        def scenario_cached_consumed(self):
+            self.build({"v2_cache_seconds": 120})   # the memory on: the test world has it off
+            self.attach_cancel()
+            self.work(lasts=7200, steps=3)
+            item = self.queue_message("old")
+            self.minutes(60)
+            engine = self.world.engine
+            now = engine.now()
+            self.assertEqual([i["id"] for i in engine.reads.inbox(self.world.sessions["platform"], now)], [item["id"]])   # the cache holds it
+            self.inbox().remove(item)   # the lane consumed it since
+            attempts = []
+            real = engine.v2.inbox_update
+            with mock.patch.object(engine.v2, "inbox_update", lambda *a, **k: attempts.append(a) or real(*a, **k)):
+                steered = engine.steer_unconsumed(self.lane(), now)   # the fake answers 404 for a consumed item: the attempt is what counts
+            self.assertEqual((steered, attempts), ([], []), "a consumed item was steered from the cached inbox")
+
+        def test_low4_a_consumed_item_still_in_the_cache_is_not_steered(self):
+            self.scenario_cached_consumed()
+
+        def test_low4_mutant_without_the_fresh_read_the_consumed_item_is_steered(self):
+            self.kills("steer_unconsumed", "found = stale(self.reads.inbox(observation.session_id, now, fresh=True))",
+                       "found = stale(self.reads.inbox(observation.session_id, now))", self.scenario_cached_consumed,
+                       "a consumed item was steered from the cached inbox")
+
     return TestUnconsumedSteer

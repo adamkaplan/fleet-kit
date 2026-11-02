@@ -122,6 +122,20 @@ class TestUnconsumedRecord(unittest.TestCase):
         self.assertEqual(mutant.read(self.dir, record_json.parse_bounded)[0]["steered"], ["inb_1"])   # the mutation is live
         self.assertEqual(self.read()[0]["steered"], [], "a symlink was followed")
 
+    def sender_case(self, module):
+        self.put(json.dumps({"steered": [], "reminders": {"reminder:a": ["K", 7, None], "reminder:b": ["K", "me", None]}}).encode())
+        data, _ = module.read(self.dir, record_json.parse_bounded)
+        self.assertEqual(list(data["reminders"]), ["reminder:b"], "an entry with a sender that is not a string was kept")
+
+    def test_an_entry_whose_sender_is_not_a_string_is_ignored(self):
+        self.sender_case(rec)
+
+    def test_mutant_without_the_sender_string_check_fails_with_the_anchored_text(self):
+        self.sender_case(self.mutant("CAP = 500\n", "CAP = 500\n"))
+        with self.assertRaises(AssertionError) as caught:
+            self.sender_case(self.mutant(" and isinstance(ident[1], str)", ""))
+        self.assertIn("a sender that is not a string was kept", str(caught.exception))
+
 
 if __name__ == "__main__":
     unittest.main()
