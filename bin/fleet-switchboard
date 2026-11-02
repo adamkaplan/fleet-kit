@@ -9953,6 +9953,7 @@ class SweepState:
         self.s5_skipped = {"draft": 0, "parked": 0}
         self.s5_unchecked = 0    # held pull requests whose gates could not be read this pass: never raised (#986)
         self.details = {}        # (kind, ref) -> the finding's own sentence
+        self.fact_pairs = {}     # #1542: fact key -> the pairs the fact lists, for the delivery re-check
 
 
 def sweep_alarmed_load(engine, state, now, cfg):
@@ -10644,7 +10645,7 @@ def sweep_queue_fact(state, due, now, cfg):
     for pair in due:
         state.alarmed[pair] = now
     state.facts[key] = (summary, now)
-    state.__dict__.setdefault("fact_pairs", {})[key] = list(shown)   # #1542: the pairs the fact lists, for the delivery re-check
+    state.fact_pairs[key] = list(shown)   # #1542: the pairs the fact lists, for the delivery re-check
     for old in [k for k, (_, at) in state.facts.items() if now - at > cfg["realarm_hours"] * 7200]:
         del state.facts[old]
     return set(due)   # every due finding is carried (named, or counted in "+N more") and remembered
@@ -10680,6 +10681,13 @@ class SweepFacts:
     def bind(self, engine):
         self.engine = engine
 
+    def drop_stale(self, keys):   # #1542: a fact dropped at delivery does not come back
+        state = getattr(self.engine, "sweep", None) if self.engine else None
+        for key in keys:
+            if state is not None:
+                state.facts.pop(key, None)
+                state.fact_pairs.pop(key, None)
+
     def __call__(self):
         engine = self.engine
         state = getattr(engine, "sweep", None) if engine else None
@@ -10707,6 +10715,7 @@ class PlanWakeState:
 
     def __init__(self, state_dir):
         self.announced, self.facts, self.unapproved, self.problem = {}, {}, [], None
+        self.newest = {}   # #1542: (repo, number) -> the hash of the newest plan the pass saw, for the delivery re-check
         try:
             raw = json.loads((Path(state_dir) / PLAN_WAKE_FILE).read_text())
             if isinstance(raw, dict) and isinstance(raw.get("announced"), dict):
@@ -10787,7 +10796,7 @@ def plan_wake_pass(engine, state, repos, now, budget=None):
                 continue
             body = plan["body"]
             plan_hash = check_module.plan_hash(body)
-            wake.__dict__.setdefault("newest", {})[(repo, number)] = plan_hash   # #1542: the present hash, for the delivery re-check
+            wake.newest[(repo, number)] = plan_hash   # #1542: the present hash, for the delivery re-check
             if consensus is None:
                 consensus = plan_wake_consensus(engine)
             if (plan_hash in consensus or module.approved_by_comment(plan, plan_hash, by_issue.get(number, []), signed_by_fleet)
@@ -10873,6 +10882,12 @@ class PlanWakeFacts:
             return []
         return [Fact(key, name, "plan", text, created, issue=number, sender="switchboard", repo=repo)
                 for key, (text, created, name, repo, number) in sorted(wake.facts.items())]
+
+    def drop_stale(self, keys):   # #1542: a notice dropped at delivery does not come back
+        wake = getattr(self.engine, "plan_wake", None) if self.engine else None
+        for key in keys:
+            if wake is not None:
+                wake.facts.pop(key, None)
 
     def present_record(self, subject):   # #1542: {"hash"} of the newest plan the plan pass saw on the issue; None when it has not seen one
         wake = getattr(self.engine, "plan_wake", None) if self.engine else None

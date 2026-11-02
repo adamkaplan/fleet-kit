@@ -367,6 +367,7 @@ class TriageState:
         self.batch_waiting = {}  # #921: repo -> how many open issues wait for the batch (their change merged into the integration branch), this pass
         self.reasons = {}        # (rule, ref) -> the worded reason of a finding that carries one (`awaiting-live expired`)
         self.logged, self.woken_logged, self.facts, self.current = set(), set(), {}, {}
+        self.fact_pairs = {}     # #1542: digest key -> the items the digest lists, for the delivery re-check
         self.started, self.day, self.day_counts = 0, None, {}
         self.summarised = None
         self.seen = None         # #349: the stale digest's memory (bin/triage_digest.py), loaded at the first pass
@@ -1275,7 +1276,7 @@ def triage_queue_fact(state, due, now, cfg, other_owner=0, invalid=()):
     for pair in shown:
         state.alarmed[pair] = now
     state.facts[key] = (summary, now)
-    state.__dict__.setdefault("fact_pairs", {})[key] = list(shown)   # #1542: the items the digest lists, for the delivery re-check
+    state.fact_pairs[key] = list(shown)   # #1542: the items the digest lists, for the delivery re-check
     for old in [k for k, (_, at) in state.facts.items() if now - at > cfg["realarm_hours"] * 7200 and "summary" not in k]:
         del state.facts[old]
     state.carried = set(shown)   # #849: what this digest carried and remembered; an overflow beyond the cap stays due
