@@ -292,6 +292,57 @@ def build():
                 with self.assertRaisesRegex(AssertionError, r"^wrote 1 times where 2 were expected"):
                     self.check_restore()
 
+        # -- S12: the Intent section ends at the first of the next heading and the Done-when line
+
+        def source_mutant(self, old, new, check):
+            """The control first (an unmutated SOURCE COPY of bin/issue_line.py passes `check`), then the copy with `old` replaced by `new`
+            (asserted applied exactly once): `check` must fail, and its failure text is the check's own."""
+            source = (REPO_ROOT / "bin" / "issue_line.py").read_text()
+            self.assertEqual(source.count(old), 1, "the mutant is not applied exactly once")
+            real = sb.load_module
+
+            def copy_of(text):
+                module = type(self.module)("issue_line_copy")
+                exec(compile(text, "issue_line_copy.py", "exec"), module.__dict__)
+                return lambda name: module if name == "issue_line" else real(name)
+            with mock.patch.object(sb, "load_module", copy_of(source)):
+                check()
+            self.fresh()
+            self.hook = None
+            mutated = source.replace(old, new)
+            self.assertNotEqual(mutated, source)
+            with mock.patch.object(sb, "load_module", copy_of(mutated)):
+                with self.assertRaises(AssertionError) as caught:
+                    check()
+            return str(caught.exception)
+
+        BODY_A = "Why.\n\n## Intent\nFix it.\n\nDone when: ok.\nNext step (1 Nov): old\n"
+        BODY_B = "Why.\n\n## Intent\nNext: x\nDone when: ok.\n"
+
+        def next_lines(self, body):
+            return [line for line in body.splitlines() if re.match(r"(Next step(\s*\([^)]*\))?|Next)\s*:", line)]
+
+        def check_a(self):
+            self.gh.bodies = {5: self.BODY_A}
+            code, _, err = self.run_it(self.ref, "--next-step", "new")
+            written = self.writes()[0]["body"]
+            kind = self.next_lines(written)
+            if len(kind) != 1:
+                raise AssertionError("S12 found %d lines of the kind Next where 1 was expected" % len(kind))
+            self.assertEqual((code, kind), (0, ["Next: new"]), err)
+
+        def test_s12_a_next_line_after_the_done_when_line_is_replaced_not_duplicated(self):
+            self.check_a()
+
+        def test_s12_a_next_line_inside_the_intent_text_stays_and_the_new_line_is_appended(self):
+            self.gh.bodies = {5: self.BODY_B}
+            code, _, err = self.run_it(self.ref, "--next-step", "new")
+            self.assertEqual((code, self.writes()[0]["body"]), (0, self.BODY_B + "\nNext: new\n"), err)
+
+        def test_s12_a_mutant_whose_intent_section_runs_to_the_end_is_caught_and_the_control_passes(self):
+            text = self.source_mutant(" or DONE_RE.match(lines[m])", "", self.check_a)
+            self.assertRegex(text, r"^S12 found 2 lines of the kind Next where 1 was expected")
+
         # -- S6: bad arguments, before any read
 
         def test_s6_five_bad_arguments_are_refused_with_no_read(self):

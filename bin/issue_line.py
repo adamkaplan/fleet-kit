@@ -78,11 +78,11 @@ def body_problem(body):
 
 
 def _intent_span(lines):
-    """The index range [start, end) of the Intent section (its heading to the next heading), or (0, 0)."""
+    """The index range [start, end) of the Intent section (its heading to the first of the next heading and the `Done when:` line), or (0, 0)."""
     for n, line in enumerate(lines):
         if INTENT_RE.match(line):
             for m in range(n + 1, len(lines)):
-                if HEADING_RE.match(lines[m]):
+                if HEADING_RE.match(lines[m]) or DONE_RE.match(lines[m]):
                     return n, m
             return n, len(lines)
     return 0, 0
