@@ -5847,7 +5847,7 @@ def herdr_live_check(herdr):
 
 def daemon_shows_absent(engine, name, agent):
     """The daemon's dead test (#1884): the registry's reader and evidence, decided by `registry.evidence_shows_absent`, the one function. A row with no pane is not judged."""
-    if not agent.get("pane"):
+    if load_module("registry").no_pane_to_judge(agent):
         return False
     try:
         evidence = load_module("agent_reconcile").evidence_of(agent, herdr_live_check(engine.herdr)(name, agent))
