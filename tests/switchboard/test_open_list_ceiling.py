@@ -39,6 +39,9 @@ class PagedHub:
             if number >= (cap or 5):
                 return out, len(self.open) > len(out)
 
+    def read_open_pages(self, path):
+        return self.read_pages(path, cap=sb.OPEN_LIST_PAGES)
+
     def open_requests(self):
         return [r for r in self.requests if "state=open" in r]
 

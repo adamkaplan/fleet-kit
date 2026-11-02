@@ -9181,6 +9181,13 @@ def publish_decisions(engine):
         triage_pass(engine, decisions, now, errors)  # #130: audits and counts; writes nothing to GitHub; never raises
     except Exception as err:
         engine._note("triage.error", None, {"error": _one_line("%s: %s" % (type(err).__name__, err), 200)})
+    try:   # #1886: the daily alert for a triage read that stopped at the ceiling, from the flag the triage state keeps
+        held = getattr(getattr(engine, "triage", None), "units", None) or {}
+        for (repo, unit), got in sorted(held.items()):
+            if unit == "issues":
+                open_list_alert(engine, repo, got.get("truncated"), now)
+    except Exception as err:
+        engine._note("open_list.error", None, {"error": _one_line("%s: %s" % (type(err).__name__, err), 200)})
     try:
         pr_events_pass(engine, now)   # #354: folds the webhook events into the pr-state picture and writes it, for watched repos too; no GitHub call
     except Exception as err:
@@ -13127,6 +13134,9 @@ class GitHubHub:
         except OSError:
             with self.lock:
                 self._markers_dirty = True  # a cursor that could not be written is written next pass
+
+    def read_open_pages(self, path):
+        return self.read_pages(path, cap=OPEN_LIST_PAGES)
 
     def read_pages(self, path, key=None, timeout=None, older=None, cap=None):
         """One list read, at most GITHUB_PAGE_CAP pages of GITHUB_PAGE_SIZE. Returns (records, truncated). `older`

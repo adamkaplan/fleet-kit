@@ -562,7 +562,7 @@ def triage_read_unit(hub, repo, unit, now, budget):
     TRIAGE_COMMENT_DAYS), closed:<label> (closed issues that still carry a label)."""
     if unit == "issues":
         path = "repos/%s/issues?state=open&per_page=100" % repo
-        records, cut = hub.read_pages(path, cap=OPEN_LIST_PAGES)
+        records, cut = hub.read_open_pages(path)
     elif unit == "merged":   # #384: ONE page of the recently closed pull requests; those with a merge date name the issues they implemented
         records, cut = hub.read_pages("repos/%s/pulls?state=closed&sort=updated&direction=desc&per_page=%d" % (repo, TRIAGE_MERGED_PER_PAGE), cap=1)
     elif unit == "comments":
@@ -599,8 +599,6 @@ def triage_refresh(engine, state, repos, units, now, budget, reserve=1, seconds=
         try:
             records, cut = triage_read_unit(hub, repo, unit, now, budget)
             state.units[(repo, unit)] = {"at": now, "data": records, "truncated": cut, "error": None}
-            if unit == "issues":
-                open_list_alert(engine, repo, cut, now)   # #1886: one named alert a day when the open list stops at the ceiling
             state.unreadable.pop(repo, None)
         except GitHubUnavailable as err:
             budget[0] -= 1
