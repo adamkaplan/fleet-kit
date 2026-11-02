@@ -157,7 +157,7 @@ def main(argv):
     sources = {}
     for path in args:
         if not re.match(r"^(bin|shims)/[^/]+$", path) or ".." in path:
-            print("new-module-demands: %s is not a file directly under bin/" % path)
+            print("new-module-demands: %s is not a file directly under bin/ or shims/" % path)
             return 2
         try:
             with open(os.path.join(root, path), encoding="utf-8") as handle:
