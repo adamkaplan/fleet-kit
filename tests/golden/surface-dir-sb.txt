@@ -1364,6 +1364,7 @@ active_faults
 add_agents_parsers
 add_budget_notice_parsers
 add_charter_parsers
+add_ci_failures_parsers
 add_close_pane_parsers
 add_cloud_clear_parsers
 add_daemon_parsers
@@ -1557,6 +1558,7 @@ cmd_agents_charters
 cmd_bootstrap
 cmd_budget_notice
 cmd_charter
+cmd_ci_failures
 cmd_close_pane
 cmd_cloud_clear
 cmd_comment
