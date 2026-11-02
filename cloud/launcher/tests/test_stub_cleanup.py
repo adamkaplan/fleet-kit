@@ -5,6 +5,8 @@ setUp that raises; the stub server ends by itself (SIGTERM even when the parent 
 of the cloud tests finds every place that starts a child process by its syntax tree, with one case per site and one mutant per site
 (the cleanup removed) that the scan must catch. Offline: loopback only. Children are only ever the ones this file started: never a name pattern.
 
+A thread of a test is started with daemon=True (and joined in the test) or ended in a cleanup: a thread started without it is a site that fails this scan.
+
 THE CLOSED RULE of the scan: a spawning primitive (the subprocess module and its names, os.spawn*/exec*/system/popen/fork, posix_spawn,
 asyncio.create_subprocess_*, threading.Thread, multiprocessing) is a start site when a constant call names it, through import aliases and getattr(module, 'name');
 ANY OTHER REFERENCE to one is itself a site that fails closed: an assignment or class-attribute alias, functools.partial(subprocess.Popen, ..), a primitive passed as

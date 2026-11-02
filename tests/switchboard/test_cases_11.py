@@ -1357,6 +1357,8 @@ class TestBuilderChecklist(unittest.TestCase):
         "i": "and keep new strings and comments clear of the added-lines scans",
         "cloud": "never runs the whole bin/test-switchboard",
         "e": "the pod's git token expires after about an hour and a late open fails",
+        "thread": "starts every test thread as a daemon thread",
+        "scan": "python3 -B cloud/launcher/tests/test_stub_cleanup.py TestEverySite",
     }
     BRIEF = "Every builder brief carries the builder checklist below by default; a brief that leaves an item out says why in one line."
 
