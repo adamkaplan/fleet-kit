@@ -344,7 +344,7 @@ def mint_from_service(target, role):
     repo = target.split("/", 1)[1]
     bearer = caller_token()
     req = urllib.request.Request(url, data=json.dumps({"repo": target, "role": role}).encode(), method="POST",
-                                 headers={"Authorization": "Bearer " + bearer, "Content-Type": "application/json", "Accept": "application/json"})
+                                 headers={"Authorization": "Bearer " + bearer, "X-Caller-Token": "Bearer " + bearer, "Content-Type": "application/json", "Accept": "application/json"})
     del bearer
     try:
         with open_url(req, 60) as r:

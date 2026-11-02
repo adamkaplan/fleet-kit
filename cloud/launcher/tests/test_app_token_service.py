@@ -34,12 +34,14 @@ def answer(perms=PERMS, repo="widget-service", full=REAL, life=3500, token=TOKEN
 class Fake(http.server.BaseHTTPRequestHandler):
     status, body = 201, {}
     seen = []   # (path, Authorization, JSON body) of each POST
+    callers = []   # the X-Caller-Token of each POST
 
     def log_message(self, *a):
         pass
 
     def do_POST(self):
         raw = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        Fake.callers.append(self.headers.get("X-Caller-Token"))
         Fake.seen.append((self.path, self.headers.get("Authorization"), json.loads(raw)))
         out = json.dumps(Fake.body).encode()
         self.send_response(Fake.status)
@@ -84,7 +86,7 @@ class ServiceBranch(unittest.TestCase):
         cls.tmp.cleanup()
 
     def setUp(self):
-        Fake.seen, Fake.status, Fake.body = [], 201, answer()
+        Fake.seen, Fake.callers, Fake.status, Fake.body = [], [], 201, answer()
 
     def run_client(self, args=(REAL,), mint=MINT, url=None, **env):
         e = {k: v for k, v in os.environ.items() if not k.startswith("CW_")}
@@ -101,6 +103,7 @@ class ServiceBranch(unittest.TestCase):
             self.assertNotIn(CALLER, p.stdout + p.stderr)
             path, auth, body = Fake.seen[-1]
             self.assertEqual((path, auth, body["repo"]), ("/mint", "Bearer " + CALLER, REAL))
+            self.assertEqual(Fake.callers[-1], "Bearer " + CALLER)   # S11 (a): the same token in the second header
             self.assertEqual(body["role"], "orchestrator" if len(args) > 1 else "worker")
             self.assertEqual(set(body), {"repo", "role"})
         self.assertFalse(os.path.exists(self.azlog), "the vault was read")

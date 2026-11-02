@@ -104,11 +104,11 @@ class Served(unittest.TestCase):
         self.addCleanup(stop)
         return srv.server_port
 
-    def post(self, port, body, token=OPERATOR, raw=None):
+    def post(self, port, body, token=OPERATOR, raw=None, header="X-Caller-Token"):
         data = raw if raw is not None else json.dumps(body).encode()
         h = {"Content-Type": "application/json"}
         if token:
-            h["Authorization"] = "Bearer " + token
+            h[header] = "Bearer " + token
         c = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
         try:
             c.request("POST", "/mint", data, h)
@@ -158,6 +158,12 @@ class Served(unittest.TestCase):
         self.assertEqual(sum(v[1].count(base.TOKEN) for v in r.values()), 2)
         self.assertEqual(sorted(os.listdir(self.tmp.name)), self.before)
         print("S8: 0 key or token occurrences in %d log lines, the token in 2 answers only, 0 files written" % len(self.log))
+
+    def test_s11_a_request_with_only_authorization_is_refused(self):
+        port = self.serve()
+        self.assertEqual(self.post(port, {"repo": base.REAL, "role": "worker"}, header="Authorization")[0], 401)
+        self.assertEqual(self.post(port, {"repo": base.REAL, "role": "worker"})[0], 200)
+        print("S11 (a): a request with only Authorization is refused 401: 1 of 1")
 
     def test_review_or_github_unavailable_is_502(self):
         def broken(token):

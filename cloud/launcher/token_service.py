@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """token-service: a small HTTP service that mints the GitHub App installation token for the operator account (ask #2002).
 
-POST /mint with the JSON body {"repo": "OWNER/NAME", "role": "worker"|"orchestrator"} and the header Authorization: Bearer <cluster token>.
+POST /mint with the JSON body {"repo": "OWNER/NAME", "role": "worker"|"orchestrator"} and the header X-Caller-Token: Bearer <cluster token> (the API server removes Authorization of a proxied request).
 The caller is REVIEWED (the cluster's TokenReview API): only the account system:serviceaccount:<namespace>:cw-operator is served.
 The repository must be on CW_ALLOWED_REPOS (the launcher's own check), the role in PERMISSIONS_BY_ROLE, the body at most 4096 bytes,
 and the body carries no other key. The answer is GitHub's own: the token, the repositories, the permissions and the expiry.
@@ -89,7 +89,7 @@ def handle(headers, body_length, read_body, review, env=None, mint_fn=None):
     if body_length > MAX_BODY:
         return 413, None, "the body is larger than %d bytes" % MAX_BODY
     raw = read_body(body_length)
-    auth = headers.get("Authorization") or ""
+    auth = headers.get("X-Caller-Token") or ""
     scheme, _, token = auth.partition(" ")
     token = token.strip()
     if scheme != "Bearer" or not token:
