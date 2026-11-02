@@ -34,6 +34,7 @@ OLD = re.compile(P, re.I)
 # The names are stripped before the scan; the copies (exact paths) are skipped whole. The word planted in any other file still fails.
 CHANNEL_NAMES = tuple(P.upper() + x for x in ("_AGENT_NAME", "_BOSS", "_CLOUD_CHANNEL_URL", "_CLOUD_TOKEN_FILE"))
 CHANNEL_NAMES += tuple(P.upper() + x for x in ("_CLOUD_CHANNEL_LISTEN", "_CLOUD_HUB_AGENTS", "_CLOUD_HUB_SECRETS", "_CLOUD_HUB_DECISIONS", "_CLOUD_AGENT_NAMESPACE"))   # the hub manifest's own names
+CHANNEL_NAMES += (P.upper() + "_CLOUD_WORKER_BIN",)   # the launcher lookup's own variable (the moved TestLauncherLookup, #1688)
 CHANNEL_COPIES = ("cloud/worker/bin/cloud_cli.py", "cloud/worker/bin/cloud_client.py", "cloud/worker/bin/cloud_hub.py",
                   "cloud/worker/bin/cloud_channel.py", "cloud/worker/bin/cloud_channel_server.py", "cloud/worker/bin/cloud_relay.py", "cloud/worker/agents/orchestrator.md",
                   "cloud/worker/tests/golden/orchestrator.md")

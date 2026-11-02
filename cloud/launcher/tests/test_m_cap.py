@@ -176,6 +176,8 @@ class TestScratch(unittest.TestCase):
         os.makedirs(os.path.join(d, "cloud", "launcher", "tests"), exist_ok=True)
         shutil.copy(__file__, os.path.join(d, "cloud", "launcher", "tests"))
         shutil.copy(ROOT / "cloud" / "launcher" / "tests" / "fake_opencode_export.sh", os.path.join(d, "cloud", "launcher", "tests"))
+        shutil.copy(ROOT / "cloud" / "launcher" / "tests" / "cw_cases_lookup.py", os.path.join(d, "cloud", "launcher", "tests"))
+        shutil.copy(ROOT / "cloud" / "launcher" / "tests" / "cw_cases_vault.py", os.path.join(d, "cloud", "launcher", "tests"))
         Path(d, "bin", "cloud_worker.py").write_text(src)
         env = dict(os.environ, TMPDIR=d)
         if old:

@@ -45,10 +45,16 @@ def strip_question(cfg):
     return c
 
 
+def _merge_base(ref):
+    r = subprocess.run(["git", "merge-base", "HEAD", ref], cwd=ROOT, capture_output=True)
+    out = r.stdout.decode().strip() if r.returncode == 0 else ""
+    return out or ref
+
+
 def base_file(rel, mode="text"):
     """The base commit's copy of a file through git (origin/integration, else origin/main); (ref, content) or (None, None)."""
     for ref in ("origin/integration", "origin/main"):
-        r = subprocess.run(["git", "show", ref + ":" + rel], cwd=ROOT, capture_output=True)
+        r = subprocess.run(["git", "show", _merge_base(ref) + ":" + rel], cwd=ROOT, capture_output=True)
         if r.returncode == 0:
             return ref, r.stdout
     return None, None
