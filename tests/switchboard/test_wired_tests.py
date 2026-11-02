@@ -358,7 +358,8 @@ class TestWiredCheckPlanted(unittest.TestCase):
         self.assertIn("TestSub", out[0])
         self.assertIn("class TestSub ", out[1])
         chain = self.lone(CHAIN)
-        self.assertEqual(len(class_problems(chain, "from test_planted import Leaf\n", {})), 0)
+        bound_leaf = class_problems(chain, "from test_planted import Leaf\n", {})
+        self.assertEqual(len(bound_leaf), 0, bound_leaf)
         out = class_problems(chain, "import test_planted\n", {})
         self.assertEqual(len(out), 3, out)
 
@@ -476,6 +477,12 @@ class TestMutantIsCaught(unittest.TestCase):
         got = self.mutant_run("test_s9_a_bound_subclass_hides_its_base_and_an_unbound_one_is_reported_with_it", S9_ORIGINAL, S9_MUTATED)
         self.assertEqual(got, "AssertionError: 1 != 2 : ['test_planted.py: class TestSub is not bound at module level by bin/test-switchboard']")
 
+    def test_s9_the_direct_only_base_mutant_fails_the_chain_case_with_its_text(self):
+        # the second S9 mutant: a base is hidden only by a DIRECT bound subclass, never through a chain
+        name = "test_s9_a_bound_subclass_hides_its_base_and_an_unbound_one_is_reported_with_it"
+        got = self.mutant_run(name, S9_DIRECT_ORIGINAL, S9_DIRECT_MUTATED)
+        self.assertEqual(got, "AssertionError: 1 != 0 : ['test_planted.py: class Base is not bound at module level by bin/test-switchboard (subclasses: Leaf, Mid)']")
+
     def test_s10_the_skip_stale_keys_mutant_fails_with_its_text(self):
         got = self.mutant_run("test_s10_stale_exemption_keys_are_reported_by_name", S10_ORIGINAL, S10_MUTATED)
         self.assertEqual(got, "AssertionError: 0 != 3 : []")
@@ -500,6 +507,8 @@ CLASS_RULE_MUTATED = "        for cls in sorted(set() if classes & " + "bound.ge
 TWO_CLASSES = "import unittest\n\nclass TestA(unittest.TestCase):\n    def test_a(self):\n        pass\n\nclass TestB(unittest.TestCase):\n    def test_b(self):\n        pass\n"
 BASE_AND_SUB = "import unittest\n\nclass Base(unittest.TestCase):\n    def test_a(self):\n        pass\n\nclass TestSub(Base):\n    def test_b(self):\n        pass\n"
 S9_ORIGINAL = "        for cls in sorted(classes - " + "bound.get(mod, set()) - hidden):"
+S9_DIRECT_ORIGINAL = "                    hidden.add(parent)\n                    todo.extend(parents.get(parent, []))\n        for cls in sorted("
+S9_DIRECT_MUTATED = "                    hidden.add(parent)\n        for cls in sorted("
 S9_MUTATED = "        for cls in sorted(classes - " + "bound.get(mod, set()) - {b for v in parents.values() for b in v}):"
 S10_ORIGINAL = "        if stale_" + "key(tests_dir, key):"
 S10_MUTATED = "        if False and stale_" + "key(tests_dir, key):"
