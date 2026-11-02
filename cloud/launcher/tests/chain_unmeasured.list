@@ -1,3 +1,4 @@
+cloud/launcher/tests/test_audit_step_seconds.py
 cloud/launcher/tests/test_cloud_quick_budget.py
 cloud/launcher/tests/test_end_hook_nothing_to_push.py
 cloud/launcher/tests/test_fixture_root.py
@@ -16,4 +17,3 @@ cloud/launcher/tests/test_stop_no_checkout.py
 cloud/launcher/tests/test_token_at_limit.py
 cloud/worker/tests/test_base_merge_base.py
 cloud/worker/tests/test_cloud_prepush_background.py
-cloud/launcher/tests/test_audit_step_seconds.py
