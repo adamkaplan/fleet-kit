@@ -67277,6 +67277,21 @@ TestTheBinSetClassesAreAllInTheTable = _bin_set_table.TestTheBinSetClassesAreAll
 _steer_long = importlib.import_module("test_steer_long_turn")
 TestSteerLongTurn = _steer_long.build(Base, TestSteerToWorking)
 TestGhShimSignInput = importlib.import_module("test_gh_shim_sign_input").TestGhShimSignInput
+TestGhShimEffectRule = importlib.import_module("test_gh_shim_sign_input").TestGhShimEffectRule
+TestGhShimMutationRoots = importlib.import_module("test_gh_shim_sign_input").TestGhShimMutationRoots
+TestGhShimRawPath = importlib.import_module("test_gh_shim_sign_input").TestGhShimRawPath
+TestGhShimRound5 = importlib.import_module("test_gh_shim_sign_input").TestGhShimRound5
+TestGhShimArgvParser = importlib.import_module("test_gh_shim_sign_input").TestGhShimArgvParser
+TestApiReadersAreViews = importlib.import_module("test_gh_shim_sign_input").TestApiReadersAreViews
+TestGhHoldIsAView = importlib.import_module("test_gh_shim_sign_input").TestGhHoldIsAView
+TestGhShimNestedAndQueryBodies = importlib.import_module("test_gh_shim_sign_input").TestGhShimNestedAndQueryBodies
+TestGhShimEncodedQueryAndLabelDelete = importlib.import_module("test_gh_shim_sign_input").TestGhShimEncodedQueryAndLabelDelete
+TestGhShimDeepBodiesAndInputForms = importlib.import_module("test_gh_shim_sign_input").TestGhShimDeepBodiesAndInputForms
+TestGhShimBodyFieldBesideInput = importlib.import_module("test_gh_shim_sign_input").TestGhShimBodyFieldBesideInput
+TestGhShimBracketBodyKeys = importlib.import_module("test_gh_shim_sign_input").TestGhShimBracketBodyKeys
+TestGhShimAllowlist = importlib.import_module("test_gh_shim_sign_input").TestGhShimAllowlist
+TestGhShimBodyFieldKeyIsExact = importlib.import_module("test_gh_shim_sign_input").TestGhShimBodyFieldKeyIsExact
+TestGhShimMethodFlagBeforeApi = importlib.import_module("test_gh_shim_sign_input").TestGhShimMethodFlagBeforeApi
 _hc = importlib.import_module("test_header_cache"); TestAges, TestSets, TestEvents, TestSafety, TestReplay, TestIsolation, TestDropNeverBlocksAWrite, TestApprovalReadsFresh, TestDocs = _hc.TestAges, _hc.TestSets, _hc.TestEvents, _hc.TestSafety, _hc.TestReplay, _hc.TestIsolation, _hc.TestDropNeverBlocksAWrite, _hc.TestApprovalReadsFresh, _hc.TestDocs
 TestReminderTtlMore = importlib.import_module("test_reminder_ttl").build(PR4Base)
 # The load figure counts cloud workers as busy (#1487).
