@@ -825,6 +825,7 @@ VALUE_FLAGS = {"-b", "--body", "-F", "--body-file", "-t", "--title", "-l", "--la
                "-r", "--reviewer", "-B", "--base", "-H", "--head", "-q", "--jq", "--json", "--template", "-s", "--state",
                "-S", "--search", "-L", "--limit", "--author", "--app", "--add-label", "--remove-label", "--add-assignee", "--remove-assignee",
                "--add-reviewer", "--remove-reviewer", "--add-project", "--remove-project", "--reason"}
+VALUE_FLAGS = VALUE_FLAGS | {"--drop-line"}   # #1895: the shim's own option takes a value
 TARGET_VERBS = {"view", "comment", "edit", "close", "reopen", "ready", "checks", "diff", "lock", "unlock", "status"}
 
 
@@ -2657,6 +2658,7 @@ VALUE_FLAGS = {"-R", "--repo", "--hostname", "-b", "--body", "-F", "--body-file"
                "-B", "--base", "-H", "--head", "--header", "--assignee", "--label", "--milestone", "--project", "--reviewer",
                "-q", "--jq", "--json", "-X", "--method", "-f", "--field", "--raw-field", "--input", "--cache", "--preview", "--state", "-S", "--search",
                "-L", "--limit", "--template"}
+VALUE_FLAGS = VALUE_FLAGS | {"--drop-line"}   # #1895: the shim's own option takes a value
 PR_VERBS = {"checkout", "checks", "close", "comment", "create", "diff", "edit", "list", "lock", "ready", "reopen", "review", "status", "unlock",
             "update-branch", "view", "revert", "merge", "help"}
 
@@ -3023,6 +3025,49 @@ def drop_plan_temp(plan):
             pass
 
 
+DROP_FLAG = "--drop-line"
+DROP_KEY_RE = re.compile(r"^[A-Z][A-Z0-9]*(-[A-Z0-9]+)*:$")
+
+
+def body_write_kind(args):
+    """"pr-edit", "api-patch" or None: the two shapes `--drop-line` is valid for (the verb words may have -R flags between them)."""
+    words = command_words(args)
+    if words[:2] == ["pr", "edit"]:
+        return "pr-edit"
+    if words[:1] == ["api"]:
+        try:
+            return "api-patch" if api_parsed(args).method == "PATCH" else None
+        except Refused:
+            return None
+    return None
+
+
+def take_drop_line(args):
+    """(args without --drop-line KEY, keys, refusal or None): the shim's own option, stripped like --over-review."""
+    out, keys, i, bad = [], [], 0, None
+    while i < len(args):
+        arg = args[i]
+        if arg == "--":
+            out.extend(args[i:])
+            break
+        if arg == DROP_FLAG or arg.startswith(DROP_FLAG + "="):
+            if arg == DROP_FLAG:
+                value = args[i + 1] if i + 1 < len(args) else ""
+                i += 2
+            else:
+                value, i = arg.split("=", 1)[1], i + 1
+            if not DROP_KEY_RE.match(value):
+                bad = bad or "%s takes an all-capitals key with its colon (for example MERGE:), not %r" % (DROP_FLAG, _clean_reason(value, 40))
+            else:
+                keys.append(value)
+            continue
+        out.append(arg)
+        i += 1
+    if (keys or bad) and not bad and body_write_kind(out) is None:
+        bad = "%s is valid only for gh pr edit and gh api PATCH of a pull request body" % DROP_FLAG
+    return out, keys, bad
+
+
 class BodyRefusal(Exception):
     pass
 
@@ -3179,6 +3224,10 @@ def body_probe(args, lookup, gh, dropped=()):
         said = guard.check(data.get("body") or "", text, dropped)
         if said:
             return said, plan
+        gone = [k for k in guard.keys_of(data.get("body") or "") if k in dropped and k not in guard.keys_of(text)]
+        for key in gone:   # a deliberate removal is audited BEFORE it passes; one that cannot be audited is not made
+            if not gate_spool("body.drop", repo, number, key, "key=%s repo=%s number=%d caller=%s" % (key, repo, number, my_name(lookup))):
+                return "the drop of %s could not be audited (the audit log cannot be written), so nothing was written" % key, plan
         return None, plan
     except Exception:
         return "the old body could not be read (unexpected error), so the new one cannot be checked and nothing was written", plan
@@ -3193,6 +3242,10 @@ def run(args):
     warn_shared_body_file(args)
     args = canonical_pr_merge(args)   # THE one parse of the call shape: every probe below (hold, review, plan gate, merge gate) reads the same canonical `pr merge` (#962)
     args, over_found, over_reason = take_over_review(args)   # the shim's own flag never reaches gh or the signing
+    args, drop_keys, drop_bad = take_drop_line(args)   # #1895: the shim's own --drop-line never reaches gh or the signing
+    if drop_bad:
+        sys.stderr.write("gh: refused: %s\n" % drop_bad)
+        return 1
     write = is_write(args)
     lookup = Lookup(write=write)   # one identity lookup, one deadline, for the name and the account together
     scope = read_scope(args, lookup, write)   # a worker with a read-only extra repository (#618): refused here, or told which repository to read as
@@ -3213,7 +3266,7 @@ def run(args):
         audit_write(args, lookup, "refused", write, hold_repo, hold_number)
         return 1
     if plan is None:
-        said, plan = body_probe(args, lookup, gh)   # a pull request body written over an old one (#1895)
+        said, plan = body_probe(args, lookup, gh, drop_keys)   # a pull request body written over an old one (#1895)
         if said:
             sys.stderr.write("gh: refused: %s\n" % _clean_reason(said, 400))
             audit_write(args, lookup, "refused", write, hold_repo, hold_number)
