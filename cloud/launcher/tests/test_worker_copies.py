@@ -3,9 +3,11 @@ import ast
 import importlib.machinery
 import importlib.util
 import io
+import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -240,6 +242,184 @@ class Strict(unittest.TestCase):
         mutated = original.replace("not-in-the-text", "x")
         with self.assertRaises(AssertionError):
             self.assertNotEqual(mutated, original, "the mutation was not applied")
+
+
+TREE = ("tools", "bin", "cloud", "agents", "tests", "docs")
+THREE = {
+    "cloud/launcher/tests/test_orchestrator_agent.py": (["cloud/launcher/tests", "test_orchestrator_agent.Drift"],
+                                                        [("self.assertIsNone(drift(ROOT, source, copy))", "pass")]),
+    "bin/test-cloud-hub": (["bin/test-cloud-hub", "-k", "test_worker_copies_match_bin"],
+                           [("self.assertEqual((BIN / name).read_text(), (BIN.parent / copy).read_text(), name)", "pass")]),
+    "tests/switchboard/test_relay_loop_cadence.py": (["tests/switchboard", "test_relay_loop_cadence.HubFilesUnchanged"],
+                                                     [("self.assertEqual((BIN.parent / copy).read_bytes(), (BIN.parent / source).read_bytes())", "pass"),
+                                                      ("self.assertEqual(other.read_bytes(), (BIN / other.name).read_bytes(), other.name)", "pass")]),
+}
+
+
+def big_scratch(test):
+    d = tempfile.mkdtemp(prefix="wc-big-")
+    test.addCleanup(shutil.rmtree, d, True)
+    for top in TREE:
+        shutil.copytree(os.path.join(ROOT, top), os.path.join(d, top), ignore=shutil.ignore_patterns("__pycache__", ".git"))
+    return d
+
+
+def run_comparing(d, rel):
+    where, arg = THREE[rel][0][0], THREE[rel][0][1:]
+    if rel == "bin/test-cloud-hub":
+        cmd = [sys.executable, "-B", os.path.join(d, rel)] + arg
+        cwd = d
+    else:
+        cmd = [sys.executable, "-B", "-m", "unittest"] + arg
+        cwd = os.path.join(d, where)
+    env = {k: v for k, v in os.environ.items() if k in ("PATH", "HOME", "LANG", "TMPDIR")}
+    r = subprocess.run(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=90)
+    return r.returncode, r.stdout.decode(errors="replace")
+
+
+def check_fails_on_drift(d, rel):
+    status, out = run_comparing(d, rel)
+    if status == 0:
+        raise AssertionError("a comparing test did not fail on a drifted copy: " + rel)
+    return out
+
+
+def drift_every_copy(d):
+    for _, copy in rows(d):
+        with open(os.path.join(d, copy), "ab") as f:
+            f.write(b"\n")
+
+
+def mutate_file(d, rel, test):
+    path = os.path.join(d, rel)
+    original = slurp(rel, d).decode()
+    mutated = original
+    for old, new in THREE[rel][1]:
+        test.assertEqual(original.count(old), 1)
+        mutated = mutated.replace(old, new)
+        test.assertIn(old, original)
+        test.assertNotIn(old, mutated)
+    test.assertNotEqual(mutated, original, "the mutation was not applied")
+    with open(path, "w") as f:
+        f.write(mutated)
+    return original
+
+
+def matrix_strings(node):
+    if isinstance(node, str):
+        yield node
+    elif isinstance(node, dict):
+        for k, v in node.items():
+            yield from matrix_strings(k)
+            yield from matrix_strings(v)
+    elif isinstance(node, list):
+        for v in node:
+            yield from matrix_strings(v)
+
+
+def check_matrix(matrix_text, table_rows):
+    copies = {c for _, c in table_rows}
+    named = sorted(p for p in matrix_strings(json.loads(matrix_text)) if p.startswith("cloud/worker/bin/") or p in copies)
+    for path in named:
+        if path not in copies:
+            raise AssertionError("the matrix names a copy that is not in the table: " + path)
+    return named, len(copies - set(named))
+
+
+def allowed_copy(text):
+    for node in ast.walk(ast.parse(text)):
+        if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "ALLOWED_COPY" for t in node.targets):
+            return sorted(ast.literal_eval(node.value))
+    raise AssertionError("ALLOWED_COPY is not in the file")
+
+
+def check_allowed(text, table_rows):
+    copies = {c for _, c in table_rows}
+    entries = allowed_copy(text)
+    for path in entries:
+        if path not in copies:
+            raise AssertionError("an allowed carrier is not a copy in the table: " + path)
+    return entries
+
+
+class Comparing(unittest.TestCase):
+    def test_s9_the_three_tests_fail_on_a_drifted_copy_and_pass_after_the_command(self):
+        d = big_scratch(self)
+        for rel in THREE:
+            self.assertEqual(run_comparing(d, rel)[0], 0, rel)   # the control: undrifted passes
+        drift_every_copy(d)
+        names = {os.path.basename(c) for _, c in rows(d)}
+        for rel in THREE:
+            with self.subTest(test=rel):
+                out = check_fails_on_drift(d, rel)
+                self.assertTrue(any(n in out for n in names | {os.path.basename(rel)}), "the failure names no pair or file: " + rel)
+        status, out = run_in(d)
+        self.assertEqual(status, 0)
+        for rel in THREE:
+            with self.subTest(after=rel):
+                self.assertEqual(run_comparing(d, rel)[0], 0, rel)
+
+    def test_s9_a_test_whose_comparison_is_pass_is_caught(self):
+        d = big_scratch(self)
+        drift_every_copy(d)
+        for rel in THREE:
+            check_fails_on_drift(d, rel)   # the control first, for each
+        for rel in THREE:
+            with self.subTest(test=rel):
+                original = mutate_file(d, rel, self)
+                try:
+                    with self.assertRaisesRegex(AssertionError, "a comparing test did not fail on a drifted copy: " + re.escape(rel)):
+                        check_fails_on_drift(d, rel)
+                finally:
+                    with open(os.path.join(d, rel), "w") as f:
+                        f.write(original)
+
+    def test_s9_a_no_op_mutation_fails_the_computation(self):
+        original = slurp("bin/test-cloud-hub").decode()
+        mutated = original.replace("not-in-the-text", "x")
+        with self.assertRaises(AssertionError):
+            self.assertNotEqual(mutated, original, "the mutation was not applied")
+
+    def test_s10_the_matrix_names_only_copies_of_the_table(self):
+        named, unnamed = check_matrix(slurp("docs/review-laws/impact-matrix.json").decode(), rows())
+        print("S10 matrix paths:", named, "rows:", [r for r in rows() if r[1] in named], "copies not named:", unnamed)
+        self.assertEqual(len(named), 2)
+
+    def test_s10_a_table_without_the_relay_row_is_caught(self):
+        text = slurp("docs/review-laws/impact-matrix.json").decode()
+        table = slurp(TABLE).decode()
+        row = "bin/cloud_relay.py\tcloud/worker/bin/cloud_relay.py\n"
+        self.assertEqual(table.count(row), 1)
+        mutated = table.replace(row, "")
+        self.assertNotEqual(mutated, table, "the mutation was not applied")
+        self.assertIn(row, table)
+        self.assertNotIn(row, mutated)
+        check_matrix(text, rows())   # the control first
+        with self.assertRaisesRegex(AssertionError, "the matrix names a copy that is not in the table: cloud/worker/bin/cloud_relay.py"):
+            check_matrix(text, [tuple(l.split("\t")) for l in mutated.splitlines() if l])
+
+    def test_s11_the_allowlist_entries_are_rows(self):
+        text = slurp("cloud/launcher/tests/test_cw_names.py").decode()
+        entries = check_allowed(text, rows())
+        print("S11 allowlist:", entries, "rows:", [r for r in rows() if r[1] in entries])
+        self.assertEqual(len(entries), 1)
+
+    def test_s11_one_more_entry_is_caught(self):
+        text = slurp("cloud/launcher/tests/test_cw_names.py").decode()
+        old = 'ALLOWED_COPY = {"cloud/worker/plan_check.py"}'
+        self.assertEqual(text.count(old), 1)
+        mutated = text.replace(old, 'ALLOWED_COPY = {"cloud/worker/plan_check.py", "cloud/worker/not_a_copy.py"}')
+        self.assertNotEqual(mutated, text, "the mutation was not applied")
+        self.assertIn(old, text)
+        self.assertNotIn(old, mutated)
+        check_allowed(text, rows())   # the control first
+        with self.assertRaisesRegex(AssertionError, "an allowed carrier is not a copy in the table: cloud/worker/not_a_copy.py"):
+            check_allowed(mutated, rows())
+
+    def test_s11_a_no_op_mutation_fails_the_computation(self):
+        text = slurp("cloud/launcher/tests/test_cw_names.py").decode()
+        with self.assertRaises(AssertionError):
+            self.assertNotEqual(text.replace("not-in-the-text", "x"), text, "the mutation was not applied")
 
 
 class Safe(unittest.TestCase):
