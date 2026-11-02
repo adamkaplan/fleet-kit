@@ -201,6 +201,65 @@ def build(PR4Base):
                 with self.assertRaisesRegex(AssertionError, r"^0 != 50 : \(a\) reminders delivered of 50", msg="mutant not caught: dropping all but the first"):
                     self.assertEqual(self.run_fifty("s-fifty2")[0], 50, msg="(a) reminders delivered of 50")
 
+        def add_row(self, item, which, base):
+            """The `reminder.add` audit line exactly as the real writer makes it: the launch block adds "for", cmd_remind adds none."""
+            detail = {"id": item["id"], "at": sb.iso(item["at"]), "from": item.get("from"), "issue": item.get("issue"), "repo": item.get("repo")}
+            if which:
+                detail["for"] = "checkpoint-" + which
+            return {"ts": sb.iso(base), "event": "reminder.add", "subject": item["to"], "detail": detail}
+
+        def writers_store(self, base):
+            """ONE item from EACH real writer, through the real add_reminder, read back from the store: [(item, which)]."""
+            import tempfile
+            tmp = tempfile.TemporaryDirectory()
+            self.addCleanup(tmp.cleanup)
+            state = sb.ensure_state_dir(tmp.name)
+            plain = lambda to, at, condition=None: sb.add_reminder(state, to, at, base, "look at the widget-api build", 7, "orch", "acme/widget-api", condition=condition)
+            made = [(sb.add_reminder(state, "w-launch", base + 100, base, "report", 7, "boss", "acme/widget-api", condition={"while_running": "w-launch"}), "worker"),
+                    (sb.add_reminder(state, "boss", base + 200, base, "overdue", 7, "w-launch", "acme/widget-api", condition={"unless_report_from": "w-launch", "since": base}), "overdue"),
+                    (plain("w-launch", base + 300), None),
+                    (plain("w-launch", base + 400, {"until_closed": "acme/widget-api#7"}), None),
+                    (plain("boss", base + 500, {"until_merged": "acme/widget-api#8"}), None)]
+            stored = {i["id"]: i for i in sb.read_reminders(state)}
+            return [(stored[i["id"]], which) for i, which in made]
+
+        def status_and_real(self, add_row, base=1_800_000_000):
+            """(the status count, the count by reminder_bound on the REAL stored items), per lane, raw. Each reminder is delivered 1 minute past its own bound."""
+            import json
+            items, rows, real = self.writers_store(base), [], {}
+            for item, which in items:
+                bound = sb.reminder_bound({}, item)
+                self.assertEqual(bound, 300 if which else (300 if "while_running" in item.get("condition", {}) else 600))   # a checkpoint kind 5 minutes, the others 10
+                rows.append(add_row(self, item, which, base))
+                delivered = item["at"] + bound + 60
+                rows.append({"ts": sb.iso(delivered), "event": "v2.synthetic", "subject": item["to"], "detail": {"keys": ["reminder:" + item["id"]]}})
+                real[item["to"]] = real.get(item["to"], 0) + (1 if delivered - item["at"] > bound else 0)
+            import tempfile
+            with tempfile.TemporaryDirectory() as tmp:
+                with open(tmp + "/audit.jsonl", "w") as handle:
+                    handle.write("\n".join(json.dumps(r) for r in rows) + "\n")
+                return sb.late_reminder_counts(tmp, {}, base + 7200), real
+
+        def test_s17_the_status_count_agrees_with_reminder_bound_for_every_real_writer(self):
+            status, real = self.status_and_real(type(self).add_row)
+            self.assertEqual(status, {"w-launch": 3, "boss": 2}, msg="control: the expected lanes")
+            self.assertEqual(status, real, msg="the status count diverged from reminder_bound")
+
+        def test_s17_a_writer_that_forgets_the_for_makes_the_two_counts_diverge(self):
+            import inspect, textwrap
+            status, real = self.status_and_real(type(self).add_row)
+            self.assertEqual(status, real, msg="control: the unmutated writer, the status count diverged from reminder_bound")
+            source = inspect.getsource(type(self).add_row)
+            old, new = 'detail["for"] = "checkpoint-" + which', 'detail["why"] = "checkpoint-" + which'
+            self.assertEqual(source.count(old), 1, msg="the replaced text is in the source once")
+            mutated = source.replace(old, new)
+            self.assertNotEqual(mutated, source, msg="mutation not applied: a writer that forgets the for")
+            space = {"sb": sb}
+            exec(textwrap.dedent(mutated), space)
+            status, real = self.status_and_real(space["add_row"])
+            with self.assertRaisesRegex(AssertionError, r"the status count diverged from reminder_bound", msg="mutant not caught: a writer that forgets the for"):
+                self.assertEqual(status, real, msg="the status count diverged from reminder_bound")
+
         def test_s6_a_real_open_permission_request_holds_the_due_reminder(self):
             self.steer_world()
             self.world.herdr.panes[self.world.panes["s-long"]]["status"] = "blocked"
