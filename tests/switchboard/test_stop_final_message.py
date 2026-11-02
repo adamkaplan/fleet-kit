@@ -4,6 +4,8 @@ A fake audit file, fake run record directories, a recording send and a temporary
 import argparse
 import json
 import os
+import random
+import re
 import shutil
 import stat
 import subprocess
@@ -685,6 +687,59 @@ class TestStopFinalMessageBare(unittest.TestCase):
                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True, timeout=600)
         self.assertEqual(done.returncode, 1, "mutant of U21: %s" % done.stdout)
         self.assertIn("the host scan is not linear", done.stdout)
+
+    U22_OLD = re.compile(r"(?:https?://)?worker-[a-z0-9-]+\.[a-z0-9.-]+(:[0-9]+)?", re.I)   # the old host pattern, the oracle (ask #1788 PC-12)
+    U22_FIXED = ("worker-b.1.:123456", "worker-b.x-1:4096409623", "worker-ab.b.:40964096409623worker-http://1",
+                 "worker-" + "a" * 70 + ".example.internal", "worker-a." + "b" * 300)
+    U22_PIECES = ("worker-", "Worker-", "WORKER-", "http://", "https://", "HTTP://", ".", ".", "a", "b", "x-1", "0", "1", "123456", "4096", ":", ":", "/", " ")
+    U22_CHILD = (
+        "import sys,os,tempfile,importlib.util,glob,shutil\n"
+        "sys.path.insert(0, %r)\n"
+        "import test_stop_final_message as t\n"
+        "real,old,new=sys.argv[1:4]\n"
+        "src=open(real).read()\n"
+        "if old:\n"
+        "    assert src.count(old)==1, 'anchor not found once'\n"
+        "    src=src.replace(old,new)\n"
+        "scratch=tempfile.mkdtemp()\n"
+        "[shutil.copy(f,scratch) for f in glob.glob(os.path.join(os.path.dirname(real),'*.py'))]\n"
+        "path=os.path.join(scratch,'cloud_retired.py')\n"
+        "open(path,'w').write(src)\n"
+        "spec=importlib.util.spec_from_file_location('cloud_retired',path); mod=importlib.util.module_from_spec(spec); sys.modules['cloud_retired']=mod; spec.loader.exec_module(mod)\n"
+        "bad=t.TestStopFinalMessageBare.u22_leaks(mod._remove_hosts)\n"
+        "if bad:\n"
+        "    print('the scan left characters the old pattern removed: %%d texts, the first %%r' %% (len(bad), bad[0])); sys.exit(1)\n"
+        "print('no text left more')\n") % str(CHECK_FILE.parent)
+
+    @classmethod
+    def u22_leaks(cls, remove):
+        def fix(step, text):
+            for _ in range(200):
+                got = step(text)
+                if got == text:
+                    return got
+                text = got
+            raise AssertionError("no fixed point")
+        rng = random.Random(7)
+        texts = list(cls.U22_FIXED)
+        texts += ["".join(rng.choice(cls.U22_PIECES) for _ in range(rng.randint(1, 14))) for _ in range(20000)]
+        return [t for t in texts if len(fix(remove, t)) > len(fix(lambda x: cls.U22_OLD.sub("", x), t))]
+
+    def test_U22_the_scan_never_leaves_more_than_the_old_pattern_removed(self):
+        mod = sb.load_module("cloud_retired")
+        bad = self.u22_leaks(mod._remove_hosts)
+        self.assertEqual(bad, [], "the scan left characters the old pattern removed: %d texts, the first %r" % (len(bad), bad[:1]))
+        # the mutant: a SCRATCH COPY (outside the repository) whose port reads at most 5 digits again; the control first
+        src = str(BIN / "cloud_retired.py")
+        run = lambda old, new: subprocess.run([sys.executable, "-c", self.U22_CHILD, src, old, new], cwd=str(CHECK_FILE.parent), stdout=subprocess.PIPE,
+                                              stderr=subprocess.STDOUT, universal_newlines=True, timeout=600)
+        done = run("", "")
+        self.assertEqual(done.returncode, 0, "control of U22: %s" % done.stdout)
+        old = 'while m < n and low[m] in "0123456789": m += 1'
+        done = run(old, 'while m < n and m - k - 1 < 5 and low[m] in "0123456789": m += 1')
+        self.assertEqual(done.returncode, 1, "mutant of U22: %s" % done.stdout)
+        self.assertIn("the scan left characters the old pattern removed", done.stdout)
+        self.assertIn("worker-b.1.:123456", done.stdout)   # the first text is named
 
 
 class TestStopFinalMessageBareMutant(unittest.TestCase):
