@@ -666,6 +666,25 @@ PYEOF
   fi
 fi
 
+# ============================================ 10. undecidable panes (#1884)
+# Read-only. The daemon's own record (pane-health.json, states[NAME].undecidable = passes in a row) of a listed pane whose agent row has no recorded
+# session id: the daemon answers `unknown` for it, never `dead`. One WARN line per such agent; no line when none.
+python3 - >"$TMPDIR_FD/und.txt" <<'PYEOF' 2>/dev/null
+import json, os
+state = os.environ.get("FLEET_REGISTRY_DIR") or os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"), "fleet-switchboard")
+try:
+    states = json.load(open(os.path.join(state, "pane-health.json"))).get("states") or {}
+    for name, row in sorted(states.items()):
+        n = row.get("undecidable") if isinstance(row, dict) else None
+        if isinstance(n, int) and n > 0 and all(c.isalnum() or c in "._-" for c in name):
+            print("%s %d" % (name, n))
+except Exception:
+    pass
+PYEOF
+while read -r und_name und_n; do
+  [ -n "$und_name" ] && emit WARN undecidable "agent $und_name: listed pane with no recorded session, undecidable for $und_n passes: reattach or retire it"
+done <"$TMPDIR_FD/und.txt"
+
 # ----------------------------------------------------------------- summary
 TOTAL=$((OK_N+WARN_N+FAIL_N))
 echo
