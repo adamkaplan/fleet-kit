@@ -1187,6 +1187,29 @@ class TokenRefresh:
         self.state, self.reason, self.token = state, reason, token
 
 
+STEP_NAMES = ("record", "hook", "refresh", "delete", "scrub", "other")
+
+
+def _seconds_number(value):
+    """A finite non-negative number rounded to one decimal, else None (a text, a bool, nan, inf, a negative never enters the audit)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+        return None
+    return round(float(value), 1)
+
+
+def _seconds_field(seconds):
+    """{} or {"seconds": <one decimal>} for a finite non-negative number only."""
+    number = _seconds_number(seconds)
+    return {} if number is None else {"seconds": number}
+
+
+def _clean_steps(steps):
+    """The steps object of a stop line: only the five names and `other`, each a finite non-negative number; anything else is dropped."""
+    if not isinstance(steps, dict):
+        return {}
+    return {k: _seconds_number(v) for k, v in steps.items() if k in STEP_NAMES and _seconds_number(v) is not None}
+
+
 class ClusterTokenRefresher:
     """The reaper's own login: the token file stays fresh without a person.
 
@@ -1254,31 +1277,35 @@ class ClusterTokenRefresher:
         life = token_file_life_left(path, now)
         if not force and life is not None and life >= CLUSTER_TOKEN_REFRESH_MARGIN_SECONDS:
             return TokenRefresh("fresh")   # the file has life left: it is left alone
+        began = self.clock()
         try:
             token = cluster_token(self.env, duration=CLUSTER_TOKEN_DURATION, capture=self.capture, now=now, strict=True)
             write_token_file(path, token)
         except ClusterLogin as e:
             reason = refresh_reason(e)
             self.last_failure = (now, reason)
-            self.audit(reason, False)
+            took = (self.clock() - began).total_seconds()
+            self.audit(reason, False, took)
             return TokenRefresh("failed", reason)
         except OSError as e:
             reason = "the token file could not be written: %s" % (e.strerror or e)
             self.last_failure = (now, reason)
-            self.audit(reason, False)
+            took = (self.clock() - began).total_seconds()
+            self.audit(reason, False, took)
             return TokenRefresh("failed", reason)
         self.last_failure = None
-        self.audit("", True)
+        took = (self.clock() - began).total_seconds()
+        self.audit("", True, took)
         return TokenRefresh("written", "", token)
 
-    def audit(self, reason, ok):
+    def audit(self, reason, ok, seconds=None):
         """One audit line per change of reason (the renewal's rule): a persistent failure is not written again every pass, and the success line
         is the one that clears it. The reason names the step, never a value."""
         text = self.scrub(reason, limit=1000)
         if not ok and last_audit_line(self.audit_file, REFRESH_ACTION, REAPER_RUNTIME_ID) == (False, text):
             return
         write_audit(self.audit_file, {"ts": iso(self.clock()), "worker": "", "runtime_id": REAPER_RUNTIME_ID, "action": REFRESH_ACTION,
-                                      "cost_estimate_usd": 0.0, "ok": ok, "actor": pwd.getpwuid(os.getuid()).pw_name, "reason": text})
+                                      "cost_estimate_usd": 0.0, "ok": ok, "actor": pwd.getpwuid(os.getuid()).pw_name, "reason": text, **_seconds_field(seconds)})
 
 
 def spend_cap(env):
@@ -1795,7 +1822,7 @@ class Launcher:
         self.renew_lock = threading.RLock()   # the pass and the renewal thread never renew at the same moment
 
     # -- audit: one line per action, no secret, written before the action returns --
-    def audit(self, worker, runtime_id, action, cost, ok, reason="", refresh=None, cause=None):
+    def audit(self, worker, runtime_id, action, cost, ok, reason="", refresh=None, cause=None, steps=None, seconds=None):
         line = {"ts": iso(self.clock()), "worker": worker, "runtime_id": runtime_id, "action": action,
                 "cost_estimate_usd": cost, "ok": ok, "actor": pwd.getpwuid(os.getuid()).pw_name,
                 "reason": self.kube.scrub(reason, limit=1000)}
@@ -1803,6 +1830,10 @@ class Launcher:
             line["refresh"] = refresh
         if cause:   # a stop the launcher made of its own accord names why: idle, hard, pod_gone or pod_failed (a person's stop has none)
             line["cause"] = cause
+        clean = _clean_steps(steps)   # only the five names and `other`, each a finite non-negative number: a text of the pod never enters
+        if clean:
+            line["steps"] = clean
+        line.update(_seconds_field(seconds))
         write_audit(self.audit_path, line)
 
     def cost(self, pod):
@@ -1820,12 +1851,12 @@ class Launcher:
         except CloudError as e:
             if not e.audited:
                 # the failure is never dropped: a caller's own reason (a stop reason, the run-secret names) comes first
-                self.audit(worker, info["rid"], action, info["cost"], False, "%s; %s" % (why(), e) if why() else str(e), info.get("refresh"), info.get("cause"))
+                self.audit(worker, info["rid"], action, info["cost"], False, "%s; %s" % (why(), e) if why() else str(e), info.get("refresh"), info.get("cause"), info.get("steps"), info.get("seconds"))
             raise
         except (ValueError, TypeError, KeyError) as e:  # a bad annotation or reply still writes its ok:false line
-            self.audit(worker, info["rid"], action, info["cost"], False, why() or str(e)[:300], info.get("refresh"), info.get("cause"))
+            self.audit(worker, info["rid"], action, info["cost"], False, why() or str(e)[:300], info.get("refresh"), info.get("cause"), info.get("steps"), info.get("seconds"))
             raise CloudError("unexpected cloud data: %s" % self.kube.scrub(e, 200))
-        self.audit(worker, info["rid"], action, info["cost"], True, why(), info.get("refresh"), info.get("cause"))
+        self.audit(worker, info["rid"], action, info["cost"], True, why(), info.get("refresh"), info.get("cause"), info.get("steps"), info.get("seconds"))
         return result
 
     def _need(self, worker):
@@ -2684,6 +2715,7 @@ class Launcher:
         out, relogged = [], False
         for pod in pods:
             worker = ann(pod, "worker")
+            began = self.clock()
             try:
                 try:
                     done = self._renew_git_token(pod, now)
@@ -2696,17 +2728,20 @@ class Launcher:
                         raise
                     done = self._renew_git_token(pod, now)
             except _NotRenewed as e:
+                took = (self.clock() - began).total_seconds()
                 why = self.kube.scrub(str(e), 200)
-                self._audit_renewal_failure(worker, pod, why)
+                self._audit_renewal_failure(worker, pod, why, took)
                 out.append((worker, "git token not renewed: " + why, 1))
                 continue
             except (CloudError, ValueError, TypeError, KeyError, AttributeError, OSError) as e:   # unexpected data from the cluster: still named, never silent
+                took = (self.clock() - began).total_seconds()
                 why = self.kube.scrub("unexpected: %s" % e, 200)
-                self._audit_renewal_failure(worker, pod, why)
+                self._audit_renewal_failure(worker, pod, why, took)
                 out.append((worker, "git token not renewed: " + why, 1))
                 continue
+            took = (self.clock() - began).total_seconds()
             if done:
-                self.audit(worker, "pod/" + pod["metadata"]["name"], "renew-git-token", self._cost_or_zero(pod), True, "")
+                self.audit(worker, "pod/" + pod["metadata"]["name"], "renew-git-token", self._cost_or_zero(pod), True, "", seconds=took)
                 out.append((worker, "git token renewed", 0))
         return out
 
@@ -2714,12 +2749,12 @@ class Launcher:
         """(ok, reason) of the newest renew-git-token audit line of this pod, or None (reads the file's tail only)."""
         return last_audit_line(self.audit_path, "renew-git-token", rid)
 
-    def _audit_renewal_failure(self, worker, pod, why):
+    def _audit_renewal_failure(self, worker, pod, why, seconds=None):
         """One audit line per CHANGE of reason (a persistent failure is not written again every pass; the success line is the 'cleared' line)."""
         rid = "pod/" + pod["metadata"]["name"]
         if self._last_renewal_audit(rid) == (False, self.kube.scrub(why, limit=1000)):
             return
-        self.audit(worker, rid, "renew-git-token", self._cost_or_zero(pod), False, why)
+        self.audit(worker, rid, "renew-git-token", self._cost_or_zero(pod), False, why, seconds=seconds)
 
     def _cost_or_zero(self, pod):
         try:
