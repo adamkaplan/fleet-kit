@@ -1257,6 +1257,11 @@ def cmd_retire(args, runner, now, record):
         return H["EXIT_OK"]
     _keep_boss(state, record)
     remove_record(state, args.name)
+    blocked = (body or {}).get("wip_blocked_by") if isinstance(body, dict) else None
+    if pushed and wip and isinstance(blocked, str) and blocked:
+        print("%s is retired: its pod and scratch volume are deleted; work was pushed to branch %s (%s/wip is blocked by the branch %s)" % (
+            args.name, _one(wip, 200), args.name, _one(blocked, 200)))
+        return H["EXIT_OK"]
     print("%s is retired: its pod and scratch volume are deleted%s" % (
         args.name, "; work was pushed to branch %s" % wip if pushed and wip else "; nothing needed pushing" if pushed is False else ""))
     return H["EXIT_OK"]
