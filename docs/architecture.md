@@ -99,6 +99,7 @@ The **Holds** column is descriptive: only the layer numbers are enforced.
 | `delegated_clear.py` | 5 | the Chief of Staff's clear under the owner's standing order | |
 | `endpoint_send.py` | 5 | the send path's route to an agent that holds no pane | |
 | `heavy_slots.py` | 5 | CPU slots for heavy commands (`fleet-switchboard heavy`) | |
+| `host_liveness.py` | 2 | the liveness of an orchestrator that a charter names by a host (alive, dead or unreachable), on demand only | |
 | `impact_floor.py` | 5 | the impact hold's deterministic floor and decision table | |
 | `impact_hold.py` | 5 | who may clear, hold or release an impact hold | |
 | `item_verdicts.py` | 5 | verdicts for a work item that has no pull request | |

@@ -541,6 +541,7 @@ heartbeat-ack:read_state_document
 heavy_slots.py:_read
 heavy_slots.py:_read_info
 heavy_slots.py:_reported
+host_liveness.py:_remote
 impact_floor.py:load_matrix
 impact_hold.py:_gh_json
 impact_hold.py:_pending_read
