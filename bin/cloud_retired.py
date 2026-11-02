@@ -221,7 +221,67 @@ LAST_HEAD = 3000                 # characters that go in the message
 LAST_FILE = 20000                # characters beyond the head that go in the file
 LAST_KEEP_SECONDS = 7 * 86400
 LAST_SCRUB_MAX = 200000          # the scrub's own input maximum (SCRUB_INPUT_MAX of the launcher): the cut before it
-_ENDPOINT_RE = re.compile(r"(?:https?://)?worker-[a-z0-9-]+\.[a-z0-9.-]+(:[0-9]+)?", re.I)
+_HOST_LABEL = frozenset("abcdefghijklmnopqrstuvwxyz0123456789-")
+_HOST_REST = _HOST_LABEL | {"."}
+
+
+class StepLimit(Exception):
+    """The step counter passed its limit (PC-12)."""
+
+
+def _remove_hosts(text, steps=None):
+    """Remove a pod's host of the shape `worker-<=63 of [a-z0-9-]>.<=253 of [a-z0-9.-]>[:<=5 digits]`, with an optional `https://` or `http://` in front,
+    case-insensitively, by ONE linear scan (no backtracking, no step goes back). A start that does not complete is skipped by one character. Every
+    character examined adds one to `steps.n` (an object with `n` and `limit`; `n > limit` raises StepLimit): at most 330 per start."""
+    low, n, out, i, keep = text.lower(), len(text), [], 0, 0
+
+    def tick(count):
+        if steps is not None:
+            steps.n += count
+            if steps.n > steps.limit:
+                raise StepLimit("step limit")
+
+    while True:
+        j = low.find("worker-", i)
+        if j < 0:
+            tick(n - i)
+            break
+        tick(j - i + 1)
+        p = j + 7
+        k = p
+        while k < n and k - p < 63 and low[k] in _HOST_LABEL:
+            k += 1
+            tick(1)
+        if k == p or k >= n or low[k] != ".":
+            i = j + 1
+            continue
+        k += 1
+        q = k
+        while k < n and k - q < 253 and low[k] in _HOST_REST:
+            k += 1
+            tick(1)
+        if k == q:
+            i = j + 1
+            continue
+        if k < n and low[k] == ":":
+            m = k + 1
+            while m < n and m - k - 1 < 5 and low[m] in "0123456789":
+                m += 1
+                tick(1)
+            if m > k + 1:
+                k = m
+        start = j
+        tick(8)
+        if low.startswith("https://", j - 8) and j >= 8:
+            start = j - 8
+        elif low.startswith("http://", j - 7) and j >= 7:
+            start = j - 7
+        if start < keep:
+            start = keep
+        out.append(text[keep:start])
+        keep = i = k
+    out.append(text[keep:])
+    return "".join(out)
 _LAST_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,199}", re.ASCII)
 
 
@@ -372,7 +432,7 @@ def last_message(directory, state, pod, clock=None):
                 if why else "no text from the worker"
         text = text[:LAST_SCRUB_MAX]
         for _ in range(21):   # PC-10 (a): repeat until the text stops changing (20 passes at most), so a rebuilt address is removed too
-            stripped = _ENDPOINT_RE.sub("", text)
+            stripped = _remove_hosts(text)
             changed = stripped != text
             text = stripped
             if not changed:
