@@ -102,11 +102,12 @@ def _read_state(path):
     except (OSError, ValueError):
         state = None
     if not isinstance(state, dict) or not isinstance(state.get("pods"), dict):
-        return {"cursor": None, "edge": [], "alarmed": [], "pods": {}}
+        return {"cursor": None, "edge": [], "alarmed": [], "unsent": [], "pods": {}}
     cursor = state.get("cursor")
     return {"cursor": cursor if isinstance(cursor, (int, float)) and not isinstance(cursor, bool) else None,
             "edge": [e for e in state.get("edge", []) if isinstance(e, str)] if isinstance(state.get("edge"), list) else [],
             "alarmed": [a for a in state.get("alarmed", []) if isinstance(a, list) and len(a) == 2 and isinstance(a[0], str) and isinstance(a[1], (int, float)) and not isinstance(a[1], bool)][-ALARMED_KEEP:] if isinstance(state.get("alarmed"), list) else [],
+            "unsent": [u for u in state.get("unsent", []) if isinstance(u, list) and len(u) == 2 and isinstance(u[0], str) and isinstance(u[1], (int, float)) and not isinstance(u[1], bool)] if isinstance(state.get("unsent"), list) else [],
             "pods": {k: v for k, v in state["pods"].items() if isinstance(v, (int, float)) and not isinstance(v, bool)}}
 
 
