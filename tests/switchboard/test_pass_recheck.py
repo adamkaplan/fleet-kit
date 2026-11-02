@@ -52,7 +52,7 @@ class TestPassRecheck(Base):
         return [e for e in self.world.audit() if e["event"] == "stale.dropped"]
 
     def hold(self, state, key, present):
-        state.fact_pairs, state.present = {key: PAIRS}, set(present)
+        state.fact_pairs, state.present = {key: (PAIRS, False) if state is self.sweep else PAIRS}, set(present)
 
     def test_s2_a_sweep_fact_whose_findings_are_all_gone_is_dropped_with_one_audit_line(self):
         self.hold(self.sweep, SWEEP_KEY, [("S1", "acme/api#9")])
@@ -219,6 +219,41 @@ class TestDropStaleOnce(RealPasses):
         self.assertEqual(self.texts(), [], msg="a resolved triage digest was delivered")
         self.assertEqual([e["detail"]["kind"] for e in self.dropped()], ["triage"], msg="not exactly one stale.dropped line over two deliveries")
         self.assertEqual([len(keys) for keys in self.offered], [1, 0], msg="the dropped digest was offered again")
+
+
+class TestHiddenFindings(RealPasses):
+    """Sixth amendment (3): a sweep fact that hides findings ("+N more") is never dropped by the re-check."""
+
+    def two_findings_one_shown(self):
+        self.engine.config["sweep"]["max_findings"] = 1   # the real queue function shows one and hides one ("+1 more")
+        self.hub.open = {1: sweep_issue(1, "intro\n## Decision required\nPick one"), 2: sweep_issue(2, "intro\n## Decision required\nPick two")}
+        self.sweep_pass()
+        (summary, _), = self.engine.sweep.facts.values()
+        self.assertIn("(+1 more)", summary, msg="the real sweep did not hide a finding")
+        self.hub.open = {}   # both resolved, and the next pass read everything
+        self.engine.sweep.confirmed.clear()
+        self.sweep_pass()
+        self.assertEqual(self.engine.sweep.present, set())
+        return summary
+
+    def test_a_sweep_fact_that_hides_findings_is_kept_whole_even_when_the_shown_one_is_gone(self):
+        summary = self.two_findings_one_shown()
+        self.deliver()
+        self.assertEqual(self.dropped(), [], msg="a fact that hides findings was dropped")
+        self.assertEqual(len(self.texts()), 1)
+        self.assertIn(summary, self.texts()[0])
+        self.assertNotIn("[unverified", self.texts()[0])
+
+    def test_a_sweep_fact_that_hides_nothing_and_whose_findings_are_gone_is_dropped(self):   # the control
+        self.hub.open = {1: sweep_issue(1, "intro\n## Decision required\nPick one")}
+        self.sweep_pass()
+        self.assertNotIn("more)", list(self.engine.sweep.facts.values())[0][0])
+        self.hub.open = {}
+        self.engine.sweep.confirmed.clear()
+        self.sweep_pass()
+        self.deliver()
+        self.assertEqual(self.texts(), [])
+        self.assertEqual(len(self.dropped()), 1)
 
 
 class TestUnreadUnitKeepsTheItem(RealPasses):
@@ -407,6 +442,18 @@ class TestPassRecheckMutants(unittest.TestCase):
         self.assertTrue(self.run_case(name, []).wasSuccessful(), msg="control failed")
         result = self.run_case(name, [(sb, "triage_pass", ns["triage_pass"])])
         self.assertFalse(result.wasSuccessful(), msg="a pass that sets present after an unread unit went unnoticed")
+
+    def test_a_recheck_that_ignores_hidden_findings_is_caught(self):
+        old = 'or record.get("hidden"):'
+        reminders = (Path(sb.__file__).resolve().parent / "switchboard" / "reminders.py").read_text()
+        self.assertEqual(reminders.count(old), 1, msg="the mutation target moved")
+        self.assertNotEqual(reminders.replace(old, ":", 1), reminders, msg="the mutation was not applied")
+        ns = dict(vars(sb))
+        exec(compile(reminders.replace(old, ":", 1), "reminders.py", "exec"), ns)
+        name = "TestHiddenFindings.test_a_sweep_fact_that_hides_findings_is_kept_whole_even_when_the_shown_one_is_gone"
+        self.assertTrue(self.run_case(name, []).wasSuccessful(), msg="control failed")
+        result = self.run_case(name, [(sb, "pass_stale", ns["pass_stale"])])
+        self.assertFalse(result.wasSuccessful(), msg="a fact that hides findings dropped went unnoticed")
 
     def test_a_source_that_does_not_forget_a_dropped_fact_is_caught(self):
         name = "TestDropStaleOnce.test_a_dropped_sweep_fact_is_not_offered_again_and_has_one_audit_line_over_two_deliveries"

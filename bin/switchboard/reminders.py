@@ -381,7 +381,7 @@ def pass_stale(subject, record):
         now = record.get("hash")
         return "a newer plan (hash %s) replaced it" % str(now)[:12] if isinstance(now, str) and now != expected else ""
     pairs, present = record.get("pairs"), record.get("present")
-    if not isinstance(pairs, list) or not isinstance(present, list) or not pairs:
+    if not isinstance(pairs, list) or not isinstance(present, list) or not pairs or record.get("hidden"):   # a fact that hides findings ("+N more") is never dropped: the shown ones are not the whole fact
         return ""
     here = {tuple(p) for p in present}
     return "" if any(tuple(p) in here for p in pairs) else "none of its %d finding%s is present any more" % (len(pairs), "" if len(pairs) == 1 else "s")

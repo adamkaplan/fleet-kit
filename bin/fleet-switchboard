@@ -10647,7 +10647,7 @@ def sweep_queue_fact(state, due, now, cfg):
     for pair in due:
         state.alarmed[pair] = now
     state.facts[key] = (summary, now)
-    state.fact_pairs[key] = list(shown)   # #1542: the pairs the fact lists, for the delivery re-check
+    state.fact_pairs[key] = (list(shown), len(due) > len(shown))   # #1542: the pairs the fact lists and whether it hides some ("+N more"), for the delivery re-check
     for old in [k for k, (_, at) in state.facts.items() if now - at > cfg["realarm_hours"] * 7200]:
         del state.facts[old]
     return set(due)   # every due finding is carried (named, or counted in "+N more") and remembered
@@ -10702,8 +10702,8 @@ class SweepFacts:
 
     def present_record(self, subject):   # #1542: {"pairs", "present"} of this fact, None when the pass has not run or the fact is not known
         state = getattr(self.engine, "sweep", None) if self.engine else None
-        present, pairs = getattr(state, "present", None), getattr(state, "fact_pairs", {}).get(subject[3])
-        return None if present is None or pairs is None else {"pairs": [list(p) for p in pairs], "present": [list(p) for p in present]}
+        present, held = getattr(state, "present", None), getattr(state, "fact_pairs", {}).get(subject[3])
+        return None if present is None or held is None else {"pairs": [list(p) for p in held[0]], "hidden": bool(held[1]), "present": [list(p) for p in present]}
 
 
 # ---- #765: a posted or edited plan tells its approver once per hash. Reads only what the triage pass already holds (no GitHub read of its own).
