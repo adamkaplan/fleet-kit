@@ -1,4 +1,5 @@
 """#1886 Sixth amendment S11-S15: one alert path for every read of open items that stops at the ceiling, from the flag of the read itself."""
+import ast
 import re
 import shutil
 import subprocess
@@ -340,6 +341,51 @@ class TestOpenListCutsMutants(Base):
         with self.assertRaises(AssertionError) as caught:
             self.held_rows_after_a_failed_read(mutant)
         self.assertIn("a failed read of a cut list keeps the held rows", str(caught.exception))
+
+
+class TestOpenListWholeReads(CutsBase):
+    """S7: the REAL read_charters (a closure of load_tick, taken from the context load_tick builds) and the REAL ci_record_pass; only the load alert's health module is a stand-in that hands the context back."""
+
+    def charters(self):
+        labels = [{"name": "tester:orchestrator"}] + [{"name": "l%d" % n} for n in range(119)]
+        charters = [{"number": n, "body": "b"} for n in range(1000, 890, -1)]   # 110 charters, one page of 100 and a second of 10
+        calls = []
+
+        def api(path, repo=None, meta=None):
+            calls.append(path)
+            page = int((re.search(r"[?&]page=(\d+)", path) or [0, 1])[1] if re.search(r"[?&]page=(\d+)", path) else 1)
+            if "/labels" in path:
+                return labels[(page - 1) * 100:page * 100]
+            return charters[(page - 1) * 100:page * 100]
+        captured = {}
+        health = types.SimpleNamespace(DEFAULTS={}, Context=lambda **kw: captured.update(kw) or types.SimpleNamespace(), tick=lambda c: [])
+        engine = types.SimpleNamespace(config={}, state_dir=str(self.state_dir), actor="daemon", audit=None, now=lambda: NOW, awaiting_first_full_pass=False,
+                                       intents=types.SimpleNamespace(_api=api, repo="acme/api"), discovery=types.SimpleNamespace(agents={}))
+        with mock.patch.object(sb, "load_fleet_health", lambda: health):
+            sb.load_tick(engine, engine.discovery)
+        return captured["read_charters"]("acme/api"), calls
+
+    def test_s7_the_real_read_charters_reads_110_charters_and_the_recorder_250_pull_requests(self):
+        got, calls = self.charters()
+        self.assertEqual(len(got), 110, msg="110 charters read over two pages")
+        self.assertEqual(len([c for c in calls if "/labels" in c]), 2, msg="120 labels are two pages")
+        hub = real_hub(0)
+        prs = [{"number": n, "state": "open", "title": "t", "body": "", "labels": [], "head": {"sha": "a" * 40}} for n in range(250, 0, -1)]
+        hub.gh_api = lambda path, paginate=True, timeout=None: [prs[(int(re.search(r"[?&]page=(\d+)", path).group(1)) - 1) * 100:int(re.search(r"[?&]page=(\d+)", path).group(1)) * 100]]
+        engine = types.SimpleNamespace(config={"plan_gates": {"repos": {"acme/api": {}}}}, state_dir=str(self.state_dir), audit=self.engine.audit, hub=hub, now=lambda: NOW,
+                                       _note=lambda *a, **k: None)
+        sb.ci_record_pass(engine, NOW)
+        self.assertEqual(len(engine.ci_record_state.lists["acme/api"][1]), 250, msg="all 250 pull requests are read (a cap of 2 pages reads 200)")
+
+
+class TestOpenListCutsWired(Base):
+    def test_the_classes_on_the_loader_line_are_the_test_classes_of_the_file(self):
+        root = Path(__file__).resolve().parents[2]
+        line = next(l for l in (root / "bin" / "test-switchboard").read_text().splitlines() if l.startswith('_olcuts = importlib.import_module("test_open_list_cuts")'))
+        named = set(re.findall(r"\bTest\w+", line.split(";", 1)[1].split("=")[0]))
+        tree = ast.parse((Path(__file__)).read_text())
+        defined = {n.name for n in tree.body if isinstance(n, ast.ClassDef) and n.name.startswith("Test")}
+        self.assertEqual(named, defined, msg="the classes named on the loader line equal the test classes of the file")
 
 
 if __name__ == "__main__":
