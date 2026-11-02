@@ -67319,6 +67319,9 @@ TestSentView = _sent_view.TestSentView
 # The relay-loop tests of #1477, moved under the architecture cap.
 _relay_loop = importlib.import_module("test_relay_loop_cadence")
 RelayLoopCadence, TwoLoopsTrace, TrickleHub, HubFilesUnchanged, OneWorkerAndCancel = _relay_loop.RelayLoopCadence, _relay_loop.TwoLoopsTrace, _relay_loop.TrickleHub, _relay_loop.HubFilesUnchanged, _relay_loop.OneWorkerAndCancel
+# The refusal of `prove` and `verdict` in a cloud pod (#1875).
+_pod_prove = importlib.import_module("test_pod_prove_refusal")
+TestPodRefusal, TestOutsideAPod, TestPodDocuments = _pod_prove.TestPodRefusal, _pod_prove.TestOutsideAPod, _pod_prove.TestPodDocuments
 # The size ceilings on the merge result (#1605).
 _size_ceilings = importlib.import_module("test_size_ceilings")
 TestTheCheck, TestSizeMutants, TestTheMergeGate, TestSizeDocumentation = _size_ceilings.TestTheCheck, _size_ceilings.TestMutants, _size_ceilings.TestTheMergeGate, _size_ceilings.TestDocumentation
