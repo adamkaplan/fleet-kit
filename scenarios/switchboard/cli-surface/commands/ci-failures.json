@@ -1,0 +1,4 @@
+{
+ "command": "ci-failures",
+ "help": "usage: fleet-switchboard ci-failures [-h] pr Reads the latest run at the head of the pull request with the lane's own account (GET only) and prints one line per failed job: its failed step and the failing test names from its log (at most 5 logs, bounded and scrubbed), or one plain line when the run is still going or has no failure. positional arguments: pr The pull request: owner/repo#N or its URL options: -h, --help show this help message and exit"
+}

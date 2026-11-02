@@ -39,6 +39,8 @@ A pull request for an ask, or for a work item with a live check, says `Refs #N`,
 
 A brief for a change that adds a file under `bin/` carries the output of `tools/new-module-demands bin/x.py` (the guard classes, the matrix entries, the units row, the closure state): the tool informs, the guards decide.
 
+A brief for a change that fixes a red pull request carries the output of `fleet-switchboard ci-failures <pr>` (the pod's token cannot read the Actions API, so the pod cannot read why CI failed).
+
 Every builder brief carries the builder checklist below by default; a brief that leaves an item out says why in one line.
 
 ## Builder checklist

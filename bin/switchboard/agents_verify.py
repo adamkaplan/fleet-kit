@@ -237,3 +237,105 @@ def add_agents_parsers(sub):
     verify.add_argument("--installed-dir", default=None, help="The folder of installed agent files to compare bodies with (default: the private profile's agents folder)")
     verify.add_argument("--opencode", default="opencode", help="The opencode executable (default: opencode on PATH)")
     verify.add_argument("--timeout", type=int, default=AGENTS_VERIFY_TIMEOUT, help="Seconds to wait for the service (default %d)" % AGENTS_VERIFY_TIMEOUT)
+
+
+# ---------------------------------------------------------------- `ci-failures` (#1968): why did CI fail, for a pod whose token cannot read the Actions API?
+# Read-only, lane-side: the lane's own account reads the runs and jobs (the counted `read` of the account layer, GET only) and prints one line per failed job.
+# Per call: 1 (the pull request) + 1 (the runs) + R (the jobs of each run) + at most CI_FAILURES_MAX_LOGS (one log per failed job). This home is temporary until #1092.
+CI_FAILURES_MAX_LOGS = 5
+CI_FAILURES_LOG_CHARS = 200000
+CI_FAILURES_MAX_NAMES = 10
+CI_FAILURES_NAME_CHARS = 200
+_CI_FAILED = ("failure", "timed_out", "startup_failure")
+_CI_QUIET = ("success", "skipped", "neutral")
+_CI_OPEN = ("queued", "in_progress", "waiting", "pending", "requested")
+_CI_TEST_LINE = re.compile(r"^(?:\S+Z )?(?:FAIL|ERROR): (.+?)\s*$", re.M)
+_CI_TOKEN = re.compile(r"(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]{16,}")
+
+
+def ci_failure_names(log):
+    """The failing test names of a unittest log (`FAIL: test_x (module.Class)` lines), in order, no repeats, cut to the bound; the names are not scrubbed here."""
+    names = []
+    for found in _CI_TEST_LINE.findall(log[-CI_FAILURES_LOG_CHARS:]):
+        if found not in names:
+            names.append(found)
+    return [n[:CI_FAILURES_NAME_CHARS] for n in names]
+
+
+def ci_failure_lines(reading, gh, repo, number, clean):
+    """The plain lines `ci-failures` prints for the pull request. Raises reading.ReadError when the pull request, the runs or a job list cannot be read."""
+    pr = reading._json(gh, ["api", "repos/%s/pulls/%d" % (repo, number)], "pull request %s#%d" % (repo, number))
+    head = ((pr.get("head") or {}).get("sha")) if isinstance(pr, dict) else None
+    if not isinstance(head, str) or len(head) != 40:
+        raise reading.ReadError("pull request %s#%d has no readable head" % (repo, number))
+    runs = reading.read_pr_runs(gh, repo, number, head)
+    if not runs:
+        return ["no run at head %s: nothing to read" % head[:7]]
+    lines, unread, failed, going, logs = [], 0, 0, [], 0
+    for run in runs:
+        data = reading._json(gh, ["api", "repos/%s/actions/runs/%s/jobs?filter=latest&per_page=100" % (repo, run["id"])], "the jobs of run %s" % run["id"])
+        jobs = [j for j in (data.get("jobs") if isinstance(data, dict) else None) or [] if isinstance(j, dict)]
+        if run["status"] != "completed":
+            going.append(run["workflow"])
+        for job in jobs:
+            name, conclusion, status = str(job.get("name")), job.get("conclusion"), job.get("status")
+            if conclusion in _CI_QUIET or (not conclusion and status in _CI_OPEN):
+                continue
+            if conclusion not in _CI_FAILED:
+                lines.append("job %s: conclusion unknown (%s), not called failed" % (name, conclusion or status or "none"))
+                continue
+            failed += 1
+            step = next((str(s.get("name")) for s in job.get("steps") or [] if isinstance(s, dict) and s.get("conclusion") in _CI_FAILED), "no failed step named")
+            if logs >= CI_FAILURES_MAX_LOGS:
+                lines.append("FAILED job %s, step %s: log not read (the cap of %d logs is reached)" % (name, step, CI_FAILURES_MAX_LOGS))
+                continue
+            logs += 1
+            code, out, _ = gh(["api", "repos/%s/actions/jobs/%s/logs" % (repo, job.get("id"))])
+            if code != 0:
+                lines.append("FAILED job %s, step %s: log not readable" % (name, step))
+                continue
+            names = ci_failure_names(out)
+            shown = names[:CI_FAILURES_MAX_NAMES]
+            tests = ("tests: " + "; ".join(shown) + (" (+%d more)" % (len(names) - len(shown)) if len(names) > len(shown) else "")) if shown else "no test names found"
+            lines.append("FAILED job %s, step %s: %s" % (name, step, tests))
+    for workflow in going:
+        lines.append("still going: the run of %s has not finished, so this may not be everything" % workflow)
+    if not failed and not lines:
+        lines.append("no failure at head %s" % head[:7])
+    return [clean(line) for line in lines]
+
+
+def cmd_ci_failures(args, runner, now):
+    """`ci-failures <pr>`: read-only. For the latest run at the head of the pull request, one line per failed job (its failed step and the failing test names read from its log), or one plain line."""
+    reading = load_module("pr_reading")
+    try:
+        repo, number = parse_pr_ref(args.pr)
+    except NoticeError as err:
+        raise LedgerCommandError(str(err)) from None
+    config = load_runnable_config()
+    accounts = GhAccounts(config, runner, now)
+
+    def gh(argv):
+        try:
+            done = accounts.read(runner, argv[1], repo, config["call_timeout_seconds"], stdin=subprocess.DEVNULL)
+        except (AccountError, GhRateLimited, OSError, subprocess.SubprocessError) as err:
+            return 1, "", _one_line(str(err), 120)
+        return done.returncode, done.stdout or "", accounts.scrub(done.stderr or "")
+
+    def clean(line):
+        return _CI_TOKEN.sub("[redacted]", redact_command_text(accounts.scrub(line)))[:400]
+    try:
+        lines = ci_failure_lines(reading, gh, repo, number, clean)
+    except reading.ReadError as err:
+        print(clean("ci-failures: %s" % err), file=sys.stderr)
+        return EXIT_ERROR
+    for line in lines:
+        print(line)
+    return EXIT_OK
+
+
+def add_ci_failures_parsers(sub):
+    sub.add_parser("ci-failures", help="Read-only: why CI failed at a pull request's head, one line per failed job (for a brief; a pod's token cannot read the Actions API)",
+                   description="Reads the latest run at the head of the pull request with the lane's own account (GET only) and prints one line per failed job: its failed step and "
+                               "the failing test names from its log (at most 5 logs, bounded and scrubbed), or one plain line when the run is still going or has no failure.").add_argument(
+        "pr", help="The pull request: owner/repo#N or its URL")
