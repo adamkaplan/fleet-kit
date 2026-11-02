@@ -597,3 +597,98 @@ class TestStopFinalMessageEdgesMutant(unittest.TestCase):
             code, out = self.run_child(name, test, old, new)
             self.assertEqual(code, 1, "mutant of %s: %s" % (test, out))
             self.assertIn(text, out, test)
+
+
+class TestStopFinalMessageBare(unittest.TestCase):
+    """PC-11 (U18..U20): the Lows of the fourth strict security pair, on fake pods."""
+
+    def test_U18_a_bare_endpoint_host_is_in_neither_the_message_nor_the_file(self):
+        w = StopWorld(self)
+        hosts = ("worker-x-ab12.example.internal", "worker-x-ab12.example.internal:4096", "WORKER-X-AB12.EXAMPLE.INTERNAL", "Worker-X-ab12.Example.Internal:4096")
+        text = "see %s and %s early " % hosts[:2] + "words " * 700 + " late %s and %s end" % hosts[2:]
+        w.stop("cb-1788a", "idle", w.pod("cb-1788a", text))
+        w.scan()
+        everything = w.to("boss-lane")[0] + "".join(p.read_text() for p in (w.state / "cloud-last").iterdir())
+        self.assertEqual(everything.lower().count("worker-x-ab12.example.internal"), 0, "a bare endpoint host reached a lane")
+        self.assertIn("early", everything)
+
+    def test_U19_a_token_straddling_the_120_character_cut_leaves_no_prefix(self):
+        w = StopWorld(self)
+        rec = w.pod("cp-1788r", "my final words")
+        reason = "x" * 109 + " " + TOKEN + " " + "y" * 29
+        self.assertEqual(reason.index(TOKEN), 110)
+        self.assertGreater(len(reason), 140)   # the token (40 characters) starts at 110 and ends past the cut at 120
+        cloud = sb.load_module("cloud_worker").bind(sb.__dict__)
+        engine = mock.Mock()
+        engine.send = lambda sender, to, text: w.sent.append((to, text))
+        args = argparse.Namespace(name="cp-1788r", undo=False, reason=reason)
+        with mock.patch.dict(cloud.H, {"build_engine": lambda *a, **k: (engine, w.state, None), "gates_caller_kind": lambda *a: ("person",)}), \
+                mock.patch.object(cloud, "run_launcher", lambda *a, **k: (0, {"pushed": True, "record": str(rec)}, "note")), \
+                mock.patch.object(cloud, "Cluster", lambda *a, **k: mock.MagicMock()), mock.patch.object(cloud, "_audit"), \
+                mock.patch.object(cloud, "_registry_note"), mock.patch.object(cloud, "_keep_boss"), mock.patch.object(cloud, "remove_record"):
+            cloud.cmd_retire(args, None, None, {"worker": "cp-1788r", "reports_to": "boss-lane"})
+        got = w.to("boss-lane")
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0].count(TOKEN[:8]), 0, "part of a token in the retire reason reached a lane")
+        self.assertIn("xxxx", got[0])
+
+    def test_U20_the_file_run_directly_runs_and_counts_its_tests(self):
+        if os.environ.get("FLEET_U20_NESTED"):
+            self.skipTest("the nested direct run: it counts this test, it does not start another")
+        path = os.environ.get("FLEET_U20_FILE") or str(CHECK_FILE)
+        want = unittest.defaultTestLoader.loadTestsFromModule(sys.modules[__name__]).countTestCases()
+        env = dict(os.environ, FLEET_U20_NESTED="1")
+        env.pop("FLEET_U20_FILE", None)
+        done = subprocess.run([sys.executable, path], cwd=str(Path(path).parent), env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                              universal_newlines=True, timeout=800)
+        self.assertIn("Ran %d tests" % want, done.stdout, "the file ran no tests")
+        self.assertEqual(done.returncode, 0, done.stdout[-2000:])
+
+
+class TestStopFinalMessageBareMutant(unittest.TestCase):
+    """U18, U19: each check on the control and on a mutant of a SCRATCH COPY of the source (outside the repository). U20: on a scratch copy of the file."""
+    CHILD = TestStopFinalMessageHardeningMutant.CHILD.replace("TestStopFinalMessageHardening.", "TestStopFinalMessageBare.")
+    CASES = (
+        ("cloud_retired", "test_U18_a_bare_endpoint_host_is_in_neither_the_message_nor_the_file", '(?:https?://)?worker-', "https?://worker-",
+         "a bare endpoint host reached a lane"),
+        ("cloud_worker", "test_U19_a_token_straddling_the_120_character_cut_leaves_no_prefix", "_one(_scrub_lib()(reason, (), 200), 120)",
+         "_scrub_lib()(_one(reason, 120), (), 200)", "part of a token in the retire reason reached a lane"),
+    )
+    run_child = TestStopFinalMessageHardeningMutant.run_child
+
+    def test_U18_U19_the_control_passes_and_each_mutant_fails_with_the_text_of_the_check(self):
+        for name, test, old, new, text in self.CASES:
+            code, out = self.run_child(name, test, "", "")
+            self.assertEqual(code, 0, "control of %s: %s" % (test, out))
+            code, out = self.run_child(name, test, old, new)
+            self.assertEqual(code, 1, "mutant of %s: %s" % (test, out))
+            self.assertIn(text, out, test)
+
+    def u20(self, path):
+        env = dict(os.environ, FLEET_U20_FILE=path)
+        code = ("import sys,unittest\nsys.path.insert(0, %r)\n"
+                "suite=unittest.defaultTestLoader.loadTestsFromName('test_stop_final_message.TestStopFinalMessageBare.test_U20_the_file_run_directly_runs_and_counts_its_tests')\n"
+                "r=unittest.TextTestRunner(verbosity=0).run(suite)\nsys.exit(0 if r.wasSuccessful() else 1)\n") % str(CHECK_FILE.parent)
+        done = subprocess.run([sys.executable, "-c", code], cwd=str(CHECK_FILE.parent), env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                              universal_newlines=True, timeout=900)
+        return done.returncode, done.stdout
+
+    def test_U20_a_copy_without_the_main_entry_is_seen(self):
+        if os.environ.get("FLEET_U20_NESTED"):
+            self.skipTest("the nested direct run does not start another")
+        scratch = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, scratch, True)
+        here = os.path.join(scratch, "tests", "switchboard")
+        shutil.copytree(str(CHECK_FILE.parent / "support"), os.path.join(here, "support"), ignore=shutil.ignore_patterns("__pycache__"))
+        os.symlink(str(BIN), os.path.join(scratch, "bin"))
+        src = CHECK_FILE.read_text()
+        tail = 'if __name__ == "__main__":\n    unittest.main()\n'
+        self.assertEqual(src.count(tail), 1, "anchor not found once")
+        copy = os.path.join(here, "test_stop_final_message.py")
+        with open(copy, "w") as handle:
+            handle.write(src.replace(tail, ""))
+        code, out = self.u20(os.path.join(here, "test_stop_final_message.py"))
+        self.assertEqual(code, 1, "mutant of U20: %s" % out)
+        self.assertIn("the file ran no tests", out)
+        code, out = self.u20(str(CHECK_FILE))
+        self.assertEqual(code, 0, "control of U20: %s" % out)
