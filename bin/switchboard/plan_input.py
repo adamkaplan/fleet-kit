@@ -343,11 +343,7 @@ def receipt_text(name, file_sha, count, why, old_hash, new_hash, caller, checked
         lines.append(one_line(why.replace("`", "'"), REASON_LIMIT))
     if checked != "pass":
         lines.append("plan check: FAIL")
-    return "\n".join(lines) + "\n\n" + mark_line(caller)
-
-
-def mark_line(name):
-    return "<!-- fleet-switchboard:from=%s -->" % name
+    return "\n".join(lines) + "\n\n" + fleet_mark(caller)
 
 
 def apply_run(args, caller, api, state_dir, audit):
@@ -381,7 +377,7 @@ def apply_run(args, caller, api, state_dir, audit):
         expect_live(old_hash, args.expect_live)
         expect_file(file_sha, args.expect_file)
         result = apply_pairs(live, pairs)
-        result = MARKER.sub("", result).rstrip() + "\n\n" + mark_line(caller)
+        result = MARKER.sub("", result).rstrip() + "\n\n" + fleet_mark(caller)
         new_hash = plan_check.plan_hash(result)
         if new_hash != args.expect_result:
             raise PlanApplyRefused("plan apply: refused: --expect-result: the result's plan hash is %s and not %s" % (hash8(new_hash), hash8(args.expect_result)))
@@ -391,7 +387,7 @@ def apply_run(args, caller, api, state_dir, audit):
         url = "https://github.com/%s/issues/%d#issuecomment-%s" % (repo, number, plan["id"])
         audited = (lambda subject, detail: audit.external("cli", "github.comment", subject, detail)) if audit is not None else None
         try:
-            edit_in_place(reader, caller, url, result, approval, lambda: _audit_tail(state_dir), audited, mark_line, getattr(reader, "repo", repo))
+            edit_in_place(reader, caller, url, result, approval, lambda: _audit_tail(state_dir), audited, fleet_mark, getattr(reader, "repo", repo))
         except CommentEditRefused as err:
             raise PlanApplyRefused("plan apply: refused: %s" % one_line(err, 300), 1) from None
         except CommentEditFailed as err:
