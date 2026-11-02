@@ -158,19 +158,23 @@ def build(HandoffCase):
             sentences = sb.REHEARSE_RULE_SENTENCES
             self.assertEqual(len(sentences), 5)
             places = {}
-            for path in (SKILL, TEMPLATE):
-                places[path.name] = sb.rehearse_section_of(path.read_text(), sb.REHEARSE_HEADING)
+            places[TEMPLATE.name] = sb.rehearse_section_of(TEMPLATE.read_text(), sb.REHEARSE_HEADING)
             with captured() as (out, err):
                 try:
                     sb.main(["rehearse", "--help"], runner=self.runner, now=self.world.clock.now)
                 except SystemExit:
                     pass
             places["help"] = out.getvalue()
-            self.assertEqual(len(places), 3)
+            self.assertEqual(len(places), 2)
+            pointer = sb.rehearse_section_of(SKILL.read_text(), sb.REHEARSE_HEADING)
+            self.assertIsNotNone(pointer)
+            self.assertEqual(SKILL.read_text().count(sb.REHEARSE_HEADING), 1)
+            self.assertIn("docs/plan-template.md", pointer)
+            self.assertIn("fleet-switchboard rehearse -h", pointer)
             for name, text in places.items():
                 self.assertIsNotNone(text, name)
                 self.assertEqual(sb.rehearse_sentences_of(text), list(sentences), name)
-            drifted = places["SKILL.md"].replace("only for a change", "only for any change")
+            drifted = places["plan-template.md"].replace("only for a change", "only for any change")
             self.assertEqual(len(sb.rehearse_sentences_of(drifted)), 4)
 
         def test_u2_the_section_runs_nothing_but_ls_remote_and_a_row_is_text(self):
@@ -210,13 +214,13 @@ def build(HandoffCase):
             self.assertNotEqual(self.plan_check(REPO, PASSING)[0], self.plan_check(REPO, FAILING)[0])
 
         def test_s2_both_documents_carry_the_rule_with_its_three_parts(self):
-            for path in (SKILL, TEMPLATE):
+            for path in (TEMPLATE,):
                 text = sb.rehearse_section_of(path.read_text(), sb.REHEARSE_HEADING)
                 self.assertIsNotNone(text, path.name)
                 folded = " ".join(text.split())
                 for part in ("no commit and no push runs before the plan is approved", "the plan then names each row first", "skipped only for a change of documents only", "the approver of the plan judges it"):
                     self.assertIn(part, folded, path.name)
-            planted = " ".join(sb.rehearse_section_of(SKILL.read_text(), sb.REHEARSE_HEADING).split()).replace("the approver of the plan judges it", "")
+            planted = " ".join(sb.rehearse_section_of(TEMPLATE.read_text(), sb.REHEARSE_HEADING).split()).replace("the approver of the plan judges it", "")
             self.assertNotIn("the approver of the plan judges it", planted)
 
         def numstat(self):
@@ -227,16 +231,22 @@ def build(HandoffCase):
 
         def test_s2_the_documents_gain_inserted_lines_only(self):
             rows = {r[2]: r for r in self.numstat()}
-            for name in ("skills/fleet-planning/SKILL.md", "docs/plan-template.md"):
-                if name in rows:
-                    self.assertEqual(rows[name][1], "0", name)
+            self.assertEqual(rows["skills/fleet-planning/SKILL.md"][1], "5")
+            if "docs/plan-template.md" in rows:
+                self.assertEqual(rows["docs/plan-template.md"][1], "0")
+
+        def test_u4_the_skill_is_within_its_word_cap(self):
+            words = len(SKILL.read_text().split())
+            print("skill words:", words)
+            self.assertLessEqual(words, 1200)
+            self.assertEqual(words, 1198)
 
         def test_s8_no_existing_test_line_changes_and_no_pin_change_commit(self):
             for added, removed, name in self.numstat():
                 if name.startswith("tests/") or name == "bin/test-switchboard":
                     self.assertEqual(removed, "0", name)
             log = subprocess.run(["git", "log", "--format=%s", "origin/integration..HEAD"], cwd=str(REPO), stdout=subprocess.PIPE, universal_newlines=True, check=True).stdout
-            self.assertNotIn("pin change of #1785", log)
+            self.assertEqual(log.count("pin change of #1785 (the planning skill shortened under its cap)"), 5)
 
         def test_s9_a_planted_unknown_class_is_the_one_failing_name(self):
             text = "class TestKnown(object):\n    pass\n"
