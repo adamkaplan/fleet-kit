@@ -22,7 +22,8 @@ def without_check(source, name):
     line = '        raise LedgerCommandError("%s is not run from a cloud pod: record it with `cw-cloud relay %s`")\n' % (name, name)
     assert source.count(line) == 1, "the check of %s does not occur once" % name
     head = source.index(line)
-    start = source.rindex("\n", 0, source.rindex(MARK, 0, head)) + 1
+    start = source.rindex("\n", 0, head - 1) + 1   # the condition line just before the raise, whatever its text
+    assert source[start:head].lstrip().startswith("if ") and "#1875" in source[start:head], "the line before the check is not its condition"
     mutated = source[:start] + source[head + len(line):]
     assert mutated != source and len(mutated) < len(source), "the mutation was not applied"
     return mutated
@@ -128,9 +129,10 @@ class TestOutsideAPod(Runs):
                 mine = self.run_cmd(sb, argv, False, config)
                 theirs = self.run_cmd(tip, argv, False, config)
                 print("S3 %s config=%r: exit %s, %r" % (name, config, mine[0], mine[2].strip()[:60]))
+                for run in (mine, theirs):   # the control itself holds the outside-a-pod text
+                    self.assertIn("'opencode' is not configured", run[1] + run[2])
+                    self.assertNotIn("cw-cloud relay", run[1] + run[2])
                 self.assertEqual(mine[:3], theirs[:3])
-                self.assertIn("'opencode' is not configured", mine[1] + mine[2])
-                self.assertNotIn("cw-cloud relay", mine[1] + mine[2])
 
     def test_s3_the_empty_marker_behaves_as_unset(self):
         cases = 0
