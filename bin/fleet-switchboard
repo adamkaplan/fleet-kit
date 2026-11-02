@@ -22488,7 +22488,7 @@ def preflight_added(runner, root):
             diff = runner(["git", "diff", "--name-status", "--no-renames", "--diff-filter=A", found.stdout.strip()], cwd=root, capture_output=True, text=True)
             if diff.returncode == 0:
                 rows = [line.split("\t", 1) for line in diff.stdout.splitlines() if "\t" in line]
-                return sorted(path for status, path in rows if status == "A" and path.startswith("bin/") and "__pycache__" not in path)
+                return sorted(path for status, path in rows if status == "A" and path.startswith(("bin/", "shims/")) and "__pycache__" not in path)
     return []
 
 
