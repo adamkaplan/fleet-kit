@@ -71919,6 +71919,8 @@ class MergeGateBase(Base):
         self.fake.tip = MG_NEWTIP
 
 
+_merge_gate_answer = importlib.import_module("test_merge_gate_answer"); TestMergeGateAnswer, TestMergeGateAnswerMutant = _merge_gate_answer.TestMergeGateAnswer, _merge_gate_answer.TestMergeGateAnswerMutant   # #1992
+
 class TestMergeGateDecision(MergeGateBase):
     """The read-only block and the decision (#962 clauses 2, 3, 6, 7)."""
 
