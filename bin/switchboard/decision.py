@@ -183,12 +183,13 @@ def compose(recipient, facts, cap=MESSAGE_CAP, section=None, repos=None, deliver
     facts = sorted(facts, key=compose_order)
     if not facts:
         raise ValueError("nothing to compose")
+    held_word = lambda held: "held ??" if not -1e18 < held < 1e18 else "held %d h" % (held // 3600) if held >= 7200 else "held %d min" % (held // 60)   # a time that is not finite never stops a message
     if facts[0].orders:  # PR 17: the orders note, whole: every order
         note = orders_note(recipient, facts[0], repos)
         late = None if delivered is None or fault("no-sent-time") else delayed_since(facts[:1], delivered)
         if late is not None:   # #1564: an old order says so in its first line (the one age rule)
             first, _, rest = note.partition("\n")
-            note = "%s (delayed: sent %s, delivered %s):%s" % (first.rstrip(":"), clock_day(late, delivered), clock_utc(delivered), "\n" + rest if rest else "")
+            note = "%s (delayed: sent %s, %s, delivered %s):%s" % (first.rstrip(":"), clock_day(late, delivered), held_word(delivered - late), clock_utc(delivered), "\n" + rest if rest else "")
         return note, facts[:1]
 
     replaced = {}
@@ -214,8 +215,7 @@ def compose(recipient, facts, cap=MESSAGE_CAP, section=None, repos=None, deliver
             first, last = clock_day(min(sent_at(f) for f in taken), delivered), clock_day(max(f.created for f in taken), delivered)
             late = delayed_since(taken, delivered)   # #1402: the sent time comes first, and an old alert or digest says so in this first line
             if late is not None:
-                held = delivered - late
-                held = "held ??" if not -1e18 < held < 1e18 else "held %d h" % (held // 3600) if held >= 7200 else "held %d min" % (held // 60)   # a time that is not finite never stops a message
+                held = held_word(delivered - late)
                 sent = "delayed: sent %s, %s" % (clock_day(late, delivered), held) + ("" if first == last else ", newest sent %s" % last)
             else:
                 sent = "sent %s" % (first if first == last else "%s-%s" % (first, last))

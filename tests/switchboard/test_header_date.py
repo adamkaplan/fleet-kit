@@ -139,7 +139,7 @@ class TestHeaderDateCallSites(unittest.TestCase):
     def check_c(self, compose):
         fact = sb.Fact("orders:1:ab:start", "platform", "orders", "approve", self.PREV, issue=1, orders=True)
         head = self.head(compose, [fact])
-        assert "delayed: sent 2027-01-15 15:15Z, delivered 14:23Z" in head, "the single late note carries the date: " + head
+        assert "delayed: sent 2027-01-15 15:15Z, held 23 h, delivered 14:23Z" in head, "the single late note carries the date: " + head
 
     def run_mutant(self, check, old, new, message):
         control, mutant = mutant_of(sb.compose, old, new)
@@ -159,6 +159,22 @@ class TestHeaderDateCallSites(unittest.TestCase):
     def test_m1c_the_single_message_late_note_carries_the_date(self):
         self.run_mutant(self.check_c, "(first.rstrip(\":\"), clock_day(late, delivered)", "(first.rstrip(\":\"), clock_utc(late)",
                         "the single late note carries the date")
+
+    def test_m1d_the_single_message_late_note_carries_the_held_word(self):
+        self.run_mutant(self.check_d, "held_word(delivered - late), clock_utc(delivered)", '"", clock_utc(delivered)',
+                        "the orders late note carries the held word")
+
+    def check_d(self, compose):
+        assert "held 23 h, delivered 14:23Z" in self.head(compose, [self.orders_fact()]), "the orders late note carries the held word"
+
+    def orders_fact(self):
+        return sb.Fact("orders:1:ab:start", "platform", "orders", "approve", self.PREV, issue=1, orders=True)
+
+    def test_m1e_an_orders_note_with_a_non_finite_delivery_time_is_delivered(self):
+        for delivered in (float("inf"), float("nan")):
+            text, carried = sb.compose("platform", [self.orders_fact()], delivered=delivered)
+            self.assertEqual(len(carried), 1)
+            self.assertTrue(text)
 
     def test_m2_without_a_delivery_time_the_plain_clock_text_is_returned(self):
         def check(clock_day):
