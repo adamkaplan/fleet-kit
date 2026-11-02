@@ -146,30 +146,66 @@ def problems(tests_dir, source, exempt):
     return out
 
 
+def stale_key(tests_dir, key):
+    """True when an exemption key names no file, or (file.py::ClassName) a class that is not a module-level TestCase class of that file."""
+    name, _, cls = key.partition("::")
+    path = Path(tests_dir) / name
+    if not (name.startswith("test_") and path.is_file()):
+        return True
+    return bool(cls) and cls not in test_classes(path)
+
+
 def class_problems(tests_dir, source, exempt):
     """#1847: one message per module-level TestCase class that the runner does not bind by name.
 
-    A base class (another class of the same file derives from it) is not required; a class is exempt by the key file.py::ClassName
-    (its reason is read by `problems`); a file name key exempts the whole file. A file the runner does not import is reported by `problems`.
+    A base class is not required only when a class that derives from it (directly or through other classes of the file) is bound;
+    otherwise it is reported with its subclasses. A class defined more than once at module level is reported with the count.
+    A class is exempt by the key file.py::ClassName (its reason is read by `problems`); a file name key exempts the whole file.
+    An exemption key that names no file, or no TestCase class of the file, is reported. A file the runner does not import is reported by `problems`.
     """
     imported, bound = loader_facts(source)
     out = []
+    for key in sorted(exempt):
+        if stale_key(tests_dir, key):
+            out.append("%s: exemption key names no file or no module-level TestCase class of it" % key)
     for path in sorted(Path(tests_dir).glob("test_*.py")):
         name, mod = path.name, path.stem
         if name in exempt or mod not in imported:
             continue
         classes = test_classes(path)
-        bases = set()
+        parents = {}
+        counts = {}
         for node in ast.parse(path.read_text()).body:
             if isinstance(node, ast.ClassDef):
-                bases.update(ast.unparse(b).split(".")[-1] for b in node.bases)
-        for cls in sorted(classes - bound.get(mod, set()) - bases):
+                parents[node.name] = [ast.unparse(b).split(".")[-1] for b in node.bases]
+                counts[node.name] = counts.get(node.name, 0) + 1
+        for cls in sorted(classes):
+            if counts[cls] > 1:
+                out.append("%s: class %s defined %d times: only the last runs" % (name, cls, counts[cls]))
+        hidden = set()      # the ancestors of a bound class: their tests run through it
+        for cls in classes & bound.get(mod, set()):
+            todo = list(parents.get(cls, []))
+            while todo:
+                parent = todo.pop()
+                if parent not in hidden:
+                    hidden.add(parent)
+                    todo.extend(parents.get(parent, []))
+        for cls in sorted(classes - bound.get(mod, set()) - hidden):
             if "%s::%s" % (name, cls) not in exempt:
-                out.append("%s: class %s is not bound at module level by bin/test-switchboard" % (name, cls))
+                below = sorted(c for c in classes if c != cls and cls in _ancestors(c, parents))
+                out.append("%s: class %s is not bound at module level by bin/test-switchboard%s"
+                           % (name, cls, " (subclasses: %s)" % ", ".join(below) if below else ""))
     return out
 
 
-
+def _ancestors(cls, parents):
+    seen, todo = set(), list(parents.get(cls, []))
+    while todo:
+        parent = todo.pop()
+        if parent not in seen:
+            seen.add(parent)
+            todo.extend(parents.get(parent, []))
+    return seen
 
 
 class TestEveryTestFileIsWired(unittest.TestCase):
@@ -306,6 +342,58 @@ class TestWiredCheckPlanted(unittest.TestCase):
         (self.tmp / "test_planted.py").write_text(TWO_CLASSES)
         self.assertEqual(problems(self.tmp, self.source, {"test_planted.py": LONG}), [])
 
+    def lone(self, text, name="test_planted.py"):
+        """A directory holding only the planted file (#1847)."""
+        d = Path(tempfile.mkdtemp(prefix="wired-lone-"))
+        self.addCleanup(shutil.rmtree, d, True)
+        (d / name).write_text(text)
+        return d
+
+    def test_s9_a_bound_subclass_hides_its_base_and_an_unbound_one_is_reported_with_it(self):
+        d = self.lone(BASE_AND_SUB)
+        self.assertEqual(len(class_problems(d, "from test_planted import TestSub\n", {})), 0)
+        out = class_problems(d, "import test_planted\n", {})
+        self.assertEqual(len(out), 2, out)
+        self.assertIn("class Base ", out[0])
+        self.assertIn("TestSub", out[0])
+        self.assertIn("class TestSub ", out[1])
+        chain = self.lone(CHAIN)
+        self.assertEqual(len(class_problems(chain, "from test_planted import Leaf\n", {})), 0)
+        out = class_problems(chain, "import test_planted\n", {})
+        self.assertEqual(len(out), 3, out)
+
+    def test_s10_stale_exemption_keys_are_reported_by_name(self):
+        d = self.lone(TWO_CLASSES)
+        keys = {"test_gone.py::TestX": LONG, "test_planted.py::TestNope": LONG, "test_nofile.py": LONG, "test_planted.py::TestB": LONG}
+        out = problems(d, "from test_planted import TestA\n", keys)
+        self.assertEqual(len(out), 3, out)
+        for key in ("test_gone.py::TestX", "test_planted.py::TestNope", "test_nofile.py"):
+            self.assertEqual(len([m for m in out if m.startswith(key + ": exemption key")]), 1, out)
+        self.assertEqual([m for m in out if "TestB" in m], [])
+
+    def test_s11_a_class_defined_twice_is_reported_with_the_count(self):
+        twice = self.lone(TWO_CLASSES.replace("TestB", "TestA"))
+        out = problems(twice, "from test_planted import TestA\n", {})
+        self.assertEqual(len(out), 1, out)
+        self.assertIn("class TestA defined 2 times: only the last runs", out[0])
+        once = self.lone(TWO_CLASSES)
+        self.assertEqual(problems(once, "from test_planted import TestA, TestB\n", {}), [])
+
+    def test_s12_only_the_direct_forms_bind_a_class(self):
+        runner = ('import importlib\nm = importlib.import_module("test_planted")\nA = m.TestA\nB, C = (m.TestB, m.TestC)\n'
+                  'D = m.build()\nE = m.TestE.helper\nF = [m.TestF][0]\n')
+        names = ["TestA", "TestB", "TestC", "D", "TestE", "TestF"]
+        d = self.lone("import unittest\n\n" + "".join(
+            "class %s(unittest.TestCase):\n    def test_x(self):\n        pass\n\n" % n for n in names))
+        bound = sorted(loader_facts(runner)[1]["test_planted"])
+        self.assertEqual(len(bound), 4, bound)
+        self.assertEqual(bound, ["D", "TestA", "TestB", "TestC"])
+        out = problems(d, runner, {})
+        self.assertEqual(len(out), 2, out)
+        self.assertIn("class TestE ", out[0])
+        self.assertIn("class TestF ", out[1])
+        self.assertEqual(problems(TESTS, RUNNER.read_text(), EXEMPT_FILES), [])
+
     def test_s2_the_real_directory_has_no_unbound_class(self):
         files = list(TESTS.glob("test_*.py"))
         classes = [c for f in files for c in test_classes(f)]
@@ -378,6 +466,28 @@ class TestMutantIsCaught(unittest.TestCase):
         got = run_named_cases(self.load_mutant(CLASS_RULE_ORIGINAL, CLASS_RULE_MUTATED), [name])
         self.assertEqual(got, {name: "AssertionError: 0 != 1 : []"})
 
+    def mutant_run(self, name, original, mutated):
+        import sys
+        this = sys.modules[__name__]
+        self.assertEqual(run_named_cases(this, [name]), {name: None})      # the control: the unmutated check
+        return run_named_cases(self.load_mutant(original, mutated), [name])[name]
+
+    def test_s9_the_always_exempt_base_mutant_fails_with_its_text(self):
+        got = self.mutant_run("test_s9_a_bound_subclass_hides_its_base_and_an_unbound_one_is_reported_with_it", S9_ORIGINAL, S9_MUTATED)
+        self.assertEqual(got, "AssertionError: 1 != 2 : ['test_planted.py: class TestSub is not bound at module level by bin/test-switchboard']")
+
+    def test_s10_the_skip_stale_keys_mutant_fails_with_its_text(self):
+        got = self.mutant_run("test_s10_stale_exemption_keys_are_reported_by_name", S10_ORIGINAL, S10_MUTATED)
+        self.assertEqual(got, "AssertionError: 0 != 3 : []")
+
+    def test_s11_the_count_once_mutant_fails_with_its_text(self):
+        got = self.mutant_run("test_s11_a_class_defined_twice_is_reported_with_the_count", S11_ORIGINAL, S11_MUTATED)
+        self.assertEqual(got, "AssertionError: 0 != 1 : []")
+
+    def test_s12_the_read_every_attribute_mutant_fails_with_its_text(self):
+        got = self.mutant_run("test_s12_only_the_direct_forms_bind_a_class", S12_ORIGINAL, S12_MUTATED)
+        self.assertEqual(got, "AssertionError: 7 != 4 : ['D', 'TestA', 'TestB', 'TestC', 'TestE', 'TestF', 'build']")
+
     def test_the_real_module_passes_the_same_tests(self):
         import sys
         this = sys.modules[__name__]
@@ -385,10 +495,20 @@ class TestMutantIsCaught(unittest.TestCase):
 
 
 # #1847: the class check. Halves keep each mutated line once in this file.
-CLASS_RULE_ORIGINAL = "        for cls in sorted(classes - " + "bound.get(mod, set()) - bases):"
-CLASS_RULE_MUTATED = "        for cls in sorted(set() if classes & " + "bound.get(mod, set()) else classes - bases):"
+CLASS_RULE_ORIGINAL = "        for cls in sorted(classes - " + "bound.get(mod, set()) - hidden):"
+CLASS_RULE_MUTATED = "        for cls in sorted(set() if classes & " + "bound.get(mod, set()) else classes - hidden):"
 TWO_CLASSES = "import unittest\n\nclass TestA(unittest.TestCase):\n    def test_a(self):\n        pass\n\nclass TestB(unittest.TestCase):\n    def test_b(self):\n        pass\n"
 BASE_AND_SUB = "import unittest\n\nclass Base(unittest.TestCase):\n    def test_a(self):\n        pass\n\nclass TestSub(Base):\n    def test_b(self):\n        pass\n"
+S9_ORIGINAL = "        for cls in sorted(classes - " + "bound.get(mod, set()) - hidden):"
+S9_MUTATED = "        for cls in sorted(classes - " + "bound.get(mod, set()) - {b for v in parents.values() for b in v}):"
+S10_ORIGINAL = "        if stale_" + "key(tests_dir, key):"
+S10_MUTATED = "        if False and stale_" + "key(tests_dir, key):"
+S11_ORIGINAL = "            if counts[cls] " + "> 1:"
+S11_MUTATED = "            if min(counts[cls], 1) " + "> 1:"
+S12_ORIGINAL = "            for sub in direct_" + "attributes(node.value):"
+S12_MUTATED = "            for sub in ast." + "walk(node.value):"
+CHAIN = ("import unittest\n\nclass Base(unittest.TestCase):\n    def test_a(self):\n        pass\n\n"
+         "class Mid(Base):\n    def test_b(self):\n        pass\n\nclass Leaf(Mid):\n    def test_c(self):\n        pass\n")
 LOADER_TA = "\nfrom test_planted import TestA\n"
 LONG = "a class another runner executes"
 
