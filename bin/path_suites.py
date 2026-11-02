@@ -44,6 +44,13 @@ NEW_BIN_GUARDS = (
     ("TestDerivedClosure", "bin/test-switchboard", "TestDerivedClosure", None, "the closure of the delegated clear is derived over the entry and every part (tests/switchboard/test_closure.py)"),
 )
 
+# The guards a NEW file under shims/ must pass (ask #1909): same shape as NEW_BIN_GUARDS.
+NEW_SHIM_GUARDS = (
+    ("TestShimHygiene", "bin/test-switchboard", "TestShimHygiene", None, "every module under shims/ is standard library only and holds no personal name"),
+    ("bin/check-public-names", "bin/check-public-names", None, None, "no private name in a tracked file"),
+    ("bin/test-gh-hold", "bin/test-gh-hold", None, None, "every shim module is installed beside the shim in its rig and the hold tests pass"),
+)
+
 
 class PathSuitesError(Exception):
     pass
@@ -266,15 +273,16 @@ def added_paths(root, base, runner=subprocess.run):
         raise PathSuitesError("no common ancestor of HEAD and %s" % base)
     diff = _git(root, "diff", "--name-only", "--no-renames", "--diff-filter=A", mb.stdout.strip(), runner=runner, check=True)
     other = _git(root, "ls-files", "--others", "--exclude-standard", runner=runner)
-    return sorted(p for p in set(diff.stdout.split("\n")) | set(other.stdout.split("\n")) if p.startswith("bin/") and "__pycache__" not in p and not p.endswith(".pyc"))
+    return sorted(p for p in set(diff.stdout.split("\n")) | set(other.stdout.split("\n")) if p.startswith(("bin/", "shims/")) and "__pycache__" not in p and not p.endswith(".pyc"))
 
 
 def guard_rows(added):
-    """The rows (suite, classes, command, why) of the four guards, when `added` holds a new file under bin/; [] otherwise. Same shape as the rows of `plan`."""
+    """The rows (suite, classes, command, why) of the four guards, when `added` holds a new file under bin/ or shims/; [] otherwise. Same shape as the rows of `plan`."""
     new = [p for p in added or [] if p.startswith("bin/")]
-    if not new:
+    shims = [p for p in added or [] if p.startswith("shims/")]
+    if not new and not shims:
         return []
-    return [(g[1], [g[2]] if g[2] else [], guard_command(g), new) for g in NEW_BIN_GUARDS]
+    return [(g[1], [g[2]] if g[2] else [], guard_command(g), new) for g in NEW_BIN_GUARDS if new] + [(g[1], [g[2]] if g[2] else [], guard_command(g), shims) for g in NEW_SHIM_GUARDS if shims]
 
 
 def plan(root, paths, files=None, runner=subprocess.run, added=None):
