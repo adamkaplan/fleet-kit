@@ -110,6 +110,7 @@ class Rig:
 
     def arrange(self, for_pane_state=False):
         c, herdr = self.case, self.herdr
+        self.saved = herdr.panes.get(self.pane, getattr(self, "saved", None))   # the agent's pane as the fake holds it (put back by `rediscover`)
         if c.get("nosession"):   # the registry row never got a session id; the agent is no longer discovered
             self.registry.upsert(self.world.state, NAME, {"pane": self.pane, "session": None, "role": None, "workspace": None, "cwd": None})
         if c.get("nopane"):
@@ -159,6 +160,20 @@ class Rig:
         self.arrange()
         for n in range(sb.PANE_MISSING_PASSES):
             self.pass_once(offset=n + 1)
+
+    def absent_passes(self, count, start=0):
+        """`count` more passes with the agent absent from the agent list (offsets after `start`)."""
+        for n in range(count):
+            self.pass_once(offset=start + n + 1)
+
+    def rediscover(self):
+        """The agent comes back to the agent list (its pane as before): a pass that DECIDES for it, the streak is over."""
+        self.herdr.panes[self.pane] = self.saved
+        self.herdr.plain_terminals = []
+        self.pass_once(offset=100)
+
+    def undecidable_lines(self):
+        return self.events("pane.undecidable")
 
     def recorded(self):
         return (sb.read_pane_health(self.world.state)["states"].get(NAME) or {}).get("state")
@@ -309,3 +324,59 @@ class TestDaemonDeadVerdictMutants(Base):
     def test_S10_mutant_death_requires_the_pane_to_be_gone(self):
         self.run_check("daemon_shows_absent", MUTANT_LINE, 'return evidence.get("pane_listed") is False and bool(load_module("registry").evidence_shows_absent(evidence))',
                        "a listed bare shell is not recorded dead by the loop")
+
+
+class TestUndecidableStreak(Base):
+    """S11 (PC-6): a LISTED pane whose agent row has no recorded session id is answered `unknown` by the missing-pass loop; the streak is said ONCE."""
+
+    N = property(lambda self: sb.PANE_MISSING_PASSES)
+
+    def streak(self, answers, rig=None):
+        """A rig for the no-session case, the agent seen once, then absent: PANE_MISSING_PASSES - 1 passes that cannot answer, then `answers` passes that answer unknown."""
+        rig = rig or Rig(self, DEAD_CASES["listed, no recorded session"])
+        rig.pass_once()
+        rig.arrange()
+        rig.absent_passes(self.N - 1 + answers)
+        return rig
+
+    def test_S11_two_answers_write_no_line_three_write_one_six_still_one_and_never_dead(self):
+        for answers, lines in ((2, 0), (3, 1), (6, 1)):
+            with self.subTest(answers=answers):
+                rig = self.streak(answers)
+                self.assertEqual(len(rig.undecidable_lines()), lines)
+                self.assertNotEqual(rig.recorded(), "dead")
+                self.assertEqual(rig.events(), [])   # 0 fleetpane.dead
+                if lines:
+                    line = rig.undecidable_lines()[0]
+                    self.assertEqual((line["name"] if "name" in line else NAME, line["detail"]["pane"], line["detail"]["passes"]), (NAME, rig.pane, self.N))
+
+    def test_S11_a_pass_that_decides_clears_the_streak_and_a_later_streak_writes_a_new_line(self):
+        rig = self.streak(3)
+        self.assertEqual(len(rig.undecidable_lines()), 1)
+        rig.rediscover()
+        self.assertEqual(sb.read_pane_health(rig.world.state)["states"][NAME].get("undecidable"), None)
+        self.assertNotEqual(rig.recorded(), "dead")
+        self.assertEqual(len(rig.undecidable_lines()), 1)
+        rig.arrange()   # the same agent, no recorded session again: a later streak
+        rig.absent_passes(self.N - 1 + 2, start=100)
+        self.assertEqual(len(rig.undecidable_lines()), 1)   # 2 answers: not yet
+        rig.absent_passes(1, start=200)
+        self.assertEqual(len(rig.undecidable_lines()), 2)
+        self.assertEqual(rig.events(), [])
+
+    def test_S11_the_streak_is_kept_in_the_agent_state_record_for_the_doctor(self):
+        rig = self.streak(4)
+        self.assertEqual(sb.read_pane_health(rig.world.state)["states"][NAME]["undecidable"], 4)
+
+    def test_S11_mutant_a_line_for_each_pass(self):
+        control = self.collect(None)
+        self.assertEqual(control, [], "control: the check must pass on the unmutated daemon")
+        func, count = source_copy_function("undecidable_streak", 'record["undecidable"] == PANE_MISSING_PASSES and ', "")
+        self.assertEqual(count, 1, "the mutation must be applied exactly once")
+        found = self.collect(func)
+        self.assertTrue(any("pane.undecidable is written more than once for one streak" in f for f in found), found)
+
+    def collect(self, func):
+        with mock.patch.object(sb, "undecidable_streak", func or sb.undecidable_streak):
+            rig = self.streak(6)
+        return [] if len(rig.undecidable_lines()) == 1 else ["pane.undecidable is written more than once for one streak"]
