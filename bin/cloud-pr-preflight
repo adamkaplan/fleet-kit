@@ -260,6 +260,17 @@ def main():
             print("NOT RUN: %s is neither chained in %s nor in EXCEPTIONS" % (rel, CHAIN))
         failed |= bool(bad)
         print("scan: " + ("FAIL" if bad else "ok"))
+        rc, out = git("diff", "--name-only", "--no-renames", "--diff-filter=AM", mb, "--", "tests/switchboard/", cwd=root)   # #1967: a new or changed switchboard test file is read before the push
+        if any(x.count("/") == 2 and os.path.basename(x).startswith("test_") and x.endswith(".py") for x in out.splitlines()):
+            print("\n== new test file checks (tools/new-test-checks) ==")
+            tool = os.path.join(root, "tools", "new-test-checks")
+            if not os.path.exists(tool):
+                print("SKIP new-test-checks: tools/new-test-checks is not in this tree")
+            else:
+                done = subprocess.run([sys.executable, tool, "--base", mb], cwd=root, capture_output=True, text=True)
+                print((done.stdout + done.stderr).rstrip("\n") or "(no findings)")
+                print("new-test-checks: " + ("FAIL" if done.returncode else "ok"))
+                failed |= bool(done.returncode)
 
         sel_of = {}
         if quick:
