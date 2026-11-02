@@ -155,18 +155,11 @@ def build(Base, World, FAKE_OPENCODE, FAKE_HERDR):
         def test_under_light_a_blocked_agent_is_read_blocked_and_nothing_is_read(self):
             engine = self.world.engine
             engine.light = True   # the engine's flag for the config key v2_light: True
-            calls = []
-            for method in ("permission_list", "form_list", "message_list"):
-                real = getattr(engine.v2, method)
-
-                def spy(session_id, *a, __real=real, __method=method, **k):
-                    calls.append((__method, session_id))
-                    return __real(session_id, *a, **k)
-                setattr(engine.v2, method, spy)
+            calls = self.counted()
             found = engine.discover(self.world.clock.now()).agents
             self.assertFalse(found["c5-econnreset"].errored)
             self.assertEqual(found["c5-econnreset"].status, "blocked")
-            self.assertEqual(len(calls), 0)
+
         def light_zero_calls(self):
             """Light mode, the blocked c5 agent: the ONE assertion under test is the call count, with its own anchored message."""
             engine = self.world.engine
@@ -197,9 +190,38 @@ def build(Base, World, FAKE_OPENCODE, FAKE_HERDR):
                 applied.append(observation.name if hasattr(observation, "name") else True)
                 return real(engine, observation, now)
             with mock.patch.object(sb, "read_errored_turn", mutant):
-                with self.assertRaisesRegex(AssertionError, r"^10 != 0 : light guard: v2 reads made under light = \[\('%s'," % method):
+                with self.assertRaisesRegex(AssertionError, r"^%d != 0 : light guard: v2 reads made under light = \[\('%s'," % (len(REAL + ERRORS + AMBIGUOUS), method)):
                     self.light_zero_calls()
             self.assertTrue(applied, "the mutation was not applied")
+
+        def test_light_mutant_real_guard_removed_from_the_entry_fails_the_call_count(self):
+            import tempfile
+            from pathlib import Path
+            import shutil
+            from support.loader import copy_entry, _load, BIN
+            self.light_zero_calls()   # control first: the shipped entry passes
+            needle = ' or getattr(engine, "light", False):'
+            with tempfile.TemporaryDirectory() as tmp:
+                for sibling in BIN.glob("*.py"):
+                    shutil.copy(str(sibling), str(Path(tmp) / sibling.name))
+                copy_entry(tmp)
+                path = None
+                for f in [Path(tmp) / "fleet-switchboard"] + sorted((Path(tmp) / "switchboard").rglob("*.py")):
+                    text = f.read_text()
+                    head = text.find("def read_errored_turn")
+                    if head >= 0:
+                        path, at = f, head
+                        break
+                self.assertIsNotNone(path, "read_errored_turn not found in the copy")
+                text = path.read_text()
+                line = text.index(needle, at)
+                self.assertLess(line - at, 1500, "the guard was not found inside read_errored_turn")
+                path.write_text(text[:line] + ":" + text[line + len(needle):])
+                self.assertNotEqual(path.read_text(), text, "the mutation was not applied")
+                mutated = _load("t_mutated_switchboard_1697", Path(tmp) / "fleet-switchboard")
+            with mock.patch.object(sb, "read_errored_turn", mutated.read_errored_turn):
+                with self.assertRaisesRegex(AssertionError, r"^\d+ != 0 : light guard: v2 reads made under light = "):
+                    self.light_zero_calls()
 
         def test_light_mutant_guard_removed_with_permission_list_fails_the_call_count(self):
             self.check_light_mutant("permission_list")
