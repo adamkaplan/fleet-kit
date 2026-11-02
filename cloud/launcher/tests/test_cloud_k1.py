@@ -640,12 +640,23 @@ class M3TokenEncodedForms(TokenBase):
 
 
 class M2CreateAndDeleteFailureSaysSo(K1Base):
+    def setUp(self):
+        super().setUp()
+        self.kubes = []   # every Kube the launcher makes in this test, recorded as it is made
+        real = cw.Kube.__init__
+
+        def record(kube_self, *a, **kw):
+            real(kube_self, *a, **kw)
+            self.kubes.append(kube_self)
+        cw.Kube.__init__ = record
+        self.addCleanup(setattr, cw.Kube, "__init__", real)
+
     def hook_ok(self, tag="r"):
         work, _ = base.make_repo(self.tmp.name, tag, dirty=False)
         self.patch_state(hook_env={"CW_WORKDIR": work, "CW_WORKER": "coder7"})
 
     def delete_cmd(self, name):
-        return "%s --context acme-cw -n cw delete secret %s" % (self.env["CW_KUBECTL"], name)
+        return self.kubes[-1].scrub("%s --context acme-cw -n cw delete secret %s" % (self.env["CW_KUBECTL"], name), limit=1000)   # as the launcher prints it: the SAME Kube object the launcher scrubbed the message with, with its real known set (the planted values, the pod password, the run secrets)
 
     def test_failed_create_with_cleanup_ok_says_cleaned_once_in_audit_and_output(self):
         self.patch_state(never_ready=True)

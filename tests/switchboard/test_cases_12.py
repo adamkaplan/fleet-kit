@@ -1198,7 +1198,7 @@ class TestSelfRegisteringCli(unittest.TestCase):
     def test_two_branches_that_add_different_commands_touch_no_common_file_and_merge_cleanly(self):
         with tempfile.TemporaryDirectory() as work:
             env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.test", GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.test",
-                       GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_SYSTEM="/dev/null")
+                       HOME=work, XDG_CONFIG_HOME=work, GIT_CONFIG_NOSYSTEM="1")
 
             def git(*args):
                 done = subprocess.run(["git", "-C", work] + list(args), capture_output=True, text=True, env=env)
