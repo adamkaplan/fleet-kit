@@ -2992,6 +2992,198 @@ def main(args):
         app_cleanup()   # a token file made for this call never outlives it
 
 
+
+# ---- #1895: a pull request body is checked on every write through the shim (new lines only)
+PR_BODY_PATH_RE = re.compile(r"^repos/([^/]+/[^/]+)/(pulls|issues)/([0-9]+)$")
+BODY_SECONDS = 5.0
+BODY_MODULE = [None, False]
+
+
+def load_body_guard():
+    if not BODY_MODULE[1]:
+        BODY_MODULE[1] = True
+        try:
+            path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "body_guard.py")
+            spec = importlib.util.spec_from_file_location("body_guard", path)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            BODY_MODULE[0] = module
+        except Exception:
+            BODY_MODULE[0] = None
+    return BODY_MODULE[0]
+
+
+
+
+def drop_plan_temp(plan):
+    if plan and isinstance(plan[2], str):
+        try:
+            os.unlink(plan[2])
+        except OSError:
+            pass
+
+
+class BodyRefusal(Exception):
+    pass
+
+
+def body_seconds():
+    try:
+        seconds = float(os.environ.get("FLEET_SHIM_BODY_SECONDS", BODY_SECONDS))
+    except ValueError:
+        seconds = BODY_SECONDS
+    return min(10.0, max(0.2, seconds))
+
+
+def body_text_of_file(path):
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    except OSError as err:
+        raise BodyRefusal("the new body file cannot be opened (%s), so it cannot be checked and nothing was written" % type(err).__name__)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise BodyRefusal("the new body file %s is not a regular file, so it cannot be checked and nothing was written" % _clean_reason(path, 60))
+        with os.fdopen(fd, "rb", closefd=False) as handle:
+            return handle.read().decode("utf-8")
+    except (OSError, UnicodeError) as err:
+        raise BodyRefusal("the new body file cannot be read (%s), so it cannot be checked and nothing was written" % type(err).__name__)
+    finally:
+        os.close(fd)
+
+
+def body_text_of_stdin():
+    try:
+        return sys.stdin.buffer.read().decode("utf-8")
+    except (OSError, UnicodeError, AttributeError) as err:
+        raise BodyRefusal("the new body on stdin cannot be read (%s), so it cannot be checked and nothing was written" % type(err).__name__)
+
+
+def pr_edit_body(args):
+    """(new text, repo or None, number or None, stdin_used) of a `gh pr edit` that carries a body, or None when it carries none."""
+    positions = command_word_positions(args)
+    drop = {positions[0][0], positions[1][0]}
+    norm = ["pr", "edit"] + [a for i, a in enumerate(args) if i not in drop]
+    found = body_flag(norm)
+    if found is None:
+        return None
+    index, kind, inline = found
+    value = inline if inline is not None else (norm[index + 1] if index + 1 < len(norm) else "")
+    used = False
+    if kind == "body":
+        text = value
+    elif value == "-":
+        text, used = body_text_of_stdin(), True
+    else:
+        text = body_text_of_file(value)
+    repo, number = None, None
+    hold = load_hold()
+    if hold is not None:
+        parsed = hold.parse_flags(norm[2:], hold.PR_EDIT)
+        pos = list(parsed.positional)
+        repos = [hold.norm_repo(r) for r in parsed.repos]
+        for p in pos:
+            m = hold.URL_RE.match(p)
+            if m:
+                repos.append(hold.norm_repo(m.group(1)))
+                number = int(m.group(3))
+        if number is None and len(pos) == 1 and pos[0].isdigit():
+            number = int(pos[0])
+        if parsed.ambiguous or len(pos) > 1:
+            number = None
+        distinct = {r for r in repos if r}
+        if len(distinct) == 1 and all(repos):
+            repo = next(iter(distinct))
+    return text, repo, number, used, True
+
+
+def api_edit_body(args):
+    """(new text, repo, number, stdin_used, must_be_pr, new argv/stdin plan or None) of a `gh api` PATCH or POST to repos/O/R/pulls/N or issues/N that carries
+    a body, or None."""
+    parsed = api_parsed(args)
+    if parsed.effective_method not in ("PATCH", "POST") or len(parsed.positionals) != 1:
+        return None
+    found = PR_BODY_PATH_RE.match(api_endpoint(parsed.positionals[0][1]))
+    if not found:
+        return None
+    repo, what, number = found.group(1), found.group(2), int(found.group(3))
+    start = api_start(args)
+    text, used, plan = None, False, None
+    if parsed.input is not None:
+        _name, index, inline, value = parsed.input
+        try:
+            raw, obj = read_input_json(value)
+        except Unsignable as err:
+            raise BodyRefusal("%s, so the body cannot be checked and nothing was written" % _clean_reason(str(err)))
+        if isinstance(obj, dict) and "body" in obj:
+            text = obj["body"] if isinstance(obj["body"], str) else ""
+            used = value == "-"
+            plan = passed_copy(args, index + start, inline, value, raw)
+    else:
+        for _i, _flag, _joined, field in parsed.fields[::-1]:
+            key, eq, val = field.partition("=")
+            if key == "body" and eq:
+                if val.startswith("@") and _flag == "field":
+                    text = body_text_of_stdin() if val == "@-" else body_text_of_file(val[1:])
+                    used = val == "@-"
+                    plan = (list(args), text, None) if used else None
+                else:
+                    text = val
+                break
+    if text is None:
+        return None
+    return text, repo, number, used, what == "pulls", plan
+
+
+def body_probe(args, lookup, gh, dropped=()):
+    """(refusal or None, plan or None): see PC-2 to PC-4 of ask #1895. The new body is read first (stdin is handed back to gh through the plan), then the
+    old one ONCE by `api repos/O/R/issues/N` with the account the write would use, under its own deadline. Fail closed."""
+    plan = None
+    try:
+        words = command_words(args)
+        kind = "pr-edit" if words[:2] == ["pr", "edit"] else ("api" if words[:1] == ["api"] else None)
+        if kind is None:
+            return None, None
+        got = pr_edit_body(args) if kind == "pr-edit" else api_edit_body(args)
+        if got is None:
+            return None, None
+        if kind == "pr-edit":
+            text, repo, number, used, must_pr = got
+            plan = (list(args), text, None) if used else None
+        else:
+            text, repo, number, used, must_pr, plan = got
+    except BodyRefusal as err:
+        return str(err), None
+    except Refused as err:
+        return _clean_reason(str(err), 400), None
+    except Exception:
+        return "the body of this write could not be checked (unexpected error) and nothing was written", None
+    try:
+        if repo is None and kind == "pr-edit":
+            repo = explicit_repo(args) or lookup.identity().get("repo")
+        hold, guard = load_hold(), load_body_guard()
+        if not repo or not number or hold is None or guard is None:
+            return "the pull request to check the new body against cannot be resolved (repository or number), so nothing was written", plan
+        try:
+            env = account_env(gh, lookup, args=args)
+        except AppMintRefused as err:
+            return str(err).replace("gh: refused: ", "", 1), plan
+        ctx = hold.Ctx(gh, env, lambda: lookup.identity().get("name"), True)
+        ctx.deadline = time.monotonic() + body_seconds()
+        data = hold.read_json(ctx, ["api", "repos/%s/issues/%d" % (repo, number)])
+        if data is None or not isinstance(data.get("body", ""), (str, type(None))):
+            return "the old body of %s#%d could not be read, so the new one cannot be checked and nothing was written" % (repo, number), plan
+        if "pull_request" not in data:
+            if must_pr:
+                return "%s#%d did not read as a pull request, so its body cannot be checked and nothing was written" % (repo, number), plan
+            return None, plan   # an issue, not a pull request: not this rule's
+        said = guard.check(data.get("body") or "", text, dropped)
+        if said:
+            return said, plan
+        return None, plan
+    except Exception:
+        return "the old body could not be read (unexpected error), so the new one cannot be checked and nothing was written", plan
+
+
 def run(args):
     gh = real_gh()
     if gh is None:
@@ -3020,6 +3212,13 @@ def run(args):
                          "gh: refused: %s, so it cannot be signed and nothing was posted\n" % _clean_reason(str(err)))
         audit_write(args, lookup, "refused", write, hold_repo, hold_number)
         return 1
+    if plan is None:
+        said, plan = body_probe(args, lookup, gh)   # a pull request body written over an old one (#1895)
+        if said:
+            sys.stderr.write("gh: refused: %s\n" % _clean_reason(said, 400))
+            audit_write(args, lookup, "refused", write, hold_repo, hold_number)
+            drop_plan_temp(plan)
+            return 1
     refusal = review_probe(args, over_found, over_reason, lookup, gh)
     if refusal is not None:
         sys.stderr.write(refusal + "\n")
