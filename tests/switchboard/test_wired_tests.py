@@ -44,6 +44,15 @@ def _imports(node):
     return None
 
 
+def direct_attributes(value):
+    """The Attribute nodes a value binds directly (#1847): the value itself when it is an Attribute, or those of a Tuple or List (recursively); nothing for any other expression."""
+    if isinstance(value, ast.Attribute):
+        yield value
+    elif isinstance(value, (ast.Tuple, ast.List)):
+        for element in value.elts:
+            yield from direct_attributes(element)
+
+
 def loader_facts(source):
     """(modules imported, {module: names bound at module level}) read from the runner's source by ast.
 
@@ -78,7 +87,7 @@ def loader_facts(source):
         if isinstance(node, ast.ImportFrom) and node.module:
             bound.setdefault(node.module, set()).update(a.name for a in node.names)
         elif isinstance(node, (ast.Assign, ast.AnnAssign)) and node.value is not None:
-            for sub in ast.walk(node.value):
+            for sub in direct_attributes(node.value):
                 if not isinstance(sub, ast.Attribute):
                     continue
                 mod = alias.get(sub.value.id) if isinstance(sub.value, ast.Name) else _imports(sub.value)
