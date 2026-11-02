@@ -61,7 +61,9 @@ def parse_quantity(q):
 
 def requests_fit(shape_name, resources):
     """True when resources hold requests of exactly cpu and memory, each equal to the table's value for the shape and not above the same limit."""
-    req, lim = (resources or {}).get("requests"), (resources or {}).get("limits")
+    if not isinstance(resources, dict) or set(resources) != {"limits", "requests"}:
+        return False
+    req, lim = resources.get("requests"), resources.get("limits")
     table = SHAPE_REQUESTS.get(shape_name)
     try:
         return bool(table) and req == table and set(lim) == {"cpu", "memory"} and all(
