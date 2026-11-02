@@ -1775,7 +1775,7 @@ def render_pod(a, worker, name, now, hard, env, run_names=()):
                   "securityContext": copy.deepcopy(POD_SECURITY_CONTEXT),
                  "containers": [{"name": "worker", "image": image,
                                  "securityContext": {"allowPrivilegeEscalation": False, "capabilities": {"drop": ["ALL"]}}, "env": [{"name": k, "value": v} for k, v in e.items()],
-                                 "resources": {"limits": {"cpu": shape["cpu"], "memory": shape["memory"]}},
+                                 "resources": {"limits": {"cpu": shape["cpu"], "memory": shape["memory"]}, **({"requests": dict(SHAPE_REQUESTS[a.shape])} if a.shape in SHAPE_REQUESTS else {})},
                                  "readinessProbe": {"tcpSocket": {"port": 4096}},
                                  "lifecycle": copy.deepcopy(PRESTOP_LIFECYCLE),
                                  "volumeMounts": [{"name": "pw", "mountPath": "/run/cw", "readOnly": True},
