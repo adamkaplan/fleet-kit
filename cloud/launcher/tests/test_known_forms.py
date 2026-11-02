@@ -129,7 +129,9 @@ class S2Kinds(unittest.TestCase):
                 before = now - 1
                 self.assertEqual(k.sweep(before, pods), 0, "a form was dropped before its event (" + kind + ")")
             elif kind == "pw":
-                self.assertEqual(k.sweep(now, pods | {"p1"}), 0, "a form was dropped before its event (" + kind + ")")
+                pre = k.sweep(now, pods | {"p1"})
+                self.assertTrue(self.F["model"] <= set(k), "a model-entry form was dropped")
+                self.assertEqual(pre, 0, "a form was dropped before its event (" + kind + ")")
             else:
                 self.assertEqual(k.sweep(now, pods | {"p2"}), 0, "a form was dropped before its event (" + kind + ")")
             if kind in ("pw", "hub"):
