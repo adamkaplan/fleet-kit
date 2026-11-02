@@ -612,16 +612,6 @@ def accepted(text):
         return True
     except ValueError:
         return False
-def leaks(out):
-    # a leak: a substring of a run of address characters of the OUTPUT, from a run boundary or a colon or a dot to one, that ipaddress accepts (a zone is set aside)
-    for run in re.findall(r"[0-9A-Fa-f:.]+", out):
-        for i in range(len(run)):
-            if not (i == 0 or (run[i - 1] in ":." and run[i - 2:i] != "::")):
-                continue
-            for j in range(i + 1, min(len(run), i + 64) + 1):
-                if (j == len(run) or (run[j] in ":." and run[j:j + 2] != "::")) and accepted(run[i:j]):
-                    return run[i:j]
-    return None
 """
         PC11_U21 = r"""
 rng = random.Random(1793)
@@ -655,12 +645,25 @@ def address():
 labels = ("", "", "host:", "ip:", "node-a ", "addr=", "[", "to ", "peer=", "x-y:", "pod/c-6152: ", "from (", "'", "\"", "url:", "no route to host:")
 tails = ("", "", ":", ": refused", ":8080", ":80:", "]", "]:80", " text", ",", ".", "=", ")", "; Insufficient cpu", ": connection refused", "/64", ":port")
 bad = []
+NON_ADDRESSES = ("12:30:45", "aa:bb:cc:dd:ee:ff", "123e4567-e89b-12d3-a456-426614174000", "deadbeefcafe0123", "node-a", "1::2::3")
+for text in NON_ADDRESSES:
+    assert not accepted(text), text    # the planted non-addresses are checked with ipaddress on the planted text
+def planted(form):
+    return form.split("%")[0]
 for _ in range(20000):
-    line = rng.choice(labels) + address() + rng.choice(tails)
+    # the oracle knows where it planted each address: every planted address is gone from the output, every planted non-address is unchanged
+    line, put = rng.choice(labels), []
+    form = address(); put.append(planted(form)); line += form + rng.choice(tails)
     if rng.random() < 0.3:
-        line += " " + rng.choice(labels) + address() + rng.choice(tails)
+        line += " " + rng.choice(labels)
+        form = address(); put.append(planted(form)); line += form + rng.choice(tails)
+    keep = rng.sample(NON_ADDRESSES, rng.randint(0, 2))
+    for text in keep:
+        line += " " + text
+    for text in put:
+        assert accepted(text), text    # the planted addresses are checked with ipaddress on the planted text
     out = lib._mask_addresses(line)
-    found = leaks(re.sub(r"%[0-9A-Za-z_-]+", " ", out))
+    found = [t for t in put if t in out] + [t for t in keep if t not in out]
     if found:
         bad.append((line, out, found))
         if len(bad) >= 5:
@@ -708,6 +711,63 @@ for name, form in sorted(forms.items()):
 if split:
     sys.exit("an address split by a window boundary leaked: %d of 483, first %r" % (len(split), split[:3]))
 """
+
+        PC11_U24 = r"""
+passes = [0]
+real_pass = lib._mask_pass
+def counting(text):
+    passes[0] += 1
+    return real_pass(text)
+lib._mask_pass = counting
+twelve = ["10.0.0.1", "fd00::1", "2001:db8::1", "::1", "::ffff:10.0.0.1", "1:2:3:4:5:6:7:8", "192.168.1.20", "fe80::1%eth0", "0:0:0:0:0:ffff:10.9.8.7", "::", "FD00:AB::7", "172.16.0.9"]
+for line, put, keep, want in (("1:2:3:4:5:6:7:fd00::1", ["3:4:5:6:7:fd00::1"], ["1:2:"], "1:2:[address]"),
+                              ("host:1:2:3:4:5:6:7:fd00::1:", ["3:4:5:6:7:fd00::1"], ["host:1:2:"], "host:1:2:[address]:"),
+                              (" ".join(twelve), [t.split("%")[0] for t in twelve], [], None),
+                              ("::1:::1", ["::1", "::1"], [], "[address]:[address]")):
+    for text in put:
+        assert accepted(text), text        # checked with ipaddress on the planted text
+    for text in keep:
+        assert not accepted(text.strip(":")), text
+    passes[0] = 0
+    out = lib._mask_addresses(line)
+    left = [t for t in put if t in out.replace("[address]", "")] 
+    if left or any(t not in out for t in keep) or (want is not None and out != want):
+        sys.exit("an address was left by a %s pass: %r gave %r (left %r, passes %d)" % ("single" if passes[0] == 1 else "repeated", line, out, left, passes[0]))
+    if passes[0] > len(put) + 1:
+        sys.exit("too many passes for %r: %d for %d planted addresses" % (line, passes[0], len(put)))
+    print(len(put), passes[0])
+"""
+
+        def test_u24_the_repeat_ends_when_nothing_changes_and_leaves_no_address(self):
+            code, err, out = self.pc11_run(self.PC11_U24)
+            self.assertEqual((code, err), (0, ""))
+            print("U24 planted and passes per line:", out.split())
+
+        def test_u24_a_mutant_limited_to_a_single_pass_fails_with_the_text(self):
+            code, err, out = self.pc11_run(self.PC11_U24)
+            self.assertEqual((code, err), (0, ""))
+            code, err, out = self.pc11_run(self.PC11_U24, ("cloud/launcher/cloud_worker.py", "        text = done\n", "        return done\n"))
+            self.assertEqual(code, 1, err)
+            self.assertIn("an address was left by a single pass", err)
+
+        PC11_U25 = r"""
+for line, want in (("host:::1", "host:[address]"), ("host:::fd00:db8:fd00,", "host:[address],"), ("ip:::2001:db8::1", "ip:[address]"),
+                   ("host:::ffff:27.9.0.1:8080", "host:[address]:8080")):
+    out = lib._mask_addresses(line)
+    if out != want:
+        sys.exit("a shorter parse took the place of a longer one: %r gave %r, wanted %r" % (line, out, want))
+"""
+
+        def test_u25_a_label_colon_then_a_double_colon_address_is_masked_whole(self):
+            code, err, out = self.pc11_run(self.PC11_U25)
+            self.assertEqual((code, err), (0, ""))
+
+        def test_u25_a_mutant_taking_the_leftmost_parse_fails_with_the_text(self):
+            code, err, out = self.pc11_run(self.PC11_U25)
+            self.assertEqual((code, err), (0, ""))
+            code, err, out = self.pc11_run(self.PC11_U25, ("cloud/launcher/cloud_worker.py", "key=lambda s: (s[0] - s[1], s[0])", "key=lambda s: (s[0], s[0] - s[1])"))
+            self.assertEqual(code, 1, err)
+            self.assertIn("a shorter parse took the place of a longer one", err)
 
         def pc11_run(self, script, mutate=None):
             import shutil, subprocess, tempfile
