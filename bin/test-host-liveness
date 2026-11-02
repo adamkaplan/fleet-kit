@@ -121,6 +121,10 @@ def run_doctor(bodies, doctor_text=None, panes=()):
     t = threading.Thread(target=go, daemon=True)
     t.start()
     t.join(70)
+    try:
+        listener.shutdown(socket.SHUT_RDWR)   # wakes the blocked accept
+    except OSError:
+        pass
     listener.close()
     server.join(10)
     shutil.rmtree(tmp, True)
