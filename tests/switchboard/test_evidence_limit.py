@@ -123,7 +123,7 @@ def build():
 
         def recorded(self, call, text, kind):
             code, out, err = call(text)
-            self.assertEqual(code, 0, out + err)
+            self.assertEqual(code, 0, "the evidence of exactly the limit (500) must be recorded whole: the command exited %s, not 0: %s" % (code, out + err))
             got = [e for e in self.ledger() if e["kind"] == kind][-1]["evidence"]
             self.assertEqual(got, text)
             self.assertEqual(len(got), 500)
@@ -323,15 +323,29 @@ def build():
                 self.run_case(self.relay_case(mod))
             self.assertIn("the relay must refuse the evidence over the limit with 400 and record nothing: it answered (200,", str(ctx.exception))
 
+        def mutated_bounded_text(self):
+            """The real bin/plan_ledger.py source with its ONE refusal comparison `>` made `>=`, applied exactly once, as a fresh module."""
+            path = BIN / "plan_ledger.py"
+            src = path.read_text()
+            old = "    if len(text) > limit:\n        raise LedgerError("
+            self.assertEqual(src.count(old), 1)
+            mod = types.ModuleType("plan_ledger_mut1901")
+            mod.__file__ = str(path)
+            exec(compile(src.replace(old, "    if len(text) >= limit:\n        raise LedgerError("), str(path), "exec"), mod.__dict__)
+            mod.LedgerError = SBP().LedgerError   # the callers catch the real LedgerError class
+            return mod
+
         def test_mutant_bounded_text_refuses_at_the_limit_itself(self):
-            real = SBP().bounded_text
-            mutant = lambda text, limit, what: real(text, limit - 1, what)
+            mutated = self.mutated_bounded_text()
             self.local_case(sb._evidence)   # control first: the real bounded_text passes the same check
-            with mock.patch.object(SBP(), "bounded_text", mutant):
+            self.assertEqual(SBP().bounded_text("a" * 500, 500, "evidence"), "a" * 500)   # original records 500 chars
+            with self.assertRaises(Exception):
+                mutated.bounded_text("a" * 500, 500, "evidence")   # the mutant is NOT equivalent: it refuses 500
+            with mock.patch.object(SBP(), "bounded_text", mutated.bounded_text):
                 with self.assertRaises(AssertionError) as ctx:
                     self.local_case(sb._evidence)
-            self.assertIn("the refusal line must name the 501 characters and the limit of 500: ", str(ctx.exception))
-            self.assertIn("the limit is 499", str(ctx.exception))   # the refusal line names 499, not 500
+            self.assertIn("the evidence of exactly the limit (500) must be recorded whole: the command exited 2, not 0: ", str(ctx.exception))
+            self.assertIn("the limit is 500", str(ctx.exception))   # the mutant refuses 500 against a limit of 500
 
     class TestEvidenceLimitUnchanged(LocalBase):
         """S7: the CI records and the waiver reason are cut or recorded as before."""
