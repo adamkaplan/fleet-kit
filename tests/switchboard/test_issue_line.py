@@ -70,18 +70,20 @@ def build():
             """The one check of every refusal: exit status 1, one plain line, no write."""
             code, _, err = self.run_it(*argv)
             if len(self.writes()) != 0:
+                if expect:
+                    raise AssertionError("the refusal /%s/ was not held: wrote %d times where 0 were expected" % (expect, len(self.writes())))
                 raise AssertionError(WRITE_FAILED % len(self.writes()))
             self.assertEqual(code, 1, err)
             self.assertEqual(len(err.strip().splitlines()), 1, err)
-            if expect:
-                self.assertRegex(err, expect)
+            if expect and not re.search(expect, err):
+                raise AssertionError("the refusal line does not say /%s/: %s" % (expect, err.strip()))
 
-        def mutated(self, name, replacement, check):
-            """Apply the mutant (asserted applied), run `check`: it must fail with the write text."""
+        def mutated(self, name, replacement, check, anchor=r"^wrote [0-9]+ times where 0 were expected"):
+            """Apply the mutant (asserted applied), run `check`: it must fail with the check's own text (`anchor`)."""
             original = getattr(self.module, name)
             with mock.patch.object(self.module, name, replacement):
                 self.assertIsNot(getattr(self.module, name), original, "the mutant was not applied")
-                with self.assertRaisesRegex(AssertionError, r"^wrote [0-9]+ times where 0 were expected"):
+                with self.assertRaisesRegex(AssertionError, anchor):
                     check()
 
         # -- S2: the three refusals, each with a mutant and the control
@@ -125,10 +127,12 @@ def build():
                     make()
                     self.refused(self.ref, "--next-step", "wait", expect=text)   # the control: the unmutated command passes
                     self.gh.__dict__.pop("patches", None)
+                    anchor = r"^the refusal /%s/ was not held: wrote [0-9]+ times" % re.escape(text)   # names the mutated check
+                    check = lambda: self.refused(self.ref, "--next-step", "wait", expect=text)
                     if label == "failed read":
-                        self.mutated("_read", self.read_that_goes_on(), lambda: self.refused(self.ref, "--next-step", "wait"))
+                        self.mutated("_read", self.read_that_goes_on(), check, anchor)
                     else:
-                        self.mutated("body_problem", lambda body: None, lambda: self.refused(self.ref, "--next-step", "wait"))
+                        self.mutated("body_problem", lambda body: None, check, anchor)
                     self.gh.__dict__.pop("patches", None)
 
         # -- S3: the copy
@@ -179,7 +183,7 @@ def build():
             self.gh.bodies = {5: "Done when: ok.\n"}
             self.refused(self.ref, "--next-step", "wait", expect="the last good read held both parts")   # control
             with mock.patch.object(self.module, "read_copy", lambda sb_, repo, number: None):
-                with self.assertRaisesRegex(AssertionError, "held both parts"):   # ignoring the copy changes the reason the test pins
+                with self.assertRaisesRegex(AssertionError, r"^the refusal line does not say /the last good read held both parts/"):   # the command's own refusal line
                     self.refused(self.ref, "--next-step", "wait", expect="the last good read held both parts")
             self.gh.bodies = {5: BODY}
             path.write_bytes(b"{not json")
@@ -191,7 +195,8 @@ def build():
                 except self.module.Refused:
                     return None
             real = self.module.read_copy
-            self.mutated("read_copy", absent, lambda: self.refused(self.ref, "--next-step", "wait"))
+            self.mutated("read_copy", absent, lambda: self.refused(self.ref, "--next-step", "wait", expect="corrupt"),
+                         r"^the refusal /corrupt/ was not held: wrote [0-9]+ times")
 
         # -- S4: only that line differs
 
@@ -291,6 +296,35 @@ def build():
                 self.assertIsNotNone(applied)
                 with self.assertRaisesRegex(AssertionError, r"^wrote 1 times where 2 were expected"):
                     self.check_restore()
+
+        # -- a restore write that fails is not silent
+
+        def check_restore_failed(self):
+            self.lose_parts_after_the_write()
+            seen = []
+
+            def refuse_the_second(number):
+                seen.append(number)
+                if len(seen) == 2:
+                    raise sb.IntentError("restore refused")
+            self.gh.before_patch = refuse_the_second
+            code, _, err = self.run_it(self.ref, "--next-step", "wait")
+            if "restore of the old body failed" not in err:
+                raise AssertionError("S5 restore failure: the line about the failed restore was not printed: %r" % err)
+            self.assertEqual((code, len(err.strip().splitlines())), (1, 1), err)
+            self.assertIn("by hand", err)
+            self.assertEqual(self.audit_text().count("issue_line.restore_failed"), 1)
+            self.assertNotIn("issue_line.restored", self.audit_text())
+            self.assertNotIn("wait\"", self.audit_text())
+
+        def test_s5_a_restore_write_that_fails_prints_one_line_and_audits_restore_failed(self):
+            self.check_restore_failed()
+
+        def test_s5_a_mutant_that_swallows_the_failed_restore_is_caught_and_the_control_passes(self):
+            old = "            except sb.IntentError:\n                sb.engine.audit.append(sb.engine.actor, \"issue_line.restore_failed\""
+            new = "            except sb.IntentError:\n                pass\n            if False:\n                sb.engine.audit.append(sb.engine.actor, \"issue_line.restore_failed\""
+            text = self.source_mutant(old, new, self.check_restore_failed)
+            self.assertRegex(text, r"^S5 restore failure: the line about the failed restore was not printed")
 
         # -- S12: the Intent section ends at the first of the next heading and the Done-when line
 

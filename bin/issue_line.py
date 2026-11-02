@@ -248,7 +248,9 @@ def run(sb, repo, number, next_step, parked):
             try:
                 sb.write(reader, repo, number, body)
             except sb.IntentError:
-                pass
+                sb.engine.audit.append(sb.engine.actor, "issue_line.restore_failed", "issue:%s#%d" % (repo, number), {"repo": repo, "number": number, "reason": "write"})
+                sb.err("%s: issue-line: #%d: the restore of the old body failed: check the body by hand\n" % (sb.PROG, number))
+                return sb.EXIT_ERROR
             sb.engine.audit.append(sb.engine.actor, "issue_line.restored", "issue:%s#%d" % (repo, number), {"repo": repo, "number": number, "reason": "readback"})
             sb.err("%s: issue-line: #%d read back without its Intent or Done-when: the body read before the edit was written back once; check the issue\n" % (sb.PROG, number))
             return sb.EXIT_ERROR
