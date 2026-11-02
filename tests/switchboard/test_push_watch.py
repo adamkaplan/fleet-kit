@@ -456,7 +456,7 @@ class TestPushWatch(Case):
         mutant = self.mutant('                n_before = len(sent)\n                tell(lane, item_text(name, branch, b["sha"], {}, "quiet"', '                b["quiet"] = True\n                n_before = len(sent)\n                tell(lane, item_text(name, branch, b["sha"], {}, "quiet"')
         self._fails(lambda: self.assertEqual(len(self._quiet_send(mutant)), 1, "the quiet item was marked before a failed send"), "the quiet item was marked before a failed send")
 
-    def _both_fail(self, module=None):
+    def _both_fail(self, module=None, recover=False):
         self.setUp()
         self.engine.cloud_watch = {"records": [record("w-a", "lane-a")]}
         self.world.refs = {"w-a/wip": SHA_A}
@@ -473,16 +473,68 @@ class TestPushWatch(Case):
         self.world = broken
         for i in (1, 2, 3):
             self.run_pass(NOW + 60 * i, module)
+        if recover:
+            self.world = real
+            self.run_pass(NOW + 300, module)
         return log
 
-    def test_fix3_pc2_both_reads_failing_advances_the_sha_and_audits_once(self):
+    def test_fix3_pc2_both_reads_failing_does_not_advance_and_audits_once_then_the_push_is_told(self):
         log = self._both_fail()
-        self.assertEqual(len(log), 2)   # the compare and the tip, in the first pass only
-        self.assertEqual(len(self.to("lane-a")), 1)   # the first sight only: no item for the failed sha
-        self.assertEqual(len([l for l in self.engine.audit.lines if l[0] == "push_watch.compare_failed"]), 1)
-        self.assertEqual(len([l for l in self.engine.audit.lines if l[0] == "push_watch.read_failed"]), 0)
-        mutant = self.mutant('if cmpfail and not limited:', 'if False:')
-        self._fails(lambda: self.assertEqual(len(self._both_fail(mutant)), 2, "the failed sha was read again at the next pass"), "the failed sha was read again at the next pass")
+        self.assertEqual(len(log), 6)   # the compare and the tip at each of the three passes: the sha stays unseen
+        self.assertEqual(len(self.to("lane-a")), 1)   # the first sight only
+        self.assertEqual(len([l for l in self.engine.audit.lines if l[0] == "push_watch.read_failed"]), 1)
+        self._both_fail(recover=True)
+        self.assertEqual(len(self.to("lane-a")), 3)   # the next pass with reads OK tells the push (two commits of the chain)
+        self.assertIn(SHA_C[:8], self.to("lane-a")[-1])
+        mutant = self.mutant('mem["cmpfailed"] = True\n', 'mem["cmpfailed"] = True; b["told"] = (b["told"] + [sha])[-TOLD_MAX:]; b["sha"], b["at"], b["quiet"] = sha, now, True\n')
+        self._fails(lambda: self.assertEqual(len(self._both_fail(mutant)), 6, "the failed sha was advanced"), "the failed sha was advanced")
+
+    def _denied(self, text, module=None):
+        self.setUp()
+        self.engine.cloud_watch = {"records": [record("w-a", "lane-a", "o/a"), record("w-b", "lane-b", "o/b")]}
+        self.world.refs = {"w-a/wip": SHA_A, "w-b/wip": SHA_A}
+        real = self.world.__call__
+        self.seen = []
+
+        def reads(path):
+            self.seen.append(path)
+            if "o/a/" in path:
+                raise OSError(text)
+            return real(path)
+        self.world = reads
+        self.run_pass(NOW, module)
+        return len([p for p in self.seen if "o/b/" in p]), len([l for l in self.engine.audit.lines if l[0] == "push_watch.rate_limited"])
+
+    def test_fix3_u11_a_403_permission_error_is_not_a_rate_limit_and_a_429_or_rate_limit_text_is(self):
+        self.assertEqual(self._denied("HTTP 403 Resource not accessible: permission"), (2, 0))   # the pass goes on to the other worker
+        self.assertEqual(self._denied("HTTP 429 too many"), (0, 1))
+        self.assertEqual(self._denied("HTTP 403 You have exceeded a secondary Rate Limit"), (0, 1))
+        mutant = self.mutant('("429", "rate limit")', '("403", "429", "rate limit")')
+        self._fails(lambda: self.assertEqual(self._denied("HTTP 403 Resource not accessible: permission", mutant), (2, 0), "a 403 was read as a rate limit"), "a 403 was read as a rate limit")
+
+    def _first_sight(self, made, module=None, interval=60):
+        self.setUp()
+        self.config = {"interval": interval, "quiet_minutes": 10}
+        self.engine.cloud_watch = {"records": [record("w-a", "lane-a")]}
+        c = commit()
+        if made is not None:
+            iso = datetime.datetime.fromtimestamp(NOW - made, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            c["commit"]["committer"] = {"date": iso}
+        self.world.commits[SHA_A] = c
+        self.world.refs = {"w-a/wip": SHA_A}
+        self.run_pass(NOW, module)
+        self.run_pass(NOW + 700, module)
+        return self.to("lane-a")[-1]
+
+    def test_fix3_u12_an_old_commit_at_first_sight_names_both_times_else_pushed_at(self):
+        first = self.pw._hms(NOW)
+        text = self._first_sight(7200)
+        self.assertIn("first seen at %s (commit made %s)" % (first, self.pw._hms(NOW - 7200)), text)
+        self.assertNotIn(" at %s and has been quiet" % first, text)
+        self.assertIn("pushed %s at %s and has been quiet" % (SHA_A[:8], first), self._first_sight(None))
+        self.assertIn("pushed %s at %s and has been quiet" % (SHA_A[:8], first), self._first_sight(30))   # within two intervals
+        mutant = self.mutant('b.get("made"))', 'None)')
+        self._fails(lambda: self.assertIn("first seen at", self._first_sight(7200, mutant), "the quiet item has no first-seen time"), "the quiet item has no first-seen time")
 
     def _rotation(self, module=None):
         self.setUp()
