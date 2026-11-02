@@ -424,5 +424,217 @@ class Mutants(unittest.TestCase):
         self.assertIn("a model-entry form was dropped", str(cm.exception))
 
 
+class S2KindMutants(unittest.TestCase):
+    """S2 (ask #1783): one mutant per dropping kind that keeps that kind for ever, beside the model-entry mutant."""
+
+    KEEP = {}
+    NAMES = (("git", "a git-token form was not dropped"), ("login", "a login-token form was not dropped"),
+             ("pw", "a pod-password form was not dropped"), ("hub", "a hub-secret form was not dropped"))
+
+    def mutant(self, kind):
+        old = "            for f, lives in list(self._lives.items()):\n"
+        src = Mutants.SRC
+        self.assertEqual(src.count(old), 1)
+        new = old + "                if f in KEEP:\n                    continue\n"
+        mut = src.replace(old, new)
+        self.assertNotEqual(mut, src)
+        ns = {"__name__": "mut", "__file__": cw.__file__, "KEEP": self.KEEP[kind]}
+        exec(compile(mut, "mut", "exec"), ns)
+        return ns["KnownForms"]
+
+    def run_check(self, cls, kind, text):
+        k = S2Kinds("test_control_counts").world(cls)
+        F = {"git": set(cw.secret_forms(G34)), "login": set(cw.secret_forms(L34)), "pw": set(cw.secret_forms(P34)), "hub": set(cw.secret_forms(H34))}
+        k.sweep(10 ** 9, set())
+        self.assertFalse(F[kind] & set(k), text)
+        return len(F[kind])
+
+    def test_one_mutant_per_kind(self):
+        for kind, v in (("git", G34), ("login", L34), ("pw", P34), ("hub", H34)):
+            self.KEEP[kind] = set(cw.secret_forms(v))
+        failed = 0; removed = []
+        for kind, text in self.NAMES:
+            removed.append(self.run_check(cw.KnownForms, kind, text))   # the control first
+            with self.assertRaises(AssertionError) as cm:
+                self.run_check(self.mutant(kind), kind, text)
+            self.assertIn(text, str(cm.exception))
+            failed += 1
+        print("S2 per-kind controls removed %s, mutants failed %d of 4 with their own anchored text" % (removed, failed))
+        self.assertEqual((removed, failed), ([8, 6, 8, 7], 4))
+
+
+class _Launch:
+    """Fakes for the reaper's two own paths (S11), S12 and S13."""
+
+    @staticmethod
+    def fresh_known():
+        k = cw.KnownForms()
+        return k
+
+
+class S11ReaperPaths(unittest.TestCase):
+    import base64 as _b64
+
+    def renewal(self, mod):
+        import datetime as dt
+        k = mod["KnownForms"]()
+        kube = mod["Kube"].__new__(mod["Kube"]); kube.known = k
+        secret = {"metadata": {"labels": {"cw/pod": "p1", "cw/run-id": "r"}, "uid": "u", "resourceVersion": "1"},
+                  "data": {"git-token": self._b64.b64encode(G34.encode()).decode(), "model-auth": self._b64.b64encode(M34.encode()).decode()}}
+        kube.get_run_secret = lambda name: secret
+        la = mod["Launcher"].__new__(mod["Launcher"]); la.kube = kube; la.env = {}
+        pod = {"metadata": {"name": "p1", "annotations": {"cw/worker": "w1", "cw/run-id": "r"}}, "status": {"phase": "Running"}}
+        try:
+            la._renew_git_token(pod, dt.datetime.now(dt.timezone.utc), force=True)
+        except Exception:
+            pass   # the path after the add is not under test
+        return k
+
+    def record(self, mod):
+        k = mod["KnownForms"]()
+        kube = type("K", (), {})(); kube.known = k
+        kube.add_secrets = lambda *v, life=None: k.add_forms([f for x in v for f in cw.secret_forms(x)], life)
+        files = {"git-token": G34, "model-auth": M34}
+        kube.exec = lambda pod, *cmd, **kw: "\n".join(files) if cmd[0] == "ls" else files[cmd[-1].split("/")[-1]]
+        rr = mod["rr"].Recorder(kube, {})
+        rr._learn_secrets("p1")
+        return k
+
+    def check(self, path, build):
+        k = build()
+        self.assertEqual(k.sweep(0, {"p1"}), 0, "a form was dropped while its pod ran")
+        gone = k.sweep(1, {"other"})
+        mf = set(cw.secret_forms(M34))
+        self.assertTrue(mf <= set(k), "a model-entry form was dropped on the reaper's path")
+        self.assertFalse(set(cw.secret_forms(G34)) & set(k), "a git-token form was kept")
+        self.assertNotIn(SHORT_KEY, cw.scrub("x " + SHORT_KEY, k), "a model-entry form was dropped on the reaper's path")
+        return gone, len(mf & set(k)), len(SHORT_KEY)
+
+    def load(self, edits):
+        import importlib.util
+        rr_path = os.path.join(os.path.dirname(cw.__file__), "run_record.py")
+        sources = {"cw": open(cw.__file__).read(), "rr": open(rr_path).read()}
+        for key, old, new in edits:
+            self.assertEqual(sources[key].count(old), 1)
+            mutated = sources[key].replace(old, new)
+            self.assertNotEqual(mutated, sources[key])
+            sources[key] = mutated
+        ns = {"__name__": "mut", "__file__": cw.__file__}
+        exec(compile(sources["cw"], "mut", "exec"), ns)
+        rrns = {"__name__": "run_record_mut", "__file__": rr_path}
+        exec(compile(sources["rr"], "mut_rr", "exec"), rrns)
+        import types
+        ns["rr"] = types.SimpleNamespace(**rrns)
+        return ns
+
+    def test_s11(self):
+        life = '], life=("pod", (pod.get("metadata") or {}).get("name")))'
+        paths = (("renewal", self.renewal, ("cw", 'and k == "model-auth"])', 'and k == "model-auth"' + life)),
+                 ("record", self.record, ("rr", 'self.kube.add_secrets(text.strip())   # the model entry', 'self.kube.add_secrets(text.strip(), life=("pod", pod))   # the model entry')))
+        kept = failed = 0
+        for name, fn, edit in paths:
+            gone, n, ln = self.check(name, lambda: fn(self.load([])))
+            self.assertEqual((gone, n), (8, 34), name)
+            kept += 1
+            with self.assertRaises(AssertionError, msg=name) as cm:
+                self.check(name, lambda: fn(self.load([edit])))
+            self.assertIn("a model-entry form was dropped on the reaper's path", str(cm.exception))
+            failed += 1
+        print("S11 git-token forms gone 8 of 8 and model forms kept 34 of 34 on %d of 2 paths (short key of %d characters redacted), copies failed %d of 2" % (kept, ln, failed))
+
+
+class S12S13Sweep(unittest.TestCase):
+    def launcher(self, mod, pods, known):
+        import tempfile
+        d = tempfile.mkdtemp()
+        kube = type("K", (), {})()
+        kube.known = known
+        kube.list_pods = lambda: pods
+        kube.scrub = lambda t, limit=300: str(t)[:limit]
+        kube.add_secrets = lambda *a, **k: None
+        la = mod["Launcher"].__new__(mod["Launcher"])
+        import datetime as dt
+        la.kube, la.env, la.clock = kube, {"CW_CLOUD_AUDIT": os.path.join(d, "a.jsonl")}, (lambda: dt.datetime.now(dt.timezone.utc))
+        la.audit_path = la.env["CW_CLOUD_AUDIT"]
+        la.renew_lock = threading.RLock(); la.relogin = None
+        la.reap_results = {}; la.last_hook = None
+        return la
+
+    def lines(self, la):
+        try:
+            return [l for l in open(la.audit_path).read().splitlines() if l]
+        except OSError:
+            return []
+
+    def pass_world(self, mod, pods):
+        k = mod["KnownForms"]()
+        k.add_forms(cw.secret_forms(G34), ("pod", "p1")); k.add_forms(cw.secret_forms(P34), ("pod", "p2"))
+        k.add_forms(cw.secret_forms(M34), None); k.add_forms(cw.secret_forms(H34), ("pod", "p2"))
+        k.add_forms(cw.secret_forms(L34), ("pod", "p1"))
+        la = self.launcher(mod, pods, k)
+        return la, k
+
+    def mod(self, old=None, new=None):
+        src = Mutants.SRC
+        if old:
+            self.assertEqual(src.count(old), 1)
+            m = src.replace(old, new)
+            self.assertNotEqual(m, src)
+            src = m
+        ns = {"__name__": "mut", "__file__": cw.__file__}
+        exec(compile(src, "mut", "exec"), ns)
+        return ns
+
+    def check12(self, mod):
+        class Once(dict):   # a fault injected into the sweep only: the first read of the entry raises
+            hit = False
+            def get(self, *a):
+                if not Once.hit:
+                    Once.hit = True
+                    raise TypeError("injected")
+                return dict.get(self, *a)
+        la, k = self.pass_world(mod, [Once({"metadata": {"name": "p1"}})]); total = len(k)
+        try:
+            la.reap()
+        except Exception:
+            raise AssertionError("the sweep raised into the pass") from None
+        ln = self.lines(la)
+        self.assertEqual(len(k), total, "a form was dropped")
+        return total, len(ln), ln
+
+    def test_s12(self):
+        total, n, ln = self.check12(self.mod())
+        self.assertEqual((total, n), (63, 1))
+        self.assertIn("known-forms.sweep-failed", ln[0]); self.assertIn("TypeError", ln[0])
+        bad = self.mod('            except Exception as e:   # the sweep never raises', '            except KeyboardInterrupt as e:   # the sweep never raises')
+        with self.assertRaises(AssertionError) as cm:
+            self.check12(bad)
+        self.assertIn("the sweep raised into the pass", str(cm.exception))
+        print("S12 the pass ended, %d audit line, %d of 63 forms kept; the copy outside the try failed 1 of 1" % (n, total))
+
+    def check13(self, mod):
+        la, k = self.pass_world(mod, [])
+        total = len(k)
+        try:
+            la.reap()
+        except Exception:
+            pass
+        self.assertEqual(len(k), total, "an empty list dropped forms")
+        ln = self.lines(la)
+        la.kube.list_pods = lambda: [{"metadata": {"name": "p9"}}]
+        k.sweep(0, {"p9"})
+        return total, ln, len(k)
+
+    def test_s13(self):
+        total, ln, after = self.check13(self.mod())
+        self.assertEqual(len(ln), 1); self.assertIn("known-forms.sweep-skipped", ln[0]); self.assertIn("empty pod list", ln[0])
+        self.assertEqual(after, 34)
+        bad = self.mod('                if not pods:   # an empty', '                if False:   # an empty')
+        with self.assertRaises(AssertionError) as cm:
+            self.check13(bad)
+        self.assertIn("an empty list dropped forms", str(cm.exception))
+        print("S13 0 of %d forms dropped on the empty list, 1 audit line, the next non-empty pass left %d (the model entry); the copy failed 1 of 1" % (total, after))
+
+
 if __name__ == "__main__":
     unittest.main()
