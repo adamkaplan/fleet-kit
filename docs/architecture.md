@@ -103,7 +103,7 @@ The **Holds** column is descriptive: only the layer numbers are enforced.
 | `impact_hold.py` | 5 | who may clear, hold or release an impact hold | |
 | `item_verdicts.py` | 5 | verdicts for a work item that has no pull request | |
 | `lanes.py` | 5 | move an ask from one orchestrator's charter to another's, with a handover | |
-| `launch_testers.py` | 5 | testers from the launch record | |
+| `launch_testers.py` | 5 | testers and reviewers from the launch record | |
 | `merge_gate.py` | 5 | the fleet's own merge queue | |
 | `orders_copy.py` | 5 | `orders copy`: a charter's standing orders copied to another charter | |
 | `path_suites.py` | 5 | which test suites exercise a changed path, and the local merge `heavy --changed` runs them on | |

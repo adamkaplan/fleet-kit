@@ -4641,13 +4641,18 @@ in the file anyway. The caller's identity is the session-based one, a guard agai
 in its session's fleet metadata) says: role `tester`, the PR's repo, a boss whose own record is `orchestrator` for that same repo, and **launched by that
 boss** (`launched_by`: `launch` records the agent that ran it, as its pane identified it; a launch from a plain shell, or from before this record existed,
 does not count: use the configured list); a retired tester does not count. So a tester launched by a repo's orchestrator may record tester verdicts for that
-repo and no other, and a coder cannot mint one by naming an orchestrator as its boss. This widens who can record a verdict, and only for `tester`:
-`reviewer`, `ci` and `owner` never come from a launch record. **It is a guardrail, not a boundary:** the record is written at launch from the caller's pane
+repo and no other, and a coder cannot mint one by naming an orchestrator as its boss. This widens who can record a verdict, for `tester` and `reviewer`:
+`ci` and `owner` never come from a launch record; a reviewer launched with `--role reviewer` counts under the same conditions and the same independence rule as a tester, and its verdicts are audited with the launch record they relied on. **It is a guardrail, not a boundary:** the record is written at launch from the caller's pane
 identity (the session-based guard of #138, which a determined local agent can spoof), and the boundary that matters is who may run `launch`. A tester is
 refused when it is a writer of the PR, runs in the session of a writer, or is the same agent as a coder launched on its work item. Each verdict a launched
 tester records is audited with the launch record it relied on (`launch_record` in `plan.verdict`), and `status` lists the resolved testers with their
 source (`config` or `launch record`). If the running agents or the retired list cannot be read, no launched tester counts (only the configured list does): a missing `retired.json` means nobody is retired, but a corrupt, empty or non-map one disables every launched tester, audited as `testers.retired_unreadable` and said in `status` ("retired file unreadable: launch-record testers disabled").
 The rules are `bin/launch_testers.py`.
+
+**The cloud relay stays list-only (#1869).** The relay daemon's verdict path judges a `tester` and a `reviewer` by the configured list `plan_evaluators` alone, because the relay daemon holds the configuration parts and the ledger and reads no agent's launch record: it has no discovery of the running agents, and its callers are cloud pods identified by their token, not by a record in the local registry, so it cannot apply the rule.
+The work item path (`verdict --item`) still takes `tester` verdicts only.
+
+**The seat of a verdict in `gates` (#1869).** Each `tester` or `reviewer` verdict records where the seat's right came from (`right`: `config` or `launch record`), and `gates` prints, in its text and in its `--json` (`verdict_lines`), one line for each such verdict it counts: `verdict: <id>: <evaluator> verdict #<seq> by <name>, <right>`, or `source not recorded` for a verdict recorded before this field existed.
 
 **Verdicts for a work item with no pull request (#770).** A work item that is an ISSUE (a production-operations item) gets tester and CI verdicts from an independent registered tester. The rules are `bin/item_verdicts.py`; no pull request RULE changes; the ordinary pull request commands (`prove`, `verdict`, `gates ci-record`, `waive`) refuse an ISSUE number and a number with an item registration, so an item's entries are written only by the item commands, and a real pull request is unaffected.
 
