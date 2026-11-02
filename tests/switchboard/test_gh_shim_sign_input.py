@@ -2080,5 +2080,109 @@ class TestGhShimBracketBodyKeys(unittest.TestCase):
         self.assertIn("a key with a percent sign went out unsigned", bracket_body_failures(rig), "a key with a percent sign went out unsigned")
 
 
+def allowlist_failures(rig):
+    """#1696 S37: the failures seen for keys outside the fixed allowlist on a comment or review endpoint (empty when both controls pass and all 9 forms are refused)."""
+    bad = []
+    comments, reviews = "repos/o/r/issues/1/comments", "repos/o/r/pulls/1/reviews"
+    good = rig.home / "known.json"
+    good.write_text('{"body":"x","event":"COMMENT","comments":[{"path":"a","line":3,"body":"y"}]}')
+    done, calls = rig.run("api", comments, "-f", "body=a", "-f", "event=COMMENT")
+    if len(calls) != 1 or sum(a.count(SIGNED) for a in calls[0]["argv"]) != 1:
+        return ["the first control of S37 did not pass"]
+    done, calls = rig.run("api", reviews, "--input", str(good))
+    if len(calls) != 1:
+        return ["the second control of S37 did not pass"]
+    text = calls[0]["files"][calls[0]["argv"][-1]]
+    if text.count("from=alice-bot") != 2:
+        return ["the second control of S37 did not pass"]
+    unknown = rig.home / "unknown.json"
+    unknown.write_text('{"body":"x","threads":[]}')
+    unknown_comment = rig.home / "unknown-comment.json"
+    unknown_comment.write_text('{"comments":[{"path":"a","body":"y","threads":1}]}')
+    forms = (
+        (comments, "-f", "body[0]=a"), (comments, "-f", "body[x]=a"), (comments, "-f", "body][=a"), (comments, "-f", "body =a"),
+        (comments, "-f", "xbody=a"), (comments, "-f", "threads=a"),
+        (reviews, "--input", str(unknown)), (reviews, "--input", str(unknown_comment)),
+        (comments + "?labels=a", "-X", "POST"),
+    )
+    for form in forms:
+        done, calls = rig.run("api", *form)
+        lines = [l for l in done.stderr.splitlines() if l.startswith("gh:")]
+        if calls or done.returncode != 1 or len(lines) != 1 or not lines[0].startswith("gh: refused:"):
+            bad.append("a key outside the allowlist went out unsigned")
+    return bad
+
+
+class TestGhShimAllowlist(unittest.TestCase):
+    """#1696 PC-12: only a fixed allowlist of keys passes on a comment or review endpoint (S37); a mutant with the old deny pattern is seen on a scratch copy (S38)."""
+
+    def setUp(self):
+        self.rig = hermetic_rig()
+        self.addCleanup(self.rig.close)
+        self.source = (SHIM_DIR / "gh").read_text()
+
+    def test_s37_control_first_known_keys_are_signed_once_per_body(self):
+        done, calls = self.rig.run("api", "repos/o/r/issues/1/comments", "-f", "body=a", "-f", "event=COMMENT")
+        self.assertEqual(len(calls), 1, done.stderr)
+        self.assertEqual(sum(a.count(SIGNED) for a in calls[0]["argv"]), 1)
+        path = self.rig.home / "k.json"
+        path.write_text('{"body":"x","event":"COMMENT","comments":[{"path":"a","line":3,"body":"y"}]}')
+        done, calls = self.rig.run("api", "repos/o/r/pulls/1/reviews", "--input", str(path))
+        self.assertEqual(len(calls), 1, done.stderr)
+        self.assertEqual(calls[0]["files"][calls[0]["argv"][-1]].count("from=alice-bot"), 2)
+
+    def test_s37_keys_outside_the_allowlist_are_refused(self):
+        self.assertEqual(allowlist_failures(self.rig), [])
+
+    def test_s38_a_mutant_with_the_old_deny_pattern_is_seen(self):
+        self.assertEqual(allowlist_failures(self.rig), [])   # control first: exit 0
+        old = '    return key.lower() == "body" or key in ALLOWED_KEYS'
+        self.assertEqual(self.source.count(old), 1, "the mutant's anchor is gone (the allowlist check of the shim)")
+        rig = Rig(self.source.replace(old, '    return not re.search(r"(?i)(^|\\[)body(\\]|\\[\\])*$", key)', 1))   # a scratch copy outside the repo
+        self.addCleanup(rig.close)
+        self.assertNotEqual(rig.home.resolve(), REPO.resolve())
+        self.assertIn("a key outside the allowlist went out unsigned", allowlist_failures(rig), "a key outside the allowlist went out unsigned")
+
+
+def early_flag_failures(rig):
+    """#1696 S39: the failures seen for a method flag written before the api word (empty when the control passes and both forms are refused)."""
+    bad = []
+    endpoint = "repos/o/r/issues/comments/1"
+    done, calls = rig.run("api", "-X", "PATCH", endpoint, "-f", "body=a")
+    if len(calls) != 1 or sum(a.count(SIGNED) for a in calls[0]["argv"]) != 1:
+        return ["the control of S39 did not pass"]
+    for form in (("-X", "PATCH", "api", endpoint, "-f", "body=a"), ("--method", "PATCH", "api", endpoint, "-f", "body=a")):
+        done, calls = rig.run(*form)
+        lines = [l for l in done.stderr.splitlines() if l.startswith("gh:")]
+        if calls or done.returncode != 1 or len(lines) != 1 or not lines[0].startswith("gh: refused:"):
+            bad.append("a method flag before api went out unsigned")
+    return bad
+
+
+class TestGhShimMethodFlagBeforeApi(unittest.TestCase):
+    """#1696 PC-12: a method flag before the api word is refused (S39), and an anchored mutant is seen."""
+
+    def setUp(self):
+        self.rig = hermetic_rig()
+        self.addCleanup(self.rig.close)
+        self.source = (SHIM_DIR / "gh").read_text()
+
+    def test_s39_control_first_the_flag_after_the_api_word_is_signed_once(self):
+        done, calls = self.rig.run("api", "-X", "PATCH", "repos/o/r/issues/comments/1", "-f", "body=a")
+        self.assertEqual(len(calls), 1, done.stderr)
+        self.assertEqual(sum(a.count(SIGNED) for a in calls[0]["argv"]), 1)
+
+    def test_s39_a_method_flag_before_api_is_refused(self):
+        self.assertEqual(early_flag_failures(self.rig), [])
+
+    def test_s39_a_mutant_ignoring_the_early_flag_is_seen(self):
+        self.assertEqual(early_flag_failures(self.rig), [])   # control first
+        old = "    if early_method_flag(args[:at]):"
+        self.assertEqual(self.source.count(old), 1, "the mutant's anchor is gone (the early flag refusal of api_parsed)")
+        rig = Rig(self.source.replace(old, "    if False:", 1))
+        self.addCleanup(rig.close)
+        self.assertIn("a method flag before api went out unsigned", early_flag_failures(rig), "a method flag before api went out unsigned")
+
+
 if __name__ == "__main__":
     unittest.main()
