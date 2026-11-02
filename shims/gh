@@ -3224,7 +3224,7 @@ def body_probe(args, lookup, gh, dropped=()):
             return None, plan   # an issue, not a pull request: not this rule's
         said = guard.check(data.get("body") or "", text, dropped)
         if said:
-            return said, plan
+            return said + "; to drop a line on purpose pass --drop-line KEY (the key with its colon, for example MERGE:)", plan
         gone = [k for k in guard.keys_of(data.get("body") or "") if k in dropped and k not in guard.keys_of(text)]
         for key in gone:   # a deliberate removal is audited BEFORE it passes; one that cannot be audited is not made
             if not gate_spool("body.drop", repo, number, key, "key=%s repo=%s number=%d caller=%s" % (key, repo, number, my_name(lookup))):

@@ -28,6 +28,5 @@ def check(old, new, dropped=()):
     kept = set(keys_of(new))
     lacking = [k for k in keys_of(old) if k not in kept and k not in set(dropped)]
     if lacking:
-        return ("the new body lacks the line %s that the old body held; to drop a line on purpose pass --drop-line KEY (the key with its colon, "
-                "for example %s)" % (", ".join(lacking), lacking[0]))
+        return ("the new body lacks the line %s that the old body held" % ", ".join(lacking))
     return None
