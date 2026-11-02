@@ -17,7 +17,7 @@ Staff; an epic or workspace plan, the Chief of Staff, then the owner.
 
 ## One plan comment
 
-A plan is one canonical comment, edited in place; every revision adds a new short receipt comment (what changed and why, two to four lines, with the new plan hash); a plan is never reposted as a second plan comment.
+A plan is one canonical comment, edited in place; every revision adds a short receipt comment (what changed and why, with the new plan hash); never repost a plan as a second plan comment.
 
 Receipt format: `docs/plan-template.md`.
 
