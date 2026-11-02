@@ -115,11 +115,11 @@ def clip(text, limit=FIELD_LIMIT):
     return text if len(text) <= limit else text[:limit - 1] + "\u2026"
 
 
-def evidence_text(text):
-    """The evidence as recorded: whitespace collapsed as `clip` does; over EVIDENCE_LIMIT it is REFUSED, never cut."""
+def bounded_text(text, limit, what):
+    """`text` with white space collapsed as `clip` does; over `limit` it is REFUSED (LedgerError), never cut."""
     text = " ".join(str(text or "").split())
-    if len(text) > EVIDENCE_LIMIT:
-        raise LedgerError("the evidence is %d characters and the limit is %d: nothing was recorded; put the long text in one comment or a file and give the link, or shorten it" % (len(text), EVIDENCE_LIMIT))
+    if len(text) > limit:
+        raise LedgerError("the %s is %d characters and the limit is %d: nothing was recorded; put the long text in one comment or a file and give the link, or shorten it" % (what, len(text), limit))
     return text
 
 

@@ -425,7 +425,7 @@ class Executor:
         except Replay as rep:
             first = rep.record   # rebuilt from the ledger entry: no digest, so compare what the entry holds
             try:
-                clipped = plan_ledger.evidence_text(str(args.get("evidence") or "").strip())
+                clipped = plan_ledger.bounded_text(str(args.get("evidence") or "").strip(), plan_ledger.EVIDENCE_LIMIT, "evidence")
             except plan_ledger.LedgerError:
                 clipped = None   # over the limit: it cannot be the recorded call
             if (clipped is None or not _same_call(first, command, pr, call.get("head")) or first.get("scenario") != args.get("scenario")
@@ -463,7 +463,7 @@ class Executor:
         if result not in plan_ledger.RESULTS:
             raise Refuse(400, "result must be pass or fail")
         try:
-            evidence = plan_ledger.evidence_text(str(args.get("evidence") or "").strip())
+            evidence = plan_ledger.bounded_text(str(args.get("evidence") or "").strip(), plan_ledger.EVIDENCE_LIMIT, "evidence")
         except plan_ledger.LedgerError as err:
             raise Refuse(400, str(err))
         if not evidence:

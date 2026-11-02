@@ -16904,7 +16904,7 @@ def tree_file_exists(runner=None):
 
 
 def _evidence(args):
-    text = plan_ledger.evidence_text(redact_command_text(args.evidence))
+    text = plan_ledger.bounded_text(redact_command_text(args.evidence), plan_ledger.EVIDENCE_LIMIT, "evidence")
     if not text:
         raise LedgerCommandError("--evidence is required: a link, or what you ran and saw")
     return text
