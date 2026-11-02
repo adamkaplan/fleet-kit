@@ -555,7 +555,8 @@ def s25(module):
             w.tick()
         except Exception:
             raised = 1
-        assert len([e for e in w.entries if e[0] == "cloud.renewal.alarm-unsent"]) == 1, "%s: %d audit entries" % (msg, len(w.entries))
+        unsent = [e for e in w.entries if e[0] == "cloud.renewal.alarm-unsent"]
+        assert len(unsent) == 1, "%s: %d unsent entries, %d audit entries in all" % (msg, len(unsent), len(w.entries))
         assert raised == 0, "a raising send was raised into the pass"
         assert os.path.exists(os.path.join(w.dir, module.STATE_FILE)), "the state was not written"
         w.send = real
@@ -563,7 +564,7 @@ def s25(module):
         assert len(w.messages) == 2 and len(w.to("lane-a")) == 1 and len(w.to("cos-1")) == 1, w.messages   # exactly one alarm per recipient at this tick
         w.tick(T0 + 10)
         assert len(w.messages) == 2, w.messages   # and nothing at the tick after
-        print("S25: audit entries %d, state written 1, exceptions raised %d, further sends %d" % (len(w.entries), raised, len(w.messages)))
+        print("S25: unsent entries %d, audit entries %d, state written 1, exceptions raised %d, further sends %d" % (len(unsent), len(w.entries), raised, len(w.messages)))
     finally:
         w.close()
 
