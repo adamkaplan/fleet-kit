@@ -2023,5 +2023,62 @@ class TestGhShimBodyFieldBesideInput(unittest.TestCase):
         self.assertIn("a body field beside --input went out unsigned", input_body_field_failures(rig))
 
 
+def bracket_body_failures(rig):
+    """#1696 S35: the failures seen for body keys with trailing brackets and a percent-bearing query key (empty when the control passes and all 4 are refused)."""
+    bad = []
+    comments = "repos/o/r/issues/1/comments"
+    path = rig.home / "bracket.json"
+    path.write_text('{"event":"COMMENT"}')
+    done, calls = rig.run("api", comments, "-f", "body=a")
+    if len(calls) != 1 or sum(a.count(SIGNED) for a in calls[0]["argv"]) != 1:
+        return ["the control of S35 did not pass"]
+    forms = (
+        (comments, "-f", "body[]=a"),
+        (comments, "-F", "comments[][body][]=a"),
+        (comments, "-f", "body[]=a", "--input", str(path)),
+        (comments + "?%2562ody=zz", "-X", "POST"),
+    )
+    for form in forms:
+        done, calls = rig.run("api", *form)
+        lines = [l for l in done.stderr.splitlines() if l.startswith("gh:")]
+        if calls or done.returncode != 1 or len(lines) != 1 or not lines[0].startswith("gh: refused:"):
+            bad.append("a body[] field went out unsigned" if "?" not in form[0] else "a key with a percent sign went out unsigned")
+    return bad
+
+
+class TestGhShimBracketBodyKeys(unittest.TestCase):
+    """#1696 PC-11: body keys with trailing brackets and percent-bearing query keys are refused (S35), and two mutants are seen (S36)."""
+
+    def setUp(self):
+        self.rig = hermetic_rig()
+        self.addCleanup(self.rig.close)
+        self.source = (SHIM_DIR / "gh").read_text()
+
+    def test_s35_control_first_a_plain_body_field_is_signed_once(self):
+        done, calls = self.rig.run("api", "repos/o/r/issues/1/comments", "-f", "body=a")
+        self.assertEqual(len(calls), 1, done.stderr)
+        self.assertEqual(sum(a.count(SIGNED) for a in calls[0]["argv"]), 1)
+
+    def test_s35_bracket_and_percent_keys_are_refused(self):
+        self.assertEqual(bracket_body_failures(self.rig), [])
+
+    def test_s36_a_mutant_with_the_old_key_pattern_is_seen(self):
+        self.assertEqual(bracket_body_failures(self.rig), [])   # control first
+        new = r'(?i)(^|\[)body(\]|\[\])*$'
+        old = r'(?i)(^|\[)body\]?$'
+        self.assertEqual(self.source.count(new), 2, "the mutant's anchor is gone (the two body key patterns of api_decide)")
+        rig = Rig(self.source.replace(new, old))
+        self.addCleanup(rig.close)
+        self.assertIn("a body[] field went out unsigned", bracket_body_failures(rig), "a body[] field went out unsigned")
+
+    def test_s36_a_mutant_dropping_the_percent_check_is_seen(self):
+        self.assertEqual(bracket_body_failures(self.rig), [])   # control first
+        old = '"%" in key or '
+        self.assertEqual(self.source.count(old), 1, "the mutant's anchor is gone (the percent check of api_decide)")
+        rig = Rig(self.source.replace(old, "", 1))
+        self.addCleanup(rig.close)
+        self.assertIn("a key with a percent sign went out unsigned", bracket_body_failures(rig), "a key with a percent sign went out unsigned")
+
+
 if __name__ == "__main__":
     unittest.main()
