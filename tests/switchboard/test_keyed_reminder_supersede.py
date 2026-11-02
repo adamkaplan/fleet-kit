@@ -1,5 +1,4 @@
 """The keyed-reminder supersede tests of #1711: a delivered keyed reminder drops the older copies of the same key and recipient, whatever their sender."""
-import json
 from support.loader import sb
 from support.wire_fakes import EPOCH
 
@@ -56,9 +55,10 @@ def build(PR4Base):
             self.assertEqual(self.drops(), [])
             present = {i["id"] for i in sb.read_reminders(self.world.state)}
             delivered = {k[len("reminder:"):] for m in self.world.admissions("platform") + self.world.admissions("web") for k in m["keys"]}
-            self.assertEqual([i["id"] for i in (other_key, other_to, unkeyed, gone_already) if not (i["id"] in present or i["id"] in delivered or i is gone_already)], [])
-            self.assertIn(newest["id"], delivered)
-            self.assertFalse([e for e in self.world.audit() if e["event"] == "reminder.drop_superseded" and gone_already["id"] in json.dumps(e)])
+            for name, copy in (("other key", other_key), ("other recipient", other_to), ("unkeyed", unkeyed)):
+                self.assertTrue(copy["id"] in present or copy["id"] in delivered, msg="s3: the %s copy was neither kept nor delivered" % name)
+            self.assertNotIn(gone_already["id"], present | delivered, msg="s3: the already delivered copy is not brought back")
+            self.assertIn(newest["id"], delivered, msg="s3: the newest keyed copy is delivered")
 
         def test_s4_a_mutant_that_keeps_the_older_copies_fails_the_check_after_the_unmutated_control(self):
             self.check_s2()   # the control: the unmutated check passes
