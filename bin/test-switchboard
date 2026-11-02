@@ -30327,7 +30327,7 @@ class TestPlanLedger(LedgerBase):
 
     def test_a_whitespace_only_edit_does_not_void_but_a_constraint_edit_does(self):
         self.all_proven()
-        self.plan_issue["body"] = LEDGER_PLAN.replace("Commissioning works.", "Commissioning   works.\n")
+        self.plan_issue["body"] = LEDGER_PLAN.replace("Commissioning works.", "Commissioning works.  ")
         self.assertEqual(self.gates()[0], 0)
         self.plan_issue["body"] = LEDGER_PLAN.replace("Commissioning works.", "Commissioning works, with a new constraint.")
         self.assertEqual(self.gates()[0], 1)
