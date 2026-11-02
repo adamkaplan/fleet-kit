@@ -501,3 +501,99 @@ class TestStopFinalMessageHardeningMutant(unittest.TestCase):
             code, out = self.run_child(name, test, old, new)
             self.assertEqual(code, 1, "mutant of %s: %s" % (test, out))
             self.assertIn(text, out, test)
+
+
+class TestStopFinalMessageEdges(unittest.TestCase):
+    """PC-10 (U15..U17): the Medium and the Lows of the third strict security pair, on fake pods."""
+
+    def test_U15_a_rebuilt_endpoint_is_in_neither_the_message_nor_the_file(self):
+        w = StopWorld(self)
+        text = "see https://" + ENDPOINT + "worker-x-ab12.example.internal:4096 early " + "words " * 700 + " late"
+        w.stop("cb-1788a", "idle", w.pod("cb-1788a", text))
+        w.scan()
+        everything = w.to("boss-lane")[0] + "".join(p.read_text() for p in (w.state / "cloud-last").iterdir())
+        self.assertEqual(everything.count("worker-x-ab12.example.internal"), 0, "a rebuilt endpoint reached a lane")
+        self.assertIn("early", everything)
+
+    def test_U15_a_text_that_still_changes_after_20_passes_is_refused_as_endpoint_loop(self):
+        w = StopWorld(self)
+        deep = ENDPOINT
+        for _ in range(25):
+            deep = "ht" + deep + "tps://worker-q.example.internal:1"
+        w.stop("cb-1788a", "idle", w.pod("cb-1788a", "start " + deep + " " + "words " * 700))
+        w.scan()
+        got = w.to("boss-lane")
+        self.assertEqual(len(got), 1)
+        self.assertTrue(got[0].endswith("\nlast text not read: endpoint_loop"), got[0])
+
+    def test_U16_a_plain_file_as_cloud_last_is_refused_and_the_cleaning_keeps_what_it_should(self):
+        w = StopWorld(self)
+        (w.state / "cloud-last").write_text("a plain file")
+        w.stop("cb-1788a", "idle", w.pod("cb-1788a", "lorem " * 1000))
+        w.scan()
+        got = w.to("boss-lane")
+        self.assertEqual(len(got), 1, got)
+        self.assertTrue(got[0].endswith("\nlast text not read: cloud_last_unsafe"), got[0])
+        w2 = StopWorld(self)
+        base = w2.state / "cloud-last"
+        base.mkdir(mode=0o700)
+        now = time.time()
+        old = now - 8 * 86400
+        outside = w2.root / "outside.txt"
+        outside.write_text("x")
+        os.utime(str(outside), (old, old))
+        files = {"old.txt": base / "old.txt", "young.txt": base / "young.txt", "old.dat": base / "old.dat"}
+        for path in files.values():
+            path.write_text("x")
+        for key in ("old.txt", "old.dat"):
+            os.utime(str(files[key]), (old, old))
+        os.symlink(str(outside), str(base / "link.txt"))
+        os.utime(str(base / "link.txt"), (old, old), follow_symlinks=False)
+        self.assertEqual(w2.retired.clean_last(base, now), 1)
+        self.assertEqual(sorted(p.name for p in base.iterdir()), ["link.txt", "old.dat", "young.txt"],
+                         "the cleaning removed a file it should keep")
+        self.assertTrue(outside.exists(), "the cleaning removed a file it should keep")
+
+    def test_U17_a_directory_whose_identity_differs_from_the_resolved_path_is_not_read(self):
+        w = StopWorld(self)
+        rec = w.pod("cb-1788a", "its own text")
+        w.stop("cb-1788a", "idle", rec)
+        real = os.lstat
+
+        def other(path, *a, **k):
+            out = real(path, *a, **k)
+            if str(path) == str(rec):   # the check saw another directory than the one opened afterwards
+                fields = list(out)
+                fields[1] += 1
+                return os.stat_result(fields)
+            return out
+        with mock.patch.object(os, "lstat", other):
+            w.scan()
+        got = w.to("boss-lane")
+        self.assertEqual(len(got), 1, got)
+        self.assertEqual(got[0].count("its own text"), 0, "a directory with another identity was read")
+        self.assertTrue(got[0].endswith("\nlast text not read: no_run_record"), got[0])
+
+
+class TestStopFinalMessageEdgesMutant(unittest.TestCase):
+    """U15..U17: each check on the control and on a mutant of a SCRATCH COPY of the source (outside the repository), each in a fresh process."""
+    CHILD = TestStopFinalMessageHardeningMutant.CHILD.replace("TestStopFinalMessageHardening.", "TestStopFinalMessageEdges.")
+    CASES = (
+        ("cloud_retired", "test_U15_a_rebuilt_endpoint_is_in_neither_the_message_nor_the_file", "        if not changed:\n", "        if True:\n",
+         "a rebuilt endpoint reached a lane"),
+        ("cloud_retired", "test_U16_a_plain_file_as_cloud_last_is_refused_and_the_cleaning_keeps_what_it_should",
+         "if stat.S_ISREG(st.st_mode) and name.endswith(\".txt\") and st.st_mtime < now - LAST_KEEP_SECONDS:\n                    os.unlink(name, dir_fd=dfd)\n",
+         "if st.st_mtime < now - LAST_KEEP_SECONDS:\n                    os.unlink(str(base / name))\n",
+         "the cleaning removed a file it should keep"),
+        ("cloud_retired", "test_U17_a_directory_whose_identity_differs_from_the_resolved_path_is_not_read",
+         "if (st.st_dev, st.st_ino) != tuple(ident):", "if False:", "a directory with another identity was read"),
+    )
+    run_child = TestStopFinalMessageHardeningMutant.run_child
+
+    def test_U15_to_U17_the_control_passes_and_each_mutant_fails_with_the_text_of_the_check(self):
+        for name, test, old, new, text in self.CASES:
+            code, out = self.run_child(name, test, "", "")
+            self.assertEqual(code, 0, "control of %s: %s" % (test, out))
+            code, out = self.run_child(name, test, old, new)
+            self.assertEqual(code, 1, "mutant of %s: %s" % (test, out))
+            self.assertIn(text, out, test)
