@@ -118,10 +118,10 @@ class Missing(unittest.TestCase):
         d = scratch(self)
         with open(os.path.join(d, "bin/cloud_cli.py"), "ab") as f:
             f.write(b"# changed\n")
-        with open(os.path.join(d, "agents/opencode/orchestrator.md"), "ab") as f:
+        with open(os.path.join(d, "bin/plan_check.py"), "ab") as f:
             f.write(b"# changed\n")
         control = scratch(self)
-        with open(os.path.join(control, "agents/opencode/orchestrator.md"), "ab") as f:
+        with open(os.path.join(control, "bin/plan_check.py"), "ab") as f:
             f.write(b"# changed\n")
         self.assertEqual(run_in(control)[0], 0)
         check_all_made(control)   # the control passes first
@@ -213,6 +213,7 @@ class Strict(unittest.TestCase):
 
     def check_copy_path_refused(self, d):
         put_table(d, "bin/cloud_cli.py\tREADME.md")
+        shutil.copyfile(os.path.join(ROOT, "README.md"), os.path.join(d, "README.md"))
         readme = slurp("README.md", d)
         status, out = run_in(d)
         if status == 0 or slurp("README.md", d) != readme:
