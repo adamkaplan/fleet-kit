@@ -35,6 +35,8 @@ class AnswerGitHub(FakeMergeGitHub):
             self.events.append("read")
             if self.lock_probe:
                 self.lock_held_at_read.append(self.lock_probe() is not None)
+            if self.view_raises:
+                raise RuntimeError("view blew up")
             if self.view is None:
                 return 1, "", "HTTP 502"
             return 0, self.view if isinstance(self.view, str) else json.dumps(self.view), ""
@@ -59,7 +61,7 @@ class AnswerBase(unittest.TestCase):
         fake.lock_probe = lambda: self.gate.read_lock(self.state, fake.repo, "main")
         return fake
 
-    def run_real(self, gate=None):
+    def run_real(self, gate=None, clock=None):
         """The REAL pass_and_merge; the lock releases are logged into the fake's event list."""
         gate = gate or self.gate
         real = gate.release
@@ -69,7 +71,7 @@ class AnswerBase(unittest.TestCase):
             return real(*a, **k)
         gate.release = release
         try:
-            return gate.pass_and_merge(self.reading, self.fake, self.conf, self.state, self.repo, self.n, "coder-a", made_up_pid(), self.fake.clock, self.fake.sleep,
+            return gate.pass_and_merge(self.reading, self.fake, self.conf, self.state, self.repo, self.n, "coder-a", made_up_pid(), clock or self.fake.clock, self.fake.sleep,
                                        alive=lambda pid: True)
         finally:
             gate.release = real
@@ -77,6 +79,10 @@ class AnswerBase(unittest.TestCase):
     def cases(self):
         other = {"state": "MERGED", "headRefOid": "c" * 40, "mergeCommit": None}
         return [{"state": "OPEN", "headRefOid": MG_HEAD, "mergeCommit": None}, other, None, "[1]"]
+
+    def late(self, bad):
+        """A clock that is the fake's until the merge was sent, then answers `bad`."""
+        return lambda: bad if self.fake.merges else self.fake.clock()
 
     def each(self, views):
         """Yield with a fresh fake per view (no setUp repeat)."""
@@ -139,6 +145,31 @@ class TestMergeGateAnswer(AnswerBase):
         self.assertIsNone(self.gate.read_lock(self.state, self.repo, "main"))
         self.assertEqual((released, run), (6, 6), "the lock is released in 6 of 6 cases")
 
+    def test_s6_the_reread_raising_is_reported_not_raised(self):
+        self.fake.view_raises = True
+        code, lines, audit = self.run_real()
+        self.assertEqual(code, 1, msg="an exception of the re-read is reported, not raised")
+        self.assertIn("could not be read", audit["merge_state"])
+        self.assertEqual((audit["merge_exit"], audit["merge_said"]), (1, "gh: boom"))
+        self.assertIsNone(self.gate.read_lock(self.state, self.repo, "main"))
+
+    def test_s7_an_unusable_clock_is_an_unknown_time(self):
+        for bad in (1e30, "x", float("nan"), None):
+            with self.subTest(clock=bad):
+                self.fake = self.fresh()
+                self.fake.view = {"state": "OPEN", "headRefOid": MG_HEAD}
+                code, lines, audit = self.run_real(clock=self.late(bad))
+                self.assertEqual(code, 1, msg="an unusable clock is reported as an unknown time")
+                self.assertIn("unknown at an unknown time", lines[-1], msg="an unusable clock is reported as an unknown time")
+                self.assertEqual(audit["merge_said"], "gh: boom")
+
+    def test_s8_merged_without_a_head_says_no_head_given(self):
+        self.fake.view = {"state": "MERGED"}
+        code, lines, audit = self.run_real()
+        self.assertEqual(code, 1)
+        self.assertEqual(audit["merge_state"], "MERGED (no head given)")
+        self.assertIn("MERGED (no head given)", lines[-1])
+
 
 class TestMergeGateAnswerMutant(AnswerBase):
     """S5: a copy of the module with the re-read skipped."""
@@ -188,3 +219,34 @@ class TestMergeGateAnswerMutant(AnswerBase):
         with self.assertRaises(AssertionError) as caught:
             other_head(mutant)
         self.assertIn("MERGED at another head is not reported merged", str(caught.exception))
+
+    def test_s9_reread_guard_control_then_mutant(self):
+        text = (REPO / "bin" / "merge_gate.py").read_text()
+        needle = "        except Exception:\n            mcode, mout = 1, \"\""
+        self.assertEqual(text.count(needle), 1)
+
+        def raising(gate):
+            self.fake = self.fresh()
+            self.fake.view_raises = True
+            code, lines, audit = self.run_real(gate)
+            self.assertEqual(code, 1, msg="an exception of the re-read is reported, not raised")
+        raising(self.copy(text))
+        mutant = self.copy(text.replace(needle, "        except KeyboardInterrupt:\n            mcode, mout = 1, \"\""))
+        with self.assertRaises(RuntimeError):
+            raising(mutant)
+
+    def test_s10_clock_guard_control_then_mutant(self):
+        text = (REPO / "bin" / "merge_gate.py").read_text()
+        needle = "if not isinstance(now, (int, float)) or isinstance(now, bool) or not math.isfinite(now):"
+        self.assertEqual(text.count(needle), 1)
+
+        def none_clock(gate):
+            self.fake = self.fresh()
+            self.fake.view = {"state": "OPEN", "headRefOid": MG_HEAD}
+            code, lines, audit = self.run_real(gate, clock=self.late(None))
+            self.assertIn("unknown at an unknown time", lines[-1], msg="an unusable clock is reported as an unknown time")
+        none_clock(self.copy(text))
+        mutant = self.copy(text.replace(needle, "if False:"))
+        with self.assertRaises(AssertionError) as caught:
+            none_clock(mutant)
+        self.assertIn("an unusable clock is reported as an unknown time", str(caught.exception))
