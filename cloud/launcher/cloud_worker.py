@@ -2813,7 +2813,8 @@ class Launcher:
             age = None   # a stamp from the future (a clock step, or an edited annotation) is not trusted either
         if not force and age is not None and age < GIT_TOKEN_RENEW_AFTER_SECONDS:
             return False
-        self.kube.add_secrets(*[self._b64_text(v) for v in (secret.get("data") or {}).values() if isinstance(v, str)], life=("pod", (pod.get("metadata") or {}).get("name")))   # every value of the Secret is known to the scrubber before anything can echo it
+        self.kube.add_secrets(*[self._b64_text(v) for k, v in (secret.get("data") or {}).items() if isinstance(v, str) and k != "model-auth"], life=("pod", (pod.get("metadata") or {}).get("name")))   # every value of the Secret is known to the scrubber before anything can echo it
+        self.kube.add_secrets(*[self._b64_text(v) for k, v in (secret.get("data") or {}).items() if isinstance(v, str) and k == "model-auth"])   # the model entry never leaves (open choice b)
         repo = _pod_repo(pod)
         if _repo_key(repo) is None or _repo_key(repo) != _repo_key(self._worker_record_repo(worker)):
             raise _NotRenewed("repository mismatch: the worker record and the pod name different repositories")
