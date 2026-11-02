@@ -2138,7 +2138,7 @@ class TestGhShimAllowlist(unittest.TestCase):
         self.assertEqual(allowlist_failures(self.rig), [])   # control first: exit 0
         old = '    return key.lower() == "body" or key in ALLOWED_KEYS'
         self.assertEqual(self.source.count(old), 1, "the mutant's anchor is gone (the allowlist check of the shim)")
-        rig = Rig(self.source.replace(old, '    return not re.search(r"(?i)(^|\\[)body(\\]|\\[\\])*$", key)', 1))   # a scratch copy outside the repo
+        rig = Rig(self.source.replace(old, '    return key.lower() == "body" or not re.search(r"(?i)(^|\\[)body(\\]|\\[\\])*$", key)', 1))   # a scratch copy outside the repo
         self.addCleanup(rig.close)
         self.assertNotEqual(rig.home.resolve(), REPO.resolve())
         self.assertIn("a key outside the allowlist went out unsigned", allowlist_failures(rig), "a key outside the allowlist went out unsigned")
