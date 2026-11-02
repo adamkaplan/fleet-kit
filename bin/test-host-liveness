@@ -95,6 +95,25 @@ def run_doctor(bodies, doctor_text=None, panes=()):
     import socket
     listener = socket.socket(socket.AF_UNIX)
     listener.bind(env["HERDR_SOCKET_PATH"])
+    listener.listen(8)
+    ready = threading.Event()
+    def accepting():
+        # the stub herdr server: accepts and closes every connection until the listener is closed
+        ready.set()
+        while True:
+            try:
+                conn, _ = listener.accept()
+            except OSError:
+                return
+            conn.close()
+    server = threading.Thread(target=accepting, daemon=True)
+    server.start()
+    if not ready.wait(30):
+        raise AssertionError("the stub herdr listener did not start")
+    probe = socket.socket(socket.AF_UNIX)
+    probe.settimeout(30)
+    probe.connect(env["HERDR_SOCKET_PATH"])   # the listener accepts before the doctor starts
+    probe.close()
     out = {}
     def go():
         proc = subprocess.run([str(path / "bash"), str(d / "fleet-doctor")], env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True, timeout=60)
@@ -103,6 +122,7 @@ def run_doctor(bodies, doctor_text=None, panes=()):
     t.start()
     t.join(70)
     listener.close()
+    server.join(10)
     shutil.rmtree(tmp, True)
     return [l for l in out.get("text", "").splitlines() if " charters " in l or l.split()[1:2] == ["charters"]]
 
