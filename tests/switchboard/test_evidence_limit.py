@@ -337,12 +337,12 @@ def build():
             self.assertEqual(code, 0, err)
             self.assertEqual(self.ledger()[0]["evidence"], "CI green at %s: every check run complete and passing" % host.LEDGER_HEAD[:12])
 
-        def test_a_waiver_reason_of_201_is_still_cut_to_200(self):
+        def test_a_waiver_reason_of_201_is_refused_not_cut(self):
             self.world.add_agent("cos", fleet={"role": "chief-of-staff"})
             self.configure()
             code, out, err = self.run_as("cos", "waive", self.PR, "--gates", "G1", "--reason", "r" * 201)
-            self.assertEqual(code, 0, err)
-            self.assertEqual(len(self.ledger()[-1]["reason"]), 200)
+            self.assertEqual((code, self.ledger()), (2, []), err)
+            self.assertIn("the reason is 201 characters and the limit is 200", err)
 
     class TestEvidenceLimitItemCi(items):
         """S7: the item CI record with 30 check names is recorded whole, above 500 characters."""
