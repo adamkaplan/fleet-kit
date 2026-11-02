@@ -941,7 +941,7 @@ class TestGhShim(Base):
 
     def test_everything_else_runs_the_real_gh_with_exactly_the_same_arguments(self):
         for args in (("issue", "view", "2", "--json", "body"), ("pr", "list"), ("api", "repos/o/r/issues/2",
-                     "-f", "body=x"), ("issue", "comment", "2"), ("issue", "comment", "2", "--editor"),
+                     "-f", "title=x"), ("issue", "comment", "2"), ("issue", "comment", "2", "--editor"),
                      ("issue", "comment"), ("--version",), ()):
             with self.subTest(args=args):
                 done, seen = self.run_shim(*args)

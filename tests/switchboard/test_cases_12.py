@@ -366,7 +366,7 @@ class TestAgentShellCalls(Base):
         self.assertEqual((done.returncode, done.stdout.strip()), (7, "real gh out"))
 
     def test_s7_only_the_account_the_class_and_the_time_are_stored(self):
-        done = self.shim("api", "repos/acme/app/issues/5?token=queryvalue", "-f", "body=secretbody", env={"GH_TOKEN": "secrettoken"})
+        done = self.shim("api", "repos/acme/app/issues/5?token=queryvalue", "-f", "title=secretbody", env={"GH_TOKEN": "secrettoken"})
         text = (self.state / "agent-calls.jsonl").read_text()
         for leak in ("secrettoken", "faketoken", "secretbody", "queryvalue", "acme/app"):
             self.assertNotIn(leak, text)
@@ -442,7 +442,7 @@ class TestAgentShellCalls(Base):
         self.assertNotIn("a b", text)
 
     def test_lane_s7_no_value_reaches_the_record_beside_the_lane(self):
-        self.shim("api", "repos/acme/app/issues/5?token=queryvalue", "-f", "body=secretbody", env={"GH_TOKEN": "secrettoken"})
+        self.shim("api", "repos/acme/app/issues/5?token=queryvalue", "-f", "title=secretbody", env={"GH_TOKEN": "secrettoken"})
         row = json.loads((self.state / "agent-calls.jsonl").read_text().splitlines()[0])
         self.assertEqual(sorted(row), ["account", "endpoint", "lane", "ts"])
         sb.agent_calls.fold(str(self.state), time.time())

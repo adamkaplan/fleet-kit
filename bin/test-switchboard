@@ -25239,7 +25239,7 @@ class TestIdentityCheck(ReportBase):
         self.assertEqual((done.returncode, seen["token"]), (0, "tok-bot"), done.stderr)
 
     def test_s6_a_worker_without_a_read_repository_is_untouched_by_the_guard(self):
-        for args in (("issue", "view", "5", "-R", "acme-org/other"), ("api", "graphql", "-f", "query=x"), ("issue", "comment", "5", "-R", "acme-org/other", "--body", "x")):
+        for args in (("issue", "view", "5", "-R", "acme-org/other"), ("api", "graphql", "-f", "query={viewer{login}}"), ("issue", "comment", "5", "-R", "acme-org/other", "--body", "x")):
             with self.subTest(args=args):
                 done, seen = self.run_gh_shim("acme-org/widget-service", self.READ_USERS, self.READ_TOKENS, args=args, own=True)
                 self.assertTrue(seen is not None and seen["argv"][0] == args[0], (done.returncode, done.stderr))
@@ -67335,6 +67335,7 @@ TestTheBinSetClassesAreAllInTheTable = _bin_set_table.TestTheBinSetClassesAreAll
 # The steer-after-minutes tests of #1540, moved under the line ceiling.
 _steer_long = importlib.import_module("test_steer_long_turn")
 TestSteerLongTurn = _steer_long.build(Base, TestSteerToWorking)
+TestGhShimSignInput = importlib.import_module("test_gh_shim_sign_input").TestGhShimSignInput
 _hc = importlib.import_module("test_header_cache"); TestAges, TestSets, TestEvents, TestSafety, TestReplay, TestIsolation, TestDropNeverBlocksAWrite, TestApprovalReadsFresh, TestDocs = _hc.TestAges, _hc.TestSets, _hc.TestEvents, _hc.TestSafety, _hc.TestReplay, _hc.TestIsolation, _hc.TestDropNeverBlocksAWrite, _hc.TestApprovalReadsFresh, _hc.TestDocs
 TestReminderTtlMore = importlib.import_module("test_reminder_ttl").build(PR4Base)
 # The load figure counts cloud workers as busy (#1487).
@@ -67367,6 +67368,7 @@ _changed_file_pages.HOST = sys.modules[__name__]
 TestWholeReadOfALargePullRequest = _changed_file_pages.load()
 
 _lm = importlib.import_module("test_launch_model"); _lm.HOST = sys.modules[__name__]; TestLaunchModel = _lm.build(); TestLaunchModelCloud = _lm.build_cloud()   # #1642
+TestBodyGuardRule, TestBodyGuardShim, TestBodyGuardMutants = (_bg := importlib.import_module("test_pr_body_guard")).TestBodyGuardRule, _bg.TestBodyGuardShim, _bg.TestBodyGuardMutants   # #1895
 TestPlanningDecision, TestConcurrencyGroup, TestGateLegs, TestGatePass, TestPlatformPaths, TestMacDocs = (_ml := importlib.import_module("test_mac_legs")).TestPlanningDecision, _ml.TestConcurrencyGroup, _ml.TestGateLegs, _ml.TestGatePass, _ml.TestPlatformPaths, _ml.TestDocs
 
 class TestTheArchitectureTestIsRun(unittest.TestCase):
@@ -73086,7 +73088,7 @@ class TestShimTopSpender(Base):
 
     # Every environment name the shim reads, with a hostile value for it. DERIVED from the shim's own code (see `shim_environment_names`): a name the shim starts to read
     # and this table does not list fails the test below, so a new switch cannot appear unseen. SWITCH_OFF lists the names that can still make the caller wait less.
-    HOSTILE = {"FLEET_REAL_GH": "/nonexistent/gh", "FLEET_SHIM_CACHE": "off", "FLEET_SHIM_GATE_SECONDS": "0.001", "FLEET_SHIM_LOOKUP_SECONDS": "0.001",
+    HOSTILE = {"FLEET_REAL_GH": "/nonexistent/gh", "FLEET_SHIM_BODY_SECONDS": "0.001", "FLEET_SHIM_CACHE": "off", "FLEET_SHIM_GATE_SECONDS": "0.001", "FLEET_SHIM_LOOKUP_SECONDS": "0.001",
                "FLEET_SHIM_MERGE_GATE_SECONDS": "0.001", "FLEET_SWITCHBOARD_BIN": "OTHER", "FLEET_SWITCHBOARD_STATE": "EMPTY", "GH_HOST": "ghe.example", "GH_REPO": "other/repo",
                "PATH": "SAME", "XDG_CONFIG_HOME": "EMPTY", "XDG_STATE_HOME": "EMPTY", "HOME": "EMPTY"}
     SWITCH_OFF = frozenset()   # none: the block reads no variable; who the caller is comes from the switchboard's answer for its session (see the shim's comment)
