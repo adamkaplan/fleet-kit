@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """Offline tests: `scrub` makes one pass over the text (ask #1776, PC-1, PC-2). The old body is the frozen reference of every check.
-Scenarios S2 S3 S4 S5 S8 S11 S13 S14 S15 S16 and U1 U2. Run directly: python3 cloud/launcher/tests/test_scrub_linear.py
+Scenarios S2 S3 S4 S5 S8 S11 S13 S14 S15 S16 S17 S18 S19 S20 and U1 U2. Run directly: python3 cloud/launcher/tests/test_scrub_linear.py
 Only counts, lengths and names are printed, never a fixture value."""
 import contextlib
+import copy
 import importlib.util
 import inspect
 import io
 import itertools
 import linecache
 import os
+import pickle
 import random
 import re
 import sys
@@ -707,7 +709,8 @@ class S16Random(unittest.TestCase):
         print("S16 control passes 1 of 1, the mutant that does not skip a candidate on a redacted character fails 1 of 1, mutation applied")
 
 
-MUTATORS = tuple(cw.KNOWN_SET_MUTATORS)
+MUTATORS = ("add", "update", "discard", "remove", "pop", "clear", "__ior__", "__iand__", "__isub__", "__ixor__", "difference_update",
+            "intersection_update", "symmetric_difference_update")
 MUTATOR_ARGS = {"add": ("c",), "update": (["c"],), "discard": ("a",), "remove": ("a",), "pop": (), "clear": (), "__ior__": ({"c"},),
                 "__iand__": ({"a"},), "__isub__": ({"a"},), "__ixor__": ({"a"},), "difference_update": (["a"],),
                 "intersection_update": (["a"],), "symmetric_difference_update": (["a"],)}
@@ -729,63 +732,61 @@ def known_set_class(src):
     return ns["KnownSet"]
 
 
-def override_attempts(cls):
-    """Make a subclass of `cls` that defines each of the thirteen, with a body that calls the parent and one that does not."""
-    refused = 0
-    for name in MUTATORS:
-        for calls_parent in (True, False):
-            body = ("        return set.%s(self, *a)\n" % name) if calls_parent else "        return None\n"
-            src = "class Sub(Base):\n    def %s(self, *a):\n%s" % (name, body)
-            try:
-                exec(src, {"Base": cls})
-            except TypeError as e:
-                if "a KnownSet subclass may not override" in str(e) and name in str(e):
-                    refused += 1
-                    continue
-                raise
-            raise AssertionError("an override of a mutator was accepted: %s" % name)
-    return refused
+def held_set_check(cls):
+    """The held set must not be reachable under a public attribute of an instance."""
+    ks = cls(["held-form-one"])
+    for name in dir(ks):
+        if name.startswith("_"):
+            continue
+        try:
+            val = getattr(ks, name)
+        except Exception:
+            continue
+        if isinstance(val, (set, frozenset)):
+            raise AssertionError("the held set is reachable: " + name)
+    return 1
 
 
 def bump_check(cls):
+    """Each of the thirteen moves `version` by exactly one when it changes the content."""
     bumped = 0
     for name in MUTATORS:
         ks = cls(["a", "b"])
-        before = ks.version
-        args = MUTATOR_ARGS[name]
-        try:
-            if name.startswith("__"):
-                getattr(ks, name)(*args)
-            else:
-                getattr(ks, name)(*args)
-        except KeyError:
-            pass
-        if ks.version != before + 1:
-            raise AssertionError("a mutator did not bump by one: %s" % name)
+        before, content = ks.version, frozenset(ks)
+        getattr(ks, name)(*MUTATOR_ARGS[name])
+        if frozenset(ks) == content or ks.version != before + 1:
+            raise AssertionError("a mutator did not change the content and bump by one: %s" % name)
         bumped += 1
-    ks = cls(["a"])
-    before = ks.version
-    with contextlib.suppress(KeyError):
-        ks.remove("absent")
-    if ks.version != before + 1:
-        raise AssertionError("a raising remove did not bump by one")
     return bumped
 
 
 class RecordingLock:
+    """A re-entrant stand-in: notes the version and the content at the outermost acquire and release."""
     def __init__(self, ks):
-        self.ks, self.lock, self.acquired, self.released, self.content = ks, threading.RLock(), [], [], []
+        self.ks, self.lock, self.depth, self.acquired, self.released, self.content, self.after = ks, threading.RLock(), 0, [], [], [], []
+
+    def acquire(self, *a):
+        ok = self.lock.acquire(*a)
+        if ok:
+            self.depth += 1
+            if self.depth == 1:
+                self.acquired.append(self.ks.version)
+                self.content.append(frozenset(self.ks._forms))
+        return ok
+
+    def release(self):
+        if self.depth == 1:
+            self.released.append(self.ks.version)
+            self.after.append(frozenset(self.ks._forms))
+        self.depth -= 1
+        self.lock.release()
 
     def __enter__(self):
-        self.lock.acquire()
-        self.acquired.append(self.ks.version)
-        self.content.append(frozenset(set.__iter__(self.ks)))
+        self.acquire()
         return self
 
     def __exit__(self, *exc):
-        self.released.append(self.ks.version)
-        self.after = frozenset(set.__iter__(self.ks))
-        self.lock.release()
+        self.release()
         return False
 
 
@@ -794,44 +795,149 @@ def lock_check(cls):
     for name in MUTATORS:
         ks = cls(["a", "b"])
         rec = RecordingLock(ks)
-        ks.lock = rec
-        with contextlib.suppress(KeyError):
-            getattr(ks, name)(*MUTATOR_ARGS[name])
+        ks._lock = rec
+        getattr(ks, name)(*MUTATOR_ARGS[name])
         if not (len(rec.acquired) == 1 and rec.released == [a + 1 for a in rec.acquired]):
             raise AssertionError("the version was bumped outside the lock: %s" % name)
-        if rec.after == rec.content[0]:
+        if rec.after[0] == rec.content[0]:
             raise AssertionError("the content had not changed when the lock was released: %s" % name)
         done += 1
     return done
 
 
-class S17Override(unittest.TestCase):
-    def test_S17_refusal_bump_and_mutant(self):
-        src = inspect.getsource(cw.KnownSet)
-        self.assertEqual(override_attempts(cw.KnownSet), 26)  # the control, first
-        class Plain(cw.KnownSet):
-            extra = 1
+def reentrant_check(cls):
+    ks = cls(["a"])
+    ks._lock.acquire()
+    ok = ks._lock.acquire(False)
+    if ok:
+        ks._lock.release()
+    ks._lock.release()
+    if not ok:
+        raise AssertionError("the lock is not re-entrant")
+    return 1
 
-            def read(self):
-                return len(self)
-        p = Plain()
-        p.add("x")
-        self.assertEqual((p.version, p.read(), p.extra), (1, 1, 1))
-        self.assertEqual(bump_check(cw.KnownSet), 13)
-        old = '                raise TypeError("a KnownSet subclass may not override %s" % name)\n'
-        mut = known_set_class(changed_text(src, old, "                pass\n"))
-        with self.assertRaisesRegex(AssertionError, "an override of a mutator was accepted:"):
-            override_attempts(mut)
+
+INSIDE_ARGS = {"add": ("charlie-form-3",), "update": (["charlie-form-3"],), "discard": ("alpha-form-1",), "remove": ("alpha-form-1",),
+               "pop": (), "clear": (), "__ior__": ({"charlie-form-3"},), "__iand__": ({"alpha-form-1"},), "__isub__": ({"alpha-form-1"},),
+               "__ixor__": ({"alpha-form-1"},), "difference_update": (["alpha-form-1"],), "intersection_update": (["alpha-form-1"],),
+               "symmetric_difference_update": (["alpha-form-1"],)}
+
+
+class HookSet(set):
+    """The held set with a hook that runs a scrub on the same KnownSet just BEFORE each content change (inside the change)."""
+    hook = None
+
+    def _run(self):
+        if self.hook:
+            self.hook()
+
+
+def _hooked(name):
+    def method(self, *a):
+        self._run()
+        return getattr(set, name)(self, *a)
+    return method
+
+
+for _n in MUTATORS:
+    setattr(HookSet, _n, _hooked(_n))
+
+
+def inside_check(cls):
+    """A scrub made from inside each change leaves no stale structure: the next scrub shows the content as it is now."""
+    done = 0
+    for name in MUTATORS:
+        ks = cls(["alpha-form-1", "bravo-form-2"])
+        held = HookSet(ks._forms)
+        ks._forms = held
+        held.hook = lambda: cw.scrub("alpha-form-1 bravo-form-2 charlie-form-3", ks, 1000)
+        getattr(ks, name)(*INSIDE_ARGS[name])
+        held.hook = None
+        for form in ("alpha-form-1", "bravo-form-2", "charlie-form-3"):
+            clear = cw.scrub("x " + form + " y", ks, 1000)
+            if (form in clear) == (form in frozenset(held)):
+                raise AssertionError("a form added was not redacted after the change (stale structure after %s)" % name)
+        done += 1
+    return done
+
+
+class S17Composition(unittest.TestCase):
+    def test_S17_composition_and_mutant(self):
+        src = inspect.getsource(cw.KnownSet)
+        self.assertEqual(held_set_check(cw.KnownSet), 1)  # the control, first
+        ks = cw.KnownSet(["held-form-one"])
+        self.assertFalse(isinstance(ks, set))
+        refused = 0
+        for fn in (lambda: setattr(ks, "version", 5), lambda: setattr(ks, "built", 5),
+                   lambda: set.add(ks, "x"), lambda: set.update(ks, ["x"])):
+            with self.assertRaises((AttributeError, TypeError)) as cm:
+                fn()
+            refused += 1
+        self.assertEqual(refused, 4)
+        self.assertEqual(ks.version, 0)
+
+        class Sub(cw.KnownSet):
+            def add(self, x):
+                return cw.KnownSet.add(self, x)
+
+        class Mix:
+            def add(self, x):
+                return super().add(x)
+
+        class Mixed(Mix, cw.KnownSet):
+            pass
+        late = Sub()
+        Sub.discard = lambda self, x: cw.KnownSet.discard(self, x)
+        through = 0
+        for obj, op, arg in ((Sub(), "add", "sub-form-1"), (Mixed(), "add", "mix-form-1"), (late, "discard", "late-form-1")):
+            before = obj.version
+            getattr(obj, op)(arg)
+            through += obj.version == before + 1
+            for attr in dir(obj):
+                if not attr.startswith("_"):
+                    self.assertNotIsInstance(getattr(obj, attr), (set, frozenset))
+        self.assertEqual(through, 3)
+        self.assertFalse(hasattr(ks, "__dict__"))
+        with self.assertRaisesRegex(TypeError, "a KnownSet is initialised once"):
+            ks.__init__()
+        self.assertEqual(ks.version, 0)
+        # copy, deepcopy and a pickle round trip
+        ks.add("original-form-9")
+        cw.scrub("some text", ks)
+        self.assertIsNotNone(ks.built)
+        independent = 0
+        for label, dup in (("copy", copy.copy(ks)), ("deepcopy", copy.deepcopy(ks)), ("pickle", pickle.loads(pickle.dumps(ks)))):
+            self.assertIsInstance(dup, cw.KnownSet)
+            ok = (dup == ks and dup._lock is not ks._lock and dup._forms is not ks._forms and dup.built is None)
+            dup.add("only-in-copy-1")
+            ok = ok and "only-in-copy-1" not in cw.scrub("x only-in-copy-1 y", dup, 1000)
+            ok = ok and "only-in-copy-1" in cw.scrub("x only-in-copy-1 y", ks, 1000)
+            independent += ok
+        self.assertEqual(independent, 3)
+        old = "    @property\n    def version(self):\n        return self._version\n"
+        new = "    @property\n    def forms(self):\n        return self._forms\n\n    @property\n    def version(self):\n        return self._version + 0\n"
+        mut = known_set_class(changed_text(src, old, new))
+        with self.assertRaisesRegex(AssertionError, r"the held set is reachable: forms"):
+            held_set_check(mut)
         with self.assertRaisesRegex(AssertionError, "the mutation was not applied"):
-            changed_text(src, "class KnownSet(set):", "class KnownSet(set):")
-        print("S17 refused 26 of 26 (name in the text), accepting case 1 of 1, 13 of 13 bump by one (raising remove too); "
-              "control passes 1 of 1, copy without the refusal fails 1 of 1, no-op mutation fails the computation 1 of 1")
+            changed_text(src, old, old)
+        print("S17 assignments and base-type calls refused %d of 4, subclass, mixin and late assignment through the own method %d of 3, "
+              "second __init__ refused 1 of 1, copy, deepcopy and pickle independent %d of 3; control passes 1 of 1, copy that exposes "
+              "the held set fails 1 of 1, no-op mutation fails the computation 1 of 1" % (refused, through, independent))
 
 
 class S18Lock(unittest.TestCase):
-    def test_S18_lock_stress_and_mutant(self):
+    def test_S18_lock_order_stress_and_mutants(self):
         src = inspect.getsource(cw.KnownSet)
-        self.assertEqual(lock_check(cw.KnownSet), 13)  # the control, first
+        self.assertEqual((reentrant_check(cw.KnownSet), lock_check(cw.KnownSet), inside_check(cw.KnownSet)), (1, 13, 13))  # control first
+        # a scrub run from inside an `update` whose argument iterator calls scrub on the same set
+        ks = cw.KnownSet(["alpha-form-1"])
+
+        def args():
+            cw.scrub("alpha-form-1 beta-form-22", ks, 1000)
+            yield "beta-form-22"
+        ks.update(args())
+        self.assertNotIn("beta-form-22", cw.scrub("x beta-form-22 y", ks, 1000))
         ks = cw.KnownSet()
         lasts = {}
 
@@ -848,16 +954,30 @@ class S18Lock(unittest.TestCase):
         self.assertEqual((ks.version, len(ks)), (4000, 4000))
         redacted = sum(1 for t in range(8) if lasts[t] not in cw.scrub("x " + lasts[t] + " y", ks, 1000))
         self.assertEqual(redacted, 8)
-        old = ("        with self.lock:\n            try:\n                return set.add(self, *args)\n"
-               "            finally:\n                self.version += 1\n")
-        new = "        with self.lock:\n            r = set.add(self, *args)\n        self.version += 1\n        return r\n"
+        old = ("        with self._lock:\n            try:\n                return getattr(self._forms, name)(*args)\n"
+               "            finally:\n                self._version += 1  # AFTER the content changed, under the lock\n")
+        new = ("        with self._lock:\n            r = getattr(self._forms, name)(*args)\n        self._version += 1\n        return r\n")
         mut = known_set_class(changed_text(src, old, new))
+        self.assertEqual(reentrant_check(mut), 1)
         with self.assertRaisesRegex(AssertionError, "the version was bumped outside the lock"):
             lock_check(mut)
-        with self.assertRaisesRegex(AssertionError, "the mutation was not applied"):
-            changed_text(src, old, old)
-        print("S18 13 of 13 release = acquire + 1, stress version %d forms %d, last forms redacted %d of 8; control passes 1 of 1, "
-              "copy that bumps after the release fails 1 of 1, no-op mutation fails the computation 1 of 1" % (ks.version, len(ks), redacted))
+        old2 = '        return self._change("discard", *args)\n'
+        new2 = "        with self._lock:\n            self._version += 1\n            return self._forms.discard(*args)\n"
+        mut2 = known_set_class(changed_text(src, old2, new2))
+        self.assertEqual((reentrant_check(mut2), lock_check(mut2)), (1, 13))
+        with self.assertRaisesRegex(AssertionError, "a form added was not redacted after the change"):
+            inside_check(mut2)
+        old3 = "self._lock = threading.RLock()"
+        mut3 = known_set_class(changed_text(src, old3, "self._lock = threading.Lock()"))
+        with self.assertRaisesRegex(AssertionError, "the lock is not re-entrant"):
+            reentrant_check(mut3)
+        for o in (old, old2, old3):
+            with self.assertRaisesRegex(AssertionError, "the mutation was not applied"):
+                changed_text(src, o, o)
+        print("S18 13 of 13 release = acquire + 1 with the content already changed, scrub inside the change leaves no stale structure "
+              "13 of 13 and 1 of 1 inside update, lock re-entrant 1 of 1, stress version %d forms %d, last forms redacted %d of 8; control "
+              "passes 1 of 1, the 3 mutants (bump after the release, bump before the change in discard, plain Lock) fail 3 of 3 with "
+              "their texts, no-op mutations fail the computation 3 of 3" % (ks.version, len(ks), redacted))
 
 
 class CountStop(Exception):
@@ -941,6 +1061,59 @@ FORM_VALUES = ['ghp_Zx9Qw3Er7Ty1Ui5Op2As4Df6Gh8Jk0Lz', '{"name": "synthetic-entr
 FORMS_FIXTURE = ['%7B%22name%22%3A%20%22synthetic-entry-one%22%2C%20%22key%22%3A%20%22synthetic-key-0123456789%22%7D', '%7B%22name%22%3A+%22synthetic-entry-one%22%2C+%22key%22%3A+%22synthetic-key-0123456789%22%7D', '6768705F5A78395177334572375479315569354F70324173344466364768384A6B304C7A', '6768705f5a78395177334572375479315569354f70324173344466364768384a6b304c7a', '706C61696E2073796E7468657469632076616C7565203432', '706c61696e2073796e7468657469632076616c7565203432', '73796E7468657469632D656E7472792D6F6E65', '73796E7468657469632D6B65792D30313233343536373839', '73796e7468657469632d656e7472792d6f6e65', '73796e7468657469632d6b65792d30313233343536373839', '7B226E616D65223A202273796E7468657469632D656E7472792D6F6E65222C20226B6579223A202273796E7468657469632D6B65792D30313233343536373839227D', '7Im5hbWUiOiAic3ludGhldGljLWVudHJ5LW9uZSIsICJrZXkiOiAic3ludGhldGljLWtleS0wMTIzNDU2Nzg5In', '7b226e616d65223a202273796e7468657469632d656e7472792d6f6e65222c20226b6579223a202273796e7468657469632d6b65792d30313233343536373839227d', 'BsYWluIHN5bnRoZXRpYyB2YWx1ZSA0M', 'N5bnRoZXRpYy1lbnRyeS1vbm', 'N5bnRoZXRpYy1rZXktMDEyMzQ1Njc4O', 'Z2hwX1p4OVF3M0VyN1R5MVVpNU9wMkFzNERmNkdoOEprMEx6', 'c3ludGhldGljLWVudHJ5LW9uZ', 'c3ludGhldGljLWVudHJ5LW9uZQ', 'c3ludGhldGljLWVudHJ5LW9uZQ==', 'c3ludGhldGljLWtleS0wMTIzNDU2Nzg5', 'cGxhaW4gc3ludGhldGljIHZhbHVlIDQy', 'docF9aeDlRdzNFcjdUeTFVaTVPcDJBczREZjZHaDhKazBMe', 'eyJuYW1lIjogInN5bnRoZXRpYy1lbnRyeS1vbmUiLCAia2V5IjogInN5bnRoZXRpYy1rZXktMDEyMzQ1Njc4OSJ9', 'ghp_Zx9Qw3Er7Ty1Ui5Op2As4Df6Gh8Jk0Lz', 'naHBfWng5UXczRXI3VHkxVWk1T3AyQXM0RGY2R2g4SmswTH', 'plain synthetic value 42', 'plain%20synthetic%20value%2042', 'plain+synthetic+value+42', 'sibmFtZSI6ICJzeW50aGV0aWMtZW50cnktb25lIiwgImtleSI6ICJzeW50aGV0aWMta2V5LTAxMjM0NTY3ODkif', 'synthetic-entry-one', 'synthetic-key-0123456789', 'wbGFpbiBzeW50aGV0aWMgdmFsdWUgND', 'zeW50aGV0aWMtZW50cnktb25l', 'zeW50aGV0aWMta2V5LTAxMjM0NTY3OD', '{"name": "synthetic-entry-one", "key": "synthetic-key-0123456789"}', '{\\"name\\": \\"synthetic-entry-one\\", \\"key\\": \\"synthetic-key-0123456789\\"}']
 
 
+class S19FurtherMutants(unittest.TestCase):
+    """Three further mutants of `_ScrubSpans`, each caught by CASES this file holds: cases 1, 3 and 5 of the S16 list (bracket cases
+    whose later secrets match a written marker), run under the count stop and compared with the reference output (the S16 test
+    holds the same cases against the reference, so the control output is the reference output):
+      no push at `rank == self.cur`  -> cases 1, 3 and 5 end with a DIFFERENT output (a candidate is lost; the strict reader's stop does not catch it, the output does);
+      `self.cur` never advanced      -> the same hang as the missing guard: cases 1, 3, 5 stop by the count;
+      stale heap keys kept           -> cases 1 and 3 stop by the count, case 5 differs.
+    (The bound here is 2,000 line events for each character of the text and of the secrets, which the control passes.)
+    None of the three is an equivalence, so no equivalence claim is made."""
+    MUTANTS = (
+        ("no push at rank == cur", "            if key >= self.ptr:\n                heapq.heappush(self.heap, key)\n", "            pass\n"),
+        ("cur never advanced", "            self.cur = rank\n", "            pass\n"),
+        ("stale heap keys kept", "            if key < self.ptr:\n                continue\n", "            pass\n"),
+    )
+    CASES = (1, 3, 5)
+
+    @staticmethod
+    def _bound(text, secs):
+        return 2000 * (len(text) + sum(len(x) for x in set(secs)))
+
+    def _run(self, fn, ns, text, secs):
+        res = []
+        run_under_stop(lambda tx, sc, lim: res.append(fn(tx, sc, lim)), ns, text, secs, self._bound(text, secs))
+        return res[0]
+
+    def test_S19_three_further_mutants_are_caught_by_cases(self):
+        cases = S16Random()._cases()
+        src = "\n\n".join(inspect.getsource(x) for x in _PARTS)
+        expected = {}
+        for i in self.CASES:  # the control, first: every case passes under the stop and equals the reference
+            text, secs = cases[i]
+            expected[i] = self._run(cw.scrub, NS, text, secs)
+            self.assertEqual(expected[i], ref(text, set(secs), 10 ** 7))
+        lines = []
+        for name, old, new in self.MUTANTS:
+            changed_text(src, old, new)  # the application, computed from the two texts
+            with self.assertRaisesRegex(AssertionError, "the mutation was not applied"):
+                changed_text(src, old, old)
+            m, mns = mutant(old, new)
+            stopped, differs = [], []
+            for i in self.CASES:
+                text, secs = cases[i]
+                try:
+                    if self._run(m, mns, text, secs) != expected[i]:
+                        differs.append(i)
+                except CountStop as e:
+                    self.assertEqual(str(e), "the count passed its bound")
+                    stopped.append(i)
+            self.assertTrue(stopped or differs, "a further mutant was not caught: " + name)
+            lines.append("%s: stop in cases %s, differs in cases %s" % (name, stopped, differs))
+        print("S19 further mutants, each caught by an S16 case under the stop (control passes %d of %d): %s" % (len(self.CASES), len(self.CASES), "; ".join(lines)))
+
+
 class U2Fixture(unittest.TestCase):
     def test_U2_forms_and_set_equal_the_tip(self):
         derived = sorted(set().union(*[cw.secret_forms(v) for v in FORM_VALUES]))
@@ -952,6 +1125,48 @@ class U2Fixture(unittest.TestCase):
         self.assertIsInstance(k.known, cw.KnownSet)
         self.assertEqual(k.known, set(FORMS_FIXTURE))
         print("U2: forms %d of %d, set equal" % (len(derived), len(FORMS_FIXTURE)))
+
+
+class S20VersionRule(unittest.TestCase):
+    def test_S20_version_rule_equality_and_kube(self):
+        self.assertEqual(bump_check(cw.KnownSet), 13)
+        unchanged = 0
+        ks = cw.KnownSet(["a"])
+        before = ks.version
+        with self.assertRaises(KeyError):
+            ks.remove("absent")
+        unchanged += ks.version == before
+        empty = cw.KnownSet()
+        with self.assertRaises(KeyError):
+            empty.pop()
+        unchanged += empty.version == 0
+        self.assertEqual(unchanged, 2)
+        half = cw.KnownSet(["a"])
+
+        def boom():
+            yield "first-form-1"
+            raise RuntimeError("the iterator stopped")
+        with self.assertRaises(RuntimeError):
+            half.update(boom())
+        self.assertEqual((half.version, "first-form-1" in half), (1, True))
+        forms = ["f%d-form-xx" % i for i in range(5)]
+        k = cw.KnownSet(forms)
+        self.assertTrue(k == set(forms) and k == frozenset(forms) and k == cw.KnownSet(forms) and k != set(forms[:2]))
+        self.assertIsNone(cw.KnownSet.__hash__)
+        self.assertEqual((len(k), forms[0] in k, "nope" in k, bool(k), bool(cw.KnownSet()), sorted(k) == sorted(forms)), (5, True, False, True, False, True))
+
+        def grow():
+            for x in k:  # a set changed during the iteration never raises
+                k.add(x + "-more")
+                yield x
+        self.assertEqual(len(list(grow())), 5)
+        self.assertEqual(len(k), 10)
+        kube = cw.Kube({})
+        kube.add_secrets(FORM_VALUES[0])
+        kube.add_secrets(*FORM_VALUES[1:])
+        self.assertTrue(isinstance(kube.known, cw.KnownSet) and kube.known == set(FORMS_FIXTURE))
+        print("S20 13 of 13 operations bump by one, raising remove and pop leave the version unchanged %d of 2, half-way update bumps once 1 of 1, "
+              "equality with a plain set and a frozenset 2 of 2, len, in and iteration 3 of 3, the set of a Kube equal by content 1 of 1" % unchanged)
 
 
 if __name__ == "__main__":
