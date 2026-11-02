@@ -483,6 +483,8 @@ class TestPushWatch(Case):
         self.assertEqual(len(log), 6)   # the compare and the tip at each of the three passes: the sha stays unseen
         self.assertEqual(len(self.to("lane-a")), 1)   # the first sight only
         self.assertEqual(len([l for l in self.engine.audit.lines if l[0] == "push_watch.read_failed"]), 1)
+        self.assertEqual(len([t for t in self.to("lane-a") if SHA_C[:8] in t]), 0)   # U10: 0 items for the failing push
+        self.assertEqual(json.loads((Path(self.tmp.name) / "push-watch.json").read_text())["workers"]["w-a"]["branches"]["w-a/wip"]["sha"], SHA_A)   # 0 advanced shas
         self._both_fail(recover=True)
         self.assertEqual(len(self.to("lane-a")), 3)   # the next pass with reads OK tells the push (two commits of the chain)
         self.assertIn(SHA_C[:8], self.to("lane-a")[-1])
@@ -507,10 +509,63 @@ class TestPushWatch(Case):
 
     def test_fix3_u11_a_403_permission_error_is_not_a_rate_limit_and_a_429_or_rate_limit_text_is(self):
         self.assertEqual(self._denied("HTTP 403 Resource not accessible: permission"), (2, 0))   # the pass goes on to the other worker
+        self.assertEqual(len(self.to("lane-b")), 1)   # and the second repo's worker got its item
         self.assertEqual(self._denied("HTTP 429 too many"), (0, 1))
+        self.assertEqual(len(self.to("lane-b")), 0)
         self.assertEqual(self._denied("HTTP 403 You have exceeded a secondary Rate Limit"), (0, 1))
-        mutant = self.mutant('("429", "rate limit")', '("403", "429", "rate limit")')
+        mutant = self.mutant('or "rate limit" in text', 'or "rate limit" in text or "403" in text')
         self._fails(lambda: self.assertEqual(self._denied("HTTP 403 Resource not accessible: permission", mutant), (2, 0), "a 403 was read as a rate limit"), "a 403 was read as a rate limit")
+
+    def test_low_a_429_inside_a_sha_is_not_a_rate_limit_but_http_429_is(self):
+        self.assertEqual(self._denied("bad object " + "ab" * 8 + "429" + "cd" * 8 + " and build 4290"), (2, 0))
+        self.assertEqual(self._denied("HTTP 429"), (0, 1))
+        mutant = self.mutant('re.search(r"(?<![0-9a-zA-Z])429(?![0-9a-zA-Z])", text)', '"429" in text')
+        self._fails(lambda: self.assertEqual(self._denied("bad object abab429cdcd", mutant), (2, 0), "429 inside a sha stopped the pass"), "429 inside a sha stopped the pass")
+
+    def _tip_limited(self, module=None):
+        self.setUp()
+        self.engine.cloud_watch = {"records": [record("w-a", "lane-a"), record("w-b", "lane-b")]}
+        self.world.refs = {"w-a/wip": SHA_A, "w-b/wip": SHA_A}
+        self.run_pass(NOW, module)
+        real = self.world.__call__
+        self.world.refs = {"w-a/wip": SHA_C, "w-b/wip": SHA_C}
+        self.seen = []
+
+        def broken(path):
+            self.seen.append(path)
+            if "/compare/" in path:
+                raise OSError("422 no merge base")
+            if path.endswith("/commits/" + SHA_C):
+                raise OSError("HTTP 429 slow down")
+            return real(path)
+        self.world = broken
+        self.run_pass(NOW + 60, module)
+        lines = [l[0] for l in self.engine.audit.lines]
+        return lines.count("push_watch.rate_limited"), lines.count("push_watch.read_failed"), len([p for p in self.seen if "w-b" in p])
+
+    def test_low_b_a_rate_limit_in_the_tip_fallback_stops_the_pass(self):
+        self.assertEqual(self._tip_limited(), (1, 0, 0))
+        mutant = self.mutant("                    if _is_limit(err2):", "                    if False:")
+        self._fails(lambda: self.assertEqual(self._tip_limited(mutant), (1, 0, 0), "the tip fallback rate limit did not stop the pass"), "the tip fallback rate limit did not stop the pass")
+
+    def _reused(self, module=None, create=True):
+        self.setUp()
+        self.engine.cloud_watch = {"records": [record("w-a", "lane-a")]}
+        self.launcher_line(worker="w-a", action="stop")   # ts 08:01:00Z
+        self.world.refs = {"w-a/wip": SHA_A}
+        self.run_pass(NOW, module)
+        self.assertEqual(len(self.to("lane-a")), 0)   # stopped: not watched
+        if create:
+            with open(self.launcher, "a") as handle:
+                handle.write(json.dumps({"action": "create", "ok": True, "worker": "w-a", "ts": "2027-01-15T09:00:00Z"}) + "\n")
+        self.run_pass(NOW + 1, module)
+        return len(self.to("lane-a"))
+
+    def test_low_e_a_reused_name_created_after_its_stop_is_watched_again(self):
+        self.assertEqual(self._reused(create=False), 0)   # control: no create, still stopped
+        self.assertEqual(self._reused(), 1)
+        mutant = self.mutant('state["stopped"].pop(worker)', 'pass')
+        self._fails(lambda: self.assertEqual(self._reused(mutant), 1, "a reused name stayed stopped"), "a reused name stayed stopped")
 
     def _first_sight(self, made, module=None, interval=60):
         self.setUp()

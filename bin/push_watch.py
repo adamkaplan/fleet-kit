@@ -103,9 +103,20 @@ def _read_launcher(sb, path, state, parse_iso):
         if not isinstance(item, dict) or not isinstance(item.get("worker"), str) or item.get("ok") is not True:
             continue
         ts = parse_iso(item.get("ts")) if isinstance(item.get("ts"), str) else None
-        table = {"stop": "stopped", "report": "reported", "send": "reported"}.get(item.get("action"))
+        table = {"stop": "stopped", "report": "reported", "send": "reported", "create": "created"}.get(item.get("action"))
         if ts is not None and table:
-            state[table][item["worker"]] = max(ts, state[table].get(item["worker"], 0))
+            state.setdefault(table, {})[item["worker"]] = max(ts, state.get(table, {}).get(item["worker"], 0))
+    for worker, made in state.get("created", {}).items():   # a name created again after its stop (names are reused) is watched again
+        if state["stopped"].get(worker, 0) and made > state["stopped"][worker]:
+            state["stopped"].pop(worker)
+        if worker in state["reported"] and state["reported"][worker] < made:
+            state["reported"].pop(worker)
+
+
+def _is_limit(err):
+    """A rate limit: the whole number 429 (not inside a sha or a longer number), or the words 'rate limit'."""
+    text = str(err).lower()
+    return bool(re.search(r"(?<![0-9a-zA-Z])429(?![0-9a-zA-Z])", text)) or "rate limit" in text
 
 
 def _dicts(result):
@@ -151,7 +162,7 @@ def run_pass(sb, engine, now, gh, config=None, launcher_audit=None):
     state = _load(sb, path)
     if _CORRUPT:
         engine.audit.append(engine.actor, "push_watch.load_failed", None, {"why": "the state file is not readable JSON: starting from an empty state"})
-    for key in ("stopped", "reported"):
+    for key in ("stopped", "reported", "created"):
         state.setdefault(key, {})
     _read_launcher(sb, launcher_audit or os.environ.get("CW_CLOUD_AUDIT") or os.path.join(
         os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"), "cw-cloud", "audit.jsonl"), state, sb.parse_iso)
@@ -167,14 +178,19 @@ def run_pass(sb, engine, now, gh, config=None, launcher_audit=None):
         try:
             return raw_gh(path_)
         except Exception as err:
-            text_ = str(err).lower()
-            if any(k in text_ for k in ("429", "rate limit")):
+            if _is_limit(err):
                 limited.append(1)
                 engine.audit.append(engine.actor, "push_watch.rate_limited", None, {"why": sb._one_line(str(err), 160)})
             elif "/compare/" in path_:
                 cmpfail.append(path_)
                 engine.audit.append(engine.actor, "push_watch.compare_failed", None, {"why": sb._one_line(str(err), 160)})
-                return raw_gh("repos/%s/commits/%s" % (path_.split("/compare/")[0].split("repos/", 1)[1], path_.rsplit("...", 1)[1]))
+                try:
+                    return raw_gh("repos/%s/commits/%s" % (path_.split("/compare/")[0].split("repos/", 1)[1], path_.rsplit("...", 1)[1]))
+                except Exception as err2:
+                    if _is_limit(err2):   # the tip read hit the rate limit: the pass stops
+                        limited.append(1)
+                        engine.audit.append(engine.actor, "push_watch.rate_limited", None, {"why": sb._one_line(str(err2), 160)})
+                    raise
             raise
 
     live = sorted(n for n, r in records.items() if isinstance(r.get("repo"), str) and not state["stopped"].get(n, 0))
@@ -269,7 +285,7 @@ def run_pass(sb, engine, now, gh, config=None, launcher_audit=None):
                 if cmpfail and not limited:   # both reads failed: the sha stays unseen (retried at the next pass), audited once per worker
                     mem["cmpfailed"] = True
                     skip, mem["failed"] = mem.get("failed"), True
-                if not skip:
+                if not skip and not limited:
                     engine.audit.append(engine.actor, "push_watch.read_failed", name, {"why": sb._one_line(str(err), 160)})
                 continue
             unsent = False
