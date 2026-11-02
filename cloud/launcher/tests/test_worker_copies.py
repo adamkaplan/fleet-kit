@@ -56,7 +56,8 @@ def run_in(d, command=COMMAND):
 
 def snapshot(d):
     snap = {}
-    for base, _, names in os.walk(d):
+    for base, dirs, names in os.walk(d):
+        dirs[:] = [x for x in dirs if x != "__pycache__"]
         for n in names:
             p = os.path.join(base, n)
             with open(p, "rb") as f:
@@ -139,6 +140,26 @@ class Missing(unittest.TestCase):
         self.assertEqual(run_in(d)[0], 0)
         with self.assertRaisesRegex(AssertionError, "a copy was not made from its source"):
             check_all_made(d)
+
+    def test_s3_mutant_writing_a_file_under_tools_is_caught_by_the_snapshot(self):
+        def run_snapshot_check(d):
+            before = snapshot(d)
+            run_in(d)
+            if snapshot(d) != before:
+                raise AssertionError("the scratch tree changed: a file was created, changed or deleted")
+        control = scratch(self)
+        run_snapshot_check(control)   # the control passes first
+        d = scratch(self)
+        original = slurp(COMMAND, d).decode()
+        old = "    changed = 0\n"
+        self.assertEqual(original.count(old), 1)
+        mutated = original.replace(old, old + "    open(os.path.join(root, 'tools', 'stray.txt'), 'w').close()\n")
+        self.assertNotEqual(mutated, original, "the mutation was not applied")
+        self.assertIn("stray.txt", mutated)
+        with open(os.path.join(d, COMMAND), "w") as f:
+            f.write(mutated)
+        with self.assertRaisesRegex(AssertionError, "the scratch tree changed: a file was created"):
+            run_snapshot_check(d)
 
     def test_s3_a_no_op_mutation_fails_the_computation(self):
         original = slurp(COMMAND).decode()
