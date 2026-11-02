@@ -66,7 +66,7 @@ chosen per item. Up to three rounds; a standing objection then goes to the Chief
 ## What the reviewers attack
 
 - **Requirements and coverage**: a Done-when clause with no scenario; vague words; a missing unchanged-behaviour scenario.
-- **Scenario adversary**: a bad build that passes every scenario (an empty or stubbed implementation); an undecidable pass rule; an evaluator who cannot record the proof.
+- **Scenario adversary**: a bad build that passes every scenario; an undecidable pass rule; an evaluator who cannot record the proof.
 - **Risk and security**: no rollback or a half-applied state; a contract change; a held-PR area; who can forge a verdict.
 - **Scope and what-not-how**: a step that dictates the design; no out-of-scope; creep; overlap with another plan.
 - **Cost and sequencing**: a smaller plan that meets the same Done-when; order and parallelism; an unwarranted integration branch.
