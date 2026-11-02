@@ -1359,7 +1359,7 @@ def rotate_audit(path, now=None, dry_run=False, _before_swap=None, _before_lock=
             except FileExistsError:
                 continue
         else:
-            raise FileExistsError(0, "no free archive name")
+            raise _GaveUp()
         temps.append(archive)
         result["archive"] = os.path.basename(archive)
         os.unlink(gz_temp)
