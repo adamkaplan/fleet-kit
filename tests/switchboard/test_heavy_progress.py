@@ -1,6 +1,8 @@
 """#1762: the heavy wrapper prints one progress line a minute while its command runs. A fake clock, a fake slot lock and a fake child: nothing waits for a real minute."""
+import faulthandler
 import importlib.util
 import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -39,11 +41,31 @@ class Out:
         pass
 
 
+LAST = [None]
+
+
+class BlockingOut(Out):
+    """An error stream whose write of a progress line blocks on an Event the test releases; the blocked line is dropped when released (the stream is gone)."""
+
+    def __init__(self, now, entered, release, done):
+        Out.__init__(self, now)
+        self.entered, self.release, self.done, self.returned = entered, release, done, threading.Event()
+
+    def write(self, text):
+        if "still running" not in text:
+            return Out.write(self, text)
+        self.done.set()   # the fake child ends while the write is blocked
+        self.entered.set()
+        self.release.wait()   # event only: no timer; the test releases it after run returned
+        self.returned.set()
+
+
 class Rig:
     """run() with a fake slot (or a busy one), a fake child alive `alive` fake seconds and a fake pause for the progress thread."""
 
-    def __init__(self, case, alive=0, status=0, busy=False, wait_max=1800, command=None, env=None, table_raises=False, slow_exit=False, slow_read=False):
+    def __init__(self, case, alive=0, status=0, busy=False, wait_max=1800, command=None, env=None, table_raises=False, slow_exit=False, slow_read=False, block_write=False):
         self.hs = load_heavy()
+        LAST[0] = self   # the kill handler of S14 reads the events of the rig that is running
         self.started = threading.Event()
         self.now = [1000.0]
         self.out = Out(self.now)
@@ -95,6 +117,8 @@ class Rig:
                    mock.patch.object(self.hs, "_progress_pause", pause), mock.patch.object(self.hs, "_progress_started", self.started, create=True),
                    mock.patch.object(self.hs, "_resolve", lambda command, environ: "/bin/true")]
         self.entered, self.release = threading.Event(), threading.Event()
+        if block_write:
+            self.out = BlockingOut(self.now, self.entered, self.release, self.done)
         if slow_read:
             def slow(pid):
                 self.entered.set()
@@ -276,6 +300,74 @@ class TestHeavyProgress(unittest.TestCase):
         self.assertEqual(set(rig.pauses), {60})
         rig = Rig(self, alive=1, env={"FLEET_HEAVY_PROGRESS_SECONDS": "0.3"})
         self.assertEqual((set(rig.pauses), len(rig.progress())), ({0.3}, 3))
+
+    def test_s13_inner_the_interval_variable_falls_back_to_60(self):
+        if not os.environ.get("FLEET_TEST_INNER"):
+            self.skipTest("run by test_s13 in a child process")
+        for value in ("0", "-5", "abc", "", "nan", "inf"):
+            rig = Rig(self, alive=1, env={"FLEET_HEAVY_PROGRESS_SECONDS": value})
+            read = set(rig.pauses)
+            self.assertNotIn(0.0, read, "a zero interval was accepted (value %r)" % value)
+            self.assertEqual(read, {60}, "value %r read as %r" % (value, read))
+        rig = Rig(self, alive=1, env={"FLEET_HEAVY_PROGRESS_SECONDS": "0.05"})
+        self.assertEqual(set(rig.pauses), {0.05})
+
+    def test_s13_a_zero_or_bad_interval_falls_back_to_60_and_the_old_reading_fails(self):
+        old = 'progress_every = float(environ.get("FLEET_HEAVY_PROGRESS_SECONDS") or PROGRESS_EVERY)'
+        results = self._scratch([("progress_every = _progress_interval(environ)", old)], "test_s13_inner_the_interval_variable_falls_back_to_60")
+        self.assertEqual(results["control"].returncode, 0, results["control"].stdout)
+        self.assertEqual(results["mutant"].returncode, 1, results["mutant"].stdout)
+        self.assertIn("a zero interval was accepted", results["mutant"].stdout)
+
+    def test_s14_inner_a_blocked_write_does_not_hold_the_return(self):
+        if not os.environ.get("FLEET_TEST_INNER"):
+            self.skipTest("run by test_s14 in a child process")
+        def killed(number, frame):   # the job's kill: name the hang and print every thread, the lock and the event
+            sys.stderr.write("the stop waited for a blocked write\n")
+            for thread in threading.enumerate():
+                sys.stderr.write("thread %s alive=%s\n" % (thread.name, thread.is_alive()))
+            faulthandler.dump_traceback(all_threads=True)
+            rig = LAST[0]
+            if rig is not None:
+                sys.stderr.write("write entered: %s, released: %s, returned: %s; the lock is shown by the traces above\n" % (rig.entered.is_set(), rig.release.is_set(), getattr(rig.out, "returned", threading.Event()).is_set()))
+            sys.stderr.flush()
+            os._exit(1)
+        signal.signal(signal.SIGTERM, killed)
+        before = set(threading.enumerate())
+        rig = Rig(self, alive=100, block_write=True, status=4)
+        self.assertEqual(rig.status, 4)   # run returned while the write is still blocked
+        self.assertTrue(rig.entered.is_set() and not rig.out.returned.is_set())
+        lines = len(rig.out.lines)
+        rig.release.set()   # only after run returned
+        self.assertTrue(rig.out.returned.wait(5))
+        for thread in set(threading.enumerate()) - before:
+            thread.join(5)
+        self.assertEqual(len(rig.out.lines) - lines, 0, "a line was written after the wrapper returned")
+
+    def test_s14_a_stop_that_waits_on_a_blocked_write_is_killed_by_the_outer_bound_and_named(self):
+        text = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "bin", "heavy_slots.py")).read()
+        anchor = "got_lock = progress_lock.acquire(timeout=2)"
+        self.assertEqual(text.count(anchor), 1, anchor)
+        here = os.path.dirname(os.path.abspath(__file__))
+        outcome = {}
+        with tempfile.TemporaryDirectory() as scratch:
+            for kind, body in (("control", text), ("mutant", text.replace(anchor, "got_lock = progress_lock.acquire()"))):
+                path = os.path.join(scratch, kind + "_heavy_slots.py")
+                with open(path, "w") as handle:
+                    handle.write(body)
+                env = dict(os.environ, FLEET_TEST_HEAVY_SLOTS=path, FLEET_TEST_INNER="1")
+                child = subprocess.Popen([sys.executable, __file__, "TestHeavyProgress.test_s14_inner_a_blocked_write_does_not_hold_the_return"], cwd=here, env=env,
+                                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
+                try:
+                    output, _ = child.communicate(timeout=60)   # the outer bound: only the mutant reaches it
+                    outcome[kind] = (child.returncode, output, False)
+                except subprocess.TimeoutExpired:
+                    child.terminate()   # the job's kill: the child names the hang
+                    output, _ = child.communicate(timeout=30)
+                    outcome[kind] = (child.returncode, output, True)
+        self.assertEqual(outcome["control"][:1] + outcome["control"][2:], (0, False), outcome["control"][1])
+        self.assertEqual(outcome["mutant"][2], True, "the mutant never reached the outer bound: " + outcome["mutant"][1])
+        self.assertIn("the stop waited for a blocked write", outcome["mutant"][1])
 
 
 if __name__ == "__main__":
