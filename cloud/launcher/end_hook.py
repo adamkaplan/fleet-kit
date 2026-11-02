@@ -247,7 +247,7 @@ def no_checkout(workdir):
 def wip_branch_for(workdir, worker, ctx):
     """(branch, blocked_by): <worker>/wip, or <worker>-wip when a remote branch named like the worker (refreshed by the bounded fetch) blocks it."""
     try:
-        p = subprocess.run([GIT_BIN, "-C", workdir, "show-ref", "--verify", "--quiet", "refs/remotes/origin/" + worker],
+        p = subprocess.run([GIT_BIN, "-C", workdir] + (ctx.opts if ctx else []) + ["show-ref", "--verify", "--quiet", "refs/remotes/origin/" + worker],
                            capture_output=True, env=ctx.env if ctx else None, timeout=FETCH_TIMEOUT_SECONDS)
     except (subprocess.TimeoutExpired, OSError):
         return "%s/wip" % worker, None
