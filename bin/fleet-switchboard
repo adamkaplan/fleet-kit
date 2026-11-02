@@ -4856,8 +4856,6 @@ def pane_state(engine, name, session_id, pane, known_names=(), known_sessions=()
         return PANE_ATTACHED, "the pane shows %s" % name, info
     others = [n for n in known_names if n and n != name and _names_agent(text, n, None)] + [x for x in known_sessions if x and x != session_id and x.lower() in text]
     info["shows_another"] = others[:3]
-    if not others and daemon_shows_absent(engine, name, {"pane": pane, "session": session_id}):   # #1884: a listed pane with no process of the agent is dead
-        return PANE_DEAD, "pane %s is listed but holds no process of %s's session %s" % (pane, name, session_id), info
     return PANE_DETACHED, "pane %s shows %r, not %s's session %s" % (pane, info["title"][:60], name, session_id), info
 
 
