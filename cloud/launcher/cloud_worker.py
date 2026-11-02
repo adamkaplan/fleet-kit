@@ -44,6 +44,31 @@ SHAPES = {"XS": {"cpu": "1", "memory": "2Gi", "usd_per_hour": 0.05, "stack": Fal
 DEFAULT_SHAPE = "XS"        # a create that names no shape and is not a stack launch (S, M by name only)
 DEFAULT_ORCHESTRATOR_SHAPE = "O"   # an orchestrator launch that names no shape takes its own small row (the role table carries no shape: this is the one place)
 DEFAULT_STACK_SHAPE = "S"   # a stack launch that names no shape (its row must carry stack: true)
+
+# Per-shape requests (#1978): ONE table, shape S only; a shape with no row has no requests key. The limits stay the SHAPES rows.
+SHAPE_REQUESTS = {"S": {"cpu": "500m", "memory": "2Gi"}}
+
+
+def parse_quantity(q):
+    """A Kubernetes quantity as an exact number (CPUs or bytes): plain numbers and the suffixes m, Ki, Mi, Gi."""
+    from fractions import Fraction
+    q = str(q)
+    for suffix, mult in (("Ki", 1024), ("Mi", 1024 ** 2), ("Gi", 1024 ** 3), ("m", Fraction(1, 1000))):
+        if q.endswith(suffix):
+            return Fraction(q[:-len(suffix)]) * mult
+    return Fraction(q)
+
+
+def requests_fit(shape_name, resources):
+    """True when resources hold requests of exactly cpu and memory, each equal to the table's value for the shape and not above the same limit."""
+    req, lim = (resources or {}).get("requests"), (resources or {}).get("limits")
+    table = SHAPE_REQUESTS.get(shape_name)
+    try:
+        return bool(table) and req == table and set(lim) == {"cpu", "memory"} and all(
+            parse_quantity(req[k]) <= parse_quantity(lim[k]) for k in ("cpu", "memory"))
+    except (TypeError, ValueError, ZeroDivisionError, KeyError):
+        return False
+
 MAX_TOKEN_SECONDS = 3600
 
 # The cluster login (ONE route, used by the launch wiring and by the reaper's own refresh; the numbers of the refresh live here).
