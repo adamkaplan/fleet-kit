@@ -644,6 +644,48 @@ class TestStopFinalMessageBare(unittest.TestCase):
         self.assertIn("Ran %d tests" % want, done.stdout, "the file ran no tests")
         self.assertEqual(done.returncode, 0, done.stdout[-2000:])
 
+    U21_TEXTS = (("worker-", 28000), ("worker-a.", 19600), ("worker-" + "a" * 60, 3000), ("http://", 28000))
+    U21_CHILD = (
+        "import sys,os,tempfile,importlib.util,glob,shutil\n"
+        "real,old,new=sys.argv[1:4]\n"
+        "src=open(real).read()\n"
+        "assert src.count(old)==1, 'anchor not found once'\n"
+        "scratch=tempfile.mkdtemp()\n"
+        "[shutil.copy(f,scratch) for f in glob.glob(os.path.join(os.path.dirname(real),'*.py'))]\n"
+        "path=os.path.join(scratch,'cloud_retired.py')\n"
+        "open(path,'w').write(src.replace(old,new))\n"
+        "spec=importlib.util.spec_from_file_location('cloud_retired',path); mod=importlib.util.module_from_spec(spec); sys.modules['cloud_retired']=mod; spec.loader.exec_module(mod)\n"
+        "class C: pass\n"
+        "c=C(); c.n=0; c.limit=330*196000\n"
+        "try:\n"
+        "    mod._remove_hosts('worker-'*28000, c)\n"
+        "except mod.StepLimit:\n"
+        "    print('the host scan is not linear: the counter passed', c.limit); sys.exit(1)\n"
+        "print('steps', c.n)\n")
+
+    def test_U21_the_host_scan_is_linear_and_counted_by_steps_not_by_the_clock(self):
+        class Counter:
+            n = 0
+            limit = 330 * 196000
+        mod = sb.load_module("cloud_retired")
+        for unit, times in self.U21_TEXTS:
+            text = unit * times
+            self.assertEqual(len(text), 196000)
+            c = Counter()
+            c.n = 0
+            try:
+                got = mod._remove_hosts(text, c)
+            except mod.StepLimit:
+                self.fail("the host scan is not linear: %r" % unit)
+            self.assertLessEqual(c.n, c.limit, "the host scan is not linear: %r" % unit)
+            if unit == "worker-":
+                self.assertEqual(got, text)
+        # the mutant: a SCRATCH COPY (outside the repository) whose scan reads the token run to its end
+        done = subprocess.run([sys.executable, "-c", self.U21_CHILD, str(BIN / "cloud_retired.py"), "k - p < 63 and ", ""], cwd=str(CHECK_FILE.parent),
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True, timeout=600)
+        self.assertEqual(done.returncode, 1, "mutant of U21: %s" % done.stdout)
+        self.assertIn("the host scan is not linear", done.stdout)
+
 
 class TestStopFinalMessageBareMutant(unittest.TestCase):
     """U18, U19: each check on the control and on a mutant of a SCRATCH COPY of the source (outside the repository). U20: on a scratch copy of the file."""
