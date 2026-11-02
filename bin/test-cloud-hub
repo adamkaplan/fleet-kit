@@ -834,6 +834,12 @@ USERS_NS = {"tok-cw": SA + "cw:agent-a", "tok-old": SA + "fleet-agents:agent-a",
 BAD_NAMESPACES = ("", "Cw", "c.w", "c:w", "cw\n", "a" * 64, "a/b", "cw/evil")
 
 
+WORKER_COPY_NAMES = tuple(
+    row.split("\t")[0][len("bin/"):]
+    for row in (BIN.parent / "cloud" / "worker" / "copies.tsv").read_text().splitlines()
+    if row.split("\t")[0].startswith("bin/") and row.split("\t")[1].startswith("cloud/worker/bin/"))
+
+
 class TestNamespaceSetting(unittest.TestCase):
     def killed(self, module, check):
         try:
@@ -929,7 +935,7 @@ class TestNamespaceSetting(unittest.TestCase):
 
     def test_old_name_is_nowhere_in_the_hub_source(self):
         old = "fleet-" + "agents"
-        for name in ("cloud_hub.py", "cloud_channel.py", "cloud_channel_server.py"):
+        for name in WORKER_COPY_NAMES:
             for base in (BIN, BIN.parent / "cloud" / "worker" / "bin"):
                 self.assertNotIn(old, (base / name).read_text(), name)
         self.assertEqual(SOURCE.count("environ.get(NAMESPACE_ENV)"), 1)
