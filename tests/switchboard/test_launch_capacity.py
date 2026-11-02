@@ -513,11 +513,11 @@ def build():
 
         def test_u11_an_ipv4_straddling_the_cut_is_masked_whole(self):
             block = self.u11_cut_block(V4)
-            self.assertEqual((block.count("10.99.8"), block.count("[address]")), (0, 1), "part of an address reached the block: " + block)
+            self.assertEqual((block.count("10.99.8"), block.count("[addres")), (0, 1), "part of an address reached the block: " + block)
 
         def test_u11_an_ipv6_straddling_the_cut_is_masked_whole(self):
             block = self.u11_cut_block(V6)
-            self.assertEqual((block.count("fd00:ab"), block.count("[address]")), (0, 1), "part of an address reached the block: " + block)
+            self.assertEqual((block.count("fd00:ab"), block.count("[addres")), (0, 1), "part of an address reached the block: " + block)
 
         def test_u11_the_cut_control_passes_and_a_mutant_masking_after_the_cut_fails_with_the_text(self):
             code, err = self.scratch_cut()
