@@ -801,8 +801,8 @@ for text in ("12:30:45", "aa:bb:cc:dd:ee:ff", "1::2::3", "x::1::2", "0123456789a
         def test_u26_the_control_passes_and_a_mutant_starting_only_at_the_edges_fails_with_the_text(self):
             code, err, out = self.pc11_run(self.PC11_U26)
             self.assertEqual((code, err), (0, ""))
-            code, err, out = self.pc11_run(self.PC11_U26, ("cloud/launcher/cloud_worker.py", "        if True:  # a candidate starts at any position (PC-13)\n",
-                                                           "        if i == 0 or (run[i - 1] in \":.\" and run[i - 2:i] != \"::\"):\n"))
+            code, err, out = self.pc11_run(self.PC11_U26, ("cloud/launcher/cloud_worker.py", "    GLUE_PASS = True\n",
+                                                           "    GLUE_PASS = False\n"))
             self.assertEqual(code, 1, err)
             self.assertIn("an address glued to letters was left", err)
 
