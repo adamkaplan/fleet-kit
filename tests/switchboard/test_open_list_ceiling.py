@@ -142,7 +142,7 @@ class TestOpenListAlert(Base):
 
     def passes(self, start, n=10):
         for i in range(n):
-            sb.open_list_alert(self.engine, "acme/api", True, start + i * 900)
+            sb.open_list_alert(self.engine, "acme/api", start + i * 900)
 
     def test_s4_one_alert_a_day_and_one_more_the_next_day(self):
         self.passes(self.DAY1)
@@ -155,7 +155,7 @@ class TestOpenListAlert(Base):
         self.assertEqual(len(self.reminders), 2)
 
     def test_an_uncut_list_and_an_absent_state_file_are_silent(self):
-        sb.open_list_alert(self.engine, "acme/api", False, self.DAY1)
+        self.assertEqual(sb.take_open_cuts(), [])
         self.assertEqual((self.reminders, self.audit), ([], []))
         self.assertFalse((self.state_dir / "open-list-alert.json").exists())
 

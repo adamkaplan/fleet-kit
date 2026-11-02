@@ -10022,8 +10022,8 @@ def open_list_alert(engine, repo, now):
     discovery = getattr(engine, "discovery", None)
     cos = next((n for n, o in sorted(discovery.agents.items()) if (o.fleet or {}).get("role") == "chief-of-staff"), None) if discovery is not None else None
     ceiling = OPEN_LIST_PAGES * GITHUB_PAGE_SIZE
-    text = ("The open items of %s were cut: %s or more are open and the read stops at %d pages (%s items, OPEN_LIST_PAGES); the oldest are not read by the checks that read this list."
-            % (repo, format(ceiling, ","), OPEN_LIST_PAGES, format(ceiling, ",")))
+    text = ("The open items of %s were cut: %s or more are open and the read stops at %d pages (%d items, OPEN_LIST_PAGES); the oldest are not read by the checks that read this list."
+            % (repo, format(ceiling, ","), OPEN_LIST_PAGES, ceiling))
     audit = getattr(engine, "audit", None)
     if cos is None:
         if audit is not None:
