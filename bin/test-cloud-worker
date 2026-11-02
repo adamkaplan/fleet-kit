@@ -1619,6 +1619,17 @@ class TestLaunchStack(Base):
         self.assertIn("worker reminder in 25 min", lines[0])
         self.assertIn("overdue reminder in 40 min", lines[0])
 
+    def test_s15_a_second_launch_of_the_same_name_arms_nothing(self):
+        def arming(err):
+            return [l for l in err.splitlines() if l.startswith("fleet-switchboard: default 25m/40m")]
+        code, out, err = self.launch_with("--cloud")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(arming(err)), 1, err)
+        code, out, err = self.launch_with("--cloud")   # no state_clean: the worker record of the first exists, the real launcher refuses it
+        self.assertNotEqual(code, 0, err)
+        self.assertEqual(len(arming(err)), 0, err)
+        self.assertEqual(len([c for c in self.stub_calls() if c[0] == "create"]), 1)   # no second pod
+
     def state_clean(self):
         """Between two launches of one test: the fakes' call logs and the worker records start empty."""
         for name in ("calls.log", "kubectl.log", "login.log"):

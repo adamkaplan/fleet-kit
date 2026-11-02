@@ -117,11 +117,14 @@ def build(TwoRepoCase, sb, EPOCH, ACME_WEB):
         def test_s7_a_mutant_in_one_place_names_that_place(self):
             places = self.places()
             self.check_places(places)   # the control passes first
-            name = "skills/fleet-coordination/SKILL.md"
-            places[name] = places[name].replace("default 25m/40m", "old rule")
-            with self.assertRaises(AssertionError) as failed:
-                self.check_places(places)
-            self.assertIn(name, str(failed.exception))
+            self.assertEqual(len(places), 4)
+            for name in list(places):
+                mutated = dict(places)
+                mutated[name] = " ".join(places[name].split()).replace("default 25m/40m", "old rule")
+                self.assertNotEqual(mutated[name], places[name], name)
+                with self.assertRaises(AssertionError) as failed:
+                    self.check_places(mutated)
+                self.assertIn(name, str(failed.exception))
         def failing_launch(self, how):
             def fake(function, args, runner, now):
                 if how == "raise":
