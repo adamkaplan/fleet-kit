@@ -9987,7 +9987,9 @@ def open_pages(read, repo=None):
     for page in range(1, OPEN_LIST_PAGES + 1):
         got = read(page)
         if not isinstance(got, list):
-            return out if out else got
+            if page > 1:
+                raise IntentError("gh", "page %d of an open list was not a list" % page)
+            return got
         out.extend(got)
         if len(got) < GITHUB_PAGE_SIZE:
             break
