@@ -10770,7 +10770,7 @@ def plan_wake_pass(engine, state, repos, now, budget=None):
                 continue
             if sends is None:
                 sends = _audit_tail(engine.state_dir)   # #790: the sends the audit already holds, read once per pass and only for a plan no other form approved
-            if module.approved_by_send(plan, plan_hash, sends, signed_by_fleet):
+            if any(module.approved_by_send(plan, h, sends, signed_by_fleet) for h in hashes):
                 continue
             url = module.plan_url(repo, number, plan["id"])
             key = "%s#%d:%s" % (repo, number, plan_hash)
