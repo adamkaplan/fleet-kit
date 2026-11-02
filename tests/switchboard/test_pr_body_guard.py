@@ -23,9 +23,9 @@ NO_PLAN = "MERGE: captain\nCLAIMS: a.py\n\nThe text of the description.\n"
 DROPPED = "PLAN: the plan\nCLAIMS: a.py\n\nThe text of the description.\n"
 PLAIN = "Just some words in a description, no keyed line.\n"
 COMPLETE = OLD + "One more line.\n"
-FORMS = ("edit --body", "edit -b", "edit --body-file", "edit -F -", "api -f", "api -F @file", "api --input -")
+BODY_FORMS = ("edit --body", "edit -b", "edit --body-file", "edit -F -", "api -f", "api -F @file", "api --input -")
 
-FAKE_GH = """#!/usr/bin/env python3
+FAKE_BODY_GH = """#!/usr/bin/env python3
 import json, os, sys, time
 argv = sys.argv[1:]
 stdin = "" if sys.stdin.isatty() else sys.stdin.read()
@@ -63,7 +63,7 @@ def load_file(name, path):
 class BodyRig(Rig):
     def __init__(self, shim_source=None, guard_source=None):
         Rig.__init__(self, shim_source)
-        (self.bin / "gh").write_text(FAKE_GH)
+        (self.bin / "gh").write_text(FAKE_BODY_GH)
         if guard_source is not None:
             (self.shims / "body_guard.py").write_text(guard_source)
 
@@ -105,7 +105,7 @@ class BodyRig(Rig):
 def scenario(rig):
     """The failures of the guard on the 7 forms (S3): empty for the real shim. Each message starts with 'body-guard:'."""
     bad = []
-    for name in FORMS:
+    for name in BODY_FORMS:
         for label, body in (("empty body", ""), ("cut-off body", CUT), ("body without PLAN:", NO_PLAN)):
             args, stdin = rig.form(name, body)
             done, writes, _reads = rig.go(*args, stdin=stdin)
@@ -124,7 +124,7 @@ def scenario(rig):
     return bad
 
 
-class Base(unittest.TestCase):
+class BodyBase(unittest.TestCase):
     def setUp(self):
         self.rig = BodyRig()
         self.addCleanup(self.rig.close)
@@ -169,7 +169,7 @@ class TestBodyGuardRule(unittest.TestCase):
         self.assertFalse(calls & {"open", "exec", "eval", "__import__"})
 
 
-class TestBodyGuardShim(Base):
+class TestBodyGuardShim(BodyBase):
     def test_s3_every_form_refuses_three_bad_bodies_and_passes_a_complete_one(self):
         self.assertEqual(scenario(self.rig), [])
 
