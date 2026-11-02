@@ -125,18 +125,46 @@ def whole_names(pr):
     return {f.get("path") for f in files if isinstance(f, dict)}
 
 
+WHOLE_PAGE_LIMIT = 30   # pages of 100 files of the files endpoint (3,000 files): a pull request with more is not read
+
+
+def endpoint_names(pr, repo):
+    """Every filename of the files endpoint of a pull request (each page of 100, at most WHOLE_PAGE_LIMIT pages) as a list, else None when a page cannot be read."""
+    base = "repos/%s" % (repo or "{owner}/{repo}")
+    names = []
+    for page in range(1, WHOLE_PAGE_LIMIT + 1):
+        done = subprocess.run(["gh", "api", "%s/pulls/%s/files?per_page=100&page=%d" % (base, pr.get("number"), page)], capture_output=True, text=True)
+        if done.returncode != 0:
+            return None
+        try:
+            entries = json.loads(done.stdout)
+        except ValueError:
+            return None
+        if not isinstance(entries, list) or not all(isinstance(e, dict) and isinstance(e.get("filename"), str) for e in entries):
+            return None
+        names += [e["filename"] for e in entries]
+        if len(entries) < 100:
+            return names
+    return None
+
+
 def fetch_whole(pr, repo):
-    """The paths from one bounded `gh pr diff <n> --name-only` when their number matches `changedFiles` and they hold every listed file, else None (GitHub refuses a diff over its limit)."""
+    """The paths of one bounded `gh pr diff <n> --name-only` when, as a set, they equal every filename of the files endpoint and their number equals `changedFiles`, else None."""
     total = pr.get("changedFiles")
-    if isinstance(total, bool) or not isinstance(total, int):
+    if isinstance(total, bool) or not isinstance(total, int) or total > 3000:
         return None
     cmd = ["gh", "pr", "diff", str(pr.get("number")), "--name-only"] + (["--repo", repo] if repo else [])
     done = subprocess.run(cmd, capture_output=True, text=True)
     if done.returncode != 0:
         return None
-    names = {line for line in done.stdout.splitlines() if line}
-    listed = {f.get("path") for f in pr.get("files") or [] if isinstance(f, dict)}
-    return names if len(names) == total and listed <= names else None
+    lines = [line for line in done.stdout.splitlines() if line]
+    names = set(lines)
+    if len(names) != len(lines):
+        return None
+    pages = endpoint_names(pr, repo)
+    if pages is None or len(set(pages)) != len(pages):
+        return None
+    return names if len(lines) == total and names == set(pages) else None
 
 
 def main(argv=None):

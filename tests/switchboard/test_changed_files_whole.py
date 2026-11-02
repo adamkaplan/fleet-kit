@@ -40,14 +40,26 @@ def make_repo(root):
     return repo
 
 
-def run_tool(tool, root, list_out, list_rc=0, diff_names=None, diff_rc=1):
+def write_pages(bindir, number, names):
+    """The files endpoint of pull request `number` as GitHub pages it: pages of 100 filenames (a last page of fewer, or empty after an exact multiple)."""
+    for k in range(len(names) // 100 + 1):
+        (bindir / ("page.%s.%d.json" % (number, k + 1))).write_text(json.dumps([{"filename": n} for n in names[k * 100:(k + 1) * 100]]))
+
+
+API_CASE = "  repos/*) n=$(echo \"$2\" | sed 's#.*pulls/\\([0-9]*\\)/files.*#\\1#'); k=${2##*page=}; echo \"$n $k\" >> '%s/pagecalls'; cat \"%s/page.$n.$k.json\" 2>/dev/null || exit 1; exit 0;;\n"
+
+
+def run_tool(tool, root, list_out, list_rc=0, diff_names=None, diff_rc=1, pages=None):
     """Run `tool` in a fresh clone with a fake `gh`: `pr list` answers list_out and list_rc, `pr diff N --name-only` answers diff_names and diff_rc."""
     repo = make_repo(tempfile.mkdtemp(dir=root))
     bindir = Path(tempfile.mkdtemp(dir=root))
     (bindir / "list.out").write_text(list_out)
     (bindir / "diff.out").write_text("\n".join(diff_names or []))
+    (bindir / "pagecalls").write_text("")
+    if pages is not None:
+        write_pages(bindir, 7, pages)
     gh = bindir / "gh"
-    gh.write_text("#!/bin/sh\ncase \"$2\" in\n  list) cat '%s/list.out'; exit %d;;\n  diff) cat '%s/diff.out'; exit %d;;\nesac\nexit 9\n" % (bindir, list_rc, bindir, diff_rc))
+    gh.write_text("#!/bin/sh\ncase \"$2\" in\n  list) cat '%s/list.out'; exit %d;;\n  diff) cat '%s/diff.out'; exit %d;;\n%sesac\nexit 9\n" % (bindir, list_rc, bindir, diff_rc, API_CASE % (bindir, bindir)))
     gh.chmod(0o755)
     env = dict(os.environ, PATH="%s:%s" % (bindir, os.environ["PATH"]))
     return subprocess.run([sys.executable, str(tool), "--base", "main"], cwd=repo, env=env, capture_output=True, text=True)
@@ -67,7 +79,7 @@ def overlap_claims(tool, root):
     """Every claim about the reader, as assertions with a leading tag (a mutant fails one of them with its tag)."""
     names = ["src/f%03d.py" % i for i in range(138)] + [DAEMON]
     big = json.dumps([dict(pr_of(139, 100), files=[{"path": "src/f%03d.py" % i} for i in range(100)], changedFiles=139)])
-    done = run_tool(tool, root, big, diff_names=names, diff_rc=0)
+    done = run_tool(tool, root, big, diff_names=names, diff_rc=0, pages=names)
     if done.returncode != 0 or "#7 edit f" not in done.stdout or "not whole" in done.stdout:
         raise AssertionError("OMITTED a pull request whose listing is cut is not read whole: %r %r" % (done.stdout, done.stderr))
     done = run_tool(tool, root, big, diff_rc=1)   # the whole list cannot be read: it is listed by number, never omitted
@@ -99,21 +111,27 @@ def role_claims(text):
             raise AssertionError("ROLE-MISSING step 1 lacks %s" % need)
 
 
-def run_many(tool, root, prs, diffs):
-    """Run `tool` with a fake `gh` that answers `pr list` with `prs` and `pr diff N --name-only` with diffs[N] = (names, exit status); returns (done, the numbers asked)."""
+def run_many(tool, root, prs, diffs, files=None):
+    """Run `tool` with a fake `gh` that answers `pr list` with `prs`, `pr diff N --name-only` with diffs[N] = (names, exit status) and the files endpoint
+    of N with pages of 100 of files[N] (a list of names; None: every page read fails; default: the 139 plain names); returns (done, the numbers asked, the page reads)."""
     repo = make_repo(tempfile.mkdtemp(dir=root))
     bindir = Path(tempfile.mkdtemp(dir=root))
     (bindir / "list.out").write_text(json.dumps(prs))
     (bindir / "calls").write_text("")
+    (bindir / "pagecalls").write_text("")
+    for number in diffs:
+        names = (files or {}).get(number, plain_names(139))
+        if names is not None:
+            write_pages(bindir, number, names)
     for number, (names, rc) in diffs.items():
         (bindir / ("diff.%s.out" % number)).write_text("\n".join(names))
         (bindir / ("diff.%s.rc" % number)).write_text(str(rc))
     gh = bindir / "gh"
-    gh.write_text("#!/bin/sh\ncase \"$2\" in\n  list) cat '%s/list.out'; exit 0;;\n  diff) echo \"$3\" >> '%s/calls'; cat \"%s/diff.$3.out\"; exit $(cat \"%s/diff.$3.rc\");;\nesac\nexit 9\n" % (bindir, bindir, bindir, bindir))
+    gh.write_text("#!/bin/sh\ncase \"$2\" in\n  list) cat '%s/list.out'; exit 0;;\n  diff) echo \"$3\" >> '%s/calls'; cat \"%s/diff.$3.out\"; exit $(cat \"%s/diff.$3.rc\");;\n%sesac\nexit 9\n" % (bindir, bindir, bindir, bindir, API_CASE % (bindir, bindir)))
     gh.chmod(0o755)
     env = dict(os.environ, PATH="%s:%s" % (bindir, os.environ["PATH"]))
     done = subprocess.run([sys.executable, str(tool), "--base", "main"], cwd=repo, env=env, capture_output=True, text=True)
-    return done, (bindir / "calls").read_text().split()
+    return done, (bindir / "calls").read_text().split(), (bindir / "pagecalls").read_text().splitlines()
 
 
 def cut_pr(number, listed_names, count=139):
@@ -132,36 +150,49 @@ def not_whole_numbers(done):
 def bound_claims(tool, root):
     """S10: 25 cut pull requests (100 listed, 139 counted), the fake diff answers 139 names: exactly 20 calls, the first 20 read whole, the last 5 not whole."""
     prs = [cut_pr(100 + i, plain_names(100)) for i in range(1, 26)]
-    done, calls = run_many(tool, root, prs, {100 + i: (plain_names(139), 0) for i in range(1, 26)})
+    done, calls, pages = run_many(tool, root, prs, {100 + i: (plain_names(139), 0) for i in range(1, 26)})
     if done.returncode != 0:
         raise AssertionError("BOUND-RUN the tool failed: %r" % done.stderr)
     if len(calls) != 20:
         raise AssertionError("BOUND %d gh pr diff calls where 20 are expected" % len(calls))
+    if len(pages) != 40:
+        raise AssertionError("BOUND-PAGES %d page reads where 40 are expected" % len(pages))
     if not_whole_numbers(done) != list(range(121, 126)):
         raise AssertionError("BOUND-LIST the not whole line is %r where #121..#125 are expected" % not_whole_numbers(done))
 
 
 def trust_claims(tool, root):
-    """S11: 138 and 140 names, and 139 names that do not hold the 100 listed files, are `not whole` and not used; 139 names that hold them are whole.
-    Every answer holds the daemon file, so a wrongly trusted one would put the pull request in the overlap report."""
+    """S11: the fetched names are compared, as a SET, with every page of the files endpoint and their number with changedFiles. 138 names, 140 names, 139 names with
+    the 120th wrong, 139 other names, a failed page read and a pull request of 3,100 files are `not whole` and the names are not used (every answer holds the daemon
+    file, so a trusted one would put the pull request in the overlap report); 139 names equal as a set to the endpoint's are whole."""
     listed = plain_names(100)
-    for what, names in (("138", plain_names(138, [DAEMON])), ("140", plain_names(140, [DAEMON]))):
-        done, calls = run_many(tool, root, [cut_pr(7, listed)], {7: (names, 0)})
-        if done.returncode != 0 or calls != ["7"] or not_whole_numbers(done) != [7] or "#7 edit f" in done.stdout:
-            raise AssertionError("TRUSTED an answer of %s names for a count of 139 is used: %r %r" % (what, done.stdout, done.stderr))
-    other = ["other/g%03d.py" % i for i in range(138)] + [DAEMON]
-    done, calls = run_many(tool, root, [cut_pr(7, listed)], {7: (other, 0)})
-    if done.returncode != 0 or calls != ["7"] or not_whole_numbers(done) != [7] or "#7 edit f" in done.stdout:
-        raise AssertionError("TRUSTED-OTHER 139 names that do not hold the listed files are used: %r %r" % (done.stdout, done.stderr))
-    done, calls = run_many(tool, root, [cut_pr(7, listed)], {7: (plain_names(139, [DAEMON]), 0)})
+    truth = plain_names(139, [DAEMON])
+
+    def refused(label, names, files=truth, count=139, calls=("7",)):
+        done, asked, pages = run_many(tool, root, [cut_pr(7, listed, count)], {7: (names, 0)}, {7: files})
+        if done.returncode != 0 or asked != list(calls) or not_whole_numbers(done) != [7] or "#7 edit f" in done.stdout:
+            raise AssertionError("%s the answer is used: %r %r" % (label, done.stdout, done.stderr))
+        return pages
+
+    refused("TRUSTED an answer of 138 names for a count of 139", plain_names(138, [DAEMON]))
+    refused("TRUSTED an answer of 140 names for a count of 139", plain_names(140, [DAEMON]))
+    refused("TRUSTED-OTHER 139 names that are all other files", ["other/g%03d.py" % i for i in range(138)] + [DAEMON])
+    wrong = list(truth)
+    wrong[119] = "zzz/g119.py"   # sorts last: beyond the first 100 names in any order
+    refused("TRUSTED-120TH 139 names of which the 120th differs from the endpoint's", wrong)
+    refused("TRUSTED-FAILED a failed page read", truth, files=None)
+    pages = refused("TRUSTED-3100 a pull request of 3,100 files", plain_names(3100, [DAEMON]), files=plain_names(3100, [DAEMON]), count=3100, calls=())
+    if len(pages) > 30:
+        raise AssertionError("PAGES-3100 %d page reads where at most 30 are allowed" % len(pages))
+    done, calls, pages = run_many(tool, root, [cut_pr(7, listed)], {7: (truth, 0)}, {7: truth})
     if done.returncode != 0 or not_whole_numbers(done) != [] or "#7 edit f" not in done.stdout:
-        raise AssertionError("TRUSTED-NOT an answer of 139 names that hold the listed files is not read whole: %r %r" % (done.stdout, done.stderr))
+        raise AssertionError("TRUSTED-NOT an answer of 139 names equal as a set to the endpoint's is not read whole: %r %r" % (done.stdout, done.stderr))
 
 
 def partial_claims(tool, root):
     """S12: both whole-reads fail. #7 lists the daemon file, #8 lists neither file."""
     prs = [cut_pr(7, plain_names(100, [DAEMON])), cut_pr(8, plain_names(100))]
-    done, calls = run_many(tool, root, prs, {7: ([], 1), 8: ([], 1)})
+    done, calls, pages = run_many(tool, root, prs, {7: ([], 1), 8: ([], 1)})
     if done.returncode != 0 or not_whole_numbers(done) != [7, 8]:
         raise AssertionError("PARTIAL-LINE the not whole line is %r where #7 #8 are expected: %r" % (not_whole_numbers(done), done.stderr))
     reported = re.findall(r"^#(\d+) edit f$", done.stdout, re.M)
@@ -188,7 +219,7 @@ def build():
 
         def role_with(self, old, new):
             text = ROLE.read_text()
-            self.assertIn(old, text, "the mutant is applied")
+            self.assertEqual(text.count(old), 1, "the mutant is applied exactly once")
             self.assertNotEqual(text.replace(old, new), text)
             return text.replace(old, new)
 
@@ -254,20 +285,25 @@ def build():
             with self.assertRaisesRegex(AssertionError, r"^BOUND 21 gh pr diff calls where 20 are expected"):
                 bound_claims(mutant, self.root)
 
-        def test_s11_fetched_names_of_the_wrong_number_or_not_holding_the_listing_are_not_used(self):
-            """The tool checks the NUMBER of the fetched names against changedFiles AND that they hold every listed file (the listing's own first 100):
-            138, 140 and 139 other names are `not whole` and not used; 139 names that hold the listed files are whole. The one remaining limit: the files
-            beyond the 100 that the listing gives have no second answer (the fetch is GitHub's one answer for them)."""
+        def test_s11_fetched_names_that_differ_from_the_files_endpoint_are_not_used(self):
+            """NO limit is left: the whole fetched list is compared as a set with every page of the files endpoint (at most 30 pages) and its number with
+            changedFiles. 138, 140, 139 with the 120th wrong, 139 other names, a failed page read and a pull request of 3,100 files are `not whole` by number
+            and their names are not used; 139 names equal as a set are whole."""
             trust_claims(TOOL, self.root)   # the unmutated control
 
         def test_s11_a_tool_that_takes_the_fetched_names_without_comparing_is_caught(self):
-            mutant = self.tool_with("return names if len(names) == total and listed <= names else None", "return names")
+            mutant = self.tool_with("return names if len(lines) == total and names == set(pages) else None", "return names")
             with self.assertRaisesRegex(AssertionError, r"^TRUSTED an answer of 138 names"):
                 trust_claims(mutant, self.root)
 
         def test_s11_a_tool_that_compares_the_number_only_is_caught(self):
-            mutant = self.tool_with(" and listed <= names else None", " else None")
+            mutant = self.tool_with(" and names == set(pages) else None", " else None")
             with self.assertRaisesRegex(AssertionError, r"^TRUSTED-OTHER 139 names"):
+                trust_claims(mutant, self.root)
+
+        def test_s11_a_tool_that_compares_only_the_first_100_names_is_caught(self):
+            mutant = self.tool_with("names == set(pages) else None", "sorted(names)[:100] == sorted(pages)[:100] else None")
+            with self.assertRaisesRegex(AssertionError, r"^TRUSTED-120TH 139 names"):
                 trust_claims(mutant, self.root)
 
         def test_s12_a_pull_request_not_whole_is_read_from_its_listed_names(self):
