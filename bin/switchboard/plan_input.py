@@ -190,11 +190,9 @@ def cmd_plan_template(args, runner, now):
     return EXIT_OK
 
 # ---- plan apply (#1789)
-import argparse
 import hashlib
 import os
 from datetime import datetime, timezone
-APPLY_HELP_FORMATTER = argparse.RawDescriptionHelpFormatter   # the help of `plan apply` keeps its lines
 # The standard form of an edit file: the lines the planning skill, docs/plan-template.md and the help of `plan apply` carry word for word (S7).
 STANDARD_FORM = (
     "Lines before the first header are a note and are read by nobody.",
