@@ -707,6 +707,236 @@ class S16Random(unittest.TestCase):
         print("S16 control passes 1 of 1, the mutant that does not skip a candidate on a redacted character fails 1 of 1, mutation applied")
 
 
+MUTATORS = tuple(cw.KNOWN_SET_MUTATORS)
+MUTATOR_ARGS = {"add": ("c",), "update": (["c"],), "discard": ("a",), "remove": ("a",), "pop": (), "clear": (), "__ior__": ({"c"},),
+                "__iand__": ({"a"},), "__isub__": ({"a"},), "__ixor__": ({"a"},), "difference_update": (["a"],),
+                "intersection_update": (["a"],), "symmetric_difference_update": (["a"],)}
+
+
+def changed_text(src, old, new):
+    """The text with `old` (asserted to occur once) changed to `new`; the application is computed from the two texts."""
+    if src.count(old) != 1:
+        raise AssertionError("the mutation text must occur once")
+    out = src.replace(old, new)
+    if not (out != src and old in src and old not in out):
+        raise AssertionError("the mutation was not applied")
+    return out
+
+
+def known_set_class(src):
+    ns = dict(vars(cw))
+    exec(compile(src, "<knownset-copy>", "exec"), ns)
+    return ns["KnownSet"]
+
+
+def override_attempts(cls):
+    """Make a subclass of `cls` that defines each of the thirteen, with a body that calls the parent and one that does not."""
+    refused = 0
+    for name in MUTATORS:
+        for calls_parent in (True, False):
+            body = ("        return set.%s(self, *a)\n" % name) if calls_parent else "        return None\n"
+            src = "class Sub(Base):\n    def %s(self, *a):\n%s" % (name, body)
+            try:
+                exec(src, {"Base": cls})
+            except TypeError as e:
+                if "a KnownSet subclass may not override" in str(e) and name in str(e):
+                    refused += 1
+                    continue
+                raise
+            raise AssertionError("an override of a mutator was accepted: %s" % name)
+    return refused
+
+
+def bump_check(cls):
+    bumped = 0
+    for name in MUTATORS:
+        ks = cls(["a", "b"])
+        before = ks.version
+        args = MUTATOR_ARGS[name]
+        try:
+            if name.startswith("__"):
+                getattr(ks, name)(*args)
+            else:
+                getattr(ks, name)(*args)
+        except KeyError:
+            pass
+        if ks.version != before + 1:
+            raise AssertionError("a mutator did not bump by one: %s" % name)
+        bumped += 1
+    ks = cls(["a"])
+    before = ks.version
+    with contextlib.suppress(KeyError):
+        ks.remove("absent")
+    if ks.version != before + 1:
+        raise AssertionError("a raising remove did not bump by one")
+    return bumped
+
+
+class RecordingLock:
+    def __init__(self, ks):
+        self.ks, self.lock, self.acquired, self.released, self.content = ks, threading.RLock(), [], [], []
+
+    def __enter__(self):
+        self.lock.acquire()
+        self.acquired.append(self.ks.version)
+        self.content.append(frozenset(set.__iter__(self.ks)))
+        return self
+
+    def __exit__(self, *exc):
+        self.released.append(self.ks.version)
+        self.after = frozenset(set.__iter__(self.ks))
+        self.lock.release()
+        return False
+
+
+def lock_check(cls):
+    done = 0
+    for name in MUTATORS:
+        ks = cls(["a", "b"])
+        rec = RecordingLock(ks)
+        ks.lock = rec
+        with contextlib.suppress(KeyError):
+            getattr(ks, name)(*MUTATOR_ARGS[name])
+        if not (len(rec.acquired) == 1 and rec.released == [a + 1 for a in rec.acquired]):
+            raise AssertionError("the version was bumped outside the lock: %s" % name)
+        if rec.after == rec.content[0]:
+            raise AssertionError("the content had not changed when the lock was released: %s" % name)
+        done += 1
+    return done
+
+
+class S17Override(unittest.TestCase):
+    def test_S17_refusal_bump_and_mutant(self):
+        src = inspect.getsource(cw.KnownSet)
+        self.assertEqual(override_attempts(cw.KnownSet), 26)  # the control, first
+        class Plain(cw.KnownSet):
+            extra = 1
+
+            def read(self):
+                return len(self)
+        p = Plain()
+        p.add("x")
+        self.assertEqual((p.version, p.read(), p.extra), (1, 1, 1))
+        self.assertEqual(bump_check(cw.KnownSet), 13)
+        old = '                raise TypeError("a KnownSet subclass may not override %s" % name)\n'
+        mut = known_set_class(changed_text(src, old, "                pass\n"))
+        with self.assertRaisesRegex(AssertionError, "an override of a mutator was accepted:"):
+            override_attempts(mut)
+        with self.assertRaisesRegex(AssertionError, "the mutation was not applied"):
+            changed_text(src, "class KnownSet(set):", "class KnownSet(set):")
+        print("S17 refused 26 of 26 (name in the text), accepting case 1 of 1, 13 of 13 bump by one (raising remove too); "
+              "control passes 1 of 1, copy without the refusal fails 1 of 1, no-op mutation fails the computation 1 of 1")
+
+
+class S18Lock(unittest.TestCase):
+    def test_S18_lock_stress_and_mutant(self):
+        src = inspect.getsource(cw.KnownSet)
+        self.assertEqual(lock_check(cw.KnownSet), 13)  # the control, first
+        ks = cw.KnownSet()
+        lasts = {}
+
+        def work(t):
+            for i in range(500):
+                form = "stress-form-%d-%04d-end" % (t, i)
+                ks.add(form)
+            lasts[t] = form
+        threads = [threading.Thread(target=work, args=(t,), daemon=True) for t in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual((ks.version, len(ks)), (4000, 4000))
+        redacted = sum(1 for t in range(8) if lasts[t] not in cw.scrub("x " + lasts[t] + " y", ks, 1000))
+        self.assertEqual(redacted, 8)
+        old = ("        with self.lock:\n            try:\n                return set.add(self, *args)\n"
+               "            finally:\n                self.version += 1\n")
+        new = "        with self.lock:\n            r = set.add(self, *args)\n        self.version += 1\n        return r\n"
+        mut = known_set_class(changed_text(src, old, new))
+        with self.assertRaisesRegex(AssertionError, "the version was bumped outside the lock"):
+            lock_check(mut)
+        with self.assertRaisesRegex(AssertionError, "the mutation was not applied"):
+            changed_text(src, old, old)
+        print("S18 13 of 13 release = acquire + 1, stress version %d forms %d, last forms redacted %d of 8; control passes 1 of 1, "
+              "copy that bumps after the release fails 1 of 1, no-op mutation fails the computation 1 of 1" % (ks.version, len(ks), redacted))
+
+
+class CountStop(Exception):
+    pass
+
+
+def run_under_stop(fn, ns, text, secs, bound):
+    """Run fn on the case; a tracer RAISES `the count passed its bound` when the line events pass `bound`. Returns the count."""
+    codes = codes_of(ns)
+    n = [0]
+
+    def tracer(frame, event, arg):
+        return local if frame.f_code in codes else None
+
+    def local(frame, event, arg):
+        if event == "line":
+            n[0] += 1
+            if n[0] > bound:
+                raise CountStop("the count passed its bound")
+        return local
+    sys.settrace(tracer)
+    try:
+        fn(text, set(secs), 10 ** 7)
+    finally:
+        sys.settrace(None)
+    return n[0]
+
+
+class S19RankGuard(unittest.TestCase):
+    def _cases(self):
+        c15 = S15Counts()
+        r16 = S16Random()
+        cases = []
+        for nsec in (30, 197):
+            secs, hit, zero = c15._form_case(nsec, 5000)
+            cases.append(("S15-%d" % nsec, hit, secs, None))
+        bases = r16._cases()
+        for i in list(range(0, 20, 2)) + list(range(1, 60, 2)) + [600, 601]:
+            cases.append(("S%s-%d" % ("16" if i < 600 else "2", i), bases[i][0], bases[i][1], None))
+        out = []
+        for label, text, secs, _ in cases:
+            res = cw.scrub(text, set(secs), 10 ** 7)
+            V, M, R = c15._vrm_big(text, secs, res, brackets=len(secs))
+            build = sum(len(x) for x in set(secs))
+            bound = 200 * (len(text) + V + max(R, 0) + max(M, 0) + build)
+            if label.startswith("S15"):
+                bound += line_events(cw.scrub, NS, "-" * len(text), set(secs), 10 ** 7)
+            out.append((label, text, secs, bound))
+        return out
+
+    def _run(self, fn, ns, cases):
+        passed, stopped = 0, []
+        for label, text, secs, bound in cases:
+            try:
+                run_under_stop(fn, ns, text, secs, bound)
+                passed += 1
+            except CountStop as e:
+                stopped.append((label, bound, str(e)))
+        return passed, stopped
+
+    def test_S19_rank_guard_mutant_ends_by_the_count(self):
+        cases = self._cases()
+        passed, stopped = self._run(cw.scrub, NS, cases)  # the control, first
+        self.assertEqual((passed, stopped), (len(cases), []))
+        src = "\n\n".join(inspect.getsource(p) for p in _PARTS)
+        old = "        if rank < self.cur:\n            return\n"
+        with self.assertRaisesRegex(AssertionError, "the mutation was not applied"):
+            changed_text(src, old, old)
+        m, mns = mutant(old, "")
+        changed_text(src, old, "")
+        mpassed, mstopped = self._run(m, mns, cases)
+        self.assertGreaterEqual(len(mstopped), 1)
+        self.assertEqual(mstopped[0][2], "the count passed its bound")
+        label, bound, _ = mstopped[0]
+        print("S19 control passes %d of %d under the stop; the copy without the guard ends by the count with `the count passed its "
+              "bound` in %d of %d cases (first: %s, bound %d, count above it); no-op mutation fails the computation 1 of 1"
+              % (passed, len(cases), len(mstopped), len(cases), label, bound))
+
+
 FORM_VALUES = ['ghp_Zx9Qw3Er7Ty1Ui5Op2As4Df6Gh8Jk0Lz', '{"name": "synthetic-entry-one", "key": "synthetic-key-0123456789"}', 'plain synthetic value 42']
 FORMS_FIXTURE = ['%7B%22name%22%3A%20%22synthetic-entry-one%22%2C%20%22key%22%3A%20%22synthetic-key-0123456789%22%7D', '%7B%22name%22%3A+%22synthetic-entry-one%22%2C+%22key%22%3A+%22synthetic-key-0123456789%22%7D', '6768705F5A78395177334572375479315569354F70324173344466364768384A6B304C7A', '6768705f5a78395177334572375479315569354f70324173344466364768384a6b304c7a', '706C61696E2073796E7468657469632076616C7565203432', '706c61696e2073796e7468657469632076616c7565203432', '73796E7468657469632D656E7472792D6F6E65', '73796E7468657469632D6B65792D30313233343536373839', '73796e7468657469632d656e7472792d6f6e65', '73796e7468657469632d6b65792d30313233343536373839', '7B226E616D65223A202273796E7468657469632D656E7472792D6F6E65222C20226B6579223A202273796E7468657469632D6B65792D30313233343536373839227D', '7Im5hbWUiOiAic3ludGhldGljLWVudHJ5LW9uZSIsICJrZXkiOiAic3ludGhldGljLWtleS0wMTIzNDU2Nzg5In', '7b226e616d65223a202273796e7468657469632d656e7472792d6f6e65222c20226b6579223a202273796e7468657469632d6b65792d30313233343536373839227d', 'BsYWluIHN5bnRoZXRpYyB2YWx1ZSA0M', 'N5bnRoZXRpYy1lbnRyeS1vbm', 'N5bnRoZXRpYy1rZXktMDEyMzQ1Njc4O', 'Z2hwX1p4OVF3M0VyN1R5MVVpNU9wMkFzNERmNkdoOEprMEx6', 'c3ludGhldGljLWVudHJ5LW9uZ', 'c3ludGhldGljLWVudHJ5LW9uZQ', 'c3ludGhldGljLWVudHJ5LW9uZQ==', 'c3ludGhldGljLWtleS0wMTIzNDU2Nzg5', 'cGxhaW4gc3ludGhldGljIHZhbHVlIDQy', 'docF9aeDlRdzNFcjdUeTFVaTVPcDJBczREZjZHaDhKazBMe', 'eyJuYW1lIjogInN5bnRoZXRpYy1lbnRyeS1vbmUiLCAia2V5IjogInN5bnRoZXRpYy1rZXktMDEyMzQ1Njc4OSJ9', 'ghp_Zx9Qw3Er7Ty1Ui5Op2As4Df6Gh8Jk0Lz', 'naHBfWng5UXczRXI3VHkxVWk1T3AyQXM0RGY2R2g4SmswTH', 'plain synthetic value 42', 'plain%20synthetic%20value%2042', 'plain+synthetic+value+42', 'sibmFtZSI6ICJzeW50aGV0aWMtZW50cnktb25lIiwgImtleSI6ICJzeW50aGV0aWMta2V5LTAxMjM0NTY3ODkif', 'synthetic-entry-one', 'synthetic-key-0123456789', 'wbGFpbiBzeW50aGV0aWMgdmFsdWUgND', 'zeW50aGV0aWMtZW50cnktb25l', 'zeW50aGV0aWMta2V5LTAxMjM0NTY3OD', '{"name": "synthetic-entry-one", "key": "synthetic-key-0123456789"}', '{\\"name\\": \\"synthetic-entry-one\\", \\"key\\": \\"synthetic-key-0123456789\\"}']
 
