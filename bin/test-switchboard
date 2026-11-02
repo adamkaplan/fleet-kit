@@ -13582,7 +13582,7 @@ class TestCharterSetGuard(CharterRig, Base):
         label = {"number": 3, "labels": [{"name": sb.orchestrator_label()}]}
         (code, out, err), paths = self.real_set(self.NOPARENT, label)
         self.assertEqual(code, 0, err)
-        self.assertEqual(paths, [("repos/%s/issues/3/parent" % self.REPO, self.REPO), ("repos/%s/issues/3" % self.REPO, self.REPO)])
+        self.assertEqual(paths, [("repos/%s/issues/3" % self.REPO, self.REPO), ("repos/%s/issues/3/parent" % self.REPO, self.REPO), ("repos/%s/issues/3" % self.REPO, self.REPO)])
 
     SHAPES = {   # every shape the guard can receive: name -> (parent read, issue record, refusal text or None)
         "root, labelled, 404 no parent": (NOPARENT, {"number": 3, "labels": [{"name": "LABEL"}]}, None),
@@ -13591,7 +13591,7 @@ class TestCharterSetGuard(CharterRig, Base):
         "pull request with the label": (NOPARENT, {"number": 3, "pull_request": {"url": "x"}, "labels": [{"name": "LABEL"}]}, "is a pull request, not a charter"),
         "no label": (NOPARENT, {"number": 3, "labels": [{"name": "bug"}]}, "is not a charter"),
         "label look-alike": (NOPARENT, {"number": 3, "labels": [{"name": "other:orchestrator"}]}, "is not a charter"),
-        "404 that is not no-parent": (sb.IntentError("not_found", "HTTP 404 repository moved or renamed"), {"number": 3, "labels": [{"name": "LABEL"}]}, "cannot read #3's parent"),
+        "404 that is not no-parent, issue 404 too": (sb.IntentError("not_found", "HTTP 404 repository moved or renamed"), sb.IntentError("not_found", "HTTP 404 repository moved or renamed"), "cannot read #3's parent"),
         "parent read error": (sb.IntentError("gh", "HTTP 502"), {"number": 3, "labels": [{"name": "LABEL"}]}, "cannot read #3's parent"),
         "parent read non-JSON": ("<html>", {"number": 3, "labels": [{"name": "LABEL"}]}, "cannot read #3's parent"),
         "issue unreadable": (NOPARENT, sb.IntentError("gh", "HTTP 502"), "cannot read #3's parent"),
