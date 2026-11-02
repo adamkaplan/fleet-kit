@@ -134,7 +134,7 @@ The **Holds** column is descriptive: only the layer numbers are enforced.
 | `switchboard/alert_labels.py` | 4 | an alert label on an open issue wakes that repository's orchestrator | |
 | `switchboard/link_scrub.py` | 4 | the signed-link scrub of a GitHub comment summary | |
 | `switchboard/handoff.py` | 5 | the handoff: a brief, not a fork | |
-| `switchboard/agents_verify.py` | 5 | `agents verify`: did the service register our agents as written | |
+| `switchboard/agents_verify.py` | 5 | `agents verify`: did the service register our agents as written, and `held-ci` (the held pull requests' CI tip; its home here is temporary until #1092) | |
 | `switchboard/launch_model.py` | 5 | `launch --model` and `--reasoning`: the choice checked against the local service's model list before a session exists | |
 | `switchboard/bot_reviews.py` | 5 | the review bots at a pull request's head: the `gates` lines, the once-per-bot-and-head wake item | |
 | `switchboard/secret_spans.py` | 5 | where the first secret-shaped match is: a fixed rule label and numbers, never the text | |
