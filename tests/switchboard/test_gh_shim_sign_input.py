@@ -360,7 +360,7 @@ class TestGhShimSignInput(unittest.TestCase):
         rig = hermetic_rig()   # no merge gate config in this rig's home: the merge mutation below is not gated
         self.addCleanup(rig.close)
         for args in (("api", "repos/o/r/issues/1/comments"), ("api", "graphql", "-f", "query=query { viewer { login } }"),
-                     ("api", "repos/o/r/issues/1/labels", "-f", "body=x"), ("api", "repos/o/r/issues/1", "-X", "PATCH", "-f", "body=x"),
+                     ("api", "repos/o/r/issues/1/labels", "-f", "body=x"), ("api", "repos/o/r/issues/1", "-X", "PATCH", "-f", "title=x"),
                      ("api", "graphql", "-f", "query=mutation{mergePullRequest(input:{pullRequestId:\"X\"}){clientMutationId}}")):
             with self.subTest(args=args):
                 done, calls = rig.run(*args)
