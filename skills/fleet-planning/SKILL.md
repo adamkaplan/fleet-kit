@@ -17,7 +17,7 @@ Staff; an epic or workspace plan, the Chief of Staff, then the owner.
 
 ## One plan comment
 
-A plan is one canonical comment, edited in place; every revision adds a short receipt comment (what changed and why, with the new plan hash); never repost a plan as a second plan comment.
+A plan is one canonical comment, edited in place; every revision adds a new short receipt comment (what changed and why, two to four lines, with the new plan hash); a plan is never reposted as a second plan comment.
 
 Receipt format: `docs/plan-template.md`.
 
@@ -33,7 +33,7 @@ Receipt format: `docs/plan-template.md`.
    `claim: epic` for what only an integrated head can prove (name the integration branch in the plan).
    **Owner evaluators are rare**: only where the owner's own eyes are the test, proved once with `claim: epic`; never for a routine PR.
 
-   **Own measurement:** launch a headless tester of your lane (`--role tester --reports-to <you>`) to re-measure and record; never record as yourself.
+   **Own measurement:** launch a tester of your lane (`--role tester --repo <the pull request's repo> --reports-to <you>`, headless) to re-measure and record; never record as yourself.
    An uncovered Done-when clause gets a new `S` scenario; never edit, reword or delete the clause.
 3. **Constraints** (`PC-n`): what must hold and why (a shared contract, a security rule, a held path). Nothing else is a
    constraint.
