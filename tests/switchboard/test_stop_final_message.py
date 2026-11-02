@@ -694,7 +694,8 @@ class TestStopFinalMessageBare(unittest.TestCase):
     U22_OLD = re.compile(r"(?:https?://)?worker-[a-z0-9-]+\.[a-z0-9.-]+(:[0-9]+)?", re.I)   # the old host pattern, the oracle (ask #1788 PC-12)
     U22_FIXED = ("worker-b.1.:123456", "worker-b.x-1:4096409623", "worker-ab.b.:40964096409623worker-http://1",
                  "worker-" + "a" * 70 + ".example.internal", "worker-a." + "b" * 300)
-    U22_PIECES = ("worker-", "Worker-", "WORKER-", "http://", "https://", "HTTP://", ".", ".", "a", "b", "x-1", "0", "1", "123456", "4096", ":", ":", "/", " ")
+    U22_PIECES = ("worker-", "Worker-", "WORKER-", "http://", "https://", "HTTP://", ".", ".", "a", "b", "x-1", "0", "1", "123456", "4096", ":", ":", "/", " ",
+                   "\u0130", "\u0131", "\u017f", "\u212a")   # U23: the four letters whose case folding is not ASCII or not one character
     U22_CHILD = (
         "import sys,os,tempfile,importlib.util,glob,shutil\n"
         "sys.path.insert(0, %r)\n"
@@ -743,6 +744,36 @@ class TestStopFinalMessageBare(unittest.TestCase):
         self.assertEqual(done.returncode, 1, "mutant of U22: %s" % done.stdout)
         self.assertIn("the scan left characters the old pattern removed", done.stdout)
         self.assertIn("worker-b.1.:123456", done.stdout)   # the first text is named
+
+
+    U23_FIXED = ("\u0130" * 40 + " see worker-x-ab12.example.internal:4096 end", "\u0130 worker-x-ab12.example.internal",
+                 "wor\u212aer-x-ab12.example.internal", "worker-x\u0131ab12.example.internal", "worker-\u017fa.example.internal:4096")
+    U23_CHILD = U22_CHILD.replace("bad=t.TestStopFinalMessageBare.u22_leaks(mod._remove_hosts)", "bad=t.TestStopFinalMessageBare.u23_longer(mod._remove_hosts)").replace(
+        "the scan left characters the old pattern removed", "a host was left behind letters whose lower case is longer")
+
+    @classmethod
+    def u23_longer(cls, remove):
+        bad = []
+        for text in cls.U23_FIXED:
+            got, want = remove(text), cls.U22_OLD.sub("", text)
+            if len(got) > len(want) or "example.internal" in got:
+                bad.append(text)
+        return bad
+
+    def test_U23_letters_whose_lower_case_is_longer_do_not_hide_a_host(self):
+        mod = sb.load_module("cloud_retired")
+        bad = self.u23_longer(mod._remove_hosts)
+        self.assertEqual(bad, [], "a host was left behind letters whose lower case is longer: %d of 5, the first %r" % (len(bad), bad[:1]))
+        self.assertEqual(self.u22_leaks(mod._remove_hosts), [], "the scan left characters the old pattern removed (corpus with the four letters)")
+        src = str(BIN / "cloud_retired.py")
+        run = lambda old, new: subprocess.run([sys.executable, "-c", self.U23_CHILD, src, old, new], cwd=str(CHECK_FILE.parent), stdout=subprocess.PIPE,
+                                              stderr=subprocess.STDOUT, universal_newlines=True, timeout=600)
+        done = run("", "")
+        self.assertEqual(done.returncode, 0, "control of U23: %s" % done.stdout)
+        line = re.search(r"low, n, out, i, keep = .*, len\(text\), \[\], 0, 0", Path(src).read_text()).group(0)
+        done = run(line, "low, n, out, i, keep = text.lower(), len(text), [], 0, 0")
+        self.assertEqual(done.returncode, 1, "mutant of U23: %s" % done.stdout)
+        self.assertIn("a host was left behind letters whose lower case is longer", done.stdout)
 
 
 class TestStopFinalMessageBareMutant(unittest.TestCase):
