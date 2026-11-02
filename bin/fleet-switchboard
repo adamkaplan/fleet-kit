@@ -3294,7 +3294,8 @@ class Switchboard:
             return ["  problem: the inbox could not be read (%s)" % _one_line(str(err), 100)]
         now, lines = self.now(), []
         for item in inbox if isinstance(inbox, list) else []:
-            if isinstance(item, dict) and _fleet_meta(item) is not None and item.get("delivery") == "queue" and _created(item) is not None:
+            if isinstance(item, dict) and _fleet_meta(item) is not None and item.get("delivery") == "queue" \
+                    and _created(item) is not None and math.isfinite(_created(item)):   # NaN and Infinity are valid JSON: int() of them raises
                 lines.append("  - not consumed: %s queued %d min ago (delivered as queue, still in the lane's inbox)"
                              % (", ".join(_fleet_keys(item)) or "no key", max(0, int((now - _created(item)) // 60))))
         return lines
@@ -3339,8 +3340,9 @@ class Switchboard:
         self._record_load()
         def stale(inbox):
             return [item for item in (inbox if isinstance(inbox, list) else [])
-                    if isinstance(item, dict) and item.get("id") not in self.unconsumed_seen and _fleet_meta(item) is not None
-                    and item.get("delivery") == "queue" and _created(item) is not None and now - _created(item) >= bound]
+                    if isinstance(item, dict) and isinstance(item.get("id"), str) and item.get("id") not in self.unconsumed_seen
+                    and _fleet_meta(item) is not None and item.get("delivery") == "queue" and _created(item) is not None
+                    and math.isfinite(_created(item)) and now - _created(item) >= bound]
         found = stale(self.reads.inbox(observation.session_id, now))
         if found:   # what is remembered says one waits: read it afresh before the write
             found = stale(self.reads.inbox(observation.session_id, now, fresh=True))

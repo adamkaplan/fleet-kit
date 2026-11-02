@@ -6,6 +6,7 @@ with a reason (the caller audits it once). `write` touches the disk only when th
 """
 import json
 import os
+import stat
 from pathlib import Path
 
 
@@ -28,6 +29,8 @@ def read(state_dir, parse):
     """(record, reason): reason is None when the file was read, else why the record reads as empty."""
     empty = {"steered": [], "reminders": {}}
     try:
+        if not stat.S_ISREG(os.lstat(str(Path(state_dir) / FILE)).st_mode):   # a FIFO would block the pass, a symlink is not followed
+            return empty, "unreadable"
         with open(str(Path(state_dir) / FILE), "rb") as handle:
             raw = handle.read(MAX_BYTES + 1)
     except FileNotFoundError:

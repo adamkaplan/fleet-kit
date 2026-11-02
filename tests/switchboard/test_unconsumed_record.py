@@ -104,6 +104,24 @@ class TestUnconsumedRecord(unittest.TestCase):
             self.shape_case(self.mutant(" and len(ident) == 3", ""))
         self.assertIn("an entry of the wrong shape was kept", str(caught.exception))
 
+    def test_a_symlink_and_a_directory_at_the_record_path_read_as_unreadable(self):
+        target = os.path.join(self.dir, "elsewhere.json")
+        with open(target, "wb") as handle:
+            handle.write(b'{"steered": ["inb_1"], "reminders": {}}')
+        os.symlink(target, self.path)
+        self.assertEqual(self.read(), ({"steered": [], "reminders": {}}, "unreadable"))
+        os.unlink(self.path)
+        os.mkdir(self.path)
+        self.assertEqual(self.read(), ({"steered": [], "reminders": {}}, "unreadable"))
+
+    def test_mutant_without_the_regular_file_check_a_symlink_is_followed(self):
+        os.symlink(os.path.join(self.dir, "elsewhere.json"), self.path)
+        with open(os.path.join(self.dir, "elsewhere.json"), "wb") as handle:
+            handle.write(b'{"steered": ["inb_1"], "reminders": {}}')
+        mutant = self.mutant("if not stat.S_ISREG(os.lstat(str(Path(state_dir) / FILE)).st_mode):", "if False:")
+        self.assertEqual(mutant.read(self.dir, record_json.parse_bounded)[0]["steered"], ["inb_1"])   # the mutation is live
+        self.assertEqual(self.read()[0]["steered"], [], "a symlink was followed")
+
 
 if __name__ == "__main__":
     unittest.main()

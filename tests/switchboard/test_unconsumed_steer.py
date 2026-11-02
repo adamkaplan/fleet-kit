@@ -505,4 +505,48 @@ def build(Base, TestSteerToWorking):
             self.kills("steer_unconsumed", "now - _created(item) >= bound", "now - _created(item) > bound + 1", self.scenario_bound,
                        "the bound is not inclusive or not exact")
 
+        # -- Medium 2 and Low 4
+
+        def scenario_non_finite(self):
+            self.build({})
+            self.attach_cancel()
+            sid = self.world.sessions["platform"]
+            self.world.tick(3600)
+            for name, created in (("nan", float("nan")), ("inf", float("inf")), ("ok", self.world.clock.ms(self.world.clock.now() - 1500))):
+                self.world.v2.sessions[sid]["inbox"].append({
+                    "id": "inb_" + name, "sessionID": sid, "type": "synthetic", "text": "x", "resume": True, "delivery": "queue",
+                    "metadata": {"fleet": {"keys": ["send:coder:" + name], "from": "switchboard"}}, "time": {"created": created}})
+            try:
+                code, out, err = self.main("pending", "platform")
+            except Exception as problem:
+                self.fail("pending raised on a non-finite created: %r" % problem)
+            self.assertEqual(code, 0, err)
+            self.assertEqual(len([l for l in out.splitlines() if "not consumed" in l]), 1, out)
+            self.assertEqual(len([l for l in out.splitlines() if ":ok" in l and "25 min" in l]), 1, out)
+
+        def test_pending_skips_a_non_finite_created_and_lists_the_good_item(self):
+            self.scenario_non_finite()
+
+        def test_mutant_without_the_finite_check_pending_raises(self):
+            self.kills("unconsumed_lines", " and math.isfinite(_created(item))", "", self.scenario_non_finite,
+                       "pending raised on a non-finite created")
+
+        def scenario_bad_id(self):
+            good = self.old_item()
+            self.inbox().insert(0, dict(good, id=["not", "a", "string"]))
+            self.inbox().insert(0, dict(good, id={"k": 1}))
+            engine = self.world.engine
+            try:
+                steered = engine.steer_unconsumed(self.lane(), engine.now())
+            except TypeError as problem:
+                self.fail("an item with an unhashable id broke the pass: %r" % problem)
+            self.assertEqual(steered, [good["id"]], "the good item was not steered")
+
+        def test_an_item_with_an_unhashable_id_is_skipped_and_the_good_one_is_steered(self):
+            self.scenario_bad_id()
+
+        def test_mutant_without_the_id_type_check_an_unhashable_id_breaks_the_pass(self):
+            self.kills("steer_unconsumed", 'isinstance(item.get("id"), str) and ', "", self.scenario_bad_id,
+                       "an item with an unhashable id broke the pass")
+
     return TestUnconsumedSteer
