@@ -9189,11 +9189,11 @@ def publish_decisions(engine):
         ci_record_pass(engine, now)   # #107: records ci verdicts for open PRs under a plan; reads GitHub, writes only the ledger and audit
     except Exception as err:
         engine._note("ci_record.error", None, {"error": _one_line("%s: %s" % (type(err).__name__, err), 200)})
-    try:   # #1886: the daily alert for every read of this pass that stopped at the ceiling
-        for repo in take_open_cuts():
+    for repo in take_open_cuts():   # #1886: the daily alert for every read of this pass that stopped at the ceiling
+        try:
             open_list_alert(engine, repo, now)
-    except Exception as err:
-        engine._note("open_list.error", None, {"error": _one_line("%s: %s" % (type(err).__name__, err), 200)})
+        except Exception as err:
+            engine._note("open_list.error", repo, {"error": _one_line("%s: %s" % (type(err).__name__, err), 200), "repo": repo})
     try:
         pane_health_pass(engine, now)   # the control plane: detached or dead panes, reads only, wakes the Chief of Staff
     except Exception as err:
