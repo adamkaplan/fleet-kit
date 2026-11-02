@@ -126,7 +126,7 @@ def whole_names(pr):
 
 
 def fetch_whole(pr, repo):
-    """The paths from one bounded `gh pr diff <n> --name-only` when they match `changedFiles`, else None (GitHub refuses a diff over its limit)."""
+    """The paths from one bounded `gh pr diff <n> --name-only` when their number matches `changedFiles` and they hold every listed file, else None (GitHub refuses a diff over its limit)."""
     total = pr.get("changedFiles")
     if isinstance(total, bool) or not isinstance(total, int):
         return None
@@ -135,7 +135,8 @@ def fetch_whole(pr, repo):
     if done.returncode != 0:
         return None
     names = {line for line in done.stdout.splitlines() if line}
-    return names if len(names) == total else None
+    listed = {f.get("path") for f in pr.get("files") or [] if isinstance(f, dict)}
+    return names if len(names) == total and listed <= names else None
 
 
 def main(argv=None):

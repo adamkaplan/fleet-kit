@@ -142,16 +142,20 @@ def bound_claims(tool, root):
 
 
 def trust_claims(tool, root):
-    """S11: the tool compares the NUMBER of the fetched names with changedFiles, not their content (a stated limit). The fetched names hold the daemon file,
-    so a wrongly trusted answer would put the pull request in the overlap report."""
+    """S11: 138 and 140 names, and 139 names that do not hold the 100 listed files, are `not whole` and not used; 139 names that hold them are whole.
+    Every answer holds the daemon file, so a wrongly trusted one would put the pull request in the overlap report."""
     listed = plain_names(100)
-    for what, count in (("138", 138), ("140", 140)):
-        done, calls = run_many(tool, root, [cut_pr(7, listed)], {7: (plain_names(count, [DAEMON]), 0)})
+    for what, names in (("138", plain_names(138, [DAEMON])), ("140", plain_names(140, [DAEMON]))):
+        done, calls = run_many(tool, root, [cut_pr(7, listed)], {7: (names, 0)})
         if done.returncode != 0 or calls != ["7"] or not_whole_numbers(done) != [7] or "#7 edit f" in done.stdout:
             raise AssertionError("TRUSTED an answer of %s names for a count of 139 is used: %r %r" % (what, done.stdout, done.stderr))
+    other = ["other/g%03d.py" % i for i in range(138)] + [DAEMON]
+    done, calls = run_many(tool, root, [cut_pr(7, listed)], {7: (other, 0)})
+    if done.returncode != 0 or calls != ["7"] or not_whole_numbers(done) != [7] or "#7 edit f" in done.stdout:
+        raise AssertionError("TRUSTED-OTHER 139 names that do not hold the listed files are used: %r %r" % (done.stdout, done.stderr))
     done, calls = run_many(tool, root, [cut_pr(7, listed)], {7: (plain_names(139, [DAEMON]), 0)})
     if done.returncode != 0 or not_whole_numbers(done) != [] or "#7 edit f" not in done.stdout:
-        raise AssertionError("TRUSTED-NOT an answer of 139 names is not read whole: %r %r" % (done.stdout, done.stderr))
+        raise AssertionError("TRUSTED-NOT an answer of 139 names that hold the listed files is not read whole: %r %r" % (done.stdout, done.stderr))
 
 
 def partial_claims(tool, root):
@@ -175,7 +179,7 @@ def build():
 
         def tool_with(self, old, new):
             source = TOOL.read_text()
-            self.assertIn(old, source, "the mutant is applied")
+            self.assertEqual(source.count(old), 1, "the mutant is applied exactly once")
             mutated = source.replace(old, new)
             self.assertNotEqual(mutated, source)
             path = Path(self.root) / "mutant-arch-overlap"
@@ -250,14 +254,20 @@ def build():
             with self.assertRaisesRegex(AssertionError, r"^BOUND 21 gh pr diff calls where 20 are expected"):
                 bound_claims(mutant, self.root)
 
-        def test_s11_fetched_names_of_the_wrong_number_are_not_used(self):
-            """The tool compares the NUMBER of the fetched names with changedFiles (138 and 140 against 139 are refused, 139 is read whole), not their
-            content: a stated limit (139 wrong names are trusted)."""
+        def test_s11_fetched_names_of_the_wrong_number_or_not_holding_the_listing_are_not_used(self):
+            """The tool checks the NUMBER of the fetched names against changedFiles AND that they hold every listed file (the listing's own first 100):
+            138, 140 and 139 other names are `not whole` and not used; 139 names that hold the listed files are whole. The one remaining limit: the files
+            beyond the 100 that the listing gives have no second answer (the fetch is GitHub's one answer for them)."""
             trust_claims(TOOL, self.root)   # the unmutated control
 
         def test_s11_a_tool_that_takes_the_fetched_names_without_comparing_is_caught(self):
-            mutant = self.tool_with("return names if len(names) == total else None", "return names")
+            mutant = self.tool_with("return names if len(names) == total and listed <= names else None", "return names")
             with self.assertRaisesRegex(AssertionError, r"^TRUSTED an answer of 138 names"):
+                trust_claims(mutant, self.root)
+
+        def test_s11_a_tool_that_compares_the_number_only_is_caught(self):
+            mutant = self.tool_with(" and listed <= names else None", " else None")
+            with self.assertRaisesRegex(AssertionError, r"^TRUSTED-OTHER 139 names"):
                 trust_claims(mutant, self.root)
 
         def test_s12_a_pull_request_not_whole_is_read_from_its_listed_names(self):
