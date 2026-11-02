@@ -20,6 +20,40 @@ BASE_TEST = ('import unittest\nfrom acme import compute_widget_total, announce\n
              '    def test_unrelated(self):\n        self.assertTrue(True)\n')
 
 
+def count_re_bindings(source):
+    """(line, form) of every binding of `re` or its functions: module-level ones (nested in module-level if/try/with/for/while/class, never in a
+    function body) have the form 'module-level ...'; function-local `import re` statements are the designed form and read 'function-local import re'."""
+    import ast
+    found = []
+
+    def forms(node, where):
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                if a.name == "re" or a.name.startswith("re."):
+                    yield "import re as %s" % a.asname if a.asname else "import re"
+        elif isinstance(node, ast.ImportFrom):
+            if node.module == "re" and not node.level:
+                for a in node.names:
+                    yield "from re import *" if a.name == "*" else "from re import %s%s" % (a.name, " as " + a.asname if a.asname else "")
+        elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)) and node.value is not None and not where:
+            if any(isinstance(n, ast.Name) and n.id == "re" for n in ast.walk(node.value)):
+                yield "assignment using re.*"
+
+    def walk(stmts, local):
+        for node in stmts:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                walk(node.body, True)
+                continue
+            for form in forms(node, local):
+                found.append((node.lineno, ("function-local " if local else "module-level ") + form))
+            for field in ("body", "orelse", "finalbody"):
+                walk(getattr(node, field, None) or [], local)
+            for h in getattr(node, "handlers", []):
+                walk(h.body, local)
+    walk(ast.parse(source).body, False)
+    return sorted(found)
+
+
 class PinsRepo(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.mkdtemp()
@@ -376,6 +410,52 @@ class TestPinsReview(PinsRepo):
                 self.test_a_scan_per_hit_is_bounded_by_the_file_not_the_hits()
         self.assertEqual(applied[0], 2000)
         self.assertRegex(str(caught.exception), r"^\d+ not less than or equal to 250005 : \d+$")
+
+    PINS_SRC = REPO / "bin" / "switchboard" / "pins.py"
+
+    def re_bindings(self, source):
+        found = count_re_bindings(source)
+        module = [f for f in found if f[1].startswith("module-level")]
+        local = [f for f in found if f[1].startswith("function-local")]
+        return module, local
+
+    def assert_no_module_level_re(self, source):
+        module, local = self.re_bindings(source)
+        self.assertEqual(module, [], "module-level binding of re (the scan-bound test cannot see it): " + "; ".join("line %d: %s" % f for f in module))
+        self.assertEqual(len(local), 2, "function-local `import re` count is not the designed 2: " + "; ".join("line %d" % f[0] for f in local))
+
+    def test_pins_binds_re_at_no_module_level_and_imports_it_in_two_functions(self):   # guard on the L1 guard
+        self.assert_no_module_level_re(self.PINS_SRC.read_text())
+
+    def test_a_module_level_binding_of_re_is_caught_in_every_form(self):   # L1 guard mutants
+        text = self.PINS_SRC.read_text()
+        self.assert_no_module_level_re(text)   # control first
+        first_def = text.index("\ndef ")
+        local_import = "    import re\n"
+        cases = [
+            ("import re", "import re\n", r"module-level import re$"),
+            ("import re as regex", "import re as regex\n", r"module-level import re as regex$"),
+            ("from re import compile", "from re import compile\n", r"module-level from re import compile$"),
+            ("from re import compile as c", "from re import compile as c\n", r"module-level from re import compile as c$"),
+            ("from re import *", "from re import *\n", r"module-level from re import \*$"),
+            ("assignment", 'compiled = re.compile("x")\n', r"module-level assignment using re\.\*$"),
+            ("try block", "try:\n    import re\nexcept ImportError:\n    pass\n", r"module-level import re$"),
+        ]
+        for name, add, form in cases:
+            with self.subTest(name):
+                mutant = text[:first_def] + "\n" + add + text[first_def:]
+                self.assertEqual(mutant.count("\n" + add), 1, "the mutation is applied exactly once")
+                with self.assertRaises(AssertionError) as caught:
+                    self.assert_no_module_level_re(mutant)
+                self.assertRegex(str(caught.exception),
+                                 r"module-level binding of re \(the scan-bound test cannot see it\): line \d+: " + form.replace("$", "") )
+        with self.subTest("a third function-local import"):
+            at = text.index(local_import)
+            mutant = text[:at] + local_import + text[at:]
+            self.assertEqual(len(re.findall(r"^    import re$", mutant, re.M)), 3, "applied once")
+            with self.assertRaises(AssertionError) as caught:
+                self.assert_no_module_level_re(mutant)
+            self.assertRegex(str(caught.exception), r"function-local `import re` count is not the designed 2: line \d+; line \d+; line \d+$")
 
     def test_a_blank_quoted_message_is_no_term(self):   # L2
         self.assertEqual(sb.pins_messages_of('x = "            "'), [])
