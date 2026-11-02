@@ -500,7 +500,7 @@ def build():
         def test_u11_the_control_passes_and_a_mutant_masking_only_ipv4_fails_with_the_text(self):
             code, err = self.scratch_u11()
             self.assertEqual((code, err), (0, ""))
-            code, err = self.scratch_u11(("cloud/launcher/cloud_worker.py", "MASK_IPV6 = True", "MASK_IPV6 = False"))
+            code, err = self.scratch_u11(("cloud/launcher/cloud_worker.py", "ipaddress.ip_address(run[i:j])", r"ipaddress.ip_address(run[i:j]) if re.fullmatch(r'[0-9]{1,3}(?:\.[0-9]{1,3}){3}', run[i:j]) else int('x')"))
             self.assertEqual(code, 1, err)
             self.assertIn("an address reached the block", err)
 
