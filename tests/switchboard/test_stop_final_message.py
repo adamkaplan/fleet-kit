@@ -482,7 +482,7 @@ class TestStopFinalMessageHardeningMutant(unittest.TestCase):
          "an upper-case endpoint reached a lane"),
         ("cloud_retired", "test_U12_a_wide_cloud_last_is_tightened_and_a_link_or_a_foreign_one_is_refused", "os.fchmod(dfd, 0o700)", "pass",
          "a cloud-last directory stayed wider than 0700"),
-        ("cloud_worker", "test_U13_a_token_in_the_retire_reason_is_not_in_the_message", "_scrub_lib()(_one(reason, 120), (), 200)", "_one(reason, 120)",
+        ("cloud_worker", "test_U13_a_token_in_the_retire_reason_is_not_in_the_message", "_one(_scrub_lib()(reason, (), 200), 120)", "_one(reason, 120)",
          "a token in the retire reason reached a lane"),
         ("cloud_retired", "test_U14_a_directory_swapped_for_a_link_after_the_check_is_not_followed", "_last_worker_text_at(directory, (before.st_dev, before.st_ino))",
          "_last_worker_text(directory)", "a directory swapped after the check was followed"),
