@@ -36,6 +36,44 @@ def check_text(fname, text, exceptions=()):
     for name in imported_names(tree):
         if name not in used and name not in allowed:
             failures.append("%s: imported name %s is never used" % (fname, name))
+    failures += duplicate_bindings(fname, tree)
+    return failures
+
+
+def scope_imports(scope):
+    """The import statements of one scope, not those of a nested function or class."""
+    found = []
+    pending = list(ast.iter_child_nodes(scope))
+    while pending:
+        node = pending.pop(0)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+            continue
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            found.append(node)
+        pending[0:0] = list(ast.iter_child_nodes(node))
+    return found
+
+
+def duplicate_bindings(fname, tree):
+    """A name bound by more than one import statement of one scope: reported once, with the first binding."""
+    failures = []
+    scopes = [tree] + [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))]
+    for scope in scopes:
+        bound = {}
+        for stmt in scope_imports(scope):
+            for alias in stmt.names:
+                name = alias.asname or (alias.name.split(".")[0] if isinstance(stmt, ast.Import) else alias.name)
+                bound.setdefault(name, []).append(stmt)
+        for name, stmts in bound.items():
+            if len(stmts) < 2:
+                continue
+            texts = [ast.unparse(s) for s in stmts]
+            submodules = (all(isinstance(s, ast.Import) and not any(a.asname for a in s.names) for s in stmts)
+                          and len(set(texts)) == len(texts))
+            if submodules:
+                continue
+            failures.append("%s: %s is bound twice; the first import (line %d: %s) is never used"
+                            % (fname, name, stmts[0].lineno, texts[0]))
     return failures
 
 
@@ -81,6 +119,23 @@ class TestNestedImports(unittest.TestCase):
         used = ("import os\n\ndef f():\n    import json\n    return os.name, json.dumps, csv.reader\n\n"
                 "try:\n    import csv\nexcept ImportError:\n    pass\nprint(csv.reader)\n")
         self.assertEqual(check_text("fake.py", used), [])
+
+
+class TestDuplicateBindings(unittest.TestCase):
+    def test_a_name_bound_twice_is_reported_once(self):
+        failures = check_text("fake.py", "from a import x\nfrom b import x\nprint(x)\n")
+        self.assertEqual(len(failures), 1, failures)
+        self.assertIn("fake.py", failures[0])
+        self.assertIn("x", failures[0])
+        self.assertIn("from a import x", failures[0])
+
+    def test_the_same_import_twice_is_a_duplicate(self):
+        failures = check_text("fake.py", "from a import x\nfrom a import x\nprint(x)\n")
+        self.assertEqual(len(failures), 1, failures)
+
+    def test_submodules_of_one_package_are_one_binding(self):
+        text = "import importlib.machinery\nimport importlib.util\nprint(importlib.machinery, importlib.util)\n"
+        self.assertEqual(check_text("fake.py", text), [])
 
 
 class TestMutant(unittest.TestCase):

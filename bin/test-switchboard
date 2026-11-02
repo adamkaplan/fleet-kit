@@ -65926,7 +65926,7 @@ _count_movable = importlib.import_module("test_count_movable")
 TestCountMovable = _count_movable.TestCountMovable
 # The guard of unused imports in the support modules (#1806).
 _support_imports = importlib.import_module("test_support_imports")
-TestFakeSupportModule, TestSupportImportsMutant, TestSupportImportsScratch, TestSupportImportsReal, TestSupportImportsNested = _support_imports.TestFakeModule, _support_imports.TestMutant, _support_imports.TestScratchDirectory, _support_imports.TestRealDirectory, _support_imports.TestNestedImports
+TestFakeSupportModule, TestSupportImportsMutant, TestSupportImportsScratch, TestSupportImportsReal, TestSupportImportsNested, TestSupportImportsDuplicates = _support_imports.TestFakeModule, _support_imports.TestMutant, _support_imports.TestScratchDirectory, _support_imports.TestRealDirectory, _support_imports.TestNestedImports, _support_imports.TestDuplicateBindings
 
 # The census of process kinds (#1501).
 _census = importlib.import_module("test_github_census")
