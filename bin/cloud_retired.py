@@ -226,20 +226,26 @@ _LAST_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,199}", re.ASCII)
 
 
 def clean_last(base, now):
-    """Remove the files of `base` older than 7 days (and the leftovers of a dead write); returns the count removed. Never raises."""
+    """Remove the regular files named `*.txt` of `base` older than 7 days, through the directory descriptor (`unlink` with `dir_fd`); a link, any other
+    name and any younger file stay. Returns the count removed. Never raises."""
     removed = 0
     try:
-        if base.is_symlink():
-            return 0
-        for path in base.iterdir():
+        dfd = os.open(str(base), os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0))
+    except OSError:
+        return 0
+    try:
+        for name in os.listdir(dfd):
             try:
-                if not path.is_symlink() and path.lstat().st_mtime < now - LAST_KEEP_SECONDS:
-                    path.unlink()
+                st = os.stat(name, dir_fd=dfd, follow_symlinks=False)
+                if stat.S_ISREG(st.st_mode) and name.endswith(".txt") and st.st_mtime < now - LAST_KEEP_SECONDS:
+                    os.unlink(name, dir_fd=dfd)
                     removed += 1
             except OSError:
                 pass
     except OSError:
         pass
+    finally:
+        os.close(dfd)
     return removed
 
 
