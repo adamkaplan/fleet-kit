@@ -602,6 +602,7 @@ launcher's allowed list and one role, and answers with GitHub's own token, repos
 - The setting `CW_TOKEN_SERVICE_URL` (`https://<server>/api/v1/namespaces/cw/services/token-mint:8080/proxy/mint`) makes `app_token.py` ask
   the service; the answer gets the same checks as the signing route. With it unset the signing route runs as before: that is the rollback.
   `CW_TOKEN_SERVICE_CALLER_TOKEN_CMD` may name a command that prints the cluster token; unset, the launcher's own cluster login is used.
+  Preflight note: the child reaches the service only if `CW_TOKEN_SERVICE_CALLER_TOKEN_CMD` prints a cluster token that the launcher holds.
 - A passing failure of the service (502, a timeout, no connection) exits 75 and the launcher tries again; a refusal exits 1.
 - The owner applies the manifests (`token-mint-review.yaml` holds the one cluster-wide permission), creates the Secret `token-mint-app`
   (keys `app-id`, `app-key`) and publishes the image.
