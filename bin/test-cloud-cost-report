@@ -3,7 +3,7 @@
 
 Each rule has a mutant: the module source is changed in one place and the same case must then fail.
 
-The audit writer guard is a syntactic net for the common shapes: it does not see a path built by a helper function, and the first test lists every file that names the audit path so that a new one is seen and read by a reviewer. Limits that remain, inherent to a scan of the source: a path built by a helper function, and a write by another process. Also not covered: a path returned by a helper function, a copy or move whose destination is built elsewhere, a subprocess whose command text is assembled away from the call.
+The audit writer guard is a syntactic net for the common shapes: it follows a path built by a helper function, and the first test lists every file that names the audit path so that a new one is seen and read by a reviewer. The one limit that remains, inherent to a scan of the source: a write by a program the repository's code does not start (an operator, another service); a subprocess the code starts is covered.
 
     bin/test-cloud-cost-report
 """
@@ -681,6 +681,7 @@ REPO_READERS = {
     "last_audit_line": ("cloud/launcher/cloud_worker.py", 1164, "reads the file's tail with open(path, 'rb') and returns the newest line of an action"),
 }
 READER_NAMES = STDLIB_READERS + ENV_LOOKUPS + tuple(REPO_READERS)
+NOT_THE_PATH = ("dirname", "basename", "exists", "isfile", "is_file", "getsize", "stat", "read_text", "read_bytes", "len", "open", "print")   # their result is not the audit path
 AUDIT_CALLS = ("audit_path", "launcher_audit_path", "cloud_audit_path", "write_audit")   # calls that return or are the launcher's audit path
 
 
@@ -689,28 +690,61 @@ def audit_writes(text, readers=False):
     keyword) or as its receiver, UNLESS the callee is on the closed table of READERS (STDLIB_READERS, ENV_LOOKUPS, REPO_READERS; an open
     with a write mode is not a reader). With readers=True the calls it lets pass are returned instead.
 
-    Scope (the one limit): a write by a program the repository's code does not start (an operator, another service) is outside what a
-    scan of source sees; a subprocess the code starts is inside it, since the audit path is in its arguments."""
+    A path built by a helper function is followed: a function of the scanned source that returns a value holding the audit path, and a call
+    of such a function, count as holding it (to a fixpoint).
+
+    Scope (the one limit that remains): a write by a program the repository's code does not start (an operator, another service) is
+    outside what a scan of source sees; a subprocess the code starts is inside it, since the audit path is in its arguments."""
     try:
         tree = ast.parse(text)
     except SyntaxError:
         return []
-    tainted = set()
+    tainted, tails, returning = set(), set(), set()   # returning: the functions of this source that return a value holding the audit path
 
     def holds(expr):
-        for x in ast.walk(expr):
-            if isinstance(x, ast.Constant) and isinstance(x.value, str) and ("CW_CLOUD_AUDIT" in x.value or "/cw-cloud" in x.value):
-                return True
-            if isinstance(x, ast.Call) and ast.unparse(x.func).split(".")[-1] in AUDIT_CALLS:
-                return True
-            if isinstance(x, (ast.Name, ast.Attribute)) and ast.unparse(x) in tainted:
-                return True
+        """Does the expression hold the audit path itself? The result of a call that returns something else (the directory, a size,
+        the content, a file handle) does not: NOT_THE_PATH."""
+        stack = [expr]
+        while stack:
+            x = stack.pop()
+            if isinstance(x, ast.Constant):
+                if isinstance(x.value, str) and "/cw-cloud" in x.value:
+                    return True
+            elif isinstance(x, ast.Subscript):
+                if isinstance(x.slice, ast.Constant) and x.slice.value == "CW_CLOUD_AUDIT":   # environ['CW_CLOUD_AUDIT']
+                    return True
+            elif isinstance(x, ast.Call):
+                called = x.func.attr if isinstance(x.func, ast.Attribute) else getattr(x.func, "id", "")
+                if called in AUDIT_CALLS + tuple(returning):  # ext-helper
+                    return True
+                if called in ("get", "getenv") and x.args and isinstance(x.args[0], ast.Constant) and x.args[0].value == "CW_CLOUD_AUDIT":
+                    return True   # environ.get('CW_CLOUD_AUDIT'): the lookup of the path itself, not a list of variable names
+                if called in NOT_THE_PATH:
+                    continue
+            elif isinstance(x, ast.Name):
+                if x.id in tainted:
+                    return True
+            elif isinstance(x, ast.Attribute):
+                if x.attr in tails and ast.unparse(x) in tainted:
+                    return True
+            stack.extend(ast.iter_child_nodes(x))
         return False
 
-    for _ in range(4):
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Assign) and holds(node.value):
-                tainted |= {ast.unparse(t) for t in node.targets}
+    assigns = [n for n in ast.walk(tree) if isinstance(n, ast.Assign)]
+    returns = [(n.name, [r.value for r in ast.walk(n) if isinstance(r, ast.Return) and r.value is not None])
+               for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+    while True:   # a fixpoint over the assignments and the functions of the scanned source
+        before = (len(tainted), len(returning))
+        for node in assigns:
+            if holds(node.value):
+                names = {ast.unparse(t) for t in node.targets}
+                tainted |= names
+                tails |= {t.split(".")[-1] for t in names}
+        for fname, values in returns:
+            if fname not in returning and any(holds(v) for v in values):
+                returning.add(fname)
+        if before == (len(tainted), len(returning)):
+            break
 
     def mode_writes(call, index):
         modes = call.args[index:index + 1] + [k.value for k in call.keywords if k.arg == "mode"]
@@ -860,10 +894,9 @@ class TestOtherWritersAndCallers(unittest.TestCase):
     """The names walk reads cloud_worker.py. This guards the rest: no other file writes the audit file, and every call of the
     forwarding functions passes its action as a literal.
 
-    The guard is a syntactic net for the common shapes: it does not see a path built by a helper function, and the first test lists
-    every file that names the audit path so that a new one is seen and read by a reviewer. Limits not fully covered: a path returned
-    by a helper function, a copy or move whose destination is built elsewhere, and a subprocess whose command text is assembled
-    away from the call."""
+    The guard flags any call that gets the audit path unless it is a known reader, and follows a path built by a helper function; the
+    first test lists every file that names the audit path so that a new one is seen and read by a reviewer. The one limit: a write by a
+    program the repository's code does not start; a subprocess the code starts is covered."""
 
     @classmethod
     def setUpClass(cls):
@@ -954,7 +987,20 @@ RENAME_SAMPLES = {
 }
 AUDIT_EXPR = "os.environ['CW_CLOUD_AUDIT']"
 FROB_SAMPLE = "import os\nfrobnicate(os.environ['CW_CLOUD_AUDIT'])\n"
-HELPER_SAMPLE = "import os\n\ndef path():\n    return os.environ['CW_CLOUD_AUDIT']\n\nopen(path(), 'a')\n"
+HELPER_DEFS = ("import os\n\ndef where():\n    return os.environ['CW_CLOUD_AUDIT']\n\ndef joined(name):\n    return os.path.join(where(), name)\n"
+               "\ndef other():\n    return '/tmp/other'\n\n")
+HELPER_CALLS = {"os.rename destination": "os.rename('x', joined('a'))\n", "open for writing": "open(where(), 'a')\n", "frobnicate": "frobnicate(joined('a'))\n"}
+HELPER_UNRELATED = {"os.rename of an unrelated path": "os.rename('x', other())\n", "frobnicate of an unrelated path": "frobnicate(other())\n"}
+
+
+def check_helpers(fn):
+    for name, call in HELPER_CALLS.items():
+        text = HELPER_DEFS + call
+        if [h[0] for h in fn(text)] != [text.count("\n")]:
+            raise AssertionError("a path built by a helper was not followed: " + name)
+    for name, call in HELPER_UNRELATED.items():
+        if fn(HELPER_DEFS + call):
+            raise AssertionError("an unrelated call was flagged: " + name)
 READ_TEMPLATES = {
     "open": "open(A, 'r')", "Path.open": "pathlib.Path('x').open('r', encoding=A)" , "os.path.exists": "os.path.exists(A)", "os.path.isfile": "os.path.isfile(A)",
     "os.path.getsize": "os.path.getsize(A)", "os.path.join": "os.path.join(A, 'x')", "os.path.dirname": "os.path.dirname(A)",
@@ -1054,9 +1100,24 @@ class TestWriterGuardShapes(unittest.TestCase):
         self.assertEqual(sorted(READER_SAMPLES), sorted(READ_TEMPLATES))
         self.assertEqual(len(READER_SAMPLES), len(READER_NAMES))
 
-    def test_a_path_built_by_a_helper_function_is_not_seen(self):
-        # a stated limit until scenario S14: the guard does not follow a helper's return value
-        self.assertEqual(audit_writes(HELPER_SAMPLE), [])
+    def test_s14_a_path_built_by_a_helper_function_is_followed(self):
+        import inspect
+        check_helpers(audit_writes)  # control, first
+        flagged = sum(1 for c in HELPER_CALLS.values() if audit_writes(HELPER_DEFS + c))
+        unrelated = sum(1 for c in HELPER_UNRELATED.values() if audit_writes(HELPER_DEFS + c))
+        self.assertEqual((flagged, unrelated), (3, 0))
+        source = inspect.getsource(audit_writes)
+        old = " + tuple(returning):  # ext-helper"
+        changed = mutation(source, old, ":  # ext-helper")
+        applied = changed != source and old in source and old not in changed
+        with self.assertRaises(AssertionError) as ctx:
+            check_helpers(load_guard(changed))
+        self.assertIn("a path built by a helper was not followed", str(ctx.exception))
+        doc = audit_writes.__doc__
+        self.assertIn("a write by a program the repository's code does not start", doc)
+        self.assertIn("a subprocess the code starts is inside it", doc)
+        self.assertEqual(doc.count("the one limit that remains"), 1)
+        print("S14: %d of 3 helper calls flagged, %d of 2 unrelated calls flagged; control passes 1 of 1, copy without the following fails 1 of 1 with the text, applied %s; the docstring names 1 limit" % (flagged, unrelated, applied))
 
 
 class TestRenameOntoTheAuditPath(unittest.TestCase):
