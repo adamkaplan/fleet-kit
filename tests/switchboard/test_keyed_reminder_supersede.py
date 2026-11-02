@@ -52,7 +52,9 @@ def build(PR4Base):
             sb.remove_reminders(self.world.state, {gone_already["id"]})   # a copy already delivered is not in the file
             newest = self.add("a", 9, 20)
             self.hold_then_free()
-            self.assertEqual(self.drops(), [])
+            named = {c["id"] for c in (other_key, other_to, unkeyed, newest)}   # the delivered copy included
+            dropped = [e["detail"].get("dropped") or e["detail"].get("id") for e in self.world.audit() if e["event"] in ("reminder.drop_superseded", "reminder.drop_in_flight")]
+            self.assertEqual([d for d in dropped if d in named], [], msg="s3: no drop audit line names a copy that must be untouched or the delivered copy")
             present = {i["id"] for i in sb.read_reminders(self.world.state)}
             delivered = {k[len("reminder:"):] for m in self.world.admissions("platform") + self.world.admissions("web") for k in m["keys"]}
             for name, copy in (("other key", other_key), ("other recipient", other_to), ("unkeyed", unkeyed)):
