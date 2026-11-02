@@ -39,6 +39,58 @@ class TestLostWorkerRemembers(unittest.TestCase):
         self.assertGreaterEqual(one, 1, WHY)
         self.assertEqual(len(r.engine.sent), one, WHY)
 
+    # S4: the S2 check run against a loader; the mutants are textual replacements in a COPY of bin/lost_worker.py (REAL detector copy, real state file; FAKE engine/clock).
+    @staticmethod
+    def _s2(loader):
+        r = Rig(loader())
+        r.created("w1")
+        first = loader().run_pass(r.sb, r.engine, NOW, r.alive, r.launcher)
+        assert len(first) == 1, WHY
+        assert len(keys(r)) == 1, WHY + ": the key is not in the saved table after pass 1"
+        second = loader().run_pass(r.sb, r.engine, NOW + 60, r.alive, r.launcher)
+        assert len(second) == 0, WHY
+
+    @staticmethod
+    def _copy_loader(tmp, new_for):
+        import importlib.util
+        import pathlib
+        src = pathlib.Path(__file__).resolve().parents[2] / "bin" / "lost_worker.py"
+        text = src.read_text()
+        text = new_for(text)
+        path = os.path.join(tmp, "lost_worker.py")
+        with open(path, "w") as handle:
+            handle.write(text)
+
+        def loader():
+            spec = importlib.util.spec_from_file_location("lost_worker_copy", path)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            return module
+        return loader
+
+    def test_control_the_unmutated_copy_passes_the_check(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            self._s2(self._copy_loader(tmp, lambda t: t))
+
+    def test_each_mutant_fails_the_check_with_the_anchored_text(self):
+        import tempfile
+        marker = '    alerted = state.setdefault("alerted", {})   # #2017:'
+        for name in ("M1", "M2"):
+            def mutate(text, name=name):
+                lines = text.split("\n")
+                hits = [l for l in lines if l.startswith(marker)]
+                old = hits[0] + "\n"
+                self.assertEqual(text.count(old), 1)
+                return text.replace(old, "" if name == "M1" else "    alerted = {}\n")
+            with tempfile.TemporaryDirectory() as tmp:
+                loader = self._copy_loader(tmp, lambda t: t)
+                self._s2(loader)   # control first
+                loader = self._copy_loader(tmp, mutate)
+                with self.assertRaises(AssertionError) as ctx:
+                    self._s2(loader)
+                self.assertIn(WHY, str(ctx.exception), name)
+
 
 if __name__ == "__main__":
     unittest.main()
