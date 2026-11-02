@@ -380,6 +380,11 @@ def build():
         """S9, S11: the commands of a review round, each run through the entry with the fixtures of TestPlanReviewCommands."""
         PREDATES = "this round predates the hash pair: start a new round"
 
+        def setUp(self):
+            snapshot = dict(os.environ)   # the commands below write HERDR_PANE_ID and HERDR_WORKSPACE_ID: put the environment back after each test
+            self.addCleanup(lambda: (os.environ.clear(), os.environ.update(snapshot)))
+            super().setUp()
+
         def signed_plan(self):
             self.plan_issue["body"] = host.LEDGER_PLAN + "\n" + MARKER
 
@@ -841,6 +846,11 @@ def build_late():
 
     class TestPlanHashMarkerLaunch(host.TestLaunchGate):
         """The G0b read of a consensus record, through the real `launch`."""
+
+        def setUp(self):
+            snapshot = dict(os.environ)   # launch_in writes HERDR_WORKSPACE_ID and pops HERDR_PANE_ID: put the environment back after each test
+            self.addCleanup(lambda: (os.environ.clear(), os.environ.update(snapshot)))
+            super().setUp()
 
         def signed(self):
             self.plan_issue["body"] = host.LEDGER_PLAN + "\n" + MARKER
