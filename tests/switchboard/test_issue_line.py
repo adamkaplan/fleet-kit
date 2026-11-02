@@ -297,7 +297,7 @@ def build():
                 with self.assertRaisesRegex(AssertionError, r"^wrote 1 times where 2 were expected"):
                     self.check_restore()
 
-        # -- a restore write that fails is not silent
+        # -- S14: a restore write that fails is not silent
 
         def check_restore_failed(self):
             self.lose_parts_after_the_write()
@@ -317,10 +317,10 @@ def build():
             self.assertNotIn("issue_line.restored", self.audit_text())
             self.assertNotIn("wait\"", self.audit_text())
 
-        def test_s5_a_restore_write_that_fails_prints_one_line_and_audits_restore_failed(self):
+        def test_s14_a_restore_write_that_fails_prints_one_line_and_audits_restore_failed(self):
             self.check_restore_failed()
 
-        def test_s5_a_mutant_that_swallows_the_failed_restore_is_caught_and_the_control_passes(self):
+        def test_s14_a_mutant_that_swallows_the_failed_restore_is_caught_and_the_control_passes(self):
             old = "            except sb.IntentError:\n                sb.engine.audit.append(sb.engine.actor, \"issue_line.restore_failed\""
             new = "            except sb.IntentError:\n                pass\n            if False:\n                sb.engine.audit.append(sb.engine.actor, \"issue_line.restore_failed\""
             text = self.source_mutant(old, new, self.check_restore_failed)
