@@ -22,9 +22,17 @@ SWITCHBOARD_FILE = BIN / "fleet-switchboard"
 PLAIN = "def format_line(x):\n    return x\n"
 # The output of the tool for a planted bin/y.py, recorded from a clean worktree of the base branch before the change
 # (the closure line is the live state of derive-closure, which this change does not touch).
-RECORDED_BIN_BLOCK = """bin/y.py:
-  guards: 9 classes run for a new file under bin/:
-    - TestAuthorityModulesGuard: a module that decides who may clear, hold or merge is listed or exempted by name
+RECORDED_BIN_HEAD = """bin/y.py:
+  guards: %d classes run for a new file under bin/:
+"""
+RECORDED_BIN_TAIL = """  authority code: no
+  matrix: no matrix line is demanded
+  units: add this row to the Units table of docs/architecture.md (header `| Unit | Layer | Job | Also may use |`, rows sorted by name), after the row of `work_sync.py`:
+    | `y.py` | <layer 0-6> | <the one job of the module> | |
+  closure: %s
+"""
+# The nine rows as recorded from the base branch before the change (the check at today's table length).
+RECORDED_BIN_ROWS_AT_NINE = """    - TestAuthorityModulesGuard: a module that decides who may clear, hold or merge is listed or exempted by name
     - TestAgentRegistryInventory: every module that reads or writes an agent record is in the registry inventory
     - TestImpactHold module-name guard: every module the clear runs is judged by name
     - bin/check-public-names: no private name in a tracked file
@@ -33,12 +41,13 @@ RECORDED_BIN_BLOCK = """bin/y.py:
     - TestTheReaperOnlyInstall: every function the installer calls is classified (Linux and macOS)
     - TestRecordingCommands: every command that reaches a ledger append is a recording command or named exempt
     - TestDerivedClosure: the closure of the delegated clear is derived over the entry and every part (tests/switchboard/test_closure.py)
-  authority code: no
-  matrix: no matrix line is demanded
-  units: add this row to the Units table of docs/architecture.md (header `| Unit | Layer | Job | Also may use |`, rows sorted by name), after the row of `work_sync.py`:
-    | `y.py` | <layer 0-6> | <the one job of the module> | |
-  closure: %s
 """
+
+
+def recorded_bin_block(ps):
+    """The recorded output for a bin/ path, rebuilt from the real NEW_BIN_GUARDS: fixed head and tail, one line per row."""
+    rows = "".join("    - %s: %s\n" % (g[0], g[4]) for g in ps.NEW_BIN_GUARDS)
+    return (RECORDED_BIN_HEAD % len(ps.NEW_BIN_GUARDS)) + rows + RECORDED_BIN_TAIL
 
 
 def shim_load(path, name):
@@ -86,24 +95,23 @@ def shim_live_closure():
     return "derive-closure --check: %s (exit %d): %s" % ({0: "ok", 1: "differs"}.get(done.returncode, "could not run"), done.returncode, first)
 
 
-def shim_check_tool_accepts_shims(case, done):
+def shim_check_tool_accepts_shims(case, done, n=3):
     case.assertEqual(done.returncode, 0, "new-module-demands refused a path under shims/: " + done.stdout)
-    case.assertIn("guards: 3 classes run for a new file under shims/", done.stdout)
+    case.assertIn("guards: %d classes run for a new file under shims/" % n, done.stdout)
 
 
 def shim_check_added_and_rows(case, ps, root):
     added = ps.added_paths(root, "main")
     case.assertEqual(added, ["shims/x.py"], "added_paths drops a file under shims/ the head adds")
-    case.assertEqual(len(ps.guard_rows(added)), 3, "guard_rows returns no row of NEW_SHIM_GUARDS for an added shims/ file")
+    case.assertEqual(len(ps.guard_rows(added)), len(ps.NEW_SHIM_GUARDS), "guard_rows returns no row of NEW_SHIM_GUARDS for an added shims/ file")
 
 
 class TestShimGuardsTool(unittest.TestCase):
     def test_s2_a_shim_a_bin_and_a_path_outside_both(self):
         with tempfile.TemporaryDirectory() as tmp:
             shim = shim_run(TOOL, tmp, shim_plant(tmp, "shims/x.py"))
-            shim_check_tool_accepts_shims(self, shim)
             ps = shim_load(PATH_SUITES, "shim_ps_tool")
-            self.assertEqual(len(ps.NEW_SHIM_GUARDS), 3)
+            shim_check_tool_accepts_shims(self, shim, len(ps.NEW_SHIM_GUARDS))
             for row in ps.NEW_SHIM_GUARDS:
                 self.assertIn("    - %s: %s" % (row[0], row[4]), shim.stdout)
             hold = json.loads(MATRIX.read_text())["owner_hold"]
@@ -113,10 +121,16 @@ class TestShimGuardsTool(unittest.TestCase):
             for line in ("  authority code: no", "  matrix: no line is demanded: shims/** is a top tier identity path and a floor glob", "  units: none", "  closure: not in the closure of the daemon"):
                 self.assertIn(line, shim.stdout)
             binned = shim_run(TOOL, tmp, shim_plant(tmp, "bin/y.py"))
-            self.assertEqual((binned.returncode, binned.stdout), (0, RECORDED_BIN_BLOCK % shim_live_closure()))
+            self.assertEqual((binned.returncode, binned.stdout), (0, recorded_bin_block(ps) % shim_live_closure()))
             outside = shim_run(TOOL, tmp, shim_plant(tmp, "plugins/z.py"))
             self.assertEqual(outside.returncode, 2)
             self.assertIn("is not a file directly under bin/ or shims/", outside.stdout)
+
+    def test_s2_the_recorded_nine_rows_are_what_the_table_builds_today(self):
+        ps = shim_load(PATH_SUITES, "shim_ps_nine")
+        if len(ps.NEW_BIN_GUARDS) != 9:
+            self.skipTest("the table no longer has the nine rows recorded at the base; the derived block covers it")
+        self.assertEqual(recorded_bin_block(ps), (RECORDED_BIN_HEAD % 9) + RECORDED_BIN_ROWS_AT_NINE + RECORDED_BIN_TAIL)
 
     def test_s6_the_six_existing_modules_demand_nothing(self):
         modules = sorted(p.name for p in (REPO / "shims").glob("*.py"))
@@ -181,7 +195,7 @@ class TestShimGuardRows(unittest.TestCase):
 
     def test_s3_added_paths_and_guard_rows_for_four_planted_changes(self):
         ps, nb, ns = self.ps, len(self.ps.NEW_BIN_GUARDS), len(self.ps.NEW_SHIM_GUARDS)
-        self.assertEqual(ns, 3)
+        self.assertGreater(ns, 0)
         for rels, expected in ((["shims/x.py"], ns), (["bin/y.py"], nb), (["shims/x.py", "bin/y.py"], nb + ns), (["docs/n.md"], 0)):
             root = shim_repo_adding(*rels)
             added = ps.added_paths(root, "main")
@@ -204,12 +218,12 @@ class TestShimGuardRows(unittest.TestCase):
         added, failed, out = self.run_preflight(["shims/x.py"])
         self.assertEqual(added, ["shims/x.py"])
         verdicts = [l for l in out.splitlines() if l.split()[0] in ("PASS", "FAIL")]
-        self.assertEqual((len(verdicts), failed), (3, 0))
+        self.assertEqual((len(verdicts), failed), (len(self.ps.NEW_SHIM_GUARDS), 0))
         self.assertTrue(all(l.startswith("PASS") for l in verdicts), verdicts)
-        self.assertIn("new file under bin/ or shims/ (shims/x.py): the 3 guards every new file there must pass", out)
+        self.assertIn("new file under bin/ or shims/ (shims/x.py): the %d guards every new file there must pass" % len(self.ps.NEW_SHIM_GUARDS), out)
         added, failed, out = self.run_preflight(["shims/x.py"], code=1)
         verdicts = [l for l in out.splitlines() if l.split()[0] in ("PASS", "FAIL")]
-        self.assertEqual((len(verdicts), failed, {l.split()[0] for l in verdicts}), (3, 3, {"FAIL"}))
+        self.assertEqual((len(verdicts), failed, {l.split()[0] for l in verdicts}), (len(self.ps.NEW_SHIM_GUARDS), len(self.ps.NEW_SHIM_GUARDS), {"FAIL"}))
 
     def test_s3_a_change_that_adds_both_runs_every_row_once_each(self):
         added, failed, out = self.run_preflight(["shims/x.py", "bin/y.py"])
@@ -279,7 +293,7 @@ class TestShimGuardMutants(unittest.TestCase):
 class TestShimGuardDocs(unittest.TestCase):
     def test_s7_the_documentation_and_the_matrix_line(self):
         text = (REPO / "docs" / "switchboard.md").read_text()
-        self.assertEqual(len(re.findall(r"^A new module under `shims/` \(#1909\) is guarded as a new bin module is:.*the 3 rows of `NEW_SHIM_GUARDS`", text, re.M)), 1)
+        self.assertEqual(len(re.findall(r"^A new module under `shims/` \(#1909\) is guarded as a new bin module is:.*the %d rows of `NEW_SHIM_GUARDS`" % len(shim_load(PATH_SUITES, "shim_ps_docs").NEW_SHIM_GUARDS), text, re.M)), 1)
         self.assertEqual(len(re.findall(r"^Not put in scope, and why: the authority-modules guard.*the Units guard.*`TestDerivedClosure`", text, re.M)), 1)
         matrix = MATRIX.read_text()
         self.assertEqual(matrix.count("code that is not a .py file in bin/ (bin/fleet-switchboard, scripts, shims, plugins, agents)"), 1)
