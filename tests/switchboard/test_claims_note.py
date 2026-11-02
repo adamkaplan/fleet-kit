@@ -157,7 +157,7 @@ class TestClaimsNotePass(ClaimsNoteBase):
         source = (REPO / "bin" / "switchboard" / "claims_note.py").read_text()
         self.assertEqual(source.count("covered_ids("), 1)   # the one reading of the claimed ids in the new code (the rest is `omitted_claims`)
         self.assertEqual(len(re.findall(r"pr_scenarios\(|pr_claim\(|claim_text\(", source)), 1)   # no second private reading of the line
-        self.assertEqual(self.sb.plan_ledger.omitted_claims(self.sb.plan_check.parse_scenarios(self.sb.plan_check.scenario_block(HOST.LEDGER_PLAN)), body, others), ["S3", "U1"])
+        self.assertEqual(self.sb.plan_ledger.omitted_claims(self.sb.plan_check.parse_scenarios(self.sb.plan_check.scenario_block(HOST.LEDGER_PLAN)), body, self.sb.plan_ledger.claim_counts(self.sb.plan_check.parse_scenarios(self.sb.plan_check.scenario_block(HOST.LEDGER_PLAN)), [body] + [o for _, o in others])), ["S3", "U1"])
 
 
 class NoGithubReadChecks:

@@ -586,15 +586,21 @@ def claim_union(scenarios, this_body, others):
     return narrowed, [i for i in per if i not in covered], last
 
 
-def omitted_claims(scenarios, this_body, others):
-    """The per-pull-request scenario ids this body's claim line leaves out (#1716) that no OTHER open or merged pull request of the plan covers: the ids `claim_union_note` lists
-    for one pull request. `others` is [(state, body)] as for `claim_union`. A body with no claim line claims every one and a refused line covers nothing (`covered_ids` gives the empty
-    set): both leave out nothing here, they have their own gates. Pure."""
+def claim_counts(scenarios, bodies):
+    """How many of `bodies` cover each per-pull-request id (#1716): one reading of each body through `covered_ids`, kept as one number for each id. Pure."""
+    counts = {}
+    for body in bodies:
+        for i in covered_ids(scenarios, [body]):
+            counts[i] = counts.get(i, 0) + 1
+    return counts
+
+
+def omitted_claims(scenarios, this_body, counts):
+    """The per-pull-request ids this body's claim line leaves out that no OTHER body counted covers (`counts` is `claim_counts` over all bodies, this one included: its own cover is
+    subtracted). No claim line claims every one and a refused line covers nothing: both leave out nothing here (`covered_ids` gives the empty set). Pure."""
     mine = covered_ids(scenarios, [this_body])
-    if not mine:
-        return []
-    covered = mine | covered_ids(scenarios, [body for _, body in others])
-    return [s.get("id") for s in scenarios if claim_of(s) == "pr" and s.get("id") not in covered]
+    return [s.get("id") for s in scenarios if mine and claim_of(s) == "pr" and counts.get(s.get("id"), 0) - (s.get("id") in mine) <= 0 and s.get("id") not in mine]
+
 
 def claim_line(pr, head, body):
     """The ONE ledger line that binds a pull request's claim as it stood when its merge was gated (#976). `claim_text` None: no claim line."""

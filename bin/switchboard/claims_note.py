@@ -67,7 +67,7 @@ def claims_note_pass(engine, state, repos, now):
         note, hub, discovery = claims_note_state(engine), getattr(engine, "hub", None), getattr(engine, "discovery", None)
         if hub is None or discovery is None or discovery.problems:
             return
-        sent, cache = False, {}
+        sent, cache, counts = False, {}, {}
         default_repo = engine.config.get("intent_repo")
         if not hub._notices:   # route_of reads them and the hub's own pass may not have run yet; never replace the ones it holds
             hub._notices = hub._load_notices()
@@ -84,7 +84,7 @@ def claims_note_pass(engine, state, repos, now):
                 key = "%s#%d:%s" % (repo, number, hashlib.sha256(record["body"].encode("utf-8", "replace")).hexdigest()[:16])
                 if key in note.announced:
                     continue
-                ids, why, plan_ref, plan_number, other_repo = claims_note_ids(engine, state, repos, repo, number, record, opened, merged, default_repo, cache)
+                ids, why, plan_ref, plan_number, other_repo = claims_note_ids(engine, state, repos, repo, number, record, opened, merged, default_repo, cache, counts)
                 if not ids:
                     if why and (key, why) not in note.said:
                         note.said.add((key, why))
@@ -118,8 +118,8 @@ def claims_note_pass(engine, state, repos, now):
         engine._note("claims_note.error", "", {"error": _one_line("%s: %s" % (type(err).__name__, err), 160)})
 
 
-def claims_note_ids(engine, state, repos, repo, number, record, opened, merged, default_repo, cache):
-    """(ids left out, why none, plan ref, plan issue number when in this repository, plan in another repository): the one rule is `plan_ledger.omitted_claims` over the other open and merged pull requests of the same plan."""
+def claims_note_ids(engine, state, repos, repo, number, record, opened, merged, default_repo, cache, counts):
+    """(ids left out, why none, plan ref, plan issue number when in this repository, plan in another repository): the one rule is `plan_ledger.omitted_claims` against the counts of the open and merged pull requests of the same plan (built once a pass)."""
     body = record["body"]
     link = PLAN_LINE_RE.search(plan_ledger.visible_body(body))
     if not link:
@@ -136,12 +136,14 @@ def claims_note_ids(engine, state, repos, repo, number, record, opened, merged, 
         return [], "the pull request has no CLAIMS line", None, None, False
     if not plan_ledger.covered_ids(scenarios, [body]):
         return [], "the CLAIMS line is refused (it covers nothing)", None, None, False
-    others = []
-    for state_name, group in (("open", opened), ("merged", merged)):
-        for other in group:
-            if other is record or _number(other) == number or not isinstance(other.get("body"), str):
-                continue
-            found = PLAN_LINE_RE.search(plan_ledger.visible_body(other["body"]))
-            if found and _same_plan(found.group(1).strip("<>.,"), ref, default_repo or repo):
-                others.append((state_name, other["body"]))
-    return plan_ledger.omitted_claims(scenarios, body, others), "", ref, (pnumber if prepo == repo else None), prepo != repo
+    key = (repo, prepo, pnumber)
+    if key not in counts:   # ONE reading of each body of the plan for the whole pass
+        bodies = []
+        for group in (opened, merged):
+            for other in group:
+                if isinstance(other.get("body"), str):
+                    found = PLAN_LINE_RE.search(plan_ledger.visible_body(other["body"]))
+                    if found and _same_plan(found.group(1).strip("<>.,"), ref, default_repo or repo):
+                        bodies.append(other["body"])
+        counts[key] = plan_ledger.claim_counts(scenarios, bodies)
+    return plan_ledger.omitted_claims(scenarios, body, counts[key]), "", ref, (pnumber if prepo == repo else None), prepo != repo
