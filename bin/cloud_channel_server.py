@@ -155,6 +155,10 @@ def make_server(address, reviewer, inbox, audit, max_handlers=None, *, namespace
                     raise TimeoutError("short body")
             except (TimeoutError, socket.timeout):
                 return self._refuse_early(408, "request timeout", "body timeout")
+            except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
+                self.close_connection = True
+                audit("client had gone during the read")
+                return
             try:
                 body = json.loads(raw.decode("utf-8"))
             except ValueError:
