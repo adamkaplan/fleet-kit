@@ -405,6 +405,78 @@ def _mask_addresses(text):
     return _ADDRESS_RE.sub("[address]", text) if isinstance(text, str) else text
 
 
+import ipaddress  # noqa: E402  (PC-11: the masking below is decided by the standard module)
+MASK_BY_IPADDRESS = True   # PC-11: False goes back to the pattern alone (the test's mutant)
+WINDOW = 200               # a run of address characters longer than this is cut into windows ...
+WINDOW_OVERLAP = 64        # ... that overlap by this many characters: more than the longest address (45) plus a short zone
+SUBSTRING_MAX = 64         # a substring tried is at most this long: at most 64 parses start at one position
+MASK_PASSES = 4
+_RUN_RE = re.compile(r"[0-9A-Fa-f:.]+")
+
+
+def _address_spans(run):
+    """The [start, end) spans of `run` (one window) that `ipaddress.ip_address` accepts: a span starts and ends at the edge of the run or next to a
+    colon or a dot (a `::` is never a separator: `1::2::3` stays whole and unmasked), the longest first from each start, left to right
+    without overlap."""
+    spans, n, i = [], len(run), 0
+    while i < n:
+        if i == 0 or (run[i - 1] in ":." and run[i - 2:i] != "::"):
+            for j in range(min(n, i + SUBSTRING_MAX), i, -1):
+                if j == n or (run[j] in ":." and run[j:j + 2] != "::"):
+                    try:
+                        ipaddress.ip_address(run[i:j])
+                    except ValueError:
+                        continue
+                    spans.append((i, j))
+                    i = j - 1
+                    break
+        i += 1
+    return spans
+
+
+def _mask_pass(text):
+    out, last = [], 0
+    for m in _RUN_RE.finditer(text):
+        run, base, spans = m.group(), m.start(), []
+        if len(run) <= WINDOW:
+            spans = _address_spans(run)
+        else:
+            step = WINDOW - WINDOW_OVERLAP
+            for w in range(0, len(run), step):
+                spans += [(w + a, w + b) for a, b in _address_spans(run[w:w + WINDOW])]
+                if w + WINDOW >= len(run):
+                    break
+        merged = []
+        for a, b in sorted(spans):
+            if merged and a < merged[-1][1]:
+                merged[-1][1] = max(merged[-1][1], b)
+            else:
+                merged.append([a, b])
+        for a, b in merged:
+            out.append(text[last:base + a])
+            out.append("[address]")
+            last = base + b
+    out.append(text[last:])
+    return "".join(out)
+
+
+def _mask_addresses(text):
+    """PC-11, the masking decided by `ipaddress` (this redefines the PC-10 function above, which stays as the pattern alone): every maximal run of
+    address characters (an optional `%zone` stays text) is searched, in windows of 200 that overlap by 64, for substrings that `ipaddress` accepts;
+    a colon that only separates a label or a port is not part of the address; text that does not parse (`1::2::3`) is kept; the pass is repeated
+    (at most 4 times) so that what a longer match left behind is masked too."""
+    if not isinstance(text, str):
+        return text
+    if not (MASK_BY_IPADDRESS and MASK_IPV6):
+        return _ADDRESS_RE.sub("[address]", text)
+    for _ in range(MASK_PASSES):
+        done = _mask_pass(text)
+        if done == text:
+            break
+        text = done
+    return text
+
+
 def _quantity(value, scale):
     """A Kubernetes quantity ('4', '3920m', '8Gi', '16000Ki') as a whole number: `scale` 1000 gives millicores, 1 gives bytes. Unreadable is 0."""
     text = str(value if value is not None else "0")
