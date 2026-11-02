@@ -167,4 +167,46 @@ def build(Base, World, FAKE_OPENCODE, FAKE_HERDR):
             self.assertFalse(found["c5-econnreset"].errored)
             self.assertEqual(found["c5-econnreset"].status, "blocked")
             self.assertEqual(len(calls), 0)
+        def light_zero_calls(self):
+            """Light mode, the blocked c5 agent: the ONE assertion under test is the call count, with its own anchored message."""
+            engine = self.world.engine
+            engine.light = True
+            calls = self.counted()
+            engine.discover(self.world.clock.now())
+            self.assertEqual(len(calls), 0, msg="light guard: v2 reads made under light = %r" % (calls,))
+
+        def test_light_guard_zero_calls_is_isolated_control(self):
+            self.light_zero_calls()   # control: the unmutated guard passes the call count alone (no assertion on `errored`)
+
+        def light_mutant(self, method):
+            """A copy of read_errored_turn with the light guard removed AND the result forced to blocked (errored False), reading only `method`."""
+            def mutant(engine, observation, now):
+                if observation.status != "blocked":
+                    return False
+                getattr(engine.v2, method)(observation.session_id, **({"limit": 1} if method == "message_list" else {}))
+                observation.errored = False
+                return False
+            return mutant
+
+        def check_light_mutant(self, method):
+            self.light_zero_calls()   # control first
+            applied = []
+            real = self.light_mutant(method)
+
+            def mutant(engine, observation, now):
+                applied.append(observation.name if hasattr(observation, "name") else True)
+                return real(engine, observation, now)
+            with mock.patch.object(sb, "read_errored_turn", mutant):
+                with self.assertRaisesRegex(AssertionError, r"^10 != 0 : light guard: v2 reads made under light = \[\('%s'," % method):
+                    self.light_zero_calls()
+            self.assertTrue(applied, "the mutation was not applied")
+
+        def test_light_mutant_guard_removed_with_permission_list_fails_the_call_count(self):
+            self.check_light_mutant("permission_list")
+
+        def test_light_mutant_guard_removed_with_form_list_fails_the_call_count(self):
+            self.check_light_mutant("form_list")
+
+        def test_light_mutant_guard_removed_with_message_list_fails_the_call_count(self):
+            self.check_light_mutant("message_list")
     return TestErroredTurn
