@@ -1161,13 +1161,21 @@ class TestListenBacklog(unittest.TestCase):
                 raise AssertionError("the listen backlog is below the handler cap: %s for caps 32/50/3" % got)
         return got
 
+    def mutation_applied(self, original, changed):
+        return changed != original and self.LINE in original and self.LINE not in changed
+
     def test_s14_backlog_is_never_below_the_handler_cap_and_a_mutant_is_caught(self):
         import cloud_channel_server
         got = self.check(cloud_channel_server)
         src = Path(cloud_channel_server.__file__).read_text()
         self.assertEqual(src.count(self.LINE), 1)
         mut = mutant(cloud_channel_server, self.LINE, "")
-        applied = self.LINE not in Path(cloud_channel_server.__file__).read_text().replace(self.LINE, "")
+        changed = src.replace(self.LINE, "")
+        applied = self.mutation_applied(src, changed)
+        self.assertTrue(applied, "the mutation of S14 was not applied")
+        with self.assertRaises(AssertionError) as noop:   # control of the check: a no-op mutation is not applied
+            self.assertTrue(self.mutation_applied(src, src.replace(self.LINE, self.LINE)), "the mutation of S14 was not applied")
+        self.assertIn("the mutation of S14 was not applied", str(noop.exception))
         text = None
         try:
             self.check(mut)
