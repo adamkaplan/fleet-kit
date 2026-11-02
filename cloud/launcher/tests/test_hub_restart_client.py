@@ -78,7 +78,7 @@ import cloud_client as c, sys
 with open('t','w') as f: f.write('tok')
 ok,line=c.send('a','b','hi',lambda r: {'status':0,'error':'x'},token_path='t',sleep=lambda s: None)
 statuses = [0 if ok else 1]
-print('S3 status %d of %d' % (sum(statuses), len(statuses)))
+print('S3 status %d' % sum(statuses))
 sys.exit(statuses[-1])
 """
 
@@ -166,9 +166,9 @@ class S3Exhausted(Base):
         control, mutated = child(src, SCRIPT_S3), child(mutant, SCRIPT_S3)
         print(control[1].strip(), "| control status", control[0], "|", mutated[1].strip(), "| mutant status", mutated[0])
         self.assertEqual(control[0], 1)
-        self.assertIn("S3 status 1 of 1", control[1])
+        self.assertIn("S3 status 1", control[1])
         self.assertEqual(mutated[0], 0)
-        self.assertIn("S3 status 0 of 1", mutated[1])
+        self.assertIn("S3 status 0", mutated[1])
 
 
 class S4Restart(Base):
@@ -251,8 +251,8 @@ class S10Tries(unittest.TestCase):
         got = self.check_document(text, text)
         sentences = [self.NEW, self.HANG]
         found = [text.count(x) for x in sentences]
-        print("S10: six tries and the window %d of %d, the sentence on a hub that hangs %d of %d, occurrences of up to 3 tries %d"
-              % (found[0], len(sentences[:1]), found[1], len(sentences[1:]), text.count(self.OLD)))
+        print("S10: six tries and the window %d, the sentence on a hub that hangs %d, occurrences of up to 3 tries %d"
+              % (found[0], found[1], text.count(self.OLD)))
         self.assertEqual(got[:2], (True, True))
 
     def test_mutant(self):
