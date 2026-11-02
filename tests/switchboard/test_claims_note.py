@@ -458,10 +458,10 @@ class ScaleChecks:
     def test_s9_the_counts_and_claim_union_note_name_the_same_ids_in_300_of_300_fixtures(self):
         self.counts_match()
 
-    def test_s9_a_mutant_that_keeps_the_bodys_own_cover_fails_beside_its_control(self):
+    def test_s9_a_mutant_that_reads_a_count_of_one_as_no_cover_fails_beside_its_control(self):
         self.counts_match()   # the control
-        old = ' and s.get("id") not in mine]'
-        with self.mutated("omitted_claims", old, "]", where="plan_ledger.py"):   # an id this body claims alone is counted as one nobody else covers
+        old = 'not counts.get(s.get("id"), 0)'
+        with self.mutated("omitted_claims", old, 'counts.get(s.get("id"), 0) <= 1', where="plan_ledger.py"):   # an id that exactly one other body covers is read as covered by nobody
             with self.assertRaisesRegex(AssertionError, r"fixtures with equal id lists, of 300"):
                 self.counts_match()
 
