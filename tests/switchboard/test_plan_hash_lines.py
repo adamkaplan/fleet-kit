@@ -100,13 +100,17 @@ class TestPlanHashLinesWhitespace(unittest.TestCase):
         self.pc = _pl_real("plan_check")
         self.base = _pl_fixture("plan_14.md")
 
-    def test_the_four_ignored_forms_give_one_hash(self):
+    def check(self, pc):
+        """The one check (S3), run on the control and on the mutant."""
         lines = self.base.split("\n")
         forms = [self.base,
                  "\n".join(l + ("  \t" if l.strip() else "") for l in lines),
                  self.base.replace("\n", "\r\n"),
                  "\n\n\n" + self.base + "\n\n"]
-        self.assertEqual(len({self.pc.plan_hash(f) for f in forms}), 1)
+        self.assertEqual(len({pc.plan_hash(f) for f in forms}), 1, "the four ignored forms give 1 hash")
+
+    def test_the_four_ignored_forms_give_one_hash(self):
+        self.check(self.pc)
 
     def test_the_four_changed_forms_give_four_other_hashes(self):
         base = self.base
@@ -123,7 +127,9 @@ class TestPlanHashLinesWhitespace(unittest.TestCase):
     def test_a_rule_that_keeps_all_whitespace_is_not_this_rule(self):
         pc = _pl_mutate("plan_check", '    lines = [l.rstrip(" \\t") for l in text.replace("\\r\\n", "\\n").split("\\n")]\n',
                         '    lines = text.split("\\n")\n')
-        self.assertNotEqual(pc.plan_hash(self.base), pc.plan_hash(self.base.replace("\n", "\r\n")))
+        self.check(self.pc)
+        with self.assertRaisesRegex(AssertionError, "the four ignored forms give 1 hash"):
+            self.check(pc)
 
 
 class TestPlanHashLinesVariants(unittest.TestCase):
