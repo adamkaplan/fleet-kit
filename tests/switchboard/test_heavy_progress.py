@@ -42,7 +42,7 @@ class Out:
 class Rig:
     """run() with a fake slot (or a busy one), a fake child alive `alive` fake seconds and a fake pause for the progress thread."""
 
-    def __init__(self, case, alive=0, status=0, busy=False, wait_max=1800, command=None, env=None, silent=False, table_raises=False, slow_exit=False):
+    def __init__(self, case, alive=0, status=0, busy=False, wait_max=1800, command=None, env=None, table_raises=False, slow_exit=False, slow_read=False):
         self.hs = load_heavy()
         self.started = threading.Event()
         self.now = [1000.0]
@@ -59,6 +59,9 @@ class Rig:
                 rig.began.append(rig.now[0])
 
             def wait(child):
+                if alive and os.environ.get("FLEET_TEST_SELFCLOCK") and not rig.started.wait(2):   # S12's copy has no progress thread: the fake child runs on its own clock
+                    rig.now[0] = rig.began[0] + alive
+                    return status
                 if alive and os.environ.get("FLEET_TEST_INNER") and not rig.started.wait(5):   # a guard against a hang, not a measure
                     raise AssertionError("the progress thread did not start within 5 s")
                 if alive and not rig.done.wait(30):
@@ -77,10 +80,6 @@ class Rig:
                 if slow_exit:
                     time.sleep(0.3)   # the thread is slow to end: only a join makes the wrapper wait for it
 
-        def silent_loop(pid, program, interval, stop, out, clock, began):
-            rig.now[0] = rig.began[0] + alive   # the mutant: no line at all
-            rig.done.set()
-
         def take(state, slots):
             if busy:
                 return None, None
@@ -95,8 +94,14 @@ class Rig:
                    mock.patch.object(self.hs.subprocess, "Popen", FakeChild), mock.patch.object(self.hs, "_own_start", lambda: ""), mock.patch.object(self.hs, "_start_of", lambda pid: ""),
                    mock.patch.object(self.hs, "_progress_pause", pause), mock.patch.object(self.hs, "_progress_started", self.started, create=True),
                    mock.patch.object(self.hs, "_resolve", lambda command, environ: "/bin/true")]
-        if silent:
-            patches.append(mock.patch.object(self.hs, "_progress_loop", silent_loop))
+        self.entered, self.release = threading.Event(), threading.Event()
+        if slow_read:
+            def slow(pid):
+                self.entered.set()
+                self.done.set()   # the fake child ends while the read is blocked
+                self.release.wait(30)   # blocks until the test releases it after the return
+                return None
+            patches.append(mock.patch.object(self.hs, "_child_cpu_seconds", slow))
         if table_raises:
             def broken(pid):
                 self.done.set()   # the thread ends on this read: the fake child ends with it
@@ -141,23 +146,64 @@ class TestHeavyProgress(unittest.TestCase):
         self.assertEqual(len([l for l in text if l.startswith("heavy: waiting for a slot")]), 3, text)
         self.assertEqual(rig.progress(), [])
 
-    def _s4(self, silent):
-        rig = Rig(self, alive=900, status=7, silent=silent)
+    def _s4(self):
+        rig = Rig(self, alive=900, status=7)
         gap = rig.longest_gap(rig.began[0] + 900)
         self.assertEqual(rig.status, 7)
         self.assertLessEqual(gap, 60, "the wrapper was silent for %d s" % gap)
         return rig, gap
 
     def test_s4_a_child_silent_for_900_seconds_never_leaves_the_wrapper_silent_for_more_than_60(self):
-        rig, gap = self._s4(False)
+        rig, gap = self._s4()
         self.assertEqual((len(rig.progress()), gap), (15, 60))
 
-    def test_s5_a_mutant_that_waits_silently_fails_with_the_anchored_text_and_the_control_passes(self):
-        rig, gap = self._s4(False)   # the control passes
-        self.assertEqual(gap, 60)
-        with self.assertRaises(AssertionError) as caught:
-            self._s4(True)
-        self.assertIn("the wrapper was silent for 900 s", str(caught.exception))
+    def _scratch(self, replacements, inner, extra_env=None):
+        """Run the inner test against scratch copies of bin/heavy_slots.py outside the repository: the control (unchanged) and the mutant (replacements applied)."""
+        source = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "bin", "heavy_slots.py")
+        text = open(source).read()
+        mutant = text
+        for old, new in replacements:
+            self.assertEqual(text.count(old), 1, old)
+            mutant = mutant.replace(old, new)
+        here = os.path.dirname(os.path.abspath(__file__))
+        results = {}
+        with tempfile.TemporaryDirectory() as scratch:
+            for kind, body in (("control", text), ("mutant", mutant)):
+                path = os.path.join(scratch, kind + "_heavy_slots.py")
+                self.assertFalse(os.path.abspath(path).startswith(os.path.abspath(os.path.join(here, "..", ".."))))
+                with open(path, "w") as handle:
+                    handle.write(body)
+                env = dict(os.environ, FLEET_TEST_HEAVY_SLOTS=path, FLEET_TEST_INNER="1", **(extra_env or {}))
+                results[kind] = subprocess.run([sys.executable, __file__, "TestHeavyProgress." + inner], cwd=here, env=env,
+                                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True, timeout=300)
+        return results
+
+    def test_s12_inner_s4_on_a_copy_without_the_progress_thread(self):
+        if not os.environ.get("FLEET_TEST_INNER"):
+            self.skipTest("run by test_s12 in a child process")
+        self._s4()
+
+    def test_s12_a_copy_without_the_progress_thread_fails_with_the_anchored_text_and_the_control_passes_first(self):
+        results = self._scratch([("progress_thread.start()", "pass")], "test_s12_inner_s4_on_a_copy_without_the_progress_thread", {"FLEET_TEST_SELFCLOCK": "1"})
+        self.assertEqual(results["control"].returncode, 0, results["control"].stdout)
+        self.assertEqual(results["mutant"].returncode, 1, results["mutant"].stdout)
+        self.assertIn("the wrapper was silent for 900 s", results["mutant"].stdout)
+
+    def test_s11_inner_a_slow_read_writes_nothing_after_the_return(self):
+        if not os.environ.get("FLEET_TEST_INNER"):
+            self.skipTest("run by test_s11 in a child process")
+        rig = Rig(self, alive=100, slow_read=True)
+        self.assertTrue(rig.entered.is_set())
+        lines = len(rig.out.lines)
+        rig.release.set()   # the read ends after the wrapper returned
+        time.sleep(0.5)
+        self.assertEqual(len(rig.out.lines) - lines, 0, "a line was written after the wrapper returned")
+
+    def test_s11_a_read_that_outlasts_the_join_writes_no_line_after_the_return(self):
+        results = self._scratch([("# stopped after the read", "if False:  # mutant")], "test_s11_inner_a_slow_read_writes_nothing_after_the_return")
+        self.assertEqual(results["control"].returncode, 0, results["control"].stdout)
+        self.assertEqual(results["mutant"].returncode, 1, results["mutant"].stdout)
+        self.assertIn("a line was written after the wrapper returned", results["mutant"].stdout)
 
     def test_s9_no_line_and_no_thread_is_left_after_the_wrapper_returned(self):
         before = threading.active_count()
@@ -173,7 +219,7 @@ class TestHeavyProgress(unittest.TestCase):
     def test_s10_inner_s4_with_the_thread_start_awaited(self):
         if not os.environ.get("FLEET_TEST_INNER"):
             self.skipTest("run by test_s10 in a child process")
-        self._s4(False)
+        self._s4()
 
     def test_s10_a_thread_that_never_starts_fails_by_a_named_text_and_the_control_passes_first(self):
         source = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "bin", "heavy_slots.py")
