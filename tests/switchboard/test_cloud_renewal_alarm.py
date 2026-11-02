@@ -560,7 +560,9 @@ def s25(module):
         assert os.path.exists(os.path.join(w.dir, module.STATE_FILE)), "the state was not written"
         w.send = real
         w.tick(T0 + 5)
-        assert w.messages == [], w.messages
+        assert len(w.messages) == 2 and len(w.to("lane-a")) == 1 and len(w.to("cos-1")) == 1, w.messages   # exactly one alarm per recipient at this tick
+        w.tick(T0 + 10)
+        assert len(w.messages) == 2, w.messages   # and nothing at the tick after
         print("S25: audit entries %d, state written 1, exceptions raised %d, further sends %d" % (len(w.entries), raised, len(w.messages)))
     finally:
         w.close()
