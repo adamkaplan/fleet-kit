@@ -2516,7 +2516,7 @@ class Launcher:
         try:
             for node in self.kube.list_nodes():
                 alloc = (node.get("status") or {}).get("allocatable") or {}
-                out["nodes"].append({"name": self.kube.scrub((node.get("metadata") or {}).get("name"), 100),
+                out["nodes"].append({"name": self.kube.scrub(_mask_addresses((node.get("metadata") or {}).get("name")), 100),
                                      "cpu_m": _quantity(alloc.get("cpu"), 1000), "memory_b": _quantity(alloc.get("memory"), 1)})
         except CloudError as e:
             out["nodes"], out["nodes_read"], out["nodes_error"] = [], False, self.kube.scrub(e, 120)
@@ -2527,7 +2527,7 @@ class Launcher:
                 pending += phase == "Pending"
                 node = (pod.get("spec") or {}).get("nodeName")
                 if node and phase not in ("Succeeded", "Failed"):
-                    mine = out["requests"].setdefault(self.kube.scrub(node, 100), {"cpu_m": 0, "memory_b": 0})
+                    mine = out["requests"].setdefault(self.kube.scrub(_mask_addresses(node), 100), {"cpu_m": 0, "memory_b": 0})
                     for c in (pod.get("spec") or {}).get("containers") or []:
                         req = ((c.get("resources") or {}).get("requests")) or {}
                         mine["cpu_m"] += _quantity(req.get("cpu"), 1000)
@@ -2542,7 +2542,7 @@ class Launcher:
                     return str(ev.get("lastTimestamp") or ev.get("eventTime") or (ev.get("metadata") or {}).get("creationTimestamp") or "")
                 last = max(events, key=when)
                 who = (last.get("involvedObject") or {}).get("name")
-                out["last_event"] = self.kube.scrub("FailedScheduling %s%s" % (who + ": " if who else "", last.get("message") or ""), 200)[:200]
+                out["last_event"] = self.kube.scrub("FailedScheduling %s%s" % (_mask_addresses(who) + ": " if who else "", _mask_addresses(last.get("message") or "")), 200)[:200]
         except CloudError as e:
             out["events_read"], out["events_error"] = False, self.kube.scrub(e, 120)
         # PC-10: after the one scrub, every name and the event line lose an address of the three forms
