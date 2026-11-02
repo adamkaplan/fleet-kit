@@ -3,7 +3,9 @@
 The fixtures are those of bin/test-switchboard (HOST is that module, set by its loader block): the plan wake world, with a routing hub whose
 `route_of` is the real one. Neutral names (acme/api). The mutants patch one function and must fail the very checks the real code passes.
 """
+import contextlib
 import json
+import random
 import re
 import sys
 import types
@@ -348,7 +350,155 @@ class TestClaimsNoteText(ClaimsNoteBase):
         self.assertNotIn(key, fx.engine.claims_note.announced)
 
 
-class TestClaimsNoteMutants(ClaimsNoteBase):
+class ScaleChecks:
+    """(mixed into TestClaimsNoteMutants, whose loader line is the one registered) S8, S9, S10 of #1716: the pass counts the claims of a plan once; the readings are counted in the namespace the code calls."""
+
+    def held(self, fx, n):
+        for i in range(n):
+            self.pull(fx, 100 + i, LINK + "CLAIMS: S1")   # every body omits S2, S3 and U1
+        with mock.patch.object(self.sb, "claims_note_pass", lambda *a: None):
+            fx.go()
+
+    def one_pass(self, fx):
+        self.sb.claims_note_pass(fx.engine, fx.engine.triage, ["acme/api"], fx.world.clock.now())
+
+    def sent(self, fx):
+        return len([e for e in fx.world.audit() if e["event"] == "claims_note.sent"])
+
+    def errors(self, fx):
+        return len([e for e in fx.world.audit() if e["event"] == "claims_note.error"])
+
+    def readings(self, fx):
+        """The readings of a body (calls of pr_scenarios) in one pass, counted in the namespace the code calls: plan_ledger is a proxy to it."""
+        namespace, calls = self.sb.plan_ledger.omitted_claims.__globals__, []
+        real = namespace["pr_scenarios"]
+        namespace["pr_scenarios"] = lambda *a, **k: (calls.append(1), real(*a, **k))[1]
+        try:
+            self.one_pass(fx)
+        finally:
+            namespace["pr_scenarios"] = real
+        return len(calls)
+
+    def scale_checks(self, sizes):
+        done = {}
+        for n in sizes:
+            fx = self.world()
+            self.held(fx, n)
+            first = self.readings(fx)
+            self.assertLessEqual(first, 3 * n, "readings per body at N=%d" % n)
+            self.assertEqual(self.sent(fx), n, "notices sent at N=%d" % n)
+            self.assertEqual((self.readings(fx), self.sent(fx)), (0, n), "second pass readings and notices at N=%d" % n)
+            done[n] = first
+        if len(done) == 2:
+            self.assertEqual(done[1000], 5 * done[200], "ratio of readings for a ratio of 5 in size")
+
+    @contextlib.contextmanager
+    def mutated(self, name, old, new, where=None):
+        """The function `name` again from a SOURCE COPY with `old` replaced by `new` (asserted found exactly once), bound in its own namespace, restored afterwards."""
+        path = REPO / "bin" / ("switchboard/claims_note.py" if where is None else where)
+        src = path.read_text()
+        start = src.index("def %s(" % name)
+        body = src[start:src.index("\n\n\ndef ", start)] if "\n\n\ndef " in src[start:] else src[start:]
+        self.assertEqual(body.count(old), 1, "the mutation is applied exactly once")
+        namespace = (self.sb.plan_ledger.omitted_claims if where else self.sb.claims_note_pass).__globals__
+        original = namespace[name]
+        exec(body.replace(old, new), namespace)
+        try:
+            yield
+        finally:
+            namespace[name] = original
+
+    def test_s8_a_pass_reads_each_body_at_most_three_times_sends_every_notice_and_a_second_pass_reads_none(self):
+        self.scale_checks((200, 1000))
+
+    def test_s8_a_mutant_that_reads_the_others_again_for_each_examination_fails_beside_its_control(self):
+        self.scale_checks((200,))   # the control
+        with self.mutated("claims_note_ids", "return plan_ledger.omitted_claims(scenarios, body, counts[key])",
+                          "return (lambda _: plan_ledger.omitted_claims(scenarios, body, counts[key]))([plan_ledger.covered_ids(scenarios, [o['body']]) for g in (opened, merged) for o in g if o is not record and isinstance(o.get('body'), str)])"):
+            with self.assertRaisesRegex(AssertionError, r"readings per body at N=200"):
+                self.scale_checks((200,))
+
+    def test_s8_a_mutant_that_builds_the_counts_for_each_examination_fails_beside_its_control(self):
+        self.scale_checks((200,))   # the control
+        with self.mutated("claims_note_ids", "if key not in counts:", "if True:"):
+            with self.assertRaisesRegex(AssertionError, r"readings per body at N=200"):
+                self.scale_checks((200,))
+
+    def fixtures(self):
+        rng, out = random.Random(1716), []
+        for _ in range(300):
+            ids = ["S%d" % i for i in range(1, rng.randint(3, 8) + 1)]
+            scenarios = [{"id": i, "claim": "pr"} for i in ids] + [{"id": "E1", "claim": "epic"}]
+            def body():
+                kind = rng.choice(("none", "refused", "full", "partial", "partial", "same"))
+                if kind == "none":
+                    return "PLAN: acme/api#3"
+                if kind == "refused":
+                    return "PLAN: acme/api#3\nCLAIMS: S99"
+                if kind == "full":
+                    return "PLAN: acme/api#3\nCLAIMS: " + " ".join(ids)
+                return "PLAN: acme/api#3\nCLAIMS: " + " ".join(rng.sample(ids, rng.randint(1, len(ids)) if kind == "partial" else 1))
+            mine = body()
+            others = [body() for _ in range(rng.randint(0, 6))]
+            if others and rng.random() < 0.3:
+                others[0] = mine   # a body that covers the same ids as another
+            out.append((scenarios, mine, others))
+        return out
+
+    def counts_match(self):
+        ledger, wrong = self.sb.plan_ledger, 0
+        for scenarios, mine, others in self.fixtures():
+            named = ledger.omitted_claims(scenarios, mine, ledger.claim_counts(scenarios, [mine] + others))
+            _, left, error = ledger.pr_scenarios(scenarios, mine)   # as claim_union_note reads them
+            covered = ledger.covered_ids(scenarios, others)
+            expected = [] if error or not left else [x["id"] for x in left if x["id"] not in covered]
+            wrong += named != expected
+        self.assertEqual(300 - wrong, 300, "fixtures with equal id lists, of 300")
+
+    def test_s9_the_counts_and_claim_union_note_name_the_same_ids_in_300_of_300_fixtures(self):
+        self.counts_match()
+
+    def test_s9_a_mutant_that_keeps_the_bodys_own_cover_fails_beside_its_control(self):
+        self.counts_match()   # the control
+        old = ' and s.get("id") not in mine]'
+        with self.mutated("omitted_claims", old, "]", where="plan_ledger.py"):   # an id this body claims alone is counted as one nobody else covers
+            with self.assertRaisesRegex(AssertionError, r"fixtures with equal id lists, of 300"):
+                self.counts_match()
+
+    def corrupt_checks(self, restart):
+        fx = self.world()
+        self.held(fx, 30)
+        target = Path(fx.engine.state_dir) / self.sb.CLAIMS_NOTE_FILE
+        target.write_text("\x00garbage{{{")
+        fx.engine.claims_note = None
+        seen = []
+        for number in (1, 2, 3):
+            if restart:
+                fx.engine.claims_note = None
+            before = self.sent(fx)
+            self.one_pass(fx)
+            seen.append(self.sent(fx) - before)
+            if number == 1:
+                try:
+                    valid = "announced" in json.loads(target.read_text())
+                except ValueError:
+                    valid = False
+                self.assertTrue(valid, "the file is valid after the first pass")
+        self.assertEqual(seen, [30, 0, 0], "notices in the 3 passes")
+        self.assertEqual(self.errors(fx), 1, "claims_note.error lines")
+
+    def test_s10_a_corrupt_file_is_audited_once_and_30_notices_go_once_on_one_engine_and_with_restarts(self):
+        self.corrupt_checks(False)
+        self.corrupt_checks(True)
+
+    def test_s10_a_mutant_that_does_not_rewrite_the_file_after_a_corrupt_read_fails_beside_its_control(self):
+        self.corrupt_checks(True)   # the control
+        with self.mutated("claims_note_pass", "if sent or old:", "if (sent or old) and not note.problem:"):
+            with self.assertRaisesRegex(AssertionError, r"the file is valid after the first pass"):
+                self.corrupt_checks(True)
+
+
+class TestClaimsNoteMutants(ScaleChecks, ClaimsNoteBase):
     """S5: each mutant is applied (asserted), caught by the checks the real code passes, and the unmutated control passes the same checks."""
 
     def checks(self, fx):
