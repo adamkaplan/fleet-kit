@@ -211,7 +211,7 @@ FILE_HASH = re.compile(r"^[0-9a-f]{64}$")
 REASON_LIMIT = 300
 
 
-class ApplyRefused(Exception):
+class PlanApplyRefused(Exception):
     """A run that is refused before anything was written: (exit status, one line)."""
 
     def __init__(self, line, code=2):
@@ -223,12 +223,12 @@ def standard_form_text():
     return "\n".join(STANDARD_FORM)
 
 
-def short(text):
+def hash8(text):
     return str(text).replace("sha256:", "")[:8]
 
 
 def parse_pairs(text):
-    """([(old, new)], why) from an edit file in the standard form. Raises ApplyRefused naming what is wrong."""
+    """([(old, new)], why) from an edit file in the standard form. Raises PlanApplyRefused naming what is wrong."""
     marks = []
     lines = text.split("\n")
     for number, line in enumerate(lines):
@@ -237,8 +237,8 @@ def parse_pairs(text):
             marks.append((number, found.group(1), int(found.group(2))))
     if not marks:
         if OTHER_FORMS.search(text):
-            raise ApplyRefused("the file is not in the standard form:\n" + standard_form_text(), 1)
-        raise ApplyRefused("the file has no pair: it needs `===== OLD 1 (verbatim) =====` and `===== NEW 1 (verbatim) =====` headers", 1)
+            raise PlanApplyRefused("the file is not in the standard form:\n" + standard_form_text(), 1)
+        raise PlanApplyRefused("the file has no pair: it needs `===== OLD 1 (verbatim) =====` and `===== NEW 1 (verbatim) =====` headers", 1)
     texts = []
     for index, (number, kind, n) in enumerate(marks):
         end = marks[index + 1][0] if index + 1 < len(marks) else len(lines)
@@ -249,9 +249,9 @@ def parse_pairs(text):
         old_mark = marks[index]
         new_mark = marks[index + 1] if index + 1 < len(marks) else None
         if old_mark[1] != "OLD" or old_mark[2] != want:
-            raise ApplyRefused("the pair numbers must run 1, 2, 3 in order: found %s %d where OLD %d was expected" % (old_mark[1], old_mark[2], want), 1)
+            raise PlanApplyRefused("the pair numbers must run 1, 2, 3 in order: found %s %d where OLD %d was expected" % (old_mark[1], old_mark[2], want), 1)
         if new_mark is None or new_mark[1] != "NEW" or new_mark[2] != want:
-            raise ApplyRefused("OLD %d has no NEW %d after it" % (want, want), 1)
+            raise PlanApplyRefused("OLD %d has no NEW %d after it" % (want, want), 1)
         pairs.append([texts[index], texts[index + 1]])
     why, last = "", pairs[-1][1]
     cut = last.rfind("\n\nWhy:")
@@ -261,26 +261,26 @@ def parse_pairs(text):
         pairs[-1][1], why = "", last
     for number, (old, new) in enumerate(pairs, 1):
         if not old:
-            raise ApplyRefused("OLD %d is empty: it must name the text it replaces" % number, 1)
+            raise PlanApplyRefused("OLD %d is empty: it must name the text it replaces" % number, 1)
     return [(old, new) for old, new in pairs], " ".join(why.split())
 
 
 def expect_live(have, want):
     if have != want:
-        raise ApplyRefused("plan apply: refused: --expect-live: the live plan hash is %s and not %s" % (short(have), short(want)))
+        raise PlanApplyRefused("plan apply: refused: --expect-live: the live plan hash is %s and not %s" % (hash8(have), hash8(want)))
 
 
 def expect_file(have, want):
     if have != want:
-        raise ApplyRefused("plan apply: refused: --expect-file: the file's sha256 is %s and not %s" % (have[:8], want[:8]))
+        raise PlanApplyRefused("plan apply: refused: --expect-file: the file's sha256 is %s and not %s" % (have[:8], want[:8]))
 
 
 def apply_pairs(text, pairs):
-    """The text after every pair, each OLD found exactly once in the text as the previous pairs left it. Raises ApplyRefused."""
+    """The text after every pair, each OLD found exactly once in the text as the previous pairs left it. Raises PlanApplyRefused."""
     for number, (old, new) in enumerate(pairs, 1):
         count = text.count(old)
         if count != 1:
-            raise ApplyRefused("plan apply: refused: OLD %d occurs %d times at its turn: it must occur once" % (number, count))
+            raise PlanApplyRefused("plan apply: refused: OLD %d occurs %d times at its turn: it must occur once" % (number, count))
         text = text.replace(old, new)
     return text
 
@@ -298,7 +298,7 @@ def parse_ref(text, home_repo):
     found = REF.match((text or "").strip())
     repo = found.group(1) if found and found.group(1) else home_repo
     if not found or not repo:
-        raise ApplyRefused("the issue is not owner/repo#N, an issue URL, or N: %s" % one_line(text, 80), 1)
+        raise PlanApplyRefused("the issue is not owner/repo#N, an issue URL, or N: %s" % one_line(text, 80), 1)
     return repo, int(found.group(2))
 
 
@@ -317,20 +317,20 @@ def read_comments(api, repo, number):
 def pick_plan(comments):
     """The one plan comment as plan_check selects it (a second plan-looking comment is refused)."""
     if any(d["code"] == "second-plan-comment" for d in plan_check.plan_comment_defects(comments)):
-        raise ApplyRefused("plan apply: refused: the issue has a second comment that looks like a plan: a plan is one comment", 1)
+        raise PlanApplyRefused("plan apply: refused: the issue has a second comment that looks like a plan: a plan is one comment", 1)
     text, source = plan_check.select_plan_text("", comments)
     found = SOURCE_ID.match(source)
     chosen = next((c for c in comments if found and str(c.get("id")) == found.group(1)), None)
     if chosen is None:
-        raise ApplyRefused("plan apply: refused: the issue has no plan comment", 1)
+        raise PlanApplyRefused("plan apply: refused: the issue has no plan comment", 1)
     return chosen
 
 
-def declared(text):
+def declared_clauses(text):
     try:
         return plan_check.declared_clauses(text)
     except plan_check.PlanFormatError as err:
-        raise ApplyRefused("plan apply: refused: the plan's clauses cannot be read: %s" % one_line(err, 150), 1) from None
+        raise PlanApplyRefused("plan apply: refused: the plan's clauses cannot be read: %s" % one_line(err, 150), 1) from None
 
 
 def receipt_text(name, file_sha, count, why, old_hash, new_hash, caller, checked="pass"):
@@ -356,13 +356,13 @@ def apply_run(args, caller, api, state_dir, audit):
         for flag, value, shape in (("--expect-live", args.expect_live, FULL_HASH), ("--expect-result", args.expect_result, FULL_HASH),
                                    ("--expect-file", args.expect_file, FILE_HASH)):
             if not shape.match(value or ""):
-                raise ApplyRefused("plan apply: refused: %s must be the full hash (%s)" % (flag, "sha256:<64 hex>" if shape is FULL_HASH else "64 hex"), 1)
+                raise PlanApplyRefused("plan apply: refused: %s must be the full hash (%s)" % (flag, "sha256:<64 hex>" if shape is FULL_HASH else "64 hex"), 1)
         try:
             with open(args.file, "rb") as handle:
                 raw = handle.read()
             text = raw.decode("utf-8")
         except (OSError, UnicodeDecodeError) as err:
-            raise ApplyRefused("plan apply: the file cannot be read: %s" % one_line(getattr(err, "strerror", None) or err, 150), 1) from None
+            raise PlanApplyRefused("plan apply: the file cannot be read: %s" % one_line(getattr(err, "strerror", None) or err, 150), 1) from None
         file_sha = hashlib.sha256(raw).hexdigest()
         pairs, why = parse_pairs(text)
         out.extend(describe(pairs))
@@ -370,11 +370,11 @@ def apply_run(args, caller, api, state_dir, audit):
         try:
             comments = read_comments(api, repo, number)
         except Exception as err:
-            raise ApplyRefused("plan apply: the plan comment cannot be read: %s" % one_line(err, 150), 1) from None
+            raise PlanApplyRefused("plan apply: the plan comment cannot be read: %s" % one_line(err, 150), 1) from None
         plan = pick_plan(comments)
         live = plan["body"]
         if marked_name(live) != caller:
-            raise ApplyRefused("plan apply: refused: the plan comment is signed %s, you are %s" % (marked_name(live) or "by no lane", caller))
+            raise PlanApplyRefused("plan apply: refused: the plan comment is signed %s, you are %s" % (marked_name(live) or "by no lane", caller))
         old_hash = plan_check.plan_hash(live)
         expect_live(old_hash, args.expect_live)
         expect_file(file_sha, args.expect_file)
@@ -382,19 +382,19 @@ def apply_run(args, caller, api, state_dir, audit):
         result = MARKER.sub("", result).rstrip() + "\n\n" + mark_line(caller)
         new_hash = plan_check.plan_hash(result)
         if new_hash != args.expect_result:
-            raise ApplyRefused("plan apply: refused: --expect-result: the result's plan hash is %s and not %s" % (short(new_hash), short(args.expect_result)))
-        if declared(live) != declared(result):
-            raise ApplyRefused("plan apply: refused: the clauses: block of the result differs from the live one (the Done-when copy is the ask's: never edited)")
+            raise PlanApplyRefused("plan apply: refused: --expect-result: the result's plan hash is %s and not %s" % (hash8(new_hash), hash8(args.expect_result)))
+        if declared_clauses(live) != declared_clauses(result):
+            raise PlanApplyRefused("plan apply: refused: the clauses: block of the result differs from the live one (the Done-when copy is the ask's: never edited)")
         approval = next(iter(approval_ids(plan, comments, _audit_tail(state_dir))), None)
         url = "https://github.com/%s/issues/%d#issuecomment-%s" % (repo, number, plan["id"])
         audited = (lambda subject, detail: audit.external("cli", "github.comment", subject, detail)) if audit is not None else None
         try:
             edit_in_place(reader, caller, url, result, approval, lambda: _audit_tail(state_dir), audited, mark_line, getattr(reader, "repo", repo))
         except CommentEditRefused as err:
-            raise ApplyRefused("plan apply: refused: %s" % one_line(err, 300), 1) from None
+            raise PlanApplyRefused("plan apply: refused: %s" % one_line(err, 300), 1) from None
         except CommentEditFailed as err:
-            raise ApplyRefused("plan apply: the patch failed, nothing is changed: %s" % one_line(err.detail, 300), 1) from None
-    except ApplyRefused as err:
+            raise PlanApplyRefused("plan apply: the patch failed, nothing is changed: %s" % one_line(err.detail, 300), 1) from None
+    except PlanApplyRefused as err:
         return err.code, err.line
     changed = None
     try:
@@ -404,7 +404,7 @@ def apply_run(args, caller, api, state_dir, audit):
         changed = None
     if changed != result:
         return 1, "plan apply: the plan comment was patched but reading it back differs from the result: live hash %s" % (plan_check.plan_hash(changed) if isinstance(changed, str) else "unknown")
-    done_when = " ".join("(%d) %s" % (i, c) for i, c in enumerate(declared(changed) or [], 1))
+    done_when = " ".join("(%d) %s" % (i, c) for i, c in enumerate(declared_clauses(changed) or [], 1))
     try:
         checked = plan_check.check(changed, done_when or None)["result"]
     except plan_check.PlanFormatError:
