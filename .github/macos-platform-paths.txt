@@ -30,6 +30,10 @@ bin/guard_alert.py
 # spotlight_guard builds an mdfind command and branches on sys.platform
 bin/spotlight_guard.py
 
+# group: cloud-launcher-chain
+# the launcher test driver, its chain list and its parallel list: do not remove: these files decide the macOS leg's time
+bin/test-cloud-launcher*
+
 # group: workflow
 .github/workflows/**
 .github/macos-platform-paths.txt
