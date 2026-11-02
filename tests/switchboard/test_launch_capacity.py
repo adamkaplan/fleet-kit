@@ -650,13 +650,20 @@ for text in NON_ADDRESSES:
     assert not accepted(text), text    # the planted non-addresses are checked with ipaddress on the planted text
 def planted(form):
     return form.split("%")[0]
+def glue(form):
+    # PC-13: 1 to 5 hex letters before and 1 to 3 after the address, now and then (no letters after a zone: they would be part of the zone)
+    if rng.random() < 0.4:
+        form = "".join(rng.choice("abcdefABCDEF") for _ in range(rng.randint(1, 5))) + form
+    if rng.random() < 0.4 and "%" not in form:
+        form += "".join(rng.choice("abcdefABCDEF") for _ in range(rng.randint(1, 3)))
+    return form
 for _ in range(20000):
     # the oracle knows where it planted each address: every planted address is gone from the output, every planted non-address is unchanged
     line, put = rng.choice(labels), []
-    form = address(); put.append(planted(form)); line += form + rng.choice(tails)
+    form = address(); put.append(planted(form)); line += glue(form) + rng.choice(tails)
     if rng.random() < 0.3:
         line += " " + rng.choice(labels)
-        form = address(); put.append(planted(form)); line += form + rng.choice(tails)
+        form = address(); put.append(planted(form)); line += glue(form) + rng.choice(tails)
     keep = rng.sample(NON_ADDRESSES, rng.randint(0, 2))
     for text in keep:
         line += " " + text
@@ -772,6 +779,35 @@ for line, want in (("host:::1", "host:[address]"), ("host:::fd00:db8:fd00,", "ho
             code, err, out = self.pc11_run(self.PC11_U25, ("cloud/launcher/cloud_worker.py", "key=lambda s: (s[0] - s[1], s[0])", "key=lambda s: (s[0], s[0] - s[1])"))
             self.assertEqual(code, 1, err)
             self.assertIn("a shorter parse took the place of a longer one", err)
+
+        PC11_U26 = r"""
+for line, planted, want in (("Added10.0.0.1", "10.0.0.1", "Added[address]"), ("dead10.0.0.1 x", "10.0.0.1", "dead[address] x"), ("a10.0.0.1", "10.0.0.1", "a[address]"),
+                            ("node-a1.2.3.4", "1.2.3.4", "node-a[address]"), ("bad10.0.0.1:80", "10.0.0.1", "bad[address]:80"), ("abcfd00::1", "fd00::1", "abc[address]"),
+                            ("10.0.0.1abc", "10.0.0.1", "[address]abc")):
+    assert accepted(planted), planted    # checked with ipaddress on the PLANTED text
+    out = lib._mask_addresses(line)
+    if planted in out or out != want:
+        sys.exit("an address glued to letters was left: %r gave %r, wanted %r" % (line, out, want))
+for text in ("12:30:45", "aa:bb:cc:dd:ee:ff", "1::2::3", "x::1::2", "0123456789abcdef0123456789abcdef01234567", "123e4567-e89b-12d3-a456-426614174000"):
+    assert not accepted(text), text
+    if lib._mask_addresses(text) != text:
+        sys.exit("a non-address was masked: %r gave %r" % (text, lib._mask_addresses(text)))
+"""
+
+        def test_u26_an_address_glued_to_letters_is_gone_and_the_letters_are_kept(self):
+            code, err, out = self.pc11_run(self.PC11_U26)
+            self.assertEqual((code, err), (0, ""))
+
+        def test_u26_the_control_passes_and_a_mutant_starting_only_at_the_edges_fails_with_the_text(self):
+            code, err, out = self.pc11_run(self.PC11_U26)
+            self.assertEqual((code, err), (0, ""))
+            code, err, out = self.pc11_run(self.PC11_U26, ("cloud/launcher/cloud_worker.py", "        if True:  # a candidate starts at any position (PC-13)\n",
+                                                           "        if i == 0 or (run[i - 1] in \":.\" and run[i - 2:i] != \"::\"):\n"))
+            self.assertEqual(code, 1, err)
+            self.assertIn("an address glued to letters was left", err)
+
+        def test_u26_the_generated_lines_hold_glued_letters_and_leave_no_address(self):
+            self.assertIn("glue(form)", self.PC11_U21)
 
         def pc11_run(self, script, mutate=None):
             import shutil, subprocess, tempfile
