@@ -5875,7 +5875,7 @@ def undecidable_streak(engine, name, agent, states, passes):
     (`states[name]["undecidable"]`, kept and reset as the missing-pass counters are); the audit line `pane.undecidable` is written ONCE, when the
     streak reaches PANE_MISSING_PASSES. Any other pass (a session id, the pane gone, a decision) clears it. True when the pass answered unknown."""
     record = states.get(name)
-    if passes >= PANE_MISSING_PASSES and pane_undecidable(engine, name, agent):
+    if passes >= PANE_MISSING_PASSES and not load_module("registry").no_pane_to_judge(agent) and pane_undecidable(engine, name, agent):
         if not isinstance(record, dict):
             record = states[name] = {"state": PANE_UNKNOWN, "why": "listed pane with no recorded session", "pane": agent.get("pane"), "session": None, "at": 0}
         record["undecidable"] = int(record.get("undecidable") or 0) + 1
