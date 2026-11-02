@@ -793,7 +793,7 @@ for line, want in (("host:::1", "host:[address]"), ("host:::fd00:db8:fd00,", "ho
         def test_u21_a_mutant_that_goes_back_to_the_pattern_alone_fails_with_the_text(self):
             code, err, out = self.pc11_run(self.PC11_U21)
             self.assertEqual((code, err), (0, ""))
-            code, err, out = self.pc11_run(self.PC11_U21, ("cloud/launcher/cloud_worker.py", "MASK_BY_IPADDRESS = True", "MASK_BY_IPADDRESS = False"))
+            code, err, out = self.pc11_run(self.PC11_U21, ("cloud/launcher/cloud_worker.py", "ipaddress.ip_address(run[i:j])", r"ipaddress.ip_address(run[i:j]) if re.fullmatch(r'[0-9]{1,3}(?:\.[0-9]{1,3}){3}', run[i:j]) else int('x')"))
             self.assertEqual(code, 1, err)
             self.assertIn("an address leaked past the masking", err)
 
