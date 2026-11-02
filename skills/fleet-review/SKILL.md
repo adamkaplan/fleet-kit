@@ -34,6 +34,8 @@ Each reviewer also checks a change that deletes something or raises an alert aga
 
 When a review finding names a gap in one member of a table, list, set or rule family (a row, a kind, an input, a rule), the fix covers every member in the same head: derive the set from the code, never a hand-listed copy, parametrise the tests over it with one mutant per member, and say in the PR body which members were checked; reviewers name the class, not only the instance.
 
+For every test you rely on, say whether it ran a real component or a fake, and which; a test that touched only a fake is reported as such and is never proof of the real component.
+
 When a function decides from text (an error message, a substring, a pattern, a name list), the first-round finding asks for an allow-list, a structured field or exact equality, and for a completeness test derived from the code, with one mutant per member, so the class is closed in one round and not found one instance at a time. The rule and its example are in `docs/review-laws/structural-rule.md` of the kit.
 
 **Name the suites that exercise the change.** A review request lists, under `suites that exercise your change`, the output of `fleet-switchboard heavy --changed --list` for the pull request; before approving, run that list (`fleet-switchboard heavy --changed --pr <number>`, a run on a local merge of the current base) and check the pull request ran or names each suite. Never approve on the classes the diff happens to name: another suite that runs the same code can be red in CI. The gates show a finding (not a block) when none of the listed suites is named.

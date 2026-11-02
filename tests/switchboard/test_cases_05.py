@@ -401,6 +401,20 @@ class TestChecklistAndFamilyTexts(unittest.TestCase):
             self.assertNotRegex(text, r"(?i)\b(coder\d|cos\b|fleet-upkeep|adam\b)")
 
 
+class TestRealOrFakeLine(unittest.TestCase):
+    """#1972: the review skill asks, once, whether each test ran a real component or a fake."""
+    LINE = ("For every test you rely on, say whether it ran a real component or a fake, and which; "
+            "a test that touched only a fake is reported as such and is never proof of the real component.")
+
+    def test_the_review_skill_holds_the_line_exactly_once_and_it_is_not_a_bullet(self):
+        text = " ".join((REPO / "skills" / "fleet-review" / "SKILL.md").read_text().split())
+        self.assertEqual(text.count(self.LINE), 1)
+        self.assertNotIn("- " + self.LINE, text)
+
+    def test_the_planning_skill_is_untouched_by_the_line(self):
+        self.assertNotIn("real component or a fake", (REPO / "skills" / "fleet-planning" / "SKILL.md").read_text())
+
+
 class TestIntegrationBranchVerdictText(unittest.TestCase):
     """#776: what plan a PR into an integration branch must link, said once in the docs and once in the coordination skill."""
     DOC = ("The ledger never uses the pull request's base branch to choose or relax a plan: a pull request, including one into an integration branch, is gated by the plan its body links with a `PLAN:` line (or `--plan`), "
