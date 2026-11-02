@@ -1,7 +1,10 @@
 """`fleet-switchboard preflight-pr --body PR`: the description against the plan's cause-first reviewer scenario (ask of 28 Oct, plan S1-S10, U1, U2).
 
-The three recorded shapes are SYNTHETIC (neutral names): the why block first, places without line numbers, fewer than N places."""
+The three recorded shapes are SYNTHETIC (neutral names): the why block first, places without line numbers, fewer than N places.
+The headings are read from the page's own rendering (`body_html`): the S11 fixtures are REAL renderings; the other tests build theirs with `render`."""
 import contextlib
+import html as htmllib
+import json
 import importlib.machinery
 import importlib.util
 import io
@@ -31,9 +34,82 @@ def plan(rule, text="Given the description, when read, then it names the cause f
             "    discriminates: a description that opens with the change fails\n    evaluator: %s\n    claim: %s\n```\n" % (text, rule, evaluator, claim))
 
 
+def render(raw):
+    """The page's rendering of the few constructs the tests use, in the shape of the real ones: `## x` h2, `**x**` p/strong, `- x` ul/li (a backticked
+    text is code), a fenced block pre/code, an HTML comment nothing, any other paragraph p."""
+    def inline(text):
+        return re.sub(r"`([^`]*)`", r'<code class="notranslate">\1</code>', htmllib.escape(text, quote=False))
+    out, para, items, fence = [], [], [], None
+    def flush():
+        nonlocal para, items
+        if para:
+            out.append('<p dir="auto">%s</p>' % inline(" ".join(para)))
+        if items:
+            out.append('<ul dir="auto">\n%s\n</ul>' % "\n".join("<li>%s</li>" % inline(i) for i in items))
+        para, items = [], []
+    raw = re.sub(r"<!--.*?-->", "", raw, flags=re.S)
+    for line in raw.splitlines():
+        if fence is not None:
+            if line.startswith("```"):
+                out.append('<pre class="notranslate"><code class="notranslate">%s\n</code></pre>' % htmllib.escape("\n".join(fence), quote=False))
+                fence = None
+            else:
+                fence.append(line)
+        elif line.startswith("```"):
+            flush()
+            fence = []
+        elif line.startswith("## "):
+            flush()
+            out.append('<h2 dir="auto">%s</h2>' % inline(line[3:]))
+        elif line.startswith("- "):
+            if para:
+                flush()
+            items.append(line[2:])
+        elif line.startswith("**") and line.endswith("**"):
+            flush()
+            out.append('<p dir="auto"><strong>%s</strong></p>' % inline(line[2:-2]))
+        elif line.strip():
+            if items:
+                flush()
+            para.append(line)
+        else:
+            flush()
+    flush()
+    return "\n".join(out)
+
+
+# The REAL renderings of eight descriptions, captured 2 Nov from GitHub's markdown renderer (repo adamkaplan/fleet-kit): the raw text and `body_html` of each
+REAL = {
+    "d1": (
+        '<!-- pr-explainer:begin -->\n\n**Why (before and after)**\n\n```text\nbefore: x\nafter:  y\n```\n\n<!-- pr-explainer:end -->\n\n```\n## Cause (DW-1): the case\n- `bin/a.py:10`, `bin/b.py:20`, `bin/c.py:30` and `bin/d.py:40`\n```\n\n## Why this needs you\n\ntext\n',
+        '\n<p dir="auto"><strong>Why (before and after)</strong></p>\n<pre lang="text" class="notranslate"><code class="notranslate">before: x\nafter:  y\n</code></pre>\n\n<pre class="notranslate"><code class="notranslate">## Cause (DW-1): the case\n- `bin/a.py:10`, `bin/b.py:20`, `bin/c.py:30` and `bin/d.py:40`\n</code></pre>\n<h2 dir="auto">Why this needs you</h2>\n<p dir="auto">text</p>'),
+    "d2": (
+        'MERGE: captain\n\n## Cause (DW-1): the case\n\n- `bin/a.py:10`, `bin/b.py:20`, `bin/c.py:30` and `bin/d.py:40`\n\n```\n## Why this needs you\n```\n\n## Why this needs you\n\ntext\n',
+        '<p dir="auto">MERGE: captain</p>\n<h2 dir="auto">Cause (DW-1): the case</h2>\n<ul dir="auto">\n<li><code class="notranslate">bin/a.py:10</code>, <code class="notranslate">bin/b.py:20</code>, <code class="notranslate">bin/c.py:30</code> and <code class="notranslate">bin/d.py:40</code></li>\n</ul>\n<pre class="notranslate"><code class="notranslate">## Why this needs you\n</code></pre>\n<h2 dir="auto">Why this needs you</h2>\n<p dir="auto">text</p>'),
+    "d3": (
+        '<!-- pr-explainer:begin -->\n\n**Why (before and after)**\n\n```text\nbefore: x\nafter:  y\n```\n\n<!-- pr-explainer:end -->\n\n~~~\n## Cause (DW-1): the case\n- `bin/a.py:10`, `bin/b.py:20`, `bin/c.py:30` and `bin/d.py:40`\n~~~\n\n## Why this needs you\n\ntext\n',
+        '\n<p dir="auto"><strong>Why (before and after)</strong></p>\n<pre lang="text" class="notranslate"><code class="notranslate">before: x\nafter:  y\n</code></pre>\n\n<pre class="notranslate"><code class="notranslate">## Cause (DW-1): the case\n- `bin/a.py:10`, `bin/b.py:20`, `bin/c.py:30` and `bin/d.py:40`\n</code></pre>\n<h2 dir="auto">Why this needs you</h2>\n<p dir="auto">text</p>'),
+    "d4": (
+        '<!-- pr-explainer:begin -->\n\n**Why (before and after)**\n\n```text\nbefore: x\nafter:  y\n```\n\n<!-- pr-explainer:end -->\n\n```\n## Cause (DW-1): the case\n- `bin/a.py:10`, `bin/b.py:20`, `bin/c.py:30` and `bin/d.py:40`\n\n## Why this needs you\n\ntext\n',
+        '\n<p dir="auto"><strong>Why (before and after)</strong></p>\n<pre lang="text" class="notranslate"><code class="notranslate">before: x\nafter:  y\n</code></pre>\n\n<pre class="notranslate"><code class="notranslate">## Cause (DW-1): the case\n- `bin/a.py:10`, `bin/b.py:20`, `bin/c.py:30` and `bin/d.py:40`\n\n## Why this needs you\n\ntext\n</code></pre>'),
+    "d5": (
+        'MERGE: captain\n\n```\n## Why this needs you\n```\n\n## Cause (DW-1): the case\n\n- `bin/a.py:10`, `bin/b.py:20`, `bin/c.py:30` and `bin/d.py:40`\n\n## Why this needs you\n\ntext\n',
+        '<p dir="auto">MERGE: captain</p>\n<pre class="notranslate"><code class="notranslate">## Why this needs you\n</code></pre>\n<h2 dir="auto">Cause (DW-1): the case</h2>\n<ul dir="auto">\n<li><code class="notranslate">bin/a.py:10</code>, <code class="notranslate">bin/b.py:20</code>, <code class="notranslate">bin/c.py:30</code> and <code class="notranslate">bin/d.py:40</code></li>\n</ul>\n<h2 dir="auto">Why this needs you</h2>\n<p dir="auto">text</p>'),
+    "d6": (
+        'MERGE: captain\n\n<!--\n## Cause (DW-1): the case\n- `bin/a.py:10`, `bin/b.py:20`, `bin/c.py:30` and `bin/d.py:40`\n-->\n\n## Why this needs you\n\ntext\n',
+        '<p dir="auto">MERGE: captain</p>\n\n<h2 dir="auto">Why this needs you</h2>\n<p dir="auto">text</p>'),
+    "d7": (
+        'MERGE: captain\n\n<!--\n## Why this needs you\n-->\n\n## Cause (DW-1): the case\n\n- `bin/a.py:10`, `bin/b.py:20`, `bin/c.py:30` and `bin/d.py:40`\n\n## Why this needs you\n\ntext\n',
+        '<p dir="auto">MERGE: captain</p>\n\n<h2 dir="auto">Cause (DW-1): the case</h2>\n<ul dir="auto">\n<li><code class="notranslate">bin/a.py:10</code>, <code class="notranslate">bin/b.py:20</code>, <code class="notranslate">bin/c.py:30</code> and <code class="notranslate">bin/d.py:40</code></li>\n</ul>\n<h2 dir="auto">Why this needs you</h2>\n<p dir="auto">text</p>'),
+    "d8": (
+        'MERGE: captain\n\nCause (DW-1): the case\n------------------------\n\n- `bin/a.py:10`, `bin/b.py:20`, `bin/c.py:30` and `bin/d.py:40`\n\n## Why this needs you\n\ntext\n',
+        '<p dir="auto">MERGE: captain</p>\n<h2 dir="auto">Cause (DW-1): the case</h2>\n<ul dir="auto">\n<li><code class="notranslate">bin/a.py:10</code>, <code class="notranslate">bin/b.py:20</code>, <code class="notranslate">bin/c.py:30</code> and <code class="notranslate">bin/d.py:40</code></li>\n</ul>\n<h2 dir="auto">Why this needs you</h2>\n<p dir="auto">text</p>'),
+}
+
+
 PLACES = "\n".join("- `src/mod_%d.py:%d` the place" % (i, 10 + i) for i in range(1, 7))
 GOOD = "PLAN: acme-org/demo#7\n\n## The cause\n\nThe places:\n%s\n\n## Why\n\nbefore and after\n\n## The change\n\nwe edit it\n" % PLACES
-WHY_FIRST = "PLAN: acme-org/demo#7\n\n<!-- pr-explainer:begin -->\nbefore and after\n<!-- pr-explainer:end -->\n\n## The cause\n\n%s\n" % PLACES
+WHY_FIRST = "PLAN: acme-org/demo#7\n\n<!-- pr-explainer:begin -->\n\n**Why (before and after)**\n\n<!-- pr-explainer:end -->\n\n## The cause\n\n%s\n" % PLACES
 HEADING_ORDER = "PLAN: acme-org/demo#7\n\n## Why\n\nbefore and after\n\n## The cause\n\n%s\n" % PLACES
 NO_LINES = "PLAN: acme-org/demo#7\n\n## The cause\n\n- `src/mod_a.py` the place\n- `src/mod_b.py` the place\n- `src/mod_c.py` the place\n"
 FEW = "PLAN: acme-org/demo#7\n\n## The cause\n\n- `src/mod_a.py:12` the place\n- `src/mod_b.py:30` the place\n\n## The change\n\nedit\n"
@@ -43,11 +119,12 @@ LINE_RULE = "the first section names at least 4 places with function and line"
 class Run:
     """The command with its readers faked; every call a fake sees is kept, so a non-GET call or a write can be counted."""
 
-    def __init__(self, body, plan_text, fail=None, sb=None, arg="acme-org/demo#9"):
+    def __init__(self, body, plan_text, fail=None, sb=None, arg="acme-org/demo#9", html=None):
         self.arg = arg
         self.sb = sb or SB
         self.calls, self.fail = [], fail
         self.body, self.plan_text = body, plan_text
+        self.html = render(body) if html is None else html   # html=False: the field is absent
 
     def __call__(self):
         SB = self.sb
@@ -63,12 +140,26 @@ class Run:
                 raise SB.PlanInputError("cannot read plan")
             return self.plan_text, "comment", "", []
 
+        outer = self
+
+        class Accounts:
+            """The account reader: its `read` answers the pull request's JSON (the rendering) and keeps the call and its header."""
+            def __init__(self, *a, **k):
+                pass
+
+            def read(self, runner, path, repo, timeout, extra_flags=(), **kw):
+                outer.calls.append("GET html %s %s" % (path, " ".join(extra_flags)))
+                if outer.fail == "html":
+                    return subprocess.CompletedProcess([], 1, "", "boom")
+                doc = {"body": outer.body} if outer.html is False else {"body": outer.body, "body_html": outer.html}
+                return subprocess.CompletedProcess([], 0, json.dumps(doc), "")
+
         args = SB.argparse.Namespace(body=self.arg, merged=False)
         out = io.StringIO()
         cfg = {"gh": "gh", "call_timeout_seconds": 5, "intent_repo": "acme-org/demo"}
         with mock.patch.object(SB, "read_pr_json", read_pr_json), mock.patch.object(SB, "fetch_plan", fetch_plan), \
                 mock.patch.object(SB, "build_engine", lambda *a, **k: (object(), None, None)), mock.patch.object(SB, "load_config", lambda: cfg), \
-                mock.patch.object(SB, "IntentReader", lambda *a, **k: object()), mock.patch.object(SB, "GhAccounts", lambda *a, **k: object()), \
+                mock.patch.object(SB, "IntentReader", lambda *a, **k: object()), mock.patch.object(SB, "GhAccounts", Accounts), \
                 mock.patch.object(subprocess, "run", side_effect=AssertionError("no process may run")), contextlib.redirect_stdout(out):
             code = SB.cmd_preflight_pr(args, lambda *a, **k: (_ for _ in ()).throw(AssertionError("no runner call")), lambda: 0)
         return code, out.getvalue()
@@ -78,15 +169,8 @@ def run(body, rule=LINE_RULE, **kw):
     return Run(body, plan(rule, **kw.pop("plan_kw", {})), **kw)()
 
 
-FENCE_LINES = "\n".join("- `src/mod_%d.py:%d` the place" % (i, 10 + i) for i in range(1, 5))
-WHY_BLOCK = "<!-- pr-explainer:begin -->\nbefore and after\n<!-- pr-explainer:end -->\n\n"
-FENCED_CAUSE = "PLAN: acme-org/demo#7\n\n" + WHY_BLOCK + "```\n## Cause\n%s\n```\n" % FENCE_LINES
-FENCED_CAUSE_TILDE = FENCED_CAUSE.replace("```", "~~~")
-FENCED_CAUSE_OPEN = "PLAN: acme-org/demo#7\n\n" + WHY_BLOCK + "```\n## Cause\n%s\n" % FENCE_LINES
-REAL_CAUSE_FENCED_WHY = "PLAN: acme-org/demo#7\n\n## Cause\n\n%s\n\n```\n## Why\nbefore\n```\n" % FENCE_LINES
 S12_RULE_PLAN = plan("the first section names at least 2 named items", text="Given the line of the description, when read, then the cause is first")
 TWO_ITEMS = "PLAN: acme-org/demo#7\n\n## The cause\n\nSee #101 and #102.\n"
-FENCED_WHY_BEFORE = "PLAN: acme-org/demo#7\n\n```\n## Why\nbefore\n```\n\n## Cause\n\n%s\n" % FENCE_LINES
 BC_NOT_FIRST = "the cause section is not first"
 S3_MSG = "places with a file and line: found 0 of at least 4"
 
@@ -98,15 +182,26 @@ def check_s3(sb=None):
         raise AssertionError("S3 check: '%s' missing (exit %s): %s" % (S3_MSG, code, out.strip()))
 
 
+def real(name):
+    """(raw, html) of a real rendering, with the PLAN: line the command reads added to both (the captured descriptions carry none)."""
+    raw, html = REAL[name]
+    return "PLAN: acme-org/demo#7\n\n" + raw, '<p dir="auto">PLAN: acme-org/demo#7</p>\n' + html
+
+
 def check_s11(sb=None):
-    for name, text, refused in (("fenced cause after why", FENCED_CAUSE, True), ("real cause, fenced why", REAL_CAUSE_FENCED_WHY, False),
-                                ("tilde fence", FENCED_CAUSE_TILDE, True), ("fence never closed", FENCED_CAUSE_OPEN, True),
-                                ("fenced why before the real cause", FENCED_WHY_BEFORE, False)):
-        code, out = Run(text, plan(LINE_RULE), sb=sb)()
-        if refused and (code != 1 or out.count(BC_NOT_FIRST) != 1):
-            raise AssertionError("S11 check: '%s' missing for %s (exit %s): %s" % (BC_NOT_FIRST, name, code, out.strip()))
-        if not refused and code != 0:
-            raise AssertionError("S11 check: %s must pass, exit %s: %s" % (name, code, out.strip()))
+    """The eight real descriptions: d1, d3, d4, d6 refused with the item, d2, d5, d7, d8 pass. Raises AssertionError anchored on its own message."""
+    wrong = []
+    for name in sorted(REAL):
+        raw, html = real(name)
+        code, out = Run(raw, plan(LINE_RULE), sb=sb, html=html)()
+        if name in ("d1", "d3", "d4", "d6"):
+            ok = code == 1 and out.count(BC_NOT_FIRST) == 1
+        else:
+            ok = code == 0 and "PASS" in out
+        if not ok:
+            wrong.append(name)
+    if wrong:
+        raise AssertionError("S11 check: wrong answers for %s" % ",".join(wrong))
 
 
 def check_s12_form(sb=None):
@@ -195,15 +290,40 @@ class TestBodyCheck(unittest.TestCase):
     def test_s3_the_check_function_passes_on_the_real_build(self):
         check_s3()
 
-    def test_s11_fenced_headings_are_not_read(self):
+    def test_s11_the_real_renderings_are_read_as_the_page_shows_them(self):
         check_s11()
-        for text in (FENCED_CAUSE, FENCED_CAUSE_TILDE, FENCED_CAUSE_OPEN):
-            self.assertEqual(Run(text, plan(LINE_RULE))()[1].count(BC_NOT_FIRST), 1)
-        self.assertEqual(Run(REAL_CAUSE_FENCED_WHY, plan(LINE_RULE))()[0], 0)
+        for name in ("d1", "d3", "d4", "d6"):
+            raw, html = real(name)
+            self.assertEqual(Run(raw, plan(LINE_RULE), html=html)()[1].count(BC_NOT_FIRST), 1, name)
+        for name in ("d2", "d5", "d7", "d8"):
+            raw, html = real(name)
+            self.assertEqual(Run(raw, plan(LINE_RULE), html=html)()[0], 0, name)
 
-    def test_s11_a_mutant_that_reads_headings_inside_fences_fails(self):
-        text = self.mutant_fails(check_s11, [("switchboard/body_check.py", "    out, fence = [], None\n", "    return text\n    out, fence = [], None\n")])
-        self.assertIn("S11 check: fenced why before the real cause must pass", text)
+    def test_s11_a_rendering_absent_or_empty_is_not_checked(self):
+        raw, html = real("d2")
+        for shown in (False, ""):
+            code, out = Run(raw, plan(LINE_RULE), html=shown)()
+            self.assertEqual(code, 1)
+            self.assertEqual(out.count("not checked"), 1, out)
+        code, out = Run(raw, plan(LINE_RULE), fail="html")()
+        self.assertEqual((code, out.count("not checked")), (1, 1))
+
+    def test_s11_the_rendering_is_one_get_with_the_html_header(self):
+        runner = Run(GOOD, plan(LINE_RULE))
+        runner()
+        gets = [c for c in runner.calls if c.startswith("GET html")]
+        self.assertEqual(gets, ["GET html repos/acme-org/demo/pulls/9 -H Accept: application/vnd.github.html+json"])
+
+    def test_s11_a_mutant_that_reads_the_headings_from_the_raw_text_fails(self):
+        old = "    heading, text, before, found, why = body_rendered(html)\n"
+        new = ("    first = _body_re(r\"(?m)^##[ \\t]+(.*)$\").search(html)\n"
+               "    heading, text, before, found, why = (first.group(1) if first else \"\"), html[first.end():] if first else \"\", html[:first.start()] if first else \"\", bool(first), "
+               "bool(first and \"Why (before and after)\" in html[:first.start()])\n")
+        feed = ("r, u = body_check_problems(html, scenario)", "r, u = body_check_problems(body, scenario)")   # the old rule: the check is given the RAW text
+        text = self.mutant_fails(check_s11, [("switchboard/body_check.py", feed[0], feed[1]), ("switchboard/body_check.py", old, new)])
+        self.assertIn("S11 check: wrong answers for", text)
+        for name in ("d5", "d7", "d6"):
+            self.assertIn(name, text.split("wrong answers for")[1].replace(" ", "").split(","))
 
     def test_s12_the_form_is_read_from_the_pass_field_only(self):
         check_s12_form()
@@ -259,7 +379,7 @@ class TestBodyCheck(unittest.TestCase):
     def test_u2_only_gets_are_made(self):
         runner = Run(GOOD, plan(LINE_RULE))
         self.assertEqual(runner()[0], 0)
-        self.assertEqual(runner.calls, ["GET pr", "GET plan"])
+        self.assertEqual([c.split(" repos")[0] for c in runner.calls], ["GET pr", "GET html", "GET plan"])
 
     def test_u1_without_body_the_command_is_unchanged(self):
         args = SB.argparse.Namespace(body=None, merged=False)
