@@ -883,3 +883,99 @@ def cmd_remind(args, runner, now):
 
 cmd_remind.ensure_on_use = True   # the daemon is alive when it runs
 cmd_remind.header_cache = True    # #1520
+
+
+# ---- a pod's pull request, told once to its launching lane (#1969)
+
+POD_PR_FILE = "pod-pr-told.json"   # private: the keys already told, saved BEFORE the send (a crash loses a line, never repeats it)
+POD_PR_KEEP_SECONDS = 24 * 3600    # the #827 rule: a line whose present-state read keeps failing is dropped after a day
+POD_PR_QUEUE_MAX = 200
+
+
+def pod_pr_note(hub, event, repo, payload):
+    """The `opened` event of a pull request, queued for the tick: its repository, number, head branch and the ask number its body names (no body text is kept). Never raises."""
+    engine = getattr(hub, "engine", None)
+    if engine is None or event != "pull_request" or not isinstance(payload, dict) or payload.get("action") != "opened":
+        return
+    pr = payload.get("pull_request")
+    head = pr.get("head") if isinstance(pr, dict) and isinstance(pr.get("head"), dict) else {}
+    number, branch = pr.get("number") if isinstance(pr, dict) else None, head.get("ref")
+    if not isinstance(number, int) or isinstance(number, bool) or not isinstance(branch, str) or not branch:
+        return
+    source = (head.get("repo") or {}).get("full_name") if isinstance(head.get("repo"), dict) else None
+    if isinstance(source, str) and source.lower() != str(repo).lower():
+        return   # a fork's branch is not a pod's branch
+    refs = pr_body_refs(pr.get("body"))
+    queue = engine.__dict__.setdefault("_pod_pr_queue", [])
+    if len(queue) < POD_PR_QUEUE_MAX:
+        queue.append({"repo": str(repo), "number": number, "branch": branch, "ask": refs[0][1] if refs else None, "at": engine.now()})
+
+
+def pod_pr_tick(engine, discovery):
+    """Each queued `opened` event whose repository and head branch equal the `repo` and `branch` of a cloud record is told once to that record's `reports_to`:
+    `PR opened by <pod>: <repo#N> (ask #<n>, branch <branch>)`. Matched by the record only, never by author, title or body. A record with no valid lane is audited
+    `pod_pr.no_lane`; a pull request no longer open at delivery is dropped, audited `pod_pr.dropped`."""
+    queue = engine.__dict__.get("_pod_pr_queue")
+    state_dir = getattr(engine, "state_dir", None)
+    watch = getattr(engine, "cloud_watch", None)
+    if not queue or state_dir is None or not watch:
+        return []
+    plain = load_module("cloud_end_alert").plain
+    path = Path(state_dir) / POD_PR_FILE
+    try:
+        told = [k for k in json.loads(path.read_text()).get("told", []) if isinstance(k, str)]
+    except (OSError, ValueError, AttributeError):
+        told = []
+    records = [r for r in watch.get("records", []) if isinstance(r, dict)]
+
+    def save():
+        tmp = path.with_name(path.name + ".tmp")
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as handle:
+            json.dump({"told": told[-1000:]}, handle)
+        os.replace(str(tmp), str(path))
+
+    def audit(kind, subject, detail):
+        if engine.audit is not None:
+            engine.audit.append(engine.actor, kind, subject, detail)
+
+    sent, keep = [], []
+    for entry in list(queue):
+        ref = "%s#%d" % (entry["repo"], entry["number"])
+        key = "pr-opened:" + ref
+        shown = "%s#%d" % (plain(entry["repo"], 100), entry["number"])   # `plain` drops the `#`
+        if key in told:
+            continue
+        pod = next((r for r in records if str(r.get("repo") or "").lower() == entry["repo"].lower() and r.get("branch") == entry["branch"]
+                    and isinstance(r.get("worker"), str) and r["worker"]), None)
+        if pod is None:
+            continue   # not from a pod's branch: nothing is said
+        lane = pod.get("reports_to")
+        if not isinstance(lane, str) or not NAME_RE.fullmatch(lane):
+            told.append(key)
+            save()
+            audit("pod_pr.no_lane", plain(pod["worker"]), {"pod": plain(pod["worker"]), "pr": shown, "reason": "the pod has no launching lane"})
+            continue
+        try:
+            present = engine.hub.present_record(entry["repo"], "pulls", entry["number"])
+        except Exception:
+            if engine.now() - entry.get("at", 0) < POD_PR_KEEP_SECONDS:
+                keep.append(entry)   # tried again next pass
+            else:
+                told.append(key)
+                save()
+                audit("pod_pr.dropped", shown, {"pod": plain(pod["worker"]), "why": "the present state could not be read for 24 hours"})
+            continue
+        if not isinstance(present, dict) or present.get("state") == "closed" or present.get("merged_at") or present.get("merged"):
+            told.append(key)
+            save()
+            audit("pod_pr.dropped", shown, {"pod": plain(pod["worker"]), "why": "the pull request is closed at delivery"})
+            continue
+        told.append(key)
+        save()   # before the send
+        ask = "#%d" % entry["ask"] if entry.get("ask") else "unknown"
+        text = "PR opened by %s: %s (ask %s, branch %s)" % (plain(pod["worker"]), shown, ask, plain(entry["branch"]))
+        engine.send("switchboard", lane, text)
+        sent.append((lane, text))
+    queue[:] = keep
+    return sent
