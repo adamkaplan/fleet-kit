@@ -22472,8 +22472,10 @@ def cmd_preflight_pr(args, runner, now):
                 return EXIT_ERROR
             args.merged = False
             code = cmd_preflight_pr_in(args, runner, now, merged.path)
+            code = EXIT_ERROR if run_new_test_checks(runner, merged.path, now) and code == EXIT_OK else code
             return EXIT_ERROR if run_new_bin_guards(ps, runner, merged.path, added, now) and code == EXIT_OK else code
     code = cmd_preflight_pr_in(args, runner, now, root)
+    code = EXIT_ERROR if run_new_test_checks(runner, root, now) and code == EXIT_OK else code
     ps = load_module("path_suites")   # #1457: without --merged the one table of NEW_BIN_GUARDS runs too, when the change adds a file under bin/; a change that adds none prints nothing more
     return EXIT_ERROR if run_new_bin_guards(ps, runner, root, preflight_added(runner, root), now) and code == EXIT_OK else code
 
@@ -22517,6 +22519,14 @@ def run_new_bin_guards(ps, runner, root, added, now):
         failed += verdict != "PASS"
         print("%s %s (%ds): %s" % (verdict, guard[0], max(0, int(now() - started)), " ".join(command)))
     return failed
+
+
+def run_new_test_checks(runner, root, now):
+    if (d := runner(["git", "diff", "--name-only", "--diff-filter=AM", "origin/HEAD...HEAD", "--", "tests/switchboard/"], cwd=root, capture_output=True, text=True)).returncode == 0 and not any(n.startswith("tests/switchboard/test_") for n in d.stdout.split()): return 0
+    if not os.path.exists(tool := os.path.join(root, "tools", "new-test-checks")): return print("SKIP new-test-checks: tools/new-test-checks is not in this tree") or 0   # #1967: a new or changed tests/switchboard/test_*.py is read before the push
+    started, done = now(), runner([sys.executable, os.path.abspath(__file__), "heavy", "--", sys.executable, tool, "--preflight"], cwd=root, capture_output=True, text=True)
+    if done.returncode == 0 and not done.stdout.strip(): return 0   # no such file against the base: nothing is printed
+    print("%s new-test-checks (%ds)" % ("PASS" if done.returncode == 0 else "FAIL", max(0, int(now() - started)))); sys.stderr.write(done.stdout if done.returncode else ""); return int(done.returncode != 0)
 
 
 def cmd_preflight_pr_in(args, runner, now, root):
