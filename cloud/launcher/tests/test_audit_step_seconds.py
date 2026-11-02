@@ -266,11 +266,12 @@ class Steps(tcw.Base):
         line, steps = self.check_s12(cw)
         self.assertEqual(line["seconds"], 41.0)
         self.assertEqual(steps, {"record": 2.0, "hook": 30.0, "delete": 3.0, "scrub": 1.5, "other": 4.5})
-        self.create()   # the first stop removed the pod
-        self.clock.advance(seconds=1)
-        _, plain = self.check_s12(cw, outside=0)
-        self.assertEqual(plain["other"], 0.0)
-        LINES.append("S12: seconds %.1f, steps sum %.1f (other %.1f); no-outside stop other %.1f" % (line["seconds"], sum(steps.values()), steps["other"], plain["other"]))
+        LINES.append("S12: seconds %.1f, steps sum %.1f (other %.1f)" % (line["seconds"], sum(steps.values()), steps["other"]))
+
+    def test_s12_a_stop_with_no_outside_time_has_other_zero(self):
+        line, steps = self.check_s12(cw, outside=0)
+        self.assertEqual((line["seconds"], steps["other"]), (36.5, 0.0))
+        LINES.append("S12: no-outside stop other %.1f" % steps["other"])
 
     def test_s12_mutant(self):
         mod = mutant_module(('            info["steps"]["other"] = max(0.0, total - sum(v for k, v in info["steps"].items() if k != "other"))', "            pass"))
