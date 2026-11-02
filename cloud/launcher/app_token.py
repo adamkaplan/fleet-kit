@@ -339,15 +339,26 @@ def mint_from_service(target, role):
     same checks as the signing route's. A passing failure exits 75, a refusal 1."""
     url = os.environ["CW_TOKEN_SERVICE_URL"].strip()
     u = urllib.parse.urlparse(url)
-    if not (u.scheme == "https" or (u.scheme == "http" and u.hostname in ("127.0.0.1", "localhost", "::1"))):
-        die("CW_TOKEN_SERVICE_URL must be an https URL (http only for a loopback address)")
+    if u.scheme == "http" and u.hostname in ("127.0.0.1", "localhost", "::1"):
+        pass  # a loopback address: for tests only
+    else:
+        server = urllib.parse.urlparse((os.environ.get("CW_CLOUD_SERVER") or "").strip())
+        exact = "https://%s/api/v1/namespaces/%s/services/token-mint:8080/proxy/mint" % (server.netloc, os.environ.get("CW_CLOUD_NAMESPACE") or "cw")
+        if not server.netloc or url != exact:
+            die("CW_TOKEN_SERVICE_URL must be exactly the cluster's service proxy of the token service")
     repo = target.split("/", 1)[1]
     bearer = caller_token()
     req = urllib.request.Request(url, data=json.dumps({"repo": target, "role": role}).encode(), method="POST",
-                                 headers={"Authorization": "Bearer " + bearer, "X-Caller-Token": "Bearer " + bearer, "Content-Type": "application/json", "Accept": "application/json"})
+                                 headers={"Authorization": "Bearer " + bearer, "X-Caller-Token": "Bearer " + bearer,
+                                          "Content-Type": "application/json", "Accept": "application/json"})
     del bearer
+    handlers = [token_mint._NoRedirect]
+    cafile = (os.environ.get("CW_CLOUD_CA_FILE") or "").strip()
+    if cafile:
+        import ssl
+        handlers.append(urllib.request.HTTPSHandler(context=ssl.create_default_context(cafile=cafile)))
     try:
-        with open_url(req, 60) as r:
+        with urllib.request.build_opener(*handlers).open(req, timeout=60) as r:
             raw = r.read(MAX_BYTES + 1)
         if len(raw) > MAX_BYTES:
             die("the token service's answer is larger than %d bytes" % MAX_BYTES)
@@ -355,12 +366,16 @@ def mint_from_service(target, role):
     except urllib.error.HTTPError as e:
         passing = e.code == 429 or 500 <= e.code <= 599
         die("the token service refused the request (HTTP %d)" % e.code, transient=passing)
-    except Exception:  # a timeout, a refused connection, an answer that is not JSON: the service could not be asked
-        die("the token service could not be asked or its answer was not usable JSON", transient=True)
+    except ValueError:  # status 200 with a body that is not JSON: not retried
+        die("the token service's answer was not JSON")
+    except Exception:  # a timeout, a refused connection, a failed TLS check: the service could not be asked
+        die("the token service could not be asked", transient=True)
     token = ans.get("token") if isinstance(ans, dict) else None
     repos = ans.get("repositories") if isinstance(ans, dict) else None
     if not isinstance(token, str) or not token:
         die("the answer has no token")
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", token):
+        die("refusing: the token holds a character that a token does not")
     MINTED.append(token)
     if not isinstance(repos, list) or len(repos) != 1 or not isinstance(repos[0], dict) or repos[0].get("name") != repo:
         die("refusing: the token does not cover exactly the one target repository")
