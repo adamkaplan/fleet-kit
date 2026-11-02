@@ -158,6 +158,66 @@ class PreflightStep(unittest.TestCase):
         self.assertEqual(p.returncode, 0, "the mutant skipped the preflight and must differ from the real script")
 
 
+TABLE = ("print('file    branch  default  verdict')\nprint('t/test_a.py   ok   ok   ok')\n"
+         "print('t/test_b.py   ok   ok   ok (fixed on branch)')\nprint('scan: ok')\nprint('differ: none')\n")
+DIFF_TESTS = {TD + "test_x.py": "# a.txt\nimport sys\nsys.exit(0 if open('a.txt').read() == 'one\\n' else 1)\n"}
+TABLE_ROW = r"\b(ok|ok \(fixed on branch\))\s*$|^scan: ok|^differ: none"
+
+
+class OutputHoldsDifferences(unittest.TestCase):
+    """Scenario S15 of ask #1284, choice (e): standard output holds only the differences, the counts line and the
+    advice line; the preflight's table goes to standard error."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="prepush-s15-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def rows(self, p):
+        import re
+        return [l for l in p.stdout.splitlines() if re.search(TABLE_ROW, l)]
+
+    def check(self, p):
+        self.assertEqual(self.rows(p), [], p.stdout)
+
+    def test_clean_branch_prints_no_passing_row(self):
+        repo = make_repo(self.tmp, TESTS)
+        p = run(repo, preflight=TABLE)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.check(p)
+        self.assertIn("cloud-prepush: advice only", p.stdout)
+        self.assertIn("cloud-prepush: run 1,", p.stdout)
+        self.assertIn("t/test_a.py", p.stderr)  # the table is on standard error
+
+    def test_planted_difference_is_named_and_no_passing_row(self):
+        repo = make_repo(self.tmp, DIFF_TESTS)
+        p = run(repo, preflight=TABLE)
+        self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+        self.check(p)
+        self.assertEqual(p.stdout.count("FAILS on the branch, passes on the base: " + TD + "test_x.py"), 1, p.stdout)
+
+    def test_failed_preflight_prints_failing_lines_only(self):
+        repo = make_repo(self.tmp, TESTS)
+        p = run(repo, preflight=TABLE + "print('scan: FAIL')\nraise SystemExit(1)\n")
+        self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+        self.check(p)
+        self.assertIn("scan: FAIL", p.stdout)
+
+    def test_mutant_printing_the_table_fails_with_anchored_text(self):
+        s = open(SCRIPT).read()
+        old = "        print(l, file=sys.stderr)  # the full table"
+        self.assertIn(old, s)
+        mutated = s.replace(old, "        print(l)  # the full table", 1)
+        self.assertNotEqual(mutated, s, "mutation applied")
+        repo = make_repo(self.tmp, TESTS)
+        # control: the real script passes the check; the mutant shows the passing rows the check forbids
+        self.check(run(repo, preflight=TABLE))
+        p = run(repo, preflight=TABLE, script_text=mutated)
+        self.assertGreaterEqual(len(self.rows(p)), 3, "the table-printing mutant must show passing rows on standard output")
+        with self.assertRaises(AssertionError) as cm:
+            self.check(p)
+        self.assertIn("t/test_a.py", str(cm.exception))
+
+
 class Bounds(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="prepush-bd-")

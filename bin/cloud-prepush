@@ -191,6 +191,14 @@ def run_one(root, rel, tmp, limit):
     return ("ran", (rc, out[-4000:]))
 
 
+PASSING_ROW = re.compile(r"(\s(ok|ok \(fixed on branch\))|^scan: ok|^differ: none)\s*$")
+
+
+def failing_lines(lines):
+    """The lines of the preflight's table that say which check failed and why: never a row that says ok or no difference."""
+    return [l for l in lines if not PASSING_ROW.search(l)]
+
+
 def preflight(root, base, scratch, limit):
     """Run the neighbouring preflight first. Returns (ok, lines). Cannot run = not ok."""
     path = os.path.join(os.path.dirname(os.path.realpath(__file__)), PREFLIGHT)
@@ -449,8 +457,10 @@ def stage(root, base, mbase, changed, tmp, scratch, TIMEOUT_S, TOTAL_S, started,
         ok, plines = True, []
     else:
         ok, plines = preflight(root, base, scratch, max(1, min(PF_S, int(TOTAL_S - (time.monotonic() - started)))))
+    for l in plines:
+        print(l, file=sys.stderr)  # the full table goes to standard error; standard output holds only the differences
     if not ok:
-        for l in plines:
+        for l in failing_lines(plines):
             note(l)
         if BUDGET_SPENT[0]:
             note("cloud-prepush: the quick budget was spent (NOT RUN (budget), not a failing test); no test was run (advice only)")
