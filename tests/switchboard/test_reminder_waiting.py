@@ -201,6 +201,32 @@ def build(PR4Base):
                 with self.assertRaisesRegex(AssertionError, r"^0 != 50 : \(a\) reminders delivered of 50", msg="mutant not caught: dropping all but the first"):
                     self.assertEqual(self.run_fifty("s-fifty2")[0], 50, msg="(a) reminders delivered of 50")
 
+        def test_s16_a_mutant_that_sends_each_due_reminder_as_its_own_steer_is_caught(self):
+            import inspect, textwrap
+            self.fifty_world()
+            delivered, most, late, repeats = self.run_fifty("s-fifty")
+            self.assertEqual((delivered, most), (50, 1), msg="control: the unmutated code, 50 delivered in at most one steer per pass")
+            self.fifty_world("s-fifty2", 51)
+            engine_class = type(self.world.engine)
+            source = inspect.getsource(engine_class.deliver)
+            old = '        if plan.action not in ("note", "wake"):\n            raise ValueError("nothing to deliver for action %r" % plan.action)\n'
+            new = old + ("        if len(plan.pending) > 1:   # the mutant: one steer per due reminder, not one merged message\n"
+                         "            result = None\n"
+                         "            for fact in list(plan.pending):\n"
+                         "                one = copy.copy(plan)\n"
+                         "                one.pending = [fact]\n"
+                         "                result = self.deliver(one, interrupt)\n"
+                         "            return result\n")
+            self.assertEqual(source.count(old), 1, msg="the replaced text is in the source once")
+            mutated = source.replace(old, new)
+            self.assertNotEqual(mutated, source, msg="mutation not applied: one steer per due reminder")
+            space = dict(engine_class.deliver.__globals__)
+            exec(textwrap.dedent(mutated), space)
+            with mock.patch.object(engine_class, "deliver", space["deliver"]):
+                delivered, most, late, repeats = self.run_fifty("s-fifty2")
+                with self.assertRaisesRegex(AssertionError, r"steers of the lane in one pass", msg="mutant not caught: 50 separate steers"):
+                    self.assertLessEqual(most, 1, msg="(c) steers of the lane in one pass (one merged message, not 50)")
+
         def real_writers(self, base):
             """ONE item from EACH real writer, made by the production code in the fake world (its state directory and its audit): the launch block
             (`set_checkpoint_reminders`: a worker and an overdue reminder, which writes the `for` field) and `remind` through `sb.main` (a plain one).
