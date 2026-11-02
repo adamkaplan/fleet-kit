@@ -1191,7 +1191,7 @@ def scan_uses(roots):
     found = []
     for root in roots:
         for path in sorted(Path(root).rglob("*")):
-            if not path.is_file() or ".git" in path.parts or path.stat().st_size > 20 * 2 ** 20:
+            if not path.is_file() or path.is_symlink() or ".git" in path.parts or path.stat().st_size > 20 * 2 ** 20:
                 continue
             try:
                 lines = path.read_text(encoding="utf-8", errors="strict").split("\n")
