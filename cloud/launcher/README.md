@@ -4,6 +4,7 @@ Launcher, reaper, end hook and token mint for cloud workers, built to `docs/clou
 
 - `cloud-worker create|stop|extend|delete|status|snapshot|reap` (`cloud_worker.py`): reaches the cloud only through `kubectl`
   (`CW_KUBECTL`, `CW_CLOUD_NAMESPACE`); writes one audit line per action to `CW_CLOUD_AUDIT`
+  A stop line also holds the seconds of its steps (record, hook, refresh, delete, scrub, other) and its total, and the renewal and refresh lines hold their seconds.
   (default `~/.local/state/cw-cloud/audit.jsonl`, mode 0600). `reap` is one pass (or `--loop SECONDS`, never slower
   than 60); run it from a cron-like scheduler. It stops a pod past its hard deadline, or idle (not busy, last
   activity older than the idle time, read by `kubectl exec <pod> -- cw-worker-activity`; an unreadable answer is not a reason to stop).
