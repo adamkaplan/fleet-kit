@@ -152,4 +152,16 @@ H
   PATH="$bin:$PATH"; export PATH
 fi
 
+# #1460: the checkout directory gets the CI runner's permissions: owned by the worker, 0755, no setgid, whatever the volume made /work.
+# Absent /work (a run outside a pod) is skipped; a failure to set the modes REFUSES the start (one line, no value printed).
+WORK="${CW_WORK_DIR:-/work}"
+if [ -d "$WORK" ]; then
+  if ! { install -d -m 0755 "$WORK/repo" && chmod g-s,go-w "$WORK/repo"; } 2>/dev/null \
+     || [ -n "$(find "$WORK/repo" -maxdepth 0 \( -perm -g+w -o -perm -o+w -o -perm -2000 \) 2>/dev/null)" ]; then
+    echo "worker: could not create $WORK/repo with mode 0755 and no setgid; refusing to start" >&2
+    exit 1
+  fi
+fi
+umask 022
+
 exec "$@"

@@ -339,6 +339,32 @@ PYX
 nice python3 -m unittest discover -s "$here/worker/tests" -p 'test_*.py' >"$tmp/ut" 2>&1 \
   && ok "worker activity reader tests" || { bad "worker activity reader tests"; tail -20 "$tmp/ut"; }
 
+# 2c. (#1460) the sample of tests that failed only in pods: the worker script's vault-check tests, the launcher's worker test file and the
+# self-registering commands test. Each runs here (inside the image when this list runs there) and a failure of any one fails the step, naming the file.
+# CW_SAMPLE_LIST (tests only) names a file of `<name>|<command>` lines that replaces the three.
+root=$(cd "$here/.." && pwd)
+sample="$tmp/sample.list"
+if [ -n "${CW_SAMPLE_LIST:-}" ]; then cp "$CW_SAMPLE_LIST" "$sample"; else
+  printf '%s\n' "bin/test-cloud-worker|$root/bin/test-cloud-worker" \
+    "cloud/launcher/tests/test_cloud_worker.py|cd $root/cloud/launcher/tests && python3 -m unittest test_cloud_worker" \
+    "tests/switchboard/test_cases_12.py (TestSelfRegisteringCli)|$root/bin/test-switchboard -k TestSelfRegisteringCli" > "$sample"
+fi
+# run_sample <list>: prints one ok/FAIL line per entry, returns 1 when any entry failed (never "|| true")
+run_sample() {
+  local sname scmd rc=0
+  while IFS='|' read -r sname scmd; do
+    [ -n "$sname" ] || continue
+    if ( eval "$scmd" ) >"$tmp/sample.out" 2>&1; then echo "ok   sample (pod-only failures): $sname"; else echo "FAIL sample (pod-only failures): $sname"; tail -5 "$tmp/sample.out"; rc=1; fi
+  done < "$1"
+  return $rc
+}
+smp=$(run_sample "$sample"); src=$?
+printf '%s\n' "$smp"; [ $src = 0 ] || fail=1
+# the mutant: one file that fails must fail the step and be named
+printf 'good-file|true\nbad-file|false\n' > "$tmp/mutant.list"
+mut=$(run_sample "$tmp/mutant.list"); mrc=$?
+[ $mrc != 0 ] && printf '%s' "$mut" | grep -q 'FAIL sample (pod-only failures): bad-file' && ok "sample step: a failing file fails the step and is named" || bad "sample step: a failing file did not fail the step"
+
 # 2b. no floating image tag: every image reference in cloud/ has an exact tag or a digest
 pins=$(python3 - "$here" <<'P'
 import re, sys, pathlib
