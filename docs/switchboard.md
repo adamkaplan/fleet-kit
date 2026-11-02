@@ -4650,7 +4650,7 @@ source (`config` or `launch record`). If the running agents or the retired list 
 The rules are `bin/launch_testers.py`.
 
 **The cloud relay stays list-only (#1869).** The relay daemon's verdict path judges a `tester` and a `reviewer` by the configured list `plan_evaluators` alone, because the relay daemon holds the configuration parts and the ledger and reads no agent's launch record: it has no discovery of the running agents, and its callers are cloud pods identified by their token, not by a record in the local registry, so it cannot apply the rule.
-The work item path (`verdict --item`) still takes `tester` verdicts only.
+The work item path (`item-verdict`) still takes `tester` verdicts only.
 
 **The seat of a verdict in `gates` (#1869).** Each `tester` or `reviewer` verdict records where the seat's right came from (`right`: `config` or `launch record`), and `gates` prints, in its text and in its `--json` (`verdict_lines`), one line for each such verdict it counts: `verdict: <id>: <evaluator> verdict #<seq> by <name>, <right>`, or `source not recorded` for a verdict recorded before this field existed.
 
