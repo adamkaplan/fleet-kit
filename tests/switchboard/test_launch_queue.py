@@ -25,7 +25,7 @@ def build(HandoffCase):
         def setUp(self):
             super().setUp()
             self.state = str(self.world.state)
-            self.cloud = self.world.add_agent("cloud")
+            self.cloud = self.world.add_agent("fleet-cloud")
             self.other = self.world.add_agent("other")
             self.n = 0
 
@@ -114,7 +114,7 @@ def build(HandoffCase):
 
         def test_s3_the_lowest_priority_number_oldest_first_launches_and_two_remain_in_order(self):
             first, second, third = self.check_order()
-            self.as_lane("cloud")
+            self.as_lane("fleet-cloud")
             code, out = self.run_queue("status", second, "launched", "--pod", "pod-a")
             self.assertEqual(code, 0, out)
             code, out = self.run_queue("list")
@@ -209,7 +209,7 @@ def build(HandoffCase):
                 sb.Switchboard.send = real
             self.assertEqual(code, 0, out)
             (line,) = self.queue_lines()
-            self.assertEqual(sent, [("cloud", "entry %s queued" % json.loads(line)["id"])])
+            self.assertEqual(sent, [("fleet-cloud", "entry %s queued" % json.loads(line)["id"])])
 
             def refused(engine, *a, **kw):
                 raise sb.FactError("the send is refused")
