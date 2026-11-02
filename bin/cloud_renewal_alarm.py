@@ -222,7 +222,10 @@ def tick(engine, discovery, send, hold_reason, boss_of, default_lane, env=None):
             by_reason.setdefault(reason, []).append(pod)
 
         def tell(to, text, subject, reason, pods):
-            item = send(engine.state_dir, to, now, now, text, KIND, subject, reason, first=True)
+            try:
+                item = send(engine.state_dir, to, now, now, text, KIND, subject, reason, first=True)
+            except Exception:
+                item = None   # a send that raises stops only its own send
             if item is not None:
                 sent.append((to, text))
                 told.setdefault(subject, []).append(to)
