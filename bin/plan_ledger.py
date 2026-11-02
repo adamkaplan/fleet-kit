@@ -953,8 +953,10 @@ def evaluate_gates(plan, entries, ledger_problem, facts, pr, now=None):
             applies, legs_ok, legs_said = (facts or {}).get("legs") or (False, True, "")   # #1235: the macOS legs, read from the rollup
             if ci in ("green", "passing") and applies and not legs_ok:
                 row.update(status="missing", missing=["CI is green at %s but %s" % ((head or "?")[:8], legs_said)])
+            elif (facts or {}).get("ci_line") and ci not in ("green", "passing"):   # #1755: the run was not made on the current tip: stale or unknown is never ok
+                row.update(status="missing", missing=[facts["ci_line"]])
             elif ci in ("green", "passing"):
-                row.update(status="ok", detail="CI %s at %s%s" % (ci, (head or "?")[:8], "; ubuntu legs green at the head, " + legs_said if applies else ""))
+                row.update(status="ok", detail="CI %s at %s%s%s" % (ci, (head or "?")[:8], "; " + facts["ci_line"] if (facts or {}).get("ci_line") else "", "; ubuntu legs green at the head, " + legs_said if applies else ""))
             elif (facts or {}).get("draft") is True and ci == "none":   # #770: a draft whose workflow skips drafts has no run at all, and "CI is failing" sends the author the wrong way; a draft WITH runs keeps the failing line
                 row.update(status="missing", missing=["draft: no CI run seen; this repo's workflow may skip drafts; mark ready, then wait"])
             else:
@@ -1144,7 +1146,7 @@ def validate_plan_gates(raw, source):
         seen[normal_repo(name)] = name
         if not isinstance(entry, dict):
             raise ValueError("%s: 'plan_gates.repos.%s' must be an object" % (source, name))
-        extra = sorted(set(entry) - {"mode", "enabled", "budget_ms", "enforce_gates", "item_checks", "ci_workflows"})
+        extra = sorted(set(entry) - {"mode", "enabled", "budget_ms", "enforce_gates", "item_checks", "ci_workflows", "ci_current_tip"})
         if extra:
             raise ValueError("%s: 'plan_gates.repos.%s' has key(s) this tool does not read: %s" % (source, name, ", ".join(extra)))
         mode = entry.get("mode", "shadow")
@@ -1165,6 +1167,8 @@ def validate_plan_gates(raw, source):
         repos[name] = {"mode": mode, "enabled": enabled, "budget_ms": budget, "enforce_gates": [g for g in ENFORCEABLE if g in gates]}
         if "item_checks" in entry:   # #770: declared and validated by bin/item_verdicts.py; carried here untouched, and absent when the repo does not list it
             repos[name]["item_checks"] = entry["item_checks"]
+        if "ci_current_tip" in entry:   # #1755: only an explicit false turns the rule off; carried as it is
+            repos[name]["ci_current_tip"] = entry["ci_current_tip"]
         if "ci_workflows" in entry:   # #1237: workflow names the gate expects a run of at the head
             flows = entry["ci_workflows"]
             if not (isinstance(flows, list) and len(flows) <= 20 and all(isinstance(x, str) and x for x in flows)):
