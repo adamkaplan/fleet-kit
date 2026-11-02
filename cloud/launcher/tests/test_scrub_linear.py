@@ -1354,8 +1354,8 @@ class S21Reads(unittest.TestCase):
         roots = [ROOT / d for d in ("cloud", "bin", "tools", "tests")]
         steps, took = read_check(cw.KnownSet)  # the control, first
         self.assertEqual((stale_check(cw.KnownSet), failed_init_check(cw.KnownSet), use_check(roots)), (1, 1, 0))
-        old = "        reads = [self._read(a) for a in args]  # BEFORE the lock\n        err = next((e for _, e in reads if e is not None), None)\n        with self._lock:\n"
-        new = "        with self._lock:\n            reads = [self._read(a) for a in args]\n            err = next((e for _, e in reads if e is not None), None)\n"
+        old = "        reads = [self._read(a) for a in args]  # BEFORE the lock\n        err = next((e for _, e in reads if e is not None), None)\n        if err is not None and name in (\"difference_update\", \"intersection_update\", \"symmetric_difference_update\"):\n            raise err  # an operation that removes forms: a half-read argument changes nothing (set and version unchanged)\n        with self._lock:\n"
+        new = "        with self._lock:\n            reads = [self._read(a) for a in args]\n            err = next((e for _, e in reads if e is not None), None)\n            if err is not None and name in (\"difference_update\", \"intersection_update\", \"symmetric_difference_update\"):\n                raise err\n"
         with self.assertRaisesRegex(AssertionError, "an argument was read while the lock was held:"):
             read_check(known_set_class(changed_text(src, old, new)))
         old2 = "            if version != self._version:\n                return False\n"
