@@ -178,6 +178,24 @@ def build(PR4Base):
             finally:
                 sb.ReminderFacts.__call__ = real
 
+        def accumulate_check(self, tag):
+            """Two deliveries of one pass (two keys): the swept sets accumulate."""
+            o1, n1 = self.arm(tag + "1")
+            o2, n2 = self.arm(tag + "2")
+            source = self.source()
+            facts = source()
+            for f in source.newest_first(facts):
+                if f.key in ("reminder:" + n1["id"], "reminder:" + n2["id"]):
+                    source.recheck_delivery(f)
+            self.assertEqual(source.swept, {i["id"] for i in o1 + o2}, msg="low5: the swept set accumulates over the deliveries of a pass")
+
+        def test_low5_swept_accumulates_over_two_deliveries_of_a_pass(self):
+            self.accumulate_check("a")
+
+        def test_low5_mutant_replacing_the_union_fails_after_the_control(self):
+            self.mutated_run(sb.ReminderFacts, "drop_older_copies", "self.swept |= gone", "self.swept = set(gone)",
+                             lambda: self.accumulate_check("m"), r"(?s)low5: the swept set accumulates over the deliveries of a pass$")
+
         def test_s5_a_copy_dropped_in_the_same_pass_is_audited_as_swept(self):
             self.setup_s2()
             self.hold_then_free()
