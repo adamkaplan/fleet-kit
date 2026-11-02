@@ -269,9 +269,21 @@ def build(PR4Base):
             engine.audit.append("cli", "reminder.add", "boss", {"id": item["id"], "at": sb.iso(item["at"]), "from": "orch", "issue": 7, "repo": "acme/widget-api", "deadline": True})
             return [e["detail"]["id"] for e in self.world.audit() if e["event"] == "reminder.add"]
 
+        def real_delivery_keys(self):
+            """One REAL delivery of one reminder in the fake world; returns a function id -> key built from the real `v2.synthetic` line's key format."""
+            self.world.add_agent("w-real", fleet={"role": "coder", "reports_to": "platform", "issue": 60})
+            real_id = self.remind("w-real")
+            del self.world.engine.deliver                        # the real delivery
+            self.world.engine.run_pass()
+            (line,) = [e for e in self.sent_to("w-real")]
+            keys = [k for k in line["detail"]["keys"] if k.startswith("reminder:")]
+            self.assertEqual(keys, ["reminder:" + real_id], msg="the real delivery line holds its key as reminder:<id>")
+            return lambda item_id: keys[0].replace(real_id, item_id)
+
         def status_and_real(self, mutate=None):
             """(the status count, the count by reminder_bound on the REAL stored items), per lane, raw. Items 1 and 3 are delivered 1 minute INSIDE their own
             bound, the others (0, 2, 4 and the deadline 5) 1 minute past it. `mutate(text)` rewrites the real audit file text before the status is read. Returns (status, real, status before the rewrite)."""
+            shape = self.real_delivery_keys()
             base = int(self.world.clock.now())
             ids = self.real_writers(base)
             self.assertEqual(len(ids), 6, msg="six real reminder.add lines")
@@ -282,7 +294,7 @@ def build(PR4Base):
                 bound = sb.reminder_bound({}, item)
                 bounds.append(bound)
                 delivered = item["at"] + bound + (-60 if number in (1, 3) else 60)
-                self.world.engine.audit.append("daemon", "v2.synthetic", item["to"], {"keys": ["reminder:" + item_id]}, ts=sb.iso(delivered))
+                self.world.engine.audit.append("daemon", "v2.synthetic", item["to"], {"keys": [shape(item_id)]}, ts=sb.iso(delivered))
                 real[item["to"]] = real.get(item["to"], 0) + (1 if delivered - item["at"] > bound else 0)   # only the late ones
             self.assertEqual(bounds, [300, 300, 600, 600, 600, 300], msg="a checkpoint reminder 5 minutes, a plain one 10")
             before = sb.late_reminder_counts(self.world.state, {}, base + 7200)
