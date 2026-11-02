@@ -45,6 +45,24 @@ if "12:30:45" not in text or '"n1"' not in text:
     sys.exit("a clock time or a name was changed: " + text)
 """
 
+U11B_CHECKER = r"""
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("launcher_u11b", sys.argv[1] + "/cloud/launcher/cloud_worker.py")
+lib = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(lib)
+bad = []
+for form in ("::FFFF:10.99.88.77", "::ffff:0:10.99.88.77", "::ffff:0:0:10.99.88.77", "0:0:0:0:0:FFFF:10.99.88.77", "0:0:0:0:0:ffff:10.99.88.77", "::Ffff:10.99.88.77"):
+    for shape in ("%s", "at %s here", "ip=%s", "http://%s/x", "[%s]", "http://[%s]:80/x"):
+        out = lib._mask_addresses(shape % form)
+        if "99" in out or "88" in out or "77" in out or "ffff" in out.lower() or "10." in out:
+            bad.append((shape % form, out))
+if bad:
+    sys.exit("an address reached the block: " + repr(bad))
+for keep in ("1::2::3", "12:30:45", "00:1a:2b:3c:4d:5e", "123e4567-e89b-12d3-a456-426614174000", "deadbeefcafe0123", "node-a"):
+    if lib._mask_addresses(keep) != keep:
+        sys.exit("text that is not an address was masked: " + keep)
+"""
+
 U11_CUT_CHECKER = r"""
 import importlib.util, json, sys
 spec = importlib.util.spec_from_file_location("launcher_u11cut", sys.argv[1] + "/cloud/launcher/cloud_worker.py")
@@ -502,6 +520,45 @@ def build():
                 done = subprocess.run([sys.executable, "-c", U11_CHECKER, tmp], capture_output=True, text=True, timeout=60,
                                       env=dict(os.environ, PYTHONPATH=tmp + "/bin"))
             return done.returncode, done.stderr
+
+        # -- U11 (PC-10), the upper-case and zero-group mapped forms: the dotted tail is masked whole, none of its octets is left
+        def u11b_event(self):
+            return "at 12:30:45: ::FFFF:10.99.88.77 ::ffff:0:10.99.88.77 fd00:abcd::1 10.99.88.77 ::ffff:10.99.88.77 Insufficient cpu"
+
+        def test_u11b_the_upper_case_and_zero_group_forms_leave_no_octet_in_the_block(self):
+            event = dict(EVENT, message=self.u11b_event())
+            self.set_cluster(FakeKube(nodes=[node(n, "4") for n in ("n1", "n2", "n3", "n4")], events=(event,)))
+            code, out, err = self.launch_with("--cloud")
+            block = self.block(err)
+            counts = {p: block.count(p) for p in (V4, V6, "ffff:" + V4, ".99.88.77", "FFFF:" + V4, "ffff:0:" + V4)}
+            self.assertEqual(counts, {p: 0 for p in counts}, "an address reached the block: " + block)
+            self.assertEqual(block.count("[address]"), 5, block)
+            self.assertIn("12:30:45", block)
+
+        def test_u11b_the_control_passes_and_the_dotted_only_mutant_fails_with_the_text(self):
+            code, err = self.scratch_u11b()
+            self.assertEqual((code, err), (0, ""))
+            code, err = self.scratch_u11b(("cloud/launcher/cloud_worker.py", "MASK_IPV6 = True", "MASK_IPV6 = False"))
+            self.assertEqual(code, 1, err)
+            self.assertIn("an address reached the block", err)
+
+        def scratch_u11b(self, mutate=None):
+            import shutil, subprocess, tempfile
+            root = Path(__file__).resolve().parents[2]
+            with tempfile.TemporaryDirectory(prefix="u11b-") as tmp:
+                for src in sorted((root / "cloud" / "launcher").glob("*.py")) + [root / "bin" / "path_walk.py"]:
+                    rel = src.relative_to(root)
+                    (Path(tmp) / rel).parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy(src, Path(tmp) / rel)
+                if mutate:
+                    rel, old, new = mutate
+                    text = (Path(tmp) / rel).read_text()
+                    self.assertEqual(text.count(old), 1, "the mutant's text is not in the copy: " + old)
+                    (Path(tmp) / rel).write_text(text.replace(old, new))
+                done = subprocess.run([sys.executable, "-c", U11B_CHECKER, tmp], capture_output=True, text=True, timeout=60,
+                                      env=dict(os.environ, PYTHONPATH=tmp + "/bin"))
+            return done.returncode, done.stderr
+
 
         # -- U11 (PC-10), the cut: an address that starts at character 192 of the printed line (counted from its first character, `FailedScheduling <pod>: ` included)
         def u11_cut_block(self, address):
