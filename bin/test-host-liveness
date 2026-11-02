@@ -1,0 +1,157 @@
+#!/usr/bin/env python3
+"""test-host-liveness — ask #1984, scenario S7: a charter whose pane line is `host:<hostname>/<agent>` is alive, dead or unreachable.
+
+The hosts are `h1` and `h2` (stubs); no real host, address or credential. Run by bin/test-switchboard (it loads this file).
+"""
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+import unittest
+from pathlib import Path
+
+BIN = Path(__file__).resolve().parent
+sys.path.insert(0, str(BIN))
+import host_liveness
+
+UTIL = ("bash", "sh", "cat", "grep", "sed", "awk", "date", "sort", "head", "tail", "tr", "cut", "mkdir", "rm", "mktemp", "dirname", "basename", "timeout", "python3", "env", "wc", "printf", "sleep", "uniq", "id", "uname", "cp", "mv", "ls", "touch", "chmod", "tee", "readlink", "stat", "find", "xargs")
+
+
+def raising(host, agent):
+    raise OSError("unreachable")
+
+
+class Module(unittest.TestCase):
+    def test_on_the_list_is_alive(self):
+        got = host_liveness.check("h1", "a1", ask=lambda h, a: ["a1", "a9"])
+        self.assertEqual(got["verdict"], "alive")
+        print("S7 host alive: %s" % got["verdict"])
+
+    def test_absent_is_dead(self):
+        got = host_liveness.check("h1", "a2", ask=lambda h, a: ["a1"])
+        self.assertEqual(got["verdict"], "dead")
+        print("S7 host dead: %s" % got["verdict"])
+
+    def test_a_failing_read_is_unreachable(self):
+        got = host_liveness.check("h2", "a3", ask=raising)
+        self.assertEqual(got["verdict"], "unreachable")
+        print("S7 host unreachable: %s" % got["verdict"])
+
+    def test_a_slow_read_is_unreachable(self):
+        def slow(host, agent):
+            raise subprocess.TimeoutExpired("ssh", 5)
+        self.assertEqual(host_liveness.check("h2", "a3", ask=slow)["verdict"], "unreachable")
+
+    def test_an_ill_formed_name_never_raises(self):
+        self.assertEqual(host_liveness.check("h 1", "a1", ask=lambda h, a: ["a1"])["verdict"], "unreachable")
+
+    def test_the_default_read_of_another_host_is_ssh_bounded_and_batch(self):
+        seen = {}
+        def runner(argv, **kw):
+            seen["argv"], seen["kw"] = argv, kw
+            return subprocess.CompletedProcess(argv, 0, stdout=json.dumps({"agents": {"list": [{"name": "a1"}]}}), stderr="")
+        names = host_liveness._remote("h1", runner=runner)
+        self.assertEqual(names, ["a1"])
+        self.assertIn("BatchMode=yes", seen["argv"])
+        self.assertEqual(seen["kw"]["timeout"], 5)
+
+
+def make_doctor_dir(tmp, text=None):
+    """A bin dir holding a copy of the doctor (optionally changed) beside the modules it loads."""
+    d = Path(tmp) / "bin"
+    d.mkdir()
+    for name in ("host_liveness.py", "registry.py", "endpoint_liveness.py"):
+        shutil.copy(BIN / name, d / name)
+    doctor = (BIN / "fleet-doctor").read_text() if text is None else text
+    (d / "fleet-doctor").write_text(doctor)
+    return d
+
+
+def run_doctor(bodies, doctor_text=None, panes=()):
+    tmp = tempfile.mkdtemp(prefix="test-host-liveness.")
+    path = Path(tmp) / "path"
+    path.mkdir()
+    for tool in UTIL:
+        real = shutil.which(tool)
+        if real:
+            (path / tool).symlink_to(real)
+    d = make_doctor_dir(tmp, doctor_text)
+    issues = [{"number": 10 + i, "title": "charter", "body": "```yaml\nstatus: active\npane: %s\n```" % p} for i, p in enumerate(bodies)]
+    (Path(tmp) / "issues.json").write_text(json.dumps(issues))
+    (path / "herdr").write_text("#!/bin/sh\n[ \"$1\" = \"--version\" ] && echo 'herdr 1.0.0' && exit 0\necho '%s'\n" % json.dumps(
+        {"result": {"panes": [{"pane_id": p} for p in panes]}}))
+    (path / "gh").write_text("#!/bin/sh\ncase \"$*\" in\n  *'issue list'*'--label'*) cat \"%s\";;\n  *'api repos'*) echo true;;\n  *) echo 1;;\nesac\nexit 0\n" % (Path(tmp) / "issues.json"))
+    # the stub of the read: host h1 lists agent a1; host h2 does not answer
+    (path / "ssh").write_text("#!/bin/sh\ncase \"$*\" in\n  *' h1 '*) echo '{\"agents\": {\"list\": [{\"name\": \"a1\"}]}}';;\n  *) exit 255;;\nesac\n")
+    for name in ("herdr", "gh", "ssh"):
+        (path / name).chmod(0o755)
+    (Path(tmp) / "home").mkdir()
+    env = {"PATH": str(path), "HOME": str(Path(tmp) / "home"), "TMPDIR": tmp, "FLEET_PREFIX": "tester", "FLEET_REPO": "acme-org/widget-service",
+           "FLEET_HEARTBEAT_CONF": str(Path(tmp) / "none.json"), "HERDR_SOCKET_PATH": str(Path(tmp) / "h.sock"),
+           "FLEET_REGISTRY_DIR": str(Path(tmp) / "state"), "XDG_STATE_HOME": str(Path(tmp) / "xdg")}
+    import socket
+    listener = socket.socket(socket.AF_UNIX)
+    listener.bind(env["HERDR_SOCKET_PATH"])
+    out = {}
+    def go():
+        proc = subprocess.run([str(path / "bash"), str(d / "fleet-doctor")], env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True, timeout=60)
+        out["text"] = proc.stdout
+    t = threading.Thread(target=go, daemon=True)
+    t.start()
+    t.join(70)
+    listener.close()
+    shutil.rmtree(tmp, True)
+    return [l for l in out.get("text", "").splitlines() if " charters " in l or l.split()[1:2] == ["charters"]]
+
+
+THREE = ["host:h1/a1", "host:h1/a2", "host:h2/a3"]
+
+
+class Doctor(unittest.TestCase):
+    def test_three_host_charters_print_a_live_a_dead_and_an_unknown_line(self):
+        lines = "\n".join(run_doctor(THREE))
+        self.assertIn("1 host charter(s) live", lines, lines)
+        self.assertIn("1 of 3 active charters name a dead pane: #11->host:h1/a2", lines, lines)
+        self.assertIn("1 host charter(s) unknown", lines, lines)
+        self.assertIn("#12->host:h2/a3", lines)
+        print("S7 doctor lines: 3 of 3")
+
+    def test_a_pane_charter_and_a_cloud_charter_are_as_before(self):
+        pane = "\n".join(run_doctor(["w1:p1"], panes=["w1:p1"]))
+        self.assertIn("1 active charters, all panes live", pane)
+        gone = "\n".join(run_doctor(["w1:p9"], panes=["w1:p1"]))
+        self.assertIn("1 of 1 active charters name a dead pane: #10->w1:p9", gone)
+        cloud = "\n".join(run_doctor(["cloud:orch-cloud"]))
+        self.assertIn("1 cloud charter(s) unknown (the endpoint did not answer; not a dead pane): #10->cloud:orch-cloud", cloud)
+        self.assertNotIn("host charter", pane + gone + cloud)
+        print("S7 pane and cloud fixtures: 2 of 2")
+
+
+def judge(lines):
+    """The check the mutant must fail: the three host charters are judged as host charters."""
+    if "1 host charter(s) live" not in lines or "1 host charter(s) unknown" not in lines:
+        raise AssertionError("a host charter was read as a pane: " + lines)
+
+
+class Mutant(unittest.TestCase):
+    """A copy of the doctor in which the host form is read as a pane."""
+
+    def test_a_host_charter_read_as_a_pane_fails(self):
+        original = (BIN / "fleet-doctor").read_text()
+        judge("\n".join(run_doctor(THREE, doctor_text=original)))   # the control, run first: it passes
+        old = "        host:*)   # #1984"
+        self.assertEqual(original.count(old), 1)
+        changed = original.replace(old, "        hostXX:*)   # #1984", 1)
+        applied = changed != original and old in original and old not in changed
+        self.assertTrue(applied, "the mutation was not applied")
+        noop = original.replace(old, old, 1)
+        self.assertFalse(noop != original and old in original and old not in noop, "the no-op mutation passed the computation")
+        with self.assertRaisesRegex(AssertionError, "^a host charter was read as a pane:"):
+            judge("\n".join(run_doctor(THREE, doctor_text=changed)))
+
+
+if __name__ == "__main__":
+    unittest.main()

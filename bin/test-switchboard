@@ -79761,6 +79761,11 @@ Brief_impact_brief_BriefTests, Brief_impact_brief_MutantTests = _brief_modules["
 Brief_installed_guard_TreeCase, Brief_installed_guard_TestTheEntryGuard, Brief_installed_guard_TestTheDaemon, Brief_installed_guard_TestTheHooks, Brief_installed_guard_TestTheDocument, Brief_installed_guard_TestAdviceNamesAWorktree = (
     _brief_modules["test_installed_guard"].TreeCase, _brief_modules["test_installed_guard"].TestTheEntryGuard, _brief_modules["test_installed_guard"].TestTheDaemon, _brief_modules["test_installed_guard"].TestTheHooks,
     _brief_modules["test_installed_guard"].TestTheDocument, _brief_modules["test_installed_guard"].TestAdviceNamesAWorktree)
+# #1984: bin/test-host-liveness is run by THIS runner too (loaded by path, bound by name so CI collects it)
+_host_liveness_loader = importlib.machinery.SourceFileLoader("host_liveness_tests", str(BIN / "test-host-liveness"))
+_host_liveness_tests = importlib.util.module_from_spec(importlib.util.spec_from_loader(_host_liveness_loader.name, _host_liveness_loader))
+_host_liveness_loader.exec_module(_host_liveness_tests)
+HostLiveness_Module, HostLiveness_Doctor, HostLiveness_Mutant = _host_liveness_tests.Module, _host_liveness_tests.Doctor, _host_liveness_tests.Mutant
 # #1552: tests/test_plan_check_words.py is run by THIS runner too (loaded by path like the brief tests above; bound by name so CI collects it)
 _plan_check_words_spec = importlib.util.spec_from_file_location("plan_check_words_tests", REPO / "tests" / "test_plan_check_words.py")
 _plan_check_words_module = importlib.util.module_from_spec(_plan_check_words_spec)
