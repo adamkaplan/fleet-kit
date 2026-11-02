@@ -32,7 +32,7 @@ def battery(rig):
         if len(calls) != 1 or calls[0]["argv"][-1].count(MARK % "alice-bot") != 1:
             bad.append("unsigned with %s" % flag)
     for args in (("-R", "issue", "view", "1"), ("-R", "o/r", "issue", "view", "1"), ("-R", "o/r", "pr", "list"),
-                 ("-R", "issue", "comment", "1", "--body", "x"), ("api", "repos/o/r/issues/1", "-f", "title=-R", "-f", "body=-R")):
+                 ("-R", "issue", "comment", "1", "--body", "x"), ("api", "repos/o/r/issues/1", "-f", "title=-R", "-f", "state=-R")):
         done, calls = rig.run(*args)
         if len(calls) != 1 or calls[0]["argv"] != list(args):
             bad.append("an unrelated call changed: %s" % " ".join(args))
