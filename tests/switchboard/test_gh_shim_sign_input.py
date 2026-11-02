@@ -2066,9 +2066,9 @@ class TestGhShimBracketBodyKeys(unittest.TestCase):
 
     def test_s36_a_mutant_with_the_old_key_pattern_is_seen(self):
         self.assertEqual(bracket_body_failures(self.rig), [])   # control first
-        new = '    return key.lower() == "body" or key in ALLOWED_KEYS'
-        old = '    return key.lower() == "body" or not re.search(r"(?i)(^|\[)body\]?$", key)'
-        self.assertEqual(self.source.count(new), 1, "the mutant's anchor is gone (the allowlist check of the shim)")
+        new = '"%" in key or key not in ALLOWED_KEYS or (key == "body" and key in query_keys)'
+        old = '"%" in key or ((key != "body" or key in query_keys) and re.search(r"(?i)(^|\\[)body\\]?$", key))'
+        self.assertEqual(self.source.count(new), 1, "the mutant's anchor is gone (the key check of api_decide)")
         rig = Rig(self.source.replace(new, old))
         self.addCleanup(rig.close)
         self.assertIn("a body[] field went out unsigned", bracket_body_failures(rig), "a body[] field went out unsigned")
