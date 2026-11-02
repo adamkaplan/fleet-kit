@@ -45,7 +45,7 @@ def scan(registry_src, view_src):
 def problems(registry_src, view_src):
     deciders, callers, old = scan(registry_src, view_src)
     out = []
-    if deciders != ["registry:shows_dead"]:
+    if deciders != ["registry:evidence_shows_absent", "registry:shows_dead"]:
         out.append("deciders %r" % deciders)
     if callers != ["reconcile_on_read", "reconcile_remove"]:
         out.append("callers %r" % callers)
@@ -58,14 +58,14 @@ def old_registry_rule(row, evidence):
     """The registry's old inline test of reconcile_remove."""
     if row.get("pane") is None and row.get("endpoint") is not None:
         return isinstance(evidence, dict) and evidence.get("endpoint_verdict") == "dead"
-    return row.get("state") == "dead" and isinstance(evidence, dict) and evidence.get("pane_listed") is False and evidence.get("process_found") is False
+    return row.get("state") == "dead" and isinstance(evidence, dict) and evidence.get("pane_listed") in (True, False) and evidence.get("process_found") is False
 
 
 def old_view_rule(row, evidence):
     """The view's old decision (whether it asked the registry to remove): no_pane_to_judge -> verdict dead; else dead state and both absent."""
     if REG.no_pane_to_judge(row):
         return evidence.get("endpoint_verdict") == "dead"
-    return row.get("state") == "dead" and evidence.get("pane_listed") is False and evidence.get("process_found") is False
+    return row.get("state") == "dead" and evidence.get("pane_listed") in (True, False) and evidence.get("process_found") is False
 
 
 def old_removes(row, evidence):
@@ -136,7 +136,7 @@ class TestSharesDeadVerdict(unittest.TestCase):
         ep = {"endpoint": "http://acme.example"}
         table = [
             (True, {"state": "dead", "pane": "p_1"}, GONE),
-            (False, {"state": "dead", "pane": "p_1"}, {"pane_listed": True, "process_found": False}),
+            (True, {"state": "dead", "pane": "p_1"}, {"pane_listed": True, "process_found": False}),
             (False, {"state": "dead", "pane": "p_1"}, {"pane_listed": False, "process_found": True}),
             (False, {"state": "dead", "pane": "p_1"}, {"pane_listed": None, "process_found": False}),
             (False, {"state": "dead", "pane": "p_1"}, {"pane_listed": False, "process_found": None}),
@@ -151,7 +151,7 @@ class TestSharesDeadVerdict(unittest.TestCase):
         ]
         got = [REG.shows_dead(row, ev) for _, row, ev in table]
         self.assertEqual(got, [want for want, _, _ in table])
-        self.assertEqual(sum(got), 2)
+        self.assertEqual(sum(got), 3)
 
     def test_s3_callers_and_the_view_against_a_fake_registry(self):
         self.assertEqual(problems((BIN / "registry.py").read_text(), (BIN / "agent_reconcile.py").read_text()), [])
@@ -184,7 +184,7 @@ class TestSharesDeadVerdict(unittest.TestCase):
         reg_src = (BIN / "registry.py").read_text()
         view_src = (BIN / "agent_reconcile.py").read_text()
         deciders, callers, old = scan(reg_src, view_src)
-        self.assertEqual((deciders, callers, old), (["registry:shows_dead"], ["reconcile_on_read", "reconcile_remove"], 0))
+        self.assertEqual((deciders, callers, old), (["registry:evidence_shows_absent", "registry:shows_dead"], ["reconcile_on_read", "reconcile_remove"], 0))
         mutants = {
             "second private rule in the view": (reg_src, view_src.replace(
                 "        evidence = evidence_of(agent, live)\n",
