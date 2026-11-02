@@ -9732,7 +9732,7 @@ def finish_pass(engine, discovery, report):
 # issue or PR is closed (withdrawn); S5 a cos-tier decision that has aged. It never edits GitHub and never changes a tier.
 
 SWEEP_DEFAULTS = {"enabled": False, "aged_cos_hours": 2, "comment_window_days": 7, "max_findings": 20,
-                  "realarm_hours": 6, "person_names": ["the owner"], "calls_per_pass": 12}
+                  "realarm_hours": 6, "person_names": ["the owner"], "calls_per_pass": 16}
 SWEEP_S6A_GRACE = 900         # a PR younger than this is not yet "marker without label": the label is applied after it opens
 SWEEP_S1A_GRACE = 600         # a decision section whose issue changed this recently may be mid-escalation (one label off, the next not yet on)
 SWEEP_TTL = 900               # seconds a repo's lists are kept before they are read again
