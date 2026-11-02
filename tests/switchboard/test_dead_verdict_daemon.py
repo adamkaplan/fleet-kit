@@ -59,7 +59,7 @@ def source_copy_function(name, old, new):
 # Each situation: how the multiplexer is arranged (the fake of tests/switchboard/support/herdr_world.py), and what the OLD rules answered.
 #  list: the whole list holds the pane ("listed"), not ("absent"), cannot be read ("unreadable"); process: the pane's foreground ("runs" the session, a
 #  bare "shell", "unread"); get: pane_get ("ok", "notfound", "error"); judged: the agent is absent from the agent list (the old loop looks).
-CASES = {
+DEAD_CASES = {
     "pane gone": dict(list="absent", process="unread", get="notfound", missing=True),
     "listed bare shell": dict(list="listed", process="shell", get="ok", missing=True),
     "listed, process unread": dict(list="listed", process="unread", get="ok", missing=True),
@@ -166,7 +166,7 @@ class TestDaemonDeadVerdict(Base):
     # -- S2 / S9: the table
     def table(self):
         rows = {}
-        for label, case in CASES.items():
+        for label, case in DEAD_CASES.items():
             rig = Rig(self, case)
             rig.arrange()
             ps, lp = old_pane_state(case), old_loop(case)
@@ -202,8 +202,8 @@ class TestDaemonDeadVerdict(Base):
 
     # -- S4: a read that failed is never death
     def test_S4_four_cases_are_not_recorded_dead_and_write_no_dead_event(self):
-        cases = {"pane_get fails, not not-found": CASES["pane_get fails, not not-found"], "list cannot be read": CASES["list cannot be read"],
-                 "listed, process unread": CASES["listed, process unread"], "row with no pane": CASES["row with no pane"]}
+        cases = {"pane_get fails, not not-found": DEAD_CASES["pane_get fails, not not-found"], "list cannot be read": DEAD_CASES["list cannot be read"],
+                 "listed, process unread": DEAD_CASES["listed, process unread"], "row with no pane": DEAD_CASES["row with no pane"]}
         for label, case in cases.items():
             with self.subTest(label):
                 rig = Rig(self, case)
@@ -220,13 +220,13 @@ class TestDaemonDeadVerdict(Base):
                     self.assertEqual(rig.pane_state(), sb.PANE_UNKNOWN)
 
     def test_S4_the_listed_pane_with_the_process_unread_keeps_its_last_state(self):
-        rig = Rig(self, CASES["listed, process unread"])
+        rig = Rig(self, DEAD_CASES["listed, process unread"])
         rig.three_passes()
         self.assertNotIn(rig.recorded(), ("dead", None))   # the loop leaves the last known state (here `attached`): it records no death
 
     # -- S5: absence, three passes
     def test_S5_three_passes_of_absence_record_dead_once_and_the_registry_removes_it_on_the_same_evidence(self):
-        rig = Rig(self, CASES["pane gone"])
+        rig = Rig(self, DEAD_CASES["pane gone"])
         rig.three_passes()
         self.assertEqual(rig.recorded(), "dead")
         self.assertEqual(len(rig.events()), 1)
@@ -241,11 +241,11 @@ class TestDaemonDeadVerdict(Base):
 
     # -- S10: a listed bare shell
     def test_S10_a_listed_bare_shell_is_detached_in_pane_state_and_dead_where_death_is_recorded(self):
-        rig = Rig(self, CASES["listed bare shell"])
+        rig = Rig(self, DEAD_CASES["listed bare shell"])
         rig.arrange(for_pane_state=True)
         self.assertEqual(rig.pane_state(), sb.PANE_DETACHED)
         self.assertTrue(rig.shows_dead())
-        loop = Rig(self, CASES["listed bare shell"])
+        loop = Rig(self, DEAD_CASES["listed bare shell"])
         loop.three_passes()
         self.assertEqual(loop.recorded(), "dead")
         self.assertEqual(len(loop.events()), 1)
@@ -253,11 +253,11 @@ class TestDaemonDeadVerdict(Base):
         self.assertTrue(loop.registry.shows_dead(row, loop.reconcile.evidence_of(row, sb.herdr_live_check(loop.engine.herdr)(NAME, row))))
 
     def test_S10_the_same_pane_with_the_process_unread_is_not_dead(self):
-        loop = Rig(self, CASES["listed, process unread"])
+        loop = Rig(self, DEAD_CASES["listed, process unread"])
         loop.three_passes()
         self.assertEqual((loop.recorded(), loop.events()), ("attached", []))   # not dead: the loop changes nothing
         self.assertFalse(loop.shows_dead())
-        state = Rig(self, CASES["listed bare shell"])
+        state = Rig(self, DEAD_CASES["listed bare shell"])
         state.arrange(for_pane_state=True)
         state.patch(sb.HerdrClient, "pane_process_info", side_effect=sb.HerdrError("down", "process list cannot be read"))
         self.assertNotEqual(state.pane_state(), sb.PANE_DEAD)   # pane_state's own answer to an unread process is `unknown` (it cannot say `detached` without the process)
@@ -283,11 +283,11 @@ class TestDaemonDeadVerdictMutants(Base):
 
     def collect(self):
         found = []
-        rig = Rig(self, CASES["listed bare shell"])
+        rig = Rig(self, DEAD_CASES["listed bare shell"])
         rig.three_passes()
         if not (rig.recorded() == "dead" and len(rig.events()) == 1):
             found.append("a listed bare shell is not recorded dead by the loop")
-        rig = Rig(self, CASES["listed, process unread"])
+        rig = Rig(self, DEAD_CASES["listed, process unread"])
         rig.three_passes()
         if rig.recorded() == "dead" or rig.events():
             found.append("an unread process is recorded dead")
