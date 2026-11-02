@@ -616,10 +616,10 @@ def leaks(out):
     # a leak: a substring of a run of address characters of the OUTPUT, from a run boundary or a colon or a dot to one, that ipaddress accepts (a zone is set aside)
     for run in re.findall(r"[0-9A-Fa-f:.]+", out):
         for i in range(len(run)):
-            if not (i == 0 or run[i - 1] in ":." or run[i] in ":."):
+            if not (i == 0 or (run[i - 1] in ":." and run[i - 2:i] != "::")):
                 continue
             for j in range(i + 1, min(len(run), i + 64) + 1):
-                if (j == len(run) or run[j] in ":." or run[j - 1] in ":.") and accepted(run[i:j]):
+                if (j == len(run) or (run[j] in ":." and run[j:j + 2] != "::")) and accepted(run[i:j]):
                     return run[i:j]
     return None
 """
@@ -660,7 +660,7 @@ for _ in range(20000):
     if rng.random() < 0.3:
         line += " " + rng.choice(labels) + address() + rng.choice(tails)
     out = lib._mask_addresses(line)
-    found = leaks(re.sub(r"%[0-9A-Za-z_-]+", "", out))
+    found = leaks(re.sub(r"%[0-9A-Za-z_-]+", " ", out))
     if found:
         bad.append((line, out, found))
         if len(bad) >= 5:
