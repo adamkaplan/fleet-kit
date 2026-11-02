@@ -227,7 +227,7 @@ def build(PR4Base):
                     self.assertEqual(self.run_fifty("s-fifty2")[0], 50, msg="(a) reminders delivered of 50")
 
         def test_s16_a_mutant_that_sends_each_due_reminder_as_its_own_steer_is_caught(self):
-            import inspect, textwrap
+            import copy, inspect, textwrap
             self.fifty_world()
             delivered, most, late, repeats = self.run_fifty("s-fifty")
             self.assertEqual((delivered, most), (50, 1), msg="control: the unmutated code, 50 delivered in at most one steer per pass")
@@ -245,7 +245,7 @@ def build(PR4Base):
             self.assertEqual(source.count(old), 1, msg="the replaced text is in the source once")
             mutated = source.replace(old, new)
             self.assertNotEqual(mutated, source, msg="mutation not applied: one steer per due reminder")
-            space = dict(engine_class.deliver.__globals__)
+            space = dict(engine_class.deliver.__globals__, copy=copy)   # the name the inserted loop uses, passed explicitly
             exec(textwrap.dedent(mutated), space)
             with mock.patch.object(engine_class, "deliver", space["deliver"]):
                 delivered, most, late, repeats = self.run_fifty("s-fifty2")
@@ -262,6 +262,7 @@ def build(PR4Base):
                 with captured() as (out, err):
                     code = sb.main(["remind", lane, when, "look at the widget-api build", "--from", "orch"], self.world.route, self.world.clock.now, lambda s: None)
                 self.assertEqual(code, 0, err.getvalue())
+            # Measure (not fixed): grep finds `deadline` only in the reads at `reminder_bound` and `late_reminder_counts` in reminders.py.
             # No production writer makes a `deadline` item (add_reminder has no such argument and no audit line carries it): the fixture marks one in the
             # store and in its `reminder.add` line, the one place `reminder_bound` and `late_reminder_counts` read it.
             item = sb.add_reminder(state, "boss", base + 600, base, "the deadline", 7, "orch", "acme/widget-api")
