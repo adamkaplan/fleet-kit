@@ -73028,7 +73028,7 @@ class TestShimTopSpender(Base):
 
     # Every environment name the shim reads, with a hostile value for it. DERIVED from the shim's own code (see `shim_environment_names`): a name the shim starts to read
     # and this table does not list fails the test below, so a new switch cannot appear unseen. SWITCH_OFF lists the names that can still make the caller wait less.
-    HOSTILE = {"FLEET_REAL_GH": "/nonexistent/gh", "FLEET_SHIM_CACHE": "off", "FLEET_SHIM_GATE_SECONDS": "0.001", "FLEET_SHIM_LOOKUP_SECONDS": "0.001",
+    HOSTILE = {"FLEET_REAL_GH": "/nonexistent/gh", "FLEET_SHIM_BODY_SECONDS": "0.001", "FLEET_SHIM_CACHE": "off", "FLEET_SHIM_GATE_SECONDS": "0.001", "FLEET_SHIM_LOOKUP_SECONDS": "0.001",
                "FLEET_SHIM_MERGE_GATE_SECONDS": "0.001", "FLEET_SWITCHBOARD_BIN": "OTHER", "FLEET_SWITCHBOARD_STATE": "EMPTY", "GH_HOST": "ghe.example", "GH_REPO": "other/repo",
                "PATH": "SAME", "XDG_CONFIG_HOME": "EMPTY", "XDG_STATE_HOME": "EMPTY", "HOME": "EMPTY"}
     SWITCH_OFF = frozenset()   # none: the block reads no variable; who the caller is comes from the switchboard's answer for its session (see the shim's comment)
