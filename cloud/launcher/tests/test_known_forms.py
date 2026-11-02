@@ -398,6 +398,7 @@ class Mutants(unittest.TestCase):
         self.assertEqual(self.SRC.count(old), 1)
         src = self.SRC.replace(old, new)
         self.assertNotEqual(src, self.SRC)
+        self.last_src = src
         ns = {"__name__": "mut", "__file__": cw.__file__}
         exec(compile(src, "mut", "exec"), ns)
         return ns["KnownForms"]
@@ -672,15 +673,26 @@ class S14TwoLists(unittest.TestCase):
         self.assertEqual(across, len(fs), self.MSG)
         return kept1, gone, kept, gone2, across, len(fs)
 
+    @staticmethod
+    def is_applied(orig, mutated, cut):
+        return mutated != orig and cut in orig and cut not in mutated
+
     def test_s14(self):
         r = self.check(cw.KnownForms)   # the control first
         self.assertEqual(r, (8, 8, [8, 8, 8], 8, 8, 8))
-        bad = Mutants("test_s3_control_and_mutant").mutant(' and (l[1] if l[0] == "pod" else l[2]) in before}', '}')
+        cut = ' and (l[1] if l[0] == "pod" else l[2]) in before}'
+        mu = Mutants("test_s3_control_and_mutant")
+        bad = mu.mutant(cut, '}')
+        applied = self.is_applied(Mutants.SRC, mu.last_src, cut)
+        self.assertTrue(applied, "the mutation of S14 was not applied")
+        with self.assertRaises(AssertionError) as nm:   # control of the check: a no-op mutation
+            self.assertTrue(self.is_applied(Mutants.SRC, Mutants.SRC.replace(cut, cut), cut), "the mutation of S14 was not applied")
+        self.assertIn("the mutation of S14 was not applied", str(nm.exception))
         with self.assertRaises(AssertionError) as cm:
             self.check(bad)
         ok = self.MSG in str(cm.exception)
         self.assertTrue(ok)
-        print("S14: kept %d of %d after one absence, gone %d of %d after two in a row, kept through absent-present-absent and across a skipped pass; control 1 of 1, mutant 1 of 1 with the text, mutation applied True" % (r[0], r[5], r[1], r[5]))
+        print("S14: kept %d of %d after one absence, gone %d of %d after two in a row, kept through absent-present-absent and across a skipped pass; control 1 of 1, mutant 1 of 1 with the text, mutation applied %s" % (r[0], r[5], r[1], r[5], applied))
 
 
 if __name__ == "__main__":
