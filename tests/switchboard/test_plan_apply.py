@@ -1,18 +1,23 @@
 """#1789: `fleet-switchboard plan apply` applies an approved plan edit and refuses anything that was not approved. Offline: a FAKE issue.
-build(host) takes the host module of bin/test-switchboard (its HandoffCase and helpers) and returns the test classes."""
+build(HandoffCase) takes the HandoffCase of bin/test-switchboard and returns the test classes."""
 import hashlib
 import json
 import os
 import re
 import subprocess
-import sys
 from pathlib import Path
 from unittest import mock
 
+from support.loader import captured, sb
+from support.scenario_roles import FAKE_GH, FAKE_REPO
 
-def build(host):
-    sb, REPO_NAME, GH = host.sb, host.FAKE_REPO, host.FAKE_GH
+
+def build(HandoffCase):
+    REPO_NAME, GH = FAKE_REPO, FAKE_GH
     mark = lambda name: "<!-- fleet-switchboard:from=%s -->" % name
+    def plan_apply_text():
+        text = (ROOT / "bin" / "switchboard" / "plan_input.py").read_text()
+        return text[text.index("# ---- plan apply (#1789)"):]
     ROOT = Path(__file__).resolve().parents[2]
     PLAN = ("## Plan (scenarios)\n\nsize: S\n\nunchanged: none because this is a brand new endpoint with no callers\n\n```yaml\nclauses:\n  DW-1: \"the thing works\"\n```\n\nTier S. The thing is small.\n"
             "Alpha line. Beta line. Beta line.\n\n```yaml\nscenarios:\n  - id: S1\n    covers: DW-1\n    text: Given a thing, when used, then it works\n"
@@ -62,7 +67,7 @@ def build(host):
         def requests_to_body(self):
             return [c for c in self.calls if re.match(r"^repos/[^/]+/[^/]+/issues/\d+$", c[1])]
 
-    class PlanApplyCase(host.HandoffCase):
+    class PlanApplyCase(HandoffCase):
         def setUp(self):
             super().setUp()
             self.gh = FakeIssue()
@@ -88,7 +93,7 @@ def build(host):
             sha = hashlib.sha256(path.read_bytes()).hexdigest()
             argv = ["plan", "apply", issue, "--file", str(path), "--expect-live", live or self.ph(self.gh.store[1]["body"]),
                     "--expect-result", result or self.ph(self.good()), "--expect-file", file or sha] + list(extra)
-            with host.captured() as (out, err):
+            with captured() as (out, err):
                 code = sb.main(argv, runner=self.route, now=self.world.clock.now, socket_call=self.world.herdr.socket)
             return code, out.getvalue(), err.getvalue()
 
@@ -197,7 +202,7 @@ def build(host):
             self.assertEqual(methods.count("PATCH"), 1)
             self.assertEqual(methods.count("POST"), 1)
             self.assertEqual(self.gh.requests_to_body(), [])
-            source = (ROOT / "bin" / "plan_apply.py").read_text()
+            source = plan_apply_text()
             self.assertEqual(len(re.findall(r"""["']api["']""", source)), 0)
             self.assertNotIn("gh api", source.replace("`gh api` call", ""))
 
@@ -222,11 +227,10 @@ def build(host):
             self.assertEqual(self.gh.store[2]["body"].count("plan check: FAIL"), 0)
 
         def test_u5_mutant_that_omits_the_line_fails_with_its_text(self):
-            import plan_apply
             self.run_apply()
             self.gh = FakeIssue(); self.gh.add(1, PLAN)
-            real = plan_apply.receipt_text
-            with mock.patch.object(plan_apply, "receipt_text", lambda *a: real(*a[:7])):
+            real = sb.receipt_text
+            with mock.patch.object(sb, "receipt_text", lambda *a: real(*a[:7])):
                 with self.assertRaisesRegex(AssertionError, r"plan check: FAIL line missing: patch, receipt, printed, in receipt, exit = \(1, 1, 1, 0, 1\)"):
                     self.check_failed_plan_check_is_in_the_receipt()
 
@@ -245,18 +249,16 @@ def build(host):
             self.check_file_was_checked()
 
         def test_s6_mutant_that_skips_the_live_check_fails_with_its_text(self):
-            import plan_apply
-            self.run_apply()   # the glue has put bin/ on sys.path by now
+            self.run_apply()
             self.gh = FakeIssue(); self.gh.add(1, PLAN)
-            with mock.patch.object(plan_apply, "expect_live", lambda have, want: None):
+            with mock.patch.object(sb, "expect_live", lambda have, want: None):
                 with self.assertRaisesRegex(AssertionError, "--expect-live was not checked"):
                     self.check_live_was_checked()
 
         def test_s6_mutant_that_skips_the_file_check_fails_with_its_text(self):
-            import plan_apply
             self.run_apply()
             self.gh = FakeIssue(); self.gh.add(1, PLAN)
-            with mock.patch.object(plan_apply, "expect_file", lambda have, want: None):
+            with mock.patch.object(sb, "expect_file", lambda have, want: None):
                 with self.assertRaisesRegex(AssertionError, "--expect-file was not checked"):
                     self.check_file_was_checked()
 
@@ -264,14 +266,13 @@ def build(host):
         HEADING = "Applying an approved plan edit"
 
         def places(self):
-            import plan_apply
             help_text = self.plain_help()
             skill = (ROOT / "skills/fleet-planning/SKILL.md").read_text()
             template = (ROOT / "docs/plan-template.md").read_text()
-            return {"skill": skill, "template": template, "help": help_text}, plan_apply.STANDARD_FORM
+            return {"skill": skill, "template": template, "help": help_text}, sb.STANDARD_FORM
 
         def plain_help(self):
-            with host.captured() as (out, err):
+            with captured() as (out, err):
                 try:
                     sb.main(["plan", "apply", "-h"], runner=self.route, now=self.world.clock.now, socket_call=self.world.herdr.socket)
                 except SystemExit:
@@ -296,7 +297,7 @@ def build(host):
             self.assertEqual(missing["help"], [form[0]])
 
         def test_u2_no_second_hash_or_plan_selection_and_plan_check_output_is_the_one_renderer(self):
-            source = (ROOT / "bin" / "plan_apply.py").read_text()
+            source = plan_apply_text()
             self.assertEqual(len(re.findall(r"hashlib\.sha256\(", source)), 1)   # the file's sha256 only
             self.assertNotIn("def plan_hash", source)
             self.assertNotIn("def select_plan_text", source)
@@ -304,7 +305,7 @@ def build(host):
             for text in (PLAN, PLAN.replace("small", "tiny")):
                 path = self.home / "p.md"
                 path.write_text(text)
-                with host.captured() as (out, err):
+                with captured() as (out, err):
                     code = sb.main(["plan", "check", "--file", str(path), "--done-when", "(1) the thing works"], runner=self.route,
                                    now=self.world.clock.now, socket_call=self.world.herdr.socket)
                 result = sb.plan_check.check(text, "(1) the thing works", None)
