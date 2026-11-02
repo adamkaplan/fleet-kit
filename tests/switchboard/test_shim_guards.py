@@ -18,7 +18,7 @@ from support.paths import BIN, REPO
 TOOL = REPO / "tools" / "new-module-demands"
 MATRIX = REPO / "docs" / "review-laws" / "impact-matrix.json"
 PATH_SUITES = BIN / "path_suites.py"
-SWITCHBOARD = BIN / "fleet-switchboard"
+SWITCHBOARD_FILE = BIN / "fleet-switchboard"
 PLAIN = "def format_line(x):\n    return x\n"
 # The output of the tool for a planted bin/y.py, recorded from a clean worktree of the base branch before the change
 # (the closure line is the live state of derive-closure, which this change does not touch).
@@ -175,7 +175,7 @@ class TestShimGuardRows(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.ps = shim_load(PATH_SUITES, "shim_ps_rows")
-        loader = importlib.machinery.SourceFileLoader("shim_sb_rows", str(SWITCHBOARD))
+        loader = importlib.machinery.SourceFileLoader("shim_sb_rows", str(SWITCHBOARD_FILE))
         cls.sb = importlib.util.module_from_spec(importlib.util.spec_from_loader("shim_sb_rows", loader))
         loader.exec_module(cls.sb)
 
