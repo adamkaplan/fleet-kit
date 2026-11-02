@@ -354,7 +354,41 @@ class TestCiFreshReads(FreshCase):
             self.assertEqual((gh.calls, facts["ci"]), ([], "unknown"), kw)
         gh = CountingGh()
         facts = judge(gh, head=None)
-        self.assertEqual((facts["ci"], "runs" in gh.kinds(), "compare" in gh.kinds()), ("unknown", False, False))   # no head: no run list (the tip line is not this PR's one named line: it still reads the tip once)
+        self.assertEqual((gh.calls, facts["ci"]), ([], "unknown"), "no head with a valid base_ref makes 0 reads")
+        control = CountingGh()
+        judge(control)
+        self.assertEqual(control.kinds()[:2], ["runs", "tip"])
+
+    def test_a_reader_that_reads_the_tip_without_a_head_is_caught(self):
+        def check(mod):
+            gh = CountingGh()
+            self.assertEqual(judge(gh, head=None, reading=mod)["ci"], "unknown")
+            self.assertEqual(len(gh.calls), 0, "no head with a valid base_ref makes 0 reads")
+        check(_copy_of(pr_reading, TestCiFreshReadMutants.TIP_NEW, None, "pr_reading_nohead_control"))
+        mod = _copy_of(pr_reading, TestCiFreshReadMutants.TIP_NEW, TestCiFreshReadMutants.TIP_OLD, "pr_reading_nohead")
+        with self.assertRaisesRegex(AssertionError, "makes 0 reads"):
+            check(mod)
+
+    def test_a_negative_boolean_or_string_ahead_by_is_not_counted(self):
+        for bad in (-3, True, "-3"):
+            clear_cache()
+            facts = judge(CountingGh(behind=bad))
+            self.assertIn("were not counted", facts["ci_line"], bad)
+            self.assertNotIn("-3", facts["ci_line"])
+            self.assertNotEqual(facts["ci"], "green")
+        clear_cache()
+        self.assertIn("3 commits behind", judge(CountingGh(behind=3))["ci_line"])
+
+    BEHIND_OLD = "if not isinstance(n, int): raise"
+
+    def test_a_reader_that_restores_the_old_ahead_by_check_is_caught(self):
+        def check(mod):
+            clear_cache()
+            self.assertIn("were not counted", judge(CountingGh(behind=-3), reading=mod)["ci_line"], "a negative ahead_by is not counted")
+        check(_copy_of(pr_reading, "if not isinstance(n, int) or isinstance(n, bool) or n < 0: raise", None, "pr_reading_behind_control"))
+        mod = _copy_of(pr_reading, "if not isinstance(n, int) or isinstance(n, bool) or n < 0: raise", self.BEHIND_OLD, "pr_reading_behind")
+        with self.assertRaisesRegex(AssertionError, "a negative ahead_by is not counted"):
+            check(mod)
 
     def test_s7_a_pair_is_read_once_per_pass(self):
         gh = CountingGh()
@@ -449,7 +483,9 @@ class TestCiFreshReadMutants(FreshCase):
     """Mutants of `pr_reading.read_fresh` (one per GitHub read it makes) and of the merge gate's `N commits behind` text; each has a control."""
 
     RUNS = "runs = read_pr_runs(gh, repo, number, head) if head and isinstance(base_ref, str) and base_ref else []"
-    TIP = "tip = read_tip(gh, repo, base_ref) if isinstance(base_ref, str) and base_ref else None"
+    TIP_NEW = "tip = read_tip(gh, repo, base_ref) if head and isinstance(base_ref, str) and base_ref else None"
+    TIP = TIP_NEW
+    TIP_OLD = "tip = read_tip(gh, repo, base_ref) if isinstance(base_ref, str) and base_ref else None"
     COMPARE = "behind = read_behind(gh, repo, base, tip) if base and base != tip else None"
 
     def read_all(self, mod):
