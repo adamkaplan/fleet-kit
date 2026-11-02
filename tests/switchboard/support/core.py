@@ -147,6 +147,10 @@ class Base(unittest.TestCase):
             calm = mock.patch.object(target, name, value)
             calm.start()
             self.addCleanup(calm.stop)
+        # no test reads the real disk: the guard reads the free space of the state directory's volume on every pass; a test of the guard patches its own reading over this one
+        calm_disk = mock.patch.object(sb.shutil, "disk_usage", lambda path: collections.namedtuple("usage", "total used free")(1000 * 10 ** 9, 762 * 10 ** 9, 238 * 10 ** 9))
+        calm_disk.start()
+        self.addCleanup(calm_disk.stop)
         (self.home / "cos-definition.md").write_text(COS_ALLOWING)
         for name in (sb.LAB_ENV, sb.FAULT_ENV, "HERDR_PANE_ID", "OPENCODE_SESSION_ID"):
             os.environ.pop(name, None)
