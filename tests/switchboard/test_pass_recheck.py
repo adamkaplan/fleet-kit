@@ -9,8 +9,8 @@ from support.core import Base
 from support.loader import sb
 
 from support.herdr_world import World
-from support.fake_hubs import FakeTriageHub, sweep_issue, tri_issue   # bin/test-switchboard also gives FakeSweepHub (it lives in a test module)
-FakeSweepHub = None
+from support.fake_hubs import FakeTriageHub, sweep_issue, tri_issue
+from support.helper_fakes import FakeSweepHub
 
 SWEEP_KEY = "sweep:0123456789:4"
 TRIAGE_KEY = "triage:abcdef0123:4"
