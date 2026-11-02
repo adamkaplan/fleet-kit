@@ -124,18 +124,14 @@ def build(PR4Base):
             self.two_plans_one_pass("k")
 
         def test_low1_mutant_clearing_in_the_sort_helper_fails_after_the_control(self):
-            real = sb.ReminderFacts.newest_first
+            self.mutated_run(sb.ReminderFacts, "newest_first", 'not per delivery call."""\n', 'not per delivery call."""\n    self.swept.clear()\n',
+                             lambda: self.two_plans_one_pass(self.next_key()), r"low1: a copy swept by the first plan")
 
-            def clearing(self_, facts):
-                self_.swept.clear()
-                return real(self_, facts)
-            self.two_plans_one_pass("k")   # the control
-            sb.ReminderFacts.newest_first = clearing
-            try:
-                with self.assertRaisesRegex(AssertionError, r"low1: a copy swept by the first plan"):
-                    self.two_plans_one_pass("y")
-            finally:
-                sb.ReminderFacts.newest_first = real
+        _n = 0
+
+        def next_key(self):
+            type(self)._n += 1
+            return "k%d" % self._n
 
         def pass_sweeping(self, key):
             self.world.tick(500)   # the last turn of the lane has ended
