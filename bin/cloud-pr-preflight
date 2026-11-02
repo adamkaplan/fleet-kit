@@ -126,7 +126,7 @@ def run_files(names, sel_of, root, basedir, timeout, quick, clock=None, run=None
         if quick and remaining <= 0:
             not_run = list(names[i:])
             break
-        if quick and secs is not None and skipped is not None and not stop and not cloud_quick.fits(path, secs, remaining):
+        if quick and secs is not None and skipped is not None and not stop and verdicts and not cloud_quick.fits(path, secs, remaining):
             stop = True
         if quick and path in cloud_quick.HEAVY:
             out("%-52s %-9s %-9s %s" % (rel, "-", "-", "skipped: memory-heavy " + path))

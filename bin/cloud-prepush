@@ -515,7 +515,7 @@ def stage(root, base, mbase, changed, tmp, scratch, TIMEOUT_S, TOTAL_S, started,
                 if rec:
                     rec.set(rel, branch="could not run", base="could not run", kind="noRun", text=diffs[-1])
                 continue
-            if MODE == "quick" and seconds and not stopped:
+            if MODE == "quick" and seconds and not stopped and (run or noRun):
                 # both sides run here, so twice the recorded seconds must fit the quick budget left
                 quick_left = quick_budget() - (time.monotonic() - loop_start)
                 stopped = not cloud_quick.fits(rel, seconds, quick_left / 2.0)
