@@ -50,7 +50,7 @@ class TestClaimLegacy(unittest.TestCase):
     def test_s3_after_the_cutoff_or_unreadable_the_sibling_is_still_unknown(self):
         for when in (iso(CUTOFF + 86400 * 30), "not a time", "2026-10-29"):
             why = self.judge(when)
-            self.assertIsNotNone(why, when)
+            self.assertIsNotNone(why, "a sibling merged AFTER the claim ledger cutoff (or unreadable) must be an unknown sibling, not legacy: " + when)
             self.assertIn("no recorded claim", why, when)
 
     def test_s4_the_boundary_is_at_or_before(self):
@@ -92,8 +92,8 @@ class TestClaimLegacy(unittest.TestCase):
         rule = "if not found and merged is not None and merged <= CLAIM_LEDGER_SINCE:"
         mutants = (
             ("the rule deleted", rule, "if False:", "has no recorded claim at or before its merge"),
-            ("the cutoff ignored", "merged <= CLAIM_LEDGER_SINCE:", "merged <= CLAIM_LEDGER_SINCE or True:", "unexpectedly None"),
-            ("the cutoff 30 days late", "CLAIM_LEDGER_SINCE = %d " % CUTOFF, "CLAIM_LEDGER_SINCE = %d " % (CUTOFF + 2592000), "unexpectedly None"),
+            ("the cutoff ignored", "merged <= CLAIM_LEDGER_SINCE:", "merged <= CLAIM_LEDGER_SINCE or True:", "a sibling merged AFTER the claim ledger cutoff (or unreadable) must be an unknown sibling, not legacy: "),
+            ("the cutoff 30 days late", "CLAIM_LEDGER_SINCE = %d " % CUTOFF, "CLAIM_LEDGER_SINCE = %d " % (CUTOFF + 2592000), "a sibling merged AFTER the claim ledger cutoff (or unreadable) must be an unknown sibling, not legacy: "),
         )
         for name, old, new, anchor in mutants:
             with self.subTest(name):
