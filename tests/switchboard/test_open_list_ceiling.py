@@ -3,10 +3,12 @@ import re
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 import types
 
 from support.core import Base
+from support.rebind import rebound
 from support.loader import copy_entry, _load, sb
 
 NOW = 1798000000.0
@@ -162,7 +164,6 @@ class TestOpenListCeilingMutant(Base):
     NAMES = ("test_s2_the_sweep_reads_all_456_and_the_oldest_held_pull_request", "test_s3_the_triage_reads_all_456")
 
     def run_against(self, source_edit, tag):
-        me = sys.modules[__name__]
         with tempfile.TemporaryDirectory() as tmp:
             for other in (Path(__file__).resolve().parents[2] / "bin").glob("*.py"):
                 (Path(tmp) / other.name).write_bytes(other.read_bytes())   # the flat modules the entry loads by name
@@ -172,18 +173,15 @@ class TestOpenListCeilingMutant(Base):
             edited = source_edit(text)
             entry.write_text(edited)
             copy = _load("t_open_list_" + tag, entry)
-        suite = unittest.TestSuite(TestOpenListCeiling(name) for name in self.NAMES)
-        real, me.sb = me.sb, copy
-        try:
+            suite = unittest.TestSuite(TestOpenListCeiling(name) for name in self.NAMES)
             result = unittest.TestResult()
-            suite.run(result)
-        finally:
-            me.sb = real
+            with mock.patch.dict(globals(), {"sb": copy}), rebound("sb", copy):
+                suite.run(result)
         return edited, result
 
     def test_s5_the_control_passes_and_the_mutant_fails_with_the_text_of_the_check(self):
         _, control = self.run_against(lambda t: t, "control")
-        self.assertEqual((len(control.failures), len(control.errors), control.testsRun), (0, 0, 2))
+        self.assertEqual((len(control.failures), len(control.errors), control.testsRun), (0, 0, 2), msg=str(control.errors))
         line = "OPEN_LIST_PAGES = 10 "
         applied = []
 
