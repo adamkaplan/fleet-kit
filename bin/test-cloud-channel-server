@@ -277,14 +277,18 @@ def trickle_client(port, declared=50, hang_guard=30):
         log.append("%.3f %s" % (time.monotonic(), text))
 
     guard = time.monotonic() + hang_guard
+
+    def over_guard():
+        if time.monotonic() > guard:
+            raise AssertionError("the client did not finish within the hang guard")
+
     sock = socket.create_connection(("127.0.0.1", port), timeout=5)
-    sent, buf, readable_at, reset = 0, b"", None, None
+    sent, buf, readable_at, reset, write_reset = 0, b"", None, None, False
     try:
         try:
             sock.sendall(request_bytes("tok-a", declared))
             while sent < declared - 1:
-                if time.monotonic() > guard:
-                    raise AssertionError("the client did not finish within the hang guard")
+                over_guard()
                 ready = bool(select.select([sock], [], [], 0.2)[0])
                 note("byte %d readable=%s" % (sent, ready))
                 if ready:
@@ -295,9 +299,9 @@ def trickle_client(port, declared=50, hang_guard=30):
         except (ConnectionResetError, BrokenPipeError) as exc:
             note("error %s on write after %d bytes" % (type(exc).__name__, sent))
             reset = exc
+            write_reset = True
         while b"\r\n\r\n" not in buf:
-            if time.monotonic() > guard:
-                raise AssertionError("the client did not finish within the hang guard")
+            over_guard()
             try:
                 chunk = sock.recv(4096)
             except OSError as exc:
@@ -310,7 +314,7 @@ def trickle_client(port, declared=50, hang_guard=30):
             buf += chunk
     finally:
         sock.close()
-    if readable_at is None and buf:
+    if readable_at is None and buf and write_reset:
         readable_at = sent
     return buf.split(b"\r\n")[0], readable_at, reset, log
 
