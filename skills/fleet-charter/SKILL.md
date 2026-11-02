@@ -234,3 +234,5 @@ Use plain `gh` for what you say on GitHub. The switchboard tells you about comme
 on your issues, and the harness signs the ones you post (an invisible HTML comment),
 so they do not come back to you as events. `fleet-switchboard comment` does the same
 by hand where the harness has no shim.
+
+To change one line of an issue body, run `fleet-switchboard issue-line owner/repo#N --next-step TEXT` (or `--parked YYYY-MM-DD`): it is the way to change one line of an issue body, it never changes the Intent or the Done-when, and a whole-body write must keep the `## Intent` heading and the `Done when:` line or the gh shim refuses it.
