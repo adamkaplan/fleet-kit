@@ -883,3 +883,177 @@ def cmd_remind(args, runner, now):
 
 cmd_remind.ensure_on_use = True   # the daemon is alive when it runs
 cmd_remind.header_cache = True    # #1520
+
+
+# ---- ci-queue (#1961): a read-only measure of the Actions queue; INLINED here until #1092 (no new flat module). GET only, writes nothing.
+
+CI_QUEUE_GATE_LEGS = ("test (ubuntu-latest)", "test-cloud (ubuntu-latest)", "test (macos-latest)", "test-cloud (macos-latest)")   # bin/merge_gate.py UBUNTU_LEGS + MAC_LEGS (a test holds them equal)
+CI_QUEUE_GATE_FEEDERS = ("plan",)   # a job no gate names but that builds the matrix of the jobs a gate does name: never a cut candidate
+CI_QUEUE_PAGES = 10                 # pages of 100 read for one run's jobs (bounded)
+CI_QUEUE_RUN_PAGES = 40             # pages of 100 read for the run list (bounded)
+
+
+def _ci_time(text):
+    """Epoch seconds of an Actions timestamp, or None when it is absent."""
+    if not isinstance(text, str) or not text:
+        return None
+    return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+
+
+def _ci_peak(spans, now):
+    """The most intervals open at one instant. `spans` are (start, end or None); None runs to now. At one instant an end is counted before a start."""
+    events = []
+    for start, end in spans:
+        events.append((start, 1))
+        events.append((now if end is None else end, -1))
+    open_now = peak = 0
+    for _, step in sorted(events):
+        open_now += step
+        peak = max(peak, open_now)
+    return peak
+
+
+def ci_queue_measure(runs, jobs_by_run, now, hours=24, gate_names=(), docs_only=()):
+    """The counts of the window: per run the queue wait (run created to first job started; an unstarted run waits until `now`), the run time and the jobs
+    by name; the job-minutes by workflow; the peak of jobs queued at once and the observed ceiling of jobs running at once; the cut, dedupe and move
+    candidates with job-minutes per day. `runs` and `jobs_by_run` are the Actions API objects (`created_at`, `started_at`, `completed_at`)."""
+    since = now - hours * 3600
+    per_run, minutes, queued, running, job_minutes = [], {}, [], [], {}
+    seen_heads, repeat_runs, repeat_minutes, move_minutes = set(), 0, 0.0, 0.0
+    for run in sorted((r for r in runs if (_ci_time(r.get("created_at")) or 0) >= since), key=lambda r: _ci_time(r["created_at"])):
+        created, jobs = _ci_time(run["created_at"]), jobs_by_run.get(run["id"]) or []
+        starts = [t for t in (_ci_time(j.get("started_at")) for j in jobs) if t is not None]
+        first = min(starts) if starts else None
+        wait = (first if first is not None else now) - created
+        done = bool(jobs) and all(j.get("completed_at") for j in jobs)
+        end = max(_ci_time(j["completed_at"]) for j in jobs) if done else now
+        names = {}
+        run_minutes = macos_minutes = 0.0
+        for job in jobs:
+            names[job["name"]] = names.get(job["name"], 0) + 1
+            job_start, job_end = _ci_time(job.get("started_at")), _ci_time(job.get("completed_at"))
+            queued.append((_ci_time(job.get("created_at")) or created, job_start))
+            if job_start is not None:
+                running.append((job_start, job_end))
+                spent = ((now if job_end is None else job_end) - job_start) / 60.0
+                run_minutes += spent
+                job_minutes[job["name"]] = job_minutes.get(job["name"], 0.0) + spent
+                if "macos" in job["name"]:
+                    macos_minutes += spent
+        workflow = run.get("name") or "?"
+        minutes[workflow] = minutes.get(workflow, 0.0) + run_minutes
+        head = (workflow, run.get("event"), run.get("head_sha"))
+        if run.get("event") == "pull_request" and run.get("head_sha"):
+            if head in seen_heads:
+                repeat_runs += 1
+                repeat_minutes += run_minutes
+            seen_heads.add(head)
+        if run["id"] in docs_only:
+            move_minutes += macos_minutes
+        per_run.append({"id": run["id"], "workflow": workflow, "event": run.get("event"), "wait_seconds": int(round(wait)),
+                        "run_seconds": int(round(end - first)) if first is not None else 0, "jobs": len(jobs), "job_names": names})
+    scale = 24.0 / hours
+    cut = [{"kind": "cut", "what": name, "job_minutes_per_day": int(round(spent * scale))} for name, spent in sorted(job_minutes.items())
+           if name not in gate_names and name not in CI_QUEUE_GATE_FEEDERS]
+    candidates = cut + [
+        {"kind": "dedupe", "what": "%d run(s) on a head that already had a run" % repeat_runs, "job_minutes_per_day": int(round(repeat_minutes * scale))},
+        {"kind": "move", "what": "macOS legs of %d run(s) whose change touches no platform path" % len(set(docs_only)), "job_minutes_per_day": int(round(move_minutes * scale))}]
+    return {"window_hours": hours, "runs": per_run, "job_minutes_by_workflow": {k: int(round(v)) for k, v in sorted(minutes.items())},
+            "peak_queued": _ci_peak(queued, now), "observed_ceiling": _ci_peak(running, now), "published_limit": "not readable by a lane",
+            "repeat_runs": repeat_runs, "draft_push_runs": sum(1 for r in runs if r.get("draft") is True), "candidates": candidates}
+
+
+def ci_queue_lines(report):
+    out = ["%-12s %-18s %-14s %8s %8s %5s" % ("run", "workflow", "event", "wait s", "run s", "jobs")]
+    for run in report["runs"]:
+        out.append("%-12s %-18s %-14s %8d %8d %5d" % (run["id"], run["workflow"], run["event"], run["wait_seconds"], run["run_seconds"], run["jobs"]))
+        out.extend("    %s x %d" % (name, count) for name, count in sorted(run["job_names"].items()))
+    out.append("job-minutes by workflow (%dh window):" % report["window_hours"])
+    out.extend("    %s = %d" % (name, value) for name, value in report["job_minutes_by_workflow"].items())
+    out.append("peak queued = %d" % report["peak_queued"])
+    out.append('runner limit: "observed" ceiling of %d concurrent jobs; published limit: "%s"' % (report["observed_ceiling"], report["published_limit"]))
+    out.append("repeat runs on one head: %d; draft push runs: %d" % (report["repeat_runs"], report["draft_push_runs"]))
+    out.append("candidates (job-minutes per day):")
+    out.extend("    %s: %s = %d" % (c["kind"], c["what"], c["job_minutes_per_day"]) for c in report["candidates"])
+    return out
+
+
+def ci_queue_get(runner, gh, path, timeout):
+    """ONE `gh api` GET (no method flag, no field flag: gh sends GET); the JSON object, or None when the call failed. Never prints the output."""
+    try:
+        done = runner([gh, "api", path], capture_output=True, text=True, timeout=timeout)
+        return json.loads(done.stdout) if done.returncode == 0 else None
+    except Exception:   # a timeout, a missing gh or a body that is not JSON: the read failed, nothing else is said (never the output: it could carry a credential)
+        return None
+
+
+def ci_queue_fetch(runner, gh, repo, since, patterns=(), timeout=60):
+    """(runs, jobs_by_run, docs_only run ids) of the repository since `since`: one list call per page and one jobs call per run, GET only."""
+    runs, jobs_by_run, docs_only = [], {}, set()
+    for page in range(1, CI_QUEUE_RUN_PAGES + 1):   # newest first: stop at the first page that reaches back past the window
+        data = ci_queue_get(runner, gh, "repos/%s/actions/runs?per_page=100&page=%d" % (repo, page), timeout)
+        if data is None:
+            raise ReminderError("the run list could not be read")
+        listed = data.get("workflow_runs") or []
+        runs.extend(r for r in listed if (_ci_time(r.get("created_at")) or 0) >= since)
+        if len(listed) < 100 or any((_ci_time(r.get("created_at")) or 0) < since for r in listed):
+            break
+    for run in runs:
+        found = []
+        for page in range(1, CI_QUEUE_PAGES + 1):
+            data = ci_queue_get(runner, gh, "repos/%s/actions/runs/%s/jobs?filter=all&per_page=100&page=%d" % (repo, run["id"], page), timeout)
+            if data is None:
+                raise ReminderError("the jobs of run %s could not be read" % run["id"])
+            found.extend(data.get("jobs") or [])
+            if len(data.get("jobs") or []) < 100:
+                break
+        jobs_by_run[run["id"]] = found
+    heads = {}
+    for run in runs:
+        if run.get("head_sha") and any("macos" in j["name"] and j.get("started_at") for j in jobs_by_run[run["id"]]):
+            heads.setdefault(run["head_sha"], []).append(run["id"])
+    for head, ids in (heads.items() if patterns else ()):
+        commit = ci_queue_get(runner, gh, "repos/%s/commits/%s" % (repo, head), timeout) or {}
+        files = [f.get("filename", "") for f in commit.get("files") or []]
+        if files and not any(re.fullmatch(".*".join(re.escape(p) for p in pattern.replace("**", "*").split("*")), name) for name in files for pattern in patterns):
+            docs_only.update(ids)
+    return runs, jobs_by_run, docs_only
+
+
+def ci_queue_platform_paths(path):
+    """The globs of a macos-platform-paths.txt file (`*` crosses a `/`); [] when the file cannot be read (then no run is a `move` candidate)."""
+    try:
+        text = Path(path).read_text()
+    except (OSError, UnicodeError):
+        return []
+    return [line.strip() for line in text.splitlines() if line.strip() and not line.lstrip().startswith("#")]
+
+
+def cmd_ci_queue(args, runner, now):
+    """`ci-queue [--repo OWNER/REPO] [--hours N] [--until ISO] [--paths-file F] [--json]`: the queue wait, run time, jobs, job-minutes, peak queued and the observed ceiling of the
+    Actions runs of the window, and the cut / dedupe / move candidates. Read-only: GET requests only, nothing is written to GitHub."""
+    engine, _, config = build_engine(runner, now, "cli", writable=False)
+    repo = args.repo or config.get("intent_repo")
+    if not repo or not re.fullmatch(r"[\w.-]+/[\w.-]+", repo):
+        sys.stderr.write("%s: ci-queue: give --repo OWNER/REPO\n" % PROG)
+        return EXIT_USAGE
+    if not 1 <= args.hours <= 168:
+        sys.stderr.write("%s: ci-queue: --hours is 1 to 168\n" % PROG)
+        return EXIT_USAGE
+    try:
+        end = _ci_time(args.until) if args.until else now()
+    except ValueError:
+        sys.stderr.write("%s: ci-queue: --until is an ISO time with a zone\n" % PROG)
+        return EXIT_USAGE
+    try:
+        runs, jobs_by_run, docs_only = ci_queue_fetch(runner, config["gh"], repo, end - args.hours * 3600, ci_queue_platform_paths(args.paths_file))
+    except (ReminderError, OSError) as err:
+        sys.stderr.write("%s: ci-queue: %s\n" % (PROG, _one_line(str(err), 120)))
+        return EXIT_ERROR
+    report = ci_queue_measure([r for r in runs if (_ci_time(r.get("created_at")) or 0) <= end], jobs_by_run, end, args.hours,
+                              CI_QUEUE_GATE_LEGS, docs_only)
+    print(json.dumps(report, indent=1, sort_keys=True) if args.json else "\n".join(ci_queue_lines(report)))
+    return EXIT_OK
+
+
+cmd_ci_queue.direct = True   # reads GitHub only; no daemon start
