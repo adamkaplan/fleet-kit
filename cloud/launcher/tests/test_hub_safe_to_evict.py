@@ -157,10 +157,14 @@ class T(unittest.TestCase):
         d = [x for x in docs if x["kind"] == "Deployment"][0]
         del d["spec"]["template"]["metadata"]["annotations"]
         d["metadata"]["annotations"] = {KEY: "false"}
+        on_dep = KEY in d["metadata"]["annotations"]
+        in_tpl = KEY in d["spec"]["template"]["metadata"].get("annotations", {})
+        self.assertTrue(on_dep)
+        self.assertFalse(in_tpl)
         problems = mark_problems("---\n".join(json.dumps(x) for x in docs))
         anchor = "the mark is not in the pod template"
         self.assertIn(anchor, problems)
-        print("on_deployment_metadata: control clean, %d problem(s), anchored on %r" % (len(problems), anchor))
+        print("on_deployment_metadata: structural move, not a fragment replacement; key in Deployment metadata %s, in template %s in the mutated copy; control clean, %d problem(s), anchored on %r" % (on_dep, in_tpl, len(problems), anchor))
 
 
 class Docs(unittest.TestCase):
@@ -199,10 +203,12 @@ class Docs(unittest.TestCase):
         m = self.par + frag
         self.assertEqual(self.par.count(frag), 0)
         self.assertEqual(doc_problems(self.par), [])
+        self.assertNotEqual(m, self.par)
+        self.assertEqual(m.count(frag), 1)
         problems = doc_problems(m)
         anchor = "gives an apply of the whole file"
         self.assertIn(anchor, problems)
-        print("whole_file_apply: control clean, %d problem(s), anchored on %r" % (len(problems), anchor))
+        print("whole_file_apply: appended (not a replacement), fragment seen %d time(s) in the original and %d in the mutated; control clean, %d problem(s), anchored on %r" % (self.par.count(frag), m.count(frag), len(problems), anchor))
 
     def test_mutant_fix_fails(self):
         frag = "it is not a fix of the outage"
@@ -232,10 +238,11 @@ class Docs(unittest.TestCase):
         m = self.par.replace(frag, "")
         self.assertEqual(not_stopped_missing(self.par), [])
         self.assertNotEqual(m, self.par)
-        self.assertEqual(self.par.lower().count(frag), self.par.count(frag))
+        seen = self.par.count(frag)
+        self.assertEqual(seen, 1)
         problems = not_stopped_missing(m)
         self.assertIn(frag, problems)
-        print("spot_eviction_removed: control clean, fragment seen %d time(s), %d problem(s), anchored on %r" % (self.par.count(frag), len(problems), frag))
+        print("spot_eviction_removed: control clean, fragment seen %d time(s) in the original, %d problem(s), anchored on %r" % (seen, len(problems), frag))
 
     def test_later_whole_template_apply_sentence_once(self):
         self.assertEqual(self.par.count("a later apply of the whole template from the file would carry the mark"), 1)
