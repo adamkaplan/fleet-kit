@@ -549,7 +549,7 @@ class TestStopFinalMessageEdges(unittest.TestCase):
             os.utime(str(files[key]), (old, old))
         os.symlink(str(outside), str(base / "link.txt"))
         os.utime(str(base / "link.txt"), (old, old), follow_symlinks=False)
-        self.assertEqual(w2.retired.clean_last(base, now), 1)
+        self.assertEqual(w2.retired.clean_last(base, now), 1, "the cleaning removed a file it should keep")
         self.assertEqual(sorted(p.name for p in base.iterdir()), ["link.txt", "old.dat", "young.txt"],
                          "the cleaning removed a file it should keep")
         self.assertTrue(outside.exists(), "the cleaning removed a file it should keep")
