@@ -151,8 +151,18 @@ def build(HandoffCase):
 
         def test_s9_every_class_of_the_guard_list_is_held_by_a_test_file(self):
             text = "".join(p.read_text(errors="replace") for p in (REPO / "tests").rglob("*.py")) + (REPO / "bin" / "test-switchboard").read_text()
-            missing = [g["class"] for g in json.loads(GUARDS.read_text()) if not re.search(r"^class %s\b" % g["class"], text, re.M)]
-            self.assertEqual(missing, [])
+            self.assertEqual(self.unheld(json.loads(GUARDS.read_text()), text), [])
+
+        def unheld(self, guards, text):
+            return [g["class"] for g in guards if not re.search(r"^class %s\b" % g["class"], text, re.M)]
+
+        def help_text(self):
+            with captured() as (out, err):
+                try:
+                    sb.main(["rehearse", "--help"], runner=self.runner, now=self.world.clock.now)
+                except SystemExit:
+                    pass
+            return out.getvalue()
 
         def test_s7_the_rule_is_the_same_in_the_skill_the_template_and_the_help(self):
             sentences = sb.REHEARSE_RULE_SENTENCES
@@ -214,13 +224,15 @@ def build(HandoffCase):
             self.assertNotEqual(self.plan_check(REPO, PASSING)[0], self.plan_check(REPO, FAILING)[0])
 
         def test_s2_both_documents_carry_the_rule_with_its_three_parts(self):
-            for path in (TEMPLATE,):
-                text = sb.rehearse_section_of(path.read_text(), sb.REHEARSE_HEADING)
-                self.assertIsNotNone(text, path.name)
+            parts = ("no commit and no push runs before the plan is approved", "the plan then names each row first", "skipped only for a change of documents only", "the approver of the plan judges it")
+            docs = {TEMPLATE.name: sb.rehearse_section_of(TEMPLATE.read_text(), sb.REHEARSE_HEADING), "help": self.help_text()}
+            self.assertEqual(len(docs), 2)
+            for name, text in docs.items():
+                self.assertIsNotNone(text, name)
                 folded = " ".join(text.split())
-                for part in ("no commit and no push runs before the plan is approved", "the plan then names each row first", "skipped only for a change of documents only", "the approver of the plan judges it"):
-                    self.assertIn(part, folded, path.name)
-            planted = " ".join(sb.rehearse_section_of(TEMPLATE.read_text(), sb.REHEARSE_HEADING).split()).replace("the approver of the plan judges it", "")
+                for part in parts:
+                    self.assertIn(part, folded, name)
+            planted = " ".join(docs["help"].split()).replace("the approver of the plan judges it", "")
             self.assertNotIn("the approver of the plan judges it", planted)
 
         def numstat(self):
@@ -243,6 +255,19 @@ def build(HandoffCase):
             pinned = set(l[1:] for l in pins.splitlines() if l.startswith("-") and not l.startswith("---"))
             for line in removed:
                 self.assertIn(line, pinned, "a removed line no pin change commit changed")
+            hunks, old, new = [], None, None   # (minus lines, plus lines) of each -U0 hunk
+            for l in diff.splitlines():
+                if l.startswith("@@"):
+                    old, new = [], []
+                    hunks.append((old, new))
+                elif old is not None and l.startswith("-") and not l.startswith("---"):
+                    old.append(l[1:])
+                elif old is not None and l.startswith("+") and not l.startswith("+++"):
+                    new.append(l[1:])
+            for old, new in hunks:
+                self.assertGreaterEqual(len(new), len(old), "a hunk removes more lines than it puts back")
+                for was, now in zip(old, new):
+                    self.assertLessEqual(len(now.split()), len(was.split()), "a pin lengthens a line: %s" % now[:40])
             print("skill removed lines:", len(removed))
 
         def test_u4_the_skill_is_within_its_word_cap(self):
@@ -250,6 +275,18 @@ def build(HandoffCase):
             words = len(SKILL.read_text().split())
             print("skill words:", words)
             self.assertLessEqual(words, CAP)
+            text = SKILL.read_text()
+            self.assertEqual(len(re.findall(r"^## Rehearse before approval$", text, re.M)), 1)
+            self.assertEqual(text.count("A code change gets a no-commit rehearsal pod first: see `docs/plan-template.md` and `fleet-switchboard rehearse -h`."), 1)
+            title = "pin change of #1785 (the planning skill shortened under its cap)"
+            rng = "origin/integration..HEAD"
+            subjects = self.git("log", "--format=%s", rng).splitlines()
+            pins = subjects.count(title)
+            diff = self.git("log", "-p", "-U0", "--format=", "--fixed-strings", "--grep=" + title, rng, "--", "skills/fleet-planning/SKILL.md")
+            changed = len([l for l in diff.splitlines() if l.startswith("-") and not l.startswith("---")])
+            print("pin commits:", pins, "skill lines they changed:", changed)
+            self.assertGreaterEqual(pins, 1)
+            self.assertEqual(pins, changed)
 
         def test_s8_no_existing_test_line_changes_and_no_pin_change_commit(self):
             for added, removed, name in self.numstat():
@@ -266,4 +303,10 @@ def build(HandoffCase):
             text = "class TestKnown(object):\n    pass\n"
             found = [c for c in ("TestKnown", "TestPlantedUnknown") if not re.search(r"^class %s\b" % c, text, re.M)]
             self.assertEqual(found, ["TestPlantedUnknown"])
+            guards = json.loads(GUARDS.read_text())
+            text = "".join(p.read_text(errors="replace") for p in (REPO / "tests").rglob("*.py")) + (REPO / "bin" / "test-switchboard").read_text()
+            self.assertEqual(self.unheld(list(guards), text), [])   # control: the unmodified copy passes
+            planted = [dict(g) for g in guards]
+            planted[0]["class"] = guards[0]["class"] + "Planted"
+            self.assertEqual(self.unheld(planted, text), [guards[0]["class"] + "Planted"])
     return TestPlanRehearsal
