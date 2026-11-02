@@ -391,68 +391,50 @@ SCRUB_OUTPUT_MAX = 2 * SCRUB_INPUT_MAX   # a limit above the input maximum: reda
 MIN_FRAGMENT = 8
 
 
-_H = r"[0-9A-Fa-f]{1,4}"
-_V4 = r"[0-9]{1,3}(?:\.[0-9]{1,3}){3}"
-MASK_IPV6 = True   # the capacity answer masks the IPv6 and the IPv4-mapped forms too (PC-10)
-_ADDRESS_V6 = (r"(?<![0-9A-Fa-f:])(?:(?:%(h)s:){6}%(v4)s|(?:%(h)s(?::%(h)s){0,5})?::(?:%(h)s:){0,3}%(v4)s|(?:%(h)s:){7}%(h)s"
-               r"|(?:%(h)s(?::%(h)s){0,6})?::(?:%(h)s(?::%(h)s){0,6})?)(?![0-9A-Fa-f:])|") % {"h": _H, "v4": _V4}
-_ADDRESS_RE = re.compile((_ADDRESS_V6 if MASK_IPV6 else "") + _V4)
-
-
-def _mask_addresses(text):
-    """The capacity answer's own masking, after the launcher's one scrub: a dotted IPv4, an IPv6 in any written form (at most one `::`) and an
-    IPv4-mapped IPv6 become `[address]`; a name such as `node-a` and a time such as `12:30:45` are kept."""
-    return _ADDRESS_RE.sub("[address]", text) if isinstance(text, str) else text
-
-
-import ipaddress  # noqa: E402  (PC-11: the masking below is decided by the standard module)
-MASK_BY_IPADDRESS = True   # PC-11: False goes back to the pattern alone (the test's mutant)
+import ipaddress  # noqa: E402  (PC-11: the masking is decided by the standard module)
 WINDOW = 200               # a run of address characters longer than this is cut into windows ...
 WINDOW_OVERLAP = 64        # ... that overlap by this many characters: more than the longest address (45) plus a short zone
 SUBSTRING_MAX = 64         # a substring tried is at most this long: at most 64 parses start at one position
-MASK_PASSES = 4
-_RUN_RE = re.compile(r"[0-9A-Fa-f:.]+")
+MASK_GUARD = 1000          # PC-12: the repeat ends in any case after this many passes; the text is then replaced by [masking_loop]
+_RUN_RE = re.compile(r"[0-9A-Fa-f:.]+")   # the finder of candidates: every maximal run of address characters
 
 
 def _address_spans(run):
-    """The [start, end) spans of `run` (one window) that `ipaddress.ip_address` accepts: a span starts and ends at the edge of the run or next to a
-    colon or a dot (a `::` is never a separator: `1::2::3` stays whole and unmasked), the longest first from each start, left to right
-    without overlap."""
-    spans, n, i = [], len(run), 0
-    while i < n:
+    """Every [start, end) span of `run` (one window) that `ipaddress.ip_address` accepts: a span starts and ends at the edge of the run or next to
+    a colon or a dot (a `::` is never a separator: `1::2::3` stays whole and unmasked)."""
+    spans, n = [], len(run)
+    for i in range(n):
         if i == 0 or (run[i - 1] in ":." and run[i - 2:i] != "::"):
-            for j in range(min(n, i + SUBSTRING_MAX), i, -1):
+            for j in range(i + 1, min(n, i + SUBSTRING_MAX) + 1):
                 if j == n or (run[j] in ":." and run[j:j + 2] != "::"):
                     try:
                         ipaddress.ip_address(run[i:j])
                     except ValueError:
                         continue
                     spans.append((i, j))
-                    i = j - 1
-                    break
-        i += 1
     return spans
 
 
 def _mask_pass(text):
+    """One pass: in every run the LONGEST parseable substring is taken first (ties: the leftmost), then the longest of what does not overlap it,
+    until nothing parses; each taken substring becomes `[address]`."""
     out, last = [], 0
     for m in _RUN_RE.finditer(text):
-        run, base, spans = m.group(), m.start(), []
+        run, base, spans = m.group(), m.start(), set()
         if len(run) <= WINDOW:
-            spans = _address_spans(run)
+            spans.update(_address_spans(run))
         else:
             step = WINDOW - WINDOW_OVERLAP
             for w in range(0, len(run), step):
-                spans += [(w + a, w + b) for a, b in _address_spans(run[w:w + WINDOW])]
+                spans.update((w + a, w + b) for a, b in _address_spans(run[w:w + WINDOW]))
                 if w + WINDOW >= len(run):
                     break
-        merged = []
-        for a, b in sorted(spans):
-            if merged and a < merged[-1][1]:
-                merged[-1][1] = max(merged[-1][1], b)
-            else:
-                merged.append([a, b])
-        for a, b in merged:
+        taken, used = [], bytearray(len(run))
+        for a, b in sorted(spans, key=lambda s: (s[0] - s[1], s[0])):
+            if not any(used[a:b]):
+                used[a:b] = b"\1" * (b - a)
+                taken.append((a, b))
+        for a, b in sorted(taken):
             out.append(text[last:base + a])
             out.append("[address]")
             last = base + b
@@ -461,20 +443,19 @@ def _mask_pass(text):
 
 
 def _mask_addresses(text):
-    """PC-11, the masking decided by `ipaddress` (this redefines the PC-10 function above, which stays as the pattern alone): every maximal run of
-    address characters (an optional `%zone` stays text) is searched, in windows of 200 that overlap by 64, for substrings that `ipaddress` accepts;
-    a colon that only separates a label or a port is not part of the address; text that does not parse (`1::2::3`) is kept; the pass is repeated
-    (at most 4 times) so that what a longer match left behind is masked too."""
+    """The capacity answer's own masking, before the launcher's one scrub, decided by `ipaddress` (PC-10, PC-11, PC-12): every maximal run of address
+    characters (an optional `%zone` stays text) is searched, in windows of 200 that overlap by 64, for substrings that `ipaddress` accepts, the longest
+    first; a colon that only separates a label or a port is not part of the address; text that does not parse (`1::2::3`) is kept. The pass repeats
+    until a pass changes nothing (each changing pass replaces a parseable substring by `[address]`, which holds none, so it ends); a guard of
+    1,000 passes ends it in any case and the text is then replaced by `[masking_loop]`."""
     if not isinstance(text, str):
         return text
-    if not (MASK_BY_IPADDRESS and MASK_IPV6):
-        return _ADDRESS_RE.sub("[address]", text)
-    for _ in range(MASK_PASSES):
+    for _ in range(MASK_GUARD):
         done = _mask_pass(text)
         if done == text:
-            break
+            return text
         text = done
-    return text
+    return "[masking_loop]"
 
 
 def _quantity(value, scale):
