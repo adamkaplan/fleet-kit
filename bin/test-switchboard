@@ -79949,6 +79949,8 @@ class ReviewCommentEndToEndTests(Base):
         self.assertTrue(paths)
 
 
+_ph_late = _ph.build_late(); TestPlanHashMarkerAsk, TestPlanHashMarkerLaunch = _ph_late   # #1713
+
 if __name__ == "__main__":
     # Run directly, the suite takes a CPU slot (`fleet-switchboard heavy`): several full suites at once starve the machine. FLEET_HEAVY=off, a CI run, a run
     # already in a slot, or a state directory that cannot be written run it as it is.

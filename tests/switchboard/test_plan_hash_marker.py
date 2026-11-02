@@ -97,7 +97,7 @@ class TestPlanHashMarkerPure(unittest.TestCase):
 class TestPlanHashMarkerStored(unittest.TestCase):
     """S3, S8, S10: a record at the old hash, at the new hash, at an edit and at an older revision."""
 
-    KINDS = ("approval", "proof", "verdict", "consensus", "claim", "ask")
+    KINDS = ("approval", "proof", "verdict", "consensus", "ask")
 
     def setUp(self):
         self.pc, self.pl = real("plan_check"), real("plan_ledger")
@@ -107,22 +107,21 @@ class TestPlanHashMarkerStored(unittest.TestCase):
     def entries(self, plan_hash):
         return [{"kind": k, "plan_hash": plan_hash, "head": self.pl.ask_head(plan_hash)} for k in self.KINDS]
 
-    def test_six_kinds_at_two_hashes_read_as_the_live_plan_and_six_of_an_edit_read_as_stale(self):
+    def test_five_kinds_at_two_hashes_read_as_the_live_plan_and_five_of_an_edit_read_as_stale(self):
         bound = 0
         for value in self.hashes:
             for entry in self.pl.as_current(self.entries(value), self.hashes):
                 bound += entry["plan_hash"] == self.hashes[0] and entry["head"] == self.pl.ask_head(self.hashes[0])
-        self.assertEqual(bound, 6 * len(self.hashes))
-        self.assertEqual(len(self.hashes), 3)
+        self.assertEqual(bound, 5 * len(self.hashes))
         edited = self.pc.plan_hashes(self.signed.replace("size: S", "size: M"))
         stale = sum(e["plan_hash"] != self.hashes[0] for v in edited for e in self.pl.as_current(self.entries(v), self.hashes))
-        self.assertEqual(stale, 6 * len(edited))
+        self.assertEqual(stale, 5 * len(edited))
 
     def test_a_binding_of_an_older_revision_stays_as_it_is_and_reads_as_stale(self):
         older = self.pc.plan_hashes(plan_text("older: yes") + "\n" + MARKER + "\n")
         for value in older:
             out = self.pl.as_current(self.entries(value), self.hashes)
-            self.assertEqual([e["plan_hash"] for e in out], [value] * 6)
+            self.assertEqual([e["plan_hash"] for e in out], [value] * 5)
             self.assertEqual(self.pc.canonical_hash(value, self.hashes), value)
         self.assertEqual(self.pc.canonical_hash(self.hashes[1], self.hashes), self.hashes[0])
 
@@ -311,8 +310,8 @@ def build():
             with tempfile.TemporaryDirectory() as tmp:
                 msb = _entry_copy(tmp, "fleet-switchboard",
                                   "check_module.canonical_hash(plan_hash, hashes) in {check_module.canonical_hash(h, hashes) for h in consensus}", "plan_hash in consensus")
-                with self.assertRaisesRegex(AssertionError, "an approval at the old hash is not read as bound"):
-                    self.assertEqual(self.scenario(msb.triage_pass, "old"), [], "an approval at the old hash is not read as bound")
+                with self.assertRaisesRegex(AssertionError, r"sha256:[0-9a-f]{64}"):   # the announcement the mutated wake sends (its text names the plan hash)
+                    self.assertEqual(self.scenario(msb.triage_pass, "old"), [])
 
     only_own_tests(TestPlanHashMarkerWake)
 
@@ -327,7 +326,20 @@ def build():
             """A review round on the marker-bearing plan; `legacy` drops `plan_hashes` from the entries it writes (a round of before the change)."""
             self.signed_plan()
             real_append = sb.plan_ledger.append_checked
-            strip = lambda state, now, build: real_append(state, now, lambda e, s: {k: v for k, v in build(e, s).items() if k != "plan_hashes"})
+            legacy_hash = sb.plan_check.plan_hash_legacy(host.LEDGER_PLAN + "\n" + MARKER)
+
+            def before_the_change(e, s):
+                """The entry as the code before this change wrote it: the OLD hash in `plan_hash`, no `plan_hashes`."""
+                entry = {k: v for k, v in build_entry(e, s).items() if k != "plan_hashes"}
+                if entry.get("kind") == "round" and entry.get("plan_hash"):
+                    entry["plan_hash"] = legacy_hash
+                return entry
+
+            def strip(state, now, build):
+                nonlocal build_entry
+                build_entry = build
+                return real_append(state, now, before_the_change)
+            build_entry = None
             with mock.patch.object(sb.plan_ledger, "append_checked", strip if legacy else real_append):
                 code, got, err = self.start()
             self.assertEqual(code, 0, err)
@@ -417,8 +429,91 @@ def build():
                         mock.patch.object(sys, "stdin", io.StringIO(self.block(rnd["lanes"][-1], rnd["plan_hash"]))):
                     code = msb.main(["plan", "review", "verdict", review, "--lane", rnd["lanes"][-1], "--json"], runner=self.route, now=self.world.clock.now,
                                     wait=lambda sock, seconds: False, socket_call=self.world.herdr.socket)
-                with self.assertRaisesRegex(AssertionError, "the tally counts the three verdicts together"):
-                    self.assertEqual(json.loads(out.getvalue())["tally"], "consensus", "the tally counts the three verdicts together")
+                with self.assertRaisesRegex(AssertionError, r"!= 'consensus'"):   # the assertion on the tally the mutated command printed
+                    self.assertEqual(json.loads(out.getvalue())["tally"], "consensus")
+
+        # -- S9: the entry's decide and the two open-reading places, on a round that holds verdicts at both forms
+
+        def escalated_signed(self, obj_lane="L2"):
+            """spent_review on the marker-bearing plan: each revision keeps the marker; the lanes but the objector report at the OLD hash (injected) on
+            the last round and at the NEW one before. Returns (review, round entry)."""
+            self.signed_plan()
+            code, got, err = self.start()
+            self.assertEqual(code, 0, err)
+            review = got["review"]
+            obj = ["- id: O1; severity: blocking; state: open; text: a stub passes"]
+            for number in (8, 9, 10, 11):
+                rnd = [e for e in self.ledger() if e["kind"] == "round" and e["review"] == review][-1]
+                new, old = rnd["plan_hashes"]
+                for i, lane in enumerate(rnd["lanes"]):
+                    if lane == obj_lane:
+                        self.assertEqual(self.verdict_current(review, lane, "iterate", obj)[0], 0)
+                    else:
+                        self.inject(self.lane_entry(review, rnd, lane, old if i % 2 else new))
+                self.plan_issue2 = {"number": number, "state": "open", "title": "p", "body": self.PLAN2 + "\nrevision %d\n" % number + MARKER,
+                                    "updated_at": "2026-01-01T00:00:00Z", "parent_issue_url": "https://api.github.com/repos/acme/app/issues/7"}
+                code, out, err = self.review("orch", "respond", review, "--plan-ref", "acme/app#%d" % number, "--table", self.table("%s/O1: reject, why" % obj_lane), "--json")
+                self.assertEqual(code, 0, err)
+                if "escalated" in json.loads(out):
+                    return review, [e for e in self.ledger() if e["kind"] == "round" and e["review"] == review][-1]
+            self.fail("it never escalated")
+
+        def override(self, review):
+            return self.review("cos", "decide", review, "--objection", "L2/O1", "--override", "--reason", "out of scope for this plan, accepted by the boss", "--json")
+
+        def consensus_entries(self, review):
+            return [e for e in self.ledger() if e["kind"] == "consensus" and e.get("review") == review]
+
+        def test_decide_through_the_entry_on_a_round_with_verdicts_at_both_forms_reaches_the_consensus_once_at_the_new_hash(self):
+            review, rnd = self.escalated_signed()
+            new, old = rnd["plan_hashes"]
+            code, out, err = self.override(review)
+            self.assertEqual(code, 0, err)
+            (consensus,) = self.consensus_entries(review)
+            self.assertEqual((consensus["plan_hash"], consensus.get("overridden_by") is not None), (new, True))
+
+        def test_decide_control_a_consensus_of_the_edited_text_does_not_stand_for_the_round_and_one_is_written(self):
+            review, rnd = self.escalated_signed()
+            edited = sb.plan_check.plan_hash(self.FINAL + "\nan edit\n")
+            self.inject({"kind": "consensus", "result": "pass", "pr": "-", "scenario": "-", "lineage": rnd["lineage"], "review": review, "plan_hash": edited, "by": "plan-review"})
+            self.assertEqual(self.override(review)[0], 0)
+            self.assertEqual([e["plan_hash"] for e in self.consensus_entries(review)], [edited, rnd["plan_hashes"][0]])
+
+        def test_decide_counts_a_consensus_at_the_old_hash_as_reached_and_writes_no_second(self):
+            review, rnd = self.escalated_signed()
+            new, old = rnd["plan_hashes"]
+            self.inject({"kind": "consensus", "result": "pass", "pr": "-", "scenario": "-", "lineage": rnd["lineage"], "review": review, "plan_hash": old, "by": "plan-review"})
+            self.assertEqual(self.override(review)[0], 0)
+            self.assertEqual(len(self.consensus_entries(review)), 1, "decide counts the old-hash consensus as the round's")
+
+        def test_a_mutant_that_compares_the_raw_strings_in_decide_writes_a_second_consensus(self):
+            review, rnd = self.escalated_signed()
+            new, old = rnd["plan_hashes"]
+            self.inject({"kind": "consensus", "result": "pass", "pr": "-", "scenario": "-", "lineage": rnd["lineage"], "review": review, "plan_hash": old, "by": "plan-review"})
+            with tempfile.TemporaryDirectory() as tmp:
+                msb = _entry_copy(tmp, "switchboard/plan_review.py", "        entries, rnd = _canon_round(entries, rnd)   # #1713: both sides in the round's own form\n", "")
+                os.environ["HERDR_PANE_ID"] = self.world.panes["cos"]
+                with captured() as (out, err), mock.patch.object(msb, "owner_terminal_problem", lambda *a, **k: None), mock.patch.object(sys, "stdin", io.StringIO("")):
+                    msb.main(["plan", "review", "decide", review, "--objection", "L2/O1", "--override", "--reason", "out of scope for this plan, accepted by the boss", "--json"],
+                             runner=self.route, now=self.world.clock.now, wait=lambda sock, seconds: False, socket_call=self.world.herdr.socket)
+                with self.assertRaisesRegex(AssertionError, r"2 != 1"):   # the mutated decide wrote a second consensus
+                    self.assertEqual(len(self.consensus_entries(review)), 1)
+
+        def test_the_tick_and_the_lane_send_check_read_a_round_with_verdicts_at_both_forms_as_open(self):
+            got = self.start_round()
+            rnd = self.kinds("round")[-1]
+            new, old = rnd["plan_hashes"]
+            lanes = rnd["lanes"]
+            self.inject(self.lane_entry(got["review"], rnd, lanes[0], old))
+            self.inject(self.lane_entry(got["review"], rnd, lanes[1], new))
+            before = len(self.ledger())
+            code, out, err = self.review("orch", "tick", "--json")
+            self.assertEqual(code, 0, err)
+            done = json.loads(out)
+            self.assertEqual(done.get("skipped", []), [], "the tick handles the round")
+            self.assertTrue(all(e.get("review") == got["review"] for e in self.ledger()[before:]))
+            session = [e["session"] for e in self.ledger() if e["kind"] == "lane_session"][0]
+            self.assertIn("is a reviewer lane", sb.review_lane_send_problem({"plan_review": {"enabled": True}}, session, "orch"), "the send check reads the round as open")
 
         # -- S11: a round without a pair
 
@@ -452,7 +547,7 @@ def build():
             self.assertNotIn("plan_hashes", rnd)
             old = sb.plan_check.plan_hash_legacy(host.LEDGER_PLAN + "\n" + MARKER)
             for lane in rnd["lanes"]:
-                self.inject(self.lane_entry(got["review"], rnd, lane, old if lane != rnd["lanes"][-1] else got["plan_hash"]))
+                self.inject(self.lane_entry(got["review"], rnd, lane, old if lane != rnd["lanes"][-1] else got["plan_hash"]))   # got["plan_hash"] is the NEW hash: a verdict at each form
             before = len(self.ledger())
             rows = self.six_commands(got["review"], rnd)
             self.assertEqual([r[0] for r in rows], ["verdict", "status", "close", "decide", "respond", "closing"])
@@ -510,8 +605,8 @@ def build():
                 except Exception as exc:
                     code, out, err = 2, "", repr(exc)
                 relaunched = json.loads(out)["relaunched"] if out.strip().startswith("{") else []
-                with self.assertRaisesRegex(AssertionError, "the round with its pair is handled"):
-                    self.assertEqual(sorted(relaunched), sorted(valid["lanes"]), "the round with its pair is handled")
+                with self.assertRaisesRegex(AssertionError, "boom"):   # the text the mutated tick raised, shown by the assertion on its stderr
+                    self.assertEqual(err.strip(), "")
                 self.assertEqual(len(self.ledger()), before)
 
         def test_the_control_a_round_started_after_the_change_is_accepted_by_the_commands_and_its_lane_send_check_answers_as_before(self):
@@ -529,8 +624,94 @@ def build():
                     os.environ["HERDR_PANE_ID"] = self.world.panes["orch"]
                     code = msb.main(["plan", "review", "status", got["review"]], runner=self.route, now=self.world.clock.now,
                                     wait=lambda sock, seconds: False, socket_call=self.world.herdr.socket)
-                with self.assertRaisesRegex(AssertionError, "the round is refused with the line"):
-                    self.assertIn(self.PREDATES, err.getvalue(), "the round is refused with the line")
+                with self.assertRaisesRegex(AssertionError, "0 != 2"):   # the mutated status ran: exit 0 where the refusal exits 2
+                    self.assertEqual(code, 2)
 
     only_own_tests(TestPlanHashMarkerRounds)
     return TestPlanHashMarkerWake, TestPlanHashMarkerRounds
+
+
+def build_late():
+    """The classes whose host classes are defined late in bin/test-switchboard (bound by a line placed after them)."""
+    host = HOST
+    import json
+    from unittest import mock
+    from support.loader import sb
+
+    def only_own_tests(cls):
+        for name in dir(cls):
+            if name.startswith("test") and name not in cls.__dict__:
+                setattr(cls, name, None)
+        return cls
+
+    class TestPlanHashMarkerAsk(host.TestAskIssueSubject):
+        """S8 through the real `prove`, `verdict` and `gates` on an ask issue whose plan comment ends with the marker (the fixtures of TestAskIssueSubject)."""
+
+        def setUp(self):
+            super().setUp()
+            pc = real("plan_check")
+            text = host.LEDGER_PLAN + "\n" + MARKER
+            self.pair = pc.plan_hashes(text)
+            self.new, self.old = self.pair
+            self.edited = pc.plan_hash(text.replace("Commissioning works.", "Commissioning works, edited."))
+            self.hash = self.new
+
+        def plan(self):
+            return dict(super().plan(), plan_hashes=self.pair)
+
+        def g1(self):
+            report = json.loads(self.run_cmd("cmd_gates", json=True)[2])
+            return next(g for g in report["gates"] if g["gate"] == "G1")
+
+        def recorded_at(self, plan_hash):
+            self.hash = plan_hash
+            self.record_all()
+            self.hash = self.new
+
+        def test_control_records_at_the_new_hash_read_as_bound(self):
+            self.recorded_at(self.new)
+            self.assertIn("3 of 3 claimed scenarios proven and judged", self.g1()["detail"])
+
+        def test_records_at_the_old_hash_and_its_head_read_as_bound_through_gates(self):
+            self.recorded_at(self.old)
+            self.assertEqual({e["plan_hash"] for e in self.entries()}, {self.old})
+            self.assertIn("3 of 3 claimed scenarios proven and judged", self.g1()["detail"])
+
+        def test_records_at_the_hash_of_an_edited_text_read_as_stale(self):
+            self.recorded_at(self.edited)
+            self.assertIn("void: plan changed", self.run_cmd("cmd_gates")[2])
+            self.assertNotIn("3 of 3 claimed scenarios proven and judged", self.g1()["detail"])
+
+        def test_a_mutant_that_reads_the_ask_head_without_as_current_fails_through_gates(self):
+            self.recorded_at(self.old)
+            with mock.patch.object(sb.load_plan_ledger(), "as_current", lambda entries, hashes: entries):   # the real module (sb.plan_ledger is a lazy proxy): the read maps nothing, so the head is compared with the new one only
+                with self.assertRaisesRegex(AssertionError, "3 of 3 claimed scenarios proven and judged"):
+                    self.assertIn("3 of 3 claimed scenarios proven and judged", self.g1()["detail"])
+
+    only_own_tests(TestPlanHashMarkerAsk)
+
+    class TestPlanHashMarkerLaunch(host.TestLaunchGate):
+        """The G0b read of a consensus record, through the real `launch`."""
+
+        def signed(self):
+            self.plan_issue["body"] = host.LEDGER_PLAN + "\n" + MARKER
+            return sb.plan_check.plan_hashes(self.plan_issue["body"])
+
+        def would_refuse(self, plan_hash):
+            self.record_consensus(plan_hash)
+            code, out, err = self.launch()
+            self.assertEqual(code, 0, err)
+            return self.events("gate.would_refuse")
+
+        def test_a_consensus_at_the_new_hash_is_quiet(self):
+            self.assertEqual(self.would_refuse(self.signed()[0]), [])
+
+        def test_a_consensus_at_the_old_hash_is_quiet_through_launch(self):
+            self.assertEqual(self.would_refuse(self.signed()[1]), [], "a consensus at the old hash is not read as bound")
+
+        def test_a_consensus_at_the_hash_of_an_edited_text_is_not_quiet(self):
+            pair = self.signed()
+            self.assertEqual(len(self.would_refuse(sb.plan_check.plan_hash(self.plan_issue["body"].replace("Commissioning works.", "Commissioning works, edited.")))), 1)
+
+    only_own_tests(TestPlanHashMarkerLaunch)
+    return TestPlanHashMarkerAsk, TestPlanHashMarkerLaunch
