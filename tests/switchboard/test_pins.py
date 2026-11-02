@@ -275,7 +275,7 @@ class TestPinsReview(PinsRepo):
         hits = [("tests/big.py", 1 + 2500 * t + 25 * h, "x", "compute_widget_total") for t in range(20) for h in range(1, 101)]
         self.assertEqual(len(hits), 2000)
         count = [0]   # compile calls of _pins_re plus every use of a pattern (match, search, finditer, findall), whether through _pins_re or through re directly
-        real = sb._pins_re
+        real = re.compile   # the unpatched compile: _pins_re reaches it through counting, so a helper compile is counted once
 
         class Counted:
             def __init__(self, pattern):
@@ -295,6 +295,10 @@ class TestPinsReview(PinsRepo):
             count[0] += 1
             return Counted(real(text))
 
+        def compiled(pattern, *args, **kw):   # re.compile used outside the helper: the compile is counted and the object returned counts its uses
+            count[0] += 1
+            return Counted(real(pattern, *args, **kw))
+
         def direct(name):
             original = getattr(re, name)
 
@@ -302,7 +306,7 @@ class TestPinsReview(PinsRepo):
                 count[0] += 1
                 return original(pattern, *args, **kw)
             return use
-        with mock.patch.object(sb, "_pins_re", counting), mock.patch.multiple(re, **{n: direct(n) for n in ("match", "search", "finditer", "findall")}):
+        with mock.patch.object(sb, "_pins_re", counting), mock.patch.object(re, "compile", compiled), mock.patch.multiple(re, **{n: direct(n) for n in ("match", "search", "finditer", "findall")}):
             listing = sb.pins_listing({}, hits, lambda path: lines)
         self.assertEqual(len(listing), 20)
         self.assertLessEqual(count[0], 5 * len(lines), count[0])   # the file, not the 2000 hits: a rescan per hit counts millions
@@ -337,6 +341,28 @@ class TestPinsReview(PinsRepo):
                 if m and (indent is None or len(m.group(1)) < indent):
                     if re.match(sb.PINS_TEST_DEF_RE, lines[i]):
                         return "TestBig", re.match(sb.PINS_TEST_DEF_RE, lines[i]).group(2), i + 1
+                    indent = len(m.group(1))
+            return "-", None, None
+        self.test_a_scan_per_hit_is_bounded_by_the_file_not_the_hits()   # control: the unmutated finder passes
+        applied = [0]
+
+        def mutated(*args, **kw):
+            applied[0] += 1
+            return rescan(*args, **kw)
+        with mock.patch.object(sb, "pins_enclosing", mutated):
+            with self.assertRaises(AssertionError) as caught:
+                self.test_a_scan_per_hit_is_bounded_by_the_file_not_the_hits()
+        self.assertEqual(applied[0], 2000)
+        self.assertRegex(str(caught.exception), r"^\d+ not less than or equal to 250005 : \d+$")
+
+    def test_a_finder_that_rescans_per_hit_through_a_pattern_compiled_outside_the_helper_is_caught(self):   # L1 mutant 3
+        def rescan(lines, number, index=None):
+            indent = None
+            for i in range(min(number, len(lines)) - 1, -1, -1):
+                m = re.compile(sb.PINS_ANY_DEF_RE).match(lines[i])
+                if m and (indent is None or len(m.group(1)) < indent):
+                    if re.compile(sb.PINS_TEST_DEF_RE).match(lines[i]):
+                        return "TestBig", re.compile(sb.PINS_TEST_DEF_RE).match(lines[i]).group(2), i + 1
                     indent = len(m.group(1))
             return "-", None, None
         self.test_a_scan_per_hit_is_bounded_by_the_file_not_the_hits()   # control: the unmutated finder passes
