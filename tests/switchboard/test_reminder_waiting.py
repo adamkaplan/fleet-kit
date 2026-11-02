@@ -151,6 +151,56 @@ def build(PR4Base):
                 with self.assertRaisesRegex(AssertionError, r"^0 != 1"):
                     self.assertEqual(self.steered("s-long2"), 1)
 
+        def fifty_world(self, name="s-fifty", issue=50):
+            """A lane in a turn of 3x the bound, steering on after 10 minutes, and 50 due reminders (distinct ids) due 10..590 s ago: all inside the bound."""
+            self.long_lane(name, issue)
+            self.world.engine.config["steer_after_minutes"] = 10
+            now = self.world.clock.now()
+            self.fifty = {sb.add_reminder(self.world.state, name, now - 10 - 12 * n, now - 3600, "check item %d of the widget-api build" % n)["id"] for n in range(50)}
+            self.world.engine.__dict__.pop("deliver", None)      # the real delivery
+
+        def run_fifty(self, name, passes=3):
+            """Runs the passes; returns (ids delivered, the most steers of the lane in ONE pass, late count of the lane, audit lines naming one id twice)."""
+            most, delivered = 0, set()
+            for _ in range(passes):
+                before = self.steered(name)
+                self.world.engine.run_pass()
+                most = max(most, self.steered(name) - before)
+                self.world.tick(10)
+            for event in self.sent_to(name):
+                delivered |= {k[len("reminder:"):] for k in event["detail"]["keys"] if k.startswith("reminder:")}
+            late = sb.late_reminder_counts(self.world.state, {}, self.world.clock.now()).get(name, 0)
+            ids = [e["detail"].get("id") for e in self.world.audit() if e["event"] in ("reminder.ceiling", "reminder.waiting") and e["subject"] == name]
+            repeats = len(ids) - len(set(ids))
+            return len(delivered & self.fifty), most, late, repeats
+
+        def test_s16_fifty_due_reminders_of_one_lane_in_a_long_turn_go_in_one_merged_steer_inside_the_bound(self):
+            self.fifty_world()
+            self.assertEqual(len(self.fifty), 50)
+            delivered, most, late, repeats = self.run_fifty("s-fifty")
+            self.assertEqual(delivered, 50, msg="(a) reminders delivered of 50")
+            self.assertEqual(late, 0, msg="(b) reminders delivered later than the bound")
+            self.assertLessEqual(most, 1, msg="(c) steers of the lane in one pass (one merged message, not 50)")
+            self.assertGreaterEqual(self.steered("s-fifty"), 1)
+            self.assertEqual(repeats, 0, msg="a reminder.ceiling or reminder.waiting line twice for one id")
+
+        def test_s16_a_mutant_that_delivers_only_the_first_due_reminder_is_caught(self):
+            import inspect
+            self.fifty_world()
+            self.assertEqual(self.run_fifty("s-fifty")[0], 50, msg="control: the unmutated code")
+            self.fifty_world("s-fifty2", 51)
+            source = inspect.getsource(sb.ReminderFacts.__call__)
+            old, new = "for item in self.due():", "for item in self.due()[:1]:"
+            self.assertEqual(source.count(old), 1, msg="the replaced text is in the source once")
+            mutated = source.replace(old, new)
+            self.assertNotEqual(mutated, source, msg="mutation not applied: dropping all but the first due reminder")
+            import textwrap
+            space = dict(sb.ReminderFacts.__call__.__globals__)
+            exec(textwrap.dedent(mutated), space)
+            with mock.patch.object(sb.ReminderFacts, "__call__", space["__call__"]):
+                with self.assertRaisesRegex(AssertionError, r"^0 != 50 : \(a\) reminders delivered of 50", msg="mutant not caught: dropping all but the first"):
+                    self.assertEqual(self.run_fifty("s-fifty2")[0], 50, msg="(a) reminders delivered of 50")
+
         def test_s6_a_real_open_permission_request_holds_the_due_reminder(self):
             self.steer_world()
             self.world.herdr.panes[self.world.panes["s-long"]]["status"] = "blocked"
