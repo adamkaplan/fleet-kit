@@ -4,6 +4,7 @@ import http.client
 import io
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -16,6 +17,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.dirname(HERE))
 SERVICE = os.path.join(os.path.dirname(HERE), "token_service.py")
+MANIFEST = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(HERE))), "cloud", "k8s", "token-mint.yaml")
 import test_app_token as base  # noqa: E402  (the stored fake GitHub: Stub, TOKEN, PERMS, iso)
 import token_service  # noqa: E402
 
@@ -307,6 +309,51 @@ class Mutants(unittest.TestCase):
             stop(srv, t)
         self.assertEqual(err.getvalue(), "")
         print("S11 (e): the stalled request is dropped 1 of 1, the service answers after it, 0 bytes on stderr, the copy without a timeout fails 1 of 1")
+
+
+RESOURCES = ("          resources:\n            requests:\n              cpu: 50m\n              memory: 64Mi\n"
+             "            limits:\n              cpu: 500m\n              memory: 256Mi\n")
+MANIFEST_CHECKS = (   # name, a pattern that must be found in the Deployment's text
+    ("a fixed non-root user and group", r"runAsUser: 10001\n\s+runAsGroup: 10001\n"),
+    ("a group for the Secret's files", r"fsGroup: 10001\n"),
+    ("the seccomp profile RuntimeDefault", r"seccompProfile:\n\s+type: RuntimeDefault\n"),
+    ("no privilege escalation", r"allowPrivilegeEscalation: false\n"),
+    ("a read-only root filesystem", r"readOnlyRootFilesystem: true\n"),
+    ("resource requests and limits", r"requests:\n(\s+\w+: \S+\n)+\s+limits:\n(\s+\w+: \S+\n)+"),
+)
+
+
+def manifest_check(text, name):
+    deployment = [d for d in text.split("\n---\n") if "kind: Deployment" in d]
+    if len(deployment) != 1:
+        raise AssertionError("the manifest lacks its Deployment:")
+    pattern = dict(MANIFEST_CHECKS)[name]
+    if not re.search(pattern, deployment[0]):
+        raise AssertionError("the manifest lacks %s:" % name)
+
+
+class Manifest(unittest.TestCase):
+    """Ask #2002, scenario S11 (f): the text of cloud/k8s/token-mint.yaml."""
+
+    def test_s11_f_the_deployment_names_its_security_context_and_each_undone_copy_fails(self):
+        with open(MANIFEST) as f:
+            original = f.read()
+        for name, _ in MANIFEST_CHECKS:
+            manifest_check(original, name)   # the controls, run first
+        undo = {
+            "a fixed non-root user and group": ("        runAsUser: 10001\n        runAsGroup: 10001\n", ""),
+            "a group for the Secret's files": ("        fsGroup: 10001\n", ""),
+            "the seccomp profile RuntimeDefault": ("type: RuntimeDefault", "type: Unconfined"),
+            "no privilege escalation": ("allowPrivilegeEscalation: false", "allowPrivilegeEscalation: true"),
+            "a read-only root filesystem": ("readOnlyRootFilesystem: true", "readOnlyRootFilesystem: false"),
+            "resource requests and limits": (RESOURCES, ""),
+        }
+        for name, (old, new) in undo.items():
+            with self.assertRaisesRegex(AssertionError, "the manifest lacks %s:" % re.escape(name)):
+                manifest_check(apply_mutation(original, old, new), name)
+            with self.assertRaisesRegex(AssertionError, "the mutation was not applied"):
+                apply_mutation(original, old, old)
+        print("S11 (f): 6 of 6 found in the manifest, 6 of 6 undone copies fail, the no-op fails the computation")
 
 
 if __name__ == "__main__":
