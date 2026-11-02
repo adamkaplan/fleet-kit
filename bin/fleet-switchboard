@@ -9972,7 +9972,7 @@ def sweep_state(engine):
 
 
 def sweep_pages_used(records, truncated):
-    return SWEEP_LIST_PAGES if truncated else max(1, -(-len(records) // GITHUB_PAGE_SIZE))
+    return max(1, -(-len(records) // GITHUB_PAGE_SIZE))
 
 
 def sweep_read_repo(hub, repo, now, window_days, regex, budget, strong):
