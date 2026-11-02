@@ -1561,7 +1561,7 @@ class TestArchitectureSafetyNet(unittest.TestCase):
         repo = self.overlap_repo()
         files = [{"path": "bin/fleet-switchboard"}, {"path": "bin/test-switchboard"}]
         done = self.run_overlap(repo, [{"number": 1, "title": "edit f", "files": files}, {"number": 2, "title": "no head", "files": files},
-                                       {"number": 3, "title": "other", "files": [{"path": "README.md"}]}])
+                                       {"number": 3, "title": "other", "files": [{"path": "README.md"}], "changedFiles": 1}])
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
         self.assertIn("symbols: f", done.stdout)
         self.assertNotIn("symbols: f, g", done.stdout)
