@@ -1119,6 +1119,17 @@ _progress_started = None   # tests: an Event the progress thread sets when it ha
 _progress_pause = None   # tests: a function (stop_event, seconds) that pauses in place of the real wait
 
 
+def _progress_interval(environ):
+    """The progress interval: FLEET_HEAVY_PROGRESS_SECONDS when it is a finite number of at least 0.01 (the tests' knob below 1 s), else PROGRESS_EVERY."""
+    try:
+        value = float(environ.get("FLEET_HEAVY_PROGRESS_SECONDS") or "")
+    except ValueError:
+        return PROGRESS_EVERY
+    if value != value or value in (float("inf"), float("-inf")) or value < 0.01:
+        return PROGRESS_EVERY
+    return value
+
+
 def _progress_loop(pid, program, interval, stop, out, clock, began, lock=None):
     """One line every `interval` seconds until `stop` is set; a failure of its own ends it quietly. Never signals the child."""
     try:
@@ -1294,10 +1305,7 @@ def run(command, state_dir, slots=DEFAULT_SLOTS, wait_max=DEFAULT_WAIT_MAX, name
         dog.start()
         progress_stop = threading.Event()
         progress_lock = threading.Lock()
-        try:
-            progress_every = float(environ.get("FLEET_HEAVY_PROGRESS_SECONDS") or PROGRESS_EVERY)
-        except ValueError:
-            progress_every = PROGRESS_EVERY
+        progress_every = _progress_interval(environ)
         progress_thread = threading.Thread(target=_progress_loop, args=(child["p"].pid, os.path.basename(command[0]), progress_every, progress_stop, out, clock, clock(), progress_lock), daemon=True)
         progress_thread.start()
         try:
@@ -1308,8 +1316,12 @@ def run(command, state_dir, slots=DEFAULT_SLOTS, wait_max=DEFAULT_WAIT_MAX, name
                 except InterruptedError:   # a signal during wait: Python retries; this is belt and braces
                     continue
         finally:
-            with progress_lock:
-                progress_stop.set()
+            got_lock = progress_lock.acquire(timeout=2)   # bounded: a write blocked on a full pipe must not hold `run`
+            try:
+                progress_stop.set()   # set anyway when the lock was not obtained: the thread checks it under the lock before it begins a write
+            finally:
+                if got_lock:
+                    progress_lock.release()
             if progress_thread.is_alive():
                 progress_thread.join(2)   # bounded: no progress line after run returns
             dog.finish()
