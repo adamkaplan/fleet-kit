@@ -11,6 +11,7 @@ from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+sys.path.insert(0, os.path.dirname(HERE))
 SERVICE = os.path.join(os.path.dirname(HERE), "token_service.py")
 import test_app_token as base  # noqa: E402  (the stored fake GitHub: Stub, TOKEN, PERMS, iso)
 import token_service  # noqa: E402
@@ -91,7 +92,7 @@ class Served(unittest.TestCase):
         self.log = []
 
     def serve(self, module=None, review=fake_review):
-        mod = module or token_service
+        mod = module or vars(token_service)
         srv = mod["make_server"](review, port=0, host="127.0.0.1", log=self.log.append)
         t = threading.Thread(target=srv.serve_forever, daemon=True)
         t.start()
