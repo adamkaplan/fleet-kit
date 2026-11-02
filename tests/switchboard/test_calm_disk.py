@@ -92,7 +92,17 @@ class TestCalmDisk(Pinned, Measure, Base):
         self.assertEqual((len(result.failures), len(result.errors)), (1, 0), result.errors)
         self.assertIn(ANCHOR, result.failures[0][1])
         self.assertIn("1 disk.low event", result.failures[0][1])
-        SEEN.update(mutant=len(result.failures), mutated=True)
+        applied = mutated != text and BLOCK in text and BLOCK not in mutated
+        self.assertTrue(applied, "the mutation was not applied")
+        SEEN.update(mutant=len(result.failures), mutated=applied)
+
+    def test_d_control_a_no_op_mutation_fails_the_applied_check(self):
+        text = CORE.read_text()
+        mutated = text.replace(BLOCK, BLOCK)
+        applied = mutated != text and BLOCK in text and BLOCK not in mutated
+        with self.assertRaises(AssertionError) as caught:
+            self.assertTrue(applied, "the mutation was not applied")
+        self.assertIn("the mutation was not applied", str(caught.exception))
 
     def test_c_a_test_that_patches_its_own_7_gb_reading_finds_one_disk_low(self):
         with mock.patch.object(sb.shutil, "disk_usage", reading(7 * GB)):
