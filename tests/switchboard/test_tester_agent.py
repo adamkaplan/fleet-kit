@@ -1,6 +1,6 @@
-"""#1963: `launch --role tester` is refused for an agent whose definition does not declare the role. build() gives the tests the fixtures of bin/test-switchboard.
+"""#1963: `launch --role tester` is refused for an agent whose line is not named for the role in agents/roles.tsv. build() gives the tests the fixtures of bin/test-switchboard.
 
-The checkout is PLANTED in a temp directory (a copy of bin/tester_agent.py and a few definitions; the entry's own root, found from its `__file__`, is recorded
+The checkout is PLANTED in a temp directory (a copy of bin/tester_agent.py and an agents/roles.tsv; the entry's own root, found from its `__file__`, is recorded
 and asserted to be this checkout, and the plant is what the module reads); the three routes (terminal, headless, cloud) are driven with the fakes of the launch tests, `run_cloud` faked."""
 import importlib.util
 import io
@@ -17,30 +17,21 @@ from unittest import mock
 from support.loader import captured, sb
 
 REPO = Path(__file__).resolve().parents[2]
-TESTER_LINE = "fleet-roles: coder, tester"
 REFUSAL_TEXT = "needs an agent that works a brief and records verdicts"
 
 
-def tester_agent_definition(name, roles=TESTER_LINE, named=True):
-    front = ["---"] + (["name: %s" % name] if named else []) + (([roles] if roles else [])) + ["description: planted", "mode: primary", "---", "body"]
-    return "\n".join(front) + "\n"
-
-
-def tester_agent_plant(base, definitions, module_source=None, agents_dir=True):
-    """A checkout under `base`: bin/tester_agent.py (a copy, or the given source) and agents/opencode/<file>.md per `definitions` {file name: text}."""
+def tester_agent_plant(base, lines, module_source=None, file_present=True):
+    """A checkout under `base`: bin/tester_agent.py (a copy, or the given source) and agents/roles.tsv holding `lines` (a list of text lines)."""
     (base / "bin").mkdir(parents=True)
     (base / "bin" / "tester_agent.py").write_text(module_source if module_source is not None else (REPO / "bin" / "tester_agent.py").read_text())
-    if agents_dir:
-        folder = base / "agents" / "opencode"
-        folder.mkdir(parents=True)
-        for file_name, text in definitions.items():
-            (folder / (file_name + ".md")).write_text(text)
+    (base / "agents").mkdir()
+    if file_present:
+        (base / "agents" / "roles.tsv").write_text("\n".join(lines) + "\n")
     return base
 
 
 def tester_agent_standard():
-    return {"alpha": tester_agent_definition("alpha"), "beta": tester_agent_definition("beta", "fleet-roles: tester"),
-            "build": tester_agent_definition("build", roles=None)}
+    return ["# planted", "alpha\tcoder,tester", "beta\ttester", "build\tcoder"]
 
 
 def build():
@@ -80,8 +71,8 @@ def build():
             patch.start()
             self.addCleanup(patch.stop)
 
-        def plant(self, definitions, **kwargs):
-            base = tester_agent_plant(self.tmp / ("c%d" % len(list(self.tmp.iterdir()))), definitions, **kwargs)
+        def plant(self, lines, **kwargs):
+            base = tester_agent_plant(self.tmp / ("c%d" % len(list(self.tmp.iterdir()))), lines, **kwargs)
             self.planted = base
             return base
 
@@ -138,45 +129,45 @@ def build():
         def test_s3_a_new_definition_is_accepted_and_a_removed_line_refuses_without_a_code_change(self):
             base = self.plant(tester_agent_standard())
             self.assertEqual(self.launch("gamma", "tester", "--terminal")[0], 2)   # not yet a tester
-            (base / "agents" / "opencode" / "gamma.md").write_text(tester_agent_definition("gamma"))
+            roles = base / "agents" / "roles.tsv"
+            roles.write_text(roles.read_text() + "gamma\ttester\n")
             code, out, err = self.launch("gamma", "tester", "--terminal", name="g1")
             self.assertEqual(code, 0, err)   # the third is accepted
-            (base / "agents" / "opencode" / "alpha.md").write_text(tester_agent_definition("alpha", roles=None))
+            roles.write_text(roles.read_text().replace("alpha\tcoder,tester\n", ""))
             code, out, err = self.launch("alpha", "tester", "--terminal", name="a1")
             self.assertEqual(code, 2)   # the first, its line removed, is refused
             self.assert_refused(err, "alpha", "beta, gamma", "beta")
 
-        def test_s3_the_name_is_the_file_name_when_the_definition_has_no_name_line(self):
-            self.plant({"delta": tester_agent_definition("x", named=False)})
-            self.assertEqual(self.launch("delta", "tester", "--terminal")[0], 0)
-
-        def test_s4_an_unreadable_directory_and_a_directory_with_no_tester_refuse_in_one_line(self):
-            for case, kwargs in (("unreadable", {"agents_dir": False}), ("no tester", {})):
+        def test_s4_an_unreadable_file_and_a_file_naming_no_tester_refuse_in_one_line(self):
+            for case, kwargs in (("unreadable", {"file_present": False}), ("no tester", {})):
                 with self.subTest(case=case):
-                    base = self.plant({"build": tester_agent_definition("build", roles="fleet-roles: coder")} if not kwargs else {}, **kwargs)
+                    base = self.plant([] if kwargs else ["build\tcoder", "# alpha\ttester"], **kwargs)
                     code, out, err = self.launch("coder", "tester", "--terminal", name="x" + case[:2])
                     self.assertEqual(code, 2)
                     lines = [line for line in err.splitlines() if line.strip()]
                     self.assertEqual(len(lines), 1, err)
-                    self.assertIn(str(base / "agents" / "opencode"), lines[0])
+                    self.assertIn(str(base / "agents" / "roles.tsv"), lines[0])
                     self.assertIn("from the switchboard's checkout", lines[0])
                     self.assertEqual(self.started(), (0, 0, 0))
 
         def test_u1_other_roles_and_no_role_are_not_checked_and_read_nothing(self):
-            self.plant({})   # a checkout that would refuse every tester launch
+            self.plant([])   # a checkout that would refuse every tester launch
             for role in ("coder", "reviewer", "orchestrator", None):
                 with self.subTest(role=role):
                     code, out, err = self.launch("build", role, "--terminal", name="n%s" % (role or "none")[:3])
                     self.assertEqual(code, 0, err)
                     self.assertNotIn(REFUSAL_TEXT, err)
-            self.assertNotIn("tester_agent", self.loaded, "the directory of definitions was not read")
+            self.assertNotIn("tester_agent", self.loaded, "the file of roles was not read")
 
-        def test_s6_the_kit_definitions_name_coder_as_the_one_tester_and_the_launch_from_the_checkout_accepts_it(self):
-            for path in (REPO / "agents" / "opencode" / "coder.md", REPO / "agents" / "copilot" / "coder.agent.md"):
-                self.assertEqual(path.read_text().split("\n---", 1)[0].splitlines().count(TESTER_LINE), 1, str(path))
-            others = [p for folder in ("opencode", "copilot", "reviewers") for p in (REPO / "agents" / folder).glob("*.md")
-                      if p.name not in ("coder.md", "coder.agent.md") and "tester" in p.read_text().split("\n---", 1)[0]]
-            self.assertEqual(others, [])
+        def test_s6_the_kit_file_names_coder_as_the_one_tester_and_the_launch_from_the_checkout_accepts_it(self):
+            rows = [l.split("\t") for l in (REPO / "agents" / "roles.tsv").read_text().splitlines() if l.strip() and not l.startswith("#")]
+            self.assertEqual([r[0] for r in rows if "tester" in r[1].split(",")], ["coder"])
+            self.assertEqual(rows, [["coder", "coder,tester"]])
+            import subprocess
+            diff = subprocess.run(["git", "-C", str(REPO), "diff", "--numstat", "origin/integration...HEAD", "--", "agents/opencode", "agents/copilot", "agents/reviewers"],
+                                  capture_output=True, text=True)
+            if diff.returncode == 0:   # a checkout without the base ref cannot measure this
+                self.assertEqual(diff.stdout.strip(), "", "no definition is changed")
             code, out, err = self.launch("coder", "tester", "--terminal", name="realtester")   # the real checkout, no plant
             self.assertEqual(code, 0, err)
 
@@ -191,7 +182,7 @@ def build():
         SOURCE = (REPO / "bin" / "tester_agent.py").read_text()
 
         def run_plant(self, source, agent):
-            self.plant(tester_agent_standard() | {"gamma": tester_agent_definition("gamma")}, module_source=source)
+            self.plant(tester_agent_standard() + ["gamma\ttester"], module_source=source)
             return self.launch(agent, "tester", "--terminal", name="m" + agent)
 
         def assert_the_check(self, source, agent, accepted):
@@ -212,7 +203,7 @@ def build():
             self.assert_the_check(self.SOURCE, "build", accepted=False)
 
         def test_s5_mutant_the_check_removed_is_caught_by_the_text_of_the_refusal(self):
-            source = self.mutate('    folder = os.path.join(root, "agents", "opencode")\n', '    return None\n    folder = os.path.join(root, "agents", "opencode")\n')
+            source = self.mutate('    path = os.path.join(root, "agents", "roles.tsv")\n', '    return None\n    path = os.path.join(root, "agents", "roles.tsv")\n')
             with self.assertRaises(AssertionError) as caught:
                 self.assert_the_check(source, "build", accepted=False)
             self.assertIn("2 != 0", str(caught.exception).replace("0 != 2", "2 != 0"))   # the launch proceeded (0) where the refusal (2) is expected

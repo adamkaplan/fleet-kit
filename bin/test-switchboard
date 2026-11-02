@@ -42118,6 +42118,7 @@ class TestLaunchRefusedMessage(TestLaunchMemoryGate):
             ' > getattr(args, "headless", Fals|raise LaunchError("--headless opens no t': (B + ["--headless"], []),
             ' > (args.name or "").startswith(L|raise LaunchError("names starting %r are': (["launch", sb.LANE_NAME_PREFIX + "x"] + B[2:], []),
             ' > problem|raise LaunchError(problem)': (B, [P("launch_agent_problem", return_value="the agent is not known")]),
+            ' > getattr(args, "role", None) == > problem|return EXIT_USAGE': (B + ["--role", "tester"], [P("load_module", side_effect=lambda name, _real=sb.load_module: types.SimpleNamespace(line_for=lambda agent, root: "fleet-switchboard: launch: --role tester needs an agent: x is not one") if name == "tester_agent" else _real(name))]),
             ' > mismatch|return EXIT_USAGE': (B, [P("launch_brief_mismatch", return_value="the brief names another issue")]),
             ' > args.new_workspace > args.workspace|raise LaunchError("--new-workspace makes': (B + ["--new-workspace", "lab"], []),
             ' > args.new_workspace > problems|raise LaunchError("; ".join(problems))': (newws, [P("launch_problems", return_value=["p1", "p2"])]),
