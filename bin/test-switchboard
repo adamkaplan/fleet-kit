@@ -173,9 +173,11 @@ _support_test_cases_07 = importlib.import_module("test_cases_07")   # support im
 TestChiefOfStaffNativePermissions, TestCosTriageAllowRule, TestCosDelegatedClearPermission = (_support_test_cases_07.TestChiefOfStaffNativePermissions, _support_test_cases_07.TestCosTriageAllowRule, _support_test_cases_07.TestCosDelegatedClearPermission)   # support import
 TestChatClearOffers, TestClearCarry, TestConflictCarry, TestRoutineLocal = (_support_test_cases_07.TestChatClearOffers, _support_test_cases_07.TestClearCarry, _support_test_cases_07.TestConflictCarry, _support_test_cases_07.TestRoutineLocal)   # support import
 TestPlanCheckCommand, TestPlanExplain, TestHeavySlots, TestHeavySlotsSlowStart = (_support_test_cases_07.TestPlanCheckCommand, _support_test_cases_07.TestPlanExplain, _support_test_cases_07.TestHeavySlots, _support_test_cases_07.TestHeavySlotsSlowStart)   # support import
+TestHeavyHolders = importlib.import_module("test_heavy_holders").TestHeavyHolders   # #1774
 TestWeeklyJobRewrite, TestSlice3Modules, TestModuleLoader, TestDeployFromMainSentence = (_support_test_cases_07.TestWeeklyJobRewrite, _support_test_cases_07.TestSlice3Modules, _support_test_cases_07.TestModuleLoader, _support_test_cases_07.TestDeployFromMainSentence)   # support import
 _support_test_cases_08 = importlib.import_module("test_cases_08")   # support import
 FakeActions, TestReds, TestTempJanitorResume, TestAgentRegistry = (_support_test_cases_08.FakeActions, _support_test_cases_08.TestReds, _support_test_cases_08.TestTempJanitorResume, _support_test_cases_08.TestAgentRegistry)   # support import
+JanitorIdentity = importlib.import_module("test_janitor_identity").JanitorIdentity   # ask #1770
 TestClosingKeywordWarning, TestPreflightPr, TestFocusedLocalRuns = (_support_test_cases_08.TestClosingKeywordWarning, _support_test_cases_08.TestPreflightPr, _support_test_cases_08.TestFocusedLocalRuns)   # support import
 TestBatchingDocs, TestCloudWatchBounds, TestArchTools = (_support_test_cases_08.TestBatchingDocs, _support_test_cases_08.TestCloudWatchBounds, _support_test_cases_08.TestArchTools)   # support import
 _support_test_cases_09 = importlib.import_module("test_cases_09")   # support import
@@ -13509,23 +13511,30 @@ class TestClearNotice(Base):
     def test_the_notice_is_last_and_a_send_that_blocks_neither_delays_nor_alters_the_clear(self):
         self.body = "MERGE: captain\n\nPLAN: https://github.com/acme-org/widget-api/issues/3\n"
         release = threading.Event()
+        entered = threading.Event()
+        finished = threading.Event()
         real = self.engine.send
 
         def slow(sender, recipient, text, **kw):
             self.order.append("SEND " + recipient)
+            entered.set()
             release.wait(1.5)
-            return real(sender, recipient, text, **kw)
+            result = real(sender, recipient, text, **kw)
+            finished.set()
+            return result
         self.engine.send = slow
         self.addCleanup(release.set)
         with mock.patch.object(sb, "NOTIFY_CLEAR_DEADLINE_SECONDS", 0.2):
             began = time.monotonic()
             lines = self.clear()
             elapsed = time.monotonic() - began
-        self.assertLess(elapsed, 1.0, "the clear did not wait for the blocked send")
+        self.assertFalse(finished.is_set(), "the clear did not wait for the blocked send")
+        if not entered.wait(10):   # a CEILING, not the decision
+            self.fail("the notice thread never reached the send: order=%s" % self.order)
         self.assertTrue(self.body.startswith("MERGE: automatic"), "the marker edit is done")
         self.assertTrue(lines[0].startswith("cleared the impact hold") and any("MERGE: automatic" in l for l in lines))
         sends = [i for i, step in enumerate(self.order) if step.startswith("SEND")]
-        self.assertTrue(sends and all(any(step.startswith("PATCH") for step in self.order[:i]) for i in sends), "the marker edit happened BEFORE the send was attempted: %s" % self.order)
+        self.assertTrue(sends and all(any(step.startswith("PATCH") for step in self.order[:i]) for i in sends), "the marker edit (PATCH) must come before every send attempt, and at least one send must have been attempted: %s" % self.order)
         (event,) = self.events("gate.clear_notify_failed")
         self.assertIn("notice not sent: timed out", event["detail"]["error"])
         release.set()
@@ -13914,6 +13923,56 @@ class TestClearNotice(Base):
         for bad in (0, -1, "x", True):
             with self.subTest(bad), self.assertRaises(sb.ConfigError):
                 sb.validate_config({"clear_remind_minutes": bad})
+
+
+class TestClearNoticeOrderMutants(unittest.TestCase):
+    """#1720: the one test of the clear notice's order (TestClearNotice) run against two mutants of the code under test, each in a scratch rebuild of the function (the file on disk is not touched); the unmutated control passes."""
+
+    TEST = "test_the_notice_is_last_and_a_send_that_blocks_neither_delays_nor_alters_the_clear"
+    ORDER_TEXT = "must come before every send attempt"
+    NEVER_TEXT = "the notice thread never reached the send"
+
+    @contextlib.contextmanager
+    def rebuilt(self, name, old, new):
+        source = textwrap.dedent(inspect.getsource(getattr(sb, name)))
+        self.assertIn(old, source, "the mutant target is in %s" % name)
+        original = getattr(sb, name)
+        exec(compile(source.replace(old, new, 1), "<mutant>", "exec"), sb.__dict__)
+        try:
+            yield
+        finally:
+            setattr(sb, name, original)
+
+    def run_the_test(self):
+        stream = io.StringIO()
+        result = unittest.TextTestRunner(stream=stream, verbosity=0).run(unittest.TestSuite([TestClearNotice(self.TEST)]))
+        return result.wasSuccessful(), stream.getvalue()
+
+    def test_the_control_passes_and_both_mutants_of_the_notice_order_are_killed(self):
+        ok, text = self.run_the_test()
+        self.assertTrue(ok, "the unmutated control passes: %s" % text)
+        killed = 0
+        # MUTANT 1: the marker edit (neutralise_marker) moves AFTER notify_clear
+        source = textwrap.dedent(inspect.getsource(sb.impact_clear_core))
+        self.assertIn("+ neutralise_marker(engine, runner, repo, number, head_now, raw)\n", source)
+        original = sb.impact_clear_core
+        mutant = source.replace("+ neutralise_marker(engine, runner, repo, number, head_now, raw)\n", "\n", 1)
+        mutant = mutant.replace("    if clear_notice_queued(engine, \"clear\"", "    lines += neutralise_marker(engine, runner, repo, number, head_now, raw)\n    if clear_notice_queued(engine, \"clear\"", 1)
+        self.assertNotEqual(mutant, source)
+        exec(compile(mutant, "<mutant1>", "exec"), sb.__dict__)
+        try:
+            ok1, text1 = self.run_the_test()
+        finally:
+            sb.impact_clear_core = original
+        with self.rebuilt("notify_clear", "        worker.start()\n", "        pass\n"):
+            ok2, text2 = self.run_the_test()
+        k1 = (not ok1) and self.ORDER_TEXT in text1
+        k2 = (not ok2) and self.NEVER_TEXT in text2 and self.ORDER_TEXT not in text2
+        killed = int(k1) + int(k2)
+        print("control passed; mutant 1 (marker edit after the notice) killed=%s; mutant 2 (the notice thread never starts) killed=%s; %d of 2 killed" % (k1, k2, killed))
+        self.assertTrue(k1, "mutant 1 fails with the order text: %s" % text1[-600:])
+        self.assertTrue(k2, "mutant 2 fails with the never-reached text only: %s" % text2[-600:])
+        self.assertEqual(killed, 2)
 
 
 class TestClearRemovesTheAuthorsHold(Base):

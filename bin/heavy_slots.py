@@ -48,6 +48,7 @@ WATCH_SECONDS = 5       # how often the watchdog looks
 KILL_GRACE_SECONDS = 10  # between the polite stop and the forced one
 SWEEP_ROUNDS = 5        # forced-stop rounds that look again for what is left
 SWEEP_SECONDS = 0.3     # between them
+PROC_ROOT = "/proc"      # the process directory the slot holders are read from; lsof only when it cannot be listed
 EXIT_TIME = 124
 EXIT_MEMORY = 137
 EXPRESS = "express"                    # the name of the one extra slot a declared-short command may use
@@ -728,8 +729,43 @@ def read_process_table():
     return rows
 
 
+def _proc_lock_pids(path, root=None):
+    """The pids of this user that have `path` open, read from the process directory (no lsof); None when that directory cannot be listed."""
+    root = root or PROC_ROOT
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return None
+    try:
+        mark = os.stat(path)
+    except OSError:
+        return set()
+    want, me, found = (mark.st_dev, mark.st_ino), os.getuid(), set()
+    for name in names:
+        if not re.fullmatch(r"[0-9]{1,12}", name):
+            continue
+        try:
+            if os.lstat(os.path.join(root, name)).st_uid != me:
+                continue
+            fds = os.listdir(os.path.join(root, name, "fd"))
+        except OSError:
+            continue
+        for fd in fds:
+            try:
+                seen = os.stat(os.path.join(root, name, "fd", fd))   # follows the link: the open file itself
+                if (seen.st_dev, seen.st_ino) == want:
+                    found.add(int(name))
+                    break
+            except OSError:
+                continue
+    return found
+
+
 def read_lock_holders(path):
     """The pids that have `path` open, from `lsof -t` (same user only); raises OSError when lsof is missing, fails or is too slow (no holder is then known)."""
+    pids = _proc_lock_pids(path)
+    if pids is not None:
+        return pids
     try:
         done = subprocess.run(["lsof", "-a", "-u", str(os.getuid()), "-t", "--", str(path)], capture_output=True, text=True, timeout=10)
     except (subprocess.SubprocessError, OSError) as err:
