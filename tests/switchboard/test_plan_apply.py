@@ -288,8 +288,8 @@ def build(HandoffCase):
             self.assertEqual(sorted(found), ["help", "template"])
             self.assertEqual(len(form), 6)
             self.assertEqual(self.missing(places, form), {"template": [], "help": []})
-            self.assertEqual(skill.count("Apply an approved plan edit with `fleet-switchboard plan apply` (the form: plan-template)."), 1)
-            self.assertTrue(skill.rstrip().endswith("(the form: plan-template)."))
+            self.assertEqual(skill.count("Apply an approved plan edit with `fleet-switchboard plan apply` (see plan-template)."), 1)
+            self.assertTrue(skill.rstrip().endswith("(see plan-template)."))
 
         def test_s7_a_planted_place_with_one_changed_word_fails_with_the_line_named(self):
             places, form, skill = self.places()

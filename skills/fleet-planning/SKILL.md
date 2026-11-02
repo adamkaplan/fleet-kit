@@ -107,4 +107,4 @@ Link it in every brief (`PLAN: <link>`). The worker proves each scenario with `f
 open. The order does not matter: a coder's only extra step is `prove`. A push voids every proof and
 verdict. The Chief of Staff may waive a hotfix, logged; the plan is then due within a day.
 `CARRIES: #N`: see plan-template.
-Apply an approved plan edit with `fleet-switchboard plan apply` (the form: plan-template).
+Apply an approved plan edit with `fleet-switchboard plan apply` (see plan-template).
