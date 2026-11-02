@@ -379,14 +379,67 @@ class TestCiFreshReads(FreshCase):
         clear_cache()
         self.assertIn("3 commits behind", judge(CountingGh(behind=3))["ci_line"])
 
+    UPPER = "not 0 <= n <= 1000000"
+
+    def s14_count_check(self, mod):
+        for bad in (2 ** 70, 1000001, True, -1, 3.0, "3", "absent"):
+            mod.read_behind.__defaults__[0].clear()
+            gh = (lambda argv, own=True: (0, "{}", "")) if bad == "absent" else CountingGh(behind=bad)
+            try:
+                mod.read_behind(gh, "acme/app", OLD, TIP)
+            except mod.ReadError as e:
+                self.assertEqual(str(e), "the commits behind were not counted", repr(bad))
+            else:
+                self.fail("a count above the bound of 1000000 or not an int is not counted: %r was counted" % (bad,))
+        for good in (0, 3):
+            mod.read_behind.__defaults__[0].clear()
+            self.assertEqual(mod.read_behind(CountingGh(behind=good), "acme/app", OLD, TIP), good)
+
+    def test_s14_the_count_is_an_int_from_0_to_1000000_else_not_counted(self):
+        self.s14_count_check(pr_reading)
+
+    def test_s14_the_control_the_unmutated_copy_refuses_the_seven_and_counts_two(self):
+        self.s14_count_check(_copy_of(pr_reading, self.UPPER, None, "pr_reading_s14_control"))
+
+    def test_s14_the_mutant_with_the_old_count_check_is_caught(self):
+        mod = _copy_of(pr_reading, self.UPPER, "n < 0", "pr_reading_s14_nobound")
+        with self.assertRaisesRegex(AssertionError, "a count above the bound of 1000000 or not an int is not counted"):
+            self.s14_count_check(mod)
+
+    def s14_memory_check(self, mod):
+        seen = mod.read_behind.__defaults__[0]
+        seen.clear()
+        gh = CountingGh(behind=3)
+        for i in range(300):
+            mod.read_behind(gh, "acme/app", "%040d" % i, TIP)
+        self.assertLessEqual(len(seen), 256, "the memory holds at most 256 pairs: it holds %d" % len(seen))
+        before = len(gh.calls)
+        self.assertEqual(mod.read_behind(gh, "acme/app", "%040d" % 299, TIP), 3)
+        self.assertEqual(len(gh.calls), before, "a pair inside the memory costs no GET")
+        self.assertEqual(mod.read_behind(gh, "acme/app", "%040d" % 0, TIP), 3)
+        self.assertEqual(len(gh.calls), before + 1, "the first pair, dropped, costs one more GET and answers as before")
+
+    def test_s14_300_pairs_the_memory_holds_256_and_a_dropped_pair_costs_one_get(self):
+        self.s14_memory_check(pr_reading)
+
+    MEM = "_seen.pop(next(iter(_seen))) if len(_seen) >= 256 else None; "
+
+    def test_s14_the_control_the_unmutated_copy_bounds_its_memory(self):
+        self.s14_memory_check(_copy_of(pr_reading, self.MEM, None, "pr_reading_s14_mem_control"))
+
+    def test_s14_the_mutant_with_no_bound_on_the_memory_is_caught(self):
+        mod = _copy_of(pr_reading, self.MEM, "", "pr_reading_s14_mem")
+        with self.assertRaisesRegex(AssertionError, "the memory holds at most 256 pairs"):
+            self.s14_memory_check(mod)
+
     BEHIND_OLD = "if not isinstance(n, int): raise"
 
     def test_a_reader_that_restores_the_old_ahead_by_check_is_caught(self):
         def check(mod):
             clear_cache()
             self.assertIn("were not counted", judge(CountingGh(behind=-3), reading=mod)["ci_line"], "a negative ahead_by is not counted")
-        check(_copy_of(pr_reading, "if not isinstance(n, int) or isinstance(n, bool) or n < 0: raise", None, "pr_reading_behind_control"))
-        mod = _copy_of(pr_reading, "if not isinstance(n, int) or isinstance(n, bool) or n < 0: raise", self.BEHIND_OLD, "pr_reading_behind")
+        check(_copy_of(pr_reading, "if not isinstance(n, int) or isinstance(n, bool) or not 0 <= n <= 1000000: raise", None, "pr_reading_behind_control"))
+        mod = _copy_of(pr_reading, "if not isinstance(n, int) or isinstance(n, bool) or not 0 <= n <= 1000000: raise", self.BEHIND_OLD, "pr_reading_behind")
         with self.assertRaisesRegex(AssertionError, "a negative ahead_by is not counted"):
             check(mod)
 
