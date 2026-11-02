@@ -229,12 +229,20 @@ class StepLimit(Exception):
     """The step counter passed its limit (PC-12)."""
 
 
+_FOLD = {"\u0130": "i", "\u0131": "i", "\u017f": "s", "\u212a": "k"}   # what the ignore-case pattern reads as ASCII letters
+
+
+def _fold_case(text):
+    """`text.lower()` that never changes the length: per character, the four letters above fold to ASCII, any other to its lower case when that is one character."""
+    return "".join(_FOLD.get(c) or (c.lower() if len(c.lower()) == 1 else c) for c in text)
+
+
 def _remove_hosts(text, steps=None):
     """Remove a pod's host `worker-<run of [a-z0-9-]>.<run of [a-z0-9.-]>[:<digits>]`, with an optional `https://` or `http://` in front, case-insensitively,
     by ONE linear scan: exactly what the old regular expression removed, without its backtracking. Each run is read whole; a start that does not
     complete JUMPS to the end of the run it read (every start inside that run would fail the same way), so a character is read a bounded number of
     times. Every character examined adds one to `steps.n` (an object with `n` and `limit`; `n > limit` raises StepLimit)."""
-    low, n, out, i, keep = text.lower(), len(text), [], 0, 0
+    low, n, out, i, keep = _fold_case(text), len(text), [], 0, 0
 
     def tick(count):
         if steps is not None:
