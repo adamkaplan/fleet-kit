@@ -728,3 +728,79 @@ class TestPlanWakeMutants(unittest.TestCase):
         helper = TestPassRecheckMutants()
         self.assertTrue(helper.run_case(name, []).wasSuccessful(), msg="control failed")
         self.assertFalse(helper.run_case(name, [(sb, "plan_wake_pass", ns["plan_wake_pass"])]).wasSuccessful(), msg="a pass that records no hash went unnoticed")
+
+
+class TestSeenAllConditions(RealPasses):
+    """Seventh amendment (4), as corrected by the Eighth (7). REAL: `sweep_decisions` (the whole sweep pass), the real queue function, the real fact source and the real
+    delivery. FAKE: the GitHub hub; in the second case also `sweep_gate_reading` (a gate read that fails: the one thing a hub cannot say).
+    The conditions of `seen_all` that these pin are `not defer` and `not state.s5_unchecked`. A third, `whole_list`, is covered by `defer` and has no test of its own:
+    in `sweep_decisions`, `whole_list = notices_whole or "*" not in defer`, so `whole_list` is false only when the notice read is not whole AND "*" is in `defer`;
+    `defer` is then non-empty and `not defer` already makes `seen_all` false. A mutant that replaces `whole_list` by `True` cannot change `seen_all`: it is equivalent."""
+
+    UNVERIFIED = "[unverified: its present state could not be read]"
+
+    def cleared_fact_then(self, errors=(), extra=(), gate=None):
+        self.hub.open = {1: sweep_issue(1, "intro\n## Decision required\nPick one")}
+        self.sweep_pass()
+        self.assertEqual(len(self.engine.sweep.facts), 1, msg="the real sweep made no fact")
+        self.hub.open = {600: sweep_issue(600, "MERGE: captain", pr=True)} if extra else {}   # the finding is gone
+        self.engine.sweep.confirmed.clear()
+        self.world.tick(sb.SWEEP_TTL + 1)
+        now = self.world.clock.now()
+        entries, found = sb.decisions_from_notices(self.engine, now)
+        with contextlib.ExitStack() as stack:
+            if gate:
+                stack.enter_context(mock.patch.object(sb, "sweep_gate_reading", gate))
+            sb.sweep_decisions(self.engine, list(entries) + list(extra), now, list(found) + list(errors))
+
+    def test_a_pass_that_deferred_a_repository_keeps_its_fact_marked_unverified(self):
+        self.cleared_fact_then(errors=[{"source": "github", "error": "acme/api: HTTP 502"}])
+        self.assertTrue(self.engine.sweep.deferred_since, msg="the pass did not defer the repository")
+        self.assertIsNone(self.engine.sweep.present)
+        self.deliver()
+        self.assertEqual(self.dropped(), [], msg="a fact was dropped on a pass that deferred a repository")
+        self.assertEqual(len(self.texts()), 1)
+        self.assertIn(self.UNVERIFIED, self.texts()[0])
+
+    def test_a_pass_with_a_held_pull_request_unchecked_keeps_its_fact_marked_unverified(self):
+        held = {"id": "pr:acme/api#600", "kind": "captain", "tier": "cos", "repo": "acme/api", "number": 600, "title": "t",
+                "since": sb.iso(self.world.clock.now() - 10 * 3600)}
+        self.cleared_fact_then(extra=[held], gate=lambda engine, repo, number, now: (None, None, None, "HTTP 502"))
+        self.assertEqual(self.engine.sweep.s5_unchecked, 1, msg="the pass did not leave the held pull request unchecked")
+        self.assertIsNone(self.engine.sweep.present)
+        self.deliver()
+        self.assertEqual(self.dropped(), [], msg="a fact was dropped on a pass that left a pull request unchecked")
+        self.assertEqual(len(self.texts()), 1)
+        self.assertIn(self.UNVERIFIED, self.texts()[0])
+
+    def test_the_control_a_pass_with_neither_condition_drops_the_cleared_fact(self):
+        self.cleared_fact_then()
+        self.assertEqual(self.engine.sweep.present, set())
+        self.deliver()
+        self.assertEqual(self.texts(), [])
+        self.assertEqual([e["detail"]["kind"] for e in self.dropped()], ["sweep"])
+
+
+class TestSeenAllMutants(unittest.TestCase):
+    """Each condition replaced by True in the real `sweep_decisions` (control first, mutation asserted applied, one mutant per condition)."""
+
+    def caught(self, old, new, name):
+        text = Path(sb.__file__).resolve().read_text()
+        start = text.index("def sweep_decisions(")
+        end = text.index("\n\n\ndef sweep_queue_fact")
+        self.assertEqual(text[start:end].count(old), 1, msg="the mutation target moved")
+        mutated = text[start:end].replace(old, new, 1)
+        self.assertNotEqual(mutated, text[start:end], msg="the mutation was not applied")
+        ns = dict(vars(sb))
+        exec(compile(mutated, "sweep_decisions.py", "exec"), ns)
+        helper = TestPassRecheckMutants()
+        self.assertTrue(helper.run_case(name, []).wasSuccessful(), msg="control failed")
+        return helper.run_case(name, [(sb, "sweep_decisions", ns["sweep_decisions"])])
+
+    def test_a_seen_all_that_ignores_the_deferral_is_caught(self):
+        result = self.caught("and not defer and", "and True and", "TestSeenAllConditions.test_a_pass_that_deferred_a_repository_keeps_its_fact_marked_unverified")
+        self.assertFalse(result.wasSuccessful(), msg="a pass that deferred a repository and set present went unnoticed")
+
+    def test_a_seen_all_that_ignores_an_unchecked_pull_request_is_caught(self):
+        result = self.caught("and not state.s5_unchecked", "and True", "TestSeenAllConditions.test_a_pass_with_a_held_pull_request_unchecked_keeps_its_fact_marked_unverified")
+        self.assertFalse(result.wasSuccessful(), msg="a pass that left a pull request unchecked and set present went unnoticed")
