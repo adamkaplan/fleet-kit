@@ -719,6 +719,8 @@ def build_entries(items, ids, home, known_title, tier_flat=False, known_parent=N
         if item["kind"] == "issue" and key(item["repo"], item["ask"]) in reporters:
             extra["reported_by"] = sorted(set(reporters[key(item["repo"], item["ask"])]))
             extra["reported_lines"] = lines[key(item["repo"], item["ask"])][-FOLDED_LINES_KEPT:]  # none is lost
+        if item.get("about"):
+            extra["about"] = item["about"]
         if item.get("considered"):
             extra["considered"] = item["considered"]
         if item.get("request"):

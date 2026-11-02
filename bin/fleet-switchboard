@@ -8394,6 +8394,7 @@ def decisions_from_github(engine, now):
                       "parent": record.get("parent"), "closed": bool(record.get("closed")),
                       "waits_for": record.get("waits_for") or [],
                       "plan_kind": kinds[(record["repo"], record["number"])]})
+        items[-1]["about"] = record.get("about")
     return items, problems
 
 
@@ -12947,6 +12948,7 @@ class GitHubHub:
                                       "parent": parent_of(issue), "tier": tier, "rows": rows,
                                       "raised_by": raised if rows else None, "closed": closed, "waits_for": waits,
                                       "repo": repo}
+                self.awaiting[key]["about"] = decision_core.parse_about(issue["body"]) if "body" in issue else (known or {}).get("about")
             else:
                 self.awaiting.pop(key, None)
 
@@ -13047,6 +13049,8 @@ class GitHubHub:
                         "raised_by": entry.get("raised_by"), "closed": bool(entry.get("closed")),
                         "waits_for": entry.get("waits_for") or []}
                        for (repo, number), entry in sorted(self.awaiting.items())]
+            for record, (_, entry) in zip(records, sorted(self.awaiting.items())):
+                record["about"] = entry.get("about")
             errors = []
             for repo in sorted(self.watches):
                 if repo not in self.awaiting_read:

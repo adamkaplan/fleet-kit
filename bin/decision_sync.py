@@ -160,6 +160,8 @@ class SyncEngine:
                                             "tier": entry.get("tier"), "floor": floor, "kind": entry.get("kind"),
                                             "thread": list(thread) if thread else None, "entry": entry,
                                             "boss": (bosses or {}).get(entry.get("id"))}
+            if entry.get("about"):   # after the digest: an About added or edited later revises nothing already linked
+                out[core.decision_key(seed)]["payload"] = dict(payload, about=entry["about"])
         return out
 
     def _projected(self):
