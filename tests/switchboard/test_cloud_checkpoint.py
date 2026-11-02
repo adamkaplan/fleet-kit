@@ -122,4 +122,37 @@ def build(TwoRepoCase, sb, EPOCH, ACME_WEB):
             with self.assertRaises(AssertionError) as failed:
                 self.check_places(places)
             self.assertIn(name, str(failed.exception))
+        def failing_launch(self, how):
+            def fake(function, args, runner, now):
+                if how == "raise":
+                    raise sb.LaunchError("pod creation failed; nothing was created")
+                return 1
+            with mock.patch.object(sb, "run_cloud", fake):
+                return self.main("launch", "web-new", "--cloud", "--repo", ACME_WEB, "--reports-to", "web-orch", "--issue", "acme/web#2")
+
+        def check_failed_launch_arms_nothing(self):
+            for how, status in (("exit", 1), ("raise", 1)):
+                sb.write_reminders(self.world.state, [])
+                code, _, err = self.failing_launch(how)
+                self.assertEqual(len(sb.read_reminders(self.world.state)), 0, "a failed launch (%s) armed reminders" % how)
+                self.assertEqual(code, status, err)
+                self.assertNotIn("default 25m/40m", err)
+
+        def test_a_failed_cloud_launch_arms_nothing(self):
+            self.check_failed_launch_arms_nothing()
+
+        def test_a_stack_launch_arms_the_default_once(self):
+            code, _, err = self.launch("--stack")
+            self.assertEqual(code, 0, err)
+            self.assertEqual(len(sb.read_reminders(self.world.state)), 2)
+            self.assertEqual(len([l for l in err.splitlines() if "default 25m/40m" in l]), 1)
+
+        def test_the_outer_handler_of_the_arming_keeps_a_launched_pod_successful(self):
+            with mock.patch.object(sb, "build_engine", side_effect=RuntimeError("the engine cannot be built")):
+                try:
+                    code, _, err = self.launch()
+                except RuntimeError as escaped:
+                    self.fail("the launch no longer returns success: the RuntimeError escaped (%s)" % escaped)
+            self.assertEqual(code, 0, "the launch no longer returns success: %s" % err)
+            self.assertEqual(len([l for l in err.splitlines() if "no checkpoint reminders" in l]), 1)
     return TestCloudLaunchArmsCheckpoint
