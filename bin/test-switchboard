@@ -67365,6 +67365,7 @@ _changed_file_pages.HOST = sys.modules[__name__]
 TestWholeReadOfALargePullRequest = _changed_file_pages.load()
 
 _lm = importlib.import_module("test_launch_model"); _lm.HOST = sys.modules[__name__]; TestLaunchModel = _lm.build(); TestLaunchModelCloud = _lm.build_cloud()   # #1642
+_pl = importlib.import_module("test_plan_hash_lines"); TestPlanHashLinesPair, TestPlanHashLinesWhitespace, TestPlanHashLinesVariants, TestPlanHashLinesBindings, TestPlanHashLinesPairOrder, TestPlanHashLinesDocs, TestPlanHashLinesCloudCopy = _pl.TestPlanHashLinesPair, _pl.TestPlanHashLinesWhitespace, _pl.TestPlanHashLinesVariants, _pl.TestPlanHashLinesBindings, _pl.TestPlanHashLinesPairOrder, _pl.TestPlanHashLinesDocs, _pl.TestPlanHashLinesCloudCopy   # #1834
 TestPlanningDecision, TestConcurrencyGroup, TestGateLegs, TestGatePass, TestPlatformPaths, TestMacDocs = (_ml := importlib.import_module("test_mac_legs")).TestPlanningDecision, _ml.TestConcurrencyGroup, _ml.TestGateLegs, _ml.TestGatePass, _ml.TestPlatformPaths, _ml.TestDocs
 _ph = importlib.import_module("test_plan_hash_marker"); _ph.HOST = sys.modules[__name__]; TestPlanHashMarkerPure, TestPlanHashMarkerStored, TestPlanHashMarkerTally, TestPlanHashMarkerMutants, TestPlanHashMarkerDocumentation, TestPlanHashMarkerNoSizeTest = _ph.TestPlanHashMarkerPure, _ph.TestPlanHashMarkerStored, _ph.TestPlanHashMarkerTally, _ph.TestPlanHashMarkerMutants, _ph.TestPlanHashMarkerDocumentation, _ph.TestPlanHashMarkerNoSizeTest; TestPlanHashMarkerWake, TestPlanHashMarkerRounds = _ph.build()   # #1713
 
