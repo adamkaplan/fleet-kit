@@ -74,5 +74,43 @@ class S7Zombie(unittest.TestCase):
             self.assertEqual((n_z, n_l, n_o), (2, 2, 2))
 
 
+class S16SkipText(unittest.TestCase):
+    """S16 of #1709: the skip text is exercised on a fake of a machine without /proc (state_of raises OSError)."""
+    def run_zombie_test(self):
+        started = []
+        real_start = stub_support.start
+
+        def counting(case, *a, **kw):
+            started.append(a)
+            return real_start(case, *a, **kw)
+        stub_support.start = counting
+        self.addCleanup(setattr, stub_support, "start", real_start)
+        result = unittest.TestResult()
+        S7Zombie("test_zombie_and_live").run(result)
+        stub_support.start = real_start
+        return result, len(started)
+
+    def test_skip_text_on_a_fake_without_proc(self):
+        if state_of(os.getpid()) is None:
+            self.skipTest("the control needs a readable /proc")
+        c_result, c_started = self.run_zombie_test()
+        control_ran = 1 if (c_started >= 1 and not c_result.skipped and c_result.wasSuccessful()) else 0
+        self.assertEqual(control_ran, 1, "control: the zombie test must run, not skip, and start its child")
+        real_state = globals()["state_of"]
+
+        def cannot_read(pid):
+            raise OSError("fake: no /proc")
+        globals()["state_of"] = cannot_read
+        self.addCleanup(globals().__setitem__, "state_of", real_state)
+        f_result, f_started = self.run_zombie_test()
+        globals()["state_of"] = real_state
+        texts = [reason for _, reason in f_result.skipped]
+        with_text = 1 if len(texts) == 1 and texts[0].startswith("SKIPPED: /proc not readable") else 0
+        print("S16: skip text exercised: control ran %d of 1, fake skipped %d of 1 with the text, children started %d"
+              % (control_ran, with_text, f_started))
+        self.assertEqual(with_text, 1, "the fake must skip with the text: %r" % (texts,))
+        self.assertEqual(f_started, 0, "no child may start on the fake")
+
+
 if __name__ == "__main__":
     unittest.main()
