@@ -2535,7 +2535,16 @@ class Launcher:
         pods = self.kube.list_pods()
         _sw = getattr(getattr(self.kube, "known", None), "sweep", None)
         if _sw:
-            _sw(time.time(), {(p.get("metadata") or {}).get("name") for p in pods})   # forms whose every holder has left are dropped (ask #1783)
+            try:
+                if not pods:   # an empty or unreadable list cannot be told from a truncated read: drop nothing
+                    self.audit("", "", "known-forms.sweep-skipped", 0, True, "empty pod list")
+                else:
+                    _sw(time.time(), {(p.get("metadata") or {}).get("name") for p in pods})   # forms whose every holder has left are dropped (ask #1783)
+            except Exception as e:   # the sweep never raises into the pass; the class name only, never a value
+                try:
+                    self.audit("", "", "known-forms.sweep-failed", 0, False, type(e).__name__)
+                except Exception:
+                    pass
         # The renewal is the FIRST step: a slow activity read or stop below can no longer hold it back (the audit of 29 October).
         renewed = self.renew_git_tokens(self._before_hard_limit(pods, now), now)
         self._note_vanished_pods(pods, now)
