@@ -183,6 +183,31 @@ def build(PR4Base):
             self.assertLessEqual(most, 1, msg="(c) steers of the lane in one pass (one merged message, not 50)")
             self.assertGreaterEqual(self.steered("s-fifty"), 1)
             self.assertEqual(repeats, 0, msg="a reminder.ceiling or reminder.waiting line twice for one id")
+            self.assertEqual(self.first_steer_keys("s-fifty"), 50, msg="one steer carries all 50 reminder keys")
+
+        def first_steer_keys(self, name):
+            """The count of reminder keys in the FIRST steer to the lane."""
+            first = [e for e in self.sent_to(name) if e["detail"]["delivery"] == "steer"][0]
+            return len([k for k in first["detail"]["keys"] if k.startswith("reminder:")])
+
+        def test_s16_a_mutant_that_merges_only_half_is_caught(self):
+            import inspect, textwrap
+            self.fifty_world()
+            self.run_fifty("s-fifty")
+            self.assertEqual(self.first_steer_keys("s-fifty"), 50, msg="control: one steer carries all 50 reminder keys")
+            self.fifty_world("s-fifty2", 51)
+            engine_class = type(self.world.engine)
+            source = inspect.getsource(engine_class.deliver)
+            old, new = "merge_wake_facts(plan.recipient, plan.pending)", "merge_wake_facts(plan.recipient, plan.pending[:25])"
+            self.assertEqual(source.count(old), 1, msg="the replaced text is in the source once")
+            mutated = source.replace(old, new)
+            self.assertNotEqual(mutated, source, msg="mutation not applied: half merge")
+            space = dict(engine_class.deliver.__globals__)
+            exec(textwrap.dedent(mutated), space)
+            with mock.patch.object(engine_class, "deliver", space["deliver"]):
+                self.run_fifty("s-fifty2")
+                with self.assertRaisesRegex(AssertionError, r"one steer carries all 50", msg="mutant not caught: half merge"):
+                    self.assertEqual(self.first_steer_keys("s-fifty2"), 50, msg="one steer carries all 50 reminder keys")
 
         def test_s16_a_mutant_that_delivers_only_the_first_due_reminder_is_caught(self):
             import inspect
