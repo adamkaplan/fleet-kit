@@ -126,6 +126,12 @@ class TestPlanningDecision(unittest.TestCase):
             self.assertNotEqual(decisions(mutant), {name: want for name, (_, want) in PLAN_CASES.items()}, old)
 
 
+    def test_pc5_a_pull_request_into_main_changing_a_newly_listed_os_path_runs_macos(self):
+        text = WORKFLOW.read_text()
+        for path in ("bin/switchboard/installer.py", "bin/github_census.py", "bin/guard_alert.py", "bin/spotlight_guard.py"):
+            self.assertEqual(planned(text, "pull_request", base="main", files=(path,)), sorted([UBUNTU, MAC]), path)
+
+
 class TestConcurrencyGroup(unittest.TestCase):
     """S5: the group model. A run's group and whether it cancels are read from the real expressions by evaluating the two the workflow writes."""
 
@@ -319,6 +325,10 @@ def patterns_of(text):
 
 
 class TestPlatformPaths(unittest.TestCase):
+    """The platform-path list. The OS-calling files are derived by ast (not a regular expression) and each must be listed or exempt with a reason.
+
+    Known limits: a command whose first element is built at run time, and a tool called only through a variable, are not seen.
+    """
     def test_s9_the_list_holds_shims_plugins_and_the_install_and_service_files(self):
         self.assertEqual(list_problems(patterns_of(LIST.read_text())), [])
         self.assertEqual(len(REQUIRED_GROUPS), 3)
@@ -334,6 +344,122 @@ class TestPlatformPaths(unittest.TestCase):
         self.assertEqual(consts["LIST"], ".github/macos-platform-paths.txt")
         self.assertEqual(consts["WORKFLOWS"], ".github/workflows/")
         self.assertTrue(LIST.exists())
+
+
+    # PC-5 of #1671. Known limits: a command whose first element is built at run time, and a tool called only through a variable, are not seen.
+    OS_TOOLS = frozenset("launchctl osascript mdfind sysctl plutil notify-send pmset caffeinate diskutil scutil sw_vers vm_stat mdutil pgrep pkill defaults open ps lsof".split())
+    REAL_ONLY = frozenset(("open", "defaults"))   # counted only as a real subprocess call (not as a word or an argv list)
+    CALLS = frozenset(("subprocess.run", "subprocess.Popen", "subprocess.call", "subprocess.check_call", "subprocess.check_output", "os.system", "os.popen"))
+    PLATFORM = frozenset(("sys.platform", "os.name", "platform.system", "os.uname"))
+    EXEMPT = {
+        "bin/fleet-switchboard": "left out on purpose: almost every change touches it; the push to main and the nightly catch a regression",
+        "bin/cloud_cluster.py": "portable ps -o ... -p PID call, which also exists on Linux",
+        "bin/guard_record_head_move.py": "portable ps -o ... -p PID call, which also exists on Linux",
+    }
+
+    @staticmethod
+    def dotted(node):
+        parts = []
+        while isinstance(node, ast.Attribute):
+            parts.append(node.attr)
+            node = node.value
+        if isinstance(node, ast.Name):
+            parts.append(node.id)
+            return ".".join(reversed(parts))
+        return ""
+
+    @classmethod
+    def tool_of(cls, node):
+        """The OS tool a literal names (a string, its first word) or ''."""
+        if isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value.split():
+            word = node.value.split()[0].rsplit("/", 1)[-1]
+            return word if word in cls.OS_TOOLS else ""
+        return ""
+
+    @classmethod
+    def os_calling(cls, source):
+        """The (line, what) hits of one source text, by ast."""
+        try:
+            tree = ast.parse(source)
+        except (SyntaxError, ValueError):
+            return []
+        hits = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and cls.dotted(node.func) in cls.CALLS and node.args:
+                first = node.args[0]
+                tool = cls.tool_of(first)
+                if not tool and isinstance(first, (ast.List, ast.Tuple)) and first.elts:
+                    tool = cls.tool_of(first.elts[0])
+                if tool:
+                    hits.append((node.lineno, tool))
+            elif isinstance(node, (ast.List, ast.Tuple)) and node.elts and isinstance(getattr(node, "ctx", None), ast.Load):
+                tool = cls.tool_of(node.elts[0])
+                if tool and tool not in cls.REAL_ONLY and len(node.elts) > 1:
+                    hits.append((node.lineno, tool))
+            elif isinstance(node, ast.Attribute) and cls.dotted(node) in cls.PLATFORM:
+                hits.append((node.lineno, cls.dotted(node)))
+        return hits
+
+    @classmethod
+    def derived(cls, root):
+        """{repo-relative path: first hit} over the non-test files of bin/, cloud/, plugins/ and shims/ (python files and extensionless python scripts)."""
+        found = {}
+        for top in ("bin", "cloud", "plugins", "shims"):
+            for path in sorted((root / top).rglob("*")) if (root / top).is_dir() else []:
+                if not path.is_file() or path.is_symlink() or "__pycache__" in path.parts or path.name.startswith(("test_", "test-")):
+                    continue
+                rel = path.relative_to(root).as_posix()
+                if "/tests/" in "/" + rel:
+                    continue
+                try:
+                    text = path.read_text()
+                except (UnicodeDecodeError, OSError):
+                    continue
+                if not (path.suffix == ".py" or (not path.suffix and text.startswith("#!") and "python" in text.split("\n", 1)[0])):
+                    continue
+                hits = cls.os_calling(text)
+                if hits:
+                    found[rel] = min(hits)
+        return found
+
+    @classmethod
+    def unlisted(cls, root, patterns):
+        import fnmatch
+        return {rel: hit for rel, hit in cls.derived(root).items()
+                if not any(fnmatch.fnmatchcase(rel, p) for p in patterns) and len(cls.EXEMPT.get(rel, "")) < 20}
+
+    def test_pc5_every_os_calling_file_is_listed_or_exempt_with_a_reason(self):
+        found = self.unlisted(REPO, patterns_of(LIST.read_text()))
+        self.assertEqual(found, {}, "OS-calling files neither on .github/macos-platform-paths.txt nor exempt: " + ", ".join("%s (line %d: %s)" % (f, h[0], h[1]) for f, h in found.items()))
+
+    def test_pc5_every_exempt_entry_is_still_os_calling_and_unlisted(self):
+        import fnmatch
+        patterns, found = patterns_of(LIST.read_text()), self.derived(REPO)
+        for rel, reason in self.EXEMPT.items():
+            self.assertGreaterEqual(len(reason), 20, rel)
+            self.assertIn(rel, found, rel + " no longer calls the OS: drop its exempt entry")
+            self.assertFalse(any(fnmatch.fnmatchcase(rel, p) for p in patterns), rel + " is listed: drop its exempt entry")
+
+    def test_pc5_the_derivation_counts_open_and_defaults_only_as_real_calls(self):
+        self.assertEqual(self.os_calling('x = "open the door"\nprint(["open", "a"], "defaults")\n'), [])
+        self.assertEqual(self.os_calling('import subprocess\nsubprocess.run(["open", "a"])\n'), [(2, "open")])
+        self.assertEqual(self.os_calling('cmd = ["pmset", "-g"]\n'), [(1, "pmset")])
+        self.assertEqual(self.os_calling('import os\nos.system("lsof -p 1")\n'), [(2, "lsof")])
+
+    def test_pc5_mutant_a_listed_line_removed_is_caught_naming_the_file(self):
+        text = LIST.read_text()
+        for gone in ("bin/switchboard/installer.py", "bin/github_census.py", "bin/guard_alert.py", "bin/spotlight_guard.py", "bin/heavy_slots.py"):
+            mutant = "\n".join(l for l in text.splitlines() if l.strip() != gone)
+            self.assertEqual(sorted(self.unlisted(REPO, patterns_of(mutant))), [gone])
+
+    def test_pc5_mutant_a_new_unlisted_file_calling_pmset_is_caught_naming_the_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "bin").mkdir()
+            (root / "bin" / "new_tool.py").write_text('import subprocess\nsubprocess.run(["pmset", "-g"])\n')
+            (root / "bin" / "plain").write_text("#!/usr/bin/env python3\nimport os\nprint(os.name)\n")
+            (root / "bin" / "docs.py").write_text('print("open the door")\n')
+            self.assertEqual(sorted(self.unlisted(root, patterns_of(LIST.read_text()))), ["bin/new_tool.py", "bin/plain"])
 
 
 class TestDocs(unittest.TestCase):
