@@ -6214,6 +6214,8 @@ At delivery, and only there, each alert or digest is judged once:
 
 Not changed: the once-per-key memory of alerts (#1378), the ordering and cap of `compose`, acknowledgement of delivered keys, the digest cadence gate, and messages of kind `send` or `report`. Lab faults for the controls: `no-sent-time`, `deliver-stale-alert` and `keep-old-digest`; `TestDeliveryLag` runs each as a mutant.
 
+Sweep, triage and plan items (#1542): a sweep fact, a triage digest and a plan notice (kind `plan`, "plan posted") are judged at delivery against their own present state: the sweep's current findings, the triage's current items and the newest plan hash on the issue, all read from the daemon's memory through the same delivery reader, with no new GitHub read. An item whose findings are all gone, or whose plan hash is superseded, is dropped with one `stale.dropped` audit line; one finding still present keeps the whole text; a present state that is absent or unreadable keeps the item marked `[unverified: its present state could not be read]`. All three share the one age mark: older than 30 minutes (`DELAYED_AFTER`, the one constant) the first line says `delayed: sent HH:MMZ`.
+
 ## The retired `FLEET_SWITCHBOARD_OWN_GH` marker and the own-call path (#1216)
 
 **What the variable does now:** nothing in `shims/gh`: no code in it reads or sets the name. The switchboard only *clears* it (an agent's pane children, its own children),
