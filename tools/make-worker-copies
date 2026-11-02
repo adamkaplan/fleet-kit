@@ -8,6 +8,7 @@ import os
 import sys
 
 TABLE = os.path.join("cloud", "worker", "copies.tsv")
+PATH_LIMIT = 1024  # characters in one path of the table; a longer path is refused
 
 
 class BadRow(Exception):
@@ -26,20 +27,48 @@ def parse_row(n, line):
         if path.startswith("/"):
             raise BadRow("row %d: a path must not begin with /" % n)
     source, copy = fields
+    for path in fields:
+        if len(path) > PATH_LIMIT:
+            raise BadRow("row %d: a path is longer than %d characters" % (n, PATH_LIMIT))
     if ".." in source.split("/"):
         raise BadRow("row %d: the source climbs out of the repository root" % n)
     if not copy.startswith("cloud/worker/") or ".." in copy.split("/"):
         raise BadRow("row %d: the copy must be under cloud/worker/ and must not climb out of it" % n)
+    for path in fields:
+        if os.path.normpath(path) != path or path.endswith("/"):
+            raise BadRow("row %d: a path is not in its plain form (no ./, no //, no trailing /)" % n)
     return source, copy
 
 
+def inside(root, rel, sub):
+    """True when the REAL PATH of root/rel is under the real path of root/sub (links are followed)."""
+    base = os.path.realpath(os.path.join(root, sub))
+    real = os.path.realpath(os.path.join(root, rel))
+    return real == base or real.startswith(base + os.sep)
+
+
 def read_rows(root):
-    with open(os.path.join(root, TABLE), encoding="utf-8") as f:
-        lines = f.read().splitlines()
+    with open(os.path.join(root, TABLE), "rb") as f:
+        raw = f.read()
     rows = []
-    for n, line in enumerate(lines, 1):
-        if line:
-            rows.append((n,) + parse_row(n, line))
+    for n, bline in enumerate(raw.split(b"\n"), 1):
+        if not bline:
+            continue
+        try:
+            line = bline.decode("utf-8")
+        except UnicodeDecodeError:
+            raise BadRow("row %d: the row is not valid UTF-8" % n)
+        if len(line) > 2 * PATH_LIMIT + 1:
+            raise BadRow("row %d: a path is longer than %d characters" % (n, PATH_LIMIT))
+        rows.append((n,) + parse_row(n, line))
+    for n, source, copy in rows:
+        try:
+            if not inside(root, source, "."):
+                raise BadRow("row %d: a symlink led out of the repository: %s" % (n, source))
+            if not inside(root, copy, os.path.join("cloud", "worker")):
+                raise BadRow("row %d: a symlink led out of cloud/worker: %s" % (n, copy))
+        except (OSError, ValueError):
+            raise BadRow("row %d: a path cannot be resolved" % n)
     sources = {s for _, s, _ in rows}
     seen = set()
     for n, source, copy in rows:

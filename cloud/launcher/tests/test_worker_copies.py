@@ -244,6 +244,105 @@ class Strict(unittest.TestCase):
             self.assertNotEqual(mutated, original, "the mutation was not applied")
 
 
+PATH_LIMIT = 1024   # the limit the command states: PATH_LIMIT characters in one path of the table
+S12_ROWS = (
+    ("c-long-path", ("bin/cloud_cli.py\tcloud/worker/" + "a" * 5000).encode()),
+    ("d-not-utf8", b"bin/cloud_cli.py\tcloud/worker/\xff\xfe"),
+    ("e-copy-dot", b"bin/cloud_cli.py\tcloud/worker/./x"),
+    ("f-source-dot", b"./bin/cloud_cli.py\tcloud/worker/x"),
+    ("g-double-slash", b"bin/cloud_cli.py\tcloud/worker//x"),
+    ("h-trailing-slash", b"bin/cloud_cli.py\tcloud/worker/x/"),
+)
+
+
+def put_bytes(d, row):
+    with open(os.path.join(d, TABLE), "ab") as f:
+        f.write(b"\n" + row + b"\n")
+
+
+def make_links(test, d):
+    """An outside file and an outside directory (kept apart from the scratch tree) and two links to them inside cloud/worker."""
+    out = tempfile.mkdtemp(prefix="wc-outside-")
+    test.addCleanup(shutil.rmtree, out, True)
+    target = os.path.join(out, "target.txt")
+    with open(target, "wb") as f:
+        f.write(b"outside bytes\n")
+    os.mkdir(os.path.join(out, "dir"))
+    os.symlink(target, os.path.join(d, "cloud/worker/leaf"))
+    os.symlink(os.path.join(out, "dir"), os.path.join(d, "cloud/worker/linkdir"))
+    return out, target
+
+
+def check_symlink_refused(d, target, row):
+    put_bytes(d, row.encode())
+    before = slurp_abs(target)
+    status, out = run_in(d)
+    if status == 0 or slurp_abs(target) != before:
+        raise AssertionError("a symlink led out of cloud/worker: " + row)
+    return status, out
+
+
+def slurp_abs(path):
+    with open(path, "rb") as f:
+        return f.read()
+
+
+class Real(unittest.TestCase):
+    def test_s12_eight_kinds_of_bad_path_are_refused_with_one_line(self):
+        for name, row in S12_ROWS + (("a-leaf-symlink", b"bin/cloud_cli.py\tcloud/worker/leaf"),
+                                     ("b-dir-symlink", b"bin/cloud_cli.py\tcloud/worker/linkdir/x")):
+            with self.subTest(row=name):
+                d = scratch(self)
+                out_dir, target = make_links(self, d)
+                put_bytes(d, row)
+                before = snapshot(d)
+                target_before = slurp_abs(target)
+                status, out = run_in(d)
+                self.assertEqual(status, 2, out)
+                lines = out.splitlines()
+                self.assertEqual(len(lines), 1, out)
+                self.assertRegex(lines[0], r"^row \d+: \S")
+                self.assertNotIn("Traceback", out)
+                self.assertEqual(snapshot(d), before)          # no file changed or created
+                self.assertEqual(slurp_abs(target), target_before)
+                self.assertEqual(os.listdir(os.path.join(out_dir, "dir")), [])
+
+    def test_s12_the_command_states_its_limit(self):
+        text = slurp(COMMAND).decode()
+        self.assertIn("PATH_LIMIT = %d" % PATH_LIMIT, text)
+
+    def test_s12_a_mutant_that_judges_the_written_path_is_caught(self):
+        control = scratch(self)
+        _, target = make_links(self, control)
+        check_symlink_refused(control, target, "bin/cloud_cli.py\tcloud/worker/leaf")   # the control first
+        d = scratch(self)
+        _, target = make_links(self, d)
+        original = slurp(COMMAND).decode()
+        old = ("    base = os.path.realpath(os.path.join(root, sub))\n"
+               "    real = os.path.realpath(os.path.join(root, rel))\n")
+        self.assertEqual(original.count(old), 1)
+        mutated = original.replace(old, "    base = os.path.abspath(os.path.join(root, sub))\n"
+                                        "    real = os.path.abspath(os.path.join(root, rel))\n")
+        self.assertNotEqual(mutated, original, "the mutation was not applied")
+        self.assertIn(old, original)
+        self.assertNotIn(old, mutated)
+        with open(os.path.join(d, COMMAND), "w") as f:
+            f.write(mutated)
+        with self.assertRaisesRegex(AssertionError, "a symlink led out of cloud/worker: bin/cloud_cli.py\tcloud/worker/leaf"):
+            check_symlink_refused(d, target, "bin/cloud_cli.py\tcloud/worker/leaf")
+
+    def test_s12_a_no_op_mutation_fails_the_computation(self):
+        original = slurp(COMMAND).decode()
+        with self.assertRaises(AssertionError):
+            self.assertNotEqual(original.replace("not-in-the-text", "x"), original, "the mutation was not applied")
+
+    def test_s12_the_orchestrator_test_file_closes_its_table(self):
+        r = subprocess.run([sys.executable, "-B", "-W", "error::ResourceWarning", os.path.join(HERE, "test_orchestrator_agent.py")],
+                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=90, cwd=ROOT)
+        self.assertEqual(r.returncode, 0, r.stdout.decode(errors="replace")[-600:])
+        self.assertNotIn(b"ResourceWarning", r.stdout)
+
+
 TREE = ("tools", "bin", "cloud", "agents", "tests", "docs")
 THREE = {
     "cloud/launcher/tests/test_orchestrator_agent.py": (["cloud/launcher/tests", "test_orchestrator_agent.Drift"],
