@@ -1344,6 +1344,7 @@ class KnownForms(set):
         super().__init__()
         self._lock = threading.RLock()
         self._lives = {}
+        self._absent = set()
 
     def __iter__(self):
         with self._lock:
@@ -1359,20 +1360,28 @@ class KnownForms(set):
                     self._lives.setdefault(f, set()).add(life)
 
     def sweep(self, now, pods):
-        """Drop each form whose every holder has left: ("pod", name) when the pod is not in pods; ("until", t, name) when now >= t and the pod is not in pods. pods=None drops nothing. Returns the count dropped."""
-        if pods is None:
+        """Drop each form whose every holder has left: ("pod", name) when the pod is not in pods; ("until", t, name) when now >= t and the pod is not in pods; a holder is released only when its pod was also absent from the previous sweep (two in a row). pods=None or an empty list drops nothing and clears that memory. Returns the count dropped."""
+        if not pods:
+            with self._lock:
+                self._absent = set()
             return 0
         pods = set(pods)
         gone = 0
         with self._lock:
+            before, absent = self._absent, set()
             for f, lives in list(self._lives.items()):
                 if lives is None:
                     continue
-                lives -= {l for l in lives if (l[0] == "pod" and l[1] not in pods) or (l[0] == "until" and now >= l[1] and l[2] not in pods)}
+                for l in lives:
+                    n = l[1] if l[0] == "pod" else l[2]
+                    if n not in pods:
+                        absent.add(n)
+                lives -= {l for l in lives if ((l[0] == "pod" and l[1] not in pods) or (l[0] == "until" and now >= l[1] and l[2] not in pods)) and (l[1] if l[0] == "pod" else l[2]) in before}
                 if not lives:
                     del self._lives[f]
                     set.discard(self, f)
                     gone += 1
+            self._absent = absent
         return gone
 
 
