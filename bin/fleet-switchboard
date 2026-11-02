@@ -4827,6 +4827,8 @@ def pane_state(engine, name, session_id, pane, known_names=(), known_sessions=()
     except HerdrError as err:
         text = str(err).lower()
         if "not found" in text or "no such" in text or "unknown pane" in text:
+            if not daemon_shows_absent(engine, name, {"pane": pane, "session": session_id}):   # #1884: one function decides death
+                return PANE_UNKNOWN, "herdr has no pane %s to get, but its list and process do not show it gone" % pane, {}
             return PANE_DEAD, "herdr has no pane %s" % pane, {}
         return PANE_UNKNOWN, "herdr cannot say what pane %s shows: %s" % (pane, _one_line(str(err), 100)), {}
     title = got.get("terminal_title_stripped") or got.get("terminal_title") or ""
@@ -4854,6 +4856,8 @@ def pane_state(engine, name, session_id, pane, known_names=(), known_sessions=()
         return PANE_ATTACHED, "the pane shows %s" % name, info
     others = [n for n in known_names if n and n != name and _names_agent(text, n, None)] + [x for x in known_sessions if x and x != session_id and x.lower() in text]
     info["shows_another"] = others[:3]
+    if not others and daemon_shows_absent(engine, name, {"pane": pane, "session": session_id}):   # #1884: a listed pane with no process of the agent is dead
+        return PANE_DEAD, "pane %s is listed but holds no process of %s's session %s" % (pane, name, session_id), info
     return PANE_DETACHED, "pane %s shows %r, not %s's session %s" % (pane, info["title"][:60], name, session_id), info
 
 
@@ -5319,6 +5323,8 @@ def pane_health_pass(engine, now):
                 engine.__dict__.setdefault("pane_held", {}).pop(name, None)
             except HerdrError:
                 pass
+        if missing[name] >= PANE_MISSING_PASSES and not daemon_shows_absent(engine, name, agents[name]):   # #1884: dead only when the one function says so
+            continue
         if missing[name] >= PANE_MISSING_PASSES and (states.get(name) or {}).get("state") != PANE_DEAD:
             last = _read_small(engine.state_dir, LAST_REPORT_FILE).get(name) or {}
             lookback = engine.config.get("worker_lookback_hours", 24) * 3600
@@ -5839,6 +5845,17 @@ def herdr_live_check(herdr):
         except Exception:
             return {"pane": True, "process": None}
     return check
+
+
+def daemon_shows_absent(engine, name, agent):
+    """The daemon's dead test (#1884): the registry's reader and evidence, decided by `registry.evidence_shows_absent`, the one function. A row with no pane is not judged."""
+    if not agent.get("pane"):
+        return False
+    try:
+        evidence = load_module("agent_reconcile").evidence_of(agent, herdr_live_check(engine.herdr)(name, agent))
+        return bool(load_module("registry").evidence_shows_absent(evidence))
+    except Exception:
+        return False
 
 
 def reconcile_agents_on_read(state_dir, herdr):
