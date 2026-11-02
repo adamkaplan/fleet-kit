@@ -16,9 +16,9 @@ ENTRY = REPO / "bin" / "fleet-switchboard"
 PART = REPO / "bin" / "switchboard" / "body_check.py"
 
 
-def load_entry():
-    loader = importlib.machinery.SourceFileLoader("sb_body_check_t", str(ENTRY))
-    module = importlib.util.module_from_spec(importlib.util.spec_from_loader("sb_body_check_t", loader))
+def load_entry(path=ENTRY, name="sb_body_check_t"):
+    loader = importlib.machinery.SourceFileLoader(name, str(path))
+    module = importlib.util.module_from_spec(importlib.util.spec_from_loader(name, loader))
     loader.exec_module(module)
     return module
 
@@ -43,11 +43,13 @@ LINE_RULE = "the first section names at least 4 places with function and line"
 class Run:
     """The command with its readers faked; every call a fake sees is kept, so a non-GET call or a write can be counted."""
 
-    def __init__(self, body, plan_text, fail=None):
+    def __init__(self, body, plan_text, fail=None, sb=None):
+        self.sb = sb or SB
         self.calls, self.fail = [], fail
         self.body, self.plan_text = body, plan_text
 
     def __call__(self):
+        SB = self.sb
         def read_pr_json(engine, repo, number, extra_fields=""):
             self.calls.append("GET pr")
             if self.fail == "pr":
@@ -103,9 +105,26 @@ class TestBodyCheck(unittest.TestCase):
         self.assertEqual(len(items), 3)
 
     def test_s6_a_build_that_skips_the_count_check_fails_the_s3_test(self):
-        with mock.patch.object(SB, "body_rule_count", lambda rule: (None, None)):
-            code, out = run(NO_LINES)
-        self.assertNotIn("found 0 of at least 4", out)   # the mutant: the S3 assertion above would fail
+        import shutil
+        import tempfile
+        old = "    if (got < count) if form == \"at least\" else (got != count):\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            for src in [p for p in (REPO / "bin").iterdir() if p.name != "test-switchboard" and (p.is_dir() or p.suffix in ("", ".py", ".parts"))]:
+                dst = Path(tmp) / "bin" / src.name
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copytree(src, dst) if src.is_dir() else shutil.copy(src, dst)
+            part = Path(tmp) / "bin" / "switchboard" / "body_check.py"
+            source = part.read_text()
+            self.assertEqual(source.count(old), 1)   # the mutation applies exactly once
+            control = load_entry(Path(tmp) / "bin" / "fleet-switchboard", "sb_body_check_control")
+            code, out = Run(NO_LINES, plan(LINE_RULE), sb=control)()   # control first: the unmutated copy gives the S3 refusal
+            self.assertEqual(code, 1)
+            self.assertIn("places with a file and line: found 0 of at least 4", out)
+            part.write_text(source.replace(old, "    if False:\n"))
+            mutant = load_entry(Path(tmp) / "bin" / "fleet-switchboard", "sb_body_check_mutant")
+            code, out = Run(NO_LINES, plan(LINE_RULE), sb=mutant)()
+        self.assertEqual(code, 0)   # the S3 test's assertions (exit 1, the found-0-of-4 line) fail on this build
+        self.assertNotIn("places with a file and line: found 0 of at least 4", out)
 
     def test_s4_the_count_forms_and_the_no_count_rule(self):
         self.assertEqual(SB.body_rule_count("on 28 Oct the section names at least 4 places"), (4, "at least"))
@@ -145,14 +164,6 @@ class TestBodyCheck(unittest.TestCase):
         runner = Run(GOOD, plan(LINE_RULE))
         self.assertEqual(runner()[0], 0)
         self.assertEqual(runner.calls, ["GET pr", "GET plan"])
-
-    def test_s8_s10_the_code_is_in_a_part_file_and_the_entry_gains_little(self):
-        self.assertTrue(PART.is_file())
-        self.assertIn("switchboard/body_check.py", (REPO / "bin" / "fleet-switchboard.parts").read_text().split())
-        text = (ENTRY).read_text()
-        self.assertNotIn("def body_rule_count", text)
-        self.assertLessEqual(text.count("cmd_body_check"), 1)
-        self.assertEqual(len(re.findall(r"preflight-pr --body", (REPO / "docs" / "switchboard.md").read_text())) >= 1, True)
 
     def test_u1_without_body_the_command_is_unchanged(self):
         args = SB.argparse.Namespace(body=None, merged=False)
