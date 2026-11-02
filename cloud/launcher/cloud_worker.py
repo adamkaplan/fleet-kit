@@ -444,6 +444,8 @@ class KnownSet:
     def _bulk(self, name, args):
         reads = [self._read(a) for a in args]  # BEFORE the lock
         err = next((e for _, e in reads if e is not None), None)
+        if err is not None and name in ("difference_update", "intersection_update", "symmetric_difference_update"):
+            raise err  # an operation that removes forms: a half-read argument changes nothing (set and version unchanged)
         with self._lock:
             before = frozenset(self._forms)
             try:
