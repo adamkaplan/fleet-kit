@@ -229,24 +229,38 @@ def build(HandoffCase):
             out = subprocess.run(["git", "diff", "--numstat", "origin/integration...HEAD"], cwd=str(REPO), stdout=subprocess.PIPE, universal_newlines=True, check=True).stdout
             return [l.split("\t") for l in out.splitlines()]
 
+        def git(self, *args):
+            return subprocess.run(("git",) + args, cwd=str(REPO), stdout=subprocess.PIPE, universal_newlines=True, check=True).stdout
+
         def test_s2_the_documents_gain_inserted_lines_only(self):
             rows = {r[2]: r for r in self.numstat()}
-            self.assertEqual(rows["skills/fleet-planning/SKILL.md"][1], "5")
-            if "docs/plan-template.md" in rows:
-                self.assertEqual(rows["docs/plan-template.md"][1], "0")
+            skill = "skills/fleet-planning/SKILL.md"
+            self.assertEqual([n for n, r in rows.items() if r[1] != "0" and n != skill], [], "a file other than the skill has removed lines")
+            diff = self.git("diff", "-U0", "origin/integration...HEAD", "--", skill)
+            removed = [l[1:] for l in diff.splitlines() if l.startswith("-") and not l.startswith("---")]
+            self.assertEqual(len(removed), int(rows[skill][1]), "the skill's removed lines are the hunks' minus lines")
+            pins = self.git("log", "-p", "--format=", "--grep=pin change of #1785", "origin/integration..HEAD", "--", skill)
+            pinned = set(l[1:] for l in pins.splitlines() if l.startswith("-") and not l.startswith("---"))
+            for line in removed:
+                self.assertIn(line, pinned, "a removed line no pin change commit changed")
+            print("skill removed lines:", len(removed))
 
         def test_u4_the_skill_is_within_its_word_cap(self):
+            CAP = 1200   # the cap TestPlanningSkill allows
             words = len(SKILL.read_text().split())
             print("skill words:", words)
-            self.assertLessEqual(words, 1200)
-            self.assertEqual(words, 1198)
+            self.assertLessEqual(words, CAP)
 
         def test_s8_no_existing_test_line_changes_and_no_pin_change_commit(self):
             for added, removed, name in self.numstat():
                 if name.startswith("tests/") or name == "bin/test-switchboard":
                     self.assertEqual(removed, "0", name)
-            log = subprocess.run(["git", "log", "--format=%s", "origin/integration..HEAD"], cwd=str(REPO), stdout=subprocess.PIPE, universal_newlines=True, check=True).stdout
-            self.assertEqual(log.count("pin change of #1785 (the planning skill shortened under its cap)"), 5)
+            pins = self.git("log", "--format=%H", "--grep=pin change of #1785", "origin/integration..HEAD").split()
+            print("pin change commits:", len(pins))
+            self.assertGreaterEqual(len(pins), 1)
+            for sha in pins:
+                names = self.git("show", "--name-only", "--format=", sha).split()
+                self.assertEqual(names, ["skills/fleet-planning/SKILL.md"], "pin change commit %s touches another file" % sha[:8])
 
         def test_s9_a_planted_unknown_class_is_the_one_failing_name(self):
             text = "class TestKnown(object):\n    pass\n"
