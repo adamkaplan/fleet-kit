@@ -695,3 +695,7 @@ class TestStopFinalMessageBareMutant(unittest.TestCase):
         self.assertIn("the file ran no tests", out)
         code, out = self.u20(str(CHECK_FILE))
         self.assertEqual(code, 0, "control of U20: %s" % out)
+
+
+if __name__ == "__main__":
+    unittest.main()
