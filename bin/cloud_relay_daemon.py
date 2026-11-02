@@ -467,10 +467,7 @@ class Executor:
         result = args.get("result")
         if result not in plan_ledger.RESULTS:
             raise Refuse(400, "result must be pass or fail")
-        try:
-            evidence = plan_ledger.bounded_text(str(args.get("evidence") or "").strip(), plan_ledger.EVIDENCE_LIMIT, "evidence")
-        except plan_ledger.LedgerError as err:
-            raise Refuse(400, str(err))
+        evidence = _checked_evidence(args)
         if not evidence:
             raise Refuse(400, "evidence is required")
         base = {"pr": pr, "scenario": sid, "plan_ref": plan["source"], "plan_hash": plan["hash"], "head": head,
