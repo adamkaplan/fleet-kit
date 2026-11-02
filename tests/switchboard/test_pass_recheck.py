@@ -804,3 +804,59 @@ class TestSeenAllMutants(unittest.TestCase):
     def test_a_seen_all_that_ignores_an_unchecked_pull_request_is_caught(self):
         result = self.caught("and not state.s5_unchecked", "and True", "TestSeenAllConditions.test_a_pass_with_a_held_pull_request_unchecked_keeps_its_fact_marked_unverified")
         self.assertFalse(result.wasSuccessful(), msg="a pass that left a pull request unchecked and set present went unnoticed")
+
+
+class TestSweepOnRealPass(RealPasses):
+    """Seventh amendment (5), the sweep. REAL: sweep_decisions, the queue function, the fact source, deliver. FAKE: the GitHub hub and the clock. Beside the S3 and S8 stand-ins."""
+
+    def two_findings(self):
+        self.hub.open = {1: sweep_issue(1, "intro\n## Decision required\nPick one"), 2: sweep_issue(2, "intro\n## Decision required\nPick two")}
+        self.sweep_pass()
+        ((key, (text, _)),) = list(self.engine.sweep.facts.items())
+        self.assertEqual(len(self.engine.sweep.fact_pairs[key][0]), 2, msg="the real fact does not list both findings")
+        return text
+
+    def test_a_fact_with_one_finding_still_present_is_delivered_whole(self):   # S3
+        text = self.two_findings()
+        del self.hub.open[1]
+        self.engine.sweep.confirmed.clear()
+        self.sweep_pass(tick=sb.SWEEP_TTL + 1)
+        self.deliver()
+        self.assertEqual(self.dropped(), [])
+        self.assertEqual(len(self.texts()), 1)
+        self.assertIn(text, self.texts()[0], msg="the fact was trimmed or not delivered whole")
+
+    def test_a_fact_delivered_ninety_minutes_late_carries_the_age_mark(self):   # S8
+        self.two_findings()
+        self.world.tick(90 * 60)
+        self.deliver()
+        self.assertEqual(len(self.texts()), 1)
+        self.assertIn("delayed: sent", self.texts()[0])
+
+
+class TestTriageOnRealPass(RealPasses):
+    """Seventh amendment (5), the triage. REAL: triage_pass, its queue function, the fact source, deliver. FAKE: the GitHub hub and the clock."""
+
+    def setUp(self):
+        RealPasses.setUp(self)
+        TestTriageHiddenGuard.triage_world(self)
+
+    add, go, make_digest = TestUnreadUnitKeepsTheDigest.add, TestUnreadUnitKeepsTheDigest.go, TestUnreadUnitKeepsTheDigest.make_digest
+
+    def test_a_digest_with_one_item_still_present_is_delivered_whole(self):   # S3 for the triage
+        self.add(11, created=3, labels=["kind"])
+        (key,) = self.make_digest()
+        text = self.engine.triage.facts[key][0]
+        self.assertGreater(len(self.engine.triage.fact_pairs[key]), 1, msg="the real digest lists one item only")
+        del self.hub.open["acme/api"][10]
+        self.go(passes=3, tick=sb.TRIAGE_TTL + 1)
+        self.deliver()
+        self.assertEqual(self.dropped(), [])
+        self.assertIn(text, self.texts()[0])
+
+    def test_a_digest_delivered_ninety_minutes_late_carries_the_age_mark(self):   # S8
+        self.make_digest()
+        self.world.tick(90 * 60)
+        self.deliver()
+        self.assertEqual(len(self.texts()), 1)
+        self.assertIn("delayed: sent", self.texts()[0])
