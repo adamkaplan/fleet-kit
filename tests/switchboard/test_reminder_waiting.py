@@ -243,16 +243,23 @@ def build(PR4Base):
             exec(source.replace(old, new), space)
             return space["late_reminder_counts"]
 
-        def test_s15_each_mutant_of_the_tail_read_fails_the_s14_test(self):
+        def test_s15_control_the_unmutated_function_gives_the_expected_counts(self):
             directory, now = self.audit_window_fixture()
-            self.assertEqual(self.norm(sb.late_reminder_counts(directory, {}, now)), self.norm({"lane-a": 2}))             # the control
-            mutants = ((("data = data.partition(b\"\\n\")[2]", "data = data"), AssertionError, r"^\{'lane-a': 2, 'lane-b': 1\} != \{'lane-a': 2\}"),
-                       (("if not isinstance(entry, dict):", "if False:"), AttributeError, r"'list' object has no attribute 'get'"),
-                       (("handle.seek(max(0, size - cap))", "handle.seek(0)"), AssertionError, r"^\{'lane-a': 3\} != \{'lane-a': 2\}"))
-            for (old, new), error, text in mutants:
-                with mock.patch.object(sb, "late_reminder_counts", self.mutant_counts(old, new)):
-                    with self.assertRaisesRegex(error, text):
-                        self.assertEqual(self.norm(sb.late_reminder_counts(directory, {}, now)), self.norm({"lane-a": 2}))
+            self.assertEqual(sb.late_reminder_counts(directory, {}, now), {"lane-a": 2}, msg="control: the unmutated tail read")
+
+        def test_s15_each_mutant_of_the_tail_read_fails_the_s14_test(self):
+            import inspect
+            directory, now = self.audit_window_fixture()
+            original = inspect.getsource(sb.late_reminder_counts)
+            mutants = (("dropping the partial first line", ("data = data.partition(b\"\\n\")[2]", "data = data"), AssertionError, r"^\{'lane-b': 1, 'lane-a': 2\} != \{'lane-a': 2\}"),
+                       ("removing the non-dict skip", ("if not isinstance(entry, dict):", "if False:"), AttributeError, r"'list' object has no attribute 'get'"),
+                       ("reading from byte 0 not the tail", ("handle.seek(max(0, size - cap))", "handle.seek(0)"), AssertionError, r"^\{'lane-a': 3, 'lane-b': 0\} != \{'lane-a': 2\}"))
+            for name, (old, new), error, text in mutants:
+                with self.subTest(mutant=name):
+                    self.assertNotEqual(original.replace(old, new), original, msg="mutation not applied: " + name)
+                    with mock.patch.object(sb, "late_reminder_counts", self.mutant_counts(old, new)):
+                        with self.assertRaisesRegex(error, text, msg="mutant not caught: " + name):
+                            self.assertEqual(sb.late_reminder_counts(directory, {}, now), {"lane-a": 2}, msg=name)
 
         def unreadable_world(self):
             self.world.add_agent("u-free", fleet={"role": "coder", "reports_to": "platform", "issue": 40})
