@@ -755,7 +755,7 @@ for line, put, keep, want in (("1:2:3:4:5:6:7:fd00::1", ["3:4:5:6:7:fd00::1"], [
             self.assertIn("an address was left by a single pass", err)
 
         PC11_U25 = r"""
-for line, want in (("host:::1", "host:[address]"), ("host:::fd00:db8:fd00,", "host:[address],"), ("ip:::2001:db8::1", "ip:[address]"),
+for line, want in (("host:::1", "host:[address]"), ("host:::fd00:db8:fd00,", "host:[address],"), ("ip:::2001:db8::1", "ip:[address]:[address]"),
                    ("host:::ffff:27.9.0.1:8080", "host:[address]:8080")):
     out = lib._mask_addresses(line)
     if out != want:
