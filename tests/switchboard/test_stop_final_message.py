@@ -373,3 +373,128 @@ class TestStopFinalMessageTwoRunsMutant(unittest.TestCase):
         code, out = self.run_child(True)
         self.assertEqual(code, 1, out)
         self.assertIn("the older run's text was sent as the last message", out)
+
+
+class TestStopFinalMessageHardening(unittest.TestCase):
+    """PC-9 (U11..U14): the Lows of the second strict security pair, on fake pods."""
+
+    def test_U11_an_upper_case_endpoint_is_in_neither_the_message_nor_the_file(self):
+        w = StopWorld(self)
+        big = "HTTPS://Worker-X-ab12.Example.Internal:4096"
+        text = "see %s early " % big + "words " * 700 + " late %s end" % big
+        w.stop("cb-1788a", "idle", w.pod("cb-1788a", text))
+        w.scan()
+        everything = w.to("boss-lane")[0] + "".join(p.read_text() for p in (w.state / "cloud-last").iterdir())
+        self.assertEqual(everything.count(big), 0, "an upper-case endpoint reached a lane")
+        self.assertEqual(everything.lower().count("worker-x-ab12"), 0, "an upper-case endpoint reached a lane")
+        self.assertIn("early", everything)
+
+    def test_U12_a_wide_cloud_last_is_tightened_and_a_link_or_a_foreign_one_is_refused(self):
+        w = StopWorld(self)
+        base = w.state / "cloud-last"
+        base.mkdir()
+        os.chmod(str(base), 0o777)
+        w.stop("cb-1788a", "idle", w.pod("cb-1788a", "lorem " * 1000))
+        w.scan()
+        mode = stat.S_IMODE(base.stat().st_mode)
+        self.assertEqual(mode & ~0o700, 0, "a cloud-last directory stayed wider than 0700")
+        self.assertEqual(mode, 0o700)
+        self.assertEqual(len(list(base.iterdir())), 1)
+        self.assertNotIn("last text not read", w.to("boss-lane")[0])
+        unsafe = "\nlast text not read: cloud_last_unsafe"
+        w2 = StopWorld(self)
+        elsewhere = w2.root / "elsewhere"
+        elsewhere.mkdir()
+        os.symlink(str(elsewhere), str(w2.state / "cloud-last"))
+        w2.stop("cb-1788a", "idle", w2.pod("cb-1788a", "lorem " * 1000))
+        w2.scan()
+        self.assertTrue(w2.to("boss-lane")[0].endswith(unsafe), w2.to("boss-lane"))
+        self.assertEqual(list(elsewhere.iterdir()), [])
+        w3 = StopWorld(self)
+        w3.stop("cb-1788a", "idle", w3.pod("cb-1788a", "lorem " * 1000))
+        with mock.patch.object(os, "getuid", lambda: os.geteuid() + 1):
+            w3.scan()
+        self.assertTrue(w3.to("boss-lane")[0].endswith(unsafe), w3.to("boss-lane"))
+        self.assertEqual(list((w3.state / "cloud-last").iterdir()), [])
+
+    def test_U13_a_token_in_the_retire_reason_is_not_in_the_message(self):
+        w = StopWorld(self)
+        rec = w.pod("cp-1788r", "my final words")
+        cloud = sb.load_module("cloud_worker").bind(sb.__dict__)
+        engine = mock.Mock()
+        engine.send = lambda sender, to, text: w.sent.append((to, text))
+        args = argparse.Namespace(name="cp-1788r", undo=False, reason="leaked %s done" % TOKEN)
+        with mock.patch.dict(cloud.H, {"build_engine": lambda *a, **k: (engine, w.state, None), "gates_caller_kind": lambda *a: ("person",)}), \
+                mock.patch.object(cloud, "run_launcher", lambda *a, **k: (0, {"pushed": True, "record": str(rec)}, "note")), \
+                mock.patch.object(cloud, "Cluster", lambda *a, **k: mock.MagicMock()), mock.patch.object(cloud, "_audit"), \
+                mock.patch.object(cloud, "_registry_note"), mock.patch.object(cloud, "_keep_boss"), mock.patch.object(cloud, "remove_record"):
+            cloud.cmd_retire(args, None, None, {"worker": "cp-1788r", "reports_to": "boss-lane"})
+        got = w.to("boss-lane")
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0].count(TOKEN), 0, "a token in the retire reason reached a lane")
+        self.assertIn("leaked", got[0])
+
+    def test_U14_a_directory_swapped_for_a_link_after_the_check_is_not_followed(self):
+        w = StopWorld(self)
+        rec = w.pod("cb-1788a", "its own text")
+        target = make_record(w.root / "elsewhere", "cb-1788a", "20261101T120000Z", "PLANTED by the swap")
+        w.stop("cb-1788a", "idle", rec)
+        real, fired = os.path.realpath, []
+
+        def swap(path, *a, **k):
+            out = real(path, *a, **k)
+            if os.path.basename(str(path)) == rec.name and not fired:   # the check has just resolved the directory: swap it now
+                fired.append(1)
+                shutil.rmtree(str(rec))
+                os.symlink(str(target), str(rec))
+            return out
+        with mock.patch.object(os.path, "realpath", swap):
+            w.scan()
+        self.assertEqual(len(fired), 1, "the swap hook did not run")
+        got = w.to("boss-lane")
+        self.assertEqual(len(got), 1, got)
+        self.assertEqual(got[0].count("PLANTED by the swap"), 0, "a directory swapped after the check was followed")
+        self.assertTrue(got[0].endswith("\nlast text not read: no_run_record"), got[0])
+
+
+class TestStopFinalMessageHardeningMutant(unittest.TestCase):
+    """U11..U14: each check on the control and on a mutant of a SCRATCH COPY of the source (outside the repository), each in a fresh process."""
+    CHILD = (
+        "import sys,os,tempfile,importlib.util,unittest\n"
+        "sys.path.insert(0, %r)\n"
+        "import test_stop_final_message as t\n"
+        "name,real,old,new,test=%r,%r,%r,%r,%r\n"
+        "if old:\n"
+        "    src=open(real).read()\n"
+        "    assert src.count(old)==1, 'anchor not found once'\n"
+        "    path=os.path.join(tempfile.mkdtemp(), name+'.py')\n"
+        "    open(path,'w').write(src.replace(old,new))\n"
+        "    spec=importlib.util.spec_from_file_location(name,path); mod=importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)\n"
+        "    t.sb.load_module = (lambda real_load: lambda n: mod if n==name else real_load(n))(t.sb.load_module)\n"
+        "suite=unittest.defaultTestLoader.loadTestsFromName('test_stop_final_message.TestStopFinalMessageHardening.'+test)\n"
+        "r=unittest.TextTestRunner(verbosity=0).run(suite)\n"
+        "sys.exit(0 if r.wasSuccessful() else 1)\n")
+    CASES = (
+        ("cloud_retired", "test_U11_an_upper_case_endpoint_is_in_neither_the_message_nor_the_file", '(:[0-9]+)?", re.I)', '(:[0-9]+)?")',
+         "an upper-case endpoint reached a lane"),
+        ("cloud_retired", "test_U12_a_wide_cloud_last_is_tightened_and_a_link_or_a_foreign_one_is_refused", "os.fchmod(dfd, 0o700)", "pass",
+         "a cloud-last directory stayed wider than 0700"),
+        ("cloud_worker", "test_U13_a_token_in_the_retire_reason_is_not_in_the_message", "_scrub_lib()(_one(reason, 120), (), 200)", "_one(reason, 120)",
+         "a token in the retire reason reached a lane"),
+        ("cloud_retired", "test_U14_a_directory_swapped_for_a_link_after_the_check_is_not_followed", "_last_worker_text_at(directory, (before.st_dev, before.st_ino))",
+         "_last_worker_text(directory)", "a directory swapped after the check was followed"),
+    )
+
+    def run_child(self, name, test, old, new):
+        code = self.CHILD % (str(CHECK_FILE.parent), name, str(BIN / (name + ".py")), old, new, test)
+        done = subprocess.run([sys.executable, "-c", code], cwd=str(CHECK_FILE.parent), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                              universal_newlines=True, timeout=120)
+        return done.returncode, done.stdout
+
+    def test_U11_to_U14_the_control_passes_and_each_mutant_fails_with_the_text_of_the_check(self):
+        for name, test, old, new, text in self.CASES:
+            code, out = self.run_child(name, test, "", "")
+            self.assertEqual(code, 0, "control of %s: %s" % (test, out))
+            code, out = self.run_child(name, test, old, new)
+            self.assertEqual(code, 1, "mutant of %s: %s" % (test, out))
+            self.assertIn(text, out, test)
