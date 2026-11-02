@@ -394,5 +394,34 @@ class CloudCharter(DoctorCase):
         self.assertNotIn("live", text)
 
 
+class UndecidablePanes(DoctorCase):
+    """#1884 (S12): one WARN line per agent whose listed pane has no recorded session (the daemon's record `states[NAME].undecidable`), none when none; read-only."""
+
+    def run_on(self, states):
+        import json
+        tmp = tempfile.mkdtemp(prefix="test-fleet-doctor.")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        state = Path(tmp) / "state"
+        state.mkdir()
+        (state / "pane-health.json").write_text(json.dumps({"agents": {}, "missing": {}, "states": states}))
+        before = {str(f): (f.read_bytes(), f.stat().st_mtime_ns) for f in state.rglob("*")}
+        run = DoctorRun(tmp, {})
+        run.extra_env["FLEET_REGISTRY_DIR"] = str(state)
+        run.run()
+        after = {str(f): (f.read_bytes(), f.stat().st_mtime_ns) for f in state.rglob("*")}
+        self.assertEqual(before, after, "the doctor changed a file")
+        return run
+
+    def test_one_agent_in_that_state_prints_exactly_one_warn_line(self):
+        run = self.run_on({"acme-worker": {"state": "unknown", "pane": "w1:p2", "session": None, "undecidable": 4},
+                           "acme-other": {"state": "attached", "pane": "w1:p3", "session": "ses_a"}})
+        found = run.lines("undecidable")
+        self.assertEqual(found, ["WARN  undecidable      agent acme-worker: listed pane with no recorded session, undecidable for 4 passes: reattach or retire it"], run.output)
+
+    def test_no_agent_in_that_state_prints_no_line(self):
+        run = self.run_on({"acme-other": {"state": "attached", "pane": "w1:p3", "session": "ses_a"}})
+        self.assertEqual(run.lines("undecidable"), [], run.output)
+
+
 if __name__ == "__main__":
     sys.exit(main(sys.argv[1:]))
