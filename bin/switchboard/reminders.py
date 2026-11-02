@@ -557,8 +557,7 @@ class ReminderFacts:
 
     def newest_first(self, facts):
         """The reminder facts in the order of their copies' (created, at), newest first, so a delivery sweeps the older copies before it asks about them.
-        It is the start of a delivery's reminder step, so it also clears `swept`: the set is bounded by one delivery pass."""
-        self.swept.clear()
+        It has no side effect: `swept` is cleared where a pass starts (`__call__`), not per delivery call."""
         try:
             marks = {"reminder:" + i["id"]: (i.get("created", 0), i["at"]) for i in read_reminders(self.state_dir)}
         except ReminderError:
@@ -604,6 +603,7 @@ class ReminderFacts:
         return kept["id"]
 
     def __call__(self):
+        self.swept.clear()   # #1711: a pass starts here (each source is read once per pass), so `swept` holds only this pass's ids
         facts = []
         everything = read_reminders(self.state_dir)
         for item in self.due():

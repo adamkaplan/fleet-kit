@@ -74,42 +74,107 @@ def build(PR4Base):
             finally:
                 sb.ReminderFacts.drop_older_copies = real
 
-        def two_passes(self):
-            """Pass one sweeps four copies; pass two sweeps two others; returns the ids of the second pass and the facts source."""
-            self.setup_s2()
-            self.hold_then_free()
-            source = next(s for s in self.world.engine.sources if isinstance(s, sb.ReminderFacts))
-            self.assertEqual(len(source.swept), 4, msg="s5: pass one sweeps four copies")
-            self.world.tick(1000)
-            base = 1000
-            older = [self.add("b", base + 1, base + 10, key="z"), self.add("c", base + 2, base + 11, key="z")]
-            self.add("a", base + 9, base + 20, key="z")
-            self.world.v2.start_turn(self.world.sessions["platform"], "fleet task", fleet=True, lasts=400)
-            self.world.tick(1100)
-            self.world.engine.run_pass()
-            return {i["id"] for i in older}, source
+        def source(self):
+            return next(s for s in self.world.engine.sources if isinstance(s, sb.ReminderFacts))
 
-        def test_s5_swept_holds_only_the_ids_of_the_last_pass(self):
-            second, source = self.two_passes()
-            self.assertEqual(source.swept, second, msg="s5: after two passes swept holds only the second pass's ids")
-            self.assertEqual(len(source.swept), 2, msg="s5: two ids")
+        def mutated_run(self, owner, name, old, new, check, rx):
+            """The control first (the unmutated check passes), then ONE textual replacement in a copy of the method's source, asserted applied;
+            the check must then fail with a message matching the anchored `rx`."""
+            import inspect
+            import textwrap
+            check()
+            src = textwrap.dedent(inspect.getsource(getattr(owner, name)))
+            self.assertEqual(src.count(old), 1, msg="mutant: the control source has the text once")
+            mutated = src.replace(old, new)
+            self.assertNotEqual(mutated, src, msg="mutant: the mutation was applied")
+            space = dict(getattr(owner, name).__globals__)
+            exec(mutated, space)
+            real = getattr(owner, name)
+            setattr(owner, name, space[name])
+            try:
+                with self.assertRaisesRegex(AssertionError, rx):
+                    check()
+            finally:
+                setattr(owner, name, real)
+
+        t = 0   # the world's clock offset, as this test has moved it
+
+        def arm(self, key, to="platform"):
+            """Two older copies and a newest one of `key`, all due after a tick; returns (older, newest)."""
+            base = self.t + 10
+            older = [self.add("b", base + 1, base + 10, key=key, to=to), self.add("c", base + 2, base + 11, key=key, to=to)]
+            newest = self.add("a", base + 9, base + 20, key=key, to=to)
+            self.world.tick(base + 100 - self.t)
+            self.t = base + 100
+            return older, newest
+
+        def two_plans_one_pass(self, key):
+            """One pass reads the facts once; two plans of one recipient deliver from them: the first sweeps, the second sees the swept copies."""
+            older, newest = self.arm(key)
+            source = self.source()
+            facts = source()
+            source.newest_first(facts)
+            self.assertEqual(source.recheck_delivery(next(f for f in facts if f.key == "reminder:" + newest["id"])), None, msg="low1: the newest is delivered")
+            second = {f.key: source.recheck_delivery(f) for f in source.newest_first(facts)}
+            self.assertEqual([second["reminder:" + i["id"]] for i in older], ["swept", "swept"], msg="low1: a copy swept by the first plan reads swept in the second")
+
+        def test_low1_two_plans_of_one_pass_read_swept_in_the_second(self):
+            self.two_plans_one_pass("k")
+
+        def test_low1_mutant_clearing_in_the_sort_helper_fails_after_the_control(self):
+            real = sb.ReminderFacts.newest_first
+
+            def clearing(self_, facts):
+                self_.swept.clear()
+                return real(self_, facts)
+            self.two_plans_one_pass("k")   # the control
+            sb.ReminderFacts.newest_first = clearing
+            try:
+                with self.assertRaisesRegex(AssertionError, r"low1: a copy swept by the first plan"):
+                    self.two_plans_one_pass("y")
+            finally:
+                sb.ReminderFacts.newest_first = real
+
+        def pass_sweeping(self, key):
+            self.world.tick(500)   # the last turn of the lane has ended
+            self.t += 500
+            self.world.v2.start_turn(self.world.sessions["platform"], "fleet task", fleet=True, lasts=400)
+            older, newest = self.arm(key)
+            self.world.engine.run_pass()
+            return {i["id"] for i in older}
+
+        def two_consecutive_passes(self, k1, k2):
+            first = self.pass_sweeping(k1)
+            reported_first = {l["detail"]["dropped"] for l in self.drops()}
+            self.assertEqual(reported_first, first, msg="s5: pass one reports its own ids")
+            self.skip = len(self.drops()) + self.skip
+            second = self.pass_sweeping(k2)
+            reported_second = {l["detail"]["dropped"] for l in self.drops()}
+            self.assertEqual(reported_second, second, msg="s5: the second pass reports only its own ids")
+            gone = sb.Fact("reminder:" + sorted(first)[0], "platform", "reminder", "x", EPOCH)   # an id of pass one, cancelled after pass two began
+            self.skip += len(self.drops())   # what this run reported is not read again by the next run in the same world
+            self.assertEqual(self.source().recheck_delivery(gone), "cancelled", msg="s5: pass one's ids are not remembered as swept")
+
+        def test_s5_the_second_pass_does_not_report_the_first_passes_ids(self):
+            self.two_consecutive_passes("k", "z")
 
         def test_s5_mutant_without_the_reset_fails_after_the_control(self):
             import inspect
-            import textwrap
-            src = textwrap.dedent(inspect.getsource(sb.ReminderFacts.newest_first))
-            self.assertIn("self.swept.clear()", src, msg="s5: the control source has the reset")
-            mutated = src.replace("self.swept.clear()", "pass")
-            self.assertNotEqual(mutated, src, msg="s5: the mutation was applied")
-            space = dict(sb.ReminderFacts.newest_first.__globals__)
-            exec(mutated, space)
-            real = sb.ReminderFacts.newest_first
-            sb.ReminderFacts.newest_first = space["newest_first"]
+            real = sb.ReminderFacts.__call__
+
+            def keeping(self_):
+                kept = set(self_.swept)
+                found = real(self_)
+                self_.swept |= kept   # the pass does not reset what the last one swept
+                return found
+            self.assertIn("self.swept.clear()", inspect.getsource(real), msg="s5: the control source has the reset")
+            self.two_consecutive_passes("k", "z")   # the control
+            sb.ReminderFacts.__call__ = keeping
             try:
-                with self.assertRaisesRegex(AssertionError, r"s5: after two passes"):
-                    self.test_s5_swept_holds_only_the_ids_of_the_last_pass()
+                with self.assertRaisesRegex(AssertionError, r"s5: pass one's ids are not remembered as swept"):
+                    self.two_consecutive_passes("p", "q")
             finally:
-                sb.ReminderFacts.newest_first = real
+                sb.ReminderFacts.__call__ = real
 
         def test_s5_a_copy_dropped_in_the_same_pass_is_audited_as_swept(self):
             self.setup_s2()
