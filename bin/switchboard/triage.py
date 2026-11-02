@@ -599,6 +599,8 @@ def triage_refresh(engine, state, repos, units, now, budget, reserve=1, seconds=
         try:
             records, cut = triage_read_unit(hub, repo, unit, now, budget)
             state.units[(repo, unit)] = {"at": now, "data": records, "truncated": cut, "error": None}
+            if unit == "issues":
+                open_list_alert(engine, repo, cut, now)   # #1886: one named alert a day when the open list stops at the ceiling
             state.unreadable.pop(repo, None)
         except GitHubUnavailable as err:
             budget[0] -= 1

@@ -410,6 +410,7 @@
         "bin/header_cache.py",
         "bin/heavy_slots.py",
         "bin/item_verdicts.py",
+        "bin/open_list_alert.py",
         "bin/plan_review.py",
         "bin/pr_events.py",
         "bin/queue_ejections.py",
@@ -452,6 +453,9 @@
           "*"
         ],
         "bin/turn_start.py": [
+          "*"
+        ],
+        "bin/open_list_alert.py": [
           "*"
         ],
         "bin/awaiting_live.py": [

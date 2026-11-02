@@ -9984,6 +9984,25 @@ def open_pages(read):
     return out
 
 
+def open_list_alert(engine, repo, cut, now):
+    """#1886: ONE alert a day when an open-item list of `repo` stops at OPEN_LIST_PAGES: to the Chief of Staff through the reminder route, one audit line, a day marker."""
+    if not cut:
+        return
+    alerts = load_module("open_list_alert")
+    day = _day(now)
+    if not alerts.due(engine.state_dir, repo, day, load_module("record_json").parse_bounded):
+        return
+    discovery = getattr(engine, "discovery", None)
+    cos = next((n for n, o in sorted(discovery.agents.items()) if (o.fleet or {}).get("role") == "chief-of-staff"), None) if discovery is not None else None
+    text = ("The open items of %s were cut: 1,000 or more are open and the read stops at %d pages (%d items, OPEN_LIST_PAGES); the oldest are not read by the sweep or the triage."
+            % (repo, OPEN_LIST_PAGES, OPEN_LIST_PAGES * GITHUB_PAGE_SIZE))
+    if cos is not None:
+        add_repeat_reminder(engine.state_dir, cos, now, now, text, "open-list-cut", repo, day, wake_class=WAKE_LOAD)
+    if getattr(engine, "audit", None) is not None:
+        engine.audit.append(engine.actor, "open_list.cut", repo, {"repo": repo, "ceiling": OPEN_LIST_PAGES * GITHUB_PAGE_SIZE, "pages": OPEN_LIST_PAGES})
+    alerts.mark(engine.state_dir, repo, day, load_module("record_json").parse_bounded)
+
+
 def sweep_pages_used(records, truncated):
     return max(1, -(-len(records) // GITHUB_PAGE_SIZE))
 
@@ -9995,6 +10014,7 @@ def sweep_read_repo(hub, repo, now, window_days, regex, budget, strong):
     since = iso(now - window_days * 86400)
     items, truncated = {}, False
     records, cut = hub.read_pages("repos/%s/issues?state=open&per_page=100" % repo, cap=OPEN_LIST_PAGES)
+    open_cut = bool(cut)
     budget[0] -= sweep_pages_used(records, cut)
     truncated = truncated or cut
     for record in records:
@@ -10036,7 +10056,7 @@ def sweep_read_repo(hub, repo, now, window_days, regex, budget, strong):
             fires, refs = sweep_strong_statement(strong, comment.get("body"), repo, [repo], matched)  # the last one wins
             items[number]["latest_strong"], items[number]["latest_refs"] = fires, refs
             items[number]["latest_source"] = {"source": "comment:%s" % comment.get("id"), "match": matched[0] if matched else ""} if fires else None
-    return {"at": now, "items": items, "truncated": truncated, "error": None, "closed_holds": closed_holds}
+    return {"at": now, "items": items, "truncated": truncated, "error": None, "closed_holds": closed_holds, "open_cut": open_cut}
 
 
 def sweep_refresh(engine, state, repos, now, cfg, regex, budget):
@@ -10054,6 +10074,7 @@ def sweep_refresh(engine, state, repos, now, cfg, regex, budget):
         try:
             state.repos[repo] = sweep_read_repo(hub, repo, now, cfg["comment_window_days"], regex, budget,
                                                 state.strong)
+            open_list_alert(engine, repo, state.repos[repo].get("open_cut"), now)
         except GitHubUnavailable as err:
             budget[0] -= 1
             old = state.repos.get(repo) or {"items": {}, "truncated": False}

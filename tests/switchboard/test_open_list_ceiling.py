@@ -114,3 +114,38 @@ class TestOpenListCeiling(Base):
         self.assertEqual(len(reader.open_asks(5)), 130)
         self.assertEqual(calls, [1, 2])
         self.assertEqual(len(sb.open_pages(lambda page: [{}] * 100 if page <= 10 else [{}])), 1000)
+
+
+class TestOpenListAlert(Base):
+    """#1886 S4: 2,000 open items raise ONE alert a day (fake clock: two days), naming the repository, "1,000 or more" and the ceiling."""
+    DAY1 = 1798000000.0
+
+    def setUp(self):
+        super().setUp()
+        self.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.audit, self.reminders = [], []
+        cos = types.SimpleNamespace(fleet={"role": "chief-of-staff"})
+        self.engine = types.SimpleNamespace(state_dir=str(self.state_dir), actor="daemon", discovery=types.SimpleNamespace(agents={"cos": cos}),
+                                            audit=types.SimpleNamespace(append=lambda *a: self.audit.append(a)))
+        real = sb.add_repeat_reminder
+        sb.add_repeat_reminder = lambda *a, **k: self.reminders.append(a) or real(*a, **k)
+        self.addCleanup(setattr, sb, "add_repeat_reminder", real)
+
+    def passes(self, start, n=10):
+        for i in range(n):
+            sb.open_list_alert(self.engine, "acme/api", True, start + i * 900)
+
+    def test_s4_one_alert_a_day_and_one_more_the_next_day(self):
+        self.passes(self.DAY1)
+        self.assertEqual(len(self.reminders), 1)
+        text = self.reminders[0][4]
+        for part in ("acme/api", "1,000 or more", "1000"):
+            self.assertIn(part, text)
+        self.assertEqual(len(self.audit), 1)
+        self.passes(self.DAY1 + 86400)
+        self.assertEqual(len(self.reminders), 2)
+
+    def test_an_uncut_list_and_an_absent_state_file_are_silent(self):
+        sb.open_list_alert(self.engine, "acme/api", False, self.DAY1)
+        self.assertEqual((self.reminders, self.audit), ([], []))
+        self.assertFalse((self.state_dir / "open-list-alert.json").exists())

@@ -47,6 +47,7 @@ The **Holds** column is descriptive: only the layer numbers are enforced.
 | `impact_brief.py` | 0 | the impact brief: what a held change can do, built from the diff and the records only (pure, no clock, no network) (#1215) | |
 | `lost_worker.py` | 0 | a lost worker is told once to its lane and the Chief of Staff, with its cause (#1481) | |
 | `merged_labels.py` | 0 | a merged pull request does not keep its hold | |
+| `open_list_alert.py` | 0 | the once-a-day memory of the alert that an open-item list is longer than the ceiling (#1886) | |
 | `plan_approval.py` | 0 | the check of an approval sent as a message (pure) | |
 | `record_json.py` | 0 | the one bounded-depth parse of untrusted record JSON, shared by every reader of it (#1314) | |
 | `turn_start.py` | 0 | when each working session's current turn began, as the daemon first saw it, for `steer_after_minutes` (#1540) | |
