@@ -1913,7 +1913,7 @@ class Launcher:
                 if getattr(a, "stack", False):
                     self._start_stack_pod(worker, name, spec, made, a.wait)
                 else:
-                    self._wait_ready(name, a.wait, explain=True)
+                    self._wait_ready(name, a.wait)
                 if a.password_fd is not None:
                     with os.fdopen(os.dup(a.password_fd), "w") as f:
                         f.write(password)
@@ -2162,10 +2162,10 @@ class Launcher:
             if ev.get("reason") == "FailedCreatePodSandBox" and STACK_RACE_RE.search(ev.get("message") or ""):
                 raise _FreshNodeRace(STACK_RACE_RE.search(ev["message"]).group(0))
 
-    def _wait_ready(self, name, seconds, on_pending=None, explain=False):
+    def _wait_ready(self, name, seconds, on_pending=None):
         end = self.clock() + dt.timedelta(seconds=seconds)
         waited = 0.0   # the second bound: the seconds slept here, for a clock that does not advance
-        scaling = unread = False   # what the cluster says of a pending pod (explain only)
+        scaling = unread = False   # what the cluster says of a pending pod (the plain wait only: the stack path passes its own watch)
         while True:
             pod = self.kube.get_pod(name)
             status = (pod or {}).get("status", {})
@@ -2175,7 +2175,7 @@ class Launcher:
                 return
             if on_pending:
                 on_pending(pod)
-            if explain:
+            else:
                 scaling, unread = self._why_pending(name, pod, scaling)
             more = max(0, LAUNCH_OUTER_SECONDS - seconds) if scaling else 0   # a scale-up under way: keep waiting to the outer bound
             if self.clock() >= end + dt.timedelta(seconds=more) or waited >= seconds + more:
