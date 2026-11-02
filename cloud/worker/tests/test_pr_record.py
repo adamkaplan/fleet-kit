@@ -215,12 +215,48 @@ class T(unittest.TestCase):
             text = f.read()
         r = self.s16_check(json.loads(text))
         print("S16: %d of 2 deny entries, 0 allow keys, %d of 6 paths denied, %d of 2 ordinary unmatched" % (r[0], r[1], r[2]))
-        # the mutant: the deny key replaced by another, applied from the two texts
+        # the mutant: the deny key replaced by another; `applied` is computed from the two texts
         old, new = '"*pr-record*": "deny"\n    }', '"*pr-record-none*": "deny"\n    }'
         self.assertEqual(text.count(old), 1)
+        changed = text.replace(old, new)
+        applied = self.applied(text, changed, old)
+        print("S16 mutant: applied=%s" % applied)
+        self.assertTrue(applied, "the mutation was not applied")
         with self.assertRaises(AssertionError) as cm:
-            self.s16_check(json.loads(text.replace(old, new)))
+            self.s16_check(json.loads(changed))
         self.assertIn("{'*pr-record-none*': 'deny'}", str(cm.exception))
+        # the no-op control: the removed text equal to the added text must fail the computation
+        self.assertFalse(self.applied(text, text.replace(old, old), old))
+
+    @staticmethod
+    def applied(original, changed, removed):
+        return changed != original and removed in original and removed not in changed
+
+    # S19: the top-level block (read by every agent) holds the deny
+    def s19_check(self, conf):
+        top = conf["permission"]
+        self.assertIn("edit", top, "the default agent is not covered")
+        self.assertEqual(top["edit"], {"*pr-record*": "deny"}, "the default agent is not covered")
+        got = [self.resolve(top["edit"], p) for p in ("src/a.py", "pr-record", "x/pr-record.json", "pr-record-x")]
+        self.assertEqual(got, [None, "deny", "deny", "deny"])
+        return got
+
+    def test_s19_the_deny_sits_in_the_top_level_block(self):
+        import json
+        with open(os.path.join(WORKER, "opencode-worker.json")) as f:
+            text = f.read()
+        got = self.s19_check(json.loads(text))   # the control first
+        old = '    "edit": {\n      "*pr-record*": "deny"\n    },\n'
+        self.assertEqual(text.count(old), 1)
+        changed = text.replace(old, "")
+        applied = self.applied(text, changed, old)
+        self.assertTrue(applied, "the mutation was not applied")
+        with self.assertRaises(AssertionError) as cm:
+            self.s19_check(json.loads(changed))
+        self.assertIn("the default agent is not covered", str(cm.exception))
+        self.assertFalse(self.applied(text, text.replace(old, old), old))
+        print("S19: top-level paths %s, copy without the entry fails with %r, applied=%s, no-op applied=%s" % (
+            got, "the default agent is not covered", applied, self.applied(text, text.replace(old, old), old)))
 
     # S16 (b): a pr-record that is already a symlink refuses the start, and the target's mode is not changed
     def test_s16_a_symlink_at_the_record_directory_refuses_the_start(self):
