@@ -50569,9 +50569,9 @@ class TestHeldRowsFromLabels(DecisionsBase):
     def lists(self, *records, repo=None, cut=False):
         self.engine.ci_record_state.lists[(repo or self.REPO).lower()] = (self.world.clock.now(), list(records))
         if cut:
-            self.engine.ci_record_state.good[(repo or self.REPO).lower()] = (self.world.clock.now(), list(records), True)
+            self.engine.ci_record_state.was_cut[(repo or self.REPO).lower()] = True
         else:   # a list read that was not cut: the recorder's flag is clear (the plan gave no else; the test s4 needs it)
-            self.engine.ci_record_state.good.pop((repo or self.REPO).lower(), None)
+            self.engine.ci_record_state.was_cut.pop((repo or self.REPO).lower(), None)
 
     def rows(self):
         return [d for d in self.listed() if d.get("number") in range(7, 400) and d.get("kind") in ("captain", "notice")]

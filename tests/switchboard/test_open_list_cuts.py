@@ -252,6 +252,56 @@ class TestOpenListCutsMutants(Base):
         text = self.run_pair("    _OPEN_CUTS.clear()\n", "    pass\n", "s12", check)
         self.assertIn("no stale cut", text)
 
+    def held_rows_after_a_failed_read(self, mod):
+        """The REAL ci_record_pass and the REAL label_hold_entries: a cut list (1,200 records) whose held pull request fell beyond the first 1,000, then a failed read."""
+        def listing(held_in):
+            top = 1300 if held_in else 2500   # newer pull requests push the held one beyond the first 1,000
+            items = [{"number": n, "state": "open", "title": "t", "body": "", "labels": [], "head": {"sha": "a" * 40}, "created_at": "2026-10-01T00:00:00Z"}
+                     for n in range(top, top - 1200, -1)]   # 1,200 records, newest first: the ceiling reads the newest 1,000
+            if held_in:
+                items[0]["labels"] = [{"name": "tester:merge-captain"}]   # the held pull request is read while it is among the newest
+            return items
+        mode = ["in"]
+
+        def gh_api(path, paginate=True, timeout=None):
+            if mode[0] == "fail":
+                raise mod.GitHubUnavailable("down")
+            items = listing(mode[0] == "in")
+            number = int(re.search(r"[?&]page=(\d+)", path).group(1))
+            return [items[(number - 1) * 100:number * 100]]
+        hub = mod.GitHubHub.__new__(mod.GitHubHub)
+        hub.gh_api = gh_api
+        engine = types.SimpleNamespace(config={"plan_gates": {"repos": {"acme/api": {}}}, "github_repos": ["acme/api"]}, state_dir=str(self.state_dir), audit=types.SimpleNamespace(append=lambda *a: None),
+                                       discovery=None, hub=hub, now=lambda: NOW, _note=lambda *a, **k: None, request_keys=set())
+        self.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        mod.ci_record_pass(engine, NOW)
+        self.assertTrue(engine.ci_record_state.was_cut.get("acme/api"), msg="the 1,200 list was cut at the ceiling")
+        self.assertTrue(mod.label_hold_entries(engine, NOW, set(), set(), ["acme/api"]), msg="the held row is shown from the first read")
+        mode[0] = "out"   # the held pull request is no longer in the newest 1,000 (a cut list)
+        mod.ci_record_pass(engine, NOW + 1000)
+        self.assertTrue(mod.label_hold_entries(engine, NOW + 1000, set(), set(), ["acme/api"]), msg="a cut list keeps the row")
+        mode[0] = "fail"
+        mod.ci_record_pass(engine, NOW + 2000)
+        rows = mod.label_hold_entries(engine, NOW + 2000, set(), set(), ["acme/api"])
+        self.assertTrue(rows, msg="a failed read of a cut list keeps the held rows")
+
+    def test_was_cut_a_failed_read_of_a_cut_list_keeps_the_held_rows(self):
+        needle = "state.good.pop(key, None)   # a failed read is no evidence"
+        _, control = self.load(lambda t: t, "wc_control")
+        self.held_rows_after_a_failed_read(control)
+        text = None
+        applied = []
+
+        def mutate(t):
+            self.assertEqual(t.count(needle), 1)
+            applied.append(True)
+            return t.replace(needle, "state.was_cut.pop(key, None); " + needle, 1)
+        _, mutant = self.load(mutate, "wc")
+        self.assertTrue(applied)
+        with self.assertRaises(AssertionError) as caught:
+            self.held_rows_after_a_failed_read(mutant)
+        self.assertIn("a failed read of a cut list keeps the held rows", str(caught.exception))
+
 
 if __name__ == "__main__":
     unittest.main()

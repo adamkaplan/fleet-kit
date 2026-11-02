@@ -641,7 +641,7 @@ def label_hold_entries(engine, now, noticed, escalated, in_play):
                 created = parse_iso(record.get("created_at"))
                 shown[(repo_key, number)] = {"repo": repo, "number": number, "title": record.get("title") if isinstance(record.get("title"), str) else "", "head": head,
                                              "since": iso(created if created is not None else now), "holds": pr_hold_reasons(names)}
-            if (state.good.get(repo_key) or (0, None, False))[2]:   # the list may be cut (the ceiling flag the recorder keeps): a held pull request beyond it is not dropped, for at most LABEL_HOLD_KEEP_SECONDS (the next complete list drops it at once)
+            if state.was_cut.get(repo_key):   # the list may be cut (the ceiling flag of the last GOOD read, which the recorder keeps): a held pull request beyond it is not dropped, for at most LABEL_HOLD_KEEP_SECONDS (the next complete list drops it at once)
                 for key, row in previous.items():
                     if key[0] == repo_key and key[1] not in seen:
                         kept_at = row.get("kept_at", now)

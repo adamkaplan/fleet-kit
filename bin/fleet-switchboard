@@ -20039,6 +20039,7 @@ class CiRecordState:
     def __init__(self):
         self.lists = {}     # normalised repo -> (read at, records)
         self.good = {}      # normalised repo -> (read at, records, cut): the list of the LAST read of it in this process that SUCCEEDED; a failed read removes it (memory only)
+        self.was_cut = {}   # normalised repo -> the ceiling flag of the last SUCCESSFUL read (a failed read leaves it)
         self.checked = {}   # (normalised repo, number) -> {"list_head", "at", "retry_at", "fails"}: the LAST-CHECKED time decides
         self.recorded = 0   # verdicts this process recorded
         self.last_record = None
@@ -20078,6 +20079,7 @@ def ci_record_pass(engine, now):
                 note_open_cut(repo)
             state.lists[key] = (now, records)
             state.good[key] = (now, records, bool(cut))
+            state.was_cut[key] = bool(cut)   # the flag of the last SUCCESSFUL read: a failed read leaves it, so the held rows of a cut list are kept until the next good read
             read_mark(engine, "pulls:" + key, not cut, "the open pull request list was cut", now)   # #811
         except GitHubUnavailable as err:
             budget[0] -= 1
