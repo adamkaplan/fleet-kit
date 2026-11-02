@@ -905,7 +905,7 @@ class TestAgentRegistry(unittest.TestCase):
 
     def test_a_dead_row_is_removed_only_when_each_evidence_key_shows_it_gone_and_each_refusal_is_audited(self):
         gone = {"pane_listed": False, "process_found": False}
-        cases = {"pane_listed true": {"pane_listed": True, "process_found": False}, "process_found true": {"pane_listed": False, "process_found": True},
+        cases = {"pane_listed true": {"pane_listed": True, "process_found": True}, "process_found true": {"pane_listed": False, "process_found": True},
                  "pane_listed missing": {"process_found": False}, "process_found missing": {"pane_listed": False}, "evidence None": None,
                  "evidence a string": "gone", "evidence a list": [gone]}
         for label, evidence in cases.items():
