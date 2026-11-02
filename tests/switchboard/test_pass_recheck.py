@@ -570,3 +570,116 @@ class TestPassRecheckMutants(unittest.TestCase):
         self.assertTrue(self.run_case(name, []).wasSuccessful(), msg="control failed")
         result = self.run_case(name, [(sb.PlanWakeFacts, "drop_stale", forget)])
         self.assertFalse(result.wasSuccessful(), msg="a plan source that never forgets went unnoticed")
+
+
+class TestTriageHiddenGuard(RealPasses):
+    """Seventh amendment (1) and (2): the triage digest that hides items is kept; the expiry and the drop forget both maps. REAL triage_pass and queue functions."""
+
+    def setUp(self):
+        RealPasses.setUp(self)
+        self.triage_world()
+
+    def triage_world(self):
+        self.world = World(self, agents=(), config={"github_repos": ["acme/api"]})
+        self.world.add_agent("cos", fleet={"role": "chief-of-staff"})
+        self.world.add_agent("orch", fleet={"role": "orchestrator", "charter": 1, "repo": "acme/api"})
+        self.hub = FakeTriageHub()
+        self.hub.present_record = lambda *a: {}
+        self.engine = self.world.engine
+        self.engine.hub = self.hub
+        self.engine.config["awaiting_label"], self.engine.config["awaiting_cos_label"] = self.USER, self.COS
+        self.engine.config["triage"] = dict(sb.TRIAGE_DEFAULTS, repos=["acme/api"], our_logins=["bot"], enabled=True)
+        self.engine.discover(self.world.clock.now())
+        self.hub.open["acme/api"] = {}
+        self.add(1, created=30, updated=0.1, labels=["x:orchestrator", "kind"], assignees=["bot"], body="## Decision required\nx")
+        self.add(2, created=20, updated=0.1, parent=1, labels=["kind"], body="Next: go")
+        self.add(10, created=2, labels=["kind"])
+
+    add, go, make_digest = TestUnreadUnitKeepsTheDigest.add, TestUnreadUnitKeepsTheDigest.go, TestUnreadUnitKeepsTheDigest.make_digest
+
+    def shown_and_hidden(self, cap):
+        self.add(11, created=3, labels=["kind"])
+        self.add(12, created=4, labels=["kind"])
+        self.engine.config["triage"]["max_findings"] = cap
+        digests = self.make_digest()
+        shown = self.engine.triage.fact_pairs[digests[0]]
+        return digests[0], shown
+
+    def clear_shown(self, shown):
+        for _rule, ref in shown:
+            self.hub.open["acme/api"].pop(int(ref.rpartition("#")[2]), None)
+        self.go(passes=3, tick=sb.TRIAGE_TTL + 1)
+        self.assertIsNotNone(self.engine.triage.present, msg="the pass did not read every unit")
+
+    def test_a_digest_that_hides_items_is_kept_when_every_shown_item_has_cleared(self):
+        key, shown = self.shown_and_hidden(1)
+        self.assertIn("(+", self.engine.triage.facts[key][0], msg="the real digest hid nothing")
+        self.assertTrue(self.engine.triage.fact_hidden[key])
+        self.clear_shown(shown)
+        self.deliver()
+        self.assertEqual(self.dropped(), [], msg="a digest that hides items was dropped")
+        self.assertTrue(any("(+" in t for t in self.texts()), msg="the digest was not delivered")
+
+    def test_a_digest_that_hides_nothing_is_dropped_when_every_item_has_cleared(self):   # the control
+        key, shown = self.shown_and_hidden(20)
+        self.assertFalse(self.engine.triage.fact_hidden[key])
+        for number in (10, 11, 12):
+            self.hub.open["acme/api"].pop(number, None)
+        self.go(passes=3, tick=sb.TRIAGE_TTL + 1)
+        self.deliver()
+        self.assertIn("triage", [e["detail"]["kind"] for e in self.dropped()])
+
+    def test_the_other_owner_note_marks_the_digest_hidden(self):
+        state = sb.triage_state(self.engine)
+        sb.triage_queue_fact(state, [("T1", "acme/api#5")], self.world.clock.now(), dict(sb.TRIAGE_DEFAULTS), other_owner=2)
+        (key,) = [k for k in state.facts]
+        self.assertTrue(state.fact_hidden[key])
+
+    def test_the_expiry_and_the_drop_leave_no_entry_in_either_map(self):
+        state, cfg, now = sb.triage_state(self.engine), dict(sb.TRIAGE_DEFAULTS), self.world.clock.now()
+        sb.triage_queue_fact(state, [("T1", "acme/api#5")], now, cfg)
+        (old,) = list(state.facts)
+        sb.triage_queue_fact(state, [("T1", "acme/api#6")], now + cfg["realarm_hours"] * 7200 + 1, cfg)
+        self.assertNotIn(old, state.facts)
+        self.assertNotIn(old, state.fact_pairs)
+        self.assertNotIn(old, state.fact_hidden)
+        (new,) = list(state.facts)
+        source = [s for s in self.engine.sources if getattr(s, "__name__", "") == "triage_facts"][0]
+        source.drop_stale([new])
+        self.assertEqual((state.facts, state.fact_pairs, state.fact_hidden), ({}, {}, {}))
+
+    def test_the_sweep_expiry_forgets_the_pairs_of_the_fact_it_deletes(self):
+        state, cfg, now = sb.sweep_state(self.engine), dict(sb.SWEEP_DEFAULTS), self.world.clock.now()
+        sb.sweep_queue_fact(state, [("S10", "acme/api#5")], now, cfg)
+        (old,) = list(state.facts)
+        sb.sweep_queue_fact(state, [("S10", "acme/api#6")], now + cfg["realarm_hours"] * 7200 + 1, cfg)
+        self.assertNotIn(old, state.facts)
+        self.assertNotIn(old, state.fact_pairs)
+
+
+class TestPlanNewestForgotten(RealPasses):
+    """Seventh amendment (2): a plan comment that disappears clears `newest`. The REAL plan_wake_pass."""
+
+    def test_a_vanished_plan_comment_clears_the_present_hash(self):
+        wake = sb.plan_wake_state(self.engine)
+        wake.newest[("acme/api", 3)] = "oldhash"
+        wake.newest[("acme/other", 4)] = "keep"
+        state = types.SimpleNamespace(units={("acme/api", "issues"): {"data": []}, ("acme/api", "comments"): {"data": []}})
+        sb.plan_wake_pass(self.engine, state, ["acme/api"], self.world.clock.now())
+        self.assertNotIn(("acme/api", 3), wake.newest)
+        self.assertEqual(wake.newest.get(("acme/other", 4)), "keep")
+
+
+class TestTriageHiddenMutants(unittest.TestCase):
+    def test_a_recheck_that_ignores_the_digest_mark_is_caught(self):
+        helper = TestPassRecheckMutants()
+        text = (Path(sb.__file__).resolve().parent / "switchboard" / "alert_labels.py").read_text()
+        old = '"hidden": bool(getattr(state, "fact_hidden", {}).get(subject[3]))'
+        self.assertEqual(text.count(old), 1, msg="the mutation target moved")
+        self.assertNotEqual(text.replace(old, '"hidden": False', 1), text, msg="the mutation was not applied")
+        ns = dict(vars(sb))
+        exec(compile(text.replace(old, '"hidden": False', 1), "alert_labels.py", "exec"), ns)
+        name = "TestTriageHiddenGuard.test_a_digest_that_hides_items_is_kept_when_every_shown_item_has_cleared"
+        self.assertTrue(helper.run_case(name, []).wasSuccessful(), msg="control failed")
+        result = helper.run_case(name, [(sb.TriageFacts, "present_record", ns["TriageFacts"].present_record)])
+        self.assertFalse(result.wasSuccessful(), msg="a digest that ignores the mark went unnoticed")

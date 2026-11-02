@@ -368,6 +368,7 @@ class TriageState:
         self.reasons = {}        # (rule, ref) -> the worded reason of a finding that carries one (`awaiting-live expired`)
         self.logged, self.woken_logged, self.facts, self.current = set(), set(), {}, {}
         self.fact_pairs = {}     # #1542: digest key -> the items the digest lists, for the delivery re-check
+        self.fact_hidden = {}    # #1542: digest key -> True when the digest hides items ("+N more") or carries a note outside its pairs
         self.started, self.day, self.day_counts = 0, None, {}
         self.summarised = None
         self.seen = None         # #349: the stale digest's memory (bin/triage_digest.py), loaded at the first pass
@@ -1279,8 +1280,11 @@ def triage_queue_fact(state, due, now, cfg, other_owner=0, invalid=()):
         state.alarmed[pair] = now
     state.facts[key] = (summary, now)
     state.fact_pairs[key] = list(shown)   # #1542: the items the digest lists, for the delivery re-check
+    state.fact_hidden[key] = len(due) > len(shown) or bool(other_owner) or bool(invalid)   # #1542: a digest that hides items or carries a note outside its pairs is never dropped
     for old in [k for k, (_, at) in state.facts.items() if now - at > cfg["realarm_hours"] * 7200 and "summary" not in k]:
         del state.facts[old]
+        state.fact_pairs.pop(old, None)   # #1542: forgotten with its fact
+        state.fact_hidden.pop(old, None)
     state.carried = set(shown)   # #849: what this digest carried and remembered; an overflow beyond the cap stays due
     return summary
 

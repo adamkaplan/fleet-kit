@@ -10650,6 +10650,7 @@ def sweep_queue_fact(state, due, now, cfg):
     state.fact_pairs[key] = (list(shown), len(due) > len(shown))   # #1542: the pairs the fact lists and whether it hides some ("+N more"), for the delivery re-check
     for old in [k for k, (_, at) in state.facts.items() if now - at > cfg["realarm_hours"] * 7200]:
         del state.facts[old]
+        state.fact_pairs.pop(old, None)   # #1542: forgotten with its fact
     return set(due)   # every due finding is carried (named, or counted in "+N more") and remembered
 
 
@@ -10787,6 +10788,9 @@ def plan_wake_pass(engine, state, repos, now, budget=None):
             if n is not None:
                 by_issue.setdefault(n, []).append(comment)
         pulls = [r for r in issues_unit["data"] if _is_pr(r)] + list((state.units.get((repo, "merged")) or {}).get("data") or [])
+        gone = module.latest_plans(comments_unit["data"], check_module.HEADING_RE, _url_number)
+        for key in [k for k in wake.newest if k[0] == repo and k[1] not in gone]:
+            del wake.newest[key]   # #1542: a plan comment that is gone or unparsable is no present hash
         for number, plan in sorted(module.latest_plans(comments_unit["data"], check_module.HEADING_RE, _url_number).items()):
             if number not in items:
                 continue
