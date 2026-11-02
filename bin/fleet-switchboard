@@ -3286,10 +3286,10 @@ class Switchboard:
 
     def unconsumed_lines(self, observation):
         """#1844: one line per message this daemon delivered as `queue` that the lane's inbox still holds, with its age and keys. Read only."""
-        if not observation or self.light:
+        if not observation:
             return []
         try:
-            inbox = self.v2.inbox_list(observation["session"])
+            inbox = self.reads.inbox(observation["session"], self.now(), fresh=True)
         except V2Error as err:
             return ["  problem: the inbox could not be read (%s)" % _one_line(str(err), 100)]
         now, lines = self.now(), []
@@ -3333,7 +3333,7 @@ class Switchboard:
         """#1844: a message this daemon delivered as `queue` that the WORKING lane has not consumed within `unconsumed_steer_minutes` is
         steered into the running turn, once per item (a refusal is audited once per item too). Held lanes are left alone. Returns the ids steered."""
         minutes = self.config.get("unconsumed_steer_minutes")
-        if self.light or not minutes or hold_reason(observation) or observation.status != "working":
+        if not minutes or hold_reason(observation) or observation.status != "working":
             return []
         bound = minutes * 60
         self._record_load()
@@ -3371,7 +3371,7 @@ class Switchboard:
         Never raises: the delivery already happened."""
         try:
             source = next((s for s in self.sources if isinstance(s, ReminderFacts)), None)
-            if source is None or self.light or self.audit is None:
+            if source is None or self.audit is None:
                 return []
             items = {i["id"]: i for i in read_reminders(source.state_dir)}
             mine = []

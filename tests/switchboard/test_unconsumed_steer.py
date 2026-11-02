@@ -311,4 +311,17 @@ def build(Base, TestSteerToWorking):
                     self.scenario_absent()
             self.assertIn("msg=an absent record was audited", str(caught.exception))
 
+        def test_light_mode_the_three_methods_make_no_session_read(self):
+            import types
+            self.build({"v2_light": True})
+            engine = self.world.engine
+            observation = types.SimpleNamespace(name="platform", session_id=self.world.sessions["platform"], status="working",
+                                                conflict=[], problem=None)
+            calls = []
+            with mock.patch.object(engine.v2, "inbox_list", lambda *a, **k: calls.append(a) or []):
+                self.assertEqual(engine.steer_unconsumed(observation, engine.now()), [])
+                self.assertEqual(engine.supersede_queued_reminders(observation, []), [])
+                self.assertEqual(engine.unconsumed_lines({"session": observation.session_id}), [])
+            self.assertEqual(calls, [], "msg=a session read under v2_light")
+
     return TestUnconsumedSteer
