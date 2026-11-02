@@ -3625,6 +3625,15 @@ a failing delivery of an inbound answer (the event is not marked, the cursor sta
 `fleet-switchboard status` and `decisions` print one line when it is on: `external  ok; outbox N; last pull 12s ago`
 or `external  down: <why>`.
 
+**The About of a raise.** The receiving tool needs an `about` string: the background a newcomer needs to decide, written by the
+author of the decision. An issue decision takes the `## About` section of its issue body (the text up to the next heading, whitespace
+folded; an empty section counts as none); a report decision takes an `About:` paragraph of its text (to the next blank line). The
+daemon sends it unchanged as `about` (a manifest may name the field with the optional `fields.raise.about`; it is never required) and
+checks only that it is not empty. A decision with no About is not sent and is never refused for good: `status` and `decisions` show
+`needs an About: <display id>` under the `external` line until the author adds one. A raise the receiving tool refuses for good is
+audited as `external.permanent_failure` with its display id and title, and shown as one line per decision, `raise refused: <display id>: <reason>`,
+under the same line (the count `N permanent failure(s)` stays on it). A decision already linked outside is not revised because of an About.
+
 **Work items.** With `external_decisions.work_items` on (it is off by default, and does nothing unless the adapter
 in use has a work sink), each worker assignment is mirrored as one external work item, as information for an outside
 dashboard; nothing flows back. An assignment is a fleet agent that reports to a boss and holds an ask (an issue in a

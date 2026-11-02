@@ -223,5 +223,13 @@ class TestAboutManifest(unittest.TestCase):
         self.assertNotIn("about", list(named.door.items.values())[0]["_args"])
 
 
+class TestAboutDocs(unittest.TestCase):
+    def test_the_documentation_says_what_a_refused_raise_looks_like(self):   # S7
+        text = (REPO / "docs" / "switchboard.md").read_text()
+        self.assertIn("raise refused", text)
+        self.assertIn("`about`", text)
+        self.assertIn("needs an About", text)
+
+
 if __name__ == "__main__":
     unittest.main()
