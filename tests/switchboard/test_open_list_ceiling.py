@@ -114,7 +114,8 @@ class TestOpenListCeiling(Base):
         calls = []
 
         def api(path, repo=None, meta=None):
-            page = int(re.search(r"&page=(\d+)", path).group(1))
+            found = re.search(r"&page=(\d+)", path)
+            page = int(found.group(1)) if found else 1   # the first page is asked exactly as before (PC-1)
             calls.append(page)
             return [{"number": 1000 + (page - 1) * 100 + i, "state": "open", "labels": [], "title": "t", "body": ""} for i in range(100 if page < 2 else 30)]
         reader = sb.IntentReader.__new__(sb.IntentReader)

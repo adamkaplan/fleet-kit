@@ -9978,6 +9978,11 @@ def sweep_state(engine):
     return state
 
 
+def open_page_suffix(page):
+    """#1886: the first page is asked exactly as before (no `page` parameter: PC-1); later pages add `&page=N`."""
+    return "" if page == 1 else "&page=%d" % page
+
+
 def open_pages(read):
     """#1886: `read(page)` -> a list or a non-list (a failed read); the pages of an open-item list up to OPEN_LIST_PAGES, stopping at a short page."""
     out = []
@@ -16173,7 +16178,7 @@ class IntentReader:
     def open_asks(self, charter, repo=None):
         """The open sub-issues of a charter, derived from GitHub on every call."""
         repo = repo or self.repo
-        found = open_pages(lambda page: self._api("repos/%s/issues/%d/sub_issues?per_page=100&page=%d" % (repo, charter, page), repo))
+        found = open_pages(lambda page: self._api("repos/%s/issues/%d/sub_issues?per_page=100%s" % (repo, charter, open_page_suffix(page)), repo))
         asks = []
         for data in found if isinstance(found, list) else []:
             issue = IssueIntent.from_api(data)
@@ -23693,11 +23698,11 @@ def load_tick(engine, discovery):
         """The open issues of `repo` that carry the orchestrator label (whatever the owner's prefix) as [(number, body)]: each list read page by page up to OPEN_LIST_PAGES."""
         if engine.intents is None:
             raise RuntimeError("no ask repo is configured")
-        labels = open_pages(lambda page: engine.intents._api("repos/%s/labels?per_page=100&page=%d" % (repo, page), repo))
+        labels = open_pages(lambda page: engine.intents._api("repos/%s/labels?per_page=100%s" % (repo, open_page_suffix(page)), repo))
         names = sorted({l["name"] for l in labels if isinstance(l, dict) and str(l.get("name")).endswith(":orchestrator")}) if isinstance(labels, list) else []
         out = []
         for name in names[:2]:   # every owner's prefix, at most two (each is one more read)
-            found = open_pages(lambda page: engine.intents._api("repos/%s/issues?state=open&per_page=100&labels=%s&page=%d" % (repo, urllib.parse.quote(name), page), repo))
+            found = open_pages(lambda page: engine.intents._api("repos/%s/issues?state=open&per_page=100&labels=%s%s" % (repo, urllib.parse.quote(name), open_page_suffix(page)), repo))
             out.extend((i["number"], i.get("body") or "") for i in found   # the issues list also returns pull requests: a PR body never names a charter
                        if isinstance(i, dict) and isinstance(i.get("number"), int) and "pull_request" not in i) if isinstance(found, list) else None
         return out
