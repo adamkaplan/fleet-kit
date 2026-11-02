@@ -273,8 +273,71 @@ def find_installation(target, jwt):
     return inst, owner_id
 
 
+def caller_token():
+    """The cluster token the service reviews: CW_TOKEN_SERVICE_CALLER_TOKEN_CMD prints one, else the launcher's own cluster login. Never printed."""
+    cmd = (os.environ.get("CW_TOKEN_SERVICE_CALLER_TOKEN_CMD") or "").strip()
+    try:
+        if cmd:
+            p = subprocess.run(["sh", "-c", cmd], capture_output=True, text=True, timeout=60)
+            tok = p.stdout.strip() if p.returncode == 0 and len(p.stdout) <= MAX_BYTES else ""
+        else:
+            import cloud_worker  # no cycle: cloud_worker does not import this file; imported only on this route
+            tok = cloud_worker.cluster_token(dict(os.environ), "10m")
+    except Exception:  # a failed login of any kind is a passing failure, never a value
+        tok = ""
+    if not tok or re.search(r"\s", tok):
+        die("the caller's cluster token could not be made", transient=True)
+    return tok
+
+
+def mint_from_service(target, role):
+    """The token of the service named by CW_TOKEN_SERVICE_URL (POST {repo, role}, Authorization: Bearer <cluster token>). The answer gets the
+    same checks as the signing route's. A passing failure exits 75, a refusal 1."""
+    url = os.environ["CW_TOKEN_SERVICE_URL"].strip()
+    u = urllib.parse.urlparse(url)
+    if not (u.scheme == "https" or (u.scheme == "http" and u.hostname in ("127.0.0.1", "localhost", "::1"))):
+        die("CW_TOKEN_SERVICE_URL must be an https URL (http only for a loopback address)")
+    repo = target.split("/", 1)[1]
+    bearer = caller_token()
+    req = urllib.request.Request(url, data=json.dumps({"repo": target, "role": role}).encode(), method="POST",
+                                 headers={"Authorization": "Bearer " + bearer, "Content-Type": "application/json", "Accept": "application/json"})
+    del bearer
+    try:
+        with open_url(req, 60) as r:
+            raw = r.read(MAX_BYTES + 1)
+        if len(raw) > MAX_BYTES:
+            die("the token service's answer is larger than %d bytes" % MAX_BYTES)
+        ans = json.loads(raw)
+    except urllib.error.HTTPError as e:
+        passing = e.code == 429 or 500 <= e.code <= 599
+        die("the token service refused the request (HTTP %d)" % e.code, transient=passing)
+    except Exception:  # a timeout, a refused connection, an answer that is not JSON: the service could not be asked
+        die("the token service could not be asked or its answer was not usable JSON", transient=True)
+    token = ans.get("token") if isinstance(ans, dict) else None
+    repos = ans.get("repositories") if isinstance(ans, dict) else None
+    if not isinstance(token, str) or not token:
+        die("the answer has no token")
+    MINTED.append(token)
+    if not isinstance(repos, list) or len(repos) != 1 or not isinstance(repos[0], dict) or repos[0].get("name") != repo:
+        die("refusing: the token does not cover exactly the one target repository")
+    full = repos[0].get("full_name")
+    if not (isinstance(full, str) and valid_target(full) and full.lower() == target.lower()):
+        die("refusing: the token does not cover exactly the one target repository")
+    try:
+        exp = dt.datetime.strptime(ans["expires_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc).timestamp()
+    except (KeyError, ValueError, TypeError):
+        die("the answer has no readable expiry")
+    if exp - dt.datetime.now(dt.timezone.utc).timestamp() > MAX_TOKEN_SECONDS:
+        die("refusing: the token lives longer than 61 minutes")
+    check_permissions(ans.get("permissions"), role)
+    MINTED.clear()
+    return token
+
+
 def mint(target, role="worker"):
     """Return a token for target (OWNER/REPO), or exit through die(). Never prints."""
+    if os.environ.get("CW_TOKEN_SERVICE_URL"):  # the service route (ask #2002); unset, the signing route below is unchanged
+        return mint_from_service(target, role)
     repo = target.split("/", 1)[1]
     app_id = vault("CW_APP_ID_CMD", "cw-app-id").strip()
     if not app_id.isdigit():
