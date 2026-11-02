@@ -1875,7 +1875,7 @@ class TestGhShimEncodedQueryAndLabelDelete(unittest.TestCase):
         self.assertEqual(encoded_query_failures(self.rig), [])   # control first
         old = 'urllib.parse.unquote(part.partition("=")[0]) for part in re.split(r"[&;]", query)'
         self.assertEqual(self.source.count(old), 1, "the mutant's anchor is gone (the query keys of api_decide)")
-        check = '"%" in key or not key_known(key) or (key.lower() == "body" and key in query_keys)'
+        check = '"%" in key or key not in ALLOWED_KEYS or (key == "body" and key in query_keys)'
         self.assertEqual(self.source.count(check), 1, "the mutant's anchor is gone (the key check of api_decide)")
         rig = Rig(self.source.replace(old, 'part.partition("=")[0] for part in query.split("&")', 1).replace(check, '(key != "body" or key in query_keys) and re.search(r"(?i)(^|\\[)body(\\]|\\[\\])*$", key)', 1))
         self.addCleanup(rig.close)
