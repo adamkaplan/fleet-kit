@@ -187,19 +187,15 @@ cmd_comment.header_cache = True    # #1520
 
 
 def cmd_comment_edit(args, engine, caller, body):
-    """`comment --edit URL`: the work is in the flat module bin/comment_edit.py (#1714); this maps its answers."""
-    here = os.path.dirname(os.path.realpath(__file__))
-    if here not in sys.path:
-        sys.path.insert(0, here)
-    import comment_edit
+    """`comment --edit URL`: the work is in bin/switchboard/agents_verify.py (#1714, the section `comment --edit`); this maps its answers."""
     try:
-        url, lapse = comment_edit.edit_in_place(engine.intents, caller, args.edit, body, getattr(args, "approval", None),
+        url, lapse = edit_in_place(engine.intents, caller, args.edit, body, getattr(args, "approval", None),
                                                 lambda: _audit_tail(engine.state_dir), lambda subject, detail: engine._external("github.comment", subject, detail),
                                                 fleet_mark, engine.intents.repo)
-    except comment_edit.CommentEditRefused as err:
+    except CommentEditRefused as err:
         sys.stderr.write("%s: comment --edit refused: %s\n" % (PROG, err))
         return EXIT_USAGE
-    except comment_edit.CommentEditFailed as err:
+    except CommentEditFailed as err:
         raise IntentError(err.kind, err.detail) from None
     if lapse:
         sys.stderr.write(lapse + "\n")
