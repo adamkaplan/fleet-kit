@@ -22,6 +22,7 @@ switchboard/audit.py
 switchboard/decision.py
 switchboard/engine.py
 switchboard/jev.py
+switchboard/pins.py
 switchboard/launch_model.py
 switchboard/secret_spans.py
 switchboard/caches.py
