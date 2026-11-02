@@ -172,7 +172,7 @@ def main(argv):
     with open(os.path.join(ROOT, "docs", "architecture.md"), encoding="utf-8") as handle:
         units_text = handle.read()
     closure = closure_state()
-    print("\n".join(block(p, sources[p], (guards, matrix, units_text), closure) for p in args))
+    print("\n".join((block_shim if p.startswith("shims/") else block)(p, sources[p], (guards, matrix, units_text), closure) for p in args))
     return 0
 
 
