@@ -2,7 +2,6 @@
   "permission": {
     "question": "deny",
     "edit": {
-      "*": "allow",
       "*pr-record*": "deny"
     },
     "bash": {
@@ -2077,7 +2076,6 @@
       "permission": {
         "question": "deny",
         "edit": {
-          "*": "allow",
           "*pr-record*": "deny"
         },
         "bash": {

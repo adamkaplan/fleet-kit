@@ -46,7 +46,7 @@ def strip_question(cfg):
 
 
 RECORD_BASH_PATTERNS = ("*CW_PR_RECORD*", "*pr-record*")   # ask 1200: the closed list of what its change adds
-RECORD_EDIT_ENTRY = {"*": "allow", "*pr-record*": "deny"}   # the editing tool's entry for the record paths
+RECORD_EDIT_ENTRY = {"*pr-record*": "deny"}   # the editing tool's entry for the record paths
 
 
 def strip_record_entries(cfg):

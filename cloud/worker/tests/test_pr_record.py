@@ -185,17 +185,42 @@ class T(unittest.TestCase):
         self.assertEqual(self.client_with_record(8, "8\n").returncode, 3)   # the true build refuses it
 
     # S16 (a): the file-editing tool is denied for a path holding pr-record, in both agent blocks
+    @staticmethod
+    def resolve(rules, path):
+        """The documented rule: the last matching rule wins, `*` matches any characters, no match = no decision."""
+        import re
+        out = None
+        for pat, act in rules.items():
+            if re.fullmatch(".*".join(re.escape(x) for x in pat.split("*")), path, re.S):
+                out = act
+        return out
+
+    def s16_check(self, conf):
+        blocks = (conf["permission"], conf["agent"]["worker"]["permission"])
+        denied = ordinary = 0
+        for b in blocks:
+            self.assertEqual(b["edit"], {"*pr-record*": "deny"})
+            for p in ("pr-record", "x/pr-record.json", "pr-record-x"):
+                self.assertEqual(self.resolve(b["edit"], p), "deny", p)
+                denied += 1
+            self.assertIsNone(self.resolve(b["edit"], "src/a.py"))
+            ordinary += 1
+            self.assertIn("bash", b)
+            self.assertEqual(b["question"], "deny")
+        return len(blocks), denied, ordinary
+
     def test_s16_the_edit_tool_is_denied_for_the_record_in_both_blocks(self):
         import json
         with open(os.path.join(WORKER, "opencode-worker.json")) as f:
-            conf = json.load(f)
-        blocks = (conf["permission"], conf["agent"]["worker"]["permission"])
-        self.assertEqual(sum(1 for b in blocks if isinstance(b.get("edit"), dict) and b["edit"].get("*pr-record*") == "deny"), 2)
-        for b in blocks:
-            self.assertEqual(b["edit"].get("*"), "allow")
-            self.assertEqual(list(b["edit"]).index("*"), 0)   # the last matching rule wins: the allow-all comes first
-            self.assertIn("bash", b)
-            self.assertEqual(b["question"], "deny")
+            text = f.read()
+        r = self.s16_check(json.loads(text))
+        print("S16: %d of 2 deny entries, 0 allow keys, %d of 6 paths denied, %d of 2 ordinary unmatched" % (r[0], r[1], r[2]))
+        # the mutant: the deny key replaced by another, applied from the two texts
+        old, new = '"*pr-record*": "deny"\n    }', '"*pr-record-none*": "deny"\n    }'
+        self.assertEqual(text.count(old), 1)
+        with self.assertRaises(AssertionError) as cm:
+            self.s16_check(json.loads(text.replace(old, new)))
+        self.assertIn("{'*pr-record-none*': 'deny'}", str(cm.exception))
 
     # S16 (b): a pr-record that is already a symlink refuses the start, and the target's mode is not changed
     def test_s16_a_symlink_at_the_record_directory_refuses_the_start(self):
