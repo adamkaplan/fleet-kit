@@ -480,7 +480,8 @@ class TestStopFinalMessageHardeningMutant(unittest.TestCase):
         "r=unittest.TextTestRunner(verbosity=0).run(suite)\n"
         "sys.exit(0 if r.wasSuccessful() else 1)\n")
     CASES = (
-        ("cloud_retired", "test_U11_an_upper_case_endpoint_is_in_neither_the_message_nor_the_file", '(:[0-9]+)?", re.I)', '(:[0-9]+)?")',
+        ("cloud_retired", "test_U11_an_upper_case_endpoint_is_in_neither_the_message_nor_the_file", "low, n, out, i, keep = text.lower(), len(text), [], 0, 0",
+         "low, n, out, i, keep = text, len(text), [], 0, 0",
          "an upper-case endpoint reached a lane"),
         ("cloud_retired", "test_U12_a_wide_cloud_last_is_tightened_and_a_link_or_a_foreign_one_is_refused", "os.fchmod(dfd, 0o700)", "pass",
          "a cloud-last directory stayed wider than 0700"),
