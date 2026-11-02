@@ -596,10 +596,9 @@ def claim_counts(scenarios, bodies):
 
 
 def omitted_claims(scenarios, this_body, counts):
-    """The per-pull-request ids this body's claim line leaves out that no OTHER body counted covers (`counts` is `claim_counts` over all bodies, this one included: its own cover is
-    subtracted). No claim line claims every one and a refused line covers nothing: both leave out nothing here (`covered_ids` gives the empty set). Pure."""
+    """The per-pull-request ids this body's claim line leaves out that no OTHER body counted covers (`counts` is `claim_counts` over all bodies, this one included, so an id this body covers has a count of at least 1: an id is omitted when this body has a claim line that covers something, the scenario is per pull request and the counts hold NO body that covers it). No claim line claims every one and a refused line covers nothing: both leave out nothing here (`covered_ids` gives the empty set). Pure."""
     mine = covered_ids(scenarios, [this_body])
-    return [s.get("id") for s in scenarios if mine and claim_of(s) == "pr" and counts.get(s.get("id"), 0) - (s.get("id") in mine) <= 0 and s.get("id") not in mine]
+    return [s.get("id") for s in scenarios if mine and claim_of(s) == "pr" and not counts.get(s.get("id"), 0)]
 
 
 def claim_line(pr, head, body):
