@@ -1290,8 +1290,11 @@ def _complete_pending(path, now_ts=None):
                 return {"done": record["done"] + 1, "pending": None,
                         "cuts": record["cuts"] + [{"cut": pend.get("cut", 0), "archive": name}]}
             ts = pend.get("ts")
-            if isinstance(ts, bool) or not isinstance(ts, (int, float)) or not math.isfinite(ts) or ts > now_ts or now_ts - ts > AUDIT_PENDING_STALE:
-                return dict(record, pending=None)
+            try:
+                if isinstance(ts, bool) or not isinstance(ts, (int, float)) or not math.isfinite(ts) or ts > now_ts or now_ts - ts > AUDIT_PENDING_STALE:
+                    return dict(record, pending=None)
+            except (OverflowError, ValueError):
+                return dict(record, pending=None)   # a ts that makes the test itself raise is stale
             return None
         _record_update(path, complete)
     finally:
