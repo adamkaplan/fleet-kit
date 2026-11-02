@@ -23420,7 +23420,7 @@ class TestSweep(Base):
             checked = set(self.engine.sweep.checked)
         self.assertEqual(seen, set(repos))                       # every repo was reached across passes
         self.assertEqual(len(checked), 20)                       # and every decision's issue was checked
-        self.assertTrue(all(cap in (sb.SWEEP_LIST_PAGES, 1) for cap in self.hub.caps), "the lists are capped; the closed-PR list (S9) is one page")
+        self.assertTrue(all(cap in (sb.SWEEP_LIST_PAGES, sb.OPEN_LIST_PAGES, 1) for cap in self.hub.caps), "the lists are capped; the closed-PR list (S9) is one page")
         quiet = self.calls()
         self.sweep(decisions)                                    # nothing is stale yet: the cache answers
         self.assertEqual(self.calls(), quiet)
@@ -23490,7 +23490,7 @@ class TestSweep(Base):
         self.assertEqual(len(self.engine.sweep.repos), 1)
 
     def test_the_sweep_budget_is_a_config_value_with_a_cap(self):
-        self.assertEqual(sb.SWEEP_CALLS_PER_PASS, 12)
+        self.assertEqual(sb.SWEEP_CALLS_PER_PASS, 16)
         base = {"opencode": FAKE_OPENCODE}
         self.assertEqual(sb.validate_config(dict(base, sweep={"calls_per_pass": 20}))["sweep"]["calls_per_pass"], 20)
         for bad in (3, 101, "6", True):
