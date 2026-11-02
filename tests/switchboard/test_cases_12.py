@@ -442,7 +442,7 @@ class TestAgentShellCalls(Base):
         self.assertNotIn("a b", text)
 
     def test_lane_s7_no_value_reaches_the_record_beside_the_lane(self):
-        self.shim("api", "repos/acme/app/issues/5?token=queryvalue", "-f", "body=secretbody", env={"GH_TOKEN": "secrettoken"})
+        self.shim("api", "repos/acme/app/issues/5?token=queryvalue", "-f", "title=secretbody", env={"GH_TOKEN": "secrettoken"})
         row = json.loads((self.state / "agent-calls.jsonl").read_text().splitlines()[0])
         self.assertEqual(sorted(row), ["account", "endpoint", "lane", "ts"])
         sb.agent_calls.fold(str(self.state), time.time())
