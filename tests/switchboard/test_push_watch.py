@@ -222,6 +222,35 @@ class TestPushWatch(Case):
         self.assertEqual([r for r, _ in self.engine.sent], ["lane-b"])
         self.assertEqual(len([l for l in self.engine.audit.lines if l[1] == "w-a" and "no reports_to" in str(l[2])]), 1)
 
+    def test_the_why_of_read_failed_names_its_cause_read_send_and_no_reports_to(self):
+        def whys(worker):
+            return [l[2]["why"] for l in self.engine.audit.lines if l[0] == "push_watch.read_failed" and l[1] == worker]
+
+        def three(module=None):
+            self.setUp()   # (a) a failed read of a branch: the one-lined error text
+            self.world.refs = {"w-a/wip": SHA_A}
+            self.world.fail = True
+            self.run_pass(NOW, module)
+            read = whys("w-a")
+            self.setUp()   # (b) a failed send: the error text of the send
+            self.world.refs = {"w-a/wip": SHA_A}
+            self.engine.send = lambda *a, **k: (_ for _ in ()).throw(OSError("lane closed"))
+            self.run_pass(NOW, module)
+            send = whys("w-a")
+            self.setUp()   # (c) a worker with no reports_to
+            self.engine.cloud_watch = {"records": [record("w-a", None)]}
+            self.world.refs = {"w-a/wip": SHA_A}
+            self.run_pass(NOW, module)
+            return read, send, whys("w-a")
+
+        def check(got):
+            self.assertEqual(got[0], ["down"], "the why of a failed read")
+            self.assertEqual(got[1], ["lane closed"], "the why of a failed send")
+            self.assertEqual(got[2], ["no reports_to: tells no lane"], "the why of a worker with no reports_to")
+        check(three())   # the control
+        mutant = self.mutant('"no reports_to: tells no lane"', '"lane closed"')   # two causes, one why
+        self._fails(lambda: check(three(mutant)), "the why of a worker with no reports_to")
+
     def test_u4_a_restart_between_the_push_and_the_quiet_time_tells_the_quiet_item_once(self):
         self.world.refs = {"w-a/wip": SHA_A}
         self.run_pass(NOW)
