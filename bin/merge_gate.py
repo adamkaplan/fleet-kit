@@ -18,6 +18,7 @@ a test fakes them. Python 3.9 standard library only; `pr_reading` (the shared pu
 """
 import fcntl
 import json
+import math
 import os
 import re
 import sys
@@ -592,13 +593,16 @@ def pass_and_merge(reading, gh, conf, state, repo, number, holder, pid, clock, s
             mdata = None
         seen = "could not be read"
         if isinstance(mdata, dict):
-            seen = "%s at head %s" % (mdata.get("state"), str(mdata.get("headRefOid") or "")[:8])
+            seen = "%s at head %s" % (mdata.get("state"), str(mdata.get("headRefOid"))[:8]) if mdata.get("headRefOid") else "%s (no head given)" % mdata.get("state")
             if mdata.get("state") == "MERGED" and mdata.get("headRefOid") == head:
                 audit["merge_state"] = seen
                 return done(0, "merged %s at head %s (squash); gh exited %d: %s" % (ref, head[:8], code, audit["merge_said"]), "merged")
         audit["merge_state"] = seen
         try:
-            stamp = time.strftime("%H:%M:%SZ", time.gmtime(clock()))
+            now = clock()
+            if not isinstance(now, (int, float)) or isinstance(now, bool) or not math.isfinite(now):
+                raise ValueError("clock")
+            stamp = time.strftime("%H:%M:%SZ", time.gmtime(now))
         except (OverflowError, TypeError, ValueError, OSError):
             stamp = "an unknown time"
         return done(1, "merge-gate --pass --merge: refused or failed (exit %d), the pull request state is unknown at %s (%s): read the pull request: %s" % (
