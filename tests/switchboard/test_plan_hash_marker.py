@@ -213,7 +213,7 @@ class TestPlanHashMarkerDocumentation(unittest.TestCase):
     def test_the_template_says_what_the_hash_covers(self):
         text = (REPO / "docs" / "plan-template.md").read_text(encoding="utf-8")
         section = text.split("#### The plan hash and the trailing marker (#1713)", 1)[1].split("\n#", 1)[0]
-        for phrase in ("whitespace collapsed", "one trailing marker line", "marker line anywhere else", "old hash"):
+        for phrase in ("line structure kept", "one trailing marker line", "marker line anywhere else", "old hash"):
             self.assertIn(phrase, section.lower())
 
     def test_switchboard_md_names_the_rule(self):
