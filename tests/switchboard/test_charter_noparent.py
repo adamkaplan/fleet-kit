@@ -145,6 +145,11 @@ class TestCharterNoParent(unittest.TestCase):
             with self.assertRaises(AssertionError, msg="the issue read of the strict parent read is fresh") as got:
                 check_fresh(lines)
             self.assertIn("the issue read of the strict parent read is fresh", str(got.exception))
+            noinval = mutant(tmp, "noinval", "            self.invalidate(number, repo)\n", "")
+            check_fresh(control)
+            with self.assertRaises(AssertionError, msg="the issue read of the strict parent read is fresh") as got:
+                check_fresh(noinval)
+            self.assertIn("the issue read of the strict parent read is fresh", str(got.exception))
 
 
 def build(CharterRig, Base, TestCharterSetGuard):
