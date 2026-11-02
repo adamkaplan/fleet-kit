@@ -228,10 +228,13 @@ class Strict(unittest.TestCase):
         original = slurp(COMMAND).decode()
         old = 'if not copy.startswith("cloud/worker/") or ".." in copy.split("/"):'
         self.assertEqual(original.count(old), 1)
-        mutated = original.replace(old, 'if False:')
+        old2 = 'if not inside(root, copy, os.path.join("cloud", "worker")):'   # the real-path test of S12 would refuse the row too
+        self.assertEqual(original.count(old2), 1)
+        mutated = original.replace(old, 'if False:').replace(old2, 'if False:')
         self.assertNotEqual(mutated, original)
-        self.assertIn(old, original)
-        self.assertNotIn(old, mutated)
+        for gone in (old, old2):
+            self.assertIn(gone, original)
+            self.assertNotIn(gone, mutated)
         with open(os.path.join(d, COMMAND), "w") as f:
             f.write(mutated)
         with self.assertRaisesRegex(AssertionError, "a row outside cloud/worker was accepted: bin/cloud_cli.py"):
@@ -592,7 +595,10 @@ class Comparing(unittest.TestCase):
         for name, form in forms.items():
             with self.subTest(form=name):
                 mutated = text.replace(old, form)
-                self.assertNotEqual(mutated, text, "the mutation was not applied")
+                if form == old:
+                    self.assertEqual(mutated, text)   # the plain form is the file as it stands
+                else:
+                    self.assertNotEqual(mutated, text, "the mutation was not applied")
                 path = os.path.join(d, name + ".py")
                 with open(path, "w") as f:
                     f.write(mutated)
