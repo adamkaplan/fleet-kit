@@ -273,6 +273,50 @@ def find_installation(target, jwt):
     return inst, owner_id
 
 
+def mint(target, role="worker"):
+    """Return a token for target (OWNER/REPO), or exit through die(). Never prints."""
+    if os.environ.get("CW_TOKEN_SERVICE_URL"):  # the service route (ask #2002); unset, the signing route below is unchanged
+        return mint_from_service(target, role)
+    repo = target.split("/", 1)[1]
+    app_id = vault("CW_APP_ID_CMD", "cw-app-id").strip()
+    if not app_id.isdigit():
+        die("the app id must be a number")
+    key = vault("CW_APP_KEY_CMD", "cw-app-key")
+    now = int(dt.datetime.now(dt.timezone.utc).timestamp())
+    head = b64(json.dumps({"alg": "RS256", "typ": "JWT"}, separators=(",", ":")).encode())
+    claims = b64(json.dumps({"iat": now - 30, "exp": now + 9 * 60, "iss": app_id}, separators=(",", ":")).encode())
+    signing = "%s.%s" % (head, claims)
+    jwt = signing + "." + b64(sign(key, signing.encode()))
+    del key
+    inst, owner_id = find_installation(target, jwt)
+    ans = github_json("POST", "/app/installations/%d/access_tokens" % inst, jwt,
+                      {"repositories": [repo], "permissions": dict(PERMISSIONS_BY_ROLE[role])}, role=role)
+    token = ans.get("token") if isinstance(ans, dict) else None
+    repos = ans.get("repositories") if isinstance(ans, dict) else None
+    if not isinstance(token, str) or not token:
+        die("the answer has no token")
+    MINTED.append(token)
+    if not isinstance(repos, list) or len(repos) != 1 or not isinstance(repos[0], dict) or repos[0].get("name") != repo:
+        die("refusing: the token does not cover exactly the one target repository")
+    full = repos[0].get("full_name")
+    if not (isinstance(full, str) and valid_target(full) and full.lower() == target.lower()):
+        die("refusing: the token does not cover exactly the one target repository")
+    owner = repos[0].get("owner")  # the account id is stable where the login is not: both answers must carry it, and it must agree
+    if not isinstance(owner, dict) or not is_id(owner.get("id")):
+        die("refusing: the token's repository carries no usable owner id")
+    if owner.get("id") != owner_id:
+        die("refusing: the token's repository is not owned by the installation's account")
+    try:
+        exp = dt.datetime.strptime(ans["expires_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc).timestamp()
+    except (KeyError, ValueError, TypeError):
+        die("the answer has no readable expiry")
+    if exp - dt.datetime.now(dt.timezone.utc).timestamp() > MAX_TOKEN_SECONDS:
+        die("refusing: the token lives longer than 61 minutes")
+    check_permissions(ans.get("permissions"), role)
+    MINTED.clear()
+    return token
+
+
 def caller_token():
     """The cluster token the service reviews: CW_TOKEN_SERVICE_CALLER_TOKEN_CMD prints one, else the launcher's own cluster login. Never printed."""
     cmd = (os.environ.get("CW_TOKEN_SERVICE_CALLER_TOKEN_CMD") or "").strip()
@@ -321,52 +365,8 @@ def mint_from_service(target, role):
     if not isinstance(repos, list) or len(repos) != 1 or not isinstance(repos[0], dict) or repos[0].get("name") != repo:
         die("refusing: the token does not cover exactly the one target repository")
     full = repos[0].get("full_name")
-    if not (isinstance(full, str) and valid_target(full) and full.lower() == target.lower()):
+    if not (isinstance(full, str) and full.lower() == target.lower()):
         die("refusing: the token does not cover exactly the one target repository")
-    try:
-        exp = dt.datetime.strptime(ans["expires_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc).timestamp()
-    except (KeyError, ValueError, TypeError):
-        die("the answer has no readable expiry")
-    if exp - dt.datetime.now(dt.timezone.utc).timestamp() > MAX_TOKEN_SECONDS:
-        die("refusing: the token lives longer than 61 minutes")
-    check_permissions(ans.get("permissions"), role)
-    MINTED.clear()
-    return token
-
-
-def mint(target, role="worker"):
-    """Return a token for target (OWNER/REPO), or exit through die(). Never prints."""
-    if os.environ.get("CW_TOKEN_SERVICE_URL"):  # the service route (ask #2002); unset, the signing route below is unchanged
-        return mint_from_service(target, role)
-    repo = target.split("/", 1)[1]
-    app_id = vault("CW_APP_ID_CMD", "cw-app-id").strip()
-    if not app_id.isdigit():
-        die("the app id must be a number")
-    key = vault("CW_APP_KEY_CMD", "cw-app-key")
-    now = int(dt.datetime.now(dt.timezone.utc).timestamp())
-    head = b64(json.dumps({"alg": "RS256", "typ": "JWT"}, separators=(",", ":")).encode())
-    claims = b64(json.dumps({"iat": now - 30, "exp": now + 9 * 60, "iss": app_id}, separators=(",", ":")).encode())
-    signing = "%s.%s" % (head, claims)
-    jwt = signing + "." + b64(sign(key, signing.encode()))
-    del key
-    inst, owner_id = find_installation(target, jwt)
-    ans = github_json("POST", "/app/installations/%d/access_tokens" % inst, jwt,
-                      {"repositories": [repo], "permissions": dict(PERMISSIONS_BY_ROLE[role])}, role=role)
-    token = ans.get("token") if isinstance(ans, dict) else None
-    repos = ans.get("repositories") if isinstance(ans, dict) else None
-    if not isinstance(token, str) or not token:
-        die("the answer has no token")
-    MINTED.append(token)
-    if not isinstance(repos, list) or len(repos) != 1 or not isinstance(repos[0], dict) or repos[0].get("name") != repo:
-        die("refusing: the token does not cover exactly the one target repository")
-    full = repos[0].get("full_name")
-    if not (isinstance(full, str) and valid_target(full) and full.lower() == target.lower()):
-        die("refusing: the token does not cover exactly the one target repository")
-    owner = repos[0].get("owner")  # the account id is stable where the login is not: both answers must carry it, and it must agree
-    if not isinstance(owner, dict) or not is_id(owner.get("id")):
-        die("refusing: the token's repository carries no usable owner id")
-    if owner.get("id") != owner_id:
-        die("refusing: the token's repository is not owned by the installation's account")
     try:
         exp = dt.datetime.strptime(ans["expires_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc).timestamp()
     except (KeyError, ValueError, TypeError):

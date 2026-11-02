@@ -17,8 +17,8 @@ CALLER = "caller-synthetic-" + "Mn4" * 5
 REAL = "acme-org/widget-service"
 PERMS = {"contents": "write", "pull_requests": "write", "issues": "read", "metadata": "read"}
 ORCH = {"issues": "write", "pull_requests": "read", "checks": "read", "metadata": "read"}
-SKIP_CHECK = ('    check_permissions(ans.get("permissions"), role)\n    MINTED.clear()\n    return token\n\n\ndef mint(')
-SKIPPED = '    MINTED.clear()\n    return token\n\n\ndef mint('
+SKIP_CHECK = ('    check_permissions(ans.get("permissions"), role)\n    MINTED.clear()\n    return token\n\n\ndef main(')
+SKIPPED = '    MINTED.clear()\n    return token\n\n\ndef main('
 
 
 def iso(seconds):
