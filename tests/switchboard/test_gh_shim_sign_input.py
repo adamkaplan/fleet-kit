@@ -2146,6 +2146,48 @@ class TestGhShimAllowlist(unittest.TestCase):
         self.assertIn("a key outside the allowlist went out unsigned", allowlist_failures(rig), "a key outside the allowlist went out unsigned")
 
 
+def upper_body_failures(rig):
+    """#1696 S40: the failures seen for a field key written Body or BODY on a comment endpoint (empty when the control passes and all 8 forms are refused)."""
+    bad = []
+    endpoint = "repos/o/r/issues/1/comments"
+    done, calls = rig.run("api", endpoint, "-f", "body=a")
+    if len(calls) != 1 or sum(a.count(SIGNED) for a in calls[0]["argv"]) != 1:
+        return ["the control of S40 did not pass"]
+    for flag, key in (("-f", "Body"), ("-F", "BODY"), ("--raw-field", "BODY"), ("--field", "Body")):
+        for early in ((), ("-X", "POST")):
+            done, calls = rig.run("api", *early, endpoint, flag, key + "=a")
+            lines = [l for l in done.stderr.splitlines() if l.startswith("gh:")]
+            if calls or done.returncode != 1 or len(lines) != 1 or not lines[0].startswith("gh: refused:"):
+                bad.append("a Body field went out unsigned")
+    return bad
+
+
+class TestGhShimBodyFieldKeyIsExact(unittest.TestCase):
+    """#1696 PC-13: a field or query key body is compared exactly (S40); a mutant folding the field key to lower case is seen."""
+
+    def setUp(self):
+        self.rig = hermetic_rig()
+        self.addCleanup(self.rig.close)
+        self.source = (SHIM_DIR / "gh").read_text()
+
+    def test_s40_control_first_the_exact_key_is_signed_once(self):
+        done, calls = self.rig.run("api", "repos/o/r/issues/1/comments", "-f", "body=a")
+        self.assertEqual(len(calls), 1, done.stderr)
+        self.assertEqual(sum(a.count(SIGNED) for a in calls[0]["argv"]), 1)
+
+    def test_s40_body_in_another_case_is_refused_as_a_field_key(self):
+        self.assertEqual(upper_body_failures(self.rig), [])
+
+    def test_s40_a_mutant_comparing_the_field_key_in_lower_case_is_seen(self):
+        self.assertEqual(upper_body_failures(self.rig), [])   # control first: exit 0
+        old = "or key not in ALLOWED_KEYS or"
+        self.assertEqual(self.source.count(old), 1, "the mutant's anchor is gone (the field key check of api_decide)")
+        rig = Rig(self.source.replace(old, "or not key_known(key) or", 1))   # a scratch copy outside the repo
+        self.addCleanup(rig.close)
+        self.assertNotEqual(rig.home.resolve(), REPO.resolve())
+        self.assertIn("a Body field went out unsigned", upper_body_failures(rig), "a Body field went out unsigned")
+
+
 def early_flag_failures(rig):
     """#1696 S39: the failures seen for a method flag written before the api word (empty when the control passes and both forms are refused)."""
     bad = []
