@@ -236,12 +236,14 @@ def run(sb, repo, number, next_step, parked):
             sb.write(reader, repo, number, new_body)
     except sb.IntentError as err:
         return _stop(sb, repo, number, "write", "the write failed (%s)" % sb.one_line(str(err), 120))
+    readable = False
     for wait in sb.waits:
         sb.sleep(wait)
         try:
             back = _read(sb, repo, number)
         except sb.IntentError:
             continue
+        readable = True
         if parts(back) != (True, True):
             try:
                 sb.write(reader, repo, number, body)
@@ -251,6 +253,10 @@ def run(sb, repo, number, next_step, parked):
             sb.err("%s: issue-line: #%d read back without its Intent or Done-when: the body read before the edit was written back once; check the issue\n" % (sb.PROG, number))
             return sb.EXIT_ERROR
         break
+    if not readable:
+        sb.engine.audit.append(sb.engine.actor, "issue_line.unverified", "issue:%s#%d" % (repo, number), {"repo": repo, "number": number, "reason": "readback"})
+        sb.err("%s: issue-line: #%d: the edit was written but could not be read back; check the issue\n" % (sb.PROG, number))
+        return sb.EXIT_ERROR
     if not saved:
         sb.err("%s: issue-line: written, but the last good copy could not be saved\n" % sb.PROG)
     sb.out("%s#%d: %s line written\n" % (repo, number, "next-step" if kind == "next" else "parked"))

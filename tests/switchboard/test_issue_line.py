@@ -343,6 +343,32 @@ def build():
             text = self.source_mutant(" or DONE_RE.match(lines[m])", "", self.check_a)
             self.assertRegex(text, r"^S12 found 2 lines of the kind Next where 1 was expected")
 
+        # -- S13: no read-back could read the body
+
+        def check_unverified(self):
+            def down_after_the_write(count):
+                if count == 3:
+                    self.gh.down = True
+            self.hook = down_after_the_write
+            code, out, err = self.run_it(self.ref, "--next-step", "wait")
+            if code != 1:
+                raise AssertionError("S13 exited %d where 1 was expected (no read-back could read the body)" % code)
+            self.assertEqual(len(self.writes()), 1)
+            self.assertEqual(len(err.strip().splitlines()), 1, err)
+            self.assertIn("written but could not be read back", err)
+            self.assertNotIn("last good copy", err + out)
+            self.assertNotIn("line written", out)
+            self.assertEqual(self.audit_text().count("issue_line.unverified"), 1)
+            self.assertNotIn("issue_line.restored", self.audit_text())
+            self.assertNotIn("wait\"", self.audit_text())
+
+        def test_s13_three_failed_read_backs_are_unverified_with_one_write_and_no_restore(self):
+            self.check_unverified()
+
+        def test_s13_a_mutant_that_exits_0_when_no_read_back_succeeded_is_caught_and_the_control_passes(self):
+            text = self.source_mutant("return sb.EXIT_ERROR\n    if not saved", "return sb.EXIT_OK\n    if not saved", self.check_unverified)
+            self.assertRegex(text, r"^S13 exited 0 where 1 was expected")
+
         # -- S6: bad arguments, before any read
 
         def test_s6_five_bad_arguments_are_refused_with_no_read(self):
