@@ -9981,7 +9981,7 @@ def sweep_read_repo(hub, repo, now, window_days, regex, budget, strong):
     one-item list: the calls this pass may still make; each read is charged what it used."""
     since = iso(now - window_days * 86400)
     items, truncated = {}, False
-    records, cut = hub.read_pages("repos/%s/issues?state=open&per_page=100" % repo, cap=SWEEP_LIST_PAGES)
+    records, cut = hub.read_pages("repos/%s/issues?state=open&per_page=100" % repo, cap=OPEN_LIST_PAGES)
     budget[0] -= sweep_pages_used(records, cut)
     truncated = truncated or cut
     for record in records:
