@@ -395,19 +395,24 @@ MIN_FRAGMENT = 8
 
 class KnownSet:
     """A set of known secret forms. It HOLDS its forms (it is not a set, and no public attribute exposes them), keeps a
-    `version` (bumped AFTER every change of the content, even one that raises half-way, under an RLock the instance owns)
-    and the structure `scrub` built for it (`built`); both are read-only from outside, and `keep` stores a structure only
-    for the version the set has now. A call whose structure is current never reads the set."""
+    `version` (bumped AFTER every change of the content, under an RLock the instance owns, and only when the content
+    changed) and the structure `scrub` built for it (`built`); both are read-only from outside, and `keep` stores a
+    structure only for the version the set has now. A call whose structure is current never reads the set. An argument
+    that is an iterable is read into a list BEFORE the lock is taken. No subclass, no pickle."""
     __slots__ = ("_forms", "_lock", "_version", "_built", "__weakref__")
     __hash__ = None
+
+    def __init_subclass__(cls, **kw):
+        raise TypeError("a KnownSet may not be subclassed")
 
     def __init__(self, forms=()):
         if getattr(self, "_lock", None) is not None:
             raise TypeError("a KnownSet is initialised once")
-        self._lock = threading.RLock()
-        self._forms = set(forms)
+        items = list(forms)  # read first: a raise leaves the object uninitialised
+        self._forms = set(items)
         self._version = 0
         self._built = None
+        self._lock = threading.RLock()  # set last: it marks the object as initialised
 
     @property
     def version(self):
@@ -425,54 +430,80 @@ class KnownSet:
             self._built = built
             return True
 
-    def _change(self, name, *args):
-        with self._lock:
-            try:
-                return getattr(self._forms, name)(*args)
-            finally:
-                self._version += 1  # AFTER the content changed, under the lock
-
     @staticmethod
-    def _plain(other):
-        return frozenset(other) if isinstance(other, KnownSet) else other
+    def _read(arg):
+        """The argument as a list, read outside the lock; a raise half-way gives what was read and the error."""
+        items = []
+        try:
+            for x in arg:
+                items.append(x)
+        except BaseException as exc:  # applied below, then raised again
+            return items, exc
+        return items, None
 
-    def add(self, *args):
-        return self._change("add", *args)
-
-    def update(self, *args):
-        return self._change("update", *[self._plain(a) for a in args])
-
-    def discard(self, *args):
-        return self._change("discard", *args)
-
-    def remove(self, *args):
+    def _bulk(self, name, args):
+        reads = [self._read(a) for a in args]  # BEFORE the lock
+        err = next((e for _, e in reads if e is not None), None)
         with self._lock:
-            if args and args[0] not in self._forms:
-                raise KeyError(args[0])  # nothing changed: no bump
-            return self._change("remove", *args)
+            before = frozenset(self._forms)
+            try:
+                getattr(self._forms, name)(*[r for r, _ in reads])
+            finally:
+                if self._forms != before:
+                    self._version += 1  # AFTER the content changed, under the lock
+        if err is not None:
+            raise err
 
-    def pop(self, *args):
+    def add(self, item):
+        with self._lock:
+            if item not in self._forms:
+                self._forms.add(item)
+                self._version += 1
+
+    def discard(self, item):
+        with self._lock:
+            if item in self._forms:
+                self._forms.discard(item)
+                self._version += 1
+
+    def remove(self, item):
+        with self._lock:
+            if item not in self._forms:
+                raise KeyError(item)  # nothing changed: no bump
+            self._forms.remove(item)
+            self._version += 1
+
+    def pop(self):
         with self._lock:
             if not self._forms:
                 raise KeyError("pop from an empty set")  # nothing changed: no bump
-            return self._change("pop", *args)
+            item = self._forms.pop()
+            self._version += 1
+            return item
 
-    def clear(self, *args):
-        return self._change("clear", *args)
+    def clear(self):
+        with self._lock:
+            if self._forms:
+                self._forms.clear()
+                self._version += 1
+
+    def update(self, *args):
+        self._bulk("update", args)
 
     def difference_update(self, *args):
-        return self._change("difference_update", *[self._plain(a) for a in args])
+        self._bulk("difference_update", args)
 
     def intersection_update(self, *args):
-        return self._change("intersection_update", *[self._plain(a) for a in args])
+        self._bulk("intersection_update", args)
 
     def symmetric_difference_update(self, *args):
-        return self._change("symmetric_difference_update", *[self._plain(a) for a in args])
+        self._bulk("symmetric_difference_update", args)
 
     def _inplace(self, name, other):
         if not isinstance(other, (set, frozenset, KnownSet)):
             return NotImplemented
-        self._change(name, self._plain(other))
+        self._bulk({"__ior__": "update", "__iand__": "intersection_update", "__isub__": "difference_update",
+                    "__ixor__": "symmetric_difference_update"}[name], (other,))
         return self
 
     def __ior__(self, other):
@@ -492,30 +523,38 @@ class KnownSet:
             return iter(frozenset(self._forms))  # ONE C-level copy: a set changed during a scrub never raises
 
     def __len__(self):
-        return len(self._forms)
+        with self._lock:
+            return len(self._forms)
 
     def __contains__(self, item):
-        return item in self._forms
+        with self._lock:
+            return item in self._forms
 
     def __bool__(self):
-        return bool(self._forms)
+        with self._lock:
+            return bool(self._forms)
 
     def __eq__(self, other):
         if not isinstance(other, (set, frozenset, KnownSet)):
             return NotImplemented
-        with self._lock:
-            return frozenset(self._forms) == frozenset(other)
+        mine = frozenset(self)
+        return mine == frozenset(other)
 
     def __ne__(self, other):
         r = self.__eq__(other)
         return r if r is NotImplemented else not r
 
     def __repr__(self):
-        return "KnownSet(%d forms)" % len(self._forms)  # never the forms
+        return "KnownSet(%d forms)" % len(self)  # never the forms
 
     def __reduce__(self):
-        with self._lock:
-            return (KnownSet, (tuple(self._forms),))  # a lock is not picklable: the state is the forms
+        raise TypeError("a KnownSet is not pickled")
+
+    def __reduce_ex__(self, protocol):
+        raise TypeError("a KnownSet is not pickled")
+
+    def copy(self):
+        return KnownSet(self)
 
     def __copy__(self):
         return KnownSet(self)
