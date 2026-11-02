@@ -45,6 +45,29 @@ if "12:30:45" not in text or '"n1"' not in text:
     sys.exit("a clock time or a name was changed: " + text)
 """
 
+U11_CUT_CHECKER = r"""
+import importlib.util, json, sys
+spec = importlib.util.spec_from_file_location("launcher_u11cut", sys.argv[1] + "/cloud/launcher/cloud_worker.py")
+lib = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(lib)
+for address, fragment in (("10.99.88.77", "10.99.8"), ("fd00:abcd::1", "fd00:ab")):
+    message = "x " * 83 + " " + address + " Insufficient cpu"
+    assert ("FailedScheduling c-6152: " + message).index(address) == 192
+    class K:
+        def list_nodes(self):
+            return []
+        def list_pods_all(self):
+            return []
+        def list_events(self):
+            return [{"reason": "FailedScheduling", "involvedObject": {"name": "c-6152"}, "message": message}]
+        def scrub(self, text, limit=300):
+            return lib.scrub(text, set(), limit)
+    text = json.dumps(lib.Launcher.capacity(type("L", (), {"kube": K()})(), None))
+    if fragment in text:
+        sys.exit("part of an address reached the block: " + text)
+"""
+
+
 CHECKER = r"""
 WRITE_VERBS = ("create", "patch", "apply", "delete", "annotate", "replace", "edit")
 import ast, importlib.util, re, sys
@@ -477,6 +500,46 @@ def build():
                     self.assertEqual(text.count(old), 1, "the mutant's text is not in the copy: " + old)
                     (Path(tmp) / rel).write_text(text.replace(old, new))
                 done = subprocess.run([sys.executable, "-c", U11_CHECKER, tmp], capture_output=True, text=True, timeout=60,
+                                      env=dict(os.environ, PYTHONPATH=tmp + "/bin"))
+            return done.returncode, done.stderr
+
+        # -- U11 (PC-10), the cut: an address that starts at character 192 of the printed line (counted from its first character, `FailedScheduling <pod>: ` included)
+        def u11_cut_block(self, address):
+            message = "x " * 83 + " " + address + " Insufficient cpu"
+            self.assertEqual(("FailedScheduling c-6152: " + message).index(address), 192)
+            self.set_cluster(FakeKube(nodes=[node(n, "4") for n in ("n1", "n2", "n3", "n4")], events=(dict(EVENT, message=message),)))
+            code, out, err = self.launch_with("--cloud")
+            return self.block(err)
+
+        def test_u11_an_ipv4_straddling_the_cut_is_masked_whole(self):
+            block = self.u11_cut_block(V4)
+            self.assertEqual((block.count("10.99.8"), block.count("[address]")), (0, 1), "part of an address reached the block: " + block)
+
+        def test_u11_an_ipv6_straddling_the_cut_is_masked_whole(self):
+            block = self.u11_cut_block(V6)
+            self.assertEqual((block.count("fd00:ab"), block.count("[address]")), (0, 1), "part of an address reached the block: " + block)
+
+        def test_u11_the_cut_control_passes_and_a_mutant_masking_after_the_cut_fails_with_the_text(self):
+            code, err = self.scratch_cut()
+            self.assertEqual((code, err), (0, ""))
+            code, err = self.scratch_cut(("cloud/launcher/cloud_worker.py", '_mask_addresses(last.get("message") or "")', 'last.get("message") or ""'))
+            self.assertEqual(code, 1, err)
+            self.assertIn("part of an address reached the block", err)
+
+        def scratch_cut(self, mutate=None):
+            import shutil, subprocess, tempfile
+            root = Path(__file__).resolve().parents[2]
+            with tempfile.TemporaryDirectory(prefix="u11cut-") as tmp:
+                for src in sorted((root / "cloud" / "launcher").glob("*.py")) + [root / "bin" / "path_walk.py"]:
+                    rel = src.relative_to(root)
+                    (Path(tmp) / rel).parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy(src, Path(tmp) / rel)
+                if mutate:
+                    rel, old, new = mutate
+                    text = (Path(tmp) / rel).read_text()
+                    self.assertEqual(text.count(old), 1, "the mutant's text is not in the copy: " + old)
+                    (Path(tmp) / rel).write_text(text.replace(old, new))
+                done = subprocess.run([sys.executable, "-c", U11_CUT_CHECKER, tmp], capture_output=True, text=True, timeout=60,
                                       env=dict(os.environ, PYTHONPATH=tmp + "/bin"))
             return done.returncode, done.stderr
 
