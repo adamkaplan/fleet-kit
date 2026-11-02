@@ -42118,6 +42118,7 @@ class TestLaunchRefusedMessage(TestLaunchMemoryGate):
             ' > getattr(args, "headless", Fals|raise LaunchError("--headless opens no t': (B + ["--headless"], []),
             ' > (args.name or "").startswith(L|raise LaunchError("names starting %r are': (["launch", sb.LANE_NAME_PREFIX + "x"] + B[2:], []),
             ' > problem|raise LaunchError(problem)': (B, [P("launch_agent_problem", return_value="the agent is not known")]),
+            ' > getattr(args, "role", None) == > problem|return EXIT_USAGE': (B + ["--role", "tester"], [P("load_module", side_effect=lambda name, _real=sb.load_module: types.SimpleNamespace(line_for=lambda agent, root: "fleet-switchboard: launch: --role tester needs an agent: x is not one") if name == "tester_agent" else _real(name))]),
             ' > mismatch|return EXIT_USAGE': (B, [P("launch_brief_mismatch", return_value="the brief names another issue")]),
             ' > args.new_workspace > args.workspace|raise LaunchError("--new-workspace makes': (B + ["--new-workspace", "lab"], []),
             ' > args.new_workspace > problems|raise LaunchError("; ".join(problems))': (newws, [P("launch_problems", return_value=["p1", "p2"])]),
@@ -67367,6 +67368,7 @@ _changed_file_pages.HOST = sys.modules[__name__]
 TestWholeReadOfALargePullRequest = _changed_file_pages.load()
 
 _lm = importlib.import_module("test_launch_model"); _lm.HOST = sys.modules[__name__]; TestLaunchModel = _lm.build(); TestLaunchModelCloud = _lm.build_cloud()   # #1642
+_ta = importlib.import_module("test_tester_agent"); _ta.HOST = sys.modules[__name__]; TestTesterAgentLaunch, TestTesterAgentMutants = _ta.build()   # #1963
 TestPlanningDecision, TestConcurrencyGroup, TestGateLegs, TestGatePass, TestPlatformPaths, TestMacDocs = (_ml := importlib.import_module("test_mac_legs")).TestPlanningDecision, _ml.TestConcurrencyGroup, _ml.TestGateLegs, _ml.TestGatePass, _ml.TestPlatformPaths, _ml.TestDocs
 
 class TestTheArchitectureTestIsRun(unittest.TestCase):
