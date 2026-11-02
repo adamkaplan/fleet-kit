@@ -67367,6 +67367,7 @@ _changed_file_pages.HOST = sys.modules[__name__]
 TestWholeReadOfALargePullRequest = _changed_file_pages.load()
 
 _lm = importlib.import_module("test_launch_model"); _lm.HOST = sys.modules[__name__]; TestLaunchModel = _lm.build(); TestLaunchModelCloud = _lm.build_cloud()   # #1642
+TestNewTestChecksRules, TestNewTestChecksFiles, TestNewTestChecksInPreflightPr, TestNewTestChecksInCloudPreflight, TestNewTestChecksMutants, TestNewTestChecksDocs = (_ntc := importlib.import_module("test_new_test_checks")).TestNewTestChecksRules, _ntc.TestNewTestChecksFiles, _ntc.TestNewTestChecksInPreflightPr, _ntc.TestNewTestChecksInCloudPreflight, _ntc.TestNewTestChecksMutants, _ntc.TestNewTestChecksDocs   # #1967
 TestPlanningDecision, TestConcurrencyGroup, TestGateLegs, TestGatePass, TestPlatformPaths, TestMacDocs = (_ml := importlib.import_module("test_mac_legs")).TestPlanningDecision, _ml.TestConcurrencyGroup, _ml.TestGateLegs, _ml.TestGatePass, _ml.TestPlatformPaths, _ml.TestDocs
 
 class TestTheArchitectureTestIsRun(unittest.TestCase):
