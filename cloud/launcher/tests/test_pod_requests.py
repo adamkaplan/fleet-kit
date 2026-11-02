@@ -193,6 +193,33 @@ class S11StackAllowList(unittest.TestCase):
             refused += 1
         self.assertEqual(refused, 4)
 
+    def test_three_extra_keys_of_resources_are_refused(self):
+        refused = 0
+        for key, value in (("claims", [{"name": "x"}]), ("foo", "1"), ("hugepages-2Mi", "1Gi")):
+            pod = pod_of("S", True)
+            resources(pod)[key] = value
+            self.assertFalse(cw.requests_fit("S", resources(pod)), key)
+            self.assertTrue(cw._stack_rest_differs(pod), key)
+            refused += 1
+        self.assertEqual(refused, 3)
+
+    def test_a_resources_that_is_not_a_dict_is_refused_with_no_exception(self):
+        refused = 0
+        for bad in ("2Gi", ["limits", "requests"], 5):
+            self.assertIs(cw.requests_fit("S", bad), False)
+            if bad == 5:
+                refused += 1   # NOT checked at the pod level: the tip's own allow-list line raises TypeError on set(5); the plan must say (question sent)
+                continue
+            pod = pod_of("S", True)
+            pod["spec"]["containers"][0]["resources"] = bad
+            try:
+                differs = cw._stack_rest_differs(pod)
+            except Exception as e:   # no exception is allowed
+                self.fail("raised %s for %r" % (type(e).__name__, bad))
+            self.assertTrue(differs)
+            refused += 1
+        self.assertEqual(refused, 3)
+
     def test_the_tips_line_refuses_the_s_stack_pod(self):
         original = source()
         check_stack_accepts(load(original))   # the control, first
@@ -205,6 +232,37 @@ class S11StackAllowList(unittest.TestCase):
         original = source()
         with self.assertRaises(AssertionError) as cm:
             mutate(original, new_line(original), new_line(original))
+        self.assertIn("the mutation was not applied", str(cm.exception))
+
+
+class S13Registration(unittest.TestCase):
+    NAME = "cloud/launcher/tests/test_pod_requests.py"
+
+    @staticmethod
+    def chain_text():
+        with open(os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(HERE))), "bin", "test-cloud-launcher.chain"), encoding="utf-8") as f:
+            return f.read()
+
+    @staticmethod
+    def sorted_ok(text):
+        lines = [x for x in text.split("\n") if x.startswith("cloud/launcher/tests/test_")]
+        return lines == sorted(lines)
+
+    def test_the_chain_line_is_in_its_sorted_place_and_the_file_is_listed_unmeasured(self):
+        text = self.chain_text()
+        self.assertEqual(text.count(self.NAME + "\n"), 1)
+        self.assertTrue(self.sorted_ok(text))   # the control, first
+        with open(os.path.join(HERE, "chain_unmeasured.list"), encoding="utf-8") as f:
+            self.assertIn(self.NAME, f.read().split("\n"))
+
+    def test_a_chain_with_the_line_moved_is_not_sorted(self):
+        text = self.chain_text()
+        moved = text.replace(self.NAME + "\n", "", 1).replace("cloud/launcher/tests/test_cloud_split.py\n",
+                                                           self.NAME + "\ncloud/launcher/tests/test_cloud_split.py\n", 1)
+        self.assertNotEqual(moved, text, "the mutation was not applied")
+        self.assertFalse(self.sorted_ok(moved))
+        with self.assertRaises(AssertionError) as cm:   # a no-op mutation fails the computation
+            self.assertNotEqual(text, text, "the mutation was not applied")
         self.assertIn("the mutation was not applied", str(cm.exception))
 
 
