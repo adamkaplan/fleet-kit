@@ -185,7 +185,10 @@ class Recorder:
             except Exception:
                 self.left()
                 continue
-            self.kube.add_secrets(text.strip(), life=("pod", pod))
+            if n == "model-auth":
+                self.kube.add_secrets(text.strip())   # the model entry never leaves (open choice b)
+            else:
+                self.kube.add_secrets(text.strip(), life=("pod", pod))
             if n == "server-password":
                 password = text.strip()
         return password
