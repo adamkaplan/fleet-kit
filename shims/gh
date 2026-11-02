@@ -3086,7 +3086,8 @@ def body_text_of_file(path):
     except OSError as err:
         raise BodyRefusal("the new body file cannot be opened (%s), so it cannot be checked and nothing was written" % type(err).__name__)
     try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
+        kind_bits = os.fstat(fd).st_mode
+        if not stat.S_ISREG(kind_bits):
             raise BodyRefusal("the new body file %s is not a regular file, so it cannot be checked and nothing was written" % _clean_reason(path, 60))
         with os.fdopen(fd, "rb", closefd=False) as handle:
             return handle.read().decode("utf-8")
