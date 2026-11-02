@@ -1114,6 +1114,61 @@ class U2Fixture(unittest.TestCase):
         print("U2: forms %d of %d, set equal" % (len(derived), len(FORMS_FIXTURE)))
 
 
+def removing_check(cls):
+    """The six operations that remove forms, given an argument iterator that raises after its first form, change nothing."""
+    def boom():
+        yield "aaaaaaaa1"
+        raise RuntimeError("the iterator stopped")
+    calls = (("intersection_update", lambda k: k.intersection_update(boom())), ("difference_update", lambda k: k.difference_update(boom())),
+             ("symmetric_difference_update", lambda k: k.symmetric_difference_update(boom())),
+             ("__iand__", lambda k: k.__iand__(Raising())), ("__isub__", lambda k: k.__isub__(Raising())), ("__ixor__", lambda k: k.__ixor__(Raising())))
+    kept = 0
+    for name, call in calls:
+        k = cls(["aaaaaaaa1", "bbbbbbbb2"])
+        v = k.version
+        try:
+            call(k)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("the iterator did not raise")
+        if k != {"aaaaaaaa1", "bbbbbbbb2"} or k.version != v:
+            raise AssertionError("a half-read argument changed the set or the version: %s" % name)
+        kept += 1
+    return kept
+
+
+class Raising(set):
+    """A set whose iteration yields one form and raises (the in-place operators accept a set)."""
+    def __iter__(self):
+        yield "aaaaaaaa1"
+        raise RuntimeError("the iterator stopped")
+
+
+def removing_mutant():
+    """KnownSet with the early raise removed (the half-read behaviour restored); applied is computed from the two texts."""
+    src = inspect.getsource(cw.KnownSet)
+    old = '        if err is not None and name in ("difference_update", "intersection_update", "symmetric_difference_update"):\n'
+    assert src.count(old) == 1, "the mutation text must occur once"
+    msrc = src.replace(old, '        if False:\n')
+    assert msrc != src and old in src and old not in msrc, "the mutation was not applied"
+    ns = dict(vars(cw))
+    exec(compile(msrc, "<mutant-removing>", "exec"), ns)
+    return ns["KnownSet"]
+
+
+class S20Removing(unittest.TestCase):
+    def test_S20_removing_operations_read_first(self):
+        self.assertEqual(removing_check(cw.KnownSet), 6)
+        mut = removing_mutant()
+        with self.assertRaisesRegex(AssertionError, "a half-read argument changed the set or the version"):
+            removing_check(mut)
+        with self.assertRaisesRegex(AssertionError, "the mutation was not applied"):
+            src = "x"
+            assert src.replace("y", "z") != src, "the mutation was not applied"
+        print("S20 removing operations with a raising iterator leave the set and the version unchanged 3 of 3; in-place operators 3 of 3; mutant fails with 'a half-read argument changed the set or the version'")
+
+
 class S20VersionRule(unittest.TestCase):
     def test_S20_version_rule_equality_and_kube(self):
         self.assertEqual(bump_check(cw.KnownSet), 13)
