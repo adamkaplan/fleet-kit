@@ -224,16 +224,17 @@ def build(PR4Base):
             return [(stored[i["id"]], which) for i, which in made]
 
         def status_and_real(self, add_row, base=1_800_000_000):
-            """(the status count, the count by reminder_bound on the REAL stored items), per lane, raw. Each reminder is delivered 1 minute past its own bound."""
+            """(the status count, the count by reminder_bound on the REAL stored items), per lane, raw. Items 0, 2 and 4 are delivered 1 minute past their own
+            bound, items 1 and 3 one minute INSIDE it."""
             import json
             items, rows, real = self.writers_store(base), [], {}
-            for item, which in items:
+            for number, (item, which) in enumerate(items):
                 bound = sb.reminder_bound({}, item)
                 self.assertEqual(bound, 300 if which else (300 if "while_running" in item.get("condition", {}) else 600))   # a checkpoint kind 5 minutes, the others 10
                 rows.append(add_row(self, item, which, base))
-                delivered = item["at"] + bound + 60
+                delivered = item["at"] + bound + (60 if number % 2 == 0 else -60)
                 rows.append({"ts": sb.iso(delivered), "event": "v2.synthetic", "subject": item["to"], "detail": {"keys": ["reminder:" + item["id"]]}})
-                real[item["to"]] = real.get(item["to"], 0) + (1 if delivered - item["at"] > bound else 0)
+                real[item["to"]] = real.get(item["to"], 0) + (1 if delivered - item["at"] > bound else 0)   # only the late ones
             import tempfile
             with tempfile.TemporaryDirectory() as tmp:
                 with open(tmp + "/audit.jsonl", "w") as handle:
@@ -242,7 +243,7 @@ def build(PR4Base):
 
         def test_s17_the_status_count_agrees_with_reminder_bound_for_every_real_writer(self):
             status, real = self.status_and_real(type(self).add_row)
-            self.assertEqual(status, {"w-launch": 3, "boss": 2}, msg="control: the expected lanes")
+            self.assertEqual(status, {"w-launch": 2, "boss": 1}, msg="control: the late ones only (w-launch: items 0 and 2 late, 3 on time; boss: item 4 late, 1 on time)")
             self.assertEqual(status, real, msg="the status count diverged from reminder_bound")
 
         def test_s17_a_writer_that_forgets_the_for_makes_the_two_counts_diverge(self):
