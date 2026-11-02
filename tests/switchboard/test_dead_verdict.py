@@ -207,7 +207,7 @@ class TestSharesDeadVerdict(unittest.TestCase):
         sections = [s for s in text.split("\n## ")[1:] if "shows_dead" in s]
         self.assertEqual(len(sections), 1)
         s = sections[0]
-        for needle in ("one function", "no_pane_to_judge", "pane_state", "missing-pass", "U6", "not met as written"):
+        for needle in ("one function", "no_pane_to_judge", "pane_state", "missing-pass", "U6", "Changed cases"):
             self.assertIn(needle, s)
 
 
