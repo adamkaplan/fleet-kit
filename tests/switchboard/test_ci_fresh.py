@@ -428,7 +428,7 @@ class TestCiFreshReads(FreshCase):
             def pop(self, *a):
                 super().pop(*a[:1], None)
                 if len(a) < 2:
-                    raise KeyError(a[0])
+                    raise KeyError("S15-POPGONE the eviction pop found its key gone: %r" % (a[0],))
                 return super().pop(*a)
 
         self.assertEqual(mod.read_behind(CountingGh(behind=3), "acme/app", OLD, TIP, Evicted()), 3, "the count answers when the stored key is gone")
@@ -474,7 +474,7 @@ class TestCiFreshReads(FreshCase):
     def test_s15_the_mutant_with_the_pop_without_a_default_is_caught(self):
         self.s15_atomic_check(_copy_of(pr_reading, self.POP, None, "pr_reading_s15_pop_control"))   # control first
         mod = _copy_of(pr_reading, self.POP, "_seen.pop(next(iter(list(_seen)), None))", "pr_reading_s15_popgone")
-        with self.assertRaises(KeyError):
+        with self.assertRaisesRegex(KeyError, "S15-POPGONE the eviction pop found its key gone"):
             self.s15_atomic_check(mod)
 
     def test_s15_the_mutant_with_the_old_iteration_is_caught(self):
@@ -498,7 +498,7 @@ class TestCiFreshReads(FreshCase):
     def test_s14_300_pairs_the_memory_holds_256_and_a_dropped_pair_costs_one_get(self):
         self.s14_memory_check(pr_reading)
 
-    MEM = "        if len(_seen) >= 256: _seen.pop(next(iter(list(_seen)), None), None)\n"
+    MEM = "        while len(_seen) >= 256: _seen.pop(next(iter(list(_seen)), None), None)\n"
 
     def test_s14_the_control_the_unmutated_copy_bounds_its_memory(self):
         self.s14_memory_check(_copy_of(pr_reading, self.MEM, None, "pr_reading_s14_mem_control"))
@@ -507,6 +507,53 @@ class TestCiFreshReads(FreshCase):
         mod = _copy_of(pr_reading, self.MEM, "", "pr_reading_s14_mem")
         with self.assertRaisesRegex(AssertionError, "the memory holds at most 256 pairs"):
             self.s14_memory_check(mod)
+
+    MEM_WHILE = "        while len(_seen) >= 256: _seen.pop(next(iter(list(_seen)), None), None)\n"
+
+    def s14_threads_check(self, mod, seen=None):
+        """8 threads, 500 distinct pairs each (4000 = more than 10 times the bound); returns the final size of the memory."""
+        import threading
+        seen = mod.read_behind.__defaults__[0] if seen is None else seen
+        seen.clear()
+        wrong = []
+
+        def work(t):
+            gh = CountingGh(behind=t + 1)
+            for i in range(500):
+                if mod.read_behind(gh, "acme/app", "%040d" % (t * 1000 + i), TIP, seen) != t + 1:
+                    wrong.append((t, i))
+        threads = [threading.Thread(target=work, args=(t,)) for t in range(8)]
+        for th in threads:
+            th.start()
+        for th in threads:
+            th.join()
+        self.assertEqual(wrong, [], "every answer is the right count")
+        self.assertLessEqual(len(seen), 264, "the memory of read_behind grew to %d entries under 8 threads where at most 264 are allowed" % len(seen))
+        return len(seen)
+
+    def test_s14_8_threads_4000_pairs_the_memory_stays_within_256_plus_7(self):
+        # each thread inserts once after its own check: at most 7 entries over the bound remain
+        self.s14_threads_check(pr_reading, {})
+
+    def test_s14_the_mutant_with_the_if_form_grows_under_8_threads(self):
+        import threading
+        self.s14_threads_check(_copy_of(pr_reading, self.MEM_WHILE, None, "pr_reading_s14_thr_control"), {})   # control first
+        mod = _copy_of(pr_reading, self.MEM_WHILE, self.MEM_WHILE.replace("while", "if"), "pr_reading_s14_thr_if")
+        barrier = threading.Barrier(8)
+
+        class Meet(dict):     # every thread's first pop of a round waits for the others: all pick the same oldest key
+            def pop(self, *a):
+                try:
+                    barrier.wait(timeout=2)
+                except threading.BrokenBarrierError:
+                    pass
+                return super().pop(*a)
+        seen = Meet()
+        with self.assertRaisesRegex(AssertionError, "the memory of read_behind grew to [0-9]+ entries under 8 threads where at most 264 are allowed"):
+            try:
+                self.s14_threads_check(mod, seen)
+            finally:
+                print("MEASURED the if-form mutant grew to %d entries (bound 256, allowed 264)" % len(seen))
 
     BEHIND_OLD = "if not isinstance(n, int): raise"
 
