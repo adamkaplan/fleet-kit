@@ -124,7 +124,7 @@ default output and the hashes are unchanged. `fleet-switchboard plan template <o
 <scenario id>: ...` line each, the source (for a comment, its id and author: the latest `Plan (scenarios)` comment counts
 whoever wrote it) and **two hashes**. The **scenario hash** is sha256 of the canonical scenario block plus the clause list
 (sorted by id, whitespace collapsed, comments and quoting ignored). The **plan hash** is sha256 of the whole plan text,
-whitespace collapsed. **Approval (G0c) and consensus (G0b) bind to the plan hash**: editing constraints, scope or risks
+with its line structure kept (what stays ignored is named below). **Approval (G0c) and consensus (G0b) bind to the plan hash**: editing constraints, scope or risks
 changes it, as editing a scenario does; the scenario hash only says the scenarios are unchanged. The text output groups defects by kind with counts (`vague-pass x17`, then up to five lines of each kind; `--json` has them all). Exit 0 pass, 1 fail, 2 unreadable (no block, a malformed block, a
 tab in the indentation, too large, GitHub unreadable). It only reads (GET); it never writes GitHub. `--ask` or
 `--done-when` supply the Done-when when the plan issue has none of its own.
@@ -132,7 +132,7 @@ tab in the indentation, too large, GitHub unreadable). It only reads (GET); it n
 
 #### The plan hash and the trailing marker (#1713)
 
-The plan hash covers the whole plan text with whitespace collapsed and **one trailing marker line removed**: the last non-blank line, only when it is exactly `<!-- fleet-switchboard:from=<name> -->` (the line `gh issue comment` adds). A marker line anywhere else is plan text and counts, and any other edit of the text changes the hash, so a plan posted plainly and the same words edited in place have one hash. A binding made at the old hash of a marker-bearing comment (an approval, a proof, a verdict, a consensus, an ask record, a review round) stays valid: `plan check` prints the new hash, the old formula's value is read as the same plan (`plan_check.plan_hashes`), and the ledger is never rewritten. A binding of an older revision of the text stays stale. After a rollback of this change, a binding made at the new hash reads as stale until the plan is edited.
+The plan hash covers the whole plan text with its line structure kept and **one trailing marker line removed**: the last non-blank line, only when it is exactly `<!-- fleet-switchboard:from=<name> -->` (the line `gh issue comment` adds). A marker line anywhere else is plan text and counts, and any other edit of the text changes the hash, so a plan posted plainly and the same words edited in place have one hash. A binding made at the old hash of a marker-bearing comment (an approval, a proof, a verdict, a consensus, an ask record, a review round) stays valid: `plan check` prints the new hash, the old formula's value is read as the same plan (`plan_check.plan_hashes`), and the ledger is never rewritten. A binding of an older revision of the text stays stale. After a rollback of this change, a binding made at the new hash reads as stale until the plan is edited.
 
 #### What the plan hash ignores (#1834)
 
