@@ -20,8 +20,15 @@ def mark_problems(text):
     if len(deps) != 1:
         return ["no single cloud-hub Deployment"]
     ann = deps[0]["spec"]["template"]["metadata"].get("annotations", {})
-    if ann != {KEY: "false"}:
-        bad.append("template annotations are %r" % (ann,))
+    if KEY not in ann:
+        if KEY in deps[0]["metadata"].get("annotations", {}):
+            bad.append("the mark is not in the pod template")
+        else:
+            bad.append("the mark is missing")
+    elif ann[KEY] != "false":
+        bad.append("the mark value is not the string false")
+    elif ann != {KEY: "false"}:
+        bad.append("template annotations carry more than the mark: %r" % (ann,))
     for d in docs:
         if d is deps[0]:
             continue
@@ -30,6 +37,18 @@ def mark_problems(text):
     if KEY in deps[0]["metadata"].get("annotations", {}):
         bad.append("the Deployment's own metadata carries the key")
     return bad
+
+
+def check_mutant(tc, name, original, mutated, fragment, check, anchor):
+    """Control passes first; the mutation is applied exactly once; the failure names the mutated check."""
+    tc.assertEqual(check(original), [], "control: the unmutated copy must pass")
+    tc.assertNotEqual(mutated, original)
+    applied = mutated != original and original.count(fragment) == 1
+    tc.assertTrue(applied, "mutation not applied exactly once")
+    problems = check(mutated)
+    tc.assertTrue(any(anchor in p for p in problems), "no problem says %r; got %r" % (anchor, problems))
+    print("%s: control clean, fragment seen %d time(s) in the original, %d problem(s), anchored on %r"
+          % (name, original.count(fragment), len(problems), anchor))
 
 
 def read(path):
@@ -91,7 +110,7 @@ def doc_problems(par):
         if phrase not in par:
             bad.append("missing: " + phrase)
     if re.search(r"\bis a fix\b|\bthe fix\b|\bfixes the outage", low):
-        bad.append("calls it a fix")
+        bad.append("the documentation calls the mark a fix of the outage")
     return bad
 
 
@@ -123,20 +142,25 @@ class T(unittest.TestCase):
         self.assertEqual(dep["spec"]["template"]["metadata"]["labels"], r["spec"]["template"]["metadata"]["labels"])
 
     def test_mutant_dropped_fails(self):
+        frag = '"annotations": {\n'
         mutated = mark_lines_removed(self.text)
-        self.assertNotEqual(mutated, self.text)
-        self.assertNotEqual(mark_problems(mutated), [])
+        check_mutant(self, "dropped", self.text, mutated, frag, mark_problems, "the mark is missing")
 
     def test_mutant_true_fails(self):
-        mutated = self.text.replace('"%s": "false"' % KEY, '"%s": "true"' % KEY)
-        self.assertNotEqual(mutated, self.text)
-        self.assertNotEqual(mark_problems(mutated), [])
+        frag = '"%s": "false"' % KEY
+        mutated = self.text.replace(frag, '"%s": "true"' % KEY)
+        check_mutant(self, "true", self.text, mutated, frag, mark_problems, "the mark value is not the string false")
 
     def test_mutant_on_deployment_metadata_fails(self):
+        self.assertEqual(mark_problems(self.text), [])
         docs = parse(self.text)
         d = [x for x in docs if x["kind"] == "Deployment"][0]
+        del d["spec"]["template"]["metadata"]["annotations"]
         d["metadata"]["annotations"] = {KEY: "false"}
-        self.assertNotEqual(mark_problems("---\n".join(json.dumps(x) for x in docs)), [])
+        problems = mark_problems("---\n".join(json.dumps(x) for x in docs))
+        anchor = "the mark is not in the pod template"
+        self.assertIn(anchor, problems)
+        print("on_deployment_metadata: control clean, %d problem(s), anchored on %r" % (len(problems), anchor))
 
 
 class Docs(unittest.TestCase):
@@ -146,7 +170,7 @@ class Docs(unittest.TestCase):
     def test_paragraph_found(self):
         self.assertTrue(self.par)
 
-    def test_the_seven_sentences(self):
+    def test_the_documentation_names_every_required_phrase(self):
         ss = sentences(self.par)
         wanted = [
             "administrator's step", "launcher's own account cannot change a Deployment",
@@ -162,6 +186,7 @@ class Docs(unittest.TestCase):
         ]
         for w in wanted:
             self.assertTrue(any(w in s for s in ss), w)
+        print("required phrases found: %d of %d" % (sum(any(w in s for s in ss) for w in wanted), len(wanted)))
 
     def test_three_phrases(self):
         self.assertEqual(doc_problems(self.par), [])
@@ -170,13 +195,19 @@ class Docs(unittest.TestCase):
         self.assertEqual(len(re.findall(r"kubectl[^`]*\bapply\b[^`]*cloud-hub\.yaml", self.par)), 0)
 
     def test_mutant_whole_file_apply_fails(self):
-        m = self.par + " Run `kubectl apply -f cloud/k8s/cloud-hub.yaml`."
-        self.assertNotEqual(doc_problems(m), [])
+        frag = " Run `kubectl apply -f cloud/k8s/cloud-hub.yaml`."
+        m = self.par + frag
+        self.assertEqual(self.par.count(frag), 0)
+        self.assertEqual(doc_problems(self.par), [])
+        problems = doc_problems(m)
+        anchor = "gives an apply of the whole file"
+        self.assertIn(anchor, problems)
+        print("whole_file_apply: control clean, %d problem(s), anchored on %r" % (len(problems), anchor))
 
     def test_mutant_fix_fails(self):
-        m = self.par.replace("it is not a fix of the outage", "it is a fix")
-        self.assertNotEqual(m, self.par)
-        self.assertNotEqual(doc_problems(m), [])
+        frag = "it is not a fix of the outage"
+        m = self.par.replace(frag, "it is a fix")
+        check_mutant(self, "fix", self.par, m, frag, doc_problems, "the documentation calls the mark a fix of the outage")
 
     def test_by_hand_wording_is_exact(self):
         self.assertEqual(wording_problems(self.par), [])
@@ -185,16 +216,26 @@ class Docs(unittest.TestCase):
         start = self.par.index(NEW_SENTENCE)
         end = self.par.index("a replacement pod is unmarked until the next marking.") + len("a replacement pod is unmarked until the next marking.")
         m = self.par[:start] + OLD_SENTENCE + self.par[end:]
+        self.assertEqual(wording_problems(self.par), [])
         self.assertNotEqual(m, self.par)
-        self.assertNotEqual(wording_problems(m), [])
+        self.assertEqual(self.par.count(NEW_SENTENCE), 1)
+        problems = wording_problems(m)
+        anchor = "old wording present: " + OLD_SENTENCE
+        self.assertIn(anchor, problems)
+        print("old_sentence_restored: control clean, %d problem(s), anchored on %r" % (len(problems), anchor))
 
     def test_names_what_the_mark_does_not_stop(self):
         self.assertEqual(not_stopped_missing(self.par), [])
 
     def test_mutant_spot_eviction_removed_fails(self):
-        m = self.par.replace("spot eviction", "")
+        frag = "spot eviction"
+        m = self.par.replace(frag, "")
+        self.assertEqual(not_stopped_missing(self.par), [])
         self.assertNotEqual(m, self.par)
-        self.assertNotEqual(not_stopped_missing(m), [])
+        self.assertEqual(self.par.lower().count(frag), self.par.count(frag))
+        problems = not_stopped_missing(m)
+        self.assertIn(frag, problems)
+        print("spot_eviction_removed: control clean, fragment seen %d time(s), %d problem(s), anchored on %r" % (self.par.count(frag), len(problems), frag))
 
     def test_later_whole_template_apply_sentence_once(self):
         self.assertEqual(self.par.count("a later apply of the whole template from the file would carry the mark"), 1)
