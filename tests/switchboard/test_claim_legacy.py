@@ -119,6 +119,63 @@ class TestClaimLegacy(unittest.TestCase):
                             self.checks()
                         self.assertIn(anchor, str(caught.exception), name)
 
+    def parse_count(self, module):
+        """Run the gate over three merged siblings (recorded claim, legacy with none, after the cutoff with none) with `module._measure_time` counting its calls on their merged_at; (calls, refusal)."""
+        times = [iso(self.fx.world.clock.now() + 1000), iso(CUTOFF - 86400), iso(CUTOFF + 86400 * 30)]
+        self.fx.record(100, "S2 U1")   # the first sibling has a recorded claim; the others have none
+        stamps = iter(times)
+        self.fx.merged_iso = lambda after=0: next(stamps)
+        calls = []
+        real = module._measure_time
+        def counting(value, *args, **kw):
+            if value in times:
+                calls.append(value)
+            return real(value, *args, **kw)
+        with mock.patch.object(module, "_measure_time", counting):
+            why = self.fx.refusal([("merged", "S2 U1"), ("merged", "S2 U1"), ("merged", "S2 U1")], record=False)
+        self.assertEqual(sorted(calls), sorted(times), "the merged time is parsed once for each merged sibling: 3 calls expected, %d made" % len(calls))
+        return why
+
+    def s9_check(self, module):
+        why = self.parse_count(module)
+        self.assertIsNotNone(why)
+        self.assertIn("#102", why)   # the unknown sibling (after the cutoff) raises ClaimUnknown; #100 kept its claim, #101 is legacy (no claim line)
+        self.assertNotIn("#101", why)
+        self.assertNotIn("#100", why)
+
+    def test_s9_the_merged_time_is_parsed_once_for_each_merged_sibling(self):
+        self.s9_check(self.sb)
+
+    def test_s9_the_double_parse_mutant_on_a_source_copy_is_applied_once_and_caught_by_the_call_count(self):
+        import importlib.machinery
+        import importlib.util
+        import shutil
+        import tempfile
+        from tests.switchboard.support.loader import copy_entry
+        old = "(repo, other.get(\"number\")), at=merged if merged is not None else -1)"
+        new = "(repo, other.get(\"number\")), at=_measure_time(other.get(\"merged_at\")) if _measure_time(other.get(\"merged_at\")) is not None else -1)"
+        directory = Path(tempfile.mkdtemp(prefix="legacy-parse-"))
+        self.addCleanup(shutil.rmtree, str(directory), True)
+        for module in (REPO / "bin").glob("*.py"):
+            shutil.copy(str(module), str(directory / module.name))
+        copy_entry(directory)
+        text = (directory / "fleet-switchboard").read_text()
+        self.assertEqual(text.count(old), 1, "the mutant applies exactly once")
+        for label, source in (("control", text), ("double parse", text.replace(old, new, 1))):
+            (directory / "fleet-switchboard").write_text(source)
+            loader = importlib.machinery.SourceFileLoader("sb_parse_%s_%d" % (label.replace(" ", "_"), id(directory)), str(directory / "fleet-switchboard"))
+            copy = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+            with mock.patch.object(sys, "dont_write_bytecode", True):
+                loader.exec_module(copy)
+            copy.ClaimUnknown = self.sb.ClaimUnknown
+            with mock.patch.object(self.sb, "plan_peers", copy.plan_peers):
+                if label == "control":
+                    self.s9_check(copy)
+                    continue
+                with self.assertRaises(AssertionError) as caught:
+                    self.s9_check(copy)
+                self.assertIn("the merged time is parsed once for each merged sibling: 3 calls expected, 9 made", str(caught.exception))
+
     def test_s7_the_docs_state_the_cutoff_its_reason_and_the_two_cases(self):
         docs = (REPO / "docs" / "switchboard.md").read_text()
         item = [p for p in docs.split("\n- **") if p.startswith("A sibling merged before the claim ledger")]
