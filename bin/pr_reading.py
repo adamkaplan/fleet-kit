@@ -104,13 +104,13 @@ def read_pr_runs(gh, repo, number, head):
     return out
 
 
-def read_behind(gh, repo, run_base, tip, _seen={}):
-    """`ahead_by` of the compare of a run's base with the tip: one read per pair, kept in memory (ask #1755)."""
-    if (repo, run_base, tip) not in _seen:
+def read_behind(gh, repo, run_base, tip, _seen={}):   # `ahead_by` of the compare, one read per pair kept in memory (ask #1755)
+    if (n := _seen.get(key := (repo, run_base, tip))) is None:
         n = (_json(gh, ["api", "repos/%s/compare/%s...%s" % (repo, run_base, tip)], "the commits behind") or {}).get("ahead_by")
         if not isinstance(n, int) or isinstance(n, bool) or not 0 <= n <= 1000000: raise ReadError("the commits behind were not counted")
-        _seen.pop(next(iter(_seen))) if len(_seen) >= 256 else None; _seen[(repo, run_base, tip)] = n
-    return _seen[(repo, run_base, tip)]
+        if len(_seen) >= 256: _seen.pop(next(iter(_seen), None), None)
+        _seen[key] = n
+    return n
 
 
 def read_fresh(gh, repo, number, head, base_ref):   # (run base of the earliest deciding run, tip, behind); None for what could not be read

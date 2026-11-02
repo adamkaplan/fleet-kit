@@ -401,10 +401,48 @@ class TestCiFreshReads(FreshCase):
     def test_s14_the_control_the_unmutated_copy_refuses_the_seven_and_counts_two(self):
         self.s14_count_check(_copy_of(pr_reading, self.UPPER, None, "pr_reading_s14_control"))
 
-    def test_s14_the_mutant_with_the_old_count_check_is_caught(self):
-        mod = _copy_of(pr_reading, self.UPPER, "n < 0", "pr_reading_s14_nobound")
-        with self.assertRaisesRegex(AssertionError, "a count above the bound of 1000000 or not an int is not counted"):
-            self.s14_count_check(mod)
+    def s14_one(self, mod, bad):
+        mod.read_behind.__defaults__[0].clear()
+        try:
+            mod.read_behind(CountingGh(behind=bad), "acme/app", OLD, TIP)
+        except mod.ReadError:
+            return
+        self.fail("a count above the bound of 1000000 or not an int is not counted: %r was counted" % (bad,))
+
+    def test_s14_the_mutant_with_the_old_count_check_is_caught_for_each_of_2_70_and_1000001(self):
+        for bad in (2 ** 70, 1000001):
+            control = _copy_of(pr_reading, self.UPPER, None, "pr_reading_s14_control_%d" % bad)
+            self.s14_one(control, bad)      # control first: it passes
+            mod = _copy_of(pr_reading, self.UPPER, "n < 0", "pr_reading_s14_nobound_%d" % bad)   # applied once (count == 1)
+            with self.assertRaisesRegex(AssertionError, "a count above the bound of 1000000 or not an int is not counted: %d was counted" % bad):
+                self.s14_one(mod, bad)
+
+    RETURN = "        _seen[key] = n\n    return n\n"
+
+    def s15_atomic_check(self, mod):
+        class Evicted(dict):      # the lookup of a key it just stored fails, as when another thread evicted it
+            def __getitem__(self, k):
+                raise KeyError(k)
+
+        class PopGone(dict):      # the eviction pop finds the oldest key already gone
+            def pop(self, *a):
+                super().pop(*a[:1], None)
+                if len(a) < 2:
+                    raise KeyError(a[0])
+                return super().pop(*a)
+
+        self.assertEqual(mod.read_behind(CountingGh(behind=3), "acme/app", OLD, TIP, Evicted()), 3, "the count answers when the stored key is gone")
+        full = PopGone({("r", "a%d" % i, "b"): i for i in range(256)})
+        self.assertEqual(mod.read_behind(CountingGh(behind=4), "acme/app", OLD, TIP, full), 4, "the count answers when the eviction finds its key gone")
+
+    def test_s15_the_control_the_unmutated_copy_answers_when_the_key_is_gone(self):
+        self.s15_atomic_check(_copy_of(pr_reading, self.RETURN, None, "pr_reading_s15_control"))
+        self.s15_atomic_check(pr_reading)
+
+    def test_s15_the_mutant_with_the_two_lookup_form_is_caught(self):
+        mod = _copy_of(pr_reading, self.RETURN, "        _seen[key] = n\n    return _seen[key]\n", "pr_reading_s15_twolookups")
+        with self.assertRaises(KeyError):
+            self.s15_atomic_check(mod)
 
     def s14_memory_check(self, mod):
         seen = mod.read_behind.__defaults__[0]
@@ -422,7 +460,7 @@ class TestCiFreshReads(FreshCase):
     def test_s14_300_pairs_the_memory_holds_256_and_a_dropped_pair_costs_one_get(self):
         self.s14_memory_check(pr_reading)
 
-    MEM = "_seen.pop(next(iter(_seen))) if len(_seen) >= 256 else None; "
+    MEM = "        if len(_seen) >= 256: _seen.pop(next(iter(_seen), None), None)\n"
 
     def test_s14_the_control_the_unmutated_copy_bounds_its_memory(self):
         self.s14_memory_check(_copy_of(pr_reading, self.MEM, None, "pr_reading_s14_mem_control"))
