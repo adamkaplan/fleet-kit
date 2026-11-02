@@ -322,6 +322,58 @@ def build():
                 with self.assertRaisesRegex(AssertionError, r"plan posted on #3: \S+ sha256:[0-9a-f]{64}, plan check (PASS|FAIL)"):   # the line the mutated wake announces for a plan approved at the old hash (triage_plan_open.line)
                     self.assertEqual(self.scenario(msb.triage_pass, "old"), [])
 
+        COMMENT_OLD = "any(module.approved_by_comment(plan, h, by_issue.get(number, []), signed_by_fleet) for h in hashes)"
+        SEND_OLD = "any(module.approved_by_send(plan, h, sends, signed_by_fleet) for h in hashes)"
+        ANNOUNCED = r"plan posted on #3: \S+ sha256:[0-9a-f]{64}, plan check (PASS|FAIL)"   # the line the wake produces for an announced plan (triage_plan_open.line)
+
+        def approval(self, run, form, cited):
+            """The wake over a marker-bearing plan with an approval of `form` (comment or send) citing `cited` (old, new or edited); the lines sent to orch."""
+            self.post(3, self.plan(), agent="fleet-registry")
+            body = self.comments[-1]["body"]
+            hashes = {"old": sb.plan_check.plan_hash_legacy(body), "new": sb.plan_check.plan_hash(body),
+                      "edited": sb.plan_check.plan_hash_legacy(body.replace("\n" + MARKER, "") + "\nedited")}
+            self.assertNotEqual(hashes["old"], hashes["new"])
+            full = hashes[cited].split(":")[1]
+            if form == "comment":
+                self.post(3, "Plan approved at sha256:%s" % full[:8], agent="orch", minutes_ago=1)
+            else:
+                self.send("Approved at sha256:%s" % full)
+            self.world.tick(1)
+            run(self.engine, [], self.world.clock.now(), ())
+            return self.to("orch")
+
+        def test_an_approval_comment_at_the_old_hash_is_read_as_bound_by_the_wake(self):
+            self.assertEqual(self.approval(sb.triage_pass, "comment", "old"), [], "an approval comment at the old hash is not read as bound")
+
+        def test_control_an_approval_comment_at_the_new_hash_is_read_as_bound_by_the_wake(self):
+            self.assertEqual(self.approval(sb.triage_pass, "comment", "new"), [])
+
+        def test_an_approval_comment_at_the_hash_of_an_edited_text_is_not_an_approval(self):
+            self.assertEqual(len(self.approval(sb.triage_pass, "comment", "edited")), 1)
+
+        def test_an_audited_send_at_the_old_hash_is_read_as_bound_by_the_wake(self):
+            self.assertEqual(self.approval(sb.triage_pass, "send", "old"), [], "an audited send at the old hash is not read as bound")
+
+        def test_control_an_audited_send_at_the_new_hash_is_read_as_bound_by_the_wake(self):
+            self.assertEqual(self.approval(sb.triage_pass, "send", "new"), [])
+
+        def test_an_audited_send_at_the_hash_of_an_edited_text_is_not_an_approval(self):
+            self.assertEqual(len(self.approval(sb.triage_pass, "send", "edited")), 1)
+
+        def test_a_mutant_that_gives_the_comment_finder_the_new_hash_only_fails(self):
+            self.assertEqual(self.approval(sb.triage_pass, "comment", "old"), [])   # the control: the unmutated copy passes the old-hash test
+            with tempfile.TemporaryDirectory() as tmp:
+                msb = _entry_copy(tmp, "fleet-switchboard", self.COMMENT_OLD, "module.approved_by_comment(plan, plan_hash, by_issue.get(number, []), signed_by_fleet)")
+                with self.assertRaisesRegex(AssertionError, self.ANNOUNCED):
+                    self.assertEqual(self.approval(msb.triage_pass, "comment", "old"), [])
+
+        def test_a_mutant_that_gives_the_send_finder_the_new_hash_only_fails(self):
+            self.assertEqual(self.approval(sb.triage_pass, "send", "old"), [])   # the control: the unmutated copy passes the old-hash test
+            with tempfile.TemporaryDirectory() as tmp:
+                msb = _entry_copy(tmp, "fleet-switchboard", self.SEND_OLD, "module.approved_by_send(plan, plan_hash, sends, signed_by_fleet)")
+                with self.assertRaisesRegex(AssertionError, self.ANNOUNCED):
+                    self.assertEqual(self.approval(msb.triage_pass, "send", "old"), [])
+
     only_own_tests(TestPlanHashMarkerWake)
 
     class TestPlanHashMarkerRounds(host.TestPlanReviewCommands):
