@@ -1019,8 +1019,28 @@ class TestGiveUpAndBadTs(Base):
         print("S32: the descriptor count is equal before and after 200 give-ups (%d and %d) in the control, %d temporary files; the copy that does not close its file fails 1 of 1 "
               "with the anchored text (%s), the mutation applied" % (before, after, temps, self.leak))
 
+    def check_bad_ts(self, cw=CW):
+        cleared = 0
+        for label, ts in (("10 minutes after the clock", 1000 + 600), ("missing", None), ("the word x", "x"), ("the integer 10**400", 10**400)):
+            self.setUp()
+            self.put(lines(0, 3000, 1500))
+            pend = {"cut": 5, "old_size": 9, "archive": "audit-2020-01-01.jsonl.gz", "new_id": [0, 0]}
+            if ts is not None:
+                pend["ts"] = ts
+            cw.write_rotation_record(self.audit, {"done": 0, "cuts": [], "pending": pend})
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                result, more = self.rotate(cw, now=dt.datetime.fromtimestamp(1000, dt.timezone.utc))
+            record = cw.read_rotation_record(self.audit)
+            bad = [x for x in (more + err.getvalue()).splitlines() if "was rotated" not in x]
+            if bad or record["done"] != 1:
+                raise AssertionError("a huge ts stopped the rotation: %s, done %s, errors %r" % (label, record["done"], "; ".join(bad)[:60]))
+            self.assertEqual((record["pending"], len(record["cuts"])), (None, 1))
+            cleared += 1
+        return cleared
+
     def test_bad_ts(self):
-        for label, ts in (("10 minutes after the clock", 1000 + 600), ("missing", None), ("the word x", "x")):
+        for label, ts in (("10 minutes after the clock", 1000 + 600), ("missing", None), ("the word x", "x"), ("the integer 10**400", 10**400)):
             with self.subTest(label):
                 self.setUp()
                 self.put(lines(0, 3000, 1500))
@@ -1028,12 +1048,24 @@ class TestGiveUpAndBadTs(Base):
                 if ts is not None:
                     pend["ts"] = ts
                 CW.write_rotation_record(self.audit, {"done": 0, "cuts": [], "pending": pend})
-                CW._complete_pending(self.audit, 1000)
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    CW._complete_pending(self.audit, 1000)
+                self.assertEqual(err.getvalue(), "")
                 record = CW.read_rotation_record(self.audit)
                 self.assertEqual((record["pending"], record["cuts"], record["done"]), (None, [], 0))
                 result, _ = self.rotate(now=dt.datetime.fromtimestamp(1000, dt.timezone.utc))
                 self.assertEqual(CW.read_rotation_record(self.audit)["done"], 1)
-        print("S32: 3 of 3 stale pendings (10 minutes after the clock, missing ts, ts x) cleared with no cut naming them, and the rotation ran after each (done 1)")
+        print("S32: 4 of 4 stale pendings cleared (10 minutes after the clock, missing ts, ts x, ts 10**400) with no cut naming them, 0 errors printed, and the rotation ran after each (done 1)")
+
+    def test_huge_ts_without_the_try(self):
+        self.assertEqual(self.check_bad_ts(), 4)
+        mutant = load("cw", "            except (OverflowError, ValueError):\n", "            except ZeroDivisionError:\n")
+        mutant.AUDIT_ROTATE_BYTES, mutant.AUDIT_KEEP_BYTES = CW.AUDIT_ROTATE_BYTES, CW.AUDIT_KEEP_BYTES
+        with self.assertRaises(AssertionError) as caught:
+            self.check_bad_ts(mutant)
+        self.assertIn("a huge ts stopped the rotation", str(caught.exception))
+        print("S32: the copy of the stale test without the try fails 1 of 1 with the anchored text (%s), control first, mutation applied" % str(caught.exception)[:60])
 
 
 class TestReadme(unittest.TestCase):
