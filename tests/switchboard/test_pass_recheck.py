@@ -113,6 +113,22 @@ class TestPassRecheck(Base):
         self.deliver()
         self.assertNotIn("delayed: sent", self.texts()[0].splitlines()[0], msg="a fresh plan notice carries an age line")
 
+    def test_s8_a_sweep_item_a_triage_item_and_a_plan_notice_made_ninety_minutes_ago_all_carry_the_one_mark(self):
+        self.hold(self.sweep, SWEEP_KEY, [("S1", "acme/api#1")])
+        self.hold(self.triage, TRIAGE_KEY, [("S1", "acme/api#1")])
+        self.wake.newest = {("acme/api", 3): "h1h1h1h1"}
+        for key, kind in ((SWEEP_KEY, "sweep"), (TRIAGE_KEY, "triage"), (PLAN_KEY, "plan")):
+            self.make(key, kind, age=90 * 60, summary="a %s item" % kind)
+            self.deliver()
+        marked = [t for t in self.texts() if "delayed: sent" in t.splitlines()[0]]
+        self.assertEqual(len(marked), 3, msg="not all three old items carry the mark: %r" % self.texts())
+
+    def test_s8_the_age_threshold_is_defined_once_in_bin(self):
+        import re
+        defs = [str(f) for f in Path(sb.__file__).resolve().parent.rglob("*") if f.is_file() and f.suffix in ("", ".py")
+                for m in [re.findall(r"^[A-Z_]*(?:DELAYED|LATE|AGE)[A-Z_]*_AFTER\s*=", f.read_text(errors="ignore"), re.M)] for _ in m]
+        self.assertEqual(len(defs), 1, msg="age threshold definitions: %r" % defs)
+
 
 class TestPassRecheckMutants(unittest.TestCase):
     """S9: three wrong builds, each caught by a test above (control first, the textual replacement asserted applied)."""
@@ -165,3 +181,12 @@ class TestPassRecheckMutants(unittest.TestCase):
         result = self.run_case(name, [(sb, "in_late_scope", ns["in_late_scope"])])
         self.assertFalse(result.wasSuccessful(), msg="a plan notice with no age went unnoticed")
 
+    def test_a_second_age_constant_for_plan_notices_is_caught(self):
+        name = "TestPassRecheck.test_s8_the_age_threshold_is_defined_once_in_bin"
+        self.assertTrue(self.run_case(name, []).wasSuccessful(), msg="control failed")
+        real = Path.read_text
+        def second(path, *a, **k):
+            text = real(path, *a, **k)
+            return text + "\nPLAN_DELAYED_AFTER = 1800\n" if path.name == "decision.py" else text
+        result = self.run_case(name, [(Path, "read_text", second)])
+        self.assertFalse(result.wasSuccessful(), msg="a second age constant went unnoticed")
