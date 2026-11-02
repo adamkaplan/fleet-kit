@@ -21,6 +21,10 @@ from test_stack_model_key import load_bin  # noqa: E402
 REPO = "acme-org/widget-service"
 REGISTRY = "cloud-hub-registry"
 BASE_KEYS = {"url", "session", "password_file"}
+MSG_REPO = "the entry lacks repo"
+MSG_ISSUE_TEXT = "the issue is text not a number"
+MSG_ISSUE_ALWAYS = "the issue is written for a worker that named none"
+MSG_EVERY_CREATE = "an entry is written for every create"
 
 
 def source(rel):
@@ -68,18 +72,19 @@ class EntryBase(Base):
         return self.entry("coder7")
 
     def check_with_issue(self, entry):
+        self.assertIn("repo", entry, MSG_REPO)
+        self.assertEqual(type(entry["issue"]), int, MSG_ISSUE_TEXT)
         self.assertEqual(set(entry), BASE_KEYS | {"repo", "issue"})
         self.assertEqual(entry["repo"], REPO)
         self.assertEqual(entry["issue"], 7)
-        self.assertEqual(type(entry["issue"]), int)
         self.assertEqual(entry["session"], "")
         self.assertTrue(entry["url"].startswith("http://") and entry["url"].endswith(":4096"))
         self.assertRegex(entry["password_file"], r"^/etc/hub/pw/(orch1|coder7)$")
 
     def check_without_issue(self, entry):
+        self.assertNotIn("issue", entry, MSG_ISSUE_ALWAYS)
         self.assertEqual(set(entry), BASE_KEYS | {"repo"})
         self.assertEqual(entry["repo"], REPO)
-        self.assertNotIn("issue", entry)
 
 
 class Entries(EntryBase):
@@ -110,26 +115,59 @@ class Entries(EntryBase):
 
 
 class Mutants(EntryBase):
-    def run_mutant(self, old, new, check, *args):
-        self.module = mutant_module(old, new)
-        with self.assertRaises(AssertionError):
-            check(*args)
+    def run_cases(self, module, cases, anchor):
+        """Run each case on a fresh state; return (passed, failed with the anchored text, failed otherwise)."""
+        passed = anchored = other = 0
+        for case in cases:
+            self.setUp()
+            self.module = module
+            try:
+                case()
+            except AssertionError as e:
+                if re.search(re.escape(anchor), str(e)):
+                    anchored += 1
+                else:
+                    other += 1
+            else:
+                passed += 1
+        return passed, anchored, other
+
+    def run_mutant(self, name, old, new, cases, anchor):
+        text = source("cloud/launcher/cloud_worker.py")
+        count = text.count(old)
+        applied = new != old and count == 1
+        self.assertTrue(applied, "the mutation does not apply: %r" % old)
+        total = len(cases)
+        c_pass, _, _ = self.run_cases(cw, cases, anchor)
+        self.assertEqual(c_pass, total, "the control (unmutated code) must pass first")
+        _, k, other = self.run_cases(mutant_module(old, new), cases, anchor)
+        print("mutant %s: control passes %d of %d, mutant fails %d of %d with the anchored text, applied %s, fragment occurs %d times"
+              % (name, c_pass, total, k, total, applied, count))
+        self.assertEqual((k, other), (total, 0), "every mutant failure must carry the anchored text %r" % anchor)
+
+    def with_issue_cases(self):
+        return [lambda: self.check_with_issue(self.orchestrator("--issue", "7")),
+                lambda: self.check_with_issue(self.coder_hub_on("--issue", "7"))]
 
     def test_omitting_repo_fails_s2(self):
-        self.run_mutant('entry["repo"] = repo', "pass", lambda: self.check_with_issue(self.orchestrator("--issue", "7")))
+        self.run_mutant("omit repo", 'entry["repo"] = repo', "pass", self.with_issue_cases(), MSG_REPO)
 
     def test_issue_as_text_fails_s2(self):
-        self.run_mutant('entry["issue"] = issue', 'entry["issue"] = str(issue)', lambda: self.check_with_issue(self.orchestrator("--issue", "7")))
+        self.run_mutant("issue as text", 'entry["issue"] = issue', 'entry["issue"] = str(issue)', self.with_issue_cases(), MSG_ISSUE_TEXT)
 
     def test_always_writing_issue_fails_s3(self):
-        self.run_mutant('if issue is not None:\n            entry["issue"] = issue', 'entry["issue"] = issue or 0', lambda: self.check_without_issue(self.orchestrator()))
+        cases = [lambda: self.check_without_issue(self.orchestrator()), lambda: self.check_without_issue(self.coder_hub_on())]
+        self.run_mutant("always write issue", 'if issue is not None:\n            entry["issue"] = issue', 'entry["issue"] = issue or 0', cases, MSG_ISSUE_ALWAYS)
 
     def test_registering_every_create_fails_s5(self):
-        def hub_off():
-            code, _, err = self.make("coder7", "--issue", "7")
-            self.assertEqual(code, 0, err)
-            self.assertIsNone(self.entry("coder7"))
-        self.run_mutant('hub = agent == "orchestrator" or hub_on(self.env)', "hub = True", hub_off)
+        def hub_off(*extra):
+            def run():
+                code, _, err = self.make("coder7", *extra)
+                self.assertEqual(code, 0, err)
+                self.assertIsNone(self.entry("coder7"), MSG_EVERY_CREATE)
+            return run
+        self.run_mutant("register every create", 'hub = agent == "orchestrator" or hub_on(self.env)', "hub = True",
+                        [hub_off("--issue", "7"), hub_off()], MSG_EVERY_CREATE)
 
 
 class Sentinel(Exception):
