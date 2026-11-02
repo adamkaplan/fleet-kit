@@ -1,0 +1,45 @@
+#!/usr/bin/env python3
+"""Make every worker copy from its source (ask #1928). No argument; idempotent.
+
+The rows are in cloud/worker/copies.tsv: source<TAB>copy, both relative to the repository root. A copy is rewritten only when its bytes
+differ from its source. A source is never changed and no file is deleted. When a source is missing the command prints ONE line naming
+the source and the copy it feeds, changes no file and exits 1. It prints paths and counts only, never file contents."""
+import os
+import sys
+
+TABLE = os.path.join("cloud", "worker", "copies.tsv")
+
+
+def read_rows(root):
+    with open(os.path.join(root, TABLE), encoding="utf-8") as f:
+        return [tuple(line.split("\t")) for line in f.read().splitlines() if line]
+
+
+def read_bytes(path):
+    with open(path, "rb") as f:
+        return f.read()
+
+
+def run(root, out):
+    rows = read_rows(root)
+    for source, copy in rows:
+        if not os.path.isfile(os.path.join(root, source)):
+            print("missing source %s for the copy %s" % (source, copy), file=out)
+            return 1
+    changed = 0
+    for source, copy in rows:
+        data = read_bytes(os.path.join(root, source))
+        target = os.path.join(root, copy)
+        if os.path.isfile(target) and read_bytes(target) == data:
+            continue
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        with open(target, "wb") as f:
+            f.write(data)
+        print("copied %s to %s" % (source, copy), file=out)
+        changed += 1
+    print("%d changed" % changed, file=out)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(run(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), sys.stdout))
