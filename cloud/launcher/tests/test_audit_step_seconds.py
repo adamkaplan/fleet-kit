@@ -126,7 +126,7 @@ class Steps(tcw.Base):
                                          {"pushed": False, "wip_branch": None}], refresh_seconds=4)
         self.assertEqual((code, line["ok"]), (0, True))
         self.assertEqual(line["steps"], {"record": 2.0, "hook": 60.0, "refresh": 4.0, "delete": 3.0, "scrub": 1.5, "other": 0.0})
-        LINES.append("S8: refreshing stop %d steps" % len(line["steps"]))
+        LINES.append("S8: refreshing stop %d steps (and other)" % (len(line["steps"]) - 1))
 
     def test_s8_a_stop_that_fails_in_the_hook_writes_the_steps_it_reached(self):
         code, line = self.stop_line(cw, [{"pushed": False, "wip_branch": None, "error": "rejected"}])
@@ -245,7 +245,7 @@ class Steps(tcw.Base):
             len(stop["steps"]), len(stop["steps"]), held, outs[0] == outs[1]))
 
     def test_s10_mutant(self):
-        mod = mutant_module(("clean = _clean_steps(steps)", "clean = dict(steps, hook=str(self.last_hook))"))
+        mod = mutant_module(("clean = _clean_steps(steps)", "clean = dict(steps, hook=str(self.last_hook)) if steps else {}"))
         with self.assertRaises(AssertionError) as cm:
             self.check_s10(mod)
         self.assertEqual(str(cm.exception), "a step held a text")
@@ -266,6 +266,8 @@ class Steps(tcw.Base):
         line, steps = self.check_s12(cw)
         self.assertEqual(line["seconds"], 41.0)
         self.assertEqual(steps, {"record": 2.0, "hook": 30.0, "delete": 3.0, "scrub": 1.5, "other": 4.5})
+        self.create()   # the first stop removed the pod
+        self.clock.advance(seconds=1)
         _, plain = self.check_s12(cw, outside=0)
         self.assertEqual(plain["other"], 0.0)
         LINES.append("S12: seconds %.1f, steps sum %.1f (other %.1f); no-outside stop other %.1f" % (line["seconds"], sum(steps.values()), steps["other"], plain["other"]))
