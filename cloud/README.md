@@ -293,6 +293,8 @@ Cause: the foreground command bounds each test file at 120 seconds and the whole
 - Read: `bin/cloud-prepush --read FILE` (the result file or its directory) prints the lines the foreground run prints, plus a `RUNNING <file> (branch|base)` line for a file in progress and `cloud-prepush: still running: N of M files done`. Exit 0: finished, no difference; 1: finished with a difference or a file that could not run; 4: still running (never 0: a file not yet run is `not started`, never passed); 2: the file is missing or unreadable.
 - Polling: a background process does not count as activity for the idle limit (only a busy session does), so a builder that starts the run and ends its turn is stopped as idle. A builder keeps polling with short foreground calls, one command at a time: `sleep 60; bin/cloud-prepush --read DIR`, until the exit status is not 4. A launch of a builder that will run the full check asks for an idle limit above the longest poll.
 
+- Output: standard output holds only the differences, the counts line and the advice line (when the preflight fails, also the lines that say which check failed, never a row that says ok or no difference); the preflight's full table goes to standard error.
+
 It needs git and python3 only, makes no network call and writes nothing outside its temporary directory. It is advice, never the gate: continuous integration stays the gate and its result is the only evidence. Tests: `cloud/worker/tests/test_cloud_prepush.py` and `cloud/worker/tests/test_cloud_prepush_preflight.py`.
 
 ## Saving unpushed work when the pod ends
