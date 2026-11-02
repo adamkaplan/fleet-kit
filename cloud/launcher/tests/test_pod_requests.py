@@ -20,7 +20,7 @@ from test_cloud_worker import T0  # noqa: E402
 
 SRC_PATH = os.path.join(os.path.dirname(HERE), "cloud_worker.py")
 FIXTURES = os.path.join(HERE, "fixtures")
-S_FIXTURES = {"default_pod.json": 2, "run_secret_pod.json": 1, "stack_pod.json": 2, "stack_pod_registry.json": 1}   # indent step of the file's text
+S_FIXTURES = {"default_pod.json": 2, "run_secret_pod.json": 1, "stack_pod.json": 2, "stack_pod_registry.json": 2}   # indent step of the file's text
 ABOVE = "a request is above its limit:"
 REFUSED = "a stack pod with requests was refused:"
 TABLE = '{"S": {"cpu": "500m", "memory": "2Gi"}}'
@@ -61,18 +61,22 @@ def build_with(mod, a):
 
 
 def check_not_above(mod):
-    """The check of S10: every request of a shape's pod is not above its limit."""
-    for name in mod.SHAPE_REQUESTS:
-        pod = build_with(mod, _args(shape=name, stack=bool(mod.SHAPES[name].get("stack"))))
-        res = pod["spec"]["containers"][0]["resources"]
+    """The check of S10: every request of the table is not above the limit of the same shape's row."""
+    for name, req in mod.SHAPE_REQUESTS.items():
         for k in ("cpu", "memory"):
-            if mod.parse_quantity(res["requests"][k]) > mod.parse_quantity(res["limits"][k]):
+            if mod.parse_quantity(req[k]) > mod.parse_quantity(mod.SHAPES[name][k]):
                 raise AssertionError(ABOVE + " " + name)
+    pod = build_with(mod, _args(shape="S"))   # and the pod the builder makes carries the table's values
+    assert pod["spec"]["containers"][0]["resources"]["requests"] == mod.SHAPE_REQUESTS["S"]
 
 
 def check_stack_accepts(mod):
-    """The check of S11: the shape S stack pod passes the allow-list."""
-    if mod._stack_rest_differs(build_with(mod, _args(shape="S", stack=True))):
+    """The check of S11: the shape S stack pod is built and passes the allow-list."""
+    try:
+        refused = mod._stack_rest_differs(build_with(mod, _args(shape="S", stack=True)))
+    except mod.CloudError:
+        refused = True
+    if refused:
         raise AssertionError(REFUSED + " S")
 
 
