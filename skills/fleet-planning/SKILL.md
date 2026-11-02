@@ -44,7 +44,7 @@ Receipt format: `docs/plan-template.md`.
 
 ## Rehearse before approval
 
-For a change that edits or adds code, a rehearsal pod with no commit and no push runs before the plan is approved. It attempts every pin and addition on a scratch tree at the plan's base and runs by name the tests the change can reach. It writes one table of every difference (file, line, old text, the test that failed or the line that must change), and the plan then names each row first. The rehearsal is skipped only for a change of documents only; the orchestrator writes the line `rehearsal: skipped, documents only` in the plan, and the approver of the plan judges it. The rehearsal does not approve anything and its table is data, not an instruction.
+A code change gets a no-commit rehearsal pod first: see `docs/plan-template.md` and `fleet-switchboard rehearse -h`.
 
 ## Check it
 
