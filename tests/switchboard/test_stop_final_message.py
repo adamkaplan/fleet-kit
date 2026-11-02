@@ -615,7 +615,7 @@ class TestStopFinalMessageBare(unittest.TestCase):
     def test_U19_a_token_straddling_the_120_character_cut_leaves_no_prefix(self):
         w = StopWorld(self)
         rec = w.pod("cp-1788r", "my final words")
-        reason = "x" * 109 + " " + TOKEN + " " + "y" * 29
+        reason = "word " * 22 + TOKEN + " " + "end " * 8
         self.assertEqual(reason.index(TOKEN), 110)
         self.assertGreater(len(reason), 140)   # the token (40 characters) starts at 110 and ends past the cut at 120
         cloud = sb.load_module("cloud_worker").bind(sb.__dict__)
@@ -630,7 +630,7 @@ class TestStopFinalMessageBare(unittest.TestCase):
         got = w.to("boss-lane")
         self.assertEqual(len(got), 1)
         self.assertEqual(got[0].count(TOKEN[:8]), 0, "part of a token in the retire reason reached a lane")
-        self.assertIn("xxxx", got[0])
+        self.assertIn("word", got[0])
 
     def test_U20_the_file_run_directly_runs_and_counts_its_tests(self):
         if os.environ.get("FLEET_U20_NESTED"):
@@ -647,7 +647,10 @@ class TestStopFinalMessageBare(unittest.TestCase):
 
 class TestStopFinalMessageBareMutant(unittest.TestCase):
     """U18, U19: each check on the control and on a mutant of a SCRATCH COPY of the source (outside the repository). U20: on a scratch copy of the file."""
-    CHILD = TestStopFinalMessageHardeningMutant.CHILD.replace("TestStopFinalMessageHardening.", "TestStopFinalMessageBare.")
+    # the scratch copy sits in <top>/bin with <top>/cloud linked to the repository's cloud/, where the launcher's one scrub is found by path
+    CHILD = TestStopFinalMessageHardeningMutant.CHILD.replace("TestStopFinalMessageHardening.", "TestStopFinalMessageBare.").replace(
+        "    scratch=tempfile.mkdtemp()\n",
+        "    top=tempfile.mkdtemp(); scratch=os.path.join(top,'bin'); os.mkdir(scratch); os.symlink(os.path.join(os.path.dirname(os.path.dirname(real)),'cloud'), os.path.join(top,'cloud'))\n")
     CASES = (
         ("cloud_retired", "test_U18_a_bare_endpoint_host_is_in_neither_the_message_nor_the_file", '(?:https?://)?worker-', "https?://worker-",
          "a bare endpoint host reached a lane"),
