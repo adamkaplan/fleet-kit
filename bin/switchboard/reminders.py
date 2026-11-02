@@ -556,7 +556,9 @@ class ReminderFacts:
         return max(newer, key=lambda i: (i.get("created", 0), i["at"])) if newer else None
 
     def newest_first(self, facts):
-        """The reminder facts in the order of their copies' (created, at), newest first, so a delivery sweeps the older copies before it asks about them."""
+        """The reminder facts in the order of their copies' (created, at), newest first, so a delivery sweeps the older copies before it asks about them.
+        It is the start of a delivery's reminder step, so it also clears `swept`: the set is bounded by one delivery pass."""
+        self.swept.clear()
         try:
             marks = {"reminder:" + i["id"]: (i.get("created", 0), i["at"]) for i in read_reminders(self.state_dir)}
         except ReminderError:

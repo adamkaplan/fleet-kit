@@ -74,6 +74,49 @@ def build(PR4Base):
             finally:
                 sb.ReminderFacts.drop_older_copies = real
 
+        def two_passes(self):
+            """Pass one sweeps four copies; pass two sweeps two others; returns the ids of the second pass and the facts source."""
+            self.setup_s2()
+            self.hold_then_free()
+            source = next(s for s in self.world.engine.sources if isinstance(s, sb.ReminderFacts))
+            self.assertEqual(len(source.swept), 4, msg="s5: pass one sweeps four copies")
+            self.world.tick(1000)
+            base = 1000
+            older = [self.add("b", base + 1, base + 10, key="z"), self.add("c", base + 2, base + 11, key="z")]
+            self.add("a", base + 9, base + 20, key="z")
+            self.world.v2.start_turn(self.world.sessions["platform"], "fleet task", fleet=True, lasts=400)
+            self.world.tick(1100)
+            self.world.engine.run_pass()
+            return {i["id"] for i in older}, source
+
+        def test_s5_swept_holds_only_the_ids_of_the_last_pass(self):
+            second, source = self.two_passes()
+            self.assertEqual(source.swept, second, msg="s5: after two passes swept holds only the second pass's ids")
+            self.assertEqual(len(source.swept), 2, msg="s5: two ids")
+
+        def test_s5_mutant_without_the_reset_fails_after_the_control(self):
+            import inspect
+            import textwrap
+            src = textwrap.dedent(inspect.getsource(sb.ReminderFacts.newest_first))
+            self.assertIn("self.swept.clear()", src, msg="s5: the control source has the reset")
+            mutated = src.replace("self.swept.clear()", "pass")
+            self.assertNotEqual(mutated, src, msg="s5: the mutation was applied")
+            space = dict(sb.ReminderFacts.newest_first.__globals__)
+            exec(mutated, space)
+            real = sb.ReminderFacts.newest_first
+            sb.ReminderFacts.newest_first = space["newest_first"]
+            try:
+                with self.assertRaisesRegex(AssertionError, r"s5: after two passes"):
+                    self.test_s5_swept_holds_only_the_ids_of_the_last_pass()
+            finally:
+                sb.ReminderFacts.newest_first = real
+
+        def test_s5_a_copy_dropped_in_the_same_pass_is_audited_as_swept(self):
+            self.setup_s2()
+            self.hold_then_free()
+            self.assertEqual(len(self.drops()), 4, msg="s5: four drop_superseded lines")
+            self.assertEqual([e for e in self.world.audit() if e["event"] == "reminder.drop_in_flight"], [], msg="s5: none says cancelled or in flight")
+
         def setup_s2b(self):
             base = 1000
             older = [self.add("b", base + 1, base + 10), self.add("c", base + 2, base + 11), self.add(None, base + 3, base + 12), self.add("d", base, base + 5000)]
