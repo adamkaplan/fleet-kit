@@ -180,18 +180,27 @@ def tick(engine, discovery, send, hold_reason, boss_of, default_lane, env=None):
     state["edge"] = sorted(({"%s|%s|%s" % (l[1], l[3], l[4]) for l in fresh if l[0] == newest}) | (edge if cursor == newest else set()))
     state["cursor"] = newest
     alarmed = set((a[0], a[1]) for a in state["alarmed"])
+    state["unsent"] = [u for u in state.get("unsent", []) if isinstance(u, list) and len(u) == 2]
+    dropped = []
     failed = {}   # pod -> (seconds, worker, reason) of its newest failure in this tick, after the last success
     for at, pod, worker, ok, reason in sorted(fresh, key=lambda l: l[0]):
         if ok:
             state["pods"].pop(pod, None)
             failed.pop(pod, None)
-        elif now - at <= MAX_AGE and (pod, at) not in alarmed:
+        elif (pod, at) in alarmed:
+            pass
+        elif now - at <= MAX_AGE:
             failed[pod] = (at, worker, reason)
+        elif [pod, at] in state["unsent"]:   # an unsent alarm that aged past the hour is dropped, once
+            dropped.append((pod, at))
+            state["alarmed"].append([pod, at])
     alarms = {}
+    before = {}
     for pod, (at, worker, reason) in sorted(failed.items()):
         last = state["pods"].get(pod)
         if last is not None and 0 <= at - last < SERIES_SECONDS:
             continue
+        before[pod] = last
         state["pods"][pod] = at
         state["alarmed"].append([pod, at])
         alarms[pod] = (worker, reason)
@@ -202,41 +211,55 @@ def tick(engine, discovery, send, hold_reason, boss_of, default_lane, env=None):
     # A crash between the send and the write repeats one round at the next start. A write that fails is kept in memory (_MEMORY).
     by_reason = {}
     told = {}
+    reached = set()
     sent = []
     try:
         lane = [n for n in _lane(engine.config, discovery, default_lane) if not hold_reason(discovery.agents[n])]
         for pod, (worker, reason) in alarms.items():
             by_reason.setdefault(reason, []).append(pod)
 
-        def tell(to, text, subject, reason):
+        def tell(to, text, subject, reason, pods):
             item = send(engine.state_dir, to, now, now, text, KIND, subject, reason, first=True)
             if item is not None:
                 sent.append((to, text))
                 told.setdefault(subject, []).append(to)
+                reached.update(pods)
         for pod, (worker, reason) in sorted(alarms.items()):
             boss = boss_of(worker) if worker else None
             seen = discovery.agents.get(boss) if boss else None
             if seen is not None and not hold_reason(seen):
-                tell(boss, "Cloud renewal alarm: the git token of pod %s could not be renewed: %s" % (pod, reason or "no reason given"), pod, reason)
+                tell(boss, "Cloud renewal alarm: the git token of pod %s could not be renewed: %s" % (pod, reason or "no reason given"), pod, reason, [pod])
             else:
                 boss = None
             if len(by_reason[reason]) == 1:
                 for to in lane:
                     if to != boss:
-                        tell(to, "Cloud renewal alarm: the git token of pod %s could not be renewed: %s" % (pod, reason or "no reason given"), pod, reason)
+                        tell(to, "Cloud renewal alarm: the git token of pod %s could not be renewed: %s" % (pod, reason or "no reason given"), pod, reason, [pod])
         for reason, pods in sorted(by_reason.items()):
             if len(pods) > 1:
                 names = sorted(pods)
                 text = "Cloud renewal alarm: the git token of %d pods could not be renewed, the same reason: %s. Pods: %s%s" % (
                     len(names), reason or "no reason given", ", ".join(names[:NAMES_MAX]), ", and %d more" % (len(names) - NAMES_MAX) if len(names) > NAMES_MAX else "")
                 for to in lane:
-                    tell(to, text, "group:" + names[0], reason)
+                    tell(to, text, "group:" + names[0], reason, names)
     except Exception:
         pass   # nothing raises into the daemon pass; the entry and the state are still written below
     finally:
+        unsent = sorted((state["pods"][pod], pod) for pod in alarms if pod not in reached)
+        for at, pod in unsent:   # a pod whose alarm reached nobody is not entered: no series, no alarmed line, the cursor stays at its line
+            if before[pod] is None:
+                state["pods"].pop(pod, None)
+            else:
+                state["pods"][pod] = before[pod]
+            state["alarmed"] = [a for a in state["alarmed"] if a != [pod, at]]
+        state["unsent"] = [[pod, at] for at, pod in unsent]
+        if unsent:
+            state["cursor"], state["edge"] = unsent[0][0], []
         _persist(state_path, state)
         try:   # the audit entry is in the same finally as the state, so a send that raises still leaves it
             if engine.audit is not None:
+                for pod, at in dropped:
+                    engine.audit.append(engine.actor, "renewal-alarm-dropped", pod, {"reason": "dropped unsent: older than one hour"})
                 for pod, (worker, reason) in sorted(alarms.items()):
                     engine.audit.append(engine.actor, EVENT, pod, {"told": sorted(set(told.get(pod, []))), "reason": reason, "group": len(by_reason.get(reason, [pod]))})
         except Exception:
