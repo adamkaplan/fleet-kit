@@ -28,6 +28,7 @@ class TestTheBinSetClassesAreAllInTheTable(unittest.TestCase):
         "TestAdoption": "reads every module's text for the adoption words, and passed with a planted unlisted module",
         "TestEveryViewDerivesFromTheRegistry": "lists bin/ for the views a command registers, and passed with a planted unlisted module",
         "TestAssembler": "copies the sibling modules the entry loads into a fixture, and passed with a planted unlisted module",
+        "TestClaimLegacy": "copies the modules of bin/ into a fixture tree for the source-copy mutants of the claim-ledger rule, and passed with a planted unlisted module",
         "TestOwnMarkerNotHonoured": "reads every module's text for the marker, and passed with a planted unlisted module",
         "TestLatestRunOfWorkflow": "copies the bin/ files into a fixture tree, and passed with a planted unlisted module",
         "TestArchTools": "copies the sibling modules into a fixture tree for the architecture tools, and passed with a planted unlisted module",
