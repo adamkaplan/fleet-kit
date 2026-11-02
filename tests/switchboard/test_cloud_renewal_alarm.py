@@ -577,6 +577,96 @@ def s26(text):
     print("S26: sentences found 3 of 3")
 
 
+def s27(module):
+    msg = "a failed send lost the alarm"
+    state_of = lambda w: json.load(open(os.path.join(w.dir, module.STATE_FILE)))
+    # one pod: the sender raises at tick 1, returns nothing at tick 2, delivers at tick 3
+    w = AlarmWorld(module, {"worker-1": "lane-a"})
+    try:
+        mode = ["raise"]
+        attempts = []
+        real = w.send
+
+        def sender(state_dir, to, at, created, text, kind, subject, state, first=False, **more):
+            attempts.append(mode[0])
+            if mode[0] == "raise":
+                raise RuntimeError("the send raised")
+            if mode[0] == "nothing":
+                return None
+            return real(state_dir, to, at, created, text, kind, subject, state, first=first, **more)
+        w.send = sender
+        line_at = T0 - 5
+        w.line(line_at, "worker-1", False, "no network")
+        w.tick(T0)
+        first = state_of(w)
+        assert first["cursor"] <= line_at, "%s: the cursor %s is after the line" % (msg, first["cursor"])
+        assert "worker-1" not in first["pods"] and ["worker-1", line_at] not in first["alarmed"], "%s: the state holds the unsent pod %s" % (msg, first)
+        mode[0] = "nothing"
+        w.tick(T0 + 60)
+        assert len(attempts) > 1 and w.messages == [], "%s: the second tick did not read the line again or sent %s" % (msg, w.messages)
+        assert state_of(w) == first, "%s: the state changed at the second tick" % msg
+        mode[0] = "deliver"
+        w.tick(T0 + 120)
+        delivered = len(w.to("lane-a"))
+        assert delivered == 1 and len(w.to("cos-1")) == 1, "%s: delivered %d, %s" % (msg, delivered, w.messages)
+        w.tick(T0 + 180)
+        assert len(w.messages) == 2, "%s: a fourth tick sent more: %s" % (msg, w.messages)
+    finally:
+        w.close()
+    # a second pod told at tick 1 while the first was not is alarmed exactly once over the four ticks
+    w = AlarmWorld(module, {"worker-1": "lane-a", "worker-2": "lane-b"})
+    try:
+        phase = [0]
+        real = w.send
+
+        def sender2(state_dir, to, at, created, text, kind, subject, state, first=False, **more):
+            if subject == "worker-1" and phase[0] == 0:
+                raise RuntimeError("the send raised")
+            if subject == "worker-1" and phase[0] == 1:
+                return None
+            return real(state_dir, to, at, created, text, kind, subject, state, first=first, **more)
+        w.send = sender2
+        w.line(T0 - 5, "worker-1", False, "no network")
+        w.line(T0 - 4, "worker-2", False, "refused")
+        for phase[0], tick_at in enumerate((T0, T0 + 60, T0 + 120, T0 + 180)):
+            w.tick(tick_at)
+        second = [m for m in w.messages if m[3] == "worker-2"]
+        first_pod = [m for m in w.messages if m[3] == "worker-1"]
+        assert len(second) == 2 and len(first_pod) == 2, "%s: second pod %d, first pod %d" % (msg, len(second), len(first_pod))
+    finally:
+        w.close()
+    # a line older than one hour whose send failed is not retried: dropped with one audit entry
+    w = AlarmWorld(module, {"worker-1": "lane-a"})
+    try:
+        tries = []
+
+        def boom(*args, **more):
+            tries.append(1)
+            raise RuntimeError("the send raised")
+        w.send = boom
+        old_at = T0 - 3590
+        w.line(old_at, "worker-1", False, "no network")
+        w.tick(T0)
+        before = len(tries)
+        assert before > 0, "%s: the first tick did not try" % msg
+        w.tick(T0 + 120)
+        drops = [e for e in w.entries if e[0] == "renewal-alarm-dropped"]
+        assert len(tries) == before, "%s: the old line was retried" % msg
+        assert len(drops) == 1 and drops[0][1] == "worker-1" and drops[0][2] == {"reason": "dropped unsent: older than one hour"}, "%s: %s" % (msg, drops)
+        assert state_of(w)["cursor"] >= old_at and not state_of(w).get("unsent"), "%s: the cursor did not pass the line" % msg
+        w.tick(T0 + 180)
+        assert len([e for e in w.entries if e[0] == "renewal-alarm-dropped"]) == 1 and len(tries) == before, "%s: a second tick added an entry or a retry" % msg
+        dropped = len(drops)
+    finally:
+        w.close()
+    print("S27: delivered alarms for the failing pod %d per recipient over 4 ticks, cursor after tick 1 not after the line, second pod alarmed %d per recipient, dropped entries %d once, retries of the old line %d" % (delivered, len(second) // 2, dropped, len(tries) - before))
+
+
+S27_MUTANT = ("writes the cursor and the state before it knows whether the send reached anyone",
+              '        unsent = sorted((state["pods"][pod], pod) for pod in alarms if pod not in reached)\n',
+              '        unsent = []\n')
+
+
 S24_S25_MUTANTS = {
     "s24": ("does not clamp the cursor", "clamped = cursor is not None and cursor > now", "clamped = False"),
 }
@@ -630,6 +720,10 @@ class TestCloudRenewalAlarmContinuation(unittest.TestCase):
         with self.assertRaises(AssertionError) as raised:
             s26(copy)
         self.assertIn("the document does not say the alarm is at least once", str(raised.exception))
+
+    def test_s27_a_failed_send_does_not_lose_the_alarm_and_a_line_past_the_hour_is_dropped_once(self):
+        s27(load())
+        self.mutant("s27", *S27_MUTANT[1:], "a failed send lost the alarm")
 
 
 if __name__ == "__main__":
