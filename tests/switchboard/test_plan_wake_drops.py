@@ -171,9 +171,9 @@ def build():
             record["updated_at"] = sb.iso(self.world.clock.now())
             self.go()
             self.offer(inbox)
-            self.assertEqual(len(inbox), 2)
-            self.assertEqual(self.engine.plan_wake.dropped, 0)
-            self.assertEqual([e for e in self.audit("plan_wake.dropped") if e["detail"]["dropped"] == first], [])
+            self.assertEqual(len(inbox), 2, msg="a plan replaced after delivery recalls nothing: the first line stays delivered and the new one is offered")
+            self.assertEqual(self.engine.plan_wake.dropped, 0, msg="a plan replaced after delivery recalls nothing: no drop is counted")
+            self.assertEqual([e for e in self.audit("plan_wake.dropped") if e["detail"]["dropped"] == first], [], msg="a plan replaced after delivery recalls nothing: no plan_wake.dropped line names the delivered hash")
 
         def test_s9_an_unknown_current_hash_keeps_the_line(self):
             self.post(3, self.plan())
@@ -202,7 +202,7 @@ def build():
             if older:
                 self.assertEqual((len(inbox), wake.dropped), (1, 0), msg="a line is dropped for a hash that is not newer")
             else:
-                self.assertEqual((len(inbox), wake.dropped, audited), (0, 1, 1), msg="a held line for a replaced hash is delivered")
+                self.assertEqual((len(inbox), wake.dropped, audited), (0, 1, 1), msg="S12 a newer-announced hash drops the held line: one dropped, one audit line, none delivered")
 
         def test_s12_a_drop_needs_a_current_hash_announced_after_the_line_and_a_differs_only_mutant_fails(self):
             self.edits(2)
