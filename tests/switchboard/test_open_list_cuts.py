@@ -1,6 +1,7 @@
 """#1886 Sixth amendment S11-S15: one alert path for every read of open items that stops at the ceiling, from the flag of the read itself."""
 import re
 import shutil
+import subprocess
 import tempfile
 import types
 import unittest
@@ -8,6 +9,7 @@ from unittest import mock
 from pathlib import Path
 
 from support.core import Base
+from support.paths import BIN
 from support.loader import copy_entry, _load, sb
 from test_open_list_ceiling import PagedHub, NOW
 
@@ -186,9 +188,8 @@ class TestOpenListDerivedText(Base):
         self.assertIn("500 or more", self.alert_text(copy, str(self.make_dir("b"))), msg="the alert text names the ceiling of the constants")
 
     def definitions(self):
-        bin_dir = Path(__file__).resolve().parents[2] / "bin"
-        files = [p for p in bin_dir.rglob("*") if p.is_file() and p.suffix in ("", ".py") and "__pycache__" not in p.parts and not p.name.startswith("test-")]
-        return sum(len(re.findall(r"^LABEL_HOLD_LIST_CUT\s*=", p.read_text(errors="replace"), re.M)) for p in files)
+        done = subprocess.run(["grep", "-rEc", "--exclude=test-*", "--exclude-dir=__pycache__", r"^LABEL_HOLD_LIST_CUT[[:space:]]*=", str(BIN)], capture_output=True, text=True)
+        return sum(int(line.rpartition(":")[2]) for line in done.stdout.splitlines())
 
     def make_dir(self, name):
         path = Path(self.state_dir) / name
