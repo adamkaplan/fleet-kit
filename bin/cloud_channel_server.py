@@ -111,11 +111,16 @@ def make_server(address, reviewer, inbox, audit, max_handlers=None, *, namespace
 
         def _send(self, status, payload):
             data = json.dumps(payload).encode()
-            self.send_response(status)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(data)))
-            self.end_headers()
-            self.wfile.write(data)
+            try:
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                self.close_connection = True
+                audit("undelivered status=%d: the client had gone" % status)
+                return
 
         def _refuse_early(self, status, error, reason):
             audit("refused status=%d reason=%s" % (status, reason))
