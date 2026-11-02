@@ -2325,3 +2325,12 @@ class TestCloudWatchTick(unittest.TestCase):
         self.assertEqual(calls["tick"], 1)
         self.assertEqual(self.audit, [])
         self.assertFalse(self.dir.exists())
+
+
+class TestEndTickWithoutStateDirectory(unittest.TestCase):
+    """#1480: the end tick reads the state directory with a default: an engine object that has none returns nothing and raises nothing."""
+
+    def test_an_engine_object_with_no_state_directory_attribute_returns_an_empty_list(self):
+        engine = types.SimpleNamespace(audit=None, actor="daemon", now=time.time)
+        self.assertFalse(hasattr(engine, "state_dir"))
+        self.assertEqual(sb.cloud_end_tick(engine, None), [])

@@ -395,7 +395,9 @@ class TestAudit(Base):
 
     def test_skips_and_other_refusals(self):
         self.passed("pr", "comment", "3", "-R", "acme-org/other-repo", "-b", "hi", env={"FLEET_SWITCHBOARD_OWN_GH": "1"})
-        self.assertEqual(self.audit(), [])                                                     # the switchboard's own call is not audited
+        rows = self.audit()                                                                    # #1216: the marker no longer skips the audit line (own calls never reach the shim)
+        self.assertEqual([(r["verb"], r["repo"], r["number"], r["caller"], r["outcome"]) for r in rows], [("pr comment", "acme-org/other-repo", 3, "worker", "passed")])
+        self.audit_dir.joinpath("gh-writes.jsonl").unlink()                                    # a fresh log for what follows
         self.run_gh("auth", "git-credential", "get")
         self.assertEqual(self.audit(), [])                                                     # nor a git credential call
         self.config({"acme-org/widget-api": {"label": LABEL, "message": MESSAGE}})
@@ -457,6 +459,39 @@ def daemon_source():
 
 
 REPO_SHAPE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+
+
+class TestMarkerMutants(Base):
+    """#1216: the shim reads FLEET_SWITCHBOARD_OWN_GH nowhere. Each mutant is a copy of the REAL shim directory with the marker honoured again in one function, run as a
+    subprocess; the real shim holds with the marker set, the mutant does not."""
+    MARKER = {"FLEET_SWITCHBOARD_OWN_GH": "1"}
+
+    def mutant(self, func):
+        source = SHIM.read_text()
+        start = source.index("def %s(" % func)
+        head = source[start:]
+        at = head.index(":\n", head.index(")")) + 2
+        if head[at:].lstrip().startswith('"""'):
+            first = head.index('"""', at) + 3
+            at = head.index('"""', first) + 3 + 1
+        guard = '    if os.environ.get("FLEET_SWITCHBOARD_OWN_GH") == "1":\n        return %s\n' % ("None, None, None" if func == "hold_probe" else "")
+        target = self.home / ("mutant-" + func)
+        shutil.copytree(str(SHIM.parent), str(target))
+        (target / "gh").write_text(source[:start] + head[:at] + guard + head[at:])
+        return target / "gh"
+
+    def test_hold_probe_honouring_the_marker_lets_a_held_write_through(self):
+        done, _ = self.run_gh("pr", "merge", "7", "-R", CFG_REPO, env=self.MARKER)
+        self.assertEqual(done.returncode, 1, "the real shim refuses a held write even with the marker set")
+        done, calls = self.run_gh("pr", "merge", "7", "-R", CFG_REPO, env=self.MARKER, shim=self.mutant("hold_probe"))
+        self.assertEqual(done.returncode, 7, "the mutant lets it run: the case above fails it")
+
+    def test_audit_write_honouring_the_marker_drops_the_audit_line(self):
+        self.passed("pr", "comment", "3", "-R", "acme-org/other-repo", "-b", "hi", env=self.MARKER)
+        self.assertEqual([(r["verb"], r["outcome"]) for r in self.audit()], [("pr comment", "passed")])
+        self.audit_dir.joinpath("gh-writes.jsonl").unlink()
+        self.passed("pr", "comment", "3", "-R", "acme-org/other-repo", "-b", "hi", env=self.MARKER, shim=self.mutant("audit_write"))
+        self.assertEqual(self.audit(), [], "the mutant writes no line: the case above fails it")
 
 
 class TestSharedMatcher(unittest.TestCase):

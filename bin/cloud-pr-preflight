@@ -12,6 +12,7 @@ Offline. Prints three sections; exits 0 when 1 and 2 pass (and no --expect stray
      nothing written into the repository)
   3. existing test files this branch changes against the default branch (listed for you to justify; it does not change the exit status)
 Environment: CLOUD_PREFLIGHT_TIMEOUT (seconds per file, default 120), CLOUD_PREFLIGHT_BASE (default branch ref).
+Quick budget: the whole quick run has CLOUD_PREFLIGHT_QUICK_TOTAL seconds (default 240); a spent budget ends with exit status 3 and a final line "NOT RUN (budget): ..." naming each file not run.
 """
 import glob, os, shutil, signal, subprocess, sys, tarfile, tempfile, io, time
 
@@ -103,6 +104,71 @@ def run_one(root, rel, timeout, selector=None):
         return "timeout"
     finally:
         kill_children()
+
+
+BUDGET_STATUS = 3  # a spent quick budget: not 1 (a failing test or a difference) and not 2 (refused input)
+
+
+def run_files(names, sel_of, root, basedir, timeout, quick, clock=None, run=None, out=print):
+    """Run each selected file on the branch; the clean copy only for a file that did not pass on the branch (quick).
+    Prints one line per file with its seconds. Returns (verdicts, failed, not_run): not_run lists the files left when the
+    quick budget was spent (a spent budget is not a failure of a test)."""
+    import types
+    time = types.SimpleNamespace(monotonic=clock or globals()["time"].monotonic)  # the fake clock of the tests
+    clock = time.monotonic
+    run = run or run_one
+    verdicts, not_run, failed = [], [], False
+    t_start = clock()
+    for i, rel in enumerate(names):
+        path, sel = sel_of.get(rel, (rel, None))
+        remaining = QUICK_TOTAL - (clock() - t_start)
+        if quick and remaining <= 0:
+            not_run = list(names[i:])
+            break
+        if quick and path in cloud_quick.HEAVY:
+            out("%-52s %-9s %-9s %s" % (rel, "-", "-", "skipped: memory-heavy " + path))
+            verdicts.append((rel, "-", "-", "skipped")); failed = True
+            continue
+        tmo = min(timeout, max(1, int(remaining))) if quick else timeout  # clamp to the time left
+        t0 = clock()
+        b = run(root, path, tmo, sel) if os.path.exists(os.path.join(root, path)) else "absent"
+        tb = clock() - t0
+        td = 0.0
+        if quick and b == "timeout" and tmo < timeout and path.rsplit("/", 1)[-1] not in TIMEOUT_ALLOW:
+            not_run = list(names[i:])  # cut short by the spent budget, not by the file's own bound
+            break
+        if quick and b == 0:
+            d = "-"  # a passing file needs no comparison with the clean copy
+        else:
+            if quick:
+                tmo = min(timeout, max(1, int(QUICK_TOTAL - (clock() - t_start))))
+            t0 = clock()
+            d = run(basedir, path, tmo, sel) if os.path.exists(os.path.join(basedir, path)) else "absent"
+            td = clock() - t0
+            if quick and d == "timeout" and tmo < timeout and path.rsplit("/", 1)[-1] not in TIMEOUT_ALLOW:
+                not_run = list(names[i:])
+                if b not in (0, "timeout", "absent"):  # a failure on the branch comes first
+                    v = "FAIL: branch exit %s; clean copy not run (budget)" % b; failed = True
+                    out("%-52s %-9s %-9s %s  [branch %.1fs, default %.1fs]" % (rel, b, "-", v, tb, clock() - t0))
+                    verdicts.append((rel, b, "-", v))
+                break
+        n = os.path.basename(path)
+        if "timeout" in (b, d):
+            if n in TIMEOUT_ALLOW:
+                v = "not run (allowed: %s)" % TIMEOUT_ALLOW[n]
+            else:
+                v = "NOT RUN: timed out"; failed = True
+        elif b == "absent":
+            v = "removed on branch"
+        elif b == 0:
+            v = "ok" if d in (0, "absent", "-") else "ok (fixed on branch)"
+        elif d == b:
+            v = "environment-only (fails the same on both; may hide a real failure)"
+        else:
+            v = "FAIL: branch exit %s, default exit %s" % (b, d); failed = True
+        out("%-52s %-9s %-9s %s  [branch %.1fs, default %.1fs]" % (rel, b, d, v, tb, td))
+        verdicts.append((rel, b, d, v))
+    return verdicts, failed, not_run
 
 
 def _on_signal(signum, frame):
@@ -228,42 +294,9 @@ def main():
             print("\n== 2. every test file, one at a time (timeout %ds each) ==" % timeout)
             names = sorted(set(tests_in(root)) | base_tests)
         print("%-52s %-9s %-9s %s" % ("file", "branch", "default", "verdict"))
-        verdicts = []
-        t_start = time.monotonic()
-        for rel in names:
-            path, sel = sel_of.get(rel, (rel, None))
-            remaining = QUICK_TOTAL - (time.monotonic() - t_start)
-            if quick and remaining <= 0:
-                print("NOT RUN: quick run exceeded %d s (selected %d files, ran %d; stopped before %s)"
-                      % (QUICK_TOTAL, len(names), len(verdicts), rel))
-                failed = True
-                break
-            if quick and path in cloud_quick.HEAVY:
-                print("%-52s %-9s %-9s %s" % (rel, "-", "-", "skipped: memory-heavy " + path))
-                verdicts.append((rel, "-", "-", "skipped")); failed = True
-                continue
-            tmo = min(timeout, max(1, int(remaining))) if quick else timeout  # clamp to the time left
-            b = run_one(root, path, tmo, sel) if os.path.exists(os.path.join(root, path)) else "absent"
-            if quick:
-                tmo = min(timeout, max(1, int(QUICK_TOTAL - (time.monotonic() - t_start))))
-            d = run_one(basedir, path, tmo, sel) if os.path.exists(os.path.join(basedir, path)) else "absent"
-            n = os.path.basename(path)
-            if "timeout" in (b, d):
-                if n in TIMEOUT_ALLOW:
-                    v = "not run (allowed: %s)" % TIMEOUT_ALLOW[n]
-                else:
-                    v = "NOT RUN: timed out"; failed = True
-            elif b == "absent":
-                v = "removed on branch"
-            elif b == 0:
-                v = "ok" if d in (0, "absent") else "ok (fixed on branch)"
-            elif d == b:
-                v = "environment-only (fails the same on both; may hide a real failure)"
-            else:
-                v = "FAIL: branch exit %s, default exit %s" % (b, d); failed = True
-            print("%-52s %-9s %-9s %s" % (rel, b, d, v))
-            verdicts.append((rel, b, d, v))
-        print("differ: " + (", ".join(r for r, b, d, v in verdicts if b != d) or "none"))
+        verdicts, loop_failed, not_run = run_files(names, sel_of, root, basedir, timeout, quick)
+        failed |= loop_failed
+        print("differ: " + (", ".join(r for r, b, d, v in verdicts if b != d and d != "-") or "none"))
 
         print("\n== 3. existing test files this branch changes against %s ==" % base)
         rc, out = git("diff", "--numstat", "--no-renames", mb, "--", *[d + "/" for d in TEST_DIRS], cwd=root)
@@ -295,8 +328,17 @@ def main():
             if not stray:
                 print("  none")
             failed |= bool(stray)
-        print("\nRESULT: " + ("FAIL" if failed else "PASS"))
-        return 1 if failed else 0
+        if not_run:
+            print("NOT RUN (budget): quick run exceeded %d s (selected %d files, ran %d); not run: %s"
+                  % (QUICK_TOTAL, len(names), len(verdicts), ", ".join(not_run)))
+        if failed:
+            print("\nRESULT: FAIL")
+            return 1
+        if not_run:
+            print("\nRESULT: NOT RUN (budget)")
+            return BUDGET_STATUS
+        print("\nRESULT: PASS")
+        return 0
     finally:
         kill_children()
         shutil.rmtree(tmp, ignore_errors=True)

@@ -193,7 +193,7 @@ class RealTree(unittest.TestCase):
     def test_h1_every_cloud_bin_script_is_chained_excepted_or_a_workflow_step(self):
         # What the old test_h1 pinned: each relay-family script (and the cost report) is run, listed exactly once in the list.
         # This derives the set from the files: bin/test-cloud-*, the list, BIN_EXCEPTIONS, and every workflow file.
-        bins = sorted(n for n in os.listdir(os.path.join(ROOT, "bin")) if n.startswith("test-cloud-") and not n.endswith(".chain"))
+        bins = sorted(n for n in os.listdir(os.path.join(ROOT, "bin")) if n.startswith("test-cloud-") and not n.endswith((".chain", ".parallel")))
         exc = slurp(SCRIPT).split("BIN_EXCEPTIONS=")[1].split("\n")[0].strip('"')
         wfdir = os.path.join(ROOT, ".github", "workflows")
         wf = "".join(slurp(os.path.join(wfdir, n)) for n in sorted(os.listdir(wfdir)) if n.endswith((".yml", ".yaml")))
