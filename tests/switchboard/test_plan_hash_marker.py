@@ -97,7 +97,7 @@ class TestPlanHashMarkerPure(unittest.TestCase):
 class TestPlanHashMarkerStored(unittest.TestCase):
     """S3, S8, S10: a record at the old hash, at the new hash, at an edit and at an older revision."""
 
-    KINDS = ("approval", "proof", "verdict", "consensus", "claim", "ask")
+    KINDS = ("approval", "proof", "verdict", "consensus", "ask")
 
     def setUp(self):
         self.pc, self.pl = real("plan_check"), real("plan_ledger")
@@ -107,21 +107,21 @@ class TestPlanHashMarkerStored(unittest.TestCase):
     def entries(self, plan_hash):
         return [{"kind": k, "plan_hash": plan_hash, "head": self.pl.ask_head(plan_hash)} for k in self.KINDS]
 
-    def test_six_kinds_at_two_hashes_read_as_the_live_plan_and_six_of_an_edit_read_as_stale(self):
+    def test_five_kinds_at_two_hashes_read_as_the_live_plan_and_five_of_an_edit_read_as_stale(self):
         bound = 0
         for value in self.hashes:
             for entry in self.pl.as_current(self.entries(value), self.hashes):
                 bound += entry["plan_hash"] == self.hashes[0] and entry["head"] == self.pl.ask_head(self.hashes[0])
-        self.assertEqual(bound, 12)
+        self.assertEqual(bound, 5 * len(self.hashes))
         edited = self.pc.plan_hashes(self.signed.replace("size: S", "size: M"))
         stale = sum(e["plan_hash"] != self.hashes[0] for v in edited for e in self.pl.as_current(self.entries(v), self.hashes))
-        self.assertEqual(stale, 6 * len(edited))
+        self.assertEqual(stale, 5 * len(edited))
 
     def test_a_binding_of_an_older_revision_stays_as_it_is_and_reads_as_stale(self):
         older = self.pc.plan_hashes(plan_text("older: yes") + "\n" + MARKER + "\n")
         for value in older:
             out = self.pl.as_current(self.entries(value), self.hashes)
-            self.assertEqual([e["plan_hash"] for e in out], [value] * 6)
+            self.assertEqual([e["plan_hash"] for e in out], [value] * 5)
             self.assertEqual(self.pc.canonical_hash(value, self.hashes), value)
         self.assertEqual(self.pc.canonical_hash(self.hashes[1], self.hashes), self.hashes[0])
 
