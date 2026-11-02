@@ -944,8 +944,11 @@ class TestNamespaceSetting(unittest.TestCase):
         self.assertRegex(quick, r"FLEET_CLOUD_AGENT_NAMESPACE.{0,10}\(value `cw`")
 
     def test_worker_copies_match_bin(self):
-        for name in ("cloud_hub.py", "cloud_channel.py", "cloud_channel_server.py"):
-            self.assertEqual((BIN / name).read_text(), (BIN.parent / "cloud" / "worker" / "bin" / name).read_text(), name)
+        for line in (BIN.parent / "cloud" / "worker" / "copies.tsv").read_text().splitlines():
+            source, copy = line.split("\t")
+            if source.startswith("bin/") and copy.startswith("cloud/worker/bin/"):
+                name = source[len("bin/"):]
+                self.assertEqual((BIN / name).read_text(), (BIN.parent / copy).read_text(), name)
 
 
 AGE_EXPR = 'return json.loads(raw.decode("utf-8")), max(0, int(delta))'
