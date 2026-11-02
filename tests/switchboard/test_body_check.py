@@ -43,7 +43,8 @@ LINE_RULE = "the first section names at least 4 places with function and line"
 class Run:
     """The command with its readers faked; every call a fake sees is kept, so a non-GET call or a write can be counted."""
 
-    def __init__(self, body, plan_text, fail=None, sb=None):
+    def __init__(self, body, plan_text, fail=None, sb=None, arg="acme-org/demo#9"):
+        self.arg = arg
         self.sb = sb or SB
         self.calls, self.fail = [], fail
         self.body, self.plan_text = body, plan_text
@@ -62,7 +63,7 @@ class Run:
                 raise SB.PlanInputError("cannot read plan")
             return self.plan_text, "comment", "", []
 
-        args = SB.argparse.Namespace(body="acme-org/demo#9", merged=False)
+        args = SB.argparse.Namespace(body=self.arg, merged=False)
         out = io.StringIO()
         cfg = {"gh": "gh", "call_timeout_seconds": 5, "intent_repo": "acme-org/demo"}
         with mock.patch.object(SB, "read_pr_json", read_pr_json), mock.patch.object(SB, "fetch_plan", fetch_plan), \
@@ -77,7 +78,79 @@ def run(body, rule=LINE_RULE, **kw):
     return Run(body, plan(rule, **kw.pop("plan_kw", {})), **kw)()
 
 
+FENCE_LINES = "\n".join("- `src/mod_%d.py:%d` the place" % (i, 10 + i) for i in range(1, 5))
+WHY_BLOCK = "<!-- pr-explainer:begin -->\nbefore and after\n<!-- pr-explainer:end -->\n\n"
+FENCED_CAUSE = "PLAN: acme-org/demo#7\n\n" + WHY_BLOCK + "```\n## Cause\n%s\n```\n" % FENCE_LINES
+FENCED_CAUSE_TILDE = FENCED_CAUSE.replace("```", "~~~")
+FENCED_CAUSE_OPEN = "PLAN: acme-org/demo#7\n\n" + WHY_BLOCK + "```\n## Cause\n%s\n" % FENCE_LINES
+REAL_CAUSE_FENCED_WHY = "PLAN: acme-org/demo#7\n\n## Cause\n\n%s\n\n```\n## Why\nbefore\n```\n" % FENCE_LINES
+S12_RULE_PLAN = plan("the first section names at least 2 named items", text="Given the line of the description, when read, then the cause is first")
+TWO_ITEMS = "PLAN: acme-org/demo#7\n\n## The cause\n\nSee #101 and #102.\n"
+FENCED_WHY_BEFORE = "PLAN: acme-org/demo#7\n\n```\n## Why\nbefore\n```\n\n## Cause\n\n%s\n" % FENCE_LINES
+MSG = "the cause section is not first"
+S3_MSG = "places with a file and line: found 0 of at least 4"
+
+
+def check_s3(sb=None):
+    """The S3 check: the description with 3 places without a line is refused with the counts. Raises AssertionError anchored on its own message."""
+    code, out = Run(NO_LINES, plan(LINE_RULE), sb=sb)()
+    if S3_MSG not in out or code != 1:
+        raise AssertionError("S3 check: '%s' missing (exit %s): %s" % (S3_MSG, code, out.strip()))
+
+
+def check_s11(sb=None):
+    for name, text, refused in (("fenced cause after why", FENCED_CAUSE, True), ("real cause, fenced why", REAL_CAUSE_FENCED_WHY, False),
+                                ("tilde fence", FENCED_CAUSE_TILDE, True), ("fence never closed", FENCED_CAUSE_OPEN, True),
+                                ("fenced why before the real cause", FENCED_WHY_BEFORE, False)):
+        code, out = Run(text, plan(LINE_RULE), sb=sb)()
+        if refused and (code != 1 or out.count(MSG) != 1):
+            raise AssertionError("S11 check: '%s' missing for %s (exit %s): %s" % (MSG, name, code, out.strip()))
+        if not refused and code != 0:
+            raise AssertionError("S11 check: %s must pass, exit %s: %s" % (name, code, out.strip()))
+
+
+def check_s12_form(sb=None):
+    code, out = Run(TWO_ITEMS, S12_RULE_PLAN, sb=sb)()
+    if code != 0 or "PASS" not in out:
+        raise AssertionError("S12 form check: the pass field says items, expected PASS (exit %s): %s" % (code, out.strip()))
+
+
+def check_s12_empty(sb=None):
+    try:
+        code, out = Run(GOOD, plan(LINE_RULE), sb=sb, arg="")()
+    except Exception as err:   # the old path ran (a runner or process call)
+        raise AssertionError("S12 empty check: expected 'not checked', the old path ran: %r" % (err,))
+    if code != 1 or out.count("not checked") != 1 or "PASS" in out or "FAIL" in out:
+        raise AssertionError("S12 empty check: expected one 'not checked' line and exit 1, got exit %s: %s" % (code, out.strip()))
+
+
+def source_copy(tmp, edits=()):
+    """A copy of bin/ in tmp with each (file under bin/, old, new) edit applied exactly once; returns the loaded entry."""
+    import shutil
+    for src in [p for p in (REPO / "bin").iterdir() if p.name != "test-switchboard" and (p.is_dir() or p.suffix in ("", ".py", ".parts"))]:
+        dst = Path(tmp) / "bin" / src.name
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(src, dst) if src.is_dir() else shutil.copy(src, dst)
+    for rel, old, new in edits:
+        target = Path(tmp) / "bin" / rel
+        source = target.read_text()
+        assert source.count(old) == 1, "mutation not applied exactly once in %s: %d" % (rel, source.count(old))
+        target.write_text(source.replace(old, new))
+    return load_entry(Path(tmp) / "bin" / "fleet-switchboard", "sb_bc_%s" % abs(hash((str(tmp), str(edits)))))
+
+
 class TestBodyCheck(unittest.TestCase):
+    def mutant_fails(self, check, edits):
+        """Control first (the unmutated copy passes the check), then the mutant copy must fail it; returns the failure text."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            check(source_copy(Path(tmp) / "control"))
+            with tempfile.TemporaryDirectory() as tmp2:
+                mutant = source_copy(Path(tmp2), edits)
+                with self.assertRaises(AssertionError) as caught:
+                    check(mutant)
+        return str(caught.exception)
+
     def test_s8_the_documentation_sentence_and_the_unit_row_each_once(self):
         doc = (REPO / "docs" / "switchboard.md").read_text()
         sentences = [l for l in doc.splitlines() if "preflight-pr --body" in l]
@@ -115,27 +188,40 @@ class TestBodyCheck(unittest.TestCase):
             items.add(re.findall(r"REFUSED: (.*)", out)[0])
         self.assertEqual(len(items), 3)
 
-    def test_s6_a_build_that_skips_the_count_check_fails_the_s3_test(self):
-        import shutil
-        import tempfile
+    def test_s6_a_build_that_skips_the_count_check_fails_the_s3_check(self):
         old = "    if (got < count) if form == \"at least\" else (got != count):\n"
-        with tempfile.TemporaryDirectory() as tmp:
-            for src in [p for p in (REPO / "bin").iterdir() if p.name != "test-switchboard" and (p.is_dir() or p.suffix in ("", ".py", ".parts"))]:
-                dst = Path(tmp) / "bin" / src.name
-                dst.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copytree(src, dst) if src.is_dir() else shutil.copy(src, dst)
-            part = Path(tmp) / "bin" / "switchboard" / "body_check.py"
-            source = part.read_text()
-            self.assertEqual(source.count(old), 1)   # the mutation applies exactly once
-            control = load_entry(Path(tmp) / "bin" / "fleet-switchboard", "sb_body_check_control")
-            code, out = Run(NO_LINES, plan(LINE_RULE), sb=control)()   # control first: the unmutated copy gives the S3 refusal
-            self.assertEqual(code, 1)
-            self.assertIn("places with a file and line: found 0 of at least 4", out)
-            part.write_text(source.replace(old, "    if False:\n"))
-            mutant = load_entry(Path(tmp) / "bin" / "fleet-switchboard", "sb_body_check_mutant")
-            code, out = Run(NO_LINES, plan(LINE_RULE), sb=mutant)()
-        self.assertEqual(code, 0)   # the S3 test's assertions (exit 1, the found-0-of-4 line) fail on this build
-        self.assertNotIn("places with a file and line: found 0 of at least 4", out)
+        text = self.mutant_fails(check_s3, [("switchboard/body_check.py", old, "    if False:\n")])
+        self.assertIn("S3 check: '%s' missing" % S3_MSG, text)
+
+    def test_s3_the_check_function_passes_on_the_real_build(self):
+        check_s3()
+
+    def test_s11_fenced_headings_are_not_read(self):
+        check_s11()
+        for text in (FENCED_CAUSE, FENCED_CAUSE_TILDE, FENCED_CAUSE_OPEN):
+            self.assertEqual(Run(text, plan(LINE_RULE))()[1].count(MSG), 1)
+        self.assertEqual(Run(REAL_CAUSE_FENCED_WHY, plan(LINE_RULE))()[0], 0)
+
+    def test_s11_a_mutant_that_reads_headings_inside_fences_fails(self):
+        text = self.mutant_fails(check_s11, [("switchboard/body_check.py", "    out, fence = [], None\n", "    return text\n    out, fence = [], None\n")])
+        self.assertIn("S11 check: fenced why before the real cause must pass", text)
+
+    def test_s12_the_form_is_read_from_the_pass_field_only(self):
+        check_s12_form()
+
+    def test_s12_an_empty_body_argument_is_not_checked(self):
+        check_s12_empty()
+
+    def test_s12_a_mutant_reading_the_form_from_the_text_fails(self):
+        old = '    if _body_re(r"\\bline\\b", "I").search(str(scenario.get("pass", ""))):\n'
+        new = '    if _body_re(r"\\bline\\b", "I").search(str(scenario.get("pass", "")) + " " + str(scenario.get("text", ""))):\n'
+        text = self.mutant_fails(check_s12_form, [("switchboard/body_check.py", old, new)])
+        self.assertIn("S12 form check: the pass field says items, expected PASS", text)
+
+    def test_s12_a_mutant_testing_the_argument_for_truth_fails(self):
+        old = 'getattr(args, "body", None) is not None:'
+        text = self.mutant_fails(check_s12_empty, [("fleet-switchboard", old, 'getattr(args, "body", None):')])
+        self.assertIn("S12 empty check: expected", text)
 
     def test_s4_the_count_forms_and_the_no_count_rule(self):
         self.assertEqual(SB.body_rule_count("on 28 Oct the section names at least 4 places"), (4, "at least"))
