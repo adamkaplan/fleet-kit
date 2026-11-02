@@ -575,6 +575,23 @@ def pass_and_merge(reading, gh, conf, state, repo, number, holder, pid, clock, s
         release(state, repo, before["branch"], holder)   # the shim frees it too; both are harmless
     if code != 0:
         said = (err or out or "").strip().splitlines()
-        return done(10 if code == 10 else 1, "merge-gate --pass --merge: the merge was refused or failed (exit %d), the lock is released: %s" % (code, (said[0] if said else "no message")[:300]),
-                    "refused: merge exit %d" % code)
+        audit["merge_exit"] = code
+        audit["merge_said"] = (said[0] if said else "no message")[:300]
+        if code == 10:
+            return done(10, "merge-gate --pass --merge: the merge was refused or failed (exit %d), the lock is released: %s" % (code, (said[0] if said else "no message")[:300]),
+                        "refused: merge exit %d" % code)
+        mcode, mout, _ = gh(["pr", "view", str(number), "-R", repo, "--json", "state,headRefOid,mergeCommit"])
+        try:
+            mdata = json.loads(mout) if mcode == 0 else None
+        except ValueError:
+            mdata = None
+        seen = "could not be read"
+        if isinstance(mdata, dict):
+            seen = "%s at head %s" % (mdata.get("state"), str(mdata.get("headRefOid") or "")[:8])
+            if mdata.get("state") == "MERGED" and mdata.get("headRefOid") == head:
+                audit["merge_state"] = seen
+                return done(0, "merged %s at head %s (squash); gh exited %d: %s" % (ref, head[:8], code, audit["merge_said"]), "merged")
+        audit["merge_state"] = seen
+        return done(1, "merge-gate --pass --merge: refused or failed (exit %d), the pull request state is unknown at %s (%s): read the pull request: %s" % (
+            code, time.strftime("%H:%M:%SZ", time.gmtime(clock())), seen, audit["merge_said"]), "refused: merge exit %d" % code)
     return done(0, "merged %s at head %s (squash, --match-head-commit)" % (ref, head[:8]), "merged")
