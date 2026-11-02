@@ -87,7 +87,7 @@ REAL_CAUSE_FENCED_WHY = "PLAN: acme-org/demo#7\n\n## Cause\n\n%s\n\n```\n## Why\
 S12_RULE_PLAN = plan("the first section names at least 2 named items", text="Given the line of the description, when read, then the cause is first")
 TWO_ITEMS = "PLAN: acme-org/demo#7\n\n## The cause\n\nSee #101 and #102.\n"
 FENCED_WHY_BEFORE = "PLAN: acme-org/demo#7\n\n```\n## Why\nbefore\n```\n\n## Cause\n\n%s\n" % FENCE_LINES
-MSG = "the cause section is not first"
+BC_NOT_FIRST = "the cause section is not first"
 S3_MSG = "places with a file and line: found 0 of at least 4"
 
 
@@ -103,8 +103,8 @@ def check_s11(sb=None):
                                 ("tilde fence", FENCED_CAUSE_TILDE, True), ("fence never closed", FENCED_CAUSE_OPEN, True),
                                 ("fenced why before the real cause", FENCED_WHY_BEFORE, False)):
         code, out = Run(text, plan(LINE_RULE), sb=sb)()
-        if refused and (code != 1 or out.count(MSG) != 1):
-            raise AssertionError("S11 check: '%s' missing for %s (exit %s): %s" % (MSG, name, code, out.strip()))
+        if refused and (code != 1 or out.count(BC_NOT_FIRST) != 1):
+            raise AssertionError("S11 check: '%s' missing for %s (exit %s): %s" % (BC_NOT_FIRST, name, code, out.strip()))
         if not refused and code != 0:
             raise AssertionError("S11 check: %s must pass, exit %s: %s" % (name, code, out.strip()))
 
@@ -124,29 +124,28 @@ def check_s12_empty(sb=None):
         raise AssertionError("S12 empty check: expected one 'not checked' line and exit 1, got exit %s: %s" % (code, out.strip()))
 
 
-def source_copy(tmp, edits=()):
-    """A copy of bin/ in tmp with each (file under bin/, old, new) edit applied exactly once; returns the loaded entry."""
-    import shutil
-    for src in [p for p in (REPO / "bin").iterdir() if p.name != "test-switchboard" and (p.is_dir() or p.suffix in ("", ".py", ".parts"))]:
-        dst = Path(tmp) / "bin" / src.name
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copytree(src, dst) if src.is_dir() else shutil.copy(src, dst)
-    for rel, old, new in edits:
-        target = Path(tmp) / "bin" / rel
-        source = target.read_text()
-        assert source.count(old) == 1, "mutation not applied exactly once in %s: %d" % (rel, source.count(old))
-        target.write_text(source.replace(old, new))
-    return load_entry(Path(tmp) / "bin" / "fleet-switchboard", "sb_bc_%s" % abs(hash((str(tmp), str(edits)))))
-
-
 class TestBodyCheck(unittest.TestCase):
+    def source_copy(self, tmp, edits=()):
+        """A copy of bin/ in tmp with each (file under bin/, old, new) edit applied exactly once; returns the loaded entry."""
+        import shutil
+        for src in [p for p in (REPO / "bin").iterdir() if p.name != "test-switchboard" and (p.is_dir() or p.suffix in ("", ".py", ".parts"))]:
+            dst = Path(tmp) / "bin" / src.name
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(src, dst) if src.is_dir() else shutil.copy(src, dst)
+        for rel, old, new in edits:
+            target = Path(tmp) / "bin" / rel
+            source = target.read_text()
+            assert source.count(old) == 1, "mutation not applied exactly once in %s: %d" % (rel, source.count(old))
+            target.write_text(source.replace(old, new))
+        return load_entry(Path(tmp) / "bin" / "fleet-switchboard", "sb_bc_%s" % abs(hash((str(tmp), str(edits)))))
+
     def mutant_fails(self, check, edits):
         """Control first (the unmutated copy passes the check), then the mutant copy must fail it; returns the failure text."""
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
-            check(source_copy(Path(tmp) / "control"))
+            check(self.source_copy(Path(tmp) / "control"))
             with tempfile.TemporaryDirectory() as tmp2:
-                mutant = source_copy(Path(tmp2), edits)
+                mutant = self.source_copy(Path(tmp2), edits)
                 with self.assertRaises(AssertionError) as caught:
                     check(mutant)
         return str(caught.exception)
@@ -199,7 +198,7 @@ class TestBodyCheck(unittest.TestCase):
     def test_s11_fenced_headings_are_not_read(self):
         check_s11()
         for text in (FENCED_CAUSE, FENCED_CAUSE_TILDE, FENCED_CAUSE_OPEN):
-            self.assertEqual(Run(text, plan(LINE_RULE))()[1].count(MSG), 1)
+            self.assertEqual(Run(text, plan(LINE_RULE))()[1].count(BC_NOT_FIRST), 1)
         self.assertEqual(Run(REAL_CAUSE_FENCED_WHY, plan(LINE_RULE))()[0], 0)
 
     def test_s11_a_mutant_that_reads_headings_inside_fences_fails(self):
