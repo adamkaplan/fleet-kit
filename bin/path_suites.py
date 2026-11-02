@@ -44,6 +44,13 @@ NEW_BIN_GUARDS = (
     ("TestDerivedClosure", "bin/test-switchboard", "TestDerivedClosure", None, "the closure of the delegated clear is derived over the entry and every part (tests/switchboard/test_closure.py)"),
 )
 
+# The guards a NEW file under shims/ must pass (ask #1909): same shape as NEW_BIN_GUARDS.
+NEW_SHIM_GUARDS = (
+    ("TestShimHygiene", "bin/test-switchboard", "TestShimHygiene", None, "every module under shims/ is standard library only and holds no personal name"),
+    ("bin/check-public-names", "bin/check-public-names", None, None, "no private name in a tracked file"),
+    ("bin/test-gh-hold", "bin/test-gh-hold", None, None, "every shim module is installed beside the shim in its rig and the hold tests pass"),
+)
+
 
 class PathSuitesError(Exception):
     pass
@@ -275,6 +282,13 @@ def guard_rows(added):
     if not new:
         return []
     return [(g[1], [g[2]] if g[2] else [], guard_command(g), new) for g in NEW_BIN_GUARDS]
+
+
+
+def shim_guard_rows(added):
+    """The rows of NEW_SHIM_GUARDS (same shape as guard_rows) when `added` holds a new file under shims/; [] otherwise."""
+    shims = [p for p in added or [] if p.startswith("shims/")]
+    return [(g[1], [g[2]] if g[2] else [], guard_command(g), shims) for g in NEW_SHIM_GUARDS] if shims else []
 
 
 def plan(root, paths, files=None, runner=subprocess.run, added=None):
