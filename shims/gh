@@ -1390,10 +1390,29 @@ def api_start(args):
     return words[0][0] if words and words[0][1] == "api" else None
 
 
+ALLOWED_KEYS = ("body", "event", "commit_id", "path", "position", "line", "side", "start_line", "start_side", "in_reply_to", "subject_type")   # #1696 PC-12: the only keys that pass on a comment or review endpoint
+
+
+def key_known(key):
+    """True for a key on the fixed allowlist: `body` in any case (it is the signed key), the others exactly."""
+    return key.lower() == "body" or key in ALLOWED_KEYS
+
+
+def early_method_flag(words):
+    """True when the words before the api word hold a method flag (-X, -XPATCH, --method, --method=PATCH): the real gh does not take one there."""
+    return any(w in ("-X", "--method") or w.startswith("--method=") or (w.startswith("-X") and not w.startswith("--")) for w in words)
+
+
+def refuse_early_method(args, at):
+    if early_method_flag(args[:at]):
+        raise Refused("a method flag (-X, --method) before the api word is refused: the real gh does not accept it there, so the call cannot be signed; write it after api")
+
+
 def api_parsed(args):
     at = api_start(args)
     if at is None:
         raise Refused("not a gh api call")
+    refuse_early_method(args, at)
     return parse_api_argv(args[at:])
 
 
@@ -1470,11 +1489,8 @@ def passed_copy(args, index, inline, value, text):
     return new, None, temp
 
 
-def body_below(value, depth=0):
-    if depth > 20:
-        raise Refused("the --input JSON is nested deeper than 20 levels, so its bodies cannot be checked")
-    items = value.items() if isinstance(value, dict) else enumerate(value) if isinstance(value, list) else ()
-    return any((isinstance(k, str) and k.lower() == "body") or body_below(v, depth + 1) for k, v in items)
+def scalar(value):
+    return value is None or isinstance(value, (str, int, float, bool))
 
 
 def input_call(args, name, found):
@@ -1483,25 +1499,28 @@ def input_call(args, name, found):
     if not isinstance(data, dict):
         raise Refused("the --input JSON is not an object (an array or a scalar), so its body cannot be found and signed: send a JSON object")
     signed = False
-    for key in [k for k in data if isinstance(k, str) and k.lower() == "body"]:
+    for key in data:
+        if not (isinstance(key, str) and (key_known(key) or key.lower() == "comments")):
+            raise Refused("the --input key %s is not one of the known keys, so the call cannot be checked and nothing was posted" % repr(key)[:40])
+        if key.lower() != "comments" and not scalar(data[key]):
+            raise Refused("the --input value of %s is not a string, number, boolean or null, so it cannot be checked" % key[:40])
+    for key in [k for k in data if k.lower() == "body"]:
         if not isinstance(data[key], str):
             raise Unsignable("the --input body is not a string")
         data[key] = sign(data[key], name)
         signed = True
-    for key in [k for k in data if isinstance(k, str) and k.lower() == "comments"]:
+    for key in [k for k in data if k.lower() == "comments"]:
         if not isinstance(data[key], list) or not all(isinstance(item, dict) for item in data[key]):
             raise Refused("the --input comments is not a list of objects, so the bodies in it cannot be signed")
         for item in data[key]:
-            for sub in [k for k in item if isinstance(k, str) and k.lower() == "body"]:
+            for sub in item:
+                if not (isinstance(sub, str) and key_known(sub)) or not scalar(item[sub]):
+                    raise Refused("the --input comment key %s is not a known key with a plain value, so the call cannot be checked" % repr(sub)[:40])
+            for sub in [k for k in item if k.lower() == "body"]:
                 if not isinstance(item[sub], str):
                     raise Unsignable("the --input comment body is not a string")
                 item[sub] = sign(item[sub], name)
                 signed = True
-    rest = [v for k, v in data.items() if not (isinstance(k, str) and k.lower() in ("body", "comments"))]
-    for key in [k for k in data if isinstance(k, str) and k.lower() == "comments"]:
-        rest += [item[sub] for item in data[key] for sub in item if not (isinstance(sub, str) and sub.lower() == "body")]
-    if any(body_below(v) for v in rest):
-        raise Refused("the --input JSON holds a body below the level that is signed, so it cannot be signed: send the comment bodies at the first level")
     if not signed:
         return passed_copy(args, index, inline, value, text)
     out = json.dumps(data)
@@ -1617,6 +1636,9 @@ def sign_plan(args, lookup):
     form and kept in the new argv."""
     lead = leading_repo_flags(args)
     core = args[lead:]
+    at = api_start(core)
+    if at:
+        refuse_early_method(core, at)
     if len(core) >= 3 and (core[0], core[1]) in SIGNED_COMMANDS:
         handler = lambda namer: signed_call(core, namer())
     elif len(core) >= 3 and (core[0], core[1]) in CLOSE_COMMANDS:
@@ -2096,9 +2118,9 @@ def api_decide(args, namer, previous):
             query = raw.partition("#")[0].partition("?")[2]
             query_keys = [urllib.parse.unquote(part.partition("=")[0]) for part in re.split(r"[&;]", query) if part]
             for key in query_keys + [f.partition("=")[0] for f in fields]:
-                if "%" in key or ((key != "body" or key in query_keys) and re.search(r"(?i)(^|\[)body(\]|\[\])*$", key)):
-                    raise Refused("a body written as %s (a nested key, another case, or the URL query string) on a comment or review endpoint cannot be signed: send it as -f body=... or --input with a JSON object" % key[:40])
-        if found[2] and has_input and any(re.search(r"(?i)(^|\[)body(\]|\[\])*$", f.partition("=")[0]) for f in fields):
+                if "%" in key or not key_known(key) or (key.lower() == "body" and key in query_keys):
+                    raise Refused("the key %s (not a known key, or a body in the URL query string) on a comment or review endpoint cannot be signed: send body, event, commit_id, path, position, line, side, start_line, start_side, in_reply_to or subject_type as -f or in an --input JSON object" % repr(key)[:40])
+        if found[2] and has_input and any(f.partition("=")[0].lower() == "body" for f in fields):
             raise Refused("a -f or -F body field with --input on a comment or review endpoint is sent by gh as a URL query parameter and cannot be signed: put the body in the --input JSON object")
         if found[2] and len(api_parse(args)[2]) != len(fields):
             raise Refused("the flags of this gh api call to a comment or review endpoint cannot be read, so its body cannot be signed and nothing was posted")
