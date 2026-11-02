@@ -262,7 +262,7 @@ def marked_name(body):
     return found.group(1) if found else None
 
 
-def one_line(text, limit=300):
+def edit_one_line(text, limit=300):
     return " ".join(str(text or "").split())[:limit]
 
 
@@ -278,7 +278,7 @@ def gh_call(reader, repo, path, method, payload=None):
     except OSError as err:
         raise CommentEditFailed("unavailable", "cannot run %s: %s" % (reader.gh, err.strerror or err)) from None
     if done.returncode != 0:
-        detail = one_line(done.stderr) or one_line(done.stdout) or "exit %d" % done.returncode
+        detail = edit_one_line(done.stderr) or edit_one_line(done.stdout) or "exit %d" % done.returncode
         raise CommentEditFailed("gh", reader.accounts.scrub(detail) if reader.accounts else detail)
     try:
         return load_module("record_json").parse_bounded(done.stdout)
@@ -303,7 +303,7 @@ def edit_in_place(reader, caller, url, text, approval, entries, audited, mark_li
     `audited(subject, detail)` is a context manager that yields a dict; `entries()` returns the audit tail; `mark_line(name)` the marker line."""
     found = COMMENT_URL.match(url or "")
     if not found:
-        raise CommentEditRefused("not a comment url (https://github.com/OWNER/REPO/issues/N#issuecomment-ID): %s" % one_line(url, 80))
+        raise CommentEditRefused("not a comment url (https://github.com/OWNER/REPO/issues/N#issuecomment-ID): %s" % edit_one_line(url, 80))
     repo, number, ident = found.group(1), int(found.group(2)), found.group(3)
     path = "repos/%s/issues/comments/%s" % (repo, ident)
     posted = gh_call(reader, repo, path, "GET")
