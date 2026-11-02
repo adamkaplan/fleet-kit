@@ -75,7 +75,7 @@ class S7Zombie(unittest.TestCase):
 
 
 class S16SkipText(unittest.TestCase):
-    """S16 of #1709: the skip text is exercised on a fake of a machine without /proc (state_of raises OSError)."""
+    """S16 of #1709: the skip text is exercised on a fake of a machine without /proc (/proc cannot be read: state_of answers None)."""
     def run_zombie_test(self):
         started = []
         real_start = stub_support.start
@@ -99,7 +99,7 @@ class S16SkipText(unittest.TestCase):
         real_state = globals()["state_of"]
 
         def cannot_read(pid):
-            raise OSError("fake: no /proc")
+            return None   # as state_of answers when /proc cannot be read
         globals()["state_of"] = cannot_read
         self.addCleanup(globals().__setitem__, "state_of", real_state)
         f_result, f_started = self.run_zombie_test()
