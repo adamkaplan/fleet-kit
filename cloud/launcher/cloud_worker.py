@@ -393,6 +393,93 @@ SCRUB_OUTPUT_MAX = 2 * SCRUB_INPUT_MAX   # a limit above the input maximum: reda
 MIN_FRAGMENT = 8
 
 
+class KnownSet(set):
+    """A set of known secret forms that keeps a `version` (bumped AFTER every change of its content, even when the change
+    raises half-way) and the structure `scrub` built for it (`built`), so a call whose structure is current never reads the set."""
+    def __init__(self, *args):
+        self.version = 0
+        self.built = None
+        super().__init__(*args)
+
+    def add(self, *args):
+        try:
+            return set.add(self, *args)
+        finally:
+            self.version += 1
+
+    def update(self, *args):
+        try:
+            return set.update(self, *args)
+        finally:
+            self.version += 1
+
+    def discard(self, *args):
+        try:
+            return set.discard(self, *args)
+        finally:
+            self.version += 1
+
+    def remove(self, *args):
+        try:
+            return set.remove(self, *args)
+        finally:
+            self.version += 1
+
+    def pop(self, *args):
+        try:
+            return set.pop(self, *args)
+        finally:
+            self.version += 1
+
+    def clear(self, *args):
+        try:
+            return set.clear(self, *args)
+        finally:
+            self.version += 1
+
+    def __ior__(self, *args):
+        try:
+            return set.__ior__(self, *args)
+        finally:
+            self.version += 1
+
+    def __iand__(self, *args):
+        try:
+            return set.__iand__(self, *args)
+        finally:
+            self.version += 1
+
+    def __isub__(self, *args):
+        try:
+            return set.__isub__(self, *args)
+        finally:
+            self.version += 1
+
+    def __ixor__(self, *args):
+        try:
+            return set.__ixor__(self, *args)
+        finally:
+            self.version += 1
+
+    def difference_update(self, *args):
+        try:
+            return set.difference_update(self, *args)
+        finally:
+            self.version += 1
+
+    def intersection_update(self, *args):
+        try:
+            return set.intersection_update(self, *args)
+        finally:
+            self.version += 1
+
+    def symmetric_difference_update(self, *args):
+        try:
+            return set.symmetric_difference_update(self, *args)
+        finally:
+            self.version += 1
+
+
 _SCRUB_MARK = "[redacted]"
 _SCRUB_SLOT = [None]  # (snapshot, order, index) for a set that keeps no version of its own
 
@@ -1548,7 +1635,7 @@ class Kube:
         self.context = (env.get("CW_KUBE_CONTEXT") or "").strip()
         self.kubeconfig = (env.get("CW_KUBECONFIG") or "").strip()
         self.dir = None
-        self.known = set()  # values of this run's secrets, known to scrub(); never logged
+        self.known = KnownSet()  # values of this run's secrets, known to scrub(); never logged
         if token_mode(env):
             self._generate_kubeconfig(env)
 
