@@ -32,9 +32,12 @@ def _remote(host, runner=subprocess.run):
     done = runner(["ssh", "-o", "BatchMode=yes", "-o", "PasswordAuthentication=no", "-o", "ConnectTimeout=%d" % SSH_SECONDS,
                    "-o", "NumberOfPasswordPrompts=0", "--", host, "fleet-switchboard", "status", "--json"],
                   capture_output=True, text=True, timeout=SSH_SECONDS)
+    if done.returncode != 0:
+        raise RuntimeError("ssh exited with status %s" % done.returncode)
     report = json.loads(done.stdout)
     entries = report["agents"]["list"]
-    return [e.get("name") for e in entries if isinstance(e, dict) and e.get("name")]
+    # an entry with no `observation` is only the recipient of a pending message: it has no session, so it is not alive
+    return [e.get("name") for e in entries if isinstance(e, dict) and e.get("name") and e.get("observation")]
 
 
 def default_ask(host, agent, this_host=None, remote=_remote, local=_local):

@@ -59,6 +59,29 @@ class Module(unittest.TestCase):
         self.assertEqual(seen["kw"]["timeout"], 5)
 
 
+def stub_ssh(status, entries):
+    def runner(argv, **kw):
+        return subprocess.CompletedProcess(argv, status, stdout=json.dumps({"agents": {"list": entries}}), stderr="")
+    return runner
+
+
+class ExitStatus(unittest.TestCase):
+    def test_a_non_zero_exit_with_valid_json_and_an_empty_list_is_unreachable(self):
+        runner = stub_ssh(1, [])
+        got = host_liveness.check("h1", "a1", ask=lambda h, a: host_liveness._remote(h, runner=runner))
+        self.assertEqual(got["verdict"], "unreachable")
+
+    def test_exit_zero_with_the_agent_absent_is_dead(self):
+        runner = stub_ssh(0, [{"name": "a9", "observation": {"session_id": "s9"}}])
+        got = host_liveness.check("h1", "a1", ask=lambda h, a: host_liveness._remote(h, runner=runner))
+        self.assertEqual(got["verdict"], "dead")
+
+    def test_a_recipient_entry_with_no_session_is_not_alive(self):
+        runner = stub_ssh(0, [{"name": "a1", "observation": None}])
+        got = host_liveness.check("h1", "a1", ask=lambda h, a: host_liveness._remote(h, runner=runner))
+        self.assertEqual(got["verdict"], "dead")
+
+
 def make_doctor_dir(tmp, text=None):
     """A bin dir holding a copy of the doctor (optionally changed) beside the modules it loads."""
     d = Path(tmp) / "bin"
@@ -175,6 +198,34 @@ class Mutant(unittest.TestCase):
         self.assertFalse(noop != original and old in original and old not in noop, "the no-op mutation passed the computation")
         with self.assertRaisesRegex(AssertionError, "^a host charter was read as a pane:"):
             judge("\n".join(run_doctor(THREE, doctor_text=changed)))
+
+
+class ExitMutant(unittest.TestCase):
+    """A copy of the module in which the exit status is not checked."""
+
+    def verdict(self, source):
+        space = {"__name__": "mutant"}
+        exec(compile(source, "host_liveness_copy", "exec"), space)
+        runner = stub_ssh(1, [])
+        return space["check"]("h1", "a1", ask=lambda h, a: space["_remote"](h, runner=runner))["verdict"]
+
+    def judge(self, source):
+        got = self.verdict(source)
+        if got != "unreachable":
+            raise AssertionError("a failed ssh was judged %s, not unreachable" % got)
+
+    def test_dropping_the_exit_status_check_fails(self):
+        original = (BIN / "host_liveness.py").read_text()
+        self.judge(original)   # the control, run first: it passes
+        old = "    if done.returncode != 0:\n"
+        self.assertEqual(original.count(old), 1)
+        changed = original.replace(old, "    if False:\n", 1)
+        applied = changed != original and old in original and old not in changed
+        self.assertTrue(applied, "the mutation was not applied")
+        noop = original.replace(old, old, 1)
+        self.assertFalse(noop != original and old in original and old not in noop, "the no-op mutation passed the computation")
+        with self.assertRaisesRegex(AssertionError, "^a failed ssh was judged dead, not unreachable"):
+            self.judge(changed)
 
 
 if __name__ == "__main__":
