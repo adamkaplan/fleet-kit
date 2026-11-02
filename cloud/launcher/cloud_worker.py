@@ -1290,7 +1290,7 @@ def _complete_pending(path, now_ts=None):
                 return {"done": record["done"] + 1, "pending": None,
                         "cuts": record["cuts"] + [{"cut": pend.get("cut", 0), "archive": name}]}
             ts = pend.get("ts")
-            if not isinstance(ts, (int, float)) or now_ts - ts > AUDIT_PENDING_STALE:
+            if isinstance(ts, bool) or not isinstance(ts, (int, float)) or not math.isfinite(ts) or ts > now_ts or now_ts - ts > AUDIT_PENDING_STALE:
                 return dict(record, pending=None)
             return None
         _record_update(path, complete)
@@ -1325,6 +1325,7 @@ def rotate_audit(path, now=None, dry_run=False, _before_swap=None, _before_lock=
     directory = os.path.dirname(path) or "."
     temps = []
     pending = False
+    keep_fd = None
     try:
         with open(path, "rb") as f:
             seen = os.fstat(f.fileno())
@@ -1374,7 +1375,6 @@ def rotate_audit(path, now=None, dry_run=False, _before_swap=None, _before_lock=
             wrote.append(1)
             return dict(record, pending=mine_pending)
         if not _record_update(path, put_pending) or not wrote:   # another rotator's pending is unfinished: not now, nothing written, nothing lost
-            os.close(keep_fd)
             raise _GaveUp()
         pending = True
         if _before_lock:
@@ -1387,7 +1387,8 @@ def rotate_audit(path, now=None, dry_run=False, _before_swap=None, _before_lock=
                     raise _GaveUp()
                 f.seek(len(data))
                 late = f.read()   # lines appended while the archive was written travel with the live part
-            with os.fdopen(keep_fd, "wb") as out:
+            keep_file, keep_fd = os.fdopen(keep_fd, "wb"), None   # the file object owns the descriptor now
+            with keep_file as out:
                 out.write(data[cut:] + late)
             if _before_swap:
                 _before_swap()
@@ -1411,6 +1412,12 @@ def rotate_audit(path, now=None, dry_run=False, _before_swap=None, _before_lock=
                 if attempt == 2:
                     print("cloud-worker: the audit rotation record could not be written (%s)" % _err_text(e), file=sys.stderr)
     except Exception as e:
+        if keep_fd is not None:   # a give-up or a failure closes the file opened for the replacement, once
+            try:
+                os.close(keep_fd)
+            except OSError:
+                pass
+            keep_fd = None
         if pending:   # a failure before the replacement clears pending
             try:
                 def clear_own(record):   # only this rotation's own pending
