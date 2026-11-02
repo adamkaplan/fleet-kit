@@ -315,7 +315,7 @@ Not run in a cluster: the live check (a real pod with an ended token, and the no
 
 ## Retention of the audit (ask #1743)
 
-- **The audit.** The launcher's audit file is rotated when the live file is over 4 MiB: everything older than its newest 1 MiB goes into dated compressed files (`audit-<UTC date>.jsonl.gz`, kept 30 days) and the live file keeps its newest 1 MiB. The rotation leaves the file `audit.jsonl.rotations` beside the audit; a reader that follows the audit (the lost-worker pass and the end alert) follows that rotation record and reads the archive part it had not read, once, before the live file.
+- **The audit.** The launcher's audit file is rotated when the live file is over 4 MiB: everything older than its newest 1 MiB goes into dated compressed files (`audit-<UTC date>.jsonl.gz`, kept 30 days) and the live file keeps its newest 1 MiB. The rotation leaves the file `audit.jsonl.rotations` beside the audit; a reader that follows the audit (the lost-worker pass and the end alert) follows that rotation record and reads the archive part it had not read, once, before the live file. A `pending` entry of the rotation record belongs to the rotation whose archive name it carries; only that rotation, or another rotation that completes it, completes or clears it. A `pending` older than 120 seconds or dated after now is stale: it is cleared with its archive left, and the rotation then runs.
 
 ## Tests (no cluster, no Azure)
 
