@@ -29,7 +29,7 @@ Receipt format: `docs/plan-template.md`.
 2. **Clauses to scenarios**: every clause needs a behaviour scenario (`S`); behaviour that must NOT change is a
    `U` scenario. Each scenario has `covers` (`DW-n` or `PC-n`), `text` (Given/when/then), `proof` (`test | live | measure |
    screenshot | review`; `review` quotes text), `pass` (a concrete observable: a status, a number, a quoted value), `discriminates` (the specific wrong
-   build that would FAIL it), `evaluator` (`ci | tester | reviewer | owner`, able to record that proof), and optionally
+   build that would FAIL it), `evaluator` (`ci | tester | reviewer | owner`), and optionally
    `claim: epic` for what only an integrated head can prove (name the integration branch in the plan).
    **Owner evaluators are rare**: only where the owner's own eyes are the test, proved once with `claim: epic`; never for a routine PR.
 
