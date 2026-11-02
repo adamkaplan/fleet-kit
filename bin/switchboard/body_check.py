@@ -82,15 +82,13 @@ def body_check_problems(body, scenario):
     """([refusal items], [not checked reasons]) of one description against one cause-first scenario. Pure: no read, no write."""
     refused, unchecked = [], []
     heading, text, before, found = body_first_section(body)
-    why_at = _body_re(BODY_WHY, "I", "M").search(body_unfenced(body))
-    if not found or "cause" not in heading.lower() or _body_re(BODY_WHY, "I", "M").search(before) or (why_at and why_at.start() < body.find(heading)):
+    if not found or "cause" not in heading.lower() or _body_re(BODY_WHY, "I", "M").search(before):
         refused.append("the cause section is not first")
     count, form = body_rule_count(str(scenario.get("pass", "")))
     if count is None:
         unchecked.append("the pass rule has no count")
         return refused, unchecked
-    rule = str(scenario.get("pass", "")) + " " + str(scenario.get("text", ""))
-    if _body_re(r"\bline\b", "I").search(rule):
+    if _body_re(r"\bline\b", "I").search(str(scenario.get("pass", ""))):
         label, got = "places with a file and line", len(set(_body_re(BODY_PLACE).findall(text)))
     else:
         label, got = "named items", len(set(_body_re(BODY_ITEM).findall(text)) | set(_body_re(BODY_PLACE).findall(text)))
