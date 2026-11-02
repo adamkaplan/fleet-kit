@@ -149,7 +149,7 @@ class TestOpenListPagesRead(CutsBase):
 
 
 class TestOpenListDerivedText(Base):
-    """S15: the text and LABEL_HOLD_LIST_CUT follow OPEN_LIST_PAGES in a copy of the entry (control first)."""
+    """S15: the text follows OPEN_LIST_PAGES in a copy of the entry (control first)."""
 
     def load(self, edit, tag):
         tmp = tempfile.mkdtemp()   # kept until the test ends: the entry loads its modules lazily
@@ -169,11 +169,10 @@ class TestOpenListDerivedText(Base):
         mod.open_list_alert(engine, "acme/api", NOW)
         return sent[0][4]
 
-    def test_s15_the_text_and_the_hold_cut_follow_the_ceiling(self):
+    def test_s15_the_text_follows_the_ceiling_and_no_second_copy_exists(self):
         line = "OPEN_LIST_PAGES = 10 "
         _, control = self.load(lambda t: t, "control")
-        self.assertEqual(control.LABEL_HOLD_LIST_CUT, 1000)
-        self.assertEqual(sb.LABEL_HOLD_LIST_CUT, 1000)
+        self.assertEqual(self.definitions(), 0, msg="LABEL_HOLD_LIST_CUT is defined nowhere over bin/")
         self.assertIn("1,000 or more", self.alert_text(control, str(self.make_dir("a"))))
         applied = []
 
@@ -184,8 +183,12 @@ class TestOpenListDerivedText(Base):
         edited, copy = self.load(mutate, "mutant")
         self.assertTrue(applied)
         self.assertIn("OPEN_LIST_PAGES = 5 ", edited)
-        self.assertEqual(copy.LABEL_HOLD_LIST_CUT, 500, msg="the hold cut follows the ceiling")
         self.assertIn("500 or more", self.alert_text(copy, str(self.make_dir("b"))), msg="the alert text names the ceiling of the constants")
+
+    def definitions(self):
+        bin_dir = Path(__file__).resolve().parents[2] / "bin"
+        files = [p for p in bin_dir.rglob("*") if p.is_file() and p.suffix in ("", ".py") and "__pycache__" not in p.parts and not p.name.startswith("test-")]
+        return sum(len(re.findall(r"^LABEL_HOLD_LIST_CUT\s*=", p.read_text(errors="replace"), re.M)) for p in files)
 
     def make_dir(self, name):
         path = Path(self.state_dir) / name
