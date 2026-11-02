@@ -434,6 +434,7 @@
         "bin/switchboard/alert_labels.py",
         "bin/switchboard/link_scrub.py",
         "bin/switchboard/handoff.py",
+        "bin/switchboard/agents_verify.py",
         "bin/switchboard/audit.py",
         "bin/switchboard/decision.py",
         "bin/switchboard/engine.py",
@@ -519,11 +520,14 @@
           "validate"
         ],
         "bin/switchboard/plan_input.py": [
+          "ApplyRefused",
           "_parent_ask_done_when",
+          "declared",
           "fetch_plan",
           "load_plan",
           "parse_plan_source",
-          "plan_comment_choice"
+          "plan_comment_choice",
+          "short"
         ],
         "bin/switchboard/v2_transport.py": [
           "V2Breaker",
@@ -629,6 +633,9 @@
           "reply_text",
           "worker_horizon",
           "worker_owned"
+        ],
+        "bin/switchboard/agents_verify.py": [
+          "one_line"
         ],
         "bin/switchboard/audit.py": [
           "AuditLog",
