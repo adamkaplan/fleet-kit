@@ -664,6 +664,11 @@ def refused_line(done, calls):
     return not calls and gh_err(done).startswith("gh: refused:") and len(gh_err(done).splitlines()) == 1
 
 
+def sends_mutation_tail(spelling):
+    """The battery's skip rule, written once: the spellings whose mutation-tail case is judged (the bare `graphql` is not)."""
+    return spelling != "graphql"
+
+
 def effect_battery(rig):
     """#1696 r4: names every call decided wrongly by the effect rule."""
     bad = []
@@ -702,7 +707,7 @@ def effect_battery(rig):
     for spelling in R4_SPELLINGS:
         for tail in (("-f", R4_MUTATION), ("-f", "body=x")):
             done, calls = rig.run("api", spelling, *tail)
-            if not refused_line(done, calls) and spelling != "graphql" or (spelling == "graphql" and tail[1] == "body=x" and not refused_line(done, calls)):
+            if not refused_line(done, calls) and sends_mutation_tail(spelling) or (spelling == "graphql" and tail[1] == "body=x" and not refused_line(done, calls)):
                 if not (spelling not in R3_GRAPHQL and tail[1].startswith("body") and False):
                     bad.append("round-3 spelling with %s passed: %r" % (tail[1][:5], spelling))
     for host in R4_MACOS:
@@ -848,10 +853,18 @@ class TestGhShimEffectRule(unittest.TestCase):
         self.assertTrue(any(s.startswith("unknown+body passed: foo/bar -f") for s in seen), seen[:5])
         self.assertFalse(any(s.startswith("unknown+method passed") and "-X" in s for s in seen), seen[:5])   # an explicit method is still seen
 
-    def test_r4_mutant_3_the_parser_accepts_a_mutation_is_seen(self):
+    def test_r4_mutant_3_the_parser_sees_a_mutation_in_every_case_that_reaches_it(self):
         seen = self.mutant4("        op = word\n", '        op = "query"\n')
         print("R4 mutant 3 seen:", len(seen))
-        self.assertEqual(len(seen), 4, seen[:5])   # r5 (OLD: 24, the 19 round-3 spellings and the 5 macOS forms): the raw rule now refuses the unclean ones first; only the 4 raw-valid graphql spellings reach the parser
+        reach = 0   # derived: the battery's own spellings, on the real shim, whose read reaches gh and whose mutation is refused with the GraphQL text
+        for spelling in [s for s in R4_SPELLINGS if sends_mutation_tail(s)]:
+            rdone, rcalls = self.rig.run("api", spelling, "-f", "query=" + R3_READ)
+            mdone, mcalls = self.rig.run("api", spelling, "-f", R4_MUTATION)
+            if len(rcalls) == 1 and not mcalls and gh_err(mdone) == R3_TEXT:
+                reach += 1
+        print("R4 mutant 3 derived number:", reach)
+        self.assertGreater(reach, 0)
+        self.assertEqual(len(seen), reach, seen[:5])
         self.assertTrue(all(s.startswith("round-3 spelling with query passed") for s in seen), seen[:5])
         # S9 per-name bar: under the mutant EVERY refused mutation name reaches the real gh (exactly 1 failure per name), on the real shim 0
         mrig = hermetic_rig()
