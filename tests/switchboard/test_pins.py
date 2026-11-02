@@ -24,9 +24,10 @@ def count_re_bindings(source):
     """(line, form) of every use of `re` that runs at import, read from the ast: every module-level statement (nested in module-level
     if/try/with/for/while/match/class bodies, never in a function body) plus the parts of a def that run at import (decorators, defaults,
     annotations) and of a class (bases, keywords, decorators) are read for an import of re (any form), any ast.Name `re`, and a call of
-    __import__ / importlib.import_module / import_module with the constant 're'; these read 'module-level ...', and the designed function-body
-    `import re` statements read 'function-local import re'; a binding made by code that is none of these (for example getattr(sys.modules, 're'))
-    is not seen, the honest limit of an ast read (the file has no such code, shown by the control)."""
+    __import__ / importlib.import_module / import_module with the constant 're' as its FIRST positional argument; these read 'module-level ...', and the designed function-body
+    `import re` statements read 'function-local import re'; it does NOT see any binding made by dynamic code: __import__ with a keyword argument or
+    with a name built at run time ('r'+'e', a variable holding 're'), globals()['re'] = ..., exec('import re'), import_module('.re', package=...),
+    getattr(sys.modules, 're'); the real pins.py has none of these (shown by the control: 0 module-level, 2 function-local)."""
     import ast
     found = []
 
