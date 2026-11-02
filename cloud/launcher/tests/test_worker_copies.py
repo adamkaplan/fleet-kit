@@ -57,7 +57,8 @@ def snapshot(d):
     for base, _, names in os.walk(d):
         for n in names:
             p = os.path.join(base, n)
-            snap[os.path.relpath(p, d)] = open(p, "rb").read()
+            with open(p, "rb") as f:
+                snap[os.path.relpath(p, d)] = f.read()
     return snap
 
 
@@ -96,8 +97,8 @@ class Drift(unittest.TestCase):
         self.assertIsNone(drift(d, "bin/cloud_channel_server.py", "cloud/worker/bin/cloud_channel_server.py"))
         self.assertEqual(run_in(d), (0, "0 changed\n"))
 
-    def test_s2_the_table_has_the_seven_rows_and_the_golden(self):
-        self.assertEqual(len(rows()), 8)
+    def test_s2_the_table_has_the_nine_rows_and_the_golden(self):
+        self.assertEqual(len(rows()), 9)
         self.assertIn(("agents/opencode/orchestrator.md", "cloud/worker/tests/golden/orchestrator.md"), rows())
 
 
@@ -165,6 +166,79 @@ class OneTable(unittest.TestCase):
         self.assertEqual(second_lists(text), [])
         found = second_lists(mutated)
         self.assertEqual(len(found), 1, "a second list of copies")
+
+
+BAD_ROWS = (
+    ("a", "bin/cloud_cli.py\tREADME.md"),
+    ("b1", "../x\tcloud/worker/x"),
+    ("b2", "/etc/hostname\tcloud/worker/x"),
+    ("c1", " bin/cloud_cli.py\tcloud/worker/x"),
+    ("c2", "bin/cloud_cli.py\tcloud/worker/x "),
+    ("d1", "bin/cloud_cli.py cloud/worker/x"),
+    ("d2", "bin/cloud_cli.py\tcloud/worker/x\tmore"),
+    ("e", "bin/cloud_cli.py\tcloud/worker/bin/cloud_hub.py\ncloud/worker/bin/cloud_hub.py\tcloud/worker/y"),
+    ("f", "bin/cloud_cli.py\tcloud/worker/dup\nbin/cloud_hub.py\tcloud/worker/dup"),
+    ("g", "# a comment"),
+)
+
+
+def put_table(d, extra):
+    with open(os.path.join(d, TABLE), "ab") as f:
+        f.write(("\n" + extra + "\n").encode())
+
+
+class Strict(unittest.TestCase):
+    def refused(self, d):
+        before = snapshot(d)
+        status, out = run_in(d)
+        return before, status, out
+
+    def test_s8_seven_kinds_of_bad_row_are_refused_with_one_line(self):
+        for name, row in BAD_ROWS:
+            with self.subTest(row=name):
+                d = scratch(self)
+                put_table(d, row)
+                before, status, out = self.refused(d)
+                self.assertEqual(status, 2)
+                lines = out.splitlines()
+                self.assertEqual(len(lines), 1, out)
+                self.assertRegex(lines[0], r"^row \d+: \S")
+                self.assertEqual(snapshot(d), before)
+
+    def test_s8_blank_lines_are_skipped(self):
+        d = scratch(self)
+        with open(os.path.join(d, TABLE), "ab") as f:
+            f.write(b"\n\n")
+        self.assertEqual(run_in(d), (0, "0 changed\n"))
+
+    def check_copy_path_refused(self, d):
+        put_table(d, "bin/cloud_cli.py\tREADME.md")
+        readme = slurp("README.md", d)
+        status, out = run_in(d)
+        if status == 0 or slurp("README.md", d) != readme:
+            raise AssertionError("a row outside cloud/worker was accepted: bin/cloud_cli.py\tREADME.md")
+
+    def test_s8_mutant_without_the_copy_path_test_is_caught(self):
+        control = scratch(self)
+        self.check_copy_path_refused(control)   # the control passes first
+        d = scratch(self)
+        original = slurp(COMMAND).decode()
+        old = 'if not copy.startswith("cloud/worker/") or ".." in copy.split("/"):'
+        self.assertEqual(original.count(old), 1)
+        mutated = original.replace(old, 'if False:')
+        self.assertNotEqual(mutated, original)
+        self.assertIn(old, original)
+        self.assertNotIn(old, mutated)
+        with open(os.path.join(d, COMMAND), "w") as f:
+            f.write(mutated)
+        with self.assertRaisesRegex(AssertionError, "a row outside cloud/worker was accepted: bin/cloud_cli.py"):
+            self.check_copy_path_refused(d)
+
+    def test_s8_a_no_op_mutation_fails_the_computation(self):
+        original = slurp(COMMAND).decode()
+        mutated = original.replace("not-in-the-text", "x")
+        with self.assertRaises(AssertionError):
+            self.assertNotEqual(mutated, original, "the mutation was not applied")
 
 
 class Safe(unittest.TestCase):

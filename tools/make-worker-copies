@@ -10,9 +10,47 @@ import sys
 TABLE = os.path.join("cloud", "worker", "copies.tsv")
 
 
+class BadRow(Exception):
+    pass
+
+
+def parse_row(n, line):
+    if line.startswith("#"):
+        raise BadRow("row %d: a line that begins with # is not a row" % n)
+    fields = line.split("\t")
+    if len(fields) != 2:
+        raise BadRow("row %d: a row needs exactly two fields separated by one tab" % n)
+    for path in fields:
+        if not path or path != path.strip():
+            raise BadRow("row %d: a path is empty or has a space at its start or end" % n)
+        if path.startswith("/"):
+            raise BadRow("row %d: a path must not begin with /" % n)
+    source, copy = fields
+    if ".." in source.split("/"):
+        raise BadRow("row %d: the source climbs out of the repository root" % n)
+    if not copy.startswith("cloud/worker/") or ".." in copy.split("/"):
+        raise BadRow("row %d: the copy must be under cloud/worker/ and must not climb out of it" % n)
+    return source, copy
+
+
 def read_rows(root):
     with open(os.path.join(root, TABLE), encoding="utf-8") as f:
-        return [tuple(line.split("\t")) for line in f.read().splitlines() if line]
+        lines = f.read().splitlines()
+    rows = []
+    for n, line in enumerate(lines, 1):
+        if line:
+            rows.append((n,) + parse_row(n, line))
+    sources = {s for _, s, _ in rows}
+    seen = set()
+    for n, source, copy in rows:
+        if copy in sources:
+            raise BadRow("row %d: the copy is the source of another row" % n)
+        if copy in seen:
+            raise BadRow("row %d: the copy repeats in another row" % n)
+        seen.add(copy)
+        if not os.path.isfile(os.path.join(root, source)) and os.path.exists(os.path.join(root, source)):
+            raise BadRow("row %d: the source is not a file" % n)
+    return [(s, c) for _, s, c in rows]
 
 
 def read_bytes(path):
@@ -21,7 +59,11 @@ def read_bytes(path):
 
 
 def run(root, out):
-    rows = read_rows(root)
+    try:
+        rows = read_rows(root)
+    except BadRow as e:
+        print(str(e), file=out)
+        return 2
     for source, copy in rows:
         if not os.path.isfile(os.path.join(root, source)):
             print("missing source %s for the copy %s" % (source, copy), file=out)

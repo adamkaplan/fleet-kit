@@ -6,3 +6,4 @@ bin/cloud_channel.py	cloud/worker/bin/cloud_channel.py
 bin/cloud_channel_server.py	cloud/worker/bin/cloud_channel_server.py
 bin/cloud_relay.py	cloud/worker/bin/cloud_relay.py
 agents/opencode/orchestrator.md	cloud/worker/tests/golden/orchestrator.md
+bin/plan_check.py	cloud/worker/plan_check.py
