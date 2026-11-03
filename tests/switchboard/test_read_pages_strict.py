@@ -30,19 +30,36 @@ def full(n=100):
 
 
 def odd_cases():
-    return {"non-list page 1": {1: ["boom"]}, "non-list page 3": {1: [full()], 2: [full()], 3: ["boom"]},
-            "list of strings": {1: [["a", "b"]]}, "object without the key": {1: [{"other": []}]}}
+    """(name, pages, key, page that must be named)."""
+    return [("non-list page 1", {1: ["boom"]}, None, 1),
+            ("non-list page 3", {1: [full()], 2: [full()], 3: ["boom"]}, None, 3),
+            ("list of strings", {1: [["a", "b"]]}, None, 1),
+            ("object without the key", {1: [{"other": []}]}, "items", 1),
+            ("mixed list", {1: [[{"a": 1}, "boom"]]}, None, 1),
+            ("dict page, key None", {1: [{"a": 1}]}, None, 1),
+            ("list of None", {1: [[None]]}, None, 1),
+            ("list of True", {1: [[True]]}, None, 1),
+            ("key list of non-objects", {1: [{"items": ["x"]}]}, "items", 1),
+            ("page 10 is not page 1", {n: [full()] for n in range(1, 10)} | {10: ["boom"]}, None, 10)]   # page 10 is read only with cap=10
 
 
 def strict_body(test, mod):
-    """The S2 count on module `mod`: 4 odd pages raise GitHubUnavailable naming path and page."""
-    raised = 0
-    for name, pages in odd_cases().items():
+    """Every odd page raises GitHubUnavailable with the exact message; an empty last page is a normal one."""
+    failures = []
+    for name, pages, key, number in odd_cases():
         try:
-            hub_over(pages, module=mod).read_pages(PATH, key="items" if "key" in name else None)
+            hub_over(pages, module=mod).read_pages(PATH, key=key, cap=max(pages))
+            failures.append("%s: no raise" % name)
         except mod.GitHubUnavailable as exc:
-            raised += PATH in str(exc) and "page %d" % max(pages) in str(exc)
-    test.assertEqual(raised, 4, CHECK)
+            want = "%s page %d is not a list of objects" % (PATH, number)
+            if str(exc) != want:
+                failures.append("%s: %r != %r" % (name, str(exc), want))
+    try:
+        if hub_over({1: [[]]}, module=mod).read_pages(PATH) != ([], False):
+            failures.append("empty last page")
+    except mod.GitHubUnavailable:
+        failures.append("empty last page raised")
+    test.assertEqual(failures, [], CHECK)
 
 
 class TestReadPagesStrict(unittest.TestCase):
@@ -54,7 +71,7 @@ class TestReadPagesStrict(unittest.TestCase):
         records, cut = hub_over({1: [full()], 2: [full()], 3: [full(50)]}, requests).read_pages(PATH)
         self.assertEqual((len(records), cut), (250, False))
         self.assertEqual(len(requests), 3)   # S3: the request count is unchanged
-        self.assertEqual(hub_over({1: []}).read_pages(PATH), ([], False))
+        self.assertEqual(hub_over({1: [[]]}).read_pages(PATH), ([], False))
         self.assertEqual(hub_over({1: [{"items": full(3)}]}).read_pages(PATH, key="items"), (full(3), False))
 
 
@@ -74,15 +91,17 @@ class TestReadPagesStrictMutant(unittest.TestCase):
     def test_control_then_mutant(self):
         control = self.load("t_strict_control", lambda t: t)
         strict_body(self, control)   # control first: passes
-        guard = 'raise GitHubUnavailable("%s page %d is not a list of objects" % (path, number))'
         source = Path(BIN, "fleet-switchboard").read_text()
-        self.assertEqual(source.count(guard), 1)
-        mutant = self.load("t_strict_mutant", lambda t: t.replace(guard, "continue"))
-        with self.assertRaises(AssertionError) as caught:
-            strict_body(self, mutant)
-        self.assertIn(CHECK, str(caught.exception))
-        self.assertIn("0 != 4", str(caught.exception).split(" : ")[0])
-
+        guard = 'raise GitHubUnavailable("%s page %d is not a list of objects" % (path, number))'
+        check = "not isinstance(value, list) or not all(isinstance(r, dict) for r in value)"
+        for needle, new in ((guard, "continue"),
+                            (check, "not isinstance(value, list) or not value or not all(isinstance(r, dict) for r in value)"),
+                            ("not all(isinstance(r, dict) for r in value)", "not any(isinstance(r, dict) for r in value)")):
+            self.assertEqual(source.count(needle), 1, needle)
+            mutant = self.load("t_strict_mutant", lambda t: t.replace(needle, new))
+            with self.assertRaises(AssertionError, msg=new) as caught:
+                strict_body(self, mutant)
+            self.assertIn(CHECK, str(caught.exception))
 
 if __name__ == "__main__":
     unittest.main()
