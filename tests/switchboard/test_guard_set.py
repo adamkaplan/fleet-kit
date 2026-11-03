@@ -3,6 +3,7 @@
 Run with `python3 bin/test-switchboard TestGuardSet`. Standard library only.
 """
 import json
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -45,9 +46,29 @@ class TestGuardSet(unittest.TestCase):
         out = run().stdout.splitlines()
         self.assertEqual(len(out), len(data["classes"]) + len(data["extras"]))
         for c in NAMED:
-            self.assertEqual(sum(1 for l in out if l.endswith("bin/test-switchboard " + c)), 1, c)
+            self.assertEqual(sum(1 for l in out if l.startswith("python3 bin/test-switchboard " + c) and l.split()[2] == c), 1, c)
         for l, e in zip(out, data["classes"]):
-            self.assertTrue(l.split("python3 bin/test-switchboard ")[1] == e["class"])
+            self.assertTrue(l.startswith("python3 bin/test-switchboard " + e["class"]), l)
+            want = "  # timeout %d" % e["timeout"] if e.get("timeout") else ""
+            self.assertEqual(l, "python3 bin/test-switchboard " + e["class"] + want)
+
+    def test_a_class_with_no_loader_line_is_caught_by_the_wired_guard_control_first(self):
+        guard = "TestEveryTestFileIsWired"
+        with tempfile.TemporaryDirectory() as d:
+            tree = Path(d) / "tree"
+            shutil.copytree(REPO, tree, ignore=shutil.ignore_patterns(".git", "__pycache__"))
+
+            def guard_run():
+                return subprocess.run([sys.executable, "bin/test-switchboard", guard], capture_output=True, text=True, cwd=tree)
+            c = guard_run()
+            self.assertEqual(c.returncode, 0, c.stdout + c.stderr)  # the control passes on the unmutated copy
+            (tree / "tests" / "switchboard" / "test_planted_unloaded.py").write_text(
+                "import unittest\n\nclass TestPlantedNoLoader(unittest.TestCase):\n    def test_a(self):\n        pass\n")
+            r = guard_run()
+            out = r.stdout + r.stderr
+            self.assertNotEqual(r.returncode, 0, out)
+            self.assertIn("test_the_real_directory_is_wired", out)
+            self.assertIn("test_planted_unloaded.py", out)
 
     def test_documents_carry_the_sentence(self):
         for f in ("docs/plan-template.md", "skills/fleet-coordination/SKILL.md"):
