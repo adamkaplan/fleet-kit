@@ -17,7 +17,7 @@ REPO = "acme/api"
 DAY = 86400
 
 
-class World:
+class CommentWorld:
     """The comments of one repository as GitHub serves them: `since` is strict, newest first, 100 a page; every request and every comment served is counted."""
 
     def __init__(self, since_epoch, total, start=60, step=200):
@@ -67,7 +67,7 @@ class HubCase(Base):
 
 class TestCommentCursor(HubCase):
     def world(self, total=2582):
-        return World(NOW - 7 * DAY, total)
+        return CommentWorld(NOW - 7 * DAY, total)
 
     def test_s2_every_comment_of_the_window_is_read_once(self):
         world = self.world()
@@ -113,7 +113,7 @@ class TestCommentCursor(HubCase):
         real = sb.add_repeat_reminder
         sb.add_repeat_reminder = lambda *a, **k: told.append(a) or real(*a, **k)
         self.addCleanup(setattr, sb, "add_repeat_reminder", real)
-        world = World(NOW - 7 * DAY, 3500, start=2 * DAY, step=100)
+        world = CommentWorld(NOW - 7 * DAY, 3500, start=2 * DAY, step=100)
         hub = self.hub(world)
 
         def one_read(now):
