@@ -52,6 +52,12 @@ The ceiling is observed, not published: the highest count of jobs running at one
 
 The figure of S8 (the reopened runs and their job-minutes) is the tester's live measure: the command does not print a reopened-run count: it prints "repeat runs on one head" and "draft push runs" (the draft count is always 0, because the run list carries no draft flag), and the tester states the count it finds.
 
+## The lane's own data for S8 and its source
+
+A read of the repository's issue events API for 2 November 2026 UTC found 59 reopened events on 38 distinct pull requests (a pull request may be reopened more than once; the plan's earlier figure of 17 was an undercount); the job-minutes of their runs are NOT computed here: the tester's live measure makes them from the run list.
+
+Draft-push runs: 0 counted (the run list carries no draft flag: not countable by a lane), 0 job-minutes.
+
 Draft-push runs: 0 counted, because the run list does not carry the draft state. `plan` is read by no gate but builds the matrix: not a cut. The gate names are the four legs of `bin/merge_gate.py` (`UBUNTU_LEGS`, `MAC_LEGS`); whether the repository's own required checks add more is not readable by a lane.
 
 Each change is a separate ask with its own plan: this ask changes no line of `.github/workflows/`.

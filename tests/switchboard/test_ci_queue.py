@@ -202,6 +202,12 @@ def build(HandoffCase, FAKE_GH):
                 self.assertIn('"%s"' % words, text)
                 self.assertIn(words, printed)
 
+        def test_docs_report_states_the_reopened_events_and_the_draft_runs(self):
+            text = (REPO / "docs" / "ci-queue-report.md").read_text()
+            self.assertIn("59 reopened events on 38 distinct pull requests", text)
+            self.assertIn("NOT computed here", text)
+            self.assertIn("Draft-push runs: 0 counted (the run list carries no draft flag: not countable by a lane), 0 job-minutes", text)
+
         def test_docs_report_every_spend_row_has_a_price_and_a_minutes_cell(self):
             lines = (REPO / "docs" / "ci-queue-report.md").read_text().split("## Spend options", 1)[1].splitlines()
             rows = [l.strip("|").split("|") for l in lines if l.startswith("|") and not l.startswith("|---") and "Option" not in l]
