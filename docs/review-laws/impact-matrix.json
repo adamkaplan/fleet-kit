@@ -409,7 +409,6 @@
         "bin/fleet_health.py",
         "bin/header_cache.py",
         "bin/heavy_slots.py",
-        "bin/heavy_slots_watch.py",
         "bin/item_verdicts.py",
         "bin/plan_review.py",
         "bin/pr_events.py",
