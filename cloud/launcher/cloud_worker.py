@@ -504,6 +504,14 @@ def check_repo_allowed(repo, env):
         raise CloudError("refused: %s is not on the cloud allow-list" % scrub(repo, (), 120), EXIT_USAGE)
 
 
+def workflows_role(repo, env, role="worker"):
+    """THE choice of the worker's token role: worker-workflows only for a worker repository named in CW_WORKFLOWS_REPOS (OWNER/NAME list, default empty = no change)."""
+    raw = (env.get("CW_WORKFLOWS_REPOS") or "").strip()
+    if role == "worker" and raw and _repo_key(repo) is not None and _repo_key(repo) in allowed_repo_keys(raw):
+        return "worker-workflows"
+    return role
+
+
 def git_token_cmd(repo, env, role="worker"):
     """The command that mints the git token for ONE repository: CW_GIT_TOKEN_CMD, else app_token.py beside this file. The launch (run_task.py)
     and the renewal run the same command; the renewal builds it here and the driver's own line in run_task.py is pinned equal by a test."""
@@ -511,6 +519,7 @@ def git_token_cmd(repo, env, role="worker"):
     if raw:
         return shlex.split(raw)
     cmd = [sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "app_token.py"), repo]
+    role = workflows_role(repo, env, role)
     return cmd + ["--role", role] if role != "worker" else cmd
 
 
@@ -2908,6 +2917,7 @@ SETTINGS = (
     ("CW_CLUSTER_ADMIN_CMD", False, "command"),
     ("CW_GIT_TOKEN_CMD", False, "command"),
     ("CW_TOKEN_SERVICE_URL", False, "name"),
+    ("CW_WORKFLOWS_REPOS", False, "name"),         # comma-separated OWNER/NAME: those repositories' worker tokens also carry workflows: write
     ("CW_TOKEN_SERVICE_CALLER_TOKEN_CMD", False, "command"),
     ("CW_APP_ID_CMD", False, "command"),
     ("CW_APP_INSTALLATION_CMD", False, "command"),
@@ -3065,6 +3075,7 @@ VALIDATORS = {
     "CW_CLUSTER_TOKEN_CMD": ("a command that does not start with -", lambda v: not v.startswith("-")),
     "CW_CLUSTER_ADMIN_CMD": ("a command that does not start with -", lambda v: not v.startswith("-")),
     "CW_GIT_TOKEN_CMD": ("a command that does not start with -", lambda v: not v.startswith("-")),
+    "CW_WORKFLOWS_REPOS": ("a comma-separated list of OWNER/NAME", lambda v: all(k is not None for k in allowed_repo_keys(v))),
     "CW_TOKEN_SERVICE_URL": ("an https URL, or http only for a loopback address, with no user, query or fragment", lambda v: _service_url_ok(v)),
     "CW_TOKEN_SERVICE_CALLER_TOKEN_CMD": ("a command that does not start with -", lambda v: not v.startswith("-")),
     "CW_APP_ID_CMD": ("a command that does not start with -", lambda v: not v.startswith("-")),

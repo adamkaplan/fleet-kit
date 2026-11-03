@@ -44,6 +44,7 @@ MAX_BYTES = 1_000_000  # the most of any GitHub answer or vault command output t
 # results and writes to issues only.
 PERMISSIONS_BY_ROLE = {
     "worker": {"contents": "write", "pull_requests": "write", "issues": "read", "metadata": "read"},
+    "worker-workflows": {"contents": "write", "pull_requests": "write", "issues": "read", "metadata": "read", "workflows": "write"},  # the worker's four plus workflows write: only for a repository named in CW_WORKFLOWS_REPOS
     "orchestrator": {"issues": "write", "pull_requests": "read", "checks": "read", "metadata": "read"},
 }
 EXPECTED_PERMISSIONS = PERMISSIONS_BY_ROLE["worker"]  # the worker's set: the name every existing importer uses

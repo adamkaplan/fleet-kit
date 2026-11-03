@@ -106,6 +106,8 @@ class Driver:
         cmd = shlex.split(raw) if raw else [sys.executable, os.path.join(HERE, "app_token.py"), self.a.repo]
         if not raw and getattr(self.a, "agent", None) == "orchestrator":
             cmd += ["--role", "orchestrator"]
+        if not raw and getattr(self.a, "agent", None) != "orchestrator" and cw.workflows_role(self.a.repo, self.env) != "worker":
+            cmd += ["--role", cw.workflows_role(self.a.repo, self.env)]
         try:   # THE mint call, shared with the reaper's renewal (cloud_worker.run_git_token_cmd)
             token = cw.run_git_token_cmd(cmd, self.a.repo, self.env)
         except cw.CloudError as e:
