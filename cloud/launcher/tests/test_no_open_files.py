@@ -39,7 +39,7 @@ GUARDED = (
     "test_token_at_limit.py",
     "test_vault_check_pins.py",
 )
-LEAK = re.compile(r"^ResourceWarning: unclosed file ", re.M)
+LEAK = re.compile(r"^ResourceWarning: unclosed ", re.M)
 LIMIT = 900
 
 
@@ -54,7 +54,7 @@ def check(name, text):
     """Raise the anchored failure when the output of a run names a leaked file."""
     n = len(LEAK.findall(text))
     if n:
-        raise AssertionError("a file was left open: %s: %d ResourceWarning lines\n%s" % (name, n, "\n".join(l for l in text.splitlines() if "ResourceWarning: unclosed file" in l)))
+        raise AssertionError("a file was left open: %s: %d ResourceWarning lines\n%s" % (name, n, "\n".join(l for l in text.splitlines() if "ResourceWarning: unclosed " in l)))
     return n
 
 
