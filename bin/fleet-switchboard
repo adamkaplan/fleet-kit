@@ -11382,6 +11382,10 @@ def blocked_tick(engine, discovery, held):
         if cos and cos not in recipients:
             recipients.append(cos)
         recipients = [r for r in recipients if r != observation.name]
+        if observation.name == cos and event != "blocked.end":   # the Chief of Staff's boss is the owner, who is no agent: the owner's panel is told
+            owner_alarm_start(engine.state_dir, observation.name, detail["since"], now, text)
+        if observation.name == cos and event == "blocked.end":
+            owner_alarm_end(engine.state_dir, observation.name, now, text)
         for who in recipients:   # #1275: only a REPEAT of the same state is held (6 hours); the first report and the end line always pass
             state_key = "%s|%s|%s|%s|%s" % (event, detail.get("held"), detail.get("refused"), why[0], why[1])
             add_repeat_reminder(engine.state_dir, who, now, now, "Blocked agent: " + text, "blocked-agent", observation.name, state_key,
@@ -11444,6 +11448,34 @@ def blocked_tick(engine, discovery, held):
     if changed or done:
         blocked_update(engine.state_dir, BLOCKED_ALERT_STATE, lambda _: state)
     return done
+
+
+OWNER_ALARM_STATE = "owner-alarm.json"   # {"alarm": {"agent", "since", "minutes", "text", "resume", "at", "ended"}}: the Chief of Staff's block, drawn by the owner's panel
+
+
+def owner_alarm_write(state_dir, change):
+    """A note, never a precondition: a state file that cannot be written (a full disk, a bad file) costs the row, not the pass."""
+    try:
+        blocked_update(state_dir, OWNER_ALARM_STATE, change)
+    except (OSError, ValueError):
+        pass
+
+
+def owner_alarm_start(state_dir, name, since_iso, now, text):
+    """The Chief of Staff has been blocked past the threshold with a message held for it: one record, one line (no token, no secret), rewritten by a repeat."""
+    since = parse_iso(since_iso)
+    resume = "%s %s" % (RESUME_COMMAND, name)
+    line = _one_line("%s; resume: `%s`" % (text, resume), BLOCKED_LINE_CHARS + 120)
+    owner_alarm_write(state_dir, lambda _: {"alarm": {"agent": name, "since": since, "minutes": int((now - since) // 60) if since is not None else None,
+                                                      "text": line, "resume": resume, "at": now, "ended": None}})
+
+
+def owner_alarm_end(state_dir, name, now, text):
+    """The block has ended: the record keeps its fields and gains the end time (the panel drops it an hour later)."""
+    def change(state):
+        old = state.get("alarm")
+        return {"alarm": dict(old, ended=now, at=now, text=_one_line(text, BLOCKED_LINE_CHARS))} if isinstance(old, dict) and old.get("agent") == name else None
+    owner_alarm_write(state_dir, change)
 
 
 def add_budget_notice_parsers(sub):

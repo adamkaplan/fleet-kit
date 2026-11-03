@@ -65997,6 +65997,7 @@ TestNewModuleDemands = importlib.import_module("test_new_module_demands").TestNe
 # The bin-set table test (#1457).
 _bin_set_table = importlib.import_module("test_bin_set_table")
 TestTheBinSetClassesAreAllInTheTable = _bin_set_table.TestTheBinSetClassesAreAllInTheTable
+_cos_blocked_owner = importlib.import_module("test_cos_blocked_owner"); TestCosBlockedOwner = _cos_blocked_owner.TestCosBlockedOwner
 # The pod niceness tests (#1794).
 TestPodNiceness = importlib.import_module("test_pod_niceness").TestPodNiceness
 # The steer-after-minutes tests of #1540, moved under the line ceiling.
@@ -74858,6 +74859,31 @@ class TestBlockedReport(Base):
         world.engine.run_pass()
         (report,) = self.audits()
         self.assertEqual((report["subject"], report["detail"]["told"], self.reminders_to("cos")), ("cos", [], []))
+
+    def alarm(self):
+        return sb._read_small(self.world.state, sb.OWNER_ALARM_STATE).get("alarm")
+
+    def test_a_blocked_chief_of_staff_is_recorded_for_the_owner_once_and_the_end_is_recorded(self):   # #2059
+        world = World(self, agents=(), config={})
+        world.add_agent("cos", fleet={"role": "chief-of-staff"})
+        self.world = world
+        world.herdr.panes[world.panes["cos"]]["status"] = "blocked"
+        world.engine.send("x", "cos", "hello")
+        world.engine.run_pass()
+        world.tick(1500)
+        world.engine.run_pass()
+        found = self.alarm()
+        self.assertEqual((found["agent"], found["minutes"], found["ended"]), ("cos", 25, None))
+        world.herdr.panes[world.panes["cos"]]["status"] = "idle"
+        world.tick(60)
+        world.engine.run_pass()
+        self.assertIsNotNone(self.alarm()["ended"])
+
+    def test_a_blocked_worker_leaves_no_owner_alarm(self):   # #2059
+        self.block()
+        self.wait(25)
+        self.assertEqual(len(self.audits()), 1)
+        self.assertIsNone(self.alarm())
 
     def test_no_chief_of_staff_and_a_boss_that_is_itself_means_nobody_is_told_but_the_report_is_audited(self):
         world = World(self, agents=(), config={})
