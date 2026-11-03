@@ -78176,6 +78176,11 @@ _plan_check_words_module = importlib.util.module_from_spec(_plan_check_words_spe
 sys.path.insert(0, str(REPO))
 _plan_check_words_spec.loader.exec_module(_plan_check_words_module)
 PlanCheckWords_Words, PlanCheckWords_Corpus = _plan_check_words_module.Words, _plan_check_words_module.Corpus
+# #2023: tests/test_doctor_watcher.py is run by THIS runner too (loaded by path like the tests above; bound by name so CI collects it)
+_doctor_watcher_spec = importlib.util.spec_from_file_location("doctor_watcher_tests", REPO / "tests" / "test_doctor_watcher.py")
+_doctor_watcher_module = importlib.util.module_from_spec(_doctor_watcher_spec)
+_doctor_watcher_spec.loader.exec_module(_doctor_watcher_module)
+DoctorWatcher_TestWatcher = _doctor_watcher_module.TestWatcher
 for _name, _module in _brief_modules.items():   # a TestCase added to one of these files and not bound above would silently drop out of CI
     _held = {v for k, v in globals().items() if k.startswith("Brief_")}
     _defined = {v for v in vars(_module).values() if isinstance(v, type) and issubclass(v, unittest.TestCase) and v.__module__ == _module.__name__}
