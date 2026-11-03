@@ -1016,6 +1016,14 @@ def queue_add(state_dir, lane, fields, moment):
         raise FactError("name is 1 to 64 letters, digits, dots, dashes")
     if not (isinstance(fields.get("brief_file"), str) and fields["brief_file"].startswith("/")):
         raise FactError("brief_file is the absolute path of the brief")
+    if fields.get("kind") == "builder":
+        issue = fields.get("plan_issue")
+        if isinstance(issue, str) and re.fullmatch(r"[0-9]+", issue):
+            if not (isinstance(fields.get("repo"), str) and re.fullmatch(r"[^/\s#]+/[^/\s#]+", fields["repo"])):
+                raise FactError("plan_issue %s is a bare number: give --repo owner/repo or the whole owner/repo#N" % issue)
+            fields = dict(fields, plan_issue="%s#%s" % (fields["repo"], issue))
+        elif not (isinstance(issue, str) and re.fullmatch(r"[^/\s#]+/[^/\s#]+#[0-9]+", issue)):
+            raise FactError("plan_issue is owner/repo#N, the form of the plan.approved audit event")
     digits = re.sub(r"[^0-9]", "", iso(moment))
     key = "q-%s-%s-%s" % (digits[:8], digits[8:14], fields.get("ask"))
     entry = {k: v for k, v in fields.items() if k in QUEUE_KEYS and v is not None}
@@ -1120,6 +1128,7 @@ def cmd_queue(args, runner, now):
     try:
         if action == "add":
             fields = {k: getattr(args, k) for k in QUEUE_KEYS if hasattr(args, k)}
+            fields["repo"] = args.repo
             key = queue_add(state_dir, caller, fields, moment)
             print(key)
             try:
@@ -1155,6 +1164,7 @@ def add_queue_parsers(sub):
     for flag in QUEUE_KEYS:
         if flag not in ("id", "enqueued", "lane"):
             add.add_argument("--" + flag.replace("_", "-"), dest=flag, default=None, type=int if flag in ("ask", "priority", "idle", "hard") else str)
+    add.add_argument("--repo", default=None, help="owner/repo for a bare --plan-issue number")
     for action in ("priority", "cancel"):
         one = actions.add_parser(action, help="%s an entry you queued" % action.capitalize())
         one.add_argument("id")

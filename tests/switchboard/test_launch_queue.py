@@ -65,6 +65,9 @@ def build(HandoffCase):
             for one in hashes:
                 sb.AuditLog(Path(self.state) / "audit.jsonl").append("daemon", "plan.approved", ISSUE, {"issue": ISSUE, "plan_hash": one})
 
+        def approved_as(self, issue, one):
+            sb.AuditLog(Path(self.state) / "audit.jsonl").append("daemon", "plan.approved", issue, {"issue": issue, "plan_hash": one})
+
         def next_lines(self, free, live=H1, ns=None):
             fn = (ns or vars(sb))["queue_next"]
             return fn(self.state, free, self.world.clock.now(), lambda issue: live, sb.queue_approvals(self.state))[0]
@@ -244,6 +247,20 @@ def build(HandoffCase):
             lines = self.next_lines(1, live=real)
             self.assertEqual(self.printed(lines), ["real"], lines)
             self.assertEqual(self.queue_lines("launch-queue.status.jsonl"), [])
+
+        def test_s13_plan_issue_is_owner_repo_number_or_refused_with_a_name(self):
+            base = ["add", "--name", "pi", "--kind", "builder", "--ask", "9", "--brief-file", "/tmp/b.md", "--plan-hash-full", H1]
+            code, out = self.run_queue(*base, "--plan-issue", "1786")
+            self.assertEqual(code, 1)
+            self.assertIn("plan_issue 1786 is a bare number", out)
+            self.assertEqual(self.queue_lines(), [])
+            code, out = self.run_queue(*base, "--plan-issue", "1786", "--repo", "adamkaplan/fleet-kit")
+            self.assertEqual(code, 0, out)
+            self.assertEqual(json.loads(self.queue_lines()[0])["plan_issue"], "adamkaplan/fleet-kit#1786")
+            self.assertEqual(self.run_queue(*base[:2], "pj", *base[3:], "--plan-issue", "x y")[0], 1)
+            # the audit key of the real event is owner/repo#N: the normalised entry meets it
+            self.approved_as("adamkaplan/fleet-kit#1786", H1)
+            self.assertEqual(self.printed(self.next_lines(1, live=H1)), ["pi"])
 
         def test_u1_unreadable_lines_are_counted_and_named_and_a_missing_file_is_empty(self):
             self.assertEqual(self.run_queue("list"), (0, ""))
