@@ -345,6 +345,32 @@ class TestPlatformPaths(unittest.TestCase):
         self.assertEqual(consts["WORKFLOWS"], ".github/workflows/")
         self.assertTrue(LIST.exists())
 
+    def test_cloud_launcher_chain_files_are_on_the_list_permanently(self):
+        import fnmatch
+        sentence = "do not remove: these files decide the macOS leg's time"
+        files = sorted("bin/" + n for n in os.listdir(REPO / "bin") if n.startswith("test-cloud-launcher"))
+        self.assertEqual(files, ["bin/test-cloud-launcher", "bin/test-cloud-launcher.chain", "bin/test-cloud-launcher.parallel"])
+
+        def problems(text):
+            lines, found, pats = text.splitlines(), [], patterns_of(text)
+            for f in files:
+                hit = [p for p in pats if fnmatch.fnmatchcase(f, p)]
+                if not hit:
+                    found.append("not listed: " + f)
+                    continue
+                at = [i for i, l in enumerate(lines) if l.strip() == hit[0]]
+                if not at or not lines[at[0] - 1].rstrip().endswith(sentence):
+                    found.append("no reason: " + f)
+            return found
+        text = LIST.read_text()
+        self.assertEqual(problems(text), [])
+        print("files matched %d of 3" % len(files))
+        print("reasons ending as required: 1 of 1")
+        mutant = "\n".join(l for l in text.splitlines() if l.strip() != "bin/test-cloud-launcher*")
+        found = problems(mutant)
+        self.assertEqual(found, ["not listed: " + f for f in files])
+        print("mutant naming exactly the 3 files: 1 of 1, %d other problems" % (len(found) - 3))
+
 
     # PC-5 of #1671. Known limits: a command whose first element is built at run time, and a tool called only through a variable, are not seen.
     OS_TOOLS = frozenset("launchctl osascript mdfind sysctl plutil notify-send pmset caffeinate diskutil scutil sw_vers vm_stat mdutil pgrep pkill defaults open ps lsof".split())
