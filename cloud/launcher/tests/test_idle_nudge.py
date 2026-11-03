@@ -119,5 +119,78 @@ class TestMutants(unittest.TestCase):
         self.assertEqual(s.marks, [], "the mutant must leave the pod unmarked where the control marks it")
 
 
+# ---- clause 3: the four fixed words of the end notice, from stub run records ----
+import json  # noqa: E402
+import shutil  # noqa: E402
+import tempfile  # noqa: E402
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(HERE)), "..", "bin"))
+import cloud_end_alert as cea  # noqa: E402
+import record_json  # noqa: E402
+
+CEA_SOURCE = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(HERE))), "bin", "cloud_end_alert.py")
+HEAD_LINE = '        return "head is on branch " + name(head) if name(head) else "unknown"\n'
+OLD_NO = '        return "work pushed: no"\n'
+
+
+def words(hook, module=cea):
+    d = tempfile.mkdtemp()
+    try:
+        if hook is not None:
+            with open(os.path.join(d, "run.json"), "w") as f:
+                json.dump({"end_hook": hook}, f)
+        return module.pushed_text(d, record_json.parse_bounded)
+    finally:
+        shutil.rmtree(d)
+
+
+def cea_mutant(old, new):
+    with open(CEA_SOURCE) as f:
+        text = f.read()
+    after = text.replace(old, new)
+    assert after != text and text.count(old) == 1, "the mutation was not applied"
+    module = types.ModuleType("cea_mutant")
+    exec(compile(after, "cea_mutant", "exec"), module.__dict__)
+    return module
+
+
+class TestNoticeWords(unittest.TestCase):
+    def test_four_words(self):
+        self.assertEqual(words({"pushed": False, "wip_branch": None, "head_on": "feat/a-1"}), "head is on branch feat/a-1")
+        self.assertEqual(words({"pushed": True, "wip_branch": "w1/wip", "head_on": None}), "unpushed work saved to w1/wip")
+        self.assertEqual(words({"pushed": False, "wip_branch": None, "head_on": None}), "nothing unpushed")
+        self.assertEqual(words(None), "unknown")
+        self.assertEqual(words({"head_on": "x"}), "unknown")
+
+    def test_never_work_pushed_no_for_a_head_on_the_remote(self):
+        self.assertNotIn("work pushed", words({"pushed": False, "wip_branch": None, "head_on": "main2"}))
+
+    def test_unknown_head_and_error_are_unknown(self):
+        self.assertEqual(words({"pushed": False, "wip_branch": None, "head_on": "unknown"}), "unknown")
+        self.assertEqual(words({"pushed": False, "wip_branch": None, "head_on": None, "error": "x"}), "unknown")
+
+    def test_no_token_form_in_a_notice(self):
+        for bad in ("ghp_" + "a" * 36, "sk-" + "b" * 20, "a" * 40, "x y", "a;b"):
+            for hook in ({"pushed": False, "wip_branch": None, "head_on": bad}, {"pushed": True, "wip_branch": bad, "head_on": None}):
+                self.assertEqual(words(hook), "unknown", bad)
+
+    def test_longest_notice_is_short(self):
+        self.assertLessEqual(len(words({"pushed": False, "wip_branch": None, "head_on": "a" * 29 + "/" + "b" * 29})), len("head is on branch ") + 100)
+
+
+class TestNoticeMutant(unittest.TestCase):
+    def test_control_passes(self):
+        self.assertEqual(words({"pushed": False, "wip_branch": None, "head_on": "b1"}), "head is on branch b1")
+
+    def test_no_op_mutation_fails_the_computation(self):
+        with self.assertRaisesRegex(AssertionError, "the mutation was not applied"):
+            cea_mutant(HEAD_LINE, HEAD_LINE)
+
+    def test_notice_that_keeps_no_for_a_head_on_the_remote_is_caught(self):
+        m = cea_mutant(HEAD_LINE, OLD_NO)
+        got = words({"pushed": False, "wip_branch": None, "head_on": "b1"}, m)
+        self.assertEqual(got, "work pushed: no")  # the mutant says the old words
+        self.assertNotEqual(got, "head is on branch b1", "the mutant must show the old words where `head is on branch` is required")
+
+
 if __name__ == "__main__":
     unittest.main()
