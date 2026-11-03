@@ -75009,6 +75009,38 @@ class TestBlockedReport(Base):
             self.wait(25)
         self.assertEqual(len(self.told("cos")), 1)
 
+    def direct_tick(self, held):
+        """blocked_tick called directly: once to record the block, then 25 minutes later; returns what the second call reports."""
+        engine = self.world.engine
+        sb.blocked_tick(engine, engine.discover(self.world.clock.now()), held)
+        self.world.tick(25 * 60)
+        return sb.blocked_tick(engine, engine.discover(self.world.clock.now()), held)
+
+    def test_the_tick_reports_a_block_with_a_held_plan_and_with_a_refusal_only_when_no_plan_exists(self):
+        self.blocked_observation()
+        plan = sb.Plan("coder", "hold", "coder is blocked", [sb.Fact("lab.fact:1", "coder", "lab.fact", "s", 1, sender="cos")])
+        self.assertEqual(self.direct_tick({"coder": plan}), [("coder", "report")])
+
+    def test_the_tick_with_no_plan_for_the_agent_reports_its_refused_sends(self):
+        observation = self.blocked_observation()
+        sb.note_held_send(self.world.state, "coder", "cos", self.world.clock.now(), observation)
+        self.assertEqual(self.direct_tick({}), [("coder", "report")])
+
+    def test_note_held_send_keeps_each_row_adds_to_a_dict_entry_and_only_for_a_blocked_agent(self):
+        observation = self.blocked_observation()
+        now = self.world.clock.now()
+        self.assertIsNone(sb.note_held_send(None, "coder", "cos", now, observation))
+        sb.note_held_send(self.world.state, "coder", "cos", now, observation)
+        sb.note_held_send(self.world.state, "coder", "platform", now + 1, observation)
+        rows = sb.blocked_update(self.world.state, sb.BLOCKED_HELD_SENDS, lambda _: None)["coder"]["rows"]
+        self.assertEqual([r["from"] for r in rows], ["cos", "platform"])
+        sb.note_held_send(self.world.state, "coder", "x", now + 2, None)
+        self.pane["status"] = "idle"
+        idle = self.world.engine.discover(self.world.clock.now()).agents["coder"]
+        sb.note_held_send(self.world.state, "other", "cos", now, idle)
+        self.assertNotIn("other", sb.blocked_update(self.world.state, sb.BLOCKED_HELD_SENDS, lambda _: None))
+        self.assertEqual(len(sb.blocked_update(self.world.state, sb.BLOCKED_HELD_SENDS, lambda _: None)["coder"]["rows"]), 2)
+
 
 # ---- the blocked report's guards, bounds, validator, lock and config key: one row and one mutant each, derived from the code
 
