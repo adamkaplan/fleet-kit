@@ -3087,8 +3087,9 @@ class Switchboard:
             plan = copy.copy(plan)
             plan.pending = kept
         pending = merge_wake_facts(plan.recipient, plan.pending)   # #1275: the sweep, triage and load-alert items of one wake are ONE message
+        in_turn = getattr(observation, "status", None) == "working"
         text, carried = compose(plan.recipient, pending, section=section_resolver(self, observation),
-                                repos=repos, delivered=self.now())
+                                repos=repos, delivered=self.now(), in_turn=in_turn)
         sent = next((fact for fact in carried if fact.kind == "send"), None)
         if sent is not None and "\n[cut at %d characters]" % MESSAGE_CAP in text[-40:]:  # never cut silently
             # Measure THE message delivered: the carried send alone (compose may cut a newer send, not pending[:1], the oldest fact).
