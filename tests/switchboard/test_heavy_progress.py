@@ -263,6 +263,7 @@ class TestHeavyProgress(unittest.TestCase):
             results = {}
             for kind in ("control", "mutant"):
                 path = os.path.join(scratch, kind + "_heavy_slots.py")
+                open(os.path.join(scratch, "heavy_slots_watch.py"), "w").write(open(os.path.join(here, "..", "..", "bin", "heavy_slots_watch.py")).read())
                 with open(path, "w") as handle:
                     handle.write(copies[kind])
                 env = dict(os.environ, FLEET_TEST_HEAVY_SLOTS=path, FLEET_TEST_INNER="1")
