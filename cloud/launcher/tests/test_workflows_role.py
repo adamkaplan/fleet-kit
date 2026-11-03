@@ -125,7 +125,8 @@ class Check(unittest.TestCase):
 
     def six_refused_or_fail(self, module):
         ok, _ = refuses(module, dict(FIVE, administration="write"))
-        self.assertTrue(ok, "the six-permission answer was accepted")
+        if not ok:
+            raise AssertionError("the six-permission answer was accepted")
 
     def test_s3_the_mutant_without_the_extra_key_test_fails_with_the_anchored_text_and_the_control_passes(self):
         text = open(SRC).read()
@@ -133,7 +134,7 @@ class Check(unittest.TestCase):
         mutant = load(apply_mutation(text, self.OLD, self.NEW))
         with self.assertRaises(AssertionError) as caught:
             self.six_refused_or_fail(mutant)
-        self.assertEqual(str(caught.exception), "the six-permission answer was accepted")
+        self.assertTrue(str(caught.exception).endswith("the six-permission answer was accepted"), str(caught.exception))
 
     def test_s3_a_no_op_mutation_fails_the_computation(self):
         text = open(SRC).read()
@@ -147,7 +148,7 @@ class Paths(unittest.TestCase):
     ENV = {"CW_WORKFLOWS_REPOS": LISTED, "CW_ALLOWED_REPOS": LISTED + "," + UNLISTED}
 
     def launch_cmd(self, repo, env):
-        a = type("A", (), {"repo": repo, "agent": "worker"})()
+        a = type("A", (), {"repo": repo, "agent": "worker", "worker": "coder7"})()
         d = run_task.Driver(a, dict(env))
         seen = []
         with mock.patch.object(cw, "run_git_token_cmd", lambda cmd, r, e: seen.append(list(cmd)) or "tok"):
