@@ -206,6 +206,17 @@ class TestCommentCursor(HubCase):
         got, _ = hub.read_comments("sweep", REPO, self.since, cap=1)   # served again: the id-less pair stays two, not four
         self.assertEqual(sorted(c["body"] for c in got), ["a", "b", "bad date", "c1", "no date"])
 
+    def test_each_consumer_keeps_its_own_cut_entry(self):
+        sb.take_comment_cuts()
+        world = CommentWorld(NOW - 7 * DAY, 3500, start=2 * DAY, step=100)
+        hub = self.hub(world)
+        hub.read_comments("sweep", REPO, self.since, cap=sb.COMMENT_WINDOW_PAGES)
+        hub.read_comments("triage", REPO, sb.iso(NOW - 14 * DAY), cap=sb.COMMENT_WINDOW_PAGES)
+        self.assertEqual(sorted(sb._COMMENT_CUTS), [("sweep", REPO), ("triage", REPO)])
+        taken = sb.take_comment_cuts()
+        self.assertEqual(list(taken), [REPO])   # one alert a day per repository
+        self.assertEqual(sb._COMMENT_CUTS, {})
+
     def test_a_small_repository_reads_what_it_read_before(self):
         world = self.world(150)
         got, cut = self.hub(world).read_comments("triage", REPO, self.since, cap=sb.COMMENT_WINDOW_PAGES)

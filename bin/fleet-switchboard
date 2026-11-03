@@ -10006,7 +10006,7 @@ def open_pages(read, repo=None):
 _UNSENT_DAY = {}   # #1886: repository -> the day its `open_list.cut_unsent` line was written (memory only: a restart may write one more; one entry per repository)
 _OPEN_CUTS = set()   # #1886: the repositories whose read of open items stopped at OPEN_LIST_PAGES in this pass (one entry per repository)
 COMMENT_WINDOW_PAGES = 30   # #1889: pages one comment read follows at most (3,000 comments); a window not read to its start is said once a day
-_COMMENT_CUTS = {}   # #1889: repository -> (comments held, window days) of a comment window not read to its start, until the pass's daily alert (one entry per repository)
+_COMMENT_CUTS = {}   # #1889: (consumer, repository) -> (comments held, window days) of a comment window not read to its start, until the pass's daily alert (one entry per repository)
 
 
 def note_open_cut(repo):
@@ -10047,7 +10047,10 @@ def open_list_alert(engine, repo, now):
 
 def take_comment_cuts():
     """#1889: {repository: (comments held, window days)} of the comment windows not read to their start; emptied."""
-    out = dict(sorted(_COMMENT_CUTS.items()))
+    out = {}
+    for (consumer, repo), cut in sorted(_COMMENT_CUTS.items()):   # one alert a day per repository: the consumer that holds more speaks
+        if repo not in out or cut[0] > out[repo][0]:
+            out[repo] = cut
     _COMMENT_CUTS.clear()
     return out
 
@@ -13268,13 +13271,13 @@ class GitHubHub:
         if key in gaps and gaps[key] < since:
             del gaps[key]
         newest = max((v["created_at"] for v in have.values()), default=None)
-        if newest is not None and cursors.get(name) != newest:
+        if newest is not None and cursors.get(name) != newest:   # an empty merge keeps the old cursor (harmless: the next read asks since it again)
             cursors[name] = newest
             store.save(self.state_dir, cursors, parse)
         merged = sorted(have.values(), key=lambda r: r["created_at"], reverse=True) + loose   # stable: equal seconds keep the API order, as read_pages gave them
         if key in gaps:
             when, then = self.now(), parse_iso(since)
-            _COMMENT_CUTS[repo] = (len(merged), max(1, round((when - then) / 86400)) if then is not None else 0)
+            _COMMENT_CUTS[key] = (len(merged), max(1, round((when - then) / 86400)) if then is not None else 0)
         return merged, key in gaps
 
     # -- gh api, and the catch-up read
