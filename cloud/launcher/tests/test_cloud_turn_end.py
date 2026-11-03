@@ -178,8 +178,8 @@ class FinishPassMutant(unittest.TestCase):
         sys.path.insert(0, os.path.join(ROOT, "cloud", "worker", "tests"))
         import stub_support
         src = open(os.path.join(ROOT, "bin", "fl" + "eet-switchboard")).read()
-        good = ('        engine._failed("cloud-turn-end", "cloud-turn-end", err, report)\n    try:\n        lost_worker_tick(engine, discovery)')
-        bad = ('        engine._failed("cloud-turn-end", "cloud-turn-end", err, report)\n        lost_worker_tick(engine, discovery)')
+        good = ('        cloud_renewal_alarm_tick(engine, discovery)\n    except Exception as err:\n        engine._failed("cloud-renewal-alarm", "cloud-renewal-alarm", err, report)\n    try:\n        lost_worker_tick(engine, discovery)')
+        bad = ('        cloud_renewal_alarm_tick(engine, discovery)\n    except Exception as err:\n        engine._failed("cloud-renewal-alarm", "cloud-renewal-alarm", err, report)\n        lost_worker_tick(engine, discovery)')
         applied = src.count(good) == 1
         self.assertTrue(applied)
         scratch = tempfile.mkdtemp(prefix="fp1-mutant-")

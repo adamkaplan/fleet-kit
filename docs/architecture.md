@@ -75,6 +75,7 @@ The **Holds** column is descriptive: only the layer numbers are enforced.
 | `guard_alert.py` | 2 | the standalone alert of a bad installed tree, run from the state directory with nothing of the kit (#1380) | |
 | `guard_record_head_move.py` | 2 | the standalone recorder a git hook runs at each move of the installed tree's HEAD (#1380) | |
 | `decision_core.py` | 3 | the pure core of the Decision subsystem | |
+| `cloud_renewal_alarm.py` | 4 | the alarm on a failed git-token renewal of a cloud pod, read from the launcher's audit tail (#1579) | |
 | `cpu_guard.py` | 4 | the CPU guard: numbers, a clock and a state directory in; a verdict out | |
 | `decision_sync.py` | 4 | the sync engine between the Decision list and an external decision system | |
 | `decisions_pull.py` | 4 | rewrite the local decisions file from a remote source | |
@@ -253,6 +254,7 @@ A site is listed by the function it sits in and its kind, with a count: `import(
 | `cloud_cluster.py` | `_lib:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
 | `cloud_cluster.py` | `_walk:exec_module` | 1 | uses an identifier of the import machinery (exec_module) |
 | `cloud_cluster.py` | `_walk:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
+| `cloud_renewal_alarm.py` | `_persist:sys.exc_info` | 1 | uses `sys` beyond its plain attributes |
 | `cloud_way_back_check.py` | `check:imp` | 3 | uses the module object (a call, an attribute, an argument) |
 | `cloud_way_back_check.py` | `check_fixture_shape:imp` | 4 | uses the module object (a call, an attribute, an argument) |
 | `cloud_worker.py` | `<module>:import(importlib)` | 1 | imports a module that can load code by name, or one of its identifiers |

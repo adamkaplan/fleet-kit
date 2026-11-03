@@ -621,6 +621,7 @@ class TestConfig(Base):
             "awaiting_live_days": 14, "awaiting_label": None, "decisions_lookback_hours": 72,  # PR 14
             "awaiting_cos_label": None, "decisions_cos_grace_seconds": 300, "cos_orders_file": None,  # PR 18
             "pr_notice_hold_minutes": 0,  # PR notices
+            "cloud_alarm_to": [],  # #1579
             "intent_repo": None, "intent_required": True,
             "gh_users": {}, "github_poll_seconds": 60, "intent_live_silence_minutes": 10,  # PR 15
             "classifier_mode": "shadow", "busy_poll_seconds": 1,  # PR 8

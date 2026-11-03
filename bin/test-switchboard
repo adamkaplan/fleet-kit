@@ -66008,6 +66008,7 @@ TestPlanRehearsal = importlib.import_module("test_plan_rehearsal").build(Handoff
 # The load figure counts cloud workers as busy (#1487).
 _load_cloud = importlib.import_module("test_load_alert_cloud")
 TestLoadAlertCloudBusy = _load_cloud.TestLoadAlertCloudBusy
+_ra = importlib.import_module("test_cloud_renewal_alarm"); TestCloudRenewalAlarm, TestCloudRenewalAlarmWired, TestCloudRenewalAlarmMutants = _ra.TestCloudRenewalAlarm, _ra.TestCloudRenewalAlarmWired, _ra.TestCloudRenewalAlarmMutants
 # The CI test-file list tests of #1498.
 _ci_test_files = importlib.import_module("test_ci_test_files")
 TestCiTestFileList = _ci_test_files.TestCiTestFileList

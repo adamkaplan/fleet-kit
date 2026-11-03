@@ -458,6 +458,8 @@ cloud_hub.py:_read_json_aged
 cloud_hub.py:kube_http
 cloud_relay.py:loads_strict
 cloud_relay_daemon.py:_read
+cloud_renewal_alarm.py:_read_state
+cloud_renewal_alarm.py:read_tail
 cloud_way_back_check.py:main
 cpu_guard.py:load_episode
 decision_sync.py:_read_json
