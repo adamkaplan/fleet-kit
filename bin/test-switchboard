@@ -41635,6 +41635,116 @@ class TestLaunchNewWorkspace(TwoRepoCase):
                 self.assertEqual(herdr([FAKE_HERDR] + argv).returncode, 2)
 
 
+class CharterGH:
+    """TwoRepoGH plus the two calls a charter's `pane:` line update makes (`--method GET` of the issue, `--method PATCH` of its body)."""
+
+    def __init__(self, inner):
+        self.inner = inner
+        self.repos, self.ran = inner.repos, inner.ran
+
+    def __call__(self, argv, **kwargs):
+        argv = list(argv)
+        if argv[3:5] == ["--method", "GET"]:
+            return self.inner(argv[:3], **kwargs)
+        if argv[3:5] == ["--method", "PATCH"]:
+            self.ran.append((argv, kwargs.get("input")))
+            number = int(re.search(r"/issues/(\d+)$", argv[2]).group(1))
+            self.repos[re.match(r"repos/([^/]+/[^/]+)/", argv[2]).group(1)].bodies[number] = json.loads(kwargs["input"])["body"]
+            return subprocess.CompletedProcess(argv, 0, "{}", "")
+        return self.inner(argv, **kwargs)
+
+
+class TestHeadlessOrchestratorWorld(TwoRepoCase):
+    """#2074: an orchestrator with no terminal, end to end on the fake herdr and service."""
+
+    BODY = "```yaml\nstatus: active\npane: w1:p9\n```\n"
+
+    def setUp(self):
+        super().setUp()
+        self.work = self.home / "checkout"
+        self.work.mkdir(exist_ok=True)
+        os.environ["HERDR_WORKSPACE_ID"] = "w1"
+        self.gh = CharterGH(self.gh)
+        term = mock.patch.object(sb, "owner_terminal_problem", lambda *a, **k: None)   # the operator's own terminal
+        term.start()
+        self.addCleanup(term.stop)
+        self.gh.repos[ACME_API].bodies = {7: self.BODY}
+        self.gh.repos[ACME_API].issues[7] = {"intent": None}
+        self.gh.repos[ACME_API].charters.add(7)
+
+    def launch(self):
+        return self.main("launch", "hl-orch", "--agent", "orchestrator", "--dir", str(self.work), "--headless",
+                         "--role", "orchestrator", "--charter", "7")
+
+    def test_pending_of_a_name_the_service_does_not_show_has_the_shape_the_doctor_reads_as_dead(self):
+        code, out, err = self.main("pending", "nobody-here", "--json")
+        self.assertEqual(code, 0, err)
+        answer = json.loads(out)
+        self.assertIsNone(answer["observation"])
+        self.assertIn(" not found: no herdr pane shows a v2 session named ", answer["missing"])
+
+    def test_s3_the_launch_writes_one_headless_pane_line_and_makes_no_pane_tab_or_workspace_call(self):
+        panes, calls, rows = dict(self.world.herdr.panes), len(self.world.herdr.socket_calls), len(self.world.herdr.calls)
+        code, out, err = self.launch()
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json.loads(out)["pane"], None)
+        patches = [json.loads(inp)["body"] for argv, inp in self.gh.ran if "PATCH" in argv]
+        self.assertEqual(len(patches), 1, patches)
+        self.assertEqual([l for l in patches[0].splitlines() if l.startswith("pane:")], ["pane: headless:hl-orch"])
+        self.assertEqual(self.world.herdr.panes, panes)
+        self.assertEqual(len(self.world.herdr.socket_calls), calls, "no layout, tab or pane call")
+        self.assertEqual([a for a in self.world.herdr.calls[rows:] if a[1:3] in (["workspace", "create"], ["tab", "create"], ["pane", "split"])], [])
+        self.assertTrue(sb.load_agent_presence().load_record(self.world.state, "hl-orch"))
+        self.assertEqual(len(list((Path(self.world.state) / "headless").glob("*.json"))), 1, "one record")
+
+    def test_s4_watch_then_closing_the_terminal_keeps_the_session_and_retire_close_ends_it(self):
+        code, out, err = self.launch()
+        self.assertEqual(code, 0, err)
+        sid = json.loads(out)["session"]
+        self.as_agent("cos")
+        code, out, err = self.main("watch", "hl-orch")
+        self.assertEqual(code, 0, err)
+        pane = json.loads(out)["pane"]
+        self.world.herdr.panes.pop(pane)                                           # the terminal is closed
+        self.assertIn(sid, self.world.v2.sessions)
+        found = self.engine_discover()["hl-orch"]
+        self.assertEqual((found.headless, found.session_id), (True, sid), "the session stays")
+        self.assertTrue(sb.load_agent_presence().load_record(self.world.state, "hl-orch"))
+        os.environ.pop("HERDR_PANE_ID", None)
+        code, out, err = self.main("retire", "hl-orch", "--close", "--force")
+        self.assertEqual(code, 0, err)
+        self.assertIsNone(sb.load_agent_presence().load_record(self.world.state, "hl-orch"), "retire ends it")
+        self.assertNotIn("hl-orch", self.engine_discover())
+
+    def engine_discover(self):
+        engine, _, _ = sb.build_engine(self.world.route, self.world.clock.now, "cli", socket_call=self.world.herdr.socket)
+        return engine.discover(self.world.clock.now()).agents
+
+    def test_s2_the_registry_reconcile_never_removes_a_headless_orchestrators_row(self):
+        self.assertEqual(self.launch()[0], 0)
+        reg, rec = sb.load_module("registry"), sb.load_module("agent_reconcile")
+        row = {"kind": "orchestrator", "state": "dead", "role": "orchestrator"}
+        self.assertTrue(reg.upsert(self.world.state, "hl-orch", row)["changed"])
+        for check in (None, lambda n, a: "unknown", lambda n, a: "unreachable"):
+            read = reg.read(self.world.state)
+            self.assertIn("hl-orch", read["agents"])
+            self.assertEqual(rec.reconcile_on_read(self.world.state, read, lambda n, a: {"pane": False, "process": False}, reg, check), [])
+        self.assertIn("hl-orch", reg.read(self.world.state)["agents"])
+        self.assertTrue(sb.load_agent_presence().load_record(self.world.state, "hl-orch"), "the headless record is untouched")
+
+    def test_s2_the_heartbeat_does_not_wake_a_headless_orchestrator_and_raises_nothing(self):
+        hb = importlib.machinery.SourceFileLoader("hb_2074", str(BIN / "fleet-heartbeat")).load_module()
+        reg = sb.load_module("registry")
+        agents = {"hl-orch": {"kind": "orchestrator", "state": "idle", "bell": True, "role": "orchestrator"},
+                  "hl-pane": {"state": "idle", "bell": True, "pane": "w1:p1"}}
+        fake = types.SimpleNamespace(read=lambda d: {"whole": True, "version": 1, "agents": dict(agents), "retired": {}, "problem": None},
+                                     bell_of=reg.bell_of, no_pane_to_judge=reg.no_pane_to_judge)
+        with mock.patch.object(hb, "registry", fake):
+            targets, problem = hb.registry_targets()
+        self.assertIsNone(problem)
+        self.assertEqual([t["name"] for t in targets], ["hl-pane"], "the headless orchestrator is not wakeable")
+
+
 class TestRepoInKeysAndListings(TwoRepoCase):
     def test_an_intent_edit_key_names_the_repo_when_the_payload_does(self):
         payload = {"action": "edited", "issue": {"number": 7, "body": "## Intent\nnew\n", "updated_at": "2027-01-15T08:00:00Z"},
