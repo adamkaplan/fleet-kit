@@ -86,6 +86,7 @@ def wrote_gitconfig(path):
 class Identity(unittest.TestCase):
     def test_s2_only_make_is_added_to_the_apt_list(self):
         self.assertEqual(apt_packages(read(DOCKERFILE)) - PREVIOUS, {"make"} | set(BROWSER_PACKAGES))
+        self.assertLessEqual(PREVIOUS, apt_packages(read(DOCKERFILE)))
 
     def test_s2_the_pin_fails_for_a_package_outside_make_and_the_tuple(self):
         text = read(DOCKERFILE)
@@ -97,7 +98,6 @@ class Identity(unittest.TestCase):
         self.assertNotEqual(apt_packages(mutant) - PREVIOUS, {"make"} | set(BROWSER_PACKAGES))
         noop = text.replace("zz-absent-zz", "", 1)
         self.assertEqual(apt_packages(noop) - apt_packages(text), set())  # a no-op fails the computation above
-        self.assertLessEqual(PREVIOUS, apt_packages(read(DOCKERFILE)))
 
     def test_u3_the_scan_stage_still_exists(self):
         self.assertEqual(len(re.findall(r"^FROM worker AS scan", read(DOCKERFILE), re.M)), 1)
