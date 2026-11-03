@@ -11267,7 +11267,7 @@ def blocked_kind(engine, observation, resumed=False):
     return ended_turn_text(observation.name, resumed)
 
 
-BLOCKED_HELD_SENDS = "blocked-held-sends.json"   # {agent: {"rows": [{"from", "at"}]}}: sends refused while it was blocked (a `send` stores nothing, so the report counts them here)
+BLOCKED_HELD_SENDS = "blocked-held-sends.json"   # {agent: {"rows": [{"from", "at"}]}}: sends refused while it was blocked (who and when, no text; a send held for it is in held-sends.json)
 BLOCKED_LOCK = "blocked-alert.lock"
 BLOCKED_HELD_KEEP = 100      # rows kept per agent: the recorded case held 11 messages in 2.5 hours, so this is about nine times that
 BLOCKED_HELD_AGENTS = 64     # agents kept in the file: the number blocked at once in a fleet is a handful; 64 is far above any real fleet
