@@ -173,3 +173,192 @@ class TestHeldSends(Base):
             with self.assertRaises(AssertionError) as caught:
                 self.blocked_pane_scenario()
         self.assertIn(ANCHOR, str(caught.exception))
+
+
+    # ---- #2051 review round: the endpoint route's own limits, order, edges and the sender who cannot be told
+
+    def cli_as(self, sender, *argv):
+        with captured() as (out, err):
+            code = sb.main(["send", "--from", sender] + list(argv), runner=self.world.route, now=self.world.clock.now,
+                           wait=lambda sock, seconds: False, socket_call=self.world.herdr.socket)
+        return code, out.getvalue(), err.getvalue()
+
+    def drops_to(self, name):
+        return [a for a in self.world.admissions(name) if "was dropped" in a["text"]]
+
+    def endpoint_scenario(self):
+        self.endpoint_world()
+        code, _, err = self.cli("cloudy", "ping")
+        self.assertEqual(code, 0, "%s: status %s, %s" % (ANCHOR, code, err))
+        self.assertEqual(len(self.held("endpoint")), 1, ANCHOR)
+        sent_at = self.held("endpoint")[0][1]["at"]
+        self.world.tick(30)
+        self.world.engine.run_pass()
+        self.assertEqual(self.posts, [], "still blocked: nothing posted")
+        self.set_state("idle")
+        self.world.engine.run_pass()
+        self.assertEqual(len(self.posts), 1, "a held endpoint send is delivered when it unblocks")
+        return self.posts[0][2], sent_at
+
+    def test_s6_the_endpoint_control_passes(self):
+        text, sent_at = self.endpoint_scenario()
+        self.assertTrue(text.startswith("(sent %s) " % sb.iso(sent_at)), "no (sent <time>) prefix: %s" % text)
+
+    def test_s6_a_mutant_that_refuses_on_the_endpoint_route_is_caught_by_the_anchored_text(self):
+        old = "if held:\n"
+        new = 'if held:\n        sys.stderr.write("%s: not sent to %s: held\\n" % (PROG, args.name))\n        return EXIT_HELD\n'
+        with self.mutant(sb, "_send_by_registry", old, new):
+            with self.assertRaises(AssertionError) as caught:
+                self.endpoint_scenario()
+        self.assertIn(ANCHOR, str(caught.exception))
+
+    def test_s6_a_mutant_that_never_delivers_the_held_endpoint_send_is_caught(self):
+        with self.mutant(sb, "held_sends_tick", 'if found[0] != "endpoint" or', 'if True or'):
+            with self.assertRaises(AssertionError) as caught:
+                self.endpoint_scenario()
+        self.assertIn("a held endpoint send is delivered when it unblocks", str(caught.exception))
+
+    def test_s6_a_mutant_that_drops_the_sent_time_is_caught(self):
+        with self.mutant(sb, "held_sends_tick", '"(sent %s) %s" % (iso(row["at"]), row["text"])', 'row["text"]'):
+            with self.assertRaises(AssertionError) as caught:
+                self.test_s6_the_endpoint_control_passes()
+        self.assertIn("(sent ", str(caught.exception))
+
+    def test_s3_the_endpoint_post_carries_the_sends_own_time_not_the_deliverys(self):
+        text, sent_at = self.endpoint_scenario()
+        self.assertTrue(text.startswith("(sent %s) " % sb.iso(sent_at)), text)
+        self.assertNotIn(sb.iso(self.world.clock.now()), text)
+        self.assertTrue(text.endswith("ping"), text)
+
+    def test_s5_endpoint_cap_is_50_and_the_oldest_is_told_it_was_dropped(self):
+        self.endpoint_world()
+        for n in range(51):
+            self.world.tick(1)
+            self.assertEqual(self.cli("cloudy", "msg%d" % n)[0], 0)
+        rows = self.held("endpoint")
+        self.assertEqual(len(rows), 50)
+        self.assertNotIn("msg0", [r["text"] for _, r in rows])
+        (drop,) = self.drops_to("coder")
+        self.assertIn("cloudy", drop["text"])
+        self.assertIn("msg0", drop["text"])
+
+    def test_s5_an_endpoint_send_older_than_24_hours_is_dropped_and_its_sender_told(self):
+        self.endpoint_world()
+        self.cli("cloudy", "old", "news")
+        self.world.clock.t += 24 * 3600 + 5
+        self.world.engine.run_pass()
+        self.assertEqual((self.held(), self.posts), ([], []))
+        (drop,) = self.drops_to("coder")
+        self.assertIn("old news", drop["text"])
+
+    def test_s5_a_gone_endpoint_recipient_is_refused_with_status_3_and_nothing_held(self):
+        self.endpoint_world()
+        self.registry.retire(self.world.state, "cloudy", "test", "gone")
+        code, _, err = self.cli("cloudy", "hi")
+        self.assertEqual(code, sb.EXIT_HELD, err)
+        self.assertEqual((self.held(), self.posts), ([], []))
+
+    def test_d1_two_held_sends_on_the_pane_route_arrive_once_in_one_message_the_ordinary_batch_lists_newest_first(self):
+        self.status("platform", "blocked")
+        self.cli("platform", "first-one")
+        self.world.tick(2)
+        self.cli("platform", "second-one")
+        self.status("platform", "idle")
+        self.world.engine.run_pass()
+        self.world.engine.run_pass()
+        (admitted,) = self.world.admissions("platform")   # pinned as it is: the ordinary batch format, not a held-send order
+        text = admitted["text"]
+        self.assertTrue(0 <= text.find("second-one") < text.find("first-one"), text)
+        self.assertEqual(self.held(), [])
+
+    def test_d1_two_held_sends_go_oldest_first_on_the_endpoint_route(self):
+        self.endpoint_world()
+        self.cli("cloudy", "first-one")
+        self.world.tick(2)
+        self.cli("cloudy", "second-one")
+        self.set_state("idle")
+        self.world.engine.run_pass()
+        self.assertEqual([p[2].split(") ", 1)[1] for p in self.posts], ["first-one", "second-one"])
+
+    def test_d2_a_send_to_oneself_while_blocked_is_held_like_any_other(self):
+        self.status("platform", "blocked")
+        code, _, err = self.cli_as("platform", "platform", "note", "to", "self")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(self.held()), 1)
+        self.status("platform", "idle")
+        self.world.engine.run_pass()
+        (admitted,) = self.world.admissions("platform")
+        self.assertIn("note to self", admitted["text"])
+
+    def test_d3_unblocking_in_the_middle_of_a_pass_delivers_the_endpoint_send_in_that_pass_and_the_pane_send_in_the_next(self):
+        self.endpoint_world()
+        self.status("platform", "blocked")
+        self.cli("cloudy", "to-endpoint")
+        self.cli("platform", "to-pane")
+        real = sb.Switchboard.render
+        engine = self.world.engine
+
+        def render(this, *a, **kw):
+            result = real(this, *a, **kw)
+            self.set_state("idle")
+            self.status("platform", "idle")   # unblocked after the pass read both
+            return result
+        with mock.patch.object(sb.Switchboard, "render", render):
+            engine.run_pass()
+        self.assertEqual(len(self.posts), 1)
+        self.assertEqual(self.world.admissions("platform"), [])
+        self.world.engine.run_pass()
+        self.assertEqual(len(self.world.admissions("platform")), 1)
+        self.world.engine.run_pass()
+        self.assertEqual((len(self.posts), len(self.world.admissions("platform"))), (1, 1))
+
+    def test_d4_a_daemon_restart_rereads_the_store_and_delivers_each_held_send_once(self):
+        self.endpoint_world()
+        self.status("platform", "blocked")
+        self.cli("cloudy", "to-endpoint")
+        self.cli("platform", "to-pane")
+        self.world.engine.run_pass()
+        self.set_state("idle")
+        self.status("platform", "idle")
+        fresh = self.world.new_engine()
+        fresh.run_pass()
+        self.world.new_engine().run_pass()
+        self.assertEqual(len(self.posts), 1)
+        self.assertEqual(len(self.world.admissions("platform")), 1)
+        self.assertEqual(self.held(), [])
+
+    def test_d5_a_pane_send_older_than_24_hours_is_still_delivered_when_the_recipient_has_just_unblocked(self):
+        self.status("platform", "blocked")
+        self.cli("platform", "ancient")
+        self.world.clock.t += 24 * 3600 + 5
+        self.status("platform", "idle")
+        self.world.engine.run_pass()   # the pane delivery step runs before the expiry in held_sends_tick: pinned
+        (admitted,) = self.world.admissions("platform")
+        self.assertIn("ancient", admitted["text"])
+        self.assertEqual((self.held(), self.drops_to("coder")), ([], []))
+
+    def audit_events(self, event):
+        return [e for e in self.world.audit() if e["event"] == event]
+
+    def test_d6_a_sender_with_no_pane_is_told_only_by_the_audit_line_when_its_send_is_dropped(self):
+        self.status("platform", "blocked")
+        for n in range(51):
+            self.world.tick(1)
+            self.assertEqual(self.cli_as("script", "platform", "msg%d" % n)[0], 0)
+        (line,) = self.audit_events("held.drop")
+        self.assertEqual((line["subject"], line["detail"]["from"]), ("platform", "script"))
+        self.assertEqual(self.world.admissions("coder"), [])
+
+    def test_d6_a_post_that_fails_after_release_is_audited_and_a_paneless_sender_is_not_told(self):
+        self.endpoint_world()
+        self.cli_as("script", "cloudy", "ping")
+        self.set_state("idle")
+        patch = mock.patch.object(sb.load_module("endpoint_send"), "deliver", lambda *a, **k: (False, "the channel said no"))
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.world.engine.run_pass()
+        (line,) = self.audit_events("held.undelivered")
+        self.assertEqual(line["subject"], "cloudy")
+        self.assertIn("the channel said no", line["detail"]["reason"])
+        self.assertEqual(self.held(), [])
+        self.assertEqual(self.world.admissions("coder"), [])
