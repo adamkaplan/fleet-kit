@@ -11555,6 +11555,16 @@ def hold_send_fact(engine, fact, now):
     return {"sent": False, "held": True, "action": "held", "key": key, "reason": "held until %s unblocks" % fact.recipient}
 
 
+def hold_send_endpoint(engine, name, sender, text, issue, now):
+    """The endpoint route's hold: the same store, delivered by held_sends_tick when the registry row is no longer blocked."""
+    issue = None if issue is None else int(issue)
+    key, dropped = hold_send(engine.state_dir, name, sender, text, issue, issue_repo(issue), now, HELD_ROUTE_ENDPOINT)
+    if engine.audit is not None:
+        engine.audit.append(engine.actor, "held", name, {"from": blocked_sender(sender), "key": key})
+    tell_dropped_sends(engine, [(name, r) for r in dropped], now, "over %d held sends or older than 24 hours" % HELD_SENDS_KEEP)
+    return key
+
+
 class HeldSendFacts:
     """The held sends of agents with a pane, as facts with their own key and sent time: the ordinary rule holds them while the recipient is
     blocked and delivers them, oldest first, when it is idle or working."""
@@ -14954,8 +14964,9 @@ def _send_by_registry(args, runner, now):
         return EXIT_USAGE
     held = es.blocked_reason(args.name, found[2], hold_reason)
     if held:
-        sys.stderr.write("%s: not sent to %s: hold (%s)\n" % (PROG, args.name, held))
-        return EXIT_HELD
+        hold_send_endpoint(engine, args.name, sender, text, args.issue, now)
+        sys.stderr.write("%s: held for %s: it will be delivered when it unblocks\n" % (PROG, args.name))
+        return EXIT_OK
     ok, line = es.deliver(load_module("cloud_client"), found[1], sender, args.name, text)
     if not ok:
         sys.stderr.write("%s: not sent to %s: %s\n" % (PROG, args.name, line))
