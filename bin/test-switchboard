@@ -66009,6 +66009,9 @@ TestLoadAlertCloudBusy = _load_cloud.TestLoadAlertCloudBusy
 # The CI test-file list tests of #1498.
 _ci_test_files = importlib.import_module("test_ci_test_files")
 TestCiTestFileList = _ci_test_files.TestCiTestFileList
+_psj = importlib.import_module("test_pr_state_jobs")
+_psj.HOST = sys.modules[__name__]
+TestPrStateJobs = _psj.load()   # #1962
 TestTempJanitorScratch = importlib.import_module("test_scratch").build(TestTempJanitor)
 
 # The delivery-lag tests of #1402.
@@ -66031,7 +66034,6 @@ TestClaimPlacement, TestClaimMutants, TestClaimReaders = _claim_placement.TestCl
 _changed_file_pages = importlib.import_module("test_changed_file_pages")
 _changed_file_pages.HOST = sys.modules[__name__]
 TestWholeReadOfALargePullRequest = _changed_file_pages.load()
-_psj = importlib.import_module("test_pr_state_jobs"); _psj.HOST = sys.modules[__name__]; TestPrStateJobs = _psj.load()   # #1962
 
 _lm = importlib.import_module("test_launch_model"); _lm.HOST = sys.modules[__name__]; TestLaunchModel = _lm.build(); TestLaunchModelCloud = _lm.build_cloud()   # #1642
 _cfw = importlib.import_module("test_changed_files_whole"); _cfw.HOST = sys.modules[__name__]; TestChangedFilesWhole = _cfw.build()   # #1531
