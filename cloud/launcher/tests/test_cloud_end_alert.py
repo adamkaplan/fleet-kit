@@ -271,7 +271,7 @@ class TestUntrusted(World):
         self.assertIn("Bad Boss", [to for to, t in self.sent])
 
     def test_m3_a_branch_copying_mutant_is_caught(self):
-        broken = mutant('return "yes" if hook["pushed"] else "no"', 'return "yes %s" % hook.get("wip_branch") if hook["pushed"] else "no"')
+        broken = mutant('return "unpushed work saved to " + name(wip) if name(wip) else "unknown"', 'return "unpushed work saved to " + str(wip) if wip else "unknown"')
         self.worker("worker7")
         self.stop("worker7", "idle")
         self.run_pass(broken)
@@ -351,10 +351,10 @@ class TestS9ThreeHostileRecords(World):
         self.assertEqual((present, branch, shapes, n), (5, 0, 0, 3))
 
     def test_s9_m3_the_branch_copying_mutant_fails_the_hostile_test_and_the_control_passes(self):
-        old = 'return "yes" if hook["pushed"] else "no"'
+        old = 'return "unpushed work saved to " + name(wip) if name(wip) else "unknown"'
         with open(SOURCE) as f:
             applied = f.read().count(old) == 1   # computed before the replace
-        broken = mutant(old, 'return "yes %s" % hook.get("wip_branch") if hook["pushed"] else "no"')
+        broken = mutant(old, 'return "unpushed work saved to " + str(wip) if wip else "unknown"')
         planted = HOSTILE_RECORDS[0][1]   # the branch of the first valid-name record, where the copy leaks first
         control = 0
         try:
