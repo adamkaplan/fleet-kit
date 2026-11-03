@@ -14,6 +14,9 @@ export const LOAD_FILE = "load.json"
 export const PANE_FILE = "pane-health.json"
 export const DECISIONS_FILE = "decisions.json"
 export const WATCHED = [RECORDS_FILE, LOAD_FILE, PANE_FILE, DECISIONS_FILE]
+export const ALARM_FILE = "owner-alarm.json"   // the Chief of Staff's blocked alarm (written by the daemon's blocked report)
+export const ALARM_KEEP_MS = 3600_000          // an ended alarm's row is kept an hour
+WATCHED.push(ALARM_FILE)
 export const RECORDS_STALE_MS = 600_000   // the daemon rewrites health-records.json at least every 5 minutes (its heartbeat)
 export const LOAD_STALE_MS = 3 * 3600_000 // load.json is rewritten only when its content changes: an hour or two quiet is normal
 export const PANE_STALE_MS = 600_000
@@ -52,6 +55,7 @@ export function loadInputs(dir, now) {
     load: read(LOAD_FILE, LOAD_STALE_MS),
     pane: read(PANE_FILE, PANE_STALE_MS),
     decisions: read(DECISIONS_FILE, DECISIONS_STALE_MS),
+    alarm: read(ALARM_FILE, Infinity), // the record carries its own times: the row judges them
   }
 }
 
@@ -259,6 +263,10 @@ function cut(segs, width) {
 
 // All rows of the health section: a heading, then each block's two lines. [] when there is no workspace to show (nothing is drawn).
 export function healthRows(inputs, now, width) {
+  if (!inputs.__inner) { // the owner's alarm row above the block; any other input is drawn as before
+    const alarm = alarmRows(inputs.alarm, now, width)
+    if (alarm.length > 0) return [...alarm, ...healthRows({ ...inputs, __inner: true }, now, width)]
+  }
   const blocks = buildBlocks(inputs, now)
   if (blocks.length === 0) return []
   const rows = [{ segs: [["Workspaces", "b"], [" · activity ≈ (calls or steps)", "m"]] }]
@@ -270,4 +278,20 @@ export function healthRows(inputs, now, width) {
   for (const block of blocks) for (const segs of blockLines(block, width)) rows.push({ segs })
   rows.push({ segs: [["", ""]] })
   return rows
+}
+
+// One row for the Chief of Staff's blocked alarm (owner-alarm.json): a blocked record always; an ended one for an hour; a missing,
+// malformed or older record nothing.
+export function alarmRows(file, now, width) {
+  const rec = obj(obj(file).alarm)
+  const agent = clean(rec.agent, 24)
+  if (!agent || !isNum(rec.since)) return []
+  let label
+  if (rec.ended === null || rec.ended === undefined) {
+    label = `! ${agent} blocked ${Math.max(0, Math.floor((now - rec.since * 1000) / 60000))} minutes`
+  } else {
+    if (!isNum(rec.ended) || now - rec.ended * 1000 > ALARM_KEEP_MS) return []
+    label = `${agent} block ended (${Math.max(0, Math.floor((rec.ended - rec.since) / 60))} minutes)`
+  }
+  return [{ segs: [[label.slice(0, width), "b"]] }, { segs: [["", ""]] }]
 }
