@@ -498,6 +498,15 @@ def _glue_pass(text):
     return "".join(out)
 
 
+_ABSORB_RE = re.compile(r"(?:(?<![0-9A-Za-z.])(?:[0-9]{1,3}\.){1,3})?\[address\](?:\.[0-9]{1,3}){1,3}(?![0-9])|(?<![0-9A-Za-z.])(?:[0-9]{1,3}\.){1,3}\[address\]")
+
+
+def _absorb_pass(text):
+    """PC-13 (the absorb rule): a `[address]` directly followed by a dot and 1 to 3 dotted octets, or directly preceded by 1 to 3 dotted octets, absorbs them
+    (the dotted tail of an IPv6 address that phase 1 parsed only in part); over-masking only."""
+    return _ABSORB_RE.sub("[address]", text)
+
+
 def _mask_addresses(text):
     """The capacity answer's own masking, before the launcher's one scrub, decided by `ipaddress` (PC-10, PC-11, PC-12): every maximal run of address
     characters (an optional `%zone` stays text) is searched, in windows of 200 that overlap by 64, for substrings that `ipaddress` accepts, the longest
@@ -516,7 +525,7 @@ def _mask_addresses(text):
     GLUE_PASS = True
     if GLUE_PASS and _address_spans("fd00::1"):  # PC-13: the glue pass (an address glued to hex letters), only while the IPv6 masking is on
         for _ in range(MASK_GUARD):
-            glued = _glue_pass(text)
+            glued = _absorb_pass(_glue_pass(text))
             if glued == text:
                 return text
             text = glued
