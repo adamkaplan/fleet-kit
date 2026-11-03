@@ -128,7 +128,7 @@ def read_jobs(gh, repo, run_id):
     jobs = data.get("jobs") if isinstance(data, dict) else None
     if not isinstance(jobs, list):
         raise ReadError("the jobs of run %s answered no list" % run_id)
-    return [{"name": str(j.get("name")), "conclusion": str(j.get("conclusion") or j.get("status") or "")} for j in jobs if isinstance(j, dict)]
+    return [{"name": str(j.get("name")), "conclusion": str(j.get("conclusion") or j.get("status") or ""), "steps": [{"name": str(s.get("name")), "conclusion": str(s.get("conclusion") or s.get("status") or "")} for s in (j.get("steps") or []) if isinstance(s, dict)][:20]} for j in jobs if isinstance(j, dict)]
 
 
 def read_branch_runs(gh, repo, branch, workflow_ids=None):
