@@ -14434,6 +14434,13 @@ def _cmd_launch(args, runner, now, socket_call=None):
         if created:
             raise LaunchError("%s (workspace %s was created and is left for you to close)" % (err, created)) from err
         raise
+    if done.get("headless") and args.role == "orchestrator" and isinstance(args.charter, int) and not isinstance(args.charter, bool):   # #2074: an orchestrator with no terminal says so in its charter
+        try:
+            note = charter_pane_update(engine, runner, {"charter": args.charter, "repo": repo}, "headless:%s" % args.name)
+        except Exception as err:
+            note = "charter pane not updated: %s" % _one_line(str(err), 120)
+        if note:
+            sys.stderr.write("%s: %s\n" % (PROG, note))
     print(json.dumps(done, sort_keys=True))
     if done.get("identity"):
         sys.stderr.write("%s: %s\n" % (PROG, done["identity"]))
