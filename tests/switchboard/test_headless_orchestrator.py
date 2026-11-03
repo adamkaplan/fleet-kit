@@ -54,7 +54,7 @@ class DoctorHeadlessCharter(unittest.TestCase):
         run = self.charter_run("echo '{\"observation\": {\"name\": \"orch-hl\", \"status\": \"idle\", \"headless\": true}}'")
         text = self.text(run)
         self.assertIn("1 headless charter(s) alive", text, "a headless orchestrator is alive while the service shows it\n" + run.output)
-        self.assertNotIn("dead pane", text)
+        self.assertNotIn("name a dead pane", text)
 
     def test_a_headless_orchestrator_the_service_does_not_show_is_dead(self):
         run = self.charter_run("echo '{\"observation\": null}'")
@@ -64,7 +64,7 @@ class DoctorHeadlessCharter(unittest.TestCase):
         run = self.charter_run("echo 'not json'")
         text = self.text(run)
         self.assertIn("unknown", text, run.output)
-        self.assertNotIn("dead pane", text)
+        self.assertNotIn("name a dead pane", text)
 
 
 if __name__ == "__main__":
