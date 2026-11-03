@@ -809,6 +809,27 @@ for text in ("12:30:45", "aa:bb:cc:dd:ee:ff", "1::2::3", "x::1::2", "0123456789a
         def test_u26_the_generated_lines_hold_glued_letters_and_leave_no_address(self):
             self.assertIn("glue(form)", self.PC11_U21)
 
+        PC11_U26B = r"""
+for line, planted, want in (("::ffff:10.0.0.1ab", "::ffff:10.0.0.1", "[address]ab"), ("64:ff9b::192.0.2.1ab", "64:ff9b::192.0.2.1", "[address]ab"),
+                            ("2001:db8::10.0.0.1abc", "2001:db8::10.0.0.1", "[address]abc"), ("::ffff:10.0.0.1ab:80", "::ffff:10.0.0.1", "[address]ab:80"),
+                            ("10.0.0.1ab::ffff:10.0.0.2", "::ffff:10.0.0.2", "[address]")):
+    assert accepted(planted), planted
+    out = lib._mask_addresses(line)
+    if planted in out or "10.0.0.1" in out or "192.0.2.1" in out or "10.0.0.2" in out or out != want:
+        sys.exit("a mapped or dotted-tail form with glue was left: %r gave %r, wanted %r" % (line, out, want))
+"""
+
+        def test_u26_the_mapped_and_dotted_tail_forms_with_glue_are_masked_whole(self):
+            code, err, out = self.pc11_run(self.PC11_U26B)
+            self.assertEqual((code, err), (0, ""))
+
+        def test_u26_the_dotted_tail_control_passes_and_the_glue_switch_off_fails_with_the_text(self):
+            code, err, out = self.pc11_run(self.PC11_U26B)
+            self.assertEqual((code, err), (0, ""))
+            code, err, out = self.pc11_run(self.PC11_U26B, ("cloud/launcher/cloud_worker.py", "    GLUE_PASS = True\n", "    GLUE_PASS = False\n"))
+            self.assertEqual(code, 1, err)
+            self.assertIn("a mapped or dotted-tail form with glue was left", err)
+
         def pc11_run(self, script, mutate=None):
             import shutil, subprocess, tempfile
             root = Path(__file__).resolve().parents[2]
