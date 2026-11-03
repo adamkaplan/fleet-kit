@@ -271,10 +271,7 @@ class Entrypoint(unittest.TestCase):
 
 
 # S3: each copy under cloud/worker equals its source when the source is in this checkout; a missing source is skipped by name
-COPIES = {"bin/cloud_cli.py": "cloud/worker/bin/cloud_cli.py", "bin/cloud_client.py": "cloud/worker/bin/cloud_client.py",
-          "agents/opencode/orchestrator.md": "cloud/worker/agents/orchestrator.md", "bin/cloud_hub.py": "cloud/worker/bin/cloud_hub.py",
-          "bin/cloud_channel.py": "cloud/worker/bin/cloud_channel.py", "bin/cloud_channel_server.py": "cloud/worker/bin/cloud_channel_server.py",
-          "bin/cloud_relay.py": "cloud/worker/bin/cloud_relay.py"}
+COPIES = [tuple(_l.split("\t")) for _l in __import__("pathlib").Path(ROOT, "cloud", "worker", "copies.tsv").read_text(encoding="utf-8").splitlines() if _l]
 
 
 def drift(root, source, copy):
@@ -285,7 +282,7 @@ def drift(root, source, copy):
 
 class Drift(unittest.TestCase):
     def test_s3_each_copy_equals_its_source(self):
-        for source, copy in COPIES.items():
+        for source, copy in COPIES:
             with self.subTest(copy=copy):
                 self.assertTrue(os.path.isfile(os.path.join(ROOT, copy)), copy + " is missing")
                 if not os.path.isfile(os.path.join(ROOT, source)):
