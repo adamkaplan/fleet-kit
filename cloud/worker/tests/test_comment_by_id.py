@@ -110,6 +110,52 @@ class ClientIsGetOnly(unittest.TestCase):
             with self.assertRaises(self.m.Fail):
                 self.m.api_get(["repos/o/r/issues/comments/1"] + extra)
 
+    BASE = "repos/o/r/issues/comments/1"
+
+    def refused_before_request(self, extra):
+        calls = []
+        real = self.m.request
+        self.m.request = lambda *a, **k: calls.append(a) or b"{}"
+        try:
+            with self.assertRaises(self.m.Fail, msg=repr(extra)):
+                self.m.api_get([self.BASE] + extra)
+        finally:
+            self.m.request = real
+        self.assertEqual(calls, [], "a request was sent for " + repr(extra))
+
+    def test_refused_x_mixed_case_patch(self):
+        self.refused_before_request(["-X", "pAtch"])
+
+    def test_refused_x_mixed_case_put(self):
+        self.refused_before_request(["-X", "PuT"])
+
+    def test_refused_x_mixed_case_delete(self):
+        self.refused_before_request(["-X", "DeLeTe"])
+
+    def test_refused_method_equals_patch(self):
+        self.refused_before_request(["--method=patch"])
+
+    def test_refused_x_attached_patch(self):
+        self.refused_before_request(["-Xpatch"])
+
+    def test_refused_x_equals_patch(self):
+        self.refused_before_request(["-X=patch"])
+
+    def test_refused_method_override_header(self):
+        self.refused_before_request(["-H", "X-HTTP-Method-Override: PATCH"])
+
+    def test_refused_hostname(self):
+        self.refused_before_request(["--hostname", "example.com"])
+
+    def test_path_refused_reactions(self):
+        self.assertFalse(self.m.api_path_allowed("/repos/o/r/issues/comments/1/reactions"))
+
+    def test_path_refused_extra_segment(self):
+        self.assertFalse(self.m.api_path_allowed("/repos/o/r/issues/comments/1/extra"))
+
+    def test_path_refused_dot_dot(self):
+        self.assertFalse(self.m.api_path_allowed("/repos/o/r/issues/comments/1/../2"))
+
 
 if __name__ == "__main__":
     unittest.main()
