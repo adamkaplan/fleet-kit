@@ -117,6 +117,8 @@ def handle(headers, body_length, read_body, review, env=None, mint_fn=None):
         cloud_worker.check_repo_allowed(repo, env)
     except cloud_worker.CloudError:
         return 403, None, "the repository is not on the allowed list"
+    if role == "worker-workflows" and cloud_worker.workflows_role(repo, env) != "worker-workflows":
+        return 403, None, "the repository is not named in CW_WORKFLOWS_REPOS"
     try:
         ans = mint_fn(repo, role)
     except SystemExit:
