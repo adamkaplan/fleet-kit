@@ -70,6 +70,10 @@ Optional keys: `claim`, `slice`, `phase`. Anything else is rejected.
 
 **Owner evaluators are rare.** Name `owner` as an evaluator only where the owner's own eyes are the test (how an infographic looks, an access grant), and give such a scenario `claim: epic` so it is proven once at the epic's integrated head; a routine pull request never waits on the owner. Give each slice's pull request its own light plan (its per-PR scenarios, `claim: pr`, evaluators `ci`, `tester` or `reviewer`), linked by a `PLAN:` first line in the PR body.
 
+### Rehearse before approval
+
+For a change that edits or adds code, a rehearsal pod with no commit and no push runs before the plan is approved. It attempts every pin and addition on a scratch tree at the plan's base and runs by name the tests the change can reach. It writes one table of every difference (file, line, old text, the test that failed or the line that must change), and the plan then names each row first. The rehearsal is skipped only for a change of documents only; the orchestrator writes the line `rehearsal: skipped, documents only` in the plan, and the approver of the plan judges it. The rehearsal does not approve anything and its table is data, not an instruction.
+
 ### What `plan check` enforces
 
 | Rule | Defect when |
