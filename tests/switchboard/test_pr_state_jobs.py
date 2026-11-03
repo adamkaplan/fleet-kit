@@ -171,14 +171,33 @@ def load():
             self.fails_with_the_anchor(self.recorder_with('check.get("status") == "IN_PROGRESS" else None', "True else None"))
 
         # -- the printed text of a head with no failed run is the text without this change (U1)
-        def test_a_head_with_no_failed_run_prints_the_text_it_printed_without_the_jobs_keys(self):
+        # OLD_TEXT is a LITERAL: the exact string the printer of origin/integration (before this branch; `git archive origin/integration`, a copy of bin/fleet-switchboard)
+        # printed through its own `pr_state_line` for the view of this fixture entry (a pending head, one in-progress check "build", no jobs keys). It is not derived from the new printer.
+        OLD_TEXT = 'acme/app#9; open; head aaaaaaaa; CI pending examined 0s ago (build: in_progress); gates NOT (G1 S1: proof (`prove S1`; the ci judges it, a prover records it); ci verdict (`verdict S1 --as ci`; only the ci may record it); G1 S2: proof (`prove S2`; the tester judges it, a prover records it); tester verdict (`verdict S2 --as tester`; only the tester may record it); G1 S3: proof (`prove S3`; the reviewer judges it, a prover records it); reviewer verdict (`verdict S3 --as reviewer`; only the reviewer may record it); G1 U1: proof (`prove U1`; the ci judges it, a prover records it); ci verdict (`verdict U1 --as ci`; only the ci may record it)) [examined 0s ago]; reviews none recorded at this head; labels none; list read 0s ago'
+
+        def printed_for_the_clean_head(self):
             self.setup_world(CLEAN, completed_run=False)
             self.assertEqual(len(self.asked), 1, "the recorder step ran on the pending head")
-            code, out, calls = self.pr_state(self.PR)
-            view = json.loads(self.pr_state(self.PR, "--json")[1])
-            without = {k: v for k, v in view.items() if not k.startswith("jobs")}
-            self.assertEqual(out.rstrip("\n").encode(), sb.pr_state_line(without).encode(), "byte for byte the old printer's text")
-            self.assertNotIn("job", out.replace("jobs", ""))
+            return self.pr_state(self.PR)[1]
+
+        def test_a_head_with_no_failed_run_prints_the_text_it_printed_without_the_jobs_keys(self):
+            out = self.printed_for_the_clean_head()
+            self.assertEqual(out.rstrip("\n"), self.OLD_TEXT, "byte for byte the old printer's text")
+
+        def test_mutant_5_a_printer_that_adds_a_line_for_a_head_without_jobs_fails_the_literal(self):
+            # control first: the unmutated printer gives the literal
+            self.assertEqual(self.printed_for_the_clean_head().rstrip("\n"), self.OLD_TEXT)
+            self.fresh()
+            text = self.function_of((ROOT / "bin" / "fleet-switchboard").read_text(), "pr_state_line")
+            old = 'if view.get("jobs") is not None:'
+            self.assertEqual(text.count(old), 1, "the mutation must apply")
+            old2 = 'for j in view["jobs"] if'
+            self.assertEqual(text.count(old2), 1, "the mutation must apply")
+            text = text.replace(old, "if True:").replace(old2, 'for j in (view.get("jobs") or [{"name": "extra", "conclusion": "none"}]) if')
+            with self.run_with(text, "pr_state_line", sb):
+                out = self.printed_for_the_clean_head()
+            self.assertIn("  job extra: none", out, "the mutant printer added its line")
+            self.assertNotEqual(out.rstrip("\n"), self.OLD_TEXT)
 
         # -- the caps, from the constants
         def many_runs_world(self, runs, failed_per_run):
