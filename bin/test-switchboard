@@ -60,8 +60,6 @@ import uuid
 import urllib.parse
 from unittest import mock
 
-BIN = Path(__file__).resolve().parent
-REPO = BIN.parent
 os.environ["GIT_TERMINAL_PROMPT"] = "0"   # #1050: a test's git never opens a credential dialog
 os.environ["GCM_INTERACTIVE"] = "never"
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tests" / "switchboard"))   # support import
@@ -69,6 +67,32 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tests" / "switc
 import importlib
 _support_rebind = importlib.import_module("support.rebind")   # support import
 rebound = _support_rebind.rebound   # support import
+_support_bodies_and_comments = importlib.import_module("support.bodies_and_comments")   # support import
+APPROVAL_DW, CLAIM_RULE, CLAIM_SENTENCE, PLAN_CLAUSES, REAL_FLOOR_BRIEF, REAL_INTENT_ISSUE, REAL_INTENT_PARENT, TRI_HEAD_A, TRI_HEAD_B, _utc, charter_with, converted_body, edited_body, hex_id, intent_body, plan_body, plan_review, sb_form_arg_names, sb_form_args, source_orders, sweep_comment, tri_comment = (_support_bodies_and_comments.APPROVAL_DW, _support_bodies_and_comments.CLAIM_RULE, _support_bodies_and_comments.CLAIM_SENTENCE, _support_bodies_and_comments.PLAN_CLAUSES, _support_bodies_and_comments.REAL_FLOOR_BRIEF, _support_bodies_and_comments.REAL_INTENT_ISSUE, _support_bodies_and_comments.REAL_INTENT_PARENT, _support_bodies_and_comments.TRI_HEAD_A, _support_bodies_and_comments.TRI_HEAD_B, _support_bodies_and_comments._utc, _support_bodies_and_comments.charter_with, _support_bodies_and_comments.converted_body, _support_bodies_and_comments.edited_body, _support_bodies_and_comments.hex_id, _support_bodies_and_comments.intent_body, _support_bodies_and_comments.plan_body, _support_bodies_and_comments.plan_review, _support_bodies_and_comments.sb_form_arg_names, _support_bodies_and_comments.sb_form_args, _support_bodies_and_comments.source_orders, _support_bodies_and_comments.sweep_comment, _support_bodies_and_comments.tri_comment)   # support import
+_support_scenario_and_delivery = importlib.import_module("support.scenario_and_delivery")   # support import
+DECISIONS_HARNESS, DELIVERY_FIXTURE, IDLE_CASES, JEV_SCENARIO_CONFIG, VIEW_HARNESS, WORK_ITEM_PLAN, _clock_at, _delivered_texts, _toasts, delivery_fixture = (_support_scenario_and_delivery.DECISIONS_HARNESS, _support_scenario_and_delivery.DELIVERY_FIXTURE, _support_scenario_and_delivery.IDLE_CASES, _support_scenario_and_delivery.JEV_SCENARIO_CONFIG, _support_scenario_and_delivery.VIEW_HARNESS, _support_scenario_and_delivery.WORK_ITEM_PLAN, _support_scenario_and_delivery._clock_at, _support_scenario_and_delivery._delivered_texts, _support_scenario_and_delivery._toasts, _support_scenario_and_delivery.delivery_fixture)   # support import
+_support_policy_and_doc_tables = importlib.import_module("support.policy_and_doc_tables")   # support import
+AGENT_WORDS, CANARY, CHANGE_KINDS, COS_ONLY_MAXIMS, CRED_CRITERIA, CRED_DOC_PATH, CRED_TOKEN_PATTERNS, CUTOVER_DOC, DERIVED_VIEWS, DOC_EXAMPLE_LINE, FREE_KEYWORDS, HYGIENE_MAXIMS, IMPACT_TABLE, KEEP_OUT, LIVE_OBSERVERS, NO_CAP_WORDS, PINNED_G1_HASHES, POLICY_CASES, PR4_CATALOG, PRE_EXISTING_REDEFINITIONS, ROLE_LINE_LIMITS, RUBRIC, SHARED_MAXIMS, STOPPED_NEWS_RULES, STRUCTURAL_RULE, VERBS, cred_doc_sections, derived_forms, maxims_block, measured_table, per_agent_limits, structural_rule_homes, structural_rule_problems = (_support_policy_and_doc_tables.AGENT_WORDS, _support_policy_and_doc_tables.CANARY, _support_policy_and_doc_tables.CHANGE_KINDS, _support_policy_and_doc_tables.COS_ONLY_MAXIMS, _support_policy_and_doc_tables.CRED_CRITERIA, _support_policy_and_doc_tables.CRED_DOC_PATH, _support_policy_and_doc_tables.CRED_TOKEN_PATTERNS, _support_policy_and_doc_tables.CUTOVER_DOC, _support_policy_and_doc_tables.DERIVED_VIEWS, _support_policy_and_doc_tables.DOC_EXAMPLE_LINE, _support_policy_and_doc_tables.FREE_KEYWORDS, _support_policy_and_doc_tables.HYGIENE_MAXIMS, _support_policy_and_doc_tables.IMPACT_TABLE, _support_policy_and_doc_tables.KEEP_OUT, _support_policy_and_doc_tables.LIVE_OBSERVERS, _support_policy_and_doc_tables.NO_CAP_WORDS, _support_policy_and_doc_tables.PINNED_G1_HASHES, _support_policy_and_doc_tables.POLICY_CASES, _support_policy_and_doc_tables.PR4_CATALOG, _support_policy_and_doc_tables.PRE_EXISTING_REDEFINITIONS, _support_policy_and_doc_tables.ROLE_LINE_LIMITS, _support_policy_and_doc_tables.RUBRIC, _support_policy_and_doc_tables.SHARED_MAXIMS, _support_policy_and_doc_tables.STOPPED_NEWS_RULES, _support_policy_and_doc_tables.STRUCTURAL_RULE, _support_policy_and_doc_tables.VERBS, _support_policy_and_doc_tables.cred_doc_sections, _support_policy_and_doc_tables.derived_forms, _support_policy_and_doc_tables.maxims_block, _support_policy_and_doc_tables.measured_table, _support_policy_and_doc_tables.per_agent_limits, _support_policy_and_doc_tables.structural_rule_homes, _support_policy_and_doc_tables.structural_rule_problems)   # support import
+_support_import_fakes = importlib.import_module("support.import_fakes")   # support import
+ALERT_BAD_SHAPES, FAKE_IMPORT_FIELDS, V2_SHAPE, _fake_message_problems, _fixture_path, _is_ms, _load_brief_tests, _unknown_fields, fake_import_problems, load_judge_eval = (_support_import_fakes.ALERT_BAD_SHAPES, _support_import_fakes.FAKE_IMPORT_FIELDS, _support_import_fakes.V2_SHAPE, _support_import_fakes._fake_message_problems, _support_import_fakes._fixture_path, _support_import_fakes._is_ms, _support_import_fakes._load_brief_tests, _support_import_fakes._unknown_fields, _support_import_fakes.fake_import_problems, _support_import_fakes.load_judge_eval)   # support import
+_support_panel_harnesses = importlib.import_module("support.panel_harnesses")   # support import
+CAPTAIN_ROW_HARNESS, HARNESS_CASES, LAYOUT_HARNESS, LINK_HARNESS, NOTICE_HARNESS, ORDER_PANEL_HARNESS, STYLED_UNIT_HARNESS = (_support_panel_harnesses.CAPTAIN_ROW_HARNESS, _support_panel_harnesses.HARNESS_CASES, _support_panel_harnesses.LAYOUT_HARNESS, _support_panel_harnesses.LINK_HARNESS, _support_panel_harnesses.NOTICE_HARNESS, _support_panel_harnesses.ORDER_PANEL_HARNESS, _support_panel_harnesses.STYLED_UNIT_HARNESS)   # support import
+_support_baseline_adapters = importlib.import_module("support.baseline_adapters")   # support import
+HEARTBEAT_EVERY, baseline_assign_ids, baseline_attach_hub, baseline_derive, baseline_failing_derivation, baseline_headline, baseline_unreadable_inbox, with_baseline = (_support_baseline_adapters.HEARTBEAT_EVERY, _support_baseline_adapters.baseline_assign_ids, _support_baseline_adapters.baseline_attach_hub, _support_baseline_adapters.baseline_derive, _support_baseline_adapters.baseline_failing_derivation, _support_baseline_adapters.baseline_headline, _support_baseline_adapters.baseline_unreadable_inbox, _support_baseline_adapters.with_baseline)   # support import
+_support_installer_tables = importlib.import_module("support.installer_tables")   # support import
+INSTALLER_FILE_MODES, INSTALLER_READERS, INSTALLER_STARTERS, INSTALLER_WRITERS, ORIGINAL_MEMORY_READING, ORIGINAL_PROCESS_TABLE, PARENT_RULE, REAPER_ONLY_LEAVE_ALONE, REAPER_ONLY_STEPS, REAPER_ONLY_WRITERS, REAPER_PLIST_FIELDS, REAPER_UNIT_FIELDS, WORKER_STEPS, _CG = (_support_installer_tables.INSTALLER_FILE_MODES, _support_installer_tables.INSTALLER_READERS, _support_installer_tables.INSTALLER_STARTERS, _support_installer_tables.INSTALLER_WRITERS, _support_installer_tables.ORIGINAL_MEMORY_READING, _support_installer_tables.ORIGINAL_PROCESS_TABLE, _support_installer_tables.PARENT_RULE, _support_installer_tables.REAPER_ONLY_LEAVE_ALONE, _support_installer_tables.REAPER_ONLY_STEPS, _support_installer_tables.REAPER_ONLY_WRITERS, _support_installer_tables.REAPER_PLIST_FIELDS, _support_installer_tables.REAPER_UNIT_FIELDS, _support_installer_tables.WORKER_STEPS, _support_installer_tables._CG)   # support import
+_support_source_scans = importlib.import_module("support.source_scans")   # support import
+BLOCKED_GUARD_KILLERS, BLOCKED_TEXT_MUTANTS, OLD_AGENT_SOURCES, _fold, _matches, _url_tail, blocked_functions, blocked_guards, duplicate_defs, load_check_public_names, marker_mutant_source, old_source_reads, scanned, urllib_query = (_support_source_scans.BLOCKED_GUARD_KILLERS, _support_source_scans.BLOCKED_TEXT_MUTANTS, _support_source_scans.OLD_AGENT_SOURCES, _support_source_scans._fold, _support_source_scans._matches, _support_source_scans._url_tail, _support_source_scans.blocked_functions, _support_source_scans.blocked_guards, _support_source_scans.duplicate_defs, _support_source_scans.load_check_public_names, _support_source_scans.marker_mutant_source, _support_source_scans.old_source_reads, _support_source_scans.scanned, _support_source_scans.urllib_query)   # support import
+_support_process_and_ci = importlib.import_module("support.process_and_ci")   # support import
+EXEC_CHILD, OLD_SOURCE_ALLOWED, SHELL_HOOK_CASES, USE_COMMANDS, _alive, _zip_with, apply_edit_intent, apply_handoff_step, ci_run, classified_in_audit, light_guard_sites, load_ci_runs, parse_plugin_manifest, s5_issue, tracked_files, watch_parent = (_support_process_and_ci.EXEC_CHILD, _support_process_and_ci.OLD_SOURCE_ALLOWED, _support_process_and_ci.SHELL_HOOK_CASES, _support_process_and_ci.USE_COMMANDS, _support_process_and_ci._alive, _support_process_and_ci._zip_with, _support_process_and_ci.apply_edit_intent, _support_process_and_ci.apply_handoff_step, _support_process_and_ci.ci_run, _support_process_and_ci.classified_in_audit, _support_process_and_ci.light_guard_sites, _support_process_and_ci.load_ci_runs, _support_process_and_ci.parse_plugin_manifest, _support_process_and_ci.s5_issue, _support_process_and_ci.tracked_files, _support_process_and_ci.watch_parent)   # support import
+_support_paths = importlib.import_module("support.paths")   # support import
+BIN, REPO = (_support_paths.BIN, _support_paths.REPO)   # support import
+_support_offline_fakes = importlib.import_module("support.offline_fakes")   # support import
+ClosingRunner, FakeGH, FakeV1, OfflineRun, apply_worker_step, attach_intent_lab, control_play, run_scenario = (_support_offline_fakes.ClosingRunner, _support_offline_fakes.FakeGH, _support_offline_fakes.FakeV1, _support_offline_fakes.OfflineRun, _support_offline_fakes.apply_worker_step, _support_offline_fakes.attach_intent_lab, _support_offline_fakes.control_play, _support_offline_fakes.run_scenario)   # support import
+_support_helper_fakes = importlib.import_module("support.helper_fakes")   # support import
+FakeSweepHub, LabelGh, MutantSpliceError, ReaperOnlyFakes = (_support_helper_fakes.FakeSweepHub, _support_helper_fakes.LabelGh, _support_helper_fakes.MutantSpliceError, _support_helper_fakes.ReaperOnlyFakes)   # support import
+_support_helper_fakes2 = importlib.import_module("support.helper_fakes2")   # support import
+AlreadyDecidedRefusal, EjectionHub, FakeOwnerlessHub, FakePullFiles, FakeQueueGh, LightProbe, OrdersReachTheJudgeWhole, OwnedInputs, PolicyCountingJev, RecFacts, StubHub, StubIssueHub, Unavailable = (_support_helper_fakes2.AlreadyDecidedRefusal, _support_helper_fakes2.EjectionHub, _support_helper_fakes2.FakeOwnerlessHub, _support_helper_fakes2.FakePullFiles, _support_helper_fakes2.FakeQueueGh, _support_helper_fakes2.LightProbe, _support_helper_fakes2.OrdersReachTheJudgeWhole, _support_helper_fakes2.OwnedInputs, _support_helper_fakes2.PolicyCountingJev, _support_helper_fakes2.RecFacts, _support_helper_fakes2.StubHub, _support_helper_fakes2.StubIssueHub, _support_helper_fakes2.Unavailable)   # support import
 
 _support_core = importlib.import_module("support.core")   # support import
 Base, COS_ALLOWING, COS_ALLOWING_FULL, COS_GUARDS, FakeRunner, REAL_NODE, SAFE_PATH, cos_rules_text = (_support_core.Base, _support_core.COS_ALLOWING, _support_core.COS_ALLOWING_FULL, _support_core.COS_GUARDS, _support_core.FakeRunner, _support_core.REAL_NODE, _support_core.SAFE_PATH, _support_core.cos_rules_text)   # support import
@@ -102,18 +126,18 @@ TestPluginPush, TestReconcileOnRead = (_support_test_cases_02.TestPluginPush, _s
 _support_test_cases_03 = importlib.import_module("test_cases_03")   # support import
 TestV2Client, TestStatus, TestPoke = (_support_test_cases_03.TestV2Client, _support_test_cases_03.TestStatus, _support_test_cases_03.TestPoke)   # support import
 TestReportFoldVariants, TestDecisionWriteWaitsForTheList, TestTrialDecisionsPlugin, TestCommissioningDocs = (_support_test_cases_03.TestReportFoldVariants, _support_test_cases_03.TestDecisionWriteWaitsForTheList, _support_test_cases_03.TestTrialDecisionsPlugin, _support_test_cases_03.TestCommissioningDocs)   # support import
-TestKeyFile, TestTodolistPlugin, ReaperOnlyFakes, TestTheReaperOnlyDryRunLive = (_support_test_cases_03.TestKeyFile, _support_test_cases_03.TestTodolistPlugin, _support_test_cases_03.ReaperOnlyFakes, _support_test_cases_03.TestTheReaperOnlyDryRunLive)   # support import
+TestKeyFile, TestTodolistPlugin, TestTheReaperOnlyDryRunLive = (_support_test_cases_03.TestKeyFile, _support_test_cases_03.TestTodolistPlugin, _support_test_cases_03.TestTheReaperOnlyDryRunLive)   # support import
 TestInstallPutsTheCliOnPath, TestExternalAdapterKeys, TestExternalAdapterOperations, TestExternalAdapterPort = (_support_test_cases_03.TestInstallPutsTheCliOnPath, _support_test_cases_03.TestExternalAdapterKeys, _support_test_cases_03.TestExternalAdapterOperations, _support_test_cases_03.TestExternalAdapterPort)   # support import
 TestExternalAdapterWork, TestWorkSyncPump, TestDecisionOrder, TestAuthorityModulesGuard = (_support_test_cases_03.TestExternalAdapterWork, _support_test_cases_03.TestWorkSyncPump, _support_test_cases_03.TestDecisionOrder, _support_test_cases_03.TestAuthorityModulesGuard)   # support import
 TestSkillsSync, = (_support_test_cases_03.TestSkillsSync,)   # support import
 _support_test_cases_04 = importlib.import_module("test_cases_04")   # support import
 TestAuditLog, TestScenarioValidator, TestScenarioFiles, TestGithubRealChild = (_support_test_cases_04.TestAuditLog, _support_test_cases_04.TestScenarioValidator, _support_test_cases_04.TestScenarioFiles, _support_test_cases_04.TestGithubRealChild)   # support import
 PipeTruncatingRunner, TestV2ClientBigReply, TestScenarioVocabularyPR4, TestIntentChange = (_support_test_cases_04.PipeTruncatingRunner, _support_test_cases_04.TestV2ClientBigReply, _support_test_cases_04.TestScenarioVocabularyPR4, _support_test_cases_04.TestIntentChange)   # support import
-TestJevConfig, TestClassify, TestPolicyCache, OwnedInputs = (_support_test_cases_04.TestJevConfig, _support_test_cases_04.TestClassify, _support_test_cases_04.TestPolicyCache, _support_test_cases_04.OwnedInputs)   # support import
-TestCaptainLabels, TestLedgerReadRace, RecFacts, TestPlanCheckParser = (_support_test_cases_04.TestCaptainLabels, _support_test_cases_04.TestLedgerReadRace, _support_test_cases_04.RecFacts, _support_test_cases_04.TestPlanCheckParser)   # support import
+TestJevConfig, TestClassify, TestPolicyCache = (_support_test_cases_04.TestJevConfig, _support_test_cases_04.TestClassify, _support_test_cases_04.TestPolicyCache)   # support import
+TestCaptainLabels, TestLedgerReadRace, TestPlanCheckParser = (_support_test_cases_04.TestCaptainLabels, _support_test_cases_04.TestLedgerReadRace, _support_test_cases_04.TestPlanCheckParser)   # support import
 TestPlanCheckRound2, TestPlanCheckHash, TestMultiRepoConfig, TestKeyCommand = (_support_test_cases_04.TestPlanCheckRound2, _support_test_cases_04.TestPlanCheckHash, _support_test_cases_04.TestMultiRepoConfig, _support_test_cases_04.TestKeyCommand)   # support import
 TestTheReapersCommandPathIsWalked, TestInstallOwnsWhatAPaneRuns, TestInstallDocs, TestOrdersFact = (_support_test_cases_04.TestTheReapersCommandPathIsWalked, _support_test_cases_04.TestInstallOwnsWhatAPaneRuns, _support_test_cases_04.TestInstallDocs, _support_test_cases_04.TestOrdersFact)   # support import
-LabelGh, TestInstallMakesTheOrdersTemplate, TestExternalAdapterMapping, TestExternalAdapterFeed = (_support_test_cases_04.LabelGh, _support_test_cases_04.TestInstallMakesTheOrdersTemplate, _support_test_cases_04.TestExternalAdapterMapping, _support_test_cases_04.TestExternalAdapterFeed)   # support import
+TestInstallMakesTheOrdersTemplate, TestExternalAdapterMapping, TestExternalAdapterFeed = (_support_test_cases_04.TestInstallMakesTheOrdersTemplate, _support_test_cases_04.TestExternalAdapterMapping, _support_test_cases_04.TestExternalAdapterFeed)   # support import
 TestJudgeSample, TestV2Breaker, SlowProbeBreaker, TestV2BreakerEdges = (_support_test_cases_04.TestJudgeSample, _support_test_cases_04.TestV2Breaker, _support_test_cases_04.SlowProbeBreaker, _support_test_cases_04.TestV2BreakerEdges)   # support import
 TestEventFeedStreamEdges, TestCloudWatchTick = (_support_test_cases_04.TestEventFeedStreamEdges, _support_test_cases_04.TestCloudWatchTick)   # support import
 TestEndTickWithoutStateDirectory = _support_test_cases_04.TestEndTickWithoutStateDirectory   # support import
@@ -122,10 +146,10 @@ TestFaults, TestMessageId, TestDecide, TestApprovalExemptionGuard = (_support_te
 TestGithubVerification, TestParseCheckpoint, TestSelfWakeInstructions, TestLabHerdrShim = (_support_test_cases_05.TestGithubVerification, _support_test_cases_05.TestParseCheckpoint, _support_test_cases_05.TestSelfWakeInstructions, _support_test_cases_05.TestLabHerdrShim)   # support import
 TestIntentParsing, TestVerdictRecordingText, TestChecklistAndFamilyTexts, TestIntegrationBranchVerdictText = (_support_test_cases_05.TestIntentParsing, _support_test_cases_05.TestVerdictRecordingText, _support_test_cases_05.TestChecklistAndFamilyTexts, _support_test_cases_05.TestIntegrationBranchVerdictText)   # support import
 TestLaunchMemoryTest, TestReplayJev, TestP5SlowOrUnreachableJudge, TestShimHygiene = (_support_test_cases_05.TestLaunchMemoryTest, _support_test_cases_05.TestReplayJev, _support_test_cases_05.TestP5SlowOrUnreachableJudge, _support_test_cases_05.TestShimHygiene)   # support import
-TestBriefParsing, PolicyCountingJev, PolicyRig, TestPolicyConfig = (_support_test_cases_05.TestBriefParsing, _support_test_cases_05.PolicyCountingJev, _support_test_cases_05.PolicyRig, _support_test_cases_05.TestPolicyConfig)   # support import
+TestBriefParsing, PolicyRig, TestPolicyConfig = (_support_test_cases_05.TestBriefParsing, _support_test_cases_05.PolicyRig, _support_test_cases_05.TestPolicyConfig)   # support import
 TestPolicyRequest, TestStandingAuthority, TestJudgeToolWritesNothingElsewhere, TestFleetHooksSource = (_support_test_cases_05.TestPolicyRequest, _support_test_cases_05.TestStandingAuthority, _support_test_cases_05.TestJudgeToolWritesNothingElsewhere, _support_test_cases_05.TestFleetHooksSource)   # support import
-FakeV1, TestImportOrder, TestImportV1Client, FakeSweepHub = (_support_test_cases_05.FakeV1, _support_test_cases_05.TestImportOrder, _support_test_cases_05.TestImportV1Client, _support_test_cases_05.FakeSweepHub)   # support import
-FakeOwnerlessHub, TestTriageRuleInputs, TestReadWholeAuditTable, TestReportScenarios = (_support_test_cases_05.FakeOwnerlessHub, _support_test_cases_05.TestTriageRuleInputs, _support_test_cases_05.TestReadWholeAuditTable, _support_test_cases_05.TestReportScenarios)   # support import
+TestImportOrder, TestImportV1Client = (_support_test_cases_05.TestImportOrder, _support_test_cases_05.TestImportV1Client)   # support import
+TestTriageRuleInputs, TestReadWholeAuditTable, TestReportScenarios = (_support_test_cases_05.TestTriageRuleInputs, _support_test_cases_05.TestReadWholeAuditTable, _support_test_cases_05.TestReportScenarios)   # support import
 TestPlanOperationsPerBoss, TestStatusIntentGapsAreBounded, TestPlanCheckSelection, TestPlanTemplateDoc = (_support_test_cases_05.TestPlanOperationsPerBoss, _support_test_cases_05.TestStatusIntentGapsAreBounded, _support_test_cases_05.TestPlanCheckSelection, _support_test_cases_05.TestPlanTemplateDoc)   # support import
 TestDecisionIds, TestDecisionsPluginSource, TestDecisionsRoleText, TestDecisionsInTheLabTier = (_support_test_cases_05.TestDecisionIds, _support_test_cases_05.TestDecisionsPluginSource, _support_test_cases_05.TestDecisionsRoleText, _support_test_cases_05.TestDecisionsInTheLabTier)   # support import
 TestDecisionsScenarios, TestMultiRepoRefs, TestMultiRepoResolution, TestDecisionsPluginShowsTheRepoTag = (_support_test_cases_05.TestDecisionsScenarios, _support_test_cases_05.TestMultiRepoRefs, _support_test_cases_05.TestMultiRepoResolution, _support_test_cases_05.TestDecisionsPluginShowsTheRepoTag)   # support import
@@ -133,16 +157,16 @@ TestTheTrialSharesTheInstaller, TestParseOrders, TestOrdersBodyEdits, TestCharte
 TestCompactionShape, TestOrdersRoleText, TestOrdersScenarios, TestTierConfig = (_support_test_cases_05.TestCompactionShape, _support_test_cases_05.TestOrdersRoleText, _support_test_cases_05.TestOrdersScenarios, _support_test_cases_05.TestTierConfig)   # support import
 TestServiceIdentity, TestCosOrdersFile, TestOrdersCosCommand, TestTierRoleText = (_support_test_cases_05.TestServiceIdentity, _support_test_cases_05.TestCosOrdersFile, _support_test_cases_05.TestOrdersCosCommand, _support_test_cases_05.TestTierRoleText)   # support import
 TestTierScenarios, TestExternalAdapterHygiene, TestExternalDecisionRules, TestWorkItemRules = (_support_test_cases_05.TestTierScenarios, _support_test_cases_05.TestExternalAdapterHygiene, _support_test_cases_05.TestExternalDecisionRules, _support_test_cases_05.TestWorkItemRules)   # support import
-TestComposeTrap, TestDaemonPriority, TestGithubWritingRule, LightProbe = (_support_test_cases_05.TestComposeTrap, _support_test_cases_05.TestDaemonPriority, _support_test_cases_05.TestGithubWritingRule, _support_test_cases_05.LightProbe)   # support import
+TestComposeTrap, TestDaemonPriority, TestGithubWritingRule = (_support_test_cases_05.TestComposeTrap, _support_test_cases_05.TestDaemonPriority, _support_test_cases_05.TestGithubWritingRule)   # support import
 TestOwnReviewLaws, TestEventFeedLines, TestCoderBooks, TestPaneWarningRule = (_support_test_cases_05.TestOwnReviewLaws, _support_test_cases_05.TestEventFeedLines, _support_test_cases_05.TestCoderBooks, _support_test_cases_05.TestPaneWarningRule)   # support import
 TestCallerWorkspace, TestMergeGateDocs = (_support_test_cases_05.TestCallerWorkspace, _support_test_cases_05.TestMergeGateDocs)   # support import
 _support_test_cases_06 = importlib.import_module("test_cases_06")   # support import
-ClosingRunner, TestV2ClientPR4, TestPR7Source, TestPolicyRedaction = (_support_test_cases_06.ClosingRunner, _support_test_cases_06.TestV2ClientPR4, _support_test_cases_06.TestPR7Source, _support_test_cases_06.TestPolicyRedaction)   # support import
-TestImportV1Config, TestImportV1AsAProcess, MutantSpliceError, TestSyncReportFreezePerBoss = (_support_test_cases_06.TestImportV1Config, _support_test_cases_06.TestImportV1AsAProcess, _support_test_cases_06.MutantSpliceError, _support_test_cases_06.TestSyncReportFreezePerBoss)   # support import
+TestV2ClientPR4, TestPR7Source, TestPolicyRedaction = (_support_test_cases_06.TestV2ClientPR4, _support_test_cases_06.TestPR7Source, _support_test_cases_06.TestPolicyRedaction)   # support import
+TestImportV1Config, TestImportV1AsAProcess, TestSyncReportFreezePerBoss = (_support_test_cases_06.TestImportV1Config, _support_test_cases_06.TestImportV1AsAProcess, _support_test_cases_06.TestSyncReportFreezePerBoss)   # support import
 TestD6Scenario, TestInstallOnLinux, TestInstallOnAnUnknownPlatform, TestCloudReaperInstallOnMacOS = (_support_test_cases_06.TestD6Scenario, _support_test_cases_06.TestInstallOnLinux, _support_test_cases_06.TestInstallOnAnUnknownPlatform, _support_test_cases_06.TestCloudReaperInstallOnMacOS)   # support import
-TestCloudReaperInstallOnLinux, TestRealStatusAfterInstallOnMacOS, TestRealStatusAfterInstallOnLinux, OrdersReachTheJudgeWhole = (_support_test_cases_06.TestCloudReaperInstallOnLinux, _support_test_cases_06.TestRealStatusAfterInstallOnMacOS, _support_test_cases_06.TestRealStatusAfterInstallOnLinux, _support_test_cases_06.OrdersReachTheJudgeWhole)   # support import
-Unavailable, AlreadyDecidedRefusal, TestOwnerEvaluatorsAreRare, TestDecisionsStaleBound = (_support_test_cases_06.Unavailable, _support_test_cases_06.AlreadyDecidedRefusal, _support_test_cases_06.TestOwnerEvaluatorsAreRare, _support_test_cases_06.TestDecisionsStaleBound)   # support import
-StubHub, EjectionHub, TestScratchFileRule = (_support_test_cases_06.StubHub, _support_test_cases_06.EjectionHub, _support_test_cases_06.TestScratchFileRule)   # support import
+TestCloudReaperInstallOnLinux, TestRealStatusAfterInstallOnMacOS, TestRealStatusAfterInstallOnLinux = (_support_test_cases_06.TestCloudReaperInstallOnLinux, _support_test_cases_06.TestRealStatusAfterInstallOnMacOS, _support_test_cases_06.TestRealStatusAfterInstallOnLinux)   # support import
+TestOwnerEvaluatorsAreRare, TestDecisionsStaleBound = (_support_test_cases_06.TestOwnerEvaluatorsAreRare, _support_test_cases_06.TestDecisionsStaleBound)   # support import
+TestScratchFileRule, = (_support_test_cases_06.TestScratchFileRule,)   # support import
 _support_rigs = importlib.import_module("support.rigs")   # support import
 _artifact_zip, build_carry_repo = (_support_rigs._artifact_zip, _support_rigs.build_carry_repo)   # support import
 _support_test_cases_07 = importlib.import_module("test_cases_07")   # support import
@@ -154,8 +178,8 @@ TestWeeklyJobRewrite, TestSlice3Modules, TestModuleLoader, TestDeployFromMainSen
 _support_test_cases_08 = importlib.import_module("test_cases_08")   # support import
 FakeActions, TestReds, TestTempJanitorResume, TestAgentRegistry = (_support_test_cases_08.FakeActions, _support_test_cases_08.TestReds, _support_test_cases_08.TestTempJanitorResume, _support_test_cases_08.TestAgentRegistry)   # support import
 JanitorIdentity = importlib.import_module("test_janitor_identity").JanitorIdentity   # ask #1770
-FakeQueueGh, TestClosingKeywordWarning, TestPreflightPr, TestFocusedLocalRuns = (_support_test_cases_08.FakeQueueGh, _support_test_cases_08.TestClosingKeywordWarning, _support_test_cases_08.TestPreflightPr, _support_test_cases_08.TestFocusedLocalRuns)   # support import
-TestBatchingDocs, FakePullFiles, TestCloudWatchBounds, TestArchTools = (_support_test_cases_08.TestBatchingDocs, _support_test_cases_08.FakePullFiles, _support_test_cases_08.TestCloudWatchBounds, _support_test_cases_08.TestArchTools)   # support import
+TestClosingKeywordWarning, TestPreflightPr, TestFocusedLocalRuns = (_support_test_cases_08.TestClosingKeywordWarning, _support_test_cases_08.TestPreflightPr, _support_test_cases_08.TestFocusedLocalRuns)   # support import
+TestBatchingDocs, TestCloudWatchBounds, TestArchTools = (_support_test_cases_08.TestBatchingDocs, _support_test_cases_08.TestCloudWatchBounds, _support_test_cases_08.TestArchTools)   # support import
 _support_test_cases_09 = importlib.import_module("test_cases_09")   # support import
 TestItemVerdicts, ReviewCommentLineTests = (_support_test_cases_09.TestItemVerdicts, _support_test_cases_09.ReviewCommentLineTests)   # support import
 _support_test_cases_10 = importlib.import_module("test_cases_10")   # support import
@@ -165,10 +189,11 @@ _support_test_cases_11 = importlib.import_module("test_cases_11")   # support im
 TestOwnerHoldRule, TestAgentRegistryInventory, TestClearCodePathsAlwaysHeld, TestTriageStandingLine = (_support_test_cases_11.TestOwnerHoldRule, _support_test_cases_11.TestAgentRegistryInventory, _support_test_cases_11.TestClearCodePathsAlwaysHeld, _support_test_cases_11.TestTriageStandingLine)   # support import
 TestConfig, TestAssembler, TestBigRegistrarFile, TestStateDir = (_support_test_cases_11.TestConfig, _support_test_cases_11.TestAssembler, _support_test_cases_11.TestBigRegistrarFile, _support_test_cases_11.TestStateDir)   # support import
 TestScanDriftGuard, TestOwnerClearModule, TestBuilderChecklist, TestEveryReaderOfAPullRequestsFileList = (_support_test_cases_11.TestScanDriftGuard, _support_test_cases_11.TestOwnerClearModule, _support_test_cases_11.TestBuilderChecklist, _support_test_cases_11.TestEveryReaderOfAPullRequestsFileList)   # support import
+TestMutantControlRule = _support_test_cases_11.TestMutantControlRule   # support import
 TestGithubConfig, TestPlanningSkill, TestCompose, TestOwnMeasurementTester = (_support_test_cases_11.TestGithubConfig, _support_test_cases_11.TestPlanningSkill, _support_test_cases_11.TestCompose, _support_test_cases_11.TestOwnMeasurementTester)   # support import
 _support_test_cases_12 = importlib.import_module("test_cases_12")   # support import
 WorkflowPlanPins, TestAgentShellCalls, TestShimReadCache, TestSameNameAccountsAdd = (_support_test_cases_12.WorkflowPlanPins, _support_test_cases_12.TestAgentShellCalls, _support_test_cases_12.TestShimReadCache, _support_test_cases_12.TestSameNameAccountsAdd)   # support import
-TestSelfRegisteringCli, TestGhShimGateProbe, TestClosedUnmergedLastPr, StubIssueHub = (_support_test_cases_12.TestSelfRegisteringCli, _support_test_cases_12.TestGhShimGateProbe, _support_test_cases_12.TestClosedUnmergedLastPr, _support_test_cases_12.StubIssueHub)   # support import
+TestSelfRegisteringCli, TestGhShimGateProbe, TestClosedUnmergedLastPr = (_support_test_cases_12.TestSelfRegisteringCli, _support_test_cases_12.TestGhShimGateProbe, _support_test_cases_12.TestClosedUnmergedLastPr)   # support import
 _support_test_cases_13 = importlib.import_module("test_cases_13")   # support import
 TestClosedUnmergedDocs, TestUnionCheckLimitsDocs = (_support_test_cases_13.TestClosedUnmergedDocs, _support_test_cases_13.TestUnionCheckLimitsDocs)   # support import
 _support_herdr_world = importlib.import_module("support.herdr_world")   # support import
@@ -185,12 +210,6 @@ set_retired, = (_support_herdr_world.set_retired,)   # support import
 # ------------------------------------------------------- made-up process numbers (#886)
 
 
-def s5_issue(number, body="", labels=(), pr=False, draft=None, **kw):
-    """The shared sweep_issue plus a draft flag, kept out of the shared fake (#1044)."""
-    record = sweep_issue(number, body, labels, pr=pr, **kw)
-    if draft is not None:
-        record["draft"] = draft
-    return record
 
 
 
@@ -1854,13 +1873,8 @@ class TestSteerToWorking(Base):
         self.assertTrue(deliver("y" * allowed).get("sent"), "the resend of the allowed length is not cut")
 
 
-PLAN_CLAUSES = ["first clause is stated here", "second clause is stated here"]
-APPROVAL_DW = "(1) %s (2) %s" % tuple(PLAN_CLAUSES)
 
 
-def plan_body(clauses=PLAN_CLAUSES, extra=""):
-    lines = "\n".join('  DW-%d: "%s"' % (i, c) for i, c in enumerate(clauses, 1))
-    return "## Plan (scenarios)\n\nsize: S\n%s\n\n```yaml\nclauses:\n%s\n```\n" % (extra, lines)
 
 
 class ApprovalGH:
@@ -2951,39 +2965,8 @@ class TestEnsure(Base):
         return False
 
 
-def _alive(pid):
-    try:
-        os.kill(pid, 0)
-        return True
-    except OSError:
-        return False
 
 
-def parse_plugin_manifest(text):
-    """Just enough TOML for herdr/herdr-plugin.toml: `key = "string"`, `key = ["a", "b"]`,
-    and `[[table]]` headers. Anything else raises, so the file cannot drift
-    past what this reads."""
-    manifest, table = {}, None
-    for number, raw in enumerate(text.splitlines(), 1):
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            continue
-        header = re.match(r"^\[\[([a-z]+)\]\]$", line)
-        if header:
-            table = {}
-            manifest.setdefault(header.group(1), []).append(table)
-            continue
-        pair = re.match(r'^([a-z_]+) = (.+)$', line)
-        if not pair:
-            raise ValueError("line %d is not understood: %r" % (number, raw))
-        try:
-            value = json.loads(pair.group(2))  # these strings and arrays are valid JSON too
-        except ValueError:
-            value = None
-        if not (isinstance(value, str) or (isinstance(value, list) and all(isinstance(v, str) for v in value))):
-            raise ValueError("line %d: value is not a string or a list of strings: %r" % (number, raw))
-        (table if table is not None else manifest)[pair.group(1)] = value
-    return manifest
 
 
 class TestPluginManifest(Base):
@@ -6470,381 +6453,16 @@ class TestLaunch(StandInPids, Base):
 SCENARIO_REPORTS = []
 
 
-def _matches(keys, pattern):
-    return any(fnmatch.fnmatchcase(key, pattern) for key in keys)
 
 
-JEV_SCENARIO_CONFIG = {"jev": {"replay": str(JEV_REPLAY)}}  # the hand-written answers every scenario runs against
 
 
-def classified_in_audit(entries, agent, text, choice):
-    """True when the audit's last classification of that agent's message `text` chose `choice`."""
-    found = [e for e in entries if e.get("event") == "classify"
-             and (e.get("detail") or {}).get("agent") == agent
-             and text in ((e["detail"].get("question") or {}).get("state") or {}).get("message", "")]
-    got = found[-1]["detail"]["answer"]["choice"] if found else None
-    return got == choice, "%d classification(s) of the message; the last chose %r" % (len(found), got)
 
 
-class OfflineRun:
-    """One scenario on the fakes: a pass every POLL seconds while the daemon
-    runs, steps applied at their times, a simulated clock in 1 s ticks.
-    Expectations are judged on the fakes' state, never on the engine's report."""
-
-    POLL = 5
-
-    def __init__(self, test, scenario, label, faults=(), baseline=None):
-        self.scenario = scenario
-        self.faults = sorted(faults)
-        self.baseline = baseline
-        self.work = test.home / "scenario-repo"
-        self.work.mkdir(exist_ok=True)
-        self.cos_orders_path = str(test.home / "scenario-runs" / scenario["id"] / label / "standing-orders.md")  # PR 18
-        self.world = World(test, agents=(), state=test.home / "scenario-runs" / scenario["id"] / label,
-                           config=dict(JEV_SCENARIO_CONFIG, cos_orders_file=self.cos_orders_path,
-                                       **(scenario.get("config") or {})))
-        launched = {step["agent"] for step in scenario["steps"] if step["do"] in ("launch", "import-v1")}
-        if any(step["do"] == "bootstrap" for step in scenario["steps"]):
-            launched.add(sb.COS_NAME)  # PR 16: `bootstrap` makes the Chief of Staff
-        for name, member in sorted(scenario["cast"].items()):
-            if name not in launched:  # a launched agent does not exist until `launch` makes it
-                self.world.add_agent(name, fleet=self.fleet_of(member))
-        attach_intent_lab(self)  # PR 6: a fake GitHub when the scenario has issues
-        self.world.engine = self.world.new_engine()
-        self.daemon = True
-        self.lock = None
-        self.take_lock()        # PR 16: a live daemon holds run.lock, so ensure-on-use can tell
-        test.addCleanup(self.drop_lock)
-        self.said = {}          # PR 16: step index -> what a command step printed
-        self.crashed_writes = set()
-        self.launched = {}
-        self.snapshots = {}  # PR 14: second -> what `fleet-switchboard decisions` showed then, for the decisions oracles
-
-    @staticmethod
-    def fleet_of(member):
-        return {key: member[key] for key in ("role", "reports_to", "issue", "charter", "repo") if key in member}
-
-    def run(self):
-        steps = list(self.scenario["steps"])
-        end = max([sc.duration_seconds(step["at"]) for step in steps] or [0])
-        for second in range(end + 1):
-            self.world.clock.t = EPOCH + second
-            self.world.v2.advance()
-            while steps and sc.duration_seconds(steps[0]["at"]) == second:
-                self.apply(steps.pop(0))
-            if self.daemon and second % self.POLL == 0:
-                self.one_pass(())
-            if second in self.snapshot_times():
-                self.snapshot(second)
-        return self
-
-    def snapshot_times(self):
-        return {sc.duration_seconds(e["at"]) for e in self.scenario["expect"] if e["that"] in ("decisions", "decisions_say")}
-
-    def snapshot(self, second):
-        """PR 14: the file the daemon keeps, as `fleet-switchboard decisions` would read it at this second."""
-        os.environ[sb.FAULT_ENV] = ",".join(self.faults)
-        now = self.world.clock.now()
-        report = sb.decisions_report(self.world.state, now)
-        self.snapshots[second] = {"report": report, "text": sb.format_decisions(report, now)}
-
-    def apply(self, step):
-        do, world = step["do"], self.world
-        if do == "fact" and self.baseline == "fleet-heartbeat":
-            self.type_wake(step)
-        elif do == "fact":
-            world.fact(step["to"], step["key"], step["summary"], kind=step.get("kind", "lab.fact"),
-                       issue=step.get("issue"), batch=step.get("batch", True), **{"from": step.get("from", "world")})
-        elif do == "turn":
-            world.v2.start_turn(world.sessions[step["actor"]], "fleet task", fleet=True,
-                                lasts=sc.duration_seconds(step.get("lasts", "0s")), steps=step.get("steps", 1))
-        elif do == "message":
-            if step["actor"] != "you":
-                raise NotImplementedError("offline: a message comes from you")
-            world.v2.start_turn(world.sessions[step["to"]], step["text"], fleet=False,
-                                lasts=sc.duration_seconds(step.get("lasts", "0s")))
-        elif do == "draft":
-            world.herdr.input_box[world.panes[step["to"]]] = step["text"]  # you, typing; nothing is sent
-        elif do == "launch":
-            self.launch(step)
-        elif do == "report":  # PR 13: `fleet-switchboard report`, as the cast member's model would run it
-            os.environ[sb.FAULT_ENV] = ",".join(self.faults)
-            world.new_engine("cli").report(step["actor"], step["state"], step["text"], step.get("issue"))
-        elif do == "send":  # PR 14: `fleet-switchboard send`, as the cast member's model would run it
-            os.environ[sb.FAULT_ENV] = ",".join(self.faults)
-            world.new_engine("cli").send(step["actor"], step["to"], step["text"], step.get("issue"))
-        elif do == "delete-decisions":  # PR 14: the projection is disposable; the daemon makes it again
-            if (world.state / sb.DECISIONS_FILE).exists():  # under `no-decisions-file` there is none to delete
-                (world.state / sb.DECISIONS_FILE).unlink()
-        elif do == "pass":
-            self.one_pass(step.get("faults", ()))
-        elif do == "kill-daemon":
-            self.daemon = False
-            self.drop_lock()
-        elif do == "restart-daemon":
-            self.start_daemon()
-        elif do == "use":  # PR 16
-            self.use(step)
-        elif do == "bootstrap":
-            self.bootstrap(step)
-        elif do == "close-agent":
-            world.herdr([FAKE_HERDR, "pane", "close", world.panes[step["agent"]]])
-        elif do in WORKER_STEPS:
-            apply_worker_step(self, step)
-        elif do == "edit-intent":
-            apply_edit_intent(self, step)
-        elif do == "handoff":  # PR 8
-            apply_handoff_step(self, step)
-        elif do != "wait":
-            raise NotImplementedError("the offline runner does not implement step %r" % do)
-
-    # -- PR 16: the daemon's lock, the commands that start it, and `bootstrap`
-    def take_lock(self):
-        if self.lock is None:
-            fd = os.open(str(self.world.state / "run.lock"), os.O_RDWR | os.O_CREAT, 0o600)
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except OSError:  # another run in this test already holds this state directory's lock
-                os.close(fd)
-                return
-            self.lock = fd
-
-    def drop_lock(self):
-        if self.lock is not None:
-            os.close(self.lock)
-            self.lock = None
-
-    def start_daemon(self):
-        self.daemon = True
-        self.world.engine = self.world.new_engine()  # a new process: nothing in memory survives
-        self.take_lock()
-
-    def use(self, step):
-        """A command that needs the daemon, as `main` runs it: ensure-on-use first, with a spawn that is this runner's daemon."""
-        if step["command"] not in sb.ENSURE_ON_USE_COMMANDS:
-            raise NotImplementedError("%r does not ensure the daemon" % step["command"])
-        with mock.patch.dict(os.environ, {sb.FAULT_ENV: ",".join(self.faults)}), mock.patch.object(sb, "ENSURE_ON_USE", True):
-            sb.ensure_on_use(lambda argv, **kwargs: self.start_daemon(), state_dir=self.world.state, sleep=lambda s: None)
-
-    def bootstrap(self, step):
-        world = self.world
-        index = [i for i, s in enumerate(self.scenario["steps"]) if s is step][0]
-        with mock.patch.dict(os.environ, {sb.FAULT_ENV: ",".join(self.faults)}):
-            try:
-                done = sb.bootstrap_cos(world.new_engine("cli"), directory=str(self.work), patience=5,
-                                        sleep=lambda seconds: setattr(world.clock, "t", world.clock.t + seconds))
-            except sb.BootstrapRefused as err:
-                self.said[index] = "bootstrap refused: %s" % err
-                return
-        world.sessions[sb.COS_NAME], world.panes[sb.COS_NAME] = done["session"], done["pane"]
-        self.said[index] = "%s %s in workspace %s, pane %s" % (done["action"], sb.COS_NAME, done["workspace"], done["pane"])
-
-    def oracle_status_first_line(self, e):
-        """The first line of `fleet-switchboard status` for a machine whose config asks for the decision model, with no key."""
-        root = self.world.state.parent / ("status-" + self.world.state.name)
-        config = root / "config" / "fleet-switchboard" / "config.json"
-        config.parent.mkdir(parents=True, exist_ok=True)
-        config.write_text(json.dumps({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "jev": {}}))
-        env = {"XDG_CONFIG_HOME": str(root / "config"), "XDG_STATE_HOME": str(root / "state"),
-               sb.FAULT_ENV: ",".join(self.faults)}
-        with mock.patch.dict(os.environ, env):
-            os.environ.pop("OPENROUTER_API_KEY", None)
-            text = sb.format_status(sb.collect_status(self.world.route, self.world.clock.now))
-        first = text.splitlines()[0]
-        return e["text"] in first, "the first line is %r" % first
-
-    def oracle_bootstrap_says(self, e):
-        said = self.said.get(e["step"])
-        return said is not None and e["text"] in said, "step %d printed %r" % (e["step"], said)
-
-    def oracle_fleet_sessions(self, e):
-        found = [sid for sid, session in self.world.v2.sessions.items()
-                 if ((session.get("metadata") or {}).get("fleet") or {}).get("name") == e["agent"]]
-        return len(found) == e["count"], "%d v2 session(s) carry the fleet name %s" % (len(found), e["agent"])
-
-    def type_wake(self, step):
-        """The baseline: today's heartbeat types the wake with `herdr agent prompt`.
-        This runner is the only code allowed to; the engine never does."""
-        herdr = self.world.herdr
-        herdr.allow_typing = True
-        herdr([FAKE_HERDR, "agent", "prompt", self.world.panes[step["to"]], "[heartbeat] " + step["summary"]])
-        herdr.allow_typing = False
-
-    def launch(self, step):
-        """fleet-switchboard launch, as the CLI runs it, on the fakes."""
-        name, world = step["agent"], self.world
-        member = self.scenario["cast"][name]
-        done = sb.launch_agent(
-            world.new_engine("cli"), name, "coder" if member["role"] == "coder" else member["role"], str(self.work),
-            "w1", member["role"], member.get("reports_to"), member.get("issue"), step.get("brief"),
-            patience=5, sleep=lambda seconds: setattr(world.clock, "t", world.clock.t + seconds),
-            repo=member.get("repo"))
-        world.sessions[name], world.panes[name] = done["session"], done["pane"]
-        self.launched[name] = done
-
-    def one_pass(self, step_faults):
-        os.environ[sb.FAULT_ENV] = ",".join(sorted(set(self.faults) | set(step_faults)))
-        first = len(self.world.v2.writes)
-        try:
-            self.world.engine.run_pass()
-        except sb.SimulatedCrash:
-            self.crashed_writes.update(range(first, len(self.world.v2.writes)))
-            self.world.engine = self.world.new_engine()
-        finally:
-            os.environ[sb.FAULT_ENV] = ",".join(self.faults)
-
-    # -- oracles: each returns (ok, what was observed)
-    def mode_of(self, name, message_id):
-        """How a delivered message reached the model, from the model calls:
-        `wake` when it was the input that called the model (it started a turn
-        from idle, or ran after the final reply); `note` when it rode along
-        with another input, or was injected between steps. The same rule as
-        the Lab's (scenarios/switchboard/README.md)."""
-        for call in self.world.model_calls(name):
-            ids = [i["id"] for i in call["inputs"]]
-            if message_id in ids:
-                woke = ids[-1] == message_id and call["phase"] in ("turn_start", "after_reply")
-                return "wake" if woke else "note"
-        return None
-
-    def oracle_delivered(self, e):
-        found = [a for a in self.world.admissions(e["to"])
-                 if a["delivered_at"] is not None and _matches(a["keys"], e["key"])]
-        if "mode" in e:
-            found = [a for a in found if self.mode_of(e["to"], a["id"]) == e["mode"]]
-        if "text" in e:
-            found = [a for a in found if e["text"] in a["text"]]
-        keys = {key for a in found for key in a["keys"] if fnmatch.fnmatchcase(key, e["key"])}
-        ok = len(found) == e["count"] if "count" in e else bool(found)
-        if "keys" in e:
-            ok = ok and len(keys) == e["keys"]
-        return ok, "%d message(s) in the transcript carry %d matching key(s)" % (len(found), len(keys))
-
-    def oracle_message_count(self, e):
-        found = [a for a in self.world.admissions(e["to"]) if a["from"] == "switchboard"]
-        return len(found) == e["count"], "%d switchboard message(s) admitted" % len(found)
-
-    def oracle_model_saw(self, e):
-        when = e.get("when", "any")
-        calls = [c for c in self.world.model_calls(e["agent"], None if when == "any" else when)
-                 if any(_matches(i["keys"], e["key"]) for i in c["inputs"])]
-        ok = len(calls) == e["count"] if "count" in e else bool(calls)
-        return ok, "%d model call(s) (%s) carried it, at %s s" % (
-            len(calls), when, [int(c["at"] - EPOCH) for c in calls])
-
-    def oracle_draft_intact(self, e):
-        """The fake herdr's input box still holds the draft, and no message sent it."""
-        draft = " ".join(e["text"].split())
-        box = " ".join(self.world.herdr.input_box.get(self.world.panes[e["agent"]], "").split())
-        session = self.world.v2.sessions[self.world.sessions[e["agent"]]]
-        sent = [m["id"] for m in session["messages"] if m["type"] == "user" and draft in " ".join(m["text"].split())]
-        return draft in box and not sent, "input box %r; sent in: %s" % (box, ", ".join(sent) or "no message")
-
-    def oracle_metadata_roundtrip(self, e):
-        name = e["agent"]
-        session = self.world.v2.sessions[self.world.sessions[name]]
-        if e.get("of", "session") == "session":
-            want = e["fleet"] if "fleet" in e else dict(
-                {"name": name}, **self.fleet_of(self.scenario["cast"][name]))
-            got = (session["metadata"] or {}).get("fleet")
-            return got == want, "session.get metadata.fleet = %s; expected %s" % (got, want)
-        if e.get("key"):
-            found = [m for m in session["messages"] if _matches(_record_keys(m), e["key"])]
-        else:
-            found = [m for m in session["messages"] if m["type"] in ("user", "synthetic") and e["text"] in m["text"]]
-        if not found:
-            return False, "no message with %r in the transcript" % (e.get("key") or e.get("text"))
-        default = {"keys": [e["key"]]} if e.get("key") else None
-        want, got = e.get("fleet", default), (found[0].get("metadata") or {}).get("fleet")
-        return got == want, "%s metadata.fleet = %s; expected %s" % (found[0]["type"], got, want)
-
-    def launched_pane(self, name):
-        """The pane herdr says shows this agent's session, found through herdr's agent list."""
-        session = self.world.sessions[name]
-        for pane in sorted(self.world.herdr.panes):
-            if sb.agent_session(self.world.herdr.agent(pane)) == session:
-                return pane, self.world.herdr.panes[pane]
-        return None, None
-
-    def oracle_pane_runs_v2(self, e):
-        pane, entry = self.launched_pane(e["agent"])
-        if pane is None:
-            return False, "no herdr pane shows session %s" % self.world.sessions[e["agent"]]
-        program = entry["program"] or ""
-        ok = sb.runs_program(program, FAKE_OPENCODE) and program.endswith("-s " + self.world.sessions[e["agent"]])
-        return ok, "pane %s runs %r (agent opencode on %s)" % (pane, program, self.world.sessions[e["agent"]])
-
-    def oracle_no_typing(self, e):
-        """The pane was started by argv, so it has no shell, and herdr was asked to type nothing."""
-        pane, entry = self.launched_pane(e["agent"])
-        typed = self.world.herdr.typing_attempts
-        ok = entry is not None and entry.get("argv", [None])[0] == FAKE_OPENCODE and not typed
-        return ok, "pane %s opened by argv %s; typing attempts: %s" % (pane, (entry or {}).get("argv"), typed or "none")
-    def oracle_classified(self, e):  # PR 7: see "PR 7" below
-        return classified_in_audit(self.world.audit(), e["agent"], self.scenario["steps"][e["step"]]["text"], e["as"])
-
-    def evaluate(self):
-        results = []
-        for expectation in self.scenario["expect"]:
-            oracle = getattr(self, "oracle_" + expectation["that"], None)
-            if oracle is None:
-                raise NotImplementedError("the offline runner has no oracle %r" % expectation["that"])
-            ok, seen = oracle(expectation)
-            results.append({"label": expectation.get("name", expectation["that"]),
-                            "that": expectation["that"], "ok": ok, "seen": seen})
-        return results
-
-    def implicit(self):
-        """Checked in every run: each write audited before and after (unless
-        the process crashed right after it), and herdr never asked to type."""
-        problems = []
-        entries = self.world.audit()
-        for index, write in enumerate(self.world.v2.writes):
-            before = entries[:write["audit_lines"]]
-            intents = [e for e in before if e.get("phase") == "intent"
-                       and write["id"] in ((e.get("detail") or {}).get("message_id"),
-                                           (e.get("detail") or {}).get("inbox_id"))]
-            if not intents:
-                problems.append("%s %s had no audit intent before it" % (write["op"], write["id"]))
-                continue
-            call = intents[-1]["call"]
-            if index not in self.crashed_writes and not any(
-                    e.get("phase") == "result" and e.get("call") == call for e in entries):
-                problems.append("%s %s has no audit result" % (write["op"], write["id"]))
-        for argv in self.world.herdr.calls:
-            if argv[1:3] not in HERDR_ALLOWED:
-                problems.append("herdr asked for %r" % argv[1:])
-        problems.extend("herdr was asked to type: %r" % attempt for attempt in self.world.herdr.typing_attempts)
-        problems.extend("herdr socket method %r" % method for method, _ in self.world.herdr.socket_calls
-                        if method not in SOCKET_ALLOWED)
-        return problems
 
 
-def control_play(test, scenario):
-    """The control's play and a line saying what it switched off or swapped."""
-    control = scenario["control"]
-    if "fault" in control:
-        return OfflineRun(test, scenario, "control", [control["fault"]]).run(), "fault %s" % control["fault"]
-    if control.get("baseline") == "timer-heartbeat":  # the old timer, added to the play (PR 4)
-        return OfflineRun(test, with_baseline(scenario, "timer-heartbeat"), "control").run(), \
-            "baseline timer-heartbeat"
-    if "baseline" in control:
-        return OfflineRun(test, scenario, "control", baseline=control["baseline"]).run(), \
-            "baseline %s" % control["baseline"]
-    return OfflineRun(test, sc.apply_variant(scenario, control["variant"]), "control").run(), "variant"
 
 
-def run_scenario(test, scenario):
-    """The run, then the control. Returns a report; a control that passes is a failure."""
-    control = scenario["control"]
-    main = OfflineRun(test, scenario, "run").run()
-    checked, how = control_play(test, scenario)
-    run_results, control_results = main.evaluate(), checked.evaluate()
-    proves_nothing = [entry for entry in control["fails"]
-                      if all(r["ok"] for r in control_results if entry in (r["label"], r["that"]))]
-    return {"id": scenario["id"], "control_kind": how, "run": run_results, "control": control_results,
-            "implicit": main.implicit(), "failures": [r for r in run_results if not r["ok"]],
-            "proves_nothing": proves_nothing}
 
 
 class TestOfflineScenarios(Base):
@@ -7019,24 +6637,12 @@ for _path in sc.scenario_files(sc.DEFAULT_DIR):
 GITHUB_STEPS = ("comment", "kill-forwarder", "occupy-hook", "awaiting")
 
 
-DELIVERY_FIXTURE = REPO / "tests" / "switchboard" / "fixtures" / "delivery_measure.json"
-IDLE_CASES = ("idle_after_normal_turn", "idle_after_provider_error")
 
 
-def delivery_fixture():
-    return json.loads(DELIVERY_FIXTURE.read_text())
 
 
-def measured_table(fixture, override=None):
-    """{(case, form): turn started?} of the fixture's rows, with `override` ({(case, form): bool}) changed on a copy: the mutants of the fake."""
-    table = {(row["case"], row["form"]): bool(row["turn_started"]) for row in fixture["rows"]}
-    table.update(override or {})
-    return table
 
 
-def derived_forms():
-    """Every way one message is delivered, from the client's own table: each delivery with resume true and false, and a plain prompt."""
-    return [d + "_resume" if resume else d for d in sb.V2Client.DELIVERIES for resume in (True, False)] + ["prompt"]
 
 
 class TestMeasuredDelivery(Base):
@@ -7250,13 +6856,8 @@ class TestMeasuredDelivery(Base):
             self.assertIn(word, section)
 
 
-def sb_form_args(form):
-    """(delivery, resume) of a form name, from the measurement helper's own table."""
-    return importlib.import_module("support.delivery_measure").FORM_ARGS[form]
 
 
-def sb_form_arg_names():
-    return list(importlib.import_module("support.delivery_measure").FORM_ARGS)
 
 
 class FakeProc:
@@ -7456,18 +7057,8 @@ class FakeGitHub:
         raise AssertionError("fake gh api: no route for %r" % path)
 
 
-def _url_tail(url):
-    match = re.search(r"/issues/(\d+)$", url or "")
-    return int(match.group(1)) if match else None
 
 
-def urllib_query(path):
-    query = {}
-    for pair in path.partition("?")[2].split("&"):
-        if pair:
-            name, _, value = pair.partition("=")
-            query[name] = value
-    return query
 
 
 class GithubRig:
@@ -8194,8 +7785,6 @@ class TestGithubKeys(Base):
         self.assertIn("since=%s" % sb.iso(self.world.clock.now() - 24 * 3600), "".join(self.gh.api_calls))
 
 
-def edited_body(intent, done):
-    return "## Intent\n%s\nDone when: %s\n" % (intent, done)
 
 
 class TestIntentEditWiring(Base):
@@ -9287,58 +8876,12 @@ def op_session_form_list(self, params, body):
 
 # ---- the offline runner learns the PR 4 steps and oracles
 
-WORKER_STEPS = ("away", "permission", "close-pane", "delete-state", "timer-heartbeat")
-HEARTBEAT_EVERY = 30 * 60  # the old timer's cadence, for the Q1 baseline
 
 
-def apply_worker_step(run, step):
-    world, do = run.world, step["do"]
-    if do == "away":
-        return  # you simply prompt nothing more
-    if do == "permission" and step["actor"] != "you":
-        name = step["actor"]  # a turn that cannot finish until you answer
-        if not world.v2.busy(world.sessions[name]):  # PR 18: an agent already blocked asks again, in the same turn
-            world.v2.start_turn(world.sessions[name], "fleet task", fleet=True, lasts=86400)
-        world.v2.ask_permission(world.sessions[name])
-        world.herdr.panes[world.panes[name]]["status"] = "blocked"
-    elif do == "permission":
-        name = step["to"]
-        world.herdr.panes[world.panes[name]]["status"] = None
-        world.v2.answer_permissions(world.sessions[name])
-    elif do == "close-pane":
-        world.engine.herdr.runner = ClosingRunner(world.herdr, world.panes[step["agent"]])
-    elif do == "delete-state":
-        shutil.rmtree(str(world.state))
-        sb.ensure_state_dir(world.state)  # what the next start of the daemon does first
-    else:  # timer-heartbeat: the old fleet-heartbeat wakes each orchestrator whether or not anything happened
-        for name, member in sorted(run.scenario["cast"].items()):
-            if member["role"] in ("orchestrator", "chief-of-staff"):
-                ses = world.sessions[name]
-                keys = ["heartbeat:%s:%d" % (name, world.clock.now())]
-                world.engine.v2.synthetic(ses, "heartbeat: anything new?", {"fleet": {"keys": keys, "from": "fleet-heartbeat"}},
-                                          True, "queue", sb.derive_message_id(ses, keys))
 
 
-def with_baseline(scenario, baseline):
-    """The scenario as the control plays it: itself, or the old timer heartbeat added to it."""
-    if baseline is None:
-        return scenario
-    if baseline != "timer-heartbeat":
-        raise NotImplementedError("the offline runner has no baseline %r" % baseline)
-    played = copy.deepcopy(scenario)
-    end = max(sc.duration_seconds(step["at"]) for step in played["steps"])
-    beats = [{"at": "%ds" % at, "actor": "world", "do": "timer-heartbeat"}
-             for at in range(HEARTBEAT_EVERY, end + 1, HEARTBEAT_EVERY)]
-    played["steps"] = sorted(played["steps"] + beats, key=lambda step: sc.duration_seconds(step["at"]))
-    return played
 
 
-def _toasts(world):
-    shown = []
-    for argv in world.herdr.calls:
-        if argv[1:3] == ["notification", "show"]:
-            shown.append({"title": argv[3], "body": argv[argv.index("--body") + 1] if "--body" in argv else ""})
-    return shown
 
 
 @adds_to(OfflineRun)
@@ -10355,7 +9898,6 @@ class TestRemindCLI(PR4Base):
 # ---- self-wakes: checkpoint reminders and the daily friction wake (docs/switchboard.md, "Self-wakes")
 
 
-DOC_EXAMPLE_LINE = "in 15 min, at 2030-01-02T15:05:05Z"   # the one line docs/switchboard.md shows for a reminder (ask #968)
 
 
 class TestReminderOutputShowsHowLong(PR4Base):
@@ -10925,7 +10467,6 @@ class TestFrictionWake(FrictionBase):
 
 # ---- the scenarios and the validator
 
-PR4_CATALOG = {"N1": 3, "N2": 3, "W1": 4, "W3": 4, "Q1": 3, "R1": 4, "H1": None, "R3": None}
 
 
 class TestPR4Catalog(unittest.TestCase):
@@ -11054,98 +10595,10 @@ import datetime  # noqa: E402  (this section's only import)
 ISSUES_API = "repos/%s/issues/" % FAKE_REPO
 
 
-def _utc(epoch):
-    return datetime.datetime.fromtimestamp(epoch, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def intent_body(intent, done_when, revision=0):
-    """An issue body: an `## Intent` section when either line is given."""
-    parts = ["Some text before.\n"]
-    if intent is not None or done_when is not None:
-        parts.append("## Intent\n")
-        if intent is not None:
-            parts.append(intent + "\n")
-        if done_when is not None:
-            parts.append("Done when: %s\n" % done_when)
-    if revision:
-        parts.append("\n## Notes\nrevision %d\n" % revision)
-    return "".join(parts)
 
 
-class FakeGH:
-    """`gh api` over a scenario's issues. A runner, like the other fakes.
-
-    Serves GET only, by path: an issue, its parent (404 without one) and a
-    charter's sub-issues. Any other shape of call raises, so a write cannot
-    pass for a read. `issues` is a scenario's table: number -> intent,
-    done_when, parent. A charter's body is its yaml block.
-    """
-
-    def __init__(self, issues, charters, clock, repo=FAKE_REPO, token=None):
-        self.issues = {int(n): dict(v) for n, v in issues.items()}
-        self.charters, self.clock = set(charters), clock
-        self.revision, self.updated = {}, {}
-        self.calls, self.down = [], False
-        self.repo, self.token = repo, token  # PR 15: which repo this is, and the one token that may read it
-        self.api = "repos/%s/issues/" % repo
-
-    def body(self, number):
-        if number in getattr(self, "bodies", {}):  # PR 17: a body written by PATCH, or set by a test
-            return self.bodies[number]
-        if number in self.charters:
-            line = self.issues[number].get("authority")  # PR 9: a charter's Standing authority line
-            workspace = self.issues[number].get("workspace")  # PR 15: a charter's `workspace:` line
-            return "```yaml\norchestrator: platform\n%sstatus: active\n```\n\nThe charter.\n" % (
-                "workspace: %s\n" % workspace if workspace else "") + (
-                "\nStanding authority: %s\n" % line if line else "")
-        issue = self.issues[number]
-        return intent_body(issue.get("intent"), issue.get("done_when"), self.revision.get(number, 0))
-
-    def record(self, number):
-        return {"number": number, "state": self.issues[number].get("state", "open"),
-                "title": "Issue %d" % number, "body": self.body(number),
-                "updated_at": self.updated.get(number, "2027-01-01T00:00:00Z")}
-
-    def edit(self, number, **fields):
-        """Edit the intent fields (None removes a line); the body always changes. (old, new) bodies."""
-        old = self.body(number)
-        self.issues[number].update(fields)
-        self.revision[number] = self.revision.get(number, 0) + 1
-        self.updated[number] = _utc(self.clock.now())
-        return old, self.body(number)
-
-    def __call__(self, argv, **kwargs):
-        return with_http_head(self.serve, argv, kwargs, self.__dict__.setdefault("http", {}))
-
-    def serve(self, argv, kwargs):
-        self.calls.append(argv)
-        if "--method" in argv and argv[argv.index("--method") + 1] == "PATCH":  # PR 17: a charter's body
-            return self.patch_body(argv, kwargs)
-        if "--method" in argv:  # PR 8: the handoff comment, the one write
-            return self.post_comment(argv, kwargs)
-        if len(argv) != 3 or argv[:2] != [FAKE_GH, "api"]:
-            raise AssertionError("fake gh serves `gh api <path>` only, a GET; got %r" % argv)
-        if self.down:
-            return subprocess.CompletedProcess(argv, 1, "", "gh: network unreachable\n")
-        if self.token is not None and (kwargs.get("env") or {}).get("GH_TOKEN") != self.token:
-            if getattr(self, "leak", False):  # a hostile gh that echoes the credential into its error
-                return subprocess.CompletedProcess(argv, 1, "", "gh: HTTP 401 bad credentials %s\n"
-                                                   % (kwargs.get("env") or {}).get("GH_TOKEN"))
-            return subprocess.CompletedProcess(argv, 1, "", "gh: Not Found (HTTP 404)\n")
-        match = re.match(r"^%s(\d+)(/parent|/sub_issues\?per_page=100)?$" % re.escape(self.api), argv[2])
-        if not match or int(match.group(1)) not in self.issues:
-            return subprocess.CompletedProcess(argv, 1, "", "gh: Not Found (HTTP 404)\n")
-        number, tail = int(match.group(1)), match.group(2)
-        if tail == "/parent":
-            parent = self.issues[number].get("parent")
-            body = self.record(parent) if parent in self.issues else None
-        elif tail:
-            body = [self.record(n) for n in sorted(self.issues) if self.issues[n].get("parent") == number]
-        else:
-            body = self.record(number)
-        if body is None:
-            return subprocess.CompletedProcess(argv, 1, "", "gh: Not Found (HTTP 404)\n")
-        return subprocess.CompletedProcess(argv, 0, json.dumps(body), "")
 
 
 @adds_to(FakeGH)
@@ -11207,45 +10660,10 @@ def patch_body(self, argv, kwargs):
     return subprocess.CompletedProcess(argv, 0, json.dumps(self.record(number)), "")
 
 
-def attach_intent_lab(run):
-    """The offline runner's seam: a scenario with `issues` gets a fake GitHub and a reader over it."""
-    run.ask_gh = None
-    if "issues" not in run.scenario or "repos" in run.scenario:  # PR 15: a play with repos has its own GitHub
-        return
-    charters = {m["charter"] for m in run.scenario["cast"].values() if "charter" in m}
-    run.ask_gh = FakeGH(run.scenario["issues"], charters, run.world.clock)
-    run.world.intents = sb.IntentReader(FAKE_GH, FAKE_REPO, run.ask_gh, run.world.clock.now, 5)
 
 
-def apply_edit_intent(run, step):
-    """`edit-intent`: edit the fake issue, then do what PR 5's webhook handler
-    will do: invalidate the cache, and turn the event into an item for the
-    Chief of Staff and a toast for you, with the pure functions under test."""
-    world = run.world
-    fields = {name: step[name] for name in ("intent", "done_when") if name in step}
-    old, new = run.ask_gh.edit(step["issue"], **fields)
-    world.intents.invalidate(step["issue"])
-    payload = {"action": "edited", "changes": {"body": {"from": old}}, "sender": {"login": "you"},
-               "issue": {"number": step["issue"], "body": new, "updated_at": run.ask_gh.updated[step["issue"]]}}
-    cos = next(name for name, member in sorted(run.scenario["cast"].items()) if member["role"] == "chief-of-staff")
-    change = sb.intent_change_fact(payload, cos)
-    if change is not None:
-        with open(str(world.state / sb.LAB_FACTS), "a") as handle:
-            handle.write(json.dumps(change.to_json()) + "\n")
-    toast = sb.intent_change_toast(payload)
-    if toast is not None:
-        with world.engine.audit.external("daemon", "herdr.notification", "you", toast):
-            world.engine.herdr.notification_show(toast["title"], toast["body"])
 
 
-def apply_handoff_step(run, step):
-    """PR 8, `handoff`: the cast member runs `fleet-switchboard handoff` for an ask, as the
-    Chief of Staff's model would. The brief is posted on the fake GitHub, and the subagent is
-    launched (into the fakes) with the cast member as the one it reports to."""
-    world = run.world
-    sb.handoff_ask(world.new_engine("cli"), step["actor"], step["issue"], step["brief"],
-                   directory=str(run.work), workspace="w1", patience=5,
-                   sleep=lambda seconds: setattr(world.clock, "t", world.clock.t + seconds))
 
 
 @adds_to(OfflineRun)
@@ -11260,8 +10678,6 @@ def oracle_handed_off(self, e):
         len(comments), e["issue"], len(subagents))
 
 
-def _delivered_texts(run, name):
-    return [a["text"] for a in run.world.admissions(name) if a["delivered_at"] is not None]
 
 
 def _ask_of(issues, number):
@@ -11913,20 +11329,8 @@ class TestIntentCLI(IntentCase):
         self.assertNotIn("intent_gaps", json.loads(self.main("status", "--json")[1])["agents"])
 
 
-SHARED_MAXIMS = ("Festina lente", "Chesterton's fence", "Cut the root, not the branch", "Outcomes, not mechanics",
-                 "Say it failed", "A diagnosis is not a mandate", "Don't widen the ask",
-                 "Permission doesn't travel", "An empty queue is not a mandate")
-HYGIENE_MAXIMS = ("Say it failed",)   # the one maxim the coder holds as a rule (R-CODE-1); the owner's two principles for how a coder works stay in the definition
-COS_ONLY_MAXIMS = ("message stands alone", "No change, no message",
-                   "Evidence, consequence, options, recommendation")
-RUBRIC = ("grows the contract", "can't be undone", "speaks for your principal", "a key that isn't yours",
-          "ready for your principal's eyes", "stuck after trying")
-ROLE_LINE_LIMITS = {"coder": 134, "orchestrator": 180, "chief-of-staff": 162, "cos-subagent": 70}  # lines; they must not grow
 
 
-def maxims_block(text):
-    match = re.search(r"^## Maxims\n(.*?)(?=^## )", text, re.S | re.M)
-    return match.group(1) if match else ""
 
 
 class TestChatClearHook(Base):
@@ -12885,7 +12289,6 @@ class TestClearMarker(Base):
         self.assertFalse(sb.pr_marker_state([], sb.marker_edit("MERGE: captain\n")[0], now=0)["captain"])
 
 
-REAL_INTENT_ISSUE, REAL_INTENT_PARENT = sb.IntentReader.issue, sb.IntentReader.parent   # before any rig patches them
 
 
 class CharterRig:
@@ -16648,16 +16051,6 @@ class TestIntentScenarios(Base):
 # ======================================================================
 
 
-POLICY_CASES = {  # answers -> judged outcome with nothing configured (allow)
-    "nothing high": ({"outside_intent": 0.1, "hard_to_reverse": 0.2, "speaks_for_you": 0.0, "outside_scope": 0.3}, "allow"),
-    "outside intent": ({"outside_intent": 0.9}, "hard-deny"),
-    "hard to reverse": ({"hard_to_reverse": 0.8}, "ask"),
-    "speaks for you": ({"speaks_for_you": 0.8}, "ask"),
-    "outside scope": ({"outside_scope": 0.8}, "ask"),
-    "outside intent beats the rest": ({"outside_intent": 0.9, "hard_to_reverse": 0.9, "outside_scope": 0.9}, "hard-deny"),
-    "at the threshold": ({"hard_to_reverse": 0.5}, "ask"),
-    "just under": ({"hard_to_reverse": 0.499, "outside_intent": 0.499}, "allow"),
-}
 
 
 class TestPolicyCombiner(Base):
@@ -18892,7 +18285,6 @@ class TestJudgeToolSecrets(PolicyCase):
             parser.parse_args(["judge-tool", "--key", "x"])
 
 
-CANARY = "canary-key-7f3a9c1e5b2d"  # a made-up key: it only has to be findable
 
 
 class TestPolicyShadow(PolicyCase):
@@ -19289,77 +18681,8 @@ class TestPolicyScenarios(Base):
 # ---------------------------------------------------------------- the plugin
 
 
-HARNESS_CASES = r"""
-await run("tighten-allow-to-ask", base("allow"), { reply: reply("ask", "Needs your yes") });
-await run("tighten-allow-to-deny", base("allow"), { reply: reply("deny", "Denied") });
-await run("tighten-ask-to-deny", base("ask"), { reply: reply("deny", "Denied") });
-await run("never-loosen-ask-to-allow", base("ask"), { reply: reply("allow", "fine") });
-await run("never-loosen-deny-to-ask", base("deny"), { reply: reply("ask", "fine") });
-await run("same-ask-changes-nothing", base("ask"), { reply: reply("ask", "same") });
-await run("timeout-keeps-configured", base("allow"), { reply: undefined }, 80);
-await run("garbage-keeps-configured", base("allow"), { reply: "not json at all" });
-await run("bad-outcome-keeps-configured", base("allow"), { reply: JSON.stringify({ outcome: "permit", reason: "x" }) });
-await run("no-line-keeps-configured", base("allow"), { reply: null });
-await run("spawn-error-keeps-configured", base("allow"), { error: true });
-await run("spawn-throws-keeps-configured", base("allow"), { throws: true });
-await run("bad-input-spawns-nothing", { action: "shell", effect: "allow" }, { reply: reply("deny") });
-const spawnedBefore = spawns.length;
-await run("unlisted-action-spawns-nothing", { sessionID: "ses_abc", action: "read", resources: ["a"], effect: "allow" }, { reply: reply("deny") });
-results["unlisted-spawned"] = spawns.length - spawnedBefore;
-results["request"] = hooks.requestOf({ sessionID: "ses_q", action: "shell", resources: ["a", 5, "b"], effect: "ask" });
-results["tools"] = ["shell", "bash", "edit", "write", "webfetch", "task", "subagent", "read", "glob", "grep", "skill", "mcp_x", "toString", "constructor", undefined]
-  .map((a) => hooks.toolOf(a));
-results["stricter"] = [["ask","allow"],["allow","ask"],["ask","deny"],["ask","ask"],["ask","bogus"]]
-  .map(([r, c]) => hooks.isStricter({ outcome: r }, c));
-results["settings"] = [
-  hooks.settingsOf({ FLEET_SWITCHBOARD_BIN: "fleet-switchboard" }),
-  hooks.settingsOf({}),
-  hooks.settingsOf({ FLEET_SWITCHBOARD_BIN: "/abs/x", FLEET_HOOKS_TIMEOUT_MS: "250" }),
-  hooks.settingsOf({ FLEET_SWITCHBOARD_BIN: "/abs/x", FLEET_HOOKS_TIMEOUT_MS: "nope" }),
-];
-process.env.OPENROUTER_API_KEY = "canary-in-service-env";
-process.env.FLEET_SWITCHBOARD_LAB = "1";
-await run("env-probe", base("allow"), { reply: reply("allow") });
-const probe = spawns[spawns.length - 1];
-results["child-env"] = { keys: Object.keys(probe.opts.env).sort(), hasCanary: JSON.stringify(probe.opts.env).includes("canary") };
-const first = spawns[0];
-results["spawn-shape"] = { bin: first.bin, args: first.args, shell: first.opts.shell, stdio: first.opts.stdio,
-                           stdin: JSON.parse(first.stdin) };
-const registered = [];
-await plugin.setup({ permission: { hook: (name, fn) => registered.push([name, typeof fn]) } }, { FLEET_SWITCHBOARD_BIN: "/abs/x" });
-const unregistered = [];
-await plugin.setup({ permission: { hook: (name) => unregistered.push(name) } }, {});
-await plugin.setup({ permission: { hook: (name) => unregistered.push(name) } }, { FLEET_SWITCHBOARD_BIN: "relative/x" });
-results["registration"] = { registered, unregistered, id: plugin.id, setupIsFunction: typeof plugin.setup };
-"""
 
 
-SHELL_HOOK_CASES = r"""
-const sep = ":";
-const hook = hooks.makeShellHook("/kit/shims");
-const spec = (env) => ({ command: "gh issue comment 2 --body hi", cwd: "/w", timeout: 0, shell: "/bin/sh", env });
-let a = spec({ PATH: "/usr/bin:/bin", KEEP: "1" }); hook(a);
-results["prepended"] = { path: a.env.PATH, keep: a.env.KEEP, command: a.command };
-let b = spec({ PATH: "/usr/bin:/kit/shims:/bin" }); hook(b); hook(b);
-results["once-only"] = b.env.PATH;
-let c = spec({}); hook(c);
-results["no-path"] = c.env.PATH;
-let d = spec(undefined); hook(d);
-results["no-env"] = d.env.PATH;
-const before = { PATH: "/x" }; let e = spec(before); hook(e);
-results["input-env-untouched"] = before.PATH;
-let junk = [undefined, null, 5, "x"]; for (const j of junk) hook(j);
-results["junk-ok"] = true;
-let frozen = Object.freeze(spec({ PATH: "/x" })); hook(frozen);
-results["frozen-ok"] = frozen.env.PATH;
-results["shimsOf"] = [hooks.shimsOf({ FLEET_SWITCHBOARD_SHIMS: "/abs/shims" }), hooks.shimsOf({ FLEET_SWITCHBOARD_SHIMS: "rel/shims" }), hooks.shimsOf({})];
-const reg = []; const noReg = [];
-await plugin.setup({ shell: { hook: (n, f) => reg.push([n, typeof f]) }, permission: { hook: () => {} } }, { FLEET_SWITCHBOARD_SHIMS: "/abs/shims" });
-await plugin.setup({ shell: { hook: (n) => noReg.push(n) } }, {});
-await plugin.setup({ shell: { hook: (n) => noReg.push(n) } }, { FLEET_SWITCHBOARD_SHIMS: "relative" });
-await plugin.setup({ permission: { hook: () => {} } }, { FLEET_SWITCHBOARD_SHIMS: "/abs/shims", FLEET_SWITCHBOARD_BIN: "/abs/x" }); // an api without a shell service
-results["registration"] = { reg, noReg };
-"""
 
 
 @unittest.skipUnless(NODE, "node is not installed: the fleet-hooks plugin tests need it (skipped, not passed)")
@@ -19497,77 +18820,19 @@ class TestFleetHooksPlugin(Base):
         self.assertEqual(package["type"], "module")
 
 
-CUTOVER_DOC = REPO / "docs" / "switchboard-cutover.md"
 
 
 # ---- an independent statement of what v2's import accepts (from its OpenAPI
 # document), so the fake does not just re-run the converter's own checker
 
-FAKE_IMPORT_FIELDS = {
-    "body": {"info", "messages", "location"},
-    "info": {"id", "parentID", "fork", "projectID", "agent", "model", "cost", "tokens", "outcome", "time", "title",
-             "subpath", "metadata", "permissions", "revert", "location"},
-    "user": {"id", "metadata", "time", "text", "files", "agents", "skills", "type"},
-    "assistant": {"id", "metadata", "time", "type", "agent", "model", "content", "snapshot", "finish", "rawFinish",
-                  "providerState", "cost", "tokens", "error", "retry"},
-    "text": {"type", "text", "state"}, "reasoning": {"type", "text", "state", "time"},
-    "tool": {"type", "id", "name", "executed", "providerState", "providerResultState", "state", "time"},
-}
 
 
-def _unknown_fields(item, kind):
-    return ["%s: %s" % (kind, name) for name in sorted(set(item) - FAKE_IMPORT_FIELDS[kind])]
 
 
-def _fake_message_problems(message):
-    kind = message.get("type") if isinstance(message, dict) else None
-    if kind not in ("user", "assistant"):
-        return ["message of type %r (the fake models user and assistant)" % kind]
-    problems = _unknown_fields(message, kind)
-    if not str(message.get("id", "")).startswith("msg_"):
-        problems.append("message id must start with msg_")
-    if not _is_ms(message.get("time", {}).get("created")):
-        problems.append("message time.created must be a number")
-    if kind == "user" and not isinstance(message.get("text"), str):
-        problems.append("user text must be a string")
-    for part in message.get("content", []) if kind == "assistant" else []:
-        ptype = part.get("type")
-        if ptype not in ("text", "reasoning", "tool"):
-            problems.append("content of type %r" % ptype)
-        else:
-            problems.extend(_unknown_fields(part, ptype))
-        if ptype == "tool" and part.get("state", {}).get("status") not in ("streaming", "running", "completed", "error"):
-            problems.append("tool state %r" % part.get("state"))
-    if kind == "assistant" and not all(isinstance(message.get(k), t) for k, t in (("agent", str), ("model", dict), ("content", list))):
-        problems.append("assistant needs agent, model and content")
-    return problems
 
 
-def _is_ms(value):
-    return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
-def fake_import_problems(body):
-    """Everything the fake v2 refuses in an import body."""
-    if not isinstance(body, dict):
-        return ["body must be an object"]
-    problems = ["body: " + n for n in sorted(set(body) - FAKE_IMPORT_FIELDS["body"])]
-    info, messages = body.get("info"), body.get("messages")
-    if not isinstance(info, dict) or not isinstance(messages, list):
-        return problems + ["info and messages are required"]
-    problems.extend(_unknown_fields(info, "info"))
-    for name in ("id", "projectID", "cost", "tokens", "time", "location"):
-        if name not in info:
-            problems.append("info.%s is required" % name)
-    if not str(info.get("id", "")).startswith("ses"):
-        problems.append("info.id must start with ses")
-    if not _is_ms(info.get("time", {}).get("created")) or not _is_ms(info.get("time", {}).get("updated")):
-        problems.append("info.time needs created and updated numbers")
-    if not isinstance(info.get("location", {}).get("directory"), str):
-        problems.append("info.location.directory must be a string")
-    for message in messages:
-        problems.extend(_fake_message_problems(message))
-    return problems
 
 
 @adds_to(FakeV2)
@@ -19626,11 +18891,6 @@ def _import_fleet_of(name, member):
     return fleet
 
 
-def _fixture_path(name):
-    path = (REPO / "scenarios" / name).resolve()
-    if (REPO / "scenarios").resolve() not in path.parents:
-        raise ValueError("a scenario fixture must live under scenarios/: %s" % name)
-    return path
 
 
 def apply_import_v1(run, step):
@@ -19717,9 +18977,6 @@ EXPECT_EXAMPLES["lists_asks"] = {"agent": "coder", "issue": 2}
 
 # ---- the schema checker
 
-def converted_body():
-    out = convert()
-    return copy.deepcopy(out["info"]), copy.deepcopy(out["messages"])
 
 
 class TestImportSchemaChecker(unittest.TestCase):
@@ -20076,7 +19333,6 @@ class TestImportV1Refusals(ImportCase):
 
 # ---- measured v2 import rules (Lab import spike), each a rule of the converter
 
-V2_SHAPE = V1_FIXTURES / "v2-export-shape.json"
 
 
 class TestImportMeasuredRules(ImportCase):
@@ -20312,7 +19568,6 @@ class TestCutoverRunbook(unittest.TestCase):
         self.assertEqual(len([line for line in readme.splitlines() if "switchboard-cutover.md" in line]), 1)
 
 
-PRE_EXISTING_REDEFINITIONS = {}  # names a bin file already defined twice before PR 10 (none)
 
 
 class TestPR10Source(unittest.TestCase):
@@ -20598,16 +19853,6 @@ class TestIdleAtASeam(WaitingInputs, ReportBase):
         self.assertEqual(sb._read_small(self.world.state, sb.LAST_REPORT_FILE)["coder"]["text"], "on the second step")
 
 
-# ======================================================================
-# #96: a worker.stopped that would wake the Chief of Staff alone is judged: "does this tell the person anything new?"
-# ======================================================================
-STOPPED_NEWS_RULES = [
-    {"contains": "NEWS-NO", "noul": {"stopped_news": 0.02, "report_owed": 0.95}},
-    {"contains": "NEWS-YES", "noul": {"stopped_news": 0.9, "report_owed": 0.95}},
-    {"contains": "NEWS-MID", "noul": {"stopped_news": 0.3, "report_owed": 0.95}},
-    {"contains": "NEWS-DOWN", "error": "unreachable"},
-    {"contains": "OWED-ME", "noul": {"report_owed": 0.95}},
-]
 
 
 class TestStalledWorking(WaitingInputs, ReportBase):
@@ -21758,11 +21003,6 @@ class TestBossAlias(ReportBase):
             self.assertTrue(any(marker in line for line in offenders), marker)
 
 
-def sweep_comment(number, body, at, cid=None):
-    out = {"issue_url": "https://api.github.com/repos/acme/api/issues/%d" % number, "body": body, "created_at": at}
-    if cid is not None:
-        out["id"] = cid
-    return out
 
 
 class TestSweep(Base):
@@ -23511,12 +22751,8 @@ class TestSweep(Base):
                 sb.validate_config(dict(base, sweep=bad))
 
 
-def tri_comment(clock_now, number, body, hours_ago=1.0, repo="acme/api"):
-    return {"issue_url": "https://api.github.com/repos/%s/issues/%d" % (repo, number), "body": body,
-            "created_at": sb.iso(clock_now - hours_ago * 3600)}
 
 
-TRI_HEAD_A, TRI_HEAD_B = "a" * 40, "b" * 40
 
 
 class TestTriage(Base):
@@ -27691,14 +26927,6 @@ class TestAlertWake(Base):
         self.assertEqual(strip(self.hub.calls), strip(baseline))
 
 
-ALERT_BAD_SHAPES = {   # one sample per row of sb.ALERT_SHAPE_CHECKS: (the whole triage section, the rows that may fire)
-    "not-a-map": {"alert_labels": ["ops-alert"]},
-    "bad-repo": {"alert_labels": {"widget": ["ops-alert"]}},
-    "labels-not-a-list": {"alert_labels": {"acme-org/widget-service": "ops-alert"}},
-    "bad-label": {"alert_labels": {"acme-org/widget-service": [""]}},
-    "duplicate-label": {"alert_labels": {"acme-org/widget-service": ["ops-alert", "ops-alert"]}},
-    "repo-not-read": {"repos": ["acme-org/other-service"], "alert_labels": {"acme-org/widget-service": ["ops-alert"]}},
-}
 
 
 class TestAlertConfig(unittest.TestCase):
@@ -29128,20 +28356,8 @@ class TestReportsPerBoss(DecisionsBase):
         self.assertEqual(error["boss"], "ghost")
 
 
-def load_judge_eval():
-    loader = importlib.machinery.SourceFileLoader("judge_eval_under_test", str(BIN / "judge-eval"))
-    spec = importlib.util.spec_from_loader(loader.name, loader)
-    module = importlib.util.module_from_spec(spec)
-    loader.exec_module(module)
-    return module
 
 
-def load_check_public_names():
-    loader = importlib.machinery.SourceFileLoader("check_public_names_under_test", str(BIN / "check-public-names"))
-    spec = importlib.util.spec_from_loader(loader.name, loader)
-    module = importlib.util.module_from_spec(spec)
-    loader.exec_module(module)
-    return module
 
 
 class TestCheckPublicNames(Base):
@@ -29243,7 +28459,6 @@ class TestCheckPublicNames(Base):
         self.assertEqual((BIN / "check-public-names").read_text().splitlines()[0], "#!/usr/bin/env python3")
 
 
-KEEP_OUT = object()   # a field a raw test record leaves out
 
 
 class LedgerBase(Base):
@@ -29432,15 +28647,6 @@ class TestGatesMissingWording(LedgerBase):
         self.assertEqual(sum(1 for ev, line in zip(self.EVALUATORS, wrong) if not line.startswith("%s verdict" % ev)), 3)
 
 
-# (plan hash, scenario hash) of five plan texts with a tester measure scenario, computed BEFORE the change to how G1 reads an unwritten claim (the checker is not touched by it): an unwritten claim and a
-# written `claim: pr` share one scenario hash because the canonical text has always filled `pr` in.
-PINNED_G1_HASHES = [
-    ("sha256:f59db1a8ea7a7a5a9a14aea40ed171467a1e44a2c22f5b7dad7ee8db9525800c", "sha256:1eb0d1ae3803c387308206baebdee4ec8f46ea649a0bc93ea21d154c9c0c2172"),
-    ("sha256:cda1cf00b68e99a39c2333618de5eb886785c7a380e9f78c4d3a8f700e441269", "sha256:1eb0d1ae3803c387308206baebdee4ec8f46ea649a0bc93ea21d154c9c0c2172"),
-    ("sha256:50a9daea80cdb6d0deb32da91d8b0b0ef938642b69c70ef6d5bb16db17146c98", "sha256:82e8896b50f5a203fa7c9f454d9f0de39a71a5f07183d9847c0b1f71e303238e"),
-    ("sha256:d5dde84d977987a17ed348cc1c2023a1456ef00b00d6b98ba412eccd8b6932a9", "sha256:1eb0d1ae3803c387308206baebdee4ec8f46ea649a0bc93ea21d154c9c0c2172"),
-    ("sha256:d2bead8ec573f01a5fb2ddc9acb39c65c9398838fb1c741d3897c2602a0eab33", "sha256:bfa5d6a9830a09f93946c6a90158edb784c7ca24778c4ece33870c9077a92e64"),
-]
 
 
 class TestG1UnwrittenClaim(LedgerBase):
@@ -32373,12 +31579,6 @@ class TestOwnerTerminal(LedgerBase):
         self.assertEqual(self.run_as("cos", "gates", "off")[0], 0)
 
 
-IMPACT_TABLE = {   # the plan's table (S10): severity -> probability -> action; H hold, 2 second review, . none
-    "Catastrophic": dict(zip(("Improbable", "Remote", "Occasional", "Probable", "Frequent"), "HHHHH")),
-    "Critical": dict(zip(("Improbable", "Remote", "Occasional", "Probable", "Frequent"), "2HHHH")),
-    "Marginal": dict(zip(("Improbable", "Remote", "Occasional", "Probable", "Frequent"), ".22HH")),
-    "Negligible": dict(zip(("Improbable", "Remote", "Occasional", "Probable", "Frequent"), "...22")),
-}
 
 
 class TestImpactFloorPure(unittest.TestCase):
@@ -32653,8 +31853,6 @@ class TestImpactFloorOwnerDecision(LedgerBase):
         self.assertNotIn("owner_decide(", source, "no second copy of the rule")
 
 
-VERBS = ["add_argument", "add_argument_group", "add_mutually_exclusive_group", "add_parser", "add_subparsers", "set_defaults"]
-FREE_KEYWORDS = ["help", "dest", "metavar", "required", "nargs", "const", "func"]   # pinned equal to the matrix by a test of the allow table
 
 
 class TestRegistrarFloor(LedgerBase):
@@ -36114,7 +35312,6 @@ def _adoption_cells():
 _adoption_cells()
 
 
-CHANGE_KINDS = ("base", "record", "matrix", "rating", "head", "none")   # (#999) what can change under a hold the daemon put on, with the head unchanged: the ONE table every row below derives from
 
 
 class TestImpactReleaseEveryPass(TestImpactRejudge):
@@ -36778,7 +35975,6 @@ for _name in list(vars(TestImpactRejudge)):   # the subclass reuses the harness,
         setattr(TestImpactReleaseEveryPass, _name, None)
 
 
-REAL_FLOOR_BRIEF = sb.floor_brief   # #1215 PC-9: the real function, for the tests that must not run on the fixture brief
 
 
 class TestImpactHold(LedgerBase):
@@ -40660,83 +39856,6 @@ class TestDecisionsConfigAndDaemon(DecisionsBase):
         self.assertEqual(self.listed(), [])
 
 
-DECISIONS_HARNESS = r"""
-import * as d from "%(url)s";
-import { mkdtempSync, writeFileSync, utimesSync, renameSync, rmSync } from "node:fs";
-import { join } from "node:path";
-
-const dir = mkdtempSync(join(%(tmp)s, "dec-"));
-const now = Date.now();
-const results = {};
-const iso = (ms) => new Date(ms).toISOString();
-const put = (body, ageMs = 0) => {
-  const temp = join(dir, "decisions.json.tmp");
-  writeFileSync(temp, typeof body === "string" ? body : JSON.stringify(body));
-  utimesSync(temp, (now - ageMs) / 1000, (now - ageMs) / 1000);
-  renameSync(temp, join(dir, "decisions.json"));
-};
-const list = [
-  { id: "#2ab", title: "Close #2? and a second deploy run?", ask: 2, agent: "platform", kind: "report", since: iso(now - 12 * 60000) },
-  { id: "platform-481", title: "permission: shell " + "x".repeat(200), ask: null, agent: "platform", kind: "permission", since: iso(now - 45000) },
-];
-
-results.unset = [d.stateDirOf({}), d.stateDirOf({ FLEET_SWITCHBOARD_STATE: "" }), d.stateDirOf({ FLEET_SWITCHBOARD_STATE: "/s" })];
-results.stateDefaults = [
-  d.stateDirOf({ XDG_STATE_HOME: "/x" }),
-  d.stateDirOf({ HOME: "/h" }),
-  d.stateDirOf({ FLEET_SWITCHBOARD_STATE: "/s", HOME: "/h" }),
-  d.stateDirOf({ XDG_STATE_HOME: "rel", HOME: "/h" }),
-  d.stateDirOf({ XDG_STATE_HOME: "rel" }),
-];
-results.noDir = d.loadSnapshot(null, now).status;
-results.missing = d.loadSnapshot(dir, now).status;
-put("{not json");
-results.garbage = d.loadSnapshot(dir, now).status;
-put({ nothing: true });
-results.wrongShape = d.loadSnapshot(dir, now).status;
-put({ decisions: list, errors: [] });
-const ok = d.loadSnapshot(dir, now);
-results.ok = { status: ok.status, n: ok.decisions.length };
-results.view = d.buildView(ok, now);
-put({ decisions: list, errors: [] }, d.STALE_MS + 1000);
-results.staleStatus = d.loadSnapshot(dir, now).status;
-results.staleView = d.buildView(d.loadSnapshot(dir, now), now);
-put({ decisions: list, errors: [] }, d.STALE_MS - 1000);
-results.edge = d.loadSnapshot(dir, now).status;
-put({ decisions: [], errors: [] });
-results.emptyView = d.buildView(d.loadSnapshot(dir, now), now);
-put({ decisions: [], errors: [{ source: "github", error: "x" }] });
-results.errorsView = d.buildView(d.loadSnapshot(dir, now), now);
-put({ decisions: [{ id: 3 }, null, { id: "#1", title: "fine", since: "nonsense" }], errors: [] });
-results.junkView = d.buildView(d.loadSnapshot(dir, now), now);
-results.ages = [0, 59, 60, 719, 3599, 3600, 3900, 7200, 86399, 86400, 259200, -5].map((s) => d.formatAge(s));
-results.wrap = {
-  words: d.wrapText("aaa bbb ccc dddd", 7),
-  long: d.wrapText("x" + "y".repeat(20) + " z", 8),
-  whole: d.wrapText("word ".repeat(60).trim(), 34),
-  capped: d.wrapText("w ".repeat(100), 4, 5),
-  empty: d.wrapText("  ", 10),
-};
-const two = (id, repo, title, ago) => ({ id, repo, title, since: iso(now - ago * 60000) });
-results.grouped = d.buildView({ status: "ok", errors: [], decisions: [
-  two("web#9", "acme/web", "newer web", 5), two("api#1", "acme/api", "api only", 3),
-  two("web#2", "acme/web", "older web " + "q".repeat(40), 50) ] }, now);
-results.groupedLines = d.viewLines(results.grouped);
-results.batchLines = d.viewLines(d.buildView({ status: "ok", errors: [], decisions: [
-  { id: "api#101", repo: "acme/api", title: "Cleanup", headline: "Cleanup of stale issues (2 rows)", since: iso(now - 7200000), tier: "cos",
-    rows: [{ text: "web#7: close it" }, { text: "web#9: close as duplicate of web#7 and also label the other issue" }] } ] }, now, 34,
-  { kind: "all", repo: null, label: "all" }));
-const cosAge = (id, mins) => ({ id, repo: "acme/api", title: id, tier: "cos", since: iso(now - mins * 60000) });
-results.overTitles = d.buildView({ status: "ok", errors: [], decisions: [cosAge("a#1", 59), cosAge("a#2", 60), cosAge("a#3", 61),
-  cosAge("a#4", 300), { id: "a#5", title: "x", tier: "cos", since: "junk" }] }, now, 34, { kind: "all", repo: null, label: "all" }).sections.map((x) => x.title);
-results.longWait = d.LONG_WAIT_SECONDS;
-results.oneLine = [d.oneLine("a\n b\t c", 20), d.oneLine("x".repeat(50), 10), d.oneLine(undefined, 5)];
-results.until = [d.msUntilStale({ status: "ok", ageMs: 100000 }), d.msUntilStale({ status: "ok", ageMs: 0 }), d.msUntilStale({ status: "stale", ageMs: 1 })];
-results.concerns = [d.concernsFile("decisions.json"), d.concernsFile("decisions.json.123.tmp"), d.concernsFile("audit.jsonl"), d.concernsFile(null), d.concernsFile(undefined)];
-results.constants = [d.STALE_MS, d.SAFETY_MS, d.STATE_ENV, d.DECISIONS_FILE, d.NOT_UPDATING, d.WRAP_MAX_LINES];
-rmSync(dir, { recursive: true });
-console.log(JSON.stringify(results));
-"""
 
 
 @unittest.skipUnless(NODE, "node is not installed: the decisions plugin tests need it (skipped, not passed)")
@@ -42994,15 +42113,6 @@ class TestStatusSaysWhenThereIsNoKey(StatusCase):
         self.assertIn("service    not installed", text)
 
 
-USE_COMMANDS = {
-    "send": ["send", "other", "hello"], "report": ["report", "done", "finished"], "launch": ["launch", "a"],
-    "handoff": ["handoff", "--issue", "1", "--brief-file", "-"], "comment": ["comment", "--issue", "1", "--body-file", "-"],
-    "remind": ["remind", "other", "1h", "later"], "decisions": ["decisions"], "intent": ["intent", "1"],
-    "bootstrap": ["bootstrap"], "notice": ["notice", "pr", "acme/api#7", "--from", "coder"],
-    "move": ["move", "1", "--to", "2", "--from", "coder"], "reassign": ["reassign", "coder", "--undo", "--from", "coder"],
-    "charter": ["charter", "set", "coder", "1", "--from", "coder"],
-    "resume": ["resume", "other"],
-}
 
 
 class TestDaemonCommand(StandInPids, Base):
@@ -43677,31 +42787,6 @@ class TestServiceTemplates(Base):
         self.assertEqual((code, slept, ran), (0, [sb.STANDBY_SECONDS], [1]))
 
 
-# Every field of the reaper's two templates: field -> what it must hold. A field added to a template needs a row.
-REAPER_PLIST_FIELDS = {
-    "Label": lambda v, ctx: v == "com.fleet-kit.cloud-reaper",
-    "ProgramArguments": lambda v, ctx: v[1:3] == ["-B", str(REPO / "cloud/launcher/cloud_worker.py")] and v[3:] == ["reap", "--loop", str(sb.REAPER_INTERVAL_SECONDS)],
-    "EnvironmentVariables": lambda v, ctx: v["HOME"] == str(Path.home()) and "/usr/bin" in v["PATH"].split(":"),
-    "RunAtLoad": lambda v, ctx: v is True,
-    "KeepAlive": lambda v, ctx: v is True,
-    "ThrottleInterval": lambda v, ctx: isinstance(v, int) and v >= 10,
-    "StandardErrorPath": lambda v, ctx: v == str(sb.state_dir_path() / "cloud-reaper-stderr.log"),
-    "StandardOutPath": lambda v, ctx: v == str(sb.state_dir_path() / "cloud-reaper-stdout.log"),
-    "ProcessType": lambda v, ctx: v == "Background",
-    "WorkingDirectory": lambda v, ctx: v == str(Path.home()),
-}
-REAPER_UNIT_FIELDS = {
-    ("Unit", "Description"): lambda v: "reaper" in v,
-    ("Service", "Type"): lambda v: v == "simple",
-    ("Service", "ExecStart"): lambda v: v.endswith("cloud/launcher/cloud_worker.py\" reap --loop %d" % sb.REAPER_INTERVAL_SECONDS),
-    ("Service", "WorkingDirectory"): lambda v: v == str(Path.home()),
-    ("Service", "Environment"): lambda v: "=" in v,
-    ("Service", "Restart"): lambda v: v == "always",
-    ("Service", "RestartSec"): lambda v: int(v) >= 10,
-    ("Service", "StandardOutput"): lambda v: v == "journal",
-    ("Service", "StandardError"): lambda v: v == "journal",
-    ("Install", "WantedBy"): lambda v: v == "default.target",
-}
 
 
 class TestCloudReaperTemplates(Base):
@@ -43797,52 +42882,6 @@ assert sorted(BAD_STATE_REASON) == sorted(BAD_TARGET_STATES)
 
 # ---- ask #982: the reaper's own installer option, and nothing else on the machine
 
-# Every step of the installer, and what the reaper-only path does with it. A step added to the installer must be
-# added here: the completeness test below fails when one has no row.
-REAPER_ONLY_STEPS = {
-    "step_config": "not called: the config file is the full install's",
-    "step_cos_orders": "not called: the standing orders file is the full install's",
-    "step_profile": "not called: the profile is the full install's",
-    "step_pieces": "not called: the profile pieces are the full install's",
-    "step_integration": "not called: herdr's integration is the full install's",
-    "step_link": "not called: the herdr plugin link is the full install's",
-    "step_cli_link": "not called: the command link is the full install's",
-    "step_service": "not called: the switchboard's own service is not installed here",
-    "step_janitor_job": "not called: the weekly disk job belongs to the full install",
-    "step_ensure": "not called: the daemon is not started here",
-    "step_installed_tree": "not called: the installed tree's record, guard scripts and hooks belong to the full install",
-    "step_reaper": "called: the reaper's own step, the one thing this path does",
-}
-# Every module-level function of bin/fleet-switchboard that the installer's steps call, and what it does. A function
-# the installer starts to call must be classified here: the completeness test fails when one has no row.
-INSTALLER_READERS = ("_one_line", "_read_json_object", "_xdg", "check_writable_target", "collect_status", "config_path",
-                     "cos_orders_path", "fault", "format_status", "herdr_integration_status", "home_link_is_ours",
-                     "home_link_path", "installed_guard_module", "load_config", "plugin_report", "private_env", "reaper_default_login_file", "reaper_file_path", "reaper_login_file", "reaper_settings_problem",
-                     "reaper_service_settings", "reaper_settings", "render_reaper", "render_service", "service_file_path",
-                     "service_kind", "service_path_dirs", "service_values", "set_file_mode", "state_dir_path",
-                     "v2_version_of", "validate_config", "weekly_job_scan")
-INSTALLER_WRITERS = ("ensure_home_link", "ensure_skills_path", "ensure_state_dir", "install_agents",
-                     "install_cos_orders_template", "install_decisions_plugin", "install_hooks_plugin", "install_skills",
-                     "install_todolist_plugin", "make_reaper_login_directory", "uninstall_agents", "uninstall_decisions_plugin", "uninstall_hooks_plugin",
-                     "uninstall_skills", "uninstall_skills_path", "uninstall_todolist_plugin", "write_if_changed")
-INSTALLER_STARTERS = ("ensure_daemon",)
-# The writers the reaper-only path may call: the reaper's own service file (through write_if_changed) and the state
-# directory it logs into. Every other writer, and the daemon, must stay untouched.
-REAPER_ONLY_WRITERS = ("ensure_state_dir", "write_if_changed")
-# The six things the reaper-only install leaves alone: the help and the quickstart must each name every one of them.
-REAPER_ONLY_LEAVE_ALONE = (r"\bconfig\b", r"profile pieces", r"command link", r"plugin link",
-                            r"switchboard'?s (own )?service", r"\bdaemon\b")
-# The files the full install writes, and the mode each one has (the umask of the run is 022): the mode argument of
-# write_if_changed is for the reaper's file alone, and every other writer keeps the mode it always had.
-INSTALLER_FILE_MODES = {
-    "xdg-config/fleet-switchboard/config.json": 0o644,
-    "xdg-data/fleet-switchboard/profile/config/opencode/agents/coder.md": 0o644,
-    "xdg-data/fleet-switchboard/profile/config/opencode/cli.json": 0o644,
-    "xdg-data/fleet-switchboard/profile/config/opencode/opencode.json": 0o644,
-    "xdg-data/fleet-switchboard/profile/config/opencode/plugins/fleet-hooks.js": 0o644,
-    "xdg-data/fleet-switchboard/skills/fleet-review/SKILL.md": 0o644,
-    "xdg-data/fleet-switchboard/bin/fleet-opencode": 0o755,
-}
 
 
 class TheReaperOnlyInstall(ReaperOnlyFakes):
@@ -45393,23 +44432,6 @@ class TestReloadInPlace(Base):
         self.assertNotIn("--standby", argv)
 
 
-EXEC_CHILD = r"""
-import importlib.machinery, importlib.util, os, sys, time
-loader = importlib.machinery.SourceFileLoader("sbx", sys.argv[1])
-spec = importlib.util.spec_from_loader("sbx", loader)
-sbx = importlib.util.module_from_spec(spec)
-loader.exec_module(sbx)
-state, phase = sys.argv[2], sys.argv[3]
-with sbx.single_instance(state):
-    if phase == "first":
-        open(os.path.join(state, "first.pid"), "w").write(str(os.getpid()))
-        sbx.reexec_in_place([sys.executable, __file__, sys.argv[1], state, "second"])
-        sys.exit(9)
-    open(os.path.join(state, "second.pid"), "w").write(str(os.getpid()))
-    deadline = time.time() + 20
-    while not os.path.exists(os.path.join(state, "stop")) and time.time() < deadline:
-        time.sleep(0.05)
-"""
 
 
 class TestTheLockSurvivesAReExec(Base):
@@ -45817,12 +44839,8 @@ class OrdersCase(IntentCase):
         return sb.parse_orders(self.gh.body(1))
 
 
-def source_orders(n=19):
-    return ["rule number %d for the lane (ordered by alice, 2026-11-%02d)" % (i, i) for i in range(1, n + 1)]
 
 
-def charter_with(orders, extra=""):
-    return ORDERS_CHARTER_BODY + "\n## Standing orders\n\n" + "".join("- %s\n" % o for o in orders) + extra
 
 
 class TestOrdersCopy(OrdersCase):
@@ -49476,47 +48494,6 @@ def test_the_view_variables_are_not_secrets_and_are_only_names_in_the_audit(self
 
 # ---- the panel in the TUI: whose view it is
 
-VIEW_HARNESS = r"""
-import * as d from "%(url)s";
-const now = Date.now();
-const iso = (ms) => new Date(ms).toISOString();
-const list = [
-  { id: "a", title: "cos one", repo: "acme/api", tier: "cos", since: iso(now - 60000) },
-  { id: "b", title: "orch one", repo: "acme/api", tier: "orchestrator", since: iso(now - 60000) },
-  { id: "c", title: "web cos", repo: "acme/web", tier: "cos", since: iso(now - 60000) },
-  { id: "d", title: "yours", repo: "acme/web", tier: "human", since: iso(now - 60000) },
-  { id: "e", title: "old file, no tier", repo: null, since: iso(now - 60000) },
-];
-const snap = (decisions, errors = []) => ({ status: "ok", decisions, errors, ageMs: 0 });
-const ids = (view) => d.selectFor(list, view).map((x) => x.id).join("");
-const results = {
-  cos: d.viewOf({ FLEET_SWITCHBOARD_ROLE: "chief-of-staff" }),
-  cosWithRepo: d.viewOf({ FLEET_SWITCHBOARD_ROLE: "chief-of-staff", FLEET_SWITCHBOARD_REPO: "acme/api" }),
-  orch: d.viewOf({ FLEET_SWITCHBOARD_ROLE: "orchestrator", FLEET_SWITCHBOARD_REPO: "acme/api" }),
-  coderWithRepo: d.viewOf({ FLEET_SWITCHBOARD_ROLE: "coder", FLEET_SWITCHBOARD_REPO: " acme/web " }),
-  orchNoRepo: d.viewOf({ FLEET_SWITCHBOARD_ROLE: "orchestrator" }),
-  plain: d.viewOf({}),
-  nothing: [d.viewOf(undefined), d.viewOf(null), d.viewOf({ FLEET_SWITCHBOARD_REPO: "" })],
-  picked: { cos: ids(d.viewOf({ FLEET_SWITCHBOARD_ROLE: "chief-of-staff" })), orch: ids(d.viewOf({ FLEET_SWITCHBOARD_REPO: "acme/api" })),
-            web: ids(d.viewOf({ FLEET_SWITCHBOARD_REPO: "acme/web" })), plain: ids(d.viewOf({})) },
-  titles: [
-    d.buildView(snap(list), now, 34, d.viewOf({ FLEET_SWITCHBOARD_ROLE: "chief-of-staff" })).title,
-    d.buildView(snap(list), now, 34, d.viewOf({ FLEET_SWITCHBOARD_REPO: "acme/api" })).title,
-    d.buildView(snap(list), now, 34, d.viewOf({})).title,
-    d.buildView(snap(list), now).title,
-  ],
-  empty: d.buildView(snap(list.slice(0, 3)), now, 34, d.viewOf({})),
-  emptyRepo: d.buildView(snap([]), now, 34, d.viewOf({ FLEET_SWITCHBOARD_REPO: "acme/api" })),
-  stale: d.buildView({ status: "stale", decisions: list, errors: [], ageMs: 999999 }, now, 34, d.viewOf({ FLEET_SWITCHBOARD_ROLE: "chief-of-staff" })),
-  unset: d.buildView({ status: "unset", decisions: [], errors: [], ageMs: null }, now, 34, d.viewOf({})),
-  errors: d.buildView(snap(list, [{ source: "github", error: "x" }]), now, 34, d.viewOf({})).rows.map((r) => r.key),
-  envNames: [d.ROLE_ENV, d.REPO_ENV],
-  cosGroups: d.buildView(snap(list), now, 34, d.viewOf({ FLEET_SWITCHBOARD_ROLE: "chief-of-staff" })).groups.map((g) => [g.repo, g.entries.map((e) => e.key)]),
-  orchGroups: d.buildView(snap(list), now, 34, d.viewOf({ FLEET_SWITCHBOARD_REPO: "acme/api" })).groups.map((g) => [g.repo, g.entries.map((e) => e.key)]),
-  humanGroups: d.buildView(snap(list), now, 34, d.viewOf({})).groups.map((g) => [g.repo, g.entries.map((e) => e.key)]),
-};
-console.log(JSON.stringify(results));
-"""
 
 
 @unittest.skipUnless(NODE, "node is not installed: the decisions plugin tests need it (skipped, not passed)")
@@ -49572,35 +48549,6 @@ class TestDecisionsPanelViews(Base):
         self.assertIn("FLEET_SWITCHBOARD_ROLE", text)
 
 
-LAYOUT_HARNESS = r"""
-import * as d from "%(url)s";
-const now = Date.now();
-const iso = (ms) => new Date(ms).toISOString();
-const mk = (id, repo, tier, headline, mins, extra = {}) =>
-  ({ id, repo, tier, title: "RAW " + headline, headline, since: iso(now - mins * 60000), ...extra });
-const list = [
-  mk("web#5", "acme/web", "cos", "web cos question", 40),
-  mk("api#2", "acme/api", "human", "api for you " + "long ".repeat(30), 90),
-  mk("web#7", "acme/web", "human", "web for you", 10, { reported_by: ["coder"] }),
-  mk("web#8", "acme/web", "human", "second for you", 5),
-  mk("site#1", "acme/site", "orchestrator", "orch one", 3),
-  { id: "old#1", repo: "acme/old", title: "only a title", since: iso(now - 60000) },
-];
-const snap = { status: "ok", decisions: list, errors: [], ageMs: 0 };
-const cos = d.buildView(snap, now, 34, d.viewOf({ FLEET_SWITCHBOARD_ROLE: "chief-of-staff" }));
-const human = d.buildView(snap, now, 34, d.viewOf({}));
-console.log(JSON.stringify({
-  cosTitles: cos.sections.map((s) => s.title),
-  cosKeys: cos.sections.map((s) => s.groups.map((g) => [g.repo, g.entries.map((e) => e.key)])),
-  humanTitles: human.sections.map((s) => s.title),
-  humanKeys: human.sections.map((s) => s.groups.map((g) => [g.repo, g.entries.map((e) => e.key)])),
-  lines: d.viewLines(cos),
-  humanLines: d.viewLines(human),
-  entry: d.entryOf(list[1], now),
-  via: d.entryOf(list[2], now).head,
-  noHeadline: d.entryOf(list[5], now),
-}));
-"""
 
 
 @unittest.skipUnless(NODE, "node is not installed: the decisions plugin tests need it (skipped, not passed)")
@@ -51440,35 +50388,6 @@ class TestPrNotices(DecisionsBase):
         self.assertEqual(sorted(d["id"] for d in self.notices()), ["pr:acme/api#7", "pr:other/api#8"])
 
 
-NOTICE_HARNESS = r"""
-import * as d from "%(url)s";
-const now = Date.parse("2026-03-04T12:00:00Z");
-const iso = (ms) => new Date(ms).toISOString();
-const mk = (id, repo, tier, headline, mins, extra = {}) =>
-  ({ id, repo, tier, kind: "issue", title: "RAW " + headline, headline, since: iso(now - mins * 60000), ...extra });
-const note = (id, repo, headline, mins, extra = {}) =>
-  ({ id, repo, tier: "human", kind: "notice", title: headline, headline, since: iso(now - mins * 60000), state: "open",
-     additions: 120, deletions: 14, files: 5, ci: "green", review: "approved", stale: false, merge_after: null, ...extra });
-const list = [
-  mk("web#5", "acme/web", "cos", "web cos question", 40),
-  mk("api#2", "acme/api", "human", "api needs your decision", 90),
-  note("pr:web#9", "acme/web", "web#9 Add the retry budget to the client", 12, { ci: "failing", review: "none" }),
-  note("pr:api#12", "acme/api", "api#12 Parser rewrite " + "long ".repeat(30), 3, { merge_after: "2026-03-04T12:10:00Z" }),
-  note("pr:api#11", "acme/api", "api#11 Docs", 30, { files: 1, ci: "pending", review: "changes requested", stale: true }),
-];
-const snap = { status: "ok", decisions: list, errors: [], ageMs: 0 };
-const cos = d.buildView(snap, now, 34, d.viewOf({ FLEET_SWITCHBOARD_ROLE: "chief-of-staff" }));
-const human = d.buildView(snap, now, 34, d.viewOf({}));
-const repo = d.buildView(snap, now, 34, d.viewOf({ FLEET_SWITCHBOARD_REPO: "acme/web" }));
-const onlyNotice = d.buildView({ status: "ok", decisions: [list[2]], errors: [], ageMs: 0 }, now, 34, d.viewOf({}));
-const keys = (v) => v.sections.map((s) => [s.title, s.groups.map((g) => [g.repo, g.entries.map((e) => e.key)])]);
-console.log(JSON.stringify({
-  cosTitle: cos.title, humanTitle: human.title, cos: keys(cos), human: keys(human), repo: keys(repo), repoTitle: repo.title,
-  onlyNotice: d.viewLines(onlyNotice), humanLines: d.viewLines(human), cosLines: d.viewLines(cos),
-  entries: Object.fromEntries(human.sections[1].groups.flatMap((g) => g.entries.map((e) => [e.key, e]))),
-  noFacts: d.entryOf(note("pr:x#1", "a/x", "x#1 T", 1, { additions: null, deletions: null, files: null, ci: null, review: null }), now),
-}));
-"""
 
 
 @unittest.skipUnless(NODE, "node is not installed: the decisions plugin tests need it (skipped, not passed)")
@@ -51680,52 +50599,16 @@ _tiers_extend_offline_run()
 BASELINE_NODE_PRESENT = bool(NODE)
 
 
-def baseline_assign_ids(items, repos=None):
-    """ADAPTER: ids for items {seed, ask, agent, bare, since, repo}, in order (today sb.assign_decision_ids)."""
-    return sb.assign_decision_ids(items, repos)
 
 
-def baseline_headline(kind, title, issue_title=None):
-    """ADAPTER: the headline of one decision of `kind` and `title`, for a report about an issue titled
-    `issue_title` when known (today sb.headline_of)."""
-    return sb.headline_of({"kind": kind, "title": title}, issue_title)
 
 
-def baseline_attach_hub(engine, runner, now):
-    """ADAPTER: give a daemon-style engine the GitHub picture the daemon's hub would hold, as `decisions --fresh`
-    does for its own engine (today a GitHubHub filled by read_awaiting)."""
-    hub = sb.GitHubHub(engine.config, engine.state_dir, None, runner, sb.spawn_forwarder, now, "cli")
-    hub.engine, engine.hub = engine, hub
-    engine.gh_runner = runner  # the notices' `gh pr view` reads
-    for repo in sb.decision_repos(engine):
-        hub.read_awaiting(repo, now())
 
 
-@contextlib.contextmanager
-def baseline_unreadable_inbox(session_id, failure):
-    """ADAPTER: the inbox of one session cannot be read (today V2Client.inbox_list raises)."""
-    real = sb.V2Client.inbox_list
-
-    def read(self, sid, *args, **kwargs):
-        if sid == session_id:
-            raise RuntimeError("inbox read failed") if failure == "RuntimeError" else sb.V2Error("v2 says 500")
-        return real(self, sid, *args, **kwargs)
-
-    with mock.patch.object(sb.V2Client, "inbox_list", read):
-        yield
 
 
-def baseline_failing_derivation():
-    """ADAPTER: the whole derivation raises (today sb.derive_decisions)."""
-    return mock.patch.object(sb, "derive_decisions", side_effect=RuntimeError("boom"))
 
 
-def baseline_derive(engine, now):
-    """ADAPTER: what the derivation lists now and what it could not read, notices included: (decisions, errors)
-    (today sb.derive_decisions, after a discovery and a fact collection)."""
-    engine.discover(now())
-    engine.collect_facts()
-    return sb.derive_decisions(engine, now())
 
 
 class BaselineWorld(WriteWorld):
@@ -53126,28 +52009,6 @@ console.log(JSON.stringify(out));
         baseline_golden(self, "plugin-views-styled", got)
 
 
-CAPTAIN_ROW_HARNESS = r"""
-import * as d from "%(url)s";
-const now = Date.parse("2026-01-10T12:00:00Z");
-const iso = (secs) => new Date(now - secs * 1000).toISOString();
-const issue = { id: "#41", kind: "issue", tier: "human", ask: 41, repo: "acme-org/widget-host", title: "Which database?", headline: "Which database?", since: iso(86400) };
-const captain = (extra = {}) => ({ id: "pr:acme-org/widget-host#132", kind: "captain", tier: "human", ask: null, repo: "acme-org/widget-host",
-  number: 132, title: "Fix the wake text", headline: "widget-host#132 Fix the wake text", since: iso(86400), ci: "green", review: "approved", ...extra });
-const snap = (decisions) => ({ status: "ok", decisions, errors: [] });
-const view = { kind: "human" };
-const out = {};
-const show = (list, opts) => { const rows = d.styledRows(snap(list), now, 34, view, opts); return { text: d.styledText(rows, 34), links: rows.filter((r) => r.url).map((r) => r.url), ids: rows.filter((r) => r.id).map((r) => r.id) }; };
-out.plain = show([issue, captain()]);
-out.v3 = show([issue, captain()], { v3: true });
-out.entry = d.buildView(snap([issue, captain()]), now, 34, view).groups.flatMap((g) => g.entries.map((e) => [e.head, e.url || null]));
-out.urls = [captain(), captain({ number: "0" }), captain({ number: -3 }), captain({ number: 1.5 }), captain({ repo: "bad repo" }),
-  captain({ repo: "../x" }), captain({ repo: "a/b?q=1" }), captain({ number: "12; rm" }), captain({ number: null })].map((x) => d.urlOf(x));
-out.safe = [d.safeUrl(d.urlOf(captain())), d.safeUrl("https://github.com/acme-org/widget-host/pull/132?x=1")];
-out.idOf = [d.idOf(captain()), d.idOf(captain(), () => true), d.idOf(captain({ repo: "bad repo" })), d.idOf(captain({ number: null })), d.idOf(issue),
-  d.idOf({ id: "pr:o/r#7", kind: "notice", repo: "o/r", number: 7 })];
-out.title = d.styledText(d.styledRows(snap([captain({ headline: "x\u001b]8;;http://evil\u0007y" })]), now, 34, view), 34).join("|");
-console.log(JSON.stringify(out));
-"""
 
 
 @unittest.skipUnless(NODE, "node is not installed: the decisions plugin tests need it (skipped, not passed)")
@@ -53196,94 +52057,6 @@ class TestPanelCaptainRows(Base):
         self.assertNotIn("\u0007", self.r["title"])
 
 
-STYLED_UNIT_HARNESS = r"""
-import * as d from "%(url)s";
-const now = Date.parse("2026-10-08T12:00:00Z");
-const iso = (secs) => new Date(now - secs * 1000).toISOString();
-const mk = (id, repo, tier, headline, secs, extra = {}) => ({ id, repo, tier, title: "RAW " + headline, headline, since: iso(secs), ask: 1, ...extra });
-const snap = (decisions, errors = []) => ({ status: "ok", decisions, errors, ageMs: 0 });
-const chief = d.viewOf({ [d.ROLE_ENV]: "chief-of-staff" });
-const human = d.viewOf({});
-const rows = (decisions, view, errors) => d.styledRows(snap(decisions, errors), now, 34, view);
-const text = (decisions, view, errors) => d.styledText(rows(decisions, view, errors), 34);
-const pr = (number, repo, secs, extra = {}) => ({ id: "pr:" + repo + "#" + number, kind: "notice", tier: "human", repo, number, title: "x",
-  headline: repo + "#" + number + " Add a thing", since: iso(secs), ci: "green", review: "approved", additions: 1, deletions: 2, files: 3, ...extra });
-const textOf = (l) => l.segs.map((s) => s[0]).join("") + (l.right ? "|" + l.right.map((s) => s[0]).join("") : "");
-const r = {};
-r.mode = [d.panelModeOf({}), d.panelModeOf({ [d.PANEL_ENV]: "plain" }), d.panelModeOf({ [d.PANEL_ENV]: " PLAIN " }), d.panelModeOf({ [d.PANEL_ENV]: "styled" }), d.panelModeOf({ [d.PANEL_ENV]: "c" }), d.panelModeOf(null)];
-r.env = d.PANEL_ENV;
-// the layout
-const mix = [mk("a#1", "o/a", "human", "Which database?", 600), mk("a#2", "o/a", "human", "Pick a cache", 1200), mk("b#1", "o/b", "cos", "c1", 3601),
-  mk("b#2", "o/b", "cos", "c2", 100), mk("b#3", "o/b", "cos", "c3", 90000), pr(5, "o/a", 100), pr(6, "o/a", 4000, { ci: "failing", review: "none" }),
-  pr(7, "o/c", 90000, { ci: "pending", review: "none", additions: 900, deletions: 100 })];
-r.chief = text(mix, chief);
-r.human = text(mix, human);
-r.none = text([], human);
-r.onlyCos = text([mk("c#1", "o/c", "cos", "q", 100)], human);
-r.onlyPr = text([pr(5, "o/a", 100)], human);
-r.stale = d.styledText(d.styledRows({ status: "stale", decisions: [], errors: [] }, now));
-r.errors = text([], human, [{ source: "x" }]).slice(-1);
-// ages: muted, error-tinted... from a day
-r.tint = [0, 59, 3599, 3600, 86399, 86400, 999999].map((s) => d.ageStyle(s));
-r.tintConst = [d.AGE_WARN_SECONDS, d.AGE_ERROR_SECONDS];
-const lineWith = (decisions, view, pick) => rows(decisions, view).find(pick);
-r.ageSegs = [30, 3599, 86399, 86400].map((s) => lineWith([mk("web#1", "o/web", "human", "x", s)], human, (l) => l.id === "web#1").right);
-r.ageLine = textOf(lineWith([mk("web#1", "o/web", "human", "x", 300)], human, (l) => l.id === "web#1"));
-// PR number coloured by state; the real id is kept on the line
-const prLine = (extra) => lineWith([pr(5, "o/a", 100, extra)], human, (l) => l.id);
-r.prState = [{ ci: "failing", review: "none" }, { ci: "green", review: "approved" }, { ci: "green", review: "none" }, { ci: "pending", review: "none" }].map((e) => prLine(e).segs.map((s) => [s[0].split(" ")[0], s[1]])[1]);
-r.prId = [prLine({}).id, textOf(prLine({}))];
-// a decision that needs you: two lines, bold headline, id muted
-r.need = rows([mk("a#1", "o/a", "human", "Which database?", 600)], human).slice(-3).map((l) => [textOf(l), l.segs.map((s) => s[1])]);
-// ambiguity and refs
-const clash = [mk("web#1", "acme/web", "human", "see acme/web#9 and other/web#4 and web#3", 60), mk("web#2", "other/web", "human", "x", 60)];
-r.clash = text(clash, human);
-r.tidy = [d.tidyRefs("fix acme/web#9, api#4.", "acme/api", d.repoAmbiguity([{ repo: "acme/web" }, { repo: "acme/api" }])), d.shortRepo("acme/web"), String(d.repoAmbiguity([{ repo: "a/web" }, { repo: "b/web" }]).ambiguous("a/web"))];
-// theme
-const theme = { text: { muted: "M", feedback: { warning: { base: "W" }, error: { base: "E" }, success: { base: "S" }, info: { base: "I" } } } };
-r.theme = [d.themeColors(theme), d.themeColors(undefined), d.themeColors({}), d.themeColors({ get text() { throw new Error("boom"); } })];
-// the plain view is untouched, same order of decisions
-r.plainFirst = d.viewLines(d.buildView(snap(mix), now, 34, chief)).slice(0, 3);
-// links and control characters
-const linked = rows([mk("web#1", "acme/web", "human", "Q?", 60, { ask: 12 }), pr(5, "acme/web", 60), mk("x#1", "bad repo", "human", "H", 60, { ask: 3 })], human);
-r.links = linked.filter((l) => l.url).map((l) => [textOf(l), l.url, !!l.id]);
-r.noLink = linked.filter((l) => !l.url).map((l) => textOf(l)).filter((t) => /bad repo|^\u2754 H$/.test(t));
-const esc = rows([mk("e#1", "acme/e", "human", "bad\u001b]8;;http://x\u0007title", 60, { ask: 1, rows: [{ text: "r\u001b[31mow" }] })], human);
-r.ctrl = esc.map((l) => textOf(l)).filter((t) => /title|31m/.test(t));
-// iteration 3
-const v3 = (list, view) => d.styledRows(snap(list), now, 34, view, { v3: true });
-r.v3 = {
-  hue: [d.projectHue("acme/web"), d.projectHue("acme/web"), d.projectHue("acme/api"), d.projectHue("")],
-  hues: [...new Set(["a/1", "b/2", "c/3", "d/4", "e/5", "f/6", "g/7", "h/8"].map((x) => d.projectHue(x)))].sort(),
-  glyphs: Object.entries(d.GLYPH).map(([k, g]) => [k, [...g].length, g.codePointAt(0) < 0x10000 && g.length === 1]),
-  chief: d.styledText(v3(mix, chief), 34),
-  styles: v3(mix, human).filter((l) => l.id || /^(a|c)$/.test(textOf(l))).map((l) => [textOf(l), l.segs.map((s) => s[1]), (l.right || []).map((s) => s[1])]),
-  size: v3([pr(5, "o/a", 100, { additions: 900, deletions: 100 })], human).slice(-2).map((l) => [textOf(l), l.segs.map((s) => s[1])]),
-  gap: v3(mix, human).slice(2, 6).map((l) => textOf(l)),
-  plainC: d.styledText(d.styledRows(snap(mix), now, 34, chief), 34).join("\n") === r.chief.join("\n"),
-  theme: d.themeColors({ syntax: { keyword: "K", function: "F", operator: "O", type: "T" }, diff: { text: { added: "A", removed: "R" } } }),
-  themeNone: d.themeColors({ syntax: {} }),
-};
-// search links and kind marks
-const env = { USER: "tester" };
-const withEnv = (list, view) => d.styledRows(snap(list), now, 34, view, { v3: true, env });
-const cosList = [mk("a#1", "acme/a", "cos", "q1", 100, { kind: "issue" }), mk("a#2", "acme/a", "cos", "q2", 100, { kind: "issue" }), mk("a#3r", "acme/a", "cos", "r", 100, { kind: "report" }),
-  mk("b#9r", "acme/b", "cos", "only a report", 100, { kind: "report" }), mk("c#1", "other/c", "cos", "q", 100, { kind: "issue" }), pr(5, "acme/a", 10), pr(6, "other/c", 10)];
-const sumRows = withEnv(cosList, chief).slice(1, 3);
-r.links2 = {
-  prs: d.searchUrl("pr", ["acme/a"]), prsMany: d.searchUrl("pr", ["other/c", "acme/a", "acme/a"]),
-  cos: d.searchUrl("label", ["acme/a"], "tester:awaiting-cos"), cosMany: d.searchUrl("label", ["acme/a", "other/c"], "tester:awaiting-user"),
-  hostile: [d.searchUrl("label", ["acme/a"], 'x" repo:evil/z'), d.searchUrl("label", ["acme/a"], "a:awaiting-cos&x=1"), d.searchUrl("pr", ["a b/c"]), d.searchUrl("pr", ["../x"]), d.searchUrl("pr", []), d.searchUrl("pr", [5, null, {}])],
-  safe: [d.safeUrl("https://github.com/a/b/issues?q=is%%3Aopen"), d.safeUrl("https://github.com/a/b/issues?q=x&y=1"), d.safeUrl("https://github.com/a/b/issues?q=x\u001b"), d.safeUrl("https://github.com/search?q=x%%2By&type=issues"),
-    d.safeUrl("https://github.com/search?q=x&type=code"), d.safeUrl("https://evil.com/a/b/issues?q=x"), d.safeUrl("https://github.com/a/b/pulls?q=x y"), d.safeUrl("https://github.com/a/b/pulls?q=x#h")],
-  user: [d.labelUserOf({ USER: "tester" }), d.labelUserOf({ LOGNAME: "x.y" }), d.labelUserOf({ USER: "a b" }), d.labelUserOf({ USER: "x:y" }), d.labelUserOf({}), d.labelUserOf(null)],
-  summary: sumRows.flatMap((l) => l.segs).map((x) => [x[0], x[2] ?? null]),
-  fold: withEnv(cosList, chief).filter((l) => l.right && /oldest/.test(textOf(l))).map((l) => [textOf(l), l.segs[0][2] ?? null]),
-  noEnv: d.styledRows(snap(cosList), now, 34, chief, { v3: true }).slice(1, 3).flatMap((l) => l.segs).map((x) => x[2] ?? null),
-  marks: [{ kind: "issue" }, { kind: "question" }, { kind: "report" }, { kind: "permission" }, {}].map((e) => d.kindGlyph(e)).concat([d.GLYPH.pr]),
-};
-console.log(JSON.stringify(r));
-"""
 
 
 @unittest.skipUnless(NODE, "node is not installed: the decisions plugin tests need it (skipped, not passed)")
@@ -54729,44 +53502,6 @@ class TestSettledOutside(ExternalWorld):
             self.assertFalse(getattr(cls, "settled_outside", False), cls.__name__)
 
 
-LINK_HARNESS = r"""
-import * as d from "%(url)s";
-const now = Date.parse("2026-03-04T12:00:00Z");
-const iso = (ms) => new Date(ms).toISOString();
-const dec = (id, extra) => ({ id, tier: "human", kind: "issue", title: "t " + id, headline: "t " + id, since: iso(now - 60000), ...extra });
-const list = [
-  dec("web#5", { repo: "acme/web", ask: 5 }),
-  dec("rep#6", { repo: "acme/web", ask: "6", kind: "report" }),
-  dec("batch#7", { repo: "acme/api", ask: 7, rows: [{ text: "a: b" }] }),
-  dec("pr:web#9", { repo: "acme/web", kind: "notice", number: 9, state: "open" }),
-  dec("untagged", { kind: "report" }),
-  dec("norepo", { ask: 3 }),
-  dec("nonum", { repo: "acme/web", ask: null }),
-  dec("nonumnotice", { repo: "acme/web", kind: "notice" }),
-];
-const bad = ["acme/web/../x", "../web", "a b/c", "acme/web\x1b", "acme/web#1", "/web", "acme/", "acme//web", "https://evil/x", "acme/web?q=1", ".", "a/.."];
-const evil = "\x1b]8;;https://evil.example\x07click\x1b]8;;\x07 \x9b31m \x1b\\";
-const snap = { status: "ok", decisions: list, errors: [], ageMs: 0 };
-const view = d.buildView(snap, now, 34, d.viewOf({ FLEET_SWITCHBOARD_ROLE: "chief-of-staff" }));
-const plain = d.viewLines(view);
-const entries = view.sections.flatMap((s) => s.groups.flatMap((g) => g.entries));
-const withEvilTitle = d.entryOf(dec("web#5", { repo: "acme/web", ask: 5, title: evil, headline: evil }), now);
-console.log(JSON.stringify({
-  urls: Object.fromEntries(list.map((x) => [x.id, d.urlOf(x)])),
-  badRepos: bad.map((r) => d.urlOf({ id: "x", repo: r, ask: 1, title: "t" })),
-  badNumbers: [0, -1, 1.5, "1x", "01", "", null, undefined, "1 ", 1e12, [1], { n: 1 }].map((n) => d.urlOf({ id: "x", repo: "acme/web", ask: n, title: "t" })),
-  badNoticeNumbers: [0, "9/../x", null].map((n) => d.urlOf({ id: "x", repo: "acme/web", kind: "notice", number: n, title: "t" })),
-  entryUrls: Object.fromEntries(entries.map((e) => [e.key, "url" in e ? e.url : "ABSENT"])),
-  plain,
-  stripped: d.stripControls(evil),
-  safe: [d.safeUrl("https://github.com/acme/web/issues/5"), d.safeUrl("https://github.com/acme/web/pull/9"),
-         d.safeUrl("https://github.com/acme/web/issues/5\x07"), d.safeUrl("https://github.com/acme/web/issues/5\x1b]8;;"),
-         d.safeUrl("http://github.com/acme/web/issues/5"), d.safeUrl("https://evil.example/acme/web/issues/5"),
-         d.safeUrl("https://github.com/acme/web/issues/5 "), d.safeUrl(null), d.safeUrl(5)],
-  evilEntry: withEvilTitle,
-  widths: plain.map((l) => l.length),
-}));
-"""
 
 
 @unittest.skipUnless(NODE, "node is not installed: the decisions plugin tests need it (skipped, not passed)")
@@ -56257,27 +54992,6 @@ class TestJobFacts(StandInPids, unittest.TestCase):
             self.assertIn("job status", (REPO / rel).read_text(), rel)
 
 
-ORDER_PANEL_HARNESS = r"""
-import * as d from "%(url)s";
-const nowMs = Date.parse("2027-01-02T00:00:00Z");
-const entry = (id, n, more = {}) => ({ id, kind: "issue", repo: "acme/api", ask: n, agent: "coder", since: "2027-01-01T0" + n + ":00:00Z", tier: "human", title: "Item " + n, headline: "Item " + n, ...more });
-const snap = (decisions) => ({ status: "ok", errors: [], decisions, ageMs: 0 });
-const plainList = [entry("#1", 1), entry("#2", 2)];
-const ordered = [entry("#1", 1, { waits_for: ["acme/api#2"], order: 1, depth: 1, blocked_by: "#2" }), entry("#2", 2, { order: 0, depth: 0, mark: "next" }),
-                 entry("#3", 3, { order: 2, depth: 0 })];
-const cyc = [entry("#1", 1, { waits_for: ["acme/api#2"], order: 0, depth: 0, mark: "cycle" }), entry("#2", 2, { waits_for: ["acme/api#1"], order: 1, depth: 0, mark: "cycle" })];
-const text = (list, v3) => d.styledText(d.styledRows(snap(list), nowMs, 34, d.HUMAN_VIEW, { v3, env: {} }), 34);
-console.log(JSON.stringify({
-  plain: d.viewLines(d.buildView(snap(ordered), nowMs)),
-  styled: text(ordered, true),
-  styledV2: text(ordered, false),
-  cycle: text(cyc, true),
-  noOrderPlain: d.viewLines(d.buildView(snap(plainList), nowMs)),
-  noOrderStyled: text(plainList, true),
-  notes: [d.orderNote({ mark: "next" }), d.orderNote({ mark: "cycle" }), d.orderNote({ blocked_by: "#2" }), d.orderNote({}), d.depthOf({ depth: 9 }), d.depthOf({ depth: "x" }), d.depthOf({})],
-  hostile: d.orderNote({ blocked_by: "#2\u001b[31m" }),
-}));
-"""
 
 
 @unittest.skipUnless(NODE, "node is not installed: the decisions plugin tests need it (skipped, not passed)")
@@ -57045,8 +55759,6 @@ class TestWriteOnlyOnChange(Base):
         self.assertTrue(self.rewritten(path))
 
 
-def hex_id(name):
-    return hashlib.sha256(name.encode()).hexdigest()
 
 
 class FakeDocker:
@@ -60799,8 +59511,6 @@ class TestCpuGuard(Base):
         self.assertNotIn("\x1b", self.cg.detail(cats))
 
 
-_CG = sb.load_cpu_guard()
-ORIGINAL_MEMORY_READING, ORIGINAL_PROCESS_TABLE = _CG.memory_reading, _CG.process_table   # the real readers, kept before a test patches them
 
 
 class TestCpuConsumersAndMemory(Base):
@@ -61410,23 +60120,6 @@ class TestDiskGuard(Base):
         self.assertIn("not installed", text)
 
 
-def light_guard_sites():
-    """Every READ of `engine.light` in bin/fleet-switchboard, derived from the code: (qualified function, ordinal in it) -> (first line, last line)."""
-    tree, found, counts = ast.parse(switchboard_source()), {}, collections.Counter()
-
-    def walk(node, stack):
-        for child in ast.iter_child_nodes(node):
-            inner = stack + [child.name] if isinstance(child, (ast.FunctionDef, ast.ClassDef)) else stack
-            asked = isinstance(child, ast.Attribute) and child.attr == "light" and isinstance(child.ctx, ast.Load)
-            asked = asked or (isinstance(child, ast.Call) and isinstance(child.func, ast.Name) and child.func.id == "getattr" and len(child.args) >= 2
-                              and isinstance(child.args[1], ast.Constant) and child.args[1].value == "light")
-            if asked:
-                owner = ".".join(stack)
-                counts[owner] += 1
-                found[(owner, counts[owner])] = (child.lineno, child.end_lineno)
-            walk(child, inner)
-    walk(tree, [])
-    return found
 
 
 class TestV2LightGuards(Base):
@@ -62004,27 +60697,10 @@ class TestV2ReadCorrectness(Base):
         self.assertIn("ses_200", engine._delivered)
 
 
-STRUCTURAL_RULE = ("When a function decides from text (an error message, a substring, a pattern, a name list), the first-round finding asks for an allow-list, "
-                   "a structured field or exact equality, and for a completeness test derived from the code, with one mutant per member, so the class is closed in one "
-                   "round and not found one instance at a time.")
 
 
-def structural_rule_homes(root):
-    """Every file that must carry STRUCTURAL_RULE, derived from the tree: each reviewer definition found in the directory (no count), the review skill, the rule's own page in the review laws' documentation."""
-    root = Path(root)
-    return sorted((root / "agents" / "reviewers").glob("*.md")) + [root / "skills" / "fleet-review" / "SKILL.md", root / "docs" / "review-laws" / "structural-rule.md"]
 
 
-def structural_rule_problems(root):
-    """[(file name, why)] for every home that does not hold the sentence exactly once, or holds a second near copy of it."""
-    out = []
-    for path in structural_rule_homes(root):
-        text = " ".join(path.read_text().split())
-        if text.count(STRUCTURAL_RULE) != 1:
-            out.append((path.name, "the shared sentence appears %d times, not once" % text.count(STRUCTURAL_RULE)))
-        elif text.count("decides from text") != 1:
-            out.append((path.name, "a second wording of the rule"))
-    return out
 
 
 class TestStructuralRuleInReviewing(unittest.TestCase):
@@ -63768,7 +62444,6 @@ class TestReviewerSubagents(LedgerBase):
         for needle in ("review laws", "review record", "reviewer-code", "reviewer-impact", "shadow"):
             self.assertIn(needle, text)
 
-plan_review = _load("t_plan_review", BIN / "plan_review.py")
 
 
 class TestReviewCheckout(LedgerBase):
@@ -67278,24 +65953,6 @@ class TestLoadAlert(Base):
         self.assertEqual((self.state_dir / "load.json").stat().st_mtime_ns, before)
 
 
-def watch_parent(getppid=os.getppid, exit_fn=os._exit, pause=time.sleep, every=2.0, rounds=None):
-    """A daemon thread that ends this run (status 143) when its parent process is gone (the parent id changes, to 1 or to a subreaper), so no run outlives the shell
-    that started it. Returns the thread, or None when the parent was already init (a container's pid 1: nothing to compare with). `rounds` bounds the loop (tests)."""
-    start = getppid()
-    if start == 1:
-        return None
-
-    def watch():
-        left = rounds
-        while left is None or left > 0:
-            if getppid() != start:
-                exit_fn(143)
-                return
-            pause(every)
-            left = None if left is None else left - 1
-    thread = threading.Thread(target=watch, daemon=True)
-    thread.start()
-    return thread
 
 
 # The architecture test lives beside the support files (docs/architecture.md, ask #1092): the suite runs it with the rest. Imported by name through
@@ -67324,19 +65981,29 @@ RelayLoopCadence, TwoLoopsTrace, TrickleHub, HubFilesUnchanged, OneWorkerAndCanc
 _size_ceilings = importlib.import_module("test_size_ceilings")
 TestTheCheck, TestSizeMutants, TestTheMergeGate, TestSizeDocumentation = _size_ceilings.TestTheCheck, _size_ceilings.TestMutants, _size_ceilings.TestTheMergeGate, _size_ceilings.TestDocumentation
 TestEveryTestFileIsWired, TestWiredCheckPlanted, TestMutantIsCaught = (_wm := importlib.import_module("test_wired_tests")).TestEveryTestFileIsWired, _wm.TestWiredCheckPlanted, _wm.TestMutantIsCaught
+# The counting tool of the test split (S13a of #1092).
+_count_movable = importlib.import_module("test_count_movable")
+TestCountMovable = _count_movable.TestCountMovable
+# The guard of unused imports in the support modules (#1806).
+_support_imports = importlib.import_module("test_support_imports")
+TestFakeSupportModule, TestSupportImportsMutant, TestSupportImportsScratch, TestSupportImportsReal, TestSupportImportsNested, TestSupportImportsDuplicates = _support_imports.TestFakeModule, _support_imports.TestMutant, _support_imports.TestScratchDirectory, _support_imports.TestRealDirectory, _support_imports.TestNestedImports, _support_imports.TestDuplicateBindings
 
 # The census of process kinds (#1501).
 _census = importlib.import_module("test_github_census")
 TestSamples, TestCensus, TestMutants, TestCensusDocumentation = _census.TestSamples, _census.TestCensus, _census.TestMutants, _census.TestDocumentation
+TestMacosReader = _census.TestMacosReader   # #1847
 TestNewModuleDemands = importlib.import_module("test_new_module_demands").TestNewModuleDemands
 # The bin-set table test (#1457).
 _bin_set_table = importlib.import_module("test_bin_set_table")
 TestTheBinSetClassesAreAllInTheTable = _bin_set_table.TestTheBinSetClassesAreAllInTheTable
+# The pod niceness tests (#1794).
+TestPodNiceness = importlib.import_module("test_pod_niceness").TestPodNiceness
 # The steer-after-minutes tests of #1540, moved under the line ceiling.
 _steer_long = importlib.import_module("test_steer_long_turn")
 TestSteerLongTurn = _steer_long.build(Base, TestSteerToWorking)
 _hc = importlib.import_module("test_header_cache"); TestAges, TestSets, TestEvents, TestSafety, TestReplay, TestIsolation, TestDropNeverBlocksAWrite, TestApprovalReadsFresh, TestDocs = _hc.TestAges, _hc.TestSets, _hc.TestEvents, _hc.TestSafety, _hc.TestReplay, _hc.TestIsolation, _hc.TestDropNeverBlocksAWrite, _hc.TestApprovalReadsFresh, _hc.TestDocs
 TestReminderTtlMore = importlib.import_module("test_reminder_ttl").build(PR4Base)
+TestPlanRehearsal = importlib.import_module("test_plan_rehearsal").build(HandoffCase)   # #1785
 # The load figure counts cloud workers as busy (#1487).
 _load_cloud = importlib.import_module("test_load_alert_cloud")
 TestLoadAlertCloudBusy = _load_cloud.TestLoadAlertCloudBusy
@@ -67368,6 +66035,8 @@ _changed_file_pages.HOST = sys.modules[__name__]
 TestWholeReadOfALargePullRequest = _changed_file_pages.load()
 
 _lm = importlib.import_module("test_launch_model"); _lm.HOST = sys.modules[__name__]; TestLaunchModel = _lm.build(); TestLaunchModelCloud = _lm.build_cloud()   # #1642
+_cfw = importlib.import_module("test_changed_files_whole"); _cfw.HOST = sys.modules[__name__]; TestChangedFilesWhole = _cfw.build()   # #1531
+TestShimGuardsTool, TestShimGuardRows, TestShimHygienePlanted, TestShimGuardMutants, TestShimGuardDocs = (_sg := importlib.import_module("test_shim_guards")).TestShimGuardsTool, _sg.TestShimGuardRows, _sg.TestShimHygienePlanted, _sg.TestShimGuardMutants, _sg.TestShimGuardDocs   # #1909
 TestPlanningDecision, TestConcurrencyGroup, TestGateLegs, TestGatePass, TestPlatformPaths, TestMacDocs = (_ml := importlib.import_module("test_mac_legs")).TestPlanningDecision, _ml.TestConcurrencyGroup, _ml.TestGateLegs, _ml.TestGatePass, _ml.TestPlatformPaths, _ml.TestDocs
 
 class TestTheArchitectureTestIsRun(unittest.TestCase):
@@ -70215,11 +68884,6 @@ class TestEarlyDecisionsWrite(DecisionsBase):
         self.assertGreater(stale[0], before, "a stale file was rewritten before the sources were collected")
 
 
-def ci_run(workflow, name, conclusion, completed=None, started=None, status="COMPLETED"):
-    """One entry of gh's statusCheckRollup, as `gh pr view --json statusCheckRollup` writes a check run."""
-    entry = {"workflowName": workflow, "name": name, "status": status, "conclusion": conclusion,
-             "startedAt": started or completed or "2026-10-15T15:00:00Z", "completedAt": completed or "0001-01-01T00:00:00Z"}
-    return entry
 
 
 class TestNewestCiRuns(unittest.TestCase):
@@ -70652,20 +69316,8 @@ class TestClosedIssueLabels(Base):
         self.assertTrue(self.audit("closed_labels.error"))
 
 
-# ---- docs/agent-credentials.md (#568): the document has its sections and no token-like text (S1, S2, S3, S5, U1)
-CRED_DOC_PATH = str(REPO / "docs" / "agent-credentials.md")
-CRED_TOKEN_PATTERNS = [
-    r"gh[pousr]_[A-Za-z0-9]{20,}", r"github_pat_[A-Za-z0-9_]{20,}", r"-----BEGIN [A-Z ]*PRIVATE KEY-----",
-    r"\bAKIA[0-9A-Z]{16}\b", r"\bxox[baprs]-[A-Za-z0-9-]{10,}", r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}",
-    r"(?i)\b(token|secret|password)\s*[:=]\s*[\"']?[A-Za-z0-9+/_-]{24,}",
-]
-CRED_CRITERIA = ("Cost", "What breaks", "Rotation", "Who merges")
 
 
-def cred_doc_sections(text):
-    """{heading: body} for every `## ` section."""
-    parts = re.split(r"(?m)^## (.+)$", text)
-    return {parts[i].strip(): parts[i + 1] for i in range(1, len(parts) - 1, 2)}
 
 
 class TestAgentCredentialsDoc(unittest.TestCase):
@@ -70777,12 +69429,6 @@ class TestAgentCredentialsDoc(unittest.TestCase):
             self.assertIsNotNone(re.search(pattern, sample), pattern)
 
 
-# ======================================================================
-# #583: a message says when it was sent and delivered; a newer send replaces older waiting ones (marked, kept); the pane warning is
-# only for a real mismatch; a launch goes to the caller's own workspace.
-# ======================================================================
-def _clock_at(hour, minute, second=0):
-    return calendar.timegm((2027, 1, 15, hour, minute, second))
 
 
 class TestMessageTimes(unittest.TestCase):
@@ -71407,11 +70053,6 @@ class TestQueueEjections(Base):
         self.assertTrue([e for e in self.world.audit() if e["event"] == "queue_ejection.error"])
 
 
-def _zip_with(member, data):
-    stream = io.BytesIO()
-    with zipfile.ZipFile(stream, "w") as archive:
-        archive.writestr(member, data)
-    return stream.getvalue()
 
 
 class TestPullFileListRead(LedgerBase):
@@ -72225,14 +70866,6 @@ class TestPullFileListRead(LedgerBase):
                 self.assertIn(refused, err, "the audit's line is the printed line")
 
 
-# #943: a work item reads its parent ask's Done-when, and a pull request's `CLAIMS:` line narrows what its proof gate counts.
-PARENT_RULE = ("A work item with no Done-when of its own takes the Done-when of its parent ask (its native sub-issue parent): `plan check` and the structure gate (G0a) read it there, "
-               "and a Done-when the work item carries itself must still match exactly.")
-CLAIM_RULE = ("A pull request that proves only some of a plan's scenarios puts `CLAIMS: S3 S4 S5` directly under its `PLAN:` line: the proof gate (G1) counts only those, "
-              "the others stay claimed by the epic, and a claim naming an undeclared scenario is refused (the union of claims is enforced at the ask's last merge). "
-              "So every per-pull-request scenario must be claimed by some pull request (else the last merge is refused; a `CU` waiver passes).")
-CLAIM_SENTENCE = "So every per-pull-request scenario must be claimed by some pull request (else the last merge is refused; a `CU` waiver passes)."
-WORK_ITEM_PLAN = LEDGER_PLAN.split("```yaml", 1)[0].split("## Intent", 1)[0] + "```yaml" + LEDGER_PLAN.split("```yaml", 1)[1]
 
 
 class TestParentAskDoneWhen(LedgerBase):
@@ -72913,29 +71546,8 @@ class TestPlanRulesWordedAlike(unittest.TestCase):
             self.assertTrue(repo.startswith("acme/"), repo)
 
 
-NO_CAP_WORDS = re.compile(r"(cap|quota|ceiling|allowance)", re.I)
-AGENT_WORDS = re.compile(r"(agent|lane|caller|worker|spender)", re.I)
 
 
-def per_agent_limits(path, text):
-    """[name] of every identifier, attribute, dictionary key or constant string of the Python source `text` that names a limit per agent: a cap word together with an
-    agent word (`agent_cap`, `lane_quota`, `max_calls_per_agent`), or a per-agent word alone. Names of the form `NOT_AGENTS` (the lanes a message never names) are not limits."""
-    tree = ast.parse(text)
-    found = set()
-    for node in ast.walk(tree):
-        names = []
-        if isinstance(node, ast.Name):
-            names.append(node.id)
-        elif isinstance(node, ast.Attribute):
-            names.append(node.attr)
-        elif isinstance(node, ast.arg):
-            names.append(node.arg)
-        elif isinstance(node, ast.Constant) and isinstance(node.value, str) and len(node.value) < 60:
-            names.append(node.value)
-        for name in names:
-            if re.search(r"max_?calls|calls_?per|per_?(agent|lane|caller)_?(cap|limit|quota|max|count|calls)", name, re.I) or (NO_CAP_WORDS.search(name) and AGENT_WORDS.search(name)):
-                found.add(name)
-    return sorted(found)
 
 
 class TestShimTopSpender(Base):
@@ -74744,119 +73356,16 @@ class TestGhShimMergeGate(Base):
         self.assertIn("--auto", done.stderr)
 
 
-OLD_AGENT_SOURCES = re.compile(r"read_pane_health|PANE_HEALTH_FILE|RETIRED_FILE|pane-health\.json|retired\.json")   # the old copies of the agent list (docs/agent-registry.md)
-# THE RULE: an old token appears ONLY in the registry module (bin/registry.py, which folds and derives them) and in this DATED list of (file, function, token).
-# Each entry names who removes it and by when; the test fails on an entry that no longer matches (shrink it) and on one past its date. The scan covers every
-# tracked file that is not a test or a document: Python by AST (aliases and constant concatenations resolved), anything else by text.
-OLD_SOURCE_ALLOWED = {
-    ("bin/fleet-switchboard", "adopt_before_close", "RETIRED_FILE"): "2026-12-20, last slice of #903 (the adoption code owns it): only the key of the strict-record table, the read itself is the registry's",
-    ("bin/fleet-switchboard", "adopt_workers", "RETIRED_FILE"): "2026-12-20, last slice of #903 (the adoption code owns it): only the key of the strict-record table, the read itself is the registry's",
-    ("bin/fleet-switchboard", "repoint_workers", "RETIRED_FILE"): "2026-12-20, last slice of #903 (the adoption code owns it): only the key of the strict-record table, the read itself is the registry's",
-    ("bin/fleet-switchboard", "write_boss_records", "RETIRED_FILE"): "2026-12-20, last slice of #903 (the adoption code owns it): only the key of the strict-record table, the read itself is the registry's",
-    ("bin/fleet-switchboard", "<module>", "PANE_HEALTH_FILE"): "2026-12-20, last slice of #903 (slice 2 owns it): the constant of the derived file",
-    ("bin/fleet-switchboard", "<module>", "RETIRED_FILE"): "2026-12-20, last slice of #903 (slice 2 owns it): the constant of the derived file",
-    ("bin/fleet-switchboard", "read_pane_health", "PANE_HEALTH_FILE"): "2026-12-20, last slice of #903 (slice 2 owns it): the derived-file reader",
-    ("bin/fleet-switchboard", "write_pane_health", "PANE_HEALTH_FILE"): "2026-12-20, last slice of #903 (slice 2 owns it): the derived-file writer the sidebar reads",
-    ("bin/fleet-switchboard", "<module>", "pane-health.json"): "2026-12-20, last slice of #903 (slice 2 owns it): the file name; the derived output goes with the old files",
-    ("bin/fleet-switchboard", "<module>", "retired.json"): "2026-12-20, last slice of #903 (slice 2 owns it): the file name; the derived output goes with the old files",
-    ("bin/fleet-switchboard", "_reattach_locked", "pane-health.json"): "2026-12-20, last slice of #903 (slice 2 owns it): reattach's message about the derived file",
-    ("bin/fleet-switchboard", "_reattach_locked", "read_pane_health"): "2026-12-20, last slice of #903 (slice 2 owns it): reattach reads the pane record it rewrites (derived)",
-    ("bin/fleet-switchboard", "cmd_retire", "read_pane_health"): "2026-12-20, last slice of #903 (slice 2 owns it): retire prunes the derived pane record it rewrites",
-    ("bin/fleet-switchboard", "pane_health_pass", "pane-health.json"): "2026-12-20, last slice of #903 (slice 2 owns it): the pane pass writes the derived file",
-    ("bin/fleet-switchboard", "pane_health_pass", "read_pane_health"): "2026-12-20, last slice of #903 (slice 2 owns it): the pane pass reads the pane states it wrote (derived)",
-    ("bin/fleet-switchboard", "janitor_agent_roots", "PANE_HEALTH_FILE"): "2026-12-20, last slice of #903 (the temp janitor, #936, owns it): it reads the live agents' working directories from the derived pane record",
-    ("bin/fleet-switchboard", "janitor_agent_roots", "RETIRED_FILE"): "2026-12-20, last slice of #903 (the temp janitor, #936, owns it): only the name in its unreadable-record message, the read itself is read_retired_strict (the registry's)",
-    ("tests/switchboard/support/herdr_world.py", "set_retired", "retired.json"): "2026-12-20, last slice of #903 (slice 2 owns it): the test helper that writes the old retired file next to the registry; moved from bin/test-switchboard with World (T1e of #1092)",
-}
-# Live observers: the call sites that ask herdr which panes exist right now (`"agent", "list"`), keyed by (file, function), each a NAMED entry with its reason,
-# never a silent skip. The heartbeat's dated entry (2026-11-03) ended with #973: its bell opt-in is the registry's `bell` field. The two left are the live source the registry is fed from.
-LIVE_OBSERVERS = {
-    ("bin/fleet-switchboard", "agent_list"): "discovery's own herdr client: the live source the registry is fed from (herdr and the v2 service), not a record of who exists",
-    ("bin/proof-switchboard", "pane_of_session"): "the proof harness finds the pane of one session in a lab; it keeps no list",
-}
-# Views that read an old file from outside Python, from their own installed copy: derived output of the registry until the last slice (docs/agent-registry.md).
-DERIVED_VIEWS = {"plugins/fleet-decisions-tui/health.mjs": "pane-health.json"}
 
 
-def _fold(node):
-    """The string an expression builds, with what is not a constant left out: a constant, a `+` chain, a `%` format, an f-string, `sep.join([...])`. None for
-    anything else. `s + "/retired" + ".json"` folds to "/retired.json", the way a reader of the file would name it."""
-    if isinstance(node, ast.Constant) and isinstance(node.value, str):
-        return node.value
-    if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Mod)):
-        left, right = _fold(node.left), _fold(node.right)
-        if isinstance(node.op, ast.Mod):
-            return left
-        return (left or "") + (right or "") if left is not None or right is not None else None
-    if isinstance(node, ast.JoinedStr):
-        return "".join(v.value for v in node.values if isinstance(v, ast.Constant) and isinstance(v.value, str))
-    if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "join" and isinstance(node.func.value, ast.Constant) \
-            and node.args and isinstance(node.args[0], (ast.List, ast.Tuple)):
-        parts = [e.value for e in node.args[0].elts if isinstance(e, ast.Constant) and isinstance(e.value, str)]
-        return node.func.value.value.join(parts)
-    return None
 
 
-def old_source_reads(path, text):
-    """{(function, token)} for every use of an old agent-list source in the Python source `text`: a name, an attribute, an import (and its alias, wherever it is
-    called), a string or a concatenation of strings, outside a docstring. A source that is not Python is read as text: [("<text>", token)]."""
-    try:
-        tree = ast.parse(text)
-    except SyntaxError:
-        return sorted({("<text>", m.group(0)) for m in OLD_AGENT_SOURCES.finditer(text)})
-    found, aliases = set(), {}
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.Import, ast.ImportFrom)):
-            for alias in node.names:
-                if OLD_AGENT_SOURCES.search(alias.name):
-                    aliases[alias.asname or alias.name.split(".")[-1]] = OLD_AGENT_SOURCES.search(alias.name).group(0)
-
-    def walk(node, fn):
-        for child in ast.iter_child_nodes(node):
-            inner = child.name if fn is None and isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) else fn
-            hit = None
-            if isinstance(child, (ast.Import, ast.ImportFrom)):
-                hit = next((OLD_AGENT_SOURCES.search(a.name).group(0) for a in child.names if OLD_AGENT_SOURCES.search(a.name)), None)
-            elif isinstance(child, ast.Name) and (OLD_AGENT_SOURCES.search(child.id) or child.id in aliases):
-                hit = OLD_AGENT_SOURCES.search(child.id).group(0) if OLD_AGENT_SOURCES.search(child.id) else aliases[child.id]
-            elif isinstance(child, ast.Attribute) and OLD_AGENT_SOURCES.search(child.attr):
-                hit = OLD_AGENT_SOURCES.search(child.attr).group(0)
-            elif isinstance(child, (ast.Constant, ast.BinOp, ast.JoinedStr, ast.Call)) and _fold(child) is not None and OLD_AGENT_SOURCES.search(_fold(child)) and not isinstance(node, ast.Expr):
-                hit = OLD_AGENT_SOURCES.search(_fold(child)).group(0)
-            if hit:
-                found.add((inner or "<module>", hit))
-            if not (isinstance(child, (ast.BinOp, ast.JoinedStr)) and _fold(child) is not None and hit):   # a folded expression is one finding
-                walk(child, inner)
-    walk(tree, None)
-    return sorted(found)
 
 
-def duplicate_defs(text):
-    """[(scope, name)] for every class or function defined twice in one scope of the Python source `text`: a second definition silently shadows the first (a merge that doubles a block).
-    A decorated function (a property's setter, an overload) is a deliberate second definition and is left out."""
-    tree = ast.parse(text)
-    found = []
-    for scope in [tree] + [n for n in ast.walk(tree) if isinstance(n, ast.ClassDef)]:
-        seen = {}
-        for node in scope.body:
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and not getattr(node, "decorator_list", None):
-                seen[node.name] = seen.get(node.name, 0) + 1
-        found += [(getattr(scope, "name", "<module>"), name) for name, n in seen.items() if n > 1]
-    return sorted(found)
 
 
-def tracked_files():
-    """Every file git tracks (the repository's own list, never a directory walk), as repository-relative paths."""
-    out = subprocess.run(["git", "ls-files", "-z"], cwd=str(BIN.parent), capture_output=True, check=True).stdout.decode()
-    return [p for p in out.split("\0") if p and os.path.isfile(str(BIN.parent / p)) and not os.path.islink(str(BIN.parent / p))]
 
 
-def scanned(path):
-    """True for a file the scan judges: not a test, a fixture, a document, or the registry module itself."""
-    name = os.path.basename(path)
-    skip = (path == "bin/registry.py" or path.endswith((".md", ".json", ".txt", ".lock", ".png", ".svg"))
-            or name.startswith("test") or ".test." in name or "/tests/" in path or "/fixtures/" in path or path.startswith(("docs/", ".github/")))
-    return not skip
 
 
 class TestBellMigration(unittest.TestCase):
@@ -75144,6 +73653,11 @@ class TestEveryViewDerivesFromTheRegistry(BaselineWorld):
         self.assertNotIn("bin/registry.py", [p for p in tracked_files() if scanned(p)])
         self.assertIn("bin/fleet-switchboard", [p for p in tracked_files() if scanned(p)])
         self.assertTrue(any(p.startswith("plugins/") and scanned(p) for p in tracked_files()), "the scan reaches subdirectories")
+
+    def test_the_scan_skips_the_tests_tree_and_still_judges_the_code(self):
+        self.assertFalse(scanned("tests/switchboard/support/x.py"))
+        self.assertTrue(scanned("bin/fleet-switchboard"))
+        self.assertTrue(scanned("plugins/fleet-decisions-tui/health.mjs"))
 
     # Every function that reads the registry through the seam is a view; each has the test that retires an agent (or breaks the registry) and checks that view.
     # The table is checked against the code: a new caller of the seam with no row fails `test_every_view_that_reads_the_registry_has_its_retire_test`.
@@ -76493,89 +75007,10 @@ class TestBlockedReport(Base):
 
 # ---- the blocked report's guards, bounds, validator, lock and config key: one row and one mutant each, derived from the code
 
-BLOCKED_GUARD_KILLERS = {
-    '_named:len(items) > limit': 'test_the_line_names_at_most_so_many_senders_and_reminders_and_is_cut',
-    'validate_blocked_alert_config:"blocked_alert" not in config or config["blocked_alert"] is None': 'test_a_block_that_ends_before_it_was_reported_says_nothing',
-    'validate_blocked_alert_config:raw is False': 'test_the_alert_can_be_set_or_turned_off',
-    'validate_blocked_alert_config:not isinstance(raw, dict)': 'test_the_alert_can_be_set_or_turned_off',
-    'validate_blocked_alert_config:unknown': 'test_blocked_alert_is_a_known_config_key_and_an_unknown_key_inside_it_is_warned_about',
-    'validate_blocked_alert_config:not _is_number(section[key]) or section[key] <= 0': 'test_the_alert_can_be_set_or_turned_off',
-    'blocked_alert_section:raw is False': 'test_a_block_that_ends_with_messages_still_held_says_so',
-    'blocked_kind:source is None': 'test_an_ended_turn_with_nothing_open_names_the_resume_command_with_the_agents_name',
-    'blocked_kind:kinds': 'test_an_ended_turn_with_nothing_open_names_the_resume_command_with_the_agents_name',
-    'blocked_kind:k == "permission"': 'test_the_kind_of_block_for_each_open_request_and_when_it_was_not_read',
-    'blocked_update:new is None': 'test_a_block_that_ends_with_messages_still_held_says_so',
-    'note_held_send:state_dir is None or observation is None or observation.status != "blocked" or hold_reason(observation) is None': 'test_a_block_that_ends_with_messages_still_held_says_so',
-    'note_held_send:len(state) > BLOCKED_HELD_AGENTS': 'test_the_lists_are_bounded_and_the_next_over_is_cut',
-    'note_held_send:isinstance(entry, dict)': 'test_a_block_that_ends_before_it_was_reported_says_nothing',
-    'blocked_sender:isinstance(who, str) and NAME_RE.fullmatch(who)': 'test_every_sink_of_a_caller_claimed_sender_name_shows_only_a_valid_agent_name',
-    'blocked_line:held or not refused': 'test_only_the_blocked_agents_own_reminders_due_in_the_block_are_in_the_line',
-    'blocked_line:refused': 'test_over_the_threshold_with_held_messages_each_recipient_gets_one_line_naming_the_count_and_senders',
-    'blocked_line:reminders': 'test_a_reminder_the_blocked_agent_set_that_falls_due_in_the_block_is_in_the_line',
-    'blocked_line:len(held) == 1': 'test_the_end_line_of_a_mix_says_the_held_were_delivered_and_the_refused_were_not',
-    'blocked_line:len(refused) == 1': 'test_over_the_threshold_with_held_messages_each_recipient_gets_one_line_naming_the_count_and_senders',
-    '_refused_senders:isinstance(entry, dict)': 'test_a_block_that_ends_with_messages_still_held_says_so',
-    '_refused_senders:isinstance(rows, list)': 'test_a_block_that_ends_with_messages_still_held_says_so',
-    'blocked_tick:section is None or discovery is None or engine.state_dir is None': 'test_a_block_that_ends_with_messages_still_held_says_so',
-    'blocked_tick:changed or done': 'test_a_block_that_ends_with_messages_still_held_says_so',
-    'blocked_tick:set(found) - waiting': 'test_held_sends_of_an_agent_no_longer_blocked_are_forgotten_and_a_blocked_agents_are_kept',
-    'blocked_tick:boss and boss_seen is not None and not hold_reason(boss_seen)': 'test_a_chief_of_staff_that_is_blocked_is_not_told_about_itself_and_none_is_added_to_nobody',
-    'blocked_tick:cos and cos not in recipients': 'test_a_boss_that_cannot_be_reached_leaves_the_chief_of_staff_alone_told',
-    'blocked_tick:engine.audit is not None': 'test_a_block_that_ends_with_messages_still_held_says_so',
-    'blocked_tick:seen.status != "blocked"': 'test_a_block_that_ends_with_messages_still_held_says_so',
-    'blocked_tick:not isinstance(entry, dict) or entry.get("session") != seen.session_id or not _is_number(entry.get("since"))': 'test_a_block_that_ends_with_messages_still_held_says_so',
-    'blocked_tick:not messages and not refusals': 'test_a_block_that_ends_with_messages_still_held_says_so',
-    'blocked_tick:last is None and now - entry["since"] >= section["minutes"] * 60': 'test_a_block_that_ends_before_it_was_reported_says_nothing',
-    'blocked_tick:not isinstance(entry, dict) or entry.get("reported") is None': 'test_a_block_that_ends_before_it_was_reported_says_nothing',
-    'blocked_tick:seen is None': 'test_a_block_that_ends_with_messages_still_held_says_so',
-    'blocked_tick:still': 'test_a_block_that_ends_with_messages_still_held_says_so',
-    'blocked_tick:refusals': 'test_the_end_line_of_a_block_with_only_refused_sends_does_not_say_delivered',
-    'blocked_tick:boss': 'test_over_the_threshold_with_held_messages_each_recipient_gets_one_line_naming_the_count_and_senders',
-    'blocked_tick:last is not None and now - last >= section["repeat_minutes"] * 60': 'test_a_block_that_ends_before_it_was_reported_says_nothing',
-    'blocked_tick:had_held': 'test_the_end_line_of_a_block_with_only_refused_sends_does_not_say_delivered',
-    'blocked_tick:plan is not None': 'test_a_block_that_ends_with_messages_still_held_says_so',
-    'blocked_tick:parts': 'test_a_block_that_ends_with_messages_still_held_says_so',
-    'blocked_tick:len(refusals) == 1': 'test_the_end_line_of_a_block_with_only_refused_sends_does_not_say_delivered',
-}
-BLOCKED_TEXT_MUTANTS = {   # id: (anchor function or None, old text, new text, the test that must fail)
-    'bound:BLOCKED_HELD_KEEP': (None, 'BLOCKED_HELD_KEEP = 100', 'BLOCKED_HELD_KEEP = 1000', 'test_the_lists_are_bounded_and_the_next_over_is_cut'),
-    'bound:BLOCKED_HELD_AGENTS': (None, 'BLOCKED_HELD_AGENTS = 64', 'BLOCKED_HELD_AGENTS = 640', 'test_the_lists_are_bounded_and_the_next_over_is_cut'),
-    'bound:BLOCKED_LINE_CHARS': (None, 'BLOCKED_LINE_CHARS = 1200', 'BLOCKED_LINE_CHARS = 12000', 'test_the_lists_are_bounded_and_the_next_over_is_cut'),
-    'bound:BLOCKED_LINE_SENDERS': (None, 'BLOCKED_LINE_SENDERS = 10', 'BLOCKED_LINE_SENDERS = 100', 'test_the_line_names_at_most_so_many_senders_and_reminders_and_is_cut'),
-    'bound:BLOCKED_LINE_REMINDERS': (None, 'BLOCKED_LINE_REMINDERS = 5', 'BLOCKED_LINE_REMINDERS = 50', 'test_the_line_names_at_most_so_many_senders_and_reminders_and_is_cut'),
-    'lock:flock': ('def blocked_lock', 'fcntl.flock(fd, fcntl.LOCK_EX)\n        yield', 'yield', 'test_two_interleaved_senders_lose_no_row'),
-    'config-key:blocked_alert': (None, '"friction_wake", "blocked_alert", ', '"friction_wake", ', 'test_blocked_alert_is_a_known_config_key_and_an_unknown_key_inside_it_is_warned_about'),
-    'validator:zero': ('def validate_blocked_alert_config', 'not _is_number(section[key]) or section[key] <= 0', 'not _is_number(section[key]) or section[key] < 0', 'test_the_alert_can_be_set_or_turned_off'),
-    'guard-removed:boss-not-blocked': (None, 'boss and boss_seen is not None and not hold_reason(boss_seen)', 'boss and boss_seen is not None', 'test_a_boss_that_is_itself_blocked_is_not_told_and_the_chief_of_staff_alone_is'),
-    'write:per-report': ('def blocked_tick', 'blocked_update(engine.state_dir, BLOCKED_ALERT_STATE, lambda _: state)', 'pass', 'test_each_report_is_written_at_once_so_a_crash_repeats_at_most_one'),
-    'wording:and-more': ('def _named', '" and %d more"', '" and %d others"', 'test_the_line_names_at_most_so_many_senders_and_reminders_and_is_cut'),
-    'wording:limit-slice': ('def _named', 'list(items)[:limit]', 'list(items)[:limit + 1]', 'test_the_line_names_at_most_so_many_senders_and_reminders_and_is_cut'),
-    'sender:gate': (None, 'return who if isinstance(who, str) and NAME_RE.fullmatch(who) else "unknown"', 'return who if isinstance(who, str) else "unknown"', 'test_every_sink_of_a_caller_claimed_sender_name_shows_only_a_valid_agent_name'),
-    'sender:fullmatch': (None, 'NAME_RE.fullmatch(who) else', 'NAME_RE.match(who) else', 'test_every_sink_of_a_caller_claimed_sender_name_shows_only_a_valid_agent_name'),
-}
 
 
-def blocked_functions(text):
-    """The names of every function of the report: those between `BLOCKED_ALERT_DEFAULTS` and the end of `blocked_tick`, derived from the code."""
-    tree = ast.parse(text)
-    first = next(n.lineno for n in tree.body if isinstance(n, ast.Assign) and getattr(n.targets[0], "id", "") == "BLOCKED_ALERT_DEFAULTS")
-    last = next(n.end_lineno for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "blocked_tick")
-    return {n.name for n in tree.body if isinstance(n, ast.FunctionDef) and first <= n.lineno <= last}
 
 
-def blocked_guards(text):
-    """{id: (start, end)} byte offsets of the test of every `if`, conditional expression and `while` in the report's functions: derived from the code."""
-    tree, found, lines = ast.parse(text), {}, [0]
-    names = blocked_functions(text)
-    for line in text.encode().split(b"\n"):
-        lines.append(lines[-1] + len(line) + 1)
-    for node in tree.body:
-        if isinstance(node, ast.FunctionDef) and node.name in names:
-            for guard in ast.walk(node):
-                if isinstance(guard, (ast.If, ast.IfExp, ast.While)):
-                    test = guard.test
-                    found["%s:%s" % (node.name, ast.get_source_segment(text, test))] = (lines[test.lineno - 1] + test.col_offset, lines[test.end_lineno - 1] + test.end_col_offset)
-    return found
 
 
 class TestBlockedMutants(Base):
@@ -77245,19 +75680,6 @@ class TestPaneExitBoundaries(TestPaneExit):
         self.assertLessEqual(guards, 16, "a guard was added to pane_exit_pass: give it a row and a mutant, then raise this count")
 
 
-def marker_mutant_source(func, ret="None"):
-    """The REAL shim's text with the retired marker honoured again at the top of `func` (after its docstring): `return` / `return None` when the variable is "1"."""
-    source = SHIM.read_text()
-    start = source.index("def %s(" % func)
-    head = source[start:]
-    at = head.index(":\n", head.index(")")) + 2
-    stripped = head[at:].lstrip()
-    if stripped.startswith('"""'):
-        at += head[at:].index('"""') + 3 + head[at:][head[at:].index('"""') + 3:].index('"""') + 3 + 1
-    guard = '    if os.environ.get("FLEET_SWITCHBOARD_OWN_GH") == "1":\n        return%s\n' % ("" if ret == "" else " " + ret)
-    mutant = source[:start] + head[:at] + guard + head[at:]
-    ast.parse(mutant)
-    return mutant
 
 
 class TestReadCheckRuns1237(unittest.TestCase):
@@ -78006,8 +76428,6 @@ class TestLatestRunOfWorkflow(unittest.TestCase):
         self.assertIn(("o/r", ci.CACHE_MAX + 19), ci._CACHE)
 
 
-def load_ci_runs():
-    return sb.load_module("ci_runs")
 class TestProofCarry(LedgerBase):
     """#1129: a tester's, live check's or reviewer's proof CARRIES to a new head when the difference touches none of the files it names, the new head is a merge of the default
     branch or a tests-and-documentation difference, and CI is green there. Fakes only; the carry decision takes the facts GitHub gave."""
@@ -79729,21 +78149,6 @@ class TestNoPaneToJudge(StandInPids, Base):
             self.assertIn(phrase, body)
 
 
-# ---- #1215: the test files of the impact brief are collected by THIS runner (CI runs `bin/test-switchboard`; a file no runner executes does not count)
-def _load_brief_tests(name):
-    """The test module of the impact brief, loaded by path; every TestCase it defines is named below (an explicit binding, not a write to this module's globals), and the check after them fails when one is missing."""
-    sys.path.insert(0, str(REPO))   # `tests.*` and the bin modules they import
-    sys.path.insert(0, str(BIN))
-    if name == "test-impact-brief":
-        loader = importlib.machinery.SourceFileLoader("brief_test_impact_brief", str(BIN / name))
-        spec = importlib.util.spec_from_loader(loader.name, loader)
-        module = importlib.util.module_from_spec(spec)
-        loader.exec_module(module)
-    else:
-        spec = importlib.util.spec_from_file_location("brief_" + name, REPO / "tests" / (name + ".py"))
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-    return module
 
 
 _brief_modules = {name: _load_brief_tests(name) for name in ("test_substance_decider", "test_brief_clear", "test_brief_advisory", "test_brief_integration", "test_brief_fix", "test_brief_order", "test-impact-brief", "test_installed_guard")}
@@ -79762,6 +78167,11 @@ Brief_impact_brief_BriefTests, Brief_impact_brief_MutantTests = _brief_modules["
 Brief_installed_guard_TreeCase, Brief_installed_guard_TestTheEntryGuard, Brief_installed_guard_TestTheDaemon, Brief_installed_guard_TestTheHooks, Brief_installed_guard_TestTheDocument, Brief_installed_guard_TestAdviceNamesAWorktree = (
     _brief_modules["test_installed_guard"].TreeCase, _brief_modules["test_installed_guard"].TestTheEntryGuard, _brief_modules["test_installed_guard"].TestTheDaemon, _brief_modules["test_installed_guard"].TestTheHooks,
     _brief_modules["test_installed_guard"].TestTheDocument, _brief_modules["test_installed_guard"].TestAdviceNamesAWorktree)
+# #1984: bin/test-host-liveness is run by THIS runner too (loaded by path, bound by name so CI collects it)
+_host_liveness_loader = importlib.machinery.SourceFileLoader("host_liveness_tests", str(BIN / "test-host-liveness"))
+_host_liveness_tests = importlib.util.module_from_spec(importlib.util.spec_from_loader(_host_liveness_loader.name, _host_liveness_loader))
+_host_liveness_loader.exec_module(_host_liveness_tests)
+HostLiveness_Module, HostLiveness_Doctor, HostLiveness_Mutant = _host_liveness_tests.Module, _host_liveness_tests.Doctor, _host_liveness_tests.Mutant
 # #1552: tests/test_plan_check_words.py is run by THIS runner too (loaded by path like the brief tests above; bound by name so CI collects it)
 _plan_check_words_spec = importlib.util.spec_from_file_location("plan_check_words_tests", REPO / "tests" / "test_plan_check_words.py")
 _plan_check_words_module = importlib.util.module_from_spec(_plan_check_words_spec)
