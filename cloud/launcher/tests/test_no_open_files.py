@@ -15,9 +15,11 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(HERE)))
 # Files run at the same time must not share a temp name: test_cloud_pr_preflight lists the temp dir for cloud-preflight-*, so no other file here may create such names.
 GUARDED = (
+    "test_app_token.py",
     "test_chain_time.py",
     "test_cloud_end_alert.py",
     "test_cloud_pr_preflight.py",
+    "test_cloud_preflight_wired.py",
     "test_cloud_quick_selector.py",
     "test_cloud_turn_end.py",
     "test_cloud_worker.py",
@@ -31,6 +33,7 @@ GUARDED = (
     "test_mint_roles.py",
     "test_model_credential.py",
     "test_orchestrator_agent.py",
+    "test_preflight.py",
     "test_reaper_managed.py",
     "test_run_record.py",
     "test_stack_model_key.py",
@@ -39,7 +42,7 @@ GUARDED = (
     "test_token_at_limit.py",
     "test_vault_check_pins.py",
 )
-LEAK = re.compile(r"^ResourceWarning: unclosed file ", re.M)
+LEAK = re.compile(r"^ResourceWarning: unclosed ", re.M)
 LIMIT = 900
 WORKERS = 4
 
@@ -55,7 +58,7 @@ def check(name, text):
     """Raise the anchored failure when the output of a run names a leaked file."""
     n = len(LEAK.findall(text))
     if n:
-        raise AssertionError("a file was left open: %s: %d ResourceWarning lines\n%s" % (name, n, "\n".join(l for l in text.splitlines() if "ResourceWarning: unclosed file" in l)))
+        raise AssertionError("a file was left open: %s: %d ResourceWarning lines\n%s" % (name, n, "\n".join(l for l in text.splitlines() if "ResourceWarning: unclosed " in l)))
     return n
 
 
@@ -118,6 +121,10 @@ class MutantLeak(unittest.TestCase):
         self.addCleanup(shutil.rmtree, d, True)
         tests = os.path.join(d, "cloud", "launcher", "tests")
         os.makedirs(tests)
+        launcher = os.path.dirname(HERE)
+        for entry in os.listdir(launcher):
+            if entry != "tests":
+                os.symlink(os.path.join(launcher, entry), os.path.join(d, "cloud", "launcher", entry))
         for link in ("bin", "docs"):
             os.symlink(os.path.join(ROOT, link), os.path.join(d, link))
         with open(os.path.join(HERE, self.NAME), encoding="utf-8") as f:
@@ -146,6 +153,41 @@ class MutantLeak(unittest.TestCase):
             self.scratch((self.OLD, self.OLD))
 
     def test_s4_the_text_occurs_once(self):
+        with open(os.path.join(HERE, self.NAME), encoding="utf-8") as f:
+            self.assertEqual(f.read().count(self.OLD), 1)
+
+
+class MutantSocket(MutantLeak):
+    """S7: one `server_close()` of `test_preflight.py` removed leaves a socket open; the widened guard fails it, the old narrow pattern would not."""
+    NAME = "test_preflight.py"
+    OLD = "cls.srv.shutdown()\n        cls.srv.server_close()"
+    NEW = "cls.srv.shutdown()"
+    NARROW = re.compile(r"^ResourceWarning: unclosed file ", re.M)
+    test_s4_control_first_passes = None
+    test_s4_one_bare_open_put_back_fails_with_the_anchored_text = None
+    test_s4_a_no_op_mutation_fails_the_applied_computation = None
+    test_s4_the_text_occurs_once = None
+
+    def test_s7_control_first_passes(self):
+        path, d = self.scratch(None)
+        rc, text = run(path, d)
+        self.assertEqual(check("control", text), 0)
+        self.assertEqual(rc, 0, text[-1500:])
+
+    def test_s7_one_server_close_removed_fails_with_the_anchored_text(self):
+        path, d = self.scratch((self.OLD, self.NEW))
+        rc, text = run(path, d)
+        with self.assertRaisesRegex(AssertionError, r"\Aa file was left open: "):
+            check("mutant", text)
+        self.assertIn("ResourceWarning: unclosed <socket", text)
+        # the old narrow pattern matches only `unclosed file`: it finds nothing in this output
+        self.assertEqual(len(self.NARROW.findall(text)), 0)
+
+    def test_s7_a_no_op_mutation_fails_the_applied_computation(self):
+        with self.assertRaisesRegex(AssertionError, "the mutation was not applied"):
+            self.scratch((self.OLD, self.OLD))
+
+    def test_s7_the_text_occurs_once(self):
         with open(os.path.join(HERE, self.NAME), encoding="utf-8") as f:
             self.assertEqual(f.read().count(self.OLD), 1)
 
