@@ -30974,7 +30974,7 @@ class TestPrSharesFiles(LedgerBase):
         self.assertEqual(line, ["shares f0, f1, f2 with #8, #20, #21, #22, #25"])
         self.assertEqual(len(self.list_calls), 1)
         argv = self.list_calls[0]
-        self.assertEqual(argv[argv.index("--limit") + 1], "50")
+        self.assertEqual(argv[argv.index("--limit") + 1], str(sb.OVERLAP_LIST_CAP))
         self.assertEqual(argv[argv.index("--state") + 1], "open")
 
     def test_S4_held_pull_requests_get_a_merge_order_by_waiting_time(self):
