@@ -921,6 +921,9 @@ def cmd_send(args, runner, now, record):
     if args.issue is not None:
         meta["fleet"]["issue"] = args.issue if isinstance(args.issue, int) else str(args.issue)
     session = _session_of(record)
+    with Cluster() as probe:   # the pod's state, read ONCE, before the prompt (its own login: the launcher's status needs one)
+        state_line, warning = send_state(runner, args.name, record, probe)
+    sys.stderr.write("%s: %s\n" % (H["PROG"], state_line))
     with Cluster() as cluster, tunnel(cluster, record) as live:
         reply = remote_v2(state, live, config["call_timeout_seconds"]).prompt(session, text, meta, delivery="queue")
     _audit(engine, "cloud.send", args.name, {"from": sender, "chars": len(text)})
@@ -928,6 +931,41 @@ def cmd_send(args, runner, now, record):
     print(message_id or "sent")
     sys.stderr.write("%s: delivered to %s\n" % (H["PROG"], args.name))
     return H["EXIT_OK"]
+
+
+_STATE_TIME = re.compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
+
+
+def _state_time(value):
+    """A launcher time as written, or None: only a plain UTC time is ever printed (never another value of the launcher's answer)."""
+    return value if isinstance(value, str) and _STATE_TIME.match(value) else None
+
+
+def send_state(runner, name, record, cluster, clock=None):
+    """(state line, warning or None) for a send: the launcher's own `status` read ONCE. The warning is set for a pod past its hard deadline,
+    a retired or unknown pod, a pod that is not running and a read that failed; the send still prompts the endpoint, only `delivered` changes."""
+    try:
+        code, body, note = run_launcher(runner, "status", name, (), STATUS_SECONDS, cluster=cluster)
+    except CloudError as err:
+        code, body, note = -1, None, str(err)
+    if code != 0 or not isinstance(body, dict):
+        retired = "unknown worker" in (note or "")
+        line = "state of %s: running=unknown idle_deadline=unknown hard_deadline=%s last_event=unknown" % (name, record.get("hard_deadline") or "unknown")
+        if retired:
+            return line, "%s is retired or unknown to the launcher" % name
+        return line, "the state of %s could not be read (%s)" % (name, _one(_reason(code, note) if code != 0 else "no answer", 100))
+    deadlines = body.get("deadlines") if isinstance(body.get("deadlines"), dict) else {}
+    idle, hard = _state_time(deadlines.get("idle")), _state_time(deadlines.get("hard"))
+    last = _state_time(body.get("idle_since"))
+    running = body.get("phase") == "Running"
+    line = "state of %s: running=%s idle_deadline=%s hard_deadline=%s last_event=%s" % (
+        name, "yes" if running else "no", idle or "unknown", hard or "unknown", last or "unknown")
+    past = _ended(record, clock) or _ended({"hard_deadline": hard}, clock)
+    if past:
+        return line, "%s is past its hard deadline" % name
+    if not running:
+        return line, "%s is not running" % name
+    return line, None
 
 
 def message_line(message):
