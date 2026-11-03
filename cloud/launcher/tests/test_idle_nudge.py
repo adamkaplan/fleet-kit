@@ -177,6 +177,47 @@ class TestNoticeWords(unittest.TestCase):
         self.assertLessEqual(len(words({"pushed": False, "wip_branch": None, "head_on": "a" * 29 + "/" + "b" * 29})), len("head is on branch ") + 100)
 
 
+EH_PATH = os.path.join(HERE, "..", "end_hook.py")
+EH_OLD = '    lines = [x for x in lines if "->" not in x and x != "origin/HEAD"]\n'
+
+
+def eh_module(mutate=None):
+    text = open(EH_PATH).read()
+    after = text.replace(EH_OLD, "") if mutate else text
+    if mutate:
+        assert after != text and text.count(EH_OLD) == 1, "the mutation was not applied"
+    module = types.ModuleType("eh_mutant")
+    module.__file__ = EH_PATH
+    exec(compile(after, "eh_mutant", "exec"), module.__dict__)
+    return module
+
+
+class TestHeadBranch(unittest.TestCase):
+    def test_origin_head_line_is_skipped(self):
+        self.assertEqual(eh_module().head_branch("  origin/HEAD -> origin/main\n  origin/main"), "main")
+
+    def test_only_an_arrow_line_is_unknown(self):
+        self.assertEqual(eh_module().head_branch("  origin/HEAD -> origin/main"), "unknown")
+
+    def test_existing_cases(self):
+        self.assertEqual(eh_module().head_branch("  origin/main2"), "main2")
+        self.assertEqual(eh_module().head_branch(""), "unknown")
+
+    def test_old_first_line_rule_is_caught(self):
+        got = eh_module(True).head_branch("  origin/HEAD -> origin/main\n  origin/main")
+        self.assertEqual(got, "HEAD")  # the mutant says HEAD
+        self.assertNotEqual(got, "main", "the mutant must show HEAD where main is required")
+
+    def test_no_op_mutation_fails_the_computation(self):
+        text = open(EH_PATH).read()
+        with self.assertRaisesRegex(AssertionError, "the mutation was not applied"):
+            assert text.replace("zzz", "") != text and text.count(EH_OLD) == 1, "the mutation was not applied"
+
+    def test_unknown_head_unpushed_and_long_run(self):
+        self.assertEqual(words({"pushed": False, "wip_branch": None, "head_on": "unknown"}), "unknown")
+        self.assertEqual(words({"pushed": False, "wip_branch": None, "head_on": "feat/" + "a1" * 15}), "unknown")
+
+
 class TestNoticeMutant(unittest.TestCase):
     def test_control_passes(self):
         self.assertEqual(words({"pushed": False, "wip_branch": None, "head_on": "b1"}), "head is on branch b1")

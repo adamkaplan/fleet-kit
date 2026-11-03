@@ -89,6 +89,7 @@ class TokenEnded(RuntimeError):
 def head_branch(contained):
     """The first branch of `git branch -r --contains` with its origin/ prefix off: at most 100 characters of [A-Za-z0-9._/-], else `unknown`."""
     lines = [x.strip() for x in (contained or "").splitlines() if x.strip()]
+    lines = [x for x in lines if "->" not in x and x != "origin/HEAD"]
     name = lines[0].split(" ")[0] if lines else ""
     name = name[len("origin/"):] if name.startswith("origin/") else name
     return name if name and len(name) <= 100 and re.fullmatch(r"[A-Za-z0-9._/-]+", name) else "unknown"
