@@ -67350,6 +67350,7 @@ TestCiTestFileList = _ci_test_files.TestCiTestFileList
 _olc = importlib.import_module("test_open_list_ceiling"); TestOpenListCeiling, TestOpenListAlert, TestOpenListCeilingMutant = _olc.TestOpenListCeiling, _olc.TestOpenListAlert, _olc.TestOpenListCeilingMutant
 TestOpenListPassCalls = importlib.import_module("test_open_list_pass_calls").build(TestASlowCatchUpDoesNotFreezeThePass)   # #1886 Eighth (3)
 _olcuts = importlib.import_module("test_open_list_cuts"); TestOpenListCuts, TestOpenListPagesRead, TestOpenListDerivedText, TestOpenListCutsMutants, TestOpenListWholeReads, TestOpenListCutsWired = _olcuts.TestOpenListCuts, _olcuts.TestOpenListPagesRead, _olcuts.TestOpenListDerivedText, _olcuts.TestOpenListCutsMutants, _olcuts.TestOpenListWholeReads, _olcuts.TestOpenListCutsWired
+_rpstrict = importlib.import_module("test_read_pages_strict"); TestReadPagesStrict, TestReadPagesStrictMutant = _rpstrict.TestReadPagesStrict, _rpstrict.TestReadPagesStrictMutant
 TestTempJanitorScratch = importlib.import_module("test_scratch").build(TestTempJanitor)
 
 # The delivery-lag tests of #1402.

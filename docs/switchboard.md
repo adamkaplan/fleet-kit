@@ -1806,6 +1806,7 @@ item) says cut that root.
 - **Every list read is paged with a hard cap** (`GITHUB_PAGE_CAP`, 5 pages of 100, unless the caller names its own `cap`: the open-item reads name `OPEN_LIST_PAGES`), and one catch-up keeps at
   most 500 items. A cap that is hit stops the read, audits one `github.catch_up.truncated` line (the capped
   reads, the items skipped) and still advances the marker: forward only, no chasing the rest.
+- **A page that is not a list of objects is an error** (#1983): `read_pages` raises `GitHubUnavailable` naming the path and the page number (a page of strings, an object without the key's list, a value that is not a list), so the read is retried as any failed read and never returns a short list; an empty list is still a normal last page.
 - **Secondary reads are best-effort**: reviews, check suites and workflow runs that fail are reported once per
   episode (the 10-minute back-off stays) and are not retried for the window they missed; live webhooks cover
   them. A failed primary read (comments, issues, pulls) does not move the marker and retries after a minute with
