@@ -2448,8 +2448,8 @@ class TestEngineCLI(Base):
     def test_a_held_send_says_why_and_sends_nothing(self):
         self.world.herdr.panes[self.world.panes["platform"]]["status"] = "blocked"
         code, out, err = self.main("send", "platform", "--from", "coder", "hi")
-        self.assertEqual((code, out), (sb.EXIT_HELD, ""))
-        self.assertIn("blocked", err)
+        self.assertEqual((code, out), (0, ""))
+        self.assertIn("held for platform: it will be delivered when it unblocks", err)
         self.assertEqual(self.world.v2.writes, [])
         self.assertEqual(self.main("send", "nobody", "--from", "coder", "hi")[0], sb.EXIT_HELD)
 
