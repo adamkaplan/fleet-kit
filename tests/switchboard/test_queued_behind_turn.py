@@ -364,4 +364,32 @@ class TestQueuedBehindTurn(QueuedWaitModuleTests, Base):
         self.assertNotEqual(code, 0)
         self.assertIn(WAITED_TEXT, out)
 
+    # ---- the light switch (#1801): the queued-wait pass reads no inbox when light is on
+    LIGHT_TEXT = "the queued-wait pass makes no session read under the light switch"
+    FORBIDDEN_READS = ("session.message.list", "session.inbox.list", "session.list")
+    GUARD = "if self.state_dir is not None and not self.light:   # #1801: a queued message gone from its inbox"
+
+    def test_the_owners_light_switch_means_the_queued_wait_pass_reads_no_inbox(self):
+        world, sid = self.queued_working()   # a RECORDED queued wait (REAL deliver; the session is FAKE)
+        self.assertTrue((world.state / "queued-wait.json").exists())
+        world.engine.light = True
+        self.consume(world, sid)
+        world.tick(WAIT * 60)
+        mark = len(world.v2.calls)
+        world.engine.run_pass()
+        world.tick(60)
+        world.engine.run_pass()
+        reads = [c[2] for c in world.v2.calls[mark:] if len(c) > 2 and c[1] == "api" and c[2] in self.FORBIDDEN_READS]
+        self.assertEqual(reads, [], self.LIGHT_TEXT)
+        self.assertEqual(self.consumed(world), [], self.LIGHT_TEXT + ": under light reads.inbox answers [] with no call, so an unguarded pass would wrongly conclude a message consumed")
+        if os.environ.get("QUEUED_BEHIND_TURN_INNER"):
+            return
+        name = "test_the_owners_light_switch_means_the_queued_wait_pass_reads_no_inbox"
+        code, out = self.run_in(self.copy_tree(), name)
+        self.assertEqual(code, 0, "the unmutated control must pass first: " + out[-600:])   # REAL
+        tree = self.copy_tree()
+        self.mutate(tree, "bin/fleet-switchboard", self.GUARD, "if self.state_dir is not None:   # #1801: a queued message gone from its inbox")
+        code, out = self.run_in(tree, name)   # FAKE: the mutant is a textual copy, run in a copy of the tree
+        self.assertNotEqual(code, 0)
+        self.assertIn(self.LIGHT_TEXT, out)
 
