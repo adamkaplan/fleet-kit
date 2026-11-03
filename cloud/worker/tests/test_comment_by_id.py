@@ -10,7 +10,7 @@ WRITES = [BASE + " " + w for w in (
     "-X PATCH", "-X DELETE", "-X patch", "--method PATCH", "--method delete",
     "-f body=x", "-F body=x", "--field body=x", "--raw-field body=x", "--input f")]
 NEW = ('"gh api*/issues/comments/*"', '"gh api*/issues/comments/* *"', '"gh api*/issues/comments/*?*"')
-POST_ROW = '"gh api*POST*": "deny",\n'
+POST_ROW = '"gh api*POST*": "deny",'
 
 
 def blocks(text):
@@ -51,10 +51,10 @@ def move_after_writes(text):
     """Move the three new rows of each block to just after the POST row; asserts each shape occurs once per block."""
     out = text
     for ind in ("      ", "          "):
-        rows = "".join(ind + n + ': "allow",\n' for n in NEW)
+        rows = "".join("\n" + ind + n + ': "allow",' for n in NEW)
         assert out.count(rows) == 1, "the new rows must occur once per block"
         out = out.replace(rows, "")
-        post = ind + POST_ROW
+        post = "\n" + ind + POST_ROW
         assert out.count(post) == 1, "the POST row must occur once per block"
         out = out.replace(post, post + rows)
     return out
