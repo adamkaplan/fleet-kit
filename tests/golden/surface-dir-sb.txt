@@ -542,6 +542,9 @@ PLUGIN_EVENT_MAX
 PLUGIN_MESSAGE_RE
 PLUGIN_SESSION_PER_SECOND
 PLUGIN_TOTAL_PER_SECOND
+POD_PR_FILE
+POD_PR_KEEP_SECONDS
+POD_PR_QUEUE_MAX
 POKE_ALARM
 POKE_SOCKET
 POLICY_ACTOR
@@ -2130,6 +2133,8 @@ plan_wake_pass
 plan_wake_route
 plan_wake_state
 plugin_report
+pod_pr_note
+pod_pr_tick
 policy_liveness
 policy_questions
 policy_reply

@@ -468,7 +468,11 @@ polled on a timer.
      number and that issue has an owner in the fleet (parents are climbed as for any issue); two or more stay
      unrouted. The PR's own number and `owner/repo#N` references do not count.
   4. `branch`: reserved. The launch metadata (`metadata.fleet`: name, role, reports_to, issue, charter, repo)
-     does not record an agent's branch, so a head branch is not linked to an agent.
+     does not record an agent's branch, so a head branch is not linked to an agent. A cloud pod is the one case the
+     daemon knows the branch of (its record carries `repo`, `branch` and `reports_to`): the `opened` event of a pull
+     request from that repository and branch is told once, by a separate line `PR opened by <pod>: <repo#N> (ask #<n>,
+     branch <branch>)`, to the record's `reports_to` (dropped if the pull request is closed at delivery; with no valid
+     lane, audited `pod_pr.no_lane`). Routing is unchanged.
 
   Nothing found: the item is dropped and `github.unrouted` names the repo, the `prs` and the first 20 keys. An
   item that was routed is audited in `github.routed` with `routed_by` (`closing`, `notice`, `reference`), the

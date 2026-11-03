@@ -9708,6 +9708,10 @@ def finish_pass(engine, discovery, report):
     except Exception as err:
         engine._failed("cloud-turn-end", "cloud-turn-end", err, report)
     try:
+        pod_pr_tick(engine, discovery)   # #1969: a pod's pull request is told once to its launching lane
+    except Exception as err:
+        engine._failed("pod-pr", "pod-pr", err, report)
+    try:
         lost_worker_tick(engine, discovery)   # #1481: a lost worker is told once to its lane and the Chief of Staff
     except Exception as err:
         engine._failed("lost-worker", "lost-worker", err, report)
@@ -12961,6 +12965,7 @@ class GitHubHub:
                     self.pr_events[ref] = made[1]
                     while len(self.pr_events) > PR_STATE_MAX:
                         self.pr_events.pop(min(self.pr_events, key=lambda r: self.pr_events[r].get("at", 0)))
+            pod_pr_note(self, event, repo, payload)   # #1969: an opened event is queued for the pod-pull-request tick
         except Exception as err:
             self._audit("github.rejected", repo, {"reason": "pull_request event not kept: %s" % _one_line(str(err))})
 
