@@ -17301,6 +17301,7 @@ def read_open_overlap(engine, repo, runner):
         done = (engine.gh_runner or runner)(argv, capture_output=True, text=True, timeout=min(engine.config["call_timeout_seconds"], GITHUB_ROUTE_READ_TIMEOUT),
                                             stdin=subprocess.DEVNULL, **({"env": env} if env is not None else {}))
         if done.returncode == 0:
+            engine.__dict__.setdefault("_overlap_read", {})[repo] = (len(listed) if isinstance(listed := json.loads(done.stdout or "[]"), list) else 0)   # #1889: how many were read, for the line a full list gets
             cache[repo] = overlap_parse_listing(json.loads(done.stdout or "[]"))
     except Exception:   # advisory: whatever goes wrong, there is no line (never a wrong one) and nothing else changes
         cache[repo] = None
@@ -17386,6 +17387,9 @@ def cmd_gates(args, runner, now):
         lines = plan_ledger.render_gates(report, ctx.pr)
         if shares:
             lines.append(shares)
+        read_n = getattr(ctx.engine, "_overlap_read", {}).get(ctx.repo, 0)
+        if read_n >= OVERLAP_LIST_CAP:   # #1889: a full list is said with the exact number read, never a bare cut
+            lines.append("read %d of at least %d open pull requests" % (read_n, read_n))
         lines.extend(bots)
         if suites_finding:
             lines.append(suites_finding)
