@@ -411,14 +411,17 @@ class TestHeavyProgress(unittest.TestCase):
                     def write(self, text):
                         raise error("broken")
                 with mock.patch.dict(globals(), {"Out": Broken}):
-                    rig = Rig(self, alive=0, status=status, env={"FLEET_HEAVY_PROGRESS_SECONDS": "abc"})
+                    try:
+                        rig = Rig(self, alive=0, status=status, env={"FLEET_HEAVY_PROGRESS_SECONDS": "abc"})
+                    except (OSError, ValueError):
+                        self.fail("a broken error stream stopped the child (%s)" % error.__name__)
                 self.assertEqual((len(rig.starts), rig.status), (1, status), "a broken error stream stopped the child (%s, status %d)" % (error.__name__, status))
 
     def test_s16_a_control_character_and_a_broken_stream_each_mutant_fails_with_its_text(self):
-        shown = '''shown = "".join("?" if ord(c) < 32 or 127 <= ord(c) <= 159 else c for c in raw[:40])'''
-        guard = "except (OSError, ValueError):\n                pass"
-        for old, new, text in ((shown, "shown = raw[:40]", "a control character reached the error stream"),
-                               (guard, "except ZeroDivisionError:\n                pass", "a broken error stream stopped the child")):
+        shown = '''raw = "".join("?" if ord(c) < 32 or 127 <= ord(c) <= 159 else c for c in raw[:40])'''
+        guard = "except (OSError, ValueError):\n            pass"
+        for old, new, text in ((shown, "pass", "a control character reached the error stream"),
+                               (guard, "except ZeroDivisionError:\n            pass", "a broken error stream stopped the child")):
             results = self._scratch([(old, new)], "test_s16_inner_a_control_character_is_not_echoed_and_a_broken_stream_does_not_stop_the_child")
             self.assertEqual(results["control"].returncode, 0, results["control"].stdout)
             self.assertEqual(results["mutant"].returncode, 1, results["mutant"].stdout)

@@ -1131,7 +1131,11 @@ def _progress_interval(environ, out=None):
     if value is not None and 0.01 <= value <= 86400:   # nan, inf, zero, negative and above a day fail here
         return value
     if out is not None:
-        out.write("heavy: FLEET_HEAVY_PROGRESS_SECONDS=%s is out of range, using 60\n" % raw[:40])
+        raw = "".join("?" if ord(c) < 32 or 127 <= ord(c) <= 159 else c for c in raw[:40])   # one line, no escape sequence
+        try:
+            out.write("heavy: FLEET_HEAVY_PROGRESS_SECONDS=%s is out of range, using 60\n" % raw[:40])
+        except (OSError, ValueError):
+            pass   # a closed or broken stream: the child still starts
     return PROGRESS_EVERY
 
 
