@@ -6,6 +6,8 @@ reports_to: <github-handle>
 status: active
 ```
 
+A headless orchestrator (no terminal) writes `pane: headless:<its name>` instead of the `wN:pN`.
+
 ## Charter
 
 <What this orchestrator owns. Two or three sentences. Scope, not a task list —
