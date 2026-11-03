@@ -5,9 +5,11 @@ import os
 import signal
 import subprocess
 import sys
+import re
 import tempfile
 import threading
 import time
+import unicodedata
 import unittest
 from unittest import mock
 
@@ -426,6 +428,39 @@ class TestHeavyProgress(unittest.TestCase):
             self.assertEqual(results["control"].returncode, 0, results["control"].stdout)
             self.assertEqual(results["mutant"].returncode, 1, results["mutant"].stdout)
             self.assertIn(text, results["mutant"].stdout)
+
+    def test_s17_inner_a_line_separator_is_not_echoed(self):
+        if not os.environ.get("FLEET_TEST_INNER"):
+            self.skipTest("run by test_s17 in a child process")
+        for sep in ("\u2028", "\u2029"):
+            rig = Rig(self, alive=0, env={"FLEET_HEAVY_PROGRESS_SECONDS": "a" + sep + "heavy: x"})
+            self.assertEqual(len(rig.out.text.splitlines()), 1, "a line separator reached the error stream: %r" % (rig.out.text,))
+            self.assertNotIn(sep, rig.out.text, "a line separator reached the error stream")
+        heavy = load_heavy()
+        for code in range(0x110000):
+            char = chr(code)
+            out = Out([0])
+            heavy._progress_interval({"FLEET_HEAVY_PROGRESS_SECONDS": char}, out)
+            if not out.text:
+                continue   # a digit: a valid interval, no fallback line
+            line = out.text[len("heavy: FLEET_HEAVY_PROGRESS_SECONDS="):-len(" is out of range, using 60\n")]
+            want = "?" if unicodedata.category(char) in ("Cc", "Zl", "Zp") else char
+            if line != want:
+                self.fail("a line separator reached the error stream: U+%04X gave %r, want %r" % (code, line, want))
+            if len(out.text.splitlines()) != 1:
+                self.fail("a line separator reached the error stream: U+%04X splits" % code)
+
+    def test_s17_a_line_separator_mutant_fails_with_its_text_and_the_control_passes_first(self):
+        source = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "bin", "heavy_slots.py")
+        text = open(source).read()
+        lines = re.findall(r'^ *raw = "".join\(.*$', text, re.M)
+        self.assertEqual(len(lines), 1, lines)
+        # mutant E: the code-range version, without U+2028 and U+2029
+        range_line = '        raw = "".join("?" if ord(c) < 32 or 127 <= ord(c) <= 159 else c for c in raw[:40])'
+        results = self._scratch([(lines[0], range_line)], "test_s17_inner_a_line_separator_is_not_echoed")
+        self.assertEqual(results["control"].returncode, 0, results["control"].stdout)
+        self.assertEqual(results["mutant"].returncode, 1, results["mutant"].stdout)
+        self.assertIn("a line separator reached the error stream", results["mutant"].stdout)
 
 
 if __name__ == "__main__":
