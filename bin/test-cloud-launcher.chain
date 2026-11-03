@@ -66,7 +66,9 @@ cloud/launcher/tests/test_stack_registry_pod.py
 cloud/launcher/tests/test_stop_cause.py
 cloud/launcher/tests/test_stop_no_checkout.py
 cloud/launcher/tests/test_stub_cleanup.py
+cloud/launcher/tests/test_tester_forwarding.py
 cloud/launcher/tests/test_tester_pod_hub.py
+cloud/launcher/tests/test_tester_relay.py
 cloud/launcher/tests/test_token_at_limit.py
 cloud/launcher/tests/test_token_read_at_call.py
 cloud/launcher/tests/test_vault_check_pins.py
