@@ -68,5 +68,5 @@ Each is decided by the owner, through the Chief of Staff. No lane buys or enable
 
 | Option | Price per month | Minutes saved per day |
 |---|---|---|
-| larger hosted runners | not readable by a lane (the owner reads the billing page) | about 2322 run-minutes of queue wait in the window (448 runs x a median of 311 s / 60) |
+| larger hosted runners | not readable by a lane (the owner reads the billing page) | queue wait of 2,322 run-minutes in the window (448 runs x a median of 311 s / 60), which is not job-minutes: the job-minutes a larger runner would save are not readable by a lane |
 | more concurrency (a higher plan) | not readable by a lane | not readable by a lane (no figure of minutes derives from a peak of 70 queued jobs against a ceiling of 61) |

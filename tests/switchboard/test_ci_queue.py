@@ -214,7 +214,9 @@ def build(HandoffCase, FAKE_GH):
             self.assertTrue(rows)
             for option, price, minutes in rows:
                 self.assertRegex(price, r"\d|not readable by a lane")
-                self.assertRegex(minutes, r"\d|not readable by a lane")
+                self.assertRegex(minutes, r"\d+ job-minutes|not readable by a lane")
+                if "run-minutes" in minutes:
+                    self.assertIn("not job-minutes", minutes)
             self.assertEqual((REPO / "docs" / "ci-queue-report.md").read_text().count("decided by the owner"), 1)
             self.assertIn("tester's live measure", (REPO / "docs" / "ci-queue-report.md").read_text())
 
