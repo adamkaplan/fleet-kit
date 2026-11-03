@@ -194,6 +194,14 @@ def build(HandoffCase, FAKE_GH):
             with self.assertRaisesRegex(AssertionError, "^1 != 0$"):
                 self.assertEqual(posts, 0)
 
+        def test_docs_report_sentences_about_the_printed_words_are_true(self):
+            text = (REPO / "docs" / "ci-queue-report.md").read_text()
+            printed = "\n".join(sb.ci_queue_lines(self.measure()))
+            self.assertNotIn("prints the reopened-run count", text)
+            for words in ("repeat runs on one head", "draft push runs"):
+                self.assertIn('"%s"' % words, text)
+                self.assertIn(words, printed)
+
         def test_docs_report_every_spend_row_has_a_price_and_a_minutes_cell(self):
             lines = (REPO / "docs" / "ci-queue-report.md").read_text().split("## Spend options", 1)[1].splitlines()
             rows = [l.strip("|").split("|") for l in lines if l.startswith("|") and not l.startswith("|---") and "Option" not in l]

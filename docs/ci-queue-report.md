@@ -50,7 +50,7 @@ The ceiling is observed, not published: the highest count of jobs running at one
 | cut | other `nightly-cloud` legs (three) | 72 |
 | dedupe | the duplicate checkout and setup of `test` and `test-cloud` (`fetch-depth: 0` twice per system) | not counted by a lane: the command reads the times of a job, not of its steps, and the checkout and setup are steps, so their job-minutes are not in the data |
 
-The figure of S8 (the reopened runs and their job-minutes) is the tester's live measure: the command prints the reopened-run count and its job-minutes from the data, and the tester states the count it finds.
+The figure of S8 (the reopened runs and their job-minutes) is the tester's live measure: the command does not print a reopened-run count: it prints "repeat runs on one head" and "draft push runs" (the draft count is always 0, because the run list carries no draft flag), and the tester states the count it finds.
 
 Draft-push runs: 0 counted, because the run list does not carry the draft state. `plan` is read by no gate but builds the matrix: not a cut. The gate names are the four legs of `bin/merge_gate.py` (`UBUNTU_LEGS`, `MAC_LEGS`); whether the repository's own required checks add more is not readable by a lane.
 
