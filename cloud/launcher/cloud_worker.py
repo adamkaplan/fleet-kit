@@ -136,6 +136,19 @@ def wip_note_due(started, now, already):
     return not already and started is not None and (now - started).total_seconds() >= WIP_NOTE_AFTER_SECONDS
 
 
+# The idle nudge: a pod idle for 15 minutes with no results file is asked, once, to continue with its brief.
+IDLE_NUDGE = "Continue with the remaining steps of your brief and push each commit. If you are finished, write /work/results.txt."
+IDLE_NUDGE_AFTER_SECONDS = 15 * 60
+IDLE_NUDGE_MARK = "idle-nudge"                   # the pod annotation (cw/idle-nudge) that says the nudge was sent: once, never twice
+
+
+def idle_nudge_due(busy, last_activity, now, idle_seconds, already, role, results_exists):
+    """True only for a pod that is not busy, idle for 15 minutes or more, whose idle limit is longer than 15 minutes, not nudged yet,
+    not the orchestrator, and whose results file does not exist."""
+    return (not busy and last_activity is not None and (now - last_activity).total_seconds() >= IDLE_NUDGE_AFTER_SECONDS
+            and idle_seconds > IDLE_NUDGE_AFTER_SECONDS and not already and role != "orchestrator" and results_exists is False)
+
+
 # Run INSIDE the pod by `kubectl exec python3 -c <this> <text>`: the pod's own headless server, the password file the activity probe reads.
 # It prompts the newest session with the note (queued). It prints nothing and holds no credential beyond the server password it already reads.
 NOTE_SENDER_CODE = (
@@ -2557,6 +2570,7 @@ class Launcher:
         out.extend(renewed)
         self.remove_orphan_secrets(pods, now)
         self.send_wip_notes(live, now)
+        self.send_idle_nudges(live, now)
         return out
 
     def _note_vanished_pods(self, pods, now):
@@ -2695,6 +2709,34 @@ class Launcher:
                 self.audit(worker, "pod/" + name, "wip-note", self._cost_or_zero(pod), True, "")
             except Exception as e:
                 print("cloud-worker: the 40-minute note was not sent: %s" % self.kube.scrub(e, 120), file=sys.stderr)
+
+    def send_idle_nudges(self, pods, now):
+        """ONE fixed line to a stalled builder (see idle_nudge_due). The cw/idle-nudge annotation is set BEFORE the send; one audit line.
+        A results check that cannot run means do not nudge. Never raises."""
+        for pod in pods:
+            try:
+                worker, name = ann(pod, "worker"), pod["metadata"]["name"]
+                if (pod.get("status") or {}).get("phase") != "Running" or not NAME_RE.match(worker or ""):
+                    continue
+                if ann(pod, "idle-nudge") or ann(pod, "role", "worker") == "orchestrator":
+                    continue
+                act = self.activity(name)
+                if not act or act[0] or act[1] is None:
+                    continue
+                idle = int(ann(pod, "idle-seconds", "600"))
+                if not idle_nudge_due(False, act[1], now, idle, "", ann(pod, "role", "worker"), False):
+                    continue
+                try:   # one read-only exec: it prints yes or no; a failure to run means do not nudge
+                    seen = self.kube.exec(name, "sh", "-c", "test -e /work/results.txt && echo yes || echo no").strip()
+                except CloudError:
+                    continue
+                if seen != "no":
+                    continue
+                self.kube.annotate(name, (pod.get("metadata") or {}).get("uid"), **{IDLE_NUDGE_MARK: "sent"})
+                self.send_note(name, IDLE_NUDGE)
+                self.audit(worker, "pod/" + name, "idle-nudge", self._cost_or_zero(pod), True, "")
+            except Exception as e:
+                print("cloud-worker: the idle nudge was not sent: %s" % self.kube.scrub(e, 120), file=sys.stderr)
 
     def send_note(self, name, text):
         self.kube.exec(name, "python3", "-c", NOTE_SENDER_CODE, text)
