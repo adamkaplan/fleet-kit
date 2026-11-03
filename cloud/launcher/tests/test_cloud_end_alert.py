@@ -73,10 +73,10 @@ class TestAlerts(World):
             self.stop(name, reason, run="r" + name)
         self.run_pass()
         self.assertEqual(len(self.sent), 6)
-        for name, label, pushed in (("worker1", "idle", "yes"), ("worker2", "hard limit", "no"), ("worker3", "idle", "yes")):
+        for name, label, pushed in (("worker1", "idle", "unpushed work saved to worker1/wip"), ("worker2", "hard limit", "nothing unpushed"), ("worker3", "idle", "unpushed work saved to worker3/wip")):
             self.assertEqual(sorted(to for to, t in self.sent if name in t), ["chief-of-staff", "coder-lead"])
             for text in (t for to, t in self.sent if name in t):
-                for fact in (name, "reason " + label, "at 2026-01-01T10:00:00Z", "work pushed: " + pushed, "run record: %s-20260101T000000Z-0f1e2d" % name):
+                for fact in (name, "reason " + label, "at 2026-01-01T10:00:00Z", pushed, "run record: %s-20260101T000000Z-0f1e2d" % name):
                     self.assertIn(fact, text)
                 self.assertNotIn(self.dir, text)
                 self.assertNotIn("a1b2c3", text)
@@ -220,7 +220,7 @@ class TestUntrusted(World):
         self.stop("worker7", "idle")
         self.run_pass()
         for to, text in self.sent:
-            self.assertIn("work pushed: yes;", text)
+            self.assertIn("; unknown;", text)
             self.assertIn("run record: worker7-20260101T000000Z-0f1e2d.", text)
             for bad in ("x.example", "sk-", "yyyy", "\n"):
                 self.assertNotIn(bad, text)
@@ -319,7 +319,7 @@ class TestS9ThreeHostileRecords(World):
         present, occurrences, shapes = FACT_COUNT, 0, 0
         for to, text in self.sent:
             facts = ["worker7", "reason idle limit", "at 2026-01-01T10:00:00Z",
-                     "work pushed: yes;" if valid_name else "work pushed: unknown;",
+                     "; unknown;",
                      ("run record: %s." % record_name) if valid_name else "run record: unknown."]
             present = min(present, sum(1 for fact in facts if fact in text))
             for piece in [branch] + [x for x in branch.split("\n") if x]:
@@ -425,7 +425,7 @@ class TestCauseRules(World):
         self.run_pass()
         self.assertEqual(len(self.sent), 2)
         for to, text in self.sent:
-            self.assertIn("work pushed: unknown", text)
+            self.assertIn("; unknown; run record", text)
             self.assertIn("run record: unknown", text)
 
     def test_s14_another_hour_alerts_again(self):
@@ -603,8 +603,8 @@ class TestDocs(unittest.TestCase):
 
 
 class TestMessageSlot(unittest.TestCase):
-    OLD = {False: "[cloud worker ended] worker7 was ended by the launcher: reason idle limit; at 2026-01-01T10:00:00Z; work pushed: yes; run record: unknown.",
-           True: "[cloud worker ended] worker7 was ended by the launcher: reason idle limit; at 2026-01-01T10:00:00Z; work pushed: yes; run record: unknown."
+    OLD = {False: "[cloud worker ended] worker7 was ended by the launcher: reason idle limit; at 2026-01-01T10:00:00Z; yes; run record: unknown.",
+           True: "[cloud worker ended] worker7 was ended by the launcher: reason idle limit; at 2026-01-01T10:00:00Z; yes; run record: unknown."
                  " The end hook could not push: the pod was kept and the work may be unpushed."}
 
     def text(self, module=real, **more):
