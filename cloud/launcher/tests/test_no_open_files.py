@@ -13,6 +13,7 @@ import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(HERE)))
+# Files run at the same time must not share a temp name: test_cloud_pr_preflight lists the temp dir for cloud-preflight-*, so no other file here may create such names.
 GUARDED = (
     "test_chain_time.py",
     "test_cloud_end_alert.py",
@@ -95,6 +96,8 @@ def run_all(names):
 
 
 class GuardEachFile(unittest.TestCase):
+    @unittest.skipIf(sys.platform == "darwin",
+                     "the leak check does not depend on the platform; the ubuntu leg of the test-cloud job enforces it; on macOS the chain step reached its 20-minute limit with this guard (run 41618172100)")
     def test_s3_each_listed_file_leaves_nothing_open(self):
         results = run_all(GUARDED)
         for n in GUARDED:
