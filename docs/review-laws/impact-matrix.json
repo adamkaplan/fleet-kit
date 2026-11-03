@@ -401,6 +401,7 @@
         "bin/awaiting_live.py",
         "bin/ci_runs.py",
         "bin/cloud_worker.py",
+        "bin/comment_cursor.py",
         "bin/cpu_guard.py",
         "bin/dead_hint.py",
         "bin/decision_core.py",
