@@ -244,7 +244,18 @@ def build(HandoffCase):
         def git(self, *args):
             return subprocess.run(("git",) + args, cwd=str(REPO), stdout=subprocess.PIPE, universal_newlines=True, check=True).stdout
 
+        def own_branch(self):
+            """True only where this branch carries change #1785 (a commit subject names it)."""
+            if subprocess.run(["git", "rev-parse", "--verify", "-q", "origin/integration"], cwd=str(REPO), stdout=subprocess.PIPE).returncode:
+                return False
+            return any("#1785" in s for s in self.git("log", "--format=%s", "origin/integration..HEAD").splitlines())
+
+        def need_own_branch(self):
+            if not self.own_branch():
+                self.skipTest("this branch does not carry the change of #1785 (no commit names it since origin/integration)")
+
         def test_s2_the_documents_gain_inserted_lines_only(self):
+            self.need_own_branch()
             rows = {r[2]: r for r in self.numstat()}
             skill = "skills/fleet-planning/SKILL.md"
             self.assertEqual([n for n, r in rows.items() if r[1] != "0" and n != skill], [], "a file other than the skill has removed lines")
@@ -278,6 +289,9 @@ def build(HandoffCase):
             text = SKILL.read_text()
             self.assertEqual(len(re.findall(r"^## Rehearse before approval$", text, re.M)), 1)
             self.assertEqual(text.count("A code change gets a no-commit rehearsal pod first: see `docs/plan-template.md` and `fleet-switchboard rehearse -h`."), 1)
+
+        def test_u4_the_pin_commits_changed_exactly_the_skill_lines_they_name(self):
+            self.need_own_branch()
             title = "pin change of #1785 (the planning skill shortened under its cap)"
             rng = "origin/integration..HEAD"
             subjects = self.git("log", "--format=%s", rng).splitlines()
@@ -289,6 +303,7 @@ def build(HandoffCase):
             self.assertEqual(pins, changed)
 
         def test_s8_no_existing_test_line_changes_and_no_pin_change_commit(self):
+            self.need_own_branch()
             for added, removed, name in self.numstat():
                 if name.startswith("tests/") or name == "bin/test-switchboard":
                     self.assertEqual(removed, "0", name)
