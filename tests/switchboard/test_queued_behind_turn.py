@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import types
 import unittest
 from pathlib import Path
@@ -17,10 +18,11 @@ from support.herdr_world import World
 from support.loader import captured, sb
 from support.wire_fakes import EPOCH, FAKE_HERDR, FAKE_OPENCODE
 
-WAIT = 58   # minutes a queued message waited; over PENDING_WAIT_MINUTES (5)
+WAIT = 58   # minutes a queued message waited; asserted over PENDING_WAIT_MINUTES in the tests
 IN_TURN_TEXT = "a message admitted while the session is in a turn says it queued behind a turn"
 WAITED_TEXT = "a consumed message says how long it waited from delivery to read"
 WORDS = "queued behind a turn"
+IDLE_STEP, IDLE_OFFSET = 61, 7   # seconds between the idle fixtures (one more than a minute, so the minute digit moves)
 ROOT = Path(__file__).resolve().parents[2]
 
 # The first header line of 20 messages admitted to an IDLE session, recorded by running idle_headers() on the head of #1842 (03eb3175) BEFORE
@@ -29,7 +31,156 @@ RECORDED = json.loads(Path(__file__).with_name("fixtures").joinpath("queued_behi
     if Path(__file__).with_name("fixtures").joinpath("queued_behind_turn_idle_headers.json").exists() else None
 
 
-class TestQueuedBehindTurn(Base):
+def fresh_module():
+    """A FRESH module object of bin/queued_wait.py, exec'd by path as the daemon loads modules."""
+    module = types.ModuleType("queued_wait_fresh")
+    module.__file__ = str(ROOT / "bin" / "queued_wait.py")
+    exec(compile((ROOT / "bin" / "queued_wait.py").read_text(), module.__file__, "exec"), module.__dict__)
+    return module
+
+
+class QueuedWaitModuleTests:
+    """The module on its own (#1801 findings): the second pass, the lock, the read bound, a missing id, the cap and the drop."""
+
+    def qw_setup(self):
+        self.dir = tempfile.mkdtemp(prefix="qw-", dir="/tmp/opencode" if os.path.isdir("/tmp/opencode") else None)
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        self.q = fresh_module()
+
+    def note(self, mid="m1", session="s1", delivered=1000, keys=("k1",)):
+        if not hasattr(self, "q"):
+            self.qw_setup()
+        return self.q.note_delivery(self.dir, mid, "platform", session, list(keys), delivered, json.loads)
+
+    def observe(self, now, inbox):
+        if not hasattr(self, "q"):
+            self.qw_setup()
+        return self.q.observe(self.dir, now, json.loads, lambda sid: inbox)
+
+    def test_an_empty_list_then_the_item_again_writes_no_consumed(self):
+        self.note()
+        self.assertEqual(self.observe(2000, []), [])
+        self.assertEqual(self.observe(2100, [{"id": "m1"}]), [])
+        self.assertEqual(self.observe(2200, []), [])   # the sighting was reset: this is a first one again
+        self.assertEqual(self.observe(2300, [{"id": "m1"}]), [])
+
+    def test_two_passes_with_it_gone_write_one_with_the_first_time(self):
+        self.note()
+        self.assertEqual(self.observe(2000, []), [])
+        (event,) = self.observe(2100, [])
+        self.assertEqual((event[0], event[2]["consumed"], event[2]["waited_seconds"]), ("message.consumed", 2000, 1000))
+        self.assertEqual(self.observe(2200, []), [])
+
+    def test_an_unreadable_inbox_concludes_nothing(self):
+        self.note()
+        self.assertEqual(self.observe(2000, None), [])
+        self.assertEqual(self.observe(2100, None), [])
+        self.assertEqual(json.loads(Path(self.dir, "queued-wait.json").read_text())["m1"].get("gone_since"), None)
+
+    def test_two_threads_noting_fifty_each_end_with_all_notes(self):
+        self.qw_setup()
+        each = min(50, self.q.MAX_NOTES // 2)
+        errors = []
+
+        def run(tag):
+            try:
+                for i in range(each):
+                    self.note("%s%d" % (tag, i), delivered=i)
+            except Exception as err:
+                errors.append(err)
+        threads = [threading.Thread(target=run, args=(t,)) for t in "ab"]
+        [t.start() for t in threads]
+        [t.join() for t in threads]
+        self.assertEqual(errors, [])
+        self.assertEqual(len(json.loads(Path(self.dir, "queued-wait.json").read_text())), 2 * each)
+
+    def test_reads_per_pass_are_bounded_oldest_first(self):
+        self.qw_setup()
+        limit = self.q.MAX_READS_PER_PASS
+        for i in range(limit + 5):
+            self.note("m%d" % i, session="s%d" % i, delivered=1000 + i)
+        seen = []
+        self.q.observe(self.dir, 5000, json.loads, lambda sid: seen.append(sid) or [{"id": "m" + sid[1:]}])
+        self.assertEqual(seen, ["s%d" % i for i in range(limit)])
+        seen[:] = []
+        self.q.observe(self.dir, 5100, json.loads, lambda sid: seen.append(sid) or [{"id": "m" + sid[1:]}])
+        self.assertEqual(len(seen), limit)   # still the oldest first; every note is read at most limit per pass
+
+    def test_a_missing_message_id_is_keyed_by_the_first_key_or_skipped(self):
+        self.assertEqual(self.note(None, keys=("kx", "ky")), [])
+        self.assertIn("kx", json.loads(Path(self.dir, "queued-wait.json").read_text()))
+        (event,) = self.note(None, keys=())
+        self.assertEqual(event[0], "queued_wait.skipped")
+
+    def test_the_cap_evicts_the_oldest_with_an_event_the_next_pass_audits(self):
+        self.qw_setup()
+        cap = self.q.MAX_NOTES
+        for i in range(cap):
+            self.note("m%d" % i, delivered=1000 + i)
+        (event,) = self.note("extra", delivered=9999)
+        self.assertEqual((event[0], event[2]["message_id"]), ("queued_wait.evicted", "m0"))
+        notes = json.loads(Path(self.dir, "queued-wait.json").read_text())
+        self.assertEqual((len(notes), "m0" in notes, "extra" in notes), (cap, False, True))
+        self.assertEqual([e[0] for e in self.observe(10000, None)], ["queued_wait.evicted"])
+        self.assertEqual(self.observe(10100, None), [])
+
+    def test_a_seven_day_drop_is_audited_once(self):
+        self.note(delivered=1000)
+        now = 1000 + self.q.DROP_AFTER + 1
+        (event,) = self.observe(now, [{"id": "m1"}])
+        self.assertEqual((event[0], event[2]["message_id"]), ("message.consumed.dropped", "m1"))
+        self.assertEqual(self.observe(now + 1, [{"id": "m1"}]), [])
+
+    def test_the_file_is_0600_after_a_rewrite_and_a_gone_session_concludes_nothing(self):
+        self.note()
+        self.note("m2", delivered=1001)
+        self.observe(2000, None)
+        self.assertEqual(Path(self.dir, "queued-wait.json").stat().st_mode & 0o777, 0o600)
+        self.assertEqual([p.name for p in Path(self.dir).glob("*.tmp")], [])
+
+    def test_a_fresh_load_reads_the_file_and_a_dict_mutant_fails(self):
+        self.qw_setup()
+        self.note()
+        again = fresh_module()   # a fresh object: nothing in memory, so only the file can carry the note
+        self.assertEqual(again.observe(self.dir, 2000, json.loads, lambda s: []), [])
+        (event,) = again.observe(self.dir, 2100, json.loads, lambda s: [])
+        self.assertEqual(event[2]["waited_seconds"], 1000)
+        source = (ROOT / "bin" / "queued_wait.py").read_text()
+        anchor = "        old = _read(state_dir, parse)\n        new = {k: dict(v) for k, v in old.items()}"
+        self.assertEqual(source.count(anchor), 1)
+        # the mutant keeps notes in a module-level dict (never reads the file): a fresh load has none, so the control's line is not written
+        mutant = types.ModuleType("qw_mutant")
+        exec(compile(source.replace(anchor, "        old = _MEM\n        new = {k: dict(v) for k, v in old.items()}").replace(
+            "_counter = ", "_MEM = {}\n_counter = ", 1), "m", "exec"), mutant.__dict__)
+        other = tempfile.mkdtemp(prefix="qw-", dir=self.dir)
+        self.note("m9")
+        self.assertEqual(mutant.observe(other, 2000, json.loads, lambda s: []), [])
+        self.assertEqual(mutant.observe(other, 2100, json.loads, lambda s: []), [])   # never reads the file: no consumed line where the control wrote one
+
+
+OTHER_NOW = EPOCH + 100000
+OTHER_SHAPES = Path(__file__).with_name("fixtures").joinpath("queued_behind_turn_other_headers.json")
+
+
+def other_shape_headers():
+    """First header lines of other shapes (delayed, held, supersedes, a date), composed with in_turn off. The fixture was generated by running
+    this function on `git archive origin/cw/header-date-2` (the BASE, before the change)."""
+    out = []
+    for age in (1900, 3600, 8000, 90000):   # delayed (held 31 min, 1 h is under 2 h so min, 2 h+, and another day)
+        out.append(sb.compose("platform", [sb.Fact("send:c:1", "platform", "send", "late", OTHER_NOW - age, batch=False, sender="coder")],
+                              delivered=OTHER_NOW)[0].splitlines()[0])
+    for age, earlier in ((10, (OTHER_NOW - 500,)), (20, (OTHER_NOW - 500, OTHER_NOW - 700)), (2500, (OTHER_NOW - 3000,)), (30, (OTHER_NOW - 90000,))):
+        fact = sb.Fact("send:c:2", "platform", "send", "newer", OTHER_NOW - age, batch=False, sender="coder")
+        fact.supersedes = earlier
+        out.append(sb.compose("platform", [fact], delivered=OTHER_NOW)[0].splitlines()[0])
+    for held in (1900, 4000):   # a held header with newest-sent: two facts, the older one late
+        facts = [sb.Fact("send:c:%d" % j, "platform", "send", "m%d" % j, OTHER_NOW - (held if j == 0 else 60 * j), batch=False, sender="coder")
+                 for j in range(3)]
+        out.append(sb.compose("platform", facts, delivered=OTHER_NOW)[0].splitlines()[0])
+    return out
+
+
+class TestQueuedBehindTurn(QueuedWaitModuleTests, Base):
 
     CONFIG = {"send_to_working": "queue"}   # a send to a working session is QUEUED (the delivery the case of 1 November 2026 shows)
 
@@ -50,9 +201,9 @@ class TestQueuedBehindTurn(Base):
 
     def idle_headers(self):
         out = []
-        for i in range(20):
+        for i in range(len(RECORDED)):   # the fixture list decides how many
             world, _sid = self.world_of({})
-            world.tick(i * 61 + 7)
+            world.tick(i * IDLE_STEP + IDLE_OFFSET)
             self.assertTrue(world.engine.send("cos", "platform", "msg %d" % i)["sent"])
             (admitted,) = world.admissions("platform")
             out.append(admitted["text"].splitlines()[0])
@@ -85,10 +236,16 @@ class TestQueuedBehindTurn(Base):
         self.assertEqual(admitted["text"].count(WORDS), 1, IN_TURN_TEXT)
         self.assertIn("delivered %s, %s)" % (sb.clock_utc(world.clock.now()), WORDS), header, IN_TURN_TEXT)
         self.assertIsNotNone(RECORDED, "the recorded headers are missing")
-        self.assertEqual(len(RECORDED), 20)
+        self.assertEqual(len(RECORDED), 20)   # the brief's count; idle_headers() follows the fixture's length
         headers = self.idle_headers()
         self.assertEqual([h for h, r in zip(headers, RECORDED) if h != r], [], "an idle header differs from its recorded bytes")
         self.assertEqual(sum(h.count(WORDS) for h in headers), 0)
+        # headers of OTHER shapes (delayed, held, supersedes), recorded on the BASE (before the change), byte for byte
+        recorded = json.loads(OTHER_SHAPES.read_text())
+        self.assertEqual(len(recorded), 10)
+        self.assertEqual(other_shape_headers(), recorded, "a header of another shape differs from its recorded bytes")
+        for shape in ("delayed", "held", "supersedes"):
+            self.assertTrue(any(shape in h for h in recorded), shape)
 
     # ---- S3 (REAL audit line)
     def test_s3_the_audit_line_says_whether_the_session_was_in_a_turn(self):
@@ -96,14 +253,18 @@ class TestQueuedBehindTurn(Base):
         idle, _ = self.world_of({})
         self.assertTrue(self.send(idle)["sent"])
         flags = [e["detail"]["in_turn"] for e in self.intents(idle)]   # the worlds of one test share the audit file: it holds both lines, busy first
-        self.assertEqual((flags.count(True), flags.count(False)), (1, 1))
+        self.assertEqual((flags.count(True), flags.count(False)), (len([f for f in flags if f]), len([f for f in flags if not f])))
+        self.assertEqual(flags, [True, False])   # one of each, the working session's first
 
     # ---- S4 (REAL note, pass, audit and pending)
     def test_s4_a_consumed_message_says_how_long_it_waited(self):
         world, sid = self.queued_working()
         world.tick(WAIT * 60)
         self.consume(world, sid)
-        world.engine.run_pass()
+        world.engine.run_pass()   # the first pass that sees it gone: not yet concluded
+        self.assertEqual(self.consumed(world), [])
+        world.tick(60)
+        world.engine.run_pass()   # the second pass confirms; the time stays the first pass's
         (line,) = self.consumed(world)
         self.assertEqual(line["detail"]["waited_seconds"], WAIT * 60, WAITED_TEXT)
         world.engine.run_pass()
@@ -114,9 +275,12 @@ class TestQueuedBehindTurn(Base):
     # ---- S7
     def test_s7_an_unconsumed_message_says_not_yet_read_only_over_five_minutes(self):
         world, _sid = self.queued_working()
-        world.tick(3 * 60)
+        limit = fresh_module().PENDING_WAIT_MINUTES
+        self.assertGreater(WAIT, limit)
+        under = limit - 2
+        world.tick(under * 60)
         self.assertEqual(self.pending_out(world).count("waited"), 0)
-        world.tick((WAIT - 3) * 60)
+        world.tick((WAIT - under) * 60)
         self.assertIn("waited %d min, not yet read" % WAIT, self.pending_out(world))
         self.assertEqual(self.consumed(world), [])
 
@@ -126,6 +290,9 @@ class TestQueuedBehindTurn(Base):
         world.tick(WAIT * 60)
         world.engine = world.new_engine()   # a new engine on the same state dir
         self.consume(world, sid)
+        world.engine.run_pass()
+        world.tick(60)
+        world.engine = world.new_engine()   # and again: the sighting is in the file
         world.engine.run_pass()
         (line,) = self.consumed(world)
         self.assertEqual(line["detail"]["waited_seconds"], WAIT * 60)
@@ -166,7 +333,9 @@ class TestQueuedBehindTurn(Base):
         self.assertNotEqual(code, 0)
         self.assertIn(IN_TURN_TEXT, out)
         tree = self.copy_tree()
-        self.mutate(tree, "bin/queued_wait.py", 'note["consumed"] = now', 'note["consumed"] = note["delivered"]')
+        self.mutate(tree, "bin/queued_wait.py", 'note["consumed"] = first', 'note["consumed"] = note["delivered"]')
         code, out = self.run_in(tree, "test_s4_a_consumed_message_says_how_long_it_waited")
         self.assertNotEqual(code, 0)
         self.assertIn(WAITED_TEXT, out)
+
+
