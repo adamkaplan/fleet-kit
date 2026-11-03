@@ -122,7 +122,7 @@ LIVE = [
 
 
 def run_plain(command):
-    p = subprocess.run([sys.executable, TOOL, command], capture_output=True, text=True)
+    p = subprocess.run([sys.executable, TOOL, "--list", LIST, command], capture_output=True, text=True)
     return p.returncode, p.stdout
 
 
@@ -180,7 +180,7 @@ class ContinuationMutant(unittest.TestCase):
         self.addCleanup(os.unlink, path)
         with os.fdopen(fd, "w") as fh:
             fh.write(text)
-        p = subprocess.run([sys.executable, path, CONT[0][1]], capture_output=True, text=True)
+        p = subprocess.run([sys.executable, path, "--list", LIST, CONT[0][1]], capture_output=True, text=True)
         self.assertEqual(p.returncode, 1, "continuation case a: the tool must deny: " + p.stdout)
 
     def mutate(self, text):
@@ -220,7 +220,7 @@ class NewCodeMutant(unittest.TestCase):
 
     def backtick_case(self, tool):
         command = LIVE[0][1]
-        p = subprocess.run([sys.executable, tool, command], capture_output=True, text=True)
+        p = subprocess.run([sys.executable, tool, "--list", LIST, command], capture_output=True, text=True)
         self.assertEqual(p.returncode, 1, "backtick case: the tool must deny: " + p.stdout)
 
     def test_control_passes(self):
