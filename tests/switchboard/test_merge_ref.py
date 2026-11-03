@@ -98,6 +98,43 @@ def build(HandoffCase):
             self.assertNotIn("fresh", out)
             self.assertEqual(self.writes(), [])
 
+        def absent_runner(self, pull):
+            """A runner whose ref read is a 404 and whose pull read answers `pull` (a JSON text, or None for a 404)."""
+            def run(argv, **kwargs):
+                self.calls.append(argv)
+                if argv[:2] == ["gh", "api"] and "/commits/refs/pull/" in argv[2]:
+                    return FakeDone(1, "", "gh: Not Found (HTTP 404)")
+                if argv[:2] == ["gh", "api"] and argv[2].endswith("/pulls/5"):
+                    return FakeDone(0, pull) if pull is not None else FakeDone(1, "", "gh: Not Found (HTTP 404)")
+                raise AssertionError("an unexpected call: %r" % (argv,))
+            return run
+
+        def run_absent(self, pull):
+            with captured() as (out, err):
+                code = sb.main(["merge-ref", PR], runner=self.absent_runner(pull), now=self.world.clock.now)
+            return code, out.getvalue(), err.getvalue()
+
+        def test_s4a_a_pull_request_that_does_not_exist_is_named_exit_1(self):
+            code, out, err = self.run_absent(None)
+            self.assertEqual(code, 1)
+            self.assertNotIn("conflicts", out + err)
+            self.assertIn("does not exist", out + err)
+            self.assertEqual(len((out + err).strip().splitlines()), 1)
+
+        def test_s4b_a_conflicting_pull_request_is_the_conflict_line_exit_3(self):
+            for body in ('{"m":false,"s":"dirty"}', '{"m":false,"s":"unknown"}'):
+                code, out, _ = self.run_absent(body)
+                self.assertEqual(code, 3)
+                self.assertEqual(len(out.strip().splitlines()), 1)
+                self.assertIn("conflicts", out)
+
+        def test_s4c_a_ref_not_built_yet_says_run_refresh_exit_1(self):
+            code, out, err = self.run_absent('{"m":null,"s":"unknown"}')
+            self.assertEqual(code, 1)
+            self.assertNotIn("conflicts", out + err)
+            self.assertIn("no merge ref yet (GitHub has not built it): run merge-ref --refresh", out + err)
+            self.assertEqual(len((out + err).strip().splitlines()), 1)
+
         def test_s4_an_unreadable_answer_is_named_and_changes_nothing(self):
             self.garbage = True
             code, out, err = self.run_cmd()
