@@ -468,7 +468,7 @@ class Grammar(Base):
 
     def snapshot(self):
         """argv of every call and the environment of every call without the per-run values."""
-        env = [l for l in open(self.envlog).read().splitlines()
+        env = [l for l in pathlib.Path(self.envlog).read_text().splitlines()
                if not l.startswith(("HOME=", "PWD=", "OLDPWD=", "SHLVL=", "_="))]
         return self.calls_list(), env
 
@@ -599,12 +599,12 @@ class Grammar(Base):
         }
         for name, (scenario, edits) in muts.items():
             mut = os.path.join(self.t, "mut-" + name.replace(" ", "-"))
-            s = open(HOOK).read()
+            s = pathlib.Path(HOOK).read_text()
             for old, new in edits:
                 self.assertIn(old, s, name)
                 s = s.replace(old, new)
-            self.assertNotEqual(s, open(HOOK).read())   # the mutation applied
-            open(mut, "w").write(s)
+            self.assertNotEqual(s, pathlib.Path(HOOK).read_text())   # the mutation applied
+            pathlib.Path(mut).write_text(s)
             with self.subTest(mutant=name):
                 with self.assertRaises(AssertionError):
                     getattr(self, "scenario_" + scenario)(mut)
@@ -613,7 +613,7 @@ class Grammar(Base):
     def test_the_seam_is_not_reachable_from_the_environment(self):
         self.assertEqual(cw_end_hook.HOST_URL, "https://github.com/")
         self.assertEqual(cw_end_hook.HELPER_DIR, "/run/cw-tmp/bin")
-        code = [l for l in open(HOOK).read().splitlines() if not l.lstrip().startswith("#")]
+        code = [l for l in pathlib.Path(HOOK).read_text().splitlines() if not l.lstrip().startswith("#")]
         for name in ("HOST_URL", "HELPER_DIR"):
             self.assertEqual([l for l in code if l.startswith(name + " =")], [l for l in code if l.startswith(name + " =")][:1])
             self.assertFalse([l for l in code if name in l and "environ" in l])
@@ -680,13 +680,13 @@ class Completeness(Base):
 
     def setUp(self):
         super().setUp()
-        self.plain = open(os.path.join(self.work, ".git", "config")).read()
+        self.plain = pathlib.Path(os.path.join(self.work, ".git", "config")).read_text()
         self.ctx = cw_end_hook.Ctx(self.helper)
         self.addCleanup(self.ctx.close)
         self.ctx.env["PATH"] = "/usr/bin:/bin"
 
     def doc_keys(self):
-        keys = [l.strip() for l in open(KEYS_FIXTURE) if l.strip() and not l.startswith("#")]
+        keys = [l.strip() for l in pathlib.Path(KEYS_FIXTURE).read_text().splitlines(True) if l.strip() and not l.startswith("#")]
         live = subprocess.run([GIT, "help", "-c"], capture_output=True, text=True)
         if live.returncode == 0 and live.stdout.strip():
             keys += [l.strip() for l in live.stdout.splitlines() if l.strip()]   # a newer git in the image adds its own keys
@@ -732,7 +732,7 @@ class Completeness(Base):
         return path
 
     def test_a_wildcard_in_the_allow_list_is_caught(self):
-        s = open(HOOK).read()
+        s = pathlib.Path(HOOK).read_text()
         for old, new in (("ALLOWED_KEYS = {", 'ALLOWED_KEYS = {"gc.recentobjectshook", '),):
             self.assertIn(old, s)
         mut = s.replace("ALLOWED_KEYS = {", 'ALLOWED_KEYS = {"gc.recentobjectshook", ')
@@ -774,7 +774,7 @@ class EarlyReturns(Base):
         # a linked worktree or a separate git directory: .git is a FILE
         work = os.path.join(self.t, "linked")
         sh("git", "-C", self.work, "worktree", "add", "-q", "--detach", work)
-        open(os.path.join(work, "w.txt"), "w").write("x")
+        pathlib.Path(os.path.join(work, "w.txt")).write_text("x")
         self.assertTrue(os.path.isfile(os.path.join(work, ".git")))
         p = self.run_main(CW_WORKDIR=work)
         self.one_line(p, ".git is a file: a linked worktree or a separate git directory is not supported); work left in %s" % work)
@@ -795,7 +795,7 @@ class EarlyReturns(Base):
 
     def test_names_only_and_at_most_fifty(self):
         for i in range(60):
-            open(os.path.join(self.work, "f%02d.txt" % i), "w").write("SECRET-CONTENT")
+            pathlib.Path(os.path.join(self.work, "f%02d.txt" % i)).write_text("SECRET-CONTENT")
         sh("git", "-C", self.work, "config", "core.sshCommand", "false")
         p = self.run_main()
         self.one_line(p, "(+10 more)")
@@ -829,7 +829,7 @@ class EarlyReturns(Base):
     def test_a_mutant_finding_git_by_path_fails_with_the_guard(self):
         self.guard_on_path()
         self.dirty()
-        s = open(HOOK).read()
+        s = pathlib.Path(HOOK).read_text()
         self.assertIn("[GIT_BIN, ", s)
         mut = os.path.join(self.t, "mut-pathgit")
         with open(mut, "w") as f:
@@ -839,7 +839,7 @@ class EarlyReturns(Base):
         self.assertEqual(self.wip(), "")
 
     def test_a_mutant_that_returns_silently_is_caught(self):
-        s = open(HOOK).read()
+        s = pathlib.Path(HOOK).read_text()
         mut = os.path.join(self.t, "mut-silent")
         open(mut, "w").write(s.replace('return report(workdir, "the pod\'s credential helper was not found")', "return 0"))
         self.assertNotEqual(open(mut).read(), s)
