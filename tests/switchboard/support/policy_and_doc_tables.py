@@ -2,7 +2,6 @@
 import ast
 from pathlib import Path
 import re
-from support.paths import BIN, REPO
 from support.delivery_measure import REPO
 from support.loader import sb
 

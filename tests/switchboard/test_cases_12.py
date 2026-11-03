@@ -60,7 +60,7 @@ class WorkflowPlanPins(unittest.TestCase):
     WORKFLOW = REPO / ".github" / "workflows" / "test.yml"
     LIST = REPO / ".github" / "macos-platform-paths.txt"
     REQUIRED = ("test (macos-latest)", "test (ubuntu-latest)")
-    GROUPS = ("shims", "plugins", "install-and-service", "heavy-slot", "workflow")
+    GROUPS = ("shims", "plugins", "install-and-service", "heavy-slot", "workflow", "cloud-launcher-chain")
 
     @staticmethod
     def entries(listtext):
@@ -181,7 +181,7 @@ class WorkflowPlanPins(unittest.TestCase):
         check(jobs.count("ref: ${{ matrix.ref }}") == 2, "the nightly leg checks out its own ref")
         check("PATH_LIST" not in text and 'LIST = ".github/macos-platform-paths.txt"' in text and "origin/\" + base + \":\" + LIST" in text, "the plan reads the one list file, from the base")
         groups = self.groups(listtext)
-        check(sorted(groups) == sorted(self.GROUPS) and all(groups.values()), "the list names all 5 groups")
+        check(sorted(groups) == sorted(self.GROUPS) and all(groups.values()), "the list names all 6 groups")
         for entry in self.retypable(listtext):
             check(entry not in text, "an entry of the list is re-typed in the workflow: " + entry)
         def run(*a, **k):

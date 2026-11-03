@@ -554,6 +554,24 @@ class TestShimHygiene(unittest.TestCase):
         for number, line in enumerate(text.splitlines(), 1):
             self.assertIsNone(pattern.search(line), "%d: %s" % (number, line))
 
+    @staticmethod
+    def module_faults(directory):
+        """#1909: every *.py module of `directory` is standard library only and holds no personal name; returns 'module:line: problem' strings."""
+        faults = []
+        pattern = re.compile("|".join(["jan" + "us", "sp" + "ire", "adk" + "aplan", "/Us" + "ers/", "direc" + "tor(?!y|ies)"]), re.IGNORECASE)
+        for path in sorted(Path(directory).glob("*.py")):
+            text = path.read_text()
+            for node in ast.walk(ast.parse(text)):
+                names = [a.name.split(".")[0] for a in node.names] if isinstance(node, ast.Import) else \
+                    [node.module.split(".")[0]] if isinstance(node, ast.ImportFrom) and node.level == 0 else []
+                faults += ["%s:%d: imports %s, not the standard library" % (path.name, node.lineno, n) for n in names if n not in sys.stdlib_module_names]
+            faults += ["%s:%d: holds a personal name" % (path.name, number) for number, line in enumerate(text.splitlines(), 1) if pattern.search(line)]
+        return faults
+
+    def test_every_module_under_shims_is_standard_library_only_and_impersonal(self):
+        self.assertEqual(len(list((SHIM.parent).glob("*.py"))), 6)
+        self.assertEqual(self.module_faults(SHIM.parent), [])
+
 
 class TestBriefParsing(unittest.TestCase):
     def test_the_sections_are_read_with_or_without_markup(self):

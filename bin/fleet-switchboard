@@ -22490,7 +22490,7 @@ def preflight_added(runner, root):
             diff = runner(["git", "diff", "--name-status", "--no-renames", "--diff-filter=A", found.stdout.strip()], cwd=root, capture_output=True, text=True)
             if diff.returncode == 0:
                 rows = [line.split("\t", 1) for line in diff.stdout.splitlines() if "\t" in line]
-                return sorted(path for status, path in rows if status == "A" and path.startswith("bin/") and "__pycache__" not in path)
+                return sorted(path for status, path in rows if status == "A" and path.startswith(("bin/", "shims/")) and "__pycache__" not in path)
     return []
 
 
@@ -22500,8 +22500,8 @@ def run_new_bin_guards(ps, runner, root, added, now):
     rows = ps.guard_rows(added)
     if not rows:
         return 0
-    print("preflight-pr: new file under bin/ (%s): the %d guards every new bin file must pass" % (", ".join(added), len(rows)))
-    guards, failed = {tuple(ps.guard_command(g)): g for g in ps.NEW_BIN_GUARDS}, 0
+    print("preflight-pr: new file under bin/ or shims/ (%s): the %d guards every new file there must pass" % (", ".join(added), len(rows)))
+    guards, failed = {tuple(ps.guard_command(g)): g for g in ps.NEW_BIN_GUARDS + ps.NEW_SHIM_GUARDS}, 0
     for _suite, _classes, command, _why in rows:
         guard = guards[tuple(command)]
         gone = ps.guard_missing(root, guard)
@@ -26009,6 +26009,18 @@ def cmd_triage(args, runner, now):
 
 
 cmd_triage.direct = True   # one small file: no daemon start, no GitHub
+
+
+def add_ci_queue_parsers(sub):
+    ci_queue = sub.add_parser("ci-queue", help="Measure the Actions queue of a window (wait, run time, jobs, peak queued); reads GitHub, writes nothing",
+                              description="Counts the workflow runs of a window: per run the queue wait and run time, the jobs by workflow and name, the "
+                                          "job-minutes by workflow, the peak of jobs queued at once, the observed ceiling of jobs running at once, and the "
+                                          "cut, dedupe and move candidates in job-minutes per day. GET requests only.")
+    ci_queue.add_argument("--repo", metavar="OWNER/REPO", help="The repository (default: the configured intent repository)")
+    ci_queue.add_argument("--hours", type=int, default=24, help="The window in hours (1 to 168; default 24)")
+    ci_queue.add_argument("--until", metavar="ISO", help="The end of the window, an ISO time with a zone (default: now)")
+    ci_queue.add_argument("--paths-file", metavar="FILE", default=".github/macos-platform-paths.txt", help="The platform-path list read for the move candidates (default: the one of the current directory; unreadable: none)")
+    ci_queue.add_argument("--json", action="store_true", help="Print the report as JSON")
 
 
 def add_triage_parsers(sub):
