@@ -603,7 +603,7 @@ def pass_and_merge(reading, gh, conf, state, repo, number, holder, pid, clock, s
             if not isinstance(now, (int, float)) or isinstance(now, bool) or not math.isfinite(now):
                 raise ValueError("clock")
             stamp = time.strftime("%H:%M:%SZ", time.gmtime(now))
-        except (OverflowError, TypeError, ValueError, OSError):
+        except Exception:
             stamp = "an unknown time"
         return done(1, "merge-gate --pass --merge: refused or failed (exit %d), the pull request state is unknown at %s (%s): read the pull request: %s" % (
             code, stamp, seen, audit["merge_said"]), "refused: merge exit %d" % code)

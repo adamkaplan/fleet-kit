@@ -163,6 +163,16 @@ class TestMergeGateAnswer(AnswerBase):
                 self.assertIn("unknown at an unknown time", lines[-1], msg="an unusable clock is reported as an unknown time")
                 self.assertEqual(audit["merge_said"], "gh: boom")
 
+    def test_s11_a_clock_that_raises_is_an_unknown_time(self):
+        def boom():
+            if self.fake.merges:
+                raise RuntimeError("clock broke")
+            return self.fake.clock()
+        self.fake.view = {"state": "OPEN", "headRefOid": MG_HEAD}
+        code, lines, audit = self.run_real(clock=boom)
+        self.assertEqual(code, 1, msg="a raising clock ends in the refusal, no traceback")
+        self.assertIn("state is unknown at an unknown time", lines[-1])
+
     def test_s8_merged_without_a_head_says_no_head_given(self):
         self.fake.view = {"state": "MERGED"}
         code, lines, audit = self.run_real()
@@ -250,3 +260,23 @@ class TestMergeGateAnswerMutant(AnswerBase):
         with self.assertRaises(AssertionError) as caught:
             none_clock(mutant)
         self.assertIn("an unusable clock is reported as an unknown time", str(caught.exception))
+
+    def test_s11_raising_clock_control_then_mutant(self):
+        text = (REPO / "bin" / "merge_gate.py").read_text()
+        needle = "        except Exception:\n            stamp = \"an unknown time\""
+        self.assertEqual(text.count(needle), 1)
+
+        def raising(gate):
+            self.fake = self.fresh()
+            self.fake.view = {"state": "OPEN", "headRefOid": MG_HEAD}
+
+            def boom():
+                if self.fake.merges:
+                    raise RuntimeError("clock broke")
+                return self.fake.clock()
+            code, lines, audit = self.run_real(gate, clock=boom)
+            self.assertIn("state is unknown at an unknown time", lines[-1], msg="a raising clock ends in the refusal")
+        raising(self.copy(text))
+        mutant = self.copy(text.replace(needle, needle.replace("Exception", "(OverflowError, TypeError, ValueError, OSError)")))
+        with self.assertRaises(RuntimeError):   # REAL: the old tuple lets RuntimeError escape
+            raising(mutant)
