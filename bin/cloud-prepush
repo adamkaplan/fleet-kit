@@ -152,6 +152,10 @@ def select(root, changed):
         if os.path.isfile(os.path.join(root, rel)) and rel not in picked:
             picked.append(rel)
             SCAN_SELECTOR[rel] = sel
+    if cloud_quick is not None and PREFLIGHT_MODE[0] == "quick":  # the one order of both commands (ask #1733)
+        pairs = cloud_quick.order_quick(root, [(r, None) for r in picked], set(changed), reads if cloud_quick is not None else [],
+                                        cloud_quick.quick_seconds(root))
+        return [r for r, _ in pairs]
     return sorted(picked)
 
 
@@ -323,6 +327,8 @@ def read_result(arg):
         print("cloud-prepush: run %d, identical: %d (of which failing on both sides: %d), could not run %d"
               % (run, same, kinds.count("both_fail"), kinds.count("noRun")))
         print("cloud-prepush: advice only; continuous integration stays the gate and its result is the only evidence")
+    if doc.get("left_to_ci"):
+        print(doc["left_to_ci"])
     rc = doc.get("exit")
     return rc if isinstance(rc, int) and rc else 0
 
@@ -434,6 +440,12 @@ def main2(argv, TIMEOUT, TOTAL):
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def quick_budget():
+    """The quick budget of the run's own loop: CLOUD_PREFLIGHT_QUICK_TOTAL, as for the preflight (default 240 seconds)."""
+    raw = os.environ.get("CLOUD_PREFLIGHT_QUICK_TOTAL", "")
+    return int(raw) if raw.isascii() and raw.isdigit() and int(raw) >= 1 else 240
+
+
 def stage(root, base, mbase, changed, tmp, scratch, TIMEOUT_S, TOTAL_S, started, PF_S, MODE="quick"):
     # Step 1: the preflight of the pod, before any test.
     PREFLIGHT_MODE[0] = MODE
@@ -469,6 +481,8 @@ def stage(root, base, mbase, changed, tmp, scratch, TIMEOUT_S, TOTAL_S, started,
                 note(line)
     if cloud_quick is not None:
         print("cloud-prepush: %s" % cloud_quick.mode_line(READERS[0], len(changed)), file=sys.stderr)
+    if cloud_quick is not None and MODE == "quick" and picked:
+        print("cloud-prepush: " + cloud_quick.order_line(picked), file=sys.stderr)
     if not picked or reason:
         note("cloud-prepush: %d changed file(s) but NO test was selected; this is not a clean result (advice only)" % len(changed))
         return 1
@@ -479,15 +493,34 @@ def stage(root, base, mbase, changed, tmp, scratch, TIMEOUT_S, TOTAL_S, started,
     if rec:
         rec.select(picked)
     run = same = noRun = 0
+    left_ci = cloud_quick.left_to_ci(*cloud_quick.split_readers(READ_LIST)) if cloud_quick is not None and MODE == "quick" else []
+    left_notes = []
+    skipped = []  # quick: checks whose recorded seconds do not fit the time left; left to CI
+    seconds = cloud_quick.quick_seconds(root) if cloud_quick is not None and MODE == "quick" else {}
+    loop_start = time.monotonic()
+    stopped = False
     both_fail = []
     diffs = []
     try:
         for i, rel in enumerate(picked, 1):
+            if rel in left_ci and rel in READ_LIST:  # one reader can run: this one is left to CI (not a difference)
+                noRun += 1
+                left_notes.append("NOT RUN: %s cannot run in quick" % rel)
+                if rec:
+                    rec.set(rel, branch="could not run", base="could not run", kind="noRun", text=left_notes[-1])
+                continue
             if MODE == "quick" and cloud_quick is not None and cloud_quick.cannot_run_quick(rel) and rel in READ_LIST:
                 noRun += 1
                 diffs.append("NOT RUN: %s cannot run in quick" % rel)
                 if rec:
                     rec.set(rel, branch="could not run", base="could not run", kind="noRun", text=diffs[-1])
+                continue
+            if MODE == "quick" and seconds and not stopped and (run or noRun):
+                # both sides run here, so twice the recorded seconds must fit the quick budget left
+                quick_left = quick_budget() - (time.monotonic() - loop_start)
+                stopped = not cloud_quick.fits(rel, seconds, quick_left / 2.0)
+            if stopped and rel not in HEAVY:
+                skipped.append(rel)
                 continue
             if rel in HEAVY:
                 noRun += 1
@@ -561,11 +594,17 @@ def stage(root, base, mbase, changed, tmp, scratch, TIMEOUT_S, TOTAL_S, started,
         git(["worktree", "prune"], root)
     for d in diffs:
         print(d)
+    for d in left_notes:
+        print(d)
     for rel in both_fail:
         print("FAILS ON BOTH SIDES with the same tail (a new failure inside it would hide): " + rel)
     print("cloud-prepush: run %d, identical: %d (of which failing on both sides: %d), could not run %d"
           % (run, same, len(both_fail), noRun))
     print("cloud-prepush: advice only; continuous integration stays the gate and its result is the only evidence")
+    if left_notes or skipped:
+        if rec:
+            rec.doc["left_to_ci"] = cloud_quick.left_line(list(left_ci) + skipped)
+        print(cloud_quick.left_line(list(left_ci) + skipped))
     return 1 if diffs else 0
 
 
