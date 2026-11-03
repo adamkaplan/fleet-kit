@@ -30,7 +30,62 @@ class Probe:
         return False
 
 
-class TestCloudSendState(unittest.TestCase):
+class TheDeliveredLineMutant:
+    """S5: a mutant that restores the delivered line for a dead pod is caught by the anchored text; the control passes first; a no-op fails the computation."""
+    SOURCE = sb.load_module("cloud_worker").__file__
+    OLD = "    if warning:\n        sys.stderr.write(\"%s: WARNING"
+    NEW = "    if False:\n        sys.stderr.write(\"%s: WARNING"
+    ANCHOR = "a dead pod is never reported delivered"
+
+    def compute(self, old, new):
+        """The mutation computed from the two texts, in its own process: exit 1 when the two texts are identical (a no-op is no mutation)."""
+        import subprocess
+        import sys
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            a, b = tmp + "/a", tmp + "/b"
+            open(a, "w").write(old)
+            open(b, "w").write(new)
+            code = "import sys; sys.exit(0 if open(sys.argv[1]).read() != open(sys.argv[2]).read() else 1)"
+            return subprocess.run([sys.executable, "-c", code, a, b]).returncode
+
+    def run_dead_pod_test(self, source):
+        import types
+        mod = types.ModuleType("cw_send_mutant")
+        mod.__dict__["__file__"] = self.SOURCE
+        import sys
+        sys.modules["cw_send_mutant"] = mod
+        try:
+            exec(compile(source, "cw_send_mutant", "exec"), mod.__dict__)
+            result = self._run_variant(mod)
+        finally:
+            sys.modules.pop("cw_send_mutant", None)
+        return result
+
+    def _run_variant(self, mod):
+
+        class Variant(TestCloudSendState):
+            def setUp(inner):
+                super().setUp()
+                inner.module = mod.bind(vars(sb))
+        result = unittest.TestResult()
+        Variant("test_a_dead_pod_is_never_reported_delivered").run(result)
+        return result
+
+    def test_the_control_passes_the_no_op_fails_the_computation_and_the_real_mutant_is_caught(self):
+        source = open(self.SOURCE).read()
+        self.assertEqual(source.count(self.OLD), 1)
+        control = self.run_dead_pod_test(source)
+        self.assertEqual((control.failures, control.errors), ([], []), "control: the unmutated source passes")
+        self.assertEqual(self.compute(source, source.replace(self.OLD, self.OLD)), 1, "a no-op mutation fails the computation")
+        mutated = source.replace(self.OLD, self.NEW)
+        self.assertEqual(self.compute(source, mutated), 0)
+        result = self.run_dead_pod_test(mutated)
+        self.assertEqual(len(result.failures), 1)
+        self.assertIn(self.ANCHOR, result.failures[0][1])
+
+
+class TestCloudSendState(TheDeliveredLineMutant, unittest.TestCase):
     def setUp(self):
         self.module = sb.load_module("cloud_worker").bind(vars(sb))
         self.prompts, self.calls = [], []
