@@ -1,6 +1,8 @@
 """#1889: the comments of a window are read incrementally (the REAL hub.read_pages over a fake gh runner that filters `since`, pages and counts); the overlap list is read whole or says how many."""
 import json
 import math
+import os
+import stat
 import subprocess
 import tempfile
 import types
@@ -11,6 +13,7 @@ from unittest import mock
 from support.core import Base
 from support.rebind import rebound
 from support.loader import copy_entry, _load, sb
+from test_open_list_cuts import real_hub
 
 NOW = 1798000000.0
 REPO = "acme/api"
@@ -69,7 +72,42 @@ class HubCase(Base):
         return [a for a in self.audit if a[1] == "comment_cursor.fallback"]
 
 
-class TestCommentCursor(HubCase):
+class PublishMixin:
+    """The real publish_decisions raises the comment-window alert (run inside TestCommentCursor, the one wired class)."""
+
+    def publish_engine(self, with_cos):
+        cos = {"cos": types.SimpleNamespace(fleet={"role": "chief-of-staff"})} if with_cos else {}
+        return types.SimpleNamespace(config={"plan_gates": {"repos": {REPO: {}}}, "github_repos": [REPO]}, state_dir=str(self.state_dir), actor="daemon",
+                                     discovery=types.SimpleNamespace(agents=cos), audit=types.SimpleNamespace(append=lambda *a: self.audit.append(a)),
+                                     hub=real_hub(0), now=lambda: NOW, _note=lambda *a, **k: None)
+
+    def publish(self, engine):
+        quiet = lambda *a, **k: None
+        with mock.patch.object(sb, "derive_decisions", lambda e, n: ([], [])), mock.patch.object(sb, "sweep_decisions", lambda e, d, n, errs: d), \
+                mock.patch.object(sb, "triage_pass", quiet), mock.patch.object(sb, "pr_events_pass", quiet), mock.patch.object(sb, "pane_health_pass", quiet), \
+                mock.patch.object(sb, "decision_store", lambda e: types.SimpleNamespace(publish=lambda *a, **k: True)), \
+                mock.patch.object(sb, "chat_clear_pass", quiet), mock.patch.object(sb, "apply_notice_effects", quiet), mock.patch.object(sb, "prune_escalations_pass", quiet), \
+                mock.patch.object(sb, "sync_external", lambda *a, **k: []), mock.patch.object(sb, "work_sync_external", quiet):
+            sb.publish_decisions(engine)
+
+    def test_the_real_publish_decisions_takes_the_cuts_and_alerts(self):
+        sb.take_comment_cuts()
+        sb._COMMENT_CUTS[("sweep", REPO)] = (3000, 7)
+        self.publish(self.publish_engine(True))
+        self.assertEqual([a[1] for a in self.audit if a[1].startswith("comment_window.")], ["comment_window.cut"])
+        self.assertEqual(sb.take_comment_cuts(), {})
+
+    def test_without_a_chief_of_staff_the_cut_is_one_unsent_line_a_day(self):
+        sb.take_comment_cuts()
+        sb._UNSENT_DAY.clear()
+        self.addCleanup(sb._UNSENT_DAY.clear)
+        for _ in range(2):
+            sb._COMMENT_CUTS[("sweep", REPO)] = (3000, 7)
+            self.publish(self.publish_engine(False))
+        self.assertEqual([a[1] for a in self.audit if a[1].startswith("comment_window.")], ["comment_window.cut_unsent"])
+
+
+class TestCommentCursor(PublishMixin, HubCase):
     def world(self, total=2582):
         return CommentWorld(NOW - 7 * DAY, total)
 
@@ -217,6 +255,46 @@ class TestCommentCursor(HubCase):
         self.assertEqual(list(taken), [REPO])   # one alert a day per repository
         self.assertEqual(sb._COMMENT_CUTS, {})
 
+    def test_a_sliding_window_drops_the_held_comments_older_than_it(self):
+        world = self.world(150)   # comments from since+60s, 200 s apart: about 8 hours
+        hub = self.hub(world)
+        got, _ = hub.read_comments("sweep", REPO, self.since, cap=sb.COMMENT_WINDOW_PAGES)
+        self.assertEqual(len(got), 150)
+        later = sb.iso(NOW - 7 * DAY + 60 + 100 * 200)   # the window's start passes the oldest 100
+        got, _ = hub.read_comments("sweep", REPO, later, cap=sb.COMMENT_WINDOW_PAGES)
+        self.assertEqual(len(got), 50, msg="held comments older than the window drop")
+        self.assertTrue(all(c["created_at"] >= later for c in got))
+
+    def test_the_fallback_audit_is_one_line_over_a_window_read_and_a_later_incremental_read(self):
+        world = self.world(300)
+        hub = self.hub(world)
+        hub.read_comments("sweep", REPO, self.since, cap=sb.COMMENT_WINDOW_PAGES)
+        world.add(5)
+        hub.read_comments("sweep", REPO, self.since, cap=sb.COMMENT_WINDOW_PAGES)
+        hub.read_comments("sweep", REPO, self.since, cap=sb.COMMENT_WINDOW_PAGES)
+        self.assertEqual(len(self.fallbacks()), 1, msg="the fallback is written once, not at every read")
+
+    def test_the_cursor_file_is_written_only_on_a_change_mode_0600_and_a_failed_replace_leaves_the_old_one(self):
+        path = self.state_dir / "comment-cursors.json"
+        world = self.world(50)
+        hub = self.hub(world)
+        hub.read_comments("sweep", REPO, self.since, cap=sb.COMMENT_WINDOW_PAGES)
+        os.utime(path, ns=(10 ** 18, 10 ** 18))
+        before = (path.read_bytes(), path.stat().st_mtime_ns)
+        hub.read_comments("sweep", REPO, self.since, cap=sb.COMMENT_WINDOW_PAGES)   # no new comment
+        self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before, msg="no write without a change")
+        os.chmod(path, 0o644)
+        world.add(1)
+        hub.read_comments("sweep", REPO, self.since, cap=sb.COMMENT_WINDOW_PAGES)
+        self.assertNotEqual(path.read_bytes(), before[0])
+        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+        kept = path.read_bytes()
+        world.add(1)
+        store = sb.load_module("comment_cursor")
+        with mock.patch.object(store.os, "replace", side_effect=OSError("boom")):
+            hub.read_comments("sweep", REPO, self.since, cap=sb.COMMENT_WINDOW_PAGES)
+        self.assertEqual(path.read_bytes(), kept)
+
     def test_a_small_repository_reads_what_it_read_before(self):
         world = self.world(150)
         got, cut = self.hub(world).read_comments("triage", REPO, self.since, cap=sb.COMMENT_WINDOW_PAGES)
@@ -248,11 +326,21 @@ class TestOverlapListWhole(Base):
         self.assertEqual(read_n, sb.OVERLAP_LIST_CAP, msg="every open pull request is read or the line says how many: %d of 250" % read_n)
         self.assertEqual("read %d of at least %d open pull requests" % (read_n, read_n), "read 200 of at least 200 open pull requests")
 
+    def test_the_gates_line_is_written_by_cmd_gates_from_the_read_count(self):
+        """Limit: the real `cmd_gates` needs the heavy host fixture (LedgerBase of bin/test-switchboard, outside this file); the read count is tested through the real
+        `read_open_overlap` above and the formatting is pinned here in the source of `cmd_gates`, which holds it inline."""
+        import inspect
+        source = inspect.getsource(sb.cmd_gates)
+        self.assertIn('read_n = getattr(ctx.engine, "_overlap_read", {}).get(ctx.repo, 0)', source)
+        self.assertIn("if read_n >= OVERLAP_LIST_CAP:", source)
+        self.assertIn('lines.append("read %d of at least %d open pull requests" % (read_n, read_n))', source)
+
 
 class TestCommentCursorMutants(Base):
     """#1889 S7: the cursor ignored, and the overlap cap back at 50, each fail the test with its anchored text; the unmutated copy passes first."""
     CASES = (("cursor", "test_s2_every_comment_of_the_window_is_read_once", TestCommentCursor, "every comment of the window is read once"),
-             ("overlap", "test_s6_every_open_pull_request_is_read_or_the_line_says_how_many", TestOverlapListWhole, "every open pull request is read or the line says how many"))
+             ("overlap", "test_s6_every_open_pull_request_is_read_or_the_line_says_how_many", TestOverlapListWhole, "every open pull request is read or the line says how many"),
+             ("prune", "test_a_sliding_window_drops_the_held_comments_older_than_it", TestCommentCursor, "held comments older than the window drop"))
 
     def run_against(self, edit, tag, cls, name):
         with tempfile.TemporaryDirectory() as tmp:
@@ -272,7 +360,8 @@ class TestCommentCursorMutants(Base):
             control = self.run_against(lambda t: t, tag + "_control", cls, name)
             self.assertEqual((len(control.failures), len(control.errors), control.testsRun), (0, 0, 1), msg=str(control.failures + control.errors))
         edits = {"cursor": ("have, mark = held.get(key), cursors.get(name)", "have, mark = None, None"),
-                 "overlap": ("OVERLAP_LIST_CAP = 200 ", "OVERLAP_LIST_CAP = 50 ")}
+                 "overlap": ("OVERLAP_LIST_CAP = 200 ", "OVERLAP_LIST_CAP = 50 "),
+                 "prune": ('        have = {k: v for k, v in have.items() if v["created_at"] >= since}\n', '        have = {k: v for k, v in have.items()}\n')}
         for tag, name, cls, text in self.CASES:
             old, new = edits[tag]
             counts = []
