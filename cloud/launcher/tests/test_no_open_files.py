@@ -88,6 +88,10 @@ class MutantLeak(unittest.TestCase):
         self.addCleanup(shutil.rmtree, d, True)
         tests = os.path.join(d, "cloud", "launcher", "tests")
         os.makedirs(tests)
+        launcher = os.path.dirname(HERE)
+        for entry in os.listdir(launcher):
+            if entry != "tests":
+                os.symlink(os.path.join(launcher, entry), os.path.join(d, "cloud", "launcher", entry))
         for link in ("bin", "docs"):
             os.symlink(os.path.join(ROOT, link), os.path.join(d, link))
         with open(os.path.join(HERE, self.NAME), encoding="utf-8") as f:
