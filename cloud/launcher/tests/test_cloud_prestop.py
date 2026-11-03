@@ -841,8 +841,8 @@ class EarlyReturns(Base):
     def test_a_mutant_that_returns_silently_is_caught(self):
         s = pathlib.Path(HOOK).read_text()
         mut = os.path.join(self.t, "mut-silent")
-        open(mut, "w").write(s.replace('return report(workdir, "the pod\'s credential helper was not found")', "return 0"))
-        self.assertNotEqual(open(mut).read(), s)
+        pathlib.Path(mut).write_text(s.replace('return report(workdir, "the pod\'s credential helper was not found")', "return 0"))
+        self.assertNotEqual(pathlib.Path(mut).read_text(), s)
         self.dirty()
         p = subprocess.run([self.seam(mut, helper_dir=os.path.join(self.t, "nowhere")), "--prestop"], env=self.env(), capture_output=True, text=True)
         with self.assertRaises(AssertionError):
@@ -857,8 +857,8 @@ class AutoGc(Base):
         self.marker = os.path.join(self.t, "gcmarker")
         cfg = os.path.join(self.work, ".git", "config")
         if not hasattr(self, "plain_cfg"):
-            self.plain_cfg = open(cfg).read()
-            open(script, "w").write("#!/bin/sh\necho ran >> %s\nexit 1\n" % self.marker)
+            self.plain_cfg = pathlib.Path(cfg).read_text()
+            pathlib.Path(script).write_text("#!/bin/sh\necho ran >> %s\nexit 1\n" % self.marker)
             os.chmod(script, 0o755)
             # loose (unreachable) objects so that an auto-gc has a reason to run: gc.auto=1 fires at more than one loose object in objects/17
             n, d = 0, os.path.join(self.work, ".git", "objects", "17")
@@ -901,8 +901,8 @@ class AutoGc(Base):
 
     def variant(self, text, name):
         mut = os.path.join(self.t, "mut-" + name)
-        open(mut, "w").write(text)
-        self.assertNotEqual(text, open(HOOK).read(), name)
+        pathlib.Path(mut).write_text(text)
+        self.assertNotEqual(text, pathlib.Path(HOOK).read_text(), name)
         if os.path.exists(self.marker):
             os.remove(self.marker)
         self.dirty()
@@ -914,7 +914,7 @@ class AutoGc(Base):
         return ran
 
     def test_mutants_wildcard_restored_and_gc_pin_removed_are_caught(self):
-        s = open(HOOK).read()
+        s = pathlib.Path(HOOK).read_text()
         check = "if key not in ALLOWED_KEYS and not BRANCH_RE.match(key):"
         pin = '"gc.auto=0", '
         self.assertIn(check, s)
@@ -949,7 +949,7 @@ class LaunchSequence(Base):
                 sh("git", "-C", work, "checkout", "-q", "-b", branch)
                 sh("git", "-C", work, "config", "user.name", "worker")
                 sh("git", "-C", work, "config", "user.email", "worker@users.noreply.github.com")
-                open(os.path.join(work, "n.txt"), "w").write("n")
+                pathlib.Path(os.path.join(work, "n.txt")).write_text("n")
                 sh("git", "-C", work, "add", "n.txt")
                 sh("git", "-C", work, "commit", "-qm", "c")
                 sh("git", "-C", work, "push", "-q", "-u", "origin", branch)
@@ -996,7 +996,7 @@ class Spec(unittest.TestCase):
 
     def test_the_refusal_text_names_the_recovery_route(self):
         self.assertIn("recover read-only", cw.RECOVERY_ROUTE)
-        src = open(os.path.join(LAUNCHER, "cloud_worker.py")).read()
+        src = pathlib.Path(os.path.join(LAUNCHER, "cloud_worker.py")).read_text()
         self.assertIn("RECOVERY_ROUTE)", src)
 
 
