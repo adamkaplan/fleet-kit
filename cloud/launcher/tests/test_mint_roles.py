@@ -124,7 +124,7 @@ class RequestBodies(Fx):
         self.assertEqual(perms, ORCH_SET)
         self.assertEqual(sorted(perms), ["checks", "issues", "metadata", "pull_requests"])
         self.assertNotIn("contents", perms)
-        self.assertEqual(list(app_token.PERMISSIONS_BY_ROLE), ["worker", "orchestrator"])
+        self.assertEqual(list(app_token.PERMISSIONS_BY_ROLE), ["worker", "worker-workflows", "orchestrator"])
 
     def test_s2_the_texts_of_each_kind_equal_the_table(self):
         for role in SETS:
@@ -284,8 +284,8 @@ class Mutants(unittest.TestCase):
         self.assertTrue([b for b in bad if b.startswith("check orchestrator")])
 
     def test_s6_a_worker_set_that_differs_fails_the_request(self):
-        m = mutant("cloud/launcher/app_token.py", '"pull_requests": "write", "issues": "read", "metadata": "read"},\n    "orch',
-                   '"pull_requests": "read", "issues": "read", "metadata": "read"},\n    "orch')
+        m = mutant("cloud/launcher/app_token.py", '"pull_requests": "write", "issues": "read", "metadata": "read"},\n    "worker-workflows',
+                   '"pull_requests": "read", "issues": "read", "metadata": "read"},\n    "worker-workflows')
         self.assertIn("body worker", table_failures(m))
 
 
