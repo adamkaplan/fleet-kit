@@ -663,7 +663,7 @@ def run_logs(args):
 # An issues path is allowed only as repos/OWNER/NAME/issues/N/comments; every other issues path is refused.
 API_ISSUE = re.compile(r"repos/[^/]+/[^/]+/issues(/.*)?", re.I)
 API_ISSUE_COMMENTS = re.compile(r"repos/[^/]+/[^/]+/issues/\d+/comments", re.I)
-API_ISSUE_COMMENT_BY_ID = re.compile(r"repos/[^/]+/[^/]+/issues/comments/\d+", re.I)
+API_ISSUE_COMMENT_BY_ID = re.compile(r"repos/[^/]+/[^/]+/issues/comments/[0-9]+", re.I)
 
 
 def api_path_clean(path):

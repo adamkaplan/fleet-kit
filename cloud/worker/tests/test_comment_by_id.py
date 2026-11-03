@@ -105,6 +105,36 @@ class ClientIsGetOnly(unittest.TestCase):
         for bad in ("abc", "1/reactions", "1/../2"):
             self.assertFalse(self.m.api_path_allowed("/repos/o/r/issues/comments/" + bad), bad)
 
+    def test_non_ascii_digit_ids_refused(self):
+        base = "/repos/o/r/issues/comments/"
+        self.assertTrue(self.m.api_path_allowed(base + "123"), "control: ascii id")
+        for bad in ("\u0661\u0662\u0663", "\uff11\uff12\uff13"):
+            self.assertFalse(self.m.api_path_allowed(base + bad), "non-ascii digit id allowed: " + repr(bad))
+
+    def test_mutant_restoring_unicode_digits_fails_anchored(self):
+        import importlib.machinery, importlib.util
+        with open(os.path.join(ROOT, "cloud/worker/cw-gh")) as f:
+            text = f.read()
+        old, new = "issues/comments/[0-9]+", "issues/comments/\\d+"
+        self.assertEqual(text.count(old), 1)
+        noop_text = text.replace(old, old)
+        self.assertEqual(noop_text, text, "the no-op mutation changed the text")
+        mut = text.replace(old, new)
+        self.assertEqual(len(mut), len(text) - len(old) + len(new), "the mutation was not applied")
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            res = {}
+            for label, body in (("control", text), ("mutant", mut)):
+                fp = os.path.join(d, label + "-cw-gh")
+                with open(fp, "w") as f:
+                    f.write(body)
+                ld = importlib.machinery.SourceFileLoader("cw_gh_" + label, fp)
+                m = importlib.util.module_from_spec(importlib.util.spec_from_loader(ld.name, ld))
+                ld.exec_module(m)
+                res[label] = m.api_path_allowed("/repos/o/r/issues/comments/\u0661\u0662\u0663")
+            self.assertFalse(res["control"], "control must refuse the Arabic-Indic id")
+            self.assertTrue(res["mutant"], "the mutant must allow the Arabic-Indic id (anchored: non-ascii digit id allowed)")
+
     def test_write_forms_refused_by_api_get(self):
         for extra in (["-X", "PATCH"], ["-f", "a=b"]):
             with self.assertRaises(self.m.Fail):
