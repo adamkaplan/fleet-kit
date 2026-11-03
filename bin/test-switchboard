@@ -74710,6 +74710,8 @@ class TestBlockedReport(Base):
         self.assertEqual(len(self.told("cos")), 1)
 
     def test_a_block_that_ends_with_messages_still_held_says_so(self):
+        self.test_note_held_send_keeps_each_row_adds_to_a_dict_entry_and_only_for_a_blocked_agent()   # #2051: the killers of the two direct guards
+        self.test_the_tick_with_no_plan_for_the_agent_reports_its_refused_sends()
         self.block()
         self.wait(25)
         self.pane["status"] = "idle"
@@ -74916,6 +74918,7 @@ class TestBlockedReport(Base):
         self.assertIn("ended turn", sb.blocked_kind(engine, observation), "another agent's request is not this one's")
 
     def test_a_block_that_ends_before_it_was_reported_says_nothing(self):
+        self.test_note_held_send_keeps_each_row_adds_to_a_dict_entry_and_only_for_a_blocked_agent()   # #2051: the direct killer of the note_held_send entry guard
         self.block()
         self.wait(10)
         self.pane["status"] = "idle"
