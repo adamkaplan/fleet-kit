@@ -738,7 +738,8 @@ def _launch(args, runner, now, reserve):
         options += [CREATE_OPTION["boss"], args.reports_to] if args.reports_to else []
     if getattr(args, "role", None) == "tester":   # a tester pod joins the hub (the launcher registers it); --boss once
         options.append("--hub")
-        if not (hub and args.agent != "orchestrator") and args.agent != "orchestrator" and args.reports_to:
+        boss_already_added = hub and args.agent != "orchestrator"   # line 738 above added it
+        if args.agent != "orchestrator" and not boss_already_added and args.reports_to:
             options += [CREATE_OPTION["boss"], args.reports_to]
     if getattr(args, "stack", False):   # only on request: a launch without --stack hands the launcher exactly what it always did
         options.append(CREATE_OPTION["stack"])
