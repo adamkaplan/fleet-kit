@@ -197,7 +197,7 @@ class Refspec(Base):
     def pushes(self):
         if not os.path.exists(self.calls):
             return []
-        return [l.strip() for l in open(self.calls) if " push " in " " + l]
+        return [l.strip() for l in pathlib.Path(self.calls).read_text().splitlines(True) if " push " in " " + l]
 
     def run_hook(self, hook, args=(), **kw):
         return subprocess.run([self.seam(hook), "--prestop", *args], env=self.env(**kw), capture_output=True, text=True, timeout=30)
@@ -258,9 +258,9 @@ class Refspec(Base):
 
 
 def mutate(dst, old, new):
-    s = open(HOOK).read()
+    s = pathlib.Path(HOOK).read_text()
     assert old in s, old
-    open(dst, "w").write(s.replace(old, new))
+    pathlib.Path(dst).write_text(s.replace(old, new))
 
 
 class Hostile(Base):
@@ -271,9 +271,9 @@ class Hostile(Base):
         self.marker = os.path.join(self.t, "marker")
         self.calls = os.path.join(self.t, "calls")
         script = os.path.join(self.t, "evil")
-        open(script, "w").write("#!/bin/sh\necho ran >> %s\nexit 1\n" % self.marker)
+        pathlib.Path(script).write_text("#!/bin/sh\necho ran >> %s\nexit 1\n" % self.marker)
         os.chmod(script, 0o755)
-        open(os.path.join(self.work, ".gitattributes"), "w").write("*.txt diff=evil\n")
+        pathlib.Path(os.path.join(self.work, ".gitattributes")).write_text("*.txt diff=evil\n")
         sh("git", "-C", self.work, "add", ".gitattributes"); sh("git", "-C", self.work, "commit", "-qm", "attr")
         sh("git", "-C", self.work, "push", "-q", self.origin, "HEAD:refs/heads/main")
         hooks = os.path.join(self.work, ".git", "hooks")
@@ -289,7 +289,7 @@ class Hostile(Base):
         self.fake_git('echo "$@" >> %s\nexec REAL "$@"\n' % self.calls)
 
     def pushes(self):
-        return [l.strip() for l in open(self.calls) if " push " in " " + l] if os.path.exists(self.calls) else []
+        return [l.strip() for l in pathlib.Path(self.calls).read_text().splitlines(True) if " push " in " " + l] if os.path.exists(self.calls) else []
 
     def run_hook(self, hook):
         return subprocess.run([self.seam(hook), "--prestop"], env=self.env(), capture_output=True, text=True, timeout=30)
@@ -339,7 +339,7 @@ class Hostile(Base):
         for name, (old, new) in muts.items():
             mut = os.path.join(self.t, "mut-" + name)
             mutate(mut, old, new)
-            self.assertNotEqual(open(mut).read(), open(HOOK).read(), name)   # the mutation applied
+            self.assertNotEqual(pathlib.Path(mut).read_text(), pathlib.Path(HOOK).read_text(), name)   # the mutation applied
             with self.subTest(mutant=name):
                 if name == "origin-check":
                     sh("git", "-C", self.work, "config", "remote.origin.url", "https://github.com/other-org/elsewhere.git")
@@ -404,14 +404,14 @@ class Grammar(Base):
         self.calls = os.path.join(self.t, "calls")
         self.envlog = os.path.join(self.t, "envlog")
         self.script = os.path.join(self.t, "script")
-        open(self.script, "w").write("#!/bin/sh\necho ran >> %s\nexit 1\n" % self.marker)
+        pathlib.Path(self.script).write_text("#!/bin/sh\necho ran >> %s\nexit 1\n" % self.marker)
         os.chmod(self.script, 0o755)
         self.host = "file://%s/" % self.t
         self.other = "file://%s/other-remote/" % self.t
         self.inc = os.path.join(self.t, "included")
-        open(self.inc, "w").write('[url "%s"]\n\tinsteadOf = %s\n\tpushInsteadOf = %s\n' % (self.other, self.host, self.host))
+        pathlib.Path(self.inc).write_text('[url "%s"]\n\tinsteadOf = %s\n\tpushInsteadOf = %s\n' % (self.other, self.host, self.host))
         self.cfg = os.path.join(self.work, ".git", "config")
-        self.plain = open(self.cfg).read()
+        self.plain = pathlib.Path(self.cfg).read_text()
         self.base_head = sh("git", "-C", self.work, "rev-parse", "HEAD")
         self.fake_git('echo "$@" >> %s\n{ echo "ARGS $@"; env | sort; echo "HOMEFILES $(ls -A "$HOME" | wc -l | tr -d " ")"; echo; } >> %s\nexec REAL "$@"\n'
                       % (self.calls, self.envlog))
@@ -423,13 +423,13 @@ class Grammar(Base):
         return [(cls, self.fill(k), self.fill(v)) for cls, rows in GRAMMAR.items() for k, v in rows]
 
     def calls_list(self):
-        return [l.strip() for l in open(self.calls)] if os.path.exists(self.calls) else []
+        return [l.strip() for l in pathlib.Path(self.calls).read_text().splitlines(True)] if os.path.exists(self.calls) else []
 
     def reset(self):
         for f in (self.calls, self.envlog, self.marker, os.path.join(self.t, "helper.log")):
             if os.path.exists(f):
                 os.remove(f)
-        open(self.cfg, "w").write(self.plain)
+        pathlib.Path(self.cfg).write_text(self.plain)
         for r in sh("git", "-C", self.origin, "for-each-ref", "--format=%(refname)").split():
             if r != "refs/heads/main":
                 sh("git", "-C", self.origin, "update-ref", "-d", r)
