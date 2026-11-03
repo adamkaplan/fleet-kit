@@ -337,6 +337,153 @@ def edit_in_place(reader, caller, url, text, approval, entries, audited, mark_li
     return result["url"], lapse
 
 
+# ---------------------------------------------------------------- `held-ci` (#1970): the held pull requests' CI tip, and a refresh of ONE on request
+#
+# TEMPORARY HOME: this command is inlined here until #1092 moves commands to their own modules (the Chief of Staff's ruling: no new flat module).
+# Cause: a pull request's CI runs on the merge commit GitHub builds from its head and the base tip AT THE TIME OF THE RUN. A re-run keeps that merge
+# commit; only a close and reopen (or a push) builds a new one. So after every merge into the base, the green of every held pull request was computed on an
+# older tip. `held-ci` shows that tip (read-only); `held-ci --refresh <pr>` closes and reopens ONE pull request, nothing refreshes by itself.
+HELD_CI_PAGES = 100   # pages of 100 read before the list is called cut: a bound only a list that never ends reaches (the shared cap of 5 would cut 600 silently)
+
+
+def _held_ci_read(hub, path, key=None):
+    return _records(hub.gh_api(path, paginate=False), key)
+
+
+def held_ci_pull(hub, repo, number):
+    """The pull request as one read: (head, sorted labels, draft, state, base ref), or None when it is not there."""
+    try:
+        values = hub.gh_api("repos/%s/pulls/%d" % (repo, number), paginate=False)
+    except Exception:
+        return None
+    for record in values:
+        if isinstance(record, dict) and "head" in record:
+            return held_ci_facts(record)
+    return None
+
+
+def held_ci_facts(record):
+    labels = sorted(str(l.get("name")) for l in record.get("labels") or [] if isinstance(l, dict))
+    return {"head": (record.get("head") or {}).get("sha"), "labels": labels, "draft": bool(record.get("draft")),
+            "state": record.get("state"), "base": (record.get("base") or {}).get("ref")}
+
+
+def held_ci_run_tip(hub, repo, head):
+    """The base tip the latest run of `head` was computed on: the `base.sha` of the pull request the run records. None when there is no run."""
+    runs = _held_ci_read(hub, "repos/%s/actions/runs?event=pull_request&per_page=1&head_sha=%s" % (repo, head), "workflow_runs")
+    for run in runs[:1]:
+        for pr in run.get("pull_requests") or []:
+            sha = (pr.get("base") or {}).get("sha")
+            if sha:
+                return sha
+    return None
+
+
+def held_ci_state(hub, repo, base, run_tip, tip):
+    """`current`, `stale: N commits behind`, or why it is not known."""
+    if run_tip is None:
+        return "no run"
+    if run_tip == tip:
+        return "current"
+    for found in hub.gh_api("repos/%s/compare/%s...%s" % (repo, run_tip, tip), paginate=False):
+        if isinstance(found, dict) and isinstance(found.get("ahead_by"), int):
+            return "stale: %d commits behind" % found["ahead_by"]
+    return "stale: unknown commits behind"
+
+
+def held_ci_list(engine, hub, repo, held_label):
+    records, cut = hub.read_pages("repos/%s/pulls?state=open&per_page=100" % repo, cap=HELD_CI_PAGES)
+    held = [r for r in records if held_label in held_ci_facts(r)["labels"]]
+    tips = {}
+    for record in sorted(held, key=lambda r: r.get("number") or 0):
+        facts = held_ci_facts(record)
+        base = facts["base"]
+        if base not in tips:
+            tips[base] = next((f["commit"]["sha"] for f in hub.gh_api("repos/%s/branches/%s" % (repo, base), paginate=False)
+                               if isinstance(f, dict) and isinstance(f.get("commit"), dict)), None)
+        run_tip = held_ci_run_tip(hub, repo, facts["head"])
+        print("%s#%s  head %s  run computed on tip %s  %s" % (repo, record.get("number"), str(facts["head"])[:8], str(run_tip)[:8] if run_tip else "none",
+                                                              held_ci_state(hub, repo, base, run_tip, tips[base])))
+    print("%d of %d held pull requests listed (%s)" % (len(held), len(held), held_label))
+    if cut:
+        print("list cut at %d pages: the open pull requests after page %d are missing; the count above is of the pages read" % (HELD_CI_PAGES, HELD_CI_PAGES))
+        return EXIT_ERROR
+    return EXIT_OK
+
+
+def held_ci_refresh(engine, runner, hub, repo, number, held_label):
+    before = held_ci_pull(hub, repo, number)
+    if before is None:
+        sys.stderr.write("%s: held-ci: %s#%d cannot be read; nothing was changed\n" % (PROG, repo, number))
+        return EXIT_ERROR
+    if before["state"] != "open":
+        sys.stderr.write("%s: held-ci: %s#%d is not open; nothing was changed\n" % (PROG, repo, number))
+        return EXIT_USAGE
+    if before["draft"]:
+        sys.stderr.write("%s: held-ci: %s#%d is a draft; a draft is not refreshed, nothing was changed\n" % (PROG, repo, number))
+        return EXIT_USAGE
+    if held_label not in before["labels"]:
+        sys.stderr.write("%s: held-ci: %s#%d is not held (no %s label); nothing was changed\n" % (PROG, repo, number, held_label))
+        return EXIT_USAGE
+    path = "repos/%s/pulls/%d" % (repo, number)
+    try:
+        _gh_write(engine, runner, repo, path, "PATCH", {"state": "closed"})
+    except IntentError as err:
+        sys.stderr.write("%s: held-ci: %s#%d: the close failed (%s); nothing was changed\n" % (PROG, repo, number, _one_line(str(err), 200)))
+        return EXIT_ERROR
+    try:
+        _gh_write(engine, runner, repo, path, "PATCH", {"state": "open"})
+    except IntentError as err:   # the close is done: the line is written even so
+        engine.audit.append(engine.actor, "held-ci.refresh", "%s#%d" % (repo, number), {"head": before["head"], "outcome": "closed, not reopened"})
+        sys.stderr.write("%s: held-ci: %s#%d is CLOSED: the reopen failed (%s). Reopen it: gh api %s --method PATCH -f state=open\n"
+                         % (PROG, repo, number, _one_line(str(err), 200), path))
+        return EXIT_ERROR
+    outcome = "reopened"
+    after = held_ci_pull(hub, repo, number)
+    engine.audit.append(engine.actor, "held-ci.refresh", "%s#%d" % (repo, number), {"head": before["head"], "outcome": outcome})
+    if after is None or after["head"] != before["head"]:
+        print("held-ci: %s#%d refreshed, but head changed: %s -> %s" % (repo, number, before["head"], after and after["head"]))
+        return EXIT_ERROR
+    if after["labels"] != before["labels"]:
+        print("held-ci: %s#%d refreshed, but labels changed: %s -> %s" % (repo, number, before["labels"], after["labels"]))
+        return EXIT_ERROR
+    print("held-ci: %s#%d closed and reopened; head and labels unchanged (head %s)" % (repo, number, str(before["head"])[:8]))
+    return EXIT_OK
+
+
+def cmd_held_ci(args, runner, now):
+    """`held-ci`: read-only list of the held pull requests with the tip of their latest run; `--refresh <pr>` closes and reopens ONE."""
+    refresh = args.refresh or []
+    if len(refresh) > 1:
+        sys.stderr.write("%s: held-ci: --refresh names exactly one pull request, got %d; nothing was changed\n" % (PROG, len(refresh)))
+        return EXIT_USAGE
+    engine, state, config = build_engine(runner, now, "cli", writable=bool(refresh))
+    repo = args.repo or config.get("intent_repo")
+    if not repo or not REPO_RE.match(repo):
+        sys.stderr.write("%s: held-ci: name the repository with --repo OWNER/REPO\n" % PROG)
+        return EXIT_USAGE
+    hub = GitHubHub(config, state, None, runner, spawn_forwarder, now, "cli")
+    hub.engine, engine.hub = engine, hub
+    held_label = label_names(config)["merge-captain"]
+    try:
+        if refresh:
+            return held_ci_refresh(engine, runner, hub, repo, refresh[0], held_label)
+        return held_ci_list(engine, hub, repo, held_label)
+    except GitHubUnavailable as err:
+        sys.stderr.write("%s: held-ci: %s\n" % (PROG, _one_line(str(err), 300)))
+        return EXIT_ERROR
+
+
+def add_held_ci_parsers(sub):
+    held = sub.add_parser("held-ci", help="List the held pull requests with the tip their latest CI run was computed on; --refresh <pr> closes and reopens one",
+                          description="Read-only: for each open pull request labelled merge-captain, its head, the base tip its latest run was computed on, and `current` or "
+                                      "`stale: N commits behind`. With --refresh <pr> (exactly one, never a draft, never a pull request that is not held) it closes and reopens that "
+                                      "pull request so GitHub builds a new merge commit, checks that the head and the labels are unchanged, and writes one audit line. "
+                                      "Refresh only a pull request that is about to go to the owner. Nothing refreshes by itself.")
+    held.add_argument("--repo", default=None, help="OWNER/REPO (default: the intent repo)")
+    held.add_argument("--refresh", type=int, nargs="+", metavar="PR", default=None, help="Close and reopen this ONE pull request")
+
+
 # ---- rehearse (#1785)
 #
 # The brief of a rehearsal pod, made from a plan, and the reading of the pod's report into one table. Read-only: it never runs a pod, never commits or

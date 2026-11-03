@@ -22661,7 +22661,7 @@ class TestSweep(Base):
             checked = set(self.engine.sweep.checked)
         self.assertEqual(seen, set(repos))                       # every repo was reached across passes
         self.assertEqual(len(checked), 20)                       # and every decision's issue was checked
-        self.assertTrue(all(cap in (sb.SWEEP_LIST_PAGES, 1) for cap in self.hub.caps), "the lists are capped; the closed-PR list (S9) is one page")
+        self.assertTrue(all(cap in (sb.SWEEP_LIST_PAGES, sb.OPEN_LIST_PAGES, 1) for cap in self.hub.caps), "the lists are capped; the closed-PR list (S9) is one page")
         quiet = self.calls()
         self.sweep(decisions)                                    # nothing is stale yet: the cache answers
         self.assertEqual(self.calls(), quiet)
@@ -22731,7 +22731,7 @@ class TestSweep(Base):
         self.assertEqual(len(self.engine.sweep.repos), 1)
 
     def test_the_sweep_budget_is_a_config_value_with_a_cap(self):
-        self.assertEqual(sb.SWEEP_CALLS_PER_PASS, 12)
+        self.assertEqual(sb.SWEEP_CALLS_PER_PASS, 16)
         base = {"opencode": FAKE_OPENCODE}
         self.assertEqual(sb.validate_config(dict(base, sweep={"calls_per_pass": 20}))["sweep"]["calls_per_pass"], 20)
         for bad in (3, 101, "6", True):
@@ -44176,7 +44176,7 @@ class TestASlowCatchUpDoesNotFreezeThePass(Base):
         rig.hub.catch_up(rig.watch(), rig.world.clock.now())
         self.assertLessEqual(len(rig.hub.queue), sb.GITHUB_PAGE_CAP * sb.GITHUB_PAGE_SIZE)
         took = self.pass_seconds(rig)
-        self.assertLessEqual(took, sb.GITHUB_ROUTE_SECONDS + sb.GITHUB_ROUTE_READ_TIMEOUT, took)
+        self.assertLessEqual(took, sb.GITHUB_ROUTE_SECONDS + sb.GITHUB_ROUTE_READ_TIMEOUT + (sb.OPEN_LIST_PAGES - sb.SWEEP_LIST_PAGES), took)   # #1886: the extra pages of one open-item read over the old cap, 1 s each in this rig
         self.assertGreater(len(rig.hub.queue), 0, "what did not fit waits for the next pass")
 
     def test_the_decisions_file_is_never_stale_because_of_it(self):
@@ -49517,6 +49517,10 @@ class TestHeldRowsFromLabels(DecisionsBase):
 
     def lists(self, *records, repo=None, cut=False):
         self.engine.ci_record_state.lists[(repo or self.REPO).lower()] = (self.world.clock.now(), list(records))
+        if cut:
+            self.engine.ci_record_state.was_cut[(repo or self.REPO).lower()] = True
+        else:   # a list read that was not cut: the recorder's flag is clear (the plan gave no else; the test s4 needs it)
+            self.engine.ci_record_state.was_cut.pop((repo or self.REPO).lower(), None)
 
     def rows(self):
         return [d for d in self.listed() if d.get("number") in range(7, 400) and d.get("kind") in ("captain", "notice")]
@@ -49544,7 +49548,7 @@ class TestHeldRowsFromLabels(DecisionsBase):
         self.lists(self.pr(20, "merge-captain"), self.pr(21, "hold-contract"))
         self.assertEqual(sorted(d["number"] for d in self.rows() if d["number"] in (20, 21)), [20, 21])
         # the list is read again and is CUT (200 records, the held ones beyond it): the rows stay
-        self.lists(*[self.pr(100 + n) for n in range(sb.LABEL_HOLD_LIST_CUT)])
+        self.lists(*[self.pr(100 + n) for n in range(5)], cut=True)
         self.assertEqual(sorted(d["number"] for d in self.rows() if d["number"] in (20, 21)), [20, 21])
         # a complete list without them (they were merged or unlabelled) drops them
         self.lists(self.pr(100))
@@ -49626,10 +49630,10 @@ class TestHeldRowsFromLabels(DecisionsBase):
     def test_a_row_kept_because_its_list_is_cut_expires_after_a_day(self):
         self.lists(self.pr(95, "merge-captain"))
         self.assertEqual([d["number"] for d in self.rows() if d["number"] == 95], [95])
-        self.lists(*[self.pr(100 + n) for n in range(sb.LABEL_HOLD_LIST_CUT)])
+        self.lists(*[self.pr(100 + n) for n in range(5)], cut=True)
         self.assertEqual([d["number"] for d in self.rows() if d["number"] == 95], [95], "kept while the list is cut")
         self.world.tick(sb.LABEL_HOLD_KEEP_SECONDS + 60)
-        self.lists(*[self.pr(100 + n) for n in range(sb.LABEL_HOLD_LIST_CUT)])
+        self.lists(*[self.pr(100 + n) for n in range(5)], cut=True)
         self.assertEqual([d for d in self.rows() if d["number"] == 95], [], "a pull request that merged meanwhile does not stay for ever")
 
     def test_a_pr_with_only_a_merge_automatic_label_is_not_held(self):
@@ -66013,6 +66017,9 @@ TestLoadAlertCloudBusy = _load_cloud.TestLoadAlertCloudBusy
 # The CI test-file list tests of #1498.
 _ci_test_files = importlib.import_module("test_ci_test_files")
 TestCiTestFileList = _ci_test_files.TestCiTestFileList
+_olc = importlib.import_module("test_open_list_ceiling"); TestOpenListCeiling, TestOpenListAlert, TestOpenListCeilingMutant = _olc.TestOpenListCeiling, _olc.TestOpenListAlert, _olc.TestOpenListCeilingMutant
+TestOpenListPassCalls = importlib.import_module("test_open_list_pass_calls").build(TestASlowCatchUpDoesNotFreezeThePass)   # #1886 Eighth (3)
+_olcuts = importlib.import_module("test_open_list_cuts"); TestOpenListCuts, TestOpenListPagesRead, TestOpenListDerivedText, TestOpenListCutsMutants, TestOpenListWholeReads, TestOpenListCutsWired = _olcuts.TestOpenListCuts, _olcuts.TestOpenListPagesRead, _olcuts.TestOpenListDerivedText, _olcuts.TestOpenListCutsMutants, _olcuts.TestOpenListWholeReads, _olcuts.TestOpenListCutsWired
 TestTempJanitorScratch = importlib.import_module("test_scratch").build(TestTempJanitor)
 
 # The delivery-lag tests of #1402.
@@ -66020,6 +66027,7 @@ _delivery_lag = importlib.import_module("test_delivery_lag")
 _delivery_lag.World = World
 PresentHub, TestDeliveryLag = _delivery_lag.PresentHub, _delivery_lag.TestDeliveryLag
 TestLaunchBriefCheck = importlib.import_module("test_launch_brief_check").build(TwoRepoCase, TestLaunchRefusedMessage)
+TestHeldCi = importlib.import_module("test_held_ci").build(HandoffCase)
 TestEveryKindDelayedMark = importlib.import_module("test_every_kind_delayed_mark").TestEveryKindDelayedMark
 TestSignedLinkScrub = importlib.import_module("test_signed_link_scrub").build(Base, GithubRig)
 TestCiQueue = importlib.import_module("test_ci_queue").build(HandoffCase, FAKE_GH)   # #1961
