@@ -17221,7 +17221,7 @@ cmd_waive.ledger = True   # state and GETs only; its own errors are usage errors
 
 
 # ---- #818: which open pull requests change the same files. Read-only information, never a block. Pure parsing and the two texts; the one bounded read is `read_open_overlap`.
-OVERLAP_LIST_CAP = 50    # the most open pull requests read, in one call
+OVERLAP_LIST_CAP = 200   # the most open pull requests read, in one call (#1889: the ceiling tools/arch-overlap already uses; a full list is said)
 OVERLAP_FILES_CAP = 100  # the most files of one pull request used; a pull request with more changed files is left out
 OVERLAP_SHOW_FILES = 3   # files named in a `shares` line
 OVERLAP_PATH_MAX = 300  # a longer path, or one with a control character, is not printed: the pull request is left out
