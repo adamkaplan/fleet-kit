@@ -1155,10 +1155,8 @@ def _child_cpu_seconds(pid):
     except Exception:
         return None
 
-
 _progress_started = None   # tests: an Event the progress thread sets when it has started
 _progress_pause = None   # tests: a function (stop_event, seconds) that pauses in place of the real wait
-
 
 def _progress_interval(environ, out=None):
     """The progress interval: FLEET_HEAVY_PROGRESS_SECONDS when it is a number from 0.01 (the tests' knob below 1 s) to 86400, else PROGRESS_EVERY; a non-empty bad value prints one line on `out`."""
@@ -1178,7 +1176,6 @@ def _progress_interval(environ, out=None):
         except (OSError, ValueError):
             pass   # a closed or broken stream: the child still starts
     return PROGRESS_EVERY
-
 
 def _progress_loop(pid, program, interval, stop, out, clock, began, lock=None):
     """One line every `interval` seconds until `stop` is set; a failure of its own ends it quietly. Never signals the child."""
@@ -1207,7 +1204,6 @@ def _progress_loop(pid, program, interval, stop, out, clock, began, lock=None):
                     pass
     except Exception:
         return
-
 
 def run(command, state_dir, slots=DEFAULT_SLOTS, wait_max=DEFAULT_WAIT_MAX, name=None, environ=None, out=None, clock=time.time, sleep=time.sleep,
         which=shutil.which, watchdog=None, short=False, line=None, ceiling=None, ceiling_config=None, on_stop=None, worktree=None, started_flag=None):
