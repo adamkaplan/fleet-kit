@@ -102,6 +102,89 @@ class ShellCheck(unittest.TestCase):
         self.assertEqual(p.returncode, 2)
 
 
+D = "gh api repos/o/r/issues/comments/1"
+# step 1 (live run in a pod, 3 November 2026): (form, command, whole command refused by the runtime?)
+LIVE = [
+    ("a backticks", "echo part-one-ran; echo `%s`" % D, True),
+    ("b substitution in double quotes", 'echo part-one-ran; echo "$(%s)"' % D, True),
+    ("c if", "if true; then %s; fi" % D, True),
+    ("d while", "while false; do %s; done" % D, True),
+    ("e for", "for i in 1; do %s; done" % D, True),
+    ("f braces", "{ echo part-one-ran; %s; }" % D, True),
+    ("g bang", "! %s" % D, True),
+    ("h time", "time %s" % D, False),
+    ("i assignment", "VAR=1 %s" % D, False),
+    ("j env", "env %s" % D, False),
+    ("k single quotes", "echo '%s'" % D, False),
+    ("l bash -c", "bash -c '%s'" % D, False),
+    ("m case", "case x in x) %s;; esac" % D, True),
+]
+
+
+def run_plain(command):
+    p = subprocess.run([sys.executable, TOOL, command], capture_output=True, text=True)
+    return p.returncode, p.stdout
+
+
+class LiveForms(unittest.TestCase):
+    def test_every_measured_form(self):
+        for form, command, refused in LIVE:
+            with self.subTest(form=form):
+                code, out = run_plain(command)
+                self.assertEqual(code, 1 if refused else 0, "%s: %s" % (form, out))
+                self.assertEqual("deny" in out.split(), refused, form)
+                self.assertNotIn("unsure", out, form)
+
+    def test_exit_statuses(self):
+        self.assertEqual(run_plain("echo hi")[0], 0)
+        self.assertEqual(run_plain(D)[0], 1)
+        self.assertEqual(subprocess.run([sys.executable, TOOL], capture_output=True).returncode, 2)
+        self.assertEqual(run_plain('echo "abc')[0], 3)
+
+    def test_unterminated_quote_is_unsure_not_allow(self):
+        code, out = run_plain('echo "abc')
+        self.assertEqual(code, 3)
+        self.assertIn("unsure : an unterminated quote", out)
+        self.assertEqual(run_plain("echo (ls")[0], 3)
+        self.assertEqual(run_plain("echo `ls")[0], 3)
+
+
+class NewCodeMutant(unittest.TestCase):
+    BRANCH = 'elif c in "`(" or (c == "$" and s[i + 1:i + 2] == "("):'
+
+    def scratch_tool(self, text):
+        fd, path = tempfile.mkstemp(suffix=".py")
+        self.addCleanup(os.unlink, path)
+        with os.fdopen(fd, "w") as fh:
+            fh.write(text)
+        return path
+
+    def backtick_case(self, tool):
+        command = LIVE[0][1]
+        p = subprocess.run([sys.executable, tool, command], capture_output=True, text=True)
+        self.assertEqual(p.returncode, 1, "backtick case: the tool must deny: " + p.stdout)
+
+    def test_control_passes(self):
+        with open(TOOL) as fh:
+            self.backtick_case(self.scratch_tool(fh.read()))
+
+    def test_without_the_backtick_branch_the_case_fails(self):
+        with open(TOOL) as fh:
+            text = fh.read()
+        self.assertEqual(text.count(self.BRANCH), 1)
+        new = text.replace(self.BRANCH, 'elif c == "(" or (c == "$" and s[i + 1:i + 2] == "("):')
+        self.assertTrue(new != text and new.count("`(") == text.count("`(") - 1, "the mutation was not applied")
+        with self.assertRaises(AssertionError) as ctx:
+            self.backtick_case(self.scratch_tool(new))
+        self.assertIn("backtick case: the tool must deny", str(ctx.exception))
+
+    def test_noop_mutation_fails_the_computation(self):
+        with open(TOOL) as fh:
+            text = fh.read()
+        with self.assertRaises(AssertionError):
+            self.assertTrue(text.replace(self.BRANCH, self.BRANCH) != text, "the mutation was not applied")
+
+
 class Mutant(unittest.TestCase):
     def scratch(self, text):
         fd, path = tempfile.mkstemp(suffix=".json")
@@ -132,8 +215,6 @@ class Mutant(unittest.TestCase):
         with self.assertRaises(AssertionError):
             # a no-op "mutation" (the text unchanged) must not count as applied
             self.assertTrue(original != original, "the mutation was not applied")
-
-
 
 if __name__ == "__main__":
     unittest.main()
