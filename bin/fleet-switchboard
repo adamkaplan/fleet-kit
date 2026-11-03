@@ -17069,7 +17069,7 @@ def cmd_verdict(args, runner, now):
                                                                                          head[:8], ctx.pr, entry["plan_hash"][:19]))
             continue
         if ctx.engine.audit is not None:
-            detail = {"scenario": entry["scenario"], "result": entry["result"], "seq": one["seq"], "by": entry["by"], "chain": one["hash"]}
+            detail = {"scenario": entry["scenario"], "result": entry["result"], "seq": one["seq"], "by": entry["by"], "chain": one["hash"], "evidence": entry["evidence"][:160]}
             if named == "tester" and caller in launch and load_launch_testers().source_of(caller, ctx.config.get("plan_evaluators"), launch) == "launch record":
                 detail["launch_record"] = {k: v for k, v in launch[caller].items() if v is not None}   # #372: the record this verdict relied on
             ctx.engine.audit.append(ctx.engine.actor, "plan.verdict", ctx.pr, detail)
