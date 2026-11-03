@@ -200,6 +200,7 @@ class TestHeavyProgress(unittest.TestCase):
         with tempfile.TemporaryDirectory() as scratch:
             for kind, body in (("control", text), ("mutant", mutant)):
                 path = os.path.join(scratch, kind + "_heavy_slots.py")
+                open(os.path.join(scratch, "heavy_slots_watch.py"), "w").write(open(os.path.join(here, "..", "..", "bin", "heavy_slots_watch.py")).read())
                 self.assertFalse(os.path.abspath(path).startswith(os.path.abspath(os.path.join(here, "..", ".."))))
                 with open(path, "w") as handle:
                     handle.write(body)
