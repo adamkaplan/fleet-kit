@@ -17,7 +17,7 @@ cloud/launcher/tests/test_scratch_clean.py
 cloud/launcher/tests/test_stop_no_checkout.py
 cloud/launcher/tests/test_token_at_limit.py
 cloud/launcher/tests/test_token_service.py
+cloud/launcher/tests/test_workflows_role.py
 cloud/worker/tests/test_base_merge_base.py
 cloud/worker/tests/test_cloud_prepush_background.py
 cloud/worker/tests/test_dockerfile_postgres.py
-cloud/launcher/tests/test_workflows_role.py
