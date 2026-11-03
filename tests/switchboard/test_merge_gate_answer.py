@@ -196,6 +196,11 @@ class TestMergeGateAnswerMutant(AnswerBase):
     NEEDLE = 'mcode, mout, _ = gh(["pr", "view", str(number), "-R", repo, "--json", "state,headRefOid,mergeCommit"])'
     SKIPPED = 'mcode, mout = 1, ""'
 
+    SOURCE = REPO / "bin" / "merge_gate.py"   # the source under test; a subclass or caller may point it at another copy
+
+    def source(self):
+        return self.SOURCE.read_text()
+
     def copy(self, text):
         path = self.dir / "merge_gate.py"
         path.write_text(text)
@@ -215,7 +220,7 @@ class TestMergeGateAnswerMutant(AnswerBase):
         self.assertEqual(code, 0, "a failing exit with the pull request merged is reported merged")
 
     def test_s5_control_then_mutant(self):
-        text = (REPO / "bin" / "merge_gate.py").read_text()
+        text = self.source()
         self.s1_on(self.copy(text))   # the unmutated copy passes first
         self.assertEqual(text.count(self.NEEDLE), 1)   # the mutation is applied: the replaced text occurs once
         self.fake = self.fresh()
@@ -225,7 +230,7 @@ class TestMergeGateAnswerMutant(AnswerBase):
         self.assertIn("a failing exit with the pull request merged is reported merged", str(caught.exception))
 
     def test_s5_head_check_control_then_mutant(self):
-        text = (REPO / "bin" / "merge_gate.py").read_text()
+        text = self.source()
         needle = 'if mdata.get("state") == "MERGED" and mdata.get("headRefOid") == head:'
         self.assertEqual(text.count(needle), 1)
 
@@ -241,7 +246,7 @@ class TestMergeGateAnswerMutant(AnswerBase):
         self.assertIn("MERGED at another head is not reported merged", str(caught.exception))
 
     def test_s9_reread_guard_control_then_mutant(self):
-        text = (REPO / "bin" / "merge_gate.py").read_text()
+        text = self.source()
         needle = "        except Exception:\n            mcode, mout = 1, \"\""
         self.assertEqual(text.count(needle), 1)
 
@@ -256,7 +261,7 @@ class TestMergeGateAnswerMutant(AnswerBase):
             raising(mutant)
 
     def test_s10_clock_guard_control_then_mutant(self):
-        text = (REPO / "bin" / "merge_gate.py").read_text()
+        text = self.source()
         needle = "if not isinstance(now, (int, float)) or isinstance(now, bool) or not math.isfinite(now) or now < 0:"
         self.assertEqual(text.count(needle), 1)
 
@@ -272,7 +277,7 @@ class TestMergeGateAnswerMutant(AnswerBase):
         self.assertIn("an unusable clock is reported as an unknown time", str(caught.exception))
 
     def test_s11_raising_clock_control_then_mutant(self):
-        text = (REPO / "bin" / "merge_gate.py").read_text()
+        text = self.source()
         needle = "        except Exception:\n            stamp = \"an unknown time\""
         self.assertEqual(text.count(needle), 1)
 
@@ -292,7 +297,7 @@ class TestMergeGateAnswerMutant(AnswerBase):
             raising(mutant)
 
     def test_s12_negative_clock_control_then_mutant(self):
-        text = (REPO / "bin" / "merge_gate.py").read_text()
+        text = self.source()
         needle = " or not math.isfinite(now) or now < 0:"
         self.assertEqual(text.count(needle), 1)
 
@@ -305,3 +310,26 @@ class TestMergeGateAnswerMutant(AnswerBase):
         mutant = self.copy(text.replace(needle, " or not math.isfinite(now):"))
         with self.assertRaises(AssertionError):   # REAL: gmtime(-1) gives 23:59:59Z
             negative(mutant)
+
+    def test_s13_bool_and_huge_clocks_control_then_mutants(self):
+        text = self.source()
+        bool_needle = " or isinstance(now, bool)"
+        fin_needle = " or not math.isfinite(now)"
+        self.assertEqual(text.count(bool_needle), 1)
+        self.assertEqual(text.count(fin_needle), 1)
+
+        def refuses(gate, bad):
+            self.fake = self.fresh()
+            self.fake.view = {"state": "OPEN", "headRefOid": MG_HEAD}
+            code, lines, audit = self.run_real(gate, clock=self.late(bad))
+            self.assertIn("unknown at an unknown time", lines[-1], msg="clock %r gives no stamp" % (bad,))
+        control = self.copy(text)
+        for bad in (True, False, float("inf"), -float("inf"), float("nan"), 1e30):
+            refuses(control, bad)
+        no_bool = self.copy(text.replace(bool_needle, ""))
+        with self.assertRaises(AssertionError):   # REAL: gmtime(True) is 00:00:01Z
+            refuses(no_bool, True)
+        # FAKE by behaviour: gmtime(inf/nan/huge) raises, and the guard catches it, so isfinite is redundant
+        no_fin = self.copy(text.replace(fin_needle, ""))
+        for bad in (float("inf"), float("nan"), 1e30):
+            refuses(no_fin, bad)
