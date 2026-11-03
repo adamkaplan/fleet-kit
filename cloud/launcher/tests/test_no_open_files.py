@@ -12,9 +12,11 @@ import unittest
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(HERE)))
 GUARDED = (
+    "test_app_token.py",
     "test_chain_time.py",
     "test_cloud_end_alert.py",
     "test_cloud_pr_preflight.py",
+    "test_cloud_preflight_wired.py",
     "test_cloud_quick_selector.py",
     "test_cloud_turn_end.py",
     "test_cloud_worker.py",
@@ -28,6 +30,7 @@ GUARDED = (
     "test_mint_roles.py",
     "test_model_credential.py",
     "test_orchestrator_agent.py",
+    "test_preflight.py",
     "test_reaper_managed.py",
     "test_run_record.py",
     "test_stack_model_key.py",
