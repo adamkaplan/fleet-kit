@@ -323,6 +323,20 @@ class TestCommentCursor(PublishMixin, HubCase):
         self.assertEqual([c["body"] for c in got].count("no date"), 1, msg="a record without a valid created_at is held, not dropped")
         self.assertEqual(len(got), 5)
 
+    def test_a_loose_record_served_on_three_incremental_reads_is_held_once(self):
+        world = CommentWorld(NOW - 7 * DAY, 3)
+        hub = self.hub(world)
+        real = world.gh_api
+        loose = [{"id": 901, "body": "loose with id"}, {"body": "loose without id"}]
+        hub.read_comments("sweep", REPO, self.since, cap=sb.COMMENT_WINDOW_PAGES)
+        hub.gh_api = lambda path, paginate=True, timeout=None: [real(path)[0] + [dict(r) for r in loose]]
+        for _ in range(3):
+            world.add(1)
+            got, _cut = hub.read_comments("sweep", REPO, self.since, cap=sb.COMMENT_WINDOW_PAGES)
+        bodies = [c["body"] for c in got]
+        self.assertEqual((bodies.count("loose with id"), bodies.count("loose without id")), (1, 1), msg="a loose record is held once however often the API serves it")
+        self.assertEqual(len(got), 8)
+
     def test_both_windows_are_named_when_both_consumers_are_cut(self):
         sb.take_comment_cuts()
         sb._COMMENT_CUTS[("sweep", REPO)] = (3000, 7)
@@ -415,3 +429,19 @@ class TestCommentCursorMutants(Base):
             self.assertEqual(counts, [1])
             self.assertEqual(len(result.failures), 1, msg=str(result.errors))
             self.assertIn(text, result.failures[0][1])
+
+    def test_a_loose_record_without_the_dedupe_fails_the_held_once_test(self):
+        name, cls = "test_a_loose_record_served_on_three_incremental_reads_is_held_once", TestCommentCursor
+        control = self.run_against(lambda t: t, "loose_control", cls, name)
+        self.assertEqual((len(control.failures), len(control.errors), control.testsRun), (0, 0, 1), msg=str(control.failures + control.errors))
+        old = 'loose_held[("id", record["id"]) if record.get("id") is not None else ("noid", json.dumps(record, sort_keys=True, default=str))] = record'
+        counts = []
+
+        def mutate(source):
+            counts.append(source.count(old))
+            return source.replace(old, "loose_held[len(loose_held)] = record", 1)
+
+        result = self.run_against(mutate, "loose", cls, name)
+        self.assertEqual(counts, [1])
+        self.assertEqual(len(result.failures), 1, msg=str(result.errors))
+        self.assertIn("a loose record is held once however often the API serves it", result.failures[0][1])
