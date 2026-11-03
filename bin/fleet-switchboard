@@ -9194,6 +9194,11 @@ def publish_decisions(engine):
             open_list_alert(engine, repo, now)
         except Exception as err:
             engine._note("open_list.error", repo, {"error": _one_line("%s: %s" % (type(err).__name__, err), 200), "repo": repo})
+    for repo, (held, days) in take_comment_cuts().items():   # #1889: the daily alert for every comment window not read to its start
+        try:
+            comment_window_alert(engine, repo, held, days, now)
+        except Exception as err:
+            engine._note("comment_window.error", repo, {"error": _one_line("%s: %s" % (type(err).__name__, err), 200), "repo": repo})
     try:
         pane_health_pass(engine, now)   # the control plane: detached or dead panes, reads only, wakes the Chief of Staff
     except Exception as err:
@@ -10000,6 +10005,8 @@ def open_pages(read, repo=None):
 
 _UNSENT_DAY = {}   # #1886: repository -> the day its `open_list.cut_unsent` line was written (memory only: a restart may write one more; one entry per repository)
 _OPEN_CUTS = set()   # #1886: the repositories whose read of open items stopped at OPEN_LIST_PAGES in this pass (one entry per repository)
+COMMENT_WINDOW_PAGES = 30   # #1889: pages one comment read follows at most (3,000 comments); a window not read to its start is said once a day
+_COMMENT_CUTS = {}   # #1889: repository -> (comments held, window days) of a comment window not read to its start, until the pass's daily alert (one entry per repository)
 
 
 def note_open_cut(repo):
@@ -10036,6 +10043,36 @@ def open_list_alert(engine, repo, now):
         audit.append(engine.actor, "open_list.cut", repo, {"repo": repo, "ceiling": ceiling, "pages": OPEN_LIST_PAGES})
     if not alerts.mark(engine.state_dir, repo, day, load_module("record_json").parse_bounded) and audit is not None:
         audit.append(engine.actor, "open_list.marker_failed", repo, {"repo": repo})
+
+
+def take_comment_cuts():
+    """#1889: {repository: (comments held, window days)} of the comment windows not read to their start; emptied."""
+    out = dict(sorted(_COMMENT_CUTS.items()))
+    _COMMENT_CUTS.clear()
+    return out
+
+
+def comment_window_alert(engine, repo, held, days, now):
+    """#1889: ONE alert a day (key `<repository>|comments`, the #1886 day marker) when the comments of `repo` were not read to the start of their window of `days` days."""
+    alerts = load_module("open_list_alert")
+    day, key = _day(now), "%s|comments" % repo
+    if not alerts.due(engine.state_dir, key, day, load_module("record_json").parse_bounded):
+        return
+    discovery = getattr(engine, "discovery", None)
+    cos = next((n for n, o in sorted(discovery.agents.items()) if (o.fleet or {}).get("role") == "chief-of-staff"), None) if discovery is not None else None
+    text = ("The comments of %s were not read to the start of their %d-day window: %s comments are read (COMMENT_WINDOW_PAGES = %d pages); the checks that read comments miss the older ones."
+            % (repo, days, format(held, ","), COMMENT_WINDOW_PAGES))
+    audit = getattr(engine, "audit", None)
+    if cos is None:
+        if audit is not None and _UNSENT_DAY.get(key) != day:
+            _UNSENT_DAY[key] = day
+            audit.append(engine.actor, "comment_window.cut_unsent", repo, {"repo": repo})
+        return
+    add_repeat_reminder(engine.state_dir, cos, now, now, text, "comment-window-cut", key, day, wake_class=WAKE_LOAD)
+    if audit is not None:
+        audit.append(engine.actor, "comment_window.cut", repo, {"repo": repo, "comments": held, "window_days": days})
+    if not alerts.mark(engine.state_dir, key, day, load_module("record_json").parse_bounded) and audit is not None:
+        audit.append(engine.actor, "comment_window.marker_failed", repo, {"repo": repo})
 
 
 def sweep_pages_used(records, truncated):
@@ -13188,6 +13225,52 @@ class GitHubHub:
                 return records, False
             if bounded and number >= (cap or GITHUB_PAGE_CAP):
                 return records, True
+
+    def read_comments(self, consumer, repo, since, cap):
+        """#1889: the comments of `repo` created since `since`, newest first, as read_pages gave them, read incrementally. A first read (nothing held in memory
+        or no cursor) follows the window to its start (at most `cap` pages); a later read asks since the newest comment held and merges the new ones into the held
+        ones (bounded to the window). Returns (comments, truncated): truncated while the window has a part never read."""
+        held = self.__dict__.setdefault("_held_comments", {})
+        gaps = self.__dict__.setdefault("_comment_gaps", {})
+        cursors = self.__dict__.get("_comment_cursors")
+        parse = load_module("record_json").parse_bounded
+        store = load_module("comment_cursor")
+        if cursors is None:
+            cursors, status = store.load(self.state_dir, parse)
+            self._comment_cursors, self._comment_state = cursors, status
+        name, key = "%s|%s" % (consumer, repo), (consumer, repo)
+        base = "repos/%s/issues/comments?since=%s&sort=created&direction=desc&per_page=100"
+        have, mark = held.get(key), cursors.get(name)
+        if have is None or mark is None:
+            why = "no held comments" if have is None and mark is not None else {"absent": "no cursor file", "unreadable": "cursor file unreadable"}.get(self._comment_state, "no cursor")
+            told = self.__dict__.setdefault("_comment_fallback", set())
+            if key not in told:
+                told.add(key)
+                if self.audit is not None:
+                    self.audit.append(self.actor, "comment_cursor.fallback", repo, {"repo": repo, "consumer": consumer, "reason": why})
+            records, cut = self.read_pages(base % (repo, since), older=("created_at", since), cap=cap)
+            have = {}
+        else:
+            records, cut = self.read_pages(base % (repo, mark), older=("created_at", mark), cap=cap)
+        for record in records:
+            if isinstance(record, dict) and isinstance(record.get("created_at"), str) and record["created_at"] >= since:
+                have[record.get("id")] = record
+        have = {k: v for k, v in have.items() if v["created_at"] >= since}
+        held[key] = have
+        oldest = min((r["created_at"] for r in records if isinstance(r, dict) and isinstance(r.get("created_at"), str)), default=None)
+        if cut and oldest is not None:
+            gaps[key] = oldest   # what lies before this was not read, until the window's start passes it
+        if key in gaps and gaps[key] < since:
+            del gaps[key]
+        newest = max((v["created_at"] for v in have.values()), default=None)
+        if newest is not None and cursors.get(name) != newest:
+            cursors[name] = newest
+            store.save(self.state_dir, cursors, parse)
+        merged = sorted(have.values(), key=lambda r: (r["created_at"], str(r.get("id"))), reverse=True)
+        if key in gaps:
+            when, then = self.now(), parse_iso(since)
+            _COMMENT_CUTS[repo] = (len(merged), max(1, round((when - then) / 86400)) if then is not None else 0)
+        return merged, key in gaps
 
     # -- gh api, and the catch-up read
 
