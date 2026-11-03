@@ -3342,9 +3342,14 @@ class Switchboard:
                     outcome = self.deliver(plan)
                     if outcome["sent"]:
                         report["sent"].append(dict(outcome, recipient=recipient))
+                        release_held_sends(self.state_dir, recipient, [f.key for f in plan.pending if f.kind == "send"]) if self.state_dir is not None else None
             except Exception as err:
                 self._failed(recipient, "deliver", err, report)
         self.render(discovery, held, now, report)
+        try:
+            held_sends_tick(self, self.now())
+        except Exception as err:
+            self._failed("held-sends", "held-sends", err, report)
         try:
             blocked_tick(self, discovery, held)
         except Exception as err:
@@ -3498,6 +3503,8 @@ class Switchboard:
         if plan.action == "hold":
             if self.audit is not None:
                 self.audit.append(self.actor, "hold", recipient, {"reason": plan.reason, "keys": [fact.key]})
+            if fact.kind == "send" and fact.key.startswith("send:") and self.state_dir is not None and held_send_applies(plan.observation):
+                return hold_send_fact(self, fact, now)   # #2051: a send to a blocked agent is held, never refused
             note_held_send(self.state_dir, recipient, fact.sender, now, plan.observation)
             return {"sent": False, "action": "hold", "reason": plan.reason}
         return self.deliver(plan, interrupt=interrupt)
@@ -15017,6 +15024,9 @@ def _cmd_send(args, runner, now):
     except MessageTooLong as err:
         sys.stderr.write("%s: %s\n" % (PROG, err))
         return EXIT_USAGE
+    if outcome.get("held"):
+        sys.stderr.write("%s: held for %s: it will be delivered when it unblocks\n" % (PROG, args.name))
+        return EXIT_OK
     if not outcome["sent"]:
         sys.stderr.write("%s: not sent to %s: %s (%s)\n" % (PROG, args.name, outcome["action"], outcome["reason"]))
         return EXIT_HELD
