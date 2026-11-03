@@ -168,7 +168,7 @@ def compose_order(fact):
     return (reminder, -fact.created, fact.key)
 
 
-def compose(recipient, facts, cap=MESSAGE_CAP, section=None, repos=None, delivered=None):
+def compose(recipient, facts, cap=MESSAGE_CAP, section=None, repos=None, delivered=None, in_turn=False):
     """One message for `facts`, newest first (a newer result is never held behind older reminders). Returns (text, the facts it carries). With `delivered` (epoch) the header says when the
     message was sent (the carried facts' creation) and when it is delivered; a send that a NEWER one from the same sender about the
     same issue replaces (`superseded_by`) stays in the message, marked, so no key is left out of what is acknowledged.
