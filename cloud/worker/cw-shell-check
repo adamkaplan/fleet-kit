@@ -1,0 +1,107 @@
+#!/usr/bin/env python3
+"""cw-shell-check [--list FILE] COMMAND | -
+
+Applies the pod's shell permission rules to a command text, the way the agent runtime does: the command is split into
+its parts at `;`, `&`, `&&`, `||`, `|`, a newline, a subshell `( ... )` and a command substitution `$( ... )`; every part
+is matched against the rows of the worker agent's `permission.bash` block in order (fnmatch, case-sensitive) and the LAST
+matching row decides. If one part is denied the runtime refuses the WHOLE command with `Permission denied: shell`.
+Prints per part `allow|deny <deciding row> : <part>`. Exit 0 all allowed, 1 any denied, 2 usage error.
+A pure read of the permission list; writes nothing.
+"""
+import fnmatch
+import json
+import sys
+
+DEFAULT_LIST = "/usr/local/share/cw/opencode-worker.json"
+
+
+def split_parts(text):
+    parts = []
+
+    def walk(s):
+        cur = []
+        i, n, quote = 0, len(s), None
+        def flush():
+            p = "".join(cur).strip()
+            del cur[:]
+            if p:
+                parts.append(p)
+        while i < n:
+            c = s[i]
+            if quote:
+                cur.append(c)
+                if c == "\\" and quote == '"' and i + 1 < n:
+                    cur.append(s[i + 1]); i += 1
+                elif c == quote:
+                    quote = None
+            elif c == "\\" and i + 1 < n:
+                cur.append(c); cur.append(s[i + 1]); i += 1
+            elif c in "'\"":
+                quote = c; cur.append(c)
+            elif c == "(" or (c == "$" and s[i + 1:i + 2] == "("):
+                j = i + (2 if c == "$" else 1)
+                depth, k, q = 1, j, None
+                while k < n and depth:
+                    d = s[k]
+                    if q:
+                        if d == q:
+                            q = None
+                    elif d in "'\"":
+                        q = d
+                    elif d == "(":
+                        depth += 1
+                    elif d == ")":
+                        depth -= 1
+                    k += 1
+                inner = s[j:k - 1 if depth == 0 else k]
+                flush()
+                walk(inner)
+                i = k
+                continue
+            elif c == "&" and (s[i - 1:i] in (">", "<") or s[i + 1:i + 2] == ">") and i > 0:
+                cur.append(c)  # a redirection (`2>&1`, `&>f`), not a separator
+            elif c in ";\n|&":
+                flush()
+            else:
+                cur.append(c)
+            i += 1
+        flush()
+
+    walk(text)
+    return parts
+
+
+def decide(rows, part):
+    row = None
+    verdict = "allow"
+    for pattern, action in rows:
+        if fnmatch.fnmatchcase(part, pattern):
+            row, verdict = pattern, action
+    return verdict, row
+
+
+def main(argv):
+    args = argv[1:]
+    path = DEFAULT_LIST
+    if len(args) >= 2 and args[0] == "--list":
+        path, args = args[1], args[2:]
+    if len(args) != 1:
+        sys.stderr.write("usage: cw-shell-check [--list FILE] COMMAND | -\n")
+        return 2
+    text = sys.stdin.read() if args[0] == "-" else args[0]
+    try:
+        with open(path) as fh:
+            rows = list(json.load(fh)["agent"]["worker"]["permission"]["bash"].items())
+    except (OSError, ValueError, KeyError) as exc:
+        sys.stderr.write("cw-shell-check: cannot read the permission list: %s\n" % type(exc).__name__)
+        return 2
+    denied = False
+    for part in split_parts(text):
+        verdict, row = decide(rows, part)
+        denied = denied or verdict == "deny"
+        print("%s %s : %s" % (verdict, row if row is not None else "(no row)", part))
+    return 1 if denied else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
