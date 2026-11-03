@@ -2371,6 +2371,7 @@ class Launcher:
         try:
             raw = res.get("skipped")
             return {"pushed": bool(res.get("pushed")), "wip_branch": text(res.get("wip_branch"), 200) or None,
+                    "head_on": text(res.get("head_on"), 100) or None,
                     "skipped": [text(x, 200) for x in raw if isinstance(x, str)][:50] if isinstance(raw, list) else [],
                     "note": text(res.get("note")), "error": text(res.get("error")) or ("end hook gave an unreadable error" if res.get("error") else "")}
         except Exception:

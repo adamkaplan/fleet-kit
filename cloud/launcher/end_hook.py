@@ -86,6 +86,14 @@ class TokenEnded(RuntimeError):
     """A git call refused because the token had ended: the one case in which the hook signals a refresh (see main)."""
 
 
+def head_branch(contained):
+    """The first branch of `git branch -r --contains` with its origin/ prefix off: at most 100 characters of [A-Za-z0-9._/-], else `unknown`."""
+    lines = [x.strip() for x in (contained or "").splitlines() if x.strip()]
+    name = lines[0].split(" ")[0] if lines else ""
+    name = name[len("origin/"):] if name.startswith("origin/") else name
+    return name if name and len(name) <= 100 and re.fullmatch(r"[A-Za-z0-9._/-]+", name) else "unknown"
+
+
 def git(workdir, *args, check=True, ctx=None, opts=True):
     cmd = [GIT_BIN, "-C", workdir] + (ctx.opts if ctx and opts else []) + list(args)
     p = subprocess.run(cmd, capture_output=True, text=True, env=ctx.env if ctx else None)
@@ -274,7 +282,7 @@ def run(workdir, worker, prestop=False, repo=None, ctx=None):
             git(workdir, "fetch", "--prune", "origin")
     contained = git(workdir, "branch", "-r", "--contains", "HEAD", ctx=ctx).stdout.strip()
     if contained:
-        return {"pushed": False, "wip_branch": None, "skipped": skipped}
+        return {"pushed": False, "wip_branch": None, "skipped": skipped, "head_on": head_branch(contained)}
     branch = "%s/wip" % worker
     # prestop: a plain push to the explicit URL, never forced and no lease: a non-fast-forward answer is a failure, not an overwrite
     if prestop:
