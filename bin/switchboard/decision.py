@@ -219,7 +219,7 @@ def compose(recipient, facts, cap=MESSAGE_CAP, section=None, repos=None, deliver
                 sent = "delayed: sent %s, %s" % (clock_day(late, delivered), held) + ("" if first == last else ", newest sent %s" % last)
             else:
                 sent = "sent %s" % (first if first == last else "%s-%s" % (first, last))
-            when = " (%s, delivered %s)" % (sent, clock_utc(delivered))
+            when = " (%s, delivered %s%s)" % (sent, clock_utc(delivered), ", queued behind a turn" if in_turn else "")
         waiting = sorted({t for f in taken for t in f.supersedes})
         if waiting:   # the earlier messages stay where they are, unchanged: this says only that the newer one replaces them
             names = sorted({f.sender for f in taken if f.supersedes and f.sender})
