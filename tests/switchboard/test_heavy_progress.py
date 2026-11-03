@@ -420,7 +420,7 @@ class TestHeavyProgress(unittest.TestCase):
                 self.assertEqual((len(rig.starts), rig.status), (1, status), "a broken error stream stopped the child (%s, status %d)" % (error.__name__, status))
 
     def test_s16_a_control_character_and_a_broken_stream_each_mutant_fails_with_its_text(self):
-        shown = '''raw = "".join("?" if ord(c) < 32 or 127 <= ord(c) <= 159 else c for c in raw[:40])'''
+        shown = '''raw = "".join("?" if unicodedata.category(c) in ("Cc", "Zl", "Zp") else c for c in raw[:40])'''
         guard = "except (OSError, ValueError):\n            pass"
         for old, new, text in ((shown, "pass", "a control character reached the error stream"),
                                (guard, "except ZeroDivisionError:\n            pass", "a broken error stream stopped the child")):
