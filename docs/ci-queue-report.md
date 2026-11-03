@@ -40,7 +40,7 @@ The ceiling is observed, not published: the highest count of jobs running at one
 
 | Kind | Candidate | Job-minutes per day |
 |---|---|---|
-| dedupe | 97 pull request runs on a head that already had a run (a repeat of a head: a `reopened` run or a rerun; the proxy for the `reopened` runs: the 17 reopens of 2 November are not readable from the run list, so S8 is re-measured by the tester) | 6580 |
+| dedupe | 97 pull request runs on a head that already had a run (a repeat of a head: a `reopened` run or a rerun; the proxy for the `reopened` runs: the 17 reopens of 2 November are not readable from the run list) | 6580 |
 | move | the macOS legs of 18 runs whose change touches no platform path (#990) | 1694 |
 | cut | `nightly-cloud integration (macos-latest)` (no gate names it) | 100 |
 | cut | `nightly integration (macos-latest)` | 62 |
@@ -48,7 +48,9 @@ The ceiling is observed, not published: the highest count of jobs running at one
 | cut | `nightly integration (ubuntu-latest)` | 55 |
 | cut | `nightly main (ubuntu-latest)` | 58 |
 | cut | other `nightly-cloud` legs (three) | 72 |
-| dedupe | the duplicate checkout and setup of `test` and `test-cloud` (`fetch-depth: 0` twice per system) | not counted: no step time is read |
+| dedupe | the duplicate checkout and setup of `test` and `test-cloud` (`fetch-depth: 0` twice per system) | not counted by a lane: the command reads the times of a job, not of its steps, and the checkout and setup are steps, so their job-minutes are not in the data |
+
+The figure of S8 (the reopened runs and their job-minutes) is the tester's live measure: the command prints the reopened-run count and its job-minutes from the data, and the tester states the count it finds.
 
 Draft-push runs: 0 counted, because the run list does not carry the draft state. `plan` is read by no gate but builds the matrix: not a cut. The gate names are the four legs of `bin/merge_gate.py` (`UBUNTU_LEGS`, `MAC_LEGS`); whether the repository's own required checks add more is not readable by a lane.
 
@@ -60,5 +62,5 @@ Each is decided by the owner, through the Chief of Staff. No lane buys or enable
 
 | Option | Price per month | Minutes saved per day |
 |---|---|---|
-| larger hosted runners | not readable by a lane (the owner reads the billing page) | the queue wait of the window: the 448 runs waited a median of 311 s each |
-| more concurrency (a higher plan) | not readable by a lane | the peak of 70 queued jobs against the observed ceiling of 61 |
+| larger hosted runners | not readable by a lane (the owner reads the billing page) | about 2322 run-minutes of queue wait in the window (448 runs x a median of 311 s / 60) |
+| more concurrency (a higher plan) | not readable by a lane | not readable by a lane (no figure of minutes derives from a peak of 70 queued jobs against a ceiling of 61) |
