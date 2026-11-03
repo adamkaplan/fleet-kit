@@ -295,6 +295,47 @@ class TestCommentCursor(PublishMixin, HubCase):
             hub.read_comments("sweep", REPO, self.since, cap=sb.COMMENT_WINDOW_PAGES)
         self.assertEqual(path.read_bytes(), kept)
 
+    def test_the_cursor_is_saved_once_and_not_at_every_read(self):
+        world = self.world(50)
+        hub = self.hub(world)
+        store = sb.load_module("comment_cursor")
+        with mock.patch.object(store, "save", wraps=store.save) as save:
+            hub.read_comments("sweep", REPO, self.since, cap=sb.COMMENT_WINDOW_PAGES)
+            self.assertEqual(save.call_count, 1, msg="control: the first read saves the cursor once")
+            hub.read_comments("sweep", REPO, self.since, cap=sb.COMMENT_WINDOW_PAGES)
+            hub.read_comments("sweep", REPO, self.since, cap=sb.COMMENT_WINDOW_PAGES)
+            self.assertEqual(save.call_count, 1, msg="no write without a change: store.save is called %d times over 3 reads with one change" % save.call_count)
+            world.add(1)
+            hub.read_comments("sweep", REPO, self.since, cap=sb.COMMENT_WINDOW_PAGES)
+            self.assertEqual(save.call_count, 2)
+
+    def test_records_without_a_valid_created_at_are_held_through_an_incremental_read(self):
+        world = CommentWorld(NOW - 7 * DAY, 3)
+        hub = self.hub(world)
+        odd = {"id": 900, "body": "no date"}
+        real = world.gh_api
+        hub.gh_api = lambda path, paginate=True, timeout=None: [real(path)[0] + ([odd] if "page=1" in path or "page=" not in path else [])]
+        got, _ = hub.read_comments("sweep", REPO, self.since, cap=sb.COMMENT_WINDOW_PAGES)
+        self.assertIn("no date", [c["body"] for c in got])
+        hub.gh_api = real   # the incremental read no longer serves it: the held record stays, once
+        world.add(1)
+        got, _ = hub.read_comments("sweep", REPO, self.since, cap=sb.COMMENT_WINDOW_PAGES)
+        self.assertEqual([c["body"] for c in got].count("no date"), 1, msg="a record without a valid created_at is held, not dropped")
+        self.assertEqual(len(got), 5)
+
+    def test_both_windows_are_named_when_both_consumers_are_cut(self):
+        sb.take_comment_cuts()
+        sb._COMMENT_CUTS[("sweep", REPO)] = (3000, 7)
+        sb._COMMENT_CUTS[("triage", REPO)] = (3000, 14)
+        taken = sb.take_comment_cuts()
+        sent = []
+        engine = self.publish_engine(True)
+        with mock.patch.object(sb, "add_repeat_reminder", lambda *a, **k: sent.append(a[4])):
+            for repo, (held, days) in taken.items():
+                sb.comment_window_alert(engine, repo, held, days, NOW)
+        self.assertEqual(len(sent), 1)
+        self.assertIn("7-day and 14-day windows", sent[0])
+
     def test_a_small_repository_reads_what_it_read_before(self):
         world = self.world(150)
         got, cut = self.hub(world).read_comments("triage", REPO, self.since, cap=sb.COMMENT_WINDOW_PAGES)

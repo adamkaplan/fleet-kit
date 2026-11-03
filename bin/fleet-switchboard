@@ -10048,9 +10048,14 @@ def open_list_alert(engine, repo, now):
 def take_comment_cuts():
     """#1889: {repository: (comments held, window days)} of the comment windows not read to their start; emptied."""
     out = {}
+    windows = {}
     for (consumer, repo), cut in sorted(_COMMENT_CUTS.items()):   # one alert a day per repository: the consumer that holds more speaks
+        windows.setdefault(repo, set()).add(cut[1])
         if repo not in out or cut[0] > out[repo][0]:
             out[repo] = cut
+    for repo, days in windows.items():   # #1889: when both consumers are cut, the alert names both windows (a tuple of days, ascending)
+        if len(days) > 1:
+            out[repo] = (out[repo][0], tuple(sorted(days)))
     _COMMENT_CUTS.clear()
     return out
 
@@ -10063,8 +10068,9 @@ def comment_window_alert(engine, repo, held, days, now):
         return
     discovery = getattr(engine, "discovery", None)
     cos = next((n for n, o in sorted(discovery.agents.items()) if (o.fleet or {}).get("role") == "chief-of-staff"), None) if discovery is not None else None
-    text = ("The comments of %s were not read to the start of their %d-day window: %s comments are read (COMMENT_WINDOW_PAGES = %d pages); the checks that read comments miss the older ones."
-            % (repo, days, format(held, ","), COMMENT_WINDOW_PAGES))
+    span = " and ".join("%d-day" % d for d in days) + " windows" if isinstance(days, tuple) else "%d-day window" % days
+    text = ("The comments of %s were not read to the start of their %s: %s comments are read (COMMENT_WINDOW_PAGES = %d pages); the checks that read comments miss the older ones."
+            % (repo, span, format(held, ","), COMMENT_WINDOW_PAGES))
     audit = getattr(engine, "audit", None)
     if cos is None:
         if audit is not None and _UNSENT_DAY.get(key) != day:
@@ -13242,6 +13248,7 @@ class GitHubHub:
             self._comment_cursors, self._comment_state = cursors, status
         name, key = "%s|%s" % (consumer, repo), (consumer, repo)
         base = "repos/%s/issues/comments?since=%s&sort=created&direction=desc&per_page=100"
+        loose_held = self.__dict__.setdefault("_held_loose", {}).setdefault(key, {})   # records without a valid created_at, keyed by id or content so they never duplicate
         have, mark = held.get(key), cursors.get(name)
         if have is None or mark is None:
             why = "no held comments" if have is None and mark is not None else {"absent": "no cursor file", "unreadable": "cursor file unreadable"}.get(self._comment_state, "no cursor")
@@ -13252,14 +13259,16 @@ class GitHubHub:
                     self.audit.append(self.actor, "comment_cursor.fallback", repo, {"repo": repo, "consumer": consumer, "reason": why})
             records, cut = self.read_pages(base % (repo, since), older=("created_at", since), cap=cap)
             have = {}
+            loose_held.clear()
         else:
             records, cut = self.read_pages(base % (repo, mark), older=("created_at", mark), cap=cap)
-        loose = []   # records without a valid created_at: read_pages kept them, so this read returns them (not held: nothing places them in the window)
         for record in records:
             if not isinstance(record, dict):
                 continue
             if not isinstance(record.get("created_at"), str):
-                loose.append(record)
+                loose_held[("id", record["id"]) if record.get("id") is not None else ("noid", json.dumps(record, sort_keys=True, default=str))] = record
+                while len(loose_held) > COMMENT_WINDOW_PAGES * GITHUB_PAGE_SIZE:
+                    del loose_held[next(iter(loose_held))]   # bounded as the held comments are: the oldest held drops
             elif record["created_at"] >= since:
                 # merge by id; a record without an id is keyed by its content so id-less records do not collapse into one
                 have[record["id"] if record.get("id") is not None else ("noid", json.dumps(record, sort_keys=True, default=str))] = record
@@ -13274,7 +13283,7 @@ class GitHubHub:
         if newest is not None and cursors.get(name) != newest:   # an empty merge keeps the old cursor (harmless: the next read asks since it again)
             cursors[name] = newest
             store.save(self.state_dir, cursors, parse)
-        merged = sorted(have.values(), key=lambda r: r["created_at"], reverse=True) + loose   # stable: equal seconds keep the API order, as read_pages gave them
+        merged = sorted(have.values(), key=lambda r: r["created_at"], reverse=True) + list(loose_held.values())   # stable: equal seconds keep the API order, as read_pages gave them
         if key in gaps:
             when, then = self.now(), parse_iso(since)
             _COMMENT_CUTS[key] = (len(merged), max(1, round((when - then) / 86400)) if then is not None else 0)
