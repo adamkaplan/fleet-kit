@@ -575,3 +575,5 @@ A pod launched with the role `tester` joins the hub: the lane's launch command h
 Settings the owner sets: the hub's address (`CW_HUB_CHANNEL_URL`) and the registry Secret name (`CW_HUB_REGISTRY_SECRET`) in the control host's settings file, only if they differ from the launcher's defaults; and in the daemon's configuration the pod names that may record tester verdicts, listed under `plan_evaluators.tester`.
 
 The relay's refusals: a pod not listed under `plan_evaluators.tester` (a worker pod) is refused; the recorded author of the pull request is refused; a pull request the pod's boss did not name is refused. An accepted verdict is recorded under the pod's own name with the evaluator tester.
+
+A pod's call is also refused (403, `pr not linked to the pod's issue`) when the pull request is not linked to the pod's own issue.
