@@ -74484,6 +74484,10 @@ class TestBlockedReport(Base):
             for part in ("coder", "blocked for 25 minutes", "Held for it: 2 messages"):
                 self.assertIn(part, found["text"])
         self.assertEqual(len(self.audits()), 1)
+        observation = self.blocked_observation()
+        now = self.world.clock.now()
+        self.assertIn("1 refused send the senders must repeat", sb.blocked_line(self.world.engine, observation, now - 1500, now, [], ["cos"], "x"))
+        self.assertIn("2 refused sends the senders must repeat", sb.blocked_line(self.world.engine, observation, now - 1500, now, [], ["cos", "platform"], "x"))
 
     def test_over_the_threshold_with_nothing_held_is_not_reported(self):
         self.block(senders=())
