@@ -295,9 +295,9 @@ class TestHeavyProgress(unittest.TestCase):
 
     def test_u4_the_niceness_is_as_at_the_base(self):
         hs = sb.load_heavy_slots()
-        self.assertEqual(hs.command_prefix(lambda name: "/usr/bin/" + name if name == "taskpolicy" else None), ["/usr/bin/taskpolicy", "-b"])
-        self.assertEqual(hs.command_prefix(lambda name: "/usr/bin/nice" if name == "nice" else None), ["/usr/bin/nice", "-n", "10"])
-        self.assertEqual(hs.command_prefix(lambda name: None), [])
+        self.assertEqual(hs.command_prefix(lambda name: "/usr/bin/" + name if name == "taskpolicy" else None, environ={}), ["/usr/bin/taskpolicy", "-b"])
+        self.assertEqual(hs.command_prefix(lambda name: "/usr/bin/nice" if name == "nice" else None, environ={}), ["/usr/bin/nice", "-n", "10"])
+        self.assertEqual(hs.command_prefix(lambda name: None, environ={}), [])
 
     def test_u6_the_interval_is_60_and_an_environment_value_shortens_it(self):
         hs = sb.load_heavy_slots()
