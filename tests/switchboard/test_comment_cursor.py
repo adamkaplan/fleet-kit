@@ -178,6 +178,34 @@ class TestCommentCursor(HubCase):
         self.assertEqual((len(ids), len(set(ids)), 3 in ids), (150, 150, True))
         self.assertEqual(next(c for c in got if c["id"] == 3)["updated_at"], sb.iso(NOW + 5))
 
+    def test_equal_second_comments_keep_the_api_order_and_latest_strong_sees_the_same_one(self):
+        world = CommentWorld(NOW - 7 * DAY, 0)
+        when = NOW - DAY
+        world.comments = [CommentWorld.make(9, when), CommentWorld.make(10, when), CommentWorld.make(5, when - 100)]
+        hub = self.hub(world)
+        old, _ = hub.read_pages("repos/%s/issues/comments?since=%s&sort=created&direction=desc&per_page=100" % (REPO, self.since), older=("created_at", self.since), cap=2)
+        self.assertEqual([c["id"] for c in old], [10, 9, 5])
+        got, _ = self.hub(world).read_comments("sweep", REPO, self.since, cap=sb.COMMENT_WINDOW_PAGES)
+        self.assertEqual([c["id"] for c in got], [10, 9, 5])
+        self.assertEqual(got[0]["id"], old[0]["id"])   # the comment a check sees first is the same as before
+        numeric = CommentWorld(NOW - 7 * DAY, 0)
+        numeric.comments = [CommentWorld.make(100, when), CommentWorld.make(99, when)]   # ids compared as strings would put 99 first
+        got, _ = self.hub(numeric).read_comments("sweep", REPO, self.since, cap=2)
+        self.assertEqual([c["id"] for c in got], [100, 99])
+
+    def test_records_without_a_valid_created_at_or_an_id_are_kept(self):
+        world = CommentWorld(NOW - 7 * DAY, 0)
+        good = CommentWorld.make(1, NOW - DAY)
+        world.comments = [good]
+        hub = self.hub(world)
+        listing = [[good, {"id": 2, "body": "no date"}, {"id": 3, "created_at": 5, "body": "bad date"},
+                    {"created_at": sb.iso(NOW - 2 * DAY), "body": "a"}, {"created_at": sb.iso(NOW - 2 * DAY), "body": "b"}]]
+        hub.gh_api = lambda path, paginate=True, timeout=None: listing
+        got, _ = hub.read_comments("sweep", REPO, self.since, cap=1)
+        self.assertEqual(sorted(c["body"] for c in got), ["a", "b", "bad date", "c1", "no date"])
+        got, _ = hub.read_comments("sweep", REPO, self.since, cap=1)   # served again: the id-less pair stays two, not four
+        self.assertEqual(sorted(c["body"] for c in got), ["a", "b", "bad date", "c1", "no date"])
+
     def test_a_small_repository_reads_what_it_read_before(self):
         world = self.world(150)
         got, cut = self.hub(world).read_comments("triage", REPO, self.since, cap=sb.COMMENT_WINDOW_PAGES)

@@ -13251,9 +13251,15 @@ class GitHubHub:
             have = {}
         else:
             records, cut = self.read_pages(base % (repo, mark), older=("created_at", mark), cap=cap)
+        loose = []   # records without a valid created_at: read_pages kept them, so this read returns them (not held: nothing places them in the window)
         for record in records:
-            if isinstance(record, dict) and isinstance(record.get("created_at"), str) and record["created_at"] >= since:
-                have[record.get("id")] = record
+            if not isinstance(record, dict):
+                continue
+            if not isinstance(record.get("created_at"), str):
+                loose.append(record)
+            elif record["created_at"] >= since:
+                # merge by id; a record without an id is keyed by its content so id-less records do not collapse into one
+                have[record["id"] if record.get("id") is not None else ("noid", json.dumps(record, sort_keys=True, default=str))] = record
         have = {k: v for k, v in have.items() if v["created_at"] >= since}
         held[key] = have
         oldest = min((r["created_at"] for r in records if isinstance(r, dict) and isinstance(r.get("created_at"), str)), default=None)
@@ -13265,7 +13271,7 @@ class GitHubHub:
         if newest is not None and cursors.get(name) != newest:
             cursors[name] = newest
             store.save(self.state_dir, cursors, parse)
-        merged = sorted(have.values(), key=lambda r: (r["created_at"], str(r.get("id"))), reverse=True)
+        merged = sorted(have.values(), key=lambda r: r["created_at"], reverse=True) + loose   # stable: equal seconds keep the API order, as read_pages gave them
         if key in gaps:
             when, then = self.now(), parse_iso(since)
             _COMMENT_CUTS[repo] = (len(merged), max(1, round((when - then) / 86400)) if then is not None else 0)
