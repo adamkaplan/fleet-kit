@@ -36,7 +36,9 @@ class TestLostWorkerRemembers(unittest.TestCase):
             sb.lost_worker_tick(r.engine, None)
             one = len(r.engine.sent)
             sb.lost_worker_tick(r.engine, None)
-        self.assertGreaterEqual(one, 1, WHY)
+        lane = r.engine.cloud_watch["records"][0]["reports_to"]   # the lane of the loss, from the fixture
+        expected = len(dict.fromkeys([x for x in [lane, "chief-of-staff"] if x]))   # as _deliver: deduplicated, None skipped
+        self.assertEqual(one, expected, WHY)
         self.assertEqual(len(r.engine.sent), one, WHY)
 
     # S4: the S2 check run against a loader; the mutants are textual replacements in a COPY of bin/lost_worker.py (REAL detector copy, real state file; FAKE engine/clock).
