@@ -85,6 +85,7 @@ class TestLostWorkerRemembers(unittest.TestCase):
             def mutate(text, name=name):
                 lines = text.split("\n")
                 hits = [l for l in lines if l.startswith(marker)]
+                self.assertEqual(len(hits), 1, "the #2017 line is not found exactly once in bin/lost_worker.py")
                 old = hits[0] + "\n"
                 self.assertEqual(text.count(old), 1)
                 return text.replace(old, "" if name == "M1" else "    alerted = {}\n")
