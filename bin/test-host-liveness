@@ -52,16 +52,16 @@ class Module(unittest.TestCase):
         seen = {}
         def runner(argv, **kw):
             seen["argv"], seen["kw"] = argv, kw
-            return subprocess.CompletedProcess(argv, 0, stdout=json.dumps({"agents": {"list": [{"name": "a1", "observation": {"session_id": "s1"}}]}}), stderr="")
+            return subprocess.CompletedProcess(argv, 0, stdout=json.dumps({"ok": True, "agents": {"problems": [], "list": [{"name": "a1", "observation": {"session_id": "s1"}}]}}), stderr="")
         names = host_liveness._remote("h1", runner=runner)
         self.assertEqual(names, ["a1"])
         self.assertIn("BatchMode=yes", seen["argv"])
         self.assertEqual(seen["kw"]["timeout"], 5)
 
 
-def stub_ssh(status, entries):
+def stub_ssh(status, entries, problems=(), ok=True):
     def runner(argv, **kw):
-        return subprocess.CompletedProcess(argv, status, stdout=json.dumps({"agents": {"list": entries}}), stderr="")
+        return subprocess.CompletedProcess(argv, status, stdout=json.dumps({"ok": ok, "agents": {"problems": list(problems), "list": entries}}), stderr="")
     return runner
 
 
@@ -80,6 +80,49 @@ class ExitStatus(unittest.TestCase):
         runner = stub_ssh(0, [{"name": "a1", "observation": None}])
         got = host_liveness.check("h1", "a1", ask=lambda h, a: host_liveness._remote(h, runner=runner))
         self.assertEqual(got["verdict"], "dead")
+
+
+class Discovery(unittest.TestCase):
+    def verdict(self, runner):
+        return host_liveness.check("h1", "a1", ask=lambda h, a: host_liveness._remote(h, runner=runner))["verdict"]
+
+    def test_problems_with_an_empty_list_are_unreachable(self):
+        self.assertEqual(self.verdict(stub_ssh(0, [], problems=["herdr unreachable: x"])), "unreachable")
+
+    def test_problems_with_a_live_agent_that_has_no_observation_are_unreachable(self):
+        self.assertEqual(self.verdict(stub_ssh(0, [{"name": "a1", "observation": None}], problems=["v2 unreachable: x"])), "unreachable")
+
+    def test_a_report_that_is_not_ok_is_unreachable(self):
+        self.assertEqual(self.verdict(stub_ssh(0, [], ok=False)), "unreachable")
+
+    def test_healthy_without_the_agent_is_dead_and_with_it_alive(self):
+        self.assertEqual(self.verdict(stub_ssh(0, [])), "dead")
+        self.assertEqual(self.verdict(stub_ssh(0, [{"name": "a1", "observation": {"session_id": "s1"}}])), "alive")
+
+
+class DiscoveryMutant(unittest.TestCase):
+    """A copy of the module in which the discovery-problems check is dropped."""
+
+    def judge(self, source):
+        space = {"__name__": "mutant"}
+        exec(compile(source, "host_liveness_copy", "exec"), space)
+        runner = stub_ssh(0, [], problems=["herdr unreachable: x"])
+        got = space["check"]("h1", "a1", ask=lambda h, a: space["_remote"](h, runner=runner))["verdict"]
+        if got != "unreachable":
+            raise AssertionError("a host with discovery problems was judged %s, not unreachable" % got)
+
+    def test_dropping_the_problems_check_fails(self):
+        original = (BIN / "host_liveness.py").read_text()
+        self.judge(original)   # the control, run first: it passes
+        old = '    if report.get("ok") is not True or agents.get("problems") != []:\n'
+        self.assertEqual(original.count(old), 1)
+        changed = original.replace(old, "    if False:\n", 1)
+        applied = changed != original and old in original and old not in changed
+        self.assertTrue(applied, "the mutation was not applied")
+        noop = original.replace(old, old, 1)
+        self.assertFalse(noop != original and old in original and old not in noop, "the no-op mutation passed the computation")
+        with self.assertRaisesRegex(AssertionError, "^a host with discovery problems was judged dead, not unreachable"):
+            self.judge(changed)
 
 
 def make_doctor_dir(tmp, text=None):

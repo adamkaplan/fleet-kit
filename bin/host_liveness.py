@@ -35,7 +35,11 @@ def _remote(host, runner=subprocess.run):
     if done.returncode != 0:
         raise RuntimeError("ssh exited with status %s" % done.returncode)
     report = json.loads(done.stdout)
-    entries = report["agents"]["list"]
+    agents = report["agents"]
+    # a live agent has an `observation` only when the host's discovery worked: with problems (herdr or v2 unreachable there) or a report that is not ok, the list proves nothing
+    if report.get("ok") is not True or agents.get("problems") != []:
+        raise RuntimeError("the host's overview says its discovery had problems")
+    entries = agents["list"]
     # an entry with no `observation` is only the recipient of a pending message: it has no session, so it is not alive
     return [e.get("name") for e in entries if isinstance(e, dict) and e.get("name") and e.get("observation")]
 
