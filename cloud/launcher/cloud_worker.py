@@ -44,6 +44,33 @@ SHAPES = {"XS": {"cpu": "1", "memory": "2Gi", "usd_per_hour": 0.05, "stack": Fal
 DEFAULT_SHAPE = "XS"        # a create that names no shape and is not a stack launch (S, M by name only)
 DEFAULT_ORCHESTRATOR_SHAPE = "O"   # an orchestrator launch that names no shape takes its own small row (the role table carries no shape: this is the one place)
 DEFAULT_STACK_SHAPE = "S"   # a stack launch that names no shape (its row must carry stack: true)
+
+# Per-shape requests (#1978): ONE table, shape S only; a shape with no row has no requests key. The limits stay the SHAPES rows.
+SHAPE_REQUESTS = {"S": {"cpu": "500m", "memory": "2Gi"}}
+
+
+def parse_quantity(q):
+    """A Kubernetes quantity as an exact number (CPUs or bytes): plain numbers and the suffixes m, Ki, Mi, Gi."""
+    from fractions import Fraction
+    q = str(q)
+    for suffix, mult in (("Ki", 1024), ("Mi", 1024 ** 2), ("Gi", 1024 ** 3), ("m", Fraction(1, 1000))):
+        if q.endswith(suffix):
+            return Fraction(q[:-len(suffix)]) * mult
+    return Fraction(q)
+
+
+def requests_fit(shape_name, resources):
+    """True when resources hold requests of exactly cpu and memory, each equal to the table's value for the shape and not above the same limit."""
+    if not isinstance(resources, dict) or set(resources) != {"limits", "requests"}:
+        return False
+    req, lim = resources.get("requests"), resources.get("limits")
+    table = SHAPE_REQUESTS.get(shape_name)
+    try:
+        return bool(table) and req == table and set(lim) == {"cpu", "memory"} and all(
+            parse_quantity(req[k]) <= parse_quantity(lim[k]) for k in ("cpu", "memory"))
+    except (TypeError, ValueError, ZeroDivisionError, KeyError):
+        return False
+
 MAX_TOKEN_SECONDS = 3600
 
 # The cluster login (ONE route, used by the launch wiring and by the reaper's own refresh; the numbers of the refresh live here).
@@ -257,7 +284,7 @@ def _stack_rest_differs(pod):
         or len(ks) != 1 or [k.get("name") for k in ks] != ["worker"]   # one container, named worker: no sidecar, even one with the stack context
         or any(not set(k) <= STACK_CONTAINER_KEYS or not isinstance(k.get("image"), str) or not k.get("image") for k in ks)
         or any(set(e) != {"name", "value"} for k in ks for e in k.get("env", []))   # no valueFrom / secretKeyRef; no envFrom (key allow-list)
-        or any(set((k.get("resources") or {})) != {"limits"} or set(k["resources"]["limits"]) != {"cpu", "memory"} for k in ks)   # limits stay
+        or any((set((k.get("resources") or {})) != {"limits"} and not requests_fit(pod.get("metadata", {}).get("annotations", {}).get("cw/shape"), k.get("resources"))) or set(k["resources"]["limits"]) != {"cpu", "memory"} for k in ks)   # limits stay; requests only the table's
         or any(k.get("readinessProbe") != {"tcpSocket": {"port": 4096}} for k in ks)
         or any(set(m) - {"name", "mountPath", "readOnly"} or {**STACK_MOUNT_PATHS, PULLER_VOLUME_NAME: PULLER_MOUNT_PATH}.get(m.get("name")) != m.get("mountPath")
                for k in ks for m in k.get("volumeMounts", []))
@@ -1802,7 +1829,7 @@ def render_pod(a, worker, name, now, hard, env, run_names=()):
                   "securityContext": copy.deepcopy(POD_SECURITY_CONTEXT),
                  "containers": [{"name": "worker", "image": image,
                                  "securityContext": {"allowPrivilegeEscalation": False, "capabilities": {"drop": ["ALL"]}}, "env": [{"name": k, "value": v} for k, v in e.items()],
-                                 "resources": {"limits": {"cpu": shape["cpu"], "memory": shape["memory"]}},
+                                 "resources": {"limits": {"cpu": shape["cpu"], "memory": shape["memory"]}, **({"requests": dict(SHAPE_REQUESTS[a.shape])} if a.shape in SHAPE_REQUESTS else {})},
                                  "readinessProbe": {"tcpSocket": {"port": 4096}},
                                  "lifecycle": copy.deepcopy(PRESTOP_LIFECYCLE),
                                  "volumeMounts": [{"name": "pw", "mountPath": "/run/cw", "readOnly": True},
