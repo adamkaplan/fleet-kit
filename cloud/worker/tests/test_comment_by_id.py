@@ -88,5 +88,28 @@ class ById(unittest.TestCase):
                             "the no-op mutation must fail the computation")
 
 
+class ClientIsGetOnly(unittest.TestCase):
+    """The pod's client allows the by-id read and refuses every write form and every near path."""
+
+    @classmethod
+    def setUpClass(cls):
+        import importlib.machinery, importlib.util
+        loader = importlib.machinery.SourceFileLoader("cw_gh_by_id", os.path.join(ROOT, "cloud/worker/cw-gh"))
+        spec = importlib.util.spec_from_loader("cw_gh_by_id", loader)
+        cls.m = importlib.util.module_from_spec(spec)
+        loader.exec_module(cls.m)
+
+    def test_path_allowed(self):
+        self.assertTrue(self.m.api_path_allowed("/repos/o/r/issues/comments/1"))
+        self.assertTrue(self.m.api_path_allowed("/repos/o/r/issues/comments/1?per_page=1"))
+        for bad in ("abc", "1/reactions", "1/../2"):
+            self.assertFalse(self.m.api_path_allowed("/repos/o/r/issues/comments/" + bad), bad)
+
+    def test_write_forms_refused_by_api_get(self):
+        for extra in (["-X", "PATCH"], ["-f", "a=b"]):
+            with self.assertRaises(self.m.Fail):
+                self.m.api_get(["repos/o/r/issues/comments/1"] + extra)
+
+
 if __name__ == "__main__":
     unittest.main()
