@@ -14971,7 +14971,7 @@ def _send_by_registry(args, runner, now):
         return EXIT_USAGE
     held = es.blocked_reason(args.name, found[2], hold_reason)
     if held:
-        hold_send_endpoint(engine, args.name, sender, text, args.issue, now)
+        hold_send_endpoint(engine, args.name, sender, text, args.issue, engine.now())
         sys.stderr.write("%s: held for %s: %s is blocked; it will be delivered when it unblocks\n" % (PROG, args.name, args.name))
         return EXIT_OK
     ok, line = es.deliver(load_module("cloud_client"), found[1], sender, args.name, text)
