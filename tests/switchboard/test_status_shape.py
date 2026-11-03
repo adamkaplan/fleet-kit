@@ -21,7 +21,7 @@ OLD = 'return child.returncode, body if isinstance(body, dict) else None, D["_on
 NEW_PREFIX = "return child.returncode, body if isinstance(body, dict) or (command"
 
 
-def mutate(text, old, new):
+def mutate_text(text, old, new):
     """The text with `old` (asserted to occur once) replaced by `new`; the mutation is applied only when the two texts differ AND the result differs."""
     assert text.count(old) == 1, "the text to mutate does not occur once"
     out = text.replace(old, new)
@@ -145,7 +145,7 @@ class TestDictCallersUnchanged(Launcher):
         full = CLUSTER.read_text()
         control = unittest.TextTestRunner(stream=io.StringIO()).run(self.callers_suite(full))
         self.assertTrue(control.wasSuccessful(), "control: the unmutated code passes the caller tests")
-        text = mutate(full, old, new)
+        text = mutate_text(full, old, new)
         self.assertNotEqual(text, full, "the mutation was not applied")
         run = unittest.TextTestRunner(stream=io.StringIO()).run(self.callers_suite(text))
         failed = run.failures + run.errors
@@ -154,7 +154,7 @@ class TestDictCallersUnchanged(Launcher):
 
     def test_a_no_op_caller_mutation_fails_the_computation(self):
         with self.assertRaisesRegex(AssertionError, "the mutation was not applied"):
-            mutate(CLUSTER.read_text(), "isinstance(body, list)", "isinstance(body, list)")
+            mutate_text(CLUSTER.read_text(), "isinstance(body, list)", "isinstance(body, list)")
 
 
     def test_create_caller_unchanged(self):
@@ -264,7 +264,7 @@ class TestTurnEnd(Launcher):
         self.assertEqual({to for to, _ in sent}, {"coder-lead"})
 
     def mutant_run_launcher(self, old, new):
-        text = mutate(CLUSTER.read_text(), old, new)
+        text = mutate_text(CLUSTER.read_text(), old, new)
         module = types.ModuleType("cloud_cluster_mutant")
         module.D = self.cw._Stayed()
         exec(compile(text, "mutant", "exec"), module.__dict__)
@@ -288,7 +288,7 @@ class TestTurnEnd(Launcher):
 
     def test_a_no_op_mutation_fails_the_computation(self):
         with self.assertRaisesRegex(AssertionError, "the mutation was not applied"):
-            mutate(CLUSTER.read_text(), self.line(), self.line())
+            mutate_text(CLUSTER.read_text(), self.line(), self.line())
 
 
 if __name__ == "__main__":
