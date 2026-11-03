@@ -567,8 +567,7 @@ def triage_read_unit(hub, repo, unit, now, budget):
         records, cut = hub.read_pages("repos/%s/pulls?state=closed&sort=updated&direction=desc&per_page=%d" % (repo, TRIAGE_MERGED_PER_PAGE), cap=1)
     elif unit == "comments":
         since = iso(now - TRIAGE_COMMENT_DAYS * 86400)
-        records, cut = hub.read_pages("repos/%s/issues/comments?since=%s&sort=created&direction=desc&per_page=100"
-                                      % (repo, since), older=("created_at", since), cap=TRIAGE_LIST_PAGES)
+        records, cut = hub.read_comments("triage", repo, since, cap=COMMENT_WINDOW_PAGES)
     else:
         label = unit.split(":", 1)[1]
         records, cut = hub.read_pages("repos/%s/issues?state=closed&labels=%s&per_page=100" % (repo, quote(label, safe="")),
