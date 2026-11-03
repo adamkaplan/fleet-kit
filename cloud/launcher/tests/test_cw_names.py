@@ -123,7 +123,7 @@ class S5Names(base.Base):
         emitted |= (set(pod["metadata"]["labels"]) - {"app"} - set(PLATFORM_KEYS)) | set(pod["metadata"]["annotations"])
         emitted.add(pod["metadata"]["labels"]["app"])
         emitted.add(pod["spec"]["serviceAccountName"])
-        calls = [json.loads(x) for x in open(self.env["FAKE_KUBE_CALLS"])]
+        calls = [json.loads(x) for x in pathlib.Path(self.env["FAKE_KUBE_CALLS"]).read_text().splitlines()]
         emitted |= {a[a.index("-n") + 1] for a in calls}
         emitted |= {a[a.index("--") + 1] for a in calls if "exec" in a and "--" in a}
         emitted |= {a.split("=", 1)[0] for a in sum(calls, []) if a.startswith("cw/")}
@@ -156,7 +156,7 @@ class S6Reaper(base.Base):
         self.assertEqual([r[:2] for r in res], [("coder7", "hard limit")])
         self.assertIsNone(self.pod())
         self.assertIn("stray", self.st()["pods"])
-        listing = [json.loads(x) for x in open(self.env["FAKE_KUBE_CALLS"])]
+        listing = [json.loads(x) for x in pathlib.Path(self.env["FAKE_KUBE_CALLS"]).read_text().splitlines()]
         self.assertTrue(any("-l" in c and "app=cw-worker" in c for c in listing))
 
     def clean(self):
