@@ -985,7 +985,7 @@ def queue_view(state_dir, moment):
         stale = moment > until if until is not None else age > QUEUE_STALE_SECONDS
         refused = last.get("state") == "refused" and last.get("rev", 0) >= entry["line"]
         priority = entry["priority"] if isinstance(entry.get("priority"), int) else 5
-        view.append(dict(entry, age=age, state=last.get("state") or "queued", stale=stale, skipped=refused, order=(priority, queued or 0, key)))
+        view.append(dict(entry, age=age, state=last.get("state") or "queued", reason=last.get("reason"), stale=stale, skipped=refused, order=(priority, queued or 0, key)))
     view.sort(key=lambda item: item["order"])
     return view, bad + bad_status
 
@@ -1077,9 +1077,15 @@ def queue_next(state_dir, free, moment, live_hash, approvals):
             if full is None:
                 queue_note(state_dir, key, "refused", moment, reason="no-plan-hash")
                 continue
-            live = queue_hash(live_hash(item.get("plan_issue")))
-            if live is None:
-                out.append("not launched: %s: the live plan hash could not be read" % name)
+            try:
+                live = queue_hash(live_hash(item.get("plan_issue")))
+                if live is None:
+                    raise FactError("no 64-hex plan hash")
+            except FactError as err:
+                why = "hash-unread: %s" % err   # waiting, not refused: a read that failed may succeed at the next slot
+                if item["state"] != "waiting" or item.get("reason") != why:
+                    queue_note(state_dir, key, "waiting", moment, reason=why)
+                out.append("not launched: %s: the live plan hash could not be read: %s" % (name, err))
                 continue
             if live != full:
                 queue_note(state_dir, key, "refused", moment, reason="hash-mismatch %s" % live[:8])
@@ -1103,12 +1109,22 @@ def queue_list_lines(state_dir, moment):
 
 
 def queue_live_hash(runner, issue):
-    """The live plan hash of the plan issue, read the way `plan check` reads it; None when it cannot be read."""
+    """The live plan hash of the plan issue, read the way `plan check` reads it; a FactError naming the cause when it cannot be read."""
     try:
         done = runner([sys.executable, sys.argv[0], "plan", "check", str(issue), "--json"], capture_output=True, text=True, timeout=60)
-        return load_module("record_json").parse_bounded(done.stdout).get("plan_hash")
+    except Exception as err:
+        raise FactError("%s: %s" % (type(err).__name__, str(err)[:100]))
+    try:
+        got = load_module("record_json").parse_bounded(done.stdout)
     except Exception:
-        return None
+        raise FactError("plan check printed no JSON: %s" % (done.stdout or "").strip()[:100])
+    if not isinstance(got, dict):
+        raise FactError("plan check printed no JSON object")
+    if got.get("result") == "error":
+        raise FactError("plan check says: %s" % str(got.get("error"))[:100])
+    if not got.get("plan_hash"):
+        raise FactError("plan check gave no plan_hash")
+    return got["plan_hash"]
 
 
 def queue_approvals(state_dir):

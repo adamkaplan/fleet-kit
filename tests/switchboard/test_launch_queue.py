@@ -262,6 +262,30 @@ def build(HandoffCase):
             self.approved_as("adamkaplan/fleet-kit#1786", H1)
             self.assertEqual(self.printed(self.next_lines(1, live=H1)), ["pi"])
 
+        def test_s14_live_hash_failures_are_named_in_the_refusal_line(self):
+            def ran(text, code=0):
+                return lambda argv, **kw: argparse.Namespace(stdout=text, returncode=code)
+
+            def boom(argv, **kw):
+                raise OSError("no such file")
+            for runner, cause in ((boom, "OSError"), (ran("not json"), "not json"), (ran(json.dumps({"result": "error", "error": "no plan"}), 2), "no plan"),
+                                  (ran(json.dumps({"result": "pass"})), "no plan_hash")):
+                with self.assertRaises(sb.FactError) as caught:
+                    sb.queue_live_hash(runner, ISSUE)
+                self.assertIn(cause, str(caught.exception))
+            self.put("unread")
+            self.approved(H1)
+
+            def failing(issue):
+                raise sb.FactError("plan check says: no plan")
+            out, _ = sb.queue_next(self.state, 1, self.world.clock.now(), failing, sb.queue_approvals(self.state))
+            self.assertEqual(out, ["not launched: unread: the live plan hash could not be read: plan check says: no plan"])
+            (status,) = [json.loads(l) for l in self.queue_lines("launch-queue.status.jsonl")]
+            self.assertEqual((status["state"], status["reason"]), ("waiting", "hash-unread: plan check says: no plan"))
+            sb.queue_next(self.state, 1, self.world.clock.now(), failing, sb.queue_approvals(self.state))
+            self.assertEqual(len(self.queue_lines("launch-queue.status.jsonl")), 1)
+            self.assertEqual(self.printed(self.next_lines(1)), ["unread"])
+
         def test_u1_unreadable_lines_are_counted_and_named_and_a_missing_file_is_empty(self):
             self.assertEqual(self.run_queue("list"), (0, ""))
             good = lambda n: json.dumps({"id": "q-%d" % n, "enqueued": sb.iso(self.world.clock.now()), "lane": "cos", "name": "n%d" % n, "kind": "tester", "priority": n})
