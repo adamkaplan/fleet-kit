@@ -883,3 +883,328 @@ def cmd_remind(args, runner, now):
 
 cmd_remind.ensure_on_use = True   # the daemon is alive when it runs
 cmd_remind.header_cache = True    # #1520
+
+
+# ---- queue (#1786)
+# The standing launch queue: `launch-queue.jsonl` (the lanes append) and `launch-queue.status.jsonl` (the cloud lane appends), both in the
+# state directory. It decides the order, the staleness and the hash check; it never starts a pod. Temporary home: moves with #1092.
+
+QUEUE_FILE = "launch-queue.jsonl"
+QUEUE_STATUS_FILE = "launch-queue.status.jsonl"
+QUEUE_LINE_MAX = 2000
+QUEUE_STALE_SECONDS = 120 * 60
+QUEUE_CLOUD_LANE = "fleet-cloud"
+QUEUE_REFUSED = 1
+QUEUE_KINDS = ("builder", "tester", "measure")
+QUEUE_KEYS = ("id", "enqueued", "lane", "name", "kind", "ask", "brief_file", "base_branch", "wip_branch", "role", "reports_to", "shape",
+              "idle", "hard", "priority", "plan_issue", "plan_hash_full", "approved_by", "approved_at", "until")
+QUEUE_STATES = ("queued", "waiting", "launched", "refused", "stale", "superseded", "finished")
+QUEUE_GONE = ("launched", "finished", "superseded")
+
+
+def queue_append(path, record):
+    data = (json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+    if len(data) > QUEUE_LINE_MAX + 1:
+        raise FactError("a queue line is at most %d bytes" % QUEUE_LINE_MAX)
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        os.write(fd, data)   # one O_APPEND write: one line, never half read
+    finally:
+        os.close(fd)
+
+
+def queue_lines(path, keys, tail=None):
+    """([(line number, record)], [bad line numbers]): a missing file is empty; a bad line is counted, never raised."""
+    try:
+        with open(str(path), "rb") as handle:
+            if tail:
+                handle.seek(0, os.SEEK_END)
+                handle.seek(max(0, handle.tell() - tail))
+            raw = handle.read()
+    except FileNotFoundError:
+        return [], []
+    except OSError:
+        return [], [0]
+    good, bad = [], []
+    for number, line in enumerate(raw.split(b"\n"), 1):
+        if not line.strip():
+            continue
+        try:
+            if len(line) > QUEUE_LINE_MAX:
+                raise ValueError("long")
+            record = load_module("record_json").parse_bounded(line.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            bad.append(number)
+            continue
+        if isinstance(record, dict) and all(isinstance(record.get(key), str) for key in keys):
+            good.append((number, record))
+        else:
+            bad.append(number)
+    return good, bad
+
+
+def queue_epoch(text):
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+    except (ValueError, AttributeError):
+        return None
+
+
+def queue_fold(state_dir):
+    """(entries by id in file order, last status by id, bad entry lines, bad status lines): the last line of an id decides."""
+    entries, status = {}, {}
+    lines, bad = queue_lines(Path(state_dir) / QUEUE_FILE, ("id",))
+    for number, rec in lines:
+        key = rec["id"]
+        if rec.get("op") is None:
+            if isinstance(rec.get("name"), str) and (key not in entries or entries[key]["lane"] == rec.get("lane")):
+                entries[key] = dict(rec, line=number)
+            else:
+                bad.append(number)
+        elif key in entries and rec.get("lane") == entries[key]["lane"]:
+            if rec["op"] == "priority" and isinstance(rec.get("priority"), int):
+                entries[key]["priority"] = rec["priority"]
+            elif rec["op"] == "cancel":
+                entries[key]["cancelled"] = True
+    rows, bad_status = queue_lines(Path(state_dir) / QUEUE_STATUS_FILE, ("id", "state"))
+    for _, rec in rows:
+        status[rec["id"]] = rec
+    return entries, status, sorted(bad), bad_status
+
+
+def queue_view(state_dir, moment):
+    """(live entries in launch order, each with age, state and stale; the unreadable line numbers)."""
+    entries, status, bad, bad_status = queue_fold(state_dir)
+    view = []
+    for key, entry in entries.items():
+        last = status.get(key) or {}
+        if entry.get("cancelled") or last.get("state") in QUEUE_GONE:
+            continue
+        queued = queue_epoch(entry.get("enqueued") or "")
+        until = queue_epoch(entry["until"]) if isinstance(entry.get("until"), str) else None
+        age = moment - queued if queued is not None else QUEUE_STALE_SECONDS + 1
+        stale = moment > until if until is not None else age > QUEUE_STALE_SECONDS
+        refused = last.get("state") == "refused" and last.get("rev", 0) >= entry["line"]
+        priority = entry["priority"] if isinstance(entry.get("priority"), int) else 5
+        view.append(dict(entry, age=age, state=last.get("state") or "queued", reason=last.get("reason"), stale=stale, skipped=refused, order=(priority, queued or 0, key)))
+    view.sort(key=lambda item: item["order"])
+    return view, bad + bad_status
+
+
+def queue_age(seconds):
+    return "%dm" % (max(seconds, 0) // 60) if seconds < 7200 else "%dh" % (seconds // 3600)
+
+
+def queue_note(state_dir, key, state, moment, pod=None, reason=None):
+    """One status line of the cloud lane's answers; `rev` is how many lines of the queue it has seen."""
+    seen = max([n for n, _ in queue_lines(Path(state_dir) / QUEUE_FILE, ("id",))[0]] or [0])
+    rec = {"id": key, "state": state, "at": iso(moment), "rev": seen}
+    if pod:
+        rec["pod"] = pod
+    if reason:
+        rec["reason"] = reason
+    queue_append(Path(state_dir) / QUEUE_STATUS_FILE, rec)
+
+
+def queue_add(state_dir, lane, fields, moment):
+    """The id of the new entry, or a FactError with the one line of the refusal."""
+    view, _ = queue_view(state_dir, moment)
+    if any(item["name"] == fields.get("name") for item in view):
+        raise FactError("%s is already queued" % fields.get("name"))
+    if not isinstance(fields.get("ask"), int):
+        raise FactError("--ask is required: the issue number the pod works under")
+    if fields.get("kind") not in QUEUE_KINDS:
+        raise FactError("kind is one of %s" % ", ".join(QUEUE_KINDS))
+    if not (isinstance(fields.get("name"), str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", fields["name"])):
+        raise FactError("name is 1 to 64 letters, digits, dots, dashes")
+    if not (isinstance(fields.get("brief_file"), str) and fields["brief_file"].startswith("/")):
+        raise FactError("brief_file is the absolute path of the brief")
+    if fields.get("kind") == "builder":
+        issue = fields.get("plan_issue")
+        if isinstance(issue, str) and re.fullmatch(r"[0-9]+", issue):
+            if not (isinstance(fields.get("repo"), str) and re.fullmatch(r"[^/\s#]+/[^/\s#]+", fields["repo"])):
+                raise FactError("plan_issue %s is a bare number: give --repo owner/repo or the whole owner/repo#N" % issue)
+            fields = dict(fields, plan_issue="%s#%s" % (fields["repo"], issue))
+        elif not (isinstance(issue, str) and re.fullmatch(r"[^/\s#]+/[^/\s#]+#[0-9]+", issue)):
+            raise FactError("plan_issue is owner/repo#N, the form of the plan.approved audit event")
+    digits = re.sub(r"[^0-9]", "", iso(moment))
+    key = "q-%s-%s-%s" % (digits[:8], digits[8:14], fields.get("ask"))
+    entry = {k: v for k, v in fields.items() if k in QUEUE_KEYS and v is not None}
+    entry.update(id=key, enqueued=iso(moment), lane=lane)
+    queue_append(Path(state_dir) / QUEUE_FILE, entry)
+    return key
+
+
+def queue_change(state_dir, lane, key, op, moment, audit, number=None):
+    """Priority or cancel by the lane that queued the entry: one line appended, one audit line."""
+    entries, _, _, _ = queue_fold(state_dir)
+    entry = entries.get(key)
+    if entry is None or entry.get("cancelled"):
+        raise FactError("no queued entry %s" % key)
+    if entry["lane"] != lane:
+        raise FactError("%s was queued by %s, not by %s: refused" % (key, entry["lane"], lane))
+    if op == "priority" and not (isinstance(number, int) and 0 <= number <= 100):
+        raise FactError("priority is a whole number from 0 to 100 (the plan gives no range): %r" % (number,))
+    last = queue_fold(state_dir)[1].get(key) or {}
+    note = "note: %s is refused (%s); it stays skipped until its lane appends a replacement line" % (key, last.get("reason")) if last.get("state") == "refused" else None
+    rec = {"id": key, "op": op, "lane": lane, "at": iso(moment)}
+    old = entry.get("priority")
+    if op == "priority":
+        rec["priority"] = number
+    queue_append(Path(state_dir) / QUEUE_FILE, rec)
+    if audit is not None:
+        audit.append("cli", "queue." + op, entry["name"], {"lane": lane, "id": key, "name": entry["name"], "old": old, "new": number})
+    return note
+
+
+def queue_hash(value):
+    """The 64 hex characters of a plan hash given as `sha256:<64 hex>` or as bare 64 hex; None for anything else."""
+    text = value[7:] if isinstance(value, str) and value.startswith("sha256:") else value
+    return text if isinstance(text, str) and re.fullmatch(r"[0-9a-f]{64}", text) else None
+
+
+def queue_next(state_dir, free, moment, live_hash, approvals):
+    """(lines to print, entries to launch): `live_hash(issue)` is the live plan hash or None; `approvals` is a set of (issue, plan_hash)."""
+    out, picked = [], []
+    if free <= 0:
+        return out, picked
+    view, _ = queue_view(state_dir, moment)
+    for item in view:
+        if len(picked) >= free:
+            break
+        key, name = item["id"], item["name"]
+        if item["stale"]:
+            if item["state"] != "stale":
+                queue_note(state_dir, key, "stale", moment)
+            out.append("stale: %s, queued %s ago" % (name, queue_age(item["age"])))
+            continue
+        if item["skipped"]:
+            continue
+        if item["kind"] == "builder":
+            full = queue_hash(item.get("plan_hash_full"))
+            if full is None:
+                queue_note(state_dir, key, "refused", moment, reason="no-plan-hash")
+                continue
+            try:
+                live = queue_hash(live_hash(item.get("plan_issue")))
+                if live is None:
+                    raise FactError("no 64-hex plan hash")
+            except FactError as err:
+                why = "hash-unread: %s" % err   # waiting, not refused: a read that failed may succeed at the next slot
+                if item["state"] != "waiting" or item.get("reason") != why:
+                    queue_note(state_dir, key, "waiting", moment, reason=why)
+                out.append("not launched: %s: the live plan hash could not be read: %s" % (name, err))
+                continue
+            if live != full:
+                queue_note(state_dir, key, "refused", moment, reason="hash-mismatch %s" % live[:8])
+                out.append("not launched: %s: the live plan hash %s is not the one the entry needs %s" % (name, live[:8], full[:8]))
+                continue
+            if (item.get("plan_issue"), full) not in approvals:   # approvals hold normalised hashes
+                queue_note(state_dir, key, "refused", moment, reason="no-approval")
+                continue
+        picked.append(item)
+        out.append(json.dumps({k: v for k, v in item.items() if k in QUEUE_KEYS}, sort_keys=True))
+    return out, picked
+
+
+def queue_list_lines(state_dir, moment):
+    view, bad = queue_view(state_dir, moment)
+    lines = ["unreadable: line %d" % number for number in bad]
+    for item in view:
+        lines.append("%s %s p%s age %s %s%s" % (item["id"], item["name"], item.get("priority"), queue_age(item["age"]), item["state"],
+                                                " stale" if item["stale"] else ""))
+    return lines
+
+
+def queue_live_hash(runner, issue):
+    """The live plan hash of the plan issue, read the way `plan check` reads it; a FactError naming the cause when it cannot be read."""
+    try:
+        done = runner([sys.executable, sys.argv[0], "plan", "check", str(issue), "--json"], capture_output=True, text=True, timeout=60)
+    except Exception as err:
+        raise FactError("%s: %s" % (type(err).__name__, str(err)[:100]))
+    try:
+        got = load_module("record_json").parse_bounded(done.stdout)
+    except Exception:
+        raise FactError("plan check printed no JSON: %s" % (done.stdout or "").strip()[:100])
+    if not isinstance(got, dict):
+        raise FactError("plan check printed no JSON object")
+    if got.get("result") == "error":
+        raise FactError("plan check says: %s" % str(got.get("error"))[:100])
+    if not got.get("plan_hash"):
+        raise FactError("plan check gave no plan_hash")
+    return got["plan_hash"]
+
+
+def queue_approvals(state_dir):
+    rows, _ = queue_lines(Path(state_dir) / "audit.jsonl", ("event",), tail=8 * 1024 * 1024)
+    found = set()
+    for _, rec in rows:
+        detail = rec.get("detail")
+        if rec["event"] == "plan.approved" and isinstance(detail, dict):
+            found.add((detail.get("issue"), queue_hash(detail.get("plan_hash"))))
+    return found
+
+
+def cmd_queue(args, runner, now):
+    engine, _, _ = build_engine(runner, now, "cli")
+    caller = identify_caller(engine.herdr, engine.v2, os.environ)
+    state_dir, moment, action = str(engine.state_dir), now(), args.queue_action
+    try:
+        if action == "add":
+            fields = {k: getattr(args, k) for k in QUEUE_KEYS if hasattr(args, k)}
+            fields["repo"] = args.repo
+            key = queue_add(state_dir, caller, fields, moment)
+            print(key)
+            try:
+                engine.send(caller, QUEUE_CLOUD_LANE, "entry %s queued" % key)
+            except Exception:   # the entry is written: a failed wake never fails the add
+                print("queue: the wake failed; the entry %s is written" % key)
+        elif action in ("priority", "cancel"):
+            note = queue_change(state_dir, caller, args.id, action, moment, engine.audit, getattr(args, "number", None))
+            print("%s: %s" % (action, args.id))
+            if note:
+                print(note)
+        elif action == "list":
+            lines = queue_list_lines(state_dir, moment)
+            if lines:
+                print("\n".join(lines))
+        elif action == "next":
+            out, _ = queue_next(state_dir, args.free, moment, lambda issue: queue_live_hash(runner, issue), queue_approvals(state_dir))
+            if out:
+                print("\n".join(out))
+        elif action == "status":
+            if caller != QUEUE_CLOUD_LANE:
+                raise FactError("a status line is appended by %s" % QUEUE_CLOUD_LANE)
+            if args.state not in QUEUE_STATES:
+                raise FactError("state is one of %s" % ", ".join(QUEUE_STATES))
+            if args.id not in queue_fold(state_dir)[0]:
+                raise FactError("no queued entry %s" % args.id)
+            queue_note(state_dir, args.id, args.state, moment, pod=args.pod, reason=args.reason)
+            print("status: %s %s" % (args.id, args.state))
+    except FactError as err:
+        print("queue: %s" % err)
+        return QUEUE_REFUSED
+    return EXIT_OK
+
+
+def add_queue_parsers(sub):
+    queue = sub.add_parser("queue", help="The standing launch queue: add, change, list; the cloud lane reads it at a free slot")
+    actions = queue.add_subparsers(dest="queue_action", required=True)
+    add = actions.add_parser("add", help="Queue one pod to launch")
+    for flag in QUEUE_KEYS:
+        if flag not in ("id", "enqueued", "lane"):
+            add.add_argument("--" + flag.replace("_", "-"), dest=flag, default=None, type=int if flag in ("ask", "priority", "idle", "hard") else str)
+    add.add_argument("--repo", default=None, help="owner/repo for a bare --plan-issue number")
+    for action in ("priority", "cancel"):
+        one = actions.add_parser(action, help="%s an entry you queued" % action.capitalize())
+        one.add_argument("id")
+        if action == "priority":
+            one.add_argument("number", type=int)
+    actions.add_parser("list", help="The queue in launch order")
+    nxt = actions.add_parser("next", help="The entries to launch at FREE free slots")
+    nxt.add_argument("--free", type=int, required=True)
+    status = actions.add_parser("status", help="The cloud lane's answer for an entry")
+    status.add_argument("id")
+    status.add_argument("state")
+    status.add_argument("--pod")
+    status.add_argument("--reason")
