@@ -130,6 +130,80 @@ def build(HandoffCase, FAKE_GH):
             with self.assertRaisesRegex(AssertionError, "^7 != 8$"):
                 self.assertEqual(peak, 8)
 
+        def pure_lines(self, old=None, new=None):
+            """ci_queue_measure and ci_queue_lines compiled from the text, with ONE optional edit (a mutant of the output)."""
+            text = (REPO / "bin" / "switchboard" / "reminders.py").read_text()
+            body = text[text.index("def _ci_time("):text.index("def ci_queue_get(")]
+            if old is not None:
+                self.assertEqual(body.count(old), 1, "the mutant's anchor is not in the code: " + old)
+                body = body.replace(old, new)
+            space = {"datetime": datetime, "CI_QUEUE_GATE_FEEDERS": sb.CI_QUEUE_GATE_FEEDERS}
+            exec(compile(body, "ci_queue_mutant", "exec"), space)
+            return space
+
+        def text_of(self, space):
+            runs, jobs = fixture()
+            return "\n".join(space["ci_queue_lines"](space["ci_queue_measure"](runs, jobs, NOW, 24, GATE, {3})))
+
+        def test_mutant_s5_the_inferred_20_printed_as_published_is_caught_control_first(self):
+            self.assertIn('"observed" ceiling of 20', self.text_of(self.pure_lines()))   # control
+            text = self.text_of(self.pure_lines('runner limit: "observed" ceiling of %d', 'runner limit: published ceiling of %d'))
+            with self.assertRaisesRegex(AssertionError, "'\"observed\" ceiling of 20' not found in"):
+                self.assertIn('"observed" ceiling of 20', text)
+
+        def test_mutant_s6_a_candidate_without_minutes_is_caught_control_first(self):
+            def found(space):
+                runs, jobs = fixture()
+                return {c["kind"]: c["job_minutes_per_day"] for c in space["ci_queue_measure"](runs, jobs, NOW, 24, GATE, {3})["candidates"]}
+            self.assertEqual(found(self.pure_lines()), {"cut": 55, "dedupe": 40, "move": 90})   # control
+            mutant = found(self.pure_lines('"what": "%d run(s) on a head that already had a run" % repeat_runs, "job_minutes_per_day": int(round(repeat_minutes * scale))',
+                                           '"what": "%d run(s) on a head that already had a run" % repeat_runs, "job_minutes_per_day": 0'))
+            with self.assertRaisesRegex(AssertionError, "^\\{'cut': 55, 'dedupe': 0, 'move': 90\\} != \\{'cut': 55, 'dedupe': 40, 'move': 90\\}\\n"):
+                self.assertEqual(mutant, {"cut": 55, "dedupe": 40, "move": 90})
+
+        def test_mutant_s7_listing_every_job_as_a_cut_is_caught_control_first(self):
+            runs = [run(1, "test", "pull_request", "aa", 0)]
+            jobs = {1: [job(UBU, 0, 0, 5), job("stale-report", 0, 0, 7)]}
+
+            def cuts(space):
+                return [c["what"] for c in space["ci_queue_measure"](runs, jobs, NOW, 24, GATE, ())["candidates"] if c["kind"] == "cut"]
+            self.assertEqual(cuts(self.pure_lines()), ["stale-report"])   # control
+            mutant = cuts(self.pure_lines("if name not in gate_names and name not in CI_QUEUE_GATE_FEEDERS]", "if True]"))
+            with self.assertRaisesRegex(AssertionError, "^2 != 1$"):
+                self.assertEqual(len(mutant), 1)
+
+        def test_mutant_s11_a_post_is_caught_control_first(self):
+            def sent(space_get):
+                seen = []
+
+                def runner(argv, **kwargs):
+                    seen.append(list(argv))
+                    return subprocess.CompletedProcess(argv, 0, "{}", "")
+                space_get(runner, "gh", "repos/o/r/actions/runs", 5)
+                return sum(1 for argv in seen if {"-X", "--method"} & set(argv))
+            text = (REPO / "bin" / "switchboard" / "reminders.py").read_text()
+            body = text[text.index("def ci_queue_get("):text.index("def ci_queue_fetch(")]
+            self.assertEqual(body.count('[gh, "api", path]'), 1)
+
+            def compiled(source):
+                space = {"json": json}
+                exec(compile(source, "ci_queue_get_mutant", "exec"), space)
+                return space["ci_queue_get"]
+            self.assertEqual(sent(compiled(body)), 0)   # control
+            posts = sent(compiled(body.replace('[gh, "api", path]', '[gh, "api", "-X", "POST", path]')))
+            with self.assertRaisesRegex(AssertionError, "^1 != 0$"):
+                self.assertEqual(posts, 0)
+
+        def test_docs_report_every_spend_row_has_a_price_and_a_minutes_cell(self):
+            lines = (REPO / "docs" / "ci-queue-report.md").read_text().split("## Spend options", 1)[1].splitlines()
+            rows = [l.strip("|").split("|") for l in lines if l.startswith("|") and not l.startswith("|---") and "Option" not in l]
+            self.assertTrue(rows)
+            for option, price, minutes in rows:
+                self.assertRegex(price, r"\d|not readable by a lane")
+                self.assertRegex(minutes, r"\d|not readable by a lane")
+            self.assertEqual((REPO / "docs" / "ci-queue-report.md").read_text().count("decided by the owner"), 1)
+            self.assertIn("tester's live measure", (REPO / "docs" / "ci-queue-report.md").read_text())
+
         def serve(self, requests):
             runs, jobs = fixture()
 
