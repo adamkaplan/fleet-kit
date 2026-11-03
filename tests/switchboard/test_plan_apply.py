@@ -292,6 +292,14 @@ def build(HandoffCase):
             self.assertEqual(code, 0, err)
             self.assertEqual(self.gh.writes, [("PATCH", 1), ("POST", 7)])
 
+        def test_race_the_control_of_the_mutant_passes_first(self):
+            self.assertIn("--expect-live", self.check_race_was_refused())
+
+        def test_race_mutant_without_the_wrappers_comparison_fails_with_its_text(self):
+            with mock.patch.object(sb, "expect_unchanged", lambda fresh, live_hash: None):
+                with self.assertRaisesRegex(AssertionError, "the changed live plan was not refused"):
+                    self.check_race_was_refused()
+
     class TestPlanApplyDerivedPlaces(PlanApplyCase):
         HEADING = "Applying an approved plan edit"
 

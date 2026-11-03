@@ -344,6 +344,33 @@ def receipt_text(name, file_sha, count, why, old_hash, new_hash, caller, mark, c
     return "\n".join(lines) + "\n\n" + mark(caller)
 
 
+def expect_unchanged(fresh, live_hash):
+    """The write's own check: the comment as it is just before the patch must still be the plan that --expect-live named."""
+    expect_live(plan_check.plan_hash(fresh), live_hash)
+
+
+class UnchangedReader:
+    """The reader of the signed edit, with its first read of the plan comment (the one just before the patch) compared with the live hash."""
+
+    def __init__(self, reader, comment_id, live_hash):
+        self.wrapped, self.path_end, self.live_hash, self.read = reader, "/issues/comments/%s" % comment_id, live_hash, False
+
+    def __getattr__(self, name):
+        return getattr(self.wrapped, name)
+
+    def runner(self, argv, **kwargs):
+        done = self.wrapped.runner(argv, **kwargs)
+        if not self.read and "--method" not in argv and argv[2].endswith(self.path_end) and done.returncode == 0:
+            self.read = True
+            try:
+                fresh = load_module("record_json").parse_bounded(done.stdout).get("body")
+            except (ValueError, AttributeError):
+                fresh = None
+            if isinstance(fresh, str):
+                expect_unchanged(fresh, self.live_hash)
+        return done
+
+
 def apply_run(args, caller, api, state_dir, audit, fleet_mark):
     """(exit status, text). Exit 0 applied, 1 a cause (nothing changed unless the text says so), 2 refused. A refusal's text is its one reason."""
     reader = getattr(api, "__self__", None)
@@ -382,6 +409,7 @@ def apply_run(args, caller, api, state_dir, audit, fleet_mark):
         if declared_clauses(live) != declared_clauses(result):
             raise PlanApplyRefused("plan apply: refused: the clauses: block of the result differs from the live one (the Done-when copy is the ask's: never edited)")
         approval = next(iter(approval_ids(plan, comments, _audit_tail(state_dir))), None)
+        reader = UnchangedReader(reader, plan["id"], old_hash)
         url = "https://github.com/%s/issues/%d#issuecomment-%s" % (repo, number, plan["id"])
         audited = (lambda subject, detail: audit.external("cli", "github.comment", subject, detail)) if audit is not None else None
         try:
