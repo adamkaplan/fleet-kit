@@ -54,11 +54,12 @@ def strict_body(test, mod):
             want = "%s page %d is not a list of objects" % (PATH, number)
             if str(exc) != want:
                 failures.append("%s: %r != %r" % (name, str(exc), want))
-    try:
-        if hub_over({1: [[]]}, module=mod).read_pages(PATH) != ([], False):
-            failures.append("empty last page")
-    except mod.GitHubUnavailable:
-        failures.append("empty last page raised")
+    for label, empty in (("empty last page", {1: [[]]}), ("page with no parsed values", {1: []})):
+        try:
+            if hub_over(empty, module=mod).read_pages(PATH) != ([], False):
+                failures.append(label)
+        except mod.GitHubUnavailable:
+            failures.append(label + " raised")
     test.assertEqual(failures, [], CHECK)
 
 
