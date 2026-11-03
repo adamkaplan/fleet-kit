@@ -11,7 +11,7 @@ LAUNCHER = os.path.dirname(HERE)
 ROOT = os.path.dirname(os.path.dirname(LAUNCHER))
 sys.path.insert(0, HERE)
 sys.path.insert(0, LAUNCHER)
-sys.path.insert(0, os.path.join(ROOT, "bin"))
+sys.path.append(os.path.join(ROOT, "bin"))
 import cloud_worker as cw  # noqa: E402
 from test_cloud_worker import Base  # noqa: E402
 import plan_ledger  # noqa: E402
