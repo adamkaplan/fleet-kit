@@ -7,6 +7,7 @@ import errno
 import fcntl
 import json
 import os
+import signal
 import sys
 import threading
 import time
