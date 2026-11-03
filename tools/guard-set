@@ -21,7 +21,7 @@ def load(path):
 
 def defined_classes():
     out = set()
-    files = sorted((REPO / "tests" / "switchboard").glob("*.py")) + [REPO / "bin" / "test-switchboard"]
+    files = sorted((REPO / "tests" / "switchboard").glob("*.py")) + [REPO / "bin" / "test-switchboard", REPO / "tests" / "test_installed_guard.py"]
     for f in files:
         for node in ast.parse(f.read_text()).body:
             if isinstance(node, ast.ClassDef):
