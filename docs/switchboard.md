@@ -211,6 +211,10 @@ message. A `send` from another agent skips the batch.
   There is nothing to fetch and nothing to acknowledge: once the message is in
   the agent's transcript, it has been delivered. Messages are capped in length;
   overflow is listed by `fleet-switchboard pending <agent>`.
+- **A send to a cloud pod says the pod's state.** Before it prompts, `send` reads the pod once through the launcher's `status` and prints
+  `state of <name>: running=yes|no idle_deadline=... hard_deadline=... last_event=...` (`last_event` is the last activity time when the
+  session is idle, and `unknown` when it is busy or unreadable). For a pod past its hard deadline, retired, unknown or unread it prints a
+  WARNING and not `delivered to <name>`; the message is still sent to the endpoint, so nothing is lost.
 - **Never typed.** The switchboard never calls `herdr agent prompt` and never
   writes into a pane's input box.
 - **A note that outlives your attention.** If 10 minutes pass with no prompt
