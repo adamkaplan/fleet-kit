@@ -20,9 +20,12 @@ from unittest import mock
 from support.loader import sb
 from support.paths import BIN, REPO
 
-NTC_TOOL = REPO / "tools" / "new-test-checks"
-NTC_CLOUD = BIN / "cloud-pr-preflight"
-NTC_ENTRY = BIN / "fleet-switchboard"
+# The standing tests read the three tool paths from these environment variables (default: the real tool); a mutant test of TestNewTestChecksMutants sets
+# them in a subprocess to point the standing tests at a mutated source copy. Nothing in production reads them.
+NTC_TOOL = Path(os.environ.get("NTC_TOOL_PATH") or REPO / "tools" / "new-test-checks")
+NTC_CLOUD = Path(os.environ.get("NTC_CLOUD_PATH") or BIN / "cloud-pr-preflight")
+NTC_ENTRY = Path(os.environ.get("NTC_ENTRY_PATH") or BIN / "fleet-switchboard")
+NTC_REAL_ENTRY = BIN / "fleet-switchboard"
 NTC_SKIPLINE = "SKIP new-test-checks: tools/new-test-checks is not in this tree"
 NTC_SUPPORT = "MOVED_ONE = 1\n\n\ndef moved_two():\n    return 2\n"
 NTC_SHEBANG = "#!/bin/sh\nEXCEPTIONS=\"\"\n"
@@ -234,6 +237,11 @@ def ntc_load_entry(path):
     return module
 
 
+def ntc_entry_under_test():
+    """The real entry (`sb`) unless NTC_ENTRY_PATH names a mutated copy."""
+    return sb if NTC_ENTRY == NTC_REAL_ENTRY else ntc_load_entry(NTC_ENTRY)
+
+
 def ntc_preflight(entry, repo, merged=False):
     """`cmd_preflight_pr` of `entry` on a planted repository: git runs for real, the heavy run is the command itself, the test classes are faked. (code, stdout, stderr)."""
     def runner(argv, **kwargs):
@@ -272,20 +280,20 @@ class TestNewTestChecksInPreflightPr(unittest.TestCase):
 
     def test_s14_a_head_that_binds_a_moved_name_fails_and_a_clean_one_passes_in_both_forms(self):
         for merged in (False, True):
-            code, out, err = ntc_preflight(sb, self.planted(NTC_BINDS), merged)
+            code, out, err = ntc_preflight(ntc_entry_under_test(), self.planted(NTC_BINDS), merged)
             self.assertEqual(code, 1, (merged, out, err))
             self.assertEqual(len(re.findall(r"^FAIL new-test-checks \(\d+s\)$", out, re.M)), 1, out)
             self.assertEqual(len(re.findall(r"moved-name", err)), 1, err)
-            code, out, err = ntc_preflight(sb, self.planted(NTC_CLEAN), merged)
+            code, out, err = ntc_preflight(ntc_entry_under_test(), self.planted(NTC_CLEAN), merged)
             self.assertEqual(code, 0, (merged, out, err))
             self.assertEqual(len(re.findall(r"^PASS new-test-checks \(\d+s\)$", out, re.M)), 1, out)
 
     def test_s15_no_test_file_prints_nothing_and_a_tree_without_the_tool_prints_the_skip_line(self):
         for merged in (False, True):
             for root in (self.planted(None, "X = 1\n"), self.planted(None, None)):
-                code, out, err = ntc_preflight(sb, root, merged)
+                code, out, err = ntc_preflight(ntc_entry_under_test(), root, merged)
                 self.assertEqual((code, "new-test-checks" in out + err), (0, False), (merged, out, err))
-            code, out, err = ntc_preflight(sb, self.planted(NTC_BINDS, None, tool=False), merged)
+            code, out, err = ntc_preflight(ntc_entry_under_test(), self.planted(NTC_BINDS, None, tool=False), merged)
             self.assertEqual((code, out.count(NTC_SKIPLINE)), (0, 1), (merged, out, err))
 
     def test_s15_no_test_file_and_no_tool_prints_nothing(self):
@@ -294,7 +302,7 @@ class TestNewTestChecksInPreflightPr(unittest.TestCase):
                 root = self.planted(None, outside, tool=False)
                 ntc_git(root, "update-ref", "refs/remotes/origin/main", "main")
                 ntc_git(root, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
-                code, out, err = ntc_preflight(sb, root, merged)
+                code, out, err = ntc_preflight(ntc_entry_under_test(), root, merged)
                 self.assertEqual((code, len((out + err).splitlines()), "new-test-checks" in out + err), (0, 0, False), (merged, out, err))
 
 
@@ -380,14 +388,39 @@ class TestNewTestChecksMutants(unittest.TestCase):
         self.assertFalse(any(": %s: " % rule in line for line in mutant[1]), "the mutant still flags %s: %r" % (rule, mutant))
         self.assertEqual(mutant[0], 0, mutant)
 
+    def standing(self, envname, mutant_path, names, failing, text):
+        """The standing tests `names` (unittest name filters of bin/test-switchboard) on the real tool exit 0 (control); on the mutated copy they exit non-zero and the
+        output names the failing standing test `failing` and carries the check's own assertion text `text`."""
+        def run(env_extra):
+            env = {k: v for k, v in os.environ.items() if not k.startswith("NTC_") or k == "NTC_NONE"}
+            env.update(env_extra)
+            done = subprocess.run([sys.executable, str(BIN / "test-switchboard")] + list(names), cwd=str(REPO), env=env, capture_output=True, text=True)
+            return done.returncode, done.stdout + done.stderr
+        code, out = run({})
+        self.assertEqual(code, 0, "control: the standing tests fail on the real tool: " + out[-3000:])
+        self.assertIn("RESULT: PASS", out)
+        code, out = run({envname: str(mutant_path)})
+        self.assertNotEqual(code, 0, "the standing tests still pass on the mutant: " + out[-3000:])
+        self.assertIn(failing, out)
+        self.assertIn(text, out)
+
     def test_mutant_moved_name_that_stops_flagging(self):
-        self.tool_case(NTC_BINDS, "moved-name", "sorted(check_moved(source, root) + check_reads(tree)", "sorted([] + check_reads(tree)")
+        old, new = "sorted(check_moved(source, root) + check_reads(tree)", "sorted([] + check_reads(tree)"
+        self.tool_case(NTC_BINDS, "moved-name", old, new)
+        self.standing("NTC_TOOL_PATH", self.mutate(NTC_TOOL, old, new), ["TestNewTestChecksRules"],
+                      "test_s2_a_moved_name_is_flagged_with_its_line_and_the_rule_is_read_not_copied", "(0, 0) != (1, 1)")
 
     def test_mutant_import_time_read_that_stops_flagging(self):
-        self.tool_case(NTC_CLASS_READ, "import-time-read", "+ check_reads(tree) +", "+ [] +")
+        old, new = "+ check_reads(tree) +", "+ [] +"
+        self.tool_case(NTC_CLASS_READ, "import-time-read", old, new)
+        self.standing("NTC_TOOL_PATH", self.mutate(NTC_TOOL, old, new), ["TestNewTestChecksRules"],
+                      "test_s3_only_a_read_at_import_outside_the_three_directories_is_flagged", "(0, 0) != (1, 1)")
 
     def test_mutant_part_module_that_stops_flagging(self):
-        self.tool_case(NTC_PATCHES, "part-module-through-import", "+ check_parts(tree, root))", "+ [])")
+        old, new = "+ check_parts(tree, root))", "+ [])"
+        self.tool_case(NTC_PATCHES, "part-module-through-import", old, new)
+        self.standing("NTC_TOOL_PATH", self.mutate(NTC_TOOL, old, new), ["TestNewTestChecksRules"],
+                      "test_s4_a_part_module_patched_or_caught_through_is_flagged_as_sb_dot_name", "(0, 0) != (1, 1)")
 
     def test_mutant_table_list_that_stops_listing(self):
         tmp = Path(tempfile.mkdtemp(prefix="ntc-"))
@@ -397,6 +430,8 @@ class TestNewTestChecksMutants(unittest.TestCase):
         self.assertTrue(any(l.startswith("table: class TestListsIt") for l in ntc_run(root, planted)[1]))
         mutant = ntc_run(root, planted, tool=self.mutate(NTC_TOOL, "lines, first = table_lines(source, tree, root, rel)", "lines, first = [], []"))
         self.assertFalse(any(l.startswith("table:") for l in mutant[1]), mutant)
+        self.standing("NTC_TOOL_PATH", self.mutate(NTC_TOOL, "lines, first = table_lines(source, tree, root, rel)", "lines, first = [], []"), ["TestNewTestChecksRules"],
+                      "test_s5_a_class_that_lists_bin_and_a_row_that_does_not_name_the_file_are_listed_not_flagged", "!= ['table: class TestListsIt lists bin/")
 
     def test_mutant_preflight_pr_without_the_call(self):
         old = "    code = EXIT_ERROR if run_new_test_checks(runner, root, now) and code == EXIT_OK else code\n"
@@ -411,6 +446,8 @@ class TestNewTestChecksMutants(unittest.TestCase):
             code, out, err = ntc_preflight(entry, root)
             self.assertNotIn("FAIL new-test-checks", out, "the mutant still runs the check")
             self.assertEqual(code, 0)
+        self.standing("NTC_ENTRY_PATH", self.mutate(NTC_ENTRY, old, "    pass\n"), ["TestNewTestChecksInPreflightPr"],
+                      "test_s14_a_head_that_binds_a_moved_name_fails_and_a_clean_one_passes_in_both_forms", "0 != 1")
 
     def test_mutant_cloud_preflight_without_the_call(self):
         scenario = TestNewTestChecksInCloudPreflight("test_s16_the_block_is_printed_only_for_a_changed_switchboard_test_file_in_both_modes")
@@ -424,6 +461,8 @@ class TestNewTestChecksMutants(unittest.TestCase):
         code, out = scenario.run_script(root, False, mutant)
         self.assertNotIn("new-test-checks: FAIL", out, "the mutant still runs the check")
         self.assertIn("RESULT: PASS", out)
+        self.standing("NTC_CLOUD_PATH", mutant, ["TestNewTestChecksInCloudPreflight"],
+                      "test_s16_the_block_is_printed_only_for_a_changed_switchboard_test_file_in_both_modes", "0 != 1")
 
 
 class TestNewTestChecksDocs(unittest.TestCase):
