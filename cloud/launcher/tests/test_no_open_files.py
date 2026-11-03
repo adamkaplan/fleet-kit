@@ -23,6 +23,7 @@ GUARDED = (
     "test_driver.py",
     "test_git_token_retry.py",
     "test_issues_read.py",
+    "test_m_cap.py",
     "test_mint_retry.py",
     "test_mint_roles.py",
     "test_model_credential.py",
