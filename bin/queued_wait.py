@@ -24,7 +24,6 @@ PENDING_WAIT_MINUTES = 5
 MAX_READS_PER_PASS = 20   # inbox reads per pass; the oldest unconsumed note first, the rest the next pass
 LOCK = "queued-wait.lock"
 LOCK_WAIT = 2.0   # seconds a pass waits for the lock; then it skips (never raises)
-EVENTS = "queued-wait-events.json"   # events (evictions) noted by note_delivery, audited by the next observe
 _counter = itertools.count()
 
 
@@ -123,20 +122,7 @@ def note_delivery(state_dir, message_id, name, session, keys, delivered, parse):
                 "message_id": gone, "keys": note.get("keys") or [], "delivered": note["delivered"],
                 "consumed": "consumed" in note, "reason": "more than %d notes" % MAX_NOTES}))
         _save(state_dir, old, new)
-        if events:
-            try:
-                _write_to(Path(state_dir) / EVENTS, (_events(state_dir) + [list(e) for e in events])[-MAX_NOTES:])
-            except OSError:
-                pass
         return events
-
-
-def _events(state_dir):
-    try:
-        data = json.loads((Path(state_dir) / EVENTS).read_text())
-    except (OSError, ValueError):
-        return []
-    return [e for e in data if isinstance(e, list) and len(e) == 3] if isinstance(data, list) else []
 
 
 def _listed(message_id, note, inbox):
@@ -162,12 +148,7 @@ def observe(state_dir, now, parse, read_inbox):
             return []
         old = _read(state_dir, parse)
         new = {k: dict(v) for k, v in old.items()}
-        events = [tuple(e) for e in _events(state_dir)]
-        if events:
-            try:
-                os.unlink(str(Path(state_dir) / EVENTS))
-            except OSError:
-                pass
+        events = []
         inboxes = {}
         reads = 0
         for message_id, note in sorted(new.items(), key=lambda kv: kv[1]["delivered"]):

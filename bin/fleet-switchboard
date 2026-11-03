@@ -3174,8 +3174,10 @@ class Switchboard:
             self.sent.confirm(observation.session_id, keys, self.now())
         if delivery == "queue" and self.state_dir is not None and not self.light:   # #1801: when a queued message was delivered
             try:
-                load_module("queued_wait").note_delivery(self.state_dir, message_id, plan.recipient, observation.session_id, keys, self.now(),
-                                                         load_module("record_json").parse_bounded)
+                for event, subject, detail in load_module("queued_wait").note_delivery(
+                        self.state_dir, message_id, plan.recipient, observation.session_id, keys, self.now(),
+                        load_module("record_json").parse_bounded):
+                    self._note(event, subject, detail)
             except Exception as err:   # an unrecorded wait is never a failed delivery
                 self._note("queued_wait.error", None, {"reason": _one_line("%s: %s" % (type(err).__name__, err), 200)})
         self._acknowledge(keys)

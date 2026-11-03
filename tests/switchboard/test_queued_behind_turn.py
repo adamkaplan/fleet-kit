@@ -121,8 +121,8 @@ class QueuedWaitModuleTests:
         self.assertEqual((event[0], event[2]["message_id"]), ("queued_wait.evicted", "m0"))
         notes = json.loads(Path(self.dir, "queued-wait.json").read_text())
         self.assertEqual((len(notes), "m0" in notes, "extra" in notes), (cap, False, True))
-        self.assertEqual([e[0] for e in self.observe(10000, None)], ["queued_wait.evicted"])
-        self.assertEqual(self.observe(10100, None), [])
+        self.assertEqual(self.observe(10000, None), [])   # the caller audits the returned event: nothing is kept for a later pass
+        self.assertFalse(Path(self.dir, "queued-wait-events.json").exists())
 
     def test_a_seven_day_drop_is_audited_once(self):
         self.note(delivered=1000)
@@ -253,8 +253,34 @@ class TestQueuedBehindTurn(QueuedWaitModuleTests, Base):
         idle, _ = self.world_of({})
         self.assertTrue(self.send(idle)["sent"])
         flags = [e["detail"]["in_turn"] for e in self.intents(idle)]   # the worlds of one test share the audit file: it holds both lines, busy first
-        self.assertEqual((flags.count(True), flags.count(False)), (len([f for f in flags if f]), len([f for f in flags if not f])))
         self.assertEqual(flags, [True, False])   # one of each, the working session's first
+
+    def lines(self, world, event):
+        return [e for e in world.audit() if e["event"] == event]
+
+    def test_a_busy_lock_is_audited_as_skipped_through_deliver(self):
+        import fcntl
+        self.q = fresh_module()
+        world, sid = self.world_of()
+        self.work(world, sid)
+        fd = os.open(str(Path(world.engine.state_dir) / self.q.LOCK), os.O_WRONLY | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            self.assertTrue(self.send(world)["sent"])
+        finally:
+            os.close(fd)
+        (line,) = self.lines(world, "queued_wait.skipped")
+        self.assertEqual(line["detail"]["reason"], "lock busy")
+
+    def test_an_eviction_at_the_cap_is_audited_as_evicted_through_deliver(self):
+        self.q = fresh_module()
+        world, sid = self.world_of()
+        self.work(world, sid)
+        notes = {"old%d" % i: {"name": "platform", "session": "x", "keys": [], "delivered": 1000 + i} for i in range(self.q.MAX_NOTES)}
+        Path(world.engine.state_dir, self.q.FILE).write_text(json.dumps(notes))
+        self.assertTrue(self.send(world)["sent"])
+        (line,) = self.lines(world, "queued_wait.evicted")
+        self.assertEqual(line["detail"]["message_id"], "old0")
 
     # ---- S4 (REAL note, pass, audit and pending)
     def test_s4_a_consumed_message_says_how_long_it_waited(self):
