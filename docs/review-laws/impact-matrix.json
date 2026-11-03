@@ -163,6 +163,7 @@
         "bin/lanes.py",
         "bin/orders_copy.py",
         "bin/charter_check.py",
+        "bin/cloud_client.py",
         "bin/cloud_worker.py",
         "bin/cloud_channel.py",
         "bin/cloud_channel_server.py",
@@ -400,12 +401,14 @@
         "bin/agent_presence.py",
         "bin/awaiting_live.py",
         "bin/ci_runs.py",
+        "bin/cloud_client.py",
         "bin/cloud_worker.py",
         "bin/cpu_guard.py",
         "bin/dead_hint.py",
         "bin/decision_core.py",
         "bin/decision_sync.py",
         "bin/disk_janitor.py",
+        "bin/endpoint_send.py",
         "bin/fleet_health.py",
         "bin/header_cache.py",
         "bin/heavy_slots.py",
@@ -470,6 +473,12 @@
           "latest_runs",
           "newest",
           "own_repo"
+        ],
+        "bin/cloud_client.py": [
+          "*"
+        ],
+        "bin/endpoint_send.py": [
+          "*"
         ],
         "bin/cloud_worker.py": [
           "read_record_file"
