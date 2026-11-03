@@ -608,8 +608,8 @@ switchboard/judge.py:looks_like_plugin_event
 switchboard/judge.py:parse_plugin_event
 switchboard/judge_request.py:_guess_configured
 switchboard/judge_request.py:parse_policy_request
-switchboard/sent_view.py:sent_deliveries
 switchboard/reminders.py:ci_queue_get
+switchboard/sent_view.py:sent_deliveries
 switchboard/triage.py:triage_summary
 switchboard/v2_transport.py:_decode
 switchboard/v2_transport.py:_read_file
