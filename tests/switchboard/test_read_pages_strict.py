@@ -105,5 +105,6 @@ class TestReadPagesStrictMutant(unittest.TestCase):
                 strict_body(self, mutant)
             self.assertIn(CHECK, str(caught.exception))
 
+
 if __name__ == "__main__":
     unittest.main()
