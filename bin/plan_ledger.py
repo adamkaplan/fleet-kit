@@ -670,7 +670,7 @@ def scenario_state(scenario, entries, pr, plan_hash, head, authors):
     if not verdict:
         out["missing"].append("%s verdict (`verdict %s --as %s`; only the %s may record it)" % (evaluator, sid, evaluator, evaluator))
     elif verdict["result"] != "pass":
-        out["missing"].append("%s verdict says fail (only the %s may record a new one)" % (evaluator, evaluator))
+        out["missing"].append("%s verdict says fail (only the %s may record a new one): %s [by %s at %s]" % (evaluator, evaluator, (verdict.get("evidence") or "")[:160], verdict.get("by"), verdict.get("ts")))
     elif verdict["by"] in authors:
         out["missing"].append("the %s verdict is by an author of the PR (not accepted; only the %s, who is not an author, may record it)" % (evaluator, evaluator))
     out["status"] = "ok" if not out["missing"] else "missing"
