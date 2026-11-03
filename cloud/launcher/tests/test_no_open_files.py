@@ -1,5 +1,5 @@
 """Guard (ask #2004): a test file of this directory that opens a file and never closes it prints a ResourceWarning only when warnings are errors, so
-nothing failed when the leaks were written. Each file in the table is run in a subprocess under `-W error::ResourceWarning`; a leaked file fails with
+nothing failed when the leaks were written. Each file in the table is run, one after the other, in a subprocess under `-W error::ResourceWarning`; a leaked file fails with
 `a file was left open:`. S3: one case per file. S4: a scratch copy of one guarded file with one bare `open(path).read()` put back fails the guard."""
 import os
 import re
@@ -36,22 +36,14 @@ GUARDED = (
     "test_vault_check_pins.py",
 )
 LEAK = re.compile(r"^ResourceWarning: unclosed file ", re.M)
-WORKERS = 3
+LIMIT = 900
 
 
 def run(path, cwd):
-    """Start one file under the strict warning flag; the caller waits on it."""
-    out = tempfile.TemporaryFile()
+    """One file under the strict warning flag, run to its end: (exit status, output)."""
     env = {k: v for k, v in os.environ.items() if k != "PYTHONDONTWRITEBYTECODE"}
-    return subprocess.Popen([sys.executable, "-W", "error::ResourceWarning", path], cwd=cwd, env=env, stdout=out, stderr=subprocess.STDOUT), out
-
-
-def finish(proc, out):
-    proc.wait()
-    out.seek(0)
-    text = out.read().decode("utf-8", "replace")
-    out.close()
-    return proc.returncode, text
+    p = subprocess.run([sys.executable, "-W", "error::ResourceWarning", path], cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=LIMIT)
+    return p.returncode, p.stdout.decode("utf-8", "replace")
 
 
 def check(name, text):
@@ -73,15 +65,7 @@ def mutate(text, old, new):
 
 class GuardEachFile(unittest.TestCase):
     def test_s3_each_listed_file_leaves_nothing_open(self):
-        results = {}
-        pending = list(GUARDED)
-        running = []
-        while pending or running:
-            while pending and len(running) < WORKERS:
-                n = pending.pop(0)
-                running.append((n,) + run(os.path.join(HERE, n), ROOT))
-            n, proc, out = running.pop(0)
-            results[n] = finish(proc, out)
+        results = {n: run(os.path.join(HERE, n), ROOT) for n in GUARDED}
         for n in GUARDED:
             rc, text = results[n]
             with self.subTest(file=n):
@@ -113,13 +97,13 @@ class MutantLeak(unittest.TestCase):
 
     def test_s4_control_first_passes(self):
         path, d = self.scratch(None)
-        rc, text = finish(*run(path, d))
+        rc, text = run(path, d)
         self.assertEqual(check("control", text), 0)
         self.assertEqual(rc, 0, text[-1500:])
 
     def test_s4_one_bare_open_put_back_fails_with_the_anchored_text(self):
         path, d = self.scratch((self.OLD, self.NEW))
-        rc, text = finish(*run(path, d))
+        rc, text = run(path, d)
         with self.assertRaisesRegex(AssertionError, r"\Aa file was left open: "):
             check("mutant", text)
 
