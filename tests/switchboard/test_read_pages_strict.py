@@ -37,6 +37,7 @@ def odd_cases():
             ("object without the key", {1: [{"other": []}]}, "items", 1),
             ("mixed list", {1: [[{"a": 1}, "boom"]]}, None, 1),
             ("dict page, key None", {1: [{"a": 1}]}, None, 1),
+            ("empty dict page, key None", {1: [{}]}, None, 1),
             ("list of None", {1: [[None]]}, None, 1),
             ("list of True", {1: [[True]]}, None, 1),
             ("key list of non-objects", {1: [{"items": ["x"]}]}, "items", 1),
