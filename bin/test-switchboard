@@ -74481,7 +74481,7 @@ class TestBlockedReport(Base):
         self.wait(5)
         for name in ("platform", "cos"):
             (found,) = self.told(name)
-            for part in ("coder", "blocked for 25 minutes", "2 refused sends the senders must repeat"):
+            for part in ("coder", "blocked for 25 minutes", "Held for it: 2 messages"):
                 self.assertIn(part, found["text"])
         self.assertEqual(len(self.audits()), 1)
 
