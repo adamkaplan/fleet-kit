@@ -65997,6 +65997,8 @@ TestNewModuleDemands = importlib.import_module("test_new_module_demands").TestNe
 # The bin-set table test (#1457).
 _bin_set_table = importlib.import_module("test_bin_set_table")
 TestTheBinSetClassesAreAllInTheTable = _bin_set_table.TestTheBinSetClassesAreAllInTheTable
+# The heavy wrapper's progress line (#1762).
+TestHeavyProgress = importlib.import_module("test_heavy_progress").TestHeavyProgress
 # The pod niceness tests (#1794).
 TestPodNiceness = importlib.import_module("test_pod_niceness").TestPodNiceness
 # The steer-after-minutes tests of #1540, moved under the line ceiling.

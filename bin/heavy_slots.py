@@ -28,11 +28,13 @@ import subprocess
 import sys
 import threading
 import time
+import unicodedata
 
 DEFAULT_SLOTS = 3
 DEFAULT_WAIT_MAX = 1800
 POLL_SECONDS = 0.5
 WAIT_REPORT_SECONDS = 30
+PROGRESS_EVERY = 60   # one progress line per interval while the command runs; FLEET_HEAVY_PROGRESS_SECONDS shortens it (tests)
 EXIT_TEMPFAIL = 75      # no slot within --wait-max
 EXIT_USAGE = 64
 EXIT_NOT_FOUND = 127
@@ -1134,6 +1136,75 @@ def _stop_orphan(state_dir, index, info, out, clock, watchdog, start_of, decided
         os.close(gate)
 
 
+def _child_cpu_seconds(pid):
+    """CPU seconds (user + system) the process has used, or None when they cannot be read (never raises)."""
+    try:
+        with open("/proc/%d/stat" % pid) as handle:
+            fields = handle.read().rsplit(")", 1)[1].split()
+        return (int(fields[11]) + int(fields[12])) / float(os.sysconf("SC_CLK_TCK"))
+    except Exception:
+        pass
+    try:
+        text = subprocess.run(["ps", "-o", "time=", "-p", str(pid)], capture_output=True, text=True, timeout=5).stdout.strip()
+        days, _, clock_part = text.rpartition("-")
+        parts = [float(x) for x in clock_part.split(":")]
+        total = 0.0
+        for part in parts:
+            total = total * 60 + part
+        return total + (float(days) * 86400 if days else 0)
+    except Exception:
+        return None
+
+_progress_started = None   # tests: an Event the progress thread sets when it has started
+_progress_pause = None   # tests: a function (stop_event, seconds) that pauses in place of the real wait
+
+def _progress_interval(environ, out=None):
+    """The progress interval: FLEET_HEAVY_PROGRESS_SECONDS when it is a number from 0.01 (the tests' knob below 1 s) to 86400, else PROGRESS_EVERY; a non-empty bad value prints one line on `out`."""
+    raw = environ.get("FLEET_HEAVY_PROGRESS_SECONDS") or ""
+    if not raw:
+        return PROGRESS_EVERY
+    try:
+        value = float(raw)
+    except ValueError:
+        value = None
+    if value is not None and 0.01 <= value <= 86400:   # nan, inf, zero, negative and above a day fail here
+        return value
+    if out is not None:
+        raw = "".join("?" if unicodedata.category(c) in ("Cc", "Zl", "Zp") else c for c in raw[:40])   # one line, no escape sequence, no line separator
+        try:
+            out.write("heavy: FLEET_HEAVY_PROGRESS_SECONDS=%s is out of range, using 60\n" % raw[:40])
+        except (OSError, ValueError):
+            pass   # a closed or broken stream: the child still starts
+    return PROGRESS_EVERY
+
+def _progress_loop(pid, program, interval, stop, out, clock, began, lock=None):
+    """One line every `interval` seconds until `stop` is set; a failure of its own ends it quietly. Never signals the child."""
+    try:
+        if _progress_started is not None:
+            _progress_started.set()
+        while True:
+            if _progress_pause is not None:
+                _progress_pause(stop, interval)
+            else:
+                stop.wait(interval)
+            if stop.is_set():
+                return
+            elapsed = max(0.0, clock() - began)
+            text = "heavy: %s still running: %d s since the command started" % (_plain(program), int(elapsed))
+            cpu = _child_cpu_seconds(pid)
+            if cpu is not None:
+                text += ", CPU %d s (%d%%)" % (int(cpu), int(100 * cpu / elapsed) if elapsed > 0 else 0)
+            with (lock or threading.Lock()):   # `run` takes this lock to set `stop`: once it is set no write begins
+                if stop.is_set():   # stopped after the read, before the write
+                    return
+                out.write(text + "\n")
+                try:
+                    out.flush()
+                except Exception:
+                    pass
+    except Exception:
+        return
+
 def run(command, state_dir, slots=DEFAULT_SLOTS, wait_max=DEFAULT_WAIT_MAX, name=None, environ=None, out=None, clock=time.time, sleep=time.sleep,
         which=shutil.which, watchdog=None, short=False, line=None, ceiling=None, ceiling_config=None, on_stop=None, worktree=None, started_flag=None):
     """Wait for a slot, run `command` in it, return its exit status. 75 when no slot came within `wait_max` seconds, 127 when the command does not exist.
@@ -1251,6 +1322,7 @@ def run(command, state_dir, slots=DEFAULT_SLOTS, wait_max=DEFAULT_WAIT_MAX, name
             os.set_inheritable(fd, True)   # the command keeps the lock: the slot is busy while it runs, whatever happens to this wrapper
             env[SLOT_ENV] = str(index)    # and a heavy inside it knows it is in a slot: it takes no second one (nested heavy never deadlocks)
         argv = (command_prefix(which) if unslotted not in ("", "inside") else []) + list(command)   # off or nested: the command as it is
+        progress_every = _progress_interval(environ, out)   # before the child starts
         try:
             child["p"] = subprocess.Popen(argv, env=env, pass_fds=(fd,) if fd is not None else ())
         except OSError as err:
@@ -1278,6 +1350,10 @@ def run(command, state_dir, slots=DEFAULT_SLOTS, wait_max=DEFAULT_WAIT_MAX, name
         dog = Watchdog(child["p"].pid, command, mem_mb, max_seconds, out, clock(), clock=clock,
                        **dict({"lock_path": lock, "hard_max": ceiling_table(ceiling_config)["max"], "decided": decided}, **(watchdog or {})))
         dog.start()
+        progress_stop = threading.Event()
+        progress_lock = threading.Lock()
+        progress_thread = threading.Thread(target=_progress_loop, args=(child["p"].pid, os.path.basename(command[0]), progress_every, progress_stop, out, clock, clock(), progress_lock), daemon=True)
+        progress_thread.start()
         try:
             while True:
                 try:
@@ -1286,6 +1362,14 @@ def run(command, state_dir, slots=DEFAULT_SLOTS, wait_max=DEFAULT_WAIT_MAX, name
                 except InterruptedError:   # a signal during wait: Python retries; this is belt and braces
                     continue
         finally:
+            got_lock = progress_lock.acquire(timeout=2)   # bounded: a write blocked on a full pipe must not hold `run`
+            try:
+                progress_stop.set()   # set anyway when the lock was not obtained: the thread checks it under the lock before it begins a write
+            finally:
+                if got_lock:
+                    progress_lock.release()
+            if progress_thread.is_alive():
+                progress_thread.join(2)   # bounded: no progress line after run returns
             dog.finish()
         if dog.reason == "time" and on_stop is not None:   # after the stop; it never changes the exit status
             try:
