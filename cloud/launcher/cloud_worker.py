@@ -2530,6 +2530,7 @@ class Launcher:
         """One pass: stop every pod past its hard deadline or idle too long. Returns [(worker, reason, exit)]."""
         out, now, live = [], self.clock(), []
         self.reap_results, self.last_hook = {}, None
+        acts = {}   # name -> the activity this pass already read (passed to send_idle_nudges: one read per pod per pass)
         pods = self.kube.list_pods()
         # The renewal is the FIRST step: a slow activity read or stop below can no longer hold it back (the audit of 29 October).
         renewed = self.renew_git_tokens(self._before_hard_limit(pods, now), now)
@@ -2547,6 +2548,7 @@ class Launcher:
             else:
                 live.append(pod)   # before its hard limit and not stopped below: the git token renewal's candidates
                 act = self.activity(pod["metadata"]["name"])
+                acts[pod["metadata"]["name"]] = act
                 if act is None:
                     # Fail mode, decided: an unreadable activity is not a reason to kill work, so the pod runs until
                     # its hard limit; it is reported so it is not silent.
@@ -2571,7 +2573,7 @@ class Launcher:
         out.extend(renewed)
         self.remove_orphan_secrets(pods, now)
         self.send_wip_notes(live, now)
-        self.send_idle_nudges(live, now)
+        self.send_idle_nudges(live, now, acts)
         return out
 
     def _note_vanished_pods(self, pods, now):
@@ -2711,7 +2713,7 @@ class Launcher:
             except Exception as e:
                 print("cloud-worker: the 40-minute note was not sent: %s" % self.kube.scrub(e, 120), file=sys.stderr)
 
-    def send_idle_nudges(self, pods, now):
+    def send_idle_nudges(self, pods, now, acts=None):
         """ONE fixed line to a stalled builder (see idle_nudge_due). The cw/idle-nudge annotation is set BEFORE the send; one audit line.
         A results check that cannot run means do not nudge. Never raises."""
         for pod in pods:
@@ -2721,7 +2723,7 @@ class Launcher:
                     continue
                 if ann(pod, "idle-nudge") or ann(pod, "role", "worker") == "orchestrator":
                     continue
-                act = self.activity(name)
+                act = (acts or {}).get(name) or self.activity(name)
                 if not act or act[0] or act[1] is None:
                     continue
                 idle = int(ann(pod, "idle-seconds", "600"))

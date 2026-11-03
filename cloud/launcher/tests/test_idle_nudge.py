@@ -153,6 +153,27 @@ def cea_mutant(old, new):
     return module
 
 
+class TestOneActivityReadPerPod(unittest.TestCase):
+    def test_a_passed_activity_is_not_read_again(self):
+        s = Stub()
+        reads = []
+        s.activity = lambda name: reads.append(name) or (False, NOW - dt.timedelta(minutes=20))
+        acts = {"w1-pod": (False, NOW - dt.timedelta(minutes=20))}
+        with contextlib.redirect_stderr(io.StringIO()):
+            cw.Launcher.send_idle_nudges(s, [pod()], NOW, acts)
+        self.assertEqual(reads, [], "%d activity reads where 0 are required" % len(reads))
+        self.assertEqual(s.sent, [cw.IDLE_NUDGE])
+
+    def test_a_pod_not_in_the_dict_falls_back_to_one_read(self):
+        s = Stub()
+        reads = []
+        s.activity = lambda name: reads.append(name) or (False, NOW - dt.timedelta(minutes=20))
+        with contextlib.redirect_stderr(io.StringIO()):
+            cw.Launcher.send_idle_nudges(s, [pod()], NOW, {})
+        self.assertEqual(len(reads), 1)
+        self.assertEqual(s.sent, [cw.IDLE_NUDGE])
+
+
 class TestNoticeWords(unittest.TestCase):
     def test_four_words(self):
         self.assertEqual(words({"pushed": False, "wip_branch": None, "head_on": "feat/a-1"}), "head is on branch feat/a-1")
