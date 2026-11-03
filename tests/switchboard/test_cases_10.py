@@ -540,7 +540,7 @@ heartbeat-ack:atomic_write
 heartbeat-ack:read_state_document
 heavy_slots.py:_read
 heavy_slots.py:_read_info
-heavy_slots.py:_reported
+heavy_slots_watch.py:_reported
 host_liveness.py:_remote
 impact_floor.py:load_matrix
 impact_hold.py:_gh_json
