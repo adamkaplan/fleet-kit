@@ -201,6 +201,8 @@ Pane addresses are only unique within one herdr server. A `wN:pN` from another
 machine is a different agent wearing the same name, which is the other reason the
 label prefix is not optional.
 
+A charter whose agent runs on a named host writes its `pane` as `host:<hostname>/<agent>`; the doctor judges it by that host's list of agents (alive, dead, or unreachable when the host cannot be asked).
+
 Only a message starting `Heartbeat` expects an acknowledgement, and it states the
 exact `heartbeat-ack` command; send exactly one per such wake and let the cadence
 tell the truth: short when work is in flight, long when there is genuinely nothing
