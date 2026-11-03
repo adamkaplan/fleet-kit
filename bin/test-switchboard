@@ -66020,7 +66020,7 @@ _delivery_lag = importlib.import_module("test_delivery_lag")
 _delivery_lag.World = World
 PresentHub, TestDeliveryLag = _delivery_lag.PresentHub, _delivery_lag.TestDeliveryLag
 TestLaunchBriefCheck = importlib.import_module("test_launch_brief_check").build(TwoRepoCase, TestLaunchRefusedMessage)
-TestRunLauncherShapes, TestStatusLines, TestTurnEnd = (lambda m: (m.TestRunLauncherShapes, m.TestStatusLines, m.TestTurnEnd))(importlib.import_module("test_status_shape"))
+TestRunLauncherShapes, TestStatusLines, TestTurnEnd, TestDictCallersUnchanged = (_ss := importlib.import_module("test_status_shape")).TestRunLauncherShapes, _ss.TestStatusLines, _ss.TestTurnEnd, _ss.TestDictCallersUnchanged
 TestEveryKindDelayedMark = importlib.import_module("test_every_kind_delayed_mark").TestEveryKindDelayedMark
 TestSignedLinkScrub = importlib.import_module("test_signed_link_scrub").build(Base, GithubRig)
 TestCiQueue = importlib.import_module("test_ci_queue").build(HandoffCase, FAKE_GH)   # #1961
