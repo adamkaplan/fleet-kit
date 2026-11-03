@@ -9,6 +9,7 @@ PW = "pw" + "Xy_-9" * 8
 MODEL = '{"provider":"p","key":"sk-' + "k" * 20 + '","base":"http://m.example"}'
 
 import re, json as _json, random as _random, string as _string
+import pathlib
 _R = _random.Random(1783)  # the fixed seed of the fixtures
 _AL = _string.ascii_letters + _string.digits + "-_"
 G34 = "ghs_" + "".join(_R.choice(_string.ascii_letters + _string.digits) for _ in range(36))
@@ -392,7 +393,7 @@ class S6NoValueInOutput(unittest.TestCase):
 class Mutants(unittest.TestCase):
     """S3 and S2 mutants: a scratch copy of the sweep, text asserted once, mutation asserted applied."""
 
-    SRC = open(cw.__file__).read()
+    SRC = pathlib.Path(cw.__file__).read_text()
 
     def mutant(self, old, new):
         self.assertEqual(self.SRC.count(old), 1)
@@ -523,7 +524,7 @@ class S11ReaperPaths(unittest.TestCase):
     def load(self, edits):
         import importlib.util
         rr_path = os.path.join(os.path.dirname(cw.__file__), "run_record.py")
-        sources = {"cw": open(cw.__file__).read(), "rr": open(rr_path).read()}
+        sources = {"cw": pathlib.Path(cw.__file__).read_text(), "rr": pathlib.Path(rr_path).read_text()}
         for key, old, new in edits:
             self.assertEqual(sources[key].count(old), 1)
             mutated = sources[key].replace(old, new)
@@ -572,7 +573,7 @@ class S12S13Sweep(unittest.TestCase):
 
     def lines(self, la):
         try:
-            return [l for l in open(la.audit_path).read().splitlines() if l]
+            return [l for l in pathlib.Path(la.audit_path).read_text().splitlines() if l]
         except OSError:
             return []
 
