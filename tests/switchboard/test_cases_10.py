@@ -459,7 +459,6 @@ cloud_hub.py:kube_http
 cloud_relay.py:loads_strict
 cloud_relay_daemon.py:_read
 cloud_way_back_check.py:main
-cloud_worker.py:launcher_status_record
 cpu_guard.py:load_episode
 decision_sync.py:_read_json
 decisions_pull.py:held_body

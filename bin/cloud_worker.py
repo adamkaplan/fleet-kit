@@ -1057,9 +1057,12 @@ def launcher_status_record(name, cluster, timeout=STATUS_SECONDS):
     note = _one(cluster.clean((err or b"").decode("utf-8", "replace"), 200) if cluster is not None else (err or b"").decode("utf-8", "replace"), 200)
     if child.returncode != 0:
         return child.returncode, None, note
-    try:
-        data = json.loads((out or b"").decode("utf-8", "replace"))
-    except ValueError:
+    try:   # bounded like the record readers: the depth scan first, then the decode (not a record file, so not one of parse_bounded's counted sites)
+        text = (out or b"").decode("utf-8", "replace")
+        if nesting_too_deep(text):
+            raise ValueError("too deep")
+        data = json.JSONDecoder().decode(text)
+    except (ValueError, RecursionError):
         return 0, None, "the launcher's answer was not JSON"
     return 0, (data[0] if isinstance(data, list) and len(data) == 1 and isinstance(data[0], dict) else None), note
 

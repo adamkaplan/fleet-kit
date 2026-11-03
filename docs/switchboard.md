@@ -6187,6 +6187,8 @@ Now every reader of record JSON uses the shared bounded-depth parse `parse_bound
 
 `TestRecordJsonReaders` derives the list of readers from the source (every `json.loads`, `json.load` and `from json import loads` call in `bin/`, found with `ast`) and fails when a reader is in neither the covered set nor its table of exempt sites (daemon-written state, command output, request bodies, log lines), and when a table entry is stale.
 
+The launcher's `status` answer (`launcher_status_record` in cloud_worker.py, read by `send_state`) is not a record file: it is checked with `nesting_too_deep` (the scan `parse_bounded` uses, `WATCH_MAX_DEPTH` levels) and then decoded with `json.JSONDecoder().decode`; a deeper or unreadable answer is "the launcher's answer was not JSON" and the send says the state is unknown.
+
 ## The assembler (#1092, slice S1)
 
 `bin/fleet-switchboard` builds the daemon's one module namespace from the manifest `bin/fleet-switchboard.parts`: one part path per line, relative to the entry's real path (symlinks resolved), `#` for comments.
