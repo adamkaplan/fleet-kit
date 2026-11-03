@@ -78,5 +78,35 @@ class TestGuardSet(unittest.TestCase):
             self.assertIn(w, t)
 
 
+    def test_the_two_classes_of_the_whole_file_run_are_listed_and_printed(self):
+        data = json.loads(LIST.read_text())
+        out = run().stdout.splitlines()
+        self.assertEqual(len(out), len(data["classes"]) + len(data["extras"]))
+        for c in ("TestOwnMarkerNotHonoured", "TestTheEntryGuard"):
+            self.assertEqual(sum(1 for l in out if l == "python3 bin/test-switchboard " + c), 1, c)
+
+    def test_a_scan_that_drops_the_second_directory_is_caught_control_first(self):
+        needle = ', REPO / "tests" / "test_installed_guard.py"'
+        text = TOOL.read_text()
+        self.assertIn(needle, text)
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "tools").mkdir()
+            for n in ("tests", "bin", "docs"):
+                (root / n).symlink_to(REPO / n)
+            copy = root / "tools" / "guard-set"
+
+            def go():
+                return subprocess.run([sys.executable, str(copy), "--check"], capture_output=True, text=True)
+            copy.write_text(text)
+            control = go()
+            self.assertEqual(control.returncode, 0, control.stdout + control.stderr)  # the control passes first
+            copy.write_text(text.replace(needle, "", 1))
+            r = go()
+            self.assertEqual(r.returncode, 1)
+            self.assertIn("every class of the guard set exists", r.stdout)
+            self.assertIn("TestTheEntryGuard", r.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()
