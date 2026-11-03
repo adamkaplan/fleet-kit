@@ -1635,3 +1635,61 @@ class TestOwnMeasurementTester(unittest.TestCase):
     def test_the_texts_name_roles_never_agents_or_people(self):
         for text in (self.PLANNING, self.COORDINATION):
             self.assertNotRegex(text, r"(?i)\b(coder\d|cos\b|fleet-upkeep|adam\b)")
+
+
+class TestWorkflowsExceptionInDocs(unittest.TestCase):
+    """Rule (h) of the coordination skill and the quickstart's Token roles paragraph name the workflows exception (ask #2038)."""
+    OLD = "is built by a local job, never a cloud pod: a pod's git token has no workflows permission, so the push is refused and the pod cannot be retired."
+    ANCHOR = "rule (h) must keep the old refusal only as the rule for every other repository"
+
+    @staticmethod
+    def skill_text():
+        return (REPO / "skills" / "fleet-coordination" / "SKILL.md").read_text()
+
+    @staticmethod
+    def rule_h(text):
+        lines = [l for l in text.splitlines() if l.startswith("- (h) Any change to `.github/workflows/*`")]
+        assert len(lines) == 1, lines
+        return lines[0]
+
+    @staticmethod
+    def token_roles():
+        paras = [p for p in (REPO / "docs" / "cloud-operator-quickstart.md").read_text().split("\n") if p.startswith("**Token roles.**")]
+        assert len(paras) == 1, len(paras)
+        return paras[0]
+
+    def check_skill(self, text):
+        h = self.rule_h(text)
+        self.assertIn("CW_WORKFLOWS_REPOS", h, self.ANCHOR + ": names the setting")
+        self.assertIn("workflows: write", h, self.ANCHOR + ": names the permission")
+        self.assertIn("every other repository", h, self.ANCHOR + ": every other repository is refused")
+        self.assertIn("built by a local job", h, self.ANCHOR + ": local job")
+        self.assertIn("the push is refused", h, self.ANCHOR + ": push refused")
+        self.assertNotIn(self.OLD, h, self.ANCHOR + ": the old unconditional sentence is back")
+
+    def test_skill_rule_h(self):
+        self.check_skill(self.skill_text())
+
+    def test_quickstart_token_roles(self):
+        p = self.token_roles()
+        for word in ("CW_WORKFLOWS_REPOS", "workflows: write", "worker-workflows"):
+            self.assertIn(word, p)
+
+    def test_mutant_control_first(self):
+        text = self.skill_text()
+        self.check_skill(text)  # the control passes
+        h = self.rule_h(text)
+        self.assertEqual(text.count(h), 1)
+        old_line = "- (h) Any change to `.github/workflows/*` " + self.OLD
+        mutant = text.replace(h, old_line)
+        self.assertNotEqual(mutant, text)  # applied, computed from the two texts
+        self.assertEqual(len(text) - len(mutant), len(h) - len(old_line))
+        with self.assertRaises(AssertionError) as cm:
+            self.check_skill(mutant)
+        self.assertIn(self.ANCHOR, str(cm.exception))
+
+    def test_a_no_op_mutation_fails_the_computation(self):
+        text = self.skill_text()
+        h = self.rule_h(text)
+        with self.assertRaises(AssertionError):
+            self.assertNotEqual(text.replace(h, h), text)
