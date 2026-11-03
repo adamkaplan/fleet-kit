@@ -514,12 +514,12 @@ def _mask_addresses(text):
     else:
         return "[masking_loop]"
     GLUE_PASS = True
-    if GLUE_PASS:  # PC-13: the glue pass (an address glued to hex letters)
+    if GLUE_PASS and _address_spans("fd00::1"):  # PC-13: the glue pass (an address glued to hex letters), only while the IPv6 masking is on
         for _ in range(MASK_GUARD):
-            done = _glue_pass(text)
-            if done == text:
+            glued = _glue_pass(text)
+            if glued == text:
                 return text
-            text = done
+            text = glued
         return "[masking_loop]"
     return text
 
