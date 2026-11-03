@@ -3105,7 +3105,7 @@ class Switchboard:
         if getattr(self, "intents", None) is not None and hasattr(self.intents, "discard_told"):
             # #1275: only the asks of the CARRIED facts are told (compose rendered every fact's header)
             self.intents.discard_told()
-            compose(plan.recipient, carried, section=section_resolver(self, observation), repos=repos, delivered=self.now())
+            compose(plan.recipient, carried, section=section_resolver(self, observation), repos=repos, delivered=self.now(), in_turn=in_turn)
         keys = []
         sent_lines = whole_lines(text)
         for fact in carried:
