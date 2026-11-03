@@ -736,6 +736,10 @@ def _launch(args, runner, now, reserve):
     hub = bool((os.environ.get("CW_HUB_CHANNEL_URL") or "").strip() or (os.environ.get("CW_HUB_REGISTRY_SECRET") or "").strip() or args.agent == "orchestrator")   # the hub setting, or an orchestrator (the launcher registers its entry always: it needs the session)
     if hub and args.agent != "orchestrator":   # a worker joins the hub too: the launcher reads the setting itself, it only needs the boss
         options += [CREATE_OPTION["boss"], args.reports_to] if args.reports_to else []
+    if getattr(args, "role", None) == "tester":   # a tester pod joins the hub (the launcher registers it); --boss once
+        options.append("--hub")
+        if not (hub and args.agent != "orchestrator") and args.agent != "orchestrator" and args.reports_to:
+            options += [CREATE_OPTION["boss"], args.reports_to]
     if getattr(args, "stack", False):   # only on request: a launch without --stack hands the launcher exactly what it always did
         options.append(CREATE_OPTION["stack"])
     if os.environ.get("CW_PULL_SECRET"):

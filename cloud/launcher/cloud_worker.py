@@ -3319,6 +3319,7 @@ def build_parser():
     c.add_argument("--stack-model-secret", metavar="NAME", help="with --stack: the NAME of the vault secret whose value arrives as the run secret %s (audit: the name and 'delivered'); never a value" % STACK_MODEL_KEY)
     c.add_argument("--agent", help="worker (default) or orchestrator: the agent the pod runs (CW_AGENT); any other value is refused before anything is made")
     c.add_argument("--boss", help="with --agent orchestrator: the name of its boss (FLEET_BOSS)")
+    c.add_argument("--hub", action="store_true", help="the pod joins the hub (channel address, token file, registry entry); the tester launch sets it")
     c.add_argument("--wait", type=int, default=300)
     c.add_argument("--pull-secret", help="name of an existing image-pull Secret (pull-only) for imagePullSecrets")
     c.add_argument("--run-secret-fd", action="append", default=[], metavar="NAME=N",
