@@ -10,7 +10,7 @@ WRITES = [BASE + " " + w for w in (
     "-X PATCH", "-X DELETE", "-X patch", "--method PATCH", "--method delete",
     "-f body=x", "-F body=x", "--field body=x", "--raw-field body=x", "--input f")]
 NEW = ('"gh api*/issues/comments/*"', '"gh api*/issues/comments/* *"', '"gh api*/issues/comments/*?*"')
-POST_ROW = '"gh api*POST*": "deny",'
+POST_ROW = '"gh api*--input*": "deny",'
 
 
 def blocks(text):
@@ -39,23 +39,23 @@ def problems(text):
 
 
 def position_computation(text):
-    """True when, in every block, the three new rows come after the POST row."""
+    """True when, in every block, the three new rows come after the last write deny."""
     flags = []
     for name, rules in blocks(text).items():
         keys = list(rules)
-        flags.append(all(keys.index(n.strip('"')) > keys.index("gh api*POST*") for n in NEW))
+        flags.append(all(keys.index(n.strip('"')) > keys.index("gh api*--input*") for n in NEW))
     return flags
 
 
 def move_after_writes(text):
-    """Move the three new rows of each block to just after the POST row; asserts each shape occurs once per block."""
+    """Move the three new rows of each block to just after the last write deny; asserts each shape occurs once per block."""
     out = text
     for ind in ("      ", "          "):
         rows = "".join("\n" + ind + n + ': "allow",' for n in NEW)
         assert out.count(rows) == 1, "the new rows must occur once per block"
         out = out.replace(rows, "")
         post = "\n" + ind + POST_ROW
-        assert out.count(post) == 1, "the POST row must occur once per block"
+        assert out.count(post) == 1, "the last write deny row must occur once per block"
         out = out.replace(post, post + rows)
     return out
 
