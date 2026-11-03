@@ -838,8 +838,27 @@ def _launch(args, runner, now, reserve):
                 remove_record(state, name)
             raise
     _registry_note(engine, "upsert", state, name, {"session": session, "repo": repo, "role": args.role, "kind": "cloud", "run_id": run_id, "state": "working"})   # a cloud worker is an agent (#903)
+    _watch_first_push(state, name, args, repo, branch, brief, now())   # #2057: the launch's watch for its checkpoint
     print(json.dumps({"name": name, "session": session, "runtime_id": record["runtime_id"], "url": record["url"], "cloud": True}, sort_keys=True))
     return H["EXIT_OK"]
+
+
+def _watch_first_push(state, name, args, repo, branch, brief, moment):
+    """Record the launch's watch (the pod, the orchestrator it reports to, the repository, the branch and the checkpoint time from --checkpoint or the
+    brief's CHECKPOINT line, the data the local launch's reminders use) for the first-push notice. No orchestrator or no checkpoint: no watch. Never raises."""
+    try:
+        if not args.reports_to:
+            return
+        flag = getattr(args, "checkpoint", None)
+        if flag is not None:
+            at = H["_cp_when"](flag, moment)
+        else:
+            parsed = H["parse_checkpoint"](brief)
+            at = moment + parsed[0] if parsed else None
+        if at is not None:
+            H["record_first_push_watch"](state, name, args.reports_to, repo, branch, at, moment)
+    except Exception as err:
+        sys.stderr.write("%s: no first-push watch for %s (%s)\n" % (H["PROG"], name, _one(str(err), 100)))
 
 
 def _registry_note(engine, what, state, name, *args):

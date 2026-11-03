@@ -9704,6 +9704,10 @@ def finish_pass(engine, discovery, report):
     except Exception as err:
         engine._failed("cloud-end-alert", "cloud-end-alert", err, report)
     try:
+        first_push_tick(engine, discovery)   # #2057: a cloud pod with no first push by its checkpoint is named once to its orchestrator
+    except Exception as err:
+        engine._failed("first-push", "first-push", err, report)
+    try:
         cloud_turn_tick(engine, discovery)
     except Exception as err:
         engine._failed("cloud-turn-end", "cloud-turn-end", err, report)
