@@ -351,7 +351,7 @@ class MergeRefError(Exception):
 
 def merge_ref_gh(runner, argv):
     try:
-        done = runner(["gh"] + argv, capture_output=True, text=True, timeout=60)
+        done = runner([load_config()["gh"]] + argv, capture_output=True, text=True, timeout=60)
     except (OSError, subprocess.TimeoutExpired) as err:
         raise MergeRefError("gh did not answer: %s" % _one_line(str(err), 120)) from None
     if done.returncode != 0:
@@ -444,6 +444,7 @@ def cmd_merge_ref(args, runner, now):
 
 
 cmd_merge_ref.direct = True
+cmd_merge_ref.guard_records = True   # `merge-ref --refresh` reads only, but the entry guard counts it with the recorders (#2053)
 
 
 def add_merge_ref_parsers(sub):

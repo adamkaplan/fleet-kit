@@ -34,6 +34,7 @@ def build(HandoffCase):
             self.garbage = False
 
         def runner(self, argv, **kwargs):
+            argv = ["gh"] + list(argv[1:])   # the configured gh path stands for gh
             self.calls.append(argv)
             if argv[:2] == ["gh", "api"] and "/commits/refs/pull/" in argv[2]:
                 if self.ref_error:
@@ -101,6 +102,7 @@ def build(HandoffCase):
         def absent_runner(self, pull):
             """A runner whose ref read is a 404 and whose pull read answers `pull` (a JSON text, or None for a 404)."""
             def run(argv, **kwargs):
+                argv = ["gh"] + list(argv[1:])   # the configured gh path stands for gh
                 self.calls.append(argv)
                 if argv[:2] == ["gh", "api"] and "/commits/refs/pull/" in argv[2]:
                     return FakeDone(1, "", "gh: Not Found (HTTP 404)")
