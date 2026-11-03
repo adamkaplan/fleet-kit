@@ -47,10 +47,13 @@ class TestLostWorkerRemembers(unittest.TestCase):
         r = Rig(loader())
         r.created("w1")
         first = loader().run_pass(r.sb, r.engine, NOW, r.alive, r.launcher)
-        assert len(first) == 1, WHY
-        assert len(keys(r)) == 1, WHY + ": the key is not in the saved table after pass 1"
+        if not (len(first) == 1):
+            raise AssertionError(WHY)
+        if not (len(keys(r)) == 1):
+            raise AssertionError(WHY + ": the key is not in the saved table after pass 1")
         second = loader().run_pass(r.sb, r.engine, NOW + 60, r.alive, r.launcher)
-        assert len(second) == 0, WHY
+        if not (len(second) == 0):
+            raise AssertionError(WHY)
 
     @staticmethod
     def _copy_loader(tmp, new_for):
