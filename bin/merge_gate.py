@@ -600,7 +600,7 @@ def pass_and_merge(reading, gh, conf, state, repo, number, holder, pid, clock, s
         audit["merge_state"] = seen
         try:
             now = clock()
-            if not isinstance(now, (int, float)) or isinstance(now, bool) or not math.isfinite(now):
+            if not isinstance(now, (int, float)) or isinstance(now, bool) or not math.isfinite(now) or now < 0:
                 raise ValueError("clock")
             stamp = time.strftime("%H:%M:%SZ", time.gmtime(now))
         except Exception:

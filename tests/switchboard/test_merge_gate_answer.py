@@ -173,6 +173,16 @@ class TestMergeGateAnswer(AnswerBase):
         self.assertEqual(code, 1, msg="a raising clock ends in the refusal, no traceback")
         self.assertIn("state is unknown at an unknown time", lines[-1])
 
+    def test_s12_a_negative_clock_is_an_unknown_time(self):
+        for bad in (-1, -1.5, -1e9):
+            with self.subTest(clock=bad):
+                self.fake = self.fresh()
+                self.fake.view = {"state": "OPEN", "headRefOid": MG_HEAD}
+                code, lines, audit = self.run_real(clock=self.late(bad))
+                self.assertEqual(code, 1)
+                self.assertIn("unknown at an unknown time", lines[-1], msg="a negative clock gives no stamp")
+                self.assertNotIn("23:59:59Z", lines[-1])
+
     def test_s8_merged_without_a_head_says_no_head_given(self):
         self.fake.view = {"state": "MERGED"}
         code, lines, audit = self.run_real()
@@ -247,7 +257,7 @@ class TestMergeGateAnswerMutant(AnswerBase):
 
     def test_s10_clock_guard_control_then_mutant(self):
         text = (REPO / "bin" / "merge_gate.py").read_text()
-        needle = "if not isinstance(now, (int, float)) or isinstance(now, bool) or not math.isfinite(now):"
+        needle = "if not isinstance(now, (int, float)) or isinstance(now, bool) or not math.isfinite(now) or now < 0:"
         self.assertEqual(text.count(needle), 1)
 
         def none_clock(gate):
@@ -280,3 +290,18 @@ class TestMergeGateAnswerMutant(AnswerBase):
         mutant = self.copy(text.replace(needle, needle.replace("Exception", "(OverflowError, TypeError, ValueError, OSError)")))
         with self.assertRaises(RuntimeError):   # REAL: the old tuple lets RuntimeError escape
             raising(mutant)
+
+    def test_s12_negative_clock_control_then_mutant(self):
+        text = (REPO / "bin" / "merge_gate.py").read_text()
+        needle = " or not math.isfinite(now) or now < 0:"
+        self.assertEqual(text.count(needle), 1)
+
+        def negative(gate):
+            self.fake = self.fresh()
+            self.fake.view = {"state": "OPEN", "headRefOid": MG_HEAD}
+            code, lines, audit = self.run_real(gate, clock=self.late(-1))
+            self.assertIn("unknown at an unknown time", lines[-1], msg="a negative clock gives no stamp")
+        negative(self.copy(text))
+        mutant = self.copy(text.replace(needle, " or not math.isfinite(now):"))
+        with self.assertRaises(AssertionError):   # REAL: gmtime(-1) gives 23:59:59Z
+            negative(mutant)
