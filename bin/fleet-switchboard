@@ -3457,7 +3457,7 @@ class Switchboard:
     # -- the CLI's entry points
 
     def send(self, sender, recipient, text, issue=None, repo=None, interrupt=False):
-        """Deliver `text` to `recipient` now, by the rule, without batching. Stores nothing. `interrupt`: only a
+        """Deliver `text` to `recipient` now, by the rule, without batching; a send to a blocked recipient is held. `interrupt`: only a
         boss to its own worker; raises InterruptRefused otherwise."""
         now = self.now()
         discovery = self.discover(now)
