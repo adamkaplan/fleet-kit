@@ -337,6 +337,99 @@ def edit_in_place(reader, caller, url, text, approval, entries, audited, mark_li
     return result["url"], lapse
 
 
+# ---- merge-ref (#2053)
+#
+# GitHub builds refs/pull/N/merge when a pull request is opened or pushed and when a mergeability query is made; it does not rebuild it when the
+# base branch moves, and a close and reopen reuse the old ref. This shows the first parent of the ref against the base head. Reads only (gh api GET,
+# `gh pr view --json mergeStateStatus` for --refresh); it never closes, reopens or edits a pull request. Placed before the rehearse section.
+MERGE_REF_PR = re.compile(r"^(?:([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)#|https://github\.com/([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)/pull/)?([1-9][0-9]{0,8})$")
+
+
+class MergeRefError(Exception):
+    pass
+
+
+def merge_ref_gh(runner, argv):
+    try:
+        done = runner(["gh"] + argv, capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as err:
+        raise MergeRefError("gh did not answer: %s" % _one_line(str(err), 120)) from None
+    if done.returncode != 0:
+        raise MergeRefError(_one_line(done.stderr or done.stdout or "exit %d" % done.returncode, 200))
+    return done.stdout
+
+
+def merge_ref_read(runner, repo, number):
+    """The parents of the merge ref as a list of shas; None when the pull request has no merge ref (it conflicts)."""
+    try:
+        text = merge_ref_gh(runner, ["api", "repos/%s/commits/refs/pull/%d/merge" % (repo, number), "--jq", ".parents"])
+    except MergeRefError as err:
+        if "404" in str(err) or "Not Found" in str(err) or "No commit found" in str(err):
+            return None
+        raise
+    try:
+        parents = [p["sha"] for p in json.loads(text)]
+    except (ValueError, KeyError, TypeError):
+        raise MergeRefError("the answer for the merge ref is not a list of parents: %s" % _one_line(text, 80)) from None
+    if not parents or not all(isinstance(p, str) and re.fullmatch(r"[0-9a-f]{40}", p) for p in parents):
+        raise MergeRefError("the answer for the merge ref has no readable parents: %s" % _one_line(text, 80))
+    return parents
+
+
+def merge_ref_base_head(runner, repo, number):
+    base = merge_ref_gh(runner, ["api", "repos/%s/pulls/%d" % (repo, number), "--jq", ".base.ref"]).strip()
+    if not base:
+        raise MergeRefError("the base branch of the pull request is unreadable")
+    sha = merge_ref_gh(runner, ["api", "repos/%s/branches/%s" % (repo, base), "--jq", ".commit.sha"]).strip()
+    if not re.fullmatch(r"[0-9a-f]{40}", sha):
+        raise MergeRefError("the head of %s is unreadable: %s" % (base, _one_line(sha, 80)))
+    return base, sha
+
+
+def merge_ref_line(base, parents, head, word_stale):
+    first = parents[0]
+    word = "fresh" if first == head else word_stale
+    return "merge ref first parent %s, %s head %s: %s" % (first[:8], base, head[:8], word)
+
+
+def cmd_merge_ref(args, runner, now):
+    found = MERGE_REF_PR.match(args.pr)
+    repo = (found.group(1) or found.group(2) or args.repo) if found else None
+    if not found or not repo:
+        sys.stderr.write("%s: merge-ref: pass owner/repo#N, the pull request URL, or a number with --repo\n" % PROG)
+        return EXIT_ERROR
+    number = int(found.group(3))
+    try:
+        parents = merge_ref_read(runner, repo, number)
+        if parents is not None:
+            base, head = merge_ref_base_head(runner, repo, number)
+            if not args.refresh:
+                print(merge_ref_line(base, parents, head, "STALE"))
+            else:
+                merge_ref_gh(runner, ["pr", "view", str(number), "--repo", repo, "--json", "mergeStateStatus"])
+                parents = merge_ref_read(runner, repo, number)
+                if parents is not None:
+                    print(merge_ref_line(base, parents, head, "still STALE"))
+        if parents is None:
+            print("pull request %d has no merge ref: it conflicts with its base" % number)
+            return 3
+    except MergeRefError as err:
+        sys.stderr.write("%s: merge-ref: %s\n" % (PROG, _one_line(str(err), 300)))
+        return EXIT_ERROR
+    return EXIT_OK
+
+
+cmd_merge_ref.direct = True
+
+
+def add_merge_ref_parsers(sub):
+    parser = sub.add_parser("merge-ref", help="Whether a pull request's merge ref is stale, and with --refresh one read that recomputes it",
+                            description="Reads the first parent of refs/pull/N/merge and the head of the base branch and says fresh or STALE. Reads only: it never closes, reopens or edits a pull request. Exit 3: the pull request conflicts and has no merge ref.")
+    parser.add_argument("pr", help="The pull request: owner/repo#N, its URL, or a number with --repo")
+    parser.add_argument("--repo", default=None, help="The repository for a bare number")
+    parser.add_argument("--refresh", action="store_true", help="Make the mergeability query that recomputes the ref (a read), read the ref again, say fresh or still STALE")
+
+
 # ---- rehearse (#1785)
 #
 # The brief of a rehearsal pod, made from a plan, and the reading of the pod's report into one table. Read-only: it never runs a pod, never commits or
