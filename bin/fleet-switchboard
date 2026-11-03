@@ -3172,11 +3172,24 @@ class Switchboard:
         self.reads.forget(observation.session_id)   # we wrote to it: its inbox and times are not what was remembered
         if self.light:
             self.sent.confirm(observation.session_id, keys, self.now())
+        if delivery == "queue" and self.state_dir is not None and not self.light:   # #1801: when a queued message was delivered
+            try:
+                load_module("queued_wait").note_delivery(self.state_dir, message_id, plan.recipient, observation.session_id, keys, self.now(),
+                                                         load_module("record_json").parse_bounded)
+            except Exception as err:   # an unrecorded wait is never a failed delivery
+                self._note("queued_wait.error", None, {"reason": _one_line("%s: %s" % (type(err).__name__, err), 200)})
         self._acknowledge(keys)
         if getattr(self, "intents", None) is not None and hasattr(self.intents, "commit_told"):
             self.intents.commit_told()
         return {"sent": True, "action": plan.action, "message_id": message_id, "keys": keys,
                 "left": len(plan.pending) - len(keys)}
+
+    def _queued_inbox(self, session_id, now):
+        try:
+            inbox = self.reads.inbox(session_id, now, fresh=True)
+        except Exception:
+            return None
+        return inbox if isinstance(inbox, list) else None
 
     def delivery_reader(self):
         """#1402: read(subject) -> the present record of an alert's subject, through the hub's one present-state read (the read #1378 uses); None when this
@@ -3303,6 +3316,13 @@ class Switchboard:
                 self.turn_start_fresh = False
             except Exception as err:   # an unrecorded start is unknown, which counts as young: never stops a pass
                 self._note("turn_start.error", None, {"reason": _one_line("%s: %s" % (type(err).__name__, err), 200)})
+        if self.state_dir is not None and not self.light:   # #1801: a queued message gone from its inbox is consumed (stamped with this pass)
+            try:
+                for event, subject, detail in load_module("queued_wait").observe(
+                        self.state_dir, now, load_module("record_json").parse_bounded, lambda sid: self._queued_inbox(sid, now)):
+                    self._note(event, subject, detail)
+            except Exception as err:
+                self._note("queued_wait.error", None, {"reason": _one_line("%s: %s" % (type(err).__name__, err), 200)})
         early_decisions(self, discovery)   # #467: the decisions file is written as soon as its own sources are read, BEFORE the heavy fact sources
         for problem in discovery.problems:
             self._note("observe.problem", None, {"problem": problem})
@@ -15176,6 +15196,12 @@ def cmd_pending(args, runner, now):
         print("  - %s%s  %s from %s%s at %s: %s" % (fact["key"], " [rider]" if fact.get("rider") else "", fact["kind"],
                                                     fact["from"] or "the fleet", where, iso(fact["created"]),
                                                     _one_line(fact["summary"], 200)))
+    if engine.state_dir is not None:   # #1801: how long a queued message waited (or has waited so far); only over PENDING_WAIT_MINUTES
+        try:
+            for line in load_module("queued_wait").lines(engine.state_dir, engine.now(), load_module("record_json").parse_bounded, args.name):
+                print(line)
+        except Exception:
+            pass
     for problem in entry["source_problems"]:
         print("  problem: %s" % problem)
     return EXIT_OK
