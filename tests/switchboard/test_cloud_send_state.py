@@ -2,6 +2,7 @@
 for a pod past its hard deadline, retired, unknown or unread. The send still prompts the endpoint in every case."""
 import argparse
 import contextlib
+import json
 import io
 import re
 import unittest
@@ -15,6 +16,12 @@ FUTURE, PAST = "2099-01-01T00:00:00Z", "2000-01-01T00:00:00Z"
 class Probe:
     """A stand-in for Cluster() and tunnel(): they carry a token the printed lines must never show."""
     token_file = TOKEN
+
+    def env(self):
+        return {"KUBECONFIG": TOKEN}
+
+    def clean(self, text, limit=300):
+        return text.replace(TOKEN, "***")[:limit]
 
     def __enter__(self):
         return self
@@ -43,14 +50,22 @@ class TestCloudSendState(unittest.TestCase):
         v2 = mock.Mock()
         v2.prompt.side_effect = lambda *a, **k: self.prompts.append(a) or {"id": "msg_1"}
 
-        def fake_launcher(runner, command, worker, options=(), timeout=0, **kw):
-            self.calls.append((command, worker))
-            return launcher
+        code, answer, stderr = launcher   # the launcher's real answer: the exit code and the stdout (a LIST of records for `status NAME`)
+
+        class Child:
+            returncode = code
+
+            def communicate(self, timeout=None):
+                return (answer if isinstance(answer, bytes) else json.dumps(answer).encode()), stderr.encode()
+
+        def fake_popen(argv, **kw):
+            self.calls.append((argv[-3], argv[-2]))
+            return Child()
 
         patched = dict(build_engine=lambda *a, **k: (mock.Mock(), "state", config), intent_refusal=lambda *a: None,
                        gates_caller_kind=lambda *a: ("agent", "coder"))
         err, out = io.StringIO(), io.StringIO()
-        with mock.patch.dict(module.H, patched), mock.patch.object(module, "run_launcher", fake_launcher), \
+        with mock.patch.dict(module.H, patched), mock.patch.object(module, "launcher_argv", lambda: ["launcher"]), mock.patch.object(module.subprocess, "Popen", fake_popen), \
                 mock.patch.object(module, "Cluster", Probe), mock.patch.object(module, "tunnel", lambda *a: Probe()), \
                 mock.patch.object(module, "remote_v2", lambda *a: v2), mock.patch.object(module, "_audit", lambda *a: None), \
                 contextlib.redirect_stderr(err), contextlib.redirect_stdout(out):
@@ -64,23 +79,23 @@ class TestCloudSendState(unittest.TestCase):
         return len(re.findall(pattern, text, re.M))
 
     def test_a_running_pod_prints_its_state_and_delivered(self):
-        text = self.send((0, self.body(), ""))
+        text = self.send((0, [self.body()], ""))
         self.assertEqual(self.count(text, r"state of coder7: running=yes idle_deadline=%s hard_deadline=%s last_event=2099-01-01T00:00:00Z" % (FUTURE, FUTURE)), 1)
         self.assertEqual(self.count(text, "delivered to coder7"), 1)
         self.assertEqual(self.count(text, "WARNING"), 0)
         self.assertEqual(self.calls, [("status", "coder7")])
 
     def test_a_busy_pod_shows_its_last_event_as_unknown(self):
-        text = self.send((0, self.body(idle_since=None), ""))
+        text = self.send((0, [self.body(idle_since=None)], ""))
         self.assertIn("last_event=unknown", text)
         self.assertEqual(self.count(text, "delivered to"), 1)
 
     def test_a_dead_pod_is_never_reported_delivered(self):
         cases = {
-            "past its hard deadline": self.send((0, self.body(deadlines={"idle": FUTURE, "hard": PAST}), "")),
-            "retired": self.send((2, None, "unknown worker coder7"), hard=PAST),
-            "unknown": self.send((2, None, "unknown worker coder7")),
-            "unread": self.send((1, None, "boom")),
+            "past its hard deadline": self.send((0, [self.body(deadlines={"idle": FUTURE, "hard": PAST})], "")),
+            "retired": self.send((2, b"", "unknown worker coder7"), hard=PAST),
+            "unknown": self.send((2, b"", "unknown worker coder7")),
+            "unread": self.send((1, b"", "boom " + TOKEN)),
         }
         for name, text in cases.items():
             self.assertEqual(self.count(text, "delivered to"), 0, "a dead pod is never reported delivered: " + name)
@@ -88,12 +103,13 @@ class TestCloudSendState(unittest.TestCase):
             self.assertEqual(self.count(text, r"state of coder7: running="), 1, name)
 
     def test_a_record_past_its_hard_deadline_warns_even_when_the_pod_still_answers(self):
-        text = self.send((0, self.body(), ""), hard=PAST)
+        text = self.send((0, [self.body()], ""), hard=PAST)
         self.assertEqual((self.count(text, "delivered to"), self.count(text, "WARNING")), (0, 1))
 
-    def test_a_non_dict_body_is_a_failed_read(self):
-        text = self.send((0, None, ""))
-        self.assertEqual((self.count(text, "delivered to"), self.count(text, "WARNING")), (0, 1))
+    def test_a_dict_an_empty_list_or_a_longer_list_is_a_failed_read(self):
+        for answer in (self.body(), [], [self.body(), self.body()], b"not json", ["x"]):
+            text = self.send((0, answer, ""))
+            self.assertEqual((self.count(text, "delivered to"), self.count(text, "WARNING")), (0, 1), repr(answer)[:30])
 
 
 if __name__ == "__main__":

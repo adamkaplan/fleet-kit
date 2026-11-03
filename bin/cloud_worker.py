@@ -944,13 +944,36 @@ def _state_time(value):
     return value if isinstance(value, str) and _STATE_TIME.match(value) else None
 
 
+def launcher_status_record(name, cluster, timeout=STATUS_SECONDS):
+    """(exit code, the one record, one-line note) of the launcher's `status NAME --json`, which prints a LIST of records (run_launcher keeps only a
+    dict, so it cannot read it). The launcher is started as run_launcher starts it (its own login, no shell, its own session); a list of any other
+    length, a non-list or a failed run is no record (None). Never raises."""
+    try:
+        argv = launcher_argv() + ["status", name, "--json"]
+        child = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                 env=cluster.env() if cluster is not None else None, start_new_session=True)
+        try:
+            out, err = child.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            _kill_group(child)
+            child.communicate()
+            return -1, None, "the launcher did not finish status within %s s" % timeout
+    except (OSError, CloudError) as err:
+        return -1, None, _one(str(err), 100)
+    note = _one(cluster.clean((err or b"").decode("utf-8", "replace"), 200) if cluster is not None else (err or b"").decode("utf-8", "replace"), 200)
+    if child.returncode != 0:
+        return child.returncode, None, note
+    try:
+        data = json.loads((out or b"").decode("utf-8", "replace"))
+    except ValueError:
+        return 0, None, "the launcher's answer was not JSON"
+    return 0, (data[0] if isinstance(data, list) and len(data) == 1 and isinstance(data[0], dict) else None), note
+
+
 def send_state(runner, name, record, cluster, clock=None):
     """(state line, warning or None) for a send: the launcher's own `status` read ONCE. The warning is set for a pod past its hard deadline,
     a retired or unknown pod, a pod that is not running and a read that failed; the send still prompts the endpoint, only `delivered` changes."""
-    try:
-        code, body, note = run_launcher(runner, "status", name, (), STATUS_SECONDS, cluster=cluster)
-    except CloudError as err:
-        code, body, note = -1, None, str(err)
+    code, body, note = launcher_status_record(name, cluster)
     if code != 0 or not isinstance(body, dict):
         retired = "unknown worker" in (note or "")
         line = "state of %s: running=unknown idle_deadline=unknown hard_deadline=%s last_event=unknown" % (name, record.get("hard_deadline") or "unknown")
