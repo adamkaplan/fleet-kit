@@ -929,7 +929,10 @@ def cmd_send(args, runner, now, record):
     _audit(engine, "cloud.send", args.name, {"from": sender, "chars": len(text)})
     message_id = reply.get("id") if isinstance(reply, dict) else None
     print(message_id or "sent")
-    sys.stderr.write("%s: delivered to %s\n" % (H["PROG"], args.name))
+    if warning:
+        sys.stderr.write("%s: WARNING: %s: the message was sent to its endpoint but is NOT reported delivered\n" % (H["PROG"], warning))
+    else:
+        sys.stderr.write("%s: delivered to %s\n" % (H["PROG"], args.name))
     return H["EXIT_OK"]
 
 
