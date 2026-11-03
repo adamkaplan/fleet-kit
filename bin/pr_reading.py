@@ -123,7 +123,7 @@ def read_failing_jobs(gh, repo, run_id):
 
 
 def read_jobs(gh, repo, run_id):
-    """[{"name", "conclusion"}] of the jobs of a run (the latest attempt, at most 100): the legs of a matrix are jobs. An unreadable list raises ReadError."""
+    """[{"name", "conclusion", "steps"}] of the jobs of a run (the latest attempt, at most 100; at most 20 steps each: {"name", "conclusion"}): the legs of a matrix are jobs. An unreadable list raises ReadError."""
     data = _json(gh, ["api", "repos/%s/actions/runs/%s/jobs?filter=latest&per_page=100" % (repo, run_id)], "the jobs of run %s" % run_id)
     jobs = data.get("jobs") if isinstance(data, dict) else None
     if not isinstance(jobs, list):
