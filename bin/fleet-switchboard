@@ -3132,6 +3132,7 @@ class Switchboard:
             delivery = "steer"
         detail = {"mode": plan.action, "session": observation.session_id, "message_id": message_id,
                   "keys": keys, "resume": resume, "delivery": delivery, "left": len(plan.pending) - len(keys)}
+        detail["in_turn"] = in_turn
         if busy:
             detail["busy"] = True
             if age is not None:
