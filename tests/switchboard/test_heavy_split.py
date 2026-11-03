@@ -54,7 +54,9 @@ class TestHeavySplit(unittest.TestCase):
         assert_same_objects(self, sb.load_heavy_slots())
 
     def test_s7_the_loader_of_cpu_guard(self):
-        import cpu_guard
+        guard_spec = importlib.util.spec_from_file_location("cpu_guard_under_test", str(BIN / "cpu_guard.py"))
+        cpu_guard = importlib.util.module_from_spec(guard_spec)
+        guard_spec.loader.exec_module(cpu_guard)
         spec = importlib.util.spec_from_file_location("heavy_slots", cpu_guard.HEAVY_SLOTS_PATH)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
