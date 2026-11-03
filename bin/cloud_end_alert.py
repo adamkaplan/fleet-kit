@@ -120,7 +120,7 @@ def pushed_text(record_dir, parse):
     if not isinstance(hook, dict) or not isinstance(hook.get("pushed"), bool):
         return "unknown"
     def name(v):
-        return v if isinstance(v, str) and len(v) <= 100 and re.fullmatch(r"[A-Za-z0-9._/-]+", v) else None
+        return v if isinstance(v, str) and len(v) <= 100 and re.fullmatch(r"[A-Za-z0-9._/-]+", v) and not re.search(r"sk-|gh[opsu]_|github_pat|AKIA|xox|eyJ|[A-Za-z0-9]{30}", v) else None
     head, wip = hook.get("head_on"), hook.get("wip_branch")
     if head is not None and head != "unknown" and not hook["pushed"]:
         return "head is on branch " + name(head) if name(head) else "unknown"
