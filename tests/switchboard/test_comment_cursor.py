@@ -18,7 +18,7 @@ DAY = 86400
 
 
 class CommentWorld:
-    """The comments of one repository as GitHub serves them: `since` is strict, newest first, 100 a page; every request and every comment served is counted."""
+    """The comments of one repository as GitHub serves them: `since` is INCLUSIVE (>=) and filters on updated_at, newest created first, 100 a page; every request and every comment served is counted."""
 
     def __init__(self, since_epoch, total, start=60, step=200):
         self.since_epoch = since_epoch
@@ -28,7 +28,7 @@ class CommentWorld:
 
     @staticmethod
     def make(n, when):
-        return {"id": n, "created_at": sb.iso(when), "body": "c%d" % n, "user": {"login": "u"}}
+        return {"id": n, "created_at": sb.iso(when), "updated_at": sb.iso(when), "body": "c%d" % n, "user": {"login": "u"}}
 
     def add(self, count, step=10):
         for _ in range(count):
@@ -36,11 +36,15 @@ class CommentWorld:
             self.comments.append(self.make(self.next_id, self.last))
             self.next_id += 1
 
+    def edit(self, n, when):
+        """An edit moves updated_at only: the comment keeps its created_at."""
+        self.comments[n]["updated_at"] = sb.iso(when)
+
     def gh_api(self, path, paginate=True, timeout=None):
         self.requests.append(path)
         query = dict(part.split("=", 1) for part in path.split("?", 1)[1].split("&"))
         page = int(query.get("page", "1"))
-        rows = sorted((c for c in self.comments if c["created_at"] > query["since"]), key=lambda c: (c["created_at"], c["id"]), reverse=True)
+        rows = sorted((c for c in self.comments if c["updated_at"] >= query["since"]), key=lambda c: (c["created_at"], c["id"]), reverse=True)
         out = rows[(page - 1) * 100:page * 100]
         for c in out:
             self.served[c["id"]] = self.served.get(c["id"], 0) + 1
@@ -78,8 +82,10 @@ class TestCommentCursor(HubCase):
             world.add(10)
             got, cut = hub.read_comments("sweep", REPO, self.since, cap=sb.COMMENT_WINDOW_PAGES)
             self.assertEqual(len(got), len(world.comments))
-        twice = [i for i, n in world.served.items() if n > 1]
-        self.assertEqual((len(world.served), len(twice), len(world.comments)), (len(world.comments), 0, 2882), msg="every comment of the window is read once: %d read, %d read twice" % (len(world.served), len(twice)))
+        ids = [c["id"] for c in got]   # the boundary comment is served again (since is inclusive) and merged by id: distinct ids are what is read once
+        twice = sum(n - 1 for n in world.served.values()) - 30   # the only re-served comment of each of the 30 steady reads is the boundary one
+        twice += len(ids) - len(set(ids))
+        self.assertEqual((len(set(world.served)), twice, len(world.comments)), (len(world.comments), 0, 2882), msg="every comment of the window is read once: %d read, %d read twice" % (len(set(world.served)), twice))
         control = self.world()
         capped, _ = self.hub(control).read_pages("repos/%s/issues/comments?since=%s&sort=created&direction=desc&per_page=100" % (REPO, self.since),
                                                  older=("created_at", self.since), cap=sb.SWEEP_LIST_PAGES)
@@ -153,6 +159,24 @@ class TestCommentCursor(HubCase):
             hub.read_comments("sweep", REPO, self.since, cap=sb.COMMENT_WINDOW_PAGES)
         after = len(world.requests)
         self.assertEqual((before, first, after), (8, 26, 4))
+
+    def test_the_boundary_comment_and_an_edited_old_comment_are_served_again_and_merged_once(self):
+        world = self.world(150)
+        hub = self.hub(world)
+        hub.read_comments("sweep", REPO, self.since, cap=sb.COMMENT_WINDOW_PAGES)
+        newest = max(c["created_at"] for c in world.comments)
+        world.requests.clear()
+        world.served.clear()
+        got, _ = hub.read_comments("sweep", REPO, self.since, cap=sb.COMMENT_WINDOW_PAGES)   # nothing new: the comment created at the cursor is served again
+        self.assertEqual(world.served, {149: 1})
+        self.assertEqual((len(got), got[0]["created_at"]), (150, newest))
+        world.edit(3, NOW + 5)   # an old comment edited after the cursor
+        world.served.clear()
+        got, _ = hub.read_comments("sweep", REPO, self.since, cap=sb.COMMENT_WINDOW_PAGES)
+        self.assertEqual(sorted(world.served), [3, 149])
+        ids = [c["id"] for c in got]
+        self.assertEqual((len(ids), len(set(ids)), 3 in ids), (150, 150, True))
+        self.assertEqual(next(c for c in got if c["id"] == 3)["updated_at"], sb.iso(NOW + 5))
 
     def test_a_small_repository_reads_what_it_read_before(self):
         world = self.world(150)
