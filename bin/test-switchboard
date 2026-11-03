@@ -1632,7 +1632,7 @@ class TestSteerToWorking(Base):
         self.endpoint_world(state="blocked")
         code, _, err = self.cli_send("ping", to="cloudy")
         self.assertEqual(code, 0, err)
-        self.assertIn("held for cloudy: it will be delivered when it unblocks", err)
+        self.assertIn("held for cloudy: cloudy is blocked; it will be delivered when it unblocks", err)
         self.assertEqual(self.posts, [])
         self.registry.upsert(self.world.state, "cloudy", {"session": None, "kind": "orchestrator", "role": "orchestrator",
                                                           "endpoint": "https://pod.example.invalid/channel", "state": "idle"}, now=2)
@@ -2449,7 +2449,8 @@ class TestEngineCLI(Base):
         self.world.herdr.panes[self.world.panes["platform"]]["status"] = "blocked"
         code, out, err = self.main("send", "platform", "--from", "coder", "hi")
         self.assertEqual((code, out), (0, ""))
-        self.assertIn("held for platform: it will be delivered when it unblocks", err)
+        self.assertIn("blocked", err)
+        self.assertIn("held for platform: platform is blocked; it will be delivered when it unblocks", err)
         self.assertEqual(self.world.v2.writes, [])
         self.assertEqual(self.main("send", "nobody", "--from", "coder", "hi")[0], sb.EXIT_HELD)
 

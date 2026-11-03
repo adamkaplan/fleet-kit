@@ -14972,7 +14972,7 @@ def _send_by_registry(args, runner, now):
     held = es.blocked_reason(args.name, found[2], hold_reason)
     if held:
         hold_send_endpoint(engine, args.name, sender, text, args.issue, now)
-        sys.stderr.write("%s: held for %s: it will be delivered when it unblocks\n" % (PROG, args.name))
+        sys.stderr.write("%s: held for %s: %s is blocked; it will be delivered when it unblocks\n" % (PROG, args.name, args.name))
         return EXIT_OK
     ok, line = es.deliver(load_module("cloud_client"), found[1], sender, args.name, text)
     if not ok:
@@ -15025,7 +15025,7 @@ def _cmd_send(args, runner, now):
         sys.stderr.write("%s: %s\n" % (PROG, err))
         return EXIT_USAGE
     if outcome.get("held"):
-        sys.stderr.write("%s: held for %s: it will be delivered when it unblocks\n" % (PROG, args.name))
+        sys.stderr.write("%s: held for %s: %s is blocked; it will be delivered when it unblocks\n" % (PROG, args.name, args.name))
         return EXIT_OK
     if not outcome["sent"]:
         sys.stderr.write("%s: not sent to %s: %s (%s)\n" % (PROG, args.name, outcome["action"], outcome["reason"]))
