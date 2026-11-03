@@ -120,5 +120,40 @@ class MutantLeak(unittest.TestCase):
             self.assertEqual(f.read().count(self.OLD), 1)
 
 
+class MutantSocket(MutantLeak):
+    """S7: one `server_close()` of `test_preflight.py` removed leaves a socket open; the widened guard fails it, the old narrow pattern would not."""
+    NAME = "test_preflight.py"
+    OLD = "cls.srv.shutdown()\n        cls.srv.server_close()"
+    NEW = "cls.srv.shutdown()"
+    NARROW = re.compile(r"^ResourceWarning: unclosed file ", re.M)
+    test_s4_control_first_passes = None
+    test_s4_one_bare_open_put_back_fails_with_the_anchored_text = None
+    test_s4_a_no_op_mutation_fails_the_applied_computation = None
+    test_s4_the_text_occurs_once = None
+
+    def test_s7_control_first_passes(self):
+        path, d = self.scratch(None)
+        rc, text = run(path, d)
+        self.assertEqual(check("control", text), 0)
+        self.assertEqual(rc, 0, text[-1500:])
+
+    def test_s7_one_server_close_removed_fails_with_the_anchored_text(self):
+        path, d = self.scratch((self.OLD, self.NEW))
+        rc, text = run(path, d)
+        with self.assertRaisesRegex(AssertionError, r"\Aa file was left open: "):
+            check("mutant", text)
+        self.assertIn("ResourceWarning: unclosed <socket", text)
+        # the old narrow pattern matches only `unclosed file`: it finds nothing in this output
+        self.assertEqual(len(self.NARROW.findall(text)), 0)
+
+    def test_s7_a_no_op_mutation_fails_the_applied_computation(self):
+        with self.assertRaisesRegex(AssertionError, "the mutation was not applied"):
+            self.scratch((self.OLD, self.OLD))
+
+    def test_s7_the_text_occurs_once(self):
+        with open(os.path.join(HERE, self.NAME), encoding="utf-8") as f:
+            self.assertEqual(f.read().count(self.OLD), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
