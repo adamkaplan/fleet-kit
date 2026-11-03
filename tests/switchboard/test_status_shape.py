@@ -24,7 +24,7 @@ def mutate(text, old, new):
     """The text with `old` (asserted to occur once) replaced by `new`; the mutation is applied only when the two texts differ AND the result differs."""
     assert text.count(old) == 1, "the text to mutate does not occur once"
     out = text.replace(old, new)
-    applied = out != text and (old in text) and (old not in out or new == old)
+    applied = out != text
     assert applied, "the mutation was not applied"
     return out
 
@@ -140,7 +140,7 @@ class TestTurnEnd(Launcher):
         counts, sent = self.scan(None)
         self.assertEqual(counts[0], 0, "busy: no notice")
         self.assertEqual(counts[-1], 1, "a turn end is one notice")
-        self.assertEqual(counts[-1], counts[-2] if counts[-2] == 1 else 1)
+        self.assertEqual(counts[-1], counts[-2], "the next scan tells no more")
         self.assertEqual({to for to, _ in sent}, {"coder-lead"})
 
     def mutant_run_launcher(self, old, new):
@@ -150,27 +150,25 @@ class TestTurnEnd(Launcher):
         exec(compile(text, "mutant", "exec"), module.__dict__)
         return module.run_launcher
 
-    def run_mutant(self, old, new):
-        with mock.patch.object(self.cw, "run_launcher", self.mutant_run_launcher(old, new)):
-            return self.scan(None)[0]
-
-    def test_mutant_control_and_dict_only_return(self):
+    def line(self):
         full = CLUSTER.read_text()
         start = full.index(NEW_PREFIX)
-        new = full[start:full.index("\n", start)].lstrip()
-        old_line = OLD + full[start:full.index("\n", start)].split(OLD[-len('D["_one"]'):], 1)[1]
-        # control first: the mutation machinery with the text unchanged (the same line) keeps the one notice
-        self.assertEqual(self.run_mutant(new, new.replace("return", "return", 1))[-1], 1) if False else None
-        control = self.run_mutant(new, new + "  # control")
+        return full[start:full.index("\n", start)]
+
+    def test_mutant_restores_the_dict_only_return(self):
+        new = self.line()
+        dict_only = OLD + new.split('D["_one"]', 1)[1]
+        # the control first: the text as it is (one occurrence of the new line, replaced by itself plus a comment that changes the text) passes
+        with mock.patch.object(self.cw, "run_launcher", self.mutant_run_launcher(new, new + "  # control")):
+            control = self.scan(None)[0]
         self.assertEqual(control[-1], 1, "control: the unmutated code tells the boss once")
-        dict_only = new.split(" if isinstance(body, dict) or", 1)[0] + " if isinstance(body, dict) else None, D[\"_one\"]" + new.split('D["_one"]', 1)[1]
-        got = self.run_mutant(new, dict_only)
+        with mock.patch.object(self.cw, "run_launcher", self.mutant_run_launcher(new, dict_only)):
+            got = self.scan(None)[0]
         self.assertEqual(got[-1], 0, "the dict-only return: the turn end is never seen (0 notices)")
 
     def test_a_no_op_mutation_fails_the_computation(self):
-        text = CLUSTER.read_text()
         with self.assertRaisesRegex(AssertionError, "the mutation was not applied"):
-            mutate(text, OLD[:20] if False else NEW_PREFIX, NEW_PREFIX)
+            mutate(CLUSTER.read_text(), self.line(), self.line())
 
 
 if __name__ == "__main__":
