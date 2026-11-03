@@ -898,6 +898,7 @@ QUEUE_REFUSED = 1
 QUEUE_KINDS = ("builder", "tester", "measure")
 QUEUE_KEYS = ("id", "enqueued", "lane", "name", "kind", "ask", "brief_file", "base_branch", "wip_branch", "role", "reports_to", "shape",
               "idle", "hard", "priority", "plan_issue", "plan_hash_full", "approved_by", "approved_at", "until")
+QUEUE_STATES = ("queued", "waiting", "launched", "refused", "stale", "superseded", "finished")
 QUEUE_GONE = ("launched", "finished", "superseded")
 
 
@@ -1010,6 +1011,8 @@ def queue_add(state_dir, lane, fields, moment):
     view, _ = queue_view(state_dir, moment)
     if any(item["name"] == fields.get("name") for item in view):
         raise FactError("%s is already queued" % fields.get("name"))
+    if not isinstance(fields.get("ask"), int):
+        raise FactError("--ask is required: the issue number the pod works under")
     if fields.get("kind") not in QUEUE_KINDS:
         raise FactError("kind is one of %s" % ", ".join(QUEUE_KINDS))
     if not (isinstance(fields.get("name"), str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", fields["name"])):
@@ -1040,6 +1043,10 @@ def queue_change(state_dir, lane, key, op, moment, audit, number=None):
         raise FactError("no queued entry %s" % key)
     if entry["lane"] != lane:
         raise FactError("%s was queued by %s, not by %s: refused" % (key, entry["lane"], lane))
+    if op == "priority" and not (isinstance(number, int) and 0 <= number <= 100):
+        raise FactError("priority is a whole number from 0 to 100 (the plan gives no range): %r" % (number,))
+    last = queue_fold(state_dir)[1].get(key) or {}
+    note = "note: %s is refused (%s); it stays skipped until its lane appends a replacement line" % (key, last.get("reason")) if last.get("state") == "refused" else None
     rec = {"id": key, "op": op, "lane": lane, "at": iso(moment)}
     old = entry.get("priority")
     if op == "priority":
@@ -1047,6 +1054,7 @@ def queue_change(state_dir, lane, key, op, moment, audit, number=None):
     queue_append(Path(state_dir) / QUEUE_FILE, rec)
     if audit is not None:
         audit.append("cli", "queue." + op, entry["name"], {"lane": lane, "id": key, "name": entry["name"], "old": old, "new": number})
+    return note
 
 
 def queue_hash(value):
@@ -1152,8 +1160,10 @@ def cmd_queue(args, runner, now):
             except Exception:   # the entry is written: a failed wake never fails the add
                 print("queue: the wake failed; the entry %s is written" % key)
         elif action in ("priority", "cancel"):
-            queue_change(state_dir, caller, args.id, action, moment, engine.audit, getattr(args, "number", None))
+            note = queue_change(state_dir, caller, args.id, action, moment, engine.audit, getattr(args, "number", None))
             print("%s: %s" % (action, args.id))
+            if note:
+                print(note)
         elif action == "list":
             lines = queue_list_lines(state_dir, moment)
             if lines:
@@ -1165,6 +1175,10 @@ def cmd_queue(args, runner, now):
         elif action == "status":
             if caller != QUEUE_CLOUD_LANE:
                 raise FactError("a status line is appended by %s" % QUEUE_CLOUD_LANE)
+            if args.state not in QUEUE_STATES:
+                raise FactError("state is one of %s" % ", ".join(QUEUE_STATES))
+            if args.id not in queue_fold(state_dir)[0]:
+                raise FactError("no queued entry %s" % args.id)
             queue_note(state_dir, args.id, args.state, moment, pod=args.pod, reason=args.reason)
             print("status: %s %s" % (args.id, args.state))
     except FactError as err:

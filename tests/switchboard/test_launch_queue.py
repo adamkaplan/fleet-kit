@@ -286,6 +286,31 @@ def build(HandoffCase):
             self.assertEqual(len(self.queue_lines("launch-queue.status.jsonl")), 1)
             self.assertEqual(self.printed(self.next_lines(1)), ["unread"])
 
+        def test_s15_priority_status_and_ask_are_checked(self):
+            key = self.put("chk", kind="tester", plan_hash=None, plan_issue=None)
+            before = self.queue_lines()
+            for bad in ("-1", "101"):
+                code, out = self.run_queue("priority", key, bad)
+                self.assertEqual(code, 1, bad)
+                self.assertIn("priority is a whole number from 0 to 100", out)
+            self.assertEqual(self.queue_lines(), before)
+            code, out = self.run_queue("add", "--name", "noask", "--kind", "tester", "--brief-file", "/tmp/b.md")
+            self.assertEqual((code, out.strip()), (1, "queue: --ask is required: the issue number the pod works under"))
+            self.assertEqual(self.queue_lines(), before)
+            self.as_lane("fleet-cloud")
+            for argv, text in ((("status", key, "bogus"), "state is one of"), (("status", "q-none", "waiting"), "no queued entry q-none")):
+                code, out = self.run_queue(*argv)
+                self.assertEqual(code, 1, argv)
+                self.assertIn(text, out)
+            self.assertEqual(self.queue_lines("launch-queue.status.jsonl"), [])
+            self.assertEqual(self.run_queue("status", key, "refused", "--reason", "base-missing")[0], 0)
+            self.as_lane("cos")
+            code, out = self.run_queue("priority", key, "2")
+            self.assertEqual(code, 0)
+            self.assertIn("note: %s is refused (base-missing)" % key, out)
+            code, out = self.run_queue("cancel", key)
+            self.assertIn("note: %s is refused (base-missing)" % key, out)
+
         def test_u1_unreadable_lines_are_counted_and_named_and_a_missing_file_is_empty(self):
             self.assertEqual(self.run_queue("list"), (0, ""))
             good = lambda n: json.dumps({"id": "q-%d" % n, "enqueued": sb.iso(self.world.clock.now()), "lane": "cos", "name": "n%d" % n, "kind": "tester", "priority": n})
