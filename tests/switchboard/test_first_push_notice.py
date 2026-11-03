@@ -140,7 +140,7 @@ class FakeCluster:
         return text
 
 
-class FakeV2:
+class PodSessionStub:
     def session_create(self, *a, **k):
         return {"id": "ses1"}
     def prompt(self, *a, **k):
@@ -157,7 +157,7 @@ def drive_launch(module, state):
                  Cluster=FakeCluster, model_entry=lambda: "m", git_token=lambda *a, **k: "t", run_launcher=lambda *a, **k: (0, {}, ""),
                  _read_password=lambda fd: "pw", _record_from_create=lambda n, b: {"runtime_id": "r1", "url": "https://pod.example"},
                  _write_private=lambda *a: None, save_record=lambda *a: None, load_record=lambda *a: None, _audit=lambda *a, **k: None,
-                 tunnel=lambda cluster, record: contextlib.nullcontext(object()), remote_v2=lambda *a: FakeV2(), _registry_note=lambda *a, **k: None)
+                 tunnel=lambda cluster, record: contextlib.nullcontext(object()), remote_v2=lambda *a: PodSessionStub(), _registry_note=lambda *a, **k: None)
     heads = {"launch_repo": lambda a: "acme/widget-api", "build_engine": lambda *a: (engine, state, None), "read_brief": lambda *a: "",
              "fleet_record": lambda *a: {}}
     with contextlib.ExitStack() as stack:
