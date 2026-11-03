@@ -360,7 +360,7 @@ class UnchangedReader:
 
     def runner(self, argv, **kwargs):
         done = self.wrapped.runner(argv, **kwargs)
-        if not self.read and "--method" not in argv and argv[2].endswith(self.path_end) and done.returncode == 0:
+        if not self.read and "--input" not in argv and argv[2].endswith(self.path_end) and done.returncode == 0:
             self.read = True
             try:
                 fresh = load_module("record_json").parse_bounded(done.stdout).get("body")
