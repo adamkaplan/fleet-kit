@@ -1,5 +1,6 @@
 """Ask #1480: a cloud worker the launcher ended alerts its boss and the Chief of Staff, once per run and reason. Offline: a scratch state
 directory, a fixture audit file, a recording send function. Mutants are copies of the module's text in memory, never a file."""
+import pathlib
 import json, os, shutil, sys, tempfile, types, unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -100,7 +101,7 @@ class TestAlerts(World):
 
     def test_s3_the_sent_keys_are_bounded_and_the_state_is_private(self):
         real.save_state(self.cursor, 0, [(str(i), "idle") for i in range(700)])
-        self.assertEqual(len(PARSE(open(self.cursor).read())["sent"]), 500)
+        self.assertEqual(len(PARSE(pathlib.Path(self.cursor).read_text())["sent"]), 500)
         self.assertEqual(oct(os.stat(self.cursor).st_mode & 0o777), "0o600")
 
     def test_s3_a_corrupt_cursor_starts_at_the_end(self):
