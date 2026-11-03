@@ -139,8 +139,11 @@ def make_doctor_dir(tmp, text=None):
 # The doctor's run_to kills its watcher subshell right after the command returns; a watcher killed before it has
 # reset the inherited traps runs the doctor's cleanup and removes the doctor's temp directory (the chance failure).
 # A stub therefore returns only once the watcher's sleep exists: a bounded poll of /proc, no fixed sleep.
+# Where /proc is not a directory (macOS) the snippet exits 0 at once and the stub behaves as before this fix: the race
+# can still occur there, but did not in the green macOS runs.
 WAIT_WATCHER = """python3 -c '
 import os, sys, time
+if not os.path.isdir("/proc"): sys.exit(0)
 parent = sys.argv[1]
 def stat(pid):
     try:
