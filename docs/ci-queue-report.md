@@ -48,7 +48,7 @@ The ceiling is observed, not published: the highest count of jobs running at one
 | cut | `nightly integration (ubuntu-latest)` | 55 |
 | cut | `nightly main (ubuntu-latest)` | 58 |
 | cut | other `nightly-cloud` legs (three) | 72 |
-| dedupe | the duplicate checkout and setup of `test` and `test-cloud` (`fetch-depth: 0` twice per system) | not counted by a lane: the command reads the times of a job, not of its steps, and the checkout and setup are steps, so their job-minutes are not in the data |
+| dedupe | the duplicate checkout and setup of `test` and `test-cloud` (`fetch-depth: 0` twice per system) | not counted by a lane: the run list read does not carry step durations; the jobs API does carry them per job, but the command does not read them, so the checkout and setup job-minutes are not in the data |
 
 The figure of S8 (the reopened runs and their job-minutes) is the tester's live measure: the command does not print a reopened-run count: it prints "repeat runs on one head" and "draft push runs" (the draft count is always 0, because the run list carries no draft flag), and the tester states the count it finds.
 
