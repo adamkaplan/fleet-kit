@@ -60,7 +60,7 @@ class TesterHub(Base):
         self.assertIn("tst1", json.loads(self.st()["secret_bodies"][REGISTRY]["secrets.json"]))
         code, _, err = self.run_cli("stop", "tst1", "--no-record")
         self.assertEqual(code, 0, err)
-        self.assertEqual(self.agents(), {"other-agent": {"url": "u"}})
+        self.assertEqual(self.agents(), {"other-agent": {"url": "u"}}, "the pod's entry tst1 stayed in the registry")
         self.assertNotIn("tst1", self.st()["secret_bodies"]["cloud-hub-pw"])
 
     def test_s3_a_refused_registration_creates_no_pod(self):
@@ -69,26 +69,44 @@ class TesterHub(Base):
         self.assertNotEqual(code, 0)
         self.assertEqual(self.st()["pods"], {})
 
+    def scratch_run(self, text):
+        """Run the REAL stop test of this file against a scratch copy of the launcher whose cloud_worker.py is `text`; returns (code, output)."""
+        import shutil
+        import subprocess
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = os.path.join(tmp, "cloud", "launcher")
+            shutil.copytree(LAUNCHER, dest, ignore=shutil.ignore_patterns("__pycache__"))
+            with open(os.path.join(dest, "cloud_worker.py"), "w") as fh:
+                fh.write(text)
+            for name in ("bin", "docs"):
+                os.symlink(os.path.join(ROOT, name), os.path.join(tmp, name))
+            env = dict(os.environ)
+            env.pop("PYTHONPATH", None)
+            run = subprocess.run([sys.executable, os.path.join(dest, "tests", "test_tester_pod_hub.py"), "TesterHub.test_s3_registered_after_launch_and_removed_after_stop"],
+                                 cwd=tmp, env=env, capture_output=True, text=True, timeout=90)
+            return run.returncode, run.stdout + run.stderr
+
     def test_s3_mutant_register_without_remove_is_caught(self):
         src = open(os.path.join(LAUNCHER, "cloud_worker.py")).read()
         old = "self._unregister(self._orchestrator)"
         self.assertEqual(src.count(old), 1)
-        for mutation, expect_applied in ((src.replace(old, "pass"), True), (src.replace(old, old), False)):
-            applied = mutation != src
-            if not expect_applied:
-                with self.assertRaises(AssertionError, msg="the no-op mutation must fail the computation"):
-                    self.assertTrue(applied, "the mutation was not applied")
-        # control first: the real launcher leaves nothing; the mutant's behaviour (an entry left after the stop) is what the real test above forbids
-        self.launch("ctl1", "--hub", "--boss", "boss1")
-        self.run_cli("stop", "ctl1", "--no-record")
-        self.assertNotIn("ctl1", self.agents())
-        real = cw.Launcher._unregister
-        cw.Launcher._unregister = lambda self_, agent: True   # the mutant: the removal never happens
-        self.addCleanup(setattr, cw.Launcher, "_unregister", real)
-        self.launch("mut1", "--hub", "--boss", "boss1")
-        self.run_cli("stop", "mut1", "--no-record")
-        with self.assertRaisesRegex(AssertionError, r"mut1"):
-            self.assertNotIn("mut1", self.agents(), "the pod's entry mut1 stayed in the registry")
+        anchor = "the pod's entry tst1 stayed in the registry"
+        # control first: the unmutated copy passes the real stop test
+        code, out = self.scratch_run(src)
+        self.assertEqual(code, 0, out)
+        self.assertNotIn(anchor, out)
+        # the no-op mutation fails the computation of `applied`
+        noop = src.replace(old, old)
+        with self.assertRaisesRegex(AssertionError, "the mutation was not applied"):
+            self.assertNotEqual(noop, src, "the mutation was not applied")
+        # the mutant: the removal replaced; applied is computed from the two texts
+        mutant = src.replace(old, "pass")
+        self.assertEqual(len(src) - len(mutant), len(old) - len("pass"))
+        self.assertNotEqual(mutant, src, "the mutation was not applied")
+        code, out = self.scratch_run(mutant)
+        self.assertNotEqual(code, 0, "the mutant passed")
+        self.assertIn(anchor, out)
 
     def test_s4_the_verdict_rule(self):
         allowed = {"tester": ["tst-1", "tst-2"]}
