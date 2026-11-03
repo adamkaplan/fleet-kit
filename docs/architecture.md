@@ -99,6 +99,7 @@ The **Holds** column is descriptive: only the layer numbers are enforced.
 | `delegated_clear.py` | 5 | the Chief of Staff's clear under the owner's standing order | |
 | `endpoint_send.py` | 5 | the send path's route to an agent that holds no pane | |
 | `heavy_slots.py` | 5 | CPU slots for heavy commands (`fleet-switchboard heavy`) | |
+| `host_liveness.py` | 2 | the liveness of an orchestrator that a charter names by a host (alive, dead or unreachable), on demand only | |
 | `impact_floor.py` | 5 | the impact hold's deterministic floor and decision table | |
 | `impact_hold.py` | 5 | who may clear, hold or release an impact hold | |
 | `item_verdicts.py` | 5 | verdicts for a work item that has no pull request | |
@@ -156,7 +157,7 @@ Kinds (the number is exact, except `size`, a ceiling with headroom: see rule 7):
 
 | From | To | Kind | Count | Why it is allowed today |
 |---|---|---|---|---|
-| `bin/test-switchboard` | `-` | size | 82,400 | the one test file; whole classes have moved to `tests/switchboard/test_cases_NN.py` (T1, T1b), and the lanes still add tests until the next split, so the row is the real count plus about 3,000 |
+| `bin/test-switchboard` | `-` | size | 79,500 | the one test file; whole classes have moved to `tests/switchboard/test_cases_NN.py` (T1, T1b), and the lanes still add tests until the next split, so the row is the real count plus about 3,000 |
 | `switchboard/alert_labels.py switchboard/triage.py` | `-` | cycle | 2 | moved together from the entry: each reads the other, one cycle to untangle |
 | `switchboard/answer_delivery.py switchboard/decisions_b.py` | `-` | cycle | 2 | moved together from the entry: each reads the other, one cycle to untangle |
 | `impact_hold.py` | `-` | size | 2,000 | the brief-bound clear (#1215) took it past the limit; to be split (ceiling = the test's own formula: 1510 lines, plus 500, rounded up to a multiple of 500) |
