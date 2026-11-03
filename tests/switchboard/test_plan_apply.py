@@ -262,6 +262,36 @@ def build(HandoffCase):
                 with self.assertRaisesRegex(AssertionError, "--expect-file was not checked"):
                     self.check_file_was_checked()
 
+        def racing(self):
+            """The plan body changes between the apply's read and the signed edit's read (before the PATCH)."""
+            gh = self.gh
+            real = type(gh).__call__
+            state = {"done": False}
+            def route(argv, **kwargs):
+                if argv[2].endswith("/issues/comments/1") and "--method" not in argv and not state["done"]:
+                    state["done"] = True
+                    gh.store[1]["body"] = gh.store[1]["body"].replace("Beta line. Beta line.", "Beta line. Beta line. Edited by another hand.")
+                return real(gh, argv, **kwargs)
+            gh.__class__ = type("RacingIssue", (type(gh),), {"__call__": lambda self, argv, **kw: route(argv, **kw)})
+
+        def check_race_was_refused(self):
+            self.racing()
+            code, out, err = self.run_apply()
+            if code == 0 or "--expect-live" not in err or self.gh.writes:
+                raise AssertionError("the changed live plan was not refused: %r %r writes %r" % (code, err, self.gh.writes))
+            return err
+
+        def test_race_a_body_changed_before_the_patch_is_refused_naming_expect_live_with_no_patch(self):
+            self.gh.fail_read = False
+            err = self.check_race_was_refused()
+            self.assertEqual(len(err.strip().splitlines()), 1, err)
+            self.assertEqual([w for w in self.gh.writes if w[0] == "PATCH"], [])
+
+        def test_race_an_unchanged_body_still_applies(self):
+            code, out, err = self.run_apply()
+            self.assertEqual(code, 0, err)
+            self.assertEqual(self.gh.writes, [("PATCH", 1), ("POST", 7)])
+
     class TestPlanApplyDerivedPlaces(PlanApplyCase):
         HEADING = "Applying an approved plan edit"
 
