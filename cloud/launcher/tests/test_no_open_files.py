@@ -1,16 +1,19 @@
 """Guard (ask #2004): a test file of this directory that opens a file and never closes it prints a ResourceWarning only when warnings are errors, so
-nothing failed when the leaks were written. Each file in the table is run, one after the other, in a subprocess under `-W error::ResourceWarning`; a leaked file fails with
+nothing failed when the leaks were written. Each file in the table is run, four at a time, in a subprocess under `-W error::ResourceWarning`; a leaked file fails with
 `a file was left open:`. S3: one case per file. S4: a scratch copy of one guarded file with one bare `open(path).read()` put back fails the guard."""
 import os
 import re
 import shutil
+import queue
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(HERE)))
+# Files run at the same time must not share a temp name: test_cloud_pr_preflight lists the temp dir for cloud-preflight-*, so no other file here may create such names.
 GUARDED = (
     "test_app_token.py",
     "test_chain_time.py",
@@ -41,6 +44,7 @@ GUARDED = (
 )
 LEAK = re.compile(r"^ResourceWarning: unclosed ", re.M)
 LIMIT = 900
+WORKERS = 4
 
 
 def run(path, cwd):
@@ -67,9 +71,38 @@ def mutate(text, old, new):
     return mutated
 
 
+def run_all(names):
+    """Every file run in a subprocess by a small pool of daemon threads (a queue and plain `threading.Thread(daemon=True)`, because the pool of
+    the standard library starts threads that are not daemon). Each file keeps the same command line and the same cwd; the results come back by name."""
+    todo = queue.Queue()
+    for n in names:
+        todo.put(n)
+    results = {}
+
+    def work():
+        while True:
+            try:
+                n = todo.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                results[n] = run(os.path.join(HERE, n), ROOT)
+            except BaseException as e:  # reported per file below
+                results[n] = (-1, "the run failed: %r" % (e,))
+
+    threads = [threading.Thread(target=work, daemon=True) for _ in range(WORKERS)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    return results
+
+
 class GuardEachFile(unittest.TestCase):
+    @unittest.skipIf(sys.platform == "darwin",
+                     "the leak check does not depend on the platform; the ubuntu leg of the test-cloud job enforces it; on macOS the chain step reached its 20-minute limit with this guard (run 41618172100)")
     def test_s3_each_listed_file_leaves_nothing_open(self):
-        results = {n: run(os.path.join(HERE, n), ROOT) for n in GUARDED}
+        results = run_all(GUARDED)
         for n in GUARDED:
             rc, text = results[n]
             with self.subTest(file=n):
