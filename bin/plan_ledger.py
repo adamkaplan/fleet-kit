@@ -660,7 +660,8 @@ def scenario_state(scenario, entries, pr, plan_hash, head, authors):
         if not newest and mine:
             why = "plan changed" if mine[-1].get("plan_hash") != plan_hash else "head moved"
             out["void"].append("%s #%d void: %s" % (kind if kind == "proof" else evaluator + " verdict", mine[-1]["seq"], why))
-        out[kind] = None if not newest else {"seq": newest["seq"], "result": newest["result"], "by": newest.get("by")}
+        out[kind] = None if not newest else {"seq": newest["seq"], "result": newest["result"], "by": newest.get("by"),
+                                                                                    "evidence": newest.get("evidence"), "ts": newest.get("ts")}
     proof, verdict = out["proof"], out["verdict"]
     if not proof:
         out["missing"].append("proof (`prove %s`; the %s judges it, a prover records it)" % (sid, evaluator))
