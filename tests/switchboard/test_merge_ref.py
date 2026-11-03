@@ -118,7 +118,7 @@ def build(HandoffCase):
                 self.assertEqual(section.count("first = parents[0]"), 1)
                 section = section.replace("first = parents[0]", "first = parents[1]")
             space = {"re": re, "json": json, "sys": sys, "subprocess": subprocess, "_one_line": lambda t, n=300: " ".join(str(t).split())[:n],
-                     "PROG": "x", "EXIT_OK": 0, "EXIT_ERROR": 1}
+                     "load_module": lambda name: type("M", (), {"parse_bounded": staticmethod(json.loads)}), "PROG": "x", "EXIT_OK": 0, "EXIT_ERROR": 1}
             exec(compile(section, "merge-ref-section", "exec"), space)
             return space
 

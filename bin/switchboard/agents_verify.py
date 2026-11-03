@@ -368,7 +368,7 @@ def merge_ref_read(runner, repo, number):
             return None
         raise
     try:
-        parents = [p["sha"] for p in json.loads(text)]
+        parents = [p["sha"] for p in load_module("record_json").parse_bounded(text)]
     except (ValueError, KeyError, TypeError):
         raise MergeRefError("the answer for the merge ref is not a list of parents: %s" % _one_line(text, 80)) from None
     if not parents or not all(isinstance(p, str) and re.fullmatch(r"[0-9a-f]{40}", p) for p in parents):
