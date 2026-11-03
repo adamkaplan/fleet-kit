@@ -121,7 +121,7 @@ class TestNewTestChecksRules(NtcTree):
 
     def test_s2_a_moved_name_is_flagged_with_its_line_and_the_rule_is_read_not_copied(self):
         code, lines = self.check(NTC_BINDS)
-        self.assertEqual((code, len(lines)), (1, 1), lines)
+        self.assertEqual((code, len(lines)), (1, 1), "the moved-name rule must flag a binding of a moved name with its file and line: got %r" % ((code, lines),))
         self.assertRegex(lines[0], r"test_planted\.py:3: moved-name: ")
         code, lines = self.check(NTC_CLEAN, "test_clean.py")
         self.assertEqual((code, lines), (0, []))
@@ -132,7 +132,7 @@ class TestNewTestChecksRules(NtcTree):
 
     def test_s3_only_a_read_at_import_outside_the_three_directories_is_flagged(self):
         code, lines = self.check(NTC_CLASS_READ, "test_a.py")
-        self.assertEqual((code, len(lines)), (1, 1), lines)
+        self.assertEqual((code, len(lines)), (1, 1), "the import-time-read rule must flag a class-body read of a repo file with its file and line: got %r" % ((code, lines),))
         self.assertRegex(lines[0], r"test_a\.py:6: import-time-read: ")
         for name, text in (("test_b.py", NTC_METHOD_READ), ("test_c.py", NTC_DOCS_READ), ("test_d.py", NTC_TEXT_ONLY)):
             self.assertEqual(self.check(text, name), (0, []), name)
@@ -141,7 +141,7 @@ class TestNewTestChecksRules(NtcTree):
         total = []
         for name, text in (("test_p.py", NTC_PATCHES), ("test_e.py", NTC_EXCEPT), ("test_r.py", NTC_RAISES)):
             code, lines = self.check(text, name)
-            self.assertEqual((code, len(lines)), (1, 1), (name, lines))
+            self.assertEqual((code, len(lines)), (1, 1), "the part-module-through-import rule must flag a part module that is patched or caught through, one finding per file: got %r" % ((name, code, lines),))
             self.assertIn("part-module-through-import", lines[0])
             self.assertIn("sb.plan_ledger", lines[0])
             total += lines
@@ -151,7 +151,8 @@ class TestNewTestChecksRules(NtcTree):
     def test_s5_a_class_that_lists_bin_and_a_row_that_does_not_name_the_file_are_listed_not_flagged(self):
         code, lines = self.check(NTC_LISTS_BIN, "test_l.py")
         self.assertEqual(code, 0, lines)
-        self.assertEqual([l for l in lines if l.startswith("table:")], ["table: class TestListsIt lists bin/: it is a row of NEW_BIN_GUARDS or exempt in tests/switchboard/test_bin_set_table.py"])
+        self.assertEqual([l for l in lines if l.startswith("table:")], ["table: class TestListsIt lists bin/: it is a row of NEW_BIN_GUARDS or exempt in tests/switchboard/test_bin_set_table.py"],
+                         "the table rule must list a class that lists bin/ as a table: line, not flag it: got %r" % (lines,))
         self.assertEqual([l for l in lines if l.startswith("run first:")], ["run first: python3 bin/test-switchboard TestTheBinSetClassesAreAllInTheTable"])
         code, lines = self.check(NTC_NAMES_PS, "test_n.py")
         self.assertEqual(code, 0, lines)
@@ -281,7 +282,7 @@ class TestNewTestChecksInPreflightPr(unittest.TestCase):
     def test_s14_a_head_that_binds_a_moved_name_fails_and_a_clean_one_passes_in_both_forms(self):
         for merged in (False, True):
             code, out, err = ntc_preflight(ntc_entry_under_test(), self.planted(NTC_BINDS), merged)
-            self.assertEqual(code, 1, (merged, out, err))
+            self.assertEqual(code, 1, "a head that binds a moved name must make preflight-pr print FAIL new-test-checks and exit 1: got %r" % ((merged, code, out, err),))
             self.assertEqual(len(re.findall(r"^FAIL new-test-checks \(\d+s\)$", out, re.M)), 1, out)
             self.assertEqual(len(re.findall(r"moved-name", err)), 1, err)
             code, out, err = ntc_preflight(ntc_entry_under_test(), self.planted(NTC_CLEAN), merged)
@@ -335,7 +336,7 @@ class TestNewTestChecksInCloudPreflight(unittest.TestCase):
     def test_s16_the_block_is_printed_only_for_a_changed_switchboard_test_file_in_both_modes(self):
         for quick in (False, True):
             code, out = self.run_script(self.planted(NTC_BINDS), quick)
-            self.assertEqual(code, 1, out)
+            self.assertEqual(code, 1, "the cloud preflight must print the new-test-checks block for a changed switchboard test file in both modes and exit 1 for a moved name: got %r" % ((quick, code, out),))
             self.assertEqual(out.count("== new test file checks (tools/new-test-checks) =="), 1, out)
             self.assertEqual((out.count("new-test-checks: FAIL"), out.count("moved-name"), out.count("RESULT: FAIL")), (1, 1, 1), out)
             code, out = self.run_script(self.planted(NTC_CLEAN), quick)
@@ -408,19 +409,19 @@ class TestNewTestChecksMutants(unittest.TestCase):
         old, new = "sorted(check_moved(source, root) + check_reads(tree)", "sorted([] + check_reads(tree)"
         self.tool_case(NTC_BINDS, "moved-name", old, new)
         self.standing("NTC_TOOL_PATH", self.mutate(NTC_TOOL, old, new), ["TestNewTestChecksRules"],
-                      "test_s2_a_moved_name_is_flagged_with_its_line_and_the_rule_is_read_not_copied", "(0, 0) != (1, 1)")
+                      "test_s2_a_moved_name_is_flagged_with_its_line_and_the_rule_is_read_not_copied", "the moved-name rule must flag a binding of a moved name with its file and line: got")
 
     def test_mutant_import_time_read_that_stops_flagging(self):
         old, new = "+ check_reads(tree) +", "+ [] +"
         self.tool_case(NTC_CLASS_READ, "import-time-read", old, new)
         self.standing("NTC_TOOL_PATH", self.mutate(NTC_TOOL, old, new), ["TestNewTestChecksRules"],
-                      "test_s3_only_a_read_at_import_outside_the_three_directories_is_flagged", "(0, 0) != (1, 1)")
+                      "test_s3_only_a_read_at_import_outside_the_three_directories_is_flagged", "the import-time-read rule must flag a class-body read of a repo file with its file and line: got")
 
     def test_mutant_part_module_that_stops_flagging(self):
         old, new = "+ check_parts(tree, root))", "+ [])"
         self.tool_case(NTC_PATCHES, "part-module-through-import", old, new)
         self.standing("NTC_TOOL_PATH", self.mutate(NTC_TOOL, old, new), ["TestNewTestChecksRules"],
-                      "test_s4_a_part_module_patched_or_caught_through_is_flagged_as_sb_dot_name", "(0, 0) != (1, 1)")
+                      "test_s4_a_part_module_patched_or_caught_through_is_flagged_as_sb_dot_name", "the part-module-through-import rule must flag a part module that is patched or caught through, one finding per file: got")
 
     def test_mutant_table_list_that_stops_listing(self):
         tmp = Path(tempfile.mkdtemp(prefix="ntc-"))
@@ -431,7 +432,7 @@ class TestNewTestChecksMutants(unittest.TestCase):
         mutant = ntc_run(root, planted, tool=self.mutate(NTC_TOOL, "lines, first = table_lines(source, tree, root, rel)", "lines, first = [], []"))
         self.assertFalse(any(l.startswith("table:") for l in mutant[1]), mutant)
         self.standing("NTC_TOOL_PATH", self.mutate(NTC_TOOL, "lines, first = table_lines(source, tree, root, rel)", "lines, first = [], []"), ["TestNewTestChecksRules"],
-                      "test_s5_a_class_that_lists_bin_and_a_row_that_does_not_name_the_file_are_listed_not_flagged", "!= ['table: class TestListsIt lists bin/")
+                      "test_s5_a_class_that_lists_bin_and_a_row_that_does_not_name_the_file_are_listed_not_flagged", "the table rule must list a class that lists bin/ as a table: line, not flag it: got")
 
     def test_mutant_preflight_pr_without_the_call(self):
         old = "    code = EXIT_ERROR if run_new_test_checks(runner, root, now) and code == EXIT_OK else code\n"
@@ -447,7 +448,7 @@ class TestNewTestChecksMutants(unittest.TestCase):
             self.assertNotIn("FAIL new-test-checks", out, "the mutant still runs the check")
             self.assertEqual(code, 0)
         self.standing("NTC_ENTRY_PATH", self.mutate(NTC_ENTRY, old, "    pass\n"), ["TestNewTestChecksInPreflightPr"],
-                      "test_s14_a_head_that_binds_a_moved_name_fails_and_a_clean_one_passes_in_both_forms", "0 != 1")
+                      "test_s14_a_head_that_binds_a_moved_name_fails_and_a_clean_one_passes_in_both_forms", "a head that binds a moved name must make preflight-pr print FAIL new-test-checks and exit 1: got")
 
     def test_mutant_cloud_preflight_without_the_call(self):
         scenario = TestNewTestChecksInCloudPreflight("test_s16_the_block_is_printed_only_for_a_changed_switchboard_test_file_in_both_modes")
@@ -462,7 +463,7 @@ class TestNewTestChecksMutants(unittest.TestCase):
         self.assertNotIn("new-test-checks: FAIL", out, "the mutant still runs the check")
         self.assertIn("RESULT: PASS", out)
         self.standing("NTC_CLOUD_PATH", mutant, ["TestNewTestChecksInCloudPreflight"],
-                      "test_s16_the_block_is_printed_only_for_a_changed_switchboard_test_file_in_both_modes", "0 != 1")
+                      "test_s16_the_block_is_printed_only_for_a_changed_switchboard_test_file_in_both_modes", "the cloud preflight must print the new-test-checks block for a changed switchboard test file in both modes and exit 1 for a moved name: got")
 
 
 class TestNewTestChecksDocs(unittest.TestCase):
