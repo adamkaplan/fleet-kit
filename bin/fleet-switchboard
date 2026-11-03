@@ -22570,7 +22570,7 @@ def preflight_added(runner, root):
             diff = runner(["git", "diff", "--name-status", "--no-renames", "--diff-filter=A", found.stdout.strip()], cwd=root, capture_output=True, text=True)
             if diff.returncode == 0:
                 rows = [line.split("\t", 1) for line in diff.stdout.splitlines() if "\t" in line]
-                return sorted(path for status, path in rows if status == "A" and path.startswith("bin/") and "__pycache__" not in path)
+                return sorted(path for status, path in rows if status == "A" and path.startswith(("bin/", "shims/")) and "__pycache__" not in path)
     return []
 
 
@@ -22580,8 +22580,8 @@ def run_new_bin_guards(ps, runner, root, added, now):
     rows = ps.guard_rows(added)
     if not rows:
         return 0
-    print("preflight-pr: new file under bin/ (%s): the %d guards every new bin file must pass" % (", ".join(added), len(rows)))
-    guards, failed = {tuple(ps.guard_command(g)): g for g in ps.NEW_BIN_GUARDS}, 0
+    print("preflight-pr: new file under bin/ or shims/ (%s): the %d guards every new file there must pass" % (", ".join(added), len(rows)))
+    guards, failed = {tuple(ps.guard_command(g)): g for g in ps.NEW_BIN_GUARDS + ps.NEW_SHIM_GUARDS}, 0
     for _suite, _classes, command, _why in rows:
         guard = guards[tuple(command)]
         gone = ps.guard_missing(root, guard)
