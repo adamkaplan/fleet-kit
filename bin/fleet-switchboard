@@ -3094,7 +3094,7 @@ class Switchboard:
         if sent is not None and "\n[cut at %d characters]" % MESSAGE_CAP in text[-40:]:  # never cut silently
             # Measure THE message delivered: the carried send alone (compose may cut a newer send, not pending[:1], the oldest fact).
             whole, _ = compose(plan.recipient, [sent], cap=10 ** 9, section=section_resolver(self, observation),
-                               repos=repos, delivered=self.now())
+                               repos=repos, delivered=self.now(), in_turn=in_turn)
             if len(pending) > 1:   # the carried send goes alone, with the line that says the others wait (compose's own rest line)
                 whole += "\n\u2026 and %d more: run fleet-switchboard pending %s" % (len(pending) - 1, plan.recipient)
             allowed = max(0, len(sent.summary) - (len(whole) - MESSAGE_CAP))
