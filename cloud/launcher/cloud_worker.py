@@ -1739,7 +1739,7 @@ def render_pod(a, worker, name, now, hard, env, run_names=()):
     agent = getattr(a, "agent", None) or "worker"
     if agent not in AGENTS:
         raise CloudError("--agent must be one of %s, got %r; nothing was created" % (" or ".join(AGENTS), str(agent)[:40]), EXIT_USAGE)
-    if agent == "orchestrator" or hub_on(env):   # with the hub setting unset a worker pod gets none of these: its spec is exactly what it was
+    if agent == "orchestrator" or hub_on(env) or getattr(a, "hub", False):   # with the hub setting unset a worker pod gets none of these: its spec is exactly what it was
         boss = getattr(a, "boss", None)
         if (agent == "orchestrator" and not boss) or (boss and not NAME_RE.match(boss)):
             raise CloudError("--agent orchestrator needs --boss NAME", EXIT_USAGE)
@@ -1905,7 +1905,7 @@ class Launcher:
             agent = getattr(a, "agent", None) or "worker"
             if agent not in AGENTS:   # before any cluster call
                 raise CloudError("--agent must be one of %s, got %r; nothing was created" % (" or ".join(AGENTS), str(agent)[:40]), EXIT_USAGE)
-            hub = agent == "orchestrator" or hub_on(self.env)
+            hub = agent == "orchestrator" or hub_on(self.env) or getattr(a, "hub", False)
             if hub:   # the per-pod channel secret: random, only its sha256 leaves the pod's Secret, never printed
                 if CHANNEL_SECRET_KEY in run_values:
                     raise CloudError("%s is the launcher's own key" % CHANNEL_SECRET_KEY, EXIT_USAGE)
