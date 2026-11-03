@@ -149,6 +149,65 @@ class LiveForms(unittest.TestCase):
         self.assertEqual(run_plain("echo `ls")[0], 3)
 
 
+# step 1, continuation (live run in a pod, 3 November 2026): (form, command, whole command refused by the runtime?)
+CONT = [
+    ("a after &&", "echo part-one-ran &&\\\n" + D + " --jq .body", True),
+    ("b inside the word sequence", "echo part-one-ran; gh \\\napi repos/o/r/issues/comments/1", False),
+    ("c inside a word", "echo part-one-ran; gh api repos/o/r/issues/comm\\\nents/1", True),
+    ("d double quotes", 'echo "a\\\nb"', False),
+    ("d single quotes", "echo 'a\\\nb'", False),
+]
+
+
+class Continuation(unittest.TestCase):
+    def test_every_measured_form(self):
+        for form, command, refused in CONT:
+            with self.subTest(form=form):
+                code, out = run_plain(command)
+                self.assertEqual(code, 1 if refused else 0, "%s: %s" % (form, out))
+                self.assertEqual("deny" in out.split(), refused, form)
+
+    def test_a_shows_the_denied_part_without_the_continuation(self):
+        out = run_plain(CONT[0][1])[1]
+        self.assertIn("deny gh api*/issues* : " + D + " --jq .body", out.splitlines())
+
+
+class ContinuationMutant(unittest.TestCase):
+    LINE = '            elif c == "\\\\" and s[i + 1:i + 2] == "\\n" and not "".join(cur).strip():\n'
+
+    def case_a(self, text):
+        fd, path = tempfile.mkstemp(suffix=".py")
+        self.addCleanup(os.unlink, path)
+        with os.fdopen(fd, "w") as fh:
+            fh.write(text)
+        p = subprocess.run([sys.executable, path, CONT[0][1]], capture_output=True, text=True)
+        self.assertEqual(p.returncode, 1, "continuation case a: the tool must deny: " + p.stdout)
+
+    def mutate(self, text):
+        self.assertEqual(text.count(self.LINE), 1)
+        return text.replace(self.LINE, '            elif False:\n')
+
+    def test_control_passes(self):
+        with open(TOOL) as fh:
+            self.case_a(fh.read())
+
+    def test_without_the_join_case_a_fails(self):
+        with open(TOOL) as fh:
+            text = fh.read()
+        new = self.mutate(text)
+        self.assertTrue(new != text and len(text) - len(new) == len(self.LINE) - len('            elif False:\n'),
+                        "the mutation was not applied")
+        with self.assertRaises(AssertionError) as ctx:
+            self.case_a(new)
+        self.assertIn("continuation case a: the tool must deny", str(ctx.exception))
+
+    def test_noop_mutation_fails_the_computation(self):
+        with open(TOOL) as fh:
+            text = fh.read()
+        with self.assertRaises(AssertionError):
+            self.assertTrue(text.replace(self.LINE, self.LINE) != text, "the mutation was not applied")
+
+
 class NewCodeMutant(unittest.TestCase):
     BRANCH = 'elif c in "`(" or (c == "$" and s[i + 1:i + 2] == "("):'
 

@@ -127,6 +127,8 @@ def split_parts(text, unsure=None):
                     cur.append(s[i + 1]); i += 1
                 elif c == quote:
                     quote = None
+            elif c == "\\" and s[i + 1:i + 2] == "\n" and not "".join(cur).strip():
+                i += 1  # measured: a continuation at the start of a part is skipped by the runtime; inside a part it stays
             elif c == "\\" and i + 1 < n:
                 cur.append(c); cur.append(s[i + 1]); i += 1
             elif c in "'\"":
