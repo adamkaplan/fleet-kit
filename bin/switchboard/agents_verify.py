@@ -376,6 +376,26 @@ def merge_ref_read(runner, repo, number):
     return parents
 
 
+def merge_ref_absent(runner, repo, number):
+    """Why the ref read was a 404: (a line, exit code) for a missing pull request or a ref not built yet; None for a conflict (or an unreadable answer)."""
+    try:
+        text = merge_ref_gh(runner, ["api", "repos/%s/pulls/%d" % (repo, number), "--jq", "{m: .mergeable, s: .mergeable_state}"])
+    except MergeRefError as err:
+        if "404" in str(err) or "Not Found" in str(err):
+            return "pull request %s#%d does not exist" % (repo, number), EXIT_ERROR
+        raise
+    try:
+        seen = load_module("record_json").parse_bounded(text)
+        mergeable, state = seen["m"], str(seen["s"]).lower()
+    except (ValueError, KeyError, TypeError):
+        return None
+    if mergeable is False or state in ("dirty", "conflicting"):
+        return None
+    if mergeable is None or state == "unknown":
+        return "no merge ref yet (GitHub has not built it): run merge-ref --refresh", EXIT_ERROR
+    return None
+
+
 def merge_ref_base_head(runner, repo, number):
     base = merge_ref_gh(runner, ["api", "repos/%s/pulls/%d" % (repo, number), "--jq", ".base.ref"]).strip()
     if not base:
@@ -411,6 +431,10 @@ def cmd_merge_ref(args, runner, now):
                 if parents is not None:
                     print(merge_ref_line(base, parents, head, "still STALE"))
         if parents is None:
+            absent = merge_ref_absent(runner, repo, number)
+            if absent is not None:
+                print(absent[0])
+                return absent[1]
             print("pull request %d has no merge ref: it conflicts with its base" % number)
             return 3
     except MergeRefError as err:
