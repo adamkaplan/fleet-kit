@@ -652,8 +652,13 @@ PYEOF
 import json, subprocess, sys
 try:
     got = subprocess.run([sys.argv[1], "pending", sys.argv[2], "--json"], capture_output=True, text=True, timeout=60)
-    seen = json.loads(got.stdout)["observation"]
-    print("dead" if seen is None else ("unknown" if seen.get("status") == "unknown" else "live"))
+    if got.returncode != 0:
+        raise ValueError("pending failed")
+    answer = json.loads(got.stdout)
+    seen = answer["observation"]
+    # dead only for a clean "not found" (no problems named); a null observation that names discovery problems is an unreadable service: unknown
+    clean = " not found: no herdr pane shows a v2 session named " in str(answer.get("missing") or "")
+    print(("dead" if clean else "unknown") if seen is None else ("unknown" if seen.get("status") == "unknown" else "live"))
 except Exception:
     print("unknown")
 PYEOF

@@ -23,14 +23,14 @@ def _doctor_module():
 FD = _doctor_module()
 
 
-class DoctorHeadlessCharter(unittest.TestCase):
+class TestDoctorHeadlessCharter(unittest.TestCase):
     """S2: the doctor on a `headless:<name>` charter (a fake service answers `pending`)."""
 
-    def charter_run(self, answer):
+    def charter_run(self, answer, exit_code=0):
         tmp = tempfile.mkdtemp(prefix="test-headless-orch.")
         self.addCleanup(shutil.rmtree, tmp, True)
         stub = Path(tmp) / "sb-stub"
-        stub.write_text("#!/bin/sh\n[ \"$1\" = pending ] && { %s; }\nexit 0\n" % answer)
+        stub.write_text("#!/bin/sh\n[ \"$1\" = pending ] && { %s; exit %d; }\nexit 0\n" % (answer, exit_code))
         stub.chmod(0o755)
         run = FD.DoctorRun(tmp, {"herdr": "  echo '{\"result\": {\"panes\": []}}'", "gh": "  true"})
         (run.path_dir / "herdr").write_text("#!/bin/sh\n[ \"$1\" = \"--version\" ] && echo 'herdr 1.0.0' && exit 0\necho '{\"result\": {\"panes\": []}}'\n")
@@ -56,9 +56,24 @@ class DoctorHeadlessCharter(unittest.TestCase):
         self.assertIn("1 headless charter(s) alive", text, "a headless orchestrator is alive while the service shows it\n" + run.output)
         self.assertNotIn("name a dead pane", text)
 
+    CLEAN = "echo '{\"observation\": null, \"missing\": \"orch-hl not found: no herdr pane shows a v2 session named orch-hl\"}'"
+    PROBLEM = "echo '{\"observation\": null, \"missing\": \"orch-hl not found; headless workers could not be read: boom\"}'"
+
     def test_a_headless_orchestrator_the_service_does_not_show_is_dead(self):
-        run = self.charter_run("echo '{\"observation\": null}'")
+        run = self.charter_run(self.CLEAN)
         self.assertIn("#7->headless:orch-hl", self.text(run), run.output)
+
+    def test_a_null_observation_naming_problems_is_unknown_never_dead(self):
+        run = self.charter_run(self.PROBLEM)
+        text = self.text(run)
+        self.assertIn("1 headless charter(s) unknown", text, run.output)
+        self.assertNotIn("name a dead pane", text)
+
+    def test_a_failing_pending_is_unknown_even_with_a_clean_looking_answer(self):
+        run = self.charter_run(self.CLEAN, exit_code=1)
+        text = self.text(run)
+        self.assertIn("1 headless charter(s) unknown", text, run.output)
+        self.assertNotIn("name a dead pane", text)
 
     def test_an_unreadable_answer_is_unknown_never_dead(self):
         run = self.charter_run("echo 'not json'")
