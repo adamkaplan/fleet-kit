@@ -6,7 +6,7 @@ from pathlib import Path
 from support.loader import SWITCHBOARD_SOURCE_FILES, captured, sb
 
 MARK = "# ---- queue (#1786)"
-H1, H2, H3 = "a" * 64, "b" * 64, "c" * 64
+H1, H2, H3 = ["sha256:" + c * 64 for c in "abc"]   # the real format: `plan check --json` and the plan.approved event carry the prefix
 ISSUE = "o/r#9"
 
 
@@ -127,7 +127,7 @@ def build(HandoffCase):
             self.approved(H1, H2)
             lines = self.next_lines(1)
             self.assertEqual([l for l in lines if l.startswith("not launched")],
-                             ["not launched: old: the live plan hash %s is not the one the entry needs %s" % (H1[:8], H2[:8])])
+                             ["not launched: old: the live plan hash %s is not the one the entry needs %s" % (H1[7:15], H2[7:15])])
             self.assertEqual(self.printed(lines), ["good"])
             self.assertEqual(len([l for l in self.run_queue("list")[1].splitlines() if " old " in l]), 1)
 
@@ -232,6 +232,18 @@ def build(HandoffCase):
             with self.assertRaises(AssertionError) as caught:
                 check(mutant)
             self.assertIn("the add failed because the wake failed", str(caught.exception))
+
+        def test_s12_real_format_hash_is_admitted_end_to_end(self):
+            real = "sha256:" + "d" * 64
+            done = argparse.Namespace(stdout=json.dumps({"result": "pass", "plan_hash": real, "source": ISSUE}) + "\n")
+            self.assertEqual(sb.queue_live_hash(lambda argv, **kw: done, ISSUE), real)
+            self.assertEqual(sb.queue_hash(real), sb.queue_hash("d" * 64))
+            self.assertIsNone(sb.queue_hash("sha256:" + "d" * 63))
+            self.put("real", plan_hash=real)
+            self.approved(real)
+            lines = self.next_lines(1, live=real)
+            self.assertEqual(self.printed(lines), ["real"], lines)
+            self.assertEqual(self.queue_lines("launch-queue.status.jsonl"), [])
 
         def test_u1_unreadable_lines_are_counted_and_named_and_a_missing_file_is_empty(self):
             self.assertEqual(self.run_queue("list"), (0, ""))

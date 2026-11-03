@@ -1041,6 +1041,12 @@ def queue_change(state_dir, lane, key, op, moment, audit, number=None):
         audit.append("cli", "queue." + op, entry["name"], {"lane": lane, "id": key, "name": entry["name"], "old": old, "new": number})
 
 
+def queue_hash(value):
+    """The 64 hex characters of a plan hash given as `sha256:<64 hex>` or as bare 64 hex; None for anything else."""
+    text = value[7:] if isinstance(value, str) and value.startswith("sha256:") else value
+    return text if isinstance(text, str) and re.fullmatch(r"[0-9a-f]{64}", text) else None
+
+
 def queue_next(state_dir, free, moment, live_hash, approvals):
     """(lines to print, entries to launch): `live_hash(issue)` is the live plan hash or None; `approvals` is a set of (issue, plan_hash)."""
     out, picked = [], []
@@ -1059,11 +1065,11 @@ def queue_next(state_dir, free, moment, live_hash, approvals):
         if item["skipped"]:
             continue
         if item["kind"] == "builder":
-            full = item.get("plan_hash_full")
-            if not (isinstance(full, str) and re.fullmatch(r"[0-9a-f]{64}", full)):
+            full = queue_hash(item.get("plan_hash_full"))
+            if full is None:
                 queue_note(state_dir, key, "refused", moment, reason="no-plan-hash")
                 continue
-            live = live_hash(item.get("plan_issue"))
+            live = queue_hash(live_hash(item.get("plan_issue")))
             if live is None:
                 out.append("not launched: %s: the live plan hash could not be read" % name)
                 continue
@@ -1071,7 +1077,7 @@ def queue_next(state_dir, free, moment, live_hash, approvals):
                 queue_note(state_dir, key, "refused", moment, reason="hash-mismatch %s" % live[:8])
                 out.append("not launched: %s: the live plan hash %s is not the one the entry needs %s" % (name, live[:8], full[:8]))
                 continue
-            if (item.get("plan_issue"), full) not in approvals:
+            if (item.get("plan_issue"), full) not in approvals:   # approvals hold normalised hashes
                 queue_note(state_dir, key, "refused", moment, reason="no-approval")
                 continue
         picked.append(item)
@@ -1103,7 +1109,7 @@ def queue_approvals(state_dir):
     for _, rec in rows:
         detail = rec.get("detail")
         if rec["event"] == "plan.approved" and isinstance(detail, dict):
-            found.add((detail.get("issue"), detail.get("plan_hash")))
+            found.add((detail.get("issue"), queue_hash(detail.get("plan_hash"))))
     return found
 
 
