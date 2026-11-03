@@ -116,11 +116,6 @@ def load():
             self.assertNotIn("jobs", view)
 
         # -- the mutants: a textual replacement in a copy of the real source, the control first
-        def mutant(self, path, old, new, name, whole=False):
-            text = (ROOT / "bin" / path).read_text()
-            self.assertEqual(text.count(old), 1, "the mutation must apply")
-            return text.replace(old, new)
-
         def function_of(self, text, name):
             found = re.search(r"^def %s\(.*?(?=^\S)" % name, text, re.S | re.M)
             self.assertIsNotNone(found)
@@ -174,5 +169,81 @@ def load():
                 self.check_world()   # the control first
             self.fresh()
             self.fails_with_the_anchor(self.recorder_with('check.get("status") == "IN_PROGRESS" else None', "True else None"))
+
+        # -- the printed text of a head with no failed run is the text without this change (U1)
+        def test_a_head_with_no_failed_run_prints_the_text_it_printed_without_the_jobs_keys(self):
+            self.setup_world(CLEAN, completed_run=False)
+            self.assertEqual(len(self.asked), 1, "the recorder step ran on the pending head")
+            code, out, calls = self.pr_state(self.PR)
+            view = json.loads(self.pr_state(self.PR, "--json")[1])
+            without = {k: v for k, v in view.items() if not k.startswith("jobs")}
+            self.assertEqual(out.rstrip("\n").encode(), sb.pr_state_line(without).encode(), "byte for byte the old printer's text")
+            self.assertNotIn("job", out.replace("jobs", ""))
+
+        # -- the caps, from the constants
+        def many_runs_world(self, runs, failed_per_run):
+            self.jobs = {200 + i: [job("j%d" % n, "failure", [("s", "failure")]) for n in range(failed_per_run)] for i in range(runs)}
+            self.pr["statusCheckRollup"] = [{"name": "b%d" % i, "workflowName": "w%d" % i, "status": "IN_PROGRESS", "conclusion": "", "detailsUrl": URL % (200 + i)} for i in range(runs)]
+            self.go()
+
+        def check_caps(self, lines_anchor, requests_anchor):
+            self.many_runs_world(sb.PR_STATE_JOBS_RUNS + 2, sb.PR_STATE_JOBS_MAX + 2)
+            lines = self.job_lines(self.pr_state(self.PR)[1])
+            self.assertEqual(len(lines), sb.PR_STATE_JOBS_MAX, "%s: not %d lines" % (lines_anchor, len(lines)))
+            kept = sb.pr_state_read(self.world.state, self.t)[0]["prs"][self.PR]["jobs"]   # the view cuts at 10 too: the cap of the recorder is read in the entry
+            self.assertEqual(len(kept), sb.PR_STATE_JOBS_MAX, "%s: %d lines kept in the entry" % (lines_anchor, len(kept)))
+            requests = [a for a in self.asked if "/jobs" in a]
+            self.assertEqual(len(requests), sb.PR_STATE_JOBS_RUNS, "%s: not %d requests" % (requests_anchor, len(requests)))
+
+        LINES, REQUESTS = "the cap of lines of jobs holds", "the cap of runs read holds"
+
+        def test_the_caps_of_lines_and_of_runs_hold(self):
+            self.check_caps(self.LINES, self.REQUESTS)
+
+        def test_mutant_3_no_cap_of_lines_fails_the_check(self):
+            with self.recorder_with("", ""):
+                self.check_caps(self.LINES, self.REQUESTS)   # the control first
+            self.fresh()
+            with self.recorder_with("jobs[:PR_STATE_JOBS_MAX]", "jobs"):
+                with self.assertRaises(AssertionError) as caught:
+                    self.check_caps(self.LINES, self.REQUESTS)
+            self.assertIn(self.LINES, str(caught.exception))
+
+        def test_mutant_4_no_cap_of_runs_fails_the_check(self):
+            with self.recorder_with("", ""):
+                self.check_caps(self.LINES, self.REQUESTS)   # the control first
+            self.fresh()
+            with self.recorder_with("runs[:PR_STATE_JOBS_RUNS]", "runs"):
+                with self.assertRaises(AssertionError) as caught:
+                    self.check_caps(self.LINES, self.REQUESTS)
+            self.assertIn(self.REQUESTS, str(caught.exception))
+
+        # -- the real run-identity reader, counted (the only test that leaves ci_runs.READER in place)
+        def test_the_real_identity_reader_and_the_jobs_reads_are_counted_together(self):
+            runs = sb.load_module("ci_runs")
+            identity = []
+            real_run = subprocess.run
+
+            def fake_run(argv, *args, **kwargs):
+                found = re.search(r"/actions/runs/(\d+)$", str(argv[2])) if isinstance(argv, list) and len(argv) > 2 and argv[0] == FAKE_GH else None
+                if not found:
+                    return real_run(argv, *args, **kwargs)
+                identity.append(int(found.group(1)))
+                return subprocess.CompletedProcess(argv, 0, json.dumps({"w": int(found.group(1)), "e": "push", "p": ".github/workflows/ci.yml"}), "")
+            patch = mock.patch.object(runs, "READER", None)   # the real reader; the daemon's config load sets runs.GH to the fake gh, whose spawn is answered below
+            patch.start()
+            self.addCleanup(patch.stop)
+            patch = mock.patch("subprocess.run", fake_run)
+            patch.start()
+            self.addCleanup(patch.stop)
+            runs._CACHE.clear()
+            runs._FAILED.clear()
+            self.setup_world(FIVE)
+            in_progress = [a for a in self.asked if "/jobs" in a]
+            rollup_runs = {100, 101}   # the runs of the rollup: one in progress, one completed
+            self.assertEqual(len(in_progress), 1, "the jobs request per run in progress")
+            self.assertEqual(sorted(set(identity)), sorted(rollup_runs), "newest() reads the identity of each run of the rollup")
+            self.assertEqual(len(identity), len(set(identity)), "each identity is read once: the later passes are served from the cache")
+            self.assertEqual(len(in_progress) + len(identity), 3, "the total GitHub requests for one pending head")
 
     return TestPrStateJobs
