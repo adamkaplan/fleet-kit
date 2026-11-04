@@ -460,7 +460,7 @@ class TestLostWorkerReadRound(unittest.TestCase):
     BAD = [None, "x", 5, [1], {"a": 1}, True, 10 ** 30, {"a": {"b": [1]}}]
     VALID = {"reaper_ok": [5], "catchup": [True], "stop": [{"a": 1}], "report": [{"a": 1}], "gone": [{"a": 1}]}   # the one bad value of the table that is a good value of that key
     KEYS = ("offsets", "alerted", "created", "stop", "report", "refused", "seen", "gone", "reaper", "reaper_ok", "reaper_outage", "reaper_gap",
-            "reaper_new", "catchup")
+            "reaper_new", "catchup", "rotations")
 
     def bad_table(self):
         return {key: [b for b in self.BAD if not any(type(b) is type(v) and b == v for v in self.VALID.get(key, []))] for key in self.KEYS}
