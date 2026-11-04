@@ -99,6 +99,7 @@ The **Holds** column is descriptive: only the layer numbers are enforced.
 | `delegated_clear.py` | 5 | the Chief of Staff's clear under the owner's standing order | |
 | `endpoint_send.py` | 5 | the send path's route to an agent that holds no pane | |
 | `heavy_slots.py` | 5 | CPU slots for heavy commands (`fleet-switchboard heavy`) | |
+| `heavy_slots_watch.py` | 5 | the watchdog and the orphan check of the heavy wrapper (#2034); a part of heavy_slots.py | |
 | `host_liveness.py` | 2 | the liveness of an orchestrator that a charter names by a host (alive, dead or unreachable), on demand only | |
 | `impact_floor.py` | 5 | the impact hold's deterministic floor and decision table | |
 | `impact_hold.py` | 5 | who may clear, hold or release an impact hold | |
@@ -329,3 +330,6 @@ A site is listed by the function it sits in and its kind, with a count: `import(
 | `header_cache.py` | `<module>:exec_module` | 1 | uses an identifier of the import machinery (exec_module) |
 | `header_cache.py` | `<module>:import(importlib)` | 1 | imports a module that can load code by name, or one of its identifiers |
 | `header_cache.py` | `<module>:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
+| `heavy_slots.py` | `_load_part:exec_module` | 1 | uses an identifier of the import machinery (exec_module) |
+| `heavy_slots.py` | `_load_part:import(importlib)` | 1 | imports a module that can load code by name, or one of its identifiers |
+| `heavy_slots.py` | `_load_part:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
