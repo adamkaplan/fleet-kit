@@ -392,7 +392,7 @@ class TestHeavyProgress(unittest.TestCase):
                 child = subprocess.Popen([sys.executable, __file__, "TestHeavyProgress.test_s14_inner_a_blocked_write_does_not_hold_the_return"], cwd=here, env=env,
                                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
                 try:
-                    output, _ = child.communicate(timeout=60)   # the outer bound: only the mutant reaches it
+                    output, _ = child.communicate(timeout=float(os.environ.get("FLEET_TEST_S14_BOUND", "10")))   # the outer bound: only the mutant reaches it
                     outcome[kind] = (child.returncode, output, False)
                 except subprocess.TimeoutExpired:
                     child.send_signal(signal.SIGUSR1)   # the job's kill notice: the child names the hang and ends

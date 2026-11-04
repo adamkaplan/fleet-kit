@@ -18802,7 +18802,7 @@ class TestFleetHooksPlugin(Base):
     def test_with_a_real_child_process(self):
         """The shipped plugin against two real scripts (no opencode, no herdr): one answers, one hangs."""
         answers = self.fake_bin("answers", "cat > /dev/null\necho '{\"outcome\":\"ask\",\"reason\":\"real\"}'\n")
-        hangs = self.fake_bin("hangs", "cat > /dev/null\nsleep 30\n")
+        hangs = self.fake_bin("hangs", "cat > /dev/null\nexec sleep 30\n")
         body = ('const real = (bin, t) => { const h = hooks.makeHandler({ bin, timeoutMs: t });'
                 ' const i = { sessionID: "ses_r", action: "shell", resources: ["x"], effect: "allow" };'
                 ' const s = Date.now(); return h(i).then(() => ({ effect: i.effect, message: i.message, ms: Date.now() - s })); };'
@@ -56489,8 +56489,8 @@ class TestMadeUpPids(unittest.TestCase):
 
     def test_s3_a_number_that_is_alive_is_never_returned_and_none_is_self_parent_or_live(self):
         child = subprocess.Popen(["sleep", "30"])
-        self.addCleanup(child.kill)
         self.addCleanup(child.wait)
+        self.addCleanup(child.kill)   # cleanups run last-in first-out: kill first, then reap
         module, proofs, real = sys.modules["support.herdr_world"], {}, _pid_alive
         spy = lambda pid: proofs.__setitem__(pid, real(pid)) or proofs[pid]           # the proof the helper made for each number it looked at
         with mock.patch.object(module, "_MADE_UP_NEXT", [child.pid]), mock.patch.object(module, "_MADE_UP_GIVEN", set()), mock.patch.object(module, "_pid_alive", spy), \
