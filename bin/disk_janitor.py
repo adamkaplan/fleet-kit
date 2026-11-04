@@ -274,7 +274,7 @@ def _forms(value):
 
 
 def judge(path, text, now, cfg, uid=None, clock=time.monotonic, busy=None):
-    """One top-level entry: {"name", "path", "action": "remove" | "keep", "why", "size", "age_days", "ident"}. `ident` is (device, inode, newest mtime):
+    """One top-level entry: {"name", "path", "action": "remove" | "keep", "why", "size", "age_days", "ident"}. `ident` is (device, inode, newest mtime, file type, size, link target):
     run compares it again right before removing. Reads only."""
     uid = os.getuid() if uid is None else uid
     name = os.path.basename(path)
@@ -326,8 +326,15 @@ def judge(path, text, now, cfg, uid=None, clock=time.monotonic, busy=None):
         if using:
             row["why"] = using
             return row
+    target = None
+    if stat.S_ISLNK(info.st_mode):
+        try:
+            target = os.readlink(path)
+        except OSError as err:
+            row["why"] = "cannot read the link (%s): kept" % err
+            return row
     row["action"], row["size"] = "remove", _size(path, deadline, clock)
-    row["ident"] = (info.st_dev, info.st_ino, newest)
+    row["ident"] = (info.st_dev, info.st_ino, newest, stat.S_IFMT(info.st_mode), info.st_size, target)
     return row
 
 
@@ -408,6 +415,20 @@ def remove_entry(path):
         os.unlink(path)
 
 
+def covers_scratch(path, state_dir):
+    """True when removing `path` would remove or empty a scratch directory (#1456): `path` is the state directory, one of its parents, or the scratch tree itself or
+    anything inside it. A scratch directory is never swept; the check is by real path, so a link INSIDE a scratch directory counts and a link to it from outside does not (a link is judged by its parent's real path plus its own name, not followed)."""
+    try:
+        if os.path.islink(str(path)):
+            target = os.path.join(os.path.realpath(os.path.dirname(str(path))), os.path.basename(str(path)))
+        else:
+            target = os.path.realpath(str(path))
+        scratch = os.path.realpath(os.path.join(str(state_dir), "scratch"))
+    except (OSError, ValueError):
+        return True
+    return scratch == target or scratch.startswith(target + os.sep) or target.startswith(scratch + os.sep)
+
+
 def run(temp_dir, state_dir, now, cfg, apply, audit, uid=None, clock=time.monotonic, busy=None, weekly=False, outcome=None, recheck_busy=None, only=None):
     """Returns (lines, removed, kept). `recheck_busy`, when given, is the in-use check for the judgement right before a removal (default: `busy`). `outcome`, when a list, receives one dict (name, age_days, bytes) for each entry that is removed (or, on a dry run, would be): the daemon's audit summary reads it; it changes nothing else. `only`, when given, is the set of names a person reviewed: an entry that qualifies now but is not in it is kept and said so (the hand-run `--apply`). `audit(name, detail)` is called once for each removal that happened; if it raises, removing STOPS and the line says so.
     Right before each removal the entry is judged again from the records as they are then, and removed only if it is still eligible and is the same
@@ -440,6 +461,10 @@ def run(temp_dir, state_dir, now, cfg, apply, audit, uid=None, clock=time.monoto
         again = judge(row["path"], again_text, now, cfg, uid, clock, recheck_busy or busy)
         if not again_complete or again["action"] != "remove" or again["ident"] != row["ident"] or not safe_dir(temp_dir)[0]:
             lines.append("kept %s: it changed since the scan" % row["name"])
+            kept += 1
+            continue
+        if covers_scratch(row["path"], state_dir):   # #1456: a scratch directory is never removed or emptied
+            lines.append("kept %s: it holds a scratch directory" % row["name"])
             kept += 1
             continue
         try:
