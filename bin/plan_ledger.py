@@ -586,6 +586,21 @@ def claim_union(scenarios, this_body, others):
     return narrowed, [i for i in per if i not in covered], last
 
 
+def claim_counts(scenarios, bodies):
+    """How many of `bodies` cover each per-pull-request id (#1716): one reading of each body through `covered_ids`, kept as one number for each id. Pure."""
+    counts = {}
+    for body in bodies:
+        for i in covered_ids(scenarios, [body]):
+            counts[i] = counts.get(i, 0) + 1
+    return counts
+
+
+def omitted_claims(scenarios, this_body, counts):
+    """The per-pull-request ids this body's claim line leaves out that no OTHER body counted covers (`counts` is `claim_counts` over all bodies, this one included, so an id this body covers has a count of at least 1: an id is omitted when this body has a claim line that covers something, the scenario is per pull request and the counts hold NO body that covers it). No claim line claims every one and a refused line covers nothing: both leave out nothing here (`covered_ids` gives the empty set). Pure."""
+    mine = covered_ids(scenarios, [this_body])
+    return [s.get("id") for s in scenarios if mine and claim_of(s) == "pr" and not counts.get(s.get("id"), 0)]
+
+
 def claim_line(pr, head, body):
     """The ONE ledger line that binds a pull request's claim as it stood when its merge was gated (#976). `claim_text` None: no claim line."""
     text = claim_text(body)
