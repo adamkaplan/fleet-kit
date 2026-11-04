@@ -728,5 +728,103 @@ class TestLostWorkerMemoryOnly(unittest.TestCase):
             self.check_audit_per_path()
 
 
+class TestLostWorkerSlowPass(unittest.TestCase):
+    """#2096: a stop behind a slow reaper pass is told as late, not lost."""
+
+    def slow(self, r, n=870, at=NOW - 300, reason=None):
+        line(r.launcher, ts=stamp(at), worker="", runtime_id="reaper", action="slow-reap-pass", ok=False,
+             reason=reason or "the pass took %d seconds (limit 600)" % n)
+
+    def pod_lines(self, r, got):
+        return [x for x in got if x["kind"] == "pod_no_stop"]
+
+    def s2_case(self, mod):
+        r = Rig(mod)
+        self.slow(r)
+        r.created("w1", deadline=NOW - 600)
+        return r, r.passes()
+
+    def check_s2(self, mod):
+        r, got = self.s2_case(mod)
+        late = [x for x in got if "late, not lost" in x.get("text", "") and "870 seconds" in x["text"]]
+        lost = [x for x in got if x["kind"] == "pod_no_stop" and "late, not lost" not in x["text"]]
+        self.assertEqual(len(late), 1, "a late stop behind a slow pass is late, not lost")
+        self.assertEqual(len(lost), 0, "a late stop behind a slow pass is late, not lost")
+
+    def test_s2_a_late_pod_is_told_as_late_naming_the_pass(self):
+        self.check_s2(load())
+
+    def test_s3_a_pod_well_past_its_deadline_is_lost_as_today(self):
+        r = Rig(load())
+        self.slow(r)
+        r.created("w1", deadline=NOW - 1800)
+        got = r.passes()
+        self.assertEqual([x for x in got if "late, not lost" in x["text"]], [])
+        self.assertEqual(len([x for x in got if x["key"].startswith("pod_no_stop:w1")]), 1)
+
+    def test_s4_a_late_pod_then_its_stop_raises_nothing_more(self):
+        r = Rig(load())
+        self.slow(r)
+        r.created("w1", deadline=NOW - 600)
+        self.assertEqual(len(self.pod_lines(r, r.passes())), 1)
+        r.stopped("w1")
+        self.assertEqual(self.pod_lines(r, r.passes(at=NOW + 10)), [])
+        self.assertEqual(self.pod_lines(r, r.passes(at=NOW + 2000)), [])
+
+    def audit_lines(self, r):
+        with open(r.engine.audit.path) as handle:
+            return len([x for x in handle if "lost_worker.slow_pass_unreadable" in x])
+
+    def test_s4_a_malformed_slow_line_falls_back_with_one_audit_line(self):
+        r = Rig(load())
+        self.slow(r, reason="took long")
+        r.created("w1", deadline=NOW - 600)
+        got = r.passes()
+        self.assertEqual([x["key"].split(":")[0] for x in self.pod_lines(r, got)], ["pod_no_stop"])
+        self.assertEqual(self.audit_lines(r), 1)
+        r.passes(at=NOW + 5)
+        self.assertEqual(self.audit_lines(r), 1)
+
+    def test_s4_an_unreadable_launcher_audit_falls_back_with_one_audit_line(self):
+        r = Rig(load())
+        os.unlink(r.launcher)
+        os.mkdir(r.launcher)   # exists and cannot be read as a file
+        r.created("w1", deadline=NOW - 600)
+        got = r.passes()
+        self.assertEqual([x["key"].split(":")[0] for x in got], ["pod_no_stop"])
+        self.assertEqual(self.audit_lines(r), 1)
+        r.passes(at=NOW + 5)
+        self.assertEqual(self.audit_lines(r), 1)
+
+    def test_a_late_alert_is_not_an_earlier_lost_worker_of_its_ask(self):
+        r = Rig(load())
+        self.slow(r)
+        r.created("a1", deadline=NOW - 600)
+        r.passes()
+        r.created("a2", deadline=NOW - 1800)
+        got = {x["name"]: x["text"] for x in r.passes(at=NOW + 1)}
+        self.assertIn("first loss of this ask", got["a2"])
+
+    def test_a_pod_later_truly_lost_still_raises_its_own_key(self):
+        r = Rig(load())
+        self.slow(r)
+        r.created("w1", deadline=NOW - 600)
+        r.passes()
+        got = self.pod_lines(r, r.passes(at=NOW + 2000))
+        self.assertEqual([x["key"].split(":")[0] for x in got], ["pod_no_stop"])
+
+    def test_s5_a_mutant_that_ignores_the_pass_length_is_caught(self):
+        source = (REPO / "bin" / "lost_worker.py").read_text()
+        needle = "if now - deadline < longest:"
+        self.assertEqual(source.count(needle), 1)
+        control = load()   # the control first: the unmutated detector passes
+        self.check_s2(control)
+        mutant = types.ModuleType("lost_worker_mutant")
+        exec(compile(source.replace(needle, "if False:"), "lost_worker_mutant", "exec"), mutant.__dict__)
+        with self.assertRaises(AssertionError) as caught:
+            self.check_s2(mutant)
+        self.assertIn("a late stop behind a slow pass is late, not lost", str(caught.exception))
+
+
 if __name__ == "__main__":
     unittest.main()
