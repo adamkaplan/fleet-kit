@@ -125,8 +125,8 @@ def mutated_first_push(source):
     mod = types.ModuleType("fp_first_push_mutant")
     mod.__dict__["__file__"] = FP_SOURCE
     worker = CW()
-    mod.H, mod.D = worker.H, worker._Stayed()
     exec(compile(source, "fp_first_push_mutant", "exec"), mod.__dict__)
+    mod.H, mod.D = worker.H, worker._Stayed()   # after the exec: the text sets its own empty H
     return mod
 
 
