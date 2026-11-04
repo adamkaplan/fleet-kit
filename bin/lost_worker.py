@@ -337,6 +337,7 @@ def _ask_of(name, record):
 def _losses(state, sb, engine, alive, now, records):
     _sanitize(state)
     out = []
+    longest = _longest_slow(state, now)
     for name, c in sorted(state.get("created", {}).items()):
         deadline = c.get("deadline")
         if deadline is None or now < deadline:
@@ -344,8 +345,13 @@ def _losses(state, sb, engine, alive, now, records):
         if state.get("stop", {}).get(name, 0) >= c["at"] or state.get("report", {}).get(name, 0) >= c["at"]:
             continue
         record = records.get(name, {})
-        out.append({"key": "pod_no_stop:%s:%s" % (name, c["at"]), "kind": "pod_no_stop", "name": name, "ask": _ask_of(name, record),
-                    "at": c["at"], "lane": record.get("reports_to"), "line": c["line"]})
+        loss = {"key": "pod_no_stop:%s:%s" % (name, c["at"]), "kind": "pod_no_stop", "name": name, "ask": _ask_of(name, record),
+                "at": c["at"], "lane": record.get("reports_to"), "line": c["line"]}
+        if now - deadline < longest:
+            # late, not lost: a stop can run one reaper pass late. Its own key; ask "-" so it adds nothing to the ask's earlier-lost count.
+            loss.update(key="pod_late:%s:%s" % (name, c["at"]), ask="-", text="[lost worker] %s (ask %s) late, not lost: the reaper's last pass took %d seconds; its hard deadline passed %s." % (
+                _name(name), loss["ask"], longest, _iso(deadline)))
+        out.append(loss)
     for key, r in sorted(state.get("refused", {}).items()):
         record = records.get(r["name"], {})
         out.append({"key": "refused_launch:" + key, "kind": "refused_launch", "name": r["name"], "ask": _ask_of(r["name"], record),
