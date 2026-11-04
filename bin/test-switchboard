@@ -42526,6 +42526,10 @@ class TestEnsureOnUse(Base):
         self.world = World(self, agents=())
         self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
         self.daemons = FakeDaemons(self, sb.ensure_state_dir())
+        self.slept = []   # the daemon wait runs on a fake clock: ensure_on_use binds time.sleep as a default, so the default is swapped, not time.sleep
+        defaults = mock.patch.object(sb.ensure_on_use, "__defaults__", (subprocess.Popen, None, self.slept.append, None))
+        defaults.start()
+        self.addCleanup(defaults.stop)
 
     def use(self, argv, spawn=None):
         with mock.patch.object(sys, "stdin", io.StringIO("text\n")), captured() as (out, err):
@@ -42567,10 +42571,8 @@ class TestEnsureOnUse(Base):
 
     def test_the_wait_is_bounded_to_a_couple_of_seconds(self):
         self.assertLessEqual(sb.USE_ENSURE_PATIENCE, 2)
-        waited = []
-        with mock.patch.object(sb.time, "sleep", side_effect=waited.append):
-            self.use(["decisions"], spawn=lambda argv, **kw: None)
-        self.assertLessEqual(sum(waited), sb.USE_ENSURE_PATIENCE + 0.5)
+        self.use(["decisions"], spawn=lambda argv, **kw: None)
+        self.assertLessEqual(sum(self.slept), sb.USE_ENSURE_PATIENCE + 0.5)
 
     def test_the_fault_skips_it_and_only_in_the_lab(self):
         os.environ[sb.FAULT_ENV] = "no-ensure-on-use"
