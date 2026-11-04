@@ -124,12 +124,13 @@ class UnreadableTreeTests:
     def test_every_recording_command_refuses_on_an_unreadable_tree_and_every_other_runs_with_a_note(self):
         self.break_tree()
         known = self.known()
+        recording = set(self.recording())   # computed once, not once per command
         for name in sorted(known):
             if name in ("install", "run"):
                 continue
             with self.subTest(name=name):
                 line = sb.installed_tree_refusal(name, records=sb.command_records(name, known))
-                if name in self.recording():
+                if name in recording:
                     self.assertIsNotNone(line)
                     self.assertEqual(len(line.splitlines()), 1)
                     self.assertIn("could not be read", line)
