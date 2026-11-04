@@ -1876,7 +1876,7 @@ def fact_sources(state_dir):
     reminders join this list. `send` delivers directly, by the same rule, and
     stores only a send held for a blocked agent (HeldSendFacts).
     """
-    return [lab_fact_source(state_dir), WorkerFacts(), ReminderFacts(state_dir), ReportRiderFacts(state_dir),
+    return [lab_fact_source(state_dir), WorkerFacts(), ReminderFacts(state_dir), ReportRiderFacts(state_dir), HeldSendFacts(state_dir),
             ForegroundFacts(), OrdersFacts(), SweepFacts(), TriageFacts(), PlanWakeFacts(), AlertWakeFacts(), RedCiFacts(), JobFacts(), PaneFacts(), PaneExitFacts(), HeadlessRestartFacts(), DiskFacts(), CpuFacts(), SpotlightFacts(), DockerReapFacts(), TempJanitorFacts(), HeavyOrphanFacts(), ScratchBoundFacts()]
 
 
@@ -11631,8 +11631,8 @@ HELD_ROUTE_PANE, HELD_ROUTE_ENDPOINT = "pane", "endpoint"
 
 
 def held_send_applies(observation):
-    """A send is held only for the `blocked` reason (a permission request or a question): nothing else would end by itself."""
-    return observation is not None and observation.status == "blocked" and not observation.conflict and not observation.problem
+    """#1400: a send is held for every hold reason (blocked, unknown status, a problem, a conflict); only a recipient that cannot be observed (gone) is refused."""
+    return observation is not None and hold_reason(observation) is not None
 
 
 def _held_first_words(text):
