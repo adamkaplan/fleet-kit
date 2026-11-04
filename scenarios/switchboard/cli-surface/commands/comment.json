@@ -1,4 +1,4 @@
 {
  "command": "comment",
- "help": "usage: fleet-switchboard comment [-h] --issue ISSUE --body-file BODY_FILE options: -h, --help show this help message and exit --issue ISSUE The issue to comment on --body-file BODY_FILE The comment: a file, or - for stdin"
+ "help": "usage: fleet-switchboard comment [-h] [--issue ISSUE] [--edit COMMENT_URL] [--approval APPROVAL] --body-file BODY_FILE options: -h, --help show this help message and exit --issue ISSUE The issue to comment on (not with --edit) --edit COMMENT_URL Replace the body of your own comment at this url, signed once --approval APPROVAL With --edit of an approved plan: the id of the approving comment or message --body-file BODY_FILE The comment: a file, or - for stdin"
 }

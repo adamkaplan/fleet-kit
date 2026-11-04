@@ -18,11 +18,19 @@ a test fakes them. Python 3.9 standard library only; `pr_reading` (the shared pu
 """
 import fcntl
 import json
+import math
 import os
 import re
+import sys
 import tempfile
 import time
 from pathlib import Path
+
+try:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+except NameError:   # a test runs the source with no file: the module is then already importable
+    pass
+import size_ceilings   # the one reading of the size ceilings of docs/architecture.md (#1605)
 
 CONFIG_KEY = "merge_gate"   # the module declares its own configuration key (bin/fleet-switchboard config_declarations)
 CONFIG_DEFAULT = None       # None: nothing is enforced and nothing is added to the configuration
@@ -95,7 +103,7 @@ def is_held(labels):
 def read_facts(reading, gh, repo, number, conf):
     """The facts of one pull request, read now. Never raises: a read that failed is in `problems` and the decision refuses on it."""
     facts = {"repo": repo, "number": number, "problems": [], "head": None, "branch": None, "tip": None, "run_base": None, "runs": [], "pr_result": "none",
-             "failing": [], "branch_runs": [], "branch_result": "unknown", "default_branch": None, "state": None, "labels": [], "gated": False}
+             "failing": [], "branch_runs": [], "branch_result": "unknown", "default_branch": None, "state": None, "labels": [], "gated": False, "legs": (False, True, "")}
     try:
         pr = reading.read_pr(gh, repo, number)
         facts.update(head=pr["head"], branch=pr["base"], state=pr["state"], labels=pr["labels"])
@@ -110,6 +118,13 @@ def read_facts(reading, gh, repo, number, conf):
             for run in runs:
                 if reading.run_result(run) == "red":
                     facts["failing"] += ["%s / %s" % (run["workflow"], job) for job in reading.read_failing_jobs(gh, repo, run["id"])]
+        if facts["pr_result"] == "green":   # the legs are jobs of a finished run: read only then (one call per run)
+            states, later = {}, False
+            for run in runs:
+                for job in reading.read_jobs(gh, repo, run["id"]):
+                    states[job["name"]] = job["conclusion"]
+                    later = later or run.get("attempts", 1) > 1
+            facts["legs"] = judge_legs(states, later)
         bases = {r["base"] for r in runs if r["base"]}
         # the oldest base among the deciding runs: a pull request is as current as its least current run
         if runs and all(r["base"] for r in runs):
@@ -120,6 +135,43 @@ def read_facts(reading, gh, repo, number, conf):
     except reading.ReadError as err:
         facts["problems"].append(str(err))
     return facts
+
+
+# ------------------------------------------------------------------------------------------------ the macOS legs (#1235)
+# A pull request push runs the macOS legs only for a platform path or the `needs-mac` label (.github/workflows/test.yml, the `plan` job). The merge still
+# needs them green: the gate pass makes the `reopened` run (every leg, on the merge ref) and reads them here. A leg that is absent, skipped, cancelled or
+# not green is never read as green. The rule applies only where the workflow has the ubuntu legs by these names (another repository is not asked).
+
+UBUNTU_LEGS = ("test (ubuntu-latest)", "test-cloud (ubuntu-latest)")
+MAC_LEGS = ("test (macos-latest)", "test-cloud (macos-latest)")
+
+
+def judge_legs(states, later_run):
+    """(applies, ok, reading): `states` maps a leg name to its conclusion word (`success`, `skipped`, `cancelled`, `failure`, `in_progress`...); a leg not in it is
+    absent. `later_run` is true when the head had an earlier run than the one that carried the macOS legs (the gate pass's merge-ref run), so the reading says which.
+    Not applicable (applies False) when the ubuntu legs are not there at all."""
+    if not any(n in states for n in UBUNTU_LEGS):
+        return False, True, "no macOS rule for this workflow"
+    bad = ["%s %s" % (n, states.get(n) or "absent") for n in MAC_LEGS if states.get(n) != "success"]
+    if bad:
+        return True, False, "the macOS legs are not green (%s): the gate pass's run on the merge ref must report both" % "; ".join(bad)
+    return True, True, "macOS legs green on the gate pass's run on the merge ref of this head" if later_run else "macOS legs green at the head"
+
+
+def rollup_legs(newest, rollup):
+    """The same reading from gh's statusCheckRollup (G4): (applies, ok, reading). `newest` is the caller's `ci_runs.newest(rollup)` (the module the daemon
+    configured: a leg is its NEWEST check); the run id is in the check's URL."""
+    states, runs = {}, {}
+    for check in newest:
+        name = check.get("name")
+        if name in UBUNTU_LEGS + MAC_LEGS:
+            done = check.get("status") in (None, "COMPLETED")
+            states[name] = str(check.get("conclusion") or "").lower() if done else "in_progress"
+            runs[name] = (re.search(r"/runs/(\d+)", str(check.get("detailsUrl") or "")) or [None, None])[1]
+    every = {m.group(1) for c in (rollup if isinstance(rollup, list) else []) if isinstance(c, dict)
+             for m in [re.search(r"/runs/(\d+)", str(c.get("detailsUrl") or ""))] if m}
+    mac_runs = {runs[n] for n in MAC_LEGS if runs.get(n)}
+    return judge_legs(states, bool(mac_runs) and bool(every - mac_runs))
 
 
 def decide(facts, waived=False):
@@ -142,12 +194,15 @@ def decide(facts, waived=False):
         return False, "CI is red at the head %s: failing %s" % (facts["head"][:8], ", ".join(facts["failing"][:3])), None
     if facts["pr_result"] == "pending":
         return False, "CI is still running at the head %s: wait for it" % facts["head"][:8], None
+    applies, legs_ok, legs_said = facts["legs"]
+    if applies and not legs_ok:
+        return False, legs_said, "rerun" if "absent" in legs_said else None
     if not facts["run_base"]:
         return False, "the branch tip the last run was computed on is not recorded: re-run its CI", "rerun"
     if facts["run_base"] != facts["tip"]:
         return False, "%s moved after the last green run (tested on %s, tip now %s): its CI must run again on the current merge ref" % (
             facts["branch"], facts["run_base"][:8], facts["tip"][:8]), "rerun"
-    return True, "green at the head %s on the current tip %s" % (facts["head"][:8], facts["tip"][:8]), None
+    return True, "green at the head %s on the current tip %s%s" % (facts["head"][:8], facts["tip"][:8], "; " + legs_said if applies else ""), None
 
 
 def block(facts, allowed, reason, waived=False):
@@ -198,6 +253,25 @@ def wait_for_run(reading, gh, conf, repo, number, since, facts, clock, sleep, wa
         if clock() >= limit:
             return latest, "no finished CI run on the current merge ref within %d minutes: nothing was allowed" % ((wait_seconds or conf["wait"]) // 60)
         sleep(POLL_SECONDS)
+
+
+def wait_in_flight(reading, gh, conf, repo, number, facts, clock, sleep, wait_seconds=None):
+    """Wait, within the same bound as for a run the gate starts, for the run already in flight at the head. Returns (facts, why); `why` is a refusal
+    when the head moved during the wait (both heads named) or the run did not finish in time (the run named)."""
+    seed = facts["head"]
+    bound = conf["wait"] if wait_seconds is None else wait_seconds
+    limit = clock() + bound
+    ids = ", ".join("%s run %s" % (r["workflow"], r["id"]) for r in facts["runs"] if reading.run_result(r) == "pending") or "unknown run"
+    while True:
+        sleep(POLL_SECONDS)
+        latest = read_facts(reading, gh, repo, number, conf)
+        if not latest["problems"] and latest["head"] and latest["head"] != seed:
+            return latest, "the head moved while waiting for CI: it was %s and is now %s: run the gate again" % (seed, latest["head"])
+        if latest["problems"] or latest["pr_result"] != "pending":
+            return latest, None
+        ids = ", ".join("%s run %s" % (r["workflow"], r["id"]) for r in latest["runs"] if reading.run_result(r) == "pending") or ids
+        if clock() >= limit:
+            return latest, "CI run in flight at the head %s (%s) did not finish within %d minutes: nothing was allowed" % (seed[:8], ids, bound // 60)
 
 
 # ------------------------------------------------------------------------------------------------ the lock and the pass record
@@ -333,6 +407,13 @@ def gate_pass(reading, gh, conf, state, repo, number, holder, pid, clock, sleep,
     lines = []
     facts = read_facts(reading, gh, repo, number, conf)
     allowed, reason, need = decide(facts)
+    if (not allowed and facts["gated"] and not facts["problems"] and facts["state"] == "OPEN" and facts["branch_result"] != "red"
+            and facts["pr_result"] == "pending"):
+        facts, why = wait_in_flight(reading, gh, conf, repo, number, facts, clock, sleep, wait_seconds)
+        if why:
+            return False, [why]
+        lines.append("waited for the CI run in flight at the head %s" % facts["head"][:8])
+        allowed, reason, need = decide(facts)
     if need == "rerun" and facts["gated"] and not facts["problems"]:
         problem = rerun(gh, repo, number, facts["labels"], allow_held)
         if problem:
@@ -362,8 +443,8 @@ def gate_pass(reading, gh, conf, state, repo, number, holder, pid, clock, sleep,
         release(state, repo, facts["branch"], holder)
         return False, lines + ["the branch or the head moved while the gate ran: run it again"]
     record_pass(state, repo, number, head, tip, facts["branch"], holder, clock())
-    return True, lines + ["gate passed for %s#%d at head %s on tip %s; the lock on %s is yours until the merge returns (`merge-gate --release` frees it early)" % (
-        repo, number, head[:8], tip[:8], facts["branch"])]
+    return True, lines + ["gate passed for %s#%d at head %s on tip %s%s; the lock on %s is yours until the merge returns (`merge-gate --release` frees it early)" % (
+        repo, number, head[:8], tip[:8], "; " + facts["legs"][2] if facts["legs"][0] else "", facts["branch"])]
 
 
 def check_merge(reading, gh, conf, state, repo, number, caller, person, waived_head, clock, alive=pid_alive):
@@ -396,4 +477,134 @@ def check_merge(reading, gh, conf, state, repo, number, caller, person, waived_h
     if lock is None or stale or lock.get("holder") != caller:
         who = "nobody holds" if lock is None or stale else "%s holds" % lock.get("holder")
         return False, "merge of %s#%d refused: %s the merge lock on %s; %s" % (repo, number, who, facts["branch"], why), None
+    sizes = size_ceilings.check_merge(os.getcwd(), facts["tip"], facts["head"]) if size_ceilings.available(os.getcwd(), facts["tip"], facts["head"]) else []   # #1605
+    if sizes:
+        return False, "\n".join(["merge of %s#%d refused: it would put a file over its size ceiling in docs/architecture.md" % (repo, number)] + sizes), None
     return True, "%s %s" % (GATE_PASSED, caller), facts["head"]
+
+
+# ------------------------------------------------------------------------------------------------ pass and merge in one process (#1122)
+
+MERGE_FLAGS = ("--squash",)   # the one merge method the shim's gated path allows here; never --admin, never an over-review flag
+
+
+def review_blockers(reviews, head="", decision=""):
+    """The SAME rule as `review_blockers` in shims/gh (a test holds the two equal): the reviewers whose latest decisive review (APPROVED, CHANGES_REQUESTED,
+    DISMISSED) is CHANGES_REQUESTED and still blocks this head (at the head, or its commit or the head unknown, or GitHub's decision says so)."""
+    latest = {}
+    for review in reviews if isinstance(reviews, list) else []:
+        if not isinstance(review, dict):
+            continue
+        author = ((review.get("author") or {}).get("login")) if isinstance(review.get("author"), dict) else None
+        state = str(review.get("state") or "").upper()
+        if author and state in ("APPROVED", "CHANGES_REQUESTED", "DISMISSED"):
+            commit = review.get("commit") if isinstance(review.get("commit"), dict) else {}
+            latest[author] = (state, commit.get("oid") if isinstance(commit.get("oid"), str) else "")
+    blocked = str(decision or "").upper() == "CHANGES_REQUESTED"
+    return sorted(who for who, (state, oid) in latest.items()
+                  if state == "CHANGES_REQUESTED" and (blocked or not oid or not head or oid.lower() == head.lower()))
+
+
+def pass_and_merge(reading, gh, conf, state, repo, number, holder, pid, clock, sleep, allow_held=False, alive=pid_alive, wait_seconds=None):
+    """`merge-gate --pass --merge`: the pass, then, in this same process, a fresh read of the head, the labels and the gates, then `gh pr merge --squash
+    --match-head-commit <head>`. The merge goes through `gh` WITHOUT the own-call marker (`own=False`), so the shim's checks run (a blocking review or a missing pass refuses it); before it, this function reads the reviews itself and refuses a blocking one by name.
+    Any mismatch merges nothing and releases the lock. Returns (exit code, lines, audit); `audit` is the ONE record of the run: the pass, each re-read and the outcome."""
+    ref = "%s#%d" % (repo, number)
+    audit = {"pr": ref, "head": None, "pass": None, "reread": {}, "outcome": None}
+    lines = []
+
+    def done(code, text, outcome):
+        audit["outcome"] = outcome
+        return code, lines + [text], audit
+
+    before = read_facts(reading, gh, repo, number, conf)
+    audit["head"] = before["head"]
+    if before["problems"]:
+        return done(1, "merge-gate --pass --merge refused: unreadable: %s" % before["problems"][0], "refused: unreadable")
+    if is_held(before["labels"]):
+        return done(1, "merge-gate --pass --merge refused: %s is held for the owner: keep the two-step form (`--pass`, then `gh pr merge`)" % ref, "refused: held")
+    ok, pass_lines = gate_pass(reading, gh, conf, state, repo, number, holder, pid, clock, sleep, allow_held=allow_held, alive=alive, wait_seconds=wait_seconds)
+    lines += pass_lines
+    audit["pass"] = "ok" if ok else (pass_lines[-1][:200] if pass_lines else "blocked")
+    if not ok:
+        return done(1, "merge-gate --pass --merge: nothing merged (the gate did not pass)", "refused: gate did not pass")
+    locked = before["gated"]
+    recorded = read_pass(state, repo, number) if locked else None
+    pass_head = recorded["head"] if recorded else before["head"]
+    pass_tip = recorded["tip"] if recorded else before["tip"]
+    now = read_facts(reading, gh, repo, number, conf)
+    head = now["head"]
+    audit["head"] = head or before["head"]
+    problem = None
+    if now["problems"]:
+        problem = ("unreadable", "unreadable: %s" % now["problems"][0])
+        audit["reread"] = {"head": "unreadable", "labels": "unreadable", "gates": "unreadable", "branch": "unreadable"}
+    else:
+        added = sorted(set(now["labels"]) - set(before["labels"]))
+        allowed, reason, _ = decide(now)
+        checks = (("head", head == pass_head and head == before["head"], "the head moved after the pass (passed at %s, now %s)" % (pass_head[:8], head[:8])),
+                  ("labels", not added and not is_held(now["labels"]), "a label appeared after the pass: %s" % ", ".join(added or now["labels"])),
+                  ("gates", allowed, "a gate is no longer ready: %s" % reason),
+                  ("branch", now["tip"] == pass_tip, "the branch %s moved after the pass (passed on %s, now %s)" % (now["branch"], pass_tip[:8], now["tip"][:8])))
+        for name, good, said in checks:
+            audit["reread"][name] = "ok" if good else said
+            if not good and problem is None:
+                problem = (name, said)
+    if problem:
+        if locked:
+            release(state, repo, before["branch"], holder)
+        return done(1, "merge-gate --pass --merge: nothing merged, the lock is released: %s" % problem[1], "refused: %s" % problem[0])
+    rcode, rout, _ = gh(["pr", "view", str(number), "-R", repo, "--json", "reviews,headRefOid,reviewDecision"])
+    try:
+        rdata = json.loads(rout) if rcode == 0 else None
+    except ValueError:
+        rdata = None
+    if not isinstance(rdata, dict):
+        audit["reread"]["reviews"] = "unreadable"
+        if locked:
+            release(state, repo, before["branch"], holder)
+        return done(1, "merge-gate --pass --merge: nothing merged, the lock is released: the reviews could not be read", "refused: reviews unreadable")
+    blockers = review_blockers(rdata.get("reviews"), head, rdata.get("reviewDecision"))
+    audit["reread"]["reviews"] = "ok" if not blockers else "blocking: %s" % ", ".join(blockers)
+    if blockers:
+        if locked:
+            release(state, repo, before["branch"], holder)
+        return done(10, "merge-gate --pass --merge: nothing merged, the lock is released: %s requested changes (CHANGES_REQUESTED) at the head %s" % (", ".join(blockers), head[:8]),
+                    "refused: blocking review")
+    code, out, err = gh(["pr", "merge", str(number), "-R", repo] + list(MERGE_FLAGS) + ["--match-head-commit", head], own=False)
+    if locked:
+        release(state, repo, before["branch"], holder)   # the shim frees it too; both are harmless
+    if code != 0:
+        said = (err or out or "").strip().splitlines()
+        audit["merge_exit"] = code
+        audit["merge_said"] = (said[0] if said else "no message")[:300]
+        if code == 10:
+            return done(10, "merge-gate --pass --merge: the merge was refused or failed (exit %d), the lock is released: %s" % (code, (said[0] if said else "no message")[:300]),
+                        "refused: merge exit %d" % code)
+        try:
+            mcode, mout, _ = gh(["pr", "view", str(number), "-R", repo, "--json", "state,headRefOid,mergeCommit"])
+        except Exception:
+            mcode, mout = 1, ""
+        try:
+            mdata = json.loads(mout) if mcode == 0 else None
+        except (TypeError, ValueError):
+            mdata = None
+        if isinstance(mdata, dict) and not isinstance(mdata.get("state"), str):
+            mdata = None
+        seen = "could not be read"
+        if isinstance(mdata, dict):
+            seen = "%s at head %s" % (mdata.get("state"), str(mdata.get("headRefOid"))[:8]) if mdata.get("headRefOid") else "%s (no head given)" % mdata.get("state")
+            if mdata.get("state") == "MERGED" and mdata.get("headRefOid") == head:
+                audit["merge_state"] = seen
+                return done(0, "merged %s at head %s (squash); gh exited %d: %s" % (ref, head[:8], code, audit["merge_said"]), "merged")
+        audit["merge_state"] = seen
+        try:
+            now = clock()
+            if not isinstance(now, (int, float)) or isinstance(now, bool) or not math.isfinite(now) or now < 0:
+                raise ValueError("clock")
+            stamp = time.strftime("%H:%M:%SZ", time.gmtime(now))
+        except Exception:
+            stamp = "an unknown time"
+        return done(1, "merge-gate --pass --merge: refused or failed (exit %d), the pull request state is unknown at %s (%s): read the pull request: %s" % (
+            code, stamp, seen, audit["merge_said"]), "refused: merge exit %d" % code)
+    return done(0, "merged %s at head %s (squash, --match-head-commit)" % (ref, head[:8]), "merged")

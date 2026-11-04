@@ -1,0 +1,24 @@
+# The test files outside bin/ (cloud/, plugins/, tests/) and how CI runs each: the sibling of bin/ci-test-files.txt (#1502).
+# `bin/test-switchboard` (TestCiOutsideBin) derives the files from the directory tree and fails a file that is in no row and not run by a rule row,
+# a row whose step is not in .github/workflows/test.yml, and an exempt row without a written reason.
+# Format, one row per line:
+#   chain <chain file> | <script>        every path the chain file lists is run by the workflow step that runs <script>
+#   loader <runner> | <what it loads>    a test file whose module name the runner (an executable bin/test-* script) names as a string is run by it
+#   run <path> | <how>                   the workflow has a step that runs this path: a `node --test` line, or the script itself with `2>&1`
+#   exempt <path> | <why it is not run: at least 20 characters>
+chain bin/test-cloud-launcher.chain | bin/test-cloud-launcher
+loader bin/test-switchboard | tests/switchboard/test_*.py and tests/test_*.py, loaded by name
+run cloud/tests/test-cloud | its own step
+run plugins/fleet-decisions-tui/click.test.mjs | node --test
+run plugins/fleet-decisions-tui/health.test.mjs | node --test
+run plugins/fleet-decisions-tui/kind.test.mjs | node --test
+run plugins/fleet-hooks/index.test.mjs | node --test
+exempt cloud/launcher/tests/test_cloud_pod_deadline.py | named in bin/test-cloud-launcher EXCEPTIONS as slow (26 s), not yet chained
+exempt cloud/launcher/tests/test_cloud_stop_nonce.py | named in bin/test-cloud-launcher EXCEPTIONS as slow (57 s), not yet chained
+exempt cloud/launcher/tests/test_reaper_record_family.py | named in bin/test-cloud-launcher EXCEPTIONS: did not finish in 120 s, not yet chained
+exempt cloud/worker/tests/test_guard.py | measured over 100 s on one core, too slow for a chain leg; run it by hand (python3 cloud/worker/tests/test_guard.py)
+exempt plugins/opencode-todolist/tests/plugin.test.ts | a TypeScript test: the workflow installs no TypeScript runner (no bun, no setup-node), so CI cannot run it
+exempt plugins/opencode-todolist/tests/timing.test.ts | a TypeScript test: the workflow installs no TypeScript runner (no bun, no setup-node), so CI cannot run it
+exempt plugins/opencode-todolist/tests/todolist.test.ts | a TypeScript test: the workflow installs no TypeScript runner (no bun, no setup-node), so CI cannot run it
+exempt plugins/opencode-todolist/tests/tui-data.test.ts | a TypeScript test: the workflow installs no TypeScript runner (no bun, no setup-node), so CI cannot run it
+exempt plugins/opencode-todolist/tests/tui-settings.test.ts | a TypeScript test: the workflow installs no TypeScript runner (no bun, no setup-node), so CI cannot run it

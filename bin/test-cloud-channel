@@ -73,7 +73,7 @@ def request(token="tok-a", sender="agent-a", key="k1", recipient="agent-b", text
 
 def run(module, req):
     inbox, lines = FakeInbox(), []
-    answer = module.handle(req, reviewer_for(TABLE), inbox, lines.append)
+    answer = module.handle(req, reviewer_for(TABLE), inbox, lines.append, namespace="fleet-agents")
     return answer, inbox, lines
 
 
@@ -87,7 +87,7 @@ def check_sender_is_the_token(module, test):
 def check_one_item_for_a_repeated_key(module, test):
     inbox, lines = FakeInbox(), []
     for _ in range(2):
-        answer = module.handle(request(), reviewer_for(TABLE), inbox, lines.append)
+        answer = module.handle(request(), reviewer_for(TABLE), inbox, lines.append, namespace="fleet-agents")
         test.assertEqual(answer["status"], 200)
     test.assertEqual(inbox.count("agent-b", "k1"), 1)
 
@@ -112,7 +112,7 @@ def check_fails_closed(module, test):
     def broken(token, audience):
         raise OSError("cluster down")
     inbox, lines = FakeInbox(), []
-    answer = module.handle(request(), broken, inbox, lines.append)
+    answer = module.handle(request(), broken, inbox, lines.append, namespace="fleet-agents")
     test.assertEqual(answer["status"], 503)
     test.assertEqual((inbox.items, len(lines)), ({}, 1))
     test.assertIn("OSError", lines[0])
@@ -121,7 +121,7 @@ def check_fails_closed(module, test):
 def check_dedupe_is_per_sender(module, test):
     inbox = FakeInbox()
     for token, sender in (("tok-a", "agent-a"), ("tok-c", "agent-c")):
-        answer = module.handle(request(token=token, sender=sender), reviewer_for(TABLE), inbox, lambda line: None)
+        answer = module.handle(request(token=token, sender=sender), reviewer_for(TABLE), inbox, lambda line: None, namespace="fleet-agents")
         test.assertEqual(answer["delivered"], True, sender)
     test.assertEqual(inbox.count("agent-b", "k1"), 2)
 
@@ -131,7 +131,7 @@ def check_newline_names_are_refused(module, test):
     test.assertEqual(answer["status"], 400)
     test.assertEqual(inbox.items, {})
     ns = dict(TABLE, **{"tok-nl": ok("agent-a\n")})
-    answer = module.handle(request(token="tok-nl", sender="agent-a\n"), reviewer_for(ns), FakeInbox(), lambda line: None)
+    answer = module.handle(request(token="tok-nl", sender="agent-a\n"), reviewer_for(ns), FakeInbox(), lambda line: None, namespace="fleet-agents")
     test.assertEqual(answer["status"], 401)
 
 
@@ -140,7 +140,7 @@ def check_inbox_failure_is_a_503(module, test):
         def put_if_absent(self, *args):
             raise OSError("disk")
     lines = []
-    answer = module.handle(request(), reviewer_for(TABLE), Broken(), lines.append)
+    answer = module.handle(request(), reviewer_for(TABLE), Broken(), lines.append, namespace="fleet-agents")
     test.assertEqual(answer["status"], 503)
     test.assertEqual(len(lines), 1)
     test.assertIn("OSError", lines[0])
@@ -148,7 +148,7 @@ def check_inbox_failure_is_a_503(module, test):
 
 def check_token_is_capped(module, test):
     seen = []
-    answer = module.handle(request(token="t" * 5000), lambda t, a: seen.append(t) or ok("agent-a"), FakeInbox(), lambda line: None)
+    answer = module.handle(request(token="t" * 5000), lambda t, a: seen.append(t) or ok("agent-a"), FakeInbox(), lambda line: None, namespace="fleet-agents")
     test.assertEqual((answer["status"], seen), (401, []))
 
 
@@ -202,17 +202,17 @@ class TestChannel(unittest.TestCase):
 
     def test_a_non_dict_reviewer_answer_and_a_missing_body_are_refused(self):
         inbox = FakeInbox()
-        self.assertEqual(load().handle(request(), lambda t, a: ["x"], inbox, lambda line: None)["status"], 401)
-        self.assertEqual(load().handle({"authorization": "Bearer tok-a"}, reviewer_for(TABLE), inbox, lambda line: None)["status"], 400)
+        self.assertEqual(load().handle(request(), lambda t, a: ["x"], inbox, lambda line: None, namespace="fleet-agents")["status"], 401)
+        self.assertEqual(load().handle({"authorization": "Bearer tok-a"}, reviewer_for(TABLE), inbox, lambda line: None, namespace="fleet-agents")["status"], 400)
 
     def test_the_same_keyed_message_twice_leaves_one_item(self):
         check_one_item_for_a_repeated_key(load(), self)
 
     def test_the_repeat_says_it_is_a_duplicate_and_a_new_key_is_delivered(self):
         inbox, lines = FakeInbox(), []
-        first = load().handle(request(), reviewer_for(TABLE), inbox, lines.append)
-        again = load().handle(request(), reviewer_for(TABLE), inbox, lines.append)
-        other = load().handle(request(key="k2"), reviewer_for(TABLE), inbox, lines.append)
+        first = load().handle(request(), reviewer_for(TABLE), inbox, lines.append, namespace="fleet-agents")
+        again = load().handle(request(), reviewer_for(TABLE), inbox, lines.append, namespace="fleet-agents")
+        other = load().handle(request(key="k2"), reviewer_for(TABLE), inbox, lines.append, namespace="fleet-agents")
         self.assertEqual((first["delivered"], again["delivered"], again["duplicate"], other["delivered"]), (True, False, True, True))
         self.assertEqual(inbox.items["agent-b"][0]["sender"], "agent-a")
         self.assertEqual(len(lines), 2)   # one line per delivery, none for the duplicate
@@ -237,7 +237,7 @@ class TestChannel(unittest.TestCase):
 
     def test_the_audience_is_passed_to_the_reviewer(self):
         seen = []
-        load().handle(request(), lambda t, a: seen.append(a) or ok("agent-a"), FakeInbox(), lambda line: None)
+        load().handle(request(), lambda t, a: seen.append(a) or ok("agent-a"), FakeInbox(), lambda line: None, namespace="fleet-agents")
         self.assertEqual(seen, ["fleet-switchboard"])
 
     def test_a_malformed_body_is_a_400_after_the_identity_checks(self):

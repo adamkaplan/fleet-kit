@@ -104,13 +104,16 @@ def _m_caps(p): p["spec"]["containers"][0]["securityContext"]["capabilities"]["a
 def _m_ctx(p): p["spec"]["containers"][0]["securityContext"]["capabilities"]["add"] = ["NET_RAW"]
 def _m_shape(p): p["spec"]["runtimeClassName"] = "runc"
 def _m_rest(p): p["spec"]["nodeName"] = "node-1"
+def _m_prestop(p): p["spec"]["terminationGracePeriodSeconds"] = 30
 def _m_token(p): p["spec"]["automountServiceAccountToken"] = True
 
 
+PRESTOP = "pre-stop lifecycle or termination grace differs from the launcher's"
 REST = "stack pod has a field or object outside the stack allow-list"
 MUTANTS = {"hostPath": _m_hostpath, "docker.sock": _m_sock, "privileged": _m_priv, "hostNetwork": _m_net, "hostPID": _m_pid,
            "hostIPC": _m_ipc, "hostUsers true": _m_users, "capabilities add SYS_ADMIN/ALL": _m_caps, "service-account token": _m_token,
-           "stack security context differs from STACK_SECURITY_CONTEXT": _m_ctx, "stack pod shape differs": _m_shape, REST: _m_rest}
+           "stack security context differs from STACK_SECURITY_CONTEXT": _m_ctx, "stack pod shape differs": _m_shape, REST: _m_rest,
+           PRESTOP: _m_prestop}
 STACK_ONLY = {"stack security context differs from STACK_SECURITY_CONTEXT", "stack pod shape differs", REST}
 ALLOW = sorted(STACK_ONLY)
 
@@ -640,7 +643,7 @@ class StackRestAllowList(unittest.TestCase):
             with self.subTest(field=name):
                 pod = build(_args(stack=True))
                 mutate(pod)
-                self.assertTrue({cw_row for cw_row in cw.forbidden_pod_fields(pod)} & {REST, "stack pod shape differs", "stack security context differs from STACK_SECURITY_CONTEXT"}, name)
+                self.assertTrue({cw_row for cw_row in cw.forbidden_pod_fields(pod)} & {REST, PRESTOP, "stack pod shape differs", "stack security context differs from STACK_SECURITY_CONTEXT"}, name)
 
     def test_the_same_pod_is_fine_without_the_stack(self):   # the rows are for stack pods only (the default pod is pinned by U1)
         pod = build(_args(stack=False))

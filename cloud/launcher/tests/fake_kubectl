@@ -185,6 +185,15 @@ elif cmd == "get" and args[1] == "pods":
         k, v = args[args.index("-l") + 1].split("=", 1)
         items = [p for p in items if p["metadata"].get("labels", {}).get(k) == v]
     print(json.dumps({"items": items}))
+elif cmd == "get" and args[1] == "nodes":
+    # the nodes of the cluster: the summary reads their pool label, their size label and their creation time. A login without `list` on
+    # nodes is refused by the API server, exactly as a real one is.
+    if st.get("fail_nodes"):
+        print("Error from server (Forbidden): nodes is forbidden: the login may not list the nodes of the cluster", file=sys.stderr); sys.exit(1)
+    print(json.dumps({"items": st.get("nodes", [])}))
+elif cmd == "create" and args[1:2] == ["token"]:
+    # the narrow login's token: the switchboard mints one per command. A fake value, never a real credential.
+    print(st.get("token", "fake-cluster-token"))
 elif cmd == "patch" and args[1] == "pod":
     assert "--patch-file=/dev/stdin" in args, "a patch must come from stdin"
     patch = json.loads(sys.stdin.read())

@@ -1,4 +1,4 @@
 {
  "command": "read",
- "help": "usage: fleet-switchboard read [-h] [--limit LIMIT] name positional arguments: name The agent's fleet name options: -h, --help show this help message and exit --limit LIMIT How many messages (default 20, at most 200)"
+ "help": "usage: fleet-switchboard read [-h] [--cloud-only] [--limit LIMIT] name positional arguments: name The agent's fleet name options: -h, --help show this help message and exit --cloud-only Require a cloud record for NAME; never fall to a local agent of that name --limit LIMIT How many messages (default 20, at most 200)"
 }

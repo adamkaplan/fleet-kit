@@ -36,6 +36,19 @@ export const isNotice = (d) => d.kind === "notice"
 // `pr:org/repo#N`). Its link is the PR's, built from its repo and number like a heads-up's.
 export const isPrRow = (d) => d.kind === "notice" || d.kind === "captain"
 
+// ---- the kind marker: every row starts with ONE emoji for its kind. THE table of the symbols (the owner may change them here).
+export const KIND_MARKS = { pr: "\u{1F500}", plan: "\u{1F4CB}", noplan: "\u{1F4DD}", unknown: "\u2754" }
+// The kind of a row: a pull request row is a pull request; an issue row is what the daemon read of its plan comment
+// ("plan" or "noplan"); anything else, or a value not in the table, is unknown, never a guess.
+export function kindOf(d) {
+  if (!d) return "unknown"
+  if (isPrRow(d)) return "pr"
+  if (d.kind === "issue" && (d.plan_kind === "plan" || d.plan_kind === "noplan")) return d.plan_kind
+  return "unknown"
+}
+export const MARK_CELLS = 3   // the emoji is 2 cells wide, plus its space: a row has that much less room
+export const markOf = (d) => KIND_MARKS[kindOf(d)]
+
 // The decisions a view shows. A decision with no tier (a file an older daemon wrote) is the human's.
 export function selectFor(decisions, view) {
   const real = decisions.filter((d) => !isNotice(d))
@@ -63,6 +76,14 @@ export function urlOf(d) {
   const n = typeof raw === "number" || typeof raw === "string" ? String(raw) : ""
   if (!NUMBER_PATTERN.test(n)) return null
   return `https://github.com/${d.repo}/${isPrRow(d) ? "pull" : "issues"}/${n}`
+}
+
+// The short code of an item, `<repository-name>:#<number>` (owner dropped), or null. The ONE place a short code is built.
+export function shortCodeOf(d) {
+  const url = urlOf(d)
+  if (!url) return null
+  const m = url.match(/^https:\/\/github\.com\/[^/]+\/([^/]+)\/(?:issues|pull)\/([0-9]+)$/)
+  return m ? `${m[1]}:#${m[2]}` : null
 }
 
 // Text safe to put on a line the terminal draws: every control character except tab and line breaks (which wrap
@@ -239,11 +260,12 @@ export function entryOf(decision, nowMs, width = ROW_WIDTH) {
   const via = Array.isArray(decision.reported_by) && decision.reported_by.length ? ` ${decision.reported_by.join(",")}` : ""
   // the daemon's headline (an older file has none: its title), never more than HEADLINE_LINES lines
   const text = stripControls(typeof decision.headline === "string" && decision.headline ? decision.headline : decision.title)
-  const entry = { key: decision.id, head: "  ".repeat(depthOf(decision)) + oneLine(`${idOf(decision)} ${age}${via}${orderNote(decision)}`, width - 2 * depthOf(decision)), lines: wrapText(text, width, HEADLINE_LINES) }
+  const entry = { key: decision.id, head: "  ".repeat(depthOf(decision)) + markOf(decision) + " " + oneLine(`${idOf(decision)} ${age}${via}${orderNote(decision)}`, width - MARK_CELLS - 2 * depthOf(decision)), lines: wrapText(text, width, HEADLINE_LINES) }
   // a batch: one line (wrapped to ROW_LINES) per row, between the headline and the id; the daemon wrote each row's text
   const rows = Array.isArray(decision.rows) ? decision.rows.filter((r) => r && typeof r.text === "string") : []
   if (rows.length) entry.rows = rows.map((r) => wrapText(stripControls(r.text), width, ROW_LINES))
   const url = urlOf(decision)
+  if (url) entry.code = shortCodeOf(decision)
   if (url) entry.url = url  // only when there is one: an entry without a link is exactly what it was
   if (isNotice(decision)) entry.facts = wrapText(factsOf(decision), width, FACTS_LINES)  // a heads-up: facts between headline and id
   return entry
@@ -501,7 +523,7 @@ export const styledRows = (snapshot, nowMs, width = ROW_WIDTH, view = HUMAN_VIEW
       items.forEach((d, ei) => {
         const url = urlOf(d)
         const indent = "  ".repeat(depthOf(d))
-        const put = (l) => { const linked = url ? { ...l, url } : l; out.push(indent ? { ...linked, segs: [[indent, ""], ...linked.segs] } : linked) }
+        const put = (l) => { const linked = url ? { ...l, url, code: shortCodeOf(d) } : l; out.push(indent ? { ...linked, segs: [[indent, ""], ...linked.segs] } : linked) }
         const tidyWith = (t) => tidyRefs(stripControls(t), repo, known)
         const headline = tidyWith(typeof d.headline === "string" && d.headline ? d.headline : d.title)
         const age = ageSeg(d)
@@ -512,8 +534,9 @@ export const styledRows = (snapshot, nowMs, width = ROW_WIDTH, view = HUMAN_VIEW
           // a heads-up's headline starts with its own ref, which the id line below says: it is not said twice
           const shownHeadline = isNotice(d) ? headline.replace(/^\S+#\d+\s+/, "") : headline
           const lead = v3 && !isNotice(d) ? [kindGlyph(d), "m"] : null  // one cell and a space: the headline wraps in what is left
-          wrapText(shownHeadline, (lead ? width - 2 : width) - indent.length, HEADLINE_LINES).forEach((t, ti) => {
-            put(lead && ti === 0 ? { segs: [[lead[0] + " ", lead[1]], [t, section.need ? "b" : ""]] } : lead ? { segs: [["  ", ""], [t, section.need ? "b" : ""]] } : row(t, section.need ? "b" : ""))
+          wrapText(shownHeadline, (lead ? width - 2 : width) - MARK_CELLS - indent.length, HEADLINE_LINES).forEach((t, ti) => {
+            const base = lead && ti === 0 ? { segs: [[lead[0] + " ", lead[1]], [t, section.need ? "b" : ""]] } : lead ? { segs: [["  ", ""], [t, section.need ? "b" : ""]] } : row(t, section.need ? "b" : "")
+            put(ti === 0 ? { ...base, segs: [[markOf(d) + " ", ""], ...base.segs] } : base)
           })
           const rows = Array.isArray(d.rows) ? d.rows.filter((r) => r && typeof r.text === "string") : []
           for (const r of rows) for (const t of wrapText(tidyWith(r.text), width, ROW_LINES)) put(row(t, "m"))
@@ -527,7 +550,7 @@ export const styledRows = (snapshot, nowMs, width = ROW_WIDTH, view = HUMAN_VIEW
             put({ segs: left, right: long ? [[GLYPH.long + " ", "w"], [age[0], "w+t"]] : [[age[0], "m+t"]], id: d.id })
           } else put({ segs: left, right: [age], id: d.id })
         } else {
-          const room = Math.max(8, width - age[0].length - 1 - (v3 ? 2 : 0))
+          const room = Math.max(8, width - MARK_CELLS - age[0].length - 1 - (v3 ? 2 : 0))
           const flatText = oneLine(headline, room)
           const failing = d.ci === "failing" || d.ci === "failed"
           const ready = refStyle(d) === "s"
@@ -540,7 +563,7 @@ export const styledRows = (snapshot, nowMs, width = ROW_WIDTH, view = HUMAN_VIEW
               ? [[(failing ? GLYPH.failing : ready ? GLYPH.ready : GLYPH.pr) + " ", failing ? "e" : ready ? "s" : "m"], [ref, hue], [body, ""]]
               : [[kindGlyph(d) + " ", "m"], [flatText, ""]]
           })() : isNotice(d) && refStyle(d) ? (() => { const cut = flatText.indexOf(" "); return cut > 0 ? [[flatText.slice(0, cut), refStyle(d)], [flatText.slice(cut), ""]] : [[flatText, refStyle(d)]] })() : [[flatText, ""]]
-          put({ segs, right: v3 ? [[age[0], age[1] === "m" ? "m+t" : "w+t"]] : [age], id: d.id })
+          put({ segs: [[markOf(d) + " ", ""], ...segs], right: v3 ? [[age[0], age[1] === "m" ? "m+t" : "w+t"]] : [age], id: d.id })
           if (v3 && isNotice(d) && Number.isInteger(d.additions) && Number.isInteger(d.deletions) && d.additions + d.deletions >= BIG_CHANGE_LINES)
             put({ segs: [["  ", ""], [`+${d.additions}`, "a"], ["/", "m"], [`-${d.deletions}`, "r"]] })
         }

@@ -79,7 +79,7 @@ def listen_address(environ):
     return match.group(1), int(match.group(2))
 
 
-def make_server(address, reviewer, inbox, audit, max_handlers=None):
+def make_server(address, reviewer, inbox, audit, max_handlers=None, *, namespace):
     """A server bound to address (not started). Raises ValueError when address is None: not configured, no listener."""
     if address is None:
         raise ValueError("cloud channel listener is not configured (%s)" % LISTEN_ENV)
@@ -165,23 +165,23 @@ def make_server(address, reviewer, inbox, audit, max_handlers=None):
                 # judge the token first: handle() with an empty body stops right after authentication (403 for a good
                 # token, 401/503 otherwise); only an unauthenticated verdict is returned, with its own audit line
                 seen = []
-                probe = cloud_channel.handle({"authorization": header, "body": {}}, reviewer, inbox, seen.append)
+                probe = cloud_channel.handle({"authorization": header, "body": {}}, reviewer, inbox, seen.append, namespace=namespace)
                 if probe["status"] in (401, 503):
                     for line in seen:
                         audit(line)
                     return self._send(probe["status"], probe)
                 audit("refused status=%d reason=%s" % (refusal[0], refusal[2]))
                 return self._send(refusal[0], {"status": refusal[0], "error": refusal[1]})
-            result = cloud_channel.handle({"authorization": header, "body": body}, reviewer, inbox, audit)
+            result = cloud_channel.handle({"authorization": header, "body": body}, reviewer, inbox, audit, namespace=namespace)
             self._send(result["status"], result)
 
     return _Server(address, Handler, max_handlers or MAX_HANDLERS, audit)
 
 
-def serve(environ, reviewer, inbox, audit):
+def serve(environ, reviewer, inbox, audit, *, namespace):
     """Start listening when configured (blocks); returns False without binding anything when it is not."""
     address = listen_address(environ)
     if address is None:
         return False
-    make_server(address, reviewer, inbox, audit).serve_forever()
+    make_server(address, reviewer, inbox, audit, namespace=namespace).serve_forever()
     return True

@@ -4,6 +4,7 @@
     "kind": "Pod",
     "metadata": {
       "annotations": {
+        "cluster-autoscaler.kubernetes.io/safe-to-evict": "false",
         "cw/hard-deadline": "2026-10-14T14:00:00Z",
         "cw/idle-seconds": "600",
         "cw/max-hard": "2026-10-14T20:00:00Z",
@@ -54,6 +55,16 @@
             }
           ],
           "image": "registry.example.internal/worker:1",
+          "lifecycle": {
+            "preStop": {
+              "exec": {
+                "command": [
+                  "/usr/local/bin/cw-prestop",
+                  "45"
+                ]
+              }
+            }
+          },
           "name": "worker",
           "readinessProbe": {
             "tcpSocket": {
@@ -64,6 +75,10 @@
             "limits": {
               "cpu": "2",
               "memory": "4Gi"
+            },
+            "requests": {
+              "cpu": "500m",
+              "memory": "2Gi"
             }
           },
           "securityContext": {
@@ -102,6 +117,7 @@
         }
       },
       "serviceAccountName": "cw-worker",
+      "terminationGracePeriodSeconds": 60,
       "volumes": [
         {
           "name": "pw",
@@ -134,6 +150,7 @@
     "kind": "Pod",
     "metadata": {
       "annotations": {
+        "cluster-autoscaler.kubernetes.io/safe-to-evict": "false",
         "cw/hard-deadline": "2026-10-14T14:00:00Z",
         "cw/idle-seconds": "600",
         "cw/max-hard": "2026-10-14T20:00:00Z",
@@ -185,6 +202,16 @@
             }
           ],
           "image": "registry.example.internal/worker:1",
+          "lifecycle": {
+            "preStop": {
+              "exec": {
+                "command": [
+                  "/usr/local/bin/cw-prestop",
+                  "45"
+                ]
+              }
+            }
+          },
           "name": "worker",
           "readinessProbe": {
             "tcpSocket": {
@@ -238,6 +265,7 @@
         }
       },
       "serviceAccountName": "cw-worker",
+      "terminationGracePeriodSeconds": 60,
       "volumes": [
         {
           "name": "pw",

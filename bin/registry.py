@@ -19,6 +19,11 @@ import os
 import time
 from pathlib import Path
 
+import importlib.util as _ilu
+_spec = _ilu.spec_from_file_location("record_json", str(Path(__file__).resolve().parent / "record_json.py"))
+_record_json = _ilu.module_from_spec(_spec)
+_spec.loader.exec_module(_record_json)   # the shared bounded-depth parse (#1314): registry.json and retired.json are record files another process can write
+
 VERSION = 1
 FILE = "registry.json"
 LOCK = "registry.lock"
@@ -84,7 +89,7 @@ def _parse(raw):
     if len(raw) > MAX_BYTES:
         return _empty(False, "%s is too large: nothing read" % FILE)
     try:
-        doc = json.loads(raw.decode("utf-8"))
+        doc = _record_json.parse_bounded(raw.decode("utf-8"))
     except (ValueError, UnicodeError):
         return _empty(False, "%s is not valid JSON: nothing read" % FILE)
     if not isinstance(doc, dict) or not _is_int(doc.get("version")):
@@ -130,7 +135,7 @@ def _old_retired(state_dir):
     except OSError as err:
         return {}, "%s cannot be read (%s)" % (RETIRED_DERIVED, getattr(err, "strerror", None) or type(err).__name__)
     try:
-        data = json.loads(raw.decode("utf-8"))
+        data = _record_json.parse_bounded(raw.decode("utf-8"))
     except (ValueError, UnicodeError):
         return {}, "%s is not valid JSON" % RETIRED_DERIVED
     if not isinstance(data, dict) or len(raw) > 1000000 or not all(isinstance(v, dict) for v in data.values()):
@@ -407,6 +412,19 @@ def endpoint_problem(fields):
     return None
 
 
+NO_PANE_KINDS = ("cloud", "orchestrator")
+
+
+def no_pane_to_judge(row):
+    """THE predicate (#1181): this row has no pane to judge. A row of kind `cloud` or `orchestrator` (with or without an endpoint), or a row that holds an
+    endpoint and no pane. Every supervising reader of the dead verdict or the missing count asks it; none reads such a row as dead (PC-1)."""
+    if not isinstance(row, dict):
+        return False
+    if row.get("kind") in NO_PANE_KINDS:
+        return True
+    return row.get("endpoint") is not None and not row.get("pane")
+
+
 def route_for(row):
     """Where a message to this agent WOULD go (a function only: send does not call it yet): its pane when it has one (as before), else its registry endpoint; None when neither."""
     if not isinstance(row, dict):
@@ -425,6 +443,13 @@ def upsert(state_dir, name, agent, now=None):
         if covers(doc["retired"].get(name), (agent or {}).get("session")):
             return False, [], "%s is retired for this session" % name
         fields = dict(agent or {})
+        if (fields.get("kind") or (old or {}).get("kind") or "local") != "local" and fields.get("pane"):
+            return False, [], "%s is not a local agent: a cloud worker has no pane (refused pane %s)" % (name, fields["pane"])
+        if fields.get("pane"):
+            for other, row in doc["agents"].items():   # a pane bound to a LIVE agent is never rebound to another (#1066)
+                if other != name and isinstance(row, dict) and row.get("pane") == fields["pane"] and (row.get("kind") or "local") == "local" \
+                        and row.get("state") not in ("dead", "detached"):
+                    return False, [], "pane %s is bound to the live agent %s: refused to bind it to %s" % (fields["pane"], other, name)
         refused = endpoint_problem(fields)
         if refused:
             return False, [], refused
@@ -544,6 +569,22 @@ def migrate_bell(state_dir, belled_panes, whole, now=None):
     return {"changed": count[0], "problem": got["problem"], "ran": True}
 
 
+def no_pane_by_both_rules(row):
+    """A row BOTH old rules call pane-less: `no_pane_to_judge(row)` and the registry's old test (no pane, an endpoint). The one copy, used by shows_dead and reconcile_remove."""
+    return no_pane_to_judge(row) and row.get("pane") is None and row.get("endpoint") is not None
+
+
+def shows_dead(row, evidence):
+    """THE registry-side dead verdict: does the evidence show this row dead? A row with no pane to judge (`no_pane_to_judge`): only the bounded
+    endpoint check answering "dead". Any other row: its recorded state is `dead` and the pane and the process were both checked absent (an unchecked
+    part, None, is not absence). Evidence that is not a dict shows nothing."""
+    if not isinstance(evidence, dict):
+        return False
+    if no_pane_by_both_rules(row):
+        return evidence.get("endpoint_verdict") == "dead"
+    return row.get("state") == "dead" and evidence.get("pane_listed") is False and evidence.get("process_found") is False
+
+
 def reconcile_remove(state_dir, name, evidence, whole):
     """Remove a DEAD agent. Refuses unless `whole` is True AND the registry's own check of the evidence shows it dead: the agent's recorded state is
     `dead`, and the live read lacked its pane (`evidence["pane_listed"]` false) and its process (`evidence["process_found"]` false)."""
@@ -551,14 +592,13 @@ def reconcile_remove(state_dir, name, evidence, whole):
         row = doc["agents"].get(name)
         if row is None:
             return False, [], None
-        if row.get("pane") is None and row.get("endpoint") is not None:   # a no-pane row: removed only on a bounded check's evidence of death (the same function, one verdict)
-            if not isinstance(evidence, dict) or evidence.get("endpoint_verdict") != "dead":
+        if no_pane_by_both_rules(row):   # a no-pane row: removed only on a bounded check's evidence of death (shows_dead, one verdict)
+            if not shows_dead(row, evidence):
                 why = "%s has no pane and no evidence of death for its endpoint: nothing removed" % name
                 return False, [{"event": "reconcile_refused", "name": name, "evidence": evidence if isinstance(evidence, dict) else None, "why": why}], why
             doc["agents"].pop(name)
             return True, [{"event": "reconcile_remove", "name": name, "evidence": evidence, "session": row.get("session")}], None
-        if row.get("state") != "dead" or not isinstance(evidence, dict) or evidence.get("pane_listed") is not False \
-                or evidence.get("process_found") is not False:
+        if not shows_dead(row, evidence):
             why = "%s is not shown dead by the evidence: nothing removed" % name
             return False, [{"event": "reconcile_refused", "name": name, "evidence": evidence if isinstance(evidence, dict) else None, "why": why}], why
         doc["agents"].pop(name)

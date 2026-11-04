@@ -1,5 +1,5 @@
 {
- "audit": "{\"action\": \"stop\", \"actor\": \"<ACTOR>\", \"cost_estimate_usd\": 0.0, \"ok\": true, \"reason\": \"operator; run record <RECORD>\", \"runtime_id\": \"pod/coder7-ffda\", \"ts\": \"2026-10-14T12:00:00Z\", \"worker\": \"coder7\"}",
+ "audit": "{\"action\": \"stop\", \"actor\": \"<ACTOR>\", \"cost_estimate_usd\": 0.0, \"ok\": true, \"reason\": \"operator; run record <RECORD>\", \"refresh\": \"none\", \"runtime_id\": \"pod/coder7-ffda\", \"ts\": \"2026-10-14T12:00:00Z\", \"worker\": \"coder7\"}",
  "code": 0,
  "files": [
   "run.json",

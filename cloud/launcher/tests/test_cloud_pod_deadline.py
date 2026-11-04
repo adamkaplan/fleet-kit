@@ -50,6 +50,7 @@ class PodDeadline(base.Base):
         self.create()
         spec = dict(self.applied_pod()["spec"])
         self.assertEqual(spec.pop("activeDeadlineSeconds"), 8 * 3600 + 300)
+        self.assertEqual(spec.pop("terminationGracePeriodSeconds"), cw.POD_TERMINATION_GRACE_SECONDS)
         self.assertEqual(sorted(spec), sorted(["restartPolicy", "serviceAccountName", "automountServiceAccountToken",
                                               "securityContext", "containers", "volumes"]))
 
