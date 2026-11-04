@@ -494,6 +494,7 @@ class TestReplay(HeaderCacheBase):
     """S7: a SYNTHETIC hour of the shape of the audit hour 01:00-02:00Z of 29 Oct (the recorded hour is private): the command kinds and counts, neutral issue numbers."""
     HOUR = (("send", 548), ("remind", 113), ("plan", 22), ("comment", 16), ("verdict", 14), ("notice", 12), ("send", 13))   # v2.synthetic, reminder.add, plan.approved, github.comment, plan.proof, notice.pr, cloud.send
     ISSUES = 60
+    OFF = {}
 
     def replay(self, cache_on, shape):
         """(budget-counted reads, plain request count) of the synthetic hour. shape: "burst" (an ask is worked in a burst), "uniform" (each issue hit evenly over the hour: command i at i/N of the hour, issue i mod 60) or "random" (random issue and time)."""
@@ -523,10 +524,12 @@ class TestReplay(HeaderCacheBase):
         return plain - (self.gh.not_modified - free), plain
 
     def figures(self, shape):
-        without = self.replay(False, shape)
-        self.tmp.cleanup()
-        self.tmp = tempfile.TemporaryDirectory()
-        os.environ["XDG_STATE_HOME"] = self.tmp.name
+        without = self.OFF.get(shape)   # the cache-off run is deterministic and never reads the validator: one per shape per class
+        if without is None:
+            without = self.OFF[shape] = self.replay(False, shape)
+            self.tmp.cleanup()
+            self.tmp = tempfile.TemporaryDirectory()
+            os.environ["XDG_STATE_HOME"] = self.tmp.name
         with_cache = self.replay(True, shape)
         print("\nS7 replay (%s%s): budget-counted without the cache %d, with it %d (%.2f%%); plain requests without %d, with %d (of which %d answered 304)"
               % (shape, {"burst": ", the burst shape", "uniform": ", evenly spread", "random": ", random spread"}[shape], without[0], with_cache[0], 100.0 * with_cache[0] / without[0], without[1], with_cache[1], with_cache[1] - with_cache[0]))
