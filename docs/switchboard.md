@@ -3844,7 +3844,7 @@ into individual model calls; forking sessions; changes to `fleet-heartbeat`.
   - **Intent lines replace quotes and threads.** Telephone drift happens
     mostly on the way back up, from orchestrator reports. Quotes captured only
     one side of a conversation, and threads duplicated what a GitHub issue
-    already is. Instead, each issue carries a one-line Intent and Done-when,
+    already is. Instead, each issue carries a one-line Intent and a Done-when (a line or a numbered list),
     every message about it carries those lines in both directions, and changes
     to them are surfaced. PR 6 is now `switchboard/intent`; PR 2 is now
     `switchboard/delivery`.

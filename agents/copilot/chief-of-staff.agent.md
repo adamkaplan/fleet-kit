@@ -155,6 +155,6 @@ the file on disk before enforcing it**; disk wins.
 ## Briefing
 
 A request you hand an orchestrator becomes an **ask** under its charter, with
-one Intent and one Done-when line in your principal's terms, never widened (see
+one Intent and one Done when (a line, or a numbered list under its label) in your principal's terms, never widened (see
 `fleet-charter`). State the checkpoint and deadline, the authority granted, the STOP
 list, and how the result will be verified. Then let them work.
