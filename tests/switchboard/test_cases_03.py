@@ -47,6 +47,7 @@ import urllib.parse
 from unittest import mock
 from support.core import Base, FakeRunner, SAFE_PATH
 from support.fake_jev import FakeOpener, JEV_SETTINGS, jev_reply, noul_answers
+from support.helper_fakes import ReaperOnlyFakes
 from support.installs_and_keys import InstallCase, KeyCase, PR16_KEY, tree_of
 from support.loader import SWITCHBOARD, SWITCHBOARD_SOURCE_FILES, captured, class_source, sb, sc, switchboard_source
 from support.orders_and_adapters import EA, ExternalAdapterCase, FakeDoorServer, FakeWorkHost, FakeWorkSink, fake_mapping, report, worker
@@ -1012,95 +1013,6 @@ class TestTodolistPlugin(Base):
         self.assertEqual(self.loader.read_text(), "// mine\n")
 
 
-class ReaperOnlyFakes:
-    """The reaper-only install (ask #982): the parser's own arguments, the fake machine, the fake home."""
-
-    # A file the LAUNCHER's own reader accepts: a digest image, an https server with a DNS host, a GUID subscription.
-    CLOUD_ENV_GOOD = ("CW_ALLOWED_REPOS=acme-org/widget-service\nCW_CLOUD_IMAGE=registry.acme.example/widget@sha256:" + "ab" * 32 + "\n"
-                      "CW_CLOUD_SERVER=https://api.acme.example:6443\nCW_CLOUD_NAMESPACE=acme-cw\n"
-                      "CW_VAULT_NAME=acme-vault\nCW_VAULT_SUBSCRIPTION=00000000-0000-4000-8000-000000000001\n")
-
-    def ensure_cloud_env(self, text=None, mode=0o600):
-        """The settings file the reaper-only install requires, as a good one: 0600, the user's own, the cluster login names
-        and the vault names (the token file name comes from the environment of the install, set here for the test).
-        Written only when there is none yet. Returns its path."""
-        path = sb.cloud_settings_path()
-        patcher = mock.patch.dict(os.environ, {"CW_CLOUD_TOKEN_FILE": "/home/user/.cw/token"})
-        patcher.start()
-        self.addCleanup(patcher.stop)
-        if not path.exists():
-            path.parent.mkdir(parents=True, exist_ok=True)
-            os.chmod(str(path.parent), 0o700)   # the launcher refuses a directory others can write, whatever the umask of the test
-            path.write_text(self.CLOUD_ENV_GOOD if text is None else text)
-            os.chmod(str(path), mode)
-        return path
-
-    def reaper_only(self, *flags, hook=None):
-        """`install --cloud-reaper-only` as the parser gives it. Returns (output, error)."""
-        self.ensure_cloud_env()
-        out = io.StringIO()
-        args = sb.build_parser().parse_args(["install", "--cloud-reaper-only"] + [f for f in flags if f != "--dry-run"] + (
-            ["--dry-run"] if "--dry-run" in flags else []))
-        installer = sb.Installer(self.machine, self.daemons, time.time, self.PLATFORM, REPO,
-                                 dry_run=args.dry_run, out=out, shared_profile=args.shared_profile,
-                                 profile=args.profile, gh_user=args.gh_user)
-        if hook is not None:
-            hook(installer)
-        try:
-            installer.install_cloud_reaper_only()
-        except sb.InstallError as err:
-            return out.getvalue(), str(err)
-        return out.getvalue(), None
-
-    def run_install(self, *argv):
-        """`install` as the CLI runs it: the parser's arguments, the fake machine, the fake daemon. (code, out, err)."""
-        out, err = io.StringIO(), io.StringIO()
-        args = sb.build_parser().parse_args(["install"] + list(argv))
-        real = sb.Installer
-
-        def installer(runner, spawn, now, **kwargs):   # the platform and the kit of the test, not the real ones
-            return real(runner, spawn, now, self.PLATFORM, REPO, **kwargs)
-
-        with mock.patch.object(sys, "stdout", out), mock.patch.object(sys, "stderr", err), \
-                mock.patch.object(sb, "Installer", installer):
-            code = sb.cmd_install(args, self.machine, time.time, self.daemons)
-        return code, out.getvalue(), err.getvalue()
-
-    def leaves(self, before):
-        """The new paths under the fake home that hold something: the ones no other new path is inside."""
-        after = tree_of(self.home)
-        fresh = sorted(path for path in after if path not in before)
-        found = []
-        for path in fresh:
-            prefix = path if path.endswith("/") else path + "/"
-            if not any(other.startswith(prefix) for other in fresh if other != path):
-                found.append(path)
-        return found
-
-    def step_names(self):
-        """The installer's step methods, from its own code: a new one must be classified."""
-        return sorted(set(re.findall(r"def (step_\w+)\(", class_source("Installer"))))
-
-    def installer_functions(self):
-        """The module-level functions the installer's steps call, from the code: a new one must be classified."""
-        tree = ast.parse(switchboard_source())   # the entry and every part
-        module = {node.name for node in tree.body if isinstance(node, ast.FunctionDef)}
-        installer = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "Installer")
-        called = {node.func.id for node in ast.walk(installer)
-                  if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)}
-        return sorted(called & module)
-
-    def reaper_path(self):
-        if self.PLATFORM == "darwin":
-            return self.home / "Library" / "LaunchAgents" / "com.fleet-kit.cloud-reaper.plist"
-        return self.home / "xdg-config" / "systemd" / "user" / "fleet-kit-cloud-reaper.service"
-
-    def fresh_state_dir(self):
-        """The state directory as a machine that has never run the switchboard has it: not there."""
-        shutil.rmtree(str(sb.state_dir_path()), ignore_errors=True)
-
-    def reaper_load_calls(self):
-        return [c for c in self.machine.calls if "cloud-reaper" in " ".join(c) and any(word in ("bootstrap", "enable") for word in c)]
 
 
 class TestTheReaperOnlyDryRunLive(Base):
