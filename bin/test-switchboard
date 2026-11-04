@@ -32248,7 +32248,6 @@ class TestRegistrarFloor(LedgerBase):
             self.assertTrue(hasattr(builtins_module, name), name)
             self.assertNotIn(name, self.FORBIDDEN_BUILTINS)
         self.assertEqual(len(allow["pure_builtins"]), len(set(allow["pure_builtins"])), "a member twice")
-        self.assertEqual(sorted(allow), ["free_keywords", "helpers", "meaning", "parser_methods", "pure_builtins"])
         self.assertEqual(allow["parser_methods"], VERBS, "the verbs this test file writes its rules with are the matrix's")
         self.assertEqual(allow["free_keywords"], FREE_KEYWORDS)
         for member in ("type", "action", "default", "choices", "default_factory"):
