@@ -371,6 +371,6 @@ A long-running agent runs the definition it began with. **Verify a policy agains
 ## Briefing
 
 A request you hand an orchestrator becomes an **ask** under its charter, with
-one Intent and one Done when (a line, or a numbered list under its label) in your principal's terms, never widened (see
+one Intent and one Done when in your principal's terms, never widened (see
 `fleet-charter`). State the checkpoint and deadline, the authority granted, the STOP
 list, and how the result will be verified.

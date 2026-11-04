@@ -159,7 +159,7 @@ class TestDoneWhenList(TestDoneWhenListCommands):
 
     def test_s7_the_wording_places_say_it(self):
         text_of = lambda n: " ".join((REPO / n).read_text().split())
-        for name in FIRST:
+        for name in ("skills/fleet-charter/SKILL.md", "skills/fleet-planning/SKILL.md", "docs/switchboard.md"):
             self.assertIn("numbered list", text_of(name), name)
         planning = text_of("skills/fleet-planning/SKILL.md")
         self.assertIn("`## Intent` before `Done when:`, which may be a numbered list", planning)
@@ -169,13 +169,15 @@ class TestDoneWhenList(TestDoneWhenListCommands):
         for number in (112, 3847):
             self.assertIn("numbered list", doc[number - 1], "docs/switchboard.md line %d" % number)
         places = (("skills/fleet-charter/SKILL.md", 97, "Done when (a line, or a numbered list under its label), once."),
-                  ("agents/opencode/chief-of-staff.md", 374, "one Intent and one Done when (a line, or a numbered list under its label)"),
-                  ("agents/copilot/chief-of-staff.agent.md", 158, "one Intent and one Done when (a line, or a numbered list under its label)"),
                   ("docs/switchboard.md", 112, "a Done-when (a line, or a numbered list under its label)"),
                   ("docs/switchboard.md", 3847, "a Done-when (a line or a numbered list)"),
                   ("skills/fleet-planning/SKILL.md", 53, "which may be a numbered list"))
-        for name, number, said in places:   # each of the six places, by file and line text: a numbered list is accepted, written once
+        for name, number, said in places:   # the four places that say a list is accepted, written once, by file and line text
             self.assertIn(said, (REPO / name).read_text().splitlines()[number - 1], "%s line %d" % (name, number))
+        for name in ("agents/opencode/chief-of-staff.md", "agents/copilot/chief-of-staff.agent.md"):
+            text = (REPO / name).read_text()
+            self.assertIn("one Intent and one Done when in your principal's terms, never widened (see\n", text, name)
+            self.assertNotIn("one Done-when line", text, name)
 
     def test_s7_the_mutant_reading_only_the_first_list_line_is_caught(self):
         src = (REPO / "bin" / "fleet-switchboard").read_text()
