@@ -311,7 +311,6 @@ class TestSummary(Base):
         self.assertEqual((result.testsRun, len(result.failures), len(result.errors)), (1, 0, 0))
         self.assertEqual(sb.load_module("cloud_worker").SNAPSHOT_SECONDS, real)
 
-
     def test_the_new_test_fails_on_a_copy_without_the_cleanup(self):
         """The mutant: a copy of this file with the three cleanup lines of setUp removed makes the new test fail; the unmutated copy passes."""
         src = open(os.path.join(HERE, "test_cloud_status_summary.py")).read()
@@ -331,7 +330,7 @@ class TestSummary(Base):
                 copy = os.path.join(d, "mutcopy_" + name + ".py")
                 with open(copy, "w") as f:
                     f.write(text.replace("HERE = os.path.dirname(os.path.abspath(__file__))", "HERE = %r" % HERE))
-                results[name] = subprocess.run([sys.executable, copy, target], capture_output=True, text=True, timeout=90, env=env)
+                results[name] = subprocess.run([sys.executable, copy, target], capture_output=True, text=True, timeout=10, env=env)
         self.assertEqual(results["control"].returncode, 0, results["control"].stderr)
         self.assertNotEqual(results["mutant"].returncode, 0)
         self.assertIn("AssertionError: 1 != 30", results["mutant"].stderr)
