@@ -59,6 +59,30 @@ class OfflineRun:
         return {key: member[key] for key in ("role", "reports_to", "issue", "charter", "repo") if key in member}
 
     def run(self):
+        # #2108: load_module() resolves the real path of bin/ files twice on every pass (about 30% of a play);
+        # those paths never change during a play, so answer them from a cache. Every other path is resolved as before.
+        bin_dir, real = os.path.dirname(os.path.realpath(sb.__file__)), os.path.realpath
+        cache = {}
+
+        def realpath(path, *args, **kwargs):
+            if args or kwargs or not isinstance(path, str) or not path.startswith(bin_dir):
+                return real(path, *args, **kwargs)
+            if path not in cache:
+                cache[path] = real(path)
+            return cache[path]
+        # and the client stamps its call record with the real clock while the play runs on the fake one, so nothing
+        # was ever forgotten and each pass counted the whole record again (quadratic); stamp with the play's clock.
+        world, original_init = self.world, sb.V2Client.__init__
+
+        def client_init(client, *args, **kwargs):
+            original_init(client, *args, **kwargs)
+            client.clock = lambda: float(world.clock.t)
+        with mock.patch.object(os.path, "realpath", realpath), mock.patch.object(sb.V2Client, "__init__", client_init):
+            if getattr(world.engine, "v2", None) is not None and hasattr(world.engine.v2, "calls"):
+                world.engine.v2.clock = lambda: float(world.clock.t)   # the engine made in __init__
+            return self._play()
+
+    def _play(self):
         steps = list(self.scenario["steps"])
         end = max([sc.duration_seconds(step["at"]) for step in steps] or [0])
         for second in range(end + 1):
