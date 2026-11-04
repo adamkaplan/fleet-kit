@@ -426,6 +426,7 @@
         "bin/spotlight_guard.py",
         "bin/triage_digest.py",
         "bin/turn_start.py",
+        "bin/unconsumed_record.py",
         "bin/work_sync.py",
         "bin/switchboard/plan_input.py",
         "bin/switchboard/v2_transport.py",
@@ -446,6 +447,7 @@
         "bin/switchboard/caches.py",
         "bin/switchboard/profile_pieces.py",
         "bin/switchboard/installer.py",
+        "bin/switchboard/stage_event.py",
         "bin/switchboard/scratch_dir.py"
       ],
       "daemon_file": "bin/fleet-switchboard",
@@ -457,6 +459,9 @@
           "*"
         ],
         "bin/turn_start.py": [
+          "*"
+        ],
+        "bin/unconsumed_record.py": [
           "*"
         ],
         "bin/awaiting_live.py": [
@@ -711,6 +716,9 @@
         ],
         "bin/switchboard/installer.py": [
           "reaper_only_conflict"
+        ],
+        "bin/switchboard/stage_event.py": [
+          "stage_check_config"
         ]
       },
       "registrar_allow": {
