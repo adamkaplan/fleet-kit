@@ -196,6 +196,27 @@ message. A `send` from another agent skips the batch.
   | config key | default | meaning |
   |---|---|---|
   | `steer_after_minutes` | `0` (off) | a peer send and a reminder steer into a long turn once it has lasted more than this many minutes |
+  | `unconsumed_steer_minutes` | `20` (`0` = off) | a message the daemon delivered as `queue` that a working lane has not consumed after this many minutes is steered into the running turn |
+
+  **A lane in a long turn.** A message delivered as `queue` waits in the lane's
+  inbox until the turn reaches its end, however long that is. The config key
+  `unconsumed_steer_minutes` (default `20`, `0` turns it off) bounds that wait:
+  once a working lane has left such a message not consumed for that many
+  minutes (read from the item's own enqueue time), the daemon changes it to
+  `steer` with `inbox.update`, so it arrives at the next step boundary of the
+  running turn. It is tried once per item, audited as `unconsumed.steer` (item
+  id, age in seconds, keys; a refusal as `unconsumed.refused`, also once per
+  item), and never into a lane that holds a permission request or a question.
+  `fleet-switchboard pending <agent>` lists each such message as "not consumed"
+  with its age in minutes and its key. When a keyed reminder is re-armed and the
+  new copy is delivered, an older delivered copy of the same key, sender and
+  recipient that the lane has still not consumed is removed with
+  `session.inbox.cancel`. Which items were tried and which reminder ids were
+  delivered is kept in `unconsumed.json` in the state directory (bounded,
+  written before the action that depends on it), so a restart neither repeats a
+  steer nor forgets the older copy; a record that is missing or unreadable
+  reads as empty and is audited once as `unconsumed_record.error`.
+
 - **Explicit interrupt.** `fleet-switchboard send --interrupt <agent> "text"`
   is for stop and hold orders only, from a boss to its own worker, and is
   never automatic. It calls `session.interrupt` with `resume=false` (the
