@@ -66199,6 +66199,7 @@ _lm = importlib.import_module("test_launch_model"); _lm.HOST = sys.modules[__nam
 _cfw = importlib.import_module("test_changed_files_whole"); _cfw.HOST = sys.modules[__name__]; TestChangedFilesWhole = _cfw.build()   # #1531
 TestShimGuardsTool, TestShimGuardRows, TestShimHygienePlanted, TestShimGuardMutants, TestShimGuardDocs = (_sg := importlib.import_module("test_shim_guards")).TestShimGuardsTool, _sg.TestShimGuardRows, _sg.TestShimHygienePlanted, _sg.TestShimGuardMutants, _sg.TestShimGuardDocs   # #1909
 TestPlanningDecision, TestConcurrencyGroup, TestGateLegs, TestGatePass, TestPlatformPaths, TestMacDocs = (_ml := importlib.import_module("test_mac_legs")).TestPlanningDecision, _ml.TestConcurrencyGroup, _ml.TestGateLegs, _ml.TestGatePass, _ml.TestPlatformPaths, _ml.TestDocs
+TestPlatformClassList = importlib.import_module("test_platform_classes").TestPlatformClassList
 
 class TestTheArchitectureTestIsRun(unittest.TestCase):
     """CI runs this file and nothing else of the switchboard's tests: if the two lines above are removed, the architecture test would drop out of CI without a
@@ -66527,6 +66528,9 @@ class TestSupportRebinding(unittest.TestCase):
 def main(argv):
     watch_parent()
     shard = None
+    platform_only = "--platform-only" in argv   # run exactly the classes of tests/platform-classes.txt (#2132)
+    if platform_only:
+        argv = [a for a in argv if a != "--platform-only"]
     if "--shard" in argv:   # --shard I/N: run only shard I of N (tools/test-shards)
         at = argv.index("--shard")
         shard = argv[at + 1]
@@ -66540,6 +66544,14 @@ def main(argv):
         _spec.loader.exec_module(_shards)
         shard_i, shard_n = _shards.parse_shard(shard)
         suite = _shards.select(suite, shard_i, shard_n)
+    if platform_only:
+        _listed = set(importlib.import_module("test_platform_classes").listed())
+        keep = unittest.TestSuite()
+        for group in suite:
+            for case in group:
+                if type(case).__name__ in _listed:
+                    keep.addTest(case)
+        suite = keep
     if argv:
         keep = unittest.TestSuite()
         for group in suite:
