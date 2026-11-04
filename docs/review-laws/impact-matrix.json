@@ -444,7 +444,8 @@
         "bin/switchboard/secret_spans.py",
         "bin/switchboard/caches.py",
         "bin/switchboard/profile_pieces.py",
-        "bin/switchboard/installer.py"
+        "bin/switchboard/installer.py",
+        "bin/switchboard/scratch_dir.py"
       ],
       "daemon_file": "bin/fleet-switchboard",
       "module_roots": {
@@ -702,6 +703,10 @@
         ],
         "bin/switchboard/profile_pieces.py": [
           "InstallError"
+        ],
+        "bin/switchboard/scratch_dir.py": [
+          "ScratchBoundFacts",
+          "scratch_bytes"
         ],
         "bin/switchboard/installer.py": [
           "reaper_only_conflict"
