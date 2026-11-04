@@ -37078,8 +37078,20 @@ class TestImpactHold(LedgerBase):
         self.assertTrue(module.refusals(rule, good, [{"filename": "bin/fleet-switchboard", "status": "modified"}], sb.impact_floor.matches, {}), "the daemon file with no mapping: refused")
         self.assertEqual(module.refusals(rule, good, [{"filename": "bin/fleet-switchboard", "status": "modified"}], sb.impact_floor.matches, {"bin/fleet-switchboard": []}), [])
 
+    _daemon_cache = None
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        import ast as _ast
+        mod = sb.load_module("delegated_clear")
+        rule = sb.impact_floor.load_matrix()["owner_hold"]["delegated_clear"]
+        source = switchboard_source()
+        tree = _ast.parse(source)    # the daemon file is parsed once; its closure is computed once
+        cls._daemon_cache = {"source": source, "tree": tree, "closure": mod.closure(tree, mod.daemon_roots(rule), rule["dynamic_actions"])}
+
     def real_source(self):
-        return switchboard_source()
+        return self._daemon_cache["source"] if self._daemon_cache else switchboard_source()
 
     def edit_one_line_under(self, source, name):
         """The source with one comment added at the end of the first body line of module-level function `name` (a one-line change right under the def), and its unified diff."""
@@ -37096,7 +37108,19 @@ class TestImpactHold(LedgerBase):
 
     def closure_check(self, head, diff):
         rule = sb.impact_floor.load_matrix()["owner_hold"]["delegated_clear"]
-        return sb.load_module("delegated_clear").closure_refusals(self.real_source(), head, diff, sb.load_module("delegated_clear").daemon_roots(rule), set(rule["clear_entry_points"]), False, rule["dynamic_actions"])
+        import unittest.mock as mock
+        mod = sb.load_module("delegated_clear")
+        cache = self._daemon_cache
+        real_ast, real_closure = mod.ast, mod.closure
+        class CachedAst:    # the unchanged daemon file's tree and closure are reused; every other source is parsed as before
+            def __getattr__(self, attr):
+                return getattr(real_ast, attr)
+            def parse(self, src, *a, **k):
+                return cache["tree"] if src is cache["source"] and not a and not k else real_ast.parse(src, *a, **k)
+        def cached_closure(tree, roots, dyn=()):
+            return cache["closure"] if tree is cache["tree"] else real_closure(tree, roots, dyn)
+        with mock.patch.object(mod, "ast", CachedAst()), mock.patch.object(mod, "closure", cached_closure):
+            return mod.closure_refusals(self.real_source(), head, diff, mod.daemon_roots(rule), set(rule["clear_entry_points"]), False, rule["dynamic_actions"])
 
     def test_the_five_functions_hunk_headers_missed_are_refused_by_the_ast_on_the_real_daemon_file(self):
         source = self.real_source()
