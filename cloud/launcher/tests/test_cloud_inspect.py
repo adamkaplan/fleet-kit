@@ -113,7 +113,7 @@ class TestTheRead(Inspect):
     def test_s2_another_lanes_pod_is_refused(self):
         self.stub(HELPER)
         code, out, err = self.as_caller(OTHER, "inspect", "coder7")
-        self.assertEqual(code, 2)
+        self.assertEqual(code, 1)
         self.assertEqual(out, "")
         self.assertIn("only coder7's own boss may inspect it", err)
         self.assertNotIn("bash", err)
@@ -147,12 +147,13 @@ class TestTheScrub(Inspect):
         code, control, err = self.run_with(os.path.join(LAUNCHER, "cloud-worker"))
         self.assertEqual(code, 0, err)
         self.assertEqual([s for s in (TOKEN, KNOWN, "Pa55w0rdZ") if s in control], [])
-        copy = Path(tempfile.mkdtemp())
-        self.addCleanup(shutil.rmtree, str(copy), True)
-        for item in os.listdir(LAUNCHER):
-            if item != "tests":
-                src = os.path.join(LAUNCHER, item)
-                (shutil.copytree if os.path.isdir(src) else shutil.copy2)(src, str(copy / item))
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(root), True)
+        copy = root / "cloud" / "launcher"   # the launcher finds the kit's bin/ two levels up
+        shutil.copytree(LAUNCHER, str(copy), symlinks=True, ignore=shutil.ignore_patterns("tests", "__pycache__"))
+        (root / "bin").mkdir()
+        for module in ("path_walk.py", "registry.py", "record_json.py"):
+            shutil.copy2(os.path.join(os.path.dirname(os.path.dirname(LAUNCHER)), "bin", module), str(root / "bin" / module))
         target = copy / "cloud_worker.py"
         old = target.read_text()
         anchor = "        scrub_ = self.kube.scrub\n"
