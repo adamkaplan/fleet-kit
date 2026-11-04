@@ -1185,11 +1185,11 @@ class TestCloudLoad(Base):
         import signal as _sig
         def boom(*a):
             raise AssertionError("the read blocked")
-        old = _sig.signal(_sig.SIGALRM, boom); _sig.alarm(3)
+        old = _sig.signal(_sig.SIGALRM, boom); _sig.setitimer(_sig.ITIMER_REAL, 1.0)
         try:
             return fn()
         finally:
-            _sig.alarm(0); _sig.signal(_sig.SIGALRM, old)
+            _sig.setitimer(_sig.ITIMER_REAL, 0); _sig.signal(_sig.SIGALRM, old)
 
     def _cw_mutant(self, old, new, *more):
         src = (BIN / "cloud_worker.py").read_text()

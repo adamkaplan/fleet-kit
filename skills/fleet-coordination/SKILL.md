@@ -20,7 +20,7 @@ Write GitHub text so a person can read it: short paragraphs, real Markdown lists
 ## The brief
 
 Send one self-contained brief at dispatch. Later updates can be shorthand; the
-first one cannot.
+first one cannot. Write the brief with a quoted heredoc (`<<'E'`) or a file, never an unquoted one: a backtick or a dollar sign in an unquoted brief is run by the shell.
 
 ```text
 ISSUE:      <full repository-qualified GitHub issue URL>

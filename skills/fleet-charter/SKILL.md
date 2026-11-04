@@ -93,8 +93,8 @@ to, or the Chief of Staff with their yes, changes either line. You do not edit
 them. If one is wrong or too small, propose the change with
 `fleet-switchboard send <chief-of-staff> --issue <ask> "<proposal>"`, and carry
 on inside the ask as written. The switchboard reads these lines from the issue
-body and heads every message about it with them, so keep them to one Intent line
-and one Done-when line.
+body and heads every message about it with them, so write one Intent line and one
+Done when (a line, or a numbered list under its label), once.
 
 ```
 gh issue create --repo OWNER/REPO --title "<assignment>" --body "<brief>"
