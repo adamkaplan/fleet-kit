@@ -17,8 +17,14 @@ NAMED = ["TestHygiene", "TestSupportRebinding", "TestArchitectureDocument", "Tes
          "TestV2LightGuards", "TestImpactHold", "TestEveryTestFileIsWired"]
 
 
+_RUNS = {}
+
+
 def run(*args):
-    return subprocess.run([sys.executable, str(TOOL), *args], capture_output=True, text=True, cwd=REPO)
+    """One scan per distinct argument list, cached for the class (the scan reads files that no test here edits)."""
+    if args not in _RUNS:
+        _RUNS[args] = subprocess.run([sys.executable, str(TOOL), *args], capture_output=True, text=True, cwd=REPO)
+    return _RUNS[args]
 
 
 class TestGuardSet(unittest.TestCase):
@@ -56,10 +62,12 @@ class TestGuardSet(unittest.TestCase):
         guard = "TestEveryTestFileIsWired"
         with tempfile.TemporaryDirectory() as d:
             tree = Path(d) / "tree"
-            shutil.copytree(REPO, tree, ignore=shutil.ignore_patterns(".git", "__pycache__"))
+            for part in ("bin", "tests", "docs"):    # the one fixture tree: only what the wired guard reads
+                shutil.copytree(REPO / part, tree / part, ignore=shutil.ignore_patterns(".git", "__pycache__"))
 
-            def guard_run():
-                return subprocess.run([sys.executable, "bin/test-switchboard", guard], capture_output=True, text=True, cwd=tree)
+            def guard_run():    # the guard class directly, without the runner's whole-suite import
+                return subprocess.run([sys.executable, "-m", "unittest", "test_wired_tests." + guard + ".test_the_real_directory_is_wired"], capture_output=True, text=True,
+                                      cwd=tree / "tests" / "switchboard")
             c = guard_run()
             self.assertEqual(c.returncode, 0, c.stdout + c.stderr)  # the control passes on the unmutated copy
             (tree / "tests" / "switchboard" / "test_planted_unloaded.py").write_text(
