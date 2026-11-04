@@ -581,8 +581,8 @@ class RouteSpan(unittest.TestCase):
         self.assertEqual((os.listdir(real), len(ta.Stub.deletes)), (["other"], 1))
 
     def test_s18_a_mutant_whose_handler_starts_at_the_delivery_fails(self):
-        path = self.mutant("    try:   # ONE handler over the whole span: from the mint to the end of the delivery\n        token = mint(target, keep=True)\n        note_minted(token)\n",
-                           "    token = mint(target, keep=True)\n    note_minted(token)\n    try:\n")
+        path = self.mutant("    try:   # ONE handler over the whole span: from the mint to the end of the delivery\n        token = mint(target, role, keep=True)\n        note_minted(token)\n",
+                           "    token = mint(target, role, keep=True)\n    note_minted(token)\n    try:\n")
         with open(path) as f, open(MINT) as g:
             self.assertNotEqual(f.read(), g.read())   # the mutation was applied
         with self.assertRaises(AssertionError):
