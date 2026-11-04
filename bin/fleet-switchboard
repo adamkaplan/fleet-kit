@@ -5214,6 +5214,19 @@ def live_cloud_record(state_dir, name, retired, now):
     return cloud_record_live(record, name, retired, _read_small(state_dir, LAST_REPORT_FILE), now)
 
 
+def _clears_pass_state(fn):
+    """#1884 PC-9 b/e: the per-pass state of the undecidable record (the seen set, the one read of the pane list) is cleared in a `finally`."""
+    def wrapped(engine, *args, **kwargs):
+        try:
+            return fn(engine, *args, **kwargs)
+        finally:
+            engine.__dict__.pop("undecidable_seen", None)
+            engine.__dict__.pop("pass_herdr", None)
+    wrapped.__name__, wrapped.__doc__ = fn.__name__, fn.__doc__
+    return wrapped
+
+
+@_clears_pass_state
 def pane_health_pass(engine, now):
     """The daemon's look at every fleet agent's pane (after discovery). Records `pane-health.json` (what `status` shows and `reattach` reads),
     audits each change of state (`pane.detached`, `pane.dead`, `pane.recovered`) and leaves `engine.pane_alerts` for the cos fact. Reads only; bounded
