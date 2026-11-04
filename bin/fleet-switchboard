@@ -7497,6 +7497,17 @@ def cmd_read(args, runner, now):
     return run_cloud("cmd_read", args, runner, now)
 
 
+def add_inspect_parsers(sub):
+    """`inspect NAME [--short]`: what a cloud worker is doing now (the call in flight, the recent calls, git, the last push), read-only; the worker's own boss only."""
+    inspect_ = sub.add_parser("inspect", help="What a cloud worker's pod is doing now, read-only (its own boss only); `--short` prints one line")
+    inspect_.add_argument("name", help="The cloud worker's fleet name")
+    inspect_.add_argument("--short", action="store_true", help="One line, for a notice")
+
+
+def cmd_inspect(args, runner, now):
+    return run_cloud("cmd_inspect", args, runner, now)
+
+
 def cmd_cloud_clear(args, runner, now):
     """`cloud-clear [--dry-run]`: every cloud worker record whose pod is gone AND whose hard deadline has passed is removed (the record and its
     password file), and every one it removes is named. A record with a pod, or one not past its deadline, is never touched, and it refuses when
