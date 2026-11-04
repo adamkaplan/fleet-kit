@@ -6,8 +6,8 @@ The daemon PULLS `GET /relay/pending` from the hub, runs each request with the s
 resolved, and answers `POST /relay/result/<id>`. Every refusal writes nothing to the ledger (byte-identical) and leaves one audit line.
 
 The world (GitHub, the plan, the registry, the audit) is a Backend, so the rules are testable with a fake; `SwitchboardBackend` is the real one.
-One ledger entry per prove or verdict, written by `plan_ledger.append_checked` under its flock; the head is re-read from GitHub INSIDE
-that decision. Replay memory: `relay_calls.json` (pod + call id -> seq, hash), backed by the call id stored in the entry itself.
+One ledger entry per prove or verdict, written by `plan_ledger.append_checked` under its flock; the head is re-read from GitHub just BEFORE
+that decision (a fresh read, never the request's memo, under HEAD_TIMEOUT; one more call in the request's allowance). Replay memory: `relay_calls.json` (pod + call id -> seq, hash), backed by the call id stored in the entry itself.
 
 Report delivery is AT-MOST-ONCE per call id: a report can be LOST (never duplicated); for `report` the ask's "exactly one" reads "at most one". A lost report is
 told to the pod by name (409 "lost or still pending: resend with a NEW call_id"). Report delivery, in detail: the call id is CLAIMED first (a PENDING record, get-or-claim in one
@@ -18,7 +18,7 @@ call id). Claims live in their own file (`relay_reports.json`, REPORT_MAX entrie
 damaged claim file refuses with 500 rather than forgetting). A report replay with a different pr or different args under the same call id is 409.
 Refusals (daemon-only credential, repo, allow-list, rules) write an AUDIT line `relay.refused` on purpose and leave the ledger and files
 byte-identical. The hub's 1000-entry finished cache can be flooded to evict another pod's hub-side replay record; the daemon-side dedupe
-above still holds it. Every hub request (connect, headers, body, response; GET and POST) has ONE wall-clock deadline (READ_DEADLINE 30 s), and a relay pass a budget (PASS_BUDGET 60 s: later requests wait for the next pass); each hub request runs in a worker thread joined at READ_DEADLINE (DNS and every connect attempt included; a late thread is abandoned and the pass records relay pass cut), so the transport of a pass is at most PASS_BUDGET + READ_DEADLINE = 90 s. Only ONE hub worker thread lives at a time (a new request while an abandoned one runs is refused as a cut: "previous request still running"), and a cut sets a cancel flag checked after connect and before the send, so a late thread never POSTs; a late GET result is discarded silently. The up to 40 GitHub context reads of a pass carry NO deadline inside the pass budget: they are unbounded. The hub read has a TOTAL deadline (READ_DEADLINE) and the live head is read OUTSIDE the ledger flock (bounded by HEAD_TIMEOUT, refused 504 with nothing written when late); inside the flock the build only compares it with the head the request judged: no network under the lock.
+above still holds it. Every hub request (connect, headers, body, response; GET and POST) has ONE wall-clock deadline (READ_DEADLINE 30 s), and a relay pass a budget (PASS_BUDGET 60 s: later requests wait for the next pass); each hub request runs in a worker thread joined at READ_DEADLINE (DNS and every connect attempt included; a late thread is abandoned and the pass records relay pass cut), so the transport of a pass is at most PASS_BUDGET + READ_DEADLINE = 90 s. Only ONE hub worker thread lives at a time (a new request while an abandoned one runs is refused as a cut: "previous request still running"), and a cut sets a cancel flag checked after connect and before the send, so a late thread never POSTs; a late GET result is discarded silently. The up to 40 GitHub context reads of a pass carry NO deadline inside the pass budget: they are unbounded. The hub read has a TOTAL deadline (READ_DEADLINE) and the live head is read FRESH, OUTSIDE the ledger flock (bounded by HEAD_TIMEOUT, refused 504 with nothing written when late); inside the flock the build only compares it with the head the request judged: no network under the lock.
 GitHub reads per pass, worst case: at most 10 requests, each making _ctx reads (a ledger context = PR facts and plan from GitHub): report 1 (link), gates 2, prove 3 (link, plan, live head), verdict 4 (link, plan, PR facts, live head); so at most 10 x 4 = 40 context reads per pass.
 Memory limit, exactly: report claims survive restarts and a missing or pruned relay_calls.json (own file, REPORT_MAX 50000 entries; beyond that the oldest claim is forgotten, and a deleted relay_reports.json is an empty memory, so a report with that call id would then be delivered again). A damaged file refuses instead.
 
@@ -57,6 +57,12 @@ NEEDS_LINK = cloud_relay.NEEDS_LINK
 PENDING_CAP = 4 * 1024 * 1024   # bytes of the hub's pending list; larger is refused
 TOKEN_CAP = 4096                # bytes of the token file
 REASON_FIXED = "relay failed"
+RELAY_GH_PER_HOUR = 600         # GitHub calls (not requests) all relay requests may make in a rolling hour (PC-6)
+RELAY_GH_WINDOW = 3600.0        # seconds of that rolling hour
+RELAY_GH_PER_POD = 120          # of those, the most ONE pod may spend in the rolling hour (a share: one pod cannot starve the others)
+RELAY_GH_PER_REQUEST = 4        # most calls one request makes: 1 link read + 2 plan reads + 1 fresh head read (prove/verdict)
+BUDGET_REASON = "relay GitHub budget"
+POD_BUDGET_REASON = "relay GitHub budget: pod share"
 PENDING_REASON = "already claimed, never delivered twice: lost or still pending: resend with a NEW call_id"
 PASS_BUDGET = 60.0              # wall-clock seconds of one relay pass; requests not started by then wait for the next pass
 REASON_MAX = 1900               # the hub refuses a reason over 2000 characters; every answer is clipped below that
@@ -191,12 +197,15 @@ _TIMEOUT = object()
 
 
 def _bounded(fn, timeout):
-    """fn() with a deadline: _TIMEOUT when it does not answer in time, None when it raises (an unknown head, refused as stale)."""
+    """fn() with a deadline: _TIMEOUT when it does not answer in time, the Refuse itself when it raises one (429 budget/pause: the pod sees the named
+    cause), None for any other failure (an unknown head, refused as stale)."""
     box = []
 
     def run():
         try:
             box.append(fn())
+        except Refuse as r:
+            box.append(r)
         except Exception:
             box.append(None)
     t = threading.Thread(target=run, daemon=True)
@@ -209,12 +218,142 @@ def _answer(known):
     return {"seq": known["seq"], "hash": known["hash"]}
 
 
+class RelayBudget:
+    """The hourly caps on the GitHub calls of relay requests (PC-6): a rolling window of call times, safe for two threads. TWO caps: a share per pod
+    (`pod_cap`, keyed on the hub-resolved pod name: one hostile pod cannot spend the hour) and the global `cap` as a backstop. A refusal names which.
+    `room` (asked before a request starts: the reserve of RELAY_GH_PER_REQUEST calls) and `take` (one call) are separate steps; `take` is the hard stop,
+    so a request that outgrows its reserve is refused 429 in the middle (fail closed: nothing is written then either)."""
+
+    def __init__(self, now, cap=None, window=None, pod_cap=None):
+        self.now, self.lock, self.times, self.pods = now, threading.Lock(), [], {}
+        self.cap = RELAY_GH_PER_HOUR if cap is None else cap
+        self.pod_cap = RELAY_GH_PER_POD if pod_cap is None else pod_cap
+        self.window = RELAY_GH_WINDOW if window is None else window
+
+    def _trim(self):
+        edge = self.now() - self.window
+        while self.times and self.times[0] <= edge:
+            self.times.pop(0)
+        for pod in list(self.pods):
+            mine = self.pods[pod]
+            while mine and mine[0] <= edge:
+                mine.pop(0)
+            if not mine:
+                del self.pods[pod]
+
+    def _refusal(self, pod, need):
+        if len(self.pods.get(pod, ())) + need > self.pod_cap:
+            return POD_BUDGET_REASON
+        if len(self.times) + need > self.cap:
+            return BUDGET_REASON
+        return None
+
+    def room(self, pod=None, need=RELAY_GH_PER_REQUEST):
+        """None when `need` more calls fit under both caps (asked BEFORE a request makes any call), else the refusal's reason."""
+        with self.lock:
+            self._trim()
+            return self._refusal(pod, need)
+
+    def take(self, pod=None):
+        """Counts one call for `pod`: None when taken, else the reason (and nothing counted)."""
+        with self.lock:
+            self._trim()
+            why = self._refusal(pod, 1)
+            if why is None:
+                at = self.now()
+                self.times.append(at)
+                self.pods.setdefault(pod, []).append(at)
+            return why
+
+
+_READ_FLAGS = frozenset({"-i", "--paginate"})                       # known read flags without a value
+_READ_VALUE_FLAGS = frozenset({"-H", "--jq", "-q", "--cache"})      # known read flags that take one value
+
+_METHOD_OVERRIDES = ("x-http-method-override", "x-method-override", "x-http-method")
+
+
+def _is_read(argv):
+    """An ALLOW-list: only `gh pr view ...` and `gh api <path>` whose other args are all known read flags are memoized within a request.
+    Anything else (any spelling of a method, field or input flag, `-XPOST`, `--field=x`, an unknown flag, a second positional) counts as a write."""
+    if not isinstance(argv, (list, tuple)) or len(argv) < 3:
+        return False
+    if argv[1] == "pr" and argv[2] == "view":
+        return True
+    if argv[1] != "api":
+        return False
+    paths, i, rest = 0, 0, list(argv[2:])
+    while i < len(rest):
+        x = rest[i]
+        if not isinstance(x, str):
+            return False
+        if x in _READ_FLAGS:
+            i += 1
+        elif x in _READ_VALUE_FLAGS:
+            if i + 1 >= len(rest):
+                return False
+            if x == "-H" and (not isinstance(rest[i + 1], str) or any(m in rest[i + 1].lower() for m in _METHOD_OVERRIDES)):
+                return False   # a header that overrides the HTTP method makes the call a write
+            i += 2
+        elif x.startswith("-"):
+            return False
+        else:
+            paths += 1
+            i += 1
+    return paths == 1
+
+
+class MeteredRunner:
+    """The runner every relay gh call goes through. The metering rules live with the gate (GhAccounts.check_pause and .record, which do nothing for a call
+    made inside GhAccounts.read: `read` checks and counts that one itself, so a call is counted exactly once); this class adds only the relay's own
+    hourly budget (global and per pod) and the per-request memo of READ argv shapes. One MeteredRunner belongs to ONE request (`for_request`)."""
+
+    def __init__(self, runner, accounts, budget, now, pod=None):
+        self.runner, self.accounts, self.budget, self.now, self.pod = runner, accounts, budget, now, pod
+        self.memo = {}
+
+    def for_request(self, pod):
+        return MeteredRunner(self.runner, self.accounts, self.budget, self.now, pod)
+
+    def __call__(self, argv, *a, **k):
+        read = _is_read(argv)
+        key = tuple(argv) if read else None
+        if key is not None and key in self.memo:   # the same read twice in ONE request (the pull request picture, the plan): answered from the first
+            return self.memo[key]
+        if not read:
+            self.memo.clear()   # a write: a later read must not be answered from before it
+        done = self._call(argv, *a, **k)
+        if key is not None and getattr(done, "returncode", 1) == 0:
+            self.memo[key] = done
+        return done
+
+    def _call(self, argv, *a, **k):
+        accounts = self.accounts
+        if accounts is not None:
+            try:
+                accounts.check_pause()   # ANY paused account stops the call (fail closed)
+            except Exception as err:
+                if type(err).__name__ != "GhRateLimited":
+                    raise
+                raise Refuse(429, "GitHub rate limited: the daemon's gate is paused", "relay stopped by the shared GitHub pause") from None
+        if self.budget is not None:
+            why = self.budget.take(self.pod)
+            if why:
+                raise Refuse(429, why)
+        if accounts is not None:
+            accounts.record("relay")
+        return self.runner(argv, *a, **k)
+
+
+TREE_REFUSAL = "installed tree is not the default branch: nothing is decided"
+
+
 class Executor:
     """backend needs: live_head(pr), plan(pr) -> {"source","hash","scenarios":{sid:{"evaluator","claim"}}},
     pr_issues(pr) -> {issue numbers the PR is linked to}, pr_facts(pr) -> {"author","notice_senders"}, evaluators(evaluator), holder_of(repo, issue), gates(pr), report(pod, args), audit(kind, pr, detail)."""
 
-    def __init__(self, state_dir, backend, now):
+    def __init__(self, state_dir, backend, now, blocked=None):
         self.state, self.backend, self.now = state_dir, backend, now
+        self.blocked = blocked   # #1380: a callable, True while the installed tree is not the default branch and clean
         self.index = Index(state_dir)
         self.reports = Index(state_dir, REPORT_FILE, REPORT_MAX, strict=True)
 
@@ -223,6 +362,12 @@ class Executor:
         pod = req.get("pod")
         call = req.get("call") if isinstance(req.get("call"), dict) else {}
         pr = call.get("pr") if isinstance(call.get("pr"), str) else ""
+        if self.blocked is not None and self.blocked():   # before anything: no backend context, no gh call, no write, no message
+            with contextlib.suppress(Exception):
+                self.backend.audit("relay.refused", clean_text(pr, 80), {"by": clean_text(pod, 80), "status": 503, "why": TREE_REFUSAL})
+            return 503, TREE_REFUSAL, None
+        begin = getattr(self.backend, "begin_request", None)
+        backend = begin(req) if begin else self.backend   # ONE context per request, held by the request itself: a late thread of an earlier request cannot reach it
         try:
             if not isinstance(pod, str) or not pod:
                 raise Refuse(400, "no pod named")
@@ -240,11 +385,15 @@ class Executor:
             args = call.get("args") if isinstance(call.get("args"), dict) else {}
             if command in NEEDS_HEAD and not SHA_RE.fullmatch(str(call.get("head") or "")):
                 raise Refuse(400, "%s needs the head sha it judged" % command)
-            if command in NEEDS_LINK:   # the PR must be the one linked to the issue this pod is bound to
-                self._check_linked(pr, req)
+            room = getattr(backend, "gh_room", None)
+            why = room() if room is not None else None
+            if why:   # BEFORE any gh call; audited as a refusal, nothing written
+                raise Refuse(429, why)
+            if command in NEEDS_LINK:   # the PR must be the one linked to the issue this pod is bound to (this read is at most 1 call, charged to the pod)
+                self._check_linked(pr, req, backend)
             if command == "gates":   # read-only and not indexed: nothing to replay
-                out = self.backend.gates(pr)
-                self.backend.audit("gates", pr, {"by": clean_text(pod, 80), "call_id": clean_text(cid, 64)})
+                out = backend.gates(pr)
+                backend.audit("gates", pr, {"by": clean_text(pod, 80), "call_id": clean_text(cid, 64)})
                 text = json.dumps(out, sort_keys=True)
                 if len(text) > REASON_MAX:   # a clipped JSON would be unreadable: send a short valid one
                     text = json.dumps({"ready": out.get("ready") if isinstance(out, dict) else None, "truncated": True})
@@ -258,18 +407,19 @@ class Executor:
                         raise Refuse(409, "call_id reused for a different call")
                     if seen.get("state") == "done":
                         return 200, "replay: already reported", None
-                    self.backend.audit("report.claimed", pr, {"by": clean_text(pod, 80), "call_id": clean_text(cid, 64)})
+                    backend.audit("report.claimed", pr, {"by": clean_text(pod, 80), "call_id": clean_text(cid, 64)})
                     raise Refuse(409, PENDING_REASON, "report replay of a pending claim")
                 # only the state and the text come from the pod; the issue is the hub's, and `everything` is dropped
-                self.backend.report(pod, {"state": args.get("state"), "text": clean_text(args.get("text")), "issue": req.get("issue")})
+                backend.report(pod, {"state": args.get("state"), "text": clean_text(args.get("text")), "issue": req.get("issue")})
                 self.reports.put(pod, cid, dict(mine, state="done"))
+                self.backend.audit("report.delivered", pr, {"by": clean_text(pod, 80), "call_id": clean_text(cid, 64)})   # #1478: the owner sees the pod's report
                 return 200, "reported", None
             known = self.index.get(pod, cid)
             if known:
                 if not _same_call(known, command, pr, call["head"], args_digest(args)):
                     raise Refuse(409, "call_id reused for a different call")
                 return 200, "replay: already recorded", _answer(known)
-            record = self._write(command, pod, req, call, pr, cid, args)
+            record = self._write(command, pod, req, call, pr, cid, args, backend)
             self.index.put(pod, cid, dict(record, command=command, pr=pr, head=call["head"], args=args_digest(args)))
             return 200, "recorded", record
         except Replay as rep:
@@ -277,28 +427,28 @@ class Executor:
             clipped = plan_ledger.clip(str(args.get("evidence") or "").strip(), plan_ledger.EVIDENCE_LIMIT)
             if (not _same_call(first, command, pr, call.get("head")) or first.get("scenario") != args.get("scenario")
                     or first.get("result") != args.get("result") or first.get("evidence") != clipped):
-                self.backend.audit("relay.refused", clean_text(pr, 80), {"by": clean_text(pod, 80), "status": 409, "why": "call_id reused for a different call"})
+                backend.audit("relay.refused", clean_text(pr, 80), {"by": clean_text(pod, 80), "status": 409, "why": "call_id reused for a different call"})
                 return 409, "call_id reused for a different call", None
             self.index.put(pod, cid, dict(_answer(first), command=command, pr=pr, head=call.get("head"), args=args_digest(args)))
             return 200, "replay: already recorded", _answer(first)
         except Refuse as err:
-            self.backend.audit("relay.refused", clean_text(pr, 80), {"by": clean_text(pod, 80), "status": err.status, "why": clean_text(err.detail or err.reason)})
+            backend.audit("relay.refused", clean_text(pr, 80), {"by": clean_text(pod, 80), "status": err.status, "why": clean_text(err.detail or err.reason)})
             return err.status, err.reason, None
         except plan_ledger.LedgerError as err:
-            self.backend.audit("relay.refused", clean_text(pr, 80), {"by": clean_text(pod, 80), "status": 409, "why": clean_text(err)})
+            backend.audit("relay.refused", clean_text(pr, 80), {"by": clean_text(pod, 80), "status": 409, "why": clean_text(err)})
             return 409, "the ledger refused the write", None
 
-    def _check_linked(self, pr, req):
-        linked = {str(i) for i in (self.backend.pr_issues(pr) or ())}
+    def _check_linked(self, pr, req, backend):
+        linked = {str(i) for i in (backend.pr_issues(pr) or ())}
         if str(req.get("issue")) not in linked:
             raise Refuse(403, "pr not linked to the pod's issue")
 
-    def _check_holder(self, pod, req):
-        if self.backend.holder_of(req.get("repo"), req.get("issue")) != pod:
+    def _check_holder(self, pod, req, backend):
+        if backend.holder_of(req.get("repo"), req.get("issue")) != pod:
             raise Refuse(403, "proof only from the pod holding the work item")
 
-    def _write(self, command, pod, req, call, pr, cid, args):
-        b, head = self.backend, call["head"]
+    def _write(self, command, pod, req, call, pr, cid, args, backend):
+        b, head = backend, call["head"]
         sid = args.get("scenario")
         plan = b.plan(pr)
         scenario = (plan or {}).get("scenarios", {}).get(sid)
@@ -315,7 +465,7 @@ class Executor:
         base = {"pr": pr, "scenario": sid, "plan_ref": plan["source"], "plan_hash": plan["hash"], "head": head,
                 "result": result, "by": pod, "evidence": evidence, "call_id": cid}
         if command == "prove":
-            self._check_holder(pod, req)
+            self._check_holder(pod, req, b)
             entry = dict(base, kind="proof", command=plan_ledger.clip(str(args.get("command") or "")), env="relay")
         else:
             named = scenario.get("evaluator")
@@ -346,6 +496,8 @@ class Executor:
             return entry
 
         first = _bounded(lambda: b.live_head(pr), HEAD_TIMEOUT)   # the slow read is made BEFORE the flock, under a short timeout
+        if isinstance(first, Refuse):
+            raise first
         if first is _TIMEOUT:
             raise Refuse(504, "the PR head could not be read in time: nothing was written", "live_head timed out after %ds" % HEAD_TIMEOUT)
         stored = plan_ledger.append_checked(self.state, self.now(), build)
@@ -505,16 +657,63 @@ def http_transport(base, token):
 class SwitchboardBackend:
     """The real world, through the switchboard's own functions (`host` is the fleet-switchboard module; `parts` = (engine, state, config))."""
 
-    def __init__(self, host, parts, runner, now):
-        self.host, self.parts, self.runner, self.now = host, parts, runner, now
+    def __init__(self, host, parts, runner, now, budget=None):
+        self.host, self.now, self.budget, self.pod = host, now, budget, None
+        accounts = getattr(parts[0], "accounts", None)
+        accounts = accounts if all(hasattr(accounts, n) for n in ("calls", "paused", "check_pause", "record")) else None
+        self.runner = MeteredRunner(runner, accounts, budget, now) if runner is not None and (accounts is not None or budget is not None) else runner
+        self.base_engine, self._rest = parts[0], tuple(parts[1:])
+        self.parts = self._parts(self.runner)
+        self.memo = {}
 
-    def _ctx(self, pr, writable=True):
+    def _parts(self, runner):
+        """(engine, state, config) whose gh runner is `runner`. A shallow copy of the engine with ONE attribute replaced (the shared accounts stay shared);
+        the Engine has no constructor argument for its gh runner."""
+        import copy
+        engine = self.base_engine
+        if engine is not None and isinstance(runner, MeteredRunner):
+            engine = copy.copy(engine)
+            engine.gh_runner = runner
+        return (engine,) + self._rest
+
+    def begin_request(self, req=None):
+        """A NEW backend for ONE request: its own memo, its own metered runner (own memo) and engine copy, held by the request's calls. A thread of an
+        earlier request that finishes late writes only into its own, abandoned context."""
+        import copy
+        view = copy.copy(self)
+        view.memo = {}
+        view.pod = req.get("pod") if isinstance(req, dict) else None
+        if isinstance(self.runner, MeteredRunner):
+            view.runner = self.runner.for_request(view.pod)
+            view.parts = view._parts(view.runner)
+        return view
+
+    def gh_room(self):
+        """None when the request may start, else the 429 reason (global cap or this pod's share)."""
+        return None if self.budget is None else self.budget.room(self.pod)
+
+    def _ctx(self, pr, writable=True, plan_read=True):
+        """The ledger context, built ONCE per request and flag set (also a refusal it raised): plan, pr_facts and pr_issues share it."""
         import types
-        args = types.SimpleNamespace(pr=pr, plan=None, ask=None)
-        return self.host._ledger_context(args, self.runner, self.now, writable, parts=self.parts, floor=not writable)
+        key = (pr, bool(writable), bool(plan_read))
+        if key not in self.memo:
+            args = types.SimpleNamespace(pr=pr, plan=None, ask=None)
+            try:
+                self.memo[key] = (self.host._ledger_context(args, self.runner, self.now, writable, parts=self.parts, floor=not writable, plan_read=plan_read), None)
+            except Exception as err:
+                self.memo[key] = (None, err)
+        ctx, err = self.memo[key]
+        if err is not None:
+            raise err
+        return ctx
 
     def live_head(self, pr):
-        return (self._ctx(pr).facts or {}).get("head")
+        """A FRESH read of the PR head (never the request's memo: the head compared under the lock is the latest one); one call in the request's allowance."""
+        import types
+        runner = self.runner.for_request(self.pod) if isinstance(self.runner, MeteredRunner) else self.runner
+        args = types.SimpleNamespace(pr=pr, plan=None, ask=None)
+        ctx = self.host._ledger_context(args, runner, self.now, True, parts=self._parts(runner), floor=False, plan_read=False)
+        return (ctx.facts or {}).get("head")
 
     def plan(self, pr):
         ctx = self._ctx(pr)
@@ -539,7 +738,7 @@ class SwitchboardBackend:
     def pr_issues(self, pr):
         """Issue numbers the PR is linked to: its closing keywords (Closes/Fixes/Resolves [owner/repo]#N) in the body, and its plan's issue."""
         import re
-        ctx = self._ctx(pr)
+        ctx = self._ctx(pr, plan_read=False)   # the link check needs the body and the plan's SOURCE, not the plan: no plan read
         repo = ctx.repo
         found = set()
         for m in re.finditer(r"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s*:?\s+(?:([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+))?#([0-9]+)", str((ctx.facts or {}).get("body") or ""), re.I):
@@ -555,7 +754,10 @@ class SwitchboardBackend:
         return plan_ledger.evaluate_gates(ctx.plan, ctx.entries, ctx.problem, ctx.facts if ctx.facts.get("head") else None, ctx.pr, now=self.now())
 
     def report(self, pod, args):
-        self.parts[0].report(pod, args.get("state"), args.get("text") or "", args.get("issue"), False)
+        try:
+            self.parts[0].report(pod, args.get("state"), args.get("text") or "", args.get("issue"), False)
+        except self.host.ReportError as err:   # #1478: a refusal of the report (no boss, bad state, unknown pod) is audited as a refusal naming the pod
+            raise Refuse(400, "the report was refused", clean_text(err)) from None
 
     def audit(self, kind, pr, detail):
         engine = self.parts[0]
@@ -563,8 +765,8 @@ class SwitchboardBackend:
             engine.audit.append(engine.actor, kind, pr, detail)
 
 
-def pass_if_configured(engine, host, runner, now, environ=os.environ):
-    """Called by the daemon after each pass. Does nothing unless FLEET_RELAY_HUB_URL and FLEET_RELAY_HUB_TOKEN_FILE are set; never raises."""
+def pass_if_configured(engine, host, runner, now, environ=os.environ, budget=None):
+    """One relay pull and answer, run by the relay loop (RelayLoop.run) on its own engine. Does nothing unless FLEET_RELAY_HUB_URL and FLEET_RELAY_HUB_TOKEN_FILE are set; never raises."""
     url, tokfile = environ.get("FLEET_RELAY_HUB_URL"), environ.get("FLEET_RELAY_HUB_TOKEN_FILE")
     if not url or not tokfile:
         return 0
@@ -599,8 +801,96 @@ def pass_if_configured(engine, host, runner, now, environ=os.environ):
             engine._note("relay.pass_failed", None, {"error": type(err).__name__})
             return 0
         fetch, post = http_transport(url, token)
-        backend = SwitchboardBackend(host, (engine, engine.state_dir, engine.config), runner, now)
-        return pass_once(Executor(engine.state_dir, backend, now), fetch, post)
+        backend = SwitchboardBackend(host, (engine, engine.state_dir, engine.config), runner, now, budget)
+        return pass_once(Executor(engine.state_dir, backend, now, getattr(budget, "blocked", None)), fetch, post)
     except Exception as err:
         engine._note("relay.pass_failed", None, {"error": " ".join(str(err).split())[:160]})
         return 0
+
+
+CADENCE = 5.0   # seconds between relay checks, on the relay's own loop (not tied to the engine pass)
+
+
+class RelayLoop:
+    """Pulls and answers relay requests on their own short cadence, in one daemon thread, so a long engine pass
+    cannot make the hub's wait run out. One thread means one in-flight pass; each pass keeps its own total
+    deadline and PASS_BUDGET (pass_once). The ledger flock is taken by the Executor as before.
+
+    CONCURRENCY RULE: the Engine is not thread-safe (discovery, the V2Reads caches, per-pass counters, _last). This thread
+    never touches the pass thread's engine: `engine_factory` builds the loop's OWN Engine (same config and state dir, own
+    caches), in the thread that starts the loop. What the two engines share is only files, each under its own lock (the
+    ledger flock, the audit and report-rider file locks). The factory is REQUIRED (ValueError at start); a test that wants sharing says so: engine_factory=lambda: engine."""
+
+    def __init__(self, engine, host, runner, now, environ=os.environ, cadence=None, sleep=None, engine_factory=None, guarded=False):
+        if engine_factory is None:
+            raise ValueError("the relay loop needs an engine factory (its own Engine); sharing the pass engine must be explicit: engine_factory=lambda: engine")
+        self.engine = engine_factory()
+        self.budget = RelayBudget(now)   # one hourly cap for every pass of this loop
+        # #1380: the pass loop (the only reader of the tree guard) sets this through set_blocked on every pass. A loop built with
+        # guarded=True (run_daemon does) starts BLOCKED and serves nothing until the first guard check says clear; a loop built without it is never blocked.
+        self.blocked = threading.Event()
+        if guarded:
+            self.blocked.set()
+        self.args = (self.engine, host, runner, now, environ, self.budget)
+        self.budget.blocked = self.blocked.is_set   # rides on the loop's budget object into each pass's Executor
+        shared = getattr(engine, "accounts", None)   # ONE gate: the relay's reads are counted and paused in the pass engine's GhAccounts
+        if self.engine is not engine and self.engine is not None and shared is not None and hasattr(shared, "calls"):
+            self.engine.accounts = shared
+            if getattr(self.engine, "intents", None) is not None:
+                self.engine.intents.accounts = shared
+        self.cadence = CADENCE if cadence is None else cadence
+        self.stop_flag = threading.Event()
+        self.sleep = sleep or self.stop_flag.wait
+        self.thread = None
+        self.failures = 0
+
+    def set_blocked(self, bad):
+        """Called by the pass loop with the guard's verdict: True (set) while the installed tree is bad, False (cleared) when clean."""
+        (self.blocked.set if bad else self.blocked.clear)()
+
+    def _record_failure(self, err):
+        """Counts the failure, and audits it if it can; never raises (the audit append itself may be what failed)."""
+        self.failures += 1
+        try:
+            self.engine._note("relay.loop_failed", None, {"error": type(err).__name__})
+        except BaseException:
+            pass
+
+    def run(self):
+        while not self.stop_flag.is_set():
+            try:
+                pass_if_configured(*self.args)   # never raises, but its own handler calls _note, which can
+            except Exception as err:
+                self._record_failure(err)
+            if self.stop_flag.is_set():
+                break
+            self.sleep(self.cadence)
+
+    def stop(self, join=2.0):
+        """Stops the loop and waits `join` s. A pull can last about 90 s: if the thread is still alive an audit line says so, and
+        the late thread can still write (a ledger append is flock-atomic; a pass cut by its deadline posts nothing).
+        Nothing needs closing: the second engine holds no open file or socket (AuditLog opens, appends and closes per call; V2Client and
+        GhAccounts only run subprocesses per call), so stopping the thread is the whole teardown."""
+        self.stop_flag.set()
+        if self.thread is not None:
+            self.thread.join(join)
+            if self.thread.is_alive():
+                try:
+                    self.engine._note("relay.stop_timeout", None, {"error": "the relay thread was still running %g s after stop" % join})
+                except BaseException:
+                    pass
+
+
+def start_loop(engine, host, runner, now, environ=os.environ, **kw):
+    """Start the relay loop; None (nothing runs) unless FLEET_RELAY_HUB_URL and FLEET_RELAY_HUB_TOKEN_FILE are set.
+    Raises ValueError when there is a hub but no host module (a None host would fail silently in every pass)."""
+    if not environ.get("FLEET_RELAY_HUB_URL") or not environ.get("FLEET_RELAY_HUB_TOKEN_FILE"):
+        return None
+    if host is None:
+        raise ValueError("the relay loop needs the switchboard module as its host")
+    if kw.get("engine_factory") is None:
+        raise ValueError("the relay loop needs an engine factory (its own Engine) when a hub is configured")
+    loop = RelayLoop(engine, host, runner, now, environ, **kw)
+    loop.thread = threading.Thread(target=loop.run, name="relay-loop", daemon=True)
+    loop.thread.start()
+    return loop

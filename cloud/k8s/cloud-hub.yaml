@@ -109,6 +109,9 @@
     },
     "template": {
       "metadata": {
+        "annotations": {
+          "cluster-autoscaler.kubernetes.io/safe-to-evict": "false"
+        },
         "labels": {
           "app": "cloud-hub",
           "app.kubernetes.io/part-of": "cloud-hub"
