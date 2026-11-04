@@ -46,7 +46,8 @@ def _stat(proc, pid):
     return rest[0], int(rest[1])
 
 
-DAEMONS = ("dockerd", "containerd", "containerd-shim", "containerd-shim-runc-v2", "docker-proxy")
+# comm is cut at 15 characters by the kernel, so the long shim names (containerd-shim-runc-v1/v2) match by argv[0]
+DAEMONS = ("dockerd", "containerd", "containerd-shim", "containerd-shim-runc-v1", "containerd-shim-runc-v2", "docker-proxy")
 
 
 def _comm_and_start(proc, pid):
@@ -185,7 +186,7 @@ def main():
             last = dt.datetime.now(dt.timezone.utc)
     created = [to_dt((s.get("time") or {}).get("created")) for s in sessions if isinstance(s, dict) and isinstance(s.get("time"), dict)]
     created = [t for t in created if t]
-    session_start = max(created).timestamp() if created else None
+    session_start = min(created).timestamp() if created else None  # the OLDEST session: a child of an older session still counts
     print(json.dumps({"busy": is_busy(active) or has_live_child(session_start=session_start), "last_activity": last.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}))
     return 0
 

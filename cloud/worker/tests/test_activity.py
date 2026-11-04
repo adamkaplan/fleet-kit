@@ -244,6 +244,66 @@ class Activity(unittest.TestCase):
         self.assertIs(self.busy(root, script=SCRIPT), True)  # control: the real tool
         self.assertIs(self.busy(root, script=path), False, "mutant ignoring the child must report busy false (the long command would be ended)")
 
+    # main() wiring of the session start, on a stub server with two sessions (created 1700000000 s and 1700000400 s) and a stub /proc
+    def two_session_busy(self, procs, script=SCRIPT):
+        import http.server
+        import threading
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path == "/api/session/active":
+                    body = {"data": {}}
+                else:
+                    body = {"data": [{"id": "a", "time": {"created": 1700000000000, "updated": 1700000100000}},
+                                     {"id": "b", "time": {"created": 1700000400000, "updated": 1700000500000}}]}
+                raw = json.dumps(body).encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+            def log_message(self, *a):
+                pass
+
+        srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+        t = threading.Thread(target=srv.serve_forever, daemon=True)
+        t.start()
+        try:
+            root = self.timed(procs)
+            e = dict(os.environ, CW_ACTIVITY_PORT=str(srv.server_address[1]), CW_ACTIVITY_PASSWORD_FILE=self.pwfile,
+                     CW_ACTIVITY_PROC=root, CW_ACTIVITY_UNDER_TEST="1")
+            p = subprocess.run([sys.executable, script], env=e, capture_output=True, text=True, timeout=30)
+            self.assertEqual(p.returncode, 0, p.stderr)
+            return json.loads(p.stdout)["busy"]
+        finally:
+            srv.shutdown()
+            srv.server_close()
+            t.join(5)
+
+    def test_a_child_started_between_two_sessions_counts(self):
+        # starts at 1700000200 s: after the oldest session (1700000000 s), before the newest (1700000400 s)
+        self.assertIs(self.two_session_busy({1: ("S", 0, "opencode", 1), 50: ("S", 1, "pytest", 120000)}), True)
+
+    def test_main_wires_the_session_start(self):
+        boot = {1: ("S", 0, "opencode", 1), 50: ("S", 1, "helper", 50000)}
+        after = {1: ("S", 0, "opencode", 1), 50: ("S", 1, "pytest", 150000)}
+        self.assertIs(self.two_session_busy(after), True)
+        self.assertIs(self.two_session_busy(boot), False)
+
+    def test_mutant_passing_no_session_start_fails_the_boot_time_case(self):
+        with open(SCRIPT) as f:
+            real = f.read()
+        old = "has_live_child(session_start=session_start)"
+        self.assertEqual(real.count(old), 1)
+        mutant = real.replace(old, "has_live_child()")
+        self.assertNotEqual(mutant, real)  # applied, computed from the two texts
+        path = os.path.join(self.tmp.name, "mutant_nostart.py")
+        with open(path, "w") as f:
+            f.write(mutant)
+        boot = {1: ("S", 0, "opencode", 1), 50: ("S", 1, "helper", 50000)}
+        self.assertIs(self.two_session_busy(boot, SCRIPT), False)  # control: the real tool
+        self.assertIs(self.two_session_busy(boot, path), True, "mutant without the session start must count a boot-time process")
+
 
 class Dockerfile(unittest.TestCase):
     def test_the_three_commands_are_installed(self):
