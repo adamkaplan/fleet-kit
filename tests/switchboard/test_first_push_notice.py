@@ -18,6 +18,10 @@ def CW():
     return sb.load_module("cloud_worker").bind(vars(sb))
 
 
+def FP():
+    return CW()._first_push()
+
+
 MAIN, WORK = "a" * 40, "b" * 40
 
 
@@ -39,13 +43,13 @@ class TestFirstPushNotice(unittest.TestCase):
             return self.answer
         self.engine = types.SimpleNamespace(state_dir=self.dir.name, now=lambda: self.clock, audit=None, actor="t", first_push_runner=runner,
                                             send=lambda frm, to, text: self.sent.append((frm, to, text)))
-        CW().record_first_push_watch(self.dir.name, "coder7", "lead", "acme/widget-api", "feature", BASE + 1800, BASE)
+        FP().record_first_push_watch(self.dir.name, "coder7", "lead", "acme/widget-api", "feature", BASE + 1800, BASE)
 
     def report(self, at):
         sb._write_small(self.dir.name, sb.LAST_REPORT_FILE, {"coder7": {"at": at}})
 
     def tick(self):
-        return CW().first_push_tick(self.engine)
+        return FP().first_push_tick(self.engine)
 
     def test_a_pod_with_no_push_and_no_report_at_its_checkpoint_is_noticed_once(self):
         self.assertEqual(self.tick(), ["coder7"])
@@ -67,11 +71,11 @@ class TestFirstPushNotice(unittest.TestCase):
     def test_a_pod_that_pushed_a_pod_that_reported_and_a_pod_already_noticed_get_none_on_a_second_pass(self):
         self.answer = listing(WORK)   # the branch head differs from HEAD: coder7 pushed
         self.assertEqual(self.tick(), [])
-        CW().record_first_push_watch(self.dir.name, "coder8", "lead", "acme/widget-api", "feature", BASE + 1800, BASE)
+        FP().record_first_push_watch(self.dir.name, "coder8", "lead", "acme/widget-api", "feature", BASE + 1800, BASE)
         sb._write_small(self.dir.name, sb.LAST_REPORT_FILE, {"coder8": {"at": BASE + 600}})   # coder8 reported
         self.assertEqual(self.tick(), [])
         self.answer = listing(None)
-        CW().record_first_push_watch(self.dir.name, "coder9", "lead", "acme/widget-api", "feature", BASE + 1800, BASE)
+        FP().record_first_push_watch(self.dir.name, "coder9", "lead", "acme/widget-api", "feature", BASE + 1800, BASE)
         self.assertEqual(self.tick(), ["coder9"])   # the noticed pod
         self.assertEqual(len(self.sent), 1)
         for _ in range(2):   # the second pass: none of the three gets a notice
@@ -98,13 +102,13 @@ class TestFirstPushNotice(unittest.TestCase):
         self.assertEqual(len(self.sent), 1)
 
     def test_a_launch_records_its_watch_from_the_checkpoint_flag_or_the_brief(self):
-        module = CW()
+        module = FP()
         args = argparse.Namespace(reports_to="lead", checkpoint="30m")
         module._watch_first_push(self.dir.name, "coder1", args, "acme/widget-api", "feature", "", BASE)
         brief = "CHECKPOINT: report at 20 minutes; overdue at 40 minutes"
         module._watch_first_push(self.dir.name, "coder2", argparse.Namespace(reports_to="lead", checkpoint=None), "acme/widget-api", "feature", brief, BASE)
         module._watch_first_push(self.dir.name, "coder3", argparse.Namespace(reports_to=None, checkpoint="30m"), "acme/widget-api", "feature", "", BASE)
-        watch = sb._read_small(self.dir.name, module.FIRST_PUSH_FILE)
+        watch = sb._read_small(self.dir.name, FP().FIRST_PUSH_FILE)
         self.assertEqual(watch["coder1"]["at"], BASE + 1800)
         self.assertEqual(watch["coder2"]["at"], BASE + 1200)
         self.assertNotIn("coder3", watch)
@@ -112,7 +116,18 @@ class TestFirstPushNotice(unittest.TestCase):
 
 
 CW_SOURCE = sb.load_module("cloud_worker").__file__
+FP_SOURCE = sb.load_module("cloud_first_push").__file__
 SB_SOURCE = SWITCHBOARD
+
+
+def mutated_first_push(source):
+    """The first-push part executed from `source` (a textual variant), with the cloud worker's names set as `_first_push()` sets them."""
+    mod = types.ModuleType("fp_first_push_mutant")
+    mod.__dict__["__file__"] = FP_SOURCE
+    worker = CW()
+    mod.H, mod.D = worker.H, worker._Stayed()
+    exec(compile(source, "fp_first_push_mutant", "exec"), mod.__dict__)
+    return mod
 
 
 def mutated_module(source):
@@ -172,7 +187,7 @@ def drive_launch(module, state):
 def drive_pass(finish_pass, state):
     """One pass of `finish_pass` with a due watch in the state; the other ticks are quiet or fail into engine._failed. Returns what was sent."""
     sent = []
-    CW().record_first_push_watch(state, "coder7", "lead", "acme/widget-api", "feature", BASE + 1800, BASE)
+    FP().record_first_push_watch(state, "coder7", "lead", "acme/widget-api", "feature", BASE + 1800, BASE)
     engine = types.SimpleNamespace(state_dir=state, now=lambda: BASE + 1900, audit=None, actor="t", first_push_runner=lambda argv, **kw: listing(None),
                                    send=lambda frm, to, text: sent.append((to, text)), _failed=lambda *a: None)
     quiet = lambda *a, **k: None
@@ -202,7 +217,7 @@ class TestFirstPushWiring(unittest.TestCase):
         with tempfile.TemporaryDirectory() as state:
             module = self.module or CW()
             self.assertEqual(drive_launch(module, state), sb.EXIT_OK)
-            watch = sb._read_small(state, module.FIRST_PUSH_FILE)
+            watch = sb._read_small(state, FP().FIRST_PUSH_FILE)
             self.assertEqual(watch.get("coder5", {}).get("boss"), "lead", "the launch wrote its first-push watch")
             self.assertEqual(watch["coder5"]["at"], BASE + 1800)
 
@@ -230,7 +245,7 @@ class TestFirstPushMutants(unittest.TestCase):
         return result
 
     def test_deleting_the_launch_call_fails_the_launch_test(self):
-        old = "    _watch_first_push(state, name, args, repo, branch, brief, now())"
+        old = "    _first_push()._watch_first_push(state, name, args, repo, branch, brief, now())"
         self.check_launch(old, "    pass")
 
     def check_launch(self, old, new):
@@ -244,7 +259,7 @@ class TestFirstPushMutants(unittest.TestCase):
         self.assertIn(name, str(result.failures[0][0]))
 
     def test_deleting_the_pass_call_fails_the_pass_test(self):
-        old = "load_module(\"cloud_worker\").bind(globals()).first_push_tick(engine, discovery)"
+        old = "load_module(\"cloud_worker\").bind(globals())._first_push().first_push_tick(engine, discovery)"
         name = WIRING[1]
         control = self.run_named(TestFirstPushWiring, name, finish=finish_pass_variant(old, old))
         self.assertEqual((control.failures, control.errors), ([], []), "control passes")
@@ -253,11 +268,11 @@ class TestFirstPushMutants(unittest.TestCase):
         self.assertIn(name, str(result.failures[0][0]))
 
     def notice_variant(self, old, new, name):
-        text = Path(CW_SOURCE).read_text()
+        text = Path(FP_SOURCE).read_text()
         self.assertEqual(text.count(old), 1, "anchored text")
         for source, passes in ((text, True), (text.replace(old, new), False)):
-            module = mutated_module(source)
-            with mock.patch.dict(globals(), {"CW": lambda: module}):
+            module = mutated_first_push(source)
+            with mock.patch.dict(globals(), {"FP": lambda: module}):
                 result = self.run_named(TestFirstPushNotice, name)
             if passes:
                 self.assertEqual((result.failures, result.errors), ([], []), "control passes")
