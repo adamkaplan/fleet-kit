@@ -1303,7 +1303,7 @@ def triage_queue_fact(state, due, now, cfg, other_owner=0, invalid=()):
         summary = "triage: no stale item to show; parked without a valid `Parked until: YYYY-MM-DD` line (treated as not parked): %s." % ", ".join(invalid)
         state.facts["triage:parked:%s" % hashlib.sha256(summary.encode()).hexdigest()[:10]] = (summary, now)
         return summary
-    summary = "triage: %d finding%s: %s%s. %s. Resolve, route or escalate each; the triage changes nothing on GitHub." % (
+    summary = triage_digest_text(state, len(due), shown, kinds, other_owner, invalid)
         len(due), "" if len(due) == 1 else "s", ", ".join("%s %s%s" % (ref, rule, " (%s)" % state.reasons[(rule, ref)] if (rule, ref) in state.reasons else "") for rule, ref in shown),
         " (+%d more)" % (len(due) - len(shown)) if len(due) > len(shown) else "",
         "; ".join("%s = %s" % (k, TRIAGE_KINDS[k]) for k in kinds))
