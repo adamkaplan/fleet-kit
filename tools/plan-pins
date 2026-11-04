@@ -1,0 +1,227 @@
+#!/usr/bin/env python3
+"""plan-pins: the OTHER lines of the repository that a plan's edits would break, printed before the plan is sent (ask #2092).
+
+    tools/plan-pins [--root DIR] [--no-checks] [--check NAME=CMD ...] EDITS.json
+    tools/plan-pins [--root DIR] -          (the list on standard input)
+
+EDITS.json is a list of planned edits: [{"file": "...", "old": "exact old text", "new": "new text"}].
+
+Part 1, a search (nothing is run, nothing is written). Each line of a tracked file other than the edited one that is
+  quote    quotes the old text or one of its distinctive lines (a stripped line of 12 or more characters);
+  digest   holds the SHA-256 of a changed file (the digest of the file as it is now);
+  count    holds a number equal to the row or entry count of the changed table (the run of `|` rows, `-` items or quoted
+           entries that holds the old text), with a word of rows or entries on the line and the table's name within 3 lines;
+  mutant   passes the old text to a mutation helper (a call named mutat*, plant*, anchor or replace on the line or the 3 lines before).
+is printed as `file:line: kind: text`, one per line. A line that is a mutant is not also printed as a quote.
+
+Part 2, the scanning checks (skipped by --no-checks). The edits are applied to a scratch copy (git worktree of HEAD under /tmp,
+removed at the end) and each check is run there; a failing check prints `FAIL name: file:line` (the last file:line its output
+names, else the check's command). The real tree is never written. --check NAME=CMD replaces the default checks.
+
+Exit 0 always when it ran (it informs); exit 2 with one plain line for an unreadable list or an old text absent from its file.
+Standard library only."""
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DEFAULT_CHECKS = [
+    ("wired-tests", "env -u PYTHONDONTWRITEBYTECODE python3 bin/test-switchboard -k TestEveryTestFileIsWired -k TestWiredCheckPlanted -k TestSupportRebinding"),
+    ("neutral-names", "bash bin/test-cloud-neutral-names"),
+    ("chain-list", "env -u PYTHONDONTWRITEBYTECODE python3 cloud/launcher/tests/test_chain_list.py"),
+    ("chain-time", "env -u PYTHONDONTWRITEBYTECODE python3 cloud/launcher/tests/test_chain_time.py"),
+]
+MIN_LINE = 12
+MUTANT_CALL = re.compile(r"(mutat\w*|plant\w*|anchor\w*|replace)\s*\(", re.I)
+ROW_WORDS = re.compile(r"\b(rows?|entr(?:y|ies)|rules?|items?)\b", re.I)
+
+
+class Bad(Exception):
+    pass
+
+
+def git_files(root):
+    out = subprocess.run(["git", "ls-files", "-z"], cwd=root, capture_output=True).stdout.decode("utf-8", "replace")
+    return [f for f in out.split("\0") if f]
+
+
+def read_text(root, rel):
+    try:
+        with open(os.path.join(root, rel), "rb") as fh:
+            data = fh.read()
+    except OSError:
+        return None
+    if b"\0" in data:
+        return None
+    return data.decode("utf-8", "replace")
+
+
+def distinctive(old):
+    seen = []
+    for ln in old.splitlines():
+        s = ln.strip()
+        if len(s) >= MIN_LINE and s not in seen:
+            seen.append(s)
+    return seen
+
+
+def table_block(text, old):
+    """(count, name_words) of the run of table-like lines that holds `old` in `text`; (None, []) when none."""
+    at = text.find(old)
+    if at < 0:
+        return None, []
+    lines = text.splitlines()
+    n = text.count("\n", 0, at)
+    def kind(s):
+        s = s.strip()
+        if s.startswith("|"):
+            return "|"
+        if s.startswith("- "):
+            return "-"
+        if s[:1] in "\"'":
+            return "q"
+        return None
+    k = kind(lines[n]) if n < len(lines) else None
+    if not k:
+        return None, []
+    a = b = n
+    while a > 0 and kind(lines[a - 1]) == k:
+        a -= 1
+    while b + 1 < len(lines) and kind(lines[b + 1]) == k:
+        b += 1
+    block = lines[a:b + 1]
+    if k == "|":
+        sep = any(re.fullmatch(r"[\s|:-]+", x) for x in block)
+        block = [x for x in block if not re.fullmatch(r"[\s|:-]+", x)]
+        if sep:
+            block = block[1:]   # the header row
+    return len(block), []
+
+
+def search(root, edits):
+    files = git_files(root)
+    edited = {e["file"] for e in edits}
+    found = []
+    digests = {}
+    counts = []
+    for e in edits:
+        text = read_text(root, e["file"])
+        if text is None or e["old"] not in text:
+            raise Bad("the old text is not in %s" % e["file"])
+        digests[hashlib.sha256(text.encode("utf-8")).hexdigest()] = e["file"]
+        n, _ = table_block(text, e["old"])
+        if n is not None and e["old"].count("\n") != e["new"].count("\n"):
+            stem = os.path.splitext(os.path.basename(e["file"]))[0]
+            counts.append((n, e["file"], {stem, stem.replace("-", "_"), stem.replace("_", "-"), stem.replace("_", " ").replace("-", " ")}))
+    quotes = []
+    for e in edits:
+        quotes.append((e["file"], e["old"], distinctive(e["old"])))
+    for rel in files:
+        if rel in edited:
+            continue
+        text = read_text(root, rel)
+        if text is None:
+            continue
+        lines = text.splitlines()
+        for i, ln in enumerate(lines):
+            hit = None
+            for f, old, parts in quotes:
+                for p in ([old] if "\n" not in old and len(old.strip()) >= 1 else []) + parts:
+                    if p and p in ln:
+                        hit = p
+                        break
+                if hit:
+                    break
+            if hit:
+                ctx = "\n".join(lines[max(0, i - 3):i + 1])
+                kind = "mutant" if MUTANT_CALL.search(ctx) else "quote"
+                found.append((rel, i + 1, kind, ln.strip()))
+                continue
+            for d, f in digests.items():
+                if d in ln:
+                    found.append((rel, i + 1, "digest", ln.strip()))
+            for n, f, names in counts:
+                if re.search(r"(?<![\w.])%d(?![\w.])" % n, ln) and ROW_WORDS.search(ln):
+                    near = "\n".join(lines[max(0, i - 3):i + 4])
+                    if any(nm and nm in near for nm in names):
+                        found.append((rel, i + 1, "count", ln.strip()))
+    return found
+
+
+def run_checks(root, edits, checks):
+    scratch = tempfile.mkdtemp(prefix="plan-pins-", dir="/tmp")
+    wt = os.path.join(scratch, "wt")
+    failed = []
+    try:
+        r = subprocess.run(["git", "worktree", "add", "--detach", wt, "HEAD"], cwd=root, capture_output=True, text=True)
+        if r.returncode:
+            raise Bad("cannot make the scratch copy: " + r.stderr.strip()[:200])
+        for e in edits:
+            p = os.path.join(wt, e["file"])
+            with open(p, encoding="utf-8") as fh:
+                t = fh.read()
+            with open(p, "w", encoding="utf-8") as fh:
+                fh.write(t.replace(e["old"], e["new"], 1))
+        for name, cmd in checks:
+            try:
+                r = subprocess.run(cmd, shell=True, cwd=wt, capture_output=True, text=True, timeout=900)
+            except subprocess.TimeoutExpired:
+                failed.append((name, "timed out: " + cmd))
+                continue
+            if r.returncode:
+                out = (r.stdout + "\n" + r.stderr)
+                hits = re.findall(r'(?:File ")?([\w./-]+\.\w+)(?::|", line )(\d+)', out)
+                where = "%s:%s" % hits[-1] if hits else cmd
+                failed.append((name, where))
+    finally:
+        subprocess.run(["git", "worktree", "remove", "--force", wt], cwd=root, capture_output=True)
+        shutil.rmtree(scratch, ignore_errors=True)
+    return failed
+
+
+def main(argv):
+    root = HERE
+    checks = None
+    run = True
+    src = None
+    i = 0
+    try:
+        while i < len(argv):
+            a = argv[i]
+            if a == "--root":
+                root = os.path.abspath(argv[i + 1]); i += 2
+            elif a == "--no-checks":
+                run = False; i += 1
+            elif a == "--check":
+                name, _, cmd = argv[i + 1].partition("=")
+                checks = (checks or []) + [(name, cmd)]; i += 2
+            else:
+                src = a; i += 1
+        if src is None:
+            raise Bad("usage: tools/plan-pins [--root DIR] [--no-checks] [--check NAME=CMD] EDITS.json")
+        try:
+            raw = sys.stdin.read() if src == "-" else open(src, encoding="utf-8").read()
+            edits = json.loads(raw)
+            assert isinstance(edits, list) and all(isinstance(e, dict) and {"file", "old", "new"} <= set(e) for e in edits)
+        except (OSError, ValueError, AssertionError):
+            raise Bad("the edits are not a readable JSON list of {file, old, new}")
+        found = search(root, edits)
+        for rel, n, kind, text in sorted(set(found)):
+            print("%s:%d: %s: %s" % (rel, n, kind, text[:160]))
+        print("found %d line(s)" % len(set(found)))
+        if run:
+            for name, where in run_checks(root, edits, checks or DEFAULT_CHECKS):
+                print("FAIL %s: %s" % (name, where))
+    except Bad as e:
+        print("plan-pins: %s" % e)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
