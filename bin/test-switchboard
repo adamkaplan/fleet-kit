@@ -75127,6 +75127,42 @@ class TestBlockedMutants(Base):
             result = unittest.TextTestRunner(stream=io.StringIO()).run(suite)
         return bool(result.failures or result.errors)
 
+    def killed_each(self, mutants, workers=2):
+        """{id: killed?} for {id: (source text, test)}: each mutant is built and its named test run in a forked CHILD (the parent's tree is never touched), `workers` at a time."""
+        out, running = {}, {}
+
+        def reap():
+            pid, _ = os.wait()
+            ident, fd = running.pop(pid)
+            with os.fdopen(fd) as pipe:
+                out[ident] = pipe.read() == "1"
+
+        for ident, (text, test) in mutants.items():
+            if len(running) >= workers:
+                reap()
+            read, write = os.pipe()
+            pid = os.fork()
+            if pid == 0:
+                code = 70
+                try:
+                    os.close(read)
+                    answer = "1" if self.killed(self.mutant_module(text), test) else "0"
+                    os.write(write, answer.encode())
+                    code = 0
+                finally:
+                    os._exit(code)
+            os.close(write)
+            running[pid] = (ident, read)
+        while running:
+            reap()
+        return out
+
+    def control_passes(self, tests):
+        """Control first: every named test passes on the real code, so a kill below is the mutant's and not a broken test."""
+        for test in sorted(set(tests)):
+            result = unittest.TextTestRunner(stream=io.StringIO()).run(unittest.TestSuite([TestBlockedReport(test)]))
+            self.assertEqual((result.failures, result.errors), ([], []), test)
+
     def test_the_table_covers_every_guard_of_the_code_and_names_only_real_tests(self):
         text = switchboard_source()
         self.assertEqual(sorted(blocked_guards(text)), sorted(BLOCKED_GUARD_KILLERS), "a guard without a row (or a row without a guard): add its row and its mutant")
@@ -75147,20 +75183,22 @@ class TestBlockedMutants(Base):
 
     def test_every_guard_negated_is_killed_by_its_named_test(self):
         text = SWITCHBOARD.read_bytes()
-        survivors = []
-        for ident, (start, end) in sorted(blocked_guards(text.decode()).items()):
-            mutant = text[:start] + b"not (" + text[start:end] + b")" + text[end:]
-            if not self.killed(self.mutant_module(mutant), BLOCKED_GUARD_KILLERS[ident]):
-                survivors.append(ident)
+        guards = blocked_guards(text.decode())
+        self.control_passes(BLOCKED_GUARD_KILLERS[ident] for ident in guards)
+        mutants = {ident: ((text[:start] + b"not (" + text[start:end] + b")" + text[end:]), BLOCKED_GUARD_KILLERS[ident]) for ident, (start, end) in sorted(guards.items())}
+        killed = self.killed_each(mutants)
+        survivors = [ident for ident in sorted(mutants) if not killed[ident]]
         self.assertEqual(survivors, [], "these negated guards pass their named test")
 
     def test_every_bound_lock_validator_and_key_mutant_is_killed_by_its_named_test(self):
-        text, survivors = switchboard_source(), []
+        text, mutants = switchboard_source(), {}
+        self.control_passes(row[3] for row in BLOCKED_TEXT_MUTANTS.values())
         for ident, (anchor, old, new, test) in sorted(BLOCKED_TEXT_MUTANTS.items()):
             at = text.index(anchor) if anchor else 0
             where = text.index(old, at)
-            if not self.killed(self.mutant_module(text[:where] + new + text[where + len(old):]), test):
-                survivors.append(ident)
+            mutants[ident] = (text[:where] + new + text[where + len(old):], test)
+        killed = self.killed_each(mutants)
+        survivors = [ident for ident in sorted(mutants) if not killed[ident]]
         self.assertEqual(survivors, [], "these mutants pass their named test")
 
 class TestPaneExit(Base):
