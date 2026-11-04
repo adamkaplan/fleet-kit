@@ -31920,10 +31920,27 @@ class TestRegistrarFloor(LedgerBase):
             source = (BIN / "fleet-switchboard").read_text()
             tree = ast.parse(source)
             reach = self.dc.closure(tree, self.dc.daemon_roots(self.rule), self.rule["dynamic_actions"])
-            TestRegistrarFloor.cache = (source, tree, sorted(reach[0] | reach[1]), sorted(reach[0]), sorted(reach[1]))
-        self.base_src, self.tree, self.names, self.defs, self.bindings = TestRegistrarFloor.cache
+            TestRegistrarFloor.cache = (source, tree, sorted(reach[0] | reach[1]), sorted(reach[0]), sorted(reach[1]), self.small_source(tree, set(reach[0] | reach[1])))
+        self.base_src, self.tree, self.names, self.defs, self.bindings, self.small_src = TestRegistrarFloor.cache
         self.extra_config = dict(FLOOR_CONFIG, plan_gates={"repos": {"acme/app": {"mode": "shadow"}}})
         self.configure()
+
+    @staticmethod
+    def small_source(tree, names):
+        """The small fixture the planted shapes are linted on (ask #2108): the real file's module-level statements with every function that is not a registrar cut to the bare references it makes to the closure's names (a closure function keeps its edges, any other function goes). The lint of the planted shape answers the same as over the 26k-line file; the real file is linted once, by the tests that say 'real'."""
+        import ast
+        body = []
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if node.name.startswith("add_") and node.name.endswith("_parsers"):
+                    body.append(node)
+                elif node.name in names:
+                    refs = sorted({x.id for x in ast.walk(node) if isinstance(x, ast.Name) and x.id in names and x.id != node.name})
+                    stub = ast.FunctionDef(node.name, node.args, [ast.Expr(ast.Name(r, ast.Load())) for r in refs] or [ast.Pass()], node.decorator_list, None)
+                    body.append(ast.fix_missing_locations(ast.copy_location(stub, node)))
+            else:
+                body.append(node)
+        return ast.unparse(ast.Module(body, []))
 
     memo = {}   # (what, text hash or tree id, ...) -> (the tree it was made from, the value); the last few only
 
@@ -31956,10 +31973,10 @@ class TestRegistrarFloor(LedgerBase):
             self.addCleanup(patcher.stop)
 
     def head_of(self, body, name="add_zzz_parsers", base=None):
-        return (base if base is not None else self.base_src) + "\n\ndef %s(sub):\n    %s\n" % (name, body.replace("\n", "\n    "))
+        return (base if base is not None else self.small_src) + "\n\ndef %s(sub):\n    %s\n" % (name, body.replace("\n", "\n    "))
 
     def found(self, body, name="add_zzz_parsers", base=None):
-        got, why = self.dc.registrar_findings(base if base is not None else self.base_src, self.head_of(body, name, base), self.rule)
+        got, why = self.dc.registrar_findings(base if base is not None else self.small_src, self.head_of(body, name, base), self.rule)
         self.assertIsNone(why, why)
         return got
 
@@ -32121,7 +32138,7 @@ class TestRegistrarFloor(LedgerBase):
         self.assertIn(("a changed line of a function that writes a namespace", "calls", "a statement that may write the module's namespace"), edited[0])
         removed = base.replace("    global %s\n    %s = None\n" % (self.pick()[1], self.pick()[1]), "    sub.add_parser('zzz')\n")
         self.assertEqual(self.dc.registrar_findings(base, removed, self.rule), ([], None), "a removed hostile line: not held")
-        added = self.dc.registrar_findings(self.base_src, base, self.rule)[0]
+        added = self.dc.registrar_findings(self.small_src, base, self.rule)[0]
         self.assertEqual({r for r, _, _ in added} - {"a changed line of a function that writes a namespace"}, {"add_zzz_parsers"})   # (the new rule also names the writer function by its own finding)  # the named rebinding and the grammar's own finding (a Global statement is not in the grammar)
         self.assertIn(("add_zzz_parsers", "rebinds", self.pick()[1]), added)
 
@@ -32207,7 +32224,7 @@ class TestRegistrarFloor(LedgerBase):
         self.assertTrue(self.reg("def add_a_parsers(sub):\n    ZZZ_HEADING = eval\n    p = sub.add_parser('x', description='%s' % ZZZ_HEADING)\n")[0], "a local binding is held")
 
     def reg(self, text, base=None):
-        return self.dc.registrar_findings(self.base_src if base is None else base, (self.base_src if base is None else base) + "\n" + text + "\n", self.rule)
+        return self.dc.registrar_findings(self.small_src if base is None else base, (self.small_src if base is None else base) + "\n" + text + "\n", self.rule)
 
     def test_a_registrar_bound_in_any_form_the_daemon_could_pick_up_is_read_or_held(self):
         function, binding, module = self.pick()
@@ -32238,7 +32255,7 @@ class TestRegistrarFloor(LedgerBase):
         self.assertIn(("add_a_parsers (through _zzz_helper)", "rebinds", binding), got)
         got, why = self.reg("def add_a_parsers(sub):\n    _zzz_helper2()\ndef _zzz_helper2():\n    _zzz_helper3()\ndef _zzz_helper3():\n    %s()\n" % function)
         self.assertTrue(any(v == "calls" and "through _zzz_helper3" in r for r, v, _ in got), got)   # transitive
-        base = self.base_src + "\n" + helper + "def add_a_parsers(sub):\n    pass\n"   # a hostile helper already there, no registrar calls it
+        base = self.small_src + "\n" + helper + "def add_a_parsers(sub):\n    pass\n"   # a hostile helper already there, no registrar calls it
         self.assertEqual(self.dc.registrar_findings(base, base, self.rule), ([], None))
         edited = base.replace("def add_a_parsers(sub):\n    pass\n", "def add_a_parsers(sub):\n    thing = sub.add_parser('a')\n")
         self.assertEqual(self.dc.registrar_findings(base, edited, self.rule), ([], None), "a different line of the registrar: the helper is not named")
@@ -32597,9 +32614,25 @@ class TestRegistrarFloor(LedgerBase):
             "def hh(text):\n    import os\n    return os.fspath(text)\ndef hh2(text):\n    import os\n    return text\nSTATES = FIELDS + FIELDS\n")   # a registration helper OUTSIDE the closure (as on a registrar split), whose body a registrar's lint would hold
     FAKE_RULE = {"closure_roots": ["main"], "rating_roots": [], "dynamic_actions": [], "registrar_allow": {"pure_builtins": ["int", "str"], "helpers": ["hh", "hh2"], "parser_methods": VERBS, "free_keywords": FREE_KEYWORDS}}
 
-    def table_failures(self, dc):
-        """[row that does not hold] for the table below, run on the lint module `dc` (the real one, or a mutant of it)."""
-        fake, rule, bad = self.FAKE, self.FAKE_RULE, []
+    class _FirstRow(Exception):
+        pass
+
+    def table_failures(self, dc, first_only=False):
+        """[row that does not hold] for the table below, run on the lint module `dc` (the real one, or a mutant of it). `first_only`: stop at the first row that does not hold (a mutant is only asked to fail ONE row: the list is then non-empty, the same assertion)."""
+        class Rows(list):
+            def append(rows, item):
+                list.append(rows, item)
+                if first_only:
+                    raise TestRegistrarFloor._FirstRow()
+        bad = Rows()
+        try:
+            self._table_rows(dc, bad)
+        except TestRegistrarFloor._FirstRow:
+            pass
+        return list(bad)
+
+    def _table_rows(self, dc, bad):
+        fake, rule = self.FAKE, self.FAKE_RULE
         def run(text, base=None):
             return dc.registrar_findings(fake if base is None else base, (fake if base is None else base) + text, rule)
         def has(label, text, want, base=None):
@@ -32957,13 +32990,13 @@ class TestRegistrarFloor(LedgerBase):
             with self.subTest(key):
                 module = self.mutant_module("NOT_BINDERS = {", "NOT_BINDERS = {")
                 module.STRING_BINDERS = {k: v for k, v in module.STRING_BINDERS.items() if k != key}
-                self.assertTrue(self.table_failures(module), "a lint that does not read %s as a binder survives" % key)
+                self.assertTrue(self.table_failures(module, first_only=True), "a lint that does not read %s as a binder survives" % key)
 
     def test_the_table_holds_on_the_real_lint_and_every_mutant_of_it_fails_a_row(self):
         self.assertEqual(self.table_failures(self.dc), [], "the table holds on the real lint")
         for label, old, new in self.MUTANTS:
             with self.subTest(label):
-                self.assertTrue(self.table_failures(self.mutant_module(old, new)), "the mutant survives: %s" % label)
+                self.assertTrue(self.table_failures(self.mutant_module(old, new), first_only=True), "the mutant survives: %s" % label)
 
     N = "REGISTRAR_NAME_RE"
     # one form per member of PATTERN_BINDERS (the node class that binds the name): the text that binds it
@@ -33046,9 +33079,9 @@ class TestRegistrarFloor(LedgerBase):
 
     def rebind_held(self, module, spelling):
         """True when the REAL owner_decide holds the daemon file text with the spelling and `zz_evil` appended; an exception of a mutant counts as not held."""
-        head = self.base_src + "\n" + spelling + "\n" + self.EVIL
+        head = self.small_src + "\n" + spelling + "\n" + self.EVIL
         try:
-            got, why = module.registrar_findings(self.base_src, head, self.rule)
+            got, why = module.registrar_findings(self.small_src, head, self.rule)
         except Exception:
             return False
         report = {"findings": got, "closure": self.names, "why": why}
@@ -33138,7 +33171,7 @@ class TestRegistrarFloor(LedgerBase):
 
     def test_the_cli_the_daemon_the_gate_and_the_delegated_clear_all_read_the_same_hold(self):
         function, binding, module = self.pick()
-        self.serve(self.head_of(self.HOSTILE % (binding, binding)))
+        self.serve(self.head_of(self.HOSTILE % (binding, binding), base=self.base_src))
         shown = json.loads(self.run_as("coder", "impact", "floor", self.PR, "--json")[1])
         report = sb.pr_floor_report(self.engine(), "acme/app", 9)
         self.assertEqual((shown["owner_decision"], shown["owner_reasons"]), (report["owner_decision"], report["owner_reasons"]))
@@ -33153,7 +33186,7 @@ class TestRegistrarFloor(LedgerBase):
         self.assertTrue(any("registrar add_zzz_parsers" in r for r in got["reasons"]))
 
     def test_a_flag_only_registrar_edit_and_an_unchanged_daemon_file_do_not_add_a_reason(self):
-        self.serve(self.head_of("thing = sub.add_parser('zzz')\nthing.add_argument('--x', type=issue_arg)"))
+        self.serve(self.head_of("thing = sub.add_parser('zzz')\nthing.add_argument('--x', type=issue_arg)", base=self.base_src))
         report = sb.pr_floor_report(self.engine(), "acme/app", 9)
         self.assertEqual(report["registrar_reasons"], [])
         self.pr = dict(self.pr, changedFiles=1, files=[{"path": "docs/a.md", "additions": 1, "deletions": 0}])
