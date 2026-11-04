@@ -1875,8 +1875,8 @@ def fact_sources(state_dir):
     reminders join this list. `send` delivers directly, by the same rule, and
     stores only a send held for a blocked agent (HeldSendFacts).
     """
-    return [lab_fact_source(state_dir), WorkerFacts(), ReminderFacts(state_dir), ReportRiderFacts(state_dir), HeldSendFacts(state_dir),
-            ForegroundFacts(), OrdersFacts(), SweepFacts(), TriageFacts(), PlanWakeFacts(), AlertWakeFacts(), RedCiFacts(), JobFacts(), PaneFacts(), PaneExitFacts(), HeadlessRestartFacts(), DiskFacts(), CpuFacts(), SpotlightFacts(), DockerReapFacts(), TempJanitorFacts(), HeavyOrphanFacts()]
+    return [lab_fact_source(state_dir), WorkerFacts(), ReminderFacts(state_dir), ReportRiderFacts(state_dir),
+            ForegroundFacts(), OrdersFacts(), SweepFacts(), TriageFacts(), PlanWakeFacts(), AlertWakeFacts(), RedCiFacts(), JobFacts(), PaneFacts(), PaneExitFacts(), HeadlessRestartFacts(), DiskFacts(), CpuFacts(), SpotlightFacts(), DockerReapFacts(), TempJanitorFacts(), HeavyOrphanFacts(), ScratchBoundFacts()]
 
 
 # --------------------------------------------------------- observing the fleet
@@ -2997,6 +2997,9 @@ class Switchboard:
                 return decide(recipient, facts, None, now, self.batch_seconds, self.engaged_seconds,
                               "cannot read what %s already has: %s" % (recipient, err))
             pending = [fact for fact in facts if fact.key not in delivered]
+            if self.sent is not None and len(pending) != len(facts):   # the ledger answered (v2_light)
+                self._note("resend.skipped", recipient, {"why": "the key was already delivered to this session (sent-keys ledger)",
+                                                         "keys": sorted(fact.key for fact in facts if fact.key in delivered)})
             self._acknowledge(delivered)
             if pending and not complete:
                 return decide(recipient, pending, None, now, self.batch_seconds, self.engaged_seconds,
@@ -9740,6 +9743,10 @@ def finish_pass(engine, discovery, report):
         publish_decisions(engine)
     except Exception as err:
         engine._failed("decisions", "decisions", err, report)
+    try:
+        publish_cockpit(engine)   # #1423: the Cockpit's fleet feed (cockpit.json), read-only over the files the pass just wrote; never stops the pass
+    except Exception as err:
+        engine._failed("cockpit", "cockpit", err, report)
     try:
         write_catching_up(engine)
     except Exception as err:
@@ -20006,7 +20013,7 @@ def ci_record_core(ctx, now, quiet=False):
     "nothing" (CI is green but no per-PR scenario names `ci`), "not-green", "unreadable", "no-plan" or "no-head". It records
     only for a complete, green run at the PR's CURRENT head and the plan's CURRENT hash, never twice, and writes nothing to GitHub.
     `quiet` leaves the audit alone for everything but a real record (the pass runs this for many PRs: a failing run is not news)."""
-    out = {"status": None, "head": None, "ci": None, "scenarios": [], "recorded": [], "already": [], "why": None}
+    out = {"status": None, "head": None, "ci": None, "scenarios": [], "recorded": [], "already": [], "proved": [], "why": None}
     if ctx.unreadable:
         return dict(out, status="unreadable", why="the PR could not be read: %s" % ctx.unreadable)
     head = (ctx.facts or {}).get("head")
@@ -20041,6 +20048,16 @@ def ci_record_core(ctx, now, quiet=False):
         if not quiet:   # nothing was recorded, so this is NOT proof that the recorder works (ok stays False for the preflight)
             _gates_audit(ctx.engine, "gate.ci_record", ctx.pr, dict(detail, ok=False, why="no scenario names ci"))
         return dict(out, status="nothing")
+    try:   # the run is on refs/pull/N/merge: a merge ref whose first parent is not the base's current head is a stale run, and records nothing (#2053 reader)
+        gh = getattr(ctx.engine, "gh_runner", None) or subprocess.run
+        parents = merge_ref_read(gh, ctx.repo, ctx.number)
+        base, base_head = merge_ref_base_head(gh, ctx.repo, ctx.number) if parents else (None, None)
+    except MergeRefError as err:   # an unreadable merge ref cannot be shown fresh: nothing is recorded, and the one line names the error
+        return dict(out, status="stale", why="the merge ref could not be read (%s): nothing was recorded" % _one_line(str(err), 120))
+    if parents is None:   # no merge ref (a 404): freshness cannot be shown, so nothing is recorded
+        return dict(out, status="stale", why="the pull request has no merge ref, so it cannot be shown fresh: nothing was recorded")
+    if parents and parents[0] != base_head:
+        return dict(out, status="stale", why="the run is on a stale merge ref (first parent %s, %s head %s): nothing was recorded" % (parents[0][:8], base, base_head[:8]))
     for scenario in wanted:
         fresh = [e for e in ctx.entries if e.get("pr") == ctx.pr and e.get("scenario") == scenario["id"] and e.get("kind") == "verdict"
                  and e.get("evaluator") == "ci" and e.get("plan_hash") == ctx.plan["plan_hash"] and e.get("head") == head
@@ -20053,8 +20070,17 @@ def ci_record_core(ctx, now, quiet=False):
                                              "by": plan_ledger.CI_RECORDER, "evaluator": "ci",
                                              "evidence": "CI green at %s: every check run complete and passing" % head[:12]}, now())
         out["recorded"].append(scenario["id"])
-    if out["recorded"] or not quiet:
-        _gates_audit(ctx.engine, "gate.ci_record", ctx.pr, dict(detail, ok=True, recorded=out["recorded"], already=out["already"]))
+    link = next((r.get("detailsUrl") for r in ((ctx.facts or {}).get("ci_rollup") or []) if isinstance(r, dict) and "/actions/runs/" in str(r.get("detailsUrl") or "")), "")
+    for scenario in wanted:   # the proof of each ci scenario, next to its verdict (same guards: only reached for a green, complete run)
+        if plan_ledger.already_recorded(ctx.entries, {"kind": "proof", "pr": ctx.pr, "scenario": scenario["id"], "plan_hash": ctx.plan["plan_hash"], "head": head, "result": "pass"}):
+            continue
+        plan_ledger.append_once(ctx.state, [{"kind": "proof", "pr": ctx.pr, "scenario": scenario["id"], "plan_ref": ctx.source,
+                                             "plan_hash": ctx.plan["plan_hash"], "head": head, "result": "pass", "by": plan_ledger.CI_RECORDER,
+                                             "evidence": "CI green at %s: %s" % (head[:12], link or "every check run complete and passing"),
+                                             "command": "gates ci-record", "env": "switchboard"}], now())
+        out["proved"].append(scenario["id"])
+    if out["recorded"] or out["proved"] or not quiet:
+        _gates_audit(ctx.engine, "gate.ci_record", ctx.pr, dict(detail, ok=True, recorded=out["recorded"], already=out["already"], proved=out["proved"]))
     return dict(out, status="recorded")
 
 
@@ -20154,6 +20180,9 @@ def cmd_gates_ci_record(args, runner, now):
             print(line)
     if got["status"] in ("unreadable", "no-plan", "no-head", "not-green"):
         raise LedgerCommandError("%s: nothing was recorded" % got["why"])
+    if got["status"] == "stale":
+        print(got["why"])
+        return EXIT_OK
     if got["status"] == "nothing":
         print("CI is green at %s; the plan has no per-PR scenario that names `ci`: nothing to record" % got["head"][:8])
         for line in carry_lines(got.get("carry") or []):
@@ -20161,6 +20190,8 @@ def cmd_gates_ci_record(args, runner, now):
         return EXIT_OK
     print("CI is green at %s: recorded %s%s" % (got["head"][:8], ", ".join(got["recorded"]) or "nothing new",
                                                " (already recorded: %s)" % ", ".join(got["already"]) if got["already"] else ""))
+    if got["proved"]:
+        print("and the proof of %s" % ", ".join(got["proved"]))
     for line in carry_lines(got.get("carry") or []):
         print(line)
     return EXIT_OK
@@ -23330,6 +23361,13 @@ def add_plan_parsers(sub):
     rreport.add_argument("--json", action="store_true")
     tick = review_sub.add_parser("tick", help="Housekeeping: relaunch a stuck lane once, then escalate it; remind an undecided escalation")
     tick.add_argument("--json", action="store_true")
+    apply = plan_sub.add_parser("apply", help="Apply an approved plan edit file to the live plan, refusing unless the live hash, the file and the result hash are the ones named",
+                                 formatter_class=APPLY_HELP_FORMATTER, epilog="Applying an approved plan edit\nLines before the first header are a note and are read by nobody.\nEach pair is `===== OLD <n> (verbatim) =====` then the old text, then `===== NEW <n> (verbatim) =====` then the new text.\nThe numbers run 1, 2, 3 in order.\nThe text of each ends at the line before the next header; its final newline is not part of it.\nThe paragraph that starts `Why:` after the last NEW is the receipt's reason.\nThe file has no other header.")
+    apply.add_argument("issue", help="owner/repo#N, an issue URL, or N with intent_repo set: the ask whose plan comment is edited")
+    apply.add_argument("--file", required=True, help="The edit file, in the standard form (see the planning skill: Applying an approved plan edit)")
+    apply.add_argument("--expect-live", dest="expect_live", required=True, help="The full plan hash the live plan must have")
+    apply.add_argument("--expect-result", dest="expect_result", required=True, help="The full plan hash the Chief of Staff approved the file for")
+    apply.add_argument("--expect-file", dest="expect_file", required=True, help="The sha256 of the file")
 
 
 POLICY_DEFAULTS = {
@@ -24295,6 +24333,8 @@ def cmd_plan(args, runner, now, socket_call=None):
         return cmd_plan_review(args, runner, now, socket_call)
     if args.plan_action == "template":
         return cmd_plan_template(args, runner, now)
+    if args.plan_action == "apply":
+        return cmd_plan_apply(args, runner, now, fleet_mark)
     return cmd_plan_check(args, runner, now)
 
 

@@ -1,4 +1,6 @@
 # ------------------------------------------------------------- OpenCode v2
+import argparse
+APPLY_HELP_FORMATTER = argparse.RawDescriptionHelpFormatter   # the help of `plan apply` keeps its lines
 
 class V2Error(Exception):
     """A v2 call that did not return usable JSON.
