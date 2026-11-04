@@ -1,5 +1,6 @@
 """#1088: the live model credential is read from OpenCode's own store (`opencode auth export`), cut to the ONE provider entry. Offline: a stand-in
 export command that reads $HOME (the launcher scrubs the environment). Every set below is derived from the code (REFUSALS, the two launchers)."""
+import pathlib
 import json
 import os
 import re
@@ -114,8 +115,8 @@ class Reader(unittest.TestCase):
                     GH_TOKEN="g", GITHUB_TOKEN="h", CW_MODEL_AUTH_FILE="/legacy", SSH_AUTH_SOCK="/s")
         before = set(os.listdir(self.home))
         mc.read_provider_entry(PROVIDER, loud)
-        self.assertEqual(open(os.path.join(self.home, "oc-argv")).read().strip(), "auth export")
-        names = {l.split("=", 1)[0] for l in open(os.path.join(self.home, "oc-env")).read().splitlines() if "=" in l}
+        self.assertEqual(pathlib.Path(os.path.join(self.home, "oc-argv")).read_text().strip(), "auth export")
+        names = {l.split("=", 1)[0] for l in pathlib.Path(os.path.join(self.home, "oc-env")).read_text().splitlines() if "=" in l}
         names -= {"PWD", "SHLVL", "_", "OLDPWD"}   # what the shell itself adds
         self.assertEqual({n for n in names if not (n in ("PATH", "HOME", "LANG") or n.startswith("XDG_"))}, set())
         for n in ("CW_CLOUD_TOKEN_FILE", "GH_TOKEN", "KUBECONFIG", "CW_GIT_TOKEN_CMD"):
@@ -123,7 +124,7 @@ class Reader(unittest.TestCase):
         self.assertEqual(set(os.listdir(self.home)) - before - {"oc-argv", "oc-env"}, set())   # no file of the launcher's holds the export
         for name in os.listdir(self.home):
             if name not in ("export.json",):
-                self.assertNotIn(CANARY, open(os.path.join(self.home, name), errors="replace").read(), name)
+                self.assertNotIn(CANARY, pathlib.Path(os.path.join(self.home, name)).read_text(errors="replace"), name)
 
     def test_s4_the_export_child_inherits_no_stdin(self):
         self.export(json.dumps([MINE]))
@@ -131,7 +132,7 @@ class Reader(unittest.TestCase):
         code = "import sys; sys.path.insert(0, %r); import model_credential as mc; mc.read_provider_entry(%r, %r)" % (LAUNCHER, PROVIDER, self.env)
         r = subprocess.run([sys.executable, "-c", code], input=CANARY.encode(), capture_output=True, timeout=60)   # the parent's stdin holds the canary
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertEqual(open(os.path.join(self.home, "oc-stdin")).read(), "")
+        self.assertEqual(pathlib.Path(os.path.join(self.home, "oc-stdin")).read_text(), "")
 
     def test_the_scrub_function_redacts_the_canary_when_it_is_fed_in(self):
         import cloud_worker as cw
@@ -199,11 +200,11 @@ class Family(unittest.TestCase):
         docs = ("docs/cloud-operator-quickstart.md", "cloud/README.md", "cloud/launcher/README.md")
         for rel in docs:
             with self.subTest(rel):
-                text = open(os.path.join(ROOT, rel)).read()
+                text = pathlib.Path(os.path.join(ROOT, rel)).read_text()
                 self.assertIn("opencode auth export", text)
                 for line in text.splitlines():   # the name may appear only to say it is retired
                     self.assertTrue("CW_MODEL_AUTH_FILE" not in line or "retired" in line, line)
-        quick = open(os.path.join(ROOT, docs[0])).read()
+        quick = pathlib.Path(os.path.join(ROOT, docs[0])).read_text()
         self.assertIn("opencode auth list", quick)
         self.assertIn("/api/provider", quick)
 
