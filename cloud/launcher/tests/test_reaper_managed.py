@@ -1,5 +1,6 @@
 """The reaper as a managed process (work item of #876): why it exits, one pass over mixed pods, and a restart that meets a
 pod the last pass already stopped. Offline: the fake kubectl and a fake clock. Every ending of the process is one row of ENDINGS."""
+import pathlib
 import ast
 import io
 import itertools
@@ -18,7 +19,7 @@ import test_cloud_worker as base  # noqa: E402
 cw = base.cw
 
 LINE = r"cloud-worker: \d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ reaper exiting: "
-SOURCE = open(os.path.join(os.path.dirname(HERE), "cloud_worker.py")).read()
+SOURCE = pathlib.Path(os.path.join(os.path.dirname(HERE), "cloud_worker.py")).read_text()
 
 # Every way the reaper process ends: row name -> (the reason its one line gives, where the code writes it).
 ENDINGS = {
