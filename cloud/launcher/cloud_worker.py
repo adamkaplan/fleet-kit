@@ -989,6 +989,8 @@ PREFLIGHT_ENV_NAMES = (
     "CW_APP_ID_CMD",           # optional commands that print the App id and key instead of the vault (app_token.py)
     "CW_APP_INSTALLATION_CMD",   # obsolete: accepted and ignored (the installation is looked up), so an old config still validates
     "CW_APP_KEY_CMD",
+    "CW_TOKEN_SERVICE_URL",   # the service route of the mint (app_token.py): with these two the child reaches the service, not the vault
+    "CW_TOKEN_SERVICE_CALLER_TOKEN_CMD",
 )
 # Never taken from the caller: PATH (a fixed one is built here), HOME and TMPDIR (a private empty directory), PYTHON* (the child runs `python -I`),
 # AZURE_CONFIG_DIR (kept only when an absolute existing directory, else the account's ~/.azure), CW_OPENSSL (kept only when it is an absolute executable file).
@@ -3350,6 +3352,8 @@ SETTINGS = (
     ("CW_CLUSTER_TOKEN_CMD", False, "command"),
     ("CW_CLUSTER_ADMIN_CMD", False, "command"),
     ("CW_GIT_TOKEN_CMD", False, "command"),
+    ("CW_TOKEN_SERVICE_URL", False, "name"),
+    ("CW_TOKEN_SERVICE_CALLER_TOKEN_CMD", False, "command"),
     ("CW_APP_ID_CMD", False, "command"),
     ("CW_APP_INSTALLATION_CMD", False, "command"),
     ("CW_APP_KEY_CMD", False, "command"),
@@ -3461,6 +3465,17 @@ def _allowed_ok(value):
     return None not in keys   # the one function the launch's allow-list check uses
 
 
+def _service_url_ok(value):
+    try:
+        u = urllib.parse.urlsplit(value)
+        host = u.hostname
+    except ValueError:
+        return False
+    if u.username is not None or u.password is not None or u.query or u.fragment or "?" in value or "#" in value or not host:
+        return False
+    return u.scheme == "https" or (u.scheme == "http" and host in ("127.0.0.1", "localhost", "::1"))
+
+
 def _path_ok(value):
     return os.path.isabs(value) and ".." not in value.split("/")
 
@@ -3495,6 +3510,8 @@ VALIDATORS = {
     "CW_CLUSTER_TOKEN_CMD": ("a command that does not start with -", lambda v: not v.startswith("-")),
     "CW_CLUSTER_ADMIN_CMD": ("a command that does not start with -", lambda v: not v.startswith("-")),
     "CW_GIT_TOKEN_CMD": ("a command that does not start with -", lambda v: not v.startswith("-")),
+    "CW_TOKEN_SERVICE_URL": ("an https URL, or http only for a loopback address, with no user, query or fragment", lambda v: _service_url_ok(v)),
+    "CW_TOKEN_SERVICE_CALLER_TOKEN_CMD": ("a command that does not start with -", lambda v: not v.startswith("-")),
     "CW_APP_ID_CMD": ("a command that does not start with -", lambda v: not v.startswith("-")),
     "CW_APP_INSTALLATION_CMD": ("a command that does not start with -", lambda v: not v.startswith("-")),
     "CW_APP_KEY_CMD": ("a command that does not start with -", lambda v: not v.startswith("-")),

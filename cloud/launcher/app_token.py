@@ -275,6 +275,8 @@ def find_installation(target, jwt):
 
 def mint(target, role="worker"):
     """Return a token for target (OWNER/REPO), or exit through die(). Never prints."""
+    if os.environ.get("CW_TOKEN_SERVICE_URL"):  # the service route (ask #2002); unset, the signing route below is unchanged
+        return mint_from_service(target, role)
     repo = target.split("/", 1)[1]
     app_id = vault("CW_APP_ID_CMD", "cw-app-id").strip()
     if not app_id.isdigit():
@@ -304,6 +306,82 @@ def mint(target, role="worker"):
         die("refusing: the token's repository carries no usable owner id")
     if owner.get("id") != owner_id:
         die("refusing: the token's repository is not owned by the installation's account")
+    try:
+        exp = dt.datetime.strptime(ans["expires_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc).timestamp()
+    except (KeyError, ValueError, TypeError):
+        die("the answer has no readable expiry")
+    if exp - dt.datetime.now(dt.timezone.utc).timestamp() > MAX_TOKEN_SECONDS:
+        die("refusing: the token lives longer than 61 minutes")
+    check_permissions(ans.get("permissions"), role)
+    MINTED.clear()
+    return token
+
+
+def caller_token():
+    """The cluster token the service reviews: CW_TOKEN_SERVICE_CALLER_TOKEN_CMD prints one, else the launcher's own cluster login. Never printed."""
+    cmd = (os.environ.get("CW_TOKEN_SERVICE_CALLER_TOKEN_CMD") or "").strip()
+    try:
+        if cmd:
+            p = subprocess.run(["sh", "-c", cmd], capture_output=True, text=True, timeout=60)
+            tok = p.stdout.strip() if p.returncode == 0 and len(p.stdout) <= MAX_BYTES else ""
+        else:
+            import cloud_worker  # no cycle: cloud_worker does not import this file; imported only on this route
+            tok = cloud_worker.cluster_token(dict(os.environ), "10m")
+    except Exception:  # a failed login of any kind is a passing failure, never a value
+        tok = ""
+    if not tok or re.search(r"\s", tok):
+        die("the caller's cluster token could not be made", transient=True)
+    return tok
+
+
+def mint_from_service(target, role):
+    """The token of the service named by CW_TOKEN_SERVICE_URL (POST {repo, role}, Authorization: Bearer <cluster token>). The answer gets the
+    same checks as the signing route's. A passing failure exits 75, a refusal 1."""
+    url = os.environ["CW_TOKEN_SERVICE_URL"].strip()
+    u = urllib.parse.urlparse(url)
+    if u.scheme == "http" and u.hostname in ("127.0.0.1", "localhost", "::1"):
+        pass  # a loopback address: for tests only
+    else:
+        server = urllib.parse.urlparse((os.environ.get("CW_CLOUD_SERVER") or "").strip())
+        exact = "https://%s/api/v1/namespaces/%s/services/token-mint:8080/proxy/mint" % (server.netloc, os.environ.get("CW_CLOUD_NAMESPACE") or "cw")
+        if not server.netloc or url != exact:
+            die("CW_TOKEN_SERVICE_URL must be exactly the cluster's service proxy of the token service")
+    repo = target.split("/", 1)[1]
+    bearer = caller_token()
+    req = urllib.request.Request(url, data=json.dumps({"repo": target, "role": role}).encode(), method="POST",
+                                 headers={"Authorization": "Bearer " + bearer, "X-Caller-Token": "Bearer " + bearer,
+                                          "Content-Type": "application/json", "Accept": "application/json"})
+    del bearer
+    handlers = [token_mint._NoRedirect]
+    cafile = (os.environ.get("CW_CLOUD_CA_FILE") or "").strip()
+    if cafile:
+        import ssl
+        handlers.append(urllib.request.HTTPSHandler(context=ssl.create_default_context(cafile=cafile)))
+    try:
+        with urllib.request.build_opener(*handlers).open(req, timeout=60) as r:
+            raw = r.read(MAX_BYTES + 1)
+        if len(raw) > MAX_BYTES:
+            die("the token service's answer is larger than %d bytes" % MAX_BYTES)
+        ans = json.loads(raw)
+    except urllib.error.HTTPError as e:
+        passing = e.code == 429 or 500 <= e.code <= 599
+        die("the token service refused the request (HTTP %d)" % e.code, transient=passing)
+    except ValueError:  # status 200 with a body that is not JSON: not retried
+        die("the token service's answer was not JSON")
+    except Exception:  # a timeout, a refused connection, a failed TLS check: the service could not be asked
+        die("the token service could not be asked", transient=True)
+    token = ans.get("token") if isinstance(ans, dict) else None
+    repos = ans.get("repositories") if isinstance(ans, dict) else None
+    if not isinstance(token, str) or not token:
+        die("the answer has no token")
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", token):
+        die("refusing: the token holds a character that a token does not")
+    MINTED.append(token)
+    if not isinstance(repos, list) or len(repos) != 1 or not isinstance(repos[0], dict) or repos[0].get("name") != repo:
+        die("refusing: the token does not cover exactly the one target repository")
+    full = repos[0].get("full_name")
+    if not (isinstance(full, str) and full.lower() == target.lower()):
+        die("refusing: the token does not cover exactly the one target repository")
     try:
         exp = dt.datetime.strptime(ans["expires_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc).timestamp()
     except (KeyError, ValueError, TypeError):
