@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Tests for bin/cloud-pr-preflight (ask #1195): temporary repositories, each check passing and failing, and a mutant per check."""
+import pathlib
 import os, signal, subprocess, sys, tempfile, shutil, time, unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
@@ -8,7 +9,8 @@ sys.path.insert(0, os.path.join(ROOT, "cloud", "worker", "tests"))
 import stub_support  # noqa: E402
 PASS = "import sys\nsys.exit(0)\n"
 FAIL = "import sys\nsys.exit(1)\n"
-CHAIN = '#!/bin/sh\nEXCEPTIONS=""\n# tests/test_a.py tests/test_b.py\n'
+CHAIN = '#!/bin/sh\nEXCEPTIONS=""\n'
+LIST = "cloud/launcher/tests/test_a.py\ncloud/worker/tests/test_b.py\n"
 
 
 def sh(cwd, *a):
@@ -25,6 +27,7 @@ class Repo:
         os.makedirs(os.path.join(self.d, "cloud/launcher/tests"))
         os.makedirs(os.path.join(self.d, "cloud/worker/tests"))
         self.put("bin/test-cloud-launcher", CHAIN)
+        self.put("bin/test-cloud-launcher.chain", LIST)
         self.put("cloud/launcher/tests/test_a.py", PASS)
         self.put("cloud/worker/tests/test_b.py", PASS)
         self.commit("base")
@@ -54,7 +57,7 @@ class Repo:
 
 
 def mutant(old, new):
-    src = open(SCRIPT).read()
+    src = pathlib.Path(SCRIPT).read_text()
     assert old in src, old
     fd, path = tempfile.mkstemp(suffix=".py")
     os.write(fd, src.replace(old, new).encode()); os.close(fd)
@@ -116,13 +119,13 @@ class T(unittest.TestCase):
 
     def test_new_test_file_not_listed_as_changed(self):
         self.r.put("cloud/launcher/tests/test_c.py", PASS)
-        self.r.put("bin/test-cloud-launcher", CHAIN + "# tests/test_c.py\n"); self.r.commit("c")
+        self.r.put("bin/test-cloud-launcher.chain", LIST + "cloud/launcher/tests/test_c.py\n"); self.r.commit("c")
         rc, out = self.r.run()
         self.assertEqual(rc, 0, out)
 
     def test_expect_flags_stray_addition(self):
         self.r.put("cloud/launcher/tests/test_c.py", PASS)
-        self.r.put("bin/test-cloud-launcher", CHAIN + "# tests/test_c.py\n")
+        self.r.put("bin/test-cloud-launcher.chain", LIST + "cloud/launcher/tests/test_c.py\n")
         self.r.put("scratch.txt", "x"); self.r.commit("c")
         rc, out = self.r.run(args=["--expect", "cloud/", "--expect", "bin/"])
         self.assertNotEqual(rc, 0)
@@ -134,7 +137,7 @@ class T(unittest.TestCase):
 
     def test_expect_inside_prefix_passes(self):
         self.r.put("cloud/launcher/tests/test_c.py", PASS)
-        self.r.put("bin/test-cloud-launcher", CHAIN + "# tests/test_c.py\n"); self.r.commit("c")
+        self.r.put("bin/test-cloud-launcher.chain", LIST + "cloud/launcher/tests/test_c.py\n"); self.r.commit("c")
         self.assertEqual(self.r.run(args=["--expect", "cloud/", "--expect", "bin/"])[0], 0)
 
     def test_mutant_stray_root_file_missed(self):
@@ -227,7 +230,7 @@ class Probes(unittest.TestCase):
         self.addCleanup(self.r.close)
 
     def chained(self, *names):
-        self.r.put("bin/test-cloud-launcher", CHAIN + "".join("# tests/%s\n" % n for n in names))
+        self.r.put("bin/test-cloud-launcher.chain", LIST + "".join("cloud/launcher/tests/%s\n" % n for n in names))
 
     def test_scan_unchained_new_file_prints_not_run_and_fails(self):
         self.r.put("cloud/worker/tests/test_z.py", PASS); self.r.commit("z")
@@ -299,7 +302,7 @@ class Probes(unittest.TestCase):
 
 
 class Docs(unittest.TestCase):
-    DOC = open(os.path.join(ROOT, "docs", "cloud-operator-quickstart.md")).read()
+    DOC = pathlib.Path(os.path.join(ROOT, "docs", "cloud-operator-quickstart.md")).read_text()
     H = "## Checking a cloud pull request before the push"
 
     def section(self):
@@ -319,9 +322,8 @@ class Docs(unittest.TestCase):
         self.assertIn("Before any push, run bin/cloud-pr-preflight at the repository root and paste its three sections", self.section())
 
     def test_chain_names_this_test(self):
-        line = [l for l in open(os.path.join(ROOT, "bin", "test-cloud-launcher")) if l.startswith("if python3")]
-        self.assertEqual(len(line), 1)
-        self.assertIn("cloud/launcher/tests/test_cloud_pr_preflight.py", line[0])
+        entries = pathlib.Path(os.path.join(ROOT, "bin", "test-cloud-launcher.chain")).read_text().split("\n")
+        self.assertEqual(entries.count("cloud/launcher/tests/test_cloud_pr_preflight.py"), 1)
 
 
 if __name__ == "__main__":

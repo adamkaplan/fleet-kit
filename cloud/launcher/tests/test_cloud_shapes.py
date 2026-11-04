@@ -196,13 +196,13 @@ class Parity(unittest.TestCase):
         self.assertIn("unset: %s" % cw.DEFAULT_SHAPE, help_text)
         launch = re.search(r'launch\.add_argument\("--shape", help="([^"]*)"', read("bin/" + "fl" + "eet-switchboard")).group(1)
         for name, row in cw.SHAPES.items():
-            self.assertIn("%s (%s CPU, %s GiB" % (name, row["cpu"], row["memory"][:-2]), launch)
+            self.assertIn("%s (%s CPU, %s %sB" % (name, row["cpu"], row["memory"][:-2], row["memory"][-2:]), launch)
         self.assertIn("%s (1 CPU, 2 GiB; the launcher's default" % cw.DEFAULT_SHAPE, launch)
 
     def test_the_docs_list_every_shape_and_say_the_default(self):
         text = read("docs/cloud-operator-quickstart.md")
         for name, row in cw.SHAPES.items():
-            self.assertIn("`%s` (%s CPU, %s GiB)" % (name, row["cpu"], row["memory"][:-2]), text, name)
+            self.assertIn("`%s` (%s CPU, %s %sB%s" % (name, row["cpu"], row["memory"][:-2], row["memory"][-2:], ")" if row["memory"].endswith("Gi") else ","), text, name)
         interface = read("docs/cloud-worker-interface.md")
         self.assertIn("`--shape %s`" % "\\|".join(cw.SHAPES), interface)
         self.assertIn("`%s`" % cw.DEFAULT_SHAPE, interface)
@@ -229,8 +229,8 @@ class OrchestratorDefault(unittest.TestCase):
 
     def test_orchestrator_default_is_s(self):
         s = self.shape(agent="orchestrator")
-        self.assertEqual(s, "S")
-        self.assertEqual((cw.SHAPES[s]["cpu"], cw.SHAPES[s]["memory"]), ("2", "4Gi"))
+        self.assertEqual(s, "O")
+        self.assertEqual((cw.SHAPES[s]["cpu"], cw.SHAPES[s]["memory"]), ("250m", "768Mi"))
 
     def test_worker_default_is_xs(self):
         self.assertEqual(self.shape(agent="worker"), "XS")

@@ -95,6 +95,37 @@ def _cloud_when(text):
         return None
 
 
+def cloud_record_live(record, worker, retired, last_reports, now):
+    """The ONE liveness test of a cloud worker's record (#1097, #1066): not retired, no final report, not past its hard deadline (a record WITHOUT a valid
+    one is no evidence of life), and a last_report_at, if present, neither future-dated nor older than CLOUD_LOAD_STALE_SECONDS. An ended record stays on
+    disk until cloud-clear, so a file's existence proves nothing."""
+    if worker in retired or (last_reports.get(worker) or {}).get("state") in ("done", "failed") or record.get("retired"):
+        return False
+    ends = _cloud_when(record.get("hard_deadline"))
+    if ends is None or ends < now:
+        return False
+    if "last_report_at" in record:
+        seen = _cloud_when(record.get("last_report_at"))
+        if seen is None or seen > now or now - seen > CLOUD_LOAD_STALE_SECONDS:
+            return False
+    return True
+
+
+def cloud_sender(state_dir, name):
+    """#1478: the pane-less sender of a cloud worker's report: an Observation built from its endpoint record (the same `reports_to` the lane count
+    reads), or None when `name` has no such record. Only a record of that exact worker counts; nothing in it but name, reports_to, repo is used."""
+    if state_dir is None or not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", name):
+        return None
+    record, _kind = load_module("cloud_worker").read_record_file(Path(state_dir) / "cloud" / (name + ".json"), CLOUD_LOAD_MAX_BYTES)
+    if record is None or record.get("worker") != name:
+        return None
+    boss = _cloud_boss(record.get("reports_to"))
+    fleet = {"name": name, "role": "cloud-worker", "reports_to": boss or None, "issue": None}
+    if isinstance(record.get("repo"), str):
+        fleet["repo"] = record["repo"]
+    return Observation(name, None, None, "unknown", fleet)
+
+
 def live_cloud_by_lane(state_dir, discovery, retired, last_reports, audit=None, now=None, clock=None):
     """#1097: {lane name: live cloud workers} from the files under the cloud record directory (one bounded scan, no GitHub read, no process). A worker
     that is retired, made its final report, or is past its hard deadline is not counted; a record WITHOUT a valid hard_deadline (no evidence of liveness)
@@ -133,15 +164,8 @@ def live_cloud_by_lane(state_dir, discovery, retired, last_reports, audit=None, 
                 record, _kind = reader(base / fname, CLOUD_LOAD_MAX_BYTES)
                 if record is None or record.get("worker") != worker:
                     continue
-                if worker in retired or (last_reports.get(worker) or {}).get("state") in ("done", "failed") or record.get("retired"):
+                if not cloud_record_live(record, worker, retired, last_reports, now):
                     continue
-                ends = _cloud_when(record.get("hard_deadline"))
-                if ends is None or ends < now:
-                    continue   # no valid hard deadline is no evidence of life; a past one is an ended pod
-                if "last_report_at" in record:
-                    seen = _cloud_when(record.get("last_report_at"))
-                    if seen is None or seen > now or now - seen > CLOUD_LOAD_STALE_SECONDS:
-                        continue   # a future-dated report is not fresh (a forged or skewed clock cannot keep a record live)
                 boss = _cloud_boss(record.get("reports_to"))
                 lane = resolve_boss(discovery, boss) if boss else CLOUD_NO_BOSS_LANE
                 counts[lane] = counts.get(lane, 0) + 1
@@ -194,7 +218,7 @@ def load_tick(engine, discovery):
                   and not coder_finished(o, retired, last_reports)]   # a retired coder, or one that made its final report, is on the books but not a coder of this workspace
         orchestrators[name] = {"charter": charter_or_first_seen(engine, name, fleet),   # a fallback: the charter is found by the yaml that names the agent; the registry's, never the launch metadata (#969)
                                "repo": _fleet_repo(fleet, engine.config) or (engine.intents.repo if engine.intents is not None else None),
-                               "busy": sum(1 for c in coders if c.status == "working"), "idle": sum(1 for c in coders if c.status == "idle"),
+                               "busy": sum(1 for c in coders if c.status == "working") + cloud_live.get(name, 0), "idle": sum(1 for c in coders if c.status == "idle"),
                                "workers": [o.name for o in coders if getattr(o, "name", None)], "cloud": cloud_live.get(name, 0),
                                "messages": sum(1 for r in reminders if r.get("to") == name and isinstance(r.get("at"), (int, float)) and r["at"] <= now)}
     cos = next((n for n, o in sorted(discovery.agents.items()) if (o.fleet or {}).get("role") == "chief-of-staff"), None)

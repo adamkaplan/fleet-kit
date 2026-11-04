@@ -54,19 +54,20 @@ export default {
     }
     const safety = setInterval(refresh, SAFETY_MS)
     refresh()
-    // A click on a row copies its link (OSC 52, through the renderer: no process, no network); a terminal that
+    // A click on a row copies its short code (OSC 52, through the renderer: no process, no network); a terminal that
     // honours OSC 8 also opens the same link on its own click (Cmd-click in iTerm2, Ctrl-click in herdr).
-    const copyLink = (raw: unknown, event: any) => {
+    const copyLink = (raw: unknown, event: any, code: unknown) => {
       const url = safeUrl(raw)
+      if (typeof code !== "string" || !/^[A-Za-z0-9._-]+:#[1-9][0-9]{0,8}$/.test(code)) return
       if (!url || event?.modifiers?.ctrl) return // no link, or a terminal link click: leave it to the terminal
       let copied = false
       try {
-        copied = api.renderer?.copyToClipboardOSC52?.(url) === true
+        copied = api.renderer?.copyToClipboardOSC52?.(code) === true
       } catch {
         copied = false
       }
       try {
-        api.ui?.toast?.show?.({ message: copied ? `Copied ${url}` : url, variant: copied ? "success" : "info", duration: 4000 })
+        api.ui?.toast?.show?.({ message: copied ? `Copied ${code}` : code, variant: copied ? "success" : "info", duration: 4000 })
       } catch {
         // a toast is a nicety
       }
@@ -107,7 +108,7 @@ export default {
                       </text>
                       <For each={group.entries}>
                         {(entry, j) => (
-                          <box flexDirection="column" onMouseUp={entry.url ? (event: any) => copyLink(entry.url, event) : undefined}>
+                          <box flexDirection="column" onMouseUp={entry.url ? (event: any) => copyLink(entry.url, event, entry.code) : undefined}>
                             {j() > 0 ? <text>{THIN(ROW_WIDTH)}</text> : null}
                             <For each={entry.lines}>{(line) => <text>{line}</text>}</For>
                             <For each={(entry.rows ?? []).flat()}>{(line) => <text>{line}</text>}</For>
@@ -136,7 +137,7 @@ export default {
         <For each={rows() ?? []}>
           {(line: any) =>
             line.right ? (
-              <box flexDirection="row" onMouseUp={line.url ? (event: any) => copyLink(line.url, event) : undefined}>
+              <box flexDirection="row" onMouseUp={line.url ? (event: any) => copyLink(line.url, event, line.code) : undefined}>
                 <text flexGrow={1} flexShrink={1} wrapMode="none">
                   {line.id && safeUrl(line.url) ? (
                     <a href={safeUrl(line.url) as string}>
@@ -151,7 +152,7 @@ export default {
                 </text>
               </box>
             ) : (
-              <text onMouseUp={line.url ? (event: any) => copyLink(line.url, event) : undefined}>
+              <text onMouseUp={line.url ? (event: any) => copyLink(line.url, event, line.code) : undefined}>
                 {line.id && safeUrl(line.url) ? (
                   <a href={safeUrl(line.url) as string}>
                     <Pieces segs={line.segs} />

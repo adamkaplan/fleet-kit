@@ -77,12 +77,20 @@ def decide(recipient, pending, observation, now, batch_seconds, engaged_seconds,
     return Plan(recipient, "wake", "no prompt from you in the engagement window", pending, observation)
 
 
-def steers_into_turn(config, observation, carried, discovery=None):
+def steers_into_turn(config, observation, carried, discovery=None, age=None):
     """A wake to an agent that is working goes in as `steer` (with `resume`, so one that outlives its turn starts
     the next at once): the running turn takes it at its next safe point instead of after the turn. Only a
     message that carries a `send` from the agent's own boss; `send_to_working` "queue" turns it off. Measured in
-    a throwaway v2 2.0.24: a steer lands after the in-flight tool call, before the next model request."""
-    return (config.get("send_to_working", "steer") == "steer" and observation.status == "working"
+    a throwaway v2 2.0.24: a steer lands after the in-flight tool call, before the next model request.
+    #1540: with `steer_after_minutes` on (not 0) and a turn that has lasted MORE than that (`age`, seconds, from the
+    recorded turn start; None = unknown = young), a message made only of peer sends and reminders steers too."""
+    if observation.status != "working":
+        return False
+    limit = config.get("steer_after_minutes", 0)
+    if limit and age is not None and age > limit * 60 and carried \
+            and all(fact.kind in ("send", "reminder") for fact in carried):
+        return True
+    return (config.get("send_to_working", "steer") == "steer"
             and any(fact.kind == "send" and fact.sender and fact.sender == boss_name(discovery, observation) for fact in carried))
 
 
@@ -112,6 +120,32 @@ def superseded_by(facts):
     return found
 
 
+# ---- #1402: a fact is made at one time and delivered at another. At delivery each alert or digest shows its sent time and is marked delayed when it is old
+# (what is dropped as stale lives in reminders.py: judge_delivery).
+DELAYED_AFTER = 1800                 # seconds: an alert or digest older than this at delivery is marked "delayed: sent HH:MMZ"
+
+
+OWN_LATE_MARK_KINDS = ("reminder",)   # #1564: the kinds whose text already says how late they are (#1285); a queued copy (#1468) joins when it exists
+
+
+def sent_at(fact):
+    """When the fact was made: a merged wake fact keeps the oldest of its members (`created` is the newest, so an old digest must not look new)."""
+    return getattr(fact, "sent_min", fact.created)
+
+
+def in_late_scope(fact):
+    """#1564: every delivered kind but the ones that carry their own mark (a plain reminder says "late by N min" itself): what the delayed mark is about.
+    The digests (merged or not) and the load alerts that ride with them stay in scope as before."""
+    return (fact.kind not in OWN_LATE_MARK_KINDS or bool(getattr(fact, "members", None)) or bool(getattr(fact, "wake_class", None))
+            or fact.kind in ("triage", "sweep"))
+
+
+def delayed_since(facts, delivered):
+    """The oldest sent time among the alerts and digests older than DELAYED_AFTER at `delivered`, or None."""
+    late = [sent_at(f) for f in facts if in_late_scope(f) and delivered - sent_at(f) > DELAYED_AFTER]
+    return min(late) if late else None
+
+
 NEWEST_FIRST_MARK = " [newest first]"
 
 
@@ -138,7 +172,12 @@ def compose(recipient, facts, cap=MESSAGE_CAP, section=None, repos=None, deliver
     if not facts:
         raise ValueError("nothing to compose")
     if facts[0].orders:  # PR 17: the orders note, whole: every order
-        return orders_note(recipient, facts[0], repos), facts[:1]
+        note = orders_note(recipient, facts[0], repos)
+        late = None if delivered is None or fault("no-sent-time") else delayed_since(facts[:1], delivered)
+        if late is not None:   # #1564: an old order says so in its first line (the one age rule)
+            first, _, rest = note.partition("\n")
+            note = "%s (delayed: sent %s, delivered %s):%s" % (first.rstrip(":"), clock_utc(late), clock_utc(delivered), "\n" + rest if rest else "")
+        return note, facts[:1]
 
     replaced = {}
     if section is not None:   # one answer per ask for the whole compose (the retries under the cap must not turn a full header into a brief one)
@@ -159,9 +198,14 @@ def compose(recipient, facts, cap=MESSAGE_CAP, section=None, repos=None, deliver
         replaced.clear()
         replaced.update(superseded_by(taken))
         when = ""
-        if delivered is not None:
-            first, last = clock_utc(min(f.created for f in taken)), clock_utc(max(f.created for f in taken))
-            when = " (sent %s, delivered %s)" % (first if first == last else "%s-%s" % (first, last), clock_utc(delivered))
+        if delivered is not None and not fault("no-sent-time"):
+            first, last = clock_utc(min(sent_at(f) for f in taken)), clock_utc(max(f.created for f in taken))
+            late = delayed_since(taken, delivered)   # #1402: the sent time comes first, and an old alert or digest says so in this first line
+            if late is not None:
+                sent = "delayed: sent %s" % clock_utc(late) + ("" if first == last else ", newest sent %s" % last)
+            else:
+                sent = "sent %s" % (first if first == last else "%s-%s" % (first, last))
+            when = " (%s, delivered %s)" % (sent, clock_utc(delivered))
         waiting = sorted({t for f in taken for t in f.supersedes})
         if waiting:   # the earlier messages stay where they are, unchanged: this says only that the newer one replaces them
             names = sorted({f.sender for f in taken if f.supersedes and f.sender})

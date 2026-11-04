@@ -168,6 +168,10 @@ def cmd_comment(args, runner, now):
     if body is None:
         raise IntentError("usage", "--body-file is required (a file, or - for stdin)")
     caller = identify_caller(engine.herdr, engine.v2, os.environ)
+    if getattr(args, "edit", None):
+        return cmd_comment_edit(args, engine, caller, body)
+    if args.issue is None or getattr(args, "approval", None):
+        raise IntentError("usage", "--issue is required (or --edit URL; --approval goes with --edit)")
     try:
         repo, number = resolve_for_sender(engine, config, args.issue, caller)
     except IssueRefError as err:
@@ -179,6 +183,24 @@ def cmd_comment(args, runner, now):
 
 
 cmd_comment.ensure_on_use = True   # the daemon is alive when it runs
+cmd_comment.header_cache = True    # #1520
+
+
+def cmd_comment_edit(args, engine, caller, body):
+    """`comment --edit URL`: the work is in bin/switchboard/agents_verify.py (#1714, the section `comment --edit`); this maps its answers."""
+    try:
+        url, lapse = edit_in_place(engine.intents, caller, args.edit, body, getattr(args, "approval", None),
+                                                lambda: _audit_tail(engine.state_dir), lambda subject, detail: engine._external("github.comment", subject, detail),
+                                                fleet_mark, engine.intents.repo)
+    except CommentEditRefused as err:
+        sys.stderr.write("%s: comment --edit refused: %s\n" % (PROG, err))
+        return EXIT_USAGE
+    except CommentEditFailed as err:
+        raise IntentError(err.kind, err.detail) from None
+    if lapse:
+        sys.stderr.write(lapse + "\n")
+    print(json.dumps({"author": caller, "comment": url, "edited": True}, sort_keys=True))
+    return EXIT_OK
 
 
 def cmd_whoami(args, runner, now):
@@ -214,7 +236,9 @@ def add_foreground_parsers(sub):
                                        "(for the gh shim, which picks the account from it); empty when it has none")
     comment = sub.add_parser("comment", help="Comment on an issue as yourself, signed so it does not come back to "
                                              "you as an event")
-    comment.add_argument("--issue", type=issue_arg, required=True, help="The issue to comment on")
+    comment.add_argument("--issue", type=issue_arg, help="The issue to comment on (not with --edit)")
+    comment.add_argument("--edit", metavar="COMMENT_URL", help="Replace the body of your own comment at this url, signed once")
+    comment.add_argument("--approval", help="With --edit of an approved plan: the id of the approving comment or message")
     comment.add_argument("--body-file", dest="body_file", required=True, help="The comment: a file, or - for stdin")
     handoff = sub.add_parser("handoff", help="Hand your current work to a background subagent: post the brief on "
                                              "the ask and launch it, without typing")
