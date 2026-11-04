@@ -545,8 +545,10 @@ try:
     d=json.loads(sys.stdin.read()).get("undecidable") or {}
 except Exception:
     sys.exit(0)
+import unicodedata
 for n in sorted(d):
-    print("agent %s: listed pane with no recorded session, undecidable for %s passes: reattach or retire it" % (n, d[n]))' 2>/dev/null)
+    n_shown="".join("?" if unicodedata.category(c) in ("Cc","Zl","Zp") else c for c in str(n))
+    print("agent %s: listed pane with no recorded session, undecidable for %s passes: reattach or retire it" % (n_shown, d[n]))' 2>/dev/null)
   if [ -n "$und" ]; then
     while IFS= read -r und_line; do emit WARN agents "$und_line"; done <<EOF_UND
 $und
