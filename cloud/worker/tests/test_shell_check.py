@@ -11,7 +11,29 @@ import unittest
 HERE = os.path.dirname(os.path.abspath(__file__))
 WORKER = os.path.dirname(HERE)
 TOOL = os.path.join(WORKER, "cw-shell-check")
-LIST = os.path.join(WORKER, "opencode-worker.json")
+REAL_LIST = os.path.join(WORKER, "opencode-worker.json")
+BY_ID_ROWS = ("gh api*/issues/comments/*", "gh api*/issues/comments/* *", "gh api*/issues/comments/*?*")
+
+
+def _fixture_list():
+    # a copy of the repository's list without the three by-id rows, written once per test process
+    with open(REAL_LIST) as fh:
+        doc = json.load(fh)
+    removed = 0
+    for node in (doc, doc["agent"]["worker"]):
+        bash = node["permission"]["bash"]
+        for row in BY_ID_ROWS:
+            if row in bash:
+                del bash[row]
+                removed += 1
+    assert removed == 6, "the by-id row was not found (%d of 6 removals)" % removed
+    path = os.path.join(tempfile.mkdtemp(prefix="cw-shell-check-"), "opencode-worker.json")
+    with open(path, "w") as fh:
+        json.dump(doc, fh, indent=2)
+    return path
+
+
+LIST = _fixture_list()
 
 COMPOUND = ("cd /work && git clone https://github.com/o/r.git repo 2>&1 | tail -2; "
             "cd repo && git fetch -q && git merge origin/main 2>&1 | tail -2; wc -l docs/x.md; "
@@ -274,6 +296,17 @@ class Mutant(unittest.TestCase):
         with self.assertRaises(AssertionError):
             # a no-op "mutation" (the text unchanged) must not count as applied
             self.assertTrue(original != original, "the mutation was not applied")
+
+class RealListByIdRead(unittest.TestCase):
+    def test_real_list_allows_the_by_id_read_and_denies_its_write_form(self):
+        read = subprocess.run([sys.executable, TOOL, "--list", REAL_LIST, "gh api repos/o/r/issues/comments/1"],
+                              capture_output=True, text=True)
+        self.assertEqual(read.returncode, 0, read.stdout)
+        write = subprocess.run([sys.executable, TOOL, "--list", REAL_LIST,
+                                "gh api repos/o/r/issues/comments/1 -X PATCH -f body=x"],
+                               capture_output=True, text=True)
+        self.assertEqual(write.returncode, 1, write.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()
