@@ -46,6 +46,9 @@ KNOWN_FAULTS = (
     "cos-orders-unfed",        # PR 18: the judge ignores the Chief of Staff's orders file
     "anyone-edits-cos-orders",  # PR 18: no agent is stopped from writing the Chief of Staff's orders file
     "answer-unjudged",         # PR 18: `decisions answer` and `decisions resolve` skip the judge
+    "no-sent-time",            # #1402: a delivered message says nothing of when its facts were sent or that they are late
+    "deliver-stale-alert",     # #1402: an alert whose subject is no longer true is delivered anyway
+    "keep-old-digest",         # #1402: a digest older than 6 hours is delivered beside the current one
 )
 
 LAB_ENV = "FLEET_SWITCHBOARD_LAB"

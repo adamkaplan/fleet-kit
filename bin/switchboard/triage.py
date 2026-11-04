@@ -18,7 +18,7 @@ TRIAGE_KINDS = {"T1": "owner missing", "T2": "required label missing", "T3": "no
 # A rule that judges whether an item is OURS (every one but T5, T6 and T10) also needs `agents`: ownership comes from the running agents.
 TRIAGE_RULE_INPUTS = {"T1": ("agents", "issues", "merged"), "T2": ("agents", "issues"), "T3": ("agents", "issues", "comments"), "T5": ("decisions", "issues"),
                       "T6": ("decisions", "issues"), "T7": ("agents", "issues", "comments", "decisions"), "T8": ("agents", "issues"),
-                      "T9": ("agents", "issues", "comments"), "T10": ("closed",), "T11": ("agents", "issues", "merged"), "T12": ("agents", "issues", "merged")}
+                      "T9": ("agents", "issues", "comments"), "T10": ("closed",), "T11": ("agents", "issues", "merged"), "T12": ("agents", "issues", "merged", "comments")}
 # "agents" and "decisions" are global; the others are per repository (`<name>:<repo>`). T7 also reads the decision list (a captain PR listed there is T6's);
 # T1 and T11 give way to T12 when a merged PR links the item (so they read `merged`), and T9 gives way to T3 (so it reads `comments`).
 # The records of the OTHER kinds are kept whenever ANY input of ANY rule is not whole: the other-owner flag stands for whichever rule would have fired, and the
@@ -73,6 +73,92 @@ def triage_parked_now(item, now):
     until = item.get("parked_until")
     return until is not None and now < until <= now + PARKED_MAX_DAYS * 86400.0
 TRIAGE_NEXT_RE = re.compile(r"^[ \t]*(?:next(?: steps?)?[ \t]*:|[-*][ \t]+\[[ xX]\])", re.I | re.M)
+TRIAGE_STANDING_RE = re.compile(r"^[ \t]*(?:[-*>][ \t]+)?(?:\*\*|__)?(?:standing line|next(?: steps?)?)(?:[ \t]*\([^)\n]*\))?(?:\*\*|__)?[ \t]*:(.*)$", re.I | re.M)
+TRIAGE_STANDING_BATCH_RE = re.compile(r"\b(?:awaiting|waiting (?:for|on)|until)[ \t]+(?:the[ \t]+)?batch\b|\bin batch[ \t]+[0-9]+", re.I)
+_MONTHS = "jan feb mar apr may jun jul aug sep oct nov dec".split()
+_MON = r"(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?"
+TRIAGE_STANDING_ISO_RE = re.compile(r"\b([0-9]{4})-([0-9]{2})-([0-9]{2})\b")
+TRIAGE_STANDING_DMY_RE = re.compile(r"\b([0-9]{1,2})(?:st|nd|rd|th)?[ \t]+" + _MON + r"(?:,?[ \t]+([0-9]{4})\b)?", re.I)
+TRIAGE_STANDING_MDY_RE = re.compile(r"\b" + _MON + r"[ \t]+([0-9]{1,2})(?:st|nd|rd|th)?\b(?:,?[ \t]+([0-9]{4})\b)?", re.I)
+
+
+TRIAGE_STANDING_YEARLESS_DAYS = 60   # a year-less wait date further ahead than this is not read
+
+
+def _standing_day(text, at):
+    """The FIRST date in `text` that is not in the past (on or after the comment's own day `at`), as the epoch second of its UTC start; None when there is no date;
+    "bad" when one is impossible, when every date is past, or when a year-less one is more than 60 days ahead. A year-less date before the comment's day is past (never
+    next year's), except a December comment naming a date within 60 days after the new year."""
+    found = []
+    for m in TRIAGE_STANDING_ISO_RE.finditer(text):
+        found.append((m.start(), int(m.group(1)), int(m.group(2)), int(m.group(3)), True))
+    for m in TRIAGE_STANDING_DMY_RE.finditer(text):
+        found.append((m.start(), m.group(3), _MONTHS.index(m.group(2).lower()[:3]) + 1, int(m.group(1)), None))
+    for m in TRIAGE_STANDING_MDY_RE.finditer(text):
+        found.append((m.start(), m.group(3), _MONTHS.index(m.group(1).lower()[:3]) + 1, int(m.group(2)), None))
+    if not found:
+        return None
+    at_day = datetime.fromtimestamp(at, timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    base = at_day.year
+    for _pos, year, month, day, _full in sorted(found, key=lambda f: f[0]):
+        try:
+            if year is not None:
+                when = datetime(int(year), month, day, tzinfo=timezone.utc)
+                if when < at_day:
+                    continue   # written with its year and already past: not a wait
+                return when.timestamp()
+            when = datetime(base, month, day, tzinfo=timezone.utc)
+            if when < at_day:   # a year-less date before the comment's own day is PAST, never next year's, except a December comment naming a January date
+                when = datetime(base + 1, month, day, tzinfo=timezone.utc)
+                if at_day.month != 12 or when.timestamp() > at_day.timestamp() + TRIAGE_STANDING_YEARLESS_DAYS * 86400.0:
+                    continue
+            if when.timestamp() > at_day.timestamp() + TRIAGE_STANDING_YEARLESS_DAYS * 86400.0:
+                return "bad"   # a year-less date more than 60 days ahead is not read as a wait
+            return when.timestamp()
+        except (ValueError, OverflowError):
+            return "bad"
+    return "bad"   # every date was past
+
+
+def standing_line(text, at):
+    """THE reader of a standing line (T3 and T12 share it; nothing else parses one). `text` has its quotes and code stripped; `at` is the epoch second the text
+    was posted. The LAST line headed `Standing line (...):`, `Next step (...):` or `Next:` decides: ("date", the epoch second the named day ends, UTC), ("batch", None)
+    for "awaiting batch" with no date, or ("none", None) for a line that names neither or an impossible date. None when the text has no such line.
+    A date in the parentheses of the heading is when it was posted, not a date it waits for. Pure: no read, no write."""
+    lines = TRIAGE_STANDING_RE.findall(text) if isinstance(text, str) else []
+    if not lines:
+        return None
+    line = lines[-1]
+    day = _standing_day(line, at)
+    if day == "bad":
+        return ("none", None)
+    if day is not None:
+        return ("date", day + 86400.0)
+    if TRIAGE_STANDING_BATCH_RE.search(line):
+        return ("batch", None)
+    return ("none", None)
+
+
+def triage_standing_silent(item, comments, now, merged_batch=False, trusted=frozenset()):
+    """True while the latest standing line of an item (its body, then its comments, the latest wins) keeps T3 and T12 quiet: a date that ends after `now` and within
+    PARKED_MAX_DAYS, or "awaiting batch" with no later comment, within PARKED_MAX_DAYS of the line, and not after the batch reached the default branch."""
+    latest = item.get("standing")   # (posted, state) from the body
+    newer = False
+    for c in comments or ():
+        if c.get("standing") is not None and (c.get("author") in trusted or (c.get("author") and c.get("author") == item.get("author"))):
+            # only a fleet login or the issue's author can silence. `trusted` is `triage_our_logins` (config `our_logins`, else gh_users values + owner_logins, lowercased, exact
+            # membership): the set triage already uses. A bot listed only in `github_bot_logins` does not silence until #1304 lands. An unreadable author ('' on both sides) never matches.
+            latest, newer = (c["at"], c["standing"]), False
+        else:
+            newer = True
+    if latest is None:
+        return False
+    posted, (kind, until) = latest
+    if kind == "date":
+        return now < until <= now + PARKED_MAX_DAYS * 86400.0
+    if kind == "batch":
+        return not newer and not merged_batch and now <= posted + PARKED_MAX_DAYS * 86400.0
+    return False
 TRIAGE_REVIEW_RE = re.compile(r"\b(?:review of [0-9a-f]{7}|approved?|changes requested|lgtm)\b", re.I)
 
 
@@ -283,6 +369,7 @@ class TriageState:
         self.logged, self.woken_logged, self.facts, self.current = set(), set(), {}, {}
         self.started, self.day, self.day_counts = 0, None, {}
         self.summarised = None
+        self.basis = {}          # digest fact key -> (shown pairs, total due, invalid refs, other-owner count, kinds) its text was made from: judged again at the end of a pass
         self.seen = None         # #349: the stale digest's memory (bin/triage_digest.py), loaded at the first pass
         self.meta = None         # #406: its cadence (warm-up done, the last delivery), kept in the same file
 
@@ -314,6 +401,7 @@ def triage_norm(issue):
             "labels": {(l.get("name") if isinstance(l, dict) else l) for l in issue.get("labels") or []},
             "section": sweep_has_section(body), "next_body": bool(isinstance(body, str) and TRIAGE_NEXT_RE.search(
                 SWEEP_QUOTED_RE.sub(" ", body))), "parent": parent_of(issue),
+            "standing": triage_body_standing(body, created),
             "parked_until": parked_until(body, {(l.get("name") if isinstance(l, dict) else l) for l in issue.get("labels") or []}),
             "owner_body": triage_names_owner(body), "owner_name": triage_owner_name(body),
             "open_sub": isinstance(total, int) and isinstance(done, int) and total > done,
@@ -322,14 +410,20 @@ def triage_norm(issue):
                                    "body": body})}
 
 
+def triage_body_standing(body, created):
+    """(posted, state) from the standing line in an item's body, or None."""
+    state = standing_line(SWEEP_QUOTED_RE.sub(" ", body), created) if isinstance(body, str) else None
+    return (created, state) if state is not None else None
+
+
 def triage_comment_facts(records):
-    """[{"at", "next", "review"}] oldest first from comment records; no text kept."""
+    """[{"at", "next", "standing", "author", "review"}] oldest first from comment records; no text kept."""
     found = []
     for c in records:
         at = parse_iso(c.get("created_at")) if isinstance(c, dict) else None
         text = SWEEP_QUOTED_RE.sub(" ", c.get("body") or "") if at is not None and isinstance(c.get("body"), str) else ""
         if at is not None:
-            found.append({"at": at, "next": bool(TRIAGE_NEXT_RE.search(text)), "review": triage_says_reviewed(text)})
+            found.append({"at": at, "next": bool(TRIAGE_NEXT_RE.search(text)), "standing": standing_line(text, at), "author": (_login_of(c.get("user")) or "").lower(), "review": triage_says_reviewed(text)})
     return sorted(found, key=lambda c: c["at"])
 
 
@@ -426,7 +520,7 @@ def triage_rules(item, comments, ctx, sla, now, ours_logins, required, notice_pr
         awaiting = any(str(l).endswith((":awaiting-user", ":awaiting-cos")) or "awaiting" in str(l) for l in item["labels"])
         parked = triage_parked_now(item, now) and not awaiting  # a park reaches at most PARKED_MAX_DAYS ahead: `9999-12-31` does not park forever. It never exempts an owner-wait; T5 and the captain PRs are other rules
         if comments is not None and not item["section"] and not awaiting and not item["next_body"] and not parked \
-                and not item["open_sub"] and not any(c["next"] for c in comments) \
+                and not item["open_sub"] and not any(c["next"] for c in comments) and not triage_standing_silent(item, comments, now, trusted=ours_logins) \
                 and age_updated >= (sla["t3_ask_days"] if ask else sla["t3_other_days"]):
             found["T3"] = {"quiet_days": round(age_updated, 2), "ask": ask}
         if ask and any("blocked" in str(l).lower() for l in item["labels"]) and age_updated >= sla["t8_days"]:
@@ -450,7 +544,8 @@ def triage_rules(item, comments, ctx, sla, now, ours_logins, required, notice_pr
         if link:   # #384: its PR merged and it is still open: that is the finding, not "no owner"; ours when the PR's author is ours
             found.pop("T1", None)
             found.pop("T11", None)
-            if not (item["open_sub"] or item["pending_text"] or number in (pending or ()) or triage_awaits_live(item)):   # #410: not truly done: an open sub-issue, pending work in its text or a proof not passed
+            if not (item["open_sub"] or item["pending_text"] or number in (pending or ()) or triage_awaits_live(item)
+                    or (comments is not None and triage_standing_silent(item, comments, now, merged_batch=waiting is not None and number not in waiting, trusted=ours_logins))):   # #410: not truly done: an open sub-issue, pending work in its text or a proof not passed
                 found["T12"] = load_triage_plan_open().evidence(link, max(0.0, now - (parse_iso(link["merged_at"]) or now)) / day)
                 ours = ours or link["by"] in ours_logins
     elif not item["draft"] and comments is not None and ours and not captain_skip:
@@ -960,6 +1055,7 @@ def triage_pass(engine, decisions, now, errors=()):
         plan_wake_pass(engine, state, repos, now, budget)   # #765: the plans posted or edited, from the units just held
     except Exception as err:
         engine._note("plan_wake.error", "", {"error": _one_line("%s: %s" % (type(err).__name__, err), 160)})
+    claims_note_pass(engine, state, repos, now)   # #1716: the claims a pull request's body leaves out, from the held units (never raises)
     triage_mark_reads(engine, state, repos, errors, now)
     try:
         alert_wake_pass(engine, state, cfg, now)   # #851: an alert issue wakes its repository's orchestrator once, from the lists just held
@@ -1094,6 +1190,7 @@ def triage_pass(engine, decisions, now, errors=()):
                 state.woken_logged.add(once)
             engine._note("triage.finding", ref, {"rule": rule, "ref": ref, "what": TRIAGE_KINDS[rule],
                                                  "evidence": evidence, "woken": (rule, ref) in woken, "applied": False})
+    triage_rejudge_facts(state, now)   # a digest still waiting for delivery is judged again from the items as they are now
     triage_daily_summary(engine, state, cfg, now, day, repos)
 
 
@@ -1157,6 +1254,55 @@ def triage_digest_commit(engine, state, shown, invalid, now):
     triage_digest.write_seen(engine.state_dir, state.seen, state.meta)
 
 
+def triage_digest_text(state, total, shown, kinds, other_owner, invalid):
+    if not shown:   # only the once-only flag of an invalid park: one message, and nothing else in it
+        return "triage: no stale item to show; parked without a valid `Parked until: YYYY-MM-DD` line (treated as not parked): %s." % ", ".join(invalid)
+    summary = "triage: %d finding%s: %s%s. %s. Resolve, route or escalate each; the triage changes nothing on GitHub." % (
+        total, "" if total == 1 else "s", ", ".join("%s %s%s" % (ref, rule, " (%s)" % state.reasons[(rule, ref)] if (rule, ref) in state.reasons else "") for rule, ref in shown),
+        " (+%d more)" % (total - len(shown)) if total > len(shown) else "",
+        "; ".join("%s = %s" % (k, TRIAGE_KINDS[k]) for k in kinds))
+    if other_owner:
+        summary += " Also %d other-owner flag(s): not ours, nothing to do." % other_owner
+    if invalid:
+        summary += " Parked without a valid `Parked until: YYYY-MM-DD` line (treated as not parked): %s." % ", ".join(invalid)
+    return summary
+
+
+def triage_validly_parked(item, now):
+    """The item as it is now: the label and one valid date still ahead and within the limit, and not awaiting (select's own test)."""
+    return item is not None and triage_parked_now(item, now) and not any("awaiting" in str(l) for l in item["labels"])
+
+
+def triage_rejudge_facts(state, now):
+    """A pending digest fact is judged again before it is delivered: an item now validly parked is dropped from it (and from its invalid-park flag),
+    and a fact left with nothing is ended."""
+    items = triage_digest_items(state)
+    for key, (shown, total, invalid, other_owner, kinds) in list(state.basis.items()):
+        if key not in state.facts:
+            del state.basis[key]
+            continue
+        keep = [p for p in shown if not triage_validly_parked(items.get(p[1]), now)]
+        keep_invalid = [r for r in invalid if not triage_validly_parked(items.get(r), now)]
+        if len(keep) == len(shown) and len(keep_invalid) == len(invalid):
+            continue
+        for ref in {p[1] for p in shown if p not in keep} | {r for r in invalid if r not in keep_invalid}:   # a validly parked item's remembered records are forgotten with it
+            for rule in TRIAGE_KINDS:
+                state.alarmed.pop((rule, ref), None)
+                state.reasons.pop((rule, ref), None)
+                if state.seen is not None:
+                    state.seen.pop("%s %s" % (rule, ref), None)
+            if state.seen is not None:
+                state.seen.pop("PARKED " + ref, None)
+        created = state.facts[key][1]
+        new_total = total - (len(shown) - len(keep))
+        if not keep and not keep_invalid:
+            del state.facts[key], state.basis[key]
+        else:
+            kinds = list(kinds) if new_total > len(keep) else sorted({r for r, _ in keep})   # kinds of all that is due, as the original rule: hidden items keep theirs
+            state.facts[key] = (triage_digest_text(state, new_total, keep, kinds, other_owner, keep_invalid), created)
+            state.basis[key] = (keep, new_total, keep_invalid, other_owner, kinds)
+
+
 def triage_queue_fact(state, due, now, cfg, other_owner=0, invalid=()):
     """Queue THE one digest of the pass and return its text (the cost figure counts it). Only the shown items are marked."""
     shown = due[:cfg["max_findings"]]
@@ -1164,20 +1310,16 @@ def triage_queue_fact(state, due, now, cfg, other_owner=0, invalid=()):
     key = "triage:%s:%d" % (digest, int(now // (cfg["realarm_hours"] * 3600)))
     kinds = sorted({r for r, _ in due})
     if not due:   # only the once-only flag of an invalid park: still one message, and nothing else in it
-        summary = "triage: no stale item to show; parked without a valid `Parked until: YYYY-MM-DD` line (treated as not parked): %s." % ", ".join(invalid)
-        state.facts["triage:parked:%s" % hashlib.sha256(summary.encode()).hexdigest()[:10]] = (summary, now)
+        summary = triage_digest_text(state, 0, [], kinds, other_owner, invalid)
+        pkey = "triage:parked:%s" % hashlib.sha256(summary.encode()).hexdigest()[:10]
+        state.facts[pkey] = (summary, now)
+        state.basis[pkey] = ([], 0, list(invalid), other_owner, [])
         return summary
-    summary = "triage: %d finding%s: %s%s. %s. Resolve, route or escalate each; the triage changes nothing on GitHub." % (
-        len(due), "" if len(due) == 1 else "s", ", ".join("%s %s%s" % (ref, rule, " (%s)" % state.reasons[(rule, ref)] if (rule, ref) in state.reasons else "") for rule, ref in shown),
-        " (+%d more)" % (len(due) - len(shown)) if len(due) > len(shown) else "",
-        "; ".join("%s = %s" % (k, TRIAGE_KINDS[k]) for k in kinds))
-    if other_owner:
-        summary += " Also %d other-owner flag(s): not ours, nothing to do." % other_owner
-    if invalid:
-        summary += " Parked without a valid `Parked until: YYYY-MM-DD` line (treated as not parked): %s." % ", ".join(invalid)
+    summary = triage_digest_text(state, len(due), shown, kinds, other_owner, invalid)
     for pair in shown:
         state.alarmed[pair] = now
     state.facts[key] = (summary, now)
+    state.basis[key] = (list(shown), len(due), list(invalid), other_owner, kinds)   # what the text was made from, so a later pass can judge it again
     for old in [k for k, (_, at) in state.facts.items() if now - at > cfg["realarm_hours"] * 7200 and "summary" not in k]:
         del state.facts[old]
     state.carried = set(shown)   # #849: what this digest carried and remembered; an overflow beyond the cap stays due
