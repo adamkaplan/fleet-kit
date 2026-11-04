@@ -113,6 +113,7 @@ The **Holds** column is descriptive: only the layer numbers are enforced.
 | `plan_check.py` | 5 | the mechanical check of a plan's scenarios | |
 | `plan_ledger.py` | 5 | the evidence ledger and the gates view of plan-driven development | |
 | `plan_review.py` | 5 | the plan review engine's pure core | |
+| `pod_silence.py` | 0 | a running cloud pod with no push and no report for 20 minutes tells its boss one summary line, once per quiet period (ask #2115; the send and summary functions are handed in) | |
 | `reassign.py` | 5 | reassign a running worker to another orchestrator | |
 | `reds.py` | 5 | classify a pull request's failing tests | |
 | `review_checkout.py` | 5 | a pull request's exact head tree, diff and base copies in one private directory | |
