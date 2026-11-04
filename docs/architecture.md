@@ -133,6 +133,7 @@ The **Holds** column is descriptive: only the layer numbers are enforced.
 | `switchboard/decision.py` | 3 | the delivery decision: what is sent, to whom, and refused when too long | |
 | `switchboard/engine.py` | 3 | the engine: the single-instance lock and the pass | |
 | `switchboard/triage.py` | 4 | the triage pass (rule family T), shadow by default, written nothing to GitHub | |
+| `switchboard/cockpit.py` | 4 | the Cockpit feed: `cockpit.json` and `cockpit --json`, read-only | |
 | `switchboard/claims_note.py` | 4 | the notice of the scenarios a pull request's `CLAIMS:` line leaves out, once per body, from the held units | |
 | `switchboard/alert_labels.py` | 4 | an alert label on an open issue wakes that repository's orchestrator | |
 | `switchboard/link_scrub.py` | 4 | the signed-link scrub of a GitHub comment summary | |
@@ -204,6 +205,8 @@ Kinds (the number is exact, except `size`, a ceiling with headroom: see rule 7):
 | `switchboard/triage.py` | `fleet-switchboard` | entry-import | 7 | the part relies on a standard-library module the entry imported; it gets its own import line |
 | `switchboard/triage.py` | `fleet-switchboard` | namespace | 34 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 | `switchboard/triage.py` | `switchboard/decisions_a.py` | namespace | 3 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
+| `switchboard/cockpit.py` | `fleet-switchboard` | entry-import | 8 | the part relies on a standard-library module the entry imported; it gets its own import line |
+| `switchboard/cockpit.py` | `fleet-switchboard` | namespace | 8 | one namespace: the part reads the entry's names (the decision file reader, the state writer, the registry); its rewiring gives it imports |
 | `switchboard/claims_note.py` | `fleet-switchboard` | entry-import | 3 | the part relies on a standard-library module the entry imported; it gets its own import line |
 | `switchboard/claims_note.py` | `fleet-switchboard` | namespace | 14 | one namespace: the part reads the entry's names (the pull request records, the plan link and the plan facts) |
 | `switchboard/claims_note.py` | `plan_check.py` | import | 1 | a name the part reads from another unit without a declared edge |
