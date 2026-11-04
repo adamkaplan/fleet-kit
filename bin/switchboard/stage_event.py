@@ -4,7 +4,7 @@ STAGE_MARKER = "<!-- stage:event "   # a first line that starts so is a stage li
 STAGE_END = " -->"
 STAGE_LINE_MAX = 400
 STAGE_STATUSES = ("requested", "up", "updated", "building", "rebuilding", "suspended", "resumed", "expiring", "renewed", "expired", "failed")
-STAGE_UNREADABLE = "stage event unreadable"
+STAGE_UNREADABLE = "preview event unreadable"
 STAGE_HEAD_RE = re.compile(r"[0-9a-fA-F]{40}")
 STAGE_UNTIL_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}(?::[0-9]{2}(?:\.[0-9]{1,6})?)?(?:Z|[+-][0-9]{2}:[0-9]{2})?")
 STAGE_LISTS = {"repos": frozenset(), "bots": frozenset()}   # set from the config by the GitHub source; empty: no comment is a stage event
@@ -87,7 +87,7 @@ def stage_item_parts(repo, comment, number, cid, kind=None):
         return "github.stage:%d:unreadable:%s" % (cid, hashlib.sha256(first.encode("utf-8", "replace")).hexdigest()[:12]), STAGE_UNREADABLE
     key = "github.stage:%d:%s:%s:%s" % (cid, fields["status"], fields["head"], fields["until"] or "")
     what = {"pr": "PR #", "issue": "issue #"}.get(kind, "#")   # #1591: only this word depends on what the number is (None: unknown, neither word)
-    text = "stage %s on %s%d, head %s" % (fields["status"], what, number, fields["head"][:7])
+    text = "preview %s on %s%d, head %s" % (fields["status"], what, number, fields["head"][:7])
     if fields["url"]:
         text += ", " + fields["url"]
     if fields["until"]:

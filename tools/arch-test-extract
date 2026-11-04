@@ -16,7 +16,10 @@ import ast
 import builtins
 import json
 import os
+import symtable
 import sys
+
+SOURCE_LINES = []
 
 
 def defined(node):
@@ -33,7 +36,23 @@ def defined(node):
 
 
 def used(node):
-    return {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
+    """The module-level names a statement reads: a name the statement binds itself (a local def, an argument) is not one."""
+    first = min([node.lineno] + [d.lineno for d in getattr(node, "decorator_list", [])])
+    text = "\n".join(SOURCE_LINES[first - 1:node.end_lineno])
+    try:
+        table = symtable.symtable(text, "<statement>", "exec")
+    except SyntaxError:
+        return {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
+    names = set()
+
+    def walk(t):
+        for symbol in t.get_symbols():
+            if symbol.is_referenced() and (symbol.is_global() or (t is table and not (symbol.is_assigned() or symbol.is_imported()))):
+                names.add(symbol.get_name())
+        for child in t.get_children():
+            walk(child)
+    walk(table)
+    return names | {n.id for n in ast.walk(node) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store) and False}
 
 
 def main(argv=None):
@@ -47,6 +66,7 @@ def main(argv=None):
     args = ap.parse_args(argv)
     text = open(args.source, encoding="utf-8").read()
     lines = text.split("\n")
+    SOURCE_LINES[:] = lines
     tree = ast.parse(text)
     plan = json.load(open(args.plan))
     by_key = {}
@@ -70,6 +90,13 @@ def main(argv=None):
             for name in defined(node):
                 home[name] = module
     moved_nodes = {id(c[2]) for cs in chunks.values() for c in cs}
+    # names an earlier run already moved into a support module of --out-dir: a moved statement imports them from there
+    existing = {}
+    for fname in sorted(os.listdir(args.out_dir)) if os.path.isdir(args.out_dir) else []:
+        if fname.endswith(".py") and fname != "__init__.py" and fname[:-3] not in chunks:
+            for node in ast.parse(open(os.path.join(args.out_dir, fname), encoding="utf-8").read()).body:
+                for name in defined(node):
+                    existing.setdefault(name, fname[:-3])
     kept_defs = set()
     for node in tree.body:
         if id(node) not in moved_nodes:
@@ -84,6 +111,8 @@ def main(argv=None):
             for name in used(node):
                 if name in home and home[name] != module:
                     need.setdefault(home[name], set()).add(name)
+                elif name in existing and name not in home and name not in dir(builtins):
+                    need.setdefault(existing[name], set()).add(name)
                 elif name in kept_defs and name not in home and name not in dir(builtins) and name not in ("BIN", "REPO"):
                     problems.append("%s: %s uses %s, which the test file keeps" % (module, ",".join(sorted(defined(node))) or "?", name))
         body = ["\n".join(lines[f - 1:l]) for f, l, _n in cs]
@@ -124,7 +153,8 @@ def main(argv=None):
             continue
         kept.append(ln)
         if i + 1 == args.insert_after_line:
-            kept += ["sys.path.insert(0, str(Path(__file__).resolve().parent.parent / \"tests\" / \"switchboard\"))   # support import", ""] + imp
+            already = any(l.startswith("sys.path.insert(0, str(Path(__file__)") and l.endswith("# support import") for l in lines)   # an earlier run put them in
+            kept += ([] if already else ["sys.path.insert(0, str(Path(__file__).resolve().parent.parent / \"tests\" / \"switchboard\"))   # support import", ""]) + [l for l in imp if not (already and l in ("import importlib", ""))]
     cleaned = []
     for ln in kept:
         if ln == "" and len(cleaned) >= 2 and cleaned[-1] == "" and cleaned[-2] == "":
