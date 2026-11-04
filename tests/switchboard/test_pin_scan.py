@@ -116,5 +116,24 @@ class TestPinScanChecks(Fixture):
         self.assertNotIn("FAIL", out)
 
 
+class TestPinScanReaders(Fixture):
+    def test_a_planted_reader_fails_only_with_the_edit_and_an_old_failure_is_not_printed(self):
+        (self.root / "test_reads.py").write_text(
+            "import unittest\n\nclass T(unittest.TestCase):\n    def test_reads_conf(self):\n"
+            "        self.assertIn('row-three', open('conf.txt').read())\n\nunittest.main()\n")
+        (self.root / "test_old.py").write_text(
+            "import unittest\n\nclass T(unittest.TestCase):\n    def test_always_fails(self):\n"
+            "        open('conf.txt').read()\n        self.fail('pod only')\n\nunittest.main()\n")
+        git(self.root, "add", "test_reads.py", "test_old.py")
+        git(self.root, "commit", "-qm", "readers")
+        edit = {"file": "conf.txt", "old": "| row-three | 3 |", "new": "| row-3 | 3 |"}
+        code, out = self.run_tool([edit], "--check", "none=true")
+        self.assertEqual(code, 0, out)
+        self.assertIn("FAIL reader test_reads.py: test_reads_conf", out)
+        self.assertNotIn("test_old.py", out)
+        code, out = self.run_tool([dict(edit, new="| row-three | 3 | x")], "--check", "none=true")
+        self.assertNotIn("FAIL reader", out)
+
+
 if __name__ == "__main__":
     unittest.main()

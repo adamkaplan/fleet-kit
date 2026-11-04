@@ -22,6 +22,9 @@ Part 2, the scanning checks (skipped by --no-checks). The edits are applied to a
 removed at the end) and each check is run there; a failing check prints `FAIL name: file:line` (the last file:line its output
 names, else the check's command). The real tree is never written. --check NAME=CMD replaces the default checks.
 
+After the checks, every tracked test_*.py that READS an edited file (its path, file name or module name appears in it) is run there
+(60 s each) and, if it failed, again at the unedited HEAD; only the failures that are NEW with the edits print as `FAIL reader FILE: test (reads EDITED)`.
+
 Exit 0 always when it ran (it informs); exit 2 with one plain line for an unreadable list or an old text absent from its file.
 Standard library only."""
 import hashlib
@@ -41,6 +44,7 @@ DEFAULT_CHECKS = [
     ("chain-time", "env -u PYTHONDONTWRITEBYTECODE python3 cloud/launcher/tests/test_chain_time.py"),
 ]
 MIN_LINE = 12
+READER_TIMEOUT = 60
 MAX_FILES = 6
 MUTANT_CALL = re.compile(r"(mutat\w*|plant\w*|anchor\w*|replace)\s*\(", re.I)
 ROW_WORDS = re.compile(r"\b(rows?|entr(?:y|ies)|rules?|items?|actions?)\b|len\(", re.I)
@@ -199,7 +203,69 @@ def search(root, edits):
     return found
 
 
-def run_checks(root, edits, checks):
+def readers(wt, edits):
+    """(test file, edited file) for each tracked test file that READS an edited file: its path, its file name or its module name appears in the test."""
+    out = []
+    edited = {e["file"] for e in edits}
+    for rel in git_files(wt):
+        base = os.path.basename(rel)
+        if rel in edited or not base.startswith("test_") or not base.endswith(".py"):
+            continue
+        text = read_text(wt, rel)
+        if text is None:
+            continue
+        for f in sorted(edited):
+            stem = os.path.splitext(os.path.basename(f))[0]
+            names = {f, os.path.basename(f)}
+            if f.endswith(".py"):
+                names.add(stem)
+            if any(re.search(r"(?<![\w.-])%s(?![\w-])" % re.escape(n), text) for n in names if n):
+                out.append((rel, f))
+                break
+    return out
+
+
+def run_test_file(wt, rel):
+    """The set of failing test names of one test file ('<file>' alone when it did not run to the end)."""
+    env = {k: v for k, v in os.environ.items() if k != "PYTHONDONTWRITEBYTECODE"}
+    try:
+        r = subprocess.run([sys.executable, rel], cwd=wt, capture_output=True, text=True, timeout=READER_TIMEOUT, env=env)
+    except subprocess.TimeoutExpired:
+        return {rel + " (timed out)"}
+    if r.returncode == 0:
+        return set()
+    names = set(re.findall(r"^(?:FAIL|ERROR): (.+)$", r.stderr + r.stdout, re.M))
+    return names or {rel + " (exit %d)" % r.returncode}
+
+
+def run_readers(wt, edits):
+    """Run every reader of an edited file with the edits, then (only those that failed) at the unedited HEAD; return the NEW failures."""
+    new = []
+    failing = []
+    for rel, f in readers(wt, edits):
+        bad = run_test_file(wt, rel)
+        if bad:
+            failing.append((rel, f, bad))
+    if not failing:
+        return new
+    originals = {}
+    for e in edits:
+        p = os.path.join(wt, e["file"])
+        with open(p, encoding="utf-8") as fh:
+            originals[p] = fh.read()
+    subprocess.run(["git", "checkout", "--", "."], cwd=wt, capture_output=True)
+    try:
+        for rel, f, bad in failing:
+            was = run_test_file(wt, rel)
+            new.extend((rel, f, n) for n in sorted(bad - was))
+    finally:
+        for p, t in originals.items():
+            with open(p, "w", encoding="utf-8") as fh:
+                fh.write(t)
+    return new
+
+
+def run_checks(root, edits, checks, readers_on=True):
     scratch = tempfile.mkdtemp(prefix="pin-scan-", dir="/tmp")
     wt = os.path.join(scratch, "wt")
     failed = []
@@ -224,6 +290,9 @@ def run_checks(root, edits, checks):
                 hits = re.findall(r'(?:File ")?([\w./-]+\.\w+)(?::|", line )(\d+)', out)
                 where = "%s:%s" % hits[-1] if hits else cmd
                 failed.append((name, where))
+        if readers_on:
+            for rel, f, n in run_readers(wt, edits):
+                failed.append(("reader " + rel, "%s (reads %s)" % (n, f)))
     finally:
         subprocess.run(["git", "worktree", "remove", "--force", wt], cwd=root, capture_output=True)
         shutil.rmtree(scratch, ignore_errors=True)
