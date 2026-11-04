@@ -20,6 +20,11 @@ import stat
 import time
 from pathlib import Path
 
+import importlib.util as _ilu
+_spec = _ilu.spec_from_file_location("record_json", str(Path(__file__).resolve().parent / "record_json.py"))
+_record_json = _ilu.module_from_spec(_spec)
+_spec.loader.exec_module(_record_json)   # the shared bounded-depth parse (#1314)
+
 WORKING, BLOCKED, IDLE, UNKNOWN = "working", "blocked", "idle", "unknown"
 STATES = (WORKING, BLOCKED, IDLE, UNKNOWN)
 RECORD_DIR = "headless"          # state-dir/headless/<name>.json, one private record per headless worker
@@ -136,7 +141,7 @@ def read_record(state, name):
             raw = handle.read(RECORD_MAX + 1)
         if len(raw) > RECORD_MAX:
             return None, "is too large"
-        record = json.loads(raw.decode("utf-8"))
+        record = _record_json.parse_bounded(raw.decode("utf-8"))
     except (OSError, ValueError, UnicodeError):
         return None, "is not readable JSON"
     if not isinstance(record, dict) or record.get("kind") != LOCAL or record.get("worker") != name:
