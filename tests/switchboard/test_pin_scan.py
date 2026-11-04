@@ -1,4 +1,4 @@
-"""#2092: tools/plan-pins prints the other lines a plan's edits would break (S2) and runs scanning checks on a scratch copy (S3). Run by bin/test-switchboard."""
+"""#2092: tools/pin-scan prints the other lines a plan's edits would break (S2) and runs scanning checks on a scratch copy (S3). Run by bin/test-switchboard."""
 import hashlib
 import json
 import os
@@ -9,7 +9,7 @@ from pathlib import Path
 
 from support.paths import REPO
 
-TOOL = REPO / "tools" / "plan-pins"
+TOOL = REPO / "tools" / "pin-scan"
 
 
 def tree_digest(root):
@@ -55,11 +55,11 @@ class Fixture(unittest.TestCase):
     def run_tool(self, edits, *extra):
         p = Path(self.tmp.name) / "edits.json"
         p.write_text(json.dumps(edits))
-        r = subprocess.run([str(TOOL), "--root", str(self.root), *extra, str(p)], capture_output=True, text=True, timeout=90)
+        r = subprocess.run([str(TOOL), "--plan", str(p), "--root", str(self.root), *extra], capture_output=True, text=True, timeout=90)
         return r.returncode, r.stdout
 
 
-class TestPlanPinsSearch(Fixture):
+class TestPinScanSearch(Fixture):
     EDIT = {"file": "conf.txt", "old": "| row-three | 3 |", "new": "| row-three | 3 |\n| row-four | 4 |"}
 
     def test_s2_the_four_planted_kinds_and_not_the_clean_file(self):
@@ -75,7 +75,7 @@ class TestPlanPinsSearch(Fixture):
         self.assertEqual(code, 2)
 
 
-class TestPlanPinsWords(Fixture):
+class TestPinScanWords(Fixture):
     def test_the_same_words_in_another_punctuation_are_found_and_the_edited_files_own_lines_are_not(self):
         (self.root / "prose.md").write_text("The set is contents write, pull requests write, issues read and metadata read.\n")
         git(self.root, "add", "prose.md")
@@ -89,7 +89,14 @@ class TestPlanPinsWords(Fixture):
         self.assertNotIn("conf.txt:1:", out)
 
 
-class TestPlanPinsChecks(Fixture):
+class TestPinScanModes(Fixture):
+    def test_a_bare_file_and_an_unbuilt_diff_mode_are_refused(self):
+        for args in (["x.json"], ["--diff", "a...b"]):
+            r = subprocess.run([str(TOOL), "--root", str(self.root), *args], capture_output=True, text=True, timeout=60)
+            self.assertEqual(r.returncode, 2, r.stdout)
+
+
+class TestPinScanChecks(Fixture):
     CHECKS = ["--check", "wired=python3 check_wired.py", "--check", "rebind=python3 check_rebind.py"]
 
     def test_s3_two_planted_failures_are_printed_and_the_real_tree_is_unchanged(self):

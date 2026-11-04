@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
-"""plan-pins: the OTHER lines of the repository that a plan's edits would break, printed before the plan is sent (ask #2092).
+"""pin-scan: the OTHER lines of the repository that a plan's edits would break, printed before the plan is sent (ask #2092).
 
-    tools/plan-pins [--root DIR] [--no-checks] [--check NAME=CMD ...] EDITS.json
-    tools/plan-pins [--root DIR] -          (the list on standard input)
+    tools/pin-scan --plan EDITS.json [--root DIR] [--no-checks] [--check NAME=CMD ...]
+    tools/pin-scan --plan - [--root DIR]          (the list on standard input)
+
+The input is a MODE. --plan is the only mode today; a mode is a function that turns its input into the list of edits {file, old, new}
+(MODES below), and the search and the checks read that list alone, so another mode (a diff's removed text) is one more entry.
 
 EDITS.json is a list of planned edits: [{"file": "...", "old": "exact old text", "new": "new text"}].
 
@@ -197,7 +200,7 @@ def search(root, edits):
 
 
 def run_checks(root, edits, checks):
-    scratch = tempfile.mkdtemp(prefix="plan-pins-", dir="/tmp")
+    scratch = tempfile.mkdtemp(prefix="pin-scan-", dir="/tmp")
     wt = os.path.join(scratch, "wt")
     failed = []
     try:
@@ -227,6 +230,19 @@ def run_checks(root, edits, checks):
     return failed
 
 
+def edits_from_plan(arg):
+    try:
+        raw = sys.stdin.read() if arg == "-" else open(arg, encoding="utf-8").read()
+        edits = json.loads(raw)
+        assert isinstance(edits, list) and all(isinstance(e, dict) and {"file", "old", "new"} <= set(e) for e in edits)
+    except (OSError, ValueError, AssertionError):
+        raise Bad("the edits are not a readable JSON list of {file, old, new}")
+    return edits
+
+
+MODES = {"--plan": edits_from_plan}
+
+
 def main(argv):
     root = HERE
     checks = None
@@ -243,16 +259,15 @@ def main(argv):
             elif a == "--check":
                 name, _, cmd = argv[i + 1].partition("=")
                 checks = (checks or []) + [(name, cmd)]; i += 2
+            elif a in MODES:
+                if src is not None or i + 1 >= len(argv):
+                    raise Bad("usage: tools/pin-scan --plan EDITS.json [--root DIR] [--no-checks] [--check NAME=CMD]")
+                src = (a, argv[i + 1]); i += 2
             else:
-                src = a; i += 1
+                raise Bad("usage: tools/pin-scan --plan EDITS.json [--root DIR] [--no-checks] [--check NAME=CMD]")
         if src is None:
-            raise Bad("usage: tools/plan-pins [--root DIR] [--no-checks] [--check NAME=CMD] EDITS.json")
-        try:
-            raw = sys.stdin.read() if src == "-" else open(src, encoding="utf-8").read()
-            edits = json.loads(raw)
-            assert isinstance(edits, list) and all(isinstance(e, dict) and {"file", "old", "new"} <= set(e) for e in edits)
-        except (OSError, ValueError, AssertionError):
-            raise Bad("the edits are not a readable JSON list of {file, old, new}")
+            raise Bad("usage: tools/pin-scan --plan EDITS.json [--root DIR] [--no-checks] [--check NAME=CMD]")
+        edits = MODES[src[0]](src[1])
         found = search(root, edits)
         for rel, n, kind, text in sorted(set(found)):
             print("%s:%d: %s: %s" % (rel, n, kind, text[:160]))
@@ -261,7 +276,7 @@ def main(argv):
             for name, where in run_checks(root, edits, checks or DEFAULT_CHECKS):
                 print("FAIL %s: %s" % (name, where))
     except Bad as e:
-        print("plan-pins: %s" % e)
+        print("pin-scan: %s" % e)
         return 2
     return 0
 
