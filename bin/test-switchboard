@@ -41733,7 +41733,9 @@ class TestHeadlessOrchestratorWorld(TwoRepoCase):
         self.assertTrue(sb.load_agent_presence().load_record(self.world.state, "hl-orch"), "the headless record is untouched")
 
     def test_s2_the_heartbeat_does_not_wake_a_headless_orchestrator_and_raises_nothing(self):
-        hb = importlib.machinery.SourceFileLoader("hb_2074", str(BIN / "fleet-heartbeat")).load_module()
+        _hb_loader = importlib.machinery.SourceFileLoader("hb_2074", str(BIN / "fleet-heartbeat"))
+        hb = importlib.util.module_from_spec(importlib.util.spec_from_loader("hb_2074", _hb_loader))
+        _hb_loader.exec_module(hb)
         reg = sb.load_module("registry")
         agents = {"hl-orch": {"kind": "orchestrator", "state": "idle", "bell": True, "role": "orchestrator"},
                   "hl-pane": {"state": "idle", "bell": True, "pane": "w1:p1"}}
