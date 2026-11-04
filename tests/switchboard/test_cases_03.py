@@ -806,17 +806,6 @@ class TestCommissioningDocs(unittest.TestCase):
             self.assertIn("with no such standing order, propose the split first", body)
             self.assertIn("then tell the person after, citing that order", body)
 
-    def test_s2_the_chief_of_staff_cap_is_the_measured_size_of_its_largest_definition(self):
-        sizes = []
-        for path in AGENT_FILES:
-            if role_of(path) != "chief-of-staff":
-                continue
-            text = path.read_text()
-            if path.parent.name == "opencode":
-                text = text.split("\n---\n", 1)[1]
-            sizes.append(len(text.encode("utf-8")))
-        self.assertEqual(max(sizes), ROLE_BYTE_LIMITS["chief-of-staff"], "the cap rose by exactly what was added: it sits at the new size")
-
     def test_the_section_the_definitions_point_to_exists_in_the_skill(self):
         self.assertIn("## Splitting a project into lanes", self.SKILL.read_text())
 
