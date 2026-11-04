@@ -1,6 +1,6 @@
 """One parse per source text per process (ask #2108): a test that parses the daemon entry for every subTest pays for the parse once.
 
-`parse` keeps the last few trees by the hash of the text; `lines_of` keeps the split lines of a text, and `segment` gives a node's source by slicing them
+`cached_parse` keeps the last few trees by the hash of the text; `lines_of` keeps the split lines of a text, and `cached_segment` gives a node's source by slicing them
 (the whole text is split once, not once per node as `ast.get_source_segment` does). `CachedParse` is a test mixin that makes `ast.parse` and
 `ast.get_source_segment` these two for the length of each test, so the product code the test calls (it parses a text it is handed) hits the cache too.
 The trees are shared and read only: nothing here edits one."""
@@ -26,7 +26,7 @@ def _remember(table, key, value):
     return value
 
 
-def parse(source, filename="<unknown>", mode="exec", **kwargs):
+def cached_parse(source, filename="<unknown>", mode="exec", **kwargs):
     """`ast.parse`, cached for a text parsed with the plain arguments; a SyntaxError is raised again each time, never cached."""
     if not isinstance(source, str) or filename != "<unknown>" or mode != "exec" or kwargs:
         return _REAL_PARSE(source, filename, mode, **kwargs)
@@ -56,7 +56,7 @@ def lines_of(source):
     return got
 
 
-def segment(source, node, *, padded=False):
+def cached_segment(source, node, *, padded=False):
     """`ast.get_source_segment(source, node)`: the node's text by lineno/end_lineno slicing of the cached lines."""
     try:
         if node.end_lineno is None or node.end_col_offset is None:
@@ -79,7 +79,7 @@ class CachedParse:
     """Mixin, first among the bases: for each test `ast.parse` and `ast.get_source_segment` are the cached ones."""
 
     def setUp(self):
-        for name, fake in (("parse", parse), ("get_source_segment", segment)):
+        for name, fake in (("parse", cached_parse), ("get_source_segment", cached_segment)):
             patcher = mock.patch.object(ast, name, fake)
             patcher.start()
             self.addCleanup(patcher.stop)
