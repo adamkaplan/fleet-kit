@@ -6,7 +6,9 @@
     {"class": "TestTheBinSetClassesAreAllInTheTable"},
     {"class": "TestV2LightGuards"},
     {"class": "TestImpactHold", "timeout": 900},
-    {"class": "TestHygiene"}
+    {"class": "TestHygiene"},
+    {"class": "TestOwnMarkerNotHonoured"},
+    {"class": "TestTheEntryGuard"}
   ],
   "extras": ["tools/derive-closure --check"]
 }
