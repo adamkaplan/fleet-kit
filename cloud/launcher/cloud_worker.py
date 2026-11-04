@@ -97,6 +97,8 @@ ORPHAN_SECRET_AFTER_SECONDS = 3600      # a per-run Secret whose pod is absent i
 ORPHAN_SECRET_ACTION = "orphan-secret-removed"   # the audit action of that removal (one line per Secret; its reason holds the name and the age)
 ORPHAN_SECRET_REASON = "orphan secret: its pod is absent"
 PW_SECRET_NAME = re.compile(r"(.+-[0-9a-f]{4})-pw")   # '<worker>-<4 hex digits>-pw': the password Secret of the pod named by the group
+REAP_PARALLEL = 4                       # the stops of one pass run at most this many at a time
+REAP_STOP_SECONDS = 420                 # one stop's own limit: past it the wait is abandoned for this pass and the pod is left whole
 RENEW_CADENCE_SECONDS = 600             # the renewal and the login refresh run at least this often, on their own thread, whatever a pass is doing
 RESTART_ACTION = "reaper-restart"       # the audit action of the reaper's exit after the installed code changed (the service manager starts it again)
 CODE_IDENTITY_FILES = ("cloud/launcher/cloud_worker.py", "cloud/launcher/run_record.py", "bin/path_walk.py", "cloud/launcher/token_mint.py", "bin/registry.py", "bin/record_json.py")   # the module and the kit modules it imports
@@ -112,6 +114,7 @@ IGNORED_NOTICE = ("cluster login: %s is ignored in the unattended refresh (the r
 # renewal's numbers and names are here.
 GIT_TOKEN_KEY = "git-token"                      # the Secret key the pod's credential helper and gh wrapper read at every call
 GIT_TOKEN_RENEW_AFTER_SECONDS = 1800             # renew when the token is this old: 30 minutes of its life are left (a failed pass or two, a kubelet delay, a short sleep)
+SAFE_TO_EVICT_KEY = "cluster-autoscaler.kubernetes.io/safe-to-evict"  # not a cw/ key: the autoscaler reads it, the launcher reads nothing from it
 GIT_TOKEN_MINTED = "cw/git-token-minted"         # the Secret annotation that says when the token was minted (the Secret's creation time stands in when it is absent)
 GIT_TOKEN_MINT_SECONDS = 60                      # the mint child's run limit
 GIT_TOKEN_MAX_CHARS = 4096                       # the most a token may be
@@ -178,6 +181,7 @@ STACK_SECURITY_CONTEXT = {"allowPrivilegeEscalation": True, "capabilities": {"dr
 # The window stays under the switchboard's own bound on the launcher call (LAUNCH_SECONDS, 900).
 STACK_RACE_WINDOW_SECONDS = 600
 STACK_RACE_PAUSE_SECONDS = 15
+LAUNCH_OUTER_SECONDS = 900   # the switchboard's own bound on the launch call: a wait for a node ends here
 WAIT_POLL_SECONDS = 2   # the pause between two reads of a pending pod
 STACK_RACE_RE = re.compile(r"RuntimeClass handler \S+ does not support user namespaces: the handler \S+ is not known")
 
@@ -589,6 +593,16 @@ def _quantity(value, scale):
         return int(float(text) * factor * scale)
     except ValueError:
         return 0
+
+
+POD_EVENTS_MAX, POD_EVENT_CHARS = 20, 200
+_ADDRESS_RE = re.compile(r"(?<![\w.-])(?:\d{1,3}\.){3}\d{1,3}(?::\d{1,5})?(?![\w.-])|(?<![\w.-])(?:(?:[A-Za-z0-9-]+\.)+[A-Za-z][A-Za-z0-9-]*|localhost):\d{1,5}(?![\w.-])|\[[0-9A-Fa-f:.]*:[0-9A-Fa-f:.]*\](?::\d{1,5})?|(?<![\w:])[0-9A-Fa-f:]{1,45}:(?:\d{1,3}\.){3}\d{1,3}(?![\w.:-])|(?<![\w:])(?:(?:[0-9A-Fa-f]{1,4}:){1,7}:(?:[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4}){0,6})?|::(?:[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4}){0,6})?)(?:%[A-Za-z0-9_.-]{1,16})?(?![\w:])|(?<![\w:])(?:[0-9A-Fa-f]{1,4}:){7}[0-9A-Fa-f]{1,4}(?![\w:])")
+
+
+def mask_addresses(text):
+    """An IPv4 address (with its port), a host name with a dot or `localhost` followed by a port, and an IPv6 address (compressed, full or bracketed with a port) become `[address]`; a word glued to a colon and digits that is no such name (`exit code:137`), a node name, a clock and a ratio are kept."""
+    return _ADDRESS_RE.sub("[address]", str(text))
+
 
 class KnownSet:
     """A set of known secret forms. It HOLDS its forms (it is not a set, and no public attribute exposes them), keeps a
@@ -2199,6 +2213,12 @@ def safe_value(value):
     return value if isinstance(value, str) and SAFE_VALUE.fullmatch(value) else "?"
 
 
+def _one_line(text):
+    """The first line of a cluster message, word by word through `safe_value` (a word that is not plain letters or digits becomes `?`), cut."""
+    words = ((text or "").strip().splitlines() or [""])[0].split(":")[-1].split()
+    return " ".join(w if re.fullmatch(r"[A-Za-z]+|[0-9]+", w) and safe_value(w) != "?" else "?" for w in words)[:120]
+
+
 def _node_label(labels, keys):
     """The first of `keys` the node carries, or "unknown" (never a guess, never a value of another label). The value is `safe_value`."""
     for key in keys:
@@ -2312,7 +2332,7 @@ def render_pod(a, worker, name, now, hard, env, run_names=()):
             puller = {k: env[k].strip() for k in STACK_REGISTRY_KEYS}
     pod = {"apiVersion": "v1", "kind": "Pod", "metadata": {
         "name": name, "labels": {"app": LABEL, "cw/worker": worker, "azure.workload.identity/use": "true"},
-        "annotations": {"cw/worker": worker, "cw/started": iso(now), "cw/hard-deadline": iso(hard),
+        "annotations": {SAFE_TO_EVICT_KEY: "false", "cw/worker": worker, "cw/started": iso(now), "cw/hard-deadline": iso(hard),
                         "cw/idle-seconds": e["CW_IDLE_SECONDS"], "cw/shape": a.shape,
                         "cw/max-hard": iso(now + dt.timedelta(seconds=parse_duration(a.max_hard or DEFAULT_MAX_HARD))),
                         **({"cw/run-id": a.run_id} if getattr(a, "run_id", None) else {}),
@@ -2361,6 +2381,23 @@ def render_pod(a, worker, name, now, hard, env, run_names=()):
 def _cap_text(kube, text, limit):
     """PC-14: known secrets first (no cut), then addresses, then the cut."""
     return _mask_addresses(kube.scrub(text, SCRUB_OUTPUT_MAX))[:limit]
+
+
+class _StopKube:
+    """One stop's view of the cluster door: the same calls, but once the stop is abandoned every call raises, so a late thread changes nothing."""
+    def __init__(self, kube, dead):
+        self._kube, self._dead = kube, dead
+
+    def __getattr__(self, name):
+        attr = getattr(self._kube, name)
+        if not callable(attr) or name == "scrub":
+            return attr
+
+        def call(*a, **k):
+            if self._dead.is_set():
+                raise CloudError("stop abandoned")
+            return attr(*a, **k)
+        return call
 
 
 class Launcher:
@@ -2505,6 +2542,7 @@ class Launcher:
             return {"worker": worker, "url": "https://worker-%s.%s:4096" % (name, domain),
                     "auth_ref": "file:/run/cw/%s.password" % worker, "runtime_id": "pod/" + name,
                     "idle_deadline": iso(now + dt.timedelta(seconds=parse_duration(a.idle))), "hard_deadline": iso(hard),
+                    "idle_seconds": parse_duration(a.idle), "hard_seconds": parse_duration(a.hard),
                     "password_fd": a.password_fd}
         old = self._catch_signals()
         try:
@@ -2737,6 +2775,7 @@ class Launcher:
     def _wait_ready(self, name, seconds, on_pending=None):
         end = self.clock() + dt.timedelta(seconds=seconds)
         waited = 0.0   # the second bound: the seconds slept here, for a clock that does not advance
+        scaling = unread = False   # what the cluster says of a pending pod (the plain wait only: the stack path passes its own watch)
         while True:
             pod = self.kube.get_pod(name)
             status = (pod or {}).get("status", {})
@@ -2746,10 +2785,40 @@ class Launcher:
                 return
             if on_pending:
                 on_pending(pod)
-            if self.clock() >= end or waited >= seconds:
-                raise CloudError("timed out waiting for the worker", EXIT_TIMEOUT)
+            else:
+                scaling, unread = self._why_pending(name, pod, scaling)
+            more = max(0, LAUNCH_OUTER_SECONDS - seconds) if scaling else 0   # a scale-up under way: keep waiting to the outer bound
+            if self.clock() >= end + dt.timedelta(seconds=more) or waited >= seconds + more:
+                raise CloudError(self._timeout_text(scaling, unread), EXIT_TIMEOUT)
             self._nap(WAIT_POLL_SECONDS)
             waited += WAIT_POLL_SECONDS
+
+    @staticmethod
+    def _timeout_text(scaling, unread):
+        if scaling:
+            return "timed out waiting for a node to be added for the worker"
+        return "timed out waiting for the worker" + ("; events could not be read" if unread else "")
+
+    def _why_pending(self, name, pod, scaling):
+        """Read why a pod is not Ready (reads only). Returns (a scale-up is under way, the events could not be read). Raises CloudError at once
+        when the autoscaler says it will not add a node. A pod that is not Unschedulable (a starting pod) is not asked: nothing is read."""
+        conds = ((pod or {}).get("status") or {}).get("conditions") or []
+        if not any(c.get("type") == "PodScheduled" and c.get("status") == "False" and c.get("reason") == "Unschedulable" for c in conds):
+            return scaling, False
+        try:
+            events = self.kube.pod_events(name)
+        except (CloudError, ValueError, KeyError):
+            return False, True
+        verdict = None   # the latest autoscaler event of the two kinds
+        for ev in events:
+            if ev.get("reason") in ("TriggeredScaleUp", "NotTriggerScaleUp"):
+                verdict = ev
+        if verdict is None:
+            return False, False
+        if verdict["reason"] == "TriggeredScaleUp":
+            return True, False
+        count = len(self.kube.list_pods_all())
+        raise CloudError("the worker pod cannot be scheduled: %s; the namespace holds %d pods" % (_one_line(verdict.get("message")), count))
 
     # -- end hook, stop, delete --
     def run_hook(self, name):
@@ -2800,6 +2869,8 @@ class Launcher:
                 if where:
                     info["record"] = where
                     print("cloud-worker: run record: %s" % where, file=sys.stderr)
+            if info.get("record"):   # BEFORE the hook and the delete: what the pod object says of the pod, and its events when it is not Running
+                self._record_pod_state(info["record"], pod, name)
             phase = (pod.get("status") or {}).get("phase")
             if phase == "Failed" and getattr(a, "cause", None):
                 info["cause"] = "pod_failed"
@@ -2915,6 +2986,51 @@ class Launcher:
                     "note": text(res.get("note")), "error": text(res.get("error")) or ("end hook gave an unreadable error" if res.get("error") else "")}
         except Exception:
             return {"pushed": False, "wip_branch": None, "skipped": [], "note": "", "error": "end hook answer unreadable"}
+
+    def _pod_state_of(self, pod, name):
+        """The pod's own state from the pod object already read (phase, each container's state, the node) and, ONLY when the phase is
+        not Running, its newest POD_EVENTS_MAX events through scrub and the address mask. A failed events read says `unreadable`. Never raises."""
+        scrub = self.kube.scrub
+        status, spec = pod.get("status") or {}, pod.get("spec") or {}
+        phase = status.get("phase")
+        containers = []
+        for c in (status.get("containerStatuses") or [])[:20]:
+            st = c.get("state") or {}
+            kind = next((k for k in ("terminated", "waiting", "running") if k in st), "unknown")
+            one = {"name": mask_addresses(scrub(c.get("name") or "", 63)), "state": kind}
+            detail = st.get(kind) or {}
+            if detail.get("reason"):
+                one["reason"] = mask_addresses(scrub(detail["reason"], 100))
+            if kind == "terminated":
+                one["exit_code"] = detail.get("exitCode")
+            containers.append(one)
+        state = {"phase": scrub(phase or "", 30), "containers": containers, "node": mask_addresses(scrub(spec.get("nodeName") or "", 253)),
+                 "events": [], "events_read": "no"}
+        if phase == "Running":
+            return state
+        try:
+            uid = (pod.get("metadata") or {}).get("uid")
+            items = [e for e in self.kube.pod_events(name) if not (uid and (e.get("involvedObject") or {}).get("uid") not in (None, uid))]
+            stamp = lambda e: str(e.get("lastTimestamp") or e.get("eventTime") or (e.get("metadata") or {}).get("creationTimestamp") or "")
+            items.sort(key=stamp)
+            events = []
+            for e in items[-POD_EVENTS_MAX:]:
+                text = "%s %s: %s" % (e.get("type") or "", e.get("reason") or "", e.get("message") or "")
+                events.append(mask_addresses(self.kube.scrub(text, 1000))[:POD_EVENT_CHARS])
+            state["events"], state["events_read"] = events, "yes"
+        except Exception:   # a Forbidden answer, a timeout, a bad reply: one word, and the stop goes on
+            state["events"], state["events_read"] = [], "unreadable"
+        return state
+
+    def _record_pod_state(self, directory, pod, name):
+        try:
+            state = self._pod_state_of(pod, name)
+        except Exception:
+            state = "unreadable"
+        try:
+            self.recorder.add_pod_state(directory, state)
+        except Exception:   # add_pod_state never raises; a stop is never held back by the record
+            pass
 
     def _hook_record(self, info, hook):
         if info.get("record"):
@@ -3109,9 +3225,51 @@ class Launcher:
                 print("cloud-worker: WARNING: no usable record for %s; using the pod's own deadline" % ann(pod, "worker"), file=sys.stderr)
         return min(hard, parse_iso(ann(pod, "max-hard", iso(hard))))  # a record never lengthens a life past the cap
 
+    def _run_stops(self, jobs):
+        """Stop the pods of one pass, at most REAP_PARALLEL at a time, each on its own per-stop copy of the launcher (own last_hook, run id, hub
+        mark, record deadline and cluster view). Returns [(result, error, last_hook)] in the order of `jobs`. A stop past REAP_STOP_SECONDS is
+        abandoned: its thread is left to end by itself (our kubectl client is not reachable), every later call of it raises, the pod is left
+        whole and un-annotated, and ONE audit line says so; the next pass tries again."""
+        done, running, nxt, got = {}, {}, 0, []
+
+        def work(i, ctx):   # a late (abandoned) thread never replaces the limit result: dict.setdefault of one key is atomic in CPython
+            _, worker, reason, nonce = jobs[i]
+            try:
+                done.setdefault(i, (ctx.stop(argparse.Namespace(worker=worker, reason=reason, run_id=nonce,
+                                                      cause="hard" if reason == "hard limit" else "idle"), reason), None, ctx.last_hook))
+            except CloudError as e:
+                done.setdefault(i, (None, e, ctx.last_hook))
+            except BaseException as e:   # as before: not ours to swallow, re-raised by the pass
+                done.setdefault(i, (None, e, None))
+        while nxt < len(jobs) or running:
+            for i, (dead, t0, ctx) in list(running.items()):
+                took = int((self.clock() - t0).total_seconds())
+                if i in done:
+                    del running[i]
+                elif took >= REAP_STOP_SECONDS:
+                    dead.set()
+                    del running[i]
+                    done[i] = (None, CloudError("stop hit its limit: %d seconds (limit %d)" % (took, REAP_STOP_SECONDS), 1), None)
+                    self.audit(jobs[i][1], "pod/" + pod_name(jobs[i][1]), "stop", 0.0, False, str(done[i][1]))
+            while nxt < len(jobs) and len(running) < REAP_PARALLEL:
+                dead = threading.Event()
+                ctx = copy.copy(self)
+                ctx.kube, ctx.last_hook, ctx._orchestrator, ctx.foreign = _StopKube(self.kube, dead), None, None, []
+                ctx.recorder = copy.copy(self.recorder)
+                ctx.audit = lambda *a, _d=dead, **k: None if _d.is_set() else self.audit(*a, **k)
+                running[nxt] = (dead, self.clock(), ctx)
+                threading.Thread(target=work, args=(nxt, ctx), daemon=True).start()
+                nxt += 1
+            if running:
+                time.sleep(0.005)
+        for i in range(len(jobs)):
+            if isinstance(done[i][1], BaseException) and not isinstance(done[i][1], CloudError):
+                raise done[i][1]
+        return [done[i] for i in range(len(jobs))]
+
     def reap(self):
         """One pass: stop every pod past its hard deadline or idle too long. Returns [(worker, reason, exit)]."""
-        out, now, live = [], self.clock(), []
+        out, now, live, jobs = [], self.clock(), [], []
         self.reap_results, self.last_hook = {}, None
         acts = {}   # name -> the activity this pass already read (passed to send_idle_nudges: one read per pod per pass)
         pods = self.kube.list_pods()
@@ -3140,19 +3298,22 @@ class Launcher:
                 if act and not act[0] and act[1] is not None and (now - act[1]).total_seconds() >= int(ann(pod, "idle-seconds", "600")):
                     reason = "idle"
             if reason:
-                self.last_hook = None
                 if pod in live:
                     live.remove(pod)
-                try:
-                    # by the run's own nonce where the pod carries one: a pod of another run under this name is left whole
-                    res = self.stop(argparse.Namespace(worker=worker, reason=reason, run_id=ann(pod, "run-id") or None,
-                                                       cause="hard" if reason == "hard limit" else "idle"), reason)
+                out.append(None)   # this pod's place in the result: filled after the stops ran
+                # by the run's own nonce where the pod carries one: a pod of another run under this name is left whole
+                jobs.append((len(out) - 1, worker, reason, ann(pod, "run-id") or None))
+        for (slot, worker, reason, _), (res, err, hook) in zip(jobs, self._run_stops(jobs)):
+            try:
+                if err is not None:
+                    raise err
+                if res is not None:
                     self.reap_results[worker] = {k: res.get(k) for k in ("pushed", "wip_branch", "skipped", "record")}
-                    out.append((worker, reason, 0))
+                    out[slot] = (worker, reason, 0)
                     self.retire_row(worker, reason)   # the pod is ended: its registry row is retired, once (DW-3)
-                except CloudError as e:
-                    self.reap_results[worker] = dict(self.last_hook or {})
-                    out.append((worker, reason, e.code))
+            except CloudError as e:
+                self.reap_results[worker] = dict(hook or {})
+                out[slot] = (worker, reason, e.code)
         out.extend(renewed)
         self.remove_orphan_secrets(pods, now)
         self.send_wip_notes(live, now)
@@ -3937,7 +4098,7 @@ def build_parser():
     c = cmd("create")
     c.add_argument("--repo", required=True)
     c.add_argument("--branch", required=True)
-    c.add_argument("--idle", default="10m")
+    c.add_argument("--idle", default="30m")
     c.add_argument("--hard", default="2h")
     c.add_argument("--max-hard", default=DEFAULT_MAX_HARD)
     c.add_argument("--shape", default=None, help="the pod shape, one of %s; unset: %s (%s with --stack, %s with --agent orchestrator)" % (", ".join(SHAPES), DEFAULT_SHAPE, DEFAULT_STACK_SHAPE, DEFAULT_ORCHESTRATOR_SHAPE))

@@ -33,6 +33,7 @@ rebuilt from another record.
 | `bin/cloud_worker.py:976` | `discovery.agents` | looks up a local agent by name before routing | nobody | `route` | derived (reader) |
 | `bin/switchboard/judge.py:53` | `discovery.agents` | the judge's own sessions: the session ids of the discovered agents | nobody | the policy judge's socket | derived (reader) |
 | `bin/switchboard/decisions_a.py:209` | `discovery.agents` | the decisions list reads the discovered agents to find each worker's boss | nobody | the Decisions list | derived (reader) |
+| `bin/switchboard/claims_note.py:95` | `discovery.agents` | the claims notice pass hands the discovered agents to `route_of` to find the recipients of a pull request's own events | nobody | the claims notice (ask #1716) | derived (reader) |
 | `bin/switchboard/decisions_b.py:457` | `discovery.agents` | the external-decision host reads the newest discovery | nobody | external decision sync | derived (reader) |
 | `bin/impact_hold.py:401` | `discovery.agents` | looks up the orchestrator of a block | nobody | impact hold | derived (reader) |
 | `bin/lanes.py:55` | `discovery.agents` | looks up lanes by agent | nobody | lane resolution | derived (reader) |
@@ -49,6 +50,8 @@ rebuilt from another record.
 | `bin/decision_core.py:1032` | `decisions.json` | comment only: names the file as the local store | nobody | nobody | derived |
 | `bin/switchboard/judge_request.py:433` | `decisions.json` | reads the open decisions to give the judge the ask's context | nobody (reader only) | the policy judge's request | derived (reader) |
 | `bin/switchboard/decisions_a.py:274` | `decisions.json` | comment only: the decisions list never rewrites the projection by itself | nobody | nobody | derived |
+| `bin/switchboard/cockpit.py:4` | `decisions.json` | reads the open decisions (and the registry rows) to build the Cockpit's read-only fleet feed | nobody (reader only; it writes `cockpit.json` only) | the fleet feed (`cockpit --json`, `$STATE/cockpit.json`) | derived (reader) |
+| `bin/switchboard/cockpit.py:4` | `last-reports.json` | reads each agent's last report time and blocked text for the feed's lane and blocked cards | nobody (reader only) | the fleet feed | derived (reader) |
 | `bin/switchboard/decisions_b.py:281` | `decisions.json` | comment only: names the projection among what the store keeps | nobody | nobody | derived |
 | `bin/switchboard/plan_review.py:544` | `boss-resolution` | plan review escalates to the planner's boss through `boss_name`, then `resolve_boss` | nobody | plan review escalation | derived (reader) |
 | `bin/switchboard/plan_review.py:542` | `discovery.agents` | plan review reads the newest discovery to find the planner's boss | nobody | plan review escalation | derived (reader) |
