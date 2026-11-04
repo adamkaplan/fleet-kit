@@ -87,6 +87,8 @@ _support_process_and_ci = importlib.import_module("support.process_and_ci")   # 
 EXEC_CHILD, OLD_SOURCE_ALLOWED, SHELL_HOOK_CASES, USE_COMMANDS, _alive, _zip_with, apply_edit_intent, apply_handoff_step, ci_run, classified_in_audit, light_guard_sites, load_ci_runs, parse_plugin_manifest, s5_issue, tracked_files, watch_parent = (_support_process_and_ci.EXEC_CHILD, _support_process_and_ci.OLD_SOURCE_ALLOWED, _support_process_and_ci.SHELL_HOOK_CASES, _support_process_and_ci.USE_COMMANDS, _support_process_and_ci._alive, _support_process_and_ci._zip_with, _support_process_and_ci.apply_edit_intent, _support_process_and_ci.apply_handoff_step, _support_process_and_ci.ci_run, _support_process_and_ci.classified_in_audit, _support_process_and_ci.light_guard_sites, _support_process_and_ci.load_ci_runs, _support_process_and_ci.parse_plugin_manifest, _support_process_and_ci.s5_issue, _support_process_and_ci.tracked_files, _support_process_and_ci.watch_parent)   # support import
 _support_paths = importlib.import_module("support.paths")   # support import
 BIN, REPO = (_support_paths.BIN, _support_paths.REPO)   # support import
+_support_parse_cache = importlib.import_module("support.parse_cache")   # support import
+CachedParse = _support_parse_cache.CachedParse   # support import
 _support_offline_fakes = importlib.import_module("support.offline_fakes")   # support import
 ClosingRunner, FakeGH, FakeV1, OfflineRun, apply_worker_step, attach_intent_lab, control_play, run_scenario = (_support_offline_fakes.ClosingRunner, _support_offline_fakes.FakeGH, _support_offline_fakes.FakeV1, _support_offline_fakes.OfflineRun, _support_offline_fakes.apply_worker_step, _support_offline_fakes.attach_intent_lab, _support_offline_fakes.control_play, _support_offline_fakes.run_scenario)   # support import
 _support_helper_fakes = importlib.import_module("support.helper_fakes")   # support import
@@ -31856,7 +31858,7 @@ class TestImpactFloorOwnerDecision(LedgerBase):
 
 
 
-class TestRegistrarFloor(LedgerBase):
+class TestRegistrarFloor(CachedParse, LedgerBase):
     """#964: a registrar that imports, calls or rebinds a name of the clear's closure is held for the owner by the floor, with no rating. The REAL daemon file, the REAL closure and the REAL matrix: both lists are derived
     from them. In one process a hostile registrar can always undo a guard; this hold and this rating are the control."""
 
@@ -34255,7 +34257,7 @@ class TestAgentBlockCounts(TestBlockTable):
             text = (REPO / "bin" / name).read_text().replace("block_impact", "")
             self.assertEqual(len(re.findall(r'get\("impact_(?:severity|probability)"\)', text)), 0, name)
 
-class TestWholeRead(LedgerBase):
+class TestWholeRead(CachedParse, LedgerBase):
     """#1047: a rating is recorded only from a whole read of the pull request's changed files (read from GitHub), and a verdict is recorded exactly as given."""
 
     FILES = ("src/a.py", "docs/long.md", "docs/b.md")
@@ -35978,7 +35980,7 @@ for _name in list(vars(TestImpactRejudge)):   # the subclass reuses the harness,
 
 
 
-class TestImpactHold(LedgerBase):
+class TestImpactHold(CachedParse, LedgerBase):
     """#179 slice L4: the switchboard WRITES the hold (two labels), only when `impact_hold.enabled`, only for repos under `plan_gates`, head-bound
     owner clear, kill switches, idempotent, bounded. A fake gh records every write."""
 
@@ -46673,7 +46675,7 @@ class TestHeadlessAnswerPath(WriteWorld):
         self.assertEqual(getattr(self.world.v2, "permission_replies", []), [], "no reply reached the service")
 
 
-class TestRetireCloseHeadless(StandInPids, Base):
+class TestRetireCloseHeadless(CachedParse, StandInPids, Base):
     """#1062: `retire --close` ends a HEADLESS worker's session through the service's session removal, by the boss rule of a pane close; also after the
     plain retire (judged from the retirement record). Fakes only: the service is the fake v2."""
 
@@ -77815,7 +77817,7 @@ class TestAskWaive(unittest.TestCase):
                     getattr(self, case)()
 
 
-class TestNoPaneToJudge(StandInPids, Base):
+class TestNoPaneToJudge(CachedParse, StandInPids, Base):
     """#1181: a row with no pane to judge (kind cloud or orchestrator, or an endpoint and no pane) is alive or unknown, never dead."""
     PASSES = 20
     ALIVE_BODY = b'[{"id": "msg_example"}]'
