@@ -3,8 +3,14 @@
 The allowed list is READ from agents/roles.tsv of the switchboard's own checkout (one line for each agent: its name, a TAB, its roles separated by commas; a line that
 begins with # is a comment): never typed here and never read from ~/.config. No definition is edited."""
 import os
+import unicodedata
 
 PROG = "fleet-switchboard"
+
+
+def printable(name):
+    """`name` with every character of category Cc, Zl or Zp replaced by `?`, so the refusal stays one line and passes no terminal escape."""
+    return "".join("?" if unicodedata.category(c) in ("Cc", "Zl", "Zp") else c for c in str(name))
 
 
 def line_for(agent, root):
@@ -29,4 +35,4 @@ def line_for(agent, root):
     if agent in allowed:
         return None
     return ("%s: launch: --role tester needs an agent that works a brief and records verdicts: %s is not one (allowed: %s); "
-            "run: fleet-switchboard launch NAME --agent %s --role tester ...; nothing was started" % (PROG, agent, ", ".join(allowed), allowed[0]))
+            "run: fleet-switchboard launch NAME --agent %s --role tester ...; nothing was started" % (PROG, printable(agent), ", ".join(allowed), allowed[0]))
