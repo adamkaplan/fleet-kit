@@ -129,6 +129,11 @@ def _note_slow(state, item, ts):
     state["slow"] = sorted((e for e in slow if e[0] >= newest - SLOW_WINDOW), key=lambda e: e[0])[-SLOW_MAX:]
 
 
+def _is_slow_line(item):
+    """A `slow-reap-pass` line in the slow-pass form is a slow pass, not a failed reaper line (#2101)."""
+    return item.get("action") == "slow-reap-pass" and isinstance(item.get("reason"), str) and SLOW_RE.fullmatch(item["reason"]) is not None
+
+
 def _fold(state, sb, lines, source):
     """Fold audit lines into the per-worker facts: created, stopped, reported, refused launches, reaper failures."""
     created, stop, report = state.setdefault("created", {}), state.setdefault("stop", {}), state.setdefault("report", {})
@@ -150,7 +155,7 @@ def _fold(state, sb, lines, source):
         else:
             name, action, ok = item.get("worker"), item.get("action"), item.get("ok")
             _note_slow(state, item, ts)
-            if item.get("runtime_id") == REAPER_ID and ok in (True, False):
+            if item.get("runtime_id") == REAPER_ID and ok in (True, False) and not _is_slow_line(item):
                 state.setdefault("reaper_new", []).append([ts, ok, _clean(item.get("reason") or action or "", 120)])   # settled by `_reaper` in this pass
             elif isinstance(name, str) and name and ok is True:
                 if action == "stop":
