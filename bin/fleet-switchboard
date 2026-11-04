@@ -5223,6 +5223,7 @@ def _clears_pass_state(fn):
             engine.__dict__.pop("undecidable_seen", None)
             engine.__dict__.pop("pass_herdr", None)
     wrapped.__name__, wrapped.__doc__ = fn.__name__, fn.__doc__
+    wrapped.__wrapped__ = fn
     return wrapped
 
 

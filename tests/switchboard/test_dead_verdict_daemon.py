@@ -3,6 +3,10 @@ The tests RUN the real functions (`pane_state`, `pane_health_pass`, `daemon_show
 of source text is S3 (an ast read of who tests the evidence keys) and the mutants (a text copy of one function, applied once)."""
 import ast
 import json
+import os
+import subprocess
+import sys
+import tempfile
 from pathlib import Path
 from unittest import mock
 
@@ -448,3 +452,137 @@ class TestPaneUndecidable(Base):
         with mock.patch.object(sb, "undecidable_streak", func):
             mutant = self.scenario()
         self.assertEqual((mutant["after 3"], mutant["after 6"]), (3, 6))
+
+
+DOCTOR = (BIN / "fleet-doctor").read_text()
+
+
+def doctor_snippet(old=None, new=None):
+    """The python reader of the undecidable record in `bin/fleet-doctor` (a TEXT COPY, `old` replaced once by `new`): (source, times applied)."""
+    head = "und=$(printf '%s' \"$LAST_OUT\" | python3 -c '"
+    start = DOCTOR.index(head) + len(head)
+    code = DOCTOR[start:DOCTOR.index("' 2>/dev/null)", start)]
+    return (code.replace(old, new), code.count(old)) if old else (code, 1)
+
+
+def run_snippet(code, report):
+    return subprocess.run([sys.executable, "-c", code], input=json.dumps(report), capture_output=True, text=True, timeout=60).stdout
+
+
+class TestUndecidableRobustness(Base):
+    """S14 (PC-9): the five checks, each with a mutant on a source copy (asserted applied once) failing beside a passing control."""
+
+    def helper(self):
+        return TestPaneUndecidable
+
+    def quiet_pass(self, rig, count=1, offset=None):
+        for _ in range(count):
+            rig.n += 1
+            try:
+                rig.pass_once(offset=rig.n)
+            except Exception:
+                pass
+
+    # (a) the streak file is written only after the audit line
+    def raising_audit(self):
+        rig = TestPaneUndecidable.world(self)
+        self.quiet_pass(rig, 2)
+        real, state = rig.engine.audit.append, {"raised": 0}
+
+        def flaky(actor, event, *args, **kw):
+            if event == "pane.undecidable" and not state["raised"]:
+                state["raised"] = 1
+                raise OSError("the audit write failed")
+            return real(actor, event, *args, **kw)
+        with mock.patch.object(rig.engine.audit, "append", side_effect=flaky):
+            self.quiet_pass(rig, 1)   # the third pass: the append raises
+            self.assertEqual(state["raised"], 1)
+            self.quiet_pass(rig, 1)   # the next pass writes the line
+        return len(rig.events("pane.undecidable"))
+
+    def test_S14_a_raising_audit_loses_no_line_the_next_pass_writes_it(self):
+        self.assertEqual(self.raising_audit(), 1)
+
+    def test_S14_mutant_a_streak_written_before_the_audit_line_loses_it_and_the_control_passes(self):
+        self.assertEqual(self.raising_audit(), 1)   # control
+        old = "    if passes == PANE_MISSING_PASSES and engine.audit is not None:"
+        early = '    data[name] = {"pane": agent["pane"], "passes": passes}\n    _write_small(engine.state_dir, UNDECIDABLE_FILE, data)\n'
+        func, count = source_copy_function("undecidable_streak", old, early + old)
+        self.assertEqual(count, 1)
+        with mock.patch.object(sb, "undecidable_streak", func):
+            self.assertEqual(self.raising_audit(), 0)
+
+    # (b) the per-pass state is cleared in a finally
+    def stale_after_a_raise(self):
+        rig = TestPaneUndecidable.world(self)
+        with mock.patch.object(sb, "undecidable_prune", side_effect=RuntimeError("in the middle of the pass")):
+            self.quiet_pass(rig, 1)
+        return sorted(k for k in ("undecidable_seen", "pass_herdr") if rig.engine.__dict__.get(k) is not None)
+
+    def test_S14_an_exception_in_a_pass_leaves_no_stale_seen_state(self):
+        self.assertEqual(self.stale_after_a_raise(), [])
+
+    def test_S14_mutant_the_clear_not_in_a_finally_leaves_stale_state_and_the_control_passes(self):
+        self.assertEqual(self.stale_after_a_raise(), [])
+        decorator, count = source_copy_function("_clears_pass_state", "        finally:", "        except ZeroDivisionError:")
+        self.assertEqual(count, 1)
+        with mock.patch.object(sb, "pane_health_pass", decorator(sb.pane_health_pass.__wrapped__)):
+            self.assertEqual(self.stale_after_a_raise(), ["pass_herdr", "undecidable_seen"])
+
+    # (c) the doctor shows each control character of a name as ?
+    def test_S14_the_doctor_prints_one_line_with_a_question_mark_for_each_control_character(self):
+        out = run_snippet(doctor_snippet()[0], {"undecidable": {"ac\nme\x1b": 4}})
+        self.assertEqual(out.splitlines(), ["agent ac?me?: listed pane with no recorded session, undecidable for 4 passes: reattach or retire it"])
+
+    def test_S14_mutant_c_a_name_with_a_newline_prints_two_lines_and_the_control_passes(self):
+        report = {"undecidable": {"ac\nme\x1b": 4}}
+        self.assertEqual(len(run_snippet(doctor_snippet()[0], report).splitlines()), 1)
+        code, count = doctor_snippet('("Cc","Zl","Zp")', '("Zl","Zp")')
+        self.assertEqual(count, 1)
+        out = run_snippet(code, report)
+        self.assertEqual(len(out.splitlines()), 2)
+        self.assertNotIn("ac?me?", out)
+
+    # (d) the real producer into the doctor's reader
+    def producer_to_doctor(self, producer=None):
+        tmp = Path(tempfile.mkdtemp(prefix="s14."))
+        self.addCleanup(__import__("shutil").rmtree, tmp, True)
+        state = tmp / sb.PROG
+        state.mkdir(mode=0o700)
+        state.chmod(0o700)
+        (state / sb.UNDECIDABLE_FILE).write_text(json.dumps({"acme": {"pane": "p_1", "passes": 4}}))
+
+        def runner(*args, **kw):
+            raise OSError("no commands in this check")
+        with mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(tmp), "HOME": str(tmp)}):
+            report = (producer or sb.collect_status)(runner, lambda: 1000.0)
+        return run_snippet(doctor_snippet()[0], json.loads(json.dumps(report, default=str))).splitlines()
+
+    def test_S14_the_real_collect_status_feeds_the_doctor(self):
+        self.assertEqual(len(self.producer_to_doctor()), 1)
+
+    def test_S14_mutant_d_a_renamed_key_fails_the_end_to_end_and_the_control_passes(self):
+        self.assertEqual(len(self.producer_to_doctor()), 1)
+        func, count = source_copy_function("collect_status", 'report["undecidable"] =', 'report["undecided"] =')
+        self.assertEqual(count, 1)
+        self.assertEqual(self.producer_to_doctor(func), [])
+
+    # (e) one read of the pane list per pass serves both decisions of an agent
+    def reads_in_the_deciding_pass(self):
+        rig = TestPaneUndecidable.world(self)
+        rig.herdr.plain_terminals = []   # the pane is gone from the list too: the streak reads the list, then the death test would read it again
+        self.quiet_pass(rig, 2)
+        with mock.patch.object(sb.HerdrClient, "pane_list", autospec=True, side_effect=sb.HerdrClient.pane_list) as reads:
+            self.quiet_pass(rig, 1)
+        return reads.call_count
+
+    def test_S14_the_pane_list_is_read_once_in_the_pass_for_the_agent(self):
+        self.assertEqual(self.reads_in_the_deciding_pass(), 1)
+
+    def test_S14_mutant_e_two_reads_of_the_list_are_counted_and_the_control_passes(self):
+        self.assertEqual(self.reads_in_the_deciding_pass(), 1)
+        func, count = source_copy_function("_pass_herdr", 'return engine.__dict__["pass_herdr"]', "return engine.herdr")
+        self.assertEqual(count, 1)
+        with mock.patch.object(sb, "_pass_herdr", func):
+            self.assertEqual(self.reads_in_the_deciding_pass(), 2)
+
