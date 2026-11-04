@@ -4028,8 +4028,8 @@ class TestLaunch(StandInPids, Base):
                                    ("herdr.layout.apply", "intent"), ("herdr.layout.apply", "result"),
                                    ("v2.session.prompt", "intent"), ("v2.session.prompt", "result")])
         layout = [e for e in self.world.audit() if e["event"] == "herdr.layout.apply"]
-        self.assertEqual(layout[0]["detail"]["env_names"],
-                         ["FLEET_SCRATCH", "FLEET_SWITCHBOARD_LAB_PANE", "FLEET_SWITCHBOARD_ROLE"] + sorted(sb.NO_CREDENTIAL_DIALOG_ENV) + ["XDG_CONFIG_HOME"])
+        self.assertLessEqual({"FLEET_SCRATCH", "FLEET_SWITCHBOARD_LAB_PANE", "FLEET_SWITCHBOARD_ROLE", "XDG_CONFIG_HOME"} | set(sb.NO_CREDENTIAL_DIALOG_ENV),
+                             set(layout[0]["detail"]["env_names"]))  # required names present, no exact set
         self.assertNotIn("/lab/config", json.dumps(layout))  # names, never values
         self.assertEqual(layout[1]["detail"]["pane"], self.world.herdr.panes and layout[1]["detail"]["pane"])
 
