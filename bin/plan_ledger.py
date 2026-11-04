@@ -363,7 +363,7 @@ def claim_of(scenario):
 def authors_of(entries, pr, notice_senders=(), github_author=None):
     """The writers of this PR: the author GitHub reports for it (not a field the writer sets), whoever recorded a PROOF
     for it, and the senders of its notice. An evaluator can never be one of them."""
-    names = {e.get("by") for e in entries if e.get("pr") == pr and e.get("kind") == "proof"}
+    names = {e.get("by") for e in entries if e.get("pr") == pr and e.get("kind") == "proof" and e.get("by") != CI_RECORDER}
     names.update(notice_senders)
     names.add(github_author)
     return {n for n in names if n}
