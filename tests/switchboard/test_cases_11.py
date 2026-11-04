@@ -1594,6 +1594,12 @@ class TestPlanningSkill(unittest.TestCase):
         self.assertIn("plan check: PASS", out.stdout)
 
 
+FACT_KIND_MODES = {"send": "cut marker (refused to the sender)", "wake": "merged within a 3000-character budget", "sweep": "parts", "triage": "parts",
+                   "alert": "parts", "reminder": "parts", "disk": "parts", "cpu": "parts", "mem": "parts", "cpu-top": "parts",
+                   "spotlight": "parts", "janitor": "parts", "plan": "parts"}
+OVER_CAP_FINDING_KINDS = tuple(k for k, v in FACT_KIND_MODES.items() if v == "parts")
+
+
 class TestCompose(unittest.TestCase):
     def test_header_then_each_item_in_full(self):
         text, carried = sb.compose("platform", [
