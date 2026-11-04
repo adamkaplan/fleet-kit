@@ -595,7 +595,7 @@ class TestFacts(Base):
 
     def test_the_registration_point_lists_the_lab_source(self):
         self.assertEqual([s.__name__ for s in sb.fact_sources(self.home)],
-                         ["lab_facts", "worker_facts", "reminder_facts", "report_rider_facts", "foreground_facts",
+                         ["lab_facts", "worker_facts", "reminder_facts", "report_rider_facts", "held_send_facts", "foreground_facts",
                           "orders_facts", "sweep_facts", "triage_facts", "plan_wake_facts", "alert_wake_facts", "red_ci_facts", "job_facts", "pane_facts", "pane_exit_facts", "headless_restart_facts", "disk_facts", "cpu_facts", "spotlight_facts", "docker_reap_facts", "temp_janitor_facts", "heavy_orphan_facts"])
 
     def test_every_fact_source_class_in_the_module_is_registered(self):   # #1030: derived, so a new source cannot be left out
