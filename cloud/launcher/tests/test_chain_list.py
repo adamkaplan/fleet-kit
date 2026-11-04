@@ -63,12 +63,12 @@ class Scratch(unittest.TestCase):
         self.assertEqual(p.stdout.strip().split("\n")[-1], "RESULT: PASS")
         self.assertEqual(ran, ["test_a.py", "test_b.py"])
 
-    def test_s3_first_red_stops_the_chain(self):
+    def test_s3_first_red_does_not_stop_the_chain(self):
         d = self.tree(["test_a.py", "test_bad.py", "test_c.py"], tests=("test_a.py", "test_bad.py", "test_c.py"))
         p, ran = self.run_chain(d)
         self.assertEqual(p.returncode, 1)
         self.assertIn("RESULT: FAIL", p.stdout)
-        self.assertEqual(ran, ["test_a.py", "test_bad.py"])
+        self.assertEqual(ran, ["test_a.py", "test_bad.py", "test_c.py"])
 
     def test_s5_unlisted_file_keeps_the_message(self):
         d = self.tree(["test_a.py"], tests=("test_a.py", "test_x.py"))
