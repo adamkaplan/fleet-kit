@@ -1,0 +1,14 @@
+{
+  "classes": [
+    {"class": "TestSupportRebinding"},
+    {"class": "TestEveryTestFileIsWired"},
+    {"class": "TestArchitectureDocument"},
+    {"class": "TestTheBinSetClassesAreAllInTheTable"},
+    {"class": "TestV2LightGuards"},
+    {"class": "TestImpactHold", "timeout": 900},
+    {"class": "TestHygiene"},
+    {"class": "TestOwnMarkerNotHonoured"},
+    {"class": "TestTheEntryGuard"}
+  ],
+  "extras": ["tools/derive-closure --check"]
+}

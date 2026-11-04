@@ -71,19 +71,71 @@ class PlanFormatError(ValueError):
 
 # ----------------------------------------------------------------------------------- finding the plan
 
+PLAN_RULE = ("A plan is one canonical comment, edited in place; every revision adds a new short receipt comment (what changed "
+             "and why, two to four lines, with the new plan hash); a plan is never reposted as a second plan comment.")
+RECEIPT_MARKER = "<!-- plan-receipt -->"   # the first line of a receipt: the only thing that makes a comment a receipt
+RECEIPT_HASH_RE = re.compile(r"^plan hash: sha256:[0-9a-f]{64}$")
+RECEIPT_MAX_LINES = 6   # the marker, the hash line and the two to four lines of reason
+
+
+def _first_line(comment):
+    return next((line.strip() for line in comment["body"].splitlines() if line.strip()), "")
+
+
+def is_receipt(comment):
+    return isinstance(comment.get("body"), str) and _first_line(comment) == RECEIPT_MARKER
+
+
+def _is_plan_comment(comment):
+    return isinstance(comment.get("body"), str) and not is_receipt(comment) and bool(HEADING_RE.match(_first_line(comment)))
+
+
+def _ordered(comments):
+    return sorted((c for c in comments or [] if isinstance(c, dict) and isinstance(c.get("body"), str)),
+                  key=lambda c: (str(c.get("created_at") or ""), c.get("id") if isinstance(c.get("id"), int) else 0))
+
+
 def select_plan_text(body, comments):
-    """(text, source): the LATEST comment whose first non-empty line is a heading containing `Plan (scenarios)`, else
-    the issue body. `comments` is a list of {"id", "created_at", "body"}; source is "comment <id>" or "issue body"."""
+    """(text, source): the LATEST plan comment (a comment whose first non-empty line is a heading containing `Plan (scenarios)`
+    and that is not a receipt), else the issue body. `comments` is a list of {"id", "created_at", "body"}; source is
+    "comment <id>" or "issue body"."""
     chosen = None
-    ordered = sorted((c for c in comments or [] if isinstance(c, dict) and isinstance(c.get("body"), str)),
-                     key=lambda c: (str(c.get("created_at") or ""), c.get("id") if isinstance(c.get("id"), int) else 0))
-    for comment in ordered:
-        first = next((line for line in comment["body"].splitlines() if line.strip()), "")
-        if HEADING_RE.match(first):
+    for comment in _ordered(comments):
+        if _is_plan_comment(comment):
             chosen = comment
     if chosen is not None:
         return chosen["body"], "comment %s%s" % (chosen.get("id"), comment_author(chosen))
     return body or "", "issue body"
+
+
+def receipt_problem(comment):
+    """Why a receipt is malformed (None when it is well formed): a receipt is the marker line, `plan hash: sha256:...`, then a short
+    reason, and carries no plan text."""
+    lines = [l for l in comment["body"].splitlines() if l.strip()]
+    text = comment["body"]
+    if any(HEADING_RE.match(l) for l in lines) or re.search(r"(?m)^\s*(?:plan-format:|scenarios:)", text) or "```" in text:
+        return "receipt carries plan text"
+    if len(lines) < 3 or not RECEIPT_HASH_RE.match(lines[1].strip()):
+        return "receipt is not the marker line, a `plan hash: sha256:<64 hex>` line and a short reason"
+    if len(lines) > RECEIPT_MAX_LINES:
+        return "receipt is longer than the marker, the hash and four lines of reason"
+    return None
+
+
+def plan_comment_defects(comments):
+    """The defects of the comments of an issue as plan comments: a second plan comment (naming both) and a malformed receipt."""
+    defects = []
+    ordered = _ordered(comments)
+    plans = [c for c in ordered if _is_plan_comment(c)]
+    for extra in plans[1:]:
+        defects.append({"id": "-", "code": "second-plan-comment",
+                        "message": "comment %s looks like a plan but comment %s is already the plan: a plan is ONE canonical comment, "
+                                   "edited in place; put the revision in comment %s and add a receipt" % (extra.get("id"), plans[0].get("id"), plans[0].get("id"))})
+    for comment in ordered:
+        problem = receipt_problem(comment) if is_receipt(comment) else None
+        if problem:
+            defects.append({"id": "-", "code": "bad-receipt", "message": "comment %s: %s" % (comment.get("id"), problem)})
+    return defects
 
 
 def comment_author(comment):
@@ -311,9 +363,18 @@ def parse_scenarios(lines):
 PROSE_REF_RE = re.compile(r"\b(?:see|per|in|of|clause|item|section|and|or|with|to)\s*\(?\s*$", re.IGNORECASE)
 
 
+DONE_WHEN_LABEL_RE = re.compile(r"^\s*(?:[-*]\s+)?\**done[ -]when\**\s*:\s*\**\s*", re.IGNORECASE)
+
+
+def strip_done_when_label(done_when):
+    """`done_when` without a leading `Done when:` label (a value copied with its label reads the same as one without)."""
+    return DONE_WHEN_LABEL_RE.sub("", done_when, count=1) if done_when else done_when
+
+
 def clauses_of(done_when):
     """[clause text] from the ask's Done-when line: its numbered parts `(1) ... (2) ...`, in order, counting up from
     1 and stopping at the first gap. A line with no `(1)` is one clause. None or empty gives []."""
+    done_when = strip_done_when_label(done_when)
     listed = [re.match(r"^\s*([0-9]+)[.)]\s+(\S.*)$", line) for line in (done_when or "").splitlines() if line.strip()]
     if len(listed) >= 2 and all(listed) and [int(m.group(1)) for m in listed] == list(range(1, len(listed) + 1)):
         return [" ".join(m.group(2).split()) for m in listed]   # a numbered list, one clause per line
@@ -349,11 +410,12 @@ def declared_clauses(text):
     """[clause text] from the plan's own `clauses:` block (a fenced yaml block, `DW-<n>: text` lines numbered from 1), or
     None when the plan has none. A Done-when written as one sentence with several clauses cannot be split reliably, so the
     plan declares them and `verify_declared` checks they say what the ask says. Raises PlanFormatError."""
-    found = []
-    for _, inner in fenced_blocks(text):
+    found, starts = [], []
+    for start, inner in fenced_blocks(text):
         first = next((l for l in inner if l.strip() and not l.lstrip().startswith("#")), None)
         if first is not None and first.strip() == "clauses:":
             found.append(inner)
+            starts.append(start)
     if not found:
         return None
     if len(found) > 1:
@@ -374,7 +436,8 @@ def declared_clauses(text):
         if found_key and (key_indent is None or indent == key_indent):
             key_indent = indent if key_indent is None else key_indent
             if int(found_key.group(1)) != len(out) + 1:
-                raise PlanFormatError("clauses line %d: DW-%s is out of order: number the clauses 1, 2, 3 ..." % (number, found_key.group(1)))
+                raise PlanFormatError("clauses line %d (plan line %d): DW-%s is out of order, expected DW-%d: %r: number the clauses 1, 2, 3 ..."
+                                      % (number, starts[0] + number, found_key.group(1), len(out) + 1, " ".join((found_key.group(2) or "").split())[:80]))
             out.append(_scalar(_strip_comment(found_key.group(2) or ""), "clauses line %d" % number))
         elif key_indent is not None and indent > key_indent and out:
             out[-1] = (out[-1] + " " + _strip_comment(body)).strip()   # a continuation line
@@ -698,7 +761,9 @@ def validate(scenarios, clauses, text=""):
         if proof and proof not in PROOFS:
             bad(ident, "bad-proof", "proof %r must be one of %s" % (proof, "|".join(PROOFS)))
         if proof == "review" and REVIEW_CODE_RE.search(_normal(scenario.get("text", "")) + " " + _normal(scenario.get("pass", ""))):
-            bad(ident, "review-for-code", "proof review is a reviewer's read of text, not of code behaviour a test can show: use test")
+            words = list(dict.fromkeys(m.group(0).lower() for m in REVIEW_CODE_RE.finditer(_normal(scenario.get("text", "")) + " " + _normal(scenario.get("pass", "")))))
+            bad(ident, "review-for-code", "proof review is a reviewer's read of text, not of code behaviour a test can show: use test (matched: %s%s)"
+                % (", ".join(words[:8]), " and %d more" % (len(words) - 8) if len(words) > 8 else ""))
         if evaluator in EVALUATOR_ALIASES:
             warnings.append({"id": ident, "code": "evaluator-alias", "message": "%s: evaluator %r is a deprecated alias of "
                              "%r: rename it" % (ident, evaluator, EVALUATOR_ALIASES[evaluator])})
@@ -730,7 +795,7 @@ def validate(scenarios, clauses, text=""):
         tag = "DW-%d" % number
         covering = [s for s in scenarios if _normal(s.get("covers", "")) == tag and _normal(s.get("id", "")).startswith("S")]
         if not covering:
-            bad("-", "uncovered-clause", "%s is not covered by any S scenario: %s" % (tag, clauses[number - 1][:80]))
+            bad("-", "uncovered-clause", "%s is not covered by any S scenario: add an S scenario that covers %s; never edit the clause (%s)" % (tag, tag, clauses[number - 1][:80]))
     if not clauses:
         bad("-", "no-done-when", "the ask has no Done-when to cover: coverage cannot be checked (the issue body needs a \"## Intent\" heading, then a line starting \"Done when:\" under it)")
     if not any(_normal(s.get("id", "")).startswith("U") for s in scenarios):
@@ -809,6 +874,40 @@ def plan_hash(text):
     return "sha256:" + hashlib.sha256(" ".join((text or "").split()).encode("utf-8")).hexdigest()
 
 
+# The words that say a plan reads or produces something (ask #1455): the one table of the `no-failure-mode` warning.
+FAILURE_TRIGGER_WORDS = ("read", "reads", "reader", "feed", "producer", "guard", "scan", "derive", "derived")
+FAILURE_SCENARIO_RE = re.compile(r"\b(?:missing|corrupt|corrupted|unreadable|absent)\b", re.IGNORECASE)
+
+
+def prose_of(text):
+    """The plan text without the lines inside its scenarios block (the whole text when it has none)."""
+    text = text or ""
+    for start, inner in fenced_blocks(text):
+        first = next((l for l in inner if l.strip() and not l.lstrip().startswith("#")), None)
+        if first is not None and first.strip() == "scenarios:":
+            lines = text.splitlines()
+            return "\n".join(lines[:start] + lines[start + len(inner):])
+    return text
+
+
+def failure_mode_warning(scenarios, text):
+    """A warning (never a defect, never in the hash) when the plan's text speaks of reading or producing something and no scenario
+    speaks of a missing, corrupt, unreadable or absent input. Only for a plan that has scenarios."""
+    if not scenarios:
+        return None
+    # the trigger words are searched in the plan's prose (the text outside the scenarios block) and in each scenario's `text`
+    # field; a `pass`, `discriminates`, `proof`, `evaluator`, `covers` or `claim` line says what a verdict quotes, not what the plan reads
+    searched = [prose_of(text)] + [str(s.get("text", "")) for s in scenarios]
+    if not re.search(r"\b(?:%s)\b" % "|".join(FAILURE_TRIGGER_WORDS), "\n".join(searched), re.IGNORECASE):
+        return None
+    # the same by-field-key method as the trigger side: only a scenario's `text` says what it covers; a failure word in a `pass`,
+    # `discriminates`, `proof`, `evaluator`, `covers` or `claim` line is a verdict's wording and never clears the warning
+    if any(FAILURE_SCENARIO_RE.search(str(s.get("text", ""))) for s in scenarios):
+        return None
+    return {"id": "-", "code": "no-failure-mode", "message": "no-failure-mode: the plan reads or produces something but no scenario "
+            "covers an input that is missing, corrupt or unreadable: add one (the output says so and the last good output is kept)"}
+
+
 # ----------------------------------------------------------------------------------- the whole check
 
 def _clause_key(clause):
@@ -821,6 +920,7 @@ def check(text, done_when, plan_done_when=None):
     `plan_done_when` is the Done-when the plan states for itself, when it does: it must be the same clauses (a plan never
     weakens coverage by copying fewer). Raises PlanFormatError when the plan cannot be read."""
     scenarios = parse_scenarios(scenario_block(text))
+    done_when, plan_done_when = strip_done_when_label(done_when), strip_done_when_label(plan_done_when)
     clauses = clauses_of(done_when)
     declared = declared_clauses(text)
     extra = []
@@ -841,6 +941,9 @@ def check(text, done_when, plan_done_when=None):
                           "joined in order they must reproduce the Done-when text (case, spacing, punctuation and `(n)` "
                           "numbers are ignored). First difference: %s. The ask has: %r" % ((first_difference(declared, clauses, done_when) or "the clauses differ"), _normal(done_when)[:160])})
     defects, warnings = validate(scenarios, clauses, text)
+    warning = failure_mode_warning(scenarios, text)
+    if warning:
+        warnings.append(warning)
     defects = [d for d in defects if not (extra and d["code"] == "no-done-when")] + extra
     if declared is None and len(clauses) == 1 and len(re.findall(r"[;,]", clauses[0])) >= 3 and not re.search(r"\([0-9]+\)", done_when or ""):
         warnings.append({"id": "-", "code": "one-clause-many-parts", "message": "the Done-when counts as 1 clause but has %d "
@@ -917,11 +1020,14 @@ EXPLAIN = {
     "bad-size": ("a size starts with S, M, L or XL", "write for example `size: S (one file, tests)`"),
     "size-in-days": ("size is a T-shirt in AGENT time, never days of human work", "drop the days; say what makes it that size"),
     "declared-clauses-mismatch": ("a `clauses:` block must reproduce the ask's Done-when, never merge or drop clauses", "copy the clauses from the ask, in order; the message shows the first one that differs"),
+    "second-plan-comment": ("a plan is ONE canonical comment on the issue, edited in place", "move the revision into the canonical comment and add a receipt"),
+    "bad-receipt": ("a receipt is the marker line, `plan hash: sha256:<hash>` and two to four lines of reason, and carries no plan text", "cut the plan text; say what changed and why"),
     "done-when-differs": ("a plan that states its own Done-when must state the ask's", "copy the Done-when from the ask"),
     "evaluator-alias": ("`adam` is an old spelling of `owner`", "write `owner`"),
     "discriminates-overlap": ("`discriminates` reuses most words of `pass`: it should name a wrong build", "name what the wrong build does"),
     "many-scenarios": ("a plan with many scenarios is hard to review", "split it into slices"),
     "no-constraint-list": ("PC-n scenarios cannot be checked without a constraints list", "add `PC-<n>: ...` lines to the plan"),
+    "no-failure-mode": ("the plan reads or produces something but no scenario covers an input that is missing, corrupt or unreadable", "add a scenario: the output says so and the last good output is kept"),
     "one-clause-many-parts": ("a one-sentence Done-when with many parts counts as one clause", "declare the clauses in a `clauses:` block"),
 }
 
