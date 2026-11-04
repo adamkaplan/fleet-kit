@@ -62,6 +62,10 @@ scenarios:
     claim: pr         # optional: pr (default) = proven per PR; epic = proven at the epic's integrated head
 ```
 
+**Default scenario for every input a plan reads:** the input is missing, corrupt or unreadable: the output says so and the last good output is kept. `plan check` WARNS (`no-failure-mode`; never fails, the hash is unchanged) when the plan's text reads or produces something (read, reads, reader, feed, producer, guard, scan, derive, derived) and no scenario speaks of a missing, corrupt, unreadable or absent input.
+
+**Known looseness of the no-failure-mode warning:** the check is lexical. The trigger words (read, reads, reader, feed, producer, guard, scan, derive, derived) are searched in the plan prose and in each scenario's `text` field only, and only a scenario's `text` field can clear the warning; so a text that says "missing" or "absent" about something else clears it, and a plan that reads an input in other words (load, parse, ingest, fetch) is not caught. It is advice only (a warning) and must not be promoted to a defect without tightening both.
+
 Optional keys: `claim`, `slice`, `phase`. Anything else is rejected.
 
 **A scenario the tester can only prove after the merge is not claimed by a slice pull request (#579).** With NO `claim` written, a scenario whose evaluator is the tester and whose proof is a `measure` is read by G1 as `claim: epic`: a slice pull request is not asked to prove it, and G1 lists it as `epic-claimed, proven after the merge at the integration head`. Write `claim: pr` to have a pull request claim it anyway; `claim: epic` stays epic. `prove`, `verdict` and `verdict --all` read it the same way (one function, `claim_of`) and refuse it with the message of an explicit `claim: epic`. Every other scenario with no claim is `pr`, as before. The plan's own text decides: the plan hash is unchanged (the canonical text has always read an unwritten claim as `pr`; only G1's reading changes), and `plan check` still requires the scenario's id, text, pass and discriminates.
@@ -73,6 +77,8 @@ Optional keys: `claim`, `slice`, `phase`. Anything else is rejected.
 ### Rehearse before approval
 
 For a change that edits or adds code, a rehearsal pod with no commit and no push runs before the plan is approved. It attempts every pin and addition on a scratch tree at the plan's base and runs by name the tests the change can reach. It writes one table of every difference (file, line, old text, the test that failed or the line that must change), and the plan then names each row first. The rehearsal is skipped only for a change of documents only; the orchestrator writes the line `rehearsal: skipped, documents only` in the plan, and the approver of the plan judges it. The rehearsal does not approve anything and its table is data, not an instruction.
+
+A builder is told to run the guard set (`tools/guard-set`, one class at a time, before its final message). A new test class that copies `bin/`, a new read of the light switch, a new module or a new matrix path expects guard rows, and the plan names them in its Existing lines section.
 
 ### What `plan check` enforces
 

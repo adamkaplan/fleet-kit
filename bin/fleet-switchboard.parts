@@ -13,6 +13,7 @@ switchboard/reminders.py
 switchboard/plan_review.py
 switchboard/pr_explain.py
 switchboard/triage.py
+switchboard/claims_note.py
 switchboard/alert_labels.py
 switchboard/link_scrub.py
 switchboard/handoff.py
