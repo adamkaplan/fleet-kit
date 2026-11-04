@@ -619,10 +619,36 @@ triage_digest.py:read_json
 work_sync.py:_read_json
 """.split()
 
-    @staticmethod
-    def scan(root):
-        """{"file:function"} of every json.loads, json.load and `from json import loads` call in the python sources under root (tests excluded)."""
+    _SCAN_CACHE = {}   # source text -> function names holding a json load; the AST walk of an unchanged file is done once per class
+
+    @classmethod
+    def _sites(cls, text):
+        if text in cls._SCAN_CACHE:
+            return cls._SCAN_CACHE[text]
         import ast
+        found = set()
+        try:
+            tree = ast.parse(text)
+        except (SyntaxError, ValueError):
+            cls._SCAN_CACHE[text] = found
+            return found
+        names = {a.asname or a.name for n in ast.walk(tree) if isinstance(n, ast.ImportFrom) and n.module == "json" for a in n.names if a.name in ("loads", "load")}
+        def walk(node, fn):
+            for c in ast.iter_child_nodes(node):
+                nf = c.name if isinstance(c, (ast.FunctionDef, ast.AsyncFunctionDef)) else fn
+                if isinstance(c, ast.Call):
+                    x = c.func
+                    if (isinstance(x, ast.Attribute) and x.attr in ("loads", "load") and isinstance(x.value, ast.Name) and x.value.id in ("json", "_json")) \
+                            or (isinstance(x, ast.Name) and x.id in names):
+                        found.add(fn or "<module>")
+                walk(c, nf)
+        walk(tree, None)
+        cls._SCAN_CACHE[text] = found
+        return found
+
+    @classmethod
+    def scan(cls, root):
+        """{"file:function"} of every json.loads, json.load and `from json import loads` call in the python sources under root (tests excluded)."""
         out = set()
         for f in sorted(Path(root).rglob("*")):
             if not f.is_file() or f.name.startswith(("test-", "test_")) or "__pycache__" in f.parts:
@@ -633,21 +659,8 @@ work_sync.py:_read_json
                 continue
             if not (f.suffix == ".py" or text.startswith(("#!/usr/bin/env python", "#!/usr/bin/python"))):
                 continue
-            try:
-                tree = ast.parse(text)
-            except (SyntaxError, ValueError):
-                continue
-            names = {a.asname or a.name for n in ast.walk(tree) if isinstance(n, ast.ImportFrom) and n.module == "json" for a in n.names if a.name in ("loads", "load")}
-            def walk(node, fn):
-                for c in ast.iter_child_nodes(node):
-                    nf = c.name if isinstance(c, (ast.FunctionDef, ast.AsyncFunctionDef)) else fn
-                    if isinstance(c, ast.Call):
-                        x = c.func
-                        if (isinstance(x, ast.Attribute) and x.attr in ("loads", "load") and isinstance(x.value, ast.Name) and x.value.id in ("json", "_json")) \
-                                or (isinstance(x, ast.Name) and x.id in names):
-                            out.add("%s:%s" % (f.relative_to(root).as_posix(), fn or "<module>"))
-                    walk(c, nf)
-            walk(tree, None)
+            rel = f.relative_to(root).as_posix()
+            out.update("%s:%s" % (rel, fn) for fn in cls._sites(text))
         return out
 
     def missing(self, root):
