@@ -400,18 +400,21 @@
         "bin/agent_presence.py",
         "bin/awaiting_live.py",
         "bin/ci_runs.py",
+        "bin/cloud_client.py",
         "bin/cloud_worker.py",
         "bin/cpu_guard.py",
         "bin/dead_hint.py",
         "bin/decision_core.py",
         "bin/decision_sync.py",
         "bin/disk_janitor.py",
+        "bin/endpoint_send.py",
         "bin/fleet_health.py",
         "bin/header_cache.py",
         "bin/heavy_slots.py",
         "bin/item_verdicts.py",
         "bin/plan_review.py",
         "bin/pr_events.py",
+        "bin/push_watch.py",
         "bin/queue_ejections.py",
         "bin/record_json.py",
         "bin/reassign.py",
@@ -441,7 +444,8 @@
         "bin/switchboard/secret_spans.py",
         "bin/switchboard/caches.py",
         "bin/switchboard/profile_pieces.py",
-        "bin/switchboard/installer.py"
+        "bin/switchboard/installer.py",
+        "bin/switchboard/scratch_dir.py"
       ],
       "daemon_file": "bin/fleet-switchboard",
       "module_roots": {
@@ -470,6 +474,12 @@
           "latest_runs",
           "newest",
           "own_repo"
+        ],
+        "bin/cloud_client.py": [
+          "*"
+        ],
+        "bin/endpoint_send.py": [
+          "*"
         ],
         "bin/cloud_worker.py": [
           "read_record_file"
@@ -501,6 +511,9 @@
         ],
         "bin/queue_ejections.py": [
           "validate"
+        ],
+        "bin/push_watch.py": [
+          "settings"
         ],
         "bin/reassign.py": [
           "*"
@@ -691,6 +704,10 @@
         "bin/switchboard/profile_pieces.py": [
           "InstallError"
         ],
+        "bin/switchboard/scratch_dir.py": [
+          "ScratchBoundFacts",
+          "scratch_bytes"
+        ],
         "bin/switchboard/installer.py": [
           "reaper_only_conflict"
         ]
@@ -812,10 +829,8 @@
       "closure_exempt": {
         "bin/agent_reconcile.py": "loaded only by `reconcile_agents_on_read`, called by `cmd_status`'s view reconcile, which the clear never calls",
         "bin/closed_labels.py": "loaded only by `publish_decisions` (the decision list), which the clear never calls",
-        "bin/cloud_client.py": "loaded only by `_send_by_registry` (the send command's registry route), which delivers a message to a registry endpoint; the clear never calls it",
         "bin/cloud_end_alert.py": "loaded only by `cloud_end_tick` and `cloud_turn_tick` (via `load_module`), both called only by `finish_pass` (after `cloud_watch_tick`), not by the clear",
         "bin/cloud_relay_daemon.py": "loaded only by `run_daemon`'s pass loop (`pass_if_configured`), not by the clear; it is still a top tier authority path (it writes ledger entries), so this lists only that the clear cannot reach it",
-        "bin/endpoint_send.py": "loaded only by `_send_by_registry` (the send command's registry route), which delivers a message to a registry endpoint; the clear never calls it",
         "bin/external_adapter.py": "loaded only by the external-decision adapter path, which the clear does not run",
         "bin/health_records.py": "loaded only by the health and pane pass, which the clear does not run",
         "bin/lanes.py": "loaded only by `cmd_move`: the lane command, not the clear",

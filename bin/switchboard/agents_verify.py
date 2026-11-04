@@ -238,6 +238,222 @@ def add_agents_parsers(sub):
     verify.add_argument("--opencode", default="opencode", help="The opencode executable (default: opencode on PATH)")
     verify.add_argument("--timeout", type=int, default=AGENTS_VERIFY_TIMEOUT, help="Seconds to wait for the service (default %d)" % AGENTS_VERIFY_TIMEOUT)
 
+# ---- comment --edit (#1714)
+MARKER = re.compile(r"<!--\s*fleet-switchboard:from=([A-Za-z0-9_-]{1,64})\s*-->")
+COMMENT_URL = re.compile(r"^https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/(?:issues|pull)/([0-9]{1,9})#issuecomment-([0-9]{1,15})$")
+PLAN_MARK = "## Plan (scenarios)"
+
+
+class CommentEditRefused(Exception):
+    """An edit that was refused before anything was written."""
+
+
+class CommentEditFailed(Exception):
+    """gh did not answer or failed: (kind, detail)."""
+
+    def __init__(self, kind, detail):
+        super().__init__(detail)
+        self.kind, self.detail = kind, detail
+
+
+def marked_name(body):
+    """The lane name of the first marker of the body (as the entry's signed_by_fleet reads it), or None."""
+    found = MARKER.search(body) if isinstance(body, str) else None
+    return found.group(1) if found else None
+
+
+def edit_one_line(text, limit=300):
+    return " ".join(str(text or "").split())[:limit]
+
+
+def gh_call(reader, repo, path, method, payload=None):
+    """One `gh api` call through the configured gh reader (as post_ask_comment runs it); the parsed answer."""
+    env = reader.env_for(repo)
+    argv = [reader.gh, "api", path] + (["--method", method, "--input", "-"] if payload is not None else [])
+    try:
+        done = reader.runner(argv, input=json.dumps(payload) if payload is not None else None, capture_output=True, text=True,
+                             timeout=reader.timeout, **({"env": env} if env is not None else {}))
+    except subprocess.TimeoutExpired:
+        raise CommentEditFailed("unavailable", "gh did not answer within %ss" % reader.timeout) from None
+    except OSError as err:
+        raise CommentEditFailed("unavailable", "cannot run %s: %s" % (reader.gh, err.strerror or err)) from None
+    if done.returncode != 0:
+        detail = edit_one_line(done.stderr) or edit_one_line(done.stdout) or "exit %d" % done.returncode
+        raise CommentEditFailed("gh", reader.accounts.scrub(detail) if reader.accounts else detail)
+    try:
+        return load_module("record_json").parse_bounded(done.stdout)
+    except ValueError:
+        return {}
+
+
+def approval_ids(plan, comments, entries):
+    """The ids that show the approval of the CURRENT hash of the plan comment: approving comments' ids (digits), approving sends' ids (msg_...)."""
+    plan_hash = load_module("plan_check").plan_hash(plan["body"])
+    found = [str(c["id"]) for c in comments if isinstance(c, dict) and load_module("triage_plan_open").approved_by_comment(plan, plan_hash, [c], marked_name)]
+    for entry in entries:
+        detail = entry.get("detail") if isinstance(entry, dict) else None
+        keys = (detail.get("keys") or []) if isinstance(detail, dict) else []
+        if load_module("triage_plan_open").approved_by_send(plan, plan_hash, [entry], marked_name) and isinstance(keys, list) and keys:
+            found.append(str(keys[0]).split(":")[-1])
+    return found
+
+
+def edit_in_place(reader, caller, url, text, approval, entries, audited, mark_line, home_repo):
+    """Replace the body of the caller's own comment `url` with `text`, signed once. Returns (comment url, lapse line or None).
+    `audited(subject, detail)` is a context manager that yields a dict; `entries()` returns the audit tail; `mark_line(name)` the marker line."""
+    found = COMMENT_URL.match(url or "")
+    if not found:
+        raise CommentEditRefused("not a comment url (https://github.com/OWNER/REPO/issues/N#issuecomment-ID): %s" % edit_one_line(url, 80))
+    repo, number, ident = found.group(1), int(found.group(2)), found.group(3)
+    path = "repos/%s/issues/comments/%s" % (repo, ident)
+    posted = gh_call(reader, repo, path, "GET")
+    old = posted.get("body") if isinstance(posted, dict) else None
+    if not isinstance(old, str):
+        raise CommentEditRefused("comment %s could not be read" % ident)
+    if marked_name(old) != caller:
+        raise CommentEditRefused("comment %s is not yours: it is signed %s, you are %s" % (ident, marked_name(old) or "by no lane", caller))
+    lapse = None
+    if PLAN_MARK in old:
+        plan = {"id": int(ident), "body": old, "created_at": posted.get("created_at"), "user": posted.get("user")}
+        listed = gh_call(reader, repo, "repos/%s/issues/%d/comments?per_page=100" % (repo, number), "GET")
+        comments = [c for c in listed if isinstance(c, dict)] if isinstance(listed, list) else []
+        ids = approval_ids(plan, comments, entries())
+        if ids and not approval:
+            raise CommentEditRefused("comment %s holds the approved plan of #%d (approval %s): give --approval ID to edit it" % (ident, number, ids[0]))
+        if ids and approval not in ids:
+            raise CommentEditRefused("approval %s does not show the approval of the current plan of #%d (approval %s does)" % (approval, number, ids[0]))
+        if ids:
+            lapse = "approval %s lapses with the new plan hash" % approval
+    elif approval:
+        raise CommentEditRefused("comment %s is not a plan: --approval is not needed" % ident)
+    body = MARKER.sub("", text).rstrip() + "\n\n" + mark_line(caller)
+    subject = "issue:%d" % number if repo == home_repo else "issue:%s#%d" % (repo, number)
+    with audited(subject, {"repo": repo, "issue": number, "comment": int(ident), "edit": True, "chars": len(body)}) as result:
+        gh_call(reader, repo, path, "PATCH", {"body": body})
+        back = gh_call(reader, repo, path, "GET")
+        if not isinstance(back, dict) or back.get("body") != body:
+            raise CommentEditFailed("gh", "the comment read back differs from the text written")
+        result["url"] = back.get("html_url") if isinstance(back.get("html_url"), str) else url
+    return result["url"], lapse
+
+
+# ---- merge-ref (#2053)
+#
+# GitHub builds refs/pull/N/merge when a pull request is opened or pushed and when a mergeability query is made; it does not rebuild it when the
+# base branch moves, and a close and reopen reuse the old ref. This shows the first parent of the ref against the base head. Reads only (gh api GET,
+# `gh pr view --json mergeStateStatus` for --refresh); it never closes, reopens or edits a pull request. Placed before the rehearse section.
+MERGE_REF_PR = re.compile(r"^(?:([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)#|https://github\.com/([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)/pull/)?([1-9][0-9]{0,8})$")
+
+
+class MergeRefError(Exception):
+    pass
+
+
+def merge_ref_gh(runner, argv):
+    try:
+        done = runner([load_config()["gh"]] + argv, capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as err:
+        raise MergeRefError("gh did not answer: %s" % _one_line(str(err), 120)) from None
+    if done.returncode != 0:
+        raise MergeRefError(_one_line(done.stderr or done.stdout or "exit %d" % done.returncode, 200))
+    return done.stdout
+
+
+def merge_ref_read(runner, repo, number):
+    """The parents of the merge ref as a list of shas; None when the pull request has no merge ref (it conflicts)."""
+    try:
+        text = merge_ref_gh(runner, ["api", "repos/%s/commits/refs/pull/%d/merge" % (repo, number), "--jq", ".parents"])
+    except MergeRefError as err:
+        if "404" in str(err) or "Not Found" in str(err) or "No commit found" in str(err):
+            return None
+        raise
+    try:
+        parents = [p["sha"] for p in load_module("record_json").parse_bounded(text)]
+    except (ValueError, KeyError, TypeError):
+        raise MergeRefError("the answer for the merge ref is not a list of parents: %s" % _one_line(text, 80)) from None
+    if not parents or not all(isinstance(p, str) and re.fullmatch(r"[0-9a-f]{40}", p) for p in parents):
+        raise MergeRefError("the answer for the merge ref has no readable parents: %s" % _one_line(text, 80))
+    return parents
+
+
+def merge_ref_absent(runner, repo, number):
+    """Why the ref read was a 404: (a line, exit code) for a missing pull request or a ref not built yet; None for a conflict (or an unreadable answer)."""
+    try:
+        text = merge_ref_gh(runner, ["api", "repos/%s/pulls/%d" % (repo, number), "--jq", "{m: .mergeable, s: .mergeable_state}"])
+    except MergeRefError as err:
+        if "404" in str(err) or "Not Found" in str(err):
+            return "pull request %s#%d does not exist" % (repo, number), EXIT_ERROR
+        raise
+    try:
+        seen = load_module("record_json").parse_bounded(text)
+        mergeable, state = seen["m"], str(seen["s"]).lower()
+    except (ValueError, KeyError, TypeError):
+        return None
+    if mergeable is False or state in ("dirty", "conflicting"):
+        return None
+    if mergeable is None or state == "unknown":
+        return "no merge ref yet (GitHub has not built it): run merge-ref --refresh", EXIT_ERROR
+    return None
+
+
+def merge_ref_base_head(runner, repo, number):
+    base = merge_ref_gh(runner, ["api", "repos/%s/pulls/%d" % (repo, number), "--jq", ".base.ref"]).strip()
+    if not base:
+        raise MergeRefError("the base branch of the pull request is unreadable")
+    sha = merge_ref_gh(runner, ["api", "repos/%s/branches/%s" % (repo, base), "--jq", ".commit.sha"]).strip()
+    if not re.fullmatch(r"[0-9a-f]{40}", sha):
+        raise MergeRefError("the head of %s is unreadable: %s" % (base, _one_line(sha, 80)))
+    return base, sha
+
+
+def merge_ref_line(base, parents, head, word_stale):
+    first = parents[0]
+    word = "fresh" if first == head else word_stale
+    return "merge ref first parent %s, %s head %s: %s" % (first[:8], base, head[:8], word)
+
+
+def cmd_merge_ref(args, runner, now):
+    found = MERGE_REF_PR.match(args.pr)
+    repo = (found.group(1) or found.group(2) or args.repo) if found else None
+    if not found or not repo:
+        sys.stderr.write("%s: merge-ref: pass owner/repo#N, the pull request URL, or a number with --repo\n" % PROG)
+        return EXIT_ERROR
+    number = int(found.group(3))
+    try:
+        parents = merge_ref_read(runner, repo, number)
+        if parents is not None:
+            base, head = merge_ref_base_head(runner, repo, number)
+            if not args.refresh:
+                print(merge_ref_line(base, parents, head, "STALE"))
+            else:
+                merge_ref_gh(runner, ["pr", "view", str(number), "--repo", repo, "--json", "mergeStateStatus"])
+                parents = merge_ref_read(runner, repo, number)
+                if parents is not None:
+                    print(merge_ref_line(base, parents, head, "still STALE"))
+        if parents is None:
+            absent = merge_ref_absent(runner, repo, number)
+            if absent is not None:
+                print(absent[0])
+                return absent[1]
+            print("pull request %d has no merge ref: it conflicts with its base" % number)
+            return 3
+    except MergeRefError as err:
+        sys.stderr.write("%s: merge-ref: %s\n" % (PROG, _one_line(str(err), 300)))
+        return EXIT_ERROR
+    return EXIT_OK
+
+
+cmd_merge_ref.direct = True
+cmd_merge_ref.guard_records = True   # `merge-ref --refresh` reads only, but the entry guard counts it with the recorders (#2053)
+
+
+def add_merge_ref_parsers(sub):
+    parser = sub.add_parser("merge-ref", help="Whether a pull request's merge ref is stale, and with --refresh one read that recomputes it",
+                            description="Reads the first parent of refs/pull/N/merge and the head of the base branch and says fresh or STALE. Reads only: it never closes, reopens or edits a pull request. Exit 3: the pull request conflicts and has no merge ref.")
+    parser.add_argument("pr", help="The pull request: owner/repo#N, its URL, or a number with --repo")
+    parser.add_argument("--repo", default=None, help="The repository for a bare number")
+    parser.add_argument("--refresh", action="store_true", help="Make the mergeability query that recomputes the ref (a read), read the ref again, say fresh or still STALE")
+
 
 # ---- rehearse (#1785)
 #
