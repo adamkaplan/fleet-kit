@@ -19827,6 +19827,8 @@ def ci_record_core(ctx, now, quiet=False):
         base, base_head = merge_ref_base_head(gh, ctx.repo, ctx.number) if parents else (None, None)
     except MergeRefError as err:   # an unreadable merge ref cannot be shown fresh: nothing is recorded, and the one line names the error
         return dict(out, status="stale", why="the merge ref could not be read (%s): nothing was recorded" % _one_line(str(err), 120))
+    if parents is None:   # no merge ref (a 404): freshness cannot be shown, so nothing is recorded
+        return dict(out, status="stale", why="the pull request has no merge ref, so it cannot be shown fresh: nothing was recorded")
     if parents and parents[0] != base_head:
         return dict(out, status="stale", why="the run is on a stale merge ref (first parent %s, %s head %s): nothing was recorded" % (parents[0][:8], base, base_head[:8]))
     for scenario in wanted:

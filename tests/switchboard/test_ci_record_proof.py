@@ -94,6 +94,19 @@ def build(LedgerBase):
             self.assertEqual((code, len(self.ledger())), (0, 0), "an unreadable merge ref records nothing")
             self.assertEqual(len([l for l in out.splitlines() if "merge ref could not be read" in l and "boom" in l]), 1)
 
+        def test_a_missing_merge_ref_records_nothing_and_says_why(self):
+            self.plan_issue["body"] = ALL_CI
+            real = self.route
+
+            def gone(argv, **kwargs):
+                if len(argv) > 2 and argv[1] == "api" and argv[2].endswith("/commits/refs/pull/9/merge"):
+                    return subprocess.CompletedProcess(argv, 1, "", "HTTP 404 Not Found")
+                return real(argv, **kwargs)
+            self.route = gone
+            code, out, err = self.record()
+            self.assertEqual((code, len(self.ledger())), (0, 0), "a missing merge ref records nothing")
+            self.assertEqual(len([l for l in out.splitlines() if "no merge ref" in l]), 1)
+
         def test_S5_the_proof_write_has_a_mutant_the_S2_case_catches(self):
             """Copy the tree, run S2 on the unmutated copy (passes), then on a copy without the proof write (fails with the anchored text in its own output)."""
             root = Path(__file__).resolve().parents[2]
