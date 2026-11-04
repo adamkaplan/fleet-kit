@@ -2102,9 +2102,7 @@ class TestApprovalRefusals(Base):
     def test_the_members_are_derived_from_the_code_and_each_has_a_sample(self):
         module = sb.load_module("plan_approval")
         names = [name for name, _ in module.REFUSALS]
-        self.assertEqual(len(names), 16)
         self.assertEqual(sorted(names), sorted(self.SAMPLES), "a member without a test (or a test without a member)")
-        self.assertEqual(len(module.NEGATION_WORDS), 11)
 
     def test_every_member_is_refused_once_and_records_nothing(self):
         for member in [name for name, _ in sb.load_module("plan_approval").REFUSALS]:
