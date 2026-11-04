@@ -719,6 +719,8 @@ def build_entries(items, ids, home, known_title, tier_flat=False, known_parent=N
         if item["kind"] == "issue" and key(item["repo"], item["ask"]) in reporters:
             extra["reported_by"] = sorted(set(reporters[key(item["repo"], item["ask"])]))
             extra["reported_lines"] = lines[key(item["repo"], item["ask"])][-FOLDED_LINES_KEPT:]  # none is lost
+        if item.get("about"):
+            extra["about"] = item["about"]
         if item.get("considered"):
             extra["considered"] = item["considered"]
         if item.get("request"):
@@ -951,6 +953,29 @@ def outward_rows(entry):
             left = max(0, left - 2 * share)
         out.append(row)
     return out
+
+
+def parse_about(body):
+    """The author's `## About` section of an issue body: the text up to the next heading (or the end), whitespace
+    folded; the first section when there are two; None when there is none or it is empty."""
+    if not isinstance(body, str):
+        return None
+    found = re.search(r"(?mi)^#{1,6}[ \t]+about[ \t]*#*[ \t]*$", body)
+    if found is None:
+        return None
+    rest = body[found.end():]
+    following = re.search(r"(?m)^#{1,6}[ \t]", rest)
+    text = " ".join((rest[:following.start()] if following else rest).split())
+    return text or None
+
+
+def parse_about_paragraph(text):
+    """The `About:` paragraph of a report's text: from `About:` (at the start or after a space: a sent report is one folded line)
+    to the next blank line or the end, whitespace folded; None when there is none or it is empty."""
+    if not isinstance(text, str):
+        return None
+    found = re.search(r"(?i)(?:^|\s)about:(.*?)(?:\n[ \t]*\n|\Z)", text, re.S)
+    return " ".join(found.group(1).split()) or None if found else None
 
 
 def outward_payload(entry, floor):

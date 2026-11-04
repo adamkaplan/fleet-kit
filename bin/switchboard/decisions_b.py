@@ -692,5 +692,7 @@ def external_status_line(config, state_dir, now):
     if isinstance(waiting, int) and not isinstance(waiting, bool) and waiting > 0:   # decided outside, answer not here yet: never invisible if it never arrives
         oldest = body.get("settled_oldest")
         text += "; settled outside, waiting for its answer: %d%s" % (waiting, " (oldest %s)" % format_age(max(0, now - oldest)) if isinstance(oldest, (int, float)) and not isinstance(oldest, bool) else "")
-    return ("external  " + text + ("; %d permanent failure(s)" % failures if failures else "")
+    shown = "".join("\n  raise refused: %s: %s" % (r.get("display_id"), r.get("error")) for r in (body.get("refused") or []) if isinstance(r, dict))
+    shown += "".join("\n  needs an About: %s" % n for n in (body.get("needs_about") or []))
+    return ("external  " + text + ("; %d permanent failure(s)" % failures if failures else "") + shown
             + ("; ALARM: outbox is deep" if body.get("alarm") else ""))

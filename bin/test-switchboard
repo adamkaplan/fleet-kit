@@ -174,6 +174,7 @@ TestChiefOfStaffNativePermissions, TestCosTriageAllowRule, TestCosDelegatedClear
 TestChatClearOffers, TestClearCarry, TestConflictCarry, TestRoutineLocal = (_support_test_cases_07.TestChatClearOffers, _support_test_cases_07.TestClearCarry, _support_test_cases_07.TestConflictCarry, _support_test_cases_07.TestRoutineLocal)   # support import
 TestPlanCheckCommand, TestPlanExplain, TestHeavySlots, TestHeavySlotsSlowStart = (_support_test_cases_07.TestPlanCheckCommand, _support_test_cases_07.TestPlanExplain, _support_test_cases_07.TestHeavySlots, _support_test_cases_07.TestHeavySlotsSlowStart)   # support import
 TestHeavyHolders = importlib.import_module("test_heavy_holders").TestHeavyHolders   # #1774
+TestAboutParsing, TestAboutCarried, TestAboutGate, TestAboutManifest, TestAboutDocs = (importlib.import_module("test_external_about").TestAboutParsing, importlib.import_module("test_external_about").TestAboutCarried, importlib.import_module("test_external_about").TestAboutGate, importlib.import_module("test_external_about").TestAboutManifest, importlib.import_module("test_external_about").TestAboutDocs)   # ask #1876
 TestWeeklyJobRewrite, TestSlice3Modules, TestModuleLoader, TestDeployFromMainSentence = (_support_test_cases_07.TestWeeklyJobRewrite, _support_test_cases_07.TestSlice3Modules, _support_test_cases_07.TestModuleLoader, _support_test_cases_07.TestDeployFromMainSentence)   # support import
 _support_test_cases_08 = importlib.import_module("test_cases_08")   # support import
 FakeActions, TestReds, TestTempJanitorResume, TestAgentRegistry = (_support_test_cases_08.FakeActions, _support_test_cases_08.TestReds, _support_test_cases_08.TestTempJanitorResume, _support_test_cases_08.TestAgentRegistry)   # support import
@@ -52217,6 +52218,23 @@ class ExternalWorld(BaselineWorld):
         self.addCleanup(sb.EXTERNAL_ADAPTERS.pop, "fake", None)
         self.mapping = self.home / "mapping.json"
         self.mapping.write_text("{}")
+        self.give_issues_an_about()
+
+    def give_issues_an_about(self):
+        """Every outward decision carries its author's About (one with none is not sent): an issue the fake makes without a body gets one."""
+        made = self.gh.issue
+        self.gh.issue = lambda repo, number, title="an issue", labels=(), body=None, **more: made(
+            repo, number, title, labels, "## About\nBackground for a newcomer." if body is None else body, **more)
+
+    def say(self, sender, state, text, issue=None, everything=False):
+        super().say(sender, state, text + "\n\nAbout: Background for a newcomer.", issue, everything=everything)
+
+    def raise_batch(self, *args, **more):
+        found = super().raise_batch(*args, **more)
+        for made in self.gh.issues.values():   # the batch issue the command opened gets its author's About too
+            if isinstance(made.get("body"), str) and "## About" not in made["body"]:
+                made["body"] += "\n\n## About\nBackground for a newcomer."
+        return found
 
     def turn_on(self, **extra):
         section = dict({"enabled": True, "adapter": "fake", "repos": [API], "mapping_file": str(self.mapping),

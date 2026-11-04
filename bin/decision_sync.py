@@ -98,6 +98,7 @@ class SyncEngine:
         self.outbox_path = os.path.join(self.state_dir, OUTBOX_FILE)
         self.status_path = os.path.join(self.state_dir, STATUS_FILE)
         self.links, self.cursor, self.applied, self.last_pull = {}, None, [], None
+        self.needs_about = {}   # decision key -> display id: outward, with no About, so not raised (this pass)
         self.failed = {}   # decision key -> {op, error, at, sig}: an operation refused for good, not enqueued again until the decision changes
         self.parked = {}   # event id -> {"event", "tries", "next_at"}: answers waiting for a judge that could not be asked
         self.ops, self.seq = [], 0
@@ -124,6 +125,9 @@ class SyncEngine:
             self.parked = parked if isinstance(parked, dict) else {}
             failed = body.get("failed")
             self.failed = failed if isinstance(failed, dict) else {}
+            for stale in [k for k, f in self.failed.items() if isinstance(f, dict) and f.get("op") == "raise"
+                          and "about" in str(f.get("error")) and "display_id" not in f]:
+                del self.failed[stale]   # once: the raises the tool refused for want of an About are sent again (a new refusal carries its display id and stays)
         box = _read_json(self.outbox_path)
         if box is not None and isinstance(box.get("ops"), list):
             self.ops, self.seq = box["ops"], box.get("seq", 0)
@@ -160,6 +164,8 @@ class SyncEngine:
                                             "tier": entry.get("tier"), "floor": floor, "kind": entry.get("kind"),
                                             "thread": list(thread) if thread else None, "entry": entry,
                                             "boss": (bosses or {}).get(entry.get("id"))}
+            if entry.get("about"):   # after the digest: an About added or edited later revises nothing already linked
+                out[core.decision_key(seed)]["payload"] = dict(payload, about=entry["about"])
         return out
 
     def _projected(self):
@@ -198,12 +204,16 @@ class SyncEngine:
             link.update(withdrawn=True, withdrawn_at=self.now(), revision=op["revision"])
 
     def _enqueue(self, planned, desired):
+        self.needs_about = {}
         for item in planned:
             key, kind = item["key"], item["op"]
             settled = self.links.get(item.get("rebind_from") or key) or self.links.get(key) or {}
             if kind != "raise" and settled.get("decided_outside") is True and not settled.get("closed") and not settled.get("withdrawn"):
                 continue   # decided outside: its answer comes by the pull; nothing more is revised, withdrawn or reported
             want = desired.get(key)
+            if kind == "raise" and want is not None and not str(want["payload"].get("about") or "").strip():
+                self.needs_about[key] = want["payload"].get("display_id")   # not sent, never refused for good: shown at once
+                continue
             failed = self.failed.get(key)
             if failed is not None:
                 if failed["sig"] == (list((want["digest"], want["tier"], want["floor"])) if want else None):
@@ -282,6 +292,9 @@ class SyncEngine:
         stamps = [w for w in waiting if isinstance(w, (int, float)) and not isinstance(w, bool)]
         status.update(outbox=len(self.ops), last_pull=self.last_pull, permanent_failures=len(self.failed),
                       settled_waiting=len(waiting), settled_oldest=min(stamps) if stamps else None)
+        status.update(refused=[{"display_id": f.get("display_id"), "error": core.one_line(str(f.get("error")), 120)}
+                               for f in self.failed.values() if f.get("op") == "raise" and f.get("display_id")],
+                      needs_about=sorted(str(v) for v in self.needs_about.values()))
         status["alarm"] = len(self.ops) > self.settings["outbox_alarm_depth"]
         failing = [o for o in self.ops if o.get("last_error")]
         if status["state"] == "ok" and failing:
@@ -391,7 +404,7 @@ class SyncEngine:
         again until the decision changes. Never a withdraw, an answer or a retry."""
         key, text = op["key"], core.line_of("%s: %s" % (type(err).__name__, err), 200)   # redacted like every other outside text
         self.ops = [o for o in self.ops if o["key"] != key]
-        self.host.audit("external.permanent_failure", key, {"op": op["op"], "error": text, "dropped_ops": 1})
+        self.host.audit("external.permanent_failure", key, {"op": op["op"], "error": text, "dropped_ops": 1, "display_id": (op.get("decision") or {}).get("display_id"), "title": (op.get("decision") or {}).get("title")})
         if op.get("note_only"):
             return
         link = self.links.get(key)
@@ -399,6 +412,7 @@ class SyncEngine:
             link.update(last_error=text, failed_op=op["op"])
         self.failed[key] = {"op": op["op"], "error": text, "at": now,
                             "sig": list((op.get("digest"), op.get("tier"), op.get("floor"))) if op.get("digest") else None}
+        self.failed[key].update(display_id=(op.get("decision") or {}).get("display_id"))
 
     # -- inbound
 

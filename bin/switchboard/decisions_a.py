@@ -265,6 +265,7 @@ def decisions_from_reports(engine, now):
                           "since": report["at"][0], "bare": False, "boss": report["boss"],
                           "seed": "report:%s:%s:%d" % (report["session"], report["message"], report["at"][1]),
                           "considered": considered})
+            items[-1]["about"] = decision_core.parse_about_paragraph(report["text"])
     return items, problems
 
 

@@ -342,7 +342,7 @@ class FakeDoorServer:
 
     # ---- the made-up protocol
     RAISE_KEYS = {"op_id", "seat", "label", "body", "advice", "floor", "choices"}
-    RAISE_OPT = {"because", "stakes", "refs"}
+    RAISE_OPT = {"because", "stakes", "refs", "about"}
 
     def run(self, op, args, ident, seat):
         if self.disabled and op not in ("feed", "items", "work_get", "work_list"):

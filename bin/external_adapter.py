@@ -520,6 +520,7 @@ class MappingFile:
             for name in ("idempotency", "project", "class", "text", "recommendation", "floor", "options"):
                 need(isinstance(raise_f, dict) and isinstance(raise_f.get(name), str),
                      "fields.raise.%s is required" % name)
+            need(not isinstance(raise_f, dict) or isinstance(raise_f.get("about", ""), str), "fields.raise.about must be a string")
             need(isinstance(fields.get("option", {}).get("label"), str), "fields.option.label is required")
             if "revise" in (ops or {}):
                 rev = fields.get("revise", {})
@@ -1215,6 +1216,8 @@ class McpRestAdapter(decision_core.ExternalDecisionAdapter):
         body = {f["idempotency"]: self._uuid_of(key), f["project"]: self.m.data["project"], f["class"]: label,
                 f["text"]: text, f["recommendation"]: str(recommendation),
                 f["floor"]: self.m.to_external("tier", floor), f["options"]: self._options(d.get("options"))}
+        if str(d.get("about") or "").strip():   # the daemon sends none without one (needs an About); a raise of the adapter alone is as before
+            body[f.get("about", "about")] = d["about"]
         for name in ("default", "grounds", "stakes"):
             if d.get(name) and f.get(name):
                 body[f[name]] = d[name]
