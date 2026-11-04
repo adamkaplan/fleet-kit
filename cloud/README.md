@@ -591,3 +591,7 @@ minutes) belongs to the launcher.
 - The fixer image is pinned by tag, not digest: pin it for a release (the OpenCode binary is already pinned with its sha256).
 - `cloud/tests/test-cloud` is not yet run by CI (this change is limited to `cloud/`); it needs Docker for the image cases
   (`CLOUD_TEST_SKIP_DOCKER=1` skips them explicitly).
+
+## Cloud testers: the commands a tester pod has (ask #1736)
+
+A cloud tester pod has `git`, `python3` and the client's subset of `gh`: no `--job` option, no `gh api .../logs` (the redirect is not followed), no `--allow-escape-sequences`; `gh run logs <run id>` works and returns the log of every job of the run. `cw-cloud` works only with the hub setting on; with the hub off the pod has no channel and cannot report or record a verdict. The switchboard command is not in a pod. A tester's result reaches the lane as its final message (read with `read NAME` while the pod runs or after the lane's own retire; a stopped pod keeps its messages in its run record), or, with the hub on, as its own verdict through the hub. A brief for a tester names only these commands.

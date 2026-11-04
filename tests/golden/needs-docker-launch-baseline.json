@@ -2,7 +2,7 @@
   "cloud_unmarked_brief": {
     "exit": 0,
     "stdout": "{\"cloud\": true, \"name\": \"coder7\", \"runtime_id\": \"pod/coder7-7f9c\", \"session\": \"ses_remote1\", \"url\": \"http://127.0.0.1:PORT\"}\n",
-    "stderr": "fleet-switchboard: cloud settings from environment\npreflight: preflight ok: deletion, non_fast_forward, pull_request\n"
+    "stderr": "fleet-switchboard: cloud settings from environment\npreflight: preflight ok: deletion, non_fast_forward, pull_request\nfleet-switchboard: this pod has no channel: it cannot report or record a verdict; its last message is saved in its run record when it stops; `read NAME` works only while it runs or after the lane's own retire\n"
   },
   "local_launch": {
     "exit": 0,

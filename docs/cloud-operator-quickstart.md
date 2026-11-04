@@ -567,3 +567,5 @@ The build step is unchanged (an operator rebuilds the image and publishes it as 
 The App already holds checks: read (the owner confirmed it on 29 October), so the orchestrator set needs no App change today; if a later set needs a permission the App lacks, the owner adds it and accepts it on each installation, never this change.
 
 **What the orchestrator's token can and cannot do.** It can read issues, pull requests, check results and repository metadata, and it can write to issues only. It cannot push, create a branch, read a file, open, edit, approve or merge a pull request, change a workflow, a setting, a secret or a ruleset, or mint a token.
+
+A launch with neither `CW_HUB_CHANNEL_URL` nor `CW_HUB_REGISTRY_SECRET` set prints one line on standard error: the pod has no channel, its last message is saved in its run record when it stops, and `read NAME` works only while it runs or after the lane's own retire (ask #1736).

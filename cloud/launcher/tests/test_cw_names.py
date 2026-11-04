@@ -44,10 +44,15 @@ def old_name_in(rel, text):
         return False
     for name in CHANNEL_NAMES:
         text = text.replace(name, "")
+    text = text.replace(COMMAND_WORD.get(rel, "\0"), "")
     return bool(OLD.search(text))
 # The one allowed carrier: the in-pod copy of bin/plan_check.py must stay byte-identical to it (a drift test pins that),
 # and bin/plan_check.py itself carries the name in its prose; so the copy cannot be reworded.
 ALLOWED_COPY = {"cloud/worker/plan_check.py"}
+# Constraint PC-4 of ask #1736: a stop line names a refused command by the name the pod typed; the refusal that began
+# the ask was the switchboard's verdict command, run by a tester pod that has none. The word is the name of a command,
+# not a name of this product's cloud. Narrow: ONE word, in ONE file.
+COMMAND_WORD = {"cloud/launcher/run_record.py": P + "-switchboard"}
 
 
 def files():
