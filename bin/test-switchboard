@@ -16978,6 +16978,7 @@ class TestGitStashGuard(Base):
 
 TestGhShimSign = importlib.import_module("test_gh_shim_sign").TestGhShimSign
 TestGhShimSignRepoFlag = importlib.import_module("test_gh_shim_sign_repo_flag").TestGhShimSignRepoFlag
+TestCommentEdit = importlib.import_module("test_comment_edit").build(HandoffCase)
 class TestSignedComments(HandoffCase):
     """The trial's agents share the user's GitHub account, so an agent's comment came back to it as a wake.
     A comment the switchboard posts is signed, and a signed comment is never an event."""
@@ -17238,7 +17239,7 @@ class TestHandoff(HandoffCase):
         # the handoff comment, (PR 17) `write_issue_body` and (PR 18) `_gh_write`: labels and comments
         # (#1123) plus ONE site in `_review_api`, the shared helper of `review post` and `review dismiss`: their writes (a review, a dismissal) are deliberate and the only ones added;
         # the reader code (IntentReader, checked above, and checkout/measure) stays read-only
-        self.assertEqual(source.count('"--method"'), 4)
+        self.assertEqual(source.count('"--method"'), 5)
         self.assertEqual(len(re.findall(r"_review_api\([^)]*\"(?:POST|PUT)\"", source)), 2)   # the post (the verdict and its own-account fallback share one call site, the event is a variable) and the dismissal: each goes through the helper
 
 
@@ -65993,17 +65994,23 @@ _census = importlib.import_module("test_github_census")
 TestSamples, TestCensus, TestMutants, TestCensusDocumentation = _census.TestSamples, _census.TestCensus, _census.TestMutants, _census.TestDocumentation
 TestMacosReader = _census.TestMacosReader   # #1847
 TestNewModuleDemands = importlib.import_module("test_new_module_demands").TestNewModuleDemands
+TestGuardSet = importlib.import_module("test_guard_set").TestGuardSet   # #2055
 # The bin-set table test (#1457).
 _bin_set_table = importlib.import_module("test_bin_set_table")
 TestTheBinSetClassesAreAllInTheTable = _bin_set_table.TestTheBinSetClassesAreAllInTheTable
+# The heavy wrapper's progress line (#1762).
+TestHeavyProgress = importlib.import_module("test_heavy_progress").TestHeavyProgress
 # The pod niceness tests (#1794).
 TestPodNiceness = importlib.import_module("test_pod_niceness").TestPodNiceness
+# The split of the heavy wrapper into a part (#2034).
+TestHeavySplit = importlib.import_module("test_heavy_split").TestHeavySplit
 # The steer-after-minutes tests of #1540, moved under the line ceiling.
 _steer_long = importlib.import_module("test_steer_long_turn")
 TestSteerLongTurn = _steer_long.build(Base, TestSteerToWorking)
 _hc = importlib.import_module("test_header_cache"); TestAges, TestSets, TestEvents, TestSafety, TestReplay, TestIsolation, TestDropNeverBlocksAWrite, TestApprovalReadsFresh, TestDocs = _hc.TestAges, _hc.TestSets, _hc.TestEvents, _hc.TestSafety, _hc.TestReplay, _hc.TestIsolation, _hc.TestDropNeverBlocksAWrite, _hc.TestApprovalReadsFresh, _hc.TestDocs
 TestReminderTtlMore = importlib.import_module("test_reminder_ttl").build(PR4Base)
 TestPlanRehearsal = importlib.import_module("test_plan_rehearsal").build(HandoffCase)   # #1785
+TestMergeRef = importlib.import_module("test_merge_ref").build(HandoffCase)   # #2053
 # The load figure counts cloud workers as busy (#1487).
 _load_cloud = importlib.import_module("test_load_alert_cloud")
 TestLoadAlertCloudBusy = _load_cloud.TestLoadAlertCloudBusy
@@ -66012,6 +66019,9 @@ _ci_test_files = importlib.import_module("test_ci_test_files")
 TestCiTestFileList = _ci_test_files.TestCiTestFileList
 TestTempJanitorScratch = importlib.import_module("test_scratch").build(TestTempJanitor)
 
+# The host-disk tests of #2081.
+TestHostDisk = importlib.import_module("test_host_disk").TestHostDisk
+
 # The delivery-lag tests of #1402.
 _delivery_lag = importlib.import_module("test_delivery_lag")
 _delivery_lag.World = World
@@ -66019,12 +66029,14 @@ PresentHub, TestDeliveryLag = _delivery_lag.PresentHub, _delivery_lag.TestDelive
 TestLaunchBriefCheck = importlib.import_module("test_launch_brief_check").build(TwoRepoCase, TestLaunchRefusedMessage)
 TestEveryKindDelayedMark = importlib.import_module("test_every_kind_delayed_mark").TestEveryKindDelayedMark
 TestSignedLinkScrub = importlib.import_module("test_signed_link_scrub").build(Base, GithubRig)
+TestCiQueue = importlib.import_module("test_ci_queue").build(HandoffCase, FAKE_GH)   # #1961
 TestLaunchQueue = importlib.import_module("test_launch_queue").build(HandoffCase)
 # The reminder-cancel tests of #1401.
 _reminder_cancel = importlib.import_module("test_reminder_cancel")
 TestCancelKeyRecheck = _reminder_cancel.build(PR4Base)
 # The lost-worker alert tests of #1481.
 _lost_worker = importlib.import_module("test_lost_worker")
+TestLostWorkerRemembers = importlib.import_module("test_lost_worker_remembers").TestLostWorkerRemembers
 TestLostWorker, TestLostWorkerReadRound, TestLostWorkerMemoryOnly = _lost_worker.TestLostWorker, _lost_worker.TestLostWorkerReadRound, _lost_worker.TestLostWorkerMemoryOnly
 # A CLAIMS: line present but not read is refused (#1617); HOST gives the test the fixtures of this file.
 _claim_placement = importlib.import_module("test_claim_placement"); _claim_placement.HOST = sys.modules[__name__]
@@ -78178,6 +78190,11 @@ _plan_check_words_module = importlib.util.module_from_spec(_plan_check_words_spe
 sys.path.insert(0, str(REPO))
 _plan_check_words_spec.loader.exec_module(_plan_check_words_module)
 PlanCheckWords_Words, PlanCheckWords_Corpus = _plan_check_words_module.Words, _plan_check_words_module.Corpus
+# #2023: tests/test_doctor_watcher.py is run by THIS runner too (loaded by path like the tests above; bound by name so CI collects it)
+_doctor_watcher_spec = importlib.util.spec_from_file_location("doctor_watcher_tests", REPO / "tests" / "test_doctor_watcher.py")
+_doctor_watcher_module = importlib.util.module_from_spec(_doctor_watcher_spec)
+_doctor_watcher_spec.loader.exec_module(_doctor_watcher_module)
+DoctorWatcher_TestWatcher = _doctor_watcher_module.TestWatcher
 for _name, _module in _brief_modules.items():   # a TestCase added to one of these files and not bound above would silently drop out of CI
     _held = {v for k, v in globals().items() if k.startswith("Brief_")}
     _defined = {v for v in vars(_module).values() if isinstance(v, type) and issubclass(v, unittest.TestCase) and v.__module__ == _module.__name__}

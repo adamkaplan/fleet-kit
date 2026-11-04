@@ -38,6 +38,7 @@ cloud/launcher/tests/test_git_token_renewal.py
 cloud/launcher/tests/test_git_token_retry.py
 cloud/launcher/tests/test_hub_restart_client.py
 cloud/launcher/tests/test_hub_safe_to_evict.py
+cloud/launcher/tests/test_idle_nudge.py
 cloud/launcher/tests/test_issues_read.py
 cloud/launcher/tests/test_known_forms.py
 cloud/launcher/tests/test_m_cap.py
@@ -45,6 +46,7 @@ cloud/launcher/tests/test_mint_retry.py
 cloud/launcher/tests/test_mint_roles.py
 cloud/launcher/tests/test_model_credential.py
 cloud/launcher/tests/test_needs_docker_hermetic.py
+cloud/launcher/tests/test_no_open_files.py
 cloud/launcher/tests/test_orchestrator_agent.py
 cloud/launcher/tests/test_orchestrator_hub_session.py
 cloud/launcher/tests/test_orchestrator_row.py
@@ -61,6 +63,7 @@ cloud/launcher/tests/test_render_namespace.py
 cloud/launcher/tests/test_retire_gone_pod.py
 cloud/launcher/tests/test_run_record.py
 cloud/launcher/tests/test_scratch_clean.py
+cloud/launcher/tests/test_scrub_linear.py
 cloud/launcher/tests/test_stack_model_key.py
 cloud/launcher/tests/test_stack_registry_check.py
 cloud/launcher/tests/test_stack_registry_pod.py
@@ -75,6 +78,7 @@ cloud/worker/tests/test_base_merge_base.py
 cloud/worker/tests/test_cloud_prepush.py
 cloud/worker/tests/test_cloud_prepush_background.py
 cloud/worker/tests/test_cloud_prepush_hardening.py
+cloud/worker/tests/test_comment_by_id.py
 cloud/worker/tests/test_cw_gh_comments.py
 cloud/worker/tests/test_dockerfile_agent.py
 cloud/worker/tests/test_dockerfile_node.py

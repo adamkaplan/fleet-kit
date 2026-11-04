@@ -189,7 +189,7 @@ class S2Kinds(unittest.TestCase):
 def OLD_SCRUB(text, secrets_known=(), limit=300):
     """The frozen copy of `scrub` as it stood at the integration tip ec5eabf1, kept verbatim as the reference (ask #1783)."""
     text = str(text)[:cw.SCRUB_INPUT_MAX]
-    for sec in sorted({v for v in secrets_known if v and len(v.strip()) >= cw.MIN_FRAGMENT}, key=len, reverse=True):
+    for sec in sorted({v for v in secrets_known if v and len(v.strip()) >= cw.MIN_FRAGMENT}, key=lambda v: (-len(v), v)):
         for v in {sec, sec.strip()}:
             text = text.replace(v, "[redacted]")
         out, i = [], 0
