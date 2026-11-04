@@ -65,6 +65,7 @@ class TestPodNiceness(unittest.TestCase):
 
     def run_mutant(self, source):
         copy = self.home / "heavy_slots.py"
+        (copy.parent / "heavy_slots_watch.py").write_text((HEAVY.parent / "heavy_slots_watch.py").read_text())
         copy.write_text(source)
         script = "import sys; sys.path.insert(0, %r); import test_pod_niceness as t; t.check_without_marker(t.load(%r))" % (str(Path(__file__).parent), str(copy))
         return subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, cwd=str(Path(__file__).parent))
@@ -84,6 +85,7 @@ class TestPodNiceness(unittest.TestCase):
         script = "import sys; sys.path.insert(0, %r); import test_pod_niceness as t; t.check_in_pod(t.load(%r))"
         def run(text):
             copy = self.home / "heavy_slots.py"
+            (copy.parent / "heavy_slots_watch.py").write_text((HEAVY.parent / "heavy_slots_watch.py").read_text())
             copy.write_text(text)
             return subprocess.run([sys.executable, "-c", script % (str(Path(__file__).parent), str(copy))], capture_output=True, text=True, cwd=str(Path(__file__).parent))
         control = run(source)

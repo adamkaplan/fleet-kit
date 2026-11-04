@@ -59,12 +59,12 @@ run_to() {
   : >"$OUT"
   "$@" >"$OUT" 2>&1 &
   cmdpid=$!
-  ( sleep "$secs"; kill -9 "$cmdpid" 2>/dev/null ) >/dev/null 2>&1 &
-  watchpid=$!
+  # The watcher polls at one-second steps and ends by itself; the doctor never signals it, so
+  # it cannot run the inherited cleanup trap.
+  ( w=0; while [ "$w" -lt "$secs" ]; do sleep 1; kill -0 "$cmdpid" 2>/dev/null || exit 0; w=$((w+1)); done
+    kill -9 "$cmdpid" 2>/dev/null ) >/dev/null 2>&1 &
   wait "$cmdpid" 2>/dev/null
   rc=$?
-  kill "$watchpid" 2>/dev/null
-  wait "$watchpid" 2>/dev/null
   LAST_OUT=$(cat "$OUT" 2>/dev/null)
   return $rc
 }

@@ -540,7 +540,7 @@ heartbeat-ack:atomic_write
 heartbeat-ack:read_state_document
 heavy_slots.py:_read
 heavy_slots.py:_read_info
-heavy_slots.py:_reported
+heavy_slots_watch.py:_reported
 host_liveness.py:_remote
 impact_floor.py:load_matrix
 impact_hold.py:_gh_json
@@ -608,6 +608,7 @@ switchboard/judge.py:looks_like_plugin_event
 switchboard/judge.py:parse_plugin_event
 switchboard/judge_request.py:_guess_configured
 switchboard/judge_request.py:parse_policy_request
+switchboard/reminders.py:ci_queue_get
 switchboard/sent_view.py:sent_deliveries
 switchboard/triage.py:triage_summary
 switchboard/v2_transport.py:_decode
