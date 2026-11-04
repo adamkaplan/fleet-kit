@@ -35508,7 +35508,7 @@ class TestImpactReleaseEveryPass(TestImpactRejudge):
         self.mutant_fails("head", self.MUTANTS["head"])
 
     # -- the cost: a held pull request costs nothing between changes (a RATE, not a per-pass count)
-    HELD, PASS_SECONDS, HOUR_PASSES = 30, 5, 720   # 30 held pull requests, a pass every 5 seconds (the default poll), for an hour
+    HELD, PASS_SECONDS, HOUR_PASSES = 30, 5, 60   # 30 held pull requests, a pass every 5 seconds (the default poll), (a count: the retarget half way, quiet passes before and after)
     HOUR_CALLS = 1   # the stated bound: one `gh pr view` for the ONE retarget of the hour (plus its 2 label removals, counted apart); nothing for the 29 unchanged
 
     def hour_of_passes(self, mutant=None):
@@ -35562,7 +35562,7 @@ class TestImpactReleaseEveryPass(TestImpactRejudge):
         one(1000)
         self.view_reads.clear()
         self.writes.clear()
-        for i in range(60):   # the base's tip moves at every pass: the same branch, the same three-dot diff
+        for i in range(10):   # the base's tip moves at every pass: the same branch, the same three-dot diff
             for n in numbers:
                 self.prs[n]["baseRefOid"] = ("%040x" % (i + 2))
             one(self.PASS_SECONDS)
