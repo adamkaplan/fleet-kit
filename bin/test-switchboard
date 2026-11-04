@@ -60369,7 +60369,7 @@ class TestV2Light(Base):
         ledger = world.engine.sent
         for n in range(sb.SENT_PER_SESSION + 50):
             ledger.reserve("ses_example", ["k%d" % n], float(n * sb.SENT_MIN_AGE))
-            ledger.confirm("ses_example", ["k%d" % n], float(n))
+            ledger.confirm("ses_example", ["k%d" % n], float(n * sb.SENT_MIN_AGE))
         self.assertEqual(len(ledger.keys["ses_example"]), sb.SENT_PER_SESSION)
         self.assertIn("k%d" % (sb.SENT_PER_SESSION + 49), ledger.keys["ses_example"])
         for n in range(sb.SENT_SESSIONS + 20):
