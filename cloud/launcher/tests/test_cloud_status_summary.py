@@ -44,6 +44,9 @@ class Base(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
+        module = self.cloud()   # the module is shared between tests: a test that shortens the bound must not leave it shortened
+        saved = module.SNAPSHOT_SECONDS
+        self.addCleanup(setattr, module, "SNAPSHOT_SECONDS", saved)
         self.home = Path(self.tmp.name).resolve()
         self.state_dir = None   # the switchboard's own state directory (its name is the switchboard's, never written here)
         self.kube = self.home / "kube.json"
@@ -292,6 +295,21 @@ class TestSummary(Base):
         self.record("coder7")
         code, out, err = self.run_command("status")
         self.assertEqual(len([l for l in out.splitlines() if l.strip().startswith("cloud: nodes")]), 1, out)
+
+    def test_a_test_that_shortens_the_bound_leaves_the_real_bound_to_the_next(self):
+        """A test that shortens SNAPSHOT_SECONDS on the shared module restores it: a fresh test reads the real bound (30), not 1 or 2."""
+        module = self.cloud()
+        real = module.SNAPSHOT_SECONDS
+        self.assertEqual(real, 30)
+
+        class Shortener(Base):
+            def test_shortens(self):
+                self.cloud().SNAPSHOT_SECONDS = 1
+
+        with open(os.devnull, "w") as sink:
+            result = unittest.TextTestRunner(stream=sink).run(unittest.defaultTestLoader.loadTestsFromTestCase(Shortener))
+        self.assertEqual((result.testsRun, len(result.failures), len(result.errors)), (1, 0, 0))
+        self.assertEqual(sb.load_module("cloud_worker").SNAPSHOT_SECONDS, real)
 
 
 class TestHostileCluster(Base):
