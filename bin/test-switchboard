@@ -6451,6 +6451,13 @@ class TestLaunch(StandInPids, Base):
 # --------------------------------------------------- the offline scenario runner
 
 SCENARIO_REPORTS = []
+_Q1_REPORT = []   # ONE replay of q1 per process, shared by TestOfflineScenarios and TestOfflineScenariosPR4 (#2108)
+
+
+def q1_report(case):
+    if not _Q1_REPORT:
+        _Q1_REPORT.append(run_scenario(case, sc.load(sc.DEFAULT_DIR / "q1-quiet-two-hours.json")))
+    return _Q1_REPORT[0]
 
 
 
@@ -6616,7 +6623,7 @@ def _scenario_test(path):
         scenario = sc.load(path)
         if "offline" not in scenario["tiers"]:
             self.skipTest("%s has no offline tier" % scenario["id"])
-        report = run_scenario(self, scenario)
+        report = q1_report(self) if path.name == "q1-quiet-two-hours.json" else run_scenario(self, scenario)
         SCENARIO_REPORTS.append(report)
         self.check_report(report)
     test.__doc__ = "scenario %s offline, and its control fails" % path.name
@@ -10511,7 +10518,7 @@ class TestOfflineScenariosPR4(Base):
             with_baseline(scenario, "something-else")
 
     def test_a_quiet_two_hours_fails_under_the_old_timer_and_passes_without_it(self):
-        report = self.run_named("q1-quiet-two-hours.json")
+        report = q1_report(self)
         self.assertEqual(report["failures"], [])
         self.assertEqual(report["proves_nothing"], [])
         self.assertFalse(next(r for r in report["control"] if r["label"] == "no-turns")["ok"])
