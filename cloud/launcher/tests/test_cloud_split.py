@@ -89,7 +89,7 @@ class TestSplitNames(unittest.TestCase):
         new = unmask((ROOT / "bin" / "cloud_cluster.py").read_text()).split("\n")
         start = new.index(FIRST_MOVED)
         old = first + ["", ""] + second
-        got = [l for l in new[start:] if True]
+        got = [re.sub(r"isinstance\(body, dict\) or \(command == \"status\".*\) else None", "isinstance(body, dict) else None", l) for l in new[start:]]   # the status-only list case of line 159 mapped back to the old dict-only text
         while got and got[-1] == "":
             got.pop()
         while old and old[-1] == "":

@@ -1188,6 +1188,8 @@ def status_lines(runner, state, timeout=STATUS_SECONDS):
                 code, body, note = run_launcher(runner, "status", record["worker"], (), timeout, cluster=cluster)
             except CloudError as err:
                 code, body, note = -1, None, str(err)
+            if isinstance(body, list):   # the launcher prints a list with one record per pod: the first one
+                body = body[0] if body and isinstance(body[0], dict) else None
             if code == 0 and body is not None:
                 row.update({key: body.get(key) for key in ("phase", "idle_since", "cost_estimate_usd")})
                 extra = "phase %s, about $%s so far" % (_safe(body.get("phase"), "?"), body.get("cost_estimate_usd", "?"))
