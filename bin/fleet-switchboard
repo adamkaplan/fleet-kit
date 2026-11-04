@@ -19821,6 +19821,14 @@ def ci_record_core(ctx, now, quiet=False):
         if not quiet:   # nothing was recorded, so this is NOT proof that the recorder works (ok stays False for the preflight)
             _gates_audit(ctx.engine, "gate.ci_record", ctx.pr, dict(detail, ok=False, why="no scenario names ci"))
         return dict(out, status="nothing")
+    try:   # the run is on refs/pull/N/merge: a merge ref whose first parent is not the base's current head is a stale run, and records nothing (#2053 reader)
+        gh = getattr(ctx.engine, "gh_runner", None) or subprocess.run
+        parents = merge_ref_read(gh, ctx.repo, ctx.number)
+        base, base_head = merge_ref_base_head(gh, ctx.repo, ctx.number) if parents else (None, None)
+    except MergeRefError:
+        parents = None   # unreadable or no merge ref: the run cannot be judged stale, the other guards stand
+    if parents and parents[0] != base_head:
+        return dict(out, status="stale", why="the run is on a stale merge ref (first parent %s, %s head %s): nothing was recorded" % (parents[0][:8], base, base_head[:8]))
     for scenario in wanted:
         fresh = [e for e in ctx.entries if e.get("pr") == ctx.pr and e.get("scenario") == scenario["id"] and e.get("kind") == "verdict"
                  and e.get("evaluator") == "ci" and e.get("plan_hash") == ctx.plan["plan_hash"] and e.get("head") == head
@@ -19943,6 +19951,9 @@ def cmd_gates_ci_record(args, runner, now):
             print(line)
     if got["status"] in ("unreadable", "no-plan", "no-head", "not-green"):
         raise LedgerCommandError("%s: nothing was recorded" % got["why"])
+    if got["status"] == "stale":
+        print(got["why"])
+        return EXIT_OK
     if got["status"] == "nothing":
         print("CI is green at %s; the plan has no per-PR scenario that names `ci`: nothing to record" % got["head"][:8])
         for line in carry_lines(got.get("carry") or []):
