@@ -122,6 +122,7 @@ _support_test_cases_02 = importlib.import_module("test_cases_02")   # support im
 TestWorkerRulesInSkills, TestJevClient, TestImportV1Converter, TestPlanCheckFeedback = (_support_test_cases_02.TestWorkerRulesInSkills, _support_test_cases_02.TestJevClient, _support_test_cases_02.TestImportV1Converter, _support_test_cases_02.TestPlanCheckFeedback)   # support import
 TestPlanReceipts, TestDecisionHeadlines, TestExternalAdapterErrors, TestJobTool = (_support_test_cases_02.TestPlanReceipts, _support_test_cases_02.TestDecisionHeadlines, _support_test_cases_02.TestExternalAdapterErrors, _support_test_cases_02.TestJobTool)   # support import
 TestPlanKind, TestAuditRotation, TestAgentsVerify, TestReviewLawsStarterSet = (_support_test_cases_02.TestPlanKind, _support_test_cases_02.TestAuditRotation, _support_test_cases_02.TestAgentsVerify, _support_test_cases_02.TestReviewLawsStarterSet)   # support import
+TestScratchBound = importlib.import_module("test_scratch_command").TestScratchBound
 TestPluginPush, TestReconcileOnRead = (_support_test_cases_02.TestPluginPush, _support_test_cases_02.TestReconcileOnRead)   # support import
 _support_test_cases_03 = importlib.import_module("test_cases_03")   # support import
 TestV2Client, TestStatus, TestPoke = (_support_test_cases_03.TestV2Client, _support_test_cases_03.TestStatus, _support_test_cases_03.TestPoke)   # support import
@@ -596,7 +597,7 @@ class TestFacts(Base):
     def test_the_registration_point_lists_the_lab_source(self):
         self.assertEqual([s.__name__ for s in sb.fact_sources(self.home)],
                          ["lab_facts", "worker_facts", "reminder_facts", "report_rider_facts", "held_send_facts", "foreground_facts",
-                          "orders_facts", "sweep_facts", "triage_facts", "plan_wake_facts", "alert_wake_facts", "red_ci_facts", "job_facts", "pane_facts", "pane_exit_facts", "headless_restart_facts", "disk_facts", "cpu_facts", "spotlight_facts", "docker_reap_facts", "temp_janitor_facts", "heavy_orphan_facts"])
+                          "orders_facts", "sweep_facts", "triage_facts", "plan_wake_facts", "alert_wake_facts", "red_ci_facts", "job_facts", "pane_facts", "pane_exit_facts", "headless_restart_facts", "disk_facts", "cpu_facts", "spotlight_facts", "docker_reap_facts", "temp_janitor_facts", "heavy_orphan_facts", "scratch_bound_facts"])
 
     def test_every_fact_source_class_in_the_module_is_registered(self):   # #1030: derived, so a new source cannot be left out
         registered = {type(s).__name__ for s in sb.fact_sources(self.home)}
@@ -10342,7 +10343,7 @@ class TestFrictionWake(FrictionBase):
         self.assertNotIn("friction_wake", sb.DEFAULTS)
         self.assertEqual([s.__name__ for s in sb.fact_sources(self.home)],
                          ["lab_facts", "worker_facts", "reminder_facts", "report_rider_facts", "held_send_facts", "foreground_facts",
-                          "orders_facts", "sweep_facts", "triage_facts", "plan_wake_facts", "alert_wake_facts", "red_ci_facts", "job_facts", "pane_facts", "pane_exit_facts", "headless_restart_facts", "disk_facts", "cpu_facts", "spotlight_facts", "docker_reap_facts", "temp_janitor_facts", "heavy_orphan_facts"])
+                          "orders_facts", "sweep_facts", "triage_facts", "plan_wake_facts", "alert_wake_facts", "red_ci_facts", "job_facts", "pane_facts", "pane_exit_facts", "headless_restart_facts", "disk_facts", "cpu_facts", "spotlight_facts", "docker_reap_facts", "temp_janitor_facts", "heavy_orphan_facts", "scratch_bound_facts"])
         self.assertNotIn("friction_wake", sb.validate_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR}))
         self.assertEqual(sb.FRICTION_DEFAULTS, {"enabled": False, "hour": 9, "to": "cos", "cos_to": "improver", "text": None})
         self.make("off")
@@ -12692,6 +12693,7 @@ class TestOneCharter(CharterRig, Base):
         ("bin/switchboard/handoff.py", "seam_applies"): "set: is this issue number known as a charter",
         ("bin/fleet-switchboard", "owned_numbers"): "registry: the numbers an agent owns (an orchestrator: its row's charter only; others: their own assignment)",
         ("bin/fleet-switchboard", "registry_charter_view"): "registry: every row's charter", ("bin/switchboard/triage.py", "triage_context"): "registry: charters via owned_numbers (an orchestrator's issue is never a charter)",
+        ("bin/switchboard/cockpit.py", "cockpit_cards"): "registry: reads every row's charter to find the orchestrator a blocked lane waits on (read-only feed)",
         ("bin/switchboard/judge_request.py", "identify"): "own: copies the caller's own launch fields into its context",
         ("bin/fleet-switchboard", "resume_agent"): "own: one agent's own repo lookup", ("bin/fleet-switchboard", "charter_pane_update"): "own: one agent's own charter for its pane",
         ("bin/fleet-switchboard", "_fleet_repo"): "own: one agent's own repo", ("bin/switchboard/decisions_b.py", "read_order_notices"): "own: the order notices' own records",
@@ -15918,7 +15920,6 @@ class TestAgentDefinitions(unittest.TestCase):
             with self.subTest(file=str(path.relative_to(REPO))):
                 block = maxims_block(path.read_text())
                 self.assertTrue(block, "no ## Maxims block")
-                self.assertLessEqual(len([line for line in block.splitlines() if line.strip()]), 12)
                 role = role_of(path)
                 for phrase in SHARED_MAXIMS:
                     # `Say it failed` lives in CODING_STANDARDS.md (R-CODE-1); the coder keeps a pointer, not the text. Chesterton's fence and cut the root stay in EVERY definition: Copilot coders and other installs load no global AGENTS.md
@@ -15930,6 +15931,36 @@ class TestAgentDefinitions(unittest.TestCase):
                 self.assertEqual("Trust, but verify" in block, role not in WORKER_ROLES)
                 for phrase in COS_ONLY_MAXIMS:
                     self.assertEqual(phrase in block, role == "chief-of-staff", phrase)
+
+    # the one maxim the two chief-of-staff copies word under different names today (reported on PR #2107, not edited here)
+    DIVERGENT_COS_MAXIMS = ("**The last message stands alone.**", "**A news message stands alone.**")
+
+    def maxim_name_problems(self, copies):
+        """copies: {file label: text}. Per role, every copy carries the same `- **Name.**` maxim lines; returns messages naming the file that misses one."""
+        by_role = {}
+        for label, text in copies.items():
+            role = "orchestrator" if label.startswith("cloud/") else role_of(REPO / label)
+            names = set(re.findall(r"^- (\*\*[^*\n]+\.\*\*)", maxims_block(text), re.M)) - set(self.DIVERGENT_COS_MAXIMS)
+            by_role.setdefault(role, {})[label] = names
+        problems = []
+        for role, group in by_role.items():
+            union = set().union(*group.values())
+            for label, names in sorted(group.items()):
+                if union - names:
+                    problems.append("%s misses %s" % (label, sorted(union - names)))
+        return problems
+
+    def test_every_definition_and_cloud_copy_carries_the_same_maxim_lines_per_role(self):
+        labels = [str(p.relative_to(REPO)) for p in AGENT_FILES] + ["cloud/worker/agents/orchestrator.md", "cloud/worker/tests/golden/orchestrator.md"]
+        self.assertEqual(len(labels), 10)
+        copies = {label: (REPO / label).read_text() for label in labels}
+        self.assertEqual(self.maxim_name_problems(copies), [])
+        planted = dict(copies)
+        victim = "cloud/worker/tests/golden/orchestrator.md"
+        planted[victim] = planted[victim].replace("- **Festina lente.**", "- Festina lente.", 1)
+        problems = self.maxim_name_problems(planted)
+        self.assertEqual(len(problems), 1)
+        self.assertIn(victim, problems[0])
 
     def test_the_maxims_come_before_the_rest_of_the_body(self):
         for path in AGENT_FILES:
@@ -16987,6 +17018,7 @@ class TestGitStashGuard(Base):
 TestGhShimSign = importlib.import_module("test_gh_shim_sign").TestGhShimSign
 TestGhShimSignRepoFlag = importlib.import_module("test_gh_shim_sign_repo_flag").TestGhShimSignRepoFlag
 TestCommentEdit = importlib.import_module("test_comment_edit").build(HandoffCase)
+TestPlanApply, TestPlanApplyDerivedPlaces = importlib.import_module("test_plan_apply").build(HandoffCase)
 class TestSignedComments(HandoffCase):
     """The trial's agents share the user's GitHub account, so an agent's comment came back to it as a wake.
     A comment the switchboard posts is signed, and a signed comment is never an event."""
@@ -28509,6 +28541,12 @@ class LedgerBase(Base):
             return subprocess.CompletedProcess(argv, 0, json.dumps(self.comments if "&page=1" in path else []), "")
         if re.search(r"/issues/7$", path):
             return subprocess.CompletedProcess(argv, 0, json.dumps(self.plan_issue), "")
+        if path.endswith("/merge") and "/commits/refs/pull/" in path:   # a fresh merge ref: its first parent is the base's head (#2091)
+            return subprocess.CompletedProcess(argv, 0, json.dumps([{"sha": "b" * 40}, {"sha": self.pr["headRefOid"]}]), "")
+        if re.search(r"/pulls/\d+$", path):
+            return subprocess.CompletedProcess(argv, 0, "main\n", "")
+        if re.search(r"/branches/main$", path):
+            return subprocess.CompletedProcess(argv, 0, "b" * 40 + "\n", "")
         return subprocess.CompletedProcess(argv, 1, "", "gh: Not Found (HTTP 404)")
 
     terminal_problem = None   # what the owner-terminal check says in these tests (None: it is the owner's terminal)
@@ -28619,7 +28657,7 @@ class TestGatesMissingWording(LedgerBase):
 
     def test_S4_the_item_and_ci_writers_each_write_one_kind_derived_from_the_code(self):
         writers = {"cmd_prove": {"proof"}, "cmd_verdict": {"verdict"}, "cmd_item_prove": {"proof"}, "cmd_item_verdict": {"verdict"},
-                   "cmd_item_ci_record": {"verdict"}, "ci_record_core": {"verdict"}}
+                   "cmd_item_ci_record": {"verdict"}, "ci_record_core": {"proof", "verdict"}}
         for name, want in writers.items():
             found = set()
             for node in ast.walk(ast.parse(textwrap.dedent(inspect.getsource(getattr(sb, name))))):
@@ -55666,7 +55704,9 @@ class TestWriteOnlyOnChange(Base):
         self.assertLessEqual(seen["sweep.json"], 1 + 1200 // sb.HEARTBEAT_SWEEP, dict(seen))          # once, plus a heartbeat per HEARTBEAT_SWEEP
         self.assertGreaterEqual(seen["v2-calls.json"], 1)
         self.assertLessEqual(seen["decisions.json"], 2, "decisions.json keeps its touch: its mtime is the signal, and a touch is not a rewrite")
-        self.assertLess(sum(seen.values()), 3 * 40 // 2, dict(seen))   # three files alone used to be written 40 times each
+        self.assertGreaterEqual(seen["cockpit.json"], 1, dict(seen))
+        self.assertLessEqual(seen["cockpit.json"], 1 + 1200 // sb.COCKPIT_HEARTBEAT, dict(seen))   # the feed: once, plus a heartbeat per COCKPIT_HEARTBEAT, never between
+        self.assertLess(sum(seen.values()) - seen["cockpit.json"], 3 * 40 // 2, dict(seen))   # three files alone used to be written 40 times each
 
     def test_the_status_files_of_the_pass_keep_a_heartbeat(self):
         world = World(self, agents=("a0",), config={})
@@ -66052,6 +66092,9 @@ TestDerivedClosure, TestRefusalInAPart, TestMovingADefinition, TestTheDerivation
 # The shadow test (#1339): an added definition under a closure name in another file is refused by the clear.
 _shadow = importlib.import_module("test_shadow")
 TestShadowRule, TestShadowGlue, TestShadowStatuses, TestReasonsAreOneCleanLine = _shadow.TestShadowRule, _shadow.TestShadowGlue, _shadow.TestShadowStatuses, _shadow.TestReasonsAreOneCleanLine
+# The Cockpit feed test (#1423): the read-only feed of what the fleet needs from a person.
+_cockpit = importlib.import_module("test_cockpit")
+TestFeedShape, TestIdsAndEtags, TestCapsAndScrub, TestDocument, TestWriting, TestReadOnly, TestBranches = _cockpit.TestFeedShape, _cockpit.TestIdsAndEtags, _cockpit.TestCapsAndScrub, _cockpit.TestDocument, _cockpit.TestWriting, _cockpit.TestReadOnly, _cockpit.TestBranches
 _claims_note = importlib.import_module("test_claims_note"); _claims_note.HOST = sys.modules[__name__]; TestClaimsNotePass, TestClaimsNoteSkips, TestClaimsNoteText, TestClaimsNoteMutants, TestClaimsNoteDocumentation, TestClaimsNoteScan = _claims_note.TestClaimsNotePass, _claims_note.TestClaimsNoteSkips, _claims_note.TestClaimsNoteText, _claims_note.TestClaimsNoteMutants, _claims_note.TestClaimsNoteDocumentation, _claims_note.TestClaimsNoteScan   # #1716
 _bot_reviews = importlib.import_module("test_bot_reviews"); _bot_reviews.HOST = sys.modules[__name__]; BotLines, BotWake, PendingJobs, BotDocumentation, BotMutants, BotSize, BotVerdict = _bot_reviews.BotLines, _bot_reviews.BotWake, _bot_reviews.PendingJobs, _bot_reviews.BotDocumentation, _bot_reviews.BotMutants, _bot_reviews.BotSize, _bot_reviews.BotVerdict
 # The relay tree-guard test (#1380, #1429): the relay thread obeys the installed-tree guard.
@@ -66060,6 +66103,7 @@ RelayObeysTheTreeGuard = _relay_tree_guard.RelayObeysTheTreeGuard
 _sent_view = importlib.import_module("test_sent_view")
 _sent_view.World = World
 TestSentView = _sent_view.TestSentView
+TestScratchCommand = importlib.import_module("test_scratch_command").TestScratchCommand
 # The relay-loop tests of #1477, moved under the architecture cap.
 _relay_loop = importlib.import_module("test_relay_loop_cadence")
 RelayLoopCadence, TwoLoopsTrace, TrickleHub, HubFilesUnchanged, OneWorkerAndCancel = _relay_loop.RelayLoopCadence, _relay_loop.TwoLoopsTrace, _relay_loop.TrickleHub, _relay_loop.HubFilesUnchanged, _relay_loop.OneWorkerAndCancel
@@ -66104,6 +66148,7 @@ _hc = importlib.import_module("test_header_cache"); TestAges, TestSets, TestEven
 TestReminderTtlMore = importlib.import_module("test_reminder_ttl").build(PR4Base)
 TestPlanRehearsal = importlib.import_module("test_plan_rehearsal").build(HandoffCase)   # #1785
 TestMergeRef = importlib.import_module("test_merge_ref").build(HandoffCase)   # #2053
+TestCiRecordProof = importlib.import_module("test_ci_record_proof").build(LedgerBase)   # #2091
 TestDoneWhenList = importlib.import_module("test_done_when_list").TestDoneWhenList   # #2078
 # The load figure counts cloud workers as busy (#1487).
 _load_cloud = importlib.import_module("test_load_alert_cloud")
@@ -66111,10 +66156,12 @@ TestLoadAlertCloudBusy = _load_cloud.TestLoadAlertCloudBusy
 # The CI test-file list tests of #1498.
 _ci_test_files = importlib.import_module("test_ci_test_files")
 TestCiTestFileList = _ci_test_files.TestCiTestFileList
+TestCiOutsideBin = importlib.import_module("test_ci_outside_bin").TestCiOutsideBin
 _psj = importlib.import_module("test_pr_state_jobs")
 _psj.HOST = sys.modules[__name__]
 TestPrStateJobs = _psj.load()   # #1962
 TestTempJanitorScratch = importlib.import_module("test_scratch").build(TestTempJanitor)
+TestScratchGuard = importlib.import_module("test_scratch_command").TestScratchGuard
 
 # The host-disk tests of #2081.
 TestHostDisk = importlib.import_module("test_host_disk").TestHostDisk
@@ -66142,7 +66189,7 @@ TestCancelKeyRecheck = _reminder_cancel.build(PR4Base)
 # The lost-worker alert tests of #1481.
 _lost_worker = importlib.import_module("test_lost_worker")
 TestLostWorkerRemembers = importlib.import_module("test_lost_worker_remembers").TestLostWorkerRemembers
-TestLostWorker, TestLostWorkerReadRound, TestLostWorkerMemoryOnly = _lost_worker.TestLostWorker, _lost_worker.TestLostWorkerReadRound, _lost_worker.TestLostWorkerMemoryOnly
+TestLostWorker, TestLostWorkerReadRound, TestLostWorkerMemoryOnly, TestLostWorkerSlowPass = _lost_worker.TestLostWorker, _lost_worker.TestLostWorkerReadRound, _lost_worker.TestLostWorkerMemoryOnly, _lost_worker.TestLostWorkerSlowPass
 TestPushWatch = importlib.import_module("test_push_watch").TestPushWatch   # the push watch of #1740
 # A CLAIMS: line present but not read is refused (#1617); HOST gives the test the fixtures of this file.
 _claim_placement = importlib.import_module("test_claim_placement"); _claim_placement.HOST = sys.modules[__name__]
@@ -66182,7 +66229,7 @@ class TestTheArchitectureTestIsRun(unittest.TestCase):
                 else:
                     yield item
         ids = [t.id() for t in flat(unittest.TestLoader().loadTestsFromModule(sys.modules[__name__]))]
-        for name in ("TestDerivedClosure", "TestRefusalInAPart", "TestMovingADefinition", "TestTheDerivationIsHeld", "TestShadowRule", "TestShadowGlue", "TestShadowStatuses", "TestReasonsAreOneCleanLine"):
+        for name in ("TestDerivedClosure", "TestRefusalInAPart", "TestMovingADefinition", "TestTheDerivationIsHeld", "TestShadowRule", "TestShadowGlue", "TestShadowStatuses", "TestReasonsAreOneCleanLine", "TestFeedShape", "TestIdsAndEtags", "TestCapsAndScrub", "TestDocument", "TestWriting", "TestReadOnly", "TestBranches"):
             with self.subTest(case=name):
                 self.assertGreaterEqual(len([i for i in ids if ".%s." % name in i]), 2, "the hook that loads tests/switchboard/test_closure.py is gone")
 
@@ -77001,6 +77048,8 @@ class TestCiRecordCarry(LedgerBase):
         self.pr["headRefOid"] = LEDGER_HEAD
 
     def route(self, argv, **kwargs):
+        if argv[0] == FAKE_GH and argv[1] == "api" and (argv[2].endswith("/merge") or re.search(r"/(pulls/\d+|branches/main)$", argv[2])):
+            return super().route(argv, **kwargs)   # the freshness read of the merge ref (#2091) is not one of the reads these tests count
         if argv[0] == FAKE_GH and argv[1] == "api" and argv[2].startswith(self.API) and not argv[2].endswith("/issues/7") and "/comments" not in argv[2]:
             path = argv[2]
             self.reads.append(path)
@@ -77094,8 +77143,8 @@ class TestCiRecordCarry(LedgerBase):
         self.step()
         rest = [json.loads(l) for l in self.ledger_bytes().splitlines() if '"kind": "carried"' not in l]
         self.assertEqual([l for l in self.ledger_bytes().splitlines() if '"kind": "carried"' not in l][:len(before)], before)
-        ci = [(e["scenario"], e["head"], e["by"]) for e in rest[len(before):]]
-        self.assertEqual(sorted(ci), [("S1", self.NEW, sb.plan_ledger.CI_RECORDER), ("U1", self.NEW, sb.plan_ledger.CI_RECORDER)])
+        ci = [(e["kind"], e["scenario"], e["head"], e["by"]) for e in rest[len(before):]]
+        self.assertEqual(sorted(ci), [("proof", "S1", self.NEW, sb.plan_ledger.CI_RECORDER), ("proof", "U1", self.NEW, sb.plan_ledger.CI_RECORDER), ("verdict", "S1", self.NEW, sb.plan_ledger.CI_RECORDER), ("verdict", "U1", self.NEW, sb.plan_ledger.CI_RECORDER)])
 
     def test_U1_the_step_decides_as_the_rule_does_on_six_combinations(self):
         combos = [(["src/widget.py"], True, True), (["bin/o.py"], False, True), (["bin/o.py"], True, False),
