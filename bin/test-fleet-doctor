@@ -419,6 +419,24 @@ class UndecidableAgents(DoctorCase):
     def test_no_line_when_there_is_none(self):
         self.assertEqual(self.run_with({}), [])
 
+    def test_the_real_collect_status_producer_feeds_the_doctor(self):   # #1884 PC-9 d: no stub of the producer; a key renamed on either side fails this
+        tmp = tempfile.mkdtemp(prefix="test-fleet-doctor.")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        xdg = Path(tmp) / "xdg"
+        state = xdg / "fleet-switchboard"
+        state.mkdir(parents=True)
+        state.chmod(0o700)   # the daemon's state directory must be private
+        (state / "pane-undecidable.json").write_text(json.dumps({"acme": {"pane": "p_1", "passes": 4}}))
+        run = DoctorRun(tmp, {})
+        real = Path(__file__).resolve().parent / "fleet-switchboard"
+        stub = Path(tmp) / "fleet-switchboard"
+        stub.symlink_to(real)   # the doctor resolves it to the main checkout's bin
+        run.extra_env.update({"FLEET_SWITCHBOARD_BIN": str(stub), "FLEET_KIT_MAIN": str(real.parent.parent), "XDG_STATE_HOME": str(xdg)})
+        run.run()
+        got = [line for line in run.output.splitlines() if "undecidable" in line]
+        self.assertEqual(len(got), 1, run.output)
+        self.assertIn("agent acme: listed pane with no recorded session, undecidable for 4 passes: reattach or retire it", got[0])
+
 
 
 
