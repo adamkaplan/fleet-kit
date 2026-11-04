@@ -1,0 +1,81 @@
+#!/usr/bin/env python3
+"""cw-pod-inspect: read-only; prints ONE JSON line about this pod (agent server + git in /work/repo). Never raises."""
+import base64, json, os, subprocess, sys, time, urllib.request
+
+PORT = os.environ.get("CW_ACTIVITY_PORT", "4096")
+PWFILE = os.environ.get("CW_ACTIVITY_PASSWORD_FILE", "/run/cw/server-password")
+REPO = os.environ.get("CW_INSPECT_REPO", "/work/repo")
+
+
+def get(path, auth):
+    req = urllib.request.Request("http://127.0.0.1:%s%s" % (PORT, path), headers={"Authorization": auth})
+    with urllib.request.urlopen(req, timeout=10) as r:
+        return json.loads(r.read().decode()).get("data")
+
+
+def git(*a):
+    return subprocess.run(["git", "-C", REPO] + list(a), capture_output=True, text=True, timeout=30, check=True).stdout
+
+
+def part(out, name, fn):
+    try:
+        out.update(fn())
+    except Exception as e:
+        out[name] = "unreadable: " + type(e).__name__
+        out.setdefault("unreadable", []).append(name)
+
+
+def agent():
+    with open(PWFILE) as f:
+        pw = f.read().strip()
+    auth = "Basic " + base64.b64encode(("opencode:" + pw).encode()).decode()
+    sessions = get("/api/session", auth)
+    sid = max(sessions, key=lambda s: (s.get("time") or {}).get("updated", 0))["id"]
+    upd = (max(sessions, key=lambda s: (s.get("time") or {}).get("updated", 0)).get("time") or {}).get("updated", 0)
+    msgs = get("/api/session/%s/message" % sid, auth) or []
+    calls, text, flight = [], "", None
+    for m in msgs:
+        for p in (m.get("parts") or []):
+            if p.get("type") == "tool":
+                st = p.get("state") or {}
+                c = {"tool": p.get("tool"), "status": st.get("status"), "exit": (st.get("metadata") or {}).get("exit"),
+                     "start": (st.get("time") or {}).get("start")}
+                calls.append(c)
+                if st.get("status") in ("running", "pending"):
+                    flight = c
+            elif p.get("type") == "text" and (m.get("info") or m).get("role") == "assistant":
+                text = p.get("text", "")
+    idle = int(time.time() - (upd / 1000 if upd > 1e11 else upd))
+    return {"in_flight": flight, "last_calls": calls[-10:], "last_assistant": text[:300], "idle_seconds": idle}
+
+
+def gitpart():
+    out = {"branch": git("rev-parse", "--abbrev-ref", "HEAD").strip(),
+           "unpushed": git("log", "--format=%H", "HEAD", "--not", "--remotes").split(),
+           "dirty": len(git("status", "--porcelain").splitlines())}
+    return out
+
+
+def lastpush():
+    for line in git("reflog", "--format=%gd %gs %cI", "--all").splitlines():
+        if "update by push" in line:
+            return {"last_push": line.split()[-1]}
+    return {"last_push": None}
+
+
+def main():
+    out = {}
+    part(out, "agent", agent)
+    part(out, "git", gitpart)
+    part(out, "last_push", lastpush)
+    out.setdefault("last_error", None)
+    print(json.dumps(out))
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except BaseException:
+        print(json.dumps({"unreadable": ["all"]}))
+        sys.exit(0)
