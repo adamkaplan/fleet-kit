@@ -1,4 +1,6 @@
 # ------------------------------------------------------------- OpenCode v2
+import argparse
+APPLY_HELP_FORMATTER = argparse.RawDescriptionHelpFormatter   # the help of `plan apply` keeps its lines
 
 class V2Error(Exception):
     """A v2 call that did not return usable JSON.
@@ -127,6 +129,7 @@ V2_HTTP_OPERATIONS = {   # operation -> (method, path template, path parameters,
     "server.info": ("GET", "/api/info", (), ()),
     "session.active": ("GET", "/api/session/active", (), ()),
     "session.create": ("POST", "/api/session", (), ()),
+    "model.list": ("GET", "/api/model", (), ()),
     "session.get": ("GET", "/api/session/{sessionID}", ("sessionID",), ()),
     "session.remove": ("DELETE", "/api/session/{sessionID}", ("sessionID",), ()),
     "session.list": ("GET", "/api/session", (), ("limit", "order", "search", "parentID", "directory", "project", "subpath", "cursor")),
@@ -690,13 +693,19 @@ class V2Client:
     def server_info(self):
         return self._call("server.info")
 
-    def session_create(self, agent, title, directory, metadata, permissions=None):
+    def model_list(self):
+        """`model.list` (GET /api/model): the LOCAL service's models, `[{providerID, id, variants: [{id}]}]` (#1642). A read of the service, never of a provider."""
+        return self._call("model.list")
+
+    def session_create(self, agent, title, directory, metadata, permissions=None, model=None):
         if not os.path.isabs(directory):
             raise ValueError("directory must be absolute: %r" % directory)
         data = {"agent": agent, "title": title, "location": {"directory": directory},
                 "metadata": metadata}
         if permissions is not None:
             data["permissions"] = permissions
+        if model is not None:   # #1642: {providerID, id[, variant]}, only when a launch chose one
+            data["model"] = model
         return self._call("session.create", data=data)
 
     def session_get(self, session_id):
@@ -832,3 +841,7 @@ class V2Client:
             raise ValueError("delivery must be one of %s" % ", ".join(self.DELIVERIES))
         return self._call("session.inbox.update", {"sessionID": session_id, "inboxID": inbox_id},
                           {"delivery": delivery})
+
+    def inbox_cancel(self, session_id, inbox_id):
+        """#1844: remove one inbox item (`session.inbox.cancel`, DELETE /api/session/{sessionID}/inbox/{inboxID}; an empty answer)."""
+        return self._call("session.inbox.cancel", {"sessionID": session_id, "inboxID": inbox_id})
