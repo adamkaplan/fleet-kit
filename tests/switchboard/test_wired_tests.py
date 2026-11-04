@@ -434,8 +434,9 @@ class TestMutantIsCaught(unittest.TestCase):
     def control(self, name):
         """The unmutated check's result for `name`, run once per class and shared by every test that needs it."""
         import sys
+        this = sys.modules[__name__]
         if name not in self._controls:
-            self._controls[name] = run_named_cases(sys.modules[__name__], [name])[name]
+            self._controls[name] = run_named_cases(this, [name])[name]
         return self._controls[name]
 
     def load_mutant(self, target, mutated_line):
