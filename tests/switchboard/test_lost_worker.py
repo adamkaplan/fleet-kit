@@ -826,5 +826,41 @@ class TestLostWorkerSlowPass(unittest.TestCase):
         self.assertIn("a late stop behind a slow pass is late, not lost", str(caught.exception))
 
 
+    def reaper_missed(self, got):
+        return [x for x in got if x["kind"] == "reaper_missed"]
+
+    def check_not_a_failure(self, mod):
+        r = Rig(mod)
+        for i in range(3):
+            self.slow(r, n=700 + i, at=NOW - 600 * (i + 1))
+        got = self.reaper_missed(r.passes())
+        self.assertEqual(len(got), 0, "a slow reaper pass is not a reaper failure")
+
+    def test_2101_three_slow_passes_alone_raise_no_reaper_missed(self):
+        self.check_not_a_failure(load())
+
+    def test_2101_a_day_of_slow_passes_and_one_failed_refresh_raises_one(self):
+        r = Rig(load())
+        for i in range(30):
+            self.slow(r, n=650 + i, at=NOW - 100 - 10 * i)
+        line(r.launcher, ts=stamp(NOW - 5), worker="", runtime_id="reaper", action="refresh-cluster-token", ok=False, reason="login failed")
+        got = self.reaper_missed(r.passes())
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0]["key"], "reaper_missed:outage@%s" % (NOW - 5))
+        self.assertIn("1 failed reaper line(s)", got[0]["line"])
+        self.assertIn("login failed", got[0]["line"])
+
+    def test_2101_a_mutant_that_counts_slow_passes_again_is_caught(self):
+        source = (REPO / "bin" / "lost_worker.py").read_text()
+        needle = " and not _is_slow_line(item):"
+        self.assertEqual(source.count(needle), 1)
+        self.check_not_a_failure(load())   # the control first
+        mutant = types.ModuleType("lost_worker_mutant2")
+        exec(compile(source.replace(needle, ":"), "lost_worker_mutant2", "exec"), mutant.__dict__)
+        with self.assertRaises(AssertionError) as caught:
+            self.check_not_a_failure(mutant)
+        self.assertIn("a slow reaper pass is not a reaper failure", str(caught.exception))
+
+
 if __name__ == "__main__":
     unittest.main()
