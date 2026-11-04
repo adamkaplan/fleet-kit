@@ -9697,17 +9697,19 @@ def pod_silence_tick(engine, discovery, summary=None):
     reports = _read_small(state_dir, LAST_REPORT_FILE)
     pushes = _read_small(state_dir, "push-watch.json").get("workers")
     live = []
+    now = time.time()
+    retired = registry_retired(state_dir)
     for rec in watch.get("records", []):
         name = rec.get("worker") if isinstance(rec, dict) else None
-        if not isinstance(name, str):
-            continue
+        if not isinstance(name, str) or not cloud_record_live(rec, name, retired, reports, now):
+            continue   # M1: a failed, retired or past-deadline record is not a live pod
         said = reports.get(name) if isinstance(reports.get(name), dict) else {}
         branches = ((pushes or {}).get(name) or {}).get("branches")
         at = [b.get("at") for b in branches.values() if isinstance(b, dict)] if isinstance(branches, dict) else []
-        live.append({"worker": name, "boss": rec.get("reports_to"), "last_report": said.get("at"), "done": said.get("state") == "done",
+        live.append({"worker": name, "boss": _cloud_boss(rec.get("reports_to")), "last_report": said.get("at"), "done": said.get("state") == "done",
                      "last_push": max([a for a in at if isinstance(a, (int, float))] or [None], key=lambda a: a or 0)})
-    return load_module("pod_silence").scan(live, time.time(), Path(state_dir) / "pod-silence.json", lambda to, text: engine.send("switchboard", to, text),
-                                           summary or pod_silence_summary, load_module("record_json").parse_bounded)
+    return load_module("pod_silence").scan(live, now, Path(state_dir) / "pod-silence.json", lambda to, text: engine.send("switchboard", to, text),
+                                           summary or pod_silence_summary, load_module("record_json").parse_bounded, prune=not watch.get("capped"))
 
 
 def lost_worker_tick(engine, discovery):

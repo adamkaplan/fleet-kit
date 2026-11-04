@@ -49,11 +49,13 @@ def message_text(worker, minutes, line):
     return "[cloud worker quiet] %s has pushed nothing and sent no report for %d minutes. Its state: %s" % (worker, minutes, one)
 
 
-def scan(workers, now, state_path, send, summary, parse, quiet=QUIET):
-    """`workers`: [{"worker", "boss", "last_report" epoch|None, "last_push" epoch|None, "done" bool}] of the LIVE pods. Returns [(boss, text)] handed to send."""
+def scan(workers, now, state_path, send, summary, parse, quiet=QUIET, prune=True):
+    """`workers`: [{"worker", "boss", "last_report" epoch|None, "last_push" epoch|None, "done" bool}] of the LIVE pods. Returns [(boss, text)] handed to send.
+    `prune` False (a capped read: the pass did not see every pod) keeps the state of the pods not handed in, so an unread pod keeps its told mark."""
     state = _load(state_path, parse)
     live = {w.get("worker") for w in workers if isinstance(w, dict)}
-    state = {k: v for k, v in state.items() if k in live}   # a pod that finished or was retired leaves the state
+    if prune:
+        state = {k: v for k, v in state.items() if k in live}   # a pod that finished or was retired leaves the state
     due = []
     for w in workers:
         name, boss = w.get("worker"), w.get("boss")

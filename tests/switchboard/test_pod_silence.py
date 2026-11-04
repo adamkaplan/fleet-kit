@@ -3,7 +3,10 @@ import json
 import tempfile
 import types
 import unittest
+import unittest.mock
 from pathlib import Path
+
+from support.loader import sb
 
 REPO = Path(__file__).resolve().parents[2]
 NOW = 1_800_000_000.0
@@ -61,3 +64,74 @@ class TestPodSilence(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _when(epoch):
+    import datetime
+    return datetime.datetime.fromtimestamp(epoch, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+class TestPodSilenceTick(unittest.TestCase):
+    """The wiring of pod_silence_tick (bin/fleet-switchboard): a stub engine, a stub summary; records are dated by the real clock."""
+
+    def world(self, records, capped=False):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.sent, self.reads = [], []
+        return types.SimpleNamespace(state_dir=Path(tmp.name), cloud_watch={"records": records, "capped": capped},
+                                     send=lambda frm, to, text: self.sent.append((to, text)))
+
+    def summary(self, name):
+        self.reads.append(name)
+        return "stub of " + name
+
+    def rec(self, name, **extra):
+        import time
+        base = {"worker": name, "reports_to": "lane-a", "hard_deadline": _when(time.time() + 7200)}
+        base.update(extra)
+        return base
+
+    def tick(self, engine, ahead=0):
+        import time
+        real = time.time
+        with unittest.mock.patch.object(sb.time, "time", lambda: real() + ahead):
+            return sb.pod_silence_tick(engine, None, self.summary)
+
+    def test_a_live_pod_is_told_after_the_quiet_period_and_the_boss_is_cleaned(self):
+        engine = self.world([self.rec("live", reports_to="lane\x07-a")])
+        self.assertEqual(self.tick(engine), [])
+        got = self.tick(engine, ahead=21 * MIN)
+        self.assertEqual([to for to, _ in self.sent], ["lane-a"])   # _cloud_boss removed the control character
+        self.assertEqual(len(got), 1)
+
+    def test_failed_retired_and_past_deadline_records_read_and_send_nothing(self):
+        import time
+        engine = self.world([self.rec("failed"), self.rec("gone", retired=True), self.rec("late", hard_deadline=_when(time.time() - 60))])
+        (engine.state_dir / "last-reports.json").write_text(json.dumps({"failed": {"state": "failed", "at": 1}}))
+        self.tick(engine)
+        self.tick(engine, ahead=30 * MIN)
+        self.assertEqual(self.reads, [])
+        self.assertEqual(self.sent, [])
+
+    def test_a_capped_pass_that_omits_a_told_pod_does_not_tell_it_again(self):
+        engine = self.world([self.rec("p1"), self.rec("p2")])
+        self.tick(engine)
+        self.tick(engine, ahead=21 * MIN)
+        self.assertEqual(len(self.sent), 2)
+        full = engine.cloud_watch["records"]
+        engine.cloud_watch = {"records": [full[1]], "capped": True}   # p1 not read this pass
+        self.tick(engine, ahead=22 * MIN)
+        engine.cloud_watch = {"records": full, "capped": True}
+        self.tick(engine, ahead=23 * MIN)
+        self.assertEqual(len(self.sent), 2)
+
+    def test_scan_prune_false_keeps_the_told_mark(self):
+        module, _ = load()
+        with tempfile.TemporaryDirectory() as tmp:
+            state = str(Path(tmp) / "s.json")
+            sent = []
+            module.scan([pod("a")], NOW - 30 * MIN, state, lambda to, t: None, lambda n: "x", json.loads)
+            module.scan([pod("a")], NOW, state, lambda to, t: sent.append(t), lambda n: "x", json.loads)
+            module.scan([pod("b")], NOW + 1, state, lambda to, t: None, lambda n: "x", json.loads, prune=False)
+            module.scan([pod("a")], NOW + 2, state, lambda to, t: sent.append(t), lambda n: "x", json.loads)
+        self.assertEqual(len(sent), 1)
