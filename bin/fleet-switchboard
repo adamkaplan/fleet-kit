@@ -5217,9 +5217,11 @@ def live_cloud_record(state_dir, name, retired, now):
 def _clears_pass_state(fn):
     """#1884 PC-9 b/e: the per-pass state of the undecidable record (the seen set, the one read of the pane list) is cleared in a `finally`."""
     def wrapped(engine, *args, **kwargs):
+        engine.__dict__["in_pane_pass"] = True
         try:
             return fn(engine, *args, **kwargs)
         finally:
+            engine.__dict__.pop("in_pane_pass", None)
             engine.__dict__.pop("undecidable_seen", None)
             engine.__dict__.pop("pass_herdr", None)
     wrapped.__name__, wrapped.__doc__ = fn.__name__, fn.__doc__
@@ -5883,6 +5885,8 @@ class _OnePaneList:
 
 def _pass_herdr(engine):
     """One read of the pane list per pass serves `undecidable_streak` and `daemon_shows_absent` (#1884 PC-9 e); cleared with the pass."""
+    if not engine.__dict__.get("in_pane_pass"):   # outside a pass: a fresh read, no cache left behind
+        return engine.herdr
     if engine.__dict__.get("pass_herdr") is None or engine.__dict__["pass_herdr"]._herdr is not engine.herdr:
         engine.__dict__["pass_herdr"] = _OnePaneList(engine.herdr)
     return engine.__dict__["pass_herdr"]
