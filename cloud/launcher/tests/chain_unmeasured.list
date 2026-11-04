@@ -25,8 +25,15 @@ cloud/launcher/tests/test_scrub_linear.py
 cloud/launcher/tests/test_stop_no_checkout.py
 cloud/launcher/tests/test_token_at_limit.py
 cloud/launcher/tests/test_worker_copies.py
+cloud/worker/tests/test_activity.py
 cloud/worker/tests/test_base_merge_base.py
 cloud/worker/tests/test_cloud_prepush_background.py
 cloud/worker/tests/test_comment_by_id.py
+cloud/worker/tests/test_cw_gh.py
 cloud/worker/tests/test_dockerfile_browser.py
 cloud/worker/tests/test_dockerfile_postgres.py
+cloud/worker/tests/test_entrypoint.py
+cloud/worker/tests/test_entrypoint_import.py
+cloud/worker/tests/test_plan_check_in_pod.py
+cloud/worker/tests/test_reach.py
+cloud/worker/tests/test_token_table.py
