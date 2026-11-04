@@ -171,10 +171,69 @@ class Activity(unittest.TestCase):
         me = os.getpid()
         self.assertIs(self.has_child({1: ("S", 0), me: ("S", 0), 70: ("S", 1)}), True)
 
+    # stub /proc with start times (field 22, ticks since boot), 100 ticks a second; the stub session started at 1700000000 s
+    def timed(self, procs, btime=1700000000 - 1000):
+        """procs: pid -> (state, ppid, comm, start ticks); the process starts at btime + ticks/100."""
+        root = self.tree({pid: (v[0], v[1]) for pid, v in procs.items()})
+        with open(os.path.join(root, "stat"), "w") as f:
+            f.write("cpu 1 1 1 1\nbtime %d\n" % btime)
+        for pid, (state, ppid, comm, ticks) in procs.items():
+            with open(os.path.join(root, str(pid), "stat"), "w") as f:
+                f.write("%d (%s) %s %d 1 1 0 %s\n" % (pid, comm, state, ppid, " ".join(["0"] * 14 + [str(ticks)])))
+            if pid != 1:
+                with open(os.path.join(root, str(pid), "cmdline"), "wb") as f:
+                    f.write(comm.encode() + b"\0")
+        return root
+
+    def child_at(self, procs):
+        sys.path.insert(0, os.path.dirname(SCRIPT))
+        try:
+            import activity
+        finally:
+            sys.path.pop(0)
+        return activity.has_live_child(self.timed(procs), session_start=1700000000)
+
+    def test_a_boot_time_process_older_than_the_session_does_not_count(self):
+        # starts at btime + 500 s = 500 s before the session
+        self.assertIs(self.child_at({1: ("S", 0, "opencode", 1), 50: ("S", 1, "helper", 50000)}), False)
+
+    def test_a_process_started_after_the_session_began_counts(self):
+        self.assertIs(self.child_at({1: ("S", 0, "opencode", 1), 50: ("S", 1, "pytest", 150000)}), True)
+
+    def test_dockerd_started_mid_session_does_not_count(self):
+        self.assertIs(self.child_at({1: ("S", 0, "opencode", 1), 50: ("S", 1, "dockerd", 150000), 51: ("S", 1, "containerd", 150000)}), False)
+
+    def test_a_container_process_under_containerd_shim_does_not_count(self):
+        self.assertIs(self.child_at({1: ("S", 0, "opencode", 1), 50: ("S", 1, "containerd-shim", 150000), 51: ("S", 50, "nginx", 150001)}), False)
+
+    def test_a_test_run_started_by_a_returned_call_still_counts(self):
+        self.assertIs(self.child_at({1: ("S", 0, "opencode", 1), 50: ("S", 1, "sh", 150000), 51: ("S", 50, "python3", 150001)}), True)
+
+    def test_mutant_without_the_daemon_list_fails_the_dockerd_case(self):
+        with open(SCRIPT) as f:
+            real = f.read()
+        old = ' and not any(_is_daemon(proc, p, comm[p]) for p in chain)'
+        self.assertEqual(real.count(old), 1)
+        mutant = real.replace(old, '')
+        self.assertNotEqual(mutant, real)  # applied, computed from the two texts
+        path = os.path.join(self.tmp.name, "mutant_daemons.py")
+        with open(path, "w") as f:
+            f.write(mutant)
+        import importlib.util
+        root = self.timed({1: ("S", 0, "opencode", 1), 50: ("S", 1, "dockerd", 150000)})
+        results = []
+        for script in (SCRIPT, path):
+            spec = importlib.util.spec_from_file_location("act_%d" % len(results), script)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            results.append(mod.has_live_child(root, session_start=1700000000))
+        self.assertIs(results[0], False)  # control: the real tool
+        self.assertIs(results[1], True, "mutant without the daemon list must count dockerd (the pod would never idle out)")
+
     def test_mutant_without_the_child_check_fails_the_long_command_case(self):
         with open(SCRIPT) as f:
             real = f.read()
-        old = '"busy": is_busy(active) or has_live_child(),'
+        old = '"busy": is_busy(active) or has_live_child(session_start=session_start),'
         self.assertEqual(real.count(old), 1)
         mutant = real.replace(old, '"busy": is_busy(active),')
         self.assertNotEqual(mutant, real)  # applied, computed from the two texts: a no-op fails here

@@ -46,6 +46,43 @@ def _stat(proc, pid):
     return rest[0], int(rest[1])
 
 
+DAEMONS = ("dockerd", "containerd", "containerd-shim", "containerd-shim-runc-v2", "docker-proxy")
+
+
+def _comm_and_start(proc, pid):
+    """(comm, start in clock ticks since boot or None) of a pid from <proc>/<pid>/stat (field 22)."""
+    with open("%s/%s/stat" % (proc, pid)) as f:
+        text = f.read()
+    comm = text.split("(", 1)[1].rsplit(")", 1)[0]
+    rest = text.rsplit(")", 1)[1].split()
+    try:
+        return comm, int(rest[19])
+    except (IndexError, ValueError):
+        return comm, None
+
+
+def _is_daemon(proc, pid, comm):
+    names = {comm}
+    try:
+        with open("%s/%s/cmdline" % (proc, pid), "rb") as f:
+            names.add(os.path.basename(f.read().split(b"\0")[0].decode("utf-8", "replace")))
+    except OSError:
+        pass
+    return bool(names & set(DAEMONS))
+
+
+def _boot_epoch(proc):
+    """Boot time in epoch seconds from <proc>/stat btime, or None when unreadable."""
+    try:
+        with open("%s/stat" % proc) as f:
+            for line in f:
+                if line.startswith("btime "):
+                    return int(line.split()[1])
+    except (OSError, ValueError):
+        pass
+    return None
+
+
 def _proc_root():
     """/proc, unless a test points the check at a stub: CW_ACTIVITY_PROC counts only with the test marker set too."""
     if os.environ.get("CW_ACTIVITY_UNDER_TEST") == "1" and os.environ.get("CW_ACTIVITY_PROC"):
@@ -61,7 +98,7 @@ def _pid1_is_the_agent(proc):
     return os.path.basename(argv[0].decode("utf-8", "replace")) == "opencode" and "serve" in [a.decode("utf-8", "replace") for a in argv[1:3]]
 
 
-def has_live_child(proc=None):
+def has_live_child(proc=None, session_start=None):
     """True when a live process descends from pid 1 (the agent AND its headless server, one process) other than pid 1
     and the whole subtree of the tool's call root (the tool's ancestor whose parent is pid 1; none when the tool runs outside
     pid 1, as under kubectl exec, so nothing is excluded); zombies do not
@@ -72,10 +109,15 @@ def has_live_child(proc=None):
             return False
         ppid = {}
         state = {}
+        comm = {}
+        start = {}
+        boot = _boot_epoch(proc) if session_start is not None else None
+        hz = os.sysconf("SC_CLK_TCK")
         for name in os.listdir(proc):
             if name.isdigit():
                 try:
                     state[int(name)], ppid[int(name)] = _stat(proc, name)
+                    comm[int(name)], start[int(name)] = _comm_and_start(proc, name)
                 except (OSError, ValueError, IndexError):
                     pass
         call_root = None
@@ -90,11 +132,13 @@ def has_live_child(proc=None):
         for pid, parent in ppid.items():
             if pid == 1 or state[pid] in ("Z", "X"):
                 continue
+            if boot is not None and start[pid] is not None and boot + start[pid] / hz < session_start:
+                continue
             chain = {pid}
             while parent > 1 and parent in ppid and parent not in chain:
                 chain.add(parent)
                 parent = ppid[parent]
-            if parent == 1 and call_root not in chain:
+            if parent == 1 and call_root not in chain and not any(_is_daemon(proc, p, comm[p]) for p in chain):
                 return True
         return False
     except Exception:
@@ -139,7 +183,10 @@ def main():
             last = dt.datetime.fromisoformat(os.environ["CW_STARTED"].replace("Z", "+00:00"))
         except (KeyError, ValueError):
             last = dt.datetime.now(dt.timezone.utc)
-    print(json.dumps({"busy": is_busy(active) or has_live_child(), "last_activity": last.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}))
+    created = [to_dt((s.get("time") or {}).get("created")) for s in sessions if isinstance(s, dict) and isinstance(s.get("time"), dict)]
+    created = [t for t in created if t]
+    session_start = max(created).timestamp() if created else None
+    print(json.dumps({"busy": is_busy(active) or has_live_child(session_start=session_start), "last_activity": last.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}))
     return 0
 
 
