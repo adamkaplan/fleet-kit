@@ -1,10 +1,8 @@
 """#2081: no switchboard test reads the free disk of the host it runs on (S2 to S5, U1). World is set by bin/test-switchboard after the import."""
 import importlib.util
+import io
 import os
-import re
 import shutil
-import subprocess
-import sys
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -12,7 +10,7 @@ from unittest import mock
 from support.core import Base
 from support.herdr_world import World
 from support.loader import sb
-from support.paths import BIN, REPO
+from support.paths import REPO
 
 GB = 10 ** 9
 SMALL = shutil._ntuple_diskusage(1000 * GB, 995 * GB, 5 * GB)
@@ -129,15 +127,14 @@ class TestHostDisk(unittest.TestCase):
         self.assertEqual(seen, {"quiet": (0, 0), "control": (1, 1)})
 
     def test_the_named_group_passes_with_the_host_at_5_gb(self):   # S3
-        site = case_tmp()
-        Path(site, "sitecustomize.py").write_text("import shutil\n_u = shutil._ntuple_diskusage(1000 * 10 ** 9, 995 * 10 ** 9, 5 * 10 ** 9)\nshutil.disk_usage = lambda path: _u\n")
-        env = dict(os.environ, PYTHONPATH=site + os.pathsep + os.environ.get("PYTHONPATH", ""), FLEET_HEAVY="off")
-        done = subprocess.run([sys.executable, str(BIN / "test-switchboard")] + list(NAMED), env=env, capture_output=True, text=True, timeout=840)
-        out = done.stdout + done.stderr
-        ran = re.findall(r"^Ran (\d+) tests? in ", out, re.M)
-        self.assertEqual(len(ran), 1, out[-400:])
-        self.assertGreater(int(ran[0]), 0, out[-400:])
-        verdict = re.findall(r"^(OK|FAILED)\b.*$", out, re.M)
-        self.assertEqual(verdict[-1:], ["OK"], out[-400:])   # "OK (skipped=N)" or "FAILED (failures=N)"
-        self.assertEqual(done.returncode, 0, out[-400:])
+        import __main__ as runner   # the classes live in bin/test-switchboard; run in-process, no child
+        loader = unittest.TestLoader()
+        suite = unittest.TestSuite(loader.loadTestsFromTestCase(getattr(runner, name)) for name in NAMED)
+        stream = io.StringIO()
+        with mock.patch.object(shutil, "disk_usage", lambda path: SMALL):
+            result = unittest.TextTestRunner(stream=stream, verbosity=0).run(suite)
+        out = stream.getvalue()
+        self.assertGreater(result.testsRun, 0, out[-400:])
+        self.assertEqual((result.failures, result.errors), ([], []), out[-400:])
+        self.assertTrue(result.wasSuccessful(), out[-400:])
 
