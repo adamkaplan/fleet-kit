@@ -337,9 +337,9 @@ class TrickleHub(unittest.TestCase):
         self.assertEqual([(k, d["error"]) for k, _, d in notes], [("relay.pass_cut", "relay pass cut")])
 
     def test_mutant_without_the_total_deadline_is_caught(self):
-        # the join cut removed from the REAL code (a string mutant, like the neighbouring tests): the pass is still running after 3 s
+        # the join cut removed from the REAL code (a string mutant, like the neighbouring tests): the pass is still running after 2 s (the cut is at 1 s)
         mod = load_backend_module(*self.STRETCH[0], extra=self.STRETCH[1:] + (("worker.join(READ_DEADLINE)", "worker.join()"),))
-        done, _, notes = self.one_pass(mod, 1.0, 3.0)
+        done, _, notes = self.one_pass(mod, 1.0, 2.0)
         self.assertFalse(done)
         self.assertEqual(notes, [])
 
