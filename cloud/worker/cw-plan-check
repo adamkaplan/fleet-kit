@@ -17,6 +17,8 @@ import plan_check  # noqa: E402
 
 _HEADING = re.compile(r"^\s{0,3}#{1,6}\s+(.*?)\s*#*\s*$")
 _DONE_WHEN = re.compile(r"^(?:[-*]\s+)?\**done when\**\s*:\s*\**\s*(.*?)\**\s*$", re.IGNORECASE)
+_CLAUSE_LINE = re.compile(r"^\s{0,3}(?:\d+[.)]|\(\d+\))\s+(\S.*?)\s*$")
+_SUB_LINE = re.compile(r"^(?:\s*[-*+]\s+|\s{2,}|\t)(\S.*?)\s*$")
 
 
 def parse_intent(body):
@@ -28,9 +30,12 @@ def parse_intent(body):
     """
     intent = done_when = None
     inside = fenced = False
+    listing = None
     for line in (body or "").splitlines():
         if line.lstrip().startswith(("```", "~~~")):
             fenced = not fenced
+            if listing is not None:
+                break
             continue
         if fenced:
             continue
@@ -43,11 +48,28 @@ def parse_intent(body):
         text = line.strip()
         if not inside or not text:
             continue
+        if listing is not None:
+            clause = _CLAUSE_LINE.match(line)
+            if clause:
+                listing.append(clause.group(1))
+                continue
+            sub = _SUB_LINE.match(line)
+            if sub and listing:
+                listing[-1] += " " + sub.group(1)
+                continue
+            if not listing:
+                listing = None
+            else:
+                break
         match = _DONE_WHEN.match(text)
         if match:
+            if done_when is None and not match.group(1).strip():
+                listing = []
             done_when = done_when or match.group(1).strip() or None
         elif intent is None:
             intent = text
+    if listing:
+        done_when = " ".join("(%d) %s" % (n, c) for n, c in enumerate(listing, 1))
     return intent, done_when
 
 

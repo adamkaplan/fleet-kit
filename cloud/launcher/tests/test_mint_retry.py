@@ -3,6 +3,7 @@
 
 Offline: the vault is a shell command, GitHub is a fake opener, the clock is a list. The old behaviour is the old get_token, kept below as text.
 """
+import pathlib
 import datetime as dt
 import email.message
 import importlib.util
@@ -197,7 +198,7 @@ class TestMintRetryAudit(Harness):
         text = "refused: the repository preflight for %s did not pass: preflight: cannot read: %s; nothing was created" % (TARGET, r["refusal"])
         with mock.patch.dict(os.environ, {"CW_CLOUD_AUDIT": path}):
             lib._audit_refused_preflight("w1", lib._lib().CloudError(text, 2))
-        lines = open(path).read().splitlines()
+        lines = pathlib.Path(path).read_text().splitlines()
         rec = json.loads(lines[0])
         self.assertEqual((len(lines), rec["action"], rec["worker"], rec["ok"]), (1, "create.failed", "w1", False))
         self.assertTrue(rec["reason"].startswith("preflight: no token could be minted after 4 tries: "), rec["reason"])
@@ -220,9 +221,9 @@ class TestMintRetryMutants(unittest.TestCase):
             self.addCleanup(shutil.rmtree, scratch, True)
             for f in ("app_token.py", "preflight.py", "token_mint.py"):
                 shutil.copy(os.path.join(os.path.dirname(HERE), f), scratch)
-            src = open(os.path.join(scratch, "preflight.py")).read()
+            src = pathlib.Path(os.path.join(scratch, "preflight.py")).read_text()
             self.assertEqual(src.count(old), 1, name)
-            open(os.path.join(scratch, "preflight.py"), "w").write(src.replace(old, new))
+            pathlib.Path(os.path.join(scratch, "preflight.py")).write_text(src.replace(old, new))
             applied += 1
             env = dict(os.environ, MINT_RETRY_SRC=scratch)
             p = stub_support.start(self, [sys.executable, "-m", "unittest", "test_mint_retry." + cls], cwd=HERE, env=env,
@@ -238,7 +239,7 @@ class TestMintRetryDocs(unittest.TestCase):
     def test_both_sentences_are_in_both_documents(self):
         found = 0
         for rel in ("cloud/launcher/README.md", "docs/cloud-worker-interface.md"):
-            text = " ".join(open(os.path.join(ROOT, rel)).read().split())
+            text = " ".join(pathlib.Path(os.path.join(ROOT, rel)).read_text().split())
             a = "A passing failure of the preflight's mint" in text and "is retried inside the preflight: 4 tries, with waits of 2, 5 and 10 seconds" in text \
                 and "is never retried" in text
             b = "A launch that still cannot mint says its tries and the last reason" in text and "writes one audit line" in text
@@ -276,9 +277,9 @@ class TestMintRetryForwarded(unittest.TestCase):
                     shutil.copy(os.path.join(os.path.dirname(HERE), f), scratch)
             old = 'if x.startswith("mint try "):'
             path = os.path.join(scratch, "cloud_worker.py")
-            src = open(path).read()
+            src = pathlib.Path(path).read_text()
             self.assertEqual(src.count(old), 1)
-            open(path, "w").write(src.replace(old, 'if False:'))
+            pathlib.Path(path).write_text(src.replace(old, 'if False:'))
             env = dict(os.environ, MINT_RETRY_SRC=scratch)
             p = stub_support.start(self, [sys.executable, "-m", "unittest", "test_mint_retry.TestMintRetryForwarded.test_retry_lines_are_forwarded_and_other_lines_are_not"],
                                    cwd=HERE, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -313,10 +314,10 @@ class TestOddRetryAfter(Harness):
                 if f.endswith(".py"):
                     shutil.copy(os.path.join(os.path.dirname(HERE), f), scratch)
             path = os.path.join(scratch, "app_token.py")
-            src = open(path).read()
+            src = pathlib.Path(path).read_text()
             old = "value.isascii() and value.isdigit()"
             self.assertEqual(src.count(old), 1)
-            open(path, "w").write(src.replace(old, "value.isdigit()"))
+            pathlib.Path(path).write_text(src.replace(old, "value.isdigit()"))
             env = dict(os.environ, MINT_RETRY_SRC=scratch)
             p = stub_support.start(self, [sys.executable, "-m", "unittest", "test_mint_retry.TestOddRetryAfter.test_wait_seconds_values",
                                           "test_mint_retry.TestOddRetryAfter.test_fake_503_with_superscript_retry_after"],
