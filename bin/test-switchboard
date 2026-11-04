@@ -595,7 +595,7 @@ class TestFacts(Base):
 
     def test_the_registration_point_lists_the_lab_source(self):
         self.assertEqual([s.__name__ for s in sb.fact_sources(self.home)],
-                         ["lab_facts", "worker_facts", "reminder_facts", "report_rider_facts", "foreground_facts",
+                         ["lab_facts", "worker_facts", "reminder_facts", "report_rider_facts", "held_send_facts", "foreground_facts",
                           "orders_facts", "sweep_facts", "triage_facts", "plan_wake_facts", "alert_wake_facts", "red_ci_facts", "job_facts", "pane_facts", "pane_exit_facts", "headless_restart_facts", "disk_facts", "cpu_facts", "spotlight_facts", "docker_reap_facts", "temp_janitor_facts", "heavy_orphan_facts"])
 
     def test_every_fact_source_class_in_the_module_is_registered(self):   # #1030: derived, so a new source cannot be left out
@@ -1631,8 +1631,8 @@ class TestSteerToWorking(Base):
     def test_the_endpoint_route_holds_while_blocked_and_keeps_the_sender_identity(self):
         self.endpoint_world(state="blocked")
         code, _, err = self.cli_send("ping", to="cloudy")
-        self.assertEqual(code, sb.EXIT_HELD)
-        self.assertIn("blocked on a permission request", err)
+        self.assertEqual(code, 0, err)
+        self.assertIn("held for cloudy: cloudy is blocked; it will be delivered when it unblocks", err)
         self.assertEqual(self.posts, [])
         self.registry.upsert(self.world.state, "cloudy", {"session": None, "kind": "orchestrator", "role": "orchestrator",
                                                           "endpoint": "https://pod.example.invalid/channel", "state": "idle"}, now=2)
@@ -2448,8 +2448,9 @@ class TestEngineCLI(Base):
     def test_a_held_send_says_why_and_sends_nothing(self):
         self.world.herdr.panes[self.world.panes["platform"]]["status"] = "blocked"
         code, out, err = self.main("send", "platform", "--from", "coder", "hi")
-        self.assertEqual((code, out), (sb.EXIT_HELD, ""))
+        self.assertEqual((code, out), (0, ""))
         self.assertIn("blocked", err)
+        self.assertIn("held for platform: platform is blocked; it will be delivered when it unblocks", err)
         self.assertEqual(self.world.v2.writes, [])
         self.assertEqual(self.main("send", "nobody", "--from", "coder", "hi")[0], sb.EXIT_HELD)
 
@@ -10340,7 +10341,7 @@ class TestFrictionWake(FrictionBase):
     def test_it_is_off_by_default_and_the_defaults_are_the_documented_ones(self):
         self.assertNotIn("friction_wake", sb.DEFAULTS)
         self.assertEqual([s.__name__ for s in sb.fact_sources(self.home)],
-                         ["lab_facts", "worker_facts", "reminder_facts", "report_rider_facts", "foreground_facts",
+                         ["lab_facts", "worker_facts", "reminder_facts", "report_rider_facts", "held_send_facts", "foreground_facts",
                           "orders_facts", "sweep_facts", "triage_facts", "plan_wake_facts", "alert_wake_facts", "red_ci_facts", "job_facts", "pane_facts", "pane_exit_facts", "headless_restart_facts", "disk_facts", "cpu_facts", "spotlight_facts", "docker_reap_facts", "temp_janitor_facts", "heavy_orphan_facts"])
         self.assertNotIn("friction_wake", sb.validate_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR}))
         self.assertEqual(sb.FRICTION_DEFAULTS, {"enabled": False, "hour": 9, "to": "cos", "cos_to": "improver", "text": None})
@@ -66059,6 +66060,7 @@ TestEveryKindDelayedMark = importlib.import_module("test_every_kind_delayed_mark
 TestSignedLinkScrub = importlib.import_module("test_signed_link_scrub").build(Base, GithubRig)
 TestCiQueue = importlib.import_module("test_ci_queue").build(HandoffCase, FAKE_GH)   # #1961
 TestLaunchQueue = importlib.import_module("test_launch_queue").build(HandoffCase)
+TestHeldSends = importlib.import_module("test_held_sends").TestHeldSends   # #2051
 # The reminder-cancel tests of #1401.
 _reminder_cancel = importlib.import_module("test_reminder_cancel")
 TestCancelKeyRecheck = _reminder_cancel.build(PR4Base)
@@ -74531,9 +74533,13 @@ class TestBlockedReport(Base):
         self.wait(5)
         for name in ("platform", "cos"):
             (found,) = self.told(name)
-            for part in ("coder", "blocked for 25 minutes", "2 refused sends the senders must repeat"):
+            for part in ("coder", "blocked for 25 minutes", "Held for it: 2 messages"):
                 self.assertIn(part, found["text"])
         self.assertEqual(len(self.audits()), 1)
+        observation = self.blocked_observation()
+        now = self.world.clock.now()
+        self.assertIn("1 refused send the senders must repeat", sb.blocked_line(self.world.engine, observation, now - 1500, now, [], ["cos"], "x"))
+        self.assertIn("2 refused sends the senders must repeat", sb.blocked_line(self.world.engine, observation, now - 1500, now, [], ["cos", "platform"], "x"))
 
     def test_over_the_threshold_with_nothing_held_is_not_reported(self):
         self.block(senders=())
@@ -74760,6 +74766,8 @@ class TestBlockedReport(Base):
         self.assertEqual(len(self.told("cos")), 1)
 
     def test_a_block_that_ends_with_messages_still_held_says_so(self):
+        self.test_note_held_send_keeps_each_row_adds_to_a_dict_entry_and_only_for_a_blocked_agent()   # #2051: the killers of the two direct guards
+        self.test_the_tick_with_no_plan_for_the_agent_reports_its_refused_sends()
         self.block()
         self.wait(25)
         self.pane["status"] = "idle"
@@ -74966,6 +74974,7 @@ class TestBlockedReport(Base):
         self.assertIn("ended turn", sb.blocked_kind(engine, observation), "another agent's request is not this one's")
 
     def test_a_block_that_ends_before_it_was_reported_says_nothing(self):
+        self.test_note_held_send_keeps_each_row_adds_to_a_dict_entry_and_only_for_a_blocked_agent()   # #2051: the direct killer of the note_held_send entry guard
         self.block()
         self.wait(10)
         self.pane["status"] = "idle"
@@ -75058,6 +75067,38 @@ class TestBlockedReport(Base):
             self.block()
             self.wait(25)
         self.assertEqual(len(self.told("cos")), 1)
+
+    def direct_tick(self, held):
+        """blocked_tick called directly: once to record the block, then 25 minutes later; returns what the second call reports."""
+        engine = self.world.engine
+        sb.blocked_tick(engine, engine.discover(self.world.clock.now()), held)
+        self.world.tick(25 * 60)
+        return sb.blocked_tick(engine, engine.discover(self.world.clock.now()), held)
+
+    def test_the_tick_reports_a_block_with_a_held_plan_and_with_a_refusal_only_when_no_plan_exists(self):
+        self.blocked_observation()
+        plan = sb.Plan("coder", "hold", "coder is blocked", [sb.Fact("lab.fact:1", "coder", "lab.fact", "s", 1, sender="cos")])
+        self.assertEqual(self.direct_tick({"coder": plan}), [("coder", "report")])
+
+    def test_the_tick_with_no_plan_for_the_agent_reports_its_refused_sends(self):
+        observation = self.blocked_observation()
+        sb.note_held_send(self.world.state, "coder", "cos", self.world.clock.now(), observation)
+        self.assertEqual(self.direct_tick({}), [("coder", "report")])
+
+    def test_note_held_send_keeps_each_row_adds_to_a_dict_entry_and_only_for_a_blocked_agent(self):
+        observation = self.blocked_observation()
+        now = self.world.clock.now()
+        self.assertIsNone(sb.note_held_send(None, "coder", "cos", now, observation))
+        sb.note_held_send(self.world.state, "coder", "cos", now, observation)
+        sb.note_held_send(self.world.state, "coder", "platform", now + 1, observation)
+        rows = sb.blocked_update(self.world.state, sb.BLOCKED_HELD_SENDS, lambda _: None)["coder"]["rows"]
+        self.assertEqual([r["from"] for r in rows], ["cos", "platform"])
+        sb.note_held_send(self.world.state, "coder", "x", now + 2, None)
+        self.pane["status"] = "idle"
+        idle = self.world.engine.discover(self.world.clock.now()).agents["coder"]
+        sb.note_held_send(self.world.state, "other", "cos", now, idle)
+        self.assertNotIn("other", sb.blocked_update(self.world.state, sb.BLOCKED_HELD_SENDS, lambda _: None))
+        self.assertEqual(len(sb.blocked_update(self.world.state, sb.BLOCKED_HELD_SENDS, lambda _: None)["coder"]["rows"]), 2)
 
 
 # ---- the blocked report's guards, bounds, validator, lock and config key: one row and one mutant each, derived from the code
