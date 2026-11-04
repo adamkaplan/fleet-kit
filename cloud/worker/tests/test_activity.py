@@ -88,18 +88,25 @@ class Activity(unittest.TestCase):
         self.assertEqual((p.returncode, p.stdout), (1, ""))
 
     # a live child of pid 1 counts as busy, read from a stub /proc; the server says idle
-    def tree(self, procs):
+    def tree(self, procs, cmd=b"opencode\0serve\0--port\0" + b"4096\0"):
         root = os.path.join(self.tmp.name, "proc")
         os.makedirs(root, exist_ok=True)
         for pid, (state, ppid) in procs.items():
             os.makedirs(os.path.join(root, str(pid)), exist_ok=True)
             with open(os.path.join(root, str(pid), "stat"), "w") as f:
                 f.write("%d (a b) %s %d 1 1 0\n" % (pid, state, ppid))
+        if 1 in procs:
+            with open(os.path.join(root, "1", "cmdline"), "wb") as f:
+                f.write(cmd)
         return root
 
-    def busy(self, root, mode="ok", script=None):
+    def busy(self, root, mode="ok", script=None, marker="1"):
         port = self.serve(mode)
         e = dict(os.environ, CW_ACTIVITY_PORT=str(port), CW_ACTIVITY_PASSWORD_FILE=self.pwfile, CW_ACTIVITY_PROC=root)
+        if marker is None:
+            e.pop("FLEET_SWITCHBOARD_UNDER_TEST", None)
+        else:
+            e["FLEET_SWITCHBOARD_UNDER_TEST"] = marker
         p = subprocess.run([sys.executable, script or SCRIPT], env=e, capture_output=True, text=True, timeout=30)
         self.assertEqual(p.returncode, 0, p.stderr)
         return json.loads(p.stdout)["busy"]
@@ -107,6 +114,22 @@ class Activity(unittest.TestCase):
     def test_live_child_with_idle_server_is_busy(self):
         root = self.tree({1: ("S", 0), 50: ("S", 1), 51: ("S", 50)})
         self.assertIs(self.busy(root), True)
+
+    def test_gate_pid1_is_init_so_a_live_child_does_not_count(self):
+        root = self.tree({1: ("S", 0), 50: ("S", 1)}, cmd=b"/sbin/init\0")
+        self.assertIs(self.busy(root), False)  # the server's answer only
+        self.assertIs(self.busy(root, "busy-forever"), True)
+
+    def test_the_stub_setting_alone_is_ignored_without_the_test_marker(self):
+        root = self.tree({1: ("S", 0), 50: ("S", 1)})
+        code = "import sys; sys.path.insert(0, %r); import activity; print(activity._proc_root())" % os.path.dirname(SCRIPT)
+        for marker, want in ((None, "/proc"), ("0", "/proc"), ("1", root)):
+            e = dict(os.environ, CW_ACTIVITY_PROC=root)
+            e.pop("FLEET_SWITCHBOARD_UNDER_TEST", None)
+            if marker:
+                e["FLEET_SWITCHBOARD_UNDER_TEST"] = marker
+            p = subprocess.run([sys.executable, "-c", code], env=e, capture_output=True, text=True, timeout=30)
+            self.assertEqual(p.stdout.strip(), want, p.stderr)
 
     def test_no_child_and_idle_server_is_not_busy(self):
         self.assertIs(self.busy(self.tree({1: ("S", 0)})), False)

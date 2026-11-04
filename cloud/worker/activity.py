@@ -46,11 +46,29 @@ def _stat(proc, pid):
     return rest[0], int(rest[1])
 
 
-def has_live_child(proc=os.environ.get("CW_ACTIVITY_PROC", "/proc")):  # CW_ACTIVITY_PROC: tests only
+def _proc_root():
+    """/proc, unless a test points the check at a stub: CW_ACTIVITY_PROC counts only with the test marker set too."""
+    if os.environ.get("FLEET_SWITCHBOARD_UNDER_TEST") == "1" and os.environ.get("CW_ACTIVITY_PROC"):
+        return os.environ["CW_ACTIVITY_PROC"]
+    return "/proc"
+
+
+def _pid1_is_the_agent(proc):
+    """True only when pid 1 runs `opencode serve` (the pod: agent and server in one process); on any other host pid 1 is
+    init and every process descends from it, so the check must not run there."""
+    with open("%s/1/cmdline" % proc, "rb") as f:
+        argv = f.read().split(b"\0")
+    return os.path.basename(argv[0].decode("utf-8", "replace")) == "opencode" and "serve" in [a.decode("utf-8", "replace") for a in argv[1:3]]
+
+
+def has_live_child(proc=None):
     """True when a live process descends from pid 1 (the agent AND its headless server, one process) other than pid 1,
     the process running this tool and its own ancestors back to pid 1 (the tool call that started it); zombies do not
     count. Never raises: any read error means no child."""
     try:
+        proc = proc or _proc_root()
+        if not _pid1_is_the_agent(proc):
+            return False
         ppid = {}
         state = {}
         for name in os.listdir(proc):
