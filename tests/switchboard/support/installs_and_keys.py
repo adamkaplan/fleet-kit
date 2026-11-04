@@ -1,51 +1,13 @@
 """Shared fakes and helpers of bin/test-switchboard (moved text, unchanged): installs_and_keys."""
-import argparse
-import ast
-import traceback
-import base64
-import calendar
-import collections
-import contextlib
-import errno
-import copy
-import datetime as _dt
 import fcntl
-import gzip
-import fnmatch
-import hashlib
-import hmac
-import importlib.machinery
-import importlib.util
-import inspect
-import http.client
 import io
-import itertools
-import select
-import json
 import os
 from pathlib import Path
 import re
-from urllib.parse import unquote
-import shlex
-import shutil
-import textwrap
-import zipfile
-import signal
-import socket
-import stat
-import tarfile
 import subprocess
-import sys
-import sysconfig
-import tempfile
-import threading
 import time
-import types
-import unittest
-import uuid
-import urllib.parse
 from unittest import mock
-from support.paths import BIN, REPO
+from support.paths import REPO
 from support.core import Base
 from support.loader import sb
 
@@ -197,6 +159,10 @@ class InstallFakes:
             shown = self.integration_reports_at or target
             state = "current (v13)" if os.path.exists(target) else "not installed"
             return ok("claude: current (v10) (/elsewhere/hooks/herdr-agent-state.sh)\nopencode: %s (%s)\n" % (state, shown))
+        if argv[0] == "git":   # #1380: the install step that records the installed tree reads its git directory; the fake one is under the test's HOME, never the real tree's
+            if "--git-common-dir" in argv:
+                return ok(str(self.binary and Path(self.binary).parent.parent / "fake-git") + "\n")
+            return subprocess.CompletedProcess(argv, 1, "", "")
         reaper = "cloud-reaper" in " ".join(argv)   # the reaper's service is loaded and unloaded on its own
         if argv[0] == "launchctl":
             if argv[1] == "print":

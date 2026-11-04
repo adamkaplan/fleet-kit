@@ -269,8 +269,8 @@ test("S4 S10: no block line prints a question mark or the word dead as an agent 
 })
 
 test("#1097: cloud workers show marked beside the local count; none shows today's text", () => {
-  const withCloud = buildBlocks({ ...live, load: { ...liveLoad, latest: { orch: { open_asks: 1, stalled: 0, busy: 1, idle: 1, cloud: 2, decisions: 0 } } } }, NOW).find((b) => b.name === "orch")
-  assert.match(text(blockLines(withCloud, 80)[1]), /c1\+2☁\/4/)
+  const withCloud = buildBlocks({ ...live, load: { ...liveLoad, latest: { orch: { open_asks: 1, stalled: 0, busy: 3, idle: 1, cloud: 2, decisions: 0 } } } }, NOW).find((b) => b.name === "orch")
+  assert.match(text(blockLines(withCloud, 80)[1]), /c3\+2☁\/4/)
   const local = buildBlocks({ ...live, load: { ...liveLoad, latest: { orch: { open_asks: 1, stalled: 0, busy: 1, idle: 1, cloud: 0, decisions: 0 } } } }, NOW).find((b) => b.name === "orch")
   assert.match(text(blockLines(local, 80)[1]), / c1\/2 /)
   assert.ok(!text(blockLines(local, 80)[1]).includes("☁"))

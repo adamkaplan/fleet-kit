@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Tests for bin/cloud-pr-preflight (ask #1195): temporary repositories, each check passing and failing, and a mutant per check."""
+import pathlib
 import os, signal, subprocess, sys, tempfile, shutil, time, unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
@@ -56,7 +57,7 @@ class Repo:
 
 
 def mutant(old, new):
-    src = open(SCRIPT).read()
+    src = pathlib.Path(SCRIPT).read_text()
     assert old in src, old
     fd, path = tempfile.mkstemp(suffix=".py")
     os.write(fd, src.replace(old, new).encode()); os.close(fd)
@@ -301,7 +302,7 @@ class Probes(unittest.TestCase):
 
 
 class Docs(unittest.TestCase):
-    DOC = open(os.path.join(ROOT, "docs", "cloud-operator-quickstart.md")).read()
+    DOC = pathlib.Path(os.path.join(ROOT, "docs", "cloud-operator-quickstart.md")).read_text()
     H = "## Checking a cloud pull request before the push"
 
     def section(self):
@@ -321,7 +322,7 @@ class Docs(unittest.TestCase):
         self.assertIn("Before any push, run bin/cloud-pr-preflight at the repository root and paste its three sections", self.section())
 
     def test_chain_names_this_test(self):
-        entries = open(os.path.join(ROOT, "bin", "test-cloud-launcher.chain")).read().split("\n")
+        entries = pathlib.Path(os.path.join(ROOT, "bin", "test-cloud-launcher.chain")).read_text().split("\n")
         self.assertEqual(entries.count("cloud/launcher/tests/test_cloud_pr_preflight.py"), 1)
 
 

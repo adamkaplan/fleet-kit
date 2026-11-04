@@ -11,7 +11,7 @@ and `symtable` and fails when:
   - two units of one layer depend on each other (a cycle);
   - a name is defined by two units and a third reads it (an ambiguous owner: which one is meant is not decided by the code);
   - a source file is over 1,500 lines or a test file over 2,500 (unless it is a `size` row: a ceiling with headroom, lowered when a PR leaves more than
-    7,000 lines of it unused, and named with the number to write when it is exceeded).
+    3,000 lines of it unused, and named with the number to write when it is exceeded).
 
 Dynamic imports it cannot follow (a non-constant `import_module`, `load_module` or `__import__`, a path-based load) are counted per unit and listed
 in the document's "Dynamic imports not followed" table, so the blind spot is visible and cannot grow unseen.
@@ -22,21 +22,25 @@ import ast
 import builtins
 import collections
 import glob
+import importlib
 import os
 import re
 import shutil
 import symtable
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO / "bin"))   # #1605: the one reading of the size rows and of a line count
+size_ceilings = importlib.import_module("size_ceilings")
 ENTRY = "fleet-switchboard"
 SOURCE_LIMIT = 1500
 TEST_LIMIT = 2500
 LAYERS = range(0, 7)
 KINDS = ("namespace", "entry-import", "ambiguous", "import", "size", "cycle")
-SIZE_UNUSED = 7000   # a size row is a ceiling with headroom; it is lowered when more than this many lines of it are unused
+SIZE_UNUSED = 3000   # a size row is a ceiling with headroom; it is lowered when more than this many lines of it are unused
 
 
 # ---------------------------------------------------------------- the document
@@ -60,7 +64,7 @@ def parse_document(text):
     for line in _section(text, "Known violations").splitlines():
         if line.startswith("| `"):
             source, target, kind, ceiling, why = (_cells(line) + [""] * 5)[:5]
-            violations[(source.strip("`"), target.strip("`"), kind)] = (int(ceiling.replace(",", "")), why)
+            violations[(source.strip("`"), target.strip("`"), kind)] = (size_ceilings.parse_count(ceiling), why)
     return units, violations
 
 
@@ -94,8 +98,7 @@ def test_files(root):
 
 
 def line_count(path):
-    with open(path, encoding="utf-8", errors="replace") as handle:
-        return sum(1 for _ in handle)
+    return size_ceilings.line_count(path)
 
 
 def _tables(path):
@@ -698,10 +701,10 @@ class TestArchitectureDocumentFailurePaths(unittest.TestCase):
         root, text = self.build(doc_violations="| `fleet-switchboard` | `-` | size | %d | being split |\n" % (SOURCE_LIMIT + 10), entry="X = 1\n" * (SOURCE_LIMIT + 11))
         self.assertEqual(check(root, text), ["fleet-switchboard is 1511 lines, over its ceiling of 1510: put the new code in a part file bin/switchboard/<job>.py, "
                                              "or lower another row (a growth that is meant: write 2500 in its row)"])
-        root, text = self.build(doc_violations=row(base + 7500))   # a PR that shrinks the file leaves the ceiling too high: it names the number to write
+        root, text = self.build(doc_violations=row(base + 3500))   # a PR that shrinks the file leaves the ceiling too high: it names the number to write
         (root / "bin" / "test-big").write_text("x = 1\n" * base)
-        self.assertEqual(check(root, text), ["bin/test-big is down to 3000 lines, 7500 under its ceiling of 10500: write 3500 in its row"])
-        root, text = self.build(doc_violations=row(base + 7000))   # exactly the allowed slack is fine
+        self.assertEqual(check(root, text), ["bin/test-big is down to 3000 lines, 3500 under its ceiling of 6500: write 3500 in its row"])
+        root, text = self.build(doc_violations=row(base + 3000))   # exactly the allowed slack is fine
         (root / "bin" / "test-big").write_text("x = 1\n" * base)
         self.assertEqual(check(root, text), [])
 

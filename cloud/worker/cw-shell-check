@@ -1,0 +1,205 @@
+#!/usr/bin/env python3
+"""cw-shell-check [--list FILE] COMMAND | -
+
+Applies the pod's shell permission rules to a command text, the way the agent runtime does: the command is split into
+its parts at `;`, `&`, `&&`, `||`, `|`, a newline, a subshell `( ... )`, a command substitution `$( ... )` or in backticks (also inside double quotes);
+the shell keywords `if then else elif while until do { } ! fi done esac in`, `for x in`, and a case pattern are not part of a command; every part
+is matched against the rows of the worker agent's `permission.bash` block in order (fnmatch, case-sensitive) and the LAST
+matching row decides. If one part is denied the runtime refuses the WHOLE command with `Permission denied: shell`.
+Prints per part `allow|deny <deciding row> : <part>`. Exit 0 all allowed, 1 any denied, 2 usage error, 3 a construct it does not parse (an unterminated quote, an unmatched
+bracket or backtick, a here-document, `((`, `function`): prints `unsure : <reason>`, never a plain allow.
+A pure read of the permission list; writes nothing.
+"""
+import fnmatch
+import json
+import re
+import sys
+
+DEFAULT_LIST = "/usr/local/share/cw/opencode-worker.json"
+
+
+KEYWORDS = ("if", "then", "else", "elif", "while", "until", "do", "{", "!")
+BARE = ("}", "fi", "done", "esac", "in", ";;")
+CASE_PATTERN = re.compile(r"^\(?[^\s'\"()]+(\|[^\s'\"()]+)*\)\s*")
+FOR_HEAD = re.compile(r"^(for|select)\s+\S+(\s+in\b.*)?$")
+CASE_HEAD = re.compile(r"^case\s+.*?\s+in\b\s*")
+
+
+def clean(part, unsure):
+    """Drop the shell keywords and case patterns the runtime does not count as part of a command."""
+    while True:
+        old = part
+        for kw in KEYWORDS:
+            if part == kw:
+                part = ""
+            elif part.startswith(kw) and part[len(kw)].isspace():
+                part = part[len(kw):].strip()
+        m = CASE_HEAD.match(part)
+        if m:
+            part = part[m.end():]
+        m = CASE_PATTERN.match(part)
+        if m:
+            part = part[m.end():]
+        if FOR_HEAD.match(part) or part in BARE:
+            part = ""
+        if part == old:
+            break
+    if part.startswith("function ") or part.startswith("coproc "):
+        unsure.append("a construct not measured: %s" % part.split()[0])
+    return part
+
+
+def split_parts(text, unsure=None):
+    """Returns the parts; the reasons for which the text is not fully parsed are appended to `unsure`."""
+    parts = []
+    if unsure is None:
+        unsure = []
+
+    def close_of(s, j, opener):
+        # index just after the closer matching an opener whose body starts at j, or -1
+        if opener == "`":
+            k = j
+            while k < len(s):
+                if s[k] == "\\":
+                    k += 2
+                    continue
+                if s[k] == "`":
+                    return k + 1
+                k += 1
+            return -1
+        depth, k, q = 1, j, None
+        while k < len(s) and depth:
+            d = s[k]
+            if q:
+                if d == "\\" and q == '"':
+                    k += 1
+                elif d == q:
+                    q = None
+            elif d == "\\":
+                k += 1
+            elif d in "'\"":
+                q = d
+            elif d == "(":
+                depth += 1
+            elif d == ")":
+                depth -= 1
+            k += 1
+        return k if depth == 0 else -1
+
+    def substitution(s, i):
+        """If a substitution or subshell opens at i return (body start, end), else None; -1 end = unterminated."""
+        c = s[i]
+        if c == "`":
+            j, opener = i + 1, "`"
+        elif c == "$" and s[i + 1:i + 2] == "(":
+            j, opener = i + 2, "("
+        elif c == "(":
+            j, opener = i + 1, "("
+        else:
+            return None
+        return j, close_of(s, j, opener)
+
+    def walk(s):
+        cur = []
+        i, n, quote = 0, len(s), None
+
+        def flush():
+            p = clean("".join(cur).strip(), unsure)
+            del cur[:]
+            if p:
+                parts.append(p)
+        while i < n:
+            c = s[i]
+            if quote:
+                if quote == '"' and c in "`$":
+                    sub = substitution(s, i)
+                    if sub:
+                        j, end = sub
+                        if end < 0:
+                            unsure.append("an unterminated substitution")
+                            walk(s[j:])
+                            return flush()
+                        walk(s[j:end - 1] if s[end - 1] in ")`" else s[j:end])
+                        i = end
+                        continue
+                cur.append(c)
+                if c == "\\" and quote == '"' and i + 1 < n:
+                    cur.append(s[i + 1]); i += 1
+                elif c == quote:
+                    quote = None
+            elif c == "\\" and s[i + 1:i + 2] == "\n" and not "".join(cur).strip():
+                i += 1  # measured: a continuation at the start of a part is skipped by the runtime; inside a part it stays
+            elif c == "\\" and i + 1 < n:
+                cur.append(c); cur.append(s[i + 1]); i += 1
+            elif c in "'\"":
+                quote = c; cur.append(c)
+            elif c in "`(" or (c == "$" and s[i + 1:i + 2] == "("):
+                if s[i:i + 2] == "((" or s[i:i + 3] == "$((":
+                    unsure.append("an arithmetic construct (( ))")
+                j, end = substitution(s, i)
+                flush()
+                if end < 0:
+                    unsure.append("an unmatched bracket or backtick")
+                    walk(s[j:])
+                    return
+                walk(s[j:end - 1])
+                i = end
+                continue
+            elif c == "<" and s[i + 1:i + 2] == "<" and s[i + 2:i + 3] != "<":
+                unsure.append("a here-document")
+                cur.append(c)
+            elif c == "&" and (s[i - 1:i] in (">", "<") or s[i + 1:i + 2] == ">") and i > 0:
+                cur.append(c)  # a redirection (`2>&1`, `&>f`), not a separator
+            elif c in ";\n|&":
+                flush()
+            else:
+                cur.append(c)
+            i += 1
+        if quote:
+            unsure.append("an unterminated quote")
+        flush()
+
+    walk(text)
+    return parts
+
+
+def decide(rows, part):
+    row = None
+    verdict = "allow"
+    for pattern, action in rows:
+        if fnmatch.fnmatchcase(part, pattern):
+            row, verdict = pattern, action
+    return verdict, row
+
+
+def main(argv):
+    args = argv[1:]
+    path = DEFAULT_LIST
+    if len(args) >= 2 and args[0] == "--list":
+        path, args = args[1], args[2:]
+    if len(args) != 1:
+        sys.stderr.write("usage: cw-shell-check [--list FILE] COMMAND | -\n")
+        return 2
+    text = sys.stdin.read() if args[0] == "-" else args[0]
+    try:
+        with open(path) as fh:
+            rows = list(json.load(fh)["agent"]["worker"]["permission"]["bash"].items())
+    except (OSError, ValueError, KeyError) as exc:
+        sys.stderr.write("cw-shell-check: cannot read the permission list: %s\n" % type(exc).__name__)
+        return 2
+    denied = False
+    unsure = []
+    for part in split_parts(text, unsure):
+        verdict, row = decide(rows, part)
+        denied = denied or verdict == "deny"
+        print("%s %s : %s" % (verdict, row if row is not None else "(no row)", part))
+    reasons = sorted(set(unsure))
+    for reason in reasons:
+        print("unsure : %s" % reason)
+    if denied:
+        return 1
+    return 3 if reasons else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
