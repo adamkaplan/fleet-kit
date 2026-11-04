@@ -296,6 +296,7 @@ The daemon runs one loop with five steps:
    apply the delivery rule.
 4. **Deliver.** Observe that agent again, then note or wake it.
 5. **Render.** Update herdr: unread badges, toasts for held items.
+   An Intent edit is toasted once per edit (the issue and its edit stamp), however many edits are pending for the Chief of Staff, and again only for a new edit stamp.
 
 Every write to another system is recorded in the audit log twice: the intent
 before the call, and the result after it.

@@ -2073,7 +2073,7 @@ class GhBudget(Fixture):
                         or isinstance(n, ast.Assign) and isinstance(n.targets[0], ast.Attribute) and isinstance(n.value, ast.Call)
                         and isinstance(n.value.func, ast.Name) and n.value.func.id in ("set", "dict", "list", "V2Reads")})
         self.assertEqual(found, ["_delivered", "_early_facts", "_last", "_not_fleet", "decision_seeds", "decision_seen", "notice_effects", "notice_facts",
-                                 "pass_toasts", "reads", "stopped_news", "stopped_news_errors", "synthetic_cache", "toasted"])
+                                 "pass_toasts", "reads", "stopped_news", "stopped_news_errors", "synthetic_cache", "toasted", "toasted_intent"])
 
     def test_final_head_is_read_fresh_not_from_the_memo(self):
         ex, _ = self.world(move_after=2)   # the head moves after the link and plan reads
