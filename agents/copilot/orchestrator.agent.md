@@ -85,8 +85,6 @@ the skill wins.
 
 ## First action after any relaunch: update `pane`
 
-If you run headless (no terminal), your launch already wrote `pane: headless:<your name>`; leave it, and write the `wN:pN` again if you are relaunched into a terminal.
-
 Your charter outlives the pane it names. When you are launched into a different
 pane, update the charter's `pane` field **before you resume work**. A stale
 `pane` makes a healthy orchestrator look dead. The mechanics are in the `fleet-charter` skill.
