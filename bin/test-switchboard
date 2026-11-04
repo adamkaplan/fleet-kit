@@ -25596,6 +25596,35 @@ class TestTriageDigest(Base):
         audit = [e for e in self.world.audit() if e["event"] == "triage.parked_invalid"]
         self.assertEqual([e["detail"]["ref"] for e in audit], ["acme/api#152"])
 
+    def test_a_validly_parked_item_is_never_repeated_by_a_pending_digest_fact(self):
+        self.add(150, created=5, updated=4, labels=["osuser:parked"], body="no date yet")
+        self.add(151, created=5, updated=4, labels=["kind"])
+        self.passes(0)
+        keys = [k for k in self.engine.triage.facts if "summary" not in k]
+        self.assertEqual(len(keys), 1)
+        self.assertIn("api#150", self.engine.triage.facts[keys[0]][0])   # control: the made digest names it as an invalid park
+        now = self.world.clock.now()
+        self.add(150, created=5, updated=0.1, labels=["osuser:parked"], body="Parked until: %s" % sb.iso(now + 30 * self.DAY)[:10])
+        self.engine.triage.units.clear()
+        sb.triage_pass(self.engine, [], self.world.clock.now(), ())   # the edited item is read again
+        mentions = 0
+        for _ in range(2):   # two later wakes
+            self.world.tick(3600)
+            facts = [f for f in self.bound()() if f.kind == "triage"]
+            mentions += sum("api#150" in f.summary for f in facts)
+        self.assertEqual(mentions, 0, "a validly parked item is never repeated")
+        self.assertTrue(any("api#151" in v[0] for v in self.engine.triage.facts.values()))   # the other item is still named
+
+    def test_a_pending_digest_of_only_parked_items_ends(self):
+        self.add(150, created=5, updated=4, labels=["kind"])
+        self.passes(0)
+        now = self.world.clock.now()
+        self.add(150, created=5, updated=0.1, labels=["osuser:parked", "kind"], body="Parked until: %s" % sb.iso(now + 30 * self.DAY)[:10])
+        self.engine.triage.units.clear()
+        sb.triage_pass(self.engine, [], self.world.clock.now(), ())
+        self.assertEqual([f for f in self.bound()() if f.kind == "triage" and "summary" not in f.key], [])
+        self.assertEqual([k for k in self.engine.triage.facts if "summary" not in k], [])
+
     def test_s11_a_bad_parked_date_is_listed_in_the_first_digest_flagged_once_and_a_muted_item_stays_hidden(self):
         self.add(170, created=5, updated=4, labels=["osuser:parked"], body="Parked until: someday")
         self.add(171, created=3, updated=0.2, labels=["kind"])

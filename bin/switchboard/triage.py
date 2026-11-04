@@ -369,6 +369,7 @@ class TriageState:
         self.logged, self.woken_logged, self.facts, self.current = set(), set(), {}, {}
         self.started, self.day, self.day_counts = 0, None, {}
         self.summarised = None
+        self.basis = {}          # digest fact key -> (shown pairs, total due, invalid refs, other-owner count) its text was made from: judged again at delivery
         self.seen = None         # #349: the stale digest's memory (bin/triage_digest.py), loaded at the first pass
         self.meta = None         # #406: its cadence (warm-up done, the last delivery), kept in the same file
 
@@ -1188,6 +1189,7 @@ def triage_pass(engine, decisions, now, errors=()):
                 state.woken_logged.add(once)
             engine._note("triage.finding", ref, {"rule": rule, "ref": ref, "what": TRIAGE_KINDS[rule],
                                                  "evidence": evidence, "woken": (rule, ref) in woken, "applied": False})
+    triage_rejudge_facts(state, now)   # a digest still waiting for delivery is judged again from the items as they are now
     triage_daily_summary(engine, state, cfg, now, day, repos)
 
 
@@ -1251,6 +1253,46 @@ def triage_digest_commit(engine, state, shown, invalid, now):
     triage_digest.write_seen(engine.state_dir, state.seen, state.meta)
 
 
+def triage_digest_text(state, total, shown, kinds, other_owner, invalid):
+    summary = "triage: %d finding%s: %s%s. %s. Resolve, route or escalate each; the triage changes nothing on GitHub." % (
+        total, "" if total == 1 else "s", ", ".join("%s %s%s" % (ref, rule, " (%s)" % state.reasons[(rule, ref)] if (rule, ref) in state.reasons else "") for rule, ref in shown),
+        " (+%d more)" % (total - len(shown)) if total > len(shown) else "",
+        "; ".join("%s = %s" % (k, TRIAGE_KINDS[k]) for k in kinds))
+    if other_owner:
+        summary += " Also %d other-owner flag(s): not ours, nothing to do." % other_owner
+    if invalid:
+        summary += " Parked without a valid `Parked until: YYYY-MM-DD` line (treated as not parked): %s." % ", ".join(invalid)
+    return summary
+
+
+def triage_validly_parked(item, now):
+    """The item as it is now: the label and one valid date still ahead and within the limit, and not awaiting (select's own test)."""
+    return item is not None and triage_parked_now(item, now) and not any("awaiting" in str(l) for l in item["labels"])
+
+
+def triage_rejudge_facts(state, now):
+    """A pending digest fact is judged again before it is delivered: an item now validly parked is dropped from it (and from its invalid-park flag),
+    and a fact left with nothing is ended."""
+    items = triage_digest_items(state)
+    for key, (shown, total, invalid, other_owner) in list(state.basis.items()):
+        if key not in state.facts:
+            del state.basis[key]
+            continue
+        keep = [p for p in shown if not triage_validly_parked(items.get(p[1]), now)]
+        keep_invalid = [r for r in invalid if not triage_validly_parked(items.get(r), now)]
+        if len(keep) == len(shown) and len(keep_invalid) == len(invalid):
+            continue
+        created = state.facts[key][1]
+        if not keep and not keep_invalid:
+            del state.facts[key], state.basis[key]
+        elif keep:
+            state.facts[key] = (triage_digest_text(state, total - (len(shown) - len(keep)), keep, sorted({r for r, _ in keep}), other_owner, keep_invalid), created)
+            state.basis[key] = (keep, total - (len(shown) - len(keep)), keep_invalid, other_owner)
+        else:   # only an invalid-park flag is left
+            state.facts[key] = ("triage: no stale item to show; parked without a valid `Parked until: YYYY-MM-DD` line (treated as not parked): %s." % ", ".join(keep_invalid), created)
+            state.basis[key] = ([], 0, keep_invalid, other_owner)
+
+
 def triage_queue_fact(state, due, now, cfg, other_owner=0, invalid=()):
     """Queue THE one digest of the pass and return its text (the cost figure counts it). Only the shown items are marked."""
     shown = due[:cfg["max_findings"]]
@@ -1261,17 +1303,11 @@ def triage_queue_fact(state, due, now, cfg, other_owner=0, invalid=()):
         summary = "triage: no stale item to show; parked without a valid `Parked until: YYYY-MM-DD` line (treated as not parked): %s." % ", ".join(invalid)
         state.facts["triage:parked:%s" % hashlib.sha256(summary.encode()).hexdigest()[:10]] = (summary, now)
         return summary
-    summary = "triage: %d finding%s: %s%s. %s. Resolve, route or escalate each; the triage changes nothing on GitHub." % (
-        len(due), "" if len(due) == 1 else "s", ", ".join("%s %s%s" % (ref, rule, " (%s)" % state.reasons[(rule, ref)] if (rule, ref) in state.reasons else "") for rule, ref in shown),
-        " (+%d more)" % (len(due) - len(shown)) if len(due) > len(shown) else "",
-        "; ".join("%s = %s" % (k, TRIAGE_KINDS[k]) for k in kinds))
-    if other_owner:
-        summary += " Also %d other-owner flag(s): not ours, nothing to do." % other_owner
-    if invalid:
-        summary += " Parked without a valid `Parked until: YYYY-MM-DD` line (treated as not parked): %s." % ", ".join(invalid)
+    summary = triage_digest_text(state, len(due), shown, kinds, other_owner, invalid)
     for pair in shown:
         state.alarmed[pair] = now
     state.facts[key] = (summary, now)
+    state.basis[key] = (list(shown), len(due), list(invalid), other_owner)   # what the text was made from, so a delivery can judge it again
     for old in [k for k, (_, at) in state.facts.items() if now - at > cfg["realarm_hours"] * 7200 and "summary" not in k]:
         del state.facts[old]
     state.carried = set(shown)   # #849: what this digest carried and remembered; an overflow beyond the cap stays due
