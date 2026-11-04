@@ -36,6 +36,9 @@ NAME_MAX = 80
 SEEN_MAX = 500
 EVIDENCE_MAX = 200
 REAPER_ID = "reaper"
+SLOW_WINDOW = 7200            # the reaper's slow passes of the last two hours say how late a stop may be
+SLOW_MAX = 50                 # most slow passes kept
+SLOW_RE = re.compile(r"the pass took (\d{1,7}) seconds \(limit (\d{1,7})\)")
 
 _PROC_ALERTED = {}            # per memory path: keys this process already alerted or skipped: survives a memory file that cannot be saved or set aside
 _PROC_AUDITED = set()          # memory paths whose memory-only audit line this process already wrote (once per path)
@@ -113,6 +116,19 @@ def _read_new(sb, path, state, key):
     return lines
 
 
+def _note_slow(state, item, ts):
+    """A `slow-reap-pass` line of the launcher audit: [ts, N seconds] in `slow`; one that does not read as the slow-pass form marks `slow_bad`."""
+    if item.get("runtime_id") != REAPER_ID or item.get("action") != "slow-reap-pass":
+        return
+    m = SLOW_RE.fullmatch(item["reason"]) if isinstance(item.get("reason"), str) else None
+    if not m:
+        state["slow_bad"] = max(ts, state.get("slow_bad", 0))
+        return
+    slow = [e for e in state.get("slow", []) if isinstance(e, list)] + [[ts, int(m.group(1))]]
+    newest = max(e[0] for e in slow)
+    state["slow"] = sorted((e for e in slow if e[0] >= newest - SLOW_WINDOW), key=lambda e: e[0])[-SLOW_MAX:]
+
+
 def _fold(state, sb, lines, source):
     """Fold audit lines into the per-worker facts: created, stopped, reported, refused launches, reaper failures."""
     created, stop, report = state.setdefault("created", {}), state.setdefault("stop", {}), state.setdefault("report", {})
@@ -133,6 +149,7 @@ def _fold(state, sb, lines, source):
                 state.setdefault("refused", {})["%s@%s" % (name, item["ts"])] = {"name": name, "at": ts, "line": raw}
         else:
             name, action, ok = item.get("worker"), item.get("action"), item.get("ok")
+            _note_slow(state, item, ts)
             if item.get("runtime_id") == REAPER_ID and ok in (True, False):
                 state.setdefault("reaper_new", []).append([ts, ok, _clean(item.get("reason") or action or "", 120)])   # settled by `_reaper` in this pass
             elif isinstance(name, str) and name and ok is True:
@@ -195,6 +212,12 @@ def _c_new(value):
     return [e for e in value if isinstance(e, list) and len(e) == 3 and _num(e[0]) and isinstance(e[1], bool) and _is_text(e[2])] or None
 
 
+def _c_slow(value):
+    if not isinstance(value, list):
+        return None
+    return [e for e in value if isinstance(e, list) and len(e) == 2 and _num(e[0]) and _num(e[1])][-SLOW_MAX:] or None
+
+
 def _c_outage(value):
     return _valid_record(value, True)
 
@@ -232,6 +255,8 @@ _CLEANERS = {
     "reaper_gap": _c_gap,
     "reaper_new": _c_new,
     "catchup": _c_flag,
+    "slow": _c_slow,
+    "slow_bad": _c_num,
 }
 
 
@@ -285,6 +310,21 @@ def _at_end(state, path, key):
         return state.get("offsets", {}).get(key, 0) >= os.stat(path).st_size
     except OSError:
         return False   # a file that exists and cannot be read is not at its end
+
+
+def _slow_readable(path):
+    return not os.path.lexists(path) or (os.path.isfile(path) and os.access(path, os.R_OK))
+
+
+def _recent(stamp, now):
+    return _num(stamp) and stamp >= now - SLOW_WINDOW
+
+
+def _longest_slow(state, now):
+    """The longest slow reaper pass of the window, or 0 when there is none or something was unreadable."""
+    if _recent(state.get("slow_bad"), now):
+        return 0
+    return max([e[1] for e in state.get("slow", []) if e[0] >= now - SLOW_WINDOW] or [0])
 
 
 def _ask_of(name, record):
@@ -394,12 +434,18 @@ def run_pass(sb, engine, now, alive=None, launcher_audit=None):
         state, status = {}, "none"   # no usable positions or no usable list of what was alerted: no usable memory (recent losses only, the older marked)
     first = status in ("none", "memory_only")
     catchup = first or state.get("catchup") is True   # a catch-up: no usable memory, and every later pass until both audits are read to their end
+    bad_before = state.get("slow_bad")
     _fold(state, sb, _read_new(sb, str(engine.audit.path), state, "switchboard"), "switchboard")
     _fold(state, sb, _read_new(sb, launcher_audit or launcher_audit_path(), state, "launcher"), "launcher")
     _reaper(state, now)
     at_end = _at_end(state, str(engine.audit.path), "switchboard") and _at_end(state, launcher_audit or launcher_audit_path(), "launcher")
     state["catchup"] = (first or state.get("catchup") is True) and not at_end   # set only on a pass with no usable memory; cleared only by a pass that reads both files to their end
     state["_gap_ready"] = at_end
+    if state.get("slow_bad") != bad_before and _num(state.get("slow_bad")):
+        engine.audit.append(engine.actor, "lost_worker.slow_pass_unreadable", None, {"why": "a slow-reap-pass line could not be read; late stops are told as lost"})
+    elif not _slow_readable(launcher_audit or launcher_audit_path()) and not _recent(bad_before, now):
+        state["slow_bad"] = now
+        engine.audit.append(engine.actor, "lost_worker.slow_pass_unreadable", None, {"why": "the launcher audit cannot be read; late stops are told as lost"})
     records = {}
     for r in (getattr(engine, "cloud_watch", None) or {}).get("records", []):
         if isinstance(r, dict) and isinstance(r.get("worker"), str):
