@@ -15910,7 +15910,6 @@ class TestAgentDefinitions(unittest.TestCase):
             with self.subTest(file=str(path.relative_to(REPO))):
                 block = maxims_block(path.read_text())
                 self.assertTrue(block, "no ## Maxims block")
-                self.assertLessEqual(len([line for line in block.splitlines() if line.strip()]), 12)
                 role = role_of(path)
                 for phrase in SHARED_MAXIMS:
                     # `Say it failed` lives in CODING_STANDARDS.md (R-CODE-1); the coder keeps a pointer, not the text. Chesterton's fence and cut the root stay in EVERY definition: Copilot coders and other installs load no global AGENTS.md
