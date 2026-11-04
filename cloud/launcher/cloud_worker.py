@@ -856,6 +856,28 @@ def _json_strings(node, out):
             _json_strings(v, out)
 
 
+SECRET_PIECE_MIN = 8
+TOKEN_PREFIXES = ("github_pat_", "ghp_", "gho_", "ghu_", "ghs_", "ghr_", "sk-ant-", "sk-proj-", "sk-", "xoxb-", "xoxp-", "glpat-")
+
+
+def _secret_pieces(value):
+    """The usable pieces of a structured value, each of SECRET_PIECE_MIN+ characters (ask #2144): for a URL with a password, the
+    password and user:password; for a token with a known prefix, the part after it; for a multi-line key, each line of 16+ characters."""
+    v, out = value.strip(), set()
+    m = re.match(r"^[A-Za-z][A-Za-z0-9+.-]*://([^/?#@]*)@", v)
+    if m and ":" in m.group(1):
+        userinfo = m.group(1)
+        out.update({userinfo, userinfo.partition(":")[2], urllib.parse.unquote(userinfo), urllib.parse.unquote(userinfo.partition(":")[2])})
+    for pre in TOKEN_PREFIXES:
+        if v.startswith(pre):
+            out.add(v[len(pre):])
+            break
+    lines = [x.strip() for x in v.splitlines()]
+    if len(lines) > 1:
+        out.update(x for x in lines if len(x) >= 16)
+    return {x for x in out if len(x) >= SECRET_PIECE_MIN and x != value and x != v}
+
+
 def secret_forms(value):
     """Every form in which a secret value can be printed: itself, base64 (standard and URL-safe, padded or not, at each of
     the three alignments of a stream: the pieces fixed by the value alone), hex, percent-encoded and JSON-escaped. A model
@@ -890,6 +912,8 @@ def secret_forms(value):
         hx = raw.hex()
         forms.update({hx, hx.upper(), urllib.parse.quote(t, safe=""), urllib.parse.quote_plus(t), urllib.parse.quote(t),
                       json.dumps(t)[1:-1], json.dumps(t, ensure_ascii=False)[1:-1]})
+    for piece in _secret_pieces(value):
+        forms.update(secret_forms(piece))  # a piece is a form of the same value, with its own encodings
     return {f for f in forms if f}
 
 
