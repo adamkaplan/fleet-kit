@@ -479,7 +479,7 @@ R3. Who: the launcher's caller, after the probe pods launch. Each pod's hub entr
 
 ## The GitHub App's permissions
 
-The token the launcher mints asks for, and accepts, exactly `contents: write`, `pull_requests: write`, `issues: read`, `metadata: read`. The worker can read issues and their comments of its own repository and cannot write issues, labels, merges or settings.
+The token the launcher mints asks for, and accepts, exactly `contents: write`, `pull_requests: write`, `issues: read`, `metadata: read`, `actions: read`. The worker can read issues and their comments of its own repository and cannot write issues, labels, merges or settings.
 
 The owner step, done only after the change that adds `issues: read` is merged: add `issues: read` to the App's permissions, then accept it on each installation. Until both are done a launch is refused before any pod exists, with a line that names `issues` and this step. See `docs/agent-credentials.md`.
 

@@ -127,7 +127,7 @@ Every step that creates or changes a credential is the owner's (see "The owner's
 
 ## Cloud worker: reading issues
 
-The cloud mint asks for, and accepts, exactly `contents: write`, `pull_requests: write`, `issues: read`, `metadata: read`. The worker can read issues and their comments of its own repository and cannot write issues, labels, merges or settings. The owner step is one numbered step with two actions, done only after the change is merged: add `issues: read` to the App's permissions, then accept it on each installation. Until then every cloud launch is refused before any pod exists, with a line that names `issues` and this step. This is the cloud token's own set and a different credential from the Mac agent set above.
+The cloud mint asks for, and accepts, exactly `contents: write`, `pull_requests: write`, `issues: read`, `metadata: read`, `actions: read`. The worker can read issues and their comments of its own repository and cannot write issues, labels, merges or settings. The owner step is one numbered step with two actions, done only after the change is merged: add `issues: read` to the App's permissions, then accept it on each installation. Until then every cloud launch is refused before any pod exists, with a line that names `issues` and this step. This is the cloud token's own set and a different credential from the Mac agent set above.
 
 ## Rollback
 
@@ -136,7 +136,7 @@ If the App token breaks agent work on an in-scope repository, return to the curr
 1. Remove that repository's entry from the installation map, or restore the previous `gh_users` entry from the copy kept before step 4. The shims read it on every call, so there is no restart.
 2. Restore the inherited token for the agent's shell, if step 5 removed it.
 3. The previous keyring login was never deleted by this migration, so it is still there.
-4. If the cause was the key, the owner rotates it in the App's settings. If widening the App made cloud tokens refused, narrow the App back to its previous permissions (the cloud mint now needs `contents: write`, `pull_requests: write`, `issues: read`, `metadata: read`; revert the change that added `issues: read` first, then remove it from the App).
+4. If the cause was the key, the owner rotates it in the App's settings. If widening the App made cloud tokens refused, narrow the App back to its previous permissions (the cloud mint now needs `contents: write`, `pull_requests: write`, `issues: read`, `metadata: read`, `actions: read`; revert the change that added `issues: read` first, then remove it from the App).
 
 Rollback returns to today's behaviour, including admin reach for agents on that repository, so record why and treat it as temporary.
 

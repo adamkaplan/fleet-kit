@@ -114,7 +114,7 @@ A cloud worker called the real `gh` binary by its path instead of the `gh` wrapp
 
 There are two real boundaries, and everything else in the pod is a convenience.
 
-- **Boundary 1, the token's scope.** The installation token has exactly contents write, pull requests write, issues read and metadata read (`app_token.py` refuses any other set). What those permissions allow is the table below.
+- **Boundary 1, the token's scope.** The installation token has exactly contents write, pull requests write, issues read, metadata read and actions read (`app_token.py` refuses any other set). What those permissions allow is the table below.
 - **Boundary 2, the repository's rules.** Rulesets, the merge queue and review requirements decide what the permitted actions can reach: a merge, a push to the default branch, a force-push. The preflight reads them before a worker is launched (`cloud/launcher/preflight.py`).
 
 The wrappers and the client are conveniences, never a boundary: the `gh` and `git` wrappers (`guard.sh`), the OpenCode deny rules, the worker prompt, and `cw-gh` (the client that replaces the real `gh`). They catch accidents and make conduct rules visible. A worker that wants to act around them can, by design, with the routes listed under "What remains reachable by design".
