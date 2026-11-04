@@ -67,24 +67,75 @@ DEAD_CASES = {
     "pane_get not found, still listed, process runs": dict(list="listed", process="runs", get="notfound", missing=False),
     "pane_get fails, not not-found": dict(list="listed", process="runs", get="error", missing=False),
     "row with no pane": dict(list="absent", process="unread", get="notfound", missing=False, nopane=True),
+    "listed, no recorded session": dict(list="listed", process="shell", get="ok", missing=True, nosession=True),   # case (iv) of PC-3
 }
-CHANGED = ("list cannot be read", "listed, process unread", "pane_get not found, still listed, process runs")
+TABLE = [label for label, case in DEAD_CASES.items() if not case.get("nopane")]   # S2: the 7 evidence cases (the row with no pane is S4's)
+CHANGED = ("list cannot be read", "listed, process unread", "pane_get not found, still listed, process runs", "listed, no recorded session")
 
 
-def old_pane_state(c):
-    if c.get("nopane"):
-        return "not judged"
-    if c["get"] == "notfound":
-        return "dead"
-    if c["get"] == "error" or c["process"] == "unread":
-        return "unknown"
-    return "attached" if c["process"] == "runs" else "detached"
+# PC-8: the OLD deciders, VERBATIM from the integration tip 0e4bb895 (`git show 0e4bb895:bin/fleet-switchboard`): `pane_state` (the whole function) and the
+# missing-pass decision of `pane_health_pass` (the block of the hold of #1066, which the loop's old dead record follows). Executed with the rig's names.
+OLD_PANE_STATE = r'''def pane_state(engine, name, session_id, pane, known_names=(), known_sessions=()):
+    """(state, why, info): `attached` when the pane's title or visible screen names the agent or its session; `detached` when it shows
+    something else; `dead` when herdr has no such pane; `unknown` when herdr cannot be read (never a verdict). `info` carries the pane's
+    workspace, tab, cwd and whether the screen shows ANOTHER fleet agent (then the pane is somebody's, not a stale screen)."""
+    try:
+        got = engine.herdr.pane_get(pane)
+    except HerdrError as err:
+        text = str(err).lower()
+        if "not found" in text or "no such" in text or "unknown pane" in text:
+            return PANE_DEAD, "herdr has no pane %s" % pane, {}
+        return PANE_UNKNOWN, "herdr cannot say what pane %s shows: %s" % (pane, _one_line(str(err), 100)), {}
+    title = got.get("terminal_title_stripped") or got.get("terminal_title") or ""
+    # POSITIVE attach evidence first: the pane's foreground process is opencode on THIS session. Whatever its title says, it is live and attached.
+    # A process list that cannot be read is unknown (a close needs proof, and no proof is not stale).
+    try:
+        processes = engine.herdr.pane_process_info(pane)
+    except HerdrError as err:
+        return PANE_UNKNOWN, "herdr cannot say what pane %s runs: %s" % (pane, _one_line(str(err), 80)), {}
+    info = {"workspace": got.get("workspace_id"), "tab": got.get("tab_id"), "cwd": got.get("cwd"), "status": got.get("agent_status"),
+            "title": _one_line(re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", title), 80)}
+    if runs_session(processes, session_id):
+        info["live_session"] = True
+        return PANE_ATTACHED, "the pane runs opencode on %s's session %s" % (name, session_id), info
+    if _names_agent(title, name, session_id):
+        return PANE_ATTACHED, "the pane's title names %s" % name, info
+    # FAIL MODE: a screen that cannot be read is UNKNOWN, never "nothing is shown": the verdict `detached` leads to a closed tab, so it needs
+    # positive evidence (a title that does not name the agent AND a screen that was read and does not either).
+    try:
+        visible = engine.herdr.pane_read_visible(pane)
+    except HerdrError as err:
+        return PANE_UNKNOWN, "the title of pane %s does not name %s and its screen could not be read: %s" % (pane, name, _one_line(str(err), 80)), info
+    text = _shown_text(title, visible)
+    if _names_agent(visible, name, session_id):
+        return PANE_ATTACHED, "the pane shows %s" % name, info
+    others = [n for n in known_names if n and n != name and _names_agent(text, n, None)] + [x for x in known_sessions if x and x != session_id and x.lower() in text]
+    info["shows_another"] = others[:3]
+    return PANE_DETACHED, "pane %s shows %r, not %s's session %s" % (pane, info["title"][:60], name, session_id), info'''
+
+OLD_MISSING_DECISION = r'''        if missing[name] >= PANE_MISSING_PASSES and agents[name].get("pane") and agents[name].get("session"):
+            try:   # #1066: a pane whose process runs the agent's session is never dead, whatever the multiplexer's list says
+                if runs_session(engine.herdr.pane_process_info(agents[name]["pane"]), agents[name]["session"], engine.executable):
+                    missing[name] = PANE_MISSING_PASSES - 1
+                    held = engine.__dict__.setdefault("pane_held", {})
+                    held[name] = held.get(name, 0) + 1
+                    if held[name] > PANE_HELD_PASSES:   # a lingering process keeps the agent alive: said once, still held (never declared dead on a process alone)
+                        engine._note("fleetpane.missing_held", name, {"pane": agents[name]["pane"], "passes": PANE_HELD_PASSES,
+                                                                      "why": "herdr no longer lists the pane but its process still runs the session"})
+                    continue
+                engine.__dict__.setdefault("pane_held", {}).pop(name, None)
+            except HerdrError:
+                pass'''
+
+# The one glue of the old loop: the block runs inside the loop (`continue` = held), and when it falls through the old code records `dead` once the count is reached.
+OLD_LOOP_HEAD = "def old_missing_decision(engine, name, agents, missing):\n    for _ in (0,):\n"
+OLD_LOOP_TAIL = "\n        return 'dead' if missing[name] >= PANE_MISSING_PASSES else 'not judged'\n    return 'held'\n"
 
 
-def old_loop(c):
-    if c.get("nopane") or not c["missing"]:
-        return "not judged"
-    return "held" if c["process"] == "runs" else "dead"
+def exec_old(source, name):
+    namespace = dict(sb.__dict__)
+    exec(compile(source, "<the old code of 0e4bb895>", "exec"), namespace)
+    return namespace[name]
 
 
 class Rig:
@@ -103,12 +154,25 @@ class Rig:
         self.reconcile = sb.load_module("agent_reconcile")
         self.row = {"pane": self.pane, "session": self.session}
 
+    def old_pane_state(self, decider=None):
+        """The OLD `pane_state`, run on this world: its answer."""
+        return (decider or exec_old(OLD_PANE_STATE, "pane_state"))(self.engine, NAME, self.session, self.pane)[0]
+
+    def old_loop(self, source=None):
+        """The OLD missing-pass decision, run on this world for the case's row: `held`, `dead` or `not judged` (the agent is not absent from the agent list)."""
+        if self.case.get("nopane") or not self.case["missing"]:
+            return "not judged"
+        decide = exec_old(OLD_LOOP_HEAD + (source or OLD_MISSING_DECISION) + OLD_LOOP_TAIL, "old_missing_decision")
+        return decide(self.engine, NAME, {NAME: dict(self.row)}, {NAME: sb.PANE_MISSING_PASSES - 1 + 1})
+
     def pass_once(self, offset=0):
         self.engine.discover(self.world.clock.now())
         sb.pane_health_pass(self.engine, self.world.clock.now() + offset)
 
     def arrange(self, for_pane_state=False):
         c, herdr = self.case, self.herdr
+        if c.get("nosession"):
+            self.row = {"pane": self.pane, "session": None}
         if c.get("nopane"):
             self.row = {"pane": None, "session": self.session, "endpoint": "http://acme.invalid/x"}
             return
@@ -164,12 +228,13 @@ class Rig:
 class TestDaemonDeadVerdict(Base):
 
     # -- S2 / S9: the table
-    def table(self):
+    def table(self, loop_source=None):
         rows = {}
-        for label, case in DEAD_CASES.items():
+        for label in TABLE:
+            case = DEAD_CASES[label]
             rig = Rig(self, case)
             rig.arrange()
-            ps, lp = old_pane_state(case), old_loop(case)
+            ps, lp = rig.old_pane_state(), rig.old_loop(loop_source)
             rows[label] = {"old pane_state": ps, "old loop": lp,
                            "new daemon": "dead" if rig.new_daemon_dead() else "not dead", "shows_dead": "dead" if rig.shows_dead() else "not dead"}
         return rows
@@ -177,20 +242,42 @@ class TestDaemonDeadVerdict(Base):
     def test_S2_the_table_has_7_cases_by_4_deciders_and_prints_28_answers(self):
         rows = self.table()
         self.assertEqual((len(rows), sum(len(r) for r in rows.values())), (7, 28))
+        self.assertEqual({k: (v["old pane_state"], v["old loop"]) for k, v in rows.items()}["pane gone"], ("dead", "dead"))   # the answers are the old code's, run
         for label, row in rows.items():
             self.assertEqual(row["new daemon"], row["shows_dead"], label)   # one function: the daemon and the registry agree on every case
         self.assertEqual({k: v["new daemon"] for k, v in rows.items()},
                          {"pane gone": "dead", "listed bare shell": "dead", "listed, process unread": "not dead", "list cannot be read": "not dead",
-                          "pane_get not found, still listed, process runs": "not dead", "pane_get fails, not not-found": "not dead", "row with no pane": "not dead"})
+                          "pane_get not found, still listed, process runs": "not dead", "pane_get fails, not not-found": "not dead", "listed, no recorded session": "not dead"})
 
-    def test_S9_exactly_the_three_cases_of_the_plan_differ(self):
-        rows = self.table()
-        differing = sorted(k for k, r in rows.items() if ("dead" in (r["old pane_state"], r["old loop"])) != (r["new daemon"] == "dead"))
+    def differing(self, loop_source=None):
+        rows = self.table(loop_source)
+        return sorted(k for k, r in rows.items() if ("dead" in (r["old pane_state"], r["old loop"])) != (r["new daemon"] == "dead"))
+
+    def test_S9_exactly_the_four_cases_of_the_plan_differ(self):
+        differing = self.differing()
         self.assertEqual(differing, sorted(CHANGED))
-        self.assertEqual(len(differing), 3)
+        self.assertEqual(len(differing), 4)
         doc = (BIN.parent / "docs" / "agent-registry.md").read_text().split("## One dead verdict", 1)[1].split("\n## ", 1)[0]
-        for phrase in ("cannot be read", "process that cannot be read", "pane_get"):
+        for phrase in ("cannot be read", "process that cannot be read", "pane_get", "no recorded session"):
             self.assertIn(phrase, doc)
+
+    # -- S13: the old deciders are the old source, executed
+    def test_S13_the_old_deciders_are_the_embedded_source_of_the_integration_tip_and_are_executed(self):
+        self.assertTrue(OLD_PANE_STATE.startswith("def pane_state(engine, name, session_id, pane, known_names=(), known_sessions=()):"))
+        self.assertIn("herdr has no pane %s", OLD_PANE_STATE)
+        self.assertNotIn("daemon_shows_absent", OLD_PANE_STATE + OLD_MISSING_DECISION)   # the OLD code: the one function is not in it
+        self.assertIn("#1066", OLD_MISSING_DECISION)
+        self.assertIs(type(exec_old(OLD_PANE_STATE, "pane_state")), type(lambda: 0))
+        self.assertIs(type(exec_old(OLD_LOOP_HEAD + OLD_MISSING_DECISION + OLD_LOOP_TAIL, "old_missing_decision")), type(lambda: 0))
+
+    def test_S13_mutant_the_hold_skipped_when_there_is_no_session_removed_changes_the_table_and_fails_S9(self):
+        self.assertEqual(self.differing(), sorted(CHANGED))   # control
+        skip, held = 'agents[name].get("pane") and agents[name].get("session"):', 'agents[name]["session"], engine.executable):'
+        self.assertEqual((OLD_MISSING_DECISION.count(skip), OLD_MISSING_DECISION.count(held)), (1, 1))   # applied once each
+        mutant = OLD_MISSING_DECISION.replace(skip, 'agents[name].get("pane"):').replace(held, 'agents[name]["session"], engine.executable) or not agents[name].get("session"):')
+        with self.assertRaises(AssertionError) as caught:
+            self.assertEqual(self.differing(mutant), sorted(CHANGED))
+        self.assertIn("listed, no recorded session", str(caught.exception))
 
     # -- S3: one function
     def test_S3_exactly_one_function_tests_the_evidence_keys_for_death_and_four_callers_reach_it(self):
