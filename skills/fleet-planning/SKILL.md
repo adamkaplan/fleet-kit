@@ -27,11 +27,11 @@ Receipt format: `docs/plan-template.md`.
    A work item with no Done-when of its own takes the Done-when of its parent ask (its native sub-issue parent): `plan check` and the structure gate (G0a) read it there, and a Done-when the work item carries itself must still match exactly.
    A pull request that proves only some of a plan's scenarios puts `CLAIMS: S3 S4 S5` directly under its `PLAN:` line: the proof gate (G1) counts only those, the others stay claimed by the epic, and a claim naming an undeclared scenario is refused (the union of claims is enforced at the ask's last merge). So every per-pull-request scenario must be claimed by some pull request (else the last merge is refused; a `CU` waiver passes).
 2. **Clauses to scenarios**: every clause needs a behaviour scenario (`S`); behaviour that must NOT change is a
-   `U` scenario. Each scenario has `covers` (`DW-n` or `PC-n`), `text` (Given/when/then), `proof` (`test | live | measure |
-   screenshot | review`; `review` quotes text), `pass` (a concrete observable: a status, a number, a quoted value), `discriminates` (the specific wrong
-   build that would FAIL it), `evaluator` (`ci | tester | reviewer | owner`, able to record that proof), and optionally
+   `U` scenario. Each has `covers` (`DW-n` or `PC-n`), `text` (Given/when/then), `proof` (`test | live | measure |
+   screenshot | review`; `review` quotes text), `pass` (a concrete observable: a status, a number, a quoted value), `discriminates` (the wrong
+   build that would FAIL it), `evaluator` (`ci | tester | reviewer | owner`, who records that proof), optionally
    `claim: epic` for what only an integrated head can prove (name the integration branch in the plan).
-   **Owner evaluators are rare**: only where the owner's own eyes are the test, proved once with `claim: epic`; never for a routine PR.
+   **Owner evaluators are rare**: only where the owner's eyes are the test, proved once with `claim: epic`; never for a routine PR.
 
    **Own measurement:** launch a tester of your lane (`--role tester --repo <the pull request's repo> --reports-to <you>`, headless) to re-measure and record; never record as yourself.
    An uncovered Done-when clause gets a new `S` scenario; never edit, reword or delete the clause.
