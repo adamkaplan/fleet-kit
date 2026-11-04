@@ -75,6 +75,20 @@ class TestPlanPinsSearch(Fixture):
         self.assertEqual(code, 2)
 
 
+class TestPlanPinsWords(Fixture):
+    def test_the_same_words_in_another_punctuation_are_found_and_the_edited_files_own_lines_are_not(self):
+        (self.root / "prose.md").write_text("The set is contents write, pull requests write, issues read and metadata read.\n")
+        git(self.root, "add", "prose.md")
+        git(self.root, "commit", "-qm", "prose")
+        old = '"contents": "write", "pull_requests": "write", "issues": "read", "metadata": "read"'
+        (self.root / "conf.txt").write_text("set = {%s}\nmutate(\"conf.txt\", '%s', 'x')\n" % (old, old))
+        git(self.root, "commit", "-qam", "conf")
+        code, out = self.run_tool([{"file": "conf.txt", "old": "set = {%s}" % old, "new": "set = {}"}], "--no-checks")
+        self.assertIn("prose.md:1: quote-words", out)
+        self.assertIn("conf.txt:2: mutant", out)
+        self.assertNotIn("conf.txt:1:", out)
+
+
 class TestPlanPinsChecks(Fixture):
     CHECKS = ["--check", "wired=python3 check_wired.py", "--check", "rebind=python3 check_rebind.py"]
 

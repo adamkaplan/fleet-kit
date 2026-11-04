@@ -6,11 +6,12 @@
 
 EDITS.json is a list of planned edits: [{"file": "...", "old": "exact old text", "new": "new text"}].
 
-Part 1, a search (nothing is run, nothing is written). Each line of a tracked file other than the edited one that is
+Part 1, a search (nothing is run, nothing is written). Each line of a tracked file that is not itself covered by an edit and that is
   quote    quotes the old text or one of its distinctive lines (a stripped line of 12 or more characters);
   digest   holds the SHA-256 of a changed file (the digest of the file as it is now);
-  count    holds a number equal to the row or entry count of the changed table (the run of `|` rows, `-` items or quoted
-           entries that holds the old text), with a word of rows or entries on the line and the table's name within 3 lines;
+  quote-words  the same words in another punctuation (prose that states a code set, a test that spells it as a tuple);
+  count    holds a number equal to the row or entry count of the changed table (the run of `|` or ` | `-separated rows, `-` items or quoted
+           entries that holds the old text), with a word of rows or entries (or `len(`) on the line and the table's name in the file's path or within 3 lines;
   mutant   passes the old text to a mutation helper (a call named mutat*, plant*, anchor or replace on the line or the 3 lines before).
 is printed as `file:line: kind: text`, one per line. A line that is a mutant is not also printed as a quote.
 
@@ -37,8 +38,27 @@ DEFAULT_CHECKS = [
     ("chain-time", "env -u PYTHONDONTWRITEBYTECODE python3 cloud/launcher/tests/test_chain_time.py"),
 ]
 MIN_LINE = 12
+MAX_FILES = 6
 MUTANT_CALL = re.compile(r"(mutat\w*|plant\w*|anchor\w*|replace)\s*\(", re.I)
-ROW_WORDS = re.compile(r"\b(rows?|entr(?:y|ies)|rules?|items?)\b", re.I)
+ROW_WORDS = re.compile(r"\b(rows?|entr(?:y|ies)|rules?|items?|actions?)\b|len\(", re.I)
+
+
+NGRAM = 6
+
+
+def words(text):
+    return re.sub(r"[^a-z0-9]+", " ", text.lower()).split()
+
+
+def grams(old):
+    """The word runs (6 words, or the whole line when it has 5) of each distinctive line of the old text, in a punctuation-blind form."""
+    out = set()
+    for ln in distinctive(old):
+        w = words(ln)
+        n = min(NGRAM, len(w))
+        if n >= 5:
+            out.update(" ".join(w[i:i + n]) for i in range(len(w) - n + 1))
+    return out
 
 
 class Bad(Exception):
@@ -85,6 +105,8 @@ def table_block(text, old):
             return "-"
         if s[:1] in "\"'":
             return "q"
+        if not s.startswith("#") and " | " in s:
+            return "|"
         return None
     k = kind(lines[n]) if n < len(lines) else None
     if not k:
@@ -121,14 +143,30 @@ def search(root, edits):
     quotes = []
     for e in edits:
         quotes.append((e["file"], e["old"], distinctive(e["old"])))
+    spans = {}   # an edited file: the line numbers its own edits cover (those are not "other" lines)
+    for e in edits:
+        text = read_text(root, e["file"])
+        a = text.find(e["old"])
+        first = text.count("\n", 0, a) + 1
+        spans.setdefault(e["file"], set()).update(range(first, first + e["old"].count("\n") + 1))
+    texts = {rel: read_text(root, rel) for rel in files}
+    common = set()   # a distinctive line found in more than MAX_FILES files is boilerplate, not a pin
+    for f, old, parts in quotes:
+        for part in parts:
+            if "\n" in old and sum(1 for t in texts.values() if t and part in t) > MAX_FILES:
+                common.add(part)
+    quotes = [(f, old, [x for x in parts if x not in common]) for f, old, parts in quotes]
+    allgrams = set()
+    for e in edits:
+        allgrams |= grams(e["old"])
     for rel in files:
-        if rel in edited:
-            continue
-        text = read_text(root, rel)
+        text = texts[rel]
         if text is None:
             continue
         lines = text.splitlines()
         for i, ln in enumerate(lines):
+            if i + 1 in spans.get(rel, ()):
+                continue
             hit = None
             for f, old, parts in quotes:
                 for p in ([old] if "\n" not in old and len(old.strip()) >= 1 else []) + parts:
@@ -137,9 +175,14 @@ def search(root, edits):
                         break
                 if hit:
                     break
+            if not hit and allgrams:
+                w = words(ln)
+                joined = " ".join(w)
+                if any(g in joined for g in allgrams):
+                    hit = "~"
             if hit:
                 ctx = "\n".join(lines[max(0, i - 3):i + 1])
-                kind = "mutant" if MUTANT_CALL.search(ctx) else "quote"
+                kind = "mutant" if MUTANT_CALL.search(ctx) else ("quote" if hit != "~" else "quote-words")
                 found.append((rel, i + 1, kind, ln.strip()))
                 continue
             for d, f in digests.items():
@@ -147,7 +190,7 @@ def search(root, edits):
                     found.append((rel, i + 1, "digest", ln.strip()))
             for n, f, names in counts:
                 if re.search(r"(?<![\w.])%d(?![\w.])" % n, ln) and ROW_WORDS.search(ln):
-                    near = "\n".join(lines[max(0, i - 3):i + 4])
+                    near = rel + "\n" + "\n".join(lines[max(0, i - 3):i + 4])
                     if any(nm and nm in near for nm in names):
                         found.append((rel, i + 1, "count", ln.strip()))
     return found
