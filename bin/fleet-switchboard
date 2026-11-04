@@ -19786,7 +19786,7 @@ def ci_record_core(ctx, now, quiet=False):
     "nothing" (CI is green but no per-PR scenario names `ci`), "not-green", "unreadable", "no-plan" or "no-head". It records
     only for a complete, green run at the PR's CURRENT head and the plan's CURRENT hash, never twice, and writes nothing to GitHub.
     `quiet` leaves the audit alone for everything but a real record (the pass runs this for many PRs: a failing run is not news)."""
-    out = {"status": None, "head": None, "ci": None, "scenarios": [], "recorded": [], "already": [], "why": None}
+    out = {"status": None, "head": None, "ci": None, "scenarios": [], "recorded": [], "already": [], "proved": [], "why": None}
     if ctx.unreadable:
         return dict(out, status="unreadable", why="the PR could not be read: %s" % ctx.unreadable)
     head = (ctx.facts or {}).get("head")
