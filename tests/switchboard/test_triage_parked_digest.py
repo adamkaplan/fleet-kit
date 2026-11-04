@@ -48,7 +48,7 @@ def build(Base, Digest, sb):
             self.assertEqual([k for k in self.engine.triage.facts if "summary" not in k], [])
             self.assertEqual([f for f in self.bound()() if f.kind == "triage" and "summary" not in f.key], [])
 
-        def test_s3_an_invalid_park_is_flagged_once_and_an_expired_park_is_judged_again(self):
+        def test_s3_an_invalid_park_is_flagged_once(self):
             self.add(152, created=5, updated=4, labels=["osuser:parked"], body="no date yet")
             self.passes(2)
             audit = [e for e in self.world.audit() if e["event"] == "triage.parked_invalid"]
@@ -107,7 +107,7 @@ def build(Base, Digest, sb):
             repo = Path(__file__).resolve().parents[2]
             test = "TestTriageParkedDigest.test_s2_a_validly_parked_item_is_never_repeated"
             call = "    triage_rejudge_facts(state, now)   # a digest still waiting"
-            with tempfile.TemporaryDirectory(dir="/tmp/opencode") as tmp:
+            with tempfile.TemporaryDirectory() as tmp:
                 copy = Path(tmp) / "copy"
                 shutil.copytree(repo, copy, ignore=shutil.ignore_patterns(".git", "__pycache__"))
                 run = lambda: subprocess.run([sys.executable, "bin/test-switchboard", test], cwd=copy, capture_output=True, text=True, timeout=600)
