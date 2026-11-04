@@ -5880,11 +5880,11 @@ def undecidable_streak(engine, name, agent):
         return False
     row = data.get(name) or {}
     passes = (row.get("passes") or 0) + 1 if row.get("pane") == agent["pane"] else 1
-    data[name] = {"pane": agent["pane"], "passes": passes}
-    _write_small(engine.state_dir, UNDECIDABLE_FILE, data)
-    if passes == PANE_MISSING_PASSES and engine.audit is not None:
+    if passes == PANE_MISSING_PASSES and engine.audit is not None:   # the line first: a raising append leaves the streak, so the next pass writes it (PC-9 a)
         engine.audit.append(engine.actor, "pane.undecidable", name, {"pane": agent["pane"], "passes": passes,
                                                                     "why": "listed pane with no recorded session: undecidable, not dead"})
+    data[name] = {"pane": agent["pane"], "passes": passes}
+    _write_small(engine.state_dir, UNDECIDABLE_FILE, data)
     return True
 
 
