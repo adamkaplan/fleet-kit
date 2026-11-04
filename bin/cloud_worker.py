@@ -838,7 +838,7 @@ def _launch(args, runner, now, reserve):
                 remove_record(state, name)
             raise
     _registry_note(engine, "upsert", state, name, {"session": session, "repo": repo, "role": args.role, "kind": "cloud", "run_id": run_id, "state": "working"})   # a cloud worker is an agent (#903)
-    _first_push()._watch_first_push(state, name, args, repo, branch, brief, now())   # #2057: the launch's watch for its checkpoint
+    _first_push()._watch_first_push(state, name, args, repo, branch, brief, now(), record.get("hard_deadline"))   # #2057: the launch's watch for its checkpoint
     print(json.dumps({"name": name, "session": session, "runtime_id": record["runtime_id"], "url": record["url"], "cloud": True}, sort_keys=True))
     return H["EXIT_OK"]
 

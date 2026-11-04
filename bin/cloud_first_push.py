@@ -15,7 +15,7 @@ H = {}   # the switchboard's own namespace (the same dict the cloud worker modul
 D: object   # the names that stayed in bin/cloud_worker.py, set by `_first_push()`
 
 
-def _watch_first_push(state, name, args, repo, branch, brief, moment):
+def _watch_first_push(state, name, args, repo, branch, brief, moment, hard=None):
     """Record the launch's watch (the pod, the orchestrator it reports to, the repository, the branch and the checkpoint time from --checkpoint or the
     brief's CHECKPOINT line, the data the local launch's reminders use) for the first-push notice. No orchestrator or no checkpoint: no watch. Never raises."""
     try:
@@ -28,7 +28,7 @@ def _watch_first_push(state, name, args, repo, branch, brief, moment):
             parsed = H["parse_checkpoint"](brief)
             at = moment + parsed[0] if parsed else None
         if at is not None:
-            record_first_push_watch(state, name, args.reports_to, repo, branch, at, moment)
+            record_first_push_watch(state, name, args.reports_to, repo, branch, at, moment, hard)
     except Exception as err:
         sys.stderr.write("%s: no first-push watch for %s (%s)\n" % (H["PROG"], name, D["_one"](str(err), 100)))
 
@@ -37,13 +37,14 @@ def _watch_first_push(state, name, args, repo, branch, brief, moment):
 # Its own record (a watch per pod, written at launch) and its own pass: NOT a reminder item.
 FIRST_PUSH_FILE = "first-push-watch.json"
 FIRST_PUSH_TIMEOUT = 20   # seconds for the one read of the remote
+FIRST_PUSH_MAX_FAILS = 30   # failed reads after which a watch closes with no notice: a repository the read cannot reach would else cost a 20 s timeout at every pass for ever
 FIRST_PUSH_REPO = re.compile(r"[A-Za-z0-9._-]{1,100}/[A-Za-z0-9._-]{1,100}")
 
 
-def record_first_push_watch(state_dir, pod, boss, repo, branch, checkpoint_at, launched):
+def record_first_push_watch(state_dir, pod, boss, repo, branch, checkpoint_at, launched, hard=None):
     """Remember the launch's watch: the pod, the orchestrator to tell, the repository and branch, the checkpoint time. One entry per pod."""
     def add(state):
-        state[pod] = {"boss": boss, "repo": repo, "branch": branch, "at": float(checkpoint_at), "launched": float(launched)}
+        state[pod] = {"boss": boss, "repo": repo, "branch": branch, "at": float(checkpoint_at), "launched": float(launched), "hard": hard}
         return state
     H["blocked_update"](state_dir, FIRST_PUSH_FILE, add)
 
@@ -72,6 +73,12 @@ def first_push_read(runner, repo, branch):
     return bool(head and head != heads["HEAD"])
 
 
+def _audit_closed(engine, pod, why):
+    """One audit line for a watch closed with no notice, saying why."""
+    if engine.audit is not None:
+        engine.audit.append(engine.actor, "first_push.closed", pod, {"why": why})
+
+
 def first_push_tick(engine, discovery=None):
     """One pass: for every watched pod whose checkpoint has passed and which is not closed, ONE `no first push` notice to its orchestrator when it
     has neither reported (last-reports.json, since the launch) nor pushed. A pod that reported or pushed is closed without a notice; a noticed pod
@@ -93,8 +100,18 @@ def first_push_tick(engine, discovery=None):
         if H["_is_number"](last) and H["_is_number"](entry.get("launched")) and last >= entry["launched"]:
             close(pod, "reported")
             continue
+        if D["_ended"]({"hard_deadline": entry.get("hard")}, now):
+            close(pod, "expired")   # the pod is gone by design: no read, no notice
+            _audit_closed(engine, pod, "its hard deadline has passed")
+            continue
         pushed = first_push_read(runner, entry.get("repo"), entry.get("branch"))
         if pushed is None:
+            fails = (entry["fails"] if isinstance(entry.get("fails"), int) else 0) + 1
+            if fails >= FIRST_PUSH_MAX_FAILS:
+                close(pod, "unreadable")
+                _audit_closed(engine, pod, "%d reads of the remote failed" % fails)
+            else:
+                H["blocked_update"](state_dir, FIRST_PUSH_FILE, lambda state: dict(state, **{pod: dict(state[pod], fails=fails)}) if isinstance(state.get(pod), dict) else None)
             continue
         if pushed:
             close(pod, "pushed")
@@ -152,7 +169,7 @@ def send_state(runner, name, record, cluster, clock=None):
     code, body, note = launcher_status_record(name, cluster)
     if code != 0 or not isinstance(body, dict):
         retired = "unknown worker" in (note or "")
-        line = "state of %s: running=unknown idle_deadline=unknown hard_deadline=%s last_event=unknown" % (name, record.get("hard_deadline") or "unknown")
+        line = "state of %s: running=unknown idle_deadline=unknown hard_deadline=%s last_event=unknown" % (name, _state_time(record.get("hard_deadline")) or "unknown")
         if retired:
             return line, "%s is retired or unknown to the launcher" % name
         return line, "the state of %s could not be read (%s)" % (name, D["_one"](D["_reason"](code, note) if code != 0 else "no answer", 100))

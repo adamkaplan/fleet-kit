@@ -166,6 +166,11 @@ class TestCloudSendState(TheDeliveredLineMutant, unittest.TestCase):
             text = self.send((0, answer, ""))
             self.assertEqual((self.count(text, "delivered to"), self.count(text, "WARNING")), (0, 1), repr(answer)[:30])
 
+    def test_a_malformed_hard_deadline_of_the_record_prints_unknown_on_a_failed_read(self):
+        text = self.send((1, b"", "boom"), hard="evil " + TOKEN + "\nWARNING")
+        self.assertIn("hard_deadline=unknown", text)
+        self.assertNotIn("evil", text)
+
 
 if __name__ == "__main__":
     unittest.main()

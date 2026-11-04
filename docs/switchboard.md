@@ -215,6 +215,7 @@ message. A `send` from another agent skips the batch.
   `state of <name>: running=yes|no idle_deadline=... hard_deadline=... last_event=...` (`last_event` is the last activity time when the
   session is idle, and `unknown` when it is busy or unreadable). For a pod past its hard deadline, retired, unknown or unread it prints a
   WARNING and not `delivered to <name>`; the message is still sent to the endpoint, so nothing is lost.
+  A busy pod has no `idle_since`, so its `idle_deadline` and `last_event` both read `unknown` while it is busy.
 - **Never typed.** The switchboard never calls `herdr agent prompt` and never
   writes into a pane's input box.
 - **A note that outlives your attention.** If 10 minutes pass with no prompt
