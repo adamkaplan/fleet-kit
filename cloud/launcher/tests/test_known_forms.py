@@ -297,7 +297,7 @@ class S5Week(unittest.TestCase):
     def test_control_and_mutant(self):
         top, bound, last = self.check(cw.KnownForms)
         print("S5 control: largest count %d, bound %d, %d passes, last %d" % (top, bound, 10080, last))
-        src = Mutants.SRC; old = "        if not pods:\n            with self._lock:\n                self._absent = set()\n            return 0\n"
+        src = Mutants.SRC; old = "        if not pods:\n            with self." + "_lock:\n                self._absent = set()\n            return 0\n"
         self.assertEqual(src.count(old), 1)
         mut = src.replace(old, "        if True:\n            return 0\n")
         self.assertNotEqual(mut, src)
