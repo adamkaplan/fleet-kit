@@ -116,8 +116,7 @@ class TestPinScanChecks(Fixture):
         self.assertNotIn("FAIL", out)
 
 
-class TestPinScanReaders(Fixture):
-    def test_a_planted_reader_fails_only_with_the_edit_and_an_old_failure_is_not_printed(self):
+    def test_s3_a_planted_reader_fails_only_with_the_edit_and_an_old_failure_is_not_printed(self):
         (self.root / "test_reads.py").write_text(
             "import unittest\n\nclass T(unittest.TestCase):\n    def test_reads_conf(self):\n"
             "        self.assertIn('row-three', open('conf.txt').read())\n\nunittest.main()\n")
