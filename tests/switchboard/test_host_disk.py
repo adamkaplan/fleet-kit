@@ -2,7 +2,10 @@
 import importlib.util
 import io
 import os
+import re
 import shutil
+import subprocess
+import sys
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -10,7 +13,7 @@ from unittest import mock
 from support.core import Base
 from support.herdr_world import World
 from support.loader import sb
-from support.paths import REPO
+from support.paths import BIN, REPO
 
 GB = 10 ** 9
 SMALL = shutil._ntuple_diskusage(1000 * GB, 995 * GB, 5 * GB)
@@ -126,15 +129,34 @@ class TestHostDisk(unittest.TestCase):
         self.assertEqual((result.failures, result.errors), ([], []))
         self.assertEqual(seen, {"quiet": (0, 0), "control": (1, 1)})
 
+    def _site_env(self):
+        site = case_tmp()
+        Path(site, "sitecustomize.py").write_text("import shutil\n_u = shutil._ntuple_diskusage(1000 * 10 ** 9, 995 * 10 ** 9, 5 * 10 ** 9)\nshutil.disk_usage = lambda path: _u\n")
+        return dict(PYTHONPATH=site + os.pathsep + os.environ.get("PYTHONPATH", ""), FLEET_HEAVY="off")
+
+    def _child(self, names):
+        done = subprocess.run([sys.executable, str(BIN / "test-switchboard")] + list(names), env=dict(os.environ, **self._site_env()), capture_output=True, text=True, timeout=840)
+        out = done.stdout + done.stderr
+        ran = re.findall(r"^Ran (\d+) tests? in ", out, re.M)
+        self.assertEqual(len(ran), 1, out[-400:])
+        self.assertGreater(int(ran[0]), 0, out[-400:])
+        self.assertEqual(re.findall(r"^(OK|FAILED)\b.*$", out, re.M)[-1:], ["OK"], out[-400:])
+        self.assertEqual(done.returncode, 0, out[-400:])
+
     def test_the_named_group_passes_with_the_host_at_5_gb(self):   # S3
-        import __main__ as runner   # the classes live in bin/test-switchboard; run in-process, no child
-        loader = unittest.TestLoader()
-        suite = unittest.TestSuite(loader.loadTestsFromTestCase(getattr(runner, name)) for name in NAMED)
+        runner = sys.modules["__main__"]
+        if not all(hasattr(runner, n) for n in NAMED):   # another loader: one child for the whole group
+            return self._child(NAMED)
+        suite = unittest.TestSuite(unittest.TestLoader().loadTestsFromTestCase(getattr(runner, n)) for n in NAMED)
         stream = io.StringIO()
-        with mock.patch.object(shutil, "disk_usage", lambda path: SMALL):
+        # env patched too, so every child the classes start inherits the 5 GB fake and FLEET_HEAVY=off
+        with mock.patch.object(shutil, "disk_usage", lambda path: SMALL), mock.patch.dict(os.environ, self._site_env()):
             result = unittest.TextTestRunner(stream=stream, verbosity=0).run(suite)
         out = stream.getvalue()
         self.assertGreater(result.testsRun, 0, out[-400:])
         self.assertEqual((result.failures, result.errors), ([], []), out[-400:])
         self.assertTrue(result.wasSuccessful(), out[-400:])
+        self.assertRegex(out, r"(?m)^OK\b")
 
+    def test_the_command_line_path_with_the_host_at_5_gb(self):   # S3: argv, one "Ran N", OK, exit 0
+        self._child(("TestDecorationIsAFact",))
