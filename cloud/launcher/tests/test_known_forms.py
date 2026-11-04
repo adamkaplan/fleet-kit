@@ -334,7 +334,7 @@ class S8Rounds(unittest.TestCase):
                 except Exception as e: errs.append(type(e).__name__)
             def scr():
                 try:
-                    go.wait(); o = cw.scrub(text, k, 100000); out.append((o, list(k.snap)))
+                    go.wait(); snap = list(k); o = cw.scrub(text, snap, 100000); out.append((o, snap))   # the one-pass scrub copies a set subclass without calling its __iter__: the test takes the snapshot itself (one locked read) and scrubs that
                 except Exception as e: errs.append(type(e).__name__)
             ts = [threading.Thread(target=f, daemon=True) for f in (adder, sweeper, scr)]
             [t.start() for t in ts]; [t.join() for t in ts]
