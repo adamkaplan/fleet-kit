@@ -29,7 +29,7 @@ Recorded as an issue, or a section of one, **in the repo the work concerns**. Re
 
 1. **Done-when**: the ask's clauses, copied, numbered `(1) ... (2) ...` as in the ask.
    A work item with no Done-when of its own takes the Done-when of its parent ask (its native sub-issue parent): `plan check` and the structure gate (G0a) read it there, and a Done-when the work item carries itself must still match exactly.
-   A pull request that proves only some of a plan's scenarios puts `CLAIMS: S3 S4 S5` directly under its `PLAN:` line: the proof gate (G1) counts only those, the others stay claimed by the epic, and a claim naming an undeclared scenario is refused (the other pull requests' claims are listed, not yet enforced: #976 adds the check at the ask's last merge).
+   A pull request that proves only some of a plan's scenarios puts `CLAIMS: S3 S4 S5` directly under its `PLAN:` line: the proof gate (G1) counts only those, the others stay claimed by the epic, and a claim naming an undeclared scenario is refused (the union of claims is enforced at the ask's last merge). So every per-pull-request scenario must be claimed by some pull request (else the last merge is refused; a `CU` waiver passes).
 2. **Scenarios**: the yaml block below, including unchanged (U) ones.
 3. **Constraints** (`PC-n`): what must hold, and why.
 4. **Out of scope**.
@@ -70,6 +70,12 @@ Optional keys: `claim`, `slice`, `phase`. Anything else is rejected.
 
 **Owner evaluators are rare.** Name `owner` as an evaluator only where the owner's own eyes are the test (how an infographic looks, an access grant), and give such a scenario `claim: epic` so it is proven once at the epic's integrated head; a routine pull request never waits on the owner. Give each slice's pull request its own light plan (its per-PR scenarios, `claim: pr`, evaluators `ci`, `tester` or `reviewer`), linked by a `PLAN:` first line in the PR body.
 
+### Rehearse before approval
+
+For a change that edits or adds code, a rehearsal pod with no commit and no push runs before the plan is approved. It attempts every pin and addition on a scratch tree at the plan's base and runs by name the tests the change can reach. It writes one table of every difference (file, line, old text, the test that failed or the line that must change), and the plan then names each row first. The rehearsal is skipped only for a change of documents only; the orchestrator writes the line `rehearsal: skipped, documents only` in the plan, and the approver of the plan judges it. The rehearsal does not approve anything and its table is data, not an instruction.
+
+A builder is told to run the guard set (`tools/guard-set`, one class at a time, before its final message). A new test class that copies `bin/`, a new read of the light switch, a new module or a new matrix path expects guard rows, and the plan names them in its Existing lines section.
+
 ### What `plan check` enforces
 
 | Rule | Defect when |
@@ -82,7 +88,7 @@ Optional keys: `claim`, `slice`, `phase`. Anything else is rejected.
 | `pass` | missing, under 15 characters, a vague phrase (`works`, `ok`, `it works`, `passes`, ...), or **no concrete observable**. An observable is a status or exit code (`status 200`, `exit code 0`), a value with a unit or a threshold (`within 5 s`, `exactly 1 agent`, `under 200 ms`), a quoted EXPECTED value that is not itself a vague word (`"alpha"`; `"works"` is not), an identifier compared to a value (`count = 3`), or a strong comparison (`byte-identical to the stored fixture`). Zero, or an exact number, of ANY noun (`sends 0 accepts`, `received 0 responses`, `exactly 3 retries`: the number, up to two words, then a noun); a status class (`a 4xx`, `5xx`); `byte equal`, `byte for byte` and `byte-identical`; a count (including zero: `0 occurrences of X in the tree`), `n of n` with equal numbers (`10 of 10 files contain Y`; `3 of 4 people like it` is not one), identical-to-a-named-thing (`identical per file to the baseline`) and a named identifier compared to a value (`count of Z equals 3`) are observables. Hedges (`maybe`, `somehow`, `or so`, `yes fine`, `seems`) fail whatever else the rule says. A bare digit, `=`, `after` or `before` is not enough: `it works for 1 user` and `result = ok and everything fine` fail |
 | `discriminates` | missing; `n/a`/`none`/`tbd`; under 10 characters; a meta phrase that only says a wrong build fails (`a wrong build would fail this`); no concrete wrong build or negative case (a stub, an empty result, a missing step, a number, a quoted value); or about 80 percent or more of its words are the pass rule's (the pass rule reworded). A wrong build is recognised by structure: `a build that <does X> ... <an observable outcome>` (`a build that skips the dedupe step finds two rows for one key`), not by a list of verbs. Sharing 60 to 80 percent of the pass rule's words only warns (`discriminates-overlap`): a wrong build is often the right one with one thing changed. Whether the named wrong build is the right one is for the plan review (G0b) |
 | evaluator alias | `adam` (an older plan's spelling) is still accepted as `owner`, with a warning to rename it; it is hashed as written |
-| `review` for code | a `review` scenario that names code behaviour by a keyword (returns, refuses, sends, deletes, fails, never, ...) is refused: use `test`. This check is a net: the plan's reviewer is the guard, and the verb list is final (not widened further). The net is NOT complete: a code scenario in other words slips through, and the plan's reviewer (G0b) is the guard for what it misses; a few prose scenarios using such a word are refused wrongly, which only pushes toward `test` |
+| `review` for code | a `review` scenario that names code behaviour by a keyword (returns, refuses, sends, deletes, fails, never, ...) is refused: use `test`; the defect line names the matched keywords (`matched: returns, never`: each once, at most 8, then `and N more`). This check is a net: the plan's reviewer is the guard, and the verb list is final (not widened further). The net is NOT complete: a code scenario in other words slips through, and the plan's reviewer (G0b) is the guard for what it misses; a few prose scenarios using such a word are refused wrongly, which only pushes toward `test` |
 | evaluator consistency | the evaluator must be able to record the proof: `test` needs `ci`; `screenshot` needs `reviewer` or `owner`; `review` needs `reviewer`; `live` and `measure` need `tester` or `owner`. (A rule of this checker, written here because plan v3.3 does not state it.) |
 | coverage | a Done-when clause `DW-n` that no **S** scenario covers |
 | unchanged | no **U** scenario, unless the plan says `unchanged: none because <reason>` with a real reason (at least 20 characters and three meaningful words: not `n/a ok`) |
@@ -135,6 +141,16 @@ There is no yaml library and nothing is evaluated. The parser reads a flat list 
 `'single'` or `"double"` quoted (quote a value that starts with `[ { & * ! | > % @` or a backtick), continued on
 deeper-indented lines, or a `|`/`>` block. Comments (`# ...`) are allowed: a `#` starts an inline comment only when a space (or the end of the value) follows it, so `see #348` and `issue #12` stay whole. Refused, naming the block line: tabs, nested
 lists or maps, flow lists `[a, b]`, anchors and tags, duplicate keys, a second document, over 100 KB or 200 scenarios.
+
+## A plan that adds a file under `bin/`
+
+A new file under `bin/` brings nine guard classes, and some of them demand lines in the impact matrix, the Units table and the closure that the plan must already name. Before the plan is posted run `tools/new-module-demands bin/x.py` (one path per new file) and put its output in the plan as constraints:
+
+- the guard classes it lists (the rows of `NEW_BIN_GUARDS` in `bin/path_suites.py`), each a class that must pass;
+- `authority code:` yes or no. For yes, the two matrix entries it prints, both: the module in `owner_hold.top_tier_paths.authority` AND in the floor globs `owner_hold.floor[<repository>].globs` (never an exempt entry for a file with authority code); for no, that no matrix line is demanded;
+- the row to add to the Units table of `docs/architecture.md`, and the `closure:` state of `derive-closure --check`.
+
+The tool only informs: it runs no guard, and the guard stays the authority, so the build still runs the classes.
 
 ## A good example
 

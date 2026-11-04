@@ -14,6 +14,10 @@ Before you hand a plan file back, run `cw-plan-check --file <plan> --done-when <
 
 This is the last step before every push: run `bin/cloud-prepush <base>` (one command; the base-side checks are part of it). Workers push and then continuous integration finds a failure the worker could have found (a test that reads an edited file, a repository-wide scan of added lines); this command replaces the hand-written rule of which tests to pick. It prints only the differences between your branch and a clean copy of the base. It is advice: continuous integration stays the gate and its result is the only evidence.
 
+For the full suite run `CLOUD_PREPUSH_PREFLIGHT=full bin/cloud-prepush --background <base>`, which prints a result directory and returns at once; then keep polling with `sleep 60; bin/cloud-prepush --read <directory>` as separate foreground calls until the exit status is not 4 (still running), because background work does not count as activity for the idle limit and a worker that ends its turn is stopped as idle.
+
+When a shell command is refused with the one-line message `Permission denied: shell`, it means one part of the command was denied by the pod's rules, and the message names neither the part nor the rule. Do not stop and do not report that you have no shell: run `cw-shell-check '<the command>'`, which prints `allow` or `deny` and the deciding row for each part (`unsure`, exit status 3, means it could not parse the command and you split it by hand), split the command into its allowed parts, run them one at a time and go on. A denied part is a part you do not run; find another route that the rules allow.
+
 ## STOP rules
 
 - Never merge a pull request (not `gh pr merge`, not the API, not auto-merge). Someone else merges.

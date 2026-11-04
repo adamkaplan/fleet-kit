@@ -25,11 +25,11 @@ Receipt format: `docs/plan-template.md`.
 
 1. **Done-when**: copy the ask's clauses, numbered `(1) ... (2) ...`. They are the authority; never reword them.
    A work item with no Done-when of its own takes the Done-when of its parent ask (its native sub-issue parent): `plan check` and the structure gate (G0a) read it there, and a Done-when the work item carries itself must still match exactly.
-   A pull request that proves only some of a plan's scenarios puts `CLAIMS: S3 S4 S5` directly under its `PLAN:` line: the proof gate (G1) counts only those, the others stay claimed by the epic, and a claim naming an undeclared scenario is refused (the other pull requests' claims are listed, not yet enforced: #976 adds the check at the ask's last merge).
-2. **Clauses to scenarios**: every clause needs at least one behaviour scenario (`S`); behaviour that must NOT change is a
+   A pull request that proves only some of a plan's scenarios puts `CLAIMS: S3 S4 S5` directly under its `PLAN:` line: the proof gate (G1) counts only those, the others stay claimed by the epic, and a claim naming an undeclared scenario is refused (the union of claims is enforced at the ask's last merge). So every per-pull-request scenario must be claimed by some pull request (else the last merge is refused; a `CU` waiver passes).
+2. **Clauses to scenarios**: every clause needs a behaviour scenario (`S`); behaviour that must NOT change is a
    `U` scenario. Each scenario has `covers` (`DW-n` or `PC-n`), `text` (Given/when/then), `proof` (`test | live | measure |
    screenshot | review`; `review` quotes text), `pass` (a concrete observable: a status, a number, a quoted value), `discriminates` (the specific wrong
-   build that would FAIL it), `evaluator` (`ci | tester | reviewer | owner`, able to record that proof), and optionally
+   build that would FAIL it), `evaluator` (`ci | tester | reviewer | owner`), and optionally
    `claim: epic` for what only an integrated head can prove (name the integration branch in the plan).
    **Owner evaluators are rare**: only where the owner's own eyes are the test, proved once with `claim: epic`; never for a routine PR.
 
@@ -40,7 +40,11 @@ Receipt format: `docs/plan-template.md`.
 4. **Out of scope**, **areas touched** (and whether any is held-PR), **risks and rollback**, **open questions**, **size and
    tier**, and **the integration-branch decision** (stay on main, or `integration/<epic-slug>`).
    **Size** is a T-shirt in AGENT time, never human-days: S under 1 hour, M a few hours, L about a day, XL several days, each with what makes it that
-   size. Never pick the smaller option for less work when a larger one simplifies the system. Put `plan-format: 2` and a `size:` line in the plan; `plan check` flags a missing size and days for work under L (a light plan may carry `size: S`).
+   size. Never pick the smaller option when a larger one simplifies the system. Put `plan-format: 2` and a `size:` line in the plan; `plan check` flags a missing size and days for work under L (a light plan may carry `size: S`).
+
+## Rehearse before approval
+
+A code change gets a no-commit rehearsal pod first: see `docs/plan-template.md` and `fleet-switchboard rehearse -h`.
 
 ## Check it
 
@@ -62,10 +66,10 @@ chosen per item. Up to three rounds; a standing objection then goes to the Chief
 ## What the reviewers attack
 
 - **Requirements and coverage**: a Done-when clause with no scenario; vague words; a missing unchanged-behaviour scenario.
-- **Scenario adversary**: a bad build that passes every scenario (an empty or stubbed implementation); an undecidable pass rule; an evaluator who cannot record the proof.
-- **Risk and security**: no rollback or a half-applied state; a contract change; a held-PR area; who can forge a verdict.
+- **Scenario adversary**: a bad build that passes every scenario; an undecidable pass rule; an evaluator who cannot record the proof.
+- **Risk and security**: no rollback or half-applied state; a contract change; a held-PR area; a forgeable verdict.
 - **Scope and what-not-how**: a step that dictates the design; no out-of-scope; creep; overlap with another plan.
-- **Cost and sequencing**: a smaller plan that meets the same Done-when; order and parallelism; an unwarranted integration branch.
+- **Cost and sequencing**: a smaller plan with the same Done-when; order and parallelism; an unwarranted branch.
 - **The owner's view**: would the owner be surprised; does it solve the asked problem.
 
 ## Good and bad
