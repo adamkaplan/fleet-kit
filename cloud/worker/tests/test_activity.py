@@ -25,6 +25,12 @@ class Activity(unittest.TestCase):
         with open(self.pwfile, "w") as f:
             f.write("synthetic-password\n")
         self.log = os.path.join(self.tmp.name, "stub.log")
+        from unittest import mock
+        self.emptyproc = tempfile.TemporaryDirectory(dir=os.environ.get("CW_TMPDIR"))
+        self.addCleanup(self.emptyproc.cleanup)
+        envpatch = mock.patch.dict(os.environ, {"CW_ACTIVITY_UNDER_TEST": "1", "CW_ACTIVITY_PROC": self.emptyproc.name})
+        envpatch.start()
+        self.addCleanup(envpatch.stop)
 
     def serve(self, mode="ok"):
         port = stub_support.free_port()
