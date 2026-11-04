@@ -312,6 +312,31 @@ class TestSummary(Base):
         self.assertEqual(sb.load_module("cloud_worker").SNAPSHOT_SECONDS, real)
 
 
+    def test_the_new_test_fails_on_a_copy_without_the_cleanup(self):
+        """The mutant: a copy of this file with the three cleanup lines of setUp removed makes the new test fail; the unmutated copy passes."""
+        src = open(os.path.join(HERE, "test_cloud_status_summary.py")).read()
+        lines = (
+            '        module = self.cloud()   # the module is shared between tests: a test that shortens the bound must not leave it shortened\n'
+            '        saved = module.SNAPSHOT_SECONDS\n'
+            '        self.addCleanup(setattr, module, "SNAPSHOT_SECONDS", saved)\n'
+        )
+        self.assertEqual(src.count(lines), 1)
+        mutated = src.replace(lines, "")
+        self.assertNotEqual(mutated, src)   # applied: computed from the two texts
+        target = "TestSummary.test_a_test_that_shortens_the_bound_leaves_the_real_bound_to_the_next"
+        env = {k: v for k, v in os.environ.items() if k != "PYTHONDONTWRITEBYTECODE"}
+        results = {}
+        for name, text in (("control", src), ("mutant", mutated)):
+            with tempfile.TemporaryDirectory(dir=HERE) as d:
+                copy = os.path.join(d, "mutcopy_" + name + ".py")
+                with open(copy, "w") as f:
+                    f.write(text.replace("HERE = os.path.dirname(os.path.abspath(__file__))", "HERE = %r" % HERE))
+                results[name] = subprocess.run([sys.executable, copy, target], capture_output=True, text=True, timeout=90, env=env)
+        self.assertEqual(results["control"].returncode, 0, results["control"].stderr)
+        self.assertNotEqual(results["mutant"].returncode, 0)
+        self.assertIn("AssertionError: 1 != 30", results["mutant"].stderr)
+
+
 class TestHostileCluster(Base):
     """A node label or a pod phase is the cluster's word, printed to a person: none of its control bytes may reach the status output."""
 
