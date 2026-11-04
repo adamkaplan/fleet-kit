@@ -27,11 +27,11 @@ Receipt format: `docs/plan-template.md`.
    A work item with no Done-when of its own takes the Done-when of its parent ask (its native sub-issue parent): `plan check` and the structure gate (G0a) read it there, and a Done-when the work item carries itself must still match exactly.
    A pull request that proves only some of a plan's scenarios puts `CLAIMS: S3 S4 S5` directly under its `PLAN:` line: the proof gate (G1) counts only those, the others stay claimed by the epic, and a claim naming an undeclared scenario is refused (the union of claims is enforced at the ask's last merge). So every per-pull-request scenario must be claimed by some pull request (else the last merge is refused; a `CU` waiver passes).
 2. **Clauses to scenarios**: every clause needs a behaviour scenario (`S`); behaviour that must NOT change is a
-   `U` scenario. Each scenario has `covers` (`DW-n` or `PC-n`), `text` (Given/when/then), `proof` (`test | live | measure |
-   screenshot | review`; `review` quotes text), `pass` (a concrete observable: a status, a number, a quoted value), `discriminates` (the specific wrong
-   build that would FAIL it), `evaluator` (`ci | tester | reviewer | owner`), and optionally
+   `U` scenario. Each has `covers` (`DW-n` or `PC-n`), `text` (Given/when/then), `proof` (`test | live | measure |
+   screenshot | review`; `review` quotes text), `pass` (a concrete observable: a status, a number, a quoted value), `discriminates` (the wrong
+   build that would FAIL it), `evaluator` (`ci | tester | reviewer | owner`, who records that proof), optionally
    `claim: epic` for what only an integrated head can prove (name the integration branch in the plan).
-   **Owner evaluators are rare**: only where the owner's own eyes are the test, proved once with `claim: epic`; never for a routine PR.
+   **Owner evaluators are rare**: only where the owner's eyes are the test, proved once with `claim: epic`; never for a routine PR.
 
    **Own measurement:** launch a tester of your lane (`--role tester --repo <the pull request's repo> --reports-to <you>`, headless) to re-measure and record; never record as yourself.
    An uncovered Done-when clause gets a new `S` scenario; never edit, reword or delete the clause.
@@ -50,17 +50,17 @@ A code change gets a no-commit rehearsal pod first: see `docs/plan-template.md` 
 
 `fleet-switchboard plan check <owner/repo#N> [--ask <owner/repo#N>] [--json]` prints `PASS` or `FAIL`, one defect per line,
 and the plan hash (editing anything changes it). Before sending a draft, run `plan check --file <plan> --done-when <the
-issue's Done-when>` (the issue body needs `## Intent` before `Done when:`; format 2 needs a `clauses:` and a `scenarios:` yaml block) and fix every defect.
+issue's Done-when>` (`## Intent` before `Done when:`, which may be a numbered list; format 2: `clauses:`, `scenarios:` yaml blocks) and fix every defect.
 
 ## The form
 
-Put it in the repo the work concerns. **a short issue body** (outcome, Done-when, link to the
+**An issue body** (outcome, Done-when, link to the
 detail) plus **one detail comment** whose first line is a heading containing `Plan (scenarios)`: the plan text and the
 `scenarios:` yaml block. The latest such comment counts. One plan per ask; sections for work items.
 
 ## Challenge it
 
-A `plan review` command launches independent read-only reviewers and records their verdicts (not built yet: ask the Chief of Staff for a hand-run review). The tier is computed from the ask or epic the plan serves, not
+A `plan review` command launches read-only reviewers and records their verdicts (not built yet: ask the Chief of Staff for a hand-run review). The tier is computed from the ask or epic the plan serves, not
 chosen per item. Up to three rounds; a standing objection then goes to the Chief of Staff, then the owner.
 
 ## What the reviewers attack
@@ -94,6 +94,8 @@ scenarios:
     evaluator: ci
 ```
 
+the input is missing, corrupt or unreadable: the output says so and the last good output is kept
+
 Bad: `pass: works`, `discriminates: a wrong build would fail this`, "add a `commission()` method" (how).
 
 ## Wordings `plan check` accepts
@@ -106,7 +108,7 @@ Bad: `pass: works`, `discriminates: a wrong build would fail this`, "add a `comm
 
 ## After the plan
 
-Link it in every brief (`PLAN: <link>`). The worker proves each scenario with `fleet-switchboard prove S1 --pr <pr>
+The worker proves each scenario with `fleet-switchboard prove S1 --pr <pr>
 --evidence <link-or-what-you-ran>`, an evaluator records `verdict`, and `fleet-switchboard gates <pr>` shows what is still
 open. The order does not matter: a coder's only extra step is `prove`. A push voids every proof and
 verdict. The Chief of Staff may waive a hotfix, logged; the plan is then due within a day.

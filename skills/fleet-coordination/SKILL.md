@@ -20,7 +20,7 @@ Write GitHub text so a person can read it: short paragraphs, real Markdown lists
 ## The brief
 
 Send one self-contained brief at dispatch. Later updates can be shorthand; the
-first one cannot.
+first one cannot. Write the brief with a quoted heredoc (`<<'E'`) or a file, never an unquoted one: a backtick or a dollar sign in an unquoted brief is run by the shell.
 
 ```text
 ISSUE:      <full repository-qualified GitHub issue URL>
@@ -40,6 +40,8 @@ A pull request for an ask, or for a work item with a live check, says `Refs #N`,
 A brief for a change that adds a file under `bin/` carries the output of `tools/new-module-demands bin/x.py` (the guard classes, the matrix entries, the units row, the closure state): the tool informs, the guards decide.
 
 Every builder brief carries the builder checklist below by default; a brief that leaves an item out says why in one line.
+
+A brief says `run the guard set` (`tools/guard-set` prints the commands, from `docs/guard-set.json`): the builder runs them one class at a time before its final message.
 
 ## Builder checklist
 
