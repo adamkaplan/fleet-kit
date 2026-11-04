@@ -290,7 +290,7 @@ def check_total_deadline(module, test):
         finally:
             sock.close()
         test.assertTrue(buf.split(b"\r\n")[0].endswith(b"408 Request Timeout"), buf)
-        test.assertLess(time.time() - t0, 5.0)
+        test.assertLess(time.time() - t0, 3.0)
         test.assertEqual(s.inbox.items, {})
 
 
