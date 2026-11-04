@@ -4,6 +4,7 @@
 Offline: fake token commands are small scripts in a temp dir, the clock is a list, GitHub is a loopback fake. The old behaviour is the old
 git_token, kept below as text (a scratch module outside the repository). The launcher's twin (run_git_token_cmd) gets the same cases.
 """
+import pathlib
 import contextlib
 import http.server
 import importlib.util
@@ -51,7 +52,7 @@ def plain_capture(argv, env=None, **kw):
 def load_bin(src_text=None):
     mod = types.ModuleType("git_token_retry_bin")
     mod.__file__ = os.path.join(ROOT, "bin", "cloud_worker.py")
-    exec(compile(src_text or open(BIN_SRC).read(), mod.__file__, "exec"), mod.__dict__)
+    exec(compile(src_text or pathlib.Path(BIN_SRC).read_text(), mod.__file__, "exec"), mod.__dict__)
     mod._capture = plain_capture
     mod.H["_one_line"] = lambda text, limit=300: text[:limit]
     return mod
@@ -264,10 +265,10 @@ class TestMutants(unittest.TestCase):
         for name, old, new, cls in MUTANTS:
             scratch = tempfile.mkdtemp(prefix="git-token-mutant-")
             self.addCleanup(shutil.rmtree, scratch, True)
-            src = open(os.path.join(ROOT, "bin", "cloud_worker.py")).read()
+            src = pathlib.Path(os.path.join(ROOT, "bin", "cloud_worker.py")).read_text()
             self.assertEqual(src.count(old), 1, name)
             path = os.path.join(scratch, "cloud_worker.py")
-            open(path, "w").write(src.replace(old, new))
+            pathlib.Path(path).write_text(src.replace(old, new))
             applied += 1
             p = stub_support.start(self, [sys.executable, "-m", "unittest", "test_git_token_retry." + cls], cwd=HERE,
                                    env=dict(os.environ, GIT_TOKEN_RETRY_BIN=path), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -283,7 +284,7 @@ class TestDocs(unittest.TestCase):
         phrases = ("exits with status 75 for a passing failure", "retries the command only on status 75", "A custom token command is retried only when it exits with 75")
         found = 0
         for rel in ("cloud/launcher/README.md", "docs/cloud-worker-interface.md"):
-            text = " ".join(open(os.path.join(ROOT, rel)).read().split())
+            text = " ".join(pathlib.Path(os.path.join(ROOT, rel)).read_text().split())
             found += sum(p in text for p in phrases)
         self.assertEqual(found, 6)
         print("S8: %d of 3 sentences found" % (found // 2))
@@ -350,11 +351,11 @@ class TestCopyMutants(unittest.TestCase):
             scratch = tempfile.mkdtemp(prefix="git-token-copy-mutant-")
             self.addCleanup(shutil.rmtree, scratch, True)
             real = os.path.join(ROOT, "bin", "cloud_worker.py") if copy == "bin" else os.path.join(ROOT, "cloud", "launcher", "cloud_worker.py")
-            src = open(real).read()
+            src = pathlib.Path(real).read_text()
             self.assertEqual(src.count(old), 1, name)
             path = os.path.join(scratch, "cloud_worker.py")
-            open(path, "w").write(src.replace(old, new))
-            self.assertIn(new, open(path).read())
+            pathlib.Path(path).write_text(src.replace(old, new))
+            self.assertIn(new, pathlib.Path(path).read_text())
             applied += 1
             p = stub_support.start(self, [sys.executable, "-m", "unittest", "test_git_token_retry." + cls], cwd=HERE,
                                    env=dict(os.environ, **{var: path}), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)

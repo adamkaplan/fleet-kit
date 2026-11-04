@@ -54,6 +54,11 @@ V2_LIGHT_OFF = ("the person's last prompt as a background read (the read before 
                 "report-answered checks", "brief scan")
 SENT_KEYS_FILE = "sent-keys.json"
 SENT_PER_SESSION, SENT_SESSIONS = 400, 200   # the ledger's bounds
+# A key delivered to a session is not trimmed while a fact carrying it can still be offered (ask #2094): the longest offer life is a held
+# triage digest's 48 h, plus 1 h; younger keys than this before the session's newest key stay, whatever their count.
+SENT_MIN_AGE = 49 * 3600.0
+SENT_HARD_PER_SESSION = 6000   # 48 h of the chattiest session with margin: the age floor never grows a session beyond this
+SENT_HARD_TOTAL = 30000        # across sessions (about 1.6 MB, under SENT_FILE_MAX): oldest first
 SENT_FILE_MAX = 4 * 1024 * 1024   # a ledger of that many keys is under 2 MB; a bigger file is not one
 
 
@@ -115,10 +120,21 @@ class SentLedger:
                 sessions, unknown = self.load()
                 change(sessions, unknown)
                 # Only `sessions` is trimmed: an unknown-fate reservation is what says "do not send again", so it stays (bounded by SENT_FILE_MAX)
+                young = {}   # the age floor: keys within SENT_MIN_AGE of the session's newest are put back after the count trim below
+                for sid, mine in sessions.items():
+                    newest = max(mine.values() or [0])
+                    young[sid] = {k: v for k, v in mine.items() if v > newest - SENT_MIN_AGE}
                 for mine in sessions.values():
                     if len(mine) > SENT_PER_SESSION:
                         for key, _ in sorted(mine.items(), key=lambda kv: kv[1])[:len(mine) - SENT_PER_SESSION]:
                             del mine[key]
+                for sid, mine in young.items():
+                    if sid in sessions:
+                        mine = dict(sorted(mine.items(), key=lambda kv: kv[1], reverse=True)[:SENT_HARD_PER_SESSION])
+                        sessions[sid].update(mine)
+                everything = sorted(((v, sid, k) for sid, mine in sessions.items() for k, v in mine.items()), reverse=True)
+                for _, sid, k in everything[SENT_HARD_TOTAL:]:
+                    del sessions[sid][k]
                 for sid in [sid for sid, mine in sessions.items() if not mine]:
                     del sessions[sid]
                 if len(sessions) > SENT_SESSIONS:
