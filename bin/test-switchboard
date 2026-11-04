@@ -66026,6 +66026,8 @@ _bin_set_table = importlib.import_module("test_bin_set_table")
 TestTheBinSetClassesAreAllInTheTable = _bin_set_table.TestTheBinSetClassesAreAllInTheTable
 # The heavy wrapper's progress line (#1762).
 TestHeavyProgress = importlib.import_module("test_heavy_progress").TestHeavyProgress
+# The shard tests (#2108).
+TestShards = importlib.import_module("test_shards").TestShards
 # The pod niceness tests (#1794).
 TestPodNiceness = importlib.import_module("test_pod_niceness").TestPodNiceness
 # The split of the heavy wrapper into a part (#2034).
@@ -66403,8 +66405,20 @@ class TestSupportRebinding(unittest.TestCase):
 
 def main(argv):
     watch_parent()
+    shard = None
+    if "--shard" in argv:   # --shard I/N: run only shard I of N (tools/test-shards)
+        at = argv.index("--shard")
+        shard = argv[at + 1]
+        argv = argv[:at] + argv[at + 2:]
     loader = unittest.TestLoader()
     suite = loader.loadTestsFromModule(sys.modules[__name__])
+    if shard is not None:
+        _spec = importlib.util.spec_from_file_location("test_shards", str(Path(__file__).resolve().parents[1] / "tools" / "test-shards"),
+                                                       loader=importlib.machinery.SourceFileLoader("test_shards", str(Path(__file__).resolve().parents[1] / "tools" / "test-shards")))
+        _shards = importlib.util.module_from_spec(_spec)
+        _spec.loader.exec_module(_shards)
+        shard_i, shard_n = _shards.parse_shard(shard)
+        suite = _shards.select(suite, shard_i, shard_n)
     if argv:
         keep = unittest.TestSuite()
         for group in suite:
@@ -66428,6 +66442,8 @@ def main(argv):
           % (result.testsRun, passed, len(result.failures), len(result.errors), len(result.skipped)))
     print("=" * 70)
     ok = result.wasSuccessful() and result.testsRun > 0
+    if shard is not None:
+        print("shard %d/%d" % (shard_i, shard_n))
     print("RESULT: %s" % ("PASS" if ok else "FAIL"))
     return 0 if ok else 1
 
