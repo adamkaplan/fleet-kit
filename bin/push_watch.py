@@ -103,9 +103,20 @@ def _read_launcher(sb, path, state, parse_iso):
         if not isinstance(item, dict) or not isinstance(item.get("worker"), str) or item.get("ok") is not True:
             continue
         ts = parse_iso(item.get("ts")) if isinstance(item.get("ts"), str) else None
-        table = {"stop": "stopped", "report": "reported", "send": "reported"}.get(item.get("action"))
+        table = {"stop": "stopped", "report": "reported", "send": "reported", "create": "created"}.get(item.get("action"))
         if ts is not None and table:
-            state[table][item["worker"]] = max(ts, state[table].get(item["worker"], 0))
+            state.setdefault(table, {})[item["worker"]] = max(ts, state.get(table, {}).get(item["worker"], 0))
+    for worker, made in state.get("created", {}).items():   # a name created again after its stop (names are reused) is watched again
+        if state["stopped"].get(worker, 0) and made > state["stopped"][worker]:
+            state["stopped"].pop(worker)
+        if worker in state["reported"] and state["reported"][worker] < made:
+            state["reported"].pop(worker)
+
+
+def _is_limit(err):
+    """A rate limit: the whole number 429 (not inside a sha or a longer number), or the words 'rate limit'."""
+    text = str(err).lower()
+    return bool(re.search(r"(?<![0-9a-zA-Z])429(?![0-9a-zA-Z])", text)) or "rate limit" in text
 
 
 def _dicts(result):
@@ -116,8 +127,11 @@ def _dicts(result):
     return out
 
 
-def item_text(worker, branch, sha, commit, kind="push", quiet=None, pushed_at=None):
+def item_text(worker, branch, sha, commit, kind="push", quiet=None, pushed_at=None, made=None):
     """The item text from a commit read. Only subject, counts and three paths are taken from it."""
+    if kind == "quiet" and made is not None:   # the commit is much older than the first sight (a restart): both times are stated
+        return "[push watch] %s pushed %s, first seen at %s (commit made %s), and has been quiet for %d minutes (branch %s)." % (
+            _clean(worker, 80), sha[:8], _hms(pushed_at), _hms(made), quiet, _clean(branch, 120))
     if kind == "quiet":
         return "[push watch] %s pushed %s at %s and has been quiet for %d minutes (branch %s)." % (
             _clean(worker, 80), sha[:8], _hms(pushed_at), quiet, _clean(branch, 120))
@@ -148,7 +162,7 @@ def run_pass(sb, engine, now, gh, config=None, launcher_audit=None):
     state = _load(sb, path)
     if _CORRUPT:
         engine.audit.append(engine.actor, "push_watch.load_failed", None, {"why": "the state file is not readable JSON: starting from an empty state"})
-    for key in ("stopped", "reported"):
+    for key in ("stopped", "reported", "created"):
         state.setdefault(key, {})
     _read_launcher(sb, launcher_audit or os.environ.get("CW_CLOUD_AUDIT") or os.path.join(
         os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"), "cw-cloud", "audit.jsonl"), state, sb.parse_iso)
@@ -164,14 +178,19 @@ def run_pass(sb, engine, now, gh, config=None, launcher_audit=None):
         try:
             return raw_gh(path_)
         except Exception as err:
-            text_ = str(err).lower()
-            if any(k in text_ for k in ("403", "429", "rate limit")):
+            if _is_limit(err):
                 limited.append(1)
                 engine.audit.append(engine.actor, "push_watch.rate_limited", None, {"why": sb._one_line(str(err), 160)})
             elif "/compare/" in path_:
                 cmpfail.append(path_)
                 engine.audit.append(engine.actor, "push_watch.compare_failed", None, {"why": sb._one_line(str(err), 160)})
-                return raw_gh("repos/%s/commits/%s" % (path_.split("/compare/")[0].split("repos/", 1)[1], path_.rsplit("...", 1)[1]))
+                try:
+                    return raw_gh("repos/%s/commits/%s" % (path_.split("/compare/")[0].split("repos/", 1)[1], path_.rsplit("...", 1)[1]))
+                except Exception as err2:
+                    if _is_limit(err2):   # the tip read hit the rate limit: the pass stops
+                        limited.append(1)
+                        engine.audit.append(engine.actor, "push_watch.rate_limited", None, {"why": sb._one_line(str(err2), 160)})
+                    raise
             raise
 
     live = sorted(n for n, r in records.items() if isinstance(r.get("repo"), str) and not state["stopped"].get(n, 0))
@@ -235,8 +254,9 @@ def run_pass(sb, engine, now, gh, config=None, launcher_audit=None):
                 if not mem.get("failed"):
                     mem["failed"] = True
                     engine.audit.append(engine.actor, "push_watch.read_failed", name, {"why": sb._one_line(str(err), 160)})
-        if not failed:
+        if not failed and not mem.get("cmpfailed"):
             mem.pop("failed", None)
+        mem.pop("cmpfailed", None)
         for branch, sha in sorted(tips.items()):
             if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{40}", sha):
                 continue
@@ -245,6 +265,7 @@ def run_pass(sb, engine, now, gh, config=None, launcher_audit=None):
                 continue
             prev = b.get("sha")
             del cmpfail[:]
+            made, skip = None, False
             try:
                 if prev:   # every new commit since the last sha: ONE compare read, the newest COMMITS_MAX
                     data = (_dicts(gh("repos/%s/compare/%s...%s" % (repo, prev, sha))) or [{}])[0]
@@ -254,11 +275,17 @@ def run_pass(sb, engine, now, gh, config=None, launcher_audit=None):
                 else:
                     commit = (_dicts(gh("repos/%s/commits/%s" % (repo, sha))) or [{}])[0]
                     batch, stats = [(sha, commit)], commit
+                    inner = commit.get("commit") if isinstance(commit.get("commit"), dict) else {}
+                    for who in ("committer", "author"):
+                        when = (inner.get(who) or {}).get("date") if isinstance(inner.get(who), dict) else None
+                        made = sb.parse_iso(when) if isinstance(when, str) else None
+                        if made is not None:
+                            break
             except Exception as err:
-                if cmpfail and not limited:   # the compare and the tip read both failed: the sha advances anyway (never retried), audited once as compare_failed
-                    b["told"] = (b["told"] + [sha])[-TOLD_MAX:]
-                    b["sha"], b["at"], b["quiet"] = sha, now, True
-                else:
+                if cmpfail and not limited:   # both reads failed: the sha stays unseen (retried at the next pass), audited once per worker
+                    mem["cmpfailed"] = True
+                    skip, mem["failed"] = mem.get("failed"), True
+                if not skip and not limited:
                     engine.audit.append(engine.actor, "push_watch.read_failed", name, {"why": sb._one_line(str(err), 160)})
                 continue
             unsent = False
@@ -278,11 +305,14 @@ def run_pass(sb, engine, now, gh, config=None, launcher_audit=None):
                 continue
             b["told"] = (b["told"] + [sha])[-TOLD_MAX:]
             b["sha"], b["at"], b["quiet"] = sha, now, False
+            b.pop("made", None)
+            if made is not None and now - min(made, now) > 2 * cfg["interval"]:
+                b["made"] = min(made, now)
         for branch, b in mem.get("branches", {}).items():
             minutes = (now - b.get("at", now)) / 60.0
             if b.get("sha") and not b.get("quiet") and state["reported"].get(name, 0) <= b.get("at", 0) and minutes >= cfg["quiet_minutes"]:
                 n_before = len(sent)
-                tell(lane, item_text(name, branch, b["sha"], {}, "quiet", int(minutes), b["at"]), name)
+                tell(lane, item_text(name, branch, b["sha"], {}, "quiet", int(minutes), b["at"], b.get("made")), name)
                 if len(sent) == n_before:   # a failed send leaves it unmarked: retried at the next pass
                     continue
                 b["quiet"] = True   # marked only after a successful send: once per sha

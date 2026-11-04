@@ -1,51 +1,7 @@
 """Shared fakes and helpers of bin/test-switchboard (moved text, unchanged): scenario_roles."""
-import argparse
-import ast
-import traceback
-import base64
-import calendar
-import collections
-import contextlib
-import errno
-import copy
-import datetime as _dt
-import fcntl
-import gzip
-import fnmatch
-import hashlib
-import hmac
-import importlib.machinery
-import importlib.util
-import inspect
-import http.client
-import io
-import itertools
-import select
-import json
 import os
-from pathlib import Path
-import re
-from urllib.parse import unquote
-import shlex
-import shutil
-import textwrap
-import zipfile
-import signal
-import socket
-import stat
-import tarfile
-import subprocess
-import sys
 import sysconfig
-import tempfile
-import threading
-import time
-import types
-import unittest
-import uuid
-import urllib.parse
-from unittest import mock
-from support.paths import BIN, REPO
+from support.paths import REPO
 from support.orders_and_adapters import report
 
 
@@ -111,7 +67,7 @@ AGENT_FILES = tuple(sorted((REPO / "agents" / "opencode").glob("*.md"))
 # `pr-state`: coder +1 line +140 B, orchestrator +1 line +120 B: the one sentence that sends an agent to the daemon's cache instead of a GitHub polling loop
 # #401 slice 1: the one-sentence GitHub writing rule in its own short section: coder +4 lines +226 B, orchestrator +2 lines +220 B (the wider runtime's file sets each limit)
 # #341: the one never-`git stash` sentence (the files sat at their caps): coder +86 B, orchestrator +60 B, no new line
-ROLE_BYTE_LIMITS = {"coder": 8585, "orchestrator": 11290, "chief-of-staff": 12097, "cos-subagent": 3500}
+ROLE_BYTE_LIMITS = {"coder": 8585, "orchestrator": 11290, "chief-of-staff": 12092, "cos-subagent": 3500}
 
 
 WORKER_ROLES = ("coder", "cos-subagent")  # PR 8: the roles that do an assignment, not a judgement of others

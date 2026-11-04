@@ -1,5 +1,6 @@
 """Ask #1484: a cloud worker that ended its turn and waits tells its recorded boss, once per turn end. Offline: a fake activity source, a fake send,
 a scratch state directory. Mutants are the module's text changed in memory, asserted applied."""
+import pathlib
 import json, os, shutil, stat, sys, tempfile, types, unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -97,7 +98,7 @@ class TestTurnEnd(World):
 
     def test_s4_it_shares_the_state_file_keys_and_bound_of_the_alert(self):
         self.turn_end()
-        data = json.load(open(self.state))
+        data = json.loads(pathlib.Path(self.state).read_text())
         self.assertEqual(data["sent"], [["w1@500", "turn_end"]])
         self.assertEqual(stat.S_IMODE(os.stat(self.state).st_mode), 0o600)
         with open(SOURCE) as f:
@@ -177,7 +178,7 @@ class FinishPassMutant(unittest.TestCase):
         import subprocess
         sys.path.insert(0, os.path.join(ROOT, "cloud", "worker", "tests"))
         import stub_support
-        src = open(os.path.join(ROOT, "bin", "fl" + "eet-switchboard")).read()
+        src = pathlib.Path(os.path.join(ROOT, "bin", "fl" + "eet-switchboard")).read_text()
         good = ('        engine._failed("cloud-turn-end", "cloud-turn-end", err, report)\n    try:\n        lost_worker_tick(engine, discovery)')
         bad = ('        engine._failed("cloud-turn-end", "cloud-turn-end", err, report)\n        lost_worker_tick(engine, discovery)')
         applied = src.count(good) == 1
@@ -185,7 +186,7 @@ class FinishPassMutant(unittest.TestCase):
         scratch = tempfile.mkdtemp(prefix="fp1-mutant-")
         self.addCleanup(shutil.rmtree, scratch, True)
         path = os.path.join(scratch, "fl" + "eet-switchboard")
-        open(path, "w").write(src.replace(good, bad))
+        pathlib.Path(path).write_text(src.replace(good, bad))
         p = stub_support.start(self, [sys.executable, "-m", "unittest", "test_cloud_turn_end.FinishPass"], cwd=HERE,
                                env=dict(os.environ, FP1_ENTRY=path), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         p.communicate(timeout=90)
