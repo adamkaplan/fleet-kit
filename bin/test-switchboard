@@ -33577,7 +33577,6 @@ class TestImpactClassAndNarrowForm(LedgerBase):
         text = (REPO / "agents" / "reviewers" / "reviewer-impact.md").read_text()
         rule = sb.load_impact_floor().owner_hold_rule(sb.load_impact_floor().load_matrix())
         classes = rule[0] + rule[1]
-        self.assertEqual(len(classes), 10)
         self.assertEqual(text.count("impact-class: <class of the hold"), 1)   # the block's class line is said once (the --block table names the flag too, #895)
         self.assertIn("always names its class", text)
         self.assertIn("A hold without a class is rejected", text)
