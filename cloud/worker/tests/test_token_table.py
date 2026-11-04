@@ -1,4 +1,4 @@
-"""#1031: the token table (cloud/token-table.txt) is ONE data table. Each of its 18 actions has one test row here that fails when the
+"""#1031: the token table (cloud/token-table.txt) is ONE data table. Each of its 19 actions has one test row here that fails when the
 row changes (action, token, deciding permission or status), the README and the worker prompt carry exactly the rendering of the file,
 and the docs say plainly what is a boundary and what is a convenience. Regenerate the two renderings with:
     python3 cloud/worker/tests/test_token_table.py --write
@@ -85,11 +85,11 @@ def write_renderings():
 class TokenTable(unittest.TestCase):
     def test_S2_exactly_eighteen_rows_each_with_all_four_fields(self):
         rs = rows()
-        self.assertEqual(len(rs), 18)
+        self.assertEqual(len(rs), 19)
         for r in rs:
             self.assertEqual(len(r), 4, r)
             self.assertTrue(all(x for x in r), r)
-        self.assertEqual(len({r[0] for r in rs}), 18)
+        self.assertEqual(len({r[0] for r in rs}), 19)
 
     def test_values_are_in_their_vocabulary(self):
         for r in rows():
