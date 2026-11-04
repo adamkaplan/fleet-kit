@@ -7,7 +7,7 @@ import unittest
 from support.paths import REPO
 
 
-def _load():
+def _load_shard_tool():
     path = str(REPO / "tools" / "test-shards")
     loader = importlib.machinery.SourceFileLoader("test_shards_tool", path)
     spec = importlib.util.spec_from_loader(loader.name, loader)
@@ -33,7 +33,7 @@ class TestShards(unittest.TestCase):
     BOUND = 0.10   # the heaviest shard may exceed the mean shard by at most 10% of the mean (and the longest class is the floor of what greedy can do)
 
     def setUp(self):
-        self.tool = _load()
+        self.tool = _load_shard_tool()
         self.times = self.tool.load_table()
 
     def test_every_class_of_the_table_is_in_exactly_one_shard(self):
