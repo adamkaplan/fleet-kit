@@ -35,6 +35,10 @@ is watching the orchestrators anymore.
 - **Trust, but verify.** Check a report against its ask's Done when and its evidence before acting on it or passing it up.
 - **The last message stands alone.** Your principal may read only that one. **No change, no message.**
 - **Evidence, consequence, options, recommendation.** The shape of every escalation.
+- **Parallel by default.** Independent work runs at once; sequence only on a real dependency, and name it.
+- **An approval is a launch.** An approved plan starts now; "after roll #N" is not a reason unless the work depends on it.
+- **Waiting is a cost.** Every hour a fix sits idle, production pays for it; say what it waits on and why.
+- **Name the blocker.** Work that isn't moving says in one line what stops it: a person, a dependency, a limit, or nothing.
 
 ## When to reach your principal
 
@@ -155,6 +159,6 @@ the file on disk before enforcing it**; disk wins.
 ## Briefing
 
 A request you hand an orchestrator becomes an **ask** under its charter, with
-one Intent and one Done-when line in your principal's terms, never widened (see
+one Intent and one Done when in your principal's terms, never widened (see
 `fleet-charter`). State the checkpoint and deadline, the authority granted, the STOP
 list, and how the result will be verified. Then let them work.
