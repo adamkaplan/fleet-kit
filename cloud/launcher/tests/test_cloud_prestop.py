@@ -1,5 +1,6 @@
 """Ask #1142: the pod's pre-stop hook (cw-prestop / cw-end-hook --prestop). Fake cluster = run the rendered spec's own command."""
 import argparse, datetime as dt, importlib.machinery, importlib.util, os, re, shutil, subprocess, sys, tempfile, time, unittest
+import pathlib
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
@@ -42,7 +43,7 @@ class Base(unittest.TestCase):
         self.helper = os.path.join(self.helper_dir, "git-credential-cw")
         os.makedirs(self.helper_dir)
         # a fake pod helper that records every call; the password is a fake assembled here
-        open(self.helper, "w").write("#!/bin/sh\ncat >> %s/helper.log\necho \"$1\" >> %s/helper.log\nprintf 'username=x\\npassword=%s\\n'\n"
+        pathlib.Path(self.helper).write_text("#!/bin/sh\ncat >> %s/helper.log\necho \"$1\" >> %s/helper.log\nprintf 'username=x\\npassword=%s\\n'\n"
                                      % (self.t, self.t, "pw-" + "fake"))
         os.chmod(self.helper, 0o755)
         self.opts = " ".join(cw_end_hook.safe_opts(self.helper))
@@ -53,7 +54,7 @@ class Base(unittest.TestCase):
         sh("git", "clone", "-q", self.origin, self.work)
         for k, v in (("user.name", "t"), ("user.email", "t@invalid")):
             sh("git", "-C", self.work, "config", k, v)
-        open(os.path.join(self.work, "a.txt"), "w").write("a")
+        pathlib.Path(os.path.join(self.work, "a.txt")).write_text("a")
         sh("git", "-C", self.work, "add", "-A")
         sh("git", "-C", self.work, "commit", "-qm", "base")
         sh("git", "-C", self.work, "push", "-q", "origin", "HEAD:main")
@@ -75,7 +76,7 @@ class Base(unittest.TestCase):
         to a file:// prefix and its helper directory to the fake one. The real hook reads neither from the environment, so the agent cannot."""
         n = len([f for f in os.listdir(self.t) if f.startswith("seam-")])
         path = os.path.join(self.t, "seam-%d.py" % n)
-        open(path, "w").write(
+        pathlib.Path(path).write_text(
             "#!%s\nimport importlib.util, importlib.machinery, sys\nsp = importlib.util.spec_from_loader('end_hook_under_test', importlib.machinery.SourceFileLoader('end_hook_under_test', %r))\n"
             "m = importlib.util.module_from_spec(sp)\nsp.loader.exec_module(m)\nm.HOST_URL = %r\nm.HELPER_DIR = %r\n"
             "import os\nif os.path.exists(%r):\n    m.GIT_BIN = %r\n"   # the logging fake git of a test, when the test made one
@@ -93,11 +94,11 @@ class Base(unittest.TestCase):
 
     def hook(self, budget="20", **kw):
         p = subprocess.run(["sh", PRESTOP, budget], env=self.env(**kw), capture_output=True, text=True, timeout=30)
-        p.stdout += open(self.out).read() if os.path.exists(self.out) else ""
+        p.stdout += pathlib.Path(self.out).read_text() if os.path.exists(self.out) else ""
         return p
 
     def dirty(self, name="work.txt"):
-        open(os.path.join(self.work, name), "w").write("x")
+        pathlib.Path(os.path.join(self.work, name)).write_text("x")
 
     def wip(self):
         p = subprocess.run([GIT, "-C", self.origin, "rev-parse", "--verify", "-q", "refs/heads/w1/wip"], capture_output=True, text=True)
@@ -106,7 +107,7 @@ class Base(unittest.TestCase):
     def fake_git(self, body):
         real = GIT
         path = os.path.join(self.bin, "git")
-        open(path, "w").write("#!/bin/sh\n" + body.replace("REAL", real))
+        pathlib.Path(path).write_text("#!/bin/sh\n" + body.replace("REAL", real))
         os.chmod(path, 0o755)
 
 
@@ -118,15 +119,15 @@ class Hook(Base):
         self.assertEqual(p.returncode, 0)
         self.assertEqual(self.wip(), sh("git", "-C", self.work, "rev-parse", "HEAD"))
         self.assertNotIn(".env", sh("git", "-C", self.origin, "ls-tree", "-r", "--name-only", "w1/wip"))
-        pushes = [l for l in open(os.path.join(self.t, "calls")) if " push " in " " + l]
+        pushes = [l for l in pathlib.Path(os.path.join(self.t, "calls")).read_text().splitlines(True) if " push " in " " + l]
         self.assertEqual(len(pushes), 1)
         self.assertEqual(pushes[0].strip(), "-C %s %s push %s" % (self.work, self.opts, self.refspec))   # exact: no force, no lease, no other refspec
 
     def test_clean_tree_or_no_repository_does_nothing(self):
         self.fake_git('echo "$@" >> %s/calls\nexec REAL "$@"\n' % self.t)
         p = self.hook()
-        self.assertEqual((p.returncode, p.stdout + p.stderr), (0, ""))
-        self.assertFalse([l for l in open(os.path.join(self.t, "calls")) if " push " in " " + l])
+        self.assertEqual((p.returncode, p.stdout + p.stderr), (0, "cw-prestop: nothing to push\n"))   # #1579: one line (was: no output)
+        self.assertFalse([l for l in pathlib.Path(os.path.join(self.t, "calls")).read_text().splitlines(True) if " push " in " " + l])
         p = self.hook(CW_WORKDIR=os.path.join(self.t, "nothing"))   # no repository: one line now (see EarlyReturns), never a push
         self.assertEqual(p.returncode, 0)
         self.assertEqual(len(p.stdout.strip().splitlines()), 1)
@@ -168,7 +169,7 @@ class Hook(Base):
         tok = "tk-" + "planted" + "-value"
         self.dirty()
         canary = os.path.join(self.t, "server-password")
-        open(canary, "w").write("x"); os.chmod(canary, 0)
+        pathlib.Path(canary).write_text("x"); os.chmod(canary, 0)
         p = self.hook(CW_TOKEN=tok)
         self.assertNotIn(tok, p.stdout + p.stderr)
         self.assertEqual(p.returncode, 0)
@@ -177,12 +178,12 @@ class Hook(Base):
 
 def mutant_hook(dst, how):
     """A copy of the hook that takes the branch from an argument or an environment variable and does not validate."""
-    s = open(HOOK).read()
+    s = pathlib.Path(HOOK).read_text()
     old = 'os.environ.get("CW_WORKER", "")\n    if not valid_worker(worker):'
     assert old in s
     new = {"arg": '(sys.argv[2:3] or [os.environ.get("CW_WORKER", "")])[0]\n    if False:',
            "env": 'os.environ.get("CW_WIP_NAME") or os.environ.get("CW_WORKER", "")\n    if False:'}[how]
-    open(dst, "w").write(s.replace(old, new))
+    pathlib.Path(dst).write_text(s.replace(old, new))
 
 
 class Refspec(Base):
@@ -196,7 +197,7 @@ class Refspec(Base):
     def pushes(self):
         if not os.path.exists(self.calls):
             return []
-        return [l.strip() for l in open(self.calls) if " push " in " " + l]
+        return [l.strip() for l in pathlib.Path(self.calls).read_text().splitlines(True) if " push " in " " + l]
 
     def run_hook(self, hook, args=(), **kw):
         return subprocess.run([self.seam(hook), "--prestop", *args], env=self.env(**kw), capture_output=True, text=True, timeout=30)
@@ -257,9 +258,9 @@ class Refspec(Base):
 
 
 def mutate(dst, old, new):
-    s = open(HOOK).read()
+    s = pathlib.Path(HOOK).read_text()
     assert old in s, old
-    open(dst, "w").write(s.replace(old, new))
+    pathlib.Path(dst).write_text(s.replace(old, new))
 
 
 class Hostile(Base):
@@ -270,9 +271,9 @@ class Hostile(Base):
         self.marker = os.path.join(self.t, "marker")
         self.calls = os.path.join(self.t, "calls")
         script = os.path.join(self.t, "evil")
-        open(script, "w").write("#!/bin/sh\necho ran >> %s\nexit 1\n" % self.marker)
+        pathlib.Path(script).write_text("#!/bin/sh\necho ran >> %s\nexit 1\n" % self.marker)
         os.chmod(script, 0o755)
-        open(os.path.join(self.work, ".gitattributes"), "w").write("*.txt diff=evil\n")
+        pathlib.Path(os.path.join(self.work, ".gitattributes")).write_text("*.txt diff=evil\n")
         sh("git", "-C", self.work, "add", ".gitattributes"); sh("git", "-C", self.work, "commit", "-qm", "attr")
         sh("git", "-C", self.work, "push", "-q", self.origin, "HEAD:refs/heads/main")
         hooks = os.path.join(self.work, ".git", "hooks")
@@ -288,7 +289,7 @@ class Hostile(Base):
         self.fake_git('echo "$@" >> %s\nexec REAL "$@"\n' % self.calls)
 
     def pushes(self):
-        return [l.strip() for l in open(self.calls) if " push " in " " + l] if os.path.exists(self.calls) else []
+        return [l.strip() for l in pathlib.Path(self.calls).read_text().splitlines(True) if " push " in " " + l] if os.path.exists(self.calls) else []
 
     def run_hook(self, hook):
         return subprocess.run([self.seam(hook), "--prestop"], env=self.env(), capture_output=True, text=True, timeout=30)
@@ -338,7 +339,7 @@ class Hostile(Base):
         for name, (old, new) in muts.items():
             mut = os.path.join(self.t, "mut-" + name)
             mutate(mut, old, new)
-            self.assertNotEqual(open(mut).read(), open(HOOK).read(), name)   # the mutation applied
+            self.assertNotEqual(pathlib.Path(mut).read_text(), pathlib.Path(HOOK).read_text(), name)   # the mutation applied
             with self.subTest(mutant=name):
                 if name == "origin-check":
                     sh("git", "-C", self.work, "config", "remote.origin.url", "https://github.com/other-org/elsewhere.git")
@@ -403,14 +404,14 @@ class Grammar(Base):
         self.calls = os.path.join(self.t, "calls")
         self.envlog = os.path.join(self.t, "envlog")
         self.script = os.path.join(self.t, "script")
-        open(self.script, "w").write("#!/bin/sh\necho ran >> %s\nexit 1\n" % self.marker)
+        pathlib.Path(self.script).write_text("#!/bin/sh\necho ran >> %s\nexit 1\n" % self.marker)
         os.chmod(self.script, 0o755)
         self.host = "file://%s/" % self.t
         self.other = "file://%s/other-remote/" % self.t
         self.inc = os.path.join(self.t, "included")
-        open(self.inc, "w").write('[url "%s"]\n\tinsteadOf = %s\n\tpushInsteadOf = %s\n' % (self.other, self.host, self.host))
+        pathlib.Path(self.inc).write_text('[url "%s"]\n\tinsteadOf = %s\n\tpushInsteadOf = %s\n' % (self.other, self.host, self.host))
         self.cfg = os.path.join(self.work, ".git", "config")
-        self.plain = open(self.cfg).read()
+        self.plain = pathlib.Path(self.cfg).read_text()
         self.base_head = sh("git", "-C", self.work, "rev-parse", "HEAD")
         self.fake_git('echo "$@" >> %s\n{ echo "ARGS $@"; env | sort; echo "HOMEFILES $(ls -A "$HOME" | wc -l | tr -d " ")"; echo; } >> %s\nexec REAL "$@"\n'
                       % (self.calls, self.envlog))
@@ -422,13 +423,13 @@ class Grammar(Base):
         return [(cls, self.fill(k), self.fill(v)) for cls, rows in GRAMMAR.items() for k, v in rows]
 
     def calls_list(self):
-        return [l.strip() for l in open(self.calls)] if os.path.exists(self.calls) else []
+        return [l.strip() for l in pathlib.Path(self.calls).read_text().splitlines(True)] if os.path.exists(self.calls) else []
 
     def reset(self):
         for f in (self.calls, self.envlog, self.marker, os.path.join(self.t, "helper.log")):
             if os.path.exists(f):
                 os.remove(f)
-        open(self.cfg, "w").write(self.plain)
+        pathlib.Path(self.cfg).write_text(self.plain)
         for r in sh("git", "-C", self.origin, "for-each-ref", "--format=%(refname)").split():
             if r != "refs/heads/main":
                 sh("git", "-C", self.origin, "update-ref", "-d", r)
@@ -467,7 +468,7 @@ class Grammar(Base):
 
     def snapshot(self):
         """argv of every call and the environment of every call without the per-run values."""
-        env = [l for l in open(self.envlog).read().splitlines()
+        env = [l for l in pathlib.Path(self.envlog).read_text().splitlines()
                if not l.startswith(("HOME=", "PWD=", "OLDPWD=", "SHLVL=", "_="))]
         return self.calls_list(), env
 
@@ -598,12 +599,12 @@ class Grammar(Base):
         }
         for name, (scenario, edits) in muts.items():
             mut = os.path.join(self.t, "mut-" + name.replace(" ", "-"))
-            s = open(HOOK).read()
+            s = pathlib.Path(HOOK).read_text()
             for old, new in edits:
                 self.assertIn(old, s, name)
                 s = s.replace(old, new)
-            self.assertNotEqual(s, open(HOOK).read())   # the mutation applied
-            open(mut, "w").write(s)
+            self.assertNotEqual(s, pathlib.Path(HOOK).read_text())   # the mutation applied
+            pathlib.Path(mut).write_text(s)
             with self.subTest(mutant=name):
                 with self.assertRaises(AssertionError):
                     getattr(self, "scenario_" + scenario)(mut)
@@ -612,7 +613,7 @@ class Grammar(Base):
     def test_the_seam_is_not_reachable_from_the_environment(self):
         self.assertEqual(cw_end_hook.HOST_URL, "https://github.com/")
         self.assertEqual(cw_end_hook.HELPER_DIR, "/run/cw-tmp/bin")
-        code = [l for l in open(HOOK).read().splitlines() if not l.lstrip().startswith("#")]
+        code = [l for l in pathlib.Path(HOOK).read_text().splitlines() if not l.lstrip().startswith("#")]
         for name in ("HOST_URL", "HELPER_DIR"):
             self.assertEqual([l for l in code if l.startswith(name + " =")], [l for l in code if l.startswith(name + " =")][:1])
             self.assertFalse([l for l in code if name in l and "environ" in l])
@@ -679,13 +680,13 @@ class Completeness(Base):
 
     def setUp(self):
         super().setUp()
-        self.plain = open(os.path.join(self.work, ".git", "config")).read()
+        self.plain = pathlib.Path(os.path.join(self.work, ".git", "config")).read_text()
         self.ctx = cw_end_hook.Ctx(self.helper)
         self.addCleanup(self.ctx.close)
         self.ctx.env["PATH"] = "/usr/bin:/bin"
 
     def doc_keys(self):
-        keys = [l.strip() for l in open(KEYS_FIXTURE) if l.strip() and not l.startswith("#")]
+        keys = [l.strip() for l in pathlib.Path(KEYS_FIXTURE).read_text().splitlines(True) if l.strip() and not l.startswith("#")]
         live = subprocess.run([GIT, "help", "-c"], capture_output=True, text=True)
         if live.returncode == 0 and live.stdout.strip():
             keys += [l.strip() for l in live.stdout.splitlines() if l.strip()]   # a newer git in the image adds its own keys
@@ -731,7 +732,7 @@ class Completeness(Base):
         return path
 
     def test_a_wildcard_in_the_allow_list_is_caught(self):
-        s = open(HOOK).read()
+        s = pathlib.Path(HOOK).read_text()
         for old, new in (("ALLOWED_KEYS = {", 'ALLOWED_KEYS = {"gc.recentobjectshook", '),):
             self.assertIn(old, s)
         mut = s.replace("ALLOWED_KEYS = {", 'ALLOWED_KEYS = {"gc.recentobjectshook", ')
@@ -773,7 +774,7 @@ class EarlyReturns(Base):
         # a linked worktree or a separate git directory: .git is a FILE
         work = os.path.join(self.t, "linked")
         sh("git", "-C", self.work, "worktree", "add", "-q", "--detach", work)
-        open(os.path.join(work, "w.txt"), "w").write("x")
+        pathlib.Path(os.path.join(work, "w.txt")).write_text("x")
         self.assertTrue(os.path.isfile(os.path.join(work, ".git")))
         p = self.run_main(CW_WORKDIR=work)
         self.one_line(p, ".git is a file: a linked worktree or a separate git directory is not supported); work left in %s" % work)
@@ -794,7 +795,7 @@ class EarlyReturns(Base):
 
     def test_names_only_and_at_most_fifty(self):
         for i in range(60):
-            open(os.path.join(self.work, "f%02d.txt" % i), "w").write("SECRET-CONTENT")
+            pathlib.Path(os.path.join(self.work, "f%02d.txt" % i)).write_text("SECRET-CONTENT")
         sh("git", "-C", self.work, "config", "core.sshCommand", "false")
         p = self.run_main()
         self.one_line(p, "(+10 more)")
@@ -828,7 +829,7 @@ class EarlyReturns(Base):
     def test_a_mutant_finding_git_by_path_fails_with_the_guard(self):
         self.guard_on_path()
         self.dirty()
-        s = open(HOOK).read()
+        s = pathlib.Path(HOOK).read_text()
         self.assertIn("[GIT_BIN, ", s)
         mut = os.path.join(self.t, "mut-pathgit")
         with open(mut, "w") as f:
@@ -838,10 +839,10 @@ class EarlyReturns(Base):
         self.assertEqual(self.wip(), "")
 
     def test_a_mutant_that_returns_silently_is_caught(self):
-        s = open(HOOK).read()
+        s = pathlib.Path(HOOK).read_text()
         mut = os.path.join(self.t, "mut-silent")
-        open(mut, "w").write(s.replace('return report(workdir, "the pod\'s credential helper was not found")', "return 0"))
-        self.assertNotEqual(open(mut).read(), s)
+        pathlib.Path(mut).write_text(s.replace('return report(workdir, "the pod\'s credential helper was not found")', "return 0"))
+        self.assertNotEqual(pathlib.Path(mut).read_text(), s)
         self.dirty()
         p = subprocess.run([self.seam(mut, helper_dir=os.path.join(self.t, "nowhere")), "--prestop"], env=self.env(), capture_output=True, text=True)
         with self.assertRaises(AssertionError):
@@ -856,8 +857,8 @@ class AutoGc(Base):
         self.marker = os.path.join(self.t, "gcmarker")
         cfg = os.path.join(self.work, ".git", "config")
         if not hasattr(self, "plain_cfg"):
-            self.plain_cfg = open(cfg).read()
-            open(script, "w").write("#!/bin/sh\necho ran >> %s\nexit 1\n" % self.marker)
+            self.plain_cfg = pathlib.Path(cfg).read_text()
+            pathlib.Path(script).write_text("#!/bin/sh\necho ran >> %s\nexit 1\n" % self.marker)
             os.chmod(script, 0o755)
             # loose (unreachable) objects so that an auto-gc has a reason to run: gc.auto=1 fires at more than one loose object in objects/17
             n, d = 0, os.path.join(self.work, ".git", "objects", "17")
@@ -900,8 +901,8 @@ class AutoGc(Base):
 
     def variant(self, text, name):
         mut = os.path.join(self.t, "mut-" + name)
-        open(mut, "w").write(text)
-        self.assertNotEqual(text, open(HOOK).read(), name)
+        pathlib.Path(mut).write_text(text)
+        self.assertNotEqual(text, pathlib.Path(HOOK).read_text(), name)
         if os.path.exists(self.marker):
             os.remove(self.marker)
         self.dirty()
@@ -913,7 +914,7 @@ class AutoGc(Base):
         return ran
 
     def test_mutants_wildcard_restored_and_gc_pin_removed_are_caught(self):
-        s = open(HOOK).read()
+        s = pathlib.Path(HOOK).read_text()
         check = "if key not in ALLOWED_KEYS and not BRANCH_RE.match(key):"
         pin = '"gc.auto=0", '
         self.assertIn(check, s)
@@ -948,7 +949,7 @@ class LaunchSequence(Base):
                 sh("git", "-C", work, "checkout", "-q", "-b", branch)
                 sh("git", "-C", work, "config", "user.name", "worker")
                 sh("git", "-C", work, "config", "user.email", "worker@users.noreply.github.com")
-                open(os.path.join(work, "n.txt"), "w").write("n")
+                pathlib.Path(os.path.join(work, "n.txt")).write_text("n")
                 sh("git", "-C", work, "add", "n.txt")
                 sh("git", "-C", work, "commit", "-qm", "c")
                 sh("git", "-C", work, "push", "-q", "-u", "origin", branch)
@@ -995,7 +996,7 @@ class Spec(unittest.TestCase):
 
     def test_the_refusal_text_names_the_recovery_route(self):
         self.assertIn("recover read-only", cw.RECOVERY_ROUTE)
-        src = open(os.path.join(LAUNCHER, "cloud_worker.py")).read()
+        src = pathlib.Path(os.path.join(LAUNCHER, "cloud_worker.py")).read_text()
         self.assertIn("RECOVERY_ROUTE)", src)
 
 

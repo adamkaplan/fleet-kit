@@ -1,4 +1,5 @@
 """Slice S3 (#638): the run record (S5, U2) and the report path (S6). Offline: the fake kubectl and the stub server."""
+import pathlib
 import base64
 import json
 import os
@@ -317,7 +318,7 @@ class Record(td.Driver):
         else:
             self.stub_env(STUB_MESSAGES_RAW=raw)
             self.create_with_secrets()
-            open(self.stub_log + ".m", "w").write("x")   # the first message read is the driver's poll: the record's is the second
+            pathlib.Path(self.stub_log + ".m").write_text("x")   # the first message read is the driver's poll: the record's is the second
             code, out, err = self.run_cli("stop", "coder7")
             self.assertEqual(code, 0, err)
         self.assertEqual(self.st()["pods"], {}, "the pod must be stopped")
@@ -399,7 +400,7 @@ class Record(td.Driver):
             p = os.path.join(root, name)
             os.mkdir(p)
             for f in files:
-                open(os.path.join(p, f), "w").write("{}")
+                pathlib.Path(os.path.join(p, f)).write_text("{}")
             t = time.time() - age * 86400
             os.utime(p, (t, t))
             return p
@@ -412,7 +413,7 @@ class Record(td.Driver):
         os.mkdir(outside)
         os.symlink(outside, stray)
         os.utime(stray, (old, old), follow_symlinks=False)
-        open(os.path.join(root, "audit.jsonl"), "w").write("x")
+        pathlib.Path(os.path.join(root, "audit.jsonl")).write_text("x")
         self.stub_env()
         code, out, err = self.run_cli("prune-records", "--days", "30")
         self.assertEqual(code, 0, err)

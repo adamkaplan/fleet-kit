@@ -328,7 +328,7 @@ def _held_defects(body):
     def words(text):
         return len(re.findall(r"[^\W_]", text))   # underscores are not word characters here
 
-    problems = []
+    problems = list(_brief_advisory().rationale_defects(lines))   # G6b (#1215): the one-sentence rationale line on top
     if HELD_WHY not in pos:
         problems.append("the held PR needs a `%s` section after the opening lines" % HELD_WHY)
     else:
