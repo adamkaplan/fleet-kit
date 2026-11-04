@@ -60452,8 +60452,8 @@ class TestV2Light(Base):
         world = self.world(agents=("platform",))
         ledger = world.engine.sent
         for n in range(sb.SENT_PER_SESSION + 50):
-            ledger.reserve("ses_example", ["k%d" % n], float(n))
-            ledger.confirm("ses_example", ["k%d" % n], float(n))
+            ledger.reserve("ses_example", ["k%d" % n], float(n * sb.SENT_MIN_AGE))
+            ledger.confirm("ses_example", ["k%d" % n], float(n * sb.SENT_MIN_AGE))
         self.assertEqual(len(ledger.keys["ses_example"]), sb.SENT_PER_SESSION)
         self.assertIn("k%d" % (sb.SENT_PER_SESSION + 49), ledger.keys["ses_example"])
         for n in range(sb.SENT_SESSIONS + 20):
@@ -66122,6 +66122,8 @@ TestHostDisk = importlib.import_module("test_host_disk").TestHostDisk
 # The delivery-lag tests of #1402.
 _delivery_lag = importlib.import_module("test_delivery_lag")
 _delivery_lag.World = World
+TestSentKeysAge = importlib.import_module("test_sent_keys_age").TestSentKeysAge   # #2094
+TestSentLedgerBounds = importlib.import_module("test_sent_keys_age").TestSentLedgerBounds   # #2094
 PresentHub, TestDeliveryLag = _delivery_lag.PresentHub, _delivery_lag.TestDeliveryLag
 TestLaunchBriefCheck = importlib.import_module("test_launch_brief_check").build(TwoRepoCase, TestLaunchRefusedMessage)
 TestRunLauncherShapes, TestStatusLines, TestTurnEnd, TestDictCallersUnchanged = (_ss := importlib.import_module("test_status_shape")).TestRunLauncherShapes, _ss.TestStatusLines, _ss.TestTurnEnd, _ss.TestDictCallersUnchanged
