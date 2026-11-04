@@ -1,6 +1,7 @@
 """#2081: no switchboard test reads the free disk of the host it runs on (S2 to S5, U1). World is set by bin/test-switchboard after the import."""
 import importlib.util
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -9,6 +10,7 @@ from pathlib import Path
 from unittest import mock
 
 from support.core import Base
+from support.herdr_world import World
 from support.loader import sb
 from support.paths import BIN, REPO
 
@@ -89,10 +91,53 @@ class TestHostDisk(unittest.TestCase):
         self.assertEqual(sb.disk_guard_settings({"disk_guard": {"min_free_gb": 80, "hard_free_gb": 20}}), {"min_free_gb": 80, "hard_free_gb": 20})
         self.assertIsNone(sb.disk_guard_settings({"disk_guard": False}))
 
+    def test_the_disk_status_line_is_as_it_was(self):   # U1
+        low = mock.patch.object(shutil, "disk_usage", lambda path: shutil._ntuple_diskusage(1000 * GB, 970 * GB, 30 * GB))
+        low.start()
+        self.addCleanup(low.stop)
+        self.assertEqual(sb.disk_status_line({}, Path(case_tmp())), "30 GB free (3%): LOW (below 50 GB; hard line 10 GB)")
+        explicit = {"disk_guard": {"min_free_gb": 80, "hard_free_gb": 20}}
+        self.assertEqual(sb.disk_status_line(explicit, Path(case_tmp())), "30 GB free (3%): LOW (below 80 GB; hard line 20 GB)")
+        self.assertEqual(sb.disk_status_line({"disk_guard": False}, Path(case_tmp())), "30 GB free (3%)")
+
+    def test_a_daemon_pass_in_a_test_world_raises_no_disk_low_and_the_guard_still_works(self):   # S2
+        seen = {}
+
+        class Probe(Base):
+            def runTest(inner):
+                def world():
+                    made = World(inner, agents=("coder",), config={})
+                    made.add_agent("cos", fleet={"role": "chief-of-staff"})
+                    return made
+
+                def disk_facts(made):
+                    found, problems = made.engine.collect_facts()
+                    inner.assertEqual(problems, [])
+                    return [f for f in found if f.kind == "disk"]
+
+                def low_lines(made):
+                    return len([e for e in made.audit() if e["event"] == "disk.low"])
+                quiet = world()   # built normally: the Base 500 GB fake is in force
+                quiet.engine.run_pass()
+                seen["quiet"] = (low_lines(quiet), len(disk_facts(quiet)))
+                with mock.patch.object(shutil, "disk_usage", lambda path: SMALL):   # control: the test itself makes the guard see 5 GB
+                    loud = world()
+                    loud.engine.run_pass()
+                    seen["control"] = (low_lines(loud), len(disk_facts(loud)))
+        result = unittest.TextTestRunner(stream=open(os.devnull, "w")).run(Probe())
+        self.assertEqual((result.failures, result.errors), ([], []))
+        self.assertEqual(seen, {"quiet": (0, 0), "control": (1, 1)})
+
     def test_the_named_group_passes_with_the_host_at_5_gb(self):   # S3
         site = case_tmp()
         Path(site, "sitecustomize.py").write_text("import shutil\n_u = shutil._ntuple_diskusage(1000 * 10 ** 9, 995 * 10 ** 9, 5 * 10 ** 9)\nshutil.disk_usage = lambda path: _u\n")
         env = dict(os.environ, PYTHONPATH=site + os.pathsep + os.environ.get("PYTHONPATH", ""), FLEET_HEAVY="off")
         done = subprocess.run([sys.executable, str(BIN / "test-switchboard")] + list(NAMED), env=env, capture_output=True, text=True, timeout=840)
-        tail = done.stdout[-400:]
-        self.assertIn(" 0 failed, 0 errored", tail, tail)
+        out = done.stdout + done.stderr
+        ran = re.findall(r"^Ran (\d+) tests? in ", out, re.M)
+        self.assertEqual(len(ran), 1, out[-400:])
+        self.assertGreater(int(ran[0]), 0, out[-400:])
+        verdict = re.findall(r"^(OK|FAILED)\b.*$", out, re.M)
+        self.assertEqual(verdict[-1:], ["OK"], out[-400:])   # "OK (skipped=N)" or "FAILED (failures=N)"
+        self.assertEqual(done.returncode, 0, out[-400:])
+
