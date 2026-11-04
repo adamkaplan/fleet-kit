@@ -1304,7 +1304,6 @@ def triage_queue_fact(state, due, now, cfg, other_owner=0, invalid=()):
         state.facts["triage:parked:%s" % hashlib.sha256(summary.encode()).hexdigest()[:10]] = (summary, now)
         return summary
     summary = triage_digest_text(state, len(due), shown, kinds, other_owner, invalid)
-    if other_owner:
         summary += " Also %d other-owner flag(s): not ours, nothing to do." % other_owner
     if invalid:
         summary += " Parked without a valid `Parked until: YYYY-MM-DD` line (treated as not parked): %s." % ", ".join(invalid)
