@@ -586,3 +586,36 @@ class TestUndecidableRobustness(Base):
         with mock.patch.object(sb, "_pass_herdr", func):
             self.assertEqual(self.reads_in_the_deciding_pass(), 2)
 
+
+    # (f) the cached list is used only inside a pass: outside one every call reads fresh and leaves no cache
+    def calls_outside_a_pass(self):
+        rig = TestPaneUndecidable.world(self)
+        seen = []
+        real = sb.HerdrClient.pane_list
+
+        def counted(client, *args, **kw):
+            got = real(client, *args, **kw)
+            seen.append([p["pane_id"] for p in got])
+            return got
+        with mock.patch.object(sb.HerdrClient, "pane_list", autospec=True, side_effect=counted):
+            sb.pane_state(rig.engine, NAME, "ses_x", rig.pane)
+            rig.herdr.plain_terminals = []   # the list changes between the two calls
+            sb.pane_state(rig.engine, NAME, "ses_x", rig.pane)
+        return seen, [k for k in ("pass_herdr", "in_pane_pass") if rig.engine.__dict__.get(k) is not None]
+
+    def test_S14_two_calls_outside_a_pass_read_the_list_fresh_and_leave_no_cache(self):
+        seen, left = self.calls_outside_a_pass()
+        self.assertEqual(len(seen), 2)
+        self.assertNotEqual(seen[0], seen[1])
+        self.assertEqual(seen[1], [])
+        self.assertEqual(left, [])
+
+    def test_S14_mutant_f_a_cache_kept_outside_a_pass_is_caught_and_the_control_passes(self):
+        seen, _ = self.calls_outside_a_pass()
+        self.assertEqual(len(seen), 2)   # control
+        old = '    if not engine.__dict__.get("in_pane_pass"):'
+        func, count = source_copy_function("_pass_herdr", old, '    if False:')
+        self.assertEqual(count, 1)
+        with mock.patch.object(sb, "_pass_herdr", func):
+            seen, left = self.calls_outside_a_pass()
+            self.assertEqual((len(seen), left), (1, ["pass_herdr"]))
