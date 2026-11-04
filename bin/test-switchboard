@@ -30755,12 +30755,14 @@ class TestFactsReadAtRunTime(TestCarriesLine):
 
     def drive(self):
         """Every scenario through the real `gates` and the real sweep reading; the keys recorded (and the star accesses), and that a reading was made."""
-        for label, setup in self.scenarios():
-            self.reset()
-            setup()
-            self.run_as("coder", "gates", self.PR, "--json")
-            engine = sb.build_engine(self.route, self.world.clock.now, "cli", writable=False)[0]
-            sb.sweep_gate_reading(engine, "acme/app", 9, self.world.clock.now())
+        parser = sb.build_parser()   # built once per drive: `main` builds the whole command parser for every run, and that is most of a run's cost
+        with mock.patch.object(sb, "build_parser", lambda: parser):
+            for label, setup in self.scenarios():
+                self.reset()
+                setup()
+                self.run_as("coder", "gates", self.PR, "--json")
+                engine = sb.build_engine(self.route, self.world.clock.now, "cli", writable=False)[0]
+                sb.sweep_gate_reading(engine, "acme/app", 9, self.world.clock.now())
 
     def test_986_every_fact_key_recorded_at_run_time_has_a_row_and_every_row_is_reached_or_not_read(self):
         with self.proxied() as seen:
@@ -75183,11 +75185,50 @@ class TestBlockedMutants(Base):
 
     def mutant_module(self, text):
         loader = importlib.machinery.SourceFileLoader("t_fleet_switchboard_blocked_mutant", str(SWITCHBOARD))
-        loader.get_data = lambda path: text if isinstance(text, bytes) else text.encode()
+        data = text if isinstance(text, bytes) else text.encode()
+        loader.get_data = lambda path: data
         spec = importlib.util.spec_from_loader(loader.name, loader)
         module = importlib.util.module_from_spec(spec)
-        loader.exec_module(module)
+        for code in self.mutant_codes(data):
+            exec(code, module.__dict__)
         return module
+
+    _pieces = None
+
+    def mutant_codes(self, data):
+        """The module's top-level statements as code objects: the original's are compiled once and shared, only the statements the mutant changed are recompiled."""
+        cls = TestBlockedMutants
+        if cls._pieces is None:
+            original = SWITCHBOARD.read_bytes()
+            starts = [0]
+            for line in original.split(b"\n"):
+                starts.append(starts[-1] + len(line) + 1)
+            spans = []
+            for node in ast.parse(original).body:
+                first = min([node.lineno] + [d.lineno for d in getattr(node, "decorator_list", [])])
+                spans.append((starts[first - 1], starts[node.end_lineno - 1] + len(original.split(b"\n")[node.end_lineno - 1]), first))
+            cls._pieces = (original, spans, [compile(b"\n" * (first - 1) + original[a:b], str(SWITCHBOARD), "exec") for a, b, first in spans])
+        original, spans, codes = cls._pieces
+        low = 0
+        high = min(len(original), len(data))
+        while low < high:
+            mid = (low + high + 1) // 2
+            low, high = (mid, high) if original[:mid] == data[:mid] else (low, mid - 1)
+        head = low
+        low, high = 0, min(len(original), len(data)) - head
+        while low < high:
+            mid = (low + high + 1) // 2
+            low, high = (mid, high) if original[len(original) - mid:] == data[len(data) - mid:] else (low, mid - 1)
+        tail = low
+        changed_to = len(original) - tail
+        hit = [i for i, (a, b, _) in enumerate(spans) if a < max(changed_to, head + 1) and b > head]
+        if head == len(original) == len(data):
+            return codes
+        if not hit or hit != list(range(hit[0], hit[-1] + 1)):
+            return [compile(data, str(SWITCHBOARD), "exec")]
+        delta = len(data) - len(original)
+        a, b, first = spans[hit[0]][0], spans[hit[-1]][1] + delta, spans[hit[0]][2]
+        return codes[:hit[0]] + [compile(b"\n" * (first - 1) + data[a:b], str(SWITCHBOARD), "exec")] + codes[hit[-1] + 1:]
 
     def killed(self, module, test):
         suite = unittest.TestSuite([TestBlockedReport(test)])
