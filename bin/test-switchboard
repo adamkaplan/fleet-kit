@@ -36793,7 +36793,7 @@ class TestImpactHold(LedgerBase):
                 self.assertTrue(set(readers) <= set(roots.get("bin/" + path.name) or []), "%s has a config reader (%s) that is not a root" % (path.name, readers))
         # the modules the clear loads or runs, DERIVED: every loader of the daemon (a `load_module("x")` call, a name in HELPER_MODULES, a function that returns one) is enumerated by ast; a module
         # is judged when the clear reaches its loader, the daemon loads it at import, it has a config reader, or the recorded run executed it; every other loaded module is listed with its reason
-        daemon, hold = ast.parse(switchboard_source()), ast.parse((BIN / "impact_hold.py").read_text())
+        daemon, hold = self.real_tree(), ast.parse((BIN / "impact_hold.py").read_text())
         names = {p.stem for p in BIN.glob("*.py")}
         helper = next(ast.literal_eval(n.value) for n in daemon.body if isinstance(n, ast.Assign) and any(getattr(t, "id", "") == "HELPER_MODULES" for t in n.targets))
         defs = {n.name: n for n in daemon.body if isinstance(n, (ast.FunctionDef, ast.ClassDef))}
@@ -37183,7 +37183,7 @@ class TestImpactHold(LedgerBase):
         rule = sb.impact_floor.load_matrix()["owner_hold"]["delegated_clear"]
         source = switchboard_source()
         tree = _ast.parse(source)    # the daemon file is parsed once; its closure is computed once
-        cls._daemon_cache = {"source": source, "tree": tree, "closure": mod.closure(tree, mod.daemon_roots(rule), rule["dynamic_actions"]), "roots": mod.daemon_roots(rule), "heads": {}}
+        cls._daemon_cache = {"source": source, "tree": tree, "closure": mod.closure(tree, mod.daemon_roots(rule), rule["dynamic_actions"]), "roots": mod.daemon_roots(rule), "dyn": rule["dynamic_actions"], "heads": {}}
 
     def real_source(self):
         return self._daemon_cache["source"] if self._daemon_cache else switchboard_source()
@@ -37211,7 +37211,7 @@ class TestImpactHold(LedgerBase):
                 cache["heads"][head_source] = ast.Module(body=[parsed if n is node else n for n in cache["tree"].body], type_ignores=[])
         return head_source, diff
 
-    def closure_check(self, head, diff, rule=None):
+    def closure_check(self, head, diff, rule=None, roots=None, dynamic=None):
         rule = rule or sb.impact_floor.load_matrix()["owner_hold"]["delegated_clear"]
         import unittest.mock as mock
         mod = sb.load_module("delegated_clear")
@@ -37225,9 +37225,9 @@ class TestImpactHold(LedgerBase):
                     return cache["tree"] if src is cache["source"] else cache["heads"].get(src) or real_ast.parse(src)
                 return real_ast.parse(src, *a, **k)
         def cached_closure(tree, roots, dyn=()):
-            return cache["closure"] if tree is cache["tree"] and roots == cache["roots"] else real_closure(tree, roots, dyn)
+            return cache["closure"] if tree is cache["tree"] and roots == cache["roots"] and tuple(dyn) == tuple(cache["dyn"]) else real_closure(tree, roots, dyn)
         with mock.patch.object(mod, "ast", CachedAst()), mock.patch.object(mod, "closure", cached_closure):
-            return mod.closure_refusals(self.real_source(), head, diff, mod.daemon_roots(rule), set(rule["clear_entry_points"]), False, rule["dynamic_actions"])
+            return mod.closure_refusals(self.real_source(), head, diff, mod.daemon_roots(rule) if roots is None else roots, set(rule["clear_entry_points"]), False, rule["dynamic_actions"] if dynamic is None else dynamic)
 
     def test_the_five_functions_hunk_headers_missed_are_refused_by_the_ast_on_the_real_daemon_file(self):
         source = self.real_source()
@@ -38049,7 +38049,7 @@ class TestImpactHold(LedgerBase):
                 head = source.replace(old, new)
                 diff = "\n".join(list(difflib.unified_diff(source.split("\n"), head.split("\n"), lineterm="", n=3))[2:])
                 self.assertTrue(self.closure_check(head, diff), "refused: %s" % label)
-                self.assertEqual(module.closure_refusals(source, head, diff, sorted(rule["closure_roots"]), set(rule["clear_entry_points"])), [], "the mutant (the roots of round 2, no dynamic edge) lets %s through" % label)
+                self.assertEqual(self.closure_check(head, diff, roots=sorted(rule["closure_roots"]), dynamic=()), [], "the mutant (the roots of round 2, no dynamic edge) lets %s through" % label)
 
     def test_one_definition_of_rated_at_this_head_the_clear_and_every_other_reader_use_it(self):
         import ast
