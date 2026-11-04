@@ -19950,6 +19950,8 @@ def cmd_gates_ci_record(args, runner, now):
         return EXIT_OK
     print("CI is green at %s: recorded %s%s" % (got["head"][:8], ", ".join(got["recorded"]) or "nothing new",
                                                " (already recorded: %s)" % ", ".join(got["already"]) if got["already"] else ""))
+    if got["proved"]:
+        print("and the proof of %s" % ", ".join(got["proved"]))
     for line in carry_lines(got.get("carry") or []):
         print(line)
     return EXIT_OK
