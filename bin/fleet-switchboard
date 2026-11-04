@@ -5308,6 +5308,8 @@ def pane_health_pass(engine, now):
             states.pop(name, None)
             continue
         missing[name] = int(missing.get(name, 0)) + 1
+        if undecidable_streak(engine, name, agents[name]) and missing[name] >= PANE_MISSING_PASSES:   # #1884 PC-6: unknown, said once per streak
+            continue
         if missing[name] >= PANE_MISSING_PASSES and agents[name].get("pane") and agents[name].get("session"):
             try:   # #1066: a pane whose process runs the agent's session is never dead, whatever the multiplexer's list says
                 if runs_session(engine.herdr.pane_process_info(agents[name]["pane"]), agents[name]["session"], engine.executable):
@@ -5373,6 +5375,7 @@ def pane_health_pass(engine, now):
             engine._note("fleetpane.bind_refused", name, {"why": _one_line(got["problem"], 160)})   # #1066: the refusal names both agents
         elif got["problem"] and not got["problem"].endswith("is retired for this session"):
             engine._note("fleetpane.error", name, {"error": "registry not updated: %s" % _one_line(got["problem"], 100)})
+    undecidable_prune(engine)
     # No removal from the registry here: a dead agent leaves it only when a view reads it (reconcile_on_read, #919), never on a pass.
     try:
         write_pane_health(engine.state_dir, {"agents": agents, "states": states, "missing": missing, "at": int(now)})
@@ -5854,6 +5857,43 @@ def daemon_shows_absent(engine, name, agent):
         return bool(load_module("registry").evidence_shows_absent(evidence))
     except Exception:
         return False
+
+
+UNDECIDABLE_FILE = "pane-undecidable.json"   # {name: {"pane", "passes"}}: the daemon's record of a listed pane with no recorded session that the loop cannot decide (#1884, PC-6)
+
+
+def undecidable_streak(engine, name, agent):
+    """Case (iv): a LISTED pane whose agent row has no recorded session id is `unknown`, never `dead`. Counts the passes in a row; writes ONE audit
+    line `pane.undecidable` when the streak reaches PANE_MISSING_PASSES (not one for each pass); any other answer clears the streak. True when it is such a pass."""
+    seen = engine.__dict__.setdefault("undecidable_seen", set())
+    seen.add(name)
+    data = _read_small(engine.state_dir, UNDECIDABLE_FILE)
+    live = None
+    if agent.get("pane") and not agent.get("session"):
+        try:
+            live = herdr_live_check(engine.herdr)(name, agent)
+        except Exception:
+            live = None
+    if not live or live.get("pane") is not True:
+        if data.pop(name, None) is not None:
+            _write_small(engine.state_dir, UNDECIDABLE_FILE, data)
+        return False
+    row = data.get(name) or {}
+    passes = (row.get("passes") or 0) + 1 if row.get("pane") == agent["pane"] else 1
+    data[name] = {"pane": agent["pane"], "passes": passes}
+    _write_small(engine.state_dir, UNDECIDABLE_FILE, data)
+    if passes == PANE_MISSING_PASSES and engine.audit is not None:
+        engine.audit.append(engine.actor, "pane.undecidable", name, {"pane": agent["pane"], "passes": passes,
+                                                                    "why": "listed pane with no recorded session: undecidable, not dead"})
+    return True
+
+
+def undecidable_prune(engine):
+    """End of a pass: a name the loop did not meet this pass has no streak any more."""
+    seen = engine.__dict__.pop("undecidable_seen", set())
+    data = _read_small(engine.state_dir, UNDECIDABLE_FILE)
+    if any(n not in seen for n in data):
+        _write_small(engine.state_dir, UNDECIDABLE_FILE, {n: v for n, v in data.items() if n in seen})
 
 
 def reconcile_agents_on_read(state_dir, herdr):

@@ -66048,6 +66048,7 @@ TestWholeReadOfALargePullRequest = _changed_file_pages.load()
 
 _lm = importlib.import_module("test_launch_model"); _lm.HOST = sys.modules[__name__]; TestLaunchModel = _lm.build(); TestLaunchModelCloud = _lm.build_cloud()   # #1642
 TestDaemonDeadVerdict, TestDaemonDeadVerdictMutants = (_dd := importlib.import_module("test_dead_verdict_daemon")).TestDaemonDeadVerdict, _dd.TestDaemonDeadVerdictMutants   # #1884
+TestPaneUndecidable = _dd.TestPaneUndecidable   # #1884 PC-6 / S11
 _cfw = importlib.import_module("test_changed_files_whole"); _cfw.HOST = sys.modules[__name__]; TestChangedFilesWhole = _cfw.build()   # #1531
 TestShimGuardsTool, TestShimGuardRows, TestShimHygienePlanted, TestShimGuardMutants, TestShimGuardDocs = (_sg := importlib.import_module("test_shim_guards")).TestShimGuardsTool, _sg.TestShimGuardRows, _sg.TestShimHygienePlanted, _sg.TestShimGuardMutants, _sg.TestShimGuardDocs   # #1909
 TestPlanningDecision, TestConcurrencyGroup, TestGateLegs, TestGatePass, TestPlatformPaths, TestMacDocs = (_ml := importlib.import_module("test_mac_legs")).TestPlanningDecision, _ml.TestConcurrencyGroup, _ml.TestGateLegs, _ml.TestGatePass, _ml.TestPlatformPaths, _ml.TestDocs

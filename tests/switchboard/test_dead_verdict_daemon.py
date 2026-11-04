@@ -305,3 +305,59 @@ class TestDaemonDeadVerdictMutants(Base):
     def test_S10_mutant_death_requires_the_pane_to_be_gone(self):
         self.run_check("daemon_shows_absent", MUTANT_LINE, 'return evidence.get("pane_listed") is False and bool(load_module("registry").evidence_shows_absent(evidence))',
                        "a listed bare shell is not recorded dead by the loop")
+
+
+class TestPaneUndecidable(Base):
+    """S11 (PC-6): a LISTED pane whose agent row has no recorded session is `unknown` in the loop; ONE `pane.undecidable` line per streak."""
+
+    def world(self):
+        rig = Rig(self, DEAD_CASES["listed bare shell"])
+        rig.pass_once()
+        row = rig.registry.read(rig.world.state)["agents"][NAME]
+        got = rig.registry.upsert(rig.world.state, NAME, dict(row, session=None), now=rig.world.clock.now())
+        self.assertEqual(got["problem"], None)
+        self.assertIsNone(rig.registry.read(rig.world.state)["agents"][NAME].get("session"))
+        del rig.herdr.panes[rig.pane]   # the agent is gone from the agent list, its pane is still a listed terminal with a bare shell
+        rig.herdr.plain_terminals = [{"pane_id": rig.pane, "processes": ["zsh"]}]
+        rig.n = 0
+        return rig
+
+    def passes(self, rig, count):
+        for _ in range(count):
+            rig.n += 1
+            rig.pass_once(offset=rig.n)
+
+    def lines(self, rig):
+        return len(rig.events("pane.undecidable"))
+
+    def scenario(self, apply_check=None):
+        rig = self.world()
+        counts = {}
+        self.passes(rig, 2)
+        counts["after 2"] = self.lines(rig)
+        self.passes(rig, 1)
+        counts["after 3"] = self.lines(rig)
+        self.passes(rig, 3)
+        counts["after 6"] = self.lines(rig)
+        counts["recorded"] = rig.recorded()
+        counts["dead events"] = len(rig.events())
+        with mock.patch.object(sb.HerdrClient, "pane_list", side_effect=sb.HerdrError("down", "herdr is down")):   # a pass that does not answer `listed`: the streak is cleared
+            self.passes(rig, 1)
+        counts["cleared"] = sb._read_small(rig.world.state, sb.UNDECIDABLE_FILE)
+        self.passes(rig, 3)
+        counts["after later streak"] = self.lines(rig)
+        return counts
+
+    def test_S11_one_line_per_streak_none_after_two_never_dead_a_new_line_for_a_later_streak(self):
+        got = self.scenario()
+        self.assertEqual(got, {"after 2": 0, "after 3": 1, "after 6": 1, "recorded": got["recorded"], "dead events": 0, "cleared": {}, "after later streak": 2})
+        self.assertNotEqual(got["recorded"], "dead")
+
+    def test_S11_mutant_a_line_for_each_pass_is_caught_and_the_control_passes(self):
+        control = self.scenario()
+        self.assertEqual((control["after 3"], control["after 6"]), (1, 1))
+        func, count = source_copy_function("undecidable_streak", "if passes == PANE_MISSING_PASSES and engine.audit", "if passes >= 1 and engine.audit")
+        self.assertEqual(count, 1)
+        with mock.patch.object(sb, "undecidable_streak", func):
+            mutant = self.scenario()
+        self.assertEqual((mutant["after 3"], mutant["after 6"]), (3, 6))
