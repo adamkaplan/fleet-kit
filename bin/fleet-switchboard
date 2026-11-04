@@ -5861,12 +5861,38 @@ def herdr_live_check(herdr):
     return check
 
 
+class _OnePaneList:
+    """A view of the multiplexer for ONE pane pass whose `pane_list` is read once (the answer or the error is kept); the rest is passed through."""
+    def __init__(self, herdr):
+        self._herdr, self._got = herdr, None
+
+    def pane_list(self):
+        if self._got is None:
+            try:
+                self._got = (True, self._herdr.pane_list())
+            except Exception as err:
+                self._got = (False, err)
+        if not self._got[0]:
+            raise self._got[1]
+        return self._got[1]
+
+    def __getattr__(self, attr):
+        return getattr(self._herdr, attr)
+
+
+def _pass_herdr(engine):
+    """One read of the pane list per pass serves `undecidable_streak` and `daemon_shows_absent` (#1884 PC-9 e); cleared with the pass."""
+    if engine.__dict__.get("pass_herdr") is None or engine.__dict__["pass_herdr"]._herdr is not engine.herdr:
+        engine.__dict__["pass_herdr"] = _OnePaneList(engine.herdr)
+    return engine.__dict__["pass_herdr"]
+
+
 def daemon_shows_absent(engine, name, agent):
     """The daemon's dead test (#1884): the registry's reader and evidence, decided by `registry.evidence_shows_absent`, the one function. A row with no pane is not judged."""
     if load_module("registry").no_pane_to_judge(agent):
         return False
     try:
-        evidence = load_module("agent_reconcile").evidence_of(agent, herdr_live_check(engine.herdr)(name, agent))
+        evidence = load_module("agent_reconcile").evidence_of(agent, herdr_live_check(_pass_herdr(engine))(name, agent))
         return bool(load_module("registry").evidence_shows_absent(evidence))
     except Exception:
         return False
@@ -5884,7 +5910,7 @@ def undecidable_streak(engine, name, agent):
     live = None
     if agent.get("pane") and not agent.get("session"):
         try:
-            live = herdr_live_check(engine.herdr)(name, agent)
+            live = herdr_live_check(_pass_herdr(engine))(name, agent)
         except Exception:
             live = None
     if not live or live.get("pane") is not True:
