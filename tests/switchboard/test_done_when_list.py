@@ -18,7 +18,7 @@ SAY = "a Done when written as a numbered list is read whole"
 FIRST = ("skills/fleet-charter/SKILL.md", "skills/fleet-planning/SKILL.md", "agents/opencode/chief-of-staff.md",
          "agents/copilot/chief-of-staff.agent.md", "docs/switchboard.md")
 
-SCENARIO = ("  - id: S%d\n    covers: DW-%d\n    text: a scenario that is long enough\n    proof: test\n"
+ONE_SCENARIO_TEXT = ("  - id: S%d\n    covers: DW-%d\n    text: a scenario that is long enough\n    proof: test\n"
             "    pass: exit status is 0 and count equals 3\n    discriminates: a stub shows count equals 0 and fails\n    evaluator: ci\n")
 
 
@@ -84,7 +84,7 @@ class TestDoneWhenListCommands(Base):
     def test_s5_the_plan_check_command_reads_both_forms_the_same(self):
         import tempfile
         plan = Path(tempfile.mkdtemp(dir=str(self.home))) / "plan.md"
-        plan.write_text("".join(SCENARIO % (n, n) for n in (1, 2)).join(("scenarios:\n", "")).join(("```yaml\n", "```\n")))
+        plan.write_text("".join(ONE_SCENARIO_TEXT % (n, n) for n in (1, 2)).join(("scenarios:\n", "")).join(("```yaml\n", "```\n")))
         got = []
         for done in ("(1) a (2) b (3) d", sb.parse_intent(body("dot"))[1]):
             got.append(self.run_main("plan", "check", "--file", str(plan), "--done-when", done))
