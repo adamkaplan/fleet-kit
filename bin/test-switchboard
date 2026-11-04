@@ -66009,6 +66009,7 @@ _hc = importlib.import_module("test_header_cache"); TestAges, TestSets, TestEven
 TestReminderTtlMore = importlib.import_module("test_reminder_ttl").build(PR4Base)
 TestPlanRehearsal = importlib.import_module("test_plan_rehearsal").build(HandoffCase)   # #1785
 TestMergeRef = importlib.import_module("test_merge_ref").build(HandoffCase)   # #2053
+TestDoneWhenList = importlib.import_module("test_done_when_list").TestDoneWhenList   # #2078
 # The load figure counts cloud workers as busy (#1487).
 _load_cloud = importlib.import_module("test_load_alert_cloud")
 TestLoadAlertCloudBusy = _load_cloud.TestLoadAlertCloudBusy
