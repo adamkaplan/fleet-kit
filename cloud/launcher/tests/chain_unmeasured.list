@@ -1,5 +1,6 @@
 cloud/launcher/tests/test_cloud_quick_budget.py
 cloud/launcher/tests/test_end_hook_nothing_to_push.py
+cloud/launcher/tests/test_end_hook_refusal_lines.py
 cloud/launcher/tests/test_fixture_root.py
 cloud/launcher/tests/test_hub_restart_client.py
 cloud/launcher/tests/test_hub_safe_to_evict.py
