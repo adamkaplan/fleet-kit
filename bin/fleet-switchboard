@@ -13748,6 +13748,7 @@ def collect_status(runner=subprocess.run, now=time.time, platform=None):
             except V2Error as err:   # status never crashes on a bad state file: it says the ledger is unusable and that the sends are stopped
                 ledger = "; sent-keys ledger: UNREADABLE (sends stopped: fail closed): %s" % _one_line(str(err), 160)
             report["v2_light"] = "ON (features off: %s)%s" % ("; ".join(V2_LIGHT_OFF), ledger)
+        report["undecidable"] = {n: v.get("passes") for n, v in _read_small(state, UNDECIDABLE_FILE).items() if v.get("passes", 0) >= PANE_MISSING_PASSES}   # #1884 PC-7: the doctor reads it
         report["sweep"] = sweep_summary(state)  # #117
         report["triage"] = triage_summary(state)  # #130
         report["ci_record"] = ci_record_status_line(state, now())
