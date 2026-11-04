@@ -34255,6 +34255,21 @@ class TestAgentBlockCounts(TestBlockTable):
             text = (REPO / "bin" / name).read_text().replace("block_impact", "")
             self.assertEqual(len(re.findall(r'get\("impact_(?:severity|probability)"\)', text)), 0, name)
 
+def fast_segment_reader(text):
+    """`ast.get_source_segment(text, node)` for many nodes of one text: the stdlib call re-splits the whole text on every call, this splits it once (same result)."""
+    import ast
+    lines = ast._splitlines_no_ff(text)
+
+    def segment(node):
+        if getattr(node, "end_lineno", None) is None or getattr(node, "end_col_offset", None) is None:
+            return None
+        first, last = node.lineno - 1, node.end_lineno - 1
+        if first == last:
+            return lines[first].encode()[node.col_offset:node.end_col_offset].decode()
+        return lines[first].encode()[node.col_offset:].decode() + "".join(lines[first + 1:last]) + lines[last].encode()[:node.end_col_offset].decode()
+    return segment
+
+
 class TestWholeRead(LedgerBase):
     """#1047: a rating is recorded only from a whole read of the pull request's changed files (read from GitHub), and a verdict is recorded exactly as given."""
 
@@ -34525,11 +34540,12 @@ class TestWholeRead(LedgerBase):
         found = set()
         for name in ("plan_ledger.py", "fleet-switchboard"):
             text = daemon_text(REPO / "bin" / name)
+            segment = fast_segment_reader(text)
             for node in ast.walk(ast.parse(text)):
                 if isinstance(node, ast.FunctionDef):
                     inner = [n for n in ast.walk(node) if isinstance(n, ast.FunctionDef) and n is not node]
-                    own = ast.get_source_segment(text, node)
-                    if "uncited" in own and not any("uncited" in (ast.get_source_segment(text, n) or "") for n in inner):
+                    own = segment(node)
+                    if "uncited" in own and not any("uncited" in (segment(n) or "") for n in inner):
                         found.add((name, node.name))
         self.assertEqual(found, set(sb.plan_ledger.UNCITED_CONSUMERS), "a reader of the uncited mark is not in plan_ledger.UNCITED_CONSUMERS (or one in it no longer reads it)")
 
@@ -46864,8 +46880,9 @@ class TestRetireCloseHeadless(StandInPids, Base):
         import ast
         text = (REPO / "bin" / "fleet-switchboard").read_text()
         tree = ast.parse(text)
+        segment = fast_segment_reader(text)
         funcs = {n.name: n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
-        holders = sorted(n for n, f in funcs.items() if "only the operator or the agent's own boss may" in (ast.get_source_segment(text, f) or "").replace("\n", " "))
+        holders = sorted(n for n, f in funcs.items() if "only the operator or the agent's own boss may" in (segment(f) or "").replace("\n", " "))
         self.assertEqual(holders, ["close_authority_problem"], "the wording of the rule lives in one function")
         for caller in ("retire_close_problem", "headless_close_problem"):
             calls = {c.func.id for c in ast.walk(funcs[caller]) if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)}
