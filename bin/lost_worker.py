@@ -407,6 +407,7 @@ def run_pass(sb, engine, now, alive=None, launcher_audit=None):
     alerted = state.setdefault("alerted", {})
     alerted.update({k: v for k, v in _PROC_ALERTED.get(path, {}).items() if k not in alerted})   # what this process already alerted is never skipped or repeated
     losses = [x for x in _losses(state, sb, engine, alive, now, records) if x["key"] not in alerted]
+    alerted = state.setdefault("alerted", {})   # #2017: _losses cleaned the memory and replaced the table: the marks of this pass go in the live one
     losses.sort(key=lambda x: (x["at"], x["key"]))
     state.pop("_gap_ready", None)
     if catchup:
