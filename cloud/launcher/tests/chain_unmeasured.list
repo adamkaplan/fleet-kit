@@ -24,6 +24,7 @@ cloud/launcher/tests/test_render_namespace.py
 cloud/launcher/tests/test_safe_to_evict.py
 cloud/launcher/tests/test_scratch_clean.py
 cloud/launcher/tests/test_scrub_linear.py
+cloud/launcher/tests/test_scrub_pieces.py
 cloud/launcher/tests/test_stop_no_checkout.py
 cloud/launcher/tests/test_token_at_limit.py
 cloud/launcher/tests/test_worker_copies.py
