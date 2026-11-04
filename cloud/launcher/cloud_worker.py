@@ -10,11 +10,13 @@ secret value is read once from an inherited descriptor and goes to kubectl's std
 """
 import argparse
 import base64
+import bisect
 import copy
 import fcntl
 import datetime as dt
 import pwd
 import hashlib
+import heapq
 import json
 import os
 import re
@@ -110,6 +112,7 @@ IGNORED_NOTICE = ("cluster login: %s is ignored in the unattended refresh (the r
 # renewal's numbers and names are here.
 GIT_TOKEN_KEY = "git-token"                      # the Secret key the pod's credential helper and gh wrapper read at every call
 GIT_TOKEN_RENEW_AFTER_SECONDS = 1800             # renew when the token is this old: 30 minutes of its life are left (a failed pass or two, a kubelet delay, a short sleep)
+SAFE_TO_EVICT_KEY = "cluster-autoscaler.kubernetes.io/safe-to-evict"  # not a cw/ key: the autoscaler reads it, the launcher reads nothing from it
 GIT_TOKEN_MINTED = "cw/git-token-minted"         # the Secret annotation that says when the token was minted (the Secret's creation time stands in when it is absent)
 GIT_TOKEN_MINT_SECONDS = 60                      # the mint child's run limit
 GIT_TOKEN_MAX_CHARS = 4096                       # the most a token may be
@@ -431,27 +434,398 @@ SCRUB_OUTPUT_MAX = 2 * SCRUB_INPUT_MAX   # a limit above the input maximum: reda
 MIN_FRAGMENT = 8
 
 
+class KnownSet:
+    """A set of known secret forms. It HOLDS its forms (it is not a set, and no public attribute exposes them), keeps a
+    `version` (bumped AFTER every change of the content, under an RLock the instance owns, and only when the content
+    changed) and the structure `scrub` built for it (`built`); both are read-only from outside, and `keep` stores a
+    structure only for the version the set has now. A call whose structure is current never reads the set. An argument
+    that is an iterable is read into a list BEFORE the lock is taken. No subclass, no pickle."""
+    __slots__ = ("_forms", "_lock", "_version", "_built", "__weakref__")
+    __hash__ = None
+
+    def __init_subclass__(cls, **kw):
+        raise TypeError("a KnownSet may not be subclassed")
+
+    def __init__(self, forms=()):
+        if getattr(self, "_lock", None) is not None:
+            raise TypeError("a KnownSet is initialised once")
+        items = list(forms)  # read first: a raise leaves the object uninitialised
+        self._forms = set(items)
+        self._version = 0
+        self._built = None
+        self._lock = threading.RLock()  # set last: it marks the object as initialised
+
+    @property
+    def version(self):
+        return self._version
+
+    @property
+    def built(self):
+        return self._built
+
+    def keep(self, version, built):
+        """Store the structure built for `version`; refused (False) when the set has moved on."""
+        with self._lock:
+            if version != self._version:
+                return False
+            self._built = built
+            return True
+
+    @staticmethod
+    def _read(arg):
+        """The argument as a list, read outside the lock; a raise half-way gives what was read and the error."""
+        items = []
+        try:
+            for x in arg:
+                items.append(x)
+        except BaseException as exc:  # applied below, then raised again
+            return items, exc
+        return items, None
+
+    def _bulk(self, name, args):
+        reads = [self._read(a) for a in args]  # BEFORE the lock
+        err = next((e for _, e in reads if e is not None), None)
+        if err is not None and name in ("difference_update", "intersection_update", "symmetric_difference_update"):
+            raise err  # an operation that removes forms: a half-read argument changes nothing (set and version unchanged)
+        with self._lock:
+            before = frozenset(self._forms)
+            try:
+                getattr(self._forms, name)(*[r for r, _ in reads])
+            finally:
+                if self._forms != before:
+                    self._version += 1  # AFTER the content changed, under the lock
+        if err is not None:
+            raise err
+
+    def add(self, item):
+        with self._lock:
+            if item not in self._forms:
+                self._forms.add(item)
+                self._version += 1
+
+    def discard(self, item):
+        with self._lock:
+            if item in self._forms:
+                self._forms.discard(item)
+                self._version += 1
+
+    def remove(self, item):
+        with self._lock:
+            if item not in self._forms:
+                raise KeyError(item)  # nothing changed: no bump
+            self._forms.remove(item)
+            self._version += 1
+
+    def pop(self):
+        with self._lock:
+            if not self._forms:
+                raise KeyError("pop from an empty set")  # nothing changed: no bump
+            item = self._forms.pop()
+            self._version += 1
+            return item
+
+    def clear(self):
+        with self._lock:
+            if self._forms:
+                self._forms.clear()
+                self._version += 1
+
+    def update(self, *args):
+        self._bulk("update", args)
+
+    def difference_update(self, *args):
+        self._bulk("difference_update", args)
+
+    def intersection_update(self, *args):
+        self._bulk("intersection_update", args)
+
+    def symmetric_difference_update(self, *args):
+        self._bulk("symmetric_difference_update", args)
+
+    def _inplace(self, name, other):
+        if not isinstance(other, (set, frozenset, KnownSet)):
+            return NotImplemented
+        self._bulk({"__ior__": "update", "__iand__": "intersection_update", "__isub__": "difference_update",
+                    "__ixor__": "symmetric_difference_update"}[name], (other,))
+        return self
+
+    def __ior__(self, other):
+        return self._inplace("__ior__", other)
+
+    def __iand__(self, other):
+        return self._inplace("__iand__", other)
+
+    def __isub__(self, other):
+        return self._inplace("__isub__", other)
+
+    def __ixor__(self, other):
+        return self._inplace("__ixor__", other)
+
+    def __iter__(self):
+        with self._lock:
+            return iter(frozenset(self._forms))  # ONE C-level copy: a set changed during a scrub never raises
+
+    def __len__(self):
+        with self._lock:
+            return len(self._forms)
+
+    def __contains__(self, item):
+        with self._lock:
+            return item in self._forms
+
+    def __bool__(self):
+        with self._lock:
+            return bool(self._forms)
+
+    def __eq__(self, other):
+        if not isinstance(other, (set, frozenset, KnownSet)):
+            return NotImplemented
+        mine = frozenset(self)
+        return mine == frozenset(other)
+
+    def __ne__(self, other):
+        r = self.__eq__(other)
+        return r if r is NotImplemented else not r
+
+    def __repr__(self):
+        return "KnownSet(%d forms)" % len(self)  # never the forms
+
+    def __reduce__(self):
+        raise TypeError("a KnownSet is not pickled")
+
+    def __reduce_ex__(self, protocol):
+        raise TypeError("a KnownSet is not pickled")
+
+    def copy(self):
+        return KnownSet(self)
+
+    def __copy__(self):
+        return KnownSet(self)
+
+    def __deepcopy__(self, memo):
+        return KnownSet(self)
+
+
+_SCRUB_MARK = "[redacted]"
+_SCRUB_SLOT = [None]  # (snapshot, order, index) for a set that keeps no version of its own
+
+
+def _scrub_built(secrets_known):
+    """The secrets in their order (longest first, then by text) and the index of every 8-character piece of every secret
+    to the ranks of the secrets that hold it. Built once for each state of the set; a `KnownSet` keeps its own version."""
+    version = getattr(secrets_known, "version", None)  # a KnownSet: read its version FIRST
+    built = getattr(secrets_known, "built", None) if version is not None else _SCRUB_SLOT[0]
+    if version is not None and built is not None and built[0] != version:
+        built = None
+    if version is None or built is None:
+        snap = frozenset(secrets_known)  # ONE C-level copy, taken first: a set that changes during the call cannot raise here
+        if version is not None or built is None or built[0] != snap:
+            order = sorted({v for v in snap if v and len(v.strip()) >= MIN_FRAGMENT}, key=lambda v: (-len(v), v))
+            index = {}
+            for n, sec in enumerate(order):
+                for k in range(len(sec) - MIN_FRAGMENT + 1):
+                    ranks = index.setdefault(sec[k:k + MIN_FRAGMENT], [])
+                    if not ranks or ranks[-1] != n:
+                        ranks.append(n)
+            built = (version if version is not None else snap, order, index)
+            if version is not None:
+                secrets_known.keep(version, built)  # kept for the version read FIRST
+            else:
+                _SCRUB_SLOT[0] = built
+    return built
+
+
+class _ScrubSpans:
+    """The text under redaction: the original string and a sorted list of spans [a, b) of it that now show `disp` (a marker,
+    or a marker with the rest of an earlier one). A position is a key (p, off): the original character p, or the character
+    `off` of the display of the span that starts at p. One edit costs the edit, never a copy of the text."""
+
+    def __init__(self, text, order, index, cand):
+        self.text, self.n, self.order, self.index, self.cand = text, len(text), order, index, cand
+        self.sa, self.sb, self.sd = [], [], []
+        self.rh, self.inq = sorted(cand), set(cand)  # a sorted list is a heap
+        self.cur, self.ptr, self.heap = -1, (-1, 0), []
+
+    def read(self, key, want):
+        """Up to `want` characters of the current text from `key`; None when `key` is not a character of it."""
+        p, off = key
+        sa, sb, sd = self.sa, self.sb, self.sd
+        k = bisect.bisect_left(sa, p)
+        parts = []
+        if k < len(sa) and sa[k] == p:
+            disp = sd[k]
+            if off >= len(disp):
+                return None
+            piece = disp[off:off + want]
+            parts.append(piece)
+            want -= len(piece)
+            p = sb[k]
+            k += 1
+        elif off or (k and sb[k - 1] > p):
+            return None
+        while want > 0 and p < self.n:
+            e = sa[k] if k < len(sa) else self.n
+            piece = self.text[p:min(e, p + want)]
+            parts.append(piece)
+            want -= len(piece)
+            p += len(piece)
+            if want > 0 and k < len(sa):
+                piece = sd[k][:want]
+                parts.append(piece)
+                want -= len(piece)
+                p = sb[k]
+                k += 1
+            else:
+                break
+        return "".join(parts)
+
+    def advance(self, key, count):
+        """The key of the character `count` characters after `key`."""
+        p, off = key
+        sa, sb, sd = self.sa, self.sb, self.sd
+        k = bisect.bisect_left(sa, p)
+        if k < len(sa) and sa[k] == p:
+            if count < len(sd[k]) - off:
+                return (p, off + count)
+            count -= len(sd[k]) - off
+            p = sb[k]
+            k += 1
+        while True:
+            e = sa[k] if k < len(sa) else self.n
+            if count < e - p:
+                return (p + count, 0)
+            count -= e - p
+            p = e
+            if k >= len(sa):
+                return (self.n, 0)
+            if count < len(sd[k]):
+                return (p, count)
+            count -= len(sd[k])
+            p = sb[k]
+            k += 1
+
+    def prev(self, key):
+        p, off = key
+        if off:
+            return (p, off - 1)
+        k = bisect.bisect_left(self.sa, p) - 1
+        if k >= 0 and self.sb[k] == p:
+            return (self.sa[k], len(self.sd[k]) - 1)
+        return (p - 1, 0) if p else None
+
+    def add(self, rank, key):
+        if rank < self.cur:
+            return
+        c = self.cand.get(rank)
+        if c is None:
+            c = self.cand[rank] = set()
+        c.add(key)
+        if rank == self.cur:
+            if key >= self.ptr:
+                heapq.heappush(self.heap, key)
+        elif rank not in self.inq:
+            self.inq.add(rank)
+            heapq.heappush(self.rh, rank)
+
+    def write(self, start, end):
+        """Replace the characters from `start` to `end` by one marker, then look up the windows that overlap what was written."""
+        (p0, o0), (p1, o1) = start, end
+        sa = self.sa
+        k0 = bisect.bisect_left(sa, p0)
+        prefix = self.sd[k0][:o0] if k0 < len(sa) and sa[k0] == p0 else ""
+        k1 = bisect.bisect_left(sa, p1)
+        suffix, b = "", p1
+        if k1 < len(sa) and sa[k1] == p1 and o1 > 0:
+            suffix, b = self.sd[k1][o1:], self.sb[k1]
+            k1 += 1
+        sa[k0:k1], self.sb[k0:k1], self.sd[k0:k1] = [p0], [b], [prefix + _SCRUB_MARK + suffix]
+        lp = len(prefix)
+        self.ptr = (p0, lp + len(_SCRUB_MARK)) if suffix else end
+        back, kk = [], (p0, lp)
+        for _ in range(MIN_FRAGMENT - 1):
+            kk = self.prev(kk)
+            if kk is None:
+                break
+            back.append(kk)
+        back.reverse()
+        keys = back + [(p0, lp + t) for t in range(len(_SCRUB_MARK) + len(suffix))]
+        ctx = self.read(keys[0], len(keys) + MIN_FRAGMENT - 1)
+        for t, key in enumerate(keys):
+            window = ctx[t:t + MIN_FRAGMENT]
+            if len(window) == MIN_FRAGMENT:
+                for rank in self.index.get(window, ()):
+                    self.add(rank, key)
+
+    def sweep(self, rank, whole, sec):
+        """One pass over the candidate positions of one secret: its whole occurrences `whole`, or (None) its runs."""
+        self.heap = heap = list(self.cand.get(rank, ()))
+        heapq.heapify(heap)
+        self.ptr = (-1, 0)
+        while heap:
+            key = heapq.heappop(heap)
+            if key < self.ptr:
+                continue
+            if whole is not None:
+                if self.read(key, len(whole)) != whole:
+                    continue
+                end = self.advance(key, len(whole))
+            else:
+                head = self.read(key, MIN_FRAGMENT)
+                if head is None or len(head) < MIN_FRAGMENT or head not in sec:
+                    continue
+                lo = len(self.read(key, len(sec)))
+                if self.read(key, lo) not in sec:  # a piece of a piece is a piece: the longest one is found by halving
+                    low, hi = MIN_FRAGMENT, lo - 1
+                    while low < hi:
+                        mid = (low + hi + 1) // 2
+                        if self.read(key, mid) in sec:
+                            low = mid
+                        else:
+                            hi = mid - 1
+                    lo = low
+                end = self.advance(key, lo)
+            self.write(key, end)
+
+    def run(self):
+        while self.rh:
+            rank = heapq.heappop(self.rh)
+            self.inq.discard(rank)
+            self.cur = rank
+            sec = self.order[rank]
+            for whole in {sec, sec.strip()}:
+                self.sweep(rank, whole, sec)
+            self.sweep(rank, None, sec)
+            self.cand.pop(rank, None)
+        parts, pos = [], 0
+        for a, b, disp in zip(self.sa, self.sb, self.sd):
+            parts.append(self.text[pos:a])
+            parts.append(disp)
+            pos = b
+        parts.append(self.text[pos:])
+        return "".join(parts)
+
+
+def _scrub_secrets(text, secrets_known):
+    """Every known secret and every 8+ character piece of one removed from `text`: ONE probe of the index for each position,
+    then each secret is applied only at the positions that hold a piece of it; the text is rebuilt once."""
+    built = _scrub_built(secrets_known)
+    order, index = built[1], built[2]
+    cand, get = {}, index.get
+    for i in range(len(text) - MIN_FRAGMENT + 1):
+        for rank in get(text[i:i + MIN_FRAGMENT], ()):
+            if rank in cand:
+                cand[rank].add((i, 0))
+            else:
+                cand[rank] = {(i, 0)}
+    return _ScrubSpans(text, order, index, cand).run() if cand else text
+
+
 def scrub(text, secrets_known=(), limit=300):
     """THE one place kubectl output (and anything built from it) is made safe to show, log or audit: the exact values
     of this run's secrets and any 8+ character piece of one, token-shaped strings and long base64/hex runs are removed,
     then the text is cut to `limit`. Control characters become '?'."""
     text = str(text)[:SCRUB_INPUT_MAX]
-    for sec in sorted({v for v in secrets_known if v and len(v.strip()) >= MIN_FRAGMENT}, key=len, reverse=True):
-        for v in {sec, sec.strip()}:
-            text = text.replace(v, "[redacted]")
-        out, i = [], 0
-        while i < len(text):  # any run of 8+ characters that is a piece of the secret
-            head = text[i:i + MIN_FRAGMENT]
-            if len(head) == MIN_FRAGMENT and head in sec:
-                j = i + MIN_FRAGMENT
-                while j < len(text) and text[i:j + 1] in sec:
-                    j += 1
-                out.append("[redacted]")
-                i = j
-            else:
-                out.append(text[i])
-                i += 1
-        text = "".join(out)
+    text = _scrub_secrets(text, secrets_known)
     for pat, repl in CREDENTIAL_SHAPES:
         text = pat.sub(repl, text)
     for pat in TOKEN_SHAPES:
@@ -1387,7 +1761,7 @@ class Kube:
         self.context = (env.get("CW_KUBE_CONTEXT") or "").strip()
         self.kubeconfig = (env.get("CW_KUBECONFIG") or "").strip()
         self.dir = None
-        self.known = set()  # values of this run's secrets, known to scrub(); never logged
+        self.known = KnownSet()  # values of this run's secrets, known to scrub(); never logged
         if token_mode(env):
             self._generate_kubeconfig(env)
 
@@ -1778,7 +2152,7 @@ def render_pod(a, worker, name, now, hard, env, run_names=()):
             puller = {k: env[k].strip() for k in STACK_REGISTRY_KEYS}
     pod = {"apiVersion": "v1", "kind": "Pod", "metadata": {
         "name": name, "labels": {"app": LABEL, "cw/worker": worker, "azure.workload.identity/use": "true"},
-        "annotations": {"cw/worker": worker, "cw/started": iso(now), "cw/hard-deadline": iso(hard),
+        "annotations": {SAFE_TO_EVICT_KEY: "false", "cw/worker": worker, "cw/started": iso(now), "cw/hard-deadline": iso(hard),
                         "cw/idle-seconds": e["CW_IDLE_SECONDS"], "cw/shape": a.shape,
                         "cw/max-hard": iso(now + dt.timedelta(seconds=parse_duration(a.max_hard or DEFAULT_MAX_HARD))),
                         **({"cw/run-id": a.run_id} if getattr(a, "run_id", None) else {}),
@@ -1966,6 +2340,7 @@ class Launcher:
             return {"worker": worker, "url": "https://worker-%s.%s:4096" % (name, domain),
                     "auth_ref": "file:/run/cw/%s.password" % worker, "runtime_id": "pod/" + name,
                     "idle_deadline": iso(now + dt.timedelta(seconds=parse_duration(a.idle))), "hard_deadline": iso(hard),
+                    "idle_seconds": parse_duration(a.idle), "hard_seconds": parse_duration(a.hard),
                     "password_fd": a.password_fd}
         old = self._catch_signals()
         try:
@@ -3354,7 +3729,7 @@ def build_parser():
     c = cmd("create")
     c.add_argument("--repo", required=True)
     c.add_argument("--branch", required=True)
-    c.add_argument("--idle", default="10m")
+    c.add_argument("--idle", default="30m")
     c.add_argument("--hard", default="2h")
     c.add_argument("--max-hard", default=DEFAULT_MAX_HARD)
     c.add_argument("--shape", default=None, help="the pod shape, one of %s; unset: %s (%s with --stack, %s with --agent orchestrator)" % (", ".join(SHAPES), DEFAULT_SHAPE, DEFAULT_STACK_SHAPE, DEFAULT_ORCHESTRATOR_SHAPE))
