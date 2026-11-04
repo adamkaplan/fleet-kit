@@ -50,7 +50,7 @@ A code change gets a no-commit rehearsal pod first: see `docs/plan-template.md` 
 
 `fleet-switchboard plan check <owner/repo#N> [--ask <owner/repo#N>] [--json]` prints `PASS` or `FAIL`, one defect per line,
 and the plan hash (editing anything changes it). Before sending a draft, run `plan check --file <plan> --done-when <the
-issue's Done-when>` (body: `## Intent`, then `Done when:`, which may be a numbered list; format 2: `clauses:`, `scenarios:` yaml blocks) and fix every defect.
+issue's Done-when>` (`## Intent` before `Done when:`, which may be a numbered list; format 2: `clauses:`, `scenarios:` yaml blocks) and fix every defect.
 
 ## The form
 
