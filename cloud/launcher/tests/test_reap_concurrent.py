@@ -514,7 +514,7 @@ class Mutants(unittest.TestCase):
                                    env=dict(os.environ, **{MODULE_ENV: cpath}), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
             cout = c.communicate(timeout=90)[0]
             self.assertEqual(c.returncode, 0, cout)
-            path = mutant(tmp, "m9", [("for v in tuple(secrets_known) if v", "for v in secrets_known if v")])
+            path = mutant(tmp, "m9", [("order = sorted({v for v in snap if v", "order = sorted({v for v in secrets_known if v")])
             p = stub_support.start(self, [sys.executable, "-m", "unittest", "test_reap_concurrent.ScrubSnapshot"], cwd=HERE,
                                    env=dict(os.environ, **{MODULE_ENV: path}), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
             out = p.communicate(timeout=90)[0]
