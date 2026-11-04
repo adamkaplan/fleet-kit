@@ -39,6 +39,45 @@ def is_busy(active):
     return any(not isinstance(v, dict) or v.get("type") in (None, "running") for v in active.values())
 
 
+def _stat(proc, pid):
+    """(state, ppid) of a pid from <proc>/<pid>/stat; the name field may hold spaces, so split after the last ')'."""
+    with open("%s/%s/stat" % (proc, pid)) as f:
+        rest = f.read().rsplit(")", 1)[1].split()
+    return rest[0], int(rest[1])
+
+
+def has_live_child(proc="/proc"):
+    """True when a live process descends from pid 1 (the agent AND its headless server, one process) other than pid 1,
+    the process running this tool and its own ancestors back to pid 1 (the tool call that started it); zombies do not
+    count. Never raises: any read error means no child."""
+    try:
+        ppid = {}
+        state = {}
+        for name in os.listdir(proc):
+            if name.isdigit():
+                try:
+                    state[int(name)], ppid[int(name)] = _stat(proc, name)
+                except (OSError, ValueError, IndexError):
+                    pass
+        own = set()
+        pid = os.getpid()
+        while pid > 1 and pid in ppid and pid not in own:
+            own.add(pid)
+            pid = ppid[pid]
+        for pid, parent in ppid.items():
+            if pid == 1 or pid in own or state[pid] in ("Z", "X"):
+                continue
+            seen = set()
+            while parent > 1 and parent in ppid and parent not in seen:
+                seen.add(parent)
+                parent = ppid[parent]
+            if parent == 1:
+                return True
+        return False
+    except Exception:
+        return False
+
+
 def to_dt(ms):
     if isinstance(ms, bool) or not isinstance(ms, (int, float)):
         return None
@@ -77,7 +116,7 @@ def main():
             last = dt.datetime.fromisoformat(os.environ["CW_STARTED"].replace("Z", "+00:00"))
         except (KeyError, ValueError):
             last = dt.datetime.now(dt.timezone.utc)
-    print(json.dumps({"busy": is_busy(active), "last_activity": last.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}))
+    print(json.dumps({"busy": is_busy(active) or has_live_child(), "last_activity": last.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}))
     return 0
 
 
