@@ -414,6 +414,7 @@
         "bin/item_verdicts.py",
         "bin/plan_review.py",
         "bin/pr_events.py",
+        "bin/push_watch.py",
         "bin/queue_ejections.py",
         "bin/record_json.py",
         "bin/reassign.py",
@@ -509,6 +510,9 @@
         ],
         "bin/queue_ejections.py": [
           "validate"
+        ],
+        "bin/push_watch.py": [
+          "settings"
         ],
         "bin/reassign.py": [
           "*"

@@ -6084,6 +6084,7 @@ ADOPT_BY_DAEMON = "the switchboard"
 BOSS_READ_SITES = {
     "bin/fleet-switchboard:headless_target": "a retired worker is not discovered: its STORED metadata (boss record applied), resolved through `resolve_boss`, as `reattach_caller_problem` does",
     "bin/lost_worker.py:_losses": "a cloud worker is not discovered: the launching lane is the `reports_to` text of its own cloud record, only the address of an alert (the loss is told to the Chief of Staff too)",
+    "bin/push_watch.py:run_pass": "a cloud worker is not discovered: the launching lane is the `reports_to` text of its own cloud record, only the address of a push item (the item is told to that lane and nobody else)",
     "bin/switchboard/handoff.py:_boss_of": "the literal text; `boss_name` is built on it",
     "bin/fleet-switchboard:notice_boss": "resolves the text through `resolve_boss`, over a discovery that already applies the boss record",
     "bin/fleet-switchboard:reattach_caller_problem": "a dead agent is not discovered: its STORED metadata, overlaid with the boss record",
@@ -9683,6 +9684,16 @@ def lost_worker_tick(engine, discovery):
     return module.run_pass(ns, engine, engine.now(), alive)
 
 
+def push_watch_tick(engine, discovery):
+    """#1740: the lane that launched a cloud worker is told of its pushes and of its quiet after a push (bin/push_watch.py, by path like lost_worker_tick)."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("push_watch", os.path.join(os.path.dirname(os.path.realpath(__file__)), "push_watch.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    ns = types.SimpleNamespace(parse_iso=parse_iso, _one_line=_one_line, parse_bounded=load_module("record_json").parse_bounded)
+    return module.run_pass(ns, engine, engine.now(), lambda path: engine.gh_api(path, paginate=False), (getattr(engine, "config", None) or {}).get("push_watch"))
+
+
 def finish_pass(engine, discovery, report):
     """The end of a pass: reminders that reached their recipient are pruned. A failure is
     audited and never stops the pass."""
@@ -9718,6 +9729,10 @@ def finish_pass(engine, discovery, report):
         lost_worker_tick(engine, discovery)   # #1481: a lost worker is told once to its lane and the Chief of Staff
     except Exception as err:
         engine._failed("lost-worker", "lost-worker", err, report)
+    try:
+        push_watch_tick(engine, discovery)   # #1740: a worker's push is told to the lane that launched it
+    except Exception as err:
+        engine._failed("push-watch", "push-watch", err, report)
     try:
         publish_decisions(engine)
     except Exception as err:

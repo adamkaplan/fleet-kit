@@ -158,7 +158,7 @@ class FinishPass(unittest.TestCase):
         quiet = lambda *a, **k: None
         engine = types.SimpleNamespace(audit=None, actor="daemon", now=lambda: 0)
         engine._failed = lambda subject, step, err, report: failed.append(step)
-        with mock.patch.multiple(sb, cloud_end_tick=bump("end"), cloud_turn_tick=turn, lost_worker_tick=bump("lost"), cloud_watch_tick=quiet,
+        with mock.patch.multiple(sb, cloud_end_tick=bump("end"), cloud_turn_tick=turn, lost_worker_tick=bump("lost"), cloud_watch_tick=quiet, push_watch_tick=quiet,
                                  health_write=quiet, prune_delivered_reminders=quiet, friction_tick=quiet, load_tick=quiet, prune_report_riders=quiet,
                                  publish_decisions=quiet, write_catching_up=quiet, schedule_judge_warm=quiet):
             sb.finish_pass(engine, None, {"errors": []})
