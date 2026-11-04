@@ -2995,6 +2995,9 @@ class Switchboard:
                 return decide(recipient, facts, None, now, self.batch_seconds, self.engaged_seconds,
                               "cannot read what %s already has: %s" % (recipient, err))
             pending = [fact for fact in facts if fact.key not in delivered]
+            if self.sent is not None and len(pending) != len(facts):   # the ledger answered (v2_light)
+                self._note("resend.skipped", recipient, {"why": "the key was already delivered to this session (sent-keys ledger)",
+                                                         "keys": sorted(fact.key for fact in facts if fact.key in delivered)})
             self._acknowledge(delivered)
             if pending and not complete:
                 return decide(recipient, pending, None, now, self.batch_seconds, self.engaged_seconds,
