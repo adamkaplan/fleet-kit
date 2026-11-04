@@ -76891,7 +76891,7 @@ class TestCiRecordCarry(LedgerBase):
         self.step()
         rest = [json.loads(l) for l in self.ledger_bytes().splitlines() if '"kind": "carried"' not in l]
         self.assertEqual([l for l in self.ledger_bytes().splitlines() if '"kind": "carried"' not in l][:len(before)], before)
-        ci = [(e["scenario"], e["head"], e["by"]) for e in rest[len(before):]]
+        ci = [(e["kind"], e["scenario"], e["head"], e["by"]) for e in rest[len(before):]]
         self.assertEqual(sorted(ci), [("S1", self.NEW, sb.plan_ledger.CI_RECORDER), ("U1", self.NEW, sb.plan_ledger.CI_RECORDER)])
 
     def test_U1_the_step_decides_as_the_rule_does_on_six_combinations(self):
