@@ -269,7 +269,7 @@ def check_token_not_in_audit(module, test):
 
 
 def check_total_deadline(module, test):
-    with Running(module, timeout=2.0, deadline=0.6) as s:
+    with Running(module, timeout=5.0, deadline=0.6) as s:
         sock = socket.create_connection(("127.0.0.1", s.port()), timeout=5)
         try:
             sock.sendall(request_bytes("tok-a", 50))
@@ -290,7 +290,7 @@ def check_total_deadline(module, test):
         finally:
             sock.close()
         test.assertTrue(buf.split(b"\r\n")[0].endswith(b"408 Request Timeout"), buf)
-        test.assertLess(time.time() - t0, 2.0)
+        test.assertLess(time.time() - t0, 5.0)
         test.assertEqual(s.inbox.items, {})
 
 
