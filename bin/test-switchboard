@@ -77890,14 +77890,33 @@ class TestNoPaneToJudge(StandInPids, Base):
         "write_pane_health": "keeps a dead row's time; judges nothing",
     }
 
-    @staticmethod
-    def readers_without_the_predicate(source, exempt=(), needles=("PANE_DEAD", "GONE_STATES", "PANE_MISSING_PASSES", "pane_alerts")):
+    _PARSED = {}   # source text -> (tree, lines): each entry is parsed and split ONCE
+
+    @classmethod
+    def parsed(cls, source):
         import ast
-        tree = ast.parse(source)
+        if source not in cls._PARSED:
+            cls._PARSED[source] = (ast.parse(source), source.encode("utf-8").splitlines(keepends=True))
+        return cls._PARSED[source]
+
+    @classmethod
+    def segment(cls, source, node):
+        """ast.get_source_segment on the cached lines (same slicing, no re-split per node)."""
+        lines = cls.parsed(source)[1]
+        first, last = node.lineno - 1, node.end_lineno - 1
+        if first == last:
+            return lines[first][node.col_offset:node.end_col_offset].decode("utf-8")
+        parts = [lines[first][node.col_offset:]] + lines[first + 1:last] + [lines[last][:node.end_col_offset]]
+        return b"".join(parts).decode("utf-8")
+
+    @classmethod
+    def readers_without_the_predicate(cls, source, exempt=(), needles=("PANE_DEAD", "GONE_STATES", "PANE_MISSING_PASSES", "pane_alerts")):
+        import ast
+        tree = cls.parsed(source)[0]
         out = []
         for node in ast.walk(tree):
             if isinstance(node, ast.FunctionDef):
-                text = ast.get_source_segment(source, node) or ""
+                text = cls.segment(source, node)
                 if any(n in text for n in needles) and "no_pane_to_judge" not in text and node.name not in exempt:
                     out.append(node.name)
         return sorted(out)
@@ -77912,8 +77931,8 @@ class TestNoPaneToJudge(StandInPids, Base):
 
     def readers_with(self, source):
         import ast
-        return [n.name for n in ast.walk(ast.parse(source)) if isinstance(n, ast.FunctionDef)
-                and "no_pane_to_judge" in (ast.get_source_segment(source, n) or "")]
+        return [n.name for n in ast.walk(self.parsed(source)[0]) if isinstance(n, ast.FunctionDef)
+                and "no_pane_to_judge" in self.segment(source, n)]
 
     # -- M2: block level. Every OUTERMOST loop or comprehension (inside a function that mentions a needle) that itself mentions a needle must contain the predicate.
     BLOCK_NEEDLES = ("PANE_DEAD", "GONE_STATES", "PANE_MISSING_PASSES")
@@ -77929,7 +77948,7 @@ class TestNoPaneToJudge(StandInPids, Base):
         needles = needles or cls.BLOCK_NEEDLES
         loops = (ast.For, ast.AsyncFor, ast.While, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
         out = []
-        for fn in ast.walk(ast.parse(source)):
+        for fn in ast.walk(cls.parsed(source)[0]):
             if not isinstance(fn, ast.FunctionDef) or fn.name in exempt_functions:
                 continue
             found, stack = [], list(ast.iter_child_nodes(fn))
@@ -77943,7 +77962,7 @@ class TestNoPaneToJudge(StandInPids, Base):
                     stack = list(ast.iter_child_nodes(node)) + stack
             n = 0
             for node in found:
-                text = ast.get_source_segment(source, node) or ""
+                text = cls.segment(source, node)
                 if any(w in text for w in needles):
                     if "no_pane_to_judge" not in text:
                         out.append((fn.name, n))
