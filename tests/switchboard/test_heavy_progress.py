@@ -13,15 +13,38 @@ import unicodedata
 import unittest
 from unittest import mock
 
-from support.loader import sb
-from support.herdr_world import made_up_pid
+
+
+class _LazySb:
+    """support.loader loads the whole switchboard (about 4.5 s); the scratch-copy child processes never need it, so it is imported on first use."""
+    def __getattr__(self, name):
+        from support.loader import sb as real
+        return getattr(real, name)
+
+
+_sb = _LazySb()
+
+
+def _made_up_pid():
+    if os.environ.get("FLEET_TEST_INNER"):   # a scratch child: a number nobody holds, without loading the switchboard just for the helper
+        pid = 4000000 + os.getpid() % 100000
+        while True:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return pid
+            except OSError:
+                pass
+            pid += 1
+    from support.herdr_world import made_up_pid as real
+    return real()
 
 
 def load_heavy():
     """bin/heavy_slots.py as loaded by the suite; FLEET_TEST_HEAVY_SLOTS names a scratch copy to load instead (S10's mutant)."""
     path = os.environ.get("FLEET_TEST_HEAVY_SLOTS")
     if not path:
-        return sb.load_heavy_slots()
+        return _sb.load_heavy_slots()
     spec = importlib.util.spec_from_file_location("heavy_slots_scratch", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -77,7 +100,7 @@ class Rig:
         rig = self
 
         class FakeChild:
-            pid = made_up_pid()   # no such process: the CPU read fails and the line has no CPU part
+            pid = _made_up_pid()   # no such process: the CPU read fails and the line has no CPU part
 
             def __init__(child, argv, **kwargs):
                 rig.starts.append(argv)
@@ -296,13 +319,13 @@ class TestHeavyProgress(unittest.TestCase):
             self.assertEqual(rig.out.text.count(word), 0, word)
 
     def test_u4_the_niceness_is_as_at_the_base(self):
-        hs = sb.load_heavy_slots()
+        hs = _sb.load_heavy_slots()
         self.assertEqual(hs.command_prefix(lambda name: "/usr/bin/" + name if name == "taskpolicy" else None, environ={}), ["/usr/bin/taskpolicy", "-b"])
         self.assertEqual(hs.command_prefix(lambda name: "/usr/bin/nice" if name == "nice" else None, environ={}), ["/usr/bin/nice", "-n", "10"])
         self.assertEqual(hs.command_prefix(lambda name: None, environ={}), [])
 
     def test_u6_the_interval_is_60_and_an_environment_value_shortens_it(self):
-        hs = sb.load_heavy_slots()
+        hs = _sb.load_heavy_slots()
         self.assertEqual((hs.PROGRESS_EVERY, hs.WAIT_REPORT_SECONDS, hs.DEFAULT_WAIT_MAX), (60, 30, 1800))
         rig = Rig(self, alive=200)
         self.assertEqual(set(rig.pauses), {60})
@@ -392,7 +415,7 @@ class TestHeavyProgress(unittest.TestCase):
                 child = subprocess.Popen([sys.executable, __file__, "TestHeavyProgress.test_s14_inner_a_blocked_write_does_not_hold_the_return"], cwd=here, env=env,
                                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
                 try:
-                    output, _ = child.communicate(timeout=60)   # the outer bound: only the mutant reaches it
+                    output, _ = child.communicate(timeout=float(os.environ.get("FLEET_TEST_S14_BOUND", "20")))   # the outer bound: only the mutant reaches it
                     outcome[kind] = (child.returncode, output, False)
                 except subprocess.TimeoutExpired:
                     child.send_signal(signal.SIGUSR1)   # the job's kill notice: the child names the hang and ends
