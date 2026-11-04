@@ -1870,11 +1870,11 @@ def fact_sources(state_dir):
     """Every fact source, in order: callables that each return a list of Facts.
 
     The one registration point. Worker facts (PR 4), GitHub facts (PR 5) and
-    reminders join this list. `send` is not a source: it delivers directly, by
-    the same rule, and stores nothing.
+    reminders join this list. `send` delivers directly, by the same rule, and
+    stores only a send held for a blocked agent (HeldSendFacts).
     """
     return [lab_fact_source(state_dir), WorkerFacts(), ReminderFacts(state_dir), ReportRiderFacts(state_dir),
-            ForegroundFacts(), OrdersFacts(), SweepFacts(), TriageFacts(), PlanWakeFacts(), AlertWakeFacts(), RedCiFacts(), JobFacts(), PaneFacts(), PaneExitFacts(), HeadlessRestartFacts(), DiskFacts(), CpuFacts(), SpotlightFacts(), DockerReapFacts(), TempJanitorFacts(), HeavyOrphanFacts()]
+            ForegroundFacts(), OrdersFacts(), SweepFacts(), TriageFacts(), PlanWakeFacts(), AlertWakeFacts(), RedCiFacts(), JobFacts(), PaneFacts(), PaneExitFacts(), HeadlessRestartFacts(), DiskFacts(), CpuFacts(), SpotlightFacts(), DockerReapFacts(), TempJanitorFacts(), HeavyOrphanFacts(), ScratchBoundFacts()]
 
 
 # --------------------------------------------------------- observing the fleet
@@ -2995,6 +2995,9 @@ class Switchboard:
                 return decide(recipient, facts, None, now, self.batch_seconds, self.engaged_seconds,
                               "cannot read what %s already has: %s" % (recipient, err))
             pending = [fact for fact in facts if fact.key not in delivered]
+            if self.sent is not None and len(pending) != len(facts):   # the ledger answered (v2_light)
+                self._note("resend.skipped", recipient, {"why": "the key was already delivered to this session (sent-keys ledger)",
+                                                         "keys": sorted(fact.key for fact in facts if fact.key in delivered)})
             self._acknowledge(delivered)
             if pending and not complete:
                 return decide(recipient, pending, None, now, self.batch_seconds, self.engaged_seconds,
@@ -3342,9 +3345,14 @@ class Switchboard:
                     outcome = self.deliver(plan)
                     if outcome["sent"]:
                         report["sent"].append(dict(outcome, recipient=recipient))
+                        release_held_sends(self.state_dir, recipient, [f.key for f in plan.pending if f.kind == "send"]) if self.state_dir is not None else None
             except Exception as err:
                 self._failed(recipient, "deliver", err, report)
         self.render(discovery, held, now, report)
+        try:
+            held_sends_tick(self, self.now())
+        except Exception as err:
+            self._failed("held-sends", "held-sends", err, report)
         try:
             blocked_tick(self, discovery, held)
         except Exception as err:
@@ -3457,7 +3465,7 @@ class Switchboard:
     # -- the CLI's entry points
 
     def send(self, sender, recipient, text, issue=None, repo=None, interrupt=False):
-        """Deliver `text` to `recipient` now, by the rule, without batching. Stores nothing. `interrupt`: only a
+        """Deliver `text` to `recipient` now, by the rule, without batching; a send to a blocked recipient is held. `interrupt`: only a
         boss to its own worker; raises InterruptRefused otherwise."""
         now = self.now()
         discovery = self.discover(now)
@@ -3498,6 +3506,8 @@ class Switchboard:
         if plan.action == "hold":
             if self.audit is not None:
                 self.audit.append(self.actor, "hold", recipient, {"reason": plan.reason, "keys": [fact.key]})
+            if fact.kind == "send" and fact.key.startswith("send:") and self.state_dir is not None and held_send_applies(plan.observation):
+                return hold_send_fact(self, fact, now)   # #2051: a send to a blocked agent is held, never refused
             note_held_send(self.state_dir, recipient, fact.sender, now, plan.observation)
             return {"sent": False, "action": "hold", "reason": plan.reason}
         return self.deliver(plan, interrupt=interrupt)
@@ -6077,6 +6087,7 @@ ADOPT_BY_DAEMON = "the switchboard"
 BOSS_READ_SITES = {
     "bin/fleet-switchboard:headless_target": "a retired worker is not discovered: its STORED metadata (boss record applied), resolved through `resolve_boss`, as `reattach_caller_problem` does",
     "bin/lost_worker.py:_losses": "a cloud worker is not discovered: the launching lane is the `reports_to` text of its own cloud record, only the address of an alert (the loss is told to the Chief of Staff too)",
+    "bin/push_watch.py:run_pass": "a cloud worker is not discovered: the launching lane is the `reports_to` text of its own cloud record, only the address of a push item (the item is told to that lane and nobody else)",
     "bin/switchboard/handoff.py:_boss_of": "the literal text; `boss_name` is built on it",
     "bin/fleet-switchboard:notice_boss": "resolves the text through `resolve_boss`, over a discovery that already applies the boss record",
     "bin/fleet-switchboard:reattach_caller_problem": "a dead agent is not discovered: its STORED metadata, overlaid with the boss record",
@@ -9676,6 +9687,16 @@ def lost_worker_tick(engine, discovery):
     return module.run_pass(ns, engine, engine.now(), alive)
 
 
+def push_watch_tick(engine, discovery):
+    """#1740: the lane that launched a cloud worker is told of its pushes and of its quiet after a push (bin/push_watch.py, by path like lost_worker_tick)."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("push_watch", os.path.join(os.path.dirname(os.path.realpath(__file__)), "push_watch.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    ns = types.SimpleNamespace(parse_iso=parse_iso, _one_line=_one_line, parse_bounded=load_module("record_json").parse_bounded)
+    return module.run_pass(ns, engine, engine.now(), lambda path: engine.gh_api(path, paginate=False), (getattr(engine, "config", None) or {}).get("push_watch"))
+
+
 def finish_pass(engine, discovery, report):
     """The end of a pass: reminders that reached their recipient are pruned. A failure is
     audited and never stops the pass."""
@@ -9712,9 +9733,17 @@ def finish_pass(engine, discovery, report):
     except Exception as err:
         engine._failed("lost-worker", "lost-worker", err, report)
     try:
+        push_watch_tick(engine, discovery)   # #1740: a worker's push is told to the lane that launched it
+    except Exception as err:
+        engine._failed("push-watch", "push-watch", err, report)
+    try:
         publish_decisions(engine)
     except Exception as err:
         engine._failed("decisions", "decisions", err, report)
+    try:
+        publish_cockpit(engine)   # #1423: the Cockpit's fleet feed (cockpit.json), read-only over the files the pass just wrote; never stops the pass
+    except Exception as err:
+        engine._failed("cockpit", "cockpit", err, report)
     try:
         write_catching_up(engine)
     except Exception as err:
@@ -11267,7 +11296,7 @@ def blocked_kind(engine, observation, resumed=False):
     return ended_turn_text(observation.name, resumed)
 
 
-BLOCKED_HELD_SENDS = "blocked-held-sends.json"   # {agent: {"rows": [{"from", "at"}]}}: sends refused while it was blocked (a `send` stores nothing, so the report counts them here)
+BLOCKED_HELD_SENDS = "blocked-held-sends.json"   # {agent: {"rows": [{"from", "at"}]}}: sends refused while it was blocked (who and when, no text; a send held for it is in held-sends.json)
 BLOCKED_LOCK = "blocked-alert.lock"
 BLOCKED_HELD_KEEP = 100      # rows kept per agent: the recorded case held 11 messages in 2.5 hours, so this is about nine times that
 BLOCKED_HELD_AGENTS = 64     # agents kept in the file: the number blocked at once in a fleet is a handful; 64 is far above any real fleet
@@ -11444,6 +11473,160 @@ def blocked_tick(engine, discovery, held):
     if changed or done:
         blocked_update(engine.state_dir, BLOCKED_ALERT_STATE, lambda _: state)
     return done
+
+
+# ------------------------------------------------- held sends (#2051): a send to a blocked agent waits, it is not refused
+
+HELD_SENDS = "held-sends.json"       # {recipient: {"rows": [{"key", "from", "at", "text", "issue", "repo", "route"}]}}: a send held while its recipient was blocked
+HELD_SENDS_KEEP = 50                 # rows kept per recipient: the 51st send drops the oldest, and its sender is told
+HELD_SENDS_SECONDS = 24 * 3600       # a held send older than this is dropped, and its sender is told
+HELD_ROUTE_PANE, HELD_ROUTE_ENDPOINT = "pane", "endpoint"
+
+
+def held_send_applies(observation):
+    """A send is held only for the `blocked` reason (a permission request or a question): nothing else would end by itself."""
+    return observation is not None and observation.status == "blocked" and not observation.conflict and not observation.problem
+
+
+def _held_first_words(text):
+    return _one_line(" ".join(str(text).split()[:8]), 60)
+
+
+def hold_send(state_dir, recipient, sender, text, issue, repo, now, route):
+    """Keep one send. Returns (key, dropped rows of this recipient: the oldest over the cap, and any older than 24 hours)."""
+    key = "send:%s:%s" % (sender, uuid.uuid4().hex[:16])
+    row = {"key": key, "from": sender, "at": now, "text": text, "issue": issue, "repo": repo, "route": route}
+    dropped = []
+
+    def add(state):
+        entry = state.get(recipient)
+        rows = [r for r in (entry.get("rows") if isinstance(entry, dict) else None) or [] if isinstance(r, dict)]
+        dropped.extend(r for r in rows if _is_number(r.get("at")) and now - r["at"] > HELD_SENDS_SECONDS)
+        rows = [r for r in rows if r not in dropped] + [row]
+        dropped.extend(rows[:-HELD_SENDS_KEEP])
+        state[recipient] = {"rows": rows[-HELD_SENDS_KEEP:]}
+        return state
+    blocked_update(state_dir, HELD_SENDS, add)
+    return key, dropped
+
+
+def held_rows(state_dir, route=None):
+    """(recipient, row) for every held send, oldest first; `route` keeps one route's rows. A row that is not whole is skipped."""
+    found = []
+    for recipient, entry in _read_small(state_dir, HELD_SENDS).items():
+        for row in entry.get("rows") or []:
+            if (isinstance(row, dict) and isinstance(row.get("key"), str) and isinstance(row.get("text"), str) and isinstance(row.get("from"), str)
+                    and _is_number(row.get("at")) and (route is None or row.get("route") == route)):
+                found.append((recipient, row))
+    return sorted(found, key=lambda pair: (pair[1]["at"], pair[1]["key"]))
+
+
+def release_held_sends(state_dir, recipient, keys):
+    """Forget the held sends of `recipient` whose keys were delivered. Never raises: a row left is skipped by the dedupe and dropped at 24 hours."""
+    keys = set(keys)
+
+    def drop(state):
+        entry = state.get(recipient)
+        rows = (entry.get("rows") if isinstance(entry, dict) else None) or []
+        kept = [r for r in rows if not (isinstance(r, dict) and r.get("key") in keys)]
+        if len(kept) == len(rows):
+            return None
+        if kept:
+            state[recipient] = {"rows": kept}
+        else:
+            state.pop(recipient, None)
+        return state
+    try:
+        blocked_update(state_dir, HELD_SENDS, drop)
+    except OSError:
+        pass
+
+
+def expire_held_sends(state_dir, now):
+    """Remove every held send older than 24 hours; returns [(recipient, row)] removed."""
+    gone = []
+
+    def drop(state):
+        for recipient in list(state):
+            rows = [r for r in state[recipient].get("rows") or [] if isinstance(r, dict)]
+            old = [r for r in rows if not _is_number(r.get("at")) or now - r["at"] > HELD_SENDS_SECONDS]
+            if old:
+                gone.extend((recipient, r) for r in old)
+                kept = [r for r in rows if r not in old]
+                if kept:
+                    state[recipient] = {"rows": kept}
+                else:
+                    state.pop(recipient)
+        return state if gone else None
+    blocked_update(state_dir, HELD_SENDS, drop)
+    return gone
+
+
+def tell_dropped_sends(engine, dropped, now, why):
+    """One message to the sender of each dropped send: who it was for and its first words. Never raises; it is never itself held."""
+    for recipient, row in dropped:
+        try:
+            text = "your send to %s was dropped (%s) and NOT delivered: \"%s\"" % (recipient, why, _held_first_words(row.get("text", "")))
+            if engine.audit is not None:
+                engine.audit.append(engine.actor, "held.drop", recipient, {"from": blocked_sender(row.get("from")), "why": why, "key": row.get("key")})
+            engine.send_fact(Fact("held-drop:%s" % row.get("key"), row["from"], "send", text, now, batch=False, sender="switchboard"),
+                             engine.discover(now), now)
+        except Exception:
+            continue
+
+
+def hold_send_fact(engine, fact, now):
+    """The pane route's hold of a send for a blocked recipient: stored, and its sender told of any send it pushed out."""
+    key, dropped = hold_send(engine.state_dir, fact.recipient, fact.sender, fact.summary, fact.issue, fact.repo, now, HELD_ROUTE_PANE)
+    if engine.audit is not None:
+        engine.audit.append(engine.actor, "held", fact.recipient, {"from": blocked_sender(fact.sender), "key": key})
+    tell_dropped_sends(engine, [(fact.recipient, r) for r in dropped], now, "over %d held sends or older than 24 hours" % HELD_SENDS_KEEP)
+    return {"sent": False, "held": True, "action": "held", "key": key, "reason": "held until %s unblocks" % fact.recipient}
+
+
+def hold_send_endpoint(engine, name, sender, text, issue, now):
+    """The endpoint route's hold: the same store, delivered by held_sends_tick when the registry row is no longer blocked."""
+    issue = None if issue is None else int(issue)
+    key, dropped = hold_send(engine.state_dir, name, sender, text, issue, issue_repo(issue), now, HELD_ROUTE_ENDPOINT)
+    if engine.audit is not None:
+        engine.audit.append(engine.actor, "held", name, {"from": blocked_sender(sender), "key": key})
+    tell_dropped_sends(engine, [(name, r) for r in dropped], now, "over %d held sends or older than 24 hours" % HELD_SENDS_KEEP)
+    return key
+
+
+class HeldSendFacts:
+    """The held sends of agents with a pane, as facts with their own key and sent time: the ordinary rule holds them while the recipient is
+    blocked and delivers them, oldest first, when it is idle or working."""
+
+    __name__ = "held_send_facts"
+
+    def __init__(self, state_dir):
+        self.state_dir = Path(state_dir)
+
+    def __call__(self):
+        return [Fact(row["key"], recipient, "send", row["text"], row["at"], issue=row.get("issue") if isinstance(row.get("issue"), int) else None,
+                     batch=False, sender=row["from"], repo=row.get("repo") if isinstance(row.get("repo"), str) else None)
+                for recipient, row in held_rows(self.state_dir, HELD_ROUTE_PANE)]
+
+
+def held_sends_tick(engine, now):
+    """Each pass: drop what is older than 24 hours (its sender told), then deliver the endpoint route's held sends whose agent is no longer blocked."""
+    if engine.state_dir is None:
+        return
+    tell_dropped_sends(engine, expire_held_sends(engine.state_dir, now), now, "held for more than 24 hours")
+    rows = held_rows(engine.state_dir, HELD_ROUTE_ENDPOINT)
+    if not rows:
+        return
+    es = load_module("endpoint_send")
+    for recipient, row in rows:
+        found = es.route(load_module("registry"), engine.state_dir, recipient)
+        if found[0] != "endpoint" or es.blocked_reason(recipient, found[2], hold_reason):
+            continue
+        release_held_sends(engine.state_dir, recipient, [row["key"]])   # marked delivered BEFORE the post: a lost post is a lost message, never a second one
+        ok, line = es.deliver(load_module("cloud_client"), found[1], row["from"], recipient,
+                              "(sent %s) %s" % (iso(row["at"]), row["text"]), key=row["key"])
+        if not ok:
+            engine._note("held.undelivered", recipient, {"key": row["key"], "reason": _one_line(line, 200)})
 
 
 def add_budget_notice_parsers(sub):
@@ -14810,8 +14993,9 @@ def _send_by_registry(args, runner, now):
         return EXIT_USAGE
     held = es.blocked_reason(args.name, found[2], hold_reason)
     if held:
-        sys.stderr.write("%s: not sent to %s: hold (%s)\n" % (PROG, args.name, held))
-        return EXIT_HELD
+        hold_send_endpoint(engine, args.name, sender, text, args.issue, engine.now())
+        sys.stderr.write("%s: held for %s: %s is blocked; it will be delivered when it unblocks\n" % (PROG, args.name, args.name))
+        return EXIT_OK
     ok, line = es.deliver(load_module("cloud_client"), found[1], sender, args.name, text)
     if not ok:
         sys.stderr.write("%s: not sent to %s: %s\n" % (PROG, args.name, line))
@@ -14862,6 +15046,9 @@ def _cmd_send(args, runner, now):
     except MessageTooLong as err:
         sys.stderr.write("%s: %s\n" % (PROG, err))
         return EXIT_USAGE
+    if outcome.get("held"):
+        sys.stderr.write("%s: held for %s: %s is blocked; it will be delivered when it unblocks\n" % (PROG, args.name, args.name))
+        return EXIT_OK
     if not outcome["sent"]:
         sys.stderr.write("%s: not sent to %s: %s (%s)\n" % (PROG, args.name, outcome["action"], outcome["reason"]))
         return EXIT_HELD
@@ -15676,6 +15863,8 @@ def validate_intent_config(config, source):
 
 _HEADING = re.compile(r"^\s{0,3}#{1,6}\s+(.*?)\s*#*\s*$")
 _DONE_WHEN = re.compile(r"^(?:[-*]\s+)?\**done when\**\s*:\s*\**\s*(.*?)\**\s*$", re.IGNORECASE)
+_CLAUSE_LINE = re.compile(r"^\s{0,3}(?:\d+[.)]|\(\d+\))\s+(\S.*?)\s*$")
+_SUB_LINE = re.compile(r"^(?:\s*[-*+]\s+|\s{2,}|\t)(\S.*?)\s*$")
 _CHARTER_BLOCK = re.compile(r"```ya?ml\s*\n\s*orchestrator\s*:", re.IGNORECASE)
 
 
@@ -15688,9 +15877,12 @@ def parse_intent(body):
     """
     intent = done_when = None
     inside = fenced = False
+    listing = None
     for line in (body or "").splitlines():
         if line.lstrip().startswith(("```", "~~~")):
             fenced = not fenced
+            if listing is not None:
+                break
             continue
         if fenced:
             continue
@@ -15703,11 +15895,28 @@ def parse_intent(body):
         text = line.strip()
         if not inside or not text:
             continue
+        if listing is not None:
+            clause = _CLAUSE_LINE.match(line)
+            if clause:
+                listing.append(clause.group(1))
+                continue
+            sub = _SUB_LINE.match(line)
+            if sub and listing:
+                listing[-1] += " " + sub.group(1)
+                continue
+            if not listing:
+                listing = None
+            else:
+                break
         match = _DONE_WHEN.match(text)
         if match:
+            if done_when is None and not match.group(1).strip():
+                listing = []
             done_when = done_when or match.group(1).strip() or None
         elif intent is None:
             intent = text
+    if listing:
+        done_when = " ".join("(%d) %s" % (n, c) for n, c in enumerate(listing, 1))
     return intent, done_when
 
 
@@ -16055,10 +16264,8 @@ class IntentReader:
         repo = repo or self.repo
         return self._cached(("orders", repo, number), lambda: fetch_orders(self, number, repo))
 
-    NO_PARENT_SHAPE = re.compile(r"(not_found: )?(gh: )?(not found|http 404 no parent)( \(http 404\))?", re.I)
-
     def parent(self, number, repo=None, strict=False):
-        """The parent issue's number, or None when the issue has no parent. `strict` (#1249, charter set): a 404 whose body is not the exact "no parent" shape raises."""
+        """The parent issue's number, or None when the issue has no parent. `strict` (#1249, charter set): the issue is read first, fresh (it raises when it is missing or unreadable), and then a 404 of its parent, whatever its text, is "no parent"."""
         repo = repo or self.repo
 
         def fetch(meta=None):
@@ -16068,13 +16275,13 @@ class IntentReader:
                     return None
             except IntentError as err:
                 if err.reason == "not_found":
-                    if strict and not self.NO_PARENT_SHAPE.fullmatch(str(err).strip()):
-                        raise IntentError("gh", "404 that is not the no-parent answer: %s" % _one_line(str(err), 60)) from None
                     return None
                 raise
             return IssueIntent.from_api(found).number
 
         if strict:   # the charter set's strict read tells "no parent" from an odd 404: it is never answered from the file
+            self.invalidate(number, repo)
+            self.issue(number, repo)   # raises for a missing or unreadable issue: the parent endpoint is not asked
             return self._cached(("parent", repo, number), fetch)
         return self._cached(("parent", repo, number), self._filed("parent", repo, number, fetch, lambda found: {"parent": found}, lambda stored: stored["parent"]))
 
@@ -16970,7 +17177,7 @@ def cmd_prove(args, runner, now):
 cmd_prove.ledger = True   # state and GETs only; its own errors are usage errors
 
 
-def launched_testers_for(ctx):
+def launched_testers_for(ctx, role="tester"):
     """({name: launch record}, {name: session id}, {name: metadata.fleet}) from ONE read of the running agents: the testers the launch record makes testers
     of this PR's repo (#372), and what the lane rule needs. Never raises: a discovery that fails gives nothing launched (so only the configured list
     counts, and the lane rule has nobody to apply to); an unreadable retired list counts every launched tester as retired (fail closed)."""
@@ -16985,7 +17192,7 @@ def launched_testers_for(ctx):
     except Exception as err:   # a corrupt retired file could hide a retired tester: no launched tester counts, loudly (audit; `status` says so too)
         ctx.engine._note("testers.retired_unreadable", None, {"error": _one_line(str(err), 160), "effect": "launch-record testers disabled"})
         return {}, sessions, fleets
-    return load_launch_testers().launched(fleets, sessions, ctx.repo, lambda fleet: _fleet_repo(fleet, ctx.config), retired), sessions, fleets
+    return load_launch_testers().launched(fleets, sessions, ctx.repo, lambda fleet: _fleet_repo(fleet, ctx.config), retired, role), sessions, fleets
 
 
 @recording("verdict")
@@ -17031,15 +17238,15 @@ def cmd_verdict(args, runner, now):
                                      "`notice pr`): its author must do that first, so the author can be excluded" % ctx.pr)
         allowed, launch, sessions, fleets = ctx.config.get("plan_evaluators"), {}, {}, {}
         authors = plan_ledger.authors_of(ctx.entries, ctx.pr, senders, ctx.facts.get("author"))
-        if named == "tester":   # #372: the configured list UNION the testers the launch record names for this repo; any trouble reading it is the configured list alone
+        if named in load_launch_testers().LAUNCHABLE:   # #372: the configured list UNION the testers the launch record names for this repo; any trouble reading it is the configured list alone
             record_step("the agent registry (the launched testers)")
-            launch, sessions, fleets = launched_testers_for(ctx)
-            allowed = load_launch_testers().evaluators(allowed, launch)
+            launch, sessions, fleets = launched_testers_for(ctx, named)
+            allowed = load_launch_testers().evaluators(allowed, launch, named)
         ok, why = plan_ledger.may_record_verdict(named, caller, allowed, authors)
         if getattr(ctx, "ask_issue", False) and caller and caller == ctx.facts.get("author"):   # #1130: the author of the ask may not judge it, as a PR's author may not
             ok, why = False, "%s is the author of the ask %s: the author of an ask cannot record a verdict on it (`prove` is the author's step)" % (caller, ctx.pr)
-        if ok and named == "tester" and caller in launch:
-            why = load_launch_testers().lane_refusal(caller, launch, authors, sessions, fleets)
+        if ok and named in load_launch_testers().LAUNCHABLE and caller in launch:
+            why = load_launch_testers().lane_refusal(caller, launch, authors, sessions, fleets, named)
             ok = why is None
     if not ok:
         if ctx.engine.audit is not None:
@@ -17057,6 +17264,10 @@ def cmd_verdict(args, runner, now):
     entries = [{"kind": "verdict", "pr": ctx.pr, "scenario": target["id"], "plan_ref": ctx.source,
                 "plan_hash": ctx.plan["plan_hash"], "head": head, "result": args.result, "by": caller,
                 "evaluator": named, "evidence": evidence, **({"files": sorted(set(args.file))} if getattr(args, "file", None) else {})} for target in targets]
+    right = load_launch_testers().source_of(caller, ctx.config.get("plan_evaluators"), launch, named) if named in load_launch_testers().LAUNCHABLE else None   # #1869: where the right came from
+    for entry in entries:
+        if right:
+            entry["right"] = right
     try:
         done = plan_ledger.append_once(ctx.state, entries, now())   # all of the new ones or none; one already there is not written again
     except plan_ledger.LedgerLockTimeout:
@@ -17069,8 +17280,8 @@ def cmd_verdict(args, runner, now):
                                                                                          head[:8], ctx.pr, entry["plan_hash"][:19]))
             continue
         if ctx.engine.audit is not None:
-            detail = {"scenario": entry["scenario"], "result": entry["result"], "seq": one["seq"], "by": entry["by"], "chain": one["hash"]}
-            if named == "tester" and caller in launch and load_launch_testers().source_of(caller, ctx.config.get("plan_evaluators"), launch) == "launch record":
+            detail = {"scenario": entry["scenario"], "result": entry["result"], "seq": one["seq"], "by": entry["by"], "chain": one["hash"], "evidence": entry["evidence"][:160]}
+            if named in load_launch_testers().LAUNCHABLE and caller in launch and load_launch_testers().source_of(caller, ctx.config.get("plan_evaluators"), launch, named) == "launch record":
                 detail["launch_record"] = {k: v for k, v in launch[caller].items() if v is not None}   # #372: the record this verdict relied on
             ctx.engine.audit.append(ctx.engine.actor, "plan.verdict", ctx.pr, detail)
         print("recorded %s verdict #%d: %s %s at %s (%s), bound to plan %s" % (named, one["seq"], entry["scenario"], args.result,
@@ -17293,6 +17504,8 @@ def cmd_gates(args, runner, now):
     bots = bot_review_lines(seen, ctx.facts.get("head")) if isinstance(ctx.facts, dict) else []   # #1625: information only
     shares = overlap_shares_line(read_open_overlap(ctx.engine, ctx.repo, runner), ctx.number) if not ctx.unreadable else None   # #818: information only
     suites_finding = gates_suites_finding(runner, ctx) if not ctx.unreadable else None   # #1045: information only: the verdict below does not read it
+    if args.json and plan_ledger.verdict_lines(report):
+        report["verdict_lines"] = plan_ledger.verdict_lines(report)   # #1869
     if args.json:
         if suites_finding:
             report["suites_finding"] = suites_finding
@@ -17571,6 +17784,8 @@ def cmd_item_verdict(args, runner, now):
     reg = regs[-1] if regs else {}
     entries = [{"kind": "verdict", "pr": ctx.item, "scenario": t["id"], "plan_ref": ctx.source, "plan_hash": ctx.plan["plan_hash"], "head": head, "result": args.result,
                 "by": caller, "evaluator": "tester", "evidence": evidence, "via": "item", "session": sessions.get(caller)} for t in targets]
+    for entry in entries:
+        entry["right"] = "launch record"   # #1869: only a launched tester may use the item path
 
     def recheck(fresh):   # under the ledger's exclusive lock: only what lives in the ledger is re-read (the agents were read above, never under the lock)
         problem = iv.verdict_problem(ctx.item, caller, fresh, writers | iv.ledger_writers(ctx.item, ctx.number, ctx.issue["author"], fresh), sessions.get(caller), now(), head)
@@ -19786,7 +20001,7 @@ def ci_record_core(ctx, now, quiet=False):
     "nothing" (CI is green but no per-PR scenario names `ci`), "not-green", "unreadable", "no-plan" or "no-head". It records
     only for a complete, green run at the PR's CURRENT head and the plan's CURRENT hash, never twice, and writes nothing to GitHub.
     `quiet` leaves the audit alone for everything but a real record (the pass runs this for many PRs: a failing run is not news)."""
-    out = {"status": None, "head": None, "ci": None, "scenarios": [], "recorded": [], "already": [], "why": None}
+    out = {"status": None, "head": None, "ci": None, "scenarios": [], "recorded": [], "already": [], "proved": [], "why": None}
     if ctx.unreadable:
         return dict(out, status="unreadable", why="the PR could not be read: %s" % ctx.unreadable)
     head = (ctx.facts or {}).get("head")
@@ -19821,6 +20036,16 @@ def ci_record_core(ctx, now, quiet=False):
         if not quiet:   # nothing was recorded, so this is NOT proof that the recorder works (ok stays False for the preflight)
             _gates_audit(ctx.engine, "gate.ci_record", ctx.pr, dict(detail, ok=False, why="no scenario names ci"))
         return dict(out, status="nothing")
+    try:   # the run is on refs/pull/N/merge: a merge ref whose first parent is not the base's current head is a stale run, and records nothing (#2053 reader)
+        gh = getattr(ctx.engine, "gh_runner", None) or subprocess.run
+        parents = merge_ref_read(gh, ctx.repo, ctx.number)
+        base, base_head = merge_ref_base_head(gh, ctx.repo, ctx.number) if parents else (None, None)
+    except MergeRefError as err:   # an unreadable merge ref cannot be shown fresh: nothing is recorded, and the one line names the error
+        return dict(out, status="stale", why="the merge ref could not be read (%s): nothing was recorded" % _one_line(str(err), 120))
+    if parents is None:   # no merge ref (a 404): freshness cannot be shown, so nothing is recorded
+        return dict(out, status="stale", why="the pull request has no merge ref, so it cannot be shown fresh: nothing was recorded")
+    if parents and parents[0] != base_head:
+        return dict(out, status="stale", why="the run is on a stale merge ref (first parent %s, %s head %s): nothing was recorded" % (parents[0][:8], base, base_head[:8]))
     for scenario in wanted:
         fresh = [e for e in ctx.entries if e.get("pr") == ctx.pr and e.get("scenario") == scenario["id"] and e.get("kind") == "verdict"
                  and e.get("evaluator") == "ci" and e.get("plan_hash") == ctx.plan["plan_hash"] and e.get("head") == head
@@ -19833,8 +20058,17 @@ def ci_record_core(ctx, now, quiet=False):
                                              "by": plan_ledger.CI_RECORDER, "evaluator": "ci",
                                              "evidence": "CI green at %s: every check run complete and passing" % head[:12]}, now())
         out["recorded"].append(scenario["id"])
-    if out["recorded"] or not quiet:
-        _gates_audit(ctx.engine, "gate.ci_record", ctx.pr, dict(detail, ok=True, recorded=out["recorded"], already=out["already"]))
+    link = next((r.get("detailsUrl") for r in ((ctx.facts or {}).get("ci_rollup") or []) if isinstance(r, dict) and "/actions/runs/" in str(r.get("detailsUrl") or "")), "")
+    for scenario in wanted:   # the proof of each ci scenario, next to its verdict (same guards: only reached for a green, complete run)
+        if plan_ledger.already_recorded(ctx.entries, {"kind": "proof", "pr": ctx.pr, "scenario": scenario["id"], "plan_hash": ctx.plan["plan_hash"], "head": head, "result": "pass"}):
+            continue
+        plan_ledger.append_once(ctx.state, [{"kind": "proof", "pr": ctx.pr, "scenario": scenario["id"], "plan_ref": ctx.source,
+                                             "plan_hash": ctx.plan["plan_hash"], "head": head, "result": "pass", "by": plan_ledger.CI_RECORDER,
+                                             "evidence": "CI green at %s: %s" % (head[:12], link or "every check run complete and passing"),
+                                             "command": "gates ci-record", "env": "switchboard"}], now())
+        out["proved"].append(scenario["id"])
+    if out["recorded"] or out["proved"] or not quiet:
+        _gates_audit(ctx.engine, "gate.ci_record", ctx.pr, dict(detail, ok=True, recorded=out["recorded"], already=out["already"], proved=out["proved"]))
     return dict(out, status="recorded")
 
 
@@ -19934,6 +20168,9 @@ def cmd_gates_ci_record(args, runner, now):
             print(line)
     if got["status"] in ("unreadable", "no-plan", "no-head", "not-green"):
         raise LedgerCommandError("%s: nothing was recorded" % got["why"])
+    if got["status"] == "stale":
+        print(got["why"])
+        return EXIT_OK
     if got["status"] == "nothing":
         print("CI is green at %s; the plan has no per-PR scenario that names `ci`: nothing to record" % got["head"][:8])
         for line in carry_lines(got.get("carry") or []):
@@ -19941,6 +20178,8 @@ def cmd_gates_ci_record(args, runner, now):
         return EXIT_OK
     print("CI is green at %s: recorded %s%s" % (got["head"][:8], ", ".join(got["recorded"]) or "nothing new",
                                                " (already recorded: %s)" % ", ".join(got["already"]) if got["already"] else ""))
+    if got["proved"]:
+        print("and the proof of %s" % ", ".join(got["proved"]))
     for line in carry_lines(got.get("carry") or []):
         print(line)
     return EXIT_OK
@@ -20050,6 +20289,7 @@ def ci_record_pass(engine, now):
                 retry_at = max(now + 1, state.lists.get(plan_ledger.normal_repo(repo), (now, []))[0] + CI_RECORD_LIST_TTL)
             state.checked[key] = {"list_head": listed_head, "at": now, "retry_at": retry_at, "fails": 0}
             pr_state_enrich(state, repo, number, ctx, now)
+            pr_state_jobs(state, engine, runner, repo, number, ctx, now)
         except Exception as err:
             fails += 1
             delay = min(CI_RECORD_RETRY[1], CI_RECORD_RETRY[0] * 2 ** (fails - 1))   # unreadable: 5 min, 10, 20, then 30
@@ -20100,6 +20340,7 @@ def pr_state_from_lists(state, repos):
             entry = {"state": "draft" if record.get("draft") else "open", "head": head, "labels": labels, "at": at, "listed_at": at}
             if old.get("head") == head and old.get("checks") is not None:   # what the examination found at this very head stays until it is examined again
                 entry.update({k: old[k] for k in ("checks", "ci", "mergeable", "gates", "examined_at", "examined_head") if k in old})
+                entry.update({k: old[k] for k in ("jobs", "jobs_note", "jobs_head") if k in old})   # #1962: the jobs of a run in progress stay with the head they were read at
             state.pr_state[ref] = entry
         for ref, old in list(state.pr_state.items()):
             if ref.startswith(key + "#") and ref not in seen and old.get("state") in ("open", "draft") and at > old.get("listed_at", 0):
@@ -20123,6 +20364,57 @@ def pr_state_enrich(state, repo, number, ctx, now):
         entry["gates"] = {"ready": bool(report.get("ready")), "missing": missing}
     except Exception as err:   # the picture is best effort: the gates are said not evaluated (not "no plan"), never guessed
         entry["gates"] = {"error": _one_line("%s: %s" % (type(err).__name__, err), 120)}
+
+
+PR_STATE_JOBS_MAX = 10   # lines of jobs kept per PR
+PR_STATE_JOBS_RUNS = 5   # runs in progress read per examination
+PR_STATE_JOBS_FAILED = ("failure", "timed_out", "cancelled", "action_required", "startup_failure")
+PR_STATE_JOBS_RUN_RE = re.compile(r"/actions/runs/(\d+)")
+
+
+def pr_state_jobs(state, engine, runner, repo, number, ctx, now):
+    """#1962: while a pending head has a run in progress, read the jobs of each such run ONCE (`pr_reading.read_jobs`, one request per run, none for a
+    completed run) and keep the failed jobs (with the failed step) and the running ones in the entry, with the head they were read at. A jobs answer that
+    cannot be read leaves one note. Runs only inside an examination, so the recorder's retry gates bound it. Never raises."""
+    entry = state.pr_state.get("%s#%d" % (plan_ledger.normal_repo(repo), number))
+    facts = ctx.facts or {}
+    if entry is None or not facts.get("head"):
+        return
+    for key in ("jobs", "jobs_note", "jobs_head"):
+        entry.pop(key, None)
+    if facts.get("ci") != "pending":
+        return
+    runs = []
+    for check in load_module("ci_runs").newest(facts.get("ci_rollup")):
+        found = PR_STATE_JOBS_RUN_RE.search(str(check.get("detailsUrl") or "")) if isinstance(check, dict) and check.get("status") == "IN_PROGRESS" else None
+        if found and found.group(1) not in runs:
+            runs.append(found.group(1))
+    if not runs:
+        return
+    jobs, note = [], None
+    try:
+        reading = load_module("pr_reading")
+        gh = merge_gate_gh(engine.config, runner, repo)
+        for run in runs[:PR_STATE_JOBS_RUNS]:
+            try:
+                answer = reading.read_jobs(gh, repo, run)
+            except reading.ReadError:
+                note = "jobs not readable"
+                continue
+            if not any(str(j.get("conclusion")).lower() in PR_STATE_JOBS_FAILED for j in answer):
+                continue
+            for job in answer:
+                word = str(job.get("conclusion") or "").lower()
+                if word in PR_STATE_JOBS_FAILED:
+                    step = next((s.get("name") for s in job.get("steps") or [] if str(s.get("conclusion")).lower() == "failure"), None)
+                    jobs.append(dict({"name": _plain(job.get("name"), 60), "conclusion": _plain(word, 30)}, **({"step": _plain(step, 60)} if step else {})))
+                elif word in ("in_progress", "queued", "pending", "waiting", "requested"):
+                    jobs.append({"name": _plain(job.get("name"), 60), "conclusion": "running"})
+    except Exception:
+        note, jobs = "jobs not readable", []
+    entry.update({"jobs": jobs[:PR_STATE_JOBS_MAX], "jobs_head": facts["head"]})
+    if note:
+        entry["jobs_note"] = note
 
 
 def write_pr_state(engine, state, now):
@@ -20195,6 +20487,9 @@ def pr_state_view(ref, body, entries, now, ledger_ref=None, ledger_problem=None)
         gates = {"ready": gates.get("ready") is True, "missing": [_plain(m, 160) for m in (gates.get("missing") if isinstance(gates.get("missing"), list) else [])[:12] if isinstance(m, str)]}
         if isinstance(entry["gates"].get("error"), str):
             gates = {"error": _plain(entry["gates"]["error"], 120)}
+    jobs = None
+    if isinstance(entry.get("jobs"), list) and not stale_head and entry.get("jobs_head") == entry.get("head"):
+        jobs = [{"name": _text(j.get("name"), 60) or "?", "conclusion": _text(j.get("conclusion"), 30) or "?", "step": _text(j.get("step"), 60)} for j in entry["jobs"][:10] if isinstance(j, dict)]
     at = entry.get("at", now)
     examined_at = entry.get("examined_at")
     examined_age = max(0, int(now - examined_at)) if _finite(examined_at) and not stale_head else None
@@ -20206,6 +20501,10 @@ def pr_state_view(ref, body, entries, now, ledger_ref=None, ledger_problem=None)
             "snapshot_age_seconds": max(0, int(now - body["written_at"]))}
     if isinstance(entry.get("why"), str):
         view["why"] = _plain(entry["why"], 100)
+    if jobs is not None and (jobs or isinstance(entry.get("jobs_note"), str)):
+        view["jobs"] = jobs
+        if isinstance(entry.get("jobs_note"), str):
+            view["jobs_note"] = _plain(entry["jobs_note"], 60)
     return view
 
 
@@ -20244,6 +20543,10 @@ def pr_state_line(view):
     parts.append("list read %ds ago" % view["age_seconds"])
     if view.get("why"):
         parts.append(view["why"])
+    if view.get("jobs") is not None:   # #1962: one line per failed or running job of a run in progress, one for a jobs answer that could not be read
+        tail = ["  job %s: %s%s" % (_plain(j.get("name"), 60), _plain(j.get("conclusion"), 30), " (failed step: %s)" % _plain(j["step"], 60) if j.get("step") else "") for j in view["jobs"] if isinstance(j, dict)]
+        tail += ["  jobs: %s" % _plain(view["jobs_note"], 60)] if view.get("jobs_note") else []
+        parts[-1] += "".join("\n" + line for line in tail)
     return "; ".join(parts)
 
 
@@ -22488,7 +22791,7 @@ def preflight_added(runner, root):
             diff = runner(["git", "diff", "--name-status", "--no-renames", "--diff-filter=A", found.stdout.strip()], cwd=root, capture_output=True, text=True)
             if diff.returncode == 0:
                 rows = [line.split("\t", 1) for line in diff.stdout.splitlines() if "\t" in line]
-                return sorted(path for status, path in rows if status == "A" and path.startswith("bin/") and "__pycache__" not in path)
+                return sorted(path for status, path in rows if status == "A" and path.startswith(("bin/", "shims/")) and "__pycache__" not in path)
     return []
 
 
@@ -22498,8 +22801,8 @@ def run_new_bin_guards(ps, runner, root, added, now):
     rows = ps.guard_rows(added)
     if not rows:
         return 0
-    print("preflight-pr: new file under bin/ (%s): the %d guards every new bin file must pass" % (", ".join(added), len(rows)))
-    guards, failed = {tuple(ps.guard_command(g)): g for g in ps.NEW_BIN_GUARDS}, 0
+    print("preflight-pr: new file under bin/ or shims/ (%s): the %d guards every new file there must pass" % (", ".join(added), len(rows)))
+    guards, failed = {tuple(ps.guard_command(g)): g for g in ps.NEW_BIN_GUARDS + ps.NEW_SHIM_GUARDS}, 0
     for _suite, _classes, command, _why in rows:
         guard = guards[tuple(command)]
         gone = ps.guard_missing(root, guard)
@@ -23046,6 +23349,13 @@ def add_plan_parsers(sub):
     rreport.add_argument("--json", action="store_true")
     tick = review_sub.add_parser("tick", help="Housekeeping: relaunch a stuck lane once, then escalate it; remind an undecided escalation")
     tick.add_argument("--json", action="store_true")
+    apply = plan_sub.add_parser("apply", help="Apply an approved plan edit file to the live plan, refusing unless the live hash, the file and the result hash are the ones named",
+                                 formatter_class=APPLY_HELP_FORMATTER, epilog="Applying an approved plan edit\nLines before the first header are a note and are read by nobody.\nEach pair is `===== OLD <n> (verbatim) =====` then the old text, then `===== NEW <n> (verbatim) =====` then the new text.\nThe numbers run 1, 2, 3 in order.\nThe text of each ends at the line before the next header; its final newline is not part of it.\nThe paragraph that starts `Why:` after the last NEW is the receipt's reason.\nThe file has no other header.")
+    apply.add_argument("issue", help="owner/repo#N, an issue URL, or N with intent_repo set: the ask whose plan comment is edited")
+    apply.add_argument("--file", required=True, help="The edit file, in the standard form (see the planning skill: Applying an approved plan edit)")
+    apply.add_argument("--expect-live", dest="expect_live", required=True, help="The full plan hash the live plan must have")
+    apply.add_argument("--expect-result", dest="expect_result", required=True, help="The full plan hash the Chief of Staff approved the file for")
+    apply.add_argument("--expect-file", dest="expect_file", required=True, help="The sha256 of the file")
 
 
 POLICY_DEFAULTS = {
@@ -23375,7 +23685,7 @@ def build_parser():
     launch.add_argument("--memory-ok", dest="memory_ok", metavar="REASON", help="Skip the memory test of a new launch (audited with the reason)")
     launch.add_argument("--cloud", action="store_true", help="Run the worker in the cloud (needs --repo and --branch; --dir is its path in the pod, default /work; the pod always runs its own 'worker' agent: --agent is only recorded)")
     launch.add_argument("--branch", help="With --cloud: the branch the worker starts on")
-    launch.add_argument("--idle", help="With --cloud: stop after this long idle (default 10m)")
+    launch.add_argument("--idle", help="With --cloud: stop after this long idle (default 30m)")
     launch.add_argument("--hard", help="With --cloud: stop after this long whatever it does (default 2h)")
     launch.add_argument("--shape", help="With --cloud: the pod shape, XS (1 CPU, 2 GiB; the launcher's default, no nested Docker), S (2 CPU, 4 GiB; the default with --stack), M (4 CPU, 8 GiB) or O (250m CPU, 768 MiB; the default of --agent orchestrator)")
     launch.add_argument("--stack", action="store_true", help="With --cloud: a pod that can run a nested Docker stack (the Sysbox runtime class, its own user namespace, no capability added, no privileged mode). Off by default; the launch without it is unchanged. The first pod on a fresh node may wait for the node's runtime: the launcher retries")
@@ -23880,7 +24190,7 @@ def cmd_charter(args, runner, now):
     if value is not None and isinstance(row0, dict):   # #1143: the GitHub reads happen BEFORE the registry lock, bound to the issue number and the repo; the lock only re-checks registry facts
         repo0 = row0.get("repo") or (engine.config.get("intent_repo") if engine.config else None)
         try:
-            parent = engine.intents.parent(value, repo0, strict=True)   # None only for the "no parent" answer; any other failure raises
+            parent = engine.intents.parent(value, repo0, strict=True)   # None only when the issue exists and its parent answers 404; a missing issue or any other failure raises
             labelled = None
             is_pr = False
             if parent is None:   # a charter has no parent: the one extra read is its label
@@ -24011,6 +24321,8 @@ def cmd_plan(args, runner, now, socket_call=None):
         return cmd_plan_review(args, runner, now, socket_call)
     if args.plan_action == "template":
         return cmd_plan_template(args, runner, now)
+    if args.plan_action == "apply":
+        return cmd_plan_apply(args, runner, now, fleet_mark)
     return cmd_plan_check(args, runner, now)
 
 
@@ -25999,6 +26311,18 @@ def cmd_triage(args, runner, now):
 
 
 cmd_triage.direct = True   # one small file: no daemon start, no GitHub
+
+
+def add_ci_queue_parsers(sub):
+    ci_queue = sub.add_parser("ci-queue", help="Measure the Actions queue of a window (wait, run time, jobs, peak queued); reads GitHub, writes nothing",
+                              description="Counts the workflow runs of a window: per run the queue wait and run time, the jobs by workflow and name, the "
+                                          "job-minutes by workflow, the peak of jobs queued at once, the observed ceiling of jobs running at once, and the "
+                                          "cut, dedupe and move candidates in job-minutes per day. GET requests only.")
+    ci_queue.add_argument("--repo", metavar="OWNER/REPO", help="The repository (default: the configured intent repository)")
+    ci_queue.add_argument("--hours", type=int, default=24, help="The window in hours (1 to 168; default 24)")
+    ci_queue.add_argument("--until", metavar="ISO", help="The end of the window, an ISO time with a zone (default: now)")
+    ci_queue.add_argument("--paths-file", metavar="FILE", default=".github/macos-platform-paths.txt", help="The platform-path list read for the move candidates (default: the one of the current directory; unreadable: none)")
+    ci_queue.add_argument("--json", action="store_true", help="Print the report as JSON")
 
 
 def add_triage_parsers(sub):
