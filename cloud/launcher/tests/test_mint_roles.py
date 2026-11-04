@@ -31,9 +31,9 @@ import test_orchestrator_agent as toa  # noqa: E402
 
 REPO = "acme-org/widget-service"
 # The recorded request bodies, written out literally (the worker's is what the mint sent before the table had roles).
-WORKER_SET = {"contents": "write", "pull_requests": "write", "issues": "read", "metadata": "read"}
+WORKER_SET = {"contents": "write", "pull_requests": "write", "issues": "read", "metadata": "read", "actions": "read"}
 ORCH_SET = {"issues": "write", "pull_requests": "read", "checks": "read", "metadata": "read"}
-WORKER_TEXT = "contents: write, pull_requests: write, issues: read, metadata: read"
+WORKER_TEXT = "contents: write, pull_requests: write, issues: read, metadata: read, actions: read"
 ORCH_TEXT = "issues: write, pull_requests: read, checks: read, metadata: read"
 STEP = "the owner adds %s to the App's permissions and accepts them on each installation"
 SETS = {"worker": WORKER_SET, "orchestrator": ORCH_SET}
@@ -114,7 +114,7 @@ class RequestBodies(Fx):
                 self.assertEqual((p.returncode, p.stdout), (0, tam.TOKEN), p.stderr)
                 body = tam.Stub.seen[0][2]
                 self.assertEqual(json.dumps(body), json.dumps({"repositories": ["widget-service"], "permissions": {
-                    "contents": "write", "pull_requests": "write", "issues": "read", "metadata": "read"}}))
+                    "contents": "write", "pull_requests": "write", "issues": "read", "metadata": "read", "actions": "read"}}))
         self.assertEqual(list(app_token.EXPECTED_PERMISSIONS.items()), list(WORKER_SET.items()))
         self.assertIs(app_token.EXPECTED_PERMISSIONS, app_token.PERMISSIONS_BY_ROLE["worker"])
 

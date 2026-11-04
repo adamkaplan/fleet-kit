@@ -14,7 +14,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 MINT = os.path.join(os.path.dirname(HERE), "app_token.py")
 TOKEN = "ghs_synthetic" + "Ab3Xy9" * 6
 REAL = "acme-org/widget-service"
-PERMS = {"contents": "write", "pull_requests": "write", "issues": "read", "metadata": "read"}
+PERMS = {"contents": "write", "pull_requests": "write", "issues": "read", "metadata": "read", "actions": "read"}
 PLANTED = "planted-secret-value-7Qz"
 
 
