@@ -286,8 +286,8 @@ class Mutants(unittest.TestCase):
         self.assertTrue([b for b in bad if b.startswith("check orchestrator")])
 
     def test_s6_a_worker_set_that_differs_fails_the_request(self):
-        m = mutant("cloud/launcher/app_token.py", '"pull_requests": "write", "issues": "read", "metadata": "read"},\n    "orch',
-                   '"pull_requests": "read", "issues": "read", "metadata": "read"},\n    "orch')
+        m = mutant("cloud/launcher/app_token.py", '"pull_requests": "write", "issues": "read", "metadata": "read", "actions": "read"},\n    "orch',
+                   '"pull_requests": "read", "issues": "read", "metadata": "read", "actions": "read"},\n    "orch')
         self.assertIn("body worker", table_failures(m))
 
 
