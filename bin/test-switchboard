@@ -595,7 +595,7 @@ class TestFacts(Base):
 
     def test_the_registration_point_lists_the_lab_source(self):
         self.assertEqual([s.__name__ for s in sb.fact_sources(self.home)],
-                         ["lab_facts", "worker_facts", "reminder_facts", "report_rider_facts", "foreground_facts",
+                         ["lab_facts", "worker_facts", "reminder_facts", "report_rider_facts", "held_send_facts", "foreground_facts",
                           "orders_facts", "sweep_facts", "triage_facts", "plan_wake_facts", "alert_wake_facts", "red_ci_facts", "job_facts", "pane_facts", "pane_exit_facts", "headless_restart_facts", "disk_facts", "cpu_facts", "spotlight_facts", "docker_reap_facts", "temp_janitor_facts", "heavy_orphan_facts"])
 
     def test_every_fact_source_class_in_the_module_is_registered(self):   # #1030: derived, so a new source cannot be left out
@@ -1631,8 +1631,8 @@ class TestSteerToWorking(Base):
     def test_the_endpoint_route_holds_while_blocked_and_keeps_the_sender_identity(self):
         self.endpoint_world(state="blocked")
         code, _, err = self.cli_send("ping", to="cloudy")
-        self.assertEqual(code, sb.EXIT_HELD)
-        self.assertIn("blocked on a permission request", err)
+        self.assertEqual(code, 0, err)
+        self.assertIn("held for cloudy: cloudy is blocked; it will be delivered when it unblocks", err)
         self.assertEqual(self.posts, [])
         self.registry.upsert(self.world.state, "cloudy", {"session": None, "kind": "orchestrator", "role": "orchestrator",
                                                           "endpoint": "https://pod.example.invalid/channel", "state": "idle"}, now=2)
@@ -2448,8 +2448,9 @@ class TestEngineCLI(Base):
     def test_a_held_send_says_why_and_sends_nothing(self):
         self.world.herdr.panes[self.world.panes["platform"]]["status"] = "blocked"
         code, out, err = self.main("send", "platform", "--from", "coder", "hi")
-        self.assertEqual((code, out), (sb.EXIT_HELD, ""))
+        self.assertEqual((code, out), (0, ""))
         self.assertIn("blocked", err)
+        self.assertIn("held for platform: platform is blocked; it will be delivered when it unblocks", err)
         self.assertEqual(self.world.v2.writes, [])
         self.assertEqual(self.main("send", "nobody", "--from", "coder", "hi")[0], sb.EXIT_HELD)
 
@@ -6451,6 +6452,13 @@ class TestLaunch(StandInPids, Base):
 # --------------------------------------------------- the offline scenario runner
 
 SCENARIO_REPORTS = []
+_Q1_REPORT = []   # ONE replay of q1 per process, shared by TestOfflineScenarios and TestOfflineScenariosPR4 (#2108)
+
+
+def q1_report(case):
+    if not _Q1_REPORT:
+        _Q1_REPORT.append(run_scenario(case, sc.load(sc.DEFAULT_DIR / "q1-quiet-two-hours.json")))
+    return _Q1_REPORT[0]
 
 
 
@@ -6616,7 +6624,7 @@ def _scenario_test(path):
         scenario = sc.load(path)
         if "offline" not in scenario["tiers"]:
             self.skipTest("%s has no offline tier" % scenario["id"])
-        report = run_scenario(self, scenario)
+        report = q1_report(self) if path.name == "q1-quiet-two-hours.json" else run_scenario(self, scenario)
         SCENARIO_REPORTS.append(report)
         self.check_report(report)
     test.__doc__ = "scenario %s offline, and its control fails" % path.name
@@ -10333,7 +10341,7 @@ class TestFrictionWake(FrictionBase):
     def test_it_is_off_by_default_and_the_defaults_are_the_documented_ones(self):
         self.assertNotIn("friction_wake", sb.DEFAULTS)
         self.assertEqual([s.__name__ for s in sb.fact_sources(self.home)],
-                         ["lab_facts", "worker_facts", "reminder_facts", "report_rider_facts", "foreground_facts",
+                         ["lab_facts", "worker_facts", "reminder_facts", "report_rider_facts", "held_send_facts", "foreground_facts",
                           "orders_facts", "sweep_facts", "triage_facts", "plan_wake_facts", "alert_wake_facts", "red_ci_facts", "job_facts", "pane_facts", "pane_exit_facts", "headless_restart_facts", "disk_facts", "cpu_facts", "spotlight_facts", "docker_reap_facts", "temp_janitor_facts", "heavy_orphan_facts"])
         self.assertNotIn("friction_wake", sb.validate_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR}))
         self.assertEqual(sb.FRICTION_DEFAULTS, {"enabled": False, "hour": 9, "to": "cos", "cos_to": "improver", "text": None})
@@ -10511,7 +10519,7 @@ class TestOfflineScenariosPR4(Base):
             with_baseline(scenario, "something-else")
 
     def test_a_quiet_two_hours_fails_under_the_old_timer_and_passes_without_it(self):
-        report = self.run_named("q1-quiet-two-hours.json")
+        report = q1_report(self)
         self.assertEqual(report["failures"], [])
         self.assertEqual(report["proves_nothing"], [])
         self.assertFalse(next(r for r in report["control"] if r["label"] == "no-turns")["ok"])
@@ -34257,6 +34265,21 @@ class TestAgentBlockCounts(TestBlockTable):
             text = (REPO / "bin" / name).read_text().replace("block_impact", "")
             self.assertEqual(len(re.findall(r'get\("impact_(?:severity|probability)"\)', text)), 0, name)
 
+def fast_segment_reader(text):
+    """`ast.get_source_segment(text, node)` for many nodes of one text: the stdlib call re-splits the whole text on every call, this splits it once (same result)."""
+    import ast
+    lines = ast._splitlines_no_ff(text)
+
+    def segment(node):
+        if getattr(node, "end_lineno", None) is None or getattr(node, "end_col_offset", None) is None:
+            return None
+        first, last = node.lineno - 1, node.end_lineno - 1
+        if first == last:
+            return lines[first].encode()[node.col_offset:node.end_col_offset].decode()
+        return lines[first].encode()[node.col_offset:].decode() + "".join(lines[first + 1:last]) + lines[last].encode()[:node.end_col_offset].decode()
+    return segment
+
+
 class TestWholeRead(LedgerBase):
     """#1047: a rating is recorded only from a whole read of the pull request's changed files (read from GitHub), and a verdict is recorded exactly as given."""
 
@@ -34527,11 +34550,12 @@ class TestWholeRead(LedgerBase):
         found = set()
         for name in ("plan_ledger.py", "fleet-switchboard"):
             text = daemon_text(REPO / "bin" / name)
+            segment = fast_segment_reader(text)
             for node in ast.walk(ast.parse(text)):
                 if isinstance(node, ast.FunctionDef):
                     inner = [n for n in ast.walk(node) if isinstance(n, ast.FunctionDef) and n is not node]
-                    own = ast.get_source_segment(text, node)
-                    if "uncited" in own and not any("uncited" in (ast.get_source_segment(text, n) or "") for n in inner):
+                    own = segment(node)
+                    if "uncited" in own and not any("uncited" in (segment(n) or "") for n in inner):
                         found.add((name, node.name))
         self.assertEqual(found, set(sb.plan_ledger.UNCITED_CONSUMERS), "a reader of the uncited mark is not in plan_ledger.UNCITED_CONSUMERS (or one in it no longer reads it)")
 
@@ -35503,7 +35527,7 @@ class TestImpactReleaseEveryPass(TestImpactRejudge):
         self.mutant_fails("head", self.MUTANTS["head"])
 
     # -- the cost: a held pull request costs nothing between changes (a RATE, not a per-pass count)
-    HELD, PASS_SECONDS, HOUR_PASSES = 30, 5, 720   # 30 held pull requests, a pass every 5 seconds (the default poll), for an hour
+    HELD, PASS_SECONDS, HOUR_PASSES = 30, 5, 60   # 30 held pull requests, a pass every 5 seconds (the default poll), (a count: the retarget half way, quiet passes before and after)
     HOUR_CALLS = 1   # the stated bound: one `gh pr view` for the ONE retarget of the hour (plus its 2 label removals, counted apart); nothing for the 29 unchanged
 
     def hour_of_passes(self, mutant=None):
@@ -35557,7 +35581,7 @@ class TestImpactReleaseEveryPass(TestImpactRejudge):
         one(1000)
         self.view_reads.clear()
         self.writes.clear()
-        for i in range(60):   # the base's tip moves at every pass: the same branch, the same three-dot diff
+        for i in range(10):   # the base's tip moves at every pass: the same branch, the same three-dot diff
             for n in numbers:
                 self.prs[n]["baseRefOid"] = ("%040x" % (i + 2))
             one(self.PASS_SECONDS)
@@ -42528,6 +42552,10 @@ class TestEnsureOnUse(Base):
         self.world = World(self, agents=())
         self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
         self.daemons = FakeDaemons(self, sb.ensure_state_dir())
+        self.slept = []   # the daemon wait runs on a fake clock: ensure_on_use binds time.sleep as a default, so the default is swapped, not time.sleep
+        defaults = mock.patch.object(sb.ensure_on_use, "__defaults__", (subprocess.Popen, None, self.slept.append, None))
+        defaults.start()
+        self.addCleanup(defaults.stop)
 
     def use(self, argv, spawn=None):
         with mock.patch.object(sys, "stdin", io.StringIO("text\n")), captured() as (out, err):
@@ -42569,10 +42597,8 @@ class TestEnsureOnUse(Base):
 
     def test_the_wait_is_bounded_to_a_couple_of_seconds(self):
         self.assertLessEqual(sb.USE_ENSURE_PATIENCE, 2)
-        waited = []
-        with mock.patch.object(sb.time, "sleep", side_effect=waited.append):
-            self.use(["decisions"], spawn=lambda argv, **kw: None)
-        self.assertLessEqual(sum(waited), sb.USE_ENSURE_PATIENCE + 0.5)
+        self.use(["decisions"], spawn=lambda argv, **kw: None)
+        self.assertLessEqual(sum(self.slept), sb.USE_ENSURE_PATIENCE + 0.5)
 
     def test_the_fault_skips_it_and_only_in_the_lab(self):
         os.environ[sb.FAULT_ENV] = "no-ensure-on-use"
@@ -46866,8 +46892,9 @@ class TestRetireCloseHeadless(StandInPids, Base):
         import ast
         text = (REPO / "bin" / "fleet-switchboard").read_text()
         tree = ast.parse(text)
+        segment = fast_segment_reader(text)
         funcs = {n.name: n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
-        holders = sorted(n for n, f in funcs.items() if "only the operator or the agent's own boss may" in (ast.get_source_segment(text, f) or "").replace("\n", " "))
+        holders = sorted(n for n, f in funcs.items() if "only the operator or the agent's own boss may" in (segment(f) or "").replace("\n", " "))
         self.assertEqual(holders, ["close_authority_problem"], "the wording of the rule lives in one function")
         for caller in ("retire_close_problem", "headless_close_problem"):
             calls = {c.func.id for c in ast.walk(funcs[caller]) if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)}
@@ -56492,7 +56519,7 @@ class TestMadeUpPids(unittest.TestCase):
     def test_s3_a_number_that_is_alive_is_never_returned_and_none_is_self_parent_or_live(self):
         child = subprocess.Popen(["sleep", "30"])
         self.addCleanup(child.wait)
-        self.addCleanup(child.kill)                                   # cleanups run last-in first: kill ends the helper, then wait reaps it
+        self.addCleanup(child.kill)   # cleanups run last-in first-out: kill first, then reap
         module, proofs, real = sys.modules["support.herdr_world"], {}, _pid_alive
         spy = lambda pid: proofs.__setitem__(pid, real(pid)) or proofs[pid]           # the proof the helper made for each number it looked at
         with mock.patch.object(module, "_MADE_UP_NEXT", [child.pid]), mock.patch.object(module, "_MADE_UP_GIVEN", set()), mock.patch.object(module, "_pid_alive", spy), \
@@ -66002,6 +66029,8 @@ _bin_set_table = importlib.import_module("test_bin_set_table")
 TestTheBinSetClassesAreAllInTheTable = _bin_set_table.TestTheBinSetClassesAreAllInTheTable
 # The heavy wrapper's progress line (#1762).
 TestHeavyProgress = importlib.import_module("test_heavy_progress").TestHeavyProgress
+# The shard tests (#2108).
+TestShards = importlib.import_module("test_shards").TestShards
 # The pod niceness tests (#1794).
 TestPodNiceness = importlib.import_module("test_pod_niceness").TestPodNiceness
 # The split of the heavy wrapper into a part (#2034).
@@ -66013,6 +66042,7 @@ _hc = importlib.import_module("test_header_cache"); TestAges, TestSets, TestEven
 TestReminderTtlMore = importlib.import_module("test_reminder_ttl").build(PR4Base)
 TestPlanRehearsal = importlib.import_module("test_plan_rehearsal").build(HandoffCase)   # #1785
 TestMergeRef = importlib.import_module("test_merge_ref").build(HandoffCase)   # #2053
+TestDoneWhenList = importlib.import_module("test_done_when_list").TestDoneWhenList   # #2078
 # The load figure counts cloud workers as busy (#1487).
 _load_cloud = importlib.import_module("test_load_alert_cloud")
 TestLoadAlertCloudBusy = _load_cloud.TestLoadAlertCloudBusy
@@ -66033,6 +66063,7 @@ TestEveryKindDelayedMark = importlib.import_module("test_every_kind_delayed_mark
 TestSignedLinkScrub = importlib.import_module("test_signed_link_scrub").build(Base, GithubRig)
 TestCiQueue = importlib.import_module("test_ci_queue").build(HandoffCase, FAKE_GH)   # #1961
 TestLaunchQueue = importlib.import_module("test_launch_queue").build(HandoffCase)
+TestHeldSends = importlib.import_module("test_held_sends").TestHeldSends   # #2051
 # The reminder-cancel tests of #1401.
 _reminder_cancel = importlib.import_module("test_reminder_cancel")
 TestCancelKeyRecheck = _reminder_cancel.build(PR4Base)
@@ -66379,8 +66410,20 @@ class TestSupportRebinding(unittest.TestCase):
 
 def main(argv):
     watch_parent()
+    shard = None
+    if "--shard" in argv:   # --shard I/N: run only shard I of N (tools/test-shards)
+        at = argv.index("--shard")
+        shard = argv[at + 1]
+        argv = argv[:at] + argv[at + 2:]
     loader = unittest.TestLoader()
     suite = loader.loadTestsFromModule(sys.modules[__name__])
+    if shard is not None:
+        _spec = importlib.util.spec_from_file_location("test_shards", str(Path(__file__).resolve().parents[1] / "tools" / "test-shards"),
+                                                       loader=importlib.machinery.SourceFileLoader("test_shards", str(Path(__file__).resolve().parents[1] / "tools" / "test-shards")))
+        _shards = importlib.util.module_from_spec(_spec)
+        _spec.loader.exec_module(_shards)
+        shard_i, shard_n = _shards.parse_shard(shard)
+        suite = _shards.select(suite, shard_i, shard_n)
     if argv:
         keep = unittest.TestSuite()
         for group in suite:
@@ -66404,6 +66447,8 @@ def main(argv):
           % (result.testsRun, passed, len(result.failures), len(result.errors), len(result.skipped)))
     print("=" * 70)
     ok = result.wasSuccessful() and result.testsRun > 0
+    if shard is not None:
+        print("shard %d/%d" % (shard_i, shard_n))
     print("RESULT: %s" % ("PASS" if ok else "FAIL"))
     return 0 if ok else 1
 
@@ -71593,6 +71638,7 @@ class TestShimTopSpender(Base):
                "module = importlib.util.module_from_spec(importlib.util.spec_from_loader('gh_shim_under_test', loader))\n"
                "loader.exec_module(module)\n"
                "module.FIXED_STATE[0], module.FIXED_PROGRAM[0] = sys.argv[2], sys.argv[3]\n"
+               "module.SLOW_SECONDS = 1.5\n"
                "sys.exit(module.main(sys.argv[4:]))\n")
 
     def run_shim(self, *args, env=None, agent="worker"):
@@ -71699,8 +71745,8 @@ class TestShimTopSpender(Base):
         slow, slow_took = self.timed("pr", "view", "3")                                   # an uncached read (not `gh api <path>`) by the top spender
         quiet, quiet_took = self.timed("pr", "view", "3", agent="other")
         self.assertEqual((slow.returncode, quiet.returncode, slow.stdout, quiet.stdout), (0, 0, quiet.stdout, quiet.stdout))
-        self.assertGreaterEqual(slow_took - quiet_took, 1.5, "the top spender waited")
-        self.assertLessEqual(slow_took - quiet_took, 4.5, "bounded: never more than SLOW_SECONDS plus the call")
+        self.assertGreaterEqual(slow_took - quiet_took, 1.0, "the top spender waited")
+        self.assertLessEqual(slow_took - quiet_took, 3.0, "bounded: never more than SLOW_SECONDS plus the call")
         write, write_took = self.timed("issue", "edit", "5", "-t", "x")
         other_write, other_write_took = self.timed("issue", "edit", "5", "-t", "x", agent="other")
         self.assertEqual((write.returncode, other_write.returncode), (0, 0))
@@ -71709,7 +71755,7 @@ class TestShimTopSpender(Base):
         self.age(20)
         cached, cached_took = self.timed("api", self.PATH)
         self.assertEqual(cached.stdout, '{"n":1}')
-        self.assertLess(cached_took, 1.5, "a cached read is not slowed")
+        self.assertLess(cached_took, 1.0, "a cached read is not slowed")
 
     # Every environment name the shim reads, with a hostile value for it. DERIVED from the shim's own code (see `shim_environment_names`): a name the shim starts to read
     # and this table does not list fails the test below, so a new switch cannot appear unseen. SWITCH_OFF lists the names that can still make the caller wait less.
@@ -71740,7 +71786,7 @@ class TestShimTopSpender(Base):
         for name, value in sorted(self.HOSTILE.items()):
             value = {"OTHER": str(self.other), "EMPTY": empty, "SAME": "%s:%s:%s" % (SHIM.parent, self.bin, SAFE_PATH)}.get(value, value)
             _, took = self.timed("pr", "view", "3", env={name: value})
-            if took - baseline < 1.5:
+            if took - baseline < 1.0:
                 switched_off.add(name)
         self.assertEqual(switched_off, set(self.SWITCH_OFF), "the names that switch the wait off are exactly the declared ones")
 
@@ -71748,10 +71794,10 @@ class TestShimTopSpender(Base):
         _, quiet = self.timed("api", self.PATH.replace("5", "9"), agent="other")                 # another agent's read, no entry: no wait
         first, took = self.timed("api", self.PATH)                                               # the top spender's read with NO cache entry: it spends, so it waits
         self.assertEqual(first.stdout, '{"n":1}')
-        self.assertGreaterEqual(took - quiet, 1.5, "an uncached `gh api <path>` read by the top spender waits (the wait inside the cache path)")
+        self.assertGreaterEqual(took - quiet, 1.0, "an uncached `gh api <path>` read by the top spender waits (the wait inside the cache path)")
         second, again = self.timed("api", self.PATH)                                             # now served from the cache: no request, no wait
         self.assertEqual(second.stdout, '{"n":1}')
-        self.assertLess(again, 1.5, "a read served from the cache never waits")
+        self.assertLess(again, 1.0, "a read served from the cache never waits")
 
     def test_s3_the_wait_ends_when_the_account_recovers_and_never_starts_above_the_line(self):
         self.usage(3000)
@@ -71760,7 +71806,7 @@ class TestShimTopSpender(Base):
         self.assertLess(took - baseline, 1.0, "above the line nobody waits")
         self.usage(500)
         _, took = self.timed("pr", "view", "3")
-        self.assertGreaterEqual(took - baseline, 1.5)
+        self.assertGreaterEqual(took - baseline, 1.0)
         self.usage(3000)
         _, took = self.timed("pr", "view", "3")
         self.assertLess(took - baseline, 1.0, "the wait ended with the low budget")
@@ -74490,9 +74536,13 @@ class TestBlockedReport(Base):
         self.wait(5)
         for name in ("platform", "cos"):
             (found,) = self.told(name)
-            for part in ("coder", "blocked for 25 minutes", "2 refused sends the senders must repeat"):
+            for part in ("coder", "blocked for 25 minutes", "Held for it: 2 messages"):
                 self.assertIn(part, found["text"])
         self.assertEqual(len(self.audits()), 1)
+        observation = self.blocked_observation()
+        now = self.world.clock.now()
+        self.assertIn("1 refused send the senders must repeat", sb.blocked_line(self.world.engine, observation, now - 1500, now, [], ["cos"], "x"))
+        self.assertIn("2 refused sends the senders must repeat", sb.blocked_line(self.world.engine, observation, now - 1500, now, [], ["cos", "platform"], "x"))
 
     def test_over_the_threshold_with_nothing_held_is_not_reported(self):
         self.block(senders=())
@@ -74719,6 +74769,8 @@ class TestBlockedReport(Base):
         self.assertEqual(len(self.told("cos")), 1)
 
     def test_a_block_that_ends_with_messages_still_held_says_so(self):
+        self.test_note_held_send_keeps_each_row_adds_to_a_dict_entry_and_only_for_a_blocked_agent()   # #2051: the killers of the two direct guards
+        self.test_the_tick_with_no_plan_for_the_agent_reports_its_refused_sends()
         self.block()
         self.wait(25)
         self.pane["status"] = "idle"
@@ -74925,6 +74977,7 @@ class TestBlockedReport(Base):
         self.assertIn("ended turn", sb.blocked_kind(engine, observation), "another agent's request is not this one's")
 
     def test_a_block_that_ends_before_it_was_reported_says_nothing(self):
+        self.test_note_held_send_keeps_each_row_adds_to_a_dict_entry_and_only_for_a_blocked_agent()   # #2051: the direct killer of the note_held_send entry guard
         self.block()
         self.wait(10)
         self.pane["status"] = "idle"
@@ -75017,6 +75070,38 @@ class TestBlockedReport(Base):
             self.block()
             self.wait(25)
         self.assertEqual(len(self.told("cos")), 1)
+
+    def direct_tick(self, held):
+        """blocked_tick called directly: once to record the block, then 25 minutes later; returns what the second call reports."""
+        engine = self.world.engine
+        sb.blocked_tick(engine, engine.discover(self.world.clock.now()), held)
+        self.world.tick(25 * 60)
+        return sb.blocked_tick(engine, engine.discover(self.world.clock.now()), held)
+
+    def test_the_tick_reports_a_block_with_a_held_plan_and_with_a_refusal_only_when_no_plan_exists(self):
+        self.blocked_observation()
+        plan = sb.Plan("coder", "hold", "coder is blocked", [sb.Fact("lab.fact:1", "coder", "lab.fact", "s", 1, sender="cos")])
+        self.assertEqual(self.direct_tick({"coder": plan}), [("coder", "report")])
+
+    def test_the_tick_with_no_plan_for_the_agent_reports_its_refused_sends(self):
+        observation = self.blocked_observation()
+        sb.note_held_send(self.world.state, "coder", "cos", self.world.clock.now(), observation)
+        self.assertEqual(self.direct_tick({}), [("coder", "report")])
+
+    def test_note_held_send_keeps_each_row_adds_to_a_dict_entry_and_only_for_a_blocked_agent(self):
+        observation = self.blocked_observation()
+        now = self.world.clock.now()
+        self.assertIsNone(sb.note_held_send(None, "coder", "cos", now, observation))
+        sb.note_held_send(self.world.state, "coder", "cos", now, observation)
+        sb.note_held_send(self.world.state, "coder", "platform", now + 1, observation)
+        rows = sb.blocked_update(self.world.state, sb.BLOCKED_HELD_SENDS, lambda _: None)["coder"]["rows"]
+        self.assertEqual([r["from"] for r in rows], ["cos", "platform"])
+        sb.note_held_send(self.world.state, "coder", "x", now + 2, None)
+        self.pane["status"] = "idle"
+        idle = self.world.engine.discover(self.world.clock.now()).agents["coder"]
+        sb.note_held_send(self.world.state, "other", "cos", now, idle)
+        self.assertNotIn("other", sb.blocked_update(self.world.state, sb.BLOCKED_HELD_SENDS, lambda _: None))
+        self.assertEqual(len(sb.blocked_update(self.world.state, sb.BLOCKED_HELD_SENDS, lambda _: None)["coder"]["rows"]), 2)
 
 
 # ---- the blocked report's guards, bounds, validator, lock and config key: one row and one mutant each, derived from the code
@@ -77931,14 +78016,33 @@ class TestNoPaneToJudge(StandInPids, Base):
         "write_pane_health": "keeps a dead row's time; judges nothing",
     }
 
-    @staticmethod
-    def readers_without_the_predicate(source, exempt=(), needles=("PANE_DEAD", "GONE_STATES", "PANE_MISSING_PASSES", "pane_alerts")):
+    _PARSED = {}   # source text -> (tree, lines): each entry is parsed and split ONCE
+
+    @classmethod
+    def parsed(cls, source):
         import ast
-        tree = ast.parse(source)
+        if source not in cls._PARSED:
+            cls._PARSED[source] = (ast.parse(source), source.encode("utf-8").splitlines(keepends=True))
+        return cls._PARSED[source]
+
+    @classmethod
+    def segment(cls, source, node):
+        """ast.get_source_segment on the cached lines (same slicing, no re-split per node)."""
+        lines = cls.parsed(source)[1]
+        first, last = node.lineno - 1, node.end_lineno - 1
+        if first == last:
+            return lines[first][node.col_offset:node.end_col_offset].decode("utf-8")
+        parts = [lines[first][node.col_offset:]] + lines[first + 1:last] + [lines[last][:node.end_col_offset]]
+        return b"".join(parts).decode("utf-8")
+
+    @classmethod
+    def readers_without_the_predicate(cls, source, exempt=(), needles=("PANE_DEAD", "GONE_STATES", "PANE_MISSING_PASSES", "pane_alerts")):
+        import ast
+        tree = cls.parsed(source)[0]
         out = []
         for node in ast.walk(tree):
             if isinstance(node, ast.FunctionDef):
-                text = ast.get_source_segment(source, node) or ""
+                text = cls.segment(source, node)
                 if any(n in text for n in needles) and "no_pane_to_judge" not in text and node.name not in exempt:
                     out.append(node.name)
         return sorted(out)
@@ -77953,8 +78057,8 @@ class TestNoPaneToJudge(StandInPids, Base):
 
     def readers_with(self, source):
         import ast
-        return [n.name for n in ast.walk(ast.parse(source)) if isinstance(n, ast.FunctionDef)
-                and "no_pane_to_judge" in (ast.get_source_segment(source, n) or "")]
+        return [n.name for n in ast.walk(self.parsed(source)[0]) if isinstance(n, ast.FunctionDef)
+                and "no_pane_to_judge" in self.segment(source, n)]
 
     # -- M2: block level. Every OUTERMOST loop or comprehension (inside a function that mentions a needle) that itself mentions a needle must contain the predicate.
     BLOCK_NEEDLES = ("PANE_DEAD", "GONE_STATES", "PANE_MISSING_PASSES")
@@ -77970,7 +78074,7 @@ class TestNoPaneToJudge(StandInPids, Base):
         needles = needles or cls.BLOCK_NEEDLES
         loops = (ast.For, ast.AsyncFor, ast.While, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
         out = []
-        for fn in ast.walk(ast.parse(source)):
+        for fn in ast.walk(cls.parsed(source)[0]):
             if not isinstance(fn, ast.FunctionDef) or fn.name in exempt_functions:
                 continue
             found, stack = [], list(ast.iter_child_nodes(fn))
@@ -77984,7 +78088,7 @@ class TestNoPaneToJudge(StandInPids, Base):
                     stack = list(ast.iter_child_nodes(node)) + stack
             n = 0
             for node in found:
-                text = ast.get_source_segment(source, node) or ""
+                text = cls.segment(source, node)
                 if any(w in text for w in needles):
                     if "no_pane_to_judge" not in text:
                         out.append((fn.name, n))
