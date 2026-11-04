@@ -49,12 +49,14 @@ def build(host):
             self.passes(2)
             audit = [e for e in self.world.audit() if e["event"] == "triage.parked_invalid"]
             self.assertEqual(len(audit), 1)
+
+        def test_s3_an_expired_park_is_judged_as_an_unparked_item(self):
             self.add(153, created=5, updated=4, labels=["osuser:parked"], body="Parked until: 2020-01-01")
             self.passes(0)
             self.assertEqual(self.mentions("api#153"), 1)
 
         def test_u1_the_moved_text_builder_is_byte_identical(self):
-            state = self.engine.triage
+            state = sb.TriageState()
             state.reasons[("T3", "acme/api#1")] = "why"
             shown = [("T3", "acme/api#1"), ("T5", "acme/api#2")]
             kinds, total, other, invalid = ["T3", "T5"], 5, 2, ["acme/api#9"]
