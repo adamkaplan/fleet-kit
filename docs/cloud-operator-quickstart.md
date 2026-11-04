@@ -567,3 +567,13 @@ The build step is unchanged (an operator rebuilds the image and publishes it as 
 The App already holds checks: read (the owner confirmed it on 29 October), so the orchestrator set needs no App change today; if a later set needs a permission the App lacks, the owner adds it and accepts it on each installation, never this change.
 
 **What the orchestrator's token can and cannot do.** It can read issues, pull requests, check results and repository metadata, and it can write to issues only. It cannot push, create a branch, read a file, open, edit, approve or merge a pull request, change a workflow, a setting, a secret or a ruleset, or mint a token.
+
+## A tester pod joins the hub (`--hub`, ask #2026)
+
+A pod launched with the role `tester` joins the hub: the lane's launch command hands the launcher the flag `--hub` (and `--boss` with the launch's `--reports-to`, once). Only a tester joins; a worker or an orchestrator launched without `--hub` is rendered exactly as before, whatever the hub setting. The pod gets the hub's channel address and token file, is registered in the hub's registry under its own worker name at the launch (a launch whose registration fails creates no pod), and is removed from it when the pod is retired or stopped.
+
+Settings the owner sets: the hub's address (`CW_HUB_CHANNEL_URL`) and the registry Secret name (`CW_HUB_REGISTRY_SECRET`) in the control host's settings file, only if they differ from the launcher's defaults; and in the daemon's configuration the pod names that may record tester verdicts, listed under `plan_evaluators.tester`.
+
+The relay's refusals: a pod not listed under `plan_evaluators.tester` (a worker pod) is refused; the recorded author of the pull request is refused; a pull request the pod's boss did not name is refused. An accepted verdict is recorded under the pod's own name with the evaluator tester.
+
+A pod's call is also refused (403, `pr not linked to the pod's issue`) when the pull request is not linked to the pod's own issue.
