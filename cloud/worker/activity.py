@@ -48,7 +48,7 @@ def _stat(proc, pid):
 
 def _proc_root():
     """/proc, unless a test points the check at a stub: CW_ACTIVITY_PROC counts only with the test marker set too."""
-    if os.environ.get("FL" + "EET_SWITCHBOARD_UNDER_TEST") == "1" and os.environ.get("CW_ACTIVITY_PROC"):
+    if os.environ.get("CW_ACTIVITY_UNDER_TEST") == "1" and os.environ.get("CW_ACTIVITY_PROC"):
         return os.environ["CW_ACTIVITY_PROC"]
     return "/proc"
 

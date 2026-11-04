@@ -104,9 +104,9 @@ class Activity(unittest.TestCase):
         port = self.serve(mode)
         e = dict(os.environ, CW_ACTIVITY_PORT=str(port), CW_ACTIVITY_PASSWORD_FILE=self.pwfile, CW_ACTIVITY_PROC=root)
         if marker is None:
-            e.pop("FL" + "EET_SWITCHBOARD_UNDER_TEST", None)
+            e.pop("CW_ACTIVITY_UNDER_TEST", None)
         else:
-            e["FL" + "EET_SWITCHBOARD_UNDER_TEST"] = marker
+            e["CW_ACTIVITY_UNDER_TEST"] = marker
         p = subprocess.run([sys.executable, script or SCRIPT], env=e, capture_output=True, text=True, timeout=30)
         self.assertEqual(p.returncode, 0, p.stderr)
         return json.loads(p.stdout)["busy"]
@@ -125,9 +125,9 @@ class Activity(unittest.TestCase):
         code = "import sys; sys.path.insert(0, %r); import activity; print(activity._proc_root())" % os.path.dirname(SCRIPT)
         for marker, want in ((None, "/proc"), ("0", "/proc"), ("1", root)):
             e = dict(os.environ, CW_ACTIVITY_PROC=root)
-            e.pop("FL" + "EET_SWITCHBOARD_UNDER_TEST", None)
+            e.pop("CW_ACTIVITY_UNDER_TEST", None)
             if marker:
-                e["FL" + "EET_SWITCHBOARD_UNDER_TEST"] = marker
+                e["CW_ACTIVITY_UNDER_TEST"] = marker
             p = subprocess.run([sys.executable, "-c", code], env=e, capture_output=True, text=True, timeout=30)
             self.assertEqual(p.stdout.strip(), want, p.stderr)
 
