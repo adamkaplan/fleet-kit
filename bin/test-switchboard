@@ -75334,13 +75334,17 @@ class TestBlockedMutants(Base):
 
     def killed_each(self, mutants, workers=2):
         """{id: killed?} for {id: (source text, test)}: each mutant is built and its named test run in a forked CHILD (the parent's tree is never touched), `workers` at a time."""
-        out, running = {}, {}
+        out, running, crashed = {}, {}, {}
 
         def reap():
-            pid, _ = os.wait()
+            pid, status = os.wait()
             ident, fd = running.pop(pid)
             with os.fdopen(fd) as pipe:
-                out[ident] = pipe.read() == "1"
+                answer = pipe.read()
+            if status != 0 or answer not in ("0", "1"):
+                crashed[ident] = "exit status %s\n%s" % (status, answer)
+            else:
+                out[ident] = answer == "1"
 
         for ident, (text, test) in mutants.items():
             if len(running) >= workers:
@@ -75351,15 +75355,20 @@ class TestBlockedMutants(Base):
                 code = 70
                 try:
                     os.close(read)
-                    answer = "1" if self.killed(self.mutant_module(text), test) else "0"
+                    try:
+                        answer = "1" if self.killed(self.mutant_module(text), test) else "0"
+                        code = 0
+                    except BaseException:
+                        answer = traceback.format_exc()
                     os.write(write, answer.encode())
-                    code = 0
                 finally:
                     os._exit(code)
             os.close(write)
             running[pid] = (ident, read)
         while running:
             reap()
+        if crashed:
+            self.fail("a mutant's child CRASHED (not a survivor):\n" + "\n".join("%s: %s" % (i, crashed[i]) for i in sorted(crashed)))
         return out
 
     def control_passes(self, tests):
