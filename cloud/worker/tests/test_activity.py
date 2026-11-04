@@ -87,6 +87,55 @@ class Activity(unittest.TestCase):
         p = self.run_script(self.serve(), CW_ACTIVITY_PASSWORD_FILE=os.path.join(self.tmp.name, "absent"))
         self.assertEqual((p.returncode, p.stdout), (1, ""))
 
+    # a live child of pid 1 counts as busy, read from a stub /proc; the server says idle
+    def tree(self, procs):
+        root = os.path.join(self.tmp.name, "proc")
+        os.makedirs(root, exist_ok=True)
+        for pid, (state, ppid) in procs.items():
+            os.makedirs(os.path.join(root, str(pid)), exist_ok=True)
+            with open(os.path.join(root, str(pid), "stat"), "w") as f:
+                f.write("%d (a b) %s %d 1 1 0\n" % (pid, state, ppid))
+        return root
+
+    def busy(self, root, mode="ok", script=None):
+        port = self.serve(mode)
+        e = dict(os.environ, CW_ACTIVITY_PORT=str(port), CW_ACTIVITY_PASSWORD_FILE=self.pwfile, CW_ACTIVITY_PROC=root)
+        p = subprocess.run([sys.executable, script or SCRIPT], env=e, capture_output=True, text=True, timeout=30)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        return json.loads(p.stdout)["busy"]
+
+    def test_live_child_with_idle_server_is_busy(self):
+        root = self.tree({1: ("S", 0), 50: ("S", 1), 51: ("S", 50)})
+        self.assertIs(self.busy(root), True)
+
+    def test_no_child_and_idle_server_is_not_busy(self):
+        self.assertIs(self.busy(self.tree({1: ("S", 0)})), False)
+
+    def test_agent_and_server_only_is_not_busy(self):
+        self.assertIs(self.busy(self.tree({1: ("S", 0), 7: ("S", 0)})), False)  # 7 is outside pid 1: not a descendant
+
+    def test_a_zombie_child_does_not_count(self):
+        self.assertIs(self.busy(self.tree({1: ("S", 0), 50: ("Z", 1)})), False)
+
+    def test_unreadable_proc_gives_the_servers_answer(self):
+        gone = os.path.join(self.tmp.name, "no-such-proc")
+        self.assertIs(self.busy(gone), False)
+        self.assertIs(self.busy(gone, "busy-forever"), True)
+
+    def test_mutant_without_the_child_check_fails_the_long_command_case(self):
+        with open(SCRIPT) as f:
+            real = f.read()
+        old = '"busy": is_busy(active) or has_live_child(),'
+        self.assertEqual(real.count(old), 1)
+        mutant = real.replace(old, '"busy": is_busy(active),')
+        self.assertNotEqual(mutant, real)  # applied, computed from the two texts: a no-op fails here
+        path = os.path.join(self.tmp.name, "mutant_activity.py")
+        with open(path, "w") as f:
+            f.write(mutant)
+        root = self.tree({1: ("S", 0), 50: ("S", 1)})
+        self.assertIs(self.busy(root, script=SCRIPT), True)  # control: the real tool
+        self.assertIs(self.busy(root, script=path), False, "mutant ignoring the child must report busy false (the long command would be ended)")
+
 
 class Dockerfile(unittest.TestCase):
     def test_the_three_commands_are_installed(self):

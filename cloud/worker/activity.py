@@ -46,7 +46,7 @@ def _stat(proc, pid):
     return rest[0], int(rest[1])
 
 
-def has_live_child(proc="/proc"):
+def has_live_child(proc=os.environ.get("CW_ACTIVITY_PROC", "/proc")):  # CW_ACTIVITY_PROC: tests only
     """True when a live process descends from pid 1 (the agent AND its headless server, one process) other than pid 1,
     the process running this tool and its own ancestors back to pid 1 (the tool call that started it); zombies do not
     count. Never raises: any read error means no child."""
