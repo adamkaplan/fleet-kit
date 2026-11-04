@@ -674,7 +674,7 @@ elif docker info >/dev/null 2>&1; then
   bctx="$tmp/bctx"; mkdir -p "$bctx/worker"; cp "$here/worker/scan-secrets.sh" "$here/worker/scan-files.py" "$here/worker/scan-allowlist.txt" "$bctx/worker/"
   ptok="ghp_$(printf 'f%.0s' $(seq 36))"; printf '%s\n' "$ptok" > "$bctx/plant.txt"
   bbuild() { # <variant body for the worker stage> [scan-user]: prints the log, returns docker's status
-    { echo "$base AS worker"; echo "RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends python3 && rm -rf /var/lib/apt/lists/*"; printf '%b\n' "$1"; echo "$tail"; } > "$bctx/Dockerfile.$2"
+    { echo "$base AS worker"; echo "RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends python3 && rm -rf /var/lib/apt/lists/*"; printf '%b\n' "$1"; echo "$base AS pgbuild"; echo "RUN mkdir -p /opt/pg"; echo "$tail"; } > "$bctx/Dockerfile.$2"
     [ -z "${3:-}" ] || sed -i.bak "s/^USER root$/USER $3/" "$bctx/Dockerfile.$2"
     docker build --platform linux/amd64 --progress=plain --no-cache -t "cw-bscan-$2" -f "$bctx/Dockerfile.$2" "$bctx" 2>&1
   }
