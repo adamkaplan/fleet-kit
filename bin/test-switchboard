@@ -31866,6 +31866,7 @@ class TestRegistrarFloor(LedgerBase):
     def setUp(self):
         super().setUp()
         self.dc = sb.load_module("delegated_clear")
+        self.once_per_tree()
         self.rule = sb.impact_floor.load_matrix()["owner_hold"]["delegated_clear"]
         if TestRegistrarFloor.cache is None:   # the real file and its closure, derived once for the class
             import ast
@@ -31876,6 +31877,36 @@ class TestRegistrarFloor(LedgerBase):
         self.base_src, self.tree, self.names, self.defs, self.bindings = TestRegistrarFloor.cache
         self.extra_config = dict(FLOOR_CONFIG, plan_gates={"repos": {"acme/app": {"mode": "shadow"}}})
         self.configure()
+
+    memo = {}   # (what, text hash or tree id, ...) -> (the tree it was made from, the value); the last few only
+
+    def once_per_tree(self):
+        """For this test the delegated_clear module (alone: its own `ast` name, not the process's) parses a text once and walks a tree once per question: `registrar_findings` read the 26k-line daemon file
+        (the base, again and again) and its head three times each. The answers are the module's own, unchanged; only a repeat of the same text or the same tree is answered from the class's table."""
+        import ast, hashlib, types
+        memo, dc = TestRegistrarFloor.memo, self.dc
+
+        def keep(key, tree, make):
+            if key not in memo:
+                while len(memo) >= 24:
+                    del memo[next(iter(memo))]
+                memo[key] = (tree, make())
+            return memo[key][1]
+
+        def parse(source, *args, **kwargs):
+            if args or kwargs or not isinstance(source, str):
+                return ast.parse(source, *args, **kwargs)
+            return keep(("parse", hashlib.sha1(source.encode("utf-8", "surrogatepass")).hexdigest()), None, lambda: ast.parse(source))
+
+        proxy = types.SimpleNamespace(**{name: getattr(ast, name) for name in dir(ast)})
+        proxy.parse = parse
+        patchers = [mock.patch.object(dc, "ast", proxy)]
+        for name, key_of in (("registrar_pattern", lambda tree, *rest: ()), ("pattern_bindings", lambda tree, *rest: ()), ("closure", lambda tree, *rest: tuple(repr(r) for r in rest))):
+            real = getattr(dc, name)
+            patchers.append(mock.patch.object(dc, name, (lambda real, name, key_of: lambda tree, *rest: keep((name, id(tree)) + key_of(tree, *rest), tree, lambda: real(tree, *rest)))(real, name, key_of)))
+        for patcher in patchers:
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def head_of(self, body, name="add_zzz_parsers", base=None):
         return (base if base is not None else self.base_src) + "\n\ndef %s(sub):\n    %s\n" % (name, body.replace("\n", "\n    "))
