@@ -1862,7 +1862,11 @@ class Kube:
     def add_secrets(self, *values, life=None):
         for v in values:
             if v:
-                (getattr(self, "registry", None) or self.known).add_forms(secret_forms(v), life)
+                reg = getattr(self, "registry", None) or self.known
+                if hasattr(reg, "add_forms"):
+                    reg.add_forms(secret_forms(v), life)
+                else:   # a plain KnownSet / set put in place of the registry: no lives, the forms stay
+                    reg.update(secret_forms(v))
 
     def delete_command(self, kind, name):
         """The exact command that removes one object by hand: the configured login flags, never a value."""
