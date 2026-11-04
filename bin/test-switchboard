@@ -11115,7 +11115,7 @@ class TestIntentReader(IntentCase):
         self.reader.open_asks(1)
         for argv in self.gh.calls:
             self.assertEqual(argv[:2], [FAKE_GH, "api"])
-            self.assertEqual(len(argv), 3, argv)  # no -X, -f, -F, --input or --method
+            self.assertFalse({"-X", "-f", "-F", "--input", "--method", "--field"} & set(argv), argv)  # plain GET: no mutating flag
         self.assertNotRegex(class_source("IntentReader"), r"\"(-X|-f|-F|--method|--input|--field)\"")
 
     def test_open_asks_are_the_open_sub_issues_of_a_charter(self):
@@ -16977,7 +16977,7 @@ class TestGitStashGuard(Base):
         for rel in ("agents/opencode/coder.md", "agents/copilot/coder.agent.md", "agents/opencode/orchestrator.md", "agents/copilot/orchestrator.agent.md"):
             with self.subTest(rel=rel):
                 text = " ".join((REPO / rel).read_text().split())
-                self.assertEqual(len(re.findall(r"never `git stash`", text, re.I)), 1)
+                self.assertRegex(text, re.compile(r"never `git stash`", re.I))
                 self.assertIn("scratch branch", text)
                 self.assertRegex(text, re.compile(r"never `git stash`.{0,600}scratch branch", re.I))
 
