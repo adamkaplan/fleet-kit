@@ -2995,6 +2995,9 @@ class Switchboard:
                 return decide(recipient, facts, None, now, self.batch_seconds, self.engaged_seconds,
                               "cannot read what %s already has: %s" % (recipient, err))
             pending = [fact for fact in facts if fact.key not in delivered]
+            if self.sent is not None and len(pending) != len(facts):   # the ledger answered (v2_light)
+                self._note("resend.skipped", recipient, {"why": "the key was already delivered to this session (sent-keys ledger)",
+                                                         "keys": sorted(fact.key for fact in facts if fact.key in delivered)})
             self._acknowledge(delivered)
             if pending and not complete:
                 return decide(recipient, pending, None, now, self.batch_seconds, self.engaged_seconds,
@@ -6084,6 +6087,7 @@ ADOPT_BY_DAEMON = "the switchboard"
 BOSS_READ_SITES = {
     "bin/fleet-switchboard:headless_target": "a retired worker is not discovered: its STORED metadata (boss record applied), resolved through `resolve_boss`, as `reattach_caller_problem` does",
     "bin/lost_worker.py:_losses": "a cloud worker is not discovered: the launching lane is the `reports_to` text of its own cloud record, only the address of an alert (the loss is told to the Chief of Staff too)",
+    "bin/push_watch.py:run_pass": "a cloud worker is not discovered: the launching lane is the `reports_to` text of its own cloud record, only the address of a push item (the item is told to that lane and nobody else)",
     "bin/switchboard/handoff.py:_boss_of": "the literal text; `boss_name` is built on it",
     "bin/fleet-switchboard:notice_boss": "resolves the text through `resolve_boss`, over a discovery that already applies the boss record",
     "bin/fleet-switchboard:reattach_caller_problem": "a dead agent is not discovered: its STORED metadata, overlaid with the boss record",
@@ -9683,6 +9687,16 @@ def lost_worker_tick(engine, discovery):
     return module.run_pass(ns, engine, engine.now(), alive)
 
 
+def push_watch_tick(engine, discovery):
+    """#1740: the lane that launched a cloud worker is told of its pushes and of its quiet after a push (bin/push_watch.py, by path like lost_worker_tick)."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("push_watch", os.path.join(os.path.dirname(os.path.realpath(__file__)), "push_watch.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    ns = types.SimpleNamespace(parse_iso=parse_iso, _one_line=_one_line, parse_bounded=load_module("record_json").parse_bounded)
+    return module.run_pass(ns, engine, engine.now(), lambda path: engine.gh_api(path, paginate=False), (getattr(engine, "config", None) or {}).get("push_watch"))
+
+
 def finish_pass(engine, discovery, report):
     """The end of a pass: reminders that reached their recipient are pruned. A failure is
     audited and never stops the pass."""
@@ -9718,6 +9732,10 @@ def finish_pass(engine, discovery, report):
         lost_worker_tick(engine, discovery)   # #1481: a lost worker is told once to its lane and the Chief of Staff
     except Exception as err:
         engine._failed("lost-worker", "lost-worker", err, report)
+    try:
+        push_watch_tick(engine, discovery)   # #1740: a worker's push is told to the lane that launched it
+    except Exception as err:
+        engine._failed("push-watch", "push-watch", err, report)
     try:
         publish_decisions(engine)
     except Exception as err:
@@ -16246,10 +16264,8 @@ class IntentReader:
         repo = repo or self.repo
         return self._cached(("orders", repo, number), lambda: fetch_orders(self, number, repo))
 
-    NO_PARENT_SHAPE = re.compile(r"(not_found: )?(gh: )?(not found|http 404 no parent)( \(http 404\))?", re.I)
-
     def parent(self, number, repo=None, strict=False):
-        """The parent issue's number, or None when the issue has no parent. `strict` (#1249, charter set): a 404 whose body is not the exact "no parent" shape raises."""
+        """The parent issue's number, or None when the issue has no parent. `strict` (#1249, charter set): the issue is read first, fresh (it raises when it is missing or unreadable), and then a 404 of its parent, whatever its text, is "no parent"."""
         repo = repo or self.repo
 
         def fetch(meta=None):
@@ -16259,13 +16275,13 @@ class IntentReader:
                     return None
             except IntentError as err:
                 if err.reason == "not_found":
-                    if strict and not self.NO_PARENT_SHAPE.fullmatch(str(err).strip()):
-                        raise IntentError("gh", "404 that is not the no-parent answer: %s" % _one_line(str(err), 60)) from None
                     return None
                 raise
             return IssueIntent.from_api(found).number
 
         if strict:   # the charter set's strict read tells "no parent" from an odd 404: it is never answered from the file
+            self.invalidate(number, repo)
+            self.issue(number, repo)   # raises for a missing or unreadable issue: the parent endpoint is not asked
             return self._cached(("parent", repo, number), fetch)
         return self._cached(("parent", repo, number), self._filed("parent", repo, number, fetch, lambda found: {"parent": found}, lambda stored: stored["parent"]))
 
@@ -17260,7 +17276,7 @@ def cmd_verdict(args, runner, now):
                                                                                          head[:8], ctx.pr, entry["plan_hash"][:19]))
             continue
         if ctx.engine.audit is not None:
-            detail = {"scenario": entry["scenario"], "result": entry["result"], "seq": one["seq"], "by": entry["by"], "chain": one["hash"]}
+            detail = {"scenario": entry["scenario"], "result": entry["result"], "seq": one["seq"], "by": entry["by"], "chain": one["hash"], "evidence": entry["evidence"][:160]}
             if named == "tester" and caller in launch and load_launch_testers().source_of(caller, ctx.config.get("plan_evaluators"), launch) == "launch record":
                 detail["launch_record"] = {k: v for k, v in launch[caller].items() if v is not None}   # #372: the record this verdict relied on
             ctx.engine.audit.append(ctx.engine.actor, "plan.verdict", ctx.pr, detail)
@@ -19977,7 +19993,7 @@ def ci_record_core(ctx, now, quiet=False):
     "nothing" (CI is green but no per-PR scenario names `ci`), "not-green", "unreadable", "no-plan" or "no-head". It records
     only for a complete, green run at the PR's CURRENT head and the plan's CURRENT hash, never twice, and writes nothing to GitHub.
     `quiet` leaves the audit alone for everything but a real record (the pass runs this for many PRs: a failing run is not news)."""
-    out = {"status": None, "head": None, "ci": None, "scenarios": [], "recorded": [], "already": [], "why": None}
+    out = {"status": None, "head": None, "ci": None, "scenarios": [], "recorded": [], "already": [], "proved": [], "why": None}
     if ctx.unreadable:
         return dict(out, status="unreadable", why="the PR could not be read: %s" % ctx.unreadable)
     head = (ctx.facts or {}).get("head")
@@ -20012,6 +20028,16 @@ def ci_record_core(ctx, now, quiet=False):
         if not quiet:   # nothing was recorded, so this is NOT proof that the recorder works (ok stays False for the preflight)
             _gates_audit(ctx.engine, "gate.ci_record", ctx.pr, dict(detail, ok=False, why="no scenario names ci"))
         return dict(out, status="nothing")
+    try:   # the run is on refs/pull/N/merge: a merge ref whose first parent is not the base's current head is a stale run, and records nothing (#2053 reader)
+        gh = getattr(ctx.engine, "gh_runner", None) or subprocess.run
+        parents = merge_ref_read(gh, ctx.repo, ctx.number)
+        base, base_head = merge_ref_base_head(gh, ctx.repo, ctx.number) if parents else (None, None)
+    except MergeRefError as err:   # an unreadable merge ref cannot be shown fresh: nothing is recorded, and the one line names the error
+        return dict(out, status="stale", why="the merge ref could not be read (%s): nothing was recorded" % _one_line(str(err), 120))
+    if parents is None:   # no merge ref (a 404): freshness cannot be shown, so nothing is recorded
+        return dict(out, status="stale", why="the pull request has no merge ref, so it cannot be shown fresh: nothing was recorded")
+    if parents and parents[0] != base_head:
+        return dict(out, status="stale", why="the run is on a stale merge ref (first parent %s, %s head %s): nothing was recorded" % (parents[0][:8], base, base_head[:8]))
     for scenario in wanted:
         fresh = [e for e in ctx.entries if e.get("pr") == ctx.pr and e.get("scenario") == scenario["id"] and e.get("kind") == "verdict"
                  and e.get("evaluator") == "ci" and e.get("plan_hash") == ctx.plan["plan_hash"] and e.get("head") == head
@@ -20024,8 +20050,17 @@ def ci_record_core(ctx, now, quiet=False):
                                              "by": plan_ledger.CI_RECORDER, "evaluator": "ci",
                                              "evidence": "CI green at %s: every check run complete and passing" % head[:12]}, now())
         out["recorded"].append(scenario["id"])
-    if out["recorded"] or not quiet:
-        _gates_audit(ctx.engine, "gate.ci_record", ctx.pr, dict(detail, ok=True, recorded=out["recorded"], already=out["already"]))
+    link = next((r.get("detailsUrl") for r in ((ctx.facts or {}).get("ci_rollup") or []) if isinstance(r, dict) and "/actions/runs/" in str(r.get("detailsUrl") or "")), "")
+    for scenario in wanted:   # the proof of each ci scenario, next to its verdict (same guards: only reached for a green, complete run)
+        if plan_ledger.already_recorded(ctx.entries, {"kind": "proof", "pr": ctx.pr, "scenario": scenario["id"], "plan_hash": ctx.plan["plan_hash"], "head": head, "result": "pass"}):
+            continue
+        plan_ledger.append_once(ctx.state, [{"kind": "proof", "pr": ctx.pr, "scenario": scenario["id"], "plan_ref": ctx.source,
+                                             "plan_hash": ctx.plan["plan_hash"], "head": head, "result": "pass", "by": plan_ledger.CI_RECORDER,
+                                             "evidence": "CI green at %s: %s" % (head[:12], link or "every check run complete and passing"),
+                                             "command": "gates ci-record", "env": "switchboard"}], now())
+        out["proved"].append(scenario["id"])
+    if out["recorded"] or out["proved"] or not quiet:
+        _gates_audit(ctx.engine, "gate.ci_record", ctx.pr, dict(detail, ok=True, recorded=out["recorded"], already=out["already"], proved=out["proved"]))
     return dict(out, status="recorded")
 
 
@@ -20125,6 +20160,9 @@ def cmd_gates_ci_record(args, runner, now):
             print(line)
     if got["status"] in ("unreadable", "no-plan", "no-head", "not-green"):
         raise LedgerCommandError("%s: nothing was recorded" % got["why"])
+    if got["status"] == "stale":
+        print(got["why"])
+        return EXIT_OK
     if got["status"] == "nothing":
         print("CI is green at %s; the plan has no per-PR scenario that names `ci`: nothing to record" % got["head"][:8])
         for line in carry_lines(got.get("carry") or []):
@@ -20132,6 +20170,8 @@ def cmd_gates_ci_record(args, runner, now):
         return EXIT_OK
     print("CI is green at %s: recorded %s%s" % (got["head"][:8], ", ".join(got["recorded"]) or "nothing new",
                                                " (already recorded: %s)" % ", ".join(got["already"]) if got["already"] else ""))
+    if got["proved"]:
+        print("and the proof of %s" % ", ".join(got["proved"]))
     for line in carry_lines(got.get("carry") or []):
         print(line)
     return EXIT_OK
@@ -20241,6 +20281,7 @@ def ci_record_pass(engine, now):
                 retry_at = max(now + 1, state.lists.get(plan_ledger.normal_repo(repo), (now, []))[0] + CI_RECORD_LIST_TTL)
             state.checked[key] = {"list_head": listed_head, "at": now, "retry_at": retry_at, "fails": 0}
             pr_state_enrich(state, repo, number, ctx, now)
+            pr_state_jobs(state, engine, runner, repo, number, ctx, now)
         except Exception as err:
             fails += 1
             delay = min(CI_RECORD_RETRY[1], CI_RECORD_RETRY[0] * 2 ** (fails - 1))   # unreadable: 5 min, 10, 20, then 30
@@ -20291,6 +20332,7 @@ def pr_state_from_lists(state, repos):
             entry = {"state": "draft" if record.get("draft") else "open", "head": head, "labels": labels, "at": at, "listed_at": at}
             if old.get("head") == head and old.get("checks") is not None:   # what the examination found at this very head stays until it is examined again
                 entry.update({k: old[k] for k in ("checks", "ci", "mergeable", "gates", "examined_at", "examined_head") if k in old})
+                entry.update({k: old[k] for k in ("jobs", "jobs_note", "jobs_head") if k in old})   # #1962: the jobs of a run in progress stay with the head they were read at
             state.pr_state[ref] = entry
         for ref, old in list(state.pr_state.items()):
             if ref.startswith(key + "#") and ref not in seen and old.get("state") in ("open", "draft") and at > old.get("listed_at", 0):
@@ -20314,6 +20356,57 @@ def pr_state_enrich(state, repo, number, ctx, now):
         entry["gates"] = {"ready": bool(report.get("ready")), "missing": missing}
     except Exception as err:   # the picture is best effort: the gates are said not evaluated (not "no plan"), never guessed
         entry["gates"] = {"error": _one_line("%s: %s" % (type(err).__name__, err), 120)}
+
+
+PR_STATE_JOBS_MAX = 10   # lines of jobs kept per PR
+PR_STATE_JOBS_RUNS = 5   # runs in progress read per examination
+PR_STATE_JOBS_FAILED = ("failure", "timed_out", "cancelled", "action_required", "startup_failure")
+PR_STATE_JOBS_RUN_RE = re.compile(r"/actions/runs/(\d+)")
+
+
+def pr_state_jobs(state, engine, runner, repo, number, ctx, now):
+    """#1962: while a pending head has a run in progress, read the jobs of each such run ONCE (`pr_reading.read_jobs`, one request per run, none for a
+    completed run) and keep the failed jobs (with the failed step) and the running ones in the entry, with the head they were read at. A jobs answer that
+    cannot be read leaves one note. Runs only inside an examination, so the recorder's retry gates bound it. Never raises."""
+    entry = state.pr_state.get("%s#%d" % (plan_ledger.normal_repo(repo), number))
+    facts = ctx.facts or {}
+    if entry is None or not facts.get("head"):
+        return
+    for key in ("jobs", "jobs_note", "jobs_head"):
+        entry.pop(key, None)
+    if facts.get("ci") != "pending":
+        return
+    runs = []
+    for check in load_module("ci_runs").newest(facts.get("ci_rollup")):
+        found = PR_STATE_JOBS_RUN_RE.search(str(check.get("detailsUrl") or "")) if isinstance(check, dict) and check.get("status") == "IN_PROGRESS" else None
+        if found and found.group(1) not in runs:
+            runs.append(found.group(1))
+    if not runs:
+        return
+    jobs, note = [], None
+    try:
+        reading = load_module("pr_reading")
+        gh = merge_gate_gh(engine.config, runner, repo)
+        for run in runs[:PR_STATE_JOBS_RUNS]:
+            try:
+                answer = reading.read_jobs(gh, repo, run)
+            except reading.ReadError:
+                note = "jobs not readable"
+                continue
+            if not any(str(j.get("conclusion")).lower() in PR_STATE_JOBS_FAILED for j in answer):
+                continue
+            for job in answer:
+                word = str(job.get("conclusion") or "").lower()
+                if word in PR_STATE_JOBS_FAILED:
+                    step = next((s.get("name") for s in job.get("steps") or [] if str(s.get("conclusion")).lower() == "failure"), None)
+                    jobs.append(dict({"name": _plain(job.get("name"), 60), "conclusion": _plain(word, 30)}, **({"step": _plain(step, 60)} if step else {})))
+                elif word in ("in_progress", "queued", "pending", "waiting", "requested"):
+                    jobs.append({"name": _plain(job.get("name"), 60), "conclusion": "running"})
+    except Exception:
+        note, jobs = "jobs not readable", []
+    entry.update({"jobs": jobs[:PR_STATE_JOBS_MAX], "jobs_head": facts["head"]})
+    if note:
+        entry["jobs_note"] = note
 
 
 def write_pr_state(engine, state, now):
@@ -20386,6 +20479,9 @@ def pr_state_view(ref, body, entries, now, ledger_ref=None, ledger_problem=None)
         gates = {"ready": gates.get("ready") is True, "missing": [_plain(m, 160) for m in (gates.get("missing") if isinstance(gates.get("missing"), list) else [])[:12] if isinstance(m, str)]}
         if isinstance(entry["gates"].get("error"), str):
             gates = {"error": _plain(entry["gates"]["error"], 120)}
+    jobs = None
+    if isinstance(entry.get("jobs"), list) and not stale_head and entry.get("jobs_head") == entry.get("head"):
+        jobs = [{"name": _text(j.get("name"), 60) or "?", "conclusion": _text(j.get("conclusion"), 30) or "?", "step": _text(j.get("step"), 60)} for j in entry["jobs"][:10] if isinstance(j, dict)]
     at = entry.get("at", now)
     examined_at = entry.get("examined_at")
     examined_age = max(0, int(now - examined_at)) if _finite(examined_at) and not stale_head else None
@@ -20397,6 +20493,10 @@ def pr_state_view(ref, body, entries, now, ledger_ref=None, ledger_problem=None)
             "snapshot_age_seconds": max(0, int(now - body["written_at"]))}
     if isinstance(entry.get("why"), str):
         view["why"] = _plain(entry["why"], 100)
+    if jobs is not None and (jobs or isinstance(entry.get("jobs_note"), str)):
+        view["jobs"] = jobs
+        if isinstance(entry.get("jobs_note"), str):
+            view["jobs_note"] = _plain(entry["jobs_note"], 60)
     return view
 
 
@@ -20435,6 +20535,10 @@ def pr_state_line(view):
     parts.append("list read %ds ago" % view["age_seconds"])
     if view.get("why"):
         parts.append(view["why"])
+    if view.get("jobs") is not None:   # #1962: one line per failed or running job of a run in progress, one for a jobs answer that could not be read
+        tail = ["  job %s: %s%s" % (_plain(j.get("name"), 60), _plain(j.get("conclusion"), 30), " (failed step: %s)" % _plain(j["step"], 60) if j.get("step") else "") for j in view["jobs"] if isinstance(j, dict)]
+        tail += ["  jobs: %s" % _plain(view["jobs_note"], 60)] if view.get("jobs_note") else []
+        parts[-1] += "".join("\n" + line for line in tail)
     return "; ".join(parts)
 
 
@@ -23566,7 +23670,7 @@ def build_parser():
     launch.add_argument("--memory-ok", dest="memory_ok", metavar="REASON", help="Skip the memory test of a new launch (audited with the reason)")
     launch.add_argument("--cloud", action="store_true", help="Run the worker in the cloud (needs --repo and --branch; --dir is its path in the pod, default /work; the pod always runs its own 'worker' agent: --agent is only recorded)")
     launch.add_argument("--branch", help="With --cloud: the branch the worker starts on")
-    launch.add_argument("--idle", help="With --cloud: stop after this long idle (default 10m)")
+    launch.add_argument("--idle", help="With --cloud: stop after this long idle (default 30m)")
     launch.add_argument("--hard", help="With --cloud: stop after this long whatever it does (default 2h)")
     launch.add_argument("--shape", help="With --cloud: the pod shape, XS (1 CPU, 2 GiB; the launcher's default, no nested Docker), S (2 CPU, 4 GiB; the default with --stack), M (4 CPU, 8 GiB) or O (250m CPU, 768 MiB; the default of --agent orchestrator)")
     launch.add_argument("--stack", action="store_true", help="With --cloud: a pod that can run a nested Docker stack (the Sysbox runtime class, its own user namespace, no capability added, no privileged mode). Off by default; the launch without it is unchanged. The first pod on a fresh node may wait for the node's runtime: the launcher retries")
@@ -24071,7 +24175,7 @@ def cmd_charter(args, runner, now):
     if value is not None and isinstance(row0, dict):   # #1143: the GitHub reads happen BEFORE the registry lock, bound to the issue number and the repo; the lock only re-checks registry facts
         repo0 = row0.get("repo") or (engine.config.get("intent_repo") if engine.config else None)
         try:
-            parent = engine.intents.parent(value, repo0, strict=True)   # None only for the "no parent" answer; any other failure raises
+            parent = engine.intents.parent(value, repo0, strict=True)   # None only when the issue exists and its parent answers 404; a missing issue or any other failure raises
             labelled = None
             is_pr = False
             if parent is None:   # a charter has no parent: the one extra read is its label
