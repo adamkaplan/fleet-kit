@@ -24,11 +24,13 @@ def messages():
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
+    override = None
+
     def do_GET(self):
         if self.path == "/api/session":
             data = [{"id": "s1", "time": {"updated": NOW_MS - 5000}}]
         elif self.path == "/api/session/s1/message":
-            data = messages()
+            data = Handler.override or messages()
         else:
             self.send_response(404)
             self.end_headers()
@@ -111,6 +113,20 @@ class PodInspect(unittest.TestCase):
         self.assertEqual(len(shas), 2)
         self.assertEqual(o["dirty"], 1)
         self.assertIsInstance(o["last_push"], str)
+
+    def test_a_call_in_flight_is_reported_with_its_age(self):
+        o = self.run_it(self.serve())
+        self.assertEqual(o["in_flight"]["tool"], "shell")
+        self.assertTrue(28 <= o["in_flight"]["seconds"] <= 60, o["in_flight"])
+        self.assertNotIn("shell", [c["tool"] for c in o["last_calls"]])
+
+    def test_more_than_ten_calls_are_cut_to_the_last_ten(self):
+        many = [{"info": {"role": "assistant"}, "parts": [{"type": "tool", "tool": "t%d" % i, "state": {"status": "completed", "time": {"start": NOW_MS - 100000 + i * 1000, "end": NOW_MS - 100000 + i * 1000}}} for i in range(15)]}]
+        Handler.override = many
+        self.addCleanup(setattr, Handler, "override", None)
+        o = self.run_it(self.serve())
+        self.assertEqual([c["tool"] for c in o["last_calls"]], ["t%d" % i for i in range(5, 15)])
+        self.assertIsNone(o["in_flight"])
 
     def test_dead_server_lists_server_fields_and_exits_zero(self):
         o = self.run_it(1)

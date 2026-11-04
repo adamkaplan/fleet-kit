@@ -118,6 +118,22 @@ class TestTheRead(Inspect):
         self.assertIn("only coder7's own boss may inspect it", err)
         self.assertNotIn("bash", err)
 
+    def test_a_worker_record_with_no_boss_is_refused(self):
+        self.record("coder7", hard=ALIVE, reports_to="")
+        self.stub(HELPER)
+        for kind in (("agent", ""), BOSS, OTHER):
+            code, out, err = self.as_caller(kind, "inspect", "coder7")
+            self.assertEqual(code, 1, kind)
+            self.assertEqual(out, "")
+            self.assertIn("only coder7's own boss may inspect it", err)
+
+    def test_a_name_with_a_path_or_a_dot_dot_is_refused(self):
+        self.stub(HELPER)
+        for name in ("../coder7", "a/b", "..", "coder7/../x", "/etc/passwd", "coder7.json"):
+            code, out, err = self.as_caller(BOSS, "inspect", name)
+            self.assertNotEqual(code, 0, name)
+            self.assertEqual(out, "", name)
+
     def test_a_person_is_refused_too(self):
         code, out, err = self.as_caller(("person", "a person at a shell"), "inspect", "coder7")
         self.assertNotEqual(code, 0)
@@ -146,7 +162,7 @@ class TestTheScrub(Inspect):
         self.stub(self.planted())
         code, control, err = self.run_with(os.path.join(LAUNCHER, "cloud-worker"))
         self.assertEqual(code, 0, err)
-        self.assertEqual([s for s in (TOKEN, KNOWN, "Pa55w0rdZ") if s in control], [])
+        self.assertEqual([s for s in (TOKEN, KNOWN, "Pa55w0rdZ") if s in control], [], "a secret reached the inspect output of the real launcher")
         root = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, str(root), True)
         copy = root / "cloud" / "launcher"   # the launcher finds the kit's bin/ two levels up
@@ -166,7 +182,8 @@ class TestTheScrub(Inspect):
         self.assertTrue(launcher, os.listdir(str(copy)))
         code, mutant, err = self.run_with(launcher[0])
         self.assertEqual(code, 0, err)
-        self.assertEqual([s for s in (TOKEN, KNOWN, "Pa55w0rdZ") if s in mutant], [TOKEN, KNOWN, "Pa55w0rdZ"], mutant)
+        leaked = [s for s in (TOKEN, KNOWN, "Pa55w0rdZ") if s in mutant]
+        self.assertEqual(leaked, [TOKEN, KNOWN, "Pa55w0rdZ"], "the mutant must leak: a secret reached the inspect output only if the scrub is gone; got %r" % leaked)
 
 
 if __name__ == "__main__":
