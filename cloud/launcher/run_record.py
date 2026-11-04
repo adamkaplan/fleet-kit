@@ -423,3 +423,51 @@ def prune(root, days, now=None):
         except OSError:
             continue
     return removed
+
+
+MAINTENANCE_MAX_REMOVALS = 500   # the most directories one maintenance run removes (ask #1743)
+
+
+def worker_of(run_id):
+    """The worker name inside a run id (<worker>-<UTC stamp>-<hex>), or None when the name is not a run id."""
+    if not RUN_ID_RE.match(run_id):
+        return None
+    return run_id.rsplit("-", 2)[0]
+
+
+def prune_limited(root, days, now, keep_workers=(), limit=MAINTENANCE_MAX_REMOVALS, dry_run=False):
+    """The scheduled form of prune: the same rule (a real directory named like a run id, holding only this tool's files, older than `days`)
+    plus a worker in `keep_workers` keeps ALL its records, and at most `limit` directories go in one run. With dry_run nothing is removed.
+    Returns (names removed or to be removed, their bytes, the count kept for a live worker). `now` is epoch seconds."""
+    removed, size, kept = [], 0, 0
+    try:
+        st = os.lstat(root)
+    except OSError:
+        return removed, size, kept
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+        raise OSError("the record directory is a symbolic link or not a directory: refused")
+    ours = RECORD_FILES | {n + ".part" for n in RECORD_FILES}
+    for name in sorted(os.listdir(root)):
+        if len(removed) >= limit:
+            break
+        path = os.path.join(root, name)
+        try:
+            s = os.lstat(path)
+            if not RUN_ID_RE.match(name) or not stat.S_ISDIR(s.st_mode) or now - s.st_mtime < days * 86400:
+                continue
+            if worker_of(name) in keep_workers:
+                kept += 1
+                continue
+            inside = os.listdir(path)
+            if any(n not in ours or not stat.S_ISREG(os.lstat(os.path.join(path, n)).st_mode) for n in inside):
+                continue
+            total = sum(os.lstat(os.path.join(path, n)).st_size for n in inside)
+            if not dry_run:
+                for n in inside:
+                    os.unlink(os.path.join(path, n))
+                os.rmdir(path)
+            removed.append(name)
+            size += total
+        except OSError:
+            continue
+    return removed, size, kept
