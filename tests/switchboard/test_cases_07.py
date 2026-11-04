@@ -272,7 +272,7 @@ class TestChiefOfStaffSedReads(unittest.TestCase):
     globs, so the deny list is a fence of listed spellings derived from the sed manual (options -i -s -f -e, commands w W e r R y z F =, the s///w and s///e flags),
     not a parser of sed. A pipe is split by the engine, so the stdin forms are the same rules."""
     P = TestChiefOfStaffNativePermissions
-    BASELINE = "d7c4f3d"   # the definition before #1012; everything outside the sed rules must equal it byte for byte
+    BASELINE = "8e3a765c"   # the definition (integration tip merged) before #1012; everything outside the sed rules must equal it byte for byte
 
     @classmethod
     def rules(cls):
