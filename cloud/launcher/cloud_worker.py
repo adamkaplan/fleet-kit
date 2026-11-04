@@ -112,6 +112,7 @@ IGNORED_NOTICE = ("cluster login: %s is ignored in the unattended refresh (the r
 # renewal's numbers and names are here.
 GIT_TOKEN_KEY = "git-token"                      # the Secret key the pod's credential helper and gh wrapper read at every call
 GIT_TOKEN_RENEW_AFTER_SECONDS = 1800             # renew when the token is this old: 30 minutes of its life are left (a failed pass or two, a kubelet delay, a short sleep)
+SAFE_TO_EVICT_KEY = "cluster-autoscaler.kubernetes.io/safe-to-evict"  # not a cw/ key: the autoscaler reads it, the launcher reads nothing from it
 GIT_TOKEN_MINTED = "cw/git-token-minted"         # the Secret annotation that says when the token was minted (the Secret's creation time stands in when it is absent)
 GIT_TOKEN_MINT_SECONDS = 60                      # the mint child's run limit
 GIT_TOKEN_MAX_CHARS = 4096                       # the most a token may be
@@ -2151,7 +2152,7 @@ def render_pod(a, worker, name, now, hard, env, run_names=()):
             puller = {k: env[k].strip() for k in STACK_REGISTRY_KEYS}
     pod = {"apiVersion": "v1", "kind": "Pod", "metadata": {
         "name": name, "labels": {"app": LABEL, "cw/worker": worker, "azure.workload.identity/use": "true"},
-        "annotations": {"cw/worker": worker, "cw/started": iso(now), "cw/hard-deadline": iso(hard),
+        "annotations": {SAFE_TO_EVICT_KEY: "false", "cw/worker": worker, "cw/started": iso(now), "cw/hard-deadline": iso(hard),
                         "cw/idle-seconds": e["CW_IDLE_SECONDS"], "cw/shape": a.shape,
                         "cw/max-hard": iso(now + dt.timedelta(seconds=parse_duration(a.max_hard or DEFAULT_MAX_HARD))),
                         **({"cw/run-id": a.run_id} if getattr(a, "run_id", None) else {}),
@@ -2339,6 +2340,7 @@ class Launcher:
             return {"worker": worker, "url": "https://worker-%s.%s:4096" % (name, domain),
                     "auth_ref": "file:/run/cw/%s.password" % worker, "runtime_id": "pod/" + name,
                     "idle_deadline": iso(now + dt.timedelta(seconds=parse_duration(a.idle))), "hard_deadline": iso(hard),
+                    "idle_seconds": parse_duration(a.idle), "hard_seconds": parse_duration(a.hard),
                     "password_fd": a.password_fd}
         old = self._catch_signals()
         try:
@@ -3727,7 +3729,7 @@ def build_parser():
     c = cmd("create")
     c.add_argument("--repo", required=True)
     c.add_argument("--branch", required=True)
-    c.add_argument("--idle", default="10m")
+    c.add_argument("--idle", default="30m")
     c.add_argument("--hard", default="2h")
     c.add_argument("--max-hard", default=DEFAULT_MAX_HARD)
     c.add_argument("--shape", default=None, help="the pod shape, one of %s; unset: %s (%s with --stack, %s with --agent orchestrator)" % (", ".join(SHAPES), DEFAULT_SHAPE, DEFAULT_STACK_SHAPE, DEFAULT_ORCHESTRATOR_SHAPE))
