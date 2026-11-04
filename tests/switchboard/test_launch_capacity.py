@@ -85,6 +85,31 @@ for address, fragment in (("10.99.88.77", "10.99.8"), ("fd00:abcd::1", "fd00:ab"
         sys.exit("part of an address reached the block: " + text)
 """
 
+U27_CHECKER = r"""
+import importlib.util, json, sys
+spec = importlib.util.spec_from_file_location("launcher_u27", sys.argv[1] + "/cloud/launcher/cloud_worker.py")
+lib = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(lib)
+SECRET, ADDR = "u:pw@10.0.0.1/db", "10.99.88.77"
+message = "db " + SECRET + " " + "x " * 70
+message += " " * (192 - len("FailedScheduling c-6152: " + message)) + ADDR + " Insufficient cpu"
+assert ("FailedScheduling c-6152: " + message).index(ADDR) == 192
+class K:
+    def list_nodes(self):
+        return [{"metadata": {"name": "host-" + SECRET}, "status": {"allocatable": {"cpu": "4", "memory": "8Gi"}}}]
+    def list_pods_all(self):
+        return [{"status": {"phase": "Running"}, "spec": {"nodeName": "host-" + SECRET, "containers": []}}]
+    def list_events(self):
+        return [{"reason": "FailedScheduling", "involvedObject": {"name": "c-6152"}, "message": message}]
+    def scrub(self, text, limit=300):
+        return lib.scrub(text, {SECRET}, limit)
+answer = lib.Launcher.capacity(type("L", (), {"kube": K()})(), None)
+text = json.dumps(answer)
+if any(piece in text for piece in ("u:pw", "pw@", "/db", "10.0.0.1", "10.99", ADDR[-6:])) or "[address]" not in answer["last_event"] \
+        or len(answer["last_event"]) > 200 or len(answer["nodes"][0]["name"]) > 100:
+    sys.exit("a piece of a known secret passed the capacity answer: " + text)
+"""
+
 
 CHECKER = r"""
 WRITE_VERBS = ("create", "patch", "apply", "delete", "annotate", "replace", "edit")
@@ -579,7 +604,7 @@ def build():
         def test_u11_the_cut_control_passes_and_a_mutant_masking_after_the_cut_fails_with_the_text(self):
             code, err = self.scratch_cut()
             self.assertEqual((code, err), (0, ""))
-            code, err = self.scratch_cut(("cloud/launcher/cloud_worker.py", '_mask_addresses(last.get("message") or "")', 'last.get("message") or ""'))
+            code, err = self.scratch_cut(("cloud/launcher/cloud_worker.py", 'return _mask_addresses(kube.scrub(text, SCRUB_OUTPUT_MAX))[:limit]', 'return _mask_addresses(kube.scrub(text, SCRUB_OUTPUT_MAX)[:limit])'))
             self.assertEqual(code, 1, err)
             self.assertIn("part of an address reached the block", err)
 
@@ -873,5 +898,35 @@ for line, planted, want in (("::ffff:10.0.0.1ab", "::ffff:10.0.0.1", "[address]a
             code, err, out = self.pc11_run(self.PC11_U23, ("cloud/launcher/cloud_worker.py", "WINDOW_OVERLAP = 64", "WINDOW_OVERLAP = 0"))
             self.assertEqual(code, 1, err)
             self.assertIn("an address split by a window boundary leaked", err)
+
+        # -- U27 (PC-14): known secrets are scrubbed first (no cut), then addresses are masked, then the cut
+        def scratch_u27(self, mutate=None):
+            import shutil, subprocess, tempfile
+            root = Path(__file__).resolve().parents[2]
+            with tempfile.TemporaryDirectory(prefix="u27-") as tmp:
+                for src in sorted((root / "cloud" / "launcher").glob("*.py")) + [root / "bin" / "path_walk.py"]:
+                    rel = src.relative_to(root)
+                    (Path(tmp) / rel).parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy(src, Path(tmp) / rel)
+                if mutate:
+                    rel, old, new = mutate
+                    text = (Path(tmp) / rel).read_text()
+                    self.assertEqual(text.count(old), 1, "the mutant's text is not in the copy: " + old)
+                    (Path(tmp) / rel).write_text(text.replace(old, new))
+                done = subprocess.run([sys.executable, "-c", U27_CHECKER, tmp], capture_output=True, text=True, timeout=60,
+                                      env=dict(os.environ, PYTHONPATH=tmp + "/bin"))
+            return done.returncode, done.stderr
+
+        def test_u27_a_known_secret_with_an_address_and_a_straddling_address_leave_nothing(self):
+            code, err = self.scratch_u27()
+            self.assertEqual((code, err), (0, ""))
+
+        def test_u27_the_control_passes_and_a_mutant_masking_before_the_scrub_fails_with_the_text(self):
+            code, err = self.scratch_u27()
+            self.assertEqual((code, err), (0, ""))
+            code, err = self.scratch_u27(("cloud/launcher/cloud_worker.py", 'return _mask_addresses(kube.scrub(text, SCRUB_OUTPUT_MAX))[:limit]',
+                                          'return kube.scrub(_mask_addresses(text), SCRUB_OUTPUT_MAX)[:limit]'))
+            self.assertEqual(code, 1, err)
+            self.assertIn("a piece of a known secret passed the capacity answer", err)
 
     return TestLaunchCapacity
