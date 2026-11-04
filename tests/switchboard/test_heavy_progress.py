@@ -13,8 +13,31 @@ import unicodedata
 import unittest
 from unittest import mock
 
-from support.loader import sb
-from support.herdr_world import made_up_pid
+
+
+class _LazySb:
+    """support.loader loads the whole switchboard (about 4.5 s); the scratch-copy child processes never need it, so it is imported on first use."""
+    def __getattr__(self, name):
+        from support.loader import sb as real
+        return getattr(real, name)
+
+
+sb = _LazySb()
+
+
+def made_up_pid():
+    if os.environ.get("FLEET_TEST_INNER"):   # a scratch child: a number nobody holds, without loading the switchboard just for the helper
+        pid = 4000000 + os.getpid() % 100000
+        while True:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return pid
+            except OSError:
+                pass
+            pid += 1
+    from support.herdr_world import made_up_pid as real
+    return real()
 
 
 def load_heavy():
