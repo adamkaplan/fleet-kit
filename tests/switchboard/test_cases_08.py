@@ -955,63 +955,6 @@ class TestAgentRegistry(unittest.TestCase):
         self.assertEqual(json.loads((self.state / "retired.json").read_text()).keys(), {"a", "b"})   # derived output, the old format
 
 
-class FakeQueueGh:
-    """`gh` for the merge queue ejection pass (#584): the merge queue runs of a repository, a pull request's state and queue entry (GraphQL), a run's artifacts
-    and jobs. Counts what it is asked, per repository."""
-
-    def __init__(self):
-        self.runs, self.pulls, self.zips, self.jobs, self.calls, self.artifact_name = {}, {}, {}, {}, [], "failing-tests"
-        self.fail, self.graphql_fault = set(), None
-
-    def add(self, repo, run_id, pr, now, conclusion="failure", status="completed", name="ci", age=60, created_age=None, names=None, complete=True, raw=None, jobs=()):
-        stamp = lambda ago: sb.iso(now - ago)
-        self.runs.setdefault(repo, []).append({"id": run_id, "name": name, "event": "merge_group", "status": status, "conclusion": conclusion,
-                                               "head_branch": "gh-readonly-queue/main/pr-%d-%s" % (pr, "%07x" % run_id), "created_at": stamp(created_age or age + 30), "updated_at": stamp(age)})
-        self.pulls.setdefault((repo, pr), ("OPEN", False))
-        if raw is not None:
-            self.zips[run_id] = raw
-        elif names is not None:
-            self.zips[run_id] = _artifact_zip(names, complete, run_id)
-        self.jobs[run_id] = list(jobs)
-        return run_id
-
-    def count(self, repo, needle):
-        return len([c for c in self.calls if repo in c and needle in c])
-
-    def __call__(self, argv, **kwargs):
-        argv = list(argv)
-        done = lambda text, code=0, err="": subprocess.CompletedProcess(argv, code, text, err)
-        if argv[1:3] == ["api", "graphql"]:
-            fields = dict(a.split("=", 1) for a in argv if "=" in a and not a.startswith("query="))
-            repo, pr = "%s/%s" % (fields["owner"], fields["name"]), int(fields["number"])
-            self.calls.append("graphql %s#%d" % (repo, pr))
-            if self.graphql_fault == "exit":
-                return done("", 1, "gh: HTTP 502")
-            if self.graphql_fault == "weird":
-                return done('{"data": {"repository": {"pullRequest": {"state": "WEIRD", "mergeQueueEntry": null}}}}')
-            if self.graphql_fault == "malformed":
-                return done('{"data": {"repository": null}}')
-            state, queued = self.pulls[(repo, pr)]
-            return done(json.dumps({"data": {"repository": {"pullRequest": {"state": state, "mergeQueueEntry": {"id": "Q", "state": queued if isinstance(queued, str) else "QUEUED"} if queued else None}}}}))
-        path = argv[-1]
-        self.calls.append(path)
-        if any(bad in path for bad in self.fail):
-            return done("", 1, "gh: HTTP 500")
-        found = re.fullmatch(r"repos/([^/]+/[^/]+)/actions/runs\?event=merge_group&per_page=\d+", path)
-        if found:
-            return done(json.dumps({"workflow_runs": self.runs.get(found.group(1), [])}))
-        found = re.fullmatch(r"repos/[^/]+/[^/]+/actions/runs/(\d+)/artifacts\?name=([^&]+)&per_page=\d+", path)
-        if found:
-            run = int(found.group(1))
-            ok = run in self.zips and urllib.parse.unquote(found.group(2)) == self.artifact_name
-            return done(json.dumps({"artifacts": [{"id": run + 9000, "name": self.artifact_name, "expired": False, "size_in_bytes": len(self.zips[run])}] if ok else []}))
-        found = re.fullmatch(r"repos/[^/]+/[^/]+/actions/artifacts/(\d+)/zip", path)
-        if found:
-            return subprocess.CompletedProcess(argv, 0, self.zips[int(found.group(1)) - 9000], b"")
-        found = re.fullmatch(r"repos/[^/]+/[^/]+/actions/runs/(\d+)/jobs\?filter=latest&per_page=\d+", path)
-        if found:
-            return done(json.dumps({"jobs": [{"name": n, "conclusion": c} for n, c in self.jobs[int(found.group(1))]]}))
-        raise AssertionError("the ejection pass reaches for nothing else: %r" % (argv,))
 
 
 class TestClosingKeywordWarning(unittest.TestCase):
@@ -1792,73 +1735,6 @@ class TestBatchingDocs(unittest.TestCase):
             self.assertEqual(section.count(phrase), 1, phrase)
 
 
-class FakePullFiles:
-    """GitHub's pull request answers for ONE pull request, no more generous than the real API: the files are served 100 a page whatever per_page asks, only the first 3000 are ever listed (a page past
-    the end is empty), `changed_files` is the true count, and `gh pr view` lists 100 files at most with no source path for a rename. `faults` is {"pull" or page number: [fault, ...]}: one fault is used up
-    by each call of that read, in order (a timeout, an HTTP 502, an answer that is not JSON, one over the size cap, an answer that is not a list). `heads` is what the pull request's head is at each read of it."""
-
-    HEAD = "c" * 40
-    LONG = "E" * 450 + " THE-END"   # an error text far over every old clip (80 to 600 characters), ending in a marker
-
-    def __init__(self, files, number=9, heads=None, count=None):
-        self.files, self.number = files, number
-        self.count = len(files) if count is None else count
-        self.faults, self.calls = {}, []
-        self.heads = list(heads or [])
-
-    @staticmethod
-    def make(size, status="modified"):
-        return [{"filename": "docs/f%04d.md" % i, "status": status, "sha": "e" * 40, "patch": "@@ -1 +1 @@\n-a\n+b", "changes": 2} for i in range(size)]
-
-    def view(self):
-        """what `gh pr view --json files,...` says: at most 100 files, a rename without its source"""
-        shown = [{"path": f["filename"] if isinstance(f, dict) else "x", "additions": 1, "deletions": 1, "changeType": f["status"].upper() if isinstance(f, dict) else "MODIFIED"} for f in self.files[:100]]
-        return dict({"headRefOid": self.HEAD, "baseRefOid": "b" * 40, "changedFiles": self.count, "files": shown}, **({"statusCheckRollup": self.rollup} if getattr(self, "rollup", None) else {}))   # `rollup` is set only by a clear that must show CI to its brief (#1215)
-
-    def fault(self, key):
-        queue = self.faults.get(key) or []
-        return queue.pop(0) if queue else None
-
-    def __call__(self, argv, **kwargs):
-        path = argv[2]
-        self.calls.append(path)
-        route, _, query = path.partition("?")
-        query = dict(q.split("=", 1) for q in query.split("&") if q)
-        tail = route.split("/", 3)[3]
-        if tail == "pulls/%d" % self.number:
-            key, body = "pull", None
-            head = (self.heads.pop(0) if self.heads else self.HEAD)
-            body = {"head": {"sha": head}, "base": {"sha": "b" * 40, "ref": "main"}, "changed_files": self.count}
-        elif tail == "pulls/%d/files" % self.number:
-            page, size = int(query.get("page", "1")), min(int(query.get("per_page", "30")), 100)
-            key, body = page, (self.files[:3000])[(page - 1) * size:page * size]
-        elif tail.startswith("compare/"):
-            key, body = "compare", {"merge_base_commit": {"sha": "b" * 40}}
-        else:
-            raise AssertionError("the fake GitHub has no answer for %s" % path)
-        fault = self.fault(key)
-        if fault == "timeout":
-            raise subprocess.TimeoutExpired(argv, 30)
-        if fault == "longerror":
-            return subprocess.CompletedProcess(argv, 1, "", "gh: " + FakePullFiles.LONG)
-        if fault == "http502":
-            return subprocess.CompletedProcess(argv, 1, "", "gh: Bad Gateway (HTTP 502)")
-        if fault in ("http403", "http404", "http422"):
-            return subprocess.CompletedProcess(argv, 1, "", "gh: Error (HTTP %s)" % fault[4:])
-        if fault == "bigbody":
-            return subprocess.CompletedProcess(argv, 1, "", "gh: Bad Gateway (HTTP 502)\n" + "B" * (1 << 20))
-        if fault == "bodystatus":
-            return subprocess.CompletedProcess(argv, 1, "", "gh: Validation Failed (HTTP 422)\n{\"message\": \"see HTTP 404 and HTTP 502\"}")
-        if fault == "notjson":
-            return subprocess.CompletedProcess(argv, 0, "<html>bad gateway</html>", "")
-        if fault == "toolarge":
-            return subprocess.CompletedProcess(argv, 0, "[" + "0," * (sb.CARRY_ANSWER_MAX // 2 + 1) + "0]", "")
-        if fault == "notlist":
-            return subprocess.CompletedProcess(argv, 0, json.dumps(["x"] if key in ("pull", "compare") else {"message": "Server Error"}), "")
-        return subprocess.CompletedProcess(argv, 0, json.dumps(body), "")
-
-    def pages_asked(self, page):
-        return len([c for c in self.calls if c.endswith("&page=%d" % page)])
 
 
 class TestCloudWatchBounds(unittest.TestCase):
@@ -2053,7 +1929,7 @@ class TestCloudWatchBounds(unittest.TestCase):
 
     def test_every_untrusted_record_parse_is_bounded_and_listed_in_the_docs(self):
         """Completeness: every json.loads in cloud_worker.py of a record file goes through parse_bounded, and the docs table names each reader."""
-        text = self.SRC.read_text()
+        text = self.SRC.read_text() + (REPO / "bin" / "cloud_cluster.py").read_text()   # the text moved out of it (ask #1647)
         loads = [l.strip() for l in text.splitlines() if "json.loads(" in l and not l.lstrip().startswith("#")]
         self.assertEqual(loads, ["return json.loads(text)", "body = json.loads(out) if (out or \"\").strip() else None"])
         import re
@@ -2157,6 +2033,34 @@ class TestCloudWatchBounds(unittest.TestCase):
 class TestArchTools(unittest.TestCase):
     """The two move tools (S0 of #1092): `arch-split-check` reads the surface of the daemon as its own entry assembles it, and `arch-part-cut` never overwrites a part."""
 
+    # The warnings machinery adds __warningregistry__ to a module's globals when a warning is raised from code of that module, so dir(module) can hold a name the tool never reads.
+    INTERPRETER_ADDED = frozenset({"__warningregistry__"})
+
+    def daemon_names(self, module):
+        return sorted(set(dir(module)) - self.INTERPRETER_ADDED)
+
+    def scratch_module(self, *extra):
+        mod = types.ModuleType("daemon_scratch")
+        for n in ("alpha", "beta") + extra:
+            setattr(mod, n, 1)
+        return mod
+
+    def test_the_names_the_interpreter_adds_are_left_out_of_the_daemon_names_and_a_planted_name_is_not(self):
+        expected = sorted(dir(self.scratch_module()))
+        self.assertEqual(self.daemon_names(self.scratch_module()), expected)
+        self.assertEqual(self.daemon_names(self.scratch_module("__warningregistry__")), expected)
+        planted = self.daemon_names(self.scratch_module("daemon_planted_name"))
+        self.assertIn("daemon_planted_name", planted)
+        self.assertEqual(planted, sorted(dir(self.scratch_module("daemon_planted_name"))))
+
+    def test_without_the_rule_the_comparison_with_the_warning_registry_present_fails(self):
+        expected = sorted(dir(self.scratch_module()))
+        self.assertEqual(self.daemon_names(self.scratch_module("__warningregistry__")), expected, "the control: the unmutated rule gives the expected names")
+        with mock.patch.object(type(self), "INTERPRETER_ADDED", frozenset()):
+            with self.assertRaises(AssertionError) as caught:
+                self.assertEqual(self.daemon_names(self.scratch_module("__warningregistry__")), expected)
+        self.assertIn("__warningregistry__", str(caught.exception), "the mutant's failure names the planted name")
+
     def tool(self, name, *args):
         return subprocess.run([sys.executable, "-B", str(REPO / "tools" / name)] + [str(a) for a in args], capture_output=True, text=True)
 
@@ -2167,7 +2071,7 @@ class TestArchTools(unittest.TestCase):
         self.addCleanup(shutil.rmtree, str(out.parent), True)
         done = self.tool("arch-split-check", "--write-surface", out, "--after", *files)
         self.assertEqual(done.returncode, 0, done.stderr[-600:])
-        self.assertEqual(out.read_text().split(), sorted(dir(sb)), "the names the tool reads are the names of the daemon as it loads")
+        self.assertEqual(out.read_text().split(), self.daemon_names(sb), "the names the tool reads are the names of the daemon as it loads, without the names the interpreter adds")
 
     def test_a_cut_refuses_a_part_name_already_listed_and_a_name_given_twice_and_writes_nothing(self):
         root = Path(tempfile.mkdtemp())
