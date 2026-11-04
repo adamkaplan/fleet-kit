@@ -559,7 +559,7 @@ class WiringReceivesBoth(Dir):
             calls.append(list(argv))
             return (0, "fake-admin-config\n", "") if len(calls) == 1 else (0, "t" * 24 + "\n", "")
         with mock.patch.dict(os.environ, {"PATH": os.environ.get("PATH", "")}, clear=True), mock.patch.object(lib, "SETTINGS_PATH", self.path), \
-                mock.patch.object(wiring, "_capture", fake_capture):
+                mock.patch.object(wiring.cloud_cluster, "_capture", fake_capture):
             source = wiring.use_settings()
             wiring.cluster_token()
         return source, calls
@@ -579,7 +579,7 @@ class WiringReceivesBoth(Dir):
             return (0, "fake-admin-config\n", "") if len(calls) == 1 else (0, "t" * 24 + "\n", "")
         env = {"CW_VAULT_SUBSCRIPTION": GOOD["CW_VAULT_SUBSCRIPTION"], "CW_VAULT_NAME": GOOD["CW_VAULT_NAME"],
                "CW_CLUSTER_ADMIN_SECRET": "acme-cluster-admin", "CW_CLUSTER_TOKEN_DURATION": "45m"}
-        with mock.patch.object(wiring, "_capture", fake_capture):
+        with mock.patch.object(wiring.cloud_cluster, "_capture", fake_capture):
             wiring.cluster_token(env)
         self.assertEqual(calls[0][calls[0].index("--name") + 1], "acme-cluster-admin")
         self.assertIn("--duration=45m", calls[1])
@@ -705,7 +705,7 @@ NOT_SETTINGS = {
     # the switchboard's own variable (S18)
     SWITCHBOARD_PREFIX + "WORKER_BIN": "the launcher program, found by a lookup order (the variable when set, else the launcher of the switchboard's own checkout, else `cloud-worker` on the PATH), not a settings key: a path in the file would be one more thing to keep in step with the checkout, and an environment override that wins is what tests and a second install need",
 }
-SOURCES = ["bin/cloud_worker.py"]
+SOURCES = ["bin/cloud_worker.py", "bin/cloud_cluster.py"]
 NAME = re.compile(r"(?:%s)[A-Z0-9_]+" % "|".join(PREFIXES))
 
 
