@@ -181,6 +181,7 @@ STACK_SECURITY_CONTEXT = {"allowPrivilegeEscalation": True, "capabilities": {"dr
 # The window stays under the switchboard's own bound on the launcher call (LAUNCH_SECONDS, 900).
 STACK_RACE_WINDOW_SECONDS = 600
 STACK_RACE_PAUSE_SECONDS = 15
+LAUNCH_OUTER_SECONDS = 900   # the switchboard's own bound on the launch call: a wait for a node ends here
 WAIT_POLL_SECONDS = 2   # the pause between two reads of a pending pod
 STACK_RACE_RE = re.compile(r"RuntimeClass handler \S+ does not support user namespaces: the handler \S+ is not known")
 
@@ -2041,6 +2042,12 @@ def safe_value(value):
     return value if isinstance(value, str) and SAFE_VALUE.fullmatch(value) else "?"
 
 
+def _one_line(text):
+    """The first line of a cluster message, word by word through `safe_value` (a word that is not plain letters or digits becomes `?`), cut."""
+    words = ((text or "").strip().splitlines() or [""])[0].split(":")[-1].split()
+    return " ".join(w if re.fullmatch(r"[A-Za-z]+|[0-9]+", w) and safe_value(w) != "?" else "?" for w in words)[:120]
+
+
 def _node_label(labels, keys):
     """The first of `keys` the node carries, or "unknown" (never a guess, never a value of another label). The value is `safe_value`."""
     for key in keys:
@@ -2592,6 +2599,7 @@ class Launcher:
     def _wait_ready(self, name, seconds, on_pending=None):
         end = self.clock() + dt.timedelta(seconds=seconds)
         waited = 0.0   # the second bound: the seconds slept here, for a clock that does not advance
+        scaling = unread = False   # what the cluster says of a pending pod (the plain wait only: the stack path passes its own watch)
         while True:
             pod = self.kube.get_pod(name)
             status = (pod or {}).get("status", {})
@@ -2601,10 +2609,40 @@ class Launcher:
                 return
             if on_pending:
                 on_pending(pod)
-            if self.clock() >= end or waited >= seconds:
-                raise CloudError("timed out waiting for the worker", EXIT_TIMEOUT)
+            else:
+                scaling, unread = self._why_pending(name, pod, scaling)
+            more = max(0, LAUNCH_OUTER_SECONDS - seconds) if scaling else 0   # a scale-up under way: keep waiting to the outer bound
+            if self.clock() >= end + dt.timedelta(seconds=more) or waited >= seconds + more:
+                raise CloudError(self._timeout_text(scaling, unread), EXIT_TIMEOUT)
             self._nap(WAIT_POLL_SECONDS)
             waited += WAIT_POLL_SECONDS
+
+    @staticmethod
+    def _timeout_text(scaling, unread):
+        if scaling:
+            return "timed out waiting for a node to be added for the worker"
+        return "timed out waiting for the worker" + ("; events could not be read" if unread else "")
+
+    def _why_pending(self, name, pod, scaling):
+        """Read why a pod is not Ready (reads only). Returns (a scale-up is under way, the events could not be read). Raises CloudError at once
+        when the autoscaler says it will not add a node. A pod that is not Unschedulable (a starting pod) is not asked: nothing is read."""
+        conds = ((pod or {}).get("status") or {}).get("conditions") or []
+        if not any(c.get("type") == "PodScheduled" and c.get("status") == "False" and c.get("reason") == "Unschedulable" for c in conds):
+            return scaling, False
+        try:
+            events = self.kube.pod_events(name)
+        except (CloudError, ValueError, KeyError):
+            return False, True
+        verdict = None   # the latest autoscaler event of the two kinds
+        for ev in events:
+            if ev.get("reason") in ("TriggeredScaleUp", "NotTriggerScaleUp"):
+                verdict = ev
+        if verdict is None:
+            return False, False
+        if verdict["reason"] == "TriggeredScaleUp":
+            return True, False
+        count = len(self.kube.list_pods_all())
+        raise CloudError("the worker pod cannot be scheduled: %s; the namespace holds %d pods" % (_one_line(verdict.get("message")), count))
 
     # -- end hook, stop, delete --
     def run_hook(self, name):
