@@ -1,4 +1,5 @@
 """Pins for three limits of the vault access check's wrapper (ask #920): a nested .git is walked, the entry cap is exact, an exit code outside the five is 'unknown-code' and stops (40). Each pin has a mutant that must fail it."""
+import pathlib
 import os, stat, sys, tempfile, unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -11,7 +12,7 @@ SRC = cw.__file__
 
 def mutant(old, new):
     """The launcher module with ONE edit, loaded as a fresh module."""
-    text = open(SRC).read()
+    text = pathlib.Path(SRC).read_text()
     assert text.count(old) == 1, old
     mod = {"__file__": SRC, "__name__": "cw_mutant"}
     sys.modules["cw_mutant"] = type(sys)("cw_mutant")

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """selector_resolves of bin/cloud_quick.py (ask #1299): a selector that matches nothing still fails; a bin/test-switchboard
 class that lives only in tests/switchboard/test_cases_NN.py resolves. A mutant that always says true is caught."""
+import pathlib
 import importlib.util
 import os
 import tempfile
@@ -27,8 +28,8 @@ class Selector(unittest.TestCase):
     def test_class_only_in_a_cases_file_resolves(self):
         with tempfile.TemporaryDirectory() as d:
             os.makedirs(os.path.join(d, "bin")); os.makedirs(os.path.join(d, "tests", "switchboard"))
-            open(os.path.join(d, "bin", "test-switchboard"), "w").write("# no classes here\n")
-            open(os.path.join(d, "tests", "switchboard", "test_cases_07.py"), "w").write("class TestMoved:\n    def test_a(self):\n        pass\n")
+            pathlib.Path(os.path.join(d, "bin", "test-switchboard")).write_text("# no classes here\n")
+            pathlib.Path(os.path.join(d, "tests", "switchboard", "test_cases_07.py")).write_text("class TestMoved:\n    def test_a(self):\n        pass\n")
             self.assertTrue(Q.selector_resolves(d, (SB, "TestMoved.test_a")))
             self.assertFalse(Q.selector_resolves(d, (SB, "TestMoved.test_b")))
             self.assertFalse(Q.selector_resolves(d, (SB, "TestOther")))
