@@ -19786,7 +19786,7 @@ def ci_record_core(ctx, now, quiet=False):
     "nothing" (CI is green but no per-PR scenario names `ci`), "not-green", "unreadable", "no-plan" or "no-head". It records
     only for a complete, green run at the PR's CURRENT head and the plan's CURRENT hash, never twice, and writes nothing to GitHub.
     `quiet` leaves the audit alone for everything but a real record (the pass runs this for many PRs: a failing run is not news)."""
-    out = {"status": None, "head": None, "ci": None, "scenarios": [], "recorded": [], "already": [], "why": None}
+    out = {"status": None, "head": None, "ci": None, "scenarios": [], "recorded": [], "already": [], "proved": [], "why": None}
     if ctx.unreadable:
         return dict(out, status="unreadable", why="the PR could not be read: %s" % ctx.unreadable)
     head = (ctx.facts or {}).get("head")
@@ -19833,8 +19833,17 @@ def ci_record_core(ctx, now, quiet=False):
                                              "by": plan_ledger.CI_RECORDER, "evaluator": "ci",
                                              "evidence": "CI green at %s: every check run complete and passing" % head[:12]}, now())
         out["recorded"].append(scenario["id"])
-    if out["recorded"] or not quiet:
-        _gates_audit(ctx.engine, "gate.ci_record", ctx.pr, dict(detail, ok=True, recorded=out["recorded"], already=out["already"]))
+    link = next((r.get("detailsUrl") for r in ((ctx.facts or {}).get("ci_rollup") or []) if isinstance(r, dict) and "/actions/runs/" in str(r.get("detailsUrl") or "")), "")
+    for scenario in wanted:   # the proof of each ci scenario, next to its verdict (same guards: only reached for a green, complete run)
+        if plan_ledger.already_recorded(ctx.entries, {"kind": "proof", "pr": ctx.pr, "scenario": scenario["id"], "plan_hash": ctx.plan["plan_hash"], "head": head, "result": "pass"}):
+            continue
+        plan_ledger.append_once(ctx.state, [{"kind": "proof", "pr": ctx.pr, "scenario": scenario["id"], "plan_ref": ctx.source,
+                                             "plan_hash": ctx.plan["plan_hash"], "head": head, "result": "pass", "by": plan_ledger.CI_RECORDER,
+                                             "evidence": "CI green at %s: %s" % (head[:12], link or "every check run complete and passing"),
+                                             "command": "gates ci-record", "env": "switchboard"}], now())
+        out["proved"].append(scenario["id"])
+    if out["recorded"] or out["proved"] or not quiet:
+        _gates_audit(ctx.engine, "gate.ci_record", ctx.pr, dict(detail, ok=True, recorded=out["recorded"], already=out["already"], proved=out["proved"]))
     return dict(out, status="recorded")
 
 
@@ -19941,6 +19950,8 @@ def cmd_gates_ci_record(args, runner, now):
         return EXIT_OK
     print("CI is green at %s: recorded %s%s" % (got["head"][:8], ", ".join(got["recorded"]) or "nothing new",
                                                " (already recorded: %s)" % ", ".join(got["already"]) if got["already"] else ""))
+    if got["proved"]:
+        print("and the proof of %s" % ", ".join(got["proved"]))
     for line in carry_lines(got.get("carry") or []):
         print(line)
     return EXIT_OK

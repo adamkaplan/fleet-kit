@@ -28611,7 +28611,7 @@ class TestGatesMissingWording(LedgerBase):
 
     def test_S4_the_item_and_ci_writers_each_write_one_kind_derived_from_the_code(self):
         writers = {"cmd_prove": {"proof"}, "cmd_verdict": {"verdict"}, "cmd_item_prove": {"proof"}, "cmd_item_verdict": {"verdict"},
-                   "cmd_item_ci_record": {"verdict"}, "ci_record_core": {"verdict"}}
+                   "cmd_item_ci_record": {"verdict"}, "ci_record_core": {"proof", "verdict"}}
         for name, want in writers.items():
             found = set()
             for node in ast.walk(ast.parse(textwrap.dedent(inspect.getsource(getattr(sb, name))))):
@@ -31408,6 +31408,23 @@ class TestCiRecorder(LedgerBase):
         self.assertEqual(self.verdicts(), [])
         self.plan_issue["body"] = LEDGER_PLAN.replace('pass: the list call returns status 200 and exactly 1 agent named "alpha"', "pass: works")
         self.assertEqual(self.record()[0], 2)
+
+    def test_ci_record_records_the_proof_and_the_verdict(self):
+        self.assertEqual(self.record()[0], 0)
+        proofs = [(e["scenario"], e["by"], e["head"]) for e in self.ledger() if e["kind"] == "proof"]
+        self.assertEqual(proofs, [("S1", "switchboard", LEDGER_HEAD), ("U1", "switchboard", LEDGER_HEAD)], "ci-record records the proof and the verdict")
+        self.assertTrue(all(LEDGER_HEAD[:12] in e["evidence"] for e in self.ledger() if e["kind"] == "proof"))
+        _, report, _ = self.gates_json()
+        g1 = next(r for r in report["gates"] if r["gate"] == "G1")
+        self.assertFalse(any(m.startswith(("S1:", "U1:")) for m in g1["missing"]), g1["missing"])
+        self.assertTrue(any(m.startswith("S2:") for m in g1["missing"]))
+        n = len(self.ledger())
+        self.assertEqual(self.record()[0], 0)
+        self.assertEqual(len(self.ledger()), n, "nothing twice")
+        self.pr["statusCheckRollup"] = [{"conclusion": "FAILURE", "status": "COMPLETED"}]
+        self.pr["headRefOid"] = LEDGER_NEW_HEAD
+        self.record()
+        self.assertEqual(len(self.ledger()), n, "a red run records nothing")
 
     def test_the_recorded_verdict_satisfies_g1_for_those_scenarios_and_no_agent_can_use_the_recorders_name(self):
         self.assertEqual(self.record()[0], 0)
@@ -76891,8 +76908,8 @@ class TestCiRecordCarry(LedgerBase):
         self.step()
         rest = [json.loads(l) for l in self.ledger_bytes().splitlines() if '"kind": "carried"' not in l]
         self.assertEqual([l for l in self.ledger_bytes().splitlines() if '"kind": "carried"' not in l][:len(before)], before)
-        ci = [(e["scenario"], e["head"], e["by"]) for e in rest[len(before):]]
-        self.assertEqual(sorted(ci), [("S1", self.NEW, sb.plan_ledger.CI_RECORDER), ("U1", self.NEW, sb.plan_ledger.CI_RECORDER)])
+        ci = [(e["kind"], e["scenario"], e["head"], e["by"]) for e in rest[len(before):]]
+        self.assertEqual(sorted(ci), [("proof", "S1", self.NEW, sb.plan_ledger.CI_RECORDER), ("proof", "U1", self.NEW, sb.plan_ledger.CI_RECORDER), ("verdict", "S1", self.NEW, sb.plan_ledger.CI_RECORDER), ("verdict", "U1", self.NEW, sb.plan_ledger.CI_RECORDER)])
 
     def test_U1_the_step_decides_as_the_rule_does_on_six_combinations(self):
         combos = [(["src/widget.py"], True, True), (["bin/o.py"], False, True), (["bin/o.py"], True, False),
