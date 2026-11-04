@@ -625,7 +625,7 @@ class WipNoteNameRule(unittest.TestCase):
 
     def test_s11_a_mutant_that_matches_loosely_fails_the_test(self):
         source = read("cloud/launcher/cloud_worker.py")
-        self.assertEqual(source.count(self.OLD), 1)
+        self.assertGreaterEqual(source.count(self.OLD), 1)   # integration added a second send path with the same line
         mutant = types.ModuleType("cw_mutant")
         mutant.__file__ = os.path.join(ROOT, "cloud", "launcher", "cloud_worker.py")
         exec(compile(source.replace(self.OLD, self.NEW), mutant.__file__, "exec"), mutant.__dict__)
@@ -667,7 +667,7 @@ class VanishedNoteNameRule(unittest.TestCase):
 
     def test_s12_a_mutant_that_matches_loosely_fails_the_test(self):
         source = read("cloud/launcher/cloud_worker.py")
-        self.assertEqual(source.count(self.OLD), 1)
+        self.assertGreaterEqual(source.count(self.OLD), 1)   # integration added a second send path with the same line
         mutant = types.ModuleType("cw_mutant12")
         mutant.__file__ = os.path.join(ROOT, "cloud", "launcher", "cloud_worker.py")
         exec(compile(source.replace(self.OLD, self.NEW), mutant.__file__, "exec"), mutant.__dict__)
