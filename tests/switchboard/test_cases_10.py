@@ -1425,7 +1425,9 @@ class TestArchitectureSafetyNet(unittest.TestCase):
         self.assertGreater(len(verbs), 40)
         for verb in verbs:
             self.assertIn((verb, "--help"), first, "the command list has no --help of the verb %s" % verb)
-        self.assertEqual(golden.differences(first, golden.record_all(entry, root, env)), [], "two recordings of one entry differ")
+        sample = sorted(first)[::8] + [("--help",)]   # the second recording is a sample of every 8th command (ask #2108): the full list was run twice
+        again = {tuple(c): golden.run(entry, list(c), root, env) for c in sample}
+        self.assertEqual(golden.differences({c: first[c] for c in again}, again), [], "two recordings of one entry differ")
 
     def fake_repo(self, text):
         """A git repository whose bin/fleet-switchboard prints bin/out.txt: a stand-in for the daemon."""

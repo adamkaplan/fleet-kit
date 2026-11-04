@@ -6611,12 +6611,22 @@ class TestOneVocabulary(unittest.TestCase):
                         self.assertIn(check, sc._CHECK_TEXT)
 
 
+_SHARED_REPORTS = {}
+
+
+def _shared_report(case, name, scenario):
+    """One run of an unedited scenario file per process: two tests that read the same report share it (ask #2108)."""
+    if name not in _SHARED_REPORTS:
+        _SHARED_REPORTS[name] = run_scenario(case, scenario)
+    return _SHARED_REPORTS[name]
+
+
 def _scenario_test(path):
     def test(self):
         scenario = sc.load(path)
         if "offline" not in scenario["tiers"]:
             self.skipTest("%s has no offline tier" % scenario["id"])
-        report = run_scenario(self, scenario)
+        report = _shared_report(self, path.name, scenario)
         SCENARIO_REPORTS.append(report)
         self.check_report(report)
     test.__doc__ = "scenario %s offline, and its control fails" % path.name
@@ -10499,7 +10509,8 @@ class TestOfflineScenariosPR4(Base):
         scenario = sc.load(sc.DEFAULT_DIR / name)
         if edit:
             edit(scenario)
-        return run_scenario(self, scenario)
+            return run_scenario(self, scenario)
+        return _shared_report(self, name, scenario)
 
     def test_the_baseline_is_the_old_timer_not_a_fault(self):
         scenario = sc.load(sc.DEFAULT_DIR / "q1-quiet-two-hours.json")

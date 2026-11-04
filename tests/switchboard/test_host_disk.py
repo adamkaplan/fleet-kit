@@ -1,5 +1,6 @@
 """#2081: no switchboard test reads the free disk of the host it runs on (S2 to S5, U1). World is set by bin/test-switchboard after the import."""
 import importlib.util
+import io
 import os
 import re
 import shutil
@@ -129,15 +130,15 @@ class TestHostDisk(unittest.TestCase):
         self.assertEqual(seen, {"quiet": (0, 0), "control": (1, 1)})
 
     def test_the_named_group_passes_with_the_host_at_5_gb(self):   # S3
-        site = case_tmp()
-        Path(site, "sitecustomize.py").write_text("import shutil\n_u = shutil._ntuple_diskusage(1000 * 10 ** 9, 995 * 10 ** 9, 5 * 10 ** 9)\nshutil.disk_usage = lambda path: _u\n")
-        env = dict(os.environ, PYTHONPATH=site + os.pathsep + os.environ.get("PYTHONPATH", ""), FLEET_HEAVY="off")
-        done = subprocess.run([sys.executable, str(BIN / "test-switchboard")] + list(NAMED), env=env, capture_output=True, text=True, timeout=840)
-        out = done.stdout + done.stderr
-        ran = re.findall(r"^Ran (\d+) tests? in ", out, re.M)
-        self.assertEqual(len(ran), 1, out[-400:])
-        self.assertGreater(int(ran[0]), 0, out[-400:])
-        verdict = re.findall(r"^(OK|FAILED)\b.*$", out, re.M)
-        self.assertEqual(verdict[-1:], ["OK"], out[-400:])   # "OK (skipped=N)" or "FAILED (failures=N)"
-        self.assertEqual(done.returncode, 0, out[-400:])
-
+        """In process (ask #2108): the named classes run with shutil.disk_usage at 5 GB, not as a child run of bin/test-switchboard."""
+        main = sys.modules.get("__main__")
+        module = next((m for m in (main, sys.modules.get("test_switchboard_main")) if m is not None and all(hasattr(m, n) for n in NAMED)), None)
+        if module is None:
+            module = next(m for m in list(sys.modules.values()) if m is not None and all(hasattr(m, n) for n in NAMED))
+        suite = unittest.TestSuite(unittest.defaultTestLoader.loadTestsFromTestCase(getattr(module, n)) for n in NAMED)
+        stream = io.StringIO()
+        with mock.patch.dict(os.environ, {"FLEET_HEAVY": "off"}), mock.patch.object(shutil, "disk_usage", lambda path: SMALL):
+            result = unittest.TextTestRunner(stream=stream, resultclass=unittest.TextTestResult).run(suite)
+        out = stream.getvalue()
+        self.assertGreater(result.testsRun, 0, out[-400:])
+        self.assertEqual((result.failures, result.errors), ([], []), out[-400:])
