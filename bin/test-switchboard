@@ -66010,6 +66010,8 @@ RelayLoopCadence, TwoLoopsTrace, TrickleHub, HubFilesUnchanged, OneWorkerAndCanc
 _size_ceilings = importlib.import_module("test_size_ceilings")
 TestTheCheck, TestSizeMutants, TestTheMergeGate, TestSizeDocumentation = _size_ceilings.TestTheCheck, _size_ceilings.TestMutants, _size_ceilings.TestTheMergeGate, _size_ceilings.TestDocumentation
 TestEveryTestFileIsWired, TestWiredCheckPlanted, TestMutantIsCaught = (_wm := importlib.import_module("test_wired_tests")).TestEveryTestFileIsWired, _wm.TestWiredCheckPlanted, _wm.TestMutantIsCaught
+# A failed verdict says why (#2054).
+TestVerdictEvidence = importlib.import_module("test_verdict_evidence").build(LedgerBase)
 # The counting tool of the test split (S13a of #1092).
 _count_movable = importlib.import_module("test_count_movable")
 TestCountMovable = _count_movable.TestCountMovable
