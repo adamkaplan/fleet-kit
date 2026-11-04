@@ -458,7 +458,7 @@ class TestLostWorkerReadRound(unittest.TestCase):
         self.assertEqual([x["name"] for x in r.passes()], ["w1"])
 
     BAD = [None, "x", 5, [1], {"a": 1}, True, 10 ** 30, {"a": {"b": [1]}}]
-    VALID = {"reaper_ok": [5], "catchup": [True], "stop": [{"a": 1}], "report": [{"a": 1}], "gone": [{"a": 1}]}   # the one bad value of the table that is a good value of that key
+    VALID = {"reaper_ok": [5], "catchup": [True], "stop": [{"a": 1}], "report": [{"a": 1}], "gone": [{"a": 1}], "slow_bad": [5]}   # the one bad value of the table that is a good value of that key
     KEYS = ("offsets", "alerted", "created", "stop", "report", "refused", "seen", "gone", "reaper", "reaper_ok", "reaper_outage", "reaper_gap",
             "reaper_new", "catchup")
 
