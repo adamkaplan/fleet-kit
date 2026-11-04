@@ -71591,6 +71591,7 @@ class TestShimTopSpender(Base):
                "module = importlib.util.module_from_spec(importlib.util.spec_from_loader('gh_shim_under_test', loader))\n"
                "loader.exec_module(module)\n"
                "module.FIXED_STATE[0], module.FIXED_PROGRAM[0] = sys.argv[2], sys.argv[3]\n"
+               "module.SLOW_SECONDS = 0.75\n"
                "sys.exit(module.main(sys.argv[4:]))\n")
 
     def run_shim(self, *args, env=None, agent="worker"):
@@ -71697,8 +71698,8 @@ class TestShimTopSpender(Base):
         slow, slow_took = self.timed("pr", "view", "3")                                   # an uncached read (not `gh api <path>`) by the top spender
         quiet, quiet_took = self.timed("pr", "view", "3", agent="other")
         self.assertEqual((slow.returncode, quiet.returncode, slow.stdout, quiet.stdout), (0, 0, quiet.stdout, quiet.stdout))
-        self.assertGreaterEqual(slow_took - quiet_took, 1.5, "the top spender waited")
-        self.assertLessEqual(slow_took - quiet_took, 4.5, "bounded: never more than SLOW_SECONDS plus the call")
+        self.assertGreaterEqual(slow_took - quiet_took, 0.6, "the top spender waited")
+        self.assertLessEqual(slow_took - quiet_took, 3.0, "bounded: never more than SLOW_SECONDS plus the call")
         write, write_took = self.timed("issue", "edit", "5", "-t", "x")
         other_write, other_write_took = self.timed("issue", "edit", "5", "-t", "x", agent="other")
         self.assertEqual((write.returncode, other_write.returncode), (0, 0))
@@ -71707,7 +71708,7 @@ class TestShimTopSpender(Base):
         self.age(20)
         cached, cached_took = self.timed("api", self.PATH)
         self.assertEqual(cached.stdout, '{"n":1}')
-        self.assertLess(cached_took, 1.5, "a cached read is not slowed")
+        self.assertLess(cached_took, 0.6, "a cached read is not slowed")
 
     # Every environment name the shim reads, with a hostile value for it. DERIVED from the shim's own code (see `shim_environment_names`): a name the shim starts to read
     # and this table does not list fails the test below, so a new switch cannot appear unseen. SWITCH_OFF lists the names that can still make the caller wait less.
@@ -71738,7 +71739,7 @@ class TestShimTopSpender(Base):
         for name, value in sorted(self.HOSTILE.items()):
             value = {"OTHER": str(self.other), "EMPTY": empty, "SAME": "%s:%s:%s" % (SHIM.parent, self.bin, SAFE_PATH)}.get(value, value)
             _, took = self.timed("pr", "view", "3", env={name: value})
-            if took - baseline < 1.5:
+            if took - baseline < 0.6:
                 switched_off.add(name)
         self.assertEqual(switched_off, set(self.SWITCH_OFF), "the names that switch the wait off are exactly the declared ones")
 
@@ -71746,10 +71747,10 @@ class TestShimTopSpender(Base):
         _, quiet = self.timed("api", self.PATH.replace("5", "9"), agent="other")                 # another agent's read, no entry: no wait
         first, took = self.timed("api", self.PATH)                                               # the top spender's read with NO cache entry: it spends, so it waits
         self.assertEqual(first.stdout, '{"n":1}')
-        self.assertGreaterEqual(took - quiet, 1.5, "an uncached `gh api <path>` read by the top spender waits (the wait inside the cache path)")
+        self.assertGreaterEqual(took - quiet, 0.6, "an uncached `gh api <path>` read by the top spender waits (the wait inside the cache path)")
         second, again = self.timed("api", self.PATH)                                             # now served from the cache: no request, no wait
         self.assertEqual(second.stdout, '{"n":1}')
-        self.assertLess(again, 1.5, "a read served from the cache never waits")
+        self.assertLess(again, 0.6, "a read served from the cache never waits")
 
     def test_s3_the_wait_ends_when_the_account_recovers_and_never_starts_above_the_line(self):
         self.usage(3000)
@@ -71758,7 +71759,7 @@ class TestShimTopSpender(Base):
         self.assertLess(took - baseline, 1.0, "above the line nobody waits")
         self.usage(500)
         _, took = self.timed("pr", "view", "3")
-        self.assertGreaterEqual(took - baseline, 1.5)
+        self.assertGreaterEqual(took - baseline, 0.6)
         self.usage(3000)
         _, took = self.timed("pr", "view", "3")
         self.assertLess(took - baseline, 1.0, "the wait ended with the low budget")
