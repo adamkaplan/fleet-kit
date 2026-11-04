@@ -20,6 +20,7 @@ GUARDED = (
     "test_cloud_end_alert.py",
     "test_cloud_pr_preflight.py",
     "test_cloud_preflight_wired.py",
+    "test_cloud_prestop.py",
     "test_cloud_quick_selector.py",
     "test_cloud_turn_end.py",
     "test_cloud_worker.py",
