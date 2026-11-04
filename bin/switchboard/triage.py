@@ -369,7 +369,7 @@ class TriageState:
         self.logged, self.woken_logged, self.facts, self.current = set(), set(), {}, {}
         self.started, self.day, self.day_counts = 0, None, {}
         self.summarised = None
-        self.basis = {}          # digest fact key -> (shown pairs, total due, invalid refs, other-owner count) its text was made from: judged again at the end of a pass
+        self.basis = {}          # digest fact key -> (shown pairs, total due, invalid refs, other-owner count, kinds) its text was made from: judged again at the end of a pass
         self.seen = None         # #349: the stale digest's memory (bin/triage_digest.py), loaded at the first pass
         self.meta = None         # #406: its cadence (warm-up done, the last delivery), kept in the same file
 
@@ -1254,6 +1254,8 @@ def triage_digest_commit(engine, state, shown, invalid, now):
 
 
 def triage_digest_text(state, total, shown, kinds, other_owner, invalid):
+    if not shown:   # only the once-only flag of an invalid park: one message, and nothing else in it
+        return "triage: no stale item to show; parked without a valid `Parked until: YYYY-MM-DD` line (treated as not parked): %s." % ", ".join(invalid)
     summary = "triage: %d finding%s: %s%s. %s. Resolve, route or escalate each; the triage changes nothing on GitHub." % (
         total, "" if total == 1 else "s", ", ".join("%s %s%s" % (ref, rule, " (%s)" % state.reasons[(rule, ref)] if (rule, ref) in state.reasons else "") for rule, ref in shown),
         " (+%d more)" % (total - len(shown)) if total > len(shown) else "",
@@ -1274,7 +1276,7 @@ def triage_rejudge_facts(state, now):
     """A pending digest fact is judged again before it is delivered: an item now validly parked is dropped from it (and from its invalid-park flag),
     and a fact left with nothing is ended."""
     items = triage_digest_items(state)
-    for key, (shown, total, invalid, other_owner) in list(state.basis.items()):
+    for key, (shown, total, invalid, other_owner, kinds) in list(state.basis.items()):
         if key not in state.facts:
             del state.basis[key]
             continue
@@ -1282,15 +1284,22 @@ def triage_rejudge_facts(state, now):
         keep_invalid = [r for r in invalid if not triage_validly_parked(items.get(r), now)]
         if len(keep) == len(shown) and len(keep_invalid) == len(invalid):
             continue
+        for ref in {p[1] for p in shown if p not in keep} | {r for r in invalid if r not in keep_invalid}:   # a validly parked item's remembered records are forgotten with it
+            for rule in TRIAGE_KINDS:
+                state.alarmed.pop((rule, ref), None)
+                state.reasons.pop((rule, ref), None)
+                if state.seen is not None:
+                    state.seen.pop("%s %s" % (rule, ref), None)
+            if state.seen is not None:
+                state.seen.pop("PARKED " + ref, None)
         created = state.facts[key][1]
+        new_total = total - (len(shown) - len(keep))
         if not keep and not keep_invalid:
             del state.facts[key], state.basis[key]
-        elif keep:
-            state.facts[key] = (triage_digest_text(state, total - (len(shown) - len(keep)), keep, sorted({r for r, _ in keep}), other_owner, keep_invalid), created)
-            state.basis[key] = (keep, total - (len(shown) - len(keep)), keep_invalid, other_owner)
-        else:   # only an invalid-park flag is left
-            state.facts[key] = ("triage: no stale item to show; parked without a valid `Parked until: YYYY-MM-DD` line (treated as not parked): %s." % ", ".join(keep_invalid), created)
-            state.basis[key] = ([], 0, keep_invalid, other_owner)
+        else:
+            kinds = list(kinds) if new_total > len(keep) else sorted({r for r, _ in keep})   # kinds of all that is due, as the original rule: hidden items keep theirs
+            state.facts[key] = (triage_digest_text(state, new_total, keep, kinds, other_owner, keep_invalid), created)
+            state.basis[key] = (keep, new_total, keep_invalid, other_owner, kinds)
 
 
 def triage_queue_fact(state, due, now, cfg, other_owner=0, invalid=()):
@@ -1300,14 +1309,16 @@ def triage_queue_fact(state, due, now, cfg, other_owner=0, invalid=()):
     key = "triage:%s:%d" % (digest, int(now // (cfg["realarm_hours"] * 3600)))
     kinds = sorted({r for r, _ in due})
     if not due:   # only the once-only flag of an invalid park: still one message, and nothing else in it
-        summary = "triage: no stale item to show; parked without a valid `Parked until: YYYY-MM-DD` line (treated as not parked): %s." % ", ".join(invalid)
-        state.facts["triage:parked:%s" % hashlib.sha256(summary.encode()).hexdigest()[:10]] = (summary, now)
+        summary = triage_digest_text(state, 0, [], kinds, other_owner, invalid)
+        pkey = "triage:parked:%s" % hashlib.sha256(summary.encode()).hexdigest()[:10]
+        state.facts[pkey] = (summary, now)
+        state.basis[pkey] = ([], 0, list(invalid), other_owner, [])
         return summary
     summary = triage_digest_text(state, len(due), shown, kinds, other_owner, invalid)
     for pair in shown:
         state.alarmed[pair] = now
     state.facts[key] = (summary, now)
-    state.basis[key] = (list(shown), len(due), list(invalid), other_owner)   # what the text was made from, so a later pass can judge it again
+    state.basis[key] = (list(shown), len(due), list(invalid), other_owner, kinds)   # what the text was made from, so a later pass can judge it again
     for old in [k for k, (_, at) in state.facts.items() if now - at > cfg["realarm_hours"] * 7200 and "summary" not in k]:
         del state.facts[old]
     state.carried = set(shown)   # #849: what this digest carried and remembered; an overflow beyond the cap stays due

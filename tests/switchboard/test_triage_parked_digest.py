@@ -1,6 +1,12 @@
 """#2090: a pending triage digest fact is judged again before it is delivered: a validly parked item is never repeated, an invalid park is still flagged once.
 The class borrows the setup of TestTriageDigest from the host file (bin/test-switchboard), passed to build() without re-running its tests."""
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 
@@ -52,6 +58,68 @@ def build(Base, Digest, sb):
             self.add(153, created=5, updated=4, labels=["osuser:parked"], body="Parked until: 2020-01-01")
             self.passes(0)
             self.assertEqual(self.mentions("api#153"), 1)
+
+        def records(self, ref):
+            st = self.engine.triage
+            keys = [k for k in (st.seen or {}) if k.endswith(ref)]
+            return len(keys) + sum(p[1].endswith(ref) for p in st.alarmed) + sum(p[1].endswith(ref) for p in st.reasons)
+
+        def test_s2_the_remembered_records_of_a_validly_parked_item_are_forgotten_in_the_same_pass(self):
+            self.add(150, created=5, updated=4, labels=["osuser:parked"], body="no date yet")
+            self.passes(0)
+            self.assertGreater(self.records("api#150"), 0)   # control: the made digest remembered it (PARKED, T3, alarmed)
+            self.reread(150, labels=["osuser:parked"], body=self.future())
+            self.assertEqual(self.records("api#150"), 0)
+
+        def test_s3_a_fact_of_only_an_invalid_park_has_a_basis_and_is_judged_again(self):
+            self.add(154, created=5, updated=4, labels=["osuser:parked"], body="no date yet")
+            self.passes(0)
+            only = [k for k in self.engine.triage.facts if k.startswith("triage:parked:")]
+            for k in only:
+                self.assertIn(k, self.engine.triage.basis)
+            self.reread(154, labels=["osuser:parked"], body=self.future())
+            self.assertEqual([k for k in self.engine.triage.facts if k.startswith("triage:parked:")], [])
+
+        def test_s3_a_held_fact_whose_park_was_valid_is_judged_again_when_it_expires_or_the_line_goes(self):
+            for body in ("Parked until: 2020-01-01", "no date at all"):
+                with self.subTest(body=body):
+                    self.setUp()
+                    self.add(155, created=5, updated=4, labels=["kind"])
+                    self.passes(0)
+                    self.reread(155, labels=["osuser:parked", "kind"], body=self.future())
+                    self.assertEqual(self.mentions("api#155"), 0)
+                    self.reread(155, labels=["osuser:parked", "kind"], body=body)
+                    self.world.tick(3 * self.DAY)
+                    self.passes(0)
+                    self.assertGreaterEqual(self.mentions("api#155"), 1)
+
+        def test_s4_the_rebuilt_text_keeps_the_kinds_of_the_items_not_shown(self):
+            state = sb.TriageState()
+            state.facts["k"] = ("old", 1.0)
+            state.basis["k"] = ([("T3", "acme/api#1"), ("T3", "acme/api#2")], 3, [], 0, ["T3", "T5"])
+            items = {"acme/api#2": {"labels": ["osuser:parked"], "parked_until": 1e12, "state": "open"}}
+            with mock.patch.object(sb, "triage_digest_items", lambda s: items), mock.patch.object(sb, "triage_validly_parked", lambda i, n: i is not None):
+                sb.triage_rejudge_facts(state, 1.0)
+            self.assertIn("T5 = ", state.facts["k"][0])
+            self.assertIn("(+1 more)", state.facts["k"][0])
+
+        def test_s4_mutant_without_the_rejudge_call_the_s2_test_fails_on_its_anchored_text(self):
+            repo = Path(__file__).resolve().parents[2]
+            test = "TestTriageParkedDigest.test_s2_a_validly_parked_item_is_never_repeated"
+            call = "    triage_rejudge_facts(state, now)   # a digest still waiting"
+            with tempfile.TemporaryDirectory(dir="/tmp/opencode") as tmp:
+                copy = Path(tmp) / "copy"
+                shutil.copytree(repo, copy, ignore=shutil.ignore_patterns(".git", "__pycache__"))
+                run = lambda: subprocess.run([sys.executable, "bin/test-switchboard", test], cwd=copy, capture_output=True, text=True, timeout=600)
+                clean = run()
+                self.assertEqual(clean.returncode, 0, clean.stdout + clean.stderr)   # the unmutated copy passes
+                path = copy / "bin" / "switchboard" / "triage.py"
+                text = path.read_text()
+                self.assertEqual(text.count(call), 1)
+                path.write_text(text.replace(call, "    pass   # a digest still waiting"))
+                mutant = run()
+                self.assertNotEqual(mutant.returncode, 0)
+                self.assertIn("a validly parked item is never repeated", mutant.stdout + mutant.stderr)
 
         def test_u1_the_moved_text_builder_is_byte_identical(self):
             state = sb.TriageState()
