@@ -19843,7 +19843,7 @@ def ci_record_core(ctx, now, quiet=False):
                                              "command": "gates ci-record", "env": "switchboard"}], now())
         out["proved"].append(scenario["id"])
     if out["recorded"] or out["proved"] or not quiet:
-        _gates_audit(ctx.engine, "gate.ci_record", ctx.pr, dict(detail, ok=True, recorded=out["recorded"], already=out["already"]))
+        _gates_audit(ctx.engine, "gate.ci_record", ctx.pr, dict(detail, ok=True, recorded=out["recorded"], already=out["already"], proved=out["proved"]))
     return dict(out, status="recorded")
 
 
