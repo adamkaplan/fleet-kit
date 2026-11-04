@@ -2,11 +2,8 @@
 from pathlib import Path
 from unittest import mock
 from support.loader import sb
+from support.bodies_and_comments import edited_body
 from support.scenario_roles import GH_BIN, GH_REPO
-
-
-def edited_body(intent, done):
-    return "## Intent\n%s\nDone when: %s\n" % (intent, done)
 
 
 def build(Wiring, GithubRig):
