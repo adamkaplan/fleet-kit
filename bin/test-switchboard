@@ -66017,6 +66017,9 @@ _ci_test_files = importlib.import_module("test_ci_test_files")
 TestCiTestFileList = _ci_test_files.TestCiTestFileList
 TestTempJanitorScratch = importlib.import_module("test_scratch").build(TestTempJanitor)
 
+# The host-disk tests of #2081.
+TestHostDisk = importlib.import_module("test_host_disk").TestHostDisk
+
 # The delivery-lag tests of #1402.
 _delivery_lag = importlib.import_module("test_delivery_lag")
 _delivery_lag.World = World
