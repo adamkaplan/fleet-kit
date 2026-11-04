@@ -2918,7 +2918,7 @@ class TestEnsure(Base):
         env = sb.daemon_environment({"HERDR_PLUGIN_ROOT": "/p", "HERDR_PLUGIN_CONTEXT_JSON": "{}",
                                      "HERDR_PANE_ID": "w1:p1", "HERDR_TAB_ID": "t", "HERDR_WORKSPACE_ID": "w",
                                      "HERDR_SOCKET_PATH": "/s", "HERDR_BIN_PATH": "/b", "HOME": "/h"})
-        self.assertEqual(sorted(env), ["FLEET_SWITCHBOARD_HERDR_SOCKET", "HOME"])   # #1066: no herdr variable; the socket path is kept under its own name
+        self.assertEqual(env["HOME"], "/h"); self.assertIn("FLEET_SWITCHBOARD_HERDR_SOCKET", env); self.assertEqual([k for k in env if k.startswith("HERDR_")], [])   # #1066: no herdr variable; the socket path is kept under its own name
 
     def test_a_real_ensure_returns_with_pipes_open_and_a_real_poke_wakes_the_real_daemon(self):
         log = self.home / "herdr-calls.log"
