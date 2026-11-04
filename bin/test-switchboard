@@ -66002,6 +66002,8 @@ TestTheBinSetClassesAreAllInTheTable = _bin_set_table.TestTheBinSetClassesAreAll
 TestHeavyProgress = importlib.import_module("test_heavy_progress").TestHeavyProgress
 # The pod niceness tests (#1794).
 TestPodNiceness = importlib.import_module("test_pod_niceness").TestPodNiceness
+# The split of the heavy wrapper into a part (#2034).
+TestHeavySplit = importlib.import_module("test_heavy_split").TestHeavySplit
 # The steer-after-minutes tests of #1540, moved under the line ceiling.
 _steer_long = importlib.import_module("test_steer_long_turn")
 TestSteerLongTurn = _steer_long.build(Base, TestSteerToWorking)
