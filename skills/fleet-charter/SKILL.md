@@ -201,6 +201,8 @@ Pane addresses are only unique within one herdr server. A `wN:pN` from another
 machine is a different agent wearing the same name, which is the other reason the
 label prefix is not optional.
 
+A charter whose agent runs on a named host writes its `pane` as `host:<hostname>/<agent>`; the doctor judges it by that host's list of agents (alive, dead, or unreachable when the host cannot be asked).
+
 Only a message starting `Heartbeat` expects an acknowledgement, and it states the
 exact `heartbeat-ack` command; send exactly one per such wake and let the cadence
 tell the truth: short when work is in flight, long when there is genuinely nothing
@@ -234,3 +236,6 @@ Use plain `gh` for what you say on GitHub. The switchboard tells you about comme
 on your issues, and the harness signs the ones you post (an invisible HTML comment),
 so they do not come back to you as events. `fleet-switchboard comment` does the same
 by hand where the harness has no shim.
+To change one of your own comments that is not your last (a plan, a receipt), use
+`fleet-switchboard comment --edit COMMENT_URL --body-file FILE` (never a `gh api` call); an
+approved plan also needs `--approval ID`, and the approval lapses with the new hash.
