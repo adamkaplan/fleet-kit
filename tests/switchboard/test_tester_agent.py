@@ -171,6 +171,17 @@ def build():
             code, out, err = self.launch("coder", "tester", "--terminal", name="realtester")   # the real checkout, no plant
             self.assertEqual(code, 0, err)
 
+        def test_s10_control_characters_of_the_agent_name_are_printed_as_question_marks_in_one_line(self):
+            self.plant(tester_agent_standard())
+            code, out, err = self.launch("bu\nil\x1bd\rx", "tester", "--terminal", name="ctl")
+            self.assertEqual(code, 2)
+            self.assertEqual(len(err.splitlines()), 1, err)
+            self.assertTrue(err.endswith("\n") and err.count("\n") == 1, err)
+            self.assertEqual((err.count("\x1b"), err.count("\r")), (0, 0))
+            self.assertIn("bu?il?d?x is not one (allowed: alpha, beta)", err)
+            self.assertEqual(err.count("?"), 3)
+            self.assertEqual(self.started(), (0, 0, 0))
+
         def test_the_entry_hands_the_check_the_checkout_above_its_own_bin(self):
             self.plant(tester_agent_standard())
             self.assertEqual(self.launch("alpha", "tester", "--terminal")[0], 0)
@@ -207,6 +218,26 @@ def build():
             with self.assertRaises(AssertionError) as caught:
                 self.assert_the_check(source, "build", accepted=False)
             self.assertIn("2 != 0", str(caught.exception).replace("0 != 2", "2 != 0"))   # the launch proceeded (0) where the refusal (2) is expected
+
+        def assert_no_control_character(self, source):
+            code, out, err = self.run_plant_named(source, "bu\nil\x1bd\rx")
+            self.assertEqual(code, 2)
+            self.assertEqual(len(err.splitlines()), 1, err)
+            if any(c in err for c in "\x1b\r") or len(err.splitlines()) != 1:
+                self.fail("the refusal printed a control character of the agent name")
+
+        def run_plant_named(self, source, agent):
+            self.plant(tester_agent_standard(), module_source=source)
+            return self.launch(agent, "tester", "--terminal", name="mctl")
+
+        def test_s10_control_the_unmutated_copy_prints_no_control_character(self):
+            self.assert_no_control_character(self.SOURCE)
+
+        def test_s10_mutant_the_name_printed_raw_is_caught(self):
+            source = self.mutate("% (PROG, printable(agent), ", "% (PROG, agent, ")
+            with self.assertRaises(AssertionError) as caught:
+                self.assert_no_control_character(source)
+            self.assertIn("the refusal printed a control character of the agent name", str(caught.exception))
 
         def test_s3_control_the_unmutated_copy_accepts_the_third_agent(self):
             self.assert_the_check(self.SOURCE, "gamma", accepted=True)
