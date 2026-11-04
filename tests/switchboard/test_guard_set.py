@@ -65,9 +65,8 @@ class TestGuardSet(unittest.TestCase):
             for part in ("bin", "tests", "docs"):    # the one fixture tree: only what the wired guard reads
                 shutil.copytree(REPO / part, tree / part, ignore=shutil.ignore_patterns(".git", "__pycache__"))
 
-            def guard_run():    # the guard class directly, without the runner's whole-suite import
-                return subprocess.run([sys.executable, "-m", "unittest", "test_wired_tests." + guard + ".test_the_real_directory_is_wired"], capture_output=True, text=True,
-                                      cwd=tree / "tests" / "switchboard")
+            def guard_run():    # the runner's own entry path, as the guard set runs it
+                return subprocess.run([sys.executable, "bin/test-switchboard", guard], capture_output=True, text=True, cwd=tree)
             c = guard_run()
             self.assertEqual(c.returncode, 0, c.stdout + c.stderr)  # the control passes on the unmutated copy
             (tree / "tests" / "switchboard" / "test_planted_unloaded.py").write_text(
