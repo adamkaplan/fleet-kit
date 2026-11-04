@@ -6,7 +6,6 @@
 # Later asks add ONLY their own rows in their own section below (ask 1166: issue writes; ask 1200: pr edit body). Do not edit existing rows.
 # ---- ask 1083 rows ----
 issue-comments-read	allowed	gh	GET	repos/OWNER/NAME/issues/N/comments		api repos/acme-org/widget-service/issues/7/comments
-issue-comment-by-id-read	allowed	gh	GET	repos/OWNER/NAME/issues/comments/ID		api repos/acme-org/widget-service/issues/comments/7
 issue-comments-list-form	allowed	gh	GET	repos/OWNER/NAME/issues/N/comments?QUERY		api repos/acme-org/widget-service/issues/7/comments?per_page=5
 pull-reviews-read	allowed	gh	GET	repos/OWNER/NAME/pulls/N/reviews		api repos/acme-org/widget-service/pulls/7/reviews
 pull-comments-read	allowed	gh	GET	repos/OWNER/NAME/pulls/N/comments		api repos/acme-org/widget-service/pulls/7/comments
