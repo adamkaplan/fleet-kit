@@ -841,3 +841,7 @@ class V2Client:
             raise ValueError("delivery must be one of %s" % ", ".join(self.DELIVERIES))
         return self._call("session.inbox.update", {"sessionID": session_id, "inboxID": inbox_id},
                           {"delivery": delivery})
+
+    def inbox_cancel(self, session_id, inbox_id):
+        """#1844: remove one inbox item (`session.inbox.cancel`, DELETE /api/session/{sessionID}/inbox/{inboxID}; an empty answer)."""
+        return self._call("session.inbox.cancel", {"sessionID": session_id, "inboxID": inbox_id})
