@@ -586,6 +586,21 @@ def claim_union(scenarios, this_body, others):
     return narrowed, [i for i in per if i not in covered], last
 
 
+def claim_counts(scenarios, bodies):
+    """How many of `bodies` cover each per-pull-request id (#1716): one reading of each body through `covered_ids`, kept as one number for each id. Pure."""
+    counts = {}
+    for body in bodies:
+        for i in covered_ids(scenarios, [body]):
+            counts[i] = counts.get(i, 0) + 1
+    return counts
+
+
+def omitted_claims(scenarios, this_body, counts):
+    """The per-pull-request ids this body's claim line leaves out that no OTHER body counted covers (`counts` is `claim_counts` over all bodies, this one included, so an id this body covers has a count of at least 1: an id is omitted when this body has a claim line that covers something, the scenario is per pull request and the counts hold NO body that covers it). No claim line claims every one and a refused line covers nothing: both leave out nothing here (`covered_ids` gives the empty set). Pure."""
+    mine = covered_ids(scenarios, [this_body])
+    return [s.get("id") for s in scenarios if mine and claim_of(s) == "pr" and not counts.get(s.get("id"), 0)]
+
+
 def claim_line(pr, head, body):
     """The ONE ledger line that binds a pull request's claim as it stood when its merge was gated (#976). `claim_text` None: no claim line."""
     text = claim_text(body)
@@ -660,7 +675,8 @@ def scenario_state(scenario, entries, pr, plan_hash, head, authors):
         if not newest and mine:
             why = "plan changed" if mine[-1].get("plan_hash") != plan_hash else "head moved"
             out["void"].append("%s #%d void: %s" % (kind if kind == "proof" else evaluator + " verdict", mine[-1]["seq"], why))
-        out[kind] = None if not newest else {"seq": newest["seq"], "result": newest["result"], "by": newest.get("by")}
+        out[kind] = None if not newest else {"seq": newest["seq"], "result": newest["result"], "by": newest.get("by"),
+                                                                                    "evidence": newest.get("evidence"), "ts": newest.get("ts")}
     proof, verdict = out["proof"], out["verdict"]
     if not proof:
         out["missing"].append("proof (`prove %s`; the %s judges it, a prover records it)" % (sid, evaluator))
@@ -669,7 +685,7 @@ def scenario_state(scenario, entries, pr, plan_hash, head, authors):
     if not verdict:
         out["missing"].append("%s verdict (`verdict %s --as %s`; only the %s may record it)" % (evaluator, sid, evaluator, evaluator))
     elif verdict["result"] != "pass":
-        out["missing"].append("%s verdict says fail (only the %s may record a new one)" % (evaluator, evaluator))
+        out["missing"].append("%s verdict says fail (only the %s may record a new one): %s [by %s at %s]" % (evaluator, evaluator, (verdict.get("evidence") or "")[:160], verdict.get("by"), verdict.get("ts")))
     elif verdict["by"] in authors:
         out["missing"].append("the %s verdict is by an author of the PR (not accepted; only the %s, who is not an author, may record it)" % (evaluator, evaluator))
     out["status"] = "ok" if not out["missing"] else "missing"
