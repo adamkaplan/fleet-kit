@@ -924,6 +924,55 @@ class TestEachThingOnce(Base):
         sent = self.cut_world(["alpha", "beta", "gamma"])
         self.assertEqual(sorted(sent["keys"]), ["s1", "s2"])
 
+    def test_1302_a_cut_that_leaves_no_member_line_sends_nothing_and_acknowledges_nothing(self):
+        world = World(self, agents=("platform",))
+        for n, text in enumerate(["alpha", "beta", "gamma"]):
+            world.fact("platform", "s%d" % n, text, kind="sweep", created=world.clock.now() + n)
+        world.tick(120)
+        real = sb.compose
+        def cut(*args, **kwargs):
+            text, carried = real(*args, **kwargs)
+            return text.splitlines()[0], carried   # the header only: every member line is cut off
+        acked = []
+        with mock.patch.dict(sb.compose.__globals__, {"compose": cut}):
+            with mock.patch.object(sb.Switchboard, "_acknowledge", lambda self, keys: acked.append(list(keys))):
+                result = world.engine.run_pass()
+        (error,) = result["errors"]   # derive_message_id raised: the pass reports it, nothing more
+        self.assertEqual((error["step"], error["error"]), ("deliver", "ValueError: keys must be a non-empty list of non-empty strings"))
+        self.assertEqual(result["sent"], [])
+        self.assertEqual(world.admissions("platform"), [])
+        self.assertEqual([key for keys in acked for key in keys], [])   # no key was acknowledged
+
+    def parts_run(self):
+        """One over-cap finding through the real deliver, pass after pass; the order of every send and every acknowledgement."""
+        world = World(self, agents=("platform",))
+        body = "\n".join("item %03d %s" % (n, "z" * 60) for n in range(100))
+        world.fact("platform", "review:big", body, kind="review")
+        events = []
+        real_send, real_ack = world.engine.v2.synthetic, sb.Switchboard._acknowledge
+        def send(*args, **kwargs):
+            events.append("send")
+            return real_send(*args, **kwargs)
+        def ack(engine, keys):
+            events.append(("ack", list(keys)))
+            return real_ack(engine, keys)
+        with mock.patch.object(world.engine.v2, "synthetic", send), mock.patch.object(sb.Switchboard, "_acknowledge", ack):
+            for _ in range(60):
+                world.tick(120)
+                world.engine.run_pass()
+        return events
+
+    def test_1302_the_key_is_acknowledged_only_after_the_last_part_is_sent(self):
+        events = self.parts_run()
+        first = next(i for i, e in enumerate(events) if e != "send" and "review:big" in e[1])   # the first acknowledgement of the finding's key
+        self.assertEqual(events[first], ("ack", ["review:big"]))   # by the delivery itself
+        self.assertEqual(events[:first].count("send"), events.count("send"))   # every part was sent before it, none after
+        self.assertGreater(events.count("send"), 1)
+
+    def test_1302_the_continuation_after_the_first_part_is_delivered(self):
+        events = self.parts_run()
+        self.assertGreater(events.count("send"), 1)   # a dropped continuation sends one part and acknowledges nothing more
+
     def test_1275_a_member_line_that_is_a_prefix_of_another_line_is_not_acknowledged(self):
         sent = self.cut_world(["aaa", "aaa bbb"])   # "- sweep: aaa" is a prefix of the line that is in the text
         self.assertEqual(sent["keys"], ["s1"])
