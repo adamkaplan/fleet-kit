@@ -2,6 +2,7 @@
 
 No cloud, no network beyond loopback: kubectl is the fake beside this file; time is a fake clock.
 """
+import pathlib
 import argparse
 import datetime as dt
 import http.server
@@ -546,7 +547,7 @@ class S5EndHook(Base):
 
     def test_every_exit_reason_the_code_writes_carries_the_time(self):
         import ast
-        src = open(os.path.join(os.path.dirname(os.path.abspath(cw.__file__)), "cloud_worker.py")).read()
+        src = pathlib.Path(os.path.join(os.path.dirname(os.path.abspath(cw.__file__)), "cloud_worker.py")).read_text()
         fn = [n for n in ast.walk(ast.parse(src)) if isinstance(n, ast.FunctionDef) and n.name == "_reap_main"][0]
         whys = sorted({ast.unparse(a.value)[:20] for a in ast.walk(fn) if isinstance(a, ast.Assign) and any(getattr(t, "id", "") == "why" for t in a.targets)})
         self.assertEqual(len(whys), 4, whys)   # end of its pass, stopped by (a signal or an interrupt), an error, not started (the lock): a form added needs its case (test_reaper_managed.ENDINGS)

@@ -3,6 +3,7 @@ Offline: a loopback stub of the GitHub API, a throwaway RSA key, the real mint a
 
 Every set here is derived from `app_token.EXPECTED_PERMISSIONS` (one table); each check has a mutant that must be caught.
 The Mac shim (shims/app_mint.py) has its own, different set and is not touched."""
+import pathlib
 import io
 import json
 import os
@@ -52,7 +53,7 @@ def refused(perms, module=app_token):
 
 
 def mutant_module(old, new):
-    src = open(os.path.join(os.path.dirname(HERE), "app_token.py")).read()
+    src = pathlib.Path(os.path.join(os.path.dirname(HERE), "app_token.py")).read_text()
     assert old in src, old
     mod = type(sys)("app_token_mutant")
     mod.__file__ = os.path.join(os.path.dirname(HERE), "app_token.py")

@@ -1,5 +1,6 @@
 """Ask #1390: the chain's parallel list. Every entry still runs (the parallel list is a subset of the chain), a red parallel entry fails the run,
 and a parallel entry that is not in the chain is refused. Offline; scratch trees under the temp dir."""
+import pathlib
 import os, re, subprocess, sys, unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -267,7 +268,7 @@ class UnmeasuredList(unittest.TestCase):
             git("checkout", "-q", "b0")
             m = git("merge", "--no-edit", "b1")
             self.assertEqual(m.returncode, 0, m.stdout + m.stderr)
-            merged = open(f).read()
+            merged = pathlib.Path(f).read_text()
             self.assertEqual(sum(1 for a in adds if a in merged.split("\n")), 2)
             self.assertNotIn("<<<<<<<", merged)
             parents = git("rev-list", "--parents", "-n1", "HEAD").stdout.split()
