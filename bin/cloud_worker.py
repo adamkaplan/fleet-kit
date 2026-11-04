@@ -838,8 +838,30 @@ def _launch(args, runner, now, reserve):
                 remove_record(state, name)
             raise
     _registry_note(engine, "upsert", state, name, {"session": session, "repo": repo, "role": args.role, "kind": "cloud", "run_id": run_id, "state": "working"})   # a cloud worker is an agent (#903)
+    print(_limits_note(args, record), file=sys.stderr)   # stderr, before the one JSON line
     print(json.dumps({"name": name, "session": session, "runtime_id": record["runtime_id"], "url": record["url"], "cloud": True}, sort_keys=True))
     return H["EXIT_OK"]
+
+
+def _limits_note(args, record):
+    """One line for stderr: the idle and hard limits of the launch (each says `(default)` only when its flag was absent) and the stop time, the
+    earlier of the launcher's own two deadlines (read from its answer; `not reported` when neither parses). No address, token or brief."""
+    def applied(seconds):
+        if isinstance(seconds, bool) or not isinstance(seconds, int) or seconds <= 0:
+            return "not reported"
+        return "%dh" % (seconds // 3600) if seconds % 3600 == 0 else "%dm" % (seconds // 60) if seconds % 60 == 0 else "%ds" % seconds
+    def limit(label, value, key):
+        text = str(value)[:20] if value else applied(record.get(key))
+        return "%s limit %s%s" % (label, text, "" if value else " (default)" if text != "not reported" else "")
+    stops = []
+    for key in ("idle_deadline", "hard_deadline"):
+        try:
+            when = datetime.datetime.strptime(str(record.get(key)), "%Y-%m-%dT%H:%M:%SZ")
+        except ValueError:
+            continue
+        stops.append(when)
+    stop = min(stops).strftime("%Y-%m-%dT%H:%M:%SZ") if stops else "not reported"
+    return "launch --cloud: %s, %s, stops at %s" % (limit("idle", args.idle, "idle_seconds"), limit("hard", args.hard, "hard_seconds"), stop)
 
 
 def _registry_note(engine, what, state, name, *args):
@@ -860,6 +882,8 @@ def _record_from_create(name, body):
     if body.get("worker") != name:
         raise CloudError("the launcher answered for another worker")
     record = {key: body.get(key) for key in RECORD_FIELDS}
+    record["idle_seconds"] = body.get("idle_seconds")   # the limits the launcher applied (ask #1474)
+    record["hard_seconds"] = body.get("hard_seconds")
     if any(not isinstance(record[key], str) or not record[key] for key in ("url", "runtime_id")):
         raise CloudError("the launcher's record has no url or runtime_id")
     problem = endpoint_problem(record["url"])
@@ -1164,6 +1188,8 @@ def status_lines(runner, state, timeout=STATUS_SECONDS):
                 code, body, note = run_launcher(runner, "status", record["worker"], (), timeout, cluster=cluster)
             except CloudError as err:
                 code, body, note = -1, None, str(err)
+            if isinstance(body, list):   # the launcher prints a list with one record per pod: the first one
+                body = body[0] if body and isinstance(body[0], dict) else None
             if code == 0 and body is not None:
                 row.update({key: body.get(key) for key in ("phase", "idle_since", "cost_estimate_usd")})
                 extra = "phase %s, about $%s so far" % (_safe(body.get("phase"), "?"), body.get("cost_estimate_usd", "?"))
