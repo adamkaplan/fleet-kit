@@ -1,12 +1,10 @@
 """#2090: a pending triage digest fact is judged again before it is delivered: a validly parked item is never repeated, an invalid park is still flagged once.
-The class borrows the setup of TestTriageDigest from the host file (bin/test-switchboard) without re-running its tests."""
+The class borrows the setup of TestTriageDigest from the host file (bin/test-switchboard), passed to build() without re-running its tests."""
 import unittest
 from unittest import mock
 
 
-def build(host):
-    sb, Base, Digest = host.sb, host.Base, host.TestTriageDigest
-
+def build(Base, Digest, sb):
     class TestTriageParkedDigest(Base):
         DAY = 86400
         COS, USER = Digest.COS, Digest.USER
