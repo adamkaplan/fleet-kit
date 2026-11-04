@@ -28509,6 +28509,12 @@ class LedgerBase(Base):
             return subprocess.CompletedProcess(argv, 0, json.dumps(self.comments if "&page=1" in path else []), "")
         if re.search(r"/issues/7$", path):
             return subprocess.CompletedProcess(argv, 0, json.dumps(self.plan_issue), "")
+        if path.endswith("/merge") and "/commits/refs/pull/" in path:   # a fresh merge ref: its first parent is the base's head (#2091)
+            return subprocess.CompletedProcess(argv, 0, json.dumps([{"sha": "b" * 40}, {"sha": self.pr["headRefOid"]}]), "")
+        if re.search(r"/pulls/\d+$", path):
+            return subprocess.CompletedProcess(argv, 0, "main\n", "")
+        if re.search(r"/branches/main$", path):
+            return subprocess.CompletedProcess(argv, 0, "b" * 40 + "\n", "")
         return subprocess.CompletedProcess(argv, 1, "", "gh: Not Found (HTTP 404)")
 
     terminal_problem = None   # what the owner-terminal check says in these tests (None: it is the owner's terminal)
@@ -28619,7 +28625,7 @@ class TestGatesMissingWording(LedgerBase):
 
     def test_S4_the_item_and_ci_writers_each_write_one_kind_derived_from_the_code(self):
         writers = {"cmd_prove": {"proof"}, "cmd_verdict": {"verdict"}, "cmd_item_prove": {"proof"}, "cmd_item_verdict": {"verdict"},
-                   "cmd_item_ci_record": {"verdict"}, "ci_record_core": {"verdict"}}
+                   "cmd_item_ci_record": {"verdict"}, "ci_record_core": {"proof", "verdict"}}
         for name, want in writers.items():
             found = set()
             for node in ast.walk(ast.parse(textwrap.dedent(inspect.getsource(getattr(sb, name))))):
@@ -66104,6 +66110,7 @@ _hc = importlib.import_module("test_header_cache"); TestAges, TestSets, TestEven
 TestReminderTtlMore = importlib.import_module("test_reminder_ttl").build(PR4Base)
 TestPlanRehearsal = importlib.import_module("test_plan_rehearsal").build(HandoffCase)   # #1785
 TestMergeRef = importlib.import_module("test_merge_ref").build(HandoffCase)   # #2053
+TestCiRecordProof = importlib.import_module("test_ci_record_proof").build(LedgerBase)   # #2091
 TestDoneWhenList = importlib.import_module("test_done_when_list").TestDoneWhenList   # #2078
 # The load figure counts cloud workers as busy (#1487).
 _load_cloud = importlib.import_module("test_load_alert_cloud")
@@ -76997,6 +77004,8 @@ class TestCiRecordCarry(LedgerBase):
         self.pr["headRefOid"] = LEDGER_HEAD
 
     def route(self, argv, **kwargs):
+        if argv[0] == FAKE_GH and argv[1] == "api" and (argv[2].endswith("/merge") or re.search(r"/(pulls/\d+|branches/main)$", argv[2])):
+            return super().route(argv, **kwargs)   # the freshness read of the merge ref (#2091) is not one of the reads these tests count
         if argv[0] == FAKE_GH and argv[1] == "api" and argv[2].startswith(self.API) and not argv[2].endswith("/issues/7") and "/comments" not in argv[2]:
             path = argv[2]
             self.reads.append(path)
@@ -77090,8 +77099,8 @@ class TestCiRecordCarry(LedgerBase):
         self.step()
         rest = [json.loads(l) for l in self.ledger_bytes().splitlines() if '"kind": "carried"' not in l]
         self.assertEqual([l for l in self.ledger_bytes().splitlines() if '"kind": "carried"' not in l][:len(before)], before)
-        ci = [(e["scenario"], e["head"], e["by"]) for e in rest[len(before):]]
-        self.assertEqual(sorted(ci), [("S1", self.NEW, sb.plan_ledger.CI_RECORDER), ("U1", self.NEW, sb.plan_ledger.CI_RECORDER)])
+        ci = [(e["kind"], e["scenario"], e["head"], e["by"]) for e in rest[len(before):]]
+        self.assertEqual(sorted(ci), [("proof", "S1", self.NEW, sb.plan_ledger.CI_RECORDER), ("proof", "U1", self.NEW, sb.plan_ledger.CI_RECORDER), ("verdict", "S1", self.NEW, sb.plan_ledger.CI_RECORDER), ("verdict", "U1", self.NEW, sb.plan_ledger.CI_RECORDER)])
 
     def test_U1_the_step_decides_as_the_rule_does_on_six_combinations(self):
         combos = [(["src/widget.py"], True, True), (["bin/o.py"], False, True), (["bin/o.py"], True, False),
