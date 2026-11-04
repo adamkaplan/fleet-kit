@@ -274,7 +274,7 @@ def _forms(value):
 
 
 def judge(path, text, now, cfg, uid=None, clock=time.monotonic, busy=None):
-    """One top-level entry: {"name", "path", "action": "remove" | "keep", "why", "size", "age_days", "ident"}. `ident` is (device, inode, newest mtime):
+    """One top-level entry: {"name", "path", "action": "remove" | "keep", "why", "size", "age_days", "ident"}. `ident` is (device, inode, newest mtime, file type, size, link target):
     run compares it again right before removing. Reads only."""
     uid = os.getuid() if uid is None else uid
     name = os.path.basename(path)
@@ -326,8 +326,15 @@ def judge(path, text, now, cfg, uid=None, clock=time.monotonic, busy=None):
         if using:
             row["why"] = using
             return row
+    target = None
+    if stat.S_ISLNK(info.st_mode):
+        try:
+            target = os.readlink(path)
+        except OSError as err:
+            row["why"] = "cannot read the link (%s): kept" % err
+            return row
     row["action"], row["size"] = "remove", _size(path, deadline, clock)
-    row["ident"] = (info.st_dev, info.st_ino, newest)
+    row["ident"] = (info.st_dev, info.st_ino, newest, stat.S_IFMT(info.st_mode), info.st_size, target)
     return row
 
 

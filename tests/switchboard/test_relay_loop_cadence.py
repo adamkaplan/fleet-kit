@@ -350,8 +350,10 @@ class HubFilesUnchanged(unittest.TestCase):
     def test_wait_is_30_and_the_copies_match(self):
         import cloud_relay
         self.assertEqual(cloud_relay.WAIT, 30)
-        copy = BIN.parent / "cloud" / "worker" / "bin" / "cloud_relay.py"
-        self.assertEqual(copy.read_bytes(), (BIN / "cloud_relay.py").read_bytes())
+        for line in (BIN.parent / "cloud" / "worker" / "copies.tsv").read_text().splitlines():
+            source, copy = line.split("\t")
+            if source == "bin/cloud_relay.py":
+                self.assertEqual((BIN.parent / copy).read_bytes(), (BIN.parent / source).read_bytes())
         for other in (BIN.parent / "cloud" / "worker" / "bin").glob("*.py"):
             if (BIN / other.name).exists():
                 self.assertEqual(other.read_bytes(), (BIN / other.name).read_bytes(), other.name)
