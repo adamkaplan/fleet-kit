@@ -48,6 +48,19 @@ class TestDoneWhenList(unittest.TestCase):
         self.assertEqual(plan_check.clauses_of(done), ["a", "b", "d"])
         self.assertEqual(plan_check.clauses_of(done), plan_check.clauses_of("(1) a (2) b (3) d"))
 
+    def test_s5_plan_check_passes_a_copy_and_names_a_dropped_or_merged_clause(self):
+        sys.path.insert(0, str(REPO / "bin"))
+        import plan_check
+        done = sb.parse_intent(body("dot"))[1]
+        clauses = plan_check.clauses_of(done)
+        self.assertTrue(plan_check.verify_declared(["a", "b", "d"], done))
+        self.assertIsNone(plan_check.first_difference(["a", "b", "d"], clauses, done))
+        dropped = plan_check.first_difference(["a", "b"], clauses, done)
+        merged = plan_check.first_difference(["a b", "d"], clauses, done)
+        self.assertIn("DW-3", dropped)
+        self.assertIn("DW-1", merged)
+        self.assertFalse(plan_check.verify_declared(["a", "b"], done))
+
     def test_s6_bodies_with_text_after_the_label_read_as_before(self):
         self.assertEqual(sb.parse_intent("## Intent\nI.\nDone when: x\n1. y\n"), ("I.", "x"))
         self.assertEqual(sb.parse_intent("## Intent\nDone when: later\n"), (None, "later"))
