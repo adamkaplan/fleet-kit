@@ -28611,7 +28611,7 @@ class TestGatesMissingWording(LedgerBase):
 
     def test_S4_the_item_and_ci_writers_each_write_one_kind_derived_from_the_code(self):
         writers = {"cmd_prove": {"proof"}, "cmd_verdict": {"verdict"}, "cmd_item_prove": {"proof"}, "cmd_item_verdict": {"verdict"},
-                   "cmd_item_ci_record": {"verdict"}, "ci_record_core": {"verdict"}}
+                   "cmd_item_ci_record": {"verdict"}, "ci_record_core": {"proof", "verdict"}}
         for name, want in writers.items():
             found = set()
             for node in ast.walk(ast.parse(textwrap.dedent(inspect.getsource(getattr(sb, name))))):
