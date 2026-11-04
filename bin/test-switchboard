@@ -56491,8 +56491,8 @@ class TestMadeUpPids(unittest.TestCase):
 
     def test_s3_a_number_that_is_alive_is_never_returned_and_none_is_self_parent_or_live(self):
         child = subprocess.Popen(["sleep", "30"])
-        self.addCleanup(child.kill)
         self.addCleanup(child.wait)
+        self.addCleanup(child.kill)                                   # cleanups run last-in first: kill ends the helper, then wait reaps it
         module, proofs, real = sys.modules["support.herdr_world"], {}, _pid_alive
         spy = lambda pid: proofs.__setitem__(pid, real(pid)) or proofs[pid]           # the proof the helper made for each number it looked at
         with mock.patch.object(module, "_MADE_UP_NEXT", [child.pid]), mock.patch.object(module, "_MADE_UP_GIVEN", set()), mock.patch.object(module, "_pid_alive", spy), \
