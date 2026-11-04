@@ -437,6 +437,15 @@ SCRUB_OUTPUT_MAX = 2 * SCRUB_INPUT_MAX   # a limit above the input maximum: reda
 MIN_FRAGMENT = 8
 
 
+POD_EVENTS_MAX, POD_EVENT_CHARS = 20, 200
+_ADDRESS_RE = re.compile(r"(?<![\w.-])(?:\d{1,3}\.){3}\d{1,3}(?::\d{1,5})?(?![\w.-])|(?<![\w.-])(?:(?:[A-Za-z0-9-]+\.)+[A-Za-z][A-Za-z0-9-]*|localhost):\d{1,5}(?![\w.-])|\[[0-9A-Fa-f:.]*:[0-9A-Fa-f:.]*\](?::\d{1,5})?|(?<![\w:])[0-9A-Fa-f:]{1,45}:(?:\d{1,3}\.){3}\d{1,3}(?![\w.:-])|(?<![\w:])(?:(?:[0-9A-Fa-f]{1,4}:){1,7}:(?:[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4}){0,6})?|::(?:[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4}){0,6})?)(?:%[A-Za-z0-9_.-]{1,16})?(?![\w:])|(?<![\w:])(?:[0-9A-Fa-f]{1,4}:){7}[0-9A-Fa-f]{1,4}(?![\w:])")
+
+
+def mask_addresses(text):
+    """An IPv4 address (with its port), a host name with a dot or `localhost` followed by a port, and an IPv6 address (compressed, full or bracketed with a port) become `[address]`; a word glued to a colon and digits that is no such name (`exit code:137`), a node name, a clock and a ratio are kept."""
+    return _ADDRESS_RE.sub("[address]", str(text))
+
+
 class KnownSet:
     """A set of known secret forms. It HOLDS its forms (it is not a set, and no public attribute exposes them), keeps a
     `version` (bumped AFTER every change of the content, under an RLock the instance owns, and only when the content
@@ -2693,6 +2702,8 @@ class Launcher:
                 if where:
                     info["record"] = where
                     print("cloud-worker: run record: %s" % where, file=sys.stderr)
+            if info.get("record"):   # BEFORE the hook and the delete: what the pod object says of the pod, and its events when it is not Running
+                self._record_pod_state(info["record"], pod, name)
             phase = (pod.get("status") or {}).get("phase")
             if phase == "Failed" and getattr(a, "cause", None):
                 info["cause"] = "pod_failed"
@@ -2808,6 +2819,51 @@ class Launcher:
                     "note": text(res.get("note")), "error": text(res.get("error")) or ("end hook gave an unreadable error" if res.get("error") else "")}
         except Exception:
             return {"pushed": False, "wip_branch": None, "skipped": [], "note": "", "error": "end hook answer unreadable"}
+
+    def _pod_state_of(self, pod, name):
+        """The pod's own state from the pod object already read (phase, each container's state, the node) and, ONLY when the phase is
+        not Running, its newest POD_EVENTS_MAX events through scrub and the address mask. A failed events read says `unreadable`. Never raises."""
+        scrub = self.kube.scrub
+        status, spec = pod.get("status") or {}, pod.get("spec") or {}
+        phase = status.get("phase")
+        containers = []
+        for c in (status.get("containerStatuses") or [])[:20]:
+            st = c.get("state") or {}
+            kind = next((k for k in ("terminated", "waiting", "running") if k in st), "unknown")
+            one = {"name": mask_addresses(scrub(c.get("name") or "", 63)), "state": kind}
+            detail = st.get(kind) or {}
+            if detail.get("reason"):
+                one["reason"] = mask_addresses(scrub(detail["reason"], 100))
+            if kind == "terminated":
+                one["exit_code"] = detail.get("exitCode")
+            containers.append(one)
+        state = {"phase": scrub(phase or "", 30), "containers": containers, "node": mask_addresses(scrub(spec.get("nodeName") or "", 253)),
+                 "events": [], "events_read": "no"}
+        if phase == "Running":
+            return state
+        try:
+            uid = (pod.get("metadata") or {}).get("uid")
+            items = [e for e in self.kube.pod_events(name) if not (uid and (e.get("involvedObject") or {}).get("uid") not in (None, uid))]
+            stamp = lambda e: str(e.get("lastTimestamp") or e.get("eventTime") or (e.get("metadata") or {}).get("creationTimestamp") or "")
+            items.sort(key=stamp)
+            events = []
+            for e in items[-POD_EVENTS_MAX:]:
+                text = "%s %s: %s" % (e.get("type") or "", e.get("reason") or "", e.get("message") or "")
+                events.append(mask_addresses(self.kube.scrub(text, 1000))[:POD_EVENT_CHARS])
+            state["events"], state["events_read"] = events, "yes"
+        except Exception:   # a Forbidden answer, a timeout, a bad reply: one word, and the stop goes on
+            state["events"], state["events_read"] = [], "unreadable"
+        return state
+
+    def _record_pod_state(self, directory, pod, name):
+        try:
+            state = self._pod_state_of(pod, name)
+        except Exception:
+            state = "unreadable"
+        try:
+            self.recorder.add_pod_state(directory, state)
+        except Exception:   # add_pod_state never raises; a stop is never held back by the record
+            pass
 
     def _hook_record(self, info, hook):
         if info.get("record"):
