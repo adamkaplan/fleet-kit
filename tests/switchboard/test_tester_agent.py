@@ -222,7 +222,6 @@ def build():
         def assert_no_control_character(self, source):
             code, out, err = self.run_plant_named(source, "bu\nil\x1bd\rx")
             self.assertEqual(code, 2)
-            self.assertEqual(len(err.splitlines()), 1, err)
             if any(c in err for c in "\x1b\r") or len(err.splitlines()) != 1:
                 self.fail("the refusal printed a control character of the agent name")
 
