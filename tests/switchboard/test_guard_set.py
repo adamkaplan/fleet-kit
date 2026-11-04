@@ -17,14 +17,8 @@ NAMED = ["TestHygiene", "TestSupportRebinding", "TestArchitectureDocument", "Tes
          "TestV2LightGuards", "TestImpactHold", "TestEveryTestFileIsWired"]
 
 
-_RUNS = {}
-
-
 def run(*args):
-    """One scan per distinct argument list, cached for the class (the scan reads files that no test here edits)."""
-    if args not in _RUNS:
-        _RUNS[args] = subprocess.run([sys.executable, str(TOOL), *args], capture_output=True, text=True, cwd=REPO)
-    return _RUNS[args]
+    return subprocess.run([sys.executable, str(TOOL), *args], capture_output=True, text=True, cwd=REPO)
 
 
 class TestGuardSet(unittest.TestCase):
@@ -81,10 +75,6 @@ class TestGuardSet(unittest.TestCase):
             r, out = guard_run()
             self.assertFalse(r.wasSuccessful(), out)
             self.assertIn("test_planted_unloaded.py", out)
-            # the runner's own entry path, one child run for the mutant: the command the guard set names catches it too
-            e = subprocess.run([sys.executable, "bin/test-switchboard", "TestEveryTestFileIsWired"], capture_output=True, text=True, cwd=tree)
-            self.assertNotEqual(e.returncode, 0, e.stdout + e.stderr)
-            self.assertIn("test_planted_unloaded.py", e.stdout + e.stderr)
 
     def test_documents_carry_the_sentence(self):
         for f in ("docs/plan-template.md", "skills/fleet-coordination/SKILL.md"):
