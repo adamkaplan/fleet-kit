@@ -113,15 +113,26 @@ def record_name_of(worker, dirname):
 
 def pushed_text(record_dir, parse):
     """`yes`, `no` or `unknown` from the run record's end_hook; never the branch."""
+    # Now (ask #2056) the answer is one of four fixed phrases, read only from the run record's end_hook: `head is on branch NAME`,
+    # `unpushed work saved to NAME`, `nothing unpushed` or `unknown`. NAME is checked like a branch name.
     run = read_small(os.path.join(record_dir, "run.json"), parse) if record_dir else None
     hook = run.get("end_hook") if run else None
     if not isinstance(hook, dict) or not isinstance(hook.get("pushed"), bool):
         return "unknown"
-    return "yes" if hook["pushed"] else "no"
+    def name(v):
+        return v if isinstance(v, str) and len(v) <= 100 and re.fullmatch(r"[A-Za-z0-9._/-]+", v) and not re.search(r"sk-|gh[opsu]_|github_pat|AKIA|xox|eyJ|[A-Za-z0-9]{30}", v) else None
+    head, wip = hook.get("head_on"), hook.get("wip_branch")
+    if head is not None and head != "unknown" and not hook["pushed"]:
+        return "head is on branch " + name(head) if name(head) else "unknown"
+    if hook["pushed"]:
+        return "unpushed work saved to " + name(wip) if name(wip) else "unknown"
+    if head is None and wip is None and not hook.get("error"):
+        return "nothing unpushed"
+    return "unknown"
 
 
 def message_text(worker, label, when, pushed, record_name, kept=False, failure=None):
-    text = ("[cloud worker ended] %s was ended by the launcher: reason %s; at %s; work pushed: %s; run record: %s."
+    text = ("[cloud worker ended] %s was ended by the launcher: reason %s; at %s; %s; run record: %s."
             % (worker, label, when, pushed, record_name or "unknown"))
     if kept:
         text += " The end hook could not push: the pod was kept and the work may be unpushed."
