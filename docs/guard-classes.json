@@ -1,0 +1,142 @@
+[
+ {
+  "class": "TestSelfRegisteringCli",
+  "file": "tests/switchboard/test_cases_12.py",
+  "guards": "commands register and dispatch by name; each has a snapshot file",
+  "reach": [
+   "new command"
+  ],
+  "one_process": false
+ },
+ {
+  "class": "TestSweep",
+  "file": "bin/test-switchboard",
+  "guards": "the sweep and its facts",
+  "reach": [
+   "new fact key"
+  ],
+  "one_process": false
+ },
+ {
+  "class": "TestCaptainSweepFindings",
+  "file": "bin/test-switchboard",
+  "guards": "the captain's sweep findings",
+  "reach": [
+   "new fact key"
+  ],
+  "one_process": false
+ },
+ {
+  "class": "TestFactsReadAtRunTime",
+  "file": "bin/test-switchboard",
+  "guards": "a fact key is read at run time from the fact table",
+  "reach": [
+   "new fact key"
+  ],
+  "one_process": false
+ },
+ {
+  "class": "TestImpactHold",
+  "file": "bin/test-switchboard",
+  "guards": "the impact tables and the closure list",
+  "reach": [
+   "new module",
+   "new command"
+  ],
+  "one_process": false
+ },
+ {
+  "class": "TestTheBinSetClassesAreAllInTheTable",
+  "file": "tests/switchboard/test_bin_set_table.py",
+  "guards": "every class of the bin set is in the table",
+  "reach": [
+   "new test file",
+   "new test class"
+  ],
+  "one_process": false
+ },
+ {
+  "class": "TestArchitectureDocument",
+  "file": "tests/switchboard/test_architecture.py",
+  "guards": "the Units table of docs/architecture.md names every module",
+  "reach": [
+   "new module"
+  ],
+  "one_process": true
+ },
+ {
+  "class": "TestAuthorityModulesGuard",
+  "file": "tests/switchboard/test_cases_03.py",
+  "guards": "a module with authority code is in the matrix tables",
+  "reach": [
+   "new module"
+  ],
+  "one_process": true
+ },
+ {
+  "class": "TestAgentRegistryInventory",
+  "file": "tests/switchboard/test_cases_11.py",
+  "guards": "a new module is in the agent registry inventory",
+  "reach": [
+   "new module"
+  ],
+  "one_process": true
+ },
+ {
+  "class": "TestRecordJsonReaders",
+  "file": "tests/switchboard/test_cases_10.py",
+  "guards": "every reader of a JSON text uses the shared bounded parse",
+  "reach": [
+   "new module",
+   "new command"
+  ],
+  "one_process": true
+ },
+ {
+  "class": "TestRecordingCommands",
+  "file": "bin/test-switchboard",
+  "guards": "a command that records is declared as recording",
+  "reach": [
+   "new module",
+   "new command"
+  ],
+  "one_process": false
+ },
+ {
+  "class": "TestDerivedClosure",
+  "file": "tests/switchboard/test_closure.py",
+  "guards": "the closure derived from the imports equals the listed one",
+  "reach": [
+   "new module"
+  ],
+  "one_process": false
+ },
+ {
+  "class": "TestTheReaperOnlyInstallOnMacOS",
+  "file": "bin/test-switchboard",
+  "guards": "the reaper-only install on macOS",
+  "reach": [
+   "new module"
+  ],
+  "one_process": false
+ },
+ {
+  "class": "TestTheReaperOnlyInstallOnLinux",
+  "file": "bin/test-switchboard",
+  "guards": "the reaper-only install on Linux",
+  "reach": [
+   "new module"
+  ],
+  "one_process": false
+ },
+ {
+  "class": "TestEveryTestFileIsWired",
+  "file": "tests/switchboard/test_wired_tests.py",
+  "guards": "every test file is loaded by bin/test-switchboard",
+  "reach": [
+   "new test file",
+   "new test class"
+  ],
+  "one_process": false
+ }
+]

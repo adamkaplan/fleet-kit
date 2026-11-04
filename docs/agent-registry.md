@@ -179,6 +179,8 @@ Such a row is **alive** or **unknown**, never dead. The liveness check (`bin/end
 
 A charter's `pane:` line may read `cloud:<agent name>`. `fleet-doctor` reports such a charter live when the row's endpoint answers and unknown when it does not, never as a dead pane. A local agent with a pane is judged as before.
 
+A charter's `pane:` line may also read `host:<hostname>/<agent>` (ask #1984): `bin/host_liveness.py` judges it by the named host's list of agents, alive when the agent is on the list, dead when the host answered and the agent is absent, and unreachable (neither alive nor dead, reported as unknown) when the host could not be asked.
+
 ## One dead verdict: `registry.shows_dead` (#1668)
 
 - **One function.** `registry.shows_dead(row, evidence)` is the one function that says whether the evidence shows a row dead. `reconcile_remove` (the registry's backstop) and `reconcile_on_read` (the view, through the loaded registry module) both call it; no other function of `bin/registry.py`, `bin/agent_reconcile.py` or `bin/fleet-switchboard` tests the evidence keys for death, and a test derived from the code counts it.

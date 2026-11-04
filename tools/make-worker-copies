@@ -1,0 +1,116 @@
+#!/usr/bin/env python3
+"""Make every worker copy from its source (ask #1928). No argument; idempotent.
+
+The rows are in cloud/worker/copies.tsv: source<TAB>copy, both relative to the repository root. A copy is rewritten only when its bytes
+differ from its source. A source is never changed and no file is deleted. When a source is missing the command prints ONE line naming
+the source and the copy it feeds, changes no file and exits 1. It prints paths and counts only, never file contents."""
+import os
+import sys
+
+TABLE = os.path.join("cloud", "worker", "copies.tsv")
+PATH_LIMIT = 1024  # characters in one path of the table; a longer path is refused
+
+
+class BadRow(Exception):
+    pass
+
+
+def parse_row(n, line):
+    if line.startswith("#"):
+        raise BadRow("row %d: a line that begins with # is not a row" % n)
+    fields = line.split("\t")
+    if len(fields) != 2:
+        raise BadRow("row %d: a row needs exactly two fields separated by one tab" % n)
+    for path in fields:
+        if not path or path != path.strip():
+            raise BadRow("row %d: a path is empty or has a space at its start or end" % n)
+        if path.startswith("/"):
+            raise BadRow("row %d: a path must not begin with /" % n)
+    source, copy = fields
+    for path in fields:
+        if len(path) > PATH_LIMIT:
+            raise BadRow("row %d: a path is longer than %d characters" % (n, PATH_LIMIT))
+    if ".." in source.split("/"):
+        raise BadRow("row %d: the source climbs out of the repository root" % n)
+    if not copy.startswith("cloud/worker/") or ".." in copy.split("/"):
+        raise BadRow("row %d: the copy must be under cloud/worker/ and must not climb out of it" % n)
+    for path in fields:
+        if os.path.normpath(path) != path or path.endswith("/"):
+            raise BadRow("row %d: a path is not in its plain form (no ./, no //, no trailing /)" % n)
+    return source, copy
+
+
+def inside(root, rel, sub):
+    """True when the REAL PATH of root/rel is under the real path of root/sub (links are followed)."""
+    base = os.path.realpath(os.path.join(root, sub))
+    real = os.path.realpath(os.path.join(root, rel))
+    return real == base or real.startswith(base + os.sep)
+
+
+def read_rows(root):
+    with open(os.path.join(root, TABLE), "rb") as f:
+        raw = f.read()
+    rows = []
+    for n, bline in enumerate(raw.split(b"\n"), 1):
+        if not bline:
+            continue
+        try:
+            line = bline.decode("utf-8")
+        except UnicodeDecodeError:
+            raise BadRow("row %d: the row is not valid UTF-8" % n)
+        if len(line) > 2 * PATH_LIMIT + 1:
+            raise BadRow("row %d: a path is longer than %d characters" % (n, PATH_LIMIT))
+        rows.append((n,) + parse_row(n, line))
+    for n, source, copy in rows:
+        try:
+            if not inside(root, source, "."):
+                raise BadRow("row %d: a symlink led out of the repository: %s" % (n, source))
+            if not inside(root, copy, os.path.join("cloud", "worker")):
+                raise BadRow("row %d: a symlink led out of cloud/worker: %s" % (n, copy))
+        except (OSError, ValueError):
+            raise BadRow("row %d: a path cannot be resolved" % n)
+    sources = {s for _, s, _ in rows}
+    seen = set()
+    for n, source, copy in rows:
+        if copy in sources:
+            raise BadRow("row %d: the copy is the source of another row" % n)
+        if copy in seen:
+            raise BadRow("row %d: the copy repeats in another row" % n)
+        seen.add(copy)
+        if not os.path.isfile(os.path.join(root, source)) and os.path.exists(os.path.join(root, source)):
+            raise BadRow("row %d: the source is not a file" % n)
+    return [(s, c) for _, s, c in rows]
+
+
+def read_bytes(path):
+    with open(path, "rb") as f:
+        return f.read()
+
+
+def run(root, out):
+    try:
+        rows = read_rows(root)
+    except BadRow as e:
+        print(str(e), file=out)
+        return 2
+    for source, copy in rows:
+        if not os.path.isfile(os.path.join(root, source)):
+            print("missing source %s for the copy %s" % (source, copy), file=out)
+            return 1
+    changed = 0
+    for source, copy in rows:
+        data = read_bytes(os.path.join(root, source))
+        target = os.path.join(root, copy)
+        if os.path.isfile(target) and read_bytes(target) == data:
+            continue
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        with open(target, "wb") as f:
+            f.write(data)
+        print("copied %s to %s" % (source, copy), file=out)
+        changed += 1
+    print("%d changed" % changed, file=out)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(run(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), sys.stdout))
