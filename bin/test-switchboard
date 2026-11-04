@@ -15922,6 +15922,36 @@ class TestAgentDefinitions(unittest.TestCase):
                 for phrase in COS_ONLY_MAXIMS:
                     self.assertEqual(phrase in block, role == "chief-of-staff", phrase)
 
+    # the one maxim the two chief-of-staff copies word under different names today (reported on PR #2107, not edited here)
+    DIVERGENT_COS_MAXIMS = ("**The last message stands alone.**", "**A news message stands alone.**")
+
+    def maxim_name_problems(self, copies):
+        """copies: {file label: text}. Per role, every copy carries the same `- **Name.**` maxim lines; returns messages naming the file that misses one."""
+        by_role = {}
+        for label, text in copies.items():
+            role = "orchestrator" if label.startswith("cloud/") else role_of(REPO / label)
+            names = set(re.findall(r"^- (\*\*[^*\n]+\.\*\*)", maxims_block(text), re.M)) - set(self.DIVERGENT_COS_MAXIMS)
+            by_role.setdefault(role, {})[label] = names
+        problems = []
+        for role, group in by_role.items():
+            union = set().union(*group.values())
+            for label, names in sorted(group.items()):
+                if union - names:
+                    problems.append("%s misses %s" % (label, sorted(union - names)))
+        return problems
+
+    def test_every_definition_and_cloud_copy_carries_the_same_maxim_lines_per_role(self):
+        labels = [str(p.relative_to(REPO)) for p in AGENT_FILES] + ["cloud/worker/agents/orchestrator.md", "cloud/worker/tests/golden/orchestrator.md"]
+        self.assertEqual(len(labels), 10)
+        copies = {label: (REPO / label).read_text() for label in labels}
+        self.assertEqual(self.maxim_name_problems(copies), [])
+        planted = dict(copies)
+        victim = "cloud/worker/tests/golden/orchestrator.md"
+        planted[victim] = planted[victim].replace("- **Festina lente.**", "- Festina lente.", 1)
+        problems = self.maxim_name_problems(planted)
+        self.assertEqual(len(problems), 1)
+        self.assertIn(victim, problems[0])
+
     def test_the_maxims_come_before_the_rest_of_the_body(self):
         for path in AGENT_FILES:
             with self.subTest(file=path.name):
