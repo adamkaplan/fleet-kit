@@ -76,6 +76,7 @@ cloud/worker/tests/test_base_merge_base.py
 cloud/worker/tests/test_cloud_prepush.py
 cloud/worker/tests/test_cloud_prepush_background.py
 cloud/worker/tests/test_cloud_prepush_hardening.py
+cloud/worker/tests/test_comment_by_id.py
 cloud/worker/tests/test_cw_gh_comments.py
 cloud/worker/tests/test_dockerfile_agent.py
 cloud/worker/tests/test_dockerfile_node.py
