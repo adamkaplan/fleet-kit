@@ -28,6 +28,7 @@ class TestTheBinSetClassesAreAllInTheTable(unittest.TestCase):
         "TestAdoption": "reads every module's text for the adoption words, and passed with a planted unlisted module",
         "TestEveryViewDerivesFromTheRegistry": "lists bin/ for the views a command registers, and passed with a planted unlisted module",
         "TestAssembler": "copies the sibling modules the entry loads into a fixture, and passed with a planted unlisted module",
+        "TestClaimLegacy": "copies the modules of bin/ into a fixture tree for the source-copy mutants of the claim-ledger rule, and passed with a planted unlisted module",
         "TestOwnMarkerNotHonoured": "reads every module's text for the marker, and passed with a planted unlisted module",
         "TestLatestRunOfWorkflow": "copies the bin/ files into a fixture tree, and passed with a planted unlisted module",
         "TestArchTools": "copies the sibling modules into a fixture tree for the architecture tools, and passed with a planted unlisted module",
@@ -43,7 +44,14 @@ class TestTheBinSetClassesAreAllInTheTable(unittest.TestCase):
     def reading_classes(cls, name, text):
         """{class name} of the top-level classes of `text` whose source lists the bin/ directory's files."""
         tree = ast.parse(text)
-        return {n.name for n in tree.body if isinstance(n, ast.ClassDef) and n.name != cls.__name__ and (cls.READS.search(ast.get_source_segment(text, n) or "") or cls.READS_MORE.search(ast.get_source_segment(text, n) or ""))}
+        lines = ast._splitlines_no_ff(text)   # split once: ast.get_source_segment re-splits the whole text on every call (same segment)
+
+        def segment(n):
+            first, last = n.lineno - 1, n.end_lineno - 1
+            if first == last:
+                return lines[first].encode()[n.col_offset:n.end_col_offset].decode()
+            return lines[first].encode()[n.col_offset:].decode() + "".join(lines[first + 1:last]) + lines[last].encode()[:n.end_col_offset].decode()
+        return {n.name for n in tree.body if isinstance(n, ast.ClassDef) and n.name != cls.__name__ and (cls.READS.search(segment(n)) or cls.READS_MORE.search(segment(n)))}
 
     @classmethod
     def derived(cls):

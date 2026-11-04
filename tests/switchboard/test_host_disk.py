@@ -1,5 +1,6 @@
 """#2081: no switchboard test reads the free disk of the host it runs on (S2 to S5, U1). World is set by bin/test-switchboard after the import."""
 import importlib.util
+import io
 import os
 import re
 import shutil
@@ -128,16 +129,34 @@ class TestHostDisk(unittest.TestCase):
         self.assertEqual((result.failures, result.errors), ([], []))
         self.assertEqual(seen, {"quiet": (0, 0), "control": (1, 1)})
 
-    def test_the_named_group_passes_with_the_host_at_5_gb(self):   # S3
+    def _site_env(self):
         site = case_tmp()
         Path(site, "sitecustomize.py").write_text("import shutil\n_u = shutil._ntuple_diskusage(1000 * 10 ** 9, 995 * 10 ** 9, 5 * 10 ** 9)\nshutil.disk_usage = lambda path: _u\n")
-        env = dict(os.environ, PYTHONPATH=site + os.pathsep + os.environ.get("PYTHONPATH", ""), FLEET_HEAVY="off")
-        done = subprocess.run([sys.executable, str(BIN / "test-switchboard")] + list(NAMED), env=env, capture_output=True, text=True, timeout=840)
+        return dict(PYTHONPATH=site + os.pathsep + os.environ.get("PYTHONPATH", ""), FLEET_HEAVY="off")
+
+    def _child(self, names):
+        done = subprocess.run([sys.executable, str(BIN / "test-switchboard")] + list(names), env=dict(os.environ, **self._site_env()), capture_output=True, text=True, timeout=840)
         out = done.stdout + done.stderr
         ran = re.findall(r"^Ran (\d+) tests? in ", out, re.M)
         self.assertEqual(len(ran), 1, out[-400:])
         self.assertGreater(int(ran[0]), 0, out[-400:])
-        verdict = re.findall(r"^(OK|FAILED)\b.*$", out, re.M)
-        self.assertEqual(verdict[-1:], ["OK"], out[-400:])   # "OK (skipped=N)" or "FAILED (failures=N)"
+        self.assertEqual(re.findall(r"^(OK|FAILED)\b.*$", out, re.M)[-1:], ["OK"], out[-400:])
         self.assertEqual(done.returncode, 0, out[-400:])
 
+    def test_the_named_group_passes_with_the_host_at_5_gb(self):   # S3
+        runner = sys.modules["__main__"]
+        if not all(hasattr(runner, n) for n in NAMED):   # another loader: one child for the whole group
+            return self._child(NAMED)
+        suite = unittest.TestSuite(unittest.TestLoader().loadTestsFromTestCase(getattr(runner, n)) for n in NAMED)
+        stream = io.StringIO()
+        # env patched too, so every child the classes start inherits the 5 GB fake and FLEET_HEAVY=off
+        with mock.patch.object(shutil, "disk_usage", lambda path: SMALL), mock.patch.dict(os.environ, self._site_env()):
+            result = unittest.TextTestRunner(stream=stream, verbosity=0).run(suite)
+        out = stream.getvalue()
+        self.assertGreater(result.testsRun, 0, out[-400:])
+        self.assertEqual((result.failures, result.errors), ([], []), out[-400:])
+        self.assertTrue(result.wasSuccessful(), out[-400:])
+        self.assertRegex(out, r"(?m)^OK\b")
+
+    def test_the_command_line_path_with_the_host_at_5_gb(self):   # S3: argv, one "Ran N", OK, exit 0
+        self._child(("TestDecorationIsAFact",))
