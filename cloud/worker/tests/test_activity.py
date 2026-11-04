@@ -145,6 +145,26 @@ class Activity(unittest.TestCase):
         self.assertIs(self.busy(gone), False)
         self.assertIs(self.busy(gone, "busy-forever"), True)
 
+    def has_child(self, procs):
+        sys.path.insert(0, os.path.dirname(SCRIPT))
+        try:
+            import activity
+        finally:
+            sys.path.pop(0)
+        return activity.has_live_child(self.tree(procs))
+
+    def test_a_child_in_another_subtree_of_pid_1_counts(self):
+        me = os.getpid()
+        self.assertIs(self.has_child({1: ("S", 0), 60: ("S", 1), me: ("S", 60), 70: ("S", 1)}), True)
+
+    def test_a_process_in_the_tools_own_call_subtree_does_not_count(self):
+        me = os.getpid()
+        self.assertIs(self.has_child({1: ("S", 0), 60: ("S", 1), me: ("S", 60), 61: ("S", 60), 62: ("S", 61)}), False)
+
+    def test_a_tool_outside_pid_1_counts_every_descendant(self):
+        me = os.getpid()
+        self.assertIs(self.has_child({1: ("S", 0), me: ("S", 0), 70: ("S", 1)}), True)
+
     def test_mutant_without_the_child_check_fails_the_long_command_case(self):
         with open(SCRIPT) as f:
             real = f.read()

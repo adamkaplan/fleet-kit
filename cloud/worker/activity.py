@@ -62,8 +62,9 @@ def _pid1_is_the_agent(proc):
 
 
 def has_live_child(proc=None):
-    """True when a live process descends from pid 1 (the agent AND its headless server, one process) other than pid 1,
-    the process running this tool and its own ancestors back to pid 1 (the tool call that started it); zombies do not
+    """True when a live process descends from pid 1 (the agent AND its headless server, one process) other than pid 1
+    and the whole subtree of the tool's call root (the tool's ancestor whose parent is pid 1; none when the tool runs outside
+    pid 1, as under kubectl exec, so nothing is excluded); zombies do not
     count. Never raises: any read error means no child."""
     try:
         proc = proc or _proc_root()
@@ -77,19 +78,23 @@ def has_live_child(proc=None):
                     state[int(name)], ppid[int(name)] = _stat(proc, name)
                 except (OSError, ValueError, IndexError):
                     pass
-        own = set()
+        call_root = None
         pid = os.getpid()
-        while pid > 1 and pid in ppid and pid not in own:
-            own.add(pid)
+        seen = set()
+        while pid in ppid and pid not in seen:
+            seen.add(pid)
+            if ppid[pid] == 1:
+                call_root = pid
+                break
             pid = ppid[pid]
         for pid, parent in ppid.items():
-            if pid == 1 or pid in own or state[pid] in ("Z", "X"):
+            if pid == 1 or state[pid] in ("Z", "X"):
                 continue
-            seen = set()
-            while parent > 1 and parent in ppid and parent not in seen:
-                seen.add(parent)
+            chain = {pid}
+            while parent > 1 and parent in ppid and parent not in chain:
+                chain.add(parent)
                 parent = ppid[parent]
-            if parent == 1:
+            if parent == 1 and call_root not in chain:
                 return True
         return False
     except Exception:
