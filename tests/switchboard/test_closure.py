@@ -21,6 +21,7 @@ import unittest.mock
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
+from support.paths import load_matrix   # noqa: E402
 TOOL = REPO / "tools" / "derive-closure"
 MATRIX = "docs/review-laws/impact-matrix.json"
 PARTS = "bin/switchboard/"
@@ -52,7 +53,7 @@ def clear():
 
 
 def rule_of(root=REPO):
-    return json.loads((Path(root) / MATRIX).read_text())["owner_hold"]["delegated_clear"]
+    return load_matrix(Path(root) / MATRIX)["owner_hold"]["delegated_clear"]
 
 
 def fixture():

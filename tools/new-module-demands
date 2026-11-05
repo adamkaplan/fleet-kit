@@ -165,8 +165,7 @@ def main(argv):
             print("new-module-demands: %s cannot be read as a python file" % path)
             return 2
     guards = load_by_path(os.path.join(ROOT, "bin", "path_suites.py"), "path_suites_for_demands").NEW_BIN_GUARDS
-    with open(os.path.join(ROOT, MATRIX), encoding="utf-8") as handle:
-        matrix = json.load(handle)
+    matrix = load_by_path(os.path.join(ROOT, "bin", "impact_floor.py"), "impact_floor_for_demands").load_matrix(os.path.join(ROOT, MATRIX))   # the ONE matrix loader: the JSON plus its entry files (#2206 part 3)
     with open(os.path.join(ROOT, "docs", "architecture.md"), encoding="utf-8") as handle:
         units_text = handle.read()
     closure = closure_state()

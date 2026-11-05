@@ -34147,7 +34147,7 @@ class TestImpactClassAndNarrowForm(LedgerBase):
 
     def matrix_copy(self, edit):
         impact_floor = sb.load_impact_floor()
-        matrix = json.loads(impact_floor.MATRIX_PATH.read_text())
+        matrix = impact_floor.load_matrix()
         edit(matrix["owner_hold"])
         path = self.world.state / "matrix-copy.json"
         path.write_text(json.dumps(matrix))
@@ -34873,7 +34873,7 @@ class TestAgentBlockCounts(TestBlockTable):
         self.assertEqual(code, 0, err)
         self.assertEqual(self.state_files(), before)
         printed = json.loads(out)
-        file = json.loads((REPO / "docs" / "review-laws" / "impact-matrix.json").read_text())
+        file = sb.load_impact_floor().load_matrix(REPO / "docs" / "review-laws" / "impact-matrix.json")
         for severity, row in file["cells"].items():
             for probability, cell in row.items():
                 self.assertEqual(printed["cells"][severity][probability], cell, (severity, probability))
@@ -34896,7 +34896,7 @@ class TestAgentBlockCounts(TestBlockTable):
         self.assertEqual(code, 0, err)
         printed = json.loads(out)["for_rater"]
         report = json.loads(self.run_as("coder", "impact", "floor", self.PR, "--json")[1])
-        rules = json.loads((REPO / "docs" / "review-laws" / "impact-matrix.json").read_text())["owner_hold"]["delegated_clear"]["score"]["floor"]["rules"]
+        rules = sb.load_impact_floor().load_matrix(REPO / "docs" / "review-laws" / "impact-matrix.json")["owner_hold"]["delegated_clear"]["score"]["floor"]["rules"]
         expected = {rule_id: sorted(report["top_tier_hits"][cls]) for rule_id, cls in rules.items() if report["top_tier_hits"].get(cls)}
         self.assertTrue(expected, "the fixture changes a floor path")
         self.assertEqual(printed["floor_hits"], expected)
@@ -35331,7 +35331,7 @@ class TestWholeRead(LedgerBase):
 
     def test_s11_the_matrix_words_name_every_floor_rule_and_the_checkout_writes_them(self):
         words = "\n".join(sb.impact_matrix_lines(sb.impact_matrix_words()))
-        file = json.loads((REPO / "docs" / "review-laws" / "impact-matrix.json").read_text())
+        file = sb.load_impact_floor().load_matrix(REPO / "docs" / "review-laws" / "impact-matrix.json")
         rules = file["owner_hold"]["delegated_clear"]["score"]["floor"]["rules"]
         self.assertEqual(sum(1 for line in words.splitlines() if line.startswith("floor rule ")), len(rules), "one line per rule the matrix file holds")
         for rule in ("floor-credentials", "floor-identity", "floor-authority"):

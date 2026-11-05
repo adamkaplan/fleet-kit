@@ -1044,7 +1044,7 @@ class TestConflictCarry(unittest.TestCase):
     def test_the_table_is_the_clear_code_the_matrix_names_and_every_clear_or_hold_module(self):
         table = set(sb.impact_floor.carry_never_paths())
         root = Path(sb.__file__).resolve().parent.parent
-        matrix = json.loads((root / "docs/review-laws/impact-matrix.json").read_text())
+        matrix = sb.impact_floor.load_matrix(root / "docs/review-laws/impact-matrix.json")
         listed = set(matrix["owner_hold"]["delegated_clear"]["clear_code_paths"]) if "owner_hold" in matrix else set(matrix["delegated_clear"]["clear_code_paths"])
         self.assertEqual(sorted(table - listed), [], "every protected path is one the matrix lists as the clear's own code")
         exact = {x for x in listed if "*" not in x}

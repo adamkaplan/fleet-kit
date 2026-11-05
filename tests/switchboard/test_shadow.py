@@ -33,7 +33,7 @@ def load(name, path):
     return module
 
 
-RULE = json.loads((REPO / "docs/review-laws/impact-matrix.json").read_text())["owner_hold"]["delegated_clear"]
+RULE = impact_floor.load_matrix(REPO / "docs/review-laws/impact-matrix.json")["owner_hold"]["delegated_clear"]
 BASE = "import os\n\n\ndef keep(a):\n    return a\n"
 NAME = "boss_name"
 
