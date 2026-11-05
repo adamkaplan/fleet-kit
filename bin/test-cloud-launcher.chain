@@ -67,6 +67,7 @@ cloud/launcher/tests/test_pod_requests.py
 cloud/launcher/tests/test_pod_state.py
 cloud/launcher/tests/test_preflight.py
 cloud/launcher/tests/test_preflight_repo_read.py
+cloud/launcher/tests/test_preflight_step.py
 cloud/launcher/tests/test_probe_redirect.py
 cloud/launcher/tests/test_read_retired_last_message.py
 cloud/launcher/tests/test_reap_concurrent.py
