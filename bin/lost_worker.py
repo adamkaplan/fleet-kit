@@ -162,6 +162,10 @@ def _fold(state, sb, lines, source):
                     stop[name] = max(ts, stop.get(name, 0))
                 elif action == "report":
                     report[name] = max(ts, report.get(name, 0))
+    while stop and max(len(created), len(stop)) > SEEN_MAX:   # a stopped worker leaves both tables together, before any worker with no stop (#2164)
+        gone = min(stop, key=lambda k: stop[k])
+        stop.pop(gone)
+        created.pop(gone, None)
     for table in ("created", "stop", "report", "refused"):
         data = state.get(table, {})
         while len(data) > SEEN_MAX:

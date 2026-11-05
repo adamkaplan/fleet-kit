@@ -10,13 +10,11 @@ secret value is read once from an inherited descriptor and goes to kubectl's std
 """
 import argparse
 import base64
-import bisect
 import copy
 import fcntl
 import datetime as dt
 import pwd
 import hashlib
-import heapq
 import json
 import os
 import re
@@ -806,170 +804,61 @@ def _scrub_built(secrets_known):
 
 
 class _ScrubSpans:
-    """The text under redaction: the original string and a sorted list of spans [a, b) of it that now show `disp` (a marker,
-    or a marker with the rest of an earlier one). A position is a key (p, off): the original character p, or the character
-    `off` of the display of the span that starts at p. One edit costs the edit, never a copy of the text."""
+    """The matches of the known secrets on the text (ask #2144, one pass): for each secret, only at the positions that hold a piece of
+    it, its whole occurrences and its runs (the longest piece of it that starts there) are kept as intervals [a, b) of the ORIGINAL
+    text. The overlapping intervals are merged and the merged ones are redacted in the same walk: no later rescan, so no piece of a
+    secret is left as the tail of an overlap, and a character outside every match is never touched."""
 
     def __init__(self, text, order, index, cand):
-        self.text, self.n, self.order, self.index, self.cand = text, len(text), order, index, cand
-        self.sa, self.sb, self.sd = [], [], []
-        self.rh, self.inq = sorted(cand), set(cand)  # a sorted list is a heap
-        self.cur, self.ptr, self.heap = -1, (-1, 0), []
+        self.text, self.order, self.index, self.cand = text, order, index, cand
+        self.found = []
 
-    def read(self, key, want):
-        """Up to `want` characters of the current text from `key`; None when `key` is not a character of it."""
-        p, off = key
-        sa, sb, sd = self.sa, self.sb, self.sd
-        k = bisect.bisect_left(sa, p)
-        parts = []
-        if k < len(sa) and sa[k] == p:
-            disp = sd[k]
-            if off >= len(disp):
-                return None
-            piece = disp[off:off + want]
-            parts.append(piece)
-            want -= len(piece)
-            p = sb[k]
-            k += 1
-        elif off or (k and sb[k - 1] > p):
-            return None
-        while want > 0 and p < self.n:
-            e = sa[k] if k < len(sa) else self.n
-            piece = self.text[p:min(e, p + want)]
-            parts.append(piece)
-            want -= len(piece)
-            p += len(piece)
-            if want > 0 and k < len(sa):
-                piece = sd[k][:want]
-                parts.append(piece)
-                want -= len(piece)
-                p = sb[k]
-                k += 1
-            else:
-                break
-        return "".join(parts)
-
-    def advance(self, key, count):
-        """The key of the character `count` characters after `key`."""
-        p, off = key
-        sa, sb, sd = self.sa, self.sb, self.sd
-        k = bisect.bisect_left(sa, p)
-        if k < len(sa) and sa[k] == p:
-            if count < len(sd[k]) - off:
-                return (p, off + count)
-            count -= len(sd[k]) - off
-            p = sb[k]
-            k += 1
-        while True:
-            e = sa[k] if k < len(sa) else self.n
-            if count < e - p:
-                return (p + count, 0)
-            count -= e - p
-            p = e
-            if k >= len(sa):
-                return (self.n, 0)
-            if count < len(sd[k]):
-                return (p, count)
-            count -= len(sd[k])
-            p = sb[k]
-            k += 1
-
-    def prev(self, key):
-        p, off = key
-        if off:
-            return (p, off - 1)
-        k = bisect.bisect_left(self.sa, p) - 1
-        if k >= 0 and self.sb[k] == p:
-            return (self.sa[k], len(self.sd[k]) - 1)
-        return (p - 1, 0) if p else None
-
-    def add(self, rank, key):
-        if rank < self.cur:
-            return
-        c = self.cand.get(rank)
-        if c is None:
-            c = self.cand[rank] = set()
-        c.add(key)
-        if rank == self.cur:
-            if key >= self.ptr:
-                heapq.heappush(self.heap, key)
-        elif rank not in self.inq:
-            self.inq.add(rank)
-            heapq.heappush(self.rh, rank)
-
-    def write(self, start, end):
-        """Replace the characters from `start` to `end` by one marker, then look up the windows that overlap what was written."""
-        (p0, o0), (p1, o1) = start, end
-        sa = self.sa
-        k0 = bisect.bisect_left(sa, p0)
-        prefix = self.sd[k0][:o0] if k0 < len(sa) and sa[k0] == p0 else ""
-        k1 = bisect.bisect_left(sa, p1)
-        suffix, b = "", p1
-        if k1 < len(sa) and sa[k1] == p1 and o1 > 0:
-            suffix, b = self.sd[k1][o1:], self.sb[k1]
-            k1 += 1
-        sa[k0:k1], self.sb[k0:k1], self.sd[k0:k1] = [p0], [b], [prefix + _SCRUB_MARK + suffix]
-        lp = len(prefix)
-        self.ptr = (p0, lp + len(_SCRUB_MARK)) if suffix else end
-        back, kk = [], (p0, lp)
-        for _ in range(MIN_FRAGMENT - 1):
-            kk = self.prev(kk)
-            if kk is None:
-                break
-            back.append(kk)
-        back.reverse()
-        keys = back + [(p0, lp + t) for t in range(len(_SCRUB_MARK) + len(suffix))]
-        ctx = self.read(keys[0], len(keys) + MIN_FRAGMENT - 1)
-        for t, key in enumerate(keys):
-            window = ctx[t:t + MIN_FRAGMENT]
-            if len(window) == MIN_FRAGMENT:
-                for rank in self.index.get(window, ()):
-                    self.add(rank, key)
-
-    def sweep(self, rank, whole, sec):
+    def sweep(self, sec, whole, positions):
         """One pass over the candidate positions of one secret: its whole occurrences `whole`, or (None) its runs."""
-        self.heap = heap = list(self.cand.get(rank, ()))
-        heapq.heapify(heap)
-        self.ptr = (-1, 0)
-        while heap:
-            key = heapq.heappop(heap)
-            if key < self.ptr:
+        text, found = self.text, self.found
+        ptr = -1
+        for i in positions:
+            if i < ptr:
                 continue
             if whole is not None:
-                if self.read(key, len(whole)) != whole:
+                if not text.startswith(whole, i):
                     continue
-                end = self.advance(key, len(whole))
+                end = i + len(whole)
             else:
-                head = self.read(key, MIN_FRAGMENT)
-                if head is None or len(head) < MIN_FRAGMENT or head not in sec:
+                if text[i:i + MIN_FRAGMENT] not in sec:
                     continue
-                lo = len(self.read(key, len(sec)))
-                if self.read(key, lo) not in sec:  # a piece of a piece is a piece: the longest one is found by halving
+                lo = min(len(sec), len(text) - i)
+                if text[i:i + lo] not in sec:  # a piece of a piece is a piece: the longest one is found by halving
                     low, hi = MIN_FRAGMENT, lo - 1
                     while low < hi:
                         mid = (low + hi + 1) // 2
-                        if self.read(key, mid) in sec:
+                        if text[i:i + mid] in sec:
                             low = mid
                         else:
                             hi = mid - 1
                     lo = low
-                end = self.advance(key, lo)
-            self.write(key, end)
+                end = i + lo
+            found.append((i, end))
+            ptr = end
 
     def run(self):
-        while self.rh:
-            rank = heapq.heappop(self.rh)
-            self.inq.discard(rank)
-            self.cur = rank
+        for rank in sorted(self.cand):
             sec = self.order[rank]
+            positions = sorted(self.cand[rank])
             for whole in {sec, sec.strip()}:
-                self.sweep(rank, whole, sec)
-            self.sweep(rank, None, sec)
-            self.cand.pop(rank, None)
+                self.sweep(sec, whole, positions)
+            self.sweep(sec, None, positions)
+        merged = []  # the matches with the overlapping and the touching ones merged
+        for a, b in sorted(self.found):
+            if merged and a <= merged[-1][1]:
+                if b > merged[-1][1]:
+                    merged[-1][1] = b
+            else:
+                merged.append([a, b])
         parts, pos = [], 0
-        for a, b, disp in zip(self.sa, self.sb, self.sd):
+        for a, b in merged:
             parts.append(self.text[pos:a])
-            parts.append(disp)
+            parts.append(_SCRUB_MARK)
             pos = b
         parts.append(self.text[pos:])
         return "".join(parts)
@@ -984,10 +873,12 @@ def _scrub_secrets(text, secrets_known):
     for i in range(len(text) - MIN_FRAGMENT + 1):
         for rank in get(text[i:i + MIN_FRAGMENT], ()):
             if rank in cand:
-                cand[rank].add((i, 0))
+                cand[rank].add(i)
             else:
-                cand[rank] = {(i, 0)}
-    return _ScrubSpans(text, order, index, cand).run() if cand else text
+                cand[rank] = {i}
+    if not cand:
+        return text
+    return _ScrubSpans(text, order, index, cand).run()
 
 
 def scrub(text, secrets_known=(), limit=300):
@@ -1012,6 +903,28 @@ def _json_strings(node, out):
     elif isinstance(node, list):
         for v in node:
             _json_strings(v, out)
+
+
+SECRET_PIECE_MIN = 8
+TOKEN_PREFIXES = ("github_pat_", "ghp_", "gho_", "ghu_", "ghs_", "ghr_", "sk-ant-", "sk-proj-", "sk-", "xoxb-", "xoxp-", "glpat-")
+
+
+def _secret_pieces(value):
+    """The usable pieces of a structured value, each of SECRET_PIECE_MIN+ characters (ask #2144): for a URL with a password, the
+    password and user:password; for a token with a known prefix, the part after it; for a multi-line key, each line of 16+ characters."""
+    v, out = value.strip(), set()
+    m = re.match(r"^[A-Za-z][A-Za-z0-9+.-]*://([^/?#@]*)@", v)
+    if m and ":" in m.group(1):
+        userinfo = m.group(1)
+        out.update({userinfo, userinfo.partition(":")[2], urllib.parse.unquote(userinfo), urllib.parse.unquote(userinfo.partition(":")[2])})
+    for pre in TOKEN_PREFIXES:
+        if v.startswith(pre):
+            out.add(v[len(pre):])
+            break
+    lines = [x.strip() for x in v.splitlines()]
+    if len(lines) > 1:
+        out.update(x for x in lines if len(x) >= 16)
+    return {x for x in out if len(x) >= SECRET_PIECE_MIN and x != value and x != v}
 
 
 def secret_forms(value):
@@ -1048,6 +961,8 @@ def secret_forms(value):
         hx = raw.hex()
         forms.update({hx, hx.upper(), urllib.parse.quote(t, safe=""), urllib.parse.quote_plus(t), urllib.parse.quote(t),
                       json.dumps(t)[1:-1], json.dumps(t, ensure_ascii=False)[1:-1]})
+    for piece in _secret_pieces(value):
+        forms.update(secret_forms(piece))  # a piece is a form of the same value, with its own encodings
     return {f for f in forms if f}
 
 
@@ -2649,6 +2564,25 @@ def hub_on(env):
     return bool((env.get("CW_HUB_CHANNEL_URL") or "").strip() or (env.get("CW_HUB_REGISTRY_SECRET") or "").strip())
 
 
+REVIEW_COMMENTS = os.path.join(os.path.dirname(os.path.realpath(__file__)), "repo-review-comments.json")   # optional; absent = no comment anywhere
+
+
+def review_comment(repo, path=None):
+    """The review comment configured for repo (a JSON object beside this file: lowercased OWNER/NAME -> one-line text, at most 500 characters), or ''.
+    Optional per repository: a missing, unreadable or malformed file, a missing key or a bad value gives '' (no comment is posted). Never raises."""
+    try:
+        with open(path or REVIEW_COMMENTS, "rb") as f:
+            raw = f.read(65537)
+        data = json.loads(raw) if len(raw) <= 65536 else {}
+        v = data.get(str(repo).lower()) if isinstance(data, dict) else None
+        if isinstance(v, str) and v.strip() and len(v) <= 500 and not re.search("[\\x00-\\x1f\\x7f-\\x9f]", v) \
+                and not any(p.search(v) for p in CREDENTIAL_PATTERNS):
+            return v.strip()
+    except Exception:
+        pass
+    return ""
+
+
 def render_pod(a, worker, name, now, hard, env, run_names=()):
     image = a.image or env.get("CW_CLOUD_IMAGE")
     if not image:
@@ -2663,6 +2597,9 @@ def render_pod(a, worker, name, now, hard, env, run_names=()):
          "CW_AUDIT_RUNTIME_ID": "pod/" + name}
     if endpoint:
         e["CW_TOKEN_ENDPOINT"] = endpoint
+    comment = review_comment(a.repo)
+    if comment:   # the repository's review comment, posted once by the end hook; none configured = no variable
+        e["CW_REVIEW_COMMENT"] = comment
     agent = getattr(a, "agent", None) or "worker"
     if agent not in AGENTS:
         raise CloudError("--agent must be one of %s, got %r; nothing was created" % (" or ".join(AGENTS), str(agent)[:40]), EXIT_USAGE)
@@ -3380,6 +3317,7 @@ class Launcher:
             raw = res.get("skipped")
             return {"pushed": bool(res.get("pushed")), "wip_branch": text(res.get("wip_branch"), 200) or None,
                     "head_on": text(res.get("head_on"), 100) or None,
+                    "pr_note": text(res.get("pr_note"), 120),
                     "skipped": [text(x, 200) for x in raw if isinstance(x, str)][:50] if isinstance(raw, list) else [],
                     "note": text(res.get("note")), "error": text(res.get("error")) or ("end hook gave an unreadable error" if res.get("error") else "")}
         except Exception:
@@ -3658,6 +3596,71 @@ class Launcher:
         if a.worker and not pods[0]:
             raise CloudError("unknown worker %s" % a.worker, EXIT_USAGE)
         return [self.record(p) for p in pods]
+
+    # -- inspect: ONE read-only look inside a running pod (slice 2 of ask #2115) --
+    def inspect(self, a):
+        """What the pod is doing NOW, read-only: ONE `kubectl exec` of the pod's `cw-pod-inspect` (one JSON line). A pod whose image has no such command
+        (or whose answer is not that line) is read by the fallback: git in /work/repo and `cw-worker-activity` through exec; every other field is listed in
+        `missing`. EVERY text is scrubbed here (Kube.scrub) before it is returned: nothing the pod printed leaves raw."""
+        if not NAME_RE.match(a.worker or ""):
+            raise CloudError("bad worker name %r" % a.worker, EXIT_USAGE)
+        name = pod_name(a.worker)
+        if not self.kube.get_pod(name):
+            raise CloudError("unknown worker %s" % a.worker, EXIT_USAGE)
+        try:
+            raw, source = json.loads(self.kube.exec(name, "cw-pod-inspect")), "cw-pod-inspect"
+            if not isinstance(raw, dict):
+                raise ValueError("not an object")
+        except (CloudError, ValueError):
+            raw, source = self._inspect_fallback(name), "fallback"
+        return self._inspect_clean(a.worker, raw, source)
+
+    def _inspect_fallback(self, name):
+        """The reads that need no helper in the image: git through exec for the branch, the unpushed commits and the dirty tree; the activity
+        tool for the idle seconds. What it cannot read is named in `missing`."""
+        def git(*args):
+            try:
+                return self.kube.exec(name, "git", "-C", "/work/repo", *args)
+            except CloudError:
+                return None
+        raw, missing = {}, []
+        branch = git("rev-parse", "--abbrev-ref", "HEAD")
+        raw["branch"] = branch.strip() if branch is not None and branch.strip() else None
+        shas = git("rev-list", "--max-count=50", "HEAD", "--not", "--remotes")
+        raw["unpushed"] = {"count": len(shas.split()), "shas": shas.split()[:10]} if shas is not None else None
+        dirty = git("status", "--porcelain")
+        raw["dirty"] = len([x for x in dirty.splitlines() if x.strip()]) if dirty is not None else None
+        act = self.activity(name)
+        raw["idle_seconds"] = (max(0, int((self.clock() - act[1]).total_seconds())) if act and not act[0] and act[1] else None)
+        raw["in_flight"], raw["last_calls"], raw["last_text"], raw["last_push"] = None, [], "", None
+        raw["missing"] = ["in_flight", "last_calls", "last_text", "last_push"] + [k for k in ("idle_seconds", "branch", "unpushed", "dirty") if raw.get(k) is None]
+        return raw
+
+    def _inspect_clean(self, worker, raw, source):
+        """The ONE shape that is printed. Every text is cut and scrubbed; a number is an int or None; a sha is hex or dropped."""
+        scrub_ = self.kube.scrub
+
+        def num(v):
+            return int(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+        def text(v, limit):
+            return scrub_(v, limit) if isinstance(v, str) else None
+        flight = raw.get("in_flight") if isinstance(raw.get("in_flight"), dict) else None
+        flight = {"tool": text(flight.get("tool"), 80) or "?", "seconds": num(flight.get("seconds"))} if flight else None
+        calls = [{"tool": text(c.get("tool"), 80) or "?", "status": text(c.get("status"), 40) or "?", "seconds_ago": num(c.get("seconds_ago"))}
+                 for c in (raw.get("last_calls") if isinstance(raw.get("last_calls"), list) else [])[:10] if isinstance(c, dict)]
+        un = raw.get("unpushed") if isinstance(raw.get("unpushed"), dict) else None
+        if un is not None:
+            shas = [s[:12] for s in (un.get("shas") if isinstance(un.get("shas"), list) else []) if isinstance(s, str) and re.fullmatch(r"[0-9a-f]{7,40}", s)][:10]
+            un = {"count": num(un.get("count")) or 0, "shas": shas}
+        bad = [c for c in calls if c["status"].lower() in ("error", "failed", "failure", "timeout", "aborted")]
+        last_error = "%s %s %ss ago" % (bad[0]["tool"], bad[0]["status"], bad[0]["seconds_ago"]) if bad else None
+        missing = [text(m, 40) for m in (raw.get("missing") if isinstance(raw.get("missing"), list) else []) if isinstance(m, str)][:20]
+        if source == "fallback" or last_error is None and "last_calls" in missing:
+            missing = missing + (["last_error"] if "last_error" not in missing else [])
+        return {"worker": worker, "source": source, "in_flight": flight, "last_calls": calls, "last_text": text(raw.get("last_text"), 300) or "",
+                "idle_seconds": num(raw.get("idle_seconds")), "branch": text(raw.get("branch"), 200), "unpushed": un, "dirty": num(raw.get("dirty")),
+                "last_push": text(raw.get("last_push"), 100), "last_error": last_error, "missing": missing}
 
     def snapshot(self, a):
         """ONE read-only look at the cluster: the pods of the namespace (name, worker, phase, node, hard deadline) and, when the login may
@@ -4738,6 +4741,7 @@ def build_parser():
     d.add_argument("--force", action="store_true")
     d.add_argument("--reason", default="")
     cmd("status")
+    cmd("inspect")   # ONE read-only look inside a running pod: the call in flight, the recent calls, git, the last push
     cmd("snapshot", worker=False)   # ONE read-only look at the cluster: the pods of the namespace and, when the login may list them, the nodes
     cmd("capacity", worker=False)   # ONE read-only look at room: the nodes' allocatable, the pods' requests, the Pending count, the last FailedScheduling line
     cmd("report")

@@ -5368,7 +5368,7 @@ class TestLaunch(StandInPids, Base):
         self.assertEqual(self.registered()[str(wt)]["agent"], "worker")
         self.assertFalse([e for e in self.world.audit() if e["event"] == "worktree.registered" and e["subject"] == "other2"])
         for n in range(sb.WORKTREE_RECLAIM_MAX + 2):    # the cap is said, not silent
-            sb.register_worktree(self.world.state, "/nonexistent/w%02d" % n, "worker", None, "b", 1)
+            sb.register_worktree(self.world.state, str(self.add_worktree("w-cap%02d" % n)), "worker", None, "w-cap%02d" % n, 1)
         lines = sb.reclaim_for_agent(self.world.new_engine("cli"), subprocess.run, "worker", True)
         self.assertTrue(any("handled (cap %d)" % sb.WORKTREE_RECLAIM_MAX in l for l in lines), lines)
 
@@ -13116,9 +13116,9 @@ class TestOneCharter(CharterRig, Base):
         # (CHECKED against the code below); set: asks only whether a number is a charter, never counts or names an owner
         ("bin/switchboard/work_moves.py", "guard"): "registry: the charter set guard, on the registry lock's own read",
         ("bin/impact_hold.py", "_lane_of_issue"): "registry: the lane lookup", ("bin/lanes.py", "charter_orchestrators"): "registry: move's lookup",
-        ("bin/fleet-switchboard", "adoption_heir"): "registry: the heir of an orphan", ("bin/fleet-switchboard", "plan_wake_route"): "registry: the orchestrator a plan wakes",
+        ("bin/fleet-switchboard", "adoption_heir"): "registry: the heir of an orphan", ("bin/switchboard/plan_notice.py", "plan_wake_route"): "registry: the orchestrator a plan wakes",
         ("bin/fleet-switchboard", "asks_of_caller"): "registry: the asks an agent is accountable for", ("bin/fleet-switchboard", "register_item_tester"): "registry: the launching orchestrator's charter gates a registration",
-        ("bin/fleet-switchboard", "load_tick"): "registry: an orchestrator's charter in the load figures", ("bin/fleet-switchboard", "worker_charter"): "registry: a worker's boss's charter (the worker's own is its launch context)",
+        ("bin/switchboard/heavy_budget.py", "load_tick"): "registry: an orchestrator's charter in the load figures", ("bin/fleet-switchboard", "worker_charter"): "registry: a worker's boss's charter (the worker's own is its launch context)",
         ("bin/fleet-switchboard", "charter_or_first_seen"): "registry: the row's charter, else the launch value of an agent with no row yet",
         ("bin/fleet-switchboard", "registry_retired_owners"): "registry: the charter a retired orchestrator's record kept",
         ("bin/registry.py", "orchestrator_charters"): "registry: the one reading", ("bin/registry.py", "duplicate_charters"): "registry: duplicates", ("bin/registry.py", "set_charter"): "writer: the audited setter",
@@ -17154,8 +17154,8 @@ class TestDecorationIsAFact(ActingCase):
     def test_the_source_is_registered_and_the_engine_has_no_second_way_to_write(self):
         self.assertIsNotNone(sb.foreground_source(self.world.engine))
         source = switchboard_source()
-        # the section runs on into the handoff part, where its closing marker now sits
-        section = (SWITCHBOARD.read_text().split("# PR 8: foreground and background", 1)[1].split("# ---- PR 13: workers report", 1)[0]
+        # the section runs on into the handoff part, where its closing marker now sits (S9: the PR 13 block that followed it moved to workers_report.py; the next marker in the entry is #96)
+        section = (SWITCHBOARD.read_text().split("# PR 8: foreground and background", 1)[1].split("# ---- #96: a worker.stopped that would wake", 1)[0]
                    + (BIN / "switchboard" / "handoff.py").read_text().split("# Worker events, reminders", 1)[0])
         for forbidden in ("v2.synthetic(", "v2.prompt(", "herdr.agent_prompt"):
             self.assertNotIn(forbidden, section.split("def launch_agent")[0], forbidden)
@@ -22723,7 +22723,8 @@ class TestSweep(Base):
         self.assertEqual(self.fact_problems(), [])
         self.assertEqual(self.fact_gaps(names, self.docs_fact_rows() - {"floor"}), ["floor"])   # a dropped row
         audit = Path(__file__).resolve().parent.parent.joinpath("docs", "switchboard.md").read_text().split("S5 fact audit: ", 1)[1]
-        self.assertEqual(audit.split(" ", 1)[0], str(len(names)))   # the figure in the docs is the computed one
+        self.assertTrue(audit.startswith("every fact key and argument"))   # the audit sentence is there, with no figure to go stale
+        self.assertTrue(names <= self.docs_fact_rows())   # the property: every fact the gates read has a row
 
     def test_986_a_new_fact_in_any_spelling_fails_the_completeness_test(self):
         for label, overrides in self.fact_mutants():
@@ -24955,7 +24956,7 @@ class TestIdentityCheck(ReportBase):
         self.assertEqual((done.returncode, seen["token"]), (0, "tok-bot"), done.stderr)
 
     def test_s6_a_worker_without_a_read_repository_is_untouched_by_the_guard(self):
-        for args in (("issue", "view", "5", "-R", "acme-org/other"), ("api", "graphql", "-f", "query=x"), ("issue", "comment", "5", "-R", "acme-org/other", "--body", "x")):
+        for args in (("issue", "view", "5", "-R", "acme-org/other"), ("api", "graphql", "-f", "query={viewer{login}}"), ("issue", "comment", "5", "-R", "acme-org/other", "--body", "x")):
             with self.subTest(args=args):
                 done, seen = self.run_gh_shim("acme-org/widget-service", self.READ_USERS, self.READ_TOKENS, args=args, own=True)
                 self.assertTrue(seen is not None and seen["argv"][0] == args[0], (done.returncode, done.stderr))
@@ -31188,7 +31189,15 @@ class TestFactsReadAtRunTime(TestCarriesLine):
             ("a plan that cannot be fetched", lambda: self.pr.update(body="PLAN: acme/app#99\ncanon: updated the docs")),
             ("a ready, held pull request with every scenario proven", lambda: (self.pr.update(body="PLAN: acme/app#7\ncanon: updated the docs", labels=[{"name": "merge-captain"}]), self.record(self.PR, self.HEAD, plan_ref="acme/app#7"))),
             ("the view is down", lambda: setattr(self, "gh_down", True)),
+            ("a held pull request whose impact floor says not held (G6 reads the findings of the held-PR check)", self.floor_not_held),
         )
+
+    def floor_not_held(self):
+        """A held pull request whose floor was read and says not held: the one state in which G6 reads `captain_findings`. Undone at the end of the test."""
+        self.pr.update(body="PLAN: acme/app#7\ncanon: updated the docs", labels=[{"name": "fleet:merge-captain"}])
+        patch = mock.patch.object(sb, "gate_floor_fact", lambda *a, **k: {"decision": "ok", "reasons": [], "cleared": False, "unreadable": None, "rehold": None})
+        patch.start()
+        self.addCleanup(patch.stop)
 
     @contextlib.contextmanager
     def proxied(self, mutant=None):
@@ -42245,6 +42254,7 @@ class TestLaunchRefusedMessage(TestLaunchMemoryGate):
         '--issue %r is not a whole numb': 'refused before any pod exists: it says nothing was created',
         'the cloud worker was not creat': 'the pod creation failed: no worker exists, so refused is right',
         'the brief line %r needs docker': 'refused before any pod exists: it says nothing was created',
+        '--boss-unregistered needs a re': 'refused before any pod exists: it says nothing was created',
     }
 
     def other_created_words(self, source):
@@ -62457,6 +62467,36 @@ class TestReviewRefusalNamesRule(TestReviewPostAndDismiss):
                         failed += 1
                 self.assertEqual(failed, 1, name)
 
+    def test_every_redaction_pattern_has_its_own_rule_name(self):   # U9
+        dash = "-" * 5
+        whole = "x\n" + dash + "BEGIN " + "PRIVATE" + " KEY" + dash + "\n" + "Q" * 12 + "\n" + dash + "END " + "PRIVATE" + " KEY" + dash + "\n"
+        marker = "x\n" + dash + "END " + "PRIVATE" + " KEY" + dash + "\n"
+
+        def check(ns):
+            names, table = ns["SECRET_RULE_NAMES"], ns["_SECRET_PATTERNS"]
+            self.assertEqual(len(names), len(table), "a redaction pattern has no rule name")
+            self.assertEqual(len(set(names)), len(names))
+            self.assertEqual(ns["find_secret_span"](whole)[0], "private-key-block")
+            self.assertEqual(ns["find_secret_span"](marker)[0], "private-key-marker")
+            return list(names), list(table)
+
+        names, table = check(vars(sb))
+        print("S9 control: every pattern has one unique rule name, and both key texts are named")
+        for added in ("private-key-block", "private-key-marker"):
+            self.assertIn(added, names)
+        self.assertEqual(len(names), len(table))
+        source = (Path(__file__).resolve().parent / "switchboard" / "secret_spans.py").read_text()
+        line = '"private-key-block", "private-key-marker", '
+        self.assertEqual(source.count(line), 1)
+        mutated = source.replace('"private-key-marker", ', "")
+        self.assertNotEqual(mutated, source)
+        ns = dict(vars(sb))
+        exec(compile(mutated, "scratch_secret_spans.py", "exec"), ns)
+        with self.assertRaises(AssertionError) as caught:
+            check(ns)
+        print("S9 mutant: applied, failed with: %s" % caught.exception)
+        self.assertIn("a redaction pattern has no rule name", str(caught.exception))
+
 
 for _name in dir(TestReviewPostAndDismiss):   # the parent's tests run in their own class
     if _name.startswith("test_") and _name not in TestReviewRefusalNamesRule.__dict__:
@@ -65712,7 +65752,7 @@ class TestLoadAlert(Base):
         def figures(latest):
             return {k: (latest[k]["busy"], latest[k]["idle"], latest[k]["cloud"]) for k in ("orch", "orchb")}
         self.assertEqual(figures(self._cloud_run()), {"orch": (3, 1, 2), "orchb": (0, 0, 0)})
-        source = SWITCHBOARD.read_text()
+        source = switchboard_source()
         import re as _re
         body = _re.search(r"def load_tick\(.*?\n\n\n", source, _re.S).group(0)
         old = '"busy": sum(1 for c in coders if c.status == "working") + cloud_live.get(name, 0),'
@@ -66730,10 +66770,12 @@ TestDerivedClosure, TestRefusalInAPart, TestMovingADefinition, TestTheDerivation
 # The shadow test (#1339): an added definition under a closure name in another file is refused by the clear.
 _shadow = importlib.import_module("test_shadow")
 TestShadowRule, TestShadowGlue, TestShadowStatuses, TestReasonsAreOneCleanLine = _shadow.TestShadowRule, _shadow.TestShadowGlue, _shadow.TestShadowStatuses, _shadow.TestReasonsAreOneCleanLine
+_pwd = importlib.import_module("test_plan_wake_drops"); _pwd.HOST = sys.modules[__name__]; TestPlanWakeDrops = _pwd.build()   # #1784
 # The Cockpit feed test (#1423): the read-only feed of what the fleet needs from a person.
 _cockpit = importlib.import_module("test_cockpit")
 TestFeedShape, TestIdsAndEtags, TestCapsAndScrub, TestDocument, TestWriting, TestReadOnly, TestBranches, TestSources, TestScrubFailsClosed, TestScrubPatterns, TestHardening, TestFileRead, TestDocumentTable = _cockpit.TestFeedShape, _cockpit.TestIdsAndEtags, _cockpit.TestCapsAndScrub, _cockpit.TestDocument, _cockpit.TestWriting, _cockpit.TestReadOnly, _cockpit.TestBranches, _cockpit.TestSources, _cockpit.TestScrubFailsClosed, _cockpit.TestScrubPatterns, _cockpit.TestHardening, _cockpit.TestFileRead, _cockpit.TestDocumentTable
 _claims_note = importlib.import_module("test_claims_note"); _claims_note.HOST = sys.modules[__name__]; TestClaimsNotePass, TestClaimsNoteSkips, TestClaimsNoteText, TestClaimsNoteMutants, TestClaimsNoteDocumentation, TestClaimsNoteScan = _claims_note.TestClaimsNotePass, _claims_note.TestClaimsNoteSkips, _claims_note.TestClaimsNoteText, _claims_note.TestClaimsNoteMutants, _claims_note.TestClaimsNoteDocumentation, _claims_note.TestClaimsNoteScan   # #1716
+_merge_drops = importlib.import_module("test_merge_drops"); _merge_drops.HOST = sys.modules[__name__]; TestMergeDrops, TestMergeDropsStep = _merge_drops.TestMergeDrops, _merge_drops.TestMergeDropsStep   # #2159
 _bot_reviews = importlib.import_module("test_bot_reviews"); _bot_reviews.HOST = sys.modules[__name__]; BotLines, BotWake, PendingJobs, BotDocumentation, BotMutants, BotSize, BotVerdict = _bot_reviews.BotLines, _bot_reviews.BotWake, _bot_reviews.PendingJobs, _bot_reviews.BotDocumentation, _bot_reviews.BotMutants, _bot_reviews.BotSize, _bot_reviews.BotVerdict
 # The relay tree-guard test (#1380, #1429): the relay thread obeys the installed-tree guard.
 _relay_tree_guard = importlib.import_module("test_relay_tree_guard")
@@ -66741,6 +66783,7 @@ RelayObeysTheTreeGuard = _relay_tree_guard.RelayObeysTheTreeGuard
 _sent_view = importlib.import_module("test_sent_view")
 _sent_view.World = World
 TestSentView = _sent_view.TestSentView
+_branch_ff = importlib.import_module("test_branch_ff"); TestBranchFf = _branch_ff.TestBranchFf
 TestScratchCommand = importlib.import_module("test_scratch_command").TestScratchCommand
 # The relay-loop tests of #1477, moved under the architecture cap.
 _relay_loop = importlib.import_module("test_relay_loop_cadence")
@@ -66782,11 +66825,28 @@ TestHeavySplit = importlib.import_module("test_heavy_split").TestHeavySplit
 # The steer-after-minutes tests of #1540, moved under the line ceiling.
 _steer_long = importlib.import_module("test_steer_long_turn")
 TestSteerLongTurn = _steer_long.build(Base, TestSteerToWorking)
+TestGhShimSignInput = importlib.import_module("test_gh_shim_sign_input").TestGhShimSignInput
+TestGhShimEffectRule = importlib.import_module("test_gh_shim_sign_input").TestGhShimEffectRule
+TestGhShimMutationRoots = importlib.import_module("test_gh_shim_sign_input").TestGhShimMutationRoots
+TestGhShimRawPath = importlib.import_module("test_gh_shim_sign_input").TestGhShimRawPath
+TestGhShimRound5 = importlib.import_module("test_gh_shim_sign_input").TestGhShimRound5
+TestGhShimArgvParser = importlib.import_module("test_gh_shim_sign_input").TestGhShimArgvParser
+TestApiReadersAreViews = importlib.import_module("test_gh_shim_sign_input").TestApiReadersAreViews
+TestGhHoldIsAView = importlib.import_module("test_gh_shim_sign_input").TestGhHoldIsAView
+TestGhShimNestedAndQueryBodies = importlib.import_module("test_gh_shim_sign_input").TestGhShimNestedAndQueryBodies
+TestGhShimEncodedQueryAndLabelDelete = importlib.import_module("test_gh_shim_sign_input").TestGhShimEncodedQueryAndLabelDelete
+TestGhShimDeepBodiesAndInputForms = importlib.import_module("test_gh_shim_sign_input").TestGhShimDeepBodiesAndInputForms
+TestGhShimBodyFieldBesideInput = importlib.import_module("test_gh_shim_sign_input").TestGhShimBodyFieldBesideInput
+TestGhShimBracketBodyKeys = importlib.import_module("test_gh_shim_sign_input").TestGhShimBracketBodyKeys
+TestGhShimAllowlist = importlib.import_module("test_gh_shim_sign_input").TestGhShimAllowlist
+TestGhShimBodyFieldKeyIsExact = importlib.import_module("test_gh_shim_sign_input").TestGhShimBodyFieldKeyIsExact
+TestGhShimMethodFlagBeforeApi = importlib.import_module("test_gh_shim_sign_input").TestGhShimMethodFlagBeforeApi
 TestUnconsumedSteer = importlib.import_module("test_unconsumed_steer").build(Base, TestSteerToWorking)   # #1844
 TestUnconsumedRecord = importlib.import_module("test_unconsumed_record").TestUnconsumedRecord   # #1844
 _noparent = importlib.import_module("test_charter_noparent"); TestCharterNoParent, TestCharterNoParentSet = _noparent.TestCharterNoParent, _noparent.build(CharterRig, Base, TestCharterSetGuard)
 _hc = importlib.import_module("test_header_cache"); TestAges, TestSets, TestEvents, TestSafety, TestReplay, TestIsolation, TestDropNeverBlocksAWrite, TestApprovalReadsFresh, TestDocs = _hc.TestAges, _hc.TestSets, _hc.TestEvents, _hc.TestSafety, _hc.TestReplay, _hc.TestIsolation, _hc.TestDropNeverBlocksAWrite, _hc.TestApprovalReadsFresh, _hc.TestDocs
 TestReminderTtlMore = importlib.import_module("test_reminder_ttl").build(PR4Base)
+TestReminderWaiting = importlib.import_module("test_reminder_waiting").build(PR4Base)
 TestPlanRehearsal = importlib.import_module("test_plan_rehearsal").build(HandoffCase)   # #1785
 TestMergeRef = importlib.import_module("test_merge_ref").build(HandoffCase)   # #2053
 TestCiRecordProof = importlib.import_module("test_ci_record_proof").build(LedgerBase)   # #2091
@@ -66801,6 +66861,7 @@ _olc = importlib.import_module("test_open_list_ceiling"); TestOpenListCeiling, T
 TestOpenListPassCalls = importlib.import_module("test_open_list_pass_calls").build(TestASlowCatchUpDoesNotFreezeThePass)   # #1886 Eighth (3)
 _olcuts = importlib.import_module("test_open_list_cuts"); TestOpenListCuts, TestOpenListPagesRead, TestOpenListDerivedText, TestOpenListCutsMutants, TestOpenListWholeReads, TestOpenListCutsWired = _olcuts.TestOpenListCuts, _olcuts.TestOpenListPagesRead, _olcuts.TestOpenListDerivedText, _olcuts.TestOpenListCutsMutants, _olcuts.TestOpenListWholeReads, _olcuts.TestOpenListCutsWired
 _cc = importlib.import_module("test_comment_cursor"); TestCommentCursor, TestOverlapListWhole, TestCommentCursorMutants = _cc.TestCommentCursor, _cc.TestOverlapListWhole, _cc.TestCommentCursorMutants   # #1889
+_rpstrict = importlib.import_module("test_read_pages_strict"); TestReadPagesStrict, TestReadPagesStrictMutant = _rpstrict.TestReadPagesStrict, _rpstrict.TestReadPagesStrictMutant
 TestCiOutsideBin = importlib.import_module("test_ci_outside_bin").TestCiOutsideBin
 _psj = importlib.import_module("test_pr_state_jobs")
 _psj.HOST = sys.modules[__name__]
@@ -66846,11 +66907,14 @@ TestHeldSends = importlib.import_module("test_held_sends").TestHeldSends   # #20
 # The reminder-cancel tests of #1401.
 _reminder_cancel = importlib.import_module("test_reminder_cancel")
 TestCancelKeyRecheck = _reminder_cancel.build(PR4Base)
+TestKeyedReminderSupersede = importlib.import_module("test_keyed_reminder_supersede").build(PR4Base)
 # The lost-worker alert tests of #1481.
 _lost_worker = importlib.import_module("test_lost_worker")
 TestLostWorkerRemembers = importlib.import_module("test_lost_worker_remembers").TestLostWorkerRemembers
 TestLostWorker, TestLostWorkerReadRound, TestLostWorkerMemoryOnly, TestLostWorkerSlowPass = _lost_worker.TestLostWorker, _lost_worker.TestLostWorkerReadRound, _lost_worker.TestLostWorkerMemoryOnly, _lost_worker.TestLostWorkerSlowPass
 TestPushWatch = importlib.import_module("test_push_watch").TestPushWatch   # the push watch of #1740
+TestPodSilence = importlib.import_module("test_pod_silence").TestPodSilence   # the pod silence watch of #2115
+TestPodSilenceTick = importlib.import_module("test_pod_silence").TestPodSilenceTick   # the pod silence tick of #2135
 _stage_events = importlib.import_module("test_stage_events"); _stage_events.GithubRig, _stage_events.GH_REPO = GithubRig, GH_REPO; TestStageEvents = _stage_events.TestStageEvents; TestStageEvents.CONF = {"github_stage_repos": [GH_REPO], "github_stage_bots": ["github-actions[bot]"]}
 # A CLAIMS: line present but not read is refused (#1617); HOST gives the test the fixtures of this file.
 _claim_placement = importlib.import_module("test_claim_placement"); _claim_placement.HOST = sys.modules[__name__]
@@ -66861,7 +66925,12 @@ _changed_file_pages = importlib.import_module("test_changed_file_pages")
 _changed_file_pages.HOST = sys.modules[__name__]
 TestWholeReadOfALargePullRequest = _changed_file_pages.load()
 
+_rc = importlib.import_module("test_reclaim_cap"); _rc.HOST = sys.modules[__name__]; TestReclaimCap = _rc.build()   # #1737
 _lm = importlib.import_module("test_launch_model"); _lm.HOST = sys.modules[__name__]; TestLaunchModel = _lm.build(); TestLaunchModelCloud = _lm.build_cloud()   # #1642
+TestDaemonDeadVerdict, TestDaemonDeadVerdictMutants = (_dd := importlib.import_module("test_dead_verdict_daemon")).TestDaemonDeadVerdict, _dd.TestDaemonDeadVerdictMutants   # #1884
+TestPaneUndecidable = _dd.TestPaneUndecidable   # #1884 PC-6 / S11
+TestUndecidableRobustness = _dd.TestUndecidableRobustness   # #1884 PC-9 / S14
+TestBodyCheck = importlib.import_module("test_body_check").TestBodyCheck   # #1476
 TestLaunchCapacity = importlib.import_module("test_launch_capacity").build()   # #1793
 _ta = importlib.import_module("test_tester_agent"); _ta.HOST = sys.modules[__name__]; TestTesterAgentLaunch, TestTesterAgentMutants = _ta.build()   # #1963
 _lr = importlib.import_module("test_launched_reviewers"); _lr.HOST = sys.modules[__name__]; TestLaunchedReviewerRule, TestLaunchedReviewerGates, TestLaunchedReviewerItems, TestLaunchedReviewerRelay, TestLaunchedReviewerDocs, TestLaunchedReviewerGuards, TestLaunchedReviewerMutants = _lr.build()   # #1869
@@ -69109,7 +69178,8 @@ class TestAdoption(LanesCase):
         return self.scan({rel: (REPO / rel).read_text() for rel in names})
 
     def test_every_reader_of_a_workers_boss_is_in_the_table_and_the_table_has_no_stale_member(self):   # S15
-        self.assertEqual(self.sites(), set(sb.BOSS_READ_SITES), "a new raw reader must go through boss_name, or be named in BOSS_READ_SITES with its reason")
+        moved = {"bin/fleet-switchboard:live_cloud_by_lane": "bin/switchboard/heavy_budget.py:live_cloud_by_lane", "bin/fleet-switchboard:cloud_sender": "bin/switchboard/heavy_budget.py:cloud_sender"}   # S9: the daemon's table still names the entry for this one; the function moved, the table's text is not changed here
+        self.assertEqual(self.sites(), {moved.get(k, k) for k in sb.BOSS_READ_SITES}, "a new raw reader must go through boss_name, or be named in BOSS_READ_SITES with its reason")
 
     def test_the_scan_finds_a_raw_reader_when_one_is_planted(self):   # S15 mutant: the real scan, fed a planted source, reports it
         planted = {"bin/planted.py": "def load_row(o):\n    return o.fleet.get('reports_to') == 'x'\n\ndef other(o):\n    return o.fleet['reports_to']\n\ndef safe(o):\n    return boss_name(o)\n"}
@@ -73476,6 +73546,18 @@ class TestGhShimMergeGate(Base):
         (self.home / ".config" / "fleet-switchboard" / "config.json").write_text(json.dumps({"merge_gate": {"repos": {"acme/app": {}}}, "plan_gates": {"repos": {"acme/app": {"mode": "shadow"}}}}))
         self.state = self.home / "state"
         self.state.mkdir()
+
+    def test_approving_a_deployment_gate_runs_the_real_gh_unchanged(self):
+        """#1706 regression: a POST to actions/runs/N/pending_deployments (its 'comment' field is no comment body; 'environment_ids[]' is a valid key) runs the real gh unchanged; a comment endpoint is still signed."""
+        ep = "repos/acme/app/actions/runs/123/pending_deployments"
+        argv = ["api", "-X", "POST", ep, "-F", "environment_ids[]=456", "-f", "state=approved", "-f", "comment=approve"]
+        done, log = self.run_shim(*argv)
+        self.assertEqual((done.returncode, log and log["argv"]), (0, argv), done.stderr)
+        done, log = self.run_shim("api", "-X", "POST", ep, "--input", "-")
+        self.assertEqual((done.returncode, log and log["argv"]), (0, ["api", "-X", "POST", ep, "--input", "-"]), done.stderr)
+        control = ["api", "-X", "POST", "repos/acme/app/issues/5/comments", "-f", "body=hello"]
+        done, log = self.run_shim(*control)
+        self.assertNotEqual(log and log["argv"], control)
 
     HEAD = "a" * 40
 
@@ -78870,6 +78952,7 @@ class TestNoPaneToJudge(StandInPids, Base):
         "pane_state": "judges the one pane it is handed (herdr's answer); the callers never hand it a no-pane row",
         "release_stale_binding": "acts on a pane herdr still lists under a name; a no-pane row has none",
         "write_pane_health": "keeps a dead row's time; judges nothing",
+        "collect_status": "reads the pane-undecidable record (a pane streak), not a dead verdict; judges nothing",
     }
 
     _PARSED = {}   # source text -> (tree, lines): each entry is parsed and split ONCE

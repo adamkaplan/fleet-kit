@@ -9,7 +9,20 @@ import types
 
 from support.core import Base
 from support.rebind import rebound
-from support.loader import copy_entry, _load, sb
+from support.loader import copy_entry, _load, sb, switchboard_source
+
+
+def edit_program(directory, edit):
+    """Apply `edit` (text -> text) to the daemon's code as ONE text (the entry and the parts it is made of, in a copy at `directory`) and write each file
+    back; returns the edited text. The edit may land in any file."""
+    directory = Path(directory)
+    files = [directory / "fleet-switchboard"] + sorted((directory / "switchboard").glob("*.py"))
+    mark = "\n#@@FILE %d@@\n"
+    edited = edit("".join(mark % i + f.read_text() for i, f in enumerate(files)))
+    for i, f in enumerate(files):
+        head, _, rest = edited.partition(mark % i)
+        f.write_text(rest.partition(mark % (i + 1))[0] if i + 1 < len(files) else rest)
+    return edited
 
 NOW = 1798000000.0
 
@@ -106,10 +119,10 @@ class TestOpenListCeiling(Base):
 
     def test_u3_one_constant_and_the_open_reads_name_it(self):
         root = Path(__file__).resolve().parents[2] / "bin"
-        entry, triage = (root / "fleet-switchboard").read_text(), (root / "switchboard" / "triage.py").read_text()
+        entry, triage = switchboard_source(), (root / "switchboard" / "triage.py").read_text()   # the entry and its parts
         self.assertEqual(len(re.findall(r"^OPEN_LIST_PAGES = ", entry, re.M)), 1)
         self.assertNotIn("OPEN_LIST_PAGES =", triage)
-        self.assertEqual(len(re.findall(r"cap=OPEN_LIST_PAGES", entry + triage)), 3)   # the sweep, the triage, the CI recorder
+        self.assertEqual(len(re.findall(r"cap=OPEN_LIST_PAGES", entry)), 3)   # the sweep, the triage, the CI recorder
         self.assertEqual(len(re.findall(r"open_pages\(lambda", entry)), 3)   # the asks, the labels and the charters
         self.assertEqual(sb.OPEN_LIST_PAGES, 10)
 
@@ -173,9 +186,7 @@ class TestOpenListCeilingMutant(Base):
                 (Path(tmp) / other.name).write_bytes(other.read_bytes())   # the flat modules the entry loads by name
             copy_entry(tmp)
             entry = Path(tmp) / "fleet-switchboard"
-            text = entry.read_text()
-            edited = source_edit(text)
-            entry.write_text(edited)
+            edited = edit_program(tmp, source_edit)
             copy = _load("t_open_list_" + tag, entry)
             suite = unittest.TestSuite(TestOpenListCeiling(name) for name in self.NAMES)
             result = unittest.TestResult()
