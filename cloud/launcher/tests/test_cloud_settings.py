@@ -23,6 +23,7 @@ OPTIONAL_SAMPLES = {"CW_TOOLING_REPO": "acme-org/tooling", "CW_CLOUD_CA_FILE": "
                     "CW_HUB_CHANNEL_URL": "http://cloud-hub.cw.svc:8443/message", "CW_HUB_REGISTRY_SECRET": "cloud-hub-registry",
                     "CW_STACK_REGISTRY": "acme-registry.azurecr.io", "CW_STACK_PULL_CLIENT_ID": "11111111-2222-3333-4444-555555555555",
                     "CW_STACK_PULL_TENANT_ID": "66666666-7777-8888-9999-000000000000"}
+OPTIONAL_SAMPLES["CW_REPO_MIN_SHAPE"] = "acme-org/widget-service=S"
 SAMPLES = {   # one value per secret shape (built here, never a real secret)
     "a JWT": "eyJhbGciOiJIUzI1" + "." + "eyJzdWIiOiJ4eHh4",
     "a PEM header": "-----BEGIN " + "PRIVATE KEY-----",
@@ -66,6 +67,7 @@ HOSTILE = {   # per key: values that must be refused (each through the REAL pars
     "CW_CLUSTER_TOKEN_CMD": ["-x"], "CW_CLUSTER_ADMIN_CMD": ["--x"], "CW_GIT_TOKEN_CMD": ["-x"], "CW_APP_ID_CMD": ["-x"],
     "CW_APP_INSTALLATION_CMD": ["-x"], "CW_APP_KEY_CMD": ["-x"],
     "CW_VAULT_CHECK_DIR": ["check", "/a/../b", "-x"],
+    "CW_REPO_MIN_SHAPE": ["acme-org/widget-service", "acme-org/widget-service=L", "widget-service=S", "acme-org/a=S,ACME-ORG/A=M"],
     "CW_STACK_REGISTRY": ["https://acme-registry.azurecr.io", "acme-registry.azurecr.io/x", "acme-registry.azurecr.io:443", "10.0.0.1", "azurecr.io", "acme-registry",
                           "acme.example.com", "-acme.azurecr.io", "Acme.azurecr.io", "user@acme.azurecr.io", "ghp_" + "A1b2C3d4E5f6G7h8.azurecr.io", "0x7f000001"],
     "CW_STACK_PULL_CLIENT_ID": ["x", "1111", "-1111-2222"],
