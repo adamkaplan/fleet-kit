@@ -613,9 +613,10 @@ class TestConfig(Base):
             "herdr": "herdr", "batch_seconds": 90, "engaged_minutes": 10, "retire_idle_minutes": 10, "call_timeout_seconds": 20, "clear_remind_minutes": 15, "send_timeout_seconds": 60, "poll_seconds": 5,
             "herdr_log": "~/.config/herdr/herdr-server.log", "pane_exit_burst_seconds": 5, "pane_exit_burst_min": 3,  # #1030
             "worker_lookback_hours": 24, "stalled_working_hours": 2, "review_window_minutes": 60, "send_to_working": "steer", "steer_after_minutes": 0, "launch_default": "headless",
+            "unconsumed_steer_minutes": 20,
             "rider_max_age_seconds": 3600, "undelivered_wake_minutes": 15, "undelivered_wake_tell_minutes": None, "undelivered_wake_per_pass": 2, "report_triage": sb.REPORT_TRIAGE_DEFAULTS,  # PR 13
             "github_repos": [], "gh": sb.own_gh_path("gh"), "gh_by_name": "gh", "github_lookback_hours": 24, "github_port": None, "github_ignore_authors": [],   # #1216: the RESOLVED gh (a machine with a gh on PATH names it by path); `gh_by_name` is the gh as configured (PATH finds the shim), used by the one merge call of `merge-gate --pass --merge`
-            "owner_logins": [], "github_bot_logins": [], "v2_light": False, "v2_cache_seconds": 120, "v2_reads_per_pass": 8, "v2_reads_per_minute": 90, "v2_events": "auto", "v2_plugin_events": "auto", "v2_transport": "auto", "cpu_guard": None, "disk_guard": None, "reds": None, "heavy": None, "no_multiplexer": False, "docker_reaper": True,
+            "owner_logins": [], "github_stage_repos": [], "github_stage_bots": [], "github_bot_logins": [], "v2_light": False, "v2_cache_seconds": 120, "v2_reads_per_pass": 8, "v2_reads_per_minute": 90, "v2_events": "auto", "v2_plugin_events": "auto", "v2_transport": "auto", "cpu_guard": None, "disk_guard": None, "reds": None, "heavy": None, "no_multiplexer": False, "docker_reaper": True,
             "github_events": ["issues", "issue_comment", "sub_issues", "pull_request", "pull_request_review",
                               "check_suite", "workflow_run"],
             "awaiting_live_days": 14, "awaiting_label": None, "decisions_lookback_hours": 72,  # PR 14
@@ -1356,6 +1357,7 @@ class TestBuilderChecklist(unittest.TestCase):
         "b": "(opens without blocking, refuses links, accepts only regular files, bounds the count, the size and the time)",
         "i": "and keep new strings and comments clear of the added-lines scans",
         "cloud": "never runs the whole bin/test-switchboard",
+        "control": "counts as caught only with a passing control",
         "e": "the pod's git token expires after about an hour and a late open fails",
     }
     BRIEF = "Every builder brief carries the builder checklist below by default; a brief that leaves an item out says why in one line."
@@ -1393,6 +1395,75 @@ class TestBuilderChecklist(unittest.TestCase):
         found = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "read_record_file"]
         self.assertEqual(len(found), 1)
         self.assertEqual([a.arg for a in found[0].args.args], ["path", "max_bytes"])
+
+
+class TestMutantControlRule(unittest.TestCase):
+    """#1700: a mutant counts as caught only with a passing control and an anchored failure text; the sentence is in 8 homes."""
+    SENTENCE = ("A mutant counts as caught only with a passing control (the same command on the unmutated copy exits 0) and an anchored "
+                "failure text (the mutated check is named in the failure); a harness that counts any non-zero exit as a catch proves nothing.")
+
+    NAMES = ["reviewer-architecture", "reviewer-code", "reviewer-impact", "reviewer-security", "reviewer-test"]
+
+    def homes(self, root):
+        defs = sorted(p.relative_to(root).as_posix() for p in (root / "agents" / "reviewers").glob("*.md"))
+        return defs + ["skills/fleet-review/SKILL.md", "docs/review-laws/structural-rule.md", "skills/fleet-coordination/SKILL.md"]
+
+    def problems(self, root):
+        found = []
+        for h in self.homes(root):
+            text = (root / h).read_text()
+            body = text
+            if h.startswith("agents/"):
+                parts = text.split("---", 2)
+                body = parts[2]
+                if " ".join(parts[1].split()).count(self.SENTENCE):
+                    found.append(h)
+            if " ".join(body.split()).count(self.SENTENCE) != 1 and h not in found:
+                found.append(h)
+        return found
+
+    def copy(self, tmp):
+        import shutil
+        for d in ("agents/reviewers", "skills/fleet-review", "skills/fleet-coordination", "docs/review-laws"):
+            shutil.copytree(REPO / d, Path(tmp) / d)
+        return Path(tmp)
+
+    def test_every_home_holds_the_sentence_once_in_the_body(self):
+        homes = self.homes(REPO)
+        self.assertEqual(self.problems(REPO), [])
+        print("homes %d of %d" % (len(homes) - len(self.problems(REPO)), len(homes)))
+        self.assertGreaterEqual(len(homes), 8)
+        named = ["agents/reviewers/%s.md" % n for n in self.NAMES] + ["docs/review-laws/structural-rule.md", "skills/fleet-review/SKILL.md", "skills/fleet-coordination/SKILL.md"]
+        for h in named:
+            self.assertIn(h, homes, "home missing from the derived set: " + h)
+
+    def test_a_mutant_removing_it_from_one_home_names_that_file(self):
+        import tempfile
+        n = 0
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.copy(tmp)
+            self.assertEqual(self.problems(root), [], "control: the unmutated copy must have no problem")
+            for h in self.homes(root):
+                f = root / h
+                orig = f.read_text()
+                f.write_text(" ".join(orig.split()).replace(self.SENTENCE, ""))
+                self.assertEqual(self.problems(root), [h])
+                n += 1
+                f.write_text(orig)
+        print("mutants %d of %d" % (n, len(self.homes(REPO))))
+        self.assertEqual(n, len(self.homes(REPO)), "mutants caught must equal the homes")
+
+    def test_a_new_definition_without_the_sentence_fails(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.copy(tmp)
+            (root / "agents/reviewers/reviewer-new.md").write_text("---\nname: x\n---\nbody\n")
+            self.assertEqual(self.problems(root), ["agents/reviewers/reviewer-new.md"])
+
+    def test_the_sentence_is_never_in_a_front_matter(self):
+        for p in (REPO / "agents" / "reviewers").glob("*.md"):
+            self.assertNotIn("counts as caught", p.read_text().split("---", 2)[1])
+
 
 
 class TestEveryReaderOfAPullRequestsFileList(unittest.TestCase):
