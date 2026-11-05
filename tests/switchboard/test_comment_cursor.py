@@ -162,7 +162,7 @@ class TestCommentCursor(PublishMixin, HubCase):
 
         def one_read(now):
             self.clock[0] = now
-            hub.read_comments("sweep", REPO, sb.iso(now - 7 * DAY), cap=sb.COMMENT_WINDOW_PAGES)
+            hub.read_comments("sweep", REPO, sb.iso(now - 7 * DAY), cap=sb.COMMENT_WINDOW_PAGES, budget=[0])
             for repo, (held, days) in sb.take_comment_cuts().items():
                 sb.comment_window_alert(engine, repo, held, days, now)
 
@@ -248,8 +248,8 @@ class TestCommentCursor(PublishMixin, HubCase):
         sb.take_comment_cuts()
         world = CommentWorld(NOW - 7 * DAY, 3500, start=2 * DAY, step=100)
         hub = self.hub(world)
-        hub.read_comments("sweep", REPO, self.since, cap=sb.COMMENT_WINDOW_PAGES)
-        hub.read_comments("triage", REPO, sb.iso(NOW - 14 * DAY), cap=sb.COMMENT_WINDOW_PAGES)
+        hub.read_comments("sweep", REPO, self.since, cap=sb.COMMENT_WINDOW_PAGES, budget=[0])
+        hub.read_comments("triage", REPO, sb.iso(NOW - 14 * DAY), cap=sb.COMMENT_WINDOW_PAGES, budget=[0])
         self.assertEqual(sorted(sb._COMMENT_CUTS), [("sweep", REPO), ("triage", REPO)])
         taken = sb.take_comment_cuts()
         self.assertEqual(list(taken), [REPO])   # one alert a day per repository
