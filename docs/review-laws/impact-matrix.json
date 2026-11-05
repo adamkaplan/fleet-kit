@@ -569,6 +569,7 @@
         "bin/switchboard/plan_input.py": [
           "_parent_ask_done_when",
           "fetch_plan",
+          "governing_done_when",
           "load_plan",
           "parse_plan_source",
           "plan_comment_choice"
