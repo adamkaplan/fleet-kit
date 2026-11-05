@@ -45,7 +45,7 @@ CLOUD_WORKER_AGENT = "worker"   # the agent the image defines (cloud/worker/agen
 # The options of the launcher's `create` that `launch --cloud` hands over: ONE table. Taken from the launcher on main (commit fb4b9f2,
 # cloud/launcher/cloud_worker.py `create`: --shape S|M, --stack); a name here that the launcher does not know makes its create fail (exit 2).
 NO_COMMIT_OPTION = "--no-commit"   # the pod is launched NOT to commit (a measure or a read): the launcher sends it no wip note
-CREATE_OPTION = {"repo": "--repo", "branch": "--branch", "run_id": "--run-id", "idle": "--idle", "hard": "--hard", "shape": "--shape", "stack": "--stack", "agent": "--agent", "boss": "--boss", "stack_model_secret": "--stack-model-secret", "persistent": "--persistent", "issue": "--issue", "no_wait": "--no-wait"}; cloud_launch_again = (lambda spec: (lambda m: (sys.modules.__setitem__("cloud_launch_again", m), spec.loader.exec_module(m), m.bind(globals()), m)[-1])(importlib.util.module_from_spec(spec)))(importlib.util.spec_from_file_location("cloud_launch_again", str(_OWN_BIN / "cloud_launch_again.py")))   # a part of this file (ask #1619)
+CREATE_OPTION = {"repo": "--repo", "branch": "--branch", "run_id": "--run-id", "idle": "--idle", "hard": "--hard", "shape": "--shape", "stack": "--stack", "agent": "--agent", "boss": "--boss", "stack_model_secret": "--stack-model-secret", "persistent": "--persistent", "issue": "--issue", "no_wait": "--no-wait"}
 LAUNCHER_SHAPES = ("XS", "S", "M", "O")   # the launcher's SHAPES keys (O: the orchestrator row, 250m and 768 MiB, meant for --agent orchestrator; a worker on it is likely to be killed for memory); the launcher's own default (XS; S with --stack; O with --agent orchestrator) applies when --shape is not given
 LAUNCHER_STACK_SHAPES = ("S", "M")   # the rows with stack: true; --stack with another shape is refused here, before any call
 MAX_M_PER_LANE = 4   # the most live shape-M (4 CPU) cloud workers one lane may hold: a lane's batch of 4-CPU pods once filled the cluster and left every other lane's launches unplaceable
@@ -564,6 +564,19 @@ CLUSTER_NAMES = (
 cloud_cluster = _load_cluster()
 for _name in CLUSTER_NAMES:
     globals()[_name] = getattr(cloud_cluster, _name)
+
+
+def _load_launch_again():
+    """Load bin/cloud_launch_again.py (beside this file; a part of it, ask #1619) and bind its names here."""
+    spec = importlib.util.spec_from_file_location("cloud_launch_again", str(_OWN_BIN / "cloud_launch_again.py"))
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["cloud_launch_again"] = module
+    spec.loader.exec_module(module)
+    module.bind(globals())
+    return module
+
+
+cloud_launch_again = _load_launch_again()
 
 
 
