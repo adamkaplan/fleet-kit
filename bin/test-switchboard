@@ -27882,8 +27882,11 @@ class TestPlanWake(Base):
         self.assertEqual(len(texts), 1, msg=texts)
         self.assertIn(b, texts[0])
         self.assertNotIn(a, texts[0])
-        dropped = [e for e in self.world.audit() if e["event"] == "stale.dropped"]
-        self.assertEqual([e["detail"]["kind"] for e in dropped], ["plan"])
+        # the replaced notice's drop is audited: by the plan pass itself (plan_wake.dropped, #1784) or by the delivery recheck (stale.dropped, #1542)
+        dropped = [e["detail"].get("dropped") or e["detail"].get("hash") or e["detail"].get("kind")
+                   for e in self.world.audit() if e["event"] in ("plan_wake.dropped", "stale.dropped")]
+        self.assertEqual(len(dropped), 1, msg=dropped)
+        self.assertIn(dropped[0], (a, "plan"))
 
     def delivered_to_orch(self):
         self.hub.present_record = lambda *args: {}   # FAKE: the delivery reader needs a hub with the present-state read; the plan facts never use it
