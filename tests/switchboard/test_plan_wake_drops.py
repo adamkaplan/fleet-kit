@@ -233,4 +233,33 @@ def build():
             self.assertEqual(sum(during), 0)
             self.assertTrue(during)
 
+        def send_for(self, record):
+            h = sb.plan_check.plan_hash(record["body"])
+            return [{"event": "v2.synthetic", "detail": {"keys": ["send:cos:1"], "description": "switchboard: cos message on acme/api: Approved at %s" % h}}]
+
+        def reload(self):
+            self.engine.plan_wake = sb.PlanWakeState(self.engine.state_dir)   # the daemon restarted: the state is read from PLAN_WAKE_FILE
+            self.engine.plan_wake.facts.clear()
+
+        def test_s2_a_plan_approved_by_a_send_is_remembered_after_the_send_leaves_the_tail_and_a_restart(self):
+            """#2193: the approval is written to plan-wake.json; no notice once the send is gone from the audit tail."""
+            record = self.post(3, self.plan())
+            with mock.patch.object(sb, "_audit_tail", lambda state_dir: self.send_for(record)):
+                self.go()
+            self.assertEqual(self.lines(), [])
+            self.reload()
+            with mock.patch.object(sb, "_audit_tail", lambda state_dir: []):
+                self.go(2)
+            self.assertEqual(self.lines(), [], msg="no plan posted notice: the approval was remembered")
+
+        def test_s3_a_new_unapproved_plan_is_announced_exactly_once_across_a_reload(self):
+            self.post(3, self.plan())
+            with mock.patch.object(sb, "_audit_tail", lambda state_dir: []):
+                self.go()
+                self.assertEqual(len(self.lines()), 1)
+                self.reload()
+                self.go(2)
+            self.assertEqual(self.lines(), [], msg="the reload dropped the held line; announced is remembered, so it is not raised again")
+            self.assertEqual(len(self.audit("plan_wake.announced")), 1)
+
     return TestPlanWakeDrops
