@@ -806,9 +806,29 @@ class TestPushWatch(Case):
 
     def test_a_worker_absent_from_one_pass_and_back_is_not_told_again(self):
         self.assertEqual(self._absent_once(), 1)
-        old = '        if name in records:\n            state["workers"][name].pop("gone", None)   # back: its absence clock restarts\n        elif name not in state["stopped"] and now - state["workers"][name].setdefault("gone", now) > 7 * 86400:'
+        old = '        if name in records:\n            state["workers"][name].pop("gone", None)   # back: its absence clock restarts\n        elif name in state["stopped"] or now - state["workers"][name].setdefault("gone", now) > 7 * 86400:'
         mutant = self.mutant(old, '        if name not in records:\n            pass\n        if name not in records:')
         self.assertEqual(self._absent_once(mutant), 2, "control: the old prune tells it again")
+
+    def _state_workers(self):
+        path = Path(str(self.engine.audit.path)).parent / self.pw.STATE_FILE
+        return json.load(open(path))["workers"]
+
+    def test_a_stopped_worker_with_no_record_is_pruned(self):
+        self._world(True)
+        self.run_pass(NOW)
+        self.assertIn("w-a", self._state_workers())
+        self.launcher_line(worker="w-a", action="stop")
+        self.engine.cloud_watch = {"records": []}
+        self.run_pass(NOW + 60)
+        self.assertNotIn("w-a", self._state_workers())
+
+    def test_a_worker_absent_one_pass_and_not_stopped_is_kept(self):
+        self._world(True)
+        self.run_pass(NOW)
+        self.engine.cloud_watch = {"records": []}
+        self.run_pass(NOW + 60)
+        self.assertIn("w-a", self._state_workers())
 
     def _launch_info(self, create, module=None):
         self.setUp()
