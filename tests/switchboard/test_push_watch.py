@@ -116,33 +116,32 @@ def _real_liveness():
     return lambda rec, name, at: module.cloud_record_live(rec, name, {}, {}, at)
 
 
-class TestPushWatchLiveOnly(Case):
-    def _world(self, deadline):
+class TestPushWatch(Case):
+    def _live_world(self, deadline):
         self.ns.record_live = _real_liveness()
         self.engine.cloud_watch = {"records": [dict(record("w-a", "lane-a"), hard_deadline=deadline)]}
         self.world.refs = {"w-a/wip": SHA_A}
 
     def test_s2_2186_a_record_past_its_hard_deadline_with_no_stop_line_tells_nothing(self):
-        self._world("2020-01-01T00:00:00Z")
+        self._live_world("2020-01-01T00:00:00Z")
         self.run_pass(NOW)
         self.run_pass(NOW + 1200)
         self.assertEqual(len(self.to("lane-a")), 0)
 
     def test_s2_2186_control_without_the_liveness_test_the_same_record_is_told(self):
-        self._world("2020-01-01T00:00:00Z")
+        self._live_world("2020-01-01T00:00:00Z")
         del self.ns.record_live   # today's code: only the stopped table filters
         self.run_pass(NOW)
         self.run_pass(NOW + 1200)
         self.assertEqual(len(self.to("lane-a")), 2)   # the push and the quiet item
 
     def test_s3_2186_a_live_record_push_is_told_once(self):
-        self._world("2099-01-01T00:00:00Z")
+        self._live_world("2099-01-01T00:00:00Z")
         self.run_pass(NOW)
         self.run_pass(NOW + 1)
         self.assertEqual(len([t for t in self.to("lane-a") if "pushed" in t]), 1)
 
 
-class TestPushWatch(Case):
     def test_s2_the_launching_lane_gets_one_item_and_the_other_lane_none(self):
         self.world.refs = {"w-a/wip": SHA_A}
         self.run_pass(NOW)
