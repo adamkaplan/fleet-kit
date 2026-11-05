@@ -15191,6 +15191,27 @@ class TestConflictCarryInTheDaemon(Base):
         self.first_hold(new)
         self.assertEqual((len(self.body_patches()), len(self.events("gate.hold_marker"))), (1, 1), "once per head")
 
+    def test_2223_s2_the_sweep_raises_no_s6b_after_a_first_hold_over_an_automatic_body(self):
+        self.body = "MERGE: automatic\n\nthe change\n"
+        self.first_hold(self.own_commit())
+        labels = [l for w in self.adds() for l in w[2]["labels"]]
+        self.assertEqual(self.body, "MERGE: captain\n\nthe change\n")
+
+        def sweep_kinds(body):
+            engine = self.world.new_engine("daemon")
+            engine.config.update(github_repos=[self.REPO])
+            engine.config["sweep"] = dict(sb.SWEEP_DEFAULTS, enabled=True, person_names=["Alex"])
+            engine.config["triage"] = {"our_logins": ["bot"]}
+            engine.hub = FakeSweepHub()
+            engine.hub.open = {7: sweep_issue(7, body, labels, pr=True)}
+            now = self.world.clock.now()
+            sb.decisions_from_notices(engine, now)
+            sb.sweep_decisions(engine, [], now, [])
+            sb.sweep_decisions(engine, [], now, [])
+            return [e["detail"]["kind"] for e in self.world.audit() if e["event"] == "sweep.finding" and e["detail"].get("ref", "").endswith("#7")]
+        self.assertNotIn("S6b", sweep_kinds(self.body), "the marker now agrees with the label the hold wrote")
+        self.assertIn("S6b", sweep_kinds("MERGE: automatic\n\nthe change\n"), "control: the old body (no marker set) is the S6b")
+
     def test_2223_s3_a_changed_body_is_not_overwritten_and_a_failed_write_is_audited_once_and_the_hold_stands(self):
         self.body = "MERGE: automatic\n\nthe change\n"
         new = self.own_commit()
