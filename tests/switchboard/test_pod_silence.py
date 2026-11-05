@@ -1,6 +1,8 @@
 """Tests of the pod silence watch (ask #2115, bin/pod_silence.py): a fake world, a stub summary, no cluster, no thread."""
+import datetime
 import json
 import tempfile
+import time
 import types
 import unittest
 import unittest.mock
@@ -11,11 +13,16 @@ from support.loader import sb
 REPO = Path(__file__).resolve().parents[2]
 NOW = 1_800_000_000.0
 MIN = 60
+load_real = sb.load_module
 
 
-def load(mutant=False):
+def load(mutant=False, prune_mutant=False):
     text = (REPO / "bin" / "pod_silence.py").read_text()
     applied = False
+    if prune_mutant:   # a capped pass prunes too: the told mark of an unread pod is lost
+        new = text.replace("    if prune:\n", "    if True:\n", 1)
+        applied = new != text
+        text = new
     if mutant:   # no once-only state: the told mark is never kept
         new = text.replace('mem["told"] = now\n', 'mem["told"] = None\n', 1)
         applied = new != text
@@ -62,12 +69,8 @@ class TestPodSilence(unittest.TestCase):
         self.assertEqual(len(self.run_passes(mutant, [pod("silent")], 2)), 2)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 def _when(epoch):
-    import datetime
     return datetime.datetime.fromtimestamp(epoch, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
@@ -86,13 +89,11 @@ class TestPodSilenceTick(unittest.TestCase):
         return "stub of " + name
 
     def rec(self, name, **extra):
-        import time
         base = {"worker": name, "reports_to": "lane-a", "hard_deadline": _when(time.time() + 7200)}
         base.update(extra)
         return base
 
     def tick(self, engine, ahead=0):
-        import time
         real = time.time
         with unittest.mock.patch.object(sb.time, "time", lambda: real() + ahead):
             return sb.pod_silence_tick(engine, None, self.summary)
@@ -105,7 +106,6 @@ class TestPodSilenceTick(unittest.TestCase):
         self.assertEqual(len(got), 1)
 
     def test_failed_retired_and_past_deadline_records_read_and_send_nothing(self):
-        import time
         engine = self.world([self.rec("failed"), self.rec("gone", retired=True), self.rec("late", hard_deadline=_when(time.time() - 60))])
         (engine.state_dir / "last-reports.json").write_text(json.dumps({"failed": {"state": "failed", "at": 1}}))
         self.tick(engine)
@@ -113,25 +113,61 @@ class TestPodSilenceTick(unittest.TestCase):
         self.assertEqual(self.reads, [])
         self.assertEqual(self.sent, [])
 
-    def test_a_capped_pass_that_omits_a_told_pod_does_not_tell_it_again(self):
+    def capped_scenario(self, module=None):
         engine = self.world([self.rec("p1"), self.rec("p2")])
-        self.tick(engine)
-        self.tick(engine, ahead=21 * MIN)
-        self.assertEqual(len(self.sent), 2)
-        full = engine.cloud_watch["records"]
-        engine.cloud_watch = {"records": [full[1]], "capped": True}   # p1 not read this pass
-        self.tick(engine, ahead=22 * MIN)
-        engine.cloud_watch = {"records": full, "capped": True}
-        self.tick(engine, ahead=23 * MIN)
-        self.assertEqual(len(self.sent), 2)
+        with unittest.mock.patch.object(sb, "load_module", lambda n: module if (n == "pod_silence" and module) else load_real(n)):
+            self.tick(engine)
+            self.tick(engine, ahead=21 * MIN)
+            self.assertEqual(len(self.sent), 2)
+            full = engine.cloud_watch["records"]
+            engine.cloud_watch = {"records": [full[1]], "capped": True}   # p1 not read this pass
+            self.tick(engine, ahead=22 * MIN)
+            engine.cloud_watch = {"records": full, "capped": True}
+            self.tick(engine, ahead=23 * MIN)
+            self.tick(engine, ahead=50 * MIN)   # past the 20 minutes: without the told mark p1 WOULD be told again
+        return [text for _, text in self.sent]
 
-    def test_scan_prune_false_keeps_the_told_mark(self):
-        module, _ = load()
+    def test_a_capped_pass_that_omits_a_told_pod_does_not_tell_it_again(self):
+        texts = self.capped_scenario()
+        self.assertEqual(len(texts), 2, "the told pod was told again: %r" % texts[2:])
+
+    def test_mutant_pruning_on_a_capped_pass_tells_the_omitted_pod_again(self):
+        self.assertEqual(len(self.capped_scenario()), 2)   # control first
+        control_sent = list(self.sent)
+        mutant, applied = load(prune_mutant=True)
+        self.assertTrue(applied)
+        self.sent = []
+        texts = self.capped_scenario(mutant)
+        self.assertEqual(len(control_sent), 2)
+        self.assertEqual(len(texts), 3)   # a no-op mutant would send 2
+        self.assertIn("stub of p1", texts[2])
+
+    def prune_false_run(self, module):
         with tempfile.TemporaryDirectory() as tmp:
             state = str(Path(tmp) / "s.json")
             sent = []
             module.scan([pod("a")], NOW - 30 * MIN, state, lambda to, t: None, lambda n: "x", json.loads)
-            module.scan([pod("a")], NOW, state, lambda to, t: sent.append(t), lambda n: "x", json.loads)
+            module.scan([pod("a")], NOW, state, lambda to, t: sent.append(t), lambda n: "x of a", json.loads)
             module.scan([pod("b")], NOW + 1, state, lambda to, t: None, lambda n: "x", json.loads, prune=False)
-            module.scan([pod("a")], NOW + 2, state, lambda to, t: sent.append(t), lambda n: "x", json.loads)
-        self.assertEqual(len(sent), 1)
+            module.scan([pod("a")], NOW + 2, state, lambda to, t: sent.append(t), lambda n: "x of a", json.loads)
+            module.scan([pod("a")], NOW + 2 + 21 * MIN, state, lambda to, t: sent.append(t), lambda n: "x of a", json.loads)   # past the 20 minutes
+        return sent
+
+    def test_scan_prune_false_keeps_the_told_mark(self):
+        module, _ = load()
+        sent = self.prune_false_run(module)
+        self.assertEqual(len(sent), 1, "the told pod was told again: %r" % sent[1:])
+
+    def test_mutant_pruning_despite_prune_false_tells_again(self):
+        control, applied0 = load()
+        self.assertFalse(applied0)
+        self.assertEqual(len(self.prune_false_run(control)), 1)   # control first
+        mutant, applied = load(prune_mutant=True)
+        self.assertTrue(applied)
+        sent = self.prune_false_run(mutant)
+        self.assertEqual(len(sent), 2)   # a no-op mutant would send 1
+        self.assertIn("x of a", sent[1])
+
+
+if __name__ == "__main__":
+    unittest.main()
