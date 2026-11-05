@@ -1,0 +1,667 @@
+From 97bf310af7bf21992374dfd4b007d4c0d1587da3 Mon Sep 17 00:00:00 2001
+From: w <w@x>
+Date: Thu, 5 Nov 2026 15:54:07 +0000
+Subject: [PATCH 1/2] ask #2196: gate shards on reused head
+
+---
+ .github/workflows/test.yml | 118 +++++++++++++++++++++++---------
+ bin/test-workflow-split    | 136 +++++++++++++++++++++++++++++++------
+ 2 files changed, 200 insertions(+), 54 deletions(-)
+
+diff --git a/.github/workflows/test.yml b/.github/workflows/test.yml
+index 0110153c..71e52f63 100644
+--- a/.github/workflows/test.yml
++++ b/.github/workflows/test.yml
+@@ -38,8 +38,12 @@ jobs:
+   plan:
+     name: plan
+     runs-on: ubuntu-latest
++    permissions:
++      contents: read
++      actions: read
+     outputs:
+       matrix: ${{ steps.plan.outputs.matrix }}
++      reused: ${{ steps.plan.outputs.reused }}
+     defaults:
+       run:
+         shell: bash
+@@ -48,9 +52,32 @@ jobs:
+         with:
+           fetch-depth: 0
+ 
++      # #2196: marking a draft ready re-ran every leg on a head whose draft run had completed. Look for a SUCCESSFUL run (conclusion success: a failed or cancelled run is never reused, so a flaky failure gets its retry)
++      # of this workflow on the same head, and the legs it ran (a leg whose job was not skipped). Empty outputs on any doubt: every needed leg runs.
++      - name: Find a completed run on this head
++        id: prior
++        if: ${{ github.event_name == 'pull_request' && github.event.action == 'ready_for_review' }}
++        env:
++          GH_TOKEN: ${{ github.token }}
++          REPO: ${{ github.repository }}
++          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
++          THIS_RUN: ${{ github.run_id }}
++        run: |
++          id=$(gh api "repos/$REPO/actions/runs?head_sha=$HEAD_SHA&per_page=100" --jq "[.workflow_runs[] | select(.path == \".github/workflows/test.yml\" and .status == \"completed\" and .conclusion == \"success\" and (.id | tostring) != \"$THIS_RUN\")] | sort_by(.created_at) | last | .id // empty" 2>/dev/null) || id=""
++          legs=""
++          if [ -n "$id" ]; then
++            legs=$(gh api "repos/$REPO/actions/runs/$id/jobs?per_page=100" --jq '[.jobs[] | select(.conclusion != "skipped" and .conclusion != "cancelled") | .name | capture("^test \\((?<os>[^)]+)\\)$") | .os] | unique | tojson' 2>/dev/null) || legs=""
++          fi
++          if [ -z "$legs" ]; then id=""; fi
++          echo "run=$id" >> "$GITHUB_OUTPUT"
++          echo "legs=$legs" >> "$GITHUB_OUTPUT"
++
+       - name: Decide the runners
+         id: plan
+         env:
++          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
++          PRIOR_RUN: ${{ steps.prior.outputs.run }}
++          PRIOR_LEGS: ${{ steps.prior.outputs.legs }}
+           EVENT: ${{ github.event_name }}
+           BASE: ${{ github.base_ref }}
+           DRAFT: ${{ github.event.pull_request.draft }}
+@@ -98,14 +125,21 @@ jobs:
+                           note("a workflow file is changed by this pull request: running macOS")
+                       macos = diff.returncode != 0 or LIST in files or any(f.startswith(WORKFLOWS) for f in files) or any(fnmatch.fnmatchcase(f, p) for f in files for p in patterns)
+           oses = ["ubuntu-latest"] + (["macos-latest"] if macos else [])
++          reused = []
++          if event == "pull_request" and os.environ.get("ACTION") == "ready_for_review" and os.environ.get("PRIOR_RUN") and os.environ.get("PRIOR_LEGS"):
++              ran = json.loads(os.environ["PRIOR_LEGS"])
++              reused = [o for o in oses if o in ran]
++              # every leg still runs and reports its own check name; a reused leg only skips its heavy steps (ask #2196)
++              note("head %s: reusing successful run %s (legs it ran: %s); legs that skip their steps: %s" % (os.environ.get("HEAD_SHA", "?"), os.environ["PRIOR_RUN"], ", ".join(ran) or "none", ", ".join(reused) or "none"))
+           rows = []
+           if event == "schedule":
+               refs = ["main"] + (["integration"] if git("rev-parse", "--verify", "-q", "refs/remotes/origin/integration").returncode == 0 else [])
+-              rows = [dict(os=o, ref=r, name="nightly %s (%s)" % (r, o), cloud="nightly-cloud %s (%s)" % (r, o)) for r in refs for o in ["ubuntu-latest", "macos-latest"]]
++              rows = [dict(os=o, ref=r, name="nightly %s (%s)" % (r, o), cloud="nightly-cloud %s (%s)" % (r, o), reuse="false", reuse_run="") for r in refs for o in ["ubuntu-latest", "macos-latest"]]
+           else:
+-              rows = [dict(os=o, ref="", name="test (%s)" % o, cloud="test-cloud (%s)" % o) for o in oses]
++              rows = [dict(os=o, ref="", name="test (%s)" % o, cloud="test-cloud (%s)" % o, reuse="true" if o in reused else "false", reuse_run=os.environ.get("PRIOR_RUN", "") if o in reused else "") for o in oses]
+           with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+               out.write("matrix=" + json.dumps(rows, separators=(",", ":")) + "\n")
++              out.write("reused=" + json.dumps(reused, separators=(",", ":")) + "\n")
+           PY
+ 
+   test:
+@@ -121,18 +155,28 @@ jobs:
+         # Explicit bash gives -eo pipefail, so a suite's exit code survives the tee.
+         shell: bash
+     steps:
++      - name: Reused run
++        if: ${{ matrix.reuse == 'true' }}
++        env:
++          REUSE_RUN: ${{ matrix.reuse_run }}
++          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
++        run: echo "$HEAD_SHA: reusing the successful run $REUSE_RUN for ${{ matrix.os }}; this leg's steps are skipped" | tee -a "$GITHUB_STEP_SUMMARY"
++
+       - uses: actions/checkout@v5
++        if: ${{ matrix.reuse != 'true' }}
+         with:
+           # Full history: test-fleet-doctor-heartbeat compares against a baseline commit.
+           fetch-depth: 0
+           # Empty for every run but the nightly: the event's own ref. The nightly checks out its leg's branch.
+           ref: ${{ matrix.ref }}
+ 
+-      - run: python3 --version
++      - if: ${{ matrix.reuse != 'true' }}
++        run: python3 --version
+ 
+       # This repo is public: refuse private names. The list lives in the repository secret PRIVATE_NAMES (never in the
+       # tree); without it (a fork's pull request has no secrets) the check prints a "skipped" note and passes.
+       - name: bin/check-public-names
++        if: ${{ matrix.reuse != 'true' }}
+         env:
+           FLEET_PRIVATE_NAMES: ${{ secrets.PRIVATE_NAMES }}
+         run: python3 bin/check-public-names
+@@ -140,63 +184,64 @@ jobs:
+       # Each suite exits non-zero on failure; the grep also fails the step if
+       # the last RESULT line is anything other than PASS.
+       - name: bin/test-heartbeat
++        if: ${{ matrix.reuse != 'true' }}
+         run: |
+           bin/test-heartbeat 2>&1 | tee "$RUNNER_TEMP/out.txt"
+           grep -qx 'RESULT: PASS' "$RUNNER_TEMP/out.txt"
+ 
+       - name: bin/test-health-records
+-        if: ${{ !cancelled() }}
++        if: ${{ !cancelled() && matrix.reuse != 'true' }}
+         run: |
+           bin/test-health-records 2>&1 | tee "$RUNNER_TEMP/out.txt"
+           grep -qx 'RESULT: PASS' "$RUNNER_TEMP/out.txt"
+ 
+       - name: bin/test-fleet-doctor
+-        if: ${{ !cancelled() }}
++        if: ${{ !cancelled() && matrix.reuse != 'true' }}
+         run: |
+           bin/test-fleet-doctor 2>&1 | tee "$RUNNER_TEMP/out.txt"
+           grep -qx 'RESULT: PASS' "$RUNNER_TEMP/out.txt"
+ 
+       - name: bin/test-fleet-doctor-config
+-        if: ${{ !cancelled() }}
++        if: ${{ !cancelled() && matrix.reuse != 'true' }}
+         run: |
+           bin/test-fleet-doctor-config 2>&1 | tee "$RUNNER_TEMP/out.txt"
+           grep -qx 'RESULT: PASS' "$RUNNER_TEMP/out.txt"
+ 
+       - name: bin/test-fleet-doctor-heartbeat
+-        if: ${{ !cancelled() }}
++        if: ${{ !cancelled() && matrix.reuse != 'true' }}
+         run: |
+           bin/test-fleet-doctor-heartbeat 2>&1 | tee "$RUNNER_TEMP/out.txt"
+           grep -qx 'RESULT: PASS' "$RUNNER_TEMP/out.txt"
+ 
+       # Ubuntu runs this file in the `shards` job; macOS (and the nightly) still run the whole file here.
+       - name: bin/test-switchboard
+-        if: ${{ !cancelled() && (matrix.os != 'ubuntu-latest' || github.event_name == 'schedule') }}
++        if: ${{ (!cancelled() && (matrix.os != 'ubuntu-latest' || github.event_name == 'schedule')) && matrix.reuse != 'true' }}
+         run: |
+           bin/test-switchboard 2>&1 | tee "$RUNNER_TEMP/out.txt"
+           grep -qx 'RESULT: PASS' "$RUNNER_TEMP/out.txt"
+ 
+       - name: bin/test-workflow-split
+-        if: ${{ !cancelled() }}
++        if: ${{ !cancelled() && matrix.reuse != 'true' }}
+         run: |
+           bin/test-workflow-split 2>&1 | tee "$RUNNER_TEMP/out.txt"
+           grep -qx 'RESULT: PASS' "$RUNNER_TEMP/out.txt"
+ 
+       # About 110 s: runs on both legs, inside the existing job.
+       - name: bin/test-path-suites
+-        if: ${{ !cancelled() }}
++        if: ${{ !cancelled() && matrix.reuse != 'true' }}
+         timeout-minutes: 15
+         run: |
+           bin/test-path-suites 2>&1 | tee "$RUNNER_TEMP/out-paths.txt"
+           grep -qx 'RESULT: PASS' "$RUNNER_TEMP/out-paths.txt"
+ 
+       - name: bin/test-gh-hold
+-        if: ${{ !cancelled() }}
++        if: ${{ !cancelled() && matrix.reuse != 'true' }}
+         run: |
+           bin/test-gh-hold 2>&1 | tee "$RUNNER_TEMP/out-hold.txt"
+           grep -qx 'RESULT: PASS' "$RUNNER_TEMP/out-hold.txt"
+ 
+       - name: bin/test-app-mint
+-        if: ${{ !cancelled() }}
++        if: ${{ !cancelled() && matrix.reuse != 'true' }}
+         run: |
+           bin/test-app-mint 2>&1 | tee "$RUNNER_TEMP/out-app.txt"
+           grep -qx 'RESULT: PASS' "$RUNNER_TEMP/out-app.txt"
+@@ -204,7 +249,7 @@ jobs:
+       # #1605: the pull request head merged with the CURRENT tip of its base (fetched now, never the stored merge ref): no file with a size row in
+       # docs/architecture.md may end over its ceiling because of this pull request. A plain re-run of the job reads the then-current tip.
+       - name: Size ceilings on the merge result
+-        if: ${{ github.event_name == 'pull_request' && github.base_ref == 'integration' && !cancelled() }}
++        if: ${{ (github.event_name == 'pull_request' && github.base_ref == 'integration' && !cancelled()) && matrix.reuse != 'true' }}
+         env:
+           BASE: ${{ github.base_ref }}
+           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+@@ -213,14 +258,14 @@ jobs:
+           python3 bin/size_ceilings.py check --tip "origin/$BASE" --head "$HEAD_SHA"
+ 
+       - name: bin/test-cloud-neutral-names
+-        if: ${{ !cancelled() }}
++        if: ${{ !cancelled() && matrix.reuse != 'true' }}
+         run: |
+           bin/test-cloud-neutral-names 2>&1 | tee "$RUNNER_TEMP/out.txt"
+           grep -qx 'RESULT: PASS' "$RUNNER_TEMP/out.txt"
+ 
+       # The image-scan cases build images FROM a pulled base image (network): skipped here, with a visible "skip docker" line.
+       - name: cloud/tests/test-cloud
+-        if: ${{ !cancelled() }}
++        if: ${{ !cancelled() && matrix.reuse != 'true' }}
+         timeout-minutes: 10
+         env:
+           CLOUD_TEST_SKIP_DOCKER: "1"
+@@ -229,19 +274,19 @@ jobs:
+           grep -qx 'RESULT: PASS' "$RUNNER_TEMP/out.txt"
+ 
+       - name: node --test plugins/fleet-decisions-tui/health.test.mjs
+-        if: ${{ !cancelled() }}
++        if: ${{ !cancelled() && matrix.reuse != 'true' }}
+         run: node --test plugins/fleet-decisions-tui/health.test.mjs
+ 
+       - name: node --test the other plugin tests
+-        if: ${{ !cancelled() }}
++        if: ${{ !cancelled() && matrix.reuse != 'true' }}
+         run: node --test plugins/fleet-decisions-tui/click.test.mjs plugins/fleet-decisions-tui/kind.test.mjs plugins/fleet-hooks/index.test.mjs
+ 
+       - name: bin/fleet-scenario validate
+-        if: ${{ !cancelled() }}
++        if: ${{ !cancelled() && matrix.reuse != 'true' }}
+         run: bin/fleet-scenario validate
+ 
+       - name: bin/fleet-scenario coverage
+-        if: ${{ !cancelled() }}
++        if: ${{ !cancelled() && matrix.reuse != 'true' }}
+         run: bin/fleet-scenario coverage --enforce --through-pr 4
+ 
+   # bin/test-switchboard in 8 shards on ubuntu, beside `test` (needs only `plan`; `test` does not wait for it). Check names: `shards (I/8)`.
+@@ -285,89 +330,98 @@ jobs:
+         # Explicit bash gives -eo pipefail, so a suite's exit code survives the tee.
+         shell: bash
+     steps:
++      - name: Reused run
++        if: ${{ matrix.reuse == 'true' }}
++        env:
++          REUSE_RUN: ${{ matrix.reuse_run }}
++          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
++        run: echo "$HEAD_SHA: reusing the successful run $REUSE_RUN for ${{ matrix.os }}; this leg's steps are skipped" | tee -a "$GITHUB_STEP_SUMMARY"
++
+       - uses: actions/checkout@v5
++        if: ${{ matrix.reuse != 'true' }}
+         with:
+           # Full history: test-fleet-doctor-heartbeat compares against a baseline commit.
+           fetch-depth: 0
+           # Empty for every run but the nightly: the event's own ref. The nightly checks out its leg's branch.
+           ref: ${{ matrix.ref }}
+ 
+-      - run: python3 --version
++      - if: ${{ matrix.reuse != 'true' }}
++        run: python3 --version
+ 
+       - name: bin/test-cloud-worker
+-        if: ${{ !cancelled() }}
++        if: ${{ !cancelled() && matrix.reuse != 'true' }}
+         run: |
+           bin/test-cloud-worker 2>&1 | tee "$RUNNER_TEMP/out.txt"
+           grep -qx 'RESULT: PASS' "$RUNNER_TEMP/out.txt"
+ 
+       - name: bin/test-cloud-launcher
+-        if: ${{ !cancelled() }}
++        if: ${{ !cancelled() && matrix.reuse != 'true' }}
+         timeout-minutes: 20
+         run: |
+           bin/test-cloud-launcher 2>&1 | tee "$RUNNER_TEMP/out.txt"
+           grep -qx 'RESULT: PASS' "$RUNNER_TEMP/out.txt"
+ 
+       - name: bin/test-cloud-hub
+-        if: ${{ !cancelled() }}
++        if: ${{ !cancelled() && matrix.reuse != 'true' }}
+         timeout-minutes: 10
+         run: |
+           bin/test-cloud-hub 2>&1 | tee "$RUNNER_TEMP/out.txt"
+           grep -qx 'RESULT: PASS' "$RUNNER_TEMP/out.txt"
+ 
+       - name: bin/test-cloud-channel
+-        if: ${{ !cancelled() }}
++        if: ${{ !cancelled() && matrix.reuse != 'true' }}
+         run: |
+           bin/test-cloud-channel 2>&1 | tee "$RUNNER_TEMP/out.txt"
+           grep -qx 'RESULT: PASS' "$RUNNER_TEMP/out.txt"
+ 
+       - name: bin/test-cloud-channel-server
+-        if: ${{ !cancelled() }}
++        if: ${{ !cancelled() && matrix.reuse != 'true' }}
+         run: |
+           bin/test-cloud-channel-server 2>&1 | tee "$RUNNER_TEMP/out.txt"
+           grep -qx 'RESULT: PASS' "$RUNNER_TEMP/out.txt"
+ 
+       - name: bin/test-cloud-client
+-        if: ${{ !cancelled() }}
++        if: ${{ !cancelled() && matrix.reuse != 'true' }}
+         run: |
+           bin/test-cloud-client 2>&1 | tee "$RUNNER_TEMP/out.txt"
+           grep -qx 'RESULT: PASS' "$RUNNER_TEMP/out.txt"
+ 
+       - name: bin/test-cloud-way-back
+-        if: ${{ !cancelled() }}
++        if: ${{ !cancelled() && matrix.reuse != 'true' }}
+         run: |
+           bin/test-cloud-way-back 2>&1 | tee "$RUNNER_TEMP/out.txt"
+           grep -qx 'RESULT: PASS' "$RUNNER_TEMP/out.txt"
+ 
+       - name: bin/test-decisions-pull
+-        if: ${{ !cancelled() }}
++        if: ${{ !cancelled() && matrix.reuse != 'true' }}
+         timeout-minutes: 10
+         run: |
+           bin/test-decisions-pull 2>&1 | tee "$RUNNER_TEMP/out.txt"
+           grep -qx 'RESULT: PASS' "$RUNNER_TEMP/out.txt"
+ 
+       - name: bin/test-cloud-cli
+-        if: ${{ !cancelled() }}
++        if: ${{ !cancelled() && matrix.reuse != 'true' }}
+         timeout-minutes: 10
+         run: |
+           bin/test-cloud-cli 2>&1 | tee "$RUNNER_TEMP/out.txt"
+           grep -qx 'RESULT: PASS' "$RUNNER_TEMP/out.txt"
+ 
+       - name: bin/test-cloud-relay
+-        if: ${{ !cancelled() }}
++        if: ${{ !cancelled() && matrix.reuse != 'true' }}
+         timeout-minutes: 10
+         run: |
+           bin/test-cloud-relay 2>&1 | tee "$RUNNER_TEMP/out.txt"
+           grep -qx 'RESULT: PASS' "$RUNNER_TEMP/out.txt"
+ 
+       - name: bin/test-cloud-hub-relay
+-        if: ${{ !cancelled() }}
++        if: ${{ !cancelled() && matrix.reuse != 'true' }}
+         timeout-minutes: 10
+         run: |
+           bin/test-cloud-hub-relay 2>&1 | tee "$RUNNER_TEMP/out.txt"
+           grep -qx 'RESULT: PASS' "$RUNNER_TEMP/out.txt"
+ 
+       - name: bin/test-cloud-relay-daemon
+-        if: ${{ !cancelled() }}
++        if: ${{ !cancelled() && matrix.reuse != 'true' }}
+         timeout-minutes: 10
+         run: |
+           bin/test-cloud-relay-daemon 2>&1 | tee "$RUNNER_TEMP/out.txt"
+diff --git a/bin/test-workflow-split b/bin/test-workflow-split
+index 0c8851c9..9b87ce07 100755
+--- a/bin/test-workflow-split
++++ b/bin/test-workflow-split
+@@ -150,15 +150,17 @@ WORKFLOW_KEYS = ["concurrency", "jobs", "name", "on", "permissions"]
+ 
+ # The expected STEP LISTS, written out in full and in order: every step is compared as the whole parsed mapping (key set and values), so a step,
+ # or a key of a step, that is not listed fails. Nothing here is derived from the workflow it pins.
+-NOT_CANCELLED = "${{ !cancelled() }}"
+-CHECKOUT = {"uses": "actions/checkout@v5", "with": {"fetch-depth": "0", "ref": "${{ matrix.ref }}"}}
+-PYTHON = {"run": "python3 --version"}
++# #2196: every step of both leg jobs also carries `matrix.reuse != 'true'` (a leg whose run is reused still runs, reports its name and skips its steps)
++NOT_REUSED = "${{ matrix.reuse != 'true' }}"
++NOT_CANCELLED = "${{ !cancelled() && matrix.reuse != 'true' }}"
++REUSED = {"name": "Reused run", "if": "${{ matrix.reuse == 'true' }}", "env": {"REUSE_RUN": "${{ matrix.reuse_run }}", "HEAD_SHA": "${{ github.event.pull_request.head.sha }}"},
++          "run": "echo \"$HEAD_SHA: reusing the successful run $REUSE_RUN for ${{ matrix.os }}; this leg's steps are skipped\" | tee -a \"$GITHUB_STEP_SUMMARY\""}
++CHECKOUT = {"uses": "actions/checkout@v5", "if": NOT_REUSED, "with": {"fetch-depth": "0", "ref": "${{ matrix.ref }}"}}
++PYTHON = {"if": NOT_REUSED, "run": "python3 --version"}
+ 
+ 
+ def step(name, out="", always=True, **more):
+-    out_ = {"name": name, "run": run_of(name, out)}
+-    if always:
+-        out_["if"] = NOT_CANCELLED
++    out_ = {"name": name, "run": run_of(name, out), "if": NOT_CANCELLED if always else NOT_REUSED}
+     out_.update(more)
+     return out_
+ 
+@@ -167,14 +169,14 @@ def plain(name, run):
+     return {"name": name, "if": NOT_CANCELLED, "run": run}
+ 
+ 
+-TEST_STEPS = [CHECKOUT, PYTHON,
+-              {"name": "bin/check-public-names", "env": {"FLEET_PRIVATE_NAMES": "${{ secrets.PRIVATE_NAMES }}"}, "run": "python3 bin/check-public-names"},
++TEST_STEPS = [REUSED, CHECKOUT, PYTHON,
++              {"name": "bin/check-public-names", "if": NOT_REUSED, "env": {"FLEET_PRIVATE_NAMES": "${{ secrets.PRIVATE_NAMES }}"}, "run": "python3 bin/check-public-names"},
+               step("bin/test-heartbeat", always=False), step("bin/test-health-records"), step("bin/test-fleet-doctor"),
+               step("bin/test-fleet-doctor-config"), step("bin/test-fleet-doctor-heartbeat"),
+               # #2131: ubuntu runs the file in the `shards` job (not on the nightly); macOS and the nightly run it whole here.
+-              step("bin/test-switchboard", always=False, **{"if": "${{ !cancelled() && (matrix.os != 'ubuntu-latest' || github.event_name == 'schedule') }}"}),
++              step("bin/test-switchboard", always=False, **{"if": "${{ (!cancelled() && (matrix.os != 'ubuntu-latest' || github.event_name == 'schedule')) && matrix.reuse != 'true' }}"}),
+               step("bin/test-workflow-split"), step("bin/test-path-suites", "-paths", **{"timeout-minutes": "15"}), step("bin/test-gh-hold", "-hold"), step("bin/test-app-mint", "-app"),
+-              {"name": "Size ceilings on the merge result", "if": "${{ github.event_name == 'pull_request' && github.base_ref == 'integration' && !cancelled() }}",
++              {"name": "Size ceilings on the merge result", "if": "${{ (github.event_name == 'pull_request' && github.base_ref == 'integration' && !cancelled()) && matrix.reuse != 'true' }}",
+                "env": {"BASE": "${{ github.base_ref }}", "HEAD_SHA": "${{ github.event.pull_request.head.sha }}"},
+                "run": "git fetch origin \"$BASE\"\npython3 bin/size_ceilings.py check --tip \"origin/$BASE\" --head \"$HEAD_SHA\""},
+               step("bin/test-cloud-neutral-names"),
+@@ -183,7 +185,7 @@ TEST_STEPS = [CHECKOUT, PYTHON,
+               plain("node --test the other plugin tests", "node --test plugins/fleet-decisions-tui/click.test.mjs plugins/fleet-decisions-tui/kind.test.mjs plugins/fleet-hooks/index.test.mjs"),
+               plain("bin/fleet-scenario validate", "bin/fleet-scenario validate"),
+               plain("bin/fleet-scenario coverage", "bin/fleet-scenario coverage --enforce --through-pr 4")]
+-CLOUD_STEPS = [CHECKOUT, PYTHON, step("bin/test-cloud-worker"), step("bin/test-cloud-launcher", **{"timeout-minutes": LAUNCHER_TIMEOUT})] + [
++CLOUD_STEPS = [REUSED, CHECKOUT, PYTHON, step("bin/test-cloud-worker"), step("bin/test-cloud-launcher", **{"timeout-minutes": LAUNCHER_TIMEOUT})] + [
+     step(n, **({"timeout-minutes": t} if t else {})) for n, t in ADDED + RELAY]
+ STEP_LISTS = {"test": TEST_STEPS, "test-cloud": CLOUD_STEPS}
+ # The step schema of GitHub Actions: every key class that can skip, soften, redirect or widen a step.
+@@ -210,6 +212,29 @@ def resolved(job, event, base="", draft=False, text=None):
+     return sorted(r[key] for r in rows)
+ 
+ 
++def plan_rows(event="pull_request", base="integration", draft=False, action="", prior_run="", prior_legs=None, head="abc123", text=None):
++    """Run the real plan script with the given prior run (the `prior` step's two outputs); return (the os values of the REUSED rows, the job-summary text). Every leg is a row."""
++    text = WORKFLOW.read_text() if text is None else text
++    start = text.index("          python3 - <<'PY'\n")
++    end = text.index("\n          PY\n", start)
++    run = "\n".join(l[10:] for l in text[start:end + len("\n          PY")].splitlines()) + "\n"
++    with tempfile.TemporaryDirectory() as tmp:
++        out, summary = os.path.join(tmp, "out.txt"), os.path.join(tmp, "summary.md")
++        open(out, "w").close()
++        open(summary, "w").close()
++        env = dict(os.environ, EVENT=event, BASE=base, DRAFT="true" if draft else "false", ACTION=action, GITHUB_OUTPUT=out, GITHUB_STEP_SUMMARY=summary,
++                   HEAD_SHA=head, PRIOR_RUN=prior_run, PRIOR_LEGS=json.dumps(prior_legs) if prior_legs is not None else "")
++        subprocess.run(["bash", "-c", run], cwd=tmp, env=env, check=True, capture_output=True)
++        line = [l for l in open(out).read().splitlines() if l.startswith("matrix=")][-1]
++        rows = json.loads(line[len("matrix="):])
++        LAST["all"] = sorted(r["os"] for r in rows)   # every leg is a row, reused or not: it runs and reports its own name
++        return sorted(r["os"] for r in rows if r["reuse"] == "true"), open(summary).read()
++
++
++BOTH = ["macos-latest", "ubuntu-latest"]
++LAST = {}
++
++
+ def only_suites(table):
+     return [row for row in table if row[0] not in ("bin/check-public-names", "bin/fleet-scenario validate", "bin/fleet-scenario coverage")]
+ 
+@@ -248,6 +273,55 @@ class Pins(unittest.TestCase):
+             self.assertEqual(resolved(job, event, base, text=self.text), sorted(OLD_CHECKS), event)
+         self.assertEqual(resolved(job, "pull_request", "main", draft=True, text=self.text), ["test (ubuntu-latest)"])   # a draft into main: ubuntu only (ask #990)
+ 
++    def test_s2_ready_for_review_on_a_head_with_a_successful_run_reuses_the_legs_it_ran_but_keeps_every_row(self):
++        # a pull request into integration (the plan reads no diff here, so macOS is needed): the successful run ran both legs
++        rows, _ = plan_rows(action="ready_for_review", prior_run="777", prior_legs=BOTH, text=self.text)
++        self.assertEqual((rows, LAST["all"]), (BOTH, BOTH))
++        rows, _ = plan_rows(action="ready_for_review", prior_run="777", prior_legs=["ubuntu-latest"], text=self.text)
++        self.assertEqual((rows, LAST["all"]), (["ubuntu-latest"], BOTH))
++
++    def test_s3_ready_for_review_without_a_successful_run_or_on_another_action_reuses_nothing(self):
++        rows, _ = plan_rows(action="ready_for_review", text=self.text)   # no successful run on the head
++        self.assertEqual((rows, LAST["all"]), ([], BOTH))
++        rows, _ = plan_rows(base="main", draft=True, action="ready_for_review", prior_run="777", prior_legs=["ubuntu-latest"], text=self.text)   # the draft's run skipped macOS
++        self.assertEqual((rows, LAST["all"]), (["ubuntu-latest"], ["ubuntu-latest"]))
++        for action in ("opened", "synchronize", "reopened"):   # only ready_for_review reuses
++            rows, _ = plan_rows(base="main", action=action, prior_run="777", prior_legs=BOTH, text=self.text)
++            self.assertEqual(rows, [], action)
++        rows, _ = plan_rows(event="push", base="", prior_run="777", prior_legs=BOTH, text=self.text)
++        self.assertEqual((rows, LAST["all"]), ([], BOTH))
++
++    def test_s4_a_reuse_says_the_head_and_the_reused_run_in_one_line(self):
++        for legs, base in ((BOTH, "integration"), (["ubuntu-latest"], "integration")):
++            _, summary = plan_rows(base=base, action="ready_for_review", prior_run="777", prior_legs=legs, head="deadbeef", text=self.text)
++            lines = [l for l in summary.splitlines() if "deadbeef" in l and "777" in l]
++            self.assertEqual(len(lines), 1, summary)
++        _, summary = plan_rows(action="ready_for_review", text=self.text)
++        self.assertNotIn("reusing", summary)
++
++    def test_s2_the_prior_run_step_reads_only_successful_runs(self):
++        steps = {s.get("id"): s for s in self.jobs()["plan"]["steps"]}
++        prior = steps["prior"]
++        self.assertEqual(prior["if"], "${{ github.event_name == 'pull_request' && github.event.action == 'ready_for_review' }}")
++        self.assertIn("head_sha=$HEAD_SHA", prior["run"])
++        self.assertIn('.status == \\"completed\\"', prior["run"])
++        self.assertIn('.conclusion == \\"success\\"', prior["run"])
++        self.assertNotIn("!= null", prior["run"])   # a failed or cancelled run is never reused: a flaky failure gets its retry
++        self.assertEqual(self.jobs()["plan"]["permissions"], {"contents": "read", "actions": "read"})
++
++    def test_s2_every_required_check_name_is_produced_by_a_job_without_a_job_level_skip_on_ready_for_review(self):
++        # ask #990 / #2196: a skipped matrix job reports the literal `${{ matrix.name }}`: the leg jobs always run, their heavy steps skip on matrix.reuse
++        for jid in ("test", "test-cloud"):
++            job = self.jobs()[jid]
++            self.assertNotIn("if", job, jid)
++            self.assertIn("matrix.", job["name"])
++            heavy = [s for s in job["steps"] if s.get("name") != "Reused run"]
++            for s in heavy:
++                self.assertIn("matrix.reuse != 'true'", s.get("if", ""), (jid, s.get("name") or s.get("run") or s.get("uses")))
++            note = [s for s in job["steps"] if s.get("name") == "Reused run"]
++            self.assertEqual(len(note), 1, jid)
++            self.assertEqual(note[0]["if"], "${{ matrix.reuse == 'true' }}")
++
+     def test_u3_the_old_job_keeps_its_matrix_runner_and_shell(self):
+         job = self.jobs()["test"]
+         self.assertEqual(job["strategy"]["matrix"], STRATEGY["matrix"])   # the runner list comes from the plan; the plan's rows are pinned in test_s7
+@@ -310,7 +384,7 @@ class Pins(unittest.TestCase):
+         self.assertEqual(self.wf["permissions"], PERMISSIONS)
+         self.assertEqual(self.wf["concurrency"], CONCURRENCY)
+         self.assertLessEqual({"plan", "test", "test-cloud"}, set(self.jobs()))
+-        self.assertEqual(sorted(self.jobs()["plan"]), ["defaults", "name", "outputs", "runs-on", "steps"])
++        self.assertEqual(sorted(self.jobs()["plan"]), ["defaults", "name", "outputs", "permissions", "runs-on", "steps"])
+         for jid in ("test", "test-cloud"):
+             job = self.jobs()[jid]
+             self.assertEqual(sorted(job), JOB_KEYS, jid)
+@@ -358,6 +432,24 @@ class Mutants(unittest.TestCase):
+         unittest.defaultTestLoader.loadTestsFromTestCase(Pins).run(result)
+         self.assertEqual((result.failures, result.errors), ([], []))
+ 
++    def test_s2_the_reuse_dropped(self):
++        self.fails('os.environ.get("ACTION") == "ready_for_review" and os.environ.get("PRIOR_RUN")', 'False and os.environ.get("PRIOR_RUN")', "test_s2_ready_for_review_on_a_head_with_a_successful_run_reuses_the_legs_it_ran_but_keeps_every_row")
++
++    def test_s3_every_leg_reused_on_ready_for_review(self):
++        self.fails('reused = [o for o in oses if o in ran]', 'reused = list(oses)', "test_s2_ready_for_review_on_a_head_with_a_successful_run_reuses_the_legs_it_ran_but_keeps_every_row")
++
++    def test_s3_a_failed_or_cancelled_run_reused(self):
++        self.fails('.conclusion == \\"success\\"', '.conclusion != null', "test_s2_the_prior_run_step_reads_only_successful_runs")
++
++    def test_s3_a_leg_job_skipped_by_a_job_level_if(self):
++        self.fails("  test:\n    needs: plan\n", "  test:\n    needs: plan\n    if: ${{ needs.plan.outputs.matrix != '[]' }}\n", "test_s2_every_required_check_name_is_produced_by_a_job_without_a_job_level_skip_on_ready_for_review")
++
++    def test_s3_a_heavy_step_that_ignores_the_reuse(self):
++        self.fails("      - name: bin/test-cloud-hub\n        if: ${{ !cancelled() && matrix.reuse != 'true' }}", "      - name: bin/test-cloud-hub\n        if: ${{ !cancelled() }}", "test_s2_every_required_check_name_is_produced_by_a_job_without_a_job_level_skip_on_ready_for_review")
++
++    def test_s4_the_summary_line_dropped(self):
++        self.fails('              note("head %s: reusing', '              print("head %s: reusing', "test_s4_a_reuse_says_the_head_and_the_reused_run_in_one_line")
++
+     def test_s1_needs_added(self):
+         self.fails("    needs: plan\n    name: ${{ matrix.cloud }}\n", "    needs: [plan, test]\n    name: ${{ matrix.cloud }}\n", "test_s1_a_second_job_runs_the_cloud_suites_in_parallel_on_both_systems")
+ 
+@@ -385,7 +477,7 @@ class Mutants(unittest.TestCase):
+         self.fails("        include: ${{ fromJSON(needs.plan.outputs.matrix) }}", "        os: [ubuntu-latest]", "test_u3_the_old_job_keeps_its_matrix_runner_and_shell")
+ 
+     def test_s7_one_of_the_seven_steps_removed(self):
+-        step = "      - name: bin/test-cloud-way-back\n        if: ${{ !cancelled() }}\n        run: |\n          bin/test-cloud-way-back 2>&1 | tee \"$RUNNER_TEMP/out.txt\"\n          grep -qx 'RESULT: PASS' \"$RUNNER_TEMP/out.txt\"\n"
++        step = "      - name: bin/test-cloud-way-back\n        if: ${{ !cancelled() && matrix.reuse != 'true' }}\n        run: |\n          bin/test-cloud-way-back 2>&1 | tee \"$RUNNER_TEMP/out.txt\"\n          grep -qx 'RESULT: PASS' \"$RUNNER_TEMP/out.txt\"\n"
+         self.assertIn(step, WORKFLOW.read_text())
+         self.fails("\n" + step, "", "test_s9_each_of_the_seven_cloud_suites_runs_in_exactly_one_test_cloud_step")
+ 
+@@ -396,7 +488,7 @@ class Mutants(unittest.TestCase):
+         self.fails(channel, "          bin/test-cloud-channel-server 2>&1 | tee", "test_s9_each_of_the_seven_cloud_suites_runs_in_exactly_one_test_cloud_step")
+ 
+     def test_s9_the_channel_step_removed_alone_fails_the_exactly_one_check(self):
+-        step = "      - name: bin/test-cloud-channel\n        if: ${{ !cancelled() }}\n        run: |\n          bin/test-cloud-channel 2>&1 | tee \"$RUNNER_TEMP/out.txt\"\n          grep -qx 'RESULT: PASS' \"$RUNNER_TEMP/out.txt\"\n"
++        step = "      - name: bin/test-cloud-channel\n        if: ${{ !cancelled() && matrix.reuse != 'true' }}\n        run: |\n          bin/test-cloud-channel 2>&1 | tee \"$RUNNER_TEMP/out.txt\"\n          grep -qx 'RESULT: PASS' \"$RUNNER_TEMP/out.txt\"\n"
+         self.assertIn(step, WORKFLOW.read_text())
+         self.fails("\n" + step, "", "test_s9_each_of_the_seven_cloud_suites_runs_in_exactly_one_test_cloud_step")
+ 
+@@ -408,7 +500,7 @@ class Mutants(unittest.TestCase):
+ 
+     def test_u1_launcher_left_in_the_old_job(self):
+         text = WORKFLOW.read_text()
+-        step = "      - name: bin/test-cloud-launcher\n        if: ${{ !cancelled() }}\n        timeout-minutes: " + LAUNCHER_TIMEOUT + "\n        run: |\n          bin/test-cloud-launcher 2>&1 | tee \"$RUNNER_TEMP/out.txt\"\n          grep -qx 'RESULT: PASS' \"$RUNNER_TEMP/out.txt\"\n"
++        step = "      - name: bin/test-cloud-launcher\n        if: ${{ !cancelled() && matrix.reuse != 'true' }}\n        timeout-minutes: " + LAUNCHER_TIMEOUT + "\n        run: |\n          bin/test-cloud-launcher 2>&1 | tee \"$RUNNER_TEMP/out.txt\"\n          grep -qx 'RESULT: PASS' \"$RUNNER_TEMP/out.txt\"\n"
+         self.assertIn(step, text)
+         text = text.replace(step, "") .replace("      - name: bin/test-switchboard\n", step + "\n      - name: bin/test-switchboard\n", 1)
+         for t in ("test_s1_a_second_job_runs_the_cloud_suites_in_parallel_on_both_systems", "test_u1_every_suite_command_appears_once_in_its_original_order_with_the_result_grep"):
+@@ -428,7 +520,7 @@ class Mutants(unittest.TestCase):
+         self.fails("  test-cloud:\n", "  test-cloud:\n    concurrency:\n      group: x\n", "test_s6_the_concurrency_block_is_the_current_one_and_no_job_has_its_own")
+ 
+     def test_u2_a_job_level_if(self):
+-        self.fails("  test-cloud:\n", "  test-cloud:\n    if: github.event_name == 'pull_request'\n", "test_u2_three_triggers_no_job_level_if_and_the_image_suite_limit")
++        self.fails("    name: ${{ matrix.cloud }}", "    if: github.event_name == 'pull_request'\n    name: ${{ matrix.cloud }}", "test_u2_three_triggers_no_job_level_if_and_the_image_suite_limit")
+ 
+     def test_u2_a_trigger_dropped(self):
+         self.fails("  workflow_dispatch:\n", "", "test_u2_three_triggers_no_job_level_if_and_the_image_suite_limit")
+@@ -479,22 +571,22 @@ class Mutants(unittest.TestCase):
+     @staticmethod
+     def anchor(jid, step_):
+         """The text of the step's first line (`      - name: X` or `      - uses: ...`), searched from the job's own line."""
+-        first = "name" if "name" in step_ else ("uses" if "uses" in step_ else "run")
++        first = "name" if "name" in step_ else ("uses" if "uses" in step_ else "if")
+         return "      - %s: %s\n" % (first, step_[first])
+ 
+     def test_steps_the_reviewers_named_each_fail(self):
+         text = WORKFLOW.read_text()
+         i = text.index("  test-cloud:")
+         launcher = "      - name: bin/test-cloud-launcher\n"
+-        cases = [text.replace(launcher + "        if: ${{ !cancelled() }}\n", launcher + "        if: false\n", 1),
+-                 text.replace(launcher + "        if: ${{ !cancelled() }}\n", launcher, 1),
++        cases = [text.replace(launcher + "        if: ${{ !cancelled() && matrix.reuse != 'true' }}\n", launcher + "        if: false\n", 1),
++                 text.replace(launcher + "        if: ${{ !cancelled() && matrix.reuse != 'true' }}\n", launcher, 1),
+                  mutate(text, launcher, launcher + "        continue-on-error: true\n"),
+                  mutate(text, launcher, launcher + "        shell: sh\n"),
+                  mutate(text, launcher, launcher + "        working-directory: /tmp\n"),
+                  mutate(text, launcher, launcher + "        env:\n          A: b\n"),
+                  text[:i] + text[i:].replace("fetch-depth: 0", "fetch-depth: 1", 1),
+-                 text[:i] + text[i:].replace("      - run: python3 --version\n", "", 1),
+-                 text[:i] + text[i:].replace("      - uses: actions/checkout@v5\n        with:\n          # Full history: test-fleet-doctor-heartbeat compares against a baseline commit.\n          fetch-depth: 0\n", "", 1),
++                 text[:i] + text[i:].replace("      - if: ${{ matrix.reuse != 'true' }}\n        run: python3 --version\n", "", 1),
++                 text[:i] + text[i:].replace("      - uses: actions/checkout@v5\n        if: ${{ matrix.reuse != 'true' }}\n        with:\n          # Full history: test-fleet-doctor-heartbeat compares against a baseline commit.\n          fetch-depth: 0\n", "", 1),
+                  text.rstrip("\n") + "\n\n      - run: echo extra\n",
+                  text[:i] + text[i:].replace("    steps:\n", "    steps:\n      - run: echo first\n", 1)]
+         for n, mutated in enumerate(cases):
+@@ -522,7 +614,7 @@ class Mutants(unittest.TestCase):
+         self.killed(mutate(text, "\n  # bin/test-switchboard in 8 shards", "\n      - run: echo x\n\n  # bin/test-switchboard in 8 shards"), self.STEPS)
+ 
+     def relay_step(self, name):
+-        return "      - name: %s\n        if: ${{ !cancelled() }}\n        timeout-minutes: 10\n        run: |\n          %s 2>&1 | tee \"$RUNNER_TEMP/out.txt\"\n          grep -qx 'RESULT: PASS' \"$RUNNER_TEMP/out.txt\"\n" % (name, name)
++        return "      - name: %s\n        if: ${{ !cancelled() && matrix.reuse != 'true' }}\n        timeout-minutes: 10\n        run: |\n          %s 2>&1 | tee \"$RUNNER_TEMP/out.txt\"\n          grep -qx 'RESULT: PASS' \"$RUNNER_TEMP/out.txt\"\n" % (name, name)
+ 
+     def test_s5_each_of_the_three_relay_steps_removed_fails_the_shape_test(self):
+         text = WORKFLOW.read_text()
+-- 
+2.43.0
+
+
+From 9d07ecff5af2ebc9af1d9248223ef2952033520d Mon Sep 17 00:00:00 2001
+From: w <w@x>
+Date: Thu, 5 Nov 2026 15:54:12 +0000
+Subject: [PATCH 2/2] ask #2196: gate shards on reused head
+
+---
+ .github/workflows/test.yml | 11 ++++++++++-
+ bin/test-workflow-split    | 12 ++++++++++++
+ 2 files changed, 22 insertions(+), 1 deletion(-)
+
+diff --git a/.github/workflows/test.yml b/.github/workflows/test.yml
+index 71e52f63..0a5d48a1 100644
+--- a/.github/workflows/test.yml
++++ b/.github/workflows/test.yml
+@@ -304,13 +304,22 @@ jobs:
+       run:
+         shell: bash
+     steps:
++      - name: Reused run
++        if: ${{ contains(fromJSON(needs.plan.outputs.reused), 'ubuntu-latest') }}
++        env:
++          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
++        run: echo "$HEAD_SHA: the ubuntu leg is reused; shard ${{ matrix.shard }}/8 skips its steps" | tee -a "$GITHUB_STEP_SUMMARY"
++
+       - uses: actions/checkout@v5
++        if: ${{ !contains(fromJSON(needs.plan.outputs.reused), 'ubuntu-latest') }}
+         with:
+           fetch-depth: 0
+ 
+-      - run: python3 --version
++      - if: ${{ !contains(fromJSON(needs.plan.outputs.reused), 'ubuntu-latest') }}
++        run: python3 --version
+ 
+       - name: bin/test-switchboard --shard ${{ matrix.shard }}/8
++        if: ${{ !contains(fromJSON(needs.plan.outputs.reused), 'ubuntu-latest') }}
+         run: |
+           bin/test-switchboard --shard ${{ matrix.shard }}/8 2>&1 | tee "$RUNNER_TEMP/out.txt"
+           grep -qx 'RESULT: PASS' "$RUNNER_TEMP/out.txt"
+diff --git a/bin/test-workflow-split b/bin/test-workflow-split
+index 9b87ce07..2db06f44 100755
+--- a/bin/test-workflow-split
++++ b/bin/test-workflow-split
+@@ -322,6 +322,18 @@ class Pins(unittest.TestCase):
+             self.assertEqual(len(note), 1, jid)
+             self.assertEqual(note[0]["if"], "${{ matrix.reuse == 'true' }}")
+ 
++    def test_s2_a_shard_on_a_reused_head_runs_and_reports_its_name_but_skips_its_heavy_steps(self):
++        job = self.jobs()["shards"]
++        self.assertIn("matrix.shard", job["name"])
++        self.assertNotIn("reused", job["if"])   # the job always runs: a skipped matrix job reports a literal name
++        cond = "${{ !contains(fromJSON(needs.plan.outputs.reused), 'ubuntu-latest') }}"
++        note = [s for s in job["steps"] if s.get("name") == "Reused run"]
++        self.assertEqual(len(note), 1)
++        self.assertEqual(note[0]["if"], "${{ contains(fromJSON(needs.plan.outputs.reused), 'ubuntu-latest') }}")
++        for s in job["steps"]:
++            if s is not note[0]:
++                self.assertEqual(s.get("if"), cond, s.get("name") or s.get("run") or s.get("uses"))
++
+     def test_u3_the_old_job_keeps_its_matrix_runner_and_shell(self):
+         job = self.jobs()["test"]
+         self.assertEqual(job["strategy"]["matrix"], STRATEGY["matrix"])   # the runner list comes from the plan; the plan's rows are pinned in test_s7
+-- 
+2.43.0
+
