@@ -8,10 +8,11 @@
 
 WORKTREES_FILE = "worktrees.json"
 WORKTREE_GIT_SECONDS = 20
+WORKTREE_LOOK_MAX = 400       # candidates judged per run (the cap above counts removals only)
 WORKTREE_RECLAIM_MAX = 20     # worktrees looked at per call: a pass or a command never does unbounded git work
 # Ignored files that are regenerable build output: deleting them with the worktree loses nothing. ANY OTHER ignored file (.env, local config, data)
 # is unrecoverable local state, so its worktree is kept.
-IGNORED_SAFE = ("node_modules", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", "dist", "build", ".venv", "venv", ".DS_Store", ".tox")
+IGNORED_SAFE = ("node_modules", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", "dist", "build", ".venv", "venv", ".DS_Store", ".tox", "target")
 
 
 def worktree_config(config):
@@ -56,7 +57,10 @@ def worktree_facts(runner, path):
     if status.returncode != 0:
         facts["why"] = "git status failed (%s)" % _one_line(status.stderr, 80)
         return facts
-    facts["dirty"] = [l for l in status.stdout.splitlines() if l.strip()]
+    facts["dirty"] = [l for l in status.stdout.splitlines() if l.strip()
+                      and not (l.startswith("?? ") and any(part in IGNORED_SAFE or part.endswith(".pyc") for part in l[3:].strip("/").split("/")))]
+    facts["build_output"] = [l[3:] for l in status.stdout.splitlines() if l.startswith("?? ") and not l[3:].startswith('"')
+                             and any(part in IGNORED_SAFE or part.endswith(".pyc") for part in l[3:].strip("/").split("/"))]
     ignored = _git(runner, path, "status", "--porcelain", "--ignored", "--untracked-files=all")
     if ignored.returncode != 0:
         facts["why"] = "git could not list the ignored files (%s)" % _one_line(ignored.stderr, 80)
@@ -226,6 +230,13 @@ def reclaim_worktree(engine, runner, path, entry, apply=True):
         return "kept", "%s: kept: %s" % (path, busy)
     if not apply:
         return "would-remove", "%s: would remove (clean, pushed; branch %s)" % (path, facts["branch"])
+    root = os.path.realpath(path)   # untracked build output (target/ ...) is cleaned first: git refuses to remove a worktree that has untracked files
+    output = [q for q in facts.get("build_output", []) if not any(os.path.islink(os.path.join(path, *q.split("/")[:i + 1])) for i in range(len(q.split("/"))))
+              and os.path.realpath(os.path.join(path, q)).startswith(root + os.sep)]   # never a symlink, never a path that leaves the worktree
+    if output:
+        cleaned = _git(runner, path, "clean", "-fdx", "--", *output)   # only those untracked paths: never a tracked file, never another path
+        if cleaned.returncode != 0:
+            return "kept", "%s: kept: the untracked build output could not be cleaned (%s)" % (path, _one_line(cleaned.stderr, 100))
     again = _git(runner, path, "status", "--porcelain", "--untracked-files=all")   # the window between the check and the remove is as short as it can be
     if again.returncode != 0 or again.stdout.strip():
         return "kept", "%s: kept: it changed while it was being checked" % path
@@ -250,13 +261,17 @@ def reclaim_for_agent(engine, runner, name, apply=True, why="retired"):
         return ["worktree reclaim is switched off (worktree_reclaim.enabled is false): %d worktree(s) of %s kept" % (len(mine), name)]
     lines = []
     with worktree_sweep(engine):   # one session.list for the whole sweep
-        results = [(path,) + reclaim_worktree(engine, runner, path, entry, apply) for path, entry in sorted(mine.items())[:WORKTREE_RECLAIM_MAX]]
+        results = []
+        for path, entry in sorted(mine.items()):
+            if len(results) >= WORKTREE_LOOK_MAX or sum(r[1] in ("removed", "would-remove") for r in results) >= WORKTREE_RECLAIM_MAX:
+                break
+            results.append((path,) + reclaim_worktree(engine, runner, path, entry, apply))
     for path, status, line in results:
         lines.append(line)
         if status == "kept" and engine.audit is not None:
             engine.audit.append(engine.actor, "worktree.kept", name, {"path": path, "reason": _one_line(line, 160), "after": why})
-    if len(mine) > WORKTREE_RECLAIM_MAX:
-        lines.append("%d of %d worktree(s) handled (cap %d); `disk reclaim-worktrees` does the rest" % (WORKTREE_RECLAIM_MAX, len(mine), WORKTREE_RECLAIM_MAX))
+    if len(results) < len(mine):
+        lines.append("%d of %d worktree(s) handled (cap %d), counting removals; `disk reclaim-worktrees` does the rest" % (len(results), len(mine), WORKTREE_RECLAIM_MAX))
     return lines
 
 
@@ -284,16 +299,24 @@ def cmd_disk_reclaim_worktrees(args, runner, now):
     registry = read_worktrees(state)
     todo = {p: e for p, e in registry.items() if isinstance(e, dict) and e.get("agent") in retired}
     removed = kept = 0
+    by_reason = {}
     with worktree_sweep(engine):   # one session.list for the whole sweep
-        results = [reclaim_worktree(engine, runner, path, entry, bool(args.apply)) for path, entry in sorted(todo.items())[:WORKTREE_RECLAIM_MAX]]
+        results = []
+        for path, entry in sorted(todo.items()):
+            if len(results) >= WORKTREE_LOOK_MAX or sum(r[0] in ("removed", "would-remove") for r in results) >= WORKTREE_RECLAIM_MAX:
+                break
+            results.append(reclaim_worktree(engine, runner, path, entry, bool(args.apply)))
     for status, line in results:
         print(line)
         removed += status in ("removed", "would-remove", "gone")
         kept += status in ("kept", "refused")
-    if len(todo) > WORKTREE_RECLAIM_MAX:
-        print("%s: only %d of %d worktree(s) handled (cap %d): run it again for the rest" % (PROG, WORKTREE_RECLAIM_MAX, len(todo), WORKTREE_RECLAIM_MAX))
+        if status == "kept" and ": kept: " in line:
+            reason = re.split(r" \(|: |;|,", line.split(": kept: ", 1)[1])[0][:40]
+            by_reason[reason] = by_reason.get(reason, 0) + 1
+    if len(results) < len(todo):
+        print("%s: only %d of %d worktree(s) handled (cap %d), counting removals; %d not reached: run it again for the rest" % (PROG, len(results), len(todo), WORKTREE_RECLAIM_MAX, len(todo) - len(results)))
     print("%s: %d registered worktree(s) of retired agents: %d %s, %d kept%s; %d registered in all, %d of agents not retired are left alone" % (
-        PROG, len(todo), removed, "removed" if args.apply else "would be removed", kept, "" if args.apply else " (a dry run: add --apply)",
+        PROG, len(todo), removed, "removed" if args.apply else "would be removed", kept, "" if args.apply else " (a dry run: add --apply; %d removable, %d kept%s; %d not reached)" % (removed, kept, "".join(" - %d %s" % (c, r) for r, c in sorted(by_reason.items())), len(todo) - len(results)),
         len(registry), len(registry) - len(todo)))
     return EXIT_OK
 

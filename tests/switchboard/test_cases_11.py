@@ -623,6 +623,7 @@ class TestConfig(Base):
             "awaiting_live_days": 14, "awaiting_label": None, "decisions_lookback_hours": 72,  # PR 14
             "awaiting_cos_label": None, "decisions_cos_grace_seconds": 300, "cos_orders_file": None,  # PR 18
             "pr_notice_hold_minutes": 0,  # PR notices
+            "reminder_bound_minutes": 10, "checkpoint_bound_minutes": 5,  # #1728: the bounds of a due reminder
             "intent_repo": None, "intent_required": True,
             "gh_users": {}, "github_poll_seconds": 60, "intent_live_silence_minutes": 10,  # PR 15
             "classifier_mode": "shadow", "busy_poll_seconds": 1,  # PR 8
@@ -908,8 +909,13 @@ class TestAssembler(unittest.TestCase):
         lines = [n.strip() for n in (BIN / "fleet-switchboard.parts").read_text().splitlines() if n.strip() and not n.startswith("#")]
         self.assertEqual(lines[0], "fleet-switchboard")
 
+    @staticmethod
+    def _shipped_parts():
+        """The parts the shipped manifest lists after the entry, from the one list (a part added to the manifest needs no edit here)."""
+        return [n.strip() for n in (BIN / "fleet-switchboard.parts").read_text().splitlines() if n.strip() and not n.startswith("#") and n.strip() != "fleet-switchboard"]
+
     def test_a_second_part_puts_its_names_into_sb_in_the_order_given(self):
-        root = self._copy(["part_a.py", "fleet-switchboard", *[str(f.relative_to(BIN)) for f in SWITCHBOARD_SOURCE_FILES if f != SWITCHBOARD], "part_b.py"])
+        root = self._copy(["part_a.py", "fleet-switchboard"] + self._shipped_parts() + ["part_b.py"])
         (root / "part_a.py").write_text('ORDER = ["a"]\nA_SAW_MAIN = "main" in globals()\nA_FILE = __file__\n')
         (root / "part_b.py").write_text('ORDER.append("b")\nB_SAW_MAIN = "main" in globals()\n')
         module = _load("t_assembled", root / "fleet-switchboard")
@@ -958,7 +964,7 @@ class TestAssembler(unittest.TestCase):
         self.assertTrue(_load("t_unnamed_entry", root / "entry").ENTRY_SAW_A)
 
     def test_comments_and_blank_lines_in_a_manifest_are_ignored(self):
-        root = self._copy(["# the parts", "", "part_a.py", "  ", "fleet-switchboard", *[str(f.relative_to(BIN)) for f in SWITCHBOARD_SOURCE_FILES if f != SWITCHBOARD]])
+        root = self._copy(["# the parts", "", "part_a.py", "  ", "fleet-switchboard"] + self._shipped_parts())
         (root / "part_a.py").write_text("FROM_A = 1\n")
         self.assertEqual(_load("t_commented", root / "fleet-switchboard").FROM_A, 1)
 

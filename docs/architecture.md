@@ -48,6 +48,7 @@ The **Holds** column is descriptive: only the layer numbers are enforced.
 | `lost_worker.py` | 0 | a lost worker is told once to its lane and the Chief of Staff, with its cause (#1481) | |
 | `push_watch.py` | 0 | the lane that launched a cloud worker is told of its pushes and of its quiet after a push, from a read of the worker's branches (#1740) | |
 | `merged_labels.py` | 0 | a merged pull request does not keep its hold | |
+| `open_list_alert.py` | 0 | the once-a-day memory of the alert that an open-item list is longer than the ceiling (#1886) | |
 | `plan_approval.py` | 0 | the check of an approval sent as a message (pure) | |
 | `record_json.py` | 0 | the one bounded-depth parse of untrusted record JSON, shared by every reader of it (#1314) | |
 | `turn_start.py` | 0 | when each working session's current turn began, as the daemon first saw it, for `steer_after_minutes` (#1540) | |
@@ -120,6 +121,7 @@ The **Holds** column is descriptive: only the layer numbers are enforced.
 | `reassign.py` | 5 | reassign a running worker to another orchestrator | |
 | `reds.py` | 5 | classify a pull request's failing tests | |
 | `review_checkout.py` | 5 | a pull request's exact head tree, diff and base copies in one private directory | |
+| `switchboard/body_check.py` | 5 | `preflight-pr --body`: a description against the plan's cause-first scenario | |
 | `switchboard/decisions_a.py` | 5 | the escalated-request, PR-notice and order-notice sections of the decisions code | |
 | `switchboard/decisions_b.py` | 5 | the external-decision host and the sources behind the decision port | |
 | `switchboard/import_v1.py` | 5 | the v1 import converter, the v2 shape checker and the `import-v1` command | |
@@ -130,6 +132,7 @@ The **Holds** column is descriptive: only the layer numbers are enforced.
 | `switchboard/review_laws_install.py` | 5 | `review-laws install`: the review laws copied into a repository | |
 | `switchboard/pr_explain.py` | 5 | `pr-explain` and the checks of a held pull request body | |
 | `switchboard/sent_view.py` | 5 | `sent`: a sender's own recent messages with their sent, delivered and picked-up times | |
+| `switchboard/branch_ff.py` | 5 | `clear-head` and `branch-ff`: a cleared head recorded by the Chief of Staff, and a pull request's branch moved to it, fast-forward only | |
 | `switchboard/v2_transport.py` | 1 | the OpenCode v2 client and its HTTP transport | |
 | `tester_agent.py` | 0 | the list of agents a `launch --role tester` accepts, read from the `agents/roles.tsv` file of the checkout (#1963) | |
 | `switchboard/jev.py` | 1 | the Jev client: the decision model, the classifier and the policy judge's questions | |
@@ -154,6 +157,18 @@ The **Holds** column is descriptive: only the layer numbers are enforced.
 | `switchboard/bootstrap.py` | 5 | the `bootstrap` command | |
 | `switchboard/profile_pieces.py` | 5 | the profile pieces shared by the install, the doctor and the commands that write a profile | |
 | `switchboard/installer.py` | 5 | the installer: the service, its units and the `install` command | |
+| `switchboard/docker_reaper.py` | 5 | the docker reaper: orphan containers and their reaping (ask #321) | |
+| `switchboard/observing.py` | 3 | observing the fleet: what a pass reads of the agents' sessions | |
+| `switchboard/workers_report.py` | 4 | workers report, and a stop without a report is triaged (PR 13) | |
+| `switchboard/batch_decision.py` | 3 | a batch: related findings raised as one decision | |
+| `switchboard/sweep.py` | 5 | the "waiting on the person" sweep (#117) | |
+| `switchboard/plan_notice.py` | 5 | a posted or edited plan tells its approver once per hash (#765) | |
+| `switchboard/disk_prune.py` | 5 | `disk prune`: reclaim old docker build cache and images | |
+| `switchboard/heavy_budget.py` | 4 | a time budget for each heavy reader (#494) | |
+| `switchboard/config_reload.py` | 4 | the config is reloaded when the file changes, and what `status` says of it | |
+| `switchboard/daemon_restart.py` | 5 | `daemon restart`: stop by the recorded pid, then ensure | |
+| `switchboard/labels_ensure.py` | 5 | `labels ensure` | |
+| `switchboard/orders_cos.py` | 5 | `orders --cos`: the Chief of Staff's standing orders | |
 | `switchboard/faults.py` | 0 | the fault switches that make a step fail on purpose in tests | |
 | `switchboard/shadow_classifier.py` | 3 | shadow mode in the engine: the classifier that records what it would do | |
 | `switchboard/worktree_lifecycle.py` | 5 | the worktree lifecycle: register, sweep and reclaim (#321) | |
@@ -177,21 +192,57 @@ Kinds (the number is exact, except `size`, a ceiling with headroom: see rule 7):
 | From | To | Kind | Count | Why it is allowed today |
 |---|---|---|---|---|
 | `bin/test-switchboard` | `-` | size | 80,500 | the one test file; whole classes have moved to `tests/switchboard/test_cases_NN.py` (T1, T1b), and the lanes still add tests until the next split, so the row is the real count plus about 3,000 |
+| `switchboard/decisions_a.py switchboard/docker_reaper.py switchboard/handoff.py switchboard/job_runs.py switchboard/plan_notice.py switchboard/sweep.py` | `-` | cycle | 6 | moved from the entry unchanged: each part reads the other, one cycle to untangle |
+| `switchboard/alert_labels.py` | `switchboard/docker_reaper.py` | namespace | 1 | one namespace: the part reads a name another part defines; its rewiring gives it an import |
+| `switchboard/batch_decision.py` | `fleet-switchboard` | namespace | 8 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
+| `switchboard/batch_decision.py` | `switchboard/decisions_a.py` | namespace | 1 | one namespace: the part reads a name another part defines; its rewiring gives it an import |
+| `switchboard/batch_decision.py` | `switchboard/handoff.py` | namespace | 4 | one namespace: the part reads a name another part defines; its rewiring gives it an import |
+| `switchboard/batch_decision.py switchboard/decision.py` | `-` | cycle | 2 | moved from the entry unchanged: each part reads the other, one cycle to untangle |
+| `switchboard/config_reload.py` | `fleet-switchboard` | entry-import | 2 | the part relies on a standard-library module the entry imported; it gets its own import line |
+| `switchboard/config_reload.py` | `fleet-switchboard` | namespace | 3 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
+| `switchboard/daemon_restart.py` | `fleet-switchboard` | entry-import | 5 | the part relies on a standard-library module the entry imported; it gets its own import line |
+| `switchboard/daemon_restart.py` | `fleet-switchboard` | namespace | 10 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
+| `switchboard/disk_prune.py` | `fleet-switchboard` | entry-import | 6 | the part relies on a standard-library module the entry imported; it gets its own import line |
+| `switchboard/disk_prune.py` | `fleet-switchboard` | namespace | 8 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
+| `switchboard/docker_reaper.py` | `fleet-switchboard` | entry-import | 10 | the part relies on a standard-library module the entry imported; it gets its own import line |
+| `switchboard/docker_reaper.py` | `fleet-switchboard` | namespace | 14 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
+| `switchboard/facts.py` | `switchboard/docker_reaper.py` | namespace | 1 | one namespace: the part reads a name another part defines; its rewiring gives it an import |
+| `switchboard/heavy_budget.py` | `cloud_worker.py` | import | 1 | a name the part reads from another unit without a declared edge |
+| `switchboard/heavy_budget.py` | `fleet-switchboard` | entry-import | 9 | the part relies on a standard-library module the entry imported; it gets its own import line |
+| `switchboard/heavy_budget.py` | `fleet-switchboard` | namespace | 12 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
+| `switchboard/labels_ensure.py` | `fleet-switchboard` | entry-import | 4 | the part relies on a standard-library module the entry imported; it gets its own import line |
+| `switchboard/labels_ensure.py` | `fleet-switchboard` | namespace | 19 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
+| `switchboard/observing.py` | `fleet-switchboard` | entry-import | 3 | the part relies on a standard-library module the entry imported; it gets its own import line |
+| `switchboard/observing.py` | `fleet-switchboard` | namespace | 2 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
+| `switchboard/orders_cos.py` | `fleet-switchboard` | entry-import | 1 | the part relies on a standard-library module the entry imported; it gets its own import line |
+| `switchboard/orders_cos.py` | `fleet-switchboard` | namespace | 6 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
+| `switchboard/plan_notice.py` | `fleet-switchboard` | entry-import | 2 | the part relies on a standard-library module the entry imported; it gets its own import line |
+| `switchboard/plan_notice.py` | `fleet-switchboard` | namespace | 7 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
+| `switchboard/reminders.py` | `switchboard/docker_reaper.py` | namespace | 1 | one namespace: the part reads a name another part defines; its rewiring gives it an import |
+| `switchboard/sweep.py` | `fleet-switchboard` | entry-import | 6 | the part relies on a standard-library module the entry imported; it gets its own import line |
+| `switchboard/sweep.py` | `fleet-switchboard` | namespace | 29 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
+| `switchboard/triage.py` | `switchboard/plan_notice.py` | namespace | 1 | one namespace: the part reads a name another part defines; its rewiring gives it an import |
+| `switchboard/triage.py` | `switchboard/sweep.py` | namespace | 5 | one namespace: the part reads a name another part defines; its rewiring gives it an import |
+| `switchboard/workers_report.py` | `fleet-switchboard` | namespace | 6 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
+| `switchboard/workers_report.py` | `switchboard/docker_reaper.py` | namespace | 1 | one namespace: the part reads a name another part defines; its rewiring gives it an import |
+| `switchboard/workers_report.py` | `switchboard/handoff.py` | namespace | 3 | one namespace: the part reads a name another part defines; its rewiring gives it an import |
 | `switchboard/alert_labels.py switchboard/triage.py` | `-` | cycle | 2 | moved together from the entry: each reads the other, one cycle to untangle |
 | `switchboard/answer_delivery.py switchboard/decisions_b.py` | `-` | cycle | 2 | moved together from the entry: each reads the other, one cycle to untangle |
 | `impact_hold.py` | `-` | size | 2,000 | the brief-bound clear (#1215) took it past the limit; to be split (ceiling = the test's own formula: 1510 lines, plus 500, rounded up to a multiple of 500) |
 | `delegated_clear.py` | `-` | size | 1,900 | the registrar lint lives with the clear it protects; a follow-up slice moves it to its own part and lowers the ceiling |
+| `switchboard/reminders.py` | `-` | size | 2,000 | the due-reminder ceiling, the `reminder.waiting` audit line and the late count (#1728) took it past the limit; the waiting and ceiling code moves to its own part in a follow-up and the row is then deleted |
+| `cloud_worker.py` | `-` | size | 1,600 | #2135 (the inspect command, +48) and #1572 (the registry note, +26) took it from 1490 to 1564 (limit 1500); a ceiling = largest measured 1564 plus a small margin; the inspect section is the next one to move to a part |
 | `switchboard/agents_verify.py` | `fleet-switchboard` | entry-import | 6 | the part relies on a standard-library module the entry imported; it gets its own import line |
-| `switchboard/agents_verify.py` | `fleet-switchboard` | namespace | 8 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
+| `switchboard/agents_verify.py` | `fleet-switchboard` | namespace | 7 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 | `switchboard/alert_labels.py` | `fleet-switchboard` | entry-import | 5 | the part relies on a standard-library module the entry imported; it gets its own import line |
-| `switchboard/alert_labels.py` | `fleet-switchboard` | namespace | 12 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
+| `switchboard/alert_labels.py` | `fleet-switchboard` | namespace | 11 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 | `switchboard/alert_labels.py` | `launch_testers.py` | import | 1 | a name the part reads from another unit without a declared edge |
 | `switchboard/answer_delivery.py` | `fleet-switchboard` | entry-import | 5 | the part relies on a standard-library module the entry imported; it gets its own import line |
-| `switchboard/answer_delivery.py` | `fleet-switchboard` | namespace | 33 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
+| `switchboard/answer_delivery.py` | `fleet-switchboard` | namespace | 26 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 | `switchboard/audit.py` | `fleet-switchboard` | entry-import | 12 | the part relies on a standard-library module the entry imported; it gets its own import line |
 | `switchboard/audit.py` | `fleet-switchboard` | namespace | 2 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports; one of them is `refuse_real_location`, the test-run guard of the audit path, which stays in the entry beside the state and config guards it shares its locations with |
 | `switchboard/bootstrap.py` | `fleet-switchboard` | entry-import | 4 | the part relies on a standard-library module the entry imported; it gets its own import line |
-| `switchboard/bootstrap.py` | `fleet-switchboard` | namespace | 15 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
+| `switchboard/bootstrap.py` | `fleet-switchboard` | namespace | 14 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 | `switchboard/caches.py` | `fleet-switchboard` | entry-import | 3 | the part relies on a standard-library module the entry imported; it gets its own import line |
 | `switchboard/caches.py` | `fleet-switchboard` | namespace | 4 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 | `switchboard/installer.py` | `fleet-switchboard` | entry-import | 10 | the part relies on a standard-library module the entry imported; it gets its own import line |
@@ -199,12 +250,12 @@ Kinds (the number is exact, except `size`, a ceiling with headroom: see rule 7):
 | `switchboard/profile_pieces.py` | `fleet-switchboard` | entry-import | 8 | the part relies on a standard-library module the entry imported; it gets its own import line |
 | `switchboard/profile_pieces.py` | `fleet-switchboard` | namespace | 13 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 | `switchboard/decision.py` | `fleet-switchboard` | entry-import | 1 | the part relies on a standard-library module the entry imported; it gets its own import line |
-| `switchboard/decision.py` | `fleet-switchboard` | namespace | 7 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
+| `switchboard/decision.py` | `fleet-switchboard` | namespace | 4 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 | `switchboard/decision.py` | `switchboard/handoff.py` | namespace | 1 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 | `switchboard/engine.py` | `fleet-switchboard` | entry-import | 5 | the part relies on a standard-library module the entry imported; it gets its own import line |
 | `switchboard/engine.py` | `fleet-switchboard` | namespace | 1 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 | `switchboard/facts.py` | `fleet-switchboard` | entry-import | 7 | the part relies on a standard-library module the entry imported; it gets its own import line |
-| `switchboard/facts.py` | `fleet-switchboard` | namespace | 6 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
+| `switchboard/facts.py` | `fleet-switchboard` | namespace | 5 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 | `switchboard/handoff.py` | `fleet-switchboard` | entry-import | 7 | the part relies on a standard-library module the entry imported; it gets its own import line |
 | `switchboard/launch_model.py` | `fleet-switchboard` | entry-import | 1 | the part relies on a standard-library module the entry imported; it gets its own import line |
 | `switchboard/launch_model.py` | `fleet-switchboard` | namespace | 1 | one namespace: the part reads the entry's `LaunchError` and `_one_line` |
@@ -213,29 +264,30 @@ Kinds (the number is exact, except `size`, a ceiling with headroom: see rule 7):
 | `switchboard/bot_reviews.py` | `fleet-switchboard` | namespace | 4 | one namespace: the part reads the entry's `_is_bot`, `_login`, `_id` and `GitHubItem` |
 | `switchboard/scratch_dir.py` | `fleet-switchboard` | namespace | 10 | one namespace: the part reads the entry's names (`build_engine`, `identify_caller`, `agent_scratch_dir`, `_write_small`); its rewiring gives it imports |
 | `switchboard/secret_spans.py` | `fleet-switchboard` | namespace | 2 | one namespace: the finder reads the entry's `_SECRET_PATTERNS` and `redact_command_text` (it must see the very patterns the net applies) |
-| `switchboard/handoff.py` | `fleet-switchboard` | namespace | 46 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
+| `switchboard/handoff.py` | `fleet-switchboard` | namespace | 40 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 | `switchboard/jev.py` | `fleet-switchboard` | entry-import | 6 | the part relies on a standard-library module the entry imported; it gets its own import line |
 | `switchboard/jev.py` | `fleet-switchboard` | namespace | 5 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 | `switchboard/reminders.py` | `switchboard/handoff.py` | namespace | 3 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 | `switchboard/triage.py` | `fleet-switchboard` | entry-import | 7 | the part relies on a standard-library module the entry imported; it gets its own import line |
-| `switchboard/triage.py` | `fleet-switchboard` | namespace | 34 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
+| `switchboard/triage.py` | `fleet-switchboard` | namespace | 27 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 | `switchboard/triage.py` | `switchboard/decisions_a.py` | namespace | 3 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 | `switchboard/cockpit.py` | `fleet-switchboard` | entry-import | 8 | the part relies on a standard-library module the entry imported; it gets its own import line |
-| `switchboard/cockpit.py` | `fleet-switchboard` | namespace | 8 | one namespace: the part reads the entry's names (the decision file reader, the state writer, the registry); its rewiring gives it imports |
+| `switchboard/cockpit.py` | `fleet-switchboard` | namespace | 7 | one namespace: the part reads the entry's names (the decision file reader, the state writer, the registry); its rewiring gives it imports |
 | `switchboard/claims_note.py` | `fleet-switchboard` | entry-import | 3 | the part relies on a standard-library module the entry imported; it gets its own import line |
-| `switchboard/claims_note.py` | `fleet-switchboard` | namespace | 14 | one namespace: the part reads the entry's names (the pull request records, the plan link and the plan facts) |
+| `switchboard/claims_note.py` | `fleet-switchboard` | namespace | 13 | one namespace: the part reads the entry's names (the pull request records, the plan link and the plan facts) |
 | `switchboard/claims_note.py` | `plan_check.py` | import | 1 | a name the part reads from another unit without a declared edge |
+| `switchboard/claims_note.py` | `switchboard/plan_notice.py` | namespace | 1 | one namespace: the part reads a name another part defines (`plan_wake_state`); its rewiring gives it an import |
 | `switchboard/claims_note.py` | `switchboard/plan_input.py` | namespace | 1 | one namespace: the part reads `parse_plan_source` |
 | `switchboard/v2_transport.py` | `fleet-switchboard` | entry-import | 15 | the part relies on a standard-library module the entry imported; it gets its own import line |
 | `switchboard/v2_transport.py` | `fleet-switchboard` | namespace | 2 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
-| `fleet-switchboard` | `-` | size | 27,500 | the entry still holds every section not yet moved to a part; each move slice lowers the ceiling |
+| `fleet-switchboard` | `-` | size | 24,500 | the entry still holds every section not yet moved to a part; each move slice lowers the ceiling |
 | `switchboard/facts.py` | `switchboard/worktree_lifecycle.py` | namespace | 1 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 | `switchboard/faults.py` | `fleet-switchboard` | entry-import | 1 | the part relies on a standard-library module the entry imported; it gets its own import line |
 | `switchboard/job_runs.py` | `fleet-switchboard` | entry-import | 11 | the part relies on a standard-library module the entry imported; it gets its own import line |
-| `switchboard/job_runs.py` | `fleet-switchboard` | namespace | 11 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
+| `switchboard/job_runs.py` | `fleet-switchboard` | namespace | 9 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 | `switchboard/judge_rule.py` | `fleet-switchboard` | entry-import | 1 | the part relies on a standard-library module the entry imported; it gets its own import line |
 | `switchboard/review_laws.py` | `fleet-switchboard` | entry-import | 3 | the part relies on a standard-library module the entry imported; it gets its own import line |
-| `switchboard/shadow_classifier.py` | `fleet-switchboard` | namespace | 7 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
+| `switchboard/shadow_classifier.py` | `fleet-switchboard` | namespace | 5 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 | `switchboard/review_laws.py` | `fleet-switchboard` | namespace | 10 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 | `switchboard/standing_authority.py` | `fleet-switchboard` | entry-import | 1 | the part relies on a standard-library module the entry imported; it gets its own import line |
 | `switchboard/verification.py` | `fleet-switchboard` | entry-import | 2 | the part relies on a standard-library module the entry imported; it gets its own import line |
@@ -253,18 +305,26 @@ Kinds (the number is exact, except `size`, a ceiling with headroom: see rule 7):
 | `switchboard/review_laws_install.py` | `fleet-switchboard` | entry-import | 3 | the part relies on a standard-library module the entry imported; it gets its own import line |
 | `switchboard/pr_explain.py` | `fleet-switchboard` | entry-import | 3 | the part relies on a standard-library module the entry imported; it gets its own import line |
 | `switchboard/sent_view.py` | `fleet-switchboard` | entry-import | 6 | the part relies on a standard-library module the entry imported; it gets its own import line |
+| `switchboard/branch_ff.py` | `fleet-switchboard` | entry-import | 4 | the part relies on a standard-library module the entry imported; it gets its own import line |
 | `switchboard/reminders.py` | `fleet-switchboard` | entry-import | 12 | the part relies on a standard-library module the entry imported; it gets its own import line |
-| `switchboard/decisions_a.py` | `fleet-switchboard` | namespace | 33 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
-| `switchboard/decisions_b.py` | `fleet-switchboard` | namespace | 29 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
-| `switchboard/import_v1.py` | `fleet-switchboard` | namespace | 15 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
+| `switchboard/decisions_a.py` | `fleet-switchboard` | namespace | 29 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
+| `switchboard/decisions_b.py` | `fleet-switchboard` | namespace | 24 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
+| `switchboard/import_v1.py` | `fleet-switchboard` | namespace | 14 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
+| `switchboard/judge.py` | `fleet-switchboard` | namespace | 12 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
+| `switchboard/judge_request.py` | `fleet-switchboard` | namespace | 15 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
+| `switchboard/plan_review.py` | `fleet-switchboard` | namespace | 23 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
+| `switchboard/decisions_a.py` | `fleet-switchboard` | namespace | 29 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
+| `switchboard/decisions_b.py` | `fleet-switchboard` | namespace | 24 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
+| `switchboard/import_v1.py` | `fleet-switchboard` | namespace | 14 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 | `switchboard/judge.py` | `fleet-switchboard` | namespace | 11 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
-| `switchboard/judge_request.py` | `fleet-switchboard` | namespace | 16 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
-| `switchboard/plan_review.py` | `fleet-switchboard` | namespace | 25 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
+| `switchboard/judge_request.py` | `fleet-switchboard` | namespace | 15 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
+| `switchboard/plan_review.py` | `fleet-switchboard` | namespace | 23 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 | `switchboard/plan_input.py` | `fleet-switchboard` | namespace | 14 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 | `switchboard/review_laws_install.py` | `fleet-switchboard` | namespace | 4 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 | `switchboard/pr_explain.py` | `fleet-switchboard` | namespace | 10 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
-| `switchboard/sent_view.py` | `fleet-switchboard` | namespace | 7 | one namespace: the part reads the entry's names (`build_engine`, `identify_caller`, `SentLedger`, `READ_LIMIT`, `_created`); its rewiring gives it imports |
-| `switchboard/reminders.py` | `fleet-switchboard` | namespace | 24 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports; two reads of untrusted JSON now go through `load_module("record_json")`, one name of the entry more (#1314); the delivery-time judgement of late and stale alerts reads one name of the entry more (#1402) |
+| `switchboard/sent_view.py` | `fleet-switchboard` | namespace | 5 | one namespace: the part reads the entry's names (`build_engine`, `identify_caller`, `SentLedger`, `READ_LIMIT`, `_created`); its rewiring gives it imports |
+| `switchboard/branch_ff.py` | `fleet-switchboard` | namespace | 11 | one namespace: the part reads the entry's names (`build_engine`, `gates_caller_kind`, `_gh_write`, `_write_small`, `parse_pr_ref`, `load_module`, `_one_line`, `IntentError`, `NoticeError`, `PROG`, `EXIT_USAGE`); its rewiring gives it imports |
+| `switchboard/reminders.py` | `fleet-switchboard` | namespace | 19 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports; two reads of untrusted JSON now go through `load_module("record_json")`, one name of the entry more (#1314); the delivery-time judgement of late and stale alerts reads one name of the entry more (#1402) |
 | `switchboard/stage_event.py` | `fleet-switchboard` | entry-import | 4 | the part relies on a standard-library module the entry imported; it gets its own import line |
 | `switchboard/stage_event.py` | `fleet-switchboard` | namespace | 4 | one namespace: the part reads the entry's names (`load_module`, the config checks, `datetime`); it gets its own imports |
 
@@ -297,6 +357,7 @@ A site is listed by the function it sits in and its kind, with a count: `import(
 | `cloud_cluster.py` | `_lib:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
 | `cloud_cluster.py` | `_walk:exec_module` | 1 | uses an identifier of the import machinery (exec_module) |
 | `cloud_cluster.py` | `_walk:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
+| `cloud_cluster.py` | `unknown_report_to:load_module(string)` | 1 | names a loading builtin by a string (a name in a list counts: over-counting by design) |
 | `cloud_way_back_check.py` | `check:imp` | 3 | uses the module object (a call, an attribute, an argument) |
 | `cloud_way_back_check.py` | `check_fixture_shape:imp` | 4 | uses the module object (a call, an attribute, an argument) |
 | `cloud_worker.py` | `<module>:import(importlib)` | 1 | imports a module that can load code by name, or one of its identifiers |

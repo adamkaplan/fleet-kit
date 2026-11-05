@@ -756,6 +756,101 @@ class TestPushWatch(Case):
         self.assertEqual(module.push_watch_tick(engine, None), [])
         self.assertEqual([l[0] for l in engine.audit.lines], ["push_watch.skipped"])
 
+    def _world(self, made_before_launch):
+        iso = lambda t: datetime.datetime.fromtimestamp(t, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        launch = NOW - 3600
+        rec = dict(record("w-a", "lane-a"), hard_deadline=iso(launch + 7200), hard_seconds=7200)
+        self.engine.cloud_watch = {"records": [rec]}
+        for sha, when in ((SHA_A, launch - 60 if made_before_launch else launch + 60), (SHA_B, launch + 120)):
+            c = commit("tip" if sha == SHA_A else "newer")
+            c["commit"]["committer"] = {"date": iso(when)}
+            self.world.commits[sha] = c
+        self.world.refs = {"w-a/wip": SHA_A}
+
+    def test_s2_a_tip_made_before_the_launch_is_stored_and_not_told(self):
+        self._world(True)
+        self.run_pass(NOW)
+        self.assertEqual(len(self.to("lane-a")), 0)
+        self.assertEqual(self.run_state_sha(), SHA_A)
+
+    def run_state_sha(self):
+        state = json.loads((Path(self.tmp.name) / "push-watch.json").read_text())
+        return state["workers"]["w-a"]["branches"]["w-a/wip"]["sha"]
+
+    def test_s3_a_tip_made_after_the_launch_is_told_once(self):
+        self._world(False)
+        self.run_pass(NOW)
+        self.run_pass(NOW + 1)
+        self.assertEqual(len(self.to("lane-a")), 1)
+
+    def test_s4_a_commit_after_the_baseline_is_told_once_and_the_old_tip_never(self):
+        self._world(True)
+        self.run_pass(NOW)
+        self.world.refs = {"w-a/wip": SHA_B}
+        self.run_pass(NOW + 60)
+        self.run_pass(NOW + 120)
+        got = self.to("lane-a")
+        self.assertEqual((len([t for t in got if SHA_B[:8] in t]), len([t for t in got if SHA_A[:8] in t])), (1, 0))
+
+    def _absent_once(self, module=None):
+        self._world(True)
+        self.run_pass(NOW, module)
+        self.world.refs = {"w-a/wip": SHA_B}
+        self.run_pass(NOW + 60, module)   # told once
+        full = self.engine.cloud_watch
+        self.engine.cloud_watch = {"records": []}
+        self.run_pass(NOW + 120, module)   # absent from one pass
+        self.engine.cloud_watch = full
+        self.run_pass(NOW + 180, module)
+        return len([t for t in self.to("lane-a") if SHA_B[:8] in t])
+
+    def test_a_worker_absent_from_one_pass_and_back_is_not_told_again(self):
+        self.assertEqual(self._absent_once(), 1)
+        old = '        if name in records:\n            state["workers"][name].pop("gone", None)   # back: its absence clock restarts\n        elif name in state["stopped"] or now - state["workers"][name].setdefault("gone", now) > 7 * 86400:'
+        mutant = self.mutant(old, '        if name not in records:\n            pass\n        if name not in records:')
+        self.assertEqual(self._absent_once(mutant), 2, "control: the old prune tells it again")
+
+    def _state_workers(self):
+        path = Path(str(self.engine.audit.path)).parent / self.pw.STATE_FILE
+        return json.load(open(path))["workers"]
+
+    def test_a_stopped_worker_with_no_record_is_pruned(self):
+        self._world(True)
+        self.run_pass(NOW)
+        self.assertIn("w-a", self._state_workers())
+        self.launcher_line(worker="w-a", action="stop")
+        self.engine.cloud_watch = {"records": []}
+        self.run_pass(NOW + 60)
+        self.assertNotIn("w-a", self._state_workers())
+
+    def test_a_worker_absent_one_pass_and_not_stopped_is_kept(self):
+        self._world(True)
+        self.run_pass(NOW)
+        self.engine.cloud_watch = {"records": []}
+        self.run_pass(NOW + 60)
+        self.assertIn("w-a", self._state_workers())
+
+    def _launch_info(self, create, module=None):
+        self.setUp()
+        self.engine.cloud_watch = {"records": [record("w-a", "lane-a")]}   # no hard_deadline: no launch time from the record
+        if create:
+            self.launcher_line(worker="w-a", action="create")   # ts 2027-01-15T08:01:00Z
+        c = commit("tip")
+        c["commit"]["committer"] = {"date": "2027-01-15T08:00:00Z"}   # made before that create
+        self.world.commits[SHA_A] = c
+        self.world.refs = {"w-a/wip": SHA_A}
+        self.run_pass(NOW, module)   # one pass: the first sight decides
+        return len(self.to("lane-a"))
+
+    def test_a_launch_time_from_the_created_state_silences_an_older_tip(self):
+        self.assertEqual(self._launch_info(True), 0)
+        mutant = self.mutant('state.get("created", {}).get(name)', 'None')
+        self.assertEqual(self._launch_info(True, mutant), 1, "a build that ignores created tells it")
+
+    def test_no_launch_information_at_all_still_tells_a_real_push(self):
+        self.assertEqual(self._launch_info(False), 1)
+        mutant = self.mutant('if launched is not None and made is not None and made <= launched:', 'if made is not None:')
+        self.assertEqual(self._launch_info(False, mutant), 0, "a build that silences without launch info")
 
 if __name__ == "__main__":
     unittest.main()
