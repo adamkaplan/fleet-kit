@@ -792,5 +792,23 @@ class TestPushWatch(Case):
         got = self.to("lane-a")
         self.assertEqual((len([t for t in got if SHA_B[:8] in t]), len([t for t in got if SHA_A[:8] in t])), (1, 0))
 
+    def _absent_once(self, module=None):
+        self._world(True)
+        self.run_pass(NOW, module)
+        self.world.refs = {"w-a/wip": SHA_B}
+        self.run_pass(NOW + 60, module)   # told once
+        full = self.engine.cloud_watch
+        self.engine.cloud_watch = {"records": []}
+        self.run_pass(NOW + 120, module)   # absent from one pass
+        self.engine.cloud_watch = full
+        self.run_pass(NOW + 180, module)
+        return len([t for t in self.to("lane-a") if SHA_B[:8] in t])
+
+    def test_a_worker_absent_from_one_pass_and_back_is_not_told_again(self):
+        self.assertEqual(self._absent_once(), 1)
+        old = '        if name in records:\n            state["workers"][name].pop("gone", None)   # back: its absence clock restarts\n        elif name not in state["stopped"] and now - state["workers"][name].setdefault("gone", now) > 7 * 86400:'
+        mutant = self.mutant(old, '        if name not in records:\n            pass\n        if name not in records:')
+        self.assertEqual(self._absent_once(mutant), 2, "control: the old prune tells it again")
+
 if __name__ == "__main__":
     unittest.main()

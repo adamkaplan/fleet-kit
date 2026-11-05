@@ -327,8 +327,10 @@ def run_pass(sb, engine, now, gh, config=None, launcher_audit=None):
     if limited and current in live:
         state["cursor"] = live.index(current)   # the worker the stop hit and those after it are read first at the next pass
     for name in list(state["workers"]):
-        if name not in records:
-            state["workers"].pop(name)
+        if name in records:
+            state["workers"][name].pop("gone", None)   # back: its absence clock restarts
+        elif name not in state["stopped"] and now - state["workers"][name].setdefault("gone", now) > 7 * 86400:
+            state["workers"].pop(name)   # kept until stopped or 7 days without a record
     try:
         _save(path, state)
     except OSError:
