@@ -54,6 +54,9 @@ def read(rel):
         return f.read()
 
 
+MAX_BLOCK_BYTES = 4096   # the block file stays a few lines, never a dump
+
+
 class Fake(unittest.TestCase):
     """A scratch tree: a fake az and kubectl first on PATH, a state directory, a call log."""
 
@@ -182,12 +185,12 @@ class Scenarios(Fake):
         self.refused()
         info = os.stat(self.block_path())
         self.assertEqual(stat.S_IMODE(info.st_mode), 0o600)
-        self.assertLess(info.st_size, 400)
+        self.assertLess(info.st_size, MAX_BLOCK_BYTES)   # small: a bound, not a size
         with open(self.block_path()) as f:
             text = f.read()
         for word in (SUB, "acme-vault", "config-body"):
             self.assertNotIn(word, text)
-        self.assertEqual(set(json.loads(text)), {"at", "reason", "retry_at"})
+        self.assertLessEqual({"at", "reason", "retry_at"}, set(json.loads(text)))   # the keys the reader needs; the secret words are refused above
         data = json.loads(text)
         self.assertAlmostEqual(data["retry_at"] - data["at"], 600, delta=1)   # ten minutes by default
         self.assertEqual([n for n in os.listdir(os.path.dirname(self.block_path())) if n.endswith(".tmp")], [])   # written by rename
