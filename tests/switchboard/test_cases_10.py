@@ -5,6 +5,8 @@ import traceback
 import base64
 import calendar
 import collections
+import concurrent.futures
+import multiprocessing
 import contextlib
 import errno
 import copy
@@ -1362,6 +1364,14 @@ class TestCloudLoad(Base):
         self.assertEqual(sb.live_cloud_by_lane(self.state_dir, self.disc, {}, {}, None, 1893456001.0), {})   # 2030-01-01T00:00:01Z
 
 
+_GOLDEN_JOB = None
+
+
+def _golden_record_share(share):
+    golden, entry, root, env = _GOLDEN_JOB
+    return [golden.run(entry, command, root, env) for command in share]
+
+
 class TestArchitectureSafetyNet(unittest.TestCase):
     """The tools that prove a move of switchboard code is text only (plan #1092, slice S0)."""
     TOOLS = REPO / "tools"
@@ -1432,13 +1442,25 @@ class TestArchitectureSafetyNet(unittest.TestCase):
         root = os.path.realpath(str(work))
         env = golden.world(root)
         entry = str(SWITCHBOARD)
-        first = golden.record_all(entry, root, env)
+        commands = golden.command_list(entry, root, env)
+
+        def record():
+            """Every command of the list, recorded by a process pool: each child records its share."""
+            global _GOLDEN_JOB
+            _GOLDEN_JOB = (golden, entry, root, env)
+            count = max(1, min(os.cpu_count() or 1, len(commands)))
+            shares = [commands[i::count] for i in range(count)]
+            with concurrent.futures.ProcessPoolExecutor(max_workers=count, mp_context=multiprocessing.get_context("fork")) as pool:
+                done = list(pool.map(_golden_record_share, shares))
+            return {tuple(command): result for share, results in zip(shares, done) for command, result in zip(share, results)}
+
+        first = record()
         self.assertGreaterEqual(len(first), 120)
         verbs = golden.choices(golden.run(entry, ["--help"], root, env)["stdout"])
         self.assertGreater(len(verbs), 40)
         for verb in verbs:
             self.assertIn((verb, "--help"), first, "the command list has no --help of the verb %s" % verb)
-        self.assertEqual(golden.differences(first, golden.record_all(entry, root, env)), [], "two recordings of one entry differ")
+        self.assertEqual(golden.differences(first, record()), [], "two recordings of one entry differ")
 
     def fake_repo(self, text):
         """A git repository whose bin/fleet-switchboard prints bin/out.txt: a stand-in for the daemon."""

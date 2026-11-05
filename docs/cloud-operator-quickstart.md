@@ -545,6 +545,7 @@ Over one day a cloud pull request took nine pushes and others two to four, becau
 ### A rule for every cloud coder brief
 
 Before any push, run bin/cloud-pr-preflight at the repository root and paste its three sections in the pull request comment; a branch-only failure, a not-run file or an unchained test file must be fixed first, and every existing test file it lists as edited must be justified there.
+When the branch adds or changes a tests/switchboard/test_*.py file, the run prints one more block, the checks of tools/new-test-checks, between the first and the second section, and a FAIL there must be fixed first too.
 
 ## Pre-push preflight modes
 
