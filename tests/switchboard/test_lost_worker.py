@@ -204,9 +204,17 @@ class TestLostWorker(unittest.TestCase):
             self.assertIn("`%s`" % name, section)
 
 
-class TestLostWorkerTrim(unittest.TestCase):
-    """#2164: the cap trims a worker's creation and stop together (cb-1793r was alerted after only its stop was trimmed)."""
-    def run_full(self):
+class TestLostWorkerReadRound(unittest.TestCase):
+    def rig(self, memory=True):
+        r = Rig(load())
+        if not memory:
+            os.unlink(os.path.join(r.dir, "lost-workers.json"))
+        return r
+
+    def alerts(self, r):
+        return [m for m in r.engine.sent if m[0] == "lane-a"]
+
+    def run_full_tables(self):
         mod = load()
         mod.SEEN_MAX = 5
         r = Rig(mod)
@@ -223,22 +231,11 @@ class TestLostWorkerTrim(unittest.TestCase):
             line(r.launcher, ts=stamp(NOW - 20), worker="x%d" % n, runtime_id="pod/x%d" % n, action="stop", ok=True, reason="finished")
         return [x for x in first + r.passes(at=NOW + 1000) if x["kind"] == "pod_no_stop"]
 
-    def test_s2_a_stopped_worker_is_never_alerted_after_the_trim(self):
-        self.assertEqual([x for x in self.run_full() if x["name"] == "old"], [])
+    def test_2164_s2_a_stopped_worker_is_never_alerted_after_the_trim(self):
+        self.assertEqual([x for x in self.run_full_tables() if x["name"] == "old"], [])
 
-    def test_s3_a_worker_with_no_stop_is_still_alerted(self):
-        self.assertEqual(len([x for x in self.run_full() if x["name"] == "lost"]), 1)
-
-
-class TestLostWorkerReadRound(unittest.TestCase):
-    def rig(self, memory=True):
-        r = Rig(load())
-        if not memory:
-            os.unlink(os.path.join(r.dir, "lost-workers.json"))
-        return r
-
-    def alerts(self, r):
-        return [m for m in r.engine.sent if m[0] == "lane-a"]
+    def test_2164_s3_a_worker_with_no_stop_is_still_alerted(self):
+        self.assertEqual(len([x for x in self.run_full_tables() if x["name"] == "lost"]), 1)
 
     def test_s9_cap_and_backlog(self):
         r = self.rig()
