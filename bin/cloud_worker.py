@@ -613,19 +613,22 @@ git_token_sleep = time.sleep   # tests replace it
 
 
 def git_token(repo, cluster, role="worker"):
-    """The one-hour git token for ONE repository: CW_GIT_TOKEN_CMD, else the mint (cloud/launcher/app_token.py REPO), as the driver does.
+    """The one-hour git token for ONE repository: CW_GIT_TOKEN_CMD (prints it on stdout), else the mint (cloud/launcher/app_token.py REPO --fd N through a pipe), as the driver does.
     The default mint gets `--role ROLE` for any role but the worker's (the same rule as the launcher's git_token_cmd); a custom command runs unchanged."""
     raw = os.environ.get("CW_GIT_TOKEN_CMD")
-    argv = shlex.split(raw) if raw else [sys.executable, str(Path(__file__).resolve().parent.parent / "cloud" / "launcher" / "app_token.py"), repo]
-    if not raw and role != "worker":
-        argv += ["--role", role]
     env = {k: v for k, v in os.environ.items() if k not in CLUSTER_DROP}
+    if not raw:   # the default mint hands the token over a pipe it names (--fd), never on stdout: the launcher's one helper does it (and its retry rule)
+        lib = _lib()
+        try:
+            return lib.run_git_token_cmd(lib.git_token_cmd(repo, env, role), repo, env)
+        except lib.CloudError as err:
+            raise Refusal("%s; nothing was created" % _one(cluster.clean(str(err), 200), 200)) from None
+    argv = shlex.split(raw)
 
     def last(ran):
         return _one(cluster.clean(ran[2].strip().splitlines()[-1], 200), 200) if ran and ran[2].strip() else "no message"
 
-    # The retry rule (a copy of the launcher's tempfail_tries: this program loads the launcher by path only for other work, and a test
-    # runs this function without it): again ONLY on status 75 (a custom command too), 4 tries, waits of 2, 5 and 10 seconds.
+    # The retry rule (a copy of the launcher's tempfail_tries): again ONLY on status 75, 4 tries, waits of 2, 5 and 10 seconds.
     tries = 0
     while True:
         tries += 1
