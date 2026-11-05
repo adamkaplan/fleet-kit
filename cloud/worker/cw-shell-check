@@ -186,7 +186,7 @@ REDIRECT = re.compile(r"^(?:\d*|&)(>>|>\|?)(.*)$")
 REDIR_OP = re.compile(r"^(?:&>>?|>>|>\||>&|>)$")
 SHELLS = ("bash", "sh", "zsh", "dash", "ksh")
 INLINE = {"python": ("-c",), "python3": ("-c",), "node": ("-e", "--eval", "-p"), "perl": ("-e", "-E"), "ruby": ("-e",)}
-NAMED_PATH = re.compile(r"""(?:(?<=[\s'"=(,;:])|^)(~?/[^\s'"`;|&)<>,]*)""")
+NAMED_PATH = re.compile(r"""(?:(?<=[\s'"=(,;:<>])|^)(~?/[^\s'"`;|&)<>,]*)""")
 WRAPPERS = ("env", "xargs", "nohup", "timeout", "time", "command", "exec")
 WRAP_ARG = {"xargs": ("-I", "-n", "-P", "-L", "-d", "-E", "-s", "-a"), "env": ("-u", "-C", "-S"), "timeout": ("-s", "-k")}
 OUT_FLAGS = {"curl": ("-o", "--output", "--output-dir"), "wget": ("-O", "-o", "-P", "--output-document", "--directory-prefix", "--output-file"),
