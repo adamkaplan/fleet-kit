@@ -74,6 +74,7 @@ cloud/launcher/tests/test_preflight_repo_read.py
 cloud/launcher/tests/test_preflight_step.py
 cloud/launcher/tests/test_probe_redirect.py
 cloud/launcher/tests/test_read_retired_last_message.py
+cloud/launcher/tests/test_readonly_root.py
 cloud/launcher/tests/test_reap_concurrent.py
 cloud/launcher/tests/test_reaper_audit_tail.py
 cloud/launcher/tests/test_reaper_managed.py

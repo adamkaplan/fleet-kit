@@ -344,6 +344,10 @@ def _apply_impact_hold_locked(engine, repo, number, report, record, carry=None):
         if marker is not None:
             detail["marker"] = marker
         engine.audit.append(engine.actor, "gate.hold_reapplied", pr, detail)
+    else:   # (#2223) a first hold: the labels now say captain, so a body that says `MERGE: automatic` is set to captain the same careful way (restore_marker); a failure is audited once and never blocks the hold
+        marker = restore_marker(engine, runner, repo, number, head, raw)
+        if marker is not None:
+            engine.audit.append(engine.actor, "gate.hold_marker_failed" if "error" in marker else "gate.hold_marker", pr, dict(marker, head=head))
     return spent
 
 

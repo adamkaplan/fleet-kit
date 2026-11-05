@@ -1,0 +1,1 @@
+| `switchboard/cockpit.py` | 4 | the Cockpit feed: `cockpit.json` and `cockpit --json`, read-only | |

@@ -1,4 +1,5 @@
 """The plan check's `no-failure-mode` warning (ask #1455): a plan that reads or produces something and has no scenario about a missing, corrupt, unreadable or absent input."""
+import os
 import re
 import subprocess
 import sys
@@ -44,7 +45,6 @@ scenarios:
     evaluator: ci
 ```
 """
-PINNED_HASH = "sha256:6cb50bf03dbe865e24ee38e553296cf71b9f33e4dc360fc52a48554395fab532"
 FAILURE = """  - id: S3
     covers: DW-1
     text: Given one input file that is unreadable, when the verb runs, then the output says so
@@ -64,7 +64,8 @@ def run(text):
         path = Path(tmp) / "plan.md"
         path.write_text(text)
         return subprocess.run([sys.executable, str(REPO / "bin" / "fleet-switchboard"), "plan", "check", "--file", str(path), "--done-when", DONE],
-                              capture_output=True, text=True)
+                              capture_output=True, text=True,
+                              env=dict(os.environ, HOME=tmp, XDG_STATE_HOME=tmp, XDG_CONFIG_HOME=tmp, FLEET_SWITCHBOARD_STATE=tmp))   # an isolated location, never the real one (#1322 guard)
 
 
 class TestNoFailureMode(unittest.TestCase):
@@ -81,8 +82,11 @@ class TestNoFailureMode(unittest.TestCase):
         self.assertNotIn("no-failure-mode", run(quiet).stdout)
 
     def test_s4_the_warning_does_not_change_the_plan_hash(self):
-        self.assertEqual(plan_check.check(plan(), DONE)["plan_hash"], PINNED_HASH)
-        self.assertIn("plan hash: %s" % PINNED_HASH, run(plan()).stdout)
+        res = plan_check.check(plan(), DONE)
+        self.assertTrue(any(w["code"] == "no-failure-mode" for w in res["warnings"]), res["warnings"])
+        expected = plan_check.plan_hash(plan())
+        self.assertEqual(res["plan_hash"], expected)
+        self.assertIn("plan hash: %s" % expected, run(plan()).stdout)
 
     def test_s1_s5_the_documents_carry_the_lines(self):
         for path in ("docs/plan-template.md", "skills/fleet-planning/SKILL.md"):

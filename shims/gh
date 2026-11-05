@@ -2147,7 +2147,7 @@ def api_call(args, namer):
 # a valid waiver, a shadow repo) runs the real gh. In an enforcing repo a merge is bound to the checked head and --auto is refused.
 # `gh pr create` has no PR number before it runs, so it is not probed here. The probe is skipped altogether for a repo that is
 # not listed under `plan_gates` in the switchboard config, and for the switchboard's own gh calls (no recursion).
-GATE_SECONDS = 3.0
+GATE_SECONDS = 8.0
 GATE_SPOOL = "gate-failopen.jsonl"
 GATE_SPOOL_LIMIT = 262144
 BOOL_SHORT = {"pr merge": {"d": "--delete-branch", "m": "--merge", "r": "--rebase", "s": "--squash"}, "pr ready": {}}

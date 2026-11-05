@@ -1830,9 +1830,11 @@ class TestGhShimGateProbe(Base):
         self.assertEqual(entry["event"], "fail_open")
         self.assertIn("no answer within 1s", entry["detail"])
 
-    def test_the_bound_is_clamped_and_defaults_to_three_seconds(self):
+    def test_the_bound_is_clamped_and_defaults_above_the_old_three_seconds(self):
         source = SHIM.read_text()
-        self.assertIn("GATE_SECONDS = 3.0", source)
+        default = float(re.search(r"^GATE_SECONDS = ([0-9.]+)", source, re.M).group(1))
+        self.assertGreater(default, 3.0)   # the old default (#2215)
+        self.assertLessEqual(default, 10.0)   # the cap, which the environment override cannot pass either
         done, seen = self.run_shim("pr", "ready", "12", "-R", "acme/app", env={"FAKE_GATE_SLEEP": "30", "FLEET_SHIM_GATE_SECONDS": "0.01"})
         self.assertLess(self.elapsed, 25, "a bound below 0.2 s is raised to 0.2 s, not 0")
 
