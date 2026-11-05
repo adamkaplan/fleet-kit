@@ -17766,6 +17766,33 @@ def _diff_lines(runner, git_dir, a, b, sign):
     return found
 
 
+def _pure_removals(runner, git_dir, a, b):
+    """The '-' lines of `git diff -U0 a b` from hunks that add nothing: a hunk with both '-' and '+' lines MODIFIES a line (an extension, a rewritten call), it does not drop one."""
+    out, name, old, hunk, found = _git_out(runner, git_dir, ["diff", "-U0", "--no-renames", "--no-color", a, b]), None, 0, [], []
+    def flush():
+        if hunk and not any(h is None for h in hunk):
+            found.extend(hunk)
+        del hunk[:]
+    for line in out.split("\n") + ["@@ end"]:
+        if line.startswith("@@"):
+            flush()
+            m = re.match(r"@@ -(\d+)", line)
+            old = int(m.group(1)) if m else 0
+        elif line.startswith("+++ "):
+            flush()
+            name = line[4:][2:] if line[4:].startswith("b/") else None if line[4:] == "/dev/null" else line[4:]
+        elif line.startswith("--- "):
+            flush()
+            if line[4:] != "/dev/null":
+                name = line[4:][2:] if line[4:].startswith("a/") else line[4:]
+        elif line.startswith("-") and name:
+            hunk.append((name, old, line[1:]))
+            old += 1
+        elif line.startswith("+"):
+            hunk.append(None)   # an addition: the hunk is a modification
+    return found
+
+
 class MergeDropsConflict(Exception):
     pass
 
@@ -17783,11 +17810,17 @@ def merge_drops(runner, git_dir, tip, head):
     own = collections.Counter()   # the PR's own removals (three-dot), per (file, stripped line); from the branch's non-merge commits, as the three-dot diff is empty once the tip is merged in
     for commit in _git_out(runner, git_dir, ["rev-list", "--no-merges", "%s..%s" % (tip, head)]).split():
         own.update((f, t.strip()) for f, _, t in _diff_lines(runner, git_dir, commit + "^", commit, "-"))
-    fork = _git_out(runner, git_dir, ["merge-base", tip, head]).strip()   # the PR's own three-dot (tip...head): a removal made while porting through a merge resolution is its own too, and the tip may have moved since
-    if fork and fork != _git_out(runner, git_dir, ["rev-parse", tip]).strip():   # when the whole tip is merged in, the base IS the tip: only the per-commit removals above are left
-        own = own | collections.Counter((f, t.strip()) for f, _, t in _diff_lines(runner, git_dir, fork, head, "-"))   # per-key maximum
+    tip_sha = _git_out(runner, git_dir, ["rev-parse", tip]).strip()
+    # the PR's own three-dot (a modified line is a removal and an addition): from the head and from the branch side (first parent) of each merge in tip..head, whose merge-base with the tip
+    # is where that side left it; so a removal made while porting through a merge resolution is its own, a line the PR modified before it merged the tip in is its own, and the tip having moved since changes nothing.
+    # A side that already holds the whole tip has no such base (its diff would hold real drops): skipped.
+    sides = [head] + [m + "^1" for m in _git_out(runner, git_dir, ["rev-list", "--merges", "%s..%s" % (tip, head)]).split()]
+    for side in sides:
+        fork = _git_out(runner, git_dir, ["merge-base", tip, side]).strip()
+        if fork and fork != tip_sha and fork != _git_out(runner, git_dir, ["rev-parse", side]).strip():
+            own = own | collections.Counter((f, t.strip()) for f, _, t in _diff_lines(runner, git_dir, fork, side, "-"))   # per-key maximum
     dropped = []
-    for d in _diff_lines(runner, git_dir, tip, tree, "-"):   # the tip's lines the merge result lacks
+    for d in _pure_removals(runner, git_dir, tip, tree):   # the tip's lines the merge result lacks
         key = (d[0], d[2].strip())
         if own[key] > 0:
             own[key] -= 1
@@ -17862,7 +17895,7 @@ def merge_drops_refusal(runner, config, repo, number, state):
     if not bad:
         return None
     return "merge of %s#%d refused: its head drops %d tip hunk(s): %s; keep them, or name each in a merge commit message (`fleet-switchboard merge-drops`)" % (
-        repo, number, len(bad), "; ".join(merge_drops_text(h) for h in bad[:3]))
+        repo, number, len(bad), "; ".join(merge_drops_text(h) for h in bad))
 
 
 ANCESTOR_DEPTH = 25
