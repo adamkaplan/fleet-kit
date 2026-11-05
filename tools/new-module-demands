@@ -113,9 +113,7 @@ def block(path, source, sources, closure):
     else:
         out.append("  authority code: no")
         out.append("  matrix: no matrix line is demanded")
-    rows = unit_rows(units_text)
-    before = [r for r in rows if r[0] < os.path.basename(path)]
-    out.append("  units: add this row to the Units table of docs/architecture.md (header `%s`, rows sorted by name), after the row of `%s`:" % (UNITS_HEAD, max(r[0] for r in before) if before else "(first row)"))
+    out.append("  units: add the file docs/architecture/units/%s.row holding this one row (a file of its own: no shared line to conflict on):" % os.path.basename(path))
     out.append("    " + unit_row(path))
     out.append("  closure: " + closure)
     return "\n".join(out)
