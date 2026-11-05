@@ -8323,11 +8323,18 @@ def cloud_turn_tick(engine, discovery, activity=None):
 
 
 def pod_silence_summary(worker):
-    """#2115: the one summary line of a pod, from the launcher's read (`inspect NAME --short`, slice 2); None when it cannot be read."""
+    """#2115 fix forward: the one summary line of a pod, read IN-PROCESS by the daemon: the launcher's plain `inspect NAME` (its JSON body) through run_launcher,
+    then the same one-line formatter `inspect --short` prints. It does NOT go through the boss-checked `inspect` command (that refuses the daemon), and it adds
+    no flag and no caller argument: this function takes a pod name from the daemon's own live records and returns the line only to pod_silence.scan, which
+    sends it to the recorded boss; a lane has no way to call it (not a command, not a request kind). Raises (a refusal text) when the pod cannot be read."""
     cloud = load_module("cloud_worker").bind(globals())
-    code, data, _err = cloud.run_launcher(None, "inspect", worker, ("--short",), 60)
-    line = data if isinstance(data, str) else (data.get("short") if isinstance(data, dict) else None)
-    return line if code == 0 and isinstance(line, str) and line.strip() else None
+    code, body, note = cloud.run_launcher(None, "inspect", worker, (), 60)
+    if code != 0 or not isinstance(body, dict):
+        raise RuntimeError("the pod was not read (%s)" % (" ".join(str(note or "exit %s" % code).split())[:120]))
+    line = cloud._inspect_short(body)
+    if not isinstance(line, str) or not line.strip():
+        raise RuntimeError("the pod state was empty")
+    return line
 
 
 def pod_silence_tick(engine, discovery, summary=None):
@@ -8351,7 +8358,8 @@ def pod_silence_tick(engine, discovery, summary=None):
         live.append({"worker": name, "boss": _cloud_boss(rec.get("reports_to")), "last_report": said.get("at"), "done": said.get("state") == "done",
                      "last_push": max([a for a in at if isinstance(a, (int, float))] or [None], key=lambda a: a or 0)})
     return load_module("pod_silence").scan(live, now, Path(state_dir) / "pod-silence.json", lambda to, text: engine.send("switchboard", to, text),
-                                           summary or pod_silence_summary, load_module("record_json").parse_bounded, prune=not watch.get("capped"))
+                                           summary or pod_silence_summary, load_module("record_json").parse_bounded, prune=not watch.get("capped"),
+                                           audit=lambda worker, detail: engine.audit is not None and engine.audit.append(engine.actor, "pod_silence.unreadable", worker, detail))
 
 
 def lost_worker_tick(engine, discovery):
