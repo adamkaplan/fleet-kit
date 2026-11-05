@@ -19,6 +19,7 @@ _ITEM = re.compile(r"^[ \t]*[-*][ \t]+(\S.*?)[ \t]*$")
 _NOT_DONE = re.compile(r"^not[ \t]+done\b", re.I)
 _SEP = ":-\u2013\u2014"   # what must follow the name: `<check>: <result>` or `<check> - <result>`
 _WRAP = " \t*_`)]"   # markup that may sit between the name and the separator
+_CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
 _PAD = " \t:;,.=()[]*_`-\u2013\u2014>"
 
 
@@ -34,7 +35,7 @@ def parse(brief):
                 item = _ITEM.match(text)
                 if not item:
                     break
-                name = " ".join(item.group(1).split())[:MAX_CHECK_CHARS]
+                name = " ".join(_CONTROL.sub("", item.group(1)).split())[:MAX_CHECK_CHARS]   # control characters out, so every reader gets a clean name
                 if name and name not in found:
                     found.append(name)
                 if len(found) >= MAX_CHECKS:

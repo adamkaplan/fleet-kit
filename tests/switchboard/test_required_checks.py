@@ -103,6 +103,12 @@ def build(TwoRepoCase):
             for line in ("restart test: ran, passes", "restart test - ran, passes", "**restart test**: passes"):
                 self.assertEqual(module().compare(line, ["restart test"])["missing"], [], line)
 
+        def test_parse_keeps_no_control_character_in_a_name(self):
+            found = module().parse("REQUIRED CHECKS:\n- red\x1b[31m team\x07 check\n- plain\n")
+            self.assertTrue(found, "the block is read")
+            self.assertFalse([c for c in found if any(ord(ch) < 32 or 127 <= ord(ch) < 160 for ch in c)], "no control character in a stored name")
+            self.assertIn("plain", found)
+
         # U1
         def test_u1_a_reader_with_no_list_changes_nothing(self):
             body = "Review of %s: APPROVE\nanything\n" % SHA
