@@ -766,6 +766,7 @@ def _launch(args, runner, now, reserve):
         if stack_model:
             cluster.add(stack_model[1])
             run_secrets.append(("stack-model-key", stack_model[1]))
+        _print_capacity(runner, cluster)   # ONE read-only block on stderr, before the create; it never refuses, never changes the launch
         read_fd, write_fd = os.pipe()
         try:
             try:
@@ -857,6 +858,54 @@ def _launch(args, runner, now, reserve):
     print(_limits_note(args, record), file=sys.stderr)   # stderr, before the one JSON line
     print(json.dumps({"name": name, "session": session, "runtime_id": record["runtime_id"], "url": record["url"], "cloud": True}, sort_keys=True))
     return H["EXIT_OK"]
+
+
+CAPACITY_SECONDS = 5   # the one bounded read of the capacity block: past it the block says `not read` and the launch goes on
+
+
+def capacity_block(body, shapes, quantity, skip=()):
+    """The lines of the capacity block from the launcher's `capacity` answer (a dict, or None when the read failed). `shapes` is the launcher's
+    SHAPES table (every row but `skip`); the room of a node is its allocatable minus the requests of the pods this login can list."""
+    body = body if isinstance(body, dict) else {}
+    nodes, pods = body.get("nodes_read") is True, body.get("pods_read") is True
+    lines = ["cloud capacity before the create (read-only; it does not change the launch):"]
+    for shape, row in shapes.items():
+        if shape in skip:
+            continue
+        if not (nodes and pods):
+            lines.append("  shape %s: nodes with room: not counted" % shape)
+            continue
+        need_cpu, need_mem = quantity(row.get("cpu"), 1000), quantity(row.get("memory"), 1)
+        used = body.get("requests") or {}
+        room = sum(1 for n in body.get("nodes") or []
+                   if int(n.get("cpu_m") or 0) - int((used.get(n.get("name")) or {}).get("cpu_m") or 0) >= need_cpu
+                   and int(n.get("memory_b") or 0) - int((used.get(n.get("name")) or {}).get("memory_b") or 0) >= need_mem)
+        lines.append("  shape %s: %d nodes with room" % (shape, room))
+    lines.append("  nodes: %s" % ("read" if nodes else "not read"))
+    lines.append("  pods: %s" % ("read" if pods else "not read"))
+    lines.append("  Pending pods: %s" % (body.get("pending") if pods else "not read"))
+    if body.get("events_read") is True:
+        lines.append("  last FailedScheduling: %s" % (str(body.get("last_event"))[:200] if body.get("last_event") else "none"))
+    else:
+        lines.append("  events: not read")
+    lines.append("  room is counted from the pods this login can see: an upper bound")
+    return lines
+
+
+def _print_capacity(runner, cluster):
+    """Print the capacity block ONCE on standard error. Information only: any failure here (a refused or hung read, a bad answer) is said as `not read`
+    and the launch goes on; nothing is written to the cluster and standard output is never touched."""
+    try:
+        lib = _lib()
+        try:
+            code, body, _ = run_launcher(runner, "capacity", "", (), CAPACITY_SECONDS, cluster=cluster)
+            body = body if code == 0 else None
+        except CloudError:
+            body = None
+        lines = capacity_block(body, lib.SHAPES, lib._quantity, skip=(lib.DEFAULT_ORCHESTRATOR_SHAPE,))
+        print("\n".join(lines), file=sys.stderr)
+    except Exception:
+        print("cloud capacity before the create: not read", file=sys.stderr)
 
 
 def _first_push():

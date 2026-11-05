@@ -253,6 +253,9 @@ class TestSplitCommands(tcw.VaultBase):
 
     def test_s4_the_scripted_commands_give_the_same_outputs_and_call_logs(self):
         new = self.script()
+        block_lines = [l for l in new[0] if "cloud capacity before the create (read-only; it does not change the launch):" in l]
+        self.assertEqual(len(block_lines), 2, block_lines)
+        new = ([l for l in new[0] if l not in block_lines],) + tuple(new[1:])
         old_module = self.old_module()
         real = tcw.sb.load_module
         self.addCleanup(setattr, tcw.sb, "load_module", real)

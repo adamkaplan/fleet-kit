@@ -437,6 +437,164 @@ SCRUB_OUTPUT_MAX = 2 * SCRUB_INPUT_MAX   # a limit above the input maximum: reda
 MIN_FRAGMENT = 8
 
 
+import ipaddress  # noqa: E402  (PC-11: the masking is decided by the standard module)
+WINDOW = 200               # a run of address characters longer than this is cut into windows ...
+WINDOW_OVERLAP = 64        # ... that overlap by this many characters: more than the longest address (45) plus a short zone
+SUBSTRING_MAX = 64         # a substring tried is at most this long: at most 64 parses start at one position
+MASK_GUARD = 1000          # PC-12: the repeat ends in any case after this many passes; the text is then replaced by [masking_loop]
+_RUN_RE = re.compile(r"[0-9A-Fa-f:.]+")   # the finder of candidates: every maximal run of address characters
+
+
+def _address_spans(run):
+    """Every [start, end) span of `run` (one window) that `ipaddress.ip_address` accepts: a span starts and ends at the edge of the run or next to
+    a colon or a dot (a `::` is never a separator: `1::2::3` stays whole and unmasked)."""
+    spans, n = [], len(run)
+    for i in range(n):
+        if i == 0 or (run[i - 1] in ":." and run[i - 2:i] != "::"):
+            for j in range(i + 1, min(n, i + SUBSTRING_MAX) + 1):
+                if j == n or (run[j] in ":." and run[j:j + 2] != "::"):
+                    try:
+                        ipaddress.ip_address(run[i:j])
+                    except ValueError:
+                        continue
+                    spans.append((i, j))
+    return spans
+
+
+def _mask_pass(text):
+    """One pass: in every run the LONGEST parseable substring is taken first (ties: the leftmost), then the longest of what does not overlap it,
+    until nothing parses; each taken substring becomes `[address]`."""
+    out, last = [], 0
+    for m in _RUN_RE.finditer(text):
+        run, base, spans = m.group(), m.start(), set()
+        if len(run) <= WINDOW:
+            spans.update(_address_spans(run))
+        else:
+            step = WINDOW - WINDOW_OVERLAP
+            for w in range(0, len(run), step):
+                spans.update((w + a, w + b) for a, b in _address_spans(run[w:w + WINDOW]))
+                if w + WINDOW >= len(run):
+                    break
+        taken, used = [], bytearray(len(run))
+        for a, b in sorted(spans, key=lambda s: (s[0] - s[1], s[0])):
+            if not any(used[a:b]):
+                used[a:b] = b"\1" * (b - a)
+                taken.append((a, b))
+        for a, b in sorted(taken):
+            out.append(text[last:base + a])
+            out.append("[address]")
+            last = base + b
+    out.append(text[last:])
+    return "".join(out)
+
+
+_HEX = frozenset("0123456789abcdefABCDEF")
+
+
+def _glue_pass(text):
+    """PC-13, one glue pass on the text the PC-11/PC-12 passes left: in every run of address characters a candidate of at most 64 characters may start at a
+    normal start (run start, or after a colon or a dot) or at an extension start (a hex digit inside a group, 1 to 5 hex characters of the group before it)
+    and end at a normal end or an extension end (the mirror), at least one being an extension; a candidate with a group of more than 4 characters is not
+    tried; the longest that `ipaddress` accepts (ties: the leftmost) becomes `[address]`."""
+    out, last = [], 0
+    for m in _RUN_RE.finditer(text):
+        r, n = m.group(), len(m.group())
+        gs, ge, mark = [0] * n, [0] * n, -1
+        for i, c in enumerate(r):
+            gs[i] = mark + 1
+            if c in ":.":
+                mark = i
+        nxt = n
+        for i in range(n - 1, -1, -1):
+            if r[i] in ":.":
+                nxt = i
+            ge[i] = nxt
+        starts = []
+        for p in range(n):
+            ext = p > 0 and r[p] not in ":." and r[p - 1] in _HEX and 1 <= p - gs[p] <= 5
+            if ext or p == 0 or r[p - 1] in ":.":
+                starts.append((p, ext))
+        ends = []
+        for q in range(1, n + 1):
+            ext = q < n and r[q - 1] in _HEX and r[q] in _HEX and r[q - 1] not in ":." and r[q] not in ":." and 1 <= ge[q] - q <= 5
+            if ext or q == n or r[q] in ":.":
+                ends.append((q, ext))
+        best = None
+        for p, pe in starts:
+            for q, qe in ends:
+                if q - p > SUBSTRING_MAX:
+                    break
+                if q <= p or not (pe or qe):
+                    continue
+                cand = r[p:q]
+                if best is not None and q - p <= best[1] - best[0]:
+                    continue
+                if any(len(g) > 4 for g in re.split(r"[:.]", cand)):
+                    continue
+                try:
+                    ipaddress.ip_address(cand)
+                except ValueError:
+                    continue
+                best = (p, q)
+        if best:
+            out.append(text[last:m.start() + best[0]])
+            out.append("[address]")
+            last = m.start() + best[1]
+    out.append(text[last:])
+    return "".join(out)
+
+
+_ABSORB_RE = re.compile(r"(?:(?<![0-9A-Za-z.])(?:[0-9]{1,3}\.){1,3})?\[address\](?:\.[0-9]{1,3}){1,3}(?![0-9])|(?<![0-9A-Za-z.])(?:[0-9]{1,3}\.){1,3}\[address\]")
+
+
+def _absorb_pass(text):
+    """PC-13 (the absorb rule): a `[address]` directly followed by a dot and 1 to 3 dotted octets, or directly preceded by 1 to 3 dotted octets, absorbs them
+    (the dotted tail of an IPv6 address that phase 1 parsed only in part); over-masking only."""
+    return _ABSORB_RE.sub("[address]", text)
+
+
+def _mask_addresses(text):
+    """The capacity answer's own masking, before the launcher's one scrub, decided by `ipaddress` (PC-10, PC-11, PC-12): every maximal run of address
+    characters (an optional `%zone` stays text) is searched, in windows of 200 that overlap by 64, for substrings that `ipaddress` accepts, the longest
+    first; a colon that only separates a label or a port is not part of the address; text that does not parse (`1::2::3`) is kept. The pass repeats
+    until a pass changes nothing (each changing pass replaces a parseable substring by `[address]`, which holds none, so it ends); a guard of
+    1,000 passes ends it in any case and the text is then replaced by `[masking_loop]`."""
+    if not isinstance(text, str):
+        return text
+    for _ in range(MASK_GUARD):
+        done = _mask_pass(text)
+        if done == text:
+            break
+        text = done
+    else:
+        return "[masking_loop]"
+    GLUE_PASS = True
+    if GLUE_PASS and _address_spans("fd00::1"):  # PC-13: the glue pass (an address glued to hex letters), only while the IPv6 masking is on
+        for _ in range(MASK_GUARD):
+            glued = _absorb_pass(_glue_pass(text))
+            if glued == text:
+                return text
+            text = glued
+        return "[masking_loop]"
+    return text
+
+
+def _quantity(value, scale):
+    """A Kubernetes quantity ('4', '3920m', '8Gi', '16000Ki') as a whole number: `scale` 1000 gives millicores, 1 gives bytes. Unreadable is 0."""
+    text = str(value if value is not None else "0")
+    units = {"Ki": 1024, "Mi": 1024 ** 2, "Gi": 1024 ** 3, "Ti": 1024 ** 4, "k": 1000, "M": 1000 ** 2, "G": 1000 ** 3, "T": 1000 ** 4, "m": 0.001}
+    for suffix, mult in units.items():
+        if text.endswith(suffix):
+            text, factor = text[:-len(suffix)], mult
+            break
+    else:
+        factor = 1
+    try:
+        return int(float(text) * factor * scale)
+    except ValueError:
+        return 0
+
+
 POD_EVENTS_MAX, POD_EVENT_CHARS = 20, 200
 _ADDRESS_RE = re.compile(r"(?<![\w.-])(?:\d{1,3}\.){3}\d{1,3}(?::\d{1,5})?(?![\w.-])|(?<![\w.-])(?:(?:[A-Za-z0-9-]+\.)+[A-Za-z][A-Za-z0-9-]*|localhost):\d{1,5}(?![\w.-])|\[[0-9A-Fa-f:.]*:[0-9A-Fa-f:.]*\](?::\d{1,5})?|(?<![\w:])[0-9A-Fa-f:]{1,45}:(?:\d{1,3}\.){3}\d{1,3}(?![\w.:-])|(?<![\w:])(?:(?:[0-9A-Fa-f]{1,4}:){1,7}:(?:[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4}){0,6})?|::(?:[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4}){0,6})?)(?:%[A-Za-z0-9_.-]{1,16})?(?![\w:])|(?<![\w:])(?:[0-9A-Fa-f]{1,4}:){7}[0-9A-Fa-f]{1,4}(?![\w:])")
 
@@ -2160,6 +2318,10 @@ class Kube:
         login without that right is refused by the API server, and the caller falls back to the pod placement."""
         return json.loads(self.run(["get", "nodes", "-o", "json"]))["items"]
 
+    def list_events(self):
+        """The namespace's scheduler events (`FailedScheduling`): a `get`, a read only."""
+        return json.loads(self.run(["get", "events", "--field-selector", "reason=FailedScheduling", "-o", "json"]))["items"]
+
     def annotate(self, name, uid, **kv):
         """Annotate the pod that was READ (its `uid`), never one of the same name that replaced it: a merge patch whose body carries
         metadata.uid, which the API server refuses on a mismatch. Raises PodChanged when the pod is not that one (or is gone)."""
@@ -2529,6 +2691,11 @@ def render_pod(a, worker, name, now, hard, env, run_names=()):
     if bad:
         raise CloudError("refusing a pod spec with a forbidden field: %s" % ", ".join(bad), EXIT_USAGE)
     return pod
+
+
+def _cap_text(kube, text, limit):
+    """PC-14: known secrets first (no cut), then addresses, then the cut."""
+    return _mask_addresses(kube.scrub(text, SCRUB_OUTPUT_MAX))[:limit]
 
 
 class _StopKube:
@@ -3349,6 +3516,50 @@ class Launcher:
         except CloudError as e:
             nodes, nodes_read, nodes_error = [], False, self.kube.scrub(e, 200)
         return {"pods": pods, "nodes": nodes, "nodes_read": nodes_read, "nodes_error": nodes_error}
+
+    def capacity(self, a):
+        """ONE read-only look at room: per node its name and allocatable cpu (millicores) and memory (bytes) ONLY (never its addresses), the requests of the
+        pods this login can list, per node, the Pending pods count and the last FailedScheduling line (scrubbed, 200 characters). Only `get` calls are made. A refused
+        read is said (`nodes_read`, `pods_read`, `events_read` false and a short scrubbed error), never a failure of the whole read."""
+        out = {"nodes": [], "requests": {}, "pending": None, "last_event": None,
+               "nodes_read": True, "nodes_error": None, "pods_read": True, "pods_error": None, "events_read": True, "events_error": None}
+        try:
+            for node in self.kube.list_nodes():
+                alloc = (node.get("status") or {}).get("allocatable") or {}
+                out["nodes"].append({"name": _cap_text(self.kube, (node.get("metadata") or {}).get("name"), 100),
+                                     "cpu_m": _quantity(alloc.get("cpu"), 1000), "memory_b": _quantity(alloc.get("memory"), 1)})
+        except CloudError as e:
+            out["nodes"], out["nodes_read"], out["nodes_error"] = [], False, self.kube.scrub(e, 120)
+        try:
+            pending = 0
+            for pod in self.kube.list_pods_all():
+                phase = (pod.get("status") or {}).get("phase")
+                pending += phase == "Pending"
+                node = (pod.get("spec") or {}).get("nodeName")
+                if node and phase not in ("Succeeded", "Failed"):
+                    mine = out["requests"].setdefault(_cap_text(self.kube, node, 100), {"cpu_m": 0, "memory_b": 0})
+                    for c in (pod.get("spec") or {}).get("containers") or []:
+                        req = ((c.get("resources") or {}).get("requests")) or {}
+                        mine["cpu_m"] += _quantity(req.get("cpu"), 1000)
+                        mine["memory_b"] += _quantity(req.get("memory"), 1)
+            out["pending"] = pending
+        except CloudError as e:
+            out["requests"], out["pods_read"], out["pods_error"] = {}, False, self.kube.scrub(e, 120)
+        try:
+            events = [ev for ev in self.kube.list_events() if (ev or {}).get("reason") in (None, "FailedScheduling")]
+            if events:
+                def when(ev):
+                    return str(ev.get("lastTimestamp") or ev.get("eventTime") or (ev.get("metadata") or {}).get("creationTimestamp") or "")
+                last = max(events, key=when)
+                who = (last.get("involvedObject") or {}).get("name")
+                out["last_event"] = _cap_text(self.kube, "FailedScheduling %s%s" % (who + ": " if who else "", last.get("message") or ""), 200)
+        except CloudError as e:
+            out["events_read"], out["events_error"] = False, self.kube.scrub(e, 120)
+        # PC-10: after the one scrub, every name and the event line lose an address of the three forms
+        out["nodes"] = [dict(n, name=_mask_addresses(n["name"])) for n in out["nodes"]]
+        out["requests"] = {_mask_addresses(k): v for k, v in out["requests"].items()}
+        out["last_event"] = _mask_addresses(out["last_event"])[:200] if out["last_event"] else out["last_event"]
+        return out
 
     def hard_deadline(self, pod):
         """The pod's copy, unless the switchboard record (read only, --record-dir) names a later or earlier one."""
@@ -4275,6 +4486,7 @@ def build_parser():
     d.add_argument("--reason", default="")
     cmd("status")
     cmd("snapshot", worker=False)   # ONE read-only look at the cluster: the pods of the namespace and, when the login may list them, the nodes
+    cmd("capacity", worker=False)   # ONE read-only look at room: the nodes' allocatable, the pods' requests, the Pending count, the last FailedScheduling line
     cmd("report")
     pr = cmd("prune-records", worker=False)
     pr.add_argument("--days", type=int, help="remove run records older than this many days (default: $CW_RECORD_KEEP_DAYS, else 30)")
