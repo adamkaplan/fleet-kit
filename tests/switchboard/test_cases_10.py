@@ -1444,23 +1444,27 @@ class TestArchitectureSafetyNet(unittest.TestCase):
         entry = str(SWITCHBOARD)
         commands = golden.command_list(entry, root, env)
 
-        def record():
-            """Every command of the list, recorded by a process pool: each child records its share."""
+        def record(wanted):
+            """The given commands, recorded by a process pool: each child records its share."""
             global _GOLDEN_JOB
             _GOLDEN_JOB = (golden, entry, root, env)
-            count = max(1, min(os.cpu_count() or 1, len(commands)))
-            shares = [commands[i::count] for i in range(count)]
+            count = max(1, min(os.cpu_count() or 1, len(wanted)))
+            shares = [wanted[i::count] for i in range(count)]
             with concurrent.futures.ProcessPoolExecutor(max_workers=count, mp_context=multiprocessing.get_context("fork")) as pool:
                 done = list(pool.map(_golden_record_share, shares))
             return {tuple(command): result for share, results in zip(shares, done) for command, result in zip(share, results)}
 
-        first = record()
-        self.assertGreaterEqual(len(first), 120)
+        self.assertGreaterEqual(len(commands), 120)
+        self.assertEqual(len({tuple(c) for c in commands}), len(commands), "the command list repeats a command")
+        helps = [command for command in commands if command[-1] == "--help"]
         verbs = golden.choices(golden.run(entry, ["--help"], root, env)["stdout"])
         self.assertGreater(len(verbs), 40)
+        first = record([[verb, "--help"] for verb in verbs])   # the --help of every verb, recorded once; the full run of every command is golden-cli compare's job
+        listed = {tuple(c) for c in commands}
         for verb in verbs:
-            self.assertIn((verb, "--help"), first, "the command list has no --help of the verb %s" % verb)
-        self.assertEqual(golden.differences(first, record()), [], "two recordings of one entry differ")
+            self.assertIn((verb, "--help"), listed, "the command list has no --help of the verb %s" % verb)
+        sample = helps[:4] + helps[-4:] + commands[-4:]   # a small fixed sample, recorded a second time
+        self.assertEqual(golden.differences(record(sample), record(sample)), [], "two recordings of one entry differ")
 
     def fake_repo(self, text):
         """A git repository whose bin/fleet-switchboard prints bin/out.txt: a stand-in for the daemon."""

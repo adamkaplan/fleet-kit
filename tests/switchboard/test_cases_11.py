@@ -23,6 +23,7 @@ import itertools
 import select
 import json
 import os
+import pwd
 from pathlib import Path
 import re
 from urllib.parse import unquote
@@ -1145,6 +1146,70 @@ class TestBigRegistrarFile(unittest.TestCase):
 
 
 class TestStateDir(Base):
+    def real_home(self):
+        """A pretend real account: the guard's real locations come from here, so no real directory is touched."""
+        real = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(real), True)
+        patcher = mock.patch.object(sb, "_real_locations", lambda: ({os.path.realpath(str(real / sb.PROG))}, {os.path.realpath(str(real / "config"))},
+                                                                      {os.path.realpath(str(real / sb.PROG / "audit.jsonl"))}))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return real
+
+    def test_the_real_state_directory_is_refused_for_none_and_for_the_real_path_and_creates_nothing(self):
+        real = self.real_home()
+        os.environ["XDG_STATE_HOME"] = str(real)   # so that the default state directory resolves to the pretend real one
+        for argument in (None, real / sb.PROG):
+            with self.subTest(argument=argument):
+                with self.assertRaises(sb.RealStateRefused):
+                    sb.ensure_state_dir(argument)
+        self.assertEqual(list(real.iterdir()), [])
+
+    def test_the_real_config_directory_and_audit_path_and_a_symlink_to_the_state_are_refused(self):
+        real = self.real_home()
+        (real / sb.PROG).mkdir()
+        link = real / "link"
+        link.symlink_to(real / sb.PROG)
+        for path, kind in ((real / "config", "config"), (real / sb.PROG / "audit.jsonl", "audit"), (link, "state")):
+            with self.subTest(kind=kind):
+                with self.assertRaises(sb.RealStateRefused):
+                    sb.refuse_real_location(path, kind)
+
+    def child_state(self, home, extra=None):
+        """A real child process, marker inherited, HOME and XDG_* at `home`: what its state_dir_path() says, or the refusal."""
+        code = ("import importlib.machinery, importlib.util, sys\n"
+                "l = importlib.machinery.SourceFileLoader('sbx', %r)\n"
+                "s = importlib.util.spec_from_loader('sbx', l); m = importlib.util.module_from_spec(s); l.exec_module(m)\n"
+                "try:\n    print(m.state_dir_path())\nexcept m.RealStateRefused as e:\n    print('REFUSED')\n" % str(SWITCHBOARD))
+        env = {k: v for k, v in os.environ.items() if not k.startswith("HERDR_")}
+        env.update({"HOME": str(home), "XDG_STATE_HOME": str(home / "xdg-state"), "XDG_CONFIG_HOME": str(home / "xdg-config"), **(extra or {})})
+        return subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=120).stdout.strip()
+
+    def test_a_real_child_with_a_temporary_home_runs_and_one_pointed_at_the_real_directory_is_refused(self):
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(tmp), True)
+        self.assertEqual(self.child_state(tmp), str(tmp / "xdg-state" / sb.PROG))
+        real = Path(json.loads(os.environ[sb.REAL_LOCATIONS_ENV])["state"][0])
+        child_home = tmp / "h"
+        self.assertEqual(self.child_state(child_home, {"XDG_STATE_HOME": str(real.parent)}), "REFUSED")
+
+    def test_mutant_without_the_passed_locations_a_child_with_a_temporary_home_is_still_fine_and_the_account_home_refused(self):
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(tmp), True)
+        gone = {k: v for k, v in os.environ.items() if k != sb.REAL_LOCATIONS_ENV}
+        with mock.patch.dict(os.environ, gone, clear=True):
+            self.assertEqual(self.child_state(tmp), str(tmp / "xdg-state" / sb.PROG))
+            self.assertEqual(self.child_state(tmp, {"XDG_STATE_HOME": str(Path(pwd.getpwuid(os.getuid()).pw_dir) / ".local/state")}), "REFUSED")
+
+    def test_without_the_marker_nothing_is_refused_and_a_temporary_path_is_fine(self):
+        real = self.real_home()
+        with mock.patch.dict(os.environ):
+            os.environ.pop(sb.UNDER_TEST_ENV)
+            self.assertEqual(sb.refuse_real_location(real / sb.PROG, "state"), real / sb.PROG)
+        other = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(other), True)
+        self.assertEqual(sb.refuse_real_location(other / "x", "state"), other / "x")
+
     def test_created_private_under_xdg_state_home_whatever_the_umask(self):
         # 0o277 strips owner bits from mkdir's mode, so only an explicit chmod
         # yields exactly 0700; 0 would let a looser mode through if one were asked for.
@@ -1599,6 +1664,12 @@ class TestPlanningSkill(unittest.TestCase):
         self.assertIn("plan check: PASS", out.stdout)
 
 
+FACT_KIND_MODES = {"send": "cut marker (refused to the sender)", "wake": "merged within a 3000-character budget", "sweep": "parts", "triage": "parts",
+                   "alert": "parts", "reminder": "parts", "disk": "parts", "cpu": "parts", "mem": "parts", "cpu-top": "parts",
+                   "spotlight": "parts", "janitor": "parts", "plan": "parts"}
+OVER_CAP_FINDING_KINDS = tuple(k for k, v in FACT_KIND_MODES.items() if v == "parts")
+
+
 class TestCompose(unittest.TestCase):
     def test_header_then_each_item_in_full(self):
         text, carried = sb.compose("platform", [
@@ -1621,8 +1692,116 @@ class TestCompose(unittest.TestCase):
         self.assertTrue(text.endswith("\u2026 and 28 more: run fleet-switchboard pending platform"))
         self.assertEqual([f.key for f in carried], ["k29", "k28"])
 
+    def whole_run(self, kind, body, cap=4000, others=(), position=0):
+        """Deliver one over-cap fact like the daemon: part after part, with the ledger of parts delivered."""
+        one = fact("%s:big" % kind, kind=kind, summary=body)
+        done, texts, acked, gone = {}, [], [], set()
+        for _ in range(sb.FINDING_MAX_PARTS + 5):
+            pending = [o for o in others if o.key not in gone]
+            pending.insert(position, one)
+            text, carried = sb.compose("platform", pending, cap=cap, resume=done)
+            self.assertLessEqual(len(text), cap)
+            self.assertNotIn("[cut at", text)
+            gone.update(f.key for f in carried if f.key != one.key)
+            mine = [f for f in carried if f.key == one.key]
+            if not mine:
+                continue
+            texts.append(text)
+            if getattr(mine[0], "partial", None):
+                done[one.key] = mine[0].partial[0]
+            else:
+                acked.append(one.key)
+                break
+        return texts, acked
+
+    def test_a_finding_over_the_cap_is_carried_over_successive_messages_1302(self):
+        for kind in OVER_CAP_FINDING_KINDS:
+            for position in (0, 1, 2):   # the over-cap fact at EVERY position
+                body = "\n".join("item %03d %s" % (n, "z" * 60) for n in range(100))
+                others = [fact("o%d" % n, kind="sweep", summary="small %d" % n) for n in range(2)]
+                texts, acked = self.whole_run(kind, body, others=others, position=position)
+                self.assertGreater(len(texts), 1, kind)
+                self.assertEqual(acked, ["%s:big" % kind], kind)   # acknowledged once, after the LAST part
+                got = [l.strip() for t in texts for l in t.split("\n")[1:] if l.strip().startswith("item ")]
+                self.assertEqual(got, ["item %03d %s" % (n, "z" * 60) for n in range(100)], kind)   # every line once, in order
+                for i, t in enumerate(texts):
+                    self.assertIn("(part %d of %d)" % (i + 1, len(texts)), t)
+
+    def test_over_cap_sizes_are_delivered_whole_1302(self):
+        for body in ("\n".join(["y" * 100] * 41), "\n".join(["y" * 100] * 120), "\n".join(["\u00e9\u4e2d" * 30] * 60), "\n".join("l%d" % n for n in range(1500))):
+            texts, acked = self.whole_run("sweep", body)
+            self.assertTrue(acked)
+            self.assertGreaterEqual(len(texts), 1)
+
+    def test_a_long_line_is_split_never_cut_1302(self):
+        for size in (3900, 4000, 4001, 12000):
+            body = "".join(chr(97 + (i // 7) % 26) for i in range(size))
+            texts, acked = self.whole_run("sweep", body)
+            self.assertTrue(acked, size)
+            self.assertGreater(len(texts), 1, size)
+            for t in texts:
+                self.assertNotIn("[cut at", t)
+                self.assertLessEqual(len(t), 4000)
+            got = "".join(t.split("\n", 1)[1] if False else t for t in texts)
+            joined = got.replace(" (line continues)", "").replace("(line continues) ", "")
+            self.assertEqual(sum(joined.count(body[i:i + 40]) >= 1 for i in range(0, size - 40, 40)), len(range(0, size - 40, 40)), size)
+
+    def test_a_long_line_is_delivered_in_exact_content_and_order_1302(self):
+        for size in (4001, 12000):
+            body = "".join(chr(97 + (i * 7 + i // 13) % 26) for i in range(size))
+            texts, acked = self.whole_run("sweep", body)
+            self.assertTrue(acked, size)
+            pieces = []
+            for t in texts:
+                lines = t.split("\n")
+                at = [i for i, l in enumerate(lines) if l.startswith("- sweep")][0]
+                piece = lines[at + 1].strip()   # the item's header, then the one body line (the first line's header copy is cut to 200 characters)
+                piece = piece.replace("(part %d of %d) " % (len(pieces) + 1, len(texts)), "", 1)
+                if piece.startswith("(line continues) "):
+                    piece = piece[len("(line continues) "):]
+                if piece.endswith(" (line continues)"):
+                    piece = piece[:-len(" (line continues)")]
+                pieces.append(piece)
+            self.assertEqual("".join(pieces), body, size)
+
+    def test_a_part_over_a_tiny_cap_is_cut_visibly_1302(self):
+        one = fact("sweep:big", kind="sweep", summary="\n".join("line %03d %s" % (n, "q" * 50) for n in range(300)))
+        probe = fact("p", kind="sweep", summary="(part 99 of 99)\n")
+        fixed = len(sb.compose("platform", [probe], cap=10 ** 9)[0])
+        for cap in (fixed + 60, fixed + 120, fixed + 250):   # the budget floor of 200 makes the part longer than the cap
+            text, carried = sb.finding_part("platform", one, [], cap, None, None, None, {})
+            self.assertLessEqual(len(text), cap)
+            self.assertIn(sb.PART_TRUNCATED, text, cap)
+
+    def test_one_megabyte_is_bounded_and_the_rest_refused_named_1302(self):
+        body = "\n".join("x" * 99 for _ in range(10500))
+        texts, acked = self.whole_run("sweep", body)
+        self.assertEqual(len(texts), sb.FINDING_MAX_PARTS)   # the maximum; beyond it the rest is refused, audited, named in the last part
+        self.assertIn("were refused; the full text is in the audit", texts[-1])
+        self.assertTrue(acked)
+
+    def test_a_restart_between_parts_continues_from_the_ledger_1302(self):
+        one = fact("sweep:big", kind="sweep", summary="\n".join("line %03d %s" % (n, "q" * 50) for n in range(300)))
+        first, carried = sb.compose("platform", [one], cap=4000, resume={})
+        self.assertEqual(carried[0].partial[0], 1)
+        second, _ = sb.compose("platform", [one], cap=4000, resume={one.key: 1})   # a fresh process: only the ledger survives
+        self.assertIn("(part 2 of", second)
+        self.assertNotIn("line 000", second)
+
+    def test_every_fact_kind_the_builders_make_is_in_the_table_1302(self):
+        import ast, glob
+        here = str(BIN)
+        found = set()
+        for path in [os.path.join(here, "fleet-switchboard")] + glob.glob(os.path.join(here, "switchboard", "*.py")):
+            for node in ast.walk(ast.parse(open(path).read())):
+                if isinstance(node, ast.Call) and getattr(node.func, "id", getattr(node.func, "attr", "")) == "Fact":
+                    kind = node.args[2] if len(node.args) > 2 else next((k.value for k in node.keywords if k.arg == "kind"), None)
+                    if isinstance(kind, ast.Constant) and isinstance(kind.value, str) and kind.value in ("sweep", "triage", "alert", "wake", "send", "reminder", "disk", "cpu", "mem", "cpu-top", "spotlight", "janitor", "plan"):
+                        found.add(kind.value)
+        self.assertEqual(found, set(FACT_KIND_MODES), "a fact kind has no row in the table")
+
     def test_one_item_longer_than_the_cap_is_cut_and_says_so(self):
-        text, carried = sb.compose("platform", [fact("big", summary="y" * 5000)], cap=500)
+        text, carried = sb.compose("platform", [fact("big", kind="send", summary="y" * 5000)], cap=500)
         self.assertEqual(len(text), 500)
         self.assertTrue(text.endswith("[cut at 500 characters]"))
         self.assertEqual(len(carried), 1)
