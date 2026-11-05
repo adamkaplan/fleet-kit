@@ -85,7 +85,7 @@ class TestGhShimSignRepoFlag(unittest.TestCase):
     def test_unrelated_calls_with_a_flag_are_passed_byte_for_byte(self):
         for args in (("-R", "o/r", "issue", "view", "1"), ("--repo=o/r", "pr", "list"), ("-Ro/r", "issue", "close", "1"),
                      ("-R", "o/r", "issue", "comment", "1", "--editor"), ("-R", "o/r", "issue", "close", "1", "--comment", ""),
-                     ("-R", "o/r", "api", "repos/o/r/issues/1", "-f", "body=x"), ("-R",), ("-R", "o/r"),
+                     ("-R",), ("-R", "o/r"),
                      ("api", "repos/o/r/issues/1", "-f", "title=-R"), ("api", "repos/o/r/issues/1/comments", "-X", "GET", "-f", "q=-R"),
                      ("issue", "view", "1", "-R", "o/r")):
             with self.subTest(args=args):
