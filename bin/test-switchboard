@@ -66257,6 +66257,8 @@ _lm = importlib.import_module("test_launch_model"); _lm.HOST = sys.modules[__nam
 _ta = importlib.import_module("test_tester_agent"); _ta.HOST = sys.modules[__name__]; TestTesterAgentLaunch, TestTesterAgentMutants = _ta.build()   # #1963
 _lr = importlib.import_module("test_launched_reviewers"); _lr.HOST = sys.modules[__name__]; TestLaunchedReviewerRule, TestLaunchedReviewerGates, TestLaunchedReviewerItems, TestLaunchedReviewerRelay, TestLaunchedReviewerDocs, TestLaunchedReviewerGuards, TestLaunchedReviewerMutants = _lr.build()   # #1869
 _cfw = importlib.import_module("test_changed_files_whole"); _cfw.HOST = sys.modules[__name__]; TestChangedFilesWhole = _cfw.build()   # #1531
+TestNewTestChecksRules, TestNewTestChecksFiles, TestNewTestChecksInPreflightPr, TestNewTestChecksInCloudPreflight, TestNewTestChecksMutants, TestNewTestChecksDocs = (_ntc := importlib.import_module("test_new_test_checks")).TestNewTestChecksRules, _ntc.TestNewTestChecksFiles, _ntc.TestNewTestChecksInPreflightPr, _ntc.TestNewTestChecksInCloudPreflight, _ntc.TestNewTestChecksMutants, _ntc.TestNewTestChecksDocs   # #1967
+
 TestShimGuardsTool, TestShimGuardRows, TestShimHygienePlanted, TestShimGuardMutants, TestShimGuardDocs = (_sg := importlib.import_module("test_shim_guards")).TestShimGuardsTool, _sg.TestShimGuardRows, _sg.TestShimHygienePlanted, _sg.TestShimGuardMutants, _sg.TestShimGuardDocs   # #1909
 TestPlanningDecision, TestConcurrencyGroup, TestGateLegs, TestGatePass, TestPlatformPaths, TestMacDocs = (_ml := importlib.import_module("test_mac_legs")).TestPlanningDecision, _ml.TestConcurrencyGroup, _ml.TestGateLegs, _ml.TestGatePass, _ml.TestPlatformPaths, _ml.TestDocs
 TestPlatformClassList = importlib.import_module("test_platform_classes").TestPlatformClassList
