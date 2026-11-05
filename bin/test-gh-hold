@@ -418,6 +418,13 @@ class TestAudit(Base):
         for leak in ("zzq", "bodytext_zz", "secretq"):
             self.assertNotIn(leak, raw)
 
+    def test_an_unknown_api_write_path_stays_refused_and_its_audit_line_names_the_reduced_endpoint(self):
+        done, calls = self.run_gh("api", "-X", "POST", "repos/acme/app/actions/runs/123/rerun")
+        self.assertNotEqual(done.returncode, 0)
+        self.assertEqual(self.writes(), [])                                                    # the real gh never ran
+        rows = self.audit()
+        self.assertEqual([(r["outcome"], r["verb"], r["endpoint"]) for r in rows], [("refused", "api POST", "api actions/runs/#/rerun")])
+
     def test_s12_no_command_line_value_is_audited_and_an_unwritable_audit_changes_nothing(self):
         token, text = "ghp_" + "a1b2c3d4e5f6" * 3, "free text that must stay out"
         self.run_gh("api", "-X", "POST", "repos/acme-org/other-repo/issues/3/comments", "-f", "body=%s %s" % (token, text), "-H", "Authorization: token " + token,
