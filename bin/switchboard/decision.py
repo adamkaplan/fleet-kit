@@ -1,5 +1,8 @@
 # ------------------------------------------------------------ the decision
 
+import copy
+
+
 class MessageTooLong(Exception):
     """A message that would be cut at the delivery cap: refused to the sender, nothing delivered."""
 
@@ -34,6 +37,8 @@ def hold_reason(observation, missing=None):
     if observation.problem:
         return observation.problem
     if observation.status == "blocked":
+        if getattr(observation, "errored", False):
+            return None   # #1697: idle after a provider error, nothing open: a send is delivered and wakes it
         return "%s is blocked on a permission request or a question" % observation.name
     if observation.status not in ("idle", "working"):
         return "%s has status %s in herdr" % (observation.name, observation.status)
@@ -77,7 +82,7 @@ def decide(recipient, pending, observation, now, batch_seconds, engaged_seconds,
     return Plan(recipient, "wake", "no prompt from you in the engagement window", pending, observation)
 
 
-def steers_into_turn(config, observation, carried, discovery=None, age=None):
+def steers_into_turn(config, observation, carried, discovery=None, age=None, now=None):
     """A wake to an agent that is working goes in as `steer` (with `resume`, so one that outlives its turn starts
     the next at once): the running turn takes it at its next safe point instead of after the turn. Only a
     message that carries a `send` from the agent's own boss; `send_to_working` "queue" turns it off. Measured in
@@ -86,6 +91,9 @@ def steers_into_turn(config, observation, carried, discovery=None, age=None):
     recorded turn start; None = unknown = young), a message made only of peer sends and reminders steers too."""
     if observation.status != "working":
         return False
+    if now is not None and any(fact.kind == "reminder" and now - fact.created > getattr(fact, "bound", float("inf")) for fact in carried) \
+            and all(fact.kind in ("send", "reminder") for fact in carried):
+        return True   # #1728: a reminder older than its bound (reminder_bound) steers, whatever the age of the turn and `steer_after_minutes`
     limit = config.get("steer_after_minutes", 0)
     if limit and age is not None and age > limit * 60 and carried \
             and all(fact.kind in ("send", "reminder") for fact in carried):
@@ -168,7 +176,7 @@ def compose_order(fact):
     return (reminder, -fact.created, fact.key)
 
 
-def compose(recipient, facts, cap=MESSAGE_CAP, section=None, repos=None, delivered=None):
+def compose(recipient, facts, cap=MESSAGE_CAP, section=None, repos=None, delivered=None, resume=None, in_turn=False):
     """One message for `facts`, newest first (a newer result is never held behind older reminders). Returns (text, the facts it carries). With `delivered` (epoch) the header says when the
     message was sent (the carried facts' creation) and when it is delivered; a send that a NEWER one from the same sender about the
     same issue replaces (`superseded_by`) stays in the message, marked, so no key is left out of what is acknowledged.
@@ -219,7 +227,7 @@ def compose(recipient, facts, cap=MESSAGE_CAP, section=None, repos=None, deliver
                 sent = "delayed: sent %s, %s" % (clock_day(late, delivered), held) + ("" if first == last else ", newest sent %s" % last)
             else:
                 sent = "sent %s" % (first if first == last else "%s-%s" % (first, last))
-            when = " (%s, delivered %s)" % (sent, clock_utc(delivered))
+            when = " (%s, delivered %s%s)" % (sent, clock_utc(delivered), ", queued behind a turn" if in_turn else "")
         waiting = sorted({t for f in taken for t in f.supersedes})
         if waiting:   # the earlier messages stay where they are, unchanged: this says only that the newer one replaces them
             names = sorted({f.sender for f in taken if f.supersedes and f.sender})
@@ -249,8 +257,81 @@ def compose(recipient, facts, cap=MESSAGE_CAP, section=None, repos=None, deliver
         text = render(count)
         if len(text) <= cap:
             return text, facts[:count]
+    if facts[0].kind != "send" and not getattr(facts[0], "members", None):   # #1302: a finding over the cap is carried over successive messages, never cut
+        part = finding_part(recipient, facts[0], facts[1:], cap, section, repos, delivered, resume)
+        if part is not None:
+            return part
     marker = "\n[cut at %d characters]" % cap
     return text[:cap - len(marker)] + marker, facts[:1]
+
+
+FINDING_MAX_PARTS = 50   # a finding is carried over at most this many messages; beyond it the rest is refused (named, audited), never dropped silently
+LINE_CONTINUES = "(line continues)"
+PART_TRUNCATED = "(truncated)"
+
+
+def finding_parts(fact, budget):
+    """The summary of one finding as chunks of WHOLE lines: `text_parts` of its summary. Returns (chunks, refused_text)."""
+    return text_parts(fact.summary, budget)
+
+
+def text_parts(text, budget):
+    """THE splitter of a long text (a finding, a `send --file`, a `remind --text-file`): chunks of WHOLE lines, each at most `budget` characters (a
+    longer line is split over chunks with a continuation mark: nothing is cut). Pure and deterministic: the same text gives the same chunks, so the
+    continuation is derived from how many parts were delivered. Returns (chunks, refused_text)."""
+    lines = []
+    for line in text.strip().split("\n"):
+        line = "".join(c if c.isprintable() else " " for c in line).rstrip()
+        if len(line) > budget:   # #1302: a long line is split, never cut: a mark ends each piece and begins the next
+            width = budget - 2 * len(LINE_CONTINUES) - 2
+            pieces = [line[i:i + width] for i in range(0, len(line), width)]
+            for n, piece in enumerate(pieces):
+                lines.append(("%s " % LINE_CONTINUES if n else "") + piece + (" %s" % LINE_CONTINUES if n < len(pieces) - 1 else ""))
+            continue
+        lines.append(line)
+    chunks, now, size = [], [], 0
+    for line in lines:
+        if now and size + len(line) + 3 > budget:
+            chunks.append("\n".join(now))
+            now, size = [], 0
+        now.append(line)
+        size += len(line) + 3
+    if now:
+        chunks.append("\n".join(now))
+    refused = ""
+    if len(chunks) > FINDING_MAX_PARTS:
+        refused = "\n".join(chunks[FINDING_MAX_PARTS:])
+        chunks = chunks[:FINDING_MAX_PARTS]
+    return chunks, refused
+
+
+def finding_part(recipient, fact, rest, cap, section, repos, delivered, resume):
+    """#1302: the next part of an over-cap finding. `resume` maps a key to how many parts were already delivered (persisted by the daemon,
+    so a restart continues). The carried fact has `partial=(i, n)` when more parts follow (its key must NOT be acknowledged yet)."""
+    done = (resume or {}).get(fact.key, 0)
+    probe = copy.copy(fact)
+    probe.summary = "(part 99 of 99)\n"
+    fixed = len(compose(recipient, [probe], 10 ** 9, section, repos, delivered, None)[0])
+    budget = max(200, cap - fixed - 400)   # the header repeats the first 200 characters; the item indents every line; room for the part label and the refusal note
+    chunks, refused = finding_parts(fact, budget)
+    if len(chunks) < 2:
+        return None
+    n = len(chunks)
+    index = min(done, n - 1)
+    short = copy.copy(fact)
+    last = index == n - 1
+    tail = "\n(%d characters of this finding past the %d-part limit were refused; the full text is in the audit)" % (len(refused), FINDING_MAX_PARTS) if refused and last else ""
+    short.summary = "(part %d of %d)\n%s%s" % (index + 1, n, chunks[index], tail)
+    if len(short.summary) + fixed > cap:   # reachable only when the cap is tiny (the budget floor is 200): the cut is marked, never silent
+        keep = max(0, cap - fixed - len(PART_TRUNCATED))
+        short.summary = short.summary[:keep] + PART_TRUNCATED
+    if not last:
+        short.partial = (index + 1, n)
+    short.refused = refused if index == 0 else ""
+    text, carried = compose(recipient, [short], 10 ** 9, section, repos, delivered, None)
+    if len(text) > cap:
+        text = text[:cap - len(PART_TRUNCATED)] + PART_TRUNCATED   # marked, never silent
+    return text, [short]
 
 
 ORDERS_CLOSING = ("These are the owner's standing instructions for this charter. Act on them without asking "

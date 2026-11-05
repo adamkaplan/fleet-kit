@@ -11,15 +11,13 @@ work starts, checked by a command, challenged by independent reviewers, and appr
 ## When a plan is required
 
 Every worker assignment links one: `PLAN: <link>` in the brief, to its own plan or to a section of an ask's, epic's or
-workspace's plan. No plan, no assignment.
+workspace's plan.
 Who approves: a work item's plan, its orchestrator (the Chief of Staff if it touches a held-PR area); an ask's, the Chief of
 Staff; an epic or workspace plan, the Chief of Staff, then the owner.
 
 ## One plan comment
 
 A plan is one canonical comment, edited in place; every revision adds a new short receipt comment (what changed and why, two to four lines, with the new plan hash); a plan is never reposted as a second plan comment.
-
-Receipt format: `docs/plan-template.md`.
 
 ## The method, in order
 
@@ -31,7 +29,7 @@ Receipt format: `docs/plan-template.md`.
    screenshot | review`; `review` quotes text), `pass` (a concrete observable: a status, a number, a quoted value), `discriminates` (the wrong
    build that would FAIL it), `evaluator` (`ci | tester | reviewer | owner`, who records that proof), optionally
    `claim: epic` for what only an integrated head can prove (name the integration branch in the plan).
-   **Owner evaluators are rare**: only where the owner's eyes are the test, proved once with `claim: epic`; never for a routine PR.
+   **Owner evaluators are rare**: only where the owner's own eyes are the test, proved once with `claim: epic`; never for a routine PR.
 
    **Own measurement:** launch a tester of your lane (`--role tester --repo <the pull request's repo> --reports-to <you>`, headless) to re-measure and record; never record as yourself.
    An uncovered Done-when clause gets a new `S` scenario; never edit the clause.
@@ -55,7 +53,7 @@ issue's Done-when>` (`## Intent` before `Done when:`, which may be a numbered li
 
 **An issue body** (outcome, Done-when, link to the
 detail) plus **one detail comment** whose first line is a heading containing `Plan (scenarios)`: the plan text and the
-`scenarios:` yaml block. The latest such comment counts. One plan per ask; sections for work items.
+`scenarios:` yaml block. One plan per ask; sections for work items.
 
 ## Challenge it
 
@@ -109,7 +107,7 @@ Bad: `pass: works`, `discriminates: a wrong build would fail this`, "add a `comm
 
 The worker proves each scenario with `fleet-switchboard prove S1 --pr <pr>
 --evidence <link-or-what-you-ran>`, an evaluator records `verdict`, and `fleet-switchboard gates <pr>` shows what is still
-open. The order does not matter: a coder's only extra step is `prove`. A push voids every proof and
-verdict. The Chief of Staff may waive a hotfix, logged; the plan is then due within a day.
+open. The order does not matter: a coder's only extra step is `prove`. The Chief of Staff may waive a hotfix, logged; the plan is then due within a day.
 `CARRIES: #N`: see plan-template.
+A launch arms a checkpoint and an overdue wake: a cloud launch with no CHECKPOINT line or flags gets the default 25m/40m.
 Apply an approved plan edit with `fleet-switchboard plan apply` (see plan-template).

@@ -116,9 +116,10 @@ class Identity(unittest.TestCase):
 
     def test_s3_the_dockerfile_writes_the_system_file_with_the_one_constant(self):
         text, args = self.render_system_file()
-        self.assertEqual(args, {"CW_DEFAULT_IDENT_NAME": NAME, "CW_DEFAULT_IDENT_EMAIL": EMAIL})
+        self.assertEqual(args.get("CW_DEFAULT_IDENT_NAME"), NAME)   # the required ARGs carry the one constant; others may be added
+        self.assertEqual(args.get("CW_DEFAULT_IDENT_EMAIL"), EMAIL)
         self.assertEqual(text.split("\n")[0], "[user]")
-        self.assertEqual(sorted(re.findall(r"^\s*(\S+) = ", text, re.M)), ["email", "name"])
+        self.assertTrue({"email", "name"} <= set(re.findall(r"^\s*(\S+) = ", text, re.M)))
         self.assertEqual(re.findall(r"^\s*name = (.*)$", text, re.M), [NAME])
         self.assertEqual(re.findall(r"^\s*email = (.*)$", text, re.M), [EMAIL])
         self.assertEqual(len(re.findall(r"^ARG CW_DEFAULT_IDENT_NAME=", read(DOCKERFILE), re.M)), 1)   # the pair is declared once

@@ -53,10 +53,13 @@ The mistakes that cost the most review rounds and the most lost work. Meet them 
 - (d) The body of a held pull request is in the owner format from the first push.
 - (e) A cloud builder opens its pull request as a draft at its first push, then updates it: the pod's git token expires after about an hour and a late open fails.
 - (f) A merger pod pushes the merge commit the minute it exists and runs the test classes after it, so a finished merge is never left unpushed when the pod ends.
+- (f2) The last step before a push of a merge or a conflict resolution is `fleet-switchboard merge-drops --git-dir . --tip origin/integration --branch HEAD`: it lists every tip line the branch removes that its own commits did not, and exits 1 for any hunk no merge commit message names (file and first line). The merge step refuses while it fails (#2159).
 - (g) A guard or scan test states its closed rule and its known-limits list in its first version, and fails closed: anything not proven harmless is a site. Reviewers judge the rule and the limits: a spelling inside the stated limits is a Low, a spelling that escapes a rule claimed closed is a High.
 - (h) Any change to `.github/workflows/*` is built by a local job, never a cloud pod: a pod's git token has no workflows permission, so the push is refused and the pod cannot be retired.
 - (i) Compare failure messages, not only test names, between the branch and a clean tree, and keep new strings and comments clear of the added-lines scans (`TestGitShim` in `bin/test-switchboard` and `TestEverySite` in `cloud/launcher/tests/test_stub_cleanup.py`): no literal ampersand, `nohup` or spawn text, no git-config variable names, no renamed import to pass a scan.
 - (j) Push the first version by minute 20, run slow suites afterwards in the background with a timeout, and say which git version the tests ran on: tests that depend on git behaviour are verified on a recent git.
+
+A person who briefs a cloud operator starts from the standard header: `fleet-switchboard brief header --role operator` (see "Briefing a cloud operator" in `docs/cloud-operator-quickstart.md`).
 
 **A cloud builder never runs the whole bin/test-switchboard** or any suite over about 10 minutes in its pod: CI runs it on the merged head (45 to 55 minutes on a runner), and a pod is slower; in the briefs the fleet writes, the pod's hard limit is 50 minutes (the launcher's own default is longer). It runs the named classes singly, each under about 100 seconds, and keeps itself active with short foreground commands, because a long background run is not activity and an idle pod is stopped. It pushes its work branch after every commit, and sends its final message the minute the class list is done and stops. Item (j) and the paragraph on focused local runs are for a local worker and are not changed.
 
@@ -92,7 +95,7 @@ When a review finding names a gap in one member of a table, list, set or rule fa
 
 Some repositories' workflows skip draft pull requests (a coder lost four hours reading that as a failing CI): when a draft shows no CI runs, look at the workflow's draft filter and mark the PR ready before waiting for CI (if there is no filter, the cause is elsewhere).
 
-Before marking the pull request ready, `fleet-switchboard preflight-pr` runs the CI-critical focused classes you otherwise skip (command surface, hygiene, public names, and the cloud suites when `cloud/` changed) and prints one PASS or FAIL line each.
+Before marking the pull request ready, `fleet-switchboard preflight-pr` runs the CI-critical focused classes you otherwise skip (command surface, hygiene, public names, and the cloud suites when `cloud/` changed) and prints one PASS or FAIL line each. Before ready, also run `fleet-switchboard preflight-pr --body owner/repo#N`: it reads the description and the plan and refuses one whose first section is not the cause the plan's cause-first scenario asks for.
 
 When a scenario's evidence is your own measurement, from your own pane launch a tester of your lane (`--role tester --repo <the pull request's repo> --reports-to <you>`, headless is enough) to re-measure and record the verdict: never record as yourself, and do not ask for a waiver.
 
@@ -302,8 +305,7 @@ Two reminders are made for you. `fleet-switchboard launch` reads the brief's
 `CHECKPOINT` (or `--checkpoint 30m --overdue 60m`): the worker is reminded at the
 checkpoint ("report now, one line"), and the launching orchestrator is woken at the
 overdue time **only if the worker has not reported or sent anything since the launch**.
-A worker that reported is not chased. If the CHECKPOINT line cannot be read, no
-reminder is made and `launch` says so; pass the flags. Write the CHECKPOINT in the
+A worker that reported is not chased. If the CHECKPOINT line cannot be read, a local launch makes no reminder and `launch` says so (pass the flags); a cloud launch arms the default 25m/40m (the worker's reminder at 25 minutes, your overdue wake at 40). Write the CHECKPOINT in the
 shape `Report at 30 minutes (kind working, one line); overdue at 60.`
 
 If the owner enables it, each orchestrator also gets one short daily wake asking what
@@ -428,6 +430,7 @@ compaction and when the file changes.
 **Finished a worker? Retire it.** When a worker has made its final `done` or `failed` report and you close its tab, run
 `fleet-switchboard retire <name> [--reason "..."]` so the fleet does not report it dead or invite a reattach. (If you close the tab after its final
 report the switchboard retires it by itself; retire is for the cases it cannot tell.) `retire --undo <name>` reverses it; nothing is deleted.
+If a cloud worker is kept because its end hook could not push, send the pod one message to commit its tree on a NEW branch and push it there plainly, read the branch from origin, then retire normally; the force-delete discards its work.
 
 ## Heavy runs
 

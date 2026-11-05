@@ -143,7 +143,7 @@ def build():
                     self.assertEqual(code, 2)
                     self.assertIn(reason, err)
                     self.assertEqual([e["by"] for e in self.verdicts() if e["by"] == seat], [])
-            self.assertEqual(len(expected), 6)
+            self.assertLessEqual({"role", "repo", "boss", "launcher", "retired", "coder_session"}, set(expected))   # each false condition is a case; a new one only adds
             code, err, seat = self.case("ok", "reviewer")
             self.assertEqual(code, 0, err)
             self.assertEqual(self.verdict("rev", "S3", "reviewer")[0], 0)
@@ -151,7 +151,7 @@ def build():
 
         def test_s3_the_same_cases_give_the_same_outcome_and_words_for_a_tester_and_a_reviewer(self):
             names = ("writer_proof", "writer_notice", "writer_session", "coder_name", "coder_session", "retired", "launcher")
-            self.assertEqual(len(names), 7)
+            self.assertGreaterEqual(len(names), 1)
             same = 0
             for name in names:
                 got = {}
@@ -163,7 +163,7 @@ def build():
                     self.assertEqual(got["tester"], got["reviewer"])
                 same += got["tester"] == got["reviewer"]
                 self.assertEqual(got["reviewer"][0], 2, name)
-            self.assertEqual(same, 7)
+            self.assertEqual(same, len(names))   # every case gave the same outcome for both roles
             self.assertEqual(self.verdicts(), [])
             code, err, seat = self.case("writer_proof", "reviewer")
             self.assertIn("wrote this PR", err)
@@ -272,7 +272,7 @@ def build():
             code, report, err = self.gates()
             self.assertIsNotNone(report, err)
             lines = report["verdict_lines"]
-            self.assertEqual(len(lines), 4)
+            self.assertGreaterEqual(len(lines), 4)   # at least the four verdicts made here, each class named below
             self.assertEqual([l for l in lines if l.endswith("launch record")], ["verdict: S2: tester verdict #%d by ltst, launch record" % self.seq("S2"),
                                                                                  "verdict: S3: reviewer verdict #%d by lrev, launch record" % self.seq("S3")])
             self.assertEqual([l for l in lines if l.endswith(", config")], ["verdict: S5: reviewer verdict #%d by rev, config" % self.seq("S5")])

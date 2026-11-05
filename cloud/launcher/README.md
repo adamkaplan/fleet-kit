@@ -83,7 +83,7 @@ used, because it moves when you work in other clusters.
 
 ## Service-account login, per-run secrets, image pull secret
 With `CW_CLOUD_SERVER` and `CW_CLOUD_TOKEN_FILE` set (and optionally `CW_CLOUD_CA_FILE`) the launcher logs in as the
-`cw-operator` account of `cloud/k8s/operator-rbac.yaml` (one namespaced Role: pods, logs, exec, port-forward, secrets; no
+`cw-operator` account of `cloud/k8s/operator-rbac.yaml` (one namespaced Role: pods, logs, exec, port-forward, secrets, and the StatefulSets rule of a persistent orchestrator; no
 wildcard, nothing cluster-wide). Every `kubectl` call carries a generated `--kubeconfig` (mode 0600, private temp dir, removed at
 exit) whose only credential is the token file's path. It never uses `--token` or an administrator kubeconfig, and refuses
 if `CW_KUBECONFIG` or `CW_KUBE_CONTEXT` is also set. A missing or unreadable token file exits 3 (`token unavailable`) with no call.
@@ -99,6 +99,21 @@ Accepted scope of the role: `cw-operator` can get and list every secret in the w
 **The one-verb node rule (`list` on `nodes`).** The `cw-operator` role of `cloud/k8s/operator-rbac.yaml` is namespaced: pods, their logs, exec, port-forward and secrets in the workers' namespace, and nothing cluster-wide. Reading the cluster's NODES needs one more rule, and it cannot live in that Role: a namespaced Role cannot grant a cluster-scoped resource. It is a `ClusterRole` with exactly ONE rule, `list` on `nodes` (the core API group), bound to the `cw-operator` service account by a `ClusterRoleBinding`: `list` on `nodes`, and nothing else (no `get`, no `watch`, no write, no wildcard). `kubectl get nodes -o json` is a list, so that verb is enough. It is the OWNER's step, applied apart from the code (its own manifest, its own pull request), and the code works with or without it: `cloud-worker snapshot` reads the pods either way, and when the node list is refused it says so (`nodes_read` false) instead of failing, and the switchboard's `status` then counts the nodes by the **pod placement** (the distinct node names of the pods) and says that in the line: it cannot see the idle nodes. Nothing else is asked of the cluster: the status read makes no write call at all.
 
 Everything that renders `kubectl` output (errors, the end hook's text, audit reasons) passes through one `scrub()`: this run's secret values and any 8+ character piece of one, token-shaped strings, long base64/hex runs, an `Authorization` header of any scheme (any case and spacing) and the `user:password@` of a URL of any scheme are removed, then the text is cut (the launcher, the run record and the driver all use this one function). Limits: the Authorization shape removes the rest of its header line and its folded continuation lines; the URL shape removes the userinfo of a `scheme://` URL only inside its own part (the user and the password hold no `/ ? # @ :`, so host, path, query and fragment survive: scoped packages, `@user` paths, `?email=a@b`, a port), and an unencoded password with those characters only when a `:` follows the user and what follows is not a bare port (every quantifier bounded, so hostile text cannot slow the scan); a secret split by a newline is caught only for pieces of 8 or more characters (the existing rule); two known slip-throughs: a password that starts with digits and then holds `/`, `?` or `#` (it reads as a port), and a user part over 200 characters; a credential that is not in either shape and is not a registered value is not recognised. A failed `create`, `stop` or `delete` that leaves a per-run Secret says so once (audit and stderr) with its name and the exact `kubectl ... delete secret NAME` command, never a value.
+
+## The persistent orchestrator (ask #1509)
+
+`create --agent orchestrator --boss NAME --persistent` (the switchboard's `launch --cloud --agent orchestrator --persistent`) makes an always-on orchestrator: ONE StatefulSet (apps/v1, one replica, the headless agent service `cw-agents`), a pod template that is the worker pod with restart policy Always, NO `activeDeadlineSeconds`, no `cw/hard-deadline`, `cw/idle-seconds` or `cw/max-hard` annotation, and the annotation `cw/persistent: "true"`. Its pod is `NAME-0` (the hub entry holds that address). The cause: every launcher pod was a one-shot pod with a hard deadline, and the workload lookup needs a strict match to be safe, so `Kube.get_workload` reads only the exact not-found answer for the exact object as missing, reports the exact forbidden answer as the missing rule, and treats every other answer as unreadable.
+
+- Valid only with `--agent orchestrator` and the per-run git-token Secret (`--run-secret-fd git-token=N`); refused (exit 2, nothing created) for a worker, with `--stack`, or without that route. The answer carries `persistent: true` and null idle and hard deadlines; the audit create line and the run record carry `persistent: true`.
+- Settings maximum: `CW_MAX_PERSISTENT`, an integer 1 to 20, default 2 (a row of the settings table); a launch above it or with an unreadable count is refused (exit 2, nothing created). The maximum is a ceiling checked at launch, not a lock: two launches at the same moment can each count below the maximum and both succeed.
+- The spend cap is priced for ONE DAY (24 hours) of the shape: the launch's spend cap counts the persistent pod at 24 hours of its shape.
+- The autoscaler's do-not-evict mark is NOT set by this change: the node of a persistent orchestrator is protected from a scale-down only once ask 1519 lands. There is no `cw/role` annotation on the template at this head (the token role of ask 1508 composes in a plain merge); renewal runs only for a pod judged owned by a readable StatefulSet, so a lost read stops renewal.
+- `delete NAME --force` refuses a persistent orchestrator (exit status 2, naming the stop command). A stop or a delete of a worker whose pod is absent takes ONE strict read of the StatefulSet named like the worker and refuses, keeping everything, on every answer but the exact not-found; the Role rule for StatefulSets (the administrator's step) must therefore be applied BEFORE this change is installed, or every stop of a worker with a gone pod, a plain one too, fails until it is.
+- The reaper never stops a persistent orchestrator: it is judged through its StatefulSet only. An unreadable or mismatching workload leaves the pod untouched and the pass reports one line `persistent workload unreadable: left alone`; that report fails the reaper's exit code on every pass until the workload is readable again (loud on purpose; nothing is stopped). The git token renewal finds the per-run Secret by the worker's name (a missing Secret is one report line); it never stops a pod.
+- The stop: the end hook first (a failed push keeps the pod AND the workload), then the StatefulSet is deleted FIRST with `kubectl delete statefulset NAME --wait=true --timeout=120s`, then the pod, both Secrets and the hub entry. A delete that does not finish makes the stop fail (nothing else removed; one line names it; stop again retries). A pod of a persistent orchestrator is never deleted alone.
+- Status: shown under the worker's name, persistent, with its age in hours and its accrued cost (age times the hourly estimate of its shape row).
+- Cost: 24 times the hourly estimate of the shape row per day (default orchestrator shape `O`: USD 0.48 a day), UNBOUNDED IN TIME by design; only an explicit stop ends it.
+- Owner step: the operator's Role in `cloud/k8s/operator-rbac.yaml` gains ONE rule (the `apps` group, `statefulsets`, get, list, watch, create, delete: five verbs; the launcher never patches a StatefulSet; watch is needed because the stop deletes the StatefulSet with kubectl's wait, which lists and watches the object); the administrator applies it, this change never does. Until the Role rule for StatefulSets is applied, the stop and the delete of ANY worker whose pod is gone keep the Secrets and say so; apply the Role rule BEFORE this change is installed.
 
 ## The run record and the report (slice 3)
 The record is the launcher's `stop`'s, so every end gets one: `run-task` (normal end, failure, interrupt), the switchboard's `retire`
@@ -188,6 +203,7 @@ The switchboard (`bin/cloud_worker.py`) calls this launcher; the settings below 
   a cloud record has it, so `send`, `read` and `retire` by name cannot be routed to the wrong one. A failed or cut `launch --cloud` stops
   the pod with the run id of its own `create` (`--run-id`); a launcher whose `stop` takes no `--run-id` yet is stopped by name and the audit line says so.
 - **`retire`** runs the launcher's `stop` (end hook, then pod and secrets); a failing end hook keeps the pod. No token or tunnel is kept.
+- **The registry row (#1510).** The switchboard-side launch writes the agent's registry row at launch through the registry's own write function (`kind` cloud, no pane and no endpoint: the endpoint is not recorded because `send` by the registry has no fallback and no address a Mac lane can reach exists yet, ask #1587); `retire` and `cloud-clear` retire it once; the reaper's own stop of a pod writes nothing, the clear retires the row later. A registry failure never refuses a launch or keeps a pod: it is one line on standard error and one audit line.
 
 **The cap on shape M per lane (ask #1640).** A lane may hold at most 4 shape-M cloud workers at once (`MAX_M_PER_LANE` in `bin/cloud_worker.py`), because a lane's batch of 4-CPU pods once filled the cluster and left every other lane's launches unplaceable. The refusal reads: `refused: lane LANE already holds 4 shape-M cloud workers (A, B, C, D): retire one (retire NAME) or launch a smaller shape (--shape S)`; it exits 2 before any token, launcher or cluster call. The count reads the record directory alone: a record counts while it exists, holds the shape M and its hard deadline has not passed (the lane is its `reports-to` boss, or `(no boss)`); a retire or a clear ends it. A launch of another shape, of a name that already has a record, or of a lane below the cap is unchanged. Limits: a launch still in flight has no record yet; two launches of one lane at the same moment can pass together; records written before this change hold no shape and are not counted.
 
@@ -256,6 +272,7 @@ Lane sums after ask #1695 (31 Oct 2026, computed from the macOS seconds above, n
 | `cloud/launcher/tests/test_model_credential.py` | 2 | serial |
 | `cloud/launcher/tests/test_orchestrator_agent.py` | 43 | serial |
 | `cloud/launcher/tests/test_reaper_managed.py` | 66 | serial |
+| `cloud/launcher/tests/test_registry_endpoint.py` | 1 | serial |
 | `cloud/launcher/tests/test_retire_gone_pod.py` | 10 | serial |
 | `cloud/launcher/tests/test_stack_model_key.py` | 8 | serial |
 | `cloud/launcher/tests/test_stack_registry_check.py` | 2 | serial |
@@ -289,6 +306,7 @@ Lane sums after ask #1695 (31 Oct 2026, computed from the macOS seconds above, n
 | `cloud/worker/tests/test_pr_edit_hardening.py` | 45 | parallel |
 | `cloud/worker/tests/test_push_rules.py` | 1 | serial |
 | `cloud/worker/tests/test_pr_edit.py` | 41 | parallel |
+| `cloud/worker/tests/test_pod_inspect.py` | 3 | parallel |
 | `cloud/launcher/tests/test_cloud_quick_scans_run.py` | 34 | parallel |
 | `cloud/worker/tests/test_guard_table.py` | 44 | parallel |
 | `cloud/worker/tests/test_cw_gh_comments.py` | 37 | parallel |
@@ -330,6 +348,7 @@ Lane sums after ask #1695 (31 Oct 2026, computed from the macOS seconds above, n
 | `cloud/launcher/tests/test_model_credential.py` | 1 | serial |
 | `cloud/launcher/tests/test_orchestrator_agent.py` | 17 | serial |
 | `cloud/launcher/tests/test_reaper_managed.py` | 23 | serial |
+| `cloud/launcher/tests/test_registry_endpoint.py` | 1 | serial |
 | `cloud/launcher/tests/test_retire_gone_pod.py` | 5 | serial |
 | `cloud/launcher/tests/test_stack_model_key.py` | 3 | serial |
 | `cloud/launcher/tests/test_stack_registry_check.py` | 1 | serial |
@@ -363,6 +382,7 @@ Lane sums after ask #1695 (31 Oct 2026, computed from the macOS seconds above, n
 | `cloud/worker/tests/test_pr_edit_hardening.py` | 5 | parallel |
 | `cloud/worker/tests/test_push_rules.py` | 1 | serial |
 | `cloud/worker/tests/test_pr_edit.py` | 5 | parallel |
+| `cloud/worker/tests/test_pod_inspect.py` | 2 | parallel |
 | `cloud/launcher/tests/test_cloud_quick_scans_run.py` | 30 | parallel |
 | `cloud/worker/tests/test_guard_table.py` | 4 | parallel |
 | `cloud/worker/tests/test_cw_gh_comments.py` | 1 | parallel |
@@ -571,8 +591,7 @@ be read. A branch protected only by classic branch protection fails closed (a re
 requirement); `--accept-classic` is the explicit, owner-approved override and prints a warning. It overrides only that one failure (the review requirement on a branch GitHub reports as protected), never an unreadable answer, an unprotected branch, or a missing `non_fast_forward` or `deletion` rule. Redirects are never followed, and `OWNER/REPO` may not contain a `.` or `..` segment. It cannot see bypass
 actors: the live refusal check on a disposable repository is the real proof.
 
-*Organization rulesets.* An App installation token can never read an organization ruleset (GitHub asks for the
-organization `Administration` permission at write; this project does not grant it). When the read of an organization
+*Organization rulesets.* An organization ruleset is read at repository level (`GET /repos/<owner>/<repo>/rulesets/<id>?includes_parents=true`) with the token the preflight already uses, because that token cannot read it by the organization's own path (HTTP 403; GitHub asks for the organization `Administration` permission, which this project does not grant). The answer carries no bypass list, so the bypass actors of organization rulesets are not returned to this token and are not seen. A counted organization ruleset is named by its identifier on one line of the output, `organization ruleset <id>: read at repository level, counted`; a repository ruleset prints nothing new. When the read of an organization
 ruleset is refused with HTTP 403, that ruleset is not counted and the output says so, one line each:
 `organization ruleset <id>: not readable with this token, not counted`. The repository passes on the rules the
 preflight can verify. If it fails only because those rules are not counted (exit 1: `protection comes from an
@@ -640,6 +659,27 @@ Test: `cloud/launcher/tests/test_retire_gone_exact.py` (against the fake cluster
 
 **A repository's smallest pod shape (`CW_REPO_MIN_SHAPE`, #1443).** What it is: one optional key of the launcher's settings file, a comma-separated list of `OWNER/NAME=SHAPE` pairs (SHAPE is `XS`, `S` or `M`; the repository is compared exactly and case-insensitively, like `CW_ALLOWED_REPOS`; for example `acme-org/widget-service=S`). The shape is a floor for that repository's launches. Why it exists: `check_shape` chose the pod shape from the launch's own flags only (`--shape`, `--stack`, the orchestrator agent) and never from the repository, so three pods of one large repository were killed for memory (exit 137, OOMKilled) on the light shape (1 CPU, 2 GiB) within 2.5 to 7.3 minutes of starting. The rule: for a listed repository a launch with no `--shape` gets the larger of the floor and the shape the flags would give (a stack launch or an orchestrator stays at least `S`); a `--shape` smaller than the floor is refused before anything is created (exit 2, one line naming the repository, the floor and `CW_REPO_MIN_SHAPE`); the same or a larger shape is accepted; an unlisted repository, or an unset setting, changes nothing. How to set it: add one line `CW_REPO_MIN_SHAPE=OWNER/NAME=SHAPE` (more pairs after commas) to the settings file, or export it when there is no file; an entry without `=`, with an unknown shape, a malformed repository or a repeated repository refuses the whole file, naming the key and no value. This change holds no repository name: the entry for a real repository is the operator's own line in the settings file.
 
+## A pod that ends Failed (ask #1442)
+
+Cause. A cloud pod that ended in the Failed phase (for example a container killed for memory, exit 137, or a pod evicted by its node) showed only
+"does not answer" in `status`, because every read of a worker goes through the agent inside the pod. The reaper asked the dead pod for its activity,
+found it unreadable, reported `activity unreadable` every minute and kept the pod for two hours, until its hard limit. No run record was written,
+because the stop path that writes it is never reached for a pod nobody can enter, so nobody could see why the pod had failed. The missing read was
+the pod's own status and events (`get_pod` and `pod_events`), which the launcher already could make and did not make for a Failed pod.
+
+What the record holds. The first reaper pass or `status` that sees the pod Failed reads, once, the pod's reason, each container's terminated reason
+and exit code, and the last 10 events (each cut to 300 characters), every text through the launcher's own scrub, and writes a run record
+(`run.json`, exit reason `pod failed`) with the reason, the exit code and the events. A later pass finds that record by the run id of the pod and
+does nothing for it: no activity read, no second record, no second report. A Failed pod without the `kept` annotation is deleted ten minutes
+after its record; one that holds unpushed work (`kept`) stays.
+
+How a lane reads it. `status` prints `pod failed: <reason>` (the reason cut to 160 characters, for example `OOMKilled (exit 137)`) for such a pod,
+instead of `does not answer`; the full reason, exit code and events are in the record's `run.json` under the run record directory.
+
+Two limits of what `status` and the reaper do. The switchboard prints the launcher's reason on one line: every control character removed, scrubbed once more by its own scrub, and a `pod_failed` value that is not text is treated like an answer it cannot read (the line for an unavailable launcher status), never an error. The reaper reads, records and deletes only a pod that carries a worker annotation: a pod with the launcher's label and none is left alone; a record that cannot be written leaves the pod in place, is reported once as `record not written`, and is written on the first pass that can.
+
+Three more limits of the record of a Failed pod. A record written when the pod could not be read has, as its reason, the text of the read error (not the pod's own reason) and is not refreshed: the pod is read once. The worker annotation of a pod is checked against the worker-name rule (the switchboard's agent name rule) before it becomes a part of a path: a pod whose annotation does not match is treated as a pod with no annotation, never read, recorded or deleted. The reaper's told-once set (the reports of an unwritable record, of an unreadable deadline and of a record time that cannot be read) clears the entry of an unwritable record when that record is written; a pod deleted by someone else leaves a few bytes in the set until the process ends. The event text stored in the record is not stripped of control characters (the JSON escapes them); only the status line prints, and it is stripped.
+
 ## A worker lost with its node
 
 **Cause: inferred until these reads are made.** On 29 October four pods that sat on one node were killed in the same second (the event `Killing: Stopping container worker`, no other event) while pods on other nodes were untouched, and the launcher's audit has no stop line for them. The cause is INFERRED to be the removal or disturbance of that node. The launcher's own login cannot read nodes (it may not list them), so the holder of the ADMINISTRATOR login confirms the cause with these read-only commands (placeholders in capitals):
@@ -669,3 +709,5 @@ The alternative causes and the read that rules each in or out:
 **What it costs.** A node that holds a worker is not scaled down until the worker ends: an idle worker ends at its idle limit (`--idle`), a worker at its hard limit, at most the maximum hard limit (8 hours by default), and a pod the reaper cannot end at the cluster-side deadline floor (the maximum hard limit plus five minutes). A persistent orchestrator has no deadline: once ask 1509 (the persistent orchestrator) lands, its pod template is rendered by the same function and carries the mark, and its node is then not scaled down while it lives.
 
 **What is saved.** The pre-stop hook (`cw-prestop`) pushes unpushed work to the worker's `wip` branch when the pod is deleted, but no stop line and no run record is written. A worker lost with its node is told apart from one the launcher stopped by the cloud end alert of ask 1480 (pull request 1486), which reports a created worker whose pod is gone with no stop line as a gone pod after that ask's own waiting rule.
+
+**Review comment (optional, per repository).** `cloud/launcher/repo-review-comments.json` (beside the launcher; absent by default, so no comment is posted anywhere) maps a lowercased `OWNER/NAME` to one line of text (at most 500 characters, no control characters, no credential shape). `launch` passes that text into the pod as `CW_REVIEW_COMMENT`; when the end hook marks the pod's draft pull request ready it posts the text once as a comment. A repository with no entry gets no variable and no comment. An owner sets it by a reviewed pull request that adds the entry: `{"owner/name": "/review"}`.

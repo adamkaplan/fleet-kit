@@ -367,6 +367,8 @@ class TriageState:
         self.batch_waiting = {}  # #921: repo -> how many open issues wait for the batch (their change merged into the integration branch), this pass
         self.reasons = {}        # (rule, ref) -> the worded reason of a finding that carries one (`awaiting-live expired`)
         self.logged, self.woken_logged, self.facts, self.current = set(), set(), {}, {}
+        self.fact_pairs = {}     # #1542: digest key -> the items the digest lists, for the delivery re-check
+        self.fact_hidden = {}    # #1542: digest key -> True when the digest hides items ("+N more") or carries a note outside its pairs
         self.started, self.day, self.day_counts = 0, None, {}
         self.summarised = None
         self.basis = {}          # digest fact key -> (shown pairs, total due, invalid refs, other-owner count, kinds) its text was made from: judged again at the end of a pass
@@ -563,13 +565,12 @@ def triage_read_unit(hub, repo, unit, now, budget):
     TRIAGE_COMMENT_DAYS), closed:<label> (closed issues that still carry a label)."""
     if unit == "issues":
         path = "repos/%s/issues?state=open&per_page=100" % repo
-        records, cut = hub.read_pages(path, cap=TRIAGE_LIST_PAGES)
+        records, cut = hub.read_open_pages(path)
     elif unit == "merged":   # #384: ONE page of the recently closed pull requests; those with a merge date name the issues they implemented
         records, cut = hub.read_pages("repos/%s/pulls?state=closed&sort=updated&direction=desc&per_page=%d" % (repo, TRIAGE_MERGED_PER_PAGE), cap=1)
     elif unit == "comments":
         since = iso(now - TRIAGE_COMMENT_DAYS * 86400)
-        records, cut = hub.read_pages("repos/%s/issues/comments?since=%s&sort=created&direction=desc&per_page=100"
-                                      % (repo, since), older=("created_at", since), cap=TRIAGE_LIST_PAGES)
+        records, cut = hub.read_comments("triage", repo, since, cap=COMMENT_WINDOW_PAGES)
     else:
         label = unit.split(":", 1)[1]
         records, cut = hub.read_pages("repos/%s/issues?state=closed&labels=%s&per_page=100" % (repo, quote(label, safe="")),
@@ -1064,6 +1065,7 @@ def triage_pass(engine, decisions, now, errors=()):
     candidates, unchecked_units, truncated = triage_findings(engine, state, repos, decisions, cfg, now, errors)
     findings, unchecked, unchecked_other, oldest = [], 0, 0, 0.0
     why = {}   # #605: repo -> {reason: count}, and its other-owner share and oldest age, for the report
+    held = set()   # #1542: candidates this pass could not judge: still present for the delivery re-check
 
     def verify(rule, ref, evidence):
         """True/False/None for one finding; keeps the confirmed, verified and attempted records."""
@@ -1095,6 +1097,7 @@ def triage_pass(engine, decisions, now, errors=()):
         if verdict:
             findings.append((rule, ref, dict(evidence, **state.enriched.pop(pair, {}))))
         elif verdict is None:
+            held.add(pair)
             unchecked += 1
             unchecked_other += rule == "OO"
             oldest = max(oldest, now - state.verified.get(pair, state.first_seen[pair]))
@@ -1105,6 +1108,9 @@ def triage_pass(engine, decisions, now, errors=()):
             entry["other_owner"] += rule == "OO"
             entry["oldest"] = max(entry["oldest"], now - state.verified.get(pair, state.first_seen[pair]))
     findings.sort()
+    seen_all = (not any(unchecked_units.values()) and not state.unreadable and not truncated and unchecked == 0
+                and all((state.units.get((r, u)) or {}).get("error", True) is None and now - state.units[(r, u)]["at"] < TRIAGE_TTL for r in repos for u in units))   # every unit of every repository read this pass (a failed refresh keeps the old copy with an error; one not refreshed is past its TTL)
+    state.present = ({(r, ref) for r, ref, _ in findings} | held) if seen_all else None   # #1542: what the delivery re-check reads, only after a pass that saw every unit it judges; else None (the item is kept, marked unverified)
     day = int(now // 86400)
     counts, other_owner = {}, 0
     for rule, ref, evidence in findings:
@@ -1136,6 +1142,8 @@ def triage_pass(engine, decisions, now, errors=()):
     if held is not None and held.unapproved:   # #765: the plans that look unapproved, one status line (a hint: see docs/switchboard.md)
         state.current["plans_unapproved"] = held.unapproved[:load_triage_plan_open().MAX_LISTED]
         state.current["plans_unapproved_more"] = max(0, len(held.unapproved) - load_triage_plan_open().MAX_LISTED)
+    if held is not None and (held.dropped or held.repeats):   # #1784: held plan lines dropped for a replaced hash, and re-offers of a delivered line not delivered
+        state.current["plan_wake_counts"] = {"dropped": held.dropped, "repeats_not_delivered": held.repeats}
     triage_write(engine, state)
     flagged = [(r, ref) for r, ref, _ in findings if r == "OO" and now - state.alarmed.get((r, ref), 0) >= cfg["realarm_hours"] * 3600]
     owner_t6 = triage_owner_tier_t6(engine, decisions)
@@ -1319,9 +1327,13 @@ def triage_queue_fact(state, due, now, cfg, other_owner=0, invalid=()):
     for pair in shown:
         state.alarmed[pair] = now
     state.facts[key] = (summary, now)
+    state.fact_pairs[key] = list(shown)   # #1542: the items the digest lists, for the delivery re-check
+    state.fact_hidden[key] = len(due) > len(shown) or bool(other_owner) or bool(invalid)   # #1542: a digest that hides items or carries a note outside its pairs is never dropped
     state.basis[key] = (list(shown), len(due), list(invalid), other_owner, kinds)   # what the text was made from, so a later pass can judge it again
     for old in [k for k, (_, at) in state.facts.items() if now - at > cfg["realarm_hours"] * 7200 and "summary" not in k]:
         del state.facts[old]
+        state.fact_pairs.pop(old, None)   # #1542: forgotten with its fact
+        state.fact_hidden.pop(old, None)
     state.carried = set(shown)   # #849: what this digest carried and remembered; an overflow beyond the cap stays due
     return summary
 

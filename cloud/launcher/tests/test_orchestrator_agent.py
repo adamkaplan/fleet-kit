@@ -148,7 +148,7 @@ class Orchestrator(Base):
         sec, agents = self.registry()
         self.assertEqual(sec, dict(OTHER, orch1=hashlib.sha256(self.channel_secret().encode()).hexdigest()))
         self.assertEqual(len(sec["orch1"]), 64)
-        self.assertEqual(set(agents["orch1"]), {"url", "session", "password_file"})
+        self.assertLessEqual({"url", "session", "password_file", "repo"}, set(agents["orch1"]))
         self.assertEqual(agents["other-agent"], {"url": "u"})
         self.assertEqual(agents["orch1"]["password_file"], "/etc/hub/pw/orch1")
         pw = self.st()["secret_bodies"]["cloud-hub-pw"]

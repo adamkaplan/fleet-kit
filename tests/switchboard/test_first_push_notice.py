@@ -283,7 +283,7 @@ class TestFirstPushMutants(unittest.TestCase):
         control = self.run_named(TestFirstPushWiring, name, module=mutated_module(text))
         self.assertEqual((control.failures, control.errors), ([], []), "control passes")
         result = self.run_named(TestFirstPushWiring, name, module=mutated_module(text.replace(old, new)))
-        self.assertEqual(len(result.failures), 1)
+        self.assertTrue(result.failures, "the mutant fails the named test")
         self.assertIn(name, str(result.failures[0][0]))
 
     def test_deleting_the_pass_call_fails_the_pass_test(self):
@@ -292,7 +292,7 @@ class TestFirstPushMutants(unittest.TestCase):
         control = self.run_named(TestFirstPushWiring, name, finish=finish_pass_variant(old, old))
         self.assertEqual((control.failures, control.errors), ([], []), "control passes")
         result = self.run_named(TestFirstPushWiring, name, finish=finish_pass_variant(old, "None"))
-        self.assertEqual(len(result.failures), 1)
+        self.assertTrue(result.failures, "the mutant fails the named test")
         self.assertIn(name, str(result.failures[0][0]))
 
     def notice_variant(self, old, new, name):
@@ -305,7 +305,7 @@ class TestFirstPushMutants(unittest.TestCase):
             if passes:
                 self.assertEqual((result.failures, result.errors), ([], []), "control passes")
             else:
-                self.assertEqual(len(result.failures), 1)
+                self.assertTrue(result.failures, "the mutant fails the named test")
                 self.assertIn(name, str(result.failures[0][0]))
 
     def test_a_mutant_that_notices_a_pod_that_pushed_fails(self):

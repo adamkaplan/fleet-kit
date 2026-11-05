@@ -111,6 +111,9 @@ class FakeTriageHub:
         self.timelines, self.cut = {}, set()   # (repo, number) -> [timeline events] (#576); numbers whose timeline page is not the whole timeline
         self.cut_open = {}                     # #851: repo -> how many open issues its list read returns before it is cut (the read says it is not whole)
 
+    def read_open_pages(self, path):
+        return self.read_pages(path, cap=sb.OPEN_LIST_PAGES)
+
     def read_pages(self, path, key=None, timeout=None, older=None, cap=None):
         self.calls.append(path)
         if any(f in path for f in self.fail):
@@ -138,6 +141,9 @@ class FakeTriageHub:
         if repo in self.cut_open:
             return list(self.open.get(repo, {}).values())[:self.cut_open[repo]], True
         return list(self.open.get(repo, {}).values()), False
+
+    def read_comments(self, consumer, repo, since, cap):   # #1889: answers what read_pages answered for the comments path
+        return self.read_pages("repos/%s/issues/comments?since=%s&sort=created&direction=desc&per_page=100" % (repo, since), older=("created_at", since), cap=cap)
 
     def _read_one(self, repo, path, now, fresh=False):
         self.calls.append(path)

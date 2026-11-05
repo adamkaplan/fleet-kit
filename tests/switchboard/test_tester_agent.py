@@ -113,8 +113,8 @@ def build():
                         code, out, err = self.launch(agent, "tester", route, name=name + route.strip("-"))
                         self.assertEqual(code, 0, err)
                         accepted += 1
-            self.assertEqual(accepted, 6)
-            self.assertEqual(len(self.cloud_calls), 2)
+            self.assertEqual(accepted, len(self.ROUTES) * 2)   # every route for each of the two agents
+            self.assertEqual(len(self.cloud_calls), 2 * sum(1 for r in self.ROUTES if r == "--cloud"))   # one cloud start per cloud launch
             sessions = len(self.world.v2.sessions)
             for route in self.ROUTES:
                 with self.subTest(route=route, agent="build"):

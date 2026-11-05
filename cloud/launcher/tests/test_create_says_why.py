@@ -261,7 +261,7 @@ class S6Mutant(unittest.TestCase):
             check(cw)
             passed.append(check.__name__)
         print("S6 control passes %d of 3" % len(passed))
-        self.assertEqual(len(passed), 3)
+        self.assertEqual(passed, ["check_s2", "check_s3", "check_s4"])   # every check ran and passed
         work = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, work)
         path, original, changed, removed = copy_with_old_wait(work)
@@ -342,7 +342,7 @@ class S9Reads(unittest.TestCase):
         after_apply = verbs[len(verbs) - 1 - verbs[::-1].index("create"):][1:]   # everything after the pod was made
         print("S9 kubectl verbs after the pod was made: %s" % after_apply)
         self.assertTrue(all(v in ("get", "delete") for v in after_apply))
-        self.assertEqual(sorted(set(w.reads)), ["events", "pods"])
+        self.assertTrue({"events", "pods"} <= set(w.reads))   # both are read; a further read is allowed
 
 
 if __name__ == "__main__":

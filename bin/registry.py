@@ -574,6 +574,12 @@ def no_pane_by_both_rules(row):
     return no_pane_to_judge(row) and row.get("pane") is None and row.get("endpoint") is not None
 
 
+def evidence_shows_absent(evidence):
+    """THE one test of the evidence for death (#1884): the pane was READ (listed or not: pane_listed is not None) AND the process of the agent was checked and not found.
+    An unchecked part (None) is not absence. Called by shows_dead and by the daemon's pane pass."""
+    return isinstance(evidence, dict) and evidence.get("pane_listed") is not None and evidence.get("process_found") is False
+
+
 def shows_dead(row, evidence):
     """THE registry-side dead verdict: does the evidence show this row dead? A row with no pane to judge (`no_pane_to_judge`): only the bounded
     endpoint check answering "dead". Any other row: its recorded state is `dead` and the pane and the process were both checked absent (an unchecked
@@ -582,7 +588,7 @@ def shows_dead(row, evidence):
         return False
     if no_pane_by_both_rules(row):
         return evidence.get("endpoint_verdict") == "dead"
-    return row.get("state") == "dead" and evidence.get("pane_listed") is False and evidence.get("process_found") is False
+    return row.get("state") == "dead" and evidence_shows_absent(evidence)
 
 
 def reconcile_remove(state_dir, name, evidence, whole):

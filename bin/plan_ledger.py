@@ -377,6 +377,23 @@ def authors_of(entries, pr, notice_senders=(), github_author=None):
     return {n for n in names if n}
 
 
+def as_current(entries, hashes):
+    """#1713: the same entries with each entry's `plan_hash` and ask head mapped to the NEW form when it is the OLD form of the live text (`hashes` is plan_check.plan_hashes(text)); every other value stays as it is, and the ledger itself is never rewritten."""
+    if not hashes or len(hashes) < 2:
+        return entries
+    new, old = hashes[0], hashes[1]
+    old_head, new_head = ask_head(old), ask_head(new)
+    out = []
+    for entry in entries:
+        if entry.get("plan_hash") == old or entry.get("head") == old_head:
+            entry = dict(entry)
+            if entry.get("plan_hash") == old:
+                entry["plan_hash"] = new
+            if entry.get("head") == old_head:
+                entry["head"] = new_head
+        out.append(entry)
+    return out
+
 def ask_head(plan_hash):
     """#1130: the "head" an ask issue's record carries: the first 40 hex digits of the plan hash (`sha256:<hex>`). A revised plan has another hash, so the
     record is void exactly as a pull request's is when its head moves."""
@@ -854,6 +871,7 @@ def carried_rows(carries, entries, facts):
     """(#1196) The dependency's scenario rows: its recorded proofs and verdicts are reused ONLY for the commit its head names (`scenario_state` compares the head by
     commit, never by pull request name); a record for any other commit is void. Returns (rows, reviews)."""
     dep_pr, dep_head, dep_plan = carries["pr"], carries["head"], carries["plan"]
+    entries = as_current(entries, dep_plan.get("plan_hashes"))   # #1713
     authors = authors_of(entries, dep_pr, carries.get("notice_senders") or (), carries.get("author"))
     rows = []
     for s in dep_plan["scenarios_parsed"]:
@@ -926,6 +944,7 @@ def evaluate_gates(plan, entries, ledger_problem, facts, pr, now=None):
     every tracked gate that applies to a PR is satisfied; the untracked ones are listed, not counted."""
     head = (facts or {}).get("head")
     authors = authors_of(entries, pr, (facts or {}).get("notice_senders") or (), (facts or {}).get("author"))
+    entries = as_current(entries, (plan or {}).get("plan_hashes"))   # #1713: a binding at the old hash of a marker-bearing plan reads as the live one
     carries = (facts or {}).get("carries") or None   # (#1196) the one dependency named by `CARRIES: #N`; None for an ordinary pull request
     carried_reviews = None
     rows, scen_rows = [], []
@@ -989,14 +1008,16 @@ def evaluate_gates(plan, entries, ledger_problem, facts, pr, now=None):
                 if left:
                     row["detail"] += "; left to the epic's other pull requests by the CLAIMS line: %s" % ", ".join(s["id"] for s in left)
                 if epic:
-                    row["detail"] += "; epic-claimed, proven after the merge at the integration head: %s" % ", ".join(epic)
+                    row["detail"] += "; epic-claimed, proven after the merge at the integration head: %s (not required of this pull request: each is recorded on the owning issue, unrecorded, recorded or stale there; read its `gates`)" % ", ".join(epic)
         elif gid == "G4":
             ci = (facts or {}).get("ci")
             applies, legs_ok, legs_said = (facts or {}).get("legs") or (False, True, "")   # #1235: the macOS legs, read from the rollup
             if ci in ("green", "passing") and applies and not legs_ok:
                 row.update(status="missing", missing=["CI is green at %s but %s" % ((head or "?")[:8], legs_said)])
+            elif (facts or {}).get("ci_line") and ci not in ("green", "passing"):   # #1755: the run was not made on the current tip: stale or unknown is never ok
+                row.update(status="missing", missing=[facts["ci_line"]])
             elif ci in ("green", "passing"):
-                row.update(status="ok", detail="CI %s at %s%s" % (ci, (head or "?")[:8], "; ubuntu legs green at the head, " + legs_said if applies else ""))
+                row.update(status="ok", detail="CI %s at %s%s%s" % (ci, (head or "?")[:8], "; " + facts["ci_line"] if (facts or {}).get("ci_line") else "", "; ubuntu legs green at the head, " + legs_said if applies else ""))
             elif (facts or {}).get("draft") is True and ci == "none":   # #770: a draft whose workflow skips drafts has no run at all, and "CI is failing" sends the author the wrong way; a draft WITH runs keeps the failing line
                 row.update(status="missing", missing=["draft: no CI run seen; this repo's workflow may skip drafts; mark ready, then wait"])
             else:
@@ -1006,9 +1027,7 @@ def evaluate_gates(plan, entries, ledger_problem, facts, pr, now=None):
             row.update(status="ok" if ok else "missing", detail=detail, missing=[] if ok else [detail])
         elif gid == "G6":
             floor = (facts or {}).get("floor")   # the impact floor read fresh for this head (#488); absent = not read, the label alone
-            if (facts or {}).get("captain"):
-                row.update(status="waiting", missing=["held for the owner (MERGE: captain): the owner decides, through cos"])
-            elif isinstance(floor, dict) and (floor.get("unreadable") or floor.get("decision") is None):
+            if isinstance(floor, dict) and (floor.get("unreadable") or floor.get("decision") is None):
                 row.update(status="waiting", missing=["the impact floor could not be read for this head (%s): the owner decides, through cos"
                                                       % (floor.get("unreadable") or "no decision")])
             elif carries and isinstance(floor, dict) and floor.get("clear_head") and floor.get("clear_head") != head and not floor.get("cleared") and floor.get("decision") == "hold":
@@ -1022,6 +1041,13 @@ def evaluate_gates(plan, entries, ledger_problem, facts, pr, now=None):
             elif isinstance(floor, dict) and floor.get("decision") == "hold" and not floor.get("cleared"):
                 row.update(status="waiting", missing=["held for the owner (impact floor, read at this head): %s; the owner clears it for this head"
                                                       % ("; ".join(floor.get("reasons") or []) or "hold")])
+            # FAIL MODE (#1119): the new wording ONLY when the floor was read and positively says not held, with no hold label. A floor that is
+            # absent or unreadable (handled above or not a dict) and any hold label keep the old behaviour: waiting for the owner.
+            elif (facts or {}).get("captain") and "marker-without-label" in ((facts or {}).get("captain_findings") or ()) \
+                    and isinstance(floor, dict) and not (facts or {}).get("holds"):   # the floor read above says not held
+                row.update(status="ok", detail="a marker without a hold: set MERGE: automatic", missing=[])
+            elif (facts or {}).get("captain"):
+                row.update(status="waiting", missing=["held for the owner (MERGE: captain): the owner decides, through cos"])
             else:
                 row.update(status="ok", detail="not a held PR")
         elif gid == "G6b":
@@ -1198,7 +1224,7 @@ def validate_plan_gates(raw, source):
         seen[normal_repo(name)] = name
         if not isinstance(entry, dict):
             raise ValueError("%s: 'plan_gates.repos.%s' must be an object" % (source, name))
-        extra = sorted(set(entry) - {"mode", "enabled", "budget_ms", "enforce_gates", "item_checks", "ci_workflows"})
+        extra = sorted(set(entry) - {"mode", "enabled", "budget_ms", "enforce_gates", "item_checks", "ci_workflows", "ci_current_tip"})
         if extra:
             raise ValueError("%s: 'plan_gates.repos.%s' has key(s) this tool does not read: %s" % (source, name, ", ".join(extra)))
         mode = entry.get("mode", "shadow")
@@ -1219,6 +1245,8 @@ def validate_plan_gates(raw, source):
         repos[name] = {"mode": mode, "enabled": enabled, "budget_ms": budget, "enforce_gates": [g for g in ENFORCEABLE if g in gates]}
         if "item_checks" in entry:   # #770: declared and validated by bin/item_verdicts.py; carried here untouched, and absent when the repo does not list it
             repos[name]["item_checks"] = entry["item_checks"]
+        if "ci_current_tip" in entry:   # #1755: only an explicit false turns the rule off; carried as it is
+            repos[name]["ci_current_tip"] = entry["ci_current_tip"]
         if "ci_workflows" in entry:   # #1237: workflow names the gate expects a run of at the head
             flows = entry["ci_workflows"]
             if not (isinstance(flows, list) and len(flows) <= 20 and all(isinstance(x, str) and x for x in flows)):
@@ -1430,6 +1458,7 @@ def launch_findings(brief, plan, entries):
         return [{"gate": "G0a", "missing": ["the plan the brief links could not be read"]}]
     if plan["result"] != "pass":
         found.append({"gate": "G0a", "missing": ["the plan fails `plan check` (%d defect(s))" % len(plan["defects"])]})
+    entries = as_current(entries, plan.get("plan_hashes"))   # #1713
     if consensus_at(entries, plan["plan_hash"]) is None:
         found.append({"gate": "G0b", "missing": ["no consensus record at the plan's current hash %s" % plan["plan_hash"][:19]]})
     return found
