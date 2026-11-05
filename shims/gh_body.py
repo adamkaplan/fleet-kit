@@ -18,6 +18,7 @@ Only the standard library. No repository name is known here.
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 import tempfile
@@ -92,8 +93,14 @@ class Probe:
         if path == "-":
             return self.stdin_text()
         try:
-            with open(path, "r") as handle:
-                text = handle.read(MAX_TEXT + 1)
+            fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)   # never blocks on a FIFO; only a regular file is read
+            try:
+                if not stat.S_ISREG(os.fstat(fd).st_mode):
+                    raise Unclassified()
+                with os.fdopen(fd, "r", closefd=False) as handle:
+                    text = handle.read(MAX_TEXT + 1)
+            finally:
+                os.close(fd)
         except (OSError, UnicodeError):
             raise Unclassified()
         if len(text) > MAX_TEXT:
@@ -253,7 +260,10 @@ def api_write(probe, args, api_parser):
     segs = clean_endpoint(endpoint)
     low = [s.lower() for s in segs]
     if low[:1] == ["graphql"]:
-        texts = query_texts(probe, parsed)
+        try:
+            texts = query_texts(probe, parsed)
+        except Unclassified:
+            return None   # an unreadable query or --input is refused by the shim's own GraphQL rule, with its own line
         return GRAPHQL if any(UPDATE_RE.search(t) for t in texts) else None
     if low[:1] == ["repos"] and len(segs) == 5 and low[3] == "issues":
         number = segs[4]
