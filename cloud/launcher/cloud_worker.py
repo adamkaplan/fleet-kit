@@ -2579,7 +2579,8 @@ class Kube:
         self.run(["patch", "secret", secret, "--type=merge", "--patch-file=/dev/stdin"], stdin=json.dumps(body))
 
     def exec(self, name, *cmd, keep_stdout=False, timeout=120):
-        return self.run(["exec", name, "-c", WORKER_CONTAINER, "--"] + list(cmd),   # the worker container by name: a stack pod's default container is not it keep_stdout=keep_stdout, timeout=timeout, retry=False)
+        # the worker container by name: a stack pod's default container is not it
+        return self.run(["exec", name, "-c", WORKER_CONTAINER, "--"] + list(cmd), keep_stdout=keep_stdout, timeout=timeout, retry=False)
 
 
 def _pod_env(pod, key):
