@@ -227,11 +227,11 @@ def pair_rows(events_fn, state_fn):
     expect(len(hashes) >= 2 and hashes[0] == current, True, "the live text has a pair led by the current hash")
     for member in hashes:
         folder = audit_dir([event(ISSUE, member, "both")])
-        got = state_fn(events_fn(folder, ISSUE, current, hashes=hashes), ISSUE, current, hashes, plan_check.canonical_hash)
+        got = state_fn(events_fn(folder, ISSUE, current, hashes=hashes), ISSUE, current, hashes)
         expect(got[0], "ok", "an event at the member %s of the pair" % member[:14])
     edited = plan_check.plan_hash(PLAN_TEXT.replace("one", "two"))
     folder = audit_dir([event(ISSUE, edited, "both")])
-    got = state_fn(events_fn(folder, ISSUE, current, hashes=hashes), ISSUE, current, hashes, plan_check.canonical_hash)
+    got = state_fn(events_fn(folder, ISSUE, current, hashes=hashes), ISSUE, current, hashes)
     expect(got[0], "missing", "an event at the hash of an edited text")
     expect((current in got[1], edited in got[1]), (True, True), "the edited-text detail names both hashes")
 
@@ -249,12 +249,12 @@ class TestApprovalPair(unittest.TestCase):
         hashes = plan_check.plan_hashes(PLAN_TEXT)
         older = hashes[-1]
         folder = audit_dir([event(ISSUE, older, "both")], broken=True)   # the unreadable rotated audit is never opened
-        self.assertEqual(HOST.sb.approval_events(folder, ISSUE, hashes[0], hashes=hashes), [{"plan_hash": older}])
+        self.assertEqual(HOST.sb.approval_events(folder, ISSUE, hashes[0], hashes=hashes), [{"plan_hash": hashes[0]}])   # read at the current hash; the broken rotated audit stays unopened
 
     def test_mutant_comparing_the_new_hash_only_is_caught(self):
-        state = mutated_state("(canonical(e[\"plan_hash\"], hashes) if canonical else e[\"plan_hash\"])", "e[\"plan_hash\"]")
+        events = mutated_events('plan_check.canonical_hash(detail["plan_hash"], hashes)', 'detail["plan_hash"]')
         with self.assertRaisesRegex(AssertionError, r"^approval gate: an event at the member sha256:[0-9a-f]{7} of the pair: got missing, want ok$"):
-            pair_rows(HOST.sb.approval_events, state)
+            pair_rows(events, plan_ledger.approval_state)
 
 
 class TestApprovalGateCommands(unittest.TestCase):

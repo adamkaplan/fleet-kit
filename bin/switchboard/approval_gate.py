@@ -39,9 +39,9 @@ def approval_events(state_dir, issue, current_hash, clock=None, seconds=None, fi
                     if not isinstance(entry, dict) or entry.get("event") != "plan.approved" or not isinstance(detail, dict):
                         continue
                     if want in (str(entry.get("subject") or "").lower(), str(detail.get("issue") or "").lower()) and isinstance(detail.get("plan_hash"), str):
-                        mine.append({"plan_hash": detail["plan_hash"]})
+                        mine.append({"plan_hash": plan_check.canonical_hash(detail["plan_hash"], hashes)})   # #1713: an event at an older member reads at the current hash
             found.extend(reversed(mine))
-            if any(plan_check.canonical_hash(e["plan_hash"], hashes) == current_hash for e in mine) or clock() > limit:
+            if any(e["plan_hash"] == current_hash for e in mine) or clock() > limit:
                 break
         return found if clock() <= limit else None
     except Exception:   # a corrupt gzip raises zlib.error, which is no OSError: every read failure is missing

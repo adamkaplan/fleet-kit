@@ -937,11 +937,6 @@ def approval_state(events, issue, current_hash, hashes=None, canonical=None):
     return "missing", "no plan.approved event for %s (current plan hash %s)" % (issue, current_hash)
 
 
-def _canonical_hash():
-    """plan_check.canonical_hash (#1713), from the module the switchboard has loaded; None when plan_check is not loaded (the hash then compares as stored)."""
-    return getattr(sys.modules.get("plan_check"), "canonical_hash", None)
-
-
 def evaluate_gates(plan, entries, ledger_problem, facts, pr, now=None):
     """The gate table for one PR. `plan` is {"result", "defects", "scenarios_parsed", "plan_hash"} from the plan checker
     (None when no plan could be found), `facts` is what `gh pr view` said (head, ci, captain, body, notice_senders).
@@ -963,7 +958,7 @@ def evaluate_gates(plan, entries, ledger_problem, facts, pr, now=None):
         elif not tracked and not (gid == "G0c" and isinstance((facts or {}).get("approval"), dict)):   # #1735: G0c is tracked only where the repo enforces it (facts["approval"] is then set)
             row["detail"] = UNTRACKED_WHY.get(gid, "not recorded yet")
         elif gid == "G0c":
-            status, said = approval_state(facts["approval"].get("events"), facts["approval"].get("issue"), (plan or {}).get("plan_hash"), (plan or {}).get("plan_hashes"), _canonical_hash())
+            status, said = approval_state(facts["approval"].get("events"), facts["approval"].get("issue"), (plan or {}).get("plan_hash"), (plan or {}).get("plan_hashes"))
             row.update(tracked=True, status=status, detail=said, missing=[said] if status == "missing" else [])
         elif gid == "G0a":
             if plan is None:
