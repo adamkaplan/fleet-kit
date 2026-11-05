@@ -2811,6 +2811,8 @@ class Switchboard:
             undelivered_wake_tick(self, discovery)
         except Exception as err:
             self._failed("undelivered-wake", "undelivered-wake", err, report)
+        if self.state_dir is not None:   # #2204: an approved, marked pull request whose only change is a git-made tip merge (never raises)
+            merge_on_resolve_tick(self, merge_on_resolve_env(self))
         finish_pass(self, discovery, report)
         if self.reads.deferred:   # the budget kept what was remembered for this many reads this pass: said, once per change of the count
             self._note("v2_reads.deferred", None, {"reads": self.reads.deferred})
@@ -9741,6 +9743,17 @@ def _review_verdict(first_line):
     """The verdict of a first line: exactly `Review of <40 hex>: <word>` (case-sensitive, trailing whitespace only), else UNKNOWN."""
     m = REVIEW_STRICT_RE.match(first_line)
     return m.group(2) if m and m.group(2) in REVIEW_VERDICTS else "UNKNOWN"
+
+
+def review_read(comment, fleet_login):
+    """(sha, verdict) of a comment that is a recorded strict read, else None: the first line is exactly `Review of <40 hex>: <word>` (`REVIEW_STRICT_RE`), the body carries
+    the fleet mark (`signed_by_fleet`) and the author is a fleet account (`fleet_login`, the engine's `_fleet_login`). The author is `user.login` (REST) or `author.login` (`gh pr view`)."""
+    body = comment.get("body") if isinstance(comment, dict) else None
+    if not isinstance(body, str) or not signed_by_fleet(body):
+        return None
+    login = _login(comment) or _login({"user": comment.get("author")})
+    m = REVIEW_STRICT_RE.match(body.split("\n", 1)[0][:300])
+    return (m.group(1), m.group(2)) if m and login and fleet_login(login) else None
 
 
 def _review_lane_member(agents, signer, owner):
@@ -18436,6 +18449,60 @@ def cmd_merge_drops(args, runner, now):
 
 
 cmd_merge_drops.ledger = True   # reads only; its own errors are usage errors
+
+
+def merge_on_resolve_env(engine):
+    """#2204: what bin/switchboard/merge_on_resolve.py reads from the daemon: the watched repositories, the marked open pull requests of the held units, and per pull request the clone,
+    the gates (`merge-drops`, the claim union, the pass and the squash merge of `merge-gate --pass --merge`) and the notice to the lane (routed as the claims note is)."""
+    config, runner, records = engine.config, engine.gh_runner or subprocess.run, {}
+    gate, reading = load_module("merge_gate"), load_module("pr_reading")
+
+    def repos():
+        cfg = config.get("triage", TRIAGE_DEFAULTS)
+        return triage_repos(engine, cfg) if cfg else []
+
+    def marked(repo):
+        unit = triage_state(engine).units.get((repo, "issues"))
+        found = []
+        for record in (unit["data"] if unit else []):
+            if _is_pr(record) and record.get("state", "open") == "open" and mor_marked([l.get("name") if isinstance(l, dict) else l for l in record.get("labels") or []]):
+                records[(repo, _number(record))] = record
+                found.append(_number(record))
+        return found
+
+    def context(repo, number):
+        gh = merge_gate_gh(config, runner, repo)
+        git_dir = Path(engine.state_dir) / "merge-drops" / repo.replace("/", "__")
+
+        def prepare(_repo, _number, base):
+            try:
+                if not git_dir.is_dir():
+                    git_dir.parent.mkdir(parents=True, exist_ok=True)
+                    _git_out(runner, ".", ["init", "--bare", "-q", str(git_dir)])
+                _git_out(runner, git_dir, ["fetch", "-q", "https://github.com/%s.git" % repo, "+refs/heads/%s:refs/tips/base" % base, "+refs/pull/%d/head:refs/tips/head%d" % (number, number)])
+            except (OSError, subprocess.SubprocessError):
+                return None, None
+            return "refs/tips/base", "refs/tips/head%d" % number
+
+        def merge(_repo, _number, expected_head=None):
+            code, lines, record = gate.pass_and_merge(reading, gh, gate.settings(config), engine.state_dir, repo, number, "switchboard-daemon", None, engine.now, MERGE_GATE_SLEEP, expected_head=expected_head)
+            _gates_audit(engine, "merge_gate.pass_merge", "%s#%d" % (repo, number), dict(record, by="switchboard-daemon"))
+            return code, lines
+
+        def tell(_repo, _number, key, text):
+            hub, discovery, now = getattr(engine, "hub", None), getattr(engine, "discovery", None), engine.now()
+            record = records.get((repo, number)) or {}
+            closing = _pr_refs(record, number)[0]
+            item = GitHubItem("github.pr:%s" % key, "github.pr", "PR #%d" % number, repo, closing, [], _login(record), now, [number], True)
+            owner, _ = hub.route_of(item, discovery.agents, now) if hub is not None and discovery is not None else (None, None)
+            if owner:
+                plan_wake_state(engine).facts["merge-on-resolve:%s:%s" % (key, owner)] = (text, now, owner, repo, number)
+            else:
+                engine._note("merge_on_resolve.no_recipient", "%s#%d" % (repo, number), {"text": text[:200]})
+        return {"gh": gh, "runner": runner, "git_dir": git_dir, "read": lambda comment: review_read(comment, engine._fleet_login), "prepare": prepare, "is_held": gate.is_held, "merge": merge, "tell": tell,
+                "drops": lambda r, n: merge_drops_refusal(runner, config, repo, number, engine.state_dir),
+                "union": lambda r, n: claim_union_refusal(types.SimpleNamespace(pr="%s#%d" % (repo, number), plan=None, ask=None), runner, engine.now)}
+    return {"parse": load_module("record_json").parse_bounded, "repos": repos, "marked": marked, "context": context}
 
 
 def merge_drops_refusal(runner, config, repo, number, state):

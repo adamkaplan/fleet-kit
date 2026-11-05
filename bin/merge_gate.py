@@ -509,7 +509,7 @@ def review_blockers(reviews, head="", decision=""):
                   if state == "CHANGES_REQUESTED" and (blocked or not oid or not head or oid.lower() == head.lower()))
 
 
-def pass_and_merge(reading, gh, conf, state, repo, number, holder, pid, clock, sleep, allow_held=False, alive=pid_alive, wait_seconds=None):
+def pass_and_merge(reading, gh, conf, state, repo, number, holder, pid, clock, sleep, allow_held=False, alive=pid_alive, wait_seconds=None, expected_head=None):
     """`merge-gate --pass --merge`: the pass, then, in this same process, a fresh read of the head, the labels and the gates, then `gh pr merge --squash
     --match-head-commit <head>`. The merge goes through `gh` WITHOUT the own-call marker (`own=False`), so the shim's checks run (a blocking review or a missing pass refuses it); before it, this function reads the reviews itself and refuses a blocking one by name.
     Any mismatch merges nothing and releases the lock. Returns (exit code, lines, audit); `audit` is the ONE record of the run: the pass, each re-read and the outcome."""
@@ -525,6 +525,8 @@ def pass_and_merge(reading, gh, conf, state, repo, number, holder, pid, clock, s
     audit["head"] = before["head"]
     if before["problems"]:
         return done(1, "merge-gate --pass --merge refused: unreadable: %s" % before["problems"][0], "refused: unreadable")
+    if expected_head is not None and before["head"] != expected_head:
+        return done(1, "merge-gate --pass --merge refused: the head moved after it was checked (checked %s, now %s)" % (str(expected_head)[:8], str(before["head"])[:8]), "refused: head moved after the check")
     if is_held(before["labels"]):
         return done(1, "merge-gate --pass --merge refused: %s is held for the owner: keep the two-step form (`--pass`, then `gh pr merge`)" % ref, "refused: held")
     ok, pass_lines = gate_pass(reading, gh, conf, state, repo, number, holder, pid, clock, sleep, allow_held=allow_held, alive=alive, wait_seconds=wait_seconds)
@@ -546,7 +548,7 @@ def pass_and_merge(reading, gh, conf, state, repo, number, holder, pid, clock, s
     else:
         added = sorted(set(now["labels"]) - set(before["labels"]))
         allowed, reason, _ = decide(now)
-        checks = (("head", head == pass_head and head == before["head"], "the head moved after the pass (passed at %s, now %s)" % (pass_head[:8], head[:8])),
+        checks = (("head", head == pass_head and head == before["head"] and (expected_head is None or head == expected_head), "the head moved after the pass (passed at %s, now %s)" % (pass_head[:8], head[:8])),
                   ("labels", not added and not is_held(now["labels"]), "a label appeared after the pass: %s" % ", ".join(added or now["labels"])),
                   ("gates", allowed, "a gate is no longer ready: %s" % reason),
                   ("branch", now["tip"] == pass_tip, "the branch %s moved after the pass (passed on %s, now %s)" % (now["branch"], pass_tip[:8], now["tip"][:8])))
