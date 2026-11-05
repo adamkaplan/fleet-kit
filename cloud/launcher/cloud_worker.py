@@ -3000,15 +3000,11 @@ class Launcher:
         except CloudError:
             seen = []
         status = whole.get("status") or {}
-        terminated = []
-        for key in ("containerStatuses", "initContainerStatuses"):
-            for c in status.get(key) or []:
-                for where in ("state", "lastState"):
-                    t = (c.get(where) or {}).get("terminated")
-                    if isinstance(t, dict):
-                        terminated.append(t)
-        chosen = ([t for t in terminated if t.get("exitCode") not in (0, None)] or terminated or [{}])[0]
-        code = chosen.get("exitCode") if isinstance(chosen.get("exitCode"), int) else None
+        # the ONE reader of container termination is _pod_state_of; its events are not asked for here (phase shown as Running), they are read above
+        held = self._pod_state_of({"status": dict(status, phase="Running"), "spec": whole.get("spec") or {}}, name)["containers"]
+        terminated = [c for c in held if "exit_code" in c]
+        chosen = ([t for t in terminated if t.get("exit_code") not in (0, None)] or terminated or [{}])[0]
+        code = chosen.get("exit_code") if isinstance(chosen.get("exit_code"), int) else None
         events = []
         for ev in [e for e in seen if isinstance(e, dict)][-FAILED_EVENTS_MAX:]:
             events.append(self.kube.scrub("%s: %s" % (ev.get("reason") or "", ev.get("message") or ""), FAILED_EVENT_CHARS))
