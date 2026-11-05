@@ -58,6 +58,8 @@ cloud/worker/tests/test_dockerfile_postgres.py
 cloud/worker/tests/test_entrypoint.py
 cloud/worker/tests/test_entrypoint_import.py
 cloud/worker/tests/test_plan_check_in_pod.py
+cloud/worker/tests/test_pr_branch_source.py
+cloud/worker/tests/test_pr_record.py
 cloud/worker/tests/test_reach.py
 cloud/worker/tests/test_shell_check.py
 cloud/worker/tests/test_token_table.py
