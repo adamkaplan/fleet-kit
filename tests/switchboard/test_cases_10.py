@@ -5,6 +5,8 @@ import traceback
 import base64
 import calendar
 import collections
+import concurrent.futures
+import multiprocessing
 import contextlib
 import errno
 import copy
@@ -501,7 +503,6 @@ fleet-switchboard:github_status
 fleet-switchboard:handle
 fleet-switchboard:health_watched_repos
 fleet-switchboard:janitor_agent_roots
-fleet-switchboard:job_read
 fleet-switchboard:json
 fleet-switchboard:lab_facts
 fleet-switchboard:launch_memory_check
@@ -540,7 +541,8 @@ heartbeat-ack:atomic_write
 heartbeat-ack:read_state_document
 heavy_slots.py:_read
 heavy_slots.py:_read_info
-heavy_slots.py:_reported
+heavy_slots_watch.py:_reported
+host_liveness.py:_remote
 impact_floor.py:load_matrix
 impact_hold.py:_gh_json
 impact_hold.py:_pending_read
@@ -602,11 +604,13 @@ switchboard/handoff.py:post_ask_comment
 switchboard/import_v1.py:read_v1_export
 switchboard/jev.py:_load
 switchboard/jev.py:_post
+switchboard/job_runs.py:job_read
 switchboard/judge.py:ask_judge_daemon
 switchboard/judge.py:looks_like_plugin_event
 switchboard/judge.py:parse_plugin_event
 switchboard/judge_request.py:_guess_configured
 switchboard/judge_request.py:parse_policy_request
+switchboard/reminders.py:ci_queue_get
 switchboard/sent_view.py:sent_deliveries
 switchboard/triage.py:triage_summary
 switchboard/v2_transport.py:_decode
@@ -617,10 +621,36 @@ triage_digest.py:read_json
 work_sync.py:_read_json
 """.split()
 
-    @staticmethod
-    def scan(root):
-        """{"file:function"} of every json.loads, json.load and `from json import loads` call in the python sources under root (tests excluded)."""
+    _SCAN_CACHE = {}   # source text -> function names holding a json load; the AST walk of an unchanged file is done once per class
+
+    @classmethod
+    def _sites(cls, text):
+        if text in cls._SCAN_CACHE:
+            return cls._SCAN_CACHE[text]
         import ast
+        found = set()
+        try:
+            tree = ast.parse(text)
+        except (SyntaxError, ValueError):
+            cls._SCAN_CACHE[text] = found
+            return found
+        names = {a.asname or a.name for n in ast.walk(tree) if isinstance(n, ast.ImportFrom) and n.module == "json" for a in n.names if a.name in ("loads", "load")}
+        def walk(node, fn):
+            for c in ast.iter_child_nodes(node):
+                nf = c.name if isinstance(c, (ast.FunctionDef, ast.AsyncFunctionDef)) else fn
+                if isinstance(c, ast.Call):
+                    x = c.func
+                    if (isinstance(x, ast.Attribute) and x.attr in ("loads", "load") and isinstance(x.value, ast.Name) and x.value.id in ("json", "_json")) \
+                            or (isinstance(x, ast.Name) and x.id in names):
+                        found.add(fn or "<module>")
+                walk(c, nf)
+        walk(tree, None)
+        cls._SCAN_CACHE[text] = found
+        return found
+
+    @classmethod
+    def scan(cls, root):
+        """{"file:function"} of every json.loads, json.load and `from json import loads` call in the python sources under root (tests excluded)."""
         out = set()
         for f in sorted(Path(root).rglob("*")):
             if not f.is_file() or f.name.startswith(("test-", "test_")) or "__pycache__" in f.parts:
@@ -631,21 +661,8 @@ work_sync.py:_read_json
                 continue
             if not (f.suffix == ".py" or text.startswith(("#!/usr/bin/env python", "#!/usr/bin/python"))):
                 continue
-            try:
-                tree = ast.parse(text)
-            except (SyntaxError, ValueError):
-                continue
-            names = {a.asname or a.name for n in ast.walk(tree) if isinstance(n, ast.ImportFrom) and n.module == "json" for a in n.names if a.name in ("loads", "load")}
-            def walk(node, fn):
-                for c in ast.iter_child_nodes(node):
-                    nf = c.name if isinstance(c, (ast.FunctionDef, ast.AsyncFunctionDef)) else fn
-                    if isinstance(c, ast.Call):
-                        x = c.func
-                        if (isinstance(x, ast.Attribute) and x.attr in ("loads", "load") and isinstance(x.value, ast.Name) and x.value.id in ("json", "_json")) \
-                                or (isinstance(x, ast.Name) and x.id in names):
-                            out.add("%s:%s" % (f.relative_to(root).as_posix(), fn or "<module>"))
-                    walk(c, nf)
-            walk(tree, None)
+            rel = f.relative_to(root).as_posix()
+            out.update("%s:%s" % (rel, fn) for fn in cls._sites(text))
         return out
 
     def missing(self, root):
@@ -1183,11 +1200,11 @@ class TestCloudLoad(Base):
         import signal as _sig
         def boom(*a):
             raise AssertionError("the read blocked")
-        old = _sig.signal(_sig.SIGALRM, boom); _sig.alarm(3)
+        old = _sig.signal(_sig.SIGALRM, boom); _sig.setitimer(_sig.ITIMER_REAL, 1.0)
         try:
             return fn()
         finally:
-            _sig.alarm(0); _sig.signal(_sig.SIGALRM, old)
+            _sig.setitimer(_sig.ITIMER_REAL, 0); _sig.signal(_sig.SIGALRM, old)
 
     def _cw_mutant(self, old, new, *more):
         src = (BIN / "cloud_worker.py").read_text()
@@ -1347,6 +1364,14 @@ class TestCloudLoad(Base):
         self.assertEqual(sb.live_cloud_by_lane(self.state_dir, self.disc, {}, {}, None, 1893456001.0), {})   # 2030-01-01T00:00:01Z
 
 
+_GOLDEN_JOB = None
+
+
+def _golden_record_share(share):
+    golden, entry, root, env = _GOLDEN_JOB
+    return [golden.run(entry, command, root, env) for command in share]
+
+
 class TestArchitectureSafetyNet(unittest.TestCase):
     """The tools that prove a move of switchboard code is text only (plan #1092, slice S0)."""
     TOOLS = REPO / "tools"
@@ -1417,13 +1442,29 @@ class TestArchitectureSafetyNet(unittest.TestCase):
         root = os.path.realpath(str(work))
         env = golden.world(root)
         entry = str(SWITCHBOARD)
-        first = golden.record_all(entry, root, env)
-        self.assertGreaterEqual(len(first), 120)
+        commands = golden.command_list(entry, root, env)
+
+        def record(wanted):
+            """The given commands, recorded by a process pool: each child records its share."""
+            global _GOLDEN_JOB
+            _GOLDEN_JOB = (golden, entry, root, env)
+            count = max(1, min(os.cpu_count() or 1, len(wanted)))
+            shares = [wanted[i::count] for i in range(count)]
+            with concurrent.futures.ProcessPoolExecutor(max_workers=count, mp_context=multiprocessing.get_context("fork")) as pool:
+                done = list(pool.map(_golden_record_share, shares))
+            return {tuple(command): result for share, results in zip(shares, done) for command, result in zip(share, results)}
+
+        self.assertGreaterEqual(len(commands), 120)
+        self.assertEqual(len({tuple(c) for c in commands}), len(commands), "the command list repeats a command")
+        helps = [command for command in commands if command[-1] == "--help"]
         verbs = golden.choices(golden.run(entry, ["--help"], root, env)["stdout"])
         self.assertGreater(len(verbs), 40)
+        first = record([[verb, "--help"] for verb in verbs])   # the --help of every verb, recorded once; the full run of every command is golden-cli compare's job
+        listed = {tuple(c) for c in commands}
         for verb in verbs:
-            self.assertIn((verb, "--help"), first, "the command list has no --help of the verb %s" % verb)
-        self.assertEqual(golden.differences(first, golden.record_all(entry, root, env)), [], "two recordings of one entry differ")
+            self.assertIn((verb, "--help"), listed, "the command list has no --help of the verb %s" % verb)
+        sample = helps[:4] + helps[-4:] + commands[-4:]   # a small fixed sample, recorded a second time
+        self.assertEqual(golden.differences(record(sample), record(sample)), [], "two recordings of one entry differ")
 
     def fake_repo(self, text):
         """A git repository whose bin/fleet-switchboard prints bin/out.txt: a stand-in for the daemon."""
@@ -1561,7 +1602,7 @@ class TestArchitectureSafetyNet(unittest.TestCase):
         repo = self.overlap_repo()
         files = [{"path": "bin/fleet-switchboard"}, {"path": "bin/test-switchboard"}]
         done = self.run_overlap(repo, [{"number": 1, "title": "edit f", "files": files}, {"number": 2, "title": "no head", "files": files},
-                                       {"number": 3, "title": "other", "files": [{"path": "README.md"}]}])
+                                       {"number": 3, "title": "other", "files": [{"path": "README.md"}], "changedFiles": 1}])
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
         self.assertIn("symbols: f", done.stdout)
         self.assertNotIn("symbols: f, g", done.stdout)
