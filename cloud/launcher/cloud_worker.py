@@ -2751,6 +2751,15 @@ def review_comment(repo, path=None):
     return ""
 
 
+READONLY_ROOT_SETTING = "CW_READONLY_ROOT_LANES"   # a set of lane (boss) names, comma or space separated; empty or unset = off
+READONLY_ROOT_MOUNTS = ("/tmp", "/home/worker/.cache/opencode", "/home/worker/.config/opencode", "/home/worker/.local/state/opencode")
+READONLY_ROOT_GITCONFIG = "/run/cw-tmp/gitconfig"   # ~/.gitconfig is a FILE: git is pointed at the tmpfs instead of mounting over it
+
+
+def readonly_root_lanes(env):
+    return set((env.get(READONLY_ROOT_SETTING) or "").replace(",", " ").split())
+
+
 def render_pod(a, worker, name, now, hard, env, run_names=()):
     image = a.image or env.get("CW_CLOUD_IMAGE")
     if not image:
@@ -2838,6 +2847,13 @@ def render_pod(a, worker, name, now, hard, env, run_names=()):
                                                    PULLER_ANNOTATIONS["tenant-id"]: puller["CW_STACK_PULL_TENANT_ID"]})
             pod["spec"]["volumes"].append(copy.deepcopy(PULLER_VOLUME))
             pod["spec"]["containers"][0]["volumeMounts"].append({"name": PULLER_VOLUME_NAME, "mountPath": PULLER_MOUNT_PATH, "readOnly": True})
+    if not stack and getattr(a, "boss", None) in readonly_root_lanes(env):   # this lane's pods: the container's root is read-only, writes only where listed
+        worker_container = pod["spec"]["containers"][0]
+        worker_container["securityContext"]["readOnlyRootFilesystem"] = True
+        worker_container["env"].append({"name": "GIT_CONFIG_GLOBAL", "value": READONLY_ROOT_GITCONFIG})
+        for i, path in enumerate(READONLY_ROOT_MOUNTS):
+            worker_container["volumeMounts"].append({"name": "rw%d" % i, "mountPath": path})
+            pod["spec"]["volumes"].append({"name": "rw%d" % i, "emptyDir": {}})
     bad = forbidden_pod_fields(pod)
     if bad:
         raise CloudError("refusing a pod spec with a forbidden field: %s" % ", ".join(bad), EXIT_USAGE)
