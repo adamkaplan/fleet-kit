@@ -760,6 +760,7 @@ def _launch(args, runner, now, reserve):
     if args.reports_to:
         check_report_to(engine, state, args, local_agents=found.agents)
     brief = H["read_brief"](args.brief_file, sys.stdin)
+    args.brief_text = brief
     for note in brief_warnings(args, repo, brief):   # before anything is created: one line each, then the launch goes on
         print("%s: %s" % (H["PROG"], note), file=sys.stderr)
     needs = next((ln for ln in str(brief).splitlines() if re.fullmatch(r"\s*NEEDS:\s*docker\s*", ln, re.I)), None)   # #1488: the XS/S/M shapes without --stack have no docker
