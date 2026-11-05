@@ -46,10 +46,12 @@ The **Holds** column is descriptive: only the layer numbers are enforced.
 | `header_cache.py` | 0 | the shared file cache of the ask header (Intent, Done-when, state, updated_at, parent): one file per issue, ages, bounds (#1520) | |
 | `impact_brief.py` | 0 | the impact brief: what a held change can do, built from the diff and the records only (pure, no clock, no network) (#1215) | |
 | `lost_worker.py` | 0 | a lost worker is told once to its lane and the Chief of Staff, with its cause (#1481) | |
+| `push_watch.py` | 0 | the lane that launched a cloud worker is told of its pushes and of its quiet after a push, from a read of the worker's branches (#1740) | |
 | `merged_labels.py` | 0 | a merged pull request does not keep its hold | |
 | `plan_approval.py` | 0 | the check of an approval sent as a message (pure) | |
 | `record_json.py` | 0 | the one bounded-depth parse of untrusted record JSON, shared by every reader of it (#1314) | |
 | `turn_start.py` | 0 | when each working session's current turn began, as the daemon first saw it, for `steer_after_minutes` (#1540) | |
+| `unconsumed_record.py` | 0 | what the daemon tried to steer and which reminder ids it delivered, for #1844 | |
 | `red_ci.py` | 0 | which check conclusions are red, green or say nothing, and the once-per-key memory (pure table) | |
 | `path_walk.py` | 0 | one walk up from a trusted path, shared by the cloud launcher and the installer | |
 | `repo_exclusion.py` | 0 | repositories the owner keeps out of the fleet's view are never watched or read | |
@@ -60,6 +62,7 @@ The **Holds** column is descriptive: only the layer numbers are enforced.
 | `cloud_relay.py` | 2 | the hub half of pod, hub and daemon calls for report, prove, verdict and gates: a bounded in-memory queue and the refusals | |
 | `cloud_client.py` | 1 | the sending end of a message or report through the cloud channel | |
 | `cloud_cluster.py` | 5 | the launcher process, the settings reader, the vault recovery, the cluster client and the tunnel of the cloud launch (#1647); a part of `cloud_worker.py` | |
+| `cloud_first_push.py` | 2 | the state line of a send to a cloud pod and the one `no first push` notice of a launch's checkpoint (#2057); a part of `cloud_worker.py` | |
 | `external_adapter.py` | 1 | a generic client for an outside system that holds decisions and work items | |
 | `agent_calls.py` | 2 | GitHub calls made from agents' shells, counted per account and per hour | |
 | `github_census.py` | 2 | the 5-minute sample line per account and the census of process kinds behind GitHub calls the records do not count (read only) | |
@@ -99,11 +102,13 @@ The **Holds** column is descriptive: only the layer numbers are enforced.
 | `delegated_clear.py` | 5 | the Chief of Staff's clear under the owner's standing order | |
 | `endpoint_send.py` | 5 | the send path's route to an agent that holds no pane | |
 | `heavy_slots.py` | 5 | CPU slots for heavy commands (`fleet-switchboard heavy`) | |
+| `heavy_slots_watch.py` | 5 | the watchdog and the orphan check of the heavy wrapper (#2034); a part of heavy_slots.py | |
+| `host_liveness.py` | 2 | the liveness of an orchestrator that a charter names by a host (alive, dead or unreachable), on demand only | |
 | `impact_floor.py` | 5 | the impact hold's deterministic floor and decision table | |
 | `impact_hold.py` | 5 | who may clear, hold or release an impact hold | |
 | `item_verdicts.py` | 5 | verdicts for a work item that has no pull request | |
 | `lanes.py` | 5 | move an ask from one orchestrator's charter to another's, with a handover | |
-| `launch_testers.py` | 5 | testers from the launch record | |
+| `launch_testers.py` | 5 | testers and reviewers from the launch record | |
 | `merge_gate.py` | 5 | the fleet's own merge queue | |
 | `orders_copy.py` | 5 | `orders copy`: a charter's standing orders copied to another charter | |
 | `path_suites.py` | 5 | which test suites exercise a changed path, and the local merge `heavy --changed` runs them on | |
@@ -124,18 +129,23 @@ The **Holds** column is descriptive: only the layer numbers are enforced.
 | `switchboard/pr_explain.py` | 5 | `pr-explain` and the checks of a held pull request body | |
 | `switchboard/sent_view.py` | 5 | `sent`: a sender's own recent messages with their sent, delivered and picked-up times | |
 | `switchboard/v2_transport.py` | 1 | the OpenCode v2 client and its HTTP transport | |
+| `tester_agent.py` | 0 | the list of agents a `launch --role tester` accepts, read from the `agents/roles.tsv` file of the checkout (#1963) | |
 | `switchboard/jev.py` | 1 | the Jev client: the decision model, the classifier and the policy judge's questions | |
+| `switchboard/stage_event.py` | 4 | the stage-event marker of a configured bot's comment: the first line only, validated and rebuilt (ask #1575) | |
 | `switchboard/audit.py` | 2 | the audit log | |
 | `switchboard/facts.py` | 4 | the fact sources: the world read into facts | |
 | `switchboard/decision.py` | 3 | the delivery decision: what is sent, to whom, and refused when too long | |
 | `switchboard/engine.py` | 3 | the engine: the single-instance lock and the pass | |
 | `switchboard/triage.py` | 4 | the triage pass (rule family T), shadow by default, written nothing to GitHub | |
+| `switchboard/cockpit.py` | 4 | the Cockpit feed: `cockpit.json` and `cockpit --json`, read-only | |
+| `switchboard/claims_note.py` | 4 | the notice of the scenarios a pull request's `CLAIMS:` line leaves out, once per body, from the held units | |
 | `switchboard/alert_labels.py` | 4 | an alert label on an open issue wakes that repository's orchestrator | |
 | `switchboard/link_scrub.py` | 4 | the signed-link scrub of a GitHub comment summary | |
 | `switchboard/handoff.py` | 5 | the handoff: a brief, not a fork | |
 | `switchboard/agents_verify.py` | 5 | `agents verify`: did the service register our agents as written | |
 | `switchboard/launch_model.py` | 5 | `launch --model` and `--reasoning`: the choice checked against the local service's model list before a session exists | |
 | `switchboard/bot_reviews.py` | 5 | the review bots at a pull request's head: the `gates` lines, the once-per-bot-and-head wake item | |
+| `switchboard/scratch_dir.py` | 5 | `scratch`: the caller's own scratch directory under the state directory, the size bound and the daemon's once-a-day audit line | |
 | `switchboard/secret_spans.py` | 5 | where the first secret-shaped match is: a fixed rule label and numbers, never the text | |
 | `switchboard/answer_delivery.py` | 5 | how an answer reaches the asker, behind the AnswerDelivery port | |
 | `switchboard/caches.py` | 5 | the bounded file cache and the audit tail a report reads | |
@@ -147,7 +157,7 @@ The **Holds** column is descriptive: only the layer numbers are enforced.
 
 ## The clear's closure follows the parts
 
-The delegated clear refuses a pull request that changes a definition of "the clear's closure" (`bin/delegated_clear.py`, `closure`). The closure is derived over the assembled daemon: the entry plus every part of `bin/fleet-switchboard.parts`, as one namespace. `tools/derive-closure --write` lists in `docs/review-laws/impact-matrix.json` each part that holds a closure definition OR a module-level binding or import the closure reads (`closure_files`), with the definitions as `module_roots[part]` (empty for a part that holds only a binding: listing the part is what refuses an edit of it); `--check` fails in both directions (a name or part missing, a name or part extra) and names the part and the name. A new part is in by derivation, not by a hand list. The manifest is read as data and fails closed (exit 1, the entry named, nothing written): an entry that is not a file, is not `switchboard/<name>.py` (`..`, a directory, an absolute path), is listed twice, a part file the manifest does not list (it is never assembled), and a closure definition defined in two files. `--write` replaces the matrix through a temp file and a rename, and never writes after a failed derivation. `tests/switchboard/test_closure.py` runs the check and pins two floors for the assembled closure from `closure_roots`: 395 definitions and 335 bindings (a falling count fails the test; a floor is raised only in its own commit, with the owner's sign-off), and keeps the entry's own `closure_roots` as they were. After moving a definition to another part, run `tools/derive-closure --write` in the same pull request. For a listed part, any top-level statement edit is refused, as for every module the clear loads.
+The delegated clear refuses a pull request that changes a definition of "the clear's closure" (`bin/delegated_clear.py`, `closure`). The closure is derived over the assembled daemon: the entry plus every part of `bin/fleet-switchboard.parts`, as one namespace. `tools/derive-closure --write` lists in `docs/review-laws/impact-matrix.json` each part that holds a closure definition OR a module-level binding or import the closure reads (`closure_files`), with the definitions as `module_roots[part]` (empty for a part that holds only a binding: listing the part is what refuses an edit of it); `--check` fails in both directions (a name or part missing, a name or part extra) and names the part and the name. A new part is in by derivation, not by a hand list. The manifest is read as data and fails closed (exit 1, the entry named, nothing written): an entry that is not a file, is not `switchboard/<name>.py` (`..`, a directory, an absolute path), is listed twice, a part file the manifest does not list (it is never assembled), and a closure definition defined in two files. `--write` replaces the matrix through a temp file and a rename, and never writes after a failed derivation. `tests/switchboard/test_closure.py` runs the check and checks the property, never a number: `--check` passes (the matrix equals what the code derives), the entry's closure and every binding it reads lie inside the assembled closure, and the entry's own `closure_roots` are as they were (the owner, 4 November 2026: tests never pin an exact count). After moving a definition to another part, run `tools/derive-closure --write` in the same pull request. For a listed part, any top-level statement edit is refused, as for every module the clear loads.
 
 ## Known violations
 
@@ -155,13 +165,13 @@ Kinds (the number is exact, except `size`, a ceiling with headroom: see rule 7):
 
 | From | To | Kind | Count | Why it is allowed today |
 |---|---|---|---|---|
-| `bin/test-switchboard` | `-` | size | 82,400 | the one test file; whole classes have moved to `tests/switchboard/test_cases_NN.py` (T1, T1b), and the lanes still add tests until the next split, so the row is the real count plus about 3,000 |
+| `bin/test-switchboard` | `-` | size | 79,500 | the one test file; whole classes have moved to `tests/switchboard/test_cases_NN.py` (T1, T1b), and the lanes still add tests until the next split, so the row is the real count plus about 3,000 |
 | `switchboard/alert_labels.py switchboard/triage.py` | `-` | cycle | 2 | moved together from the entry: each reads the other, one cycle to untangle |
 | `switchboard/answer_delivery.py switchboard/decisions_b.py` | `-` | cycle | 2 | moved together from the entry: each reads the other, one cycle to untangle |
 | `impact_hold.py` | `-` | size | 2,000 | the brief-bound clear (#1215) took it past the limit; to be split (ceiling = the test's own formula: 1510 lines, plus 500, rounded up to a multiple of 500) |
 | `delegated_clear.py` | `-` | size | 1,900 | the registrar lint lives with the clear it protects; a follow-up slice moves it to its own part and lowers the ceiling |
 | `switchboard/agents_verify.py` | `fleet-switchboard` | entry-import | 6 | the part relies on a standard-library module the entry imported; it gets its own import line |
-| `switchboard/agents_verify.py` | `fleet-switchboard` | namespace | 7 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
+| `switchboard/agents_verify.py` | `fleet-switchboard` | namespace | 8 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 | `switchboard/alert_labels.py` | `fleet-switchboard` | entry-import | 5 | the part relies on a standard-library module the entry imported; it gets its own import line |
 | `switchboard/alert_labels.py` | `fleet-switchboard` | namespace | 12 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 | `switchboard/alert_labels.py` | `launch_testers.py` | import | 1 | a name the part reads from another unit without a declared edge |
@@ -188,7 +198,9 @@ Kinds (the number is exact, except `size`, a ceiling with headroom: see rule 7):
 | `switchboard/launch_model.py` | `fleet-switchboard` | entry-import | 1 | the part relies on a standard-library module the entry imported; it gets its own import line |
 | `switchboard/launch_model.py` | `fleet-switchboard` | namespace | 1 | one namespace: the part reads the entry's `LaunchError` and `_one_line` |
 | `switchboard/bot_reviews.py` | `fleet-switchboard` | entry-import | 1 | the part relies on a standard-library module the entry imported; it gets its own import line |
+| `switchboard/scratch_dir.py` | `fleet-switchboard` | entry-import | 5 | the part relies on a standard-library module the entry imported; it gets its own import line |
 | `switchboard/bot_reviews.py` | `fleet-switchboard` | namespace | 4 | one namespace: the part reads the entry's `_is_bot`, `_login`, `_id` and `GitHubItem` |
+| `switchboard/scratch_dir.py` | `fleet-switchboard` | namespace | 10 | one namespace: the part reads the entry's names (`build_engine`, `identify_caller`, `agent_scratch_dir`, `_write_small`); its rewiring gives it imports |
 | `switchboard/secret_spans.py` | `fleet-switchboard` | namespace | 2 | one namespace: the finder reads the entry's `_SECRET_PATTERNS` and `redact_command_text` (it must see the very patterns the net applies) |
 | `switchboard/handoff.py` | `fleet-switchboard` | namespace | 48 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 | `switchboard/jev.py` | `fleet-switchboard` | entry-import | 6 | the part relies on a standard-library module the entry imported; it gets its own import line |
@@ -197,6 +209,12 @@ Kinds (the number is exact, except `size`, a ceiling with headroom: see rule 7):
 | `switchboard/triage.py` | `fleet-switchboard` | entry-import | 7 | the part relies on a standard-library module the entry imported; it gets its own import line |
 | `switchboard/triage.py` | `fleet-switchboard` | namespace | 34 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 | `switchboard/triage.py` | `switchboard/decisions_a.py` | namespace | 3 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
+| `switchboard/cockpit.py` | `fleet-switchboard` | entry-import | 8 | the part relies on a standard-library module the entry imported; it gets its own import line |
+| `switchboard/cockpit.py` | `fleet-switchboard` | namespace | 8 | one namespace: the part reads the entry's names (the decision file reader, the state writer, the registry); its rewiring gives it imports |
+| `switchboard/claims_note.py` | `fleet-switchboard` | entry-import | 3 | the part relies on a standard-library module the entry imported; it gets its own import line |
+| `switchboard/claims_note.py` | `fleet-switchboard` | namespace | 14 | one namespace: the part reads the entry's names (the pull request records, the plan link and the plan facts) |
+| `switchboard/claims_note.py` | `plan_check.py` | import | 1 | a name the part reads from another unit without a declared edge |
+| `switchboard/claims_note.py` | `switchboard/plan_input.py` | namespace | 1 | one namespace: the part reads `parse_plan_source` |
 | `switchboard/v2_transport.py` | `fleet-switchboard` | entry-import | 15 | the part relies on a standard-library module the entry imported; it gets its own import line |
 | `switchboard/v2_transport.py` | `fleet-switchboard` | namespace | 2 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 | `fleet-switchboard` | `-` | size | 27,500 | the entry still holds every section not yet moved to a part; each move slice lowers the ceiling |
@@ -217,11 +235,13 @@ Kinds (the number is exact, except `size`, a ceiling with headroom: see rule 7):
 | `switchboard/judge.py` | `fleet-switchboard` | namespace | 12 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 | `switchboard/judge_request.py` | `fleet-switchboard` | namespace | 24 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 | `switchboard/plan_review.py` | `fleet-switchboard` | namespace | 25 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
-| `switchboard/plan_input.py` | `fleet-switchboard` | namespace | 13 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
+| `switchboard/plan_input.py` | `fleet-switchboard` | namespace | 14 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 | `switchboard/review_laws_install.py` | `fleet-switchboard` | namespace | 5 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 | `switchboard/pr_explain.py` | `fleet-switchboard` | namespace | 10 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 | `switchboard/sent_view.py` | `fleet-switchboard` | namespace | 8 | one namespace: the part reads the entry's names (`build_engine`, `identify_caller`, `SentLedger`, `READ_LIMIT`, `_created`); its rewiring gives it imports |
 | `switchboard/reminders.py` | `fleet-switchboard` | namespace | 26 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports; two reads of untrusted JSON now go through `load_module("record_json")`, one name of the entry more (#1314); the delivery-time judgement of late and stale alerts reads one name of the entry more (#1402) |
+| `switchboard/stage_event.py` | `fleet-switchboard` | entry-import | 4 | the part relies on a standard-library module the entry imported; it gets its own import line |
+| `switchboard/stage_event.py` | `fleet-switchboard` | namespace | 4 | one namespace: the part reads the entry's names (`load_module`, the config checks, `datetime`); it gets its own imports |
 
 ## Dynamic imports not followed
 
@@ -259,6 +279,7 @@ A site is listed by the function it sits in and its kind, with a count: `import(
 | `cloud_worker.py` | `_load_cluster:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
 | `cloud_worker.py` | `_load_cluster:sys.modules` | 1 | uses `sys` beyond its plain attributes |
 | `cloud_worker.py` | `_registry_note:load_module(string)` | 1 | names a loading builtin by a string (a name in a list counts: over-counting by design) |
+| `cloud_worker.py` | `_first_push:load_module(string)` | 1 | names a loading builtin by a string (a name in a list counts: over-counting by design) |
 | `cloud_worker.py` | `_retired:load_module(string)` | 1 | names a loading builtin by a string (a name in a list counts: over-counting by design) |
 | `cloud_worker.py` | `bind:sys.modules` | 1 | uses `sys` beyond its plain attributes |
 | `cloud_worker.py` | `model_entry:exec_module` | 1 | uses an identifier of the import machinery (exec_module) |
@@ -311,6 +332,9 @@ A site is listed by the function it sits in and its kind, with a count: `import(
 | `fleet-switchboard` | `lost_worker_tick:exec_module` | 1 | uses an identifier of the import machinery (exec_module) |
 | `fleet-switchboard` | `lost_worker_tick:import(importlib)` | 1 | imports a module that can load code by name, or one of its identifiers |
 | `fleet-switchboard` | `lost_worker_tick:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
+| `fleet-switchboard` | `push_watch_tick:exec_module` | 1 | uses an identifier of the import machinery (exec_module) |
+| `fleet-switchboard` | `push_watch_tick:import(importlib)` | 1 | imports a module that can load code by name, or one of its identifiers |
+| `fleet-switchboard` | `push_watch_tick:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
 | `fleet-switchboard` | `validate_app_config:exec_module` | 1 | uses an identifier of the import machinery (exec_module) |
 | `fleet-switchboard` | `validate_app_config:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
 | `fleet-switchboard` | `validate_hold_labels_config:exec_module` | 1 | uses an identifier of the import machinery (exec_module) |
@@ -328,3 +352,6 @@ A site is listed by the function it sits in and its kind, with a count: `import(
 | `header_cache.py` | `<module>:exec_module` | 1 | uses an identifier of the import machinery (exec_module) |
 | `header_cache.py` | `<module>:import(importlib)` | 1 | imports a module that can load code by name, or one of its identifiers |
 | `header_cache.py` | `<module>:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
+| `heavy_slots.py` | `_load_part:exec_module` | 1 | uses an identifier of the import machinery (exec_module) |
+| `heavy_slots.py` | `_load_part:import(importlib)` | 1 | imports a module that can load code by name, or one of its identifiers |
+| `heavy_slots.py` | `_load_part:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
