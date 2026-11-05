@@ -1,5 +1,6 @@
 """Ask #1480: every stop the launcher makes of its own accord carries `cause` (idle, hard, pod_gone, pod_failed); a stop by a person's call carries none.
 The vanished-pod check of the reaper's pass writes ONE stop line per vanished worker. Offline: the fake cluster of test_cloud_worker."""
+import pathlib
 import json
 import os
 import sys
@@ -249,7 +250,7 @@ class Cause(tcw.Base):
 
     def test_s19_a_mutant_without_the_persistent_condition_is_caught(self):
         mod = self.mutant('if rec.get("persistent") is True:\n                    continue', 'if False:\n                    continue')
-        self.assertNotEqual(open(cw.__file__).read(), open(cw.__file__).read().replace('if rec.get("persistent") is True:\n                    continue', 'if False:\n                    continue'), "the mutant source must differ from the real source")
+        self.assertNotEqual(pathlib.Path(cw.__file__).read_text(), pathlib.Path(cw.__file__).read_text().replace('if rec.get("persistent") is True:\n                    continue', 'if False:\n                    continue'), "the mutant source must differ from the real source")
         self.vanish()
         self.mark_persistent("coder7")
         for _ in range(3):

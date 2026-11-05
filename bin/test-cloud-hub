@@ -834,6 +834,12 @@ USERS_NS = {"tok-cw": SA + "cw:agent-a", "tok-old": SA + "fleet-agents:agent-a",
 BAD_NAMESPACES = ("", "Cw", "c.w", "c:w", "cw\n", "a" * 64, "a/b", "cw/evil")
 
 
+WORKER_COPY_NAMES = tuple(
+    row.split("\t")[0][len("bin/"):]
+    for row in (BIN.parent / "cloud" / "worker" / "copies.tsv").read_text().splitlines()
+    if row.split("\t")[0].startswith("bin/") and row.split("\t")[1].startswith("cloud/worker/bin/"))
+
+
 class TestNamespaceSetting(unittest.TestCase):
     def killed(self, module, check):
         try:
@@ -929,7 +935,7 @@ class TestNamespaceSetting(unittest.TestCase):
 
     def test_old_name_is_nowhere_in_the_hub_source(self):
         old = "fleet-" + "agents"
-        for name in ("cloud_hub.py", "cloud_channel.py", "cloud_channel_server.py"):
+        for name in WORKER_COPY_NAMES:
             for base in (BIN, BIN.parent / "cloud" / "worker" / "bin"):
                 self.assertNotIn(old, (base / name).read_text(), name)
         self.assertEqual(SOURCE.count("environ.get(NAMESPACE_ENV)"), 1)
@@ -944,8 +950,11 @@ class TestNamespaceSetting(unittest.TestCase):
         self.assertRegex(quick, r"FLEET_CLOUD_AGENT_NAMESPACE.{0,10}\(value `cw`")
 
     def test_worker_copies_match_bin(self):
-        for name in ("cloud_hub.py", "cloud_channel.py", "cloud_channel_server.py"):
-            self.assertEqual((BIN / name).read_text(), (BIN.parent / "cloud" / "worker" / "bin" / name).read_text(), name)
+        for line in (BIN.parent / "cloud" / "worker" / "copies.tsv").read_text().splitlines():
+            source, copy = line.split("\t")
+            if source.startswith("bin/") and copy.startswith("cloud/worker/bin/"):
+                name = source[len("bin/"):]
+                self.assertEqual((BIN / name).read_text(), (BIN.parent / copy).read_text(), name)
 
 
 AGE_EXPR = 'return json.loads(raw.decode("utf-8")), max(0, int(delta))'

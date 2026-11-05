@@ -6,6 +6,7 @@ Three cases the end hook and the stop tell apart:
   (b) a checkout whose push fails (rejected push, expired token, conflict): the pod is KEPT and the stop says why;
   (c) nothing unpushed or a good push: as before (covered by test_cloud_worker.py).
 Offline: the fake kubectl; a mutant is the launcher's hook reader patched in memory, never a file."""
+import pathlib
 import json
 import os
 import sys
@@ -565,7 +566,7 @@ class StopNoCheckout(base.Base):
         os.makedirs(os.path.dirname(mut))
         with open(mut, "w", encoding="utf-8") as f:
             f.write(src.replace(old, new))
-        self.assertEqual(open(mut, encoding="utf-8").read().count(new), 1)
+        self.assertEqual(pathlib.Path(mut).read_text(encoding="utf-8").count(new), 1)
         mut_fails = head_passes = 0
         for name in ("A2", "E"):
             d = self.workspace_state(name)
