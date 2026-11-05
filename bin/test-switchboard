@@ -67126,6 +67126,7 @@ TestWholeReadOfALargePullRequest = _changed_file_pages.load()
 
 _rc = importlib.import_module("test_reclaim_cap"); _rc.HOST = sys.modules[__name__]; TestReclaimCap = _rc.build()   # #1737
 _lm = importlib.import_module("test_launch_model"); _lm.HOST = sys.modules[__name__]; TestLaunchModel = _lm.build(); TestLaunchModelCloud = _lm.build_cloud()   # #1642
+_il = importlib.import_module("test_issue_line"); _il.HOST = sys.modules[__name__]; TestIssueLine = _il.build()   # #1751
 TestDaemonDeadVerdict, TestDaemonDeadVerdictMutants = (_dd := importlib.import_module("test_dead_verdict_daemon")).TestDaemonDeadVerdict, _dd.TestDaemonDeadVerdictMutants   # #1884
 TestPaneUndecidable = _dd.TestPaneUndecidable   # #1884 PC-6 / S11
 TestUndecidableRobustness = _dd.TestUndecidableRobustness   # #1884 PC-9 / S14
