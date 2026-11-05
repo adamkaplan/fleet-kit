@@ -63,8 +63,8 @@ def _fleet_parts(after=False):
     cut = paths.index(here) if here in paths else len(paths)
     for path in (paths[cut + 1:] if after else paths[:cut]):
         try:
-            with open(path) as handle:
-                code = compile(handle.read(), path, "exec")
+            import importlib.machinery   # #2230: the same source, compiled once and kept beside it in __pycache__ (checked against the file's time and size), not at every start
+            code = importlib.machinery.SourceFileLoader("fleet_part", path).get_code("fleet_part")
         except OSError:
             sys.exit("fleet-switchboard: part file not found: %s" % path)
         exec(code, globals())
