@@ -109,7 +109,7 @@ tf = os.environ.get("CW_CLOUD_TOKEN_FILE")
 login = {"command": command, "argv": argv, "env": dict(os.environ), "token_ok": bool(tf) and hashlib.sha256(open(tf).read().encode()).hexdigest() == os.environ.get("STUB_TOKEN_SHA"),
          "token_mode": oct(os.stat(tf).st_mode & 0o777) if tf else None}
 open(os.environ["STUB_DIR"] + "/login.log", "a").write(json.dumps(login) + "\\n")
-CREATE_OPTIONS = ("--repo", "--branch", "--idle", "--hard", "--max-hard", "--shape", "--image", "--stack", "--wait", "--pull-secret", "--run-secret-fd", "--run-id", "--password-fd", "--json")   # what the launcher's create knows (main, fb4b9f2)
+CREATE_OPTIONS = ("--repo", "--branch", "--idle", "--hard", "--max-hard", "--shape", "--image", "--stack", "--wait", "--pull-secret", "--run-secret-fd", "--no-commit", "--run-id", "--password-fd", "--json")   # what the launcher's create knows (main, fb4b9f2)
 if command == "create":
     unknown = [a for a in argv[2:] if a.startswith("--") and a not in CREATE_OPTIONS]
     if unknown:
@@ -1648,6 +1648,17 @@ class TestLaunchStack(Base):
         self.assertEqual(code, 0, err)
         self.assertNotIn("--stack", self.create_argv())
         self.assertEqual(self.create_argv()[self.create_argv().index("--shape") + 1], "M")
+
+    def test_1771_the_create_call_carries_no_commit_for_the_flag_and_the_two_roles_only(self):
+        base = json.loads((self.FIXTURES / "launch-create-argv.json").read_text())
+        for extra in (("--no-commit",), ("--role", "tester"), ("--role", "reviewer"), ()):
+            with self.subTest(extra=extra):
+                self.state_clean()
+                code, out, err = self.launch_with("--cloud", *extra)
+                self.assertEqual(code, 0, err)
+                argv = self.create_argv()
+                self.assertEqual(argv.count("--no-commit"), 1 if extra else 0)
+                self.assertEqual([x for x in argv if x != "--no-commit"], base)   # the other options are identical
 
     def test_s9_the_fake_launcher_refuses_an_option_it_does_not_know(self):
         text = self.stub.read_text().replace('"--stack", ', "")

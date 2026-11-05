@@ -2708,6 +2708,7 @@ def render_pod(a, worker, name, now, hard, env, run_names=()):
                         "cw/idle-seconds": e["CW_IDLE_SECONDS"], "cw/shape": a.shape,
                         "cw/max-hard": iso(now + dt.timedelta(seconds=parse_duration(a.max_hard or DEFAULT_MAX_HARD))),
                         **({"cw/run-id": a.run_id} if getattr(a, "run_id", None) else {}),
+                        **({"cw/no-commit": "true"} if getattr(a, "no_commit", False) else {}),   # launched NOT to commit (a measure or a read): no wip note
                         **({"cw/role": agent} if agent == "orchestrator" else {})}},   # a worker pod's spec is byte-for-byte what it was: no annotation means worker
         "spec": {"restartPolicy": "Never", "activeDeadlineSeconds": pod_deadline_floor(a.max_hard),
                  "terminationGracePeriodSeconds": POD_TERMINATION_GRACE_SECONDS,
@@ -4327,8 +4328,14 @@ class Launcher:
                 worker, name = ann(pod, "worker"), pod["metadata"]["name"]
                 if (pod.get("status") or {}).get("phase") != "Running" or not NAME_RE.fullmatch(worker or ""):
                     continue
+                no_commit_mark = ann(pod, "no-commit")
+                if no_commit_mark == "true":
+                    continue   # launched not to commit: no note, no annotation, no audit line
+                no_commit_unreadable = no_commit_mark is not None   # present but not the text true: treated as unmarked
                 if not wip_note_due(parse_iso(ann(pod, "started")), now, ann(pod, "wip-note")):
                     continue
+                if no_commit_unreadable:   # the note below sets the wip-note annotation, so this line is written once
+                    self.audit(worker, "pod/" + name, "no-commit-unreadable", 0.0, True, "the cw/no-commit annotation is not the text true; the pod is treated as unmarked")
                 self.kube.annotate(name, (pod.get("metadata") or {}).get("uid"), **{WIP_NOTE_MARK: "sent"})
                 self.send_note(name, wip_note(worker))
                 self.audit(worker, "pod/" + name, "wip-note", self._cost_or_zero(pod), True, "")
@@ -5073,6 +5080,7 @@ def build_parser():
                    help="a pod for a worker that runs a nested Docker stack: the Sysbox runtime class, its own user namespace, the pool's node label; off by default (the default pod is unchanged)")
     c.add_argument("--stack-model-secret", metavar="NAME", help="with --stack: the NAME of the vault secret whose value arrives as the run secret %s (audit: the name and 'delivered'); never a value" % STACK_MODEL_KEY)
     c.add_argument("--agent", help="worker (default) or orchestrator: the agent the pod runs (CW_AGENT); any other value is refused before anything is made")
+    c.add_argument("--no-commit", action="store_true", help="this pod is launched NOT to commit (a measure or a read): the launcher never tells it to push its work")
     c.add_argument("--boss", help="with --agent orchestrator: the name of its boss (FLEET_BOSS)")
     c.add_argument("--persistent", action="store_true",
                    help="with --agent orchestrator and the per-run git-token Secret: an always-on orchestrator as ONE StatefulSet (restart always, no deadline, no idle limit); ended only by an explicit stop; refused for a worker or a stack launch")
