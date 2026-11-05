@@ -1,6 +1,7 @@
 bin/test-cloud-cost-report
 bin/test-cloud-retired
 cloud/launcher/tests/test_app_token.py
+cloud/launcher/tests/test_app_token_route.py
 cloud/launcher/tests/test_chain_list.py
 cloud/launcher/tests/test_chain_time.py
 cloud/launcher/tests/test_cloud_allowlist.py
@@ -35,9 +36,11 @@ cloud/launcher/tests/test_cw_names.py
 cloud/launcher/tests/test_docs_preflight_modes.py
 cloud/launcher/tests/test_driver.py
 cloud/launcher/tests/test_end_hook_nothing_to_push.py
+cloud/launcher/tests/test_failed_pod_record.py
 cloud/launcher/tests/test_fixture_root.py
 cloud/launcher/tests/test_git_token_renewal.py
 cloud/launcher/tests/test_git_token_retry.py
+cloud/launcher/tests/test_hub_entry_keys.py
 cloud/launcher/tests/test_hub_restart_client.py
 cloud/launcher/tests/test_hub_safe_to_evict.py
 cloud/launcher/tests/test_idle_default_note.py
@@ -64,6 +67,8 @@ cloud/launcher/tests/test_reaper_renewal.py
 cloud/launcher/tests/test_reaper_restart.py
 cloud/launcher/tests/test_reaper_row.py
 cloud/launcher/tests/test_render_namespace.py
+cloud/launcher/tests/test_repo_min_shape.py
+cloud/launcher/tests/test_retire_gone_exact.py
 cloud/launcher/tests/test_retire_gone_pod.py
 cloud/launcher/tests/test_run_record.py
 cloud/launcher/tests/test_safe_to_evict.py
@@ -77,6 +82,7 @@ cloud/launcher/tests/test_stop_no_checkout.py
 cloud/launcher/tests/test_stub_cleanup.py
 cloud/launcher/tests/test_token_at_limit.py
 cloud/launcher/tests/test_token_read_at_call.py
+cloud/launcher/tests/test_vault_block.py
 cloud/launcher/tests/test_vault_check_pins.py
 cloud/launcher/tests/test_worker_copies.py
 cloud/worker/tests/test_activity.py

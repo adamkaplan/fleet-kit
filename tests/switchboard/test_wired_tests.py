@@ -241,7 +241,7 @@ class TestEveryTestFileIsWired(unittest.TestCase):
             self.assertIn(item, lines[0])
 
     def test_s8_the_loader_line_binds_by_explicit_name(self):
-        lines = [l for l in RUNNER.read_text().splitlines() if "TestMacosReader" in l]
+        lines = [l for l in RUNNER.read_text().splitlines() if "TestMacosReader" in l and l.startswith("TestMacosReader")]
         self.assertEqual(lines, ["TestMacosReader = _census.TestMacosReader   # #1847"])
         self.assertNotIn("globals", lines[0])
 
