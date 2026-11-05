@@ -18186,6 +18186,59 @@ def _diff_lines(runner, git_dir, a, b, sign):
     return found
 
 
+def _removed_lines(runner, git_dir, a, b):
+    """[(file, old line number, text, replaced)] of the '-' lines of `git diff -U0 a b`; `replaced` is True when the hunk also adds a line (a modification of the tip line, not a plain removal)."""
+    out, name, old, hunk, found = _git_out(runner, git_dir, ["diff", "-U0", "--no-renames", "--no-color", a, b]), None, 0, [], []
+    def flush():
+        added = any(h is None for h in hunk)
+        found.extend((h[0], h[1], h[2], added) for h in hunk if h is not None)
+        del hunk[:]
+    for line in out.split("\n") + ["@@ end"]:
+        if line.startswith("@@"):
+            flush()
+            m = re.match(r"@@ -(\d+)", line)
+            old = int(m.group(1)) if m else 0
+        elif line.startswith("+++ "):
+            flush()
+            name = line[4:][2:] if line[4:].startswith("b/") else None if line[4:] == "/dev/null" else line[4:]
+        elif line.startswith("--- "):
+            flush()
+            if line[4:] != "/dev/null":
+                name = line[4:][2:] if line[4:].startswith("a/") else line[4:]
+        elif line.startswith("-") and name:
+            hunk.append((name, old, line[1:]))
+            old += 1
+        elif line.startswith("+"):
+            hunk.append(None)
+    return found
+
+
+def _fork_lines(runner, git_dir, fork, tip, cache):
+    """{file: [(old start, old count, new start, new count)]} of `git diff -U0 fork tip`: what the tip did since `fork`."""
+    if fork not in cache:
+        out, name, hunks = _git_out(runner, git_dir, ["diff", "-U0", "--no-renames", "--no-color", fork, tip]), None, {}
+        for line in out.split("\n"):
+            if line.startswith("+++ "):
+                name = line[4:][2:] if line[4:].startswith("b/") else None
+            elif line.startswith("@@") and name:
+                m = re.match(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))?", line)
+                if m:
+                    hunks.setdefault(name, []).append((int(m.group(1)), int(m.group(2) or 1), int(m.group(3)), int(m.group(4) or 1)))
+        cache[fork] = hunks
+    return cache[fork]
+
+
+def _tip_line_in_fork(hunks, number):
+    """The line numbers at the fork that tip line `number` came from: itself shifted by the tip's earlier hunks, or the old range of the tip hunk that rewrote it."""
+    shift = 0
+    for os_, oc, ns, nc in hunks:
+        if nc > 0 and ns <= number < ns + nc:
+            return set(range(os_, os_ + oc))
+        if (nc > 0 and ns + nc <= number) or (nc == 0 and ns < number):
+            shift += nc - oc
+    return {number - shift}
+
+
 class MergeDropsConflict(Exception):
     pass
 
@@ -18203,10 +18256,29 @@ def merge_drops(runner, git_dir, tip, head):
     own = collections.Counter()   # the PR's own removals (three-dot), per (file, stripped line); from the branch's non-merge commits, as the three-dot diff is empty once the tip is merged in
     for commit in _git_out(runner, git_dir, ["rev-list", "--no-merges", "%s..%s" % (tip, head)]).split():
         own.update((f, t.strip()) for f, _, t in _diff_lines(runner, git_dir, commit + "^", commit, "-"))
+    tip_sha = _git_out(runner, git_dir, ["rev-parse", tip]).strip()
+    # the PR's own three-dot (a modified line is a removal and an addition): from the head and from the branch side (first parent) of each merge in tip..head, whose merge-base with the tip
+    # is where that side left it; so a removal made while porting through a merge resolution is its own, a line the PR modified before it merged the tip in is its own, and the tip having moved since changes nothing.
+    # A side that already holds the whole tip has no such base (its diff would hold real drops): skipped.
+    own_lines, fork_cache = [], {}   # per side: (fork, {file: set of fork line numbers the PR's own side removed or rewrote})
+    sides = [head] + [m + "^1" for m in _git_out(runner, git_dir, ["rev-list", "--merges", "%s..%s" % (tip, head)]).split()]
+    for side in sides:
+        fork = _git_out(runner, git_dir, ["merge-base", tip, side]).strip()
+        if fork and fork != tip_sha and fork != _git_out(runner, git_dir, ["rev-parse", side]).strip():
+            removed = _diff_lines(runner, git_dir, fork, side, "-")
+            own = own | collections.Counter((f, t.strip()) for f, _, t in removed)   # per-key maximum
+            at = {}
+            for f, n, _ in removed:
+                at.setdefault(f, set()).add(n)
+            own_lines.append((fork, at))
     dropped = []
-    for d in _diff_lines(runner, git_dir, tip, tree, "-"):   # the tip's lines the merge result lacks
-        key = (d[0], d[2].strip())
-        if own[key] > 0:
+    for f, n, t, replaced in _removed_lines(runner, git_dir, tip, tree):   # the tip's lines the merge result lacks
+        d, key = (f, n, t), (f, t.strip())
+        if replaced:   # a replacement hunk is the PR's own only when its own side changed THAT tip line (by position at the fork); otherwise the removed tip text is dropped
+            if any(_tip_line_in_fork(_fork_lines(runner, git_dir, fork, tip, fork_cache).get(f, []), n) & at.get(f, set()) for fork, at in own_lines):
+                continue
+            dropped.append(d)
+        elif own[key] > 0:
             own[key] -= 1
         else:
             dropped.append(d)
@@ -18279,7 +18351,7 @@ def merge_drops_refusal(runner, config, repo, number, state):
     if not bad:
         return None
     return "merge of %s#%d refused: its head drops %d tip hunk(s): %s; keep them, or name each in a merge commit message (`fleet-switchboard merge-drops`)" % (
-        repo, number, len(bad), "; ".join(merge_drops_text(h) for h in bad[:3]))
+        repo, number, len(bad), "; ".join(merge_drops_text(h) for h in bad))
 
 
 ANCESTOR_DEPTH = 25
