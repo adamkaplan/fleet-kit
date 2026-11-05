@@ -75,10 +75,21 @@ class S18Row(CopyRun):
 
 
 class S21Entries(CopyRun):
+    def with_integration_entries(self, src):
+        """The copy's exempt table also names every other pre-creation raise of the launcher that integration added (the stack model secret
+        read failure, #1435): a key the table lacks is added to the copy only, so the control isolates the two persistent entries."""
+        head = "    CREATED_EXEMPT = {\n"
+        self.assertEqual(src.count(head), 1)
+        key = "'the stack model secret %s coul'"
+        if key in src:
+            return src
+        return src.replace(head, head + "        %s: '%s',\n" % (key, RESULT))
+
     def test_s21_the_control_passes_and_the_copy_without_the_two_entries_names_the_stray_raise(self):
         src = self.source()
         for line in ENTRY_LINES:
             self.assertEqual(src.count(line), 1)
+        src = self.with_integration_entries(src)
         code, out = self.run_copy(src, CREATED)
         self.assertEqual(code, 0, out[-600:])   # the control: 1 of 1
         mutated = src
