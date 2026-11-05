@@ -38,6 +38,7 @@ FAKE_SB = '#!/bin/sh\nif [ "$1" = whoami ]; then\n  echo \'{"name": "alice-bot",
 OLD_EXAMPLE = {"issue": "1", "pr": "1"}
 API_EXAMPLES = {"issue-comments": "repos/o/r/issues/1/comments", "issue-comment": "repos/o/r/issues/comments/9",
                 "review-comments": "repos/o/r/pulls/1/comments", "reviews": "repos/o/r/pulls/1/reviews"}
+API_EXAMPLES.update({"pr-review-comment": "repos/o/r/pulls/comments/5", "pr-review-reply": "repos/o/r/pulls/1/comments/5/replies"})   # #1696
 
 
 def pairs(source, name):
@@ -148,7 +149,7 @@ class TestGhShimSign(unittest.TestCase):
         self.assertEqual(forms_without_an_example(self.source), [])
         self.assertEqual(len(pairs(self.source, "SIGNED_COMMANDS")), 5)
         self.assertEqual(len(pairs(self.source, "CLOSE_COMMANDS")), 2)
-        self.assertEqual(len(pairs(self.source, "SIGNED_API")), 4)
+        self.assertEqual(len(pairs(self.source, "SIGNED_API")), 6)
 
     def test_a_new_form_spelled_another_way_makes_the_completeness_check_fail(self):
         planted = self.source.replace("CLOSE_COMMANDS = {", "CLOSE_COMMANDS = set([(\"gist\", \"close\")]) | {", 1)
@@ -224,7 +225,7 @@ class TestGhShimSign(unittest.TestCase):
                  ("api", "repos/o/r/pulls/1/reviews", "-X", "GET"),
                  ("api", "repos/o/r/issues/1", "-X", "PATCH", "-f", "body=x"), ("api", "repos/o/r/issues/1/labels", "-f", "body=x"),
                  ("api", "repos/o/r/issues/1/comments", "-f", "event=x"), ("api", "repos/o/r/issues/1/comments", "-X", "DELETE"),
-                 ("api", "repos/o/r/pulls/1/reviews", "--input", "x.json"), ("api", "repos/o/r/pulls/1/reviews", "--input=x.json", "-f", "body=x"),
+                 # #1696: --input on a comment or review endpoint is no longer passed through (it is signed or refused: test_gh_shim_sign_input.py)
                  ("api", "repos/o/r/issues/1/comments", "-X", "GET", "-f", "body=x"),
                  ("issue", "view", "1"), ("pr", "list"), ("issue", "close", "1"), ("pr", "close", "1", "--delete-branch"),
                  ("issue", "comment", "1", "--editor"), ("issue", "close", "1", "--comment", "")]

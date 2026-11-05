@@ -151,8 +151,9 @@ def message_text(worker, label, when, pushed, record_name, kept=False, failure=N
     return text
 
 
-def scan_audit(audit_file, state_file, cloud_dir, last_reports, send, parse, audit=None):
-    """One pass. `send(recipient, text)` is the daemon's own send path. Returns [(recipient, text)] handed to it."""
+def scan_audit(audit_file, state_file, cloud_dir, last_reports, send, parse, audit=None, last_text=None):
+    """One pass. `send(recipient, text)` is the daemon's own send path. Returns [(recipient, text)] handed to it. `last_text(directory, worker)` (ask #1788)
+    gives (block, None) or (None, why): the boss's copy, not the Chief of Staff's, ends with the pod's last text, framed as untrusted."""
     try:
         size = os.stat(str(audit_file)).st_size
     except OSError:
@@ -204,7 +205,14 @@ def scan_audit(audit_file, state_file, cloud_dir, last_reports, send, parse, aud
         text += " " + pr_line(raw_dir(reason), parse) + "."
         keys.append(key)
         to_list = [CHIEF] + ([boss] if isinstance(boss, str) and AGENT_NAME.fullmatch(boss) and boss != CHIEF else [])
-        out.extend((to, text, worker, label) for to in reversed(to_list))
+        boss_text = text
+        if len(to_list) > 1 and last_text is not None:
+            try:
+                block, why = last_text(raw_dir(reason) if name else "", worker)
+            except Exception as err:
+                block, why = None, type(err).__name__
+            boss_text = text + "\n" + (block if block else "last text not read: %s" % plain((why or "unknown").replace(" ", "_"), 120))
+        out.extend((to, text if to == CHIEF else boss_text, worker, label) for to in reversed(to_list))
     save_state(state_file, offset + cut, keys)
     failed = set()
     for to, text, worker, label in out:
