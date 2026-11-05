@@ -115,6 +115,14 @@ def clip(text, limit=FIELD_LIMIT):
     return text if len(text) <= limit else text[:limit - 1] + "\u2026"
 
 
+def bounded_text(text, limit, what):
+    """`text` with white space collapsed as `clip` does; over `limit` it is REFUSED (LedgerError), never cut."""
+    text = " ".join(str(text or "").split())
+    if len(text) > limit:
+        raise LedgerError("the %s is %d characters and the limit is %d: nothing was recorded; put the long text in one comment or a file and give the link, or shorten it" % (what, len(text), limit))
+    return text
+
+
 def read_ledger(state_dir):
     """(entries, problem): every line parsed, and None when the chain holds, else a sentence naming the first break
     (the entries before it are still returned: they are intact, the ones from the break on are not trusted)."""
@@ -980,9 +988,7 @@ def evaluate_gates(plan, entries, ledger_problem, facts, pr, now=None):
             row.update(status="ok" if ok else "missing", detail=detail, missing=[] if ok else [detail])
         elif gid == "G6":
             floor = (facts or {}).get("floor")   # the impact floor read fresh for this head (#488); absent = not read, the label alone
-            if (facts or {}).get("captain"):
-                row.update(status="waiting", missing=["held for the owner (MERGE: captain): the owner decides, through cos"])
-            elif isinstance(floor, dict) and (floor.get("unreadable") or floor.get("decision") is None):
+            if isinstance(floor, dict) and (floor.get("unreadable") or floor.get("decision") is None):
                 row.update(status="waiting", missing=["the impact floor could not be read for this head (%s): the owner decides, through cos"
                                                       % (floor.get("unreadable") or "no decision")])
             elif carries and isinstance(floor, dict) and floor.get("clear_head") and floor.get("clear_head") != head and not floor.get("cleared") and floor.get("decision") == "hold":
@@ -996,6 +1002,13 @@ def evaluate_gates(plan, entries, ledger_problem, facts, pr, now=None):
             elif isinstance(floor, dict) and floor.get("decision") == "hold" and not floor.get("cleared"):
                 row.update(status="waiting", missing=["held for the owner (impact floor, read at this head): %s; the owner clears it for this head"
                                                       % ("; ".join(floor.get("reasons") or []) or "hold")])
+            # FAIL MODE (#1119): the new wording ONLY when the floor was read and positively says not held, with no hold label. A floor that is
+            # absent or unreadable (handled above or not a dict) and any hold label keep the old behaviour: waiting for the owner.
+            elif (facts or {}).get("captain") and "marker-without-label" in ((facts or {}).get("captain_findings") or ()) \
+                    and isinstance(floor, dict) and not (facts or {}).get("holds"):   # the floor read above says not held
+                row.update(status="ok", detail="a marker without a hold: set MERGE: automatic", missing=[])
+            elif (facts or {}).get("captain"):
+                row.update(status="waiting", missing=["held for the owner (MERGE: captain): the owner decides, through cos"])
             else:
                 row.update(status="ok", detail="not a held PR")
         elif gid == "G6b":

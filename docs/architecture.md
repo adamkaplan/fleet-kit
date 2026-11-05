@@ -62,6 +62,7 @@ The **Holds** column is descriptive: only the layer numbers are enforced.
 | `cloud_relay.py` | 2 | the hub half of pod, hub and daemon calls for report, prove, verdict and gates: a bounded in-memory queue and the refusals | |
 | `cloud_client.py` | 1 | the sending end of a message or report through the cloud channel | |
 | `cloud_cluster.py` | 5 | the launcher process, the settings reader, the vault recovery, the cluster client and the tunnel of the cloud launch (#1647); a part of `cloud_worker.py` | |
+| `cloud_first_push.py` | 2 | the state line of a send to a cloud pod and the one `no first push` notice of a launch's checkpoint (#2057); a part of `cloud_worker.py` | |
 | `external_adapter.py` | 1 | a generic client for an outside system that holds decisions and work items | |
 | `agent_calls.py` | 2 | GitHub calls made from agents' shells, counted per account and per hour | |
 | `github_census.py` | 2 | the 5-minute sample line per account and the census of process kinds behind GitHub calls the records do not count (read only) | |
@@ -128,6 +129,7 @@ The **Holds** column is descriptive: only the layer numbers are enforced.
 | `switchboard/pr_explain.py` | 5 | `pr-explain` and the checks of a held pull request body | |
 | `switchboard/sent_view.py` | 5 | `sent`: a sender's own recent messages with their sent, delivered and picked-up times | |
 | `switchboard/v2_transport.py` | 1 | the OpenCode v2 client and its HTTP transport | |
+| `tester_agent.py` | 0 | the list of agents a `launch --role tester` accepts, read from the `agents/roles.tsv` file of the checkout (#1963) | |
 | `switchboard/jev.py` | 1 | the Jev client: the decision model, the classifier and the policy judge's questions | |
 | `switchboard/stage_event.py` | 4 | the stage-event marker of a configured bot's comment: the first line only, validated and rebuilt (ask #1575) | |
 | `switchboard/audit.py` | 2 | the audit log | |
@@ -155,7 +157,7 @@ The **Holds** column is descriptive: only the layer numbers are enforced.
 
 ## The clear's closure follows the parts
 
-The delegated clear refuses a pull request that changes a definition of "the clear's closure" (`bin/delegated_clear.py`, `closure`). The closure is derived over the assembled daemon: the entry plus every part of `bin/fleet-switchboard.parts`, as one namespace. `tools/derive-closure --write` lists in `docs/review-laws/impact-matrix.json` each part that holds a closure definition OR a module-level binding or import the closure reads (`closure_files`), with the definitions as `module_roots[part]` (empty for a part that holds only a binding: listing the part is what refuses an edit of it); `--check` fails in both directions (a name or part missing, a name or part extra) and names the part and the name. A new part is in by derivation, not by a hand list. The manifest is read as data and fails closed (exit 1, the entry named, nothing written): an entry that is not a file, is not `switchboard/<name>.py` (`..`, a directory, an absolute path), is listed twice, a part file the manifest does not list (it is never assembled), and a closure definition defined in two files. `--write` replaces the matrix through a temp file and a rename, and never writes after a failed derivation. `tests/switchboard/test_closure.py` runs the check and pins two floors for the assembled closure from `closure_roots`: 395 definitions and 335 bindings (a falling count fails the test; a floor is raised only in its own commit, with the owner's sign-off), and keeps the entry's own `closure_roots` as they were. After moving a definition to another part, run `tools/derive-closure --write` in the same pull request. For a listed part, any top-level statement edit is refused, as for every module the clear loads.
+The delegated clear refuses a pull request that changes a definition of "the clear's closure" (`bin/delegated_clear.py`, `closure`). The closure is derived over the assembled daemon: the entry plus every part of `bin/fleet-switchboard.parts`, as one namespace. `tools/derive-closure --write` lists in `docs/review-laws/impact-matrix.json` each part that holds a closure definition OR a module-level binding or import the closure reads (`closure_files`), with the definitions as `module_roots[part]` (empty for a part that holds only a binding: listing the part is what refuses an edit of it); `--check` fails in both directions (a name or part missing, a name or part extra) and names the part and the name. A new part is in by derivation, not by a hand list. The manifest is read as data and fails closed (exit 1, the entry named, nothing written): an entry that is not a file, is not `switchboard/<name>.py` (`..`, a directory, an absolute path), is listed twice, a part file the manifest does not list (it is never assembled), and a closure definition defined in two files. `--write` replaces the matrix through a temp file and a rename, and never writes after a failed derivation. `tests/switchboard/test_closure.py` runs the check and checks the property, never a number: `--check` passes (the matrix equals what the code derives), the entry's closure and every binding it reads lie inside the assembled closure, and the entry's own `closure_roots` are as they were (the owner, 4 November 2026: tests never pin an exact count). After moving a definition to another part, run `tools/derive-closure --write` in the same pull request. For a listed part, any top-level statement edit is refused, as for every module the clear loads.
 
 ## Known violations
 
@@ -176,7 +178,7 @@ Kinds (the number is exact, except `size`, a ceiling with headroom: see rule 7):
 | `switchboard/answer_delivery.py` | `fleet-switchboard` | entry-import | 5 | the part relies on a standard-library module the entry imported; it gets its own import line |
 | `switchboard/answer_delivery.py` | `fleet-switchboard` | namespace | 33 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 | `switchboard/audit.py` | `fleet-switchboard` | entry-import | 12 | the part relies on a standard-library module the entry imported; it gets its own import line |
-| `switchboard/audit.py` | `fleet-switchboard` | namespace | 2 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
+| `switchboard/audit.py` | `fleet-switchboard` | namespace | 3 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports; the third is `refuse_real_location`, the test-run guard of the audit path, which stays in the entry beside the state and config guards it shares its locations with |
 | `switchboard/bootstrap.py` | `fleet-switchboard` | entry-import | 4 | the part relies on a standard-library module the entry imported; it gets its own import line |
 | `switchboard/bootstrap.py` | `fleet-switchboard` | namespace | 15 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 | `switchboard/caches.py` | `fleet-switchboard` | entry-import | 3 | the part relies on a standard-library module the entry imported; it gets its own import line |
@@ -277,6 +279,7 @@ A site is listed by the function it sits in and its kind, with a count: `import(
 | `cloud_worker.py` | `_load_cluster:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
 | `cloud_worker.py` | `_load_cluster:sys.modules` | 1 | uses `sys` beyond its plain attributes |
 | `cloud_worker.py` | `_registry_note:load_module(string)` | 1 | names a loading builtin by a string (a name in a list counts: over-counting by design) |
+| `cloud_worker.py` | `_first_push:load_module(string)` | 1 | names a loading builtin by a string (a name in a list counts: over-counting by design) |
 | `cloud_worker.py` | `_retired:load_module(string)` | 1 | names a loading builtin by a string (a name in a list counts: over-counting by design) |
 | `cloud_worker.py` | `bind:sys.modules` | 1 | uses `sys` beyond its plain attributes |
 | `cloud_worker.py` | `model_entry:exec_module` | 1 | uses an identifier of the import machinery (exec_module) |

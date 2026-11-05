@@ -718,7 +718,7 @@ class TestPushWatch(Case):
         with tempfile.TemporaryDirectory() as tmp:
             audit = types.SimpleNamespace(append=lambda *a: lines.append(a))
             lines = []
-            engine = types.SimpleNamespace(audit=audit, actor="daemon", now=lambda: NOW)
+            engine = types.SimpleNamespace(audit=audit, actor="daemon", now=lambda: NOW, hub=types.SimpleNamespace(gh_api=lambda *a, **k: []))
             result = module.push_watch_tick(engine, None)
             self.assertEqual((result, lines, list(Path(tmp).iterdir())), ([], [], []))
 
@@ -729,6 +729,32 @@ class TestPushWatch(Case):
         with self.assertRaises(AttributeError) as caught:
             self._tick(old=True)
         self.assertIn("has no attribute 'config'", str(caught.exception))
+
+    def _hub_tick(self, hub):
+        path = str(REPO / "bin" / "fleet-switchboard")
+        module = types.ModuleType("sb_push_hub")
+        module.__file__ = path
+        exec(compile(Path(path).read_text(), path, "exec"), module.__dict__)
+        engine = Engine(self.tmp.name, [record("w-a", "lane-a")])
+        engine.now, engine.hub, engine.config = (lambda: NOW), hub, {"push_watch": self.config}
+        assert not hasattr(engine, "gh_api")   # a Switchboard-shaped engine: the reader is engine.hub
+        return module, engine
+
+    def test_fix2_the_read_goes_through_the_hub(self):
+        import os
+        self.world.refs = {"w-a/x": SHA_A}
+        hub = types.SimpleNamespace(gh_api=lambda path, paginate=True: self.assertFalse(paginate) or self.world(path))
+        module, engine = self._hub_tick(hub)
+        os.environ["CW_CLOUD_AUDIT"] = self.launcher
+        self.addCleanup(os.environ.pop, "CW_CLOUD_AUDIT", None)
+        module.push_watch_tick(engine, None)
+        self.assertTrue(self.world.requests)
+        self.assertFalse([l for l in engine.audit.lines if "read_failed" in l[0]], engine.audit.lines)
+
+    def test_fix2_no_hub_skips_with_one_line(self):
+        module, engine = self._hub_tick(None)
+        self.assertEqual(module.push_watch_tick(engine, None), [])
+        self.assertEqual([l[0] for l in engine.audit.lines], ["push_watch.skipped"])
 
 
 if __name__ == "__main__":
