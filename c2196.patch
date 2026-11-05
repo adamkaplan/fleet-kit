@@ -1,0 +1,224 @@
+From 28a617d3a745c4d50db81f0af3f8c2b53a69daef Mon Sep 17 00:00:00 2001
+From: cloud-worker <cloud-worker@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 13:20:35 +0000
+Subject: [PATCH] test workflow: ready_for_review reuses a completed run on the
+ same head (ask #2196)
+
+---
+ .github/workflows/test.yml | 32 +++++++++++++++
+ bin/test-workflow-split    | 81 +++++++++++++++++++++++++++++++++++---
+ 2 files changed, 108 insertions(+), 5 deletions(-)
+
+diff --git a/.github/workflows/test.yml b/.github/workflows/test.yml
+index 0110153c..f473b6ef 100644
+--- a/.github/workflows/test.yml
++++ b/.github/workflows/test.yml
+@@ -38,6 +38,9 @@ jobs:
+   plan:
+     name: plan
+     runs-on: ubuntu-latest
++    permissions:
++      contents: read
++      actions: read
+     outputs:
+       matrix: ${{ steps.plan.outputs.matrix }}
+     defaults:
+@@ -48,9 +51,32 @@ jobs:
+         with:
+           fetch-depth: 0
+ 
++      # #2196: marking a draft ready re-ran every leg on a head whose draft run had completed. Look for a COMPLETED run (a conclusion, not cancelled)
++      # of this workflow on the same head, and the legs it ran (a leg whose job was not skipped). Empty outputs on any doubt: every needed leg runs.
++      - name: Find a completed run on this head
++        id: prior
++        if: ${{ github.event_name == 'pull_request' && github.event.action == 'ready_for_review' }}
++        env:
++          GH_TOKEN: ${{ github.token }}
++          REPO: ${{ github.repository }}
++          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
++          THIS_RUN: ${{ github.run_id }}
++        run: |
++          id=$(gh api "repos/$REPO/actions/runs?head_sha=$HEAD_SHA&per_page=100" --jq "[.workflow_runs[] | select(.path == \".github/workflows/test.yml\" and .status == \"completed\" and .conclusion != null and .conclusion != \"cancelled\" and (.id | tostring) != \"$THIS_RUN\")] | sort_by(.created_at) | last | .id // empty" 2>/dev/null) || id=""
++          legs=""
++          if [ -n "$id" ]; then
++            legs=$(gh api "repos/$REPO/actions/runs/$id/jobs?per_page=100" --jq '[.jobs[] | select(.conclusion != "skipped" and .conclusion != "cancelled") | .name | capture("^test \\((?<os>[^)]+)\\)$") | .os] | unique | tojson' 2>/dev/null) || legs=""
++          fi
++          if [ -z "$legs" ]; then id=""; fi
++          echo "run=$id" >> "$GITHUB_OUTPUT"
++          echo "legs=$legs" >> "$GITHUB_OUTPUT"
++
+       - name: Decide the runners
+         id: plan
+         env:
++          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
++          PRIOR_RUN: ${{ steps.prior.outputs.run }}
++          PRIOR_LEGS: ${{ steps.prior.outputs.legs }}
+           EVENT: ${{ github.event_name }}
+           BASE: ${{ github.base_ref }}
+           DRAFT: ${{ github.event.pull_request.draft }}
+@@ -98,6 +124,10 @@ jobs:
+                           note("a workflow file is changed by this pull request: running macOS")
+                       macos = diff.returncode != 0 or LIST in files or any(f.startswith(WORKFLOWS) for f in files) or any(fnmatch.fnmatchcase(f, p) for f in files for p in patterns)
+           oses = ["ubuntu-latest"] + (["macos-latest"] if macos else [])
++          if event == "pull_request" and os.environ.get("ACTION") == "ready_for_review" and os.environ.get("PRIOR_RUN") and os.environ.get("PRIOR_LEGS"):
++              ran = json.loads(os.environ["PRIOR_LEGS"])
++              oses = [o for o in oses if o not in ran]
++              note("head %s: reusing completed run %s (legs it ran: %s); scheduling only: %s" % (os.environ.get("HEAD_SHA", "?"), os.environ["PRIOR_RUN"], ", ".join(ran) or "none", ", ".join(oses) or "none"))
+           rows = []
+           if event == "schedule":
+               refs = ["main"] + (["integration"] if git("rev-parse", "--verify", "-q", "refs/remotes/origin/integration").returncode == 0 else [])
+@@ -110,6 +140,7 @@ jobs:
+ 
+   test:
+     needs: plan
++    if: ${{ needs.plan.outputs.matrix != '[]' }}
+     name: ${{ matrix.name }}
+     strategy:
+       fail-fast: false
+@@ -274,6 +305,7 @@ jobs:
+   # `test-cloud (<os>)` for the two operating systems (`nightly-cloud <ref> (<os>)` in the nightly). Same matrix, runner and shell as `test`.
+   test-cloud:
+     needs: plan
++    if: ${{ needs.plan.outputs.matrix != '[]' }}
+     name: ${{ matrix.cloud }}
+     strategy:
+       fail-fast: false
+diff --git a/bin/test-workflow-split b/bin/test-workflow-split
+index 0c8851c9..00f47bec 100755
+--- a/bin/test-workflow-split
++++ b/bin/test-workflow-split
+@@ -138,7 +138,7 @@ MATRIX = ["ubuntu-latest", "macos-latest"]
+ # Since ask #990 the two jobs take their runners from a `plan` job's matrix (the macOS entry is in or out of the MATRIX, never skipped by an `if`):
+ # the INTENT of the split is unchanged (the check names, the parallel cloud job, no needs between test and test-cloud) and is pinned on the names
+ # the real plan script RESOLVES to per event (`resolved`). The LITERAL job shape below changed on purpose.
+-JOB_KEYS = ["defaults", "name", "needs", "runs-on", "steps", "strategy"]
++JOB_KEYS = ["defaults", "if", "name", "needs", "runs-on", "steps", "strategy"]
+ STRATEGY = {"fail-fast": "false", "matrix": {"include": "${{ fromJSON(needs.plan.outputs.matrix) }}"}}
+ JOB_NAMES = {"test": "${{ matrix.name }}", "test-cloud": "${{ matrix.cloud }}"}
+ DEFAULTS = {"run": {"shell": "bash"}}
+@@ -210,6 +210,26 @@ def resolved(job, event, base="", draft=False, text=None):
+     return sorted(r[key] for r in rows)
+ 
+ 
++def plan_rows(event="pull_request", base="integration", draft=False, action="", prior_run="", prior_legs=None, head="abc123", text=None):
++    """Run the real plan script with the given prior run (the `prior` step's two outputs); return (the rows' os values, the job-summary text)."""
++    text = WORKFLOW.read_text() if text is None else text
++    start = text.index("          python3 - <<'PY'\n")
++    end = text.index("\n          PY\n", start)
++    run = "\n".join(l[10:] for l in text[start:end + len("\n          PY")].splitlines()) + "\n"
++    with tempfile.TemporaryDirectory() as tmp:
++        out, summary = os.path.join(tmp, "out.txt"), os.path.join(tmp, "summary.md")
++        open(out, "w").close()
++        open(summary, "w").close()
++        env = dict(os.environ, EVENT=event, BASE=base, DRAFT="true" if draft else "false", ACTION=action, GITHUB_OUTPUT=out, GITHUB_STEP_SUMMARY=summary,
++                   HEAD_SHA=head, PRIOR_RUN=prior_run, PRIOR_LEGS=json.dumps(prior_legs) if prior_legs is not None else "")
++        subprocess.run(["bash", "-c", run], cwd=tmp, env=env, check=True, capture_output=True)
++        line = [l for l in open(out).read().splitlines() if l.startswith("matrix=")][-1]
++        return sorted(r["os"] for r in json.loads(line[len("matrix="):])), open(summary).read()
++
++
++BOTH = ["macos-latest", "ubuntu-latest"]
++
++
+ def only_suites(table):
+     return [row for row in table if row[0] not in ("bin/check-public-names", "bin/fleet-scenario validate", "bin/fleet-scenario coverage")]
+ 
+@@ -248,6 +268,42 @@ class Pins(unittest.TestCase):
+             self.assertEqual(resolved(job, event, base, text=self.text), sorted(OLD_CHECKS), event)
+         self.assertEqual(resolved(job, "pull_request", "main", draft=True, text=self.text), ["test (ubuntu-latest)"])   # a draft into main: ubuntu only (ask #990)
+ 
++    def test_s2_ready_for_review_on_a_head_with_a_completed_run_schedules_no_leg_it_already_ran(self):
++        # a pull request into integration (the plan reads no diff here, so macOS is needed): the completed run ran both legs
++        rows, _ = plan_rows(action="ready_for_review", prior_run="777", prior_legs=BOTH, text=self.text)
++        self.assertEqual(rows, [])
++        # the same run that ran only ubuntu leaves only macOS to run
++        rows, _ = plan_rows(action="ready_for_review", prior_run="777", prior_legs=["ubuntu-latest"], text=self.text)
++        self.assertEqual(rows, ["macos-latest"])
++
++    def test_s3_ready_for_review_without_a_completed_run_or_for_a_draft_into_main_schedules_the_needed_legs(self):
++        rows, _ = plan_rows(action="ready_for_review", text=self.text)   # no completed run on the head
++        self.assertEqual(rows, BOTH)
++        rows, _ = plan_rows(base="main", action="ready_for_review", prior_run="777", prior_legs=["ubuntu-latest"], text=self.text)   # the draft's run skipped macOS
++        self.assertEqual(rows, ["macos-latest"])
++        for action in ("opened", "synchronize", "reopened"):   # only ready_for_review reuses: every other action runs every leg
++            rows, _ = plan_rows(base="main", action=action, prior_run="777", prior_legs=BOTH, text=self.text)
++            self.assertEqual(rows, BOTH, action)
++        rows, _ = plan_rows(event="push", base="", prior_run="777", prior_legs=BOTH, text=self.text)
++        self.assertEqual(rows, BOTH)
++
++    def test_s4_a_skipped_leg_selection_says_the_head_and_the_reused_run_in_one_line(self):
++        for legs, base in ((BOTH, "integration"), (["ubuntu-latest"], "main")):
++            _, summary = plan_rows(base=base, action="ready_for_review", prior_run="777", prior_legs=legs, head="deadbeef", text=self.text)
++            lines = [l for l in summary.splitlines() if "deadbeef" in l and "777" in l]
++            self.assertEqual(len(lines), 1, summary)
++        _, summary = plan_rows(action="ready_for_review", text=self.text)
++        self.assertNotIn("reusing", summary)   # no completed run: nothing is skipped, nothing is said
++
++    def test_s2_the_prior_run_step_reads_only_completed_runs_that_are_not_cancelled(self):
++        steps = {s.get("id"): s for s in self.jobs()["plan"]["steps"]}
++        prior = steps["prior"]
++        self.assertEqual(prior["if"], "${{ github.event_name == 'pull_request' && github.event.action == 'ready_for_review' }}")
++        self.assertIn("head_sha=$HEAD_SHA", prior["run"])
++        self.assertIn('.status == \\"completed\\"', prior["run"])
++        self.assertIn('.conclusion != \\"cancelled\\"', prior["run"])
++        self.assertEqual(self.jobs()["plan"]["permissions"], {"contents": "read", "actions": "read"})
++
+     def test_u3_the_old_job_keeps_its_matrix_runner_and_shell(self):
+         job = self.jobs()["test"]
+         self.assertEqual(job["strategy"]["matrix"], STRATEGY["matrix"])   # the runner list comes from the plan; the plan's rows are pinned in test_s7
+@@ -281,8 +337,11 @@ class Pins(unittest.TestCase):
+         self.assertEqual(sorted(self.wf["on"]), sorted(TRIGGERS))
+         self.assertEqual(self.wf["on"]["push"], {"branches": ["main"]})
+         for jid, job in self.jobs().items():
+-            if jid in ("plan", "test", "test-cloud"):
++            if jid == "plan":
+                 self.assertNotIn("if", job, jid)   # a skipped job would leave a required name unreported (ask #990)
++            elif jid in ("test", "test-cloud"):
++                # #2196: skipped only when the plan schedules no leg (a ready_for_review on a head whose completed run already ran them all)
++                self.assertEqual(job.get("if"), "${{ needs.plan.outputs.matrix != '[]' }}", jid)
+             else:
+                 # #2131: a job with a fixed (non-matrix-os) name, like `shards`, may be skipped, on the nightly only
+                 self.assertNotIn("matrix.name", job["name"], jid)
+@@ -310,7 +369,7 @@ class Pins(unittest.TestCase):
+         self.assertEqual(self.wf["permissions"], PERMISSIONS)
+         self.assertEqual(self.wf["concurrency"], CONCURRENCY)
+         self.assertLessEqual({"plan", "test", "test-cloud"}, set(self.jobs()))
+-        self.assertEqual(sorted(self.jobs()["plan"]), ["defaults", "name", "outputs", "runs-on", "steps"])
++        self.assertEqual(sorted(self.jobs()["plan"]), ["defaults", "name", "outputs", "permissions", "runs-on", "steps"])
+         for jid in ("test", "test-cloud"):
+             job = self.jobs()[jid]
+             self.assertEqual(sorted(job), JOB_KEYS, jid)
+@@ -358,8 +417,20 @@ class Mutants(unittest.TestCase):
+         unittest.defaultTestLoader.loadTestsFromTestCase(Pins).run(result)
+         self.assertEqual((result.failures, result.errors), ([], []))
+ 
++    def test_s2_the_reuse_dropped(self):
++        self.fails('os.environ.get("ACTION") == "ready_for_review" and os.environ.get("PRIOR_RUN")', 'False and os.environ.get("PRIOR_RUN")', "test_s2_ready_for_review_on_a_head_with_a_completed_run_schedules_no_leg_it_already_ran")
++
++    def test_s3_every_leg_dropped_on_ready_for_review(self):
++        self.fails('oses = [o for o in oses if o not in ran]', 'oses = []', "test_s3_ready_for_review_without_a_completed_run_or_for_a_draft_into_main_schedules_the_needed_legs")
++
++    def test_s3_a_cancelled_run_reused(self):
++        self.fails('.conclusion != \\"cancelled\\"', '.conclusion != \\"x\\"', "test_s2_the_prior_run_step_reads_only_completed_runs_that_are_not_cancelled")
++
++    def test_s4_the_summary_line_dropped(self):
++        self.fails('              note("head %s: reusing', '              print("head %s: reusing', "test_s4_a_skipped_leg_selection_says_the_head_and_the_reused_run_in_one_line")
++
+     def test_s1_needs_added(self):
+-        self.fails("    needs: plan\n    name: ${{ matrix.cloud }}\n", "    needs: [plan, test]\n    name: ${{ matrix.cloud }}\n", "test_s1_a_second_job_runs_the_cloud_suites_in_parallel_on_both_systems")
++        self.fails("    needs: plan\n    if: ${{ needs.plan.outputs.matrix != '[]' }}\n    name: ${{ matrix.cloud }}\n", "    needs: [plan, test]\n    if: ${{ needs.plan.outputs.matrix != '[]' }}\n    name: ${{ matrix.cloud }}\n", "test_s1_a_second_job_runs_the_cloud_suites_in_parallel_on_both_systems")
+ 
+     def test_s1_macos_dropped_from_the_new_job(self):
+         self.fails("          macos = True\n", "          macos = False\n", "test_s1_a_second_job_runs_the_cloud_suites_in_parallel_on_both_systems", "test_s7_the_old_job_keeps_its_id_and_check_names")
+@@ -428,7 +499,7 @@ class Mutants(unittest.TestCase):
+         self.fails("  test-cloud:\n", "  test-cloud:\n    concurrency:\n      group: x\n", "test_s6_the_concurrency_block_is_the_current_one_and_no_job_has_its_own")
+ 
+     def test_u2_a_job_level_if(self):
+-        self.fails("  test-cloud:\n", "  test-cloud:\n    if: github.event_name == 'pull_request'\n", "test_u2_three_triggers_no_job_level_if_and_the_image_suite_limit")
++        self.fails("    if: ${{ needs.plan.outputs.matrix != '[]' }}\n    name: ${{ matrix.cloud }}", "    if: github.event_name == 'pull_request'\n    name: ${{ matrix.cloud }}", "test_u2_three_triggers_no_job_level_if_and_the_image_suite_limit")
+ 
+     def test_u2_a_trigger_dropped(self):
+         self.fails("  workflow_dispatch:\n", "", "test_u2_three_triggers_no_job_level_if_and_the_image_suite_limit")
+-- 
+2.43.0
+
