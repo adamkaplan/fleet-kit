@@ -57,6 +57,9 @@ class PagedHub:
             if number >= (cap or 5):
                 return out, len(self.open) > len(out)
 
+    def read_comments(self, consumer, repo, since, cap):   # #1889: what read_pages answered for the comments path
+        return self.read_pages("repos/%s/issues/comments?since=%s&sort=created&direction=desc&per_page=100" % (repo, since), older=("created_at", since), cap=cap)
+
     def read_open_pages(self, path):
         return self.read_pages(path, cap=sb.OPEN_LIST_PAGES)
 

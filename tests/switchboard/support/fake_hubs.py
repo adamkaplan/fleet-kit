@@ -142,6 +142,9 @@ class FakeTriageHub:
             return list(self.open.get(repo, {}).values())[:self.cut_open[repo]], True
         return list(self.open.get(repo, {}).values()), False
 
+    def read_comments(self, consumer, repo, since, cap):   # #1889: answers what read_pages answered for the comments path
+        return self.read_pages("repos/%s/issues/comments?since=%s&sort=created&direction=desc&per_page=100" % (repo, since), older=("created_at", since), cap=cap)
+
     def _read_one(self, repo, path, now, fresh=False):
         self.calls.append(path)
         number = int(path.rsplit("/", 1)[1])

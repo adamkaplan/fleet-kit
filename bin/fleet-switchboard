@@ -7985,6 +7985,11 @@ def publish_decisions(engine):
             open_list_alert(engine, repo, now)
         except Exception as err:
             engine._note("open_list.error", repo, {"error": _one_line("%s: %s" % (type(err).__name__, err), 200), "repo": repo})
+    for repo, (held, days) in take_comment_cuts().items():   # #1889: the daily alert for every comment window not read to its start
+        try:
+            comment_window_alert(engine, repo, held, days, now)
+        except Exception as err:
+            engine._note("comment_window.error", repo, {"error": _one_line("%s: %s" % (type(err).__name__, err), 200), "repo": repo})
     try:
         pane_health_pass(engine, now)   # the control plane: detached or dead panes, reads only, wakes the Chief of Staff
     except Exception as err:
@@ -11106,6 +11111,61 @@ class GitHubHub:
                 return records, False
             if bounded and number >= (cap or GITHUB_PAGE_CAP):
                 return records, True
+
+    def read_comments(self, consumer, repo, since, cap):
+        """#1889: the comments of `repo` created since `since`, newest first, as read_pages gave them, read incrementally. A first read (nothing held in memory
+        or no cursor) follows the window to its start (at most `cap` pages); a later read asks since the newest comment held and merges the new ones into the held
+        ones (bounded to the window). Returns (comments, truncated): truncated while the window has a part never read."""
+        held = self.__dict__.setdefault("_held_comments", {})
+        gaps = self.__dict__.setdefault("_comment_gaps", {})
+        cursors = self.__dict__.get("_comment_cursors")
+        parse = load_module("record_json").parse_bounded
+        store = load_module("comment_cursor")
+        if cursors is None:
+            cursors, status = store.load(self.state_dir, parse)
+            self._comment_cursors, self._comment_state = cursors, status
+        name, key = "%s|%s" % (consumer, repo), (consumer, repo)
+        base = "repos/%s/issues/comments?since=%s&sort=created&direction=desc&per_page=100"
+        loose_held = self.__dict__.setdefault("_held_loose", {}).setdefault(key, {})   # records without a valid created_at, keyed by id or content so they never duplicate
+        have, mark = held.get(key), cursors.get(name)
+        if have is None or mark is None:
+            why = "no held comments" if have is None and mark is not None else {"absent": "no cursor file", "unreadable": "cursor file unreadable"}.get(self._comment_state, "no cursor")
+            told = self.__dict__.setdefault("_comment_fallback", set())
+            if key not in told:
+                told.add(key)
+                if self.audit is not None:
+                    self.audit.append(self.actor, "comment_cursor.fallback", repo, {"repo": repo, "consumer": consumer, "reason": why})
+            records, cut = self.read_pages(base % (repo, since), older=("created_at", since), cap=cap)
+            have = {}
+            loose_held.clear()
+        else:
+            records, cut = self.read_pages(base % (repo, mark), older=("created_at", mark), cap=cap)
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            if not isinstance(record.get("created_at"), str):
+                loose_held[("id", record["id"]) if record.get("id") is not None else ("noid", json.dumps(record, sort_keys=True, default=str))] = record
+                while len(loose_held) > COMMENT_WINDOW_PAGES * GITHUB_PAGE_SIZE:
+                    del loose_held[next(iter(loose_held))]   # bounded as the held comments are: the oldest held drops
+            elif record["created_at"] >= since:
+                # merge by id; a record without an id is keyed by its content so id-less records do not collapse into one
+                have[record["id"] if record.get("id") is not None else ("noid", json.dumps(record, sort_keys=True, default=str))] = record
+        have = {k: v for k, v in have.items() if v["created_at"] >= since}
+        held[key] = have
+        oldest = min((r["created_at"] for r in records if isinstance(r, dict) and isinstance(r.get("created_at"), str)), default=None)
+        if cut and oldest is not None:
+            gaps[key] = oldest   # what lies before this was not read, until the window's start passes it
+        if key in gaps and gaps[key] < since:
+            del gaps[key]
+        newest = max((v["created_at"] for v in have.values()), default=None)
+        if newest is not None and cursors.get(name) != newest:   # an empty merge keeps the old cursor (harmless: the next read asks since it again)
+            cursors[name] = newest
+            store.save(self.state_dir, cursors, parse)
+        merged = sorted(have.values(), key=lambda r: r["created_at"], reverse=True) + list(loose_held.values())   # stable: equal seconds keep the API order, as read_pages gave them
+        if key in gaps:
+            when, then = self.now(), parse_iso(since)
+            _COMMENT_CUTS[key] = (len(merged), max(1, round((when - then) / 86400)) if then is not None else 0)
+        return merged, key in gaps
 
     # -- gh api, and the catch-up read
 
@@ -15552,7 +15612,7 @@ cmd_waive.ledger = True   # state and GETs only; its own errors are usage errors
 
 
 # ---- #818: which open pull requests change the same files. Read-only information, never a block. Pure parsing and the two texts; the one bounded read is `read_open_overlap`.
-OVERLAP_LIST_CAP = 50    # the most open pull requests read, in one call
+OVERLAP_LIST_CAP = 200   # the most open pull requests read, in one call (#1889: the ceiling tools/arch-overlap already uses; a full list is said)
 OVERLAP_FILES_CAP = 100  # the most files of one pull request used; a pull request with more changed files is left out
 OVERLAP_SHOW_FILES = 3   # files named in a `shares` line
 OVERLAP_PATH_MAX = 300  # a longer path, or one with a control character, is not printed: the pull request is left out
@@ -15632,6 +15692,7 @@ def read_open_overlap(engine, repo, runner):
         done = (engine.gh_runner or runner)(argv, capture_output=True, text=True, timeout=min(engine.config["call_timeout_seconds"], GITHUB_ROUTE_READ_TIMEOUT),
                                             stdin=subprocess.DEVNULL, **({"env": env} if env is not None else {}))
         if done.returncode == 0:
+            engine.__dict__.setdefault("_overlap_read", {})[repo] = (len(listed) if isinstance(listed := json.loads(done.stdout or "[]"), list) else 0)   # #1889: how many were read, for the line a full list gets
             cache[repo] = overlap_parse_listing(json.loads(done.stdout or "[]"))
     except Exception:   # advisory: whatever goes wrong, there is no line (never a wrong one) and nothing else changes
         cache[repo] = None
@@ -15740,6 +15801,9 @@ def cmd_gates(args, runner, now):
             lines.extend(load_module("epic_record").epic_lines(epic_rows, report["epic_default_head"]))
         if shares:
             lines.append(shares)
+        read_n = getattr(ctx.engine, "_overlap_read", {}).get(ctx.repo, 0)
+        if read_n >= OVERLAP_LIST_CAP:   # #1889: a full list is said with the exact number read, never a bare cut
+            lines.append("read %d of at least %d open pull requests" % (read_n, read_n))
         lines.extend(bots)
         if suites_finding:
             lines.append(suites_finding)
