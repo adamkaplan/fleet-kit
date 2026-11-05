@@ -1,4 +1,5 @@
 """The plan check's `no-failure-mode` warning (ask #1455): a plan that reads or produces something and has no scenario about a missing, corrupt, unreadable or absent input."""
+import os
 import re
 import subprocess
 import sys
@@ -63,7 +64,8 @@ def run(text):
         path = Path(tmp) / "plan.md"
         path.write_text(text)
         return subprocess.run([sys.executable, str(REPO / "bin" / "fleet-switchboard"), "plan", "check", "--file", str(path), "--done-when", DONE],
-                              capture_output=True, text=True)
+                              capture_output=True, text=True,
+                              env=dict(os.environ, HOME=tmp, XDG_STATE_HOME=tmp, XDG_CONFIG_HOME=tmp, FLEET_SWITCHBOARD_STATE=tmp))   # an isolated location, never the real one (#1322 guard)
 
 
 class TestNoFailureMode(unittest.TestCase):
