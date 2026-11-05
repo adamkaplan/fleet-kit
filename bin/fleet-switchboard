@@ -9468,6 +9468,7 @@ GITHUB_CATCHUP_ITEMS = 500     # items one catch-up keeps (the newest)
 GITHUB_SUBREAD_TIMEOUT = 10    # seconds for a secondary read (reviews, check suites, workflow runs)
 GITHUB_READ_BACKOFF = 600      # a secondary read that failed is not tried again for this long
 GITHUB_PAGE_SIZE = 100         # records per page of every list read
+COMMENT_GAP_PAGES = 5          # pages one pass may read of a window's missing older part (it counts against the pass's budget)
 GITHUB_PAGE_CAP = 5            # pages one list read follows; the rest is skipped, not chased
 GITHUB_MARKER_SLACK = 60       # seconds before the read marker a catch-up starts (a forwarder repo)
 READ_MARKER_FILE = "github-read.json"  # {"owner/repo": "<iso>"}: how far each repo was read; a disposable cursor
@@ -11119,7 +11120,32 @@ class GitHubHub:
             if bounded and number >= (cap or GITHUB_PAGE_CAP):
                 return records, True
 
-    def read_comments(self, consumer, repo, since, cap):
+    def _fill_comment_gap(self, key, repo, since, have, gaps, budget):
+        """The part of the window before gaps[key] was never read: read it oldest first from the window's start (since=<edge>, ascending), at most
+        COMMENT_GAP_PAGES pages a pass and never more than the caller's budget[0] (charged here), merging by id; the gap closes where the read meets the held comments."""
+        edges = self.__dict__.setdefault("_comment_gap_edges", {})
+        pages = COMMENT_GAP_PAGES if budget is None else min(COMMENT_GAP_PAGES, budget[0])
+        edge = max(edges.get(key) or since, since)
+        path = "repos/%s/issues/comments?since=%s&sort=created&direction=asc&per_page=100" % (repo, edge)
+        for number in range(1, pages + 1):
+            raw = _page_records(self.gh_api("%s&page=%d" % (path, number), paginate=False), None, path, number)
+            page = [r for r in raw
+                    if isinstance(r, dict) and isinstance(r.get("created_at"), str) and r.get("id") is not None]
+            if budget is not None:
+                budget[0] -= 1
+            for record in page:
+                if record["created_at"] >= since:
+                    have.setdefault(record["id"], record)
+            if page:
+                edges[key] = edge = max(edge, page[-1]["created_at"])
+            if len(raw) < GITHUB_PAGE_SIZE or not page or page[-1]["created_at"] >= gaps[key]:
+                del gaps[key]
+                edges.pop(key, None)
+                return
+            if page[0]["created_at"] == page[-1]["created_at"]:
+                return   # a whole page in one second cannot advance the edge; the window's start passing it ends this gap
+
+    def read_comments(self, consumer, repo, since, cap, budget=None):
         """#1889: the comments of `repo` created since `since`, newest first, as read_pages gave them, read incrementally. A first read (nothing held in memory
         or no cursor) follows the window to its start (at most `cap` pages); a later read asks since the newest comment held and merges the new ones into the held
         ones (bounded to the window). Returns (comments, truncated): truncated while the window has a part never read."""
@@ -11160,8 +11186,11 @@ class GitHubHub:
         have = {k: v for k, v in have.items() if v["created_at"] >= since}
         held[key] = have
         oldest = min((r["created_at"] for r in records if isinstance(r, dict) and isinstance(r.get("created_at"), str)), default=None)
+        self._comment_main_pages = max(1, -(-len(records) // GITHUB_PAGE_SIZE))   # CHARGE-ONCE RULE: the callers charge only this (the main read); the gap fill charges its own pages
         if cut and oldest is not None:
             gaps[key] = oldest   # what lies before this was not read, until the window's start passes it
+        if key in gaps:
+            self._fill_comment_gap(key, repo, since, have, gaps, budget)
         if key in gaps and gaps[key] < since:
             del gaps[key]
         newest = max((v["created_at"] for v in have.values()), default=None)
