@@ -104,6 +104,26 @@ def read_pr_runs(gh, repo, number, head):
     return out
 
 
+def read_behind(gh, repo, run_base, tip, _seen={}):   # `ahead_by` of the compare, one read per pair kept in memory (ask #1755)
+    if (n := _seen.get(key := (repo, run_base, tip))) is None:
+        n = (_json(gh, ["api", "repos/%s/compare/%s...%s" % (repo, run_base, tip)], "the commits behind") or {}).get("ahead_by")
+        if not isinstance(n, int) or isinstance(n, bool) or not 0 <= n <= 1000000: raise ReadError("the commits behind were not counted")
+        if len(_seen) >= 256: _seen.pop(next(iter(list(_seen)), None), None)
+        _seen[key] = n
+    return n
+
+
+def read_fresh(gh, repo, number, head, base_ref):   # (run base of the earliest deciding run, tip, behind); None for what could not be read
+    base = tip = behind = None
+    try:
+        runs = read_pr_runs(gh, repo, number, head) if head and isinstance(base_ref, str) and base_ref else []
+        base = min(runs, key=lambda r: r["created"] or 0)["base"] if runs and all(r["base"] for r in runs) else None
+        tip = read_tip(gh, repo, base_ref) if head and isinstance(base_ref, str) and base_ref else None
+        behind = read_behind(gh, repo, base, tip) if base and base != tip else None
+    except (ReadError, AttributeError, TypeError): pass
+    return base, tip, behind
+
+
 def run_result(run):
     """`green`, `red` or `pending` for one run: only a completed run with a green conclusion is green; anything unknown is red or pending, never green."""
     if run.get("status") != "completed":
@@ -123,12 +143,12 @@ def read_failing_jobs(gh, repo, run_id):
 
 
 def read_jobs(gh, repo, run_id):
-    """[{"name", "conclusion"}] of the jobs of a run (the latest attempt, at most 100): the legs of a matrix are jobs. An unreadable list raises ReadError."""
+    """[{"name", "conclusion", "steps"}] of the jobs of a run (the latest attempt, at most 100; at most 20 steps each: {"name", "conclusion"}): the legs of a matrix are jobs. An unreadable list raises ReadError."""
     data = _json(gh, ["api", "repos/%s/actions/runs/%s/jobs?filter=latest&per_page=100" % (repo, run_id)], "the jobs of run %s" % run_id)
     jobs = data.get("jobs") if isinstance(data, dict) else None
     if not isinstance(jobs, list):
         raise ReadError("the jobs of run %s answered no list" % run_id)
-    return [{"name": str(j.get("name")), "conclusion": str(j.get("conclusion") or j.get("status") or "")} for j in jobs if isinstance(j, dict)]
+    return [{"name": str(j.get("name")), "conclusion": str(j.get("conclusion") or j.get("status") or ""), "steps": [{"name": str(s.get("name")), "conclusion": str(s.get("conclusion") or s.get("status") or "")} for s in (j.get("steps") or []) if isinstance(s, dict)][:20]} for j in jobs if isinstance(j, dict)]
 
 
 def read_branch_runs(gh, repo, branch, workflow_ids=None):

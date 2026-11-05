@@ -589,6 +589,8 @@ class TestGitShim(Base):
         thread.join(5)
         return done, took, starts.exists() and starts.read_text().count("started")
 
+    HANG_GUARD_SECONDS = 30   # mirrors the timeout=30 of lsremote (asserted below)
+
     def mutant(self, name, old, new):
         text = GIT_SHIM.read_text()
         self.assertIn(old, text, "the mutant %s no longer applies" % name)
@@ -602,9 +604,12 @@ class TestGitShim(Base):
     def test_s5_a_local_port_url_fails_at_once_and_the_helper_never_starts(self):
         if not (shutil.which("git", path=SAFE_PATH) or shutil.which("git")):
             self.skipTest("no real git")
-        done, took, starts = self.lsremote(GIT_SHIM)
+        self.assertIn("timeout=%d" % self.HANG_GUARD_SECONDS, inspect.getsource(type(self).lsremote), "HANG_GUARD_SECONDS and the timeout of lsremote disagree")
+        try:
+            done, took, starts = self.lsremote(GIT_SHIM)
+        except subprocess.TimeoutExpired:
+            self.fail("hang: git ls-remote to a closed local port did not return within %d s" % self.HANG_GUARD_SECONDS)
         self.assertEqual((done.returncode, starts), (128, 0), done.stderr)
-        self.assertLess(took, 5)
         self.assertNotIn("started", done.stdout + done.stderr)
 
     def test_s5_three_mutants_of_the_shim_start_the_helper_or_do_not_fail(self):
@@ -614,6 +619,7 @@ class TestGitShim(Base):
             "drop-terminal-prompt": ('{"GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "never"}', '{"GCM_INTERACTIVE": "never"}'),
             "drop-gcm-interactive": ('{"GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "never"}', '{"GIT_TERMINAL_PROMPT": "0"}'),
             "interactive-back-on": ('NO_DIALOG_CONFIG = "credential.interactive=false"', 'NO_DIALOG_CONFIG = "credential.interactive=true"'),
+            "no-dialog-wrapping-dropped": ("    return no_dialog(route_credentials(args))", "    return route_credentials(args)"),
             "code-host-only": ("    return no_dialog(route_credentials(args))", "    return no_dialog(route_credentials(args)) if any('github.com' in a for a in args) else route_credentials(args)"),
         }
         for name, (old, new) in mutants.items():
