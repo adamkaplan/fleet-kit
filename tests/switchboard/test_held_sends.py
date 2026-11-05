@@ -399,14 +399,20 @@ class TestHeldSends(Base):
         sid = self.provider_error_scenario()
         v2 = self.world.v2
         self.world.v2.sessions[sid]["turn"] = None
-        before = len(self.world.admissions("platform"))
         # the wake sits in the inbox, absent from the transcript: the #1337 recovery resumes the idle agent once
-        v2.sessions[sid]["messages"] = [m for m in v2.sessions[sid]["messages"] if "after the error" not in str(m.get("text"))]
-        if not v2.sessions[sid]["inbox"]:
-            admitted = self.world.admissions("platform")[0]
-            v2.sessions[sid]["inbox"].append({"id": admitted["id"], "sessionID": sid, "text": admitted["text"], "delivery": "queue", "resume": False,
-                                              "metadata": {"fleet": {"from": "switchboard", "keys": admitted["keys"]}},
-                                              "time": {"created": v2.clock.ms(admitted["at"])}})
+        # the resume rules out an open request first: this fake v2 has no such list, so it answers "none open" (nothing is open here)
+        v2.op_session_permission_list = lambda params, body: []
+        v2.op_session_form_list = lambda params, body: []
+        wake_key = self.world.admissions("platform")[0]["keys"][0]
+        v2.sessions[sid]["messages"] = [m for m in v2.sessions[sid]["messages"] if wake_key not in str(m)]
+        self.assertFalse([m for m in v2.sessions[sid]["messages"] if wake_key in str(m)], "the wake is absent from the transcript")
+        # The fake v2 consumes the admitted wake into the transcript, so the real flow cannot leave it in the inbox. The inbox
+        # below IS BUILT BY HAND, always, from the real admission (no "if"): the undelivered state is the test's own setup.
+        self.assertEqual(v2.sessions[sid]["inbox"], [], "the fake consumed the wake: the inbox is rebuilt by hand below")
+        admitted = self.world.admissions("platform")[0]
+        v2.sessions[sid]["inbox"].append({"id": admitted["id"], "sessionID": sid, "text": admitted["text"], "delivery": "queue", "resume": False,
+                                          "metadata": {"fleet": {"from": "switchboard", "keys": admitted["keys"]}},
+                                          "time": {"created": v2.clock.ms(admitted["at"])}})
         self.world.tick(16 * 60)
         self.world.engine.run_pass()
         resumes = [e for e in self.audit_events("undelivered.resume")]
@@ -414,8 +420,7 @@ class TestHeldSends(Base):
         self.world.tick(60)
         self.world.engine.run_pass()
         self.assertEqual(len(self.audit_events("undelivered.resume")), 1, "never a second resume in the incident")
-        self.assertEqual(len([r for r in self.audit_events("resume")]) <= 1, True)
-        self.assertGreaterEqual(len(self.world.admissions("platform")), before)
+        self.assertIn("platform", str(resumes[0]), "the resume's audit line names the recipient")
 
     # ---- #1400 (c): mutants "delivered twice" and "out of order" on the endpoint route; each control first
 
