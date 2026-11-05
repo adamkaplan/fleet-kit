@@ -38,7 +38,8 @@ def make_exec(src=None):
 
     def run(args, *a, **kw):
         calls.append(list(args))
-        if "-c" in args and args[args.index("-c") + 1] == "worker":
+        head = args[:args.index("--")]
+        if "-c" in head and head[head.index("-c") + 1] == "worker":
             return "no\n" if "sh" in args else ""
         return ""   # the default (service) container: no /work, prints nothing
     kube.run = run
@@ -88,14 +89,14 @@ class TestStackNudge(unittest.TestCase):
         s, calls = nudge(stack_pod())
         self.assertEqual([a[2] for a in s.audits], ["idle-nudge"])
         self.assertEqual(s.sent, [cw.IDLE_NUDGE])
-        self.assertTrue(calls and all(c[c.index("-c") + 1] == "worker" for c in calls), calls)
+        self.assertTrue(calls and all(c[c.index("-c") + 1] == "worker" and c.index("-c") < c.index("--") for c in calls), calls)
 
     def test_mutant_without_container_name_skips_stack_pod(self):
         src = EXEC_SRC.replace('"-c", WORKER_CONTAINER, ', "")
         self.assertNotEqual(src, EXEC_SRC, "the mutation was not applied")
         s, calls = nudge(stack_pod(), src)
         self.assertEqual(s.audits, [], "the mutant must skip the stack pod where the control nudges it")
-        self.assertFalse(any("-c" in c for c in calls), calls)
+        self.assertTrue(calls and all("-c" not in c[:c.index("--")] for c in calls), calls)
 
 
 if __name__ == "__main__":
