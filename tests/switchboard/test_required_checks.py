@@ -50,11 +50,12 @@ def build(TwoRepoCase):
 
         def route(self, fleet, body):
             """One review comment routed to its lane: the item as the daemon holds it afterwards."""
+            self.audits = []
             agents = {"orch": types.SimpleNamespace(fleet={"role": "orchestrator"}), "rev-1": types.SimpleNamespace(fleet=fleet)}
             item = sb.GitHubItem("github.reviewcomment:1", "github.comment", "base summary", "o/r", [], [], "bob", 1.0, [10], True)
             item.review_signer, item.review_body = "rev-1", body
             hub = types.SimpleNamespace(queue={item.key: item}, lock=threading.RLock(), _unrouted=set(), _filtered=set(), _unrouted_batch=[], _filtered_batch=[],
-                                        _routed_batch=[], _audit=lambda *a: None, route_of=lambda *a: ("orch", "closing"), _fleet_login=lambda l: True,
+                                        _routed_batch=[], _audit=lambda *a: self.audits.append(a), route_of=lambda *a: ("orch", "closing"), _fleet_login=lambda l: True,
                                         _unowned_seen=lambda k: False)
             hub._review_checks_note = lambda i, a: sb.GitHubHub._review_checks_note(hub, i, a)
             sb.GitHubHub._route(hub, item, types.SimpleNamespace(problems=[], agents=agents), 1.0)
@@ -108,6 +109,14 @@ def build(TwoRepoCase):
             self.assertTrue(found, "the block is read")
             self.assertFalse([c for c in found if any(ord(ch) < 32 or 127 <= ord(ch) < 160 for ch in c)], "no control character in a stored name")
             self.assertIn("plain", found)
+
+        def test_a_failing_comparison_keeps_todays_notice_and_leaves_an_audit_line(self):
+            with mock.patch.object(module(), "notice", side_effect=RuntimeError("boom-marker")):
+                item = self.route({"required_checks": CHECKS}, "Review of %s: APPROVE\nx\n" % SHA)
+            self.assertEqual(item.summary, "base summary", "the notice stays today's notice")
+            failed = [a for a in self.audits if "checks_note" in str(a[0])]
+            self.assertTrue(failed, "the failure is audited")
+            self.assertIn("boom-marker", str(failed[0]), "the audit line names the failure")
 
         # U1
         def test_u1_a_reader_with_no_list_changes_nothing(self):
