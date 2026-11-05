@@ -683,7 +683,8 @@
           "orders_note",
           "sent_at",
           "steers_into_turn",
-          "superseded_by"
+          "superseded_by",
+          "text_parts"
         ],
         "bin/switchboard/engine.py": [
           "KeyTimes",
