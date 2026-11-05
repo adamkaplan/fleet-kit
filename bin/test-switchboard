@@ -104,6 +104,8 @@ _support_installs_and_keys = importlib.import_module("support.installs_and_keys"
 ACME_API, ACME_WEB, API, BAD_STATE_REASON, BAD_TARGET_STATES, CloudReaperInstall, DECISIONS_PLUGIN, DEFAULT_TOKEN, FAKE_TOKENS, FakeDaemons, GOOD_DONE_WHEN, GOOD_PLAN, InstallCase, KeyCase, ORDERS_CHARTER_BODY, PR16_KEY, PR16_NOTICE, RealStatusAfterInstall, TIER_LABELS, WEB, WrittenFilesAreGuarded, secrets_in, tree_of = (_support_installs_and_keys.ACME_API, _support_installs_and_keys.ACME_WEB, _support_installs_and_keys.API, _support_installs_and_keys.BAD_STATE_REASON, _support_installs_and_keys.BAD_TARGET_STATES, _support_installs_and_keys.CloudReaperInstall, _support_installs_and_keys.DECISIONS_PLUGIN, _support_installs_and_keys.DEFAULT_TOKEN, _support_installs_and_keys.FAKE_TOKENS, _support_installs_and_keys.FakeDaemons, _support_installs_and_keys.GOOD_DONE_WHEN, _support_installs_and_keys.GOOD_PLAN, _support_installs_and_keys.InstallCase, _support_installs_and_keys.KeyCase, _support_installs_and_keys.ORDERS_CHARTER_BODY, _support_installs_and_keys.PR16_KEY, _support_installs_and_keys.PR16_NOTICE, _support_installs_and_keys.RealStatusAfterInstall, _support_installs_and_keys.TIER_LABELS, _support_installs_and_keys.WEB, _support_installs_and_keys.WrittenFilesAreGuarded, _support_installs_and_keys.secrets_in, _support_installs_and_keys.tree_of)   # support import
 _support_loader = importlib.import_module("support.loader")   # support import
 SCENARIO, SWITCHBOARD, SWITCHBOARD_SOURCE_FILES, _load, captured, class_source, class_source_fn, copy_entry, sb, sc, switchboard_source, with_http_head = (_support_loader.SCENARIO, _support_loader.SWITCHBOARD, _support_loader.SWITCHBOARD_SOURCE_FILES, _support_loader._load, _support_loader.captured, _support_loader.class_source, _support_loader.class_source_fn, _support_loader.copy_entry, _support_loader.sb, _support_loader.sc, _support_loader.switchboard_source, _support_loader.with_http_head)   # support import
+_REAL = sb.real_locations_from(os.environ)   # the real state, config and audit locations, computed once BEFORE any test isolates HOME or XDG_*, and passed on to every child process (a child with a temporary HOME is then not "the real one")
+os.environ.setdefault(sb.REAL_LOCATIONS_ENV, json.dumps({"state": sorted(_REAL[0]), "config": sorted(_REAL[1]), "audit": sorted(_REAL[2])}))
 _support_orders_and_adapters = importlib.import_module("support.orders_and_adapters")   # support import
 BoundedList, BoundedOut, EA, EXTERNAL_ADAPTER, ExternalAdapterCase, FakeDoorServer, FakeExternal, FakeGhPr, FakePruneDocker, FakeWorkHost, FakeWorkSink, HEAD_A, HEAD_B, PermanentRefusal, PickyExternal, baseline_failing_send, baseline_failing_source, baseline_golden, captain_pr, cos_orders_file, fake_mapping, janitor_review, pr_view_json, put_cos_orders, report, reviewed_janitor_argv, worker = (_support_orders_and_adapters.BoundedList, _support_orders_and_adapters.BoundedOut, _support_orders_and_adapters.EA, _support_orders_and_adapters.EXTERNAL_ADAPTER, _support_orders_and_adapters.ExternalAdapterCase, _support_orders_and_adapters.FakeDoorServer, _support_orders_and_adapters.FakeExternal, _support_orders_and_adapters.FakeGhPr, _support_orders_and_adapters.FakePruneDocker, _support_orders_and_adapters.FakeWorkHost, _support_orders_and_adapters.FakeWorkSink, _support_orders_and_adapters.HEAD_A, _support_orders_and_adapters.HEAD_B, _support_orders_and_adapters.PermanentRefusal, _support_orders_and_adapters.PickyExternal, _support_orders_and_adapters.baseline_failing_send, _support_orders_and_adapters.baseline_failing_source, _support_orders_and_adapters.baseline_golden, _support_orders_and_adapters.captain_pr, _support_orders_and_adapters.cos_orders_file, _support_orders_and_adapters.fake_mapping, _support_orders_and_adapters.janitor_review, _support_orders_and_adapters.pr_view_json, _support_orders_and_adapters.put_cos_orders, _support_orders_and_adapters.report, _support_orders_and_adapters.reviewed_janitor_argv, _support_orders_and_adapters.worker)   # support import
 _support_policy_and_import = importlib.import_module("support.policy_and_import")   # support import
@@ -7248,6 +7250,8 @@ class GithubRig:
     """A hub on fake GitHub, attached to an engine on the fake fleet, on one simulated clock."""
 
     def __init__(self, test, agents=None, config=None, repos=(GH_REPO,)):
+        if not isinstance(test, Base):
+            raise sb.RealStateRefused("GithubRig in %s: a rig with no state of its own is the real state directory; derive the test from Base (isolating)" % type(test).__name__)
         raw = {"github_repos": list(repos), "gh": GH_BIN}
         raw.update(config or {})
         self.world = World(test, agents=(), config=raw)
@@ -8921,6 +8925,33 @@ class TestGithubScenarios(Base):
 
 
 # ------------------------------------------------------- portability and hygiene
+
+
+class TestFactSourcesRegistered(unittest.TestCase):
+    """Every *Facts source class of the entry and its parts is a member of fact_sources (#1756's merge dropped HeldSendFacts: held sends were
+    stored and never delivered)."""
+
+    @staticmethod
+    def defined():
+        import ast
+        files = [BIN / "fleet-switchboard"] + sorted((BIN / "switchboard").glob("*.py"))
+        return {n.name for f in files for n in ast.parse(f.read_text()).body if isinstance(n, ast.ClassDef) and n.name.endswith("Facts")}
+
+    @staticmethod
+    def missing(sources, defined):
+        have = {type(s).__name__ for s in sources}
+        return sorted(defined - have)
+
+    def test_every_facts_class_is_registered_in_fact_sources(self):
+        with tempfile.TemporaryDirectory() as d:
+            sources = sb.fact_sources(d)
+        missing = [n for n in self.missing(sources, self.defined()) if n != "Facts"]
+        self.assertEqual(missing, [], "a *Facts class is defined but not in fact_sources: %s" % ", ".join(missing))
+
+    def test_planted_a_list_missing_held_send_facts_fails_naming_it(self):
+        with tempfile.TemporaryDirectory() as d:
+            sources = [s for s in sb.fact_sources(d) if type(s).__name__ != "HeldSendFacts"]
+        self.assertEqual(self.missing(sources, self.defined()), ["HeldSendFacts"])
 
 
 class TestHygiene(unittest.TestCase):
@@ -19226,7 +19257,8 @@ class TestFleetHooksPlugin(Base):
         self.assertFalse(env["hasCanary"])
         self.assertNotIn("OPENROUTER_API_KEY", env["keys"])
         self.assertIn("FLEET_SWITCHBOARD_LAB", env["keys"])
-        self.assertLessEqual(set(env["keys"]) - {"FLEET_SWITCHBOARD_LAB", "FLEET_SWITCHBOARD_UNDER_TEST"},   # the suite's own marker (refuse the real opencode) is passed on
+        self.assertLessEqual(set(env["keys"]) - {"FLEET_SWITCHBOARD_LAB", "FLEET_SWITCHBOARD_UNDER_TEST",
+                                                     "FLEET_SWITCHBOARD_REAL_LOCATIONS"},   # the suite's own marker (refuse the real opencode) is passed on; the guard (#1322) is active in the child, which needs the real locations
                              {"PATH", "HOME", "TMPDIR", "LANG", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_RUNTIME_DIR"})
 
     def test_stricter_is_strict(self):
@@ -22757,6 +22789,7 @@ class TestSweep(Base):
         ("body", "the body is None", {"body": None}, {}, "not ready"),
         ("body_unreadable", "the body is not text", {"body_unreadable": True}, {}, "not checked"),
         ("captain", "captain None and no floor: G6 is not open", {"captain": None}, {}, "not ready"),
+        ("captain_findings", "captain_findings absent: the baseline stays ready", {"captain_findings": KeyError}, {}, "ready"),
         ("holds", "holds None (only the label of a hold)", {"holds": None}, {}, "ready"),
         ("holds", "holds absent", {"holds": KeyError}, {}, "ready"),
         ("author", "author None: the proof writers still exclude", {"author": None}, {}, "ready"),
@@ -30019,6 +30052,26 @@ class TestPlanLedger(LedgerBase):
         self.assertIn("LEDGER", self.run_as("coder", "gates", self.PR)[1])
         self.assertTrue(report["ledger_problem"])
 
+    def test_g6_says_a_marker_without_a_hold_when_the_floor_says_not_held(self):
+        facts = {"head": LEDGER_HEAD, "ci": "green", "captain": True, "captain_findings": ["marker-without-label"],
+                 "body": "MERGE: captain", "floor": {"decision": "none"}}
+        row = lambda f: next(r for r in sb.plan_ledger.evaluate_gates(None, [], None, f, self.PR)["gates"] if r["gate"] == "G6")
+        self.assertEqual(row(facts)["status"], "ok")
+        self.assertIn("set MERGE: automatic", row(facts)["detail"])
+        self.assertEqual(row(dict(facts, floor={"decision": "hold"}))["status"], "waiting")
+        self.assertEqual(row(dict(facts, captain_findings=[]))["status"], "waiting")   # a merge-captain label is a hold
+
+    def test_g6_keeps_waiting_when_holds_is_non_empty_or_the_floor_is_absent_or_unreadable(self):
+        facts = {"head": LEDGER_HEAD, "ci": "green", "captain": True, "captain_findings": ["marker-without-label"],
+                 "body": "MERGE: captain", "floor": {"decision": "none"}}
+        row = lambda f: next(r for r in sb.plan_ledger.evaluate_gates(None, [], None, f, self.PR)["gates"] if r["gate"] == "G6")
+        for name, f in (("holds", dict(facts, holds=["hold"])), ("absent", {k: v for k, v in facts.items() if k != "floor"}),
+                        ("unreadable", dict(facts, floor={"unreadable": "boom"}))):
+            with self.subTest(name):
+                self.assertEqual(row(f)["status"], "waiting")
+                self.assertNotIn("set MERGE: automatic", str(row(f)))
+        self.assertEqual(row(facts)["status"], "ok")
+
     def test_g4_g5_and_g6_read_the_pr(self):
         self.all_proven()
         self.pr["statusCheckRollup"] = [{"conclusion": "FAILURE", "status": "COMPLETED"}]
@@ -30494,10 +30547,11 @@ class TestWaive(LedgerBase):
                   "result": "pass", "expires": self.world.clock.now() + 3600}
         sb.plan_ledger.append_entry(self.world.state, forged, self.world.clock.now())
         report = self.gates()[1]
-        self.assertEqual(self.row(report, "G6")["status"], "waiting")               # the owner's hold stands
+        self.assertEqual(self.row(report, "G6")["status"], "ok")                    # a marker without a hold (the floor says not held), never waived into it
+        self.assertIn("set MERGE: automatic", self.row(report, "G6")["detail"])
         self.assertEqual(self.row(report, "G1")["status"], "waived")
         code, payload, _ = self.check()
-        self.assertEqual([f["gate"] for f in payload["failed"]], ["G6", "G6b"])      # still failing (reported: a repo lists G6 to enforce it)
+        self.assertEqual([f["gate"] for f in payload["failed"]], ["G6b"])      # the held PR's body is still checked
         self.assertEqual(self.run_as("coder", "gates-check", self.PR, "--for", "merge")[0], 0)   # G6 is not in this repo's enforced list
 
     def test_a_short_reason_is_refused(self):
@@ -38950,7 +39004,7 @@ class TestCiRecordPass(LedgerBase):
         self.go()
         line = sb.ci_record_status_line(self.world.state, self.t + 30)
         self.assertIn("ci-record: last pass", line)
-        self.assertIn("recorded 2 since the daemon started", line)
+        self.assertIn("recorded 2, already 0 since the daemon started", line)
         self.assertIn("last record", line)
 
     def pr_state(self, ref, *more):
@@ -39211,7 +39265,8 @@ class TestCiRecordPass(LedgerBase):
             with self.subTest(rollup=rollup):
                 self.pr["statusCheckRollup"] = rollup
                 self.go(advance=1000)
-        self.assertEqual((self.verdicts(), self.events("gate.ci_record")), ([], []))
+        self.assertEqual(self.verdicts(), [])
+        self.assertLessEqual([e["detail"].get("skip") for e in self.events("gate.ci_record")], ["pending"])   # at most one skip line per reason, nothing else
 
     def test_a_draft_pr_with_a_plan_gets_its_ci_verdict_so_ready_is_not_a_chicken_and_egg(self):
         self.hub.prs["acme/app"] = [self.listed(9, draft=True)]
@@ -39258,10 +39313,10 @@ class TestCiRecordPass(LedgerBase):
         calls = self.view_calls()
         self.gh_down = True
         self.simulate(minutes=16)      # a 5 s daemon loop for 16 minutes: 192 passes
-        self.assertLessEqual(len(calls), 4, calls)
-        self.assertGreaterEqual(len(calls), 2, "it is retried, with a delay that doubles (5, 10, 20, then 30 minutes)")
+        self.assertLessEqual(len(calls), 7, calls)
+        self.assertGreaterEqual(len(calls), 4, "it is retried at the next pass for the first failures, then with a delay that doubles (5, 10, 20, then 30 minutes)")
         errors = [e["detail"]["retry_in"] for e in self.world.audit() if e["event"] == "ci_record.error"]
-        self.assertEqual(errors[:3], [300, 600, 1200])
+        self.assertEqual(errors[:4], [0, 300, 600, 1200])   # the audit folds the two repeats of the first
         self.gh_down = False
         self.go(advance=3600)
         self.assertEqual(len(self.verdicts()), 2, "and it recovers once it can be read")
@@ -39389,6 +39444,128 @@ class TestCiRecordPass(LedgerBase):
         self.configure(evaluators={"ci": ["switchboard"]})
         self.assertEqual(self.run_as(None, "gates", "mode", "acme/app", "off")[0], 0)
         self.assertEqual(json.loads(self.config_file.read_text())["plan_gates"]["ci_record"], {"calls_per_pass": 12})
+
+
+class TestCiRecordPassOrder(LedgerBase):
+    """#1119: a green CI is recorded within one pass. The pass visits PRs before it re-reads lists, retries a skipped PR first and
+    says every skip once. A counting runner records every gh read; nothing is written to GitHub."""
+
+    REPOS = ("acme/app", "acme/tools", "acme/docs", "acme/infra")
+
+    def setUp(self):
+        super().setUp()
+        self.set_repos(self.REPOS)
+        self.t = 100000.0
+        self.views, self.failing, self.rollups, self.engine_cached = [], {}, {}, None
+        self.view_marks = []
+
+    def set_repos(self, repos, extra=None):
+        plan_gates = {"repos": {r: {"mode": "shadow"} for r in repos}}
+        plan_gates.update(extra or {})
+        self.extra_config = {"plan_gates": plan_gates}
+        self.configure(evaluators={"ci": ["switchboard"], "reviewer": ["rev"], "tester": ["tst"]})
+        self.hub = FakeHub({r: [self.listed(9)] for r in repos})
+
+    def listed(self, number, body="PLAN: acme/app#7", base="main"):
+        return {"number": number, "head": {"sha": LEDGER_HEAD}, "body": body, "draft": False, "base": {"ref": base}}
+
+    def counting(self, argv, **kwargs):
+        if argv[0] == FAKE_GH and argv[1] == "pr" and argv[2] == "view":
+            number = int(argv[3].rsplit("#", 1)[-1])
+            self.views.append(number)
+            self.view_marks.append(len(self.hub.reads))
+            if self.failing.get(number, 0) > 0:
+                self.failing[number] -= 1
+                return subprocess.CompletedProcess(argv, 1, "", "gh: connection reset by peer")
+            if number in self.rollups:
+                saved = self.pr["statusCheckRollup"]
+                self.pr["statusCheckRollup"] = self.rollups[number]
+                try:
+                    return self.route(argv, **kwargs)
+                finally:
+                    self.pr["statusCheckRollup"] = saved
+        return self.route(argv, **kwargs)
+
+    def go(self, advance=0):
+        self.t += advance
+        if self.engine_cached is None:
+            engine = self.world.new_engine("daemon")
+            engine.hub, engine.gh_runner = self.hub, self.counting
+            engine.config = sb.load_config()
+            engine.state_dir = self.world.state
+            self.engine_cached = engine
+        sb.ci_record_pass(self.engine_cached, self.t)
+
+    def verdicts(self):
+        return [e for e in self.ledger() if e["kind"] == "verdict"]
+
+    def skips(self):
+        return [(e["subject"], e["detail"]["skip"]) for e in self.world.audit() if e["event"] == "gate.ci_record" and e["detail"].get("skip")]
+
+    def test_a_green_ci_is_recorded_in_one_pass_over_four_stale_lists_with_one_failed_read(self):
+        self.pr["statusCheckRollup"] = [{"status": "IN_PROGRESS", "conclusion": ""}]
+        self.go()                                                    # lists read, CI still running: nothing recorded
+        self.assertEqual(self.verdicts(), [])
+        self.pr["statusCheckRollup"] = [{"conclusion": "SUCCESS", "status": "COMPLETED"}]
+        for key in list(self.hub.prs):                               # another base branch in one of the repositories
+            self.hub.prs[key] = [self.listed(9, base="release/1")]
+        self.failing[9] = 1                                          # one gh read fails once
+        self.views.clear()
+        self.go(advance=sb.CI_RECORD_LIST_TTL + sb.CI_RECORD_PENDING_RETRY + 1)   # the lists are stale
+        self.assertEqual(sorted({(v["pr"], v["scenario"]) for v in self.verdicts()}),
+                         sorted((r + "#9", s) for r in self.REPOS for s in ("S1", "U1")), "all four repositories, in ONE pass")
+        self.assertEqual(len(self.verdicts()), 8, "never twice")
+        self.assertLessEqual(len(self.views) * sb.CI_RECORD_PR_COST, 30)
+
+    def test_a_warm_pass_visits_a_pr_before_it_re_reads_a_stale_list(self):
+        self.pr["statusCheckRollup"] = [{"status": "IN_PROGRESS", "conclusion": ""}]
+        self.go()                                                    # cold: the lists are read first
+        self.view_marks.clear()
+        before = len(self.hub.reads)
+        self.go(advance=sb.CI_RECORD_LIST_TTL + sb.CI_RECORD_PENDING_RETRY + 1)   # every list stale, PRs due
+        self.assertGreater(len(self.hub.reads), before, "the stale lists are read")
+        self.assertTrue(self.view_marks, "PRs are visited")
+        self.assertEqual(self.view_marks[0], before, "the first PR is visited before any list is re-read")
+
+    def test_a_skipped_pr_is_audited_once_with_its_reason_and_visited_first_at_the_next_pass(self):
+        self.set_repos(("acme/app",), {"ci_record": {"calls_per_pass": 12}})
+        self.hub.prs["acme/app"] = [self.listed(9), self.listed(10, body="**PLAN:** acme/app#7"), self.listed(11), self.listed(12)]
+        self.rollups[9] = [{"status": "IN_PROGRESS", "conclusion": ""}]
+        self.failing[11] = 1
+        self.go()
+        self.assertEqual(sorted(self.skips()), [("acme/app#10", "no plan link"), ("acme/app#11", "unreadable"), ("acme/app#12", "budget"),
+                                                ("acme/app#9", "pending")])
+        self.views.clear()
+        self.go(advance=1)
+        self.assertEqual(sorted(self.views[:2]), [11, 12], "the skipped PRs come first")
+        self.assertEqual({v["pr"] for v in self.verdicts()}, {"acme/app#11", "acme/app#12"})
+
+    def test_the_budget_is_never_exceeded_and_nothing_is_written(self):
+        self.set_repos(("acme/app",), {"ci_record": {"calls_per_pass": 10}})
+        self.hub.prs["acme/app"] = [self.listed(n) for n in range(9, 16)]
+        self.go()
+        self.go(advance=1)
+        self.assertLessEqual(len(self.views), 2 * 2, self.views)
+        self.assertEqual(len({(v["pr"], v["scenario"]) for v in self.verdicts()}), len(self.verdicts()))
+
+    def test_a_check_that_finishes_after_the_proofs_is_recorded_at_the_next_pass(self):
+        self.set_repos(("acme/app",))
+        self.pr["statusCheckRollup"] = [{"status": "IN_PROGRESS", "conclusion": ""}]
+        self.go()
+        for sid in ("S1", "U1"):
+            self.assertEqual(self.run_as("coder", "prove", sid, "--pr", self.PR, "--evidence", "ran the suite: 12 passed")[0], 0)
+        self.assertEqual(self.verdicts(), [])
+        self.pr["statusCheckRollup"] = [{"conclusion": "SUCCESS", "status": "COMPLETED"}]
+        self.go(advance=sb.CI_RECORD_PENDING_RETRY + 1)
+        self.assertEqual(sorted(v["scenario"] for v in self.verdicts() if v["by"] == "switchboard"), ["S1", "U1"])
+
+    def test_the_status_line_shows_already_recorded_verdicts(self):
+        self.set_repos(("acme/app",))
+        self.run_as("coder", "gates", "ci-record", self.PR)
+        self.go()
+        self.assertIn("already", sb.ci_record_status_line(self.world.state, self.t))
+        self.assertIn("recorded 0", sb.ci_record_status_line(self.world.state, self.t))
+
 
 
 class TestJudgeEval(Base):
@@ -60737,6 +60914,7 @@ class TestV2LightGuards(Base):
         ("triage_stop", 1): (3, "stop", ()),
         ("synthetic_lines", 1): (5, "lines", (("transcript_lines", 1),)),
         ("transcript_lines", 1): (5, "transcript", ()),
+        ("read_errored_turn", 1): ("covered", "its own test: test_under_light_a_blocked_agent_is_read_blocked_and_nothing_is_read in TestErroredTurn (tests/switchboard/test_errored_turn.py)", ()),
         ("undelivered_wake_tick", 1): ("list", "wedged", (("V2Reads.inbox", 1),)),
         ("chat_clear_live_now", 1): ("chat", "the live decision: shadow under light; pinned by TestChatClearHook test_light_live_route_* and test_light_live_every_route_*", ()),
         ("chat_clear_prompts", 1): ("chat", "the ONE allowed read: pinned by TestChatClearHook (S1 to S4)", ()),
@@ -66643,6 +66821,7 @@ TestRunLauncherShapes, TestStatusLines, TestTurnEnd, TestDictCallersUnchanged = 
 TestEveryKindDelayedMark = importlib.import_module("test_every_kind_delayed_mark").TestEveryKindDelayedMark
 TestHeaderDate, TestHeaderDateCallSites, TestHeaderInfiniteTime = (_hd := importlib.import_module("test_header_date")).TestHeaderDate, _hd.TestHeaderDateCallSites, _hd.TestHeaderInfiniteTime
 TestSignedLinkScrub = importlib.import_module("test_signed_link_scrub").build(Base, GithubRig)
+TestErroredTurn = importlib.import_module("test_errored_turn").build(Base, World, FAKE_OPENCODE, FAKE_HERDR)
 TestCharterOtherRepo = importlib.import_module("test_charter_other_repo").build(CharterRig, Base)
 TestCiQueue = importlib.import_module("test_ci_queue").build(HandoffCase, FAKE_GH)   # #1961
 TestLaunchQueue = importlib.import_module("test_launch_queue").build(HandoffCase)
@@ -74493,6 +74672,9 @@ class TestResume(Base):
         self.sid = self.world.sessions["coder"]
         self.pane["status"] = "blocked"   # the terminal shows an ended turn as blocked
         os.environ[sb.LAB_ENV] = "1"
+        patcher = mock.patch.object(sb, "read_errored_turn", lambda *args, **kw: False)   # #1697: these tests are the long-block path of an agent that stays blocked (the errored read is #1697's own tests)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def cli(self, *argv):
         self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
@@ -79184,15 +79366,153 @@ class ReviewCommentEndToEndTests(Base):
         self.assertTrue(paths)
 
 
+# ------------------------------------------------- every test class isolates, or says why not (#1322)
+
+# THE one exceptions table: a unittest.TestCase that is not derived from Base (which isolates HOME and the XDG directories) is listed here with a one-line reason.
+# A class in the first group that builds a World or a rig fails the test below: it must derive from Base.
+NOT_ISOLATED_BY_BASE = {
+    "builds no World, rig or state path: it reads source text, parses strings or runs pure functions": (
+    "AnswerBase", "BotDocumentation", "BotLines", "BotMutants", "BotSize", "BotVerdict", "BotWake", "Cases", "ClaimsNoteBase", "ExternalAdapterCase",
+    "Fixture", "HubFilesUnchanged", "JanitorIdentity", "Launcher", "OneWorkerAndCancel", "PendingJobs", "RelayLoopCadence", "RelayObeysTheTreeGuard",
+    "ReviewCommentIsolationTests", "Rig", "TestAgentCredentialsDoc", "TestAgentDefinitions", "TestAgentRegistry", "TestAgentRegistryInventory",
+    "TestAgentsVerify", "TestAges", "TestAlertConfig", "TestApprovalExemptionGuard", "TestApprovalReadsFresh", "TestArchTools",
+    "TestArchitectureDocument", "TestArchitectureDocumentFailurePaths", "TestArchitectureSafetyNet", "TestAskIssueSubject", "TestAskWaive",
+    "TestAssembler", "TestAuditRotation", "TestAuthorityModulesGuard", "TestBatchingDocs", "TestBellMigration", "TestBigRegistrarFile",
+    "TestBranches", "TestBriefParsing", "TestBuilderChecklist", "TestCallerWorkspace", "TestCapsAndScrub", "TestCensus", "TestCharterEditGuard",
+    "TestCharterNoParent", "TestChatClearJudge", "TestChatClearOffers", "TestChecklistAndFamilyTexts", "TestChiefOfStaffNativePermissions",
+    "TestCiOutsideBin", "TestCiTestFileList", "TestClaimMutants", "TestClaimPlacement", "TestClaimReaders", "TestClaimsNoteDocumentation",
+    "TestClaimsNoteMutants", "TestClaimsNotePass", "TestClaimsNoteScan", "TestClaimsNoteSkips", "TestClaimsNoteText", "TestClassify",
+    "TestClearCarry", "TestClearCodePathsAlwaysHeld", "TestClearNoticeOrderMutants", "TestClosedUnmergedAskClose", "TestClosedUnmergedDocs",
+    "TestClosedUnmergedLastPr", "TestClosingKeywordWarning", "TestCommissioningDocs", "TestCompactionShape", "TestCompose", "TestConcurrencyGroup",
+    "TestConflictCarry", "TestCosDelegatedClearPermission", "TestCosTriageAllowRule", "TestCountMovable", "TestCutoverRunbook",
+    "TestDecisionBaselineIds", "TestDecisionHeadlines", "TestDecisionIds", "TestDecisionOrder", "TestDecisionsPanelOrder",
+    "TestDecisionsPluginSource", "TestDecisionsRoleText", "TestDecisionsStaleBound", "TestDecisionsStyledPanel", "TestDeployFromMainSentence",
+    "TestDerivedClosure", "TestDictCallersUnchanged", "TestDocs", "TestDocument", "TestDocumentTable", "TestDocumentation",
+    "TestDropNeverBlocksAWrite", "TestDuplicateBindings", "TestEndTickWithoutStateDirectory", "TestEventFeedLines", "TestEventFeedReads",
+    "TestEvents", "TestEveryBriefTestFileIsBound", "TestEveryFunctionOf1066IsPinned", "TestEveryKindDelayedMark",
+    "TestEveryReaderOfAPullRequestsFileList", "TestEveryTestFileIsWired", "TestExternalAdapterErrors", "TestExternalAdapterFeed",
+    "TestExternalAdapterHygiene", "TestExternalAdapterKeys", "TestExternalAdapterMapping", "TestExternalAdapterOperations", "TestExternalAdapterPort",
+    "TestExternalAdapterWork", "TestExternalDecisionConfig", "TestExternalDecisionRules", "TestFakeModule", "TestFeedShape", "TestFileRead",
+    "TestFleetHooksSource", "TestFocusedLocalRuns", "TestGateLegs", "TestGhShimSign", "TestGhShimSignRepoFlag", "TestGithubWritingRule",
+    "TestGuardSet", "TestHardening", "TestHeavyCeilings", "TestHeavyFifo", "TestHeavyHolders", "TestHeavyProgress", "TestHeavyQueueLogic",
+    "TestHeavySplit", "TestHeavyWaitRecord", "TestHeavyWatchdog", "TestHeldSummaryFlowchart", "TestHygiene", "TestIdsAndEtags", "TestImpactFloorPure",
+    "TestImportOrder", "TestImportSchemaChecker", "TestImportV1Converter", "TestInstallDocs", "TestIntegrationBranchVerdictText", "TestIntentChange",
+    "TestIntentParsing", "TestItemVerdicts", "TestJobEndRecord", "TestJobFacts", "TestJobTool", "TestJudgeSample",
+    "TestJudgeToolWritesNothingElsewhere", "TestLatestRunOfWorkflow", "TestLaunchMemoryTest", "TestLedgerReadRace", "TestLostWorker",
+    "TestLostWorkerMemoryOnly", "TestLostWorkerReadRound", "TestLostWorkerRemembers", "TestLostWorkerSlowPass", "TestMacosReader", "TestMadeUpPids",
+    "TestMergeGateAnswer", "TestMergeGateAnswerMutant", "TestMergeGateDocs", "TestMessageId", "TestMessageTimes", "TestMovingADefinition",
+    "TestMutant", "TestMutantControlRule", "TestMutantIsCaught", "TestMutants", "TestNestedImports", "TestNewModuleDemands", "TestNewestCiRuns",
+    "TestNoFailureMode", "TestOneVocabulary", "TestOrdersBodyEdits", "TestOrdersFact", "TestOrdersRoleText", "TestOwnMarkerNotHonoured",
+    "TestOwnMeasurementTester", "TestOwnReviewLaws", "TestOwnerClearModule", "TestOwnerEvaluatorsAreRare", "TestOwnerHoldRule", "TestPR10Source",
+    "TestPR4Catalog", "TestPR7Source", "TestPR8Source", "TestPaneWarningRule", "TestParseCheckpoint", "TestParseOrders", "TestPlanCheckFeedback",
+    "TestPlanCheckHash", "TestPlanCheckParser", "TestPlanCheckRound2", "TestPlanCheckRules", "TestPlanCheckSelection", "TestPlanKind",
+    "TestPlanOperationsPerBoss", "TestPlanReceipts", "TestPlanReviewCore", "TestPlanRulesWordedAlike", "TestPlanTemplateDoc", "TestPlanningDecision",
+    "TestPlanningSkill", "TestPlatformClassList", "TestPlatformPaths", "TestPluginPush", "TestPodNiceness", "TestPolicyRedaction",
+    "TestPolicyRequest", "TestPreflightPr", "TestPushWatch", "TestReadCheckRuns1237", "TestReadOnly", "TestReadWholeAuditTable", "TestRealDirectory",
+    "TestReasonsAreOneCleanLine", "TestReconcileOnRead", "TestRecordJsonReaders", "TestRefusalInAPart", "TestRegistryEndpoint", "TestReplay",
+    "TestReportFoldVariants", "TestRoutineLocal", "TestRunLauncherShapes", "TestSamples", "TestScanDriftGuard", "TestScenarioValidator",
+    "TestScratchDirectory", "TestScratchFileRule", "TestScrubFailsClosed", "TestScrubPatterns", "TestSelfRegisteringCli", "TestSelfWakeInstructions",
+    "TestServiceIdentity", "TestSets", "TestShadowGlue", "TestShadowRule", "TestShadowStatuses", "TestShards", "TestSharesDeadVerdict",
+    "TestShimGuardDocs", "TestShimGuardMutants", "TestShimGuardRows", "TestShimGuardsTool", "TestShimHygiene", "TestShimHygienePlanted",
+    "TestSkillsSync", "TestSources", "TestStandingAuthority", "TestStatusIntentGapsAreBounded", "TestStatusLines", "TestStructuralRuleInReviewing",
+    "TestSupportRebinding", "TestSyncReportFreezePerBoss", "TestTheArchitectureTestIsRun", "TestTheBinSetClassesAreAllInTheTable", "TestTheCheck",
+    "TestTheDerivationIsHeld", "TestTheMergeGate", "TestTierRoleText", "TestTriageRuleInputs", "TestTriageStandingLine", "TestTurnEnd",
+    "TestUnionCheckLimitsDocs", "TestVerdictRecordingText", "TestWhoCanClear", "TestWiredCheckPlanted", "TestWorkItemRules", "TestWorkSyncPump",
+    "TestWorkerRulesInSkills", "TestWriting", "TrickleHub", "TwoLoopsTrace", "WorkflowPlanPins",
+    ),
+    "makes its own temporary directory or state (a tempfile.mkdtemp, a patched environment or its own isolating setUp) and never reads the real one": (
+    "TestEveryTestClassIsolates",
+    "Case", "HeaderCacheBase", "TestCloudWatchBounds", "TestCloudWatchTick", "TestGatePass", "TestHostDisk", "TestIsolation", "TestSafety",
+    ),
+}
+
+
+ISOLATION_BUILDERS = ("World(", "GithubRig(", "CharterRig(", "FarmRig(", "ensure_state_dir(", "state_dir_path(", "config_path(")
+ISOLATION_FILES = ("bin/test-switchboard", "tests/switchboard/test_*.py", "tests/switchboard/support/*.py")
+
+
+class TestEveryTestClassIsolates(unittest.TestCase):
+    """The ast of the suite (the entry, every test file, the support): every TestCase class derives (through any chain) from Base or is in NOT_ISOLATED_BY_BASE."""
+
+    @staticmethod
+    def classes():
+        import glob
+        root = Path(__file__).resolve().parents[1]
+        table = {}
+        for pattern in ISOLATION_FILES:
+            for path in sorted(glob.glob(str(root / pattern))):
+                for node in ast.parse(Path(path).read_text()).body:   # top level: a class nested in a test is that test's own fixture
+                    if isinstance(node, ast.ClassDef):
+                        table.setdefault(node.name, []).append(node)
+        return table
+
+    @classmethod
+    def reaches(cls, node, target, table, seen=()):
+        for base in (ast.unparse(b) for b in node.bases):
+            if base in target or (base in table and base not in seen and any(cls.reaches(m, target, table, seen + (node.name,)) for m in table[base])):
+                return True
+        return False
+
+    @classmethod
+    def offenders(cls):
+        table = cls.classes()
+        listed = {name: reason for reason, names in NOT_ISOLATED_BY_BASE.items() for name in names}
+        bad = []
+        for name, nodes in table.items():
+            for node in nodes:
+                if name == "Base" or not cls.reaches(node, ("unittest.TestCase", "TestCase"), table) or cls.reaches(node, ("Base",), table):
+                    continue
+                if name not in listed:
+                    bad.append(name)
+                elif listed[name].startswith("builds no") and any(b in ast.unparse(node) for b in ISOLATION_BUILDERS):
+                    bad.append(name)
+        return sorted(set(bad))
+
+    def test_no_test_class_is_neither_isolated_nor_listed(self):
+        self.assertEqual(self.offenders(), [])
+
+    def test_the_table_lists_no_class_that_does_not_exist_or_derives_from_base(self):
+        table = self.classes()
+        for reason, names in NOT_ISOLATED_BY_BASE.items():
+            for name in names:
+                with self.subTest(name=name):
+                    self.assertIn(name, table)
+                    self.assertFalse(any(self.reaches(n, ("Base",), table) for n in table[name]), name + " derives from Base: drop it from the table")
+                    self.assertTrue(any(self.reaches(n, ("unittest.TestCase", "TestCase"), table) for n in table[name]), name + " is not a TestCase")
+
+    def test_a_plain_testcase_that_builds_a_world_is_found(self):
+        # the mutant: the recorded case, a plain TestCase that builds a rig
+        src = "class Plain(unittest.TestCase):\n    def test_x(self):\n        GithubRig(self)\n"
+        node = ast.parse(src).body[0]
+        self.assertTrue(any(b in ast.unparse(node) for b in ISOLATION_BUILDERS))
+        self.assertFalse(self.reaches(node, ("Base",), {"Plain": [node]}))
+        self.assertNotIn("Plain", [n for names in NOT_ISOLATED_BY_BASE.values() for n in names])
+
+    def test_world_and_rig_refuse_state_none_outside_base(self):
+        class Plain(unittest.TestCase):
+            def runTest(self):
+                pass
+        for build, named in ((lambda t: World(t), "World(state=None)"), (lambda t: GithubRig(t), "GithubRig in")):   # the rig's own refusal, not the World it would build
+            with self.subTest(named=named):
+                with self.assertRaises(sb.RealStateRefused) as caught:
+                    build(Plain())
+                self.assertIn(named, str(caught.exception))
+
+
 if __name__ == "__main__":
     # Run directly, the suite takes a CPU slot (`fleet-switchboard heavy`): several full suites at once starve the machine. FLEET_HEAVY=off, a CI run, a run
     # already in a slot, or a state directory that cannot be written run it as it is.
-    _wrapped = sb.load_heavy_slots().wrap_argv(sys.argv[1:], os.environ, sys.executable, str(SWITCHBOARD), os.path.abspath(__file__),
-                                                                  state_dir=sb.state_dir_path())
-    if _wrapped is not None:
-        try:
-            os.execv(_wrapped[0], _wrapped)
-        except OSError as _err:
-            sys.stderr.write("heavy: cannot start the slot wrapper (%s): running without a slot\n" % (_err.strerror or _err))
+    _marker = os.environ.pop(sb.UNDER_TEST_ENV, None)   # the slot wrapper reads the daemon's own config and slot directory by design (CPU slots are shared with the daemon): the guard is off for this one call
+    try:
+        _wrapped = sb.load_heavy_slots().wrap_argv(sys.argv[1:], os.environ, sys.executable, str(SWITCHBOARD), os.path.abspath(__file__),
+                                                                      state_dir=sb.state_dir_path())
+        if _wrapped is not None:
+            try:
+                os.execv(_wrapped[0], _wrapped)   # the marker stays off: the wrapper is not a test; the suite it starts sets the marker again
+            except OSError as _err:
+                sys.stderr.write("heavy: cannot start the slot wrapper (%s): running without a slot\n" % (_err.strerror or _err))
+    finally:
+        if _marker is not None:
+            os.environ[sb.UNDER_TEST_ENV] = _marker
     sys.exit(main(sys.argv[1:]))
 

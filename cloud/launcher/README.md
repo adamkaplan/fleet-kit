@@ -640,6 +640,27 @@ Test: `cloud/launcher/tests/test_retire_gone_exact.py` (against the fake cluster
 
 **A repository's smallest pod shape (`CW_REPO_MIN_SHAPE`, #1443).** What it is: one optional key of the launcher's settings file, a comma-separated list of `OWNER/NAME=SHAPE` pairs (SHAPE is `XS`, `S` or `M`; the repository is compared exactly and case-insensitively, like `CW_ALLOWED_REPOS`; for example `acme-org/widget-service=S`). The shape is a floor for that repository's launches. Why it exists: `check_shape` chose the pod shape from the launch's own flags only (`--shape`, `--stack`, the orchestrator agent) and never from the repository, so three pods of one large repository were killed for memory (exit 137, OOMKilled) on the light shape (1 CPU, 2 GiB) within 2.5 to 7.3 minutes of starting. The rule: for a listed repository a launch with no `--shape` gets the larger of the floor and the shape the flags would give (a stack launch or an orchestrator stays at least `S`); a `--shape` smaller than the floor is refused before anything is created (exit 2, one line naming the repository, the floor and `CW_REPO_MIN_SHAPE`); the same or a larger shape is accepted; an unlisted repository, or an unset setting, changes nothing. How to set it: add one line `CW_REPO_MIN_SHAPE=OWNER/NAME=SHAPE` (more pairs after commas) to the settings file, or export it when there is no file; an entry without `=`, with an unknown shape, a malformed repository or a repeated repository refuses the whole file, naming the key and no value. This change holds no repository name: the entry for a real repository is the operator's own line in the settings file.
 
+## A pod that ends Failed (ask #1442)
+
+Cause. A cloud pod that ended in the Failed phase (for example a container killed for memory, exit 137, or a pod evicted by its node) showed only
+"does not answer" in `status`, because every read of a worker goes through the agent inside the pod. The reaper asked the dead pod for its activity,
+found it unreadable, reported `activity unreadable` every minute and kept the pod for two hours, until its hard limit. No run record was written,
+because the stop path that writes it is never reached for a pod nobody can enter, so nobody could see why the pod had failed. The missing read was
+the pod's own status and events (`get_pod` and `pod_events`), which the launcher already could make and did not make for a Failed pod.
+
+What the record holds. The first reaper pass or `status` that sees the pod Failed reads, once, the pod's reason, each container's terminated reason
+and exit code, and the last 10 events (each cut to 300 characters), every text through the launcher's own scrub, and writes a run record
+(`run.json`, exit reason `pod failed`) with the reason, the exit code and the events. A later pass finds that record by the run id of the pod and
+does nothing for it: no activity read, no second record, no second report. A Failed pod without the `kept` annotation is deleted ten minutes
+after its record; one that holds unpushed work (`kept`) stays.
+
+How a lane reads it. `status` prints `pod failed: <reason>` (the reason cut to 160 characters, for example `OOMKilled (exit 137)`) for such a pod,
+instead of `does not answer`; the full reason, exit code and events are in the record's `run.json` under the run record directory.
+
+Two limits of what `status` and the reaper do. The switchboard prints the launcher's reason on one line: every control character removed, scrubbed once more by its own scrub, and a `pod_failed` value that is not text is treated like an answer it cannot read (the line for an unavailable launcher status), never an error. The reaper reads, records and deletes only a pod that carries a worker annotation: a pod with the launcher's label and none is left alone; a record that cannot be written leaves the pod in place, is reported once as `record not written`, and is written on the first pass that can.
+
+Three more limits of the record of a Failed pod. A record written when the pod could not be read has, as its reason, the text of the read error (not the pod's own reason) and is not refreshed: the pod is read once. The worker annotation of a pod is checked against the worker-name rule (the switchboard's agent name rule) before it becomes a part of a path: a pod whose annotation does not match is treated as a pod with no annotation, never read, recorded or deleted. The reaper's told-once set (the reports of an unwritable record, of an unreadable deadline and of a record time that cannot be read) clears the entry of an unwritable record when that record is written; a pod deleted by someone else leaves a few bytes in the set until the process ends. The event text stored in the record is not stripped of control characters (the JSON escapes them); only the status line prints, and it is stripped.
+
 ## A worker lost with its node
 
 **Cause: inferred until these reads are made.** On 29 October four pods that sat on one node were killed in the same second (the event `Killing: Stopping container worker`, no other event) while pods on other nodes were untouched, and the launcher's audit has no stop line for them. The cause is INFERRED to be the removal or disturbance of that node. The launcher's own login cannot read nodes (it may not list them), so the holder of the ADMINISTRATOR login confirms the cause with these read-only commands (placeholders in capitals):

@@ -23,6 +23,7 @@ import itertools
 import select
 import json
 import os
+import pwd
 from pathlib import Path
 import re
 from urllib.parse import unquote
@@ -1140,6 +1141,70 @@ class TestBigRegistrarFile(unittest.TestCase):
 
 
 class TestStateDir(Base):
+    def real_home(self):
+        """A pretend real account: the guard's real locations come from here, so no real directory is touched."""
+        real = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(real), True)
+        patcher = mock.patch.object(sb, "_real_locations", lambda: ({os.path.realpath(str(real / sb.PROG))}, {os.path.realpath(str(real / "config"))},
+                                                                      {os.path.realpath(str(real / sb.PROG / "audit.jsonl"))}))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return real
+
+    def test_the_real_state_directory_is_refused_for_none_and_for_the_real_path_and_creates_nothing(self):
+        real = self.real_home()
+        os.environ["XDG_STATE_HOME"] = str(real)   # so that the default state directory resolves to the pretend real one
+        for argument in (None, real / sb.PROG):
+            with self.subTest(argument=argument):
+                with self.assertRaises(sb.RealStateRefused):
+                    sb.ensure_state_dir(argument)
+        self.assertEqual(list(real.iterdir()), [])
+
+    def test_the_real_config_directory_and_audit_path_and_a_symlink_to_the_state_are_refused(self):
+        real = self.real_home()
+        (real / sb.PROG).mkdir()
+        link = real / "link"
+        link.symlink_to(real / sb.PROG)
+        for path, kind in ((real / "config", "config"), (real / sb.PROG / "audit.jsonl", "audit"), (link, "state")):
+            with self.subTest(kind=kind):
+                with self.assertRaises(sb.RealStateRefused):
+                    sb.refuse_real_location(path, kind)
+
+    def child_state(self, home, extra=None):
+        """A real child process, marker inherited, HOME and XDG_* at `home`: what its state_dir_path() says, or the refusal."""
+        code = ("import importlib.machinery, importlib.util, sys\n"
+                "l = importlib.machinery.SourceFileLoader('sbx', %r)\n"
+                "s = importlib.util.spec_from_loader('sbx', l); m = importlib.util.module_from_spec(s); l.exec_module(m)\n"
+                "try:\n    print(m.state_dir_path())\nexcept m.RealStateRefused as e:\n    print('REFUSED')\n" % str(SWITCHBOARD))
+        env = {k: v for k, v in os.environ.items() if not k.startswith("HERDR_")}
+        env.update({"HOME": str(home), "XDG_STATE_HOME": str(home / "xdg-state"), "XDG_CONFIG_HOME": str(home / "xdg-config"), **(extra or {})})
+        return subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=120).stdout.strip()
+
+    def test_a_real_child_with_a_temporary_home_runs_and_one_pointed_at_the_real_directory_is_refused(self):
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(tmp), True)
+        self.assertEqual(self.child_state(tmp), str(tmp / "xdg-state" / sb.PROG))
+        real = Path(json.loads(os.environ[sb.REAL_LOCATIONS_ENV])["state"][0])
+        child_home = tmp / "h"
+        self.assertEqual(self.child_state(child_home, {"XDG_STATE_HOME": str(real.parent)}), "REFUSED")
+
+    def test_mutant_without_the_passed_locations_a_child_with_a_temporary_home_is_still_fine_and_the_account_home_refused(self):
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(tmp), True)
+        gone = {k: v for k, v in os.environ.items() if k != sb.REAL_LOCATIONS_ENV}
+        with mock.patch.dict(os.environ, gone, clear=True):
+            self.assertEqual(self.child_state(tmp), str(tmp / "xdg-state" / sb.PROG))
+            self.assertEqual(self.child_state(tmp, {"XDG_STATE_HOME": str(Path(pwd.getpwuid(os.getuid()).pw_dir) / ".local/state")}), "REFUSED")
+
+    def test_without_the_marker_nothing_is_refused_and_a_temporary_path_is_fine(self):
+        real = self.real_home()
+        with mock.patch.dict(os.environ):
+            os.environ.pop(sb.UNDER_TEST_ENV)
+            self.assertEqual(sb.refuse_real_location(real / sb.PROG, "state"), real / sb.PROG)
+        other = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(other), True)
+        self.assertEqual(sb.refuse_real_location(other / "x", "state"), other / "x")
+
     def test_created_private_under_xdg_state_home_whatever_the_umask(self):
         # 0o277 strips owner bits from mkdir's mode, so only an explicit chmod
         # yields exactly 0700; 0 would let a looser mode through if one were asked for.
@@ -1720,7 +1785,7 @@ class TestCompose(unittest.TestCase):
 
     def test_every_fact_kind_the_builders_make_is_in_the_table_1302(self):
         import ast, glob
-        here = str(REPO / "bin")
+        here = str(BIN)
         found = set()
         for path in [os.path.join(here, "fleet-switchboard")] + glob.glob(os.path.join(here, "switchboard", "*.py")):
             for node in ast.walk(ast.parse(open(path).read())):
