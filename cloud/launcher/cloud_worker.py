@@ -2813,6 +2813,9 @@ class _StopKube:
         return call
 
 
+KEPT_ENDED_NOTE = "kept pod ended: its work is unreachable by exec; the pod is left for a person"
+
+
 class Launcher:
     def __init__(self, kube, env, clock=None, sleep=time.sleep):
         self.kube, self.env, self.sleep = kube, env, sleep
@@ -2821,6 +2824,7 @@ class Launcher:
         self.clock = clock or (lambda: dt.datetime.now(dt.timezone.utc))
         self.audit_path = audit_path(env)
         self.relogin = None   # set by the reaper's loop: a function that refreshes the reaper's own login now; True when it did
+        self.ended_tried = set()   # (name, uid) of kept ended pods already tried once by this process (a failed mark still counts)
         self.renew_lock = threading.RLock()   # the pass and the renewal thread never renew at the same moment
 
     # -- audit: one line per action, no secret, written before the action returns --
@@ -3417,6 +3421,17 @@ class Launcher:
                 self._hook_record(info, {"ran": False, "pushed": False, "wip_branch": None, "skipped": [], "note": "pod was %s; end hook not run" % phase})
                 return {"worker": worker, "runtime_id": "pod/" + target, "pushed": False, "wip_branch": None,
                         "skipped": [], "note": "pod was %s; end hook not run" % phase, "record": info.get("record", "")}
+            if phase in ("Failed", "Succeeded"):   # kept, and ended: no exec can reach its work. Tried ONCE: marked, left for a person, never retried
+                self.ended_tried.add((name, uid))
+                try:
+                    note = self._mark(name, uid, unreachable="true")
+                except CloudError as err:   # the mark failed: the try still counts (remembered in this process), logged once
+                    note = "could not mark the pod unreachable: %s" % self.kube.scrub(str(err), 200)
+                    print("cloud-worker: " + note, file=sys.stderr)
+                info["hook_note"] = KEPT_ENDED_NOTE + ("; " + note if note else "")
+                print("cloud-worker: " + KEPT_ENDED_NOTE, file=sys.stderr)
+                return {"worker": worker, "runtime_id": "pod/" + name, "pushed": False, "wip_branch": None,
+                        "skipped": [], "note": KEPT_ENDED_NOTE, "record": info.get("record", ""), "left": True}
             info["refresh"] = REFRESH_NONE
             try:
                 res = self.run_hook(target)
@@ -4052,6 +4067,10 @@ class Launcher:
         finally:
             steps["vanished"] = mono() - t0
         for pod in pods:
+            ended = (pod.get("status") or {}).get("phase") in ("Failed", "Succeeded")
+            if ended and ann(pod, "kept") == "true" and (ann(pod, "unreachable") == "true"
+                                                         or ((pod.get("metadata") or {}).get("name"), (pod.get("metadata") or {}).get("uid")) in self.ended_tried):
+                continue   # a kept pod that ended and was tried once: left for a person; no stop, no record, no audit
             worker = ann(pod, "worker")
             reason = None
             if PERSISTENT_ANNOTATION in ((pod.get("metadata") or {}).get("annotations") or {}):
