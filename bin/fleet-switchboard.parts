@@ -14,6 +14,7 @@ switchboard/plan_review.py
 switchboard/pr_explain.py
 switchboard/body_check.py
 switchboard/triage.py
+switchboard/claims_note.py
 switchboard/alert_labels.py
 switchboard/link_scrub.py
 switchboard/handoff.py
@@ -23,6 +24,16 @@ switchboard/audit.py
 switchboard/decision.py
 switchboard/engine.py
 switchboard/jev.py
+switchboard/faults.py
+switchboard/shadow_classifier.py
+switchboard/worktree_lifecycle.py
+switchboard/verification.py
+switchboard/judge_rule.py
+switchboard/review_laws.py
+switchboard/job_runs.py
+switchboard/standing_authority.py
+switchboard/work_moves.py
+switchboard/cockpit.py
 switchboard/launch_model.py
 switchboard/secret_spans.py
 switchboard/caches.py
@@ -31,3 +42,5 @@ switchboard/profile_pieces.py
 switchboard/installer.py
 switchboard/sent_view.py
 switchboard/bot_reviews.py
+switchboard/stage_event.py
+switchboard/scratch_dir.py
