@@ -232,7 +232,7 @@ class TestAgentRegistryInventory(unittest.TestCase):
     interface spec has its sections and its freeze line."""
     DOC = REPO / "docs" / "agent-registry.md"
     RECORDS = {
-        "pane-health.json": r"pane-health\.json|PANE_HEALTH_FILE|PANE_FILE|read_pane_health|write_pane_health|pane_health_pass|pane_health_status",
+        "pane-health.json": r"pane-health\.json|pane-health registry|PANE_HEALTH_FILE|PANE_FILE|read_pane_health|write_pane_health|pane_health_pass|pane_health_status",
         "retired.json": r"retired\.json|RETIRED_FILE|read_retired|known_agent",
         "last-reports.json": r"last-reports\.json|LAST_REPORT_FILE|record_last_report",
         "boss-overrides.json": r"boss-overrides\.json|\.overlay\(",
