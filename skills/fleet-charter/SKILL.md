@@ -239,3 +239,5 @@ by hand where the harness has no shim.
 To change one of your own comments that is not your last (a plan, a receipt), use
 `fleet-switchboard comment --edit COMMENT_URL --body-file FILE` (never a `gh api` call); an
 approved plan also needs `--approval ID`, and the approval lapses with the new hash.
+
+To change one line of an issue body (the next step, a parked date) use `fleet-switchboard issue-line`, which never changes the Intent or the Done-when; a whole-body write must keep both the Intent and the Done-when, and the gh shim refuses one that drops either.
