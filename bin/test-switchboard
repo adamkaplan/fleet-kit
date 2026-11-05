@@ -16648,7 +16648,7 @@ class TestShadowClassifier(Base):
         self.assertEqual(self.world.v2.writes, [])
         self.assertEqual(self.world.admissions("cos"), [])
         self.assertEqual(self.world.admissions("coder"), [])
-        self.assertEqual([e for e in self.world.audit() if e["event"] not in ("classify",)], [])
+        self.assertEqual([e for e in self.world.audit() if e["event"] not in ("classify", "push_watch.skipped")], [])   # push_watch.skipped (#2175): the push watch notes that it has no hub, a note about itself, not an action on the message
         self.assertEqual([c[1:3] for c in self.world.herdr.calls if c[1:3] not in HERDR_ALLOWED], [])
 
     def test_each_new_message_is_classified_once_and_the_previous_one_is_sent_along(self):
