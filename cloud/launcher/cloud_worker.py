@@ -3216,9 +3216,13 @@ class Launcher:
         t0 = mono()
         try:
             self.send_wip_notes(live, now)
-            self.send_idle_nudges(live, now, acts)
         finally:
             steps["notes"] = mono() - t0
+        t0 = mono()
+        try:
+            self.send_idle_nudges(live, now, acts)
+        finally:
+            steps["notes"] += mono() - t0   # the nudges are counted with the notes: both are the pass's sends
         steps["total"] = mono() - t_pass
         return out
 
