@@ -100,6 +100,7 @@ The **Holds** column is descriptive: only the layer numbers are enforced.
 | `cloud_cli.py` | 5 | the pod-side command to send and report through the cloud channel | |
 | `cloud_cost_report.py` | 5 | USD per day of the cloud fleet, from the launcher's audit lines (read only) | |
 | `cloud_hub.py` | 5 | the cloud switchboard's front door | |
+| `cloud_inspect.py` | 5 | the `inspect` command: what a pod of the caller is doing now, read-only (#2115); a part of `cloud_worker.py` | |
 | `cloud_retired.py` | 5 | the read of a retired cloud worker from its run record, and the boss kept at its removal (#1546); a part of `cloud_worker.py` | |
 | `cloud_way_back_check.py` | 5 | a read-only check of the way back from the cloud to local | |
 | `cloud_worker.py` | 5 | remote (cloud) workers for the switchboard | |
@@ -237,7 +238,7 @@ Kinds (the number is exact, except `size`, a ceiling with headroom: see rule 7):
 | `impact_hold.py` | `-` | size | 2,000 | the brief-bound clear (#1215) took it past the limit; to be split (ceiling = the test's own formula: 1510 lines, plus 500, rounded up to a multiple of 500) |
 | `delegated_clear.py` | `-` | size | 1,900 | the registrar lint lives with the clear it protects; a follow-up slice moves it to its own part and lowers the ceiling |
 | `switchboard/reminders.py` | `-` | size | 2,000 | the due-reminder ceiling, the `reminder.waiting` audit line and the late count (#1728) took it past the limit; the waiting and ceiling code moves to its own part in a follow-up and the row is then deleted |
-| `cloud_worker.py` | `-` | size | 1,604 | #2135 (the inspect command, +48) and #1572 (the registry note, +26) took it from 1490 to 1564 (limit 1500); a ceiling = largest measured 1564 plus a small margin; the inspect section is the next one to move to a part |
+| `cloud_worker.py` | `-` | size | 1,604 | #2135 (the inspect command, +48) and #1572 (the registry note, +26) took it from 1490 to 1564 (limit 1500); a ceiling = largest measured 1564 plus a small margin; the inspect section moved to bin/cloud_inspect.py |
 | `switchboard/agents_verify.py` | `fleet-switchboard` | entry-import | 6 | the part relies on a standard-library module the entry imported; it gets its own import line |
 | `switchboard/agents_verify.py` | `fleet-switchboard` | namespace | 7 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 | `switchboard/alert_labels.py` | `fleet-switchboard` | entry-import | 5 | the part relies on a standard-library module the entry imported; it gets its own import line |
@@ -372,6 +373,9 @@ A site is listed by the function it sits in and its kind, with a count: `import(
 | `cloud_worker.py` | `_load_cluster:exec_module` | 1 | uses an identifier of the import machinery (exec_module) |
 | `cloud_worker.py` | `_load_cluster:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
 | `cloud_worker.py` | `_load_cluster:sys.modules` | 1 | uses `sys` beyond its plain attributes |
+| `cloud_worker.py` | `_load_inspect:exec_module` | 1 | uses an identifier of the import machinery (exec_module) |
+| `cloud_worker.py` | `_load_inspect:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
+| `cloud_worker.py` | `_load_inspect:sys.modules` | 1 | uses `sys` beyond its plain attributes |
 | `cloud_worker.py` | `_registry_note:load_module(string)` | 1 | names a loading builtin by a string (a name in a list counts: over-counting by design) |
 | `cloud_worker.py` | `_first_push:load_module(string)` | 1 | names a loading builtin by a string (a name in a list counts: over-counting by design) |
 | `cloud_worker.py` | `_retired:load_module(string)` | 1 | names a loading builtin by a string (a name in a list counts: over-counting by design) |
