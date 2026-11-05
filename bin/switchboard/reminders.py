@@ -1311,6 +1311,7 @@ def ci_queue_measure(runs, jobs_by_run, now, hours=24, gate_names=(), docs_only=
     scale = 24.0 / hours
     cut = [{"kind": "cut", "what": name, "job_minutes_per_day": int(round(spent * scale))} for name, spent in sorted(job_minutes.items())
            if name not in gate_names and name not in CI_QUEUE_GATE_FEEDERS]
+    cut = [c for c in cut if "${{" not in c["what"] and not c["what"].startswith("matrix.")]   # #2197: a matrix placeholder is never a name
     candidates = cut + [
         {"kind": "dedupe", "what": "%d run(s) on a head that already had a run" % repeat_runs, "job_minutes_per_day": int(round(repeat_minutes * scale))},
         {"kind": "move", "what": "macOS legs of %d run(s) whose change touches no platform path" % len(set(docs_only)), "job_minutes_per_day": int(round(move_minutes * scale))}]

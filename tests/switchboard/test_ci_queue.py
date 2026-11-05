@@ -278,4 +278,11 @@ def build(HandoffCase, FAKE_GH):
             head = text.split("\n\n\n# ---- ci-queue", 1)[0]
             self.assertTrue(head.endswith("cmd_remind.ensure_on_use = True   # the daemon is alive when it runs\ncmd_remind.header_cache = True    # #1520"))
             self.assertEqual(text.count("def cmd_remind("), 1)
+
+        def test_s2_an_unexpanded_matrix_placeholder_is_never_a_cut_candidate(self):
+            runs = [run(1, "test", "pull_request", "aa", 0)]
+            jobs = {1: [job("shards (${{ matrix.shard }}/8)", 0, 0, 5), job("matrix.cloud", 0, 0, 5), job("stale-report", 0, 0, 7)]}
+            space = self.measure(runs, jobs, docs_only=())
+            cut = [c["what"] for c in space["candidates"] if c["kind"] == "cut"]
+            self.assertEqual(cut, ["stale-report"])
     return TestCiQueue
