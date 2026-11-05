@@ -72,8 +72,9 @@ class TestGuardSet(unittest.TestCase):
             self.assertTrue(c.wasSuccessful(), text)  # the control passes on the unmutated copy
             self.assertGreaterEqual(c.testsRun, 1)     # the named guard test ran (not a skipped-everything pass)
             self.assertEqual(c.skipped, [], "the guard test ran, it was not skipped")   # a skipped guard is a pass that checked nothing
+            # since #2210 a Test* class is bound by the runner's self-registration; a class with no loader line AND not named Test* is the one nothing reaches
             (tree / "tests" / "switchboard" / "test_planted_unloaded.py").write_text(
-                "import unittest\n\nclass TestPlantedNoLoader(unittest.TestCase):\n    def test_a(self):\n        pass\n")
+                "import unittest\n\nclass PlantedNoLoader(unittest.TestCase):\n    def test_a(self):\n        pass\n")
             r, out = guard_run()
             self.assertFalse(r.wasSuccessful(), out)
             self.assertIn("test_the_real_directory_is_wired", [t.id().rsplit(".", 1)[-1] for t, _ in r.failures + r.errors])  # the in-process form of the removed assertIn of the test name

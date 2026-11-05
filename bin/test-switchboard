@@ -3712,7 +3712,8 @@ class TestRestartGuard(Base):
     def test_send_is_refused_for_such_a_pane(self):
         self.wrong_program()
         outcome = self.world.new_engine("cli").send("coder", "platform", "hi")
-        self.assertEqual(outcome["action"], "hold")
+        self.assertFalse(outcome["sent"])
+        self.assertIn(outcome["action"], ("hold", "held"))   # #2051: a send to a held agent is kept until it unblocks, not refused outright
         self.assertEqual(self.world.v2.writes, [])
 
     def test_a_pane_that_cannot_be_read_is_held_not_assumed_fine(self):
@@ -15174,6 +15175,61 @@ class TestConflictCarryInTheDaemon(Base):
             self.rehold(new)
         self.assertEqual((len(self.body_patches()), len(self.events("gate.hold_reapplied"))), (1, 1), "once per head")
         self.assertTrue(sb.impact_rehold_open(self.world.state, self.REPO, 7))
+
+    def first_hold(self, head):
+        report = {"pr": self.PR, "head": head, "reasons": ["a sensitive path"], "floor_paths": [], "globs": []}
+        return sb.apply_impact_hold(self.engine, self.REPO, 7, report, {"labels": []})
+
+    def test_2223_s2_a_first_hold_over_an_automatic_body_leaves_captain_once(self):
+        self.body = "MERGE: automatic\n\nthe change\n"
+        new = self.own_commit()
+        self.assertGreater(self.first_hold(new), 0)
+        self.assertEqual(self.body, "MERGE: captain\n\nthe change\n", "only the marker changed")
+        self.assertEqual(len(self.body_patches()), 1)
+        (done,) = self.events("gate.hold_marker")
+        self.assertEqual((done["detail"]["before"], done["detail"]["after"]), ("MERGE: automatic", "MERGE: captain"))
+        self.labels = [l for w in self.adds() for l in w[2]["labels"]]
+        self.first_hold(new)
+        self.assertEqual((len(self.body_patches()), len(self.events("gate.hold_marker"))), (1, 1), "once per head")
+
+    def test_2223_s2_the_sweep_raises_no_s6b_after_a_first_hold_over_an_automatic_body(self):
+        self.body = "MERGE: automatic\n\nthe change\n"
+        self.first_hold(self.own_commit())
+        labels = [l for w in self.adds() for l in w[2]["labels"]]
+        self.assertEqual(self.body, "MERGE: captain\n\nthe change\n")
+
+        def sweep_kinds(body):
+            engine = self.world.new_engine("daemon")
+            engine.config.update(github_repos=[self.REPO])
+            engine.config["sweep"] = dict(sb.SWEEP_DEFAULTS, enabled=True, person_names=["Alex"])
+            engine.config["triage"] = {"our_logins": ["bot"]}
+            engine.hub = FakeSweepHub()
+            engine.hub.open = {7: sweep_issue(7, body, labels, pr=True)}
+            now = self.world.clock.now()
+            sb.decisions_from_notices(engine, now)
+            sb.sweep_decisions(engine, [], now, [])
+            sb.sweep_decisions(engine, [], now, [])
+            return [e["detail"]["kind"] for e in self.world.audit() if e["event"] == "sweep.finding" and e["detail"].get("ref", "").endswith("#7")]
+        self.assertNotIn("S6b", sweep_kinds(self.body), "the marker now agrees with the label the hold wrote")
+        self.assertIn("S6b", sweep_kinds("MERGE: automatic\n\nthe change\n"), "control: the old body (no marker set) is the S6b")
+
+    def test_2223_s3_a_changed_body_is_not_overwritten_and_a_failed_write_is_audited_once_and_the_hold_stands(self):
+        self.body = "MERGE: automatic\n\nthe change\n"
+        new = self.own_commit()
+        reads, real = [], self.route
+
+        def changed(argv, **kwargs):
+            if argv[0] == FAKE_GH and argv[1:3] == ["pr", "view"]:
+                reads.append(1)
+                if len(reads) == 2:
+                    self.body = "MERGE: automatic\n\nthe author edited this\n"
+            return real(argv, **kwargs)
+        self.engine.gh_runner = changed
+        self.assertGreater(self.first_hold(new), 0)
+        self.assertEqual((self.body_patches(), self.body), ([], "MERGE: automatic\n\nthe author edited this\n"))
+        self.assertEqual(len(self.adds()), 1, "the hold labels are written all the same")
+        (failed,) = self.events("gate.hold_marker_failed")
+        self.assertIn("changed", failed["detail"]["error"])
 
     def test_s10_a_carried_clear_never_rewrites_the_body_and_marks_no_re_hold(self):
         self.body = "MERGE: captain\n\nthe change\n"
@@ -42366,6 +42422,8 @@ class TestLaunchRefusedMessage(TestLaunchMemoryGate):
             text = "".join(consts) + " " + ast.get_source_segment(source, node)
             if not re.search("created", text, re.I):
                 continue
+            if re.search(r"nothing was created", text):   # a refusal that says nothing was created is a before-the-pod text by its own words: the property, not a list of sites
+                continue
             if sb.LAUNCH_AFTER_CREATED.search(text.replace("%s ", "")) or sb.LAUNCH_AFTER_CREATED.search(ast.get_source_segment(source, node)):
                 continue
             if (consts[0] if consts else "")[:30] in self.CREATED_EXEMPT:
@@ -55596,7 +55654,7 @@ class TestJobEndRecord(StandInPids, unittest.TestCase):
     def setUp(self):
         self.root = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, str(self.root), True)
-        patcher = mock.patch.dict(os.environ, {sb.JOBS_DIR_ENV: str(self.root)})
+        patcher = mock.patch.dict(os.environ, {sb.JOBS_DIR_ENV: str(self.root), "XDG_STATE_HOME": str(self.root / "xdg-state"), "XDG_CONFIG_HOME": str(self.root / "xdg-config")})
         patcher.start()
         self.addCleanup(patcher.stop)
         self.procs, self.pids, self.audited = {}, [], []
@@ -66970,6 +67028,7 @@ TestGhShimBracketBodyKeys = importlib.import_module("test_gh_shim_sign_input").T
 TestGhShimAllowlist = importlib.import_module("test_gh_shim_sign_input").TestGhShimAllowlist
 TestGhShimBodyFieldKeyIsExact = importlib.import_module("test_gh_shim_sign_input").TestGhShimBodyFieldKeyIsExact
 TestGhShimMethodFlagBeforeApi = importlib.import_module("test_gh_shim_sign_input").TestGhShimMethodFlagBeforeApi
+_ghb = importlib.import_module("test_gh_shim_body"); TestGhBodyGuard, TestGhBodyRefusalIsPure, TestGhBodyMutants = _ghb.TestGhBodyGuard, _ghb.TestGhBodyRefusalIsPure, _ghb.TestGhBodyMutants   # #1751
 TestUnconsumedSteer = importlib.import_module("test_unconsumed_steer").build(Base, TestSteerToWorking)   # #1844
 TestUnconsumedRecord = importlib.import_module("test_unconsumed_record").TestUnconsumedRecord   # #1844
 _noparent = importlib.import_module("test_charter_noparent"); TestCharterNoParent, TestCharterNoParentSet = _noparent.TestCharterNoParent, _noparent.build(CharterRig, Base, TestCharterSetGuard)
@@ -66993,6 +67052,8 @@ _cc = importlib.import_module("test_comment_cursor"); TestCommentCursor, TestOve
 TestCommentWindowGapFill = _cc.TestCommentWindowGapFill   # #2192: a comment window is read to its start by time
 _rpstrict = importlib.import_module("test_read_pages_strict"); TestReadPagesStrict, TestReadPagesStrictMutant = _rpstrict.TestReadPagesStrict, _rpstrict.TestReadPagesStrictMutant
 TestCiOutsideBin = importlib.import_module("test_ci_outside_bin").TestCiOutsideBin
+TestGateProbeReads = importlib.import_module("test_gate_probe_reads").TestGateProbeReads   # #2215
+TestDirectReads = importlib.import_module("test_gate_direct_reads").TestDirectReads   # #2215
 _psj = importlib.import_module("test_pr_state_jobs")
 _psj.HOST = sys.modules[__name__]
 TestPrStateJobs = _psj.load()   # #1962
@@ -67066,6 +67127,7 @@ TestWholeReadOfALargePullRequest = _changed_file_pages.load()
 
 _rc = importlib.import_module("test_reclaim_cap"); _rc.HOST = sys.modules[__name__]; TestReclaimCap = _rc.build()   # #1737
 _lm = importlib.import_module("test_launch_model"); _lm.HOST = sys.modules[__name__]; TestLaunchModel = _lm.build(); TestLaunchModelCloud = _lm.build_cloud()   # #1642
+_il = importlib.import_module("test_issue_line"); _il.HOST = sys.modules[__name__]; TestIssueLine = _il.build()   # #1751
 TestDaemonDeadVerdict, TestDaemonDeadVerdictMutants = (_dd := importlib.import_module("test_dead_verdict_daemon")).TestDaemonDeadVerdict, _dd.TestDaemonDeadVerdictMutants   # #1884
 TestPaneUndecidable = _dd.TestPaneUndecidable   # #1884 PC-6 / S11
 TestUndecidableRobustness = _dd.TestUndecidableRobustness   # #1884 PC-9 / S14
@@ -74773,6 +74835,8 @@ class TestEveryViewDerivesFromTheRegistry(BaselineWorld):
         "item_agents": ("test_item_agents_fails_closed_on_a_half_read_registry", "item_agents"),
         "known_session": ("test_known_session_and_watch_follow_the_registrys_retired_record", "known_session"),
         "janitor_agent_roots": ("test_s1_an_entry_a_live_or_recently_retired_agent_owns_is_kept", "janitor_agent_roots"),
+        "pod_silence_tick": ("test_a_pod_the_registry_retired_is_not_told_while_a_live_one_is", "retired-in-registry"),
+        "push_watch_tick": ("test_a_worker_the_registry_retired_is_not_watched_while_a_live_one_is", "push_watch_tick"),
         "cmd_retire": ("test_retire_frees_the_name_of_a_headless_worker_and_undo_restores_the_record_unless_the_name_was_taken", "undo"),
     }
 
@@ -80283,10 +80347,28 @@ NOT_ISOLATED_BY_BASE = {
     "TestTheDerivationIsHeld", "TestTheMergeGate", "TestTierRoleText", "TestTriageRuleInputs", "TestTriageStandingLine", "TestTurnEnd",
     "TestUnionCheckLimitsDocs", "TestVerdictRecordingText", "TestWhoCanClear", "TestWiredCheckPlanted", "TestWorkItemRules", "TestWorkSyncPump",
     "TestWorkerRulesInSkills", "TestWriting", "TrickleHub", "TwoLoopsTrace", "WorkflowPlanPins",
+    # classes of the test files added since (bare names; the check reads the property: no World, rig or state path in the class)
+    "FreshCase", "MergeDropsBase", "NtcTree", "PinsRepo", "TestApiReadersAreViews", "TestApprovalGateCommands",
+    "TestApprovalGateReader", "TestApprovalPair", "TestBodyCheck", "TestChiefOnlyWhenNeeded", "TestCiFreshDocs", "TestCiFreshOptOut",
+    "TestCiFreshReadMutants", "TestCiFreshReaders", "TestCiFreshReads", "TestCiFreshRefusalAndEvidence", "TestCiFreshSeamMutants", "TestCiFreshUnreadable",
+    "TestCiStateDecision", "TestClaimLegacy", "TestCloudSendState", "TestDaemonSummary", "TestDiskGuardPrune", "TestEpicBatch",
+    "TestEpicRecord", "TestEpicRecordMove", "TestEpicRecordPlacement", "TestFactSourcesRegistered", "TestFirstPushMutants", "TestFirstPushNotice",
+    "TestFirstPushWiring", "TestGhHoldIsAView", "TestGhShimAllowlist", "TestGhShimArgvParser", "TestGhShimBodyFieldBesideInput", "TestGhShimBodyFieldKeyIsExact",
+    "TestGhShimBracketBodyKeys", "TestGhShimDeepBodiesAndInputForms", "TestGhShimEffectRule", "TestGhShimEncodedQueryAndLabelDelete", "TestGhShimMethodFlagBeforeApi", "TestGhShimMutationRoots",
+    "TestGhShimNestedAndQueryBodies", "TestGhShimRawPath", "TestGhShimRound5", "TestGhShimSignInput", "TestHeaderDate", "TestHeaderDateCallSites",
+    "TestHeaderInfiniteTime", "TestImpactHoldByEntry", "TestMergeDrops", "TestMergeDropsStep", "TestNewTestChecksDocs", "TestNewTestChecksFiles",
+    "TestNewTestChecksInCloudPreflight", "TestNewTestChecksInPreflightPr", "TestNewTestChecksMutants", "TestNewTestChecksRules", "TestOperatorHoldDocs", "TestPassRecheckMutants",
+    "TestPins", "TestPinsMutants", "TestPinsReview", "TestPinsStrictRead", "TestPlanHashLinesBindings", "TestPlanHashLinesCloudCopy",
+    "TestPlanHashLinesDocs", "TestPlanHashLinesPair", "TestPlanHashLinesPairOrder", "TestPlanHashLinesVariants", "TestPlanHashLinesWhitespace", "TestPlanHashMarkerDocumentation",
+    "TestPlanHashMarkerMutants", "TestPlanHashMarkerNoSizeTest", "TestPlanHashMarkerPure", "TestPlanHashMarkerStored", "TestPlanHashMarkerTally", "TestPlanKeyHash",
+    "TestPlanWakeMutants", "TestPodSilence", "TestPodSilenceTick", "TestReadPagesStrict", "TestReadPagesStrictMutant", "TestSeenAllMutants",
+    "TestStopFinalMessageBareMutant", "TestStopFinalMessageEdgesMutant", "TestStopFinalMessageHardeningMutant", "TestStopFinalMessageMutants", "TestStopFinalMessageTwoRunsMutant", "TestSummaryCluster",
+    "TestTriageHiddenMutants", "TestTwoBranchesAddingATestFile", "TestUnconsumedRecord", "TestUnreadableSummary",
     ),
     "makes its own temporary directory or state (a tempfile.mkdtemp, a patched environment or its own isolating setUp) and never reads the real one": (
     "TestEveryTestClassIsolates",
     "Case", "HeaderCacheBase", "TestCloudWatchBounds", "TestCloudWatchTick", "TestGatePass", "TestHostDisk", "TestIsolation", "TestSafety",
+    "TestStopFinalMessage", "TestStopFinalMessageBare", "TestStopFinalMessageEdges", "TestStopFinalMessageHardening", "TestStopFinalMessageTwoRuns",
     ),
 }
 

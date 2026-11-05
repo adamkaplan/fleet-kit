@@ -170,11 +170,11 @@ class WorkflowPlanPins(unittest.TestCase):
         check("    types: [opened, synchronize, reopened, ready_for_review]\n" in on, "ready_for_review is among the pull_request types, exactly 4")
         check("    branches: [main]\n" in on, "a push to main")
         check(re.search(r'^    - cron: "\d{1,2} \d{1,2} \* \* \*"$', on, re.M), "a daily schedule")
-        check(re.findall(r"uses: (\S+)", text) == ["actions/checkout@v5"] * 3, "the only action is actions/checkout@v5 (no third-party action)")
+        check(re.findall(r"uses: (\S+)", text) and set(re.findall(r"uses: (\S+)", text)) == {"actions/checkout@v5"}, "the only action is actions/checkout@v5 (no third-party action)")
         check("permissions:\n  contents: read\n\n" in top and top.count("permissions:") == 1, "contents: read only")
         check("secrets." not in text.replace("secrets.PRIVATE_NAMES", ""), "no new secret")
         check("cancel-in-progress: ${{ github.event_name == 'pull_request' && github.event.action != 'reopened' }}" in top, "the concurrency rule: cancel a push run, never a reopened one (#1235)")
-        check(re.findall(r"^  ([a-z][a-z-]*):$", jobs, re.M) == ["plan", "test", "test-cloud"], "the jobs")
+        check([j for j in re.findall(r"^  ([a-z][a-z-]*):$", jobs, re.M) if j in ("plan", "test", "test-cloud")] == ["plan", "test", "test-cloud"], "the jobs: plan, test and test-cloud are all there, once, in that order (other jobs, such as shards, #2131, may be added)")
         check("\n  test:\n    needs: plan\n    name: ${{ matrix.name }}\n" in text, "test is named by the plan's name")
         check("\n  test-cloud:\n    needs: plan\n    name: ${{ matrix.cloud }}\n" in text, "test-cloud is named by the plan's cloud name")
         check(jobs.count("include: ${{ fromJSON(needs.plan.outputs.matrix) }}") == 2, "both take the plan's matrix")
@@ -1830,9 +1830,11 @@ class TestGhShimGateProbe(Base):
         self.assertEqual(entry["event"], "fail_open")
         self.assertIn("no answer within 1s", entry["detail"])
 
-    def test_the_bound_is_clamped_and_defaults_to_three_seconds(self):
+    def test_the_bound_is_clamped_and_defaults_above_the_old_three_seconds(self):
         source = SHIM.read_text()
-        self.assertIn("GATE_SECONDS = 3.0", source)
+        default = float(re.search(r"^GATE_SECONDS = ([0-9.]+)", source, re.M).group(1))
+        self.assertGreater(default, 3.0)   # the old default (#2215)
+        self.assertLessEqual(default, 10.0)   # the cap, which the environment override cannot pass either
         done, seen = self.run_shim("pr", "ready", "12", "-R", "acme/app", env={"FAKE_GATE_SLEEP": "30", "FLEET_SHIM_GATE_SECONDS": "0.01"})
         self.assertLess(self.elapsed, 25, "a bound below 0.2 s is raised to 0.2 s, not 0")
 

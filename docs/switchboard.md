@@ -2741,6 +2741,14 @@ call reads again. Reads are never refused. `fleet-switchboard` checks the key wh
 printable `label`, a one-line `message` and `allowed_removers` as agent names). The shim reads no environment variable to skip it:
 the retired `FLEET_SWITCHBOARD_OWN_GH` does not bypass it, and the switchboard's own calls reach the real gh by path, not through the shim.
 
+**The body guard (ask #1751).** `shims/gh_body.py`, loaded by path beside the shim, is asked once per write, right after the hold check. A body write
+to an issue whose current body holds the `## Intent` heading line and the `Done when:` line is refused (exit 1, nothing passed to `gh`) when the new body
+lacks either; a whole-body write must keep both parts. The forms read are `gh issue edit` with `--body`, `-b`, `--body-file` or `-F` (`-F -` from
+stdin), `gh api` to `repos/O/R/issues/N` with `-f body=`, `-F body=@file`, `-F body=@-` or `--input`, and `gh api graphql` naming `updateIssue` (refused
+outright). The current body is read with the account the write would use and the same deadline; a body that cannot be read or is empty, and a form
+whose new body cannot be read, are refused (fail closed). A current body with neither part is not an ask and passes, and so do pull requests, reads
+and writes that carry no body. To change one line of a body use `fleet-switchboard issue-line`, which never changes the Intent or the Done-when.
+
 **Live with no restart, and how to check it.** The shim directory is read on every call, so once the change is on the checkout and the config
 names a repository, the next `gh` call is checked. On a labelled pull request run `gh pr merge <n> -R <owner/repo>`: it exits 1 with the
 configured message and nothing is merged; on an unlabelled one it behaves as before. Removing the config entry switches it off.
@@ -4953,12 +4961,12 @@ check names no head the merge is allowed unbound and recorded as a fail-open. Ev
 
 What it does: for a PR whose repo is listed under `plan_gates.repos` in the switchboard config (matched without regard to case;
 with no `plan_gates`, or another repo, nothing is probed and the cost is zero), it runs
-`fleet-switchboard gates-check <repo#N> --for ready|merge --json` with a bound of **3 seconds** (`FLEET_SHIM_GATE_SECONDS`, kept
+`fleet-switchboard gates-check <repo#N> --for ready|merge --json` with a bound of **8 seconds** (was 3; `FLEET_SHIM_GATE_SECONDS`, kept
 between 0.2 and 10), after which the child is killed and the command goes on. The check itself records `gate.would_refuse` in the
 audit (shadow) and its own `gate.fail_open`. What the shim adds is a line in `gate-failopen.jsonl` in the state directory (mode
 0600, at most 256 KB) for the cases only the shim can see: `would_refuse` (the check exited 10), `fail_open` (it timed out, could not
 run or exited with anything else, or there is no switchboard). **The file is written by any local process, so the daemon must read it as
-untrusted text** (clipped, data only); nothing reads it yet.
+untrusted text** (clipped, data only). The daemon reads it each pass (`bin/switchboard/gate_spool.py`, ask #2216): the new lines from a saved position (`gate-spool-state.json`: inode and offset, so no line is read twice and a rotation by the shim, to `.1`, is followed), the file renamed to `.1` once it is read to the end and holds 3/4 of the limit, so the shim never finds it full. Fail-opens are counted per repository per hour: sweep kind S11 raises one finding per repository per hour when they exceed `sweep.failopen_per_hour` (default 20), naming the count and the commonest reason. An `over_review` line is shown as `over_review` on its pull request's decision entry. A spool that cannot be read is said once (`gate_spool.unreadable`), never stops a pass.
 
 Shapes it probes: `pr ready <n>` and `pr merge <n>` with a number, `-R/--repo owner/repo`, or a PR URL
 (`https://github.com/owner/repo/pull/N`); a bare number uses the caller's own repo from `whoami --json` (the #138 identity, unchanged).
@@ -6768,6 +6776,14 @@ A review bot is an account of type Bot (or a login ending `[bot]`); no list and 
 
 `tools/new-module-demands bin/x.py [bin/y.py ...]` prints one block per file: `guards:` (the classes `preflight-pr` runs for a new bin file, read from `NEW_BIN_GUARDS` in `bin/path_suites.py`), `authority code:` (yes or no, with the function names and role literals found by a copy of the two rules of the authority-modules guard, the vocabulary read from the impact matrix), `matrix:` (for yes, both entries to add, `owner_hold.top_tier_paths.authority` and the floor globs of the repository, with their JSON paths; never the exempt entry; for no, that no line is demanded), `units:` (the row to add to the Units table of `docs/architecture.md`) and `closure:` (the state of `tools/derive-closure --check`). It exits 0 for a block and 2 with one plain line for a path that is not under `bin/` or cannot be read.
 It never runs the guards, writes nothing and makes no GitHub call. The guard stays the authority: the tool is advice, and `tests/switchboard/test_new_module_demands.py` pins that its detection and the guard name the same modules.
+
+## `issue-line`: one line of an issue body (#1751)
+
+A lane that wrote a whole issue body from an empty read once left an ask with no Intent and no Done-when for about two minutes. `fleet-switchboard issue-line owner/repo#N --next-step TEXT` (or `--parked YYYY-MM-DD`, exactly one) is the way to change one line of an issue body: it replaces the last `Next step (...):` or `Next:` line (or appends `Next step (<D Mon HH:MMZ>): TEXT` before a trailing marker line), or the `Parked until:` line, and every other byte stays. A whole-body write must keep the `## Intent` heading line and the `Done when:` line, and the gh shim refuses one that drops them. The command never changes the Intent or the Done-when.
+
+It validates the arguments first (text not empty, one line, at most 600 characters; a date a real day ahead within 366 days), then reads the body now through the repository's own account, never a cache. It refuses with one plain line, exit status 1 and nothing written when the read fails or is empty, when the body lacks the Intent heading or the Done-when line, when the last good copy says the body held a part the read lacks, or when that copy cannot be read. It reads the body again just before the write and refuses if it moved; after the write it looks at the issue up to three times, and if the body read back lacks the Intent heading or the Done-when line it writes back the body read before the edit once, audits `issue_line.restored` and exits 1. Audit events: `issue_line.refused`, `issue_line.written`, `issue_line.restored`, with the repository, the number and the reason, never the text.
+
+The last good copy is `<state>/issue-line/<hash of repo#N>.json`, holding only `{"intent": true, "done_when": true, "at": <epoch>}`, mode 0600 in a 0700 directory, written through a temporary file and `os.replace`, at most 2,000 files (the oldest evicted), read through the shared bounded parse. No copy is a first use: the fresh read alone must hold both parts. The logic is `bin/issue_line.py` (pure: it reads no file and calls no GitHub; the entry hands it the reader, the writer `write_issue_body` and the file calls).
 
 ### What a new test file under `tests/switchboard/` shows before the whole-file run (`tools/new-test-checks`, #1967)
 

@@ -1,0 +1,4 @@
+{
+ "command": "issue-line",
+ "help": "usage: fleet-switchboard issue-line [-h] [--next-step NEXT_STEP] [--parked PARKED] issue positional arguments: issue owner/repo#N options: -h, --help show this help message and exit --next-step NEXT_STEP The next-step line: one line of at most 600 characters (give this or --parked) --parked PARKED The parked date: YYYY-MM-DD, a day ahead within 366 days (give this or --next-step)"
+}

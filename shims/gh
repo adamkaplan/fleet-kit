@@ -2147,7 +2147,7 @@ def api_call(args, namer):
 # a valid waiver, a shadow repo) runs the real gh. In an enforcing repo a merge is bound to the checked head and --auto is refused.
 # `gh pr create` has no PR number before it runs, so it is not probed here. The probe is skipped altogether for a repo that is
 # not listed under `plan_gates` in the switchboard config, and for the switchboard's own gh calls (no recursion).
-GATE_SECONDS = 3.0
+GATE_SECONDS = 8.0
 GATE_SPOOL = "gate-failopen.jsonl"
 GATE_SPOOL_LIMIT = 262144
 BOOL_SHORT = {"pr merge": {"d": "--delete-branch", "m": "--merge", "r": "--rebase", "s": "--squash"}, "pr ready": {}}
@@ -2941,6 +2941,15 @@ def hold_probe(args, lookup, gh, write):
         return (RETRY_HOLD if write else None), None, None
 
 
+def body_probe(args, gh, write, lookup):   # #1751: gh_body.py beside this file, loaded by path; a WRITE it cannot load or run is refused
+    try:
+        spec = importlib.util.spec_from_file_location("gh_body", os.path.join(os.path.dirname(os.path.realpath(__file__)), "gh_body.py"))
+        module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+        return module.guard(args, write, api_parsed, gh, lambda: account_env(gh, lookup, args=args))
+    except Exception:
+        return "gh: refused: the body guard could not be loaded, retry" if write else None
+
+
 def api_write_endpoint(module, args):
     """The reduced endpoint of a `gh api` write for its audit line (allow-listed words only, numbers as '#'; no body, no query, no host), else None."""
     try:
@@ -3043,6 +3052,7 @@ def run(args):
         audit_write(args, lookup, "refused", write)
         return 1
     held, hold_repo, hold_number = hold_probe(args, lookup, gh, write)   # a hold label refuses before anything else is asked (#376)
+    held = held or body_probe(args, gh, write, lookup)   # #1751: a body write that drops the Intent or the Done-when is refused (gh_body.py)
     if held:
         sys.stderr.write(held.strip() + "\n")
         audit_write(args, lookup, "refused", write, hold_repo, hold_number)
