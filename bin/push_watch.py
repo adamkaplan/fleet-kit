@@ -297,7 +297,7 @@ def run_pass(sb, engine, now, gh, config=None, launcher_audit=None):
                 continue
             unsent = False
             for csha, c in batch:
-                if csha in b["told"]:
+                if csha in b["told"] or csha in mem.get("told", []):   # told once per worker across its branches (ask #2153)
                     continue
                 b["told"] = (b["told"] + [csha])[-TOLD_MAX:]
                 text = item_text(name, branch, csha, dict(c, files=stats.get("files", c.get("files")), stats=stats.get("stats", c.get("stats"))) if len(batch) > 1 or prev else c)
@@ -307,6 +307,7 @@ def run_pass(sb, engine, now, gh, config=None, launcher_audit=None):
                     b["told"].remove(csha)
                     unsent = True
                     break
+                mem["told"] = (mem.get("told", []) + [csha])[-TOLD_MAX:]
                 engine.audit.append(engine.actor, "push_watch.sent", name, {"to": lane, "sha": csha[:8]})
             if unsent:
                 continue

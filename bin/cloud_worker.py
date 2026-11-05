@@ -1419,6 +1419,8 @@ def _may_retire(kind, record):
 
 RECOVER_SENTENCE = ("send the pod one message to commit its tree on a NEW branch and push it there plainly, read the branch from origin, "
                     "then retire normally")
+
+
 _BOSS_NAME_RE = re.compile(r"[a-z][a-z0-9_-]{0,31}", re.ASCII)
 
 

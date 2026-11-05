@@ -45,6 +45,7 @@ The **Holds** column is descriptive: only the layer numbers are enforced.
 | `closed_labels.py` | 0 | a closed issue never keeps asking for an answer | |
 | `dead_hint.py` | 0 | what is known about a dead agent and what to do about it (pure text) | |
 | `header_cache.py` | 0 | the shared file cache of the ask header (Intent, Done-when, state, updated_at, parent): one file per issue, ages, bounds (#1520) | |
+| `comment_cursor.py` | 0 | the cursor file of the incremental comment reads: the newest comment held per consumer and repository (#1889) | |
 | `impact_brief.py` | 0 | the impact brief: what a held change can do, built from the diff and the records only (pure, no clock, no network) (#1215) | |
 | `lost_worker.py` | 0 | a lost worker is told once to its lane and the Chief of Staff, with its cause (#1481) | |
 | `push_watch.py` | 0 | the lane that launched a cloud worker is told of its pushes and of its quiet after a push, from a read of the worker's branches (#1740) | |
@@ -104,6 +105,7 @@ The **Holds** column is descriptive: only the layer numbers are enforced.
 | `cloud_worker.py` | 5 | remote (cloud) workers for the switchboard | |
 | `delegated_clear.py` | 5 | the Chief of Staff's clear under the owner's standing order | |
 | `endpoint_send.py` | 5 | the send path's route to an agent that holds no pane | |
+| `epic_record.py` | 4 | an epic-claimed scenario's record on its owning issue: the states and the lines `gates` prints (moved from `plan_ledger.py`) | |
 | `heavy_slots.py` | 5 | CPU slots for heavy commands (`fleet-switchboard heavy`) | |
 | `heavy_slots_watch.py` | 5 | the watchdog and the orphan check of the heavy wrapper (#2034); a part of heavy_slots.py | |
 | `host_liveness.py` | 2 | the liveness of an orchestrator that a charter names by a host (alive, dead or unreachable), on demand only | |
@@ -208,7 +210,7 @@ Kinds (the number is exact, except `size`, a ceiling with headroom: see rule 7):
 | `switchboard/disk_prune.py` | `fleet-switchboard` | namespace | 8 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 | `switchboard/docker_reaper.py` | `fleet-switchboard` | entry-import | 10 | the part relies on a standard-library module the entry imported; it gets its own import line |
 | `switchboard/docker_reaper.py` | `fleet-switchboard` | namespace | 14 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
-| `switchboard/facts.py` | `switchboard/docker_reaper.py` | namespace | 1 | one namespace: the part reads a name another part defines; its rewiring gives it an import |
+| `switchboard/facts.py` | `switchboard/docker_reaper.py` | namespace | 2 | one namespace: the part reads a name another part defines; its rewiring gives it an import |
 | `switchboard/heavy_budget.py` | `cloud_worker.py` | import | 1 | a name the part reads from another unit without a declared edge |
 | `switchboard/heavy_budget.py` | `fleet-switchboard` | entry-import | 9 | the part relies on a standard-library module the entry imported; it gets its own import line |
 | `switchboard/heavy_budget.py` | `fleet-switchboard` | namespace | 12 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
@@ -224,7 +226,7 @@ Kinds (the number is exact, except `size`, a ceiling with headroom: see rule 7):
 | `switchboard/sweep.py` | `fleet-switchboard` | entry-import | 6 | the part relies on a standard-library module the entry imported; it gets its own import line |
 | `switchboard/sweep.py` | `fleet-switchboard` | namespace | 29 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 | `switchboard/triage.py` | `switchboard/plan_notice.py` | namespace | 1 | one namespace: the part reads a name another part defines; its rewiring gives it an import |
-| `switchboard/triage.py` | `switchboard/sweep.py` | namespace | 5 | one namespace: the part reads a name another part defines; its rewiring gives it an import |
+| `switchboard/triage.py` | `switchboard/sweep.py` | namespace | 6 | one namespace: the part reads a name another part defines; its rewiring gives it an import |
 | `switchboard/workers_report.py` | `fleet-switchboard` | namespace | 6 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 | `switchboard/workers_report.py` | `switchboard/docker_reaper.py` | namespace | 1 | one namespace: the part reads a name another part defines; its rewiring gives it an import |
 | `switchboard/workers_report.py` | `switchboard/handoff.py` | namespace | 3 | one namespace: the part reads a name another part defines; its rewiring gives it an import |
@@ -388,6 +390,10 @@ A site is listed by the function it sits in and its kind, with a count: `import(
 | `delegated_clear.py` | `_registrar_unit:__import__(string)` | 2 | the registrar lint only names this in order to refuse it in a registrar; it loads nothing |
 | `delegated_clear.py` | `_registrar_unit:builtins` | 2 | the registrar lint only names this in order to refuse it in a registrar; it loads nothing |
 | `delegated_clear.py` | `_registrar_unit:import_module(string)` | 1 | the registrar lint only names this in order to refuse it in a registrar; it loads nothing |
+| `epic_record.py` | `<module>:import(importlib)` | 1 | imports a module that can load code by name, or one of its identifiers |
+| `epic_record.py` | `_plan_ledger:exec_module` | 1 | uses an identifier of the import machinery (exec_module) |
+| `epic_record.py` | `_plan_ledger:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
+| `epic_record.py` | `_plan_ledger:sys.modules` | 1 | uses `sys` beyond its plain attributes |
 | `external_adapter.py` | `<module>:import(importlib)` | 1 | imports a module that can load code by name, or one of its identifiers |
 | `external_adapter.py` | `_load_core:exec_module` | 1 | uses an identifier of the import machinery (exec_module) |
 | `external_adapter.py` | `_load_core:importlib` | 2 | uses the module object (a call, an attribute, an argument) |

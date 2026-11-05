@@ -166,6 +166,17 @@ class TestPushWatch(Case):
         self.run_pass(NOW + 120)
         self.assertEqual(len(self.to("lane-a")), 3)
 
+    def _two_branches_one_sha(self, module=None):
+        self.setUp()
+        self.world.refs = {"w-a/wip": SHA_A, "w-a/task": SHA_A}
+        self.run_pass(NOW, module)
+        return len(self.to("lane-a"))
+
+    def test_2153_one_sha_on_two_branches_of_one_worker_is_told_once(self):
+        self.assertEqual(self._two_branches_one_sha(), 1)
+        mutant = self.mutant('csha in b["told"] or csha in mem.get("told", [])', 'csha in b["told"]')
+        self.assertEqual(self._two_branches_one_sha(mutant), 2, "control: the per-branch check tells it twice")
+
     def test_the_task_branch_of_the_record_is_read_by_its_exact_name(self):
         self.engine.cloud_watch = {"records": [dict(record("w-a", "lane-a"), branch="upkeep/1-x")]}
         self.world.refs = {"upkeep/1-x": SHA_A, "upkeep/1-xy": SHA_B}
