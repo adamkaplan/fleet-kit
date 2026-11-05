@@ -366,6 +366,8 @@ DEFAULTS = {
     "launch_default": "headless",   # #433: what a plain `launch` starts: "headless" (no terminal) or "terminal" (a herdr tab)
     "send_to_working": "steer",     # a boss's `send` to a working agent: "steer" (its next safe point) or "queue" (after its turn)
     "steer_after_minutes": 0,       # #1540: 0 = off; else a turn longer than this many minutes takes a peer `send` and a reminder as `steer` too
+    "reminder_bound_minutes": 10,     # #1728: a due reminder not admitted within this many minutes is delivered by the next pass (a queued wake)
+    "checkpoint_bound_minutes": 5,    # #1728: the same bound for a reminder a launch checkpoint set (the worker's, and the overdue one to its boss)
     "unconsumed_steer_minutes": 20,   # #1844: 0 = off; a delivered queue-mode message the lane has not consumed after this many minutes is steered into the running turn
     "engaged_minutes": 10,
     "retire_idle_minutes": 10,     # `retire --close`: a pane herdr reads as working is closed without --force only when its session has had no turn and no activity this long
@@ -2393,7 +2395,7 @@ class Switchboard:
             except Exception as err:   # an unreadable record or module is an unknown age = young = queue
                 age = None
                 self._note("turn_start.error", None, {"reason": _one_line("%s: %s" % (type(err).__name__, err), 200)})
-            busy = steers_into_turn(self.config, observation, carried, getattr(self, "discovery", None), age)
+            busy = steers_into_turn(self.config, observation, carried, getattr(self, "discovery", None), age, self.now())
         if busy:
             delivery = "steer"
         detail = {"mode": plan.action, "session": observation.session_id, "message_id": message_id,
@@ -2781,6 +2783,7 @@ class Switchboard:
                 plan = self.plan(recipient, by_recipient[recipient], discovery, now)
                 if plan is None:
                     continue
+                reminder_waiting(self, plan, now)   # #1728
                 if plan.action == "wait":
                     report["waiting"].append(recipient)
                 elif plan.action == "hold":
@@ -11792,6 +11795,12 @@ def cmd_status(args, runner=subprocess.run, now=time.time):
         print(json.dumps(report, indent=2, sort_keys=True))
     else:
         print(format_status(report))
+        try:
+            lane_lines = late_reminder_lines(state_dir_path(), load_config(config_path()), now())
+        except Exception:   # a missing log or config must not take `status` down
+            lane_lines = []
+        if lane_lines:
+            print("\n".join(lane_lines))
         if cloud_lines:
             print("\n".join(cloud_lines))
     return EXIT_OK if report["ok"] else EXIT_ERROR
@@ -12120,7 +12129,7 @@ def launch_memory_check(args, engine, state, runner, now):
         except OSError:
             pass   # the cache is only an optimisation: a failed write costs the next launch one wait, deliberately silent
     if reason is not None:
-        audit("launch.memory_ok", {"reason": _one_line(reason, 200), "measured": ("free %d%%, swapouts %d" % first) if first else "not measured"})
+        audit("launch.memory_ok", {"reason": scrubbed_flag_text(reason), "measured": ("free %d%%, swapouts %d" % first) if first else "not measured"})
         return None
     if first is None:
         sys.stderr.write("%s: memory test not available: launching\n" % PROG)
@@ -12237,6 +12246,8 @@ def _cmd_launch(args, runner, now, socket_call=None):
     problem = launch_agent_problem(engine.config, runner, args.agent)
     if problem:
         raise LaunchError(problem)
+    if args.reports_to:   # #1046: a boss nobody can answer to is refused before anything is created (a registered name, a retired one, the role alias or a cloud record passes)
+        load_module("cloud_worker").bind(globals()).check_report_to(engine, state, args, engine.discover(engine.now()).agents)
     brief = read_brief(args.brief_file, sys.stdin)
     mismatch = launch_brief_mismatch(args, engine, repo, brief)   # #1350: before anything starts
     if mismatch:
@@ -17565,6 +17576,11 @@ def cmd_merge_gate(args, runner, now):
         else:
             sys.stderr.write("%s\n" % union)
         return plan_ledger.EXIT_REFUSE
+    drops = merge_drops_refusal(runner, config, repo, number, state)   # #2159: a merge never silently drops a line of the tip
+    if drops:
+        _gates_audit(engine, "merge_gate.refused", ref, {"by": who, "why": _one_line(drops, 300)})
+        sys.stderr.write("%s\n" % drops)
+        return plan_ledger.EXIT_REFUSE
     allowed, why, head = gate.check_merge(reading, gh, conf, state, repo, number, who, kind[0] == "person", waived, now)
     _gates_audit(engine, "merge_gate.allowed" if allowed else "merge_gate.refused", ref, {"by": who, "why": _one_line(why, 300)})
     if args.json:
@@ -17575,6 +17591,136 @@ def cmd_merge_gate(args, runner, now):
 
 
 cmd_merge_gate.ledger = True   # state and GETs only; its own errors are usage errors
+
+
+# ---- #2159: a merge resolution never silently drops a line of the tip. `merge-drops` is read-only: the lines the branch head removes relative to the integration tip, minus the
+# pull request's own removals (its three-dot diff) and minus the tip's own newer lines (a branch behind the tip has not been asked to carry them). The merge step refuses while it lists any.
+def _git_out(runner, git_dir, argv):
+    done = runner(["git", "-C", str(git_dir)] + argv, capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
+    if done.returncode != 0:
+        raise OSError("git %s failed: %s" % (argv[0], _one_line(done.stderr or "", 120)))
+    return done.stdout or ""
+
+
+def _diff_lines(runner, git_dir, a, b, sign):
+    """[(file, old or new line number, text)] of the `sign` ('-' or '+') lines of `git diff -U0 a b` (a '-' line numbers the old side, a '+' line the new side)."""
+    out, name, old, new, found = _git_out(runner, git_dir, ["diff", "-U0", "--no-renames", "--no-color", a, b]), None, 0, 0, []
+    for line in out.split("\n"):
+        if line.startswith("+++ "):
+            name = line[4:][2:] if line[4:].startswith("b/") else None if line[4:] == "/dev/null" else line[4:]
+        elif line.startswith("--- "):
+            if line[4:] != "/dev/null":
+                name = line[4:][2:] if line[4:].startswith("a/") else line[4:]
+        elif line.startswith("@@"):
+            m = re.match(r"@@ -(\d+)(?:,\d+)? \+(\d+)", line)
+            old, new = (int(m.group(1)), int(m.group(2))) if m else (0, 0)
+        elif line.startswith("-") and sign == "-" and name:
+            found.append((name, old, line[1:]))
+            old += 1
+        elif line.startswith("+") and sign == "+" and name:
+            found.append((name, new, line[1:]))
+            new += 1
+        elif line.startswith("-"):
+            old += 1
+        elif line.startswith("+"):
+            new += 1
+    return found
+
+
+class MergeDropsConflict(Exception):
+    pass
+
+
+def merge_drops(runner, git_dir, tip, head):
+    """The hunks `head` drops from `tip`: [(file, first line number, last line number, first line text)], and the merge commit messages of `tip..head`.
+    A dropped line is a '-' line of `git diff tip head` that is not among the '-' lines of the branch's own non-merge commits (the pull request's own removals, by file and content)
+    and not a '+' line of `git diff merge-base tip` (the tip's newer lines)."""
+    done = runner(["git", "-C", str(git_dir), "merge-tree", "--write-tree", head, tip], capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
+    if done.returncode == 1:
+        raise MergeDropsConflict("conflicts, resolve first")
+    if done.returncode != 0:
+        raise OSError("git merge-tree failed: %s" % _one_line(done.stderr or "", 120))
+    tree = (done.stdout or "").split("\n")[0].strip()
+    own = collections.Counter()   # the PR's own removals (three-dot), per (file, stripped line); from the branch's non-merge commits, as the three-dot diff is empty once the tip is merged in
+    for commit in _git_out(runner, git_dir, ["rev-list", "--no-merges", "%s..%s" % (tip, head)]).split():
+        own.update((f, t.strip()) for f, _, t in _diff_lines(runner, git_dir, commit + "^", commit, "-"))
+    dropped = []
+    for d in _diff_lines(runner, git_dir, tip, tree, "-"):   # the tip's lines the merge result lacks
+        key = (d[0], d[2].strip())
+        if own[key] > 0:
+            own[key] -= 1
+        else:
+            dropped.append(d)
+    hunks = []
+    for name, number, text in dropped:
+        if hunks and hunks[-1][0] == name and hunks[-1][2] + 1 == number:
+            hunks[-1][2] = number
+        else:
+            hunks.append([name, number, number, text])
+    messages = _git_out(runner, git_dir, ["log", "--merges", "--format=%B%x00", "%s..%s" % (tip, head)])
+    return [tuple(h) for h in hunks], [m for m in messages.split("\0") if m.strip()]
+
+
+def merge_drops_unnamed(hunks, messages):
+    """The hunks no merge commit message names (its file AND the first line of the hunk)."""
+    return [h for h in hunks if not any(h[0] in m and h[3].strip() and h[3].strip() in m for m in messages)]
+
+
+def merge_drops_text(hunk):
+    return "%s lines %d-%d (first: %s)" % (hunk[0], hunk[1], hunk[2], _one_line(hunk[3].strip(), 80))
+
+
+def add_merge_drops_parsers(sub):
+    drops = sub.add_parser("merge-drops", help="Read-only: the lines a pull request branch removes relative to the integration tip that are not its own removals; exit 1 if any "
+                                               "hunk is not named in a merge commit message",
+                           description="Compares the branch head with the tip in a git directory: every '-' line of the tip-to-head diff that is not among the branch's own removals "
+                                       "(the three-dot diff). Prints each hunk (file, line range). A hunk whose file and first line a merge commit of the branch names is allowed. Exit 0 when clean.")
+    drops.add_argument("--git-dir", default=".", help="A checkout or bare repository holding both refs (default: the current directory)")
+    drops.add_argument("--tip", default="origin/integration", help="The integration tip (default origin/integration)")
+    drops.add_argument("--branch", default="HEAD", help="The branch head to judge (default HEAD)")
+
+
+def cmd_merge_drops(args, runner, now):
+    try:
+        hunks, messages = merge_drops(runner, args.git_dir, args.tip, args.branch)
+    except MergeDropsConflict:
+        print("conflicts, resolve first")
+        return EXIT_USAGE
+    except (OSError, subprocess.SubprocessError) as err:
+        raise LedgerCommandError("merge-drops: %s" % _one_line(str(err), 200)) from None
+    bad = merge_drops_unnamed(hunks, messages)
+    for hunk in bad:
+        print("dropped: %s" % merge_drops_text(hunk))
+    return EXIT_ERROR if bad else EXIT_OK
+
+
+cmd_merge_drops.ledger = True   # reads only; its own errors are usage errors
+
+
+def merge_drops_refusal(runner, config, repo, number, state):
+    """The merge step's refusal line when the pull request's head drops a line of its base branch's tip, else None. A cached bare clone under the state directory is fetched
+    for the read; a read that cannot be made refuses nothing (the claim gate and the review check are what they were)."""
+    gh = merge_gate_gh(config, runner, repo)
+    code, out, _ = gh(["pr", "view", str(number), "--repo", repo, "--json", "baseRefName,headRefOid"])
+    try:
+        data = load_module("record_json").parse_bounded(out) if code == 0 else {}
+        base, head = data["baseRefName"], data["headRefOid"]
+    except (ValueError, KeyError, TypeError):
+        return None
+    git_dir = Path(state) / "merge-drops" / repo.replace("/", "__")
+    try:
+        if not git_dir.is_dir():
+            git_dir.parent.mkdir(parents=True, exist_ok=True)
+            _git_out(runner, ".", ["init", "--bare", "-q", str(git_dir)])
+        _git_out(runner, git_dir, ["fetch", "-q", "https://github.com/%s.git" % repo, "+refs/heads/%s:refs/tips/base" % base, "+refs/pull/%d/head:refs/tips/head" % number])
+        hunks, messages = merge_drops(runner, git_dir, "refs/tips/base", "refs/tips/head")
+    except (MergeDropsConflict, OSError, subprocess.SubprocessError):
+        return None
+    bad = merge_drops_unnamed(hunks, messages)
+    if not bad:
+        return None
+    return "merge of %s#%d refused: its head drops %d tip hunk(s): %s; keep them, or name each in a merge commit message (`fleet-switchboard merge-drops`)" % (
+        repo, number, len(bad), "; ".join(merge_drops_text(h) for h in bad[:3]))
 
 
 ANCESTOR_DEPTH = 25
@@ -20147,6 +20293,10 @@ def preflight_changed(runner, root):
 
 def cmd_preflight_pr(args, runner, now):
     """`preflight-pr`: run each class of PREFLIGHT_CLASSES under `heavy`, print one PASS or FAIL line per class, exit 1 when any fails. Only runs tests."""
+    if getattr(args, "body", None) is not None:   # off by default: only reads the description and the plan (bin/switchboard/body_check.py)
+        return cmd_body_check(args.body, runner, now, dict(parse_pr_ref=parse_pr_ref, build_engine=build_engine, read_pr_json=read_pr_json, load_config=load_config,
+                              parse_plan_source=parse_plan_source, IntentReader=IntentReader, GhAccounts=GhAccounts, fetch_plan=fetch_plan,
+                              plan_ledger=plan_ledger, plan_check=plan_check, PLAN_LINE_RE=PLAN_LINE_RE))
     top = runner(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True)
     if top.returncode != 0:
         sys.stderr.write("%s: preflight-pr: not inside a git work tree\n" % PROG)
@@ -20285,6 +20435,7 @@ def add_preflight_pr_parsers(sub):
                                "token-shaped directory name. Only runs tests: it never pushes, labels or records a verdict. "
                                "With --merged the same classes run on a local merge of the base into the head (a temporary worktree, removed afterwards).")
     pre.add_argument("--merged", action="store_true", help="Run on a local merge of the current base into the head, so a change green alone and red against the moved base is found before the push")
+    pre.add_argument("--body", metavar="PR", help="Only read the pull request (owner/repo#N) and its plan: refuse a description whose first section is not the cause the plan's cause-first scenario asks for (writes nothing)")
 
 
 def add_disk_parsers(sub):
@@ -20470,12 +20621,15 @@ def _checked_policy_thresholds(thresholds, source):
 
 _SECRET_PATTERNS = (
     (re.compile(r"(?i)\b(bearer|basic)\s+[A-Za-z0-9._~+/=-]{6,}"), r"\1 [redacted]"),
-    (re.compile(r"(?i)\b([A-Za-z0-9_.-]*(?:token|secret|passw(?:or)?d|api[_-]?key|credential|auth)[A-Za-z0-9_.-]*)"
-                r"(\s*[=:]\s*|\s+)(\"[^\"]*\"|'[^']*'|\S+)"), r"\1\2[redacted]"),
+    (re.compile(r"(?i)(?<![A-Za-z0-9_.-])(?=[A-Za-z0-9_.-]*?(?:token|secret|passw(?:or)?d|api[_-]?key|credential|auth))([A-Za-z0-9_.-]+)"
+                r"([\"']?)(\s*[=:]\s*|\s+)(\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|[\"'][^\n]*|\S+)"), r"\1\2\3[redacted]"),
     (re.compile(r"\b(?:sk-[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{20,}"
                 r"|AKIA[0-9A-Z]{12,}|xox[abprs]-[A-Za-z0-9-]{8,})"), "[redacted]"),
-    (re.compile(r"(://[^/\s:@]+:)[^@\s/]+@"), r"\1[redacted]@"),
-    (re.compile(r"\beyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]*"), "[redacted]"),   # a JWT (#773)
+    (re.compile(r"(://[^/\s:@]+:)\S{1,256}@"), r"\1[redacted]@"),   # the password may hold a slash or a raw @ (the last @ within 256 characters of one word)
+    # a whole key block (begin marker, body, the block's own first end marker): the body is any run of characters that does not begin another private-key marker (a tempered pattern), so every scan stops at the next marker (linear); a block with no end marker is redacted to the end of the text
+    (re.compile(r"-----BEGIN[A-Z ]*PRIVATE KEY(?: BLOCK)?-----(?:(?!-----BEGIN[A-Z ]{0,40}PRIVATE KEY)(?!-----END[A-Z ]{0,40}PRIVATE KEY)[\s\S])*(?:-----END[A-Z ]{0,40}PRIVATE KEY(?: BLOCK)?-----)?"), "[redacted]"),
+    (re.compile(r"-----(?:BEGIN|END)[A-Z ]*PRIVATE KEY(?: BLOCK)?-----"), "[redacted]"),   # a lone marker
+    (re.compile(r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}(?:\.[A-Za-z0-9_-]*)?"), "[redacted]"),   # a JWT (#773)
 )
 
 
@@ -20494,6 +20648,16 @@ def redact_command_text(text, extra=()):
     return text
 
 
+OVERRIDE_TEXT_LIMIT = 160
+
+
+def scrubbed_flag_text(text, limit=OVERRIDE_TEXT_LIMIT):
+    """Free text of an override audit line (`--boss-unregistered`: the reason and the boss text; `--memory-ok`: the reason) as the audit keeps it:
+    secret shapes replaced (the scrub above), control characters removed (one line), then cut to `limit` characters (160 by default).
+    A text without a secret shape stays as typed."""
+    text = redact_command_text(text)
+    text = re.sub(r"[\x00-\x1f\x7f-\x9f]+", " ", text)
+    return _one_line(text, limit)
 
 
 # PR 10: move a v1 session into v2 (`import-v1`)
@@ -20629,6 +20793,7 @@ def build_parser():
     launch.add_argument("--workspace", help="The herdr workspace for the new tab (default: the workspace of this session, else $HERDR_WORKSPACE_ID)")
     launch.add_argument("--role", help="metadata.fleet.role")
     launch.add_argument("--reports-to", dest="reports_to", help="metadata.fleet.reports_to")
+    launch.add_argument("--boss-unregistered", dest="boss_unregistered", metavar="REASON", help="Launch although --reports-to names no registered identity (audited with the reason)")
     launch.add_argument("--issue", type=issue_arg, help="metadata.fleet.issue (owner/repo#N also sets --repo)")
     launch.add_argument("--repo", help="metadata.fleet.repo, OWNER/REPO: the project the agent works in. Its gh "
                                        "account (config gh_users) is the agent's GH_TOKEN")
@@ -21168,6 +21333,40 @@ def cmd_key(args, runner=None, now=None):
         return EXIT_ERROR
     print("key saved")
     return EXIT_OK
+
+
+BRIEF_HEADER_FILE = Path("skills") / "fleet-coordination" / "operator-brief-header.txt"   # the one source of the standard brief header (ask #1046)
+
+
+def brief_header_text(path=None):
+    """The standard brief header printed from its one source file: a title, then each rule as `[id] text`. Nothing is retyped here."""
+    source = Path(path) if path else KIT_ROOT / BRIEF_HEADER_FILE
+    lines = ["Standard brief header (fleet-switchboard brief header):"]
+    for line in source.read_text().splitlines():
+        if line.strip() and not line.startswith("#"):
+            ident, _, text = line.partition(" | ")
+            lines.append("- [%s] %s" % (ident.strip(), text.strip()))
+    return "\n".join(lines)
+
+
+def cmd_brief(args, runner, now):
+    """`brief header --role operator`: print the standard header a person starts a brief from (files only; it reads no setting value)."""
+    try:
+        print(brief_header_text())
+    except OSError as err:
+        sys.stderr.write("%s: brief: the header source %s cannot be read (%s)\n" % (PROG, BRIEF_HEADER_FILE, _one_line(str(err), 100)))
+        return EXIT_ERROR
+    return EXIT_OK
+
+
+cmd_brief.direct = True   # files only: no daemon start
+
+
+def add_brief_parsers(sub):
+    brief = sub.add_parser("brief", help="Print the standard header of a brief for a cloud operator (`brief header --role operator`)")
+    brief_sub = brief.add_subparsers(dest="brief_action", required=True)
+    header = brief_sub.add_parser("header", help="Print the standard header: the admin route by setting key name, the secret rules, delete by exact name, stop at the first surprise")
+    header.add_argument("--role", required=True, choices=("operator",), help="whose brief: operator")
 
 
 # ----------------------------------------------------------------- the service

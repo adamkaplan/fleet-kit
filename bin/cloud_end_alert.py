@@ -132,7 +132,7 @@ def pushed_text(record_dir, parse):
 
 
 def pr_line(record_dir, parse):
-    """Ask #2145: the one line the end hook recorded about the pull request, only if it is one of the fixed forms; else a fixed unknown."""
+    """The end-hook ask: the one line the end hook recorded about the pull request, only if it is one of the fixed forms; else a fixed unknown."""
     run = read_small(os.path.join(record_dir, "run.json"), parse) if record_dir else None
     hook = run.get("end_hook") if run else None
     note = hook.get("pr_note") if isinstance(hook, dict) else None

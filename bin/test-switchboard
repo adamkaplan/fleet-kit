@@ -5368,7 +5368,7 @@ class TestLaunch(StandInPids, Base):
         self.assertEqual(self.registered()[str(wt)]["agent"], "worker")
         self.assertFalse([e for e in self.world.audit() if e["event"] == "worktree.registered" and e["subject"] == "other2"])
         for n in range(sb.WORKTREE_RECLAIM_MAX + 2):    # the cap is said, not silent
-            sb.register_worktree(self.world.state, "/nonexistent/w%02d" % n, "worker", None, "b", 1)
+            sb.register_worktree(self.world.state, str(self.add_worktree("w-cap%02d" % n)), "worker", None, "w-cap%02d" % n, 1)
         lines = sb.reclaim_for_agent(self.world.new_engine("cli"), subprocess.run, "worker", True)
         self.assertTrue(any("handled (cap %d)" % sb.WORKTREE_RECLAIM_MAX in l for l in lines), lines)
 
@@ -42306,6 +42306,7 @@ class TestLaunchRefusedMessage(TestLaunchMemoryGate):
         '--issue %r is not a whole numb': 'refused before any pod exists: it says nothing was created',
         'the cloud worker was not creat': 'the pod creation failed: no worker exists, so refused is right',
         'the brief line %r needs docker': 'refused before any pod exists: it says nothing was created',
+        '--boss-unregistered needs a re': 'refused before any pod exists: it says nothing was created',
     }
 
     def other_created_words(self, source):
@@ -62514,6 +62515,36 @@ class TestReviewRefusalNamesRule(TestReviewPostAndDismiss):
                         failed += 1
                 self.assertEqual(failed, 1, name)
 
+    def test_every_redaction_pattern_has_its_own_rule_name(self):   # U9
+        dash = "-" * 5
+        whole = "x\n" + dash + "BEGIN " + "PRIVATE" + " KEY" + dash + "\n" + "Q" * 12 + "\n" + dash + "END " + "PRIVATE" + " KEY" + dash + "\n"
+        marker = "x\n" + dash + "END " + "PRIVATE" + " KEY" + dash + "\n"
+
+        def check(ns):
+            names, table = ns["SECRET_RULE_NAMES"], ns["_SECRET_PATTERNS"]
+            self.assertEqual(len(names), len(table), "a redaction pattern has no rule name")
+            self.assertEqual(len(set(names)), len(names))
+            self.assertEqual(ns["find_secret_span"](whole)[0], "private-key-block")
+            self.assertEqual(ns["find_secret_span"](marker)[0], "private-key-marker")
+            return list(names), list(table)
+
+        names, table = check(vars(sb))
+        print("S9 control: every pattern has one unique rule name, and both key texts are named")
+        for added in ("private-key-block", "private-key-marker"):
+            self.assertIn(added, names)
+        self.assertEqual(len(names), len(table))
+        source = (Path(__file__).resolve().parent / "switchboard" / "secret_spans.py").read_text()
+        line = '"private-key-block", "private-key-marker", '
+        self.assertEqual(source.count(line), 1)
+        mutated = source.replace('"private-key-marker", ', "")
+        self.assertNotEqual(mutated, source)
+        ns = dict(vars(sb))
+        exec(compile(mutated, "scratch_secret_spans.py", "exec"), ns)
+        with self.assertRaises(AssertionError) as caught:
+            check(ns)
+        print("S9 mutant: applied, failed with: %s" % caught.exception)
+        self.assertIn("a redaction pattern has no rule name", str(caught.exception))
+
 
 for _name in dir(TestReviewPostAndDismiss):   # the parent's tests run in their own class
     if _name.startswith("test_") and _name not in TestReviewRefusalNamesRule.__dict__:
@@ -66787,10 +66818,12 @@ TestDerivedClosure, TestRefusalInAPart, TestMovingADefinition, TestTheDerivation
 # The shadow test (#1339): an added definition under a closure name in another file is refused by the clear.
 _shadow = importlib.import_module("test_shadow")
 TestShadowRule, TestShadowGlue, TestShadowStatuses, TestReasonsAreOneCleanLine = _shadow.TestShadowRule, _shadow.TestShadowGlue, _shadow.TestShadowStatuses, _shadow.TestReasonsAreOneCleanLine
+_pwd = importlib.import_module("test_plan_wake_drops"); _pwd.HOST = sys.modules[__name__]; TestPlanWakeDrops = _pwd.build()   # #1784
 # The Cockpit feed test (#1423): the read-only feed of what the fleet needs from a person.
 _cockpit = importlib.import_module("test_cockpit")
 TestFeedShape, TestIdsAndEtags, TestCapsAndScrub, TestDocument, TestWriting, TestReadOnly, TestBranches, TestSources, TestScrubFailsClosed, TestScrubPatterns, TestHardening, TestFileRead, TestDocumentTable = _cockpit.TestFeedShape, _cockpit.TestIdsAndEtags, _cockpit.TestCapsAndScrub, _cockpit.TestDocument, _cockpit.TestWriting, _cockpit.TestReadOnly, _cockpit.TestBranches, _cockpit.TestSources, _cockpit.TestScrubFailsClosed, _cockpit.TestScrubPatterns, _cockpit.TestHardening, _cockpit.TestFileRead, _cockpit.TestDocumentTable
 _claims_note = importlib.import_module("test_claims_note"); _claims_note.HOST = sys.modules[__name__]; TestClaimsNotePass, TestClaimsNoteSkips, TestClaimsNoteText, TestClaimsNoteMutants, TestClaimsNoteDocumentation, TestClaimsNoteScan = _claims_note.TestClaimsNotePass, _claims_note.TestClaimsNoteSkips, _claims_note.TestClaimsNoteText, _claims_note.TestClaimsNoteMutants, _claims_note.TestClaimsNoteDocumentation, _claims_note.TestClaimsNoteScan   # #1716
+_merge_drops = importlib.import_module("test_merge_drops"); _merge_drops.HOST = sys.modules[__name__]; TestMergeDrops, TestMergeDropsStep = _merge_drops.TestMergeDrops, _merge_drops.TestMergeDropsStep   # #2159
 _bot_reviews = importlib.import_module("test_bot_reviews"); _bot_reviews.HOST = sys.modules[__name__]; BotLines, BotWake, PendingJobs, BotDocumentation, BotMutants, BotSize, BotVerdict = _bot_reviews.BotLines, _bot_reviews.BotWake, _bot_reviews.PendingJobs, _bot_reviews.BotDocumentation, _bot_reviews.BotMutants, _bot_reviews.BotSize, _bot_reviews.BotVerdict
 # The relay tree-guard test (#1380, #1429): the relay thread obeys the installed-tree guard.
 _relay_tree_guard = importlib.import_module("test_relay_tree_guard")
@@ -66798,6 +66831,7 @@ RelayObeysTheTreeGuard = _relay_tree_guard.RelayObeysTheTreeGuard
 _sent_view = importlib.import_module("test_sent_view")
 _sent_view.World = World
 TestSentView = _sent_view.TestSentView
+_branch_ff = importlib.import_module("test_branch_ff"); TestBranchFf = _branch_ff.TestBranchFf
 TestScratchCommand = importlib.import_module("test_scratch_command").TestScratchCommand
 # The relay-loop tests of #1477, moved under the architecture cap.
 _relay_loop = importlib.import_module("test_relay_loop_cadence")
@@ -66860,6 +66894,7 @@ TestUnconsumedRecord = importlib.import_module("test_unconsumed_record").TestUnc
 _noparent = importlib.import_module("test_charter_noparent"); TestCharterNoParent, TestCharterNoParentSet = _noparent.TestCharterNoParent, _noparent.build(CharterRig, Base, TestCharterSetGuard)
 _hc = importlib.import_module("test_header_cache"); TestAges, TestSets, TestEvents, TestSafety, TestReplay, TestIsolation, TestDropNeverBlocksAWrite, TestApprovalReadsFresh, TestDocs = _hc.TestAges, _hc.TestSets, _hc.TestEvents, _hc.TestSafety, _hc.TestReplay, _hc.TestIsolation, _hc.TestDropNeverBlocksAWrite, _hc.TestApprovalReadsFresh, _hc.TestDocs
 TestReminderTtlMore = importlib.import_module("test_reminder_ttl").build(PR4Base)
+TestReminderWaiting = importlib.import_module("test_reminder_waiting").build(PR4Base)
 TestPlanRehearsal = importlib.import_module("test_plan_rehearsal").build(HandoffCase)   # #1785
 TestMergeRef = importlib.import_module("test_merge_ref").build(HandoffCase)   # #2053
 TestCiRecordProof = importlib.import_module("test_ci_record_proof").build(LedgerBase)   # #2091
@@ -66923,6 +66958,7 @@ TestLostWorkerRemembers = importlib.import_module("test_lost_worker_remembers").
 TestLostWorker, TestLostWorkerReadRound, TestLostWorkerMemoryOnly, TestLostWorkerSlowPass = _lost_worker.TestLostWorker, _lost_worker.TestLostWorkerReadRound, _lost_worker.TestLostWorkerMemoryOnly, _lost_worker.TestLostWorkerSlowPass
 TestPushWatch = importlib.import_module("test_push_watch").TestPushWatch   # the push watch of #1740
 TestPodSilence = importlib.import_module("test_pod_silence").TestPodSilence   # the pod silence watch of #2115
+TestPodSilenceTick = importlib.import_module("test_pod_silence").TestPodSilenceTick   # the pod silence tick of #2135
 _stage_events = importlib.import_module("test_stage_events"); _stage_events.GithubRig, _stage_events.GH_REPO = GithubRig, GH_REPO; TestStageEvents = _stage_events.TestStageEvents; TestStageEvents.CONF = {"github_stage_repos": [GH_REPO], "github_stage_bots": ["github-actions[bot]"]}
 # A CLAIMS: line present but not read is refused (#1617); HOST gives the test the fixtures of this file.
 _claim_placement = importlib.import_module("test_claim_placement"); _claim_placement.HOST = sys.modules[__name__]
@@ -66933,7 +66969,9 @@ _changed_file_pages = importlib.import_module("test_changed_file_pages")
 _changed_file_pages.HOST = sys.modules[__name__]
 TestWholeReadOfALargePullRequest = _changed_file_pages.load()
 
+_rc = importlib.import_module("test_reclaim_cap"); _rc.HOST = sys.modules[__name__]; TestReclaimCap = _rc.build()   # #1737
 _lm = importlib.import_module("test_launch_model"); _lm.HOST = sys.modules[__name__]; TestLaunchModel = _lm.build(); TestLaunchModelCloud = _lm.build_cloud()   # #1642
+TestBodyCheck = importlib.import_module("test_body_check").TestBodyCheck   # #1476
 TestLaunchCapacity = importlib.import_module("test_launch_capacity").build()   # #1793
 _ta = importlib.import_module("test_tester_agent"); _ta.HOST = sys.modules[__name__]; TestTesterAgentLaunch, TestTesterAgentMutants = _ta.build()   # #1963
 _lr = importlib.import_module("test_launched_reviewers"); _lr.HOST = sys.modules[__name__]; TestLaunchedReviewerRule, TestLaunchedReviewerGates, TestLaunchedReviewerItems, TestLaunchedReviewerRelay, TestLaunchedReviewerDocs, TestLaunchedReviewerGuards, TestLaunchedReviewerMutants = _lr.build()   # #1869
@@ -73549,6 +73587,18 @@ class TestGhShimMergeGate(Base):
         (self.home / ".config" / "fleet-switchboard" / "config.json").write_text(json.dumps({"merge_gate": {"repos": {"acme/app": {}}}, "plan_gates": {"repos": {"acme/app": {"mode": "shadow"}}}}))
         self.state = self.home / "state"
         self.state.mkdir()
+
+    def test_approving_a_deployment_gate_runs_the_real_gh_unchanged(self):
+        """#1706 regression: a POST to actions/runs/N/pending_deployments (its 'comment' field is no comment body; 'environment_ids[]' is a valid key) runs the real gh unchanged; a comment endpoint is still signed."""
+        ep = "repos/acme/app/actions/runs/123/pending_deployments"
+        argv = ["api", "-X", "POST", ep, "-F", "environment_ids[]=456", "-f", "state=approved", "-f", "comment=approve"]
+        done, log = self.run_shim(*argv)
+        self.assertEqual((done.returncode, log and log["argv"]), (0, argv), done.stderr)
+        done, log = self.run_shim("api", "-X", "POST", ep, "--input", "-")
+        self.assertEqual((done.returncode, log and log["argv"]), (0, ["api", "-X", "POST", ep, "--input", "-"]), done.stderr)
+        control = ["api", "-X", "POST", "repos/acme/app/issues/5/comments", "-f", "body=hello"]
+        done, log = self.run_shim(*control)
+        self.assertNotEqual(log and log["argv"], control)
 
     HEAD = "a" * 40
 
