@@ -14958,13 +14958,51 @@ def ask_subject(engine, repo, number, entries, unreadable, explicit, runner, now
     return {"facts": facts, "plan": plan, "plan_problem": problem}
 
 
+LEDGER_KEPT_FILE = "plan-ledger.kept"   # #2230
+
+
+def read_ledger_kept(state):
+    """`plan_ledger.read_ledger(state)`, whose answer is a function of the ledger file and its head pointer file alone: when a kept copy was made from the same bytes of both (sha256 over them), its answer is returned
+    without parsing and hashing every entry again; else the ledger is read as always and the answer is kept. Best effort: any trouble with the copy is the plain read."""
+    import hashlib
+    import marshal
+    try:
+        raw = b""
+        for name in (plan_ledger.LEDGER_FILE, plan_ledger.HEAD_FILE):
+            try:
+                raw += (Path(state) / name).read_bytes()
+            except FileNotFoundError:
+                pass
+            raw += b"\0"
+        stamp = hashlib.sha256(raw).hexdigest().encode()
+    except OSError:
+        return plan_ledger.read_ledger(state)
+    path = Path(state) / LEDGER_KEPT_FILE
+    try:
+        head, _, blob = path.read_bytes().partition(b"\n")
+        if head == stamp:
+            kept = marshal.loads(blob)
+            if isinstance(kept, tuple) and len(kept) == 2 and isinstance(kept[0], list) and (kept[1] is None or isinstance(kept[1], str)):
+                return kept
+    except (OSError, ValueError, EOFError, TypeError):
+        pass
+    answer = plan_ledger.read_ledger(state)
+    try:
+        temp = path.with_name("%s.%d.tmp" % (LEDGER_KEPT_FILE, os.getpid()))
+        temp.write_bytes(stamp + b"\n" + marshal.dumps((answer[0], answer[1])))
+        os.replace(str(temp), str(path))
+    except (OSError, ValueError, TypeError):
+        pass
+    return answer
+
+
 def _ledger_context(args, runner, now, writable, parts=None, floor=False, plan_read=True):
     """Everything `prove`, `verdict` and `gates` share: the engine, state, PR ref, its picture and its checked plan. `parts` is
     (engine, state, config) when the caller already has them (the daemon's pass); else the engine is built. `plan_read=False` skips the read of the plan
     (the relay's link check needs only the PR and the plan's source: one GitHub read)."""
     engine, state, config = parts if parts is not None else build_engine(runner, now, "cli", writable=writable)
     repo, number, pr = _ledger_pr(args)
-    entries, problem = plan_ledger.read_ledger(state)
+    entries, problem = read_ledger_kept(state)   # #2230: the same answer as plan_ledger.read_ledger, from a kept copy when both files are the bytes it was made from
     record_step("a GitHub read of %s" % pr)
     facts, body, senders, unreadable = pr_picture(engine, repo, number, state)
     if writable:   # #770: an item's entries are written only by the item commands

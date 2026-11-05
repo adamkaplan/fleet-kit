@@ -90,5 +90,33 @@ class TestGatesCheckReads(unittest.TestCase):
         self.assertEqual([c for c in calls if c.startswith("pr view")], [])
 
 
+class TestKeptLedger(unittest.TestCase):
+    """read_ledger_kept answers exactly as plan_ledger.read_ledger, also for an edited ledger beside a kept copy."""
+
+    def setUp(self):
+        from importlib.machinery import SourceFileLoader
+        sys.path.insert(0, str(REPO / "bin"))
+        import plan_ledger
+        self.pl = plan_ledger
+        self.sb = SourceFileLoader("sb_kept", str(PROGRAM)).load_module()
+        self.dir = tempfile.mkdtemp(prefix="chain-")
+        for n in range(3):
+            self.pl.append_entry(self.dir, {"pr": "acme/app#%d" % n, "kind": "proof", "result": "pass"}, 1000 + n)
+
+    def test_s3_a_second_read_is_the_same_answer_from_the_kept_copy(self):
+        first = self.sb.read_ledger_kept(self.dir)
+        self.assertTrue((Path(self.dir) / self.sb.LEDGER_KEPT_FILE).exists())
+        self.assertEqual(self.sb.read_ledger_kept(self.dir), first)
+        self.assertEqual(first, self.pl.read_ledger(self.dir))
+
+    def test_s3_an_edited_ledger_and_a_moved_pointer_are_found_with_a_kept_copy_beside(self):
+        self.sb.read_ledger_kept(self.dir)
+        path = Path(self.dir) / self.pl.LEDGER_FILE
+        path.write_text(path.read_text().replace("acme/app#1", "acme/app#9"))
+        got = self.sb.read_ledger_kept(self.dir)
+        self.assertEqual(got, self.pl.read_ledger(self.dir))
+        self.assertIn("edited", got[1] or "")
+
+
 if __name__ == "__main__":
     unittest.main()
