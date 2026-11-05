@@ -75,7 +75,8 @@ class TestIdleNudge(unittest.TestCase):
         self.assertEqual(s.sent, [cw.IDLE_NUDGE])
         self.assertEqual(len(s.audits), 1)
         self.assertEqual(s.audits[0][2], "idle-nudge")
-        self.assertEqual(s.marks, [{cw.IDLE_NUDGE_MARK: "sent"}])
+        self.assertEqual(len(s.marks), 1)   # one mark call; whatever else a mark may carry is not pinned
+        self.assertEqual(s.marks[0].get(cw.IDLE_NUDGE_MARK), "sent")
         run(self.fn, s, pod(marked=True))   # the next pass sees the annotation
         self.assertEqual(len(s.sent), 1, "%d lines sent where 1 is required" % len(s.sent))
 

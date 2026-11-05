@@ -35,7 +35,7 @@ def build(PR4Base):
             self.hold_then_free()
             self.assertEqual(self.delivered_ids(), [newest["id"]])
             lines = self.drops()
-            self.assertEqual(len(lines), 4)
+            self.assertEqual(len(lines), len(older))   # one drop line per older copy
             self.assertEqual(sorted(l["detail"]["dropped"] for l in lines), sorted(i["id"] for i in older))
             self.assertTrue(all(l["detail"]["kept"] == newest["id"] and l["detail"]["by"] == "delivered" for l in lines))
             self.assertEqual([i["id"] for i in sb.read_reminders(self.world.state) if i["id"] in {o["id"] for o in older}], [])

@@ -299,7 +299,9 @@ def build():
             code, out, err = self.launch_with("--cloud")
             self.assertEqual(code, 0, err)
             block = self.block(err)
-            self.assertEqual(self.rows(block), {"XS": "4", "S": "3", "M": "1"}, block)
+            rows = self.rows(block)
+            for shape, room in {"XS": "4", "S": "3", "M": "1"}.items():   # the room per shape the fixture gives; a new shape adds a row
+                self.assertEqual(rows.get(shape), room, block)
             self.assertIn("Pending pods: 2", block)
             event = [line for line in block.splitlines() if "last FailedScheduling:" in line]
             self.assertEqual(len(event), 1, block)

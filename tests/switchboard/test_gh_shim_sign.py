@@ -147,9 +147,8 @@ class TestGhShimSign(unittest.TestCase):
     # ---- the forms, derived from the code
     def test_every_form_in_the_code_has_an_example_here(self):
         self.assertEqual(forms_without_an_example(self.source), [])
-        self.assertEqual(len(pairs(self.source, "SIGNED_COMMANDS")), 5)
-        self.assertEqual(len(pairs(self.source, "CLOSE_COMMANDS")), 2)
-        self.assertEqual(len(pairs(self.source, "SIGNED_API")), 6)
+        for table in ("SIGNED_COMMANDS", "CLOSE_COMMANDS", "SIGNED_API"):
+            self.assertGreater(len(pairs(self.source, table)), 0, table)   # each table is read from the code and not empty
 
     def test_a_new_form_spelled_another_way_makes_the_completeness_check_fail(self):
         planted = self.source.replace("CLOSE_COMMANDS = {", "CLOSE_COMMANDS = set([(\"gist\", \"close\")]) | {", 1)

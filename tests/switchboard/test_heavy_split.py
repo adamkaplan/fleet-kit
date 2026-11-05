@@ -34,7 +34,7 @@ if bad:
 def assert_same_objects(test, module):
     part = module._part
     same = [name for name in MOVED if getattr(module, name) is getattr(part, name)]
-    test.assertEqual(len(same), 11, "11 of 11 names identical, got %r" % (same,))
+    test.assertEqual(same, list(MOVED), "every moved name is the same object, got %r" % (same,))
 
 
 class TestHeavySplit(unittest.TestCase):

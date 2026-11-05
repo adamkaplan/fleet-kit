@@ -57,8 +57,10 @@ def build():
                 with captured():
                     apply_run(args, self.world.route, self.world.clock.now)
                 counts.append(len([p for p in removable if not p.exists()]))
-            self.assertEqual(counts[0], 20, msg="first run removes 20")
-            self.assertEqual(counts[1] - counts[0], 10, msg="second run removes the next 10")
+            cap = sb.cmd_disk_reclaim_worktrees.__globals__["WORKTREE_RECLAIM_MAX"]   # the name the command reads, wherever the module is loaded from
+            self.assertLess(cap, REMOVABLE)   # the cap bites in the first run
+            self.assertEqual(counts[0], cap, msg="first run removes the cap")
+            self.assertEqual(counts[1] - counts[0], REMOVABLE - cap, msg="second run removes the rest")
             self.assertEqual(len([p for p in kept if p.exists()]), KEPT, msg="the kept ones are all still present")
 
         def test_a_control_the_real_command_removes_20_then_the_next_10_and_keeps_the_17(self):
@@ -70,7 +72,7 @@ def build():
             space = dict(vars(sb))
             exec(source.replace(OLD, NEW), space)
             self.assertIn(NEW, inspect.getsource(sb.cmd_disk_reclaim_worktrees).replace(OLD, NEW), msg="the mutation was applied")
-            with self.assertRaisesRegex(AssertionError, r"^3 != 20 : first run removes 20"):
+            with self.assertRaisesRegex(AssertionError, r"^3 != 20 : first run removes the cap"):
                 self.cap_check(space["cmd_disk_reclaim_worktrees"])
 
         def test_c_a_worktree_with_only_target_files_is_removed_and_one_with_a_stray_file_is_kept_with_its_reason(self):

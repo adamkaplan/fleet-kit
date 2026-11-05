@@ -151,7 +151,7 @@ class TestSharesDeadVerdict(unittest.TestCase):
         ]
         got = [REG.shows_dead(row, ev) for _, row, ev in table]
         self.assertEqual(got, [want for want, _, _ in table])
-        self.assertEqual(sum(got), 3)
+        self.assertEqual(sum(got), sum(want for want, _, _ in table))
 
     def test_s3_callers_and_the_view_against_a_fake_registry(self):
         self.assertEqual(problems((BIN / "registry.py").read_text(), (BIN / "agent_reconcile.py").read_text()), [])

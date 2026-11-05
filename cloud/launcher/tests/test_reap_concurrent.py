@@ -486,7 +486,7 @@ class Mutants(unittest.TestCase):
         ]
         print("S7: mutants caught %d of 4, mutations applied 4 of 4" % sum(n))
         print("S7 control: unmutated copies pass %d of 4" % self.controls)
-        self.assertEqual(sum(n), 4)
+        self.assertEqual(sum(n), len(n))   # every mutant is caught
 
     def test_S4b_the_mutant_with_a_plain_write_in_work_fails(self):
         edits = [("done.setdefault(i, (ctx.stop(", "done[i] = (ctx.stop("), ("ctx.last_hook))\n            except CloudError as e:", "ctx.last_hook)\n            except CloudError as e:"),
@@ -548,7 +548,7 @@ class Docs(unittest.TestCase):
             text = f.read()
         found = sum(p in text for p in PHRASES)
         print("S8: phrases found %d of 3" % found)
-        self.assertEqual(found, 3)
+        self.assertEqual(found, len(PHRASES))   # every phrase the plan names is in the doc
 
 
 if __name__ == "__main__":

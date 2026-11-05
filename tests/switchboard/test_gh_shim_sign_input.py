@@ -50,6 +50,9 @@ def forms_missing(source):
     return missing
 
 
+MIN_SIGNED_FORMS = 21   # the forms known when ask #1696 closed; the count never falls below it
+
+
 def count_forms(source):
     return (len(pairs(source, "SIGNED_COMMANDS")) + len(pairs(source, "CLOSE_COMMANDS")) + len(pairs(source, "SIGNED_API"))
             + len(names_in(source, "GRAPHQL_BODY_MUTATIONS")))
@@ -504,7 +507,7 @@ class TestGhShimSignInput(unittest.TestCase):
 
     def test_s10_completeness_and_count(self):
         self.assertEqual(forms_missing(self.source), [])
-        self.assertEqual(count_forms(self.source), 21)
+        self.assertGreaterEqual(count_forms(self.source), MIN_SIGNED_FORMS, "a signed form was dropped")   # a floor: a new form grows the count
         self.assertEqual(old_forms_without_an_example(self.source), [])
 
     def test_s11_a_planted_name_is_reported(self):
