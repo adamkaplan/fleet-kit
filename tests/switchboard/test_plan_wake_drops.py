@@ -42,9 +42,10 @@ def build():
             return [e for e in self.world.audit() if e["event"] == event]
 
         def class_source(self):
-            text = (BIN / "fleet-switchboard").read_text()
+            text = (BIN / "switchboard" / "plan_notice.py").read_text()   # the part holds the class since the daemon was split into parts
             start = text.index("class PlanWakeFacts:")
-            return text[start:text.index("\n\n\n# ----", start)]
+            end = text.find("\n\n\n# ----", start)
+            return text[start:] if end < 0 else text[start:end]
 
         def mutant(self, old, new):
             source = self.class_source()
