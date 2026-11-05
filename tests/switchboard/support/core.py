@@ -1,51 +1,14 @@
 """Shared fakes and helpers of bin/test-switchboard (moved text, unchanged): core."""
-import argparse
-import ast
-import traceback
-import base64
-import calendar
-import collections
-import contextlib
-import errno
-import copy
-import datetime as _dt
-import fcntl
-import gzip
-import fnmatch
-import hashlib
-import hmac
-import importlib.machinery
-import importlib.util
-import inspect
-import http.client
-import io
-import itertools
-import select
 import json
 import os
 from pathlib import Path
-import re
-from urllib.parse import unquote
-import shlex
 import shutil
-import textwrap
-import zipfile
-import signal
-import socket
-import stat
-import tarfile
 import subprocess
 import sys
-import sysconfig
 import tempfile
-import threading
 import time
-import types
 import unittest
-import uuid
-import urllib.parse
 from unittest import mock
-from support.paths import BIN, REPO
 from support.loader import sb
 
 
@@ -147,6 +110,10 @@ class Base(unittest.TestCase):
             calm = mock.patch.object(target, name, value)
             calm.start()
             self.addCleanup(calm.stop)
+        # a test world never reads the host's free disk: the disk guard runs in every pass and a small CI runner would raise disk.low in unrelated tests.
+        ample = mock.patch.object(shutil, "disk_usage", lambda path: shutil._ntuple_diskusage(1000 * 10 ** 9, 500 * 10 ** 9, 500 * 10 ** 9))
+        ample.start()
+        self.addCleanup(ample.stop)
         (self.home / "cos-definition.md").write_text(COS_ALLOWING)
         for name in (sb.LAB_ENV, sb.FAULT_ENV, "HERDR_PANE_ID", "OPENCODE_SESSION_ID"):
             os.environ.pop(name, None)

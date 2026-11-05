@@ -45,10 +45,16 @@ def strip_question(cfg):
     return c
 
 
+def _merge_base(ref):
+    r = subprocess.run(["git", "merge-base", "HEAD", ref], cwd=ROOT, capture_output=True)
+    out = r.stdout.decode().strip() if r.returncode == 0 else ""
+    return out or ref
+
+
 def base_file(rel, mode="text"):
     """The base commit's copy of a file through git (origin/integration, else origin/main); (ref, content) or (None, None)."""
     for ref in ("origin/integration", "origin/main"):
-        r = subprocess.run(["git", "show", ref + ":" + rel], cwd=ROOT, capture_output=True)
+        r = subprocess.run(["git", "show", _merge_base(ref) + ":" + rel], cwd=ROOT, capture_output=True)
         if r.returncode == 0:
             return ref, r.stdout
     return None, None
@@ -75,7 +81,7 @@ def base_other_keys():
 
 def without_ref_rules(cfg):
     cfg = copy.deepcopy(cfg)
-    gone = ("git*push*main*", "git*push*master*")
+    gone = ("git*push*main*", "git*push*master*", "gh api*/issues/comments/*", "gh api*/issues/comments/* *", "gh api*/issues/comments/*?*")
     for b in (cfg["permission"]["bash"], cfg["agent"]["worker"]["permission"]["bash"]):
         for k in [k for k in b if k in gone or k.startswith("*git*push*")]:
             del b[k]
