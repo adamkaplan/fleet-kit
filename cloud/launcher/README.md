@@ -274,6 +274,7 @@ Lane sums after ask #1695 (31 Oct 2026, computed from the macOS seconds above, n
 | `cloud/launcher/tests/test_model_credential.py` | 2 | serial |
 | `cloud/launcher/tests/test_orchestrator_agent.py` | 43 | serial |
 | `cloud/launcher/tests/test_reaper_managed.py` | 66 | serial |
+| `cloud/launcher/tests/test_refusal_label.py` | 3 | serial |
 | `cloud/launcher/tests/test_registry_endpoint.py` | 1 | serial |
 | `cloud/launcher/tests/test_retire_gone_pod.py` | 10 | serial |
 | `cloud/launcher/tests/test_stack_model_key.py` | 8 | serial |
@@ -350,6 +351,7 @@ Lane sums after ask #1695 (31 Oct 2026, computed from the macOS seconds above, n
 | `cloud/launcher/tests/test_model_credential.py` | 1 | serial |
 | `cloud/launcher/tests/test_orchestrator_agent.py` | 17 | serial |
 | `cloud/launcher/tests/test_reaper_managed.py` | 23 | serial |
+| `cloud/launcher/tests/test_refusal_label.py` | 3 | serial |
 | `cloud/launcher/tests/test_registry_endpoint.py` | 1 | serial |
 | `cloud/launcher/tests/test_retire_gone_pod.py` | 5 | serial |
 | `cloud/launcher/tests/test_stack_model_key.py` | 3 | serial |
@@ -558,6 +560,18 @@ accepting the old set). The exact refusal GitHub gives for a permission granted 
 The private key travels only through a pipe to `openssl`; only `https://api.github.com` is used (`CW_GITHUB_API_BASE`
 may name a loopback `http` address, for tests).
 
+**Why no token could be minted (the label).** When the mint cannot print a token, the repository preflight says so with one label of a closed list and the mint's own reason, scrubbed by the launcher's one `scrub()`, with addresses and long numbers replaced, cut to 160 characters, never the provider's own text: `preflight: cannot read: no token could be minted (<label>): <line>`. The mint decides the label where it refuses (`app_token.die(msg, label)`); the preflight reads it from the mint's exit and never matches text. The launch is still refused (exit 2) before anything is created. The vault's own answer is read only to choose `vault firewall` (its forbidden-client-address refusal) or `vault auth` (a missing sign-in), and is never printed, stored or audited.
+
+| Label | What it means | What it asks, of whom |
+|---|---|---|
+| `vault firewall` | the vault refused this machine's address | the vault owner adds this machine's address to the vault's firewall (the address is not printed: read it from the vault's own answer by running the vault command by hand) |
+| `vault auth` | the vault command is not signed in | the person running the launch signs in to the vault tool, then launches again |
+| `vault other` | the vault command did not run, printed nothing, printed too much, or the vault settings are missing | the person running the launch checks `CW_VAULT_SUBSCRIPTION`, `CW_VAULT_NAME` and the vault command |
+| `App key` | the App id is not a number, or the App key could not sign | the vault owner checks the `cw-app-id` and `cw-app-key` secrets |
+| `installation` | the App is not installed on the repository's account, the repository is not in the installation, or the installation is not the right one | the App owner installs the App on the account and adds the repository |
+| `permissions` | the token's permissions are not exactly the table, or GitHub refused a requested permission | the App owner grants and accepts the permission named in the line |
+| `GitHub error` | GitHub answered an error, too much, nothing usable, or too slowly | the person running the launch waits and launches again; a rate limit names its wait |
+| `other` | any refusal that fits none of the above (for example a wrong API address or a bad call) | the person running the launch reads the mint's own line (`app_token.py OWNER/REPO`, standard error) |
 The revoke covers the whole span from the mint to the end of the delivery: any exception or signal (an interrupt, SIGTERM, SIGHUP, a broken pipe, a full disk, an error in the code between the mint and the route) revokes the token once with its own value, removes the file this run created (only that one) and exits non-zero.
 A path over the file system's name or path limit is refused before anything is minted (exit 2, no request to GitHub); the limit is the smaller of the file system's `PC_NAME_MAX` and `PC_PATH_MAX` names and a fixed cap of 4096 bytes in total.
 A revoke that fails (GitHub refuses the DELETE or the connection fails) prints one line on stderr, `app-token: the token could not be revoked (status N)`, where N is the HTTP status or the word `unreachable` (never the token), and the exit status is non-zero, for the no-route run and the failed-delivery run; a good revoke prints no such line.

@@ -218,7 +218,7 @@ class TestSplitCommands(tcw.VaultBase):
         text = text.replace('print(message_id or "sent")', 'print(message_id or "sent!")')
         self.applied = before == 1 and text.count('print(message_id or "sent!")') == 1
         (tree / "bin" / "cloud_worker.py").write_text(text)
-        for name in ("cloud_cluster.py", "cloud_launch_again.py", "path_walk.py"):
+        for name in ("cloud_cluster.py", "cloud_inspect.py", "cloud_launch_again.py", "path_walk.py"):
             shutil.copy(str(ROOT / "bin" / name), str(tree / "bin" / name))
         os.symlink(str(ROOT / "cloud"), str(tree / "cloud"))
         loader = importlib.machinery.SourceFileLoader("cw_mutant_1647", str(tree / "bin" / "cloud_worker.py"))

@@ -22804,6 +22804,9 @@ class TestSweep(Base):
         ("held_check", "no held_check on a held PR", {"held_check": KeyError}, {}, "not ready"),
         ("held_check", "a raising held_check", {"held_check": lambda: 1 / 0}, {}, "not checked"),
         ("held_check", "a held_check that finds a defect", {"held_check": lambda: ["no table"]}, {}, "not ready"),
+        ("approval", "G0c enforced and no approval event at the plan hash", {"approval": {"G0c": {"tracked": True, "status": "missing", "detail": "no plan.approved event", "missing": ["no plan.approved event"]}}}, {}, "not ready"),
+        ("approval", "G0c enforced and the events could not be read", {"approval": {"G0c": {"tracked": True, "status": "missing", "detail": "events could not be read", "missing": ["events could not be read"]}}}, {}, "not ready"),
+        ("approval", "G0c enforced and an approval event at the plan hash", {"approval": {"G0c": {"tracked": True, "status": "ok", "detail": "approved at plan hash", "missing": []}}}, {}, "ready"),
         ("floor", "floor without a decision", {"floor": {"decision": None, "unreadable": None, "rehold": None}}, {}, "not checked"),
         ("floor", "floor of the wrong type", {"floor": "hold"}, {}, "not checked"),
         ("floor", "re-hold unreadable", {"floor": {"decision": "hold", "unreadable": "bad json", "rehold": None}}, {}, "not checked"),
@@ -30096,7 +30099,7 @@ class TestPlanLedger(LedgerBase):
 
     def test_a_whitespace_only_edit_does_not_void_but_a_constraint_edit_does(self):
         self.all_proven()
-        self.plan_issue["body"] = LEDGER_PLAN.replace("Commissioning works.", "Commissioning   works.\n")
+        self.plan_issue["body"] = LEDGER_PLAN.replace("Commissioning works.", "Commissioning works.  ")
         self.assertEqual(self.gates()[0], 0)
         self.plan_issue["body"] = LEDGER_PLAN.replace("Commissioning works.", "Commissioning works, with a new constraint.")
         self.assertEqual(self.gates()[0], 1)
@@ -66885,6 +66888,7 @@ class TestLoadAlert(Base):
 sys.path.insert(0, str(REPO / "tests" / "switchboard"))
 _architecture = importlib.import_module("test_architecture")
 TestArchitectureDocument, TestArchitectureDocumentFailurePaths = _architecture.TestArchitectureDocument, _architecture.TestArchitectureDocumentFailurePaths
+_approval_gate = importlib.import_module("test_approval_gate"); _approval_gate.HOST = sys.modules[__name__]; TestApprovalGateReader, TestApprovalGateCommands, TestApprovalPair = _approval_gate.TestApprovalGateReader, _approval_gate.TestApprovalGateCommands, _approval_gate.TestApprovalPair   # #1735
 TestSharesDeadVerdict = importlib.import_module("test_dead_verdict").TestSharesDeadVerdict   # #1668
 # The closure test (ask #1092, slice S13) is run the same way: the clear's closure follows the parts (tools/derive-closure).
 _closure = importlib.import_module("test_closure")
@@ -66986,6 +66990,7 @@ _olc = importlib.import_module("test_open_list_ceiling"); TestOpenListCeiling, T
 TestOpenListPassCalls = importlib.import_module("test_open_list_pass_calls").build(TestASlowCatchUpDoesNotFreezeThePass)   # #1886 Eighth (3)
 _olcuts = importlib.import_module("test_open_list_cuts"); TestOpenListCuts, TestOpenListPagesRead, TestOpenListDerivedText, TestOpenListCutsMutants, TestOpenListWholeReads, TestOpenListCutsWired = _olcuts.TestOpenListCuts, _olcuts.TestOpenListPagesRead, _olcuts.TestOpenListDerivedText, _olcuts.TestOpenListCutsMutants, _olcuts.TestOpenListWholeReads, _olcuts.TestOpenListCutsWired
 _cc = importlib.import_module("test_comment_cursor"); TestCommentCursor, TestOverlapListWhole, TestCommentCursorMutants = _cc.TestCommentCursor, _cc.TestOverlapListWhole, _cc.TestCommentCursorMutants   # #1889
+TestCommentWindowGapFill = _cc.TestCommentWindowGapFill   # #2192: a comment window is read to its start by time
 _rpstrict = importlib.import_module("test_read_pages_strict"); TestReadPagesStrict, TestReadPagesStrictMutant = _rpstrict.TestReadPagesStrict, _rpstrict.TestReadPagesStrictMutant
 TestCiOutsideBin = importlib.import_module("test_ci_outside_bin").TestCiOutsideBin
 _psj = importlib.import_module("test_pr_state_jobs")
@@ -67042,6 +67047,7 @@ TestKeyedReminderSupersede = importlib.import_module("test_keyed_reminder_supers
 _lost_worker = importlib.import_module("test_lost_worker")
 TestLostWorkerRemembers = importlib.import_module("test_lost_worker_remembers").TestLostWorkerRemembers
 TestLostWorker, TestLostWorkerReadRound, TestLostWorkerMemoryOnly, TestLostWorkerSlowPass = _lost_worker.TestLostWorker, _lost_worker.TestLostWorkerReadRound, _lost_worker.TestLostWorkerMemoryOnly, _lost_worker.TestLostWorkerSlowPass
+TestChiefOnlyWhenNeeded = _lost_worker.TestChiefOnlyWhenNeeded
 TestPushWatch = importlib.import_module("test_push_watch").TestPushWatch   # the push watch of #1740
 TestPodSilence = importlib.import_module("test_pod_silence").TestPodSilence   # the pod silence watch of #2115
 TestPodSilenceTick = importlib.import_module("test_pod_silence").TestPodSilenceTick   # the pod silence tick of #2135
@@ -67076,6 +67082,7 @@ _ph = importlib.import_module("test_plan_hash_marker"); _ph.HOST = sys.modules[_
 TestCiStateDecision, TestCiFreshReaders, TestCiFreshUnreadable, TestCiFreshOptOut, TestCiFreshReads, TestCiFreshRefusalAndEvidence, TestCiFreshDocs, TestCiFreshReadMutants, TestCiFreshSeamMutants = (_cf := importlib.import_module("test_ci_fresh")).TestCiStateDecision, _cf.TestCiFreshReaders, _cf.TestCiFreshUnreadable, _cf.TestCiFreshOptOut, _cf.TestCiFreshReads, _cf.TestCiFreshRefusalAndEvidence, _cf.TestCiFreshDocs, _cf.TestCiFreshReadMutants, _cf.TestCiFreshSeamMutants   # #1755
 _el = importlib.import_module("test_evidence_limit"); _el.HOST = sys.modules[__name__]; TestEvidenceLimitLocal, TestEvidenceLimitItems, TestEvidenceLimitCounting, TestEvidenceLimitRelay, TestEvidenceLimitMutants, TestEvidenceLimitUnchanged, TestEvidenceLimitItemCi, TestEvidenceLimitDocsAndCode = _el.build()   # #1901
 TestPlatformClassList = importlib.import_module("test_platform_classes").TestPlatformClassList
+_pl = importlib.import_module("test_plan_hash_lines"); TestPlanHashLinesPair, TestPlanHashLinesWhitespace, TestPlanHashLinesVariants, TestPlanHashLinesBindings, TestPlanHashLinesPairOrder, TestPlanHashLinesDocs, TestPlanHashLinesCloudCopy = _pl.TestPlanHashLinesPair, _pl.TestPlanHashLinesWhitespace, _pl.TestPlanHashLinesVariants, _pl.TestPlanHashLinesBindings, _pl.TestPlanHashLinesPairOrder, _pl.TestPlanHashLinesDocs, _pl.TestPlanHashLinesCloudCopy   # #1834
 
 class TestTheArchitectureTestIsRun(unittest.TestCase):
     """CI runs this file and nothing else of the switchboard's tests: if the two lines above are removed, the architecture test would drop out of CI without a
@@ -67400,6 +67407,10 @@ class TestSupportRebinding(unittest.TestCase):
         for path in sorted((REPO / "tests" / "switchboard").glob("test_*.py")):   # the test files the classes moved to follow the same rule
             with self.subTest(file=path.name):
                 self.assertEqual(self.rebindings(path.read_text(), self.moved_names()), [], "a moved name rebound in %s does not reach the moved code (rebound)" % path.name)
+
+# Self-registration (#2206): every Test* class of tests/switchboard/test_*.py that no line above binds is bound here, so a new test file needs no loader line.
+DISCOVERED_TEST_CLASSES = importlib.import_module("support.discovery").bind_discovered(__name__, Path(__file__).resolve().parent.parent / "tests" / "switchboard")
+
 
 def main(argv):
     watch_parent()
@@ -80014,6 +80025,7 @@ Brief_test_brief_fix_TestClassifyRoots, Brief_test_brief_fix_TestDeletionsAndCla
     _brief_modules["test_brief_fix"].TestClassifyRoots, _brief_modules["test_brief_fix"].TestDeletionsAndClasses, _brief_modules["test_brief_fix"].TestDocs,
     _brief_modules["test_brief_fix"].TestMutants, _brief_modules["test_brief_fix"].TestTablesDerivedFromTheCode)
 Brief_test_brief_order_TestRefusalOrder = _brief_modules["test_brief_order"].TestRefusalOrder
+Pod_header_TestPodHeader = _load_brief_tests("test_pod_header").TestPodHeader   # #2205
 Brief_impact_brief_BriefTests, Brief_impact_brief_MutantTests = _brief_modules["test-impact-brief"].BriefTests, _brief_modules["test-impact-brief"].MutantTests
 Brief_installed_guard_TreeCase, Brief_installed_guard_TestTheEntryGuard, Brief_installed_guard_TestTheDaemon, Brief_installed_guard_TestTheHooks, Brief_installed_guard_TestTheDocument, Brief_installed_guard_TestAdviceNamesAWorktree = (
     _brief_modules["test_installed_guard"].TreeCase, _brief_modules["test_installed_guard"].TestTheEntryGuard, _brief_modules["test_installed_guard"].TestTheDaemon, _brief_modules["test_installed_guard"].TestTheHooks,

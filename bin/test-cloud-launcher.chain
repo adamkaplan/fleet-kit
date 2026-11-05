@@ -81,6 +81,7 @@ cloud/launcher/tests/test_reaper_renewal.py
 cloud/launcher/tests/test_reaper_restart.py
 cloud/launcher/tests/test_reaper_row.py
 cloud/launcher/tests/test_reaper_unauthorized.py
+cloud/launcher/tests/test_refusal_label.py
 cloud/launcher/tests/test_registry_endpoint.py
 cloud/launcher/tests/test_render_namespace.py
 cloud/launcher/tests/test_repo_min_shape.py

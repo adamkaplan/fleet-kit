@@ -101,6 +101,7 @@ The **Holds** column is descriptive: only the layer numbers are enforced.
 | `cloud_cli.py` | 5 | the pod-side command to send and report through the cloud channel | |
 | `cloud_cost_report.py` | 5 | USD per day of the cloud fleet, from the launcher's audit lines (read only) | |
 | `cloud_hub.py` | 5 | the cloud switchboard's front door | |
+| `cloud_inspect.py` | 5 | the `inspect` command: what a pod of the caller is doing now, read-only (#2115); a part of `cloud_worker.py` | |
 | `cloud_retired.py` | 5 | the read of a retired cloud worker from its run record, and the boss kept at its removal (#1546); a part of `cloud_worker.py` | |
 | `cloud_way_back_check.py` | 5 | a read-only check of the way back from the cloud to local | |
 | `cloud_worker.py` | 5 | remote (cloud) workers for the switchboard | |
@@ -155,6 +156,7 @@ The **Holds** column is descriptive: only the layer numbers are enforced.
 | `switchboard/agents_verify.py` | 5 | `agents verify`: did the service register our agents as written | |
 | `switchboard/launch_model.py` | 5 | `launch --model` and `--reasoning`: the choice checked against the local service's model list before a session exists | |
 | `switchboard/bot_reviews.py` | 5 | the review bots at a pull request's head: the `gates` lines, the once-per-bot-and-head wake item | |
+| `switchboard/approval_gate.py` | 5 | the approval gate G0c: the one reader of the plan.approved events and the merge gate's refusal | |
 | `switchboard/scratch_dir.py` | 5 | `scratch`: the caller's own scratch directory under the state directory, the size bound and the daemon's once-a-day audit line | |
 | `switchboard/secret_spans.py` | 5 | where the first secret-shaped match is: a fixed rule label and numbers, never the text | |
 | `switchboard/answer_delivery.py` | 5 | how an answer reaches the asker, behind the AnswerDelivery port | |
@@ -163,6 +165,7 @@ The **Holds** column is descriptive: only the layer numbers are enforced.
 | `switchboard/profile_pieces.py` | 5 | the profile pieces shared by the install, the doctor and the commands that write a profile | |
 | `switchboard/installer.py` | 5 | the installer: the service, its units and the `install` command | |
 | `switchboard/docker_reaper.py` | 5 | the docker reaper: orphan containers and their reaping (ask #321) | |
+| `switchboard/gate_spool.py` | 5 | the gate spool reader: new lines of the shim's `gate-failopen.jsonl`, rotation, fail-open counts and over-review lines (ask #2216) | |
 | `switchboard/observing.py` | 3 | observing the fleet: what a pass reads of the agents' sessions | |
 | `switchboard/workers_report.py` | 4 | workers report, and a stop without a report is triaged (PR 13) | |
 | `switchboard/batch_decision.py` | 3 | a batch: related findings raised as one decision | |
@@ -210,7 +213,9 @@ Kinds (the number is exact, except `size`, a ceiling with headroom: see rule 7):
 | `switchboard/disk_prune.py` | `fleet-switchboard` | entry-import | 6 | the part relies on a standard-library module the entry imported; it gets its own import line |
 | `switchboard/disk_prune.py` | `fleet-switchboard` | namespace | 8 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 | `switchboard/docker_reaper.py` | `fleet-switchboard` | entry-import | 10 | the part relies on a standard-library module the entry imported; it gets its own import line |
+| `switchboard/gate_spool.py` | `fleet-switchboard` | entry-import | 3 | the part relies on standard-library modules the entry imported (`json`, `os`, `Path`); it gets its own import lines |
 | `switchboard/docker_reaper.py` | `fleet-switchboard` | namespace | 14 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
+| `switchboard/gate_spool.py` | `fleet-switchboard` | namespace | 1 | one namespace: the part reads the entry's `_plain` |
 | `switchboard/facts.py` | `switchboard/docker_reaper.py` | namespace | 2 | one namespace: the part reads a name another part defines; its rewiring gives it an import |
 | `switchboard/heavy_budget.py` | `cloud_worker.py` | import | 1 | a name the part reads from another unit without a declared edge |
 | `switchboard/heavy_budget.py` | `fleet-switchboard` | entry-import | 9 | the part relies on a standard-library module the entry imported; it gets its own import line |
@@ -237,7 +242,7 @@ Kinds (the number is exact, except `size`, a ceiling with headroom: see rule 7):
 | `impact_hold.py` | `-` | size | 2,000 | the brief-bound clear (#1215) took it past the limit; to be split (ceiling = the test's own formula: 1510 lines, plus 500, rounded up to a multiple of 500) |
 | `delegated_clear.py` | `-` | size | 1,900 | the registrar lint lives with the clear it protects; a follow-up slice moves it to its own part and lowers the ceiling |
 | `switchboard/reminders.py` | `-` | size | 2,000 | the due-reminder ceiling, the `reminder.waiting` audit line and the late count (#1728) took it past the limit; the waiting and ceiling code moves to its own part in a follow-up and the row is then deleted |
-| `cloud_worker.py` | `-` | size | 1,608 | #1619: the module loader and three call sites of bin/cloud_launch_again.py; the launch-again code itself lives there; #2135 (the inspect command, +48) and #1572 (the registry note, +26) took it from 1490 to 1564 (limit 1500); a ceiling = largest measured 1564 plus a small margin; the inspect section is the next one to move to a part |
+| `cloud_worker.py` | `-` | size | 1,608 | #1619: the module loader and three call sites of bin/cloud_launch_again.py (+4 over integration's 1604); the launch-again code itself lives there; #2135 (the inspect command, +48) and #1572 (the registry note, +26) took it from 1490 to 1564 (limit 1500); a ceiling = largest measured 1564 plus a small margin; #2221 moved the inspect section to bin/cloud_inspect.py |
 | `switchboard/agents_verify.py` | `fleet-switchboard` | entry-import | 6 | the part relies on a standard-library module the entry imported; it gets its own import line |
 | `switchboard/agents_verify.py` | `fleet-switchboard` | namespace | 7 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 | `switchboard/alert_labels.py` | `fleet-switchboard` | entry-import | 5 | the part relies on a standard-library module the entry imported; it gets its own import line |
@@ -268,6 +273,8 @@ Kinds (the number is exact, except `size`, a ceiling with headroom: see rule 7):
 | `switchboard/bot_reviews.py` | `fleet-switchboard` | entry-import | 1 | the part relies on a standard-library module the entry imported; it gets its own import line |
 | `switchboard/scratch_dir.py` | `fleet-switchboard` | entry-import | 5 | the part relies on a standard-library module the entry imported; it gets its own import line |
 | `switchboard/bot_reviews.py` | `fleet-switchboard` | namespace | 4 | one namespace: the part reads the entry's `_is_bot`, `_login`, `_id` and `GitHubItem` |
+| `switchboard/approval_gate.py` | `fleet-switchboard` | entry-import | 4 | the part relies on standard-library modules the entry imported; it gets its own import lines |
+| `switchboard/approval_gate.py` | `fleet-switchboard` | namespace | 7 | one namespace: the part reads seven names the entry defines (the merge gate's, the ledger context's and the audit's helpers) |
 | `switchboard/scratch_dir.py` | `fleet-switchboard` | namespace | 10 | one namespace: the part reads the entry's names (`build_engine`, `identify_caller`, `agent_scratch_dir`, `_write_small`); its rewiring gives it imports |
 | `switchboard/secret_spans.py` | `fleet-switchboard` | namespace | 2 | one namespace: the finder reads the entry's `_SECRET_PATTERNS` and `redact_command_text` (it must see the very patterns the net applies) |
 | `switchboard/handoff.py` | `fleet-switchboard` | namespace | 40 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
@@ -283,7 +290,7 @@ Kinds (the number is exact, except `size`, a ceiling with headroom: see rule 7):
 | `switchboard/claims_note.py` | `fleet-switchboard` | namespace | 13 | one namespace: the part reads the entry's names (the pull request records, the plan link and the plan facts) |
 | `switchboard/claims_note.py` | `plan_check.py` | import | 1 | a name the part reads from another unit without a declared edge |
 | `switchboard/claims_note.py` | `switchboard/plan_notice.py` | namespace | 1 | one namespace: the part reads a name another part defines (`plan_wake_state`); its rewiring gives it an import |
-| `switchboard/claims_note.py` | `switchboard/plan_input.py` | namespace | 1 | one namespace: the part reads `parse_plan_source` |
+| `switchboard/claims_note.py` | `switchboard/plan_input.py` | namespace | 2 | one namespace: the part reads `parse_plan_source` and `governing_done_when` |
 | `switchboard/v2_transport.py` | `fleet-switchboard` | entry-import | 15 | the part relies on a standard-library module the entry imported; it gets its own import line |
 | `switchboard/v2_transport.py` | `fleet-switchboard` | namespace | 2 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 | `fleet-switchboard` | `-` | size | 24,500 | the entry still holds every section not yet moved to a part; each move slice lowers the ceiling |
@@ -373,6 +380,9 @@ A site is listed by the function it sits in and its kind, with a count: `import(
 | `cloud_worker.py` | `_load_cluster:exec_module` | 1 | uses an identifier of the import machinery (exec_module) |
 | `cloud_worker.py` | `_load_cluster:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
 | `cloud_worker.py` | `_load_cluster:sys.modules` | 1 | uses `sys` beyond its plain attributes |
+| `cloud_worker.py` | `_load_inspect:exec_module` | 1 | uses an identifier of the import machinery (exec_module) |
+| `cloud_worker.py` | `_load_inspect:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
+| `cloud_worker.py` | `_load_inspect:sys.modules` | 1 | uses `sys` beyond its plain attributes |
 | `cloud_worker.py` | `_registry_note:load_module(string)` | 1 | names a loading builtin by a string (a name in a list counts: over-counting by design) |
 | `cloud_worker.py` | `_first_push:load_module(string)` | 1 | names a loading builtin by a string (a name in a list counts: over-counting by design) |
 | `cloud_worker.py` | `_retired:load_module(string)` | 1 | names a loading builtin by a string (a name in a list counts: over-counting by design) |
