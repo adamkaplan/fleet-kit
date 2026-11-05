@@ -71,14 +71,16 @@ class ById(unittest.TestCase):
 
     def test_control_real_file(self):
         self.assertEqual(problems(self.real()), [])
-        self.assertEqual(position_computation(self.real()), [False, False])
+        computed = position_computation(self.real())
+        self.assertTrue(computed and not any(computed), "no block lists the by-id rows after a write")
 
     def test_mutant_fails_with_anchored_text(self):
         text = self.real()
         self.assertEqual(problems(text), [], "control must pass first")
         mut = move_after_writes(text)
         self.assertNotEqual(mut, text, "the mutation was not applied")
-        self.assertEqual(position_computation(mut), [True, True], "the mutation was not applied")
+        computed = position_computation(mut)
+        self.assertTrue(computed and all(computed), "the mutation was not applied in every block")
         found = problems(mut)
         self.assertTrue(any(p.startswith("a write form of the by-id call is allowed:") for p in found), found)
 

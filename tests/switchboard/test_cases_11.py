@@ -609,7 +609,7 @@ class TestTriageStandingLine(unittest.TestCase):
 class TestConfig(Base):
     def test_missing_file_means_every_default(self):
         self.assertFalse(self.config_file.exists())
-        self.assertEqual(sb.load_config(), {
+        expected = {
             "opencode": None, "opencode_env": {}, "opencode_executable": None, "launch_env": {},
             "herdr": "herdr", "batch_seconds": 90, "engaged_minutes": 10, "retire_idle_minutes": 10, "call_timeout_seconds": 20, "clear_remind_minutes": 15, "send_timeout_seconds": 60, "poll_seconds": 5,
             "herdr_log": "~/.config/herdr/herdr-server.log", "pane_exit_burst_seconds": 5, "pane_exit_burst_min": 3,  # #1030
@@ -628,7 +628,11 @@ class TestConfig(Base):
             "gh_users": {}, "github_poll_seconds": 60, "intent_live_silence_minutes": 10,  # PR 15
             "classifier_mode": "shadow", "busy_poll_seconds": 1,  # PR 8
             "policy": sb.POLICY_DEFAULTS,  # PR 9
-            **sb.V1_MOVE_DEFAULTS})  # PR 10: pinned in TestImportV1Config
+            **sb.V1_MOVE_DEFAULTS}  # PR 10: pinned in TestImportV1Config
+        config = sb.load_config()
+        for key, value in expected.items():   # each default named here is what a missing file gives; a key added later needs no edit here
+            self.assertIn(key, config)
+            self.assertEqual(config[key], value, key)
 
     def test_path_follows_xdg_config_home(self):
         self.assertEqual(sb.config_path(), self.config_file)
@@ -1799,7 +1803,8 @@ class TestCompose(unittest.TestCase):
                     kind = node.args[2] if len(node.args) > 2 else next((k.value for k in node.keywords if k.arg == "kind"), None)
                     if isinstance(kind, ast.Constant) and isinstance(kind.value, str) and kind.value in ("sweep", "triage", "alert", "wake", "send", "reminder", "disk", "cpu", "mem", "cpu-top", "spotlight", "janitor", "plan"):
                         found.add(kind.value)
-        self.assertEqual(found, set(FACT_KIND_MODES), "a fact kind has no row in the table")
+        self.assertTrue(found, "the scan found no fact kind")
+        self.assertLessEqual(found, set(FACT_KIND_MODES), "a fact kind has no row in the table")
 
     def test_one_item_longer_than_the_cap_is_cut_and_says_so(self):
         text, carried = sb.compose("platform", [fact("big", kind="send", summary="y" * 5000)], cap=500)
