@@ -8527,6 +8527,10 @@ def push_watch_tick(engine, discovery):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     ns = types.SimpleNamespace(parse_iso=parse_iso, _one_line=_one_line, parse_bounded=load_module("record_json").parse_bounded)
+    state_dir = getattr(engine, "state_dir", None)
+    if state_dir is not None:   # #2186: only a record the one liveness test accepts is read (as pod_silence_tick reads it)
+        retired, reports = registry_retired(state_dir), _read_small(state_dir, LAST_REPORT_FILE)
+        ns.record_live = lambda rec, name, at: cloud_record_live(rec, name, retired, reports, at)
     hub = getattr(engine, "hub", None)   # the GitHub reader is the hub (Switchboard has no gh_api); with none, skip the pass
     if hub is None:
         engine.audit.append(engine.actor, "push_watch.skipped", None, "no GitHub hub")
