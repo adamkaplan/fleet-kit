@@ -796,6 +796,24 @@ class TestPushWatch(Case):
         self.assertTrue(self.world.requests)
         self.assertFalse([l for l in engine.audit.lines if "read_failed" in l[0]], engine.audit.lines)
 
+    def test_a_worker_the_registry_retired_is_not_watched_while_a_live_one_is(self):
+        """push_watch_tick reads the registry: retire a name, then the tick; the control, a live worker, is told."""
+        import os
+        self.world.refs = {"w-a/x": SHA_A, "w-b/x": SHA_A}
+        hub = types.SimpleNamespace(gh_api=lambda path, paginate=True: self.world(path))
+        module, engine = self._hub_tick(hub)
+        later = "2099-01-01T00:00:00Z"
+        engine.cloud_watch = {"records": [dict(record(w, "lane-" + w[-1]), hard_deadline=later) for w in ("w-a", "w-b")]}
+        engine.state_dir = self.tmp.name
+        Path(self.tmp.name, module.PANE_HEALTH_FILE).write_text(json.dumps({"agents": {}, "states": {}, "missing": {}}))
+        Path(self.tmp.name, module.RETIRED_FILE).write_text(json.dumps({"w-b": {"at": 1, "reason": "finished", "session": "s"}}))
+        os.environ["CW_CLOUD_AUDIT"] = self.launcher
+        self.addCleanup(os.environ.pop, "CW_CLOUD_AUDIT", None)
+        module.push_watch_tick(engine, None)
+        told = {to for to, _ in engine.sent}
+        self.assertNotIn("lane-b", told)
+        self.assertIn("lane-a", told)
+
     def test_fix2_no_hub_skips_with_one_line(self):
         module, engine = self._hub_tick(None)
         self.assertEqual(module.push_watch_tick(engine, None), [])

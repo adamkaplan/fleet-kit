@@ -74833,6 +74833,8 @@ class TestEveryViewDerivesFromTheRegistry(BaselineWorld):
         "item_agents": ("test_item_agents_fails_closed_on_a_half_read_registry", "item_agents"),
         "known_session": ("test_known_session_and_watch_follow_the_registrys_retired_record", "known_session"),
         "janitor_agent_roots": ("test_s1_an_entry_a_live_or_recently_retired_agent_owns_is_kept", "janitor_agent_roots"),
+        "pod_silence_tick": ("test_a_pod_the_registry_retired_is_not_told_while_a_live_one_is", "retired-in-registry"),
+        "push_watch_tick": ("test_a_worker_the_registry_retired_is_not_watched_while_a_live_one_is", "push_watch_tick"),
         "cmd_retire": ("test_retire_frees_the_name_of_a_headless_worker_and_undo_restores_the_record_unless_the_name_was_taken", "undo"),
     }
 
@@ -80343,10 +80345,28 @@ NOT_ISOLATED_BY_BASE = {
     "TestTheDerivationIsHeld", "TestTheMergeGate", "TestTierRoleText", "TestTriageRuleInputs", "TestTriageStandingLine", "TestTurnEnd",
     "TestUnionCheckLimitsDocs", "TestVerdictRecordingText", "TestWhoCanClear", "TestWiredCheckPlanted", "TestWorkItemRules", "TestWorkSyncPump",
     "TestWorkerRulesInSkills", "TestWriting", "TrickleHub", "TwoLoopsTrace", "WorkflowPlanPins",
+    # classes of the test files added since (bare names; the check reads the property: no World, rig or state path in the class)
+    "FreshCase", "MergeDropsBase", "NtcTree", "PinsRepo", "TestApiReadersAreViews", "TestApprovalGateCommands",
+    "TestApprovalGateReader", "TestApprovalPair", "TestBodyCheck", "TestChiefOnlyWhenNeeded", "TestCiFreshDocs", "TestCiFreshOptOut",
+    "TestCiFreshReadMutants", "TestCiFreshReaders", "TestCiFreshReads", "TestCiFreshRefusalAndEvidence", "TestCiFreshSeamMutants", "TestCiFreshUnreadable",
+    "TestCiStateDecision", "TestClaimLegacy", "TestCloudSendState", "TestDaemonSummary", "TestDiskGuardPrune", "TestEpicBatch",
+    "TestEpicRecord", "TestEpicRecordMove", "TestEpicRecordPlacement", "TestFactSourcesRegistered", "TestFirstPushMutants", "TestFirstPushNotice",
+    "TestFirstPushWiring", "TestGhHoldIsAView", "TestGhShimAllowlist", "TestGhShimArgvParser", "TestGhShimBodyFieldBesideInput", "TestGhShimBodyFieldKeyIsExact",
+    "TestGhShimBracketBodyKeys", "TestGhShimDeepBodiesAndInputForms", "TestGhShimEffectRule", "TestGhShimEncodedQueryAndLabelDelete", "TestGhShimMethodFlagBeforeApi", "TestGhShimMutationRoots",
+    "TestGhShimNestedAndQueryBodies", "TestGhShimRawPath", "TestGhShimRound5", "TestGhShimSignInput", "TestHeaderDate", "TestHeaderDateCallSites",
+    "TestHeaderInfiniteTime", "TestImpactHoldByEntry", "TestMergeDrops", "TestMergeDropsStep", "TestNewTestChecksDocs", "TestNewTestChecksFiles",
+    "TestNewTestChecksInCloudPreflight", "TestNewTestChecksInPreflightPr", "TestNewTestChecksMutants", "TestNewTestChecksRules", "TestOperatorHoldDocs", "TestPassRecheckMutants",
+    "TestPins", "TestPinsMutants", "TestPinsReview", "TestPinsStrictRead", "TestPlanHashLinesBindings", "TestPlanHashLinesCloudCopy",
+    "TestPlanHashLinesDocs", "TestPlanHashLinesPair", "TestPlanHashLinesPairOrder", "TestPlanHashLinesVariants", "TestPlanHashLinesWhitespace", "TestPlanHashMarkerDocumentation",
+    "TestPlanHashMarkerMutants", "TestPlanHashMarkerNoSizeTest", "TestPlanHashMarkerPure", "TestPlanHashMarkerStored", "TestPlanHashMarkerTally", "TestPlanKeyHash",
+    "TestPlanWakeMutants", "TestPodSilence", "TestPodSilenceTick", "TestReadPagesStrict", "TestReadPagesStrictMutant", "TestSeenAllMutants",
+    "TestStopFinalMessageBareMutant", "TestStopFinalMessageEdgesMutant", "TestStopFinalMessageHardeningMutant", "TestStopFinalMessageMutants", "TestStopFinalMessageTwoRunsMutant", "TestSummaryCluster",
+    "TestTriageHiddenMutants", "TestTwoBranchesAddingATestFile", "TestUnconsumedRecord", "TestUnreadableSummary",
     ),
     "makes its own temporary directory or state (a tempfile.mkdtemp, a patched environment or its own isolating setUp) and never reads the real one": (
     "TestEveryTestClassIsolates",
     "Case", "HeaderCacheBase", "TestCloudWatchBounds", "TestCloudWatchTick", "TestGatePass", "TestHostDisk", "TestIsolation", "TestSafety",
+    "TestStopFinalMessage", "TestStopFinalMessageBare", "TestStopFinalMessageEdges", "TestStopFinalMessageHardening", "TestStopFinalMessageTwoRuns",
     ),
 }
 

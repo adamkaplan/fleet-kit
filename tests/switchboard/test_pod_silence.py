@@ -113,6 +113,16 @@ class TestPodSilenceTick(unittest.TestCase):
         self.assertEqual(self.reads, [])
         self.assertEqual(self.sent, [])
 
+    def test_a_pod_the_registry_retired_is_not_told_while_a_live_one_is(self):
+        """The view reads the registry: retire the name, then the tick (the control, a live pod, is told)."""
+        engine = self.world([self.rec("keep"), self.rec("retired-in-registry")])
+        (engine.state_dir / sb.PANE_HEALTH_FILE).write_text(json.dumps({"agents": {}, "states": {}, "missing": {}}))
+        (engine.state_dir / sb.RETIRED_FILE).write_text(json.dumps({"retired-in-registry": {"at": 1, "reason": "finished", "session": "s"}}))
+        engine.state_dir = str(engine.state_dir)
+        self.tick(engine)
+        self.tick(engine, ahead=30 * MIN)
+        self.assertEqual(self.reads, ["keep"])
+
     def capped_scenario(self, module=None):
         engine = self.world([self.rec("p1"), self.rec("p2")])
         with unittest.mock.patch.object(sb, "load_module", lambda n: module if (n == "pod_silence" and module) else load_real(n)):
