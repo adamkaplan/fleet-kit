@@ -71,6 +71,7 @@ class TestGuardSet(unittest.TestCase):
             c, text = guard_run()
             self.assertTrue(c.wasSuccessful(), text)  # the control passes on the unmutated copy
             self.assertGreaterEqual(c.testsRun, 1)     # the named guard test ran (not a skipped-everything pass)
+            self.assertEqual(c.skipped, [], "the guard test ran, it was not skipped")   # a skipped guard is a pass that checked nothing
             (tree / "tests" / "switchboard" / "test_planted_unloaded.py").write_text(
                 "import unittest\n\nclass TestPlantedNoLoader(unittest.TestCase):\n    def test_a(self):\n        pass\n")
             r, out = guard_run()
