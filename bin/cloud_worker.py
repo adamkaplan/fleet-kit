@@ -1423,6 +1423,10 @@ def _may_retire(kind, record):
     return kind[0] == "person" or (kind[0] == "agent" and ((len(kind) > 2 and kind[2] == "chief-of-staff") or kind[1] == record.get("reports_to")))
 
 
+RECOVER_SENTENCE = ("send the pod one message to commit its tree on a NEW branch and push it there plainly, read the branch from origin, "
+                    "then retire normally")
+
+
 _BOSS_NAME_RE = re.compile(r"[a-z][a-z0-9_-]{0,31}", re.ASCII)
 
 
@@ -1470,9 +1474,15 @@ def cmd_retire(args, runner, now, record):
     _audit(engine, "cloud.stopped", args.name, {"exit": code, "reason": reason, "runtime_id": record.get("runtime_id"),
                                                 "pushed": (body or {}).get("pushed"), "wip_branch": (body or {}).get("wip_branch")})
     if code == 1:
-        sys.stderr.write("%s: %s was not retired: the end hook could not push (%s): pod kept, record kept; `%s retire %s` again once it can "
-                         "(only if there is nothing to save, `cloud-worker delete %s --force` is the explicit last resort: it discards the pod and its work)\n"
-                         % (H["PROG"], args.name, note or "no reason given", H["PROG"], args.name, args.name))
+        save = "%s-save" % args.name
+        message = ("Commit the working tree of /work/repo as ONE commit on the new branch %s (a name that does not exist on origin), push it with a plain "
+                   "git push (never forced), print the full sha, and STOP." % save)
+        recover = ("%s: %s: to save its tree first, %s: %s send %s \"%s\"; this only prints the command, it sends nothing"
+                   % (H["PROG"], args.name, RECOVER_SENTENCE, H["PROG"], args.name, message))
+        hint = ("%s: %s was not retired: the end hook could not push (%s): pod kept, record kept; `%s retire %s` again once it can "
+                "(only if there is nothing to save, `cloud-worker delete %s --force` is the explicit last resort: it discards the pod and its work)"
+                % (H["PROG"], args.name, note or "no reason given", H["PROG"], args.name, args.name))
+        sys.stderr.write(recover + "\n" + hint + "\n")
         print("%s: pod kept" % args.name)
         return H["EXIT_ERROR"]
     if code != 0:

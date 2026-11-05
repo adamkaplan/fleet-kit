@@ -1068,6 +1068,11 @@ class TestJobTool(unittest.TestCase):
     (no polling of a clock), so a loaded machine only makes it slower."""
 
     def setUp(self):
+        tmp_state = tempfile.mkdtemp()   # main() reads the state directory first (the installed-tree guard, #1380): never the real one
+        self.addCleanup(shutil.rmtree, tmp_state, True)
+        state_patch = mock.patch.dict(os.environ, {"XDG_STATE_HOME": tmp_state})
+        state_patch.start()
+        self.addCleanup(state_patch.stop)
         self.root = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, str(self.root), True)
         patcher = mock.patch.dict(os.environ, {sb.JOBS_DIR_ENV: str(self.root)})
@@ -1539,6 +1544,13 @@ class TestAgentsVerify(unittest.TestCase):
     """`agents verify`: the running service's registered agents against the rules each kit definition declares (not a count: the service adds default
     rules of its own and their number changes between versions)."""
 
+    def setUp(self):
+        tmp_state = tempfile.mkdtemp()   # main() reads the state directory first (the installed-tree guard, #1380): never the real one
+        self.addCleanup(shutil.rmtree, tmp_state, True)
+        state_patch = unittest.mock.patch.dict(os.environ, {"XDG_STATE_HOME": tmp_state})
+        state_patch.start()
+        self.addCleanup(state_patch.stop)
+
     DEFAULTS_10 = [{"action": "read", "resource": "*.env", "effect": "ask"}, {"action": "*", "resource": "*", "effect": "allow"}] + [
         {"action": "default%d" % n, "resource": "*", "effect": "allow"} for n in range(8)]
     DEFAULTS_5 = DEFAULTS_10[:5]
@@ -1718,8 +1730,10 @@ class TestReviewLawsStarterSet(Base):
         for line in body.splitlines():
             if line.startswith("## "):
                 break
-            if line.strip():
+            if line.startswith("- "):   # a rule is a list item; a closing paragraph (#2134) is guidance, not a rule
                 lines.append(line)
+            elif line.strip():
+                self.assertFalse(line.startswith(("-", "*", "R-")), "a malformed rule line: %r" % line[:80])
         return lines
 
     def install(self, *argv):
