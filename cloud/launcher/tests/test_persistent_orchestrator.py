@@ -871,21 +871,16 @@ class OneRead(PBase):
         return [v for v in self.verbs() if v[0] == "delete"]
 
     def check_plain(self):
-        """A plain worker whose pod is absent: the 22 answers fail the stop after exactly one read, keeping both Secrets."""
+        """A plain worker whose pod is absent: the 22 answers change nothing: NO workload read, the stop succeeds as before #1532 and both Secrets go."""
         problems = []
         for what, planted in self.answers().items():
             self.setUp_again()
             self.plain_worker()
-            before = {NAME + "-pw", NAME + "-run"} & set(self.st()["secrets"])
-            self.assertTrue(before)
             code, out, err = self.stop_with(planted)
-            if code != 1 or len(self.sts_reads()) != 1 or self.deletes() or "pod_gone" in out:
-                problems.append("%s: exit %s, %d reads, %d deletes" % (what, code, len(self.sts_reads()), len(self.deletes())))
-            if not before <= set(self.st()["secrets"]):
-                problems.append("%s: a per-run Secret was removed" % what)
-            last = [l for l in self.audit_lines() if l.get("action") == "stop"][-1]
-            if last.get("ok") is not False:
-                problems.append("%s: the audit stop line is not ok false" % what)
+            if code != 0 or len(self.sts_reads()) != 0 or "pod_gone" not in out:
+                problems.append("%s: exit %s, %d reads" % (what, code, len(self.sts_reads())))
+            if {NAME + "-pw", NAME + "-run"} & set(self.st()["secrets"]):
+                problems.append("%s: a per-run Secret was kept" % what)
         self.assertEqual(len(self.answers()), 22)
         self.assertEqual(problems, [])
 
@@ -923,7 +918,7 @@ class OneRead(PBase):
         if os.path.exists(self.env["CW_CLOUD_AUDIT"]):
             os.remove(self.env["CW_CLOUD_AUDIT"])
 
-    def test_s15_22_answers_for_a_plain_worker_fail_the_stop_after_one_read_and_keep_both_secrets(self):
+    def test_s15_22_answers_for_a_plain_worker_make_no_read_and_the_stop_succeeds(self):
         self.check_plain()
 
     def test_s15_22_answers_for_a_persistent_worker_fail_the_stop_and_keep_everything(self):
@@ -935,7 +930,7 @@ class OneRead(PBase):
         code, out, err = self.stop_with(dict(err=S7Lookup.NOT_FOUND % NAME + "\n"))
         self.assertEqual(code, 0, err)
         self.assertIn("pod_gone", out)
-        self.assertEqual(len(self.sts_reads()), 1)
+        self.assertEqual(len(self.sts_reads()), 0)
         self.assertFalse({NAME + "-pw", NAME + "-run"} & set(self.st()["secrets"]))
 
     def test_s15_a_statefulset_with_its_pod_gone_is_the_persistent_path(self):
@@ -965,11 +960,9 @@ class OneRead(PBase):
         self.mod = mutant("                    workload = self._absent_pod_workload(name)\n", "                    workload = self._persistent_workload(name)\n")
         with self.assertRaises(AssertionError):
             self.check_persistent()
-        with self.assertRaises(AssertionError):
-            self.check_plain()
 
     def test_s15_mutant_the_read_made_for_a_worker_with_a_pod_fails_the_check(self):
-        self.mod = mutant("            if pod is None:\n                # ONE strict read", "            if True:\n                # ONE strict read")
+        self.mod = mutant("            if pod is None and self._known_persistent(worker):\n                # ONE strict read", "            if True:\n                # ONE strict read")
         with self.assertRaises(AssertionError):
             self.check_pod_present_reads_none()
 
@@ -1006,18 +999,18 @@ class OneRead(PBase):
         problems = []
         for what, planted in self.answers().items():
             code, out, err = self.gone_plain_delete(planted)
-            if code != 2 or "stop %s" % WORKER not in err or self.writes() or len(self.sts_reads()) != 1 or '"deleted": true' in out:
+            if code != 0 or self.writes() or len(self.sts_reads()) != 0 or '"deleted": true' not in out:
                 problems.append("%s: exit %s, %d reads, %d writes" % (what, code, len(self.sts_reads()), len(self.writes())))
         self.assertEqual(problems, [])
 
-    def test_s17_the_22_answers_refuse_the_delete_of_a_worker_with_its_pod_gone(self):
+    def test_s17_the_22_answers_make_no_read_for_the_delete_of_a_plain_worker_with_its_pod_gone(self):
         self.check_delete_table()
 
     def test_s17_the_exact_not_found_is_the_plain_delete_after_one_read(self):
         code, out, err = self.gone_plain_delete(dict(err=S7Lookup.NOT_FOUND % NAME + "\n"))
         self.assertEqual(code, 0, err)
         self.assertIn('"deleted": true', out)
-        self.assertEqual(len(self.sts_reads()), 1)
+        self.assertEqual(len(self.sts_reads()), 0)
         self.assertEqual([v for v in self.verbs() if v[0] == "delete"], [])
 
     def test_s17_a_statefulset_with_its_pod_gone_refuses_the_delete_with_no_write(self):
@@ -1034,7 +1027,23 @@ class OneRead(PBase):
     def test_s17_mutant_the_delete_proceeding_on_a_non_exact_answer_fails_the_check(self):
         self.mod = mutant("                except CloudError:\n                    found = True\n", "                except CloudError:\n                    found = None\n")
         with self.assertRaises(AssertionError):
-            self.check_delete_table()
+            self.check_persistent_delete_table()
+
+    def check_persistent_delete_table(self):
+        """A persistent worker (its hub entry says so) whose pod is gone: every answer refuses the delete after one read, nothing written."""
+        problems = []
+        for what, planted in self.answers().items():
+            self.setUp_again()
+            self.launch()
+            self.patch_state(sts_get_stdout=planted.get("out", ""), sts_get_stderr=planted.get("err", ""), sts_get_code=1)
+            open(self.env["FAKE_KUBE_CALLS"], "w").close()
+            code, out, err = self.run_cli("delete", WORKER, "--force")
+            if code != 2 or "stop %s" % WORKER not in err or self.writes() or len(self.sts_reads()) != 1 or '"deleted": true' in out:
+                problems.append("%s: exit %s, %d reads, %d writes" % (what, code, len(self.sts_reads()), len(self.writes())))
+        self.assertEqual(problems, [])
+
+    def test_s17_the_22_answers_refuse_the_delete_of_a_persistent_worker_with_its_pod_gone(self):
+        self.check_persistent_delete_table()
 
     def delete_force(self):
         open(self.env["FAKE_KUBE_CALLS"], "w").close()
@@ -1081,7 +1090,7 @@ class S16Docs(unittest.TestCase):
         "at 24 hours of its shape",
         "no `cw/role` annotation on the template at this head",
         "a lost read stops renewal",
-        "A stop or a delete of a worker whose pod is absent takes ONE strict read of the StatefulSet named like the worker and refuses, keeping everything, on every answer but the exact not-found; the Role rule for StatefulSets (the administrator's step) must therefore be applied BEFORE this change is installed, or every stop of a worker with a gone pod, a plain one too, fails until it is.",
+        "A stop or a delete of a persistent orchestrator (its hub entry carries `persistent: true`) whose pod is absent takes ONE strict read of the StatefulSet named like the worker and refuses, keeping everything, on every answer but the exact not-found; any other worker with its pod absent takes NO workload read and goes on as before, so the Role rule for StatefulSets (the administrator's step) is needed only for a persistent orchestrator.",
     )
 
     def text(self, rel, drop=None):
@@ -1169,8 +1178,7 @@ class OneFormOfTheValue(unittest.TestCase):
 
 
 class StopWithoutRuleSentence(unittest.TestCase):
-    SENTENCE = ("Until the Role rule for StatefulSets is applied, the stop and the delete of ANY worker whose pod is gone keep the Secrets and say so; "
-                "apply the Role rule BEFORE this change is installed.")
+    SENTENCE = ("Until the Role rule for StatefulSets is applied, the stop and the delete of a persistent orchestrator whose pod is gone keep everything and say so; an ordinary worker is never affected (no workload read).")
 
     def test_sentence_is_found_in_both_documents(self):
         for rel in ("cloud/launcher/README.md", "docs/cloud-worker-interface.md"):

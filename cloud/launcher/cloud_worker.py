@@ -3356,7 +3356,7 @@ class Launcher:
             pod = self._need(worker)
             persistent = False
             workload = None
-            if pod is None:
+            if pod is None and self._known_persistent(worker):
                 # ONE strict read: every answer but the exact not-found (the exact Forbidden line included) fails the stop with everything kept
                 try:
                     workload = self._absent_pod_workload(name)
@@ -3494,6 +3494,19 @@ class Launcher:
             return self.kube.get_workload(name)
         except WorkloadForbidden:
             return None
+
+    def _known_persistent(self, worker):
+        """True only when the launcher KNOWS the worker is a persistent orchestrator: the hub entry its launch wrote carries persistent: true (the one
+        signal that exists before any stop; the run record is written by the first stop, and the stop's arguments carry no such flag). Any other
+        worker, or a registry that cannot be read, is not persistent: an absent pod goes on as before, with no workload read."""
+        try:
+            obj = self.kube.get_secret(self._registry_secret())
+            raw = ((obj or {}).get("data") or {}).get(REGISTRY_KEYS[1])
+            agents = json.loads(base64.b64decode(raw).decode()) if raw else {}
+            entry = agents.get(worker) if isinstance(agents, dict) else None
+            return isinstance(entry, dict) and entry.get("persistent") is True
+        except (CloudError, ValueError, TypeError, AttributeError):
+            return False
 
     def _absent_pod_workload(self, name):
         """The ONE strict read for a worker whose pod NAME is absent (shared by stop and delete): the StatefulSet named like the worker, or None
@@ -3657,7 +3670,7 @@ class Launcher:
 
         def go(info):
             pod = self._need(worker)
-            if not pod:   # the same ONE strict read as the stop: a StatefulSet or any answer but the exact not-found refuses, nothing deleted
+            if not pod and self._known_persistent(worker):   # the same ONE strict read as the stop: a StatefulSet or any answer but the exact not-found refuses, nothing deleted
                 try:
                     found = self._absent_pod_workload(name)
                 except CloudError:
