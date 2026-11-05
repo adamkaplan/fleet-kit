@@ -411,8 +411,9 @@ class UndecidableAgents(DoctorCase):
         return [line for line in run.output.splitlines() if "undecidable" in line]
 
     def test_one_warn_line_names_the_agent_and_the_passes(self):
-        got = self.run_with({"acme": 4})
-        self.assertEqual(len(got), 1, got)
+        agents = {"acme": 4}
+        got = self.run_with(agents)
+        self.assertEqual(len(got), len(agents), got)   # one line per listed agent
         self.assertTrue(got[0].startswith("WARN"), got)
         self.assertIn("agent acme: listed pane with no recorded session, undecidable for 4 passes: reattach or retire it", got[0])
 
@@ -434,7 +435,7 @@ class UndecidableAgents(DoctorCase):
         run.extra_env.update({"FLEET_SWITCHBOARD_BIN": str(stub), "FLEET_KIT_MAIN": str(real.parent.parent), "XDG_STATE_HOME": str(xdg)})
         run.run()
         got = [line for line in run.output.splitlines() if "undecidable" in line]
-        self.assertEqual(len(got), 1, run.output)
+        self.assertEqual(len(got), len(["acme"]), run.output)   # one line per listed agent
         self.assertIn("agent acme: listed pane with no recorded session, undecidable for 4 passes: reattach or retire it", got[0])
 
 

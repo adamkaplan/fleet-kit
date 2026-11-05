@@ -9,12 +9,15 @@ class PlanWakeState:
 
     def __init__(self, state_dir):
         self.announced, self.facts, self.unapproved, self.problem = {}, {}, [], None
+        self.approved = {}   # #2193: key -> time the plan was first judged approved, kept in PLAN_WAKE_FILE
         self.current, self.delivered, self.dropped, self.repeats = {}, {}, 0, 0   # #1784: the current hash of each issue seen, the keys delivered (key: time), the two counts
         self.newest = {}   # #1542: (repo, number) -> the hash of the newest plan the pass saw, for the delivery re-check
         try:
             raw = json.loads((Path(state_dir) / PLAN_WAKE_FILE).read_text())
             if isinstance(raw, dict) and isinstance(raw.get("announced"), dict):
                 self.announced = {k: v for k, v in raw["announced"].items() if isinstance(k, str) and isinstance(v, (int, float))}
+            if isinstance(raw, dict) and isinstance(raw.get("approved"), dict):
+                self.approved = {k: v for k, v in raw["approved"].items() if isinstance(k, str) and isinstance(v, (int, float))}
         except FileNotFoundError:
             pass
         except (OSError, ValueError) as err:
@@ -96,19 +99,25 @@ def plan_wake_pass(engine, state, repos, now, budget=None):
             plan_hash = check_module.plan_hash(body)
             wake.newest[(repo, number)] = plan_hash   # #1542: the present hash, for the delivery re-check
             wake.current[(repo, number)] = plan_hash   # #1784: recorded before the approved and cited skips
+            remembered = "%s#%d:%s" % (repo, number, plan_hash)
             if consensus is None:
                 consensus = plan_wake_consensus(engine)
-            if (plan_hash in consensus or module.approved_by_comment(plan, plan_hash, by_issue.get(number, []), signed_by_fleet)
+            hashes = check_module.plan_hashes(body)
+            if (check_module.canonical_hash(plan_hash, hashes) in {check_module.canonical_hash(h, hashes) for h in consensus} or any(module.approved_by_comment(plan, h, by_issue.get(number, []), signed_by_fleet) for h in hashes)
                     or module.cited_by_pr(repo, number, plan, pulls, parse_iso)):
+                if remembered not in wake.approved:   # #2193: keep the first time; no rewrite while remembered
+                    wake.approved[remembered], changed = now, True
                 continue
             if sends is None:
                 sends = _audit_tail(engine.state_dir)   # #790: the sends the audit already holds, read once per pass and only for a plan no other form approved
-            if module.approved_by_send(plan, plan_hash, sends, signed_by_fleet):
+            if any(module.approved_by_send(plan, h, sends, signed_by_fleet) for h in hashes):
+                if remembered not in wake.approved:   # #2193: keep the first time; no rewrite while remembered
+                    wake.approved[remembered], changed = now, True
                 continue
             url = module.plan_url(repo, number, plan["id"])
             key = "%s#%d:%s" % (repo, number, plan_hash)
             names = route[0]
-            if key not in wake.announced and names:
+            if key not in wake.announced and key not in wake.approved and names:   # #2193
                 own = raw[number][1]
                 source = number
                 done_when = parse_intent(own.get("body"))[1]
@@ -148,11 +157,14 @@ def plan_wake_pass(engine, state, repos, now, budget=None):
                 wake.announced[key] = now
                 changed = True
                 engine._note("plan_wake.announced", "%s#%d" % (repo, number), {"hash": plan_hash, "to": names, "route": route[1], "check": "PASS" if passed else "FAIL", "stale": bool(stale and not passed), "defect": "" if passed else defect})
-            if now - posted >= module.UNAPPROVED_SECONDS:
+            if now - posted >= module.UNAPPROVED_SECONDS and remembered not in wake.approved:
                 listed.append("%s#%d" % (repo, number) if len(repos) > 1 else "#%d" % number)
     wake.unapproved = sorted(listed)
     for old in [k for k, v in wake.announced.items() if now - v > 14 * 86400]:
         del wake.announced[old]
+        changed = True
+    for old in [k for k, v in wake.approved.items() if now - v > 14 * 86400]:
+        del wake.approved[old]
         changed = True
     for old in [k for k, v in wake.facts.items() if now - v[1] > PLAN_WAKE_FACT_KEEP]:
         del wake.facts[old]
@@ -160,7 +172,7 @@ def plan_wake_pass(engine, state, repos, now, budget=None):
         del wake.delivered[old]
     if changed:
         try:
-            state_write(Path(engine.state_dir) / PLAN_WAKE_FILE, json.dumps({"announced": wake.announced}, sort_keys=True) + "\n", fsync=True)
+            state_write(Path(engine.state_dir) / PLAN_WAKE_FILE, json.dumps(dict({"announced": wake.announced}, **({"approved": wake.approved} if wake.approved else {})), sort_keys=True) + "\n", fsync=True)
         except OSError as err:
             engine._note("plan_wake.error", "", {"error": "plan-wake.json was not saved, so a restart may announce again: %s" % _one_line(type(err).__name__, 40)})
 

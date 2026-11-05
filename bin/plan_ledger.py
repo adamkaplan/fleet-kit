@@ -377,6 +377,23 @@ def authors_of(entries, pr, notice_senders=(), github_author=None):
     return {n for n in names if n}
 
 
+def as_current(entries, hashes):
+    """#1713: the same entries with each entry's `plan_hash` and ask head mapped to the NEW form when it is the OLD form of the live text (`hashes` is plan_check.plan_hashes(text)); every other value stays as it is, and the ledger itself is never rewritten."""
+    if not hashes or len(hashes) < 2:
+        return entries
+    new, old = hashes[0], hashes[1]
+    old_head, new_head = ask_head(old), ask_head(new)
+    out = []
+    for entry in entries:
+        if entry.get("plan_hash") == old or entry.get("head") == old_head:
+            entry = dict(entry)
+            if entry.get("plan_hash") == old:
+                entry["plan_hash"] = new
+            if entry.get("head") == old_head:
+                entry["head"] = new_head
+        out.append(entry)
+    return out
+
 def ask_head(plan_hash):
     """#1130: the "head" an ask issue's record carries: the first 40 hex digits of the plan hash (`sha256:<hex>`). A revised plan has another hash, so the
     record is void exactly as a pull request's is when its head moves."""
@@ -854,6 +871,7 @@ def carried_rows(carries, entries, facts):
     """(#1196) The dependency's scenario rows: its recorded proofs and verdicts are reused ONLY for the commit its head names (`scenario_state` compares the head by
     commit, never by pull request name); a record for any other commit is void. Returns (rows, reviews)."""
     dep_pr, dep_head, dep_plan = carries["pr"], carries["head"], carries["plan"]
+    entries = as_current(entries, dep_plan.get("plan_hashes"))   # #1713
     authors = authors_of(entries, dep_pr, carries.get("notice_senders") or (), carries.get("author"))
     rows = []
     for s in dep_plan["scenarios_parsed"]:
@@ -911,6 +929,7 @@ def evaluate_gates(plan, entries, ledger_problem, facts, pr, now=None):
     every tracked gate that applies to a PR is satisfied; the untracked ones are listed, not counted."""
     head = (facts or {}).get("head")
     authors = authors_of(entries, pr, (facts or {}).get("notice_senders") or (), (facts or {}).get("author"))
+    entries = as_current(entries, (plan or {}).get("plan_hashes"))   # #1713: a binding at the old hash of a marker-bearing plan reads as the live one
     carries = (facts or {}).get("carries") or None   # (#1196) the one dependency named by `CARRIES: #N`; None for an ordinary pull request
     carried_reviews = None
     rows, scen_rows = [], []
@@ -1421,6 +1440,7 @@ def launch_findings(brief, plan, entries):
         return [{"gate": "G0a", "missing": ["the plan the brief links could not be read"]}]
     if plan["result"] != "pass":
         found.append({"gate": "G0a", "missing": ["the plan fails `plan check` (%d defect(s))" % len(plan["defects"])]})
+    entries = as_current(entries, plan.get("plan_hashes"))   # #1713
     if consensus_at(entries, plan["plan_hash"]) is None:
         found.append({"gate": "G0b", "missing": ["no consensus record at the plan's current hash %s" % plan["plan_hash"][:19]]})
     return found
