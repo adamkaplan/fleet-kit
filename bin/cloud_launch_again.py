@@ -9,6 +9,7 @@ import json
 import os
 import sys
 
+BRIEF_MAX = 4_000_000   # the kept text of a no-wait launch's brief (the file read_brief already bounded)
 H: dict = {}   # the globals of bin/cloud_worker.py, set by bind
 
 
@@ -34,6 +35,8 @@ def _launch_line(record, **extra):
 def _launch_again(args, runner, engine, state, record, repo, branch):
     """A launch of a name that has a record. Returns the exit code when the launch is decided here (the worker returned, still starting, finished,
     or refused), or None when the record was cleared (its pod is gone and its hard deadline passed) and a new worker is to be made."""
+    if record is None:   # a first launch of the name
+        return None
     LaunchError = H["H"]["LaunchError"]
     name = args.name
     if not H["_ended"](record):
@@ -93,7 +96,7 @@ def _finish_starting(args, runner, engine, state, record, repo, branch):
                         raise H["CloudError"]("the hub entry could not be given the session: %s" % H["_reason"](hcode, hnote))
                 brief = None
                 try:
-                    brief = H["_read_private"](brief_path(state, name), H["BRIEF_MAX"]) if brief_path(state, name).exists() else None
+                    brief = H["_read_private"](brief_path(state, name), BRIEF_MAX) if brief_path(state, name).exists() else None
                 except (OSError, ValueError):
                     brief = None
                 record["state"] = "ready"
@@ -107,5 +110,30 @@ def _finish_starting(args, runner, engine, state, record, repo, branch):
     except (H["H"]["V2Error"], H["H"]["V2Unreachable"], H["CloudError"], OSError, KeyError, TypeError) as err:
         raise LaunchError("%s (the worker %s is kept: launch again, or `%s retire %s`)" % (H["_one"](str(err), 200), name, H["H"]["PROG"], name)) from None
     H["_registry_note"](engine, "upsert", state, name, {"session": record["session"], "repo": repo, "role": args.role, "kind": "cloud", "run_id": record.get("run_id"), "state": "working"})
+    print(json.dumps(_launch_line(record), sort_keys=True))
+    return H["H"]["EXIT_OK"]
+
+
+def no_wait_options(args):
+    """--no-wait (only on request): the launcher requests the pod and returns; the same launch command finishes it later. The create options it adds."""
+    if not getattr(args, "no_wait", False):
+        return []
+    if getattr(args, "stack", False):
+        raise H["H"]["LaunchError"]("--no-wait does not combine with --stack (a stack pod's start is its own wait); nothing was created")
+    return [H["CREATE_OPTION"]["no_wait"]]
+
+
+def park(engine, runner, state, name, record, run_id, brief, cluster):
+    """The pod is requested: keep what the finishing call needs (the run id, the brief once) and return at once."""
+    try:
+        record["state"], record["run_id"] = "starting", run_id
+        if brief:
+            H["_write_private"](brief_path(state, name), brief)
+        H["save_record"](state, record)
+    except (H["CloudError"], OSError) as err:
+        H["remove_record"](state, name)
+        H["_stop_after_failure"](engine, runner, name, run_id, "launch: record not stored", cluster)
+        raise H["H"]["LaunchError"]("the worker was requested but its record could not be stored (%s); stop was requested" % H["_one"](cluster.clean(str(err), 100), 100)) from None
+    print("starting: %s requested; run the same launch command again to finish it, or read %s / status to poll" % (name, name), file=sys.stderr)
     print(json.dumps(_launch_line(record), sort_keys=True))
     return H["H"]["EXIT_OK"]
