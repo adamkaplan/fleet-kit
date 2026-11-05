@@ -78237,6 +78237,7 @@ class TestNoPaneToJudge(StandInPids, Base):
         "pane_state": "judges the one pane it is handed (herdr's answer); the callers never hand it a no-pane row",
         "release_stale_binding": "acts on a pane herdr still lists under a name; a no-pane row has none",
         "write_pane_health": "keeps a dead row's time; judges nothing",
+        "collect_status": "reads the pane-undecidable record (a pane streak), not a dead verdict; judges nothing",
     }
 
     _PARSED = {}   # source text -> (tree, lines): each entry is parsed and split ONCE
