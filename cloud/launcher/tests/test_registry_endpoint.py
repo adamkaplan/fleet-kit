@@ -261,8 +261,8 @@ class Mutants(unittest.TestCase):
         ("the row left behind at the clear", "bin/cloud_worker.py",
          '        _registry_note(engine, "retire", state, name, "cleared: the pod is gone and the hard deadline has passed")', "        pass", "^(FAIL|ERROR): test_matches_the_cloud_sweep_retires_the_row_once_and_a_second_run_retires_nothing "),
         ("the row retired before the stop", "bin/cloud_worker.py",
-         "    try:\n        with Cluster() as cluster:\n            code, body, note = run_launcher(runner, \"stop\", args.name, [\"--reason\", reason], STOP_SECONDS, cluster=cluster)",
-         "    _registry_note(engine, \"retire\", state, args.name, reason)\n    try:\n        with Cluster() as cluster:\n            code, body, note = run_launcher(runner, \"stop\", args.name, [\"--reason\", reason], STOP_SECONDS, cluster=cluster)", "^(FAIL|ERROR): test_matches_a_failed_stop_leaves_the_row "),
+         "    try:\n        with Cluster() as cluster:\n            code, body, note = run_launcher(runner, \"stop\", args.name, extra, STOP_SECONDS, cluster=cluster)",
+         "    _registry_note(engine, \"retire\", state, args.name, reason)\n    try:\n        with Cluster() as cluster:\n            code, body, note = run_launcher(runner, \"stop\", args.name, extra, STOP_SECONDS, cluster=cluster)", "^(FAIL|ERROR): test_matches_a_failed_stop_leaves_the_row "),
     )
 
     def run_tree(self, rel=None, old=None, new=None):
