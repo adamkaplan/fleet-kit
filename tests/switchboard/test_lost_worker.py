@@ -885,10 +885,6 @@ class TestLostWorkerSlowPass(unittest.TestCase):
         self.assertIn("a slow reaper pass is not a reaper failure", str(caught.exception))
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestChiefOnlyWhenNeeded(unittest.TestCase):
     """#2202: a loss the launcher's own record shows as an ok stop goes to its lane only; any other loss still goes to the lane and the Chief of Staff."""
 
@@ -908,3 +904,7 @@ class TestChiefOnlyWhenNeeded(unittest.TestCase):
 
     def test_s4_no_stop_goes_to_the_lane_and_the_chief(self):
         self.assertEqual(self.delivered(False), ["chief-of-staff", "lane-a"])
+
+
+if __name__ == "__main__":
+    unittest.main()
