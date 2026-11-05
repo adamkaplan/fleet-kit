@@ -61651,7 +61651,8 @@ class TestStructuralRuleInReviewing(unittest.TestCase):
 
     def test_verify_with_no_folder_named_reads_no_installed_file_under_the_suite(self):
         listing = TestAgentsVerify("listing").listing()
-        with unittest.mock.patch.object(sb, "stale_installed_agents", wraps=sb.stale_installed_agents) as spy, \
+        with tempfile.TemporaryDirectory() as xdg, unittest.mock.patch.dict(os.environ, {"XDG_STATE_HOME": xdg, "XDG_CONFIG_HOME": xdg}), \
+                unittest.mock.patch.object(sb, "stale_installed_agents", wraps=sb.stale_installed_agents) as spy, \
                 contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             sb.main(["agents", "verify"], runner=lambda argv, **kw: subprocess.CompletedProcess(argv, 0, listing, ""))
         self.assertEqual(spy.call_args.args[0], None)
@@ -61659,7 +61660,7 @@ class TestStructuralRuleInReviewing(unittest.TestCase):
     def verify(self, installed_dir):
         listing = TestAgentsVerify("listing").listing()
         out, err = io.StringIO(), io.StringIO()
-        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err), unittest.mock.patch.dict(os.environ):
+        with tempfile.TemporaryDirectory() as xdg, contextlib.redirect_stdout(out), contextlib.redirect_stderr(err), unittest.mock.patch.dict(os.environ, {"XDG_STATE_HOME": xdg, "XDG_CONFIG_HOME": xdg}):   # the installed-tree check (#1380) reads the state dir: keep it off the real one
             code = sb.main(["agents", "verify", "--installed-dir", str(installed_dir)],
                            runner=lambda argv, **kw: subprocess.CompletedProcess(argv, 0, listing, ""))
         return code, out.getvalue()
