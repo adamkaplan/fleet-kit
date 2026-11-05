@@ -1,6 +1,7 @@
 """#1215 PC-9 (strict-read fixes): deletions are material, the owner-only classes are reachable from the real path list, the brief labels PR text untrusted,
 the docs say six material risks; the tables of kinds are derived from the code; mutants of each rule fail.
 Run from the repo root: python3 -m unittest tests.test_brief_fix   (also collected by bin/test-switchboard)."""
+import importlib.util
 import json
 import re
 import sys
@@ -15,7 +16,15 @@ import impact_brief as ib  # noqa: E402
 import delegated_clear as dc  # noqa: E402
 
 HEAD = "a" * 40
-MATRIX = json.loads((ROOT / "docs/review-laws/impact-matrix.json").read_text())
+
+def _load_matrix(path):
+    """The impact matrix through its ONE loader (the JSON plus its entry files, ask #2206 part 3)."""
+    spec = importlib.util.spec_from_file_location("impact_floor_for_test", str(ROOT / "bin" / "impact_floor.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.load_matrix(path)
+
+MATRIX = _load_matrix(ROOT / "docs/review-laws/impact-matrix.json")
 SUB = MATRIX["owner_hold"]["substance_decider"]
 OWNER_PATHS = SUB["owner_only_paths"]
 SOURCE = (BIN / "impact_brief.py").read_text()

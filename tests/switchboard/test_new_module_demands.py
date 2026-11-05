@@ -9,7 +9,7 @@ import unittest
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
-from support.paths import BIN, REPO
+from support.paths import BIN, REPO, load_matrix
 
 TOOL = REPO / "tools" / "new-module-demands"
 AUTHORITY = "def may_clear_hold(pr):\n    return pr == 'operator'\n"
@@ -100,7 +100,7 @@ class TestNewModuleDemands(unittest.TestCase):
 
     def test_s5_the_tool_and_the_guard_name_the_same_modules(self):
         tool, guard = load_tool(), guard_class()
-        matrix = json.loads((REPO / "docs" / "review-laws" / "impact-matrix.json").read_text())["owner_hold"]["authority_modules"]
+        matrix = load_matrix(REPO / "docs" / "review-laws" / "impact-matrix.json")["owner_hold"]["authority_modules"]
         vocab, literals = matrix["vocabulary"], matrix["role_literals"]
 
         def both(directory):
@@ -140,7 +140,7 @@ class TestNewModuleDemands(unittest.TestCase):
         ps = load_module_path_suites()
         for row in ps.NEW_BIN_GUARDS:
             self.assertNotIn(row[0], source.replace("NEW_BIN_GUARDS", ""), row[0])
-        matrix = json.loads((REPO / "docs" / "review-laws" / "impact-matrix.json").read_text())["owner_hold"]["authority_modules"]
+        matrix = load_matrix(REPO / "docs" / "review-laws" / "impact-matrix.json")["owner_hold"]["authority_modules"]
         typed = [w for w in matrix["vocabulary"] + matrix["role_literals"] if re.search(r"""['"]%s['"]""" % re.escape(w), source)]
         self.assertEqual(set(typed) - {"authority"}, set(), "only the class key `authority` of top_tier_paths is named, not a list of the vocabulary")
         self.assertNotIn("test-switchboard", source.replace("tests/switchboard/test_new_module_demands.py", ""))
