@@ -31921,10 +31921,27 @@ class TestRegistrarFloor(LedgerBase):
             source = (BIN / "fleet-switchboard").read_text()
             tree = ast.parse(source)
             reach = self.dc.closure(tree, self.dc.daemon_roots(self.rule), self.rule["dynamic_actions"])
-            TestRegistrarFloor.cache = (source, tree, sorted(reach[0] | reach[1]), sorted(reach[0]), sorted(reach[1]))
-        self.base_src, self.tree, self.names, self.defs, self.bindings = TestRegistrarFloor.cache
+            TestRegistrarFloor.cache = (source, tree, sorted(reach[0] | reach[1]), sorted(reach[0]), sorted(reach[1]), self.small_source(tree, set(reach[0] | reach[1])))
+        self.base_src, self.tree, self.names, self.defs, self.bindings, self.small_src = TestRegistrarFloor.cache
         self.extra_config = dict(FLOOR_CONFIG, plan_gates={"repos": {"acme/app": {"mode": "shadow"}}})
         self.configure()
+
+    @staticmethod
+    def small_source(tree, names):
+        """The small fixture the planted shapes are linted on (ask #2108): the real file's module-level statements with every function that is not a registrar cut to the bare references it makes to the closure's names (a closure function keeps its edges, any other function goes). The lint of the planted shape answers the same as over the 26k-line file; the real file is linted once, by the tests that say 'real'."""
+        import ast
+        body = []
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if node.name.startswith("add_") and node.name.endswith("_parsers"):
+                    body.append(node)
+                elif node.name in names:
+                    refs = sorted({x.id for x in ast.walk(node) if isinstance(x, ast.Name) and x.id in names and x.id != node.name})
+                    stub = ast.FunctionDef(node.name, node.args, [ast.Expr(ast.Name(r, ast.Load())) for r in refs] or [ast.Pass()], node.decorator_list, None)
+                    body.append(ast.fix_missing_locations(ast.copy_location(stub, node)))
+            else:
+                body.append(node)
+        return ast.unparse(ast.Module(body, []))
 
     memo = {}   # (what, text hash or tree id, ...) -> (the tree it was made from, the value); the last few only
 
@@ -31957,10 +31974,10 @@ class TestRegistrarFloor(LedgerBase):
             self.addCleanup(patcher.stop)
 
     def head_of(self, body, name="add_zzz_parsers", base=None):
-        return (base if base is not None else self.base_src) + "\n\ndef %s(sub):\n    %s\n" % (name, body.replace("\n", "\n    "))
+        return (base if base is not None else self.small_src) + "\n\ndef %s(sub):\n    %s\n" % (name, body.replace("\n", "\n    "))
 
     def found(self, body, name="add_zzz_parsers", base=None):
-        got, why = self.dc.registrar_findings(base if base is not None else self.base_src, self.head_of(body, name, base), self.rule)
+        got, why = self.dc.registrar_findings(base if base is not None else self.small_src, self.head_of(body, name, base), self.rule)
         self.assertIsNone(why, why)
         return got
 
@@ -32122,7 +32139,7 @@ class TestRegistrarFloor(LedgerBase):
         self.assertIn(("a changed line of a function that writes a namespace", "calls", "a statement that may write the module's namespace"), edited[0])
         removed = base.replace("    global %s\n    %s = None\n" % (self.pick()[1], self.pick()[1]), "    sub.add_parser('zzz')\n")
         self.assertEqual(self.dc.registrar_findings(base, removed, self.rule), ([], None), "a removed hostile line: not held")
-        added = self.dc.registrar_findings(self.base_src, base, self.rule)[0]
+        added = self.dc.registrar_findings(self.small_src, base, self.rule)[0]
         self.assertEqual({r for r, _, _ in added} - {"a changed line of a function that writes a namespace"}, {"add_zzz_parsers"})   # (the new rule also names the writer function by its own finding)  # the named rebinding and the grammar's own finding (a Global statement is not in the grammar)
         self.assertIn(("add_zzz_parsers", "rebinds", self.pick()[1]), added)
 
@@ -32208,7 +32225,7 @@ class TestRegistrarFloor(LedgerBase):
         self.assertTrue(self.reg("def add_a_parsers(sub):\n    ZZZ_HEADING = eval\n    p = sub.add_parser('x', description='%s' % ZZZ_HEADING)\n")[0], "a local binding is held")
 
     def reg(self, text, base=None):
-        return self.dc.registrar_findings(self.base_src if base is None else base, (self.base_src if base is None else base) + "\n" + text + "\n", self.rule)
+        return self.dc.registrar_findings(self.small_src if base is None else base, (self.small_src if base is None else base) + "\n" + text + "\n", self.rule)
 
     def test_a_registrar_bound_in_any_form_the_daemon_could_pick_up_is_read_or_held(self):
         function, binding, module = self.pick()
@@ -32239,7 +32256,7 @@ class TestRegistrarFloor(LedgerBase):
         self.assertIn(("add_a_parsers (through _zzz_helper)", "rebinds", binding), got)
         got, why = self.reg("def add_a_parsers(sub):\n    _zzz_helper2()\ndef _zzz_helper2():\n    _zzz_helper3()\ndef _zzz_helper3():\n    %s()\n" % function)
         self.assertTrue(any(v == "calls" and "through _zzz_helper3" in r for r, v, _ in got), got)   # transitive
-        base = self.base_src + "\n" + helper + "def add_a_parsers(sub):\n    pass\n"   # a hostile helper already there, no registrar calls it
+        base = self.small_src + "\n" + helper + "def add_a_parsers(sub):\n    pass\n"   # a hostile helper already there, no registrar calls it
         self.assertEqual(self.dc.registrar_findings(base, base, self.rule), ([], None))
         edited = base.replace("def add_a_parsers(sub):\n    pass\n", "def add_a_parsers(sub):\n    thing = sub.add_parser('a')\n")
         self.assertEqual(self.dc.registrar_findings(base, edited, self.rule), ([], None), "a different line of the registrar: the helper is not named")
@@ -32598,9 +32615,25 @@ class TestRegistrarFloor(LedgerBase):
             "def hh(text):\n    import os\n    return os.fspath(text)\ndef hh2(text):\n    import os\n    return text\nSTATES = FIELDS + FIELDS\n")   # a registration helper OUTSIDE the closure (as on a registrar split), whose body a registrar's lint would hold
     FAKE_RULE = {"closure_roots": ["main"], "rating_roots": [], "dynamic_actions": [], "registrar_allow": {"pure_builtins": ["int", "str"], "helpers": ["hh", "hh2"], "parser_methods": VERBS, "free_keywords": FREE_KEYWORDS}}
 
-    def table_failures(self, dc):
-        """[row that does not hold] for the table below, run on the lint module `dc` (the real one, or a mutant of it)."""
-        fake, rule, bad = self.FAKE, self.FAKE_RULE, []
+    class _FirstRow(Exception):
+        pass
+
+    def table_failures(self, dc, first_only=False):
+        """[row that does not hold] for the table below, run on the lint module `dc` (the real one, or a mutant of it). `first_only`: stop at the first row that does not hold (a mutant is only asked to fail ONE row: the list is then non-empty, the same assertion)."""
+        class Rows(list):
+            def append(rows, item):
+                list.append(rows, item)
+                if first_only:
+                    raise TestRegistrarFloor._FirstRow()
+        bad = Rows()
+        try:
+            self._table_rows(dc, bad)
+        except TestRegistrarFloor._FirstRow:
+            pass
+        return list(bad)
+
+    def _table_rows(self, dc, bad):
+        fake, rule = self.FAKE, self.FAKE_RULE
         def run(text, base=None):
             return dc.registrar_findings(fake if base is None else base, (fake if base is None else base) + text, rule)
         def has(label, text, want, base=None):
@@ -32958,13 +32991,13 @@ class TestRegistrarFloor(LedgerBase):
             with self.subTest(key):
                 module = self.mutant_module("NOT_BINDERS = {", "NOT_BINDERS = {")
                 module.STRING_BINDERS = {k: v for k, v in module.STRING_BINDERS.items() if k != key}
-                self.assertTrue(self.table_failures(module), "a lint that does not read %s as a binder survives" % key)
+                self.assertTrue(self.table_failures(module, first_only=True), "a lint that does not read %s as a binder survives" % key)
 
     def test_the_table_holds_on_the_real_lint_and_every_mutant_of_it_fails_a_row(self):
         self.assertEqual(self.table_failures(self.dc), [], "the table holds on the real lint")
         for label, old, new in self.MUTANTS:
             with self.subTest(label):
-                self.assertTrue(self.table_failures(self.mutant_module(old, new)), "the mutant survives: %s" % label)
+                self.assertTrue(self.table_failures(self.mutant_module(old, new), first_only=True), "the mutant survives: %s" % label)
 
     N = "REGISTRAR_NAME_RE"
     # one form per member of PATTERN_BINDERS (the node class that binds the name): the text that binds it
@@ -33047,9 +33080,9 @@ class TestRegistrarFloor(LedgerBase):
 
     def rebind_held(self, module, spelling):
         """True when the REAL owner_decide holds the daemon file text with the spelling and `zz_evil` appended; an exception of a mutant counts as not held."""
-        head = self.base_src + "\n" + spelling + "\n" + self.EVIL
+        head = self.small_src + "\n" + spelling + "\n" + self.EVIL
         try:
-            got, why = module.registrar_findings(self.base_src, head, self.rule)
+            got, why = module.registrar_findings(self.small_src, head, self.rule)
         except Exception:
             return False
         report = {"findings": got, "closure": self.names, "why": why}
@@ -33139,7 +33172,7 @@ class TestRegistrarFloor(LedgerBase):
 
     def test_the_cli_the_daemon_the_gate_and_the_delegated_clear_all_read_the_same_hold(self):
         function, binding, module = self.pick()
-        self.serve(self.head_of(self.HOSTILE % (binding, binding)))
+        self.serve(self.head_of(self.HOSTILE % (binding, binding), base=self.base_src))
         shown = json.loads(self.run_as("coder", "impact", "floor", self.PR, "--json")[1])
         report = sb.pr_floor_report(self.engine(), "acme/app", 9)
         self.assertEqual((shown["owner_decision"], shown["owner_reasons"]), (report["owner_decision"], report["owner_reasons"]))
@@ -33154,7 +33187,7 @@ class TestRegistrarFloor(LedgerBase):
         self.assertTrue(any("registrar add_zzz_parsers" in r for r in got["reasons"]))
 
     def test_a_flag_only_registrar_edit_and_an_unchanged_daemon_file_do_not_add_a_reason(self):
-        self.serve(self.head_of("thing = sub.add_parser('zzz')\nthing.add_argument('--x', type=issue_arg)"))
+        self.serve(self.head_of("thing = sub.add_parser('zzz')\nthing.add_argument('--x', type=issue_arg)", base=self.base_src))
         report = sb.pr_floor_report(self.engine(), "acme/app", 9)
         self.assertEqual(report["registrar_reasons"], [])
         self.pr = dict(self.pr, changedFiles=1, files=[{"path": "docs/a.md", "additions": 1, "deletions": 0}])
@@ -36793,7 +36826,7 @@ class TestImpactHold(LedgerBase):
                 self.assertTrue(set(readers) <= set(roots.get("bin/" + path.name) or []), "%s has a config reader (%s) that is not a root" % (path.name, readers))
         # the modules the clear loads or runs, DERIVED: every loader of the daemon (a `load_module("x")` call, a name in HELPER_MODULES, a function that returns one) is enumerated by ast; a module
         # is judged when the clear reaches its loader, the daemon loads it at import, it has a config reader, or the recorded run executed it; every other loaded module is listed with its reason
-        daemon, hold = ast.parse(switchboard_source()), ast.parse((BIN / "impact_hold.py").read_text())
+        daemon, hold = self.real_tree(), ast.parse((BIN / "impact_hold.py").read_text())
         names = {p.stem for p in BIN.glob("*.py")}
         helper = next(ast.literal_eval(n.value) for n in daemon.body if isinstance(n, ast.Assign) and any(getattr(t, "id", "") == "HELPER_MODULES" for t in n.targets))
         defs = {n.name: n for n in daemon.body if isinstance(n, (ast.FunctionDef, ast.ClassDef))}
@@ -37183,10 +37216,13 @@ class TestImpactHold(LedgerBase):
         rule = sb.impact_floor.load_matrix()["owner_hold"]["delegated_clear"]
         source = switchboard_source()
         tree = _ast.parse(source)    # the daemon file is parsed once; its closure is computed once
-        cls._daemon_cache = {"source": source, "tree": tree, "closure": mod.closure(tree, mod.daemon_roots(rule), rule["dynamic_actions"])}
+        cls._daemon_cache = {"source": source, "tree": tree, "closure": mod.closure(tree, mod.daemon_roots(rule), rule["dynamic_actions"]), "roots": mod.daemon_roots(rule), "dyn": rule["dynamic_actions"], "heads": {}}
 
     def real_source(self):
         return self._daemon_cache["source"] if self._daemon_cache else switchboard_source()
+
+    def real_tree(self):   # the daemon file's tree, parsed once for the class and only read
+        return self._daemon_cache["tree"] if self._daemon_cache else ast.parse(switchboard_source())
 
     def edit_one_line_under(self, source, name):
         """The source with one comment added at the end of the first body line of module-level function `name` (a one-line change right under the def), and its unified diff."""
@@ -37199,10 +37235,17 @@ class TestImpactHold(LedgerBase):
         head = list(lines)
         head[j + 1] = head[j + 1] + "  # x"
         diff = "\n".join(list(difflib.unified_diff(lines, head, lineterm="", n=3))[2:])
-        return "\n".join(head), diff
+        head_source = "\n".join(head)
+        cache = self._daemon_cache
+        if cache and source is cache["source"]:   # the edited file's tree: the unchanged tree with the ONE edited definition parsed again at its own line numbers (the rest of the file is the same text)
+            node = next((n for n in cache["tree"].body if isinstance(n, ast.FunctionDef) and n.name == name and n.lineno == i + 1), None)
+            if node is not None and j + 1 < node.end_lineno:
+                parsed = ast.parse("\n" * i + "\n".join(head[i:node.end_lineno])).body[0]
+                cache["heads"][head_source] = ast.Module(body=[parsed if n is node else n for n in cache["tree"].body], type_ignores=[])
+        return head_source, diff
 
-    def closure_check(self, head, diff):
-        rule = sb.impact_floor.load_matrix()["owner_hold"]["delegated_clear"]
+    def closure_check(self, head, diff, rule=None, roots=None, dynamic=None):
+        rule = rule or sb.impact_floor.load_matrix()["owner_hold"]["delegated_clear"]
         import unittest.mock as mock
         mod = sb.load_module("delegated_clear")
         cache = self._daemon_cache
@@ -37211,11 +37254,13 @@ class TestImpactHold(LedgerBase):
             def __getattr__(self, attr):
                 return getattr(real_ast, attr)
             def parse(self, src, *a, **k):
-                return cache["tree"] if src is cache["source"] and not a and not k else real_ast.parse(src, *a, **k)
+                if not a and not k:
+                    return cache["tree"] if src is cache["source"] else cache["heads"].get(src) or real_ast.parse(src)
+                return real_ast.parse(src, *a, **k)
         def cached_closure(tree, roots, dyn=()):
-            return cache["closure"] if tree is cache["tree"] else real_closure(tree, roots, dyn)
+            return cache["closure"] if tree is cache["tree"] and roots == cache["roots"] and tuple(dyn) == tuple(cache["dyn"]) else real_closure(tree, roots, dyn)
         with mock.patch.object(mod, "ast", CachedAst()), mock.patch.object(mod, "closure", cached_closure):
-            return mod.closure_refusals(self.real_source(), head, diff, mod.daemon_roots(rule), set(rule["clear_entry_points"]), False, rule["dynamic_actions"])
+            return mod.closure_refusals(self.real_source(), head, diff, mod.daemon_roots(rule) if roots is None else roots, set(rule["clear_entry_points"]), False, rule["dynamic_actions"] if dynamic is None else dynamic)
 
     def test_the_five_functions_hunk_headers_missed_are_refused_by_the_ast_on_the_real_daemon_file(self):
         source = self.real_source()
@@ -37939,7 +37984,7 @@ class TestImpactHold(LedgerBase):
         import ast
         rule = sb.impact_floor.load_matrix()["owner_hold"]["delegated_clear"]
         module = sb.load_module("delegated_clear")
-        daemon = ast.parse(self.real_source())
+        daemon = self.real_tree()
         fields = set(sb.IMPACT_RATING_FIELDS) | {"by_role"}
         names = {"IMPACT_RATING_FIELDS", "IMPACT_CLASS_RE"}
         def touches(node):   # a definition that builds, parses, defaults, fills or REGISTERS (an argparse flag or its default) a rating field
@@ -37966,11 +38011,11 @@ class TestImpactHold(LedgerBase):
                 self.assertNotEqual(head, lines)
                 diff = "\n".join(list(difflib.unified_diff(lines, head, lineterm="", n=3))[2:])
                 self.assertTrue(self.closure_check("\n".join(head), diff), "%s is refused a delegated clear" % label)
-                if not module.closure_refusals(self.real_source(), "\n".join(head), diff, module.daemon_roots(dict(rule, rating_roots=[])), set(rule["clear_entry_points"]), False, rule["dynamic_actions"]):
+                if not self.closure_check("\n".join(head), diff, dict(rule, rating_roots=[])):
                     passed.append(label)
         for name in rule["rating_roots"]:
             head, diff = self.edit_one_line_under(self.real_source(), name)
-            if not module.closure_refusals(self.real_source(), head, diff, module.daemon_roots(dict(rule, rating_roots=[])), set(rule["clear_entry_points"]), False, rule["dynamic_actions"]):
+            if not self.closure_check(head, diff, dict(rule, rating_roots=[])):
                 passed.append(name)
         for needle in ("parse_review_block", "add_review_parsers", "a default on the rating flags", "the loop that registers the rating flags turned off"):
             self.assertIn(needle, passed, "without the rating roots a change to %s passes: the roots are what refuse it" % needle)
@@ -37981,7 +38026,7 @@ class TestImpactHold(LedgerBase):
         import ast
         rule = sb.impact_floor.load_matrix()["owner_hold"]["delegated_clear"]
         module = sb.load_module("delegated_clear")
-        daemon = ast.parse(self.real_source())
+        daemon = self.real_tree()
         defs = {n.name: n for n in daemon.body if isinstance(n, (ast.FunctionDef, ast.ClassDef))}
         dynamic = rule["dynamic_actions"]
         self.assertEqual(dynamic, ["review"])
@@ -38037,12 +38082,12 @@ class TestImpactHold(LedgerBase):
                 head = source.replace(old, new)
                 diff = "\n".join(list(difflib.unified_diff(source.split("\n"), head.split("\n"), lineterm="", n=3))[2:])
                 self.assertTrue(self.closure_check(head, diff), "refused: %s" % label)
-                self.assertEqual(module.closure_refusals(source, head, diff, sorted(rule["closure_roots"]), set(rule["clear_entry_points"])), [], "the mutant (the roots of round 2, no dynamic edge) lets %s through" % label)
+                self.assertEqual(self.closure_check(head, diff, roots=sorted(rule["closure_roots"]), dynamic=()), [], "the mutant (the roots of round 2, no dynamic edge) lets %s through" % label)
 
     def test_one_definition_of_rated_at_this_head_the_clear_and_every_other_reader_use_it(self):
         import ast
         hold = ast.parse((BIN / "impact_hold.py").read_text())
-        daemon = ast.parse(self.real_source())
+        daemon = self.real_tree()
         calls = lambda node: {getattr(x.func, "id", None) for x in ast.walk(node) if isinstance(x, ast.Call)}
         for name in ("delegated_clear_score", "delegated_clear_pr_checks"):
             checks = next(n for n in hold.body if isinstance(n, ast.FunctionDef) and n.name == name)
@@ -38315,7 +38360,7 @@ class TestImpactHold(LedgerBase):
         self.assertEqual(private & public, set(), "an input is private or public, never both")
         self.assertTrue(all(isinstance(r, str) and len(r) > 20 for r in sb.REVIEW_RECORD_PUBLIC_INPUTS.values()), "every public input carries its reason")
         self.assertTrue({"reviewer", "verdict", "confirms_carry", "block"} <= private)
-        node = next(n for n in ast.parse(self.real_source()).body if isinstance(n, ast.FunctionDef) and n.name == "cmd_review")
+        node = next(n for n in self.real_tree().body if isinstance(n, ast.FunctionDef) and n.name == "cmd_review")
         read = {x.attr for x in ast.walk(node) if isinstance(x, ast.Attribute) and isinstance(x.value, ast.Name) and x.value.id == "args"}
         self.assertEqual(sorted(read - public - {"raw_argv"}), [], "cmd_review reads an input from the shared namespace that is not listed as public")
         parsed = sb.record_inputs(("review", "record", "acme/app#9", "--reviewer", "code", "--verdict", "approve", "--confirms-carry"))
@@ -38370,7 +38415,7 @@ class TestImpactHold(LedgerBase):
         wanted = {a.dest: (tuple(a.option_strings), a.nargs) for a in private._actions if a.dest in sb.RATING_INPUTS}
         self.assertEqual(shared, wanted, "the flags of the shared record parser equal the private parser's (names and arity): they cannot drift")
         self.assertFalse(record.allow_abbrev)
-        daemon = ast.parse(self.real_source())
+        daemon = self.real_tree()
         for name in ("cmd_review", "parse_review_block"):
             node = next(n for n in daemon.body if isinstance(n, ast.FunctionDef) and n.name == name)
             reads = sorted({"args.%s" % x.attr for x in ast.walk(node) if isinstance(x, ast.Attribute) and isinstance(x.value, ast.Name) and x.value.id == "args" and x.attr in sb.PRIVATE_INPUTS}
@@ -38383,7 +38428,7 @@ class TestImpactHold(LedgerBase):
         """Defence in depth (not the closure): the vocabulary a registrar may use is its own `sub.add_parser`, `add_argument`, `add_subparsers` and `set_defaults` on a parser it made. A NEW use of the rest fails here."""
         import ast
         found = {}
-        for node in ast.parse(self.real_source()).body:
+        for node in self.real_tree().body:
             if not (isinstance(node, ast.FunctionDef) and re.fullmatch(r"add_[a-z0-9_]+_parsers", node.name)):
                 continue
             for x in ast.walk(node):
@@ -66094,7 +66139,7 @@ _shadow = importlib.import_module("test_shadow")
 TestShadowRule, TestShadowGlue, TestShadowStatuses, TestReasonsAreOneCleanLine = _shadow.TestShadowRule, _shadow.TestShadowGlue, _shadow.TestShadowStatuses, _shadow.TestReasonsAreOneCleanLine
 # The Cockpit feed test (#1423): the read-only feed of what the fleet needs from a person.
 _cockpit = importlib.import_module("test_cockpit")
-TestFeedShape, TestIdsAndEtags, TestCapsAndScrub, TestDocument, TestWriting, TestReadOnly, TestBranches = _cockpit.TestFeedShape, _cockpit.TestIdsAndEtags, _cockpit.TestCapsAndScrub, _cockpit.TestDocument, _cockpit.TestWriting, _cockpit.TestReadOnly, _cockpit.TestBranches
+TestFeedShape, TestIdsAndEtags, TestCapsAndScrub, TestDocument, TestWriting, TestReadOnly, TestBranches, TestSources, TestScrubFailsClosed, TestScrubPatterns, TestHardening, TestFileRead, TestDocumentTable = _cockpit.TestFeedShape, _cockpit.TestIdsAndEtags, _cockpit.TestCapsAndScrub, _cockpit.TestDocument, _cockpit.TestWriting, _cockpit.TestReadOnly, _cockpit.TestBranches, _cockpit.TestSources, _cockpit.TestScrubFailsClosed, _cockpit.TestScrubPatterns, _cockpit.TestHardening, _cockpit.TestFileRead, _cockpit.TestDocumentTable
 _claims_note = importlib.import_module("test_claims_note"); _claims_note.HOST = sys.modules[__name__]; TestClaimsNotePass, TestClaimsNoteSkips, TestClaimsNoteText, TestClaimsNoteMutants, TestClaimsNoteDocumentation, TestClaimsNoteScan = _claims_note.TestClaimsNotePass, _claims_note.TestClaimsNoteSkips, _claims_note.TestClaimsNoteText, _claims_note.TestClaimsNoteMutants, _claims_note.TestClaimsNoteDocumentation, _claims_note.TestClaimsNoteScan   # #1716
 _bot_reviews = importlib.import_module("test_bot_reviews"); _bot_reviews.HOST = sys.modules[__name__]; BotLines, BotWake, PendingJobs, BotDocumentation, BotMutants, BotSize, BotVerdict = _bot_reviews.BotLines, _bot_reviews.BotWake, _bot_reviews.PendingJobs, _bot_reviews.BotDocumentation, _bot_reviews.BotMutants, _bot_reviews.BotSize, _bot_reviews.BotVerdict
 # The relay tree-guard test (#1380, #1429): the relay thread obeys the installed-tree guard.
@@ -66143,6 +66188,8 @@ TestHeavySplit = importlib.import_module("test_heavy_split").TestHeavySplit
 # The steer-after-minutes tests of #1540, moved under the line ceiling.
 _steer_long = importlib.import_module("test_steer_long_turn")
 TestSteerLongTurn = _steer_long.build(Base, TestSteerToWorking)
+TestUnconsumedSteer = importlib.import_module("test_unconsumed_steer").build(Base, TestSteerToWorking)   # #1844
+TestUnconsumedRecord = importlib.import_module("test_unconsumed_record").TestUnconsumedRecord   # #1844
 _noparent = importlib.import_module("test_charter_noparent"); TestCharterNoParent, TestCharterNoParentSet = _noparent.TestCharterNoParent, _noparent.build(CharterRig, Base, TestCharterSetGuard)
 _hc = importlib.import_module("test_header_cache"); TestAges, TestSets, TestEvents, TestSafety, TestReplay, TestIsolation, TestDropNeverBlocksAWrite, TestApprovalReadsFresh, TestDocs = _hc.TestAges, _hc.TestSets, _hc.TestEvents, _hc.TestSafety, _hc.TestReplay, _hc.TestIsolation, _hc.TestDropNeverBlocksAWrite, _hc.TestApprovalReadsFresh, _hc.TestDocs
 TestReminderTtlMore = importlib.import_module("test_reminder_ttl").build(PR4Base)
@@ -66172,10 +66219,13 @@ _delivery_lag.World = World
 TestSentKeysAge = importlib.import_module("test_sent_keys_age").TestSentKeysAge   # #2094
 TestSentLedgerBounds = importlib.import_module("test_sent_keys_age").TestSentLedgerBounds   # #2094
 PresentHub, TestDeliveryLag = _delivery_lag.PresentHub, _delivery_lag.TestDeliveryLag
+# The per-repository owner hold tests of #1241.
+_t1241 = importlib.import_module("test_1241"); TestOwnerHoldFloorConfig, TestImpactHoldByEntry, TestOperatorHoldDocs = _t1241.TestOwnerHoldFloorConfig, _t1241.TestImpactHoldByEntry, _t1241.TestOperatorHoldDocs
 TestLaunchBriefCheck = importlib.import_module("test_launch_brief_check").build(TwoRepoCase, TestLaunchRefusedMessage)
 TestRunLauncherShapes, TestStatusLines, TestTurnEnd, TestDictCallersUnchanged = (_ss := importlib.import_module("test_status_shape")).TestRunLauncherShapes, _ss.TestStatusLines, _ss.TestTurnEnd, _ss.TestDictCallersUnchanged
 TestEveryKindDelayedMark = importlib.import_module("test_every_kind_delayed_mark").TestEveryKindDelayedMark
 TestSignedLinkScrub = importlib.import_module("test_signed_link_scrub").build(Base, GithubRig)
+TestCharterOtherRepo = importlib.import_module("test_charter_other_repo").build(CharterRig, Base)
 TestCiQueue = importlib.import_module("test_ci_queue").build(HandoffCase, FAKE_GH)   # #1961
 TestLaunchQueue = importlib.import_module("test_launch_queue").build(HandoffCase)
 TestHeldSends = importlib.import_module("test_held_sends").TestHeldSends   # #2051
@@ -66187,15 +66237,18 @@ _lost_worker = importlib.import_module("test_lost_worker")
 TestLostWorkerRemembers = importlib.import_module("test_lost_worker_remembers").TestLostWorkerRemembers
 TestLostWorker, TestLostWorkerReadRound, TestLostWorkerMemoryOnly, TestLostWorkerSlowPass = _lost_worker.TestLostWorker, _lost_worker.TestLostWorkerReadRound, _lost_worker.TestLostWorkerMemoryOnly, _lost_worker.TestLostWorkerSlowPass
 TestPushWatch = importlib.import_module("test_push_watch").TestPushWatch   # the push watch of #1740
+_stage_events = importlib.import_module("test_stage_events"); _stage_events.GithubRig, _stage_events.GH_REPO = GithubRig, GH_REPO; TestStageEvents = _stage_events.TestStageEvents; TestStageEvents.CONF = {"github_stage_repos": [GH_REPO], "github_stage_bots": ["github-actions[bot]"]}
 # A CLAIMS: line present but not read is refused (#1617); HOST gives the test the fixtures of this file.
 _claim_placement = importlib.import_module("test_claim_placement"); _claim_placement.HOST = sys.modules[__name__]
 TestClaimPlacement, TestClaimMutants, TestClaimReaders = _claim_placement.TestClaimPlacement, _claim_placement.TestClaimMutants, _claim_placement.TestClaimReaders
+_claim_legacy = importlib.import_module("test_claim_legacy"); _claim_legacy.HOST = sys.modules[__name__]; TestClaimLegacy = _claim_legacy.TestClaimLegacy
 # The whole-read check of a pull request of more than 100 files (#1098); the host module gives the class its fixtures.
 _changed_file_pages = importlib.import_module("test_changed_file_pages")
 _changed_file_pages.HOST = sys.modules[__name__]
 TestWholeReadOfALargePullRequest = _changed_file_pages.load()
 
 _lm = importlib.import_module("test_launch_model"); _lm.HOST = sys.modules[__name__]; TestLaunchModel = _lm.build(); TestLaunchModelCloud = _lm.build_cloud()   # #1642
+_lr = importlib.import_module("test_launched_reviewers"); _lr.HOST = sys.modules[__name__]; TestLaunchedReviewerRule, TestLaunchedReviewerGates, TestLaunchedReviewerItems, TestLaunchedReviewerRelay, TestLaunchedReviewerDocs, TestLaunchedReviewerGuards, TestLaunchedReviewerMutants = _lr.build()   # #1869
 _cfw = importlib.import_module("test_changed_files_whole"); _cfw.HOST = sys.modules[__name__]; TestChangedFilesWhole = _cfw.build()   # #1531
 TestShimGuardsTool, TestShimGuardRows, TestShimHygienePlanted, TestShimGuardMutants, TestShimGuardDocs = (_sg := importlib.import_module("test_shim_guards")).TestShimGuardsTool, _sg.TestShimGuardRows, _sg.TestShimHygienePlanted, _sg.TestShimGuardMutants, _sg.TestShimGuardDocs   # #1909
 TestPlanningDecision, TestConcurrencyGroup, TestGateLegs, TestGatePass, TestPlatformPaths, TestMacDocs = (_ml := importlib.import_module("test_mac_legs")).TestPlanningDecision, _ml.TestConcurrencyGroup, _ml.TestGateLegs, _ml.TestGatePass, _ml.TestPlatformPaths, _ml.TestDocs
@@ -75301,13 +75354,17 @@ class TestBlockedMutants(Base):
 
     def killed_each(self, mutants, workers=2):
         """{id: killed?} for {id: (source text, test)}: each mutant is built and its named test run in a forked CHILD (the parent's tree is never touched), `workers` at a time."""
-        out, running = {}, {}
+        out, running, crashed = {}, {}, {}
 
         def reap():
-            pid, _ = os.wait()
+            pid, status = os.wait()
             ident, fd = running.pop(pid)
             with os.fdopen(fd) as pipe:
-                out[ident] = pipe.read() == "1"
+                answer = pipe.read()
+            if status != 0 or answer not in ("0", "1"):
+                crashed[ident] = "exit status %s\n%s" % (status, answer)
+            else:
+                out[ident] = answer == "1"
 
         for ident, (text, test) in mutants.items():
             if len(running) >= workers:
@@ -75318,15 +75375,20 @@ class TestBlockedMutants(Base):
                 code = 70
                 try:
                     os.close(read)
-                    answer = "1" if self.killed(self.mutant_module(text), test) else "0"
+                    try:
+                        answer = "1" if self.killed(self.mutant_module(text), test) else "0"
+                        code = 0
+                    except BaseException:
+                        answer = traceback.format_exc()
                     os.write(write, answer.encode())
-                    code = 0
                 finally:
                     os._exit(code)
             os.close(write)
             running[pid] = (ident, read)
         while running:
             reap()
+        if crashed:
+            self.fail("a mutant's child CRASHED (not a survivor):\n" + "\n".join("%s: %s" % (i, crashed[i]) for i in sorted(crashed)))
         return out
 
     def control_passes(self, tests):
@@ -77476,7 +77538,7 @@ class TestAskIssueSubject(unittest.TestCase):
         out, err = io.StringIO(), io.StringIO()
         with mock.patch.object(sb, "build_engine", lambda *a, **k: (engine, self.state, config)), mock.patch.object(sb, "pr_picture", lambda *a: picture), \
                 mock.patch.object(sb, "identify_caller", lambda *a: self.caller), mock.patch.object(sb, "checked_plan", lambda *a, **k: self.plan()), \
-                mock.patch.object(sb, "launched_testers_for", lambda c: ({}, {}, {})), mock.patch.object(sb, "read_open_overlap", lambda *a: None), \
+                mock.patch.object(sb, "launched_testers_for", lambda c, role="tester": ({}, {}, {})), mock.patch.object(sb, "read_open_overlap", lambda *a: None), \
                 contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             try:
                 code = getattr(sb, command)(args, None, self.now)
@@ -77978,7 +78040,7 @@ class TestClosedUnmergedAskClose(unittest.TestCase):
         if kind == "too many pull requests":
             self.too_many = True
         elif kind == "unknown sibling":   # merged, and no claim line was ever recorded for it
-            self.found = [dict(number=31, state="closed", merged_at="2026-01-01T00:00:00Z", body="PLAN: %s\nCLAIMS: S1" % self.ASK, pull_request={"merged_at": "2026-01-01T00:00:00Z"})]
+            self.found = [dict(number=31, state="closed", merged_at="2026-11-01T00:00:00Z", body="PLAN: %s\nCLAIMS: S1" % self.ASK, pull_request={"merged_at": "2026-11-01T00:00:00Z"})]
         else:
             self.broken = kind
 
