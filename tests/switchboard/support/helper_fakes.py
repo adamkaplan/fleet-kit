@@ -220,7 +220,7 @@ class FakeSweepHub:
             return list(self.closed_records.values()), False
         return list(self.open.values()), False
 
-    def read_comments(self, consumer, repo, since, cap):   # #1889: what read_pages answered for the comments path
+    def read_comments(self, consumer, repo, since, cap, budget=None):   # #1889: what read_pages answered for the comments path
         return self.read_pages("repos/%s/issues/comments?since=%s&sort=created&direction=desc&per_page=100" % (repo, since), older=("created_at", since), cap=cap)
 
     def _read_one(self, repo, path, now, fresh=False):

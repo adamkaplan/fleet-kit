@@ -47,7 +47,7 @@ class CommentWorld:
         self.requests.append(path)
         query = dict(part.split("=", 1) for part in path.split("?", 1)[1].split("&"))
         page = int(query.get("page", "1"))
-        rows = sorted((c for c in self.comments if c["updated_at"] >= query["since"]), key=lambda c: (c["created_at"], c["id"]), reverse=True)
+        rows = sorted((c for c in self.comments if c["updated_at"] >= query["since"]), key=lambda c: (c["created_at"], c["id"]), reverse=query.get("direction") != "asc")
         out = rows[(page - 1) * 100:page * 100]
         for c in out:
             self.served[c["id"]] = self.served.get(c["id"], 0) + 1
