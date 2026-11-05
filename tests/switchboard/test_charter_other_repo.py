@@ -95,13 +95,12 @@ def build(CharterRig, Base):
             with self.assertRaisesRegex(AssertionError, r"^0 != 1"):
                 self.assertEqual(self.recorded(mutated), 1)
 
-        def test_s6_the_live_text_and_an_odd_404(self):
+        def test_s6_the_live_text_and_an_odd_404_both_mean_no_parent(self):
             a, b = self.lane("orch-s6a"), self.lane("orch-s6b")
             self.run_set(a, "7", LIVE)
             self.assertEqual(self.recorded(a), 1)
             code, err, _ = self.run_set(b, "7", sb.IntentError("not_found", "gh: repository moved (HTTP 404)"))
-            self.assertIn("that is not the no-parent answer".replace(" ", "?"), err)   # charter_safe turns every space of the reason into ?
-            self.assertEqual(self.recorded(b), 0)
+            self.assertEqual(self.recorded(b), 1)   # #1943: the strict read trusts no wording of a 404 of the parent: it is "no parent"
 
         def test_s8_a_missing_issue_is_refused_after_the_parent_read(self):
             miss = sb.IntentError("not_found", "gh: Not Found (HTTP 404)")

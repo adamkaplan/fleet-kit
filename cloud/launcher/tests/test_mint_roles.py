@@ -3,7 +3,9 @@
 Offline: a loopback stand-in for the GitHub API (the pattern of test_app_token.py), the fake cluster of the orchestrator tests, and the
 reaper's renewal harness of test_git_token_renewal.py. Mutants are built from the real source and each must be caught.
 """
+import pathlib
 import argparse
+import io
 import json
 import os
 import re
@@ -66,7 +68,7 @@ def table_failures(m):
                     "repositories": [{"name": "widget-service", "full_name": REPO, "owner": {"id": 9}}]}
         with mock.patch.object(m, "github_json", side_effect=fake), mock.patch.object(m, "vault", return_value="12345"), \
                 mock.patch.object(m, "sign", return_value=b"s"), mock.patch.object(m, "find_installation", return_value=(678, 9)), \
-                mock.patch.object(sys, "stderr", open(os.devnull, "w")):
+                mock.patch.object(sys, "stderr", io.StringIO()):
             try:
                 m.mint(REPO, role)
             except SystemExit:
@@ -79,7 +81,7 @@ def table_failures(m):
         if role == "orchestrator":
             cases += [(dict(want, contents="write"), True), (dict(ORCH_SET, contents="write"), True)]
         for perms, rejected in cases:
-            with mock.patch.object(sys, "stderr", open(os.devnull, "w")):
+            with mock.patch.object(sys, "stderr", io.StringIO()):
                 try:
                     m.check_permissions(perms, role)
                     got = False
@@ -331,7 +333,7 @@ class LaunchSideMint(unittest.TestCase):
             tok = mod.git_token(REPO, cluster, *args)
         calls = []
         if os.path.exists(self.log):
-            calls = [json.loads(line) for line in open(self.log)]
+            calls = [json.loads(line) for line in pathlib.Path(self.log).read_text().splitlines()]
         return tok, calls
 
     def test_the_first_token_of_an_orchestrator_launch_carries_its_kind_once(self):
@@ -386,7 +388,7 @@ class LaunchSideMint(unittest.TestCase):
                 if os.path.exists(own + ".argv"):
                     os.remove(own + ".argv")
                 self.run_mint(self.load(), kind, env=env)
-                self.assertEqual([json.loads(x) for x in open(own + ".argv")], [["extra"]])
+                self.assertEqual([json.loads(x) for x in pathlib.Path(own + ".argv").read_text().splitlines()], [["extra"]])
         self.assertFalse(os.path.exists(self.log))
 
     def test_the_launch_passes_its_kind_to_the_mint(self):
