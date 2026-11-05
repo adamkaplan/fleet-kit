@@ -71,7 +71,8 @@ def write_reminders(state_dir, items):
 
 
 LATE_NOTE_SECONDS = 300
-TEXT_CAP = 4000  # mirrors MESSAGE_CAP in bin/fleet-switchboard
+TEXT_CAP = 4000  # mirrors MESSAGE_CAP in bin/fleet-switchboard: a text over it is refused on the command line and carried in parts from `--text-file` (#1355)
+TEXT_FILE_MAX = 100000  # characters of a `--text-file`: about 30 parts, well inside the 50-part bound of the parts carrier, so nothing is ever refused after arming
 
 
 REMINDER_TTL_MAX = 86400   # #1563: the longest ttl `remind --ttl` takes
@@ -288,6 +289,46 @@ def merge_wake_facts(recipient, facts, budget=None):
     merged.sent_min = min(f.created for f in group)   # #1402: the oldest member, so an old digest does not look new
     merged.member_lines = {f.key: "- %s: %s" % (_clean_line(wake_class_of(f)), _clean_line(f.summary)) for f in group}
     return [f for f in facts if not wake_class_of(f)] + rest + [merged]
+
+
+DELAYED_MARK_SECONDS = 1800   # #1468: a reminder copy delivered later than this after it fired is marked "delayed: sent HH:MMZ"
+
+
+def delayed_text(text, sent_at):
+    """The reminder text with the first line "delayed: sent HH:MMZ" (UTC)."""
+    return "delayed: sent %sZ\n%s" % (time.strftime("%H:%M", time.gmtime(sent_at)), text)
+
+
+def merge_reminder_copies(facts):
+    """#1468: queued reminder copies with the same sender, recipient and text (keyed or not) become ONE fact with the count and the newest
+    sent time. The merged fact carries every copy's key in `members`, so all are acknowledged. Any other fact passes through untouched."""
+    groups = {}
+    for fact in facts:
+        if fact.kind == "reminder" and not getattr(fact, "wake_class", None) and hasattr(fact, "reminder_text"):
+            groups.setdefault((fact.sender, fact.recipient, fact.reminder_text), []).append(fact)
+    merged_for = {}
+    for (sender, recipient, text), group in groups.items():
+        if len(group) < 2:
+            continue
+        newest = max(group, key=lambda f: (f.created, f.key))
+        body = "%s (%d copies, newest sent %sZ)" % (text, len(group), time.strftime("%H:%M", time.gmtime(newest.created)))
+        if getattr(newest, "delayed", False):
+            body = delayed_text(body, newest.created)
+        keys = sorted(f.key for f in group)
+        merged = Fact("reminder-merge:" + hashlib.sha256("|".join(keys).encode()).hexdigest()[:12], recipient, "reminder", body,
+                      newest.created, issue=newest.issue, batch=False, sender=sender, repo=newest.repo)
+        merged.members = keys
+        for f in group:
+            merged_for[id(f)] = merged
+    out, seen = [], set()
+    for fact in facts:
+        merged = merged_for.get(id(fact))
+        if merged is None:
+            out.append(fact)
+        elif id(merged) not in seen:
+            seen.add(id(merged))
+            out.append(merged)
+    return out
 
 
 # ---- #1402: what is dropped at delivery
@@ -603,12 +644,16 @@ class ReminderFacts:
                     continue
             text = self.overdue_text(item) if isinstance(item.get("condition"), dict) and isinstance(item["condition"].get("unless_report_from"), str) and self.engine else item["text"]
             late = (self.engine.now() if self.engine else time.time()) - item["at"]
-            if late >= LATE_NOTE_SECONDS:
+            raw_text = text
+            if late > DELAYED_MARK_SECONDS:
+                text = delayed_text(text, item["at"])
+            elif late >= LATE_NOTE_SECONDS:
                 note = " (late by %d min)" % int(late // 60)
-                cut = len(text) + len(note) > TEXT_CAP
-                text = text[:max(0, TEXT_CAP - len(note) - (1 if cut else 0))] + ("\u2026" if cut else "") + note   # the note is applied before the cap and kept: the body is cut, not the note
+                text = text + note   # #1355: never cut here: an over-cap text is carried in parts by compose, the note ends the last part
             facts.append(Fact("reminder:" + item["id"], item["to"], "reminder", text, item["at"],
                               issue=item.get("issue"), batch=False, sender=item.get("from"), repo=item.get("repo")))
+            facts[-1].reminder_text = raw_text
+            facts[-1].delayed = late > DELAYED_MARK_SECONDS
             if isinstance(item.get("wake_class"), str):
                 facts[-1].wake_class = item["wake_class"]
         return facts
@@ -828,8 +873,22 @@ def cmd_remind(args, runner, now):
     moment = now()
     if args.list_mine or args.cancel or getattr(args, "cancel_key", None):
         return remind_manage(args, engine, state, sender, moment)
-    if not args.name or not args.when or not args.text:
-        sys.stderr.write("%s: remind needs <name> <when> <text> (or --list, or --cancel <id>)\n" % PROG)
+    text_file = getattr(args, "text_file", None)   # a caller that builds its own namespace has none
+    if text_file and args.text:
+        sys.stderr.write("%s: remind takes the text as words or from --text-file, not both; nothing armed\n" % PROG)
+        return EXIT_USAGE
+    if not args.name or not args.when or not (args.text or text_file):
+        sys.stderr.write("%s: remind needs <name> <when> <text> (or --text-file F, or --list, or --cancel <id>)\n" % PROG)
+        return EXIT_USAGE
+    if text_file:
+        text, problem = read_text_file(text_file)
+    else:
+        text, problem = " ".join(args.text).strip(), None
+        if len(text) > TEXT_CAP:   # #1355: never armed to be cut on delivery
+            problem = ("the text is %d characters, over the %d-character message cap: nothing armed. "
+                       "Put it in a file and use --text-file F, which carries it in full in parts" % (len(text), TEXT_CAP))
+    if problem:
+        sys.stderr.write("%s: %s\n" % (PROG, problem))
         return EXIT_USAGE
     try:
         repo, number = resolve_for_sender(engine, config, args.issue, sender)
@@ -868,10 +927,10 @@ def cmd_remind(args, runner, now):
         warning = ("%s: reminder is dropped if it closes (%s#%d closes or its pull request merges), with one notice to you; "
                    "use --keep-if-closed to keep it\n" % (PROG, repo, number))
     item = add_reminder(state, args.name, parse_when(args.when, moment), moment,
-                        " ".join(args.text).strip(), number, sender, repo, condition=condition or None,
+                        text, number, sender, repo, condition=condition or None,
                         key=_one_line(args.key, 80) if args.key else None, ttl=ttl)
     if len(item["text"]) > TEXT_CAP:
-        sys.stderr.write("%s: warning: text is cut at %d characters: %d characters over\n" % (PROG, TEXT_CAP, len(item["text"]) - TEXT_CAP))
+        sys.stderr.write("%s: the text is %d characters: it is delivered in parts, each under %d, the last one closing it\n" % (PROG, len(item["text"]), TEXT_CAP))
     engine.audit.append("cli", "reminder.add", args.name, {"id": item["id"], "at": iso(item["at"]),
                                                           "from": sender, "issue": number, "repo": repo})
     print(item["id"])
@@ -879,6 +938,40 @@ def cmd_remind(args, runner, now):
     if warning:
         sys.stderr.write(warning)
     return EXIT_OK
+
+
+def read_text_file(path, flag="--text-file", outcome="nothing armed", own_dirs_only=False):
+    """(text, None) of a UTF-8 text file for `remind --text-file` and `send --file` (`flag` and `outcome` word the refusals), or (None, why it is refused):
+    unreadable, not a regular file, too large, not UTF-8 text, or empty. `own_dirs_only` (send): a symlink is refused unless it resolves inside the
+    user's home, the temp directory or the working directory."""
+    import tempfile   # local: a module-level name here would be one more entry import (docs/architecture.md counts them)
+    name = _one_line(path, 80)
+    if own_dirs_only and os.path.islink(path):
+        real = os.path.realpath(path)
+        roots = [os.path.realpath(r) for r in (os.path.expanduser("~"), tempfile.gettempdir(), os.getcwd()) if r]
+        if not any(real == r or real.startswith(r.rstrip(os.sep) + os.sep) for r in roots):
+            return None, "%s %s is a symlink that leaves your own directories: %s" % (flag, name, outcome)
+    try:
+        with open(path, "rb") as handle:
+            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                return None, "%s %s is not a regular file: %s" % (flag, name, outcome)
+            raw = handle.read(TEXT_FILE_MAX * 4 + 1)   # a character is at most 4 bytes: bounded whatever the file is
+    except OSError as err:
+        return None, "%s %s cannot be read (%s): %s" % (flag, name, err.strerror or "error", outcome)
+    try:
+        text = raw.decode("utf-8").strip()
+    except UnicodeDecodeError:
+        if len(raw) > TEXT_FILE_MAX * 4:
+            text = None
+        else:
+            return None, "%s %s is not UTF-8 text: %s" % (flag, name, outcome)
+    if text is None or len(text) > TEXT_FILE_MAX:
+        return None, "%s %s is over %d characters: %s" % (flag, name, TEXT_FILE_MAX, outcome)
+    if "\x00" in text:
+        return None, "%s %s is not text (it holds a NUL): %s" % (flag, name, outcome)
+    if not text:
+        return None, "%s %s is empty: %s" % (flag, name, outcome)
+    return text, None
 
 
 cmd_remind.ensure_on_use = True   # the daemon is alive when it runs
