@@ -66842,6 +66842,7 @@ TestUnconsumedRecord = importlib.import_module("test_unconsumed_record").TestUnc
 _noparent = importlib.import_module("test_charter_noparent"); TestCharterNoParent, TestCharterNoParentSet = _noparent.TestCharterNoParent, _noparent.build(CharterRig, Base, TestCharterSetGuard)
 _hc = importlib.import_module("test_header_cache"); TestAges, TestSets, TestEvents, TestSafety, TestReplay, TestIsolation, TestDropNeverBlocksAWrite, TestApprovalReadsFresh, TestDocs = _hc.TestAges, _hc.TestSets, _hc.TestEvents, _hc.TestSafety, _hc.TestReplay, _hc.TestIsolation, _hc.TestDropNeverBlocksAWrite, _hc.TestApprovalReadsFresh, _hc.TestDocs
 TestReminderTtlMore = importlib.import_module("test_reminder_ttl").build(PR4Base)
+TestReminderWaiting = importlib.import_module("test_reminder_waiting").build(PR4Base)
 TestPlanRehearsal = importlib.import_module("test_plan_rehearsal").build(HandoffCase)   # #1785
 TestMergeRef = importlib.import_module("test_merge_ref").build(HandoffCase)   # #2053
 TestCiRecordProof = importlib.import_module("test_ci_record_proof").build(LedgerBase)   # #2091
