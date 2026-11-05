@@ -9,7 +9,8 @@ import cloud_worker as cw  # noqa: E402
 
 SOURCE = os.path.join(LAUNCHER, "cloud_worker.py")
 NOW = dt.datetime(2026, 11, 5, tzinfo=dt.timezone.utc)
-MOUNTS = ["/tmp", "/home/worker/.cache/opencode", "/home/worker/.config/opencode", "/home/worker/.local/state/opencode"]
+MOUNTS = ["/tmp", "/home/worker/.cache/opencode", "/home/worker/.config/opencode", "/home/worker/.local/state/opencode",
+          "/home/worker/.local/share", "/home/worker/.npm", "/home/worker/.cache/pip", "/var/lib/docker", "/var/log"]
 BASE_ENV = {"CW_TOKEN_ENDPOINT": "http://t"}
 
 
@@ -25,7 +26,14 @@ def check_rendered(test, mod):
     c = pod["spec"]["containers"][0]
     test.assertTrue(c["securityContext"].get("readOnlyRootFilesystem") is True, "readOnlyRootFilesystem is not true for a listed lane")
     extra = [m["mountPath"] for m in c["volumeMounts"] if m["mountPath"] not in ("/run/cw", "/run/cw-tmp", "/work")]
-    test.assertEqual(extra, MOUNTS)
+    for m in MOUNTS:   # a required path is present (the set may grow)
+        test.assertIn(m, extra, "no writable mount at " + m)
+    # nested docker: the daemon dirs are writable emptyDirs, so a read-only pod keeps docker working
+    vols = {v["name"]: v for v in pod["spec"]["volumes"]}
+    for m in ("/var/lib/docker", "/var/log"):
+        mount = [x for x in c["volumeMounts"] if x["mountPath"] == m][0]
+        test.assertIn("emptyDir", vols[mount["name"]])
+        test.assertFalse(mount.get("readOnly"))
     test.assertIn({"name": "GIT_CONFIG_GLOBAL", "value": "/run/cw-tmp/gitconfig"}, c["env"])
     names = {v["name"] for v in pod["spec"]["volumes"]}
     test.assertTrue(all(m["name"] in names for m in c["volumeMounts"]))

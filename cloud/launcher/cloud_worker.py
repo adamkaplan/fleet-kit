@@ -2752,7 +2752,11 @@ def review_comment(repo, path=None):
 
 
 READONLY_ROOT_SETTING = "CW_READONLY_ROOT_LANES"   # a set of lane (boss) names, comma or space separated; empty or unset = off
-READONLY_ROOT_MOUNTS = ("/tmp", "/home/worker/.cache/opencode", "/home/worker/.config/opencode", "/home/worker/.local/state/opencode")
+READONLY_ROOT_MOUNTS = ("/tmp", "/home/worker/.cache/opencode", "/home/worker/.config/opencode", "/home/worker/.local/state/opencode",
+                        # opencode data without model-auth (XDG_DATA_HOME is set only with it); npm, pip and the docker client write these in $HOME
+                        "/home/worker/.local/share", "/home/worker/.npm", "/home/worker/.cache/pip", "/home/worker/.docker",
+                        # nested docker: start-dockerd (through sudo) writes /var/log/dockerd.log and /var/lib/docker; mounted, so docker stays usable
+                        "/var/lib/docker", "/var/log")
 READONLY_ROOT_GITCONFIG = "/run/cw-tmp/gitconfig"   # ~/.gitconfig is a FILE: git is pointed at the tmpfs instead of mounting over it
 
 
