@@ -20164,7 +20164,7 @@ def merge_drops_refusal(runner, config, repo, number, state):
     gh = merge_gate_gh(config, runner, repo)
     code, out, _ = gh(["pr", "view", str(number), "--repo", repo, "--json", "baseRefName,headRefOid"])
     try:
-        data = json.loads(out) if code == 0 else {}
+        data = load_module("record_json").parse_bounded(out) if code == 0 else {}
         base, head = data["baseRefName"], data["headRefOid"]
     except (ValueError, KeyError, TypeError):
         return None
