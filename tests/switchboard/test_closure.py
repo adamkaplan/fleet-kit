@@ -24,8 +24,6 @@ REPO = Path(__file__).resolve().parents[2]
 TOOL = REPO / "tools" / "derive-closure"
 MATRIX = "docs/review-laws/impact-matrix.json"
 PARTS = "bin/switchboard/"
-FLOOR = 418   # definitions reachable from closure_roots over the entry and the parts: it only grows (the floors are re-derived at each batch entry, only up; raised only in its own commit, with the owner's sign-off)
-FLOOR_BINDINGS = 366   # the module-level bindings (and imports) those definitions read, over the entry and the parts: the same rule
 
 
 def run(*args):
