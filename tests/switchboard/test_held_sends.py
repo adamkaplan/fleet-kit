@@ -127,19 +127,32 @@ class TestHeldSends(Base):
         self.assertEqual(len(drops), 1)
         self.assertIn("old news", drops[0]["text"])
 
-    def test_s5_unknown_and_doubly_claimed_recipients_are_refused_with_status_3(self):
+    def test_s5_unknown_recipient_is_refused_with_status_3_and_a_doubly_claimed_one_is_held(self):
+        # #1400 (a): the conflict half. OLD: code == sb.EXIT_HELD, "not sent" in err, nothing held. NEW: code 0, one send queued.
         self.assertEqual(self.cli("nobody", "hi")[0], sb.EXIT_HELD)
         self.world.add_agent("platform")   # a second session claims the same name
         code, _, err = self.cli("platform", "hi")
-        self.assertEqual(code, sb.EXIT_HELD, err)
-        self.assertIn("not sent", err)
-        self.assertEqual(self.held(), [])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(self.held()), 1)
 
-    def test_s5_a_recipient_with_another_hold_reason_is_refused(self):
+    def test_s5_a_recipient_with_another_hold_reason_is_held_too(self):   # #1400 (a): OLD: refused with EXIT_HELD, nothing held. NEW: queued, exit 0
         self.status("platform", "weird")
         code, _, err = self.cli("platform", "hi")
-        self.assertEqual(code, sb.EXIT_HELD, err)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(self.held()), 1)
+        self.assertEqual(self.world.admissions("platform"), [])
+        self.status("platform", "idle")
+        self.world.engine.run_pass()
+        self.assertEqual(len(self.world.admissions("platform")), 1)
         self.assertEqual(self.held(), [])
+
+    def test_a_problem_and_a_conflict_hold_a_send_too_and_a_gone_pane_still_refuses(self):
+        obs = mock.Mock(status="idle", conflict=["s2"], problem=None, name="platform", session_id="s1")
+        self.assertTrue(sb.held_send_applies(obs))
+        obs = mock.Mock(status="idle", conflict=[], problem="v2 unreadable", name="platform", session_id="s1")
+        self.assertTrue(sb.held_send_applies(obs))
+        self.assertFalse(sb.held_send_applies(mock.Mock(status="idle", conflict=[], problem=None, name="platform", session_id="s1")))
+        self.assertFalse(sb.held_send_applies(None))
 
     def test_u1_an_idle_and_a_working_agent_get_the_send_at_once(self):
         self.assertEqual(self.cli("platform", "one")[0], 0)
@@ -362,3 +375,82 @@ class TestHeldSends(Base):
         self.assertIn("the channel said no", line["detail"]["reason"])
         self.assertEqual(self.held(), [])
         self.assertEqual(self.world.admissions("coder"), [])
+
+
+    # ---- #1400: a send queued while the pane is held after a provider error, delivered once the hold ends, and the bounded resume
+
+    def provider_error_scenario(self):
+        sid = self.world.sessions["platform"]
+        self.world.v2.sessions[sid]["outcome"] = "failed"   # the turn ended on a provider error; herdr shows the pane blocked
+        self.status("platform", "blocked")
+        code, _, err = self.cli("platform", "after", "the", "error")
+        self.assertEqual(code, 0, "%s: status %s, %s" % (ANCHOR, code, err))
+        self.assertEqual(len(self.held()), 1, ANCHOR)
+        self.world.tick(30)
+        self.world.engine.run_pass()
+        self.assertEqual(self.world.admissions("platform"), [], "still on hold: nothing delivered")
+        self.status("platform", "idle")
+        self.world.engine.run_pass()
+        (admitted,) = self.world.admissions("platform")
+        self.assertIn("after the error", admitted["text"])
+        return sid
+
+    def test_b_a_queued_send_is_delivered_and_an_undelivered_wake_after_a_provider_error_gets_one_bounded_resume(self):
+        sid = self.provider_error_scenario()
+        v2 = self.world.v2
+        self.world.v2.sessions[sid]["turn"] = None
+        # the wake sits in the inbox, absent from the transcript: the #1337 recovery resumes the idle agent once
+        # the resume rules out an open request first: this fake v2 has no such list, so it answers "none open" (nothing is open here)
+        v2.op_session_permission_list = lambda params, body: []
+        v2.op_session_form_list = lambda params, body: []
+        wake_key = self.world.admissions("platform")[0]["keys"][0]
+        v2.sessions[sid]["messages"] = [m for m in v2.sessions[sid]["messages"] if wake_key not in str(m)]
+        self.assertFalse([m for m in v2.sessions[sid]["messages"] if wake_key in str(m)], "the wake is absent from the transcript")
+        # The fake v2 consumes the admitted wake into the transcript, so the real flow cannot leave it in the inbox. The inbox
+        # below IS BUILT BY HAND, always, from the real admission (no "if"): the undelivered state is the test's own setup.
+        self.assertEqual(v2.sessions[sid]["inbox"], [], "the fake consumed the wake: the inbox is rebuilt by hand below")
+        admitted = self.world.admissions("platform")[0]
+        v2.sessions[sid]["inbox"].append({"id": admitted["id"], "sessionID": sid, "text": admitted["text"], "delivery": "queue", "resume": False,
+                                          "metadata": {"fleet": {"from": "switchboard", "keys": admitted["keys"]}},
+                                          "time": {"created": v2.clock.ms(admitted["at"])}})
+        self.world.tick(16 * 60)
+        self.world.engine.run_pass()
+        resumes = [e for e in self.audit_events("undelivered.resume")]
+        self.assertEqual(len(resumes), 1, "one bounded resume")
+        self.world.tick(60)
+        self.world.engine.run_pass()
+        self.assertEqual(len(self.audit_events("undelivered.resume")), 1, "never a second resume in the incident")
+        self.assertIn("platform", str(resumes[0]), "the resume's audit line names the recipient")
+
+    # ---- #1400 (c): mutants "delivered twice" and "out of order" on the endpoint route; each control first
+
+    def endpoint_two_sends(self, passes=2):
+        self.endpoint_world()
+        self.cli("cloudy", "first-one")
+        self.world.tick(2)
+        self.cli("cloudy", "second-one")
+        self.set_state("idle")
+        for _ in range(passes):
+            self.world.engine.run_pass()
+        order = [p[2].split(") ", 1)[1] for p in self.posts]
+        self.assertEqual(len(self.posts), 2, "a held send is delivered once: delivered twice or not at all: %s" % order)
+        self.assertEqual(order, ["first-one", "second-one"], "held sends are delivered in the order they were sent")
+
+    def test_c_control_two_held_sends_are_delivered_once_each_in_order(self):
+        self.endpoint_two_sends()
+
+    def test_c_mutant_delivered_twice_is_caught_by_the_anchored_text(self):
+        self.test_c_control_two_held_sends_are_delivered_once_each_in_order()
+        old = "release_held_sends(engine.state_dir, recipient, [row[\"key\"]])"
+        with self.mutant(sb, "held_sends_tick", old, "None"):
+            with self.assertRaises(AssertionError) as caught:
+                self.endpoint_two_sends()
+        self.assertIn("a held send is delivered once", str(caught.exception))
+
+    def test_c_mutant_out_of_order_is_caught_by_the_anchored_text(self):
+        self.test_c_control_two_held_sends_are_delivered_once_each_in_order()
+        old = "key=lambda pair: (pair[1][\"at\"], pair[1][\"key\"]))"
+        with self.mutant(sb, "held_rows", old, old[:-1] + ", reverse=True)"):
+            with self.assertRaises(AssertionError) as caught:
+                self.endpoint_two_sends()
+        self.assertIn("held sends are delivered in the order they were sent", str(caught.exception))

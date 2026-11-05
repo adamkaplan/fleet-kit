@@ -9,6 +9,7 @@ cloud/launcher/tests/test_cloud_docs_wording.py
 cloud/launcher/tests/test_cloud_end_alert.py
 cloud/launcher/tests/test_cloud_hub_manifest.py
 cloud/launcher/tests/test_cloud_hub_network.py
+cloud/launcher/tests/test_cloud_inspect.py
 cloud/launcher/tests/test_cloud_k1.py
 cloud/launcher/tests/test_cloud_model_served.py
 cloud/launcher/tests/test_cloud_pod_replaced.py
@@ -36,10 +37,12 @@ cloud/launcher/tests/test_cw_names.py
 cloud/launcher/tests/test_docs_preflight_modes.py
 cloud/launcher/tests/test_driver.py
 cloud/launcher/tests/test_end_hook_nothing_to_push.py
+cloud/launcher/tests/test_end_hook_pr_ready.py
 cloud/launcher/tests/test_failed_pod_record.py
 cloud/launcher/tests/test_fixture_root.py
 cloud/launcher/tests/test_git_token_renewal.py
 cloud/launcher/tests/test_git_token_retry.py
+cloud/launcher/tests/test_hub_entry_keys.py
 cloud/launcher/tests/test_hub_restart_client.py
 cloud/launcher/tests/test_hub_safe_to_evict.py
 cloud/launcher/tests/test_idle_default_note.py
@@ -58,13 +61,16 @@ cloud/launcher/tests/test_orphan_secrets.py
 cloud/launcher/tests/test_pod_requests.py
 cloud/launcher/tests/test_pod_state.py
 cloud/launcher/tests/test_preflight.py
+cloud/launcher/tests/test_preflight_repo_read.py
 cloud/launcher/tests/test_probe_redirect.py
 cloud/launcher/tests/test_read_retired_last_message.py
 cloud/launcher/tests/test_reap_concurrent.py
+cloud/launcher/tests/test_reaper_audit_tail.py
 cloud/launcher/tests/test_reaper_managed.py
 cloud/launcher/tests/test_reaper_renewal.py
 cloud/launcher/tests/test_reaper_restart.py
 cloud/launcher/tests/test_reaper_row.py
+cloud/launcher/tests/test_registry_endpoint.py
 cloud/launcher/tests/test_render_namespace.py
 cloud/launcher/tests/test_repo_min_shape.py
 cloud/launcher/tests/test_retire_gone_exact.py
@@ -73,6 +79,7 @@ cloud/launcher/tests/test_run_record.py
 cloud/launcher/tests/test_safe_to_evict.py
 cloud/launcher/tests/test_scratch_clean.py
 cloud/launcher/tests/test_scrub_linear.py
+cloud/launcher/tests/test_scrub_pieces.py
 cloud/launcher/tests/test_stack_model_key.py
 cloud/launcher/tests/test_stack_registry_check.py
 cloud/launcher/tests/test_stack_registry_pod.py
@@ -102,6 +109,7 @@ cloud/worker/tests/test_entrypoint_question.py
 cloud/worker/tests/test_guard_table.py
 cloud/worker/tests/test_identity_image.py
 cloud/worker/tests/test_plan_check_in_pod.py
+cloud/worker/tests/test_pod_inspect.py
 cloud/worker/tests/test_pr_edit.py
 cloud/worker/tests/test_pr_edit_hardening.py
 cloud/worker/tests/test_push_rules.py

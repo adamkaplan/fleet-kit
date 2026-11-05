@@ -131,6 +131,16 @@ def pushed_text(record_dir, parse):
     return "unknown"
 
 
+def pr_line(record_dir, parse):
+    """Ask #2145: the one line the end hook recorded about the pull request, only if it is one of the fixed forms; else a fixed unknown."""
+    run = read_small(os.path.join(record_dir, "run.json"), parse) if record_dir else None
+    hook = run.get("end_hook") if run else None
+    note = hook.get("pr_note") if isinstance(hook, dict) else None
+    if isinstance(note, str) and len(note) <= 120 and re.fullmatch(r"PR (#[0-9]{1,9} marked ready(, review requested|, no review comment is configured)|not marked ready: [A-Za-z0-9 #(),._-]+)", note):
+        return note
+    return "PR not marked ready: no answer recorded"
+
+
 def message_text(worker, label, when, pushed, record_name, kept=False, failure=None):
     text = ("[cloud worker ended] %s was ended by the launcher: reason %s; at %s; %s; run record: %s."
             % (worker, label, when, pushed, record_name or "unknown"))
@@ -192,6 +202,7 @@ def scan_audit(audit_file, state_file, cloud_dir, last_reports, send, parse, aud
         name = record_name_of(worker, record_name)
         pushed = pushed_text(raw_dir(reason), parse) if name else "unknown"
         text = message_text(worker, label, when_text(line.get("ts")), pushed, name, line["ok"] is False)
+        text += " " + pr_line(raw_dir(reason), parse) + "."
         keys.append(key)
         to_list = [CHIEF] + ([boss] if isinstance(boss, str) and AGENT_NAME.fullmatch(boss) and boss != CHIEF else [])
         boss_text = text
