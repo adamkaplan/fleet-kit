@@ -3904,9 +3904,13 @@ class Launcher:
         t0 = mono()
         try:
             self.send_wip_notes(live, now)
-            self.send_final_notes(live, now)
         finally:
             steps["notes"] = mono() - t0
+        t0 = mono()
+        try:
+            self.send_final_notes(live, now)
+        finally:
+            steps["notes"] += mono() - t0   # the final note is counted with the notes
         t0 = mono()
         try:
             self.send_idle_nudges(live, now, acts)
