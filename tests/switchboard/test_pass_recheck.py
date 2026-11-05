@@ -421,7 +421,7 @@ class TestPassRecheckMutants(unittest.TestCase):
     def test_the_three_mutation_targets_exist_once(self):
         reminders = self.source("reminders")
         decision = self.source("decision")
-        self.assertEqual(reminders.count("            if why:\n                dropped.append((fact, mine[0], why))"), 1, msg="the resolved-finding target moved")
+        self.assertEqual(reminders.count("why = pass_stale(subject, record) if mine else"), 1, msg="the resolved-finding target moved")
         self.assertEqual(reminders.count("now != expected else"), 1, msg="the plan-hash target moved")
         self.assertEqual(decision.count('OWN_LATE_MARK_KINDS = ("reminder",)'), 1, msg="the age-scope target moved")
 
@@ -435,7 +435,7 @@ class TestPassRecheckMutants(unittest.TestCase):
         return result
 
     def test_a_resolved_finding_delivered_is_caught(self):
-        mod, ns = self.mutant("reminders", "            if why:\n                dropped.append((fact, mine[0], why))", "            if False:\n                dropped.append((fact, mine[0], why))")
+        mod, ns = self.mutant("reminders", "why = pass_stale(subject, record) if mine else", "why = \"\" if mine else")
         self.assertTrue(self.run_case("TestPassRecheck.test_s2_a_sweep_fact_whose_findings_are_all_gone_is_dropped_with_one_audit_line", []).wasSuccessful(), msg="control failed")
         result = self.run_case("TestPassRecheck.test_s2_a_sweep_fact_whose_findings_are_all_gone_is_dropped_with_one_audit_line", [(sb, "judge_delivery", ns["judge_delivery"])])
         self.assertFalse(result.wasSuccessful(), msg="a resolved finding delivered went unnoticed")

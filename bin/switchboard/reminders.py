@@ -396,23 +396,13 @@ PLAN_KEY_RE = re.compile(r"^plan:([^#:\s]+/[^#:\s]+)#([0-9]+):(\S+):[^:\s]+$")
 
 
 def pass_subject(fact):
-    """(kind, repo, number, expected) of a sweep fact, a triage digest or a plan notice, or None: ("sweep" or "triage", "", 0, the fact key) is judged
-    against the pairs its pass holds now; ("plan", repo, n, hash) against the hash of the newest plan on that issue."""
+    """(kind, repo, number, expected) of a sweep fact, a triage digest or a plan notice, or None; judged against the pass's present pairs or the newest plan hash."""
     if fact.kind == "sweep" and SWEEP_KEY_RE.match(fact.key):
         return ("sweep", "", 0, fact.key)
     if is_digest(fact):
         return ("triage", "", 0, fact.key)
     found = PLAN_KEY_RE.match(fact.key) if fact.kind == "plan" else None
     return ("plan", found.group(1), int(found.group(2)), found.group(3)) if found else None
-
-
-def pass_record(read, subject):
-    """The present record of a pass subject, or None when it cannot be read (no pass has run, a failed read): the fact is then kept, marked."""
-    try:
-        record = read(subject)
-    except Exception:
-        return None
-    return record if isinstance(record, dict) else None
 
 
 def pass_stale(subject, record):
@@ -424,8 +414,7 @@ def pass_stale(subject, record):
     pairs, present = record.get("pairs"), record.get("present")
     if not isinstance(pairs, list) or not isinstance(present, list) or not pairs or record.get("hidden"):   # a fact that hides findings ("+N more") is never dropped: the shown ones are not the whole fact
         return ""
-    here = {tuple(p) for p in present}
-    return "" if any(tuple(p) in here for p in pairs) else "none of its %d finding%s is present any more" % (len(pairs), "" if len(pairs) == 1 else "s")
+    return "" if any(tuple(p) in {tuple(q) for q in present} for p in pairs) else "none of its %d finding%s is present any more" % (len(pairs), "" if len(pairs) == 1 else "s")
 
 
 def digest_replaced(facts, delivered):
@@ -449,17 +438,7 @@ def judge_delivery(facts, delivered, read, standing):
         if fact.key in replaced:
             dropped.append((fact, "digest", "replaced by the current digest %s" % replaced[fact.key].key))
             continue
-        mine = pass_subject(fact) if read is not None else None
-        if mine is not None:   # #1542: a sweep fact, a triage digest or a plan notice, judged against its own pass's present state
-            found = pass_record(read, mine)
-            why = pass_stale(mine, found) if found is not None else ""
-            if why:
-                dropped.append((fact, mine[0], why))
-            else:
-                kept.append(fact if found is not None else Fact(fact.key, fact.recipient, fact.kind, UNVERIFIED_MARK + fact.summary, fact.created, issue=fact.issue,
-                                                                batch=fact.batch, sender=fact.sender, rider=fact.rider, repo=fact.repo))
-            continue
-        subject = alert_subject(fact) if read is not None else None
+        subject = (pass_subject(fact) or alert_subject(fact)) if read is not None else None   # #1542: a sweep fact, a triage digest or a plan notice is judged by its own pass's present state
         if subject is None:
             kept.append(fact)
             continue
@@ -471,9 +450,10 @@ def judge_delivery(facts, delivered, read, standing):
             kept.append(Fact(fact.key, fact.recipient, fact.kind, UNVERIFIED_MARK + fact.summary, fact.created, issue=fact.issue, batch=fact.batch,
                              sender=fact.sender, rider=fact.rider, repo=fact.repo))
             continue
-        why = alert_stale(subject, record, fact, standing)
-        if why and not fault("deliver-stale-alert"):
-            dropped.append((fact, "alert", why))
+        mine = subject[0] in PASS_SUBJECTS
+        why = pass_stale(subject, record) if mine else alert_stale(subject, record, fact, standing)
+        if why and (mine or not fault("deliver-stale-alert")):
+            dropped.append((fact, subject[0] if mine else "alert", why))
         else:
             kept.append(fact)
     return kept, dropped

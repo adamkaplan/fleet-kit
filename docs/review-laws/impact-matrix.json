@@ -587,7 +587,6 @@
           "merge_reminder_copies",
           "merge_wake",
           "merge_wake_facts",
-          "pass_record",
           "pass_stale",
           "pass_subject",
           "read_record_file",
