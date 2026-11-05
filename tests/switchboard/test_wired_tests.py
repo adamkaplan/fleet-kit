@@ -132,8 +132,18 @@ def call_bound(source):
     return out
 
 
+def discovery_on(source):
+    """#2206: True when the runner's loader lines call the self-registration (support.discovery.bind_discovered)."""
+    return "bind_discovered(" in source
+
+
+def discovered(classes, source):
+    """#2206: the classes of a file the runner binds itself: those named Test* when the self-registration is in the loader lines."""
+    return {c for c in classes if c.startswith("Test")} if discovery_on(source) else set()
+
+
 def problems(tests_dir, source, exempt):
-    """The wiring failures, one message each."""
+    """The wiring failures, one message each (a file is imported by a loader line or by the self-registration, #2206)."""
     imported, bound = loader_facts(source)
     built = call_bound(source)
     out = []
@@ -145,11 +155,11 @@ def problems(tests_dir, source, exempt):
         if name in exempt:
             continue
         mod = name[:-3]
-        if mod not in imported:
+        if mod not in imported and not discovery_on(source):
             out.append("%s: not imported by bin/test-switchboard" % name)
         elif built.get(mod) and not test_classes(Path(tests_dir) / name):
             continue    # the class is built by a call on the module: no module-level ClassDef to match
-        elif not (test_classes(Path(tests_dir) / name) & bound.get(mod, set())):
+        elif not (test_classes(Path(tests_dir) / name) & (bound.get(mod, set()) | discovered(test_classes(Path(tests_dir) / name), source))):
             out.append("%s: no class bound at module level by bin/test-switchboard" % name)
     out.extend(class_problems(tests_dir, source, exempt))
     return out
@@ -179,9 +189,10 @@ def class_problems(tests_dir, source, exempt):
             out.append("%s: exemption key names no file or no module-level TestCase class of it" % key)
     for path in sorted(Path(tests_dir).glob("test_*.py")):
         name, mod = path.name, path.stem
-        if name in exempt or mod not in imported:
+        if name in exempt or (mod not in imported and not discovery_on(source)):
             continue
         classes = test_classes(path)
+        bound_here = bound.get(mod, set()) | discovered(classes, source)
         parents = {}
         counts = {}
         for node in parse_cached(path.read_text()).body:
@@ -192,17 +203,17 @@ def class_problems(tests_dir, source, exempt):
             if counts[cls] > 1:
                 out.append("%s: class %s defined %d times: only the last runs" % (name, cls, counts[cls]))
         hidden = set()      # the ancestors of a bound class: their tests run through it
-        for cls in classes & bound.get(mod, set()):
+        for cls in classes & bound_here:
             todo = list(parents.get(cls, []))
             while todo:
                 parent = todo.pop()
                 if parent not in hidden:
                     hidden.add(parent)
                     todo.extend(parents.get(parent, []))
-        for cls in sorted(classes - bound.get(mod, set()) - hidden):
+        for cls in sorted(classes - bound_here - hidden):
             if "%s::%s" % (name, cls) not in exempt:
                 below = sorted(c for c in classes if c != cls and cls in _lineage_of(c, parents))
-                out.append("%s: class %s is not bound at module level by bin/test-switchboard%s"
+                out.append("%s: class %s is not bound at module level by bin/test-switchboard or discovered (named Test*)%s"
                            % (name, cls, " (subclasses: %s)" % ", ".join(below) if below else ""))
     return out
 
