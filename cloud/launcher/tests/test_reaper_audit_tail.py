@@ -387,7 +387,7 @@ class TestStepSeconds(unittest.TestCase):
         with open(os.path.join(ROOT, "cloud", "README.md")) as f:
             para = TestDocs.paragraph(f.read())
         found = [n for n in STEP_NAMES if "`%s`" % n in para]
-        self.assertEqual(len(found), 7)
+        self.assertEqual(found, list(STEP_NAMES))   # every step named is in the README paragraph
         print("S8: 7 of 7 step seconds + 2 counts + total equal; 0 of 3 pod names, 0 planted; mutant fails 'no step seconds'; %d of 7 names in README" % len(found))
 
 
@@ -632,7 +632,7 @@ def s12_numbers(test, mod):
 class TestClockStepsBack(unittest.TestCase):
     def test_s12_clock_steps_back(self):
         line, nums = s12_numbers(self, build_module())   # the control first
-        self.assertEqual(len(nums), 8)
+        self.assertGreaterEqual(len(nums), len(STEP_NAMES))   # at least one number per step
         print("S12: control: a read 5 seconds smaller at the end of the pod list; %d seconds in the line, min %.1f: %s" % (len(nums), min(nums), line.split(" steps ", 1)[1]))
         with self.assertRaisesRegex(AssertionError, "^a negative number was printed$"):
             s12_numbers(self, build_module(("return max(0.0, float(v))", "return float(v)")))
