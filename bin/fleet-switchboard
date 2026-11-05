@@ -11164,6 +11164,22 @@ class GitHubHub:
             gaps[key] = oldest   # what lies before this was not read, until the window's start passes it
         if key in gaps and gaps[key] < since:
             del gaps[key]
+        if key in gaps:   # #2192: a window left with a gap is read ascending from its start, a bounded number of pages a pass, inside the caller's page budget
+            allowed = COMMENT_GAP_PAGES if budget is None else min(COMMENT_GAP_PAGES, budget[0] - max(1, -(-len(records) // GITHUB_PAGE_SIZE)))
+            fills = self.__dict__.setdefault("_comment_fills", {})
+            if fills.get(key, (None, None))[0] != gaps[key]:
+                fills[key] = (gaps[key], since)   # a new gap starts its fill at the window's start
+            if allowed > 0:
+                fetched, more = self.read_pages("repos/%s/issues/comments?since=%s&sort=created&direction=asc&per_page=100" % (repo, fills[key][1]), cap=allowed)
+                dated = [r for r in fetched if isinstance(r, dict) and isinstance(r.get("created_at"), str) and r["created_at"] >= since]
+                for record in dated:
+                    have[record["id"] if record.get("id") is not None else ("noid", json.dumps(record, sort_keys=True, default=str))] = record
+                last = max((r["created_at"] for r in dated), default=None)
+                if not more or (last is not None and last >= gaps[key]):
+                    del gaps[key]   # the fill met the held comments (or the end of the window): the gap is closed
+                    fills.pop(key, None)
+                elif last is not None:
+                    fills[key] = (gaps[key], last)   # the next pass reads on from here
         newest = max((v["created_at"] for v in have.values()), default=None)
         if newest is not None and cursors.get(name) != newest:   # an empty merge keeps the old cursor (harmless: the next read asks since it again)
             cursors[name] = newest
