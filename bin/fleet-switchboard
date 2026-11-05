@@ -20054,6 +20054,11 @@ def cmd_merge_gate(args, runner, now):
         else:
             sys.stderr.write("%s\n" % union)
         return plan_ledger.EXIT_REFUSE
+    drops = merge_drops_refusal(runner, config, repo, number, state)   # #2159: a merge never silently drops a line of the tip
+    if drops:
+        _gates_audit(engine, "merge_gate.refused", ref, {"by": who, "why": _one_line(drops, 300)})
+        sys.stderr.write("%s\n" % drops)
+        return plan_ledger.EXIT_REFUSE
     allowed, why, head = gate.check_merge(reading, gh, conf, state, repo, number, who, kind[0] == "person", waived, now)
     _gates_audit(engine, "merge_gate.allowed" if allowed else "merge_gate.refused", ref, {"by": who, "why": _one_line(why, 300)})
     if args.json:
@@ -20064,6 +20069,119 @@ def cmd_merge_gate(args, runner, now):
 
 
 cmd_merge_gate.ledger = True   # state and GETs only; its own errors are usage errors
+
+
+# ---- #2159: a merge resolution never silently drops a line of the tip. `merge-drops` is read-only: the lines the branch head removes relative to the integration tip, minus the
+# pull request's own removals (its three-dot diff) and minus the tip's own newer lines (a branch behind the tip has not been asked to carry them). The merge step refuses while it lists any.
+def _git_out(runner, git_dir, argv):
+    done = runner(["git", "-C", str(git_dir)] + argv, capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
+    if done.returncode != 0:
+        raise OSError("git %s failed: %s" % (argv[0], _one_line(done.stderr or "", 120)))
+    return done.stdout or ""
+
+
+def _diff_lines(runner, git_dir, a, b, sign):
+    """[(file, old or new line number, text)] of the `sign` ('-' or '+') lines of `git diff -U0 a b` (a '-' line numbers the old side, a '+' line the new side)."""
+    out, name, old, new, found = _git_out(runner, git_dir, ["diff", "-U0", "--no-renames", "--no-color", a, b]), None, 0, 0, []
+    for line in out.split("\n"):
+        if line.startswith("+++ "):
+            name = line[4:][2:] if line[4:].startswith("b/") else None if line[4:] == "/dev/null" else line[4:]
+        elif line.startswith("--- "):
+            if line[4:] != "/dev/null":
+                name = line[4:][2:] if line[4:].startswith("a/") else line[4:]
+        elif line.startswith("@@"):
+            m = re.match(r"@@ -(\d+)(?:,\d+)? \+(\d+)", line)
+            old, new = (int(m.group(1)), int(m.group(2))) if m else (0, 0)
+        elif line.startswith("-") and sign == "-" and name:
+            found.append((name, old, line[1:]))
+            old += 1
+        elif line.startswith("+") and sign == "+" and name:
+            found.append((name, new, line[1:]))
+            new += 1
+        elif line.startswith("-"):
+            old += 1
+        elif line.startswith("+"):
+            new += 1
+    return found
+
+
+def merge_drops(runner, git_dir, tip, head):
+    """The hunks `head` drops from `tip`: [(file, first line number, last line number, first line text)], and the merge commit messages of `tip..head`.
+    A dropped line is a '-' line of `git diff tip head` that is not among the '-' lines of the branch's own non-merge commits (the pull request's own removals, by file and content)
+    and not a '+' line of `git diff merge-base tip` (the tip's newer lines)."""
+    base = _git_out(runner, git_dir, ["merge-base", tip, head]).strip()
+    own = set()   # the removals of the branch's own (non-merge) commits: the three-dot diff is useless once the tip is merged in (the merge base is then the tip itself)
+    for commit in _git_out(runner, git_dir, ["rev-list", "--no-merges", "%s..%s" % (tip, head)]).split():
+        own.update((f, t) for f, _, t in _diff_lines(runner, git_dir, commit + "^", commit, "-"))
+    newer = {(f, t) for f, _, t in _diff_lines(runner, git_dir, base, tip, "+")}
+    dropped = [d for d in _diff_lines(runner, git_dir, tip, head, "-") if (d[0], d[2]) not in own and (d[0], d[2]) not in newer]
+    hunks = []
+    for name, number, text in dropped:
+        if hunks and hunks[-1][0] == name and hunks[-1][2] + 1 == number:
+            hunks[-1][2] = number
+        else:
+            hunks.append([name, number, number, text])
+    messages = _git_out(runner, git_dir, ["log", "--merges", "--format=%B%x00", "%s..%s" % (tip, head)])
+    return [tuple(h) for h in hunks], [m for m in messages.split("\0") if m.strip()]
+
+
+def merge_drops_unnamed(hunks, messages):
+    """The hunks no merge commit message names (its file AND the first line of the hunk)."""
+    return [h for h in hunks if not any(h[0] in m and h[3].strip() and h[3].strip() in m for m in messages)]
+
+
+def merge_drops_text(hunk):
+    return "%s lines %d-%d (first: %s)" % (hunk[0], hunk[1], hunk[2], _one_line(hunk[3].strip(), 80))
+
+
+def add_merge_drops_parsers(sub):
+    drops = sub.add_parser("merge-drops", help="Read-only: the lines a pull request branch removes relative to the integration tip that are not its own removals; exit 1 if any "
+                                               "hunk is not named in a merge commit message",
+                           description="Compares the branch head with the tip in a git directory: every '-' line of the tip-to-head diff that is not among the branch's own removals "
+                                       "(the three-dot diff). Prints each hunk (file, line range). A hunk whose file and first line a merge commit of the branch names is allowed. Exit 0 when clean.")
+    drops.add_argument("--git-dir", default=".", help="A checkout or bare repository holding both refs (default: the current directory)")
+    drops.add_argument("--tip", default="origin/integration", help="The integration tip (default origin/integration)")
+    drops.add_argument("--branch", default="HEAD", help="The branch head to judge (default HEAD)")
+
+
+def cmd_merge_drops(args, runner, now):
+    try:
+        hunks, messages = merge_drops(runner, args.git_dir, args.tip, args.branch)
+    except (OSError, subprocess.SubprocessError) as err:
+        raise LedgerCommandError("merge-drops: %s" % _one_line(str(err), 200)) from None
+    bad = merge_drops_unnamed(hunks, messages)
+    for hunk in bad:
+        print("dropped: %s" % merge_drops_text(hunk))
+    return EXIT_ERROR if bad else EXIT_OK
+
+
+cmd_merge_drops.ledger = True   # reads only; its own errors are usage errors
+
+
+def merge_drops_refusal(runner, config, repo, number, state):
+    """The merge step's refusal line when the pull request's head drops a line of its base branch's tip, else None. A cached bare clone under the state directory is fetched
+    for the read; a read that cannot be made refuses nothing (the claim gate and the review check are what they were)."""
+    gh = merge_gate_gh(config, runner, repo)
+    code, out, _ = gh(["pr", "view", str(number), "--repo", repo, "--json", "baseRefName,headRefOid"])
+    try:
+        data = json.loads(out) if code == 0 else {}
+        base, head = data["baseRefName"], data["headRefOid"]
+    except (ValueError, KeyError, TypeError):
+        return None
+    git_dir = Path(state) / "merge-drops" / repo.replace("/", "__")
+    try:
+        if not git_dir.is_dir():
+            git_dir.parent.mkdir(parents=True, exist_ok=True)
+            _git_out(runner, ".", ["init", "--bare", "-q", str(git_dir)])
+        _git_out(runner, git_dir, ["fetch", "-q", "https://github.com/%s.git" % repo, "+refs/heads/%s:refs/tips/base" % base, "+refs/pull/%d/head:refs/tips/head" % number])
+        hunks, messages = merge_drops(runner, git_dir, "refs/tips/base", "refs/tips/head")
+    except (OSError, subprocess.SubprocessError):
+        return None
+    bad = merge_drops_unnamed(hunks, messages)
+    if not bad:
+        return None
+    return "merge of %s#%d refused: its head drops %d tip hunk(s): %s; keep them, or name each in a merge commit message (`fleet-switchboard merge-drops`)" % (
+        repo, number, len(bad), "; ".join(merge_drops_text(h) for h in bad[:3]))
 
 
 ANCESTOR_DEPTH = 25

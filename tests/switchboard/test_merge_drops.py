@@ -1,0 +1,132 @@
+"""#2159: a merge resolution never silently drops a line of the tip. Fixture git repositories (neutral names); S2, S3, S4 and U1 of the plan.
+
+HOST is bin/test-switchboard (set by its loader block): `HOST.sb` is the entry module."""
+import subprocess
+import sys
+import tempfile
+import types
+import unittest
+from pathlib import Path
+from unittest import mock
+
+HOST = None   # set by bin/test-switchboard
+
+
+def git(cwd, *argv):
+    done = subprocess.run(["git", "-C", str(cwd)] + list(argv), capture_output=True, text=True, stdin=subprocess.DEVNULL,
+                          env={"PATH": "/usr/bin:/bin", "HOME": str(cwd), "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null",
+                               "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@x", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@x"})
+    assert done.returncode == 0, done.stderr
+    return done.stdout.strip()
+
+
+class MergeDropsBase(unittest.TestCase):
+    def setUp(self):
+        if HOST is None:
+            self.skipTest("the entry is loaded by bin/test-switchboard")
+        self.sb = HOST.sb
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dir = Path(tmp.name)
+        git(self.dir, "init", "-q", "-b", "integration")
+        self.write("app.py", "".join("line %d\n" % n for n in range(1, 11)))
+        self.write("other.py", "keep one\nkeep two\n")
+        self.commit("base")
+
+    def write(self, name, text):
+        (self.dir / name).write_text(text)
+
+    def commit(self, msg):
+        git(self.dir, "add", "-A")
+        git(self.dir, "commit", "-q", "-m", msg)
+
+    def tip_moves(self):
+        """The tip adds a line `fact_sources HeldSendFacts` to app.py after the branch left it."""
+        git(self.dir, "checkout", "-q", "integration")
+        self.write("app.py", "".join("line %d\n" % n for n in range(1, 6)) + "HeldSendFacts(state_dir)\n" + "".join("line %d\n" % n for n in range(6, 11)))
+        self.commit("tip adds a line")
+
+    def run_cmd(self, branch="pr"):
+        args = types.SimpleNamespace(git_dir=str(self.dir), tip="integration", branch=branch)
+        out = []
+        with mock.patch("builtins.print", lambda *a, **k: out.append(" ".join(str(x) for x in a))):
+            code = self.sb.cmd_merge_drops(args, subprocess.run, None)
+        return code, out
+
+
+class TestMergeDrops(MergeDropsBase):
+    def merge_dropping(self, message="merge the tip"):
+        git(self.dir, "checkout", "-q", "-b", "pr", "integration~1")
+        self.write("other.py", "keep one\nkeep two\nown addition\n")
+        self.commit("the change")
+        git(self.dir, "merge", "-q", "--no-commit", "integration")
+        self.write("app.py", "".join("line %d\n" % n for n in range(1, 11)))   # the resolution loses the tip's line
+        git(self.dir, "add", "-A")
+        git(self.dir, "commit", "-q", "-m", message)
+
+    def test_s2_a_merge_that_drops_a_tip_line_is_listed(self):
+        self.tip_moves()
+        self.merge_dropping()
+        code, out = self.run_cmd()
+        self.assertEqual(code, 1, out)
+        self.assertEqual(len(out), 1, out)
+        self.assertIn("app.py", out[0])
+        self.assertIn("HeldSendFacts(state_dir)", out[0])
+
+    def test_s3_a_removal_of_the_branch_itself_passes(self):
+        git(self.dir, "checkout", "-q", "-b", "pr")
+        self.write("other.py", "keep one\n")   # the pull request means to remove `keep two`
+        self.commit("remove a line")
+        self.assertEqual(self.run_cmd()[0], 0)
+
+    def test_s3_a_hunk_named_in_the_merge_message_passes(self):
+        self.tip_moves()
+        self.merge_dropping("merge the tip; drops app.py: HeldSendFacts(state_dir) on purpose")
+        self.assertEqual(self.run_cmd()[0], 0)
+
+    def test_s3_a_branch_behind_the_tip_is_not_judged_for_the_tip_s_newer_lines(self):
+        self.tip_moves()
+        git(self.dir, "checkout", "-q", "-b", "pr", "integration~1")
+        self.write("other.py", "keep one\nkeep two\nown addition\n")
+        self.commit("the change")
+        self.assertEqual(self.run_cmd()[0], 0)
+
+    def test_u1_a_merge_that_keeps_the_tip_whole_is_not_refused(self):
+        self.tip_moves()
+        git(self.dir, "checkout", "-q", "-b", "pr", "integration~1")
+        self.write("other.py", "keep one\nkeep two\nown addition\n")
+        self.commit("the change")
+        git(self.dir, "merge", "-q", "-m", "merge the tip", "integration")
+        code, out = self.run_cmd()
+        self.assertEqual((code, out), (0, []))
+
+
+class TestMergeDropsStep(MergeDropsBase):
+    def refusal(self):
+        git(self.dir, "update-ref", "refs/heads/base", "integration")
+        local = str(self.dir)
+
+        def runner(argv, **kw):
+            if argv[:1] == ["git"] and "fetch" in argv:   # the fetch reads the fixture, never the network
+                argv = argv[:argv.index("fetch") + 2] + [local, "+refs/heads/base:refs/tips/base", "+refs/heads/pr:refs/tips/head"]
+            return subprocess.run(argv, **kw)
+        gh = lambda argv, own=True: (0, '{"baseRefName": "base", "headRefOid": "x"}', "")
+        state = tempfile.TemporaryDirectory()
+        self.addCleanup(state.cleanup)
+        with mock.patch.object(self.sb, "merge_gate_gh", lambda config, run, repo: gh):
+            return self.sb.merge_drops_refusal(runner, {}, "acme/api", 7, state.name)
+
+    def test_s4_the_merge_step_refuses_a_pull_request_that_drops_a_tip_line_naming_the_file(self):
+        TestMergeDrops.tip_moves(self)
+        TestMergeDrops.merge_dropping(self)
+        text = self.refusal()
+        self.assertIsNotNone(text)
+        self.assertEqual(text.count("app.py"), 1, text)
+
+    def test_u1_the_merge_step_refuses_nothing_for_a_clean_merge(self):
+        TestMergeDrops.tip_moves(self)
+        git(self.dir, "checkout", "-q", "-b", "pr", "integration~1")
+        self.write("other.py", "keep one\nkeep two\nown addition\n")
+        self.commit("the change")
+        git(self.dir, "merge", "-q", "-m", "merge the tip", "integration")
+        self.assertIsNone(self.refusal())
