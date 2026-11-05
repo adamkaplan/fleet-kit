@@ -485,6 +485,7 @@ class ReminderFacts:
 
     def __init__(self, state_dir):
         self.state_dir, self.engine = Path(state_dir), None
+        self.swept = set()   # #1711: ids dropped at a delivery for a newer copy of the same key and recipient
 
     def bind(self, engine):
         self.engine = engine
@@ -595,6 +596,35 @@ class ReminderFacts:
                  and i["at"] <= now and (i.get("created", 0), i["at"]) > (item.get("created", 0), item["at"])]
         return max(newer, key=lambda i: (i.get("created", 0), i["at"])) if newer else None
 
+    def newest_first(self, facts):
+        """The reminder facts in the order of their copies' (created, at), newest first, so a delivery sweeps the older copies before it asks about them.
+        It has no side effect: `swept` is cleared where a pass starts (`__call__`), not per delivery call."""
+        try:
+            marks = {"reminder:" + i["id"]: (i.get("created", 0), i["at"]) for i in read_reminders(self.state_dir)}
+        except ReminderError:
+            return list(facts)   # the recheck itself reads the file again and defers the delivery
+        return sorted(facts, key=lambda f: marks.get(str(f.key), (0, 0)), reverse=True)
+
+    def drop_older_copies(self, item, items):
+        """#1711: at the delivery of a keyed, unconditional copy, every OTHER older copy of the same key and recipient still in the file
+        (whatever its sender, also none) is dropped, one audit line each. Called under the lock with `items` just read. An unkeyed copy,
+        another key, another recipient and a copy already delivered (not in the file) are never touched."""
+        if not item.get("key") or item.get("condition"):
+            return []
+        mark = (item.get("created", 0), item["at"])
+        older = [i for i in items if i["id"] != item["id"] and i.get("key") == item["key"] and i["to"] == item["to"]
+                 and (i.get("created", 0), i["at"]) < mark]
+        if not older:
+            return []
+        gone = {i["id"] for i in older}
+        self.swept |= gone
+        write_reminders(self.state_dir, [i for i in items if i["id"] not in gone])
+        if self.engine is not None and self.engine.audit is not None:
+            for i in older:
+                self.engine.audit.append(self.engine.actor, "reminder.drop_superseded", i["to"],
+                                         {"dropped": i["id"], "kept": item["id"], "key": _one_line(item["key"], 60), "by": "delivered"})
+        return sorted(gone)
+
     def recheck_delivery(self, fact):
         """#1401: the delivery step asks once more, under the lock, whether a reminder fact is still wanted. Returns None (deliver it) or the
         id of the newer copy that replaces it, or "cancelled" when it is no longer in the file; a dropped superseded copy is removed here."""
@@ -605,14 +635,16 @@ class ReminderFacts:
             items = read_reminders(self.state_dir)
             item = next((i for i in items if i["id"] == item_id), None)
             if item is None:
-                return "cancelled"
+                return "swept" if item_id in self.swept else "cancelled"
             kept = self.superseded(item, items)
             if kept is None or kept.get("condition"):   # a gated newer copy may not be delivered: the older one is not dropped for it
+                self.drop_older_copies(item, items)
                 return None
             write_reminders(self.state_dir, [i for i in items if i["id"] != item_id])
         return kept["id"]
 
     def __call__(self):
+        self.swept.clear()   # #1711: a pass starts here (each source is read once per pass), so `swept` holds only this pass's ids
         facts = []
         everything = read_reminders(self.state_dir)
         for item in self.due():
@@ -932,7 +964,8 @@ def cmd_remind(args, runner, now):
     if len(item["text"]) > TEXT_CAP:
         sys.stderr.write("%s: the text is %d characters: it is delivered in parts, each under %d, the last one closing it\n" % (PROG, len(item["text"]), TEXT_CAP))
     engine.audit.append("cli", "reminder.add", args.name, {"id": item["id"], "at": iso(item["at"]),
-                                                          "from": sender, "issue": number, "repo": repo})
+                                                          "from": sender, "issue": number, "repo": repo,
+                                                          **({"key": _one_line(item["key"], 60)} if item.get("key") else {})})
     print(item["id"])
     sys.stderr.write("%s: reminder for %s %s (now %s)\n" % (PROG, args.name, _print_when(item["at"], moment), _print_when_now(moment)))
     if warning:
@@ -940,28 +973,37 @@ def cmd_remind(args, runner, now):
     return EXIT_OK
 
 
-def read_text_file(path):
-    """(text, None) of a UTF-8 text file for `remind --text-file`, or (None, why it is refused): unreadable, not a regular file, too large, not UTF-8 text, or empty."""
+def read_text_file(path, flag="--text-file", outcome="nothing armed", own_dirs_only=False):
+    """(text, None) of a UTF-8 text file for `remind --text-file` and `send --file` (`flag` and `outcome` word the refusals), or (None, why it is refused):
+    unreadable, not a regular file, too large, not UTF-8 text, or empty. `own_dirs_only` (send): a symlink is refused unless it resolves inside the
+    user's home, the temp directory or the working directory."""
+    import tempfile   # local: a module-level name here would be one more entry import (docs/architecture.md counts them)
+    name = _one_line(path, 80)
+    if own_dirs_only and os.path.islink(path):
+        real = os.path.realpath(path)
+        roots = [os.path.realpath(r) for r in (os.path.expanduser("~"), tempfile.gettempdir(), os.getcwd()) if r]
+        if not any(real == r or real.startswith(r.rstrip(os.sep) + os.sep) for r in roots):
+            return None, "%s %s is a symlink that leaves your own directories: %s" % (flag, name, outcome)
     try:
         with open(path, "rb") as handle:
             if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
-                return None, "--text-file %s is not a regular file: nothing armed" % _one_line(path, 80)
+                return None, "%s %s is not a regular file: %s" % (flag, name, outcome)
             raw = handle.read(TEXT_FILE_MAX * 4 + 1)   # a character is at most 4 bytes: bounded whatever the file is
     except OSError as err:
-        return None, "--text-file %s cannot be read (%s): nothing armed" % (_one_line(path, 80), err.strerror or "error")
+        return None, "%s %s cannot be read (%s): %s" % (flag, name, err.strerror or "error", outcome)
     try:
         text = raw.decode("utf-8").strip()
     except UnicodeDecodeError:
         if len(raw) > TEXT_FILE_MAX * 4:
             text = None
         else:
-            return None, "--text-file %s is not UTF-8 text: nothing armed" % _one_line(path, 80)
+            return None, "%s %s is not UTF-8 text: %s" % (flag, name, outcome)
     if text is None or len(text) > TEXT_FILE_MAX:
-        return None, "--text-file %s is over %d characters: nothing armed" % (_one_line(path, 80), TEXT_FILE_MAX)
+        return None, "%s %s is over %d characters: %s" % (flag, name, TEXT_FILE_MAX, outcome)
     if "\x00" in text:
-        return None, "--text-file %s is not text (it holds a NUL): nothing armed" % _one_line(path, 80)
+        return None, "%s %s is not text (it holds a NUL): %s" % (flag, name, outcome)
     if not text:
-        return None, "--text-file %s is empty: nothing armed" % _one_line(path, 80)
+        return None, "%s %s is empty: %s" % (flag, name, outcome)
     return text, None
 
 

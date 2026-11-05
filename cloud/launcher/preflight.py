@@ -203,7 +203,7 @@ def covers(conditions, branch, default_branch):
     return (inc and not exc), odd
 
 
-def judge(rules, branch, default_branch, fetch, unreadable=None, bypass=None):
+def judge(rules, branch, default_branch, fetch, unreadable=None, bypass=None, target=None):
     """Keep only the rules of rulesets that are active and cover the branch. Returns (problems, kept rules), or
     (problems, None) when a ruleset cannot be read.
 
@@ -228,7 +228,7 @@ def judge(rules, branch, default_branch, fetch, unreadable=None, bypass=None):
             return problems, None
         key = (st, src, rid)
         if key not in verdict:
-            path = ("/repos/%s/rulesets/%d" if st == "Repository" else "/orgs/%s/rulesets/%d") % (src, rid)
+            path = ("/repos/%s/rulesets/%d" % (src, rid)) if st == "Repository" else ("/repos/%s/rulesets/%d?includes_parents=true" % (target, rid))
             try:
                 rs = fetch(path)
             except Unreadable as e:
@@ -250,6 +250,7 @@ def judge(rules, branch, default_branch, fetch, unreadable=None, bypass=None):
                 problems.append("ruleset %d does not cover the branch%s" % (
                     rid, " (a pattern was not understood: %s)" % ", ".join(odd) if odd else ""))
             verdict[key] = enf == "active" and cov
+            if verdict[key] and st == "Organization": say("organization ruleset %d: read at repository level, counted" % rid)
             if verdict[key] and bypass is not None and isinstance(rs.get("bypass_actors"), list):
                 bypass.extend((rid, a) for a in rs["bypass_actors"] if isinstance(a, dict))
         if verdict[key] is None:
@@ -368,7 +369,7 @@ def main(argv):
         return 2
     unreadable = {}
     bypass = []
-    problems, valid = judge(rules, branch, repo.get("default_branch"), lambda path: get(base, path, token), unreadable, bypass)
+    problems, valid = judge(rules, branch, repo.get("default_branch"), lambda path: get(base, path, token), unreadable, bypass, target)
     if valid is None:
         return 2
     missing, has_pr, types, review_problem = evaluate(valid)
