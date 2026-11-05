@@ -315,7 +315,6 @@ class Route(unittest.TestCase):
         "bin/cloud_worker.py": "fd (the launcher's helper)",
         "bin/test-cloud-launcher.chain": "text (the test list)",
         "bin/test-cloud-launcher.parallel": "text (the test list)",
-        "bin/test-switchboard": "text (a hygiene list)",
         "cloud/README.md": "text",
         "cloud/launcher/README.md": "text",
         "cloud/launcher/app_token.py": "the mint itself",
@@ -328,11 +327,19 @@ class Route(unittest.TestCase):
         "cloud/launcher/tests/test_chain_time.py": "text (the test list)",
         "cloud/launcher/tests/test_driver.py": "text (the default command is pinned)",
         "cloud/launcher/tests/test_git_token_renewal.py": "fd (through the launcher's helper)",
+        "cloud/launcher/tests/test_git_token_retry.py": "path (runs the mint as a program; asserts the token is absent from its output)",
         "cloud/launcher/tests/test_issues_read.py": "in process and fd",
+        "cloud/launcher/tests/test_mint_retry.py": "in process",
+        "cloud/launcher/tests/test_mint_roles.py": "argv (a fake mint records it)",
+        "cloud/launcher/tests/test_no_open_files.py": "text (a file list)",
         "cloud/launcher/tests/test_preflight.py": "in process",
+        "cloud/launcher/tests/test_token_at_limit.py": "text (reads the mint source)",
         "docs/agent-credentials.md": "text",
         "docs/cloud-operator-quickstart.md": "text",
+        "docs/cloud-worker-interface.md": "text",
         "docs/review-laws/impact-matrix.json": "text (a path list)",
+        "tests/switchboard/fixtures/cloud_worker.before-1647": "text (a frozen copy)",
+        "tests/switchboard/test_cases_11.py": "text (a path list)",
     }
 
     def test_s9_every_file_that_names_the_mint_is_in_the_table_and_none_reads_stdout(self):
