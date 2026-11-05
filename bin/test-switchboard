@@ -78857,7 +78857,7 @@ class TestEpicRecord(unittest.TestCase):
         for patch in (mock.patch.object(sb, "IntentReader", Reader), mock.patch.object(sb, "GhAccounts", lambda *a, **k: None),
                       mock.patch.object(sb, "impact_carry_get", lambda *a: self.get), mock.patch.object(sb, "build_engine", lambda *a, **k: (self.engine, self.state, self.config)),
                       mock.patch.object(sb, "checked_plan", lambda *a, **k: self.plan()), mock.patch.object(sb, "identify_caller", lambda *a: self.caller),
-                      mock.patch.object(sb, "launched_testers_for", lambda c: ({}, {}, {})), mock.patch.object(sb, "read_open_overlap", lambda *a: None),
+                      mock.patch.object(sb, "launched_testers_for", lambda c, role="tester": ({}, {}, {})), mock.patch.object(sb, "read_open_overlap", lambda *a: None),
                       mock.patch.object(sb, "gates_suites_finding", lambda *a: None), mock.patch.object(sb, "item_context", self.item_ctx),
                       mock.patch.object(sb, "pr_picture", lambda *a: ({"head": self.HEAD, "ci": "green"}, "PLAN: %s" % self.ASK, [], None) if a[2] == 9 else (None, "", [], "no pull request found"))):
             patch.start()
