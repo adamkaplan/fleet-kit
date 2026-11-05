@@ -35,6 +35,7 @@ cloud/launcher/tests/test_reaper_audit_tail.py
 cloud/launcher/tests/test_reaper_renewal.py
 cloud/launcher/tests/test_reaper_restart.py
 cloud/launcher/tests/test_reaper_row.py
+cloud/launcher/tests/test_reaper_unauthorized.py
 cloud/launcher/tests/test_render_namespace.py
 cloud/launcher/tests/test_repo_min_shape.py
 cloud/launcher/tests/test_retire_gone_exact.py
