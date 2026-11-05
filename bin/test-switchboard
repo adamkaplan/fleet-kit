@@ -27829,6 +27829,7 @@ class TestPlanWake(Base):
         self.pr(21, "PLAN: https://github.com/acme/api/issues/3#issuecomment-%d\nbody" % record["id"], 10)
         self.go()
         self.assertEqual(self.engine.plan_wake.unapproved, [])
+        self.engine.plan_wake.approved.clear()   # #2193: an approval is remembered; forget it to test the next form on its own
         self.pr(21, "see PLAN: https://github.com/acme/api/issues/3#issuecomment-%d" % record["id"], 10)   # not the first line
         self.go()
         self.assertEqual(self.engine.plan_wake.unapproved, ["#3"])
