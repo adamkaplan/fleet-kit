@@ -64,6 +64,31 @@ class Kept(Scen):
         self.reap()
         self.assertIsNone(self.pod("plainh"))
 
+    def test_unkept_ended_pod_with_the_mark_is_still_deleted(self):
+        self.fail("stray", {"phase": "Failed"})
+        st = self.st()
+        st["pods"][cw.pod_name("stray")]["metadata"].setdefault("annotations", {})["cw/unreachable"] = "true"
+        self.write_state(st)
+        self.past_hard()
+        self.reap()
+        self.clock.advance(minutes=11)
+        self.reap()
+        self.assertIsNone(self.pod("stray"))
+
+    def test_a_mark_that_raises_still_counts_as_the_one_try(self):
+        self.w = "boom"
+        self.fail("boom", {"phase": "Failed"}, kept=True)
+        self.past_hard()
+        la = cw.Launcher(cw.Kube(self.env), self.env, self.clock)   # one launcher: the process's own state
+        with mock.patch.object(cw.Kube, "annotate", side_effect=cw.CloudError("annotate refused")):
+            la.reap()
+            self.assertEqual(len(self.mine()), 1)
+            self.assertEqual(len(self.lines()), 1)
+            la.reap()
+            la.reap()
+        self.assertEqual(len(self.mine()), 1, "RECORDS_AFTER")
+        self.assertEqual(len(self.lines()), 1, "AUDIT_AFTER")
+
     def test_kept_running_is_still_retried(self):
         self.w = "runner"
         self.create("runner")
