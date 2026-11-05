@@ -1,0 +1,519 @@
+"""The approval gate G0c reads the plan.approved events and blocks a merge without one (ask #1735).
+
+HOST is bin/test-switchboard (set by its loader line). The audit is a FIXTURE in a temp state directory: a live audit.jsonl and one rotated audit-*.jsonl.gz.
+The command tests borrow the merge-gate fixture of the host (acme/app#9 under the plan acme/app#7); the reader and the pure rows use acme-org/widget-api and acme/api#2.
+The mutants are the real source with one line replaced: each is applied, asserted applied, and must fail the scenario check with an anchored text, the unmutated source passing it.
+"""
+import gzip
+import inspect
+import json
+import re
+import sys
+import subprocess
+import tempfile
+import types
+import unittest
+from pathlib import Path
+from unittest import mock
+
+REPO = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO / "bin"))
+import plan_ledger  # noqa: E402
+import plan_check  # noqa: E402
+
+HOST = None   # set by bin/test-switchboard
+ISSUE, OTHER = "acme/api#2", "acme/api#3"
+H_NEW, H_OLD = "sha256:" + "a" * 64, "sha256:" + "b" * 64
+PART = REPO / "bin" / "switchboard" / "approval_gate.py"
+
+
+def event(issue, plan_hash, where="subject"):
+    """One audit line of a plan.approved event: the issue in the subject only (before 30 Oct), or in the detail too."""
+    detail = {"plan_hash": plan_hash, "from": "cos", "to": "orch"}
+    if where == "both":
+        detail["issue"] = issue
+    elif where == "detail":
+        return {"event": "plan.approved", "subject": None, "detail": dict(detail, issue=issue)}
+    return {"event": "plan.approved", "subject": issue, "detail": detail}
+
+
+def audit_dir(live, rotated=(), broken=False):
+    """A temp state directory: audit.jsonl with `live`, audit-2026-10-20.jsonl.gz with `rotated` (or a gz file that is not one)."""
+    folder = Path(tempfile.mkdtemp(prefix="approval-"))
+    (folder / "audit.jsonl").write_text("".join(json.dumps(e) + "\n" for e in live))
+    if rotated or broken:
+        with gzip.open(str(folder / "audit-2026-10-20.jsonl.gz"), "wb") as handle:
+            handle.write(b"this is not a gzip stream" if broken else "".join(json.dumps(e) + "\n" for e in rotated).encode())
+        if broken:
+            (folder / "audit-2026-10-20.jsonl.gz").write_bytes(b"this is not a gzip stream")
+    return folder
+
+
+def judge(events_fn, state_fn, folder, issue, current):
+    """The row the gate would show for `issue` at `current`, read from the fixture directory."""
+    return state_fn(events_fn(folder, issue, current), issue, current)
+
+
+def expect(got, want, what):
+    if got != want:
+        raise AssertionError("approval gate: %s: got %s, want %s" % (what, got, want))
+
+
+def scenario_rows(events_fn, state_fn):
+    """S2 and S4 on the fixture: the five rows, the subject-only event, the event in a rotated audit, the unreadable audit."""
+    live = [event(ISSUE, H_NEW, "both"), event(OTHER, H_OLD)]
+    expect(judge(events_fn, state_fn, audit_dir(live), ISSUE, H_NEW)[0], "ok", "an event at the current hash")
+    old = judge(events_fn, state_fn, audit_dir([event(ISSUE, H_OLD, "both")]), ISSUE, H_NEW)
+    expect(old[0], "missing", "events only at an older hash")
+    expect((H_NEW in old[1], H_OLD in old[1]), (True, True), "the older-hash detail names both hashes")
+    expect(judge(events_fn, state_fn, audit_dir([]), ISSUE, H_NEW)[0], "missing", "no event at all")
+    expect(judge(events_fn, state_fn, audit_dir([event(OTHER, H_NEW)]), ISSUE, H_NEW)[0], "missing", "an event of another issue")
+    nolink = state_fn([], None, H_NEW)
+    expect(nolink, ("missing", "no plan issue named: G0c cannot find an approval"), "no plan link")
+    expect(judge(events_fn, state_fn, audit_dir([event(ISSUE, H_NEW, "subject")]), ISSUE, H_NEW)[0], "ok", "an event whose issue is only in its subject")
+    expect(judge(events_fn, state_fn, audit_dir([], [event(ISSUE, H_NEW)]), ISSUE, H_NEW)[0], "ok", "an event only in a rotated compressed audit")
+    expect(judge(events_fn, state_fn, audit_dir([event(ISSUE, H_OLD)], [event(ISSUE, H_NEW)]), ISSUE, H_NEW)[0], "ok", "an event at the current hash in a rotated audit")
+    bad = judge(events_fn, state_fn, audit_dir([], broken=True), ISSUE, H_NEW)
+    expect((bad[0], "could not be read" in bad[1]), ("missing", True), "an unreadable audit")
+
+
+def source_of(fn):
+    return inspect.getsource(fn)
+
+
+def mutated_state(old, new):
+    """approval_state from the real source with `old` replaced by `new` (asserted applied)."""
+    text = source_of(HOST.sb.approval_state)
+    if old not in text:
+        raise AssertionError("mutant not applied: %r" % old)
+    space = dict(vars(HOST.sb))
+    exec(text.replace(old, new, 1), space)
+    return space["approval_state"]
+
+
+def mutated_events(old, new):
+    """approval_events from the real part with `old` replaced by `new` (asserted applied)."""
+    text = PART.read_text()
+    if old not in text:
+        raise AssertionError("mutant not applied: %r" % old)
+    space = dict(vars(HOST.sb))
+    exec(compile(text.replace(old, new, 1), str(PART), "exec"), space)
+    return space["approval_events"]
+
+
+def corrupt_gz_dir():
+    """A state directory whose rotated audit has a valid gzip header and a corrupt deflate body (zlib.error, not an OSError)."""
+    folder = audit_dir([])
+    data = bytearray(gzip.compress("".join(json.dumps(event(ISSUE, H_NEW)) + "\n" for _ in range(50)).encode()))   # no file name in the header: the deflate stream starts at byte 10
+    for i in range(10, len(data) - 8):
+        data[i] = 0xFF   # block type 3 is invalid: zlib.error
+    (folder / "audit-2026-10-20.jsonl.gz").write_bytes(bytes(data))
+    return folder
+
+
+def mutated_refusal(old, new):
+    """approval_refusal from the real part with `old` replaced by `new` (asserted applied)."""
+    text = PART.read_text()
+    if old not in text:
+        raise AssertionError("mutant not applied: %r" % old)
+    space = dict(vars(HOST.sb))
+    exec(compile(text.replace(old, new, 1), str(PART), "exec"), space)
+    return space["approval_refusal"]
+
+
+def many_files(total, at):
+    """A state directory of `total` audit files (the live one, then rotated ones) read newest first; the ISSUE event at H_NEW sits only in the `at`th file read (1 = the live audit)."""
+    folder = Path(tempfile.mkdtemp(prefix="approval-"))
+    line = lambda e: (json.dumps(e) + "\n").encode()
+    for position in range(1, total + 1):
+        body = line(event(ISSUE if position == at else OTHER, H_NEW if position == at else H_OLD))
+        if position == 1:
+            (folder / "audit.jsonl").write_bytes(body)
+        else:
+            with gzip.open(str(folder / ("audit-2026-%03d.jsonl.gz" % (1000 - position))), "wb") as handle:
+                handle.write(body)
+    return folder
+
+
+def seventy_files_found(events_fn):
+    got = events_fn(many_files(70, 1), ISSUE, H_NEW)
+    if got != [{"plan_hash": H_NEW}]:
+        raise AssertionError("approval gate: 70 files present: got %s, want the event found" % (got,))
+
+
+class TestApprovalGateReader(unittest.TestCase):
+    """S2, S4, S7, U2, U3 on a fixture audit."""
+
+    def test_the_rows_of_the_fixture_audit(self):
+        scenario_rows(HOST.sb.approval_events, HOST.sb.approval_state)
+
+    def test_the_unmutated_control_passes_the_scenario_check(self):
+        scenario_rows(mutated_events("count % 500 == 0", "count % 500 == 0"), mutated_state("seen:", "seen:"))
+
+    def test_mutant_a_missing_approval_read_as_ok_is_caught(self):
+        state = mutated_state('    return "missing", "no plan.approved event for', '    return "ok", "no plan.approved event for')
+        with self.assertRaisesRegex(AssertionError, r"^approval gate: no event at all: got ok, want missing$"):
+            scenario_rows(HOST.sb.approval_events, state)
+
+    def test_mutant_only_detail_issue_read_is_caught(self):
+        events = mutated_events('want in (str(entry.get("subject") or "").lower(), str(detail.get("issue") or "").lower())', 'want == str(detail.get("issue") or "").lower()')
+        with self.assertRaisesRegex(AssertionError, r"^approval gate: an event whose issue is only in its subject: got missing, want ok$"):
+            scenario_rows(events, HOST.sb.approval_state)
+
+    def test_mutant_the_hash_ignored_is_caught(self):
+        state = mutated_state("if current_hash and current_hash in seen:", "if seen:")
+        with self.assertRaisesRegex(AssertionError, r"^approval gate: events only at an older hash: got ok, want missing$"):
+            scenario_rows(HOST.sb.approval_events, state)
+
+    def test_a_corrupt_gzip_reads_as_none_and_the_row_says_could_not_be_read(self):
+        folder = corrupt_gz_dir()
+        self.assertIsNone(HOST.sb.approval_events(folder, ISSUE, H_NEW))
+        row = judge(HOST.sb.approval_events, HOST.sb.approval_state, folder, ISSUE, H_NEW)
+        self.assertEqual((row[0], "could not be read" in row[1]), ("missing", True))
+
+    def test_mutant_the_narrow_except_lets_a_corrupt_gzip_propagate_and_is_caught(self):
+        narrow = mutated_events("    except Exception:", "    except (OSError, EOFError, ValueError, UnicodeError, RecursionError):")
+        with self.assertRaisesRegex(Exception, r"^Error -3"):
+            narrow(corrupt_gz_dir(), ISSUE, H_NEW)
+
+    def test_the_reader_stops_at_the_first_file_with_the_current_hash_and_at_its_bounds(self):
+        read = HOST.sb.approval_events
+        early = audit_dir([event(ISSUE, H_NEW)], broken=True)   # the live audit holds the current hash: the unreadable rotated audit is never opened
+        self.assertEqual(read(early, ISSUE, H_NEW), [{"plan_hash": H_NEW}])
+        folder = audit_dir([event(ISSUE, H_OLD)], [event(ISSUE, H_OLD)])
+        self.assertIsNone(read(folder, ISSUE, H_NEW, files=1), "more files than the bound")
+        ticks = iter(range(0, 1000, 5))
+        self.assertIsNone(read(folder, ISSUE, H_NEW, clock=lambda: next(ticks), seconds=2), "a read past its time bound")
+        self.assertEqual(read(folder, ISSUE, H_NEW), [{"plan_hash": H_OLD}, {"plan_hash": H_OLD}])
+
+    def test_seventy_files_present_are_not_an_error_when_the_event_is_in_the_live_audit(self):
+        seventy_files_found(HOST.sb.approval_events)
+
+    def test_the_bound_counts_files_read_the_61st_file_read_is_not_read(self):
+        read = HOST.sb.approval_events
+        self.assertEqual(read(many_files(61, 60), ISSUE, H_NEW), [{"plan_hash": H_NEW}], "the 60th file read is read")
+        folder = many_files(62, 61)
+        self.assertIsNone(read(folder, ISSUE, H_NEW), "the 61st file read is past the bound")
+        row = HOST.sb.approval_state(read(folder, ISSUE, H_NEW), ISSUE, H_NEW)
+        self.assertEqual(row[0], "missing")
+        self.assertRegex(row[1], r"could not be read in time")
+
+    def test_mutant_the_up_front_count_of_files_present_is_caught_by_the_seventy_file_check(self):
+        mutant = mutated_events("    bound, read = (APPROVAL_FILES if files is None else files), 0\n", "    bound, read = (APPROVAL_FILES if files is None else files), 0\n    if len(paths) > bound:\n        return None\n")
+        with self.assertRaisesRegex(AssertionError, r"^approval gate: 70 files present: got None, want the event found$"):
+            seventy_files_found(mutant)
+
+    def test_the_decision_is_one_short_pure_function_and_the_reader_reads_no_github_and_writes_nothing(self):
+        body = source_of(HOST.sb.approval_state)
+        self.assertLessEqual(len(body.splitlines()), 30)
+        for word in ("open(", "Path(", "read_text", "subprocess", "runner"):
+            self.assertNotIn(word, body)
+        part = PART.read_text()
+        reader = part[part.index("def approval_events"):part.index("def approval_issue")]
+        for word in ("gh(", "runner", "subprocess", ".write", "AuditLog", "'w'", '"w"', "read_pr", "_api"):
+            self.assertNotIn(word, reader)
+        self.assertNotIn("plan_hash(", part, "the current hash is the plan's own, read through plan_check.plan_hash by the plan read")
+        me = Path(__file__).read_text()
+        self.assertEqual(me.count("git " + "diff"), 0)
+        self.assertEqual(me.count("git" + " merge-base"), 0)
+
+
+PLAN_TEXT = "## Plan\n\nsize: S\n\n### Facts\n- one\n\n<!-- fleet-switchboard:from=fleet-registry -->\n"
+
+
+def pair_rows(events_fn, state_fn):
+    """S11 on the fixture: a plan text ending with the marker line; an event at each member of its pair reads ok, an event at the hash of an edited text reads missing naming both hashes."""
+    hashes = plan_check.plan_hashes(PLAN_TEXT)
+    current = plan_check.plan_hash(PLAN_TEXT)
+    expect(len(hashes) >= 2 and hashes[0] == current, True, "the live text has a pair led by the current hash")
+    for member in hashes:
+        folder = audit_dir([event(ISSUE, member, "both")])
+        got = state_fn(events_fn(folder, ISSUE, current, hashes=hashes), ISSUE, current, hashes)
+        expect(got[0], "ok", "an event at the member %s of the pair" % member[:14])
+    edited = plan_check.plan_hash(PLAN_TEXT.replace("one", "two"))
+    folder = audit_dir([event(ISSUE, edited, "both")])
+    got = state_fn(events_fn(folder, ISSUE, current, hashes=hashes), ISSUE, current, hashes)
+    expect(got[0], "missing", "an event at the hash of an edited text")
+    expect((current in got[1], edited in got[1]), (True, True), "the edited-text detail names both hashes")
+
+
+class TestApprovalPair(unittest.TestCase):
+    """S11 (ask #1713's pair): the gate accepts an event at any member of the pair of the live text."""
+
+    def test_the_rows_of_the_pair(self):
+        pair_rows(HOST.sb.approval_events, HOST.sb.approval_state)
+
+    def test_the_unmutated_control_passes(self):
+        pair_rows(mutated_events("count % 500 == 0", "count % 500 == 0"), mutated_state("seen:", "seen:"))
+
+    def test_the_reader_stops_at_an_event_at_an_older_member(self):
+        hashes = plan_check.plan_hashes(PLAN_TEXT)
+        older = hashes[-1]
+        folder = audit_dir([event(ISSUE, older, "both")], broken=True)   # the unreadable rotated audit is never opened
+        self.assertEqual(HOST.sb.approval_events(folder, ISSUE, hashes[0], hashes=hashes), [{"plan_hash": hashes[0]}])   # read at the current hash; the broken rotated audit stays unopened
+
+    def test_mutant_comparing_the_new_hash_only_is_caught(self):
+        events = mutated_events('plan_check.canonical_hash(detail["plan_hash"], hashes)', 'detail["plan_hash"]')
+        state = mutated_state('plan_check.canonical_hash(e["plan_hash"], hashes)', 'e["plan_hash"]')   # the pair is accepted at both reads (reader and decision): the mutant drops both
+        with self.assertRaisesRegex(AssertionError, r"^approval gate: an event at the member sha256:[0-9a-f]{7} of the pair: got missing, want ok$"):
+            pair_rows(events, state)
+
+
+class TestApprovalGateCommands(unittest.TestCase):
+    """S2, S3, S5, S6 through the commands, on the merge-gate fixture of the host (acme/app#9, plan acme/app#7)."""
+
+    def setUp(self):
+        def route(me, argv, **kwargs):   # the plan issue and its comments come from the ledger fixture, the rest from the merge-gate fake
+            joined = " ".join(argv)
+            if argv[0] == HOST.FAKE_GH and re.search(r"/issues/7(\s|$|/)", joined):
+                return HOST.LedgerBase.route(me, argv, **kwargs)
+            if argv[0] == "git":   # #2159: the merge step's drops read; this fixture has no repository, and a read that cannot be made refuses nothing
+                return subprocess.CompletedProcess(argv, 1, "", "no repository in this fixture")
+            return HOST.TestMergeGateCommand.route(me, argv, **kwargs)
+        host_class = type("ApprovalHost", (HOST.TestMergeGateCommand,), {"runTest": lambda self: None, "route": route})
+        self.h = host_class("runTest")
+        self.h.setUp()
+        self.addCleanup(self.h.doCleanups)   # the host's own cleanups (Base.setUp's os.environ patch.dict) run after its tearDown
+        self.addCleanup(self.h.tearDown)
+        self.args = types.SimpleNamespace(pr=self.h.PR)
+        self.h.pr.update(headRefOid=HOST.MG_HEAD)
+
+    def enforce(self, gates=("G0a", "G0c", "G1")):
+        self.h.extra_config = {"merge_gate": {"repos": {"acme/app": {}}}, "plan_gates": {"repos": {"acme/app": {"mode": "enforce", "enforce_gates": list(gates)}}}}
+        self.h.configure()
+
+    def current(self):
+        return self.h.gates()[1]["plan_hash"]
+
+    def approve(self, plan_hash, issue="acme/app#7", where="subject"):
+        with open(str(self.h.world.state / "audit.jsonl"), "a") as handle:
+            handle.write(json.dumps(event(issue, plan_hash, where)) + "\n")
+
+    def refusal(self):
+        return HOST.sb.approval_refusal(self.args, self.h.route, self.h.world.clock.now)
+
+    def row(self):
+        return self.h.row(self.h.gates()[1], "G0c")
+
+    def test_the_gates_row_is_untracked_and_nothing_refuses_where_the_repo_does_not_name_g0c(self):
+        report = self.h.gates()[1]
+        self.assertEqual((self.h.row(report, "G0c")["status"], "G0c" in report["untracked"]), ("untracked", True))
+        self.assertIsNone(self.refusal())
+        self.enforce(("G0a", "G1"))
+        self.assertEqual(self.row()["status"], "untracked")
+        self.assertIsNone(self.refusal())
+
+    def test_the_gates_row_where_the_repo_enforces_it(self):
+        self.enforce()
+        current = self.current()
+        self.assertEqual(self.row()["status"], "missing")
+        self.approve("sha256:" + "c" * 64)
+        row = self.row()
+        self.assertEqual(row["status"], "missing")
+        self.assertIn(current, row["detail"])
+        self.assertIn("sha256:" + "c" * 64, row["detail"])
+        self.approve(current)
+        self.assertEqual(self.row()["status"], "ok")
+
+    def test_the_merge_gate_refuses_the_integration_branch_and_the_default_branch_and_passes_with_an_event(self):
+        self.enforce()
+        current = self.current()
+        for base in ("integration", "main"):
+            self.h.fake.base = base
+            text = self.refusal()
+            self.assertTrue(text and self.h.PR in text, base)
+            self.assertIn("acme/app#7", text)
+            self.assertIn(current, text)
+            self.assertIn("the Chief of Staff", text)
+            code, out, err = self.h.run_as("coder", "merge-gate", self.h.PR, "--check", "--json")
+            self.assertEqual(code, 10, base)
+            self.assertIn(current, json.loads(out)["reason"])
+        self.approve(current)
+        for base in ("integration", "main"):
+            self.h.fake.base = base
+            self.assertIsNone(self.refusal(), base)
+
+    def test_a_waiver_passes_it_is_audited_and_listed_and_a_new_head_voids_it(self):
+        self.enforce()
+        self.assertTrue(self.refusal())
+        code, out, err = self.h.run_as("cos", "waive", self.h.PR, "--gates", "G0c", "--reason", "the owner decided to ship it before the approval is recorded")
+        self.assertEqual(code, 0, err)
+        self.assertIsNone(self.refusal())
+        self.assertEqual(len(self.h.audit_lines("plan.approval.waived")), 1)
+        self.assertIn("G0c", json.dumps(self.h.audit_lines("plan.approval.waived")[0]))
+        self.assertIn("G0c", json.dumps([e for e in self.h.ledger() if e.get("kind") == "waiver"]))   # the waiver list is the ledger's waiver entries
+        self.h.pr.update(headRefOid="c" * 40)
+        self.h.fake.head = "c" * 40
+        self.assertTrue(self.refusal())
+
+    def waive(self):
+        code, out, err = self.h.run_as("cos", "waive", self.h.PR, "--gates", "G0c", "--reason", "the owner decided to ship it before the approval is recorded")
+        self.assertEqual(code, 0, err)
+
+    def refusal_by(self, fn):
+        return fn(self.args, self.h.route, self.h.world.clock.now)
+
+    def unwritable_audit(self):
+        audit = self.h.world.state / "audit.jsonl"
+        if audit.exists():
+            audit.unlink()
+        audit.mkdir()   # an audit that cannot be appended to
+        self.addCleanup(lambda: audit.rmdir() if audit.is_dir() else None)
+
+    def test_a_waiver_whose_audit_write_fails_is_refused(self):
+        self.enforce()
+        self.waive()
+        self.assertEqual(len(self.h.audit_lines("plan.approval.waived")), 0)
+        self.assertIsNone(self.refusal(), "control: a writable audit passes")
+        self.assertEqual(len(self.h.audit_lines("plan.approval.waived")), 1, "control: one waived line")
+        self.unwritable_audit()
+        text = self.refusal()
+        self.assertRegex(text or "", r"^merge of acme/app#9 refused: the waiver of G0c at head %s could not be recorded in the audit" % HOST.MG_HEAD)
+
+    def test_mutant_the_swallowed_audit_failure_is_caught(self):
+        self.enforce()
+        self.waive()
+        self.unwritable_audit()
+        mutant = mutated_refusal("        except Exception:\n            return \"merge of %s refused: the waiver", "        except Exception:\n            pass\n            return None\n            return \"merge of %s refused: the waiver")
+        self.assertIsNone(self.refusal_by(mutant), "the mutant honours an unaudited waiver")
+        with self.assertRaisesRegex(AssertionError, r"^None is not true : the waiver must be refused$"):
+            self.assertTrue(self.refusal_by(mutant), "the waiver must be refused")
+
+    def test_a_corrupt_gzip_in_the_state_dir_fails_the_gates_row_and_the_merge_gate_closed(self):
+        self.enforce()
+        self.approve(self.current())
+        self.assertEqual(self.row()["status"], "ok")
+        self.assertIsNone(self.refusal(), "control: readable audit passes")
+        (self.h.world.state / "audit.jsonl").unlink()
+        corrupt = corrupt_gz_dir() / "audit-2026-10-20.jsonl.gz"
+        (self.h.world.state / corrupt.name).write_bytes(corrupt.read_bytes())
+        row = self.row()
+        self.assertEqual((row["status"], "could not be read" in row["detail"]), ("missing", True))
+        self.assertRegex(self.refusal() or "", r"^merge of acme/app#9 refused: ")
+
+    HELD = r"^merge of acme/app#9 refused: the approval gate setting could not be read: held$"
+
+    def broken_setting(self, how):
+        """Make the setting unreadable: `load` (the loader raises), `unreadable` (a directory where the file is), `corrupt` (not JSON)."""
+        cfg = self.h.config_file
+        if how == "unreadable":
+            cfg.unlink()
+            cfg.mkdir()
+            self.addCleanup(lambda: cfg.rmdir() if cfg.is_dir() else None)
+        elif how == "corrupt":
+            self.h.write_config("{ this is not json")
+        else:
+            patcher = mock.patch.object(HOST.sb, "load_runnable_config", side_effect=ValueError("config broken"))
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_a_clean_absent_setting_is_off_and_every_other_failure_to_read_it_holds_the_merge(self):
+        before = self.h.run_as("coder", "merge-gate", self.h.PR, "--check", "--json")
+        self.assertIsNone(self.refusal())   # absent: the config was read and does not name G0c
+        self.assertEqual(self.h.run_as("coder", "merge-gate", self.h.PR, "--check", "--json"), before, "the merge-gate output is unchanged (0 differing lines)")
+        self.enforce(("G0a", "G1"))
+        self.assertIsNone(self.refusal())
+        for how in ("load", "unreadable", "corrupt"):
+            self.doCleanups()   # undo the last break and the last world
+            self.setUp()   # a fresh world for each break
+            self.enforce()
+            self.waive()   # a valid head-bound waiver must NOT pass a broken setting
+            self.broken_setting(how)
+            self.assertRegex(self.refusal() or "", self.HELD, how)
+        with mock.patch.object(HOST.sb, "approval_on", side_effect=RuntimeError("setting broken")):
+            self.assertRegex(self.refusal() or "", self.HELD, "approval_on raising")
+        self.enforce()
+        with mock.patch.object(HOST.sb, "_ledger_context", side_effect=RuntimeError("ledger broken")):
+            self.assertRegex(self.refusal() or "", r"^merge of acme/app#9 refused: the plan approval could not be judged \(ledger broken\)")
+
+    def test_mutant_any_error_reading_the_setting_is_off_is_caught(self):
+        old = "    except Exception:   # a setting that cannot be read is not an absent setting: the merge is held (a broken config is fixed, not waived)\n        return \"merge of %s refused: the approval gate setting could not be read: held\" % args.pr\n"
+        self.broken_setting("load")
+        self.assertRegex(self.refusal() or "", self.HELD, "control: the unmutated rule holds")
+        mutant = mutated_refusal(old, "    except Exception:\n        return None\n")   # round 2's 'any error = OFF'
+        self.assertIsNone(self.refusal_by(mutant), "the mutant reads the error as off")
+        with self.assertRaisesRegex(AssertionError, r"^None is not true : a setting that cannot be read must hold the merge$"):
+            self.assertTrue(self.refusal_by(mutant), "a setting that cannot be read must hold the merge")
+
+    NOPLAN = "no plan issue named: G0c cannot find an approval"
+
+    def set_body(self, body):
+        self.h.pr["body"] = body
+
+    def test_no_plan_link_or_a_link_naming_no_issue_is_refused_and_only_a_waiver_passes_with_one_audit_line(self):
+        self.enforce()
+        for body, base in (("canon: updated the docs", "integration"), ("PLAN: none for the batch itself: each change in the table cites its own plan", "main")):
+            self.doCleanups()
+            self.setUp()
+            self.enforce()
+            self.set_body(body)
+            self.h.fake.base = base
+            text = self.refusal() or ""
+            self.assertRegex(text, r"^merge of acme/app#9 refused: " + re.escape(self.NOPLAN) + r"; ask ", body)
+            self.waive()
+            self.assertIsNone(self.refusal(), "a valid waiver at the head passes: " + body)
+            self.assertEqual(len(self.h.audit_lines("plan.approval.waived")), 1, "one audited line: " + body)
+            self.assertIn("G0c", json.dumps(self.h.audit_lines("plan.approval.waived")[0]))
+
+    def test_the_g0c_row_for_no_plan_link_is_missing_and_no_row_is_not_applicable(self):
+        self.enforce()
+        self.set_body("canon: updated the docs")
+        report = self.h.gates()[1]
+        row = self.h.row(report, "G0c")
+        self.assertEqual((row["status"], row["detail"]), ("missing", self.NOPLAN))
+        self.assertEqual([r["gate"] for r in report["gates"] if r["status"] == "n/a" and r["gate"] == "G0c"], [])
+
+    def test_mutant_no_plan_link_read_as_not_applicable_is_caught(self):
+        old = '        return "missing", "no plan issue named: G0c cannot find an approval"'
+        self.enforce()
+        self.set_body("canon: updated the docs")
+        self.assertRegex(self.refusal() or "", re.escape(self.NOPLAN), "control: the unmutated rule refuses")
+        fn = mutated_state(old, '        return "n/a", "the pull request has no plan link"')
+        with mock.patch.object(HOST.sb, "approval_state", fn):
+            self.assertIsNone(self.refusal(), "the mutant passes a pull request with no plan link")
+            with self.assertRaisesRegex(AssertionError, r"^None is not true : no plan link must be refused$"):
+                self.assertTrue(self.refusal(), "no plan link must be refused")
+
+    def nolink_row(self, base, default="main"):
+        self.enforce()
+        self.set_body("canon: updated the docs")
+        self.h.fake.base, self.h.fake.default = base, default
+        report = self.h.gates()[1]
+        return report, self.h.row(report, "G0c")
+
+    def test_the_same_pull_request_on_the_integration_branch_or_the_default_branch_reads_missing(self):
+        for base in ("integration", "main", "feature"):
+            report, row = self.nolink_row(base)
+            self.assertEqual((row["status"], row["detail"]), ("missing", self.NOPLAN), base)
+            self.assertTrue(self.refusal(), base)
+            self.doCleanups()
+            self.setUp()
+
+    def feature_check(self, refusal_fn):
+        """S10: a gate-ON repo, a pull request into a feature branch: no approval is `missing` and refused; with an event at the current hash `ok` and passed."""
+        self.enforce()
+        self.h.fake.base, self.h.fake.default = "feature", "main"
+        current = self.current()
+        self.assertEqual(self.row()["status"], "missing")
+        text = refusal_fn()
+        self.assertTrue(text and current in text, "a feature-branch base must be refused")
+        code, out, err = self.h.run_as("coder", "merge-gate", self.h.PR, "--check", "--json")
+        self.assertEqual(code, 10)
+        self.approve(current)
+        self.assertEqual(self.row()["status"], "ok")
+        self.assertIsNone(refusal_fn())
+
+    def test_a_pull_request_into_a_feature_branch_is_held_like_any_other(self):
+        self.feature_check(self.refusal)
+
+    def test_mutant_g0c_holds_only_the_integration_branch_and_the_default_branch_is_caught(self):
+        old = "    try:\n        ctx = _ledger_context("
+        new = ("    try:\n        reading, gh = load_module(\"pr_reading\"), merge_gate_gh(config, runner, repo)\n"
+               "        if reading.read_pr(gh, repo, number)[\"base\"] not in (\"integration\", reading.read_default_branch(gh, repo)):\n            return None\n"
+               "        ctx = _ledger_context(")
+        mutant = mutated_refusal(old, new)
+        self.feature_check(self.refusal)   # the unmutated control passes
+        self.doCleanups()
+        self.setUp()
+        with self.assertRaisesRegex(AssertionError, r"^None is not true : a feature-branch base must be refused$"):
+            self.feature_check(lambda: self.refusal_by(mutant))

@@ -20,6 +20,7 @@ tests/switchboard/test_new_module_demands.py pins that the copy and the guard na
 When the file has authority code the tool proposes the HELD entries (top tier path of class authority AND a floor glob), never the exempt entry:
 an exemption needs a reason a reviewer can verify, and a gate that refuses merges is authority. Standard library only."""
 import ast
+import fnmatch
 import importlib.util
 import json
 import os
@@ -112,11 +113,32 @@ def block(path, source, sources, closure):
     else:
         out.append("  authority code: no")
         out.append("  matrix: no matrix line is demanded")
-    rows = unit_rows(units_text)
-    before = [r for r in rows if r[0] < os.path.basename(path)]
-    out.append("  units: add this row to the Units table of docs/architecture.md (header `%s`, rows sorted by name), after the row of `%s`:" % (UNITS_HEAD, max(r[0] for r in before) if before else "(first row)"))
+    out.append("  units: add the file docs/architecture/units/%s.row holding this one row (a file of its own: no shared line to conflict on):" % os.path.basename(path))
     out.append("    " + unit_row(path))
     out.append("  closure: " + closure)
+    return "\n".join(out)
+
+
+def block_shim(path, source, sources, closure):
+    _, matrix, units_text = sources
+    guards = load_by_path(os.path.join(ROOT, "bin", "path_suites.py"), "path_suites_for_shims").NEW_SHIM_GUARDS
+    hold = matrix["owner_hold"]
+    names, literals = authority_code(source, hold["authority_modules"]["vocabulary"], hold["authority_modules"]["role_literals"])
+    out = ["%s:" % path, "  guards: %d classes run for a new file under shims/:" % len(guards)]
+    out += ["    - %s: %s" % (g[0], g[4]) for g in guards]
+    if names or literals:
+        out.append("  authority code: yes (functions: %s; role literals compared: %s)" % (", ".join(names) or "none", ", ".join(literals) or "none"))
+    else:
+        out.append("  authority code: no")
+    top = [("owner_hold.top_tier_paths.%s" % k, g) for k, v in sorted(hold["top_tier_paths"].items()) for g in v]
+    floor = [("owner_hold.floor[\"%s\"].globs" % r, g) for r, v in sorted(hold["floor"].items()) for g in v["globs"]]
+    held = [(w, g) for w, g in top + floor if fnmatch.fnmatch(path, g)]
+    if held:
+        out.append("  matrix: no line is demanded: %s is a top tier identity path and a floor glob (%s)" % (", ".join(sorted({g for _, g in held})), "; ".join("%s: %s" % h for h in held)))
+    else:
+        out.append("  matrix: no glob holds this path: add it to owner_hold.top_tier_paths.<class> and owner_hold.floor[\"<repo>\"].globs in %s" % MATRIX)
+    out.append("  units: none: a shim is a standalone script, not a unit of the daemon")
+    out.append("  closure: not in the closure of the daemon")
     return "\n".join(out)
 
 
@@ -132,8 +154,8 @@ def main(argv):
         return 2
     sources = {}
     for path in args:
-        if not re.match(r"^bin/[^/]+$", path) or ".." in path:
-            print("new-module-demands: %s is not a file directly under bin/" % path)
+        if not re.match(r"^(bin|shims)/[^/]+$", path) or ".." in path:
+            print("new-module-demands: %s is not a file directly under bin/ or shims/" % path)
             return 2
         try:
             with open(os.path.join(root, path), encoding="utf-8") as handle:
@@ -148,7 +170,7 @@ def main(argv):
     with open(os.path.join(ROOT, "docs", "architecture.md"), encoding="utf-8") as handle:
         units_text = handle.read()
     closure = closure_state()
-    print("\n".join(block(p, sources[p], (guards, matrix, units_text), closure) for p in args))
+    print("\n".join((block_shim if p.startswith("shims/") else block)(p, sources[p], (guards, matrix, units_text), closure) for p in args))
     return 0
 
 

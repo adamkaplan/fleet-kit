@@ -1,0 +1,164 @@
+#!/usr/bin/env python3
+"""Ask #1289 (DW-4): a cloud test never opens a path for writing under the repository root; it writes under the directory the
+temporary-directory variable names. One scan, by syntax tree, of cloud/*/tests/*.py.
+
+What it sees: a call of open() with a write, append, exclusive or update mode, or of write_text / write_bytes, whose path is built
+from the repository root: the names ROOT, HERE, REPO_ROOT or KIT, __file__, or a name assigned from one of those (followed through
+plain assignments of the same file). LIMIT (stated, not hidden): a path assembled through a helper, an alias, a star import or a
+subprocess is not seen; the mutants below show the direct forms only."""
+import ast
+import glob
+import os
+import unittest
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+KIT = os.path.dirname(os.path.dirname(os.path.dirname(HERE)))
+SEEDS = {"ROOT", "HERE", "REPO_ROOT", "KIT", "__file__"}
+WRITE_CHARS = set("wax+")
+
+
+def _root(node):
+    """The name a path expression starts from: the first argument of a join or other os.path call, the left of a `/`, the first
+    piece of an f-string, the receiver of an attribute; None when it starts from something else (a call of a helper, a constant)."""
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return _root(node.value)
+    if isinstance(node, ast.BinOp):
+        return _root(node.left)
+    if isinstance(node, ast.JoinedStr):
+        return next((_root(v.value) for v in node.values if isinstance(v, ast.FormattedValue)), None)
+    if isinstance(node, ast.Call):
+        f = node.func
+        if node.args and (isinstance(f, ast.Name) and f.id in ("Path", "str") or isinstance(f, ast.Attribute) and (
+                (isinstance(f.value, ast.Attribute) and f.value.attr == "path") or f.attr in ("Path", "resolve", "joinpath"))):
+            return _root(node.args[0])
+        if isinstance(f, ast.Attribute) and f.attr in ("resolve", "joinpath", "parent"):
+            return _root(f.value)
+    return None
+
+
+def _own(scope):
+    """The nodes of a scope without descending into a nested function (a class body is part of the module's scope)."""
+    stack = list(ast.iter_child_nodes(scope))
+    while stack:
+        n = stack.pop()
+        yield n
+        if not isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            stack.extend(ast.iter_child_nodes(n))
+
+
+def _taint(scope, taint):
+    taint = set(taint)
+    changed = True
+    while changed:
+        changed = False
+        for n in _own(scope):
+            if isinstance(n, ast.Assign) and _root(n.value) in taint:
+                for t in n.targets:
+                    if isinstance(t, ast.Name) and t.id not in taint:
+                        taint.add(t.id)
+                        changed = True
+    return taint
+
+
+def _mode(call):
+    mode = call.args[1] if len(call.args) > 1 else None
+    for k in call.keywords:
+        if k.arg == "mode":
+            mode = k.value
+    return mode.value if isinstance(mode, ast.Constant) and isinstance(mode.value, str) else ""
+
+
+def _calls(scope, taint, hits):
+    for n in _own(scope):
+        if not isinstance(n, ast.Call):
+            continue
+        f = n.func
+        name = f.id if isinstance(f, ast.Name) else f.attr if isinstance(f, ast.Attribute) else ""
+        if name == "open" and n.args and WRITE_CHARS & set(_mode(n)):
+            path = n.args[0]
+        elif name in ("write_text", "write_bytes") and isinstance(f, ast.Attribute):
+            path = f.value
+        else:
+            continue
+        if _root(path) in taint:
+            hits.add(n.lineno)
+
+
+# The ONE exemption (a named entry, not a pattern): path relative to the repository root -> (guard, reason).
+ALLOWED = {
+    "cloud/worker/tests/test_push_rules.py": (
+        "only when WRITE_PUSH_RULES=1 regenerates a fixture",
+        "the write is guarded by the environment switch WRITE_PUSH_RULES=1; a normal run only reads the fixture, so no file lands in the tree"),
+}
+GUARD_TEXT = 'os.environ.get("WRITE_PUSH_RULES") == "1"'
+
+
+def scan(files, allowed):
+    """`path:line` of every write under the root, minus the lines of an allowed path whose source holds its guard (at most one line)."""
+    found = []
+    for p in files:
+        rel = os.path.relpath(p, KIT)
+        with open(p) as fh:
+            src = fh.read()
+        lines = writes_under_root(src)
+        if rel in allowed and GUARD_TEXT in src and len(lines) <= 1:
+            continue
+        found += ["%s:%d" % (rel, ln) for ln in lines]
+    return found
+
+
+def writes_under_root(source):
+    """Sorted line numbers of the calls in `source` that write to a path built from the repository root. Taint is followed through
+    plain assignments, per function (a name such as `path` is a temporary path in one test and a root path in another)."""
+    tree = ast.parse(source)
+    module = _taint(tree, SEEDS)
+    hits = set()
+    _calls(tree, module, hits)
+    for fn in ast.walk(tree):
+        if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            _calls(fn, _taint(fn, module), hits)
+    return sorted(hits)
+
+
+MUTANT_OPEN = 'import os\nROOT = os.getcwd()\nf = open(os.path.join(ROOT, "x.txt"), "w")\n'
+MUTANT_WRITE_TEXT = 'import pathlib\nROOT = pathlib.Path(__file__).parent\n(ROOT / "x.txt").write_text("x")\n'
+MUTANT_ALIASED = 'import os\nHERE = os.path.dirname(__file__)\ntarget = os.path.join(HERE, "x")\nopen(target, "a")\n'
+CLEAN = 'import os, tempfile\nd = tempfile.mkdtemp()\nopen(os.path.join(d, "x"), "w")\nopen(__file__)\n'
+
+
+class Scan(unittest.TestCase):
+    def test_no_cloud_test_writes_under_the_repository_root(self):
+        files = sorted(glob.glob(os.path.join(KIT, "cloud", "*", "tests", "*.py")))
+        self.assertTrue(files)
+        self.assertEqual(scan(files, ALLOWED), [])
+
+    def test_each_planted_write_is_refused_and_clean_code_passes(self):
+        for name, src in (("open", MUTANT_OPEN), ("write_text", MUTANT_WRITE_TEXT), ("through a name", MUTANT_ALIASED)):
+            self.assertEqual(len(writes_under_root(src)), 1, name)
+        self.assertEqual(writes_under_root(CLEAN), [])
+
+    def test_a_widened_exemption_is_refused(self):
+        files = sorted(glob.glob(os.path.join(KIT, "cloud", "*", "tests", "*.py")))
+        self.assertEqual(list(ALLOWED), ["cloud/worker/tests/test_push_rules.py"])
+        rel = "cloud/worker/tests/test_push_rules.py"
+        with open(os.path.join(KIT, rel)) as fh:
+            found_at = [i for i, text in enumerate(fh.read().splitlines(), 1) if 'open(CONF, "w")' in text]
+        self.assertEqual(len(found_at), 1)   # exactly one line is the guarded write; found by its text, not by a number
+        self.assertEqual(scan(files, {}), ["%s:%d" % (rel, found_at[0])])   # the exemption is what makes the real scan pass
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            planted = os.path.join(d, "test_planted.py")
+            with open(planted, "w") as fh:
+                fh.write(MUTANT_OPEN + "# " + GUARD_TEXT + "\n")
+            self.assertEqual(len(scan(files + [planted], ALLOWED)), 1)   # a second path is not exempt: the scan fails
+            widened = dict(ALLOWED); widened[os.path.relpath(planted, KIT)] = ("x", "x")
+            self.assertEqual(scan(files + [planted], widened), [])        # mutation applied True: only a widened table lets it pass
+            print("S15: guarded write found by text at line %d, scan without the table names it %d of 1, second paths refused %d of 1, "
+                  "widened tables let it pass %d of 1, mutation applied True" % (found_at[0], len(scan(files, {})),
+                  len(scan(files + [planted], ALLOWED)), int(scan(files + [planted], widened) == [])))
+
+
+if __name__ == "__main__":
+    unittest.main()

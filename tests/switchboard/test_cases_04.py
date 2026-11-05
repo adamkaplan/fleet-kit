@@ -741,67 +741,6 @@ class TestPolicyCache(Base):
         self.assertIsNone(cache.get("k"))
 
 
-class OwnedInputs(WaitingInputs):
-    """#874: the daemon's lists for a scene of an ask (#2), its work item (#3), a work item below it (#4) and an unrelated issue (#5). Ages are
-    counted back from the moment of each read (the daemon's pass re-reads the lists every few minutes), so time can pass and the lists stay fresh. The
-    pull request list is `ci_record_pass`'s over a fake hub that honours the cut and the failure; the issue list is the triage's."""
-    OLD, RECENT = 10 * 3600, 600
-    NO_HEAD = object()
-
-    def wire_scene(self):
-        self.scene = {"issues": {3: {"parent": 2}, 4: {"parent": 3}}, "prs": []}
-        self.wire_inputs()
-
-    def pr(self, number, body, age=None, base="main", created=None, head=None, **extra):
-        return dict({"number": number, "body": body, "age": self.OLD if age is None else age, "created": 86400 if created is None else created, "base": base,
-                     "head": "a" * 40 if head is None else head}, **extra)
-
-    def plan(self, n):
-        return "PLAN: https://github.com/%s/issues/%d\n" % (self.REPO, n)
-
-    def set_scene(self, prs=None, issues=None, **issue_extra):
-        if prs is not None:
-            self.scene["prs"] = prs
-        for n, fields in (issues or {}).items():
-            self.scene["issues"].setdefault(n, {}).update(fields)
-        self.apply()
-
-    def apply(self):
-        engine, scene = self.world.engine, self.scene
-        now = self.world.clock.now()
-        def row(n):
-            f = scene["issues"].get(n, {})
-            record = {"number": n, "updated_at": sb.iso(now - f.get("age", self.OLD)), "created_at": sb.iso(now - self.OLD),
-                      "labels": [{"name": l} for l in f.get("labels", ())]}
-            if "raw_time" in f:
-                record["updated_at"] = f["raw_time"]
-            if f.get("parent") is not None:
-                record["parent_issue_url"] = "https://api.github.com/repos/%s/issues/%d" % (f.get("parent_repo", self.REPO), f["parent"])
-            return record
-        engine.triage = sb.TriageState()
-        engine.triage.units[(self.REPO, "issues")] = {"at": now, "data": [row(n) for n in range(1, 100)], "truncated": False, "error": None}
-        sb.read_mark(engine, "issues:" + self.REPO, True, "", now)
-        sb.read_mark(engine, "decisions", True, "", now)
-        self.hub.records = [{"number": p["number"], "body": p["body"], "updated_at": p["age"][1] if isinstance(p["age"], tuple) else sb.iso(now - p["age"]), "created_at": sb.iso(now - p["created"]),
-                             "head": {"sha": p["head"]}, "base": {"ref": p["base"]}, "labels": [{"name": l} for l in p.get("labels", ())],
-                             **{k: v for k, v in p.items() if k in ("requested_reviewers", "requested_teams", "draft")}} for p in scene["prs"]]
-        for record, p in zip(self.hub.records, scene["prs"]):
-            if p["head"] is self.NO_HEAD:
-                del record["head"]   # a record with no head at all
-
-        engine.__dict__.pop("ci_record_state", None)
-        engine.__dict__.get("read_whole", {}).pop("pulls:" + self.REPO, None)
-        sb.ci_record_pass(engine, now)
-
-    def owned(self):
-        engine = self.world.engine
-        records = engine.triage.units[(self.REPO, "issues")]["data"]
-        pulls = engine.ci_record_state.lists[sb.plan_ledger.normal_repo(self.REPO)][1]
-        return sb.worker_owned(records, pulls, 2, self.REPO)
-
-    def owned_numbers(self):
-        got = self.owned()
-        return sorted(r["number"] for r in got.issues), sorted(r["number"] for r in got.pulls)
 
 
 # ======================================================================
@@ -956,90 +895,6 @@ class TestLedgerReadRace(unittest.TestCase):
         self.assertIsNotNone(sb.plan_ledger.read_ledger(self.dir)[1])
 
 
-class RecFacts(dict):
-    """(#986) A facts mapping that RECORDS every key touched, by any spelling; an access it cannot attribute to a key records '*'."""
-
-    seen = None   # set by the test: the one shared set of keys
-    quiet = False   # true while the proxy is built from a picture: that copy is not a read
-
-    def _note(self, key):
-        if not RecFacts.quiet:
-            RecFacts.seen.add(key)
-
-    def __getitem__(self, key):
-        self._note(key)
-        return dict.__getitem__(self, key)
-
-    def __setitem__(self, key, value):
-        self._note(key)
-        dict.__setitem__(self, key, value)
-
-    def __delitem__(self, key):
-        self._note(key)
-        dict.__delitem__(self, key)
-
-    def __contains__(self, key):
-        self._note(key)
-        return dict.__contains__(self, key)
-
-    def get(self, key, default=None):
-        self._note(key)
-        return dict.get(self, key, default)
-
-    def pop(self, key, *default):
-        self._note(key)
-        return dict.pop(self, key, *default)
-
-    def setdefault(self, key, default=None):
-        self._note(key)
-        return dict.setdefault(self, key, default)
-
-    def update(self, *a, **k):
-        RecFacts.seen.update(dict(*a, **k))
-        RecFacts.seen.add("*")
-        dict.update(self, *a, **k)
-
-    def _star(self):
-        if not RecFacts.quiet:
-            RecFacts.seen.add("*")
-
-    def items(self):
-        self._star()
-        return dict.items(self)
-
-    def keys(self):
-        self._star()
-        return dict.keys(self)
-
-    def values(self):
-        self._star()
-        return dict.values(self)
-
-    def __iter__(self):
-        self._star()
-        return dict.__iter__(self)
-
-    def copy(self):
-        self._star()
-        return RecFacts(dict.copy(self))
-
-    def __or__(self, other):
-        self._star()
-        return dict.__or__(self, other)
-
-    def __reversed__(self):
-        self._star()
-        return dict.__reversed__(self)
-
-    def __eq__(self, other):
-        self._star()
-        return dict.__eq__(self, other)
-
-    __hash__ = None
-
-    def __repr__(self):
-        self._star()
-        return dict.__repr__(self)
 
 
 class TestPlanCheckParser(unittest.TestCase):
@@ -1661,92 +1516,6 @@ class TestOrdersFact(unittest.TestCase):
         self.assertEqual(sb.describe_items("platform", [self.orders_fact()]), "switchboard: standing orders for platform")
 
 
-class LabelGh:
-    """`gh api` over issues with labels, in any number of repos: the reads the daemon makes (a list of the open
-    issues with one label) and the writes `decisions` and `labels ensure` make (labels, comments). A runner.
-    A write checks its shape, and records the account's token it ran with."""
-
-    def __init__(self, clock):
-        self.clock, self.issues, self.labels, self.comments = clock, {}, {}, []
-        self.calls, self.envs, self.down, self.fail = [], [], False, set()
-        self.fail_writes = set()   # repos whose writes (not reads) fail
-
-    def issue(self, repo, number, title="an issue", labels=(), body=None, pr=False, author=None):
-        self.issues[(repo, number)] = {"number": number, "title": title, "state": "open", "labels": list(labels),
-                                       "updated_at": sb.iso(self.clock.now() - 60)}
-        if body is not None:
-            self.issues[(repo, number)]["body"] = body
-        if pr:
-            self.issues[(repo, number)]["pull_request"] = {"url": "x"}
-        if author:
-            self.issues[(repo, number)]["user"] = {"login": author}
-
-    def names(self, repo, number):
-        return sorted(self.issues[(repo, number)]["labels"])
-
-    def __call__(self, argv, **kwargs):
-        argv = list(argv)
-        self.calls.append(argv)
-        self.envs.append(kwargs.get("env"))
-        if argv[:2] != [FAKE_GH, "api"]:
-            raise AssertionError("fake gh serves `gh api` only, got %r" % argv)
-        if self.down:
-            return subprocess.CompletedProcess(argv, 1, "", "gh: network unreachable\n")
-        path = argv[2]
-        if any(repo in path for repo in self.fail):
-            return subprocess.CompletedProcess(argv, 1, "", "gh: HTTP 403\n")
-        method = argv[argv.index("--method") + 1] if "--method" in argv else "GET"
-        if method != "GET" and any(repo in path for repo in self.fail_writes):
-            return subprocess.CompletedProcess(argv, 1, "", "gh: HTTP 403\n")
-        data = json.loads(kwargs["input"]) if "input" in kwargs else None
-        if method != "GET" and "--input" in argv and data is None:
-            raise AssertionError("a write passes its body as input")
-        missing = subprocess.CompletedProcess(argv, 1, "", "gh: Not Found (HTTP 404)\n")
-        found = re.match(r"^repos/([^/]+/[^/?]+)/issues\?(.*)$", path)
-        if found and method == "GET":
-            query = dict(pair.partition("=")[::2] for pair in found.group(2).split("&"))
-            label = urllib.parse.unquote(query["labels"]) if "labels" in query else None
-            rows = [dict(i, labels=[{"name": n} for n in i["labels"]]) for (repo, _), i in sorted(self.issues.items())
-                    if repo == found.group(1) and (label is None or label in i["labels"]) and i["state"] == "open"]
-            page = int(query.get("page", "1"))
-            return subprocess.CompletedProcess(argv, 0, json.dumps(rows if page == 1 else []), "")
-        found = re.match(r"^repos/([^/]+/[^/]+)/issues$", path)
-        if found and method == "POST":
-            repo = found.group(1)
-            number = max([n for (r, n) in self.issues if r == repo] + [100]) + 1
-            self.issue(repo, number, data["title"], data.get("labels", ()), data.get("body"))
-            self.issues[(repo, number)]["updated_at"] = sb.iso(self.clock.now())
-            return subprocess.CompletedProcess(argv, 0, json.dumps({"number": number, "html_url": "https://github.com/%s/issues/%d" % (repo, number)}), "")
-        found = re.match(r"^repos/([^/]+/[^/]+)/issues/(\d+)/(labels|comments)(?:/(.+))?$", path)
-        if found:
-            key = (found.group(1), int(found.group(2)))
-            if key not in self.issues:
-                return missing
-            issue = self.issues[key]
-            if found.group(3) == "labels" and method == "POST":
-                issue["labels"] = sorted(set(issue["labels"]) | set(data["labels"]))
-            elif found.group(3) == "labels" and method == "DELETE":
-                name = urllib.parse.unquote(found.group(4))
-                if name not in issue["labels"]:
-                    return missing
-                issue["labels"].remove(name)
-            elif found.group(3) == "comments" and method == "POST":
-                self.comments.append({"repo": key[0], "issue": key[1], "body": data["body"]})
-            else:
-                raise AssertionError("fake gh: no such write %r" % argv)
-            issue["updated_at"] = sb.iso(self.clock.now())
-            return subprocess.CompletedProcess(argv, 0, json.dumps({"ok": True}), "")
-        found = re.match(r"^repos/([^/]+/[^/]+)/labels(?:/(.+))?$", path)
-        if found:
-            repo = found.group(1)
-            have = self.labels.setdefault(repo, {})
-            if method == "GET":
-                name = urllib.parse.unquote(found.group(2))
-                return subprocess.CompletedProcess(argv, 0, json.dumps({"name": name}), "") if name in have else missing
-            if method == "POST" and not found.group(2):
-                have[data["name"]] = data
-                return subprocess.CompletedProcess(argv, 0, json.dumps(data), "")
-        raise AssertionError("fake gh: no route for %r" % (argv,))
 
 
 class TestInstallMakesTheOrdersTemplate(InstallCase):
@@ -2323,7 +2092,7 @@ class TestCloudWatchTick(unittest.TestCase):
     def test_U2_no_directory_no_error_no_directory_created(self):
         calls = self.finish()
         self.assertEqual(calls["tick"], 1)
-        self.assertEqual(self.audit, [])
+        self.assertEqual([a for a in self.audit if str(a[1]).startswith("cloud-watch")], [])   # the watch says nothing; other daemon notes (the push watch) are not its business
         self.assertFalse(self.dir.exists())
 
 

@@ -35,6 +35,9 @@ def review_lane_send_problem(config, recipient, sender):
             return None
         review = next(e["review"] for e in entries if e.get("kind") == "lane_session" and e.get("session") == recipient)
         rnd = _round_of(entries, review)
+        if not rnd.get("plan_hashes"):
+            return "%s is a reviewer lane of a plan review round that predates the hash pair, held open: it takes no message from an agent" % recipient   # #1713
+        entries, rnd = _canon_round(entries, rnd)   # #1713
         if plan_review.lineage_state([e for e in entries if e.get("lineage") == rnd["lineage"]], rnd["plan_hash"])["open_review"]:
             return "%s is a reviewer lane of the open plan review %s: it takes no message from an agent" % (recipient, review)
     except Exception:
@@ -135,6 +138,19 @@ def _round_of(entries, review):
     return rounds[-1]
 
 
+def _round_pair(rnd):
+    """(#1713) The round's own pair of hashes of its text: the stored `plan_hashes`. A round that predates it has none and is refused (the plan is never read)."""
+    if not rnd.get("plan_hashes"):
+        raise ReviewError("this round predates the hash pair: start a new round")
+    return tuple(rnd["plan_hashes"])
+
+
+def _canon_round(entries, rnd):
+    """(#1713) The entries and the round with every plan hash that is a member of the round's pair mapped to the NEW one; any other stays."""
+    pair = _round_pair(rnd)
+    return plan_ledger.as_current(entries, pair), dict(rnd, plan_hash=load_plan_check().canonical_hash(rnd["plan_hash"], pair))
+
+
 def _sessions_of(entries, review, number):
     return {e["lane"]: e["session"] for e in entries if e.get("kind") == "lane_session" and e.get("review") == review
             and e.get("round") == number}
@@ -229,6 +245,7 @@ def review_start(args, runner, now, socket_call=None):
         chosen.update(review="rv%d" % seq, tier=tier, why=tier_why, lanes=lanes)   # the id comes from the appended sequence number
         return {"kind": "round", "lineage": lineage, "review": chosen["review"], "round": 1, "closing": False, "start": True,
                 "ask_number": ask_number, "plan_ref": plan_ref, "plan_hash": plan_hash, "scenario_hash": result.get("scenario_hash"),
+                "plan_hashes": list(result.get("plan_hashes") or ()),
                 "tier": tier, "tier_why": tier_why, "lanes": lanes, "held_area": bool(hits), "by": planner}
 
     stored = plan_ledger.append_checked(state, now(), decide)
@@ -263,6 +280,7 @@ def review_verdict(args, runner, now, socket_call=None):
     entries = review_entries(state)
     _refuse_if_abandoned(entries, args.review)
     rnd = _round_of(entries, args.review)
+    _round_pair(rnd)   # #1713: a round that predates the hash pair is refused before anything is recorded
     caller = identify_caller(engine.herdr, engine.v2, os.environ)
     sessions = _sessions_of(entries, args.review, rnd["round"])
     if sessions.get(args.lane) != caller:
@@ -305,10 +323,12 @@ def _closing_outcome(engine, state, cfg, config, runner, now, review):
     ledger alone; the consensus is bound to the final plan hash."""
     entries = review_entries(state)
     rnd = _round_of(entries, review)
+    _pair = _round_pair(rnd)   # #1713: a round that predates the hash pair is refused; the stored-vs-stored compares below read both sides in the round's own form
     if _abandoned(entries, review):
         return {}
     if not rnd.get("closing") or any(l not in _verdicts_of(entries, review, rnd["round"]) for l in rnd["lanes"]):
         return {}
+    entries, rnd = _canon_round(entries, rnd)
     lineage = [e for e in entries if e.get("lineage") == rnd["lineage"]]
     st = plan_review.lineage_state(lineage, rnd["plan_hash"])
     lane_entries = [e for e in lineage if e.get("kind") == "lane"]
@@ -322,6 +342,7 @@ def _closing_outcome(engine, state, cfg, config, runner, now, review):
     def write(ledger, seq):
         """Under the lock, from the ledger as it stands: the same tally, and not twice for one hash."""
         _refuse_if_abandoned(ledger, review)
+        ledger = plan_ledger.as_current(ledger, _pair)   # #1713
         mine = [e for e in ledger if e.get("lineage") == rnd["lineage"]]
         again, _ = plan_review.decide_consensus([e for e in mine if e.get("kind") == "lane"], rnd["lanes"], rnd["plan_hash"],
                                                 rounds_left=plan_review._rounds_left(plan_review.lineage_state(mine, rnd["plan_hash"])))
@@ -353,6 +374,7 @@ def review_close(args, runner, now, socket_call=None):
     entries = review_entries(state)
     _refuse_if_abandoned(entries, args.review)
     rnd = _round_of(entries, args.review)
+    _round_pair(rnd)   # #1713: a round that predates the hash pair is refused first, nothing recorded
     if planner != rnd["by"] and planner != "owner":
         raise ReviewError("refused: only the planner who started the review (%s) closes it" % rnd["by"])
     missing = [l for l in rnd["lanes"] if l not in _verdicts_of(entries, args.review, rnd["round"])]
@@ -374,9 +396,11 @@ def review_close(args, runner, now, socket_call=None):
     if not plan_review.session_budget_ok(used, len(lanes), cfg["session_cap"]):
         raise ReviewError("refused: the lineage has used %d of its %d lane sessions" % (used, cfg["session_cap"]))
     plan_ref = "%s#%d" % (plan_repo, plan_number)
+    _pair = rnd.get("plan_hashes")   # #1713: a round that predates the pair has none; its entries are then compared as they are
 
     def decide(ledger, seq):
         _refuse_if_abandoned(ledger, args.review)
+        ledger = plan_ledger.as_current(plan_ledger.as_current(ledger, _pair), result.get("plan_hashes"))   # #1713: both forms of the round's and of the final text
         mine = [e for e in ledger if e.get("lineage") == rnd["lineage"]]
         later = [e for e in ledger if e.get("kind") == "round" and e.get("review") == args.review and e.get("round") > rnd["round"]]
         if later:
@@ -387,6 +411,7 @@ def review_close(args, runner, now, socket_call=None):
         return {"kind": "round", "lineage": rnd["lineage"], "review": args.review, "round": rnd["round"] + 1, "closing": True,
                 "ask_number": rnd.get("ask_number"), "plan_ref": plan_ref, "plan_hash": result["plan_hash"],
                 "scenario_hash": result.get("scenario_hash"), "tier": rnd["tier"], "lanes": lanes,
+                "plan_hashes": list(result.get("plan_hashes") or ()),
                 "held_area": rnd.get("held_area", False), "by": rnd["by"]}
 
     stored = plan_ledger.append_checked(state, now(), decide)
@@ -441,6 +466,7 @@ def review_status(args, runner, now):
     state = ensure_state_dir()
     entries = review_entries(state)
     rnd = _round_of(entries, args.review)
+    entries, rnd = _canon_round(entries, rnd)   # #1713
     mine = [e for e in entries if e.get("lineage") == rnd["lineage"]]
     st = plan_review.lineage_state(mine, rnd["plan_hash"])
     sessions, verdicts = _sessions_of(entries, args.review, rnd["round"]), _verdicts_of(entries, args.review, rnd["round"])
@@ -467,6 +493,7 @@ def review_respond(args, runner, now, socket_call=None):
     entries = review_entries(state)
     _refuse_if_abandoned(entries, args.review)
     rnd = _round_of(entries, args.review)
+    _pair = _round_pair(rnd)   # #1713: a round that predates the hash pair is refused before anything else
     if planner != rnd["by"] and planner != "owner":
         raise ReviewError("refused: only the planner who started the review (%s) answers it" % rnd["by"])
     verdicts = _verdicts_of(entries, args.review, rnd["round"])
@@ -474,6 +501,8 @@ def review_respond(args, runner, now, socket_call=None):
     if missing:
         raise ReviewError("refused: lanes %s have not reported for round %d" % (", ".join(missing), rnd["round"]))
     mine = [e for e in entries if e.get("lineage") == rnd["lineage"]]
+    mine = plan_ledger.as_current(mine, _pair)
+    rnd = _canon_round(entries, rnd)[1]
     st = plan_review.lineage_state(mine, rnd["plan_hash"])
     if not st["open_blocking"]:
         raise ReviewError("nothing blocking is open: the next step is the closing round (`plan review close`), not another round")
@@ -492,7 +521,7 @@ def review_respond(args, runner, now, socket_call=None):
     text, label, result = load_plan(ns, runner, now)
     if result["result"] != "pass":
         raise ReviewError("the new revision fails `plan check` (%d defect(s))" % len(result["defects"]))
-    if result["plan_hash"] == rnd["plan_hash"]:
+    if result["plan_hash"] == load_plan_check().canonical_hash(rnd["plan_hash"], result.get("plan_hashes")):
         raise ReviewError("the revision has the same plan hash: a new round needs a changed plan")
     plan_repo, plan_number, _ = parse_plan_source(args.plan_ref, config.get("intent_repo"))
     ask_repo, _, ask_number = rnd["lineage"].rpartition("#")
@@ -518,6 +547,7 @@ def review_respond(args, runner, now, socket_call=None):
         later = [e for e in entries if e.get("kind") == "round" and e.get("review") == args.review and e.get("round") > rnd["round"]]
         if later:
             raise ReviewError("refused: round %d of this review is already open" % later[-1]["round"])
+        entries = plan_ledger.as_current(entries, _pair)   # #1713
         now_state = plan_review.lineage_state([e for e in entries if e.get("lineage") == rnd["lineage"]], rnd["plan_hash"])
         allowed, why_not = plan_review.may_open_round(now_state)
         if not allowed:
@@ -525,6 +555,7 @@ def review_respond(args, runner, now, socket_call=None):
         return {"kind": "round", "lineage": rnd["lineage"], "review": args.review, "round": rnd["round"] + 1, "closing": False,
                 "ask_number": rnd.get("ask_number"), "plan_ref": plan_ref, "plan_hash": result["plan_hash"],
                 "scenario_hash": result.get("scenario_hash"), "tier": rnd["tier"], "lanes": lanes,
+                "plan_hashes": list(result.get("plan_hashes") or ()),
                 "held_area": rnd.get("held_area", False), "by": rnd["by"]}
 
     stored = plan_ledger.append_checked(state, now(), decide)
@@ -638,6 +669,7 @@ def review_decide(args, runner, now):
 
     def build(entries, seq):
         _refuse_if_abandoned(entries, args.review)
+        _round_pair(_round_of(entries, args.review))   # #1713: a round that predates the hash pair is refused, nothing recorded
         escalations = _escalations(entries, args.review)
         esc = escalations.get(args.objection)
         if esc is None:
@@ -665,6 +697,7 @@ def review_decide(args, runner, now):
         mine = [e for e in entries if e.get("review") == args.review]
         accepted = [e for e in mine if e.get("kind") == "decision" and e.get("action") == "accept"]
         rnd = _round_of(entries, args.review)
+        entries, rnd = _canon_round(entries, rnd)   # #1713: both sides in the round's own form
         # the last open objection was overridden and nothing awaits a revision: the consensus is written, marked overridden
         if not accepted or accepted[-1]["seq"] < max(e["seq"] for e in mine if e.get("kind") == "escalation"):
             if not _abandoned(entries, args.review) and not any(e.get("kind") == "consensus" and e.get("plan_hash") == rnd["plan_hash"] for e in entries):
@@ -694,11 +727,19 @@ def review_tick(args, runner, now, socket_call=None):
     engine, state, _ = build_engine(runner, now, "cli", writable=True, socket_call=socket_call)
     entries = review_entries(state)
     done = {"relaunched": [], "unavailable": [], "reminded": []}
+    done["skipped"] = []   # #1713
     reviews = sorted({e["review"] for e in entries if e.get("kind") == "round"})
     for review in reviews:
         rnd = _round_of(entries, review)
+        if not rnd.get("plan_hashes"):   # #1713: one round without the pair never aborts the others: skipped and named
+            done["skipped"].append("skipped: %s: this round predates the hash pair" % review)
+            continue
+        rnd_stored, _pair = rnd, _round_pair(rnd)   # #1713
+        rnd = _canon_round(entries, rnd)[1]
         mine = [e for e in entries if e.get("lineage") == rnd["lineage"]]
+        mine = plan_ledger.as_current(mine, _pair)
         st = plan_review.lineage_state(mine, rnd["plan_hash"])
+        rnd = rnd_stored   # the lane's brief keeps the hash its round was given
         if not st["open_review"]:
             continue
         sessions = [e for e in entries if e.get("kind") == "lane_session" and e.get("review") == review and e.get("round") == rnd["round"]]
@@ -810,3 +851,13 @@ def cmd_plan_review(args, runner, now, socket_call=None):
         for key, value in done.items():
             print("%s: %s" % (key, value if not isinstance(value, (list, dict)) else json.dumps(value, sort_keys=True)))
     return EXIT_OK
+
+
+def cmd_plan_apply(args, runner, now, fleet_mark):
+    """`plan apply`: the work is the section `plan apply (#1789)` at the end of plan_input.py; this passes it the caller and the engine's reader, and prints."""
+    engine, _, _ = build_engine(runner, now, "cli")
+    caller = identify_caller(engine.herdr, engine.v2, os.environ)
+    code, text = apply_run(args, caller, engine.intents._api, str(engine.state_dir), engine.audit, fleet_mark)
+    if text:
+        (sys.stdout if code == 0 else sys.stderr).write(text.rstrip("\n") + "\n")
+    return code

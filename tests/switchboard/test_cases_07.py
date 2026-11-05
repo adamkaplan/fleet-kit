@@ -1348,7 +1348,7 @@ class TestPlanCheckCommand(Base):
         second = json.loads(self.run_cmd("acme/app#7", "--json")[1])
         self.assertEqual(second["scenario_hash"], first["scenario_hash"])
         self.assertNotEqual(second["plan_hash"], first["plan_hash"])
-        self.issue["body"] = GOOD_PLAN.replace("Commissioning works.", "Commissioning   works.\n\n")
+        self.issue["body"] = GOOD_PLAN.replace("Commissioning works.", "Commissioning works.  ")
         self.assertEqual(json.loads(self.run_cmd("acme/app#7", "--json")[1])["plan_hash"], first["plan_hash"], "whitespace only")
         code, out, err = self.run_cmd("acme/app#7")
         self.assertIn("scenario hash:", out)
@@ -1501,7 +1501,7 @@ class TestHeavySlots(Base):
 
     def env(self, **more):
         env = dict(os.environ, XDG_STATE_HOME=str(self.dir), FLEET_HEAVY_REPORT_SECONDS="0.3", PATH=os.environ["PATH"])
-        for key in ("FLEET_HEAVY_SLOT", "FLEET_HEAVY", "CI"):   # the suite may itself run in a slot, under FLEET_HEAVY=off, or in CI: these tests are about the slots
+        for key in ("FLEET_HEAVY_SLOT", "FLEET_HEAVY", "CI", "CW_AUDIT_RUNTIME_ID"):   # the suite may itself run in a slot, under FLEET_HEAVY=off, or in CI: these tests are about the slots
             env.pop(key, None)
         env.update(more)
         return env
@@ -1729,9 +1729,9 @@ class TestHeavySlots(Base):
         env = self.env(PATH="%s:%s" % (fake, os.environ["PATH"]))
         self.assertEqual(self.start("true", env=env).wait(timeout=90), 0)
         self.assertEqual(record.read_text().strip(), "-b", "run as taskpolicy -b <command>")
-        self.assertEqual(self.hs.command_prefix(lambda n: "/x/taskpolicy" if n == "taskpolicy" else "/x/nice"), ["/x/taskpolicy", "-b"])
-        self.assertEqual(self.hs.command_prefix(lambda n: "/x/nice" if n == "nice" else None), ["/x/nice", "-n", "10"])
-        self.assertEqual(self.hs.command_prefix(lambda n: None), [])
+        self.assertEqual(self.hs.command_prefix(lambda n: "/x/taskpolicy" if n == "taskpolicy" else "/x/nice", {}), ["/x/taskpolicy", "-b"])
+        self.assertEqual(self.hs.command_prefix(lambda n: "/x/nice" if n == "nice" else None, {}), ["/x/nice", "-n", "10"])
+        self.assertEqual(self.hs.command_prefix(lambda n: None, {}), [])
         # and with no taskpolicy the real nice runs it at a lower priority
         stub = self.home / "nobin"
         stub.mkdir()

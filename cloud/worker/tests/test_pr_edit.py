@@ -49,6 +49,22 @@ class H(http.server.BaseHTTPRequestHandler):
     do_POST = do_PUT = do_DELETE = do_PATCH
 
 
+CONST = 'BRANCH_SOURCE = "/proc/1/environ"'
+
+
+def bound_client(directory, name, branch, text=None):
+    """A copy of the client whose BRANCH_SOURCE names a scratch file 'CW_BRANCH=<branch>' (the pod's /proc/1/environ is never read)."""
+    src = text if text is not None else open(CW_GH).read()
+    assert src.count(CONST) == 1
+    env = os.path.join(directory, name + ".environ")
+    with open(env, "wb") as f:
+        f.write(b"CW_BRANCH=" + branch.encode() + b"\0")
+    out = os.path.join(directory, name)
+    with open(out, "w") as f:
+        f.write(src.replace(CONST, "BRANCH_SOURCE = %r" % env, 1))
+    return out
+
+
 def pr(head=BRANCH, base=REPO, body="PLAN: x\nMERGE: captain\n\nold", head_repo=REPO):
     return {"head": {"ref": head, "repo": {"full_name": head_repo}}, "base": {"repo": {"full_name": base}}, "body": body}
 
@@ -70,6 +86,7 @@ class T(unittest.TestCase):
         subprocess.run(["git", "init", "-q", cls.work], check=True)
         subprocess.run(["git", "-C", cls.work, "remote", "add", "origin", "https://github.com/%s.git" % REPO], check=True)
         cls.addClassCleanup(cls.srv.shutdown)
+        cls.cw = bound_client(cls.tmp.name, "cw-gh-bound", BRANCH)
 
     def setUp(self):
         PRS.clear()
@@ -91,7 +108,8 @@ class T(unittest.TestCase):
         r = subprocess.run(["sh", GUARD, "gh"] + line.split(), capture_output=True, text=True, env=env, timeout=30)
         return r
 
-    def client(self, line, script=CW_GH, extra=None):
+    def client(self, line, script=None, extra=None):
+        script = script or self.cw
         H.seen = []
         env = {"PATH": "/usr/bin:/bin", "CW_GH_API_BASE": self.base, "GH_TOKEN": TOKEN, "HOME": "/nonexistent", "CW_BRANCH": BRANCH}
         env.update(extra or {})
@@ -99,7 +117,7 @@ class T(unittest.TestCase):
         self.assertNotIn(TOKEN, r.stdout + r.stderr)
         return r
 
-    def edit(self, n, f=None, script=CW_GH):
+    def edit(self, n, f=None, script=None):
         return self.client("pr edit %d --body-file %s" % (n, f or self.hold), script)
 
     # S2, S5
@@ -182,7 +200,7 @@ class T(unittest.TestCase):
 
     def test_a_pull_request_the_pod_created_is_recorded_and_allowed(self):
         rec = os.path.join(self.tmp.name, "rec2")
-        PRS[11] = pr(head="another")
+        PRS[11] = pr(head=BRANCH)
         r = self.client("pr edit 11 --body-file " + self.hold, extra={"CW_PR_RECORD": rec})
         self.assertEqual(r.returncode, 3)
         open(rec, "w").write("11\n")
@@ -220,17 +238,17 @@ class T(unittest.TestCase):
         self.assertIn(r.returncode, (0, 128))
 
     # S6, S9: mutants
-    def mutant(self, old, new, script=CW_GH):
-        src = open(script).read()
+    def mutant(self, old, new, script=None):
+        src = open(script or self.cw).read()
         self.assertIn(old, src)
         p = os.path.join(self.tmp.name, "mut-" + str(abs(hash(old + new))))
         open(p, "w").write(src.replace(old, new, 1))
         return p
 
     def test_mutants_of_the_client_each_fail_the_checks(self):
-        m = self.mutant('or recorded(n)):\n        raise refused("pr-edit-other-number")', 'or True):\n        raise refused("pr-edit-other-number")')
+        m = self.mutant('or not (mine and head == mine):', 'or False:')
         self.assertEqual(self.edit(8, script=m).returncode, 0)   # allows any number (the true build: 3)
-        src = open(CW_GH).read()
+        src = open(self.cw).read()
         for name, old, new, probe in (
             ("title edit", 'if len(args) != 3 or args[1] != "--body-file" or not args[0].isdigit():', "if False:", "pr edit 7 --body-file %s --title x" % self.hold),
             ("inline body", 'if a in ("--body", "-b") or a.startswith(("--body=", "-b")):', "if False:", "pr edit 7 --body-file %s --body x" % self.hold),
@@ -248,9 +266,23 @@ class T(unittest.TestCase):
                 self.assertIn("refused: " + row, t.stderr)
 
     def test_mutant_that_skips_the_own_check_edits_another_pull_request(self):
-        m = self.mutant('if base_repo.lower() != repo.lower() or not ((mine and head == mine) or recorded(n)):', "if False:")
+        m = self.mutant('if base_repo.lower() != repo.lower() or not (mine and head == mine):', "if False:")
         self.assertEqual(self.edit(8, script=m).returncode, 0)
         self.assertEqual(self.edit(8).returncode, 3)
+
+    def test_control_a_hostile_pid1_branch_is_never_used(self):
+        # the pod's /proc/1/environ simulated by a hostile scratch file; the test's own source file holds the test's branch
+        hostile = bound_client(self.tmp.name, "cw-gh-hostile", "hostile-branch-in-pid1")
+        ok = self.edit(7)   # source: the scratch file with BRANCH
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        own_patches = len(patches())
+        self.assertEqual(own_patches, 1)
+        self.assertNotIn("hostile-branch-in-pid1", ok.stdout + ok.stderr)
+        bad = self.edit(7, script=hostile)   # mutant: the source left at the hostile file
+        self.assertEqual(bad.returncode, 3)
+        self.assertIn("pr-edit-other-number", bad.stderr)
+        self.assertEqual(len(patches()), 0)
+        print("BRANCH_SOURCE: tests pass with a hostile pid-1 branch %d of 1" % (1 if ok.returncode == 0 and own_patches == 1 else 0))
 
     def test_mutants_of_the_guard_each_fail(self):
         src = open(GUARD).read()

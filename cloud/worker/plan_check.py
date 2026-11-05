@@ -868,10 +868,84 @@ def content_hash(scenarios, clauses, text=""):
     return "sha256:" + hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
-def plan_hash(text):
-    """sha256 of the WHOLE plan text, whitespace collapsed. Approval (G0c) and consensus (G0b) bind to this one: an edit
-    to constraints, scope or risks changes it as well as an edit to a scenario."""
+_TRAILING_MARKER = re.compile(r"<!-- fleet-switchboard:from=[^\s>]+ -->")
+
+
+def plan_hash_legacy(text):
+    """The old formula: sha256 of the WHOLE plan text, whitespace collapsed (the trailing marker line included)."""
     return "sha256:" + hashlib.sha256(" ".join((text or "").split()).encode("utf-8")).hexdigest()
+
+
+def _without_trailing_marker(text):
+    """(#1713) The text without ONE trailing marker line (the last non-blank line, only when it is exactly the marker)."""
+    lines = (text or "").rstrip().split("\n")
+    if lines and _TRAILING_MARKER.fullmatch(lines[-1].strip()):
+        return "\n".join(lines[:-1])
+    return text or ""
+
+
+def plan_hash_collapsed(text):
+    """(#1834) The form of #1713: whitespace collapsed, the trailing marker removed."""
+    return "sha256:" + hashlib.sha256(" ".join(_without_trailing_marker(text).split()).encode("utf-8")).hexdigest()
+
+
+def plan_hashes(text):
+    """(new, collapsed without marker, oldest collapsed with marker), duplicates removed, in that order."""
+    out = []
+    for h in (plan_hash(text), plan_hash_collapsed(text), plan_hash_legacy(text)):
+        if h not in out:
+            out.append(h)
+    return tuple(out)
+
+
+def canonical_hash(stored, hashes):
+    """The NEW hash when `stored` is a member of `hashes`; `stored` itself otherwise."""
+    return hashes[0] if hashes and stored in hashes else stored
+
+
+def plan_hash(text):
+    """sha256 of the plan text with its LINE STRUCTURE kept and ONE trailing marker line removed first. Ignored: spaces and tabs at the end of a line, the CR of a CRLF pair, blank lines at the start and the end of the text. Anything else changes it."""
+    text = _without_trailing_marker(text)
+    lines = [l.rstrip(" \t") for l in text.replace("\r\n", "\n").split("\n")]
+    while lines and not lines[0]:
+        lines.pop(0)
+    while lines and not lines[-1]:
+        lines.pop()
+    return "sha256:" + hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
+
+
+# The words that say a plan reads or produces something (ask #1455): the one table of the `no-failure-mode` warning.
+FAILURE_TRIGGER_WORDS = ("read", "reads", "reader", "feed", "producer", "guard", "scan", "derive", "derived")
+FAILURE_SCENARIO_RE = re.compile(r"\b(?:missing|corrupt|corrupted|unreadable|absent)\b", re.IGNORECASE)
+
+
+def prose_of(text):
+    """The plan text without the lines inside its scenarios block (the whole text when it has none)."""
+    text = text or ""
+    for start, inner in fenced_blocks(text):
+        first = next((l for l in inner if l.strip() and not l.lstrip().startswith("#")), None)
+        if first is not None and first.strip() == "scenarios:":
+            lines = text.splitlines()
+            return "\n".join(lines[:start] + lines[start + len(inner):])
+    return text
+
+
+def failure_mode_warning(scenarios, text):
+    """A warning (never a defect, never in the hash) when the plan's text speaks of reading or producing something and no scenario
+    speaks of a missing, corrupt, unreadable or absent input. Only for a plan that has scenarios."""
+    if not scenarios:
+        return None
+    # the trigger words are searched in the plan's prose (the text outside the scenarios block) and in each scenario's `text`
+    # field; a `pass`, `discriminates`, `proof`, `evaluator`, `covers` or `claim` line says what a verdict quotes, not what the plan reads
+    searched = [prose_of(text)] + [str(s.get("text", "")) for s in scenarios]
+    if not re.search(r"\b(?:%s)\b" % "|".join(FAILURE_TRIGGER_WORDS), "\n".join(searched), re.IGNORECASE):
+        return None
+    # the same by-field-key method as the trigger side: only a scenario's `text` says what it covers; a failure word in a `pass`,
+    # `discriminates`, `proof`, `evaluator`, `covers` or `claim` line is a verdict's wording and never clears the warning
+    if any(FAILURE_SCENARIO_RE.search(str(s.get("text", ""))) for s in scenarios):
+        return None
+    return {"id": "-", "code": "no-failure-mode", "message": "no-failure-mode: the plan reads or produces something but no scenario "
+            "covers an input that is missing, corrupt or unreadable: add one (the output says so and the last good output is kept)"}
 
 
 # ----------------------------------------------------------------------------------- the whole check
@@ -907,6 +981,9 @@ def check(text, done_when, plan_done_when=None):
                           "joined in order they must reproduce the Done-when text (case, spacing, punctuation and `(n)` "
                           "numbers are ignored). First difference: %s. The ask has: %r" % ((first_difference(declared, clauses, done_when) or "the clauses differ"), _normal(done_when)[:160])})
     defects, warnings = validate(scenarios, clauses, text)
+    warning = failure_mode_warning(scenarios, text)
+    if warning:
+        warnings.append(warning)
     defects = [d for d in defects if not (extra and d["code"] == "no-done-when")] + extra
     if declared is None and len(clauses) == 1 and len(re.findall(r"[;,]", clauses[0])) >= 3 and not re.search(r"\([0-9]+\)", done_when or ""):
         warnings.append({"id": "-", "code": "one-clause-many-parts", "message": "the Done-when counts as 1 clause but has %d "
@@ -919,7 +996,7 @@ def check(text, done_when, plan_done_when=None):
                             "message": "the plan states %d Done-when clause(s) but the ask has %d, or they differ: the ask's "
                                        "Done-when is the authority, copy it exactly" % (len(own), len(clauses))})
     return {"result": "fail" if defects else "pass", "scenario_hash": content_hash(scenarios, clauses, text),
-            "plan_hash": plan_hash(text), "scenarios": len(scenarios), "clauses": clauses, "defects": defects,
+            "plan_hash": plan_hash(text), "plan_hashes": plan_hashes(text), "scenarios": len(scenarios), "clauses": clauses, "defects": defects,
             "warnings": warnings}
 
 
@@ -990,6 +1067,7 @@ EXPLAIN = {
     "discriminates-overlap": ("`discriminates` reuses most words of `pass`: it should name a wrong build", "name what the wrong build does"),
     "many-scenarios": ("a plan with many scenarios is hard to review", "split it into slices"),
     "no-constraint-list": ("PC-n scenarios cannot be checked without a constraints list", "add `PC-<n>: ...` lines to the plan"),
+    "no-failure-mode": ("the plan reads or produces something but no scenario covers an input that is missing, corrupt or unreadable", "add a scenario: the output says so and the last good output is kept"),
     "one-clause-many-parts": ("a one-sentence Done-when with many parts counts as one clause", "declare the clauses in a `clauses:` block"),
 }
 

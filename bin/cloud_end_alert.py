@@ -113,15 +113,36 @@ def record_name_of(worker, dirname):
 
 def pushed_text(record_dir, parse):
     """`yes`, `no` or `unknown` from the run record's end_hook; never the branch."""
+    # Now (ask #2056) the answer is one of four fixed phrases, read only from the run record's end_hook: `head is on branch NAME`,
+    # `unpushed work saved to NAME`, `nothing unpushed` or `unknown`. NAME is checked like a branch name.
     run = read_small(os.path.join(record_dir, "run.json"), parse) if record_dir else None
     hook = run.get("end_hook") if run else None
     if not isinstance(hook, dict) or not isinstance(hook.get("pushed"), bool):
         return "unknown"
-    return "yes" if hook["pushed"] else "no"
+    def name(v):
+        return v if isinstance(v, str) and len(v) <= 100 and re.fullmatch(r"[A-Za-z0-9._/-]+", v) and not re.search(r"sk-|gh[opsu]_|github_pat|AKIA|xox|eyJ|[A-Za-z0-9]{30}", v) else None
+    head, wip = hook.get("head_on"), hook.get("wip_branch")
+    if head is not None and head != "unknown" and not hook["pushed"]:
+        return "head is on branch " + name(head) if name(head) else "unknown"
+    if hook["pushed"]:
+        return "unpushed work saved to " + name(wip) if name(wip) else "unknown"
+    if head is None and wip is None and not hook.get("error"):
+        return "nothing unpushed"
+    return "unknown"
+
+
+def pr_line(record_dir, parse):
+    """The end-hook ask: the one line the end hook recorded about the pull request, only if it is one of the fixed forms; else a fixed unknown."""
+    run = read_small(os.path.join(record_dir, "run.json"), parse) if record_dir else None
+    hook = run.get("end_hook") if run else None
+    note = hook.get("pr_note") if isinstance(hook, dict) else None
+    if isinstance(note, str) and len(note) <= 120 and re.fullmatch(r"PR (#[0-9]{1,9} marked ready(, review requested|, no review comment is configured)|not marked ready: [A-Za-z0-9 #(),._-]+)", note):
+        return note
+    return "PR not marked ready: no answer recorded"
 
 
 def message_text(worker, label, when, pushed, record_name, kept=False, failure=None):
-    text = ("[cloud worker ended] %s was ended by the launcher: reason %s; at %s; work pushed: %s; run record: %s."
+    text = ("[cloud worker ended] %s was ended by the launcher: reason %s; at %s; %s; run record: %s."
             % (worker, label, when, pushed, record_name or "unknown"))
     if kept:
         text += " The end hook could not push: the pod was kept and the work may be unpushed."
@@ -130,8 +151,22 @@ def message_text(worker, label, when, pushed, record_name, kept=False, failure=N
     return text
 
 
-def scan_audit(audit_file, state_file, cloud_dir, last_reports, send, parse, audit=None):
-    """One pass. `send(recipient, text)` is the daemon's own send path. Returns [(recipient, text)] handed to it."""
+def chief_not_needed(cause, ok, pushed):
+    """#2202: True for an end that needs nothing from the Chief of Staff: a clean reason (idle or hard limit), the stop done, and nothing unpushed."""
+    return cause in ("idle", "hard") and ok is True and pushed == "nothing unpushed"
+
+
+def retired_boss(cloud_dir, worker, parse):
+    """The boss kept at a worker's removal (<state>/cloud-boss/<worker>.json, bin/cloud_retired.py keep_boss, #1546), or None."""
+    found = read_small(os.path.join(os.path.dirname(str(cloud_dir).rstrip("/")), "cloud-boss", worker + ".json"), parse)
+    if isinstance(found, dict) and found.get("worker") == worker and isinstance(found.get("boss"), str):
+        return found["boss"]
+    return None
+
+
+def scan_audit(audit_file, state_file, cloud_dir, last_reports, send, parse, audit=None, last_text=None):
+    """One pass. `send(recipient, text)` is the daemon's own send path. Returns [(recipient, text)] handed to it. `last_text(directory, worker)` (ask #1788)
+    gives (block, None) or (None, why): the boss's copy, not the Chief of Staff's, ends with the pod's last text, framed as untrusted."""
     try:
         size = os.stat(str(audit_file)).st_size
     except OSError:
@@ -177,12 +212,24 @@ def scan_audit(audit_file, state_file, cloud_dir, last_reports, send, parse, aud
             continue
         record = read_small(os.path.join(str(cloud_dir), worker + ".json"), parse)
         boss = record.get("reports_to") if record and record.get("worker") == worker else None
+        if boss is None and not record:
+            boss = retired_boss(cloud_dir, worker, parse)   # the live record is gone: the boss the launcher kept at the removal
         name = record_name_of(worker, record_name)
         pushed = pushed_text(raw_dir(reason), parse) if name else "unknown"
         text = message_text(worker, label, when_text(line.get("ts")), pushed, name, line["ok"] is False)
+        text += " " + pr_line(raw_dir(reason), parse) + "."
         keys.append(key)
         to_list = [CHIEF] + ([boss] if isinstance(boss, str) and AGENT_NAME.fullmatch(boss) and boss != CHIEF else [])
-        out.extend((to, text, worker, label) for to in reversed(to_list))
+        boss_text = text
+        if len(to_list) > 1 and last_text is not None:
+            try:
+                block, why = last_text(raw_dir(reason) if name else "", worker)
+            except Exception as err:
+                block, why = None, type(err).__name__
+            boss_text = text + "\n" + (block if block else "last text not read: %s" % plain((why or "unknown").replace(" ", "_"), 120))
+        if len(to_list) > 1 and chief_not_needed(cause, line["ok"], pushed):
+            to_list = to_list[1:]   # #2202: a clean end with nothing unpushed goes to the boss only
+        out.extend((to, text if to == CHIEF else boss_text, worker, label) for to in reversed(to_list))
     save_state(state_file, offset + cut, keys)
     failed = set()
     for to, text, worker, label in out:

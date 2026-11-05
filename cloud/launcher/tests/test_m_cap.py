@@ -44,7 +44,7 @@ class Cap(tcw.Base):
         brief = self.home / "brief.txt"
         brief.write_text("Build the thing.\n")
         return self.main("launch", name, "--cloud", "--agent", "coder", "--repo", "acme-org/widget-service", "--branch", "main", "--role", "coder",
-                         "--reports-to", lane, "--shape", shape, "--brief-file", str(brief))
+                         "--reports-to", lane, "--boss-unregistered", "the cap test names lanes that no registry holds", "--shape", shape, "--brief-file", str(brief))
 
     def calls(self):
         return len(self.stub_calls()) + len(self.jsonl("kubectl.log")) + len(self.jsonl("login.log"))
@@ -176,13 +176,16 @@ class TestScratch(unittest.TestCase):
         os.makedirs(os.path.join(d, "cloud", "launcher", "tests"), exist_ok=True)
         shutil.copy(__file__, os.path.join(d, "cloud", "launcher", "tests"))
         shutil.copy(ROOT / "cloud" / "launcher" / "tests" / "fake_opencode_export.sh", os.path.join(d, "cloud", "launcher", "tests"))
+        shutil.copy(ROOT / "cloud" / "launcher" / "tests" / "cw_cases_lookup.py", os.path.join(d, "cloud", "launcher", "tests"))
+        shutil.copy(ROOT / "cloud" / "launcher" / "tests" / "cw_cases_vault.py", os.path.join(d, "cloud", "launcher", "tests"))
         Path(d, "bin", "cloud_worker.py").write_text(src)
         env = dict(os.environ, TMPDIR=d)
         if old:
             env[OLD_ONLY] = "1"
         argv = [sys.executable, os.path.join(d, "cloud", "launcher", "tests", Path(__file__).name), "TestScenarios." + test]
-        p = stub_support.start(self, argv, cwd=d, env=env, stdout=open(os.path.join(d, "out.txt"), "w"), stderr=open(os.path.join(d, "err.txt"), "w"))
-        code = p.wait(timeout=90)
+        with open(os.path.join(d, "out.txt"), "w") as out_f, open(os.path.join(d, "err.txt"), "w") as err_f:
+            p = stub_support.start(self, argv, cwd=d, env=env, stdout=out_f, stderr=err_f)
+            code = p.wait(timeout=90)
         return applied, code, Path(d, "out.txt").read_text() + Path(d, "err.txt").read_text()
 
     def test_s2_the_old_code_accepts_the_sixth_launch(self):
