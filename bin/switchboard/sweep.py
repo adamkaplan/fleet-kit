@@ -390,7 +390,7 @@ def sweep_read_repo(hub, repo, now, window_days, regex, budget, strong):
         if number is not None and _is_pr(record) and not _issue_pr_merged(record) and _label_kind(names, CAPTAIN_MERGE_LABELS[:1] + CAPTAIN_HOLD_LABELS):   # #559: a merged PR is the daemon's to clean, never a finding
             closed_holds[number] = sorted(_label_kind(names, CAPTAIN_MERGE_LABELS[:1] + CAPTAIN_HOLD_LABELS))
     comments, cut = hub.read_comments("sweep", repo, since, cap=COMMENT_WINDOW_PAGES, budget=budget)
-    budget[0] -= sweep_pages_used(comments, cut)
+    budget[0] -= getattr(hub, "_comment_main_pages", None) or sweep_pages_used(comments, cut)   # charge once: gap pages were charged by the gap fill
     truncated = truncated or cut
     for comment in reversed(comments):  # oldest first, so the last N are the newest
         number = _url_number(comment.get("issue_url"))

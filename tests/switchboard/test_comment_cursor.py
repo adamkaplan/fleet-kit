@@ -523,6 +523,19 @@ class TestCommentWindowGapFill(HubCase):
         self.assertEqual(len([u for u in used if u > 30 + 12]), 0)
         self.assertTrue(all(u <= 12 for u in used[1:]))
 
+    def test_a_pass_filling_gap_pages_is_charged_exactly_the_pages_it_read(self):
+        world = AscendingWorld(NOW - 7 * DAY, self.TOTAL)
+        hub = self.hub(world)
+        hub.read_comments("sweep", REPO, self.since, cap=sb.COMMENT_WINDOW_PAGES, budget=[100])
+        budget = [100]
+        before = len(world.requests)
+        comments, cut = hub.read_comments("sweep", REPO, self.since, cap=sb.COMMENT_WINDOW_PAGES, budget=budget)
+        gap = len([p for p in world.requests[before:] if "direction=asc" in p])
+        read = len(world.requests) - before
+        self.assertGreater(gap, 0)
+        budget[0] -= hub._comment_main_pages   # what sweep.py and triage.py charge for the main read
+        self.assertEqual(100 - budget[0], read, msg="charged %d for %d pages read" % (100 - budget[0], read))
+
     def test_a_pass_with_no_budget_reads_no_gap_pages(self):
         world = AscendingWorld(NOW - 7 * DAY, self.TOTAL)
         hub = self.hub(world)

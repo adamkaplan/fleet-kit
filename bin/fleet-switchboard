@@ -11186,6 +11186,7 @@ class GitHubHub:
         have = {k: v for k, v in have.items() if v["created_at"] >= since}
         held[key] = have
         oldest = min((r["created_at"] for r in records if isinstance(r, dict) and isinstance(r.get("created_at"), str)), default=None)
+        self._comment_main_pages = max(1, -(-len(records) // GITHUB_PAGE_SIZE))   # CHARGE-ONCE RULE: the callers charge only this (the main read); the gap fill charges its own pages
         if cut and oldest is not None:
             gaps[key] = oldest   # what lies before this was not read, until the window's start passes it
         if key in gaps:
