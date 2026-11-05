@@ -44,7 +44,7 @@ DEFAULT_DIRECTORY = "/work"   # the session's directory in the pod: the scratch 
 CLOUD_WORKER_AGENT = "worker"   # the agent the image defines (cloud/worker/agents/worker.md): a cloud session always runs it; the local --agent name is only recorded
 # The options of the launcher's `create` that `launch --cloud` hands over: ONE table. Taken from the launcher on main (commit fb4b9f2,
 # cloud/launcher/cloud_worker.py `create`: --shape S|M, --stack); a name here that the launcher does not know makes its create fail (exit 2).
-CREATE_OPTION = {"repo": "--repo", "branch": "--branch", "run_id": "--run-id", "idle": "--idle", "hard": "--hard", "shape": "--shape", "stack": "--stack", "agent": "--agent", "boss": "--boss", "stack_model_secret": "--stack-model-secret"}
+CREATE_OPTION = {"repo": "--repo", "branch": "--branch", "run_id": "--run-id", "idle": "--idle", "hard": "--hard", "shape": "--shape", "stack": "--stack", "agent": "--agent", "boss": "--boss", "stack_model_secret": "--stack-model-secret", "issue": "--issue"}
 LAUNCHER_SHAPES = ("XS", "S", "M", "O")   # the launcher's SHAPES keys (O: the orchestrator row, 250m and 768 MiB, meant for --agent orchestrator; a worker on it is likely to be killed for memory); the launcher's own default (XS; S with --stack; O with --agent orchestrator) applies when --shape is not given
 LAUNCHER_STACK_SHAPES = ("S", "M")   # the rows with stack: true; --stack with another shape is refused here, before any call
 MAX_M_PER_LANE = 4   # the most live shape-M (4 CPU) cloud workers one lane may hold: a lane's batch of 4-CPU pods once filled the cluster and left every other lane's launches unplaceable
@@ -710,6 +710,9 @@ def _launch(args, runner, now, reserve):
     choice = H["launch_model_cloud"](args, MODEL_PROVIDER) if (getattr(args, "model", None) is not None or getattr(args, "reasoning", None) is not None) else {}   # #1642: before any setting, token or cluster call
     source = use_settings()   # before any setting is read: the allow-list, the preflight and the launcher all read this one source
     print("%s: cloud settings from %s" % (H["PROG"], source), file=sys.stderr)
+    issue = getattr(args, "issue", None)
+    if issue is not None and (isinstance(issue, bool) or not isinstance(issue, (int, str)) or not re.fullmatch(r"[1-9][0-9]{0,9}", str(int(issue)) if isinstance(issue, int) else issue)):
+        raise Refusal("--issue %r is not a whole number above 0; nothing was created" % str(issue)[:40])
     check_allowed(repo)   # before anything is read, minted or created
     if getattr(args, "stack", False) and args.shape and args.shape not in LAUNCHER_STACK_SHAPES:   # exact membership in a tuple; after the allow-list, before the preflight, any token or call
         raise Refusal("--shape %r is not a pod shape (%s); nothing was created" % (str(args.shape)[:40], " or ".join(LAUNCHER_STACK_SHAPES)))
@@ -743,6 +746,8 @@ def _launch(args, runner, now, reserve):
     for key, value in (("idle", args.idle), ("hard", args.hard), ("shape", args.shape)):
         if value:
             options += [CREATE_OPTION[key], str(value)]
+    if issue is not None:   # the launcher writes it into the hub entry of a registered worker
+        options += [CREATE_OPTION["issue"], str(int(issue))]
     if args.agent == "orchestrator":   # only on request: a worker launch hands the launcher exactly what it always did
         options += [CREATE_OPTION["agent"], args.agent, CREATE_OPTION["boss"], args.reports_to]
     hub = bool((os.environ.get("CW_HUB_CHANNEL_URL") or "").strip() or (os.environ.get("CW_HUB_REGISTRY_SECRET") or "").strip() or args.agent == "orchestrator")   # the hub setting, or an orchestrator (the launcher registers its entry always: it needs the session)
@@ -853,7 +858,7 @@ def _launch(args, runner, now, reserve):
             if _stop_after_failure(engine, runner, name, run_id, "launch interrupted", cluster):
                 remove_record(state, name)
             raise
-    _registry_note(engine, "upsert", state, name, {"session": session, "repo": repo, "role": args.role, "kind": "cloud", "run_id": run_id, "state": "working"})   # a cloud worker is an agent (#903)
+    _registry_note(engine, "upsert", state, name, {"session": session, "repo": repo, "role": args.role, "kind": "cloud", "run_id": run_id, "state": "working"}, address=record["url"])   # a cloud worker is an agent (#903)
     _first_push()._watch_first_push(state, name, args, repo, branch, brief, now(), record.get("hard_deadline"))   # #2057: the launch's watch for its checkpoint
     print(_limits_note(args, record), file=sys.stderr)   # stderr, before the one JSON line
     print(json.dumps({"name": name, "session": session, "runtime_id": record["runtime_id"], "url": record["url"], "cloud": True}, sort_keys=True))
@@ -954,16 +959,42 @@ def _limits_note(args, record):
     return "launch --cloud: %s, %s, stops at %s" % (limit("idle", args.idle, "idle_seconds"), limit("hard", args.hard, "hard_seconds"), stop)
 
 
-def _registry_note(engine, what, state, name, *args):
+def _endpoint_forms(endpoint):
+    """The endpoint as it may show in a registry or exception text: whole, percent-encoded, and its host part (longest first)."""
+    if not endpoint:
+        return []
+    forms = {endpoint, urllib.parse.quote(endpoint, safe=""), urllib.parse.quote(endpoint)}
+    try:
+        parts = urllib.parse.urlsplit(endpoint)
+        forms.update(x for x in (parts.netloc, parts.hostname) if x)
+    except ValueError:
+        pass
+    return sorted(forms, key=len, reverse=True)
+
+
+def _registry_note(engine, what, state, name, *args, address=""):
     """The cloud launcher and reaper are WRITERS of the agent registry: `upsert` on launch, `retire` once the pod is stopped. The stop itself stays
     this launcher's act; a registry that cannot be written is said in the audit, never raised (the pod's own record is still the launcher's)."""
+    endpoint = str(address or "")
+
+    def say(why):
+        text = str(why)
+        for part in _endpoint_forms(endpoint):
+            text = re.sub(re.escape(part), "<endpoint>", text, flags=re.I)
+        try:
+            text = _scrub_lib()(text)
+        except Exception:
+            text = "unreadable"
+        text = _one(text, 120)
+        _audit(engine, "cloud.registry_error", name, {"why": text})
+        print("registry: %s: %s" % (name, text), file=sys.stderr)
     try:
         registry = H["load_module"]("registry")
         got = registry.upsert(state, name, args[0]) if what == "upsert" else registry.retire(state, name, "cloud-worker", args[0])
         if got["problem"]:
-            _audit(engine, "cloud.registry_error", name, {"why": _one(got["problem"], 120)})
+            say(got["problem"])
     except Exception as err:
-        _audit(engine, "cloud.registry_error", name, {"why": _one(str(err), 120)})
+        say("the registry write failed (%s)" % type(err).__name__)
 
 
 POD_UID_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")   # the form of a pod uid (the launcher's cloud_worker.py holds the equal text: a test compares them)
@@ -1482,4 +1513,52 @@ def cmd_cloud_clear(args, runner, now):
         cleared += 1
     if not cleared and not dry_run:
         print("nothing to clear")
+    return H["EXIT_OK"]
+
+
+# ---------------------------------------------------------------- inspect: what a pod of the caller is doing now (ask #2115, read-only)
+
+INSPECT_SECONDS = 60   # the bound of the launcher's one read (one exec, or the fallback's four)
+
+
+def _inspect_short(body):
+    """ONE line for a notice: 'NAME: running TOOL for Ns | last: TOOL STATUS | idle Ns | branch B, N unpushed, dirty D | last push P'."""
+    def word(value, limit=60):
+        return _one(str(value), limit) if value not in (None, "") else "?"
+    flight, calls, un = body.get("in_flight"), body.get("last_calls") or [], body.get("unpushed")
+    doing = "running %s for %ss" % (word(flight.get("tool")), word(flight.get("seconds"))) if isinstance(flight, dict) else "no call in flight"
+    last = "last: %s %s" % (word(calls[0].get("tool")), word(calls[0].get("status"))) if calls and isinstance(calls[0], dict) else "last: none read"
+    idle = "idle %ss" % word(body.get("idle_seconds")) if body.get("idle_seconds") is not None else "idle ?"
+    git = "branch %s, %s unpushed, dirty %s" % (word(body.get("branch")), word(un.get("count")) if isinstance(un, dict) else "?", word(body.get("dirty")))
+    return "%s: %s | %s | %s | %s | last push %s" % (word(body.get("worker"), 80), doing, last, idle, git, word(body.get("last_push"), 100))
+
+
+@refusals
+def cmd_inspect(args, runner, now):
+    """`inspect NAME [--short]`: the pod's live state (the call in flight, the last calls, the last message, the idle seconds, git, the last push and
+    error), read-only, through the launcher's `inspect`. Only the pod's BOSS may read it (its worker record's `reports_to`): any other caller is refused
+    and the refusal audited. Every text was scrubbed by the launcher before it came here."""
+    LaunchError = H["LaunchError"]
+    if not valid_name(args.name):
+        raise LaunchError("name the worker: `%s inspect <name>`" % H["PROG"])
+    record = route(args.name)
+    if record is None:
+        raise LaunchError("%s has no cloud record" % args.name)
+    engine, state, _ = H["build_engine"](runner, now, "cli")
+    kind = H["gates_caller_kind"](runner, now)
+    if not (kind[0] == "agent" and record.get("reports_to") and kind[1] == record.get("reports_to")):
+        _audit(engine, "cloud.inspect_refused", args.name, {"why": _one(str(kind[1]), 120)})
+        raise LaunchError("refused: only %s's own boss may inspect it" % args.name)
+    try:
+        with Cluster() as cluster:
+            code, body, note = run_launcher(runner, "inspect", args.name, (), INSPECT_SECONDS, cluster=cluster)
+    except CloudError as err:
+        raise LaunchError("%s: nothing was read" % err) from None
+    if code != 0 or not isinstance(body, dict):
+        raise LaunchError("the pod was not read (%s)" % _reason(code, note))
+    if getattr(args, "short", False):
+        print(_inspect_short(body))
+        return H["EXIT_OK"]
+    for key in ("source", "in_flight", "last_calls", "last_text", "idle_seconds", "branch", "unpushed", "dirty", "last_push", "last_error", "missing"):
+        print("%s: %s" % (key, json.dumps(body.get(key), sort_keys=True)))
     return H["EXIT_OK"]
