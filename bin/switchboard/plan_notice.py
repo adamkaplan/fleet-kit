@@ -9,12 +9,15 @@ class PlanWakeState:
 
     def __init__(self, state_dir):
         self.announced, self.facts, self.unapproved, self.problem = {}, {}, [], None
+        self.approved = {}   # #2193: key -> time the plan was first judged approved, kept in PLAN_WAKE_FILE
         self.current, self.delivered, self.dropped, self.repeats = {}, {}, 0, 0   # #1784: the current hash of each issue seen, the keys delivered (key: time), the two counts
         self.newest = {}   # #1542: (repo, number) -> the hash of the newest plan the pass saw, for the delivery re-check
         try:
             raw = json.loads((Path(state_dir) / PLAN_WAKE_FILE).read_text())
             if isinstance(raw, dict) and isinstance(raw.get("announced"), dict):
                 self.announced = {k: v for k, v in raw["announced"].items() if isinstance(k, str) and isinstance(v, (int, float))}
+            if isinstance(raw, dict) and isinstance(raw.get("approved"), dict):
+                self.approved = {k: v for k, v in raw["approved"].items() if isinstance(k, str) and isinstance(v, (int, float))}
         except FileNotFoundError:
             pass
         except (OSError, ValueError) as err:
@@ -153,6 +156,9 @@ def plan_wake_pass(engine, state, repos, now, budget=None):
     wake.unapproved = sorted(listed)
     for old in [k for k, v in wake.announced.items() if now - v > 14 * 86400]:
         del wake.announced[old]
+        changed = True
+    for old in [k for k, v in wake.approved.items() if now - v > 14 * 86400]:
+        del wake.approved[old]
         changed = True
     for old in [k for k, v in wake.facts.items() if now - v[1] > PLAN_WAKE_FACT_KEEP]:
         del wake.facts[old]
