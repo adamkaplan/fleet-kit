@@ -79,7 +79,7 @@ class TestUnconsumedRecord(unittest.TestCase):
         ids = ["i%d" % n for n in range(501)]
         module.write(self.dir, {"steered": ids, "reminders": {}}, record_json.parse_bounded)
         data, _ = module.read(self.dir, record_json.parse_bounded)
-        self.assertEqual((len(data["steered"]), "i0" in data["steered"]), (500, False), "the cap of 500 is not enforced")
+        self.assertEqual((len(data["steered"]), data["steered"][-1], "i0" in data["steered"]), (module.CAP, "i500", False), "the cap of 500 is not enforced")
 
     def shape_case(self, module):
         self.put(json.dumps({"steered": [], "reminders": {"reminder:a": ["K", "me"], "reminder:b": ["K", "me", None]}}).encode())

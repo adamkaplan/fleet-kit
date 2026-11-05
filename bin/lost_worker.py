@@ -162,6 +162,10 @@ def _fold(state, sb, lines, source):
                     stop[name] = max(ts, stop.get(name, 0))
                 elif action == "report":
                     report[name] = max(ts, report.get(name, 0))
+    while stop and max(len(created), len(stop)) > SEEN_MAX:   # a stopped worker leaves both tables together, before any worker with no stop (#2164)
+        gone = min(stop, key=lambda k: stop[k])
+        stop.pop(gone)
+        created.pop(gone, None)
     for table in ("created", "stop", "report", "refused"):
         data = state.get(table, {})
         while len(data) > SEEN_MAX:
@@ -483,6 +487,10 @@ def run_pass(sb, engine, now, alive=None, launcher_audit=None):
             state.pop("reaper_gap", None)   # summed once per gap: cleared as it is sent
         if loss.get("outage") and isinstance(state.get("reaper_outage"), dict):
             state["reaper_outage"]["sent"] = True
+        if stopped_cleanly(state, loss):
+            _deliver(engine, sb, loss, [loss.get("lane")], text)   # #2202: the launcher's own records show a clean stop: the lane only
+            raised.append(dict(loss, text=text, earlier=earlier))
+            continue
         _deliver(engine, sb, loss, [loss.get("lane"), "chief-of-staff"], text)
         raised.append(dict(loss, text=text, earlier=earlier))
     if rest:
@@ -499,6 +507,14 @@ def run_pass(sb, engine, now, alive=None, launcher_audit=None):
         except OSError as err:
             engine.audit.append(engine.actor, "lost_worker.state_not_saved", None, {"why": sb._one_line(str(err), 160)})
     return raised
+
+
+def stopped_cleanly(state, loss):
+    """#2202: True when the launcher audit or run record (folded into `stop`) shows an ok stop at or after the loss's last event."""
+    if loss.get("kind") == "reaper_missed" or not isinstance(loss.get("lane"), str) or not loss["lane"]:
+        return False
+    name = loss.get("name")
+    return any(isinstance(t.get(name), (int, float)) and t[name] >= loss["at"] for t in (state.get("stop", {}),))
 
 
 def _deliver(engine, sb, loss, recipients, text):

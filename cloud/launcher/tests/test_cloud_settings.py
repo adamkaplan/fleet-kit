@@ -22,7 +22,8 @@ OPTIONAL_SAMPLES = {"CW_TOOLING_REPO": "acme-org/tooling", "CW_CLOUD_CA_FILE": "
                     "CW_CLUSTER_ADMIN_SECRET": "acme-cluster-admin", "CW_CLUSTER_TOKEN_DURATION": "20m", "CW_VAULT_BLOCK_DURATION": "10m", "CW_STACK_MODEL_SECRET": "acme-stack-model",
                     "CW_HUB_CHANNEL_URL": "http://cloud-hub.cw.svc:8443/message", "CW_HUB_REGISTRY_SECRET": "cloud-hub-registry",
                     "CW_STACK_REGISTRY": "acme-registry.azurecr.io", "CW_STACK_PULL_CLIENT_ID": "11111111-2222-3333-4444-555555555555",
-                    "CW_STACK_PULL_TENANT_ID": "66666666-7777-8888-9999-000000000000"}
+                    "CW_STACK_PULL_TENANT_ID": "66666666-7777-8888-9999-000000000000", "CW_MAX_PERSISTENT": "3"}
+OPTIONAL_SAMPLES["CW_FINAL_NOTE_MINUTES"] = "10"   # ask #1757: the final note's minutes
 OPTIONAL_SAMPLES["CW_REPO_MIN_SHAPE"] = "acme-org/widget-service=S"
 SAMPLES = {   # one value per secret shape (built here, never a real secret)
     "a JWT": "eyJhbGciOiJIUzI1" + "." + "eyJzdWIiOiJ4eHh4",
@@ -76,7 +77,9 @@ HOSTILE = {   # per key: values that must be refused (each through the REAL pars
     "CW_HUB_REGISTRY_SECRET": ["A_B", "a b", "-", "a/b", "$(x)", "UPPER"],
     "CW_STACK_MODEL_SECRET": ["https://vault.example.internal/secrets/x", "/home/user/secret", "a b", "a_b", "a.b", "a/b", "a" * 128, "$(x)", "-x", "--help"],
     "CW_CLUSTER_ADMIN_SECRET": ["/home/user/secret", "a b", "a_b", "a.b", "a/b", "a" * 128, "a;b", "$(x)", "a\u00e9", "-x", "--help", "--", "--query", "-", "-a"],
+    "CW_FINAL_NOTE_MINUTES": ["0", "61", "abc", "-5", "1.5", "10m", "\u0661\u0660", "007x"],
     "CW_CLUSTER_TOKEN_DURATION": ["-5m", "0m", "61m", "2h", "1000m", "20", "m", "20s", "1.5h", "20 m", "/tmp/20m", "20m5s", "\u0662\u0660m", "-1h", "0h"],
+    "CW_MAX_PERSISTENT": ["0", "21", "00", "01", "+5", "-5", "-1", "\u0662", "\u0661\u0662", "2\x01", "2\t", "1.5", "abc", "100"],
     "CW_VAULT_BLOCK_DURATION": ["-5m", "0m", "61m", "2h", "1000m", "10", "m", "10s", "1.5h", "10 m", "/tmp/10m", "10m5s", "\u0662\u0660m", "-1h", "0h"],
 }
 CONTROL = ["\t", "\x00", "\r", "\x0b", "\x0c", "\x1c", "\x1b", "\x7f", "\x01"]
@@ -679,6 +682,7 @@ NOT_SETTINGS = {
     "CW_AGENT": "set by the launcher into an orchestrator pod's environment from --agent (worker or orchestrator); the entrypoint reads it inside the pod",
     "FLEET_CLOUD_CHANNEL_URL": "set by the launcher into an orchestrator pod's environment from the CW_HUB_CHANNEL_URL row (or its default); the cloud command reads it in the pod",
     "FLEET_CLOUD_TOKEN_FILE": "set by the launcher into an orchestrator pod's environment: the fixed path of the channel secret's file in the pod's memory-backed directory",
+    "CW_REVIEW_COMMENT": "set by the launcher into the pod's environment from cloud/launcher/repo-review-comments.json (optional, per repository, absent = not set); the end hook reads it inside the pod",
     "CW_WORKDIR": "the pod's own working directory (default /work/repo), read by the hook and the record inside the pod",
     # the other login kind: a file with CW_CLOUD_SERVER (required) is the token route; these select kubectl's own context instead
     "CW_KUBE_CONTEXT": "the other login kind (kubectl's own context); a lane with the settings file has the required CW_CLOUD_SERVER and so the token route, and the two never mix",

@@ -193,7 +193,8 @@ def run_pass(sb, engine, now, gh, config=None, launcher_audit=None):
                     raise
             raise
 
-    live = sorted(n for n, r in records.items() if isinstance(r.get("repo"), str) and not state["stopped"].get(n, 0))
+    live = sorted(n for n, r in records.items() if isinstance(r.get("repo"), str) and not state["stopped"].get(n, 0)
+                  and (getattr(sb, "record_live", None) is None or sb.record_live(r, n, now)))   # #2186: the daemon's one liveness test (`cloud_record_live`), passed in
     start = state.get("cursor", 0) % len(live) if live else 0
     order = (live[start:] + live[:start])[:PASS_WORKERS_MAX]
     chosen = set(order)
@@ -281,6 +282,13 @@ def run_pass(sb, engine, now, gh, config=None, launcher_audit=None):
                         made = sb.parse_iso(when) if isinstance(when, str) else None
                         if made is not None:
                             break
+                    launched = state.get("created", {}).get(name)   # first sight: a tip made before the launch is the baseline, not a push
+                    if launched is None:
+                        hard, secs = sb.parse_iso(str(record.get("hard_deadline"))), record.get("hard_seconds")
+                        launched = hard - secs if hard is not None and isinstance(secs, (int, float)) and not isinstance(secs, bool) else None
+                    if launched is not None and made is not None and made <= launched:
+                        b["sha"], b["at"], b["quiet"] = sha, now, True
+                        continue
             except Exception as err:
                 if cmpfail and not limited:   # both reads failed: the sha stays unseen (retried at the next pass), audited once per worker
                     mem["cmpfailed"] = True
@@ -290,7 +298,7 @@ def run_pass(sb, engine, now, gh, config=None, launcher_audit=None):
                 continue
             unsent = False
             for csha, c in batch:
-                if csha in b["told"]:
+                if csha in b["told"] or csha in mem.get("told", []):   # told once per worker across its branches (ask #2153)
                     continue
                 b["told"] = (b["told"] + [csha])[-TOLD_MAX:]
                 text = item_text(name, branch, csha, dict(c, files=stats.get("files", c.get("files")), stats=stats.get("stats", c.get("stats"))) if len(batch) > 1 or prev else c)
@@ -300,6 +308,7 @@ def run_pass(sb, engine, now, gh, config=None, launcher_audit=None):
                     b["told"].remove(csha)
                     unsent = True
                     break
+                mem["told"] = (mem.get("told", []) + [csha])[-TOLD_MAX:]
                 engine.audit.append(engine.actor, "push_watch.sent", name, {"to": lane, "sha": csha[:8]})
             if unsent:
                 continue
@@ -320,8 +329,10 @@ def run_pass(sb, engine, now, gh, config=None, launcher_audit=None):
     if limited and current in live:
         state["cursor"] = live.index(current)   # the worker the stop hit and those after it are read first at the next pass
     for name in list(state["workers"]):
-        if name not in records:
-            state["workers"].pop(name)
+        if name in records:
+            state["workers"][name].pop("gone", None)   # back: its absence clock restarts
+        elif name in state["stopped"] or now - state["workers"][name].setdefault("gone", now) > 7 * 86400:
+            state["workers"].pop(name)   # kept until stopped or 7 days without a record
     try:
         _save(path, state)
     except OSError:

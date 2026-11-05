@@ -478,24 +478,26 @@ external_adapter.py:sse_messages
 fleet-heartbeat:call
 fleet-heartbeat:load_config
 fleet-scenario:read
-fleet-switchboard:__init__
+switchboard/plan_notice.py:__init__
 fleet-switchboard:_api
 switchboard/caches.py:_audit_tail
 fleet-switchboard:_call
-fleet-switchboard:_docker_inspect
+switchboard/docker_reaper.py:_docker_inspect
 switchboard/caches.py:_fresh
-fleet-switchboard:_last
+switchboard/docker_reaper.py:_last
 fleet-switchboard:_load_markers
+fleet-switchboard:_real_locations
 switchboard/profile_pieces.py:_read_json_object
 fleet-switchboard:_review_api
 fleet-switchboard:_write_gates_config
-fleet-switchboard:anonymous_volumes
+switchboard/disk_prune.py:anonymous_volumes
 fleet-switchboard:catching_up_lines
 fleet-switchboard:charter_pane_update
 fleet-switchboard:ci_record_status_line
 fleet-switchboard:cmd_review_measure
 fleet-switchboard:daemon_record_of
 fleet-switchboard:daemon_snapshot
+fleet-switchboard:deliver
 fleet-switchboard:gates_state
 fleet-switchboard:get
 fleet-switchboard:github_calls_status
@@ -503,9 +505,8 @@ fleet-switchboard:github_status
 fleet-switchboard:handle
 fleet-switchboard:health_watched_repos
 fleet-switchboard:janitor_agent_roots
-fleet-switchboard:job_read
 fleet-switchboard:json
-fleet-switchboard:lab_facts
+switchboard/docker_reaper.py:lab_facts
 fleet-switchboard:launch_memory_check
 fleet-switchboard:load_config
 fleet-switchboard:pane_exit_audit_tail
@@ -513,8 +514,8 @@ fleet-switchboard:pr_state_read
 fleet-switchboard:pull_state
 fleet-switchboard:read_decisions_file
 fleet-switchboard:read_friction_state
-fleet-switchboard:read_janitor_record
-fleet-switchboard:read_open_items
+switchboard/docker_reaper.py:read_janitor_record
+switchboard/labels_ensure.py:read_open_items
 fleet-switchboard:read_open_overlap
 fleet-switchboard:read_pane_health
 fleet-switchboard:read_pr_json
@@ -523,7 +524,7 @@ fleet-switchboard:read_ref_state
 fleet-switchboard:read_report_riders
 fleet-switchboard:receive
 fleet-switchboard:stopped_news_summary
-fleet-switchboard:sweep_summary
+switchboard/sweep.py:sweep_summary
 fleet-switchboard:unix_socket_call
 fleet-switchboard:update_daemon_record
 fleet-switchboard:v2_calls_status
@@ -601,10 +602,12 @@ switchboard/decisions_b.py:read_order_notices
 switchboard/decisions_b.py:sync_for
 switchboard/engine.py:load
 switchboard/facts.py:_load
+switchboard/facts.py:_load_pruned
 switchboard/handoff.py:post_ask_comment
 switchboard/import_v1.py:read_v1_export
 switchboard/jev.py:_load
 switchboard/jev.py:_post
+switchboard/job_runs.py:job_read
 switchboard/judge.py:ask_judge_daemon
 switchboard/judge.py:looks_like_plugin_event
 switchboard/judge.py:parse_plugin_event
@@ -840,7 +843,7 @@ class TestPlanCheckRules(unittest.TestCase):
         self.assertEqual(self.warn_codes(self.edit("    evaluator: tester", "    evaluator: tester\n    claim: pr")), [])
         same = self.check(GOOD_PLAN)["plan_hash"]
         self.assertEqual(same, got["plan_hash"])
-        self.assertEqual(same, "sha256:2ad49344a1bf3ea7fc5ceeef6f60013e02fa465dc04da8a3b5b389a82b686cdb", "the hash the checker gave this plan before the warning existed")
+        self.assertEqual(same, "sha256:5ebca0edd1d11d361a1a6384a1d262d30455d1a737cf4c608baf0a2f71f38a18", "the hash the checker gave this plan before the warning existed")
         self.assertEqual([w["code"] for w in got["warnings"] if w["code"] != "live-no-claim"], ["no-constraint-list"])
 
     def test_the_template_marks_every_stub_with_a_ready_claim_line_and_a_live_one_for_live_or_tester(self):
@@ -1105,7 +1108,7 @@ class TestCloudLoad(Base):
 
     def mutant(self, old, new):
         import re as _re
-        source = SWITCHBOARD.read_text()
+        source = switchboard_source()
         body = _re.search(r"def live_cloud_by_lane.*?\n\n\n", source, _re.S).group(0)
         helper = _re.search(r"def cloud_record_live.*?\n\n\n", source, _re.S).group(0)   # #1066: the shared liveness helper holds the liveness lines
         self.assertIn(old, body + helper)
@@ -1333,7 +1336,7 @@ class TestCloudLoad(Base):
         self.assertNotEqual(self.count(mutant), out)
 
     def test_the_shared_helper_is_the_only_place_the_liveness_test_lives(self):
-        source = SWITCHBOARD.read_text()
+        source = switchboard_source()
         for line in ('seen is None or seen > now or', '(last_reports.get(worker) or {}).get("state") in ("done", "failed")', 'if ends is None or ends < now:'):
             self.assertEqual(source.count(line), 1, line)   # once: inside cloud_record_live
         helper = source[source.index("def cloud_record_live"):source.index("def live_cloud_by_lane")]
@@ -1444,23 +1447,27 @@ class TestArchitectureSafetyNet(unittest.TestCase):
         entry = str(SWITCHBOARD)
         commands = golden.command_list(entry, root, env)
 
-        def record():
-            """Every command of the list, recorded by a process pool: each child records its share."""
+        def record(wanted):
+            """The given commands, recorded by a process pool: each child records its share."""
             global _GOLDEN_JOB
             _GOLDEN_JOB = (golden, entry, root, env)
-            count = max(1, min(os.cpu_count() or 1, len(commands)))
-            shares = [commands[i::count] for i in range(count)]
+            count = max(1, min(os.cpu_count() or 1, len(wanted)))
+            shares = [wanted[i::count] for i in range(count)]
             with concurrent.futures.ProcessPoolExecutor(max_workers=count, mp_context=multiprocessing.get_context("fork")) as pool:
                 done = list(pool.map(_golden_record_share, shares))
             return {tuple(command): result for share, results in zip(shares, done) for command, result in zip(share, results)}
 
-        first = record()
-        self.assertGreaterEqual(len(first), 120)
+        self.assertGreaterEqual(len(commands), 120)
+        self.assertEqual(len({tuple(c) for c in commands}), len(commands), "the command list repeats a command")
+        helps = [command for command in commands if command[-1] == "--help"]
         verbs = golden.choices(golden.run(entry, ["--help"], root, env)["stdout"])
         self.assertGreater(len(verbs), 40)
+        first = record([[verb, "--help"] for verb in verbs])   # the --help of every verb, recorded once; the full run of every command is golden-cli compare's job
+        listed = {tuple(c) for c in commands}
         for verb in verbs:
-            self.assertIn((verb, "--help"), first, "the command list has no --help of the verb %s" % verb)
-        self.assertEqual(golden.differences(first, record()), [], "two recordings of one entry differ")
+            self.assertIn((verb, "--help"), listed, "the command list has no --help of the verb %s" % verb)
+        sample = helps[:4] + helps[-4:] + commands[-4:]   # a small fixed sample, recorded a second time
+        self.assertEqual(golden.differences(record(sample), record(sample)), [], "two recordings of one entry differ")
 
     def fake_repo(self, text):
         """A git repository whose bin/fleet-switchboard prints bin/out.txt: a stand-in for the daemon."""

@@ -35,7 +35,7 @@ FAKE_GH = "/fake/bin/gh"
 
 def is_floor_view(argv):
     """A floor read of a pull request: a `pr view` of its files that is not `review record`'s own read (which also asks for the base name, #1047), so a test counting floor reads leaves the record out."""
-    return "files" in argv[-1] and "baseRefName" not in argv[-1]
+    return "files" in argv[-1] and "baseRefOid,baseRefName" not in argv[-1]
 
 
 FAKE_REPO = "acme/fleet"

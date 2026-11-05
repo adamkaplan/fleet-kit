@@ -73,8 +73,9 @@ class TestHeaderDate(unittest.TestCase):
         self.assertIn("held 119 min", self.header([header_fact("send:c:3", 119 * 60 + 5)]))
 
     def test_s4_twenty_same_day_headers_equal_the_stored_baseline(self):
-        self.assertEqual(len(BASELINE), 20)
-        self.assertEqual(sum(1 for a, b in zip(baseline_headers(), BASELINE) if a != b), 0)
+        now = baseline_headers()
+        self.assertEqual(len(now), len(BASELINE), "a header per stored baseline line, so zip drops none")
+        self.assertEqual(sum(1 for a, b in zip(now, BASELINE) if a != b), 0)   # kept byte-equal: the unchanged output text is the behaviour of #1800
 
     def test_s5_a_merged_header_of_two_days_dates_the_oldest_once(self):
         old = MID + 20 * 3600     # 2027-01-15 20:00Z

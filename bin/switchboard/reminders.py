@@ -71,7 +71,8 @@ def write_reminders(state_dir, items):
 
 
 LATE_NOTE_SECONDS = 300
-TEXT_CAP = 4000  # mirrors MESSAGE_CAP in bin/fleet-switchboard
+TEXT_CAP = 4000  # mirrors MESSAGE_CAP in bin/fleet-switchboard: a text over it is refused on the command line and carried in parts from `--text-file` (#1355)
+TEXT_FILE_MAX = 100000  # characters of a `--text-file`: about 30 parts, well inside the 50-part bound of the parts carrier, so nothing is ever refused after arming
 
 
 REMINDER_TTL_MAX = 86400   # #1563: the longest ttl `remind --ttl` takes
@@ -230,6 +231,8 @@ FINDING_TABLE = {
     "cmd_remind": ("a reminder the agent set (`remind`)", "its own id (a request, not a finding)", "none: sent as asked", "test_a_reminder_is_a_fact_only_once_it_is_due"),
     "set_checkpoint_reminders": ("checkpoint reminder", "launch (own id)", "once per launch", "test_a_launch_checkpoint_reminder_is_not_a_wait_and_a_workers_own_reminder_is"),
     "notify_drop": ("reminder drop notice", "dropped reminder (removed first)", "once", "test_a_drop_sends_the_setter_one_notice_naming_text_and_reason_audited_once"),
+    "comment_window_alert": ("comment window not read to its start alert", "repo, comments, day (own state, open-list-alert.json)", "once a day per repository", "test_s4_a_window_not_read_to_its_start_is_said_once_a_day"),
+    "open_list_alert": ("open-item list cut alert", "repo and day (own state, open-list-alert.json)", "once a day per repository", "test_s4_one_alert_a_day_and_one_more_the_next_day"),
     "SweepFacts": ("sweep (a fact, merged per wake)", "set and slot (own key)", "re-alarm hours", "test_s4_three_finding_kinds_of_one_wake_are_one_queued_message_with_three_lines"),
     "TriageFacts": ("triage (a fact, merged per wake)", "set and slot (own key)", "re-alarm hours", "test_s4_three_finding_kinds_of_one_wake_are_one_queued_message_with_three_lines"),
 }
@@ -389,6 +392,33 @@ def alert_stale(subject, record, fact, standing):
     return ""
 
 
+PASS_SUBJECTS = {"sweep": "sweep_facts", "triage": "triage_facts", "plan": "plan_wake_facts"}   # #1542: the fact source whose pass keeps each kind's present state
+SWEEP_KEY_RE = re.compile(r"^sweep:[0-9a-f]{10}:[0-9]+$")
+PLAN_KEY_RE = re.compile(r"^plan:([^#:\s]+/[^#:\s]+)#([0-9]+):(\S+):[^:\s]+$")
+
+
+def pass_subject(fact):
+    """(kind, repo, number, expected) of a sweep fact, a triage digest or a plan notice, or None; judged against the pass's present pairs or the newest plan hash."""
+    if fact.kind == "sweep" and SWEEP_KEY_RE.match(fact.key):
+        return ("sweep", "", 0, fact.key)
+    if is_digest(fact):
+        return ("triage", "", 0, fact.key)
+    found = PLAN_KEY_RE.match(fact.key) if fact.kind == "plan" else None
+    return ("plan", found.group(1), int(found.group(2)), found.group(3)) if found else None
+
+
+def pass_stale(subject, record):
+    """Why a sweep, triage or plan fact is no longer true against its pass's present state, or "" when it still is. One pair still present keeps the whole fact. Pure."""
+    kind, _repo, _number, expected = subject
+    if kind == "plan":
+        now = record.get("hash")
+        return "a newer plan (hash %s) replaced it" % str(now)[:12] if isinstance(now, str) and now != expected else ""
+    pairs, present = record.get("pairs"), record.get("present")
+    if not isinstance(pairs, list) or not isinstance(present, list) or not pairs or record.get("hidden"):   # a fact that hides findings ("+N more") is never dropped: the shown ones are not the whole fact
+        return ""
+    return "" if any(tuple(p) in {tuple(q) for q in present} for p in pairs) else "none of its %d finding%s is present any more" % (len(pairs), "" if len(pairs) == 1 else "s")
+
+
 def digest_replaced(facts, delivered):
     """{key: the current digest} for each digest older than DIGEST_REPLACE_AFTER that a newer digest for the same recipient replaces."""
     newest = {}
@@ -410,7 +440,7 @@ def judge_delivery(facts, delivered, read, standing):
         if fact.key in replaced:
             dropped.append((fact, "digest", "replaced by the current digest %s" % replaced[fact.key].key))
             continue
-        subject = alert_subject(fact) if read is not None else None
+        subject = (pass_subject(fact) or alert_subject(fact)) if read is not None else None   # #1542: a sweep fact, a triage digest or a plan notice is judged by its own pass's present state
         if subject is None:
             kept.append(fact)
             continue
@@ -422,9 +452,10 @@ def judge_delivery(facts, delivered, read, standing):
             kept.append(Fact(fact.key, fact.recipient, fact.kind, UNVERIFIED_MARK + fact.summary, fact.created, issue=fact.issue, batch=fact.batch,
                              sender=fact.sender, rider=fact.rider, repo=fact.repo))
             continue
-        why = alert_stale(subject, record, fact, standing)
-        if why and not fault("deliver-stale-alert"):
-            dropped.append((fact, "alert", why))
+        mine = subject[0] in PASS_SUBJECTS
+        why = pass_stale(subject, record) if mine else alert_stale(subject, record, fact, standing)
+        if why and (mine or not fault("deliver-stale-alert")):
+            dropped.append((fact, subject[0] if mine else "alert", why))
         else:
             kept.append(fact)
     return kept, dropped
@@ -484,6 +515,7 @@ class ReminderFacts:
 
     def __init__(self, state_dir):
         self.state_dir, self.engine = Path(state_dir), None
+        self.swept = set()   # #1711: ids dropped at a delivery for a newer copy of the same key and recipient
 
     def bind(self, engine):
         self.engine = engine
@@ -569,6 +601,30 @@ class ReminderFacts:
             return "%s reported to %s since the launch" % (worker, item["to"])
         return "deliver"
 
+    def says_again(self, item_id, reason, now):
+        """#1728: True when `reminder.waiting` is to be written for this reminder now: the first time, a changed reason, or every WAITING_REPEAT seconds."""
+        said = self.__dict__.setdefault("_said", {})
+        before = said.get(item_id)
+        if before is not None and before[0] == reason and 0 <= now - before[1] < WAITING_REPEAT:
+            return False
+        if len(said) > 1000:
+            said.clear()
+        said[item_id] = (reason, now)
+        return True
+
+    def waiting(self, item_id, recipient, due, reason):
+        """#1728: one `reminder.waiting` audit line (id, recipient, minutes past due, a one-line reason) for a due reminder not delivered in this pass."""
+        if self.engine is None or self.engine.audit is None:
+            return
+        now, reason = self.engine.now(), _one_line(reason, 160)
+        if self.says_again(item_id, reason, now):
+            self.engine.audit.append(self.engine.actor, "reminder.waiting", recipient,
+                                     {"id": item_id, "late_min": max(0, int((now - due) // 60)), "reason": reason})
+
+    def ceiling(self, plan, now):
+        """#1728: the ceiling step of one plan (see `ceiling_wake`)."""
+        return ceiling_wake(self.engine, self, plan, now)
+
     def notify_drop(self, item, why):
         """#1132: a reminder dropped because its issue closed or its pull request merged tells its setter ONCE. Called only by the caller
         that removed the reminder from the file (`gone` was non-empty), so a second sweep finds nothing to drop and sends nothing."""
@@ -594,6 +650,35 @@ class ReminderFacts:
                  and i["at"] <= now and (i.get("created", 0), i["at"]) > (item.get("created", 0), item["at"])]
         return max(newer, key=lambda i: (i.get("created", 0), i["at"])) if newer else None
 
+    def newest_first(self, facts):
+        """The reminder facts in the order of their copies' (created, at), newest first, so a delivery sweeps the older copies before it asks about them.
+        It has no side effect: `swept` is cleared where a pass starts (`__call__`), not per delivery call."""
+        try:
+            marks = {"reminder:" + i["id"]: (i.get("created", 0), i["at"]) for i in read_reminders(self.state_dir)}
+        except ReminderError:
+            return list(facts)   # the recheck itself reads the file again and defers the delivery
+        return sorted(facts, key=lambda f: marks.get(str(f.key), (0, 0)), reverse=True)
+
+    def drop_older_copies(self, item, items):
+        """#1711: at the delivery of a keyed, unconditional copy, every OTHER older copy of the same key and recipient still in the file
+        (whatever its sender, also none) is dropped, one audit line each. Called under the lock with `items` just read. An unkeyed copy,
+        another key, another recipient and a copy already delivered (not in the file) are never touched."""
+        if not item.get("key") or item.get("condition"):
+            return []
+        mark = (item.get("created", 0), item["at"])
+        older = [i for i in items if i["id"] != item["id"] and i.get("key") == item["key"] and i["to"] == item["to"]
+                 and (i.get("created", 0), i["at"]) < mark]
+        if not older:
+            return []
+        gone = {i["id"] for i in older}
+        self.swept |= gone
+        write_reminders(self.state_dir, [i for i in items if i["id"] not in gone])
+        if self.engine is not None and self.engine.audit is not None:
+            for i in older:
+                self.engine.audit.append(self.engine.actor, "reminder.drop_superseded", i["to"],
+                                         {"dropped": i["id"], "kept": item["id"], "key": _one_line(item["key"], 60), "by": "delivered"})
+        return sorted(gone)
+
     def recheck_delivery(self, fact):
         """#1401: the delivery step asks once more, under the lock, whether a reminder fact is still wanted. Returns None (deliver it) or the
         id of the newer copy that replaces it, or "cancelled" when it is no longer in the file; a dropped superseded copy is removed here."""
@@ -604,14 +689,16 @@ class ReminderFacts:
             items = read_reminders(self.state_dir)
             item = next((i for i in items if i["id"] == item_id), None)
             if item is None:
-                return "cancelled"
+                return "swept" if item_id in self.swept else "cancelled"
             kept = self.superseded(item, items)
             if kept is None or kept.get("condition"):   # a gated newer copy may not be delivered: the older one is not dropped for it
+                self.drop_older_copies(item, items)
                 return None
             write_reminders(self.state_dir, [i for i in items if i["id"] != item_id])
         return kept["id"]
 
     def __call__(self):
+        self.swept.clear()   # #1711: a pass starts here (each source is read once per pass), so `swept` holds only this pass's ids
         facts = []
         everything = read_reminders(self.state_dir)
         for item in self.due():
@@ -629,9 +716,20 @@ class ReminderFacts:
                     self.engine.audit.append(self.engine.actor, "reminder.drop_superseded", item["to"],
                                              {"dropped": item["id"], "kept": kept["id"], "key": _one_line(item["key"], 60)})
                 continue
+            unreadable = False
             if item.get("condition"):
                 found = self.verdict(item)
+                unreadable = found is None and self.engine is not None and self.engine.now() - item["at"] > reminder_bound(self.engine.config, item)   # #1728 ceiling: a condition that cannot be read does not hold a due reminder past its bound
+                if unreadable:
+                    found = "deliver"
+                    done = self.__dict__.setdefault("_ceiled_unreadable", set())   # once per id, on the ReminderFacts instance like ceiling_wake's _ceiled (never on the shared engine)
+                    if len(done) > 1000:
+                        done.clear()
+                    if self.engine.audit is not None and item["id"] not in done:
+                        done.add(item["id"])
+                        self.engine.audit.append(self.engine.actor, "reminder.ceiling", item["to"], {"id": item["id"], "why": "condition unreadable"})
                 if found is None:
+                    self.waiting(item["id"], item["to"], item["at"], "condition unreadable")
                     continue
                 if found != "deliver":
                     gone = remove_reminders(self.state_dir, {item["id"]})
@@ -648,15 +746,149 @@ class ReminderFacts:
                 text = delayed_text(text, item["at"])
             elif late >= LATE_NOTE_SECONDS:
                 note = " (late by %d min)" % int(late // 60)
-                cut = len(text) + len(note) > TEXT_CAP
-                text = text[:max(0, TEXT_CAP - len(note) - (1 if cut else 0))] + ("\u2026" if cut else "") + note   # the note is applied before the cap and kept: the body is cut, not the note
+                text = text + note   # #1355: never cut here: an over-cap text is carried in parts by compose, the note ends the last part
+            if unreadable:
+                text = text + " (condition unreadable)"
             facts.append(Fact("reminder:" + item["id"], item["to"], "reminder", text, item["at"],
                               issue=item.get("issue"), batch=False, sender=item.get("from"), repo=item.get("repo")))
             facts[-1].reminder_text = raw_text
             facts[-1].delayed = late > DELAYED_MARK_SECONDS
+            facts[-1].bound = reminder_bound(self.engine.config if self.engine else {}, item)   # #1728: read by steers_into_turn
             if isinstance(item.get("wake_class"), str):
                 facts[-1].wake_class = item["wake_class"]
         return facts
+
+
+WAITING_REPEAT = 1800   # #1728: seconds between two `reminder.waiting` lines for the same reminder and reason
+
+
+def waiting_reason(engine, plan, now):
+    """#1728: why the reminders of this plan do not reach the lane now, or None (a wake that goes in at once, or a steer)."""
+    if plan.action != "wake":
+        return "%s: %s" % (plan.action, plan.reason)
+    observation = plan.observation
+    if observation is None or observation.status != "working":
+        return None
+    age = None
+    try:
+        if engine.config.get("steer_after_minutes") and engine.state_dir is not None:
+            age = load_module("turn_start").age(engine.state_dir, observation.session_id, now, load_module("record_json").parse_bounded)
+    except Exception:
+        age = None
+    if steers_into_turn(engine.config, observation, plan.pending, getattr(engine, "discovery", None), age, now):
+        return None
+    return "lane in a turn of %d minutes, queued" % (age // 60) if age is not None else "lane in a turn of unknown length, queued"
+
+
+def reminder_bound(config, item):
+    """#1728: the bound in SECONDS of a due reminder: `checkpoint_bound_minutes` (default 5) for one a launch checkpoint set (its condition names
+    the worker, or the overdue one to its boss), else `reminder_bound_minutes` (default 10)."""
+    condition = item.get("condition") if isinstance(item.get("condition"), dict) else {}
+    checkpoint = "while_running" in condition or "unless_report_from" in condition
+    key, default = ("checkpoint_bound_minutes", 5) if checkpoint else ("reminder_bound_minutes", 10)
+    minutes = config.get(key, default)
+    return (minutes if _is_number(minutes) and minutes >= 0 else default) * 60
+
+
+def late_reminder_counts(state_dir, config, now):
+    """#1728: {lane: reminders delivered LATER than their bound in the last 24 hours}, from the audit lines. Each `reminder.add` (id, `at`, recipient)
+    is paired with the FIRST `v2.synthetic` line whose keys hold `reminder:<id>`; delivery minus `at` is compared with `reminder_bound`."""
+    from datetime import datetime
+    parse = load_module("record_json").parse_bounded
+    def epoch(text):
+        try:
+            return datetime.fromisoformat(str(text).replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return None
+    added, delivered, counts = {}, {}, {}
+    try:
+        cap = 8 * 1024 * 1024   # only a bounded TAIL of the audit is ever read
+        with open(str(state_dir) + "/audit.jsonl", "rb") as handle:
+            size = handle.seek(0, 2)
+            handle.seek(max(0, size - cap))
+            data = handle.read(cap)
+            if size > cap:
+                data = data.partition(b"\n")[2]   # drop the first partial line
+        lines = data.decode("utf-8", errors="replace").splitlines()
+    except OSError:
+        return counts
+    for line in lines:
+        try:
+            entry = parse(line)
+        except ValueError:
+            continue
+        if not isinstance(entry, dict):
+            continue
+        detail = entry.get("detail") if isinstance(entry, dict) and isinstance(entry.get("detail"), dict) else {}
+        if entry.get("event") == "reminder.add" and detail.get("id") is not None:
+            added[str(detail["id"])] = (entry.get("subject"), epoch(detail.get("at")), {"condition": {"unless_report_from": 1} if detail.get("for") else {}})
+        elif entry.get("event") == "v2.synthetic":
+            for key in detail.get("keys") or []:
+                if isinstance(key, str) and key.startswith("reminder:"):
+                    delivered.setdefault(key[len("reminder:"):], epoch(entry.get("ts")))
+    for item_id, (lane, due, item) in added.items():
+        counts.setdefault(lane, 0)
+        sent = delivered.get(item_id)
+        if due is not None and sent is not None and sent >= now - 86400 and sent - due > reminder_bound(config, item):
+            counts[lane] += 1
+    return counts
+
+
+def late_reminder_lines(state_dir, config, now):
+    """One `status` line per lane: how many reminders came later than their bound in the last 24 hours."""
+    return ["      reminders  %s: %d later than the bound in 24h" % (lane, n) for lane, n in sorted(late_reminder_counts(state_dir, config, now).items())]
+
+
+def ceiling_wake(engine, source, plan, now):
+    """#1728 ceiling: a due reminder of this lane past its bound that this pass would not admit (a batch window) turns the plan into a queued wake,
+    carrying every pending fact of the lane, with one `reminder.ceiling` audit line per reminder. A wake already planned (queued behind a turn) is
+    delivered by this very pass: only the line is written. A held lane is left alone. Returns the ids written."""
+    if plan.action not in ("wait", "wake"):
+        return []
+    items = {i["id"]: i for i in read_reminders(source.state_dir)}
+    late = [(f, items[f.key[len("reminder:"):]]) for f in plan.pending
+            if str(f.key).startswith("reminder:") and f.key[len("reminder:"):] in items]
+    over = [(f, i) for f, i in late if now - i["at"] > reminder_bound(engine.config, i)]
+    done = source.__dict__.setdefault("_ceiled", set())
+    over = [(f, i) for f, i in over if i["id"] not in done]
+    if not over:
+        return []
+    if plan.action == "wait":
+        for fact in plan.pending:
+            fact.batch = False
+        plan.action, plan.reason = "wake", "ceiling: a due reminder is past its bound"
+    for _, item in over:
+        if len(done) > 1000:
+            done.clear()
+        done.add(item["id"])
+        if engine.audit is not None:
+            engine.audit.append(engine.actor, "reminder.ceiling", plan.recipient,
+                                {"id": item["id"], "late_min": max(0, int((now - item["at"]) // 60)),
+                                 "bound_min": int(reminder_bound(engine.config, item) // 60), "delivery": "queued wake"})
+    return [i["id"] for _, i in over]
+
+
+def invariant_break(source, plan, now):
+    """#1728 invariant: the unconditional, unexpired due reminders of this lane that are not in its pending facts (an empty list: it holds)."""
+    have = {f.key for f in plan.pending}
+    return [i for i in source.due() if i["to"] == plan.recipient and not i.get("condition") and not i.get("key") and not i.get("ttl")
+            and "reminder:" + i["id"] not in have]
+
+
+def reminder_waiting(engine, plan, now):
+    """#1728: the audit line for each due reminder in `plan` that is not delivered in this pass. Never raises: it must not stop a delivery."""
+    try:
+        source = next((s for s in engine.sources if isinstance(s, ReminderFacts)), None)
+        mine = [f for f in plan.pending if str(f.key).startswith("reminder:")]
+        reason = waiting_reason(engine, plan, now) if source is not None and mine else None
+        for fact in mine if reason else ():
+            source.waiting(fact.key[len("reminder:"):], plan.recipient, fact.created, reason)
+        if source is not None and plan.action != "hold":
+            for item in invariant_break(source, plan, now):
+                source.waiting(item["id"], plan.recipient, item["at"], "invariant broken: a due reminder of a lane neither held nor cancelled is not a pending fact")
+            source.ceiling(plan, now)
+    except Exception:
+        pass
 
 
 def prune_delivered_reminders(engine, discovery):
@@ -803,6 +1035,36 @@ def set_checkpoint_reminders(engine, state, name, boss, issue, repo, brief, chec
         return "no checkpoint reminders: %s" % _one_line(str(err), 200)
 
 
+CLOUD_DEFAULT_CHECKPOINT = ("25m", "40m")   # #1790: a cloud launch with no CHECKPOINT line and no flag arms this
+
+
+def arm_cloud_checkpoints(args, runner, now):
+    """#1790: after a cloud launch that succeeded, what a local launch arms (set_checkpoint_reminders), else the default 25m/40m.
+    One line on stderr; never raises and always returns EXIT_OK: the pod already exists."""
+    try:
+        engine, state, _ = build_engine(runner, now, "cli")
+        boss = args.reports_to
+        if boss is None:
+            try:
+                boss = identify_caller(engine.herdr, engine.v2, os.environ)
+            except Exception:
+                boss = None
+        brief, checkpoint, overdue = getattr(args, "brief_text", None), getattr(args, "checkpoint", None), getattr(args, "overdue", None)
+        why = None
+        if checkpoint is None and overdue is None and parse_checkpoint(brief) is None:
+            why = "the brief's CHECKPOINT line could not be read" if re.search(r"^\s*CHECKPOINT\s*:", brief or "", re.I | re.M) else "no CHECKPOINT line and no flag"
+            checkpoint, overdue = CLOUD_DEFAULT_CHECKPOINT
+        note = set_checkpoint_reminders(engine, state, args.name, boss, None if args.issue is None else int(args.issue), getattr(args, "repo", None),
+                                        brief, checkpoint, overdue, now(), now())
+        if why and note and note.startswith("checkpoint reminders"):
+            note = "default %s/%s (%s): %s" % (CLOUD_DEFAULT_CHECKPOINT + (why, note))
+    except Exception as err:
+        note = "no checkpoint reminders: %s" % _one_line(str(err), 200)
+    if note:
+        sys.stderr.write("%s: %s\n" % (PROG, note))
+    return EXIT_OK
+
+
 REMIND_LIST_MAX = 50   # reminders `remind --list` prints
 
 
@@ -873,8 +1135,22 @@ def cmd_remind(args, runner, now):
     moment = now()
     if args.list_mine or args.cancel or getattr(args, "cancel_key", None):
         return remind_manage(args, engine, state, sender, moment)
-    if not args.name or not args.when or not args.text:
-        sys.stderr.write("%s: remind needs <name> <when> <text> (or --list, or --cancel <id>)\n" % PROG)
+    text_file = getattr(args, "text_file", None)   # a caller that builds its own namespace has none
+    if text_file and args.text:
+        sys.stderr.write("%s: remind takes the text as words or from --text-file, not both; nothing armed\n" % PROG)
+        return EXIT_USAGE
+    if not args.name or not args.when or not (args.text or text_file):
+        sys.stderr.write("%s: remind needs <name> <when> <text> (or --text-file F, or --list, or --cancel <id>)\n" % PROG)
+        return EXIT_USAGE
+    if text_file:
+        text, problem = read_text_file(text_file)
+    else:
+        text, problem = " ".join(args.text).strip(), None
+        if len(text) > TEXT_CAP:   # #1355: never armed to be cut on delivery
+            problem = ("the text is %d characters, over the %d-character message cap: nothing armed. "
+                       "Put it in a file and use --text-file F, which carries it in full in parts" % (len(text), TEXT_CAP))
+    if problem:
+        sys.stderr.write("%s: %s\n" % (PROG, problem))
         return EXIT_USAGE
     try:
         repo, number = resolve_for_sender(engine, config, args.issue, sender)
@@ -913,17 +1189,52 @@ def cmd_remind(args, runner, now):
         warning = ("%s: reminder is dropped if it closes (%s#%d closes or its pull request merges), with one notice to you; "
                    "use --keep-if-closed to keep it\n" % (PROG, repo, number))
     item = add_reminder(state, args.name, parse_when(args.when, moment), moment,
-                        " ".join(args.text).strip(), number, sender, repo, condition=condition or None,
+                        text, number, sender, repo, condition=condition or None,
                         key=_one_line(args.key, 80) if args.key else None, ttl=ttl)
     if len(item["text"]) > TEXT_CAP:
-        sys.stderr.write("%s: warning: text is cut at %d characters: %d characters over\n" % (PROG, TEXT_CAP, len(item["text"]) - TEXT_CAP))
+        sys.stderr.write("%s: the text is %d characters: it is delivered in parts, each under %d, the last one closing it\n" % (PROG, len(item["text"]), TEXT_CAP))
     engine.audit.append("cli", "reminder.add", args.name, {"id": item["id"], "at": iso(item["at"]),
-                                                          "from": sender, "issue": number, "repo": repo})
+                                                          "from": sender, "issue": number, "repo": repo,
+                                                          **({"key": _one_line(item["key"], 60)} if item.get("key") else {})})
     print(item["id"])
     sys.stderr.write("%s: reminder for %s %s (now %s)\n" % (PROG, args.name, _print_when(item["at"], moment), _print_when_now(moment)))
     if warning:
         sys.stderr.write(warning)
     return EXIT_OK
+
+
+def read_text_file(path, flag="--text-file", outcome="nothing armed", own_dirs_only=False):
+    """(text, None) of a UTF-8 text file for `remind --text-file` and `send --file` (`flag` and `outcome` word the refusals), or (None, why it is refused):
+    unreadable, not a regular file, too large, not UTF-8 text, or empty. `own_dirs_only` (send): a symlink is refused unless it resolves inside the
+    user's home, the temp directory or the working directory."""
+    import tempfile   # local: a module-level name here would be one more entry import (docs/architecture.md counts them)
+    name = _one_line(path, 80)
+    if own_dirs_only and os.path.islink(path):
+        real = os.path.realpath(path)
+        roots = [os.path.realpath(r) for r in (os.path.expanduser("~"), tempfile.gettempdir(), os.getcwd()) if r]
+        if not any(real == r or real.startswith(r.rstrip(os.sep) + os.sep) for r in roots):
+            return None, "%s %s is a symlink that leaves your own directories: %s" % (flag, name, outcome)
+    try:
+        with open(path, "rb") as handle:
+            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                return None, "%s %s is not a regular file: %s" % (flag, name, outcome)
+            raw = handle.read(TEXT_FILE_MAX * 4 + 1)   # a character is at most 4 bytes: bounded whatever the file is
+    except OSError as err:
+        return None, "%s %s cannot be read (%s): %s" % (flag, name, err.strerror or "error", outcome)
+    try:
+        text = raw.decode("utf-8").strip()
+    except UnicodeDecodeError:
+        if len(raw) > TEXT_FILE_MAX * 4:
+            text = None
+        else:
+            return None, "%s %s is not UTF-8 text: %s" % (flag, name, outcome)
+    if text is None or len(text) > TEXT_FILE_MAX:
+        return None, "%s %s is over %d characters: %s" % (flag, name, TEXT_FILE_MAX, outcome)
+    if "\x00" in text:
+        return None, "%s %s is not text (it holds a NUL): %s" % (flag, name, outcome)
+    if not text:
+        return None, "%s %s is empty: %s" % (flag, name, outcome)
+    return text, None
 
 
 cmd_remind.ensure_on_use = True   # the daemon is alive when it runs
@@ -934,6 +1245,7 @@ cmd_remind.header_cache = True    # #1520
 
 CI_QUEUE_GATE_LEGS = ("test (ubuntu-latest)", "test-cloud (ubuntu-latest)", "test (macos-latest)", "test-cloud (macos-latest)")   # bin/merge_gate.py UBUNTU_LEGS + MAC_LEGS (a test holds them equal)
 CI_QUEUE_GATE_FEEDERS = ("plan",)   # a job no gate names but that builds the matrix of the jobs a gate does name: never a cut candidate
+CI_QUEUE_WORKFLOWS = Path(__file__).resolve().parents[1] / ".github" / "workflows"   # #2197: the workflow files whose job names a gate reads
 CI_QUEUE_PAGES = 10                 # pages of 100 read for one run's jobs (bounded)
 CI_QUEUE_RUN_PAGES = 40             # pages of 100 read for the run list (bounded)
 
@@ -1000,6 +1312,7 @@ def ci_queue_measure(runs, jobs_by_run, now, hours=24, gate_names=(), docs_only=
     scale = 24.0 / hours
     cut = [{"kind": "cut", "what": name, "job_minutes_per_day": int(round(spent * scale))} for name, spent in sorted(job_minutes.items())
            if name not in gate_names and name not in CI_QUEUE_GATE_FEEDERS]
+    cut = [c for c in cut if "${{" not in c["what"] and not c["what"].startswith("matrix.")]   # #2197: a matrix placeholder is never a name
     candidates = cut + [
         {"kind": "dedupe", "what": "%d run(s) on a head that already had a run" % repeat_runs, "job_minutes_per_day": int(round(repeat_minutes * scale))},
         {"kind": "move", "what": "macOS legs of %d run(s) whose change touches no platform path" % len(set(docs_only)), "job_minutes_per_day": int(round(move_minutes * scale))}]
@@ -1074,6 +1387,37 @@ def ci_queue_platform_paths(path):
     return [line.strip() for line in text.splitlines() if line.strip() and not line.lstrip().startswith("#")]
 
 
+def ci_queue_workflow_jobs(directory):
+    """The job names the workflow files in `directory` give their checks, a literal matrix list (`key: [1, 2]`) expanded one name per value (#2197: a gate
+    reads them by name). A name that stays a `${{ ... }}` placeholder (a matrix built at run time) is not returned. [] when the files cannot be read."""
+    names = []
+    for path in sorted(Path(directory).glob("*.yml")):
+        try:
+            lines = path.read_text().splitlines()
+        except (OSError, UnicodeError):
+            continue
+        jobs, current, in_jobs = [], None, False
+        for line in lines:
+            if re.match(r"jobs:\s*$", line):
+                in_jobs = True
+            elif in_jobs and re.match(r"  [\w-]+:\s*$", line):
+                current = {"id": line.strip()[:-1], "name": None, "matrix": {}}
+                jobs.append(current)
+            elif in_jobs and current is not None:
+                found = re.match(r"    name:\s*(.+?)\s*$", line)
+                lists = re.match(r"        (\w+):\s*\[(.*)\]\s*$", line)
+                if found:
+                    current["name"] = found.group(1).strip("\"'")
+                elif lists:
+                    current["matrix"][lists.group(1)] = [v.strip().strip("\"'") for v in lists.group(2).split(",") if v.strip()]
+        for item in jobs:
+            expanded = [item["name"] or item["id"]]
+            for key, values in item["matrix"].items():
+                expanded = [n.replace("${{ matrix.%s }}" % key, v) for n in expanded for v in values] if any("${{ matrix.%s }}" % key in n for n in expanded) else expanded
+            names.extend(n for n in expanded if "${{" not in n)
+    return tuple(names)
+
+
 def cmd_ci_queue(args, runner, now):
     """`ci-queue [--repo OWNER/REPO] [--hours N] [--until ISO] [--paths-file F] [--json]`: the queue wait, run time, jobs, job-minutes, peak queued and the observed ceiling of the
     Actions runs of the window, and the cut / dedupe / move candidates. Read-only: GET requests only, nothing is written to GitHub."""
@@ -1096,7 +1440,7 @@ def cmd_ci_queue(args, runner, now):
         sys.stderr.write("%s: ci-queue: %s\n" % (PROG, _one_line(str(err), 120)))
         return EXIT_ERROR
     report = ci_queue_measure([r for r in runs if (_ci_time(r.get("created_at")) or 0) <= end], jobs_by_run, end, args.hours,
-                              CI_QUEUE_GATE_LEGS, docs_only)
+                              CI_QUEUE_GATE_LEGS + ci_queue_workflow_jobs(CI_QUEUE_WORKFLOWS), docs_only)
     print(json.dumps(report, indent=1, sort_keys=True) if args.json else "\n".join(ci_queue_lines(report)))
     return EXIT_OK
 

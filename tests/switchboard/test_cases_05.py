@@ -197,6 +197,8 @@ class TestApprovalExemptionGuard(unittest.TestCase):
         self.assertEqual(self.offenders(self.real_texts()), [], self.MESSAGE)
 
     def test_mutant_an_import_in_a_closure_module_fails_the_scan(self):
+        if not self.exemption_stands():
+            self.skipTest("the exemption is gone")
         texts = self.real_texts()
         texts["bin/merge_gate.py"] = "import plan_approval\n" + texts["bin/merge_gate.py"]
         self.assertEqual(self.offenders(texts), ["bin/merge_gate.py"], self.MESSAGE)
@@ -741,7 +743,7 @@ class TestJudgeToolWritesNothingElsewhere(unittest.TestCase):
         """The policy section: its part files, and the statements of it that stay in the entry (S2 keeps the ones the clear's closure reads), between the DEFAULTS line and the next section."""
         entry = switchboard_source()
         kept = entry[entry.index('DEFAULTS["policy"] = None'):entry.index("# PR 10: move a v1 session")]
-        return "\n".join([kept] + [path.read_text() for path in SWITCHBOARD_SOURCE_FILES if path.name in ("judge_request.py", "judge.py")])   # the policy judge's own parts: another part (plan review, which launches lanes) is not the policy section
+        return "\n".join([kept] + [path.read_text() for path in SWITCHBOARD_SOURCE_FILES if path.name in ("judge_request.py", "judge.py", "standing_authority.py")])   # the policy judge's own parts: another part (plan review, which launches lanes) is not the policy section
 
     def test_no_herdr_and_no_github_write_is_reachable_from_the_section(self):
         tree = ast.parse(self.section())

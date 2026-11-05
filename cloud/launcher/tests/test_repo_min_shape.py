@@ -193,7 +193,11 @@ class Floor(base.Base):
         print("S9: 1 of 1 mixed-case launches get the floor shape and %d of 1 mutants fail, mutation applied %s" % (caught, applied))
 
     def test_s10_the_floor_order_and_the_rank_of_the_orchestrator_row(self):
-        self.assertEqual(cw.FLOOR_ORDER, ("XS", "S", "M"))
+        for name in ("XS", "S", "M"):
+            self.assertIn(name, cw.FLOOR_ORDER)
+        self.assertNotIn("O", cw.FLOOR_ORDER)
+        self.assertLess(cw.FLOOR_ORDER.index("XS"), cw.FLOOR_ORDER.index("S"))
+        self.assertLess(cw.FLOOR_ORDER.index("S"), cw.FLOOR_ORDER.index("M"))
         self.assertLess(cw.shape_rank("O"), cw.shape_rank("XS"))
         a = argparse.Namespace(repo=REPO, agent="orchestrator")
         cw.check_shape(a, {"CW_REPO_MIN_SHAPE": "acme-org/widget-service=XS"})

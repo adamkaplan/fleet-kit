@@ -225,8 +225,9 @@ def build(HandoffCase, FAKE_GH):
             self.assertEqual((REPO / "docs" / "ci-queue-report.md").read_text().count("decided by the owner"), 1)
             self.assertIn("tester's live measure", (REPO / "docs" / "ci-queue-report.md").read_text())
 
-        def serve(self, requests):
+        def serve(self, requests, extra=None):
             runs, jobs = fixture()
+            jobs.update(extra or {})
 
             def route(argv, **kwargs):
                 if argv[0] != FAKE_GH:
@@ -278,4 +279,74 @@ def build(HandoffCase, FAKE_GH):
             head = text.split("\n\n\n# ---- ci-queue", 1)[0]
             self.assertTrue(head.endswith("cmd_remind.ensure_on_use = True   # the daemon is alive when it runs\ncmd_remind.header_cache = True    # #1520"))
             self.assertEqual(text.count("def cmd_remind("), 1)
+
+        def test_s2_an_unexpanded_matrix_placeholder_is_never_a_cut_candidate(self):
+            runs = [run(1, "test", "pull_request", "aa", 0)]
+            jobs = {1: [job("shards (${{ matrix.shard }}/8)", 0, 0, 5), job("matrix.cloud", 0, 0, 5), job("stale-report", 0, 0, 7)]}
+            space = self.measure(runs, jobs, docs_only=())
+            cut = [c["what"] for c in space["candidates"] if c["kind"] == "cut"]
+            self.assertEqual(cut, ["stale-report"])
+
+        WORKFLOW = ("name: test\njobs:\n  plan:\n    runs-on: x\n  shards:\n    name: shards (${{ matrix.shard }}/3)\n    strategy:\n      matrix:\n"
+                    "        shard: [1, 2, 3]\n  test:\n    name: ${{ matrix.name }}\n    strategy:\n      matrix:\n        include: ${{ fromJSON(x) }}\n")
+
+        def gate_jobs(self):
+            folder = self.home / "wf"
+            folder.mkdir(exist_ok=True)
+            (folder / "test.yml").write_text(self.WORKFLOW)
+            return folder, sb.ci_queue_workflow_jobs(folder)
+
+        def test_s2_the_jobs_of_a_workflow_are_read_with_the_matrix_expanded_and_no_placeholder(self):
+            _, names = self.gate_jobs()
+            self.assertEqual(sorted(names), ["plan", "shards (1/3)", "shards (2/3)", "shards (3/3)"])
+
+        def test_s2_s3_a_matrix_job_a_gate_reads_is_no_cut_and_a_job_no_gate_reads_is_one_with_its_minutes(self):
+            _, names = self.gate_jobs()
+            runs = [run(1, "test", "pull_request", "aa", 0)]
+            jobs = {1: [job("shards (%d/3)" % i, 0, 0, 10) for i in (1, 2, 3)] + [job("shards (${{ matrix.shard }}/3)", 0, 0, 4), job("stale-report", 0, 0, 7)]}
+            space = self.measure(runs, jobs, docs_only=(), gate_names=GATE + names)
+            cut = [c for c in space["candidates"] if c["kind"] == "cut"]
+            self.assertEqual(len([c for c in cut if "shards" in c["what"] or "matrix" in c["what"]]), 0)
+            self.assertEqual([(c["what"], c["job_minutes_per_day"]) for c in cut], [("stale-report", 7)])
+
+        def test_s2_the_default_workflow_folder_is_the_real_one_and_no_shard_is_a_cut(self):
+            folder = Path(sb.CI_QUEUE_WORKFLOWS)
+            self.assertTrue(folder.is_dir(), str(folder))
+            self.assertTrue((folder / "test.yml").is_file())
+            runs, jobs = fixture()
+            extra = jobs[1] + [job("shards (%d/8)" % i, 1395, 1395, 1400) for i in range(1, 9)]
+            with captured() as (out, err):
+                code = sb.main(["ci-queue", "--repo", "o/r", "--until", at(24 * 60), "--json"], runner=self.serve([], extra={1: extra}), now=lambda: NOW,
+                               socket_call=self.world.herdr.socket)
+            self.assertEqual(code, 0, err.getvalue())
+            cut = [c["what"] for c in json.loads(out.getvalue())["candidates"] if c["kind"] == "cut"]
+            self.assertEqual([w for w in cut if "shards" in w], [])
+
+        def test_s2_the_command_reads_the_workflow_files_for_the_gate_names(self):
+            folder, _ = self.gate_jobs()
+            runs, jobs = fixture()
+            jobs[1] = jobs[1] + [job("shards (2/3)", 1395, 1395, 1400)]
+            original = sb.CI_QUEUE_WORKFLOWS
+            sb.CI_QUEUE_WORKFLOWS = folder
+            try:
+                with captured() as (out, err):
+                    code = sb.main(["ci-queue", "--repo", "o/r", "--until", at(24 * 60), "--json"], runner=self.serve([], extra={1: jobs[1]}), now=lambda: NOW,
+                                   socket_call=self.world.herdr.socket)
+            finally:
+                sb.CI_QUEUE_WORKFLOWS = original
+            self.assertEqual(code, 0, err.getvalue())
+            cut = [c["what"] for c in json.loads(out.getvalue())["candidates"] if c["kind"] == "cut"]
+            self.assertEqual(len([w for w in cut if "shards" in w]), 0)
+            self.assertIn("stale-report", cut)
+
+        def test_mutant_s2_dropping_the_placeholder_filter_is_caught_control_first(self):
+            runs = [run(1, "test", "pull_request", "aa", 0)]
+            jobs = {1: [job("matrix.cloud", 0, 0, 5), job("stale-report", 0, 0, 7)]}
+
+            def cuts(space):
+                return [c["what"] for c in space["ci_queue_measure"](runs, jobs, NOW, 24, GATE, ())["candidates"] if c["kind"] == "cut"]
+            self.assertEqual(cuts(self.pure_lines()), ["stale-report"])   # control
+            mutant = cuts(self.pure_lines('if "${{" not in c["what"] and not c["what"].startswith("matrix.")]', "if True]"))
+            with self.assertRaisesRegex(AssertionError, "^2 != 1$"):
+                self.assertEqual(len(mutant), 1)
     return TestCiQueue

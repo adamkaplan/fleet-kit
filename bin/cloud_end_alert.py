@@ -131,6 +131,16 @@ def pushed_text(record_dir, parse):
     return "unknown"
 
 
+def pr_line(record_dir, parse):
+    """The end-hook ask: the one line the end hook recorded about the pull request, only if it is one of the fixed forms; else a fixed unknown."""
+    run = read_small(os.path.join(record_dir, "run.json"), parse) if record_dir else None
+    hook = run.get("end_hook") if run else None
+    note = hook.get("pr_note") if isinstance(hook, dict) else None
+    if isinstance(note, str) and len(note) <= 120 and re.fullmatch(r"PR (#[0-9]{1,9} marked ready(, review requested|, no review comment is configured)|not marked ready: [A-Za-z0-9 #(),._-]+)", note):
+        return note
+    return "PR not marked ready: no answer recorded"
+
+
 def message_text(worker, label, when, pushed, record_name, kept=False, failure=None):
     text = ("[cloud worker ended] %s was ended by the launcher: reason %s; at %s; %s; run record: %s."
             % (worker, label, when, pushed, record_name or "unknown"))
@@ -139,6 +149,11 @@ def message_text(worker, label, when, pushed, record_name, kept=False, failure=N
     if failure is not None:
         text += " Pod termination: %s." % failure
     return text
+
+
+def chief_not_needed(cause, ok, pushed):
+    """#2202: True for an end that needs nothing from the Chief of Staff: a clean reason (idle or hard limit), the stop done, and nothing unpushed."""
+    return cause in ("idle", "hard") and ok is True and pushed == "nothing unpushed"
 
 
 def scan_audit(audit_file, state_file, cloud_dir, last_reports, send, parse, audit=None, last_text=None):
@@ -192,6 +207,7 @@ def scan_audit(audit_file, state_file, cloud_dir, last_reports, send, parse, aud
         name = record_name_of(worker, record_name)
         pushed = pushed_text(raw_dir(reason), parse) if name else "unknown"
         text = message_text(worker, label, when_text(line.get("ts")), pushed, name, line["ok"] is False)
+        text += " " + pr_line(raw_dir(reason), parse) + "."
         keys.append(key)
         to_list = [CHIEF] + ([boss] if isinstance(boss, str) and AGENT_NAME.fullmatch(boss) and boss != CHIEF else [])
         boss_text = text
@@ -201,6 +217,8 @@ def scan_audit(audit_file, state_file, cloud_dir, last_reports, send, parse, aud
             except Exception as err:
                 block, why = None, type(err).__name__
             boss_text = text + "\n" + (block if block else "last text not read: %s" % plain((why or "unknown").replace(" ", "_"), 120))
+        if len(to_list) > 1 and chief_not_needed(cause, line["ok"], pushed):
+            to_list = to_list[1:]   # #2202: a clean end with nothing unpushed goes to the boss only
         out.extend((to, text if to == CHIEF else boss_text, worker, label) for to in reversed(to_list))
     save_state(state_file, offset + cut, keys)
     failed = set()
