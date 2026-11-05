@@ -9817,6 +9817,16 @@ def _records(values, key=None):
     return [r for r in records if isinstance(r, dict)]
 
 
+def _page_records(values, key, path, number):
+    """The records of ONE page, or GitHubUnavailable (#1983): a page is a list of objects, or an object whose `key` list holds objects; an empty list is a valid last page."""
+    for value in values:
+        if isinstance(value, dict) and key and isinstance(value.get(key), list):
+            value = value[key]
+        if not isinstance(value, list) or not all(isinstance(r, dict) for r in value):
+            raise GitHubUnavailable("%s page %d is not a list of objects" % (path, number))
+    return _records(values, key)
+
+
 def _is_orchestrator(observation):
     return (observation.fleet or {}).get("role") == "orchestrator"
 
@@ -10953,7 +10963,7 @@ class GitHubHub:
         number = 0
         while True:
             number += 1
-            page = _records(self.gh_api("%s%spage=%d" % (path, joiner, number), paginate=False, timeout=timeout), key)
+            page = _page_records(self.gh_api("%s%spage=%d" % (path, joiner, number), paginate=False, timeout=timeout), key, path, number)
             records.extend(page)
             if len(page) < GITHUB_PAGE_SIZE:
                 return records, False
