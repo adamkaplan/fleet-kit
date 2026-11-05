@@ -446,8 +446,7 @@
         "bin/switchboard/caches.py",
         "bin/switchboard/profile_pieces.py",
         "bin/switchboard/installer.py",
-        "bin/switchboard/stage_event.py",
-        "bin/switchboard/scratch_dir.py"
+        "bin/switchboard/stage_event.py"
       ],
       "daemon_file": "bin/fleet-switchboard",
       "module_roots": {
@@ -711,10 +710,6 @@
         ],
         "bin/switchboard/profile_pieces.py": [
           "InstallError"
-        ],
-        "bin/switchboard/scratch_dir.py": [
-          "ScratchBoundFacts",
-          "scratch_bytes"
         ],
         "bin/switchboard/installer.py": [
           "reaper_only_conflict"

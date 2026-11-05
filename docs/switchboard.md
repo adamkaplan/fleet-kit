@@ -6668,14 +6668,6 @@ Run `tools/new-test-checks` after writing a new `tests/switchboard/test_*.py` an
 
 `preflight-pr` (with and without `--merged`) and `bin/cloud-pr-preflight` (which `bin/cloud-prepush` runs) run it when the head adds or changes such a file: `PASS new-test-checks` or `FAIL new-test-checks` with the findings beneath, a FAIL makes the exit status 1, and `SKIP new-test-checks: tools/new-test-checks is not in this tree` is printed for a tree that does not hold it. The continuous-integration workflow and the hooks do not run it.
 
-## `scratch`: a directory of your own that nothing sweeps (#1456)
-
-The system temp area is swept, so helper scripts and rule texts kept there disappeared between turns. `fleet-switchboard scratch` prints the path of the caller's own scratch directory, `<state dir>/scratch/<your name>`, and makes it (mode `0700`, owned by you) when it is absent, also for an agent that `launch` did not start. It calls the same helper as `launch` (`agent_scratch_dir`, which uses `job_ensure_root`: no second copy of that logic). It takes no argument: the name is the caller's own, resolved as `send` resolves its sender, so a path or another agent's name cannot be given. A symlink, a directory of another user, a loose mode or a name with a path separator or a leading dot is refused with one line and exit 2.
-
-No fleet command removes or empties a scratch directory or a file in it: the disk commands, the worktree reclaim, the rotation of the state directory and the daemon's passes never reach it, and the temp janitor keeps an entry that holds the state directory (`covers_scratch`). The bound is 100 MB: when `scratch` finds the directory over it, it prints one warning line (on stderr) naming the size and the bound, still prints the path and exits 0; the daemon records one `scratch.over_bound` audit line a day while it stays over. The bound never deletes or refuses anything.
-
-A scratch file is not a place for a secret or a token: the directory is private to you, but it is plain files on disk that nothing encrypts or expires.
-
 ### Editing your own comment in place (`comment --edit`, #1714)
 
 Cause: the ways to change a posted comment were three: `gh issue comment --edit-last` (only the caller's LAST comment on the issue), `gh api -X PATCH repos/R/issues/comments/ID` (refused for a lane by the signing rule: comments go only through `gh issue comment`, `gh pr comment`, `gh pr review` and `gh ... close --comment`, which `shims/gh` signs), and delete plus re-post (`--delete-last`). `fleet-switchboard comment` could only post a new comment. A plan comment is rarely the last comment (a receipt follows it), so on 31 Oct a lane deleted its own receipt and re-posted it 3 times to edit a plan.

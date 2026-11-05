@@ -122,7 +122,6 @@ _support_test_cases_02 = importlib.import_module("test_cases_02")   # support im
 TestWorkerRulesInSkills, TestJevClient, TestImportV1Converter, TestPlanCheckFeedback = (_support_test_cases_02.TestWorkerRulesInSkills, _support_test_cases_02.TestJevClient, _support_test_cases_02.TestImportV1Converter, _support_test_cases_02.TestPlanCheckFeedback)   # support import
 TestPlanReceipts, TestDecisionHeadlines, TestExternalAdapterErrors, TestJobTool = (_support_test_cases_02.TestPlanReceipts, _support_test_cases_02.TestDecisionHeadlines, _support_test_cases_02.TestExternalAdapterErrors, _support_test_cases_02.TestJobTool)   # support import
 TestPlanKind, TestAuditRotation, TestAgentsVerify, TestReviewLawsStarterSet = (_support_test_cases_02.TestPlanKind, _support_test_cases_02.TestAuditRotation, _support_test_cases_02.TestAgentsVerify, _support_test_cases_02.TestReviewLawsStarterSet)   # support import
-TestScratchBound = importlib.import_module("test_scratch_command").TestScratchBound
 TestPluginPush, TestReconcileOnRead = (_support_test_cases_02.TestPluginPush, _support_test_cases_02.TestReconcileOnRead)   # support import
 _support_test_cases_03 = importlib.import_module("test_cases_03")   # support import
 TestV2Client, TestStatus, TestPoke = (_support_test_cases_03.TestV2Client, _support_test_cases_03.TestStatus, _support_test_cases_03.TestPoke)   # support import
@@ -597,7 +596,7 @@ class TestFacts(Base):
     def test_the_registration_point_lists_the_lab_source(self):
         self.assertEqual([s.__name__ for s in sb.fact_sources(self.home)],
                          ["lab_facts", "worker_facts", "reminder_facts", "report_rider_facts", "held_send_facts", "foreground_facts",
-                          "orders_facts", "sweep_facts", "triage_facts", "plan_wake_facts", "alert_wake_facts", "red_ci_facts", "job_facts", "pane_facts", "pane_exit_facts", "headless_restart_facts", "disk_facts", "cpu_facts", "spotlight_facts", "docker_reap_facts", "temp_janitor_facts", "heavy_orphan_facts", "scratch_bound_facts"])
+                          "orders_facts", "sweep_facts", "triage_facts", "plan_wake_facts", "alert_wake_facts", "red_ci_facts", "job_facts", "pane_facts", "pane_exit_facts", "headless_restart_facts", "disk_facts", "cpu_facts", "spotlight_facts", "docker_reap_facts", "temp_janitor_facts", "heavy_orphan_facts"])
 
     def test_every_fact_source_class_in_the_module_is_registered(self):   # #1030: derived, so a new source cannot be left out
         registered = {type(s).__name__ for s in sb.fact_sources(self.home)}
@@ -10394,7 +10393,7 @@ class TestFrictionWake(FrictionBase):
         self.assertNotIn("friction_wake", sb.DEFAULTS)
         self.assertEqual([s.__name__ for s in sb.fact_sources(self.home)],
                          ["lab_facts", "worker_facts", "reminder_facts", "report_rider_facts", "held_send_facts", "foreground_facts",
-                          "orders_facts", "sweep_facts", "triage_facts", "plan_wake_facts", "alert_wake_facts", "red_ci_facts", "job_facts", "pane_facts", "pane_exit_facts", "headless_restart_facts", "disk_facts", "cpu_facts", "spotlight_facts", "docker_reap_facts", "temp_janitor_facts", "heavy_orphan_facts", "scratch_bound_facts"])
+                          "orders_facts", "sweep_facts", "triage_facts", "plan_wake_facts", "alert_wake_facts", "red_ci_facts", "job_facts", "pane_facts", "pane_exit_facts", "headless_restart_facts", "disk_facts", "cpu_facts", "spotlight_facts", "docker_reap_facts", "temp_janitor_facts", "heavy_orphan_facts"])
         self.assertNotIn("friction_wake", sb.validate_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR}))
         self.assertEqual(sb.FRICTION_DEFAULTS, {"enabled": False, "hour": 9, "to": "cos", "cos_to": "improver", "text": None})
         self.make("off")
@@ -66201,7 +66200,6 @@ RelayObeysTheTreeGuard = _relay_tree_guard.RelayObeysTheTreeGuard
 _sent_view = importlib.import_module("test_sent_view")
 _sent_view.World = World
 TestSentView = _sent_view.TestSentView
-TestScratchCommand = importlib.import_module("test_scratch_command").TestScratchCommand
 # The relay-loop tests of #1477, moved under the architecture cap.
 _relay_loop = importlib.import_module("test_relay_loop_cadence")
 RelayLoopCadence, TwoLoopsTrace, TrickleHub, HubFilesUnchanged, OneWorkerAndCancel = _relay_loop.RelayLoopCadence, _relay_loop.TwoLoopsTrace, _relay_loop.TrickleHub, _relay_loop.HubFilesUnchanged, _relay_loop.OneWorkerAndCancel
@@ -66269,7 +66267,6 @@ TestStopFinalMessage, TestStopFinalMessageMutants, TestStopFinalMessageTwoRuns, 
     _stop_final.TestStopFinalMessageTwoRunsMutant, _stop_final.TestStopFinalMessageHardening, _stop_final.TestStopFinalMessageHardeningMutant)
 TestStopFinalMessageEdges, TestStopFinalMessageEdgesMutant = _stop_final.TestStopFinalMessageEdges, _stop_final.TestStopFinalMessageEdgesMutant
 TestStopFinalMessageBare, TestStopFinalMessageBareMutant = _stop_final.TestStopFinalMessageBare, _stop_final.TestStopFinalMessageBareMutant
-TestScratchGuard = importlib.import_module("test_scratch_command").TestScratchGuard
 
 # The host-disk tests of #2081.
 TestHostDisk = importlib.import_module("test_host_disk").TestHostDisk

@@ -33,4 +33,3 @@ switchboard/installer.py
 switchboard/sent_view.py
 switchboard/bot_reviews.py
 switchboard/stage_event.py
-switchboard/scratch_dir.py
