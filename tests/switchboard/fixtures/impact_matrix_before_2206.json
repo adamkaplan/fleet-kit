@@ -1,0 +1,1034 @@
+{
+  "source": "MIL-STD-882E categories; cell assignments are this repository's own, stricter than the standard in places by design. This file is the single source of truth for the 4x5 impact matrix: the table in REVIEW_LAWS.md equals it (a test checks), and repo-side copies of REVIEW_LAWS.md copy that table.",
+  "severities": [
+    "Catastrophic",
+    "Critical",
+    "Marginal",
+    "Negligible"
+  ],
+  "probabilities": [
+    "Improbable",
+    "Remote",
+    "Occasional",
+    "Probable",
+    "Frequent"
+  ],
+  "not_rated": [
+    "Eliminated"
+  ],
+  "actions": {
+    "High": "H",
+    "Serious": "H",
+    "Medium": "2",
+    "Low": "."
+  },
+  "action_meaning": {
+    "H": "hold the pull request for the captain",
+    "2": "request a second independent review",
+    ".": "no action"
+  },
+  "cells": {
+    "Catastrophic": {
+      "Improbable": {
+        "level": "Serious",
+        "action": "H"
+      },
+      "Remote": {
+        "level": "High",
+        "action": "H"
+      },
+      "Occasional": {
+        "level": "High",
+        "action": "H"
+      },
+      "Probable": {
+        "level": "High",
+        "action": "H"
+      },
+      "Frequent": {
+        "level": "High",
+        "action": "H"
+      }
+    },
+    "Critical": {
+      "Improbable": {
+        "level": "Medium",
+        "action": "2"
+      },
+      "Remote": {
+        "level": "Serious",
+        "action": "H"
+      },
+      "Occasional": {
+        "level": "Serious",
+        "action": "H"
+      },
+      "Probable": {
+        "level": "High",
+        "action": "H"
+      },
+      "Frequent": {
+        "level": "High",
+        "action": "H"
+      }
+    },
+    "Marginal": {
+      "Improbable": {
+        "level": "Low",
+        "action": "."
+      },
+      "Remote": {
+        "level": "Medium",
+        "action": "2"
+      },
+      "Occasional": {
+        "level": "Medium",
+        "action": "2"
+      },
+      "Probable": {
+        "level": "Serious",
+        "action": "H"
+      },
+      "Frequent": {
+        "level": "Serious",
+        "action": "H"
+      }
+    },
+    "Negligible": {
+      "Improbable": {
+        "level": "Low",
+        "action": "."
+      },
+      "Remote": {
+        "level": "Low",
+        "action": "."
+      },
+      "Occasional": {
+        "level": "Low",
+        "action": "."
+      },
+      "Probable": {
+        "level": "Medium",
+        "action": "2"
+      },
+      "Frequent": {
+        "level": "Medium",
+        "action": "2"
+      }
+    }
+  },
+  "owner_hold": {
+    "meaning": "Which holds need the owner's own clear. Only a change to credentials, identity or who may do what holds for the owner; every other floor path or rating asks for a second independent review and the usual checks decide the merge. The code reads this block and has no path or class list of its own.",
+    "top_tier_classes": [
+      "credentials",
+      "identity",
+      "authority"
+    ],
+    "other_classes": [
+      "availability",
+      "data",
+      "performance",
+      "correctness",
+      "compatibility",
+      "privacy",
+      "cost"
+    ],
+    "top_tier_paths": {
+      "credentials": [
+        "shims/gh",
+        "shims/git",
+        "cloud/launcher/token_mint.py",
+        "cloud/launcher/cloud_worker.py",
+        "cloud/launcher/app_token.py",
+        "cloud/launcher/preflight.py",
+        "cloud/worker/entrypoint.sh",
+        "cloud/launcher/repo-approvals.json"
+      ],
+      "identity": [
+        "shims/**",
+        "bin/switchboard-trial"
+      ],
+      "authority": [
+        "bin/plan_ledger.py",
+        "bin/plan_approval.py",
+        "bin/epic_record.py",
+        "bin/impact_floor.py",
+        "bin/chat_clear.py",
+        "bin/merge_gate.py",
+        "bin/size_ceilings.py",
+        "bin/clear_carry.py",
+        "bin/reassign.py",
+        "bin/item_verdicts.py",
+        "bin/launch_testers.py",
+        "bin/plan_review.py",
+        "bin/decision_core.py",
+        "bin/lanes.py",
+        "bin/orders_copy.py",
+        "bin/charter_check.py",
+        "bin/cloud_worker.py",
+        "bin/cloud_channel.py",
+        "bin/cloud_channel_server.py",
+        "bin/cloud_relay_daemon.py",
+        "bin/cloud_hub.py",
+        "bin/cloud_relay.py",
+        "cloud/worker/bin/cloud_relay.py",
+        "bin/cloud_cli.py",
+        "bin/cloud_cluster.py",
+        "bin/external_adapter.py",
+        "bin/delegated_clear.py",
+        "bin/impact_hold.py",
+        "docs/review-laws/impact-matrix.json",
+        "plugins/fleet-hooks/**",
+        "tools/cos-permissions-proof/**",
+        "agents/**",
+        ".github/workflows/**"
+      ]
+    },
+    "narrow_by_diff": {
+      "meaning": "Paths whose hold depends on their CONTENT: an agent definition holds for the owner only when its permission block changes between the base and the head of the pull request (the top level front matter keys named here); an added, removed or unreadable definition holds, and so does a pull request that changes more than max_files of them. The code has no path or key of its own.",
+      "paths": [
+        "agents/**"
+      ],
+      "keys": [
+        "permissions",
+        "permission",
+        "mode",
+        "tools"
+      ],
+      "max_files": 8
+    },
+    "floor": {
+      "adamkaplan/fleet-kit": {
+        "globs": [
+          "shims/**",
+          "plugins/fleet-hooks/**",
+          "templates/**",
+          "tools/cos-permissions-proof/**",
+          "bin/plan_ledger.py",
+          "bin/plan_approval.py",
+          "bin/epic_record.py",
+          "bin/impact_floor.py",
+          "bin/chat_clear.py",
+          "bin/merge_gate.py",
+          "bin/size_ceilings.py",
+          "bin/clear_carry.py",
+          "bin/reassign.py",
+          "bin/item_verdicts.py",
+          "bin/launch_testers.py",
+          "bin/plan_review.py",
+          "bin/decision_core.py",
+          "bin/lanes.py",
+          "bin/orders_copy.py",
+          "bin/charter_check.py",
+          "bin/cloud_worker.py",
+          "bin/cloud_channel.py",
+          "bin/cloud_channel_server.py",
+          "bin/cloud_relay_daemon.py",
+          "bin/cloud_hub.py",
+          "bin/cloud_relay.py",
+          "cloud/worker/bin/cloud_relay.py",
+          "bin/cloud_cli.py",
+          "bin/cloud_cluster.py",
+          "bin/external_adapter.py",
+          "bin/delegated_clear.py",
+          "bin/impact_hold.py",
+          "docs/review-laws/impact-matrix.json",
+          "cloud/launcher/app_token.py",
+          "cloud/launcher/preflight.py",
+          "cloud/worker/entrypoint.sh"
+        ],
+        "exclude": [
+          "agents/**",
+          "skills/**",
+          "docs/**",
+          "AGENTS.md"
+        ],
+        "force": [
+          "bin/impact_floor.py",
+          "docs/review-laws/impact-matrix.json"
+        ]
+      }
+    },
+    "top_tier_outside_floor": [
+      "agents/**",
+      "cloud/launcher/token_mint.py",
+      "cloud/launcher/cloud_worker.py",
+      "cloud/launcher/repo-approvals.json",
+      ".github/workflows/**",
+      "bin/switchboard-trial"
+    ],
+    "authority_modules": {
+      "meaning": "Every module in bin/ that defines a function whose name has a word of `vocabulary` (names split at underscores) decides who may clear, hold, release, carry, consent to, record a verdict for or merge something, so it must be a top tier path above or be named in `exempt` with the reason it is not. A test reads this block and fails, naming the module, when a module is neither. The vocabulary is data: adding a word here widens the guard with no code change. A SECOND rule does not look at names: a module with a comparison (==, !=, in, not in) against one of the `role_literals` (the role names the fleet checks a caller by) decides who may act, so it must be listed or exempted too; a renamed function cannot hide it. When in doubt, LIST: an exemption needs a reason a reviewer can verify. `limits` says what the guard cannot see.",
+      "vocabulary": [
+        "clear",
+        "clearing",
+        "hold",
+        "holds",
+        "release",
+        "carry",
+        "consent",
+        "verdict",
+        "authority",
+        "owner",
+        "gate",
+        "gates",
+        "approve",
+        "approved",
+        "allow",
+        "allowed",
+        "allows",
+        "may",
+        "merge",
+        "merged",
+        "waive",
+        "waiver",
+        "grant",
+        "permit",
+        "authorize",
+        "revoke",
+        "deny",
+        "decide",
+        "caller",
+        "role",
+        "refuse",
+        "refused",
+        "refusal",
+        "chief",
+        "operator",
+        "person",
+        "only"
+      ],
+      "exempt": {
+        "bin/brief_advisory.py": "is_advisory and owner_hold_wanted only read a brief that bin/impact_brief.py built and answer whether the daemon writes an owner-hold label for a pull request the floor already holds; they clear, release and merge nothing. Trace: the only callers are impact_plan in bin/impact_hold.py and the Decisions row in bin/decision_core.py; the clear itself (bin/delegated_clear.py) does not read them, and a pull request whose brief names a material risk is held as before.",
+        "bin/path_suites.py": "gate_finding words an INFORMATION line (a pull request changes a path and names none of the suites that exercise it). Trace: its only caller is the gates finding in bin/fleet-switchboard, which prints the line for people to read and never changes a gate verdict; no role, tier, identity, verdict, clear or merge is produced or read (ask #1045).",
+        "bin/agent_calls.py": "release_notice gives back a once-an-hour message claim for an account's budget notice. Trace: its only caller is the budget notice command in bin/fleet-switchboard, which calls it after claim_notice when the reminder could not be added; it truncates a rate-limit file in the state directory and returns nothing, so no role, tier, identity, verdict or clear is produced or read.",
+        "bin/spotlight_guard.py": "holds_files tells whether a folder holds an entry. Trace: used only inside bin/spotlight_guard.py (the Spotlight index check of ask #438); the module returns no role, tier, identity, verdict or clear, and nothing in bin/ reads its result as one.",
+        "bin/triage_digest.py": "gate is a rate limit on the stale digest (warm-up and interval). Trace: its only caller is the triage digest in bin/fleet-switchboard, where `allowed` decides whether a digest message is SENT now; no role, tier, verdict or clear is produced or read.",
+        "bin/triage_plan_open.py": "merged_links reads which links a merged unit names. Trace: its callers are the triage's plan-open check in bin/fleet-switchboard, which only lists findings for people to read; nothing it returns reaches answer_authority, a caller check, a verdict or a clear."
+      },
+      "role_literals": [
+        "chief-of-staff",
+        "operator",
+        "orchestrator"
+      ],
+      "limits": [
+        "The guard reads function NAMES (underscore-separated words) and COMPARISONS (==, !=, in, not in) against the role literals, in the .py files of bin/ only.",
+        "It cannot see: a role held in a constant or variable and compared by that name; a check written with startswith, endswith, a regular expression, match/case or a dictionary lookup; a literal built at run time; code that is not a .py file in bin/ (bin/fleet-switchboard, scripts, shims, plugins, agents); a value that is PRODUCED by an unlisted module and later read by an authority function (a producer trace is the reviewer's).",
+        "The fallback: the strict review (the independent reviewer) looks for exactly these, as R-LAW-12 and the owner-hold rule say, and an exemption must carry a trace of where its values go. When in doubt, LIST."
+      ]
+    },
+    "note": "top_tier_outside_floor lists the top tier paths that are deliberately not in the floor globs (the floor excludes agent definitions, which are captain pull requests); a test checks that every other top tier path is inside the floor. bin/fleet-switchboard selects accounts and mints tokens but is not a top tier path (it would hold nearly every change): a change there to credentials or identity must be rated with that class by the independent review.",
+    "never_carried_paths": [
+      "bin/chat_clear.py",
+      "bin/merge_gate.py",
+      "bin/clear_carry.py",
+      "bin/delegated_clear.py",
+      "bin/impact_floor.py",
+      "bin/impact_hold.py",
+      "bin/impact_brief.py",
+      "bin/brief_advisory.py",
+      "bin/plan_check.py",
+      "bin/plan_ledger.py",
+      "bin/repo_exclusion.py",
+      "docs/review-laws/impact-matrix.json",
+      "tools/derive-closure",
+      "tests/switchboard/test_closure.py",
+      "bin/fleet-switchboard.parts"
+    ],
+    "never_carried_meaning": "The owner's clear is NEVER carried over a merge of main that resolved a conflict by hand (bin/clear_carry.py, bin/impact_hold.py: the carry reads this list through impact_floor.carry_never_paths and holds no path of its own) when that merge touches one of these paths or the pull request's own change does: the clear's own code and this matrix. Credential and identity paths are not here: they are carried like any other path (the owner's answer, ask #815). Every exact path of `delegated_clear.clear_code_paths` is here, because the ledger and the plan check decide who may confirm a carry; its directory globs (the plugin, the shims, the templates, the proof tools, the workflows) are not, and the shims are identity paths the owner chose to carry. A test checks both lists against each other and that every bin module named for the clear, the hold or the floor is here. The guard for what is not listed (the daemon file, the globs) is the independent reviewer's confirmation and the continuous tests, not a proof.",
+    "substance_decider": {
+      "meaning": "Who may decide a clear on the SUBSTANCE of the impact brief (bin/delegated_clear.py `decide_on_substance` reads this block). A class listed in `owner_only` is always the owner's: the merge shim and the clear-and-hold machinery's own decision of who may clear. A class listed in `chief_of_staff` (every other class the brief knows, a test derives both lists from bin/impact_brief.py KNOWN_CLASSES) may be decided by the Chief of Staff only when the brief names no material risk (a credentials, identity, issuance, spend or authority path the diff ADDS to is one), no loosening and no `not shown` piece. A class named in neither is unknown and is the owner's. Nothing is relaxed by default.",
+      "owner_only": ["clear_machinery", "merge_shim"],
+      "owner_only_paths": {
+        "clear_machinery": ["docs/review-laws/impact-matrix.json", "bin/delegated_clear.py", "bin/chat_clear.py", "bin/clear_carry.py", "bin/impact_hold.py", "bin/impact_floor.py", "bin/impact_brief.py", "bin/brief_advisory.py", "bin/plan_check.py", "bin/plan_ledger.py", "bin/repo_exclusion.py", "bin/fleet-switchboard", "plugins/fleet-hooks/**", "templates/**", "tools/cos-permissions-proof/**", "tools/derive-closure", "tests/switchboard/test_closure.py", "bin/fleet-switchboard.parts", ".github/workflows/**"],
+        "merge_shim": ["bin/merge_gate.py", "shims/**"]
+      },
+      "owner_only_paths_meaning": "The REAL path list that makes the owner-only classes reachable (bin/impact_brief.py `classify` reads it): every path of `delegated_clear.clear_code_paths` is in exactly one of the two lists (a test checks it), plus bin/brief_advisory.py and bin/fleet-switchboard (the whole file: the brief sees files, not hunks, so a change to the daemon file is read as a change to the clear's code and fails closed to the owner).",
+      "chief_of_staff": ["authority", "code", "credentials", "docs", "identity", "issuance", "owner_voice", "release", "review_definitions", "spend", "tests"],
+      "material_risks": ["credentials_widened", "issuance_widened", "spend", "irreversible", "speaks_for_owner", "authority_widened"]
+    },
+    "delegated_clear": {
+      "meaning": "What the Chief of Staff's clear under the owner's standing order may NEVER lift (bin/delegated_clear.py reads this block and holds no path, class or function name of its own). For an order WITHOUT a `max_level`, two refusals apply. The first refuses a pull request whose top tier path hits include a class of `never_path_classes`. The second refuses a pull request whose independent review's class is one of `top_tier_review_classes` (or none is recorded). For an order WITH a `max_level`, the score rule in `score` replaces those two refusals. The refusals below apply either way, with or without a `max_level`. A pull request that changes ANY file matching `clear_code_paths` (the clear and hold machinery by name, and the directories the daemon and the CLI load at start) is refused: never delegated also means ALWAYS HELD for the owner, because the floor holds a pull request that changes one of them (the code the clear merely loads, `closure_files`, is outside that hold until the closure ask #940 lands). A pull request that ADDS, DELETES or RENAMES a file matching `new_file_globs` (a new file under bin/ is loaded at config load) is refused. A pull request that changes a file of `closure_files` (the daemon file and the bin modules the clear loads or runs (the daemon's imports at load, the config readers every module declares, and a recorded run of the clear: a test derives the list); for a module other than the daemon file ANY import-time statement, and the functions of `module_roots`) on a line that belongs to the CLEAR CLOSURE is refused: the definitions reachable by name from `closure_roots`, the module-level bindings they read, any other top-level statement, or a definition that refers to a `clear_entry_points` name. Other changes under bin/ (an authority module edit that does not change who may do what) are allowed.",
+      "score": {
+      "meaning": "The score rule (#835), used for an order that sets max_level: the score is the highest LEVEL of the matrix's cells for the independent impact reviewer's records at the pull request's exact head, on the ladder below. A changed path of a top tier class (the rule ids below name the classes) makes `floor.lowest_level` the lowest score allowed: a rating below it on such a path is refused, and the rating's reason must name the rule id. Only a level of `delegable_levels` may be cleared: High is always the owner's. Only a record whose recorded role is in `rating_roles` counts. The clear code holds no level, rule id or role of its own.",
+      "ladder": ["Low", "Medium", "Serious", "High"],
+      "delegable_levels": ["Low", "Medium", "Serious"],
+      "rating_roles": ["reviewer"],
+      "floor": {
+        "lowest_level": "Serious",
+        "rules": {
+          "floor-credentials": "credentials",
+          "floor-identity": "identity",
+          "floor-authority": "authority"
+        }
+      }
+    },
+    "never_path_classes": [
+        "credentials",
+        "identity"
+      ],
+      "top_tier_review_classes": [
+        "credentials",
+        "identity",
+        "authority"
+      ],
+      "clear_code_paths": [
+        "docs/review-laws/impact-matrix.json",
+        "bin/delegated_clear.py",
+        "bin/chat_clear.py",
+        "bin/merge_gate.py",
+        "bin/clear_carry.py",
+        "bin/impact_hold.py",
+        "bin/impact_floor.py",
+        "bin/impact_brief.py",
+        "bin/brief_advisory.py",
+        "bin/plan_check.py",
+        "bin/plan_ledger.py",
+        "bin/repo_exclusion.py",
+        "plugins/fleet-hooks/**",
+        "shims/**",
+        "templates/**",
+        "tools/cos-permissions-proof/**",
+        "tools/derive-closure",
+        "tests/switchboard/test_closure.py",
+        "bin/fleet-switchboard.parts",
+        ".github/workflows/**"
+      ],
+      "new_file_globs": [
+        "bin/**"
+      ],
+      "closure_files": [
+        "bin/fleet-switchboard",
+        "bin/agent_calls.py",
+        "bin/agent_presence.py",
+        "bin/awaiting_live.py",
+        "bin/ci_fresh.py",
+        "bin/ci_runs.py",
+        "bin/cloud_client.py",
+        "bin/cloud_worker.py",
+        "bin/comment_cursor.py",
+        "bin/cpu_guard.py",
+        "bin/dead_hint.py",
+        "bin/decision_core.py",
+        "bin/decision_sync.py",
+        "bin/disk_janitor.py",
+        "bin/endpoint_send.py",
+        "bin/fleet_health.py",
+        "bin/header_cache.py",
+        "bin/heavy_slots.py",
+        "bin/item_verdicts.py",
+        "bin/plan_review.py",
+        "bin/pr_events.py",
+        "bin/pr_reading.py",
+        "bin/push_watch.py",
+        "bin/queue_ejections.py",
+        "bin/record_json.py",
+        "bin/reassign.py",
+        "bin/red_ci.py",
+        "bin/reds.py",
+        "bin/registry.py",
+        "bin/report_fold.py",
+        "bin/spotlight_guard.py",
+        "bin/triage_digest.py",
+        "bin/turn_start.py",
+        "bin/queued_wait.py",
+        "bin/unconsumed_record.py",
+        "bin/work_sync.py",
+        "bin/switchboard/plan_input.py",
+        "bin/switchboard/observing.py",
+        "bin/switchboard/v2_transport.py",
+        "bin/switchboard/facts.py",
+        "bin/switchboard/import_v1.py",
+        "bin/switchboard/decisions_a.py",
+        "bin/switchboard/reminders.py",
+        "bin/switchboard/plan_review.py",
+        "bin/switchboard/triage.py",
+        "bin/switchboard/alert_labels.py",
+        "bin/switchboard/link_scrub.py",
+        "bin/switchboard/handoff.py",
+        "bin/switchboard/audit.py",
+        "bin/switchboard/decision.py",
+        "bin/switchboard/engine.py",
+        "bin/switchboard/jev.py",
+        "bin/switchboard/faults.py",
+        "bin/switchboard/shadow_classifier.py",
+        "bin/switchboard/worktree_lifecycle.py",
+        "bin/switchboard/review_laws.py",
+        "bin/switchboard/job_runs.py",
+        "bin/switchboard/standing_authority.py",
+        "bin/switchboard/secret_spans.py",
+        "bin/switchboard/caches.py",
+        "bin/switchboard/profile_pieces.py",
+        "bin/switchboard/installer.py",
+        "bin/switchboard/stage_event.py",
+        "bin/switchboard/scratch_dir.py",
+        "bin/switchboard/docker_reaper.py",
+        "bin/switchboard/workers_report.py",
+        "bin/switchboard/batch_decision.py",
+        "bin/switchboard/sweep.py",
+        "bin/switchboard/plan_notice.py",
+        "bin/switchboard/heavy_budget.py",
+        "bin/switchboard/config_reload.py",
+        "bin/switchboard/labels_ensure.py"
+      ],
+      "daemon_file": "bin/fleet-switchboard",
+      "module_roots": {
+        "bin/agent_presence.py": [
+          "*"
+        ],
+        "bin/record_json.py": [
+          "*"
+        ],
+        "bin/turn_start.py": [
+          "*"
+        ],
+        "bin/ci_fresh.py": [
+          "*"
+        ],
+        "bin/pr_reading.py": [
+          "*"
+        ],
+        "bin/queued_wait.py": [
+          "*"
+        ],
+        "bin/unconsumed_record.py": [
+          "*"
+        ],
+        "bin/awaiting_live.py": [
+          "validate"
+        ],
+        "bin/ci_runs.py": [
+          "*",
+          "_details_repo",
+          "_identity",
+          "_rank",
+          "_run_id",
+          "_started",
+          "_time",
+          "_unfinished",
+          "_winners",
+          "latest_runs",
+          "newest",
+          "own_repo"
+        ],
+        "bin/cloud_client.py": [
+          "*"
+        ],
+        "bin/endpoint_send.py": [
+          "*"
+        ],
+        "bin/cloud_worker.py": [
+          "read_record_file"
+        ],
+        "bin/red_ci.py": [
+          "*"
+        ],
+        "bin/cpu_guard.py": [
+          "settings",
+          "validate"
+        ],
+        "bin/decision_core.py": [
+          "one_line"
+        ],
+        "bin/header_cache.py": ["_dir", "_h", "drop", "usable"],
+        "bin/disk_janitor.py": [
+          "settings",
+          "validate"
+        ],
+        "bin/fleet_health.py": [
+          "validate"
+        ],
+        "bin/heavy_slots.py": [
+          "settings"
+        ],
+        "bin/item_verdicts.py": [
+          "registrations",
+          "validate_item_checks"
+        ],
+        "bin/queue_ejections.py": [
+          "validate"
+        ],
+        "bin/push_watch.py": [
+          "settings"
+        ],
+        "bin/reassign.py": [
+          "*"
+        ],
+        "bin/registry.py": [
+          "*"
+        ],
+        "bin/reds.py": [
+          "settings"
+        ],
+        "bin/report_fold.py": [
+          "*"
+        ],
+        "bin/spotlight_guard.py": [
+          "settings",
+          "validate"
+        ],
+        "bin/switchboard/plan_input.py": [
+          "_parent_ask_done_when",
+          "fetch_plan",
+          "governing_done_when",
+          "load_plan",
+          "parse_plan_source",
+          "plan_comment_choice"
+        ],
+        "bin/switchboard/observing.py": [
+          "Discovery",
+          "Observation",
+          "_created",
+          "_fleet_keys",
+          "_fleet_meta",
+          "_seconds",
+          "agent_session",
+          "iso",
+          "program_version",
+          "resolve_program",
+          "runs_program"
+        ],
+        "bin/switchboard/v2_transport.py": [
+          "V2Breaker",
+          "V2Client",
+          "V2Error",
+          "V2Http",
+          "V2Unreachable",
+          "_V2Unauthorized",
+          "_one_line",
+          "_without",
+          "refuse_real_opencode_under_test",
+          "state_write",
+          "v2_service_file",
+          "valid_description"
+        ],
+        "bin/switchboard/facts.py": [
+          "CpuFacts",
+          "DiskFacts",
+          "FactError",
+          "SpotlightFacts",
+          "disk_free",
+          "disk_guard_settings",
+          "validate_disk_guard"
+        ],
+        "bin/switchboard/import_v1.py": [
+        ],
+        "bin/switchboard/decisions_a.py": [
+          "parse_bare_pr_ref"
+        ],
+        "bin/switchboard/reminders.py": [
+          "ReminderError",
+          "ReminderFacts",
+          "_clean_line",
+          "add_reminder",
+          "alert_stale",
+          "alert_subject",
+          "delayed_text",
+          "digest_replaced",
+          "drop_superseded_item",
+          "found_reason",
+          "is_digest",
+          "judge_delivery",
+          "merge_reminder_copies",
+          "merge_wake",
+          "merge_wake_facts",
+          "pass_stale",
+          "pass_subject",
+          "read_record_file",
+          "read_reminders",
+          "reminder_bound",
+          "reminders_lock",
+          "remove_reminders",
+          "wake_class_of",
+          "write_reminders"
+        ],
+        "bin/switchboard/plan_review.py": [
+          "ReviewError",
+          "_read_capped"
+        ],
+        "bin/switchboard/triage.py": [
+          "_alert_bad_label",
+          "_alert_bad_repo",
+          "_alert_duplicate_label",
+          "_alert_labels_not_a_list",
+          "_alert_not_a_map",
+          "_alert_repo_not_read",
+          "_check_sla",
+          "_standing_day",
+          "parked_until",
+          "read_mark",
+          "standing_line",
+          "triage_awaiting_labels",
+          "triage_body_standing",
+          "triage_says_reviewed",
+          "validate_triage_config",
+          "whole",
+          "whole_skipped"
+        ],
+        "bin/switchboard/alert_labels.py": [
+          "AlertWakeFacts",
+          "RedCiFacts",
+          "TriageFacts"
+        ],
+        "bin/switchboard/link_scrub.py": [
+        ],
+        "bin/switchboard/handoff.py": [
+          "WorkerFacts",
+          "_Unread",
+          "_boss_of",
+          "_guard_awaiting_issue",
+          "_guard_awaiting_pr",
+          "_guard_ci",
+          "_guard_decision",
+          "_guard_last_report",
+          "_guard_reminder",
+          "_guard_review_requested",
+          "_guard_review_window",
+          "_issue_of",
+          "_label_names",
+          "_owned_issue",
+          "_owned_pulls",
+          "_owned_work_items",
+          "_readable_head",
+          "_readable_time",
+          "_stalled_age",
+          "legitimately_waiting",
+          "owned_readable",
+          "reply_text",
+          "worker_horizon",
+          "worker_owned"
+        ],
+        "bin/switchboard/audit.py": [
+          "AuditLog",
+          "_sensitive",
+          "redact",
+          "utc_now"
+        ],
+        "bin/switchboard/decision.py": [
+          "InterruptRefused",
+          "MessageTooLong",
+          "Plan",
+          "_line_of",
+          "clock_day",
+          "clock_utc",
+          "collapse_riders",
+          "compose",
+          "compose_order",
+          "decide",
+          "delayed_since",
+          "describe_items",
+          "finding_part",
+          "finding_parts",
+          "hold_reason",
+          "in_late_scope",
+          "is_withdrawal",
+          "orders_note",
+          "sent_at",
+          "steers_into_turn",
+          "superseded_by",
+          "text_parts"
+        ],
+        "bin/switchboard/engine.py": [
+          "KeyTimes",
+          "LockError",
+          "SentLedger"
+        ],
+        "bin/switchboard/jev.py": [
+          "JevClient",
+          "JevError",
+          "KeyFileError",
+          "ReplayJev",
+          "_canonical",
+          "_checked_jev_settings",
+          "_clip",
+          "_is_probability",
+          "_scrub_provider_text",
+          "_usage_of",
+          "build_jev",
+          "check_answers",
+          "jev_key_file",
+          "locate_jev_key",
+          "validate_jev_config"
+        ],
+        "bin/switchboard/faults.py": [
+          "FaultError",
+          "SimulatedCrash",
+          "active_faults",
+          "fault"
+        ],
+        "bin/switchboard/shadow_classifier.py": [
+          "_ask_of"
+        ],
+        "bin/switchboard/worktree_lifecycle.py": [
+          "_git",
+          "_unregister_worktree",
+          "read_worktrees",
+          "reclaim_for_agent",
+          "reclaim_worktree",
+          "validate_worktree_config",
+          "worktree_config",
+          "worktree_facts",
+          "worktree_in_use",
+          "worktree_session_in_use",
+          "worktree_session_index",
+          "worktree_sweep"
+        ],
+        "bin/switchboard/review_laws.py": [
+          "_private_parse",
+          "_review_pr",
+          "block_table_text",
+          "local_review_overlay",
+          "parse_files_read_row",
+          "parse_review_block",
+          "pr_changed_bounds",
+          "pr_changed_paths",
+          "rating_inputs",
+          "record_inputs",
+          "review_law_files",
+          "review_laws_text",
+          "whole_read_problem"
+        ],
+        "bin/switchboard/job_runs.py": [
+          "JobFacts",
+          "boot_time",
+          "job_age",
+          "job_end_reason",
+          "job_last_seen",
+          "job_paths",
+          "job_private",
+          "job_process_token",
+          "job_read",
+          "job_record_end",
+          "job_state",
+          "jobs_dir"
+        ],
+        "bin/switchboard/standing_authority.py": [
+          "_legacy_authority",
+          "_orders_section",
+          "fetch_charter_body",
+          "fetch_orders",
+          "parse_orders",
+          "section_orders"
+        ],
+        "bin/switchboard/secret_spans.py": [
+          "_secret_position",
+          "find_secret_span",
+          "secret_where"
+        ],
+        "bin/switchboard/caches.py": [
+          "BoundedFileCache",
+          "_audit_tail",
+          "_valid_context"
+        ],
+        "bin/switchboard/profile_pieces.py": [
+          "InstallError"
+        ],
+        "bin/switchboard/installer.py": [
+          "reaper_only_conflict"
+        ],
+        "bin/switchboard/stage_event.py": [
+          "stage_check_config"
+        ],
+        "bin/switchboard/scratch_dir.py": [
+          "ScratchBoundFacts",
+          "scratch_bytes"
+        ],
+        "bin/switchboard/docker_reaper.py": [
+          "DockerReapFacts",
+          "Fact",
+          "HeavyOrphanFacts",
+          "TempJanitorFacts",
+          "_docker_executable",
+          "_docker_inspect",
+          "_docker_labelled",
+          "_docker_problem",
+          "_docker_run",
+          "docker_reap",
+          "fact_sources",
+          "janitor_apply_allowed",
+          "lab_fact_source",
+          "read_janitor_record"
+        ],
+        "bin/switchboard/workers_report.py": [
+          "ReportError",
+          "ask_report_owed",
+          "assigning_input",
+          "report_jev",
+          "report_owed_questions",
+          "report_owed_state",
+          "triage_stop",
+          "validate_report_triage_config"
+        ],
+        "bin/switchboard/batch_decision.py": [
+          "boss_name",
+          "numbered_lines",
+          "resolve_boss",
+          "synthetic_lines",
+          "transcript_lines"
+        ],
+        "bin/switchboard/sweep.py": [
+          "SweepFacts",
+          "sweep_ref_of",
+          "validate_sweep_config"
+        ],
+        "bin/switchboard/plan_notice.py": [
+          "PlanWakeFacts"
+        ],
+        "bin/switchboard/heavy_budget.py": [
+          "SourceBudget",
+          "_cloud_boss",
+          "cloud_sender",
+          "set_source_state",
+          "source_budget_seconds",
+          "validate_load_alert_config",
+          "validate_source_budgets"
+        ],
+        "bin/switchboard/config_reload.py": [
+          "load_runnable_config"
+        ],
+        "bin/switchboard/labels_ensure.py": [
+          "ensure_labels",
+          "label_names",
+          "read_open_items"
+        ]
+      },
+      "registrar_allow": {
+        "meaning": "The ONE allow table of the registrar lint (bin/delegated_clear.py `registrar_findings`, #964). A registrar may set up its own parsers and nothing else: any import, any write outside its own names, any call of a function it neither defines nor receives is held for the owner, EXCEPT the pure builtins and the registration helpers named here. The builtins are listed by name and are only ones that cannot reach or rebind another object (never getattr, setattr, delattr, eval, exec, compile, globals, locals, vars, __import__ or open: a test pins them absent). `parser_methods` are the argparse methods a registrar may call on the parser it is handed or on one it built; every other member of the handed parser (`choices`, `_name_parser_map`, `_actions`, `_defaults`, `_registries`, `parser_class`...) is shared with the other commands and is held, and a store is allowed only as a plain store of a literal on a parser the registrar built. A registration helper is a daemon-file function that argparse calls as a `type=`; a test verifies each is pure and that every daemon-file callable a real registrar hands to its parser is listed. The lint does not read a helper as part of a registrar, so a changed line of a helper holds for the owner. argparse RUNS what it is handed as `type=`, `action=`, a default it converts and `choices=` at parse time, so a value for any argument or keyword of a parser method except `free_keywords` (text, or a function stored by set_defaults `func=`) must be a literal, a builtin or helper of this table or a function the registrar defines; `action=` takes a string literal only. `aliases=` on add_parser and set_defaults on the handed parser are held (they name another command or set defaults every command shares); a command name equal to an existing one is an accepted residual risk the lint cannot see (the names are the other registrars'). `super` is not in the table: a registrar that calls it is held (the helpers may call it, by their own purity test). Growing this table is itself an edit of this file, which is the owner's clear.",
+        "pure_builtins": ["abs", "all", "any", "bool", "dict", "enumerate", "float", "frozenset", "int", "isinstance", "issubclass", "len", "list", "max", "min", "range", "repr", "reversed", "set", "sorted", "str", "sum", "tuple", "zip"],
+        "helpers": ["RepoIssue", "issue_arg", "parse_issue_ref"],
+        "parser_methods": ["add_argument", "add_argument_group", "add_mutually_exclusive_group", "add_parser", "add_subparsers", "set_defaults"],
+        "free_keywords": ["help", "dest", "metavar", "required", "nargs", "const", "func"]
+      },
+      "dynamic_actions": [
+        "review"
+      ],
+      "rating_roots": [
+        "add_review_parsers",
+        "build_parser",
+        "call_command",
+        "cmd_review",
+        "command_registrars",
+        "dispatch",
+        "main",
+        "resolve_command",
+        "parse_review_block"
+      ],
+      "closure_roots": [
+        "CLEAR_NOTICE_BACKOFF",
+        "CLEAR_NOTICE_CLAIM_SECONDS",
+        "CLEAR_NOTICE_KINDS",
+        "CLEAR_NOTICE_MAX_AGE_SECONDS",
+        "CLEAR_NOTICE_PASS_MAX",
+        "CLEAR_NOTIFIED_FILE",
+        "CLEAR_NOTIFIED_MAX",
+        "CLEAR_PENDING_BODY_MAX",
+        "CLEAR_PENDING_FILE",
+        "CLEAR_PENDING_MAX",
+        "CLEAR_REMINDED_FILE",
+        "ConfigError",
+        "CosOrdersError",
+        "DEFAULTS",
+        "EXIT_ERROR",
+        "EXIT_OK",
+        "EXIT_USAGE",
+        "HELPER_MODULES",
+        "IMPACT_STATE_FILE",
+        "IMPACT_STATE_MAX_BYTES",
+        "ImpactStateBusy",
+        "IntentError",
+        "LABEL_SPECS",
+        "NOTIFY_CLEAR_DEADLINE_SECONDS",
+        "NoticeError",
+        "OWNER_HOLD_KEY",
+        "PROG",
+        "Path",
+        "_PLAN_ISSUE_RE",
+        "_PLAN_REF_SHORT",
+        "_audit_tail",
+        "_finite",
+        "_gh_write",
+        "_intent_reader",
+        "_is_orchestrator",
+        "_make_loader",
+        "_one_line",
+        "_read_small",
+        "_write_small",
+        "authoritative_plan",
+        "boss_name",
+        "build_engine",
+        "change_issue_labels",
+        "checked_plan",
+        "cos_orders_text_of",
+        "ensure_labels",
+        "ensure_state_dir",
+        "fetch_orders",
+        "gates_caller_kind",
+        "impact_carry_get",
+        "impact_carry_marks",
+        "impact_floor",
+        "impact_rating_entries",
+        "impact_records",
+        "impact_review_record",
+        "impact_state_lock",
+        "json",
+        "label_names",
+        "load_config",
+        "load_module",
+        "notice_senders",
+        "os",
+        "parse_pr_ref",
+        "plan_ledger",
+        "pr_facts_from",
+        "pr_floor_report",
+        "pr_marker",
+        "re",
+        "read_cos_orders",
+        "read_open_items",
+        "read_pr_json",
+        "read_pr_notices",
+        "redact_command_text",
+        "subprocess",
+        "sys",
+        "threading",
+        "types",
+        "whole_skipped"
+      ],
+      "clear_entry_points": [
+        "impact_clear_core",
+        "cmd_impact_clear",
+        "delegated_clear_checks",
+        "delegated_clear_pr_checks",
+        "chat_clear_apply",
+        "chat_clear_pass",
+        "write_impact_state",
+        "impact_state_lock",
+        "notify_clear",
+        "neutralise_marker",
+        "gates_caller_kind"
+      ],
+      "closure_exempt": {
+        "bin/agent_reconcile.py": "loaded only by `reconcile_agents_on_read`, called by `cmd_status`'s view reconcile, which the clear never calls",
+        "bin/closed_labels.py": "loaded only by `publish_decisions` (the decision list), which the clear never calls",
+        "bin/cloud_end_alert.py": "loaded only by `cloud_end_tick` and `cloud_turn_tick` (via `load_module`), both called only by `finish_pass` (after `cloud_watch_tick`), not by the clear",
+        "bin/pod_silence.py": "loaded only by `pod_silence_tick` (via `load_module`), called only by `finish_pass` (after `cloud_turn_tick`), not by the clear",
+        "bin/cloud_relay_daemon.py": "loaded only by `run_daemon`'s pass loop (`pass_if_configured`), not by the clear; it is still a top tier authority path (it writes ledger entries), so this lists only that the clear cannot reach it",
+        "bin/epic_record.py": "loaded only by the gates commands (gates, gates ask-close, item-gates) and the epic prove and verdict commands, never by the clear: no function the clear reaches calls it",
+        "bin/external_adapter.py": "loaded only by the external-decision adapter path, which the clear does not run",
+        "bin/health_records.py": "loaded only by the health and pane pass, which the clear does not run",
+        "bin/lanes.py": "loaded only by `cmd_move`: the lane command, not the clear",
+        "bin/launch_brief_check.py": "loaded only by `launch_brief_mismatch`, the launch-time reader of the brief (#1350), which the clear cannot reach",
+        "bin/launch_testers.py": "loaded only by the tester launch command, not the clear",
+        "bin/merged_labels.py": "loaded only by `publish_decisions` (the decision list), which the clear never calls",
+        "bin/open_list_alert.py": "loaded only by `open_list_alert` (the open-item list cut alert), called only by `publish_decisions` and `sweep_refresh`, which the clear never calls",
+        "bin/orders_copy.py": "loaded only by `cmd_orders_copy`, not the clear",
+        "bin/path_suites.py": "loaded only by the gates finding (an information line), `heavy --changed`/`--list` and `preflight-pr --merged`: the suite map and its runs, not the clear",
+        "bin/plan_approval.py": "loaded only by `check_approval`, the send command's approval check (#951), which the clear never calls",
+        "bin/resume_brief.py": "loaded only by `cmd_launch`, not the clear",
+        "bin/review_checkout.py": "loaded only by `cmd_review_checkout`, the reviewer checkout command, not the clear",
+        "bin/tester_agent.py": "loaded only by the launch refusal of a tester, not the clear",
+        "bin/triage_ownerless.py": "loaded only by the triage passes, which the clear does not run",
+        "bin/triage_plan_open.py": "loaded only by the triage plan-open pass, which the clear does not run"
+      }
+    }
+  }
+}
