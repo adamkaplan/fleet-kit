@@ -220,7 +220,7 @@ class TestDocs(unittest.TestCase):
         phrases = ["not served by the pod's provider", "the cloud launch refuses it before the brief is sent"]
         found = len([p for p in phrases if p in section])
         print("S7: phrases found %d of 2" % found)
-        self.assertEqual(found, 2)
+        self.assertEqual(found, len(phrases))
 
 
 if __name__ == "__main__":

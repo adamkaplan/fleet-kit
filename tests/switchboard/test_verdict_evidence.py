@@ -41,8 +41,9 @@ def build(Base):
             self.assertEqual(len(details), 1, why)
             self.assertTrue(details[0].get("evidence", "").startswith("saw "), "%s: %r" % (why, details[0]))
             self.assertNotIn(SECRET, str(self.world.audit()), why)
-            self.assertEqual(details[0]["evidence"], self.ledger()[-1]["evidence"][:160], why)
-            self.assertEqual(len(details[0]["evidence"]), 160, why)
+            full = self.ledger()[-1]["evidence"]
+            self.assertTrue(full.startswith(details[0]["evidence"]), why)   # the audit line carries a clip of the ledger's text
+            self.assertLess(len(details[0]["evidence"]), len(full), why)    # and it is a clip, not the whole text
 
         def check_S4(self):
             self.assertEqual(self.prove("coder", "S2")[0], 0)

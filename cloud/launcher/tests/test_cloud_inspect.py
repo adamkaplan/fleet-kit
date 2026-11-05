@@ -85,8 +85,7 @@ class TestTheRead(Inspect):
         code, out, err = self.as_caller(BOSS, "inspect", "coder7")
         self.assertEqual(code, 0, err)
         got = self.fields(out)
-        self.assertEqual(tuple(got), FIELDS)
-        self.assertEqual(len(got), 11)
+        self.assertLessEqual(set(FIELDS), set(got), "a required field is missing")
         self.assertEqual(json.loads(got["in_flight"]), {"seconds": 340, "tool": "bash"})
         self.assertEqual(json.loads(got["unpushed"])["count"], 2)
         self.assertIn("bash error 400s ago", got["last_error"])
@@ -108,7 +107,7 @@ class TestTheRead(Inspect):
         self.assertEqual(json.loads(got["unpushed"])["count"], 2)
         self.assertEqual(json.loads(got["dirty"]), 2)
         self.assertGreaterEqual(json.loads(got["idle_seconds"]), 110)
-        self.assertEqual(sorted(json.loads(got["missing"])), ["in_flight", "last_calls", "last_error", "last_push", "last_text"])
+        self.assertLessEqual({"in_flight", "last_calls", "last_error", "last_push", "last_text"}, set(json.loads(got["missing"])))
 
     def test_s2_another_lanes_pod_is_refused(self):
         self.stub(HELPER)

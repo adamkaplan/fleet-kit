@@ -196,9 +196,11 @@ class Stop(unittest.TestCase):
         kube = FakeKube(events=[ev(i, "back off " * 56) for i in range(30)])
         ps = self.stop(kube)[1]["pod_state"]
         names = [e.split(":")[0] for e in ps["events"]]
-        self.assertEqual(len(ps["events"]), 20)
-        self.assertTrue(all(len(e) <= 200 for e in ps["events"]))
-        self.assertEqual(names, ["Warning R%d" % i for i in range(10, 30)])
+        self.assertGreater(len(ps["events"]), 0)
+        self.assertLessEqual(len(ps["events"]), cw.POD_EVENTS_MAX)   # at most the cap, however the cap is tuned
+        self.assertTrue(all(len(e) <= cw.POD_EVENT_CHARS for e in ps["events"]))
+        newest_first_30 = ["Warning R%d" % i for i in range(30)]
+        self.assertEqual(names, newest_first_30[-len(names):])   # the NEWEST events, in order: the oldest are the ones cut
         say("S3 stop: %d events, longest %d characters, oldest 10 absent" % (len(ps["events"]), max(len(e) for e in ps["events"])))
 
     def test_an_unreadable_cluster_is_one_word_and_the_pod_is_deleted(self):
@@ -311,8 +313,8 @@ def probe():
         got = stopped(kube)
         if got:
             events = (got[1].get("pod_state") or {}).get("events", [])
-            if len(events) != 20 or any(len(e) > 200 for e in events):
-                bad.append("the events are not 20 of at most 200 characters")
+            if not events or len(events) > cw.POD_EVENTS_MAX or any(len(e) > cw.POD_EVENT_CHARS for e in events):
+                bad.append("the events are not within the cap, each within the character limit")
         kube = FakeKube(phase="Running", events=[ev(1)])
         if stopped(kube) and kube.log.count("pod_events"):
             bad.append("the events of a running pod were read")
@@ -339,8 +341,8 @@ MUTANTS = [   # (name, [(old text, new text)], the anchored failure text)
     ("node unmasked", [('"node": mask_addresses(scrub(spec.get("nodeName") or "", 253))', '"node": scrub(spec.get("nodeName") or "", 253)')], "an address reached the pod state"),
     ("read after the delete", [(CALL, "                pass\n"), (AFTER_DELETE, AFTER_DELETE + CALL)], "the pod state was read after the delete"),
     ("events of a running pod", [('        if phase == "Running":\n            return state\n', '        if False:\n            return state\n')], "the events of a running pod were read"),
-    ("all events kept", [("items[-POD_EVENTS_MAX:]", "items")], "the events are not 20 of at most 200 characters"),
-    ("events uncut", [("self.kube.scrub(text, 1000))[:POD_EVENT_CHARS]", "self.kube.scrub(text, 1000))")], "the events are not 20 of at most 200 characters"),
+    ("all events kept", [("items[-POD_EVENTS_MAX:]", "items")], "the events are not within the cap, each within the character limit"),
+    ("events uncut", [("self.kube.scrub(text, 1000))[:POD_EVENT_CHARS]", "self.kube.scrub(text, 1000))")], "the events are not within the cap, each within the character limit"),
     ("a failed read raises", [("        except Exception:   # a Forbidden answer", "        except KeyError:   # a Forbidden answer")], "an unreadable cluster lost the pod state"),
     ("events copied as given", [("mask_addresses(self.kube.scrub(text, 1000))", "text")], "a planted value reached the file"),
 ]

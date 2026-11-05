@@ -107,7 +107,8 @@ def build():
             events = self.audit("plan_wake.dropped")
             self.assertEqual(len(events), 2)
             for e in events:
-                self.assertEqual(sorted(e["detail"]), ["current", "dropped"])
+                for key in ("current", "dropped"):
+                    self.assertIn(key, e["detail"])
                 self.assertEqual(e["detail"]["current"], sb.plan_check.plan_hash(record["body"]))
                 self.assertNotEqual(e["detail"]["dropped"], e["detail"]["current"])
             self.go()

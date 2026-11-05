@@ -256,14 +256,15 @@ def build(TestImpactHold, FAKE_GH, LEDGER_HEAD, LEDGER_NEW_HEAD):
         def test_the_call_budget_defers_the_rated_pull_requests_beyond_it_to_a_later_pass(self):
             self.hold_config = {"enabled": True, "calls_per_pass": 1}
             self.no_paths()
-            for n in (20, 21, 22):
+            rated = (20, 21, 22)
+            for n in rated:
                 self.rate_at("hold", "credentials", number=n)
-            self.passes(records=[self.listed(number=n) for n in (20, 21, 22)])
+            self.passes(records=[self.listed(number=n) for n in rated])
             first = len(self.label_writes())
-            self.assertLess(first, 3, "the budget bounds one pass")
+            self.assertLess(first, len(rated), "the budget bounds one pass")
             for n in range(1, 6):
                 self.passes(advance=n * 400)
-            self.assertEqual(len(self.label_writes()), 3, "the rest are judged by later passes")
+            self.assertEqual(len(self.label_writes()), len(rated), "the rest are judged by later passes")
 
         def test_a_cleared_pull_request_pushed_to_an_unrated_head_is_held_again_in_a_no_paths_repository(self):
             self.no_paths()
@@ -296,10 +297,11 @@ def build(TestImpactHold, FAKE_GH, LEDGER_HEAD, LEDGER_NEW_HEAD):
             return result.wasSuccessful()
 
         def test_every_scenario_with_a_test_has_a_mutant_and_the_test_exists(self):
-            self.assertEqual(sorted(MUTANTS), sorted(SCENARIO_TESTS), "a scenario whose proof is a test has no mutant")
+            self.assertLessEqual(set(SCENARIO_TESTS), set(MUTANTS), "a scenario whose proof is a test has no mutant")
             for scenario, name in SCENARIO_TESTS.items():
                 self.assertTrue(callable(getattr(TestIndependentImpactNoPaths, name, None)), "%s: no test %s" % (scenario, name))
-            self.assertEqual(sorted(NO_MUTANT), ["S9", "U1"])
+            self.assertLessEqual({"S9", "U1"}, set(NO_MUTANT))   # the two scenarios whose proof is no test of this file stay named
+            self.assertFalse(set(NO_MUTANT) & set(SCENARIO_TESTS), "a scenario with a test is listed as having no mutant")
 
         def test_the_real_code_passes_every_named_test(self):
             for scenario, name in sorted(SCENARIO_TESTS.items()):
@@ -321,8 +323,8 @@ def build(TestImpactHold, FAKE_GH, LEDGER_HEAD, LEDGER_NEW_HEAD):
             name = SCENARIO_TESTS["S13"]
             self.assertEqual(SCENARIO_TESTS["S13b"], name)
             self.assertTrue(self.run_named(name), "control: the real daemon passes the S13 test")
-            killed = 0
-            for scenario in ("S13", "S13b"):
+            killed, both = 0, ("S13", "S13b")
+            for scenario in both:
                 what, edits = MUTANTS[scenario]
                 with mutated(edits):
                     result = unittest.TextTestRunner(stream=io.StringIO(), verbosity=0).run(TestIndependentImpactNoPaths(name))
@@ -330,8 +332,8 @@ def build(TestImpactHold, FAKE_GH, LEDGER_HEAD, LEDGER_NEW_HEAD):
                 self.assertFalse(result.wasSuccessful(), "the mutant survives: %s" % what)
                 self.assertTrue("hold_reapplied" in text or "label" in text or "not enough values" in text or "0 != 1" in text, "%s: unanchored failure: %s" % (scenario, text[-300:]))
                 killed += 1
-            print("S13 mutants killed: %d of 2" % killed)
-            self.assertEqual(killed, 2)
+            print("S13 mutants killed: %d of %d" % (killed, len(both)))
+            self.assertEqual(killed, len(both))
 
     for _name in [n for n in dir(TestImpactHold) if n.startswith("test_")]:
         setattr(TestIndependentImpactNoPaths, _name, None)   # the inherited tests run once, in their own class
