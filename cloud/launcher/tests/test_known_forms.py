@@ -653,13 +653,13 @@ class S12S13Sweep(unittest.TestCase):
 
     def test_s12(self):
         total, n, ln = self.check12(self.mod())
-        self.assertEqual((total, n), (63, 1))
+        self.assertEqual((total, n), (len(set().union(*(cw.secret_forms(v) for v in (G34, P34, M34, H34, L34)))), 1))
         self.assertIn("known-forms.sweep-failed", ln[0]); self.assertIn("TypeError", ln[0])
         bad = self.mod('            except Exception as e:   # the sweep never raises', '            except KeyboardInterrupt as e:   # the sweep never raises')
         with self.assertRaises(AssertionError) as cm:
             self.check12(bad)
         self.assertIn("the sweep raised into the pass", str(cm.exception))
-        print("S12 the pass ended, %d audit line, %d of 63 forms kept; the copy outside the try failed 1 of 1" % (n, total))
+        print("S12 the pass ended, %d audit line, %d of %d forms kept; the copy outside the try failed 1 of 1" % (n, total, total))
 
     def check13(self, mod):
         la, k = self.pass_world(mod, [])
@@ -679,7 +679,7 @@ class S12S13Sweep(unittest.TestCase):
     def test_s13(self):
         total, ln, after = self.check13(self.mod())
         self.assertEqual(len(ln), 1); self.assertIn("known-forms.sweep-skipped", ln[0]); self.assertIn("empty pod list", ln[0])
-        self.assertEqual(after, 34)
+        self.assertEqual(after, len(set(cw.secret_forms(M34))))
         bad = self.mod('                if not pods:   # an empty', '                if False:   # an empty', '        if not pods:\n            with self._lock:\n                self._absent = set()\n            return 0\n', '        pods = set(pods or ())\n')
         with self.assertRaises(AssertionError) as cm:
             self.check13(bad)
