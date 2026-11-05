@@ -66209,6 +66209,14 @@ _psj = importlib.import_module("test_pr_state_jobs")
 _psj.HOST = sys.modules[__name__]
 TestPrStateJobs = _psj.load()   # #1962
 TestTempJanitorScratch = importlib.import_module("test_scratch").build(TestTempJanitor)
+# The last message of a stopped pod goes to its boss (#1788).
+_stop_final = importlib.import_module("test_stop_final_message")
+TestStopFinalMessage, TestStopFinalMessageMutants, TestStopFinalMessageTwoRuns, TestStopFinalMessageTwoRunsMutant, \
+    TestStopFinalMessageHardening, TestStopFinalMessageHardeningMutant = (
+    _stop_final.TestStopFinalMessage, _stop_final.TestStopFinalMessageMutants, _stop_final.TestStopFinalMessageTwoRuns,
+    _stop_final.TestStopFinalMessageTwoRunsMutant, _stop_final.TestStopFinalMessageHardening, _stop_final.TestStopFinalMessageHardeningMutant)
+TestStopFinalMessageEdges, TestStopFinalMessageEdgesMutant = _stop_final.TestStopFinalMessageEdges, _stop_final.TestStopFinalMessageEdgesMutant
+TestStopFinalMessageBare, TestStopFinalMessageBareMutant = _stop_final.TestStopFinalMessageBare, _stop_final.TestStopFinalMessageBareMutant
 TestScratchGuard = importlib.import_module("test_scratch_command").TestScratchGuard
 
 # The host-disk tests of #2081.

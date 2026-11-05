@@ -1269,6 +1269,24 @@ def _may_retire(kind, record):
     return kind[0] == "person" or (kind[0] == "agent" and ((len(kind) > 2 and kind[2] == "chief-of-staff") or kind[1] == record.get("reports_to")))
 
 
+_BOSS_NAME_RE = re.compile(r"[a-z][a-z0-9_-]{0,31}", re.ASCII)
+
+
+def _final_message(engine, state, record, name, reason, body=None):
+    """Ask #1788: after a successful retire, ONE message to the recorded boss: the pod, the reason, and its last text (cut, scrubbed, framed as
+    untrusted: cloud_retired.last_message). Never raises: a failed send is said in the audit and the retire goes on."""
+    boss = record.get("reports_to")
+    if not isinstance(boss, str) or not _BOSS_NAME_RE.fullmatch(boss):
+        return
+    try:
+        where = body.get("record") if isinstance(body, dict) else None   # THIS stop's record, as the launcher's answer names it (PC-7); never a lookup by name
+        block, why = _retired().last_message(where, state, name) if isinstance(where, str) and where else (None, "no run record")
+        text = "cloud worker %s retired (%s)\n%s" % (name, _one(_scrub_lib()(reason, (), 200), 120), block or "last text not read: %s" % _one((why or "unknown").replace(" ", "_"), 120))
+        engine.send("switchboard", boss, text)
+    except Exception as err:
+        _audit(engine, "cloud.final_message_failed", name, {"why": _one(type(err).__name__, 60)})
+
+
 @refusals
 def cmd_retire(args, runner, now, record):
     """`retire NAME` for a cloud worker: `stop` (the end hook runs, the pod and its scratch volume go), then the record goes. A stop that exits 1
@@ -1301,6 +1319,7 @@ def cmd_retire(args, runner, now, record):
         raise LaunchError("stop of %s failed: %s: the record is kept" % (args.name, _reason(code, note)))
     # The run record (slice 3, #638) is written by the launcher's stop; no call is needed here when it lands: this is its hook point (after the
     # end hook, before the endpoint record goes).
+    _final_message(engine, state, record, args.name, reason, body)   # ask #1788: once, after a successful stop only
     _registry_note(engine, "retire", state, args.name, reason)
     wip, pushed = (body or {}).get("wip_branch"), (body or {}).get("pushed")
     if isinstance(body, dict) and body.get("pod_gone") is True:   # only the launcher's explicit reply: an unreadable pod never says it
