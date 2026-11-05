@@ -60,3 +60,4 @@ switchboard/config_reload.py
 switchboard/daemon_restart.py
 switchboard/labels_ensure.py
 switchboard/orders_cos.py
+switchboard/checkpoint_reminders.py

@@ -13997,7 +13997,7 @@ def header_cache_action(name):
     return name if name in cache_allowed_commands() and name not in always_fresh_commands() else None
 
 
-HEADER_FRESH_EXTRA = ("plan", "gates", "gates-check", "merge-gate", "impact", "merge", "charter", "orders")   # approval and check, the gates, the impact floor and the merge shim; the charter set decides from the issue and its parent (#1249), the orders are read fresh
+HEADER_FRESH_EXTRA = ("plan", "gates", "gates-check", "merge-gate", "impact", "merge", "charter", "orders", "issue-line")   # approval and check, the gates, the impact floor and the merge shim; the charter set decides from the issue and its parent (#1249), the orders are read fresh
 
 
 class IntentReader:
@@ -23168,6 +23168,17 @@ def announce_order_change(engine, args, caller, repo, charter, detail):
         sys.stderr.write("%s: the order stands, but the comment on the charter failed (%s): tell the owner what was changed\n" % (PROG, _one_line(str(err), 200)))
         return EXIT_ERROR
     return EXIT_OK
+
+
+def cmd_issue_line(args, runner, now):
+    return load_module("issue_line").run(types.SimpleNamespace(build_engine=lambda: build_engine(runner, now, "cli")[0], make_reader=lambda: _intent_reader(runner, now), fs=os, parse_bounded=load_module("record_json").parse_bounded, write=write_issue_body, IntentError=IntentError, one_line=_one_line, sleep=_sleep, waits=ORDERS_READBACK_WAITS, PROG=PROG, EXIT_OK=EXIT_OK, EXIT_ERROR=EXIT_ERROR, err=sys.stderr.write, out=sys.stdout.write), args.issue.repo, int(args.issue), args.next_step, args.parked)
+
+
+def add_issue_line_parsers(sub):
+    line = sub.add_parser("issue-line", help="Change ONE line of an issue body (the next step or a parked date) from a fresh read; the Intent and the Done-when are never changed")
+    line.add_argument("issue", type=issue_arg, help="owner/repo#N")
+    line.add_argument("--next-step", help="The next-step line: one line of at most 600 characters (give this or --parked)")
+    line.add_argument("--parked", help="The parked date: YYYY-MM-DD, a day ahead within 366 days (give this or --next-step)")
 
 
 CHARTER_HELP = "The charter issue: N (in your own repo) or owner/repo#N"

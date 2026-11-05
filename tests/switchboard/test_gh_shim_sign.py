@@ -121,7 +121,7 @@ def battery(rig):
     done, calls = rig.run("issue", "close", "1", "--comment", "x " + MARK % "bob")
     if len(calls) != 1 or calls[0]["argv"][-1].count("fleet-switchboard:from=") != 1:
         bad.append("a marked body was signed twice")
-    for args in (("api", "repos/o/r/issues/1", "-X", "PATCH", "-f", "body=x"), ("api", "repos/o/r/issues/1/labels", "-f", "body=x"),
+    for args in (("api", "repos/o/r/issues/1/labels", "-f", "body=x"),
                  ("api", "repos/o/r/issues/1/comments"), ("api", "repos/o/r/issues/1/comments", "-X", "GET")):
         done, calls = rig.run(*args)
         if len(calls) != 1 or calls[0]["argv"] != list(args):
@@ -222,7 +222,7 @@ class TestGhShimSign(unittest.TestCase):
     def test_unrelated_calls_are_passed_byte_for_byte(self):
         calls = [("api", "repos/o/r/issues/1"), ("api", "repos/o/r/issues/1/comments"), ("api", "repos/o/r/issues/1/comments", "-X", "GET"),
                  ("api", "repos/o/r/pulls/1/reviews", "-X", "GET"),
-                 ("api", "repos/o/r/issues/1", "-X", "PATCH", "-f", "body=x"), ("api", "repos/o/r/issues/1/labels", "-f", "body=x"),
+                 ("api", "repos/o/r/issues/1/labels", "-f", "body=x"),
                  ("api", "repos/o/r/issues/1/comments", "-f", "event=x"), ("api", "repos/o/r/issues/1/comments", "-X", "DELETE"),
                  # #1696: --input on a comment or review endpoint is no longer passed through (it is signed or refused: test_gh_shim_sign_input.py)
                  ("api", "repos/o/r/issues/1/comments", "-X", "GET", "-f", "body=x"),

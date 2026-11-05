@@ -661,6 +661,8 @@ class TestGitShim(Base):
     CONFIG_WRITE_ALLOWED = (   # (file, exact added line, purpose)
         ("tests/switchboard/test_cases_12.py", " " * 23 + "GIT_CONFIG_" + _G.upper() + '="/dev/null", GIT_CONFIG_' + _S.upper() + '="/dev/null")',
          "points git at /dev/null: writes no git configuration"),
+        ("tests/switchboard/test_merge_drops.py", " " * 26 + 'env={"PATH": "/usr/bin:/bin", "HOME": str(cwd), "GIT_CONFIG_' + _G.upper() + '": "/dev/null", "GIT_CONFIG_' + _S.upper() + '": "/dev/null",',
+         "points git at /dev/null: writes no git configuration (#2161)"),
     )
 
     @classmethod

@@ -434,10 +434,11 @@ class TestBranches(Fixture):
         self.assertEqual(len(lanes), len(sb.COCKPIT_LANE_STATES))
 
     def test_a_publish_that_raises_is_reported_and_the_rest_of_the_pass_runs(self):
-        names = ["prune_delivered_reminders", "friction_tick", "load_tick", "prune_report_riders", "cloud_watch_tick", "cloud_end_tick", "cloud_turn_tick", "lost_worker_tick", "publish_decisions", "schedule_judge_warm", "write_catching_up", "health_write"]
+        names = ["prune_delivered_reminders", "friction_tick", "load_tick", "prune_report_riders", "cloud_watch_tick", "cloud_end_tick", "cloud_turn_tick", "pod_silence_tick", "lost_worker_tick", "push_watch_tick", "publish_decisions", "schedule_judge_warm", "write_catching_up", "health_write"]
         calls = []
         patches = [mock.patch.object(sb, n, side_effect=lambda *a, _n=n, **k: calls.append(_n)) for n in names]
         patches.append(mock.patch.object(sb, "publish_cockpit", side_effect=RuntimeError("boom")))
+        patches.append(mock.patch.object(sb, "load_module", return_value=mock.MagicMock()))   # the first-push step (#2057) loads cloud_worker: not under test here
         engine = mock.Mock(now=lambda: T0)
         report = {"errors": []}
         with contextlib.ExitStack() as stack:
