@@ -6,6 +6,8 @@
 # merged); otherwise they keep it and say why in one line. A `done` report only says a worktree is reclaimable. Never an unregistered worktree,
 # never a main checkout, never `--force`, never a branch. The kill switch is `worktree_reclaim.enabled: false` (and `on_done: false` for the done note).
 
+from contextlib import contextmanager
+
 WORKTREES_FILE = "worktrees.json"
 WORKTREE_GIT_SECONDS = 20
 WORKTREE_LOOK_MAX = 400       # candidates judged per run (the cap above counts removals only)

@@ -305,8 +305,7 @@ Two reminders are made for you. `fleet-switchboard launch` reads the brief's
 `CHECKPOINT` (or `--checkpoint 30m --overdue 60m`): the worker is reminded at the
 checkpoint ("report now, one line"), and the launching orchestrator is woken at the
 overdue time **only if the worker has not reported or sent anything since the launch**.
-A worker that reported is not chased. If the CHECKPOINT line cannot be read, no
-reminder is made and `launch` says so; pass the flags. Write the CHECKPOINT in the
+A worker that reported is not chased. If the CHECKPOINT line cannot be read, a local launch makes no reminder and `launch` says so (pass the flags); a cloud launch arms the default 25m/40m (the worker's reminder at 25 minutes, your overdue wake at 40). Write the CHECKPOINT in the
 shape `Report at 30 minutes (kind working, one line); overdue at 60.`
 
 If the owner enables it, each orchestrator also gets one short daily wake asking what
@@ -431,6 +430,7 @@ compaction and when the file changes.
 **Finished a worker? Retire it.** When a worker has made its final `done` or `failed` report and you close its tab, run
 `fleet-switchboard retire <name> [--reason "..."]` so the fleet does not report it dead or invite a reattach. (If you close the tab after its final
 report the switchboard retires it by itself; retire is for the cases it cannot tell.) `retire --undo <name>` reverses it; nothing is deleted.
+If a cloud worker is kept because its end hook could not push, send the pod one message to commit its tree on a NEW branch and push it there plainly, read the branch from origin, then retire normally; the force-delete discards its work.
 
 ## Heavy runs
 

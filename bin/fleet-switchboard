@@ -6613,6 +6613,7 @@ def add_close_pane_parsers(sub):
 
 def add_retire_parsers(sub):
     retire = sub.add_parser("retire", help="Mark a finished worker RETIRED (not watched, not reattached); `--undo` reverses. Nothing is deleted or closed")
+    retire.epilog = "A cloud worker whose end hook could not push is kept: to save its tree, send the pod one message to commit its tree on a NEW branch and push it there plainly, read the branch from origin, then retire normally."
     retire.add_argument("name", help="The agent's fleet name")
     retire.add_argument("--reason", help="Why (one line)")
     retire.add_argument("--undo", action="store_true", help="Watch it again")
@@ -7985,6 +7986,11 @@ def publish_decisions(engine):
             open_list_alert(engine, repo, now)
         except Exception as err:
             engine._note("open_list.error", repo, {"error": _one_line("%s: %s" % (type(err).__name__, err), 200), "repo": repo})
+    for repo, (held, days) in take_comment_cuts().items():   # #1889: the daily alert for every comment window not read to its start
+        try:
+            comment_window_alert(engine, repo, held, days, now)
+        except Exception as err:
+            engine._note("comment_window.error", repo, {"error": _one_line("%s: %s" % (type(err).__name__, err), 200), "repo": repo})
     try:
         pane_health_pass(engine, now)   # the control plane: detached or dead panes, reads only, wakes the Chief of Staff
     except Exception as err:
@@ -8523,7 +8529,9 @@ def push_watch_tick(engine, discovery):
     ns = types.SimpleNamespace(parse_iso=parse_iso, _one_line=_one_line, parse_bounded=load_module("record_json").parse_bounded)
     hub = getattr(engine, "hub", None)   # the GitHub reader is the hub (Switchboard has no gh_api); with none, skip the pass
     if hub is None:
-        engine.audit.append(engine.actor, "push_watch.skipped", None, "no GitHub hub")
+        if not getattr(engine, "_push_watch_skip_told", False):   # once per engine, not every idle pass: a line per pass grows the audit and every reader of it rewrites its offsets (TestWriteOnlyOnChange)
+            engine._push_watch_skip_told = True
+            engine.audit.append(engine.actor, "push_watch.skipped", None, "no GitHub hub")
         return []
     return module.run_pass(ns, engine, engine.now(), lambda path: hub.gh_api(path, paginate=False), (getattr(engine, "config", None) or {}).get("push_watch"))
 
@@ -11107,6 +11115,61 @@ class GitHubHub:
             if bounded and number >= (cap or GITHUB_PAGE_CAP):
                 return records, True
 
+    def read_comments(self, consumer, repo, since, cap):
+        """#1889: the comments of `repo` created since `since`, newest first, as read_pages gave them, read incrementally. A first read (nothing held in memory
+        or no cursor) follows the window to its start (at most `cap` pages); a later read asks since the newest comment held and merges the new ones into the held
+        ones (bounded to the window). Returns (comments, truncated): truncated while the window has a part never read."""
+        held = self.__dict__.setdefault("_held_comments", {})
+        gaps = self.__dict__.setdefault("_comment_gaps", {})
+        cursors = self.__dict__.get("_comment_cursors")
+        parse = load_module("record_json").parse_bounded
+        store = load_module("comment_cursor")
+        if cursors is None:
+            cursors, status = store.load(self.state_dir, parse)
+            self._comment_cursors, self._comment_state = cursors, status
+        name, key = "%s|%s" % (consumer, repo), (consumer, repo)
+        base = "repos/%s/issues/comments?since=%s&sort=created&direction=desc&per_page=100"
+        loose_held = self.__dict__.setdefault("_held_loose", {}).setdefault(key, {})   # records without a valid created_at, keyed by id or content so they never duplicate
+        have, mark = held.get(key), cursors.get(name)
+        if have is None or mark is None:
+            why = "no held comments" if have is None and mark is not None else {"absent": "no cursor file", "unreadable": "cursor file unreadable"}.get(self._comment_state, "no cursor")
+            told = self.__dict__.setdefault("_comment_fallback", set())
+            if key not in told:
+                told.add(key)
+                if self.audit is not None:
+                    self.audit.append(self.actor, "comment_cursor.fallback", repo, {"repo": repo, "consumer": consumer, "reason": why})
+            records, cut = self.read_pages(base % (repo, since), older=("created_at", since), cap=cap)
+            have = {}
+            loose_held.clear()
+        else:
+            records, cut = self.read_pages(base % (repo, mark), older=("created_at", mark), cap=cap)
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            if not isinstance(record.get("created_at"), str):
+                loose_held[("id", record["id"]) if record.get("id") is not None else ("noid", json.dumps(record, sort_keys=True, default=str))] = record
+                while len(loose_held) > COMMENT_WINDOW_PAGES * GITHUB_PAGE_SIZE:
+                    del loose_held[next(iter(loose_held))]   # bounded as the held comments are: the oldest held drops
+            elif record["created_at"] >= since:
+                # merge by id; a record without an id is keyed by its content so id-less records do not collapse into one
+                have[record["id"] if record.get("id") is not None else ("noid", json.dumps(record, sort_keys=True, default=str))] = record
+        have = {k: v for k, v in have.items() if v["created_at"] >= since}
+        held[key] = have
+        oldest = min((r["created_at"] for r in records if isinstance(r, dict) and isinstance(r.get("created_at"), str)), default=None)
+        if cut and oldest is not None:
+            gaps[key] = oldest   # what lies before this was not read, until the window's start passes it
+        if key in gaps and gaps[key] < since:
+            del gaps[key]
+        newest = max((v["created_at"] for v in have.values()), default=None)
+        if newest is not None and cursors.get(name) != newest:   # an empty merge keeps the old cursor (harmless: the next read asks since it again)
+            cursors[name] = newest
+            store.save(self.state_dir, cursors, parse)
+        merged = sorted(have.values(), key=lambda r: r["created_at"], reverse=True) + list(loose_held.values())   # stable: equal seconds keep the API order, as read_pages gave them
+        if key in gaps:
+            when, then = self.now(), parse_iso(since)
+            _COMMENT_CUTS[key] = (len(merged), max(1, round((when - then) / 86400)) if then is not None else 0)
+        return merged, key in gaps
+
     # -- gh api, and the catch-up read
 
     def child_env(self, repo):
@@ -12314,13 +12377,17 @@ def _cmd_launch(args, runner, now, socket_call=None):
     if getattr(args, "stack", False) and not getattr(args, "cloud", False):   # before anything is read or called: the option is the cloud launcher's
         sys.stderr.write("%s: --stack needs --cloud: the nested Docker stack is a cloud worker's pod; nothing was created\n" % PROG)
         return EXIT_USAGE
+    if getattr(args, "persistent", False) and not getattr(args, "cloud", False):   # before anything is read or called: the option is the cloud launcher's
+        sys.stderr.write("%s: --persistent needs --cloud: an always-on orchestrator is a cloud pod; nothing was created\n" % PROG)
+        return EXIT_USAGE
     if getattr(args, "role", None) == "tester" and getattr(args, "agent", None):   # #1963: before every route; the allowed agents are read from the checkout's agents/roles.tsv
         problem = load_module("tester_agent").line_for(args.agent, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
         if problem:
             sys.stderr.write(problem + "\n")
             return EXIT_USAGE
     if getattr(args, "cloud", False):   # a worker in the cloud (#371): its own module; nothing below runs
-        return run_cloud("cmd_launch", args, runner, now)
+        code = run_cloud("cmd_launch", args, runner, now)
+        return arm_cloud_checkpoints(args, runner, now) if code == EXIT_OK else code   # #1790
     refuse_cloud_name(args.name)   # a name that has a cloud record is not launched locally (#640)
     engine, state, _ = build_engine(runner, now, "cli", socket_call=socket_call)
     choice = launch_model_choice(args, engine)   # #1642: before any session or pane
@@ -15552,7 +15619,7 @@ cmd_waive.ledger = True   # state and GETs only; its own errors are usage errors
 
 
 # ---- #818: which open pull requests change the same files. Read-only information, never a block. Pure parsing and the two texts; the one bounded read is `read_open_overlap`.
-OVERLAP_LIST_CAP = 50    # the most open pull requests read, in one call
+OVERLAP_LIST_CAP = 200   # the most open pull requests read, in one call (#1889: the ceiling tools/arch-overlap already uses; a full list is said)
 OVERLAP_FILES_CAP = 100  # the most files of one pull request used; a pull request with more changed files is left out
 OVERLAP_SHOW_FILES = 3   # files named in a `shares` line
 OVERLAP_PATH_MAX = 300  # a longer path, or one with a control character, is not printed: the pull request is left out
@@ -15632,6 +15699,7 @@ def read_open_overlap(engine, repo, runner):
         done = (engine.gh_runner or runner)(argv, capture_output=True, text=True, timeout=min(engine.config["call_timeout_seconds"], GITHUB_ROUTE_READ_TIMEOUT),
                                             stdin=subprocess.DEVNULL, **({"env": env} if env is not None else {}))
         if done.returncode == 0:
+            engine.__dict__.setdefault("_overlap_read", {})[repo] = (len(listed) if isinstance(listed := json.loads(done.stdout or "[]"), list) else 0)   # #1889: how many were read, for the line a full list gets
             cache[repo] = overlap_parse_listing(json.loads(done.stdout or "[]"))
     except Exception:   # advisory: whatever goes wrong, there is no line (never a wrong one) and nothing else changes
         cache[repo] = None
@@ -15740,6 +15808,9 @@ def cmd_gates(args, runner, now):
             lines.extend(load_module("epic_record").epic_lines(epic_rows, report["epic_default_head"]))
         if shares:
             lines.append(shares)
+        read_n = getattr(ctx.engine, "_overlap_read", {}).get(ctx.repo, 0)
+        if read_n >= OVERLAP_LIST_CAP:   # #1889: a full list is said with the exact number read, never a bare cut
+            lines.append("read %d of at least %d open pull requests" % (read_n, read_n))
         lines.extend(bots)
         if suites_finding:
             lines.append(suites_finding)
@@ -18186,6 +18257,59 @@ def _diff_lines(runner, git_dir, a, b, sign):
     return found
 
 
+def _removed_lines(runner, git_dir, a, b):
+    """[(file, old line number, text, replaced)] of the '-' lines of `git diff -U0 a b`; `replaced` is True when the hunk also adds a line (a modification of the tip line, not a plain removal)."""
+    out, name, old, hunk, found = _git_out(runner, git_dir, ["diff", "-U0", "--no-renames", "--no-color", a, b]), None, 0, [], []
+    def flush():
+        added = any(h is None for h in hunk)
+        found.extend((h[0], h[1], h[2], added) for h in hunk if h is not None)
+        del hunk[:]
+    for line in out.split("\n") + ["@@ end"]:
+        if line.startswith("@@"):
+            flush()
+            m = re.match(r"@@ -(\d+)", line)
+            old = int(m.group(1)) if m else 0
+        elif line.startswith("+++ "):
+            flush()
+            name = line[4:][2:] if line[4:].startswith("b/") else None if line[4:] == "/dev/null" else line[4:]
+        elif line.startswith("--- "):
+            flush()
+            if line[4:] != "/dev/null":
+                name = line[4:][2:] if line[4:].startswith("a/") else line[4:]
+        elif line.startswith("-") and name:
+            hunk.append((name, old, line[1:]))
+            old += 1
+        elif line.startswith("+"):
+            hunk.append(None)
+    return found
+
+
+def _fork_lines(runner, git_dir, fork, tip, cache):
+    """{file: [(old start, old count, new start, new count)]} of `git diff -U0 fork tip`: what the tip did since `fork`."""
+    if fork not in cache:
+        out, name, hunks = _git_out(runner, git_dir, ["diff", "-U0", "--no-renames", "--no-color", fork, tip]), None, {}
+        for line in out.split("\n"):
+            if line.startswith("+++ "):
+                name = line[4:][2:] if line[4:].startswith("b/") else None
+            elif line.startswith("@@") and name:
+                m = re.match(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))?", line)
+                if m:
+                    hunks.setdefault(name, []).append((int(m.group(1)), int(m.group(2) or 1), int(m.group(3)), int(m.group(4) or 1)))
+        cache[fork] = hunks
+    return cache[fork]
+
+
+def _tip_line_in_fork(hunks, number):
+    """The line numbers at the fork that tip line `number` came from: itself shifted by the tip's earlier hunks, or the old range of the tip hunk that rewrote it."""
+    shift = 0
+    for os_, oc, ns, nc in hunks:
+        if nc > 0 and ns <= number < ns + nc:
+            return set(range(os_, os_ + oc))
+        if (nc > 0 and ns + nc <= number) or (nc == 0 and ns < number):
+            shift += nc - oc
+    return {number - shift}
+
+
 class MergeDropsConflict(Exception):
     pass
 
@@ -18203,10 +18327,29 @@ def merge_drops(runner, git_dir, tip, head):
     own = collections.Counter()   # the PR's own removals (three-dot), per (file, stripped line); from the branch's non-merge commits, as the three-dot diff is empty once the tip is merged in
     for commit in _git_out(runner, git_dir, ["rev-list", "--no-merges", "%s..%s" % (tip, head)]).split():
         own.update((f, t.strip()) for f, _, t in _diff_lines(runner, git_dir, commit + "^", commit, "-"))
+    tip_sha = _git_out(runner, git_dir, ["rev-parse", tip]).strip()
+    # the PR's own three-dot (a modified line is a removal and an addition): from the head and from the branch side (first parent) of each merge in tip..head, whose merge-base with the tip
+    # is where that side left it; so a removal made while porting through a merge resolution is its own, a line the PR modified before it merged the tip in is its own, and the tip having moved since changes nothing.
+    # A side that already holds the whole tip has no such base (its diff would hold real drops): skipped.
+    own_lines, fork_cache = [], {}   # per side: (fork, {file: set of fork line numbers the PR's own side removed or rewrote})
+    sides = [head] + [m + "^1" for m in _git_out(runner, git_dir, ["rev-list", "--merges", "%s..%s" % (tip, head)]).split()]
+    for side in sides:
+        fork = _git_out(runner, git_dir, ["merge-base", tip, side]).strip()
+        if fork and fork != tip_sha and fork != _git_out(runner, git_dir, ["rev-parse", side]).strip():
+            removed = _diff_lines(runner, git_dir, fork, side, "-")
+            own = own | collections.Counter((f, t.strip()) for f, _, t in removed)   # per-key maximum
+            at = {}
+            for f, n, _ in removed:
+                at.setdefault(f, set()).add(n)
+            own_lines.append((fork, at))
     dropped = []
-    for d in _diff_lines(runner, git_dir, tip, tree, "-"):   # the tip's lines the merge result lacks
-        key = (d[0], d[2].strip())
-        if own[key] > 0:
+    for f, n, t, replaced in _removed_lines(runner, git_dir, tip, tree):   # the tip's lines the merge result lacks
+        d, key = (f, n, t), (f, t.strip())
+        if replaced:   # a replacement hunk is the PR's own only when its own side changed THAT tip line (by position at the fork); otherwise the removed tip text is dropped
+            if any(_tip_line_in_fork(_fork_lines(runner, git_dir, fork, tip, fork_cache).get(f, []), n) & at.get(f, set()) for fork, at in own_lines):
+                continue
+            dropped.append(d)
+        elif own[key] > 0:
             own[key] -= 1
         else:
             dropped.append(d)
@@ -18279,7 +18422,7 @@ def merge_drops_refusal(runner, config, repo, number, state):
     if not bad:
         return None
     return "merge of %s#%d refused: its head drops %d tip hunk(s): %s; keep them, or name each in a merge commit message (`fleet-switchboard merge-drops`)" % (
-        repo, number, len(bad), "; ".join(merge_drops_text(h) for h in bad[:3]))
+        repo, number, len(bad), "; ".join(merge_drops_text(h) for h in bad))
 
 
 ANCESTOR_DEPTH = 25
@@ -21342,7 +21485,8 @@ def build_parser():
     notice.add_argument("--from", dest="sender", help="Lab only: the sender's fleet name")
     sub.add_parser("ensure", help="Start the daemon unless it runs (herdr's startup hook calls this)")
     sub.add_parser("poke", help="Ask the daemon for a pass now; silent, never blocks (herdr's event hooks call this)")
-    launch = sub.add_parser("launch", help="Start a fleet agent (headless by default, or in a new herdr tab with --terminal), without typing", description="Start a fleet agent (headless by default, or in a new herdr tab with --terminal), without typing. A NEW launch (not a resume or --cloud) first runs the memory test: this is the lanes' safety check, not the owner's rule (there are no caps on coders), and `--memory-ok <reason>` overrides it. A refusal exits 5.")
+    launch = sub.add_parser("launch", help="Start a fleet agent (headless by default, or in a new herdr tab with --terminal), without typing", description="Start a fleet agent (headless by default, or in a new herdr tab with --terminal), without typing. A NEW launch (not a resume or --cloud) first runs the memory test: this is the lanes' safety check, not the owner's rule (there are no caps on coders), and `--memory-ok <reason>` overrides it. A refusal exits 5. A cloud launch arms a checkpoint reminder and an overdue wake; with no CHECKPOINT line and no --checkpoint/--overdue it arms the default 25m/40m.")
+    launch.epilog = "A cloud worker kept by retire (its end hook could not push): send the pod one message to commit its tree on a NEW branch and push it there plainly, read the branch from origin, then retire normally."
     launch.add_argument("name", help="The agent's fleet name (lower case, digits, - and _)")
     launch.add_argument("--agent", help="The OpenCode agent definition, such as coder")
     launch.add_argument("--dir", help="The agent's working directory (absolute)")
@@ -21382,6 +21526,8 @@ def build_parser():
     launch.add_argument("--hard", help="With --cloud: stop after this long whatever it does (default 2h)")
     launch.add_argument("--shape", help="With --cloud: the pod shape, XS (1 CPU, 2 GiB; the launcher's default, no nested Docker), S (2 CPU, 4 GiB; the default with --stack), M (4 CPU, 8 GiB) or O (250m CPU, 768 MiB; the default of --agent orchestrator)")
     launch.add_argument("--stack", action="store_true", help="With --cloud: a pod that can run a nested Docker stack (the Sysbox runtime class, its own user namespace, no capability added, no privileged mode). Off by default; the launch without it is unchanged. The first pod on a fresh node may wait for the node's runtime: the launcher retries")
+    launch.add_argument("--no-commit", action="store_true", help="With --cloud: this pod is launched NOT to commit (a measure or a read): the launcher never tells it to push its work. Implied by --role tester and --role reviewer.")
+    launch.add_argument("--persistent", action="store_true", help="With --cloud and --agent orchestrator: an always-on orchestrator (one StatefulSet, restart always, no hard or idle limit; only an explicit stop ends it, and its cost is unbounded in time). Refused for a worker or a --stack launch")
     pending = sub.add_parser("pending", help="What is pending for an agent, and why it waits or is held")
     pending.add_argument("name", help="The agent's fleet name")
     pending.add_argument("--json", action="store_true", help="Emit machine-readable JSON instead")
@@ -21604,7 +21750,7 @@ CLOUD_ENV_SETTING_NAMES = ("CW_ALLOWED_REPOS", "CW_TOOLING_REPO", "CW_CLOUD_IMAG
                             "CW_OPENCODE_BIN", "CW_RUN_RECORD_DIR", "CW_CLOUD_SPEND_CAP_USD", "CW_CLUSTER_TOKEN_CMD",
                             "CW_CLUSTER_ADMIN_CMD", "CW_GIT_TOKEN_CMD", "CW_APP_ID_CMD", "CW_APP_INSTALLATION_CMD",
                             "CW_APP_KEY_CMD", "CW_CLUSTER_ADMIN_SECRET", "CW_CLUSTER_TOKEN_DURATION", "CW_HUB_CHANNEL_URL",
-                            "CW_HUB_REGISTRY_SECRET", "CW_VAULT_CHECK_DIR")
+                            "CW_HUB_REGISTRY_SECRET", "CW_VAULT_CHECK_DIR", "CW_MAX_PERSISTENT")
 REAPER_CLUSTER_NAMES = ("CW_CLOUD_SERVER", "CW_CLOUD_NAMESPACE", "CW_CLOUD_TOKEN_FILE")   # the cluster login the reaper needs (the token file: the install's environment, else a default)
 REAPER_VAULT_NAMES = ("CW_VAULT_NAME", "CW_VAULT_SUBSCRIPTION")   # the vault names (CW_CLUSTER_ADMIN_SECRET has a default: optional)
 # The reaper's NON-SECRET settings the installer copies from its own environment into the service (names of a cluster or a

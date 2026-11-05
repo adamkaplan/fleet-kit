@@ -51,6 +51,9 @@ def sh(cwd, *a):
 
 class PodInspect(unittest.TestCase):
     def setUp(self):
+        # The fixtures' ages are relative to NOW_MS: re-read it per test, or a long whole-directory run ages every call past its bound.
+        global NOW_MS
+        NOW_MS = int(time.time() * 1000)
         self.tmp = tempfile.TemporaryDirectory(dir="/tmp")
         self.addCleanup(self.tmp.cleanup)
         self.pw = os.path.join(self.tmp.name, "pw")

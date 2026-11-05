@@ -108,17 +108,95 @@ class TestMergeDrops(MergeDropsBase):
         self.write("app.py", "def a():\n    return None\ndef b():\n    pass\nz = 1\n")   # the branch removes one `return None`
         self.commit("own removal")
         git(self.dir, "checkout", "-q", "integration")
-        self.write("app.py", two + "tail = 2\n")
-        self.commit("tip adds a line")
+        self.write("app.py", two + "def c():\n    return None\n")
+        self.commit("tip adds a function")
         git(self.dir, "checkout", "-q", "pr")
         git(self.dir, "merge", "-q", "--no-commit", "integration")
-        self.write("app.py", "def a():\n    pass\ndef b():\n    pass\nz = 1\ntail = 2\n")   # the merge drops the other one
+        self.write("app.py", "def a():\n    return None\ndef b():\n    pass\nz = 1\n")   # the merge drops the tip's own new function, whole
         git(self.dir, "add", "-A")
         git(self.dir, "commit", "-q", "-m", "merge the tip")
         code, out = self.run_cmd()
         self.assertEqual(code, 1, out)
         self.assertEqual(len(out), 1, out)
-        self.assertIn("return None", out[0])
+        self.assertIn("def c()", out[0])
+
+    def test_the_branchs_own_removal_behind_the_tip_is_not_a_drop(self):
+        git(self.dir, "checkout", "-q", "-b", "pr")
+        self.write("app.py", "".join("line %d\n" % n for n in range(1, 11) if n != 3))   # the branch's own removal
+        self.commit("own removal")
+        self.tip_moves()   # the tip keeps line 3 and moves on
+        self.assertEqual(self.run_cmd(), (0, []))
+
+    def test_the_branchs_own_removal_made_in_a_merge_resolution_is_not_a_drop(self):
+        git(self.dir, "checkout", "-q", "-b", "pr")
+        self.write("other.py", "keep one\nkeep two\nown addition\n")
+        self.commit("the change")
+        self.tip_moves()
+        git(self.dir, "branch", "-f", "mid", "integration")
+        git(self.dir, "checkout", "-q", "integration")   # the tip moves on again after the branch took `mid`
+        self.write("third.py", "tip tail\n")
+        self.commit("tip moves again")
+        git(self.dir, "checkout", "-q", "pr")
+        git(self.dir, "merge", "-q", "--no-commit", "mid")
+        self.write("app.py", "".join("line %d\n" % n for n in range(1, 6)) + "HeldSendFacts(state_dir)\n" + "".join("line %d\n" % n for n in range(6, 11) if n != 8))   # the port removes line 8: the PR's own change
+        git(self.dir, "add", "-A")
+        git(self.dir, "commit", "-q", "-m", "merge the tip; port")
+        self.assertEqual(self.run_cmd()[0], 0)
+
+    def test_a_line_the_branch_modified_then_merged_the_tip_is_not_a_drop(self):
+        git(self.dir, "checkout", "-q", "-b", "pr")
+        self.write("app.py", "".join(("line 3 extended, extra=None\n" if n == 3 else "line %d\n" % n) for n in range(1, 11)))   # a modified line: a removal and an addition
+        self.commit("modify line 3")
+        self.tip_moves()
+        git(self.dir, "checkout", "-q", "pr")
+        git(self.dir, "merge", "-q", "-m", "merge the tip", "integration")
+        self.assertEqual(self.run_cmd(), (0, []))   # the tip is wholly merged in: the head and the tip share it
+
+    def test_a_tip_line_the_branch_extended_in_a_conflict_resolution_is_not_a_drop(self):
+        git(self.dir, "checkout", "-q", "-b", "pr")
+        self.write("app.py", "".join(("line 3 mine\n" if n == 3 else "line %d\n" % n) for n in range(1, 11)))
+        self.commit("modify line 3")
+        git(self.dir, "checkout", "-q", "integration")
+        self.write("app.py", "".join(("line 3 tip\n" if n == 3 else "line %d\n" % n) for n in range(1, 11)))
+        self.commit("tip modifies line 3")
+        git(self.dir, "checkout", "-q", "pr")
+        git(self.dir, "merge", "-q", "--no-commit", "integration") if False else subprocess.run(["git", "-C", str(self.dir), "merge", "-q", "--no-commit", "integration"], capture_output=True)
+        self.write("app.py", "".join(("line 3 tip, extra=None\n" if n == 3 else "line %d\n" % n) for n in range(1, 11)))   # the PR's extension of the tip's line
+        git(self.dir, "add", "-A")
+        git(self.dir, "commit", "-q", "-m", "merge the tip")
+        self.assertEqual(self.run_cmd(), (0, []))
+
+    def test_a_tip_line_added_after_the_branchs_last_merge_is_not_a_drop(self):
+        git(self.dir, "checkout", "-q", "-b", "pr")
+        self.write("app.py", "".join(("line 3 extended\n" if n == 3 else "line %d\n" % n) for n in range(1, 11)))
+        self.commit("modify line 3")
+        self.tip_moves()
+        git(self.dir, "checkout", "-q", "pr")
+        git(self.dir, "merge", "-q", "-m", "merge the tip", "integration")
+        git(self.dir, "checkout", "-q", "integration")   # the tip moves after the re-merge, in the file the branch touched
+        self.write("app.py", "".join("line %d\n" % n for n in range(1, 6)) + "HeldSendFacts(state_dir)\n" + "".join("line %d\n" % n for n in range(6, 11)) + "with cloud.Cluster() as cluster:\n")
+        self.commit("tip moves again")
+        self.assertEqual(self.run_cmd(), (0, []))
+
+    def test_the_founding_case_a_resolution_rewriting_a_tip_line_that_drops_an_element_is_refused(self):
+        self.write("f.py", "a = 1\nfact_sources = [Held(s), Other(s), Third(s)]\nb = 2\n")
+        self.write("g.py", "g = 1\n")
+        self.commit("f and g")
+        git(self.dir, "checkout", "-q", "-b", "pr", "HEAD")
+        self.write("g.py", "g = 2\n")
+        self.commit("the PR's own change to g")
+        git(self.dir, "checkout", "-q", "integration")
+        self.write("f.py", "a = 1\nfact_sources = [Held(s), Other(s), Third(s)]\nb = 3\n")
+        self.commit("tip modifies f elsewhere")
+        git(self.dir, "checkout", "-q", "pr")
+        git(self.dir, "merge", "-q", "--no-commit", "integration")
+        self.write("f.py", "a = 1\nfact_sources = [Other(s), Third(s)]\nb = 3\n")
+        git(self.dir, "add", "-A")
+        git(self.dir, "commit", "-q", "-m", "merge the tip")
+        code, out = self.run_cmd()
+        self.assertEqual(code, 1)
+        self.assertIn("f.py", out[0])
+        self.assertIn("fact_sources = [Held(s)", out[0])
 
     def test_a_conflicting_merge_says_resolve_first(self):
         git(self.dir, "checkout", "-q", "-b", "pr")

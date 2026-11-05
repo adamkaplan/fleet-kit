@@ -1282,7 +1282,9 @@ class TestDeliver(Base):
         self.assertEqual((intent["phase"], result["phase"], result["ok"]), ("intent", "result", True))
         self.assertEqual(intent["detail"]["message_id"], admitted["id"])
         (write,) = self.world.v2.writes
-        self.assertEqual(write["audit_lines"], len(self.world.audit()) - 1)  # the intent was on disk first
+        events = self.world.audit()
+        intent_at = next(i for i, e in enumerate(events) if e["event"] == "v2.synthetic" and e["phase"] == "intent")
+        self.assertEqual(write["audit_lines"], intent_at + 1)  # the intent was on disk first: the write saw every line up to and including it, whatever other lines the pass adds after
         self.world.tick(5)
         self.assertEqual(self.pass_()["sent"], [])  # delivered keys are never sent again
 
@@ -16646,7 +16648,7 @@ class TestShadowClassifier(Base):
         self.assertEqual(self.world.v2.writes, [])
         self.assertEqual(self.world.admissions("cos"), [])
         self.assertEqual(self.world.admissions("coder"), [])
-        self.assertEqual([e for e in self.world.audit() if e["event"] not in ("classify",)], [])
+        self.assertEqual([e for e in self.world.audit() if e["event"] not in ("classify", "push_watch.skipped")], [])   # push_watch.skipped (#2175): the push watch notes that it has no hub, a note about itself, not an action on the message
         self.assertEqual([c[1:3] for c in self.world.herdr.calls if c[1:3] not in HERDR_ALLOWED], [])
 
     def test_each_new_message_is_classified_once_and_the_previous_one_is_sent_along(self):
@@ -23143,7 +23145,7 @@ class TestSweep(Base):
             checked = set(self.engine.sweep.checked)
         self.assertEqual(seen, set(repos))                       # every repo was reached across passes
         self.assertEqual(len(checked), 20)                       # and every decision's issue was checked
-        self.assertTrue(all(cap in (sb.SWEEP_LIST_PAGES, sb.OPEN_LIST_PAGES, 1) for cap in self.hub.caps), "the lists are capped; the closed-PR list (S9) is one page")
+        self.assertTrue(all(cap in (sb.SWEEP_LIST_PAGES, sb.OPEN_LIST_PAGES, sb.COMMENT_WINDOW_PAGES, 1) for cap in self.hub.caps), "the lists are capped; the closed-PR list (S9) is one page")
         quiet = self.calls()
         self.sweep(decisions)                                    # nothing is stale yet: the cache answers
         self.assertEqual(self.calls(), quiet)
@@ -27880,8 +27882,11 @@ class TestPlanWake(Base):
         self.assertEqual(len(texts), 1, msg=texts)
         self.assertIn(b, texts[0])
         self.assertNotIn(a, texts[0])
-        dropped = [e for e in self.world.audit() if e["event"] == "stale.dropped"]
-        self.assertEqual([e["detail"]["kind"] for e in dropped], ["plan"])
+        # the replaced notice's drop is audited: by the plan pass itself (plan_wake.dropped, #1784) or by the delivery recheck (stale.dropped, #1542)
+        dropped = [e["detail"].get("dropped") or e["detail"].get("hash") or e["detail"].get("kind")
+                   for e in self.world.audit() if e["event"] in ("plan_wake.dropped", "stale.dropped")]
+        self.assertEqual(len(dropped), 1, msg=dropped)
+        self.assertIn(dropped[0], (a, "plan"))
 
     def delivered_to_orch(self):
         self.hub.present_record = lambda *args: {}   # FAKE: the delivery reader needs a hub with the present-state read; the plan facts never use it
@@ -30753,7 +30758,7 @@ class TestPrSharesFiles(LedgerBase):
         self.assertEqual(line, ["shares f0, f1, f2 with #8, #20, #21, #22, #25"])
         self.assertEqual(len(self.list_calls), 1)
         argv = self.list_calls[0]
-        self.assertEqual(argv[argv.index("--limit") + 1], "50")
+        self.assertEqual(argv[argv.index("--limit") + 1], str(sb.OVERLAP_LIST_CAP))
         self.assertEqual(argv[argv.index("--state") + 1], "open")
 
     def test_S4_held_pull_requests_get_a_merge_order_by_waiting_time(self):
@@ -42082,6 +42087,7 @@ class TestLaunchRefusedMessage(TestLaunchMemoryGate):
             ' > args.new_workspace > problem|raise LaunchError(problem)': (newws, [P("launch_account_problem", return_value="no account")]),
             ' > use_headless > except > except|raise LaunchError("headless refused (%s)': (no_ws, [P("launch_headless", side_effect=sb.HeadlessRefused("no")), P("caller_workspace", side_effect=RuntimeError("none"))]),
             ' > except > created|raise LaunchError("%s (workspace %s was ': (newws, [P("launch_agent", side_effect=sb.LaunchError("the tab did not open"))]),
+            ' > getattr(args, "persistent", Fa|return EXIT_USAGE': (B + ["--persistent"], []),
         }
 
     def run_row(self, argv, patches):
@@ -42317,6 +42323,8 @@ class TestLaunchRefusedMessage(TestLaunchMemoryGate):
 
     # A raise that says "created" about something else than the worker (checked before any pod exists); first 30 characters -> reason.
     CREATED_EXEMPT = {
+        '--persistent is only for --age': 'refused before any pod exists: it says nothing was created',
+        '--persistent does not combine ': 'refused before any pod exists: it says nothing was created',
         'the launch reservation of %s i': 'refused before any pod exists: it says nothing was created',
         '%s is not on the cloud allow-l': 'refused before any pod exists: it says nothing was created',
         'CW_ALLOWED_REPOS has an entry ': 'refused before any pod exists: it says nothing was created',
@@ -45018,7 +45026,7 @@ class TestASlowCatchUpDoesNotFreezeThePass(Base):
         rig.hub.catch_up(rig.watch(), rig.world.clock.now())
         self.assertLessEqual(len(rig.hub.queue), sb.GITHUB_PAGE_CAP * sb.GITHUB_PAGE_SIZE)
         took = self.pass_seconds(rig)
-        self.assertLessEqual(took, sb.GITHUB_ROUTE_SECONDS + sb.GITHUB_ROUTE_READ_TIMEOUT + (sb.OPEN_LIST_PAGES - sb.SWEEP_LIST_PAGES), took)   # #1886: the extra pages of one open-item read over the old cap, 1 s each in this rig
+        self.assertLessEqual(took, sb.GITHUB_ROUTE_SECONDS + sb.GITHUB_ROUTE_READ_TIMEOUT + (sb.OPEN_LIST_PAGES - sb.SWEEP_LIST_PAGES) + (sb.COMMENT_WINDOW_PAGES - sb.SWEEP_LIST_PAGES), took)   # #1886, #1889: the extra pages of one open-item read and of the first comment-window read over the old cap, 1 s each in this rig
         self.assertGreater(len(rig.hub.queue), 0, "what did not fit waits for the next pass")
 
     def test_the_decisions_file_is_never_stale_because_of_it(self):
@@ -50148,7 +50156,8 @@ class TestHeldSummaryFlowchart(unittest.TestCase):
         """The combined path: the explainer check and the held check both see the flowchart, and the command prints it once."""
         pr = {"title": "t", "state": "OPEN", "labels": [{"name": "me:merge-captain"}], "files": [], "additions": 1, "deletions": 0, "changedFiles": 1,
               "body": TestHeldTop.OPEN + TestHeldTop.TOP + self.TECH + self.SUMMARY}
-        with mock.patch.object(sb, "read_pr_json", return_value=pr), mock.patch.object(sb, "build_engine", return_value=(mock.Mock(), None, None)):
+        with tempfile.TemporaryDirectory() as state, mock.patch.dict(os.environ, {"XDG_STATE_HOME": state}), \
+                mock.patch.object(sb, "read_pr_json", return_value=pr), mock.patch.object(sb, "build_engine", return_value=(mock.Mock(), None, None)):
             with captured() as (out, err):
                 code = sb.main(["pr-explain", "acme/api#7", "--check"])
         self.assertEqual(code, 1, out.getvalue() + err.getvalue())
@@ -61651,7 +61660,8 @@ class TestStructuralRuleInReviewing(unittest.TestCase):
 
     def test_verify_with_no_folder_named_reads_no_installed_file_under_the_suite(self):
         listing = TestAgentsVerify("listing").listing()
-        with unittest.mock.patch.object(sb, "stale_installed_agents", wraps=sb.stale_installed_agents) as spy, \
+        with tempfile.TemporaryDirectory() as xdg, unittest.mock.patch.dict(os.environ, {"XDG_STATE_HOME": xdg, "XDG_CONFIG_HOME": xdg}), \
+                unittest.mock.patch.object(sb, "stale_installed_agents", wraps=sb.stale_installed_agents) as spy, \
                 contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             sb.main(["agents", "verify"], runner=lambda argv, **kw: subprocess.CompletedProcess(argv, 0, listing, ""))
         self.assertEqual(spy.call_args.args[0], None)
@@ -61659,7 +61669,7 @@ class TestStructuralRuleInReviewing(unittest.TestCase):
     def verify(self, installed_dir):
         listing = TestAgentsVerify("listing").listing()
         out, err = io.StringIO(), io.StringIO()
-        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err), unittest.mock.patch.dict(os.environ):
+        with tempfile.TemporaryDirectory() as xdg, contextlib.redirect_stdout(out), contextlib.redirect_stderr(err), unittest.mock.patch.dict(os.environ, {"XDG_STATE_HOME": xdg, "XDG_CONFIG_HOME": xdg}):   # the installed-tree check (#1380) reads the state dir: keep it off the real one
             code = sb.main(["agents", "verify", "--installed-dir", str(installed_dir)],
                            runner=lambda argv, **kw: subprocess.CompletedProcess(argv, 0, listing, ""))
         return code, out.getvalue()
@@ -66967,6 +66977,7 @@ TestCiTestFileList = _ci_test_files.TestCiTestFileList
 _olc = importlib.import_module("test_open_list_ceiling"); TestOpenListCeiling, TestOpenListAlert, TestOpenListCeilingMutant = _olc.TestOpenListCeiling, _olc.TestOpenListAlert, _olc.TestOpenListCeilingMutant
 TestOpenListPassCalls = importlib.import_module("test_open_list_pass_calls").build(TestASlowCatchUpDoesNotFreezeThePass)   # #1886 Eighth (3)
 _olcuts = importlib.import_module("test_open_list_cuts"); TestOpenListCuts, TestOpenListPagesRead, TestOpenListDerivedText, TestOpenListCutsMutants, TestOpenListWholeReads, TestOpenListCutsWired = _olcuts.TestOpenListCuts, _olcuts.TestOpenListPagesRead, _olcuts.TestOpenListDerivedText, _olcuts.TestOpenListCutsMutants, _olcuts.TestOpenListWholeReads, _olcuts.TestOpenListCutsWired
+_cc = importlib.import_module("test_comment_cursor"); TestCommentCursor, TestOverlapListWhole, TestCommentCursorMutants = _cc.TestCommentCursor, _cc.TestOverlapListWhole, _cc.TestCommentCursorMutants   # #1889
 _rpstrict = importlib.import_module("test_read_pages_strict"); TestReadPagesStrict, TestReadPagesStrictMutant = _rpstrict.TestReadPagesStrict, _rpstrict.TestReadPagesStrictMutant
 TestCiOutsideBin = importlib.import_module("test_ci_outside_bin").TestCiOutsideBin
 _psj = importlib.import_module("test_pr_state_jobs")
@@ -66998,6 +67009,7 @@ PresentHub, TestDeliveryLag = _delivery_lag.PresentHub, _delivery_lag.TestDelive
 # The per-repository owner hold tests of #1241.
 _t1241 = importlib.import_module("test_1241"); TestOwnerHoldFloorConfig, TestImpactHoldByEntry, TestOperatorHoldDocs = _t1241.TestOwnerHoldFloorConfig, _t1241.TestImpactHoldByEntry, _t1241.TestOperatorHoldDocs
 TestLaunchBriefCheck = importlib.import_module("test_launch_brief_check").build(TwoRepoCase, TestLaunchRefusedMessage)
+TestCloudLaunchArmsCheckpoint = importlib.import_module("test_cloud_checkpoint").build(TwoRepoCase, sb, EPOCH, ACME_WEB)
 TestIntentEditToldOnce = importlib.import_module("test_intent_told_once").build(TestIntentEditWiring, GithubRig)   # #1437
 TestRunLauncherShapes, TestStatusLines, TestTurnEnd, TestDictCallersUnchanged = (_ss := importlib.import_module("test_status_shape")).TestRunLauncherShapes, _ss.TestStatusLines, _ss.TestTurnEnd, _ss.TestDictCallersUnchanged
 TestEveryKindDelayedMark = importlib.import_module("test_every_kind_delayed_mark").TestEveryKindDelayedMark
@@ -67025,6 +67037,9 @@ TestLostWorker, TestLostWorkerReadRound, TestLostWorkerMemoryOnly, TestLostWorke
 TestPushWatch = importlib.import_module("test_push_watch").TestPushWatch   # the push watch of #1740
 TestPodSilence = importlib.import_module("test_pod_silence").TestPodSilence   # the pod silence watch of #2115
 TestPodSilenceTick = importlib.import_module("test_pod_silence").TestPodSilenceTick   # the pod silence tick of #2135
+TestSummaryCluster = importlib.import_module("test_pod_silence").TestSummaryCluster   # the summary cluster session of #2173
+TestDaemonSummary = importlib.import_module("test_pod_silence").TestDaemonSummary   # the daemon summary of #2173
+TestUnreadableSummary = importlib.import_module("test_pod_silence").TestUnreadableSummary   # the unreadable summary of #2173
 _stage_events = importlib.import_module("test_stage_events"); _stage_events.GithubRig, _stage_events.GH_REPO = GithubRig, GH_REPO; TestStageEvents = _stage_events.TestStageEvents; TestStageEvents.CONF = {"github_stage_repos": [GH_REPO], "github_stage_bots": ["github-actions[bot]"]}
 # A CLAIMS: line present but not read is refused (#1617); HOST gives the test the fixtures of this file.
 _claim_placement = importlib.import_module("test_claim_placement"); _claim_placement.HOST = sys.modules[__name__]
