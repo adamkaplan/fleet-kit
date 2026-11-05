@@ -57,9 +57,9 @@ def build(Base, World, FAKE_OPENCODE, FAKE_HERDR):
 
         def check_table(self):
             got = self.read_all()
-            self.assertEqual(sum(1 for n in REAL if not got[n]), 4)
-            self.assertEqual(sum(1 for n in ERRORS if got[n]), 3)
-            self.assertEqual(sum(1 for n in AMBIGUOUS if not got[n]), 3)
+            self.assertEqual(sum(1 for n in REAL if not got[n]), len(REAL))   # every one of them
+            self.assertEqual(sum(1 for n in ERRORS if got[n]), len(ERRORS))
+            self.assertEqual(sum(1 for n in AMBIGUOUS if not got[n]), len(AMBIGUOUS))
 
         def test_s2_a_table_of_ten_cases_through_the_real_pane_read(self):
             self.check_table()
@@ -85,7 +85,7 @@ def build(Base, World, FAKE_OPENCODE, FAKE_HERDR):
             for name in REAL:
                 self.assertFalse(self.world.engine.send("cos", name, "hello")["sent"])
                 self.assertEqual(self.world.admissions(name), [])
-            self.assertEqual(len(self.holds()), 4)
+            self.assertEqual(len(self.holds()), len(REAL))   # a hold for each real block, none for an error
             for line in self.holds():
                 self.assertIn("is blocked on a permission request or a question", line["detail"]["reason"])
 
