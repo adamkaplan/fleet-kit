@@ -810,5 +810,27 @@ class TestPushWatch(Case):
         mutant = self.mutant(old, '        if name not in records:\n            pass\n        if name not in records:')
         self.assertEqual(self._absent_once(mutant), 2, "control: the old prune tells it again")
 
+    def _launch_info(self, create, module=None):
+        self.setUp()
+        self.engine.cloud_watch = {"records": [record("w-a", "lane-a")]}   # no hard_deadline: no launch time from the record
+        if create:
+            self.launcher_line(worker="w-a", action="create")   # ts 2027-01-15T08:01:00Z
+        c = commit("tip")
+        c["commit"]["committer"] = {"date": "2027-01-15T08:00:00Z"}   # made before that create
+        self.world.commits[SHA_A] = c
+        self.world.refs = {"w-a/wip": SHA_A}
+        self.run_pass(NOW, module)   # one pass: the first sight decides
+        return len(self.to("lane-a"))
+
+    def test_a_launch_time_from_the_created_state_silences_an_older_tip(self):
+        self.assertEqual(self._launch_info(True), 0)
+        mutant = self.mutant('state.get("created", {}).get(name)', 'None')
+        self.assertEqual(self._launch_info(True, mutant), 1, "a build that ignores created tells it")
+
+    def test_no_launch_information_at_all_still_tells_a_real_push(self):
+        self.assertEqual(self._launch_info(False), 1)
+        mutant = self.mutant('if launched is not None and made is not None and made <= launched:', 'if made is not None:')
+        self.assertEqual(self._launch_info(False, mutant), 0, "a build that silences without launch info")
+
 if __name__ == "__main__":
     unittest.main()
