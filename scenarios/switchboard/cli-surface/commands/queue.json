@@ -1,0 +1,4 @@
+{
+ "command": "queue",
+ "help": "usage: fleet-switchboard queue [-h] {add,priority,cancel,list,next,status} ... positional arguments: {add,priority,cancel,list,next,status} add Queue one pod to launch priority Priority an entry you queued cancel Cancel an entry you queued list The queue in launch order next The entries to launch at FREE free slots status The cloud lane's answer for an entry options: -h, --help show this help message and exit"
+}

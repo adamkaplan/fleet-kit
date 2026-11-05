@@ -178,6 +178,7 @@ TEST_STEPS = [CHECKOUT, PYTHON,
               step("bin/test-cloud-neutral-names"),
               step("cloud/tests/test-cloud", **{"timeout-minutes": "10", "env": {"CLOUD_TEST_SKIP_DOCKER": "1"}}),
               plain("node --test plugins/fleet-decisions-tui/health.test.mjs", "node --test plugins/fleet-decisions-tui/health.test.mjs"),
+              plain("node --test the other plugin tests", "node --test plugins/fleet-decisions-tui/click.test.mjs plugins/fleet-decisions-tui/kind.test.mjs plugins/fleet-hooks/index.test.mjs"),
               plain("bin/fleet-scenario validate", "bin/fleet-scenario validate"),
               plain("bin/fleet-scenario coverage", "bin/fleet-scenario coverage --enforce --through-pr 4")]
 CLOUD_STEPS = [CHECKOUT, PYTHON, step("bin/test-cloud-worker"), step("bin/test-cloud-launcher", **{"timeout-minutes": LAUNCHER_TIMEOUT})] + [

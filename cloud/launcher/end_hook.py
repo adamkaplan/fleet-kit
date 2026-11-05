@@ -86,6 +86,15 @@ class TokenEnded(RuntimeError):
     """A git call refused because the token had ended: the one case in which the hook signals a refresh (see main)."""
 
 
+def head_branch(contained):
+    """The first branch of `git branch -r --contains` with its origin/ prefix off: at most 100 characters of [A-Za-z0-9._/-], else `unknown`."""
+    lines = [x.strip() for x in (contained or "").splitlines() if x.strip()]
+    lines = [x for x in lines if "->" not in x and x != "origin/HEAD"]
+    name = lines[0].split(" ")[0] if lines else ""
+    name = name[len("origin/"):] if name.startswith("origin/") else name
+    return name if name and len(name) <= 100 and re.fullmatch(r"[A-Za-z0-9._/-]+", name) else "unknown"
+
+
 def git(workdir, *args, check=True, ctx=None, opts=True):
     cmd = [GIT_BIN, "-C", workdir] + (ctx.opts if ctx and opts else []) + list(args)
     p = subprocess.run(cmd, capture_output=True, text=True, env=ctx.env if ctx else None)
@@ -274,7 +283,7 @@ def run(workdir, worker, prestop=False, repo=None, ctx=None):
             git(workdir, "fetch", "--prune", "origin")
     contained = git(workdir, "branch", "-r", "--contains", "HEAD", ctx=ctx).stdout.strip()
     if contained:
-        return {"pushed": False, "wip_branch": None, "skipped": skipped}
+        return {"pushed": False, "wip_branch": None, "skipped": skipped, "head_on": head_branch(contained)}
     branch = "%s/wip" % worker
     # prestop: a plain push to the explicit URL, never forced and no lease: a non-fast-forward answer is a failure, not an overwrite
     if prestop:
@@ -282,6 +291,80 @@ def run(workdir, worker, prestop=False, repo=None, ctx=None):
     else:
         git(workdir, "push", "--force-with-lease", "origin", "HEAD:refs/heads/" + branch)
     return {"pushed": True, "wip_branch": branch, "skipped": skipped}
+
+
+# ---- the end-hook ask: a finished pod's pull request is marked ready (and the repository's review comment posted once) when the pod ends ----
+GH_TIMEOUT = 30
+
+
+class GhHub:
+    """The pull request calls through the pod's `gh` client. Each raises RuntimeError on any failure."""
+    def _gh(self, *args):
+        try:
+            r = subprocess.run(["gh", *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=GH_TIMEOUT)
+        except (OSError, subprocess.SubprocessError) as e:
+            raise RuntimeError(type(e).__name__)
+        if r.returncode != 0:
+            raise RuntimeError("gh exit %d" % r.returncode)
+        return r.stdout
+
+    def find(self, branch):
+        """The open pull request of the branch as {number, isDraft, headRefOid}, or None."""
+        found = json.loads(self._gh("pr", "list", "--head", branch, "--state", "open", "--json", "number,isDraft,headRefOid") or "[]")
+        if not found:
+            return None
+        row = found[0]   # the pod's cw-gh prints the raw REST row (draft, head.sha); the gh field form (isDraft, headRefOid) is read too
+        head = row.get("head")
+        return {"number": row.get("number"),
+                "isDraft": row["isDraft"] if "isDraft" in row else row.get("draft"),
+                "headRefOid": row["headRefOid"] if "headRefOid" in row else (head.get("sha") if isinstance(head, dict) else None)}
+
+    def ready(self, number):
+        self._gh("pr", "ready", str(number))
+
+    def comment(self, number, text):
+        self._gh("pr", "comment", str(number), "--body", text)
+
+
+def pr_note(workdir, res, hub=None, comment=None):
+    """One line for the end notice: `PR #N marked ready, review requested` or `PR not marked ready: <reason>`. Never raises."""
+    try:
+        if res.get("no_repository"):
+            return "PR not marked ready: no repository"
+        if res.get("pushed"):
+            return "PR not marked ready: unpushed work was left"
+        ctx = Ctx("/nonexistent")
+        try:
+            branch = git(workdir, "rev-parse", "--abbrev-ref", "HEAD", ctx=ctx).stdout.strip()
+            sha = git(workdir, "rev-parse", "HEAD", ctx=ctx).stdout.strip()
+        finally:
+            ctx.close()
+        if not branch or branch == "HEAD":
+            return "PR not marked ready: no branch"
+        hub = hub or GhHub()
+        pr = hub.find(branch)
+        if not pr:
+            return "PR not marked ready: no pull request"
+        number = pr.get("number")
+        if not pr.get("isDraft"):
+            return "PR not marked ready: #%s is not a draft" % number
+        if pr.get("headRefOid") != sha:
+            return "PR not marked ready: head is not the pushed commit"
+        hub.ready(number)
+        if comment is None:
+            comment = os.environ.get("CW_REVIEW_COMMENT", "")
+        if comment:
+            hub.comment(number, comment)
+            return "PR #%s marked ready, review requested" % number
+        return "PR #%s marked ready, no review comment is configured" % number
+    except Exception as e:
+        return "PR not marked ready: the call failed (%s)" % type(e).__name__
+
+
+def with_pr(workdir, res, hub=None, comment=None):
+    """The hook's answer with `pr_note` added."""
+    res["pr_note"] = pr_note(workdir, res, hub, comment)
+    return res
 
 
 MAX_NAMES = 50
@@ -389,7 +472,7 @@ def main():
         print(json.dumps({"pushed": False, "wip_branch": None, "error": "CW_WORKER is not set"}))
         return 1
     try:
-        print(json.dumps(run(workdir, worker)))
+        print(json.dumps(with_pr(workdir, run(workdir, worker))))
         return 0
     except TokenEnded as e:
         # ONE word to the stop side: ask for a fresh token and run me once more. The hook holds no credential for the minter and asks no one itself.

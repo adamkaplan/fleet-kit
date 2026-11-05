@@ -1,0 +1,32 @@
+# Test classes whose behaviour depends on the platform: one class per line, then '# <platform call>'.
+# bin/test-switchboard --platform-only runs exactly these. A listed class that does not exist fails TestPlatformClassList.
+TestPlatformPaths  # sys.platform, os.uname, platform.system, launchctl, plutil
+TestServiceTemplates  # launchd .plist templates, plutil
+TestCloudReaperTemplates  # launchd .plist templates
+TestDaemonCommand  # launchctl, /Library paths
+TestInstall  # sys.platform darwin, launchctl
+TestInstallPrivateProfile  # launchctl
+TestInstallStatusUsesTheInstalledPlatform  # darwin install status
+TestTheReaperOnlyInstallOnMacOS  # darwin reaper install
+TestTheReaperOnlyDryRunLive  # launchctl
+TestTheReapersCommandPathIsWalked  # .plist, darwin, symlink path walk
+TestDaemonPriority  # .plist, launchctl
+TestCloudReaperInstallOnMacOS  # darwin, launchctl, plutil
+TestRealStatusAfterInstallOnMacOS  # darwin install status
+TestRealStatusAfterInstallOnLinux  # platform branch on the install status
+TestWeeklyJobRewrite  # .plist, darwin, symlink
+TestCpuConsumersAndMemory  # sys.platform darwin (BSD ps, memory reading)
+TestMacosReader  # darwin reader
+TestWatcher  # sys.platform (doctor watcher)
+TestTempJanitor  # stat identity: st_dev, st_ino, symlink
+TestTempJanitorResume  # symlink identity
+TestHeavyHolders  # os.link, st_dev, st_ino file identity
+TestWriteOnlyOnChange  # st_ino file identity
+TestLaunch  # st_ino, symlink
+TestPaneExit  # st_ino
+TestDockerReaper  # stat call
+TestLaunchMemoryGate  # sed -i (BSD sed)
+TestGuardOnTheOrdersFile  # sed -i (BSD sed)
+TestRoutineLocal  # date, sed -i (BSD tools)
+TestTriageStandingLine  # date (BSD date)
+TestPushWatch  # date (BSD date)
