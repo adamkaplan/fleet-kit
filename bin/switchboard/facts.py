@@ -26,7 +26,9 @@ def validate_disk_guard(raw, source):
     if "prune" in raw and not isinstance(raw["prune"], bool):
         raise ConfigError("%s: 'disk_guard.prune' must be true or false, got %r" % (source, raw["prune"]))
     for key, value in raw.items():
-        if key != "prune" and not _is_number(value) or value < 0:
+        if key == "prune":
+            continue   # a boolean, checked above
+        if not _is_number(value) or value < 0:
             raise ConfigError("%s: 'disk_guard.%s' must be a number of gigabytes of at least 0, got %r" % (source, key, value))
     merged = dict(DISK_GUARD_DEFAULTS, **{k: v for k, v in raw.items() if k != "prune"})
     if merged["hard_free_gb"] > merged["min_free_gb"]:
