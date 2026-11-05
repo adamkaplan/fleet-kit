@@ -158,7 +158,7 @@ def _mint_with_retry(target):
             raise Unreadable("no token could be minted (%s): %s" % (refusal_label(), refusal_line()))
         asked = fail.get("retry_after")
         if n >= MINT_TRIES:
-            raise Unreadable("no token could be minted after %s: %s" % (_tries(n), reason))
+            raise Unreadable("no token could be minted after %s: no token could be minted (%s): %s" % (_tries(n), refusal_label(), refusal_line()))
         if asked is not None and asked > MINT_WAITS[-1]:
             raise Unreadable("no token could be minted after %s: %s (GitHub asked for %d seconds, more than the %d seconds waited: not retried)"
                              % (_tries(n), reason, asked, MINT_WAITS[-1]))

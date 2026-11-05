@@ -324,17 +324,17 @@ def github_json(method, path, jwt, body=None, not_found=None, role="worker"):
             die(not_found, "installation")
         if e.code == 422 and method == "POST":
             die("the App's installation does not cover this repository: add it to the installation (HTTP 422); "
-                "if the App lacks a requested permission, %s" % owner_step(role))
+                "if the App lacks a requested permission, %s" % owner_step(role), "installation")
         retry = e.headers.get("Retry-After") if e.headers else None
         passing = e.code == 429 or 500 <= e.code <= 599 or (e.code == 403 and retry is not None)
         flags = {"transient": passing, "retry_after": _wait_seconds(retry) if passing else None}
         if e.code == 403 and method == "POST":  # the App may not hold, or the installation not yet accept, a requested permission
-            die("%s; if the App lacks a requested permission, %s" % (http_error_text(e.code, retry), owner_step(role)), **flags)
-        die(http_error_text(e.code, retry), **flags)
+            die("%s; if the App lacks a requested permission, %s" % (http_error_text(e.code, retry), owner_step(role)), "permissions", **flags)
+        die(http_error_text(e.code, retry), "GitHub error", **flags)
     except TimeoutError:
-        die("the GitHub request timed out: the launch is refused and nothing was minted", transient=True)
+        die("the GitHub request timed out: the launch is refused and nothing was minted", "GitHub error", transient=True)
     except Exception:  # OSError, ValueError, UnicodeDecodeError, RecursionError, MemoryError: any failure is a named refusal, never a crash
-        die("the GitHub request failed or its answer was not usable JSON: the launch is refused and nothing was minted", transient=True)
+        die("the GitHub request failed or its answer was not usable JSON: the launch is refused and nothing was minted", "GitHub error", transient=True)
 
 
 def is_id(x):
@@ -418,10 +418,10 @@ def parse_route(rest):
     if not rest:
         return None, None
     if len(rest) != 2 or rest[0] not in ("--fd", "--out"):
-        die(USAGE, 2)
+        die(USAGE, "other", 2)
     if rest[0] == "--fd":
         if not (rest[1].isascii() and rest[1].isdigit() and len(rest[1]) <= 6):
-            die(USAGE, 2)
+            die(USAGE, "other", 2)
         return "fd", int(rest[1])
     return "out", rest[1]
 
@@ -430,18 +430,18 @@ def check_fd(fd):
     """Refuse (exit 2) before minting unless fd is 3 or more, open, writable and not a terminal."""
     import fcntl
     if fd < 3:
-        die("the route --fd must be 3 or more (0, 1 and 2 are the terminal's)", 2)
+        die("the route --fd must be 3 or more (0, 1 and 2 are the terminal's)", "other", 2)
     try:
         flags = fcntl.fcntl(fd, fcntl.F_GETFL)
         tty = os.isatty(fd)
     except OSError:
-        die("the route --fd %d is not an open descriptor" % fd, 2)
+        die("the route --fd %d is not an open descriptor" % fd, "other", 2)
     if flags & os.O_ACCMODE == os.O_RDONLY:
-        die("the route --fd %d is not writable" % fd, 2)
+        die("the route --fd %d is not writable" % fd, "other", 2)
     if tty:
-        die("the route --fd %d is a terminal" % fd, 2)
+        die("the route --fd %d is a terminal" % fd, "other", 2)
     if same_stream_as_output(fd):
-        die("the route --fd %d is the same open file or pipe as standard output or standard error" % fd, 2)
+        die("the route --fd %d is the same open file or pipe as standard output or standard error" % fd, "other", 2)
 
 
 def same_stream_as_output(fd):
@@ -507,7 +507,7 @@ def check_length(path):
         name_max, path_max = 255, 4096
     raw = os.fsencode(path)
     if len(raw) >= path_max or any(len(p) > name_max for p in raw.split(b"/")):
-        die("the route --out is longer than the file system allows", 2)
+        die("the route --out is longer than the file system allows", "other", 2)
 
 
 def check_out(path):
@@ -515,26 +515,26 @@ def check_out(path):
     Returns the path to create, with every judged link resolved."""
     import stat
     if not path or "\0" in path or "\n" in path:
-        die("the route --out needs a path", 2)
+        die("the route --out needs a path", "other", 2)
     if ".." in path.split("/"):
-        die("the route --out must not hold a '..' component", 2)
+        die("the route --out must not hold a '..' component", "other", 2)
     if path.endswith("/"):
-        die("the route --out must name a file", 2)
+        die("the route --out must name a file", "other", 2)
     path = os.path.join(os.getcwd(), path)
     check_length(path)
     d = os.path.dirname(os.path.abspath(path))
     if link_in_parents(os.path.join(d, "x")):
-        die("the directory of --out is a link or not a directory", 2)
+        die("the directory of --out is a link or not a directory", "other", 2)
     d = os.path.realpath(d)   # every link in it was judged above
     path = os.path.join(d, os.path.basename(path))
     try:
         st = os.lstat(d)
     except OSError:
-        die("the directory of --out does not exist", 2)
+        die("the directory of --out does not exist", "other", 2)
     if not stat.S_ISDIR(st.st_mode):
-        die("the directory of --out is a link or not a directory", 2)
+        die("the directory of --out is a link or not a directory", "other", 2)
     if st.st_uid != os.getuid() or st.st_mode & 0o077:
-        die("the directory of --out must be owned by you with no group or world access (mode 0700)", 2)
+        die("the directory of --out must be owned by you with no group or world access (mode 0700)", "other", 2)
     if os.path.lexists(path):
         die("refusing: --out path exists; the mint never overwrites", 1)
     return path
@@ -575,7 +575,7 @@ def deliver(kind, value, token):
 
 def main(argv):
     if len(argv) < 1 or not valid_target(argv[0]):
-        die(USAGE, 2)
+        die(USAGE, "other", 2)
     target = argv[0]
     role, rest = "worker", argv[1:]
     if len(rest) >= 2 and rest[0] == "--role":
@@ -583,7 +583,7 @@ def main(argv):
     elif len(rest) >= 2 and rest[-2] == "--role":
         role, rest = rest[-1], rest[:-2]
     if role not in PERMISSIONS_BY_ROLE:
-        die("unknown role (one of: %s)" % ", ".join(PERMISSIONS_BY_ROLE), 2)
+        die("unknown role (one of: %s)" % ", ".join(PERMISSIONS_BY_ROLE), "other", 2)
     kind, value = parse_route(rest)
     if kind == "fd":
         check_fd(value)
@@ -611,15 +611,15 @@ def main(argv):
             return
         deliver(kind, value, token)
     except KeyboardInterrupt:   # an interrupt or a signal at any point: revoke, leave nothing, exit non-zero
-        die("the delivery was interrupted", 130)
+        die("the delivery was interrupted", "other", 130)
     except SystemExit as e:
         if not MINTED:   # a refusal already revoked, or nothing was minted yet, or the run ended well
             raise
-        die("the delivery was interrupted", e.code if isinstance(e.code, int) and e.code else 1)
+        die("the delivery was interrupted", "other", e.code if isinstance(e.code, int) and e.code else 1)
     except Exception:   # OSError, a full disk, a broken pipe, an error in the code between the mint and the route
         if not MINTED:   # before any token exists the failure is not this handler's
             raise
-        die("the token could not be delivered to the route")
+        die("the token could not be delivered to the route", "other")
     MINTED.clear()
 
 
