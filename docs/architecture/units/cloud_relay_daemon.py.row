@@ -1,0 +1,1 @@
+| `cloud_relay_daemon.py` | 5 | the daemon half of the cloud hub relay: pulls pod requests from the hub and runs them with the same rules as the local commands | |
