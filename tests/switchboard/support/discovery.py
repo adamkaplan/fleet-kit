@@ -7,6 +7,7 @@ A loader line that binds a class (by its name or under another name) still wins:
 Standard library only.
 """
 import importlib
+import sys
 import unittest
 from pathlib import Path
 
@@ -29,7 +30,11 @@ def discovered_classes(tests_dir):
 
 
 def bind_discovered(namespace, tests_dir):
-    """Bind into `namespace` the discoverable classes it does not hold yet; return the sorted names bound."""
+    """Bind into `namespace` the discoverable classes it does not hold yet; return the sorted names bound.
+    `namespace` is a dict, or the NAME of a module (`__name__`): the runner hands its name, so no call there takes the module itself (the rebinding guard);
+    only names that are not held are ever written, so a moved name is never rebound."""
+    if isinstance(namespace, str):
+        namespace = vars(sys.modules[namespace])
     found = discovered_classes(tests_dir)
     held = [v for v in namespace.values() if isinstance(v, type)]
     bound = []

@@ -413,6 +413,7 @@ class TestWiredCheckPlanted(unittest.TestCase):
         self.assertEqual(self.source.count(line), 1)
         self.assertEqual(self.source.count("bind_discovered("), 1)
         out = problems(self.tmp, self.source.replace(line, "").replace("bind_discovered(", "bind_nothing("), {})
+        out = [o for o in out if not o.startswith("test_loader_merge.py:")]   # a file only discovery reaches (#2206) is unimported once discovery is off: that is the point
         self.assertEqual(len(out), 1, out)
         self.assertIn("test_github_census.py", out[0])
         self.assertIn("TestMacosReader", out[0])

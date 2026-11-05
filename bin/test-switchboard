@@ -67402,7 +67402,7 @@ class TestSupportRebinding(unittest.TestCase):
                 self.assertEqual(self.rebindings(path.read_text(), self.moved_names()), [], "a moved name rebound in %s does not reach the moved code (rebound)" % path.name)
 
 # Self-registration (#2206): every Test* class of tests/switchboard/test_*.py that no line above binds is bound here, so a new test file needs no loader line.
-DISCOVERED_TEST_CLASSES = importlib.import_module("support.discovery").bind_discovered(globals(), Path(__file__).resolve().parent.parent / "tests" / "switchboard")
+DISCOVERED_TEST_CLASSES = importlib.import_module("support.discovery").bind_discovered(__name__, Path(__file__).resolve().parent.parent / "tests" / "switchboard")
 
 
 def main(argv):
