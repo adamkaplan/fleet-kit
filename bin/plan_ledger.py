@@ -921,22 +921,6 @@ def review_records_at(entries, pr, head, expected=REVIEWERS_NOW):
     return {"expected": list(expected), "recorded": recorded, "uncited": uncited, "blocking": blocking, "missing": [r for r in expected if r not in recorded]}
 
 
-def approval_state(events, issue, current_hash, hashes=None, canonical=None):
-    """#1735, G0c: (status, detail) from the plan.approved events of `issue`, newest first, each {"plan_hash": ...}; None = they could not be read. Pure: it reads no file.
-    #1713: `hashes` is plan_check.plan_hashes(text) and `canonical` is plan_check.canonical_hash: an event at ANY member of the pair of the live text holds the current hash.
-    ok when an event holds the current hash; missing when none does (the detail names the current hash and the newest approved one), the events were unreadable, or no plan issue is named (fail closed)."""
-    if not issue:
-        return "missing", "no plan issue named: G0c cannot find an approval"
-    if events is None:
-        return "missing", "the plan.approved events of %s could not be read in time: refused (fails closed)" % issue
-    seen = [(canonical(e["plan_hash"], hashes) if canonical else e["plan_hash"]) for e in events if isinstance(e, dict) and isinstance(e.get("plan_hash"), str)]
-    if current_hash and current_hash in seen:
-        return "ok", "approved at plan hash %s" % current_hash
-    if seen:
-        return "missing", "no approval of %s at its current plan hash %s; the newest approved hash is %s" % (issue, current_hash, seen[0])
-    return "missing", "no plan.approved event for %s (current plan hash %s)" % (issue, current_hash)
-
-
 def evaluate_gates(plan, entries, ledger_problem, facts, pr, now=None):
     """The gate table for one PR. `plan` is {"result", "defects", "scenarios_parsed", "plan_hash"} from the plan checker
     (None when no plan could be found), `facts` is what `gh pr view` said (head, ci, captain, body, notice_senders).
@@ -951,15 +935,12 @@ def evaluate_gates(plan, entries, ledger_problem, facts, pr, now=None):
     rows, scen_rows = [], []
     for gid, name, scope, owner, tracked in GATES:
         row = {"gate": gid, "name": name, "scope": scope, "decided_by": owner, "tracked": tracked, "status": "untracked",
-               "missing": []}
+               "missing": [], **((facts or {}).get("approval") or {}).get(gid, {})}   # #1735: the G0c row is decided by bin/switchboard/approval_gate.py and arrives in facts["approval"]["G0c"]
         if scope != "P":
             row["status"] = "n/a"
             row["detail"] = UNTRACKED_WHY.get(gid, "")
-        elif not tracked and not (gid == "G0c" and isinstance((facts or {}).get("approval"), dict)):   # #1735: G0c is tracked only where the repo enforces it (facts["approval"] is then set)
+        elif not row["tracked"]:
             row["detail"] = UNTRACKED_WHY.get(gid, "not recorded yet")
-        elif gid == "G0c":
-            status, said = approval_state(facts["approval"].get("events"), facts["approval"].get("issue"), (plan or {}).get("plan_hash"), (plan or {}).get("plan_hashes"))
-            row.update(tracked=True, status=status, detail=said, missing=[said] if status == "missing" else [])
         elif gid == "G0a":
             if plan is None:
                 row.update(status="missing", missing=["no plan found: pass --plan, or put `PLAN: <link>` in the PR body"])

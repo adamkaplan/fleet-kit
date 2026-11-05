@@ -48,6 +48,22 @@ def approval_events(state_dir, issue, current_hash, clock=None, seconds=None, fi
         return None
 
 
+def approval_state(events, issue, current_hash, hashes=None):
+    """#1735, G0c: (status, detail) from the plan.approved events of `issue`, newest first, each {"plan_hash": ...}; None = they could not be read. Pure: it reads no file.
+    #1713: `hashes` is plan_check.plan_hashes(text): an event at ANY member of the pair of the live text holds the current hash.
+    ok when an event holds the current hash; missing when none does (the detail names the current hash and the newest approved one), the events were unreadable, or no plan issue is named (fail closed)."""
+    if not issue:
+        return "missing", "no plan issue named: G0c cannot find an approval"
+    if events is None:
+        return "missing", "the plan.approved events of %s could not be read in time: refused (fails closed)" % issue
+    seen = [plan_check.canonical_hash(e["plan_hash"], hashes) for e in events if isinstance(e, dict) and isinstance(e.get("plan_hash"), str)]
+    if current_hash and current_hash in seen:
+        return "ok", "approved at plan hash %s" % current_hash
+    if seen:
+        return "missing", "no approval of %s at its current plan hash %s; the newest approved hash is %s" % (issue, current_hash, seen[0])
+    return "missing", "no plan.approved event for %s (current plan hash %s)" % (issue, current_hash)
+
+
 def approval_issue(source, config):
     """`owner/repo#N` of the plan source a pull request names, or None (no plan link, or one that is no issue)."""
     try:
@@ -64,12 +80,14 @@ def approval_on(config, repo):
 
 
 def approval_fact(config, state, pr, source, plan):
-    """The approval fact (a dict) when the gate is on for this repo, else None (G0c stays untracked). The current hash is the plan's own (plan_check.plan_hash)."""
+    """facts["approval"] when the gate is on for this repo, else None (G0c stays untracked): {"G0c": the row's tracked, status, detail, missing}. The current hash is the plan's own (plan_check.plan_hash)."""
     if not approval_on(config, pr.rsplit("#", 1)[0]):
         return None
     issue = approval_issue(source, config)
-    events = approval_events(state, issue, (plan or {}).get("plan_hash"), hashes=(plan or {}).get("plan_hashes")) if issue and plan else ([] if issue is None else None)
-    return {"issue": issue, "events": events}
+    hashes, current = (plan or {}).get("plan_hashes"), (plan or {}).get("plan_hash")
+    events = approval_events(state, issue, current, hashes=hashes) if issue and plan else ([] if issue is None else None)
+    status, said = approval_state(events, issue, current, hashes)
+    return {"G0c": {"tracked": True, "status": status, "detail": said, "missing": [said] if status == "missing" else []}}
 
 
 def approval_refusal(args, runner, now):
@@ -86,7 +104,8 @@ def approval_refusal(args, runner, now):
     try:
         ctx = _ledger_context(types.SimpleNamespace(pr=args.pr, plan=None, ask=None), runner, now, False)
         facts = dict(ctx.facts or {}, approval=approval_fact(ctx.config, ctx.state, ctx.pr, ctx.source, ctx.plan))
-        status, said = plan_ledger.approval_state(facts["approval"]["events"], facts["approval"]["issue"], (ctx.plan or {}).get("plan_hash"), (ctx.plan or {}).get("plan_hashes"), plan_check.canonical_hash) if facts.get("approval") else ("missing", "the plan could not be read")
+        row = (facts.get("approval") or {}).get("G0c") or {"status": "missing", "detail": "the plan could not be read"}
+        status, said = row["status"], row["detail"]
     except Exception as err:
         return "merge of %s refused: the plan approval could not be judged (%s); the gate fails closed" % (args.pr, _one_line(str(err), 100))
     if status != "missing":

@@ -82,10 +82,10 @@ def source_of(fn):
 
 def mutated_state(old, new):
     """approval_state from the real source with `old` replaced by `new` (asserted applied)."""
-    text = source_of(plan_ledger.approval_state)
+    text = source_of(HOST.sb.approval_state)
     if old not in text:
         raise AssertionError("mutant not applied: %r" % old)
-    space = dict(vars(plan_ledger))
+    space = dict(vars(HOST.sb))
     exec(text.replace(old, new, 1), space)
     return space["approval_state"]
 
@@ -144,7 +144,7 @@ class TestApprovalGateReader(unittest.TestCase):
     """S2, S4, S7, U2, U3 on a fixture audit."""
 
     def test_the_rows_of_the_fixture_audit(self):
-        scenario_rows(HOST.sb.approval_events, plan_ledger.approval_state)
+        scenario_rows(HOST.sb.approval_events, HOST.sb.approval_state)
 
     def test_the_unmutated_control_passes_the_scenario_check(self):
         scenario_rows(mutated_events("count % 500 == 0", "count % 500 == 0"), mutated_state("seen:", "seen:"))
@@ -157,7 +157,7 @@ class TestApprovalGateReader(unittest.TestCase):
     def test_mutant_only_detail_issue_read_is_caught(self):
         events = mutated_events('want in (str(entry.get("subject") or "").lower(), str(detail.get("issue") or "").lower())', 'want == str(detail.get("issue") or "").lower()')
         with self.assertRaisesRegex(AssertionError, r"^approval gate: an event whose issue is only in its subject: got missing, want ok$"):
-            scenario_rows(events, plan_ledger.approval_state)
+            scenario_rows(events, HOST.sb.approval_state)
 
     def test_mutant_the_hash_ignored_is_caught(self):
         state = mutated_state("if current_hash and current_hash in seen:", "if seen:")
@@ -167,7 +167,7 @@ class TestApprovalGateReader(unittest.TestCase):
     def test_a_corrupt_gzip_reads_as_none_and_the_row_says_could_not_be_read(self):
         folder = corrupt_gz_dir()
         self.assertIsNone(HOST.sb.approval_events(folder, ISSUE, H_NEW))
-        row = judge(HOST.sb.approval_events, plan_ledger.approval_state, folder, ISSUE, H_NEW)
+        row = judge(HOST.sb.approval_events, HOST.sb.approval_state, folder, ISSUE, H_NEW)
         self.assertEqual((row[0], "could not be read" in row[1]), ("missing", True))
 
     def test_mutant_the_narrow_except_lets_a_corrupt_gzip_propagate_and_is_caught(self):
@@ -193,7 +193,7 @@ class TestApprovalGateReader(unittest.TestCase):
         self.assertEqual(read(many_files(61, 60), ISSUE, H_NEW), [{"plan_hash": H_NEW}], "the 60th file read is read")
         folder = many_files(62, 61)
         self.assertIsNone(read(folder, ISSUE, H_NEW), "the 61st file read is past the bound")
-        row = plan_ledger.approval_state(read(folder, ISSUE, H_NEW), ISSUE, H_NEW)
+        row = HOST.sb.approval_state(read(folder, ISSUE, H_NEW), ISSUE, H_NEW)
         self.assertEqual(row[0], "missing")
         self.assertRegex(row[1], r"could not be read in time")
 
@@ -203,7 +203,7 @@ class TestApprovalGateReader(unittest.TestCase):
             seventy_files_found(mutant)
 
     def test_the_decision_is_one_short_pure_function_and_the_reader_reads_no_github_and_writes_nothing(self):
-        body = source_of(plan_ledger.approval_state)
+        body = source_of(HOST.sb.approval_state)
         self.assertLessEqual(len(body.splitlines()), 30)
         for word in ("open(", "Path(", "read_text", "subprocess", "runner"):
             self.assertNotIn(word, body)
@@ -240,7 +240,7 @@ class TestApprovalPair(unittest.TestCase):
     """S11 (ask #1713's pair): the gate accepts an event at any member of the pair of the live text."""
 
     def test_the_rows_of_the_pair(self):
-        pair_rows(HOST.sb.approval_events, plan_ledger.approval_state)
+        pair_rows(HOST.sb.approval_events, HOST.sb.approval_state)
 
     def test_the_unmutated_control_passes(self):
         pair_rows(mutated_events("count % 500 == 0", "count % 500 == 0"), mutated_state("seen:", "seen:"))
@@ -253,8 +253,9 @@ class TestApprovalPair(unittest.TestCase):
 
     def test_mutant_comparing_the_new_hash_only_is_caught(self):
         events = mutated_events('plan_check.canonical_hash(detail["plan_hash"], hashes)', 'detail["plan_hash"]')
+        state = mutated_state('plan_check.canonical_hash(e["plan_hash"], hashes)', 'e["plan_hash"]')   # the pair is accepted at both reads (reader and decision): the mutant drops both
         with self.assertRaisesRegex(AssertionError, r"^approval gate: an event at the member sha256:[0-9a-f]{7} of the pair: got missing, want ok$"):
-            pair_rows(events, plan_ledger.approval_state)
+            pair_rows(events, state)
 
 
 class TestApprovalGateCommands(unittest.TestCase):
@@ -465,7 +466,7 @@ class TestApprovalGateCommands(unittest.TestCase):
         self.set_body("canon: updated the docs")
         self.assertRegex(self.refusal() or "", re.escape(self.NOPLAN), "control: the unmutated rule refuses")
         fn = mutated_state(old, '        return "n/a", "the pull request has no plan link"')
-        with mock.patch.object(plan_ledger, "approval_state", fn):
+        with mock.patch.object(HOST.sb, "approval_state", fn):
             self.assertIsNone(self.refusal(), "the mutant passes a pull request with no plan link")
             with self.assertRaisesRegex(AssertionError, r"^None is not true : no plan link must be refused$"):
                 self.assertTrue(self.refusal(), "no plan link must be refused")
