@@ -67025,6 +67025,9 @@ TestLostWorker, TestLostWorkerReadRound, TestLostWorkerMemoryOnly, TestLostWorke
 TestPushWatch = importlib.import_module("test_push_watch").TestPushWatch   # the push watch of #1740
 TestPodSilence = importlib.import_module("test_pod_silence").TestPodSilence   # the pod silence watch of #2115
 TestPodSilenceTick = importlib.import_module("test_pod_silence").TestPodSilenceTick   # the pod silence tick of #2135
+TestSummaryCluster = importlib.import_module("test_pod_silence").TestSummaryCluster   # the summary cluster session of #2173
+TestDaemonSummary = importlib.import_module("test_pod_silence").TestDaemonSummary   # the daemon summary of #2173
+TestUnreadableSummary = importlib.import_module("test_pod_silence").TestUnreadableSummary   # the unreadable summary of #2173
 _stage_events = importlib.import_module("test_stage_events"); _stage_events.GithubRig, _stage_events.GH_REPO = GithubRig, GH_REPO; TestStageEvents = _stage_events.TestStageEvents; TestStageEvents.CONF = {"github_stage_repos": [GH_REPO], "github_stage_bots": ["github-actions[bot]"]}
 # A CLAIMS: line present but not read is refused (#1617); HOST gives the test the fixtures of this file.
 _claim_placement = importlib.import_module("test_claim_placement"); _claim_placement.HOST = sys.modules[__name__]
