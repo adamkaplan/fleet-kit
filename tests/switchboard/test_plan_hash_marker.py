@@ -364,6 +364,8 @@ def build():
             self.assertEqual(self.approval(sb.triage_pass, "comment", "old"), [])   # the control: the unmutated copy passes the old-hash test
             with tempfile.TemporaryDirectory() as tmp:
                 msb = _entry_copy(tmp, "switchboard/plan_notice.py", self.COMMENT_OLD, "module.approved_by_comment(plan, plan_hash, by_issue.get(number, []), signed_by_fleet)")
+                self.engine.plan_wake.approved.clear()   # #2193: the control run remembered the plan as approved; the mutant is judged on a wake that holds nothing
+                self.engine.plan_wake.announced.clear()
                 with self.assertRaisesRegex(AssertionError, self.ANNOUNCED):
                     self.assertEqual(self.approval(msb.triage_pass, "comment", "old"), [])
 
@@ -371,6 +373,8 @@ def build():
             self.assertEqual(self.approval(sb.triage_pass, "send", "old"), [])   # the control: the unmutated copy passes the old-hash test
             with tempfile.TemporaryDirectory() as tmp:
                 msb = _entry_copy(tmp, "switchboard/plan_notice.py", self.SEND_OLD, "module.approved_by_send(plan, plan_hash, sends, signed_by_fleet)")
+                self.engine.plan_wake.approved.clear()   # #2193: the control run remembered the plan as approved; the mutant is judged on a wake that holds nothing
+                self.engine.plan_wake.announced.clear()
                 with self.assertRaisesRegex(AssertionError, self.ANNOUNCED):
                     self.assertEqual(self.approval(msb.triage_pass, "send", "old"), [])
 
