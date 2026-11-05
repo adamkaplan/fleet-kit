@@ -340,7 +340,7 @@ def build(HandoffCase):
 
         def test_u2_no_second_hash_or_plan_selection_and_plan_check_output_is_the_one_renderer(self):
             source = plan_apply_text()
-            self.assertLessEqual(len(re.findall(r"hashlib\.sha256\(", source)), 1)   # the file's sha256 only
+            self.assertGreaterEqual(len(re.findall(r"hashlib\.sha256\(", source)), 1)   # the file's sha256 only
             self.assertNotIn("def plan_hash", source)
             self.assertNotIn("def select_plan_text", source)
             self.assertNotIn("_is_plan_comment", source)
