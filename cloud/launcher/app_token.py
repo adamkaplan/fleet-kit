@@ -536,7 +536,7 @@ def check_out(path):
     if st.st_uid != os.getuid() or st.st_mode & 0o077:
         die("the directory of --out must be owned by you with no group or world access (mode 0700)", "other", 2)
     if os.path.lexists(path):
-        die("refusing: --out path exists; the mint never overwrites", 1)
+        die("refusing: --out path exists; the mint never overwrites", "other", 1)
     return path
 
 
