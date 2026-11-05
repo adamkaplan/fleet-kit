@@ -283,18 +283,6 @@ class CloudLimits(LaunchHarness):
         result, err, _ = self.run_launch(None, brief="use docker", stack=True, shape="S")
         self.assertEqual([l for l in err.splitlines() if "no nested Docker" in l], [])
 
-    def test_s9_the_pod_shape_is_in_the_one_line_output(self):
-        src = read("bin/cloud_worker.py")
-        self.assertIn("def pod_shape(", src)
-        sb, _ = make_state()
-        b = sb.load_module("cloud_worker")
-        self.assertEqual(b.pod_shape(types.SimpleNamespace(shape=None, stack=False, agent="worker")), "XS")
-        self.assertEqual(b.pod_shape(types.SimpleNamespace(shape=None, stack=True, agent="worker")), "S")
-        self.assertEqual(b.pod_shape(types.SimpleNamespace(shape="M", stack=False, agent="worker")), "M")
-        self.assertEqual(b.pod_shape(types.SimpleNamespace(shape=None, stack=False, agent="orchestrator")), "S")
-        tail = src[src.index("def _launch("):]
-        self.assertIn('"shape": pod_shape(args)', tail[:tail.index("def _registry_note")])
-
     def test_u3_the_one_temporary_rule_is_a_constant_in_one_module_followed_by_an_ask_number(self):
         src = read("bin/cloud_worker.py")
         names = re.findall(r"^(TEMP_[A-Z_]+) =", src, re.M)

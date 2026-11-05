@@ -20,7 +20,7 @@ Write GitHub text so a person can read it: short paragraphs, real Markdown lists
 ## The brief
 
 Send one self-contained brief at dispatch. Later updates can be shorthand; the
-first one cannot.
+first one cannot. Write the brief with a quoted heredoc (`<<'E'`) or a file, never an unquoted one: a backtick or a dollar sign in an unquoted brief is run by the shell.
 
 ```text
 ISSUE:      <full repository-qualified GitHub issue URL>
@@ -41,6 +41,8 @@ A brief for a change that adds a file under `bin/` carries the output of `tools/
 
 Every builder brief carries the builder checklist below by default; a brief that leaves an item out says why in one line.
 
+A brief says `run the guard set` (`tools/guard-set` prints the commands, from `docs/guard-set.json`): the builder runs them one class at a time before its final message.
+
 ## Builder checklist
 
 The mistakes that cost the most review rounds and the most lost work. Meet them in the first push.
@@ -59,6 +61,8 @@ The mistakes that cost the most review rounds and the most lost work. Meet them 
 A person who briefs a cloud operator starts from the standard header: `fleet-switchboard brief header --role operator` (see "Briefing a cloud operator" in `docs/cloud-operator-quickstart.md`).
 
 **A cloud builder never runs the whole bin/test-switchboard** or any suite over about 10 minutes in its pod: CI runs it on the merged head (45 to 55 minutes on a runner), and a pod is slower; in the briefs the fleet writes, the pod's hard limit is 50 minutes (the launcher's own default is longer). It runs the named classes singly, each under about 100 seconds, and keeps itself active with short foreground commands, because a long background run is not activity and an idle pod is stopped. It pushes its work branch after every commit, and sends its final message the minute the class list is done and stops. Item (j) and the paragraph on focused local runs are for a local worker and are not changed.
+
+A mutant counts as caught only with a passing control (the same command on the unmutated copy exits 0) and an anchored failure text (the mutated check is named in the failure); a harness that counts any non-zero exit as a catch proves nothing. Builders RUN the control and print its result next to the mutant count.
 
 A coder that posts a plan also reports `working: plan posted <hash> <url>` (a report arrives even when a send is lost).
 

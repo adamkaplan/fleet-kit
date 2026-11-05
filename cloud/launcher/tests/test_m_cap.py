@@ -183,8 +183,9 @@ class TestScratch(unittest.TestCase):
         if old:
             env[OLD_ONLY] = "1"
         argv = [sys.executable, os.path.join(d, "cloud", "launcher", "tests", Path(__file__).name), "TestScenarios." + test]
-        p = stub_support.start(self, argv, cwd=d, env=env, stdout=open(os.path.join(d, "out.txt"), "w"), stderr=open(os.path.join(d, "err.txt"), "w"))
-        code = p.wait(timeout=90)
+        with open(os.path.join(d, "out.txt"), "w") as out_f, open(os.path.join(d, "err.txt"), "w") as err_f:
+            p = stub_support.start(self, argv, cwd=d, env=env, stdout=out_f, stderr=err_f)
+            code = p.wait(timeout=90)
         return applied, code, Path(d, "out.txt").read_text() + Path(d, "err.txt").read_text()
 
     def test_s2_the_old_code_accepts_the_sixth_launch(self):

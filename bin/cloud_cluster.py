@@ -197,7 +197,7 @@ def run_launcher(runner, command, worker, options=(), timeout=D["LAUNCH_SECONDS"
     except ValueError:
         body = None
     clean = cluster.clean if cluster is not None else (lambda text, limit=300: _scrub_lib()(text, (), limit))
-    return child.returncode, body if isinstance(body, dict) else None, D["_one"](clean(err or "", 2000))
+    return child.returncode, body if isinstance(body, dict) or (command == "status" and isinstance(body, list) and body and all(isinstance(r, dict) for r in body)) else None, D["_one"](clean(err or "", 2000))
 
 
 LAUNCHER_OUTPUT_LIMIT = 4000000   # bytes of the launcher's stdout (a snapshot of a large cluster is far below it)
