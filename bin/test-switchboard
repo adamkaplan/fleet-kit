@@ -73544,6 +73544,9 @@ class TestGhShimMergeGate(Base):
         control = ["api", "-X", "POST", "repos/acme/app/issues/5/comments", "-f", "body=hello"]
         done, log = self.run_shim(*control)
         self.assertNotEqual(log and log["argv"], control)
+        done, log = self.run_shim("api", "-X", "POST", "repos/acme/app/actions/runs/123/rerun")   # an unknown write path is still refused
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIsNone(log)
 
     HEAD = "a" * 40
 
