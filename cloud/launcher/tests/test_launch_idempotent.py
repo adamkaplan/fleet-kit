@@ -27,7 +27,7 @@ stub_support = tcw.stub_support
 
 PAST = "2000-01-01T00:00:00Z"
 POD = "coder7-7f9c"
-GATE = '        done = _launch_again(args, runner, engine, state, existing, repo, branch)\n'
+GATE = '    if record is None:   # a first launch of the name\n        return None\n'   # in bin/cloud_launch_again.py (the gate moved there with the launch-again code)
 
 
 class Launch(tcw.Base):
@@ -224,8 +224,8 @@ def run_child(case, test_file, selector, mutations):
     return applied, child.returncode, out
 
 
-MUTANT_SECOND_LAUNCH_CREATES = ("bin/cloud_worker.py", GATE, "        done = None\n")
-OLD_SECOND_LAUNCH_REFUSED = ("bin/cloud_worker.py", GATE, '        raise LaunchError("a cloud worker named %s already exists (retire %s ends it)" % (name, name))\n')
+MUTANT_SECOND_LAUNCH_CREATES = ("bin/cloud_launch_again.py", GATE, "    return None\n")
+OLD_SECOND_LAUNCH_REFUSED = ("bin/cloud_launch_again.py", GATE, '    if record is not None:\n        raise H["H"]["LaunchError"]("a cloud worker named %s already exists (retire %s ends it)" % (args.name, args.name))\n    return None\n')
 
 
 class Probe(Launch):
