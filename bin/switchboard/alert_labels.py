@@ -365,6 +365,8 @@ def triage_status_lines(triage):
     plans = load_triage_plan_open().unapproved_line(triage.get("plans_unapproved"), triage.get("plans_unapproved_more", 0))
     if plans:
         lines.append("      triage     " + plans)
+    if triage.get("plan_wake_counts"):   # #1784
+        lines.append("      triage     plan lines: dropped %d (a replaced hash), repeats not delivered %d" % (triage["plan_wake_counts"]["dropped"], triage["plan_wake_counts"]["repeats_not_delivered"]))
     if triage.get("waiting_for_batch"):   # #921: counted apart, never a finding
         lines.append("      triage     %d plan issue(s) waiting for the batch (their change merged into the integration branch)" % triage["waiting_for_batch"])
     if triage.get("other_owner"):
@@ -422,8 +424,15 @@ class TriageFacts:
         return [Fact(key, name, "triage", summary, created, sender="switchboard")
                 for key, (summary, created) in sorted(state.facts.items()) for name in chiefs]
 
+    def present_record(self, subject):   # #1542: {"pairs", "present"} of this digest, None when the pass has not run or the digest is not known
+        state = getattr(self.engine, "triage", None) if self.engine else None
+        present, pairs = getattr(state, "present", None), getattr(state, "fact_pairs", {}).get(subject[3])
+        return None if present is None or pairs is None else {"pairs": [list(p) for p in pairs], "present": [list(p) for p in present], "hidden": bool(getattr(state, "fact_hidden", {}).get(subject[3]))}
+
     def drop_stale(self, keys):   # #1402: a fact dropped at delivery does not come back
         state = getattr(self.engine, "triage", None) if self.engine else None
         for key in keys:
             if state is not None:
                 state.facts.pop(key, None)
+                getattr(state, "fact_pairs", {}).pop(key, None)   # #1542: forgotten with its fact (a state without the maps has nothing to forget)
+                getattr(state, "fact_hidden", {}).pop(key, None)

@@ -1,7 +1,7 @@
 # ---- #1544: where the first secret-shaped match is, named by a fixed rule label and numbers only (never a matched character).
 # A separate finder: redact_command_text and _SECRET_PATTERNS stay as they are. The names are a parallel table, one per pattern, in the same order.
 
-SECRET_RULE_NAMES = ("bearer-or-basic-token", "credential-word-value", "known-key-prefix", "url-password", "jwt-shape")
+SECRET_RULE_NAMES = ("bearer-or-basic-token", "credential-word-value", "known-key-prefix", "url-password", "private-key-block", "private-key-marker", "jwt-shape")
 SECRET_RULE_SEQUENCE = "rules-in-sequence"
 
 

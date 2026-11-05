@@ -1,0 +1,621 @@
+"""#1884: the daemon's dead verdict is decided by the registry's one function, `registry.evidence_shows_absent`. Neutral names (acme).
+The tests RUN the real functions (`pane_state`, `pane_health_pass`, `daemon_shows_absent`, `registry.shows_dead`) over the fake multiplexer; the only read
+of source text is S3 (an ast read of who tests the evidence keys) and the mutants (a text copy of one function, applied once)."""
+import ast
+import json
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+from unittest import mock
+
+from support.core import Base
+from support.herdr_world import World
+from support.loader import SWITCHBOARD, sb
+
+BIN = SWITCHBOARD.parent
+NAME = "platform"
+MUTANT_LINE = 'return bool(load_module("registry").evidence_shows_absent(evidence))'
+
+
+def calls_of(fn):
+    return {getattr(c.func, "attr", getattr(c.func, "id", None)) for c in ast.walk(fn) if isinstance(c, ast.Call)}
+
+
+def functions(paths):
+    out = {}
+    for path in paths:
+        for fn in [n for n in ast.walk(ast.parse(Path(path).read_text())) if isinstance(n, ast.FunctionDef)]:
+            out.setdefault(fn.name, []).append(fn)
+    return out
+
+
+def tests_keys_for_death(fn):
+    """A comparison of the key pane_listed or process_found (not a build of the dict, not a read for display)."""
+    return any(isinstance(c, ast.Compare) and any(isinstance(k, ast.Constant) and k.value in ("pane_listed", "process_found") for k in ast.walk(c))
+               for c in ast.walk(fn))
+
+
+def reaches(table, start, goal, seen=None):
+    seen = seen if seen is not None else set()
+    if start in seen:
+        return False
+    seen.add(start)
+    for fn in table.get(start, ()):
+        names = calls_of(fn)
+        if goal in names or any(reaches(table, n, goal, seen) for n in names if n in table):
+            return True
+    return False
+
+
+def source_copy_function(name, old, new):
+    """A function of the entry, from a TEXT COPY of its source with `old` replaced once by `new`; asserted applied once by the caller (returns count)."""
+    text = SWITCHBOARD.read_text()
+    fn = next(n for n in ast.parse(text).body if isinstance(n, ast.FunctionDef) and n.name == name)
+    segment = ast.get_source_segment(text, fn)
+    count = segment.count(old)
+    namespace = dict(sb.__dict__)
+    exec(compile(segment.replace(old, new), str(SWITCHBOARD), "exec"), namespace)
+    return namespace[name], count
+
+
+# Each situation: how the multiplexer is arranged (the fake of tests/switchboard/support/herdr_world.py), and what the OLD rules answered.
+#  list: the whole list holds the pane ("listed"), not ("absent"), cannot be read ("unreadable"); process: the pane's foreground ("runs" the session, a
+#  bare "shell", "unread"); get: pane_get ("ok", "notfound", "error"); judged: the agent is absent from the agent list (the old loop looks).
+DEAD_CASES = {
+    "pane gone": dict(list="absent", process="unread", get="notfound", missing=True),
+    "listed bare shell": dict(list="listed", process="shell", get="ok", missing=True),
+    "listed, process unread": dict(list="listed", process="unread", get="ok", missing=True),
+    "list cannot be read": dict(list="unreadable", process="shell", get="notfound", missing=True),
+    "pane_get not found, still listed, process runs": dict(list="listed", process="runs", get="notfound", missing=False),
+    "pane_get fails, not not-found": dict(list="listed", process="runs", get="error", missing=False),
+    "row with no pane": dict(list="absent", process="unread", get="notfound", missing=False, nopane=True),
+    "listed, no recorded session": dict(list="listed", process="shell", get="ok", missing=True, nosession=True),   # case (iv) of PC-3
+}
+TABLE = [label for label, case in DEAD_CASES.items() if not case.get("nopane")]   # S2: the 7 evidence cases (the row with no pane is S4's)
+CHANGED = ("list cannot be read", "listed, process unread", "pane_get not found, still listed, process runs", "listed, no recorded session")
+
+
+# PC-8: the OLD deciders, VERBATIM from the integration tip 0e4bb895 (`git show 0e4bb895:bin/fleet-switchboard`): `pane_state` (the whole function) and the
+# missing-pass decision of `pane_health_pass` (the block of the hold of #1066, which the loop's old dead record follows). Executed with the rig's names.
+OLD_PANE_STATE = r'''def pane_state(engine, name, session_id, pane, known_names=(), known_sessions=()):
+    """(state, why, info): `attached` when the pane's title or visible screen names the agent or its session; `detached` when it shows
+    something else; `dead` when herdr has no such pane; `unknown` when herdr cannot be read (never a verdict). `info` carries the pane's
+    workspace, tab, cwd and whether the screen shows ANOTHER fleet agent (then the pane is somebody's, not a stale screen)."""
+    try:
+        got = engine.herdr.pane_get(pane)
+    except HerdrError as err:
+        text = str(err).lower()
+        if "not found" in text or "no such" in text or "unknown pane" in text:
+            return PANE_DEAD, "herdr has no pane %s" % pane, {}
+        return PANE_UNKNOWN, "herdr cannot say what pane %s shows: %s" % (pane, _one_line(str(err), 100)), {}
+    title = got.get("terminal_title_stripped") or got.get("terminal_title") or ""
+    # POSITIVE attach evidence first: the pane's foreground process is opencode on THIS session. Whatever its title says, it is live and attached.
+    # A process list that cannot be read is unknown (a close needs proof, and no proof is not stale).
+    try:
+        processes = engine.herdr.pane_process_info(pane)
+    except HerdrError as err:
+        return PANE_UNKNOWN, "herdr cannot say what pane %s runs: %s" % (pane, _one_line(str(err), 80)), {}
+    info = {"workspace": got.get("workspace_id"), "tab": got.get("tab_id"), "cwd": got.get("cwd"), "status": got.get("agent_status"),
+            "title": _one_line(re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", title), 80)}
+    if runs_session(processes, session_id):
+        info["live_session"] = True
+        return PANE_ATTACHED, "the pane runs opencode on %s's session %s" % (name, session_id), info
+    if _names_agent(title, name, session_id):
+        return PANE_ATTACHED, "the pane's title names %s" % name, info
+    # FAIL MODE: a screen that cannot be read is UNKNOWN, never "nothing is shown": the verdict `detached` leads to a closed tab, so it needs
+    # positive evidence (a title that does not name the agent AND a screen that was read and does not either).
+    try:
+        visible = engine.herdr.pane_read_visible(pane)
+    except HerdrError as err:
+        return PANE_UNKNOWN, "the title of pane %s does not name %s and its screen could not be read: %s" % (pane, name, _one_line(str(err), 80)), info
+    text = _shown_text(title, visible)
+    if _names_agent(visible, name, session_id):
+        return PANE_ATTACHED, "the pane shows %s" % name, info
+    others = [n for n in known_names if n and n != name and _names_agent(text, n, None)] + [x for x in known_sessions if x and x != session_id and x.lower() in text]
+    info["shows_another"] = others[:3]
+    return PANE_DETACHED, "pane %s shows %r, not %s's session %s" % (pane, info["title"][:60], name, session_id), info'''
+
+OLD_MISSING_DECISION = r'''        if missing[name] >= PANE_MISSING_PASSES and agents[name].get("pane") and agents[name].get("session"):
+            try:   # #1066: a pane whose process runs the agent's session is never dead, whatever the multiplexer's list says
+                if runs_session(engine.herdr.pane_process_info(agents[name]["pane"]), agents[name]["session"], engine.executable):
+                    missing[name] = PANE_MISSING_PASSES - 1
+                    held = engine.__dict__.setdefault("pane_held", {})
+                    held[name] = held.get(name, 0) + 1
+                    if held[name] > PANE_HELD_PASSES:   # a lingering process keeps the agent alive: said once, still held (never declared dead on a process alone)
+                        engine._note("fleetpane.missing_held", name, {"pane": agents[name]["pane"], "passes": PANE_HELD_PASSES,
+                                                                      "why": "herdr no longer lists the pane but its process still runs the session"})
+                    continue
+                engine.__dict__.setdefault("pane_held", {}).pop(name, None)
+            except HerdrError:
+                pass'''
+
+# The one glue of the old loop: the block runs inside the loop (`continue` = held), and when it falls through the old code records `dead` once the count is reached.
+OLD_LOOP_HEAD = "def old_missing_decision(engine, name, agents, missing):\n    for _ in (0,):\n"
+OLD_LOOP_TAIL = "\n        return 'dead' if missing[name] >= PANE_MISSING_PASSES else 'not judged'\n    return 'held'\n"
+
+
+def exec_old(source, name):
+    namespace = dict(sb.__dict__)
+    exec(compile(source, "<the old code of 0e4bb895>", "exec"), namespace)
+    return namespace[name]
+
+
+class Rig:
+    """One world, one agent, arranged as a case says."""
+
+    def __init__(self, test, case):
+        self.test = test
+        self.case = case
+        test.rigs = getattr(test, "rigs", 0) + 1   # one state directory per world: two worlds of one test never share a record
+        self.world = World(test, agents=(NAME,), state=test.home / ("world%d" % test.rigs))
+        self.engine = self.world.engine
+        self.engine.state_dir = self.world.state
+        self.herdr = self.world.herdr
+        self.pane, self.session = self.world.panes[NAME], self.world.sessions[NAME]
+        self.registry = sb.load_module("registry")
+        self.reconcile = sb.load_module("agent_reconcile")
+        self.row = {"pane": self.pane, "session": self.session}
+
+    def old_pane_state(self, decider=None):
+        """The OLD `pane_state`, run on this world: its answer."""
+        return (decider or exec_old(OLD_PANE_STATE, "pane_state"))(self.engine, NAME, self.session, self.pane)[0]
+
+    def old_loop(self, source=None):
+        """The OLD missing-pass decision, run on this world for the case's row: `held`, `dead` or `not judged` (the agent is not absent from the agent list)."""
+        if self.case.get("nopane") or not self.case["missing"]:
+            return "not judged"
+        decide = exec_old(OLD_LOOP_HEAD + (source or OLD_MISSING_DECISION) + OLD_LOOP_TAIL, "old_missing_decision")
+        return decide(self.engine, NAME, {NAME: dict(self.row)}, {NAME: sb.PANE_MISSING_PASSES - 1 + 1})
+
+    def pass_once(self, offset=0):
+        self.engine.discover(self.world.clock.now())
+        sb.pane_health_pass(self.engine, self.world.clock.now() + offset)
+
+    def arrange(self, for_pane_state=False):
+        c, herdr = self.case, self.herdr
+        if c.get("nosession"):
+            self.row = {"pane": self.pane, "session": None}
+        if c.get("nopane"):
+            self.row = {"pane": None, "session": self.session, "endpoint": "http://acme.invalid/x"}
+            return
+        if c["process"] == "shell" and for_pane_state:   # the pane is up and an agent pane of the fake, its foreground a bare shell and a screen that names nobody
+            herdr.panes[self.pane].update(program="zsh", title="OpenCode", screen="  Build auto · model\n")
+        elif c["list"] == "absent":
+            del herdr.panes[self.pane]
+        elif c["process"] in ("shell", "unread") and c["missing"]:   # no longer an agent of the fake, still a terminal of its list
+            del herdr.panes[self.pane]
+            herdr.plain_terminals = [{"pane_id": self.pane, "processes": ["zsh"], **({"process_fails": True} if c["process"] == "unread" else {})}]
+        if c["list"] == "unreadable":
+            self.patch(sb.HerdrClient, "pane_list", side_effect=sb.HerdrError("down", "herdr is down"))
+        if c["get"] == "error":
+            self.patch(sb.HerdrClient, "pane_get", side_effect=sb.HerdrError("boom", "herdr said boom"))
+        elif c["get"] == "notfound" and c["list"] != "absent" and self.pane in herdr.panes:
+            self.patch(sb.HerdrClient, "pane_get", side_effect=sb.HerdrError("failed", "pane %s not found" % self.pane))
+        if c["process"] == "unread" and self.pane in herdr.panes:
+            self.patch(sb.HerdrClient, "pane_process_info", side_effect=sb.HerdrError("down", "process list cannot be read"))
+
+    def patch(self, target, attr, **kw):
+        patcher = mock.patch.object(target, attr, **kw)
+        patcher.start()
+        self.test.addCleanup(patcher.stop)
+
+    def evidence(self, state="dead"):
+        row = dict(self.row, state=state)
+        return row, self.reconcile.evidence_of(row, sb.herdr_live_check(self.engine.herdr)(NAME, row))
+
+    def new_daemon_dead(self):
+        return sb.daemon_shows_absent(self.engine, NAME, dict(self.row))
+
+    def shows_dead(self):
+        row, evidence = self.evidence()
+        return self.registry.shows_dead(row, evidence)
+
+    def events(self, event="fleetpane.dead"):
+        return [e for e in self.world.audit() if e["event"] == event]
+
+    def pane_state(self):
+        return sb.pane_state(self.engine, NAME, self.session, self.pane)[0]
+
+    def three_passes(self):
+        """The agent is seen once (so the pass knows it), then the world changes and it is absent from the agent list for PANE_MISSING_PASSES passes."""
+        self.pass_once()
+        self.arrange()
+        for n in range(sb.PANE_MISSING_PASSES):
+            self.pass_once(offset=n + 1)
+
+    def recorded(self):
+        return (sb.read_pane_health(self.world.state)["states"].get(NAME) or {}).get("state")
+
+
+class TestDaemonDeadVerdict(Base):
+
+    # -- S2 / S9: the table
+    def table(self, loop_source=None):
+        rows = {}
+        for label in TABLE:
+            case = DEAD_CASES[label]
+            rig = Rig(self, case)
+            rig.arrange()
+            ps, lp = rig.old_pane_state(), rig.old_loop(loop_source)
+            rows[label] = {"old pane_state": ps, "old loop": lp,
+                           "new daemon": "dead" if rig.new_daemon_dead() else "not dead", "shows_dead": "dead" if rig.shows_dead() else "not dead"}
+        return rows
+
+    def test_S2_the_table_has_7_cases_by_4_deciders_and_prints_28_answers(self):
+        rows = self.table()
+        self.assertEqual((len(rows), sum(len(r) for r in rows.values())), (7, 28))
+        self.assertEqual({k: (v["old pane_state"], v["old loop"]) for k, v in rows.items()}["pane gone"], ("dead", "dead"))   # the answers are the old code's, run
+        for label, row in rows.items():
+            self.assertEqual(row["new daemon"], row["shows_dead"], label)   # one function: the daemon and the registry agree on every case
+        self.assertEqual({k: v["new daemon"] for k, v in rows.items()},
+                         {"pane gone": "dead", "listed bare shell": "dead", "listed, process unread": "not dead", "list cannot be read": "not dead",
+                          "pane_get not found, still listed, process runs": "not dead", "pane_get fails, not not-found": "not dead", "listed, no recorded session": "not dead"})
+
+    def differing(self, loop_source=None):
+        rows = self.table(loop_source)
+        return sorted(k for k, r in rows.items() if ("dead" in (r["old pane_state"], r["old loop"])) != (r["new daemon"] == "dead"))
+
+    def test_S9_exactly_the_four_cases_of_the_plan_differ(self):
+        differing = self.differing()
+        self.assertEqual(differing, sorted(CHANGED))
+        self.assertEqual(len(differing), 4)
+        doc = (BIN.parent / "docs" / "agent-registry.md").read_text().split("## One dead verdict", 1)[1].split("\n## ", 1)[0]
+        for phrase in ("cannot be read", "process that cannot be read", "pane_get", "no recorded session"):
+            self.assertIn(phrase, doc)
+
+    # -- S13: the old deciders are the old source, executed
+    def test_S13_the_old_deciders_are_the_embedded_source_of_the_integration_tip_and_are_executed(self):
+        self.assertTrue(OLD_PANE_STATE.startswith("def pane_state(engine, name, session_id, pane, known_names=(), known_sessions=()):"))
+        self.assertIn("herdr has no pane %s", OLD_PANE_STATE)
+        self.assertNotIn("daemon_shows_absent", OLD_PANE_STATE + OLD_MISSING_DECISION)   # the OLD code: the one function is not in it
+        self.assertIn("#1066", OLD_MISSING_DECISION)
+        self.assertIs(type(exec_old(OLD_PANE_STATE, "pane_state")), type(lambda: 0))
+        self.assertIs(type(exec_old(OLD_LOOP_HEAD + OLD_MISSING_DECISION + OLD_LOOP_TAIL, "old_missing_decision")), type(lambda: 0))
+
+    def test_S13_mutant_the_hold_skipped_when_there_is_no_session_removed_changes_the_table_and_fails_S9(self):
+        self.assertEqual(self.differing(), sorted(CHANGED))   # control
+        skip, held = 'agents[name].get("pane") and agents[name].get("session"):', 'agents[name]["session"], engine.executable):'
+        self.assertEqual((OLD_MISSING_DECISION.count(skip), OLD_MISSING_DECISION.count(held)), (1, 1))   # applied once each
+        mutant = OLD_MISSING_DECISION.replace(skip, 'agents[name].get("pane"):').replace(held, 'agents[name]["session"], engine.executable) or not agents[name].get("session"):')
+        with self.assertRaises(AssertionError) as caught:
+            self.assertEqual(self.differing(mutant), sorted(CHANGED))
+        self.assertIn("listed, no recorded session", str(caught.exception))
+
+    # -- S3: one function
+    def test_S3_exactly_one_function_tests_the_evidence_keys_for_death_and_four_callers_reach_it(self):
+        table = functions([BIN / "registry.py", BIN / "agent_reconcile.py", SWITCHBOARD])
+        testers = sorted(n for n, fns in table.items() if any(tests_keys_for_death(f) for f in fns))
+        self.assertEqual(testers, ["evidence_shows_absent"])
+        for caller in ("shows_dead", "reconcile_remove", "reconcile_on_read", "pane_health_pass"):
+            self.assertTrue(reaches(table, caller, "evidence_shows_absent"), caller)
+
+    # -- S4: a read that failed is never death
+    def test_S4_four_cases_are_not_recorded_dead_and_write_no_dead_event(self):
+        cases = {"pane_get fails, not not-found": DEAD_CASES["pane_get fails, not not-found"], "list cannot be read": DEAD_CASES["list cannot be read"],
+                 "listed, process unread": DEAD_CASES["listed, process unread"], "row with no pane": DEAD_CASES["row with no pane"]}
+        for label, case in cases.items():
+            with self.subTest(label):
+                rig = Rig(self, case)
+                if case.get("nopane"):
+                    rig.arrange()
+                    self.assertFalse(rig.new_daemon_dead())
+                    self.assertTrue(rig.registry.no_pane_to_judge(rig.row))
+                    continue
+                rig.three_passes()
+                self.assertNotEqual(rig.recorded(), "dead")
+                self.assertNotEqual((rig.registry.read(rig.world.state)["agents"].get(NAME) or {}).get("state"), "dead")
+                self.assertEqual(rig.events(), [])
+                if case["get"] != "ok":
+                    self.assertEqual(rig.pane_state(), sb.PANE_UNKNOWN)
+
+    def test_S4_the_listed_pane_with_the_process_unread_keeps_its_last_state(self):
+        rig = Rig(self, DEAD_CASES["listed, process unread"])
+        rig.three_passes()
+        self.assertNotIn(rig.recorded(), ("dead", None))   # the loop leaves the last known state (here `attached`): it records no death
+
+    # -- S5: absence, three passes
+    def test_S5_three_passes_of_absence_record_dead_once_and_the_registry_removes_it_on_the_same_evidence(self):
+        rig = Rig(self, DEAD_CASES["pane gone"])
+        rig.three_passes()
+        self.assertEqual(rig.recorded(), "dead")
+        self.assertEqual(len(rig.events()), 1)
+        row, evidence = rig.evidence(state=None)
+        row = rig.registry.read(rig.world.state)["agents"][NAME]
+        self.assertEqual(row["state"], "dead")
+        evidence = rig.reconcile.evidence_of(row, sb.herdr_live_check(rig.engine.herdr)(NAME, row))
+        got = rig.registry.reconcile_remove(rig.world.state, NAME, evidence, True)
+        self.assertTrue(got["changed"], got)
+        self.assertNotIn(NAME, rig.registry.read(rig.world.state)["agents"])
+        self.assertEqual((evidence["pane_listed"], evidence["process_found"]), (False, False))
+
+    # -- S10: a listed bare shell
+    def test_S10_a_listed_bare_shell_is_detached_in_pane_state_and_dead_where_death_is_recorded(self):
+        rig = Rig(self, DEAD_CASES["listed bare shell"])
+        rig.arrange(for_pane_state=True)
+        self.assertEqual(rig.pane_state(), sb.PANE_DETACHED)
+        self.assertTrue(rig.shows_dead())
+        loop = Rig(self, DEAD_CASES["listed bare shell"])
+        loop.three_passes()
+        self.assertEqual(loop.recorded(), "dead")
+        self.assertEqual(len(loop.events()), 1)
+        row = loop.registry.read(loop.world.state)["agents"][NAME]
+        self.assertTrue(loop.registry.shows_dead(row, loop.reconcile.evidence_of(row, sb.herdr_live_check(loop.engine.herdr)(NAME, row))))
+
+    def test_S10_the_same_pane_with_the_process_unread_is_not_dead(self):
+        loop = Rig(self, DEAD_CASES["listed, process unread"])
+        loop.three_passes()
+        self.assertEqual((loop.recorded(), loop.events()), ("attached", []))   # not dead: the loop changes nothing
+        self.assertFalse(loop.shows_dead())
+        state = Rig(self, DEAD_CASES["listed bare shell"])
+        state.arrange(for_pane_state=True)
+        state.patch(sb.HerdrClient, "pane_process_info", side_effect=sb.HerdrError("down", "process list cannot be read"))
+        self.assertNotEqual(state.pane_state(), sb.PANE_DEAD)   # pane_state's own answer to an unread process is `unknown` (it cannot say `detached` without the process)
+        self.assertFalse(state.shows_dead())
+
+
+class TestDaemonDeadVerdictMutants(Base):
+    """S6 and S10: a mutant of one function of the entry (a text copy, applied once) fails the check; a control passes first."""
+
+    def run_check(self, name, old, new, expect):
+        control = self.violations_with(None)
+        self.assertEqual(control, [], "control: the check must pass on the unmutated daemon")
+        func, count = source_copy_function(name, old, new)
+        self.assertEqual(count, 1, "the mutation must be applied exactly once")
+        found = self.violations_with((name, func))
+        self.assertTrue(any(expect in f for f in found), found)
+
+    def violations_with(self, patch):
+        if patch is None:
+            return self.collect()
+        with mock.patch.object(sb, patch[0], patch[1]):
+            return self.collect()
+
+    def collect(self):
+        found = []
+        rig = Rig(self, DEAD_CASES["listed bare shell"])
+        rig.three_passes()
+        if not (rig.recorded() == "dead" and len(rig.events()) == 1):
+            found.append("a listed bare shell is not recorded dead by the loop")
+        rig = Rig(self, DEAD_CASES["listed, process unread"])
+        rig.three_passes()
+        if rig.recorded() == "dead" or rig.events():
+            found.append("an unread process is recorded dead")
+        return found
+
+    def test_S6_mutant_the_daemon_decides_death_by_its_own_test_again(self):
+        self.run_check("daemon_shows_absent", MUTANT_LINE,
+                       'return evidence.get("pane_listed") is False and evidence.get("process_found") is False',
+                       "a listed bare shell is not recorded dead by the loop")
+
+    def test_S6_mutant_a_failed_read_is_taken_as_absence(self):
+        self.run_check("herdr_live_check", 'return {"pane": True, "process": None}\n    return check',
+                       'return {"pane": True, "process": False}\n    return check', "an unread process is recorded dead")
+
+    def test_S10_mutant_death_requires_the_pane_to_be_gone(self):
+        self.run_check("daemon_shows_absent", MUTANT_LINE, 'return evidence.get("pane_listed") is False and bool(load_module("registry").evidence_shows_absent(evidence))',
+                       "a listed bare shell is not recorded dead by the loop")
+
+
+class TestPaneUndecidable(Base):
+    """S11 (PC-6): a LISTED pane whose agent row has no recorded session is `unknown` in the loop; ONE `pane.undecidable` line per streak."""
+
+    def world(self):
+        rig = Rig(self, DEAD_CASES["listed bare shell"])
+        rig.pass_once()
+        row = rig.registry.read(rig.world.state)["agents"][NAME]
+        got = rig.registry.upsert(rig.world.state, NAME, dict(row, session=None), now=rig.world.clock.now())
+        self.assertEqual(got["problem"], None)
+        self.assertIsNone(rig.registry.read(rig.world.state)["agents"][NAME].get("session"))
+        del rig.herdr.panes[rig.pane]   # the agent is gone from the agent list, its pane is still a listed terminal with a bare shell
+        rig.herdr.plain_terminals = [{"pane_id": rig.pane, "processes": ["zsh"]}]
+        rig.n = 0
+        return rig
+
+    def passes(self, rig, count):
+        for _ in range(count):
+            rig.n += 1
+            rig.pass_once(offset=rig.n)
+
+    def lines(self, rig):
+        return len(rig.events("pane.undecidable"))
+
+    def scenario(self, apply_check=None):
+        rig = self.world()
+        counts = {}
+        self.passes(rig, 2)
+        counts["after 2"] = self.lines(rig)
+        self.passes(rig, 1)
+        counts["after 3"] = self.lines(rig)
+        self.passes(rig, 3)
+        counts["after 6"] = self.lines(rig)
+        counts["recorded"] = rig.recorded()
+        counts["dead events"] = len(rig.events())
+        with mock.patch.object(sb.HerdrClient, "pane_list", side_effect=sb.HerdrError("down", "herdr is down")):   # a pass that does not answer `listed`: the streak is cleared
+            self.passes(rig, 1)
+        counts["cleared"] = sb._read_small(rig.world.state, sb.UNDECIDABLE_FILE)
+        self.passes(rig, 3)
+        counts["after later streak"] = self.lines(rig)
+        return counts
+
+    def test_S11_one_line_per_streak_none_after_two_never_dead_a_new_line_for_a_later_streak(self):
+        got = self.scenario()
+        self.assertEqual(got, {"after 2": 0, "after 3": 1, "after 6": 1, "recorded": got["recorded"], "dead events": 0, "cleared": {}, "after later streak": 2})
+        self.assertNotEqual(got["recorded"], "dead")
+
+    def test_S11_mutant_a_line_for_each_pass_is_caught_and_the_control_passes(self):
+        control = self.scenario()
+        self.assertEqual((control["after 3"], control["after 6"]), (1, 1))
+        func, count = source_copy_function("undecidable_streak", "if passes == PANE_MISSING_PASSES and engine.audit", "if passes >= 1 and engine.audit")
+        self.assertEqual(count, 1)
+        with mock.patch.object(sb, "undecidable_streak", func):
+            mutant = self.scenario()
+        self.assertEqual((mutant["after 3"], mutant["after 6"]), (3, 6))
+
+
+DOCTOR = (BIN / "fleet-doctor").read_text()
+
+
+def doctor_snippet(old=None, new=None):
+    """The python reader of the undecidable record in `bin/fleet-doctor` (a TEXT COPY, `old` replaced once by `new`): (source, times applied)."""
+    head = "und=$(printf '%s' \"$LAST_OUT\" | python3 -c '"
+    start = DOCTOR.index(head) + len(head)
+    code = DOCTOR[start:DOCTOR.index("' 2>/dev/null)", start)]
+    return (code.replace(old, new), code.count(old)) if old else (code, 1)
+
+
+def run_snippet(code, report):
+    return subprocess.run([sys.executable, "-c", code], input=json.dumps(report), capture_output=True, text=True, timeout=60).stdout
+
+
+class TestUndecidableRobustness(Base):
+    """S14 (PC-9): the five checks, each with a mutant on a source copy (asserted applied once) failing beside a passing control."""
+
+    def helper(self):
+        return TestPaneUndecidable
+
+    def quiet_pass(self, rig, count=1, offset=None):
+        for _ in range(count):
+            rig.n += 1
+            try:
+                rig.pass_once(offset=rig.n)
+            except Exception:
+                pass
+
+    # (a) the streak file is written only after the audit line
+    def raising_audit(self):
+        rig = TestPaneUndecidable.world(self)
+        self.quiet_pass(rig, 2)
+        real, state = rig.engine.audit.append, {"raised": 0}
+
+        def flaky(actor, event, *args, **kw):
+            if event == "pane.undecidable" and not state["raised"]:
+                state["raised"] = 1
+                raise OSError("the audit write failed")
+            return real(actor, event, *args, **kw)
+        with mock.patch.object(rig.engine.audit, "append", side_effect=flaky):
+            self.quiet_pass(rig, 1)   # the third pass: the append raises
+            self.assertEqual(state["raised"], 1)
+            self.quiet_pass(rig, 1)   # the next pass writes the line
+        return len(rig.events("pane.undecidable"))
+
+    def test_S14_a_raising_audit_loses_no_line_the_next_pass_writes_it(self):
+        self.assertEqual(self.raising_audit(), 1)
+
+    def test_S14_mutant_a_streak_written_before_the_audit_line_loses_it_and_the_control_passes(self):
+        self.assertEqual(self.raising_audit(), 1)   # control
+        old = "    if passes == PANE_MISSING_PASSES and engine.audit is not None:"
+        early = '    data[name] = {"pane": agent["pane"], "passes": passes}\n    _write_small(engine.state_dir, UNDECIDABLE_FILE, data)\n'
+        func, count = source_copy_function("undecidable_streak", old, early + old)
+        self.assertEqual(count, 1)
+        with mock.patch.object(sb, "undecidable_streak", func):
+            self.assertEqual(self.raising_audit(), 0)
+
+    # (b) the per-pass state is cleared in a finally
+    def stale_after_a_raise(self):
+        rig = TestPaneUndecidable.world(self)
+        with mock.patch.object(sb, "undecidable_prune", side_effect=RuntimeError("in the middle of the pass")):
+            self.quiet_pass(rig, 1)
+        return sorted(k for k in ("undecidable_seen", "pass_herdr") if rig.engine.__dict__.get(k) is not None)
+
+    def test_S14_an_exception_in_a_pass_leaves_no_stale_seen_state(self):
+        self.assertEqual(self.stale_after_a_raise(), [])
+
+    def test_S14_mutant_the_clear_not_in_a_finally_leaves_stale_state_and_the_control_passes(self):
+        self.assertEqual(self.stale_after_a_raise(), [])
+        decorator, count = source_copy_function("_clears_pass_state", "        finally:", "        except ZeroDivisionError:")
+        self.assertEqual(count, 1)
+        with mock.patch.object(sb, "pane_health_pass", decorator(sb.pane_health_pass.__wrapped__)):
+            self.assertEqual(self.stale_after_a_raise(), ["pass_herdr", "undecidable_seen"])
+
+    # (c) the doctor shows each control character of a name as ?
+    def test_S14_the_doctor_prints_one_line_with_a_question_mark_for_each_control_character(self):
+        out = run_snippet(doctor_snippet()[0], {"undecidable": {"ac\nme\x1b": 4}})
+        self.assertEqual(out.splitlines(), ["agent ac?me?: listed pane with no recorded session, undecidable for 4 passes: reattach or retire it"])
+
+    def test_S14_mutant_c_a_name_with_a_newline_prints_two_lines_and_the_control_passes(self):
+        report = {"undecidable": {"ac\nme\x1b": 4}}
+        self.assertEqual(len(run_snippet(doctor_snippet()[0], report).splitlines()), 1)
+        code, count = doctor_snippet('("Cc","Zl","Zp")', '("Zl","Zp")')
+        self.assertEqual(count, 1)
+        out = run_snippet(code, report)
+        self.assertEqual(len(out.splitlines()), 2)
+        self.assertNotIn("ac?me?", out)
+
+    # (d) the real producer into the doctor's reader
+    def producer_to_doctor(self, producer=None):
+        tmp = Path(tempfile.mkdtemp(prefix="s14."))
+        self.addCleanup(__import__("shutil").rmtree, tmp, True)
+        state = tmp / sb.PROG
+        state.mkdir(mode=0o700)
+        state.chmod(0o700)
+        (state / sb.UNDECIDABLE_FILE).write_text(json.dumps({"acme": {"pane": "p_1", "passes": 4}}))
+
+        def runner(*args, **kw):
+            raise OSError("no commands in this check")
+        with mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(tmp), "HOME": str(tmp)}):
+            report = (producer or sb.collect_status)(runner, lambda: 1000.0)
+        return run_snippet(doctor_snippet()[0], json.loads(json.dumps(report, default=str))).splitlines()
+
+    def test_S14_the_real_collect_status_feeds_the_doctor(self):
+        self.assertEqual(len(self.producer_to_doctor()), 1)
+
+    def test_S14_mutant_d_a_renamed_key_fails_the_end_to_end_and_the_control_passes(self):
+        self.assertEqual(len(self.producer_to_doctor()), 1)
+        func, count = source_copy_function("collect_status", 'report["undecidable"] =', 'report["undecided"] =')
+        self.assertEqual(count, 1)
+        self.assertEqual(self.producer_to_doctor(func), [])
+
+    # (e) one read of the pane list per pass serves both decisions of an agent
+    def reads_in_the_deciding_pass(self):
+        rig = TestPaneUndecidable.world(self)
+        rig.herdr.plain_terminals = []   # the pane is gone from the list too: the streak reads the list, then the death test would read it again
+        self.quiet_pass(rig, 2)
+        with mock.patch.object(sb.HerdrClient, "pane_list", autospec=True, side_effect=sb.HerdrClient.pane_list) as reads:
+            self.quiet_pass(rig, 1)
+        return reads.call_count
+
+    def test_S14_the_pane_list_is_read_once_in_the_pass_for_the_agent(self):
+        self.assertEqual(self.reads_in_the_deciding_pass(), 1)
+
+    def test_S14_mutant_e_two_reads_of_the_list_are_counted_and_the_control_passes(self):
+        self.assertEqual(self.reads_in_the_deciding_pass(), 1)
+        func, count = source_copy_function("_pass_herdr", 'return engine.__dict__["pass_herdr"]', "return engine.herdr")
+        self.assertEqual(count, 1)
+        with mock.patch.object(sb, "_pass_herdr", func):
+            self.assertEqual(self.reads_in_the_deciding_pass(), 2)
+
+
+    # (f) the cached list is used only inside a pass: outside one every call reads fresh and leaves no cache
+    def calls_outside_a_pass(self):
+        rig = TestPaneUndecidable.world(self)
+        seen = []
+        real = sb.HerdrClient.pane_list
+
+        def counted(client, *args, **kw):
+            got = real(client, *args, **kw)
+            seen.append([p["pane_id"] for p in got])
+            return got
+        with mock.patch.object(sb.HerdrClient, "pane_list", autospec=True, side_effect=counted):
+            sb.pane_state(rig.engine, NAME, "ses_x", rig.pane)
+            rig.herdr.plain_terminals = []   # the list changes between the two calls
+            sb.pane_state(rig.engine, NAME, "ses_x", rig.pane)
+        return seen, [k for k in ("pass_herdr", "in_pane_pass") if rig.engine.__dict__.get(k) is not None]
+
+    def test_S14_two_calls_outside_a_pass_read_the_list_fresh_and_leave_no_cache(self):
+        seen, left = self.calls_outside_a_pass()
+        self.assertEqual(len(seen), 2)
+        self.assertNotEqual(seen[0], seen[1])
+        self.assertEqual(seen[1], [])
+        self.assertEqual(left, [])
+
+    def test_S14_mutant_f_a_cache_kept_outside_a_pass_is_caught_and_the_control_passes(self):
+        seen, _ = self.calls_outside_a_pass()
+        self.assertEqual(len(seen), 2)   # control
+        old = '    if not engine.__dict__.get("in_pane_pass"):'
+        func, count = source_copy_function("_pass_herdr", old, '    if False:')
+        self.assertEqual(count, 1)
+        with mock.patch.object(sb, "_pass_herdr", func):
+            seen, left = self.calls_outside_a_pass()
+            self.assertEqual((len(seen), left), (1, ["pass_herdr"]))

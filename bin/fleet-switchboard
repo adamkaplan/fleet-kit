@@ -366,6 +366,8 @@ DEFAULTS = {
     "launch_default": "headless",   # #433: what a plain `launch` starts: "headless" (no terminal) or "terminal" (a herdr tab)
     "send_to_working": "steer",     # a boss's `send` to a working agent: "steer" (its next safe point) or "queue" (after its turn)
     "steer_after_minutes": 0,       # #1540: 0 = off; else a turn longer than this many minutes takes a peer `send` and a reminder as `steer` too
+    "reminder_bound_minutes": 10,     # #1728: a due reminder not admitted within this many minutes is delivered by the next pass (a queued wake)
+    "checkpoint_bound_minutes": 5,    # #1728: the same bound for a reminder a launch checkpoint set (the worker's, and the overdue one to its boss)
     "unconsumed_steer_minutes": 20,   # #1844: 0 = off; a delivered queue-mode message the lane has not consumed after this many minutes is steered into the running turn
     "engaged_minutes": 10,
     "retire_idle_minutes": 10,     # `retire --close`: a pane herdr reads as working is closed without --force only when its session has had no turn and no activity this long
@@ -2293,7 +2295,7 @@ class Switchboard:
         if source is not None and any(str(f.key).startswith("reminder:") for f in plan.pending):
             # #1401: a reminder superseded by a re-arm or cancelled after it became a fact is not delivered; the drop names both reminders
             kept_facts = []
-            for fact in plan.pending:
+            for fact in source.newest_first(plan.pending):
                 try:
                     replaced = source.recheck_delivery(fact)
                 except ReminderError as err:   # as the other reads of the file: the pass step fails, the reminder stays queued, the next pass decides again
@@ -2302,9 +2304,10 @@ class Switchboard:
                     return {"sent": False, "action": "deferred", "reason": why}
                 if replaced is None:
                     kept_facts.append(fact)
-                elif self.audit is not None:
+                elif self.audit is not None and replaced != "swept":   # #1711: a swept copy has its own drop_superseded line
                     self.audit.append(self.actor, "reminder.drop_in_flight", plan.recipient,
                                       {"dropped": fact.key[len("reminder:"):], "kept": replaced})
+            kept_facts = [f for f in plan.pending if any(f is k for k in kept_facts)]   # the order the plan had
             if len(kept_facts) != len(plan.pending):
                 plan.pending = kept_facts
                 if not kept_facts:
@@ -2392,7 +2395,7 @@ class Switchboard:
             except Exception as err:   # an unreadable record or module is an unknown age = young = queue
                 age = None
                 self._note("turn_start.error", None, {"reason": _one_line("%s: %s" % (type(err).__name__, err), 200)})
-            busy = steers_into_turn(self.config, observation, carried, getattr(self, "discovery", None), age)
+            busy = steers_into_turn(self.config, observation, carried, getattr(self, "discovery", None), age, self.now())
         if busy:
             delivery = "steer"
         detail = {"mode": plan.action, "session": observation.session_id, "message_id": message_id,
@@ -2477,6 +2480,11 @@ class Switchboard:
         seen = {}
         def read(subject):
             kind, repo, number, _expected = subject
+            if kind in PASS_SUBJECTS:   # #1542: a pass's own present state, from the fact source that made the fact: no GitHub read, no budget
+                slot = (kind, repo, number, _expected)
+                if slot not in seen:
+                    seen[slot] = self.pass_state(kind, subject)
+                return seen[slot]
             slot = (SUBJECT_ENDPOINT[kind], repo, number)
             if slot not in seen:
                 if len(seen) >= MAX_PRESENT_READS:
@@ -2487,6 +2495,16 @@ class Switchboard:
                     seen[slot] = None
             return seen[slot]
         return read
+
+    def pass_state(self, kind, subject):
+        """#1542: the present record of a sweep, triage or plan fact, asked of the fact source that made it; None when it cannot be read."""
+        for source in self.sources:
+            if getattr(source, "__name__", "") == PASS_SUBJECTS[kind] and hasattr(source, "present_record"):
+                try:
+                    return source.present_record(subject)
+                except Exception:
+                    return None
+        return None
 
     def drop_stale(self, recipient, dropped):
         """Audit each dropped fact (what, why, when it was sent) and tell the fact sources to forget it, so it does not return."""
@@ -2765,6 +2783,7 @@ class Switchboard:
                 plan = self.plan(recipient, by_recipient[recipient], discovery, now)
                 if plan is None:
                     continue
+                reminder_waiting(self, plan, now)   # #1728
                 if plan.action == "wait":
                     report["waiting"].append(recipient)
                 elif plan.action == "hold":
@@ -2938,7 +2957,7 @@ class Switchboard:
             if self.audit is not None:
                 self.audit.append(self.actor, "hold", recipient, {"reason": plan.reason, "keys": [fact.key]})
             if fact.kind == "send" and fact.key.startswith("send:") and self.state_dir is not None and held_send_applies(plan.observation):
-                return hold_send_fact(self, fact, now)   # #2051: a send to a blocked agent is held, never refused
+                return hold_send_fact(self, fact, now)   # #2051: a send to an agent with any hold reason is held, never refused
             note_held_send(self.state_dir, recipient, fact.sender, now, plan.observation)
             return {"sent": False, "action": "hold", "reason": plan.reason}
         return self.deliver(plan, interrupt=interrupt)
@@ -4174,6 +4193,8 @@ def pane_state(engine, name, session_id, pane, known_names=(), known_sessions=()
     except HerdrError as err:
         text = str(err).lower()
         if "not found" in text or "no such" in text or "unknown pane" in text:
+            if not daemon_shows_absent(engine, name, {"pane": pane, "session": session_id}):   # #1884: one function decides death
+                return PANE_UNKNOWN, "herdr has no pane %s to get, but its list and process do not show it gone" % pane, {}
             return PANE_DEAD, "herdr has no pane %s" % pane, {}
         return PANE_UNKNOWN, "herdr cannot say what pane %s shows: %s" % (pane, _one_line(str(err), 100)), {}
     title = got.get("terminal_title_stripped") or got.get("terminal_title") or ""
@@ -4559,6 +4580,22 @@ def live_cloud_record(state_dir, name, retired, now):
     return cloud_record_live(record, name, retired, _read_small(state_dir, LAST_REPORT_FILE), now)
 
 
+def _clears_pass_state(fn):
+    """#1884 PC-9 b/e: the per-pass state of the undecidable record (the seen set, the one read of the pane list) is cleared in a `finally`."""
+    def wrapped(engine, *args, **kwargs):
+        engine.__dict__["in_pane_pass"] = True
+        try:
+            return fn(engine, *args, **kwargs)
+        finally:
+            engine.__dict__.pop("in_pane_pass", None)
+            engine.__dict__.pop("undecidable_seen", None)
+            engine.__dict__.pop("pass_herdr", None)
+    wrapped.__name__, wrapped.__doc__ = fn.__name__, fn.__doc__
+    wrapped.__wrapped__ = fn
+    return wrapped
+
+
+@_clears_pass_state
 def pane_health_pass(engine, now):
     """The daemon's look at every fleet agent's pane (after discovery). Records `pane-health.json` (what `status` shows and `reattach` reads),
     audits each change of state (`pane.detached`, `pane.dead`, `pane.recovered`) and leaves `engine.pane_alerts` for the cos fact. Reads only; bounded
@@ -4653,6 +4690,8 @@ def pane_health_pass(engine, now):
             states.pop(name, None)
             continue
         missing[name] = int(missing.get(name, 0)) + 1
+        if undecidable_streak(engine, name, agents[name]) and missing[name] >= PANE_MISSING_PASSES:   # #1884 PC-6: unknown, said once per streak
+            continue
         if missing[name] >= PANE_MISSING_PASSES and agents[name].get("pane") and agents[name].get("session"):
             try:   # #1066: a pane whose process runs the agent's session is never dead, whatever the multiplexer's list says
                 if runs_session(engine.herdr.pane_process_info(agents[name]["pane"]), agents[name]["session"], engine.executable):
@@ -4666,6 +4705,8 @@ def pane_health_pass(engine, now):
                 engine.__dict__.setdefault("pane_held", {}).pop(name, None)
             except HerdrError:
                 pass
+        if missing[name] >= PANE_MISSING_PASSES and not daemon_shows_absent(engine, name, agents[name]):   # #1884: dead only when the one function says so
+            continue
         if missing[name] >= PANE_MISSING_PASSES and (states.get(name) or {}).get("state") != PANE_DEAD:
             last = _read_small(engine.state_dir, LAST_REPORT_FILE).get(name) or {}
             lookback = engine.config.get("worker_lookback_hours", 24) * 3600
@@ -4716,6 +4757,7 @@ def pane_health_pass(engine, now):
             engine._note("fleetpane.bind_refused", name, {"why": _one_line(got["problem"], 160)})   # #1066: the refusal names both agents
         elif got["problem"] and not got["problem"].endswith("is retired for this session"):
             engine._note("fleetpane.error", name, {"error": "registry not updated: %s" % _one_line(got["problem"], 100)})
+    undecidable_prune(engine)
     # No removal from the registry here: a dead agent leaves it only when a view reads it (reconcile_on_read, #919), never on a pass.
     try:
         write_pane_health(engine.state_dir, {"agents": agents, "states": states, "missing": missing, "at": int(now)})
@@ -5182,10 +5224,88 @@ def herdr_live_check(herdr):
         if not any(p["pane_id"] == pane for p in panes):
             return {"pane": False, "process": False}
         try:
-            return {"pane": True, "process": bool(herdr.pane_process_info(pane))}
+            return {"pane": True, "process": runs_session(herdr.pane_process_info(pane), agent.get("session")) if agent.get("session") else None}
         except Exception:
             return {"pane": True, "process": None}
     return check
+
+
+class _OnePaneList:
+    """A view of the multiplexer for ONE pane pass whose `pane_list` is read once (the answer or the error is kept); the rest is passed through."""
+    def __init__(self, herdr):
+        self._herdr, self._got = herdr, None
+
+    def pane_list(self):
+        if self._got is None:
+            try:
+                self._got = (True, self._herdr.pane_list())
+            except Exception as err:
+                self._got = (False, err)
+        if not self._got[0]:
+            raise self._got[1]
+        return self._got[1]
+
+    def __getattr__(self, attr):
+        return getattr(self._herdr, attr)
+
+
+def _pass_herdr(engine):
+    """One read of the pane list per pass serves `undecidable_streak` and `daemon_shows_absent` (#1884 PC-9 e); cleared with the pass."""
+    if not engine.__dict__.get("in_pane_pass"):   # outside a pass: a fresh read, no cache left behind
+        return engine.herdr
+    if engine.__dict__.get("pass_herdr") is None or engine.__dict__["pass_herdr"]._herdr is not engine.herdr:
+        engine.__dict__["pass_herdr"] = _OnePaneList(engine.herdr)
+    return engine.__dict__["pass_herdr"]
+
+
+def daemon_shows_absent(engine, name, agent):
+    """The daemon's dead test (#1884): the registry's reader and evidence, decided by `registry.evidence_shows_absent`, the one function. A row with no pane is not judged."""
+    if load_module("registry").no_pane_to_judge(agent):
+        return False
+    try:
+        evidence = load_module("agent_reconcile").evidence_of(agent, herdr_live_check(_pass_herdr(engine))(name, agent))
+        return bool(load_module("registry").evidence_shows_absent(evidence))
+    except Exception:
+        return False
+
+
+UNDECIDABLE_FILE = "pane-undecidable.json"   # {name: {"pane", "passes"}}: the daemon's record of a listed pane with no recorded session that the loop cannot decide (#1884, PC-6)
+
+
+def undecidable_streak(engine, name, agent):
+    """Case (iv): a LISTED pane whose agent row has no recorded session id is `unknown`, never `dead`. Counts the passes in a row; writes ONE audit
+    line `pane.undecidable` when the streak reaches PANE_MISSING_PASSES (not one for each pass); any other answer clears the streak. True when it is such a pass."""
+    seen = engine.__dict__.setdefault("undecidable_seen", set())
+    seen.add(name)
+    if load_module("registry").no_pane_to_judge(agent):   # a row with no pane to judge is never undecidable by a pane
+        return False
+    data = _read_small(engine.state_dir, UNDECIDABLE_FILE)
+    live = None
+    if agent.get("pane") and not agent.get("session"):
+        try:
+            live = herdr_live_check(_pass_herdr(engine))(name, agent)
+        except Exception:
+            live = None
+    if not live or live.get("pane") is not True:
+        if data.pop(name, None) is not None:
+            _write_small(engine.state_dir, UNDECIDABLE_FILE, data)
+        return False
+    row = data.get(name) or {}
+    passes = (row.get("passes") or 0) + 1 if row.get("pane") == agent["pane"] else 1
+    if passes == PANE_MISSING_PASSES and engine.audit is not None:   # the line first: a raising append leaves the streak, so the next pass writes it (PC-9 a)
+        engine.audit.append(engine.actor, "pane.undecidable", name, {"pane": agent["pane"], "passes": passes,
+                                                                    "why": "listed pane with no recorded session: undecidable, not dead"})
+    data[name] = {"pane": agent["pane"], "passes": passes}
+    _write_small(engine.state_dir, UNDECIDABLE_FILE, data)
+    return True
+
+
+def undecidable_prune(engine):
+    """End of a pass: a name the loop did not meet this pass has no streak any more."""
+    seen = engine.__dict__.pop("undecidable_seen", set())
+    data = _read_small(engine.state_dir, UNDECIDABLE_FILE)
+    if any(n not in seen for n in data):
+        _write_small(engine.state_dir, UNDECIDABLE_FILE, {n: v for n, v in data.items() if n in seen})
 
 
 def reconcile_agents_on_read(state_dir, herdr):
@@ -7854,6 +7974,11 @@ def publish_decisions(engine):
         ci_record_pass(engine, now)   # #107: records ci verdicts for open PRs under a plan; reads GitHub, writes only the ledger and audit
     except Exception as err:
         engine._note("ci_record.error", None, {"error": _one_line("%s: %s" % (type(err).__name__, err), 200)})
+    for repo in take_open_cuts():   # #1886: the daily alert for every read of this pass that stopped at the ceiling
+        try:
+            open_list_alert(engine, repo, now)
+        except Exception as err:
+            engine._note("open_list.error", repo, {"error": _one_line("%s: %s" % (type(err).__name__, err), 200), "repo": repo})
     try:
         pane_health_pass(engine, now)   # the control plane: detached or dead panes, reads only, wakes the Chief of Staff
     except Exception as err:
@@ -8323,11 +8448,18 @@ def cloud_turn_tick(engine, discovery, activity=None):
 
 
 def pod_silence_summary(worker):
-    """#2115: the one summary line of a pod, from the launcher's read (`inspect NAME --short`, slice 2); None when it cannot be read."""
+    """#2115 fix forward: the one summary line of a pod, read IN-PROCESS by the daemon: the launcher's plain `inspect NAME` (its JSON body) through run_launcher,
+    then the same one-line formatter `inspect --short` prints. It does NOT go through the boss-checked `inspect` command (that refuses the daemon), and it adds
+    no flag and no caller argument: this function takes a pod name from the daemon's own live records and returns the line only to pod_silence.scan, which
+    sends it to the recorded boss; a lane has no way to call it (not a command, not a request kind). Raises (a refusal text) when the pod cannot be read."""
     cloud = load_module("cloud_worker").bind(globals())
-    code, data, _err = cloud.run_launcher(None, "inspect", worker, ("--short",), 60)
-    line = data if isinstance(data, str) else (data.get("short") if isinstance(data, dict) else None)
-    return line if code == 0 and isinstance(line, str) and line.strip() else None
+    code, body, note = cloud.run_launcher(None, "inspect", worker, (), 60)
+    if code != 0 or not isinstance(body, dict):
+        raise RuntimeError("the pod was not read (%s)" % (" ".join(str(note or "exit %s" % code).split())[:120]))
+    line = cloud._inspect_short(body)
+    if not isinstance(line, str) or not line.strip():
+        raise RuntimeError("the pod state was empty")
+    return line
 
 
 def pod_silence_tick(engine, discovery, summary=None):
@@ -8351,7 +8483,8 @@ def pod_silence_tick(engine, discovery, summary=None):
         live.append({"worker": name, "boss": _cloud_boss(rec.get("reports_to")), "last_report": said.get("at"), "done": said.get("state") == "done",
                      "last_push": max([a for a in at if isinstance(a, (int, float))] or [None], key=lambda a: a or 0)})
     return load_module("pod_silence").scan(live, now, Path(state_dir) / "pod-silence.json", lambda to, text: engine.send("switchboard", to, text),
-                                           summary or pod_silence_summary, load_module("record_json").parse_bounded, prune=not watch.get("capped"))
+                                           summary or pod_silence_summary, load_module("record_json").parse_bounded, prune=not watch.get("capped"),
+                                           audit=lambda worker, detail: engine.audit is not None and engine.audit.append(engine.actor, "pod_silence.unreadable", worker, detail))
 
 
 def lost_worker_tick(engine, discovery):
@@ -9071,7 +9204,7 @@ def blocked_tick(engine, discovery, held):
     return done
 
 
-# ------------------------------------------------- held sends (#2051): a send to a blocked agent waits, it is not refused
+# ------------------------------------------------- held sends (#2051): a send to an agent with any hold reason waits, it is not refused
 
 HELD_SENDS = "held-sends.json"       # {recipient: {"rows": [{"key", "from", "at", "text", "issue", "repo", "route"}]}}: a send held while its recipient was blocked
 HELD_SENDS_KEEP = 50                 # rows kept per recipient: the 51st send drops the oldest, and its sender is told
@@ -9080,8 +9213,8 @@ HELD_ROUTE_PANE, HELD_ROUTE_ENDPOINT = "pane", "endpoint"
 
 
 def held_send_applies(observation):
-    """A send is held only for the `blocked` reason (a permission request or a question): nothing else would end by itself."""
-    return observation is not None and observation.status == "blocked" and not observation.conflict and not observation.problem
+    """#1400: a send is held for every hold reason (blocked, unknown status, a problem, a conflict); only a recipient that cannot be observed (gone) is refused."""
+    return observation is not None and hold_reason(observation) is not None
 
 
 def _held_first_words(text):
@@ -9810,6 +9943,16 @@ def _records(values, key=None):
         elif isinstance(value, dict) and key and isinstance(value.get(key), list):
             records.extend(value[key])
     return [r for r in records if isinstance(r, dict)]
+
+
+def _page_records(values, key, path, number):
+    """The records of ONE page, or GitHubUnavailable (#1983): a page is a list of objects, or an object whose `key` list holds objects; an empty list is a valid last page."""
+    for value in values:
+        if isinstance(value, dict) and key and isinstance(value.get(key), list):
+            value = value[key]
+        if not isinstance(value, list) or not all(isinstance(r, dict) for r in value):
+            raise GitHubUnavailable("%s page %d is not a list of objects" % (path, number))
+    return _records(values, key)
 
 
 def _is_orchestrator(observation):
@@ -10932,8 +11075,15 @@ class GitHubHub:
             with self.lock:
                 self._markers_dirty = True  # a cursor that could not be written is written next pass
 
+    def read_open_pages(self, path):
+        records, cut = self.read_pages(path, cap=OPEN_LIST_PAGES)
+        named = re.match(r"^repos/([^/]+/[^/]+)/", path)   # the repository, read the way gh_api reads it
+        if cut and named:
+            note_open_cut(named.group(1))
+        return records, cut
+
     def read_pages(self, path, key=None, timeout=None, older=None, cap=None):
-        """One list read, at most GITHUB_PAGE_CAP pages of GITHUB_PAGE_SIZE. Returns (records, truncated). `older`
+        """One list read, at most `cap` (default GITHUB_PAGE_CAP) pages of GITHUB_PAGE_SIZE. Returns (records, truncated). `older`
         is (field, since): a listing newest first stops at the first page that ends before `since`."""
         joiner = "&" if "?" in path else "?"
         records = []
@@ -10941,13 +11091,13 @@ class GitHubHub:
         number = 0
         while True:
             number += 1
-            page = _records(self.gh_api("%s%spage=%d" % (path, joiner, number), paginate=False, timeout=timeout), key)
+            page = _page_records(self.gh_api("%s%spage=%d" % (path, joiner, number), paginate=False, timeout=timeout), key, path, number)
             records.extend(page)
             if len(page) < GITHUB_PAGE_SIZE:
                 return records, False
             if older and isinstance(page[-1].get(older[0]), str) and page[-1][older[0]] < older[1]:
                 return records, False
-            if bounded and number >= min(GITHUB_PAGE_CAP, cap or GITHUB_PAGE_CAP):
+            if bounded and number >= (cap or GITHUB_PAGE_CAP):
                 return records, True
 
     # -- gh api, and the catch-up read
@@ -11532,6 +11682,7 @@ def collect_status(runner=subprocess.run, now=time.time, platform=None):
             except V2Error as err:   # status never crashes on a bad state file: it says the ledger is unusable and that the sends are stopped
                 ledger = "; sent-keys ledger: UNREADABLE (sends stopped: fail closed): %s" % _one_line(str(err), 160)
             report["v2_light"] = "ON (features off: %s)%s" % ("; ".join(V2_LIGHT_OFF), ledger)
+        report["undecidable"] = {n: v.get("passes") for n, v in _read_small(state, UNDECIDABLE_FILE).items() if v.get("passes", 0) >= PANE_MISSING_PASSES}   # #1884 PC-7: the doctor reads it
         report["sweep"] = sweep_summary(state)  # #117
         report["triage"] = triage_summary(state)  # #130
         report["ci_record"] = ci_record_status_line(state, now())
@@ -11776,6 +11927,12 @@ def cmd_status(args, runner=subprocess.run, now=time.time):
         print(json.dumps(report, indent=2, sort_keys=True))
     else:
         print(format_status(report))
+        try:
+            lane_lines = late_reminder_lines(state_dir_path(), load_config(config_path()), now())
+        except Exception:   # a missing log or config must not take `status` down
+            lane_lines = []
+        if lane_lines:
+            print("\n".join(lane_lines))
         if cloud_lines:
             print("\n".join(cloud_lines))
     return EXIT_OK if report["ok"] else EXIT_ERROR
@@ -12105,7 +12262,7 @@ def launch_memory_check(args, engine, state, runner, now):
         except OSError:
             pass   # the cache is only an optimisation: a failed write costs the next launch one wait, deliberately silent
     if reason is not None:
-        audit("launch.memory_ok", {"reason": _one_line(reason, 200), "measured": ("free %d%%, swapouts %d" % first) if first else "not measured"})
+        audit("launch.memory_ok", {"reason": scrubbed_flag_text(reason), "measured": ("free %d%%, swapouts %d" % first) if first else "not measured"})
         return None
     if first is None:
         sys.stderr.write("%s: memory test not available: launching\n" % PROG)
@@ -12222,6 +12379,8 @@ def _cmd_launch(args, runner, now, socket_call=None):
     problem = launch_agent_problem(engine.config, runner, args.agent)
     if problem:
         raise LaunchError(problem)
+    if args.reports_to:   # #1046: a boss nobody can answer to is refused before anything is created (a registered name, a retired one, the role alias or a cloud record passes)
+        load_module("cloud_worker").bind(globals()).check_report_to(engine, state, args, engine.discover(engine.now()).agents)
     brief = read_brief(args.brief_file, sys.stdin)
     mismatch = launch_brief_mismatch(args, engine, repo, brief)   # #1350: before anything starts
     if mismatch:
@@ -14026,7 +14185,7 @@ class IntentReader:
     def open_asks(self, charter, repo=None):
         """The open sub-issues of a charter, derived from GitHub on every call."""
         repo = repo or self.repo
-        found = self._api("repos/%s/issues/%d/sub_issues?per_page=100" % (repo, charter), repo)
+        found = open_pages(lambda page: self._api("repos/%s/issues/%d/sub_issues?per_page=100%s" % (repo, charter, open_page_suffix(page)), repo), repo)
         asks = []
         for data in found if isinstance(found, list) else []:
             issue = IssueIntent.from_api(data)
@@ -17550,6 +17709,11 @@ def cmd_merge_gate(args, runner, now):
         else:
             sys.stderr.write("%s\n" % union)
         return plan_ledger.EXIT_REFUSE
+    drops = merge_drops_refusal(runner, config, repo, number, state)   # #2159: a merge never silently drops a line of the tip
+    if drops:
+        _gates_audit(engine, "merge_gate.refused", ref, {"by": who, "why": _one_line(drops, 300)})
+        sys.stderr.write("%s\n" % drops)
+        return plan_ledger.EXIT_REFUSE
     allowed, why, head = gate.check_merge(reading, gh, conf, state, repo, number, who, kind[0] == "person", waived, now)
     _gates_audit(engine, "merge_gate.allowed" if allowed else "merge_gate.refused", ref, {"by": who, "why": _one_line(why, 300)})
     if args.json:
@@ -17560,6 +17724,136 @@ def cmd_merge_gate(args, runner, now):
 
 
 cmd_merge_gate.ledger = True   # state and GETs only; its own errors are usage errors
+
+
+# ---- #2159: a merge resolution never silently drops a line of the tip. `merge-drops` is read-only: the lines the branch head removes relative to the integration tip, minus the
+# pull request's own removals (its three-dot diff) and minus the tip's own newer lines (a branch behind the tip has not been asked to carry them). The merge step refuses while it lists any.
+def _git_out(runner, git_dir, argv):
+    done = runner(["git", "-C", str(git_dir)] + argv, capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
+    if done.returncode != 0:
+        raise OSError("git %s failed: %s" % (argv[0], _one_line(done.stderr or "", 120)))
+    return done.stdout or ""
+
+
+def _diff_lines(runner, git_dir, a, b, sign):
+    """[(file, old or new line number, text)] of the `sign` ('-' or '+') lines of `git diff -U0 a b` (a '-' line numbers the old side, a '+' line the new side)."""
+    out, name, old, new, found = _git_out(runner, git_dir, ["diff", "-U0", "--no-renames", "--no-color", a, b]), None, 0, 0, []
+    for line in out.split("\n"):
+        if line.startswith("+++ "):
+            name = line[4:][2:] if line[4:].startswith("b/") else None if line[4:] == "/dev/null" else line[4:]
+        elif line.startswith("--- "):
+            if line[4:] != "/dev/null":
+                name = line[4:][2:] if line[4:].startswith("a/") else line[4:]
+        elif line.startswith("@@"):
+            m = re.match(r"@@ -(\d+)(?:,\d+)? \+(\d+)", line)
+            old, new = (int(m.group(1)), int(m.group(2))) if m else (0, 0)
+        elif line.startswith("-") and sign == "-" and name:
+            found.append((name, old, line[1:]))
+            old += 1
+        elif line.startswith("+") and sign == "+" and name:
+            found.append((name, new, line[1:]))
+            new += 1
+        elif line.startswith("-"):
+            old += 1
+        elif line.startswith("+"):
+            new += 1
+    return found
+
+
+class MergeDropsConflict(Exception):
+    pass
+
+
+def merge_drops(runner, git_dir, tip, head):
+    """The hunks `head` drops from `tip`: [(file, first line number, last line number, first line text)], and the merge commit messages of `tip..head`.
+    A dropped line is a '-' line of `git diff tip head` that is not among the '-' lines of the branch's own non-merge commits (the pull request's own removals, by file and content)
+    and not a '+' line of `git diff merge-base tip` (the tip's newer lines)."""
+    done = runner(["git", "-C", str(git_dir), "merge-tree", "--write-tree", head, tip], capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
+    if done.returncode == 1:
+        raise MergeDropsConflict("conflicts, resolve first")
+    if done.returncode != 0:
+        raise OSError("git merge-tree failed: %s" % _one_line(done.stderr or "", 120))
+    tree = (done.stdout or "").split("\n")[0].strip()
+    own = collections.Counter()   # the PR's own removals (three-dot), per (file, stripped line); from the branch's non-merge commits, as the three-dot diff is empty once the tip is merged in
+    for commit in _git_out(runner, git_dir, ["rev-list", "--no-merges", "%s..%s" % (tip, head)]).split():
+        own.update((f, t.strip()) for f, _, t in _diff_lines(runner, git_dir, commit + "^", commit, "-"))
+    dropped = []
+    for d in _diff_lines(runner, git_dir, tip, tree, "-"):   # the tip's lines the merge result lacks
+        key = (d[0], d[2].strip())
+        if own[key] > 0:
+            own[key] -= 1
+        else:
+            dropped.append(d)
+    hunks = []
+    for name, number, text in dropped:
+        if hunks and hunks[-1][0] == name and hunks[-1][2] + 1 == number:
+            hunks[-1][2] = number
+        else:
+            hunks.append([name, number, number, text])
+    messages = _git_out(runner, git_dir, ["log", "--merges", "--format=%B%x00", "%s..%s" % (tip, head)])
+    return [tuple(h) for h in hunks], [m for m in messages.split("\0") if m.strip()]
+
+
+def merge_drops_unnamed(hunks, messages):
+    """The hunks no merge commit message names (its file AND the first line of the hunk)."""
+    return [h for h in hunks if not any(h[0] in m and h[3].strip() and h[3].strip() in m for m in messages)]
+
+
+def merge_drops_text(hunk):
+    return "%s lines %d-%d (first: %s)" % (hunk[0], hunk[1], hunk[2], _one_line(hunk[3].strip(), 80))
+
+
+def add_merge_drops_parsers(sub):
+    drops = sub.add_parser("merge-drops", help="Read-only: the lines a pull request branch removes relative to the integration tip that are not its own removals; exit 1 if any "
+                                               "hunk is not named in a merge commit message",
+                           description="Compares the branch head with the tip in a git directory: every '-' line of the tip-to-head diff that is not among the branch's own removals "
+                                       "(the three-dot diff). Prints each hunk (file, line range). A hunk whose file and first line a merge commit of the branch names is allowed. Exit 0 when clean.")
+    drops.add_argument("--git-dir", default=".", help="A checkout or bare repository holding both refs (default: the current directory)")
+    drops.add_argument("--tip", default="origin/integration", help="The integration tip (default origin/integration)")
+    drops.add_argument("--branch", default="HEAD", help="The branch head to judge (default HEAD)")
+
+
+def cmd_merge_drops(args, runner, now):
+    try:
+        hunks, messages = merge_drops(runner, args.git_dir, args.tip, args.branch)
+    except MergeDropsConflict:
+        print("conflicts, resolve first")
+        return EXIT_USAGE
+    except (OSError, subprocess.SubprocessError) as err:
+        raise LedgerCommandError("merge-drops: %s" % _one_line(str(err), 200)) from None
+    bad = merge_drops_unnamed(hunks, messages)
+    for hunk in bad:
+        print("dropped: %s" % merge_drops_text(hunk))
+    return EXIT_ERROR if bad else EXIT_OK
+
+
+cmd_merge_drops.ledger = True   # reads only; its own errors are usage errors
+
+
+def merge_drops_refusal(runner, config, repo, number, state):
+    """The merge step's refusal line when the pull request's head drops a line of its base branch's tip, else None. A cached bare clone under the state directory is fetched
+    for the read; a read that cannot be made refuses nothing (the claim gate and the review check are what they were)."""
+    gh = merge_gate_gh(config, runner, repo)
+    code, out, _ = gh(["pr", "view", str(number), "--repo", repo, "--json", "baseRefName,headRefOid"])
+    try:
+        data = load_module("record_json").parse_bounded(out) if code == 0 else {}
+        base, head = data["baseRefName"], data["headRefOid"]
+    except (ValueError, KeyError, TypeError):
+        return None
+    git_dir = Path(state) / "merge-drops" / repo.replace("/", "__")
+    try:
+        if not git_dir.is_dir():
+            git_dir.parent.mkdir(parents=True, exist_ok=True)
+            _git_out(runner, ".", ["init", "--bare", "-q", str(git_dir)])
+        _git_out(runner, git_dir, ["fetch", "-q", "https://github.com/%s.git" % repo, "+refs/heads/%s:refs/tips/base" % base, "+refs/pull/%d/head:refs/tips/head" % number])
+        hunks, messages = merge_drops(runner, git_dir, "refs/tips/base", "refs/tips/head")
+    except (MergeDropsConflict, OSError, subprocess.SubprocessError):
+        return None
+    bad = merge_drops_unnamed(hunks, messages)
+    if not bad:
+        return None
+    return "merge of %s#%d refused: its head drops %d tip hunk(s): %s; keep them, or name each in a merge commit message (`fleet-switchboard merge-drops`)" % (
+        repo, number, len(bad), "; ".join(merge_drops_text(h) for h in bad[:3]))
 
 
 ANCESTOR_DEPTH = 25
@@ -17977,6 +18271,7 @@ class CiRecordState:
     def __init__(self):
         self.lists = {}     # normalised repo -> (read at, records)
         self.good = {}      # normalised repo -> (read at, records, cut): the list of the LAST read of it in this process that SUCCEEDED; a failed read removes it (memory only)
+        self.was_cut = {}   # normalised repo -> the ceiling flag of the last SUCCESSFUL read (a failed read leaves it)
         self.checked = {}   # (normalised repo, number) -> {"list_head", "at", "retry_at", "fails"}: the LAST-CHECKED time decides
         self.recorded = 0   # verdicts this process recorded
         self.already = 0    # verdicts this process found already recorded (a manual `gates ci-record` first leaves these, not `recorded`)
@@ -18025,10 +18320,13 @@ def ci_record_pass(engine, now):
                 break
             key = plan_ledger.normal_repo(repo)
             try:
-                records, cut = hub.read_pages("repos/%s/pulls?state=open&per_page=100" % repo, cap=2)
+                records, cut = hub.read_pages("repos/%s/pulls?state=open&per_page=100" % repo, cap=OPEN_LIST_PAGES)
                 budget[0] -= sweep_pages_used(records, cut)
+                if cut:
+                    note_open_cut(repo)
                 state.lists[key] = (now, records)
-                state.good[key] = (now, records, bool(cut) or len(records) >= LABEL_HOLD_LIST_CUT)
+                state.good[key] = (now, records, bool(cut))
+                state.was_cut[key] = bool(cut)   # the flag of the last SUCCESSFUL read: a failed read leaves it, so the held rows of a cut list are kept until the next good read
                 read_mark(engine, "pulls:" + key, not cut, "the open pull request list was cut", now)   # #811
             except GitHubUnavailable as err:
                 budget[0] -= 1
@@ -20132,6 +20430,10 @@ def preflight_changed(runner, root):
 
 def cmd_preflight_pr(args, runner, now):
     """`preflight-pr`: run each class of PREFLIGHT_CLASSES under `heavy`, print one PASS or FAIL line per class, exit 1 when any fails. Only runs tests."""
+    if getattr(args, "body", None) is not None:   # off by default: only reads the description and the plan (bin/switchboard/body_check.py)
+        return cmd_body_check(args.body, runner, now, dict(parse_pr_ref=parse_pr_ref, build_engine=build_engine, read_pr_json=read_pr_json, load_config=load_config,
+                              parse_plan_source=parse_plan_source, IntentReader=IntentReader, GhAccounts=GhAccounts, fetch_plan=fetch_plan,
+                              plan_ledger=plan_ledger, plan_check=plan_check, PLAN_LINE_RE=PLAN_LINE_RE))
     top = runner(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True)
     if top.returncode != 0:
         sys.stderr.write("%s: preflight-pr: not inside a git work tree\n" % PROG)
@@ -20270,6 +20572,7 @@ def add_preflight_pr_parsers(sub):
                                "token-shaped directory name. Only runs tests: it never pushes, labels or records a verdict. "
                                "With --merged the same classes run on a local merge of the base into the head (a temporary worktree, removed afterwards).")
     pre.add_argument("--merged", action="store_true", help="Run on a local merge of the current base into the head, so a change green alone and red against the moved base is found before the push")
+    pre.add_argument("--body", metavar="PR", help="Only read the pull request (owner/repo#N) and its plan: refuse a description whose first section is not the cause the plan's cause-first scenario asks for (writes nothing)")
 
 
 def add_disk_parsers(sub):
@@ -20455,12 +20758,15 @@ def _checked_policy_thresholds(thresholds, source):
 
 _SECRET_PATTERNS = (
     (re.compile(r"(?i)\b(bearer|basic)\s+[A-Za-z0-9._~+/=-]{6,}"), r"\1 [redacted]"),
-    (re.compile(r"(?i)\b([A-Za-z0-9_.-]*(?:token|secret|passw(?:or)?d|api[_-]?key|credential|auth)[A-Za-z0-9_.-]*)"
-                r"(\s*[=:]\s*|\s+)(\"[^\"]*\"|'[^']*'|\S+)"), r"\1\2[redacted]"),
+    (re.compile(r"(?i)(?<![A-Za-z0-9_.-])(?=[A-Za-z0-9_.-]*?(?:token|secret|passw(?:or)?d|api[_-]?key|credential|auth))([A-Za-z0-9_.-]+)"
+                r"([\"']?)(\s*[=:]\s*|\s+)(\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|[\"'][^\n]*|\S+)"), r"\1\2\3[redacted]"),
     (re.compile(r"\b(?:sk-[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{20,}"
                 r"|AKIA[0-9A-Z]{12,}|xox[abprs]-[A-Za-z0-9-]{8,})"), "[redacted]"),
-    (re.compile(r"(://[^/\s:@]+:)[^@\s/]+@"), r"\1[redacted]@"),
-    (re.compile(r"\beyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]*"), "[redacted]"),   # a JWT (#773)
+    (re.compile(r"(://[^/\s:@]+:)\S{1,256}@"), r"\1[redacted]@"),   # the password may hold a slash or a raw @ (the last @ within 256 characters of one word)
+    # a whole key block (begin marker, body, the block's own first end marker): the body is any run of characters that does not begin another private-key marker (a tempered pattern), so every scan stops at the next marker (linear); a block with no end marker is redacted to the end of the text
+    (re.compile(r"-----BEGIN[A-Z ]*PRIVATE KEY(?: BLOCK)?-----(?:(?!-----BEGIN[A-Z ]{0,40}PRIVATE KEY)(?!-----END[A-Z ]{0,40}PRIVATE KEY)[\s\S])*(?:-----END[A-Z ]{0,40}PRIVATE KEY(?: BLOCK)?-----)?"), "[redacted]"),
+    (re.compile(r"-----(?:BEGIN|END)[A-Z ]*PRIVATE KEY(?: BLOCK)?-----"), "[redacted]"),   # a lone marker
+    (re.compile(r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}(?:\.[A-Za-z0-9_-]*)?"), "[redacted]"),   # a JWT (#773)
 )
 
 
@@ -20479,6 +20785,16 @@ def redact_command_text(text, extra=()):
     return text
 
 
+OVERRIDE_TEXT_LIMIT = 160
+
+
+def scrubbed_flag_text(text, limit=OVERRIDE_TEXT_LIMIT):
+    """Free text of an override audit line (`--boss-unregistered`: the reason and the boss text; `--memory-ok`: the reason) as the audit keeps it:
+    secret shapes replaced (the scrub above), control characters removed (one line), then cut to `limit` characters (160 by default).
+    A text without a secret shape stays as typed."""
+    text = redact_command_text(text)
+    text = re.sub(r"[\x00-\x1f\x7f-\x9f]+", " ", text)
+    return _one_line(text, limit)
 
 
 # PR 10: move a v1 session into v2 (`import-v1`)
@@ -20614,6 +20930,7 @@ def build_parser():
     launch.add_argument("--workspace", help="The herdr workspace for the new tab (default: the workspace of this session, else $HERDR_WORKSPACE_ID)")
     launch.add_argument("--role", help="metadata.fleet.role")
     launch.add_argument("--reports-to", dest="reports_to", help="metadata.fleet.reports_to")
+    launch.add_argument("--boss-unregistered", dest="boss_unregistered", metavar="REASON", help="Launch although --reports-to names no registered identity (audited with the reason)")
     launch.add_argument("--issue", type=issue_arg, help="metadata.fleet.issue (owner/repo#N also sets --repo)")
     launch.add_argument("--repo", help="metadata.fleet.repo, OWNER/REPO: the project the agent works in. Its gh "
                                        "account (config gh_users) is the agent's GH_TOKEN")
@@ -21153,6 +21470,40 @@ def cmd_key(args, runner=None, now=None):
         return EXIT_ERROR
     print("key saved")
     return EXIT_OK
+
+
+BRIEF_HEADER_FILE = Path("skills") / "fleet-coordination" / "operator-brief-header.txt"   # the one source of the standard brief header (ask #1046)
+
+
+def brief_header_text(path=None):
+    """The standard brief header printed from its one source file: a title, then each rule as `[id] text`. Nothing is retyped here."""
+    source = Path(path) if path else KIT_ROOT / BRIEF_HEADER_FILE
+    lines = ["Standard brief header (fleet-switchboard brief header):"]
+    for line in source.read_text().splitlines():
+        if line.strip() and not line.startswith("#"):
+            ident, _, text = line.partition(" | ")
+            lines.append("- [%s] %s" % (ident.strip(), text.strip()))
+    return "\n".join(lines)
+
+
+def cmd_brief(args, runner, now):
+    """`brief header --role operator`: print the standard header a person starts a brief from (files only; it reads no setting value)."""
+    try:
+        print(brief_header_text())
+    except OSError as err:
+        sys.stderr.write("%s: brief: the header source %s cannot be read (%s)\n" % (PROG, BRIEF_HEADER_FILE, _one_line(str(err), 100)))
+        return EXIT_ERROR
+    return EXIT_OK
+
+
+cmd_brief.direct = True   # files only: no daemon start
+
+
+def add_brief_parsers(sub):
+    brief = sub.add_parser("brief", help="Print the standard header of a brief for a cloud operator (`brief header --role operator`)")
+    brief_sub = brief.add_subparsers(dest="brief_action", required=True)
+    header = brief_sub.add_parser("header", help="Print the standard header: the admin route by setting key name, the secret rules, delete by exact name, stop at the first surprise")
+    header.add_argument("--role", required=True, choices=("operator",), help="whose brief: operator")
 
 
 # ----------------------------------------------------------------- the service
