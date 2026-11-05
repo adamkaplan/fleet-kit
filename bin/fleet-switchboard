@@ -565,6 +565,8 @@ def _declared_key(data):
     """The key a module's source declares with a top-level `CONFIG_KEY = "<key>"` (read with `ast`, so quotes, spacing and indentation of the line do not matter;
     an annotation is allowed), or None. A file that does not parse falls back to the text of the line, so a broken declaring module is still SEEN (and then refused
     when it is loaded), never silently skipped."""
+    if b"CONFIG_KEY" not in data:
+        return None   # #2230: the name is not in the text at all, so no parse can find a declaration (the start-up reads 91 files and parsed each)
     try:
         declared = None
         for node in ast.parse(data).body:   # the LAST top-level assignment is the one the module ends up holding
