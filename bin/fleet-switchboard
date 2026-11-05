@@ -1011,8 +1011,19 @@ def validate_external_config(config, source):
     config["external_decisions"] = section
 
 
+_CONFIG_ONCE = {}   # #2215: while `gates-check` runs, the configuration is read from disk once and handed out as copies (it was read three times)
+
+
 def load_config(path=None):
     """Read config.json. A missing file means every default applies."""
+    if path is None and _CONFIG_ONCE.get("on"):
+        if "config" not in _CONFIG_ONCE:
+            _CONFIG_ONCE["config"] = _load_config_file(None)
+        return copy.deepcopy(_CONFIG_ONCE["config"])
+    return _load_config_file(path)
+
+
+def _load_config_file(path):
     path = Path(path) if path else config_path()
     try:
         text = path.read_text()
@@ -7732,6 +7743,9 @@ def read_pr_json(engine, repo, number, extra_fields=""):
     extra = {"env": env} if env is not None else {}
     argv = [config["gh"], "pr", "view", str(number), "--repo", repo, "--json",
             PR_VIEW_FIELDS + ("," + extra_fields if extra_fields else "")]
+    once = getattr(engine, "pr_view_once", None)   # #2215: `gates-check` sets a dict: the same pull request is asked of gh once, whoever asks
+    if isinstance(once, dict) and tuple(argv) in once:
+        return copy.deepcopy(once[tuple(argv)])
     try:
         done = (engine.gh_runner or subprocess.run)(argv, capture_output=True, text=True,
                                                     timeout=min(config["call_timeout_seconds"],
@@ -7743,9 +7757,12 @@ def read_pr_json(engine, repo, number, extra_fields=""):
         why = "gh pr view %s#%d failed: %s" % (repo, number, accounts.scrub(_one_line(done.stderr or "", 160)) or "exit %d" % done.returncode)
         raise (NoticeNotFound if _PR_NOT_FOUND.search(done.stderr or "") else NoticeError)(why)
     try:
-        return json.loads(done.stdout or "")
+        raw = json.loads(done.stdout or "")
     except ValueError:
         raise NoticeError("gh pr view %s#%d answered something that is not JSON" % (repo, number)) from None
+    if isinstance(once, dict):
+        once[tuple(argv)] = copy.deepcopy(raw)
+    return raw
 
 
 def read_ref_state(engine, repo, number, kind):
@@ -18070,6 +18087,13 @@ def once_pr_view_runner(inner):
 
 def cmd_gates_check(args, runner, now):
     """`gates-check <pr> --for ready|merge`. Read-only (state counters aside). 0 allow, 10 refuse, 3 fail-open."""
+    try:
+        return _gates_check(args, runner, now)
+    finally:
+        _CONFIG_ONCE.clear()   # #2215
+
+
+def _gates_check(args, runner, now):
     exit_code, payload = plan_ledger.EXIT_FAIL_OPEN, {"verdict": "fail-open"}
     engine = state = None
     repo = None
@@ -18079,6 +18103,7 @@ def cmd_gates_check(args, runner, now):
         setting = plan_ledger.repo_setting(config, repo)
         state = ensure_state_dir()
         engine, _, _ = build_engine(runner, now, "cli", writable=True)
+        engine.pr_view_once = {}   # #2215
         if setting is None or not setting["enabled"]:
             payload = {"verdict": "allow", "reason": "not opted in" if setting is None else "disabled (kill switch)"}
             exit_code = plan_ledger.EXIT_ALLOW
@@ -21731,6 +21756,7 @@ def _dispatch(args, known, available):
 def main(argv=None, runner=subprocess.run, now=time.time, wait=None, spawn=subprocess.Popen,
          socket_call=None):
     os.environ.pop(OWN_GH_ENV, None)   # #1216: an inherited marker means nothing; own gh calls reach the real gh by path (own_gh_path)
+    _CONFIG_ONCE.clear()   # #2215
     raw = tuple(argv if argv is not None else sys.argv[1:])   # #835: the command line as typed, captured BEFORE any registrar runs: `review record` reads its rating inputs from this, never from the shared parser
     held = {name: (globals()[name], globals()[name].__code__) for name in RATING_PATH_FUNCTIONS if name in globals()}
     parser = build_parser()
@@ -21752,6 +21778,8 @@ def main(argv=None, runner=subprocess.run, now=time.time, wait=None, spawn=subpr
         sys.stderr.write("%s: review: a command registrar replaced code on the rating path: nothing was recorded\n" % PROG)   # a registrar reassigned one of the functions the rating is read and recorded by
         return EXIT_ERROR
     action = getattr(args, "action", None)
+    if action == "gates-check":
+        _CONFIG_ONCE["on"] = True   # #2215: one read of config.json for the whole check; cmd_gates_check turns it off again
     refused, noted = installed_tree_check(action, daemon=action == "run" and not getattr(args, "once", False), records=command_records(action, parser.commands))   # #1380: before anything else runs, and for every command but the ones that move the tree
     if refused:
         sys.stderr.write(refused + "\n")

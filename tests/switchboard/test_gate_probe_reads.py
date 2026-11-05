@@ -32,6 +32,17 @@ sys.exit(code)
 """
 
 
+GH_RICH = GH_SCRIPT.replace('"statusCheckRollup": []', '"statusCheckRollup": [{"__typename": "CheckRun", "name": "ci", "status": "COMPLETED", "conclusion": "SUCCESS", "detailsUrl": "https://github.com/acme/app/actions/runs/55/job/1", "workflowName": "ci"}]'
+                           ).replace('"files": [{"path": "a.py"}]', '"files": [{"path": "a.py", "changeType": "RENAMED"}]').replace(
+    """else:
+    sys.stderr""", '''elif a[:1] == ["api"]:
+    print(json.dumps({"w": 5, "e": "push", "p": ".github/workflows/ci.yml", "status": "x"}))
+    code = 0
+else:
+    sys.stderr''')
+MOST_GH_CALLS = 4   # (#2215) one `gh pr view`, one run identity, one list of runs, one paged file list: none repeated
+
+
 class TestGateProbeReads(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="gate-probe-"))
@@ -65,6 +76,21 @@ class TestGateProbeReads(unittest.TestCase):
             self.assertLessEqual(len(reads), 2, "one read of the pull request and one of its plan, no more: %s" % [r["argv"][:3] for r in reads])
             span = max(r["end"] for r in reads) - min(r["start"] for r in reads)
             self.assertLess(span, PROBE_LIMIT / 2.0, "the reads took %.2f s of the probe's %.1f s" % (span, PROBE_LIMIT))
+
+    def test_the_gh_calls_of_one_check_are_few_and_the_decision_is_the_same_with_ci_and_a_rename(self):
+        (self.tmp / "gh").write_text(GH_RICH % {"delay": 0, "head": HEAD, "log": str(self.log)})
+        outcomes = {}
+        for kind in ("ready", "merge"):
+            done, reads = self.check(kind)
+            self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+            views = [r for r in reads if r["argv"][:2] == ["pr", "view"]]
+            self.assertEqual(len(views), 1, [r["argv"][:3] for r in reads])
+            self.assertLessEqual(len(reads), MOST_GH_CALLS, [r["argv"][:3] for r in reads])
+            payload = json.loads(done.stdout)
+            outcomes[kind] = (payload["verdict"], payload["mode"], [f["gate"] for f in payload["failed"]])
+        self.assertEqual(outcomes["ready"], ("allow", "shadow", ["G0a", "G1"]))
+        self.assertEqual(outcomes["merge"][:2], ("allow", "shadow"))
+        self.assertTrue({"G0a", "G1"} <= set(outcomes["merge"][2]))
 
     def test_s3_the_decision_is_the_one_the_gates_made_before(self):
         no_plan = "G0a: no plan found: pass --plan, or put `PLAN: <link>` in the PR body; G1: needs a plan that passes G0a"
