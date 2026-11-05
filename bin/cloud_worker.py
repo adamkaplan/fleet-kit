@@ -45,7 +45,7 @@ CLOUD_WORKER_AGENT = "worker"   # the agent the image defines (cloud/worker/agen
 # The options of the launcher's `create` that `launch --cloud` hands over: ONE table. Taken from the launcher on main (commit fb4b9f2,
 # cloud/launcher/cloud_worker.py `create`: --shape S|M, --stack); a name here that the launcher does not know makes its create fail (exit 2).
 NO_COMMIT_OPTION = "--no-commit"   # the pod is launched NOT to commit (a measure or a read): the launcher sends it no wip note
-CREATE_OPTION = {"repo": "--repo", "branch": "--branch", "run_id": "--run-id", "idle": "--idle", "hard": "--hard", "shape": "--shape", "stack": "--stack", "agent": "--agent", "boss": "--boss", "stack_model_secret": "--stack-model-secret", "persistent": "--persistent", "issue": "--issue", "no_wait": "--no-wait"}
+CREATE_OPTION = {"repo": "--repo", "branch": "--branch", "run_id": "--run-id", "idle": "--idle", "hard": "--hard", "shape": "--shape", "stack": "--stack", "agent": "--agent", "boss": "--boss", "stack_model_secret": "--stack-model-secret", "persistent": "--persistent", "issue": "--issue", "no_wait": "--no-wait"}; cloud_launch_again = (lambda spec: (lambda m: (sys.modules.__setitem__("cloud_launch_again", m), spec.loader.exec_module(m), m.bind(globals()), m)[-1])(importlib.util.module_from_spec(spec)))(importlib.util.spec_from_file_location("cloud_launch_again", str(_OWN_BIN / "cloud_launch_again.py")))   # a part of this file (ask #1619)
 LAUNCHER_SHAPES = ("XS", "S", "M", "O")   # the launcher's SHAPES keys (O: the orchestrator row, 250m and 768 MiB, meant for --agent orchestrator; a worker on it is likely to be killed for memory); the launcher's own default (XS; S with --stack; O with --agent orchestrator) applies when --shape is not given
 LAUNCHER_STACK_SHAPES = ("S", "M")   # the rows with stack: true; --stack with another shape is refused here, before any call
 MAX_M_PER_LANE = 4   # the most live shape-M (4 CPU) cloud workers one lane may hold: a lane's batch of 4-CPU pods once filled the cluster and left every other lane's launches unplaceable
@@ -61,7 +61,6 @@ Task:
 # The TEMPORARY launch rule (ask #1046): the only place it is written; it names the ask whose merge removes it.
 TEMP_ISSUE_LINK_WARNING = True   # a worker cannot read issues yet: removed when ask #1019 (issue reading by workers) merges
 RECORD_MAX = 8192
-BRIEF_MAX = 4_000_000   # the kept text of a no-wait launch's brief (the file read_brief already bounded)
 PASSWORD_MAX = 512
 LAUNCH_SECONDS = 900                      # `create` returns only once the worker answers
 STOP_SECONDS = 600
@@ -267,7 +266,7 @@ def save_record(state, record):
 
 
 def remove_record(state, name):
-    for path in (record_path(state, name), password_path(state, name), brief_path(state, name)):
+    for path in (record_path(state, name), password_path(state, name), cloud_launch_again.brief_path(state, name)):
         try:
             os.unlink(str(path))
         except FileNotFoundError:
@@ -559,21 +558,6 @@ for _name in CLUSTER_NAMES:
     globals()[_name] = getattr(cloud_cluster, _name)
 
 
-def _load_launch_again():
-    """Load bin/cloud_launch_again.py (beside this file; a part of it) and bind it to this file's globals (a name defined there and patched here does not reach it)."""
-    spec = importlib.util.spec_from_file_location("cloud_launch_again", str(_OWN_BIN / "cloud_launch_again.py"))
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["cloud_launch_again"] = module
-    spec.loader.exec_module(module)
-    module.bind(globals())
-    return module
-
-
-cloud_launch_again = _load_launch_again()
-for _name in ("brief_path", "_launch_line", "_launch_again", "_finish_starting"):
-    globals()[_name] = getattr(cloud_launch_again, _name)
-
-
 
 def refusals(function):
     """A Refusal is exit 2 with its one line; nothing else about the command changes."""
@@ -772,11 +756,7 @@ def _launch(args, runner, now, reserve):
     if local is not None:   # `route` prefers a cloud record: every later send/read/retire for the local agent would go INTO the pod
         raise LaunchError("a local fleet agent named %s exists: a cloud worker cannot take its name (send, read and retire by name would reach "
                           "the pod instead of the local agent); retire it or pick another name; nothing was created" % name)
-    existing = load_record(state, name)
-    if existing is not None:   # a second launch of a name (#1619): returned, finished (no-wait), refused or (a gone pod) the name is freed
-        done = _launch_again(args, runner, engine, state, existing, repo, branch)
-        if done is not None:
-            return done
+    if (done := cloud_launch_again._launch_again(args, runner, engine, state, load_record(state, name), repo, branch)) is not None: return done   # a second launch of a name (#1619)
     if args.reports_to:
         check_report_to(engine, state, args, local_agents=found.agents)
     brief = H["read_brief"](args.brief_file, sys.stdin)
@@ -800,11 +780,7 @@ def _launch(args, runner, now, reserve):
         options += [CREATE_OPTION["boss"], args.reports_to] if args.reports_to else []
     if getattr(args, "stack", False):   # only on request: a launch without --stack hands the launcher exactly what it always did
         options.append(CREATE_OPTION["stack"])
-    no_wait = bool(getattr(args, "no_wait", False))
-    if no_wait:   # only on request: the launcher requests the pod and returns; the same launch command finishes it later
-        if getattr(args, "stack", False):
-            raise LaunchError("--no-wait does not combine with --stack (a stack pod's start is its own wait); nothing was created")
-        options.append(CREATE_OPTION["no_wait"])
+    options += cloud_launch_again.no_wait_options(args)   # --no-wait (#1619)
     if getattr(args, "no_commit", False) or getattr(args, "role", None) in ("tester", "reviewer"):   # a measure or a read never commits
         options.append(NO_COMMIT_OPTION)
     if persistent:   # only on request: any other launch hands the launcher exactly what it always did
@@ -885,19 +861,7 @@ def _launch(args, runner, now, reserve):
                 remove_record(state, name)
             raise LaunchError("%s: %s (the worker %s was created; %s)" % (
                 name, problem, name, "it was stopped and its record dropped" if stopped else "the stop failed: the pod and its record are kept; stop it with `%s retire %s`" % (H["PROG"], name)))
-        if no_wait:   # the pod is requested: keep what the finishing call needs (the run id, the brief once) and return at once
-            try:
-                record["state"], record["run_id"] = "starting", run_id
-                if brief:
-                    _write_private(brief_path(state, name), brief)
-                save_record(state, record)
-            except (CloudError, OSError) as err:
-                remove_record(state, name)
-                _stop_after_failure(engine, runner, name, run_id, "launch: record not stored", cluster)
-                raise LaunchError("the worker was requested but its record could not be stored (%s); stop was requested" % _one(cluster.clean(str(err), 100), 100)) from None
-            print("starting: %s requested; run the same launch command again to finish it, or read %s / status to poll" % (name, name), file=sys.stderr)
-            print(json.dumps(_launch_line(record), sort_keys=True))
-            return H["EXIT_OK"]
+        if getattr(args, "no_wait", False): return cloud_launch_again.park(engine, runner, state, name, record, run_id, brief, cluster)
         fleet = H["fleet_record"](name, args.role, args.reports_to, None if args.issue is None else int(args.issue), args.charter, repo, *((None, None, choice) if choice else ()))
         try:
             with tunnel(cluster, record) as live:
