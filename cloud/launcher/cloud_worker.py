@@ -2649,6 +2649,25 @@ def hub_on(env):
     return bool((env.get("CW_HUB_CHANNEL_URL") or "").strip() or (env.get("CW_HUB_REGISTRY_SECRET") or "").strip())
 
 
+REVIEW_COMMENTS = os.path.join(os.path.dirname(os.path.realpath(__file__)), "repo-review-comments.json")   # optional; absent = no comment anywhere
+
+
+def review_comment(repo, path=None):
+    """The review comment configured for repo (a JSON object beside this file: lowercased OWNER/NAME -> one-line text, at most 500 characters), or ''.
+    Optional per repository: a missing, unreadable or malformed file, a missing key or a bad value gives '' (no comment is posted). Never raises."""
+    try:
+        with open(path or REVIEW_COMMENTS, "rb") as f:
+            raw = f.read(65537)
+        data = json.loads(raw) if len(raw) <= 65536 else {}
+        v = data.get(str(repo).lower()) if isinstance(data, dict) else None
+        if isinstance(v, str) and v.strip() and len(v) <= 500 and not re.search("[\\x00-\\x1f\\x7f-\\x9f]", v) \
+                and not any(p.search(v) for p in CREDENTIAL_PATTERNS):
+            return v.strip()
+    except Exception:
+        pass
+    return ""
+
+
 def render_pod(a, worker, name, now, hard, env, run_names=()):
     image = a.image or env.get("CW_CLOUD_IMAGE")
     if not image:
@@ -2663,6 +2682,9 @@ def render_pod(a, worker, name, now, hard, env, run_names=()):
          "CW_AUDIT_RUNTIME_ID": "pod/" + name}
     if endpoint:
         e["CW_TOKEN_ENDPOINT"] = endpoint
+    comment = review_comment(a.repo)
+    if comment:   # the repository's review comment, posted once by the end hook; none configured = no variable
+        e["CW_REVIEW_COMMENT"] = comment
     agent = getattr(a, "agent", None) or "worker"
     if agent not in AGENTS:
         raise CloudError("--agent must be one of %s, got %r; nothing was created" % (" or ".join(AGENTS), str(agent)[:40]), EXIT_USAGE)
@@ -3380,6 +3402,7 @@ class Launcher:
             raw = res.get("skipped")
             return {"pushed": bool(res.get("pushed")), "wip_branch": text(res.get("wip_branch"), 200) or None,
                     "head_on": text(res.get("head_on"), 100) or None,
+                    "pr_note": text(res.get("pr_note"), 120),
                     "skipped": [text(x, 200) for x in raw if isinstance(x, str)][:50] if isinstance(raw, list) else [],
                     "note": text(res.get("note")), "error": text(res.get("error")) or ("end hook gave an unreadable error" if res.get("error") else "")}
         except Exception:
