@@ -87,11 +87,11 @@ KEEP_OUT = object()   # a field a raw test record leaves out
 # (plan hash, scenario hash) of five plan texts with a tester measure scenario, computed BEFORE the change to how G1 reads an unwritten claim (the checker is not touched by it): an unwritten claim and a
 # written `claim: pr` share one scenario hash because the canonical text has always filled `pr` in.
 PINNED_G1_HASHES = [
-    ("sha256:f59db1a8ea7a7a5a9a14aea40ed171467a1e44a2c22f5b7dad7ee8db9525800c", "sha256:1eb0d1ae3803c387308206baebdee4ec8f46ea649a0bc93ea21d154c9c0c2172"),
-    ("sha256:cda1cf00b68e99a39c2333618de5eb886785c7a380e9f78c4d3a8f700e441269", "sha256:1eb0d1ae3803c387308206baebdee4ec8f46ea649a0bc93ea21d154c9c0c2172"),
-    ("sha256:50a9daea80cdb6d0deb32da91d8b0b0ef938642b69c70ef6d5bb16db17146c98", "sha256:82e8896b50f5a203fa7c9f454d9f0de39a71a5f07183d9847c0b1f71e303238e"),
-    ("sha256:d5dde84d977987a17ed348cc1c2023a1456ef00b00d6b98ba412eccd8b6932a9", "sha256:1eb0d1ae3803c387308206baebdee4ec8f46ea649a0bc93ea21d154c9c0c2172"),
-    ("sha256:d2bead8ec573f01a5fb2ddc9acb39c65c9398838fb1c741d3897c2602a0eab33", "sha256:bfa5d6a9830a09f93946c6a90158edb784c7ca24778c4ece33870c9077a92e64"),
+    ("sha256:49e198bed39e626db8ae96c3bca1c4698d8897aedfcbee424139135c9f5a57dd", "sha256:1eb0d1ae3803c387308206baebdee4ec8f46ea649a0bc93ea21d154c9c0c2172"),
+    ("sha256:c1e0c68206aae87de7c06ec127259bbaf3ca8ad26939e858cbfc2d6c46b32136", "sha256:1eb0d1ae3803c387308206baebdee4ec8f46ea649a0bc93ea21d154c9c0c2172"),
+    ("sha256:d1d6c9c28bede4370228a8396948c32fa2ca2ea27489aa835c2395e6e4912272", "sha256:82e8896b50f5a203fa7c9f454d9f0de39a71a5f07183d9847c0b1f71e303238e"),
+    ("sha256:c0ff23d4f5be469763524ae46e6e10152b3f31d7463654be2f7ec4decab02097", "sha256:1eb0d1ae3803c387308206baebdee4ec8f46ea649a0bc93ea21d154c9c0c2172"),
+    ("sha256:5d1b65ebb74ce95831795f14f760542313f95f872541214c220d2d459a75849f", "sha256:bfa5d6a9830a09f93946c6a90158edb784c7ca24778c4ece33870c9077a92e64"),
 ]
 
 

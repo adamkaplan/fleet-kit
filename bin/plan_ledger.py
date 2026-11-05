@@ -381,15 +381,15 @@ def as_current(entries, hashes):
     """#1713: the same entries with each entry's `plan_hash` and ask head mapped to the NEW form when it is the OLD form of the live text (`hashes` is plan_check.plan_hashes(text)); every other value stays as it is, and the ledger itself is never rewritten."""
     if not hashes or len(hashes) < 2:
         return entries
-    new, old = hashes[0], hashes[1]
-    old_head, new_head = ask_head(old), ask_head(new)
+    new, olds = hashes[0], set(hashes[1:]) - {hashes[0]}
+    old_heads, new_head = {ask_head(o) for o in olds}, ask_head(hashes[0])
     out = []
     for entry in entries:
-        if entry.get("plan_hash") == old or entry.get("head") == old_head:
+        if entry.get("plan_hash") in olds or entry.get("head") in old_heads:
             entry = dict(entry)
-            if entry.get("plan_hash") == old:
+            if entry.get("plan_hash") in olds:
                 entry["plan_hash"] = new
-            if entry.get("head") == old_head:
+            if entry.get("head") in old_heads:
                 entry["head"] = new_head
         out.append(entry)
     return out

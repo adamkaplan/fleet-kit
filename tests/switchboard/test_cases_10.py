@@ -843,7 +843,7 @@ class TestPlanCheckRules(unittest.TestCase):
         self.assertEqual(self.warn_codes(self.edit("    evaluator: tester", "    evaluator: tester\n    claim: pr")), [])
         same = self.check(GOOD_PLAN)["plan_hash"]
         self.assertEqual(same, got["plan_hash"])
-        self.assertEqual(same, "sha256:2ad49344a1bf3ea7fc5ceeef6f60013e02fa465dc04da8a3b5b389a82b686cdb", "the hash the checker gave this plan before the warning existed")
+        self.assertEqual(same, "sha256:5ebca0edd1d11d361a1a6384a1d262d30455d1a737cf4c608baf0a2f71f38a18", "the hash the checker gave this plan before the warning existed")
         self.assertEqual([w["code"] for w in got["warnings"] if w["code"] != "live-no-claim"], ["no-constraint-list"])
 
     def test_the_template_marks_every_stub_with_a_ready_claim_line_and_a_live_one_for_live_or_tester(self):

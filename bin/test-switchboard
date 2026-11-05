@@ -30096,7 +30096,7 @@ class TestPlanLedger(LedgerBase):
 
     def test_a_whitespace_only_edit_does_not_void_but_a_constraint_edit_does(self):
         self.all_proven()
-        self.plan_issue["body"] = LEDGER_PLAN.replace("Commissioning works.", "Commissioning   works.\n")
+        self.plan_issue["body"] = LEDGER_PLAN.replace("Commissioning works.", "Commissioning works.  ")
         self.assertEqual(self.gates()[0], 0)
         self.plan_issue["body"] = LEDGER_PLAN.replace("Commissioning works.", "Commissioning works, with a new constraint.")
         self.assertEqual(self.gates()[0], 1)
@@ -67076,6 +67076,7 @@ _ph = importlib.import_module("test_plan_hash_marker"); _ph.HOST = sys.modules[_
 TestCiStateDecision, TestCiFreshReaders, TestCiFreshUnreadable, TestCiFreshOptOut, TestCiFreshReads, TestCiFreshRefusalAndEvidence, TestCiFreshDocs, TestCiFreshReadMutants, TestCiFreshSeamMutants = (_cf := importlib.import_module("test_ci_fresh")).TestCiStateDecision, _cf.TestCiFreshReaders, _cf.TestCiFreshUnreadable, _cf.TestCiFreshOptOut, _cf.TestCiFreshReads, _cf.TestCiFreshRefusalAndEvidence, _cf.TestCiFreshDocs, _cf.TestCiFreshReadMutants, _cf.TestCiFreshSeamMutants   # #1755
 _el = importlib.import_module("test_evidence_limit"); _el.HOST = sys.modules[__name__]; TestEvidenceLimitLocal, TestEvidenceLimitItems, TestEvidenceLimitCounting, TestEvidenceLimitRelay, TestEvidenceLimitMutants, TestEvidenceLimitUnchanged, TestEvidenceLimitItemCi, TestEvidenceLimitDocsAndCode = _el.build()   # #1901
 TestPlatformClassList = importlib.import_module("test_platform_classes").TestPlatformClassList
+_pl = importlib.import_module("test_plan_hash_lines"); TestPlanHashLinesPair, TestPlanHashLinesWhitespace, TestPlanHashLinesVariants, TestPlanHashLinesBindings, TestPlanHashLinesPairOrder, TestPlanHashLinesDocs, TestPlanHashLinesCloudCopy = _pl.TestPlanHashLinesPair, _pl.TestPlanHashLinesWhitespace, _pl.TestPlanHashLinesVariants, _pl.TestPlanHashLinesBindings, _pl.TestPlanHashLinesPairOrder, _pl.TestPlanHashLinesDocs, _pl.TestPlanHashLinesCloudCopy   # #1834
 
 class TestTheArchitectureTestIsRun(unittest.TestCase):
     """CI runs this file and nothing else of the switchboard's tests: if the two lines above are removed, the architecture test would drop out of CI without a
