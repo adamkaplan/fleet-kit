@@ -57,6 +57,8 @@ SETUP_PREAMBLE = """Setup (do this first, before the task below):
 
 Task:
 """
+# The TEMPORARY launch rule (ask #1046): the only place it is written; it names the ask whose merge removes it.
+TEMP_ISSUE_LINK_WARNING = True   # a worker cannot read issues yet: removed when ask #1019 (issue reading by workers) merges
 RECORD_MAX = 8192
 PASSWORD_MAX = 512
 LAUNCH_SECONDS = 900                      # `create` returns only once the worker answers
@@ -547,6 +549,8 @@ CLUSTER_NAMES = (
     "_lib", "_scrub_lib", "use_settings", "_OWNER_RE", "_NAME_RE", "_repo_key", "check_allowed", "_capture", "_jwt_lifetime", "_duration",
     "firewall_refused", "VaultRecovery", "_token_refusal", "cluster_token", "_cluster_token_bounded", "private_root", "_ps", "stop_recorded_tunnels",
     "sweep_stale", "Cluster", "tunnel",
+    "unknown_report_to",
+    "check_report_to",
 )
 cloud_cluster = _load_cluster()
 for _name in CLUSTER_NAMES:
@@ -667,6 +671,16 @@ def cmd_launch(args, runner, now):
         return _launch(args, runner, now, lambda state: stack.enter_context(reservation(state, args.name)))
 
 
+def brief_warnings(args, repo, brief):
+    """The one-line warnings a brief earns (each at most once): it names docker or buildx while --stack is not given, or it links an issue of the repository."""
+    notes = []
+    if not getattr(args, "stack", False) and re.search(r"\b(docker|buildx|lane stack|lane-stack|stack-up)\b", brief or "", re.I):
+        notes.append("warning: the brief names docker, buildx or the lane stack tooling but --stack is not given: the worker would have no nested Docker")
+    if TEMP_ISSUE_LINK_WARNING and re.search(r"(github\.com/%s/issues/\d+|(?<![\w/.-])%s#\d+)" % (re.escape(repo), re.escape(repo)), brief or "", re.I):
+        notes.append("warning: the brief links an issue of %s: the worker cannot read issues yet (ask #1019); put what it needs in the brief" % repo)
+    return notes
+
+
 def lane_m_workers(state, lane):
     """The sorted names of the lane's live shape-M workers, from the record directory alone (no token, no cluster call)."""
     found = []
@@ -736,13 +750,18 @@ def _launch(args, runner, now, reserve):
         raise Refusal(str(err)) from None
     engine, state, _ = H["build_engine"](runner, now, "cli")
     reserve(state)
-    local = engine.discover(engine.now()).agents.get(name)
+    found = engine.discover(engine.now())   # the launch's first discovery: the report-to check reuses its answer
+    local = found.agents.get(name)
     if local is not None:   # `route` prefers a cloud record: every later send/read/retire for the local agent would go INTO the pod
         raise LaunchError("a local fleet agent named %s exists: a cloud worker cannot take its name (send, read and retire by name would reach "
                           "the pod instead of the local agent); retire it or pick another name; nothing was created" % name)
     if load_record(state, name) is not None:
         raise LaunchError("a cloud worker named %s already exists (`%s retire %s` ends it)" % (name, H["PROG"], name))
+    if args.reports_to:
+        check_report_to(engine, state, args, local_agents=found.agents)
     brief = H["read_brief"](args.brief_file, sys.stdin)
+    for note in brief_warnings(args, repo, brief):   # before anything is created: one line each, then the launch goes on
+        print("%s: %s" % (H["PROG"], note), file=sys.stderr)
     needs = next((ln for ln in str(brief).splitlines() if re.fullmatch(r"\s*NEEDS:\s*docker\s*", ln, re.I)), None)   # #1488: the XS/S/M shapes without --stack have no docker
     if needs is not None and not getattr(args, "stack", False):
         raise LaunchError("the brief line %r needs docker, which only the --stack pod has: launch again with --stack; nothing was created" % needs.strip())

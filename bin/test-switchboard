@@ -42257,6 +42257,7 @@ class TestLaunchRefusedMessage(TestLaunchMemoryGate):
         '--issue %r is not a whole numb': 'refused before any pod exists: it says nothing was created',
         'the cloud worker was not creat': 'the pod creation failed: no worker exists, so refused is right',
         'the brief line %r needs docker': 'refused before any pod exists: it says nothing was created',
+        '--boss-unregistered needs a re': 'refused before any pod exists: it says nothing was created',
     }
 
     def other_created_words(self, source):
@@ -62465,6 +62466,36 @@ class TestReviewRefusalNamesRule(TestReviewPostAndDismiss):
                         failed += 1
                 self.assertEqual(failed, 1, name)
 
+    def test_every_redaction_pattern_has_its_own_rule_name(self):   # U9
+        dash = "-" * 5
+        whole = "x\n" + dash + "BEGIN " + "PRIVATE" + " KEY" + dash + "\n" + "Q" * 12 + "\n" + dash + "END " + "PRIVATE" + " KEY" + dash + "\n"
+        marker = "x\n" + dash + "END " + "PRIVATE" + " KEY" + dash + "\n"
+
+        def check(ns):
+            names, table = ns["SECRET_RULE_NAMES"], ns["_SECRET_PATTERNS"]
+            self.assertEqual(len(names), len(table), "a redaction pattern has no rule name")
+            self.assertEqual(len(set(names)), len(names))
+            self.assertEqual(ns["find_secret_span"](whole)[0], "private-key-block")
+            self.assertEqual(ns["find_secret_span"](marker)[0], "private-key-marker")
+            return list(names), list(table)
+
+        names, table = check(vars(sb))
+        print("S9 control: every pattern has one unique rule name, and both key texts are named")
+        for added in ("private-key-block", "private-key-marker"):
+            self.assertIn(added, names)
+        self.assertEqual(len(names), len(table))
+        source = (Path(__file__).resolve().parent / "switchboard" / "secret_spans.py").read_text()
+        line = '"private-key-block", "private-key-marker", '
+        self.assertEqual(source.count(line), 1)
+        mutated = source.replace('"private-key-marker", ', "")
+        self.assertNotEqual(mutated, source)
+        ns = dict(vars(sb))
+        exec(compile(mutated, "scratch_secret_spans.py", "exec"), ns)
+        with self.assertRaises(AssertionError) as caught:
+            check(ns)
+        print("S9 mutant: applied, failed with: %s" % caught.exception)
+        self.assertIn("a redaction pattern has no rule name", str(caught.exception))
+
 
 for _name in dir(TestReviewPostAndDismiss):   # the parent's tests run in their own class
     if _name.startswith("test_") and _name not in TestReviewRefusalNamesRule.__dict__:
@@ -66866,12 +66897,14 @@ TestHeldSends = importlib.import_module("test_held_sends").TestHeldSends   # #20
 # The reminder-cancel tests of #1401.
 _reminder_cancel = importlib.import_module("test_reminder_cancel")
 TestCancelKeyRecheck = _reminder_cancel.build(PR4Base)
+TestKeyedReminderSupersede = importlib.import_module("test_keyed_reminder_supersede").build(PR4Base)
 # The lost-worker alert tests of #1481.
 _lost_worker = importlib.import_module("test_lost_worker")
 TestLostWorkerRemembers = importlib.import_module("test_lost_worker_remembers").TestLostWorkerRemembers
 TestLostWorker, TestLostWorkerReadRound, TestLostWorkerMemoryOnly, TestLostWorkerSlowPass = _lost_worker.TestLostWorker, _lost_worker.TestLostWorkerReadRound, _lost_worker.TestLostWorkerMemoryOnly, _lost_worker.TestLostWorkerSlowPass
 TestPushWatch = importlib.import_module("test_push_watch").TestPushWatch   # the push watch of #1740
 TestPodSilence = importlib.import_module("test_pod_silence").TestPodSilence   # the pod silence watch of #2115
+TestPodSilenceTick = importlib.import_module("test_pod_silence").TestPodSilenceTick   # the pod silence tick of #2135
 _stage_events = importlib.import_module("test_stage_events"); _stage_events.GithubRig, _stage_events.GH_REPO = GithubRig, GH_REPO; TestStageEvents = _stage_events.TestStageEvents; TestStageEvents.CONF = {"github_stage_repos": [GH_REPO], "github_stage_bots": ["github-actions[bot]"]}
 # A CLAIMS: line present but not read is refused (#1617); HOST gives the test the fixtures of this file.
 _claim_placement = importlib.import_module("test_claim_placement"); _claim_placement.HOST = sys.modules[__name__]
