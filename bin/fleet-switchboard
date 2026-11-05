@@ -3582,10 +3582,12 @@ def launch_problems(name, agent, directory, workspace, issue, charter=None, head
     return problems
 
 
-def fleet_record(name, role, reports_to, issue, charter=None, repo=None, launched_by=None, read_repo=None, choice=None):
+def fleet_record(name, role, reports_to, issue, charter=None, repo=None, launched_by=None, read_repo=None, choice=None, required_checks=None):
     fleet = {"name": name, "role": role, "reports_to": reports_to, "issue": None if issue is None else int(issue),
              "charter": charter, "repo": repo, "launched_by": launched_by, "read_repo": read_repo}   # launched_by (#372): the agent that ran `launch`, as its pane identified it; None from a plain shell
     fleet.update(choice or {})   # #1642: `model` and `reasoning`, only when launch was given them
+    if required_checks:
+        fleet["required_checks"] = list(required_checks)   # #2203: the brief's marked block, only when there is one: no block, no key
     return {key: value for key, value in fleet.items() if value is not None}
 
 
@@ -3804,7 +3806,7 @@ def record_launch_charter(engine, name, session_id, fleet, pane=None):
 
 
 def launch_agent(engine, name, agent, directory, workspace, role=None, reports_to=None, issue=None,
-                 brief=None, patience=LAUNCH_PATIENCE, sleep=time.sleep, charter=None, repo=None, launched_by=None, read_repo=None, choice=None):
+                 brief=None, patience=LAUNCH_PATIENCE, sleep=time.sleep, charter=None, repo=None, launched_by=None, read_repo=None, choice=None, required_checks=None):
     """Create a fleet agent: a v2 session, its own herdr tab, the brief.
 
     Nothing is typed. The tab's program is started by argv through herdr's
@@ -3819,7 +3821,7 @@ def launch_agent(engine, name, agent, directory, workspace, role=None, reports_t
     taken = engine.discover(engine.now()).agents.get(name)
     if taken is not None:
         raise LaunchError("a fleet agent named %s already runs in pane %s" % (name, taken.pane))
-    fleet = fleet_record(name, role, reports_to, issue, charter, repo, launched_by, read_repo, choice)
+    fleet = fleet_record(name, role, reports_to, issue, charter, repo, launched_by, read_repo, choice, required_checks)
     env = launch_base_env(engine.config)
     env.update(view_env(role, repo or (engine.config.get("intent_repo") if charter else None)))  # PR 18
     env.update(agent_tmp_env(engine, name))   # #767: before the session exists, so a failure leaves nothing started
@@ -3878,7 +3880,7 @@ def register_launch_worktree(engine, name, directory, repo):
         engine._note("worktree.error", name, {"error": _one_line(str(err), 120)})
 
 
-def launch_headless(engine, name, agent, directory, role=None, reports_to=None, issue=None, brief=None, charter=None, repo=None, launched_by=None, choice=None):
+def launch_headless(engine, name, agent, directory, role=None, reports_to=None, issue=None, brief=None, charter=None, repo=None, launched_by=None, choice=None, required_checks=None):
     """Create a fleet agent with NO terminal (#433): a v2 session in the OpenCode service, a private record (state-dir/headless/<name>.json) and the
     brief through the API. Nothing is opened in herdr. Presence is proved by the service: the new session must answer and carry the worker's name
     before the brief is sent. Returns {"name", "session", "pane": None, "tab": None, "headless": True}.
@@ -3904,7 +3906,7 @@ def launch_headless(engine, name, agent, directory, role=None, reports_to=None, 
                 raise LaunchError("a headless record for %s already exists: `%s retire %s` first, or pick another name" % (name, PROG, name))
             identity = headless_identity(engine, repo)   # a repo that maps to a named gh account is refused unless the route can be proved (below, once the session exists)
             account = engine.accounts.account_for(repo) if repo and getattr(engine, "accounts", None) is not None else None
-            fleet = fleet_record(name, role, reports_to, issue, charter, repo, launched_by, None, choice)
+            fleet = fleet_record(name, role, reports_to, issue, charter, repo, launched_by, None, choice, required_checks)
             fleet["headless"] = True
             try:
                 with engine._external("v2.session.create", name, {"agent": agent, "directory": directory, "fleet": fleet, "headless": True}) as result:
@@ -9567,6 +9569,7 @@ class GitHubItem:
         # is delivered only to an owner the old links found; `routed_by` says which link found the owner.
         self.numbers, self.actionable, self.routed_by = list(numbers), actionable, None
         self.review_signer = None   # the from= marker name of a review comment (`_review_comment_item`)
+        self.review_body = None   # #2203: the clipped text of a review comment, read against the reader's required checks when it is routed
 
     @property
     def issue(self):
@@ -9777,6 +9780,7 @@ def _review_comment_item(repo, comment, issue, number, cid, now):
     item = GitHubItem("github.reviewcomment:%d" % cid, "github.comment", summary, repo, known, lookups, login, now,
                       [number], True)
     item.review_signer = signer
+    item.review_body = body[:20000]
     return item
 
 
@@ -10633,6 +10637,19 @@ class GitHubHub:
             fact.look_back = self.lookback
         return found
 
+    def _review_checks_note(self, item, agents):
+        """#2203: one sentence on the review comment's notice naming the required checks of the reader's brief that are answered and missing. A reader with
+        no list in its launch record (the signer unknown, or a brief with no block) adds nothing. Never raises: a notice without it is the notice of today."""
+        try:
+            agent = agents.get(item.review_signer) if item.review_signer else None
+            checks = ((agent.fleet if agent is not None else None) or {}).get("required_checks")
+            if isinstance(checks, list) and item.review_body:
+                note = load_module("required_checks").notice(item.review_body, [c for c in checks if isinstance(c, str)][:12])
+                if note:
+                    item.summary += "; " + _one_line(re.sub(r"[\x00-\x1f\x7f]", "", note), 400)
+        except Exception:
+            pass
+
     def _route(self, item, discovery, now):
         if discovery is None or discovery.problems:
             return  # the fleet cannot be read: keep it, ask again next pass
@@ -10653,6 +10670,7 @@ class GitHubHub:
                     self._audit("github.reviewcomment.unowned", item.repo, {"key": item.key, "prs": item.numbers[:GITHUB_AUDIT_KEYS],
                                                                             "note": "no lane owns the pull request; audited once per comment id, no message is sent"})
                 return
+            self._review_checks_note(item, discovery.agents)
         with self.lock:
             if owner and not item.actionable and routed_by != "closing":
                 # PR 52: an owner found by a new link is told what needs it, not every passing check
@@ -12493,7 +12511,7 @@ def _cmd_launch(args, runner, now, socket_call=None):
             try:
                 done = launch_headless(engine, args.name, args.agent, args.dir, args.role, args.reports_to,
                                        None if args.issue is None else int(args.issue), brief, charter=args.charter, repo=repo,
-                                       launched_by=launched_by, choice=choice)
+                                       launched_by=launched_by, choice=choice, required_checks=load_module("required_checks").parse(brief))
             except HeadlessRefused as err:
                 if getattr(args, "headless", False):
                     raise   # asked for by name: the refusal is the answer
@@ -12511,7 +12529,7 @@ def _cmd_launch(args, runner, now, socket_call=None):
         if done is None:
             done = launch_agent(engine, args.name, args.agent, args.dir, workspace, args.role, args.reports_to,
                                 None if args.issue is None else int(args.issue), brief, charter=args.charter, repo=repo,
-                                launched_by=launched_by, read_repo=read_repo, choice=choice)
+                                launched_by=launched_by, read_repo=read_repo, choice=choice, required_checks=load_module("required_checks").parse(brief))
     except LaunchError as err:
         if created:
             raise LaunchError("%s (workspace %s was created and is left for you to close)" % (err, created)) from err
