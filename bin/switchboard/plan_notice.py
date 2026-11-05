@@ -126,7 +126,7 @@ def plan_wake_pass(engine, state, repos, now, budget=None):
                 done_when = parse_intent(own.get("body"))[1]
                 if route[1] == "work item":
                     parent_record = (raw.get((items[number] or {}).get("parent")) or (None, {}))[1]
-                    if parse_intent(parent_record.get("body"))[1]:
+                    if not done_when and parse_intent(parent_record.get("body"))[1]:   # #2200: plan check's rule (plan_input.load_plan): the own Done-when first, the ask's only when none
                         source, done_when = items[number]["parent"], parse_intent(parent_record.get("body"))[1]
                 stale, defect = False, ""
                 try:
