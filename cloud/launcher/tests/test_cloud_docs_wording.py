@@ -95,6 +95,15 @@ class TestClusterServerWording(unittest.TestCase):
     def test_window_sentence_present(self):
         self.assertTrue(has_window(read(QS)))
 
+    def test_s9_final_note_is_documented(self):
+        doc = read(os.path.join(ROOT, "docs", "cloud-worker-interface.md"))
+        para = doc.split("- **The final note.**", 1)[1].split("\n", 1)[0]
+        for phrase in ("send its final message", "N minutes left before its hard limit", "`CW_FINAL_NOTE_MINUTES`", "A brief no longer needs"):
+            self.assertIn(phrase, para)
+        self.assertLess(doc.index("- **The note at minute 40.**"), doc.index("- **The final note.**"))
+        self.assertEqual(len([x for x in read(QS).splitlines() if x.startswith("| `CW_FINAL_NOTE_MINUTES` |")]), 1)
+        self.assertNotIn("A brief no longer needs", doc.replace(para, ""))   # with the paragraph removed the phrase is gone: the check bites
+
     # mutants: a copy of the text with the claim broken; the REAL check must then fail
     def test_mutants_are_caught(self):
         for name, get in PLACES.items():

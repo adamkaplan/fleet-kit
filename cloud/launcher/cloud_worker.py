@@ -129,6 +129,13 @@ WIP_NOTE_AFTER_SECONDS = 40 * 60
 WIP_NOTE_MARK = "wip_note"                      # the pod annotation (cw/wip-note) that says the note was sent: once, never twice
 
 
+# The final note: N minutes before the pod's own hard deadline, the worker is asked, once, to send its final message (fixed words).
+FINAL_NOTE_MARK = "final_note"                   # the pod annotation (cw/final-note): "sent" or "unreadable"; once, never twice
+FINAL_NOTE_DEFAULT_MINUTES = "10"
+FINAL_NOTE_TEXT = ("Your time is almost up. Send your final message now: what you pushed, your counts and what is left. "
+                   "Then continue only if time remains.")
+
+
 def wip_note(worker):
     """The note sent to the worker at minute 40: names the branch and the exact command (plain, never forced)."""
     return ("Your git token ends in about 20 minutes. Save your work now: commit it, then push it to your work-in-progress branch %s/wip "
@@ -4174,6 +4181,11 @@ class Launcher:
             steps["notes"] = mono() - t0
         t0 = mono()
         try:
+            self.send_final_notes(live, now)
+        finally:
+            steps["notes"] += mono() - t0   # the final note is counted with the notes
+        t0 = mono()
+        try:
             self.send_idle_nudges(live, now, acts)
         finally:
             steps["notes"] += mono() - t0   # the nudges are counted with the notes: both are the pass's sends
@@ -4353,6 +4365,57 @@ class Launcher:
 
     def send_note(self, name, text):
         self.kube.exec(name, "python3", "-c", NOTE_SENDER_CODE, text)
+
+    def send_final_notes(self, pods, now):
+        """When a worker pod has N minutes left to its hard deadline (N = CW_FINAL_NOTE_MINUTES, default 10) and lived at least 2N minutes in all,
+        ONE note asks it to send its final message. The pod's cw/final-note annotation is set BEFORE the send, so a failed send or a restart
+        never repeats it. A pod with no cw/hard-deadline (a persistent orchestrator) is skipped. Unreadable data: no note, one audit line. Never raises."""
+        for pod in pods:
+            try:
+                worker, name = ann(pod, "worker"), pod["metadata"]["name"]
+                if (pod.get("status") or {}).get("phase") != "Running" or not NAME_RE.match(worker or ""):
+                    continue
+                raw_end = ann(pod, "hard-deadline")
+                if not raw_end or ann(pod, "final-note"):
+                    continue
+                uid = (pod.get("metadata") or {}).get("uid")
+                raw_n = self.env.get("CW_FINAL_NOTE_MINUTES")
+                raw_n = FINAL_NOTE_DEFAULT_MINUTES if raw_n is None else raw_n
+                reason = None
+                try:
+                    end, began = parse_iso(raw_end), parse_iso(ann(pod, "started"))
+                    if end is None or began is None:
+                        reason = "unreadable annotation"
+                except Exception:
+                    reason = "unreadable annotation"
+                if reason is None:
+                    s = str(raw_n)
+                    if not (s.isascii() and s.isdigit() and 1 <= int(s) <= 60):
+                        reason = "unreadable setting"
+                    else:
+                        n = int(s)
+                bad_setting = False
+                if reason == "unreadable setting":
+                    reason, n, bad_setting = None, int(FINAL_NOTE_DEFAULT_MINUTES), True
+                    if str(raw_n).strip() == "":
+                        bad_setting = False
+                if reason is not None:
+                    self.kube.annotate(name, uid, **{FINAL_NOTE_MARK: "unreadable"})
+                    self.audit(worker, "pod/" + name, "final-note", self._cost_or_zero(pod), False, reason)
+                    continue
+                left = (end - now).total_seconds() / 60
+                if left > n or (end - began).total_seconds() / 60 < 2 * n:
+                    continue
+                if bad_setting:
+                    self.kube.annotate(name, uid, **{FINAL_NOTE_MARK: "sent"})
+                    self.send_note(name, FINAL_NOTE_TEXT)
+                    self.audit(worker, "pod/" + name, "final-note", self._cost_or_zero(pod), True, "minutes left: %d; unreadable setting, %d used" % (max(0, int(left)), n))
+                    continue
+                self.kube.annotate(name, uid, **{FINAL_NOTE_MARK: "sent"})
+                self.send_note(name, FINAL_NOTE_TEXT)
+                self.audit(worker, "pod/" + name, "final-note", self._cost_or_zero(pod), True, "minutes left: %d" % max(0, int(left)))
+            except Exception as e:
+                print("cloud-worker: the final note was not sent: %s" % self.kube.scrub(e, 120), file=sys.stderr)
 
     # -- the git token's renewal (one more step of the reaper's pass) --
     def renew_git_tokens(self, pods, now):
@@ -4606,6 +4669,7 @@ SETTINGS = (
     ("CW_STACK_MODEL_SECRET", False, "secret-name"),      # the NAME of the vault secret holding the stack-only model credential (a stack launch only); the name, never the value
     ("CW_CLUSTER_ADMIN_SECRET", False, "secret-name"),   # the NAME of the vault secret that holds the cluster administrator route (default cw-cluster-admin-kubeconfig), never its content
     ("CW_CLUSTER_TOKEN_DURATION", False, "duration"),    # the cluster token's requested life (default 20m)
+    ("CW_FINAL_NOTE_MINUTES", False, "number"),          # minutes before a worker's hard limit that it is told to send its final message (default 10)
     ("CW_HUB_CHANNEL_URL", False, "name"),         # the channel's address an orchestrator pod is told (default http://cloud-hub.cw.svc:8443/message); not a secret
     ("CW_HUB_REGISTRY_SECRET", False, "name"),     # the NAME of the hub's registry Secret in the cloud namespace (default cloud-hub-registry), never its content
     ("CW_STACK_REGISTRY", False, "registry-host"),  # the stack registry's host name (pull-only for a stack pod); all three CW_STACK_ keys are set together or not at all
@@ -4728,6 +4792,10 @@ def _duration_ok(value):
     return bool(m) and 1 <= int(m.group(1)) * (60 if m.group(2) == "h" else 1) <= 60
 
 
+def _minutes_ok(value):
+    return value.isascii() and value.isdigit() and 1 <= int(value) <= 60
+
+
 # THE table of value rules: one row per setting, the rule's words (shown in a refusal, never the value) and its test. DEFAULT-DENY: a setting with no
 # row is refused, and a test fails when SETTINGS and this table differ. Every value also refuses control characters (checked before this table).
 VALIDATORS = {
@@ -4754,6 +4822,7 @@ VALIDATORS = {
     "CW_STACK_MODEL_SECRET": ("a vault secret name: 1 to 127 letters, digits and hyphens, starting with a letter or digit", lambda v: bool(_VAULT_SECRET_NAME.fullmatch(v))),
     "CW_CLUSTER_ADMIN_SECRET": ("a vault secret name: 1 to 127 letters, digits and hyphens, starting with a letter or digit", lambda v: bool(_VAULT_SECRET_NAME.fullmatch(v))),
     "CW_CLUSTER_TOKEN_DURATION": ("a duration of 1 to 3 digits and m or h, from 1m to 60m (for example 20m or 1h)", _duration_ok),
+    "CW_FINAL_NOTE_MINUTES": ("a whole number of minutes from 1 to 60", _minutes_ok),
     "CW_HUB_CHANNEL_URL": ("an http or https URL: a host, an optional port, an optional one-segment path (/message), no user, query or fragment", lambda v: bool(re.fullmatch(r"https?://[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?(?::[0-9]{1,5})?(?:/[A-Za-z0-9._-]{0,64})?", v))),
     "CW_HUB_REGISTRY_SECRET": ("a Kubernetes name (lowercase letters, digits, - and .)", lambda v: bool(_SECRET_NAME.fullmatch(v))),
     "CW_STACK_REGISTRY": ("a lower-case registry host name ending in .azurecr.io: no scheme, path, port, user or IP address", _registry_host_ok),
