@@ -1,0 +1,1 @@
+| `comment_cursor.py` | 0 | the cursor file of the incremental comment reads: the newest comment held per consumer and repository (#1889) | |

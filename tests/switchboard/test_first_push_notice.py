@@ -192,7 +192,8 @@ def drive_launch(module, state):
                               stack=False, brief_file=None, idle=None, hard=None, role="coder", issue=None, charter=None, model=None, reasoning=None, brief=None, branch="feature", repo="acme/widget-api")
     engine = types.SimpleNamespace(now=lambda: BASE, discover=lambda at: types.SimpleNamespace(agents={}), config={"call_timeout_seconds": 5}, audit=None, actor="t")
     lib = types.SimpleNamespace(check_repo_preflight=lambda repo, env: "ok", CloudError=Exception, AGENTS=("worker",))
-    stubs = dict(use_settings=lambda: "test", check_allowed=lambda repo: None, _lib=lambda: lib, launcher_argv=lambda: ["x"], VaultRecovery=lambda *a: None,
+    stubs = dict(use_settings=lambda: "test", check_report_to=lambda *a, **k: None,   # the boss check has its own tests; this one pins the watch record
+                 check_allowed=lambda repo: None, _lib=lambda: lib, launcher_argv=lambda: ["x"], VaultRecovery=lambda *a: None,
                  Cluster=FakeCluster, model_entry=lambda: "m", git_token=lambda *a, **k: "t", run_launcher=lambda *a, **k: (0, {}, ""),
                  _read_password=lambda fd: "pw", _record_from_create=lambda n, b: {"runtime_id": "r1", "url": "https://pod.example"},
                  _write_private=lambda *a: None, save_record=lambda *a: None, load_record=lambda *a: None, _audit=lambda *a, **k: None,
