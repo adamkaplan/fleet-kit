@@ -192,11 +192,11 @@ class TestGhBodyRefusalIsPure(unittest.TestCase):
 
 class TestGhBodyMutants(unittest.TestCase):
     """S9: each mutant is applied once to a source copy, asserted applied, and fails the battery; the control passes it first."""
-    MUTANTS = (("gh", "the guard is not called", "or body_probe(args, gh, write, lookup)", "or None"),
+    MUTANTS = (("gh", "the guard is not called", "or body_probe(args, gh, write, lookup)", "or None", "not refused"),
                ("gh_body.py", "only the Intent heading is compared", "return bool(HEAD_RE.search(body)) and bool(DONE_RE.search(body))",
-                "return bool(HEAD_RE.search(body))"),
+                "return bool(HEAD_RE.search(body))", "not refused: --body without a part"),
                ("gh_body.py", "a failed read is read as a body with no parts", "    if data is None:\n        return UNREAD\n",
-                "    if data is None:\n        return None\n"))
+                "    if data is None:\n        return None\n", "an unreadable current body passed"))
 
     def run_with(self, name, source):
         rig = BodyRig(shim_source=source if name == "gh" else None, gh_body_source=source if name != "gh" else None)
@@ -204,13 +204,13 @@ class TestGhBodyMutants(unittest.TestCase):
         return battery(rig)
 
     def test_the_control_passes_and_each_mutant_fails_with_its_anchored_text(self):
-        for name, label, old, new in self.MUTANTS:
+        for name, label, old, new, text in self.MUTANTS:
             with self.subTest(mutant=label):
                 source = (SHIM_DIR / name).read_text()
                 self.assertEqual(self.run_with(name, source), [])   # the control
                 self.assertEqual(source.count(old), 1, label)
                 failures = self.run_with(name, source.replace(old, new, 1))
-                self.assertTrue(failures, label)
+                self.assertTrue(any(text in f for f in failures), (label, failures))
 
 
 if __name__ == "__main__":
