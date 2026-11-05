@@ -111,6 +111,7 @@ def _real_liveness():
     """The daemon's ONE liveness test, `cloud_record_live` (bin/switchboard/heavy_budget.py), as the tick passes it."""
     spec = importlib.util.spec_from_file_location("heavy_budget_2186", REPO / "bin" / "switchboard" / "heavy_budget.py")
     module = importlib.util.module_from_spec(spec)
+    module.datetime, module.timezone, module.CLOUD_LOAD_STALE_SECONDS = datetime.datetime, datetime.timezone, 1800   # the file is a fragment of the daemon's namespace
     spec.loader.exec_module(module)
     return lambda rec, name, at: module.cloud_record_live(rec, name, {}, {}, at)
 
