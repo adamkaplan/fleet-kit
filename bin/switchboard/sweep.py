@@ -269,6 +269,7 @@ def open_pages(read, repo=None):
 _UNSENT_DAY = {}   # #1886: repository -> the day its `open_list.cut_unsent` line was written (memory only: a restart may write one more; one entry per repository)
 _OPEN_CUTS = set()   # #1886: the repositories whose read of open items stopped at OPEN_LIST_PAGES in this pass (one entry per repository)
 COMMENT_WINDOW_PAGES = 30   # #1889: pages one comment read follows at most (3,000 comments); a window not read to its start is said once a day
+COMMENT_GAP_PAGES = 5   # #2192: pages one pass may read of a window's missing part, oldest first from the window's start, inside the pass's page budget
 _COMMENT_CUTS = {}   # #1889: (consumer, repository) -> (comments held, window days) of a comment window not read to its start, until the pass's daily alert (one entry per repository)
 
 
@@ -389,7 +390,7 @@ def sweep_read_repo(hub, repo, now, window_days, regex, budget, strong):
         names = {(l.get("name") if isinstance(l, dict) else l) for l in record.get("labels") or []}
         if number is not None and _is_pr(record) and not _issue_pr_merged(record) and _label_kind(names, CAPTAIN_MERGE_LABELS[:1] + CAPTAIN_HOLD_LABELS):   # #559: a merged PR is the daemon's to clean, never a finding
             closed_holds[number] = sorted(_label_kind(names, CAPTAIN_MERGE_LABELS[:1] + CAPTAIN_HOLD_LABELS))
-    comments, cut = hub.read_comments("sweep", repo, since, cap=COMMENT_WINDOW_PAGES)
+    comments, cut = hub.read_comments("sweep", repo, since, cap=COMMENT_WINDOW_PAGES, budget=budget)
     budget[0] -= sweep_pages_used(comments, cut)
     truncated = truncated or cut
     for comment in reversed(comments):  # oldest first, so the last N are the newest

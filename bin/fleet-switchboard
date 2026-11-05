@@ -11119,7 +11119,7 @@ class GitHubHub:
             if bounded and number >= (cap or GITHUB_PAGE_CAP):
                 return records, True
 
-    def read_comments(self, consumer, repo, since, cap):
+    def read_comments(self, consumer, repo, since, cap, budget=None):
         """#1889: the comments of `repo` created since `since`, newest first, as read_pages gave them, read incrementally. A first read (nothing held in memory
         or no cursor) follows the window to its start (at most `cap` pages); a later read asks since the newest comment held and merges the new ones into the held
         ones (bounded to the window). Returns (comments, truncated): truncated while the window has a part never read."""
