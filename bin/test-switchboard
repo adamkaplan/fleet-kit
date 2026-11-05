@@ -5368,7 +5368,7 @@ class TestLaunch(StandInPids, Base):
         self.assertEqual(self.registered()[str(wt)]["agent"], "worker")
         self.assertFalse([e for e in self.world.audit() if e["event"] == "worktree.registered" and e["subject"] == "other2"])
         for n in range(sb.WORKTREE_RECLAIM_MAX + 2):    # the cap is said, not silent
-            sb.register_worktree(self.world.state, "/nonexistent/w%02d" % n, "worker", None, "b", 1)
+            sb.register_worktree(self.world.state, str(self.add_worktree("w-cap%02d" % n)), "worker", None, "w-cap%02d" % n, 1)
         lines = sb.reclaim_for_agent(self.world.new_engine("cli"), subprocess.run, "worker", True)
         self.assertTrue(any("handled (cap %d)" % sb.WORKTREE_RECLAIM_MAX in l for l in lines), lines)
 
@@ -66914,6 +66914,7 @@ _changed_file_pages = importlib.import_module("test_changed_file_pages")
 _changed_file_pages.HOST = sys.modules[__name__]
 TestWholeReadOfALargePullRequest = _changed_file_pages.load()
 
+_rc = importlib.import_module("test_reclaim_cap"); _rc.HOST = sys.modules[__name__]; TestReclaimCap = _rc.build()   # #1737
 _lm = importlib.import_module("test_launch_model"); _lm.HOST = sys.modules[__name__]; TestLaunchModel = _lm.build(); TestLaunchModelCloud = _lm.build_cloud()   # #1642
 TestBodyCheck = importlib.import_module("test_body_check").TestBodyCheck   # #1476
 TestLaunchCapacity = importlib.import_module("test_launch_capacity").build()   # #1793
