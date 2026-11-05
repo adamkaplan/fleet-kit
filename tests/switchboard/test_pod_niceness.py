@@ -99,7 +99,7 @@ class TestPodNiceness(unittest.TestCase):
     def wrapper(self, env_more):
         """Run the real wrapper on a child that prints its niceness and the slot record it can see; return (niceness, record count while running)."""
         env = dict(os.environ, XDG_STATE_HOME=str(self.home), PATH=os.environ["PATH"])
-        for key in ("FLEET_HEAVY_SLOT", "FLEET_HEAVY", "CI", "CW_AUDIT_RUNTIME_ID", "CW_HARD_DEADLINE"):
+        for key in ("FLEET_HEAVY_SLOT", "FLEET_HEAVY", "CI", "CW_AUDIT_RUNTIME_ID", "CW_HARD_DEADLINE", sb.UNDER_TEST_ENV):   # the slot wrapper reads the daemon's own config by design: it is not a test, so the guard marker is not passed to it
             env.pop(key, None)
         env.update(env_more)
         stub = self.home / "nobin"

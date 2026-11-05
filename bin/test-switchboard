@@ -42367,6 +42367,8 @@ class TestLaunchRefusedMessage(TestLaunchMemoryGate):
             text = "".join(consts) + " " + ast.get_source_segment(source, node)
             if not re.search("created", text, re.I):
                 continue
+            if re.search(r"nothing was created", text):   # a refusal that says nothing was created is a before-the-pod text by its own words: the property, not a list of sites
+                continue
             if sb.LAUNCH_AFTER_CREATED.search(text.replace("%s ", "")) or sb.LAUNCH_AFTER_CREATED.search(ast.get_source_segment(source, node)):
                 continue
             if (consts[0] if consts else "")[:30] in self.CREATED_EXEMPT:
@@ -55597,7 +55599,7 @@ class TestJobEndRecord(StandInPids, unittest.TestCase):
     def setUp(self):
         self.root = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, str(self.root), True)
-        patcher = mock.patch.dict(os.environ, {sb.JOBS_DIR_ENV: str(self.root)})
+        patcher = mock.patch.dict(os.environ, {sb.JOBS_DIR_ENV: str(self.root), "XDG_STATE_HOME": str(self.root / "xdg-state"), "XDG_CONFIG_HOME": str(self.root / "xdg-config")})
         patcher.start()
         self.addCleanup(patcher.stop)
         self.procs, self.pids, self.audited = {}, [], []
