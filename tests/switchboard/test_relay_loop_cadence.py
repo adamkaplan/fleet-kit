@@ -337,9 +337,9 @@ class TrickleHub(unittest.TestCase):
         self.assertEqual([(k, d["error"]) for k, _, d in notes], [("relay.pass_cut", "relay pass cut")])
 
     def test_mutant_without_the_total_deadline_is_caught(self):
-        # the join cut removed from the REAL code (a string mutant, like the neighbouring tests): the pass is still running after 3 s
+        # the join cut removed from the REAL code (a string mutant, like the neighbouring tests): the pass is still running after 2 s (the cut is at 1 s)
         mod = load_backend_module(*self.STRETCH[0], extra=self.STRETCH[1:] + (("worker.join(READ_DEADLINE)", "worker.join()"),))
-        done, _, notes = self.one_pass(mod, 1.0, 3.0)
+        done, _, notes = self.one_pass(mod, 1.0, 2.0)
         self.assertFalse(done)
         self.assertEqual(notes, [])
 
@@ -350,8 +350,10 @@ class HubFilesUnchanged(unittest.TestCase):
     def test_wait_is_30_and_the_copies_match(self):
         import cloud_relay
         self.assertEqual(cloud_relay.WAIT, 30)
-        copy = BIN.parent / "cloud" / "worker" / "bin" / "cloud_relay.py"
-        self.assertEqual(copy.read_bytes(), (BIN / "cloud_relay.py").read_bytes())
+        for line in (BIN.parent / "cloud" / "worker" / "copies.tsv").read_text().splitlines():
+            source, copy = line.split("\t")
+            if source == "bin/cloud_relay.py":
+                self.assertEqual((BIN.parent / copy).read_bytes(), (BIN.parent / source).read_bytes())
         for other in (BIN.parent / "cloud" / "worker" / "bin").glob("*.py"):
             if (BIN / other.name).exists():
                 self.assertEqual(other.read_bytes(), (BIN / other.name).read_bytes(), other.name)

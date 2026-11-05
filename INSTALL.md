@@ -212,6 +212,10 @@ PROVES:  the agent resolves by name. An unknown-agent error (Copilot) or no matc
          (opencode) means it did not install.
 ```
 
+A tester agent has a line with the role `tester` in `agents/roles.tsv` (its name, a TAB, its roles separated by commas). `fleet-switchboard launch --role tester` reads that file
+from `agents/` of the switchboard's own checkout, not from the copies installed above, so the merge alone puts it in force. It refuses an agent whose line lacks `tester` (one line
+on standard error naming the agent and the allowed agents, exit 2, nothing started) and, when the file cannot be read or names no tester, says to run from the checkout.
+
 `opencode --version` tells the generations apart. v1 prints a bare `1.x.y`, and
 v2 prints `opencode v2.x.y`. `./bin/fleet-doctor` classifies it on its
 `dispatch` line.
