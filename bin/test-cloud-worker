@@ -20,6 +20,7 @@ import signal
 import subprocess
 import sys
 import time
+import types
 import tempfile
 import threading
 import unittest
@@ -1794,6 +1795,51 @@ class TestNeedsDocker(Base):   # #1488
         failing = int(done.returncode != 0 and "AssertionError" in done.stderr + done.stdout)   # the refusal case sees exit 0: the pod was launched
         print("%d of 1 mutants failing" % failing)
         self.assertEqual(failing, 1, done.stdout + done.stderr)
+
+
+class TestCloudReaderRecordHoldsTheRequiredChecks(Base):   # #2203 follow-on: a CLOUD reader's launch carries the brief's list in its session's fleet metadata
+    CHECKS = ["production-mutant sample", "restart test"]
+    BRIEF = "CLOUD REVIEWER. PR #5.\n\nREQUIRED CHECKS:\n" + "".join("- %s\n" % c for c in CHECKS) + "\n- outside line\n"
+    GUARD = 'H["brief_required_checks"](brief))'
+    ANCHOR = "a cloud reader's launch keeps the list"
+
+    def reader_fleet(self, brief):
+        (self.home / "brief.txt").write_text(brief)
+        code, out, err = self.main("launch", "rev9", "--cloud", "--agent", "coder", "--repo", "acme-org/widget-service", "--branch", "main", "--role", "reviewer",
+                                   "--reports-to", "orch", "--brief-file", str(self.home / "brief.txt"))
+        self.assertEqual(code, 0, err)
+        return [b["metadata"]["fleet"] for m, path, b in self.remote.bodies if m == "POST" and path == "/api/session"][0]
+
+    def note(self, fleet, body):
+        item = sb.GitHubItem("github.reviewcomment:1", "github.comment", "base", "o/r", [], [], "bob", 1.0, [10], True)
+        item.review_signer, item.review_body = "rev9", body
+        agents = {"rev9": types.SimpleNamespace(fleet=fleet)}   # discovery reads the session's metadata.fleet, keyed by its name
+        sb.GitHubHub._review_checks_note(types.SimpleNamespace(_audit=lambda *a: None), item, agents)
+        return item.summary
+
+    def test_cloud_reader_comment_missing_a_check_gets_the_missing_sentence(self):
+        fleet = self.reader_fleet(self.BRIEF)
+        self.assertEqual(fleet.get("required_checks"), self.CHECKS, self.ANCHOR)
+        summary = self.note(fleet, "Review of %s: APPROVE\nproduction-mutant sample: 3 of 3 killed\n" % ("a" * 40))
+        self.assertIn("restart test", summary.split("issing", 1)[-1], self.ANCHOR)
+        self.assertNotIn("production-mutant sample", summary.split("issing", 1)[-1])
+
+    def test_cloud_reader_with_no_block_has_no_key(self):
+        self.assertNotIn("required_checks", self.reader_fleet("Review it.\n- not a block\n"))
+
+    def test_a_cloud_record_without_the_key_is_caught(self):
+        src = (BIN / "cloud_worker.py").read_text()
+        self.assertEqual(src.count(self.GUARD), 1)
+        scratch = Path(tempfile.mkdtemp(prefix="checks-mutant-", dir=str(self.home)))   # a copy outside the repository
+        shutil.copytree(str(BIN), str(scratch / "bin"), ignore=shutil.ignore_patterns("__pycache__"))
+        shutil.copytree(str(BIN.parent / "cloud"), str(scratch / "cloud"), ignore=shutil.ignore_patterns("__pycache__"))
+        name = "TestCloudReaderRecordHoldsTheRequiredChecks.test_cloud_reader_comment_missing_a_check_gets_the_missing_sentence"
+        control = subprocess.run([sys.executable, str(scratch / "bin" / "test-cloud-worker"), name], capture_output=True, text=True, timeout=600)
+        self.assertEqual(control.returncode, 0, control.stdout + control.stderr)   # the control passes first
+        (scratch / "bin" / "cloud_worker.py").write_text(src.replace(self.GUARD, "None)"))
+        done = subprocess.run([sys.executable, str(scratch / "bin" / "test-cloud-worker"), name], capture_output=True, text=True, timeout=600)
+        self.assertNotEqual(done.returncode, 0, "the mutant survived")
+        self.assertIn(self.ANCHOR, done.stdout + done.stderr)
 
 
 class TestKeptRetireNamesTheSave(Base):   # #1791
