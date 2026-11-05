@@ -22780,6 +22780,8 @@ class TestSweep(Base):
         ("ci", "ci is None", {"ci": None}, {}, "not ready"),
         ("ci", "ci is absent", {"ci": KeyError}, {}, "not ready"),
         ("ci", "ci says none", {"ci": "none"}, {}, "not ready"),
+        ("ci_line", "the run is stale", {"ci_line": "stale: 3 commits behind", "ci": "stale: 3 behind"}, {}, "not ready"),
+        ("base_ref", "no base branch name: not a gate input", {"base_ref": None}, {}, "ready"),
         ("legs", "a macOS leg is not green (failed, absent, skipped, cancelled or in progress)", {"legs": sb.load_module("merge_gate").judge_legs({"test (ubuntu-latest)": "success", "test (macos-latest)": "failure"}, False)}, {}, "not ready"),
         ("legs", "a macOS leg is skipped", {"legs": sb.load_module("merge_gate").judge_legs({"test (ubuntu-latest)": "success", "test-cloud (ubuntu-latest)": "success", "test (macos-latest)": "success", "test-cloud (macos-latest)": "skipped"}, False)}, {}, "not ready"),
         ("legs", "the macOS legs are absent", {"legs": sb.load_module("merge_gate").judge_legs({"test (ubuntu-latest)": "success", "test-cloud (ubuntu-latest)": "success"}, False)}, {}, "not ready"),
@@ -29006,6 +29008,7 @@ class LedgerBase(Base):
         self.comments = []
         self.pr = {"title": "Add it", "state": "OPEN", "headRefOid": LEDGER_HEAD, "reviewDecision": "", "author": {"login": "shared"},
                    "body": "PLAN: acme/app#7\ncanon: updated the docs", "labels": [], "reviews": [], "comments": [],
+                   "baseRefName": "main",
                    "statusCheckRollup": [{"conclusion": "SUCCESS", "status": "COMPLETED"}]}
         self.gh_down = False
         self.configure()
@@ -29018,6 +29021,8 @@ class LedgerBase(Base):
         raw["plan_evaluators"] = evaluators if evaluators is not None else {
             "reviewer": ["rev"], "tester": ["tst"], "owner": ["own"], "ci": ["cibot"]}
         self.write_config(raw)
+
+    run_base = "t" * 40   # #1755: the base the fake's run list records; a test sets another to make the run stale
 
     def route(self, argv, **kwargs):
         if argv[0] != FAKE_GH:
@@ -29033,6 +29038,14 @@ class LedgerBase(Base):
             return subprocess.CompletedProcess(argv, 0, json.dumps(self.comments if "&page=1" in path else []), "")
         if re.search(r"/issues/7$", path):
             return subprocess.CompletedProcess(argv, 0, json.dumps(self.plan_issue), "")
+        if "/actions/runs" in path:
+            run = {"id": 1, "head_sha": self.pr["headRefOid"], "status": "completed", "conclusion": "success",
+                   "pull_requests": [{"number": n, "base": {"sha": self.run_base}} for n in (9, 11, 12)]}
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"workflow_runs": [run]}), "")
+        if "/git/ref/heads/" in path:
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"object": {"sha": "t" * 40}}), "")
+        if "/compare/" in path and path.endswith("..." + "t" * 40):
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"ahead_by": 3}), "")
         if path.endswith("/merge") and "/commits/refs/pull/" in path:   # a fresh merge ref: its first parent is the base's head (#2091)
             return subprocess.CompletedProcess(argv, 0, json.dumps([{"sha": "b" * 40}, {"sha": self.pr["headRefOid"]}]), "")
         if re.search(r"/pulls/\d+$", path):
@@ -31387,6 +31400,13 @@ class TestPlanGatesCheck(LedgerBase):
         (event,) = self.events("gate.would_refuse")
         self.assertIn("G1", event["detail"]["failed"])
         self.assertEqual(self.events("gate.refused"), [])
+
+    def test_a_stale_run_makes_g4_missing_with_the_stale_line(self):   # #1755; the control is the test below (the default run_base is the tip: it allows)
+        self.all_proven()
+        self.run_base = "s" * 40
+        row = next(r for r in json.loads(self.run_as("coder", "gates", self.PR, "--json")[1])["gates"] if r["gate"] == "G4")
+        self.assertEqual(row["status"], "missing", "the G4 row is missing for a stale run")
+        self.assertEqual(row["missing"], ["stale: 3 commits behind (CI ran on ssssssss, the tip is tttttttt): close and reopen the pull request for a fresh run"], "the G4 row says the stale line")
 
     def test_enforce_refuses_with_exit_10_and_names_the_gates(self):
         self.set_gates({"acme/app": {"mode": "enforce"}})
@@ -39034,6 +39054,14 @@ class TestCiRecordPass(LedgerBase):
         self.assertEqual(self.verdicts(), [("acme/app#9", "S1", "switchboard", LEDGER_HEAD), ("acme/app#9", "U1", "switchboard", LEDGER_HEAD)])
         (event,) = self.events("gate.ci_record")
         self.assertEqual((event["detail"]["ok"], event["detail"]["recorded"]), (True, ["S1", "U1"]))
+
+    def test_a_stale_run_records_no_verdict_and_says_the_stale_line(self):   # #1755; the control is the test above (the default run_base is the tip: it records)
+        self.run_base = "s" * 40
+        self.go()
+        self.assertEqual(self.verdicts(), [], "ci-record records no verdict for a stale run")
+        code, out, err = self.run_as("coder", "gates", "ci-record", self.PR)
+        self.assertIn("stale: 3 commits behind (CI ran on ssssssss, the tip is tttttttt): close and reopen the pull request for a fresh run", out + err, "ci-record says the stale line")
+        self.assertEqual(self.verdicts(), [], "ci-record records no verdict for a stale run")
 
     def test_a_pr_whose_checks_are_running_is_recorded_within_five_minutes_of_going_green(self):
         self.pr["statusCheckRollup"] = [{"status": "IN_PROGRESS", "conclusion": ""}]
@@ -50907,6 +50935,12 @@ class TestPrNotices(DecisionsBase):
         self.assertEqual((entry["headline"], entry["ci"], entry["additions"]), ("api#7 Add the parser", "green", 120))
         self.assertIn("(stale)", " ".join(sb.facts_text(entry).split()) + " (stale)")
 
+    def test_a_stale_run_reads_stale_in_the_pull_request_notice(self):   # #1755; the control is test_a_failed_read_keeps_the_last_facts_marked_stale_and_never_drops_the_notice above (the default run_base is the tip: ci is green)
+        self.gh.run_base = "s" * 40
+        self.notify()
+        (entry,) = self.notices()
+        self.assertEqual(entry["ci"], "stale: 3 behind", "the pull request notice reads stale: 3 behind")
+
     def test_a_failure_before_any_read_still_lists_the_notice_without_facts(self):
         self.gh.answers[7] = (1, "", "HTTP 404")
         self.notify()
@@ -51435,6 +51469,8 @@ class BaselineWorld(WriteWorld):
     """The Chief of Staff, two orchestrators and their coders (TierWorld), a fake gh with labels, comments and PRs,
     and the fake v2. Every observation goes through the CLI or a file."""
 
+    run_base = "t" * 40   # #1755: the base the fake's run list records; a test sets another to make the run stale
+
     def setUp(self):
         super().setUp()
         self.prs = {}
@@ -51448,6 +51484,13 @@ class BaselineWorld(WriteWorld):
             if self.prs[int(argv[3])] is None:
                 return subprocess.CompletedProcess(argv, 1, "", "HTTP 502 boom")
             return subprocess.CompletedProcess(argv, 0, self.prs[int(argv[3])], "")
+        if argv[0] == FAKE_GH and argv[1] == "api" and "/actions/runs" in argv[2]:
+            run = {"id": 1, "head_sha": re.search(r"head_sha=(\w+)", argv[2]).group(1), "status": "completed", "conclusion": "success", "pull_requests": [{"number": n, "base": {"sha": self.run_base}} for n in self.prs]}
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"workflow_runs": [run]}), "")
+        if argv[0] == FAKE_GH and argv[1] == "api" and "/git/ref/heads/" in argv[2]:
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"object": {"sha": "t" * 40}}), "")
+        if argv[0] == FAKE_GH and argv[1] == "api" and argv[2].endswith("..." + "t" * 40):
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"ahead_by": 3}), "")
         return super().route(argv, **kwargs)
 
     def who(self, name):
@@ -52576,6 +52619,15 @@ class TestDecisionBaselineNotices(BaselineWorld):
         steps["merged: its record is forgotten"] = json.loads((self.world.state / "pr-notices.json").read_text())
         steps["status line"] = [self.scrub(l) for l in self.cmd("you", "status")["out"].splitlines() if l.startswith("      decisions")]
         baseline_golden(self, "notices", steps)
+
+    def test_a_stale_run_reads_stale_in_the_notice_facts(self):   # #1755; the control is test_a_notice_its_facts_and_its_life above (the default run_base is the tip: its golden reads "green")
+        self.run_base = "s" * 40
+        self.prs[7] = pr_view_json()
+        self.step("api-coder", "notice", "pr", "acme/api#7", "ready", "for", "review")
+        self.daemon_pass()
+        (notice,) = [d for d in self.file_body()["decisions"] if d["kind"] == "notice"]
+        self.assertEqual(json.dumps(notice).count("stale: 3 behind"), 1, "the panel notice facts read stale: 3 behind")
+        self.assertNotIn('"ci": "green"', json.dumps(notice), "the panel notice facts do not read green")
 
     def test_a_malformed_notices_file_is_an_error_entry_and_the_rest_still_lists(self):
         self.say("api-orch", "question", "Which database?")
@@ -66991,6 +67043,7 @@ TestNewTestChecksRules, TestNewTestChecksFiles, TestNewTestChecksInPreflightPr, 
 
 TestShimGuardsTool, TestShimGuardRows, TestShimHygienePlanted, TestShimGuardMutants, TestShimGuardDocs = (_sg := importlib.import_module("test_shim_guards")).TestShimGuardsTool, _sg.TestShimGuardRows, _sg.TestShimHygienePlanted, _sg.TestShimGuardMutants, _sg.TestShimGuardDocs   # #1909
 TestPlanningDecision, TestConcurrencyGroup, TestGateLegs, TestGatePass, TestPlatformPaths, TestMacDocs = (_ml := importlib.import_module("test_mac_legs")).TestPlanningDecision, _ml.TestConcurrencyGroup, _ml.TestGateLegs, _ml.TestGatePass, _ml.TestPlatformPaths, _ml.TestDocs
+TestCiStateDecision, TestCiFreshReaders, TestCiFreshUnreadable, TestCiFreshOptOut, TestCiFreshReads, TestCiFreshRefusalAndEvidence, TestCiFreshDocs, TestCiFreshReadMutants, TestCiFreshSeamMutants = (_cf := importlib.import_module("test_ci_fresh")).TestCiStateDecision, _cf.TestCiFreshReaders, _cf.TestCiFreshUnreadable, _cf.TestCiFreshOptOut, _cf.TestCiFreshReads, _cf.TestCiFreshRefusalAndEvidence, _cf.TestCiFreshDocs, _cf.TestCiFreshReadMutants, _cf.TestCiFreshSeamMutants   # #1755
 _el = importlib.import_module("test_evidence_limit"); _el.HOST = sys.modules[__name__]; TestEvidenceLimitLocal, TestEvidenceLimitItems, TestEvidenceLimitCounting, TestEvidenceLimitRelay, TestEvidenceLimitMutants, TestEvidenceLimitUnchanged, TestEvidenceLimitItemCi, TestEvidenceLimitDocsAndCode = _el.build()   # #1901
 TestPlatformClassList = importlib.import_module("test_platform_classes").TestPlatformClassList
 
@@ -77929,6 +77982,13 @@ class TestCiRecordCarry(LedgerBase):
                 body = {"default_branch": "main"}
             elif "/compare/main..." in path:
                 body = {"status": "behind"}
+            elif "/actions/runs" in path:
+                body = {"workflow_runs": [{"id": 1, "head_sha": self.pr["headRefOid"], "status": "completed", "conclusion": "success",
+                                           "pull_requests": [{"number": n, "base": {"sha": self.run_base}} for n in (9, 11)]}]}
+            elif "/git/ref/heads/" in path:
+                body = {"object": {"sha": "t" * 40}}
+            elif path.endswith("..." + "t" * 40):
+                body = {"ahead_by": 3}
             else:
                 return subprocess.CompletedProcess(argv, 1, "", "gh: Not Found (HTTP 404)")
             return subprocess.CompletedProcess(argv, 0, json.dumps(body), "")
@@ -77960,6 +78020,17 @@ class TestCiRecordCarry(LedgerBase):
         self.assertEqual({(c["old_head"], c["new_head"]) for c in lines}, {(LEDGER_HEAD, self.NEW)})
         self.assertEqual(sorted(c["scenario"] for c in lines), ["S2", "S2", "S3"])
         self.assertEqual(out.count("carried proof #"), 3)
+
+    def test_a_stale_run_carries_nothing_and_prints_the_stale_line(self):   # #1755; the control is test_S1 above (the default run_base is the tip: one carried line per proof)
+        self.run_base = "s" * 40
+        self.proofs()
+        before = self.ledger_bytes()
+        code, out, err = self.step()
+        self.assertEqual(code, 2, "a stale run carries no proof: exit code: " + err)   # the step records nothing for a stale run and exits 2
+        self.assertEqual(self.carried(), [], "a stale run carries no proof: carried lines")
+        self.assertIn("commits behind", out + err, "the stale line is printed: the count")
+        self.assertIn("close and reopen the pull request for a fresh run", out + err, "the stale line is printed: the way to a fresh run")
+        self.assertEqual(self.ledger_bytes(), before, "the ledger bytes are unchanged")
 
     def test_S2_a_tests_and_documentation_only_head_carries(self):
         self.proofs(files=("src/widget.py",))
