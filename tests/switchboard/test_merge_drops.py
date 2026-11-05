@@ -91,6 +91,25 @@ class TestMergeDrops(MergeDropsBase):
         self.commit("the change")
         self.assertEqual(self.run_cmd()[0], 0)
 
+    def test_a_branch_behind_a_tip_that_reindents_and_moves_lines_is_clean(self):
+        git(self.dir, "checkout", "-q", "-b", "pr")
+        self.write("other.py", "keep one\nkeep two\nown addition\n")
+        self.commit("the change")
+        git(self.dir, "checkout", "-q", "integration")
+        self.write("app.py", "    line 1\n" + "".join("line %d\n" % n for n in range(3, 11)) + "line 2\n")
+        self.commit("tip re-indents and moves")
+        self.assertEqual(self.run_cmd(), (0, []))
+
+    def test_a_conflicting_merge_says_resolve_first(self):
+        git(self.dir, "checkout", "-q", "-b", "pr")
+        self.write("app.py", "mine\n")
+        self.commit("mine")
+        git(self.dir, "checkout", "-q", "integration")
+        self.write("app.py", "theirs\n")
+        self.commit("theirs")
+        code, out = self.run_cmd()
+        self.assertEqual((code, out), (2, ["conflicts, resolve first"]))
+
     def test_u1_a_merge_that_keeps_the_tip_whole_is_not_refused(self):
         self.tip_moves()
         git(self.dir, "checkout", "-q", "-b", "pr", "integration~1")

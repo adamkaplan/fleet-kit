@@ -20105,16 +20105,30 @@ def _diff_lines(runner, git_dir, a, b, sign):
     return found
 
 
+class MergeDropsConflict(Exception):
+    pass
+
+
 def merge_drops(runner, git_dir, tip, head):
     """The hunks `head` drops from `tip`: [(file, first line number, last line number, first line text)], and the merge commit messages of `tip..head`.
     A dropped line is a '-' line of `git diff tip head` that is not among the '-' lines of the branch's own non-merge commits (the pull request's own removals, by file and content)
     and not a '+' line of `git diff merge-base tip` (the tip's newer lines)."""
-    base = _git_out(runner, git_dir, ["merge-base", tip, head]).strip()
-    own = set()   # the removals of the branch's own (non-merge) commits: the three-dot diff is useless once the tip is merged in (the merge base is then the tip itself)
+    done = runner(["git", "-C", str(git_dir), "merge-tree", "--write-tree", head, tip], capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
+    if done.returncode == 1:
+        raise MergeDropsConflict("conflicts, resolve first")
+    if done.returncode != 0:
+        raise OSError("git merge-tree failed: %s" % _one_line(done.stderr or "", 120))
+    tree = (done.stdout or "").split("\n")[0].strip()
+    own = collections.Counter()   # the PR's own removals (three-dot), per (file, stripped line); from the branch's non-merge commits, as the three-dot diff is empty once the tip is merged in
     for commit in _git_out(runner, git_dir, ["rev-list", "--no-merges", "%s..%s" % (tip, head)]).split():
-        own.update((f, t) for f, _, t in _diff_lines(runner, git_dir, commit + "^", commit, "-"))
-    newer = {(f, t) for f, _, t in _diff_lines(runner, git_dir, base, tip, "+")}
-    dropped = [d for d in _diff_lines(runner, git_dir, tip, head, "-") if (d[0], d[2]) not in own and (d[0], d[2]) not in newer]
+        own.update((f, t.strip()) for f, _, t in _diff_lines(runner, git_dir, commit + "^", commit, "-"))
+    dropped = []
+    for d in _diff_lines(runner, git_dir, tip, tree, "-"):   # the tip's lines the merge result lacks
+        key = (d[0], d[2].strip())
+        if own[key] > 0:
+            own[key] -= 1
+        else:
+            dropped.append(d)
     hunks = []
     for name, number, text in dropped:
         if hunks and hunks[-1][0] == name and hunks[-1][2] + 1 == number:
@@ -20147,6 +20161,9 @@ def add_merge_drops_parsers(sub):
 def cmd_merge_drops(args, runner, now):
     try:
         hunks, messages = merge_drops(runner, args.git_dir, args.tip, args.branch)
+    except MergeDropsConflict:
+        print("conflicts, resolve first")
+        return EXIT_USAGE
     except (OSError, subprocess.SubprocessError) as err:
         raise LedgerCommandError("merge-drops: %s" % _one_line(str(err), 200)) from None
     bad = merge_drops_unnamed(hunks, messages)
@@ -20175,7 +20192,7 @@ def merge_drops_refusal(runner, config, repo, number, state):
             _git_out(runner, ".", ["init", "--bare", "-q", str(git_dir)])
         _git_out(runner, git_dir, ["fetch", "-q", "https://github.com/%s.git" % repo, "+refs/heads/%s:refs/tips/base" % base, "+refs/pull/%d/head:refs/tips/head" % number])
         hunks, messages = merge_drops(runner, git_dir, "refs/tips/base", "refs/tips/head")
-    except (OSError, subprocess.SubprocessError):
+    except (MergeDropsConflict, OSError, subprocess.SubprocessError):
         return None
     bad = merge_drops_unnamed(hunks, messages)
     if not bad:
