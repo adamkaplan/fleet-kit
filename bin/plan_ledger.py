@@ -115,6 +115,14 @@ def clip(text, limit=FIELD_LIMIT):
     return text if len(text) <= limit else text[:limit - 1] + "\u2026"
 
 
+def bounded_text(text, limit, what):
+    """`text` with white space collapsed as `clip` does; over `limit` it is REFUSED (LedgerError), never cut."""
+    text = " ".join(str(text or "").split())
+    if len(text) > limit:
+        raise LedgerError("the %s is %d characters and the limit is %d: nothing was recorded; put the long text in one comment or a file and give the link, or shorten it" % (what, len(text), limit))
+    return text
+
+
 def read_ledger(state_dir):
     """(entries, problem): every line parsed, and None when the chain holds, else a sentence naming the first break
     (the entries before it are still returned: they are intact, the ones from the break on are not trusted)."""
@@ -675,7 +683,7 @@ def scenario_state(scenario, entries, pr, plan_hash, head, authors):
         if not newest and mine:
             why = "plan changed" if mine[-1].get("plan_hash") != plan_hash else "head moved"
             out["void"].append("%s #%d void: %s" % (kind if kind == "proof" else evaluator + " verdict", mine[-1]["seq"], why))
-        out[kind] = None if not newest else {"seq": newest["seq"], "result": newest["result"], "by": newest.get("by"),
+        out[kind] = None if not newest else {"seq": newest["seq"], "result": newest["result"], "by": newest.get("by"), "right": newest.get("right"),
                                                                                     "evidence": newest.get("evidence"), "ts": newest.get("ts")}
     proof, verdict = out["proof"], out["verdict"]
     if not proof:
@@ -1077,6 +1085,17 @@ def impact_rating_line(rating, head):
     return "impact rating at %s: recorded by role %s; recorded, not counted as the independent rating" % (at, rating.get("role") or "unrecorded")
 
 
+def verdict_lines(report):
+    """#1869: one line per tester or reviewer verdict the report counts: `verdict: <id>: <evaluator> verdict #<seq> by <name>, <right>`; a verdict recorded
+    before the right was kept says `source not recorded`."""
+    out = []
+    for s in report.get("scenarios", []):
+        v = s.get("verdict")
+        if v and s.get("evaluator") in ("tester", "reviewer"):
+            out.append("verdict: %s: %s verdict #%s by %s, %s" % (s["id"], s["evaluator"], v["seq"], v.get("by"), v.get("right") or "source not recorded"))
+    return out
+
+
 def render_gates(report, pr):
     """The lines `gates` prints."""
     if report.get("enforced"):
@@ -1105,6 +1124,7 @@ def render_gates(report, pr):
         for view in s.get("carried") or ():   # #1129: a carried proof is shown with the head it was recorded at
             lines.append("  %s: carried: row #%d recorded at %s, held here by carried line #%d" % (s["id"], view["proof"], str(view["original_head"])[:8], view["carried_line"]))
     lines.extend("  proof: %s" % l for l in report.get("head_lines") or ())   # #1405: per scenario, proven / carried / void by a named file
+    lines.extend("  %s" % l for l in verdict_lines(report))   # #1869: the seat of each tester or reviewer verdict counted, and where its right came from
     rating = report.get("impact_rating")
     if isinstance(rating, dict):
         lines.append("  " + impact_rating_line(rating, report.get("head")))

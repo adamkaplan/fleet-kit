@@ -366,6 +366,7 @@ DEFAULTS = {
     "launch_default": "headless",   # #433: what a plain `launch` starts: "headless" (no terminal) or "terminal" (a herdr tab)
     "send_to_working": "steer",     # a boss's `send` to a working agent: "steer" (its next safe point) or "queue" (after its turn)
     "steer_after_minutes": 0,       # #1540: 0 = off; else a turn longer than this many minutes takes a peer `send` and a reminder as `steer` too
+    "unconsumed_steer_minutes": 20,   # #1844: 0 = off; a delivered queue-mode message the lane has not consumed after this many minutes is steered into the running turn
     "engaged_minutes": 10,
     "retire_idle_minutes": 10,     # `retire --close`: a pane herdr reads as working is closed without --force only when its session has had no turn and no activity this long
     "call_timeout_seconds": 20,
@@ -414,6 +415,8 @@ DEFAULTS = {
     "cos_orders_file": None,        # PR 18: the Chief of Staff's own standing orders, an absolute path; None means standing-orders.md beside config.json
     # PR 15: many repos, one fleet. "owner/repo" or "owner/*" -> the gh account whose token that repo uses
     "gh_users": {},
+    "github_stage_repos": [],  # #1575: "owner/repo" names whose pull-request comment may carry a stage event (empty: none does)
+    "github_stage_bots": [],   # #1575: the logins (for example github-actions[bot]) whose comment may carry a stage event (empty: none does)
     "github_bot_logins": [],  # the cloud readers' bot account(s), each a fleet identity besides the `gh_users` accounts (at most 10); none by default
     "intent_live_silence_minutes": 10,  # #367: a live forwarder whose last event (or start) is older than this does not get the long intent trust (0 = always trusted, as before)
     "github_poll_seconds": 60,  # PR 15: how often a repo without a forwarder is read (the catch-up read, on a poll)
@@ -2557,6 +2560,9 @@ class Switchboard:
         self.request_keys = None        # PR 18: "<session>:<request id>" of every request pending at the last derivation
         self.gh_runner = None           # PR notices: the runner for `gh pr view` (None: subprocess.run)
         self.stopped_news_errors = set()  # reasons already audited: one line per distinct failure
+        self.unconsumed_seen = collections.OrderedDict()    # #1844: inbox ids whose steer was tried (bounded): at most one try per item
+        self.reminder_memory = collections.OrderedDict()    # #1844: "reminder:<id>" -> (dedupe key, from, to) of a reminder delivered by THIS process (bounded; empty after a restart)
+        self.record_loaded, self.record_errors = False, set()   # #1844: the persisted record is read at first use; reasons already audited
         self.stopped_news = {}          # #96: worker.stopped key -> judged clearly no news (decided once per note)
         self.awaiting_held_links = True        # #796: cleared by the first load tick whose held-PR links were all whole (it lapses after HELD_LINKS_WAIT_SECONDS)
         self.awaiting_first_full_pass = True   # #796: set False once a pass has published a non-provisional decisions file; the load tick judges nothing before
@@ -2859,11 +2865,26 @@ class Switchboard:
         return fresh, None
 
     def _acknowledge(self, keys):
-        """Tell the fact sources that hold items in memory (GitHub, PR 5) which keys are delivered."""
+        """Tell the fact sources that hold items in memory (GitHub, PR 5) which keys are delivered.
+        After `_record_told` the keys are acknowledged for that recipient (#1437), once."""
+        recipient, self._told_for = getattr(self, "_told_for", None), None
         for source in self.sources:
             acknowledge = getattr(source, "acknowledge", None)
-            if acknowledge is not None:
+            if acknowledge is None:
+                continue
+            if recipient is not None and getattr(source, "told", None) is not None:
+                acknowledge(keys, recipient)
+            else:
                 acknowledge(keys)
+
+    def _record_told(self, keys, recipient):
+        """#1437: the durable once-per-recipient record, written BEFORE _acknowledge (the held payload still names the edit);
+        the next _acknowledge is for this recipient."""
+        self._told_for = recipient
+        for source in self.sources:
+            told = getattr(source, "told", None)
+            if told is not None:
+                told(keys, recipient)
 
     def charter_repo(self, observation):
         """PR 17: the repo an agent's charter is in: its own `repo`, else the intent repo."""
@@ -2995,6 +3016,7 @@ class Switchboard:
                 return decide(recipient, facts, None, now, self.batch_seconds, self.engaged_seconds,
                               "cannot read what %s already has: %s" % (recipient, err))
             pending = [fact for fact in facts if fact.key not in delivered]
+            self._record_told(delivered, recipient)
             if self.sent is not None and len(pending) != len(facts):   # the ledger answered (v2_light)
                 self._note("resend.skipped", recipient, {"why": "the key was already delivered to this session (sent-keys ledger)",
                                                          "keys": sorted(fact.key for fact in facts if fact.key in delivered)})
@@ -3089,7 +3111,7 @@ class Switchboard:
         else:
             plan = copy.copy(plan)
             plan.pending = kept
-        pending = merge_wake_facts(plan.recipient, plan.pending)   # #1275: the sweep, triage and load-alert items of one wake are ONE message
+        pending = merge_wake_facts(plan.recipient, merge_reminder_copies(plan.pending))   # #1275: the sweep, triage and load-alert items of one wake are ONE message
         text, carried = compose(plan.recipient, pending, section=section_resolver(self, observation),
                                 repos=repos, delivered=self.now())
         sent = next((fact for fact in carried if fact.kind == "send"), None)
@@ -3171,8 +3193,10 @@ class Switchboard:
             else:
                 raise   # a 5xx, 408, timeout, bad_json, a dropped call: the fate is unknown, so the reservation STAYS (counts as delivered; status says how many)
         self.reads.forget(observation.session_id)   # we wrote to it: its inbox and times are not what was remembered
+        self.supersede_queued_reminders(observation, carried)   # #1844: after the new copy is in, an older delivered copy of its key is removed
         if self.light:
             self.sent.confirm(observation.session_id, keys, self.now())
+        self._record_told(keys, plan.recipient)
         self._acknowledge(keys)
         if getattr(self, "intents", None) is not None and hasattr(self.intents, "commit_told"):
             self.intents.commit_told()
@@ -3280,6 +3304,137 @@ class Switchboard:
             converted.append(item.get("id"))
         return converted
 
+    UNCONSUMED_CAP = 500
+
+    def unconsumed_lines(self, observation):
+        """#1844: one line per message this daemon delivered as `queue` that the lane's inbox still holds, with its age and keys. Read only."""
+        if not observation:
+            return []
+        try:
+            inbox = self.reads.inbox(observation["session"], self.now(), fresh=True)
+        except V2Error as err:
+            return ["  problem: the inbox could not be read (%s)" % _one_line(str(err), 100)]
+        now, lines = self.now(), []
+        for item in inbox if isinstance(inbox, list) else []:
+            if isinstance(item, dict) and _fleet_meta(item) is not None and item.get("delivery") == "queue" \
+                    and _created(item) is not None and math.isfinite(_created(item)):   # NaN and Infinity are valid JSON: int() of them raises
+                lines.append("  - not consumed: %s queued %d min ago (delivered as queue, still in the lane's inbox)"
+                             % (", ".join(_fleet_keys(item)) or "no key", max(0, int((now - _created(item)) // 60))))
+        return lines
+
+    def _record_load(self):
+        """#1844: the persisted record (unconsumed_record.py) is read when this engine starts and whenever memory holds nothing; a record
+        that is missing, corrupt, unreadable or of the wrong type reads as empty and is audited once per process and reason."""
+        if self.record_loaded and (self.unconsumed_seen or self.reminder_memory):
+            return
+        self.record_loaded = True
+        try:
+            record, reason = load_module("unconsumed_record").read(self.state_dir, load_module("record_json").parse_bounded)
+        except Exception as err:
+            record, reason = {"steered": [], "reminders": {}}, "unreadable: %s" % type(err).__name__
+        if reason is not None and reason != "missing" and reason not in self.record_errors:   # absent = empty, silent
+            self.record_errors.add(reason)
+            if self.audit is not None:
+                self.audit.append(self.actor, "unconsumed_record.error", None, {"reason": reason, "phase": "read"})
+        self.unconsumed_seen = collections.OrderedDict((i, True) for i in record["steered"])
+        self.reminder_memory = collections.OrderedDict((k, tuple(v)) for k, v in record["reminders"].items())
+
+    def _record_save(self):
+        """#1844: written BEFORE the action that depends on it; a failure is audited once and the daemon goes on."""
+        try:
+            load_module("unconsumed_record").write(self.state_dir, {"steered": list(self.unconsumed_seen),
+                                                                    "reminders": {k: list(v) for k, v in self.reminder_memory.items()}},
+                                                   load_module("record_json").parse_bounded)
+        except Exception as err:
+            if "write" not in self.record_errors:
+                self.record_errors.add("write")
+                if self.audit is not None:
+                    self.audit.append(self.actor, "unconsumed_record.error", None,
+                                      {"reason": _one_line("%s: %s" % (type(err).__name__, err), 200), "phase": "write"})
+
+    def steer_unconsumed(self, observation, now):
+        """#1844: a message this daemon delivered as `queue` that the WORKING lane has not consumed within `unconsumed_steer_minutes` is
+        steered into the running turn, once per item (a refusal is audited once per item too). Held lanes are left alone. Returns the ids steered."""
+        minutes = self.config.get("unconsumed_steer_minutes")
+        if not minutes or hold_reason(observation) or observation.status != "working":
+            return []
+        bound = minutes * 60
+        self._record_load()
+        def stale(inbox):
+            return [item for item in (inbox if isinstance(inbox, list) else [])
+                    if isinstance(item, dict) and isinstance(item.get("id"), str) and item.get("id") not in self.unconsumed_seen
+                    and _fleet_meta(item) is not None and item.get("delivery") == "queue" and _created(item) is not None
+                    and math.isfinite(_created(item)) and now - _created(item) >= bound]
+        found = stale(self.reads.inbox(observation.session_id, now))
+        if found:   # what is remembered says one waits: read it afresh before the write
+            found = stale(self.reads.inbox(observation.session_id, now, fresh=True))
+        steered = []
+        for item in found:
+            self.unconsumed_seen[item.get("id")] = True
+            while len(self.unconsumed_seen) > self.UNCONSUMED_CAP:
+                self.unconsumed_seen.popitem(last=False)
+            self._record_save()   # before inbox_update: a restart never repeats the try
+            detail = {"session": observation.session_id, "inbox_id": item.get("id"), "keys": _fleet_keys(item),
+                      "age_seconds": int(now - _created(item))}
+            try:
+                with self._external("v2.inbox.update", observation.name, dict(detail, delivery="steer", why="unconsumed")):
+                    self.v2.inbox_update(observation.session_id, item.get("id"), "steer")
+            except V2Error as err:
+                self.audit.append(self.actor, "unconsumed.refused", observation.name,
+                                  dict(detail, error=_one_line(str(err), 200)))
+                continue
+            self.audit.append(self.actor, "unconsumed.steer", observation.name, detail)
+            steered.append(item.get("id"))
+        if steered:
+            self.reads.forget(observation.session_id)
+        return steered
+
+    def supersede_queued_reminders(self, observation, carried):
+        """#1844: a keyed reminder was just delivered: an older delivered copy of the same key, sender and recipient that is still in the lane's
+        inbox is removed (`session.inbox.cancel`). Only what this process delivered is known (memory): after a restart the older copy stays.
+        Never raises: the delivery already happened."""
+        try:
+            source = next((s for s in self.sources if isinstance(s, ReminderFacts)), None)
+            if source is None or self.audit is None:
+                return []
+            items = {i["id"]: i for i in read_reminders(source.state_dir)}
+            mine = []
+            for fact in carried:
+                item = items.get(str(fact.key)[len("reminder:"):]) if str(fact.key).startswith("reminder:") else None
+                if item is None or not item.get("key") or not isinstance(item.get("from"), str) or not item["from"].strip():
+                    continue
+                mine.append((fact.key, (item["key"], item["from"], item.get("to"))))
+            self._record_load()
+            older = {}
+            for new_key, ident in mine:
+                older.update({k: v for k, v in self.reminder_memory.items() if v == ident and k != new_key})
+            for new_key, ident in mine:
+                self.reminder_memory[new_key] = ident
+                self.reminder_memory.move_to_end(new_key)
+            while len(self.reminder_memory) > self.UNCONSUMED_CAP:
+                self.reminder_memory.popitem(last=False)
+            self._record_save()   # the new ids are recorded before the cancel call
+            if not older:
+                return []
+            cancelled = []
+            for item in self.reads.inbox(observation.session_id, self.now(), fresh=True) or []:
+                keys = _fleet_keys(item) if isinstance(item, dict) else []
+                if keys and all(k in older for k in keys):
+                    with self._external("v2.inbox.cancel", observation.name, {
+                            "session": observation.session_id, "inbox_id": item.get("id"), "keys": keys,
+                            "why": "reminder re-armed"}):
+                        self.v2.inbox_cancel(observation.session_id, item.get("id"))
+                    for k in keys:
+                        self.reminder_memory.pop(k, None)
+                    self._record_save()
+                    cancelled.append(item.get("id"))
+            if cancelled:
+                self.reads.forget(observation.session_id)
+            return cancelled
+        except Exception as err:
+            self._note("reminder.cancel_queued.error", observation.name, {"reason": _one_line("%s: %s" % (type(err).__name__, err), 200)})
+            return []
+
     # -- the pass
 
     def _failed(self, subject, step, err, report):
@@ -3314,6 +3469,10 @@ class Switchboard:
                 report["converted"].extend(self.convert_lapsed_notes(observation, now))
             except Exception as err:
                 self._failed(observation.name, "convert", err, report)
+            try:
+                self.steer_unconsumed(observation, now)
+            except Exception as err:
+                self._failed(observation.name, "unconsumed", err, report)
         run_shadow_classifier(self, discovery, now)  # PR 7: logs, acts on nothing
         facts, _ = self.collect_facts()
         try:
@@ -6085,6 +6244,7 @@ ADOPT_BY_DAEMON = "the switchboard"
 # Every function that reads a worker's boss from the raw `reports_to` text, and why it may. Anything else must go through `boss_name` (the lookup that
 # resolves the role alias and the boss record). A test scans this file for `reports_to` readers and fails when one is not in this table.
 BOSS_READ_SITES = {
+    "bin/cloud_worker.py:_final_message": "a cloud worker's own endpoint record (not a discovered agent): its reports_to is read from the record the retire already holds and validated as an agent name; only the address of the one final message",
     "bin/fleet-switchboard:headless_target": "a retired worker is not discovered: its STORED metadata (boss record applied), resolved through `resolve_boss`, as `reattach_caller_problem` does",
     "bin/lost_worker.py:_losses": "a cloud worker is not discovered: the launching lane is the `reports_to` text of its own cloud record, only the address of an alert (the loss is told to the Chief of Staff too)",
     "bin/push_watch.py:run_pass": "a cloud worker is not discovered: the launching lane is the `reports_to` text of its own cloud record, only the address of a push item (the item is told to that lane and nobody else)",
@@ -6102,6 +6262,7 @@ BOSS_READ_SITES = {
     "bin/fleet-switchboard:cloud_sender": "a cloud worker's own endpoint record (not a discovered agent: out of scope of the boss record): its reports_to is read from the record and validated by `_cloud_boss`, to name the pane-less sender of its report",
     "bin/fleet-switchboard:cloud_turn_tick": "a cloud worker's own endpoint record (not a discovered agent): its reports_to is read from the watch's record and handed to scan_turns, which sends to that lane or, with no valid name, to the Chief of Staff alone (#1484)",
     "bin/fleet-switchboard:pod_silence_tick": "a cloud worker's own endpoint record (not a discovered agent): its reports_to is read from the watch's record and handed to pod_silence.scan, which sends the one summary to that lane alone (#2115)",
+    "bin/fleet-switchboard:route_of": "a cloud worker is not discovered: the launching lane is the `reports_to` text of its own cloud record (#1740), only the address of a stage event (#1575); it is told to that lane and nobody else",
     "bin/cloud_end_alert.py:scan_audit": "a cloud worker's own endpoint record (not a discovered agent): its reports_to is read from the record; the message goes to the lane name `send` resolves (the same lookup), with the Chief of Staff as the second recipient",
     "bin/cloud_worker.py:_may_retire": "the one caller rule of `retire` and `cloud-clear`: a cloud worker's own endpoint record (not a discovered agent: out of scope of the boss record)",
     "bin/cloud_retired.py:keep_boss": "keeps the boss of a removed cloud worker from the worker's own endpoint record (not a discovered agent) so `read` can answer for it after the record is gone",
@@ -8324,6 +8485,10 @@ def validate_decisions_config(config, source):
     if not _is_number(steer_after) or isinstance(steer_after, bool) or steer_after < 0:
         raise ConfigError("%s: 'steer_after_minutes' must be a number of minutes, 0 (off, the default) or more, got %r"
                           % (source, steer_after))
+    unconsumed_steer = config["unconsumed_steer_minutes"]
+    if not _is_number(unconsumed_steer) or isinstance(unconsumed_steer, bool) or unconsumed_steer < 0:
+        raise ConfigError("%s: 'unconsumed_steer_minutes' must be a number of minutes, 0 (off) or more (the default is 20), got %r"
+                          % (source, unconsumed_steer))
     hold = config["pr_notice_hold_minutes"]
     if not _is_number(hold) or hold < 0:
         raise ConfigError("%s: 'pr_notice_hold_minutes' must be a number of minutes, 0 (no hold, the default) or "
@@ -9649,7 +9814,8 @@ def cloud_end_tick(engine, discovery):
     return load_module("cloud_end_alert").scan_audit(cloud_audit_path(), Path(state_dir) / CLOUD_END_ALERT_FILE, Path(state_dir) / "cloud",
                                                      _read_small(state_dir, LAST_REPORT_FILE), lambda to, text: engine.send("switchboard", to, text),
                                                      load_module("record_json").parse_bounded,
-                                                     lambda worker, detail: engine.audit is not None and engine.audit.append(engine.actor, "cloud_end_alert.send_failed", worker, detail))
+                                                     lambda worker, detail: engine.audit is not None and engine.audit.append(engine.actor, "cloud_end_alert.send_failed", worker, detail),
+                                                     lambda directory, worker: load_module("cloud_worker").bind(globals())._retired().last_message(directory, state_dir, worker))
 
 
 def cloud_turn_activity(worker):
@@ -9739,7 +9905,11 @@ def push_watch_tick(engine, discovery):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     ns = types.SimpleNamespace(parse_iso=parse_iso, _one_line=_one_line, parse_bounded=load_module("record_json").parse_bounded)
-    return module.run_pass(ns, engine, engine.now(), lambda path: engine.gh_api(path, paginate=False), (getattr(engine, "config", None) or {}).get("push_watch"))
+    hub = getattr(engine, "hub", None)   # the GitHub reader is the hub (Switchboard has no gh_api); with none, skip the pass
+    if hub is None:
+        engine.audit.append(engine.actor, "push_watch.skipped", None, "no GitHub hub")
+        return []
+    return module.run_pass(ns, engine, engine.now(), lambda path: hub.gh_api(path, paginate=False), (getattr(engine, "config", None) or {}).get("push_watch"))
 
 
 def finish_pass(engine, discovery, report):
@@ -9769,6 +9939,10 @@ def finish_pass(engine, discovery, report):
         cloud_end_tick(engine, discovery)
     except Exception as err:
         engine._failed("cloud-end-alert", "cloud-end-alert", err, report)
+    try:
+        load_module("cloud_worker").bind(globals())._first_push().first_push_tick(engine, discovery)   # #2057: a cloud pod with no first push by its checkpoint is named once to its orchestrator
+    except Exception as err:
+        engine._failed("first-push", "first-push", err, report)
     try:
         cloud_turn_tick(engine, discovery)
     except Exception as err:
@@ -11838,6 +12012,7 @@ def _validate_github(config, source):
     if not isinstance(bots, list) or len(bots) > 10 or not all(isinstance(a, str) and GITHUB_LOGIN_RE.match(a) for a in bots):
         raise ConfigError("%s: 'github_bot_logins' must be a list of at most 10 GitHub logins, got %r" % (source, bots))
     config["github_bot_logins"] = list(bots)
+    stage_check_config(config, source)
     poll = config["github_poll_seconds"]
     if not _is_number(poll) or poll < GITHUB_POLL_MIN:
         raise ConfigError("%s: 'github_poll_seconds' must be a number of at least %d (each read of a repo costs "
@@ -12055,6 +12230,7 @@ REVIEW_STRICT_RE = re.compile(r"^Review of ([0-9a-f]{40}): (APPROVE|CHANGES REQU
 REVIEW_VERDICTS = ("CHANGES REQUESTED", "APPROVE")
 REVIEW_NAME_CAP = 40
 REVIEW_UNOWNED_FILE, REVIEW_UNOWNED_CAP = "review-unowned.json", 2000
+INTENT_TOLD_FILE, INTENT_TOLD_CAP, INTENT_TOLD_AGE = "intent-told.json", 2000, 14 * 86400   # #1437: which recipient was told which Intent edit
 
 
 def _review_verdict(first_line):
@@ -12106,6 +12282,10 @@ def _comment_item(repo, comment, issue, now):
     number = _number(issue) or _url_number(comment.get("issue_url"))
     if cid is None or number is None:
         return None
+    staged = stage_item_parts(repo, comment, number, cid)   # #1575: only the first line of a configured bot's marker comment is read
+    if staged:
+        known, lookups = _issue_refs(issue, number)
+        return GitHubItem(staged[0], "github.stage", staged[1], repo, known, lookups, _login(comment), now, [number], True)
     body = comment.get("body") if isinstance(comment, dict) else None
     if isinstance(body, str) and REVIEW_COMMENT_RE.match(body.split("\n", 1)[0][:300]):
         return _review_comment_item(repo, comment, issue, number, cid, now)
@@ -12198,8 +12378,9 @@ def _wh_issues(repo, payload, now):
 
 
 def _wh_issue_comment(repo, payload, now):
-    if payload.get("action") != "created":
-        return []
+    comment = payload.get("comment")
+    if payload.get("action") != "created" and not (payload.get("action") == "edited" and isinstance(comment, dict) and stage_item_parts(repo, comment, 0, 0) is not None):
+        return []   # #1575: `edited` only for a stage comment
     item = _comment_item(repo, payload.get("comment") or {}, payload.get("issue"), now)
     return [item] if item else []
 
@@ -12450,6 +12631,7 @@ class GitHubHub:
                  now=time.time, actor="daemon"):
         self.config, self.state_dir, self.audit = config, Path(state_dir), audit
         self.runner, self.spawn, self.now, self.actor = runner, spawn, now, actor
+        stage_lists_set(config)
         self.lock = threading.RLock()
         self.queue = {}        # key -> GitHubItem, until delivered
         self.watches = {repo: Watch(repo) for repo in watched_repos(config, {})}   # the baseline less the excluded repositories
@@ -12672,14 +12854,75 @@ class GitHubHub:
             while len(self.queue) > GITHUB_QUEUE_LIMIT:
                 self.queue.pop(next(iter(self.queue)))
 
-    def acknowledge(self, keys):
+    def acknowledge(self, keys, recipient=None):
         """The engine found these keys delivered: forget them. Not stored, so a later
         catch-up that reads them again queues them once more, and the transcript
         stops the repeat."""
         with self.lock:
             for key in keys:
                 self.queue.pop(key, None)
-                self.intent_edits.pop(key, None)
+                # an Intent edit named with its recipient (#1437) is kept until every Chief of Staff has it: `told` records who does
+                if recipient is None:
+                    self.intent_edits.pop(key, None)
+        if recipient is not None:
+            chiefs = self._chiefs_of_staff()
+            with self.lock:
+                for key in [k for k in keys if k in self.intent_edits]:
+                    if all(self._told_has(name, self.intent_edits[key]) for name in chiefs):
+                        del self.intent_edits[key]
+
+    def _told_load(self):
+        """The durable record {"<recipient>|<edit id>": time}, read once and kept; corrupt or missing reads as empty."""
+        if getattr(self, "_told", None) is None:
+            path = Path(self.state_dir) / INTENT_TOLD_FILE if getattr(self, "state_dir", None) else None
+            data = {}
+            if path is not None:
+                try:
+                    data = load_module("record_json").parse_bounded(path.read_text())
+                except OSError:
+                    data = {}
+                except ValueError:
+                    data = {}
+                    self._audit("github.rejected", "-", {"reason": "%s is unreadable: read as empty" % INTENT_TOLD_FILE})
+            self._told = {k: v for k, v in data.items() if isinstance(k, str) and isinstance(v, (int, float))} \
+                if isinstance(data, dict) else {}
+        return self._told
+
+    def told(self, keys, recipient):
+        """The engine confirmed `keys` delivered to `recipient`: record each held Intent edit among them, per recipient, durably."""
+        with self.lock:
+            edits = [self.intent_edits[k] for k in keys if k in self.intent_edits]
+            if not edits:
+                return
+            record = self._told_load()
+            now = self.now()
+            for payload in edits:
+                record["%s|%s" % (recipient, intent_edit_id(payload))] = now
+            for stale in [k for k, t in record.items() if t < now - INTENT_TOLD_AGE]:
+                del record[stale]
+            while len(record) > INTENT_TOLD_CAP:
+                del record[min(record, key=record.get)]
+            if getattr(self, "state_dir", None) is None:
+                return
+            path = Path(self.state_dir) / INTENT_TOLD_FILE
+            tmp = path.with_name(INTENT_TOLD_FILE + ".tmp")
+            try:
+                fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                with os.fdopen(fd, "w") as handle:
+                    handle.write(json.dumps(record))
+                os.replace(str(tmp), str(path))
+                self._told_write_failed = False
+            except OSError:
+                if not getattr(self, "_told_write_failed", False):   # once per failure episode, no message text
+                    self._told_write_failed = True
+                    self._audit("github.rejected", "-", {"reason": "%s could not be written: a restart repeats the edit once" % INTENT_TOLD_FILE})
+
+    def _told_has(self, recipient, payload):
+        return "%s|%s" % (recipient, intent_edit_id(payload)) in self._told_load()
+
+    def _was_told(self, recipient, payload):
+        with self.lock:
+            return self._told_has(recipient, payload)
 
     # -- an edit to an ask's Intent (PR 6's item and toast, which nothing called until now)
 
@@ -12768,6 +13011,8 @@ class GitHubHub:
                     fact = intent_change_fact(payload, name)
                     if fact is None or fact.created < self.now() - self.lookback:
                         continue
+                    if self._was_told(name, payload):
+                        continue
                     wakes, note = self.intent_edit_wakes(fact)
                     if not wakes:
                         continue
@@ -12810,6 +13055,7 @@ class GitHubHub:
                 self.start()  # inside the daemon's lock: the first pass starts it
             return self.facts()
         github_facts.acknowledge = self.acknowledge
+        github_facts.told = self.told
         github_facts.toasts = self.toasts
         return github_facts
 
@@ -13033,6 +13279,16 @@ class GitHubHub:
                 owner = self._resolve(item.repo, candidates[:], [("issue", candidates[0])], agents, now, seen)
                 if owner:
                     return owner, "reference"
+        if item.key.startswith("github.stage:"):   # #1575: a pull request of a cloud worker's branch goes to the lane that launched it (#1740: engine.cloud_watch records)
+            for number in item.numbers:
+                pr = seen.get(number)
+                if pr is None:
+                    pr = self._read_one(item.repo, "pulls/%d" % number, now)
+                ref = ((pr or {}).get("head") or {}).get("ref") if isinstance(pr, dict) else None
+                for rec in ((getattr(self.engine, "cloud_watch", None) or {}).get("records") or []) if isinstance(ref, str) else []:   # #1740's records: the lane that launched the worker
+                    lane = rec.get("reports_to") if isinstance(rec, dict) else None
+                    if rec.get("repo") == item.repo and rec.get("branch") == ref and isinstance(lane, str) and lane in agents:
+                        return lane, "cloud"
         return None, None
 
     def _resolve(self, repo, known, pending, agents, now, seen):
@@ -14542,6 +14798,11 @@ def _cmd_launch(args, runner, now, socket_call=None):
     if getattr(args, "stack", False) and not getattr(args, "cloud", False):   # before anything is read or called: the option is the cloud launcher's
         sys.stderr.write("%s: --stack needs --cloud: the nested Docker stack is a cloud worker's pod; nothing was created\n" % PROG)
         return EXIT_USAGE
+    if getattr(args, "role", None) == "tester" and getattr(args, "agent", None):   # #1963: before every route; the allowed agents are read from the checkout's agents/roles.tsv
+        problem = load_module("tester_agent").line_for(args.agent, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+        if problem:
+            sys.stderr.write(problem + "\n")
+            return EXIT_USAGE
     if getattr(args, "cloud", False):   # a worker in the cloud (#371): its own module; nothing below runs
         return run_cloud("cmd_launch", args, runner, now)
     refuse_cloud_name(args.name)   # a name that has a cloud record is not launched locally (#640)
@@ -15412,6 +15673,8 @@ def cmd_pending(args, runner, now):
                                                     _one_line(fact["summary"], 200)))
     for problem in entry["source_problems"]:
         print("  problem: %s" % problem)
+    for line in engine.unconsumed_lines(entry["observation"]):   # #1844: delivered as `queue`, still in the lane's inbox
+        print(line)
     return EXIT_OK
 
 
@@ -16511,6 +16774,14 @@ def intent_change_fact(payload, recipient="chief-of-staff"):
                 sender=login if isinstance(login, str) and login else "github", repo=repo)
 
 
+def intent_edit_id(payload):
+    """What names one Intent edit (#1437): repo#issue, the edit time (`updated_at`) and a hash of the changed Intent text."""
+    number, updated, _ = _payload_issue(payload)
+    repo = (payload.get("repository") or {}).get("full_name")
+    text = json.dumps([[label, new] for label, _old, new in intent_diff(payload)])
+    return "%s#%d:%s:%s" % (repo, number, updated, hashlib.sha256(text.encode()).hexdigest()[:16])
+
+
 def intent_change_toast(payload):
     """What to tell you when an Intent changed: {"title", "body"} for
     HerdrClient.notification_show, or None."""
@@ -17160,7 +17431,7 @@ def tree_file_exists(runner=None):
 
 
 def _evidence(args):
-    text = plan_ledger.clip(redact_command_text(args.evidence), plan_ledger.EVIDENCE_LIMIT)
+    text = plan_ledger.bounded_text(redact_command_text(args.evidence), plan_ledger.EVIDENCE_LIMIT, "evidence")
     if not text:
         raise LedgerCommandError("--evidence is required: a link, or what you ran and saw")
     return text
@@ -17226,7 +17497,7 @@ def cmd_prove(args, runner, now):
 cmd_prove.ledger = True   # state and GETs only; its own errors are usage errors
 
 
-def launched_testers_for(ctx):
+def launched_testers_for(ctx, role="tester"):
     """({name: launch record}, {name: session id}, {name: metadata.fleet}) from ONE read of the running agents: the testers the launch record makes testers
     of this PR's repo (#372), and what the lane rule needs. Never raises: a discovery that fails gives nothing launched (so only the configured list
     counts, and the lane rule has nobody to apply to); an unreadable retired list counts every launched tester as retired (fail closed)."""
@@ -17241,7 +17512,7 @@ def launched_testers_for(ctx):
     except Exception as err:   # a corrupt retired file could hide a retired tester: no launched tester counts, loudly (audit; `status` says so too)
         ctx.engine._note("testers.retired_unreadable", None, {"error": _one_line(str(err), 160), "effect": "launch-record testers disabled"})
         return {}, sessions, fleets
-    return load_launch_testers().launched(fleets, sessions, ctx.repo, lambda fleet: _fleet_repo(fleet, ctx.config), retired), sessions, fleets
+    return load_launch_testers().launched(fleets, sessions, ctx.repo, lambda fleet: _fleet_repo(fleet, ctx.config), retired, role), sessions, fleets
 
 
 @recording("verdict")
@@ -17287,15 +17558,15 @@ def cmd_verdict(args, runner, now):
                                      "`notice pr`): its author must do that first, so the author can be excluded" % ctx.pr)
         allowed, launch, sessions, fleets = ctx.config.get("plan_evaluators"), {}, {}, {}
         authors = plan_ledger.authors_of(ctx.entries, ctx.pr, senders, ctx.facts.get("author"))
-        if named == "tester":   # #372: the configured list UNION the testers the launch record names for this repo; any trouble reading it is the configured list alone
+        if named in load_launch_testers().LAUNCHABLE:   # #372: the configured list UNION the testers the launch record names for this repo; any trouble reading it is the configured list alone
             record_step("the agent registry (the launched testers)")
-            launch, sessions, fleets = launched_testers_for(ctx)
-            allowed = load_launch_testers().evaluators(allowed, launch)
+            launch, sessions, fleets = launched_testers_for(ctx, named)
+            allowed = load_launch_testers().evaluators(allowed, launch, named)
         ok, why = plan_ledger.may_record_verdict(named, caller, allowed, authors)
         if getattr(ctx, "ask_issue", False) and caller and caller == ctx.facts.get("author"):   # #1130: the author of the ask may not judge it, as a PR's author may not
             ok, why = False, "%s is the author of the ask %s: the author of an ask cannot record a verdict on it (`prove` is the author's step)" % (caller, ctx.pr)
-        if ok and named == "tester" and caller in launch:
-            why = load_launch_testers().lane_refusal(caller, launch, authors, sessions, fleets)
+        if ok and named in load_launch_testers().LAUNCHABLE and caller in launch:
+            why = load_launch_testers().lane_refusal(caller, launch, authors, sessions, fleets, named)
             ok = why is None
     if not ok:
         if ctx.engine.audit is not None:
@@ -17313,6 +17584,10 @@ def cmd_verdict(args, runner, now):
     entries = [{"kind": "verdict", "pr": ctx.pr, "scenario": target["id"], "plan_ref": ctx.source,
                 "plan_hash": ctx.plan["plan_hash"], "head": head, "result": args.result, "by": caller,
                 "evaluator": named, "evidence": evidence, **({"files": sorted(set(args.file))} if getattr(args, "file", None) else {})} for target in targets]
+    right = load_launch_testers().source_of(caller, ctx.config.get("plan_evaluators"), launch, named) if named in load_launch_testers().LAUNCHABLE else None   # #1869: where the right came from
+    for entry in entries:
+        if right:
+            entry["right"] = right
     try:
         done = plan_ledger.append_once(ctx.state, entries, now())   # all of the new ones or none; one already there is not written again
     except plan_ledger.LedgerLockTimeout:
@@ -17326,7 +17601,7 @@ def cmd_verdict(args, runner, now):
             continue
         if ctx.engine.audit is not None:
             detail = {"scenario": entry["scenario"], "result": entry["result"], "seq": one["seq"], "by": entry["by"], "chain": one["hash"], "evidence": entry["evidence"][:160]}
-            if named == "tester" and caller in launch and load_launch_testers().source_of(caller, ctx.config.get("plan_evaluators"), launch) == "launch record":
+            if named in load_launch_testers().LAUNCHABLE and caller in launch and load_launch_testers().source_of(caller, ctx.config.get("plan_evaluators"), launch, named) == "launch record":
                 detail["launch_record"] = {k: v for k, v in launch[caller].items() if v is not None}   # #372: the record this verdict relied on
             ctx.engine.audit.append(ctx.engine.actor, "plan.verdict", ctx.pr, detail)
         print("recorded %s verdict #%d: %s %s at %s (%s), bound to plan %s" % (named, one["seq"], entry["scenario"], args.result,
@@ -17549,6 +17824,8 @@ def cmd_gates(args, runner, now):
     bots = bot_review_lines(seen, ctx.facts.get("head")) if isinstance(ctx.facts, dict) else []   # #1625: information only
     shares = overlap_shares_line(read_open_overlap(ctx.engine, ctx.repo, runner), ctx.number) if not ctx.unreadable else None   # #818: information only
     suites_finding = gates_suites_finding(runner, ctx) if not ctx.unreadable else None   # #1045: information only: the verdict below does not read it
+    if args.json and plan_ledger.verdict_lines(report):
+        report["verdict_lines"] = plan_ledger.verdict_lines(report)   # #1869
     if args.json:
         if suites_finding:
             report["suites_finding"] = suites_finding
@@ -17827,6 +18104,8 @@ def cmd_item_verdict(args, runner, now):
     reg = regs[-1] if regs else {}
     entries = [{"kind": "verdict", "pr": ctx.item, "scenario": t["id"], "plan_ref": ctx.source, "plan_hash": ctx.plan["plan_hash"], "head": head, "result": args.result,
                 "by": caller, "evaluator": "tester", "evidence": evidence, "via": "item", "session": sessions.get(caller)} for t in targets]
+    for entry in entries:
+        entry["right"] = "launch record"   # #1869: only a launched tester may use the item path
 
     def recheck(fresh):   # under the ledger's exclusive lock: only what lives in the ledger is re-read (the agents were read above, never under the lock)
         problem = iv.verdict_problem(ctx.item, caller, fresh, writers | iv.ledger_writers(ctx.item, ctx.number, ctx.issue["author"], fresh), sessions.get(caller), now(), head)
@@ -18290,7 +18569,7 @@ def pr_floor_report(engine, repo, number, rated_pairs=(), paged=None):
     if record_problem:
         record = ("hold", None)   # an unreadable ledger is an unknown rating: it holds
     registrar = registrar_states(engine, repo, matrix, paths, raw.get("baseRefOid"), head)   # #964: the one reading of what a registrar edit does to the clear's closure (every consumer reads the report)
-    owner = impact_floor.owner_decide(matrix, paths, [(sev, prob, None) for sev, prob in rated_pairs], unknown, hit, narrow, record, registrar)
+    owner = impact_floor.owner_decide(matrix, paths, [(sev, prob, None) for sev, prob in rated_pairs], unknown, hit, narrow, record, registrar, impact_floor.entry_hold(engine.config, repo, matrix))
     if record_problem:
         owner = (owner[0], owner[1] + ["the ledger could not be read, so the independent rating is unknown: %s" % _one_line(str(record_problem), 120)])   # advisory (#451): which tier the owner-hold rule puts it in; the labels still follow `decision` until the re-judge slice
     if engine.state_dir is not None and isinstance(head, str):
@@ -19196,6 +19475,9 @@ PEERS_TOO_MANY = "too many pull requests to judge"
 CU_HINT = "; the chief of staff can log a waiver at this head (`waive %s --gates CU`)"
 
 
+CLAIM_LEDGER_SINCE = 1793310807   # #1690: the ledger's first claim line (2026-10-29T21:53:27Z); a merged sibling at or before it was merged before claims were recorded
+
+
 class ClaimUnknown(Exception):
     pass
 
@@ -19234,7 +19516,11 @@ def plan_peers(ctx, runner, now, closed=None):
         if other.get("state") == "open":
             peers.append(("open", other.get("body")))
             continue
-        found, text = plan_ledger.recorded_claim(ctx.entries, "%s#%s" % (repo, other.get("number")), at=_measure_time(other.get("merged_at")) if _measure_time(other.get("merged_at")) is not None else -1)
+        merged = _measure_time(other.get("merged_at"))
+        found, text = plan_ledger.recorded_claim(ctx.entries, "%s#%s" % (repo, other.get("number")), at=merged if merged is not None else -1)
+        if not found and merged is not None and merged <= CLAIM_LEDGER_SINCE:   # #1690: a legacy sibling has no claim line (it claims every per-pull-request scenario)
+            peers.append(("merged", ""))
+            continue
         if not found:
             raise ClaimUnknown("merged pull request #%s has no recorded claim at or before its merge: its claim is unknown" % other.get("number"))
         peers.append(("merged", plan_ledger.claim_body(text)))
@@ -22816,8 +23102,10 @@ def cmd_preflight_pr(args, runner, now):
                 return EXIT_ERROR
             args.merged = False
             code = cmd_preflight_pr_in(args, runner, now, merged.path)
+            code = EXIT_ERROR if run_new_test_checks(runner, merged.path, now) and code == EXIT_OK else code
             return EXIT_ERROR if run_new_bin_guards(ps, runner, merged.path, added, now) and code == EXIT_OK else code
     code = cmd_preflight_pr_in(args, runner, now, root)
+    code = EXIT_ERROR if run_new_test_checks(runner, root, now) and code == EXIT_OK else code
     ps = load_module("path_suites")   # #1457: without --merged the one table of NEW_BIN_GUARDS runs too, when the change adds a file under bin/; a change that adds none prints nothing more
     return EXIT_ERROR if run_new_bin_guards(ps, runner, root, preflight_added(runner, root), now) and code == EXIT_OK else code
 
@@ -22861,6 +23149,14 @@ def run_new_bin_guards(ps, runner, root, added, now):
         failed += verdict != "PASS"
         print("%s %s (%ds): %s" % (verdict, guard[0], max(0, int(now() - started)), " ".join(command)))
     return failed
+
+
+def run_new_test_checks(runner, root, now):
+    if (d := runner(["git", "diff", "--name-only", "--diff-filter=AM", "origin/HEAD...HEAD", "--", "tests/switchboard/"], cwd=root, capture_output=True, text=True)).returncode == 0 and not any(n.startswith("tests/switchboard/test_") for n in d.stdout.split()): return 0
+    if not os.path.exists(tool := os.path.join(root, "tools", "new-test-checks")): return print("SKIP new-test-checks: tools/new-test-checks is not in this tree") or 0   # #1967: a new or changed tests/switchboard/test_*.py is read before the push
+    started, done = now(), runner([sys.executable, os.path.abspath(__file__), "heavy", "--", sys.executable, tool, "--preflight"], cwd=root, capture_output=True, text=True)
+    if done.returncode == 0 and not done.stdout.strip(): return 0   # no such file against the base: nothing is printed
+    print("%s new-test-checks (%ds)" % ("PASS" if done.returncode == 0 else "FAIL", max(0, int(now() - started)))); sys.stderr.write(done.stdout if done.returncode else ""); return int(done.returncode != 0)
 
 
 def cmd_preflight_pr_in(args, runner, now, root):
@@ -23390,6 +23686,13 @@ def add_plan_parsers(sub):
     rreport.add_argument("--json", action="store_true")
     tick = review_sub.add_parser("tick", help="Housekeeping: relaunch a stuck lane once, then escalate it; remind an undecided escalation")
     tick.add_argument("--json", action="store_true")
+    apply = plan_sub.add_parser("apply", help="Apply an approved plan edit file to the live plan, refusing unless the live hash, the file and the result hash are the ones named",
+                                 formatter_class=APPLY_HELP_FORMATTER, epilog="Applying an approved plan edit\nLines before the first header are a note and are read by nobody.\nEach pair is `===== OLD <n> (verbatim) =====` then the old text, then `===== NEW <n> (verbatim) =====` then the new text.\nThe numbers run 1, 2, 3 in order.\nThe text of each ends at the line before the next header; its final newline is not part of it.\nThe paragraph that starts `Why:` after the last NEW is the receipt's reason.\nThe file has no other header.")
+    apply.add_argument("issue", help="owner/repo#N, an issue URL, or N with intent_repo set: the ask whose plan comment is edited")
+    apply.add_argument("--file", required=True, help="The edit file, in the standard form (see the planning skill: Applying an approved plan edit)")
+    apply.add_argument("--expect-live", dest="expect_live", required=True, help="The full plan hash the live plan must have")
+    apply.add_argument("--expect-result", dest="expect_result", required=True, help="The full plan hash the Chief of Staff approved the file for")
+    apply.add_argument("--expect-file", dest="expect_file", required=True, help="The sha256 of the file")
 
 
 POLICY_DEFAULTS = {
@@ -24209,11 +24512,11 @@ def cmd_charter(args, runner, now):
         audit("charter.refused", why="lane", given=safe(args.name))
         sys.stderr.write("%s: charter: the lane %r is not a valid agent name; nothing was changed\n" % (PROG, safe(args.name)))
         return EXIT_USAGE
-    raw = (args.charter or "").strip().lower().lstrip("#")
+    raw = (args.charter or "").strip().lower(); named, raw = raw.rpartition("#")[::2] if "/" in raw else ("", raw.lstrip("#"))   # `owner/repo#N` names the repo
     value = None if raw == "none" else (int(raw) if re.fullmatch(r"[0-9]{1,9}", raw) and int(raw) > 0 else False)
     if value is False:
         audit("charter.refused", why="value", given=safe(args.charter or ""))
-        sys.stderr.write("%s: charter: give a positive issue number or `none`, not %r; nothing was changed\n" % (PROG, safe(args.charter or "")))
+        sys.stderr.write("%s: charter: give a positive issue number (N, #N or owner/repo#N) or `none`, not %r; nothing was changed\n" % (PROG, safe(args.charter or "")))
         return EXIT_USAGE
     registry = load_module("registry")
     replace = bool(getattr(args, "replace", False))
@@ -24221,6 +24524,12 @@ def cmd_charter(args, runner, now):
     decided = {}
     pre = {}
     row0 = registry.read(engine.state_dir)["agents"].get(args.name)
+    row_repo = (row0.get("repo") if isinstance(row0, dict) else None) or (engine.config.get("intent_repo") if engine.config else None)
+    if named and named != str(row_repo).lower():
+        audit("charter.refused", why="repo", given=safe(named))
+        rs = lambda t: re.sub(r"[^A-Za-z0-9_./-]", "?", str(t)[:60])
+        sys.stderr.write("%s: charter: %s is not the repo of %s's registry row (%s); nothing was changed\n" % (PROG, rs(named), safe(args.name), rs(row_repo)))
+        return EXIT_USAGE
     if value is not None and isinstance(row0, dict):   # #1143: the GitHub reads happen BEFORE the registry lock, bound to the issue number and the repo; the lock only re-checks registry facts
         repo0 = row0.get("repo") or (engine.config.get("intent_repo") if engine.config else None)
         try:
@@ -24282,7 +24591,7 @@ def add_charter_parsers(sub):
                                     description="The registry row's `charter` is the one record of which charter an orchestrator owns; the lane lookup reads it. The live session's metadata is written once at launch and "
                                                 "cannot be corrected, so it is never read as a second owner. Run by the Chief of Staff or the operator; one audit line with the old and the new value.")
     setter.add_argument("name", help="The orchestrator's fleet name")
-    setter.add_argument("charter", help="An issue number, or `none`")
+    setter.add_argument("charter", help="An issue number (N, #N or owner/repo#N), or `none`")
     setter.add_argument("--replace", action="store_true", help="Required to change a charter that is already set (a flag: it takes no value)")
     setter.add_argument("--from", dest="sender", help="Lab only: the caller's fleet name")
 
@@ -24355,6 +24664,8 @@ def cmd_plan(args, runner, now, socket_call=None):
         return cmd_plan_review(args, runner, now, socket_call)
     if args.plan_action == "template":
         return cmd_plan_template(args, runner, now)
+    if args.plan_action == "apply":
+        return cmd_plan_apply(args, runner, now, fleet_mark)
     return cmd_plan_check(args, runner, now)
 
 
