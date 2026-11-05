@@ -669,6 +669,8 @@
           "decide",
           "delayed_since",
           "describe_items",
+          "finding_part",
+          "finding_parts",
           "hold_reason",
           "in_late_scope",
           "is_withdrawal",
