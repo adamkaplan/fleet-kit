@@ -352,4 +352,14 @@ def build():
             self.assertEqual(len(self.lines()), 1)
             self.assertEqual(len(self.audit("plan_wake.announced")), 1)
 
+        def test_s5_a_work_item_with_its_own_done_when_is_checked_against_it_not_its_asks(self):
+            self.add(3, parent=2, body="## Intent\nx\nDone when: " + "an entirely different own outcome that the plan does not state")
+            self.post(3, self.plan())
+            with mock.patch.object(sb, "_audit_tail", lambda state_dir: []):
+                self.go()
+            got = self.audit("plan_wake.announced")
+            self.assertEqual(len(got), 1)
+            self.assertEqual(got[0]["detail"].get("check") if "detail" in got[0] else got[0].get("check"), "FAIL")
+            self.assertEqual(got[0].get("detail", got[0]).get("stale"), False)
+
     return TestPlanWakeDrops
