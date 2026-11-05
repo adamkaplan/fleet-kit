@@ -325,4 +325,15 @@ def build(HandoffCase, FAKE_GH):
             cut = [c["what"] for c in json.loads(out.getvalue())["candidates"] if c["kind"] == "cut"]
             self.assertEqual(len([w for w in cut if "shards" in w]), 0)
             self.assertIn("stale-report", cut)
+
+        def test_mutant_s2_dropping_the_placeholder_filter_is_caught_control_first(self):
+            runs = [run(1, "test", "pull_request", "aa", 0)]
+            jobs = {1: [job("matrix.cloud", 0, 0, 5), job("stale-report", 0, 0, 7)]}
+
+            def cuts(space):
+                return [c["what"] for c in space["ci_queue_measure"](runs, jobs, NOW, 24, GATE, ())["candidates"] if c["kind"] == "cut"]
+            self.assertEqual(cuts(self.pure_lines()), ["stale-report"])   # control
+            mutant = cuts(self.pure_lines('if "${{" not in c["what"] and not c["what"].startswith("matrix.")]', "if True]"))
+            with self.assertRaisesRegex(AssertionError, "^2 != 1$"):
+                self.assertEqual(len(mutant), 1)
     return TestCiQueue
