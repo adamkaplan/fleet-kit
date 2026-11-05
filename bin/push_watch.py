@@ -281,6 +281,13 @@ def run_pass(sb, engine, now, gh, config=None, launcher_audit=None):
                         made = sb.parse_iso(when) if isinstance(when, str) else None
                         if made is not None:
                             break
+                    launched = state.get("created", {}).get(name)   # first sight: a tip made before the launch is the baseline, not a push
+                    if launched is None:
+                        hard, secs = sb.parse_iso(str(record.get("hard_deadline"))), record.get("hard_seconds")
+                        launched = hard - secs if hard is not None and isinstance(secs, (int, float)) and not isinstance(secs, bool) else None
+                    if launched is not None and made is not None and made <= launched:
+                        b["sha"], b["at"], b["quiet"] = sha, now, True
+                        continue
             except Exception as err:
                 if cmpfail and not limited:   # both reads failed: the sha stays unseen (retried at the next pass), audited once per worker
                     mem["cmpfailed"] = True

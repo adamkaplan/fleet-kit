@@ -757,5 +757,44 @@ class TestPushWatch(Case):
         self.assertEqual([l[0] for l in engine.audit.lines], ["push_watch.skipped"])
 
 
+class TestFirstSightBaseline(Case):
+    """#2153: the first sight of a branch is a baseline, told only when its tip was made after the worker's launch."""
+    def _world(self, made_before_launch):
+        iso = lambda t: datetime.datetime.fromtimestamp(t, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        launch = NOW - 3600
+        rec = dict(record("w-a", "lane-a"), hard_deadline=iso(launch + 7200), hard_seconds=7200)
+        self.engine.cloud_watch = {"records": [rec]}
+        for sha, when in ((SHA_A, launch - 60 if made_before_launch else launch + 60), (SHA_B, launch + 120)):
+            c = commit("tip" if sha == SHA_A else "newer")
+            c["commit"]["committer"] = {"date": iso(when)}
+            self.world.commits[sha] = c
+        self.world.refs = {"w-a/wip": SHA_A}
+
+    def test_s2_a_tip_made_before_the_launch_is_stored_and_not_told(self):
+        self._world(True)
+        self.run_pass(NOW)
+        self.assertEqual(len(self.to("lane-a")), 0)
+        self.assertEqual(self.run_state_sha(), SHA_A)
+
+    def run_state_sha(self):
+        state = json.loads((Path(self.tmp.name) / "push-watch.json").read_text())
+        return state["workers"]["w-a"]["branches"]["w-a/wip"]["sha"]
+
+    def test_s3_a_tip_made_after_the_launch_is_told_once(self):
+        self._world(False)
+        self.run_pass(NOW)
+        self.run_pass(NOW + 1)
+        self.assertEqual(len(self.to("lane-a")), 1)
+
+    def test_s4_a_commit_after_the_baseline_is_told_once_and_the_old_tip_never(self):
+        self._world(True)
+        self.run_pass(NOW)
+        self.world.refs = {"w-a/wip": SHA_B}
+        self.run_pass(NOW + 60)
+        self.run_pass(NOW + 120)
+        got = self.to("lane-a")
+        self.assertEqual((len([t for t in got if SHA_B[:8] in t]), len([t for t in got if SHA_A[:8] in t])), (1, 0))
+
+
 if __name__ == "__main__":
     unittest.main()
