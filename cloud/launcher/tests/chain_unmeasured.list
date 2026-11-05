@@ -22,11 +22,14 @@ cloud/launcher/tests/test_reaper_renewal.py
 cloud/launcher/tests/test_reaper_restart.py
 cloud/launcher/tests/test_reaper_row.py
 cloud/launcher/tests/test_render_namespace.py
+cloud/launcher/tests/test_repo_min_shape.py
+cloud/launcher/tests/test_retire_gone_exact.py
 cloud/launcher/tests/test_safe_to_evict.py
 cloud/launcher/tests/test_scratch_clean.py
 cloud/launcher/tests/test_scrub_linear.py
 cloud/launcher/tests/test_stop_no_checkout.py
 cloud/launcher/tests/test_token_at_limit.py
+cloud/launcher/tests/test_vault_block.py
 cloud/launcher/tests/test_worker_copies.py
 cloud/worker/tests/test_activity.py
 cloud/worker/tests/test_base_merge_base.py
@@ -39,4 +42,5 @@ cloud/worker/tests/test_entrypoint.py
 cloud/worker/tests/test_entrypoint_import.py
 cloud/worker/tests/test_plan_check_in_pod.py
 cloud/worker/tests/test_reach.py
+cloud/worker/tests/test_shell_check.py
 cloud/worker/tests/test_token_table.py
