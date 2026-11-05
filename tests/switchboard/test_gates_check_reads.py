@@ -90,28 +90,5 @@ class TestGatesCheckReads(unittest.TestCase):
         self.assertEqual([c for c in calls if c.startswith("pr view")], [])
 
 
-class TestKeptLedgerChain(unittest.TestCase):
-    def setUp(self):
-        sys.path.insert(0, str(REPO / "bin"))
-        import plan_ledger
-        self.pl = plan_ledger
-        self.dir = tempfile.mkdtemp(prefix="chain-")
-        for n in range(3):
-            self.pl.append_entry(self.dir, {"pr": "acme/app#%d" % n, "kind": "proof", "result": "pass"}, 1000 + n)
-
-    def test_s3_a_second_read_gives_the_same_answer_from_the_kept_entries(self):
-        first = self.pl.read_ledger(self.dir)
-        self.assertTrue((Path(self.dir) / self.pl.KEPT_CHAIN_FILE).exists())
-        self.assertEqual(self.pl.read_ledger(self.dir), first)
-        self.assertEqual(first[1], None)
-
-    def test_s3_an_edited_ledger_is_still_found_with_a_kept_copy_beside_it(self):
-        self.pl.read_ledger(self.dir)
-        path = Path(self.dir) / self.pl.LEDGER_FILE
-        path.write_text(path.read_text().replace("acme/app#1", "acme/app#9"))
-        entries, problem = self.pl.read_ledger(self.dir)
-        self.assertIn("edited", problem or "")
-
-
 if __name__ == "__main__":
     unittest.main()

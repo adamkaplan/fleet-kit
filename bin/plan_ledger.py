@@ -136,9 +136,8 @@ def read_ledger(state_dir):
         return [], None
     except OSError as err:
         raise LedgerError("cannot read the ledger: %s" % (err.strerror or err)) from None
-    sealed = _kept_chain(state_dir, text)   # #2230: the same bytes were verified before: their entries are kept, not parsed and hashed again
-    entries, prev = ([], GENESIS) if sealed is None else (sealed, None)
-    for number, line in enumerate(text.splitlines() if sealed is None else (), 1):
+    entries, prev = [], GENESIS
+    for number, line in enumerate(text.splitlines(), 1):
         if not line.strip():
             continue
         try:
@@ -150,42 +149,10 @@ def read_ledger(state_dir):
             return entries, "entry %d does not follow from the one before it: the ledger was edited" % (len(entries) + 1)
         entries.append(entry)
         prev = entry["hash"]
-    if sealed is None:
-        _keep_chain(state_dir, text, entries)
     if pointer is not None and (len(entries) < pointer["seq"] or entries[pointer["seq"] - 1]["hash"] != pointer["hash"]):
         return entries, ("the ledger ends before entry %d, where its head pointer says it should (entries were cut off or the "
                          "file was rewritten)" % pointer["seq"])
     return entries, None
-
-
-KEPT_CHAIN_FILE = "ledger-chain.kept"   # #2230
-
-
-def _kept_chain(state_dir, text):
-    """The entries of a ledger text whose chain held when they were kept (same sha256 of the same bytes), or None. Best effort: any trouble is None (the chain is then checked)."""
-    try:
-        import marshal
-        with open(str(Path(state_dir) / KEPT_CHAIN_FILE), "rb") as handle:
-            head, _, blob = handle.read().partition(b"\n")
-        if head != hashlib.sha256(text.encode("utf-8")).hexdigest().encode():
-            return None
-        entries = marshal.loads(blob)
-        return entries if isinstance(entries, list) else None
-    except (OSError, ValueError, EOFError, TypeError):
-        return None
-
-
-def _keep_chain(state_dir, text, entries):
-    """Keep the entries of a ledger whose chain held, beside it, stamped with the text's sha256. Best effort."""
-    try:
-        import marshal
-        path = Path(state_dir) / KEPT_CHAIN_FILE
-        temp = path.with_name("%s.%d.tmp" % (KEPT_CHAIN_FILE, os.getpid()))
-        with open(str(temp), "wb") as handle:
-            handle.write(hashlib.sha256(text.encode("utf-8")).hexdigest().encode() + b"\n" + marshal.dumps(entries))
-        os.replace(str(temp), str(path))
-    except (OSError, ValueError, TypeError):
-        pass
 
 
 def _read_head(state_dir):
