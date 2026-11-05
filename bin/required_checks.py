@@ -5,7 +5,7 @@ first line that is not one). At most MAX_CHECKS lines are read and each is cut t
 A brief with no block gives the empty list, and the empty list changes nothing anywhere.
 
 `compare` reads a review comment against the list. A check is ANSWERED when a line of the comment names it (case folded) and what follows
-the name on that line is a result, or `not done` with a reason. A bare mention, or `not done` with no reason, is MISSING. It never judges
+the name on that line is `:` or a dash and then a result, or `not done` with a reason. A bare mention, or `not done` with no reason, is MISSING. It never judges
 whether an answer is right: that is for the lane. Pure: no I/O."""
 
 import re
@@ -17,6 +17,8 @@ MAX_BRIEF_CHARS = 200000
 MAX_COMMENT_CHARS = 20000
 _ITEM = re.compile(r"^[ \t]*[-*][ \t]+(\S.*?)[ \t]*$")
 _NOT_DONE = re.compile(r"^not[ \t]+done\b", re.I)
+_SEP = ":-\u2013\u2014"   # what must follow the name: `<check>: <result>` or `<check> - <result>`
+_WRAP = " \t*_`)]"   # markup that may sit between the name and the separator
 _PAD = " \t:;,.=()[]*_`-\u2013\u2014>"
 
 
@@ -46,7 +48,10 @@ def _state(line, name):
     at = line.casefold().find(name.casefold())
     if at < 0:
         return None
-    rest = line[at + len(name):].strip(_PAD)
+    rest = line[at + len(name):].lstrip(_WRAP)
+    if not rest or rest[0] not in _SEP:
+        return None   # a bare mention, or a name followed by prose, gives no result
+    rest = rest[1:].strip(_PAD)
     if _NOT_DONE.match(rest):
         return "not_done" if re.search(r"[A-Za-z0-9]", rest[len("not done"):]) else "no_reason"
     return "result" if re.search(r"[A-Za-z0-9]", rest) else None

@@ -97,6 +97,12 @@ def build(TwoRepoCase):
             self.assertIn("required checks:", item.summary, "the note is on the line")
             self.assertNotIn("SECRETVALUE1234", item.summary, "a signed link never reaches the line")
 
+        def test_prose_after_the_name_is_not_an_answer_but_a_separated_result_is(self):
+            prose = module().compare("restart test was required but I did not run it\n", ["restart test"])
+            self.assertIn("restart test", prose["missing"], "prose after the name is not a result")
+            for line in ("restart test: ran, passes", "restart test - ran, passes", "**restart test**: passes"):
+                self.assertEqual(module().compare(line, ["restart test"])["missing"], [], line)
+
         # U1
         def test_u1_a_reader_with_no_list_changes_nothing(self):
             body = "Review of %s: APPROVE\nanything\n" % SHA
