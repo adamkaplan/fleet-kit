@@ -17,3 +17,5 @@ the tests and the change and judges them; it never runs them.
 - **R-TEST-8 No debt.** Duplicate tests and tests that cannot fail are removed; the proportion of test to change is reasonable for the risk. _check: note only: a judgement about proportion._
 - **R-TEST-9 Fixtures are synthetic.** A fixture uses neutral names and invented data with the same shape as the real case; nothing private is committed. _check: search: a fixture holding a private name or real data._
 - **R-TEST-10 The unchanged still holds.** A change states what must stay the same and has a test that shows it does (a golden output, a regression case). _check: test: a golden or regression case for what must stay the same._
+
+A test never pins an exact set or size (an argument list, environment names, settings, flags, file sizes, line or word counts, or any set a normal change grows): it checks behaviour and real safety properties (no secret in an output, no untrusted interpolation, a required item present). A reviewer flags such a test and never asks for one.

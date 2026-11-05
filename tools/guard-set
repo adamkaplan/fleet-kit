@@ -1,0 +1,56 @@
+#!/usr/bin/env python3
+"""guard-set: print the guard set, one command line per entry, derived from docs/guard-set.json.
+
+    tools/guard-set [--list FILE]          print `python3 bin/test-switchboard <Class>` per class, then the extras
+    tools/guard-set --check [--list FILE]  exit 1 naming each class that no test file defines ("every class of the guard set exists")
+
+A brief says "run the guard set"; a builder runs the printed lines one at a time. A class with a "timeout" (seconds) is printed AFTER the command as a trailing `# timeout N` comment.
+Standard library only.
+"""
+import ast
+import json
+import sys
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parents[1]
+
+
+def load(path):
+    return json.loads(Path(path).read_text())
+
+
+def defined_classes():
+    out = set()
+    files = sorted((REPO / "tests" / "switchboard").glob("*.py")) + [REPO / "bin" / "test-switchboard", REPO / "tests" / "test_installed_guard.py"]
+    for f in files:
+        for node in ast.parse(f.read_text()).body:
+            if isinstance(node, ast.ClassDef):
+                out.add(node.name)
+    return out
+
+
+def lines(data):
+    out = []
+    for e in data["classes"]:
+        post = "  # timeout %d" % e["timeout"] if e.get("timeout") else ""
+        out.append("python3 bin/test-switchboard %s%s" % (e["class"], post))
+    return out + list(data.get("extras", []))
+
+
+def main(argv):
+    path = REPO / "docs" / "guard-set.json"
+    if "--list" in argv:
+        path = argv[argv.index("--list") + 1]
+    data = load(path)
+    if "--check" in argv:
+        have = defined_classes()
+        missing = [e["class"] for e in data["classes"] if e["class"] not in have]
+        for m in missing:
+            print("every class of the guard set exists: FAIL, no test file defines %s" % m)
+        return 1 if missing else 0
+    print("\n".join(lines(data)))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

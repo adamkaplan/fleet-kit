@@ -1,0 +1,4 @@
+{
+ "command": "scratch",
+ "help": "usage: fleet-switchboard scratch [-h] options: -h, --help show this help message and exit"
+}
