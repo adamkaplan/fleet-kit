@@ -233,7 +233,7 @@ class TestHeavyHolders(unittest.TestCase):
         (fake / "4242" / "fd").mkdir(parents=True)
         if stranger:
             os.symlink(str(lock), fake / "4242" / "fd" / "3")
-        env.update(ACME_PROC_ROOT=str(fake), XDG_STATE_HOME=str(state), PATH=self.no_lsof_path(), FLEET_HEAVY_MEM_MB="100000", FLEET_HEAVY_REPORT_SECONDS="0.3")
+        env.update(ACME_PROC_ROOT=str(fake), XDG_STATE_HOME=str(state), XDG_CONFIG_HOME=str(state / "config"), PATH=self.no_lsof_path(), FLEET_HEAVY_MEM_MB="100000", FLEET_HEAVY_REPORT_SECONDS="0.3")
         argv = [sys.executable, "-c", RUNNER % str(BIN), str(BIN / "fleet-switchboard"), "heavy", "--slots", "1", "--name", "acme", "--",
                 "sh", "-c", "echo out-line; echo err-line >&2; sleep 1.5; echo done-line"]
         merged = subprocess.run(argv, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=90, stdin=subprocess.DEVNULL)

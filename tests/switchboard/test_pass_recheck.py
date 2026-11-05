@@ -719,10 +719,12 @@ class TestPlanWakeMutants(unittest.TestCase):
         text = (Path(sb.__file__).resolve().parent / "switchboard" / "plan_notice.py").read_text()
         start = text.index("def plan_wake_pass(")
         end = text.index("\n\n\n", start)
-        old = "wake.newest[(repo, number)] = plan_hash"
-        self.assertEqual(text[start:end].count(old), 1, msg="the mutation target moved")
-        mutated = text[start:end].replace(old, "pass", 1)
-        self.assertNotEqual(mutated, text[start:end], msg="the mutation was not applied")
+        # the present hash is recorded twice: for the delivery re-check (`newest`, #1542) and for the pass's own drop (`current`, #1784); either alone keeps a replaced notice out, so the mutant removes both
+        olds = ("wake.newest[(repo, number)] = plan_hash", "wake.current[(repo, number)] = plan_hash")
+        mutated = text[start:end]
+        for old in olds:
+            self.assertEqual(mutated.count(old), 1, msg="the mutation target moved")
+            mutated = mutated.replace(old, "pass", 1)
         ns = dict(vars(sb))
         exec(compile(mutated, "plan_wake_pass.py", "exec"), ns)
         helper = TestPassRecheckMutants()
