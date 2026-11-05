@@ -424,8 +424,15 @@ class TriageFacts:
         return [Fact(key, name, "triage", summary, created, sender="switchboard")
                 for key, (summary, created) in sorted(state.facts.items()) for name in chiefs]
 
+    def present_record(self, subject):   # #1542: {"pairs", "present"} of this digest, None when the pass has not run or the digest is not known
+        state = getattr(self.engine, "triage", None) if self.engine else None
+        present, pairs = getattr(state, "present", None), getattr(state, "fact_pairs", {}).get(subject[3])
+        return None if present is None or pairs is None else {"pairs": [list(p) for p in pairs], "present": [list(p) for p in present], "hidden": bool(getattr(state, "fact_hidden", {}).get(subject[3]))}
+
     def drop_stale(self, keys):   # #1402: a fact dropped at delivery does not come back
         state = getattr(self.engine, "triage", None) if self.engine else None
         for key in keys:
             if state is not None:
                 state.facts.pop(key, None)
+                getattr(state, "fact_pairs", {}).pop(key, None)   # #1542: forgotten with its fact (a state without the maps has nothing to forget)
+                getattr(state, "fact_hidden", {}).pop(key, None)

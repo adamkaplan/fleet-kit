@@ -211,6 +211,7 @@ class SweepState:
         self.s5_skipped = {"draft": 0, "parked": 0}
         self.s5_unchecked = 0    # held pull requests whose gates could not be read this pass: never raised (#986)
         self.details = {}        # (kind, ref) -> the finding's own sentence
+        self.fact_pairs = {}     # #1542: fact key -> the pairs the fact lists, for the delivery re-check
 
 
 def sweep_alarmed_load(engine, state, now, cfg):
@@ -891,11 +892,13 @@ def sweep_decisions(engine, decisions, now, errors=()):
     candidates = sweep_findings(engine, state, kept, home, now, cfg, regex, defer, whole_list)
     findings, unchecked = [], 0
     attempts = sorted(candidates, key=lambda c: (state.attempted.get(c, 0), c))  # the longest untried first
+    held = set()   # #1542: candidates this pass could not judge: still present for the delivery re-check
     for pair in attempts:
         if now - state.confirmed.get(pair, 0) < SWEEP_TTL:
             findings.append(pair)
             continue
         if engine.now() - state.started >= SWEEP_PASS_SECONDS:
+            held.add(pair)
             unchecked += 1
             continue
         state.attempted[pair] = now
@@ -904,6 +907,7 @@ def sweep_decisions(engine, decisions, now, errors=()):
             state.confirmed[pair] = now
             findings.append(pair)
         elif verdict is None:
+            held.add(pair)
             unchecked += 1
         else:
             state.confirmed.pop(pair, None)
@@ -912,6 +916,9 @@ def sweep_decisions(engine, decisions, now, errors=()):
                 engine._note("sweep.dismissed", pair[1], {"kind": pair[0], "ref": pair[1],
                                                           "why": "a fresh read does not bear it out"})
     findings.sort()
+    seen_all = (unchecked == 0 and whole_list and not defer and not state.s5_unchecked
+                and all(r in state.repos and not state.repos[r].get("truncated") and not state.repos[r].get("error") for r in repos))
+    state.present = (set(findings) | held) if seen_all else None   # #1542: what the delivery re-check reads, only after a pass that saw everything it judges; else None (the item is kept, marked unverified)
     day = int(now // 86400)
     due = [(k, r) for k, r in findings
            if cfg["enabled"] and now - state.alarmed.get((k, r), 0) >= cfg["realarm_hours"] * 3600]   # what is queued this pass
@@ -963,8 +970,10 @@ def sweep_queue_fact(state, due, now, cfg):
     for pair in due:
         state.alarmed[pair] = now
     state.facts[key] = (summary, now)
+    state.fact_pairs[key] = (list(shown), len(due) > len(shown))   # #1542: the pairs the fact lists and whether it hides some ("+N more"), for the delivery re-check
     for old in [k for k, (_, at) in state.facts.items() if now - at > cfg["realarm_hours"] * 7200]:
         del state.facts[old]
+        state.fact_pairs.pop(old, None)   # #1542: forgotten with its fact
     return set(due)   # every due finding is carried (named, or counted in "+N more") and remembered
 
 
@@ -998,6 +1007,13 @@ class SweepFacts:
     def bind(self, engine):
         self.engine = engine
 
+    def drop_stale(self, keys):   # #1542: a fact dropped at delivery does not come back
+        state = getattr(self.engine, "sweep", None) if self.engine else None
+        for key in keys:
+            if state is not None:
+                state.facts.pop(key, None)
+                state.fact_pairs.pop(key, None)
+
     def __call__(self):
         engine = self.engine
         state = getattr(engine, "sweep", None) if engine else None
@@ -1007,3 +1023,8 @@ class SweepFacts:
         chiefs = sorted(n for n, o in discovery.agents.items() if (o.fleet or {}).get("role") == "chief-of-staff")
         return [Fact(key, name, "sweep", summary, created, sender="switchboard")
                 for key, (summary, created) in sorted(state.facts.items()) for name in chiefs]
+
+    def present_record(self, subject):   # #1542: {"pairs", "present"} of this fact, None when the pass has not run or the fact is not known
+        state = getattr(self.engine, "sweep", None) if self.engine else None
+        present, held = getattr(state, "present", None), getattr(state, "fact_pairs", {}).get(subject[3])
+        return None if present is None or held is None else {"pairs": [list(p) for p in held[0]], "hidden": bool(held[1]), "present": [list(p) for p in present]}

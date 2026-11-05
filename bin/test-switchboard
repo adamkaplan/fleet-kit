@@ -27856,6 +27856,58 @@ class TestPlanWake(Base):
         sb.plan_wake_pass(self.engine, self.engine.triage, ["acme/api"], self.world.clock.now())
         self.assertEqual(self.hub.calls, before)
 
+    def test_the_plan_pass_records_the_present_hash_so_a_replaced_plan_notice_is_dropped_and_the_new_one_kept(self):
+        """#1542 Seventh (3). REAL: triage_pass and plan_wake_pass (the notices and `newest` come from them), the real hash `sha256:<hex>` of the plan check, the real
+        `plan`, `deliver` and `judge_delivery`. FAKE: only the GitHub hub (FakeTriageHub) and the clock."""
+        self.hub.present_record = lambda *args: {}   # FAKE: the delivery reader needs a hub with the present-state read; the plan facts never use it
+        record = self.post(3, self.plan())
+        self.go()
+        a = sb.plan_check.plan_hash(record["body"])
+        record["body"] += "\nan edit"
+        record["updated_at"] = sb.iso(self.world.clock.now())
+        self.go()
+        b = sb.plan_check.plan_hash(record["body"])
+        self.assertTrue(a.startswith("sha256:") and b.startswith("sha256:") and a != b)
+        self.assertEqual(len(self.engine.plan_wake.facts), 2, msg="the real pass did not announce both hashes")
+        self.world.tick(int(self.engine.batch_seconds) + 1)
+        engine, now = self.engine, self.world.clock.now()
+        facts = [f for f in engine.collect_facts()[0] if f.kind == "plan"]
+        plan = engine.plan("orch", facts, engine.discover(now), now)
+        engine.deliver(plan)
+        texts = [x["text"] for x in self.world.admissions("orch")]
+        self.assertEqual(len(texts), 1, msg=texts)
+        self.assertIn(b, texts[0])
+        self.assertNotIn(a, texts[0])
+        dropped = [e for e in self.world.audit() if e["event"] == "stale.dropped"]
+        self.assertEqual([e["detail"]["kind"] for e in dropped], ["plan"])
+
+    def delivered_to_orch(self):
+        self.hub.present_record = lambda *args: {}   # FAKE: the delivery reader needs a hub with the present-state read; the plan facts never use it
+        engine, now = self.engine, self.world.clock.now()
+        facts = [f for f in engine.collect_facts()[0] if f.kind == "plan"]
+        engine.deliver(engine.plan("orch", facts, engine.discover(now), now))
+        return [x["text"] for x in self.world.admissions("orch")]
+
+    def test_a_real_plan_notice_delivered_ninety_minutes_late_carries_the_age_mark(self):
+        """#1542 Seventh (5). REAL: triage_pass, plan_wake_pass, deliver. FAKE: the hub and the clock."""
+        self.post(3, self.plan())
+        self.go()
+        self.world.tick(90 * 60)
+        texts = self.delivered_to_orch()
+        self.assertEqual(len(texts), 1)
+        self.assertIn("delayed: sent", texts[0])
+
+    def test_a_real_plan_notice_with_no_present_hash_known_is_kept_marked_unverified(self):
+        """#1542 Seventh (5). REAL: triage_pass, plan_wake_pass, deliver. The present hash is forgotten as after a restart (the memory of the pass is empty)."""
+        self.post(3, self.plan())
+        self.go()
+        self.engine.plan_wake.newest.clear()
+        self.world.tick(int(self.engine.batch_seconds) + 1)
+        texts = self.delivered_to_orch()
+        self.assertEqual(len(texts), 1)
+        self.assertIn("[unverified", texts[0])
+        self.assertEqual([e for e in self.world.audit() if e["event"] == "stale.dropped"], [])
+
     def test_the_fact_source_makes_one_plan_fact_per_recipient_by_key(self):
         self.post(3, self.plan())
         self.go()
@@ -66891,6 +66943,7 @@ TestLaunchBriefCheck = importlib.import_module("test_launch_brief_check").build(
 TestIntentEditToldOnce = importlib.import_module("test_intent_told_once").build(TestIntentEditWiring, GithubRig)   # #1437
 TestRunLauncherShapes, TestStatusLines, TestTurnEnd, TestDictCallersUnchanged = (_ss := importlib.import_module("test_status_shape")).TestRunLauncherShapes, _ss.TestStatusLines, _ss.TestTurnEnd, _ss.TestDictCallersUnchanged
 TestEveryKindDelayedMark = importlib.import_module("test_every_kind_delayed_mark").TestEveryKindDelayedMark
+_pass_recheck = importlib.import_module("test_pass_recheck"); _pass_recheck.World = World; TestPassRecheck, TestPassRecheckMutants, TestDropStaleOnce, TestUnreadUnitKeepsTheItem, TestUnreadUnitKeepsTheDigest, TestHiddenFindings, TestMissingCases, TestTriageHiddenGuard, TestPlanNewestForgotten, TestTriageHiddenMutants, TestPlanKeyHash, TestPlanWakeMutants, TestSeenAllConditions, TestSeenAllMutants, TestSweepOnRealPass, TestTriageOnRealPass = _pass_recheck.TestPassRecheck, _pass_recheck.TestPassRecheckMutants, _pass_recheck.TestDropStaleOnce, _pass_recheck.TestUnreadUnitKeepsTheItem, _pass_recheck.TestUnreadUnitKeepsTheDigest, _pass_recheck.TestHiddenFindings, _pass_recheck.TestMissingCases, _pass_recheck.TestTriageHiddenGuard, _pass_recheck.TestPlanNewestForgotten, _pass_recheck.TestTriageHiddenMutants, _pass_recheck.TestPlanKeyHash, _pass_recheck.TestPlanWakeMutants, _pass_recheck.TestSeenAllConditions, _pass_recheck.TestSeenAllMutants, _pass_recheck.TestSweepOnRealPass, _pass_recheck.TestTriageOnRealPass; _pass_recheck.TestPlanWake = TestPlanWake   # #1542
 TestQueuedBehindTurn = importlib.import_module("test_queued_behind_turn").TestQueuedBehindTurn
 TestHeaderDate, TestHeaderDateCallSites, TestHeaderInfiniteTime = (_hd := importlib.import_module("test_header_date")).TestHeaderDate, _hd.TestHeaderDateCallSites, _hd.TestHeaderInfiniteTime
 TestSignedLinkScrub = importlib.import_module("test_signed_link_scrub").build(Base, GithubRig)

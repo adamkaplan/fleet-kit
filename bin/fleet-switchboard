@@ -2480,6 +2480,11 @@ class Switchboard:
         seen = {}
         def read(subject):
             kind, repo, number, _expected = subject
+            if kind in PASS_SUBJECTS:   # #1542: a pass's own present state, from the fact source that made the fact: no GitHub read, no budget
+                slot = (kind, repo, number, _expected)
+                if slot not in seen:
+                    seen[slot] = self.pass_state(kind, subject)
+                return seen[slot]
             slot = (SUBJECT_ENDPOINT[kind], repo, number)
             if slot not in seen:
                 if len(seen) >= MAX_PRESENT_READS:
@@ -2490,6 +2495,16 @@ class Switchboard:
                     seen[slot] = None
             return seen[slot]
         return read
+
+    def pass_state(self, kind, subject):
+        """#1542: the present record of a sweep, triage or plan fact, asked of the fact source that made it; None when it cannot be read."""
+        for source in self.sources:
+            if getattr(source, "__name__", "") == PASS_SUBJECTS[kind] and hasattr(source, "present_record"):
+                try:
+                    return source.present_record(subject)
+                except Exception:
+                    return None
+        return None
 
     def drop_stale(self, recipient, dropped):
         """Audit each dropped fact (what, why, when it was sent) and tell the fact sources to forget it, so it does not return."""
