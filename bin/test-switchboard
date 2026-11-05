@@ -31194,7 +31194,7 @@ class TestFactsReadAtRunTime(TestCarriesLine):
 
     def floor_not_held(self):
         """A held pull request whose floor was read and says not held: the one state in which G6 reads `captain_findings`. Undone at the end of the test."""
-        self.pr.update(body="PLAN: acme/app#7\ncanon: updated the docs", labels=[{"name": "merge-captain"}])
+        self.pr.update(body="PLAN: acme/app#7\ncanon: updated the docs", labels=[{"name": "fleet:merge-captain"}])
         patch = mock.patch.object(sb, "gate_floor_fact", lambda *a, **k: {"decision": "ok", "reasons": [], "cleared": False, "unreadable": None, "rehold": None})
         patch.start()
         self.addCleanup(patch.stop)
