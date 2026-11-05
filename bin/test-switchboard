@@ -28987,7 +28987,7 @@ class LedgerBase(Base):
             return subprocess.CompletedProcess(argv, 0, json.dumps(self.plan_issue), "")
         if "/actions/runs" in path:
             run = {"id": 1, "head_sha": self.pr["headRefOid"], "status": "completed", "conclusion": "success",
-                   "pull_requests": [{"number": n, "base": {"sha": self.run_base}} for n in (9, 11)]}
+                   "pull_requests": [{"number": n, "base": {"sha": self.run_base}} for n in (9, 11, 12)]}
             return subprocess.CompletedProcess(argv, 0, json.dumps({"workflow_runs": [run]}), "")
         if "/git/ref/heads/" in path:
             return subprocess.CompletedProcess(argv, 0, json.dumps({"object": {"sha": "t" * 40}}), "")
