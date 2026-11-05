@@ -1245,6 +1245,7 @@ cmd_remind.header_cache = True    # #1520
 
 CI_QUEUE_GATE_LEGS = ("test (ubuntu-latest)", "test-cloud (ubuntu-latest)", "test (macos-latest)", "test-cloud (macos-latest)")   # bin/merge_gate.py UBUNTU_LEGS + MAC_LEGS (a test holds them equal)
 CI_QUEUE_GATE_FEEDERS = ("plan",)   # a job no gate names but that builds the matrix of the jobs a gate does name: never a cut candidate
+CI_QUEUE_WORKFLOWS = Path(__file__).resolve().parents[2] / ".github" / "workflows"   # #2197: the workflow files whose job names a gate reads
 CI_QUEUE_PAGES = 10                 # pages of 100 read for one run's jobs (bounded)
 CI_QUEUE_RUN_PAGES = 40             # pages of 100 read for the run list (bounded)
 
@@ -1384,6 +1385,37 @@ def ci_queue_platform_paths(path):
     except (OSError, UnicodeError):
         return []
     return [line.strip() for line in text.splitlines() if line.strip() and not line.lstrip().startswith("#")]
+
+
+def ci_queue_workflow_jobs(directory):
+    """The job names the workflow files in `directory` give their checks, a literal matrix list (`key: [1, 2]`) expanded one name per value (#2197: a gate
+    reads them by name). A name that stays a `${{ ... }}` placeholder (a matrix built at run time) is not returned. [] when the files cannot be read."""
+    names = []
+    for path in sorted(Path(directory).glob("*.yml")):
+        try:
+            lines = path.read_text().splitlines()
+        except (OSError, UnicodeError):
+            continue
+        jobs, current, in_jobs = [], None, False
+        for line in lines:
+            if re.match(r"jobs:\s*$", line):
+                in_jobs = True
+            elif in_jobs and re.match(r"  [\w-]+:\s*$", line):
+                current = {"id": line.strip()[:-1], "name": None, "matrix": {}}
+                jobs.append(current)
+            elif in_jobs and current is not None:
+                found = re.match(r"    name:\s*(.+?)\s*$", line)
+                lists = re.match(r"        (\w+):\s*\[(.*)\]\s*$", line)
+                if found:
+                    current["name"] = found.group(1).strip("\"'")
+                elif lists:
+                    current["matrix"][lists.group(1)] = [v.strip().strip("\"'") for v in lists.group(2).split(",") if v.strip()]
+        for item in jobs:
+            expanded = [item["name"] or item["id"]]
+            for key, values in item["matrix"].items():
+                expanded = [n.replace("${{ matrix.%s }}" % key, v) for n in expanded for v in values] if any("${{ matrix.%s }}" % key in n for n in expanded) else expanded
+            names.extend(n for n in expanded if "${{" not in n)
+    return tuple(names)
 
 
 def cmd_ci_queue(args, runner, now):

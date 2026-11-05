@@ -285,4 +285,26 @@ def build(HandoffCase, FAKE_GH):
             space = self.measure(runs, jobs, docs_only=())
             cut = [c["what"] for c in space["candidates"] if c["kind"] == "cut"]
             self.assertEqual(cut, ["stale-report"])
+
+        WORKFLOW = ("name: test\njobs:\n  plan:\n    runs-on: x\n  shards:\n    name: shards (${{ matrix.shard }}/3)\n    strategy:\n      matrix:\n"
+                    "        shard: [1, 2, 3]\n  test:\n    name: ${{ matrix.name }}\n    strategy:\n      matrix:\n        include: ${{ fromJSON(x) }}\n")
+
+        def gate_jobs(self):
+            folder = self.home / "wf"
+            folder.mkdir(exist_ok=True)
+            (folder / "test.yml").write_text(self.WORKFLOW)
+            return folder, sb.ci_queue_workflow_jobs(folder)
+
+        def test_s2_the_jobs_of_a_workflow_are_read_with_the_matrix_expanded_and_no_placeholder(self):
+            _, names = self.gate_jobs()
+            self.assertEqual(sorted(names), ["plan", "shards (1/3)", "shards (2/3)", "shards (3/3)"])
+
+        def test_s2_s3_a_matrix_job_a_gate_reads_is_no_cut_and_a_job_no_gate_reads_is_one_with_its_minutes(self):
+            _, names = self.gate_jobs()
+            runs = [run(1, "test", "pull_request", "aa", 0)]
+            jobs = {1: [job("shards (%d/3)" % i, 0, 0, 10) for i in (1, 2, 3)] + [job("shards (${{ matrix.shard }}/3)", 0, 0, 4), job("stale-report", 0, 0, 7)]}
+            space = self.measure(runs, jobs, docs_only=(), gate_names=GATE + names)
+            cut = [c for c in space["candidates"] if c["kind"] == "cut"]
+            self.assertEqual(len([c for c in cut if "shards" in c["what"] or "matrix" in c["what"]]), 0)
+            self.assertEqual([(c["what"], c["job_minutes_per_day"]) for c in cut], [("stale-report", 7)])
     return TestCiQueue
