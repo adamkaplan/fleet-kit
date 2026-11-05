@@ -1171,6 +1171,21 @@ def _preflight_env(env, home):
     return clean
 
 
+def _preflight_not_run(repo, exc):
+    """The refusal text when the preflight did not run: on its time limit, the last `step:` line the child printed (subprocess.run keeps the partial
+    stderr on the TimeoutExpired it re-raises) and the seconds waited; every other cause keeps the old text."""
+    if not isinstance(exc, subprocess.TimeoutExpired):
+        return "refused: the repository preflight for %s could not be run; nothing was created" % scrub(repo, (), 120)
+    err = exc.stderr
+    err = err.decode("utf-8", "replace") if isinstance(err, bytes) else (err or "")
+    steps = [x.strip()[len("step: "):] for x in err.splitlines() if x.startswith("step: ")]
+    step = steps[-1] if steps and steps[-1] in ("token mint", "repository read") else "its start"
+    text = "refused: the repository preflight for %s timed out after %s s at %s; nothing was created" % (scrub(repo, (), 120), PREFLIGHT_SECONDS, step)
+    if step == "token mint":
+        text = text.replace("; nothing was created", "; the key vault is unreachable from this host; nothing was created")
+    return text
+
+
 def check_repo_preflight(repo, env):
     """The one preflight call (the operator driver and `launch --cloud` both call it), run AFTER the allow-list and BEFORE any token is minted.
     Returns the preflight's one result line. Raises CloudError(EXIT_USAGE) (fail closed) unless the program ran, exited 0 and printed something:
@@ -1180,7 +1195,7 @@ def check_repo_preflight(repo, env):
         with tempfile.TemporaryDirectory(prefix="cw-preflight-") as home:   # 0700, empty, removed when the child ends (also on failure)
             p = subprocess.run(argv, capture_output=True, text=True, timeout=PREFLIGHT_SECONDS, stdin=subprocess.DEVNULL, env=_preflight_env(env, home), cwd=home)
     except (OSError, subprocess.TimeoutExpired, ValueError):
-        raise CloudError("refused: the repository preflight for %s could not be run; nothing was created" % scrub(repo, (), 120), EXIT_USAGE) from None
+        raise CloudError(_preflight_not_run(repo, sys.exc_info()[1]), EXIT_USAGE) from None
     for x in (p.stderr or "").splitlines():   # only the child's own retry lines (already scrubbed texts), once each, in order
         if x.startswith("mint try "):
             print(scrub(x.strip(), (), 300), file=sys.stderr)

@@ -350,7 +350,9 @@ def main(argv):
             base = app_token.api_base()
         except SystemExit:  # already said why on stderr
             raise Unreadable("the API base is refused")
+        print("step: token mint", file=sys.stderr, flush=True)
         token = get_token(target)
+        print("step: repository read", file=sys.stderr, flush=True)
         repo = get(base, "/repos/" + target, token)
         branch = branch or (repo.get("default_branch") if isinstance(repo, dict) else None)
         if not isinstance(branch, str) or not branch:
