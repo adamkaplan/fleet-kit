@@ -1,4 +1,4 @@
-"""#2145: the end hook marks a finished pod's draft pull request ready (S2, S3) and the end notice says so (S4). A fake hub, a scratch repository."""
+"""The end-hook ask: the end hook marks a finished pod's draft pull request ready (S2, S3) and the end notice says so (S4). A fake hub, a scratch repository."""
 import json
 import os
 import subprocess
