@@ -251,7 +251,7 @@ class Route(unittest.TestCase):
         self.caught(self.check_fd, "        write_all(value, data)\n        return", "        print(token)\n        write_all(value, data)\n        return")
         self.caught(self.check_out, "    os.close(fd)\n\n\ndef main", "    print(token)\n    os.close(fd)\n\n\ndef main")
         self.caught(self.check_out, "os.O_EXCL | os.O_NOFOLLOW, 0o600", "os.O_NOFOLLOW, 0o600",   # no exclusivity (and no early check, which is a second line of defence)
-                    ('    if os.path.lexists(path):\n        die("refusing: --out path exists; the mint never overwrites", 1)\n', ""))
+                    ('    if os.path.lexists(path):\n        die("refusing: --out path exists; the mint never overwrites", "other", 1)\n', ""))
         self.caught(self.check_out, "os.O_EXCL | os.O_NOFOLLOW, 0o600", "os.O_EXCL | os.O_NOFOLLOW, 0o644")
 
     # -- DW-3: the launcher's two default calls --

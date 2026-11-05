@@ -104,7 +104,7 @@ def build(Base):
         def test_S4_mutant_is_caught(self):
             anchor = "a blank evidence is refused"
             self.check_S4()   # the unmutated control first
-            old = "    text = plan_ledger.clip(redact_command_text(args.evidence), plan_ledger.EVIDENCE_LIMIT)\n    if not text:\n"
+            old = "    text = plan_ledger.bounded_text(redact_command_text(args.evidence), plan_ledger.EVIDENCE_LIMIT, \"evidence\")\n    if not text:\n"
             self.caught(self.check_S4, anchor, old, old.replace("if not text:", "if not args.evidence:"))
 
     return TestVerdictEvidence

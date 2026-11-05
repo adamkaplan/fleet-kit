@@ -329,10 +329,10 @@ def build():
             """#2200: a plan with a trailing marker line; its legacy hash (marker included) is the one held."""
             record = self.post(3, self.plan(), agent="platform")
             hashes = sb.plan_check.plan_hashes(record["body"])
-            self.assertEqual(len(hashes), 2)
+            self.assertGreaterEqual(len(hashes), 2)   # the new hash and at least one earlier scheme; how many schemes there are is not pinned
             if announce_legacy:
                 self.engine.plan_wake = sb.PlanWakeState(self.engine.state_dir)
-                self.engine.plan_wake.announced["acme/api#3:%s" % hashes[1]] = self.world.clock.now()
+                self.engine.plan_wake.announced["acme/api#3:%s" % hashes[-1]] = self.world.clock.now()
             return record, hashes
 
         def test_s2_a_plan_announced_under_its_legacy_hash_raises_no_notice_and_records_the_new_key(self):
@@ -346,7 +346,7 @@ def build():
         def test_s2_a_plan_approved_under_its_legacy_hash_records_the_new_key_and_is_not_unapproved(self):
             record, hashes = self.legacy_world(False)
             self.engine.plan_wake = sb.PlanWakeState(self.engine.state_dir)
-            self.engine.plan_wake.approved["acme/api#3:%s" % hashes[1]] = self.world.clock.now()
+            self.engine.plan_wake.approved["acme/api#3:%s" % hashes[-1]] = self.world.clock.now()
             with mock.patch.object(sb, "_audit_tail", lambda state_dir: []):
                 self.go(2)
             self.assertEqual(self.lines(), [])

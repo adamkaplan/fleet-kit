@@ -138,7 +138,7 @@ class TestEpicRecordPlacement(unittest.TestCase):
         for n in NAMES + ("epic_record", "importlib"):
             self.assertNotRegex(pl, r"(?m)^(def |class )?%s\b" % n)
             self.assertFalse(hasattr(plan_ledger, n), n)
-        self.assertLess(len(pl.splitlines()), 1500)
+        self.assertLessEqual(len(pl.splitlines()), 1500)   # the architecture ceiling (SOURCE_LIMIT in test_architecture) allows exactly 1500: a file AT it is within it
         for n in NAMES:
             self.assertTrue(hasattr(epic(), n), n)
 

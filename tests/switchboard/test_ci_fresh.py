@@ -670,14 +670,14 @@ class TestCiFreshSeamMutants(FreshCase):
     """The fakes of the existing fixtures answer a run list whose base is their `run_base` (default: the tip). A copy of each seam whose run list ignores `run_base` and answers the tip
     makes the stale test of its family fail with the anchored text of that test's assertion; the unmutated copy passes the same test (the control)."""
 
-    SEAMS = (("LedgerBase", "route", '"base": {"sha": self.run_base}} for n in (9, 11)]}', '"base": {"sha": "t" * 40}} for n in (9, 11)]}',
+    SEAMS = (("LedgerBase", "route", '"base": {"sha": self.run_base}}', '"base": {"sha": "t" * 40}}',
               (("TestCiRecordPass", "test_a_stale_run_records_no_verdict_and_says_the_stale_line", "ci-record records no verdict for a stale run"),
                ("TestPlanGatesCheck", "test_a_stale_run_makes_g4_missing_with_the_stale_line", "the G4 row is missing for a stale run"))),
-             ("TestCiRecordCarry", "route", '"base": {"sha": self.run_base}} for n in (9, 11)]}', '"base": {"sha": "t" * 40}} for n in (9, 11)]}',
+             ("TestCiRecordCarry", "route", '"base": {"sha": self.run_base}}', '"base": {"sha": "t" * 40}}',
               (("TestCiRecordCarry", "test_a_stale_run_carries_nothing_and_prints_the_stale_line", "a stale run carries no proof: exit code"),)),
-             ("BaselineWorld", "route", '"base": {"sha": self.run_base}} for n in self.prs]}', '"base": {"sha": "t" * 40}} for n in self.prs]}',
+             ("BaselineWorld", "route", '"base": {"sha": self.run_base}}', '"base": {"sha": "t" * 40}}',
               (("TestDecisionBaselineNotices", "test_a_stale_run_reads_stale_in_the_notice_facts", "the panel notice facts read stale: 3 behind"),)),
-             ("FakeGhPr", "__call__", '"base": {"sha": self.run_base}} for n in (7, 8)]}', '"base": {"sha": "t" * 40}} for n in (7, 8)]}',
+             ("FakeGhPr", "__call__", '"base": {"sha": self.run_base}}', '"base": {"sha": "t" * 40}}',
               (("TestPrNotices", "test_a_stale_run_reads_stale_in_the_pull_request_notice", "the pull request notice reads stale: 3 behind"),)))
 
     def seam(self, cls, name, old, new):
