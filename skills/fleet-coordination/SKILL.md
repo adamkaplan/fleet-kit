@@ -437,5 +437,3 @@ If a cloud worker is kept because its end hook could not push, send the pod one 
 Full suites and browser/e2e runs go through `fleet-switchboard heavy -- <cmd>`: it waits for one of a few CPU slots and runs the command at background priority, so many agents do not starve the machine.
 
 An agent that is asked to run a mutation or fault-injection check (a tester or the orchestrator's own worker, never a reviewer, who runs nothing) runs each run through `fleet-switchboard heavy` with a time limit (`heavy -- timeout N <command>`), in its own process group which it stops as a whole when the limit is hit, and runs in the background only as a named job with a time limit and a job record (the job-start rule), never as a loose background process. The wrapper also stops a tree that passes its ceiling, but do not rely on that for a mutant that can loop.
-
-To change one line of an issue body (the next step, a parked date) use `fleet-switchboard issue-line`, which never changes the Intent or the Done-when; a whole-body write must keep both the Intent and the Done-when, and the gh shim refuses one that drops either.
