@@ -222,8 +222,8 @@ cloud/launcher/run_task.py WORKER OWNER/NAME BRANCH BRIEF_FILE [--pull-secret NA
 ```
 
 The target repository is an argument and has no default. The driver reads the model entry (the one `github-copilot` entry of OpenCode's own
-credential store, read with `opencode auth export` in a scrubbed environment through a pipe, in memory; `CW_OPENCODE_BIN` names the program) and a git token (the output of `CW_GIT_TOKEN_CMD`;
-default `app_token.py OWNER/NAME` beside the driver, the one-hour GitHub App token) in memory, creates the pod through
+credential store, read with `opencode auth export` in a scrubbed environment through a pipe, in memory; `CW_OPENCODE_BIN` names the program) and a git token (the stdout of `CW_GIT_TOKEN_CMD`;
+default `app_token.py OWNER/NAME --fd N` beside the driver, which hands the one-hour GitHub App token over a pipe of its own, never standard output or standard error, and never prints it) in memory, creates the pod through
 the launcher with both handed over inherited pipes (`--run-secret-fd`), port-forwards, opens a session, sends the brief,
 waits for idle, then stops the worker (the end hook pushes the work; the pod and its Secrets are deleted).
 
@@ -591,3 +591,5 @@ minutes) belongs to the launcher.
 - The fixer image is pinned by tag, not digest: pin it for a release (the OpenCode binary is already pinned with its sha256).
 - `cloud/tests/test-cloud` is not yet run by CI (this change is limited to `cloud/`); it needs Docker for the image cases
   (`CLOUD_TEST_SKIP_DOCKER=1` skips them explicitly).
+
+**The reaper pass line and the renewal tick line (#1742).** The reaper writes one `reaper pass line` for each pass and one `renewal tick line` for each tick of its renewal thread, on its own log (standard error), not in the audit. Each line holds its numbers: `cpu_seconds`, the CPU seconds of the thread that ran the pass or the tick, and `audit_lines_parsed`, the audit lines read and parsed in it for the renewal's failure lookup; the pass line holds those two numbers and the seconds and counts of the seven steps of the pass (`list`, `renew`, `vanished`, `activity`, `stops`, `orphans` and `notes`, with the number of pods for `activity` and `stops`, and the `total`), and nothing else. They are counts only: no pod name, no worker name, no address, no value. To see whether the reaper spends CPU between passes, read the renewal tick lines: a tick with a high `cpu_seconds` or a high `audit_lines_parsed` is where the CPU went; a tail is read once per tick, so `audit_lines_parsed` is at most the lines of the audit tail (about 262,144 bytes). The step with the most seconds in the pass line is where a slow pass spent its time.

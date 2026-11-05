@@ -28,6 +28,7 @@ class TestTheBinSetClassesAreAllInTheTable(unittest.TestCase):
         "TestAdoption": "reads every module's text for the adoption words, and passed with a planted unlisted module",
         "TestEveryViewDerivesFromTheRegistry": "lists bin/ for the views a command registers, and passed with a planted unlisted module",
         "TestAssembler": "copies the sibling modules the entry loads into a fixture, and passed with a planted unlisted module",
+        "TestClaimLegacy": "copies the modules of bin/ into a fixture tree for the source-copy mutants of the claim-ledger rule, and passed with a planted unlisted module",
         "TestOwnMarkerNotHonoured": "reads every module's text for the marker, and passed with a planted unlisted module",
         "TestLatestRunOfWorkflow": "copies the bin/ files into a fixture tree, and passed with a planted unlisted module",
         "TestArchTools": "copies the sibling modules into a fixture tree for the architecture tools, and passed with a planted unlisted module",
@@ -35,6 +36,8 @@ class TestTheBinSetClassesAreAllInTheTable(unittest.TestCase):
         "TestPlatformPaths": "lists bin/ only for the files named test-cloud-launcher*, and passed with a planted unlisted module (a file outside that name is never read)",
         "TestGitShim": "lists bin/test-* for the suites that must route git through the shim; a new bin file that is not a test-* file is not read",
         "TestConflictCarry": "lists the modules of bin/ whose names contain clear, hold or floor to compare them with its carried table; a name outside that pattern is not read (the classes could not run in the pod: the git wrapper refuses their setUp; named so)",
+        "TestOpenListCeilingMutant": "copies the flat modules of bin/ into a temp fixture tree to run a mutated entry against them; what it plants is that temp copy, nothing under the repository's bin/ is added or listed, and it passed with a planted unlisted module",
+        "TestReadPagesStrictMutant": "copies bin/fleet-switchboard into a temp file to run a mutated read_pages against a fake runner; what it plants is that temp copy, nothing under the repository's bin/ is added or listed, and it passed with a planted unlisted module",
         "TestCiTestFileList": "derives every bin/test-* file from the directory and judges the CI list (bin/ci-test-files.txt) against it, so a new bin file is judged by its own derivation, and it passed with a planted unlisted module",
     }
     FAILED_ON_1429 = ("TestArchitectureDocument", "TestAuthorityModulesGuard", "TestImpactHold", "TestRecordJsonReaders", "TestTheReaperOnlyInstall", "TestRecordingCommands", "TestDerivedClosure")
@@ -43,7 +46,14 @@ class TestTheBinSetClassesAreAllInTheTable(unittest.TestCase):
     def reading_classes(cls, name, text):
         """{class name} of the top-level classes of `text` whose source lists the bin/ directory's files."""
         tree = ast.parse(text)
-        return {n.name for n in tree.body if isinstance(n, ast.ClassDef) and n.name != cls.__name__ and (cls.READS.search(ast.get_source_segment(text, n) or "") or cls.READS_MORE.search(ast.get_source_segment(text, n) or ""))}
+        lines = ast._splitlines_no_ff(text)   # split once: ast.get_source_segment re-splits the whole text on every call (same segment)
+
+        def segment(n):
+            first, last = n.lineno - 1, n.end_lineno - 1
+            if first == last:
+                return lines[first].encode()[n.col_offset:n.end_col_offset].decode()
+            return lines[first].encode()[n.col_offset:].decode() + "".join(lines[first + 1:last]) + lines[last].encode()[:n.end_col_offset].decode()
+        return {n.name for n in tree.body if isinstance(n, ast.ClassDef) and n.name != cls.__name__ and (cls.READS.search(segment(n)) or cls.READS_MORE.search(segment(n)))}
 
     @classmethod
     def derived(cls):

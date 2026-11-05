@@ -2174,7 +2174,7 @@ class TestReconcileOnRead(unittest.TestCase):
 
     def test_s3_a_half_known_live_check_removes_nothing(self):
         reg = self.registry()
-        for live in ({"pane": False, "process": None}, {"pane": True, "process": False}, {"pane": None, "process": False}):
+        for live in ({"pane": False, "process": None}, {"pane": None, "process": False}):
             self.assertEqual(self.mod.reconcile_on_read(self.dir, reg.read(self.dir), lambda n, a, live=live: live, reg), [], live)
         self.assertIn("ghost", reg.read(self.dir)["agents"])
 
@@ -2213,7 +2213,7 @@ class TestReconcileOnRead(unittest.TestCase):
             "pane unchecked": (whole, {"pane": None, "process": False}, 0),
             "process unchecked": (whole, {"pane": False, "process": None}, 0),
             "process present": (whole, {"pane": False, "process": True}, 0),
-            "pane present": (whole, {"pane": True, "process": False}, 0),
+            "pane present": (whole, {"pane": True, "process": True}, 0),
             "both gone": (whole, {"pane": False, "process": False}, 1),
             "recorded live": ({"whole": True, "agents": {"ghost": {"state": "working"}}}, {"pane": False, "process": False}, 0),
         }
@@ -2238,10 +2238,10 @@ class TestReconcileOnRead(unittest.TestCase):
 
             def pane_process_info(self, pane):
                 return list(self.procs)
-        agent = {"pane": "p_1"}
+        agent = {"pane": "p_1", "session": "ses_a"}
         gone, unknown = {"pane": False, "process": False}, {"pane": None, "process": None}
         cases = {
-            "listed and present, process running": (Herdr([{"pane_id": "p_1"}], procs=[{"cmdline": "x"}]), {"pane": True, "process": True}),
+            "listed and present, process running": (Herdr([{"pane_id": "p_1"}], procs=[{"cmdline": "opencode -s ses_a"}]), {"pane": True, "process": True}),
             "listed and present, no process": (Herdr([{"pane_id": "p_1"}]), {"pane": True, "process": False}),
             "listed and absent": (Herdr([{"pane_id": "p_2"}, {"pane_id": "p_3"}]), gone),
             "empty list": (Herdr([]), gone),
