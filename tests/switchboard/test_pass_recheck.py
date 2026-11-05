@@ -465,7 +465,7 @@ class TestPassRecheckMutants(unittest.TestCase):
         self.assertFalse(result.wasSuccessful(), msg="a second age constant went unnoticed")
 
     def test_a_sweep_pass_that_sets_present_anyway_is_caught(self):
-        text = (Path(sb.__file__).resolve()).read_text()
+        text = (Path(sb.__file__).resolve().parent / "switchboard" / "sweep.py").read_text()
         start = text.index("def sweep_decisions(")
         end = text.index("\n\n\ndef sweep_queue_fact")
         old = "if seen_all else None"
@@ -545,8 +545,8 @@ class TestPassRecheckMutants(unittest.TestCase):
         self.assertFalse(result.wasSuccessful(), msg="an unknown hash read as a newer plan went unnoticed")
 
     def test_offering_a_sweep_fact_to_every_agent_is_caught(self):
-        text = (Path(sb.__file__).resolve()).read_text()
-        start, end = text.index("class SweepFacts:"), text.index("# ---- #765")
+        text = (Path(sb.__file__).resolve().parent / "switchboard" / "sweep.py").read_text()
+        start, end = text.index("class SweepFacts:"), len(text)
         old = '(o.fleet or {}).get("role") == "chief-of-staff")'
         body = text[start:end]
         self.assertEqual(body.count(old), 1, msg="the mutation target moved")
@@ -716,7 +716,7 @@ class TestPlanWakeMutants(unittest.TestCase):
 
     def test_a_plan_pass_that_does_not_record_the_present_hash_is_caught(self):
         name = "TestPlanWake.test_the_plan_pass_records_the_present_hash_so_a_replaced_plan_notice_is_dropped_and_the_new_one_kept"
-        text = Path(sb.__file__).resolve().read_text()
+        text = (Path(sb.__file__).resolve().parent / "switchboard" / "plan_notice.py").read_text()
         start = text.index("def plan_wake_pass(")
         end = text.index("\n\n\n", start)
         old = "wake.newest[(repo, number)] = plan_hash"
@@ -785,7 +785,7 @@ class TestSeenAllMutants(unittest.TestCase):
     """Each condition replaced by True in the real `sweep_decisions` (control first, mutation asserted applied, one mutant per condition)."""
 
     def caught(self, old, new, name):
-        text = Path(sb.__file__).resolve().read_text()
+        text = (Path(sb.__file__).resolve().parent / "switchboard" / "sweep.py").read_text()
         start = text.index("def sweep_decisions(")
         end = text.index("\n\n\ndef sweep_queue_fact")
         self.assertEqual(text[start:end].count(old), 1, msg="the mutation target moved")
