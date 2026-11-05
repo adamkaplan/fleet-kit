@@ -10646,7 +10646,7 @@ class GitHubHub:
             if isinstance(checks, list) and item.review_body:
                 note = load_module("required_checks").notice(item.review_body, [c for c in checks if isinstance(c, str)][:12])
                 if note:
-                    item.summary += "; " + _one_line(re.sub(r"[\x00-\x1f\x7f]", "", note), 400)
+                    item.summary += "; " + _one_line(scrub_signed_links(re.sub(r"[\x00-\x1f\x7f]", "", note)), 400)
         except Exception:
             pass
 

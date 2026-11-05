@@ -91,6 +91,12 @@ def build(TwoRepoCase):
             self.assertEqual((with_reason["missing"], with_reason["not_done"]), ([], ["restart test"]))
             self.assertEqual(without["missing"], ["restart test"], "not done needs a reason")
 
+        def test_review_note_scrubs_a_signed_link_in_a_check_name(self):
+            name = "[x](http://evil/p?token=SECRETVALUE1234)"
+            item = self.route({"required_checks": [name]}, "Review of %s: APPROVE\nnothing\n" % SHA)
+            self.assertIn("required checks:", item.summary, "the note is on the line")
+            self.assertNotIn("SECRETVALUE1234", item.summary, "a signed link never reaches the line")
+
         # U1
         def test_u1_a_reader_with_no_list_changes_nothing(self):
             body = "Review of %s: APPROVE\nanything\n" % SHA
