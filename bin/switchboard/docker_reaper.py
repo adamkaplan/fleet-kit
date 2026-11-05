@@ -553,7 +553,7 @@ def fact_sources(state_dir):
 
     The one registration point. Worker facts (PR 4), GitHub facts (PR 5) and
     reminders join this list. `send` delivers directly, by the same rule, and
-    stores only a send held for a blocked agent (HeldSendFacts).
+    stores a send held for any hold reason: blocked, unknown status, problem or conflict (HeldSendFacts).
     """
     return [lab_fact_source(state_dir), WorkerFacts(), ReminderFacts(state_dir), ReportRiderFacts(state_dir), HeldSendFacts(state_dir),
             ForegroundFacts(), OrdersFacts(), SweepFacts(), TriageFacts(), PlanWakeFacts(), AlertWakeFacts(), RedCiFacts(), JobFacts(), PaneFacts(), PaneExitFacts(), HeadlessRestartFacts(), DiskFacts(), CpuFacts(), SpotlightFacts(), DockerReapFacts(), TempJanitorFacts(), HeavyOrphanFacts(), ScratchBoundFacts()]

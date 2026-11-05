@@ -2938,7 +2938,7 @@ class Switchboard:
             if self.audit is not None:
                 self.audit.append(self.actor, "hold", recipient, {"reason": plan.reason, "keys": [fact.key]})
             if fact.kind == "send" and fact.key.startswith("send:") and self.state_dir is not None and held_send_applies(plan.observation):
-                return hold_send_fact(self, fact, now)   # #2051: a send to a blocked agent is held, never refused
+                return hold_send_fact(self, fact, now)   # #2051: a send to an agent with any hold reason is held, never refused
             note_held_send(self.state_dir, recipient, fact.sender, now, plan.observation)
             return {"sent": False, "action": "hold", "reason": plan.reason}
         return self.deliver(plan, interrupt=interrupt)
@@ -9071,7 +9071,7 @@ def blocked_tick(engine, discovery, held):
     return done
 
 
-# ------------------------------------------------- held sends (#2051): a send to a blocked agent waits, it is not refused
+# ------------------------------------------------- held sends (#2051): a send to an agent with any hold reason waits, it is not refused
 
 HELD_SENDS = "held-sends.json"       # {recipient: {"rows": [{"key", "from", "at", "text", "issue", "repo", "route"}]}}: a send held while its recipient was blocked
 HELD_SENDS_KEEP = 50                 # rows kept per recipient: the 51st send drops the oldest, and its sender is told
@@ -9080,8 +9080,8 @@ HELD_ROUTE_PANE, HELD_ROUTE_ENDPOINT = "pane", "endpoint"
 
 
 def held_send_applies(observation):
-    """A send is held only for the `blocked` reason (a permission request or a question): nothing else would end by itself."""
-    return observation is not None and observation.status == "blocked" and not observation.conflict and not observation.problem
+    """#1400: a send is held for every hold reason (blocked, unknown status, a problem, a conflict); only a recipient that cannot be observed (gone) is refused."""
+    return observation is not None and hold_reason(observation) is not None
 
 
 def _held_first_words(text):
