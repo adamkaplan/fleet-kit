@@ -22,6 +22,7 @@ BIN_SWITCHBOARD_TEST = os.path.join(ROOT, "bin", "test-switchboard")
 ROW_LINE = '''            ' > getattr(args, "persistent", Fa|return EXIT_USAGE': (B + ["--persistent"], []),\n'''
 RESULT = "refused before any pod exists: it says nothing was created"
 ENTRY_LINES = ["        '--persistent is only for --age': '%s',\n" % RESULT, "        '--persistent does not combine ': '%s',\n" % RESULT]
+INTEGRATION_KEYS = ["'the stack model secret %s coul'", "'%s; nothing was created'"]   # what the scan names for the raise integration added (#1435): the text is cut at 30 characters, and its second form is the bare tail
 DERIVED = "test_s6_every_refusal_exit_derived_from_the_source_has_a_row_and_sends_exactly_one_message"
 CREATED = "test_s9_no_raise_of_the_launcher_mentions_a_created_worker_in_other_words"
 BLOCK_RENEWAL = '''            if ann(pod, "persistent") is not None:   # a persistent pod has no hard deadline: it is always before its limit
@@ -80,10 +81,8 @@ class S21Entries(CopyRun):
         read failure, #1435): a key the table lacks is added to the copy only, so the control isolates the two persistent entries."""
         head = "    CREATED_EXEMPT = {\n"
         self.assertEqual(src.count(head), 1)
-        key = "'the stack model secret %s coul'"
-        if key in src:
-            return src
-        return src.replace(head, head + "        %s: '%s',\n" % (key, RESULT))
+        added = "".join("        %s: '%s',\n" % (key, RESULT) for key in INTEGRATION_KEYS if key not in src)
+        return src.replace(head, head + added)
 
     def test_s21_the_control_passes_and_the_copy_without_the_two_entries_names_the_stray_raise(self):
         src = self.source()
