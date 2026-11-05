@@ -4953,7 +4953,7 @@ check names no head the merge is allowed unbound and recorded as a fail-open. Ev
 
 What it does: for a PR whose repo is listed under `plan_gates.repos` in the switchboard config (matched without regard to case;
 with no `plan_gates`, or another repo, nothing is probed and the cost is zero), it runs
-`fleet-switchboard gates-check <repo#N> --for ready|merge --json` with a bound of **3 seconds** (`FLEET_SHIM_GATE_SECONDS`, kept
+`fleet-switchboard gates-check <repo#N> --for ready|merge --json` with a bound of **8 seconds** (was 3; `FLEET_SHIM_GATE_SECONDS`, kept
 between 0.2 and 10), after which the child is killed and the command goes on. The check itself records `gate.would_refuse` in the
 audit (shadow) and its own `gate.fail_open`. What the shim adds is a line in `gate-failopen.jsonl` in the state directory (mode
 0600, at most 256 KB) for the cases only the shim can see: `would_refuse` (the check exited 10), `fail_open` (it timed out, could not
