@@ -3582,6 +3582,11 @@ def launch_problems(name, agent, directory, workspace, issue, charter=None, head
     return problems
 
 
+def brief_required_checks(brief):
+    """#2203: the brief's marked block of required checks (the same bounded parse the local launch uses); the cloud launch reaches it by this name."""
+    return load_module("required_checks").parse(brief)
+
+
 def fleet_record(name, role, reports_to, issue, charter=None, repo=None, launched_by=None, read_repo=None, choice=None, required_checks=None):
     fleet = {"name": name, "role": role, "reports_to": reports_to, "issue": None if issue is None else int(issue),
              "charter": charter, "repo": repo, "launched_by": launched_by, "read_repo": read_repo}   # launched_by (#372): the agent that ran `launch`, as its pane identified it; None from a plain shell

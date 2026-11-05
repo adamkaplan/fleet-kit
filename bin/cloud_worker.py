@@ -861,7 +861,7 @@ def _launch(args, runner, now, reserve):
                 remove_record(state, name)
             raise LaunchError("%s: %s (the worker %s was created; %s)" % (
                 name, problem, name, "it was stopped and its record dropped" if stopped else "the stop failed: the pod and its record are kept; stop it with `%s retire %s`" % (H["PROG"], name)))
-        fleet = H["fleet_record"](name, args.role, args.reports_to, None if args.issue is None else int(args.issue), args.charter, repo, *((None, None, choice) if choice else ()))
+        fleet = H["fleet_record"](name, args.role, args.reports_to, None if args.issue is None else int(args.issue), args.charter, repo, None, None, choice, H["brief_required_checks"](brief))   # #2203: the brief's marked block rides in the session's fleet metadata (what discovery reads); no block, no key
         try:
             with tunnel(cluster, record) as live:
                 v2 = remote_v2(state, live, engine.config["call_timeout_seconds"])
