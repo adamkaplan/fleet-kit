@@ -63,8 +63,28 @@ def _fleet_parts(after=False):
     cut = paths.index(here) if here in paths else len(paths)
     for path in (paths[cut + 1:] if after else paths[:cut]):
         try:
-            import importlib.machinery   # #2230: the same source, compiled once and kept beside it in __pycache__ (checked against the file's time and size), not at every start
-            code = importlib.machinery.SourceFileLoader("fleet_part", path).get_code("fleet_part")
+            import marshal   # #2230: each part's compiled code is kept in __pycache__ beside it, stamped with the source's mtime, size and the interpreter version; a part that changed is compiled again
+            info = os.stat(path)
+            stamp = ("%d %d %d.%d" % (info.st_mtime_ns, info.st_size, sys.version_info[0], sys.version_info[1])).encode()
+            kept = os.path.join(os.path.dirname(path), "__pycache__", os.path.basename(path) + ".fleetpart")
+            code = None
+            try:
+                with open(kept, "rb") as handle:
+                    head, _, blob = handle.read().partition(b"\n")
+                if head == stamp:
+                    code = marshal.loads(blob)
+            except (OSError, ValueError, EOFError, TypeError):
+                code = None
+            if code is None:
+                with open(path) as handle:
+                    code = compile(handle.read(), path, "exec")
+                try:
+                    os.makedirs(os.path.dirname(kept), exist_ok=True)
+                    with open(kept + ".%d.tmp" % os.getpid(), "wb") as handle:
+                        handle.write(stamp + b"\n" + marshal.dumps(code))
+                    os.replace(kept + ".%d.tmp" % os.getpid(), kept)
+                except OSError:
+                    pass   # a cache is best effort
         except OSError:
             sys.exit("fleet-switchboard: part file not found: %s" % path)
         exec(code, globals())

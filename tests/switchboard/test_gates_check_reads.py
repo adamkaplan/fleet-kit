@@ -13,7 +13,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[2]
 PROGRAM = REPO / "bin" / "fleet-switchboard"
 
-FAKE_GH = """#!/usr/bin/env python3
+GH_STUB_TEXT = """#!/usr/bin/env python3
 import json, sys
 open(%(log)r, "a").write(" ".join(sys.argv[1:]) + "\\n")
 a = sys.argv[1:]
@@ -32,7 +32,7 @@ def run_check(mode, enabled=True, touch_part=False):
     root = Path(tempfile.mkdtemp(prefix="gates-reads-"))
     log = root / "calls.log"
     gh = root / "gh"
-    gh.write_text(FAKE_GH % {"log": str(log)})
+    gh.write_text(GH_STUB_TEXT % {"log": str(log)})
     gh.chmod(0o755)
     oc = root / "opencode"
     oc.write_text("#!/bin/sh\nexit 0\n")
