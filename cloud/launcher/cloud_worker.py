@@ -3137,7 +3137,9 @@ class Launcher:
                     self._register(worker, run_values[CHANNEL_SECRET_KEY], spec if not persistent else {"metadata": {"name": name + "-0"}},
                                    self.env.get("CW_CLOUD_DOMAIN", "example.internal"), password, persistent, a.repo, issue_no)
                 self._make(made, "sts" if persistent else "pod", self.kube.apply, spec)
-                if getattr(a, "stack", False):
+                if getattr(a, "no_wait", False):
+                    pass   # the caller asked to return once the pod is requested: it reads the pod's readiness itself
+                elif getattr(a, "stack", False):
                     self._start_stack_pod(worker, name, spec, made, a.wait)
                 else:
                     self._wait_ready(name + "-0" if persistent else name, a.wait)
@@ -4079,7 +4081,8 @@ class Launcher:
             meta = pod.get("metadata") or {}
             pods.append({"name": meta.get("name"), "worker": ann(pod, "worker"),
                          "phase": safe_value((pod.get("status") or {}).get("phase")) if (pod.get("status") or {}).get("phase") else None,
-                         "node": (pod.get("spec") or {}).get("nodeName"), "hard_deadline": ann(pod, "hard-deadline")})
+                         "node": (pod.get("spec") or {}).get("nodeName"), "hard_deadline": ann(pod, "hard-deadline"),
+                         "ready": any(c.get("type") == "Ready" and c.get("status") == "True" for c in ((pod.get("status") or {}).get("conditions") or []) if isinstance(c, dict))})
         nodes, nodes_read, nodes_error = [], True, None
         try:
             for node in self.kube.list_nodes():
@@ -5251,6 +5254,7 @@ def build_parser():
     c.add_argument("--persistent", action="store_true",
                    help="with --agent orchestrator and the per-run git-token Secret: an always-on orchestrator as ONE StatefulSet (restart always, no deadline, no idle limit); ended only by an explicit stop; refused for a worker or a stack launch")
     c.add_argument("--wait", type=int, default=300)
+    c.add_argument("--no-wait", action="store_true", help="return once the pod is requested, without waiting for it to be ready (the caller reads the pod's state later)")
     c.add_argument("--pull-secret", help="name of an existing image-pull Secret (pull-only) for imagePullSecrets")
     c.add_argument("--run-secret-fd", action="append", default=[], metavar="NAME=N",
                    help="repeatable; the value is read from inherited descriptor N and piped to kubectl's stdin into the run's one Secret, mounted read-only at /run/cw/NAME (0400), deleted with the pod")

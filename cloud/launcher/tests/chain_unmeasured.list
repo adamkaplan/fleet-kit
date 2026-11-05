@@ -65,3 +65,5 @@ cloud/worker/tests/test_pr_record.py
 cloud/worker/tests/test_reach.py
 cloud/worker/tests/test_shell_check.py
 cloud/worker/tests/test_token_table.py
+cloud/launcher/tests/test_launch_idempotent.py
+cloud/launcher/tests/test_stop_failed_pod.py
