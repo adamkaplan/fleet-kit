@@ -50,6 +50,7 @@ class Behaviour(TCW.Base):
     def blocked_registry(self):
         """The registry's file cannot be read or written: a directory stands where registry.json goes."""
         os.makedirs(str(self.state), mode=0o700, exist_ok=True)
+        (self.state / REG.FILE).unlink(missing_ok=True)   # #1046: the base seeded the boss row, a file
         (self.state / REG.FILE).mkdir()
 
     def audit_lines(self, word):
@@ -84,7 +85,7 @@ class Behaviour(TCW.Base):
             self.assertEqual(code, 0, err)
             self.assertEqual(json.loads(out.strip().splitlines()[-1])["url"], json.loads((self.state / "cloud" / (name + ".json")).read_text())["url"])
         rows = self.rows()
-        self.assertEqual(sorted(rows), ["coder7", "coder8"])
+        self.assertEqual(sorted(rows), ["coder7", "coder8", "orch"])   # #1046: the base seeds the registered boss "orch"
         for name, url in urls.items():
             self.assertEqual(rows[name]["kind"], "cloud")
             self.assertNotIn("endpoint", rows[name])
@@ -149,7 +150,7 @@ class Behaviour(TCW.Base):
         with mock.patch.dict(os.environ, {"STUB_URL": "https://user:pw@worker.example.internal:4096"}):
             code, out, err = self.launch("coder7")
         self.assertEqual(code, 1)
-        self.assertEqual(self.rows(), {})
+        self.assertEqual(sorted(self.rows()), ["orch"])   # no launch row; only the seeded boss (#1046)
 
     def test_matches_a_registry_that_fails_says_one_line_without_endpoint_or_secret(self):
         url = self.remote.url

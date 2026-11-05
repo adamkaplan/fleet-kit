@@ -355,7 +355,7 @@ def build():
             self.configure(evaluators={"ci": ["switchboard"], "reviewer": ["rev"], "tester": ["tst"]})
             code, out, err = self.run_as(None, "gates", "ci-record", self.PR)
             self.assertEqual(code, 0, err)
-            self.assertEqual(self.ledger()[0]["evidence"], "CI green at %s: every check run complete and passing" % host.LEDGER_HEAD[:12])
+            self.assertEqual(self.ledger()[0]["evidence"], "CI green at %s on the tip tttttttttttt: every check run complete and passing" % host.LEDGER_HEAD[:12])   # #1755: the record names the tip a fresh run ran on
 
         def test_a_waiver_reason_of_201_is_still_cut_to_200(self):
             self.world.add_agent("cos", fleet={"role": "chief-of-staff"})

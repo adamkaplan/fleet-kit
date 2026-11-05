@@ -34,5 +34,5 @@ def build(Slow):
             self.assertEqual(now["all"] - now["open"], old["all"] - old["open"], "every other call of the pass is the same as at the old cap")
             # 1 s a call, plus 19 s more for each timed-out workflow read of this rig
             self.assertEqual(now["took"], now["all"] + 19 * now["runs"])
-            self.assertLessEqual(now["took"], sb.GITHUB_ROUTE_SECONDS + sb.GITHUB_ROUTE_READ_TIMEOUT + (sb.OPEN_LIST_PAGES - sb.SWEEP_LIST_PAGES), now["took"])
+            self.assertLessEqual(now["took"], sb.GITHUB_ROUTE_SECONDS + sb.GITHUB_ROUTE_READ_TIMEOUT + (sb.OPEN_LIST_PAGES - sb.SWEEP_LIST_PAGES) + (sb.COMMENT_WINDOW_PAGES - sb.SWEEP_LIST_PAGES), now["took"])
     return TestOpenListPassCalls

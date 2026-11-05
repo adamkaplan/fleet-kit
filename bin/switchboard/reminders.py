@@ -231,6 +231,7 @@ FINDING_TABLE = {
     "cmd_remind": ("a reminder the agent set (`remind`)", "its own id (a request, not a finding)", "none: sent as asked", "test_a_reminder_is_a_fact_only_once_it_is_due"),
     "set_checkpoint_reminders": ("checkpoint reminder", "launch (own id)", "once per launch", "test_a_launch_checkpoint_reminder_is_not_a_wait_and_a_workers_own_reminder_is"),
     "notify_drop": ("reminder drop notice", "dropped reminder (removed first)", "once", "test_a_drop_sends_the_setter_one_notice_naming_text_and_reason_audited_once"),
+    "comment_window_alert": ("comment window not read to its start alert", "repo, comments, day (own state, open-list-alert.json)", "once a day per repository", "test_s4_a_window_not_read_to_its_start_is_said_once_a_day"),
     "open_list_alert": ("open-item list cut alert", "repo and day (own state, open-list-alert.json)", "once a day per repository", "test_s4_one_alert_a_day_and_one_more_the_next_day"),
     "SweepFacts": ("sweep (a fact, merged per wake)", "set and slot (own key)", "re-alarm hours", "test_s4_three_finding_kinds_of_one_wake_are_one_queued_message_with_three_lines"),
     "TriageFacts": ("triage (a fact, merged per wake)", "set and slot (own key)", "re-alarm hours", "test_s4_three_finding_kinds_of_one_wake_are_one_queued_message_with_three_lines"),
@@ -1032,6 +1033,36 @@ def set_checkpoint_reminders(engine, state, name, boss, issue, repo, brief, chec
         return "checkpoint reminders (now %s): " % _print_when_now(moment) + "; ".join(notes) if notes else None
     except (ReminderError, OSError, ValueError, OverflowError) as err:
         return "no checkpoint reminders: %s" % _one_line(str(err), 200)
+
+
+CLOUD_DEFAULT_CHECKPOINT = ("25m", "40m")   # #1790: a cloud launch with no CHECKPOINT line and no flag arms this
+
+
+def arm_cloud_checkpoints(args, runner, now):
+    """#1790: after a cloud launch that succeeded, what a local launch arms (set_checkpoint_reminders), else the default 25m/40m.
+    One line on stderr; never raises and always returns EXIT_OK: the pod already exists."""
+    try:
+        engine, state, _ = build_engine(runner, now, "cli")
+        boss = args.reports_to
+        if boss is None:
+            try:
+                boss = identify_caller(engine.herdr, engine.v2, os.environ)
+            except Exception:
+                boss = None
+        brief, checkpoint, overdue = getattr(args, "brief_text", None), getattr(args, "checkpoint", None), getattr(args, "overdue", None)
+        why = None
+        if checkpoint is None and overdue is None and parse_checkpoint(brief) is None:
+            why = "the brief's CHECKPOINT line could not be read" if re.search(r"^\s*CHECKPOINT\s*:", brief or "", re.I | re.M) else "no CHECKPOINT line and no flag"
+            checkpoint, overdue = CLOUD_DEFAULT_CHECKPOINT
+        note = set_checkpoint_reminders(engine, state, args.name, boss, None if args.issue is None else int(args.issue), getattr(args, "repo", None),
+                                        brief, checkpoint, overdue, now(), now())
+        if why and note and note.startswith("checkpoint reminders"):
+            note = "default %s/%s (%s): %s" % (CLOUD_DEFAULT_CHECKPOINT + (why, note))
+    except Exception as err:
+        note = "no checkpoint reminders: %s" % _one_line(str(err), 200)
+    if note:
+        sys.stderr.write("%s: %s\n" % (PROG, note))
+    return EXIT_OK
 
 
 REMIND_LIST_MAX = 50   # reminders `remind --list` prints
