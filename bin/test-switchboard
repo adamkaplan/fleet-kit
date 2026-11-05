@@ -1891,9 +1891,9 @@ class TestSteerToWorking(Base):
                                now=self.world.clock.now, wait=lambda sock, seconds: False, socket_call=self.world.herdr.socket)
             return code, out.getvalue(), err.getvalue()
         before = len(self.world.v2.__dict__.get("sent", [])) if hasattr(self.world.v2, "sent") else 0
-        code, out, err = send("x" * 6000)
+        code, out, err = send("x" * 3990)
         self.assertEqual(code, sb.EXIT_USAGE)
-        self.assertIn("message is 6000 characters", err)
+        self.assertIn("message is 3990 characters", err)
         self.assertIn("nothing was sent", err)
         self.assertEqual(out, "")
         allowed = int(re.search(r"allowed text for this message is (\d+) characters", err).group(1))
@@ -1923,6 +1923,133 @@ class TestSteerToWorking(Base):
         allowed = int(re.search(r"allowed text for this message is (\d+) characters", str(cm.exception)).group(1))
         self.assertTrue(3000 < allowed < 4000, allowed)   # about 3,754, never the 8,444 of the short older fact
         self.assertTrue(deliver("y" * allowed).get("sent"), "the resend of the allowed length is not cut")
+
+    # ---- #1399: `send --file` carries a long message in numbered parts
+    def long_file(self, text, name="long.txt"):
+        folder = tempfile.mkdtemp(prefix="send-file-")
+        self.addCleanup(shutil.rmtree, folder, True)
+        path = os.path.join(folder, name)
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        return path
+
+    @staticmethod
+    def whole_lines(count=187):
+        return "\n".join("line %04d %s" % (n, "w" * 37) for n in range(count))   # about 9,000 characters of whole lines
+
+    def delivered(self):
+        return [a["text"] for a in self.world.admissions("platform")]
+
+    def send_file(self, text, *extra):
+        return self.cli_send("--file", self.long_file(text), *extra)
+
+    def test_1399_s2_a_9000_character_file_is_queued_as_three_parts_in_order_under_the_cap(self):
+        self.work()
+        text = self.whole_lines()
+        self.assertTrue(8900 < len(text) < 9100)
+        code, out, err = self.send_file(text)
+        self.assertEqual(code, 0, err)
+        texts = self.delivered()
+        self.assertEqual(len(texts), 3)
+        for n, got in enumerate(texts, 1):
+            self.assertIn("part %d of 3" % n, got)
+            self.assertNotIn("[cut at", got)
+            self.assertLess(len(got), sb.MESSAGE_CAP)
+        self.assertEqual(sorted(texts, key=lambda t: re.search(r"part (\d) of 3", t).group(1)), texts)
+        for number in range(187):   # every line arrived, once
+            self.assertEqual(sum("line %04d " % number in got for got in texts), 1)
+        found = [int(n) for got in texts for n in re.findall(r"line (\d{4}) ", got.split("\n- send from", 1)[1])]
+        self.assertEqual(found, sorted(found))   # the text itself runs in order across the parts
+        self.assertIn("3 parts queued", err)   # S7: the sender is told
+
+    def test_1399_s3_send_and_remind_split_with_the_one_function(self):
+        self.assertIs(sb.send_plan.__globals__["text_parts"], sb.finding_parts.__globals__["text_parts"])
+        text = self.whole_lines() + "\n" + "L" * 5000   # a long line too
+        chunks, _ = sb.text_parts(text, sb.SEND_PART_BUDGET - 40)
+        parts, problem = sb.send_plan(argparse.Namespace(text=[], file=self.long_file(text)))
+        self.assertIsNone(problem)
+        self.assertEqual([p.split("\n", 1)[1] for p in parts], chunks)
+        fact = sb.Fact("k", "platform", "reminder", text, 0)
+        self.assertEqual(sb.finding_parts(fact, sb.SEND_PART_BUDGET - 40), (chunks, ""))
+        calls = []
+        real = sb.text_parts
+        with mock.patch.dict(sb.send_plan.__globals__, {"text_parts": lambda *a: calls.append(a) or real(*a)}):
+            sb.send_plan(argparse.Namespace(text=[], file=self.long_file(text)))
+        self.assertEqual(len(calls), 1)
+
+    def test_1399_s4_a_file_under_the_cap_is_one_message_with_no_part_header(self):
+        self.work()
+        code, out, err = self.send_file("a short message\nfrom a file")
+        self.assertEqual(code, 0, err)
+        (got,) = self.delivered()
+        self.assertNotIn("part 1 of", got)
+        self.assertIn("a short message", got)
+        self.assertNotIn("parts queued", err)
+
+    def test_1399_s5_command_line_text_over_the_cap_is_refused_with_the_file_hint_and_nothing_is_queued(self):
+        self.work()
+        code, out, err = self.cli_send("x" * 5000)
+        self.assertEqual(code, 2)
+        for needle in ("5000 characters", "4000", "--file"):
+            self.assertIn(needle, err)
+        self.assertEqual(self.delivered(), [])
+
+    def test_1399_s6_a_file_that_cannot_be_used_is_refused_and_nothing_is_queued(self):
+        self.work()
+        folder = tempfile.mkdtemp(prefix="send-file-")
+        self.addCleanup(shutil.rmtree, folder, True)
+        link = os.path.join(folder, "link.txt")
+        os.symlink("/etc/hosts", link)
+        cases = {"missing": os.path.join(folder, "none.txt"), "oversized": self.long_file("x" * (sb.TEXT_FILE_MAX + 1)),
+                 "a directory": folder, "symlink": link}
+        for why, path in cases.items():
+            with self.subTest(why=why):
+                code, out, err = self.cli_send("--file", path)
+                self.assertEqual(code, 2, err)
+                self.assertIn("nothing sent", err)
+        self.assertIn("symlink", err)
+        self.assertEqual(self.delivered(), [])
+        inside = os.path.join(folder, "inside.txt")   # a symlink that stays in the user's directories is fine
+        os.symlink(self.long_file("through a link"), inside)
+        code, _, err = self.cli_send("--file", inside)
+        self.assertEqual(code, 0, err)
+        code, _, err = self.cli_send("--file", self.long_file("a"), "and words")
+        self.assertEqual(code, 2)
+        code, _, err = self.cli_send()
+        self.assertEqual(code, 2)
+
+    def test_1399_s7_a_failed_part_is_named_and_no_later_part_is_sent(self):
+        self.work()
+        real = sb._send_one
+        calls = []
+
+        def fail_second(args, runner, now):
+            calls.append(args.text[0])
+            return sb.EXIT_HELD if len(calls) == 2 else real(args, runner, now)
+        with mock.patch.dict(sb.send_plan.__globals__, {"_send_one": fail_second}):
+            code, out, err = self.send_file(self.whole_lines())
+        self.assertEqual(code, sb.EXIT_HELD)
+        self.assertIn("part 2 of 3", err)
+        self.assertEqual(len(calls), 2)   # part 3 was never attempted
+        self.assertEqual(len(self.delivered()), 1)
+        self.assertNotIn("parts queued", err)
+
+    def test_1399_s8_the_mutants_are_caught(self):
+        def cut(text, budget):
+            return [text[:budget]], ""
+
+        real = sb.text_parts
+        reversed_order = lambda text, budget: (real(text, budget)[0][::-1], "")
+        mutants = {"cut at the cap": ("text_parts", cut), "parts out of order": ("text_parts", reversed_order),
+                   "no header": ("part_label", lambda n, total: "")}
+        tests = (self.test_1399_s2_a_9000_character_file_is_queued_as_three_parts_in_order_under_the_cap,)
+        for label, (name, mutant) in mutants.items():
+            with self.subTest(mutant=label):
+                with mock.patch.dict(sb.send_plan.__globals__, {name: mutant}):
+                    with self.assertRaises(AssertionError):
+                        for test in tests:
+                            test()
+                self.setUp()
 
 
 
@@ -5241,7 +5368,7 @@ class TestLaunch(StandInPids, Base):
         self.assertEqual(self.registered()[str(wt)]["agent"], "worker")
         self.assertFalse([e for e in self.world.audit() if e["event"] == "worktree.registered" and e["subject"] == "other2"])
         for n in range(sb.WORKTREE_RECLAIM_MAX + 2):    # the cap is said, not silent
-            sb.register_worktree(self.world.state, "/nonexistent/w%02d" % n, "worker", None, "b", 1)
+            sb.register_worktree(self.world.state, str(self.add_worktree("w-cap%02d" % n)), "worker", None, "w-cap%02d" % n, 1)
         lines = sb.reclaim_for_agent(self.world.new_engine("cli"), subprocess.run, "worker", True)
         self.assertTrue(any("handled (cap %d)" % sb.WORKTREE_RECLAIM_MAX in l for l in lines), lines)
 
@@ -12987,17 +13114,17 @@ class TestOneCharter(CharterRig, Base):
 
     READERS = {   # (file, function) -> "kind: reason". registry: decides who owns a charter and reads the registry's charter (#969); writer / display: writes or shows the registry row; own: reads ONE agent's own launch context and enumerates no other agent
         # (CHECKED against the code below); set: asks only whether a number is a charter, never counts or names an owner
-        ("bin/fleet-switchboard", "guard"): "registry: the charter set guard, on the registry lock's own read",
+        ("bin/switchboard/work_moves.py", "guard"): "registry: the charter set guard, on the registry lock's own read",
         ("bin/impact_hold.py", "_lane_of_issue"): "registry: the lane lookup", ("bin/lanes.py", "charter_orchestrators"): "registry: move's lookup",
-        ("bin/fleet-switchboard", "adoption_heir"): "registry: the heir of an orphan", ("bin/fleet-switchboard", "plan_wake_route"): "registry: the orchestrator a plan wakes",
+        ("bin/fleet-switchboard", "adoption_heir"): "registry: the heir of an orphan", ("bin/switchboard/plan_notice.py", "plan_wake_route"): "registry: the orchestrator a plan wakes",
         ("bin/fleet-switchboard", "asks_of_caller"): "registry: the asks an agent is accountable for", ("bin/fleet-switchboard", "register_item_tester"): "registry: the launching orchestrator's charter gates a registration",
-        ("bin/fleet-switchboard", "load_tick"): "registry: an orchestrator's charter in the load figures", ("bin/fleet-switchboard", "worker_charter"): "registry: a worker's boss's charter (the worker's own is its launch context)",
+        ("bin/switchboard/heavy_budget.py", "load_tick"): "registry: an orchestrator's charter in the load figures", ("bin/fleet-switchboard", "worker_charter"): "registry: a worker's boss's charter (the worker's own is its launch context)",
         ("bin/fleet-switchboard", "charter_or_first_seen"): "registry: the row's charter, else the launch value of an agent with no row yet",
         ("bin/fleet-switchboard", "registry_retired_owners"): "registry: the charter a retired orchestrator's record kept",
         ("bin/registry.py", "orchestrator_charters"): "registry: the one reading", ("bin/registry.py", "duplicate_charters"): "registry: duplicates", ("bin/registry.py", "set_charter"): "writer: the audited setter",
         ("bin/registry.py", "change"): "writer: the registry's own writer", ("bin/fleet-switchboard", "registry_charter"): "writer: the pass's rule over the registry row",
         ("bin/fleet-switchboard", "pane_health_pass"): "writer: writes the registry row through registry_charter", ("bin/switchboard/agents_verify.py", "charters_report"): "display: both records, read-only",
-        ("bin/switchboard/agents_verify.py", "cmd_agents_charters"): "display: the report", ("bin/fleet-switchboard", "cmd_charter"): "writer: the audited command",
+        ("bin/switchboard/agents_verify.py", "cmd_agents_charters"): "display: the report", ("bin/switchboard/work_moves.py", "cmd_charter"): "writer: the audited command",
         ("bin/fleet-switchboard", "record_launch_charter"): "writer: a launch writes the registry row (first sight; a relaunch under the name is a new launch)",
         ("bin/impact_hold.py", "clear_lane"): "display: carries the lookup's `charter` into the notice line", ("bin/impact_hold.py", "_notify_clear_body"): "display: words the notice line",
         ("bin/switchboard/handoff.py", "seam_applies"): "set: is this issue number known as a charter",
@@ -17027,8 +17154,8 @@ class TestDecorationIsAFact(ActingCase):
     def test_the_source_is_registered_and_the_engine_has_no_second_way_to_write(self):
         self.assertIsNotNone(sb.foreground_source(self.world.engine))
         source = switchboard_source()
-        # the section runs on into the handoff part, where its closing marker now sits
-        section = (SWITCHBOARD.read_text().split("# PR 8: foreground and background", 1)[1].split("# ---- PR 13: workers report", 1)[0]
+        # the section runs on into the handoff part, where its closing marker now sits (S9: the PR 13 block that followed it moved to workers_report.py; the next marker in the entry is #96)
+        section = (SWITCHBOARD.read_text().split("# PR 8: foreground and background", 1)[1].split("# ---- #96: a worker.stopped that would wake", 1)[0]
                    + (BIN / "switchboard" / "handoff.py").read_text().split("# Worker events, reminders", 1)[0])
         for forbidden in ("v2.synthetic(", "v2.prompt(", "herdr.agent_prompt"):
             self.assertNotIn(forbidden, section.split("def launch_agent")[0], forbidden)
@@ -22596,7 +22723,8 @@ class TestSweep(Base):
         self.assertEqual(self.fact_problems(), [])
         self.assertEqual(self.fact_gaps(names, self.docs_fact_rows() - {"floor"}), ["floor"])   # a dropped row
         audit = Path(__file__).resolve().parent.parent.joinpath("docs", "switchboard.md").read_text().split("S5 fact audit: ", 1)[1]
-        self.assertEqual(audit.split(" ", 1)[0], str(len(names)))   # the figure in the docs is the computed one
+        self.assertTrue(audit.startswith("every fact key and argument"))   # the audit sentence is there, with no figure to go stale
+        self.assertTrue(names <= self.docs_fact_rows())   # the property: every fact the gates read has a row
 
     def test_986_a_new_fact_in_any_spelling_fails_the_completeness_test(self):
         for label, overrides in self.fact_mutants():
@@ -24828,7 +24956,7 @@ class TestIdentityCheck(ReportBase):
         self.assertEqual((done.returncode, seen["token"]), (0, "tok-bot"), done.stderr)
 
     def test_s6_a_worker_without_a_read_repository_is_untouched_by_the_guard(self):
-        for args in (("issue", "view", "5", "-R", "acme-org/other"), ("api", "graphql", "-f", "query=x"), ("issue", "comment", "5", "-R", "acme-org/other", "--body", "x")):
+        for args in (("issue", "view", "5", "-R", "acme-org/other"), ("api", "graphql", "-f", "query={viewer{login}}"), ("issue", "comment", "5", "-R", "acme-org/other", "--body", "x")):
             with self.subTest(args=args):
                 done, seen = self.run_gh_shim("acme-org/widget-service", self.READ_USERS, self.READ_TOKENS, args=args, own=True)
                 self.assertTrue(seen is not None and seen["argv"][0] == args[0], (done.returncode, done.stderr))
@@ -31061,7 +31189,15 @@ class TestFactsReadAtRunTime(TestCarriesLine):
             ("a plan that cannot be fetched", lambda: self.pr.update(body="PLAN: acme/app#99\ncanon: updated the docs")),
             ("a ready, held pull request with every scenario proven", lambda: (self.pr.update(body="PLAN: acme/app#7\ncanon: updated the docs", labels=[{"name": "merge-captain"}]), self.record(self.PR, self.HEAD, plan_ref="acme/app#7"))),
             ("the view is down", lambda: setattr(self, "gh_down", True)),
+            ("a held pull request whose impact floor says not held (G6 reads the findings of the held-PR check)", self.floor_not_held),
         )
+
+    def floor_not_held(self):
+        """A held pull request whose floor was read and says not held: the one state in which G6 reads `captain_findings`. Undone at the end of the test."""
+        self.pr.update(body="PLAN: acme/app#7\ncanon: updated the docs", labels=[{"name": "fleet:merge-captain"}])
+        patch = mock.patch.object(sb, "gate_floor_fact", lambda *a, **k: {"decision": "ok", "reasons": [], "cleared": False, "unreadable": None, "rehold": None})
+        patch.start()
+        self.addCleanup(patch.stop)
 
     @contextlib.contextmanager
     def proxied(self, mutant=None):
@@ -42118,6 +42254,7 @@ class TestLaunchRefusedMessage(TestLaunchMemoryGate):
         '--issue %r is not a whole numb': 'refused before any pod exists: it says nothing was created',
         'the cloud worker was not creat': 'the pod creation failed: no worker exists, so refused is right',
         'the brief line %r needs docker': 'refused before any pod exists: it says nothing was created',
+        '--boss-unregistered needs a re': 'refused before any pod exists: it says nothing was created',
     }
 
     def other_created_words(self, source):
@@ -60777,11 +60914,13 @@ class TestV2LightGuards(Base):
         ("Switchboard.deliver", 1): ("ledger", "the sent-keys ledger reserves before a write: not a read", ()),
         ("Switchboard.deliver", 2): ("ledger", "the sent-keys ledger: not a read", ()),
         ("Switchboard.deliver", 3): ("ledger", "the sent-keys ledger: not a read", ()),
+        ("Switchboard.deliver", 4): ("no-read", "the queued-wait note of a delivery: writes the daemon's own state file, never reads a session", ()),
         ("Switchboard.waiting_earlier", 1): (2, "waiting", (("V2Reads.inbox", 1),)),
         ("Switchboard.convert_lapsed_notes", 1): (2, "idle", (("V2Reads.inbox", 1),)),
         ("Switchboard.unread_count", 1): (2, "idle", (("V2Reads.inbox", 1),)),
         ("Switchboard.send", 1): ("no-read", "whether a folded question keeps its issue: nothing is read", ()),
         ("Switchboard.report", 1): ("no-read", "reads the daemon's own last-reports.json (a state file), never a session", ()),
+        ("Switchboard.run_pass", 1): ("covered", "the queued-wait pass: its inbox read is made only when light is off; pinned by test_queued_behind_turn test_the_owners_light_switch_means_the_queued_wait_pass_reads_no_inbox", ()),
         ("brief_in_transcript", 1): (6, "brief", ()),
         ("inbox_human_prompts", 1): (0, "newest", ()),
         ("WorkerFacts.last_reply", 1): (3, "stop", ()),
@@ -62323,6 +62462,36 @@ class TestReviewRefusalNamesRule(TestReviewPostAndDismiss):
                     except AssertionError:
                         failed += 1
                 self.assertEqual(failed, 1, name)
+
+    def test_every_redaction_pattern_has_its_own_rule_name(self):   # U9
+        dash = "-" * 5
+        whole = "x\n" + dash + "BEGIN " + "PRIVATE" + " KEY" + dash + "\n" + "Q" * 12 + "\n" + dash + "END " + "PRIVATE" + " KEY" + dash + "\n"
+        marker = "x\n" + dash + "END " + "PRIVATE" + " KEY" + dash + "\n"
+
+        def check(ns):
+            names, table = ns["SECRET_RULE_NAMES"], ns["_SECRET_PATTERNS"]
+            self.assertEqual(len(names), len(table), "a redaction pattern has no rule name")
+            self.assertEqual(len(set(names)), len(names))
+            self.assertEqual(ns["find_secret_span"](whole)[0], "private-key-block")
+            self.assertEqual(ns["find_secret_span"](marker)[0], "private-key-marker")
+            return list(names), list(table)
+
+        names, table = check(vars(sb))
+        print("S9 control: every pattern has one unique rule name, and both key texts are named")
+        for added in ("private-key-block", "private-key-marker"):
+            self.assertIn(added, names)
+        self.assertEqual(len(names), len(table))
+        source = (Path(__file__).resolve().parent / "switchboard" / "secret_spans.py").read_text()
+        line = '"private-key-block", "private-key-marker", '
+        self.assertEqual(source.count(line), 1)
+        mutated = source.replace('"private-key-marker", ', "")
+        self.assertNotEqual(mutated, source)
+        ns = dict(vars(sb))
+        exec(compile(mutated, "scratch_secret_spans.py", "exec"), ns)
+        with self.assertRaises(AssertionError) as caught:
+            check(ns)
+        print("S9 mutant: applied, failed with: %s" % caught.exception)
+        self.assertIn("a redaction pattern has no rule name", str(caught.exception))
 
 
 for _name in dir(TestReviewPostAndDismiss):   # the parent's tests run in their own class
@@ -65579,7 +65748,7 @@ class TestLoadAlert(Base):
         def figures(latest):
             return {k: (latest[k]["busy"], latest[k]["idle"], latest[k]["cloud"]) for k in ("orch", "orchb")}
         self.assertEqual(figures(self._cloud_run()), {"orch": (3, 1, 2), "orchb": (0, 0, 0)})
-        source = SWITCHBOARD.read_text()
+        source = switchboard_source()
         import re as _re
         body = _re.search(r"def load_tick\(.*?\n\n\n", source, _re.S).group(0)
         old = '"busy": sum(1 for c in coders if c.status == "working") + cloud_live.get(name, 0),'
@@ -66597,6 +66766,7 @@ TestDerivedClosure, TestRefusalInAPart, TestMovingADefinition, TestTheDerivation
 # The shadow test (#1339): an added definition under a closure name in another file is refused by the clear.
 _shadow = importlib.import_module("test_shadow")
 TestShadowRule, TestShadowGlue, TestShadowStatuses, TestReasonsAreOneCleanLine = _shadow.TestShadowRule, _shadow.TestShadowGlue, _shadow.TestShadowStatuses, _shadow.TestReasonsAreOneCleanLine
+_pwd = importlib.import_module("test_plan_wake_drops"); _pwd.HOST = sys.modules[__name__]; TestPlanWakeDrops = _pwd.build()   # #1784
 # The Cockpit feed test (#1423): the read-only feed of what the fleet needs from a person.
 _cockpit = importlib.import_module("test_cockpit")
 TestFeedShape, TestIdsAndEtags, TestCapsAndScrub, TestDocument, TestWriting, TestReadOnly, TestBranches, TestSources, TestScrubFailsClosed, TestScrubPatterns, TestHardening, TestFileRead, TestDocumentTable = _cockpit.TestFeedShape, _cockpit.TestIdsAndEtags, _cockpit.TestCapsAndScrub, _cockpit.TestDocument, _cockpit.TestWriting, _cockpit.TestReadOnly, _cockpit.TestBranches, _cockpit.TestSources, _cockpit.TestScrubFailsClosed, _cockpit.TestScrubPatterns, _cockpit.TestHardening, _cockpit.TestFileRead, _cockpit.TestDocumentTable
@@ -66608,6 +66778,7 @@ RelayObeysTheTreeGuard = _relay_tree_guard.RelayObeysTheTreeGuard
 _sent_view = importlib.import_module("test_sent_view")
 _sent_view.World = World
 TestSentView = _sent_view.TestSentView
+_branch_ff = importlib.import_module("test_branch_ff"); TestBranchFf = _branch_ff.TestBranchFf
 TestScratchCommand = importlib.import_module("test_scratch_command").TestScratchCommand
 # The relay-loop tests of #1477, moved under the architecture cap.
 _relay_loop = importlib.import_module("test_relay_loop_cadence")
@@ -66649,6 +66820,22 @@ TestHeavySplit = importlib.import_module("test_heavy_split").TestHeavySplit
 # The steer-after-minutes tests of #1540, moved under the line ceiling.
 _steer_long = importlib.import_module("test_steer_long_turn")
 TestSteerLongTurn = _steer_long.build(Base, TestSteerToWorking)
+TestGhShimSignInput = importlib.import_module("test_gh_shim_sign_input").TestGhShimSignInput
+TestGhShimEffectRule = importlib.import_module("test_gh_shim_sign_input").TestGhShimEffectRule
+TestGhShimMutationRoots = importlib.import_module("test_gh_shim_sign_input").TestGhShimMutationRoots
+TestGhShimRawPath = importlib.import_module("test_gh_shim_sign_input").TestGhShimRawPath
+TestGhShimRound5 = importlib.import_module("test_gh_shim_sign_input").TestGhShimRound5
+TestGhShimArgvParser = importlib.import_module("test_gh_shim_sign_input").TestGhShimArgvParser
+TestApiReadersAreViews = importlib.import_module("test_gh_shim_sign_input").TestApiReadersAreViews
+TestGhHoldIsAView = importlib.import_module("test_gh_shim_sign_input").TestGhHoldIsAView
+TestGhShimNestedAndQueryBodies = importlib.import_module("test_gh_shim_sign_input").TestGhShimNestedAndQueryBodies
+TestGhShimEncodedQueryAndLabelDelete = importlib.import_module("test_gh_shim_sign_input").TestGhShimEncodedQueryAndLabelDelete
+TestGhShimDeepBodiesAndInputForms = importlib.import_module("test_gh_shim_sign_input").TestGhShimDeepBodiesAndInputForms
+TestGhShimBodyFieldBesideInput = importlib.import_module("test_gh_shim_sign_input").TestGhShimBodyFieldBesideInput
+TestGhShimBracketBodyKeys = importlib.import_module("test_gh_shim_sign_input").TestGhShimBracketBodyKeys
+TestGhShimAllowlist = importlib.import_module("test_gh_shim_sign_input").TestGhShimAllowlist
+TestGhShimBodyFieldKeyIsExact = importlib.import_module("test_gh_shim_sign_input").TestGhShimBodyFieldKeyIsExact
+TestGhShimMethodFlagBeforeApi = importlib.import_module("test_gh_shim_sign_input").TestGhShimMethodFlagBeforeApi
 TestUnconsumedSteer = importlib.import_module("test_unconsumed_steer").build(Base, TestSteerToWorking)   # #1844
 TestUnconsumedRecord = importlib.import_module("test_unconsumed_record").TestUnconsumedRecord   # #1844
 _noparent = importlib.import_module("test_charter_noparent"); TestCharterNoParent, TestCharterNoParentSet = _noparent.TestCharterNoParent, _noparent.build(CharterRig, Base, TestCharterSetGuard)
@@ -66694,6 +66881,7 @@ TestLaunchBriefCheck = importlib.import_module("test_launch_brief_check").build(
 TestIntentEditToldOnce = importlib.import_module("test_intent_told_once").build(TestIntentEditWiring, GithubRig)   # #1437
 TestRunLauncherShapes, TestStatusLines, TestTurnEnd, TestDictCallersUnchanged = (_ss := importlib.import_module("test_status_shape")).TestRunLauncherShapes, _ss.TestStatusLines, _ss.TestTurnEnd, _ss.TestDictCallersUnchanged
 TestEveryKindDelayedMark = importlib.import_module("test_every_kind_delayed_mark").TestEveryKindDelayedMark
+TestQueuedBehindTurn = importlib.import_module("test_queued_behind_turn").TestQueuedBehindTurn
 TestHeaderDate, TestHeaderDateCallSites, TestHeaderInfiniteTime = (_hd := importlib.import_module("test_header_date")).TestHeaderDate, _hd.TestHeaderDateCallSites, _hd.TestHeaderInfiniteTime
 TestSignedLinkScrub = importlib.import_module("test_signed_link_scrub").build(Base, GithubRig)
 TestErroredTurn = importlib.import_module("test_errored_turn").build(Base, World, FAKE_OPENCODE, FAKE_HERDR)
@@ -66708,11 +66896,14 @@ TestHeldSends = importlib.import_module("test_held_sends").TestHeldSends   # #20
 # The reminder-cancel tests of #1401.
 _reminder_cancel = importlib.import_module("test_reminder_cancel")
 TestCancelKeyRecheck = _reminder_cancel.build(PR4Base)
+TestKeyedReminderSupersede = importlib.import_module("test_keyed_reminder_supersede").build(PR4Base)
 # The lost-worker alert tests of #1481.
 _lost_worker = importlib.import_module("test_lost_worker")
 TestLostWorkerRemembers = importlib.import_module("test_lost_worker_remembers").TestLostWorkerRemembers
 TestLostWorker, TestLostWorkerReadRound, TestLostWorkerMemoryOnly, TestLostWorkerSlowPass = _lost_worker.TestLostWorker, _lost_worker.TestLostWorkerReadRound, _lost_worker.TestLostWorkerMemoryOnly, _lost_worker.TestLostWorkerSlowPass
 TestPushWatch = importlib.import_module("test_push_watch").TestPushWatch   # the push watch of #1740
+TestPodSilence = importlib.import_module("test_pod_silence").TestPodSilence   # the pod silence watch of #2115
+TestPodSilenceTick = importlib.import_module("test_pod_silence").TestPodSilenceTick   # the pod silence tick of #2135
 _stage_events = importlib.import_module("test_stage_events"); _stage_events.GithubRig, _stage_events.GH_REPO = GithubRig, GH_REPO; TestStageEvents = _stage_events.TestStageEvents; TestStageEvents.CONF = {"github_stage_repos": [GH_REPO], "github_stage_bots": ["github-actions[bot]"]}
 # A CLAIMS: line present but not read is refused (#1617); HOST gives the test the fixtures of this file.
 _claim_placement = importlib.import_module("test_claim_placement"); _claim_placement.HOST = sys.modules[__name__]
@@ -66723,10 +66914,12 @@ _changed_file_pages = importlib.import_module("test_changed_file_pages")
 _changed_file_pages.HOST = sys.modules[__name__]
 TestWholeReadOfALargePullRequest = _changed_file_pages.load()
 
+_rc = importlib.import_module("test_reclaim_cap"); _rc.HOST = sys.modules[__name__]; TestReclaimCap = _rc.build()   # #1737
 _lm = importlib.import_module("test_launch_model"); _lm.HOST = sys.modules[__name__]; TestLaunchModel = _lm.build(); TestLaunchModelCloud = _lm.build_cloud()   # #1642
 TestDaemonDeadVerdict, TestDaemonDeadVerdictMutants = (_dd := importlib.import_module("test_dead_verdict_daemon")).TestDaemonDeadVerdict, _dd.TestDaemonDeadVerdictMutants   # #1884
 TestPaneUndecidable = _dd.TestPaneUndecidable   # #1884 PC-6 / S11
 TestUndecidableRobustness = _dd.TestUndecidableRobustness   # #1884 PC-9 / S14
+TestBodyCheck = importlib.import_module("test_body_check").TestBodyCheck   # #1476
 TestLaunchCapacity = importlib.import_module("test_launch_capacity").build()   # #1793
 _ta = importlib.import_module("test_tester_agent"); _ta.HOST = sys.modules[__name__]; TestTesterAgentLaunch, TestTesterAgentMutants = _ta.build()   # #1963
 _lr = importlib.import_module("test_launched_reviewers"); _lr.HOST = sys.modules[__name__]; TestLaunchedReviewerRule, TestLaunchedReviewerGates, TestLaunchedReviewerItems, TestLaunchedReviewerRelay, TestLaunchedReviewerDocs, TestLaunchedReviewerGuards, TestLaunchedReviewerMutants = _lr.build()   # #1869
@@ -68974,7 +69167,8 @@ class TestAdoption(LanesCase):
         return self.scan({rel: (REPO / rel).read_text() for rel in names})
 
     def test_every_reader_of_a_workers_boss_is_in_the_table_and_the_table_has_no_stale_member(self):   # S15
-        self.assertEqual(self.sites(), set(sb.BOSS_READ_SITES), "a new raw reader must go through boss_name, or be named in BOSS_READ_SITES with its reason")
+        moved = {"bin/fleet-switchboard:live_cloud_by_lane": "bin/switchboard/heavy_budget.py:live_cloud_by_lane", "bin/fleet-switchboard:cloud_sender": "bin/switchboard/heavy_budget.py:cloud_sender"}   # S9: the daemon's table still names the entry for this one; the function moved, the table's text is not changed here
+        self.assertEqual(self.sites(), {moved.get(k, k) for k in sb.BOSS_READ_SITES}, "a new raw reader must go through boss_name, or be named in BOSS_READ_SITES with its reason")
 
     def test_the_scan_finds_a_raw_reader_when_one_is_planted(self):   # S15 mutant: the real scan, fed a planted source, reports it
         planted = {"bin/planted.py": "def load_row(o):\n    return o.fleet.get('reports_to') == 'x'\n\ndef other(o):\n    return o.fleet['reports_to']\n\ndef safe(o):\n    return boss_name(o)\n"}
@@ -70155,10 +70349,6 @@ class TestAgentCredentialsDoc(unittest.TestCase):
 
 
 
-FACT_KIND_MODES = {"send": "cut marker (refused to the sender)", "wake": "merged within a 3000-character budget", "sweep": "parts", "triage": "parts",
-                   "alert": "parts", "reminder": "parts", "disk": "parts", "cpu": "parts", "mem": "parts", "cpu-top": "parts",
-                   "spotlight": "parts", "janitor": "parts", "plan": "parts"}
-OVER_CAP_FINDING_KINDS = tuple(k for k, v in FACT_KIND_MODES.items() if v == "parts")
 
 
 class TestMessageTimes(unittest.TestCase):

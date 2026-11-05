@@ -57,6 +57,8 @@ SETUP_PREAMBLE = """Setup (do this first, before the task below):
 
 Task:
 """
+# The TEMPORARY launch rule (ask #1046): the only place it is written; it names the ask whose merge removes it.
+TEMP_ISSUE_LINK_WARNING = True   # a worker cannot read issues yet: removed when ask #1019 (issue reading by workers) merges
 RECORD_MAX = 8192
 PASSWORD_MAX = 512
 LAUNCH_SECONDS = 900                      # `create` returns only once the worker answers
@@ -547,6 +549,8 @@ CLUSTER_NAMES = (
     "_lib", "_scrub_lib", "use_settings", "_OWNER_RE", "_NAME_RE", "_repo_key", "check_allowed", "_capture", "_jwt_lifetime", "_duration",
     "firewall_refused", "VaultRecovery", "_token_refusal", "cluster_token", "_cluster_token_bounded", "private_root", "_ps", "stop_recorded_tunnels",
     "sweep_stale", "Cluster", "tunnel",
+    "unknown_report_to",
+    "check_report_to",
 )
 cloud_cluster = _load_cluster()
 for _name in CLUSTER_NAMES:
@@ -667,6 +671,16 @@ def cmd_launch(args, runner, now):
         return _launch(args, runner, now, lambda state: stack.enter_context(reservation(state, args.name)))
 
 
+def brief_warnings(args, repo, brief):
+    """The one-line warnings a brief earns (each at most once): it names docker or buildx while --stack is not given, or it links an issue of the repository."""
+    notes = []
+    if not getattr(args, "stack", False) and re.search(r"\b(docker|buildx|lane stack|lane-stack|stack-up)\b", brief or "", re.I):
+        notes.append("warning: the brief names docker, buildx or the lane stack tooling but --stack is not given: the worker would have no nested Docker")
+    if TEMP_ISSUE_LINK_WARNING and re.search(r"(github\.com/%s/issues/\d+|(?<![\w/.-])%s#\d+)" % (re.escape(repo), re.escape(repo)), brief or "", re.I):
+        notes.append("warning: the brief links an issue of %s: the worker cannot read issues yet (ask #1019); put what it needs in the brief" % repo)
+    return notes
+
+
 def lane_m_workers(state, lane):
     """The sorted names of the lane's live shape-M workers, from the record directory alone (no token, no cluster call)."""
     found = []
@@ -731,13 +745,18 @@ def _launch(args, runner, now, reserve):
         raise Refusal(str(err)) from None
     engine, state, _ = H["build_engine"](runner, now, "cli")
     reserve(state)
-    local = engine.discover(engine.now()).agents.get(name)
+    found = engine.discover(engine.now())   # the launch's first discovery: the report-to check reuses its answer
+    local = found.agents.get(name)
     if local is not None:   # `route` prefers a cloud record: every later send/read/retire for the local agent would go INTO the pod
         raise LaunchError("a local fleet agent named %s exists: a cloud worker cannot take its name (send, read and retire by name would reach "
                           "the pod instead of the local agent); retire it or pick another name; nothing was created" % name)
     if load_record(state, name) is not None:
         raise LaunchError("a cloud worker named %s already exists (`%s retire %s` ends it)" % (name, H["PROG"], name))
+    if args.reports_to:
+        check_report_to(engine, state, args, local_agents=found.agents)
     brief = H["read_brief"](args.brief_file, sys.stdin)
+    for note in brief_warnings(args, repo, brief):   # before anything is created: one line each, then the launch goes on
+        print("%s: %s" % (H["PROG"], note), file=sys.stderr)
     needs = next((ln for ln in str(brief).splitlines() if re.fullmatch(r"\s*NEEDS:\s*docker\s*", ln, re.I)), None)   # #1488: the XS/S/M shapes without --stack have no docker
     if needs is not None and not getattr(args, "stack", False):
         raise LaunchError("the brief line %r needs docker, which only the --stack pod has: launch again with --stack; nothing was created" % needs.strip())
@@ -858,7 +877,7 @@ def _launch(args, runner, now, reserve):
             if _stop_after_failure(engine, runner, name, run_id, "launch interrupted", cluster):
                 remove_record(state, name)
             raise
-    _registry_note(engine, "upsert", state, name, {"session": session, "repo": repo, "role": args.role, "kind": "cloud", "run_id": run_id, "state": "working"})   # a cloud worker is an agent (#903)
+    _registry_note(engine, "upsert", state, name, {"session": session, "repo": repo, "role": args.role, "kind": "cloud", "run_id": run_id, "state": "working"}, address=record["url"])   # a cloud worker is an agent (#903)
     _first_push()._watch_first_push(state, name, args, repo, branch, brief, now(), record.get("hard_deadline"))   # #2057: the launch's watch for its checkpoint
     print(_limits_note(args, record), file=sys.stderr)   # stderr, before the one JSON line
     print(json.dumps({"name": name, "session": session, "runtime_id": record["runtime_id"], "url": record["url"], "cloud": True}, sort_keys=True))
@@ -959,16 +978,42 @@ def _limits_note(args, record):
     return "launch --cloud: %s, %s, stops at %s" % (limit("idle", args.idle, "idle_seconds"), limit("hard", args.hard, "hard_seconds"), stop)
 
 
-def _registry_note(engine, what, state, name, *args):
+def _endpoint_forms(endpoint):
+    """The endpoint as it may show in a registry or exception text: whole, percent-encoded, and its host part (longest first)."""
+    if not endpoint:
+        return []
+    forms = {endpoint, urllib.parse.quote(endpoint, safe=""), urllib.parse.quote(endpoint)}
+    try:
+        parts = urllib.parse.urlsplit(endpoint)
+        forms.update(x for x in (parts.netloc, parts.hostname) if x)
+    except ValueError:
+        pass
+    return sorted(forms, key=len, reverse=True)
+
+
+def _registry_note(engine, what, state, name, *args, address=""):
     """The cloud launcher and reaper are WRITERS of the agent registry: `upsert` on launch, `retire` once the pod is stopped. The stop itself stays
     this launcher's act; a registry that cannot be written is said in the audit, never raised (the pod's own record is still the launcher's)."""
+    endpoint = str(address or "")
+
+    def say(why):
+        text = str(why)
+        for part in _endpoint_forms(endpoint):
+            text = re.sub(re.escape(part), "<endpoint>", text, flags=re.I)
+        try:
+            text = _scrub_lib()(text)
+        except Exception:
+            text = "unreadable"
+        text = _one(text, 120)
+        _audit(engine, "cloud.registry_error", name, {"why": text})
+        print("registry: %s: %s" % (name, text), file=sys.stderr)
     try:
         registry = H["load_module"]("registry")
         got = registry.upsert(state, name, args[0]) if what == "upsert" else registry.retire(state, name, "cloud-worker", args[0])
         if got["problem"]:
-            _audit(engine, "cloud.registry_error", name, {"why": _one(got["problem"], 120)})
+            say(got["problem"])
     except Exception as err:
-        _audit(engine, "cloud.registry_error", name, {"why": _one(str(err), 120)})
+        say("the registry write failed (%s)" % type(err).__name__)
 
 
 POD_UID_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")   # the form of a pod uid (the launcher's cloud_worker.py holds the equal text: a test compares them)
@@ -1487,4 +1532,52 @@ def cmd_cloud_clear(args, runner, now):
         cleared += 1
     if not cleared and not dry_run:
         print("nothing to clear")
+    return H["EXIT_OK"]
+
+
+# ---------------------------------------------------------------- inspect: what a pod of the caller is doing now (ask #2115, read-only)
+
+INSPECT_SECONDS = 60   # the bound of the launcher's one read (one exec, or the fallback's four)
+
+
+def _inspect_short(body):
+    """ONE line for a notice: 'NAME: running TOOL for Ns | last: TOOL STATUS | idle Ns | branch B, N unpushed, dirty D | last push P'."""
+    def word(value, limit=60):
+        return _one(str(value), limit) if value not in (None, "") else "?"
+    flight, calls, un = body.get("in_flight"), body.get("last_calls") or [], body.get("unpushed")
+    doing = "running %s for %ss" % (word(flight.get("tool")), word(flight.get("seconds"))) if isinstance(flight, dict) else "no call in flight"
+    last = "last: %s %s" % (word(calls[0].get("tool")), word(calls[0].get("status"))) if calls and isinstance(calls[0], dict) else "last: none read"
+    idle = "idle %ss" % word(body.get("idle_seconds")) if body.get("idle_seconds") is not None else "idle ?"
+    git = "branch %s, %s unpushed, dirty %s" % (word(body.get("branch")), word(un.get("count")) if isinstance(un, dict) else "?", word(body.get("dirty")))
+    return "%s: %s | %s | %s | %s | last push %s" % (word(body.get("worker"), 80), doing, last, idle, git, word(body.get("last_push"), 100))
+
+
+@refusals
+def cmd_inspect(args, runner, now):
+    """`inspect NAME [--short]`: the pod's live state (the call in flight, the last calls, the last message, the idle seconds, git, the last push and
+    error), read-only, through the launcher's `inspect`. Only the pod's BOSS may read it (its worker record's `reports_to`): any other caller is refused
+    and the refusal audited. Every text was scrubbed by the launcher before it came here."""
+    LaunchError = H["LaunchError"]
+    if not valid_name(args.name):
+        raise LaunchError("name the worker: `%s inspect <name>`" % H["PROG"])
+    record = route(args.name)
+    if record is None:
+        raise LaunchError("%s has no cloud record" % args.name)
+    engine, state, _ = H["build_engine"](runner, now, "cli")
+    kind = H["gates_caller_kind"](runner, now)
+    if not (kind[0] == "agent" and record.get("reports_to") and kind[1] == record.get("reports_to")):
+        _audit(engine, "cloud.inspect_refused", args.name, {"why": _one(str(kind[1]), 120)})
+        raise LaunchError("refused: only %s's own boss may inspect it" % args.name)
+    try:
+        with Cluster() as cluster:
+            code, body, note = run_launcher(runner, "inspect", args.name, (), INSPECT_SECONDS, cluster=cluster)
+    except CloudError as err:
+        raise LaunchError("%s: nothing was read" % err) from None
+    if code != 0 or not isinstance(body, dict):
+        raise LaunchError("the pod was not read (%s)" % _reason(code, note))
+    if getattr(args, "short", False):
+        print(_inspect_short(body))
+        return H["EXIT_OK"]
+    for key in ("source", "in_flight", "last_calls", "last_text", "idle_seconds", "branch", "unpushed", "dirty", "last_push", "last_error", "missing"):
+        print("%s: %s" % (key, json.dumps(body.get(key), sort_keys=True)))
     return H["EXIT_OK"]

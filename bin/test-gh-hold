@@ -92,6 +92,10 @@ class Base(unittest.TestCase):
         self.sleepfile.write_text(environ.get("FAKE_WHOAMI_SLEEP", "0"))
         if self.calls.exists():
             self.calls.unlink()
+        if shim == SHIM:   # #1696: the shim reads the merge gate config from the account's real home; this run's gate home is the rig's own (no merge_gate entry)
+            shutil.copytree(str(SHIM.parent), str(self.home / "hermetic"), dirs_exist_ok=True)
+            shim = self.home / "hermetic" / "gh"
+        shim.write_text(shim.read_text().replace("MG_HOME = None", "MG_HOME = %r" % str(self.home), 1))
         done = subprocess.run([sys.executable, str(shim), *args], capture_output=True, text=True, env=environ, timeout=60)
         return done, self.recorded()
 
