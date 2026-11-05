@@ -108,11 +108,11 @@ class TestMergeDrops(MergeDropsBase):
         self.write("app.py", "def a():\n    return None\ndef b():\n    pass\nz = 1\n")   # the branch removes one `return None`
         self.commit("own removal")
         git(self.dir, "checkout", "-q", "integration")
-        self.write("app.py", two + "tail = 2\n")
-        self.commit("tip adds a line")
+        self.write("app.py", two + "def c():\n    return None\n")
+        self.commit("tip adds a function")
         git(self.dir, "checkout", "-q", "pr")
         git(self.dir, "merge", "-q", "--no-commit", "integration")
-        self.write("app.py", "def a():\n    pass\ndef b():\n    pass\nz = 1\ntail = 2\n")   # the merge drops the other one
+        self.write("app.py", "def a():\n    return None\ndef b():\n    pass\nz = 1\ndef c():\n    pass\n")   # the merge drops the tip's own new `return None`
         git(self.dir, "add", "-A")
         git(self.dir, "commit", "-q", "-m", "merge the tip")
         code, out = self.run_cmd()
@@ -132,8 +132,12 @@ class TestMergeDrops(MergeDropsBase):
         self.write("other.py", "keep one\nkeep two\nown addition\n")
         self.commit("the change")
         self.tip_moves()
+        git(self.dir, "branch", "-f", "mid", "integration")
+        git(self.dir, "checkout", "-q", "integration")   # the tip moves on again after the branch took `mid`
+        self.write("third.py", "tip tail\n")
+        self.commit("tip moves again")
         git(self.dir, "checkout", "-q", "pr")
-        git(self.dir, "merge", "-q", "--no-commit", "integration")
+        git(self.dir, "merge", "-q", "--no-commit", "mid")
         self.write("app.py", "".join("line %d\n" % n for n in range(1, 6)) + "HeldSendFacts(state_dir)\n" + "".join("line %d\n" % n for n in range(6, 11) if n != 8))   # the port removes line 8: the PR's own change
         git(self.dir, "add", "-A")
         git(self.dir, "commit", "-q", "-m", "merge the tip; port")
