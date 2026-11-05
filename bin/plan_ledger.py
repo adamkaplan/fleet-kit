@@ -378,8 +378,7 @@ def authors_of(entries, pr, notice_senders=(), github_author=None):
 
 
 def as_current(entries, hashes):
-    """#1713: the same entries with each entry's `plan_hash` and ask head mapped to the NEW form when it is the OLD form of the live text
-    (`hashes` is plan_check.plan_hashes(text)); every other value stays as it is, and the ledger itself is never rewritten."""
+    """#1713: the same entries with each entry's `plan_hash` and ask head mapped to the NEW form when it is the OLD form of the live text (`hashes` is plan_check.plan_hashes(text)); every other value stays as it is, and the ledger itself is never rewritten."""
     if not hashes or len(hashes) < 2:
         return entries
     new, old = hashes[0], hashes[1]
@@ -394,7 +393,6 @@ def as_current(entries, hashes):
                 entry["head"] = new_head
         out.append(entry)
     return out
-
 
 def ask_head(plan_hash):
     """#1130: the "head" an ask issue's record carries: the first 40 hex digits of the plan hash (`sha256:<hex>`). A revised plan has another hash, so the
