@@ -117,7 +117,10 @@ def plan_wake_pass(engine, state, repos, now, budget=None):
             url = module.plan_url(repo, number, plan["id"])
             key = "%s#%d:%s" % (repo, number, plan_hash)
             names = route[0]
-            if key not in wake.announced and key not in wake.approved and names:   # #2193
+            earlier = ["%s#%d:%s" % (repo, number, h) for h in hashes]   # #2200: the new and the legacy form of the same text
+            if any(k in wake.announced for k in earlier) and key not in wake.announced:
+                wake.announced[key], changed = now, True   # #2200: record the new form
+            if not any(k in wake.announced or k in wake.approved for k in earlier) and names:   # #2193, #2200
                 own = raw[number][1]
                 source = number
                 done_when = parse_intent(own.get("body"))[1]
