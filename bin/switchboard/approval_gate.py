@@ -5,8 +5,8 @@ APPROVAL_FILES = 60             # the bound in files (the live audit and the rot
 APPROVER = "the plan's approver (work item: its orchestrator; ask: the Chief of Staff; epic: the Chief of Staff, then the owner)"
 
 
-def approval_events(state_dir, issue, current_hash, clock=None, seconds=None, files=None):
-    """The plan.approved events of `issue` (subject, or detail.issue), as [{"plan_hash"}] newest first, stopping at the first file that holds one at `current_hash`;
+def approval_events(state_dir, issue, current_hash, clock=None, seconds=None, files=None, hashes=None):
+    """The plan.approved events of `issue` (subject, or detail.issue), as [{"plan_hash"}] newest first, stopping at the first file that holds one at `current_hash` or at any older member of `hashes` (plan_check.plan_hashes, #1713);
     None when a file cannot be read or the bound (2 seconds, 60 files) is passed: the caller reads that as missing."""
     clock = clock or time.monotonic
     limit = clock() + (APPROVAL_SECONDS if seconds is None else seconds)
@@ -41,7 +41,7 @@ def approval_events(state_dir, issue, current_hash, clock=None, seconds=None, fi
                     if want in (str(entry.get("subject") or "").lower(), str(detail.get("issue") or "").lower()) and isinstance(detail.get("plan_hash"), str):
                         mine.append({"plan_hash": detail["plan_hash"]})
             found.extend(reversed(mine))
-            if any(e["plan_hash"] == current_hash for e in mine) or clock() > limit:
+            if any(plan_check.canonical_hash(e["plan_hash"], hashes) == current_hash for e in mine) or clock() > limit:
                 break
         return found if clock() <= limit else None
     except Exception:   # a corrupt gzip raises zlib.error, which is no OSError: every read failure is missing
@@ -68,7 +68,7 @@ def approval_fact(config, state, pr, source, plan):
     if not approval_on(config, pr.rsplit("#", 1)[0]):
         return None
     issue = approval_issue(source, config)
-    events = approval_events(state, issue, (plan or {}).get("plan_hash")) if issue and plan else ([] if issue is None else None)
+    events = approval_events(state, issue, (plan or {}).get("plan_hash"), hashes=(plan or {}).get("plan_hashes")) if issue and plan else ([] if issue is None else None)
     return {"issue": issue, "events": events}
 
 
@@ -86,7 +86,7 @@ def approval_refusal(args, runner, now):
     try:
         ctx = _ledger_context(types.SimpleNamespace(pr=args.pr, plan=None, ask=None), runner, now, False)
         facts = dict(ctx.facts or {}, approval=approval_fact(ctx.config, ctx.state, ctx.pr, ctx.source, ctx.plan))
-        status, said = plan_ledger.approval_state(facts["approval"]["events"], facts["approval"]["issue"], (ctx.plan or {}).get("plan_hash")) if facts.get("approval") else ("missing", "the plan could not be read")
+        status, said = plan_ledger.approval_state(facts["approval"]["events"], facts["approval"]["issue"], (ctx.plan or {}).get("plan_hash"), (ctx.plan or {}).get("plan_hashes"), plan_check.canonical_hash) if facts.get("approval") else ("missing", "the plan could not be read")
     except Exception as err:
         return "merge of %s refused: the plan approval could not be judged (%s); the gate fails closed" % (args.pr, _one_line(str(err), 100))
     if status != "missing":

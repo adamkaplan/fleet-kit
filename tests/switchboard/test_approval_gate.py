@@ -18,6 +18,7 @@ from unittest import mock
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / "bin"))
 import plan_ledger  # noqa: E402
+import plan_check  # noqa: E402
 
 HOST = None   # set by bin/test-switchboard
 ISSUE, OTHER = "acme/api#2", "acme/api#3"
@@ -214,6 +215,46 @@ class TestApprovalGateReader(unittest.TestCase):
         me = Path(__file__).read_text()
         self.assertEqual(me.count("git " + "diff"), 0)
         self.assertEqual(me.count("git" + " merge-base"), 0)
+
+
+PLAN_TEXT = "## Plan\n\nsize: S\n\n### Facts\n- one\n\n<!-- fleet-switchboard:from=fleet-registry -->\n"
+
+
+def pair_rows(events_fn, state_fn):
+    """S11 on the fixture: a plan text ending with the marker line; an event at each member of its pair reads ok, an event at the hash of an edited text reads missing naming both hashes."""
+    hashes = plan_check.plan_hashes(PLAN_TEXT)
+    current = plan_check.plan_hash(PLAN_TEXT)
+    expect(len(hashes) >= 2 and hashes[0] == current, True, "the live text has a pair led by the current hash")
+    for member in hashes:
+        folder = audit_dir([event(ISSUE, member, "both")])
+        got = state_fn(events_fn(folder, ISSUE, current, hashes=hashes), ISSUE, current, hashes, plan_check.canonical_hash)
+        expect(got[0], "ok", "an event at the member %s of the pair" % member[:14])
+    edited = plan_check.plan_hash(PLAN_TEXT.replace("one", "two"))
+    folder = audit_dir([event(ISSUE, edited, "both")])
+    got = state_fn(events_fn(folder, ISSUE, current, hashes=hashes), ISSUE, current, hashes, plan_check.canonical_hash)
+    expect(got[0], "missing", "an event at the hash of an edited text")
+    expect((current in got[1], edited in got[1]), (True, True), "the edited-text detail names both hashes")
+
+
+class TestApprovalPair(unittest.TestCase):
+    """S11 (ask #1713's pair): the gate accepts an event at any member of the pair of the live text."""
+
+    def test_the_rows_of_the_pair(self):
+        pair_rows(HOST.sb.approval_events, plan_ledger.approval_state)
+
+    def test_the_unmutated_control_passes(self):
+        pair_rows(mutated_events("count % 500 == 0", "count % 500 == 0"), mutated_state("seen:", "seen:"))
+
+    def test_the_reader_stops_at_an_event_at_an_older_member(self):
+        hashes = plan_check.plan_hashes(PLAN_TEXT)
+        older = hashes[-1]
+        folder = audit_dir([event(ISSUE, older, "both")], broken=True)   # the unreadable rotated audit is never opened
+        self.assertEqual(HOST.sb.approval_events(folder, ISSUE, hashes[0], hashes=hashes), [{"plan_hash": older}])
+
+    def test_mutant_comparing_the_new_hash_only_is_caught(self):
+        state = mutated_state("(canonical(e[\"plan_hash\"], hashes) if canonical else e[\"plan_hash\"])", "e[\"plan_hash\"]")
+        with self.assertRaisesRegex(AssertionError, r"^approval gate: an event at the member sha256:[0-9a-f]{7} of the pair: got missing, want ok$"):
+            pair_rows(HOST.sb.approval_events, state)
 
 
 class TestApprovalGateCommands(unittest.TestCase):
