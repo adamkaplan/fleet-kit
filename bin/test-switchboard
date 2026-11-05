@@ -8747,6 +8747,33 @@ class TestGithubScenarios(Base):
 # ------------------------------------------------------- portability and hygiene
 
 
+class TestFactSourcesRegistered(unittest.TestCase):
+    """Every *Facts source class of the entry and its parts is a member of fact_sources (#1756's merge dropped HeldSendFacts: held sends were
+    stored and never delivered)."""
+
+    @staticmethod
+    def defined():
+        import ast
+        files = [BIN / "fleet-switchboard"] + sorted((BIN / "switchboard").glob("*.py"))
+        return {n.name for f in files for n in ast.parse(f.read_text()).body if isinstance(n, ast.ClassDef) and n.name.endswith("Facts")}
+
+    @staticmethod
+    def missing(sources, defined):
+        have = {type(s).__name__ for s in sources}
+        return sorted(defined - have)
+
+    def test_every_facts_class_is_registered_in_fact_sources(self):
+        with tempfile.TemporaryDirectory() as d:
+            sources = sb.fact_sources(d)
+        missing = [n for n in self.missing(sources, self.defined()) if n != "Facts"]
+        self.assertEqual(missing, [], "a *Facts class is defined but not in fact_sources: %s" % ", ".join(missing))
+
+    def test_planted_a_list_missing_held_send_facts_fails_naming_it(self):
+        with tempfile.TemporaryDirectory() as d:
+            sources = [s for s in sb.fact_sources(d) if type(s).__name__ != "HeldSendFacts"]
+        self.assertEqual(self.missing(sources, self.defined()), ["HeldSendFacts"])
+
+
 class TestHygiene(unittest.TestCase):
     FILES = ("fleet-switchboard", "fleet-scenario", "test-switchboard", "proof-switchboard", "switchboard-trial")
 
