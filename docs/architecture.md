@@ -104,6 +104,7 @@ The **Holds** column is descriptive: only the layer numbers are enforced.
 | `cloud_worker.py` | 5 | remote (cloud) workers for the switchboard | |
 | `delegated_clear.py` | 5 | the Chief of Staff's clear under the owner's standing order | |
 | `endpoint_send.py` | 5 | the send path's route to an agent that holds no pane | |
+| `epic_record.py` | 4 | an epic-claimed scenario's record on its owning issue: the states and the lines `gates` prints (moved from `plan_ledger.py`) | |
 | `heavy_slots.py` | 5 | CPU slots for heavy commands (`fleet-switchboard heavy`) | |
 | `heavy_slots_watch.py` | 5 | the watchdog and the orphan check of the heavy wrapper (#2034); a part of heavy_slots.py | |
 | `host_liveness.py` | 2 | the liveness of an orchestrator that a charter names by a host (alive, dead or unreachable), on demand only | |
@@ -388,6 +389,10 @@ A site is listed by the function it sits in and its kind, with a count: `import(
 | `delegated_clear.py` | `_registrar_unit:__import__(string)` | 2 | the registrar lint only names this in order to refuse it in a registrar; it loads nothing |
 | `delegated_clear.py` | `_registrar_unit:builtins` | 2 | the registrar lint only names this in order to refuse it in a registrar; it loads nothing |
 | `delegated_clear.py` | `_registrar_unit:import_module(string)` | 1 | the registrar lint only names this in order to refuse it in a registrar; it loads nothing |
+| `epic_record.py` | `<module>:import(importlib)` | 1 | imports a module that can load code by name, or one of its identifiers |
+| `epic_record.py` | `_plan_ledger:exec_module` | 1 | uses an identifier of the import machinery (exec_module) |
+| `epic_record.py` | `_plan_ledger:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
+| `epic_record.py` | `_plan_ledger:sys.modules` | 1 | uses `sys` beyond its plain attributes |
 | `external_adapter.py` | `<module>:import(importlib)` | 1 | imports a module that can load code by name, or one of its identifiers |
 | `external_adapter.py` | `_load_core:exec_module` | 1 | uses an identifier of the import machinery (exec_module) |
 | `external_adapter.py` | `_load_core:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
