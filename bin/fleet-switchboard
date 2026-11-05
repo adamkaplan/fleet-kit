@@ -1876,7 +1876,7 @@ def fact_sources(state_dir):
     reminders join this list. `send` delivers directly, by the same rule, and
     stores only a send held for a blocked agent (HeldSendFacts).
     """
-    return [lab_fact_source(state_dir), WorkerFacts(), ReminderFacts(state_dir), ReportRiderFacts(state_dir),
+    return [lab_fact_source(state_dir), WorkerFacts(), ReminderFacts(state_dir), ReportRiderFacts(state_dir), HeldSendFacts(state_dir),
             ForegroundFacts(), OrdersFacts(), SweepFacts(), TriageFacts(), PlanWakeFacts(), AlertWakeFacts(), RedCiFacts(), JobFacts(), PaneFacts(), PaneExitFacts(), HeadlessRestartFacts(), DiskFacts(), CpuFacts(), SpotlightFacts(), DockerReapFacts(), TempJanitorFacts(), HeavyOrphanFacts(), ScratchBoundFacts()]
 
 
