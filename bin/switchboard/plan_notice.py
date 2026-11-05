@@ -100,8 +100,6 @@ def plan_wake_pass(engine, state, repos, now, budget=None):
             wake.newest[(repo, number)] = plan_hash   # #1542: the present hash, for the delivery re-check
             wake.current[(repo, number)] = plan_hash   # #1784: recorded before the approved and cited skips
             remembered = "%s#%d:%s" % (repo, number, plan_hash)
-            if remembered in wake.approved:
-                continue   # #2193: judged approved before, whatever the audit tail holds now
             if consensus is None:
                 consensus = plan_wake_consensus(engine)
             if (plan_hash in consensus or module.approved_by_comment(plan, plan_hash, by_issue.get(number, []), signed_by_fleet)
