@@ -349,7 +349,7 @@ class TestPinsReview(PinsRepo):
     def test_a_finder_that_skips_a_deleted_file_is_caught(self):   # M2 mutant: the old side's path is hidden, as before the fix
         def blind(argv, **kwargs):
             done = self.runner(argv, **kwargs)
-            if argv[1] == "diff":
+            if "diff" in argv[:4]:
                 done.stdout = done.stdout.replace("--- a/acme.py", "--- /dev/null")
             return done
         _, found = self.delete_file(blind)
@@ -570,7 +570,7 @@ class TestPinsStrictRead(PinsRepo):
     def fake(self, diff_out="", grep=None):
         def run(argv, **kwargs):
             self.calls.append((list(argv), kwargs))
-            if argv[1] == "diff":
+            if "diff" in argv[:4]:
                 return subprocess.CompletedProcess(argv, 0, diff_out, "")
             return grep(argv, **kwargs)
         return run
