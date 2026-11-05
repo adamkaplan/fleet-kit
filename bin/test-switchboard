@@ -24955,7 +24955,7 @@ class TestIdentityCheck(ReportBase):
         self.assertEqual((done.returncode, seen["token"]), (0, "tok-bot"), done.stderr)
 
     def test_s6_a_worker_without_a_read_repository_is_untouched_by_the_guard(self):
-        for args in (("issue", "view", "5", "-R", "acme-org/other"), ("api", "graphql", "-f", "query=x"), ("issue", "comment", "5", "-R", "acme-org/other", "--body", "x")):
+        for args in (("issue", "view", "5", "-R", "acme-org/other"), ("api", "graphql", "-f", "query={viewer{login}}"), ("issue", "comment", "5", "-R", "acme-org/other", "--body", "x")):
             with self.subTest(args=args):
                 done, seen = self.run_gh_shim("acme-org/widget-service", self.READ_USERS, self.READ_TOKENS, args=args, own=True)
                 self.assertTrue(seen is not None and seen["argv"][0] == args[0], (done.returncode, done.stderr))
@@ -66778,6 +66778,22 @@ TestHeavySplit = importlib.import_module("test_heavy_split").TestHeavySplit
 # The steer-after-minutes tests of #1540, moved under the line ceiling.
 _steer_long = importlib.import_module("test_steer_long_turn")
 TestSteerLongTurn = _steer_long.build(Base, TestSteerToWorking)
+TestGhShimSignInput = importlib.import_module("test_gh_shim_sign_input").TestGhShimSignInput
+TestGhShimEffectRule = importlib.import_module("test_gh_shim_sign_input").TestGhShimEffectRule
+TestGhShimMutationRoots = importlib.import_module("test_gh_shim_sign_input").TestGhShimMutationRoots
+TestGhShimRawPath = importlib.import_module("test_gh_shim_sign_input").TestGhShimRawPath
+TestGhShimRound5 = importlib.import_module("test_gh_shim_sign_input").TestGhShimRound5
+TestGhShimArgvParser = importlib.import_module("test_gh_shim_sign_input").TestGhShimArgvParser
+TestApiReadersAreViews = importlib.import_module("test_gh_shim_sign_input").TestApiReadersAreViews
+TestGhHoldIsAView = importlib.import_module("test_gh_shim_sign_input").TestGhHoldIsAView
+TestGhShimNestedAndQueryBodies = importlib.import_module("test_gh_shim_sign_input").TestGhShimNestedAndQueryBodies
+TestGhShimEncodedQueryAndLabelDelete = importlib.import_module("test_gh_shim_sign_input").TestGhShimEncodedQueryAndLabelDelete
+TestGhShimDeepBodiesAndInputForms = importlib.import_module("test_gh_shim_sign_input").TestGhShimDeepBodiesAndInputForms
+TestGhShimBodyFieldBesideInput = importlib.import_module("test_gh_shim_sign_input").TestGhShimBodyFieldBesideInput
+TestGhShimBracketBodyKeys = importlib.import_module("test_gh_shim_sign_input").TestGhShimBracketBodyKeys
+TestGhShimAllowlist = importlib.import_module("test_gh_shim_sign_input").TestGhShimAllowlist
+TestGhShimBodyFieldKeyIsExact = importlib.import_module("test_gh_shim_sign_input").TestGhShimBodyFieldKeyIsExact
+TestGhShimMethodFlagBeforeApi = importlib.import_module("test_gh_shim_sign_input").TestGhShimMethodFlagBeforeApi
 TestUnconsumedSteer = importlib.import_module("test_unconsumed_steer").build(Base, TestSteerToWorking)   # #1844
 TestUnconsumedRecord = importlib.import_module("test_unconsumed_record").TestUnconsumedRecord   # #1844
 _noparent = importlib.import_module("test_charter_noparent"); TestCharterNoParent, TestCharterNoParentSet = _noparent.TestCharterNoParent, _noparent.build(CharterRig, Base, TestCharterSetGuard)
