@@ -26,7 +26,7 @@ def _fixture_list():
             if row in bash:
                 del bash[row]
                 removed += 1
-    assert removed == 6, "the by-id row was not found (%d of 6 removals)" % removed
+    assert removed == len(BY_ID_ROWS) * 2, "a by-id row was not found (%d removals, wanted each of %d rows in both permission lists)" % (removed, len(BY_ID_ROWS))
     path = os.path.join(tempfile.mkdtemp(prefix="cw-shell-check-"), "opencode-worker.json")
     with open(path, "w") as fh:
         json.dump(doc, fh, indent=2)

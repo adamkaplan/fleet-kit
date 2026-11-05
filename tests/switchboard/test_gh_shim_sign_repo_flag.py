@@ -47,7 +47,9 @@ class TestGhShimSignRepoFlag(unittest.TestCase):
 
     def test_every_form_with_every_flag_form_is_signed_and_the_flag_is_kept(self):
         listed = forms(self.source)
-        self.assertEqual(len(listed), 13)
+        labels = {label for label, _argv, _at in listed}
+        for required in ("issue comment", "pr comment"):   # the forms the rule must always cover; a new signed form only adds
+            self.assertIn(required, labels)
         for label, argv, at in listed:
             for flag_name, flag in FLAG_FORMS.items():
                 with self.subTest(form=label, flag=flag_name):

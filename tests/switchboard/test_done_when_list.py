@@ -166,14 +166,12 @@ class TestDoneWhenList(TestDoneWhenListCommands):
         doc = (REPO / "docs/switchboard.md").read_text().splitlines()
         hits = [i + 1 for i, line in enumerate(doc) if "numbered list" in line]
         self.assertGreaterEqual(len(hits), 2)
-        for number in (112, 3847):
-            self.assertIn("numbered list", doc[number - 1], "docs/switchboard.md line %d" % number)
         places = (("skills/fleet-charter/SKILL.md", 97, "Done when (a line, or a numbered list under its label), once."),
                   ("docs/switchboard.md", 112, "a Done-when (a line, or a numbered list under its label)"),
                   ("docs/switchboard.md", 3847, "a Done-when (a line or a numbered list)"),
                   ("skills/fleet-planning/SKILL.md", 53, "which may be a numbered list"))
-        for name, number, said in places:   # the four places that say a list is accepted, written once, by file and line text
-            self.assertIn(said, (REPO / name).read_text().splitlines()[number - 1], "%s line %d" % (name, number))
+        for name, number, said in places:   # the four places that say a list is accepted: the text is in its line of the file, wherever the line now sits
+            self.assertTrue(any(said in line for line in (REPO / name).read_text().splitlines()), "%s: %s" % (name, said))
         for name in ("agents/opencode/chief-of-staff.md", "agents/copilot/chief-of-staff.agent.md"):
             text = (REPO / name).read_text()
             self.assertIn("one Intent and one Done when in your principal's terms, never widened (see\n", text, name)

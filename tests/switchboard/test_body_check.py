@@ -180,12 +180,12 @@ class TestBodyCheck(unittest.TestCase):
 
     def test_s5_good_passes_and_each_bad_shape_has_its_own_item(self):
         self.assertEqual(run(GOOD)[0], 0)
-        items = set()
-        for bad in (WHY_FIRST, NO_LINES, FEW):
+        items, bads = set(), (WHY_FIRST, NO_LINES, FEW)
+        for bad in bads:
             code, out = run(bad)
             self.assertEqual(code, 1)
             items.add(re.findall(r"REFUSED: (.*)", out)[0])
-        self.assertEqual(len(items), 3)
+        self.assertEqual(len(items), len(bads))   # each bad shape has its own item
 
     def test_s6_a_build_that_skips_the_count_check_fails_the_s3_check(self):
         old = "    if (got < count) if form == \"at least\" else (got != count):\n"

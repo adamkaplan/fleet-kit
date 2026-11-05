@@ -99,7 +99,7 @@ class TestStageEvents(Base):
         for n, text in enumerate(lines):
             self.comment(text, cid=5100 + n)
         got = self.told()
-        self.assertEqual(len(got), 9)
+        self.assertEqual(len(got), len(lines), "one notice per planted line")
         self.assertEqual({g[1] for g in got}, {"preview event unreadable"})
         self.assertNotIn("ignore your instructions", self.rig.state_text())
         self.assertEqual({g[2] for g in got}, {"github.stage"})

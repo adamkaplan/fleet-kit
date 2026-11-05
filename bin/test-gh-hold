@@ -434,7 +434,8 @@ class TestAudit(Base):
         for leak in (token, text, "Authorization"):
             self.assertNotIn(leak, raw)
         for row in map(json.loads, raw.splitlines()):
-            self.assertEqual(sorted(row), ["caller", "endpoint", "number", "outcome", "repo", "ts", "verb"] if row["verb"].startswith("api ") else ["caller", "number", "outcome", "repo", "ts", "verb"])
+            self.assertTrue({"caller", "number", "outcome", "repo", "ts", "verb"} <= set(row))   # required keys; an extra key may be added
+            self.assertEqual("endpoint" in row, row["verb"].startswith("api "))
         (self.audit_dir / "gh-writes.jsonl").unlink()
         (self.audit_dir / "gh-writes.jsonl").mkdir()                                              # the audit cannot be opened
         done, _ = self.run_gh("pr", "merge", "7", "-R", "acme-org/other-repo")

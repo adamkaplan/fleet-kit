@@ -102,14 +102,15 @@ def plan_wake_pass(engine, state, repos, now, budget=None):
             remembered = "%s#%d:%s" % (repo, number, plan_hash)
             if consensus is None:
                 consensus = plan_wake_consensus(engine)
-            if (plan_hash in consensus or module.approved_by_comment(plan, plan_hash, by_issue.get(number, []), signed_by_fleet)
+            hashes = check_module.plan_hashes(body)
+            if (check_module.canonical_hash(plan_hash, hashes) in {check_module.canonical_hash(h, hashes) for h in consensus} or any(module.approved_by_comment(plan, h, by_issue.get(number, []), signed_by_fleet) for h in hashes)
                     or module.cited_by_pr(repo, number, plan, pulls, parse_iso)):
                 if remembered not in wake.approved:   # #2193: keep the first time; no rewrite while remembered
                     wake.approved[remembered], changed = now, True
                 continue
             if sends is None:
                 sends = _audit_tail(engine.state_dir)   # #790: the sends the audit already holds, read once per pass and only for a plan no other form approved
-            if module.approved_by_send(plan, plan_hash, sends, signed_by_fleet):
+            if any(module.approved_by_send(plan, h, sends, signed_by_fleet) for h in hashes):
                 if remembered not in wake.approved:   # #2193: keep the first time; no rewrite while remembered
                     wake.approved[remembered], changed = now, True
                 continue

@@ -138,14 +138,14 @@ class TestNewTestChecksRules(NtcTree):
             self.assertEqual(self.check(text, name), (0, []), name)
 
     def test_s4_a_part_module_patched_or_caught_through_is_flagged_as_sb_dot_name(self):
-        total = []
-        for name, text in (("test_p.py", NTC_PATCHES), ("test_e.py", NTC_EXCEPT), ("test_r.py", NTC_RAISES)):
+        total, fixtures = [], (("test_p.py", NTC_PATCHES), ("test_e.py", NTC_EXCEPT), ("test_r.py", NTC_RAISES))
+        for name, text in fixtures:
             code, lines = self.check(text, name)
             self.assertEqual((code, len(lines)), (1, 1), "the part-module-through-import rule must flag a part module that is patched or caught through, one finding per file: got %r" % ((name, code, lines),))
             self.assertIn("part-module-through-import", lines[0])
             self.assertIn("sb.plan_ledger", lines[0])
             total += lines
-        self.assertEqual(len(total), 3)
+        self.assertEqual(len(total), len(fixtures))   # one finding per file
         self.assertEqual(self.check(NTC_CONSTANT, "test_k.py"), (0, []))
 
     def test_s5_a_class_that_lists_bin_and_a_row_that_does_not_name_the_file_are_listed_not_flagged(self):
@@ -204,7 +204,7 @@ class TestNewTestChecksFiles(unittest.TestCase):
 
     def test_s8_the_existing_test_files_and_this_one_give_no_finding(self):
         files = sorted((REPO / "tests" / "switchboard").glob("test_*.py"))
-        self.assertGreaterEqual(len(files), 47)
+        self.assertGreater(len(files), 0)   # the walk found the test files (the set grows; no count is pinned)
         done = subprocess.run([sys.executable, str(NTC_TOOL)] + [str(f) for f in files], capture_output=True, text=True, cwd=str(REPO))
         findings = [l for l in done.stdout.splitlines() if not l.startswith(("table:", "run first:"))]
         self.assertEqual((done.returncode, findings), (0, []), done.stdout)

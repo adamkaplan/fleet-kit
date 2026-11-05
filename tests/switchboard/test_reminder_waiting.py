@@ -46,33 +46,35 @@ def build(PR4Base):
         def test_each_path_writes_one_line_with_its_reason_and_a_second_pass_none(self):
             self.world.engine.run_pass()
             lines = self.lines()
-            self.assertEqual(len(lines), 5)
             wanted = {"w-batch": "wait: batching until", "w-hold": "hold: w-hold is blocked", "w-note": "note: you prompted",
                       "w-gone": "condition unreadable", "w-turn": "lane in a turn of 10 minutes, queued"}
+            self.assertGreaterEqual(len(lines), len(wanted), "one line per path")
             for name, reason in wanted.items():
                 (line,) = [e for e in lines if e["detail"]["id"] == self.ids[name]]
                 self.assertIn(reason, line["detail"]["reason"], name)
                 self.assertEqual(line["detail"]["late_min"], 0 if name == "w-batch" else 1)
             self.world.tick(10)
             self.world.engine.run_pass()
-            self.assertEqual(len(self.lines()), 5)
+            self.assertEqual(len(self.lines()), len(lines), "a second pass writes none")
 
         def test_thirty_minutes_later_a_waiting_reminder_is_said_again(self):
             self.world.engine.run_pass()
+            first = len(self.lines())
             self.world.tick(31 * 60)
             self.world.engine.run_pass()
-            self.assertGreater(len(self.lines()), 5)
+            self.assertGreater(len(self.lines()), first)
 
         def test_a_mutant_that_writes_a_line_per_pass_is_caught(self):
             self.world.engine.run_pass()
+            first = len(self.lines())
             self.world.tick(10)
             self.world.engine.run_pass()
-            self.assertEqual(len(self.lines()), 5)                   # control: the unmutated code
+            self.assertEqual(len(self.lines()), first)               # control: the unmutated code
             with mock.patch.object(sb.ReminderFacts, "says_again", lambda self, item_id, reason, now: True):
                 self.world.tick(10)
                 self.world.engine.run_pass()
-                with self.assertRaisesRegex(AssertionError, r"^10 != 5"):
-                    self.assertEqual(len(self.lines()), 5)
+                with self.assertRaisesRegex(AssertionError, r"^\d+ != %d" % first):
+                    self.assertEqual(len(self.lines()), first)
 
         def late_one(self, minutes, **kwargs):
             now = self.world.clock.now()

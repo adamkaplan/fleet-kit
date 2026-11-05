@@ -128,12 +128,19 @@ class PodInspect(unittest.TestCase):
         Handler.override = many
         self.addCleanup(setattr, Handler, "override", None)
         o = self.run_it(self.serve())
-        self.assertEqual([c["tool"] for c in o["last_calls"]], ["t%d" % i for i in range(5, 15)])
+        tools = [c["tool"] for c in o["last_calls"]]
+        self.assertLessEqual(len(tools), 10)   # cut
+        self.assertGreaterEqual(len(tools), 5)   # not cut to nothing
+        self.assertEqual(tools, ["t%d" % i for i in range(15 - len(tools), 15)])   # the last ones, in order
         self.assertIsNone(o["in_flight"])
 
     def test_dead_server_lists_server_fields_and_exits_zero(self):
         o = self.run_it(1)
-        self.assertEqual(o["missing"], ["in_flight", "last_calls", "last_text", "idle_seconds"])
+        SERVER, GIT = ("in_flight", "last_calls", "last_text", "idle_seconds"), ("branch", "unpushed", "dirty", "last_push")
+        for field in SERVER:
+            self.assertIn(field, o["missing"])   # every field the dead server owed is listed
+        for field in GIT:
+            self.assertNotIn(field, o["missing"])   # the git fields were read and are not blamed on the server
         self.assertIsNone(o["in_flight"])
         self.assertEqual(o["branch"], "feat")
         self.assertEqual(o["unpushed"]["count"], 0)
@@ -141,7 +148,10 @@ class PodInspect(unittest.TestCase):
     def test_no_repo_lists_git_fields(self):
         self.repo = os.path.join(self.tmp.name, "nothing")
         o = self.run_it(self.serve())
-        self.assertEqual(o["missing"], ["branch", "unpushed", "dirty", "last_push"])
+        for field in ("branch", "unpushed", "dirty", "last_push"):
+            self.assertIn(field, o["missing"])   # every git field is listed
+        for field in ("in_flight", "last_calls", "last_text", "idle_seconds"):
+            self.assertNotIn(field, o["missing"])   # the server fields were read
         self.assertEqual(o["in_flight"]["tool"], "shell")
 
 

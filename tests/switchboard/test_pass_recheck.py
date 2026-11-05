@@ -119,11 +119,12 @@ class TestPassRecheck(Base):
         self.hold(self.sweep, SWEEP_KEY, [("S1", "acme/api#1")])
         self.hold(self.triage, TRIAGE_KEY, [("S1", "acme/api#1")])
         self.wake.newest = {("acme/api", 3): "h1h1h1h1"}
-        for key, kind in ((SWEEP_KEY, "sweep"), (TRIAGE_KEY, "triage"), (PLAN_KEY, "plan")):
+        kinds = ((SWEEP_KEY, "sweep"), (TRIAGE_KEY, "triage"), (PLAN_KEY, "plan"))
+        for key, kind in kinds:
             self.make(key, kind, age=90 * 60, summary="a %s item" % kind)
             self.deliver()
         marked = [t for t in self.texts() if "delayed: sent" in t.splitlines()[0]]
-        self.assertEqual(len(marked), 3, msg="not all three old items carry the mark: %r" % self.texts())
+        self.assertEqual(len(marked), len(kinds), msg="not all three old items carry the mark: %r" % self.texts())
 
     def test_s8_the_age_threshold_is_defined_once_in_bin(self):
         import re

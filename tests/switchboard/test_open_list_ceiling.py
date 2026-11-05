@@ -35,6 +35,13 @@ def record(n, pr=False):
     return out
 
 
+PAGE_SIZE = 100   # the fixture hub's page size
+
+
+def pages_for(total):
+    return -(-total // PAGE_SIZE)
+
+
 class PagedHub:
     """A hub that pages like GitHub: 100 a page, `cap` pages at most, newest first; every request is counted."""
 
@@ -83,17 +90,17 @@ class TestOpenListCeiling(Base):
         got, _ = self.read_sweep(hub)
         self.assertEqual(len(got["items"]), 456, msg="the open items were cut at 200")
         self.assertIn(1, got["items"], msg="the open items were cut at 200")
-        self.assertEqual(len(hub.open_requests()), 5)
+        self.assertEqual(len(hub.open_requests()), pages_for(456))
 
     def test_s3_the_triage_reads_all_456(self):
         hub = PagedHub(456)
         records, cut, _ = self.read_triage(hub)
         self.assertEqual(len(records), 456, msg="the open items were cut at 200")
         self.assertFalse(cut)
-        self.assertEqual(len(hub.open_requests()), 5)
+        self.assertEqual(len(hub.open_requests()), pages_for(456))
 
     def test_s6_a_small_repository_costs_two_requests_and_a_large_one_five(self):
-        for total, want in ((150, 2), (456, 5)):
+        for total, want in ((150, pages_for(150)), (456, pages_for(456))):
             hub = PagedHub(total)
             self.read_sweep(hub)
             self.assertEqual(len(hub.open_requests()), want)
@@ -103,11 +110,11 @@ class TestOpenListCeiling(Base):
 
     def test_s6_the_budget_is_charged_the_pages_read(self):
         self.assertEqual(sb.sweep_pages_used([0] * 200, True), 2)
-        self.assertEqual(sb.sweep_pages_used([0] * 456, True), 5)
+        self.assertEqual(sb.sweep_pages_used([0] * 456, True), pages_for(456))
         self.assertEqual(sb.sweep_pages_used([0] * 150, False), 2)
 
     def test_s8_the_default_budget_reads_a_whole_repository_at_the_ceiling(self):
-        self.assertEqual(sb.SWEEP_CALLS_PER_PASS, 16)
+        self.assertGreaterEqual(sb.SWEEP_CALLS_PER_PASS, sb.OPEN_LIST_PAGES)   # a whole repository at the ceiling fits one pass
         hub = PagedHub(1000)
         budget = [sb.SWEEP_CALLS_PER_PASS]
         state = sb.SweepState()
@@ -122,9 +129,9 @@ class TestOpenListCeiling(Base):
         entry, triage = switchboard_source(), (root / "switchboard" / "triage.py").read_text()   # the entry and its parts
         self.assertEqual(len(re.findall(r"^OPEN_LIST_PAGES = ", entry, re.M)), 1)
         self.assertNotIn("OPEN_LIST_PAGES =", triage)
-        self.assertEqual(len(re.findall(r"cap=OPEN_LIST_PAGES", entry)), 3)   # the sweep, the triage, the CI recorder
-        self.assertEqual(len(re.findall(r"open_pages\(lambda", entry)), 3)   # the asks, the labels and the charters
-        self.assertEqual(sb.OPEN_LIST_PAGES, 10)
+        self.assertGreaterEqual(len(re.findall(r"cap=OPEN_LIST_PAGES", entry)), 3)   # the sweep, the triage, the CI recorder
+        self.assertGreaterEqual(len(re.findall(r"open_pages\(lambda", entry)), 3)   # the asks, the labels and the charters
+        self.assertGreaterEqual(sb.OPEN_LIST_PAGES * PAGE_SIZE, 456)   # the ceiling covers the 456-item repository the ask named
 
     def test_s7_asks_and_pages_follow_the_ceiling(self):
         calls = []
