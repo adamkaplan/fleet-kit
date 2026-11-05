@@ -1,6 +1,7 @@
 """#1784: a held plan line for a replaced hash is dropped and counted; a delivered line is not repeated. The fake world is TestPlanWake's (HOST, set by
 bin/test-switchboard); mutants are one textual replacement in a copy of the PlanWakeFacts source, never production."""
 import copy
+import json
 import re
 import unittest
 from pathlib import Path
@@ -251,6 +252,67 @@ def build():
             with mock.patch.object(sb, "_audit_tail", lambda state_dir: []):
                 self.go(2)
             self.assertEqual(self.lines(), [], msg="no plan posted notice: the approval was remembered")
+
+        def approved_file(self):
+            return json.loads((Path(self.engine.state_dir) / sb.PLAN_WAKE_FILE).read_text()).get("approved", {})
+
+        def test_s2_approved_is_remembered_once_keeping_the_first_time_and_not_rewritten_each_pass(self):
+            record = self.post(3, self.plan(), minutes_ago=5)
+            with mock.patch.object(sb, "_audit_tail", lambda state_dir: self.send_for(record)):
+                self.go()
+                first = dict(self.engine.plan_wake.approved)
+                self.assertEqual(len(first), 1)
+                writes = []
+                real = sb.state_write
+                with mock.patch.object(sb, "state_write", lambda *a, **k: (writes.append(a), real(*a, **k))[1]):
+                    self.go(3)
+                self.assertEqual([w for w in writes if Path(w[0]).name == sb.PLAN_WAKE_FILE], [], msg="a remembered approval rewrites nothing")
+                self.assertEqual(self.engine.plan_wake.approved, first, msg="the first time is kept")
+
+        def test_s2_the_state_file_round_trips_approved_and_prunes_after_fourteen_days(self):
+            now = self.world.clock.now()
+            wake = sb.PlanWakeState(self.engine.state_dir)
+            wake.approved = {"acme/api#3:sha256:aa": now, "acme/api#4:sha256:bb": now - 15 * 86400}
+            self.engine.plan_wake = wake
+            record = self.post(3, self.plan())
+            wake.announced = {"x": now}
+            with mock.patch.object(sb, "_audit_tail", lambda state_dir: self.send_for(record)):
+                self.go()   # records a new key and prunes the old one in one write
+            saved = self.approved_file()
+            self.assertIn("acme/api#3:sha256:aa", saved)
+            self.assertNotIn("acme/api#4:sha256:bb", saved, msg="an approval older than 14 days is pruned")
+            self.assertEqual(sb.PlanWakeState(self.engine.state_dir).approved, saved, msg="load returns what save wrote")
+
+        def test_s2_each_approval_form_records_the_key(self):
+            consensus = self.post(3, self.plan(), minutes_ago=40)
+            h = sb.plan_check.plan_hash(consensus["body"])
+            sb.plan_ledger.append_entry(self.world.state, {"kind": "consensus", "result": "pass", "pr": "-", "scenario": "-", "plan_hash": h}, self.world.clock.now())
+            self.go()
+            self.assertEqual(list(self.approved_file()), ["acme/api#3:" + h], msg="consensus")
+            self.comments.clear()
+            self.engine.plan_wake.approved.clear()
+            record = self.post(3, self.plan("\ncomment"), agent="coder", minutes_ago=40)
+            h = sb.plan_check.plan_hash(record["body"])
+            self.post(3, "Plan approved at %s" % h, agent="orch", minutes_ago=30)
+            self.go()
+            self.assertIn("acme/api#3:" + h, self.approved_file(), msg="comment")
+            self.comments.clear()
+            self.engine.plan_wake.approved.clear()
+            record = self.post(3, self.plan("\npull request"), minutes_ago=40)
+            h = sb.plan_check.plan_hash(record["body"])
+            pr = HOST.tri_issue(self.world.clock.now(), 20, created=0.01, body="PLAN: https://github.com/acme/api/issues/3#issuecomment-%d\nbody" % record["id"], pr=True)
+            pr["created_at"] = sb.iso(self.world.clock.now() - 10 * 60)
+            self.hub.open["acme/api"][20] = pr
+            self.go()
+            self.assertIn("acme/api#3:" + h, self.approved_file(), msg="pull request")
+
+        def test_s2_a_remembered_approval_is_not_listed_as_unapproved_after_the_send_leaves_the_tail(self):
+            record = self.post(3, self.plan(), minutes_ago=40)
+            with mock.patch.object(sb, "_audit_tail", lambda state_dir: self.send_for(record)):
+                self.go()
+            with mock.patch.object(sb, "_audit_tail", lambda state_dir: []):
+                self.go(2)
+            self.assertEqual(self.engine.plan_wake.unapproved, [])
 
         def test_s3_a_new_unapproved_plan_is_announced_exactly_once_across_a_reload(self):
             self.post(3, self.plan())

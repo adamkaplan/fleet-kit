@@ -104,12 +104,14 @@ def plan_wake_pass(engine, state, repos, now, budget=None):
                 consensus = plan_wake_consensus(engine)
             if (plan_hash in consensus or module.approved_by_comment(plan, plan_hash, by_issue.get(number, []), signed_by_fleet)
                     or module.cited_by_pr(repo, number, plan, pulls, parse_iso)):
-                wake.approved[remembered], changed = now, True
+                if remembered not in wake.approved:   # #2193: keep the first time; no rewrite while remembered
+                    wake.approved[remembered], changed = now, True
                 continue
             if sends is None:
                 sends = _audit_tail(engine.state_dir)   # #790: the sends the audit already holds, read once per pass and only for a plan no other form approved
             if module.approved_by_send(plan, plan_hash, sends, signed_by_fleet):
-                wake.approved[remembered], changed = now, True
+                if remembered not in wake.approved:   # #2193: keep the first time; no rewrite while remembered
+                    wake.approved[remembered], changed = now, True
                 continue
             url = module.plan_url(repo, number, plan["id"])
             key = "%s#%d:%s" % (repo, number, plan_hash)
@@ -154,7 +156,7 @@ def plan_wake_pass(engine, state, repos, now, budget=None):
                 wake.announced[key] = now
                 changed = True
                 engine._note("plan_wake.announced", "%s#%d" % (repo, number), {"hash": plan_hash, "to": names, "route": route[1], "check": "PASS" if passed else "FAIL", "stale": bool(stale and not passed), "defect": "" if passed else defect})
-            if now - posted >= module.UNAPPROVED_SECONDS:
+            if now - posted >= module.UNAPPROVED_SECONDS and remembered not in wake.approved:
                 listed.append("%s#%d" % (repo, number) if len(repos) > 1 else "#%d" % number)
     wake.unapproved = sorted(listed)
     for old in [k for k, v in wake.announced.items() if now - v > 14 * 86400]:
