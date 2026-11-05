@@ -428,6 +428,7 @@
         "bin/reds.py",
         "bin/registry.py",
         "bin/report_fold.py",
+        "bin/required_checks.py",
         "bin/spotlight_guard.py",
         "bin/triage_digest.py",
         "bin/turn_start.py",
