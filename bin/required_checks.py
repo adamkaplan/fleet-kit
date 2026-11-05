@@ -46,10 +46,10 @@ def parse(brief):
 
 def _state(line, name):
     """'result', 'not_done', 'no_reason' or None for one comment line and one check name."""
-    at = line.casefold().find(name.casefold())
-    if at < 0:
+    found = re.search(r"(?<!\w)%s(?!\w)" % re.escape(name), line, re.I)   # the whole phrase, not a piece of a longer word
+    if found is None:
         return None
-    rest = line[at + len(name):].lstrip(_WRAP)
+    rest = line[found.end():].lstrip(_WRAP)
     if not rest or rest[0] not in _SEP:
         return None   # a bare mention, or a name followed by prose, gives no result
     rest = rest[1:].strip(_PAD)

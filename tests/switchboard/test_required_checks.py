@@ -118,6 +118,11 @@ def build(TwoRepoCase):
             self.assertTrue(failed, "the failure is audited")
             self.assertIn("boom-marker", str(failed[0]), "the audit line names the failure")
 
+        def test_the_name_matches_as_a_whole_phrase(self):
+            inside = module().compare("latest: passes\nattestation: ok\n", ["test"])
+            self.assertIn("test", inside["missing"], "a name inside a longer word is not a mention")
+            self.assertEqual(module().compare("TEST: passes\n", ["test"])["missing"], [], "a whole phrase matches, any case")
+
         # U1
         def test_u1_a_reader_with_no_list_changes_nothing(self):
             body = "Review of %s: APPROVE\nanything\n" % SHA
