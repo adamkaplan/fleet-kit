@@ -45,7 +45,7 @@ CLOUD_WORKER_AGENT = "worker"   # the agent the image defines (cloud/worker/agen
 # The options of the launcher's `create` that `launch --cloud` hands over: ONE table. Taken from the launcher on main (commit fb4b9f2,
 # cloud/launcher/cloud_worker.py `create`: --shape S|M, --stack); a name here that the launcher does not know makes its create fail (exit 2).
 NO_COMMIT_OPTION = "--no-commit"   # the pod is launched NOT to commit (a measure or a read): the launcher sends it no wip note
-CREATE_OPTION = {"repo": "--repo", "branch": "--branch", "run_id": "--run-id", "idle": "--idle", "hard": "--hard", "shape": "--shape", "stack": "--stack", "agent": "--agent", "boss": "--boss", "stack_model_secret": "--stack-model-secret", "issue": "--issue"}
+CREATE_OPTION = {"repo": "--repo", "branch": "--branch", "run_id": "--run-id", "idle": "--idle", "hard": "--hard", "shape": "--shape", "stack": "--stack", "agent": "--agent", "boss": "--boss", "stack_model_secret": "--stack-model-secret", "persistent": "--persistent", "issue": "--issue"}
 LAUNCHER_SHAPES = ("XS", "S", "M", "O")   # the launcher's SHAPES keys (O: the orchestrator row, 250m and 768 MiB, meant for --agent orchestrator; a worker on it is likely to be killed for memory); the launcher's own default (XS; S with --stack; O with --agent orchestrator) applies when --shape is not given
 LAUNCHER_STACK_SHAPES = ("S", "M")   # the rows with stack: true; --stack with another shape is refused here, before any call
 MAX_M_PER_LANE = 4   # the most live shape-M (4 CPU) cloud workers one lane may hold: a lane's batch of 4-CPU pods once filled the cluster and left every other lane's launches unplaceable
@@ -711,6 +711,11 @@ def _launch(args, runner, now, reserve):
         raise LaunchError("--agent is required")
     if args.agent == "orchestrator" and not args.reports_to:
         raise Refusal("--agent orchestrator needs --reports-to BOSS (the pod's FLEET_BOSS); nothing was created")
+    persistent = bool(getattr(args, "persistent", False))
+    if persistent and args.agent != "orchestrator":   # before anything is read or created
+        raise Refusal("--persistent is only for --agent orchestrator, not a worker; nothing was created")
+    if persistent and getattr(args, "stack", False):
+        raise Refusal("--persistent does not combine with --stack; nothing was created")
     if args.dir:
         given = str(args.dir)   # a normal absolute path (no `..`, no doubled or trailing slash) under a pod root
         if given != os.path.normpath(given) or not any(given == root or given.startswith(root + "/") for root in POD_DIR_ROOTS):
@@ -756,6 +761,7 @@ def _launch(args, runner, now, reserve):
     if args.reports_to:
         check_report_to(engine, state, args, local_agents=found.agents)
     brief = H["read_brief"](args.brief_file, sys.stdin)
+    args.brief_text = brief
     for note in brief_warnings(args, repo, brief):   # before anything is created: one line each, then the launch goes on
         print("%s: %s" % (H["PROG"], note), file=sys.stderr)
     needs = next((ln for ln in str(brief).splitlines() if re.fullmatch(r"\s*NEEDS:\s*docker\s*", ln, re.I)), None)   # #1488: the XS/S/M shapes without --stack have no docker
@@ -777,6 +783,8 @@ def _launch(args, runner, now, reserve):
         options.append(CREATE_OPTION["stack"])
     if getattr(args, "no_commit", False) or getattr(args, "role", None) in ("tester", "reviewer"):   # a measure or a read never commits
         options.append(NO_COMMIT_OPTION)
+    if persistent:   # only on request: any other launch hands the launcher exactly what it always did
+        options.append(CREATE_OPTION["persistent"])
     if os.environ.get("CW_PULL_SECRET"):
         options += ["--pull-secret", os.environ["CW_PULL_SECRET"]]
     stack_model = stack_model_secret() if getattr(args, "stack", False) else None   # before any cluster call; without --stack the setting is ignored

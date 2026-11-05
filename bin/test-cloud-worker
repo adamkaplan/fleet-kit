@@ -1616,6 +1616,26 @@ class TestLaunchStack(Base):
                 self.assertEqual(self.create_argv(), expected)
                 self.assertEqual(self.create_argv().count("--stack"), 1)
 
+    def test_s14_a_stack_launch_arms_the_default_once(self):
+        code, out, err = self.launch_with("--cloud", "--stack")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.create_argv().count("--stack"), 1)
+        lines = [l for l in err.splitlines() if l.startswith("fleet-switchboard: default 25m/40m")]
+        self.assertEqual(len(lines), 1, err)
+        self.assertIn("worker reminder in 25 min", lines[0])
+        self.assertIn("overdue reminder in 40 min", lines[0])
+
+    def test_s15_a_second_launch_of_the_same_name_arms_nothing(self):
+        def arming(err):
+            return [l for l in err.splitlines() if l.startswith("fleet-switchboard: default 25m/40m")]
+        code, out, err = self.launch_with("--cloud")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(arming(err)), 1, err)
+        code, out, err = self.launch_with("--cloud")   # no state_clean: the worker record of the first exists, the real launcher refuses it
+        self.assertNotEqual(code, 0, err)
+        self.assertEqual(len(arming(err)), 0, err)
+        self.assertEqual(len([c for c in self.stub_calls() if c[0] == "create"]), 1)   # no second pod
+
     def state_clean(self):
         """Between two launches of one test: the fakes' call logs and the worker records start empty."""
         for name in ("calls.log", "kubectl.log", "login.log"):
@@ -1734,7 +1754,16 @@ class TestNeedsDocker(Base):   # #1488
             return self.main(*argv, *(["--cloud"] if cloud else ["--terminal", "--workspace", "w1", "--dir", str(self.home)]))
 
     def seen(self, res):
-        return {"exit": res[0], "stdout": re.sub(r"(127\.0\.0\.1:)\d+", r"\1PORT", res[1]), "stderr": "".join(l + "\n" for l in res[2].splitlines() if l.startswith(("fleet-switchboard:", "preflight:")))}
+        return {"exit": res[0], "stdout": re.sub(r"(127\.0\.0\.1:)\d+", r"\1PORT", res[1]), "stderr": "".join((re.sub(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", "TIME", l) if l.startswith("fleet-switchboard: default 25m/40m") else l) + "\n" for l in res[2].splitlines() if l.startswith(("fleet-switchboard:", "preflight:")))}
+
+    def test_s16_seen_masks_the_time_of_the_arming_line_only(self):
+        iso = r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ"
+        res = self.seen((0, "{}", "fleet-switchboard: default 25m/40m (no CHECKPOINT line and no flag): checkpoint reminders (now 2026-11-01T22:32:44Z): worker reminder in 25 min, at 2026-11-01T22:57:44Z; overdue reminder in 40 min, at 2026-11-01T23:12:44Z\nfleet-switchboard: another line 2026-11-01T10:00:00Z\n"))
+        arming, other = res["stderr"].splitlines()
+        self.assertIn("TIME", arming)
+        self.assertEqual(len(re.findall(iso, arming)), 0)
+        self.assertEqual(res["stderr"].count("2026-11-01T10:00:00Z"), 1)
+        self.assertEqual(len(re.findall(iso, other)), 1)
 
     def test_s2_a_docker_brief_without_stack_is_refused_before_any_pod(self):
         code, out, err = self.run_launch("Build.\n" + self.LINE + "\n")

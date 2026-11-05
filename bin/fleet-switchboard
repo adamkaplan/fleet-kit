@@ -8529,7 +8529,9 @@ def push_watch_tick(engine, discovery):
     ns = types.SimpleNamespace(parse_iso=parse_iso, _one_line=_one_line, parse_bounded=load_module("record_json").parse_bounded)
     hub = getattr(engine, "hub", None)   # the GitHub reader is the hub (Switchboard has no gh_api); with none, skip the pass
     if hub is None:
-        engine.audit.append(engine.actor, "push_watch.skipped", None, "no GitHub hub")
+        if not getattr(engine, "_push_watch_skip_told", False):   # once per engine, not every idle pass: a line per pass grows the audit and every reader of it rewrites its offsets (TestWriteOnlyOnChange)
+            engine._push_watch_skip_told = True
+            engine.audit.append(engine.actor, "push_watch.skipped", None, "no GitHub hub")
         return []
     return module.run_pass(ns, engine, engine.now(), lambda path: hub.gh_api(path, paginate=False), (getattr(engine, "config", None) or {}).get("push_watch"))
 
@@ -12375,13 +12377,17 @@ def _cmd_launch(args, runner, now, socket_call=None):
     if getattr(args, "stack", False) and not getattr(args, "cloud", False):   # before anything is read or called: the option is the cloud launcher's
         sys.stderr.write("%s: --stack needs --cloud: the nested Docker stack is a cloud worker's pod; nothing was created\n" % PROG)
         return EXIT_USAGE
+    if getattr(args, "persistent", False) and not getattr(args, "cloud", False):   # before anything is read or called: the option is the cloud launcher's
+        sys.stderr.write("%s: --persistent needs --cloud: an always-on orchestrator is a cloud pod; nothing was created\n" % PROG)
+        return EXIT_USAGE
     if getattr(args, "role", None) == "tester" and getattr(args, "agent", None):   # #1963: before every route; the allowed agents are read from the checkout's agents/roles.tsv
         problem = load_module("tester_agent").line_for(args.agent, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
         if problem:
             sys.stderr.write(problem + "\n")
             return EXIT_USAGE
     if getattr(args, "cloud", False):   # a worker in the cloud (#371): its own module; nothing below runs
-        return run_cloud("cmd_launch", args, runner, now)
+        code = run_cloud("cmd_launch", args, runner, now)
+        return arm_cloud_checkpoints(args, runner, now) if code == EXIT_OK else code   # #1790
     refuse_cloud_name(args.name)   # a name that has a cloud record is not launched locally (#640)
     engine, state, _ = build_engine(runner, now, "cli", socket_call=socket_call)
     choice = launch_model_choice(args, engine)   # #1642: before any session or pane
@@ -21479,7 +21485,7 @@ def build_parser():
     notice.add_argument("--from", dest="sender", help="Lab only: the sender's fleet name")
     sub.add_parser("ensure", help="Start the daemon unless it runs (herdr's startup hook calls this)")
     sub.add_parser("poke", help="Ask the daemon for a pass now; silent, never blocks (herdr's event hooks call this)")
-    launch = sub.add_parser("launch", help="Start a fleet agent (headless by default, or in a new herdr tab with --terminal), without typing", description="Start a fleet agent (headless by default, or in a new herdr tab with --terminal), without typing. A NEW launch (not a resume or --cloud) first runs the memory test: this is the lanes' safety check, not the owner's rule (there are no caps on coders), and `--memory-ok <reason>` overrides it. A refusal exits 5.")
+    launch = sub.add_parser("launch", help="Start a fleet agent (headless by default, or in a new herdr tab with --terminal), without typing", description="Start a fleet agent (headless by default, or in a new herdr tab with --terminal), without typing. A NEW launch (not a resume or --cloud) first runs the memory test: this is the lanes' safety check, not the owner's rule (there are no caps on coders), and `--memory-ok <reason>` overrides it. A refusal exits 5. A cloud launch arms a checkpoint reminder and an overdue wake; with no CHECKPOINT line and no --checkpoint/--overdue it arms the default 25m/40m.")
     launch.epilog = "A cloud worker kept by retire (its end hook could not push): send the pod one message to commit its tree on a NEW branch and push it there plainly, read the branch from origin, then retire normally."
     launch.add_argument("name", help="The agent's fleet name (lower case, digits, - and _)")
     launch.add_argument("--agent", help="The OpenCode agent definition, such as coder")
@@ -21521,6 +21527,7 @@ def build_parser():
     launch.add_argument("--shape", help="With --cloud: the pod shape, XS (1 CPU, 2 GiB; the launcher's default, no nested Docker), S (2 CPU, 4 GiB; the default with --stack), M (4 CPU, 8 GiB) or O (250m CPU, 768 MiB; the default of --agent orchestrator)")
     launch.add_argument("--stack", action="store_true", help="With --cloud: a pod that can run a nested Docker stack (the Sysbox runtime class, its own user namespace, no capability added, no privileged mode). Off by default; the launch without it is unchanged. The first pod on a fresh node may wait for the node's runtime: the launcher retries")
     launch.add_argument("--no-commit", action="store_true", help="With --cloud: this pod is launched NOT to commit (a measure or a read): the launcher never tells it to push its work. Implied by --role tester and --role reviewer.")
+    launch.add_argument("--persistent", action="store_true", help="With --cloud and --agent orchestrator: an always-on orchestrator (one StatefulSet, restart always, no hard or idle limit; only an explicit stop ends it, and its cost is unbounded in time). Refused for a worker or a --stack launch")
     pending = sub.add_parser("pending", help="What is pending for an agent, and why it waits or is held")
     pending.add_argument("name", help="The agent's fleet name")
     pending.add_argument("--json", action="store_true", help="Emit machine-readable JSON instead")
@@ -21743,7 +21750,7 @@ CLOUD_ENV_SETTING_NAMES = ("CW_ALLOWED_REPOS", "CW_TOOLING_REPO", "CW_CLOUD_IMAG
                             "CW_OPENCODE_BIN", "CW_RUN_RECORD_DIR", "CW_CLOUD_SPEND_CAP_USD", "CW_CLUSTER_TOKEN_CMD",
                             "CW_CLUSTER_ADMIN_CMD", "CW_GIT_TOKEN_CMD", "CW_APP_ID_CMD", "CW_APP_INSTALLATION_CMD",
                             "CW_APP_KEY_CMD", "CW_CLUSTER_ADMIN_SECRET", "CW_CLUSTER_TOKEN_DURATION", "CW_HUB_CHANNEL_URL",
-                            "CW_HUB_REGISTRY_SECRET", "CW_VAULT_CHECK_DIR")
+                            "CW_HUB_REGISTRY_SECRET", "CW_VAULT_CHECK_DIR", "CW_MAX_PERSISTENT")
 REAPER_CLUSTER_NAMES = ("CW_CLOUD_SERVER", "CW_CLOUD_NAMESPACE", "CW_CLOUD_TOKEN_FILE")   # the cluster login the reaper needs (the token file: the install's environment, else a default)
 REAPER_VAULT_NAMES = ("CW_VAULT_NAME", "CW_VAULT_SUBSCRIPTION")   # the vault names (CW_CLUSTER_ADMIN_SECRET has a default: optional)
 # The reaper's NON-SECRET settings the installer copies from its own environment into the service (names of a cluster or a

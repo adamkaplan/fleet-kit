@@ -145,7 +145,9 @@ class TestStopFinalMessage(unittest.TestCase):
         w.scan()
         chief = w.to("chief-of-staff")
         base = w.mod.message_text("cb-1788a", "hard limit", w.mod.when_text("2026-11-01T12:30:00Z"), "unknown", "cb-1788a-20261101T120000Z-abc123")
-        self.assertEqual(chief, [base])
+        self.assertEqual(len(chief), 1)
+        self.assertTrue(chief[0].startswith(base + " "), "the message is the base text, then the end hook's PR line (#2147)")
+        self.assertRegex(chief[0][len(base) + 1:], r"^PR (#\d+ marked ready[^.]*|not marked ready: [^.]+)\.$")
         self.assertNotIn("secret words", chief[0])
         self.assertEqual([to for to, t in w.sent if "cb-1788z" in t], [], "a causeless stop sent a message")
         # last_text left at its default: the boss's copy is the same bytes as the Chief's

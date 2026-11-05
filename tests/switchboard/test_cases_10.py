@@ -486,6 +486,7 @@ switchboard/docker_reaper.py:_docker_inspect
 switchboard/caches.py:_fresh
 switchboard/docker_reaper.py:_last
 fleet-switchboard:_load_markers
+fleet-switchboard:_real_locations
 switchboard/profile_pieces.py:_read_json_object
 fleet-switchboard:_review_api
 fleet-switchboard:_write_gates_config
@@ -496,6 +497,7 @@ fleet-switchboard:ci_record_status_line
 fleet-switchboard:cmd_review_measure
 fleet-switchboard:daemon_record_of
 fleet-switchboard:daemon_snapshot
+fleet-switchboard:deliver
 fleet-switchboard:gates_state
 fleet-switchboard:get
 fleet-switchboard:github_calls_status
@@ -600,6 +602,7 @@ switchboard/decisions_b.py:read_order_notices
 switchboard/decisions_b.py:sync_for
 switchboard/engine.py:load
 switchboard/facts.py:_load
+switchboard/facts.py:_load_pruned
 switchboard/handoff.py:post_ask_comment
 switchboard/import_v1.py:read_v1_export
 switchboard/jev.py:_load

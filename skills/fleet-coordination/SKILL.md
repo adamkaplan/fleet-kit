@@ -305,8 +305,7 @@ Two reminders are made for you. `fleet-switchboard launch` reads the brief's
 `CHECKPOINT` (or `--checkpoint 30m --overdue 60m`): the worker is reminded at the
 checkpoint ("report now, one line"), and the launching orchestrator is woken at the
 overdue time **only if the worker has not reported or sent anything since the launch**.
-A worker that reported is not chased. If the CHECKPOINT line cannot be read, no
-reminder is made and `launch` says so; pass the flags. Write the CHECKPOINT in the
+A worker that reported is not chased. If the CHECKPOINT line cannot be read, a local launch makes no reminder and `launch` says so (pass the flags); a cloud launch arms the default 25m/40m (the worker's reminder at 25 minutes, your overdue wake at 40). Write the CHECKPOINT in the
 shape `Report at 30 minutes (kind working, one line); overdue at 60.`
 
 If the owner enables it, each orchestrator also gets one short daily wake asking what
