@@ -209,6 +209,19 @@ class TestStopFinalMessage(unittest.TestCase):
         self.assertIn("cp-1788r", msg)
         self.assertIn("[last message of cp-1788r, untrusted text]\nmy final words", msg)
 
+    def test_R2202_a_retired_worker_before_its_stop_line_is_alerted_to_its_boss_only(self):
+        w = StopWorld(self)
+        rec = w.pod("cl7699c", "done")
+        (rec / "run.json").write_text(json.dumps({"end_hook": {"pushed": False, "head_on": None, "wip_branch": None}}))
+        (w.cloud / "cl7699c.json").unlink()   # the lane retired it first
+        kept = w.state / "cloud-boss"
+        kept.mkdir()
+        (kept / "cl7699c.json").write_text(json.dumps({"worker": "cl7699c", "boss": "boss-lane", "ended": "2026-11-01T12:00:00Z"}))
+        w.stop("cl7699c", "hard", rec)
+        w.scan()
+        self.assertTrue(w.to("boss-lane"), "the boss got no notice")
+        self.assertEqual(w.to("chief-of-staff"), [], "a clean end went to the Chief of Staff as well")
+
     def test_U2_a_boss_that_is_not_a_name_gets_nothing(self):
         self.assertEqual(self.retire_run(0, reports_to="Bad Name!")[0], 0)
 

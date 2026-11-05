@@ -156,6 +156,14 @@ def chief_not_needed(cause, ok, pushed):
     return cause in ("idle", "hard") and ok is True and pushed == "nothing unpushed"
 
 
+def retired_boss(cloud_dir, worker, parse):
+    """The boss kept at a worker's removal (<state>/cloud-boss/<worker>.json, bin/cloud_retired.py keep_boss, #1546), or None."""
+    found = read_small(os.path.join(os.path.dirname(str(cloud_dir).rstrip("/")), "cloud-boss", worker + ".json"), parse)
+    if isinstance(found, dict) and found.get("worker") == worker and isinstance(found.get("boss"), str):
+        return found["boss"]
+    return None
+
+
 def scan_audit(audit_file, state_file, cloud_dir, last_reports, send, parse, audit=None, last_text=None):
     """One pass. `send(recipient, text)` is the daemon's own send path. Returns [(recipient, text)] handed to it. `last_text(directory, worker)` (ask #1788)
     gives (block, None) or (None, why): the boss's copy, not the Chief of Staff's, ends with the pod's last text, framed as untrusted."""
@@ -204,6 +212,8 @@ def scan_audit(audit_file, state_file, cloud_dir, last_reports, send, parse, aud
             continue
         record = read_small(os.path.join(str(cloud_dir), worker + ".json"), parse)
         boss = record.get("reports_to") if record and record.get("worker") == worker else None
+        if boss is None and not record:
+            boss = retired_boss(cloud_dir, worker, parse)   # the live record is gone: the boss the launcher kept at the removal
         name = record_name_of(worker, record_name)
         pushed = pushed_text(raw_dir(reason), parse) if name else "unknown"
         text = message_text(worker, label, when_text(line.get("ts")), pushed, name, line["ok"] is False)
