@@ -37,6 +37,9 @@ class TestImpactEntriesLoader(unittest.TestCase):
             else:
                 self.assertEqual(sorted(set(was) - set(now)), [], "an entry of %s was dropped" % "/".join(keys))
                 self.assertEqual(len(now), len(set(now)), "a duplicate in %s" % "/".join(keys))
+        force = after["owner_hold"]["floor"]["adamkaplan/fleet-kit"]["force"]   # the one deliberate addition: the entry directory is protected from the matrix file
+        self.assertIn("docs/review-laws/impact-entries/**", force)
+        force.remove("docs/review-laws/impact-entries/**")
         for keys in self.MOVED:   # blank the moved lists, the rest must be identical
             for tree in (before, after):
                 box = self.at(tree, keys[:-1])
@@ -52,6 +55,23 @@ class TestImpactEntriesLoader(unittest.TestCase):
             (root / "impact-entries" / "top_tier_outside_floor" / "a").write_text("x/**\n")
             after = self.mod.load_matrix(root / "m.json")
         self.assertEqual((before, after), ({}, {"owner_hold": {"top_tier_outside_floor": ["x/**"]}}))
+
+    def test_every_entry_file_is_top_tier_and_floor_and_a_deleted_one_holds(self):
+        """Review of #2220: the entry directory is protected by the matrix file itself (an entry cannot protect its own directory)."""
+        root = Path(self.mod.MATRIX_PATH).parent / "impact-entries"
+        paths = sorted(str(f.relative_to(root.parent.parent.parent)) for f in root.rglob("*") if f.is_file())
+        self.assertTrue(paths)
+        matrix = self.mod.load_matrix()
+        globs, exclude, force = self.mod.floor_for("adamkaplan/fleet-kit")
+        for p in paths + ["docs/review-laws/impact-entries/top_tier_paths.authority/brand_new"]:
+            self.assertTrue(self.mod.top_tier_hits([p], matrix), p)
+            self.assertEqual(self.mod.floor_paths([p], globs, exclude, force), [p], p)
+        # a deleted entry is just a changed path in the diff: it holds
+        self.assertIn("authority", self.mod.top_tier_hits(["docs/review-laws/impact-entries/top_tier_paths.credentials/shims_gh"], matrix))
+        # control: without the protecting entries in the matrix file nothing hits
+        bare = json.loads(Path(self.mod.MATRIX_PATH).read_text())
+        bare["owner_hold"]["top_tier_paths"]["authority"] = []
+        self.assertEqual(self.mod.top_tier_hits(["docs/review-laws/impact-entries/top_tier_paths.credentials/shims_gh"], bare), {})
 
 
 def git(cwd, *args, check=True):

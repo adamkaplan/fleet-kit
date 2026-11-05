@@ -136,7 +136,7 @@
     "top_tier_paths": {
       "credentials": [],
       "identity": [],
-      "authority": []
+      "authority": ["docs/review-laws/impact-entries/**"]
     },
     "narrow_by_diff": {
       "meaning": "Paths whose hold depends on their CONTENT: an agent definition holds for the owner only when its permission block changes between the base and the head of the pull request (the top level front matter keys named here); an added, removed or unreadable definition holds, and so does a pull request that changes more than max_files of them. The code has no path or key of its own.",
@@ -153,7 +153,7 @@
     },
     "floor": {
       "adamkaplan/fleet-kit": {
-        "globs": [],
+        "globs": ["docs/review-laws/impact-entries/**"],
         "exclude": [
           "agents/**",
           "skills/**",
@@ -162,7 +162,8 @@
         ],
         "force": [
           "bin/impact_floor.py",
-          "docs/review-laws/impact-matrix.json"
+          "docs/review-laws/impact-matrix.json",
+          "docs/review-laws/impact-entries/**"
         ]
       }
     },
