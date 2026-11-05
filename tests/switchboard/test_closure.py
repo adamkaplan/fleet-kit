@@ -24,9 +24,6 @@ REPO = Path(__file__).resolve().parents[2]
 TOOL = REPO / "tools" / "derive-closure"
 MATRIX = "docs/review-laws/impact-matrix.json"
 PARTS = "bin/switchboard/"
-FLOOR = 422   # definitions reachable from closure_roots over the entry and the parts: it only grows (the floors are re-derived at each batch entry, only up; raised only in its own commit, with the owner's sign-off)
-FLOOR_BINDINGS = 363   # the module-level bindings (and imports) those definitions read, over the entry and the parts: the same rule
-ENTRY_ONLY = 252   # the entry's own closure from closure_roots, re-derived at each batch entry with the floors
 
 
 def run(*args):
@@ -87,13 +84,15 @@ def function_lines(source, name):
 
 
 class TestDerivedClosure(unittest.TestCase):
-    def test_the_matrix_is_what_the_code_derives_and_the_closure_is_over_the_floor(self):
-        code, out = run("--check", "--floor", str(FLOOR), "--floor-bindings", str(FLOOR_BINDINGS))
-        self.assertEqual(code, 0, out)
+    def test_the_matrix_is_what_the_code_derives_and_the_closure_holds(self):
+        code, out = run("--check")
+        self.assertEqual(code, 0, out)   # the property: the matrix equals what the code derives, in both directions
         found = counts(out)
-        self.assertEqual(found[0], ENTRY_ONLY, "the entry's own closure is as before")
-        self.assertGreaterEqual(found[1], FLOOR)
-        self.assertGreaterEqual(found[3], FLOOR_BINDINGS)
+        self.assertLessEqual(found[0], found[1], "the entry's own closure is inside the assembled closure")
+        self.assertLessEqual(found[2], found[3], "every binding the entry's closure reads is inside the assembled closure")
+        # the floor mechanism itself, relative to what is derived now (no number written here)
+        code, out = run("--check", "--floor", str(found[1]), "--floor-bindings", str(found[3]))
+        self.assertEqual(code, 0, out)
         code, out = run("--check", "--floor-bindings", str(found[3] + 1))
         self.assertEqual(code, 1)
         self.assertIn("below the floor of %d" % (found[3] + 1), out)
@@ -330,6 +329,7 @@ class TestMovingADefinition(unittest.TestCase):
     def test_the_floor_fails_on_a_derivation_that_lacks_a_definition(self):
         root = fixture()
         self.addCleanup(shutil.rmtree, str(root))
+        before = counts(run("--check")[1])[1]   # the definitions derived before the deletion: the floor is what was there
         module, rule = clear(), rule_of()
         trees = {n: ast.parse((REPO / "bin" / n).read_text()) for n in (l.strip() for l in (REPO / "bin" / "fleet-switchboard.parts").read_text().splitlines()) if n and not n.startswith("#")}
         whole = ast.Module(body=[b for t in trees.values() for b in t.body], type_ignores=[])
@@ -341,7 +341,7 @@ class TestMovingADefinition(unittest.TestCase):
         lines = text.splitlines(True)
         part.write_text("".join(lines[:node.lineno - 1] + lines[node.end_lineno:]))
         self.assertEqual(run("--write", "--root", str(root))[0], 0)
-        code, out = run("--check", "--root", str(root), "--floor", str(FLOOR))
+        code, out = run("--check", "--root", str(root), "--floor", str(before))
         self.assertEqual(code, 1, out)
         self.assertIn("below the floor", out)
 

@@ -104,6 +104,18 @@ def clock_utc(epoch):
         return "??:??Z"   # a time that is not a time never stops a message
 
 
+def clock_day(epoch, delivered):
+    """clock_utc of an epoch, with its date (2026-10-31 15:15Z) when its UTC day is not the delivery's day."""
+    if delivered is None:
+        return clock_utc(epoch)
+    try:
+        if time.gmtime(epoch)[:3] != time.gmtime(delivered)[:3]:
+            return time.strftime("%Y-%m-%d %H:%MZ", time.gmtime(epoch))
+    except (OverflowError, ValueError, OSError, TypeError):
+        return "??:??Z"
+    return clock_utc(epoch)
+
+
 def superseded_by(facts):
     """{key of an older undelivered `send`: the newer `send` that replaces it}: the same sender, about the same issue (repo and number), to the same
     recipient. Never across senders or issues, and a send with no issue is never superseded. The older text is KEPT (the caller marks it, never drops it)."""
@@ -173,12 +185,13 @@ def compose(recipient, facts, cap=MESSAGE_CAP, section=None, repos=None, deliver
     facts = sorted(facts, key=compose_order)
     if not facts:
         raise ValueError("nothing to compose")
+    held_word = lambda held: "held ??" if not -1e18 < held < 1e18 else "held %d h" % (held // 3600) if held >= 7200 else "held %d min" % (held // 60)   # a time that is not finite never stops a message
     if facts[0].orders:  # PR 17: the orders note, whole: every order
         note = orders_note(recipient, facts[0], repos)
         late = None if delivered is None or fault("no-sent-time") else delayed_since(facts[:1], delivered)
         if late is not None:   # #1564: an old order says so in its first line (the one age rule)
             first, _, rest = note.partition("\n")
-            note = "%s (delayed: sent %s, delivered %s):%s" % (first.rstrip(":"), clock_utc(late), clock_utc(delivered), "\n" + rest if rest else "")
+            note = "%s (delayed: sent %s, %s, delivered %s):%s" % (first.rstrip(":"), clock_day(late, delivered), held_word(delivered - late), clock_utc(delivered), "\n" + rest if rest else "")
         return note, facts[:1]
 
     replaced = {}
@@ -201,10 +214,11 @@ def compose(recipient, facts, cap=MESSAGE_CAP, section=None, repos=None, deliver
         replaced.update(superseded_by(taken))
         when = ""
         if delivered is not None and not fault("no-sent-time"):
-            first, last = clock_utc(min(sent_at(f) for f in taken)), clock_utc(max(f.created for f in taken))
+            first, last = clock_day(min(sent_at(f) for f in taken), delivered), clock_day(max(f.created for f in taken), delivered)
             late = delayed_since(taken, delivered)   # #1402: the sent time comes first, and an old alert or digest says so in this first line
             if late is not None:
-                sent = "delayed: sent %s" % clock_utc(late) + ("" if first == last else ", newest sent %s" % last)
+                held = held_word(delivered - late)
+                sent = "delayed: sent %s, %s" % (clock_day(late, delivered), held) + ("" if first == last else ", newest sent %s" % last)
             else:
                 sent = "sent %s" % (first if first == last else "%s-%s" % (first, last))
             when = " (%s, delivered %s)" % (sent, clock_utc(delivered))
@@ -212,7 +226,7 @@ def compose(recipient, facts, cap=MESSAGE_CAP, section=None, repos=None, deliver
         if waiting:   # the earlier messages stay where they are, unchanged: this says only that the newer one replaces them
             names = sorted({f.sender for f in taken if f.supersedes and f.sender})
             when = (when[:-1] + "; " if when else " (") + "supersedes %d earlier message%s from %s on this issue, still waiting: sent %s)" % (
-                len(waiting), "" if len(waiting) == 1 else "s", ", ".join(names) or "the same sender", ", ".join(clock_utc(t) for t in waiting[:5]))
+                len(waiting), "" if len(waiting) == 1 else "s", ", ".join(names) or "the same sender", ", ".join(clock_day(t, delivered) for t in waiting[:5]))
         lead_text = _one_line(lead.summary, 200)
         while lead_text.rstrip().endswith(NEWEST_FIRST_MARK.strip()):   # an agent's text must never forge the daemon's mark (numbering): only the count decides it
             lead_text = lead_text.rstrip()[:-len(NEWEST_FIRST_MARK.strip())].rstrip()
