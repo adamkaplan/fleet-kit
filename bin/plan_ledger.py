@@ -115,6 +115,14 @@ def clip(text, limit=FIELD_LIMIT):
     return text if len(text) <= limit else text[:limit - 1] + "\u2026"
 
 
+def bounded_text(text, limit, what):
+    """`text` with white space collapsed as `clip` does; over `limit` it is REFUSED (LedgerError), never cut."""
+    text = " ".join(str(text or "").split())
+    if len(text) > limit:
+        raise LedgerError("the %s is %d characters and the limit is %d: nothing was recorded; put the long text in one comment or a file and give the link, or shorten it" % (what, len(text), limit))
+    return text
+
+
 def read_ledger(state_dir):
     """(entries, problem): every line parsed, and None when the chain holds, else a sentence naming the first break
     (the entries before it are still returned: they are intact, the ones from the break on are not trusted)."""
