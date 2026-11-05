@@ -1,0 +1,1 @@
+| `cloud_inspect.py` | 5 | the `inspect` command: what a pod of the caller is doing now, read-only (#2115); a part of `cloud_worker.py` | |
