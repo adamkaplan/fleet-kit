@@ -1460,8 +1460,9 @@ class TestArchitectureSafetyNet(unittest.TestCase):
         verbs = golden.choices(golden.run(entry, ["--help"], root, env)["stdout"])
         self.assertGreater(len(verbs), 40)
         first = record([[verb, "--help"] for verb in verbs])   # the --help of every verb, recorded once; the full run of every command is golden-cli compare's job
+        listed = {tuple(c) for c in commands}
         for verb in verbs:
-            self.assertIn((verb, "--help"), first, "the command list has no --help of the verb %s" % verb)
+            self.assertIn((verb, "--help"), listed, "the command list has no --help of the verb %s" % verb)
         sample = helps[:4] + helps[-4:] + commands[-4:]   # a small fixed sample, recorded a second time
         self.assertEqual(golden.differences(record(sample), record(sample)), [], "two recordings of one entry differ")
 
