@@ -1,8 +1,10 @@
+cloud/launcher/tests/test_brief_header.py
 cloud/launcher/tests/test_cloud_inspect.py
 cloud/launcher/tests/test_cloud_model_served.py
 cloud/launcher/tests/test_cloud_quick_budget.py
 cloud/launcher/tests/test_create_says_why.py
 cloud/launcher/tests/test_end_hook_nothing_to_push.py
+cloud/launcher/tests/test_end_hook_pr_ready.py
 cloud/launcher/tests/test_failed_pod_record.py
 cloud/launcher/tests/test_fixture_root.py
 cloud/launcher/tests/test_hub_entry_keys.py
@@ -31,6 +33,7 @@ cloud/launcher/tests/test_retire_gone_exact.py
 cloud/launcher/tests/test_safe_to_evict.py
 cloud/launcher/tests/test_scratch_clean.py
 cloud/launcher/tests/test_scrub_linear.py
+cloud/launcher/tests/test_scrub_pieces.py
 cloud/launcher/tests/test_stop_no_checkout.py
 cloud/launcher/tests/test_token_at_limit.py
 cloud/launcher/tests/test_vault_block.py

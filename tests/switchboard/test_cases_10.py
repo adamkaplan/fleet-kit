@@ -478,18 +478,18 @@ external_adapter.py:sse_messages
 fleet-heartbeat:call
 fleet-heartbeat:load_config
 fleet-scenario:read
-fleet-switchboard:__init__
+switchboard/plan_notice.py:__init__
 fleet-switchboard:_api
 switchboard/caches.py:_audit_tail
 fleet-switchboard:_call
-fleet-switchboard:_docker_inspect
+switchboard/docker_reaper.py:_docker_inspect
 switchboard/caches.py:_fresh
-fleet-switchboard:_last
+switchboard/docker_reaper.py:_last
 fleet-switchboard:_load_markers
 switchboard/profile_pieces.py:_read_json_object
 fleet-switchboard:_review_api
 fleet-switchboard:_write_gates_config
-fleet-switchboard:anonymous_volumes
+switchboard/disk_prune.py:anonymous_volumes
 fleet-switchboard:catching_up_lines
 fleet-switchboard:charter_pane_update
 fleet-switchboard:ci_record_status_line
@@ -504,7 +504,7 @@ fleet-switchboard:handle
 fleet-switchboard:health_watched_repos
 fleet-switchboard:janitor_agent_roots
 fleet-switchboard:json
-fleet-switchboard:lab_facts
+switchboard/docker_reaper.py:lab_facts
 fleet-switchboard:launch_memory_check
 fleet-switchboard:load_config
 fleet-switchboard:pane_exit_audit_tail
@@ -512,8 +512,8 @@ fleet-switchboard:pr_state_read
 fleet-switchboard:pull_state
 fleet-switchboard:read_decisions_file
 fleet-switchboard:read_friction_state
-fleet-switchboard:read_janitor_record
-fleet-switchboard:read_open_items
+switchboard/docker_reaper.py:read_janitor_record
+switchboard/labels_ensure.py:read_open_items
 fleet-switchboard:read_open_overlap
 fleet-switchboard:read_pane_health
 fleet-switchboard:read_pr_json
@@ -522,7 +522,7 @@ fleet-switchboard:read_ref_state
 fleet-switchboard:read_report_riders
 fleet-switchboard:receive
 fleet-switchboard:stopped_news_summary
-fleet-switchboard:sweep_summary
+switchboard/sweep.py:sweep_summary
 fleet-switchboard:unix_socket_call
 fleet-switchboard:update_daemon_record
 fleet-switchboard:v2_calls_status
@@ -1105,7 +1105,7 @@ class TestCloudLoad(Base):
 
     def mutant(self, old, new):
         import re as _re
-        source = SWITCHBOARD.read_text()
+        source = switchboard_source()
         body = _re.search(r"def live_cloud_by_lane.*?\n\n\n", source, _re.S).group(0)
         helper = _re.search(r"def cloud_record_live.*?\n\n\n", source, _re.S).group(0)   # #1066: the shared liveness helper holds the liveness lines
         self.assertIn(old, body + helper)
@@ -1333,7 +1333,7 @@ class TestCloudLoad(Base):
         self.assertNotEqual(self.count(mutant), out)
 
     def test_the_shared_helper_is_the_only_place_the_liveness_test_lives(self):
-        source = SWITCHBOARD.read_text()
+        source = switchboard_source()
         for line in ('seen is None or seen > now or', '(last_reports.get(worker) or {}).get("state") in ("done", "failed")', 'if ends is None or ends < now:'):
             self.assertEqual(source.count(line), 1, line)   # once: inside cloud_record_live
         helper = source[source.index("def cloud_record_live"):source.index("def live_cloud_by_lane")]
