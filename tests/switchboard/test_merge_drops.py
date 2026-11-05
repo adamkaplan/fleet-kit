@@ -178,6 +178,26 @@ class TestMergeDrops(MergeDropsBase):
         self.commit("tip moves again")
         self.assertEqual(self.run_cmd(), (0, []))
 
+    def test_the_founding_case_a_resolution_rewriting_a_tip_line_that_drops_an_element_is_refused(self):
+        self.write("f.py", "a = 1\nfact_sources = [Held(s), Other(s), Third(s)]\nb = 2\n")
+        self.write("g.py", "g = 1\n")
+        self.commit("f and g")
+        git(self.dir, "checkout", "-q", "-b", "pr", "HEAD")
+        self.write("g.py", "g = 2\n")
+        self.commit("the PR's own change to g")
+        git(self.dir, "checkout", "-q", "integration")
+        self.write("f.py", "a = 1\nfact_sources = [Held(s), Other(s), Third(s)]\nb = 3\n")
+        self.commit("tip modifies f elsewhere")
+        git(self.dir, "checkout", "-q", "pr")
+        git(self.dir, "merge", "-q", "--no-commit", "integration")
+        self.write("f.py", "a = 1\nfact_sources = [Other(s), Third(s)]\nb = 3\n")
+        git(self.dir, "add", "-A")
+        git(self.dir, "commit", "-q", "-m", "merge the tip")
+        code, out = self.run_cmd()
+        self.assertEqual(code, 1)
+        self.assertIn("f.py", out[0])
+        self.assertIn("fact_sources = [Held(s)", out[0])
+
     def test_a_conflicting_merge_says_resolve_first(self):
         git(self.dir, "checkout", "-q", "-b", "pr")
         self.write("app.py", "mine\n")
