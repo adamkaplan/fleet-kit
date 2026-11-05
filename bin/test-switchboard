@@ -50148,7 +50148,8 @@ class TestHeldSummaryFlowchart(unittest.TestCase):
         """The combined path: the explainer check and the held check both see the flowchart, and the command prints it once."""
         pr = {"title": "t", "state": "OPEN", "labels": [{"name": "me:merge-captain"}], "files": [], "additions": 1, "deletions": 0, "changedFiles": 1,
               "body": TestHeldTop.OPEN + TestHeldTop.TOP + self.TECH + self.SUMMARY}
-        with mock.patch.object(sb, "read_pr_json", return_value=pr), mock.patch.object(sb, "build_engine", return_value=(mock.Mock(), None, None)):
+        with tempfile.TemporaryDirectory() as state, mock.patch.dict(os.environ, {"XDG_STATE_HOME": state}), \
+                mock.patch.object(sb, "read_pr_json", return_value=pr), mock.patch.object(sb, "build_engine", return_value=(mock.Mock(), None, None)):
             with captured() as (out, err):
                 code = sb.main(["pr-explain", "acme/api#7", "--check"])
         self.assertEqual(code, 1, out.getvalue() + err.getvalue())
