@@ -61,6 +61,7 @@ The **Holds** column is descriptive: only the layer numbers are enforced.
 | `repo_exclusion.py` | 0 | repositories the owner keeps out of the fleet's view are never watched or read | |
 | `report_fold.py` | 0 | folding a report into an earlier send | |
 | `launch_brief_check.py` | 0 | `launch --issue N` refuses a brief that names another issue or a stale PR head, before anything starts (#1350) | |
+| `required_checks.py` | 0 | parsing the required-check block of a reader's brief and reading a review comment against it (#2203) | |
 | `resume_brief.py` | 0 | a brief given to `launch --resume` is delivered or the command says it was not | |
 | `cloud_channel.py` | 1 | the receiving end of a message between two cloud agents | |
 | `cloud_relay.py` | 2 | the hub half of pod, hub and daemon calls for report, prove, verdict and gates: a bounded in-memory queue and the refusals | |
