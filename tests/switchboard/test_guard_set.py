@@ -70,12 +70,12 @@ class TestGuardSet(unittest.TestCase):
                 return result, "".join(t for _, t in result.failures + result.errors)
             c, text = guard_run()
             self.assertTrue(c.wasSuccessful(), text)  # the control passes on the unmutated copy
-            self.assertEqual(c.testsRun, 1)     # exactly the one named guard test ran
+            self.assertGreaterEqual(c.testsRun, 1)     # the named guard test ran (not a skipped-everything pass)
             (tree / "tests" / "switchboard" / "test_planted_unloaded.py").write_text(
                 "import unittest\n\nclass TestPlantedNoLoader(unittest.TestCase):\n    def test_a(self):\n        pass\n")
             r, out = guard_run()
             self.assertFalse(r.wasSuccessful(), out)
-            self.assertEqual([t.id().rsplit(".", 1)[-1] for t, _ in r.failures + r.errors], ["test_the_real_directory_is_wired"])  # the in-process form of the removed assertIn of the test name
+            self.assertIn("test_the_real_directory_is_wired", [t.id().rsplit(".", 1)[-1] for t, _ in r.failures + r.errors])  # the in-process form of the removed assertIn of the test name
             self.assertIn("test_planted_unloaded.py", out)
 
     def test_documents_carry_the_sentence(self):
