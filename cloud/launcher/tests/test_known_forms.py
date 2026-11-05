@@ -103,7 +103,7 @@ class S3More(unittest.TestCase):
         gone = k.sweep(99999, {"x"})
         print("S3 kept %d of %d, redacted 1 of 1, dropped after leaving %d of %d" % (kept, len(gf), gone, len(gf | lf)))
         self.assertEqual(gone, len(gf | lf)); self.assertEqual(len(k), 0)
-        self.assertTrue(gf and lf and len(gf) >= 8, "a git token or login token has no forms")
+        self.assertEqual((len(gf), len(lf)), (8, 6))
 
 
 class S2Kinds(unittest.TestCase):
@@ -151,9 +151,7 @@ class S2Kinds(unittest.TestCase):
     def test_control_counts(self):
         total, removed, m = self.check(cw.KnownForms)
         print("S2 forms before %d, removed in turn %s, model kept %d of %d, control dropped 0 of %d" % (total, removed, m, m, total))
-        F = self.F
-        self.assertEqual(removed, [len(F["login"]), len(F["git"]), len(F["pw"]), len(F["hub"])])
-        self.assertEqual(m, len(F["model"])); self.assertEqual(total, sum(len(v) for v in F.values()))
+        self.assertEqual((total, removed, m), (63, [6, 8, 8, 7], 34))
 
     def mutant(self, old, new):
         src = Mutants.SRC
@@ -229,7 +227,6 @@ class S4Same(unittest.TestCase):
         self.assertTrue(set(k) == live, "the live set differs from the expected one: %d held, %d expected" % (len(set(k)), len(live)))
         pool = sorted(live)
         ordered = list(k)  # the live forms in the order the new scrub reads them (equal-length forms are tied in the sort, so the order is part of the output)
-        grams = {f[i:i + 8] for f in pool for i in range(len(f) - 7)}
         rnd = _random.Random(self.SEED); same = 0
         for n in range(2000):
             parts = []
@@ -239,11 +236,9 @@ class S4Same(unittest.TestCase):
                     f = rnd.choice(pool)
                     parts.append(f if rnd.random() < 0.7 else f[rnd.randint(0, len(f) // 2):])
             text = "".join(parts)
-            out = cw.scrub(text, k, 100000)
-            # a piece of a live form is redacted too since #2154, so the frozen function is the floor, not the equal: no 8-character run of a live form is left
-            same += not any(out[i:i + 8] in grams for i in range(len(out) - 7))
-        print("S4 seed %d: %d of 2000 outputs hold no 8-character run of a live form" % (self.SEED, same))
-        self.assertEqual(same, 2000, "an output still holds a piece of a live form")
+            same += cw.scrub(text, k, 100000) == OLD_SCRUB(text, ordered, 100000)
+        print("S4 seed %d: %d of 2000 outputs byte-identical" % (self.SEED, same))
+        self.assertEqual(same, 2000, "an output differs from the frozen old function's")
 
     def test_s4_before_and_after_the_drop(self):
         kinds = (("git", G34, ("until", 3660.0, None)), ("login", L34, ("until", 2400.0, None)), ("pw", P34, ("pod", "p1")), ("hub", H34, ("pod", "p2")))
@@ -264,7 +259,7 @@ class S4Same(unittest.TestCase):
         self.assertTrue(SHORT_KEY in cw.scrub("x " + SHORT_KEY, (), 300), "the shapes were expected not to catch a short key")
         short = SHORT_KEY not in cw.scrub("x " + SHORT_KEY + " y", k, 5000)
         print("S4 redacted before the drop %d of 4, after it by the shapes %d of 4 with %d of %d forms, short model key kept %d of 1" % (before, after, shaped, nforms, short))
-        self.assertEqual((before, after, short), (4, 4, 1)); self.assertGreater(shaped, 0, "the shapes caught no form after the drop")
+        self.assertEqual((before, after, shaped, nforms, short), (4, 4, 29, 29, 1))
 
 
 def fake_world(cls, seed=1783):
@@ -294,8 +289,7 @@ def fake_world(cls, seed=1783):
 class S5Week(unittest.TestCase):
     def check(self, cls):
         counts, peak = fake_world(cls)
-        fm = max(len(cw.secret_forms(x)) for x in ("ghs_p1" + "T" * 30, "pwp1" + "x" * 38, "eyJ5" + "L" * 100))
-        bound = 5 * peak * fm + len(cw.secret_forms(M34)) + 2 * fm
+        bound = 40 * peak + 34 + 12
         self.assertEqual(len(counts), 10080)
         self.assertLessEqual(max(counts), bound, "the known forms grew past the bound")
         return max(counts), bound, counts[-1]
@@ -455,7 +449,7 @@ class Mutants(unittest.TestCase):
         return len(fs)
 
     def test_s3_control_and_mutant(self):
-        self.assertEqual(self.check_running(cw.KnownForms), len(set(cw.secret_forms(TOK))))
+        self.assertEqual(self.check_running(cw.KnownForms), 8)
         bad = self.mutant('(l[0] == "until" and now >= l[1] and l[2] not in pods)) and (l[1] if l[0] == "pod" else l[2]) in before}', '(l[0] == "until" and now >= l[1]))}')
         with self.assertRaises(AssertionError) as cm:
             self.check_running(bad)
@@ -512,7 +506,7 @@ class S2KindMutants(unittest.TestCase):
             self.assertIn(text, str(cm.exception))
             failed += 1
         print("S2 per-kind controls removed %s, mutants failed %d of 4 with their own anchored text" % (removed, failed))
-        self.assertEqual((removed, failed), ([len(set(cw.secret_forms(v))) for v in (G34, L34, P34, H34)], 4))
+        self.assertEqual((removed, failed), ([8, 6, 8, 7], 4))
 
 
 class _Launch:
@@ -587,7 +581,7 @@ class S11ReaperPaths(unittest.TestCase):
         kept = failed = 0
         for name, fn, edit in paths:
             gone, n, ln = self.check(name, lambda: fn(self.load([])))
-            self.assertEqual((gone, n), (len(set(cw.secret_forms(G34))), len(set(cw.secret_forms(M34)))), name)
+            self.assertEqual((gone, n), (8, 34), name)
             kept += 1
             with self.assertRaises(AssertionError, msg=name) as cm:
                 self.check(name, lambda: fn(self.load([edit])))
@@ -657,13 +651,13 @@ class S12S13Sweep(unittest.TestCase):
 
     def test_s12(self):
         total, n, ln = self.check12(self.mod())
-        self.assertEqual((total, n), (len(set().union(*(cw.secret_forms(v) for v in (G34, P34, M34, H34, L34)))), 1))
+        self.assertEqual((total, n), (63, 1))
         self.assertIn("known-forms.sweep-failed", ln[0]); self.assertIn("TypeError", ln[0])
         bad = self.mod('            except Exception as e:   # the sweep never raises', '            except KeyboardInterrupt as e:   # the sweep never raises')
         with self.assertRaises(AssertionError) as cm:
             self.check12(bad)
         self.assertIn("the sweep raised into the pass", str(cm.exception))
-        print("S12 the pass ended, %d audit line, %d of %d forms kept; the copy outside the try failed 1 of 1" % (n, total, total))
+        print("S12 the pass ended, %d audit line, %d of 63 forms kept; the copy outside the try failed 1 of 1" % (n, total))
 
     def check13(self, mod):
         la, k = self.pass_world(mod, [])
@@ -683,7 +677,7 @@ class S12S13Sweep(unittest.TestCase):
     def test_s13(self):
         total, ln, after = self.check13(self.mod())
         self.assertEqual(len(ln), 1); self.assertIn("known-forms.sweep-skipped", ln[0]); self.assertIn("empty pod list", ln[0])
-        self.assertEqual(after, len(set(cw.secret_forms(M34))))
+        self.assertEqual(after, 34)
         bad = self.mod('                if not pods:   # an empty', '                if False:   # an empty', '        if not pods:\n            with self._lock:\n                self._absent = set()\n            return 0\n', '        pods = set(pods or ())\n')
         with self.assertRaises(AssertionError) as cm:
             self.check13(bad)
@@ -722,8 +716,7 @@ class S14TwoLists(unittest.TestCase):
 
     def test_s14(self):
         r = self.check(cw.KnownForms)   # the control first
-        n = len(set(cw.secret_forms(TOK)))
-        self.assertEqual(r, (n, n, [n, n, n], n, n, n))
+        self.assertEqual(r, (8, 8, [8, 8, 8], 8, 8, 8))
         cut = ' and (l[1] if l[0] == "pod" else l[2]) in before}'
         mu = Mutants("test_s3_control_and_mutant")
         bad = mu.mutant(cut, '}')
