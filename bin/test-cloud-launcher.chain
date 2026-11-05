@@ -49,6 +49,7 @@ cloud/launcher/tests/test_hub_safe_to_evict.py
 cloud/launcher/tests/test_idle_default_note.py
 cloud/launcher/tests/test_idle_nudge.py
 cloud/launcher/tests/test_issues_read.py
+cloud/launcher/tests/test_kept_failed_once.py
 cloud/launcher/tests/test_m_cap.py
 cloud/launcher/tests/test_mint_retry.py
 cloud/launcher/tests/test_mint_roles.py
@@ -59,6 +60,8 @@ cloud/launcher/tests/test_orchestrator_agent.py
 cloud/launcher/tests/test_orchestrator_hub_session.py
 cloud/launcher/tests/test_orchestrator_row.py
 cloud/launcher/tests/test_orphan_secrets.py
+cloud/launcher/tests/test_persistent_merge_fix.py
+cloud/launcher/tests/test_persistent_orchestrator.py
 cloud/launcher/tests/test_pod_requests.py
 cloud/launcher/tests/test_pod_state.py
 cloud/launcher/tests/test_preflight.py
