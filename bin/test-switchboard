@@ -22723,7 +22723,8 @@ class TestSweep(Base):
         self.assertEqual(self.fact_problems(), [])
         self.assertEqual(self.fact_gaps(names, self.docs_fact_rows() - {"floor"}), ["floor"])   # a dropped row
         audit = Path(__file__).resolve().parent.parent.joinpath("docs", "switchboard.md").read_text().split("S5 fact audit: ", 1)[1]
-        self.assertEqual(audit.split(" ", 1)[0], str(len(names)))   # the figure in the docs is the computed one
+        self.assertTrue(audit.startswith("every fact key and argument"))   # the audit sentence is there, with no figure to go stale
+        self.assertTrue(names <= self.docs_fact_rows())   # the property: every fact the gates read has a row
 
     def test_986_a_new_fact_in_any_spelling_fails_the_completeness_test(self):
         for label, overrides in self.fact_mutants():
@@ -31188,7 +31189,15 @@ class TestFactsReadAtRunTime(TestCarriesLine):
             ("a plan that cannot be fetched", lambda: self.pr.update(body="PLAN: acme/app#99\ncanon: updated the docs")),
             ("a ready, held pull request with every scenario proven", lambda: (self.pr.update(body="PLAN: acme/app#7\ncanon: updated the docs", labels=[{"name": "merge-captain"}]), self.record(self.PR, self.HEAD, plan_ref="acme/app#7"))),
             ("the view is down", lambda: setattr(self, "gh_down", True)),
+            ("a held pull request whose impact floor says not held (G6 reads the findings of the held-PR check)", self.floor_not_held),
         )
+
+    def floor_not_held(self):
+        """A held pull request whose floor was read and says not held: the one state in which G6 reads `captain_findings`. Undone at the end of the test."""
+        self.pr.update(body="PLAN: acme/app#7\ncanon: updated the docs", labels=[{"name": "fleet:merge-captain"}])
+        patch = mock.patch.object(sb, "gate_floor_fact", lambda *a, **k: {"decision": "ok", "reasons": [], "cleared": False, "unreadable": None, "rehold": None})
+        patch.start()
+        self.addCleanup(patch.stop)
 
     @contextlib.contextmanager
     def proxied(self, mutant=None):
