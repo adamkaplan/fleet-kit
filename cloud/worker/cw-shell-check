@@ -152,6 +152,8 @@ def split_parts(text, unsure=None):
                 cur.append(c)
             elif c == "&" and (s[i - 1:i] in (">", "<") or s[i + 1:i + 2] == ">") and i > 0:
                 cur.append(c)  # a redirection (`2>&1`, `&>f`), not a separator
+            elif c == "|" and s[i - 1:i] == ">":
+                cur.append(c)  # the clobber redirect `>|`, not a pipe
             elif c in ";\n|&":
                 flush()
             else:
@@ -181,6 +183,65 @@ WRITE_ROOTS = ("/work", "/tmp")
 IMAGE_WRITES = ("/run/cw-tmp", "/home/worker/.cache", "/home/worker/.npm", "/home/worker/.gitconfig",
                 "/dev/null", "/dev/stdout", "/dev/stderr", "/dev/tty")
 REDIRECT = re.compile(r"^(?:\d*|&)(>>|>\|?)(.*)$")
+REDIR_OP = re.compile(r"^(?:&>>?|>>|>\||>&|>)$")
+SHELLS = ("bash", "sh", "zsh", "dash", "ksh")
+INLINE = {"python": ("-c",), "python3": ("-c",), "node": ("-e", "--eval", "-p"), "perl": ("-e", "-E"), "ruby": ("-e",)}
+NAMED_PATH = re.compile(r"""(?:(?<=[\s'"=(,;:])|^)(~?/[^\s'"`;|&)<>,]*)""")
+WRAPPERS = ("env", "xargs", "nohup", "timeout", "time", "command", "exec")
+WRAP_ARG = {"xargs": ("-I", "-n", "-P", "-L", "-d", "-E", "-s", "-a"), "env": ("-u", "-C", "-S"), "timeout": ("-s", "-k")}
+OUT_FLAGS = {"curl": ("-o", "--output", "--output-dir"), "wget": ("-O", "-o", "-P", "--output-document", "--directory-prefix", "--output-file"),
+             "tar": ("-C", "--directory"), "unzip": ("-d",), "cp": ("-t", "--target-directory"), "rsync": ("--target-directory",)}
+
+
+def lex(part):
+    """The words of a part with every redirect operator a word of its own (`x>/etc/a` -> x > /etc/a)."""
+    lx = shlex.shlex(part, posix=True, punctuation_chars="<>|&")
+    lx.whitespace_split = True
+    toks = list(lx)
+    out = []
+    for t in toks:
+        if out and REDIR_OP.match(t) and out[-1].isdigit():
+            out.pop()
+        out.append(t)
+    return out
+
+
+def named_paths(text, cwd):
+    """The paths a literal inline script names (as resolved) that lie outside the allowed roots."""
+    found = []
+    for m in NAMED_PATH.finditer(text):
+        raw = m.group(1)
+        if raw in ("/", "~"):
+            continue
+        full = resolve(raw, cwd)
+        if full is None or not allowed_path(full):
+            found.append(full or raw)
+    return found
+
+
+def inline_text(cmd, args):
+    """(text, index) of the -c/-e text of a shell or interpreter, or (None, -1)."""
+    for k, a in enumerate(args[:-1]):
+        if cmd in SHELLS and re.match(r"^-[a-zA-Z]*c$", a) or a in INLINE.get(cmd, ()) or (cmd == "perl" and re.match(r"^-[a-zA-Z]*[eE]$", a)):
+            return args[k + 1], k + 1
+    return None, -1
+
+
+def unwrap(words):
+    """Drop one wrapper (env, xargs, nohup, timeout, time, command, exec) and its options."""
+    w, rest = os.path.basename(words[0]), words[1:]
+    skip, first = WRAP_ARG.get(w, ()), True
+    while rest:
+        a = rest[0]
+        if a in skip and len(rest) > 1:
+            rest = rest[2:]
+        elif a.startswith("-") and a != "-" or (w == "env" and re.match(r"^\w+=", a)):
+            rest = rest[1:]
+        elif w == "timeout" and first:
+            rest, first = rest[1:], False
+        else:
+            break
+    return rest
 
 
 def resolve(path, cwd):
@@ -201,13 +262,20 @@ def allowed_path(path):
 def write_targets(part, cwd):
     """(targets, new cwd) of one part: the paths the part writes to, as written."""
     try:
-        toks = shlex.split(part)
+        toks = lex(part)
     except ValueError:
         return [], cwd
     targets, words, i = [], [], 0
     while i < len(toks):
         m = REDIRECT.match(toks[i])
-        if m and not m.group(2).startswith("&"):
+        if REDIR_OP.match(toks[i]):
+            nxt = toks[i + 1] if i + 1 < len(toks) else ""
+            if toks[i] == ">&" and (nxt.isdigit() or nxt == "-"):
+                pass  # a descriptor copy (`2>&1`), not a file
+            elif nxt:
+                targets.append(nxt)
+            i += 1
+        elif m and not m.group(2).startswith("&"):
             if m.group(2):
                 targets.append(m.group(2))
             elif i + 1 < len(toks):
@@ -220,10 +288,37 @@ def write_targets(part, cwd):
         words.pop(0)
     if words and words[0] == "sudo":
         words.pop(0)
+    while words and os.path.basename(words[0]) in WRAPPERS:
+        words = unwrap(words)
+        while words and re.match(r"^\w+=", words[0]):
+            words.pop(0)
     if not words:
         return targets, cwd
     cmd, args = os.path.basename(words[0]), words[1:]
     plain = [a for a in args if not a.startswith("-")]
+    text, ti = inline_text(cmd, args)
+    if text is not None:
+        targets += named_paths(text, cwd)
+        if cmd in SHELLS:
+            for sub in split_parts(text, []):
+                more, cwd = write_targets(sub, cwd)
+                targets += more
+        if cmd == "perl" and any(re.match(r"^-[a-zA-Z]*i", a) for a in args):
+            targets += [a for k, a in enumerate(args) if not a.startswith("-") and k != ti]
+        return targets, cwd
+    flags = OUT_FLAGS.get(cmd, ())
+    for k, a in enumerate(args):
+        if a in flags and k + 1 < len(args):
+            targets.append(args[k + 1])
+        elif a.split("=")[0] in flags and "=" in a:
+            targets.append(a.split("=", 1)[1])
+        elif cmd in ("curl", "wget", "tar", "unzip", "cp") and re.match(r"^-[oOCdtP].+", a) and a[:2] in flags and not a.startswith("--"):
+            targets.append(a[2:])
+    if cmd == "rsync":
+        targets += plain[-1:]
+    if cmd == "pushd" and plain:
+        dest = resolve(plain[0], cwd)
+        return targets, dest or cwd
     if cmd == "cd":
         dest = resolve(plain[0], cwd) if plain else resolve("~", cwd)
         return targets, dest or cwd
