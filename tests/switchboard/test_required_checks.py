@@ -163,7 +163,8 @@ def build(TwoRepoCase):
                    ("launch drops the list", "test_guard_fleet_record", "the fleet record keeps the list",
                     (("bin/fleet-switchboard", 'fleet["required_checks"] = list(required_checks)', 'fleet["required_checks"] = []'),)),
                    ("a bare mention answers", "test_guard_bare_mention", "a bare mention is not an answer",
-                    (("bin/required_checks.py", 'return "result" if re.search(r"[A-Za-z0-9]", rest) else None', 'return "result"'),)),
+                    (("bin/required_checks.py", 'return "result" if re.search(r"[A-Za-z0-9]", rest) else None', 'return "result"'),
+                     ("bin/required_checks.py", "if not rest or rest[0] not in _SEP:", "if False:"))),   # item 2: the separator rule is what makes a bare mention missing now
                    ("not done needs no reason", "test_guard_not_done_reason", "not done needs a reason",
                     (("bin/required_checks.py", 'return "not_done" if re.search(r"[A-Za-z0-9]", rest[len("not done"):]) else "no_reason"', 'return "not_done"'),)),
                    ("an absent list is all missing", "test_guard_no_list", "no list changes nothing",
