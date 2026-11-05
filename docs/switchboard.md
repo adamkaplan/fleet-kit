@@ -6289,6 +6289,10 @@ pod NAME pushed BRANCH head XXXXXXXX
 
 The message means that the worker's branch moved to a head that starts with those eight characters; it never carries a token or the content of a commit. It pairs with the pod status line of the sibling ask #1397: the status line says what a pod is doing now, this message says that its branch moved.
 
+Rules: the first head seen is recorded without a message when it equals the head the launch recorded (a record without one: the first head seen is taken as the head the launch left); a head already told is not told again; a branch that does not exist yet gives no message and no error, and its later appearance is told; a remote that cannot be read gives ONE audit line per pass (`cloud-branch.unreadable`) and no message. The heads seen are kept in `cloud-heads.json` in the state directory.
+
+Limits: at most 20 reads and 5 s per pass, each read with a 5 s timeout. Unread branches wait for the next pass (round robin) and ONE audit line (`cloud-branch.capped`) says a limit cut the pass. Budget: an account whose fresh reading is below the low-budget line (`agent_calls.low_budget`, the line `status` shows) is not read (0 reads, ONE audit line `cloud-branch.skipped_budget`); a stale or missing reading counts as above the line. Worst case branch reads per hour: 0 for a repository with a live forwarder; branches x 60 an hour (1200 for 20 branches) for a repository with none (a read answered 304 Not Modified costs nothing against the limit). The push route and the read share `cloud-heads.json`, so a head the push told is not told again by a read.
+
 ## The assembler (#1092, slice S1)
 
 `bin/fleet-switchboard` builds the daemon's one module namespace from the manifest `bin/fleet-switchboard.parts`: one part path per line, relative to the entry's real path (symlinks resolved), `#` for comments.
@@ -6459,6 +6463,8 @@ canon: the wake channel carries each thing once.
 | `_impact_post_list` | owner-hold rule list | rule version (own state) | per rule | `test_s8_an_unreadable_decision_or_rule_or_file_list_is_refused_and_nothing_is_lifted` |
 | `cmd_remind` | a reminder the agent set (`remind`) | its own id (a request, not a finding) | none: sent as asked | `test_a_reminder_is_a_fact_only_once_it_is_due` |
 | `set_checkpoint_reminders` | checkpoint reminder | launch (own id) | once per launch | `test_a_launch_checkpoint_reminder_is_not_a_wait_and_a_workers_own_reminder_is` |
+| `cloud_push_told` | cloud branch head | worker and head (cloud-heads.json) | once per new head | `test_a_pushed_head_tells_the_lane_once_and_the_same_head_again_tells_nobody` |
+| `cloud_branch_tick` | cloud branch head | worker and head (cloud-heads.json) | once per new head | `test_a_pushed_head_tells_the_lane_once_and_the_same_head_again_tells_nobody` |
 | `notify_drop` | reminder drop notice | dropped reminder (removed first) | once | `test_a_drop_sends_the_setter_one_notice_naming_text_and_reason_audited_once` |
 | `SweepFacts` | sweep (a fact, merged per wake) | set and slot (own key) | re-alarm hours | `test_s4_three_finding_kinds_of_one_wake_are_one_queued_message_with_three_lines` |
 | `TriageFacts` | triage (a fact, merged per wake) | set and slot (own key) | re-alarm hours | `test_s4_three_finding_kinds_of_one_wake_are_one_queued_message_with_three_lines` |
