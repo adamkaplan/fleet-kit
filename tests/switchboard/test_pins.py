@@ -253,7 +253,7 @@ class TestPins(PinsRepo):
         with mock.patch("urllib.request.urlopen", side_effect=AssertionError("network")), mock.patch("socket.create_connection", side_effect=AssertionError("network")):
             self.pins()
         self.assertTrue(self.calls)
-        self.assertEqual({(c[0], c[1]) for c in self.calls}, {("git", "diff"), ("git", "grep")})
+        self.assertEqual({(c[0], "diff" if c[1] == "-c" else c[1]) for c in self.calls}, {("git", "diff"), ("git", "grep")})
         self.assertEqual(sorted(str(p) for p in Path(self.dir).rglob("*") if ".git" not in p.parts), before)
         self.assertEqual({p: p.stat().st_mtime_ns for p in stamp}, stamp)
         self.assertFalse([c for c in self.calls if "fetch" in c or "pull" in c])
@@ -620,8 +620,8 @@ class TestPinsStrictRead(PinsRepo):
     def test_the_diff_call_pins_prefixes_and_textconv(self):   # L1 argv
         self.write("acme.py", BASE_SRC.replace("count * 2", "count * 3"))
         self.pins()
-        diff = [c for c in self.calls if c[1] == "diff"][0]
-        self.assertEqual(diff[:2], ["git", "diff"])
+        diff = [c for c in self.calls if "diff" in c[:4]][0]
+        self.assertEqual(diff[:4], ["git", "-c", "core.quotePath=false", "diff"])
         for opt in ("--src-prefix=a/", "--dst-prefix=b/", "--no-textconv"):
             self.assertIn(opt, diff)
 
@@ -630,11 +630,11 @@ class TestPinsStrictRead(PinsRepo):
 
         def run(argv, **kw):
             seen.update(kw)
+            seen["argv"] = argv
             return subprocess.CompletedProcess(argv, 0, "", "")
         sb.pins_read_diff("HEAD", run)
-        env = seen["env"]
-        pairs = [(env["GIT_CONFIG_KEY_%d" % i], env["GIT_CONFIG_VALUE_%d" % i]) for i in range(int(env["GIT_CONFIG_COUNT"]))]
-        self.assertIn(("core.quotePath", "false"), pairs)
+        self.assertNotIn("env", seen)   # a pod's git wrapper refuses git configuration from the environment
+        self.assertEqual(seen["argv"][:4], ["git", "-c", "core.quotePath=false", "diff"])
 
     def test_other_prefixes_are_not_a_clean_answer(self):   # L1 headers
         for pre in ("c/", "w/"):

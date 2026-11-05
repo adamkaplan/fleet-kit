@@ -61,14 +61,10 @@ def pins_messages_of(line):
 
 def pins_read_diff(base, runner):
     """{path: {"added": set of new-side line numbers, "names": set, "messages": set}} for `git diff -U0 base`; PinsError when git cannot read it."""
-    import os
     import subprocess
-    env = dict(os.environ)   # core.quotePath=false through the environment (a path with a non-ASCII character is not quoted), the way that leaves the argv as `git diff`
-    count = int(env["GIT_CONFIG_COUNT"]) if env.get("GIT_CONFIG_COUNT", "").isdigit() else 0
-    env.update({"GIT_CONFIG_COUNT": str(count + 1), "GIT_CONFIG_KEY_%d" % count: "core.quotePath", "GIT_CONFIG_VALUE_%d" % count: "false"})
     try:
-        done = runner(["git", "diff", "-U0", "--no-color", "--no-ext-diff", "--no-textconv", "--src-prefix=a/", "--dst-prefix=b/", base, "--"],
-                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=60, env=env)
+        done = runner(["git", "-c", "core.quotePath=false", "diff", "-U0", "--no-color", "--no-ext-diff", "--no-textconv", "--src-prefix=a/", "--dst-prefix=b/", base, "--"],
+                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=60)
     except (OSError, subprocess.SubprocessError) as err:
         raise PinsError("could not read the diff: %s" % _pins_one_line(str(err), 200))
     if done.returncode != 0:
