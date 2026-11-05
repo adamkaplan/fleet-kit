@@ -7305,7 +7305,7 @@ def decision_repos(engine):
 PR_NOTICES = "pr-notices.json"
 
 
-PR_VIEW_FIELDS = "title,state,additions,deletions,changedFiles,statusCheckRollup,reviewDecision,mergeable,headRefOid,body,author,reviews,comments,labels,isDraft"
+PR_VIEW_FIELDS = "title,state,additions,deletions,changedFiles,statusCheckRollup,reviewDecision,mergeable,headRefOid,body,author,reviews,comments,labels,isDraft,baseRefName"
 
 
 _PR_SHORT = re.compile(r"^([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#([0-9]+)$")
@@ -7703,6 +7703,7 @@ def pr_facts_from(data):
             # commit is what makes it one event per push
             "mergeable": str(data.get("mergeable") or "").upper() or None,
             "checks": pr_checks_of(data.get("statusCheckRollup")),
+            "base_ref": data.get("baseRefName"),
             "head": head, "refs": pr_body_refs(data.get("body")),
             "draft": data.get("isDraft") is True}   # #770: gate G4 says a draft runs no tests
 
@@ -7710,7 +7711,12 @@ def pr_facts_from(data):
 def read_pr_facts(engine, repo, number, extra_fields=""):
     """ONE `gh pr view` of the PR, with the repo's configured account (gh_users). The hub's picture holds the PR's
     title, size and state only (not checks or review), so it cannot answer this on its own. Raises NoticeError."""
-    return pr_facts_from(read_pr_json(engine, repo, number, extra_fields))
+    return ci_fresh_fact(engine, repo, number, pr_facts_from(read_pr_json(engine, repo, number, extra_fields)))   # #1755
+
+
+def ci_fresh_fact(engine, repo, number, facts):
+    """#1755: a green `facts["ci"]` counts only when its run was made on the current tip of the base (the rule is in bin/ci_fresh.py)."""
+    return load_module("ci_fresh").fresh_fact(facts, lambda: plan_ledger.repo_setting(engine.config, repo), lambda: merge_gate_gh(engine.config, engine.gh_runner or subprocess.run, repo), load_module("pr_reading"), repo, number)
 
 
 def read_pr_json(engine, repo, number, extra_fields=""):
@@ -8453,7 +8459,8 @@ def pod_silence_summary(worker):
     no flag and no caller argument: this function takes a pod name from the daemon's own live records and returns the line only to pod_silence.scan, which
     sends it to the recorded boss; a lane has no way to call it (not a command, not a request kind). Raises (a refusal text) when the pod cannot be read."""
     cloud = load_module("cloud_worker").bind(globals())
-    code, body, note = cloud.run_launcher(None, "inspect", worker, (), 60)
+    with cloud.Cluster() as cluster:   # the launcher's inspect needs a cluster login, like every other caller
+        code, body, note = cloud.run_launcher(None, "inspect", worker, (), 60, cluster=cluster)
     if code != 0 or not isinstance(body, dict):
         raise RuntimeError("the pod was not read (%s)" % (" ".join(str(note or "exit %s" % code).split())[:120]))
     line = cloud._inspect_short(body)
@@ -14690,7 +14697,7 @@ def pr_picture(engine, repo, number, state):
     """(facts, body, notice senders) of a PR, best effort: ({}, "", []) with a reason string when it cannot be read."""
     try:
         raw = read_pr_json(engine, repo, number)
-        facts = pr_facts_from(raw)
+        facts = ci_fresh_fact(engine, repo, number, pr_facts_from(raw))   # #1755
     except (NoticeError, AttributeError) as err:
         return None, "", [], _one_line(str(err), 160)
     body = raw.get("body") if isinstance(raw.get("body"), str) else ""
@@ -18095,7 +18102,7 @@ def ci_record_core(ctx, now, quiet=False):
         if not quiet:
             _gates_audit(ctx.engine, "gate.ci_record", ctx.pr, dict(detail, ok=False, why="CI is %s at the head" % ci))
         named = "; ".join("%s%s run %s is %s" % (w or "status", " job " + j if j else "", r, st) for w, j, r, st in load_module("ci_runs").not_green_jobs((ctx.facts or {}).get("ci_rollup"))[:3]) if (ctx.facts or {}).get("ci_rollup") else ""
-        return dict(out, status="not-green", why="CI is %s at %s (only a complete, green run is recorded)%s" % (ci, head[:8], " [%s]" % named if named else ""))
+        return dict(out, status="not-green", why=(ctx.facts or {}).get("ci_line") or "CI is %s at %s (only a complete, green run is recorded)%s" % (ci, head[:8], " [%s]" % named if named else ""))
     out["carry"] = carry_at_green(ctx, now)   # the carry does not depend on whether any ci verdict is wanted
     for d in out["carry"]:
         if d.get("noted") and not quiet:   # #1217: a real run always has ledger state, so a missing one is SAID (here, once), not skipped silently
@@ -18124,7 +18131,7 @@ def ci_record_core(ctx, now, quiet=False):
         plan_ledger.append_entry(ctx.state, {"kind": "verdict", "pr": ctx.pr, "scenario": scenario["id"], "plan_ref": ctx.source,
                                              "plan_hash": ctx.plan["plan_hash"], "head": head, "result": "pass",
                                              "by": plan_ledger.CI_RECORDER, "evaluator": "ci",
-                                             "evidence": "CI green at %s: every check run complete and passing" % head[:12]}, now())
+                                             "evidence": "CI green at %s%s: every check run complete and passing" % (head[:12], " on the tip " + ctx.facts["ci_line"].split()[-1] if (ctx.facts or {}).get("ci_line", "").startswith("fresh") else "")}, now())
         out["recorded"].append(scenario["id"])
     link = next((r.get("detailsUrl") for r in ((ctx.facts or {}).get("ci_rollup") or []) if isinstance(r, dict) and "/actions/runs/" in str(r.get("detailsUrl") or "")), "")
     for scenario in wanted:   # the proof of each ci scenario, next to its verdict (same guards: only reached for a green, complete run)
