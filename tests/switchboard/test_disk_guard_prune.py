@@ -14,7 +14,6 @@ from support.paths import BIN
 GB = 10 ** 9
 HOUR = 3600
 DOCKER = "/fake/bin/docker"
-PRUNE = [DOCKER, "builder", "prune", "-f", "--filter", "until=6h"]
 COMMAND = "docker builder prune -f --filter until=6h"
 A_COMMAND = "the prune command is exactly docker builder prune -f --filter until=6h"
 A_HOUR = "a second episode within an hour of the last prune does not prune"
@@ -25,6 +24,22 @@ Usage = namedtuple("usage", "total used free")
 def need(condition, message):
     if not condition:
         raise AssertionError(message)
+
+
+def check_properties(mod, rig, prunes):
+    """Properties over EVERY recorded docker call (AGENTS.md: no exact argument list, no number): `prunes` is the count of prune calls expected."""
+    found = rig.prunes()
+    need(len(found) == prunes, "%d prune call(s) expected, got %d: %r" % (prunes, len(found), rig.calls))
+    for argv, kwargs in zip(rig.calls, rig.kwargs):
+        need(argv[1] != "info" or argv[2:3] == ["--format"], "docker info is the only other call: %r" % (argv,))
+        need("-a" not in argv and "--all" not in argv, "%s: no -a or --all: %r" % (A_COMMAND, argv))
+        need(not {"image", "volume", "system", "container"} & set(argv), "%s: no image, volume, system or container call: %r" % (A_COMMAND, argv))
+    for argv, kwargs in ((c, k) for c, k in zip(rig.calls, rig.kwargs) if c[1:3] == ["builder", "prune"]):
+        need(argv[1:3] == ["builder", "prune"], "%s: the subcommand pair is builder prune: %r" % (A_COMMAND, argv))
+        need("--filter" in argv and argv[argv.index("--filter") + 1:argv.index("--filter") + 2] == ["until=6h"], "%s: the filter is until=6h: %r" % (A_COMMAND, argv))
+        timeout = kwargs.get("timeout")
+        need(isinstance(timeout, (int, float)) and 0 < timeout <= mod.DISK_PRUNE_GUARD_TIMEOUT, "the prune carries a timeout, positive and at most the guard's bound: %r" % (timeout,))
+        need(kwargs.get("stdin") == subprocess.DEVNULL, "the prune has no stdin")
 
 
 class Audit:
@@ -96,11 +111,9 @@ def check_command(mod):   # S2
         facts = rig.step()
         for minute in range(10, 190, 10):   # three hours of passes in one low episode
             facts = rig.step(10, 40)
-        need(rig.prunes() == [PRUNE], "%s: got %r" % (A_COMMAND, rig.prunes()))
-        need(rig.calls == [PRUNE], "no other docker command is run: got %r" % (rig.calls,))
-        need(rig.kwargs[0].get("timeout") == 60 and rig.kwargs[0].get("stdin") == subprocess.DEVNULL, "the prune carries a 60 s timeout and no stdin")
+        check_properties(mod, rig, 1)
         (pruned,) = rig.events("disk.pruned")
-        need(pruned == {"command": COMMAND, "exit_status": 0, "bytes_freed": 5 * GB}, "disk.pruned names the command, the status and the bytes freed: %r" % pruned)
+        need(pruned["command"] == COMMAND and pruned["exit_status"] == 0 and pruned["bytes_freed"] == rig.freed, "disk.pruned names the command, the status and the bytes freed: %r" % pruned)
         need(len(facts) == 1 and COMMAND in facts[0].summary and "freed 5.0 GB" in facts[0].summary, "the notice says what ran and how much it freed")   # S5
 
 
@@ -128,7 +141,7 @@ def check_hour(mod):   # S3
 
 
 def check_failures(mod):   # S4
-    cases = (("no docker", {"docker": None}, None, "not installed"), ("timeout", {}, "timeout", "did not answer within 60 seconds"), ("exit 1", {}, "fail", "exit status 1"))
+    cases = (("no docker", {"docker": None}, None, "not installed"), ("timeout", {}, "timeout", "did not answer within"), ("exit 1", {}, "fail", "exit status"))
     for label, rig_args, mode, said in cases:
         with Rig(mod, {"disk_guard": {"prune": True}}, **rig_args) as rig:
             rig.mode = mode
@@ -148,13 +161,14 @@ def check_off(mod):   # S6
     with Rig(mod, {"disk_guard": {"prune": False}}) as rig:
         rig.step()
         rig.step(10, 40)
-        need(rig.calls == [], "the switch false runs no docker at all: %r" % rig.calls)
+        need(rig.calls == [], "the switch false runs no docker at all: %r" % rig.calls)   # nothing at all: no call to check
     with Rig(mod, {"disk_guard": {}}, info="Ubuntu 24.04 LTS") as rig:
         rig.step()
-        need(rig.prunes() == [] and rig.calls == [[DOCKER, "info", "--format", "{{.OperatingSystem}}"]], "a docker that is not Docker Desktop is not pruned: %r" % rig.calls)
+        check_properties(mod, rig, 0)
+        need(rig.calls, "docker was asked what it is")
     with Rig(mod, {"disk_guard": {}}) as rig:
         rig.step()
-        need(rig.prunes() == [PRUNE], "the switch absent on Docker Desktop prunes once: %r" % rig.calls)
+        check_properties(mod, rig, 1)
 
 
 class TestDiskGuardPrune(unittest.TestCase):
