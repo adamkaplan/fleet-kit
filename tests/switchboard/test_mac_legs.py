@@ -379,6 +379,7 @@ class TestPlatformPaths(unittest.TestCase):
     PLATFORM = frozenset(("sys.platform", "os.name", "platform.system", "os.uname"))
     EXEMPT = {
         "bin/fleet-switchboard": "left out on purpose: almost every change touches it; the push to main and the nightly catch a regression",
+        "bin/switchboard/docker_reaper.py": "a part cut out of bin/fleet-switchboard (left out on purpose, see above); its \"ps\" is the docker subcommand `docker ps`, not the host tool",
         "bin/cloud_cluster.py": "portable ps -o ... -p PID call, which also exists on Linux",
         "bin/guard_record_head_move.py": "portable ps -o ... -p PID call, which also exists on Linux",
     }
