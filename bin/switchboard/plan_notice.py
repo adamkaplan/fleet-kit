@@ -114,7 +114,7 @@ def plan_wake_pass(engine, state, repos, now, budget=None):
             url = module.plan_url(repo, number, plan["id"])
             key = "%s#%d:%s" % (repo, number, plan_hash)
             names = route[0]
-            if key not in wake.announced and names:
+            if key not in wake.announced and key not in wake.approved and names:   # #2193
                 own = raw[number][1]
                 source = number
                 done_when = parse_intent(own.get("body"))[1]
