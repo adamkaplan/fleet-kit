@@ -31,7 +31,7 @@ Receipt format: `docs/plan-template.md`.
    screenshot | review`; `review` quotes text), `pass` (a concrete observable: a status, a number, a quoted value), `discriminates` (the wrong
    build that would FAIL it), `evaluator` (`ci | tester | reviewer | owner`, who records that proof), optionally
    `claim: epic` for what only an integrated head can prove (name the integration branch in the plan).
-   **Owner evaluators are rare**: only where the owner's eyes are the test, proved once with `claim: epic`; never for a routine PR.
+   **Owner evaluators are rare**: only where the owner's own eyes are the test, proved once with `claim: epic`; never for a routine PR.
 
    **Own measurement:** launch a tester of your lane (`--role tester --repo <the pull request's repo> --reports-to <you>`, headless) to re-measure and record; never record as yourself.
    An uncovered Done-when clause gets a new `S` scenario; never edit the clause.
