@@ -104,6 +104,8 @@ _support_installs_and_keys = importlib.import_module("support.installs_and_keys"
 ACME_API, ACME_WEB, API, BAD_STATE_REASON, BAD_TARGET_STATES, CloudReaperInstall, DECISIONS_PLUGIN, DEFAULT_TOKEN, FAKE_TOKENS, FakeDaemons, GOOD_DONE_WHEN, GOOD_PLAN, InstallCase, KeyCase, ORDERS_CHARTER_BODY, PR16_KEY, PR16_NOTICE, RealStatusAfterInstall, TIER_LABELS, WEB, WrittenFilesAreGuarded, secrets_in, tree_of = (_support_installs_and_keys.ACME_API, _support_installs_and_keys.ACME_WEB, _support_installs_and_keys.API, _support_installs_and_keys.BAD_STATE_REASON, _support_installs_and_keys.BAD_TARGET_STATES, _support_installs_and_keys.CloudReaperInstall, _support_installs_and_keys.DECISIONS_PLUGIN, _support_installs_and_keys.DEFAULT_TOKEN, _support_installs_and_keys.FAKE_TOKENS, _support_installs_and_keys.FakeDaemons, _support_installs_and_keys.GOOD_DONE_WHEN, _support_installs_and_keys.GOOD_PLAN, _support_installs_and_keys.InstallCase, _support_installs_and_keys.KeyCase, _support_installs_and_keys.ORDERS_CHARTER_BODY, _support_installs_and_keys.PR16_KEY, _support_installs_and_keys.PR16_NOTICE, _support_installs_and_keys.RealStatusAfterInstall, _support_installs_and_keys.TIER_LABELS, _support_installs_and_keys.WEB, _support_installs_and_keys.WrittenFilesAreGuarded, _support_installs_and_keys.secrets_in, _support_installs_and_keys.tree_of)   # support import
 _support_loader = importlib.import_module("support.loader")   # support import
 SCENARIO, SWITCHBOARD, SWITCHBOARD_SOURCE_FILES, _load, captured, class_source, class_source_fn, copy_entry, sb, sc, switchboard_source, with_http_head = (_support_loader.SCENARIO, _support_loader.SWITCHBOARD, _support_loader.SWITCHBOARD_SOURCE_FILES, _support_loader._load, _support_loader.captured, _support_loader.class_source, _support_loader.class_source_fn, _support_loader.copy_entry, _support_loader.sb, _support_loader.sc, _support_loader.switchboard_source, _support_loader.with_http_head)   # support import
+_REAL = sb.real_locations_from(os.environ)   # the real state, config and audit locations, computed once BEFORE any test isolates HOME or XDG_*, and passed on to every child process (a child with a temporary HOME is then not "the real one")
+os.environ.setdefault(sb.REAL_LOCATIONS_ENV, json.dumps({"state": sorted(_REAL[0]), "config": sorted(_REAL[1]), "audit": sorted(_REAL[2])}))
 _support_orders_and_adapters = importlib.import_module("support.orders_and_adapters")   # support import
 BoundedList, BoundedOut, EA, EXTERNAL_ADAPTER, ExternalAdapterCase, FakeDoorServer, FakeExternal, FakeGhPr, FakePruneDocker, FakeWorkHost, FakeWorkSink, HEAD_A, HEAD_B, PermanentRefusal, PickyExternal, baseline_failing_send, baseline_failing_source, baseline_golden, captain_pr, cos_orders_file, fake_mapping, janitor_review, pr_view_json, put_cos_orders, report, reviewed_janitor_argv, worker = (_support_orders_and_adapters.BoundedList, _support_orders_and_adapters.BoundedOut, _support_orders_and_adapters.EA, _support_orders_and_adapters.EXTERNAL_ADAPTER, _support_orders_and_adapters.ExternalAdapterCase, _support_orders_and_adapters.FakeDoorServer, _support_orders_and_adapters.FakeExternal, _support_orders_and_adapters.FakeGhPr, _support_orders_and_adapters.FakePruneDocker, _support_orders_and_adapters.FakeWorkHost, _support_orders_and_adapters.FakeWorkSink, _support_orders_and_adapters.HEAD_A, _support_orders_and_adapters.HEAD_B, _support_orders_and_adapters.PermanentRefusal, _support_orders_and_adapters.PickyExternal, _support_orders_and_adapters.baseline_failing_send, _support_orders_and_adapters.baseline_failing_source, _support_orders_and_adapters.baseline_golden, _support_orders_and_adapters.captain_pr, _support_orders_and_adapters.cos_orders_file, _support_orders_and_adapters.fake_mapping, _support_orders_and_adapters.janitor_review, _support_orders_and_adapters.pr_view_json, _support_orders_and_adapters.put_cos_orders, _support_orders_and_adapters.report, _support_orders_and_adapters.reviewed_janitor_argv, _support_orders_and_adapters.worker)   # support import
 _support_policy_and_import = importlib.import_module("support.policy_and_import")   # support import
@@ -7072,6 +7074,8 @@ class GithubRig:
     """A hub on fake GitHub, attached to an engine on the fake fleet, on one simulated clock."""
 
     def __init__(self, test, agents=None, config=None, repos=(GH_REPO,)):
+        if not isinstance(test, Base):
+            raise sb.RealStateRefused("GithubRig in %s: a rig with no state of its own is the real state directory; derive the test from Base (isolating)" % type(test).__name__)
         raw = {"github_repos": list(repos), "gh": GH_BIN}
         raw.update(config or {})
         self.world = World(test, agents=(), config=raw)
@@ -18898,7 +18902,8 @@ class TestFleetHooksPlugin(Base):
         self.assertFalse(env["hasCanary"])
         self.assertNotIn("OPENROUTER_API_KEY", env["keys"])
         self.assertIn("FLEET_SWITCHBOARD_LAB", env["keys"])
-        self.assertLessEqual(set(env["keys"]) - {"FLEET_SWITCHBOARD_LAB", "FLEET_SWITCHBOARD_UNDER_TEST"},   # the suite's own marker (refuse the real opencode) is passed on
+        self.assertLessEqual(set(env["keys"]) - {"FLEET_SWITCHBOARD_LAB", "FLEET_SWITCHBOARD_UNDER_TEST",
+                                                     "FLEET_SWITCHBOARD_REAL_LOCATIONS"},   # the suite's own marker (refuse the real opencode) is passed on; the guard (#1322) is active in the child, which needs the real locations
                              {"PATH", "HOME", "TMPDIR", "LANG", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_RUNTIME_DIR"})
 
     def test_stricter_is_strict(self):
@@ -78999,15 +79004,153 @@ class ReviewCommentEndToEndTests(Base):
         self.assertTrue(paths)
 
 
+# ------------------------------------------------- every test class isolates, or says why not (#1322)
+
+# THE one exceptions table: a unittest.TestCase that is not derived from Base (which isolates HOME and the XDG directories) is listed here with a one-line reason.
+# A class in the first group that builds a World or a rig fails the test below: it must derive from Base.
+NOT_ISOLATED_BY_BASE = {
+    "builds no World, rig or state path: it reads source text, parses strings or runs pure functions": (
+    "AnswerBase", "BotDocumentation", "BotLines", "BotMutants", "BotSize", "BotVerdict", "BotWake", "Cases", "ClaimsNoteBase", "ExternalAdapterCase",
+    "Fixture", "HubFilesUnchanged", "JanitorIdentity", "Launcher", "OneWorkerAndCancel", "PendingJobs", "RelayLoopCadence", "RelayObeysTheTreeGuard",
+    "ReviewCommentIsolationTests", "Rig", "TestAgentCredentialsDoc", "TestAgentDefinitions", "TestAgentRegistry", "TestAgentRegistryInventory",
+    "TestAgentsVerify", "TestAges", "TestAlertConfig", "TestApprovalExemptionGuard", "TestApprovalReadsFresh", "TestArchTools",
+    "TestArchitectureDocument", "TestArchitectureDocumentFailurePaths", "TestArchitectureSafetyNet", "TestAskIssueSubject", "TestAskWaive",
+    "TestAssembler", "TestAuditRotation", "TestAuthorityModulesGuard", "TestBatchingDocs", "TestBellMigration", "TestBigRegistrarFile",
+    "TestBranches", "TestBriefParsing", "TestBuilderChecklist", "TestCallerWorkspace", "TestCapsAndScrub", "TestCensus", "TestCharterEditGuard",
+    "TestCharterNoParent", "TestChatClearJudge", "TestChatClearOffers", "TestChecklistAndFamilyTexts", "TestChiefOfStaffNativePermissions",
+    "TestCiOutsideBin", "TestCiTestFileList", "TestClaimMutants", "TestClaimPlacement", "TestClaimReaders", "TestClaimsNoteDocumentation",
+    "TestClaimsNoteMutants", "TestClaimsNotePass", "TestClaimsNoteScan", "TestClaimsNoteSkips", "TestClaimsNoteText", "TestClassify",
+    "TestClearCarry", "TestClearCodePathsAlwaysHeld", "TestClearNoticeOrderMutants", "TestClosedUnmergedAskClose", "TestClosedUnmergedDocs",
+    "TestClosedUnmergedLastPr", "TestClosingKeywordWarning", "TestCommissioningDocs", "TestCompactionShape", "TestCompose", "TestConcurrencyGroup",
+    "TestConflictCarry", "TestCosDelegatedClearPermission", "TestCosTriageAllowRule", "TestCountMovable", "TestCutoverRunbook",
+    "TestDecisionBaselineIds", "TestDecisionHeadlines", "TestDecisionIds", "TestDecisionOrder", "TestDecisionsPanelOrder",
+    "TestDecisionsPluginSource", "TestDecisionsRoleText", "TestDecisionsStaleBound", "TestDecisionsStyledPanel", "TestDeployFromMainSentence",
+    "TestDerivedClosure", "TestDictCallersUnchanged", "TestDocs", "TestDocument", "TestDocumentTable", "TestDocumentation",
+    "TestDropNeverBlocksAWrite", "TestDuplicateBindings", "TestEndTickWithoutStateDirectory", "TestEventFeedLines", "TestEventFeedReads",
+    "TestEvents", "TestEveryBriefTestFileIsBound", "TestEveryFunctionOf1066IsPinned", "TestEveryKindDelayedMark",
+    "TestEveryReaderOfAPullRequestsFileList", "TestEveryTestFileIsWired", "TestExternalAdapterErrors", "TestExternalAdapterFeed",
+    "TestExternalAdapterHygiene", "TestExternalAdapterKeys", "TestExternalAdapterMapping", "TestExternalAdapterOperations", "TestExternalAdapterPort",
+    "TestExternalAdapterWork", "TestExternalDecisionConfig", "TestExternalDecisionRules", "TestFakeModule", "TestFeedShape", "TestFileRead",
+    "TestFleetHooksSource", "TestFocusedLocalRuns", "TestGateLegs", "TestGhShimSign", "TestGhShimSignRepoFlag", "TestGithubWritingRule",
+    "TestGuardSet", "TestHardening", "TestHeavyCeilings", "TestHeavyFifo", "TestHeavyHolders", "TestHeavyProgress", "TestHeavyQueueLogic",
+    "TestHeavySplit", "TestHeavyWaitRecord", "TestHeavyWatchdog", "TestHeldSummaryFlowchart", "TestHygiene", "TestIdsAndEtags", "TestImpactFloorPure",
+    "TestImportOrder", "TestImportSchemaChecker", "TestImportV1Converter", "TestInstallDocs", "TestIntegrationBranchVerdictText", "TestIntentChange",
+    "TestIntentParsing", "TestItemVerdicts", "TestJobEndRecord", "TestJobFacts", "TestJobTool", "TestJudgeSample",
+    "TestJudgeToolWritesNothingElsewhere", "TestLatestRunOfWorkflow", "TestLaunchMemoryTest", "TestLedgerReadRace", "TestLostWorker",
+    "TestLostWorkerMemoryOnly", "TestLostWorkerReadRound", "TestLostWorkerRemembers", "TestLostWorkerSlowPass", "TestMacosReader", "TestMadeUpPids",
+    "TestMergeGateAnswer", "TestMergeGateAnswerMutant", "TestMergeGateDocs", "TestMessageId", "TestMessageTimes", "TestMovingADefinition",
+    "TestMutant", "TestMutantControlRule", "TestMutantIsCaught", "TestMutants", "TestNestedImports", "TestNewModuleDemands", "TestNewestCiRuns",
+    "TestNoFailureMode", "TestOneVocabulary", "TestOrdersBodyEdits", "TestOrdersFact", "TestOrdersRoleText", "TestOwnMarkerNotHonoured",
+    "TestOwnMeasurementTester", "TestOwnReviewLaws", "TestOwnerClearModule", "TestOwnerEvaluatorsAreRare", "TestOwnerHoldRule", "TestPR10Source",
+    "TestPR4Catalog", "TestPR7Source", "TestPR8Source", "TestPaneWarningRule", "TestParseCheckpoint", "TestParseOrders", "TestPlanCheckFeedback",
+    "TestPlanCheckHash", "TestPlanCheckParser", "TestPlanCheckRound2", "TestPlanCheckRules", "TestPlanCheckSelection", "TestPlanKind",
+    "TestPlanOperationsPerBoss", "TestPlanReceipts", "TestPlanReviewCore", "TestPlanRulesWordedAlike", "TestPlanTemplateDoc", "TestPlanningDecision",
+    "TestPlanningSkill", "TestPlatformClassList", "TestPlatformPaths", "TestPluginPush", "TestPodNiceness", "TestPolicyRedaction",
+    "TestPolicyRequest", "TestPreflightPr", "TestPushWatch", "TestReadCheckRuns1237", "TestReadOnly", "TestReadWholeAuditTable", "TestRealDirectory",
+    "TestReasonsAreOneCleanLine", "TestReconcileOnRead", "TestRecordJsonReaders", "TestRefusalInAPart", "TestRegistryEndpoint", "TestReplay",
+    "TestReportFoldVariants", "TestRoutineLocal", "TestRunLauncherShapes", "TestSamples", "TestScanDriftGuard", "TestScenarioValidator",
+    "TestScratchDirectory", "TestScratchFileRule", "TestScrubFailsClosed", "TestScrubPatterns", "TestSelfRegisteringCli", "TestSelfWakeInstructions",
+    "TestServiceIdentity", "TestSets", "TestShadowGlue", "TestShadowRule", "TestShadowStatuses", "TestShards", "TestSharesDeadVerdict",
+    "TestShimGuardDocs", "TestShimGuardMutants", "TestShimGuardRows", "TestShimGuardsTool", "TestShimHygiene", "TestShimHygienePlanted",
+    "TestSkillsSync", "TestSources", "TestStandingAuthority", "TestStatusIntentGapsAreBounded", "TestStatusLines", "TestStructuralRuleInReviewing",
+    "TestSupportRebinding", "TestSyncReportFreezePerBoss", "TestTheArchitectureTestIsRun", "TestTheBinSetClassesAreAllInTheTable", "TestTheCheck",
+    "TestTheDerivationIsHeld", "TestTheMergeGate", "TestTierRoleText", "TestTriageRuleInputs", "TestTriageStandingLine", "TestTurnEnd",
+    "TestUnionCheckLimitsDocs", "TestVerdictRecordingText", "TestWhoCanClear", "TestWiredCheckPlanted", "TestWorkItemRules", "TestWorkSyncPump",
+    "TestWorkerRulesInSkills", "TestWriting", "TrickleHub", "TwoLoopsTrace", "WorkflowPlanPins",
+    ),
+    "makes its own temporary directory or state (a tempfile.mkdtemp, a patched environment or its own isolating setUp) and never reads the real one": (
+    "TestEveryTestClassIsolates",
+    "Case", "HeaderCacheBase", "TestCloudWatchBounds", "TestCloudWatchTick", "TestGatePass", "TestHostDisk", "TestIsolation", "TestSafety",
+    ),
+}
+
+
+ISOLATION_BUILDERS = ("World(", "GithubRig(", "CharterRig(", "FarmRig(", "ensure_state_dir(", "state_dir_path(", "config_path(")
+ISOLATION_FILES = ("bin/test-switchboard", "tests/switchboard/test_*.py", "tests/switchboard/support/*.py")
+
+
+class TestEveryTestClassIsolates(unittest.TestCase):
+    """The ast of the suite (the entry, every test file, the support): every TestCase class derives (through any chain) from Base or is in NOT_ISOLATED_BY_BASE."""
+
+    @staticmethod
+    def classes():
+        import glob
+        root = Path(__file__).resolve().parents[1]
+        table = {}
+        for pattern in ISOLATION_FILES:
+            for path in sorted(glob.glob(str(root / pattern))):
+                for node in ast.parse(Path(path).read_text()).body:   # top level: a class nested in a test is that test's own fixture
+                    if isinstance(node, ast.ClassDef):
+                        table.setdefault(node.name, []).append(node)
+        return table
+
+    @classmethod
+    def reaches(cls, node, target, table, seen=()):
+        for base in (ast.unparse(b) for b in node.bases):
+            if base in target or (base in table and base not in seen and any(cls.reaches(m, target, table, seen + (node.name,)) for m in table[base])):
+                return True
+        return False
+
+    @classmethod
+    def offenders(cls):
+        table = cls.classes()
+        listed = {name: reason for reason, names in NOT_ISOLATED_BY_BASE.items() for name in names}
+        bad = []
+        for name, nodes in table.items():
+            for node in nodes:
+                if name == "Base" or not cls.reaches(node, ("unittest.TestCase", "TestCase"), table) or cls.reaches(node, ("Base",), table):
+                    continue
+                if name not in listed:
+                    bad.append(name)
+                elif listed[name].startswith("builds no") and any(b in ast.unparse(node) for b in ISOLATION_BUILDERS):
+                    bad.append(name)
+        return sorted(set(bad))
+
+    def test_no_test_class_is_neither_isolated_nor_listed(self):
+        self.assertEqual(self.offenders(), [])
+
+    def test_the_table_lists_no_class_that_does_not_exist_or_derives_from_base(self):
+        table = self.classes()
+        for reason, names in NOT_ISOLATED_BY_BASE.items():
+            for name in names:
+                with self.subTest(name=name):
+                    self.assertIn(name, table)
+                    self.assertFalse(any(self.reaches(n, ("Base",), table) for n in table[name]), name + " derives from Base: drop it from the table")
+                    self.assertTrue(any(self.reaches(n, ("unittest.TestCase", "TestCase"), table) for n in table[name]), name + " is not a TestCase")
+
+    def test_a_plain_testcase_that_builds_a_world_is_found(self):
+        # the mutant: the recorded case, a plain TestCase that builds a rig
+        src = "class Plain(unittest.TestCase):\n    def test_x(self):\n        GithubRig(self)\n"
+        node = ast.parse(src).body[0]
+        self.assertTrue(any(b in ast.unparse(node) for b in ISOLATION_BUILDERS))
+        self.assertFalse(self.reaches(node, ("Base",), {"Plain": [node]}))
+        self.assertNotIn("Plain", [n for names in NOT_ISOLATED_BY_BASE.values() for n in names])
+
+    def test_world_and_rig_refuse_state_none_outside_base(self):
+        class Plain(unittest.TestCase):
+            def runTest(self):
+                pass
+        for build, named in ((lambda t: World(t), "World(state=None)"), (lambda t: GithubRig(t), "GithubRig in")):   # the rig's own refusal, not the World it would build
+            with self.subTest(named=named):
+                with self.assertRaises(sb.RealStateRefused) as caught:
+                    build(Plain())
+                self.assertIn(named, str(caught.exception))
+
+
 if __name__ == "__main__":
     # Run directly, the suite takes a CPU slot (`fleet-switchboard heavy`): several full suites at once starve the machine. FLEET_HEAVY=off, a CI run, a run
     # already in a slot, or a state directory that cannot be written run it as it is.
-    _wrapped = sb.load_heavy_slots().wrap_argv(sys.argv[1:], os.environ, sys.executable, str(SWITCHBOARD), os.path.abspath(__file__),
-                                                                  state_dir=sb.state_dir_path())
-    if _wrapped is not None:
-        try:
-            os.execv(_wrapped[0], _wrapped)
-        except OSError as _err:
-            sys.stderr.write("heavy: cannot start the slot wrapper (%s): running without a slot\n" % (_err.strerror or _err))
+    _marker = os.environ.pop(sb.UNDER_TEST_ENV, None)   # the slot wrapper reads the daemon's own config and slot directory by design (CPU slots are shared with the daemon): the guard is off for this one call
+    try:
+        _wrapped = sb.load_heavy_slots().wrap_argv(sys.argv[1:], os.environ, sys.executable, str(SWITCHBOARD), os.path.abspath(__file__),
+                                                                      state_dir=sb.state_dir_path())
+        if _wrapped is not None:
+            try:
+                os.execv(_wrapped[0], _wrapped)   # the marker stays off: the wrapper is not a test; the suite it starts sets the marker again
+            except OSError as _err:
+                sys.stderr.write("heavy: cannot start the slot wrapper (%s): running without a slot\n" % (_err.strerror or _err))
+    finally:
+        if _marker is not None:
+            os.environ[sb.UNDER_TEST_ENV] = _marker
     sys.exit(main(sys.argv[1:]))
 
