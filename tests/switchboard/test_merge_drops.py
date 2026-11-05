@@ -100,6 +100,26 @@ class TestMergeDrops(MergeDropsBase):
         self.commit("tip re-indents and moves")
         self.assertEqual(self.run_cmd(), (0, []))
 
+    def test_a_second_dropped_return_none_is_flagged_when_the_branch_removed_only_one(self):
+        two = "def a():\n    return None\ndef b():\n    return None\nz = 1\n"
+        self.write("app.py", two)
+        self.commit("two returns")
+        git(self.dir, "checkout", "-q", "-b", "pr")
+        self.write("app.py", "def a():\n    return None\ndef b():\n    pass\nz = 1\n")   # the branch removes one `return None`
+        self.commit("own removal")
+        git(self.dir, "checkout", "-q", "integration")
+        self.write("app.py", two + "tail = 2\n")
+        self.commit("tip adds a line")
+        git(self.dir, "checkout", "-q", "pr")
+        git(self.dir, "merge", "-q", "--no-commit", "integration")
+        self.write("app.py", "def a():\n    pass\ndef b():\n    pass\nz = 1\ntail = 2\n")   # the merge drops the other one
+        git(self.dir, "add", "-A")
+        git(self.dir, "commit", "-q", "-m", "merge the tip")
+        code, out = self.run_cmd()
+        self.assertEqual(code, 1, out)
+        self.assertEqual(len(out), 1, out)
+        self.assertIn("return None", out[0])
+
     def test_a_conflicting_merge_says_resolve_first(self):
         git(self.dir, "checkout", "-q", "-b", "pr")
         self.write("app.py", "mine\n")
