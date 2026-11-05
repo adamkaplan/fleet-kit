@@ -7732,6 +7732,12 @@ def read_pr_json(engine, repo, number, extra_fields=""):
     except AccountError as err:
         raise NoticeError(str(err)) from None
     extra = {"env": env} if env is not None else {}
+    memo = getattr(engine, "pr_read_memo", None)   # #2230: `gates-check` sets one for its pull request: the first read asks for the files too, the floor's read is then this answer
+    if isinstance(memo, dict) and memo.get("key") == (repo, number) and extra_fields in ("", memo["extra"]):
+        if memo.get("raw") is not None:
+            return copy.deepcopy(memo["raw"])
+        extra_fields = memo["extra"]
+        memo["fetching"] = True
     argv = [config["gh"], "pr", "view", str(number), "--repo", repo, "--json",
             PR_VIEW_FIELDS + ("," + extra_fields if extra_fields else "")]
     try:
@@ -7745,9 +7751,12 @@ def read_pr_json(engine, repo, number, extra_fields=""):
         why = "gh pr view %s#%d failed: %s" % (repo, number, accounts.scrub(_one_line(done.stderr or "", 160)) or "exit %d" % done.returncode)
         raise (NoticeNotFound if _PR_NOT_FOUND.search(done.stderr or "") else NoticeError)(why)
     try:
-        return json.loads(done.stdout or "")
+        raw = json.loads(done.stdout or "")
     except ValueError:
         raise NoticeError("gh pr view %s#%d answered something that is not JSON" % (repo, number)) from None
+    if isinstance(memo, dict) and memo.pop("fetching", False) and isinstance(raw, dict):
+        memo["raw"] = raw   # #2230
+    return raw
 
 
 def read_ref_state(engine, repo, number, kind):
@@ -18077,7 +18086,9 @@ def cmd_gates_check(args, runner, now):
             def work():
                 try:
                     ns = types.SimpleNamespace(pr=args.pr, plan=args.plan, ask=args.ask, head=None)
-                    ctx = _ledger_context(ns, runner, now, False, floor=True)
+                    engine.pr_read_memo = {"key": (repo, number), "extra": "files,baseRefOid", "raw": None}   # #2230: one read of the pull request serves the facts and the floor
+                    ctx = _ledger_context(ns, runner, now, False, parts=(engine, state, config), floor=True)
+                    engine.pr_read_memo = None
                     box["report"] = plan_ledger.evaluate_gates(ctx.plan, ctx.entries, ctx.problem,
                                                                 ctx.facts if ctx.facts.get("head") or ctx.facts.get("body") else None, ctx.pr,
                                                                 now=now())
