@@ -5245,7 +5245,7 @@ What each refusal means, and what to do:
 |---|---|---|---|
 | `read_pr_files` | `bin/delegated_clear.py` | it is the shared pager | the pages, one retry, up to 3000 files |
 | `pr_floor_report` | `bin/fleet-switchboard` | uses it (the floor and the clear) | reads `gh pr view --json files` first, pages only when that list cannot vouch for itself |
-| `_review_pr` | `bin/fleet-switchboard` | no | the review command's hint reader of the first 100 files from `gh pr view`; it judges nothing and clears nothing |
+| `_review_pr` | `bin/switchboard/review_laws.py` | no | the review command's hint reader of the first 100 files from `gh pr view`; it judges nothing and clears nothing |
 | `read_open_overlap` | `bin/fleet-switchboard` | no | `gh pr list --json files` for overlap warnings only; a cut list there only hides a warning |
 | `own_change` | `bin/clear_carry.py` | no | its own pager (`_get_list`) is fail-closed: a page that fails refuses the carry |
 
