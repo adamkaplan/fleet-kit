@@ -935,11 +935,11 @@ def evaluate_gates(plan, entries, ledger_problem, facts, pr, now=None):
     rows, scen_rows = [], []
     for gid, name, scope, owner, tracked in GATES:
         row = {"gate": gid, "name": name, "scope": scope, "decided_by": owner, "tracked": tracked, "status": "untracked",
-               "missing": []}
+               "missing": [], **((facts or {}).get("approval") or {}).get(gid, {})}   # #1735: the G0c row is decided by bin/switchboard/approval_gate.py and arrives in facts["approval"]["G0c"]
         if scope != "P":
             row["status"] = "n/a"
             row["detail"] = UNTRACKED_WHY.get(gid, "")
-        elif not tracked:
+        elif not row["tracked"]:
             row["detail"] = UNTRACKED_WHY.get(gid, "not recorded yet")
         elif gid == "G0a":
             if plan is None:
@@ -1177,9 +1177,9 @@ CHECK_FOR = ("ready", "merge")
 DEFAULT_BUDGET_MS = 3000
 BUDGET_RANGE = (500, 30000)
 # the gates each check requires, among those the engine tracks (G0b, G0c and G2/G3 are untracked and cannot refuse)
-REQUIRED_FOR = {"ready": ("G0a", "G1"), "merge": ("G0a", "G1", "G4", "G6", "G6b")}
+REQUIRED_FOR = {"ready": ("G0a", "G1"), "merge": ("G0a", "G0c", "G1", "G4", "G6", "G6b")}
 DEFAULT_ENFORCED = ("G0a", "G1")   # the gates a repo in `enforce` refuses on unless its `enforce_gates` says otherwise
-ENFORCEABLE = ("G0a", "G1", "G4", "G6", "G6b")
+ENFORCEABLE = ("G0a", "G0c", "G1", "G4", "G6", "G6b")
 EXIT_ALLOW, EXIT_REFUSE, EXIT_FAIL_OPEN = 0, 10, 3   # only EXIT_REFUSE refuses; every other exit is an allow
 
 
