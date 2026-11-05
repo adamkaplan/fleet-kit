@@ -130,7 +130,7 @@ def battery(rig):
     return bad
 
 
-class TestBodyGuard(unittest.TestCase):
+class TestGhBodyGuard(unittest.TestCase):
     def setUp(self):
         self.rig = BodyRig()
         self.addCleanup(self.rig.close)
@@ -169,7 +169,7 @@ class TestBodyGuard(unittest.TestCase):
         self.assertEqual(len(calls), 1)
 
 
-class TestRefusalIsPure(unittest.TestCase):
+class TestGhBodyRefusalIsPure(unittest.TestCase):
     def test_the_decision_over_every_combination_of_the_two_parts(self):
         module = load_module()
         for cur_i, cur_d, new_i, new_d in itertools.product((False, True), repeat=4):
@@ -190,7 +190,7 @@ class TestRefusalIsPure(unittest.TestCase):
         self.assertIsNone(module.refusal(BOTH, BOTH))
 
 
-class TestMutants(unittest.TestCase):
+class TestGhBodyMutants(unittest.TestCase):
     """S9: each mutant is applied once to a source copy, asserted applied, and fails the battery; the control passes it first."""
     MUTANTS = (("gh", "the guard is not called", "or body_probe(args, gh, write, lookup)", "or None"),
                ("gh_body.py", "only the Intent heading is compared", "return bool(HEAD_RE.search(body)) and bool(DONE_RE.search(body))",

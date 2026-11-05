@@ -2740,6 +2740,14 @@ call reads again. Reads are never refused. `fleet-switchboard` checks the key wh
 printable `label`, a one-line `message` and `allowed_removers` as agent names). The shim reads no environment variable to skip it:
 the retired `FLEET_SWITCHBOARD_OWN_GH` does not bypass it, and the switchboard's own calls reach the real gh by path, not through the shim.
 
+**The body guard (ask #1751).** `shims/gh_body.py`, loaded by path beside the shim, is asked once per write, right after the hold check. A body write
+to an issue whose current body holds the `## Intent` heading line and the `Done when:` line is refused (exit 1, nothing passed to `gh`) when the new body
+lacks either; a whole-body write must keep both parts. The forms read are `gh issue edit` with `--body`, `-b`, `--body-file` or `-F` (`-F -` from
+stdin), `gh api` to `repos/O/R/issues/N` with `-f body=`, `-F body=@file`, `-F body=@-` or `--input`, and `gh api graphql` naming `updateIssue` (refused
+outright). The current body is read with the account the write would use and the same deadline; a body that cannot be read or is empty, and a form
+whose new body cannot be read, are refused (fail closed). A current body with neither part is not an ask and passes, and so do pull requests, reads
+and writes that carry no body. To change one line of a body use `fleet-switchboard issue-line`, which never changes the Intent or the Done-when.
+
 **Live with no restart, and how to check it.** The shim directory is read on every call, so once the change is on the checkout and the config
 names a repository, the next `gh` call is checked. On a labelled pull request run `gh pr merge <n> -R <owner/repo>`: it exits 1 with the
 configured message and nothing is merged; on an unlabelled one it behaves as before. Removing the config entry switches it off.
