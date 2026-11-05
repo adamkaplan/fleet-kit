@@ -3,8 +3,24 @@ import json
 import os
 import subprocess
 import tempfile
+import sys
 import unittest
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from support.loader import sb   # the daemon: its `review_read` is the one reader of a recorded read
+
+FLEET = "fleet-bot"
+MARK = "\n<!-- fleet-switchboard:from=lane -->"
+
+
+def fleet_login(login):
+    return login == FLEET
+
+
+def read_comment(sha, word="APPROVE", user=FLEET, mark=MARK):
+    return {"author": {"login": user}, "body": "Review of %s: %s\nlooks right%s" % (sha, word, mark)}
+
 
 REPO = Path(__file__).resolve().parents[2]
 PART = REPO / "bin" / "switchboard" / "merge_on_resolve.py"
@@ -61,7 +77,7 @@ class Fixture:
 
     def view(self, labels=("lane:merge-on-resolve",), comments=None):
         head = git(self.dir, "rev-parse", "HEAD")
-        comments = [{"body": "Review of %s: APPROVE\nlooks right" % self.approved[:12]}] if comments is None else comments
+        comments = [read_comment(self.approved)] if comments is None else comments
         return {"state": "OPEN", "labels": [{"name": l} for l in labels], "comments": comments, "headRefOid": head, "baseRefName": "main"}
 
 
@@ -70,7 +86,7 @@ class Hub:
         self.merges, self.notices, self.fx = [], [], fx
         self.ctx = {"runner": subprocess.run, "git_dir": fx.dir, "prepare": lambda r, n, b: ("main", "feature"),
                     "is_held": lambda labels: any("hold" in str(l) for l in labels), "drops": lambda r, n: drops, "union": lambda r, n: None,
-                    "merge": self.merge, "tell": lambda r, n, key, text: self.notices.append((key, text))}
+                    "merge": self.merge, "read": lambda c: sb.review_read(c, fleet_login), "tell": lambda r, n, key, text: self.notices.append((key, text))}
         self.merge_code = merge_code
 
     def merge(self, repo, number):
@@ -132,9 +148,35 @@ class TestMergeOnResolve(unittest.TestCase):
     def test_a_changes_requested_read_after_the_approve_merges_nothing(self):
         self.fx.clean_merge()
         hub = Hub(self.fx)
-        comments = [{"body": "Review of %s: APPROVE" % self.fx.approved[:12]}, {"body": "Review of %s: CHANGES REQUESTED" % self.fx.approved[:12]}]
+        comments = [read_comment(self.fx.approved), read_comment(self.fx.approved, "CHANGES REQUESTED")]
         self.assertEqual(self.run_case(hub, self.fx.view(comments=comments))[0], "skip")
         self.assertEqual(hub.merges, [])
+
+    def test_a_spoofed_approve_from_another_user_merges_nothing_control_first(self):
+        self.fx.clean_merge()
+        spoof = [read_comment(self.fx.approved, user="mallory")]
+        any_author = lambda c: sb.review_read(c, lambda login: True)   # the control: a reader that ignores the author (today's behaviour)
+        hub = Hub(self.fx)
+        hub.ctx["read"] = any_author
+        self.assertEqual(self.run_case(hub, self.fx.view(comments=spoof))[0], "merged")
+        hub = Hub(self.fx)
+        self.assertEqual(self.run_case(hub, self.fx.view(comments=spoof))[0], "skip")
+        self.assertEqual(hub.merges, [])
+        hub = Hub(self.fx)   # the fleet's account without the fleet mark is a plain comment too
+        self.assertEqual(self.run_case(hub, self.fx.view(comments=[read_comment(self.fx.approved, mark="")]))[0], "skip")
+        self.assertEqual(hub.merges, [])
+        hub = Hub(self.fx)   # and the fleet's own signed read still merges
+        self.assertEqual(self.run_case(hub, self.fx.view())[0], "merged")
+
+    def test_a_short_sha_or_a_loose_word_is_not_a_read(self):
+        self.fx.clean_merge()
+        for body in ("Review of %s: APPROVE" % self.fx.approved[:7], "Review of %s: APPROVED" % self.fx.approved,
+                     "Review of %s: approve" % self.fx.approved, "Review of %s: APPROVE (more)" % self.fx.approved,
+                     "Review of %s: APPROVE" % self.fx.approved.upper(), "Review of %s - APPROVE" % self.fx.approved):
+            hub = Hub(self.fx)
+            comment = {"author": {"login": FLEET}, "body": body + MARK}
+            self.assertEqual(self.run_case(hub, self.fx.view(comments=[comment]))[0], "skip", body)
+            self.assertEqual(hub.merges, [])
 
     def test_s5_the_control_and_the_mutant_without_the_tree_comparison(self):
         text = PART.read_text()

@@ -1,28 +1,26 @@
 # ---------------------------------------------------------------- merge on resolve (#2204): an approved pull request whose only change is a clean tip merge merges at once
 #
 # A lane marks a pull request with a label ending `:merge-on-resolve` (the opt-in; docs/switchboard.md). When the pull request holds a recorded strict read
-# (`Review of <sha>: APPROVE`) and every commit after that read's head is a two-parent merge, first-parent chained from the read head, whose second parent is an
+# (`Review of <40 hex>: APPROVE`, posted by the fleet's signed account) and every commit after that read's head is a two-parent merge, first-parent chained from the read head, whose second parent is an
 # ancestor of the integration tip and whose tree equals `git merge-tree --write-tree <p1> <p2>` (a merge git made, no hand resolution), then, with the tip merging
 # clean, `merge-drops` clean and no hold label, the step merges through the lane's own gates (`merge_gate.pass_and_merge`: squash, --match-head-commit) and tells the
 # lane. Every other case is told to the lane ONCE per head, in one line, with its reason. The part reads no name of the entry: the entry hands it `ctx` (docs/architecture.md).
 
 MOR_MARK_SUFFIX = ":merge-on-resolve"
-MOR_TAG = r"^\s*Review of ([0-9a-fA-F]{7,40})\s*[:\-]\s*(CHANGES[ _]REQUESTED|REQUEST[ _]CHANGES|APPROVED?)\b"
 
 
 def mor_marked(labels):
     return any(str(label).lower().endswith(MOR_MARK_SUFFIX) for label in labels or [])
 
 
-def mor_read(comments):
-    """(sha, True) of the LATEST tagged read when it is an APPROVE, (sha, False) when it asks for changes, (None, False) when there is none."""
-    import re
+def mor_read(comments, read):
+    """(sha, True) of the LATEST recorded read when it is an APPROVE, (sha, False) when it asks for changes, (None, False) when there is none. `read(comment)` is the daemon's
+    `review_read`: (sha, verdict) only for a strict read by the fleet's signed account; any other comment is None and is never looked at."""
     found = (None, False)
     for comment in comments if isinstance(comments, list) else []:
-        body = comment.get("body") if isinstance(comment, dict) and isinstance(comment.get("body"), str) else ""
-        tag = re.match(MOR_TAG, body.strip().splitlines()[0], re.I) if body.strip() else None
-        if tag:
-            found = (tag.group(1).lower(), tag.group(2).upper().startswith("APPROVE"))
+        got = read(comment)
+        if got:
+            found = (got[0], got[1] == "APPROVE")
     return found
 
 
@@ -68,7 +66,7 @@ def mor_run(ctx, repo, number, view):
     ctx: runner, git_dir, prepare(repo, number, base) -> (tip ref, head ref), is_held(labels), drops(repo, number), union(repo, number), merge(repo, number) -> (code, lines), tell(repo, number, key, text)."""
     head, ref = view.get("headRefOid"), "%s#%d" % (repo, number)
     labels = [l.get("name") if isinstance(l, dict) else l for l in view.get("labels") or []]
-    approved, ok = mor_read(view.get("comments"))
+    approved, ok = mor_read(view.get("comments"), ctx["read"])
     if view.get("state") != "OPEN" or not approved or not ok or not isinstance(head, str) or head.startswith(approved):
         return "skip", ""
 

@@ -9744,6 +9744,17 @@ def _review_verdict(first_line):
     return m.group(2) if m and m.group(2) in REVIEW_VERDICTS else "UNKNOWN"
 
 
+def review_read(comment, fleet_login):
+    """(sha, verdict) of a comment that is a recorded strict read, else None: the first line is exactly `Review of <40 hex>: <word>` (`REVIEW_STRICT_RE`), the body carries
+    the fleet mark (`signed_by_fleet`) and the author is a fleet account (`fleet_login`, the engine's `_fleet_login`). The author is `user.login` (REST) or `author.login` (`gh pr view`)."""
+    body = comment.get("body") if isinstance(comment, dict) else None
+    if not isinstance(body, str) or not signed_by_fleet(body):
+        return None
+    login = _login(comment) or _login({"user": comment.get("author")})
+    m = REVIEW_STRICT_RE.match(body.split("\n", 1)[0][:300])
+    return (m.group(1), m.group(2)) if m and login and fleet_login(login) else None
+
+
 def _review_lane_member(agents, signer, owner):
     """True when `signer` is the owner or a worker of the owner's lane: the fleet record's `reports_to` (what `_boss_of` reads; there is no
     `boss`, `orchestrator` or `lane` key in it). A signer no agent record names (`agents.get` is None) is NOT a member: its comment is delivered."""
@@ -18459,7 +18470,7 @@ def merge_on_resolve_env(engine):
                 plan_wake_state(engine).facts["merge-on-resolve:%s:%s" % (key, owner)] = (text, now, owner, repo, number)
             else:
                 engine._note("merge_on_resolve.no_recipient", "%s#%d" % (repo, number), {"text": text[:200]})
-        return {"gh": gh, "runner": runner, "git_dir": git_dir, "prepare": prepare, "is_held": gate.is_held, "merge": merge, "tell": tell,
+        return {"gh": gh, "runner": runner, "git_dir": git_dir, "read": lambda comment: review_read(comment, engine._fleet_login), "prepare": prepare, "is_held": gate.is_held, "merge": merge, "tell": tell,
                 "drops": lambda r, n: merge_drops_refusal(runner, config, repo, number, engine.state_dir),
                 "union": lambda r, n: claim_union_refusal(types.SimpleNamespace(pr="%s#%d" % (repo, number), plan=None, ask=None), runner, engine.now)}
     return {"parse": load_module("record_json").parse_bounded, "repos": repos, "marked": marked, "context": context}
