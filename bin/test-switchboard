@@ -1282,7 +1282,9 @@ class TestDeliver(Base):
         self.assertEqual((intent["phase"], result["phase"], result["ok"]), ("intent", "result", True))
         self.assertEqual(intent["detail"]["message_id"], admitted["id"])
         (write,) = self.world.v2.writes
-        self.assertEqual(write["audit_lines"], len(self.world.audit()) - 1)  # the intent was on disk first
+        events = self.world.audit()
+        intent_at = next(i for i, e in enumerate(events) if e["event"] == "v2.synthetic" and e["phase"] == "intent")
+        self.assertEqual(write["audit_lines"], intent_at + 1)  # the intent was on disk first: the write saw every line up to and including it, whatever other lines the pass adds after
         self.world.tick(5)
         self.assertEqual(self.pass_()["sent"], [])  # delivered keys are never sent again
 
