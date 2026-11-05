@@ -66863,6 +66863,7 @@ TestHeldSends = importlib.import_module("test_held_sends").TestHeldSends   # #20
 # The reminder-cancel tests of #1401.
 _reminder_cancel = importlib.import_module("test_reminder_cancel")
 TestCancelKeyRecheck = _reminder_cancel.build(PR4Base)
+TestKeyedReminderSupersede = importlib.import_module("test_keyed_reminder_supersede").build(PR4Base)
 # The lost-worker alert tests of #1481.
 _lost_worker = importlib.import_module("test_lost_worker")
 TestLostWorkerRemembers = importlib.import_module("test_lost_worker_remembers").TestLostWorkerRemembers
