@@ -317,16 +317,74 @@ def build():
 
         def test_a_mutant_that_compares_the_wakes_stored_hash_without_canonical_hash_fails(self):
             with tempfile.TemporaryDirectory() as tmp:
-                msb = _entry_copy(tmp, "fleet-switchboard",
+                msb = _entry_copy(tmp, "switchboard/plan_notice.py",
                                   "check_module.canonical_hash(plan_hash, hashes) in {check_module.canonical_hash(h, hashes) for h in consensus}", "plan_hash in consensus")
                 with self.assertRaisesRegex(AssertionError, r"plan posted on #3: \S+ sha256:[0-9a-f]{64}, plan check (PASS|FAIL)"):   # the line the mutated wake announces for a plan approved at the old hash (triage_plan_open.line)
                     self.assertEqual(self.scenario(msb.triage_pass, "old"), [])
+
+        COMMENT_OLD = "any(module.approved_by_comment(plan, h, by_issue.get(number, []), signed_by_fleet) for h in hashes)"
+        SEND_OLD = "any(module.approved_by_send(plan, h, sends, signed_by_fleet) for h in hashes)"
+        ANNOUNCED = r"plan posted on #3: \S+ sha256:[0-9a-f]{64}, plan check (PASS|FAIL)"   # the line the wake produces for an announced plan (triage_plan_open.line)
+
+        def approval(self, run, form, cited):
+            """The wake over a marker-bearing plan with an approval of `form` (comment or send) citing `cited` (old, new or edited); the lines sent to orch."""
+            self.post(3, self.plan(), agent="fleet-registry")
+            body = self.comments[-1]["body"]
+            hashes = {"old": sb.plan_check.plan_hash_legacy(body), "new": sb.plan_check.plan_hash(body),
+                      "edited": sb.plan_check.plan_hash_legacy(body.replace("\n" + MARKER, "") + "\nedited")}
+            self.assertNotEqual(hashes["old"], hashes["new"])
+            full = hashes[cited].split(":")[1]
+            if form == "comment":
+                self.post(3, "Plan approved at sha256:%s" % full[:8], agent="orch", minutes_ago=1)
+            else:
+                self.send("Approved at sha256:%s" % full)
+            self.world.tick(1)
+            run(self.engine, [], self.world.clock.now(), ())
+            return self.to("orch")
+
+        def test_an_approval_comment_at_the_old_hash_is_read_as_bound_by_the_wake(self):
+            self.assertEqual(self.approval(sb.triage_pass, "comment", "old"), [], "an approval comment at the old hash is not read as bound")
+
+        def test_control_an_approval_comment_at_the_new_hash_is_read_as_bound_by_the_wake(self):
+            self.assertEqual(self.approval(sb.triage_pass, "comment", "new"), [])
+
+        def test_an_approval_comment_at_the_hash_of_an_edited_text_is_not_an_approval(self):
+            self.assertEqual(len(self.approval(sb.triage_pass, "comment", "edited")), 1)
+
+        def test_an_audited_send_at_the_old_hash_is_read_as_bound_by_the_wake(self):
+            self.assertEqual(self.approval(sb.triage_pass, "send", "old"), [], "an audited send at the old hash is not read as bound")
+
+        def test_control_an_audited_send_at_the_new_hash_is_read_as_bound_by_the_wake(self):
+            self.assertEqual(self.approval(sb.triage_pass, "send", "new"), [])
+
+        def test_an_audited_send_at_the_hash_of_an_edited_text_is_not_an_approval(self):
+            self.assertEqual(len(self.approval(sb.triage_pass, "send", "edited")), 1)
+
+        def test_a_mutant_that_gives_the_comment_finder_the_new_hash_only_fails(self):
+            self.assertEqual(self.approval(sb.triage_pass, "comment", "old"), [])   # the control: the unmutated copy passes the old-hash test
+            with tempfile.TemporaryDirectory() as tmp:
+                msb = _entry_copy(tmp, "switchboard/plan_notice.py", self.COMMENT_OLD, "module.approved_by_comment(plan, plan_hash, by_issue.get(number, []), signed_by_fleet)")
+                with self.assertRaisesRegex(AssertionError, self.ANNOUNCED):
+                    self.assertEqual(self.approval(msb.triage_pass, "comment", "old"), [])
+
+        def test_a_mutant_that_gives_the_send_finder_the_new_hash_only_fails(self):
+            self.assertEqual(self.approval(sb.triage_pass, "send", "old"), [])   # the control: the unmutated copy passes the old-hash test
+            with tempfile.TemporaryDirectory() as tmp:
+                msb = _entry_copy(tmp, "switchboard/plan_notice.py", self.SEND_OLD, "module.approved_by_send(plan, plan_hash, sends, signed_by_fleet)")
+                with self.assertRaisesRegex(AssertionError, self.ANNOUNCED):
+                    self.assertEqual(self.approval(msb.triage_pass, "send", "old"), [])
 
     only_own_tests(TestPlanHashMarkerWake)
 
     class TestPlanHashMarkerRounds(host.TestPlanReviewCommands):
         """S9, S11: the commands of a review round, each run through the entry with the fixtures of TestPlanReviewCommands."""
+        S12_CALLS = {}
         PREDATES = "this round predates the hash pair: start a new round"
+
+        def setUp(self):
+            snapshot = dict(os.environ)   # the commands below write HERDR_PANE_ID and HERDR_WORKSPACE_ID: put the environment back after each test
+            self.addCleanup(lambda: (os.environ.clear(), os.environ.update(snapshot)))
+            super().setUp()
 
         def signed_plan(self):
             self.plan_issue["body"] = host.LEDGER_PLAN + "\n" + MARKER
@@ -523,6 +581,100 @@ def build():
             self.assertTrue(all(e.get("review") == got["review"] for e in self.ledger()[before:]))
             session = [e["session"] for e in self.ledger() if e["kind"] == "lane_session"][0]
             self.assertIn("is a reviewer lane", sb.review_lane_send_problem({"plan_review": {"enabled": True}}, session, "orch"), "the send check reads the round as open")
+
+        # -- S12: abandon and report on a round without the pair
+
+        PLAN_ROUTE = re.compile(r"/issues/\d+(/comments)?(\?.*)?$")   # the plan's routes: the issue itself and the comments of the plan's issue
+
+        def count_calls(self):
+            """Wrap the fake's one entry point (self.route: every gh call and the engine's reader pass it) so EVERY call, of every route and method, is recorded."""
+            calls = []
+            real_route = self.route
+
+            def counting(argv, **kwargs):
+                calls.append(list(argv))
+                return real_route(argv, **kwargs)
+            self.route = counting
+            return calls
+
+        def plan_reads(self, calls):
+            return [c for c in calls if c and c[0] == host.FAKE_GH and any(self.PLAN_ROUTE.search(str(x)) for x in c[1:])]
+
+        def assert_no_plan_reads(self, calls):
+            reads = self.plan_reads(calls)
+            print("S12: %d calls in all, %d plan reads" % (len(calls), len(reads)))
+            self.assertEqual(reads, [], "0 plan reads of %d calls in all" % len(calls))
+
+        def abandon_and_report(self, got, rnd, expect_pair):
+            """Run report then abandon on the round; assert the S12 pass line and return the report."""
+            self.assertEqual("plan_hashes" in rnd, expect_pair)
+            for lane in rnd["lanes"][:2]:
+                self.inject(self.lane_entry(got["review"], rnd, lane, rnd["plan_hash"]))
+            before = len(self.ledger())
+            calls = self.count_calls()
+            code, out, err = self.review("orch", "report", got["review"], "--json")
+            self.assertEqual(code, 0, err)
+            rep = json.loads(out)
+            self.assertEqual([r["round"] for r in rep["rounds"]], [1])
+            self.assertEqual(sorted(rep["rounds"][0]["lanes"]), sorted(rnd["lanes"][:2]), "1 report printed with the round and its lanes")
+            self.assertEqual(len(self.ledger()), before, "report writes nothing")
+            code, out, err = self.review("cos", "abandon", got["review"], "--reason", "the round predates the pair; closed by the lane", "--json")
+            self.assertEqual(code, 0, err)
+            self.assertEqual(len(self.kinds("abandoned")), 1, "1 abandoned entry written")
+            self.assertEqual(json.loads(out)["abandoned"], got["review"])
+            self.assert_no_plan_reads(calls)
+            self.S12_CALLS[expect_pair] = len(calls)
+            if len(self.S12_CALLS) == 2:
+                self.assertEqual(self.S12_CALLS[True], self.S12_CALLS[False], "the control makes the same count of calls")
+            added = self.ledger()[before:]
+            self.assertTrue(added and all(e["kind"] in ("abandoned", "decision") for e in added))
+            self.assertEqual([e for e in added if "plan_hash" in e or "plan_hashes" in e], [], "0 plan hashes written")
+            self.assertEqual(self.kinds("abandoned")[0]["round"], 1)
+            return rep
+
+        def test_abandon_and_report_run_on_a_round_without_the_pair_and_a_new_round_can_start(self):
+            got = self.start_round(legacy=True)
+            rnd = self.kinds("round")[-1]
+            self.abandon_and_report(got, rnd, expect_pair=False)
+            self.assertEqual(self.start(who="cos")[0], 0, "1 new round started after the abandon")
+            self.assertEqual(len(self.kinds("round")), 2)
+
+        def test_abandon_and_report_run_on_the_frozen_literal_round_and_a_new_round_can_start(self):
+            got = self.frozen_round()
+            rnd = self.kinds("round")[-1]
+            self.abandon_and_report(got, rnd, expect_pair=False)
+            self.assertEqual(self.start(who="cos")[0], 0, "1 new round started after the abandon")
+
+        def test_the_control_abandon_and_report_behave_the_same_on_a_round_started_after_the_change(self):
+            got = self.start_round()
+            rnd = self.kinds("round")[-1]
+            self.abandon_and_report(got, rnd, expect_pair=True)
+            self.assertEqual(self.start(who="cos")[0], 0)
+
+        def test_a_mutant_abandon_that_reads_the_plan_through_the_comments_route_is_seen_by_the_count(self):
+            got = self.start_round(legacy=True)
+            args = ["plan", "review", "abandon", got["review"], "--reason", "the round predates the pair; closed by the lane", "--json"]
+
+            def run(module):
+                calls = self.count_calls()
+                with captured() as (out, err), mock.patch.object(module, "owner_terminal_problem", lambda *a, **k: None), mock.patch.object(sys, "stdin", io.StringIO("")):
+                    os.environ["HERDR_PANE_ID"] = self.world.panes["cos"]
+                    code = module.main(args, runner=self.route, now=self.world.clock.now, wait=lambda sock, seconds: False, socket_call=self.world.herdr.socket)
+                self.assertEqual(code, 0, err.getvalue() if hasattr(err, "getvalue") else err)
+                return calls
+            self.assert_no_plan_reads(run(sb))   # the control first: the unmutated abandon reads no plan
+            self.assertEqual(len(self.kinds("abandoned")), 1)
+            with tempfile.TemporaryDirectory() as tmp:
+                msb = _entry_copy(tmp, "switchboard/plan_review.py", "    rnd = _round_of(entries, args.review)\n    if _abandoned(entries, args.review):\n",
+                                  "    rnd = _round_of(entries, args.review)\n    runner([load_config()[\"gh\"], \"api\", \"repos/acme/app/issues/7/comments\"])\n    if _abandoned(entries, args.review):\n")
+                # the review is already abandoned by the control: the mutant still reads the plan before it refuses, and the read is counted once
+                calls = self.count_calls()
+                with captured() as (out, err), mock.patch.object(msb, "owner_terminal_problem", lambda *a, **k: None), mock.patch.object(sys, "stdin", io.StringIO("")):
+                    os.environ["HERDR_PANE_ID"] = self.world.panes["cos"]
+                    msb.main(args, runner=self.route, now=self.world.clock.now, wait=lambda sock, seconds: False, socket_call=self.world.herdr.socket)
+                self.assertEqual(len(self.plan_reads(calls)), 1, "the mutant's read is applied exactly once")
+                with self.assertRaisesRegex(AssertionError, "0 plan reads of"):
+                    self.assert_no_plan_reads(calls)
 
         # -- S11: a round without a pair
 
@@ -737,6 +889,11 @@ def build_late():
 
     class TestPlanHashMarkerLaunch(host.TestLaunchGate):
         """The G0b read of a consensus record, through the real `launch`."""
+
+        def setUp(self):
+            snapshot = dict(os.environ)   # launch_in writes HERDR_WORKSPACE_ID and pops HERDR_PANE_ID: put the environment back after each test
+            self.addCleanup(lambda: (os.environ.clear(), os.environ.update(snapshot)))
+            super().setUp()
 
         def signed(self):
             self.plan_issue["body"] = host.LEDGER_PLAN + "\n" + MARKER

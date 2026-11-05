@@ -1,51 +1,10 @@
 """Shared fakes and helpers of bin/test-switchboard (moved text, unchanged): wire_fakes."""
-import argparse
 import ast
-import traceback
-import base64
-import calendar
-import collections
-import contextlib
-import errno
 import copy
-import datetime as _dt
-import fcntl
-import gzip
-import fnmatch
-import hashlib
-import hmac
-import importlib.machinery
-import importlib.util
-import inspect
-import http.client
-import io
-import itertools
-import select
 import json
-import os
 from pathlib import Path
 import re
-from urllib.parse import unquote
-import shlex
-import shutil
-import textwrap
-import zipfile
-import signal
-import socket
-import stat
-import tarfile
 import subprocess
-import sys
-import sysconfig
-import tempfile
-import threading
-import time
-import types
-import unittest
-import uuid
-import urllib.parse
-from unittest import mock
-from support.paths import BIN, REPO
 from support.core import FakeRunner
 from support.loader import sb
 
@@ -84,7 +43,14 @@ def herdr_typing_violations(source):
     for node in ast.walk(tree):
         if isinstance(node, ast.Constant) and node.value == "--focus" and not any(node is inner for inner in allowed):
             found.append("--focus outside HerdrClient.workspace_create")
+    # an audit action name (`audit.append(actor, "pane.undecidable", ...)`) is a log line's name, never a herdr method
+    audit_actions = {call.args[1].value for call in ast.walk(tree)
+                     if isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute) and call.func.attr == "append"
+                     and isinstance(call.func.value, ast.Attribute) and call.func.value.attr == "audit"
+                     and len(call.args) > 1 and isinstance(call.args[1], ast.Constant) and isinstance(call.args[1].value, str)}
     for token in tokens:  # the socket: any herdr method but the one allowed is a way in
+        if token in audit_actions:
+            continue
         if re.match(r"^(agent|pane|tab|workspace|terminal|layout|window|input)\.", token) \
                 and token not in SOCKET_ALLOWED:
             found.append("socket method %s" % token)
@@ -770,7 +736,7 @@ class FakeV2:
 
 HERDR_ALLOWED = (["agent", "list"], ["agent", "get"], ["pane", "report-metadata"], ["notification", "show"],
                  ["pane", "process-info"], ["pane", "close"], ["workspace", "list"], ["workspace", "create"],
-                 ["plugin", "list"], ["pane", "get"], ["pane", "read"], ["tab", "close"], ["tab", "get"], ["tab", "list"])  # PR 16; #973: the bell migration reads the tab labels once; the control plane reads a pane and closes a stale tab: `status` reads herdr's plugin list; `bootstrap` makes a workspace
+                 ["plugin", "list"], ["pane", "get"], ["pane", "read"], ["tab", "close"], ["tab", "get"], ["tab", "list"], ["pane", "list"])  # PR 16; #973: the bell migration reads the tab labels once; the control plane reads a pane and closes a stale tab: `status` reads herdr's plugin list; `bootstrap` makes a workspace
 
 
 SOCKET_ALLOWED = ("layout.apply",)
