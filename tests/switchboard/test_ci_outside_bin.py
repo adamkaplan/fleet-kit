@@ -42,6 +42,7 @@ def problems(list_text, files, workflow_text, chain_texts, runner_sources):
             out.append("no workflow step runs: " + script)
         chained |= {l.strip() for l in chain_texts.get(chain, "").splitlines() if l.strip()}
     named = set()
+    discovered = [r for r in loaders if 'bind_discovered(__name__, ' in runner_sources.get(r, "") and '"tests" / "switchboard"' in runner_sources.get(r, "")]   # #2206: a runner that self-registers the Test* classes of tests/switchboard/ names no module
     for runner in loaders:
         named |= {n.value for n in ast.walk(ast.parse(runner_sources.get(runner, ""))) if isinstance(n, ast.Constant) and isinstance(n.value, str)}
     for path, step in sorted(run.items()):
@@ -52,7 +53,7 @@ def problems(list_text, files, workflow_text, chain_texts, runner_sources):
             out.append("exempt without a reason: " + path)
     for f in files:
         stem = f.rsplit("/", 1)[-1]
-        by_loader = f.endswith(".py") and (stem[:-3] in named or stem in named)
+        by_loader = f.endswith(".py") and (stem[:-3] in named or stem in named or (bool(discovered) and re.fullmatch(r"tests/switchboard/test_[^/]*\.py", f) is not None))
         if f not in chained and not by_loader and f not in run and f not in exempt:
             out.append("not in the CI outside-bin list: " + f)
     for path in list(run) + list(exempt):

@@ -3712,7 +3712,8 @@ class TestRestartGuard(Base):
     def test_send_is_refused_for_such_a_pane(self):
         self.wrong_program()
         outcome = self.world.new_engine("cli").send("coder", "platform", "hi")
-        self.assertEqual(outcome["action"], "hold")
+        self.assertFalse(outcome["sent"])
+        self.assertIn(outcome["action"], ("hold", "held"))   # #2051: a send to a held agent is kept until it unblocks, not refused outright
         self.assertEqual(self.world.v2.writes, [])
 
     def test_a_pane_that_cannot_be_read_is_held_not_assumed_fine(self):
