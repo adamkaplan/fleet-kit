@@ -7,6 +7,7 @@ STATUS = {"working": "working", "idle": "idle", "done": "idle", "blocked": "bloc
 READ_LIMIT = 200    # transcript messages per read, newest first
 SINCE_SLACK = 60    # seconds read back beyond the oldest fact, for clock skew
 MESSAGE_CAP = 4000  # characters in one delivered message
+SEND_PART_BUDGET = MESSAGE_CAP - 800   # characters of one part's text: the room left for the part line, the delivery header and the ask's lines
 HELD_TOAST_AFTER = 15 * 60  # seconds an item is held before you get a toast
 
 

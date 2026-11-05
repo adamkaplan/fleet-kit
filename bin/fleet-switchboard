@@ -12616,7 +12616,6 @@ def _send_by_registry(args, runner, now):
     return EXIT_OK
 
 
-SEND_PART_BUDGET = MESSAGE_CAP - 800   # characters of one part's text: the room left for the part line, the delivery header and the ask's lines
 
 
 def part_label(n, total):
