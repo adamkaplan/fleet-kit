@@ -1,51 +1,10 @@
 """Shared fakes and helpers of bin/test-switchboard (moved text, unchanged): fake_hubs."""
-import argparse
-import ast
-import traceback
-import base64
-import calendar
-import collections
-import contextlib
-import errno
-import copy
-import datetime as _dt
-import fcntl
-import gzip
-import fnmatch
-import hashlib
-import hmac
-import importlib.machinery
-import importlib.util
-import inspect
-import http.client
-import io
-import itertools
-import select
 import json
-import os
 from pathlib import Path
 import re
 from urllib.parse import unquote
-import shlex
-import shutil
-import textwrap
-import zipfile
-import signal
-import socket
-import stat
-import tarfile
-import subprocess
-import sys
-import sysconfig
-import tempfile
-import threading
-import time
-import types
-import unittest
-import uuid
-import urllib.parse
 from unittest import mock
-from support.paths import BIN, REPO
+from support.paths import REPO
 from support.loader import sb
 
 
@@ -151,6 +110,9 @@ class FakeTriageHub:
         self.fail = []   # path fragments whose list reads fail (one kind of unit at a time)
         self.timelines, self.cut = {}, set()   # (repo, number) -> [timeline events] (#576); numbers whose timeline page is not the whole timeline
         self.cut_open = {}                     # #851: repo -> how many open issues its list read returns before it is cut (the read says it is not whole)
+
+    def read_open_pages(self, path):
+        return self.read_pages(path, cap=sb.OPEN_LIST_PAGES)
 
     def read_pages(self, path, key=None, timeout=None, older=None, cap=None):
         self.calls.append(path)

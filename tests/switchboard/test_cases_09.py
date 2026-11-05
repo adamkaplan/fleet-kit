@@ -666,7 +666,7 @@ class TestItemVerdicts(unittest.TestCase):
         launch = sb.load_launch_testers().launched(self.fleets, self.sessions, self.REPO, lambda f: f.get("repo"), {})
         with mock.patch.object(sb, "build_engine", lambda *a, **k: (ctx.engine, self.state, {"intent_repo": self.REPO})), mock.patch.object(sb, "pr_picture", lambda *a: picture), \
                 mock.patch.object(sb, "identify_caller", lambda *a: caller), mock.patch.object(sb, "checked_plan", lambda *a, **k: self.plan), \
-                mock.patch.object(sb, "launched_testers_for", lambda c: (launch, self.sessions, self.fleets)), mock.patch.object(sb, "gates_caller_kind", lambda *a: ("agent", "x", "chief-of-staff")):
+                mock.patch.object(sb, "launched_testers_for", lambda c, role="tester": (launch, self.sessions, self.fleets)), mock.patch.object(sb, "gates_caller_kind", lambda *a: ("agent", "x", "chief-of-staff")):
             try:
                 with captured() as (out, err):
                     code = getattr(sb, command)(args, None, self.now)

@@ -92,6 +92,10 @@ class Base(unittest.TestCase):
         self.sleepfile.write_text(environ.get("FAKE_WHOAMI_SLEEP", "0"))
         if self.calls.exists():
             self.calls.unlink()
+        if shim == SHIM:   # #1696: the shim reads the merge gate config from the account's real home; this run's gate home is the rig's own (no merge_gate entry)
+            shutil.copytree(str(SHIM.parent), str(self.home / "hermetic"), dirs_exist_ok=True)
+            shim = self.home / "hermetic" / "gh"
+        shim.write_text(shim.read_text().replace("MG_HOME = None", "MG_HOME = %r" % str(self.home), 1))
         done = subprocess.run([sys.executable, str(shim), *args], capture_output=True, text=True, env=environ, timeout=60)
         return done, self.recorded()
 
@@ -404,6 +408,23 @@ class TestAudit(Base):
         self.refused("pr", "merge", "7", "--surprise-flag", "x", "-R", CFG_REPO)               # a refusal other than the label one
         self.assertEqual([r["outcome"] for r in self.audit()], ["refused"])
 
+    def test_the_write_audit_names_the_reduced_endpoint_of_an_api_write_passed_or_refused(self):
+        self.run_gh("api", "-X", "PUT", "repos/acme-org/other-repo/pulls/12/merge?secretq=zzq", "-f", "body=bodytext_zz")
+        self.config({"acme-org/widget-api": {"label": LABEL, "message": MESSAGE}})
+        self.refused("api", "-X", "PUT", "repos/%s/pulls/7/merge?qq=zzq" % CFG_REPO, "-f", "sha=bodytext_zz")
+        rows = self.audit()
+        self.assertEqual([(r["outcome"], r["endpoint"]) for r in rows], [("passed", "api pulls/#/merge"), ("refused", "api pulls/#/merge")])
+        raw = (self.audit_dir / "gh-writes.jsonl").read_text()
+        for leak in ("zzq", "bodytext_zz", "secretq"):
+            self.assertNotIn(leak, raw)
+
+    def test_an_unknown_api_write_path_stays_refused_and_its_audit_line_names_the_reduced_endpoint(self):
+        done, calls = self.run_gh("api", "-X", "POST", "repos/acme/app/actions/runs/123/rerun")
+        self.assertNotEqual(done.returncode, 0)
+        self.assertEqual(self.writes(), [])                                                    # the real gh never ran
+        rows = self.audit()
+        self.assertEqual([(r["outcome"], r["verb"], r["endpoint"]) for r in rows], [("refused", "api POST", "api actions/runs/#/rerun")])
+
     def test_s12_no_command_line_value_is_audited_and_an_unwritable_audit_changes_nothing(self):
         token, text = "ghp_" + "a1b2c3d4e5f6" * 3, "free text that must stay out"
         self.run_gh("api", "-X", "POST", "repos/acme-org/other-repo/issues/3/comments", "-f", "body=%s %s" % (token, text), "-H", "Authorization: token " + token,
@@ -413,7 +434,7 @@ class TestAudit(Base):
         for leak in (token, text, "Authorization"):
             self.assertNotIn(leak, raw)
         for row in map(json.loads, raw.splitlines()):
-            self.assertEqual(sorted(row), ["caller", "number", "outcome", "repo", "ts", "verb"])
+            self.assertEqual(sorted(row), ["caller", "endpoint", "number", "outcome", "repo", "ts", "verb"] if row["verb"].startswith("api ") else ["caller", "number", "outcome", "repo", "ts", "verb"])
         (self.audit_dir / "gh-writes.jsonl").unlink()
         (self.audit_dir / "gh-writes.jsonl").mkdir()                                              # the audit cannot be opened
         done, _ = self.run_gh("pr", "merge", "7", "-R", "acme-org/other-repo")

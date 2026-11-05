@@ -399,19 +399,24 @@
         "bin/agent_calls.py",
         "bin/agent_presence.py",
         "bin/awaiting_live.py",
+        "bin/ci_fresh.py",
         "bin/ci_runs.py",
+        "bin/cloud_client.py",
         "bin/cloud_worker.py",
         "bin/cpu_guard.py",
         "bin/dead_hint.py",
         "bin/decision_core.py",
         "bin/decision_sync.py",
         "bin/disk_janitor.py",
+        "bin/endpoint_send.py",
         "bin/fleet_health.py",
         "bin/header_cache.py",
         "bin/heavy_slots.py",
         "bin/item_verdicts.py",
         "bin/plan_review.py",
         "bin/pr_events.py",
+        "bin/pr_reading.py",
+        "bin/push_watch.py",
         "bin/queue_ejections.py",
         "bin/record_json.py",
         "bin/reassign.py",
@@ -422,8 +427,11 @@
         "bin/spotlight_guard.py",
         "bin/triage_digest.py",
         "bin/turn_start.py",
+        "bin/queued_wait.py",
+        "bin/unconsumed_record.py",
         "bin/work_sync.py",
         "bin/switchboard/plan_input.py",
+        "bin/switchboard/observing.py",
         "bin/switchboard/v2_transport.py",
         "bin/switchboard/facts.py",
         "bin/switchboard/import_v1.py",
@@ -438,10 +446,26 @@
         "bin/switchboard/decision.py",
         "bin/switchboard/engine.py",
         "bin/switchboard/jev.py",
+        "bin/switchboard/faults.py",
+        "bin/switchboard/shadow_classifier.py",
+        "bin/switchboard/worktree_lifecycle.py",
+        "bin/switchboard/review_laws.py",
+        "bin/switchboard/job_runs.py",
+        "bin/switchboard/standing_authority.py",
         "bin/switchboard/secret_spans.py",
         "bin/switchboard/caches.py",
         "bin/switchboard/profile_pieces.py",
-        "bin/switchboard/installer.py"
+        "bin/switchboard/installer.py",
+        "bin/switchboard/stage_event.py",
+        "bin/switchboard/scratch_dir.py",
+        "bin/switchboard/docker_reaper.py",
+        "bin/switchboard/workers_report.py",
+        "bin/switchboard/batch_decision.py",
+        "bin/switchboard/sweep.py",
+        "bin/switchboard/plan_notice.py",
+        "bin/switchboard/heavy_budget.py",
+        "bin/switchboard/config_reload.py",
+        "bin/switchboard/labels_ensure.py"
       ],
       "daemon_file": "bin/fleet-switchboard",
       "module_roots": {
@@ -452,6 +476,18 @@
           "*"
         ],
         "bin/turn_start.py": [
+          "*"
+        ],
+        "bin/ci_fresh.py": [
+          "*"
+        ],
+        "bin/pr_reading.py": [
+          "*"
+        ],
+        "bin/queued_wait.py": [
+          "*"
+        ],
+        "bin/unconsumed_record.py": [
           "*"
         ],
         "bin/awaiting_live.py": [
@@ -470,6 +506,12 @@
           "latest_runs",
           "newest",
           "own_repo"
+        ],
+        "bin/cloud_client.py": [
+          "*"
+        ],
+        "bin/endpoint_send.py": [
+          "*"
         ],
         "bin/cloud_worker.py": [
           "read_record_file"
@@ -502,6 +544,9 @@
         "bin/queue_ejections.py": [
           "validate"
         ],
+        "bin/push_watch.py": [
+          "settings"
+        ],
         "bin/reassign.py": [
           "*"
         ],
@@ -524,6 +569,19 @@
           "load_plan",
           "parse_plan_source",
           "plan_comment_choice"
+        ],
+        "bin/switchboard/observing.py": [
+          "Discovery",
+          "Observation",
+          "_created",
+          "_fleet_keys",
+          "_fleet_meta",
+          "_seconds",
+          "agent_session",
+          "iso",
+          "program_version",
+          "resolve_program",
+          "runs_program"
         ],
         "bin/switchboard/v2_transport.py": [
           "V2Breaker",
@@ -560,15 +618,20 @@
           "add_reminder",
           "alert_stale",
           "alert_subject",
+          "delayed_text",
           "digest_replaced",
           "drop_superseded_item",
           "found_reason",
           "is_digest",
           "judge_delivery",
+          "merge_reminder_copies",
           "merge_wake",
           "merge_wake_facts",
+          "pass_stale",
+          "pass_subject",
           "read_record_file",
           "read_reminders",
+          "reminder_bound",
           "reminders_lock",
           "remove_reminders",
           "wake_class_of",
@@ -641,6 +704,7 @@
           "MessageTooLong",
           "Plan",
           "_line_of",
+          "clock_day",
           "clock_utc",
           "collapse_riders",
           "compose",
@@ -648,13 +712,16 @@
           "decide",
           "delayed_since",
           "describe_items",
+          "finding_part",
+          "finding_parts",
           "hold_reason",
           "in_late_scope",
           "is_withdrawal",
           "orders_note",
           "sent_at",
           "steers_into_turn",
-          "superseded_by"
+          "superseded_by",
+          "text_parts"
         ],
         "bin/switchboard/engine.py": [
           "KeyTimes",
@@ -678,6 +745,66 @@
           "locate_jev_key",
           "validate_jev_config"
         ],
+        "bin/switchboard/faults.py": [
+          "FaultError",
+          "SimulatedCrash",
+          "active_faults",
+          "fault"
+        ],
+        "bin/switchboard/shadow_classifier.py": [
+          "_ask_of"
+        ],
+        "bin/switchboard/worktree_lifecycle.py": [
+          "_git",
+          "_unregister_worktree",
+          "read_worktrees",
+          "reclaim_for_agent",
+          "reclaim_worktree",
+          "validate_worktree_config",
+          "worktree_config",
+          "worktree_facts",
+          "worktree_in_use",
+          "worktree_session_in_use",
+          "worktree_session_index",
+          "worktree_sweep"
+        ],
+        "bin/switchboard/review_laws.py": [
+          "_private_parse",
+          "_review_pr",
+          "block_table_text",
+          "local_review_overlay",
+          "parse_files_read_row",
+          "parse_review_block",
+          "pr_changed_bounds",
+          "pr_changed_paths",
+          "rating_inputs",
+          "record_inputs",
+          "review_law_files",
+          "review_laws_text",
+          "whole_read_problem"
+        ],
+        "bin/switchboard/job_runs.py": [
+          "JobFacts",
+          "boot_time",
+          "job_age",
+          "job_end_reason",
+          "job_last_seen",
+          "job_paths",
+          "job_private",
+          "job_process_token",
+          "job_read",
+          "job_record_end",
+          "job_state",
+          "jobs_dir"
+        ],
+        "bin/switchboard/standing_authority.py": [
+          "_legacy_authority",
+          "_orders_section",
+          "fetch_charter_body",
+          "fetch_orders",
+          "parse_orders",
+          "section_orders"
+        ],
         "bin/switchboard/secret_spans.py": [
           "_secret_position",
           "find_secret_span",
@@ -693,6 +820,71 @@
         ],
         "bin/switchboard/installer.py": [
           "reaper_only_conflict"
+        ],
+        "bin/switchboard/stage_event.py": [
+          "stage_check_config"
+        ],
+        "bin/switchboard/scratch_dir.py": [
+          "ScratchBoundFacts",
+          "scratch_bytes"
+        ],
+        "bin/switchboard/docker_reaper.py": [
+          "DockerReapFacts",
+          "Fact",
+          "HeavyOrphanFacts",
+          "TempJanitorFacts",
+          "_docker_executable",
+          "_docker_inspect",
+          "_docker_labelled",
+          "_docker_problem",
+          "_docker_run",
+          "docker_reap",
+          "fact_sources",
+          "janitor_apply_allowed",
+          "lab_fact_source",
+          "read_janitor_record"
+        ],
+        "bin/switchboard/workers_report.py": [
+          "ReportError",
+          "ask_report_owed",
+          "assigning_input",
+          "report_jev",
+          "report_owed_questions",
+          "report_owed_state",
+          "triage_stop",
+          "validate_report_triage_config"
+        ],
+        "bin/switchboard/batch_decision.py": [
+          "boss_name",
+          "numbered_lines",
+          "resolve_boss",
+          "synthetic_lines",
+          "transcript_lines"
+        ],
+        "bin/switchboard/sweep.py": [
+          "SweepFacts",
+          "sweep_ref_of",
+          "validate_sweep_config"
+        ],
+        "bin/switchboard/plan_notice.py": [
+          "PlanWakeFacts"
+        ],
+        "bin/switchboard/heavy_budget.py": [
+          "SourceBudget",
+          "_cloud_boss",
+          "cloud_sender",
+          "set_source_state",
+          "source_budget_seconds",
+          "validate_load_alert_config",
+          "validate_source_budgets"
+        ],
+        "bin/switchboard/config_reload.py": [
+          "load_runnable_config"
+        ],
+        "bin/switchboard/labels_ensure.py": [
+          "ensure_labels",
+          "label_names",
+          "read_open_items"
         ]
       },
       "registrar_allow": {
@@ -812,22 +1004,22 @@
       "closure_exempt": {
         "bin/agent_reconcile.py": "loaded only by `reconcile_agents_on_read`, called by `cmd_status`'s view reconcile, which the clear never calls",
         "bin/closed_labels.py": "loaded only by `publish_decisions` (the decision list), which the clear never calls",
-        "bin/cloud_client.py": "loaded only by `_send_by_registry` (the send command's registry route), which delivers a message to a registry endpoint; the clear never calls it",
         "bin/cloud_end_alert.py": "loaded only by `cloud_end_tick` and `cloud_turn_tick` (via `load_module`), both called only by `finish_pass` (after `cloud_watch_tick`), not by the clear",
+        "bin/pod_silence.py": "loaded only by `pod_silence_tick` (via `load_module`), called only by `finish_pass` (after `cloud_turn_tick`), not by the clear",
         "bin/cloud_relay_daemon.py": "loaded only by `run_daemon`'s pass loop (`pass_if_configured`), not by the clear; it is still a top tier authority path (it writes ledger entries), so this lists only that the clear cannot reach it",
-        "bin/endpoint_send.py": "loaded only by `_send_by_registry` (the send command's registry route), which delivers a message to a registry endpoint; the clear never calls it",
         "bin/external_adapter.py": "loaded only by the external-decision adapter path, which the clear does not run",
         "bin/health_records.py": "loaded only by the health and pane pass, which the clear does not run",
         "bin/lanes.py": "loaded only by `cmd_move`: the lane command, not the clear",
         "bin/launch_brief_check.py": "loaded only by `launch_brief_mismatch`, the launch-time reader of the brief (#1350), which the clear cannot reach",
         "bin/launch_testers.py": "loaded only by the tester launch command, not the clear",
         "bin/merged_labels.py": "loaded only by `publish_decisions` (the decision list), which the clear never calls",
+        "bin/open_list_alert.py": "loaded only by `open_list_alert` (the open-item list cut alert), called only by `publish_decisions` and `sweep_refresh`, which the clear never calls",
         "bin/orders_copy.py": "loaded only by `cmd_orders_copy`, not the clear",
         "bin/path_suites.py": "loaded only by the gates finding (an information line), `heavy --changed`/`--list` and `preflight-pr --merged`: the suite map and its runs, not the clear",
         "bin/plan_approval.py": "loaded only by `check_approval`, the send command's approval check (#951), which the clear never calls",
-        "bin/pr_reading.py": "loaded only by `cmd_merge_gate`: the merge gate command, not the clear",
         "bin/resume_brief.py": "loaded only by `cmd_launch`, not the clear",
         "bin/review_checkout.py": "loaded only by `cmd_review_checkout`, the reviewer checkout command, not the clear",
+        "bin/tester_agent.py": "loaded only by the launch refusal of a tester, not the clear",
         "bin/triage_ownerless.py": "loaded only by the triage passes, which the clear does not run",
         "bin/triage_plan_open.py": "loaded only by the triage plan-open pass, which the clear does not run"
       }

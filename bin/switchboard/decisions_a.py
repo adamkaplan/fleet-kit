@@ -605,9 +605,6 @@ def facts_text(entry):
 LABEL_HOLD_KEEP_SECONDS = 86400   # a row kept because its list is cut or gone is dropped after a day (a pull request that merged meanwhile does not stay)
 
 
-LABEL_HOLD_LIST_CUT = 200   # the daemon's open-pull-request list is read to 2 pages of 100: a list this long may be cut
-
-
 def label_hold_entries(engine, now, noticed, escalated, in_play):
     """#641: [(order, entry, key)] for the open pull requests that carry the fleet's hold labels (`merge-captain` or a `hold-*`) and have NO recorded notice: a decision row on the labels
     alone, with its head and its hold reasons. Read from the open-pull-request list the daemon ALREADY holds (the ci recorder's: no read of its own, none per pull request), so only the
@@ -644,7 +641,7 @@ def label_hold_entries(engine, now, noticed, escalated, in_play):
                 created = parse_iso(record.get("created_at"))
                 shown[(repo_key, number)] = {"repo": repo, "number": number, "title": record.get("title") if isinstance(record.get("title"), str) else "", "head": head,
                                              "since": iso(created if created is not None else now), "holds": pr_hold_reasons(names)}
-            if len(records) >= LABEL_HOLD_LIST_CUT:   # the list may be cut: a held pull request beyond it is not dropped, for at most LABEL_HOLD_KEEP_SECONDS (the next complete list drops it at once)
+            if state.was_cut.get(repo_key):   # the list may be cut (the ceiling flag of the last GOOD read, which the recorder keeps): a held pull request beyond it is not dropped, for at most LABEL_HOLD_KEEP_SECONDS (the next complete list drops it at once)
                 for key, row in previous.items():
                     if key[0] == repo_key and key[1] not in seen:
                         kept_at = row.get("kept_at", now)

@@ -10,6 +10,7 @@ import unittest
 from unittest import mock
 from support.wire_fakes import FAKE_HERDR, FAKE_OPENCODE, FakeV2, SimClock, TOKEN_NAME, TYPING_VERBS, _usage, parse_flags
 from support.loader import SWITCHBOARD, sb, switchboard_source
+from support.core import Base
 
 
 def daemon_text(path):
@@ -475,6 +476,8 @@ class World:
     """Fake v2, fake herdr and a simulated clock, and an engine on the real clients."""
 
     def __init__(self, test, agents=("platform", "coder"), config=None, state=None):
+        if state is None and not isinstance(test, Base):
+            raise sb.RealStateRefused("World(state=None) in %s: a world with no state of its own is the real state directory; derive the test from Base (isolating) or pass a temporary state" % type(test).__name__)
         os.environ[sb.LAB_ENV] = "1"  # lab facts are the event source in these tests
         patch = mock.patch.object(sb, "memory_sleep", lambda seconds: None)   # a new launch's memory test (#779) never waits 30 s here
         patch.start()
