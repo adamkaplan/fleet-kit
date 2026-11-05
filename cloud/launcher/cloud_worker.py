@@ -437,6 +437,173 @@ SCRUB_OUTPUT_MAX = 2 * SCRUB_INPUT_MAX   # a limit above the input maximum: reda
 MIN_FRAGMENT = 8
 
 
+import ipaddress  # noqa: E402  (PC-11: the masking is decided by the standard module)
+WINDOW = 200               # a run of address characters longer than this is cut into windows ...
+WINDOW_OVERLAP = 64        # ... that overlap by this many characters: more than the longest address (45) plus a short zone
+SUBSTRING_MAX = 64         # a substring tried is at most this long: at most 64 parses start at one position
+MASK_GUARD = 1000          # PC-12: the repeat ends in any case after this many passes; the text is then replaced by [masking_loop]
+_RUN_RE = re.compile(r"[0-9A-Fa-f:.]+")   # the finder of candidates: every maximal run of address characters
+
+
+def _address_spans(run):
+    """Every [start, end) span of `run` (one window) that `ipaddress.ip_address` accepts: a span starts and ends at the edge of the run or next to
+    a colon or a dot (a `::` is never a separator: `1::2::3` stays whole and unmasked)."""
+    spans, n = [], len(run)
+    for i in range(n):
+        if i == 0 or (run[i - 1] in ":." and run[i - 2:i] != "::"):
+            for j in range(i + 1, min(n, i + SUBSTRING_MAX) + 1):
+                if j == n or (run[j] in ":." and run[j:j + 2] != "::"):
+                    try:
+                        ipaddress.ip_address(run[i:j])
+                    except ValueError:
+                        continue
+                    spans.append((i, j))
+    return spans
+
+
+def _mask_pass(text):
+    """One pass: in every run the LONGEST parseable substring is taken first (ties: the leftmost), then the longest of what does not overlap it,
+    until nothing parses; each taken substring becomes `[address]`."""
+    out, last = [], 0
+    for m in _RUN_RE.finditer(text):
+        run, base, spans = m.group(), m.start(), set()
+        if len(run) <= WINDOW:
+            spans.update(_address_spans(run))
+        else:
+            step = WINDOW - WINDOW_OVERLAP
+            for w in range(0, len(run), step):
+                spans.update((w + a, w + b) for a, b in _address_spans(run[w:w + WINDOW]))
+                if w + WINDOW >= len(run):
+                    break
+        taken, used = [], bytearray(len(run))
+        for a, b in sorted(spans, key=lambda s: (s[0] - s[1], s[0])):
+            if not any(used[a:b]):
+                used[a:b] = b"\1" * (b - a)
+                taken.append((a, b))
+        for a, b in sorted(taken):
+            out.append(text[last:base + a])
+            out.append("[address]")
+            last = base + b
+    out.append(text[last:])
+    return "".join(out)
+
+
+_HEX = frozenset("0123456789abcdefABCDEF")
+
+
+def _glue_pass(text):
+    """PC-13, one glue pass on the text the PC-11/PC-12 passes left: in every run of address characters a candidate of at most 64 characters may start at a
+    normal start (run start, or after a colon or a dot) or at an extension start (a hex digit inside a group, 1 to 5 hex characters of the group before it)
+    and end at a normal end or an extension end (the mirror), at least one being an extension; a candidate with a group of more than 4 characters is not
+    tried; the longest that `ipaddress` accepts (ties: the leftmost) becomes `[address]`."""
+    out, last = [], 0
+    for m in _RUN_RE.finditer(text):
+        r, n = m.group(), len(m.group())
+        gs, ge, mark = [0] * n, [0] * n, -1
+        for i, c in enumerate(r):
+            gs[i] = mark + 1
+            if c in ":.":
+                mark = i
+        nxt = n
+        for i in range(n - 1, -1, -1):
+            if r[i] in ":.":
+                nxt = i
+            ge[i] = nxt
+        starts = []
+        for p in range(n):
+            ext = p > 0 and r[p] not in ":." and r[p - 1] in _HEX and 1 <= p - gs[p] <= 5
+            if ext or p == 0 or r[p - 1] in ":.":
+                starts.append((p, ext))
+        ends = []
+        for q in range(1, n + 1):
+            ext = q < n and r[q - 1] in _HEX and r[q] in _HEX and r[q - 1] not in ":." and r[q] not in ":." and 1 <= ge[q] - q <= 5
+            if ext or q == n or r[q] in ":.":
+                ends.append((q, ext))
+        best = None
+        for p, pe in starts:
+            for q, qe in ends:
+                if q - p > SUBSTRING_MAX:
+                    break
+                if q <= p or not (pe or qe):
+                    continue
+                cand = r[p:q]
+                if best is not None and q - p <= best[1] - best[0]:
+                    continue
+                if any(len(g) > 4 for g in re.split(r"[:.]", cand)):
+                    continue
+                try:
+                    ipaddress.ip_address(cand)
+                except ValueError:
+                    continue
+                best = (p, q)
+        if best:
+            out.append(text[last:m.start() + best[0]])
+            out.append("[address]")
+            last = m.start() + best[1]
+    out.append(text[last:])
+    return "".join(out)
+
+
+_ABSORB_RE = re.compile(r"(?:(?<![0-9A-Za-z.])(?:[0-9]{1,3}\.){1,3})?\[address\](?:\.[0-9]{1,3}){1,3}(?![0-9])|(?<![0-9A-Za-z.])(?:[0-9]{1,3}\.){1,3}\[address\]")
+
+
+def _absorb_pass(text):
+    """PC-13 (the absorb rule): a `[address]` directly followed by a dot and 1 to 3 dotted octets, or directly preceded by 1 to 3 dotted octets, absorbs them
+    (the dotted tail of an IPv6 address that phase 1 parsed only in part); over-masking only."""
+    return _ABSORB_RE.sub("[address]", text)
+
+
+def _mask_addresses(text):
+    """The capacity answer's own masking, before the launcher's one scrub, decided by `ipaddress` (PC-10, PC-11, PC-12): every maximal run of address
+    characters (an optional `%zone` stays text) is searched, in windows of 200 that overlap by 64, for substrings that `ipaddress` accepts, the longest
+    first; a colon that only separates a label or a port is not part of the address; text that does not parse (`1::2::3`) is kept. The pass repeats
+    until a pass changes nothing (each changing pass replaces a parseable substring by `[address]`, which holds none, so it ends); a guard of
+    1,000 passes ends it in any case and the text is then replaced by `[masking_loop]`."""
+    if not isinstance(text, str):
+        return text
+    for _ in range(MASK_GUARD):
+        done = _mask_pass(text)
+        if done == text:
+            break
+        text = done
+    else:
+        return "[masking_loop]"
+    GLUE_PASS = True
+    if GLUE_PASS and _address_spans("fd00::1"):  # PC-13: the glue pass (an address glued to hex letters), only while the IPv6 masking is on
+        for _ in range(MASK_GUARD):
+            glued = _absorb_pass(_glue_pass(text))
+            if glued == text:
+                return text
+            text = glued
+        return "[masking_loop]"
+    return text
+
+
+def _quantity(value, scale):
+    """A Kubernetes quantity ('4', '3920m', '8Gi', '16000Ki') as a whole number: `scale` 1000 gives millicores, 1 gives bytes. Unreadable is 0."""
+    text = str(value if value is not None else "0")
+    units = {"Ki": 1024, "Mi": 1024 ** 2, "Gi": 1024 ** 3, "Ti": 1024 ** 4, "k": 1000, "M": 1000 ** 2, "G": 1000 ** 3, "T": 1000 ** 4, "m": 0.001}
+    for suffix, mult in units.items():
+        if text.endswith(suffix):
+            text, factor = text[:-len(suffix)], mult
+            break
+    else:
+        factor = 1
+    try:
+        return int(float(text) * factor * scale)
+    except ValueError:
+        return 0
+
+
+POD_EVENTS_MAX, POD_EVENT_CHARS = 20, 200
+_ADDRESS_RE = re.compile(r"(?<![\w.-])(?:\d{1,3}\.){3}\d{1,3}(?::\d{1,5})?(?![\w.-])|(?<![\w.-])(?:(?:[A-Za-z0-9-]+\.)+[A-Za-z][A-Za-z0-9-]*|localhost):\d{1,5}(?![\w.-])|\[[0-9A-Fa-f:.]*:[0-9A-Fa-f:.]*\](?::\d{1,5})?|(?<![\w:])[0-9A-Fa-f:]{1,45}:(?:\d{1,3}\.){3}\d{1,3}(?![\w.:-])|(?<![\w:])(?:(?:[0-9A-Fa-f]{1,4}:){1,7}:(?:[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4}){0,6})?|::(?:[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4}){0,6})?)(?:%[A-Za-z0-9_.-]{1,16})?(?![\w:])|(?<![\w:])(?:[0-9A-Fa-f]{1,4}:){7}[0-9A-Fa-f]{1,4}(?![\w:])")
+
+
+def mask_addresses(text):
+    """An IPv4 address (with its port), a host name with a dot or `localhost` followed by a port, and an IPv6 address (compressed, full or bracketed with a port) become `[address]`; a word glued to a colon and digits that is no such name (`exit code:137`), a node name, a clock and a ratio are kept."""
+    return _ADDRESS_RE.sub("[address]", str(text))
+
+
 class KnownSet:
     """A set of known secret forms. It HOLDS its forms (it is not a set, and no public attribute exposes them), keeps a
     `version` (bumped AFTER every change of the content, under an RLock the instance owns, and only when the content
@@ -951,24 +1118,55 @@ def tempfail_tries(run, last_line, say, sleep):
         sleep(wait)
 
 
+def read_pipe_end(fd, limit=8192):
+    """Everything in the read end of a pipe (at most limit bytes), then close it. The writer has exited, so this does not wait."""
+    try:
+        data = b""
+        while len(data) < limit:
+            chunk = os.read(fd, limit - len(data))
+            if not chunk:
+                break
+            data += chunk
+        return data.decode("utf-8", "replace")
+    except OSError:
+        return ""
+    finally:
+        os.close(fd)
+
+
+def mint_is_default(cmd, env):
+    """True for the repository's own mint (no CW_GIT_TOKEN_CMD): it delivers the token through a descriptor, never on stdout. An override command prints on stdout."""
+    return not env.get("CW_GIT_TOKEN_CMD") and len(cmd) >= 2 and cmd[1] == os.path.join(os.path.dirname(os.path.abspath(__file__)), "app_token.py")
+
+
 def run_git_token_cmd(cmd, repo, env, register=None):
-    """THE mint call (the launch and the renewal both come here): run cmd for repo in env, return the token it printed. Never prints, never puts
-    the token in an argument or a file. register(text) hears the child's stdout before it is judged, so a caller's scrubber knows it.
+    """THE mint call (the launch and the renewal both come here): run cmd for repo in env, return the token it gave. The default mint hands it over a
+    pipe (--fd); an operator's CW_GIT_TOKEN_CMD prints it on stdout. Never prints, never puts the token in an argument or a file. register(text) hears
+    the token before it is judged, so a caller's scrubber knows it. A passing failure (status 75) is tried again (tempfail_tries), a new pipe each try.
     Raises CloudError(EXIT_USAGE) with no value in the text."""
     def once():
+        ends = os.pipe() if mint_is_default(cmd, env) else None
         try:
-            q = subprocess.run(cmd, capture_output=True, text=True, timeout=GIT_TOKEN_MINT_SECONDS, stdin=subprocess.DEVNULL, env=dict(env, GH_REPO=repo))
+            q = subprocess.run(cmd + ["--fd", str(ends[1])] if ends else cmd, capture_output=True, text=True, timeout=GIT_TOKEN_MINT_SECONDS,
+                               stdin=subprocess.DEVNULL, env=dict(env, GH_REPO=repo), pass_fds=(ends[1],) if ends else ())
         except (OSError, subprocess.TimeoutExpired, ValueError):
             q = None
+        finally:
+            if ends:
+                os.close(ends[1])
+        given = read_pipe_end(ends[0]) if ends else (q.stdout if q else "")
         if q and register:
             register(q.stdout.strip())
-        return (q.returncode if q else None), q
+            if ends:
+                register(given.strip())
+        return (q.returncode if q else None), (q, given)
 
-    def line(q):
+    def line(res):
+        q = res[0]
         return scrub(q.stderr.strip().splitlines()[-1], (), 200) if q and q.stderr.strip() else "no message"
 
-    _, p, tries = tempfail_tries(once, line, lambda t: print(t, file=sys.stderr), lambda s: git_token_sleep(s))
-    token = (p.stdout if p and p.returncode == 0 else "").strip()
+    _, (p, given), tries = tempfail_tries(once, line, lambda t: print(t, file=sys.stderr), lambda s: git_token_sleep(s))
+    token = (given if p and p.returncode == 0 else "").strip()
     if not token or len(token) > GIT_TOKEN_MAX_CHARS:
         why = ""
         if p and p.stderr.strip():
@@ -1307,6 +1505,238 @@ def firewall_refused(ran):
     return any(marker in text for marker in FIREWALL_MARKERS)
 
 
+# ---------------------------------------------------------------- the vault block (ask #1427)
+# After the vault's FIREWALL refuses this machine, every command that needs the vault refuses at once, for a set time, and starts no vault call.
+# The block is ONE small private file in the switchboard's state directory: the time, a one-line reason and the retry time (no secret, no address, no
+# vault name). Only a firewall answer creates it: a timeout, a missing secret, a login problem or a malformed answer never does. After the retry time
+# exactly ONE command probes (the lock file below): success removes the block, a refusal renews it. With no block yet, the callers of one moment also
+# take the lock one at a time, so a refusing vault is asked once and the others find the block.
+VAULT_BLOCK_NAME = "vault-block.json"
+VAULT_BLOCK_LOCK_NAME = "vault-block.lock"
+VAULT_BLOCK_SETTING = "CW" + "_VAULT_BLOCK_DURATION"   # written in two parts: its settings row is a separate commit of ask #1427 (the names guard reads string constants)
+VAULT_BLOCK_DEFAULT_MINUTES = 10
+VAULT_BLOCK_REASON = "the vault refused this machine"
+VAULT_BLOCK_POLL_SECONDS = 0.05
+
+
+def vault_block_dir(env):
+    """The block's folder: the switchboard's state directory ($XDG_STATE_HOME, default ~/.local/state, / the switchboard's directory name), in its
+    `cloud` folder, where the launcher keeps its other records and where its tests already clear their files between two launches."""
+    base = env.get("XDG_STATE_HOME") or os.path.join(env.get("HOME") or os.path.expanduser("~"), ".local", "state")
+    return os.path.join(base, CONFIG_DIR_NAME, "cloud")
+
+
+def vault_block_minutes(env):
+    """The block's length in minutes: the setting (1m to 60m, the duration kind), else ten. A value that cannot be read gives the default."""
+    text = (env.get(VAULT_BLOCK_SETTING) or "").strip()
+    found = _DURATION.fullmatch(text) if text else None
+    minutes = int(found.group(1)) * (60 if found.group(2) == "h" else 1) if found else VAULT_BLOCK_DEFAULT_MINUTES
+    return minutes if 1 <= minutes <= 60 else VAULT_BLOCK_DEFAULT_MINUTES
+
+
+def vault_lock_stale_seconds():
+    """A probe lock older than the longest a vault call can last (the read, the access check after a refusal and the second read) is ignored."""
+    return 2 * TOKEN_CMD_SECONDS + VAULT_CHECK_SECONDS + VAULT_CHECK_GRACE
+
+
+VAULT_BLOCK_MAX_BYTES = 65536   # a block file is tiny: a larger one is not ours
+
+
+def _damaged_block(path, base, minutes):
+    """A block file that cannot be trusted FAILS CLOSED: it blocks until the file's own time plus the setting's length (never longer), then one probe runs."""
+    return (base, base + 60 * minutes, path)
+
+
+def read_vault_block(env, now=None):
+    """None when there is no block file; otherwise (refused_at, retry_at, damaged_path) in epoch seconds (damaged_path is None for a good file).
+    A file that is corrupt, empty, huge, a symlink, not ours, with a negative or non-number time blocks too, until the file's time (the earlier of its
+    modification and change time and now, so a future date or a clock set back cannot lengthen it) plus the setting's length. A retry time is capped to it."""
+    path = os.path.join(vault_block_dir(env), VAULT_BLOCK_NAME)
+    try:
+        found = os.lstat(path)
+    except OSError:
+        return None
+    minutes = vault_block_minutes(env)
+    now = time.time() if now is None else now
+    mtime = found.st_mtime
+    if mtime > now and stat.S_ISREG(found.st_mode) and found.st_uid == os.getuid():
+        try:
+            os.utime(path, (now, now), follow_symlinks=False)   # a time ahead of the clock (it was set back): the block starts now, never later
+            mtime = now
+        except OSError:
+            pass
+    # a time ahead of now is not believed: the block ends at most one setting's length from now (and from the first time it was seen so)
+    base = min([t for t in (mtime, found.st_ctime) if t <= now] + [now])
+    if not stat.S_ISREG(found.st_mode) or found.st_uid != os.getuid() or found.st_size > VAULT_BLOCK_MAX_BYTES:
+        return _damaged_block(path, base, minutes)
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, "rb") as f:
+            raw = f.read(VAULT_BLOCK_MAX_BYTES + 1)
+        if len(raw) > VAULT_BLOCK_MAX_BYTES:
+            return _damaged_block(path, base, minutes)
+        data = json.loads(raw.decode("utf-8"))
+        at, retry = data["at"], data["retry_at"]
+        if any(isinstance(v, bool) or not isinstance(v, (int, float)) for v in (at, retry)):
+            raise ValueError("not a number")
+        at, retry = float(at), float(retry)
+        if not (math.isfinite(at) and math.isfinite(retry)) or at < 0 or retry < 0:
+            raise ValueError("not a time")
+    except (OSError, ValueError, KeyError, TypeError, OverflowError):
+        return _damaged_block(path, base, minutes)
+    retry = min(retry, base + 60 * minutes)
+    return (min(at, retry), retry, None)
+
+
+def _stamp(epoch):
+    return dt.datetime.fromtimestamp(epoch, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def vault_block_line(block):
+    """The ONE line a blocked command prints: the reason and the retry time (never a value, an address or a name)."""
+    if len(block) > 2 and block[2]:
+        return "the vault block file %s cannot be trusted (damaged, too large, too far ahead or not a plain file of this user); no vault call is made until %s (delete that file to clear it by hand)" % (
+            block[2], _stamp(block[1]))
+    return "%s at %s; no vault call is made until %s (delete the vault-block file in the switchboard state directory to clear it by hand)" % (
+        VAULT_BLOCK_REASON, _stamp(block[0]), _stamp(block[1]))
+
+
+def write_vault_block(env, now):
+    """Write the block by rename (a private temp file in the same directory, then os.replace). Never raises: a block that cannot be written costs only the saving."""
+    directory = vault_block_dir(env)
+    temp = None
+    try:
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+        body = json.dumps({"at": now, "reason": VAULT_BLOCK_REASON, "retry_at": now + 60 * vault_block_minutes(env)}, sort_keys=True)
+        temp = os.path.join(directory, ".%s.%d.%s.tmp" % (VAULT_BLOCK_NAME, os.getpid(), secrets.token_hex(4)))
+        fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(body)
+        os.replace(temp, os.path.join(directory, VAULT_BLOCK_NAME))
+        temp = None
+    except OSError:
+        pass
+    finally:
+        if temp is not None:
+            try:
+                os.unlink(temp)
+            except OSError:
+                pass
+
+
+def _unlink(path):
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def _inspect_lock(lock):
+    """(mtime, holder_gone) of the probe lock, or None when it is unusable (a FIFO, a symlink, a directory, a file of another user, unreadable).
+    It is opened WITHOUT following a symlink and WITHOUT blocking, then judged by fstat: only a regular file of this user is a lock."""
+    try:
+        fd = os.open(lock, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return None
+    try:
+        found = os.fstat(fd)
+        if not stat.S_ISREG(found.st_mode) or found.st_uid != os.getuid():
+            return None
+        try:
+            pid = int(os.read(fd, 20).decode("ascii", "replace").strip())
+            os.kill(pid, 0)
+            gone = False
+        except ProcessLookupError:
+            gone = True
+        except (OSError, ValueError, OverflowError):
+            gone = False   # an empty or unreadable lock is not judged gone: its age decides
+        return (found.st_mtime, gone)
+    finally:
+        os.close(fd)
+
+
+def _clear_unusable_lock(lock):
+    """Replace an unusable lock (one line names it); True when it is gone, False when it cannot be removed (the call then goes on without a lock)."""
+    print("cloud-worker: the vault probe lock %s is not a plain file of this user; ignoring it (delete it by hand to clear it)" % lock, file=sys.stderr)
+    for remove in (os.unlink, os.rmdir):
+        try:
+            remove(lock)
+            return True
+        except FileNotFoundError:
+            return True
+        except OSError:
+            pass
+    return False
+
+
+class VaultFlight:
+    """ONE vault call in flight at a time. `VaultFlight.enter(env)` raises ClusterLogin("vault-blocked") while a block lasts (its line is `.line`),
+    or when a probe after the block's time is already running; otherwise it holds the lock. `done(ran)` records the final answer (a firewall refusal
+    writes or renews the block; a success removes it; anything else changes nothing) and releases the lock."""
+
+    def __init__(self, env, clock):
+        self.env, self.clock, self.lock = env, clock, None
+
+    @classmethod
+    def enter(cls, env, clock=time.time, sleep=time.sleep):
+        flight = cls(env, clock)
+        directory = vault_block_dir(env)
+        lock = os.path.join(directory, VAULT_BLOCK_LOCK_NAME)
+        while True:
+            block = read_vault_block(env, clock())
+            if block is not None and clock() < block[1]:
+                raise _vault_blocked(block)
+            try:
+                os.makedirs(directory, mode=0o700, exist_ok=True)
+                fd = os.open(lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            except FileExistsError:
+                seen = _inspect_lock(lock)
+                if seen is None:
+                    if not os.path.lexists(lock):
+                        continue   # it went away between the two calls: take it
+                    if _clear_unusable_lock(lock):
+                        continue
+                    return flight   # cannot be removed: no lock is kept, and the call goes on (one call at most)
+                age = clock() - seen[0]
+                if abs(age) > vault_lock_stale_seconds() or seen[1]:   # too old, or dated far from now (a clock set back), or its command was killed
+                    _unlink(lock)   # a stale lock (too old, or its command was killed) is ignored
+                    continue
+                if block is not None:
+                    raise _vault_blocked(block)   # a probe is running: this command uses the block
+                sleep(VAULT_BLOCK_POLL_SECONDS)   # no block yet: the call in flight answers first
+                continue
+            except OSError:
+                return flight   # no state directory: no block can be kept, and the call goes on as before
+            os.write(fd, str(os.getpid()).encode())   # who holds it: a lock of a command that is gone is ignored at once
+            os.close(fd)
+            flight.lock = lock
+            block = read_vault_block(env, clock())   # the holder before us may have just written it
+            if block is not None and clock() < block[1]:
+                flight.release()
+                raise _vault_blocked(block)
+            return flight
+
+    def release(self):
+        if self.lock is not None:
+            _unlink(self.lock)
+            self.lock = None
+
+    def done(self, ran):
+        try:
+            if firewall_refused(ran):
+                write_vault_block(self.env, self.clock())
+            elif ran is not None and ran[0] == 0:
+                _unlink(os.path.join(vault_block_dir(self.env), VAULT_BLOCK_NAME))
+        finally:
+            self.release()
+
+
+def _vault_blocked(block):
+    err = ClusterLogin("vault-blocked", firewall=True)
+    err.line = vault_block_line(block)
+    return err
+
+
 def jwt_claims(token):
     """(exp, iat) of a JWT's claims, or None when the text is not a JWT with a readable exp. Never raises."""
     parts = (token or "").split(".")
@@ -1451,11 +1881,16 @@ def cluster_token(env, duration, capture=None, now=None, recovery=None, strict=F
                     "--name", env.get("CW_CLUSTER_ADMIN_SECRET") or "cw-cluster-admin-kubeconfig", "--query", "value", "-o", "tsv"]
         def read():
             return capture(argv, env=child_env)
-        ran = read()
-        recovered = False
-        if recovery is not None and not admin and firewall_refused(ran):   # only the default vault read, only a firewall refusal, once
-            ran = recovery(read, env)
-            recovered = True
+        flight = VaultFlight.enter(env)   # BEFORE any vault call: a block (or a probe in flight) refuses here, at once
+        ran = None
+        try:
+            ran = read()
+            recovered = False
+            if recovery is not None and not admin and firewall_refused(ran):   # only the default vault read, only a firewall refusal, once
+                ran = recovery(read, env)
+                recovered = True
+        finally:
+            flight.done(ran)   # AFTER the final answer: a firewall refusal writes or renews the block, a success removes it
         if ran is None or ran[0] != 0 or not ran[1].strip() or len(ran[1]) > 1000000:
             raise ClusterLogin("admin-unreadable", firewall=firewall_refused(ran), recovered=recovered)
         admin_config = ran[1]
@@ -1545,6 +1980,7 @@ REFRESH_REASONS = {
     "az-refused": "no az of the fixed list is a plain executable file that only its owner can write",
     "namespace-refused": "the namespace is not a DNS label (CW_CLOUD_NAMESPACE)",
     "duration-refused": "the requested token life is not a whole number of minutes",
+    "vault-blocked": "the vault refused this machine and a block is in force (the vault-block file of the switchboard state directory)",
 }
 FIREWALL_REASON = "the vault refused this machine"   # the firewall refused this machine: the launch path's own words
 
@@ -1595,6 +2031,45 @@ def last_audit_line(path, action, runtime_id=None):
         if rec.get("action") == action and (runtime_id is None or rec.get("runtime_id") == runtime_id):
             return rec.get("ok"), rec.get("reason")
     return None
+
+
+_TAIL_COUNT = threading.local()   # audit lines parsed by AuditTail, per thread: a pass or a tick reads its own thread's count
+
+
+def tail_lines_parsed():
+    return getattr(_TAIL_COUNT, "n", 0)
+
+
+class AuditTail:
+    """One read of the audit file's tail (the same 262,144-byte window as last_audit_line), made at the FIRST question and kept: for each
+    (action, runtime id) the newest line's (ok, reason). A line that is not JSON is skipped; the newest line wins. `parsed` counts the lines parsed."""
+
+    def __init__(self, path):
+        self.path, self.parsed, self.newest, self.loaded = path, 0, {}, False
+
+    def _load(self):
+        self.loaded = True
+        try:
+            with open(self.path, "rb") as f:
+                f.seek(0, os.SEEK_END)
+                f.seek(max(0, f.tell() - 262144))
+                lines = f.read().decode(errors="replace").splitlines()
+        except OSError:
+            return
+        for raw in reversed(lines):
+            self.parsed += 1
+            _TAIL_COUNT.n = tail_lines_parsed() + 1
+            try:
+                rec = json.loads(raw)
+            except ValueError:
+                continue
+            if isinstance(rec, dict):
+                self.newest.setdefault((rec.get("action"), rec.get("runtime_id")), (rec.get("ok"), rec.get("reason")))
+
+    def get(self, action, runtime_id):
+        if not self.loaded:
+            self._load()
+        return self.newest.get((action, runtime_id))
 
 
 class TokenRefresh:
@@ -1754,6 +2229,12 @@ def scan_credentials(spec):
 REGISTRY_KEYS = ("secrets.json", "agents.json")
 
 
+def _not_found_exactly(stderr, what):
+    """True only when the whole message (one trailing newline trimmed) is the client's not-found text for the ONE object asked for (kind and exact name)."""
+    text = stderr[:-1] if stderr.endswith("\n") else stderr
+    return bool(what) and text == "Error from server (NotFound): %s not found" % what
+
+
 class Kube:
     """The only door to the cloud: one kubectl call per method. Never puts a secret on a command line."""
 
@@ -1835,7 +2316,7 @@ class Kube:
         if p.returncode != 0:
             if keep_stdout and p.stdout.strip():
                 return p.stdout  # the caller reads the failure from the tool's own JSON
-            if ok_missing and "NotFound" in p.stderr and (missing_what is None or (missing_what in p.stderr and " not found" in p.stderr)):
+            if ok_missing and _not_found_exactly(p.stderr, missing_what):
                 return None
             last = (self.scrub(p.stderr, limit=SCRUB_OUTPUT_MAX).strip().splitlines() or ["failed"])[-1]
             raise CloudError("kubectl %s: %s" % (args[0], self.scrub(last)))
@@ -1857,7 +2338,7 @@ class Kube:
             raise self._exists(e, "%s %s" % (obj["kind"], obj["metadata"]["name"])) from None
 
     def get_secret(self, full_name):
-        out = self.run(["get", "secret", full_name, "-o", "json"], ok_missing=True)
+        out = self.run(["get", "secret", full_name, "-o", "json"], ok_missing=True, missing_what='secrets "%s"' % full_name)
         return json.loads(out) if out else None
 
     def get_pod(self, name):
@@ -1875,6 +2356,10 @@ class Kube:
         """The cluster's nodes: their pool label, their instance size label and their creation time. Needs `list` on nodes (cluster-wide): a
         login without that right is refused by the API server, and the caller falls back to the pod placement."""
         return json.loads(self.run(["get", "nodes", "-o", "json"]))["items"]
+
+    def list_events(self):
+        """The namespace's scheduler events (`FailedScheduling`): a `get`, a read only."""
+        return json.loads(self.run(["get", "events", "--field-selector", "reason=FailedScheduling", "-o", "json"]))["items"]
 
     def annotate(self, name, uid, **kv):
         """Annotate the pod that was READ (its `uid`), never one of the same name that replaced it: a merge patch whose body carries
@@ -1953,7 +2438,7 @@ class Kube:
                 ", ".join("%s/%s" % x for x in left), "; ".join(self.delete_command(k, o) for k, o in left)))
 
     def get_run_secret(self, name):
-        out = self.run(["get", "secret", name + "-run", "-o", "json"], ok_missing=True)
+        out = self.run(["get", "secret", name + "-run", "-o", "json"], ok_missing=True, missing_what='secrets "%s-run"' % name)
         return json.loads(out) if out else None
 
     def create_run_secret(self, name, pod, values, run_id=None):
@@ -2028,11 +2513,18 @@ def _pod_repo(pod):
     return _pod_env(pod, "CW_REPO")
 
 
+FAILED_EVENTS_MAX = 10
+FAILED_EVENT_CHARS = 300
+FAILED_POD_KEEP_SECONDS = 600   # a Failed pod without unpushed work is deleted this long after its record
+FAILED_UNWRITTEN_TOLD = set()   # the Failed pods whose unwritable record was already reported (one report, not one per pass)
+
+
 def ann(pod, key, default=None):
     return pod["metadata"].get("annotations", {}).get("cw/" + key, default)
 
 
 SAFE_VALUE = re.compile(r"[A-Za-z0-9._-]{1,63}", re.ASCII)
+POD_UID_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")   # the form of a pod uid: the create records it, the retire hands it back (bin/cloud_worker.py holds the equal text)
 
 
 def safe_value(value):
@@ -2103,12 +2595,51 @@ def pod_deadline_floor(max_hard):
     return parse_duration(max_hard or DEFAULT_MAX_HARD) + POD_DEADLINE_GRACE_SECONDS
 
 
-def check_shape(a):
-    """Set a.shape when it names none (XS, or S for a stack launch) and refuse an unknown name, or a row that cannot run a stack, with --stack."""
-    if getattr(a, "shape", None) is None:
-        a.shape = DEFAULT_STACK_SHAPE if getattr(a, "stack", False) else DEFAULT_ORCHESTRATOR_SHAPE if getattr(a, "agent", None) == "orchestrator" else DEFAULT_SHAPE
-    if a.shape not in SHAPES:
+FLOOR_ORDER = ("XS", "S", "M")   # the shapes a repository floor may name, smallest first; the orchestrator row O is not one of them and ranks below XS
+
+
+def shape_rank(shape):
+    """The rank of a shape for the floor comparisons: its place in FLOOR_ORDER, or -1 (below XS) for any other row, the orchestrator row O included."""
+    return FLOOR_ORDER.index(shape) if shape in FLOOR_ORDER else -1
+
+
+def repo_min_shapes(raw):
+    """THE parse of CW_REPO_MIN_SHAPE: {repository key: shape} from comma-separated OWNER/NAME=SHAPE pairs, or None when any entry is malformed (no
+    '=', an unknown shape, a repository that is not OWNER/NAME, a repeated repository, a control character). The repository part is parsed by `_repo_key`,
+    the one parse the allow-list uses. The settings file's validator and check_shape both call it."""
+    if any(ord(c) < 32 or ord(c) == 127 for c in raw):
+        return None
+    floors = {}
+    for entry in raw.split(","):
+        repo, sep, shape = entry.partition("=")
+        key = _repo_key(repo.strip())
+        shape = shape.strip()
+        if not sep or key is None or shape not in FLOOR_ORDER or key in floors:
+            return None
+        floors[key] = shape
+    return floors
+
+
+def check_shape(a, env=None):
+    """Set a.shape when it names none (XS, or S for a stack launch or an orchestrator) and refuse an unknown name, or a row that cannot run a stack, with --stack.
+    With `env` holding CW_REPO_MIN_SHAPE and a repository listed in it, the listed shape is a floor: an unnamed shape becomes the larger of the floor and
+    the shape the flags give, and a named shape below the floor is refused. An unlisted repository or an unset setting changes nothing."""
+    floor = None
+    raw = ((env or {}).get("CW_REPO_MIN_SHAPE") or "").strip()
+    if raw:
+        floors = repo_min_shapes(raw)
+        if floors is None:
+            raise CloudError("refused: CW_REPO_MIN_SHAPE is not a list of OWNER/NAME=SHAPE entries; nothing was created", EXIT_USAGE)
+        floor = floors.get(_repo_key(getattr(a, "repo", None) or "") or "")
+    named = getattr(a, "shape", None)
+    if named is not None and named not in SHAPES:
         raise CloudError("shape must be one of %s" % ", ".join(SHAPES), EXIT_USAGE)
+    if named is not None and floor is not None and shape_rank(named) < shape_rank(floor):
+        raise CloudError("refused: %s needs at least shape %s (CW_REPO_MIN_SHAPE), not %s; name a larger shape or change the setting; nothing was created" % (scrub(a.repo, (), 120), floor, named), EXIT_USAGE)
+    if named is None:
+        a.shape = DEFAULT_STACK_SHAPE if getattr(a, "stack", False) else DEFAULT_ORCHESTRATOR_SHAPE if getattr(a, "agent", None) == "orchestrator" else DEFAULT_SHAPE
+        if floor is not None and shape_rank(floor) > shape_rank(a.shape):
+            a.shape = floor
     if getattr(a, "stack", False) and not SHAPES[a.shape]["stack"]:
         raise CloudError("--stack needs a shape that can run a nested Docker stack (%s), not %s" % (", ".join(k for k, v in SHAPES.items() if v["stack"]), a.shape), EXIT_USAGE)
 
@@ -2137,7 +2668,7 @@ def render_pod(a, worker, name, now, hard, env, run_names=()):
         raise CloudError("--agent must be one of %s, got %r; nothing was created" % (" or ".join(AGENTS), str(agent)[:40]), EXIT_USAGE)
     if agent == "orchestrator" or hub_on(env):   # with the hub setting unset a worker pod gets none of these: its spec is exactly what it was
         boss = getattr(a, "boss", None)
-        if (agent == "orchestrator" and not boss) or (boss and not NAME_RE.match(boss)):
+        if (agent == "orchestrator" and not boss) or (boss and not NAME_RE.fullmatch(boss)):
             raise CloudError("--agent orchestrator needs --boss NAME", EXIT_USAGE)
         if CHANNEL_SECRET_KEY not in run_names:
             raise CloudError("a hub pod needs its channel secret", EXIT_USAGE)
@@ -2207,6 +2738,11 @@ def render_pod(a, worker, name, now, hard, env, run_names=()):
     return pod
 
 
+def _cap_text(kube, text, limit):
+    """PC-14: known secrets first (no cut), then addresses, then the cut."""
+    return _mask_addresses(kube.scrub(text, SCRUB_OUTPUT_MAX))[:limit]
+
+
 class _StopKube:
     """One stop's view of the cluster door: the same calls, but once the stop is abandoned every call raises, so a late thread changes nothing."""
     def __init__(self, kube, dead):
@@ -2252,8 +2788,12 @@ class Launcher:
     def _audited(self, worker, action, fn, reason="", runtime_id=""):
         info = {"rid": runtime_id, "cost": 0.0}
 
-        def why():   # a stop that wrote a run record names its directory once, here
+        def why():   # a stop that wrote a run record names its directory once, here; a gone-pod stop names the Secrets it removed (names only)
             text = "%s; run record %s" % (reason, info["record"]) if info.get("record") else reason
+            if "removed" in info:
+                text = "%s%ssecrets removed: %s" % (text, "; " if text else "", ", ".join(info["removed"]) or "none")
+            if info.get("identity_note"):
+                text = "%s%s%s" % (text, "; " if text else "", info["identity_note"])
             return "%s; %s" % (text, info["hook_note"]) if text and info.get("hook_note") else (text or info.get("hook_note", ""))
         try:
             result = fn(info)
@@ -2269,7 +2809,7 @@ class Launcher:
         return result
 
     def _need(self, worker):
-        if not NAME_RE.match(worker or ""):
+        if not NAME_RE.fullmatch(worker or ""):
             raise CloudError("bad worker name %r" % worker, EXIT_USAGE)
         pod = self.kube.get_pod(pod_name(worker))
         return pod
@@ -2299,10 +2839,11 @@ class Launcher:
 
         def go(info):
             info["rid"] = "pod/" + name
+            issue_no = parse_issue_number(getattr(a, "issue", None))   # before anything is made
             check_repo_allowed(a.repo, self.env)  # before anything is read or made
-            if not NAME_RE.match(worker):
+            if not NAME_RE.fullmatch(worker):
                 raise CloudError("bad worker name %r" % worker, EXIT_USAGE)
-            check_shape(a)   # resolves an unnamed shape; before any cluster, vault or token call
+            check_shape(a, self.env)   # resolves an unnamed shape; before any cluster, vault or token call
             now = self.clock()
             hard = now + dt.timedelta(seconds=parse_duration(a.hard))
             max_hard = now + dt.timedelta(seconds=parse_duration(a.max_hard))
@@ -2341,7 +2882,7 @@ class Launcher:
                     self._make(made, "run", self.kube.create_run_secret, name, name, run_values, *([a.run_id] if getattr(a, "run_id", None) else []))
                 if hub:
                     made["reg"] = (self._registry_secret(), worker)   # set before the call: a half write is undone by the cleanup
-                    self._register(worker, run_values[CHANNEL_SECRET_KEY], spec, self.env.get("CW_CLOUD_DOMAIN", "example.internal"), password)
+                    self._register(worker, run_values[CHANNEL_SECRET_KEY], spec, self.env.get("CW_CLOUD_DOMAIN", "example.internal"), password, a.repo, issue_no)
                 self._make(made, "pod", self.kube.apply, spec)
                 if getattr(a, "stack", False):
                     self._start_stack_pod(worker, name, spec, made, a.wait)
@@ -2350,6 +2891,7 @@ class Launcher:
                 if a.password_fd is not None:
                     with os.fdopen(os.dup(a.password_fd), "w") as f:
                         f.write(password)
+                pod_uid = self._read_pod_uid(worker, name, info)   # inside the cleanup: a signal during this read ends the create like any other failure
             except (CloudError, OSError) as e:
                 left = self._cleanup(name, made)  # nothing is left running (and costing) or holding a password
                 err = e if isinstance(e, CloudError) else CloudError("could not hand over the password: %s" % e)
@@ -2363,7 +2905,8 @@ class Launcher:
             except BaseException as e:  # interrupt or an unexpected exception: clean up, audit, say what was cleaned
                 self._abort(worker, name, made, e)
             domain = self.env.get("CW_CLOUD_DOMAIN", "example.internal")
-            return {"worker": worker, "url": "https://worker-%s.%s:4096" % (name, domain),
+            return {"worker": worker, "url": "https://worker-%s.%s:4096" % (name, domain), "pod_uid": pod_uid,
+                    **({"identity_note": info["identity_note"]} if "identity_note" in info else {}),
                     "auth_ref": "file:/run/cw/%s.password" % worker, "runtime_id": "pod/" + name,
                     "idle_deadline": iso(now + dt.timedelta(seconds=parse_duration(a.idle))), "hard_deadline": iso(hard),
                     "idle_seconds": parse_duration(a.idle), "hard_seconds": parse_duration(a.hard),
@@ -2376,6 +2919,25 @@ class Launcher:
             return self._audited(worker, "create", go, reason)
         finally:
             self._restore_signals(old)
+
+    def _read_pod_uid(self, worker, name, info):
+        """The pod's own uid, read once at create: a later retire acts only on a pod with this uid.
+        ONE check covers every way it is missing: the read raises any error, or answers anything but a pod with a uid in the form a retire accepts
+        (nothing, text, a list, metadata that is no dict, no uid, an empty, non-text, spaced, control-character or over-long uid)."""
+        try:
+            uid = self.kube.get_pod(name)["metadata"]["uid"]
+        except Exception:   # the pod exists: no failure of this read may escape the create
+            uid = None
+        if not (isinstance(uid, str) and POD_UID_RE.fullmatch(uid)):
+            self._note_unread_identity(worker, info)
+            return ""
+        return uid
+
+    def _note_unread_identity(self, worker, info):
+        """The create could not read the new pod's uid: say so once on stderr and in the create's audit line."""
+        note = "the pod identity of %s could not be read; the worker record holds none and a retire acts by name" % worker
+        print("cloud-worker: WARNING: %s" % note, file=sys.stderr)
+        info["identity_note"] = note
 
     @staticmethod
     def _catch_signals():
@@ -2403,11 +2965,15 @@ class Launcher:
     def _registry_secret(self):
         return self.env.get("CW_HUB_REGISTRY_SECRET") or DEFAULT_REGISTRY_SECRET
 
-    def _register(self, agent, channel_secret, spec, domain, password):
-        """The hub's registry: {agent: sha256 hex of the channel secret} and {agent: {url, session, password_file}}. Only the hash is stored."""
+    def _register(self, agent, channel_secret, spec, domain, password, repo=None, issue=None):
+        """The hub's registry: {agent: sha256 hex of the channel secret} and {agent: {url, session, password_file, repo[, issue]}}. Only the hash is stored."""
         digest = hashlib.sha256(channel_secret.encode()).hexdigest()
         name = spec["metadata"]["name"]
         entry = {"url": hub_agent_url(name, self.env.get("CW_CLOUD_NAMESPACE", "cw")), "session": "", "password_file": "%s/%s" % (HUB_PW_DIR, agent)}
+        if repo is not None:
+            entry["repo"] = repo
+        if issue is not None:
+            entry["issue"] = issue
 
         def change(sec, agents):
             sec[agent], agents[agent] = digest, entry
@@ -2416,7 +2982,7 @@ class Launcher:
 
     def hub_session(self, a):
         """Write the session id into the agent's hub entry (a no-op when it has none). Called by the switchboard once the session exists."""
-        if not NAME_RE.match(a.worker or "") or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,200}", a.session or ""):
+        if not NAME_RE.fullmatch(a.worker or "") or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,200}", a.session or ""):
             raise CloudError("bad worker name or session id", EXIT_USAGE)
         found = []
 
@@ -2669,6 +3235,9 @@ class Launcher:
             pod = self._need(worker)
             uid = ((pod or {}).get("metadata") or {}).get("uid")
             self._orchestrator = _pod_env(pod, "FLEET_AGENT_NAME") if pod and _pod_env(pod, "FLEET_CLOUD_TOKEN_FILE") else None   # a hub pod, orchestrator or worker
+            want_uid = getattr(a, "pod_uid", None)
+            if want_uid and pod and uid != want_uid:   # a new pod holds the name: not the one the record names; it and its Secrets are left whole
+                raise CloudError("pod/%s is not the pod this worker's record names (its uid differs); nothing was stopped or deleted" % name, EXIT_REFUSED)
             if nonce and pod:
                 info["rid"] = "pod/" + name
                 if ann(pod, "run-id") != nonce:   # another run's (or an unlabelled) worker of this name: nothing is changed
@@ -2681,10 +3250,15 @@ class Launcher:
                 # The pod read said NotFound (an operator deleted it); any other read error raised in _need above and never reaches here.
                 removed = []
                 if not nonce:   # by name, pod NotFound: only this worker's own two Secrets (exact names) may be left over; nothing else is touched
+                    if self.kube.get_pod(name):   # read again: a pod that reads as gone is retired by name only when no live pod holds the name
+                        raise CloudError("pod/%s exists now (another pod holds the name); its Secrets are left whole" % name, EXIT_REFUSED)
                     for full, fn in ((name + "-pw", self.kube.delete_secret), (name + "-run", self.kube.delete_run_secret)):
                         if self.kube.get_secret(full):
                             fn(name)
                             removed.append(full)
+                    info["removed"] = removed
+                if getattr(a, "hub_entry", False) and not self._unregister(worker):   # the same call the live path uses; a failure is reported
+                    raise CloudError("the hub registry entry of %s could not be removed (the Secrets are); retire again to finish" % worker)
                 return {"worker": worker, "runtime_id": "", "pushed": False, "wip_branch": None, "pod_gone": True, "secrets_removed": removed}
             info["rid"], info["cost"] = "pod/" + name, self.cost(pod)
             if not getattr(a, "no_record", False):   # BEFORE the hook and the delete; never raises, never holds the stop back
@@ -2693,6 +3267,8 @@ class Launcher:
                 if where:
                     info["record"] = where
                     print("cloud-worker: run record: %s" % where, file=sys.stderr)
+            if info.get("record"):   # BEFORE the hook and the delete: what the pod object says of the pod, and its events when it is not Running
+                self._record_pod_state(info["record"], pod, name)
             phase = (pod.get("status") or {}).get("phase")
             if phase == "Failed" and getattr(a, "cause", None):
                 info["cause"] = "pod_failed"
@@ -2809,6 +3385,51 @@ class Launcher:
         except Exception:
             return {"pushed": False, "wip_branch": None, "skipped": [], "note": "", "error": "end hook answer unreadable"}
 
+    def _pod_state_of(self, pod, name):
+        """The pod's own state from the pod object already read (phase, each container's state, the node) and, ONLY when the phase is
+        not Running, its newest POD_EVENTS_MAX events through scrub and the address mask. A failed events read says `unreadable`. Never raises."""
+        scrub = self.kube.scrub
+        status, spec = pod.get("status") or {}, pod.get("spec") or {}
+        phase = status.get("phase")
+        containers = []
+        for c in (status.get("containerStatuses") or [])[:20]:
+            st = c.get("state") or {}
+            kind = next((k for k in ("terminated", "waiting", "running") if k in st), "unknown")
+            one = {"name": mask_addresses(scrub(c.get("name") or "", 63)), "state": kind}
+            detail = st.get(kind) or {}
+            if detail.get("reason"):
+                one["reason"] = mask_addresses(scrub(detail["reason"], 100))
+            if kind == "terminated":
+                one["exit_code"] = detail.get("exitCode")
+            containers.append(one)
+        state = {"phase": scrub(phase or "", 30), "containers": containers, "node": mask_addresses(scrub(spec.get("nodeName") or "", 253)),
+                 "events": [], "events_read": "no"}
+        if phase == "Running":
+            return state
+        try:
+            uid = (pod.get("metadata") or {}).get("uid")
+            items = [e for e in self.kube.pod_events(name) if not (uid and (e.get("involvedObject") or {}).get("uid") not in (None, uid))]
+            stamp = lambda e: str(e.get("lastTimestamp") or e.get("eventTime") or (e.get("metadata") or {}).get("creationTimestamp") or "")
+            items.sort(key=stamp)
+            events = []
+            for e in items[-POD_EVENTS_MAX:]:
+                text = "%s %s: %s" % (e.get("type") or "", e.get("reason") or "", e.get("message") or "")
+                events.append(mask_addresses(self.kube.scrub(text, 1000))[:POD_EVENT_CHARS])
+            state["events"], state["events_read"] = events, "yes"
+        except Exception:   # a Forbidden answer, a timeout, a bad reply: one word, and the stop goes on
+            state["events"], state["events_read"] = [], "unreadable"
+        return state
+
+    def _record_pod_state(self, directory, pod, name):
+        try:
+            state = self._pod_state_of(pod, name)
+        except Exception:
+            state = "unreadable"
+        try:
+            self.recorder.add_pod_state(directory, state)
+        except Exception:   # add_pod_state never raises; a stop is never held back by the record
+            pass
+
     def _hook_record(self, info, hook):
         if info.get("record"):
             try:
@@ -2909,6 +3530,14 @@ class Launcher:
 
     def record(self, pod):
         name = pod["metadata"]["name"]
+        if (pod.get("status") or {}).get("phase") == "Failed" and not self._failed_name_fits(pod):   # not this launcher's pod: nothing is read of it
+            return {"worker": ann(pod, "worker"), "runtime_id": "pod/" + name, "phase": "Failed", "idle_since": None,
+                    "deadlines": {"idle": None, "hard": ann(pod, "hard-deadline")}, "cost_estimate_usd": self.cost(pod)}
+        if (pod.get("status") or {}).get("phase") == "Failed":   # a dead pod answers nothing: its reason is read, once, from the cluster
+            note, _ = self._failed_note(pod)
+            return {"worker": ann(pod, "worker"), "runtime_id": "pod/" + name, "phase": "Failed", "idle_since": None,
+                    "deadlines": {"idle": None, "hard": ann(pod, "hard-deadline")}, "cost_estimate_usd": self.cost(pod),
+                    "pod_failed": note["pod_failed_reason"][:160], "status_line": "pod failed: " + note["pod_failed_reason"][:160]}
         act = self.activity(name)
         idle_for = int(ann(pod, "idle-seconds", "600"))
         since = act[1] if act and not act[0] else None
@@ -2917,13 +3546,183 @@ class Launcher:
                 "deadlines": {"idle": iso(since + dt.timedelta(seconds=idle_for)) if since else None, "hard": ann(pod, "hard-deadline")},
                 "cost_estimate_usd": self.cost(pod)}
 
+    # -- a pod that ended Failed (#1442) --
+    def _failed_facts(self, name):
+        """ONE read of a Failed pod's own status and of its events: (reason text, exit code or None, [events]). Every text goes through the
+        launcher's scrub; at most FAILED_EVENTS_MAX events, each cut to FAILED_EVENT_CHARS. A read that fails is said in the reason."""
+        try:
+            whole = self.kube.get_pod(name) or {}
+        except CloudError as e:
+            whole = {"_unread": self.kube.scrub(e, 120)}
+        try:
+            seen = self.kube.pod_events(name)
+        except CloudError:
+            seen = []
+        status = whole.get("status") or {}
+        terminated = []
+        for key in ("containerStatuses", "initContainerStatuses"):
+            for c in status.get(key) or []:
+                for where in ("state", "lastState"):
+                    t = (c.get(where) or {}).get("terminated")
+                    if isinstance(t, dict):
+                        terminated.append(t)
+        chosen = ([t for t in terminated if t.get("exitCode") not in (0, None)] or terminated or [{}])[0]
+        code = chosen.get("exitCode") if isinstance(chosen.get("exitCode"), int) else None
+        events = []
+        for ev in [e for e in seen if isinstance(e, dict)][-FAILED_EVENTS_MAX:]:
+            events.append(self.kube.scrub("%s: %s" % (ev.get("reason") or "", ev.get("message") or ""), FAILED_EVENT_CHARS))
+        last = ([e for e in seen if isinstance(e, dict)] or [{}])[-1]
+        word = chosen.get("reason") or None
+        if word and code is not None:
+            text = "%s (exit %d)" % (word, code)
+        elif word or code is not None:
+            text = word or "exit %d" % code
+        else:
+            text = status.get("reason") or whole.get("_unread") or last.get("reason") or "no reason was given"
+        return self.kube.scrub(text, 300), code, events, self.kube.scrub(status.get("message") or "", 300)
+
+    def _failed_name_fits(self, pod):
+        """True when the pod's worker annotation is a worker name (NAME_RE, the whole text): only then it may become a part of a path."""
+        worker = ann(pod, "worker")
+        return isinstance(worker, str) and bool(NAME_RE.fullmatch(worker))
+
+    def _failed_key(self, pod):
+        return ann(pod, "run-id") or (pod.get("metadata") or {}).get("uid") or pod["metadata"]["name"]
+
+    def _failed_find(self, pod):
+        """The record of this Failed pod (found by the pod's run id), as a dict, or None."""
+        worker, tail = ann(pod, "worker") or "", hashlib.sha1(self._failed_key(pod).encode()).hexdigest()[:6]
+        root = self.recorder.root()
+        try:
+            names = sorted(os.listdir(root))
+        except OSError:
+            return None
+        for n in names:
+            if n.startswith(worker + "-") and n.endswith("-" + tail):   # the name is a guide; the record's own fields decide
+                try:
+                    with open(os.path.join(root, n, "run.json")) as f:
+                        info = json.load(f)
+                except (OSError, ValueError):
+                    continue
+                if isinstance(info, dict) and info.get("pod_run_id") == self._failed_key(pod) and info.get("exit_reason") == "pod failed" \
+                        and info.get("worker") == worker:
+                    return info
+        return None
+
+    def _failed_aged(self, worker, pod, note, now):
+        """True when the record is old enough for the pod to go, False when not, None when its time cannot be read. Such a record counts as
+        no usable record: the pod is left (neither rewritten nor deleted), the caller says so once, and the other pods of the pass go on."""
+        try:
+            return (now - parse_iso(note["recorded_at"])).total_seconds() >= FAILED_POD_KEEP_SECONDS
+        except (ValueError, TypeError):
+            return None
+
+    def _failed_note(self, pod):
+        """(record, new): the run record of a Failed pod; read ONCE (the pod's status and events) and written once; a second call finds it."""
+        if not self._failed_name_fits(pod):   # no path part is built from a text that is not a worker name: nothing is read or written
+            return {"unwritten": True, "skipped": True, "pod_failed_reason": "", "pod_message": "the pod carries no usable worker name"}, False
+        found = self._failed_find(pod)
+        if found:
+            return found, False
+        name, now = pod["metadata"]["name"], self.clock()
+        text, code, events, message = self._failed_facts(name)
+        worker = ann(pod, "worker") or ""
+        run_id = "%s-%s-%s" % (worker, now.strftime("%Y%m%dT%H%M%SZ"), hashlib.sha1(self._failed_key(pod).encode()).hexdigest()[:6])
+        info = {"worker": worker, "repository": _pod_repo(pod), "run_id": run_id, "pod_run_id": self._failed_key(pod), "start": ann(pod, "started") or "",
+                "end": iso(now), "recorded_at": iso(now), "exit_reason": "pod failed", "pod_failed_reason": text, "exit_code": code,
+                "pod_message": message, "events": events, "head_sha": None, "transcript": "unavailable", "reason": "the pod ended Failed; no session could be read"}
+        directory = None
+        try:
+            base = run_record.private_root(self.recorder.root())
+            directory = os.path.join(base, run_id)
+            if not os.path.realpath(directory).startswith(os.path.realpath(base) + os.sep):   # a second line of defence
+                directory = None
+                raise OSError("the record directory is outside the record root")
+            os.makedirs(directory, mode=0o700, exist_ok=True)
+            run_record.write_private(directory, "run.json", json.dumps(info, sort_keys=True) + "\n")
+        except OSError as e:
+            if directory:
+                try:
+                    os.rmdir(directory)   # an empty directory of a record that was not written is not left behind
+                except OSError:
+                    pass
+            info["pod_message"] = self.kube.scrub("the record could not be written: %s" % e, 200)
+            info["unwritten"] = True
+            return info, False   # not written: the next pass tries again
+        return info, True
+
     def status(self, a):
-        if a.worker and not NAME_RE.match(a.worker):
+        if a.worker and not NAME_RE.fullmatch(a.worker):
             raise CloudError("bad worker name %r" % a.worker, EXIT_USAGE)
         pods = [self.kube.get_pod(pod_name(a.worker))] if a.worker else self.kube.list_pods()
         if a.worker and not pods[0]:
             raise CloudError("unknown worker %s" % a.worker, EXIT_USAGE)
         return [self.record(p) for p in pods]
+
+    # -- inspect: ONE read-only look inside a running pod (slice 2 of ask #2115) --
+    def inspect(self, a):
+        """What the pod is doing NOW, read-only: ONE `kubectl exec` of the pod's `cw-pod-inspect` (one JSON line). A pod whose image has no such command
+        (or whose answer is not that line) is read by the fallback: git in /work/repo and `cw-worker-activity` through exec; every other field is listed in
+        `missing`. EVERY text is scrubbed here (Kube.scrub) before it is returned: nothing the pod printed leaves raw."""
+        if not NAME_RE.match(a.worker or ""):
+            raise CloudError("bad worker name %r" % a.worker, EXIT_USAGE)
+        name = pod_name(a.worker)
+        if not self.kube.get_pod(name):
+            raise CloudError("unknown worker %s" % a.worker, EXIT_USAGE)
+        try:
+            raw, source = json.loads(self.kube.exec(name, "cw-pod-inspect")), "cw-pod-inspect"
+            if not isinstance(raw, dict):
+                raise ValueError("not an object")
+        except (CloudError, ValueError):
+            raw, source = self._inspect_fallback(name), "fallback"
+        return self._inspect_clean(a.worker, raw, source)
+
+    def _inspect_fallback(self, name):
+        """The reads that need no helper in the image: git through exec for the branch, the unpushed commits and the dirty tree; the activity
+        tool for the idle seconds. What it cannot read is named in `missing`."""
+        def git(*args):
+            try:
+                return self.kube.exec(name, "git", "-C", "/work/repo", *args)
+            except CloudError:
+                return None
+        raw, missing = {}, []
+        branch = git("rev-parse", "--abbrev-ref", "HEAD")
+        raw["branch"] = branch.strip() if branch is not None and branch.strip() else None
+        shas = git("rev-list", "--max-count=50", "HEAD", "--not", "--remotes")
+        raw["unpushed"] = {"count": len(shas.split()), "shas": shas.split()[:10]} if shas is not None else None
+        dirty = git("status", "--porcelain")
+        raw["dirty"] = len([x for x in dirty.splitlines() if x.strip()]) if dirty is not None else None
+        act = self.activity(name)
+        raw["idle_seconds"] = (max(0, int((self.clock() - act[1]).total_seconds())) if act and not act[0] and act[1] else None)
+        raw["in_flight"], raw["last_calls"], raw["last_text"], raw["last_push"] = None, [], "", None
+        raw["missing"] = ["in_flight", "last_calls", "last_text", "last_push"] + [k for k in ("idle_seconds", "branch", "unpushed", "dirty") if raw.get(k) is None]
+        return raw
+
+    def _inspect_clean(self, worker, raw, source):
+        """The ONE shape that is printed. Every text is cut and scrubbed; a number is an int or None; a sha is hex or dropped."""
+        scrub_ = self.kube.scrub
+
+        def num(v):
+            return int(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+        def text(v, limit):
+            return scrub_(v, limit) if isinstance(v, str) else None
+        flight = raw.get("in_flight") if isinstance(raw.get("in_flight"), dict) else None
+        flight = {"tool": text(flight.get("tool"), 80) or "?", "seconds": num(flight.get("seconds"))} if flight else None
+        calls = [{"tool": text(c.get("tool"), 80) or "?", "status": text(c.get("status"), 40) or "?", "seconds_ago": num(c.get("seconds_ago"))}
+                 for c in (raw.get("last_calls") if isinstance(raw.get("last_calls"), list) else [])[:10] if isinstance(c, dict)]
+        un = raw.get("unpushed") if isinstance(raw.get("unpushed"), dict) else None
+        if un is not None:
+            shas = [s[:12] for s in (un.get("shas") if isinstance(un.get("shas"), list) else []) if isinstance(s, str) and re.fullmatch(r"[0-9a-f]{7,40}", s)][:10]
+            un = {"count": num(un.get("count")) or 0, "shas": shas}
+        bad = [c for c in calls if c["status"].lower() in ("error", "failed", "failure", "timeout", "aborted")]
+        last_error = "%s %s %ss ago" % (bad[0]["tool"], bad[0]["status"], bad[0]["seconds_ago"]) if bad else None
+        missing = [text(m, 40) for m in (raw.get("missing") if isinstance(raw.get("missing"), list) else []) if isinstance(m, str)][:20]
+        if source == "fallback" or last_error is None and "last_calls" in missing:
+            missing = missing + (["last_error"] if "last_error" not in missing else [])
+        return {"worker": worker, "source": source, "in_flight": flight, "last_calls": calls, "last_text": text(raw.get("last_text"), 300) or "",
+                "idle_seconds": num(raw.get("idle_seconds")), "branch": text(raw.get("branch"), 200), "unpushed": un, "dirty": num(raw.get("dirty")),
+                "last_push": text(raw.get("last_push"), 100), "last_error": last_error, "missing": missing}
 
     def snapshot(self, a):
         """ONE read-only look at the cluster: the pods of the namespace (name, worker, phase, node, hard deadline) and, when the login may
@@ -2946,11 +3745,55 @@ class Launcher:
             nodes, nodes_read, nodes_error = [], False, self.kube.scrub(e, 200)
         return {"pods": pods, "nodes": nodes, "nodes_read": nodes_read, "nodes_error": nodes_error}
 
+    def capacity(self, a):
+        """ONE read-only look at room: per node its name and allocatable cpu (millicores) and memory (bytes) ONLY (never its addresses), the requests of the
+        pods this login can list, per node, the Pending pods count and the last FailedScheduling line (scrubbed, 200 characters). Only `get` calls are made. A refused
+        read is said (`nodes_read`, `pods_read`, `events_read` false and a short scrubbed error), never a failure of the whole read."""
+        out = {"nodes": [], "requests": {}, "pending": None, "last_event": None,
+               "nodes_read": True, "nodes_error": None, "pods_read": True, "pods_error": None, "events_read": True, "events_error": None}
+        try:
+            for node in self.kube.list_nodes():
+                alloc = (node.get("status") or {}).get("allocatable") or {}
+                out["nodes"].append({"name": _cap_text(self.kube, (node.get("metadata") or {}).get("name"), 100),
+                                     "cpu_m": _quantity(alloc.get("cpu"), 1000), "memory_b": _quantity(alloc.get("memory"), 1)})
+        except CloudError as e:
+            out["nodes"], out["nodes_read"], out["nodes_error"] = [], False, self.kube.scrub(e, 120)
+        try:
+            pending = 0
+            for pod in self.kube.list_pods_all():
+                phase = (pod.get("status") or {}).get("phase")
+                pending += phase == "Pending"
+                node = (pod.get("spec") or {}).get("nodeName")
+                if node and phase not in ("Succeeded", "Failed"):
+                    mine = out["requests"].setdefault(_cap_text(self.kube, node, 100), {"cpu_m": 0, "memory_b": 0})
+                    for c in (pod.get("spec") or {}).get("containers") or []:
+                        req = ((c.get("resources") or {}).get("requests")) or {}
+                        mine["cpu_m"] += _quantity(req.get("cpu"), 1000)
+                        mine["memory_b"] += _quantity(req.get("memory"), 1)
+            out["pending"] = pending
+        except CloudError as e:
+            out["requests"], out["pods_read"], out["pods_error"] = {}, False, self.kube.scrub(e, 120)
+        try:
+            events = [ev for ev in self.kube.list_events() if (ev or {}).get("reason") in (None, "FailedScheduling")]
+            if events:
+                def when(ev):
+                    return str(ev.get("lastTimestamp") or ev.get("eventTime") or (ev.get("metadata") or {}).get("creationTimestamp") or "")
+                last = max(events, key=when)
+                who = (last.get("involvedObject") or {}).get("name")
+                out["last_event"] = _cap_text(self.kube, "FailedScheduling %s%s" % (who + ": " if who else "", last.get("message") or ""), 200)
+        except CloudError as e:
+            out["events_read"], out["events_error"] = False, self.kube.scrub(e, 120)
+        # PC-10: after the one scrub, every name and the event line lose an address of the three forms
+        out["nodes"] = [dict(n, name=_mask_addresses(n["name"])) for n in out["nodes"]]
+        out["requests"] = {_mask_addresses(k): v for k, v in out["requests"].items()}
+        out["last_event"] = _mask_addresses(out["last_event"])[:200] if out["last_event"] else out["last_event"]
+        return out
+
     def hard_deadline(self, pod):
         """The pod's copy, unless the switchboard record (read only, --record-dir) names a later or earlier one."""
         hard = parse_iso(ann(pod, "hard-deadline"))
         rd = self.env.get("CW_CLOUD_RECORD_DIR")
-        if rd and NAME_RE.match(ann(pod, "worker", "")):
+        if rd and NAME_RE.fullmatch(ann(pod, "worker", "")):
             try:
                 with open(os.path.join(rd, ann(pod, "worker") + ".json")) as f:
                     hard = parse_iso(json.load(f)["hard_deadline"])
@@ -3004,24 +3847,78 @@ class Launcher:
         """One pass: stop every pod past its hard deadline or idle too long. Returns [(worker, reason, exit)]."""
         out, now, live, jobs = [], self.clock(), [], []
         self.reap_results, self.last_hook = {}, None
+        mono = time.monotonic
+        steps = self.step_seconds = {"list": 0.0, "renew": 0.0, "vanished": 0.0, "activity": 0.0, "activity_n": 0, "stops": 0.0, "stops_n": 0, "orphans": 0.0, "notes": 0.0, "total": None}
+        t_pass = t0 = mono()
+        steps["start"] = t_pass   # a pass that raises is measured from here at its finally
         acts = {}   # name -> the activity this pass already read (passed to send_idle_nudges: one read per pod per pass)
-        pods = self.kube.list_pods()
+        try:
+            pods = self.kube.list_pods()
+        finally:
+            steps["list"] = mono() - t0
+        t0 = mono()
         # The renewal is the FIRST step: a slow activity read or stop below can no longer hold it back (the audit of 29 October).
-        renewed = self.renew_git_tokens(self._before_hard_limit(pods, now), now)
-        self._note_vanished_pods(pods, now)
+        try:
+            renewed = self.renew_git_tokens(self._before_hard_limit(pods, now), now)
+        finally:
+            steps["renew"] = mono() - t0
+        t0 = mono()
+        try:
+            self._note_vanished_pods(pods, now)
+        finally:
+            steps["vanished"] = mono() - t0
         for pod in pods:
             worker = ann(pod, "worker")
             reason = None
+            failed = (pod.get("status") or {}).get("phase") == "Failed"
             try:
                 hard = self.hard_deadline(pod)
             except (ValueError, TypeError):
-                out.append((worker, "unreadable deadline", 1))  # one bad pod never stops the pass
-                continue
-            if now >= hard:
+                if not failed:
+                    out.append((worker, "unreadable deadline", 1))  # one bad pod never stops the pass
+                    continue
+                hard = None   # a Failed pod is still handled below; its deadline is said once, not on every pass
+                said = (worker, self._failed_key(pod), "deadline")
+                if self._failed_name_fits(pod) and said not in FAILED_UNWRITTEN_TOLD:
+                    FAILED_UNWRITTEN_TOLD.add(said)
+                    out.append((worker, "unreadable deadline", 1))
+            if hard is not None and now >= hard:
                 reason = "hard limit"
+            elif failed:
+                # A pod that ended Failed answers nothing: read why ONCE, keep the record, report it once; delete it ten minutes after
+                # its record unless it holds unpushed work (kept). A second pass reads no activity of it.
+                if not self._failed_name_fits(pod):   # no worker annotation, or one that is not a worker name: not this launcher's pod, never read, recorded or deleted
+                    continue
+                note, fresh = self._failed_note(pod)
+                told = (worker, self._failed_key(pod))
+                if note.get("unwritten"):   # the pod stays; said once, written on the first pass that can
+                    if told not in FAILED_UNWRITTEN_TOLD:
+                        FAILED_UNWRITTEN_TOLD.add(told)
+                        out.append((worker, "record not written: " + note["pod_message"], 1))
+                    continue
+                FAILED_UNWRITTEN_TOLD.discard(told)
+                if fresh:
+                    out.append((worker, "pod failed: " + note["pod_failed_reason"][:160], 0))
+                elif ann(pod, "kept") != "true" and note.get("recorded_at") and self._failed_aged(worker, pod, note, now) is None:
+                    said = (worker, self._failed_key(pod), "time")
+                    if said not in FAILED_UNWRITTEN_TOLD:
+                        FAILED_UNWRITTEN_TOLD.add(said)
+                        out.append((worker, "record time unreadable; the pod is left", 1))
+                elif ann(pod, "kept") != "true" and note.get("recorded_at") and self._failed_aged(worker, pod, note, now):
+                    try:
+                        self._remove(pod["metadata"]["name"], ann(pod, "run-id") or None, (pod.get("metadata") or {}).get("uid"))
+                        self.audit(worker, "pod/" + pod["metadata"]["name"], "stop", self.cost(pod), True, "failed pod: record kept ten minutes", None, "pod_failed")
+                    except CloudError as e:
+                        out.append((worker, "failed pod not deleted: " + self.kube.scrub(e, 120), e.code))
+                continue
             else:
                 live.append(pod)   # before its hard limit and not stopped below: the git token renewal's candidates
-                act = self.activity(pod["metadata"]["name"])
+                t0 = mono()
+                try:
+                    act = self.activity(pod["metadata"]["name"])
+                finally:
+                    steps["activity"] += mono() - t0
+                    steps["activity_n"] += 1
                 acts[pod["metadata"]["name"]] = act
                 if act is None:
                     # Fail mode, decided: an unreadable activity is not a reason to kill work, so the pod runs until
@@ -3036,7 +3933,13 @@ class Launcher:
                 out.append(None)   # this pod's place in the result: filled after the stops ran
                 # by the run's own nonce where the pod carries one: a pod of another run under this name is left whole
                 jobs.append((len(out) - 1, worker, reason, ann(pod, "run-id") or None))
-        for (slot, worker, reason, _), (res, err, hook) in zip(jobs, self._run_stops(jobs)):
+        t0 = mono()
+        try:
+            stopped = self._run_stops(jobs)
+        finally:
+            steps["stops"] += mono() - t0
+            steps["stops_n"] += len(jobs)
+        for (slot, worker, reason, _), (res, err, hook) in zip(jobs, stopped):
             try:
                 if err is not None:
                     raise err
@@ -3048,9 +3951,22 @@ class Launcher:
                 self.reap_results[worker] = dict(hook or {})
                 out[slot] = (worker, reason, e.code)
         out.extend(renewed)
-        self.remove_orphan_secrets(pods, now)
-        self.send_wip_notes(live, now)
-        self.send_idle_nudges(live, now, acts)
+        t0 = mono()
+        try:
+            self.remove_orphan_secrets(pods, now)
+        finally:
+            steps["orphans"] = mono() - t0
+        t0 = mono()
+        try:
+            self.send_wip_notes(live, now)
+        finally:
+            steps["notes"] = mono() - t0
+        t0 = mono()
+        try:
+            self.send_idle_nudges(live, now, acts)
+        finally:
+            steps["notes"] += mono() - t0   # the nudges are counted with the notes: both are the pass's sends
+        steps["total"] = mono() - t_pass
         return out
 
     def _note_vanished_pods(self, pods, now):
@@ -3084,7 +4000,7 @@ class Launcher:
             return   # an empty snapshot is no evidence of anything
         reads = 0
         for rid, (worker, created) in open_runs.items():
-            if rid in present or not isinstance(worker, str) or not NAME_RE.match(worker):
+            if rid in present or not isinstance(worker, str) or not NAME_RE.fullmatch(worker):
                 continue
             if (now - created).total_seconds() <= VANISHED_MIN_AGE_SECONDS:
                 continue   # too young: a later pass notices it
@@ -3180,7 +4096,7 @@ class Launcher:
         for pod in pods:
             try:
                 worker, name = ann(pod, "worker"), pod["metadata"]["name"]
-                if (pod.get("status") or {}).get("phase") != "Running" or not NAME_RE.match(worker or ""):
+                if (pod.get("status") or {}).get("phase") != "Running" or not NAME_RE.fullmatch(worker or ""):
                     continue
                 if not wip_note_due(parse_iso(ann(pod, "started")), now, ann(pod, "wip-note")):
                     continue
@@ -3196,7 +4112,7 @@ class Launcher:
         for pod in pods:
             try:
                 worker, name = ann(pod, "worker"), pod["metadata"]["name"]
-                if (pod.get("status") or {}).get("phase") != "Running" or not NAME_RE.match(worker or ""):
+                if (pod.get("status") or {}).get("phase") != "Running" or not NAME_RE.fullmatch(worker or ""):
                     continue
                 if ann(pod, "idle-nudge") or ann(pod, "role", "worker") == "orchestrator":
                     continue
@@ -3227,7 +4143,11 @@ class Launcher:
         (worker, "git token renewed", 0) or (worker, "git token not renewed: WHY", 1). A pod that needs nothing (no per-run Secret, not due)
         adds nothing. One pod's trouble never stops the pass; the old token stays until a patch has landed."""
         with self.renew_lock:
-            return self._renew_locked(pods, now)
+            self._tail = AuditTail(self.audit_path)   # one lookup for this call; it reads nothing until a failure asks
+            try:
+                return self._renew_locked(pods, now)
+            finally:
+                self._tail = None
 
     def _renew_locked(self, pods, now):
         out, relogged = [], False
@@ -3261,7 +4181,8 @@ class Launcher:
 
     def _last_renewal_audit(self, rid):
         """(ok, reason) of the newest renew-git-token audit line of this pod, or None (reads the file's tail only)."""
-        return last_audit_line(self.audit_path, "renew-git-token", rid)
+        tail = getattr(self, "_tail", None)
+        return tail.get("renew-git-token", rid) if tail is not None else last_audit_line(self.audit_path, "renew-git-token", rid)
 
     def _audit_renewal_failure(self, worker, pod, why):
         """One audit line per CHANGE of reason (a persistent failure is not written again every pass; the success line is the 'cleared' line)."""
@@ -3280,7 +4201,7 @@ class Launcher:
         """The repository the switchboard's worker record names (read only, CW_CLOUD_RECORD_DIR): the one source the renewal trusts for what
         the worker was launched for. A missing or unreadable record stops the renewal."""
         rd = self.env.get("CW_CLOUD_RECORD_DIR")
-        if not rd or not NAME_RE.match(worker or ""):
+        if not rd or not NAME_RE.fullmatch(worker or ""):
             raise _NotRenewed("no worker record to read (CW_CLOUD_RECORD_DIR is not set)" if not rd else "bad worker name")
         try:
             with open(os.path.join(rd, worker + ".json")) as f:
@@ -3465,7 +4386,9 @@ SETTINGS = (
     ("CW_STACK_REGISTRY", False, "registry-host"),  # the stack registry's host name (pull-only for a stack pod); all three CW_STACK_ keys are set together or not at all
     ("CW_STACK_PULL_CLIENT_ID", False, "guid"),    # the client id of the pull identity (not a secret)
     ("CW_STACK_PULL_TENANT_ID", False, "guid"),    # the tenant id (not a secret)
+    ("CW_REPO_MIN_SHAPE", False, "name"),          # comma-separated OWNER/NAME=SHAPE: the smallest pod shape a launch for that repository may use (a floor)
     ("CW_VAULT_CHECK_DIR", False, "path"),         # the checkout the vault access check runs from; needed only after a vault firewall refusal (see vault_check_dir_problem)
+    ("CW_VAULT_BLOCK_DURATION", False, "duration"),   # how long the launcher refuses vault commands after a vault firewall refusal (default 10m, 1m to 60m)
 )
 SETTING_KINDS = {name: kind for name, _, kind in SETTINGS}
 SETTING_REQUIRED = tuple(name for name, required, _ in SETTINGS if required)
@@ -3610,7 +4533,9 @@ VALIDATORS = {
     "CW_STACK_REGISTRY": ("a lower-case registry host name ending in .azurecr.io: no scheme, path, port, user or IP address", _registry_host_ok),
     "CW_STACK_PULL_CLIENT_ID": ("a GUID", lambda v: bool(_GUID.fullmatch(v))),
     "CW_STACK_PULL_TENANT_ID": ("a GUID", lambda v: bool(_GUID.fullmatch(v))),
+    "CW_REPO_MIN_SHAPE": ("a comma-separated list of OWNER/NAME=SHAPE entries (SHAPE one of %s), no repository twice" % ", ".join(FLOOR_ORDER), lambda v: repo_min_shapes(v) is not None),
     "CW_VAULT_CHECK_DIR": ("an absolute path with no .. segment", _path_ok),
+    "CW_VAULT_BLOCK_DURATION": ("a duration of 1 to 3 digits and m or h, from 1m to 60m (for example 10m or 1h)", _duration_ok),
 }
 _SETTING_LINE = re.compile(r"([A-Z][A-Z0-9_]*)=(.*)")
 
@@ -3814,6 +4739,17 @@ def stack_registry_check(a, env, out):
     return 0
 
 
+def parse_issue_number(value):
+    """None when no issue is named; else an int above 0; anything else is a usage error."""
+    if value is None:
+        return None
+    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+        return value
+    if isinstance(value, str) and re.fullmatch(r"[1-9][0-9]{0,9}", value):
+        return int(value)
+    raise CloudError("--issue must be a whole number above 0, got %r; nothing was created" % str(value)[:40], EXIT_USAGE)
+
+
 def build_parser():
     p = argparse.ArgumentParser(prog="cloud-worker")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -3830,6 +4766,7 @@ def build_parser():
     k.add_argument("--identity", default=PULLER_IDENTITY)
     c = cmd("create")
     c.add_argument("--repo", required=True)
+    c.add_argument("--issue", default=None, help="the issue number (a whole number above 0) written into the hub entry of a registered worker")
     c.add_argument("--branch", required=True)
     c.add_argument("--idle", default="30m")
     c.add_argument("--hard", default="2h")
@@ -3856,6 +4793,8 @@ def build_parser():
                    help="the nonce create recorded: stop acts only when the pod carries it (another run's worker of the same name is left whole, exit 6); without it stop acts by name")
     s.add_argument("--record-dir", help="where the run record goes (default: $CW_RUN_RECORD_DIR, else runs/ beside the audit file)")
     s.add_argument("--no-record", action="store_true", help="write no run record (a record is the default: every stop makes one)")
+    s.add_argument("--pod-uid", type=_pod_uid, help="the uid create recorded: stop acts only on the pod with this uid (a new pod under the name is left whole, exit 6)")
+    s.add_argument("--hub-entry", action="store_true", help="also remove the worker's hub entry when its pod is already gone (a hub orchestrator)")
     e = cmd("extend")
     e.add_argument("--hard")
     e.add_argument("--idle")
@@ -3864,7 +4803,9 @@ def build_parser():
     d.add_argument("--force", action="store_true")
     d.add_argument("--reason", default="")
     cmd("status")
+    cmd("inspect")   # ONE read-only look inside a running pod: the call in flight, the recent calls, git, the last push
     cmd("snapshot", worker=False)   # ONE read-only look at the cluster: the pods of the namespace and, when the login may list them, the nodes
+    cmd("capacity", worker=False)   # ONE read-only look at room: the nodes' allocatable, the pods' requests, the Pending count, the last FailedScheduling line
     cmd("report")
     pr = cmd("prune-records", worker=False)
     pr.add_argument("--days", type=int, help="remove run records older than this many days (default: $CW_RECORD_KEEP_DAYS, else 30)")
@@ -3877,6 +4818,12 @@ def build_parser():
 def _run_id(v):
     if not re.fullmatch(r"[0-9a-f]{8,64}", v):
         raise argparse.ArgumentTypeError("--run-id is 8 to 64 lowercase hex characters")
+    return v
+
+
+def _pod_uid(v):
+    if not POD_UID_RE.fullmatch(v):
+        raise argparse.ArgumentTypeError("--pod-uid is 1 to 64 letters, digits, dots, dashes or underscores")
     return v
 
 
@@ -3973,6 +4920,7 @@ class RenewalTicker:
         now = self.clock()
         self.last = now
         self.ticks += 1
+        cpu0, parsed0 = time.thread_time(), tail_lines_parsed()
         try:
             with self.L.renew_lock:
                 refresh = self.refresher.run()
@@ -3984,6 +4932,8 @@ class RenewalTicker:
                 self.L.renew_git_tokens(self.L._before_hard_limit(self.L.kube.list_pods(), now), now)
         except Exception as e:   # the thread goes on: the next tick tries again
             print("cloud-worker: the renewal thread: %s" % scrub(e, (), 200), file=sys.stderr)
+        finally:
+            print("cloud-worker: renewal tick line: cpu_seconds=%.3f audit_lines_parsed=%d" % (time.thread_time() - cpu0, tail_lines_parsed() - parsed0), file=sys.stderr)
 
     def _run(self):
         while not self._stop.is_set():
@@ -4001,6 +4951,23 @@ class RenewalTicker:
         self._stop.set()
         if self.thread is not None and self.thread is not threading.current_thread():
             self.thread.join(5)   # a tick in flight ends first
+
+
+def step_text(st):
+    """The seconds of the seven steps of a pass, for the pass line: numbers only, no name or value.
+
+    Never raises (it runs inside a finally) and never prints a negative number: a bad dictionary gives the line without a step part."""
+    try:
+        if not st:
+            return ""
+        def sec(v):
+            return max(0.0, float(v))
+        total = st["total"] if st["total"] is not None else time.monotonic() - st["start"]   # a pass that raised never set its total: the wall seconds from its start
+        return " steps list=%.1f renew=%.1f vanished=%.1f activity=%.1f (%d) stops=%.1f (%d) orphans=%.1f notes=%.1f total=%.1f" % (
+            sec(st["list"]), sec(st["renew"]), sec(st["vanished"]), sec(st["activity"]), int(st["activity_n"]), sec(st["stops"]), int(st["stops_n"]),
+            sec(st["orphans"]), sec(st["notes"]), sec(total))
+    except Exception:
+        return ""
 
 
 def _reap_main(env, a, sleep, clock=None, refresher=None, kube=None, ticker_wait=None, tree=None):
@@ -4023,6 +4990,14 @@ def _reap_main(env, a, sleep, clock=None, refresher=None, kube=None, ticker_wait
         ticker = None
         identity = code_identity(tree) if tree else START_IDENTITY
         while True:
+            blocked = read_vault_block(env)
+            if blocked is not None and time.time() < blocked[1]:   # the vault block (ask #1427): no pass, no az process, ONE log line
+                print("cloud-worker: reaper pass skipped: %s" % vault_block_line(blocked), file=sys.stderr)
+                if not a.loop:
+                    why = "end of its pass"
+                    return 0
+                sleep(min(a.loop, REAP_FLOOR_SECONDS))
+                continue
             refresh = refresher.run()
             for line in getattr(refresher, "notices", []):
                 print(line, file=sys.stderr)   # the stdout line of a pass is the JSON report; the notice names a setting, never a value
@@ -4046,7 +5021,13 @@ def _reap_main(env, a, sleep, clock=None, refresher=None, kube=None, ticker_wait
                 ticker = RenewalTicker(L, refresher, clock, ticker_wait)
                 ticker.start()
             began = clock()
-            work = L.reap() if L is not None else []   # the pass's own work: the workers' results
+            if L is not None:
+                L.step_seconds = None   # the pass line shows the steps of THIS pass only
+            cpu0, parsed0 = time.thread_time(), tail_lines_parsed()
+            try:
+                work = L.reap() if L is not None else []   # the pass's own work: the workers' results
+            finally:
+                print("cloud-worker: reaper pass line: cpu_seconds=%.3f audit_lines_parsed=%d%s" % (time.thread_time() - cpu0, tail_lines_parsed() - parsed0, step_text(getattr(L, "step_seconds", None))), file=sys.stderr)
             took = (clock() - began).total_seconds()
             if L is not None:
                 L.note_slow_pass(took)
