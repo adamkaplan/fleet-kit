@@ -1282,7 +1282,9 @@ class TestDeliver(Base):
         self.assertEqual((intent["phase"], result["phase"], result["ok"]), ("intent", "result", True))
         self.assertEqual(intent["detail"]["message_id"], admitted["id"])
         (write,) = self.world.v2.writes
-        self.assertEqual(write["audit_lines"], len(self.world.audit()) - 1)  # the intent was on disk first
+        events = self.world.audit()
+        intent_at = next(i for i, e in enumerate(events) if e["event"] == "v2.synthetic" and e["phase"] == "intent")
+        self.assertEqual(write["audit_lines"], intent_at + 1)  # the intent was on disk first: the write saw every line up to and including it, whatever other lines the pass adds after
         self.world.tick(5)
         self.assertEqual(self.pass_()["sent"], [])  # delivered keys are never sent again
 
@@ -16646,7 +16648,7 @@ class TestShadowClassifier(Base):
         self.assertEqual(self.world.v2.writes, [])
         self.assertEqual(self.world.admissions("cos"), [])
         self.assertEqual(self.world.admissions("coder"), [])
-        self.assertEqual([e for e in self.world.audit() if e["event"] not in ("classify",)], [])
+        self.assertEqual([e for e in self.world.audit() if e["event"] not in ("classify", "push_watch.skipped")], [])   # push_watch.skipped (#2175): the push watch notes that it has no hub, a note about itself, not an action on the message
         self.assertEqual([c[1:3] for c in self.world.herdr.calls if c[1:3] not in HERDR_ALLOWED], [])
 
     def test_each_new_message_is_classified_once_and_the_previous_one_is_sent_along(self):
@@ -27880,8 +27882,11 @@ class TestPlanWake(Base):
         self.assertEqual(len(texts), 1, msg=texts)
         self.assertIn(b, texts[0])
         self.assertNotIn(a, texts[0])
-        dropped = [e for e in self.world.audit() if e["event"] == "stale.dropped"]
-        self.assertEqual([e["detail"]["kind"] for e in dropped], ["plan"])
+        # the replaced notice's drop is audited: by the plan pass itself (plan_wake.dropped, #1784) or by the delivery recheck (stale.dropped, #1542)
+        dropped = [e["detail"].get("dropped") or e["detail"].get("hash") or e["detail"].get("kind")
+                   for e in self.world.audit() if e["event"] in ("plan_wake.dropped", "stale.dropped")]
+        self.assertEqual(len(dropped), 1, msg=dropped)
+        self.assertIn(dropped[0], (a, "plan"))
 
     def delivered_to_orch(self):
         self.hub.present_record = lambda *args: {}   # FAKE: the delivery reader needs a hub with the present-state read; the plan facts never use it
