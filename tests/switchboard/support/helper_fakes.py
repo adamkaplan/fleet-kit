@@ -10,7 +10,6 @@ import sys
 import time
 import urllib.parse
 from unittest import mock
-from support.paths import BIN, REPO
 from support.delivery_measure import REPO
 from support.installs_and_keys import tree_of
 from support.loader import class_source, sb, switchboard_source

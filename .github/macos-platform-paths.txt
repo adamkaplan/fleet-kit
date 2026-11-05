@@ -21,6 +21,7 @@ bin/switchboard/installer.py
 
 # group: heavy-slot
 bin/heavy_slots.py
+bin/heavy_slots_watch.py
 bin/cpu_guard.py
 bin/disk_janitor.py
 # github_census picks the /proc reader or the ps/lsof reader by sys.platform

@@ -90,3 +90,5 @@ findings:
 ## Posting your review
 
 To have your review posted to GitHub with your marker, the command is `fleet-switchboard review post <PR> --head <full head> --verdict approve|request-changes|comment --body-file FILE`, and to clear your own request-changes after the fix `fleet-switchboard review dismiss <PR> --review ID --reason TEXT` (the coordinator or a registered reader runs them; this definition's permissions stay read-only). A cloud reader can use them once its token allows it.
+
+A test never pins an exact set or size (an argument list, environment names, settings, flags, file sizes, line or word counts, or any set a normal change grows): it checks behaviour and real safety properties (no secret in an output, no untrusted interpolation, a required item present). A reviewer flags such a test and never asks for one.

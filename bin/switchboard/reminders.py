@@ -71,7 +71,8 @@ def write_reminders(state_dir, items):
 
 
 LATE_NOTE_SECONDS = 300
-TEXT_CAP = 4000  # mirrors MESSAGE_CAP in bin/fleet-switchboard
+TEXT_CAP = 4000  # mirrors MESSAGE_CAP in bin/fleet-switchboard: a text over it is refused on the command line and carried in parts from `--text-file` (#1355)
+TEXT_FILE_MAX = 100000  # characters of a `--text-file`: about 30 parts, well inside the 50-part bound of the parts carrier, so nothing is ever refused after arming
 
 
 REMINDER_TTL_MAX = 86400   # #1563: the longest ttl `remind --ttl` takes
@@ -288,6 +289,46 @@ def merge_wake_facts(recipient, facts, budget=None):
     merged.sent_min = min(f.created for f in group)   # #1402: the oldest member, so an old digest does not look new
     merged.member_lines = {f.key: "- %s: %s" % (_clean_line(wake_class_of(f)), _clean_line(f.summary)) for f in group}
     return [f for f in facts if not wake_class_of(f)] + rest + [merged]
+
+
+DELAYED_MARK_SECONDS = 1800   # #1468: a reminder copy delivered later than this after it fired is marked "delayed: sent HH:MMZ"
+
+
+def delayed_text(text, sent_at):
+    """The reminder text with the first line "delayed: sent HH:MMZ" (UTC)."""
+    return "delayed: sent %sZ\n%s" % (time.strftime("%H:%M", time.gmtime(sent_at)), text)
+
+
+def merge_reminder_copies(facts):
+    """#1468: queued reminder copies with the same sender, recipient and text (keyed or not) become ONE fact with the count and the newest
+    sent time. The merged fact carries every copy's key in `members`, so all are acknowledged. Any other fact passes through untouched."""
+    groups = {}
+    for fact in facts:
+        if fact.kind == "reminder" and not getattr(fact, "wake_class", None) and hasattr(fact, "reminder_text"):
+            groups.setdefault((fact.sender, fact.recipient, fact.reminder_text), []).append(fact)
+    merged_for = {}
+    for (sender, recipient, text), group in groups.items():
+        if len(group) < 2:
+            continue
+        newest = max(group, key=lambda f: (f.created, f.key))
+        body = "%s (%d copies, newest sent %sZ)" % (text, len(group), time.strftime("%H:%M", time.gmtime(newest.created)))
+        if getattr(newest, "delayed", False):
+            body = delayed_text(body, newest.created)
+        keys = sorted(f.key for f in group)
+        merged = Fact("reminder-merge:" + hashlib.sha256("|".join(keys).encode()).hexdigest()[:12], recipient, "reminder", body,
+                      newest.created, issue=newest.issue, batch=False, sender=sender, repo=newest.repo)
+        merged.members = keys
+        for f in group:
+            merged_for[id(f)] = merged
+    out, seen = [], set()
+    for fact in facts:
+        merged = merged_for.get(id(fact))
+        if merged is None:
+            out.append(fact)
+        elif id(merged) not in seen:
+            seen.add(id(merged))
+            out.append(merged)
+    return out
 
 
 # ---- #1402: what is dropped at delivery
@@ -651,12 +692,16 @@ class ReminderFacts:
                     continue
             text = self.overdue_text(item) if isinstance(item.get("condition"), dict) and isinstance(item["condition"].get("unless_report_from"), str) and self.engine else item["text"]
             late = (self.engine.now() if self.engine else time.time()) - item["at"]
-            if late >= LATE_NOTE_SECONDS:
+            raw_text = text
+            if late > DELAYED_MARK_SECONDS:
+                text = delayed_text(text, item["at"])
+            elif late >= LATE_NOTE_SECONDS:
                 note = " (late by %d min)" % int(late // 60)
-                cut = len(text) + len(note) > TEXT_CAP
-                text = text[:max(0, TEXT_CAP - len(note) - (1 if cut else 0))] + ("\u2026" if cut else "") + note   # the note is applied before the cap and kept: the body is cut, not the note
+                text = text + note   # #1355: never cut here: an over-cap text is carried in parts by compose, the note ends the last part
             facts.append(Fact("reminder:" + item["id"], item["to"], "reminder", text, item["at"],
                               issue=item.get("issue"), batch=False, sender=item.get("from"), repo=item.get("repo")))
+            facts[-1].reminder_text = raw_text
+            facts[-1].delayed = late > DELAYED_MARK_SECONDS
             if isinstance(item.get("wake_class"), str):
                 facts[-1].wake_class = item["wake_class"]
         return facts
@@ -876,8 +921,22 @@ def cmd_remind(args, runner, now):
     moment = now()
     if args.list_mine or args.cancel or getattr(args, "cancel_key", None):
         return remind_manage(args, engine, state, sender, moment)
-    if not args.name or not args.when or not args.text:
-        sys.stderr.write("%s: remind needs <name> <when> <text> (or --list, or --cancel <id>)\n" % PROG)
+    text_file = getattr(args, "text_file", None)   # a caller that builds its own namespace has none
+    if text_file and args.text:
+        sys.stderr.write("%s: remind takes the text as words or from --text-file, not both; nothing armed\n" % PROG)
+        return EXIT_USAGE
+    if not args.name or not args.when or not (args.text or text_file):
+        sys.stderr.write("%s: remind needs <name> <when> <text> (or --text-file F, or --list, or --cancel <id>)\n" % PROG)
+        return EXIT_USAGE
+    if text_file:
+        text, problem = read_text_file(text_file)
+    else:
+        text, problem = " ".join(args.text).strip(), None
+        if len(text) > TEXT_CAP:   # #1355: never armed to be cut on delivery
+            problem = ("the text is %d characters, over the %d-character message cap: nothing armed. "
+                       "Put it in a file and use --text-file F, which carries it in full in parts" % (len(text), TEXT_CAP))
+    if problem:
+        sys.stderr.write("%s: %s\n" % (PROG, problem))
         return EXIT_USAGE
     try:
         repo, number = resolve_for_sender(engine, config, args.issue, sender)
@@ -916,10 +975,10 @@ def cmd_remind(args, runner, now):
         warning = ("%s: reminder is dropped if it closes (%s#%d closes or its pull request merges), with one notice to you; "
                    "use --keep-if-closed to keep it\n" % (PROG, repo, number))
     item = add_reminder(state, args.name, parse_when(args.when, moment), moment,
-                        " ".join(args.text).strip(), number, sender, repo, condition=condition or None,
+                        text, number, sender, repo, condition=condition or None,
                         key=_one_line(args.key, 80) if args.key else None, ttl=ttl)
     if len(item["text"]) > TEXT_CAP:
-        sys.stderr.write("%s: warning: text is cut at %d characters: %d characters over\n" % (PROG, TEXT_CAP, len(item["text"]) - TEXT_CAP))
+        sys.stderr.write("%s: the text is %d characters: it is delivered in parts, each under %d, the last one closing it\n" % (PROG, len(item["text"]), TEXT_CAP))
     engine.audit.append("cli", "reminder.add", args.name, {"id": item["id"], "at": iso(item["at"]),
                                                           "from": sender, "issue": number, "repo": repo})
     print(item["id"])
@@ -929,5 +988,527 @@ def cmd_remind(args, runner, now):
     return EXIT_OK
 
 
+def read_text_file(path):
+    """(text, None) of a UTF-8 text file for `remind --text-file`, or (None, why it is refused): unreadable, not a regular file, too large, not UTF-8 text, or empty."""
+    try:
+        with open(path, "rb") as handle:
+            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                return None, "--text-file %s is not a regular file: nothing armed" % _one_line(path, 80)
+            raw = handle.read(TEXT_FILE_MAX * 4 + 1)   # a character is at most 4 bytes: bounded whatever the file is
+    except OSError as err:
+        return None, "--text-file %s cannot be read (%s): nothing armed" % (_one_line(path, 80), err.strerror or "error")
+    try:
+        text = raw.decode("utf-8").strip()
+    except UnicodeDecodeError:
+        if len(raw) > TEXT_FILE_MAX * 4:
+            text = None
+        else:
+            return None, "--text-file %s is not UTF-8 text: nothing armed" % _one_line(path, 80)
+    if text is None or len(text) > TEXT_FILE_MAX:
+        return None, "--text-file %s is over %d characters: nothing armed" % (_one_line(path, 80), TEXT_FILE_MAX)
+    if "\x00" in text:
+        return None, "--text-file %s is not text (it holds a NUL): nothing armed" % _one_line(path, 80)
+    if not text:
+        return None, "--text-file %s is empty: nothing armed" % _one_line(path, 80)
+    return text, None
+
+
 cmd_remind.ensure_on_use = True   # the daemon is alive when it runs
 cmd_remind.header_cache = True    # #1520
+
+
+# ---- ci-queue (#1961): a read-only measure of the Actions queue; INLINED here until #1092 (no new flat module). GET only, writes nothing.
+
+CI_QUEUE_GATE_LEGS = ("test (ubuntu-latest)", "test-cloud (ubuntu-latest)", "test (macos-latest)", "test-cloud (macos-latest)")   # bin/merge_gate.py UBUNTU_LEGS + MAC_LEGS (a test holds them equal)
+CI_QUEUE_GATE_FEEDERS = ("plan",)   # a job no gate names but that builds the matrix of the jobs a gate does name: never a cut candidate
+CI_QUEUE_PAGES = 10                 # pages of 100 read for one run's jobs (bounded)
+CI_QUEUE_RUN_PAGES = 40             # pages of 100 read for the run list (bounded)
+
+
+def _ci_time(text):
+    """Epoch seconds of an Actions timestamp, or None when it is absent."""
+    if not isinstance(text, str) or not text:
+        return None
+    return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+
+
+def _ci_peak(spans, now):
+    """The most intervals open at one instant. `spans` are (start, end or None); None runs to now. At one instant an end is counted before a start."""
+    events = []
+    for start, end in spans:
+        events.append((start, 1))
+        events.append((now if end is None else end, -1))
+    open_now = peak = 0
+    for _, step in sorted(events):
+        open_now += step
+        peak = max(peak, open_now)
+    return peak
+
+
+def ci_queue_measure(runs, jobs_by_run, now, hours=24, gate_names=(), docs_only=()):
+    """The counts of the window: per run the queue wait (run created to first job started; an unstarted run waits until `now`), the run time and the jobs
+    by name; the job-minutes by workflow; the peak of jobs queued at once and the observed ceiling of jobs running at once; the cut, dedupe and move
+    candidates with job-minutes per day. `runs` and `jobs_by_run` are the Actions API objects (`created_at`, `started_at`, `completed_at`)."""
+    since = now - hours * 3600
+    per_run, minutes, queued, running, job_minutes = [], {}, [], [], {}
+    seen_heads, repeat_runs, repeat_minutes, move_minutes = set(), 0, 0.0, 0.0
+    for run in sorted((r for r in runs if (_ci_time(r.get("created_at")) or 0) >= since), key=lambda r: _ci_time(r["created_at"])):
+        created, jobs = _ci_time(run["created_at"]), jobs_by_run.get(run["id"]) or []
+        starts = [t for t in (_ci_time(j.get("started_at")) for j in jobs) if t is not None]
+        first = min(starts) if starts else None
+        wait = (first if first is not None else now) - created
+        done = bool(jobs) and all(j.get("completed_at") for j in jobs)
+        end = max(_ci_time(j["completed_at"]) for j in jobs) if done else now
+        names = {}
+        run_minutes = macos_minutes = 0.0
+        for job in jobs:
+            names[job["name"]] = names.get(job["name"], 0) + 1
+            job_start, job_end = _ci_time(job.get("started_at")), _ci_time(job.get("completed_at"))
+            queued.append((_ci_time(job.get("created_at")) or created, job_start))
+            if job_start is not None:
+                running.append((job_start, job_end))
+                spent = ((now if job_end is None else job_end) - job_start) / 60.0
+                run_minutes += spent
+                job_minutes[job["name"]] = job_minutes.get(job["name"], 0.0) + spent
+                if "macos" in job["name"]:
+                    macos_minutes += spent
+        workflow = run.get("name") or "?"
+        minutes[workflow] = minutes.get(workflow, 0.0) + run_minutes
+        head = (workflow, run.get("event"), run.get("head_sha"))
+        if run.get("event") == "pull_request" and run.get("head_sha"):
+            if head in seen_heads:
+                repeat_runs += 1
+                repeat_minutes += run_minutes
+            seen_heads.add(head)
+        if run["id"] in docs_only:
+            move_minutes += macos_minutes
+        per_run.append({"id": run["id"], "workflow": workflow, "event": run.get("event"), "wait_seconds": int(round(wait)),
+                        "run_seconds": int(round(end - first)) if first is not None else 0, "jobs": len(jobs), "job_names": names})
+    scale = 24.0 / hours
+    cut = [{"kind": "cut", "what": name, "job_minutes_per_day": int(round(spent * scale))} for name, spent in sorted(job_minutes.items())
+           if name not in gate_names and name not in CI_QUEUE_GATE_FEEDERS]
+    candidates = cut + [
+        {"kind": "dedupe", "what": "%d run(s) on a head that already had a run" % repeat_runs, "job_minutes_per_day": int(round(repeat_minutes * scale))},
+        {"kind": "move", "what": "macOS legs of %d run(s) whose change touches no platform path" % len(set(docs_only)), "job_minutes_per_day": int(round(move_minutes * scale))}]
+    return {"window_hours": hours, "runs": per_run, "job_minutes_by_workflow": {k: int(round(v)) for k, v in sorted(minutes.items())},
+            "peak_queued": _ci_peak(queued, now), "observed_ceiling": _ci_peak(running, now), "published_limit": "not readable by a lane",
+            "repeat_runs": repeat_runs, "draft_push_runs": sum(1 for r in runs if r.get("draft") is True), "candidates": candidates}
+
+
+def ci_queue_lines(report):
+    out = ["%-12s %-18s %-14s %8s %8s %5s" % ("run", "workflow", "event", "wait s", "run s", "jobs")]
+    for run in report["runs"]:
+        out.append("%-12s %-18s %-14s %8d %8d %5d" % (run["id"], run["workflow"], run["event"], run["wait_seconds"], run["run_seconds"], run["jobs"]))
+        out.extend("    %s x %d" % (name, count) for name, count in sorted(run["job_names"].items()))
+    out.append("job-minutes by workflow (%dh window):" % report["window_hours"])
+    out.extend("    %s = %d" % (name, value) for name, value in report["job_minutes_by_workflow"].items())
+    out.append("peak queued = %d" % report["peak_queued"])
+    out.append('runner limit: "observed" ceiling of %d concurrent jobs; published limit: "%s"' % (report["observed_ceiling"], report["published_limit"]))
+    out.append("repeat runs on one head: %d; draft push runs: %d" % (report["repeat_runs"], report["draft_push_runs"]))
+    out.append("candidates (job-minutes per day):")
+    out.extend("    %s: %s = %d" % (c["kind"], c["what"], c["job_minutes_per_day"]) for c in report["candidates"])
+    return out
+
+
+def ci_queue_get(runner, gh, path, timeout):
+    """ONE `gh api` GET (no method flag, no field flag: gh sends GET); the JSON object, or None when the call failed. Never prints the output."""
+    try:
+        done = runner([gh, "api", path], capture_output=True, text=True, timeout=timeout)
+        return json.loads(done.stdout) if done.returncode == 0 else None
+    except Exception:   # a timeout, a missing gh or a body that is not JSON: the read failed, nothing else is said (never the output: it could carry a credential)
+        return None
+
+
+def ci_queue_fetch(runner, gh, repo, since, patterns=(), timeout=60):
+    """(runs, jobs_by_run, docs_only run ids) of the repository since `since`: one list call per page and one jobs call per run, GET only."""
+    runs, jobs_by_run, docs_only = [], {}, set()
+    for page in range(1, CI_QUEUE_RUN_PAGES + 1):   # newest first: stop at the first page that reaches back past the window
+        data = ci_queue_get(runner, gh, "repos/%s/actions/runs?per_page=100&page=%d" % (repo, page), timeout)
+        if data is None:
+            raise ReminderError("the run list could not be read")
+        listed = data.get("workflow_runs") or []
+        runs.extend(r for r in listed if (_ci_time(r.get("created_at")) or 0) >= since)
+        if len(listed) < 100 or any((_ci_time(r.get("created_at")) or 0) < since for r in listed):
+            break
+    for run in runs:
+        found = []
+        for page in range(1, CI_QUEUE_PAGES + 1):
+            data = ci_queue_get(runner, gh, "repos/%s/actions/runs/%s/jobs?filter=all&per_page=100&page=%d" % (repo, run["id"], page), timeout)
+            if data is None:
+                raise ReminderError("the jobs of run %s could not be read" % run["id"])
+            found.extend(data.get("jobs") or [])
+            if len(data.get("jobs") or []) < 100:
+                break
+        jobs_by_run[run["id"]] = found
+    heads = {}
+    for run in runs:
+        if run.get("head_sha") and any("macos" in j["name"] and j.get("started_at") for j in jobs_by_run[run["id"]]):
+            heads.setdefault(run["head_sha"], []).append(run["id"])
+    for head, ids in (heads.items() if patterns else ()):
+        commit = ci_queue_get(runner, gh, "repos/%s/commits/%s" % (repo, head), timeout) or {}
+        files = [f.get("filename", "") for f in commit.get("files") or []]
+        if files and not any(re.fullmatch(".*".join(re.escape(p) for p in pattern.replace("**", "*").split("*")), name) for name in files for pattern in patterns):
+            docs_only.update(ids)
+    return runs, jobs_by_run, docs_only
+
+
+def ci_queue_platform_paths(path):
+    """The globs of a macos-platform-paths.txt file (`*` crosses a `/`); [] when the file cannot be read (then no run is a `move` candidate)."""
+    try:
+        text = Path(path).read_text()
+    except (OSError, UnicodeError):
+        return []
+    return [line.strip() for line in text.splitlines() if line.strip() and not line.lstrip().startswith("#")]
+
+
+def cmd_ci_queue(args, runner, now):
+    """`ci-queue [--repo OWNER/REPO] [--hours N] [--until ISO] [--paths-file F] [--json]`: the queue wait, run time, jobs, job-minutes, peak queued and the observed ceiling of the
+    Actions runs of the window, and the cut / dedupe / move candidates. Read-only: GET requests only, nothing is written to GitHub."""
+    engine, _, config = build_engine(runner, now, "cli", writable=False)
+    repo = args.repo or config.get("intent_repo")
+    if not repo or not re.fullmatch(r"[\w.-]+/[\w.-]+", repo):
+        sys.stderr.write("%s: ci-queue: give --repo OWNER/REPO\n" % PROG)
+        return EXIT_USAGE
+    if not 1 <= args.hours <= 168:
+        sys.stderr.write("%s: ci-queue: --hours is 1 to 168\n" % PROG)
+        return EXIT_USAGE
+    try:
+        end = _ci_time(args.until) if args.until else now()
+    except ValueError:
+        sys.stderr.write("%s: ci-queue: --until is an ISO time with a zone\n" % PROG)
+        return EXIT_USAGE
+    try:
+        runs, jobs_by_run, docs_only = ci_queue_fetch(runner, config["gh"], repo, end - args.hours * 3600, ci_queue_platform_paths(args.paths_file))
+    except (ReminderError, OSError) as err:
+        sys.stderr.write("%s: ci-queue: %s\n" % (PROG, _one_line(str(err), 120)))
+        return EXIT_ERROR
+    report = ci_queue_measure([r for r in runs if (_ci_time(r.get("created_at")) or 0) <= end], jobs_by_run, end, args.hours,
+                              CI_QUEUE_GATE_LEGS, docs_only)
+    print(json.dumps(report, indent=1, sort_keys=True) if args.json else "\n".join(ci_queue_lines(report)))
+    return EXIT_OK
+
+
+cmd_ci_queue.direct = True   # reads GitHub only; no daemon start
+# ---- queue (#1786)
+# The standing launch queue: `launch-queue.jsonl` (the lanes append) and `launch-queue.status.jsonl` (the cloud lane appends), both in the
+# state directory. It decides the order, the staleness and the hash check; it never starts a pod. Temporary home: moves with #1092.
+
+QUEUE_FILE = "launch-queue.jsonl"
+QUEUE_STATUS_FILE = "launch-queue.status.jsonl"
+QUEUE_LINE_MAX = 2000
+QUEUE_STALE_SECONDS = 120 * 60
+QUEUE_CLOUD_LANE = "fleet-cloud"
+QUEUE_REFUSED = 1
+QUEUE_KINDS = ("builder", "tester", "measure")
+QUEUE_KEYS = ("id", "enqueued", "lane", "name", "kind", "ask", "brief_file", "base_branch", "wip_branch", "role", "reports_to", "shape",
+              "idle", "hard", "priority", "plan_issue", "plan_hash_full", "approved_by", "approved_at", "until")
+QUEUE_STATES = ("queued", "waiting", "launched", "refused", "stale", "superseded", "finished")
+QUEUE_GONE = ("launched", "finished", "superseded")
+
+
+def queue_append(path, record):
+    data = (json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+    if len(data) > QUEUE_LINE_MAX + 1:
+        raise FactError("a queue line is at most %d bytes" % QUEUE_LINE_MAX)
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        os.write(fd, data)   # one O_APPEND write: one line, never half read
+    finally:
+        os.close(fd)
+
+
+def queue_lines(path, keys, tail=None):
+    """([(line number, record)], [bad line numbers]): a missing file is empty; a bad line is counted, never raised."""
+    try:
+        with open(str(path), "rb") as handle:
+            if tail:
+                handle.seek(0, os.SEEK_END)
+                handle.seek(max(0, handle.tell() - tail))
+            raw = handle.read()
+    except FileNotFoundError:
+        return [], []
+    except OSError:
+        return [], [0]
+    good, bad = [], []
+    for number, line in enumerate(raw.split(b"\n"), 1):
+        if not line.strip():
+            continue
+        try:
+            if len(line) > QUEUE_LINE_MAX:
+                raise ValueError("long")
+            record = load_module("record_json").parse_bounded(line.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            bad.append(number)
+            continue
+        if isinstance(record, dict) and all(isinstance(record.get(key), str) for key in keys):
+            good.append((number, record))
+        else:
+            bad.append(number)
+    return good, bad
+
+
+def queue_epoch(text):
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+    except (ValueError, AttributeError):
+        return None
+
+
+def queue_fold(state_dir):
+    """(entries by id in file order, last status by id, bad entry lines, bad status lines): the last line of an id decides."""
+    entries, status = {}, {}
+    lines, bad = queue_lines(Path(state_dir) / QUEUE_FILE, ("id",))
+    for number, rec in lines:
+        key = rec["id"]
+        if rec.get("op") is None:
+            if isinstance(rec.get("name"), str) and (key not in entries or entries[key]["lane"] == rec.get("lane")):
+                entries[key] = dict(rec, line=number)
+            else:
+                bad.append(number)
+        elif key in entries and rec.get("lane") == entries[key]["lane"]:
+            if rec["op"] == "priority" and isinstance(rec.get("priority"), int):
+                entries[key]["priority"] = rec["priority"]
+            elif rec["op"] == "cancel":
+                entries[key]["cancelled"] = True
+    rows, bad_status = queue_lines(Path(state_dir) / QUEUE_STATUS_FILE, ("id", "state"))
+    for _, rec in rows:
+        status[rec["id"]] = rec
+    return entries, status, sorted(bad), bad_status
+
+
+def queue_view(state_dir, moment):
+    """(live entries in launch order, each with age, state and stale; the unreadable line numbers)."""
+    entries, status, bad, bad_status = queue_fold(state_dir)
+    view = []
+    for key, entry in entries.items():
+        last = status.get(key) or {}
+        if entry.get("cancelled") or last.get("state") in QUEUE_GONE:
+            continue
+        queued = queue_epoch(entry.get("enqueued") or "")
+        until = queue_epoch(entry["until"]) if isinstance(entry.get("until"), str) else None
+        age = moment - queued if queued is not None else QUEUE_STALE_SECONDS + 1
+        stale = moment > until if until is not None else age > QUEUE_STALE_SECONDS
+        refused = last.get("state") == "refused" and last.get("rev", 0) >= entry["line"]
+        priority = entry["priority"] if isinstance(entry.get("priority"), int) else 5
+        view.append(dict(entry, age=age, state=last.get("state") or "queued", reason=last.get("reason"), stale=stale, skipped=refused, order=(priority, queued or 0, key)))
+    view.sort(key=lambda item: item["order"])
+    return view, bad + bad_status
+
+
+def queue_age(seconds):
+    return "%dm" % (max(seconds, 0) // 60) if seconds < 7200 else "%dh" % (seconds // 3600)
+
+
+def queue_note(state_dir, key, state, moment, pod=None, reason=None):
+    """One status line of the cloud lane's answers; `rev` is how many lines of the queue it has seen."""
+    seen = max([n for n, _ in queue_lines(Path(state_dir) / QUEUE_FILE, ("id",))[0]] or [0])
+    rec = {"id": key, "state": state, "at": iso(moment), "rev": seen}
+    if pod:
+        rec["pod"] = pod
+    if reason:
+        rec["reason"] = reason
+    queue_append(Path(state_dir) / QUEUE_STATUS_FILE, rec)
+
+
+def queue_add(state_dir, lane, fields, moment):
+    """The id of the new entry, or a FactError with the one line of the refusal."""
+    view, _ = queue_view(state_dir, moment)
+    if any(item["name"] == fields.get("name") for item in view):
+        raise FactError("%s is already queued" % fields.get("name"))
+    if not isinstance(fields.get("ask"), int):
+        raise FactError("--ask is required: the issue number the pod works under")
+    if fields.get("kind") not in QUEUE_KINDS:
+        raise FactError("kind is one of %s" % ", ".join(QUEUE_KINDS))
+    if not (isinstance(fields.get("name"), str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", fields["name"])):
+        raise FactError("name is 1 to 64 letters, digits, dots, dashes")
+    if not (isinstance(fields.get("brief_file"), str) and fields["brief_file"].startswith("/")):
+        raise FactError("brief_file is the absolute path of the brief")
+    if fields.get("kind") == "builder":
+        issue = fields.get("plan_issue")
+        if isinstance(issue, str) and re.fullmatch(r"[0-9]+", issue):
+            if not (isinstance(fields.get("repo"), str) and re.fullmatch(r"[^/\s#]+/[^/\s#]+", fields["repo"])):
+                raise FactError("plan_issue %s is a bare number: give --repo owner/repo or the whole owner/repo#N" % issue)
+            fields = dict(fields, plan_issue="%s#%s" % (fields["repo"], issue))
+        elif not (isinstance(issue, str) and re.fullmatch(r"[^/\s#]+/[^/\s#]+#[0-9]+", issue)):
+            raise FactError("plan_issue is owner/repo#N, the form of the plan.approved audit event")
+    digits = re.sub(r"[^0-9]", "", iso(moment))
+    key = "q-%s-%s-%s" % (digits[:8], digits[8:14], fields.get("ask"))
+    entry = {k: v for k, v in fields.items() if k in QUEUE_KEYS and v is not None}
+    entry.update(id=key, enqueued=iso(moment), lane=lane)
+    queue_append(Path(state_dir) / QUEUE_FILE, entry)
+    return key
+
+
+def queue_change(state_dir, lane, key, op, moment, audit, number=None):
+    """Priority or cancel by the lane that queued the entry: one line appended, one audit line."""
+    entries, _, _, _ = queue_fold(state_dir)
+    entry = entries.get(key)
+    if entry is None or entry.get("cancelled"):
+        raise FactError("no queued entry %s" % key)
+    if entry["lane"] != lane:
+        raise FactError("%s was queued by %s, not by %s: refused" % (key, entry["lane"], lane))
+    if op == "priority" and not (isinstance(number, int) and 0 <= number <= 100):
+        raise FactError("priority is a whole number from 0 to 100 (the plan gives no range): %r" % (number,))
+    last = queue_fold(state_dir)[1].get(key) or {}
+    note = "note: %s is refused (%s); it stays skipped until its lane appends a replacement line" % (key, last.get("reason")) if last.get("state") == "refused" else None
+    rec = {"id": key, "op": op, "lane": lane, "at": iso(moment)}
+    old = entry.get("priority")
+    if op == "priority":
+        rec["priority"] = number
+    queue_append(Path(state_dir) / QUEUE_FILE, rec)
+    if audit is not None:
+        audit.append("cli", "queue." + op, entry["name"], {"lane": lane, "id": key, "name": entry["name"], "old": old, "new": number})
+    return note
+
+
+def queue_hash(value):
+    """The 64 hex characters of a plan hash given as `sha256:<64 hex>` or as bare 64 hex; None for anything else."""
+    text = value[7:] if isinstance(value, str) and value.startswith("sha256:") else value
+    return text if isinstance(text, str) and re.fullmatch(r"[0-9a-f]{64}", text) else None
+
+
+def queue_next(state_dir, free, moment, live_hash, approvals):
+    """(lines to print, entries to launch): `live_hash(issue)` is the live plan hash or None; `approvals` is a set of (issue, plan_hash)."""
+    out, picked = [], []
+    if free <= 0:
+        return out, picked
+    view, _ = queue_view(state_dir, moment)
+    for item in view:
+        if len(picked) >= free:
+            break
+        key, name = item["id"], item["name"]
+        if item["stale"]:
+            if item["state"] != "stale":
+                queue_note(state_dir, key, "stale", moment)
+            out.append("stale: %s, queued %s ago" % (name, queue_age(item["age"])))
+            continue
+        if item["skipped"]:
+            continue
+        if item["kind"] == "builder":
+            full = queue_hash(item.get("plan_hash_full"))
+            if full is None:
+                queue_note(state_dir, key, "refused", moment, reason="no-plan-hash")
+                continue
+            try:
+                live = queue_hash(live_hash(item.get("plan_issue")))
+                if live is None:
+                    raise FactError("no 64-hex plan hash")
+            except FactError as err:
+                why = "hash-unread: %s" % err   # waiting, not refused: a read that failed may succeed at the next slot
+                if item["state"] != "waiting" or item.get("reason") != why:
+                    queue_note(state_dir, key, "waiting", moment, reason=why)
+                out.append("not launched: %s: the live plan hash could not be read: %s" % (name, err))
+                continue
+            if live != full:
+                queue_note(state_dir, key, "refused", moment, reason="hash-mismatch %s" % live[:8])
+                out.append("not launched: %s: the live plan hash %s is not the one the entry needs %s" % (name, live[:8], full[:8]))
+                continue
+            if (item.get("plan_issue"), full) not in approvals:   # approvals hold normalised hashes
+                queue_note(state_dir, key, "refused", moment, reason="no-approval")
+                continue
+        picked.append(item)
+        out.append(json.dumps({k: v for k, v in item.items() if k in QUEUE_KEYS}, sort_keys=True))
+    return out, picked
+
+
+def queue_list_lines(state_dir, moment):
+    view, bad = queue_view(state_dir, moment)
+    lines = ["unreadable: line %d" % number for number in bad]
+    for item in view:
+        lines.append("%s %s p%s age %s %s%s" % (item["id"], item["name"], item.get("priority"), queue_age(item["age"]), item["state"],
+                                                " stale" if item["stale"] else ""))
+    return lines
+
+
+def queue_live_hash(runner, issue):
+    """The live plan hash of the plan issue, read the way `plan check` reads it; a FactError naming the cause when it cannot be read."""
+    try:
+        done = runner([sys.executable, sys.argv[0], "plan", "check", str(issue), "--json"], capture_output=True, text=True, timeout=60)
+    except Exception as err:
+        raise FactError("%s: %s" % (type(err).__name__, str(err)[:100]))
+    try:
+        got = load_module("record_json").parse_bounded(done.stdout)
+    except Exception:
+        raise FactError("plan check printed no JSON: %s" % (done.stdout or "").strip()[:100])
+    if not isinstance(got, dict):
+        raise FactError("plan check printed no JSON object")
+    if got.get("result") == "error":
+        raise FactError("plan check says: %s" % str(got.get("error"))[:100])
+    if not got.get("plan_hash"):
+        raise FactError("plan check gave no plan_hash")
+    return got["plan_hash"]
+
+
+def queue_approvals(state_dir):
+    rows, _ = queue_lines(Path(state_dir) / "audit.jsonl", ("event",), tail=8 * 1024 * 1024)
+    found = set()
+    for _, rec in rows:
+        detail = rec.get("detail")
+        if rec["event"] == "plan.approved" and isinstance(detail, dict):
+            found.add((detail.get("issue"), queue_hash(detail.get("plan_hash"))))
+    return found
+
+
+def cmd_queue(args, runner, now):
+    engine, _, _ = build_engine(runner, now, "cli")
+    caller = identify_caller(engine.herdr, engine.v2, os.environ)
+    state_dir, moment, action = str(engine.state_dir), now(), args.queue_action
+    try:
+        if action == "add":
+            fields = {k: getattr(args, k) for k in QUEUE_KEYS if hasattr(args, k)}
+            fields["repo"] = args.repo
+            key = queue_add(state_dir, caller, fields, moment)
+            print(key)
+            try:
+                engine.send(caller, QUEUE_CLOUD_LANE, "entry %s queued" % key)
+            except Exception:   # the entry is written: a failed wake never fails the add
+                print("queue: the wake failed; the entry %s is written" % key)
+        elif action in ("priority", "cancel"):
+            note = queue_change(state_dir, caller, args.id, action, moment, engine.audit, getattr(args, "number", None))
+            print("%s: %s" % (action, args.id))
+            if note:
+                print(note)
+        elif action == "list":
+            lines = queue_list_lines(state_dir, moment)
+            if lines:
+                print("\n".join(lines))
+        elif action == "next":
+            out, _ = queue_next(state_dir, args.free, moment, lambda issue: queue_live_hash(runner, issue), queue_approvals(state_dir))
+            if out:
+                print("\n".join(out))
+        elif action == "status":
+            if caller != QUEUE_CLOUD_LANE:
+                raise FactError("a status line is appended by %s" % QUEUE_CLOUD_LANE)
+            if args.state not in QUEUE_STATES:
+                raise FactError("state is one of %s" % ", ".join(QUEUE_STATES))
+            if args.id not in queue_fold(state_dir)[0]:
+                raise FactError("no queued entry %s" % args.id)
+            queue_note(state_dir, args.id, args.state, moment, pod=args.pod, reason=args.reason)
+            print("status: %s %s" % (args.id, args.state))
+    except FactError as err:
+        print("queue: %s" % err)
+        return QUEUE_REFUSED
+    return EXIT_OK
+
+
+def add_queue_parsers(sub):
+    queue = sub.add_parser("queue", help="The standing launch queue: add, change, list; the cloud lane reads it at a free slot")
+    actions = queue.add_subparsers(dest="queue_action", required=True)
+    add = actions.add_parser("add", help="Queue one pod to launch")
+    for flag in QUEUE_KEYS:
+        if flag not in ("id", "enqueued", "lane"):
+            add.add_argument("--" + flag.replace("_", "-"), dest=flag, default=None, type=int if flag in ("ask", "priority", "idle", "hard") else str)
+    add.add_argument("--repo", default=None, help="owner/repo for a bare --plan-issue number")
+    for action in ("priority", "cancel"):
+        one = actions.add_parser(action, help="%s an entry you queued" % action.capitalize())
+        one.add_argument("id")
+        if action == "priority":
+            one.add_argument("number", type=int)
+    actions.add_parser("list", help="The queue in launch order")
+    nxt = actions.add_parser("next", help="The entries to launch at FREE free slots")
+    nxt.add_argument("--free", type=int, required=True)
+    status = actions.add_parser("status", help="The cloud lane's answer for an entry")
+    status.add_argument("id")
+    status.add_argument("state")
+    status.add_argument("--pod")
+    status.add_argument("--reason")

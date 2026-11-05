@@ -98,7 +98,7 @@ def cloud_dir(state):
 
 
 def valid_name(name):
-    return isinstance(name, str) and bool(H["NAME_RE"].match(name))
+    return isinstance(name, str) and bool(H["NAME_RE"].fullmatch(name))
 
 
 def record_path(state, name):
@@ -596,8 +596,17 @@ def stack_model_secret(env=None):
     if not sub or not vault:
         why = "CW_VAULT_SUBSCRIPTION and CW_VAULT_NAME are not set"
     else:
-        ran = _capture(["az", "keyvault", "secret", "show", "--subscription", sub, "--vault-name", vault, "--name", name, "--query", "value", "-o", "tsv"],
-                       env={k: v for k, v in env.items() if k not in CLUSTER_DROP}, limit=STACK_MODEL_KEY_LIMIT + 1)
+        lib = _lib()
+        try:
+            flight = lib.VaultFlight.enter(env)   # a vault block refuses here, before any call
+        except lib.ClusterLogin as err:
+            raise Refusal("the stack model secret %s could not be read: %s; nothing was created" % (name, err.line)) from None
+        ran = None
+        try:
+            ran = _capture(["az", "keyvault", "secret", "show", "--subscription", sub, "--vault-name", vault, "--name", name, "--query", "value", "-o", "tsv"],
+                           env={k: v for k, v in env.items() if k not in CLUSTER_DROP}, limit=STACK_MODEL_KEY_LIMIT + 1)
+        finally:
+            flight.done(ran)
         if ran is None or ran[0] != 0:
             why = "could not be read from the vault"
         elif len(ran[1]) > STACK_MODEL_KEY_LIMIT:
@@ -613,19 +622,22 @@ git_token_sleep = time.sleep   # tests replace it
 
 
 def git_token(repo, cluster, role="worker"):
-    """The one-hour git token for ONE repository: CW_GIT_TOKEN_CMD, else the mint (cloud/launcher/app_token.py REPO), as the driver does.
+    """The one-hour git token for ONE repository: CW_GIT_TOKEN_CMD (prints it on stdout), else the mint (cloud/launcher/app_token.py REPO --fd N through a pipe), as the driver does.
     The default mint gets `--role ROLE` for any role but the worker's (the same rule as the launcher's git_token_cmd); a custom command runs unchanged."""
     raw = os.environ.get("CW_GIT_TOKEN_CMD")
-    argv = shlex.split(raw) if raw else [sys.executable, str(Path(__file__).resolve().parent.parent / "cloud" / "launcher" / "app_token.py"), repo]
-    if not raw and role != "worker":
-        argv += ["--role", role]
     env = {k: v for k, v in os.environ.items() if k not in CLUSTER_DROP}
+    if not raw:   # the default mint hands the token over a pipe it names (--fd), never on stdout: the launcher's one helper does it (and its retry rule)
+        lib = _lib()
+        try:
+            return lib.run_git_token_cmd(lib.git_token_cmd(repo, env, role), repo, env)
+        except lib.CloudError as err:
+            raise Refusal("%s; nothing was created" % _one(cluster.clean(str(err), 200), 200)) from None
+    argv = shlex.split(raw)
 
     def last(ran):
         return _one(cluster.clean(ran[2].strip().splitlines()[-1], 200), 200) if ran and ran[2].strip() else "no message"
 
-    # The retry rule (a copy of the launcher's tempfail_tries: this program loads the launcher by path only for other work, and a test
-    # runs this function without it): again ONLY on status 75 (a custom command too), 4 tries, waits of 2, 5 and 10 seconds.
+    # The retry rule (a copy of the launcher's tempfail_tries): again ONLY on status 75, 4 tries, waits of 2, 5 and 10 seconds.
     tries = 0
     while True:
         tries += 1
@@ -754,6 +766,7 @@ def _launch(args, runner, now, reserve):
         if stack_model:
             cluster.add(stack_model[1])
             run_secrets.append(("stack-model-key", stack_model[1]))
+        _print_capacity(runner, cluster)   # ONE read-only block on stderr, before the create; it never refuses, never changes the launch
         read_fd, write_fd = os.pipe()
         try:
             try:
@@ -801,6 +814,7 @@ def _launch(args, runner, now, reserve):
             raise LaunchError("the worker was created but its record could not be stored (%s); stop was requested" % _one(cluster.clean(str(err), 100), 100)) from None
         _audit(engine, "cloud.created", name, {"runtime_id": record["runtime_id"], "host": urllib.parse.urlsplit(record["url"]).hostname,
                                                "idle_deadline": record.get("idle_deadline"), "hard_deadline": record.get("hard_deadline")})
+        _show_identity_note(body, cluster)
         try:   # a local agent may have taken the name while the pod was being made; discovery that cannot answer counts as a failure (cannot tell)
             taken = engine.discover(engine.now()).agents.get(name) is not None
             problem = "a local fleet agent named %s appeared while the pod was being made" % name if taken else None
@@ -816,6 +830,8 @@ def _launch(args, runner, now, reserve):
         try:
             with tunnel(cluster, record) as live:
                 v2 = remote_v2(state, live, engine.config["call_timeout_seconds"])
+                if choice:   # #1655: the pod's own model list, read once, before the session and the brief
+                    _model_served(engine, name, choice["model"], v2)
                 session = v2.session_create(args.agent if args.agent == "orchestrator" else CLOUD_WORKER_AGENT, name, args.dir or DEFAULT_DIRECTORY,
                                             {"fleet": fleet, "cloud": {"runtime_id": record["runtime_id"], "agent": CLOUD_WORKER_AGENT}},
                                             **(H["launch_model_kwargs"](choice) if choice else {}))["id"]
@@ -838,8 +854,104 @@ def _launch(args, runner, now, reserve):
                 remove_record(state, name)
             raise
     _registry_note(engine, "upsert", state, name, {"session": session, "repo": repo, "role": args.role, "kind": "cloud", "run_id": run_id, "state": "working"})   # a cloud worker is an agent (#903)
+    _first_push()._watch_first_push(state, name, args, repo, branch, brief, now(), record.get("hard_deadline"))   # #2057: the launch's watch for its checkpoint
+    print(_limits_note(args, record), file=sys.stderr)   # stderr, before the one JSON line
     print(json.dumps({"name": name, "session": session, "runtime_id": record["runtime_id"], "url": record["url"], "cloud": True}, sort_keys=True))
     return H["EXIT_OK"]
+
+
+CAPACITY_SECONDS = 5   # the one bounded read of the capacity block: past it the block says `not read` and the launch goes on
+
+
+def capacity_block(body, shapes, quantity, skip=()):
+    """The lines of the capacity block from the launcher's `capacity` answer (a dict, or None when the read failed). `shapes` is the launcher's
+    SHAPES table (every row but `skip`); the room of a node is its allocatable minus the requests of the pods this login can list."""
+    body = body if isinstance(body, dict) else {}
+    nodes, pods = body.get("nodes_read") is True, body.get("pods_read") is True
+    lines = ["cloud capacity before the create (read-only; it does not change the launch):"]
+    for shape, row in shapes.items():
+        if shape in skip:
+            continue
+        if not (nodes and pods):
+            lines.append("  shape %s: nodes with room: not counted" % shape)
+            continue
+        need_cpu, need_mem = quantity(row.get("cpu"), 1000), quantity(row.get("memory"), 1)
+        used = body.get("requests") or {}
+        room = sum(1 for n in body.get("nodes") or []
+                   if int(n.get("cpu_m") or 0) - int((used.get(n.get("name")) or {}).get("cpu_m") or 0) >= need_cpu
+                   and int(n.get("memory_b") or 0) - int((used.get(n.get("name")) or {}).get("memory_b") or 0) >= need_mem)
+        lines.append("  shape %s: %d nodes with room" % (shape, room))
+    lines.append("  nodes: %s" % ("read" if nodes else "not read"))
+    lines.append("  pods: %s" % ("read" if pods else "not read"))
+    lines.append("  Pending pods: %s" % (body.get("pending") if pods else "not read"))
+    if body.get("events_read") is True:
+        lines.append("  last FailedScheduling: %s" % (str(body.get("last_event"))[:200] if body.get("last_event") else "none"))
+    else:
+        lines.append("  events: not read")
+    lines.append("  room is counted from the pods this login can see: an upper bound")
+    return lines
+
+
+def _print_capacity(runner, cluster):
+    """Print the capacity block ONCE on standard error. Information only: any failure here (a refused or hung read, a bad answer) is said as `not read`
+    and the launch goes on; nothing is written to the cluster and standard output is never touched."""
+    try:
+        lib = _lib()
+        try:
+            code, body, _ = run_launcher(runner, "capacity", "", (), CAPACITY_SECONDS, cluster=cluster)
+            body = body if code == 0 else None
+        except CloudError:
+            body = None
+        lines = capacity_block(body, lib.SHAPES, lib._quantity, skip=(lib.DEFAULT_ORCHESTRATOR_SHAPE,))
+        print("\n".join(lines), file=sys.stderr)
+    except Exception:
+        print("cloud capacity before the create: not read", file=sys.stderr)
+
+
+def _first_push():
+    """The send state and the first-push notice (bin/cloud_first_push.py, beside this file; a part of it), bound to this file's names."""
+    module = H["load_module"]("cloud_first_push")
+    module.H, module.D = H, _Stayed()
+    return module
+
+
+def _model_served(engine, name, model, v2):
+    """#1655: ONE read of the pod's model list; a model its provider does not serve (providerID AND id) is refused with one line that lists at most
+    twelve served ids of the provider that match the model-id pattern (never other pod text); the failure path of _launch stops the pod."""
+    provider, _, mid = model.partition("/")
+    try:
+        listed = v2.model_list()
+    except (H["V2Error"], H["V2Unreachable"], OSError):
+        listed = None
+    if not isinstance(listed, list):
+        raise CloudError("--model %s could not be verified: the pod's model list could not be read" % model)
+    rows = [m for m in listed[:2000] if isinstance(m, dict) and m.get("providerID") == provider and isinstance(m.get("id"), str)]
+    if any(m["id"] == mid for m in rows):
+        return
+    ids = sorted({m["id"] for m in rows if H["LAUNCH_MODEL_RE"].fullmatch(m["id"])})[:12]
+    _audit(engine, "cloud.model_not_served", name, {"model": model})
+    raise CloudError("--model %s is not served by the pod's provider: it serves at most 12 of: %s" % (model, ", ".join(ids) or "none"))
+
+
+def _limits_note(args, record):
+    """One line for stderr: the idle and hard limits of the launch (each says `(default)` only when its flag was absent) and the stop time, the
+    earlier of the launcher's own two deadlines (read from its answer; `not reported` when neither parses). No address, token or brief."""
+    def applied(seconds):
+        if isinstance(seconds, bool) or not isinstance(seconds, int) or seconds <= 0:
+            return "not reported"
+        return "%dh" % (seconds // 3600) if seconds % 3600 == 0 else "%dm" % (seconds // 60) if seconds % 60 == 0 else "%ds" % seconds
+    def limit(label, value, key):
+        text = str(value)[:20] if value else applied(record.get(key))
+        return "%s limit %s%s" % (label, text, "" if value else " (default)" if text != "not reported" else "")
+    stops = []
+    for key in ("idle_deadline", "hard_deadline"):
+        try:
+            when = datetime.datetime.strptime(str(record.get(key)), "%Y-%m-%dT%H:%M:%SZ")
+        except ValueError:
+            continue
+        stops.append(when)
+    stop = min(stops).strftime("%Y-%m-%dT%H:%M:%SZ") if stops else "not reported"
+    return "launch --cloud: %s, %s, stops at %s" % (limit("idle", args.idle, "idle_seconds"), limit("hard", args.hard, "hard_seconds"), stop)
 
 
 def _registry_note(engine, what, state, name, *args):
@@ -854,17 +966,31 @@ def _registry_note(engine, what, state, name, *args):
         _audit(engine, "cloud.registry_error", name, {"why": _one(str(err), 120)})
 
 
+POD_UID_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")   # the form of a pod uid (the launcher's cloud_worker.py holds the equal text: a test compares them)
+
+
+def _show_identity_note(body, cluster):
+    """The launcher's one-line note that a pod's uid could not be read (the record holds none): shown once on stderr, never on stdout."""
+    note = body.get("identity_note")
+    if isinstance(note, str) and note:
+        print("%s: WARNING: %s" % (H["PROG"], _one(cluster.clean(note, 300), 300)), file=sys.stderr)
+
+
 def _record_from_create(name, body):
     if body is None:
         raise CloudError("the launcher printed no record")
     if body.get("worker") != name:
         raise CloudError("the launcher answered for another worker")
     record = {key: body.get(key) for key in RECORD_FIELDS}
+    record["idle_seconds"] = body.get("idle_seconds")   # the limits the launcher applied (ask #1474)
+    record["hard_seconds"] = body.get("hard_seconds")
     if any(not isinstance(record[key], str) or not record[key] for key in ("url", "runtime_id")):
         raise CloudError("the launcher's record has no url or runtime_id")
     problem = endpoint_problem(record["url"])
     if problem:
         raise CloudError("the launcher named an endpoint that is refused: %s" % problem)
+    if isinstance(body.get("pod_uid"), str) and POD_UID_RE.fullmatch(body["pod_uid"]):
+        record["pod_uid"] = body["pod_uid"]   # the pod's identity at create time: a retire acts only on the pod that has it
     return record
 
 
@@ -921,12 +1047,18 @@ def cmd_send(args, runner, now, record):
     if args.issue is not None:
         meta["fleet"]["issue"] = args.issue if isinstance(args.issue, int) else str(args.issue)
     session = _session_of(record)
+    with Cluster() as probe:   # the pod's state, read ONCE, before the prompt (its own login: the launcher's status needs one)
+        state_line, warning = _first_push().send_state(runner, args.name, record, probe)
+    sys.stderr.write("%s: %s\n" % (H["PROG"], state_line))
     with Cluster() as cluster, tunnel(cluster, record) as live:
         reply = remote_v2(state, live, config["call_timeout_seconds"]).prompt(session, text, meta, delivery="queue")
     _audit(engine, "cloud.send", args.name, {"from": sender, "chars": len(text)})
     message_id = reply.get("id") if isinstance(reply, dict) else None
     print(message_id or "sent")
-    sys.stderr.write("%s: delivered to %s\n" % (H["PROG"], args.name))
+    if warning:
+        sys.stderr.write("%s: WARNING: %s: the message was sent to its endpoint but is NOT reported delivered\n" % (H["PROG"], warning))
+    else:
+        sys.stderr.write("%s: delivered to %s\n" % (H["PROG"], args.name))
     return H["EXIT_OK"]
 
 
@@ -1164,12 +1296,25 @@ def status_lines(runner, state, timeout=STATUS_SECONDS):
                 code, body, note = run_launcher(runner, "status", record["worker"], (), timeout, cluster=cluster)
             except CloudError as err:
                 code, body, note = -1, None, str(err)
+            if isinstance(body, list):   # the launcher prints a list with one record per pod: the first one
+                body = body[0] if body and isinstance(body[0], dict) else None
             if code == 0 and body is not None:
                 row.update({key: body.get(key) for key in ("phase", "idle_since", "cost_estimate_usd")})
                 extra = "phase %s, about $%s so far" % (_safe(body.get("phase"), "?"), body.get("cost_estimate_usd", "?"))
             else:
                 row["launcher_status"] = _reason(code, note)
                 extra = "launcher status unavailable (%s)" % _one(row["launcher_status"], 100)
+            failed = None
+            if code == 0 and isinstance(body, dict) and body.get("pod_failed") is not None:
+                failed = _failed_text(body["pod_failed"])
+                if failed is None:   # not text: the launcher's answer cannot be read, so the line is the one for an unreadable answer
+                    row["launcher_status"] = "the launcher's pod_failed answer is not text"
+                    extra = "launcher status unavailable (%s)" % _one(row["launcher_status"], 100)
+            if failed:   # the launcher read why the pod ended: no tunnel to a dead pod, no "does not answer"
+                row["answers"], row["pod_failed"] = False, failed
+                rows.append(row)
+                lines.append("      cloud %s: %s, pod failed: %s; stops at %s" % (record["worker"], record["runtime_id"], failed, record.get("hard_deadline") or "?"))
+                continue
             row["answers"] = _answers(state, cluster, record, timeout)
             rows.append(row)
             lines.append("      cloud %s: %s, %s; %s; stops at %s" % (record["worker"], record["runtime_id"], extra,
@@ -1178,6 +1323,18 @@ def status_lines(runner, state, timeout=STATUS_SECONDS):
         if cluster is not None:
             cluster.close()
     return lines, rows
+
+
+_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+def _failed_text(value):
+    """The launcher's reason for a Failed pod, made safe to print: None when it is not text; otherwise one line, every control character removed
+    (a newline or tab becomes a space), scrubbed once more by the ONE scrub the launcher module holds, cut to 160 characters. May be empty."""
+    if not isinstance(value, str):
+        return None
+    flat = _CONTROL_RE.sub(lambda m: " " if m.group() in "\t\n\r\x0b\x0c" else "", value)
+    return _one(_scrub_lib()(flat, (), 600), 160)
 
 
 def _answers(state, cluster, record, timeout):
@@ -1209,6 +1366,24 @@ def _may_retire(kind, record):
     return kind[0] == "person" or (kind[0] == "agent" and ((len(kind) > 2 and kind[2] == "chief-of-staff") or kind[1] == record.get("reports_to")))
 
 
+_BOSS_NAME_RE = re.compile(r"[a-z][a-z0-9_-]{0,31}", re.ASCII)
+
+
+def _final_message(engine, state, record, name, reason, body=None):
+    """Ask #1788: after a successful retire, ONE message to the recorded boss: the pod, the reason, and its last text (cut, scrubbed, framed as
+    untrusted: cloud_retired.last_message). Never raises: a failed send is said in the audit and the retire goes on."""
+    boss = record.get("reports_to")
+    if not isinstance(boss, str) or not _BOSS_NAME_RE.fullmatch(boss):
+        return
+    try:
+        where = body.get("record") if isinstance(body, dict) else None   # THIS stop's record, as the launcher's answer names it (PC-7); never a lookup by name
+        block, why = _retired().last_message(where, state, name) if isinstance(where, str) and where else (None, "no run record")
+        text = "cloud worker %s retired (%s)\n%s" % (name, _one(_scrub_lib()(reason, (), 200), 120), block or "last text not read: %s" % _one((why or "unknown").replace(" ", "_"), 120))
+        engine.send("switchboard", boss, text)
+    except Exception as err:
+        _audit(engine, "cloud.final_message_failed", name, {"why": _one(type(err).__name__, 60)})
+
+
 @refusals
 def cmd_retire(args, runner, now, record):
     """`retire NAME` for a cloud worker: `stop` (the end hook runs, the pod and its scratch volume go), then the record goes. A stop that exits 1
@@ -1222,9 +1397,15 @@ def cmd_retire(args, runner, now, record):
     if args.undo:
         raise LaunchError("a cloud worker's pod is gone once retired: there is nothing to undo")
     reason = " ".join(re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", args.reason or "").split())[:200] or "finished"
+    extra = ["--reason", reason]
+    uid = record.get("pod_uid")
+    if isinstance(uid, str) and re.fullmatch(r"[A-Za-z0-9._-]{1,64}", uid):
+        extra += ["--pod-uid", uid]
+    if record.get("agent") == "orchestrator":   # a hub orchestrator: its hub entry goes with it, also when its pod is already gone
+        extra += ["--hub-entry"]
     try:
         with Cluster() as cluster:
-            code, body, note = run_launcher(runner, "stop", args.name, ["--reason", reason], STOP_SECONDS, cluster=cluster)
+            code, body, note = run_launcher(runner, "stop", args.name, extra, STOP_SECONDS, cluster=cluster)
     except Refusal:
         raise
     except CloudError as err:
@@ -1241,6 +1422,7 @@ def cmd_retire(args, runner, now, record):
         raise LaunchError("stop of %s failed: %s: the record is kept" % (args.name, _reason(code, note)))
     # The run record (slice 3, #638) is written by the launcher's stop; no call is needed here when it lands: this is its hook point (after the
     # end hook, before the endpoint record goes).
+    _final_message(engine, state, record, args.name, reason, body)   # ask #1788: once, after a successful stop only
     _registry_note(engine, "retire", state, args.name, reason)
     wip, pushed = (body or {}).get("wip_branch"), (body or {}).get("pushed")
     if isinstance(body, dict) and body.get("pod_gone") is True:   # only the launcher's explicit reply: an unreadable pod never says it

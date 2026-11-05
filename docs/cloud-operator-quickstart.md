@@ -62,7 +62,7 @@ Each setting's name, whether the file requires it, and its kind (name, https URL
 | `CW_CLUSTER_ADMIN_SECRET` | no | secret-name | the name of the vault secret that holds the cluster administrator kubeconfig (default `cw-cluster-admin-kubeconfig`): 1 to 127 letters, digits and hyphens; the name, never its content |
 | `CW_STACK_MODEL_SECRET` | no | secret-name | with `launch --cloud --stack` only: the name of the vault secret (same vault as the others) that holds the stack-only model credential: 1 to 127 letters, digits and hyphens; the name, never its value. Ignored without `--stack`. See "A stack-only model credential" |
 | `CW_CLUSTER_TOKEN_DURATION` | no | duration | the cluster token's requested life: 1 to 3 digits and `m` or `h`, from `1m` to `60m` (default `20m`; `1h` is the same as `60m`) |
-| `CW_GIT_TOKEN_CMD` | no | command | a command that prints the one-hour git token; default is the GitHub App mint beside the launcher (`app_token.py`) |
+| `CW_GIT_TOKEN_CMD` | no | command | a command that prints the one-hour git token on stdout; default is the GitHub App mint beside the launcher (`app_token.py`), which hands the token to the launcher over a pipe and never prints it. To run the mint by hand, see "Running the mint by hand" in `cloud/launcher/README.md` (a file route in a private directory with no symbolic link in its path, never a redirect; a descriptor that is the same pipe or file as standard output or standard error is refused) |
 | `CW_APP_ID_CMD`, `CW_APP_KEY_CMD` | no | command | commands that print the GitHub App's id and key instead of the vault read (`app_token.py`) |
 | `CW_APP_INSTALLATION_CMD` | no | command | obsolete: accepted and ignored, never run. The installation is looked up per repository (see the next paragraph); the vault no longer needs `cw-app-installation-id` |
 | `CW_STACK_REGISTRY` | no | registry-host | the stack registry (lower case, ending `.azurecr.io`; no scheme, path, port or IP); with the next two, a stack pod pulls prebuilt images (see `cloud/README.md`); all three or none |
@@ -313,6 +313,14 @@ Before you apply: replace the placeholder `IMAGE_DIGEST` with the settings' `CW_
 - Delay: kubelet refreshes mounted Secret contents within about a minute, so a newly launched agent can need up to ~60 s before it can message through the hub.
 - Smoke check: the hub has no unauthenticated health path (`GET /decisions` needs a token), so readiness is a TCP check on 8443. From a pod in `cw`, `nc -z cloud-hub 8443` must succeed.
 - Rollback that keeps the Secrets: `kubectl -n cw delete deployment,service -l app.kubernetes.io/part-of=cloud-hub`. Do not add `secret` to that list: `kubectl delete deployment,service,secret -l <label>` also deletes BOTH Secrets (the registry and the per-agent passwords), and running agents cannot message after such a rollback until they are relaunched.
+- The autoscaler's do-not-evict mark (ask #1524): the hub's pod template carries the annotation `cluster-autoscaler.kubernetes.io/safe-to-evict` with the string `false`.
+  - The apply of the changed Deployment is the administrator's step, because the launcher's own account cannot change a Deployment. First run a server dry run of the patch, then the patch itself: `kubectl -n NAMESPACE_NAME patch deployment cloud-hub --type merge --dry-run=server -p PATCH`, then `kubectl -n NAMESPACE_NAME patch deployment cloud-hub --type merge -p PATCH`, where PATCH is `{"spec":{"template":{"metadata":{"annotations":{"cluster-autoscaler.kubernetes.io/safe-to-evict":"false"}}}}}`.
+  - Apply only that one annotation, never the whole file: the file also holds the two registry Secrets, created empty, and applying it again resets them, so every registered agent and the daemon's digest are lost. The file holds the mark now, so a later apply of the whole template from the file would carry the mark.
+  - The patch rolls the hub pod once, which is one more restart for every lane: announce it to the lanes and do it at a quiet moment; the registry Secrets and digests are untouched. The annotation put by hand on the RUNNING hub pod protects THAT pod only, and it is lost when that pod is replaced (a restart, a rollout or a node loss makes a new pod from the Deployment's template, which has no annotation yet). The patch puts the annotation in the template, so every pod made afterwards carries it. Until the patch is applied, the 5-minute by-hand marking of the live pod stays: it protects the pod that is running at that moment, and a replacement pod is unmarked until the next marking.
+  - The change protects only against the autoscaler's scale-down; that it prevents the kills is inferred and not shown, and it is not a fix of the outage.
+  - The mark does not stop a node upgrade, a node failure, a spot eviction, or a reboot or drain for maintenance.
+  - There is no disruption budget for a one-replica hub: a budget that allows no unavailable pod blocks every drain and upgrade of its node indefinitely, a cluster-wide effect, and a second replica with a budget is a separate ask.
+  - The follow-up ask for hub availability is #1525: today a restart loses the dedupe keys (memory only, bounded) and a report claimed but not yet delivered, while the registry survives in the Secrets.
 
 State: the decisions file is on an emptyDir at `/var/hub`; it is lost when the pod restarts. Tests (offline, no cluster): `python3 cloud/launcher/tests/test_cloud_hub_manifest.py`.
 
@@ -537,6 +545,7 @@ Over one day a cloud pull request took nine pushes and others two to four, becau
 ### A rule for every cloud coder brief
 
 Before any push, run bin/cloud-pr-preflight at the repository root and paste its three sections in the pull request comment; a branch-only failure, a not-run file or an unchained test file must be fixed first, and every existing test file it lists as edited must be justified there.
+When the branch adds or changes a tests/switchboard/test_*.py file, the run prints one more block, the checks of tools/new-test-checks, between the first and the second section, and a FAIL there must be fixed first too.
 
 ## Pre-push preflight modes
 
@@ -559,3 +568,33 @@ The build step is unchanged (an operator rebuilds the image and publishes it as 
 The App already holds checks: read (the owner confirmed it on 29 October), so the orchestrator set needs no App change today; if a later set needs a permission the App lacks, the owner adds it and accepts it on each installation, never this change.
 
 **What the orchestrator's token can and cannot do.** It can read issues, pull requests, check results and repository metadata, and it can write to issues only. It cannot push, create a branch, read a file, open, edit, approve or merge a pull request, change a workflow, a setting, a secret or a ruleset, or mint a token.
+
+## A worker lost with its node
+
+**Cause: inferred until these reads are made.** On 29 October four pods that sat on one node were killed in the same second (the event `Killing: Stopping container worker`, no other event) while pods on other nodes were untouched, and the launcher's audit has no stop line for them. The cause is INFERRED to be the removal or disturbance of that node. The launcher's own login cannot read nodes (it may not list them), so the holder of the ADMINISTRATOR login confirms the cause with these read-only commands (placeholders in capitals):
+
+```
+kubectl get events --all-namespaces --field-selector involvedObject.kind=Node
+kubectl describe node NODE_NAME
+kubectl get pods --all-namespaces -o wide
+kubectl -n kube-system get configmap cluster-autoscaler-status -o yaml
+az aks nodepool show --resource-group RESOURCE_GROUP_NAME --cluster-name CLUSTER_NAME --name NODEPOOL_NAME
+az aks nodepool list --resource-group RESOURCE_GROUP_NAME --cluster-name CLUSTER_NAME
+az monitor activity-log list --resource-group RESOURCE_GROUP_NAME --start-time START_TIME --end-time END_TIME
+```
+
+Also read the API server's audit log of pod deletes in the window through the cloud's log query (a query such as `AUDIT_LOG_QUERY` over the diagnostic logs, which names who deleted each pod). Read the Events, Conditions and Taints parts of `kubectl describe node`.
+
+The alternative causes and the read that rules each in or out:
+
+- A person's delete or another operator's cleanup: the audit log of pod deletes names the requester.
+- An eviction for node pressure: the event says `Evicted`, not `Killing`, and the pod is Failed.
+- The autoscaler's scale-down: the node would be gone; the status record and the node events confirm or rule it out.
+- A reboot, a drain or an image upgrade: the node survives; the node pool's recent operations, the node's events and conditions confirm it.
+- A taint eviction after the node was NotReady: the node events say not ready and the taints show it.
+
+**What the annotation does.** Every pod the launcher renders (a worker, a stack worker, and an orchestrator) carries `cluster-autoscaler.kubernetes.io/safe-to-evict: "false"`. It protects ONLY against the autoscaler's scale-down. It does not protect against a node upgrade or maintenance eviction (only a pod disruption budget limits those, a separate cluster-wide object this change does not add), a reboot, a drain for an upgrade, a node failure, a taint eviction or a spot eviction.
+
+**What it costs.** A node that holds a worker is not scaled down until the worker ends: an idle worker ends at its idle limit (`--idle`), a worker at its hard limit, at most the maximum hard limit (8 hours by default), and a pod the reaper cannot end at the cluster-side deadline floor (the maximum hard limit plus five minutes). A persistent orchestrator has no deadline: once ask 1509 (the persistent orchestrator) lands, its pod template is rendered by the same function and carries the mark, and its node is then not scaled down while it lives.
+
+**What is saved.** The pre-stop hook (`cw-prestop`) pushes unpushed work to the worker's `wip` branch when the pod is deleted, but no stop line and no run record is written. A worker lost with its node is told apart from one the launcher stopped by the cloud end alert of ask 1480 (pull request 1486), which reports a created worker whose pod is gone with no stop line as a gone pod after that ask's own waiting rule.

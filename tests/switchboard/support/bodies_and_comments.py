@@ -5,7 +5,6 @@ import hashlib
 import importlib.machinery
 import importlib.util
 import importlib
-from support.paths import BIN, REPO
 from support.installs_and_keys import ORDERS_CHARTER_BODY
 from support.loader import _load, sb
 from support.paths import BIN
