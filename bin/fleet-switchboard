@@ -18085,6 +18085,45 @@ def once_pr_view_runner(inner):
     return run
 
 
+def gate_read_only(argv):
+    """(#2215) True for a gh argv that only READS: pr view|diff|list|checks, run view|list, issue view|list, repo view, or a `gh api` without a method, field or input flag. A write is never one."""
+    args = list(argv[1:])
+    if args[:2] in (["pr", "view"], ["pr", "diff"], ["pr", "list"], ["pr", "checks"], ["run", "view"], ["run", "list"], ["issue", "view"], ["issue", "list"], ["repo", "view"]):
+        return True
+    if args[:1] == ["api"]:
+        flags = [a for a in args[1:] if a.startswith("-")]
+        return not any(f in ("-X", "--method", "-f", "-F", "--field", "--raw-field", "--input") or f.startswith(("-X", "--method=", "--field=", "--raw-field=", "--input=")) for f in flags)
+    return False
+
+
+def direct_read_runner(inner, repo, config, environ=None):
+    """(#2215) `inner` (a gh runner) where a READ-ONLY gh call that names the gh by its bare name (the shim, where PATH finds it) runs the real gh binary directly: the shim's
+    work per call (~0.5 s measured on the Mac, 4-5 calls per check) was the probe's whole time. The one rule for the real gh is `own_gh_path` (FLEET_REAL_GH, else the first gh
+    on PATH that is not the fleet shim; the shim's real_gh() says the same). The account is kept: the call carries the repo's GH_TOKEN (GhAccounts.env_for) unless the caller gave an env.
+    A write never takes this route; with no real gh found, or the account unreadable, the call goes as it did."""
+    try:
+        named = config.get("gh_by_name") or config["gh"]   # the gh as configured: a bare name is what the shim answers
+        real = own_gh_path(named, environ)
+    except ConfigError:
+        return inner
+    if not os.path.isabs(real) or real == named:
+        return inner
+    accounts = GhAccounts(config, inner, time.time, environ)
+
+    def run(argv, *a, **kw):
+        if argv and argv[0] == named and gate_read_only(argv):
+            try:
+                if kw.get("env") is None:
+                    env = accounts.env_for(repo)
+                    if env is not None:
+                        kw["env"] = env
+                argv = [real] + list(argv[1:])
+            except AccountError:
+                pass
+        return inner(argv, *a, **kw)
+    return run
+
+
 def cmd_gates_check(args, runner, now):
     """`gates-check <pr> --for ready|merge`. Read-only (state counters aside). 0 allow, 10 refuse, 3 fail-open."""
     try:
@@ -18102,6 +18141,7 @@ def _gates_check(args, runner, now):
         config = load_config()
         setting = plan_ledger.repo_setting(config, repo)
         state = ensure_state_dir()
+        runner = direct_read_runner(runner or subprocess.run, repo, config)   # #2215: a read goes to the real gh, not through the shim
         engine, _, _ = build_engine(runner, now, "cli", writable=True)
         engine.pr_view_once = {}   # #2215
         if setting is None or not setting["enabled"]:
@@ -18117,7 +18157,7 @@ def _gates_check(args, runner, now):
             def work():
                 try:
                     ns = types.SimpleNamespace(pr=args.pr, plan=args.plan, ask=args.ask, head=None)
-                    ctx = _ledger_context(ns, once_pr_view_runner(runner or subprocess.run), now, False, floor=True)   # #2215: the same `gh pr view` is asked once
+                    ctx = _ledger_context(ns, once_pr_view_runner(runner), now, False, floor=True)   # #2215: the same `gh pr view` is asked once
                     box["report"] = plan_ledger.evaluate_gates(ctx.plan, ctx.entries, ctx.problem,
                                                                 ctx.facts if ctx.facts.get("head") or ctx.facts.get("body") else None, ctx.pr,
                                                                 now=now())

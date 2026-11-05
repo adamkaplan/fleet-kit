@@ -66990,6 +66990,7 @@ TestCommentWindowGapFill = _cc.TestCommentWindowGapFill   # #2192: a comment win
 _rpstrict = importlib.import_module("test_read_pages_strict"); TestReadPagesStrict, TestReadPagesStrictMutant = _rpstrict.TestReadPagesStrict, _rpstrict.TestReadPagesStrictMutant
 TestCiOutsideBin = importlib.import_module("test_ci_outside_bin").TestCiOutsideBin
 TestGateProbeReads = importlib.import_module("test_gate_probe_reads").TestGateProbeReads   # #2215
+TestDirectReads = importlib.import_module("test_gate_direct_reads").TestDirectReads   # #2215
 _psj = importlib.import_module("test_pr_state_jobs")
 _psj.HOST = sys.modules[__name__]
 TestPrStateJobs = _psj.load()   # #1962
