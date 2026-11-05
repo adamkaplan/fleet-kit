@@ -81,7 +81,7 @@ class TestNoFailureMode(unittest.TestCase):
 
     def test_s4_the_warning_does_not_change_the_plan_hash(self):
         res = plan_check.check(plan(), DONE)
-        self.assertTrue(any("no-failure-mode" in w for w in res["warnings"]), res["warnings"])
+        self.assertTrue(any(w["code"] == "no-failure-mode" for w in res["warnings"]), res["warnings"])
         expected = plan_check.plan_hash(plan())
         self.assertEqual(res["plan_hash"], expected)
         self.assertIn("plan hash: %s" % expected, run(plan()).stdout)
