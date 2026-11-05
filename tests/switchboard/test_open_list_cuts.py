@@ -68,7 +68,7 @@ class CutsBase(Base):
         hub = real_hub(total, self.requests)
         sb.sweep_read_repo(hub, repo, NOW, 7, sb.sweep_phrase_re(["Alex"]), [100], sb.SweepState().strong)
         sb.triage_read_unit(hub, repo, "issues", NOW, [100])
-        engine = types.SimpleNamespace(config={"plan_gates": {"repos": {repo: {}}}}, state_dir=str(self.state_dir), audit=self.engine.audit,
+        engine = types.SimpleNamespace(actor="daemon", config={"plan_gates": {"repos": {repo: {}}}}, state_dir=str(self.state_dir), audit=self.engine.audit,
                                        hub=hub,
                                        now=lambda: NOW)
         sb.ci_record_pass(engine, NOW)
@@ -349,7 +349,7 @@ class TestOpenListCutsMutants(Base):
             return [items[(number - 1) * 100:number * 100]]
         hub = mod.GitHubHub.__new__(mod.GitHubHub)
         hub.gh_api = gh_api
-        engine = types.SimpleNamespace(config={"plan_gates": {"repos": {"acme/api": {}}}, "github_repos": ["acme/api"]}, state_dir=str(self.state_dir), audit=types.SimpleNamespace(append=lambda *a: None),
+        engine = types.SimpleNamespace(actor="daemon", config={"plan_gates": {"repos": {"acme/api": {}}}, "github_repos": ["acme/api"]}, state_dir=str(self.state_dir), audit=types.SimpleNamespace(append=lambda *a: None),
                                        discovery=None, hub=hub, now=lambda: NOW, _note=lambda *a, **k: None, request_keys=set())
         self.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         mod.ci_record_pass(engine, NOW)
@@ -410,7 +410,7 @@ class TestOpenListWholeReads(CutsBase):
         hub = real_hub(0)
         prs = [{"number": n, "state": "open", "title": "t", "body": "", "labels": [], "head": {"sha": "a" * 40}} for n in range(250, 0, -1)]
         hub.gh_api = lambda path, paginate=True, timeout=None: [prs[(int(re.search(r"[?&]page=(\d+)", path).group(1)) - 1) * 100:int(re.search(r"[?&]page=(\d+)", path).group(1)) * 100]]
-        engine = types.SimpleNamespace(config={"plan_gates": {"repos": {"acme/api": {}}}}, state_dir=str(self.state_dir), audit=self.engine.audit, hub=hub, now=lambda: NOW,
+        engine = types.SimpleNamespace(actor="daemon", config={"plan_gates": {"repos": {"acme/api": {}}}}, state_dir=str(self.state_dir), audit=self.engine.audit, hub=hub, now=lambda: NOW,
                                        _note=lambda *a, **k: None)
         sb.ci_record_pass(engine, NOW)
         self.assertEqual(len(engine.ci_record_state.lists["acme/api"][1]), 250, msg="all 250 pull requests are read (a cap of 2 pages reads 200)")
