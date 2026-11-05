@@ -1730,8 +1730,10 @@ class TestReviewLawsStarterSet(Base):
         for line in body.splitlines():
             if line.startswith("## "):
                 break
-            if line.strip():
+            if line.startswith("- "):   # a rule is a list item; a closing paragraph (#2134) is guidance, not a rule
                 lines.append(line)
+            elif line.strip():
+                self.assertFalse(line.startswith(("-", "*", "R-")), "a malformed rule line: %r" % line[:80])
         return lines
 
     def install(self, *argv):
