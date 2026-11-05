@@ -209,7 +209,7 @@ class TestPlanHashLinesBindings(unittest.TestCase):
         self.assertEqual([self.pc.canonical_hash(h, self.hashes) for h in self.hashes], [self.hashes[0]] * 3)
 
     def test_a_mutant_that_reads_the_new_hash_only_fails_with_its_anchored_text(self):
-        pl = _pl_mutate("plan_ledger", "    olds = set(hashes[1:]) - {new}\n", "    olds = set()\n")
+        pl = _pl_mutate("plan_ledger", "    new, olds = hashes[0], set(hashes[1:]) - {hashes[0]}\n", "    new, olds = hashes[0], set()\n")
         with self.assertRaisesRegex(AssertionError, "bound 5 of 15"):
             self.check(pl)
 
