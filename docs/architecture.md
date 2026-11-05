@@ -62,6 +62,7 @@ The **Holds** column is descriptive: only the layer numbers are enforced.
 | `cloud_relay.py` | 2 | the hub half of pod, hub and daemon calls for report, prove, verdict and gates: a bounded in-memory queue and the refusals | |
 | `cloud_client.py` | 1 | the sending end of a message or report through the cloud channel | |
 | `cloud_cluster.py` | 5 | the launcher process, the settings reader, the vault recovery, the cluster client and the tunnel of the cloud launch (#1647); a part of `cloud_worker.py` | |
+| `cloud_first_push.py` | 2 | the state line of a send to a cloud pod and the one `no first push` notice of a launch's checkpoint (#2057); a part of `cloud_worker.py` | |
 | `external_adapter.py` | 1 | a generic client for an outside system that holds decisions and work items | |
 | `agent_calls.py` | 2 | GitHub calls made from agents' shells, counted per account and per hour | |
 | `github_census.py` | 2 | the 5-minute sample line per account and the census of process kinds behind GitHub calls the records do not count (read only) | |
@@ -128,6 +129,7 @@ The **Holds** column is descriptive: only the layer numbers are enforced.
 | `switchboard/pr_explain.py` | 5 | `pr-explain` and the checks of a held pull request body | |
 | `switchboard/sent_view.py` | 5 | `sent`: a sender's own recent messages with their sent, delivered and picked-up times | |
 | `switchboard/v2_transport.py` | 1 | the OpenCode v2 client and its HTTP transport | |
+| `tester_agent.py` | 0 | the list of agents a `launch --role tester` accepts, read from the `agents/roles.tsv` file of the checkout (#1963) | |
 | `switchboard/jev.py` | 1 | the Jev client: the decision model, the classifier and the policy judge's questions | |
 | `switchboard/stage_event.py` | 4 | the stage-event marker of a configured bot's comment: the first line only, validated and rebuilt (ask #1575) | |
 | `switchboard/audit.py` | 2 | the audit log | |
@@ -277,6 +279,7 @@ A site is listed by the function it sits in and its kind, with a count: `import(
 | `cloud_worker.py` | `_load_cluster:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
 | `cloud_worker.py` | `_load_cluster:sys.modules` | 1 | uses `sys` beyond its plain attributes |
 | `cloud_worker.py` | `_registry_note:load_module(string)` | 1 | names a loading builtin by a string (a name in a list counts: over-counting by design) |
+| `cloud_worker.py` | `_first_push:load_module(string)` | 1 | names a loading builtin by a string (a name in a list counts: over-counting by design) |
 | `cloud_worker.py` | `_retired:load_module(string)` | 1 | names a loading builtin by a string (a name in a list counts: over-counting by design) |
 | `cloud_worker.py` | `bind:sys.modules` | 1 | uses `sys` beyond its plain attributes |
 | `cloud_worker.py` | `model_entry:exec_module` | 1 | uses an identifier of the import machinery (exec_module) |
