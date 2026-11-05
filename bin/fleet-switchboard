@@ -3087,6 +3087,7 @@ class Switchboard:
             plan = copy.copy(plan)
             plan.pending = kept
         pending = merge_wake_facts(plan.recipient, merge_reminder_copies(plan.pending))   # #1275: the sweep, triage and load-alert items of one wake are ONE message
+        in_turn = getattr(observation, "status", None) == "working"
         parts_file = (self.state_dir / "finding-parts.json") if self.state_dir is not None else None   # #1302: how many parts of an over-cap finding were delivered (survives a restart; derived from nothing else)
         try:
             parts_done = json.loads(parts_file.read_text()) if parts_file is not None and parts_file.exists() else {}
@@ -3095,12 +3096,12 @@ class Switchboard:
         if not isinstance(parts_done, dict):
             parts_done = {}
         text, carried = compose(plan.recipient, pending, section=section_resolver(self, observation),
-                                repos=repos, delivered=self.now(), resume=parts_done)
+                                repos=repos, delivered=self.now(), resume=parts_done, in_turn=in_turn)
         sent = next((fact for fact in carried if fact.kind == "send"), None)
         if sent is not None and "\n[cut at %d characters]" % MESSAGE_CAP in text[-40:]:  # never cut silently
             # Measure THE message delivered: the carried send alone (compose may cut a newer send, not pending[:1], the oldest fact).
             whole, _ = compose(plan.recipient, [sent], cap=10 ** 9, section=section_resolver(self, observation),
-                               repos=repos, delivered=self.now())
+                               repos=repos, delivered=self.now(), in_turn=in_turn)
             if len(pending) > 1:   # the carried send goes alone, with the line that says the others wait (compose's own rest line)
                 whole += "\n\u2026 and %d more: run fleet-switchboard pending %s" % (len(pending) - 1, plan.recipient)
             allowed = max(0, len(sent.summary) - (len(whole) - MESSAGE_CAP))
@@ -3111,7 +3112,7 @@ class Switchboard:
         if getattr(self, "intents", None) is not None and hasattr(self.intents, "discard_told"):
             # #1275: only the asks of the CARRIED facts are told (compose rendered every fact's header)
             self.intents.discard_told()
-            compose(plan.recipient, carried, section=section_resolver(self, observation), repos=repos, delivered=self.now())
+            compose(plan.recipient, carried, section=section_resolver(self, observation), repos=repos, delivered=self.now(), in_turn=in_turn)
         keys = []
         part_keys = []   # ids of the parts delivered without the last: never acknowledged
         sent_lines = whole_lines(text)
@@ -3148,6 +3149,7 @@ class Switchboard:
             delivery = "steer"
         detail = {"mode": plan.action, "session": observation.session_id, "message_id": message_id,
                   "keys": keys, "resume": resume, "delivery": delivery, "left": len(plan.pending) - len(keys)}
+        detail["in_turn"] = in_turn
         if busy:
             detail["busy"] = True
             if age is not None:
@@ -3188,6 +3190,14 @@ class Switchboard:
         self.supersede_queued_reminders(observation, carried)   # #1844: after the new copy is in, an older delivered copy of its key is removed
         if self.light:
             self.sent.confirm(observation.session_id, keys, self.now())
+        if delivery == "queue" and self.state_dir is not None and not self.light:   # #1801: when a queued message was delivered
+            try:
+                for event, subject, detail in load_module("queued_wait").note_delivery(
+                        self.state_dir, message_id, plan.recipient, observation.session_id, keys, self.now(),
+                        load_module("record_json").parse_bounded):
+                    self._note(event, subject, detail)
+            except Exception as err:   # an unrecorded wait is never a failed delivery
+                self._note("queued_wait.error", None, {"reason": _one_line("%s: %s" % (type(err).__name__, err), 200)})
         self._record_told(keys, plan.recipient)
         sent_keys, keys = keys, ack_keys   # #1302: only the finished findings are acknowledged (a part's own id is not)
         self._acknowledge(keys)
@@ -3202,6 +3212,13 @@ class Switchboard:
             self.intents.commit_told()
         return {"sent": True, "action": plan.action, "message_id": message_id, "keys": keys,
                 "left": len(plan.pending) - len(keys)}
+
+    def _queued_inbox(self, session_id, now):
+        try:
+            inbox = self.reads.inbox(session_id, now, fresh=True)
+        except Exception:
+            return None
+        return inbox if isinstance(inbox, list) else None
 
     def delivery_reader(self):
         """#1402: read(subject) -> the present record of an alert's subject, through the hub's one present-state read (the read #1378 uses); None when this
@@ -3459,6 +3476,13 @@ class Switchboard:
                 self.turn_start_fresh = False
             except Exception as err:   # an unrecorded start is unknown, which counts as young: never stops a pass
                 self._note("turn_start.error", None, {"reason": _one_line("%s: %s" % (type(err).__name__, err), 200)})
+        if self.state_dir is not None and not self.light:   # #1801: a queued message gone from its inbox is consumed (stamped with this pass)
+            try:
+                for event, subject, detail in load_module("queued_wait").observe(
+                        self.state_dir, now, load_module("record_json").parse_bounded, lambda sid: self._queued_inbox(sid, now)):
+                    self._note(event, subject, detail)
+            except Exception as err:
+                self._note("queued_wait.error", None, {"reason": _one_line("%s: %s" % (type(err).__name__, err), 200)})
         early_decisions(self, discovery)   # #467: the decisions file is written as soon as its own sources are read, BEFORE the heavy fact sources
         for problem in discovery.problems:
             self._note("observe.problem", None, {"problem": problem})
@@ -15257,6 +15281,12 @@ def cmd_pending(args, runner, now):
         print("  - %s%s  %s from %s%s at %s: %s" % (fact["key"], " [rider]" if fact.get("rider") else "", fact["kind"],
                                                     fact["from"] or "the fleet", where, iso(fact["created"]),
                                                     _one_line(fact["summary"], 200)))
+    if engine.state_dir is not None:   # #1801: how long a queued message waited (or has waited so far); only over PENDING_WAIT_MINUTES
+        try:
+            for line in load_module("queued_wait").lines(engine.state_dir, engine.now(), load_module("record_json").parse_bounded, args.name):
+                print(line)
+        except Exception:
+            pass
     for problem in entry["source_problems"]:
         print("  problem: %s" % problem)
     for line in engine.unconsumed_lines(entry["observation"]):   # #1844: delivered as `queue`, still in the lane's inbox

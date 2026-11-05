@@ -173,7 +173,7 @@ def compose_order(fact):
     return (reminder, -fact.created, fact.key)
 
 
-def compose(recipient, facts, cap=MESSAGE_CAP, section=None, repos=None, delivered=None, resume=None):
+def compose(recipient, facts, cap=MESSAGE_CAP, section=None, repos=None, delivered=None, resume=None, in_turn=False):
     """One message for `facts`, newest first (a newer result is never held behind older reminders). Returns (text, the facts it carries). With `delivered` (epoch) the header says when the
     message was sent (the carried facts' creation) and when it is delivered; a send that a NEWER one from the same sender about the
     same issue replaces (`superseded_by`) stays in the message, marked, so no key is left out of what is acknowledged.
@@ -224,7 +224,7 @@ def compose(recipient, facts, cap=MESSAGE_CAP, section=None, repos=None, deliver
                 sent = "delayed: sent %s, %s" % (clock_day(late, delivered), held) + ("" if first == last else ", newest sent %s" % last)
             else:
                 sent = "sent %s" % (first if first == last else "%s-%s" % (first, last))
-            when = " (%s, delivered %s)" % (sent, clock_utc(delivered))
+            when = " (%s, delivered %s%s)" % (sent, clock_utc(delivered), ", queued behind a turn" if in_turn else "")
         waiting = sorted({t for f in taken for t in f.supersedes})
         if waiting:   # the earlier messages stay where they are, unchanged: this says only that the newer one replaces them
             names = sorted({f.sender for f in taken if f.supersedes and f.sender})

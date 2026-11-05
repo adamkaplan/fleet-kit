@@ -51,6 +51,7 @@ The **Holds** column is descriptive: only the layer numbers are enforced.
 | `plan_approval.py` | 0 | the check of an approval sent as a message (pure) | |
 | `record_json.py` | 0 | the one bounded-depth parse of untrusted record JSON, shared by every reader of it (#1314) | |
 | `turn_start.py` | 0 | when each working session's current turn began, as the daemon first saw it, for `steer_after_minutes` (#1540) | |
+| `queued_wait.py` | 0 | how long a message delivered by queue waited before the session took it, and the `message.consumed` record (#1801) | |
 | `unconsumed_record.py` | 0 | what the daemon tried to steer and which reminder ids it delivered, for #1844 | |
 | `red_ci.py` | 0 | which check conclusions are red, green or say nothing, and the once-per-key memory (pure table) | |
 | `path_walk.py` | 0 | one walk up from a trusted path, shared by the cloud launcher and the installer | |
