@@ -67071,6 +67071,7 @@ TestNewTestChecksRules, TestNewTestChecksFiles, TestNewTestChecksInPreflightPr, 
 
 TestShimGuardsTool, TestShimGuardRows, TestShimHygienePlanted, TestShimGuardMutants, TestShimGuardDocs = (_sg := importlib.import_module("test_shim_guards")).TestShimGuardsTool, _sg.TestShimGuardRows, _sg.TestShimHygienePlanted, _sg.TestShimGuardMutants, _sg.TestShimGuardDocs   # #1909
 TestPlanningDecision, TestConcurrencyGroup, TestGateLegs, TestGatePass, TestPlatformPaths, TestMacDocs = (_ml := importlib.import_module("test_mac_legs")).TestPlanningDecision, _ml.TestConcurrencyGroup, _ml.TestGateLegs, _ml.TestGatePass, _ml.TestPlatformPaths, _ml.TestDocs
+_ph = importlib.import_module("test_plan_hash_marker"); _ph.HOST = sys.modules[__name__]; TestPlanHashMarkerPure, TestPlanHashMarkerStored, TestPlanHashMarkerTally, TestPlanHashMarkerMutants, TestPlanHashMarkerDocumentation, TestPlanHashMarkerNoSizeTest = _ph.TestPlanHashMarkerPure, _ph.TestPlanHashMarkerStored, _ph.TestPlanHashMarkerTally, _ph.TestPlanHashMarkerMutants, _ph.TestPlanHashMarkerDocumentation, _ph.TestPlanHashMarkerNoSizeTest; TestPlanHashMarkerWake, TestPlanHashMarkerRounds = _ph.build()   # #1713
 TestCiStateDecision, TestCiFreshReaders, TestCiFreshUnreadable, TestCiFreshOptOut, TestCiFreshReads, TestCiFreshRefusalAndEvidence, TestCiFreshDocs, TestCiFreshReadMutants, TestCiFreshSeamMutants = (_cf := importlib.import_module("test_ci_fresh")).TestCiStateDecision, _cf.TestCiFreshReaders, _cf.TestCiFreshUnreadable, _cf.TestCiFreshOptOut, _cf.TestCiFreshReads, _cf.TestCiFreshRefusalAndEvidence, _cf.TestCiFreshDocs, _cf.TestCiFreshReadMutants, _cf.TestCiFreshSeamMutants   # #1755
 _el = importlib.import_module("test_evidence_limit"); _el.HOST = sys.modules[__name__]; TestEvidenceLimitLocal, TestEvidenceLimitItems, TestEvidenceLimitCounting, TestEvidenceLimitRelay, TestEvidenceLimitMutants, TestEvidenceLimitUnchanged, TestEvidenceLimitItemCi, TestEvidenceLimitDocsAndCode = _el.build()   # #1901
 TestPlatformClassList = importlib.import_module("test_platform_classes").TestPlatformClassList
@@ -80215,6 +80216,7 @@ class ReviewCommentEndToEndTests(Base):
         self.assertTrue(paths)
 
 
+_ph_late = _ph.build_late(); TestPlanHashMarkerAsk, TestPlanHashMarkerLaunch = _ph_late   # #1713
 # ------------------------------------------------- every test class isolates, or says why not (#1322)
 
 # THE one exceptions table: a unittest.TestCase that is not derived from Base (which isolates HOME and the XDG directories) is listed here with a one-line reason.
