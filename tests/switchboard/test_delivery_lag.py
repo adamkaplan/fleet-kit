@@ -68,7 +68,7 @@ class TestDeliveryLag(Base):
         self.make("red-ci:pr-unowned:acme/api#8:%s:ci:platform" % self.OPEN_HEAD, 15 * 3600)
         self.assertTrue(self.deliver()["sent"])
         first = self.texts()[0].splitlines()[0]
-        self.assertIn("delayed: sent %s" % self.sent_clock(15 * 3600), first)
+        self.assertIn("delayed: sent 2027-01-14 %s, held 15 h" % self.sent_clock(15 * 3600), first)
         self.make("alert:acme/api#4 alert:platform", 1700, issue=4, repo="acme/api")   # 28 minutes: not late
         self.assertTrue(self.deliver()["sent"])
         self.assertNotIn("delayed:", self.texts()[1].splitlines()[0])
