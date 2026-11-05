@@ -188,7 +188,7 @@ class PodSessionStub:
 
 def drive_launch(module, state):
     """The real `_launch` of `module` with the cluster, the launcher and the tunnel stubbed; returns the exit code."""
-    args = argparse.Namespace(name="coder5", agent="worker", reports_to="lead", boss_unregistered="test fixture: the lead is not in the registry", checkpoint="30m", resume=False, headless=False, dir=None, shape=None,
+    args = argparse.Namespace(name="coder5", agent="worker", reports_to="lead", checkpoint="30m", resume=False, headless=False, dir=None, shape=None,
                               stack=False, brief_file=None, idle=None, hard=None, role="coder", issue=None, charter=None, model=None, reasoning=None, brief=None, branch="feature", repo="acme/widget-api")
     engine = types.SimpleNamespace(now=lambda: BASE, discover=lambda at: types.SimpleNamespace(agents={}), config={"call_timeout_seconds": 5}, audit=None, actor="t")
     lib = types.SimpleNamespace(check_repo_preflight=lambda repo, env: "ok", CloudError=Exception, AGENTS=("worker",))
