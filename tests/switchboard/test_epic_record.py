@@ -152,7 +152,8 @@ class TestEpicRecordPlacement(unittest.TestCase):
         for path in ("bin/epic_record.py", "bin/plan_ledger.py"):
             self.assertEqual(HOST.sb.impact_floor.floor_paths([path], globs, exclude, force), [path])
         import json
-        m = json.loads((REPO / "docs" / "review-laws" / "impact-matrix.json").read_text())
+        from support.paths import load_matrix
+        m = load_matrix(REPO / "docs" / "review-laws" / "impact-matrix.json")
         self.assertIn("bin/epic_record.py", m["owner_hold"]["top_tier_paths"]["authority"])
         self.assertIn("bin/epic_record.py", m["owner_hold"]["floor"]["adamkaplan/fleet-kit"]["globs"])
         others = json.dumps([m["owner_hold"]["never_carried_paths"],

@@ -24,10 +24,42 @@ class MatrixError(ValueError):
 _MATRIX_CACHE = {}
 
 
+ENTRIES_DIRNAME = "impact-entries"
+
+
+def _entry_files(path=None):
+    """[(directory name, file)] of every entry file beside the matrix file, sorted by directory then file name (the order every reader sees)."""
+    root = Path(path or MATRIX_PATH).parent / ENTRIES_DIRNAME
+    if not root.is_dir():
+        return []
+    return [(d.name, f) for d in sorted(root.iterdir()) if d.is_dir() for f in sorted(d.iterdir()) if f.is_file()]
+
+
+def _entries_stamp(path=None):
+    root = Path(path or MATRIX_PATH).parent / ENTRIES_DIRNAME
+    if not root.is_dir():
+        return ()
+    return (root.stat().st_mtime_ns,) + tuple((d.name, d.stat().st_mtime_ns) for d in sorted(root.iterdir()) if d.is_dir()) + tuple((n, f.name, f.stat().st_mtime_ns) for n, f in _entry_files(path))
+
+
+def _entry_target(name, root):
+    """(container dict, key, kind) the directory `name` extends in the parsed matrix `root`, or None for an unknown directory."""
+    parts = [x.replace("__", "/") for x in name.split(".")]
+    if name == "top_tier_outside_floor":
+        return root.setdefault("owner_hold", {}), "top_tier_outside_floor", "list"
+    if parts[0] == "top_tier_paths" and len(parts) == 2:
+        return root.setdefault("owner_hold", {}).setdefault("top_tier_paths", {}), parts[1], "list"
+    if parts[0] == "floor" and len(parts) == 3 and parts[2] == "globs":
+        return root.setdefault("owner_hold", {}).setdefault("floor", {}).setdefault(parts[1], {}), "globs", "list"
+    if parts[0] in ("authority_modules", "delegated_clear") and len(parts) == 2:
+        return root.setdefault("owner_hold", {}).setdefault(parts[0], {}), parts[1], "dict"
+    return None
+
+
 def _matrix_cached():
     """The matrix file, re-read only when it changes (the daemon asks per record per pass)."""
     try:
-        stamp = MATRIX_PATH.stat().st_mtime_ns
+        stamp = (MATRIX_PATH.stat().st_mtime_ns, _entries_stamp())
         if _MATRIX_CACHE.get("stamp") != stamp:
             _MATRIX_CACHE.update({"stamp": stamp, "matrix": load_matrix()})
         return _MATRIX_CACHE["matrix"]
@@ -40,7 +72,10 @@ def rule_fingerprint():
     """A short fingerprint of the matrix file's bytes, the version of the rule: the daemon judges a pull request again when it changes (#451 slice 3). Raises
     MatrixError when the file cannot be read (a rule that cannot be read has no version)."""
     try:
-        return hashlib.sha256(MATRIX_PATH.read_bytes()).hexdigest()[:12]
+        digest = hashlib.sha256(MATRIX_PATH.read_bytes())
+        for name, f in _entry_files():   # the entry files are part of the rule: a new entry makes the daemon judge again
+            digest.update(name.encode() + b"\0" + f.name.encode() + b"\0" + f.read_bytes() + b"\0")
+        return digest.hexdigest()[:12]
     except OSError as err:
         raise MatrixError("the impact matrix file cannot be read (%s: %s)" % (type(err).__name__, err)) from None
 
@@ -338,7 +373,21 @@ def entry_hits(paths, hold, exclude):
 
 
 def load_matrix(path=None):
-    return json.loads(Path(path or MATRIX_PATH).read_text())
+    """The matrix: the JSON file plus the entry files beside it (`impact-entries/<list>/<entry>`, one value per file, loaded sorted by file name; a list takes
+    the file's text, a dict entry takes `key` on the first line and the reason after it). The ONE loader every reader goes through."""
+    matrix = json.loads(Path(path or MATRIX_PATH).read_text())
+    for name, f in _entry_files(path):
+        target = _entry_target(name, matrix)
+        if target is None:
+            raise ValueError("impact entry directory %r is not a known list (file %s)" % (name, f.name))
+        box, key, kind = target
+        text = f.read_text()
+        if kind == "list":
+            box.setdefault(key, []).append(text.strip("\n"))
+        else:
+            head, _, reason = text.partition("\n")
+            box.setdefault(key, {})[head.strip()] = reason.strip("\n")
+    return matrix
 
 
 def cell_action(matrix, severity, probability):

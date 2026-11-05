@@ -131,8 +131,11 @@ def derive(root, rule):
 
 
 def load_rule(path):
-    with open(path, encoding="utf-8") as handle:
-        return json.load(handle)["owner_hold"]["delegated_clear"]
+    """The delegated_clear block, through the ONE matrix loader (bin/impact_floor.load_matrix: the JSON plus the entry files beside it, ask #2206 part 3). The rewrite below splices the JSON text only."""
+    spec = importlib.util.spec_from_file_location("impact_floor_loader", os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, "bin", "impact_floor.py"))
+    loader = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(loader)
+    return loader.load_matrix(path)["owner_hold"]["delegated_clear"]
 
 
 def differences(rule, per_part):

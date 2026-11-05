@@ -19,7 +19,15 @@ import impact_brief as ib  # noqa: E402
 import brief_advisory as ba  # noqa: E402
 
 HEAD, OTHER = "a" * 40, "b" * 40
-MATRIX = json.loads((ROOT / "docs/review-laws/impact-matrix.json").read_text())
+
+def _load_matrix(path):
+    """The impact matrix through its ONE loader (the JSON plus its entry files, ask #2206 part 3)."""
+    spec = importlib.util.spec_from_file_location("impact_floor_for_test", str(ROOT / "bin" / "impact_floor.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.load_matrix(path)
+
+MATRIX = _load_matrix(ROOT / "docs/review-laws/impact-matrix.json")
 RULE = MATRIX["owner_hold"]["delegated_clear"]
 SUB = dc.substance_rule(MATRIX)
 

@@ -134,56 +134,9 @@
       "cost"
     ],
     "top_tier_paths": {
-      "credentials": [
-        "shims/gh",
-        "shims/git",
-        "cloud/launcher/token_mint.py",
-        "cloud/launcher/cloud_worker.py",
-        "cloud/launcher/app_token.py",
-        "cloud/launcher/preflight.py",
-        "cloud/worker/entrypoint.sh",
-        "cloud/launcher/repo-approvals.json"
-      ],
-      "identity": [
-        "shims/**",
-        "bin/switchboard-trial"
-      ],
-      "authority": [
-        "bin/plan_ledger.py",
-        "bin/plan_approval.py",
-        "bin/epic_record.py",
-        "bin/impact_floor.py",
-        "bin/chat_clear.py",
-        "bin/merge_gate.py",
-        "bin/size_ceilings.py",
-        "bin/clear_carry.py",
-        "bin/reassign.py",
-        "bin/item_verdicts.py",
-        "bin/launch_testers.py",
-        "bin/plan_review.py",
-        "bin/decision_core.py",
-        "bin/lanes.py",
-        "bin/orders_copy.py",
-        "bin/charter_check.py",
-        "bin/cloud_worker.py",
-        "bin/cloud_channel.py",
-        "bin/cloud_channel_server.py",
-        "bin/cloud_relay_daemon.py",
-        "bin/cloud_hub.py",
-        "bin/cloud_relay.py",
-        "cloud/worker/bin/cloud_relay.py",
-        "bin/cloud_cli.py",
-        "bin/cloud_cluster.py",
-        "bin/cloud_launch_again.py",
-        "bin/external_adapter.py",
-        "bin/delegated_clear.py",
-        "bin/impact_hold.py",
-        "docs/review-laws/impact-matrix.json",
-        "plugins/fleet-hooks/**",
-        "tools/cos-permissions-proof/**",
-        "agents/**",
-        ".github/workflows/**"
-      ]
+      "credentials": [],
+      "identity": [],
+      "authority": ["docs/review-laws/impact-entries/**"]
     },
     "narrow_by_diff": {
       "meaning": "Paths whose hold depends on their CONTENT: an agent definition holds for the owner only when its permission block changes between the base and the head of the pull request (the top level front matter keys named here); an added, removed or unreadable definition holds, and so does a pull request that changes more than max_files of them. The code has no path or key of its own.",
@@ -200,45 +153,7 @@
     },
     "floor": {
       "adamkaplan/fleet-kit": {
-        "globs": [
-          "shims/**",
-          "plugins/fleet-hooks/**",
-          "templates/**",
-          "tools/cos-permissions-proof/**",
-          "bin/plan_ledger.py",
-          "bin/plan_approval.py",
-          "bin/epic_record.py",
-          "bin/impact_floor.py",
-          "bin/chat_clear.py",
-          "bin/merge_gate.py",
-          "bin/size_ceilings.py",
-          "bin/clear_carry.py",
-          "bin/reassign.py",
-          "bin/item_verdicts.py",
-          "bin/launch_testers.py",
-          "bin/plan_review.py",
-          "bin/decision_core.py",
-          "bin/lanes.py",
-          "bin/orders_copy.py",
-          "bin/charter_check.py",
-          "bin/cloud_worker.py",
-          "bin/cloud_channel.py",
-          "bin/cloud_channel_server.py",
-          "bin/cloud_relay_daemon.py",
-          "bin/cloud_hub.py",
-          "bin/cloud_relay.py",
-          "cloud/worker/bin/cloud_relay.py",
-          "bin/cloud_cli.py",
-          "bin/cloud_cluster.py",
-          "bin/cloud_launch_again.py",
-          "bin/external_adapter.py",
-          "bin/delegated_clear.py",
-          "bin/impact_hold.py",
-          "docs/review-laws/impact-matrix.json",
-          "cloud/launcher/app_token.py",
-          "cloud/launcher/preflight.py",
-          "cloud/worker/entrypoint.sh"
-        ],
+        "globs": ["docs/review-laws/impact-entries/**"],
         "exclude": [
           "agents/**",
           "skills/**",
@@ -247,18 +162,12 @@
         ],
         "force": [
           "bin/impact_floor.py",
-          "docs/review-laws/impact-matrix.json"
+          "docs/review-laws/impact-matrix.json",
+          "docs/review-laws/impact-entries/**"
         ]
       }
     },
-    "top_tier_outside_floor": [
-      "agents/**",
-      "cloud/launcher/token_mint.py",
-      "cloud/launcher/cloud_worker.py",
-      "cloud/launcher/repo-approvals.json",
-      ".github/workflows/**",
-      "bin/switchboard-trial"
-    ],
+    "top_tier_outside_floor": [],
     "authority_modules": {
       "meaning": "Every module in bin/ that defines a function whose name has a word of `vocabulary` (names split at underscores) decides who may clear, hold, release, carry, consent to, record a verdict for or merge something, so it must be a top tier path above or be named in `exempt` with the reason it is not. A test reads this block and fails, naming the module, when a module is neither. The vocabulary is data: adding a word here widens the guard with no code change. A SECOND rule does not look at names: a module with a comparison (==, !=, in, not in) against one of the `role_literals` (the role names the fleet checks a caller by) decides who may act, so it must be listed or exempted too; a renamed function cannot hide it. When in doubt, LIST: an exemption needs a reason a reviewer can verify. `limits` says what the guard cannot see.",
       "vocabulary": [
@@ -300,15 +209,7 @@
         "person",
         "only"
       ],
-      "exempt": {
-        "bin/cloud_end_alert.py": "chief_not_needed only decides whether the Chief of Staff is among the recipients of a pod-end message (#2202); it clears, releases and merges nothing. Trace: its only caller is the pass in bin/cloud_end_alert.py that builds the send list, and its value only drops the chief from a recipient list handed to the send function; no value of it feeds an authority function.",
-        "bin/brief_advisory.py": "is_advisory and owner_hold_wanted only read a brief that bin/impact_brief.py built and answer whether the daemon writes an owner-hold label for a pull request the floor already holds; they clear, release and merge nothing. Trace: the only callers are impact_plan in bin/impact_hold.py and the Decisions row in bin/decision_core.py; the clear itself (bin/delegated_clear.py) does not read them, and a pull request whose brief names a material risk is held as before.",
-        "bin/path_suites.py": "gate_finding words an INFORMATION line (a pull request changes a path and names none of the suites that exercise it). Trace: its only caller is the gates finding in bin/fleet-switchboard, which prints the line for people to read and never changes a gate verdict; no role, tier, identity, verdict, clear or merge is produced or read (ask #1045).",
-        "bin/agent_calls.py": "release_notice gives back a once-an-hour message claim for an account's budget notice. Trace: its only caller is the budget notice command in bin/fleet-switchboard, which calls it after claim_notice when the reminder could not be added; it truncates a rate-limit file in the state directory and returns nothing, so no role, tier, identity, verdict or clear is produced or read.",
-        "bin/spotlight_guard.py": "holds_files tells whether a folder holds an entry. Trace: used only inside bin/spotlight_guard.py (the Spotlight index check of ask #438); the module returns no role, tier, identity, verdict or clear, and nothing in bin/ reads its result as one.",
-        "bin/triage_digest.py": "gate is a rate limit on the stale digest (warm-up and interval). Trace: its only caller is the triage digest in bin/fleet-switchboard, where `allowed` decides whether a digest message is SENT now; no role, tier, verdict or clear is produced or read.",
-        "bin/triage_plan_open.py": "merged_links reads which links a merged unit names. Trace: its callers are the triage's plan-open check in bin/fleet-switchboard, which only lists findings for people to read; nothing it returns reaches answer_authority, a caller check, a verdict or a clear."
-      },
+      "exempt": {},
       "role_literals": [
         "chief-of-staff",
         "operator",
@@ -1015,30 +916,7 @@
         "neutralise_marker",
         "gates_caller_kind"
       ],
-      "closure_exempt": {
-        "bin/agent_reconcile.py": "loaded only by `reconcile_agents_on_read`, called by `cmd_status`'s view reconcile, which the clear never calls",
-        "bin/closed_labels.py": "loaded only by `publish_decisions` (the decision list), which the clear never calls",
-        "bin/cloud_end_alert.py": "loaded only by `cloud_end_tick` and `cloud_turn_tick` (via `load_module`), both called only by `finish_pass` (after `cloud_watch_tick`), not by the clear",
-        "bin/pod_silence.py": "loaded only by `pod_silence_tick` (via `load_module`), called only by `finish_pass` (after `cloud_turn_tick`), not by the clear",
-        "bin/cloud_relay_daemon.py": "loaded only by `run_daemon`'s pass loop (`pass_if_configured`), not by the clear; it is still a top tier authority path (it writes ledger entries), so this lists only that the clear cannot reach it",
-        "bin/epic_record.py": "loaded only by the gates commands (gates, gates ask-close, item-gates) and the epic prove and verdict commands, never by the clear: no function the clear reaches calls it",
-        "bin/external_adapter.py": "loaded only by the external-decision adapter path, which the clear does not run",
-        "bin/health_records.py": "loaded only by the health and pane pass, which the clear does not run",
-        "bin/issue_line.py": "loaded only by `cmd_issue_line`, the issue-line command, not the clear",
-        "bin/lanes.py": "loaded only by `cmd_move`: the lane command, not the clear",
-        "bin/launch_brief_check.py": "loaded only by `launch_brief_mismatch`, the launch-time reader of the brief (#1350), which the clear cannot reach",
-        "bin/launch_testers.py": "loaded only by the tester launch command, not the clear",
-        "bin/merged_labels.py": "loaded only by `publish_decisions` (the decision list), which the clear never calls",
-        "bin/open_list_alert.py": "loaded only by `open_list_alert` (the open-item list cut alert), called only by `publish_decisions` and `sweep_refresh`, which the clear never calls",
-        "bin/orders_copy.py": "loaded only by `cmd_orders_copy`, not the clear",
-        "bin/path_suites.py": "loaded only by the gates finding (an information line), `heavy --changed`/`--list` and `preflight-pr --merged`: the suite map and its runs, not the clear",
-        "bin/plan_approval.py": "loaded only by `check_approval`, the send command's approval check (#951), which the clear never calls",
-        "bin/resume_brief.py": "loaded only by `cmd_launch`, not the clear",
-        "bin/review_checkout.py": "loaded only by `cmd_review_checkout`, the reviewer checkout command, not the clear",
-        "bin/tester_agent.py": "loaded only by the launch refusal of a tester, not the clear",
-        "bin/triage_ownerless.py": "loaded only by the triage passes, which the clear does not run",
-        "bin/triage_plan_open.py": "loaded only by the triage plan-open pass, which the clear does not run"
-      }
+      "closure_exempt": {}
     }
   }
 }

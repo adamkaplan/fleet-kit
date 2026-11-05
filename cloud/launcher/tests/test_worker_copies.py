@@ -27,6 +27,14 @@ def slurp(rel, root=ROOT):
         return f.read()
 
 
+def matrix_text(root=ROOT):
+    """The impact matrix as JSON text, through the ONE loader (the JSON plus docs/review-laws/impact-entries/, ask #2206 part 3): the entries that moved name paths too."""
+    spec = importlib.util.spec_from_file_location("impact_floor_for_copies", os.path.join(root, "bin", "impact_floor.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return json.dumps(mod.load_matrix(os.path.join(root, "docs/review-laws/impact-matrix.json")))
+
+
 def rows(root=ROOT):
     return [tuple(l.split("\t")) for l in slurp(TABLE, root).decode().splitlines() if l]
 
@@ -547,12 +555,12 @@ class Comparing(unittest.TestCase):
             self.assertNotEqual(mutated, original, "the mutation was not applied")
 
     def test_s10_the_matrix_names_only_copies_of_the_table(self):
-        named, unnamed = check_matrix(slurp("docs/review-laws/impact-matrix.json").decode(), rows())
+        named, unnamed = check_matrix(matrix_text(), rows())
         print("S10 matrix paths:", named, "rows:", [r for r in rows() if r[1] in named], "copies not named:", unnamed)
         self.assertEqual(len(named), 2)
 
     def test_s10_a_table_without_the_relay_row_is_caught(self):
-        text = slurp("docs/review-laws/impact-matrix.json").decode()
+        text = matrix_text()
         table = slurp(TABLE).decode()
         row = "bin/cloud_relay.py\tcloud/worker/bin/cloud_relay.py\n"
         self.assertEqual(table.count(row), 1)
@@ -588,7 +596,7 @@ class Comparing(unittest.TestCase):
             self.assertNotEqual(text.replace("not-in-the-text", "x"), text, "the mutation was not applied")
 
     def test_s10_odd_forms_of_the_path_are_judged_like_the_plain_path(self):
-        base = json.loads(slurp("docs/review-laws/impact-matrix.json").decode())
+        base = json.loads(matrix_text())
         self.assertEqual(len(check_matrix(json.dumps(base), rows())[0]), 2)
         for form in ("./cloud/worker/bin/cloud_relay.py", "cloud/worker/bin/cloud_relay.py/"):
             with self.subTest(form=form):
