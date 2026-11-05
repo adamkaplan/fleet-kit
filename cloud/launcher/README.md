@@ -151,7 +151,7 @@ The switchboard (`bin/cloud_worker.py`) calls this launcher; the settings below 
 | `CW_CLUSTER_TOKEN_CMD` | a command that prints a cluster token; when unset the default below is used |
 | `CW_VAULT_SUBSCRIPTION`, `CW_VAULT_NAME` | the vault that holds the cluster administrator credential (secret `CW_CLUSTER_ADMIN_SECRET`, default `cw-cluster-admin-kubeconfig`; or a command in `CW_CLUSTER_ADMIN_CMD`) |
 | `CW_CLUSTER_TOKEN_DURATION` | the token's requested life, default `20m`, at most `60m` (kubectl's own floor is 10 minutes) |
-| `CW_GIT_TOKEN_CMD` | prints the one-hour git token for the repository (default: `app_token.py OWNER/NAME`, same settings as `run_task.py`); the managed reaper runs the same command to renew the token every 30 minutes |
+| `CW_GIT_TOKEN_CMD` | prints the one-hour git token for the repository on stdout (an override's contract); the default is `app_token.py OWNER/NAME --fd N`, which hands the token over a pipe the launcher reads and never prints it (same settings as `run_task.py`); the managed reaper runs the same command to renew the token every 30 minutes |
 | `CW_OPENCODE_BIN` | the `opencode` program (default `opencode` on `PATH`); the launcher runs `opencode auth export` (fixed arguments, scrubbed environment, output through a pipe, in memory) and keeps only the one `github-copilot` entry, as a one-entry array. Refused by name: command missing or failing, no entry, two entries, an inactive entry, an entry that is not `oauth`; nothing is created |
 | `CW_PULL_SECRET` | optional: the image pull secret name passed to `create` |
 | `CW_HUB_CHANNEL_URL` | the address of the hub's channel an orchestrator or hub pod is told (`FLEET_CLOUD_CHANNEL_URL`); an `http` or `https` URL with a host, an optional port and an optional one-segment path; not a secret; default `http://cloud-hub.cw.svc:8443/message`. **Set (this or `CW_HUB_REGISTRY_SECRET`) = the hub setting is on: every launch registers** with the hub (a worker launch included), and a launch needs the headless Service `cw-agents` |
@@ -416,7 +416,7 @@ The managed reaper's loop (`reap --loop`) does it, as one more step of each pass
 
 - **When.** For each running pod, when the token is `GIT_TOKEN_RENEW_AFTER_SECONDS` (1800, so 30 minutes of its life are left) old. The age is the Secret's
   `cw/git-token-minted` annotation, or the Secret's creation time when it has none. A pass that finds the token older than an hour (the machine slept) renews at once.
-- **How.** It mints through the SAME route as the launch (`run_git_token_cmd`: `CW_GIT_TOKEN_CMD`, else `app_token.py OWNER/NAME`), so one repository, the exact
+- **How.** It mints through the SAME route as the launch (`run_git_token_cmd`: `CW_GIT_TOKEN_CMD`, else `app_token.py OWNER/NAME` with a pipe named by `--fd`), so one repository, the exact
   permissions and the 61-minute cap hold by construction, and replaces only the `git-token` key by one merge patch whose body goes on standard input. The patch is bound to the exact Secret that was checked: its body carries that Secret's `metadata.uid` and `metadata.resourceVersion`, so the API server refuses it (Conflict) if the Secret changed or was made again while the mint ran (a relaunch of the same worker gets the same names); the labels are read again after the mint as a second guard. A refusal keeps the old state, writes one audit line (`the secret changed during the mint: not renewed`), names the worker in the report and is retried at the next pass. The token is
   never in an argument, an environment value, a file, an output, an audit line or a record. The pod needs no change: its credential helper and `gh` wrapper read the file at every
   call, and the file is a whole-directory projected volume (no `subPath`) that the kubelet refreshes, usually within a minute or two.
@@ -491,10 +491,18 @@ token file by hand. The reaper does that now, by itself, and runs unattended for
 ## Server-side guards: `app_token.py` and `preflight.py`
 
 A guard is enforced where the action takes effect (the repository's rules, the token's scope), not in a wrapper.
-These two programs are the server side of that. Neither writes a file; neither prints a secret.
+These two programs are the server side of that. The mint writes a file only when a person names `--out` (one new file, mode 0600); the preflight writes none; neither prints a secret.
 
-**`app_token.py OWNER/REPO`** prints a one-hour GitHub App installation token for that one repository, and nothing
-else, on stdout. It refuses (exit 1, one line on stderr naming the key, never a value) to print a token unless:
+**The cause (ask #1043):** the mint printed the one-hour repository token on standard output, where terminals, transcripts and logs capture it; two recorded cases (a misordered redirect, and a debugging run of a clone) each showed a live token.
+**`app_token.py OWNER/REPO`** now mints a one-hour GitHub App installation token for that one repository and writes it only to a route the
+caller names, never to stdout or stderr. The fix removes stdout as a delivery channel. The routes (exactly one per run):
+
+- `--fd N`: a descriptor (3 or more, open, writable, not a terminal) the caller passes down, normally a pipe the launcher reads. No file exists. This is the route for programs.
+- `--out PATH`: a new file, mode 0600, created only after every check passed, in a directory you own with no group or world access; it is refused when PATH exists and never overwritten. This is the route for a person.
+- no route: the token is minted, then revoked (nobody received it), and stderr says one line with the token's byte count; stdout stays empty, exit 0.
+
+A bad route (0, 1 or 2, a closed or read-only descriptor, a terminal, a second descriptor of the very file or pipe that standard output or standard error is (`3>&1`, `3>&2`), both routes, a bad directory, a symbolic link in any part of the directory path) exits 2 before anything is minted. The path route accepts the system's own root-owned links in a directory others cannot write, or a sticky one (such as `/var` and `/tmp` on a Mac); a `..` component and every other link are refused. A delivery
+that fails revokes the token and exits non-zero. Success is silent. It refuses (exit 1, one line on stderr naming the key, never a value) to deliver a token unless:
 
 - the installation is found, not stored: the mint asks GitHub (`GET /repos/OWNER/REPO/installation`, signed with the App's
   own short-lived token) which installation covers the repository, and refuses unless that answer is one installation whose
@@ -514,6 +522,34 @@ accepting the old set). The exact refusal GitHub gives for a permission granted 
 
 The private key travels only through a pipe to `openssl`; only `https://api.github.com` is used (`CW_GITHUB_API_BASE`
 may name a loopback `http` address, for tests).
+
+The revoke covers the whole span from the mint to the end of the delivery: any exception or signal (an interrupt, SIGTERM, SIGHUP, a broken pipe, a full disk, an error in the code between the mint and the route) revokes the token once with its own value, removes the file this run created (only that one) and exits non-zero.
+A path over the file system's name or path limit is refused before anything is minted (exit 2, no request to GitHub); the limit is the smaller of the file system's `PC_NAME_MAX` and `PC_PATH_MAX` names and a fixed cap of 4096 bytes in total.
+A revoke that fails (GitHub refuses the DELETE or the connection fails) prints one line on stderr, `app-token: the token could not be revoked (status N)`, where N is the HTTP status or the word `unreachable` (never the token), and the exit status is non-zero, for the no-route run and the failed-delivery run; a good revoke prints no such line.
+The no-route run revokes the token before it forgets it: the kept token is dropped only after the revoke call has ended, and the token is kept from the moment the mint knows it.
+An interrupt of any kind ends with the token revoked and the interrupted status (130 for Ctrl-C, 143 for SIGTERM, 129 for SIGHUP): an interrupt during the revoke request makes the revoke once more and is then raised again, never swallowed; a revoke that still did not complete prints the one line above.
+Two more same-user limits of the path route, stated: a root-owned link accepted in a directory another non-root user owns is inside the same-user limit F1; a signal between creating the file and its guarding try leaves an empty 0600 file with no token.
+Two same-user limits remain, stated rather than fixed (a complete fix walks every path component with a directory descriptor and touches the link allowance above, so it is not cheap): F1, an ancestor of the path swapped for a link by the same user after the check redirects the delivery, and F2, the cleanup removes whatever is at the file's name. The attacker would already hold the caller's own user id, can read the delivered file and trace the mint: no new access.
+
+### Running the mint by hand
+
+Run it only with the file route, in a private directory you own, and never with a redirect or a command substitution (a slip there is
+how a token reached a screen):
+
+```
+mkdir -m 700 "$HOME/.cw-token-dir"
+python3 cloud/launcher/app_token.py acme-org/widget-service --out "$HOME/.cw-token-dir/token"
+# use the file (for example: read it into the program that needs it), then remove it:
+rm -r "$HOME/.cw-token-dir"
+```
+
+The run prints nothing on success. With no route it only reports a byte count and revokes the token, so it is a safe way to check that the
+mint works. The one line on stderr (here for a token of 49 bytes; the count is the token's own) reads:
+
+```
+app-token: minted a token of 49 bytes and did not deliver it: name a route with --fd N or --out PATH
+```
+ The file is created with mode 0600 and the mint refuses an existing path. Do not print the file in a shared session or a log.
 
 **`preflight.py OWNER/REPO [--branch NAME] [--accept-classic]`** reads, with GET only, whether the default branch
 refuses direct pushes (a `pull_request` rule that requires at least one approving review, or a `merge_queue` rule, in an active ruleset that covers the branch; `evaluate` and `disabled` rulesets and rulesets not covering the branch are refused by name; ref patterns follow GitHub: `*` stops at `/`, `**` crosses it, and a pattern the program does not understand, such as a character class, covers nothing), force-pushes (`non_fast_forward`) and deletion
@@ -572,6 +608,22 @@ The App already holds checks: read (the owner confirmed it on 29 October), so th
 A passing failure of the preflight's mint (the vault command, a network error or timeout, an HTTP 5xx or 429 answer, or a 403 with a Retry-After) is retried inside the preflight: 4 tries, with waits of 2, 5 and 10 seconds between them, one line on standard error per retry (`mint try N of 4 failed: <reason>; trying again in S seconds`, never a value); a Retry-After over 10 seconds ends the retries at once. A refusal (a 404, a 422, a 403 without Retry-After, any `refusing:` check, the expiry or permission checks) is never retried: it ends after one try. A launch that still cannot mint says its tries and the last reason (`no token could be minted after 4 tries: <reason>`) and writes one audit line (action `create.failed`, reason `preflight: ...`) through the launcher's own audit file.
 
 The launch's own mint of the pod's git token runs a command (`app_token.py`, or `CW_GIT_TOKEN_CMD`): `app_token.py` exits with status 75 for a passing failure (the vault command, a network error or timeout, an HTTP 5xx or 429 answer, or a 403 with a Retry-After) and keeps its old status for every refusal. The launch retries the command only on status 75: up to 4 tries with waits of 2, 5 and 10 seconds, one line on standard error per retry (`git token try N of 4 failed: <last line>; trying again in S seconds`, never a value), and a final refusal that says `after 4 tries`; a Retry-After over 10 seconds cannot be read from an exit status, so it does not end the retries early. A custom token command is retried only when it exits with 75; a command that exits with any other status is never retried.
+## Retire of a gone worker (ask #1327)
+
+Cause: the name-freeing change (a retire of a worker whose pod is already gone frees its name) was read on its own and left six gaps. (1) The stop audit did not name the Secrets it removed, so the trail of what a stop deleted was incomplete. (2) The not-found match was a substring match: any error text that held `NotFound` and the object name read as gone. (3) The Secret read still used the loose match. (4) A name with a trailing newline passed the name pattern, because the end anchor `$` matches before a final newline. (5) The record was not bound to a pod identity, so a retire that raced a relaunch under the same name could delete the new pod's Secrets. (6) The hub entry of a gone orchestrator was left behind.
+
+What each part does now, in plain sentences:
+
+- The stop audit names the Secrets it removed: when the pod is gone, the audit line of `stop` ends with `secrets removed: ` and the names (`cw-NAME-pw`, `cw-NAME-run`), or `none`. Names only, never content.
+- The not-found match is anchored to the whole message of the one object asked for. The text of the cluster client, after one trailing newline is trimmed, must equal `Error from server (NotFound): <kind> "<exact name>" not found` for the pod read and for both Secret reads. Any other text, such as another object, another kind, extra words after it or the words inside another sentence, raises and never reads as gone.
+- A name with a trailing newline is refused: every name check uses a full match, in the launcher and in the switchboard's record and password paths, so such a name reaches no cluster call and no file path. Every valid name is still accepted.
+- The worker record carries the pod's uid and a retire acts only on the pod with that uid. The uid is read when `create` made the pod (`pod_uid` in the create answer); `retire` hands it to `stop --pod-uid UID`: a new pod under the same name is left whole with its Secrets (exit `6`, nothing deleted). A pod that reads as gone is retired by name only when a second read finds no live pod. A record without a uid acts by name, as before. Known residual: a relaunch of the same worker name that has created its Secrets but not yet its pod, between the second read of the retire and its Secret delete, can lose the new run's Secrets; the lane launches again.
+- A create whose read of the new pod fails or gives no usable uid cannot record the pod's uid: it says so in one stderr line and in its audit line, the worker record holds no pod identity, and a retire acts by name. A usable uid is 1 to 64 letters, digits, dots, dashes or underscores; anything else (no pod, text, a list, no uid, an empty, spaced, control-character or over-long one) is the same case. A successful `launch --cloud` shows that line once on its own stderr (the launcher's create answer carries it as `identity_note`).
+- A signal (an interrupt or a termination request) during that read of the new pod's uid ends the create with its usual cleanup: the pod and its Secrets are removed once, the audit line of the failed create is written and the interrupted exit status is kept; an ordinary failure of the read gives the note and no cleanup, and the pod is kept.
+- A retire of a gone orchestrator removes its hub entry and reports a failure to do so. The switchboard sends `--hub-entry` for a record whose agent is `orchestrator`, and the launcher calls the same unregister call the live path uses. A failure of that call exits non-zero with an `ok: false` audit line and the record kept, and is never swallowed; a second retire finishes the work.
+
+Test: `cloud/launcher/tests/test_retire_gone_exact.py` (against the fake cluster of the launcher tests, with a mutant for the uid and one for the hub entry).
+
 
 **A repository's smallest pod shape (`CW_REPO_MIN_SHAPE`, #1443).** What it is: one optional key of the launcher's settings file, a comma-separated list of `OWNER/NAME=SHAPE` pairs (SHAPE is `XS`, `S` or `M`; the repository is compared exactly and case-insensitively, like `CW_ALLOWED_REPOS`; for example `acme-org/widget-service=S`). The shape is a floor for that repository's launches. Why it exists: `check_shape` chose the pod shape from the launch's own flags only (`--shape`, `--stack`, the orchestrator agent) and never from the repository, so three pods of one large repository were killed for memory (exit 137, OOMKilled) on the light shape (1 CPU, 2 GiB) within 2.5 to 7.3 minutes of starting. The rule: for a listed repository a launch with no `--shape` gets the larger of the floor and the shape the flags would give (a stack launch or an orchestrator stays at least `S`); a `--shape` smaller than the floor is refused before anything is created (exit 2, one line naming the repository, the floor and `CW_REPO_MIN_SHAPE`); the same or a larger shape is accepted; an unlisted repository, or an unset setting, changes nothing. How to set it: add one line `CW_REPO_MIN_SHAPE=OWNER/NAME=SHAPE` (more pairs after commas) to the settings file, or export it when there is no file; an entry without `=`, with an unknown shape, a malformed repository or a repeated repository refuses the whole file, naming the key and no value. This change holds no repository name: the entry for a real repository is the operator's own line in the settings file.
 

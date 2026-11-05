@@ -570,7 +570,7 @@ class RealRuleMutants(unittest.TestCase):
         self.caught("test_replay_with_different_args_is_409_and_writes_nothing")
 
     def test_mutant_replay_in_build_ignores_args(self):
-        self.patch(plan_ledger, "clip", lambda text, *a: "ran it")   # the replay's evidence comparison collapses
+        self.patch(plan_ledger, "bounded_text", lambda text, *a: "ran it")   # the replay's evidence comparison collapses
         self.caught("test_replay_with_different_args_after_the_index_is_gone_is_409")
 
     def test_mutant_in_build_verdict_recheck_removed(self):
