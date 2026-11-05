@@ -282,7 +282,7 @@ Kinds (the number is exact, except `size`, a ceiling with headroom: see rule 7):
 | `switchboard/claims_note.py` | `fleet-switchboard` | namespace | 13 | one namespace: the part reads the entry's names (the pull request records, the plan link and the plan facts) |
 | `switchboard/claims_note.py` | `plan_check.py` | import | 1 | a name the part reads from another unit without a declared edge |
 | `switchboard/claims_note.py` | `switchboard/plan_notice.py` | namespace | 1 | one namespace: the part reads a name another part defines (`plan_wake_state`); its rewiring gives it an import |
-| `switchboard/claims_note.py` | `switchboard/plan_input.py` | namespace | 1 | one namespace: the part reads `parse_plan_source` |
+| `switchboard/claims_note.py` | `switchboard/plan_input.py` | namespace | 2 | one namespace: the part reads `parse_plan_source` and `governing_done_when` |
 | `switchboard/v2_transport.py` | `fleet-switchboard` | entry-import | 15 | the part relies on a standard-library module the entry imported; it gets its own import line |
 | `switchboard/v2_transport.py` | `fleet-switchboard` | namespace | 2 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 | `fleet-switchboard` | `-` | size | 24,500 | the entry still holds every section not yet moved to a part; each move slice lowers the ceiling |

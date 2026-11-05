@@ -343,6 +343,15 @@ def build():
             self.assertEqual(len(self.audit("plan_wake.announced")), 0)
             self.assertIn("acme/api#3:%s" % hashes[0], self.engine.plan_wake.announced)
 
+        def test_s2_a_plan_approved_under_its_legacy_hash_records_the_new_key_and_is_not_unapproved(self):
+            record, hashes = self.legacy_world(False)
+            self.engine.plan_wake = sb.PlanWakeState(self.engine.state_dir)
+            self.engine.plan_wake.approved["acme/api#3:%s" % hashes[1]] = self.world.clock.now()
+            with mock.patch.object(sb, "_audit_tail", lambda state_dir: []):
+                self.go(2)
+            self.assertEqual(self.lines(), [])
+            self.assertIn("acme/api#3:%s" % hashes[0], self.engine.plan_wake.approved)
+
         def test_s3_an_edited_plan_with_a_legacy_key_held_is_announced_exactly_once(self):
             record, hashes = self.legacy_world(True)
             record["body"] += "\nan edit\n" + self.MARK % "platform"
