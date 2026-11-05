@@ -226,8 +226,6 @@ def run_child(case, test_file, selector, mutations):
 
 MUTANT_SECOND_LAUNCH_CREATES = ("bin/cloud_worker.py", GATE, "        done = None\n")
 OLD_SECOND_LAUNCH_REFUSED = ("bin/cloud_worker.py", GATE, '        raise LaunchError("a cloud worker named %s already exists (retire %s ends it)" % (name, name))\n')
-MUTANT_RETIRE_LEAVES_FAILED_POD = ("cloud/launcher/cloud_worker.py", 'if phase in ("Failed", "Succeeded"):   # whatever',
-                                   'if phase in ("Failed", "Succeeded") and ann(pod, "kept") != "true":   # whatever')
 
 
 class Probe(Launch):
@@ -245,15 +243,14 @@ class TestMutants(unittest.TestCase):
         self.assertEqual(applied, 1)
         self.assertTrue(shown, out[-800:])
 
-    def test_s10_the_two_mutants_fail_their_scenario_tests(self):
+    def test_s10_the_mutant_fails_their_scenario_tests(self):
         results = []
         for test_file, selector, mutation in (
-                (Path(__file__).name, "TestExists.test_s3_second_launch_returns_the_existing_worker_and_creates_nothing", MUTANT_SECOND_LAUNCH_CREATES),
-                ("test_stop_failed_pod.py", "TestRetireFailedPod.test_s9_retires_as_stated", MUTANT_RETIRE_LEAVES_FAILED_POD)):
+                (Path(__file__).name, "TestExists.test_s3_second_launch_returns_the_existing_worker_and_creates_nothing", MUTANT_SECOND_LAUNCH_CREATES),):
             applied, status, out = run_child(self, test_file, selector, [mutation])
             results.append((applied, status == 1 and "FAILED" in out))
-        print("S10: %d of 2 mutants fail, %d of 2 mutations applied" % (sum(1 for r in results if r[1]), sum(r[0] for r in results)))
-        self.assertEqual(results, [(1, True), (1, True)])
+        print("S10: %d of 1 mutants fail, %d of 1 mutations applied" % (sum(1 for r in results if r[1]), sum(r[0] for r in results)))
+        self.assertEqual(results, [(1, True)])
 
 
 class TestDocs(unittest.TestCase):

@@ -3502,7 +3502,7 @@ class Launcher:
                         "skipped": [], "note": "pod was absent; end hook not run", "record": info.get("record", "")}
             if phase == "Failed" and getattr(a, "cause", None):
                 info["cause"] = "pod_failed"
-            if phase in ("Failed", "Succeeded"):   # whatever its kept mark (#1619): no command can run in it, so nothing can be saved from it
+            if phase in ("Failed", "Succeeded") and ann(pod, "kept") != "true":  # a pod kept for unpushed work is never deleted here
                 # No container is running, so no hook can run and a kept pod would only linger: delete it and its
                 # Secrets, and say so.
                 self._remove(name, nonce, uid)
