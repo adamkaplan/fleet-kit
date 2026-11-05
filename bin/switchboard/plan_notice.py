@@ -9,6 +9,8 @@ class PlanWakeState:
 
     def __init__(self, state_dir):
         self.announced, self.facts, self.unapproved, self.problem = {}, {}, [], None
+        self.current, self.delivered, self.dropped, self.repeats = {}, {}, 0, 0   # #1784: the current hash of each issue seen, the keys delivered (key: time), the two counts
+        self.newest = {}   # #1542: (repo, number) -> the hash of the newest plan the pass saw, for the delivery re-check
         try:
             raw = json.loads((Path(state_dir) / PLAN_WAKE_FILE).read_text())
             if isinstance(raw, dict) and isinstance(raw.get("announced"), dict):
@@ -78,6 +80,9 @@ def plan_wake_pass(engine, state, repos, now, budget=None):
             if n is not None:
                 by_issue.setdefault(n, []).append(comment)
         pulls = [r for r in issues_unit["data"] if _is_pr(r)] + list((state.units.get((repo, "merged")) or {}).get("data") or [])
+        gone = module.latest_plans(comments_unit["data"], check_module.HEADING_RE, _url_number)
+        for key in [k for k in wake.newest if k[0] == repo and k[1] not in gone]:
+            del wake.newest[key]   # #1542: a plan comment that is gone or unparsable is no present hash
         for number, plan in sorted(module.latest_plans(comments_unit["data"], check_module.HEADING_RE, _url_number).items()):
             if number not in items:
                 continue
@@ -89,6 +94,8 @@ def plan_wake_pass(engine, state, repos, now, budget=None):
                 continue
             body = plan["body"]
             plan_hash = check_module.plan_hash(body)
+            wake.newest[(repo, number)] = plan_hash   # #1542: the present hash, for the delivery re-check
+            wake.current[(repo, number)] = plan_hash   # #1784: recorded before the approved and cited skips
             if consensus is None:
                 consensus = plan_wake_consensus(engine)
             if (plan_hash in consensus or module.approved_by_comment(plan, plan_hash, by_issue.get(number, []), signed_by_fleet)
@@ -149,6 +156,8 @@ def plan_wake_pass(engine, state, repos, now, budget=None):
         changed = True
     for old in [k for k, v in wake.facts.items() if now - v[1] > PLAN_WAKE_FACT_KEEP]:
         del wake.facts[old]
+    for old in [k for k, v in wake.delivered.items() if now - v > PLAN_WAKE_FACT_KEEP]:
+        del wake.delivered[old]
     if changed:
         try:
             state_write(Path(engine.state_dir) / PLAN_WAKE_FILE, json.dumps({"announced": wake.announced}, sort_keys=True) + "\n", fsync=True)
@@ -172,5 +181,39 @@ class PlanWakeFacts:
         wake = getattr(self.engine, "plan_wake", None) if self.engine else None
         if not wake or not wake.facts:
             return []
+        kept = {}
+        for key, held in sorted(wake.facts.items()):
+            text, created, name, repo, number = held
+            if key in wake.delivered:   # #1784: a key already delivered is not offered again
+                del wake.facts[key]
+                wake.repeats += 1
+                continue
+            own = key[len("plan:"):-len(":" + name)]
+            current = wake.current.get((repo, number))
+            now_key = "%s#%d:%s" % (repo, number, current)
+            if current is not None and now_key != own and own in wake.announced and now_key in wake.announced and wake.announced[now_key] > wake.announced[own]:
+                del wake.facts[key]
+                wake.dropped += 1
+                self.engine._note("plan_wake.dropped", "%s#%d" % (repo, number), {"dropped": own.split(":", 1)[1], "current": current})
+                continue
+            kept[key] = held
         return [Fact(key, name, "plan", text, created, issue=number, sender="switchboard", repo=repo)
-                for key, (text, created, name, repo, number) in sorted(wake.facts.items())]
+                for key, (text, created, name, repo, number) in sorted(kept.items())]
+
+    def acknowledge(self, keys):
+        wake = getattr(self.engine, "plan_wake", None) if self.engine else None
+        for key in keys if wake else ():
+            if key in wake.facts:
+                wake.delivered[key] = wake.facts.pop(key)[1]
+
+
+    def drop_stale(self, keys):   # #1542: a notice dropped at delivery does not come back
+        wake = getattr(self.engine, "plan_wake", None) if self.engine else None
+        for key in keys:
+            if wake is not None:
+                wake.facts.pop(key, None)
+
+    def present_record(self, subject):   # #1542: {"hash"} of the newest plan the plan pass saw on the issue; None when it has not seen one
+        wake = getattr(self.engine, "plan_wake", None) if self.engine else None
+        found = getattr(wake, "newest", {}).get((subject[1], subject[2]))
+        return None if found is None else {"hash": found}

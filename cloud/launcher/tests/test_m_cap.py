@@ -44,7 +44,7 @@ class Cap(tcw.Base):
         brief = self.home / "brief.txt"
         brief.write_text("Build the thing.\n")
         return self.main("launch", name, "--cloud", "--agent", "coder", "--repo", "acme-org/widget-service", "--branch", "main", "--role", "coder",
-                         "--reports-to", lane, "--shape", shape, "--brief-file", str(brief))
+                         "--reports-to", lane, "--boss-unregistered", "the cap test names lanes that no registry holds", "--shape", shape, "--brief-file", str(brief))
 
     def calls(self):
         return len(self.stub_calls()) + len(self.jsonl("kubectl.log")) + len(self.jsonl("login.log"))

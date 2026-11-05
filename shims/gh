@@ -1818,7 +1818,8 @@ REST_SIGNED_METHODS = {label: ("POST", "PATCH", "DELETE") for label, _p in SIGNE
 REST_WRITES = (   # (label, path after repos/OWNER/REPO/, methods): the unsigned REST write shapes lanes use (N, NAME: one path segment)
     ("issue-create", r"issues", ("POST",)), ("issue-update", r"issues/[^/]+", ("PATCH", "POST")), ("issue-labels", r"issues/[^/]+/labels", ("POST", "PUT", "DELETE")),
     ("issue-label", r"issues/[^/]+/labels/[^/]+", ("DELETE",)), ("sub-issues", r"issues/[^/]+/sub_issues", ("POST",)),
-    ("pull-update", r"pulls/[^/]+", ("PATCH", "POST")), ("pull-merge", r"pulls/[^/]+/merge", ("PUT",)), ("label-create", r"labels", ("POST",)), ("label-delete", r"labels/[^/]+", ("DELETE",)))
+    ("pull-update", r"pulls/[^/]+", ("PATCH", "POST")), ("pull-merge", r"pulls/[^/]+/merge", ("PUT",)), ("label-create", r"labels", ("POST",)), ("label-delete", r"labels/[^/]+", ("DELETE",)),
+    ("deployment-gate", r"actions/runs/[0-9]+/pending_deployments", ("POST",)))   # approving a deployment gate: its 'comment' field is not a comment body
 
 
 def api_scan(args, headers=None):
@@ -2940,6 +2941,17 @@ def hold_probe(args, lookup, gh, write):
         return (RETRY_HOLD if write else None), None, None
 
 
+def api_write_endpoint(module, args):
+    """The reduced endpoint of a `gh api` write for its audit line (allow-listed words only, numbers as '#'; no body, no query, no host), else None."""
+    try:
+        if command_words(args)[:1] != ["api"]:
+            return None
+        found = module.parse_api(args)[0]
+        return reduce_endpoint("api " + found[0]) if found else "api"
+    except Exception:
+        return None
+
+
 def audit_write(args, lookup, outcome, write, repo=None, number=None):
     """One audit line for a gh write (never a command line); best effort, never changes the command."""
     try:
@@ -2947,7 +2959,7 @@ def audit_write(args, lookup, outcome, write, repo=None, number=None):
             return
         module = load_hold()
         if module is not None:
-            module.write_audit(args, my_name(lookup), outcome, repo, number)
+            module.write_audit(args, my_name(lookup), outcome, repo, number, api_write_endpoint(module, args))
     except Exception:
         pass
 

@@ -5368,7 +5368,7 @@ class TestLaunch(StandInPids, Base):
         self.assertEqual(self.registered()[str(wt)]["agent"], "worker")
         self.assertFalse([e for e in self.world.audit() if e["event"] == "worktree.registered" and e["subject"] == "other2"])
         for n in range(sb.WORKTREE_RECLAIM_MAX + 2):    # the cap is said, not silent
-            sb.register_worktree(self.world.state, "/nonexistent/w%02d" % n, "worker", None, "b", 1)
+            sb.register_worktree(self.world.state, str(self.add_worktree("w-cap%02d" % n)), "worker", None, "w-cap%02d" % n, 1)
         lines = sb.reclaim_for_agent(self.world.new_engine("cli"), subprocess.run, "worker", True)
         self.assertTrue(any("handled (cap %d)" % sb.WORKTREE_RECLAIM_MAX in l for l in lines), lines)
 
@@ -22780,6 +22780,8 @@ class TestSweep(Base):
         ("ci", "ci is None", {"ci": None}, {}, "not ready"),
         ("ci", "ci is absent", {"ci": KeyError}, {}, "not ready"),
         ("ci", "ci says none", {"ci": "none"}, {}, "not ready"),
+        ("ci_line", "the run is stale", {"ci_line": "stale: 3 commits behind", "ci": "stale: 3 behind"}, {}, "not ready"),
+        ("base_ref", "no base branch name: not a gate input", {"base_ref": None}, {}, "ready"),
         ("legs", "a macOS leg is not green (failed, absent, skipped, cancelled or in progress)", {"legs": sb.load_module("merge_gate").judge_legs({"test (ubuntu-latest)": "success", "test (macos-latest)": "failure"}, False)}, {}, "not ready"),
         ("legs", "a macOS leg is skipped", {"legs": sb.load_module("merge_gate").judge_legs({"test (ubuntu-latest)": "success", "test-cloud (ubuntu-latest)": "success", "test (macos-latest)": "success", "test-cloud (macos-latest)": "skipped"}, False)}, {}, "not ready"),
         ("legs", "the macOS legs are absent", {"legs": sb.load_module("merge_gate").judge_legs({"test (ubuntu-latest)": "success", "test-cloud (ubuntu-latest)": "success"}, False)}, {}, "not ready"),
@@ -23141,7 +23143,7 @@ class TestSweep(Base):
             checked = set(self.engine.sweep.checked)
         self.assertEqual(seen, set(repos))                       # every repo was reached across passes
         self.assertEqual(len(checked), 20)                       # and every decision's issue was checked
-        self.assertTrue(all(cap in (sb.SWEEP_LIST_PAGES, 1) for cap in self.hub.caps), "the lists are capped; the closed-PR list (S9) is one page")
+        self.assertTrue(all(cap in (sb.SWEEP_LIST_PAGES, sb.OPEN_LIST_PAGES, 1) for cap in self.hub.caps), "the lists are capped; the closed-PR list (S9) is one page")
         quiet = self.calls()
         self.sweep(decisions)                                    # nothing is stale yet: the cache answers
         self.assertEqual(self.calls(), quiet)
@@ -23211,7 +23213,7 @@ class TestSweep(Base):
         self.assertEqual(len(self.engine.sweep.repos), 1)
 
     def test_the_sweep_budget_is_a_config_value_with_a_cap(self):
-        self.assertEqual(sb.SWEEP_CALLS_PER_PASS, 12)
+        self.assertEqual(sb.SWEEP_CALLS_PER_PASS, 16)
         base = {"opencode": FAKE_OPENCODE}
         self.assertEqual(sb.validate_config(dict(base, sweep={"calls_per_pass": 20}))["sweep"]["calls_per_pass"], 20)
         for bad in (3, 101, "6", True):
@@ -27856,6 +27858,58 @@ class TestPlanWake(Base):
         sb.plan_wake_pass(self.engine, self.engine.triage, ["acme/api"], self.world.clock.now())
         self.assertEqual(self.hub.calls, before)
 
+    def test_the_plan_pass_records_the_present_hash_so_a_replaced_plan_notice_is_dropped_and_the_new_one_kept(self):
+        """#1542 Seventh (3). REAL: triage_pass and plan_wake_pass (the notices and `newest` come from them), the real hash `sha256:<hex>` of the plan check, the real
+        `plan`, `deliver` and `judge_delivery`. FAKE: only the GitHub hub (FakeTriageHub) and the clock."""
+        self.hub.present_record = lambda *args: {}   # FAKE: the delivery reader needs a hub with the present-state read; the plan facts never use it
+        record = self.post(3, self.plan())
+        self.go()
+        a = sb.plan_check.plan_hash(record["body"])
+        record["body"] += "\nan edit"
+        record["updated_at"] = sb.iso(self.world.clock.now())
+        self.go()
+        b = sb.plan_check.plan_hash(record["body"])
+        self.assertTrue(a.startswith("sha256:") and b.startswith("sha256:") and a != b)
+        self.assertEqual(len(self.engine.plan_wake.facts), 2, msg="the real pass did not announce both hashes")
+        self.world.tick(int(self.engine.batch_seconds) + 1)
+        engine, now = self.engine, self.world.clock.now()
+        facts = [f for f in engine.collect_facts()[0] if f.kind == "plan"]
+        plan = engine.plan("orch", facts, engine.discover(now), now)
+        engine.deliver(plan)
+        texts = [x["text"] for x in self.world.admissions("orch")]
+        self.assertEqual(len(texts), 1, msg=texts)
+        self.assertIn(b, texts[0])
+        self.assertNotIn(a, texts[0])
+        dropped = [e for e in self.world.audit() if e["event"] == "stale.dropped"]
+        self.assertEqual([e["detail"]["kind"] for e in dropped], ["plan"])
+
+    def delivered_to_orch(self):
+        self.hub.present_record = lambda *args: {}   # FAKE: the delivery reader needs a hub with the present-state read; the plan facts never use it
+        engine, now = self.engine, self.world.clock.now()
+        facts = [f for f in engine.collect_facts()[0] if f.kind == "plan"]
+        engine.deliver(engine.plan("orch", facts, engine.discover(now), now))
+        return [x["text"] for x in self.world.admissions("orch")]
+
+    def test_a_real_plan_notice_delivered_ninety_minutes_late_carries_the_age_mark(self):
+        """#1542 Seventh (5). REAL: triage_pass, plan_wake_pass, deliver. FAKE: the hub and the clock."""
+        self.post(3, self.plan())
+        self.go()
+        self.world.tick(90 * 60)
+        texts = self.delivered_to_orch()
+        self.assertEqual(len(texts), 1)
+        self.assertIn("delayed: sent", texts[0])
+
+    def test_a_real_plan_notice_with_no_present_hash_known_is_kept_marked_unverified(self):
+        """#1542 Seventh (5). REAL: triage_pass, plan_wake_pass, deliver. The present hash is forgotten as after a restart (the memory of the pass is empty)."""
+        self.post(3, self.plan())
+        self.go()
+        self.engine.plan_wake.newest.clear()
+        self.world.tick(int(self.engine.batch_seconds) + 1)
+        texts = self.delivered_to_orch()
+        self.assertEqual(len(texts), 1)
+        self.assertIn("[unverified", texts[0])
+        self.assertEqual([e for e in self.world.audit() if e["event"] == "stale.dropped"], [])
+
     def test_the_fact_source_makes_one_plan_fact_per_recipient_by_key(self):
         self.post(3, self.plan())
         self.go()
@@ -28954,6 +29008,7 @@ class LedgerBase(Base):
         self.comments = []
         self.pr = {"title": "Add it", "state": "OPEN", "headRefOid": LEDGER_HEAD, "reviewDecision": "", "author": {"login": "shared"},
                    "body": "PLAN: acme/app#7\ncanon: updated the docs", "labels": [], "reviews": [], "comments": [],
+                   "baseRefName": "main",
                    "statusCheckRollup": [{"conclusion": "SUCCESS", "status": "COMPLETED"}]}
         self.gh_down = False
         self.configure()
@@ -28966,6 +29021,8 @@ class LedgerBase(Base):
         raw["plan_evaluators"] = evaluators if evaluators is not None else {
             "reviewer": ["rev"], "tester": ["tst"], "owner": ["own"], "ci": ["cibot"]}
         self.write_config(raw)
+
+    run_base = "t" * 40   # #1755: the base the fake's run list records; a test sets another to make the run stale
 
     def route(self, argv, **kwargs):
         if argv[0] != FAKE_GH:
@@ -28981,6 +29038,14 @@ class LedgerBase(Base):
             return subprocess.CompletedProcess(argv, 0, json.dumps(self.comments if "&page=1" in path else []), "")
         if re.search(r"/issues/7$", path):
             return subprocess.CompletedProcess(argv, 0, json.dumps(self.plan_issue), "")
+        if "/actions/runs" in path:
+            run = {"id": 1, "head_sha": self.pr["headRefOid"], "status": "completed", "conclusion": "success",
+                   "pull_requests": [{"number": n, "base": {"sha": self.run_base}} for n in (9, 11, 12)]}
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"workflow_runs": [run]}), "")
+        if "/git/ref/heads/" in path:
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"object": {"sha": "t" * 40}}), "")
+        if "/compare/" in path and path.endswith("..." + "t" * 40):
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"ahead_by": 3}), "")
         if path.endswith("/merge") and "/commits/refs/pull/" in path:   # a fresh merge ref: its first parent is the base's head (#2091)
             return subprocess.CompletedProcess(argv, 0, json.dumps([{"sha": "b" * 40}, {"sha": self.pr["headRefOid"]}]), "")
         if re.search(r"/pulls/\d+$", path):
@@ -31335,6 +31400,13 @@ class TestPlanGatesCheck(LedgerBase):
         (event,) = self.events("gate.would_refuse")
         self.assertIn("G1", event["detail"]["failed"])
         self.assertEqual(self.events("gate.refused"), [])
+
+    def test_a_stale_run_makes_g4_missing_with_the_stale_line(self):   # #1755; the control is the test below (the default run_base is the tip: it allows)
+        self.all_proven()
+        self.run_base = "s" * 40
+        row = next(r for r in json.loads(self.run_as("coder", "gates", self.PR, "--json")[1])["gates"] if r["gate"] == "G4")
+        self.assertEqual(row["status"], "missing", "the G4 row is missing for a stale run")
+        self.assertEqual(row["missing"], ["stale: 3 commits behind (CI ran on ssssssss, the tip is tttttttt): close and reopen the pull request for a fresh run"], "the G4 row says the stale line")
 
     def test_enforce_refuses_with_exit_10_and_names_the_gates(self):
         self.set_gates({"acme/app": {"mode": "enforce"}})
@@ -38983,6 +39055,14 @@ class TestCiRecordPass(LedgerBase):
         (event,) = self.events("gate.ci_record")
         self.assertEqual((event["detail"]["ok"], event["detail"]["recorded"]), (True, ["S1", "U1"]))
 
+    def test_a_stale_run_records_no_verdict_and_says_the_stale_line(self):   # #1755; the control is the test above (the default run_base is the tip: it records)
+        self.run_base = "s" * 40
+        self.go()
+        self.assertEqual(self.verdicts(), [], "ci-record records no verdict for a stale run")
+        code, out, err = self.run_as("coder", "gates", "ci-record", self.PR)
+        self.assertIn("stale: 3 commits behind (CI ran on ssssssss, the tip is tttttttt): close and reopen the pull request for a fresh run", out + err, "ci-record says the stale line")
+        self.assertEqual(self.verdicts(), [], "ci-record records no verdict for a stale run")
+
     def test_a_pr_whose_checks_are_running_is_recorded_within_five_minutes_of_going_green(self):
         self.pr["statusCheckRollup"] = [{"status": "IN_PROGRESS", "conclusion": ""}]
         self.go()
@@ -42254,6 +42334,7 @@ class TestLaunchRefusedMessage(TestLaunchMemoryGate):
         '--issue %r is not a whole numb': 'refused before any pod exists: it says nothing was created',
         'the cloud worker was not creat': 'the pod creation failed: no worker exists, so refused is right',
         'the brief line %r needs docker': 'refused before any pod exists: it says nothing was created',
+        '--boss-unregistered needs a re': 'refused before any pod exists: it says nothing was created',
     }
 
     def other_created_words(self, source):
@@ -44937,7 +45018,7 @@ class TestASlowCatchUpDoesNotFreezeThePass(Base):
         rig.hub.catch_up(rig.watch(), rig.world.clock.now())
         self.assertLessEqual(len(rig.hub.queue), sb.GITHUB_PAGE_CAP * sb.GITHUB_PAGE_SIZE)
         took = self.pass_seconds(rig)
-        self.assertLessEqual(took, sb.GITHUB_ROUTE_SECONDS + sb.GITHUB_ROUTE_READ_TIMEOUT, took)
+        self.assertLessEqual(took, sb.GITHUB_ROUTE_SECONDS + sb.GITHUB_ROUTE_READ_TIMEOUT + (sb.OPEN_LIST_PAGES - sb.SWEEP_LIST_PAGES), took)   # #1886: the extra pages of one open-item read over the old cap, 1 s each in this rig
         self.assertGreater(len(rig.hub.queue), 0, "what did not fit waits for the next pass")
 
     def test_the_decisions_file_is_never_stale_because_of_it(self):
@@ -50279,6 +50360,10 @@ class TestHeldRowsFromLabels(DecisionsBase):
 
     def lists(self, *records, repo=None, cut=False):
         self.engine.ci_record_state.lists[(repo or self.REPO).lower()] = (self.world.clock.now(), list(records))
+        if cut:
+            self.engine.ci_record_state.was_cut[(repo or self.REPO).lower()] = True
+        else:   # a list read that was not cut: the recorder's flag is clear (the plan gave no else; the test s4 needs it)
+            self.engine.ci_record_state.was_cut.pop((repo or self.REPO).lower(), None)
 
     def rows(self):
         return [d for d in self.listed() if d.get("number") in range(7, 400) and d.get("kind") in ("captain", "notice")]
@@ -50306,7 +50391,7 @@ class TestHeldRowsFromLabels(DecisionsBase):
         self.lists(self.pr(20, "merge-captain"), self.pr(21, "hold-contract"))
         self.assertEqual(sorted(d["number"] for d in self.rows() if d["number"] in (20, 21)), [20, 21])
         # the list is read again and is CUT (200 records, the held ones beyond it): the rows stay
-        self.lists(*[self.pr(100 + n) for n in range(sb.LABEL_HOLD_LIST_CUT)])
+        self.lists(*[self.pr(100 + n) for n in range(5)], cut=True)
         self.assertEqual(sorted(d["number"] for d in self.rows() if d["number"] in (20, 21)), [20, 21])
         # a complete list without them (they were merged or unlabelled) drops them
         self.lists(self.pr(100))
@@ -50388,10 +50473,10 @@ class TestHeldRowsFromLabels(DecisionsBase):
     def test_a_row_kept_because_its_list_is_cut_expires_after_a_day(self):
         self.lists(self.pr(95, "merge-captain"))
         self.assertEqual([d["number"] for d in self.rows() if d["number"] == 95], [95])
-        self.lists(*[self.pr(100 + n) for n in range(sb.LABEL_HOLD_LIST_CUT)])
+        self.lists(*[self.pr(100 + n) for n in range(5)], cut=True)
         self.assertEqual([d["number"] for d in self.rows() if d["number"] == 95], [95], "kept while the list is cut")
         self.world.tick(sb.LABEL_HOLD_KEEP_SECONDS + 60)
-        self.lists(*[self.pr(100 + n) for n in range(sb.LABEL_HOLD_LIST_CUT)])
+        self.lists(*[self.pr(100 + n) for n in range(5)], cut=True)
         self.assertEqual([d for d in self.rows() if d["number"] == 95], [], "a pull request that merged meanwhile does not stay for ever")
 
     def test_a_pr_with_only_a_merge_automatic_label_is_not_held(self):
@@ -50849,6 +50934,12 @@ class TestPrNotices(DecisionsBase):
         self.assertTrue(entry["stale"])
         self.assertEqual((entry["headline"], entry["ci"], entry["additions"]), ("api#7 Add the parser", "green", 120))
         self.assertIn("(stale)", " ".join(sb.facts_text(entry).split()) + " (stale)")
+
+    def test_a_stale_run_reads_stale_in_the_pull_request_notice(self):   # #1755; the control is test_a_failed_read_keeps_the_last_facts_marked_stale_and_never_drops_the_notice above (the default run_base is the tip: ci is green)
+        self.gh.run_base = "s" * 40
+        self.notify()
+        (entry,) = self.notices()
+        self.assertEqual(entry["ci"], "stale: 3 behind", "the pull request notice reads stale: 3 behind")
 
     def test_a_failure_before_any_read_still_lists_the_notice_without_facts(self):
         self.gh.answers[7] = (1, "", "HTTP 404")
@@ -51378,6 +51469,8 @@ class BaselineWorld(WriteWorld):
     """The Chief of Staff, two orchestrators and their coders (TierWorld), a fake gh with labels, comments and PRs,
     and the fake v2. Every observation goes through the CLI or a file."""
 
+    run_base = "t" * 40   # #1755: the base the fake's run list records; a test sets another to make the run stale
+
     def setUp(self):
         super().setUp()
         self.prs = {}
@@ -51391,6 +51484,13 @@ class BaselineWorld(WriteWorld):
             if self.prs[int(argv[3])] is None:
                 return subprocess.CompletedProcess(argv, 1, "", "HTTP 502 boom")
             return subprocess.CompletedProcess(argv, 0, self.prs[int(argv[3])], "")
+        if argv[0] == FAKE_GH and argv[1] == "api" and "/actions/runs" in argv[2]:
+            run = {"id": 1, "head_sha": re.search(r"head_sha=(\w+)", argv[2]).group(1), "status": "completed", "conclusion": "success", "pull_requests": [{"number": n, "base": {"sha": self.run_base}} for n in self.prs]}
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"workflow_runs": [run]}), "")
+        if argv[0] == FAKE_GH and argv[1] == "api" and "/git/ref/heads/" in argv[2]:
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"object": {"sha": "t" * 40}}), "")
+        if argv[0] == FAKE_GH and argv[1] == "api" and argv[2].endswith("..." + "t" * 40):
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"ahead_by": 3}), "")
         return super().route(argv, **kwargs)
 
     def who(self, name):
@@ -52519,6 +52619,15 @@ class TestDecisionBaselineNotices(BaselineWorld):
         steps["merged: its record is forgotten"] = json.loads((self.world.state / "pr-notices.json").read_text())
         steps["status line"] = [self.scrub(l) for l in self.cmd("you", "status")["out"].splitlines() if l.startswith("      decisions")]
         baseline_golden(self, "notices", steps)
+
+    def test_a_stale_run_reads_stale_in_the_notice_facts(self):   # #1755; the control is test_a_notice_its_facts_and_its_life above (the default run_base is the tip: its golden reads "green")
+        self.run_base = "s" * 40
+        self.prs[7] = pr_view_json()
+        self.step("api-coder", "notice", "pr", "acme/api#7", "ready", "for", "review")
+        self.daemon_pass()
+        (notice,) = [d for d in self.file_body()["decisions"] if d["kind"] == "notice"]
+        self.assertEqual(json.dumps(notice).count("stale: 3 behind"), 1, "the panel notice facts read stale: 3 behind")
+        self.assertNotIn('"ci": "green"', json.dumps(notice), "the panel notice facts do not read green")
 
     def test_a_malformed_notices_file_is_an_error_entry_and_the_rest_still_lists(self):
         self.say("api-orch", "question", "Which database?")
@@ -62462,6 +62571,36 @@ class TestReviewRefusalNamesRule(TestReviewPostAndDismiss):
                         failed += 1
                 self.assertEqual(failed, 1, name)
 
+    def test_every_redaction_pattern_has_its_own_rule_name(self):   # U9
+        dash = "-" * 5
+        whole = "x\n" + dash + "BEGIN " + "PRIVATE" + " KEY" + dash + "\n" + "Q" * 12 + "\n" + dash + "END " + "PRIVATE" + " KEY" + dash + "\n"
+        marker = "x\n" + dash + "END " + "PRIVATE" + " KEY" + dash + "\n"
+
+        def check(ns):
+            names, table = ns["SECRET_RULE_NAMES"], ns["_SECRET_PATTERNS"]
+            self.assertEqual(len(names), len(table), "a redaction pattern has no rule name")
+            self.assertEqual(len(set(names)), len(names))
+            self.assertEqual(ns["find_secret_span"](whole)[0], "private-key-block")
+            self.assertEqual(ns["find_secret_span"](marker)[0], "private-key-marker")
+            return list(names), list(table)
+
+        names, table = check(vars(sb))
+        print("S9 control: every pattern has one unique rule name, and both key texts are named")
+        for added in ("private-key-block", "private-key-marker"):
+            self.assertIn(added, names)
+        self.assertEqual(len(names), len(table))
+        source = (Path(__file__).resolve().parent / "switchboard" / "secret_spans.py").read_text()
+        line = '"private-key-block", "private-key-marker", '
+        self.assertEqual(source.count(line), 1)
+        mutated = source.replace('"private-key-marker", ', "")
+        self.assertNotEqual(mutated, source)
+        ns = dict(vars(sb))
+        exec(compile(mutated, "scratch_secret_spans.py", "exec"), ns)
+        with self.assertRaises(AssertionError) as caught:
+            check(ns)
+        print("S9 mutant: applied, failed with: %s" % caught.exception)
+        self.assertIn("a redaction pattern has no rule name", str(caught.exception))
+
 
 for _name in dir(TestReviewPostAndDismiss):   # the parent's tests run in their own class
     if _name.startswith("test_") and _name not in TestReviewRefusalNamesRule.__dict__:
@@ -66732,13 +66871,17 @@ TestSharesDeadVerdict = importlib.import_module("test_dead_verdict").TestSharesD
 # The closure test (ask #1092, slice S13) is run the same way: the clear's closure follows the parts (tools/derive-closure).
 _closure = importlib.import_module("test_closure")
 TestDerivedClosure, TestRefusalInAPart, TestMovingADefinition, TestTheDerivationIsHeld = _closure.TestDerivedClosure, _closure.TestRefusalInAPart, _closure.TestMovingADefinition, _closure.TestTheDerivationIsHeld
+_support_test_pins = importlib.import_module("test_pins")   # support import
+TestPins, TestPinsMutants, TestPinsReview, TestPinsStrictRead = (_support_test_pins.TestPins, _support_test_pins.TestPinsMutants, _support_test_pins.TestPinsReview, _support_test_pins.TestPinsStrictRead)   # support import
 # The shadow test (#1339): an added definition under a closure name in another file is refused by the clear.
 _shadow = importlib.import_module("test_shadow")
 TestShadowRule, TestShadowGlue, TestShadowStatuses, TestReasonsAreOneCleanLine = _shadow.TestShadowRule, _shadow.TestShadowGlue, _shadow.TestShadowStatuses, _shadow.TestReasonsAreOneCleanLine
+_pwd = importlib.import_module("test_plan_wake_drops"); _pwd.HOST = sys.modules[__name__]; TestPlanWakeDrops = _pwd.build()   # #1784
 # The Cockpit feed test (#1423): the read-only feed of what the fleet needs from a person.
 _cockpit = importlib.import_module("test_cockpit")
 TestFeedShape, TestIdsAndEtags, TestCapsAndScrub, TestDocument, TestWriting, TestReadOnly, TestBranches, TestSources, TestScrubFailsClosed, TestScrubPatterns, TestHardening, TestFileRead, TestDocumentTable = _cockpit.TestFeedShape, _cockpit.TestIdsAndEtags, _cockpit.TestCapsAndScrub, _cockpit.TestDocument, _cockpit.TestWriting, _cockpit.TestReadOnly, _cockpit.TestBranches, _cockpit.TestSources, _cockpit.TestScrubFailsClosed, _cockpit.TestScrubPatterns, _cockpit.TestHardening, _cockpit.TestFileRead, _cockpit.TestDocumentTable
 _claims_note = importlib.import_module("test_claims_note"); _claims_note.HOST = sys.modules[__name__]; TestClaimsNotePass, TestClaimsNoteSkips, TestClaimsNoteText, TestClaimsNoteMutants, TestClaimsNoteDocumentation, TestClaimsNoteScan = _claims_note.TestClaimsNotePass, _claims_note.TestClaimsNoteSkips, _claims_note.TestClaimsNoteText, _claims_note.TestClaimsNoteMutants, _claims_note.TestClaimsNoteDocumentation, _claims_note.TestClaimsNoteScan   # #1716
+_merge_drops = importlib.import_module("test_merge_drops"); _merge_drops.HOST = sys.modules[__name__]; TestMergeDrops, TestMergeDropsStep = _merge_drops.TestMergeDrops, _merge_drops.TestMergeDropsStep   # #2159
 _bot_reviews = importlib.import_module("test_bot_reviews"); _bot_reviews.HOST = sys.modules[__name__]; BotLines, BotWake, PendingJobs, BotDocumentation, BotMutants, BotSize, BotVerdict = _bot_reviews.BotLines, _bot_reviews.BotWake, _bot_reviews.PendingJobs, _bot_reviews.BotDocumentation, _bot_reviews.BotMutants, _bot_reviews.BotSize, _bot_reviews.BotVerdict
 _epic_record = importlib.import_module("test_epic_record"); _epic_record.HOST = sys.modules[__name__]; TestEpicRecordPlacement, TestEpicRecordMove = _epic_record.TestEpicRecordPlacement, _epic_record.TestEpicRecordMove
 # The relay tree-guard test (#1380, #1429): the relay thread obeys the installed-tree guard.
@@ -66747,6 +66890,7 @@ RelayObeysTheTreeGuard = _relay_tree_guard.RelayObeysTheTreeGuard
 _sent_view = importlib.import_module("test_sent_view")
 _sent_view.World = World
 TestSentView = _sent_view.TestSentView
+_branch_ff = importlib.import_module("test_branch_ff"); TestBranchFf = _branch_ff.TestBranchFf
 TestScratchCommand = importlib.import_module("test_scratch_command").TestScratchCommand
 # The relay-loop tests of #1477, moved under the architecture cap.
 _relay_loop = importlib.import_module("test_relay_loop_cadence")
@@ -66809,6 +66953,7 @@ TestUnconsumedRecord = importlib.import_module("test_unconsumed_record").TestUnc
 _noparent = importlib.import_module("test_charter_noparent"); TestCharterNoParent, TestCharterNoParentSet = _noparent.TestCharterNoParent, _noparent.build(CharterRig, Base, TestCharterSetGuard)
 _hc = importlib.import_module("test_header_cache"); TestAges, TestSets, TestEvents, TestSafety, TestReplay, TestIsolation, TestDropNeverBlocksAWrite, TestApprovalReadsFresh, TestDocs = _hc.TestAges, _hc.TestSets, _hc.TestEvents, _hc.TestSafety, _hc.TestReplay, _hc.TestIsolation, _hc.TestDropNeverBlocksAWrite, _hc.TestApprovalReadsFresh, _hc.TestDocs
 TestReminderTtlMore = importlib.import_module("test_reminder_ttl").build(PR4Base)
+TestReminderWaiting = importlib.import_module("test_reminder_waiting").build(PR4Base)
 TestPlanRehearsal = importlib.import_module("test_plan_rehearsal").build(HandoffCase)   # #1785
 TestMergeRef = importlib.import_module("test_merge_ref").build(HandoffCase)   # #2053
 TestCiRecordProof = importlib.import_module("test_ci_record_proof").build(LedgerBase)   # #2091
@@ -66819,6 +66964,10 @@ TestLoadAlertCloudBusy = _load_cloud.TestLoadAlertCloudBusy
 # The CI test-file list tests of #1498.
 _ci_test_files = importlib.import_module("test_ci_test_files")
 TestCiTestFileList = _ci_test_files.TestCiTestFileList
+_olc = importlib.import_module("test_open_list_ceiling"); TestOpenListCeiling, TestOpenListAlert, TestOpenListCeilingMutant = _olc.TestOpenListCeiling, _olc.TestOpenListAlert, _olc.TestOpenListCeilingMutant
+TestOpenListPassCalls = importlib.import_module("test_open_list_pass_calls").build(TestASlowCatchUpDoesNotFreezeThePass)   # #1886 Eighth (3)
+_olcuts = importlib.import_module("test_open_list_cuts"); TestOpenListCuts, TestOpenListPagesRead, TestOpenListDerivedText, TestOpenListCutsMutants, TestOpenListWholeReads, TestOpenListCutsWired = _olcuts.TestOpenListCuts, _olcuts.TestOpenListPagesRead, _olcuts.TestOpenListDerivedText, _olcuts.TestOpenListCutsMutants, _olcuts.TestOpenListWholeReads, _olcuts.TestOpenListCutsWired
+_rpstrict = importlib.import_module("test_read_pages_strict"); TestReadPagesStrict, TestReadPagesStrictMutant = _rpstrict.TestReadPagesStrict, _rpstrict.TestReadPagesStrictMutant
 TestCiOutsideBin = importlib.import_module("test_ci_outside_bin").TestCiOutsideBin
 _psj = importlib.import_module("test_pr_state_jobs")
 _psj.HOST = sys.modules[__name__]
@@ -66849,6 +66998,7 @@ TestLaunchBriefCheck = importlib.import_module("test_launch_brief_check").build(
 TestIntentEditToldOnce = importlib.import_module("test_intent_told_once").build(TestIntentEditWiring, GithubRig)   # #1437
 TestRunLauncherShapes, TestStatusLines, TestTurnEnd, TestDictCallersUnchanged = (_ss := importlib.import_module("test_status_shape")).TestRunLauncherShapes, _ss.TestStatusLines, _ss.TestTurnEnd, _ss.TestDictCallersUnchanged
 TestEveryKindDelayedMark = importlib.import_module("test_every_kind_delayed_mark").TestEveryKindDelayedMark
+_pass_recheck = importlib.import_module("test_pass_recheck"); _pass_recheck.World = World; TestPassRecheck, TestPassRecheckMutants, TestDropStaleOnce, TestUnreadUnitKeepsTheItem, TestUnreadUnitKeepsTheDigest, TestHiddenFindings, TestMissingCases, TestTriageHiddenGuard, TestPlanNewestForgotten, TestTriageHiddenMutants, TestPlanKeyHash, TestPlanWakeMutants, TestSeenAllConditions, TestSeenAllMutants, TestSweepOnRealPass, TestTriageOnRealPass = _pass_recheck.TestPassRecheck, _pass_recheck.TestPassRecheckMutants, _pass_recheck.TestDropStaleOnce, _pass_recheck.TestUnreadUnitKeepsTheItem, _pass_recheck.TestUnreadUnitKeepsTheDigest, _pass_recheck.TestHiddenFindings, _pass_recheck.TestMissingCases, _pass_recheck.TestTriageHiddenGuard, _pass_recheck.TestPlanNewestForgotten, _pass_recheck.TestTriageHiddenMutants, _pass_recheck.TestPlanKeyHash, _pass_recheck.TestPlanWakeMutants, _pass_recheck.TestSeenAllConditions, _pass_recheck.TestSeenAllMutants, _pass_recheck.TestSweepOnRealPass, _pass_recheck.TestTriageOnRealPass; _pass_recheck.TestPlanWake = TestPlanWake   # #1542
 TestQueuedBehindTurn = importlib.import_module("test_queued_behind_turn").TestQueuedBehindTurn
 TestHeaderDate, TestHeaderDateCallSites, TestHeaderInfiniteTime = (_hd := importlib.import_module("test_header_date")).TestHeaderDate, _hd.TestHeaderDateCallSites, _hd.TestHeaderInfiniteTime
 TestSignedLinkScrub = importlib.import_module("test_signed_link_scrub").build(Base, GithubRig)
@@ -66864,12 +67014,14 @@ TestHeldSends = importlib.import_module("test_held_sends").TestHeldSends   # #20
 # The reminder-cancel tests of #1401.
 _reminder_cancel = importlib.import_module("test_reminder_cancel")
 TestCancelKeyRecheck = _reminder_cancel.build(PR4Base)
+TestKeyedReminderSupersede = importlib.import_module("test_keyed_reminder_supersede").build(PR4Base)
 # The lost-worker alert tests of #1481.
 _lost_worker = importlib.import_module("test_lost_worker")
 TestLostWorkerRemembers = importlib.import_module("test_lost_worker_remembers").TestLostWorkerRemembers
 TestLostWorker, TestLostWorkerReadRound, TestLostWorkerMemoryOnly, TestLostWorkerSlowPass = _lost_worker.TestLostWorker, _lost_worker.TestLostWorkerReadRound, _lost_worker.TestLostWorkerMemoryOnly, _lost_worker.TestLostWorkerSlowPass
 TestPushWatch = importlib.import_module("test_push_watch").TestPushWatch   # the push watch of #1740
 TestPodSilence = importlib.import_module("test_pod_silence").TestPodSilence   # the pod silence watch of #2115
+TestPodSilenceTick = importlib.import_module("test_pod_silence").TestPodSilenceTick   # the pod silence tick of #2135
 _stage_events = importlib.import_module("test_stage_events"); _stage_events.GithubRig, _stage_events.GH_REPO = GithubRig, GH_REPO; TestStageEvents = _stage_events.TestStageEvents; TestStageEvents.CONF = {"github_stage_repos": [GH_REPO], "github_stage_bots": ["github-actions[bot]"]}
 # A CLAIMS: line present but not read is refused (#1617); HOST gives the test the fixtures of this file.
 _claim_placement = importlib.import_module("test_claim_placement"); _claim_placement.HOST = sys.modules[__name__]
@@ -66880,7 +67032,12 @@ _changed_file_pages = importlib.import_module("test_changed_file_pages")
 _changed_file_pages.HOST = sys.modules[__name__]
 TestWholeReadOfALargePullRequest = _changed_file_pages.load()
 
+_rc = importlib.import_module("test_reclaim_cap"); _rc.HOST = sys.modules[__name__]; TestReclaimCap = _rc.build()   # #1737
 _lm = importlib.import_module("test_launch_model"); _lm.HOST = sys.modules[__name__]; TestLaunchModel = _lm.build(); TestLaunchModelCloud = _lm.build_cloud()   # #1642
+TestDaemonDeadVerdict, TestDaemonDeadVerdictMutants = (_dd := importlib.import_module("test_dead_verdict_daemon")).TestDaemonDeadVerdict, _dd.TestDaemonDeadVerdictMutants   # #1884
+TestPaneUndecidable = _dd.TestPaneUndecidable   # #1884 PC-6 / S11
+TestUndecidableRobustness = _dd.TestUndecidableRobustness   # #1884 PC-9 / S14
+TestBodyCheck = importlib.import_module("test_body_check").TestBodyCheck   # #1476
 TestLaunchCapacity = importlib.import_module("test_launch_capacity").build()   # #1793
 _ta = importlib.import_module("test_tester_agent"); _ta.HOST = sys.modules[__name__]; TestTesterAgentLaunch, TestTesterAgentMutants = _ta.build()   # #1963
 _lr = importlib.import_module("test_launched_reviewers"); _lr.HOST = sys.modules[__name__]; TestLaunchedReviewerRule, TestLaunchedReviewerGates, TestLaunchedReviewerItems, TestLaunchedReviewerRelay, TestLaunchedReviewerDocs, TestLaunchedReviewerGuards, TestLaunchedReviewerMutants = _lr.build()   # #1869
@@ -66889,6 +67046,7 @@ TestNewTestChecksRules, TestNewTestChecksFiles, TestNewTestChecksInPreflightPr, 
 
 TestShimGuardsTool, TestShimGuardRows, TestShimHygienePlanted, TestShimGuardMutants, TestShimGuardDocs = (_sg := importlib.import_module("test_shim_guards")).TestShimGuardsTool, _sg.TestShimGuardRows, _sg.TestShimHygienePlanted, _sg.TestShimGuardMutants, _sg.TestShimGuardDocs   # #1909
 TestPlanningDecision, TestConcurrencyGroup, TestGateLegs, TestGatePass, TestPlatformPaths, TestMacDocs = (_ml := importlib.import_module("test_mac_legs")).TestPlanningDecision, _ml.TestConcurrencyGroup, _ml.TestGateLegs, _ml.TestGatePass, _ml.TestPlatformPaths, _ml.TestDocs
+TestCiStateDecision, TestCiFreshReaders, TestCiFreshUnreadable, TestCiFreshOptOut, TestCiFreshReads, TestCiFreshRefusalAndEvidence, TestCiFreshDocs, TestCiFreshReadMutants, TestCiFreshSeamMutants = (_cf := importlib.import_module("test_ci_fresh")).TestCiStateDecision, _cf.TestCiFreshReaders, _cf.TestCiFreshUnreadable, _cf.TestCiFreshOptOut, _cf.TestCiFreshReads, _cf.TestCiFreshRefusalAndEvidence, _cf.TestCiFreshDocs, _cf.TestCiFreshReadMutants, _cf.TestCiFreshSeamMutants   # #1755
 _el = importlib.import_module("test_evidence_limit"); _el.HOST = sys.modules[__name__]; TestEvidenceLimitLocal, TestEvidenceLimitItems, TestEvidenceLimitCounting, TestEvidenceLimitRelay, TestEvidenceLimitMutants, TestEvidenceLimitUnchanged, TestEvidenceLimitItemCi, TestEvidenceLimitDocsAndCode = _el.build()   # #1901
 TestPlatformClassList = importlib.import_module("test_platform_classes").TestPlatformClassList
 
@@ -73497,6 +73655,18 @@ class TestGhShimMergeGate(Base):
         self.state = self.home / "state"
         self.state.mkdir()
 
+    def test_approving_a_deployment_gate_runs_the_real_gh_unchanged(self):
+        """#1706 regression: a POST to actions/runs/N/pending_deployments (its 'comment' field is no comment body; 'environment_ids[]' is a valid key) runs the real gh unchanged; a comment endpoint is still signed."""
+        ep = "repos/acme/app/actions/runs/123/pending_deployments"
+        argv = ["api", "-X", "POST", ep, "-F", "environment_ids[]=456", "-f", "state=approved", "-f", "comment=approve"]
+        done, log = self.run_shim(*argv)
+        self.assertEqual((done.returncode, log and log["argv"]), (0, argv), done.stderr)
+        done, log = self.run_shim("api", "-X", "POST", ep, "--input", "-")
+        self.assertEqual((done.returncode, log and log["argv"]), (0, ["api", "-X", "POST", ep, "--input", "-"]), done.stderr)
+        control = ["api", "-X", "POST", "repos/acme/app/issues/5/comments", "-f", "body=hello"]
+        done, log = self.run_shim(*control)
+        self.assertNotEqual(log and log["argv"], control)
+
     HEAD = "a" * 40
 
     shim_file = None   # where the shim claims to live (its sibling files are looked for there)
@@ -77815,6 +77985,13 @@ class TestCiRecordCarry(LedgerBase):
                 body = {"default_branch": "main"}
             elif "/compare/main..." in path:
                 body = {"status": "behind"}
+            elif "/actions/runs" in path:
+                body = {"workflow_runs": [{"id": 1, "head_sha": self.pr["headRefOid"], "status": "completed", "conclusion": "success",
+                                           "pull_requests": [{"number": n, "base": {"sha": self.run_base}} for n in (9, 11)]}]}
+            elif "/git/ref/heads/" in path:
+                body = {"object": {"sha": "t" * 40}}
+            elif path.endswith("..." + "t" * 40):
+                body = {"ahead_by": 3}
             else:
                 return subprocess.CompletedProcess(argv, 1, "", "gh: Not Found (HTTP 404)")
             return subprocess.CompletedProcess(argv, 0, json.dumps(body), "")
@@ -77846,6 +78023,17 @@ class TestCiRecordCarry(LedgerBase):
         self.assertEqual({(c["old_head"], c["new_head"]) for c in lines}, {(LEDGER_HEAD, self.NEW)})
         self.assertEqual(sorted(c["scenario"] for c in lines), ["S2", "S2", "S3"])
         self.assertEqual(out.count("carried proof #"), 3)
+
+    def test_a_stale_run_carries_nothing_and_prints_the_stale_line(self):   # #1755; the control is test_S1 above (the default run_base is the tip: one carried line per proof)
+        self.run_base = "s" * 40
+        self.proofs()
+        before = self.ledger_bytes()
+        code, out, err = self.step()
+        self.assertEqual(code, 2, "a stale run carries no proof: exit code: " + err)   # the step records nothing for a stale run and exits 2
+        self.assertEqual(self.carried(), [], "a stale run carries no proof: carried lines")
+        self.assertIn("commits behind", out + err, "the stale line is printed: the count")
+        self.assertIn("close and reopen the pull request for a fresh run", out + err, "the stale line is printed: the way to a fresh run")
+        self.assertEqual(self.ledger_bytes(), before, "the ledger bytes are unchanged")
 
     def test_S2_a_tests_and_documentation_only_head_carries(self):
         self.proofs(files=("src/widget.py",))
@@ -79489,6 +79677,7 @@ class TestNoPaneToJudge(StandInPids, Base):
         "pane_state": "judges the one pane it is handed (herdr's answer); the callers never hand it a no-pane row",
         "release_stale_binding": "acts on a pane herdr still lists under a name; a no-pane row has none",
         "write_pane_health": "keeps a dead row's time; judges nothing",
+        "collect_status": "reads the pane-undecidable record (a pane streak), not a dead verdict; judges nothing",
     }
 
     _PARSED = {}   # source text -> (tree, lines): each entry is parsed and split ONCE

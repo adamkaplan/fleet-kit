@@ -232,14 +232,14 @@ def load_tick(engine, discovery):
                  "parked_until": getattr(issue, "parked_until", None)} for issue in engine.intents.open_asks(charter, repo)]
 
     def read_charters(repo):
-        """The open issues of `repo` that carry the orchestrator label (whatever the owner's prefix) as [(number, body)]: two bounded reads."""
+        """The open issues of `repo` that carry the orchestrator label (whatever the owner's prefix) as [(number, body)]: each list read page by page up to OPEN_LIST_PAGES."""
         if engine.intents is None:
             raise RuntimeError("no ask repo is configured")
-        labels = engine.intents._api("repos/%s/labels?per_page=100" % repo, repo)
+        labels = open_pages(lambda page: engine.intents._api("repos/%s/labels?per_page=100%s" % (repo, open_page_suffix(page)), repo), repo)
         names = sorted({l["name"] for l in labels if isinstance(l, dict) and str(l.get("name")).endswith(":orchestrator")}) if isinstance(labels, list) else []
         out = []
         for name in names[:2]:   # every owner's prefix, at most two (each is one more read)
-            found = engine.intents._api("repos/%s/issues?state=open&per_page=100&labels=%s" % (repo, urllib.parse.quote(name)), repo)
+            found = open_pages(lambda page: engine.intents._api("repos/%s/issues?state=open&per_page=100&labels=%s%s" % (repo, urllib.parse.quote(name), open_page_suffix(page)), repo), repo)
             out.extend((i["number"], i.get("body") or "") for i in found   # the issues list also returns pull requests: a PR body never names a charter
                        if isinstance(i, dict) and isinstance(i.get("number"), int) and "pull_request" not in i) if isinstance(found, list) else None
         return out

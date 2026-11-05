@@ -214,6 +214,29 @@ class TestLostWorkerReadRound(unittest.TestCase):
     def alerts(self, r):
         return [m for m in r.engine.sent if m[0] == "lane-a"]
 
+    def run_full_tables(self):
+        mod = load()
+        mod.SEEN_MAX = 5
+        r = Rig(mod)
+        path = r.engine.audit.path
+        r.created("lost", deadline=NOW + 600)   # created with no stop, oldest creation, due only at the second pass
+        line(path, ts=stamp(NOW - 7000), actor="x", event="cloud.created", subject="old", detail={"hard_deadline": stamp(NOW - 60)})
+        line(r.launcher, ts=stamp(NOW - 5000), worker="old", runtime_id="pod/old", action="stop", ok=True, reason="finished")
+        for n in range(3):
+            r.created("f%d" % n)
+        first = r.passes()   # five creations: the cap is not passed yet
+        for n in range(3):
+            r.stopped("f%d" % n)
+        for n in range(3):   # later stops pass the cap
+            line(r.launcher, ts=stamp(NOW - 20), worker="x%d" % n, runtime_id="pod/x%d" % n, action="stop", ok=True, reason="finished")
+        return [x for x in first + r.passes(at=NOW + 1000) if x["kind"] == "pod_no_stop"]
+
+    def test_2164_s2_a_stopped_worker_is_never_alerted_after_the_trim(self):
+        self.assertEqual([x for x in self.run_full_tables() if x["name"] == "old"], [])
+
+    def test_2164_s3_a_worker_with_no_stop_is_still_alerted(self):
+        self.assertEqual(len([x for x in self.run_full_tables() if x["name"] == "lost"]), 1)
+
     def test_s9_cap_and_backlog(self):
         r = self.rig()
         for n in range(25):

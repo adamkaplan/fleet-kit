@@ -1,7 +1,7 @@
 """A running cloud pod that pushed nothing and reported nothing for 20 minutes tells its boss ONE short summary (ask #2115, slice 3).
 
 Pure of the daemon: the live workers, the clock, the state path, the send function and the summary function are handed in. The summary comes from
-`summary(worker)`, the one line of the switchboard's `inspect NAME --short` (a stub in tests); an empty or failing summary sends nothing this pass.
+`summary(worker)`, the one line of the switchboard's `inspect NAME --short` (a stub in tests); an empty or failing summary still sends the line 'state unreadable: <reason>' and writes ONE audit line (`audit(worker, detail)`), once per quiet period.
 A worker is silent when `now - max(first seen, last report, last push)` reaches QUIET seconds. One message per worker and quiet period: the worker is
 written to the state file BEFORE the message goes, and is told again only after a later report or push. A worker that reported `done`, or is no longer
 live (finished or retired), sends nothing and leaves the state. The state is one private file (0600): {"workers": {name: {"seen": epoch, "told": epoch|null}}}.
@@ -49,7 +49,7 @@ def message_text(worker, minutes, line):
     return "[cloud worker quiet] %s has pushed nothing and sent no report for %d minutes. Its state: %s" % (worker, minutes, one)
 
 
-def scan(workers, now, state_path, send, summary, parse, quiet=QUIET, prune=True):
+def scan(workers, now, state_path, send, summary, parse, quiet=QUIET, prune=True, audit=None):
     """`workers`: [{"worker", "boss", "last_report" epoch|None, "last_push" epoch|None, "done" bool}] of the LIVE pods. Returns [(boss, text)] handed to send.
     `prune` False (a capped read: the pass did not see every pod) keeps the state of the pods not handed in, so an unread pod keeps its told mark."""
     state = _load(state_path, parse)
@@ -68,12 +68,18 @@ def scan(workers, now, state_path, send, summary, parse, quiet=QUIET, prune=True
             mem["told"] = told = None   # a report or a push after the message: a new quiet period
         if told is not None or now - active < quiet:
             continue
+        reason = None
         try:
             line = summary(name)
-        except Exception:
-            line = None
-        if not line:
-            continue
+        except Exception as err:
+            line, reason = None, " ".join(str(err).split())[:120] or type(err).__name__
+        if not isinstance(line, str) or not line.strip():
+            line = "state unreadable: %s" % (reason or "no summary came back")   # never skip silently: the boss hears it, once, and one audit line says so
+            if audit is not None:
+                try:
+                    audit(name, {"reason": line[:200]})
+                except Exception:
+                    pass
         mem["told"] = now
         due.append((boss, message_text(name, int((now - active) // 60), line)))
     _save(state_path, state)   # saved BEFORE the messages go: a crash loses a message, it never sends one twice
