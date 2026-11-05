@@ -1852,7 +1852,7 @@ class TestKeptRetireNamesTheSave(Base):   # #1791
             except AssertionError as e:
                 failing += int(("the %s lacks the recover sentence" % name) in str(e))
                 print("mutant in %s fails with: %s" % (name, str(e).rsplit(" : ", 1)[-1]))
-        self.assertEqual(failing, 5, "each of the five mutants must fail naming its own place")
+        self.assertEqual(failing, len(places), "each mutant must fail naming its own place")
 
 
 if __name__ == "__main__":
