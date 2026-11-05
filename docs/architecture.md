@@ -221,10 +221,10 @@ A site is listed by the function it sits in and its kind, with a count: `import(
 | `cloud_cluster.py` | `unknown_report_to:load_module(string)` | 1 | names a loading builtin by a string (a name in a list counts: over-counting by design) |
 | `cloud_way_back_check.py` | `check:imp` | 3 | uses the module object (a call, an attribute, an argument) |
 | `cloud_way_back_check.py` | `check_fixture_shape:imp` | 4 | uses the module object (a call, an attribute, an argument) |
-| `cloud_worker.py` | `<module>:exec_module` | 1 | uses an identifier of the import machinery (exec_module) |
+| `cloud_worker.py` | `_load_launch_again:exec_module` | 1 | uses an identifier of the import machinery (exec_module) |
 | `cloud_worker.py` | `<module>:import(importlib)` | 1 | imports a module that can load code by name, or one of its identifiers |
-| `cloud_worker.py` | `<module>:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
-| `cloud_worker.py` | `<module>:sys.modules` | 1 | uses `sys` beyond its plain attributes |
+| `cloud_worker.py` | `_load_launch_again:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
+| `cloud_worker.py` | `_load_launch_again:sys.modules` | 1 | uses `sys` beyond its plain attributes |
 | `cloud_worker.py` | `_load_cluster:exec_module` | 1 | uses an identifier of the import machinery (exec_module) |
 | `cloud_worker.py` | `_load_cluster:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
 | `cloud_worker.py` | `_load_cluster:sys.modules` | 1 | uses `sys` beyond its plain attributes |
