@@ -29183,7 +29183,7 @@ class TestPlanLedger(LedgerBase):
 
     def test_evidence_is_redacted_and_clipped(self):
         secret = "ghp_" + "0123456789abcdefABCDEF0123"
-        code, out, err = self.run_as("coder", "prove", "S1", "--pr", self.PR, "--evidence", "token %s and %s" % (secret, "x" * 900))
+        code, out, err = self.run_as("coder", "prove", "S1", "--pr", self.PR, "--evidence", "token %s and %s" % (secret, "x" * 400))
         self.assertEqual(code, 0, err)
         evidence = self.ledger()[0]["evidence"]
         self.assertNotIn(secret, evidence)
@@ -66269,6 +66269,7 @@ TestNewTestChecksRules, TestNewTestChecksFiles, TestNewTestChecksInPreflightPr, 
 
 TestShimGuardsTool, TestShimGuardRows, TestShimHygienePlanted, TestShimGuardMutants, TestShimGuardDocs = (_sg := importlib.import_module("test_shim_guards")).TestShimGuardsTool, _sg.TestShimGuardRows, _sg.TestShimHygienePlanted, _sg.TestShimGuardMutants, _sg.TestShimGuardDocs   # #1909
 TestPlanningDecision, TestConcurrencyGroup, TestGateLegs, TestGatePass, TestPlatformPaths, TestMacDocs = (_ml := importlib.import_module("test_mac_legs")).TestPlanningDecision, _ml.TestConcurrencyGroup, _ml.TestGateLegs, _ml.TestGatePass, _ml.TestPlatformPaths, _ml.TestDocs
+_el = importlib.import_module("test_evidence_limit"); _el.HOST = sys.modules[__name__]; TestEvidenceLimitLocal, TestEvidenceLimitItems, TestEvidenceLimitCounting, TestEvidenceLimitRelay, TestEvidenceLimitMutants, TestEvidenceLimitUnchanged, TestEvidenceLimitItemCi, TestEvidenceLimitDocsAndCode = _el.build()   # #1901
 TestPlatformClassList = importlib.import_module("test_platform_classes").TestPlatformClassList
 
 class TestTheArchitectureTestIsRun(unittest.TestCase):
