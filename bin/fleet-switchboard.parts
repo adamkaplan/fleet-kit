@@ -13,6 +13,7 @@ switchboard/decisions_b.py
 switchboard/reminders.py
 switchboard/plan_review.py
 switchboard/pr_explain.py
+switchboard/body_check.py
 switchboard/triage.py
 switchboard/claims_note.py
 switchboard/alert_labels.py
@@ -24,6 +25,7 @@ switchboard/audit.py
 switchboard/decision.py
 switchboard/engine.py
 switchboard/jev.py
+switchboard/pins.py
 switchboard/faults.py
 switchboard/shadow_classifier.py
 switchboard/worktree_lifecycle.py
@@ -42,6 +44,7 @@ switchboard/profile_pieces.py
 switchboard/installer.py
 switchboard/sent_view.py
 switchboard/bot_reviews.py
+switchboard/branch_ff.py
 switchboard/stage_event.py
 switchboard/scratch_dir.py
 switchboard/docker_reaper.py

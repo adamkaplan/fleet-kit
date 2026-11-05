@@ -53,6 +53,7 @@ The mistakes that cost the most review rounds and the most lost work. Meet them 
 - (d) The body of a held pull request is in the owner format from the first push.
 - (e) A cloud builder opens its pull request as a draft at its first push, then updates it: the pod's git token expires after about an hour and a late open fails.
 - (f) A merger pod pushes the merge commit the minute it exists and runs the test classes after it, so a finished merge is never left unpushed when the pod ends.
+- (f2) The last step before a push of a merge or a conflict resolution is `fleet-switchboard merge-drops --git-dir . --tip origin/integration --branch HEAD`: it lists every tip line the branch removes that its own commits did not, and exits 1 for any hunk no merge commit message names (file and first line). The merge step refuses while it fails (#2159).
 - (g) A guard or scan test states its closed rule and its known-limits list in its first version, and fails closed: anything not proven harmless is a site. Reviewers judge the rule and the limits: a spelling inside the stated limits is a Low, a spelling that escapes a rule claimed closed is a High.
 - (h) Any change to `.github/workflows/*` is built by a local job, never a cloud pod: a pod's git token has no workflows permission, so the push is refused and the pod cannot be retired.
 - (i) Compare failure messages, not only test names, between the branch and a clean tree, and keep new strings and comments clear of the added-lines scans (`TestGitShim` in `bin/test-switchboard` and `TestEverySite` in `cloud/launcher/tests/test_stub_cleanup.py`): no literal ampersand, `nohup` or spawn text, no git-config variable names, no renamed import to pass a scan.
@@ -94,7 +95,7 @@ When a review finding names a gap in one member of a table, list, set or rule fa
 
 Some repositories' workflows skip draft pull requests (a coder lost four hours reading that as a failing CI): when a draft shows no CI runs, look at the workflow's draft filter and mark the PR ready before waiting for CI (if there is no filter, the cause is elsewhere).
 
-Before marking the pull request ready, `fleet-switchboard preflight-pr` runs the CI-critical focused classes you otherwise skip (command surface, hygiene, public names, and the cloud suites when `cloud/` changed) and prints one PASS or FAIL line each.
+Before marking the pull request ready, `fleet-switchboard preflight-pr` runs the CI-critical focused classes you otherwise skip (command surface, hygiene, public names, and the cloud suites when `cloud/` changed) and prints one PASS or FAIL line each. Before ready, also run `fleet-switchboard preflight-pr --body owner/repo#N`: it reads the description and the plan and refuses one whose first section is not the cause the plan's cause-first scenario asks for.
 
 When a scenario's evidence is your own measurement, from your own pane launch a tester of your lane (`--role tester --repo <the pull request's repo> --reports-to <you>`, headless is enough) to re-measure and record the verdict: never record as yourself, and do not ask for a waiver.
 

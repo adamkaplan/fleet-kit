@@ -730,7 +730,7 @@ def check(args, ctx):
 
 # ---- the audit
 
-def write_audit(args, name, outcome, repo=None, number=None):
+def write_audit(args, name, outcome, repo=None, number=None, endpoint=None):
     """One line per gh write: time, verb, repository, number, caller, outcome (`passed` = handed to gh, `refused`). Never a command line. Best effort."""
     try:
         state = os.environ.get("FLEET_SWITCHBOARD_STATE") or os.path.join(
@@ -782,7 +782,7 @@ def write_audit(args, name, outcome, repo=None, number=None):
                             break
         line = json.dumps({"ts": int(time.time()), "verb": verb, "repo": repo if isinstance(repo, str) else None,
                            "number": number if isinstance(number, int) else None, "caller": name if isinstance(name, str) else "agent",
-                           "outcome": outcome}, sort_keys=True)
+                           "outcome": outcome, **({"endpoint": endpoint} if words[:1] == ["api"] and isinstance(endpoint, str) else {})}, sort_keys=True)
         folder = state.rstrip(os.sep) + "-audit"      # beside the state directory, not in it: the state directory holds only what the daemon reads
         os.makedirs(folder, mode=0o700, exist_ok=True)
         path = os.path.join(folder, AUDIT_FILE)

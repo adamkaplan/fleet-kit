@@ -293,7 +293,7 @@ def run(workdir, worker, prestop=False, repo=None, ctx=None):
     return {"pushed": True, "wip_branch": branch, "skipped": skipped}
 
 
-# ---- ask #2145: a finished pod's pull request is marked ready (and the repository's review comment posted once) when the pod ends ----
+# ---- the end-hook ask: a finished pod's pull request is marked ready (and the repository's review comment posted once) when the pod ends ----
 GH_TIMEOUT = 30
 
 

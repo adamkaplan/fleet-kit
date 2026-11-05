@@ -169,5 +169,76 @@ class TestPodSilenceTick(unittest.TestCase):
         self.assertIn("x of a", sent[1])
 
 
+BODY = {"worker": "other-pod", "in_flight": None, "last_calls": [], "idle_seconds": 1300, "branch": "b", "unpushed": {"count": 0}, "dirty": False, "last_push": "p"}
+
+
+class TestDaemonSummary(unittest.TestCase):
+    def test_daemon_reads_another_lanes_pod_in_process_while_the_command_refuses_a_lane(self):
+        cloud = load_real("cloud_worker").bind(sb.__dict__)
+        calls = []
+
+        def fake_launcher(runner, command, worker, options=(), timeout=0, **kw):
+            calls.append((command, worker, tuple(options)))
+            return 0, dict(BODY), ""
+        fake = types.SimpleNamespace(run_launcher=fake_launcher, _inspect_short=cloud._inspect_short)
+        fake.bind = lambda g: fake
+        with unittest.mock.patch.object(sb, "load_module", lambda n: fake if n == "cloud_worker" else load_real(n)):
+            line = sb.pod_silence_summary("other-pod")
+        self.assertIn("other-pod: no call in flight", line)
+        self.assertEqual(calls, [("inspect", "other-pod", ())])   # the daemon's read has no flag and no caller
+        # the command still refuses a lane that is not the boss
+        args = types.SimpleNamespace(name="other-pod", short=True)
+        H = cloud.H if hasattr(cloud, "H") else None
+        self.assertIsNotNone(H)
+        audits = []
+        with unittest.mock.patch.dict(H, {"gates_caller_kind": lambda r, n: ("agent", "lane-b"), "build_engine": lambda r, n, k: (object(), None, None)}), \
+                unittest.mock.patch.object(cloud, "route", lambda n: {"reports_to": "lane-a"}), \
+                unittest.mock.patch.object(cloud, "_audit", lambda e, *a: audits.append(a)):
+            with self.assertRaises(H["LaunchError"]) as ctx:
+                cloud.cmd_inspect(args, None, 0)
+        self.assertIn("only other-pod's own boss may inspect it", str(ctx.exception))
+        self.assertEqual(audits[0][0], "cloud.inspect_refused")
+
+
+class TestUnreadableSummary(unittest.TestCase):
+    def run_passes(self, module, summary, passes=3):
+        sent, audits = [], []
+        with tempfile.TemporaryDirectory() as tmp:
+            state = str(Path(tmp) / "s.json")
+            module.scan([pod("silent")], NOW - 30 * MIN, state, lambda to, t: None, lambda n: "x", json.loads)
+            for i in range(passes):
+                module.scan([pod("silent")], NOW + i, state, lambda to, t: sent.append((to, t)), summary, json.loads,
+                            audit=lambda w, d: audits.append((w, d)))
+        return sent, audits
+
+    def failing(self, name):
+        raise RuntimeError("the pod was not read (exit 3)")
+
+    def test_none_and_failing_summaries_send_the_reason_and_one_audit_line_once(self):
+        module, _ = load()
+        for summary in (lambda n: None, self.failing):
+            sent, audits = self.run_passes(module, summary)
+            self.assertEqual(len(sent), 1)
+            self.assertEqual(sent[0][0], "lane-a")
+            self.assertIn("state unreadable: ", sent[0][1])
+            self.assertEqual(len(audits), 1)
+            self.assertEqual(audits[0][0], "silent")
+        sent, _ = self.run_passes(module, self.failing)
+        self.assertIn("state unreadable: the pod was not read (exit 3)", sent[0][1])
+
+    def test_mutant_that_skips_on_none_fails_with_an_anchored_text(self):
+        control, applied0 = load()
+        self.assertFalse(applied0)
+        sent, _ = self.run_passes(control, lambda n: None)
+        self.assertIn("state unreadable: ", sent[0][1])   # control first
+        text = (REPO / "bin" / "pod_silence.py").read_text()
+        new = text.replace('        if not isinstance(line, str) or not line.strip():\n', '        if not isinstance(line, str) or not line.strip():\n            continue\n', 1)
+        self.assertNotEqual(new, text)   # applied
+        mutant = types.ModuleType("mutant")
+        exec(compile(new, "pod_silence.py", "exec"), mutant.__dict__)
+        sent, audits = self.run_passes(mutant, lambda n: None)
+        self.assertEqual((sent, audits), ([], []))   # the skip sends nothing: the real module sends one
+
+
 if __name__ == "__main__":
     unittest.main()

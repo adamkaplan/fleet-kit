@@ -126,9 +126,13 @@ def read_facts(reading, gh, repo, number, conf):
                     later = later or run.get("attempts", 1) > 1
             facts["legs"] = judge_legs(states, later)
         bases = {r["base"] for r in runs if r["base"]}
+        facts["behind"] = None
         # the oldest base among the deciding runs: a pull request is as current as its least current run
         if runs and all(r["base"] for r in runs):
             facts["run_base"] = min((r for r in runs), key=lambda r: r["created"] or 0)["base"] if len(bases) > 1 else next(iter(bases))
+        if facts["run_base"] and facts["run_base"] != facts["tip"]:
+            try: facts["behind"] = reading.read_behind(gh, repo, facts["run_base"], facts["tip"])
+            except reading.ReadError: pass
         branch_runs = reading.read_branch_runs(gh, repo, pr["base"], {r["workflow_id"] for r in runs} or None)
         facts["branch_runs"] = branch_runs
         facts["branch_result"] = "unknown" if not branch_runs else "red" if any(r["result"] == "red" for r in branch_runs) else "green"
@@ -200,8 +204,8 @@ def decide(facts, waived=False):
     if not facts["run_base"]:
         return False, "the branch tip the last run was computed on is not recorded: re-run its CI", "rerun"
     if facts["run_base"] != facts["tip"]:
-        return False, "%s moved after the last green run (tested on %s, tip now %s): its CI must run again on the current merge ref" % (
-            facts["branch"], facts["run_base"][:8], facts["tip"][:8]), "rerun"
+        return False, "%s moved after the last green run (tested on %s, tip now %s%s): its CI must run again on the current merge ref" % (
+            facts["branch"], facts["run_base"][:8], facts["tip"][:8], ", %d commits behind" % facts["behind"] if facts.get("behind") is not None else ""), "rerun"
     return True, "green at the head %s on the current tip %s%s" % (facts["head"][:8], facts["tip"][:8], "; " + legs_said if applies else ""), None
 
 
