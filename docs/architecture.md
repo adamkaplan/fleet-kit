@@ -223,7 +223,7 @@ Kinds (the number is exact, except `size`, a ceiling with headroom: see rule 7):
 | `switchboard/sweep.py` | `fleet-switchboard` | entry-import | 6 | the part relies on a standard-library module the entry imported; it gets its own import line |
 | `switchboard/sweep.py` | `fleet-switchboard` | namespace | 29 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 | `switchboard/triage.py` | `switchboard/plan_notice.py` | namespace | 1 | one namespace: the part reads a name another part defines; its rewiring gives it an import |
-| `switchboard/triage.py` | `switchboard/sweep.py` | namespace | 5 | one namespace: the part reads a name another part defines; its rewiring gives it an import |
+| `switchboard/triage.py` | `switchboard/sweep.py` | namespace | 6 | one namespace: the part reads a name another part defines; its rewiring gives it an import |
 | `switchboard/workers_report.py` | `fleet-switchboard` | namespace | 6 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 | `switchboard/workers_report.py` | `switchboard/docker_reaper.py` | namespace | 1 | one namespace: the part reads a name another part defines; its rewiring gives it an import |
 | `switchboard/workers_report.py` | `switchboard/handoff.py` | namespace | 3 | one namespace: the part reads a name another part defines; its rewiring gives it an import |
