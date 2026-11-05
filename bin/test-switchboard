@@ -67064,6 +67064,7 @@ TestDaemonDeadVerdict, TestDaemonDeadVerdictMutants = (_dd := importlib.import_m
 TestPaneUndecidable = _dd.TestPaneUndecidable   # #1884 PC-6 / S11
 TestUndecidableRobustness = _dd.TestUndecidableRobustness   # #1884 PC-9 / S14
 TestBodyCheck = importlib.import_module("test_body_check").TestBodyCheck   # #1476
+TestMergeOnResolve = importlib.import_module("test_merge_on_resolve").TestMergeOnResolve   # #2204
 TestLaunchCapacity = importlib.import_module("test_launch_capacity").build()   # #1793
 _ta = importlib.import_module("test_tester_agent"); _ta.HOST = sys.modules[__name__]; TestTesterAgentLaunch, TestTesterAgentMutants = _ta.build()   # #1963
 _lr = importlib.import_module("test_launched_reviewers"); _lr.HOST = sys.modules[__name__]; TestLaunchedReviewerRule, TestLaunchedReviewerGates, TestLaunchedReviewerItems, TestLaunchedReviewerRelay, TestLaunchedReviewerDocs, TestLaunchedReviewerGuards, TestLaunchedReviewerMutants = _lr.build()   # #1869
