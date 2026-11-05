@@ -756,9 +756,6 @@ class TestPushWatch(Case):
         self.assertEqual(module.push_watch_tick(engine, None), [])
         self.assertEqual([l[0] for l in engine.audit.lines], ["push_watch.skipped"])
 
-
-class TestFirstSightBaseline(Case):
-    """#2153: the first sight of a branch is a baseline, told only when its tip was made after the worker's launch."""
     def _world(self, made_before_launch):
         iso = lambda t: datetime.datetime.fromtimestamp(t, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         launch = NOW - 3600
@@ -794,7 +791,6 @@ class TestFirstSightBaseline(Case):
         self.run_pass(NOW + 120)
         got = self.to("lane-a")
         self.assertEqual((len([t for t in got if SHA_B[:8] in t]), len([t for t in got if SHA_A[:8] in t])), (1, 0))
-
 
 if __name__ == "__main__":
     unittest.main()
