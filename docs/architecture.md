@@ -51,6 +51,7 @@ The **Holds** column is descriptive: only the layer numbers are enforced.
 | `plan_approval.py` | 0 | the check of an approval sent as a message (pure) | |
 | `record_json.py` | 0 | the one bounded-depth parse of untrusted record JSON, shared by every reader of it (#1314) | |
 | `turn_start.py` | 0 | when each working session's current turn began, as the daemon first saw it, for `steer_after_minutes` (#1540) | |
+| `unconsumed_record.py` | 0 | what the daemon tried to steer and which reminder ids it delivered, for #1844 | |
 | `red_ci.py` | 0 | which check conclusions are red, green or say nothing, and the once-per-key memory (pure table) | |
 | `path_walk.py` | 0 | one walk up from a trusted path, shared by the cloud launcher and the installer | |
 | `repo_exclusion.py` | 0 | repositories the owner keeps out of the fleet's view are never watched or read | |
@@ -106,7 +107,7 @@ The **Holds** column is descriptive: only the layer numbers are enforced.
 | `impact_hold.py` | 5 | who may clear, hold or release an impact hold | |
 | `item_verdicts.py` | 5 | verdicts for a work item that has no pull request | |
 | `lanes.py` | 5 | move an ask from one orchestrator's charter to another's, with a handover | |
-| `launch_testers.py` | 5 | testers from the launch record | |
+| `launch_testers.py` | 5 | testers and reviewers from the launch record | |
 | `merge_gate.py` | 5 | the fleet's own merge queue | |
 | `orders_copy.py` | 5 | `orders copy`: a charter's standing orders copied to another charter | |
 | `path_suites.py` | 5 | which test suites exercise a changed path, and the local merge `heavy --changed` runs them on | |
@@ -128,6 +129,7 @@ The **Holds** column is descriptive: only the layer numbers are enforced.
 | `switchboard/sent_view.py` | 5 | `sent`: a sender's own recent messages with their sent, delivered and picked-up times | |
 | `switchboard/v2_transport.py` | 1 | the OpenCode v2 client and its HTTP transport | |
 | `switchboard/jev.py` | 1 | the Jev client: the decision model, the classifier and the policy judge's questions | |
+| `switchboard/stage_event.py` | 4 | the stage-event marker of a configured bot's comment: the first line only, validated and rebuilt (ask #1575) | |
 | `switchboard/audit.py` | 2 | the audit log | |
 | `switchboard/facts.py` | 4 | the fact sources: the world read into facts | |
 | `switchboard/decision.py` | 3 | the delivery decision: what is sent, to whom, and refused when too long | |
@@ -153,7 +155,7 @@ The **Holds** column is descriptive: only the layer numbers are enforced.
 
 ## The clear's closure follows the parts
 
-The delegated clear refuses a pull request that changes a definition of "the clear's closure" (`bin/delegated_clear.py`, `closure`). The closure is derived over the assembled daemon: the entry plus every part of `bin/fleet-switchboard.parts`, as one namespace. `tools/derive-closure --write` lists in `docs/review-laws/impact-matrix.json` each part that holds a closure definition OR a module-level binding or import the closure reads (`closure_files`), with the definitions as `module_roots[part]` (empty for a part that holds only a binding: listing the part is what refuses an edit of it); `--check` fails in both directions (a name or part missing, a name or part extra) and names the part and the name. A new part is in by derivation, not by a hand list. The manifest is read as data and fails closed (exit 1, the entry named, nothing written): an entry that is not a file, is not `switchboard/<name>.py` (`..`, a directory, an absolute path), is listed twice, a part file the manifest does not list (it is never assembled), and a closure definition defined in two files. `--write` replaces the matrix through a temp file and a rename, and never writes after a failed derivation. `tests/switchboard/test_closure.py` runs the check and pins two floors for the assembled closure from `closure_roots`: 395 definitions and 335 bindings (a falling count fails the test; a floor is raised only in its own commit, with the owner's sign-off), and keeps the entry's own `closure_roots` as they were. After moving a definition to another part, run `tools/derive-closure --write` in the same pull request. For a listed part, any top-level statement edit is refused, as for every module the clear loads.
+The delegated clear refuses a pull request that changes a definition of "the clear's closure" (`bin/delegated_clear.py`, `closure`). The closure is derived over the assembled daemon: the entry plus every part of `bin/fleet-switchboard.parts`, as one namespace. `tools/derive-closure --write` lists in `docs/review-laws/impact-matrix.json` each part that holds a closure definition OR a module-level binding or import the closure reads (`closure_files`), with the definitions as `module_roots[part]` (empty for a part that holds only a binding: listing the part is what refuses an edit of it); `--check` fails in both directions (a name or part missing, a name or part extra) and names the part and the name. A new part is in by derivation, not by a hand list. The manifest is read as data and fails closed (exit 1, the entry named, nothing written): an entry that is not a file, is not `switchboard/<name>.py` (`..`, a directory, an absolute path), is listed twice, a part file the manifest does not list (it is never assembled), and a closure definition defined in two files. `--write` replaces the matrix through a temp file and a rename, and never writes after a failed derivation. `tests/switchboard/test_closure.py` runs the check and pins two floors for the assembled closure from `closure_roots`: 427 definitions and 378 bindings (a falling count fails the test; a floor is raised only in its own commit, with the owner's sign-off), and keeps the entry's own `closure_roots` as they were. After moving a definition to another part, run `tools/derive-closure --write` in the same pull request. For a listed part, any top-level statement edit is refused, as for every module the clear loads.
 
 ## Known violations
 
@@ -236,6 +238,8 @@ Kinds (the number is exact, except `size`, a ceiling with headroom: see rule 7):
 | `switchboard/pr_explain.py` | `fleet-switchboard` | namespace | 10 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 | `switchboard/sent_view.py` | `fleet-switchboard` | namespace | 8 | one namespace: the part reads the entry's names (`build_engine`, `identify_caller`, `SentLedger`, `READ_LIMIT`, `_created`); its rewiring gives it imports |
 | `switchboard/reminders.py` | `fleet-switchboard` | namespace | 26 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports; two reads of untrusted JSON now go through `load_module("record_json")`, one name of the entry more (#1314); the delivery-time judgement of late and stale alerts reads one name of the entry more (#1402) |
+| `switchboard/stage_event.py` | `fleet-switchboard` | entry-import | 4 | the part relies on a standard-library module the entry imported; it gets its own import line |
+| `switchboard/stage_event.py` | `fleet-switchboard` | namespace | 4 | one namespace: the part reads the entry's names (`load_module`, the config checks, `datetime`); it gets its own imports |
 
 ## Dynamic imports not followed
 
