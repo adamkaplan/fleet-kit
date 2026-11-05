@@ -580,28 +580,29 @@ def build(Base, TestSteerToWorking):
             self.kills("steer_unconsumed", " and math.isfinite(_created(item))", "",
                        self.scenario_infinite_created, "a non-finite created escaped the pass")
 
-        def cap_engine_case(self, cap):
-            """501 distinct steered ids and 501 distinct reminder ids on one engine whose cap is `cap`."""
+        def cap_engine_case(self, cap, items=None):
+            """cap+1 (or `items`) distinct steered ids and as many reminder ids on one engine whose cap is `cap`."""
+            items = items or cap + 1
             import types
             self.build({})
             self.attach_cancel()
             self.work(lasts=7200, steps=3)
             self.minutes(60)
             created = self.world.clock.ms(self.world.clock.now() - 3600)
-            for n in range(501):
+            for n in range(items):
                 self.add_item("c%03d" % n, created)
             engine = self.world.engine
             with mock.patch.object(sb.Switchboard, "UNCONSUMED_CAP", cap):
                 engine.steer_unconsumed(self.lane(), engine.now())
-                self.assertNotIn("inb_c000", engine.unconsumed_seen, "the steered map is not capped at 500")
-                self.assertEqual(len(engine.unconsumed_seen), 500, "the steered map is not capped at 500")
+                self.assertNotIn("inb_c000", engine.unconsumed_seen, "the steered map is not capped")
+                self.assertEqual(len(engine.unconsumed_seen), cap, "the steered map is not capped")
                 now = self.world.clock.now()
                 ids = [sb.add_reminder(self.world.state, "platform", now, now, "r%d" % n, sender="coder", key="K%d" % n)
-                       for n in range(501)]
+                       for n in range(items)]
                 ids = [i["id"] if isinstance(i, dict) else i for i in ids]
                 engine.supersede_queued_reminders(self.lane(), [types.SimpleNamespace(key="reminder:%s" % i) for i in ids])
-                self.assertNotIn("reminder:%s" % ids[0], engine.reminder_memory, "the reminder map is not capped at 500")
-                self.assertEqual(len(engine.reminder_memory), 500, "the reminder map is not capped at 500")
+                self.assertNotIn("reminder:%s" % ids[0], engine.reminder_memory, "the reminder map is not capped")
+                self.assertEqual(len(engine.reminder_memory), cap, "the reminder map is not capped")
 
         def test_low2_the_daemon_cap_is_500_after_501_ids_the_oldest_is_gone(self):
             self.cap_engine_case(sb.Switchboard.UNCONSUMED_CAP)
@@ -609,14 +610,13 @@ def build(Base, TestSteerToWorking):
         def test_low2_mutant_cap_5000_keeps_the_oldest(self):
             with open(SOURCE, encoding="utf-8") as handle:
                 text = handle.read()
-            old = "    UNCONSUMED_CAP = 500\n"
+            real = sb.Switchboard.UNCONSUMED_CAP
+            old = "    UNCONSUMED_CAP = %d\n" % real
             self.assertEqual(text.count(old), 1, "the mutation did not apply")
-            self.assertEqual(sb.Switchboard.UNCONSUMED_CAP, 500, "the control cap is not 500")
-            self.cap_engine_case(sb.Switchboard.UNCONSUMED_CAP)   # control first
-            mutated = int(old.replace("500", "5000").split("=")[1])
+            self.cap_engine_case(real)   # control first
             with self.assertRaises(AssertionError) as caught:
-                self.cap_engine_case(mutated)
-            self.assertIn("is not capped at 500", str(caught.exception))
+                self.cap_engine_case(real * 10, items=real + 1)   # the mutant: a cap ten times larger keeps the oldest
+            self.assertIn("is not capped", str(caught.exception))
 
         def scenario_cached_consumed(self):
             self.build({"v2_cache_seconds": 120})   # the memory on: the test world has it off

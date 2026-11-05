@@ -241,7 +241,7 @@ class TestPins(PinsRepo):
         self.change_function()
         _, lines, _ = self.pins(base="HEAD")
         found = self.listed(lines)
-        self.assertEqual(len(found), 200)
+        self.assertEqual(len(found), sb.PINS_MAX_LINES)
         self.assertEqual(len([l for l in lines if l.startswith("cut:")]), 1)
         self.assertIn("301", lines[-1])
 
@@ -316,7 +316,7 @@ class TestPinsReview(PinsRepo):
         self.git("-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-q", "-m", msg)
 
     def many_terms(self):
-        self.write("wide.py", "".join('def widget_fn_%03d(): return "message number %03d here"\n' % (i, i) if i < 302 else "def widget_fn_%03d(): pass\n" % i for i in range(305)))
+        self.write("wide.py", "".join('def widget_fn_%03d(): return "message number %03d here"\n' % (i, i) if i < sb.PINS_MAX_TERMS + 2 else "def widget_fn_%03d(): pass\n" % i for i in range(sb.PINS_MAX_TERMS + 5)))   # 5 names and 2 messages over the bound
         self.commit()
         self.write("wide.py", "")
 
@@ -324,7 +324,7 @@ class TestPinsReview(PinsRepo):
         self.many_terms()
         code, lines, _ = self.pins()
         self.assertEqual(code, 0)
-        self.assertEqual([l for l in lines if l.startswith("cut:")], ["cut: 5 names / 2 messages not searched"])
+        self.assertEqual([l for l in lines if l.startswith("cut:")], ["cut: %d names / %d messages not searched" % (5, 2)])   # the notice text is the behaviour (byte-equal); its counts are the excess over sb.PINS_MAX_TERMS the fixture builds
 
     def test_cut_terms_are_said_with_their_counts(self):   # M1
         self.check_cut_line()
@@ -595,7 +595,7 @@ class TestPinsStrictRead(PinsRepo):
         diff = "diff --git a/m.py b/m.py\n--- a/m.py\n+++ b/m.py\n@@ -1,120 +0,0 @@\n" + "".join("-def widget_fn_%03d(): pass\n" % i for i in range(120))
         code, lines, err = self.run_cmd(self.fake(diff, self.timing_out_after_first()))
         self.assertEqual(code, 0, err)
-        self.assertEqual(lines[0], "cut: search timed out: 70 of 120 terms not searched")
+        self.assertEqual(lines[0], "cut: search timed out: %d of 120 terms not searched" % (120 - sb.PINS_CHUNK))   # the first chunk was searched
         self.assertTrue([l for l in lines if "widget_fn_001" in l], lines)
 
     def test_a_finder_that_raises_on_a_timeout_is_caught(self):   # M1 mutant: the old behaviour
@@ -614,8 +614,8 @@ class TestPinsStrictRead(PinsRepo):
         names = ["widget_fn_%04d" % i for i in range(601)]
         sb.pins_search(names, [], self.fake("", grep))
         greps = [c for c in self.calls if c[0][1] == "grep"]
-        self.assertEqual(len(greps), 13)
-        self.assertTrue(all(len(c[1]["input"].split()) <= 50 and c[1]["timeout"] <= 30 for c in greps))
+        self.assertEqual(len(greps), -(-601 // sb.PINS_CHUNK))   # ceil(601 / chunk): 13 at 50
+        self.assertTrue(all(len(c[1]["input"].split()) <= sb.PINS_CHUNK and c[1]["timeout"] <= sb.PINS_CALL_SECONDS for c in greps))
 
     def test_the_diff_call_pins_prefixes_and_textconv(self):   # L1 argv
         self.write("acme.py", BASE_SRC.replace("count * 2", "count * 3"))

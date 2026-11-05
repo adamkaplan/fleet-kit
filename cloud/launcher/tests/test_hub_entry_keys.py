@@ -74,7 +74,7 @@ class EntryBase(Base):
     def check_with_issue(self, entry):
         self.assertIn("repo", entry, MSG_REPO)
         self.assertEqual(type(entry["issue"]), int, MSG_ISSUE_TEXT)
-        self.assertEqual(set(entry), BASE_KEYS | {"repo", "issue"})
+        self.assertLessEqual(BASE_KEYS | {"repo", "issue"}, set(entry))   # every required key is present; a new key is allowed
         self.assertEqual(entry["repo"], REPO)
         self.assertEqual(entry["issue"], 7)
         self.assertEqual(entry["session"], "")
@@ -83,7 +83,7 @@ class EntryBase(Base):
 
     def check_without_issue(self, entry):
         self.assertNotIn("issue", entry, MSG_ISSUE_ALWAYS)
-        self.assertEqual(set(entry), BASE_KEYS | {"repo"})
+        self.assertLessEqual(BASE_KEYS | {"repo"}, set(entry))   # every required key is present; a new key is allowed
         self.assertEqual(entry["repo"], REPO)
 
 

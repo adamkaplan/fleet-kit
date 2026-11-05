@@ -116,7 +116,7 @@ class NotFoundExact(tcw.Base):
                 rows.append((case, "raises"))
         for case, got in rows:
             print("%s | %s | %s" % (label, case, got))
-        self.assertEqual([got for _, got in rows], ["raises"] * 4, rows)
+        self.assertEqual([got for _, got in rows], ["raises"] * len(self.cases(kind, other)), rows)   # every near miss raises
         self.assertIsNone(read_it(self.kube_saying(self.exact(kind))), "the exact message reads as gone")
 
     def test_s3_pod_read_near_misses_raise_and_the_exact_message_is_gone(self):
@@ -506,7 +506,10 @@ class SignalDuringTheRead(tcw.Base):
                 print("%s: %d pods, %d Secrets left, %d cleanups, status %d, %d deletes" % ((label,) + self.left() + (len(self.cleanups()), code, len(self.deletes()))))
                 self.assertEqual(code, cw.EXIT_INTERRUPTED, err)
                 self.assertEqual(self.left(), (0, 0))
-                self.assertEqual(len(self.deletes()), 3, "the pod, the password Secret and the per-run Secret, once each")
+                deletes, pod = self.deletes(), cw.pod_name("coder7")
+                self.assertEqual(len(deletes), len(set(deletes)), "no object is deleted twice")
+                for obj in (pod, pod + "-pw", pod + "-run"):   # the pod, the password Secret and the per-run Secret, once each
+                    self.assertEqual(len([d for d in deletes if '"%s"' % obj in d]), 1, (obj, deletes))
                 lines = self.cleanups()
                 self.assertEqual(len(lines), 1)
                 self.assertEqual(lines[0]["action"], "create.interrupted")

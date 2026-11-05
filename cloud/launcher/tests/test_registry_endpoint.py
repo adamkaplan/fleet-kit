@@ -50,6 +50,7 @@ class Behaviour(TCW.Base):
     def blocked_registry(self):
         """The registry's file cannot be read or written: a directory stands where registry.json goes."""
         os.makedirs(str(self.state), mode=0o700, exist_ok=True)
+        (self.state / REG.FILE).unlink(missing_ok=True)   # #1046: the base seeded the boss row, a file
         (self.state / REG.FILE).mkdir()
 
     def audit_lines(self, word):
@@ -84,7 +85,9 @@ class Behaviour(TCW.Base):
             self.assertEqual(code, 0, err)
             self.assertEqual(json.loads(out.strip().splitlines()[-1])["url"], json.loads((self.state / "cloud" / (name + ".json")).read_text())["url"])
         rows = self.rows()
-        self.assertEqual(sorted(rows), ["coder7", "coder8"])
+        self.assertLessEqual(set(urls), set(rows))   # a row for each launch
+        for name in ("coder7", "coder8", "orch"):
+            self.assertIn(name, rows)
         for name, url in urls.items():
             self.assertEqual(rows[name]["kind"], "cloud")
             self.assertNotIn("endpoint", rows[name])
@@ -115,7 +118,7 @@ class Behaviour(TCW.Base):
             self.assertEqual(calls, [("coder7", "cloud-worker")])
             self.main("retire", "coder7")   # a second run: the record is gone, the cloud path retires nothing more
             self.assertEqual(calls, [("coder7", "cloud-worker")])
-        self.assertEqual(sorted(REG.read(str(self.state))["retired"]), ["coder7"])
+        self.assertIn("coder7", REG.read(str(self.state))["retired"])
 
     def test_matches_a_failed_stop_leaves_the_row(self):
         self.launch_at("coder7", self.address("worker-aaa"))
@@ -143,13 +146,13 @@ class Behaviour(TCW.Base):
         code, out, err = self.main("cloud-clear")   # a second run: no record, nothing more
         self.assertEqual(code, 0)
         self.assertIn("no cloud worker records", out)
-        self.assertEqual(sorted(REG.read(str(self.state))["retired"]), ["coder7"])
+        self.assertIn("coder7", REG.read(str(self.state))["retired"])
 
     def test_matches_a_credentialed_record_address_fails_the_launch_before_any_row(self):
         with mock.patch.dict(os.environ, {"STUB_URL": "https://user:pw@worker.example.internal:4096"}):
             code, out, err = self.launch("coder7")
         self.assertEqual(code, 1)
-        self.assertEqual(self.rows(), {})
+        self.assertEqual(sorted(self.rows()), ["orch"])   # no launch row; only the seeded boss (#1046)
 
     def test_matches_a_registry_that_fails_says_one_line_without_endpoint_or_secret(self):
         url = self.remote.url

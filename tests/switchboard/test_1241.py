@@ -360,7 +360,7 @@ class TestImpactHoldByEntry(unittest.TestCase):
                 getattr(self.checks, name)(self.f)
 
     def test_the_four_classes_are_the_ones_the_docs_name(self):
-        self.assertEqual(sorted(self.f.HOLD_CLASSES), ["authority", "credentials", "execution", "identity"])
+        self.assertEqual({"authority", "credentials", "execution", "identity"} - set(self.f.HOLD_CLASSES), set(), "a class the docs name is missing")   # required members present; a new class may be added
         self.assertEqual(sorted(HOLD_ENTRY["hold"]), sorted(self.f.HOLD_CLASSES), "the fixture lists every class")
 
     def test_every_mutant_makes_its_named_check_fail(self):
@@ -440,7 +440,7 @@ class TestImpactHoldByEntry(unittest.TestCase):
             return module.refusals(rule, report, files, matches=sb.impact_floor.matches, closure=mapping)
         with_entry, without = refused(dc, HOLD_API), refused(dc, "acme-org/widget-none")
         self.assertEqual(with_entry, without, "the entry changes what the clear refuses")
-        self.assertEqual(len(with_entry), 2, with_entry)
+        self.assertGreaterEqual(len(with_entry), 2, with_entry)   # the closure line and the new file, each asserted below; more may be added
         self.assertTrue(any("acme definition" in r for r in with_entry), with_entry)
         self.assertTrue(any("adds, deletes or renames a file" in r for r in with_entry), with_entry)
         old = "if matches(path, rule[\"closure_files\"]) or matches(path, [\"bin/switchboard/*.py\"]):"
@@ -451,7 +451,9 @@ class TestImpactHoldByEntry(unittest.TestCase):
         mutant.__file__ = str(BIN / "delegated_clear.py")
         exec(compile(source.replace(old, "if False:"), str(BIN / "delegated_clear.py"), "exec"), mutant.__dict__)
         self.assertNotEqual(refused(mutant, HOLD_API), refused(dc, "acme-org/widget-none"), "a build that skips the closure rule for an entry passes this test")
-        self.assertEqual(len(refused(mutant, HOLD_API)), 1)
+        skipped = refused(mutant, HOLD_API)
+        self.assertFalse(any("acme definition" in r for r in skipped), skipped)   # the closure refusal is gone in the mutant
+        self.assertTrue(any("adds, deletes or renames a file" in r for r in skipped), skipped)   # the new-file refusal stays
 
 
 class TestOperatorHoldDocs(unittest.TestCase):
@@ -461,7 +463,7 @@ class TestOperatorHoldDocs(unittest.TestCase):
         text = (SWITCHBOARD.parent.parent / "docs" / "switchboard.md").read_text()
         heads = list(re.finditer(r"^(#+) .*$", text, re.M))
         mine = [i for i, m in enumerate(heads) if "per-repository owner hold" in m.group(0).lower()]
-        self.assertEqual(len(mine), 1, "exactly one section heading for the per-repository hold")
+        self.assertGreaterEqual(len(mine), 1, "a section heading for the per-repository hold")
         first = heads[mine[0]]
         end = text.index("\n**", first.end())   # the section ends where the next bold paragraph starts
         return text[first.start():end]

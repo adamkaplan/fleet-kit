@@ -109,7 +109,7 @@ tf = os.environ.get("CW_CLOUD_TOKEN_FILE")
 login = {"command": command, "argv": argv, "env": dict(os.environ), "token_ok": bool(tf) and hashlib.sha256(open(tf).read().encode()).hexdigest() == os.environ.get("STUB_TOKEN_SHA"),
          "token_mode": oct(os.stat(tf).st_mode & 0o777) if tf else None}
 open(os.environ["STUB_DIR"] + "/login.log", "a").write(json.dumps(login) + "\\n")
-CREATE_OPTIONS = ("--repo", "--branch", "--idle", "--hard", "--max-hard", "--shape", "--image", "--stack", "--wait", "--pull-secret", "--run-secret-fd", "--run-id", "--password-fd", "--json")   # what the launcher's create knows (main, fb4b9f2)
+CREATE_OPTIONS = ("--repo", "--branch", "--idle", "--hard", "--max-hard", "--shape", "--image", "--stack", "--wait", "--pull-secret", "--run-secret-fd", "--no-commit", "--run-id", "--password-fd", "--json")   # what the launcher's create knows (main, fb4b9f2)
 if command == "create":
     unknown = [a for a in argv[2:] if a.startswith("--") and a not in CREATE_OPTIONS]
     if unknown:
@@ -1616,6 +1616,26 @@ class TestLaunchStack(Base):
                 self.assertEqual(self.create_argv(), expected)
                 self.assertEqual(self.create_argv().count("--stack"), 1)
 
+    def test_s14_a_stack_launch_arms_the_default_once(self):
+        code, out, err = self.launch_with("--cloud", "--stack")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.create_argv().count("--stack"), 1)
+        lines = [l for l in err.splitlines() if l.startswith("fleet-switchboard: default 25m/40m")]
+        self.assertEqual(len(lines), 1, err)
+        self.assertIn("worker reminder in 25 min", lines[0])
+        self.assertIn("overdue reminder in 40 min", lines[0])
+
+    def test_s15_a_second_launch_of_the_same_name_arms_nothing(self):
+        def arming(err):
+            return [l for l in err.splitlines() if l.startswith("fleet-switchboard: default 25m/40m")]
+        code, out, err = self.launch_with("--cloud")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(arming(err)), 1, err)
+        code, out, err = self.launch_with("--cloud")   # no state_clean: the worker record of the first exists, the real launcher refuses it
+        self.assertNotEqual(code, 0, err)
+        self.assertEqual(len(arming(err)), 0, err)
+        self.assertEqual(len([c for c in self.stub_calls() if c[0] == "create"]), 1)   # no second pod
+
     def state_clean(self):
         """Between two launches of one test: the fakes' call logs and the worker records start empty."""
         for name in ("calls.log", "kubectl.log", "login.log"):
@@ -1628,6 +1648,17 @@ class TestLaunchStack(Base):
         self.assertEqual(code, 0, err)
         self.assertNotIn("--stack", self.create_argv())
         self.assertEqual(self.create_argv()[self.create_argv().index("--shape") + 1], "M")
+
+    def test_1771_the_create_call_carries_no_commit_for_the_flag_and_the_two_roles_only(self):
+        base = json.loads((self.FIXTURES / "launch-create-argv.json").read_text())
+        for extra in (("--no-commit",), ("--role", "tester"), ("--role", "reviewer"), ()):
+            with self.subTest(extra=extra):
+                self.state_clean()
+                code, out, err = self.launch_with("--cloud", *extra)
+                self.assertEqual(code, 0, err)
+                argv = self.create_argv()
+                self.assertEqual(argv.count("--no-commit"), 1 if extra else 0)
+                self.assertEqual([x for x in argv if x != "--no-commit"], base)   # the other options are identical
 
     def test_s9_the_fake_launcher_refuses_an_option_it_does_not_know(self):
         text = self.stub.read_text().replace('"--stack", ', "")
@@ -1723,7 +1754,16 @@ class TestNeedsDocker(Base):   # #1488
             return self.main(*argv, *(["--cloud"] if cloud else ["--terminal", "--workspace", "w1", "--dir", str(self.home)]))
 
     def seen(self, res):
-        return {"exit": res[0], "stdout": re.sub(r"(127\.0\.0\.1:)\d+", r"\1PORT", res[1]), "stderr": "".join(l + "\n" for l in res[2].splitlines() if l.startswith(("fleet-switchboard:", "preflight:")))}
+        return {"exit": res[0], "stdout": re.sub(r"(127\.0\.0\.1:)\d+", r"\1PORT", res[1]), "stderr": "".join((re.sub(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", "TIME", l) if l.startswith("fleet-switchboard: default 25m/40m") else l) + "\n" for l in res[2].splitlines() if l.startswith(("fleet-switchboard:", "preflight:")))}
+
+    def test_s16_seen_masks_the_time_of_the_arming_line_only(self):
+        iso = r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ"
+        res = self.seen((0, "{}", "fleet-switchboard: default 25m/40m (no CHECKPOINT line and no flag): checkpoint reminders (now 2026-11-01T22:32:44Z): worker reminder in 25 min, at 2026-11-01T22:57:44Z; overdue reminder in 40 min, at 2026-11-01T23:12:44Z\nfleet-switchboard: another line 2026-11-01T10:00:00Z\n"))
+        arming, other = res["stderr"].splitlines()
+        self.assertIn("TIME", arming)
+        self.assertEqual(len(re.findall(iso, arming)), 0)
+        self.assertEqual(res["stderr"].count("2026-11-01T10:00:00Z"), 1)
+        self.assertEqual(len(re.findall(iso, other)), 1)
 
     def test_s2_a_docker_brief_without_stack_is_refused_before_any_pod(self):
         code, out, err = self.run_launch("Build.\n" + self.LINE + "\n")

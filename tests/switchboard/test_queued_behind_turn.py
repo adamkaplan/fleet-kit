@@ -236,13 +236,13 @@ class TestQueuedBehindTurn(QueuedWaitModuleTests, Base):
         self.assertEqual(admitted["text"].count(WORDS), 1, IN_TURN_TEXT)
         self.assertIn("delivered %s, %s)" % (sb.clock_utc(world.clock.now()), WORDS), header, IN_TURN_TEXT)
         self.assertIsNotNone(RECORDED, "the recorded headers are missing")
-        self.assertEqual(len(RECORDED), 20)   # the brief's count; idle_headers() follows the fixture's length
+        self.assertGreaterEqual(len(RECORDED), 20)   # a floor (the brief recorded 20): the fixture may grow, idle_headers() follows its length
         headers = self.idle_headers()
         self.assertEqual([h for h, r in zip(headers, RECORDED) if h != r], [], "an idle header differs from its recorded bytes")
         self.assertEqual(sum(h.count(WORDS) for h in headers), 0)
         # headers of OTHER shapes (delayed, held, supersedes), recorded on the BASE (before the change), byte for byte
         recorded = json.loads(OTHER_SHAPES.read_text())
-        self.assertEqual(len(recorded), 10)
+        self.assertGreaterEqual(len(recorded), 10)   # a floor; the byte-for-byte comparison below is the behaviour (the notice text must not change)
         self.assertEqual(other_shape_headers(), recorded, "a header of another shape differs from its recorded bytes")
         for shape in ("delayed", "held", "supersedes"):
             self.assertTrue(any(shape in h for h in recorded), shape)

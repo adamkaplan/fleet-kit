@@ -193,7 +193,8 @@ def run_pass(sb, engine, now, gh, config=None, launcher_audit=None):
                     raise
             raise
 
-    live = sorted(n for n, r in records.items() if isinstance(r.get("repo"), str) and not state["stopped"].get(n, 0))
+    live = sorted(n for n, r in records.items() if isinstance(r.get("repo"), str) and not state["stopped"].get(n, 0)
+                  and (getattr(sb, "record_live", None) is None or sb.record_live(r, n, now)))   # #2186: the daemon's one liveness test (`cloud_record_live`), passed in
     start = state.get("cursor", 0) % len(live) if live else 0
     order = (live[start:] + live[:start])[:PASS_WORKERS_MAX]
     chosen = set(order)

@@ -1384,7 +1384,7 @@ class TestSelfRegisteringCli(unittest.TestCase):
 
         def add_not_a_registrar_parser(sub):   # the registrar name rule: `add_<name>_parsers` only
             raise AssertionError("must not be collected")
-        with mock.patch.dict(sb.__dict__, {"add_synthetic_parsers": add_synthetic_parsers, "cmd_synthetic": cmd_synthetic, "add_not_a_registrar_parser": add_not_a_registrar_parser}):
+        with tempfile.TemporaryDirectory() as state, mock.patch.dict(os.environ, {"XDG_STATE_HOME": state}), mock.patch.dict(sb.__dict__, {"add_synthetic_parsers": add_synthetic_parsers, "cmd_synthetic": cmd_synthetic, "add_not_a_registrar_parser": add_not_a_registrar_parser}):
             self.assertIn("add_synthetic_parsers", [r.__name__ for r in sb.command_registrars()])
             self.assertNotIn("add_not_a_registrar_parser", [r.__name__ for r in sb.command_registrars()])
             self.assertEqual(sb.main(["synthetic", "--x", "1"], runner="R", now="N"), 7)
@@ -1399,7 +1399,7 @@ class TestSelfRegisteringCli(unittest.TestCase):
         def cmd_direct_demo(args, runner, now):
             raise sb.V2Error("its own error")
         cmd_direct_demo.direct = True
-        with mock.patch.dict(sb.__dict__, {"add_direct_demo_parsers": add_direct_demo_parsers, "cmd_direct_demo": cmd_direct_demo}):
+        with tempfile.TemporaryDirectory() as state, mock.patch.dict(os.environ, {"XDG_STATE_HOME": state}), mock.patch.dict(sb.__dict__, {"add_direct_demo_parsers": add_direct_demo_parsers, "cmd_direct_demo": cmd_direct_demo}):
             with self.assertRaises(sb.V2Error):   # direct: the error is not mapped (a mapped command would return EXIT_ERROR)
                 sb.main(["direct-demo"])
 

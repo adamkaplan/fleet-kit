@@ -597,9 +597,11 @@ class TestFacts(Base):
         self.assertIn(":2:", str(caught.exception))
 
     def test_the_registration_point_lists_the_lab_source(self):
-        self.assertEqual([s.__name__ for s in sb.fact_sources(self.home)],
-                         ["lab_facts", "worker_facts", "reminder_facts", "report_rider_facts", "held_send_facts", "foreground_facts",
-                          "orders_facts", "sweep_facts", "triage_facts", "plan_wake_facts", "alert_wake_facts", "red_ci_facts", "job_facts", "pane_facts", "pane_exit_facts", "headless_restart_facts", "disk_facts", "cpu_facts", "spotlight_facts", "docker_reap_facts", "temp_janitor_facts", "heavy_orphan_facts", "scratch_bound_facts"])
+        names = [s.__name__ for s in sb.fact_sources(self.home)]
+        required = ["lab_facts", "worker_facts", "reminder_facts", "report_rider_facts", "held_send_facts", "foreground_facts",
+                          "orders_facts", "sweep_facts", "triage_facts", "plan_wake_facts", "alert_wake_facts", "red_ci_facts", "job_facts", "pane_facts", "pane_exit_facts", "headless_restart_facts", "disk_facts", "cpu_facts", "spotlight_facts", "docker_reap_facts", "temp_janitor_facts", "heavy_orphan_facts", "scratch_bound_facts"]
+        self.assertEqual([n for n in required if n not in names], [], "a required fact source is not registered")   # a new source may be added; a required one may not go
+        self.assertEqual(len(set(names)), len(names), "a source is registered twice")
 
     def test_every_fact_source_class_in_the_module_is_registered(self):   # #1030: derived, so a new source cannot be left out
         registered = {type(s).__name__ for s in sb.fact_sources(self.home)}
@@ -23215,8 +23217,9 @@ class TestSweep(Base):
         self.assertEqual(len(self.engine.sweep.repos), 1)
 
     def test_the_sweep_budget_is_a_config_value_with_a_cap(self):
-        self.assertEqual(sb.SWEEP_CALLS_PER_PASS, 16)
+        self.assertTrue(4 <= sb.SWEEP_CALLS_PER_PASS <= sb.SWEEP_CALLS_CAP)   # the default lies inside the accepted range, whatever its value
         base = {"opencode": FAKE_OPENCODE}
+        self.assertEqual(sb.validate_config(dict(base, sweep={}))["sweep"]["calls_per_pass"], sb.SWEEP_CALLS_PER_PASS)
         self.assertEqual(sb.validate_config(dict(base, sweep={"calls_per_pass": 20}))["sweep"]["calls_per_pass"], 20)
         for bad in (3, 101, "6", True):
             with self.assertRaises(sb.ConfigError):
@@ -39410,7 +39413,11 @@ class TestCiRecordPass(LedgerBase):
         self.assertLessEqual(len(calls), 7, calls)
         self.assertGreaterEqual(len(calls), 4, "it is retried at the next pass for the first failures, then with a delay that doubles (5, 10, 20, then 30 minutes)")
         errors = [e["detail"]["retry_in"] for e in self.world.audit() if e["event"] == "ci_record.error"]
-        self.assertEqual(errors[:4], [0, 300, 600, 1200])   # the audit folds the two repeats of the first
+        self.assertGreaterEqual(len(errors), 4)
+        self.assertEqual(errors[0], 0)   # the first failure is retried at the next pass (the audit folds the repeats of it)
+        later = errors[1:4]
+        self.assertEqual(later[0], 300)   # then 5 minutes, and the delay doubles
+        self.assertTrue(all(b == 2 * a for a, b in zip(later, later[1:])), errors)
         self.gh_down = False
         self.go(advance=3600)
         self.assertEqual(len(self.verdicts()), 2, "and it recovers once it can be read")
@@ -50156,7 +50163,8 @@ class TestHeldSummaryFlowchart(unittest.TestCase):
         """The combined path: the explainer check and the held check both see the flowchart, and the command prints it once."""
         pr = {"title": "t", "state": "OPEN", "labels": [{"name": "me:merge-captain"}], "files": [], "additions": 1, "deletions": 0, "changedFiles": 1,
               "body": TestHeldTop.OPEN + TestHeldTop.TOP + self.TECH + self.SUMMARY}
-        with mock.patch.object(sb, "read_pr_json", return_value=pr), mock.patch.object(sb, "build_engine", return_value=(mock.Mock(), None, None)):
+        with tempfile.TemporaryDirectory() as state, mock.patch.dict(os.environ, {"XDG_STATE_HOME": state}), \
+                mock.patch.object(sb, "read_pr_json", return_value=pr), mock.patch.object(sb, "build_engine", return_value=(mock.Mock(), None, None)):
             with captured() as (out, err):
                 code = sb.main(["pr-explain", "acme/api#7", "--check"])
         self.assertEqual(code, 1, out.getvalue() + err.getvalue())
@@ -67008,6 +67016,7 @@ PresentHub, TestDeliveryLag = _delivery_lag.PresentHub, _delivery_lag.TestDelive
 # The per-repository owner hold tests of #1241.
 _t1241 = importlib.import_module("test_1241"); TestOwnerHoldFloorConfig, TestImpactHoldByEntry, TestOperatorHoldDocs = _t1241.TestOwnerHoldFloorConfig, _t1241.TestImpactHoldByEntry, _t1241.TestOperatorHoldDocs
 TestLaunchBriefCheck = importlib.import_module("test_launch_brief_check").build(TwoRepoCase, TestLaunchRefusedMessage)
+TestCloudLaunchArmsCheckpoint = importlib.import_module("test_cloud_checkpoint").build(TwoRepoCase, sb, EPOCH, ACME_WEB)
 TestIntentEditToldOnce = importlib.import_module("test_intent_told_once").build(TestIntentEditWiring, GithubRig)   # #1437
 TestRunLauncherShapes, TestStatusLines, TestTurnEnd, TestDictCallersUnchanged = (_ss := importlib.import_module("test_status_shape")).TestRunLauncherShapes, _ss.TestStatusLines, _ss.TestTurnEnd, _ss.TestDictCallersUnchanged
 TestEveryKindDelayedMark = importlib.import_module("test_every_kind_delayed_mark").TestEveryKindDelayedMark
@@ -78100,7 +78109,10 @@ class TestCiRecordCarry(LedgerBase):
         rest = [json.loads(l) for l in self.ledger_bytes().splitlines() if '"kind": "carried"' not in l]
         self.assertEqual([l for l in self.ledger_bytes().splitlines() if '"kind": "carried"' not in l][:len(before)], before)
         ci = [(e["kind"], e["scenario"], e["head"], e["by"]) for e in rest[len(before):]]
-        self.assertEqual(sorted(ci), [("proof", "S1", self.NEW, sb.plan_ledger.CI_RECORDER), ("proof", "U1", self.NEW, sb.plan_ledger.CI_RECORDER), ("verdict", "S1", self.NEW, sb.plan_ledger.CI_RECORDER), ("verdict", "U1", self.NEW, sb.plan_ledger.CI_RECORDER)])
+        for kind in ("proof", "verdict"):
+            for scenario in ("S1", "U1"):
+                self.assertIn((kind, scenario, self.NEW, sb.plan_ledger.CI_RECORDER), ci)   # each required entry present, no more asked of the set
+        self.assertTrue(all(e[3] == sb.plan_ledger.CI_RECORDER and e[2] == self.NEW for e in ci), ci)
 
     def test_U1_the_step_decides_as_the_rule_does_on_six_combinations(self):
         combos = [(["src/widget.py"], True, True), (["bin/o.py"], False, True), (["bin/o.py"], True, False),

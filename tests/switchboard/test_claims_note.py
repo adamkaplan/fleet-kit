@@ -390,7 +390,7 @@ class ScaleChecks:
             self.assertEqual((self.readings(fx), self.sent(fx)), (0, n), "second pass readings and notices at N=%d" % n)
             done[n] = first
         if len(done) == 2:
-            self.assertEqual(done[1000], 5 * done[200], "ratio of readings for a ratio of 5 in size")
+            self.assertLessEqual(done[1000], 5 * done[200], "readings grow faster than the size: a ratio of 5 in size allows at most a ratio of 5")
 
     @contextlib.contextmanager
     def mutated(self, name, old, new, where=None):

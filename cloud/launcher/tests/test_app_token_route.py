@@ -354,7 +354,13 @@ class Route(unittest.TestCase):
                         found.add(name)
             except OSError:
                 pass
-        self.assertEqual((sorted(found - set(self.CALLERS)), sorted(set(self.CALLERS) - found)), ([], []))
+        # the property: no file that names the mint runs it and reads its stdout. The table documents the known callers and may grow; a file
+        # it does not list is judged by its text: a line that runs app_token.py must name a route (--fd or --out), never capture stdout.
+        for name in sorted(found - set(self.CALLERS)):
+            with open(os.path.join(ROOT, name), errors="replace") as f:
+                for line in f:
+                    if "app_token.py" in line and re.search(r"subprocess|check_output|capture_output|\$\(|`|Popen", line):
+                        self.assertTrue("--fd" in line or "--out" in line, "%s runs the mint without a route: %s" % (name, line.strip()))
         self.assertFalse([f for f, route in self.CALLERS.items() if "stdout" in route.replace("an override prints on stdout", "")])
 
     def read_doc(self, name):

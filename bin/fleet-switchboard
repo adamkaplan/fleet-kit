@@ -8527,9 +8527,15 @@ def push_watch_tick(engine, discovery):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     ns = types.SimpleNamespace(parse_iso=parse_iso, _one_line=_one_line, parse_bounded=load_module("record_json").parse_bounded)
+    state_dir = getattr(engine, "state_dir", None)
+    if state_dir is not None:   # #2186: only a record the one liveness test accepts is read (as pod_silence_tick reads it)
+        retired, reports = registry_retired(state_dir), _read_small(state_dir, LAST_REPORT_FILE)
+        ns.record_live = lambda rec, name, at: cloud_record_live(rec, name, retired, reports, at)
     hub = getattr(engine, "hub", None)   # the GitHub reader is the hub (Switchboard has no gh_api); with none, skip the pass
     if hub is None:
-        engine.audit.append(engine.actor, "push_watch.skipped", None, "no GitHub hub")
+        if not getattr(engine, "_push_watch_skip_told", False):   # once per engine, not every idle pass: a line per pass grows the audit and every reader of it rewrites its offsets (TestWriteOnlyOnChange)
+            engine._push_watch_skip_told = True
+            engine.audit.append(engine.actor, "push_watch.skipped", None, "no GitHub hub")
         return []
     return module.run_pass(ns, engine, engine.now(), lambda path: hub.gh_api(path, paginate=False), (getattr(engine, "config", None) or {}).get("push_watch"))
 
@@ -12384,7 +12390,8 @@ def _cmd_launch(args, runner, now, socket_call=None):
             sys.stderr.write(problem + "\n")
             return EXIT_USAGE
     if getattr(args, "cloud", False):   # a worker in the cloud (#371): its own module; nothing below runs
-        return run_cloud("cmd_launch", args, runner, now)
+        code = run_cloud("cmd_launch", args, runner, now)
+        return arm_cloud_checkpoints(args, runner, now) if code == EXIT_OK else code   # #1790
     refuse_cloud_name(args.name)   # a name that has a cloud record is not launched locally (#640)
     engine, state, _ = build_engine(runner, now, "cli", socket_call=socket_call)
     choice = launch_model_choice(args, engine)   # #1642: before any session or pane
@@ -21482,7 +21489,7 @@ def build_parser():
     notice.add_argument("--from", dest="sender", help="Lab only: the sender's fleet name")
     sub.add_parser("ensure", help="Start the daemon unless it runs (herdr's startup hook calls this)")
     sub.add_parser("poke", help="Ask the daemon for a pass now; silent, never blocks (herdr's event hooks call this)")
-    launch = sub.add_parser("launch", help="Start a fleet agent (headless by default, or in a new herdr tab with --terminal), without typing", description="Start a fleet agent (headless by default, or in a new herdr tab with --terminal), without typing. A NEW launch (not a resume or --cloud) first runs the memory test: this is the lanes' safety check, not the owner's rule (there are no caps on coders), and `--memory-ok <reason>` overrides it. A refusal exits 5.")
+    launch = sub.add_parser("launch", help="Start a fleet agent (headless by default, or in a new herdr tab with --terminal), without typing", description="Start a fleet agent (headless by default, or in a new herdr tab with --terminal), without typing. A NEW launch (not a resume or --cloud) first runs the memory test: this is the lanes' safety check, not the owner's rule (there are no caps on coders), and `--memory-ok <reason>` overrides it. A refusal exits 5. A cloud launch arms a checkpoint reminder and an overdue wake; with no CHECKPOINT line and no --checkpoint/--overdue it arms the default 25m/40m.")
     launch.epilog = "A cloud worker kept by retire (its end hook could not push): send the pod one message to commit its tree on a NEW branch and push it there plainly, read the branch from origin, then retire normally."
     launch.add_argument("name", help="The agent's fleet name (lower case, digits, - and _)")
     launch.add_argument("--agent", help="The OpenCode agent definition, such as coder")
@@ -21523,6 +21530,7 @@ def build_parser():
     launch.add_argument("--hard", help="With --cloud: stop after this long whatever it does (default 2h)")
     launch.add_argument("--shape", help="With --cloud: the pod shape, XS (1 CPU, 2 GiB; the launcher's default, no nested Docker), S (2 CPU, 4 GiB; the default with --stack), M (4 CPU, 8 GiB) or O (250m CPU, 768 MiB; the default of --agent orchestrator)")
     launch.add_argument("--stack", action="store_true", help="With --cloud: a pod that can run a nested Docker stack (the Sysbox runtime class, its own user namespace, no capability added, no privileged mode). Off by default; the launch without it is unchanged. The first pod on a fresh node may wait for the node's runtime: the launcher retries")
+    launch.add_argument("--no-commit", action="store_true", help="With --cloud: this pod is launched NOT to commit (a measure or a read): the launcher never tells it to push its work. Implied by --role tester and --role reviewer.")
     launch.add_argument("--persistent", action="store_true", help="With --cloud and --agent orchestrator: an always-on orchestrator (one StatefulSet, restart always, no hard or idle limit; only an explicit stop ends it, and its cost is unbounded in time). Refused for a worker or a --stack launch")
     pending = sub.add_parser("pending", help="What is pending for an agent, and why it waits or is held")
     pending.add_argument("name", help="The agent's fleet name")

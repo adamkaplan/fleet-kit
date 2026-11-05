@@ -1171,6 +1171,21 @@ def _preflight_env(env, home):
     return clean
 
 
+def _preflight_not_run(repo, exc):
+    """The refusal text when the preflight did not run: on its time limit, the last `step:` line the child printed (subprocess.run keeps the partial
+    stderr on the TimeoutExpired it re-raises) and the seconds waited; every other cause keeps the old text."""
+    if not isinstance(exc, subprocess.TimeoutExpired):
+        return "refused: the repository preflight for %s could not be run; nothing was created" % scrub(repo, (), 120)
+    err = exc.stderr
+    err = err.decode("utf-8", "replace") if isinstance(err, bytes) else (err or "")
+    steps = [x.strip()[len("step: "):] for x in err.splitlines() if x.startswith("step: ")]
+    step = steps[-1] if steps and steps[-1] in ("token mint", "repository read") else "its start"
+    text = "refused: the repository preflight for %s timed out after %s s at %s; nothing was created" % (scrub(repo, (), 120), PREFLIGHT_SECONDS, step)
+    if step == "token mint":
+        text = text.replace("; nothing was created", "; the key vault is unreachable from this host; nothing was created")
+    return text
+
+
 def check_repo_preflight(repo, env):
     """The one preflight call (the operator driver and `launch --cloud` both call it), run AFTER the allow-list and BEFORE any token is minted.
     Returns the preflight's one result line. Raises CloudError(EXIT_USAGE) (fail closed) unless the program ran, exited 0 and printed something:
@@ -1180,7 +1195,7 @@ def check_repo_preflight(repo, env):
         with tempfile.TemporaryDirectory(prefix="cw-preflight-") as home:   # 0700, empty, removed when the child ends (also on failure)
             p = subprocess.run(argv, capture_output=True, text=True, timeout=PREFLIGHT_SECONDS, stdin=subprocess.DEVNULL, env=_preflight_env(env, home), cwd=home)
     except (OSError, subprocess.TimeoutExpired, ValueError):
-        raise CloudError("refused: the repository preflight for %s could not be run; nothing was created" % scrub(repo, (), 120), EXIT_USAGE) from None
+        raise CloudError(_preflight_not_run(repo, sys.exc_info()[1]), EXIT_USAGE) from None
     for x in (p.stderr or "").splitlines():   # only the child's own retry lines (already scrubbed texts), once each, in order
         if x.startswith("mint try "):
             print(scrub(x.strip(), (), 300), file=sys.stderr)
@@ -2176,6 +2191,63 @@ def scan_credentials(spec):
 REGISTRY_KEYS = ("secrets.json", "agents.json")
 
 
+class KnownForms(set):
+    """The forms of the known secrets, each with the lifetimes that hold it; a form with no lifetime never leaves."""
+
+    def __init__(self, mirror=None):
+        super().__init__()
+        self._mirror = mirror   # a KnownSet (or set) kept equal to the live forms
+        self._lock = threading.RLock()
+        self._lives = {}
+        self._absent = set()
+
+    def __iter__(self):
+        with self._lock:
+            return iter(sorted(set.__iter__(self), key=lambda v: (-len(v), v)))   # the order of scrub
+
+    def add_forms(self, forms, life=None):
+        with self._lock:
+            for f in forms:
+                set.add(self, f)
+                if self._mirror is not None:
+                    self._mirror.add(f)
+                if life is None:
+                    self._lives[f] = None
+                elif self._lives.get(f, 0) is not None:
+                    self._lives.setdefault(f, set()).add(life)
+
+    def sweep(self, now, pods):
+        """Drop each form whose every holder has left: ("pod", name) when the pod is not in pods; ("until", t, name) when now >= t and the pod is not in pods; a holder is released only when its pod was also absent from the previous sweep (two in a row). pods=None or an empty list drops nothing and clears that memory. Returns the count dropped."""
+        if not pods:
+            with self._lock:
+                self._absent = set()
+            return 0
+        pods = set(pods)
+        gone = 0
+        with self._lock:
+            before, absent = self._absent, set()
+            for f, lives in list(self._lives.items()):
+                if lives is None:
+                    continue
+                for l in lives:
+                    n = l[1] if l[0] == "pod" else l[2]
+                    if n not in pods:
+                        absent.add(n)
+                lives -= {l for l in lives if ((l[0] == "pod" and l[1] not in pods) or (l[0] == "until" and now >= l[1] and l[2] not in pods)) and (l[1] if l[0] == "pod" else l[2]) in before}
+                if not lives:
+                    del self._lives[f]
+                    set.discard(self, f)
+                    if self._mirror is not None:
+                        self._mirror.discard(f)
+                    gone += 1
+            self._absent = absent
+        return gone
+
+
+def secret_life_until(seconds=3660, pod=None):
+    return ("until", time.time() + seconds, pod)
+
+
 def _not_found_exactly(stderr, what):
     """True only when the whole message (one trailing newline trimmed) is the client's not-found text for the ONE object asked for (kind and exact name)."""
     text = stderr[:-1] if stderr.endswith("\n") else stderr
@@ -2193,6 +2265,7 @@ class Kube:
         self.kubeconfig = (env.get("CW_KUBECONFIG") or "").strip()
         self.dir = None
         self.known = KnownSet()  # values of this run's secrets, known to scrub(); never logged
+        self.registry = KnownForms(mirror=self.known)  # the lives of the forms; keeps `known` equal to the live forms (ask #1783)
         if token_mode(env):
             self._generate_kubeconfig(env)
 
@@ -2206,7 +2279,7 @@ class Kube:
             with open(token_file) as f:
                 body = f.read(65536)
             usable = bool(body.strip())
-            self.add_secrets(body.strip())
+            self.add_secrets(body.strip(), life=secret_life_until())
         except OSError:
             usable = False
         if not usable:
@@ -2233,10 +2306,16 @@ class Kube:
     def scrub(self, text, limit=300):
         return scrub(text, self.known, limit)
 
-    def add_secrets(self, *values):
+    def add_secrets(self, *values, life=None):
         for v in values:
             if v:
-                self.known.update(secret_forms(v))
+                reg = getattr(self, "registry", None)
+                if reg is None:
+                    reg = self.known
+                if hasattr(reg, "add_forms"):
+                    reg.add_forms(secret_forms(v), life)
+                else:   # a plain KnownSet / set put in place of the registry: no lives, the forms stay
+                    reg.update(secret_forms(v))
 
     def delete_command(self, kind, name):
         """The exact command that removes one object by hand: the configured login flags, never a value."""
@@ -2708,6 +2787,7 @@ def render_pod(a, worker, name, now, hard, env, run_names=()):
                         "cw/idle-seconds": e["CW_IDLE_SECONDS"], "cw/shape": a.shape,
                         "cw/max-hard": iso(now + dt.timedelta(seconds=parse_duration(a.max_hard or DEFAULT_MAX_HARD))),
                         **({"cw/run-id": a.run_id} if getattr(a, "run_id", None) else {}),
+                        **({"cw/no-commit": "true"} if getattr(a, "no_commit", False) else {}),   # launched NOT to commit (a measure or a read): no wip note
                         **({"cw/role": agent} if agent == "orchestrator" else {})}},   # a worker pod's spec is byte-for-byte what it was: no annotation means worker
         "spec": {"restartPolicy": "Never", "activeDeadlineSeconds": pod_deadline_floor(a.max_hard),
                  "terminationGracePeriodSeconds": POD_TERMINATION_GRACE_SECONDS,
@@ -4063,6 +4143,19 @@ class Launcher:
         finally:
             steps["list"] = mono() - t0
         t0 = mono()
+        _sw = getattr(self.kube.registry if getattr(self.kube, "registry", None) is not None else getattr(self.kube, "known", None), "sweep", None)
+        if _sw:
+            try:
+                if not pods:   # an empty or unreadable list cannot be told from a truncated read: drop nothing
+                    self.audit("", "", "known-forms.sweep-skipped", 0, True, "empty pod list")
+                    _sw(time.time(), None)   # a skipped pass clears the memory of absent pods (two non-empty lists in a row are needed)
+                else:
+                    _sw(time.time(), {(p.get("metadata") or {}).get("name") for p in pods})   # forms whose every holder has left are dropped (ask #1783)
+            except Exception as e:   # the sweep never raises into the pass; the class name only, never a value
+                try:
+                    self.audit("", "", "known-forms.sweep-failed", 0, False, type(e).__name__)
+                except Exception:
+                    pass
         # The renewal is the FIRST step: a slow activity read or stop below can no longer hold it back (the audit of 29 October).
         try:
             renewed = self.renew_git_tokens(self._before_hard_limit(pods, now), now)
@@ -4327,8 +4420,14 @@ class Launcher:
                 worker, name = ann(pod, "worker"), pod["metadata"]["name"]
                 if (pod.get("status") or {}).get("phase") != "Running" or not NAME_RE.fullmatch(worker or ""):
                     continue
+                no_commit_mark = ann(pod, "no-commit")
+                if no_commit_mark == "true":
+                    continue   # launched not to commit: no note, no annotation, no audit line
+                no_commit_unreadable = no_commit_mark is not None   # present but not the text true: treated as unmarked
                 if not wip_note_due(parse_iso(ann(pod, "started")), now, ann(pod, "wip-note")):
                     continue
+                if no_commit_unreadable:   # the note below sets the wip-note annotation, so this line is written once
+                    self.audit(worker, "pod/" + name, "no-commit-unreadable", 0.0, True, "the cw/no-commit annotation is not the text true; the pod is treated as unmarked")
                 self.kube.annotate(name, (pod.get("metadata") or {}).get("uid"), **{WIP_NOTE_MARK: "sent"})
                 self.send_note(name, wip_note(worker))
                 self.audit(worker, "pod/" + name, "wip-note", self._cost_or_zero(pod), True, "")
@@ -4525,7 +4624,8 @@ class Launcher:
             age = None   # a stamp from the future (a clock step, or an edited annotation) is not trusted either
         if not force and age is not None and age < GIT_TOKEN_RENEW_AFTER_SECONDS:
             return False
-        self.kube.add_secrets(*[self._b64_text(v) for v in (secret.get("data") or {}).values() if isinstance(v, str)])   # every value of the Secret is known to the scrubber before anything can echo it
+        self.kube.add_secrets(*[self._b64_text(v) for k, v in (secret.get("data") or {}).items() if isinstance(v, str) and k != "model-auth"], life=("pod", (pod.get("metadata") or {}).get("name")))   # every value of the Secret is known to the scrubber before anything can echo it
+        self.kube.add_secrets(*[self._b64_text(v) for k, v in (secret.get("data") or {}).items() if isinstance(v, str) and k == "model-auth"])   # the model entry never leaves (open choice b)
         repo = _pod_repo(pod)
         if _repo_key(repo) is None or _repo_key(repo) != _repo_key(self._worker_record_repo(worker)):
             raise _NotRenewed("repository mismatch: the worker record and the pod name different repositories")
@@ -4537,10 +4637,10 @@ class Launcher:
             role = ann(pod, "role", "worker")   # the role the pod was made under; a pod made before the annotation is a worker
             role = role if role in AGENTS else "worker"
             cmd = git_token_cmd(repo, self.env, role) if role != "worker" else git_token_cmd(repo, self.env)
-            token = run_git_token_cmd(cmd, repo, dict(os.environ, **self.env), register=self.kube.add_secrets)
+            token = run_git_token_cmd(cmd, repo, dict(os.environ, **self.env), register=lambda *v: self.kube.add_secrets(*v, life=secret_life_until(pod=(pod.get("metadata") or {}).get("name"))))
         except CloudError as e:
             raise _NotRenewed("the mint failed: %s" % e) from None
-        self.kube.add_secrets(token)
+        self.kube.add_secrets(token, life=secret_life_until(pod=(pod.get("metadata") or {}).get("name")))
         if re.search(r"\s", token):
             raise _NotRenewed("the mint gave a token with whitespace in it")
         self._require_same_scope(force, token, repo)
@@ -5073,6 +5173,7 @@ def build_parser():
                    help="a pod for a worker that runs a nested Docker stack: the Sysbox runtime class, its own user namespace, the pool's node label; off by default (the default pod is unchanged)")
     c.add_argument("--stack-model-secret", metavar="NAME", help="with --stack: the NAME of the vault secret whose value arrives as the run secret %s (audit: the name and 'delivered'); never a value" % STACK_MODEL_KEY)
     c.add_argument("--agent", help="worker (default) or orchestrator: the agent the pod runs (CW_AGENT); any other value is refused before anything is made")
+    c.add_argument("--no-commit", action="store_true", help="this pod is launched NOT to commit (a measure or a read): the launcher never tells it to push its work")
     c.add_argument("--boss", help="with --agent orchestrator: the name of its boss (FLEET_BOSS)")
     c.add_argument("--persistent", action="store_true",
                    help="with --agent orchestrator and the per-run git-token Secret: an always-on orchestrator as ONE StatefulSet (restart always, no deadline, no idle limit); ended only by an explicit stop; refused for a worker or a stack launch")
@@ -5226,7 +5327,7 @@ class RenewalTicker:
                 if refresh.state == "failed":   # one line per failure, not one per look
                     print("cloud-worker: the login refresh failed: %s" % scrub(getattr(refresh, "reason", ""), (), 200), file=sys.stderr)
                 if self.L.kube is not None and refresh.token:
-                    self.L.kube.add_secrets(refresh.token)
+                    self.L.kube.add_secrets(refresh.token, life=secret_life_until())
                 self.L.renew_git_tokens(self.L._before_hard_limit(self.L.kube.list_pods(), now), now)
         except Exception as e:   # the thread goes on: the next tick tries again
             print("cloud-worker: the renewal thread: %s" % scrub(e, (), 200), file=sys.stderr)
@@ -5300,7 +5401,7 @@ def _reap_main(env, a, sleep, clock=None, refresher=None, kube=None, ticker_wait
             for line in getattr(refresher, "notices", []):
                 print(line, file=sys.stderr)   # the stdout line of a pass is the JSON report; the notice names a setting, never a value
             if kube is not None and refresh.token:
-                kube.add_secrets(refresh.token)   # the new token is a secret from now on: the scrubber knows it
+                kube.add_secrets(refresh.token, life=secret_life_until())   # the new token is a secret from now on: the scrubber knows it
             note = "cluster token not refreshed: %s" % refresh.reason if refresh.state in ("failed", "waiting") else ""
             if kube is None:
                 try:
@@ -5313,7 +5414,7 @@ def _reap_main(env, a, sleep, clock=None, refresher=None, kube=None, ticker_wait
                 def relogin(refresher=refresher, L=L):
                     r = refresher.run(force=True)
                     if r.token:
-                        L.kube.add_secrets(r.token)
+                        L.kube.add_secrets(r.token, life=secret_life_until())
                     return r.state == "written"
                 L.relogin = relogin
                 ticker = RenewalTicker(L, refresher, clock, ticker_wait)

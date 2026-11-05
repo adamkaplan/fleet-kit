@@ -236,6 +236,7 @@ fleet-switchboard launch coder7 --cloud --stack --agent coder --repo acme-org/wi
 - With `--stack`, `--shape` is `S` (2 CPU, 4 GiB) or `M` (4 CPU, 8 GiB). Leave it out for `S` (4 GiB): the measured stack lane peaked at 0.8 to 1.35 GiB. The memory limit stays; the pod is never unlimited.
 - The first pod on a fresh node may wait for the node's runtime to be ready (a short delay, a few minutes at most); the launcher notices that case and creates the pod again after a pause of 15 seconds (`STACK_RACE_PAUSE_SECONDS`), for as long as a retry fits in a window of 600 seconds (`STACK_RACE_WINDOW_SECONDS`); a fresh node can take 3 to 5 minutes. If the window ends, the launcher says so once (the attempts and the seconds spent) and leaves no pod. You do not retry it.
 - `--stack` needs `--cloud`, and an unknown `--shape`, and `XS`, are refused with `--stack`. `--stack` without `--cloud` is refused first of all; an unknown shape is refused right after the allow-list check (step 1 of section 2). Both exit 2 before any token is minted or any cluster call is made, and the order of section 2 is unchanged. `--shape` without `--stack` is passed to the launcher as before.
+- `--no-commit` (with `--cloud`): the pod is launched NOT to commit (a measure or a read), and the launcher never sends it the minute-40 note that orders a push. `--role tester` and `--role reviewer` imply it.
 
 ## 4. What a worker can and cannot do
 
