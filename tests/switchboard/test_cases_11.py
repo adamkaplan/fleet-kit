@@ -23,6 +23,7 @@ import itertools
 import select
 import json
 import os
+import pwd
 from pathlib import Path
 import re
 from urllib.parse import unquote
@@ -47,7 +48,7 @@ import urllib.parse
 from unittest import mock
 from support.core import Base
 from support.fake_hubs import tri_issue
-from support.loader import SWITCHBOARD, SWITCHBOARD_SOURCE_FILES, _load, copy_entry, sb, switchboard_source
+from support.loader import SWITCHBOARD, SWITCHBOARD_SOURCE_FILES, _load, captured, copy_entry, sb, switchboard_source
 from support.paths import BIN, REPO
 from support.wire_fakes import EPOCH, fact
 
@@ -231,7 +232,7 @@ class TestAgentRegistryInventory(unittest.TestCase):
     interface spec has its sections and its freeze line."""
     DOC = REPO / "docs" / "agent-registry.md"
     RECORDS = {
-        "pane-health.json": r"pane-health\.json|PANE_HEALTH_FILE|PANE_FILE|read_pane_health|write_pane_health|pane_health_pass|pane_health_status",
+        "pane-health.json": r"pane-health\.json|pane-health registry|PANE_HEALTH_FILE|PANE_FILE|read_pane_health|write_pane_health|pane_health_pass|pane_health_status",
         "retired.json": r"retired\.json|RETIRED_FILE|read_retired|known_agent",
         "last-reports.json": r"last-reports\.json|LAST_REPORT_FILE|record_last_report",
         "boss-overrides.json": r"boss-overrides\.json|\.overlay\(",
@@ -612,15 +613,17 @@ class TestConfig(Base):
             "opencode": None, "opencode_env": {}, "opencode_executable": None, "launch_env": {},
             "herdr": "herdr", "batch_seconds": 90, "engaged_minutes": 10, "retire_idle_minutes": 10, "call_timeout_seconds": 20, "clear_remind_minutes": 15, "send_timeout_seconds": 60, "poll_seconds": 5,
             "herdr_log": "~/.config/herdr/herdr-server.log", "pane_exit_burst_seconds": 5, "pane_exit_burst_min": 3,  # #1030
-            "worker_lookback_hours": 24, "stalled_working_hours": 2, "review_window_minutes": 60, "send_to_working": "steer", "launch_default": "headless",
+            "worker_lookback_hours": 24, "stalled_working_hours": 2, "review_window_minutes": 60, "send_to_working": "steer", "steer_after_minutes": 0, "launch_default": "headless",
+            "unconsumed_steer_minutes": 20,
             "rider_max_age_seconds": 3600, "undelivered_wake_minutes": 15, "undelivered_wake_tell_minutes": None, "undelivered_wake_per_pass": 2, "report_triage": sb.REPORT_TRIAGE_DEFAULTS,  # PR 13
             "github_repos": [], "gh": sb.own_gh_path("gh"), "gh_by_name": "gh", "github_lookback_hours": 24, "github_port": None, "github_ignore_authors": [],   # #1216: the RESOLVED gh (a machine with a gh on PATH names it by path); `gh_by_name` is the gh as configured (PATH finds the shim), used by the one merge call of `merge-gate --pass --merge`
-            "owner_logins": [], "github_bot_logins": [], "v2_light": False, "v2_cache_seconds": 120, "v2_reads_per_pass": 8, "v2_reads_per_minute": 90, "v2_events": "auto", "v2_plugin_events": "auto", "v2_transport": "auto", "cpu_guard": None, "disk_guard": None, "reds": None, "heavy": None, "no_multiplexer": False, "docker_reaper": True,
+            "owner_logins": [], "github_stage_repos": [], "github_stage_bots": [], "github_bot_logins": [], "v2_light": False, "v2_cache_seconds": 120, "v2_reads_per_pass": 8, "v2_reads_per_minute": 90, "v2_events": "auto", "v2_plugin_events": "auto", "v2_transport": "auto", "cpu_guard": None, "disk_guard": None, "reds": None, "heavy": None, "no_multiplexer": False, "docker_reaper": True,
             "github_events": ["issues", "issue_comment", "sub_issues", "pull_request", "pull_request_review",
                               "check_suite", "workflow_run"],
             "awaiting_live_days": 14, "awaiting_label": None, "decisions_lookback_hours": 72,  # PR 14
             "awaiting_cos_label": None, "decisions_cos_grace_seconds": 300, "cos_orders_file": None,  # PR 18
             "pr_notice_hold_minutes": 0,  # PR notices
+            "reminder_bound_minutes": 10, "checkpoint_bound_minutes": 5,  # #1728: the bounds of a due reminder
             "intent_repo": None, "intent_required": True,
             "gh_users": {}, "github_poll_seconds": 60, "intent_live_silence_minutes": 10,  # PR 15
             "classifier_mode": "shadow", "busy_poll_seconds": 1,  # PR 8
@@ -708,6 +711,179 @@ class TestConfig(Base):
                     sb.load_config()
                 self.assertIn(needle, str(caught.exception))
 
+    def test_relay_holders_is_a_known_key_with_a_validated_shape(self):
+        """#1479. S1/S2/S6: a valid object (and {}) loads silently. S3/S4/S5: each bad shape is a ConfigError naming relay_holders. U1/U2: other loading unchanged."""
+        for good in ({"acme/app#12": "pod-a"}, {}):
+            with self.subTest(good=good):
+                sb._WARNED_CONFIG.clear()
+                err = io.StringIO()
+                self.write_config({"relay_holders": good})
+                with contextlib.redirect_stderr(err):
+                    config = sb.load_config()
+                self.assertNotIn("relay_holders", err.getvalue())
+                self.assertEqual(config["relay_holders"], good)
+        sb._WARNED_CONFIG.clear()
+        err = io.StringIO()
+        self.write_config({"no_such_key": 1})
+        with contextlib.redirect_stderr(err):
+            self.assertNotIn("relay_holders", sb.load_config())
+        self.assertEqual(err.getvalue().count("does not read: no_such_key"), 1)
+
+    def _refused(self, value, entry=None):
+        self.write_config({"relay_holders": value})
+        with self.assertRaises(sb.ConfigError) as caught:
+            sb.load_config()
+        self.assertIn("'relay_holders'", str(caught.exception))
+        if entry:
+            self.assertIn(entry, str(caught.exception))
+
+    def test_relay_holders_that_is_not_an_object_is_refused(self):   # S3
+        for value in ([1], "x", None):
+            with self.subTest(value=value):
+                self._refused(value)
+
+    def test_a_relay_holders_key_without_a_hash_is_refused(self):   # S4
+        self._refused({"acme/app": "pod-a"}, "'acme/app'")
+
+    def test_a_relay_holders_pod_that_is_empty_is_refused(self):   # S5
+        self._refused({"a/b#1": ""}, "'a/b#1'")
+
+    def test_a_relay_holders_pod_that_is_whitespace_is_refused(self):
+        self._refused({"a/b#1": "  "}, "'a/b#1'")
+
+    def test_a_relay_holders_pod_that_is_not_a_string_is_refused(self):
+        for value in (7, None, ["p"]):
+            with self.subTest(value=value):
+                self._refused({"a/b#1": value}, "'a/b#1'")
+
+    def test_a_relay_holders_value_of_null_is_refused(self):
+        self._refused(None)
+
+    def test_the_relay_holders_key_must_be_owner_repo_hash_digits(self):
+        for good in ("a/b#1", "acme-org/widget-service#7", "o/r.x#120"):
+            with self.subTest(good=good):
+                sb.validate_config({"relay_holders": {good: "p"}})
+        for bad in ("#", "a#", "#5", "a#x", "a#5", "/b#5", "a/#5", "a/b/c#5", "a/b#", "a/b#5x", "a/b#-1", "a/b#1\n"):
+            with self.subTest(bad=bad):
+                self._refused({bad: "p"}, repr(bad))
+
+    def test_a_bad_relay_holders_fails_the_cli_like_every_other_config_error(self):
+        """The CLI maps a ConfigError to exit 1 (EXIT_ERROR) for every key, so this one does the same."""
+        self.write_config({"relay_holders": ["acme/app#1"]})
+        with captured() as (out, err):
+            code = sb.main(["status"])
+        self.assertEqual(code, 1)
+        self.assertIn("relay_holders", out.getvalue() + err.getvalue())
+
+    def _relay_load(self, raw):
+        sb._WARNED_CONFIG.clear()
+        err = io.StringIO()
+        self.write_config(raw)
+        with contextlib.redirect_stderr(err):
+            config = sb.load_config()
+        return config, err.getvalue()
+
+    def test_a_config_without_relay_holders_loads_as_on_the_base_commit(self):
+        """U1: same dict (the defaults plus what the file sets, no relay_holders key added) and exactly the same warning as before the change."""
+        sb._WARNED_CONFIG.clear()
+        self.assertFalse(self.config_file.exists())
+        defaults = sb.load_config()
+        config, warned = self._relay_load({"batch_seconds": 5, "no_such_key": 1})
+        self.assertEqual(config, {**defaults, "batch_seconds": 5, "no_such_key": 1})
+        self.assertNotIn("relay_holders", config)
+        self.assertEqual(warned.count("warning:"), 1)
+        self.assertIn("does not read: no_such_key", warned)
+        self.assertNotIn("relay_holders", warned)
+
+    def _holder_mutants(self):
+        """Each mutant is the real check with ONE rule changed; the key is the test that must catch it."""
+        real = sb.validate_relay_holders
+
+        def with_default(config, source):
+            real(config, source)
+            config.setdefault("relay_holders", {})
+
+        def accepts_list(config, source):
+            if isinstance(config.get("relay_holders"), list):
+                return
+            real(config, source)
+
+        def accepts_key_without_hash(config, source):
+            raw = config.get("relay_holders")
+            if isinstance(raw, dict):
+                config["relay_holders"] = {(k if "#" in k else k + "#0"): v for k, v in raw.items()}
+            real(config, source)
+            if isinstance(raw, dict):
+                config["relay_holders"] = raw
+
+        def accepts_empty_pod(config, source):
+            raw = config.get("relay_holders")
+            if isinstance(raw, dict):
+                config["relay_holders"] = {k: (v if v != "" else "x") for k, v in raw.items()}
+            real(config, source)
+            if isinstance(raw, dict):
+                config["relay_holders"] = raw
+
+        def pod_mutant(replace):
+            def mutant(config, source):
+                raw = config.get("relay_holders")
+                if isinstance(raw, dict):
+                    config["relay_holders"] = {k: replace(v) for k, v in raw.items()}
+                real(config, source)
+                if isinstance(raw, dict):
+                    config["relay_holders"] = raw
+            return mutant
+
+        def accepts_null(config, source):
+            if "relay_holders" in config and config["relay_holders"] is None:
+                return
+            real(config, source)
+
+        return {"test_a_config_without_relay_holders_loads_as_on_the_base_commit": with_default,
+                "test_relay_holders_that_is_not_an_object_is_refused": accepts_list,
+                "test_a_relay_holders_key_without_a_hash_is_refused": accepts_key_without_hash,
+                "test_a_relay_holders_pod_that_is_empty_is_refused": accepts_empty_pod,
+                "test_a_relay_holders_pod_that_is_whitespace_is_refused": pod_mutant(lambda v: "x" if isinstance(v, str) and v and not v.strip() else v),
+                "test_a_relay_holders_pod_that_is_not_a_string_is_refused": pod_mutant(lambda v: "x" if not isinstance(v, str) else v),
+                "test_a_relay_holders_value_of_null_is_refused": accepts_null}
+
+    def test_each_relay_holders_check_has_a_mutant_its_own_test_catches(self):
+        """S7/U1: every mutant fails its named test, and the real build passes every one."""
+        real = sb.validate_relay_holders
+        for name, mutant in self._holder_mutants().items():
+            with self.subTest(mutant=name):
+                ok = unittest.TestResult()
+                type(self)(name).run(ok)
+                self.assertEqual(len(ok.failures) + len(ok.errors), 0, "the real build passes " + name)
+                sb.validate_relay_holders = mutant
+                try:
+                    bad = unittest.TestResult()
+                    type(self)(name).run(bad)
+                finally:
+                    sb.validate_relay_holders = real
+                self.assertGreaterEqual(len(bad.failures) + len(bad.errors), 1, "the mutant survives " + name)
+        sb.validate_relay_holders = lambda config, source: None   # the whole validation removed: the bad-shape tests all fail
+        try:
+            res = unittest.TestResult()
+            for name in list(self._holder_mutants())[1:]:
+                type(self)(name).run(res)
+        finally:
+            sb.validate_relay_holders = real
+        self.assertGreaterEqual(len(res.failures), 3)
+
+    def test_the_relay_daemons_holder_of_reads_the_validated_shape_unchanged(self):
+        """U6/PC-3: a config with relay_holders, validated by this change, gives the relay daemon's holder_of the same pod for the fixed key, and a key
+        the config does not name stays None (fail closed). That the daemon file has 0 changed lines in this diff is checked by the diff itself."""
+        loader = importlib.machinery.SourceFileLoader("cloud_relay_daemon_u6", str(BIN / "cloud_relay_daemon.py"))
+        relay = importlib.util.module_from_spec(importlib.util.spec_from_loader("cloud_relay_daemon_u6", loader))
+        loader.exec_module(relay)
+        holders = {"acme-org/widget-service#7": "widget-pod"}
+        config = sb.validate_config({"relay_holders": dict(holders)})
+        backend = relay.SwitchboardBackend(None, (None, None, config), None, None)
+        self.assertEqual(backend.holder_of("acme-org/widget-service", 7), "widget-pod")
+        self.assertIsNone(backend.holder_of("acme-org/widget-service", 8))
+        self.assertIsNone(relay.SwitchboardBackend(None, (None, None, sb.validate_config({})), None, None).holder_of("acme-org/widget-service", 7))
+
     def test_malformed_files_are_refused(self):
         for text, needle in (("{not json", "not valid JSON"), ("[1, 2]", "JSON object"), ('"x"', "JSON object")):
             with self.subTest(text=text):
@@ -733,8 +909,13 @@ class TestAssembler(unittest.TestCase):
         lines = [n.strip() for n in (BIN / "fleet-switchboard.parts").read_text().splitlines() if n.strip() and not n.startswith("#")]
         self.assertEqual(lines[0], "fleet-switchboard")
 
+    @staticmethod
+    def _shipped_parts():
+        """The parts the shipped manifest lists after the entry, from the one list (a part added to the manifest needs no edit here)."""
+        return [n.strip() for n in (BIN / "fleet-switchboard.parts").read_text().splitlines() if n.strip() and not n.startswith("#") and n.strip() != "fleet-switchboard"]
+
     def test_a_second_part_puts_its_names_into_sb_in_the_order_given(self):
-        root = self._copy(["part_a.py", "fleet-switchboard", "switchboard/v2_transport.py", "switchboard/facts.py", "switchboard/judge_request.py", "switchboard/judge.py", "switchboard/import_v1.py", "switchboard/handoff.py", "part_b.py"])
+        root = self._copy(["part_a.py", "fleet-switchboard"] + self._shipped_parts() + ["part_b.py"])
         (root / "part_a.py").write_text('ORDER = ["a"]\nA_SAW_MAIN = "main" in globals()\nA_FILE = __file__\n')
         (root / "part_b.py").write_text('ORDER.append("b")\nB_SAW_MAIN = "main" in globals()\n')
         module = _load("t_assembled", root / "fleet-switchboard")
@@ -783,7 +964,7 @@ class TestAssembler(unittest.TestCase):
         self.assertTrue(_load("t_unnamed_entry", root / "entry").ENTRY_SAW_A)
 
     def test_comments_and_blank_lines_in_a_manifest_are_ignored(self):
-        root = self._copy(["# the parts", "", "part_a.py", "  ", "fleet-switchboard", "switchboard/v2_transport.py", "switchboard/facts.py", "switchboard/judge_request.py", "switchboard/judge.py", "switchboard/import_v1.py", "switchboard/handoff.py"])
+        root = self._copy(["# the parts", "", "part_a.py", "  ", "fleet-switchboard"] + self._shipped_parts())
         (root / "part_a.py").write_text("FROM_A = 1\n")
         self.assertEqual(_load("t_commented", root / "fleet-switchboard").FROM_A, 1)
 
@@ -966,6 +1147,70 @@ class TestBigRegistrarFile(unittest.TestCase):
 
 
 class TestStateDir(Base):
+    def real_home(self):
+        """A pretend real account: the guard's real locations come from here, so no real directory is touched."""
+        real = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(real), True)
+        patcher = mock.patch.object(sb, "_real_locations", lambda: ({os.path.realpath(str(real / sb.PROG))}, {os.path.realpath(str(real / "config"))},
+                                                                      {os.path.realpath(str(real / sb.PROG / "audit.jsonl"))}))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return real
+
+    def test_the_real_state_directory_is_refused_for_none_and_for_the_real_path_and_creates_nothing(self):
+        real = self.real_home()
+        os.environ["XDG_STATE_HOME"] = str(real)   # so that the default state directory resolves to the pretend real one
+        for argument in (None, real / sb.PROG):
+            with self.subTest(argument=argument):
+                with self.assertRaises(sb.RealStateRefused):
+                    sb.ensure_state_dir(argument)
+        self.assertEqual(list(real.iterdir()), [])
+
+    def test_the_real_config_directory_and_audit_path_and_a_symlink_to_the_state_are_refused(self):
+        real = self.real_home()
+        (real / sb.PROG).mkdir()
+        link = real / "link"
+        link.symlink_to(real / sb.PROG)
+        for path, kind in ((real / "config", "config"), (real / sb.PROG / "audit.jsonl", "audit"), (link, "state")):
+            with self.subTest(kind=kind):
+                with self.assertRaises(sb.RealStateRefused):
+                    sb.refuse_real_location(path, kind)
+
+    def child_state(self, home, extra=None):
+        """A real child process, marker inherited, HOME and XDG_* at `home`: what its state_dir_path() says, or the refusal."""
+        code = ("import importlib.machinery, importlib.util, sys\n"
+                "l = importlib.machinery.SourceFileLoader('sbx', %r)\n"
+                "s = importlib.util.spec_from_loader('sbx', l); m = importlib.util.module_from_spec(s); l.exec_module(m)\n"
+                "try:\n    print(m.state_dir_path())\nexcept m.RealStateRefused as e:\n    print('REFUSED')\n" % str(SWITCHBOARD))
+        env = {k: v for k, v in os.environ.items() if not k.startswith("HERDR_")}
+        env.update({"HOME": str(home), "XDG_STATE_HOME": str(home / "xdg-state"), "XDG_CONFIG_HOME": str(home / "xdg-config"), **(extra or {})})
+        return subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=120).stdout.strip()
+
+    def test_a_real_child_with_a_temporary_home_runs_and_one_pointed_at_the_real_directory_is_refused(self):
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(tmp), True)
+        self.assertEqual(self.child_state(tmp), str(tmp / "xdg-state" / sb.PROG))
+        real = Path(json.loads(os.environ[sb.REAL_LOCATIONS_ENV])["state"][0])
+        child_home = tmp / "h"
+        self.assertEqual(self.child_state(child_home, {"XDG_STATE_HOME": str(real.parent)}), "REFUSED")
+
+    def test_mutant_without_the_passed_locations_a_child_with_a_temporary_home_is_still_fine_and_the_account_home_refused(self):
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(tmp), True)
+        gone = {k: v for k, v in os.environ.items() if k != sb.REAL_LOCATIONS_ENV}
+        with mock.patch.dict(os.environ, gone, clear=True):
+            self.assertEqual(self.child_state(tmp), str(tmp / "xdg-state" / sb.PROG))
+            self.assertEqual(self.child_state(tmp, {"XDG_STATE_HOME": str(Path(pwd.getpwuid(os.getuid()).pw_dir) / ".local/state")}), "REFUSED")
+
+    def test_without_the_marker_nothing_is_refused_and_a_temporary_path_is_fine(self):
+        real = self.real_home()
+        with mock.patch.dict(os.environ):
+            os.environ.pop(sb.UNDER_TEST_ENV)
+            self.assertEqual(sb.refuse_real_location(real / sb.PROG, "state"), real / sb.PROG)
+        other = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(other), True)
+        self.assertEqual(sb.refuse_real_location(other / "x", "state"), other / "x")
+
     def test_created_private_under_xdg_state_home_whatever_the_umask(self):
         # 0o277 strips owner bits from mkdir's mode, so only an explicit chmod
         # yields exactly 0700; 0 would let a looser mode through if one were asked for.
@@ -1182,6 +1427,8 @@ class TestBuilderChecklist(unittest.TestCase):
     RULES = {
         "b": "(opens without blocking, refuses links, accepts only regular files, bounds the count, the size and the time)",
         "i": "and keep new strings and comments clear of the added-lines scans",
+        "cloud": "never runs the whole bin/test-switchboard",
+        "control": "counts as caught only with a passing control",
         "e": "the pod's git token expires after about an hour and a late open fails",
     }
     BRIEF = "Every builder brief carries the builder checklist below by default; a brief that leaves an item out says why in one line."
@@ -1219,6 +1466,75 @@ class TestBuilderChecklist(unittest.TestCase):
         found = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "read_record_file"]
         self.assertEqual(len(found), 1)
         self.assertEqual([a.arg for a in found[0].args.args], ["path", "max_bytes"])
+
+
+class TestMutantControlRule(unittest.TestCase):
+    """#1700: a mutant counts as caught only with a passing control and an anchored failure text; the sentence is in 8 homes."""
+    SENTENCE = ("A mutant counts as caught only with a passing control (the same command on the unmutated copy exits 0) and an anchored "
+                "failure text (the mutated check is named in the failure); a harness that counts any non-zero exit as a catch proves nothing.")
+
+    NAMES = ["reviewer-architecture", "reviewer-code", "reviewer-impact", "reviewer-security", "reviewer-test"]
+
+    def homes(self, root):
+        defs = sorted(p.relative_to(root).as_posix() for p in (root / "agents" / "reviewers").glob("*.md"))
+        return defs + ["skills/fleet-review/SKILL.md", "docs/review-laws/structural-rule.md", "skills/fleet-coordination/SKILL.md"]
+
+    def problems(self, root):
+        found = []
+        for h in self.homes(root):
+            text = (root / h).read_text()
+            body = text
+            if h.startswith("agents/"):
+                parts = text.split("---", 2)
+                body = parts[2]
+                if " ".join(parts[1].split()).count(self.SENTENCE):
+                    found.append(h)
+            if " ".join(body.split()).count(self.SENTENCE) != 1 and h not in found:
+                found.append(h)
+        return found
+
+    def copy(self, tmp):
+        import shutil
+        for d in ("agents/reviewers", "skills/fleet-review", "skills/fleet-coordination", "docs/review-laws"):
+            shutil.copytree(REPO / d, Path(tmp) / d)
+        return Path(tmp)
+
+    def test_every_home_holds_the_sentence_once_in_the_body(self):
+        homes = self.homes(REPO)
+        self.assertEqual(self.problems(REPO), [])
+        print("homes %d of %d" % (len(homes) - len(self.problems(REPO)), len(homes)))
+        self.assertGreaterEqual(len(homes), 8)
+        named = ["agents/reviewers/%s.md" % n for n in self.NAMES] + ["docs/review-laws/structural-rule.md", "skills/fleet-review/SKILL.md", "skills/fleet-coordination/SKILL.md"]
+        for h in named:
+            self.assertIn(h, homes, "home missing from the derived set: " + h)
+
+    def test_a_mutant_removing_it_from_one_home_names_that_file(self):
+        import tempfile
+        n = 0
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.copy(tmp)
+            self.assertEqual(self.problems(root), [], "control: the unmutated copy must have no problem")
+            for h in self.homes(root):
+                f = root / h
+                orig = f.read_text()
+                f.write_text(" ".join(orig.split()).replace(self.SENTENCE, ""))
+                self.assertEqual(self.problems(root), [h])
+                n += 1
+                f.write_text(orig)
+        print("mutants %d of %d" % (n, len(self.homes(REPO))))
+        self.assertEqual(n, len(self.homes(REPO)), "mutants caught must equal the homes")
+
+    def test_a_new_definition_without_the_sentence_fails(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.copy(tmp)
+            (root / "agents/reviewers/reviewer-new.md").write_text("---\nname: x\n---\nbody\n")
+            self.assertEqual(self.problems(root), ["agents/reviewers/reviewer-new.md"])
+
+    def test_the_sentence_is_never_in_a_front_matter(self):
+        for p in (REPO / "agents" / "reviewers").glob("*.md"):
+            self.assertNotIn("counts as caught", p.read_text().split("---", 2)[1])
+
 
 
 class TestEveryReaderOfAPullRequestsFileList(unittest.TestCase):
@@ -1349,6 +1665,12 @@ class TestPlanningSkill(unittest.TestCase):
         self.assertIn("plan check: PASS", out.stdout)
 
 
+FACT_KIND_MODES = {"send": "cut marker (refused to the sender)", "wake": "merged within a 3000-character budget", "sweep": "parts", "triage": "parts",
+                   "alert": "parts", "reminder": "parts", "disk": "parts", "cpu": "parts", "mem": "parts", "cpu-top": "parts",
+                   "spotlight": "parts", "janitor": "parts", "plan": "parts"}
+OVER_CAP_FINDING_KINDS = tuple(k for k, v in FACT_KIND_MODES.items() if v == "parts")
+
+
 class TestCompose(unittest.TestCase):
     def test_header_then_each_item_in_full(self):
         text, carried = sb.compose("platform", [
@@ -1371,8 +1693,116 @@ class TestCompose(unittest.TestCase):
         self.assertTrue(text.endswith("\u2026 and 28 more: run fleet-switchboard pending platform"))
         self.assertEqual([f.key for f in carried], ["k29", "k28"])
 
+    def whole_run(self, kind, body, cap=4000, others=(), position=0):
+        """Deliver one over-cap fact like the daemon: part after part, with the ledger of parts delivered."""
+        one = fact("%s:big" % kind, kind=kind, summary=body)
+        done, texts, acked, gone = {}, [], [], set()
+        for _ in range(sb.FINDING_MAX_PARTS + 5):
+            pending = [o for o in others if o.key not in gone]
+            pending.insert(position, one)
+            text, carried = sb.compose("platform", pending, cap=cap, resume=done)
+            self.assertLessEqual(len(text), cap)
+            self.assertNotIn("[cut at", text)
+            gone.update(f.key for f in carried if f.key != one.key)
+            mine = [f for f in carried if f.key == one.key]
+            if not mine:
+                continue
+            texts.append(text)
+            if getattr(mine[0], "partial", None):
+                done[one.key] = mine[0].partial[0]
+            else:
+                acked.append(one.key)
+                break
+        return texts, acked
+
+    def test_a_finding_over_the_cap_is_carried_over_successive_messages_1302(self):
+        for kind in OVER_CAP_FINDING_KINDS:
+            for position in (0, 1, 2):   # the over-cap fact at EVERY position
+                body = "\n".join("item %03d %s" % (n, "z" * 60) for n in range(100))
+                others = [fact("o%d" % n, kind="sweep", summary="small %d" % n) for n in range(2)]
+                texts, acked = self.whole_run(kind, body, others=others, position=position)
+                self.assertGreater(len(texts), 1, kind)
+                self.assertEqual(acked, ["%s:big" % kind], kind)   # acknowledged once, after the LAST part
+                got = [l.strip() for t in texts for l in t.split("\n")[1:] if l.strip().startswith("item ")]
+                self.assertEqual(got, ["item %03d %s" % (n, "z" * 60) for n in range(100)], kind)   # every line once, in order
+                for i, t in enumerate(texts):
+                    self.assertIn("(part %d of %d)" % (i + 1, len(texts)), t)
+
+    def test_over_cap_sizes_are_delivered_whole_1302(self):
+        for body in ("\n".join(["y" * 100] * 41), "\n".join(["y" * 100] * 120), "\n".join(["\u00e9\u4e2d" * 30] * 60), "\n".join("l%d" % n for n in range(1500))):
+            texts, acked = self.whole_run("sweep", body)
+            self.assertTrue(acked)
+            self.assertGreaterEqual(len(texts), 1)
+
+    def test_a_long_line_is_split_never_cut_1302(self):
+        for size in (3900, 4000, 4001, 12000):
+            body = "".join(chr(97 + (i // 7) % 26) for i in range(size))
+            texts, acked = self.whole_run("sweep", body)
+            self.assertTrue(acked, size)
+            self.assertGreater(len(texts), 1, size)
+            for t in texts:
+                self.assertNotIn("[cut at", t)
+                self.assertLessEqual(len(t), 4000)
+            got = "".join(t.split("\n", 1)[1] if False else t for t in texts)
+            joined = got.replace(" (line continues)", "").replace("(line continues) ", "")
+            self.assertEqual(sum(joined.count(body[i:i + 40]) >= 1 for i in range(0, size - 40, 40)), len(range(0, size - 40, 40)), size)
+
+    def test_a_long_line_is_delivered_in_exact_content_and_order_1302(self):
+        for size in (4001, 12000):
+            body = "".join(chr(97 + (i * 7 + i // 13) % 26) for i in range(size))
+            texts, acked = self.whole_run("sweep", body)
+            self.assertTrue(acked, size)
+            pieces = []
+            for t in texts:
+                lines = t.split("\n")
+                at = [i for i, l in enumerate(lines) if l.startswith("- sweep")][0]
+                piece = lines[at + 1].strip()   # the item's header, then the one body line (the first line's header copy is cut to 200 characters)
+                piece = piece.replace("(part %d of %d) " % (len(pieces) + 1, len(texts)), "", 1)
+                if piece.startswith("(line continues) "):
+                    piece = piece[len("(line continues) "):]
+                if piece.endswith(" (line continues)"):
+                    piece = piece[:-len(" (line continues)")]
+                pieces.append(piece)
+            self.assertEqual("".join(pieces), body, size)
+
+    def test_a_part_over_a_tiny_cap_is_cut_visibly_1302(self):
+        one = fact("sweep:big", kind="sweep", summary="\n".join("line %03d %s" % (n, "q" * 50) for n in range(300)))
+        probe = fact("p", kind="sweep", summary="(part 99 of 99)\n")
+        fixed = len(sb.compose("platform", [probe], cap=10 ** 9)[0])
+        for cap in (fixed + 60, fixed + 120, fixed + 250):   # the budget floor of 200 makes the part longer than the cap
+            text, carried = sb.finding_part("platform", one, [], cap, None, None, None, {})
+            self.assertLessEqual(len(text), cap)
+            self.assertIn(sb.PART_TRUNCATED, text, cap)
+
+    def test_one_megabyte_is_bounded_and_the_rest_refused_named_1302(self):
+        body = "\n".join("x" * 99 for _ in range(10500))
+        texts, acked = self.whole_run("sweep", body)
+        self.assertEqual(len(texts), sb.FINDING_MAX_PARTS)   # the maximum; beyond it the rest is refused, audited, named in the last part
+        self.assertIn("were refused; the full text is in the audit", texts[-1])
+        self.assertTrue(acked)
+
+    def test_a_restart_between_parts_continues_from_the_ledger_1302(self):
+        one = fact("sweep:big", kind="sweep", summary="\n".join("line %03d %s" % (n, "q" * 50) for n in range(300)))
+        first, carried = sb.compose("platform", [one], cap=4000, resume={})
+        self.assertEqual(carried[0].partial[0], 1)
+        second, _ = sb.compose("platform", [one], cap=4000, resume={one.key: 1})   # a fresh process: only the ledger survives
+        self.assertIn("(part 2 of", second)
+        self.assertNotIn("line 000", second)
+
+    def test_every_fact_kind_the_builders_make_is_in_the_table_1302(self):
+        import ast, glob
+        here = str(BIN)
+        found = set()
+        for path in [os.path.join(here, "fleet-switchboard")] + glob.glob(os.path.join(here, "switchboard", "*.py")):
+            for node in ast.walk(ast.parse(open(path).read())):
+                if isinstance(node, ast.Call) and getattr(node.func, "id", getattr(node.func, "attr", "")) == "Fact":
+                    kind = node.args[2] if len(node.args) > 2 else next((k.value for k in node.keywords if k.arg == "kind"), None)
+                    if isinstance(kind, ast.Constant) and isinstance(kind.value, str) and kind.value in ("sweep", "triage", "alert", "wake", "send", "reminder", "disk", "cpu", "mem", "cpu-top", "spotlight", "janitor", "plan"):
+                        found.add(kind.value)
+        self.assertEqual(found, set(FACT_KIND_MODES), "a fact kind has no row in the table")
+
     def test_one_item_longer_than_the_cap_is_cut_and_says_so(self):
-        text, carried = sb.compose("platform", [fact("big", summary="y" * 5000)], cap=500)
+        text, carried = sb.compose("platform", [fact("big", kind="send", summary="y" * 5000)], cap=500)
         self.assertEqual(len(text), 500)
         self.assertTrue(text.endswith("[cut at 500 characters]"))
         self.assertEqual(len(carried), 1)

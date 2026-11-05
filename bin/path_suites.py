@@ -36,6 +36,20 @@ NEW_BIN_GUARDS = (
     ("TestAgentRegistryInventory", "bin/test-switchboard", "TestAgentRegistryInventory", None, "every module that reads or writes an agent record is in the registry inventory"),
     ("TestImpactHold module-name guard", "bin/test-switchboard", "TestImpactHold", "test_the_modules_the_clear_loads_or_runs_are_all_judged_and_the_list_is_derived_from_what_runs", "every module the clear runs is judged by name"),
     ("bin/check-public-names", "bin/check-public-names", None, None, "no private name in a tracked file"),
+    # #1457: the classes that read the set of files under bin/ (the failed classes of the three red rounds of #1429), run by `preflight-pr` with and without --merged
+    ("TestArchitectureDocument", "bin/test-switchboard", "TestArchitectureDocument", None, "every file under bin/ is a row of the Units table of docs/architecture.md"),
+    ("TestRecordJsonReaders", "bin/test-switchboard", "TestRecordJsonReaders", None, "every module under bin/ that reads a record's JSON is in the table of readers"),
+    ("TestTheReaperOnlyInstall", "bin/test-switchboard", "TestTheReaperOnlyInstall", None, "every function the installer calls is classified (Linux and macOS)"),
+    ("TestRecordingCommands", "bin/test-switchboard", "TestRecordingCommands", None, "every command that reaches a ledger append is a recording command or named exempt"),
+    ("TestDerivedClosure", "bin/test-switchboard", "TestDerivedClosure", None, "the closure of the delegated clear is derived over the entry and every part (tests/switchboard/test_closure.py)"),
+    ("TestBodyCheck", "bin/test-switchboard", "TestBodyCheck", None, "the source-copy mutant of `preflight-pr --body` copies every file under bin/ into a temporary tree: a new file under bin/ must copy and load there"),
+)
+
+# The guards a NEW file under shims/ must pass (ask #1909): same shape as NEW_BIN_GUARDS.
+NEW_SHIM_GUARDS = (
+    ("TestShimHygiene", "bin/test-switchboard", "TestShimHygiene", None, "every module under shims/ is standard library only and holds no personal name"),
+    ("bin/check-public-names", "bin/check-public-names", None, None, "no private name in a tracked file"),
+    ("bin/test-gh-hold", "bin/test-gh-hold", None, None, "every shim module is installed beside the shim in its rig and the hold tests pass"),
 )
 
 
@@ -235,8 +249,15 @@ def guard_missing(root, guard):
     if not os.path.isfile(os.path.join(root, path)):
         return "%s is not in this tree" % path
     if cls is not None:
-        body = _read(root, path)
-        if not re.search(r"(?m)^class %s\b" % re.escape(cls), body):
+        try:   # #1457: the whole file, not READ_MAX of it: a class past the first 4 MiB of bin/test-switchboard is still there
+            with open(os.path.join(root, path), encoding="utf-8", errors="replace") as handle:
+                body = handle.read()
+        except OSError:
+            body = ""
+        imported = re.search(r"(?m)^(?:\w+\s*,\s*)*%s\w*(?:\s*,\s*\w+)*\s*=" % re.escape(cls), body)   # #1457: a class the file imports from tests/switchboard/ is in the file by name
+        if imported and not test:
+            return ""
+        if not re.search(r"(?m)^class %s\w*" % re.escape(cls), body):   # a prefix: `-k` matches a substring, so TestTheReaperOnlyInstall runs both TestTheReaperOnlyInstallOnLinux and ...OnMacOS
             return "class %s is not defined in %s" % (cls, path)
         # Known limits (a closed rule): the block runs from the class line to the next top-level `class` line, so a class nested at column 0 inside a string, or a `def NAME`
         # written inside a string or comment of the block, still counts; the guard table names real classes and tests, and a CI run of the guard is the proof.
@@ -247,21 +268,23 @@ def guard_missing(root, guard):
 
 
 def added_paths(root, base, runner=subprocess.run):
-    """The files under bin/ the head ADDS against the merge-base with `base` (committed, uncommitted or untracked)."""
+    """The files under bin/ or shims/ the head ADDS against the merge-base with `base` (committed, uncommitted or untracked)."""
     mb = _git(root, "merge-base", "HEAD", base, runner=runner)
     if mb.returncode != 0 or not mb.stdout.strip():
         raise PathSuitesError("no common ancestor of HEAD and %s" % base)
     diff = _git(root, "diff", "--name-only", "--no-renames", "--diff-filter=A", mb.stdout.strip(), runner=runner, check=True)
     other = _git(root, "ls-files", "--others", "--exclude-standard", runner=runner)
-    return sorted(p for p in set(diff.stdout.split("\n")) | set(other.stdout.split("\n")) if p.startswith("bin/") and "__pycache__" not in p and not p.endswith(".pyc"))
+    return sorted(p for p in set(diff.stdout.split("\n")) | set(other.stdout.split("\n")) if p.startswith(("bin/", "shims/")) and "__pycache__" not in p and not p.endswith(".pyc"))
 
 
 def guard_rows(added):
-    """The rows (suite, classes, command, why) of the four guards, when `added` holds a new file under bin/; [] otherwise. Same shape as the rows of `plan`."""
+    """The rows (suite, classes, command, why) of the four guards, when `added` holds a new file under bin/ or shims/; [] otherwise. Same shape as the rows of `plan`."""
     new = [p for p in added or [] if p.startswith("bin/")]
-    if not new:
+    shims = [p for p in added or [] if p.startswith("shims/")]
+    if not new and not shims:
         return []
-    return [(g[1], [g[2]] if g[2] else [], guard_command(g), new) for g in NEW_BIN_GUARDS]
+    return [(g[1], [g[2]] if g[2] else [], guard_command(g), new) for g in NEW_BIN_GUARDS if new] + [(g[1], [g[2]] if g[2] else [], guard_command(g), shims) for g in NEW_SHIM_GUARDS if shims]
+
 
 
 def plan(root, paths, files=None, runner=subprocess.run, added=None):

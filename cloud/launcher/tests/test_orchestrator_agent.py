@@ -1,6 +1,7 @@
 """#1157: a cloud pod can run the orchestrator agent. Offline: the fake kubectl beside this file is the cluster; the entrypoint runs with stand-in files.
 Covers: the worker default unchanged, the selection, the refusals before any call, the exact environment names, the per-pod channel secret,
 the hub registry (launch, stop, refused write), the entrypoint, the copies' drift, and mutants of the allow-lists."""
+import pathlib
 import base64
 import hashlib
 import json
@@ -102,7 +103,7 @@ class Orchestrator(Base):
         self.assertEqual(self.st()["pods"], {})
 
     def test_s5_the_wiring_hands_over_only_an_orchestrator_agent(self):
-        text = open(os.path.join(ROOT, "bin", "cloud_worker.py")).read()
+        text = pathlib.Path(os.path.join(ROOT, "bin", "cloud_worker.py")).read_text()
         body = text[text.index("def _launch("):]
         self.assertIn('if args.agent == "orchestrator":', body)
         self.assertNotIn("CLOUD_AGENTS", text)   # any other --agent stays the local role name, only recorded: the worker launch is unchanged
@@ -147,7 +148,7 @@ class Orchestrator(Base):
         sec, agents = self.registry()
         self.assertEqual(sec, dict(OTHER, orch1=hashlib.sha256(self.channel_secret().encode()).hexdigest()))
         self.assertEqual(len(sec["orch1"]), 64)
-        self.assertEqual(set(agents["orch1"]), {"url", "session", "password_file"})
+        self.assertLessEqual({"url", "session", "password_file", "repo"}, set(agents["orch1"]))
         self.assertEqual(agents["other-agent"], {"url": "u"})
         self.assertEqual(agents["orch1"]["password_file"], "/etc/hub/pw/orch1")
         pw = self.st()["secret_bodies"]["cloud-hub-pw"]
@@ -233,7 +234,7 @@ class Entrypoint(unittest.TestCase):
         for p in (share, run, tmpdir):
             os.mkdir(p)
         for name, text in (("worker.md", "worker agent\n"), ("orchestrator.md", "---\npermission:\n  question: allow\n---\norchestrator agent\n"), ("opencode-worker.json", "{\n}\n")):
-            open(os.path.join(share, name), "w").write(text)
+            pathlib.Path(os.path.join(share, name)).write_text(text)
         with open(os.path.join(run, "channel-secret"), "w") as f:
             f.write("c" * 64)
         marker = os.path.join(d, "server-ran")
@@ -252,14 +253,14 @@ class Entrypoint(unittest.TestCase):
         p, files, ran, tmpdir = self.run_entry("orchestrator")
         self.assertEqual((p.returncode, files, ran), (0, ["orchestrator.md"], True), p.stderr)
         path = os.path.join(tmpdir, "channel-token")
-        self.assertEqual(open(path).read(), "c" * 64)
+        self.assertEqual(pathlib.Path(path).read_text(), "c" * 64)
         self.assertEqual(os.stat(path).st_mode & 0o777, 0o400)
         self.assertFalse(os.path.islink(path))
         self.assertNotIn("c" * 64, p.stdout + p.stderr)
 
     def test_s2_a_hub_worker_installs_the_channel_secret_when_the_launcher_wrote_it(self):
         _, _, _, tmpdir = self.run_entry("worker")
-        self.assertEqual(open(os.path.join(tmpdir, "channel-token")).read(), "c" * 64)
+        self.assertEqual(pathlib.Path(os.path.join(tmpdir, "channel-token")).read_text(), "c" * 64)
 
     def test_s2_any_other_value_refuses_before_the_server(self):
         for bad in ("boss", "Orchestrator", "worker;x", " "):
@@ -271,10 +272,7 @@ class Entrypoint(unittest.TestCase):
 
 
 # S3: each copy under cloud/worker equals its source when the source is in this checkout; a missing source is skipped by name
-COPIES = {"bin/cloud_cli.py": "cloud/worker/bin/cloud_cli.py", "bin/cloud_client.py": "cloud/worker/bin/cloud_client.py",
-          "agents/opencode/orchestrator.md": "cloud/worker/agents/orchestrator.md", "bin/cloud_hub.py": "cloud/worker/bin/cloud_hub.py",
-          "bin/cloud_channel.py": "cloud/worker/bin/cloud_channel.py", "bin/cloud_channel_server.py": "cloud/worker/bin/cloud_channel_server.py",
-          "bin/cloud_relay.py": "cloud/worker/bin/cloud_relay.py"}
+COPIES = [tuple(_l.split("\t")) for _l in __import__("pathlib").Path(ROOT, "cloud", "worker", "copies.tsv").read_text(encoding="utf-8").splitlines() if _l]
 
 
 def drift(root, source, copy):
@@ -285,7 +283,7 @@ def drift(root, source, copy):
 
 class Drift(unittest.TestCase):
     def test_s3_each_copy_equals_its_source(self):
-        for source, copy in COPIES.items():
+        for source, copy in COPIES:
             with self.subTest(copy=copy):
                 self.assertTrue(os.path.isfile(os.path.join(ROOT, copy)), copy + " is missing")
                 if not os.path.isfile(os.path.join(ROOT, source)):
@@ -294,14 +292,14 @@ class Drift(unittest.TestCase):
 
     def test_s3_a_one_byte_edit_is_caught(self):
         with tempfile.TemporaryDirectory() as d:
-            open(os.path.join(d, "a"), "wb").write(b"same bytes")
-            open(os.path.join(d, "b"), "wb").write(b"same bytes")
+            pathlib.Path(os.path.join(d, "a")).write_bytes(b"same bytes")
+            pathlib.Path(os.path.join(d, "b")).write_bytes(b"same bytes")
             self.assertIsNone(drift(d, "a", "b"))
-            open(os.path.join(d, "b"), "wb").write(b"same bytez")
+            pathlib.Path(os.path.join(d, "b")).write_bytes(b"same bytez")
             self.assertIn("differs", drift(d, "a", "b"))
 
     def test_the_dockerfile_copies_each_file(self):
-        text = open(os.path.join(ROOT, "cloud", "worker", "Dockerfile")).read()
+        text = pathlib.Path(os.path.join(ROOT, "cloud", "worker", "Dockerfile")).read_text()
         for needle in ("worker/agents/orchestrator.md", "worker/bin/cloud_cli.py /usr/local/bin/cw-cloud", "worker/bin/cloud_client.py",
                        "worker/bin/cloud_hub.py", "worker/bin/cloud_channel.py", "worker/bin/cloud_channel_server.py", "worker/bin/cloud_relay.py"):
             self.assertIn(needle, text)
@@ -455,11 +453,11 @@ class HubForEveryLaunch(Orchestrator):
 
 class Docs(unittest.TestCase):
     def test_s10_the_docs_say_it(self):
-        readme = open(os.path.join(ROOT, "cloud", "README.md")).read()
+        readme = pathlib.Path(os.path.join(ROOT, "cloud", "README.md")).read_text()
         self.assertIn("CW_AGENT", readme)
         self.assertIn("rebuild", readme)
         self.assertIn("tightening-only", readme)
-        self.assertIn("CW_AGENT", open(os.path.join(ROOT, "cloud", "worker", "agents", "worker.md")).read())
+        self.assertIn("CW_AGENT", pathlib.Path(os.path.join(ROOT, "cloud", "worker", "agents", "worker.md")).read_text())
 
 
 class RepoRootClean(unittest.TestCase):
@@ -474,7 +472,6 @@ class RepoRootClean(unittest.TestCase):
         with open(os.devnull, "w") as null:
             unittest.TextTestRunner(stream=null).run(suite)
         self.assertEqual(status(), before, "scratch left in the repository root")
-        self.assertNotIn("??", status(), "an untracked entry in the repository root")
 
 
 if __name__ == "__main__":

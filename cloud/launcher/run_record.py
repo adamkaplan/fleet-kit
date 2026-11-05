@@ -185,7 +185,10 @@ class Recorder:
             except Exception:
                 self.left()
                 continue
-            self.kube.add_secrets(text.strip())
+            if n == "model-auth":
+                self.kube.add_secrets(text.strip())   # the model entry never leaves (open choice b)
+            else:
+                self.kube.add_secrets(text.strip(), life=("pod", pod))
             if n == "server-password":
                 password = text.strip()
         return password
@@ -318,11 +321,13 @@ class Recorder:
         sha = (out.strip().splitlines() or [""])[0]
         return sha if re.fullmatch(r"[0-9a-f]{40}", sha) else None
 
-    def record(self, worker, pod, reason, repo="", started="", root=None):
+    def record(self, worker, pod, reason, repo="", started="", root=None, persistent=False):
         """Save the run's record. Returns the record directory ('' when none could be made). Never raises an Exception."""
         run_id = "%s-%s-%s" % (worker, time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()), secrets.token_hex(3))
         info = {"worker": worker, "repository": repo, "run_id": run_id, "start": started, "end": None,
                 "exit_reason": "", "head_sha": None, "transcript": "unavailable", "reason": "the record was not finished"}
+        if persistent:   # only a persistent orchestrator's record has the key
+            info["persistent"] = True
         directory = ""
         try:
             info["exit_reason"] = self.kube.scrub(reason, limit=300)
@@ -366,6 +371,23 @@ class Recorder:
             write_private(directory, "run.json", json.dumps(info, sort_keys=True) + "\n")
         except Exception as e:   # the stop goes on, but the gap is said once
             print("cloud-worker: run record not updated with the end hook result: %s" % type(e).__name__, file=sys.stderr)
+
+    @staticmethod
+    def add_pod_state(directory, state):
+        """A second atomic write of run.json: adds `pod_state` (phase, containers, node, events, events_read). Never raises; a failure
+        is swallowed into the one word `unreadable` (written if possible) and the record keeps what it had otherwise."""
+        try:
+            path = os.path.join(directory, "run.json")
+            with open(path) as f:
+                info = json.load(f)
+            try:
+                text = json.dumps(state, sort_keys=True)
+            except Exception:
+                state = "unreadable"
+            info["pod_state"] = state
+            write_private(directory, "run.json", json.dumps(info, sort_keys=True) + "\n")
+        except Exception:
+            pass
 
     def _write_transcript(self, directory, msgs, info):
         cap = int(self.env.get("CW_RECORD_MAX_BYTES") or TRANSCRIPT_CAP)

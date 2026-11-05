@@ -1,12 +1,15 @@
 """Ask #1165: the image installs make (one new apt package) and carries ONE system-level git file written at build with a
 default identity (one named pair in the Dockerfile); the entrypoint exports no identity variable and writes nothing; a
 repository's own identity and a local `git config user.name` still win; the shell guard is unchanged. Offline; temp dirs only."""
+import hashlib
 import os
 import re
 import shutil
 import subprocess
 import tempfile
 import unittest
+
+from test_dockerfile_browser import PACKAGES as BROWSER_PACKAGES
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 WORKER = os.path.join(HERE, "..")
@@ -82,8 +85,19 @@ def wrote_gitconfig(path):
 
 class Identity(unittest.TestCase):
     def test_s2_only_make_is_added_to_the_apt_list(self):
-        self.assertEqual(apt_packages(read(DOCKERFILE)) - PREVIOUS, {"make"})
+        self.assertEqual(apt_packages(read(DOCKERFILE)) - PREVIOUS, {"make"} | set(BROWSER_PACKAGES))
         self.assertLessEqual(PREVIOUS, apt_packages(read(DOCKERFILE)))
+
+    def test_s2_the_pin_fails_for_a_package_outside_make_and_the_tuple(self):
+        text = read(DOCKERFILE)
+        pkgs = apt_packages(text)
+        self.assertEqual(pkgs - PREVIOUS, {"make"} | set(BROWSER_PACKAGES))  # control first
+        mutant = text.replace("libnss3 ", "libnss3 zz-extra ", 1)
+        extra = apt_packages(mutant) - apt_packages(text)
+        self.assertEqual(extra, {"zz-extra"}, "the mutation was not applied")
+        self.assertNotEqual(apt_packages(mutant) - PREVIOUS, {"make"} | set(BROWSER_PACKAGES))
+        noop = text.replace("zz-absent-zz", "", 1)
+        self.assertEqual(apt_packages(noop) - apt_packages(text), set())  # a no-op fails the computation above
 
     def test_u3_the_scan_stage_still_exists(self):
         self.assertEqual(len(re.findall(r"^FROM worker AS scan", read(DOCKERFILE), re.M)), 1)
@@ -102,9 +116,10 @@ class Identity(unittest.TestCase):
 
     def test_s3_the_dockerfile_writes_the_system_file_with_the_one_constant(self):
         text, args = self.render_system_file()
-        self.assertEqual(args, {"CW_DEFAULT_IDENT_NAME": NAME, "CW_DEFAULT_IDENT_EMAIL": EMAIL})
+        self.assertEqual(args.get("CW_DEFAULT_IDENT_NAME"), NAME)   # the required ARGs carry the one constant; others may be added
+        self.assertEqual(args.get("CW_DEFAULT_IDENT_EMAIL"), EMAIL)
         self.assertEqual(text.split("\n")[0], "[user]")
-        self.assertEqual(sorted(re.findall(r"^\s*(\S+) = ", text, re.M)), ["email", "name"])
+        self.assertTrue({"email", "name"} <= set(re.findall(r"^\s*(\S+) = ", text, re.M)))
         self.assertEqual(re.findall(r"^\s*name = (.*)$", text, re.M), [NAME])
         self.assertEqual(re.findall(r"^\s*email = (.*)$", text, re.M), [EMAIL])
         self.assertEqual(len(re.findall(r"^ARG CW_DEFAULT_IDENT_NAME=", read(DOCKERFILE), re.M)), 1)   # the pair is declared once
@@ -213,21 +228,8 @@ class Identity(unittest.TestCase):
         self.assertEqual(self.guard("git", "config", "push.default", "y"), 3)
 
     def test_s7_guard_is_unchanged_by_this_change(self):
-        def run(args):
-            return subprocess.run(["git", "-C", CLOUD] + args, capture_output=True, text=True)
-        ref = "origin/integration"
-        three_dot = True
-        if run(["rev-parse", "--verify", "-q", ref]).returncode != 0:
-            ref, three_dot = "origin/main", False   # no integration ref: the old compare against main
-        if run(["rev-parse", "--verify", "-q", ref]).returncode != 0:   # skip only when the base ref is truly absent, loudly
-            print("SKIPPED: test_s7_guard_is_unchanged_by_this_change: the base ref is absent, nothing to compare", flush=True)
-            self.skipTest("the base ref is absent")
-        if on_default_branch(run, "origin/main", ref):   # a squash merge to main: the merge-base is the old main
-            print("SKIPPED: test_s7_guard_is_unchanged_by_this_change: HEAD is the default branch", flush=True)
-            self.skipTest("HEAD is the default branch")
-        r = guard_diff(ref, run, three_dot)
-        self.assertEqual(r.returncode, 0, r.stderr)   # the base exists: a failing diff is a failure, never a skip
-        self.assertEqual(r.stdout.strip(), "")
+        digest = hashlib.sha256(open(GUARD, "rb").read()).hexdigest()   # the wrapper's content, not a diff against a branch (ask #1677)
+        self.assertEqual(digest, read(os.path.join(HERE, "guard.sha256")).strip())
 
     def make_repo(self, feature_edits_guard, base_moves_on):
         d = tempfile.mkdtemp()

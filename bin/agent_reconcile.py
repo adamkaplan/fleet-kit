@@ -34,11 +34,6 @@ def evidence_of(agent, live):
     return {"state": agent.get("state"), "pane_listed": live.get("pane"), "process_found": live.get("process"), "checked_at": int(time.time())}
 
 
-def has_no_live_data(agent, live):
-    """True only when both the pane and the process were checked and are both absent. An unchecked part (None) is not absence."""
-    return live.get("pane") is False and live.get("process") is False
-
-
 def unknown_endpoint_check(name, agent):
     """The default check of a no-pane row's endpoint: "unknown", never dead. A cloud lane's feeder supplies a real one (a bounded probe or a lease)."""
     return "unknown"
@@ -49,7 +44,7 @@ def has_no_pane(agent):
     return _load_registry().no_pane_to_judge(agent)
 
 
-# TODO(#1066, PR #1075): when the process-evidence verdict lands, this and `has_no_live_data` must call that ONE dead-verdict function (U6).
+# The dead verdict is `registry.shows_dead` (one function, called through the loaded module); the daemon's pane_state is not part of it (docs/agent-registry.md).
 def reconcile_on_read(state_dir, read, live_check, registry=None, endpoint_check=None):
     """Called by a view with the registry read it is drawing from. Returns the names removed.
 
@@ -69,10 +64,12 @@ def reconcile_on_read(state_dir, read, live_check, registry=None, endpoint_check
                 verdict = (endpoint_check or unknown_endpoint_check)(name, agent)
             except Exception:
                 continue
-            if verdict != "dead":
+            evidence = {"endpoint_verdict": verdict, "checked_at": int(time.time())}
+            # a row the view calls pane-less but shows_dead does not: the evidence fails the pane rule, nothing is removed (as the old pair).
+            if not _load_registry().shows_dead(agent, evidence):
                 continue
             try:
-                result = registry.reconcile_remove(state_dir, name, {"endpoint_verdict": "dead", "checked_at": int(time.time())}, True)
+                result = registry.reconcile_remove(state_dir, name, evidence, True)
             except Exception:
                 continue
             if isinstance(result, dict) and result.get("changed"):
@@ -84,10 +81,11 @@ def reconcile_on_read(state_dir, read, live_check, registry=None, endpoint_check
             live = live_check(name, agent) or {}
         except Exception:
             continue   # a check that cannot be made is no evidence
-        if not has_no_live_data(agent, live):
+        evidence = evidence_of(agent, live)
+        if not _load_registry().shows_dead(agent, evidence):
             continue
         try:
-            result = registry.reconcile_remove(state_dir, name, evidence_of(agent, live), True)
+            result = registry.reconcile_remove(state_dir, name, evidence, True)
         except Exception:
             continue
         if isinstance(result, dict) and result.get("changed"):
