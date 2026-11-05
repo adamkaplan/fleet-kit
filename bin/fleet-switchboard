@@ -14828,6 +14828,7 @@ def recording_commands():
 def pr_picture(engine, repo, number, state):
     """(facts, body, notice senders) of a PR, best effort: ({}, "", []) with a reason string when it cannot be read."""
     try:
+        load_module("ci_runs").KEEP_DIR = state   # #2230: the identities of runs are kept beside the state
         raw = read_pr_json(engine, repo, number)
         facts = ci_fresh_fact(engine, repo, number, pr_facts_from(raw))   # #1755
     except (NoticeError, AttributeError) as err:

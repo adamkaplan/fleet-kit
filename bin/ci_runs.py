@@ -135,6 +135,44 @@ def _read_run(repo, run):
     return None
 
 
+KEEP_DIR = None   # #2230: the state directory the identities of runs are kept in (set by the pull request reader); None keeps none
+KEEP_FILE = "ci-run-identity.json"
+
+
+def _read_run_kept(repo, run):
+    """`_read_run`, but an identity already read in an earlier process comes from KEEP_DIR/KEEP_FILE (workflow id, event, path of an immutable run). Any trouble with the file is a read from GitHub as before."""
+    import json
+    import os
+    key = "%s#%d" % (repo, run)
+    path = os.path.join(KEEP_DIR, KEEP_FILE) if KEEP_DIR else None
+    table = {}
+    if path:
+        try:
+            with open(path, encoding="utf-8") as handle:
+                table = json.load(handle)
+            row = table.get(key) if isinstance(table, dict) else None
+            if isinstance(row, list) and len(row) == 3 and type(row[0]) is int and isinstance(row[1], str) and re.fullmatch(r"[a-z_]{1,40}", row[1]):
+                if isinstance(row[2], str) and re.fullmatch(r"\.github/workflows/[\w.-]{1,100}", row[2]):
+                    _put(_PATH, (repo, run), row[2])
+                    return (row[0], row[1])
+        except (OSError, ValueError):
+            pass
+        if not isinstance(table, dict):
+            table = {}
+    got = _read_run(repo, run)
+    if got is not None and path and (repo, run) in _PATH:
+        try:
+            table = {k: v for k, v in list(table.items())[-(CACHE_MAX - 1):]}
+            table[key] = [got[0], got[1], _PATH[(repo, run)]]
+            temp = "%s.%d.tmp" % (path, os.getpid())
+            with open(temp, "w", encoding="utf-8") as handle:
+                json.dump(table, handle)
+            os.replace(temp, path)
+        except (OSError, ValueError, TypeError):
+            pass
+    return got
+
+
 def _cached_identity(entry, run, repo):
     """The identity already read for this run of the PR's own repo, or None. Never reads."""
     return _CACHE.get((repo, run)) if repo and _details_repo(entry) == repo else None
@@ -157,7 +195,7 @@ def _identity_of_run(entry, run, repo, budget=None):
         budget[0] -= 1
     got = None
     try:
-        got = (READER or _read_run)(repo, run)
+        got = (READER or _read_run_kept)(repo, run)   # #2230: a run's identity never changes, so one kept beside the state is read from the file, not from GitHub again
     except Exception:
         got = None
     if not (isinstance(got, tuple) and len(got) == 2):
