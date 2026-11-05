@@ -93,6 +93,7 @@ cloud/launcher/tests/test_scratch_clean.py
 cloud/launcher/tests/test_scrub_linear.py
 cloud/launcher/tests/test_scrub_pieces.py
 cloud/launcher/tests/test_stack_model_key.py
+cloud/launcher/tests/test_stack_nudge.py
 cloud/launcher/tests/test_stack_registry_check.py
 cloud/launcher/tests/test_stack_registry_pod.py
 cloud/launcher/tests/test_stop_cause.py
