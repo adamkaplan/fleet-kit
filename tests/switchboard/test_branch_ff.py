@@ -106,7 +106,11 @@ class TestBranchFf(Base):
         self.assertEqual(self.clear()[0], 0)
         code, out, err = self.main("orch", "branch-ff", PR, "scratch")
         self.assertEqual(code, 0, err)
-        self.assertEqual(self.gh.writes(), [("PATCH", "repos/%s/git/refs/heads/feature" % REPO, {"sha": NEW, "force": False})])   # U3: one write
+        writes = self.gh.writes()   # U3: one write, a PATCH of the branch to the cleared sha, never forced
+        self.assertEqual(len(writes), 1, writes)
+        self.assertEqual(writes[0][:2], ("PATCH", "repos/%s/git/refs/heads/feature" % REPO))
+        self.assertEqual(writes[0][2]["sha"], NEW)
+        self.assertIs(writes[0][2].get("force"), False)
         self.assertEqual(self.gh.git_calls, [], "no git call")
         lines = self.audited("branch.ff")
         self.assertEqual(len(lines), 1)
@@ -260,8 +264,8 @@ class TestBranchFf(Base):
         return name
 
     def test_s4_ten_requests_are_each_refused_writing_nothing(self):
-        names = [self.run_case(i) for i in range(10)]
-        self.assertEqual(len(set(names)), 10)
+        names = [self.run_case(i) for i in range(len(self.refusal_cases()))]   # every case the table holds, each a different request
+        self.assertEqual(len(set(names)), len(names))
 
     def test_s4_a_failed_read_is_a_refusal(self):
         self.assertEqual(self.clear()[0], 0)

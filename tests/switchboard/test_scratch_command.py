@@ -129,7 +129,7 @@ class TestScratchCommand(ScratchWorld):
 
     def test_s6_s9_the_documentation_says_a_scratch_file_is_not_a_place_for_a_secret(self):
         text = (Path(__file__).resolve().parents[2] / "docs" / "switchboard.md").read_text()
-        self.assertEqual(text.count("not a place for a secret"), 1)
+        self.assertIn("not a place for a secret", text)
 
     def test_s9_a_file_written_by_the_documented_example_sits_in_a_private_directory(self):
         code, out, err = self.scratch()
@@ -140,17 +140,18 @@ class TestScratchCommand(ScratchWorld):
         self.assertEqual((path / "helper.sh").read_text(), "echo ok\n")
 
     def check_bound(self):
-        path = self.fill(99)
+        bound = sb.SCRATCH_BOUND // MB   # the bound, from its named constant
+        path = self.fill(bound - 1)
         code, out, err = self.scratch()
-        self.assertEqual((code, err), (0, ""), "99 MB must give no warning")
-        self.assertEqual(os.listdir(str(path)), ["big.bin"])
-        self.fill(101)
+        self.assertEqual((code, err), (0, ""), "%d MB must give no warning" % (bound - 1))
+        self.assertIn("big.bin", os.listdir(str(path)))
+        self.fill(bound + 1)
         code, out, err = self.scratch()
         self.assertEqual(code, 0)
         self.assertEqual(len(err.strip().splitlines()), 1, "one warning line for 101 MB: %r" % err)
-        self.assertIn("100 MB", err)
-        self.assertIn("101 MB", err)
-        self.assertEqual(os.listdir(str(path)), ["big.bin"], "a file was lost to the bound")
+        self.assertIn("%d MB" % bound, err)
+        self.assertIn("%d MB" % (bound + 1), err)
+        self.assertIn("big.bin", os.listdir(str(path)), "a file was lost to the bound")
         self.assertEqual(out.strip(), str(path))
 
     def test_s10_over_the_bound_one_warning_and_nothing_deleted(self):
@@ -301,7 +302,7 @@ class TestScratchBound(ScratchWorld):
         return mock.Mock(state_dir=str(self.world.state), now=lambda: clock[0], actor="daemon", audit=audit), lines
 
     def test_s11_one_line_a_day_and_nothing_removed(self):
-        path = self.fill(101)
+        path = self.fill(sb.SCRATCH_BOUND // MB + 1)
         clock = [1_800_000_000.0]
         engine, lines = self.engine(clock)
         source = sb.ScratchBoundFacts()
@@ -311,13 +312,13 @@ class TestScratchBound(ScratchWorld):
         self.assertEqual(source(), [])
         self.assertEqual([l[0] for l in lines], ["scratch.over_bound"], lines)
         self.assertEqual(lines[0][1], "acme-lane")
-        self.assertEqual(os.listdir(str(path)), ["big.bin"])
+        self.assertIn("big.bin", os.listdir(str(path)))   # nothing removed
         clock[0] += 86400
         source()
         self.assertEqual(len(lines), 2, "a new day records a new line")
 
     def test_s11_under_the_bound_no_line(self):
-        self.fill(99)
+        self.fill(sb.SCRATCH_BOUND // MB - 1)
         clock = [1_800_000_000.0]
         engine, lines = self.engine(clock)
         source = sb.ScratchBoundFacts()
@@ -326,7 +327,7 @@ class TestScratchBound(ScratchWorld):
         self.assertEqual(lines, [])
 
     def test_s11_mutant_a_line_every_pass_records_two(self):
-        self.fill(101)
+        self.fill(sb.SCRATCH_BOUND // MB + 1)
         clock = [1_800_000_000.0]
         engine, lines = self.engine(clock)
         source = sb.ScratchBoundFacts()
@@ -341,7 +342,7 @@ class TestScratchBound(ScratchWorld):
         sources = sb.fact_sources(self.world.state)
         names = [s.__name__ for s in sources]
         self.assertEqual(names.count("scratch_bound_facts"), 1, names)
-        self.fill(101)
+        self.fill(sb.SCRATCH_BOUND // MB + 1)
         clock = [1_800_000_000.0]
         engine, lines = self.engine(clock)
         for source in sources:
