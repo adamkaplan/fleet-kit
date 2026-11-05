@@ -250,7 +250,7 @@ class S2Render(PBase):
 
 
 class S3Unchanged(PBase):
-    LEGACY_ANSWER = {"worker", "url", "auth_ref", "runtime_id", "idle_deadline", "hard_deadline", "idle_seconds", "hard_seconds", "password_fd"}
+    LEGACY_ANSWER = {"worker", "url", "auth_ref", "runtime_id", "idle_deadline", "hard_deadline", "idle_seconds", "hard_seconds", "password_fd", "pod_uid"}
 
     def test_s3_the_recorded_fixtures_still_equal_what_the_launcher_renders(self):
         with open(os.path.join(HERE, "fixtures", "default_pod.json")) as f:
