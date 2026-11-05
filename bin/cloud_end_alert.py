@@ -151,6 +151,11 @@ def message_text(worker, label, when, pushed, record_name, kept=False, failure=N
     return text
 
 
+def chief_not_needed(cause, ok, pushed):
+    """#2202: True for an end that needs nothing from the Chief of Staff: a clean reason (idle or hard limit), the stop done, and nothing unpushed."""
+    return cause in ("idle", "hard") and ok is True and pushed == "nothing unpushed"
+
+
 def scan_audit(audit_file, state_file, cloud_dir, last_reports, send, parse, audit=None, last_text=None):
     """One pass. `send(recipient, text)` is the daemon's own send path. Returns [(recipient, text)] handed to it. `last_text(directory, worker)` (ask #1788)
     gives (block, None) or (None, why): the boss's copy, not the Chief of Staff's, ends with the pod's last text, framed as untrusted."""
@@ -212,6 +217,8 @@ def scan_audit(audit_file, state_file, cloud_dir, last_reports, send, parse, aud
             except Exception as err:
                 block, why = None, type(err).__name__
             boss_text = text + "\n" + (block if block else "last text not read: %s" % plain((why or "unknown").replace(" ", "_"), 120))
+        if len(to_list) > 1 and chief_not_needed(cause, line["ok"], pushed):
+            to_list = to_list[1:]   # #2202: a clean end with nothing unpushed goes to the boss only
         out.extend((to, text if to == CHIEF else boss_text, worker, label) for to in reversed(to_list))
     save_state(state_file, offset + cut, keys)
     failed = set()

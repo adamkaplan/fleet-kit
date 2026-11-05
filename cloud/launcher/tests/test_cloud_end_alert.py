@@ -67,19 +67,36 @@ class World(unittest.TestCase):
 
 
 class TestAlerts(World):
-    def test_s2_three_stops_make_six_messages_naming_the_facts(self):
+    def test_s2_three_stops_name_the_facts_and_route_by_need(self):
         for name, reason, pushed in (("worker1", "idle", True), ("worker2", "hard limit", False), ("worker3", "idle", True)):
             self.worker(name, pushed=pushed)
             self.stop(name, reason, run="r" + name)
         self.run_pass()
-        self.assertEqual(len(self.sent), 6)
         for name, label, pushed in (("worker1", "idle", "unpushed work saved to worker1/wip"), ("worker2", "hard limit", "nothing unpushed"), ("worker3", "idle", "unpushed work saved to worker3/wip")):
-            self.assertEqual(sorted(to for to, t in self.sent if name in t), ["chief-of-staff", "coder-lead"])
+            # #2202 OLD: every end went to ["chief-of-staff", "coder-lead"]; NEW: worker2 (clean, nothing unpushed) goes to its boss only
+            want = ["coder-lead"] if name == "worker2" else ["chief-of-staff", "coder-lead"]
+            self.assertEqual(sorted(to for to, t in self.sent if name in t), want)
             for text in (t for to, t in self.sent if name in t):
                 for fact in (name, "reason " + label, "at 2026-01-01T10:00:00Z", pushed, "run record: %s-20260101T000000Z-0f1e2d" % name):
                     self.assertIn(fact, text)
                 self.assertNotIn(self.dir, text)
                 self.assertNotIn("a1b2c3", text)
+
+    def test_s2_clean_end_nothing_unpushed_goes_to_the_boss_only(self):
+        self.worker("w1", pushed=False)
+        self.stop("w1", "idle")
+        self.run_pass()
+        self.assertEqual([to for to, t in self.sent if "w1" in t], ["coder-lead"])
+
+    def test_s3_ends_that_need_the_chief_reach_her(self):
+        cases = {"saved": dict(), "failed": dict(ok=False), "kept": dict(ok=False, reason="hard limit"), "noboss": dict(boss=None)}
+        self.worker("saved", pushed=True); self.stop("saved", "idle", run="r1")
+        self.worker("failed", pushed=False); self.stop("failed", "idle", run="r2", ok=False)
+        self.worker("kept", pushed=False); self.stop("kept", "hard limit", run="r3", ok=False)
+        self.worker("noboss", boss=None, pushed=False); self.stop("noboss", "idle", run="r4")
+        self.run_pass()
+        for name in cases:
+            self.assertIn("chief-of-staff", [to for to, t in self.sent if name in t], name)
 
     def test_s3_seven_lines_of_one_run_and_three_passes_send_two_messages(self):
         self.worker("worker7")
