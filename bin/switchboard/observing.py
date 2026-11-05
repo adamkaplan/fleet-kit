@@ -146,6 +146,7 @@ class Observation:
         self.wrong_program = False  # the pane runs something other than the configured v2
         self.headless = False  # #433: a worker with no terminal: what it does is read from the OpenCode service, never from herdr
         self.conflict = []  # other sessions that claim the same name
+        self.errored = False  # #1697: herdr says blocked, but nothing is open and the last turn ended on a provider error: idle, not blocked
 
     def engaged(self, now, window):
         """You prompted this agent within `window` seconds. Off under `no-engagement-gate`."""
@@ -158,6 +159,8 @@ class Observation:
                "fleet": self.fleet, "idle_at": iso(self.idle_at), "outcome": self.outcome,
                "last_human_prompt": iso(self.last_human_prompt), "problem": self.problem,
                "wrong_program": self.wrong_program, "conflict": self.conflict}
+        if self.errored:   # present only for an errored agent: every other agent's output is what it always was
+            out["errored"] = True
         if self.headless:   # present only for a headless worker: a terminal-only fleet's output is what it always was
             out["headless"] = True
         return out
