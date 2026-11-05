@@ -85,7 +85,6 @@ class Behaviour(TCW.Base):
             self.assertEqual(code, 0, err)
             self.assertEqual(json.loads(out.strip().splitlines()[-1])["url"], json.loads((self.state / "cloud" / (name + ".json")).read_text())["url"])
         rows = self.rows()
-
         self.assertLessEqual(set(urls), set(rows))   # a row for each launch
         for name in ("coder7", "coder8", "orch"):
             self.assertIn(name, rows)
