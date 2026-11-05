@@ -147,9 +147,9 @@ class ScrubPieces(unittest.TestCase):
         print("S3 control 1 of 1, mutants fail 2 of 2 with the anchored text, mutations applied 2 of 2, tails left by the old choice %d" % tails(old_choice))
 
     def _overlap_source(self):
-        old = "    return first.run(union.run())\n"
+        old = "                if b > merged[-1][1]:\n                    merged[-1][1] = b\n"
         self.assertEqual(self.src.count(old), 1)
-        new = self.src.replace(old, "    return first.run()\n")
+        new = self.src.replace(old, "                pass  # mutant: a later match that overlaps is dropped, its tail stays\n")
         self.assertNotEqual(new, self.src)
         return new
 
