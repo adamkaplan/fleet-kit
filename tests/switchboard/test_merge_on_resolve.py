@@ -171,7 +171,7 @@ class TestMergeOnResolve(unittest.TestCase):
                 notes.append(a)
         view = json.dumps(self.fx.view())
         hub.ctx["gh"] = lambda argv: (0, view, "")
-        env = {"repos": lambda: ["acme/app"], "marked": lambda repo: [7], "context": lambda repo, n: dict(hub.ctx)}
+        env = {"parse": json.loads, "repos": lambda: ["acme/app"], "marked": lambda repo: [7], "context": lambda repo, n: dict(hub.ctx)}
         for step in range(3):
             engine = Engine()   # a new engine each time: a restart keeps the told reason in its state file
             engine.clock[0] = 1000.0 + 100 * step

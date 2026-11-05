@@ -104,11 +104,10 @@ MOR_TOLD_FILE = "merge-on-resolve.json"
 MOR_TOLD_KEEP = 14 * 86400
 
 
-def mor_told_load(state_dir):
-    import json
+def mor_told_load(state_dir, parse):
     try:
         with open("%s/%s" % (state_dir, MOR_TOLD_FILE)) as handle:
-            raw = json.load(handle)
+            raw = parse(handle.read())
         return {k: v for k, v in raw.items() if isinstance(k, str) and isinstance(v, (int, float))} if isinstance(raw, dict) else {}
     except (OSError, ValueError):
         return {}
@@ -123,15 +122,14 @@ def mor_told_save(state_dir, told):
 
 
 def merge_on_resolve_tick(engine, env):
-    """One look at the marked pull requests, at most once in MOR_EVERY seconds; never raises. env: repos() -> [repo], marked(repo) -> [number], context(repo, number) ->
+    """One look at the marked pull requests, at most once in MOR_EVERY seconds; never raises. env: parse (the bounded JSON reader), repos() -> [repo], marked(repo) -> [number], context(repo, number) ->
     the `mor_run` context plus `gh` and `route(repo, number) -> [text sink]`; a told reason is kept in MOR_TOLD_FILE so a restart never repeats it."""
-    import json
     now = engine.now()
     if now - getattr(engine, "mor_last", 0) < MOR_EVERY:
         return
     engine.mor_last = now
     try:
-        told = mor_told_load(engine.state_dir)
+        told = mor_told_load(engine.state_dir, env["parse"])
         told = {k: v for k, v in told.items() if now - v < MOR_TOLD_KEEP}
         changed = []
         for repo in env["repos"]():
@@ -146,7 +144,7 @@ def merge_on_resolve_tick(engine, env):
                         inner(r, n, key, text)
                 ctx["tell"] = once
                 code, out, _ = ctx["gh"](["pr", "view", str(number), "-R", repo, "--json", "state,labels,comments,headRefOid,baseRefName"])
-                view = json.loads(out) if code == 0 else None
+                view = env["parse"](out) if code == 0 else None
                 if not isinstance(view, dict):
                     continue
                 outcome, reason = mor_run(ctx, repo, number, view)

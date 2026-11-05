@@ -2811,7 +2811,7 @@ class Switchboard:
             undelivered_wake_tick(self, discovery)
         except Exception as err:
             self._failed("undelivered-wake", "undelivered-wake", err, report)
-        if not self.light and self.state_dir is not None:   # #2204: an approved, marked pull request whose only change is a git-made tip merge (never raises)
+        if self.state_dir is not None:   # #2204: an approved, marked pull request whose only change is a git-made tip merge (never raises)
             merge_on_resolve_tick(self, merge_on_resolve_env(self))
         finish_pass(self, discovery, report)
         if self.reads.deferred:   # the budget kept what was remembered for this many reads this pass: said, once per change of the count
@@ -18462,7 +18462,7 @@ def merge_on_resolve_env(engine):
         return {"gh": gh, "runner": runner, "git_dir": git_dir, "prepare": prepare, "is_held": gate.is_held, "merge": merge, "tell": tell,
                 "drops": lambda r, n: merge_drops_refusal(runner, config, repo, number, engine.state_dir),
                 "union": lambda r, n: claim_union_refusal(types.SimpleNamespace(pr="%s#%d" % (repo, number), plan=None, ask=None), runner, engine.now)}
-    return {"repos": repos, "marked": marked, "context": context}
+    return {"parse": load_module("record_json").parse_bounded, "repos": repos, "marked": marked, "context": context}
 
 
 def merge_drops_refusal(runner, config, repo, number, state):
