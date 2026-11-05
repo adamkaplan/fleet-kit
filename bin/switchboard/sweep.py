@@ -268,6 +268,8 @@ def open_pages(read, repo=None):
 
 _UNSENT_DAY = {}   # #1886: repository -> the day its `open_list.cut_unsent` line was written (memory only: a restart may write one more; one entry per repository)
 _OPEN_CUTS = set()   # #1886: the repositories whose read of open items stopped at OPEN_LIST_PAGES in this pass (one entry per repository)
+COMMENT_WINDOW_PAGES = 30   # #1889: pages one comment read follows at most (3,000 comments); a window not read to its start is said once a day
+_COMMENT_CUTS = {}   # #1889: (consumer, repository) -> (comments held, window days) of a comment window not read to its start, until the pass's daily alert (one entry per repository)
 
 
 def note_open_cut(repo):
@@ -304,6 +306,45 @@ def open_list_alert(engine, repo, now):
         audit.append(engine.actor, "open_list.cut", repo, {"repo": repo, "ceiling": ceiling, "pages": OPEN_LIST_PAGES})
     if not alerts.mark(engine.state_dir, repo, day, load_module("record_json").parse_bounded) and audit is not None:
         audit.append(engine.actor, "open_list.marker_failed", repo, {"repo": repo})
+
+
+def take_comment_cuts():
+    """#1889: {repository: (comments held, window days)} of the comment windows not read to their start; emptied."""
+    out = {}
+    windows = {}
+    for (consumer, repo), cut in sorted(_COMMENT_CUTS.items()):   # one alert a day per repository: the consumer that holds more speaks
+        windows.setdefault(repo, set()).add(cut[1])
+        if repo not in out or cut[0] > out[repo][0]:
+            out[repo] = cut
+    for repo, days in windows.items():   # #1889: when both consumers are cut, the alert names both windows (a tuple of days, ascending)
+        if len(days) > 1:
+            out[repo] = (out[repo][0], tuple(sorted(days)))
+    _COMMENT_CUTS.clear()
+    return out
+
+
+def comment_window_alert(engine, repo, held, days, now):
+    """#1889: ONE alert a day (key `<repository>|comments`, the #1886 day marker) when the comments of `repo` were not read to the start of their window of `days` days."""
+    alerts = load_module("open_list_alert")
+    day, key = _day(now), "%s|comments" % repo
+    if not alerts.due(engine.state_dir, key, day, load_module("record_json").parse_bounded):
+        return
+    discovery = getattr(engine, "discovery", None)
+    cos = next((n for n, o in sorted(discovery.agents.items()) if (o.fleet or {}).get("role") == "chief-of-staff"), None) if discovery is not None else None
+    span = " and ".join("%d-day" % d for d in days) + " windows" if isinstance(days, tuple) else "%d-day window" % days
+    text = ("The comments of %s were not read to the start of their %s: %s comments are read (COMMENT_WINDOW_PAGES = %d pages); the checks that read comments miss the older ones."
+            % (repo, span, format(held, ","), COMMENT_WINDOW_PAGES))
+    audit = getattr(engine, "audit", None)
+    if cos is None:
+        if audit is not None and _UNSENT_DAY.get(key) != day:
+            _UNSENT_DAY[key] = day
+            audit.append(engine.actor, "comment_window.cut_unsent", repo, {"repo": repo})
+        return
+    add_repeat_reminder(engine.state_dir, cos, now, now, text, "comment-window-cut", key, day, wake_class=WAKE_LOAD)
+    if audit is not None:
+        audit.append(engine.actor, "comment_window.cut", repo, {"repo": repo, "comments": held, "window_days": days})
+    if not alerts.mark(engine.state_dir, key, day, load_module("record_json").parse_bounded) and audit is not None:
+        audit.append(engine.actor, "comment_window.marker_failed", repo, {"repo": repo})
 
 
 def sweep_pages_used(records, truncated):
@@ -348,8 +389,7 @@ def sweep_read_repo(hub, repo, now, window_days, regex, budget, strong):
         names = {(l.get("name") if isinstance(l, dict) else l) for l in record.get("labels") or []}
         if number is not None and _is_pr(record) and not _issue_pr_merged(record) and _label_kind(names, CAPTAIN_MERGE_LABELS[:1] + CAPTAIN_HOLD_LABELS):   # #559: a merged PR is the daemon's to clean, never a finding
             closed_holds[number] = sorted(_label_kind(names, CAPTAIN_MERGE_LABELS[:1] + CAPTAIN_HOLD_LABELS))
-    comments, cut = hub.read_pages("repos/%s/issues/comments?since=%s&sort=created&direction=desc&per_page=100"
-                                   % (repo, since), older=("created_at", since), cap=SWEEP_LIST_PAGES)
+    comments, cut = hub.read_comments("sweep", repo, since, cap=COMMENT_WINDOW_PAGES)
     budget[0] -= sweep_pages_used(comments, cut)
     truncated = truncated or cut
     for comment in reversed(comments):  # oldest first, so the last N are the newest

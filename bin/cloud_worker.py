@@ -44,7 +44,7 @@ DEFAULT_DIRECTORY = "/work"   # the session's directory in the pod: the scratch 
 CLOUD_WORKER_AGENT = "worker"   # the agent the image defines (cloud/worker/agents/worker.md): a cloud session always runs it; the local --agent name is only recorded
 # The options of the launcher's `create` that `launch --cloud` hands over: ONE table. Taken from the launcher on main (commit fb4b9f2,
 # cloud/launcher/cloud_worker.py `create`: --shape S|M, --stack); a name here that the launcher does not know makes its create fail (exit 2).
-CREATE_OPTION = {"repo": "--repo", "branch": "--branch", "run_id": "--run-id", "idle": "--idle", "hard": "--hard", "shape": "--shape", "stack": "--stack", "agent": "--agent", "boss": "--boss", "stack_model_secret": "--stack-model-secret", "issue": "--issue"}
+CREATE_OPTION = {"repo": "--repo", "branch": "--branch", "run_id": "--run-id", "idle": "--idle", "hard": "--hard", "shape": "--shape", "stack": "--stack", "agent": "--agent", "boss": "--boss", "stack_model_secret": "--stack-model-secret", "persistent": "--persistent", "issue": "--issue"}
 LAUNCHER_SHAPES = ("XS", "S", "M", "O")   # the launcher's SHAPES keys (O: the orchestrator row, 250m and 768 MiB, meant for --agent orchestrator; a worker on it is likely to be killed for memory); the launcher's own default (XS; S with --stack; O with --agent orchestrator) applies when --shape is not given
 LAUNCHER_STACK_SHAPES = ("S", "M")   # the rows with stack: true; --stack with another shape is refused here, before any call
 MAX_M_PER_LANE = 4   # the most live shape-M (4 CPU) cloud workers one lane may hold: a lane's batch of 4-CPU pods once filled the cluster and left every other lane's launches unplaceable
@@ -710,6 +710,11 @@ def _launch(args, runner, now, reserve):
         raise LaunchError("--agent is required")
     if args.agent == "orchestrator" and not args.reports_to:
         raise Refusal("--agent orchestrator needs --reports-to BOSS (the pod's FLEET_BOSS); nothing was created")
+    persistent = bool(getattr(args, "persistent", False))
+    if persistent and args.agent != "orchestrator":   # before anything is read or created
+        raise Refusal("--persistent is only for --agent orchestrator, not a worker; nothing was created")
+    if persistent and getattr(args, "stack", False):
+        raise Refusal("--persistent does not combine with --stack; nothing was created")
     if args.dir:
         given = str(args.dir)   # a normal absolute path (no `..`, no doubled or trailing slash) under a pod root
         if given != os.path.normpath(given) or not any(given == root or given.startswith(root + "/") for root in POD_DIR_ROOTS):
@@ -774,6 +779,8 @@ def _launch(args, runner, now, reserve):
         options += [CREATE_OPTION["boss"], args.reports_to] if args.reports_to else []
     if getattr(args, "stack", False):   # only on request: a launch without --stack hands the launcher exactly what it always did
         options.append(CREATE_OPTION["stack"])
+    if persistent:   # only on request: any other launch hands the launcher exactly what it always did
+        options.append(CREATE_OPTION["persistent"])
     if os.environ.get("CW_PULL_SECRET"):
         options += ["--pull-secret", os.environ["CW_PULL_SECRET"]]
     stack_model = stack_model_secret() if getattr(args, "stack", False) else None   # before any cluster call; without --stack the setting is ignored
@@ -1416,6 +1423,10 @@ def _may_retire(kind, record):
     return kind[0] == "person" or (kind[0] == "agent" and ((len(kind) > 2 and kind[2] == "chief-of-staff") or kind[1] == record.get("reports_to")))
 
 
+RECOVER_SENTENCE = ("send the pod one message to commit its tree on a NEW branch and push it there plainly, read the branch from origin, "
+                    "then retire normally")
+
+
 _BOSS_NAME_RE = re.compile(r"[a-z][a-z0-9_-]{0,31}", re.ASCII)
 
 
@@ -1463,9 +1474,15 @@ def cmd_retire(args, runner, now, record):
     _audit(engine, "cloud.stopped", args.name, {"exit": code, "reason": reason, "runtime_id": record.get("runtime_id"),
                                                 "pushed": (body or {}).get("pushed"), "wip_branch": (body or {}).get("wip_branch")})
     if code == 1:
-        sys.stderr.write("%s: %s was not retired: the end hook could not push (%s): pod kept, record kept; `%s retire %s` again once it can "
-                         "(only if there is nothing to save, `cloud-worker delete %s --force` is the explicit last resort: it discards the pod and its work)\n"
-                         % (H["PROG"], args.name, note or "no reason given", H["PROG"], args.name, args.name))
+        save = "%s-save" % args.name
+        message = ("Commit the working tree of /work/repo as ONE commit on the new branch %s (a name that does not exist on origin), push it with a plain "
+                   "git push (never forced), print the full sha, and STOP." % save)
+        recover = ("%s: %s: to save its tree first, %s: %s send %s \"%s\"; this only prints the command, it sends nothing"
+                   % (H["PROG"], args.name, RECOVER_SENTENCE, H["PROG"], args.name, message))
+        hint = ("%s: %s was not retired: the end hook could not push (%s): pod kept, record kept; `%s retire %s` again once it can "
+                "(only if there is nothing to save, `cloud-worker delete %s --force` is the explicit last resort: it discards the pod and its work)"
+                % (H["PROG"], args.name, note or "no reason given", H["PROG"], args.name, args.name))
+        sys.stderr.write(recover + "\n" + hint + "\n")
         print("%s: pod kept" % args.name)
         return H["EXIT_ERROR"]
     if code != 0:

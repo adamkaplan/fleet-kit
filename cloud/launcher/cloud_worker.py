@@ -35,6 +35,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import run_record  # noqa: E402  (the run record: one module, one function the stop calls)
 
 NAME_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")  # the switchboard's agent name rule
+NAME_OBJECT = re.compile(r"[a-z0-9][a-z0-9.-]{0,252}")   # a Kubernetes object name (what an ownerReference may name)
 SHAPES = {"XS": {"cpu": "1", "memory": "2Gi", "usd_per_hour": 0.05, "stack": False},   # the light shape: no nested Docker (the default of a non-stack worker)
           # the orchestrator row: it reads and relays, it builds nothing; no nested Docker. The estimate is the larger of the ratios 0.25 (cpu) and 0.375 (memory) against XS 0.05 = 0.01875, rounded up
           "O": {"cpu": "250m", "memory": "768Mi", "usd_per_hour": 0.02, "stack": False},
@@ -377,6 +378,16 @@ CLUSTER_DOMAIN = "cluster.local"   # the one place the cluster domain is named
 HUB_SUBDOMAIN = "cw-agents"   # the headless Service (made by the hub manifests) that gives a hub pod the DNS name <pod>.cw-agents.<namespace>.svc.cluster.local
 
 
+PERSISTENT_ANNOTATION = "cw/persistent"   # on the pod template (so on the pod) and on the StatefulSet of a persistent orchestrator
+PERSISTENT_PATTERN = re.compile(r"[1-9][0-9]?")   # the ONE form of the value, used by the settings validator and by the launch: no leading zero, no space
+PERSISTENT_SETTING = "CW_MAX_PERSISTENT"   # the settings maximum of persistent orchestrators in the namespace
+PERSISTENT_DEFAULT_MAX = 2
+PERSISTENT_MAX_LIMIT = 20
+PERSISTENT_DAY_SECONDS = 24 * 3600          # the spend cap prices ONE DAY of the shape for a persistent launch
+WORKLOAD_DELETE_SECONDS = 120               # the bounded wait of a StatefulSet delete (kubectl's own --timeout)
+PERSISTENT_UNREADABLE = "persistent workload unreadable: left alone"   # the reaper's one report line
+
+
 def hub_agent_url(pod_name, namespace):
     return "http://%s.%s.%s.svc.%s:4096" % (pod_name, HUB_SUBDOMAIN, namespace, CLUSTER_DOMAIN)
 
@@ -391,6 +402,10 @@ class CloudError(Exception):
     def __init__(self, msg, code=EXIT_CLOUD):
         super().__init__(msg)
         self.code = code
+
+
+class WorkloadForbidden(CloudError):
+    """The cluster refused the read of a StatefulSet: the login's Role lacks the rule for StatefulSets in the apps group."""
 
 
 class PodChanged(Exception):
@@ -2109,6 +2124,16 @@ def spend_cap(env):
     return cap
 
 
+def max_persistent(env):
+    """The settings maximum of persistent orchestrators in the namespace: the setting (an integer 1 to 20), else 2. A bad value refuses (exit 2)."""
+    raw = env.get(PERSISTENT_SETTING) or ""
+    if not raw:
+        return PERSISTENT_DEFAULT_MAX
+    if not PERSISTENT_PATTERN.fullmatch(raw) or not 1 <= int(raw) <= PERSISTENT_MAX_LIMIT:
+        raise CloudError("%s must be an integer from 1 to %d; nothing was created" % (PERSISTENT_SETTING, PERSISTENT_MAX_LIMIT), EXIT_USAGE)
+    return int(raw)
+
+
 def as_cost(x):
     """A finite non-negative number, or refuse: a cost that cannot be read is not a cost of zero."""
     if isinstance(x, bool) or not isinstance(x, (int, float)) or not math.isfinite(x) or x < 0:
@@ -2269,6 +2294,49 @@ class Kube:
 
     def list_pods(self):
         return json.loads(self.run(["get", "pods", "-l", "app=" + LABEL, "-o", "json"]))["items"]
+
+    def _raw(self, args, timeout=120):
+        """One kubectl call whose three results are returned whole: (exit status, stdout, stderr). A failure to run it raises CloudError."""
+        if not self.context:
+            raise CloudError("CW_KUBE_CONTEXT is not set; refusing to run kubectl against an unnamed context", EXIT_USAGE)
+        cmd = [self.bin] + (["--kubeconfig", self.kubeconfig] if self.kubeconfig else []) + ["--context", self.context, "-n", self.ns] + args
+        try:
+            p = subprocess.run(cmd, capture_output=True, timeout=timeout, env=self.env)   # bytes: a carriage return is kept, never folded into a newline
+        except (OSError, subprocess.TimeoutExpired) as e:
+            raise CloudError("kubectl failed: %s" % self.scrub(e))
+        return p.returncode, p.stdout.decode("utf-8", "replace"), p.stderr.decode("utf-8", "replace")
+
+    def get_workload(self, name):
+        """The StatefulSet of this name, or None when the cluster says, in these exact words and on stderr alone, that THIS one is not there:
+        `Error from server (NotFound): statefulsets.apps "NAME" not found` (one trailing newline allowed). The Forbidden answer for this object
+        raises a CloudError that names the Role's missing rule. EVERY other answer (another name, kind, wording, extra or mixed output, a server
+        error, an empty answer, an answer for another namespace) raises an `unreadable` CloudError: never None."""
+        code, out, err = self._raw(["get", "statefulset", name, "-o", "json"])
+        quoted = re.escape(name)
+        if code != 0 and not out and re.fullmatch(r'Error from server \(NotFound\): statefulsets\.apps "%s" not found\n?' % quoted, err):
+            return None
+        if code != 0 and not out and re.fullmatch(r'Error from server \(Forbidden\): statefulsets\.apps "%s" is forbidden: [^\r\n]*in the namespace "%s"\n?' % (quoted, re.escape(self.ns)), err):
+            raise WorkloadForbidden("the cluster login's Role lacks the rule for StatefulSets in the apps group (the owner's step: the administrator applies it); "
+                                    "nothing was created or judged")
+        if code == 0:
+            try:
+                obj = json.loads(out)
+            except ValueError:
+                obj = None
+            if isinstance(obj, dict) and obj.get("kind") == "StatefulSet" and (obj.get("metadata") or {}).get("name") == name:
+                return obj
+        raise CloudError("workload %s unreadable: the cluster's answer is not the StatefulSet asked for (%s)" % (name, self.scrub(" ".join(err.split()) or "no message", 120)))
+
+    def list_workloads(self):
+        """The StatefulSets of the launcher's label in the namespace (a failure, a forbidden list included, raises CloudError)."""
+        return json.loads(self.run(["get", "statefulsets", "-l", "app=" + LABEL, "-o", "json"]))["items"]
+
+    def delete_workload_and_wait(self, name):
+        """Delete the StatefulSet and return only when it is gone, within WORKLOAD_DELETE_SECONDS (its controller would recreate a pod deleted alone)."""
+        try:
+            self.run(["delete", "statefulset", name, "--ignore-not-found", "--wait=true", "--timeout=%ds" % WORKLOAD_DELETE_SECONDS], timeout=WORKLOAD_DELETE_SECONDS + 30)
+        except CloudError as e:
+            raise CloudError("the StatefulSet %s was not deleted within %d seconds: %s" % (name, WORKLOAD_DELETE_SECONDS, e)) from None
 
     def list_pods_all(self):
         """EVERY pod of the namespace (not only the worker's): the status summary counts them by phase. One call, one read."""
@@ -2682,6 +2750,54 @@ def render_pod(a, worker, name, now, hard, env, run_names=()):
     return pod
 
 
+def render_workload(a, worker, name, now, env, run_names=()):
+    """The persistent orchestrator: ONE StatefulSet (apps/v1, one replica, the headless agent service) around render_pod's own pod: restart
+    Always, no active deadline, no hard-deadline, idle or max-hard annotation (and no deadline names in the environment), the annotation cw/persistent.
+    The guards run on the WHOLE StatefulSet spec. Its pod is NAME-0 (the controller names it and sets its hostname and subdomain)."""
+    pod = render_pod(a, worker, name, now, now, env, run_names)
+    meta, spec = pod["metadata"], pod["spec"]
+    spec["restartPolicy"] = "Always"
+    for key in ("activeDeadlineSeconds", "hostname", "subdomain"):
+        spec.pop(key, None)
+    for container in spec["containers"]:
+        container["env"] = [e for e in container["env"] if e["name"] not in ("CW_IDLE_SECONDS", "CW_HARD_DEADLINE")]
+    annotations = {k: v for k, v in meta["annotations"].items() if k not in ("cw/hard-deadline", "cw/idle-seconds", "cw/max-hard")}
+    annotations[PERSISTENT_ANNOTATION] = "true"
+    labels = dict(meta["labels"])
+    selector = {"app": LABEL, "cw/worker": worker}
+    top = {"app": LABEL, "cw/worker": worker, **({"cw/run-id": a.run_id} if getattr(a, "run_id", None) else {})}
+    workload = {"apiVersion": "apps/v1", "kind": "StatefulSet",
+                "metadata": {"name": name, "labels": top, "annotations": dict(annotations)},
+                "spec": {"replicas": 1, "serviceName": HUB_SUBDOMAIN, "selector": {"matchLabels": selector},
+                         "template": {"metadata": {"labels": labels, "annotations": annotations}, "spec": spec}}}
+    bad = workload_problems(workload)
+    if bad:
+        raise CloudError("refusing a pod spec with a forbidden field: %s" % ", ".join(bad), EXIT_USAGE)
+    return workload
+
+
+def _workload_views(workload):
+    template = workload["spec"]["template"]
+    return [{"metadata": template["metadata"], "spec": template["spec"]}, {"spec": workload["spec"]}]
+
+
+def workload_problems(workload):
+    """The forbidden-field names found anywhere in the whole StatefulSet spec: every row on the template as a pod, and the rows that look at
+    text (docker.sock, hostPath) on the whole spec too (a volume claim or any other key of the StatefulSet could carry them)."""
+    found = set(forbidden_pod_fields(_workload_views(workload)[0]))
+    whole = {"spec": workload["spec"]}
+    if FORBIDDEN_POD_FIELDS["docker.sock"](whole):
+        found.add("docker.sock")
+    if '"hostPath"' in json.dumps(workload["spec"]):
+        found.add("hostPath")
+    return sorted(found)
+
+
+def scan_workload(workload):
+    """Stored-credential patterns found in the whole StatefulSet (empty means clean)."""
+    return sorted({hit for view in _workload_views(workload) + [workload] for hit in scan_credentials(view)})
+
+
 def _cap_text(kube, text, limit):
     """PC-14: known secrets first (no cut), then addresses, then the cut."""
     return _mask_addresses(kube.scrub(text, SCRUB_OUTPUT_MAX))[:limit]
@@ -2715,7 +2831,7 @@ class Launcher:
         self.renew_lock = threading.RLock()   # the pass and the renewal thread never renew at the same moment
 
     # -- audit: one line per action, no secret, written before the action returns --
-    def audit(self, worker, runtime_id, action, cost, ok, reason="", refresh=None, cause=None):
+    def audit(self, worker, runtime_id, action, cost, ok, reason="", refresh=None, cause=None, extra=None):
         line = {"ts": iso(self.clock()), "worker": worker, "runtime_id": runtime_id, "action": action,
                 "cost_estimate_usd": cost, "ok": ok, "actor": pwd.getpwuid(os.getuid()).pw_name,
                 "reason": self.kube.scrub(reason, limit=1000)}
@@ -2723,7 +2839,7 @@ class Launcher:
             line["refresh"] = refresh
         if cause:   # a stop the launcher made of its own accord names why: idle, hard, pod_gone or pod_failed (a person's stop has none)
             line["cause"] = cause
-        write_audit(self.audit_path, line)
+        write_audit(self.audit_path, dict(line, **(extra or {})))
 
     def cost(self, pod):
         hours = (self.clock() - parse_iso(ann(pod, "started"))).total_seconds() / 3600
@@ -2739,17 +2855,20 @@ class Launcher:
             if info.get("identity_note"):
                 text = "%s%s%s" % (text, "; " if text else "", info["identity_note"])
             return "%s; %s" % (text, info["hook_note"]) if text and info.get("hook_note") else (text or info.get("hook_note", ""))
+
+        def extra():   # a persistent orchestrator's line says so (no other line has the key)
+            return {"persistent": True} if info.get("persistent") else None
         try:
             result = fn(info)
         except CloudError as e:
             if not e.audited:
                 # the failure is never dropped: a caller's own reason (a stop reason, the run-secret names) comes first
-                self.audit(worker, info["rid"], action, info["cost"], False, "%s; %s" % (why(), e) if why() else str(e), info.get("refresh"), info.get("cause"))
+                self.audit(worker, info["rid"], action, info["cost"], False, "%s; %s" % (why(), e) if why() else str(e), info.get("refresh"), info.get("cause"), extra())
             raise
         except (ValueError, TypeError, KeyError) as e:  # a bad annotation or reply still writes its ok:false line
-            self.audit(worker, info["rid"], action, info["cost"], False, why() or str(e)[:300], info.get("refresh"), info.get("cause"))
+            self.audit(worker, info["rid"], action, info["cost"], False, why() or str(e)[:300], info.get("refresh"), info.get("cause"), extra())
             raise CloudError("unexpected cloud data: %s" % self.kube.scrub(e, 200))
-        self.audit(worker, info["rid"], action, info["cost"], True, why(), info.get("refresh"), info.get("cause"))
+        self.audit(worker, info["rid"], action, info["cost"], True, why(), info.get("refresh"), info.get("cause"), extra())
         return result
 
     def _need(self, worker):
@@ -2775,14 +2894,38 @@ class Launcher:
         if spent >= cap or spent + launch > cap:
             raise CloudError("spend cap reached (cap USD %s, spent %.4f, this launch %.4f)" % (cap, spent, launch), EXIT_CAP)
 
+    def _persistent_refusals(self, a, agent, run_values):
+        """--persistent is for an orchestrator launched with the per-run git-token Secret, never a worker or a stack launch: each refusal names
+        itself, exits 2 and happens before any cluster call."""
+        if agent != "orchestrator":
+            raise CloudError("--persistent is only for --agent orchestrator, not a worker; nothing was created", EXIT_USAGE)
+        if getattr(a, "stack", False):
+            raise CloudError("--persistent does not combine with --stack (a stack launch is a one-shot pod); nothing was created", EXIT_USAGE)
+        if GIT_TOKEN_KEY not in run_values:
+            raise CloudError("--persistent needs the per-run token route: pass --run-secret-fd %s=N (the reaper renews that Secret); nothing was created" % GIT_TOKEN_KEY, EXIT_USAGE)
+
+    def check_persistent_count(self):
+        """A persistent create that would make the namespace's StatefulSets of the launcher's label exceed the settings maximum, or whose count
+        cannot be read, is refused (exit 2) and nothing is created."""
+        limit = max_persistent(self.env)
+        try:
+            count = len(self.kube.list_workloads())
+        except (CloudError, ValueError, KeyError, TypeError) as e:
+            raise CloudError("could not count the persistent orchestrators of the namespace (%s); nothing was created" % self.kube.scrub(e, 150), EXIT_USAGE)
+        if count + 1 > limit:
+            raise CloudError("the namespace already has %d persistent orchestrator(s); the maximum is %d (%s); nothing was created" % (count, limit, PERSISTENT_SETTING), EXIT_USAGE)
+
     # -- create --
     def create(self, a):
         worker, name = a.worker, pod_name(a.worker)
         self.run_id, self.foreign = getattr(a, "run_id", None), []   # what this call proved is another's is never deleted
-        made = {"secret": False, "run": False, "pod": False, "reg": None}  # set before the call that may create it: an interrupt may land after
+        made = {"secret": False, "run": False, "pod": False, "reg": None, "sts": False}  # set before the call that may create it: an interrupt may land after
+        persistent = bool(getattr(a, "persistent", False))
 
         def go(info):
-            info["rid"] = "pod/" + name
+            info["rid"] = "pod/" + name + ("-0" if persistent else "")
+            if persistent:
+                info["persistent"] = True
             issue_no = parse_issue_number(getattr(a, "issue", None))   # before anything is made
             check_repo_allowed(a.repo, self.env)  # before anything is read or made
             if not NAME_RE.fullmatch(worker):
@@ -2791,7 +2934,7 @@ class Launcher:
             now = self.clock()
             hard = now + dt.timedelta(seconds=parse_duration(a.hard))
             max_hard = now + dt.timedelta(seconds=parse_duration(a.max_hard))
-            if hard > max_hard:
+            if hard > max_hard and not persistent:
                 raise CloudError("--hard is past --max-hard", EXIT_REFUSED)
             run_values = read_run_secret_values(parse_run_secret_fds(a.run_secret_fd))  # before anything is made
             stack_secret = getattr(a, "stack_model_secret", None)
@@ -2803,18 +2946,26 @@ class Launcher:
             agent = getattr(a, "agent", None) or "worker"
             if agent not in AGENTS:   # before any cluster call
                 raise CloudError("--agent must be one of %s, got %r; nothing was created" % (" or ".join(AGENTS), str(agent)[:40]), EXIT_USAGE)
+            if persistent:
+                self._persistent_refusals(a, agent, run_values)
+                max_persistent(self.env)   # a bad setting is refused before any cluster call
             hub = agent == "orchestrator" or hub_on(self.env)
             if hub:   # the per-pod channel secret: random, only its sha256 leaves the pod's Secret, never printed
                 if CHANNEL_SECRET_KEY in run_values:
                     raise CloudError("%s is the launcher's own key" % CHANNEL_SECRET_KEY, EXIT_USAGE)
                 run_values[CHANNEL_SECRET_KEY] = secrets.token_hex(32)
             self.kube.add_secrets(*run_values.values())  # known to scrub before the first kubectl call
-            self.check_cap(a.shape, int((hard - now).total_seconds()))
-            spec = render_pod(a, worker, name, now, hard, self.env, sorted(run_values))
-            hits = scan_credentials(spec)
+            self.check_cap(a.shape, PERSISTENT_DAY_SECONDS if persistent else int((hard - now).total_seconds()))
+            if persistent:
+                self.check_persistent_count()
+                spec = render_workload(a, worker, name, now, self.env, sorted(run_values))
+                hits = scan_workload(spec)
+            else:
+                spec = render_pod(a, worker, name, now, hard, self.env, sorted(run_values))
+                hits = scan_credentials(spec)
             if hits:
                 raise CloudError("refusing a pod spec with a stored credential: %s" % ", ".join(hits), EXIT_USAGE)
-            if self.kube.get_pod(name):
+            if self.kube.get_pod(name) or (persistent and (self.kube.get_workload(name) or self.kube.get_pod(name + "-0"))):
                 raise CloudError("worker %s already exists" % worker, EXIT_EXISTS)
             password = secrets.token_urlsafe(32)
             self.kube.add_secrets(password)
@@ -2826,12 +2977,13 @@ class Launcher:
                     self._make(made, "run", self.kube.create_run_secret, name, name, run_values, *([a.run_id] if getattr(a, "run_id", None) else []))
                 if hub:
                     made["reg"] = (self._registry_secret(), worker)   # set before the call: a half write is undone by the cleanup
-                    self._register(worker, run_values[CHANNEL_SECRET_KEY], spec, self.env.get("CW_CLOUD_DOMAIN", "example.internal"), password, a.repo, issue_no)
-                self._make(made, "pod", self.kube.apply, spec)
+                    self._register(worker, run_values[CHANNEL_SECRET_KEY], spec if not persistent else {"metadata": {"name": name + "-0"}},
+                                   self.env.get("CW_CLOUD_DOMAIN", "example.internal"), password, persistent, a.repo, issue_no)
+                self._make(made, "sts" if persistent else "pod", self.kube.apply, spec)
                 if getattr(a, "stack", False):
                     self._start_stack_pod(worker, name, spec, made, a.wait)
                 else:
-                    self._wait_ready(name, a.wait)
+                    self._wait_ready(name + "-0" if persistent else name, a.wait)
                 if a.password_fd is not None:
                     with os.fdopen(os.dup(a.password_fd), "w") as f:
                         f.write(password)
@@ -2849,6 +3001,11 @@ class Launcher:
             except BaseException as e:  # interrupt or an unexpected exception: clean up, audit, say what was cleaned
                 self._abort(worker, name, made, e)
             domain = self.env.get("CW_CLOUD_DOMAIN", "example.internal")
+            if persistent:   # no deadline of either kind: the answer says so (never the defaults), and carries the field the end alert reads
+                return {"worker": worker, "url": "https://worker-%s-0.%s:4096" % (name, domain),
+                        "auth_ref": "file:/run/cw/%s.password" % worker, "runtime_id": "pod/" + name + "-0",
+                        "idle_deadline": None, "hard_deadline": None, "persistent": True,
+                        "password_fd": a.password_fd}
             return {"worker": worker, "url": "https://worker-%s.%s:4096" % (name, domain), "pod_uid": pod_uid,
                     **({"identity_note": info["identity_note"]} if "identity_note" in info else {}),
                     "auth_ref": "file:/run/cw/%s.password" % worker, "runtime_id": "pod/" + name,
@@ -2909,11 +3066,13 @@ class Launcher:
     def _registry_secret(self):
         return self.env.get("CW_HUB_REGISTRY_SECRET") or DEFAULT_REGISTRY_SECRET
 
-    def _register(self, agent, channel_secret, spec, domain, password, repo=None, issue=None):
-        """The hub's registry: {agent: sha256 hex of the channel secret} and {agent: {url, session, password_file, repo[, issue]}}. Only the hash is stored."""
+    def _register(self, agent, channel_secret, spec, domain, password, persistent=False, repo=None, issue=None):
+        """The hub's registry: {agent: sha256 hex of the channel secret} and {agent: {url, session, password_file[, persistent][, repo][, issue]}}. Only the hash is stored."""
         digest = hashlib.sha256(channel_secret.encode()).hexdigest()
         name = spec["metadata"]["name"]
         entry = {"url": hub_agent_url(name, self.env.get("CW_CLOUD_NAMESPACE", "cw")), "session": "", "password_file": "%s/%s" % (HUB_PW_DIR, agent)}
+        if persistent:   # only a persistent orchestrator's entry has the key
+            entry["persistent"] = True
         if repo is not None:
             entry["repo"] = repo
         if issue is not None:
@@ -2956,6 +3115,8 @@ class Launcher:
             return True   # a caller that sent no --run-id gets the plain behaviour
         if kind == "pod":
             obj, where = self.kube.get_pod(name), "annotations"
+        elif kind == "sts":
+            obj, where = self.kube.get_workload(name), "annotations"
         else:
             obj, where = self.kube.get_secret(name + ("-pw" if kind == "secret" else "-run")), "labels"
         if not obj:
@@ -2973,6 +3134,17 @@ class Launcher:
         if made.get("reg"):
             self._unregister(made["reg"][1])
         try:
+            if made.get("sts"):   # the workload FIRST and waited for (its controller would recreate a pod deleted alone), then its pod
+                try:
+                    mine = self._mine("sts", name)
+                    if mine is False:
+                        self.foreign.append("statefulset/" + name)
+                        print("cloud-worker: statefulset/%s is not this call's (its run id does not match); left whole" % name, file=sys.stderr)
+                    elif mine:
+                        self.kube.delete_workload_and_wait(name)
+                        self.kube.delete_pod(name + "-0")
+                except CloudError:
+                    left.append("statefulset/" + name)
             for kind, fn, label in (("pod", self.kube.delete_pod, "pod/" + name), ("secret", self.kube.delete_secret, "secret/%s-pw" % name),
                                   ("run", self.kube.delete_run_secret, "secret/%s-run" % name)):
                 if made[kind]:
@@ -3009,14 +3181,15 @@ class Launcher:
     def _abort(self, worker, name, made, exc):
         interrupted = isinstance(exc, (Interrupted, KeyboardInterrupt))
         left = self._cleanup(name, made)
-        cleaned = [l for k, l in (("pod", "pod/" + name), ("secret", "secret/%s-pw" % name), ("run", "secret/%s-run" % name)) if made[k] and l not in left and l not in self.foreign]
+        cleaned = [l for k, l in (("sts", "statefulset/" + name), ("pod", "pod/" + name), ("secret", "secret/%s-pw" % name), ("run", "secret/%s-run" % name)) if made.get(k) and l not in left and l not in self.foreign]
         reason = "%s; cleaned: %s" % ("interrupted" if interrupted else "failed: %s" % str(exc)[:200], ", ".join(cleaned) or "nothing")
         if left:
             reason += "; REMAINS: %s; delete each with: %s" % (", ".join(left), "; ".join(self._delete_cmd(l) for l in left))
         note = self._run_secret_note(name, made, left)
         if note:
             reason += "; " + note
-        self.audit(worker, "pod/" + name, "create.interrupted" if interrupted else "create.failed", 0.0, False, reason)
+        self.audit(worker, "pod/" + name + ("-0" if made.get("sts") else ""), "create.interrupted" if interrupted else "create.failed", 0.0, False, reason,
+                   {"persistent": True} if made.get("sts") else None)
         err = CloudError("create %s" % reason, EXIT_INTERRUPTED if interrupted else EXIT_CLOUD)
         err.audited = True
         raise err from None
@@ -3177,16 +3350,36 @@ class Launcher:
             if getattr(a, "cause", None):
                 info["cause"] = a.cause
             pod = self._need(worker)
-            uid = ((pod or {}).get("metadata") or {}).get("uid")
-            self._orchestrator = _pod_env(pod, "FLEET_AGENT_NAME") if pod and _pod_env(pod, "FLEET_CLOUD_TOKEN_FILE") else None   # a hub pod, orchestrator or worker
+            persistent = False
+            workload = None
+            if pod is None:
+                # ONE strict read: every answer but the exact not-found (the exact Forbidden line included) fails the stop with everything kept
+                try:
+                    workload = self._absent_pod_workload(name)
+                except CloudError as e:
+                    raise CloudError("the persistent orchestrator %s has its workload unreadable; nothing was stopped or deleted: %s" % (worker, e), EXIT_HOOK) from None
+                if workload is not None:
+                    persistent = True
+                    pod = self.kube.get_pod(name + "-0")
+            self._persistent_stop = name if persistent else None
+            target = name + "-0" if persistent else name   # the pod the hook, the record and the marks act on
+            if persistent:
+                info["persistent"] = True
+            uid = ((pod or {}).get("metadata") or {}).get("uid") if not persistent else None   # a persistent pod is never deleted alone: no pod-bound delete
+            if persistent:
+                template = (((workload.get("spec") or {}).get("template")) or {})
+                self._orchestrator = _pod_env({"spec": template.get("spec") or {}}, "FLEET_AGENT_NAME") or None
+            else:
+                self._orchestrator = _pod_env(pod, "FLEET_AGENT_NAME") if pod and _pod_env(pod, "FLEET_CLOUD_TOKEN_FILE") else None   # a hub pod, orchestrator or worker
             want_uid = getattr(a, "pod_uid", None)
-            if want_uid and pod and uid != want_uid:   # a new pod holds the name: not the one the record names; it and its Secrets are left whole
+            if want_uid and pod and not persistent and uid != want_uid:   # a new pod holds the name: not the one the record names; it and its Secrets are left whole
                 raise CloudError("pod/%s is not the pod this worker's record names (its uid differs); nothing was stopped or deleted" % name, EXIT_REFUSED)
-            if nonce and pod:
-                info["rid"] = "pod/" + name
-                if ann(pod, "run-id") != nonce:   # another run's (or an unlabelled) worker of this name: nothing is changed
+            if nonce and (pod or persistent):
+                info["rid"] = "pod/" + target
+                have = ann(pod, "run-id") if pod else ((workload.get("metadata") or {}).get("annotations") or {}).get("cw/run-id")
+                if have != nonce:   # another run's (or an unlabelled) worker of this name: nothing is changed
                     raise CloudError("worker %s does not match run id %s; nothing was stopped or deleted" % (worker, nonce), EXIT_REFUSED)
-            if not pod:
+            if not pod and not persistent:
                 if getattr(a, "cause", None):   # only the reaper's own stop names a cause; a by-name stop carries none
                     info["cause"] = "pod_gone"
                 if nonce:   # no pod: this run's own Secrets (carrying the nonce) may remain from a cut-off create; another's are left whole
@@ -3204,16 +3397,23 @@ class Launcher:
                 if getattr(a, "hub_entry", False) and not self._unregister(worker):   # the same call the live path uses; a failure is reported
                     raise CloudError("the hub registry entry of %s could not be removed (the Secrets are); retire again to finish" % worker)
                 return {"worker": worker, "runtime_id": "", "pushed": False, "wip_branch": None, "pod_gone": True, "secrets_removed": removed}
-            info["rid"], info["cost"] = "pod/" + name, self.cost(pod)
+            info["rid"] = "pod/" + target
+            info["cost"] = self.cost(pod if pod else {"metadata": {"annotations": ((workload.get("spec") or {}).get("template") or {}).get("metadata", {}).get("annotations") or {}}})
             if not getattr(a, "no_record", False):   # BEFORE the hook and the delete; never raises, never holds the stop back
-                where = self.recorder.record(worker, name, reason or "stop", repo=_pod_repo(pod), started=ann(pod, "started") or "",
-                                             root=getattr(a, "record_dir", None))
+                where = self.recorder.record(worker, target, reason or "stop", repo=_pod_repo(pod) if pod else "", started=ann(pod, "started") or "" if pod else "",
+                                             root=getattr(a, "record_dir", None), **({"persistent": True} if persistent else {}))
                 if where:
                     info["record"] = where
                     print("cloud-worker: run record: %s" % where, file=sys.stderr)
             if info.get("record"):   # BEFORE the hook and the delete: what the pod object says of the pod, and its events when it is not Running
                 self._record_pod_state(info["record"], pod, name)
-            phase = (pod.get("status") or {}).get("phase")
+            phase = (pod.get("status") or {}).get("phase") if pod else "Absent"
+            if persistent and not pod:   # its controller has no pod now: nothing runs, no hook can run; the workload goes first
+                self._remove(name, nonce, uid)
+                print("cloud-worker: the persistent pod was absent; end hook not run; the StatefulSet was deleted", file=sys.stderr)
+                self._hook_record(info, {"ran": False, "pushed": False, "wip_branch": None, "skipped": [], "note": "pod was absent; end hook not run"})
+                return {"worker": worker, "runtime_id": "pod/" + target, "pushed": False, "wip_branch": None,
+                        "skipped": [], "note": "pod was absent; end hook not run", "record": info.get("record", "")}
             if phase == "Failed" and getattr(a, "cause", None):
                 info["cause"] = "pod_failed"
             if phase in ("Failed", "Succeeded") and ann(pod, "kept") != "true":  # a pod kept for unpushed work is never deleted here
@@ -3222,11 +3422,11 @@ class Launcher:
                 self._remove(name, nonce, uid)
                 print("cloud-worker: pod was %s; end hook not run; deleted" % phase, file=sys.stderr)
                 self._hook_record(info, {"ran": False, "pushed": False, "wip_branch": None, "skipped": [], "note": "pod was %s; end hook not run" % phase})
-                return {"worker": worker, "runtime_id": "pod/" + name, "pushed": False, "wip_branch": None,
+                return {"worker": worker, "runtime_id": "pod/" + target, "pushed": False, "wip_branch": None,
                         "skipped": [], "note": "pod was %s; end hook not run" % phase, "record": info.get("record", "")}
             info["refresh"] = REFRESH_NONE
             try:
-                res = self.run_hook(name)
+                res = self.run_hook(target)
             except CloudError as e:
                 res = {"pushed": False, "wip_branch": None, "error": str(e)}
             if res.get("refresh") == "needed" and res.get("error") and not res.get("pushed"):
@@ -3235,7 +3435,7 @@ class Launcher:
                 info["refresh"] = self.refresh_for_stop(pod, self.clock())
                 if info["refresh"] == REFRESH_USED:
                     try:
-                        res = self.run_hook(name)
+                        res = self.run_hook(target)
                     except CloudError as e:
                         res = {"pushed": False, "wip_branch": None, "error": str(e)}
             view = self._hook_view(res)   # every field text from the pod: a string, scrubbed, short
@@ -3246,11 +3446,11 @@ class Launcher:
             self.last_hook = {k: view[k] for k in ("pushed", "wip_branch", "error")}
             self._hook_record(info, dict(view, ran=True, refresh=info["refresh"]))
             if view["error"]:
-                note = self._mark(name, uid, kept="true")  # the pod is kept: the commit is not safe yet
+                note = self._mark(target, pod["metadata"].get("uid"), kept="true")  # the pod is kept (and its workload): the commit is not safe yet
                 raise CloudError("end hook could not push, pod kept: %s%s; %s" % (view["error"], "; " + note if note else "", RECOVERY_ROUTE), EXIT_HOOK)
             note = ""
             try:
-                note = self._mark(name, uid, hook_ran="true")
+                note = self._mark(target, pod["metadata"].get("uid"), hook_ran="true")
             finally:
                 self._remove(name, nonce, uid)  # the hook succeeded: whatever happens next, the pod and its Secrets go (that pod only)
             if note:
@@ -3272,10 +3472,29 @@ class Launcher:
                     "wip_branch": view["wip_branch"], "skipped": skipped, "record": info.get("record", "")}
         return self._audited(worker, "stop", go, audit_reason)
 
+    def _persistent_workload(self, name):
+        """The StatefulSet of a worker whose own pod is not there (the strict read), or None. The Role's missing rule (a Forbidden answer) means this
+        launcher cannot have made one: None. Any other unreadable answer raises: a stop never reads an unknown answer as no workload."""
+        try:
+            return self.kube.get_workload(name)
+        except WorkloadForbidden:
+            return None
+
+    def _absent_pod_workload(self, name):
+        """The ONE strict read for a worker whose pod NAME is absent (shared by stop and delete): the StatefulSet named like the worker, or None
+        for the exact not-found. Every other answer (a near miss, the exact Forbidden line) raises CloudError."""
+        return self.kube.get_workload(name)
+
     def _remove(self, name, nonce, uid=None):
         """Delete the pod and both Secrets (as `delete` does); with a nonce, only those that carry it (the pod, when there, matched already).
-        With a uid the pod delete carries it as a precondition: a pod that changed since it was read is left whole, with a refusal."""
+        With a uid the pod delete carries it as a precondition: a pod that changed since it was read is left whole, with a refusal.
+        A persistent orchestrator: the StatefulSet FIRST, waited for within its bound (its controller would recreate a pod deleted alone); a delete
+        that does not finish raises here and NOTHING else is removed (the pod, both Secrets and the hub entries stay); then the pod, then the rest."""
         try:
+            if getattr(self, "_persistent_stop", None) == name:
+                self.kube.delete_workload_and_wait(name)
+                self.kube.delete_pod(name + "-0")
+                uid = None
             got = self._remove_bound(name, nonce, uid)
             if getattr(self, "_orchestrator", None):   # the pod and its Secrets are gone: so are its hub entries
                 self._unregister(self._orchestrator)
@@ -3423,6 +3642,14 @@ class Launcher:
 
         def go(info):
             pod = self._need(worker)
+            if not pod:   # the same ONE strict read as the stop: a StatefulSet or any answer but the exact not-found refuses, nothing deleted
+                try:
+                    found = self._absent_pod_workload(name)
+                except CloudError:
+                    found = True
+                if found is not None:
+                    raise CloudError("worker %s is a persistent orchestrator: delete is refused (even with --force); use the stop command: cloud-worker stop %s"
+                                     % (worker, worker), EXIT_USAGE)
             if not pod:
                 return {"worker": worker, "runtime_id": "", "deleted": True}
             info["rid"], info["cost"] = "pod/" + name, self.cost(pod)
@@ -3484,6 +3711,10 @@ class Launcher:
                     "deadlines": {"idle": None, "hard": ann(pod, "hard-deadline")}, "cost_estimate_usd": self.cost(pod),
                     "pod_failed": note["pod_failed_reason"][:160], "status_line": "pod failed: " + note["pod_failed_reason"][:160]}
         act = self.activity(name)
+        if ann(pod, "persistent") is not None:   # under the worker's name (NAME-0 is only its runtime id): persistent, no deadline, its age and accrued cost
+            hours = max((self.clock() - parse_iso(ann(pod, "started"))).total_seconds() / 3600, 0)
+            return {"worker": ann(pod, "worker"), "runtime_id": "pod/" + name, "phase": pod.get("status", {}).get("phase"), "persistent": True,
+                    "idle_since": None, "deadlines": {"idle": None, "hard": None}, "age_hours": round(hours, 4), "cost_estimate_usd": self.cost(pod)}
         idle_for = int(ann(pod, "idle-seconds", "600"))
         since = act[1] if act and not act[0] else None
         return {"worker": ann(pod, "worker"), "runtime_id": "pod/" + name, "phase": pod.get("status", {}).get("phase"),
@@ -3600,6 +3831,8 @@ class Launcher:
         if a.worker and not NAME_RE.fullmatch(a.worker):
             raise CloudError("bad worker name %r" % a.worker, EXIT_USAGE)
         pods = [self.kube.get_pod(pod_name(a.worker))] if a.worker else self.kube.list_pods()
+        if a.worker and not pods[0] and self._persistent_workload(pod_name(a.worker)) is not None:
+            pods = [self.kube.get_pod(pod_name(a.worker) + "-0")]   # a persistent orchestrator: shown under the worker's name
         if a.worker and not pods[0]:
             raise CloudError("unknown worker %s" % a.worker, EXIT_USAGE)
         return [self.record(p) for p in pods]
@@ -3746,6 +3979,19 @@ class Launcher:
                 print("cloud-worker: WARNING: no usable record for %s; using the pod's own deadline" % ann(pod, "worker"), file=sys.stderr)
         return min(hard, parse_iso(ann(pod, "max-hard", iso(hard))))  # a record never lengthens a life past the cap
 
+    def _persistent_owned(self, pod):
+        """True only when the pod's own StatefulSet (named by its ownerReferences) is read strictly, exists, carries cw/persistent and owns this pod
+        (an ownerReference of kind StatefulSet with the same name). Forbidden, unreadable, absent or any mismatch is False."""
+        try:
+            refs = [r for r in ((pod.get("metadata") or {}).get("ownerReferences") or []) if isinstance(r, dict) and r.get("kind") == "StatefulSet"]
+            if len(refs) != 1 or not isinstance(refs[0].get("name"), str) or not NAME_OBJECT.fullmatch(refs[0]["name"]):
+                return False
+            workload = self.kube.get_workload(refs[0]["name"])
+            meta = (workload or {}).get("metadata") or {}
+            return bool(workload) and meta.get("name") == refs[0]["name"] and PERSISTENT_ANNOTATION in (meta.get("annotations") or {})
+        except (CloudError, ValueError, TypeError, AttributeError):
+            return False
+
     def _run_stops(self, jobs):
         """Stop the pods of one pass, at most REAP_PARALLEL at a time, each on its own per-stop copy of the launcher (own last_hook, run id, hub
         mark, record deadline and cluster view). Returns [(result, error, last_hook)] in the order of `jobs`. A stop past REAP_STOP_SECONDS is
@@ -3815,6 +4061,14 @@ class Launcher:
         for pod in pods:
             worker = ann(pod, "worker")
             reason = None
+            if PERSISTENT_ANNOTATION in ((pod.get("metadata") or {}).get("annotations") or {}):
+                # A persistent orchestrator is judged ONLY through its workload: never by a deadline or by idleness, never stopped here. A workload
+                # that cannot be read, or that does not own the pod, leaves the pod untouched (no stop, delete or patch) and is reported once.
+                if self._persistent_owned(pod):
+                    live.append(pod)   # the git token renewal still serves it
+                else:
+                    out.append((worker, PERSISTENT_UNREADABLE, 1))
+                continue
             failed = (pod.get("status") or {}).get("phase") == "Failed"
             try:
                 hard = self.hard_deadline(pod)
@@ -4033,6 +4287,10 @@ class Launcher:
         """The pods whose hard limit has not passed (a bad deadline is left to the pass's own report)."""
         out = []
         for pod in pods:
+            if ann(pod, "persistent") is not None:   # a persistent pod has no hard deadline: it is always before its limit
+                if self._persistent_owned(pod):   # only a pod whose own workload is read and owns it is renewed; the reap pass reports the others
+                    out.append(pod)
+                continue
             try:
                 if now < self.hard_deadline(pod):
                     out.append(pod)
@@ -4044,6 +4302,8 @@ class Launcher:
         """At minute 40 of a pod's life, ONE note asks its worker to push <worker>/wip (the text is wip_note). The pod's cw/wip-note annotation
         is set BEFORE the note goes, so a failed send is not repeated and a second pass never sends a second note. Never raises."""
         for pod in pods:
+            if ann(pod, "persistent") is not None:   # an always-on orchestrator is not asked to push at minute 40
+                continue
             try:
                 worker, name = ann(pod, "worker"), pod["metadata"]["name"]
                 if (pod.get("status") or {}).get("phase") != "Running" or not NAME_RE.fullmatch(worker or ""):
@@ -4155,6 +4415,9 @@ class Launcher:
         for pod in pods:
             worker = ann(pod, "worker")
             try:
+                if ann(pod, "persistent") is not None and (pod.get("status") or {}).get("phase") == "Running" and NAME_RE.match(worker or "") \
+                        and not self.kube.get_run_secret(pod_name(worker)):   # a persistent pod's Secret is the worker's: its absence is ONE report line
+                    raise _NotRenewed("the per-run Secret of the persistent orchestrator was not found")
                 try:
                     done = self._renew_git_token(pod, now)
                 except (_NotRenewed, CloudError) as first:
@@ -4219,6 +4482,11 @@ class Launcher:
         name, worker = pod["metadata"]["name"], ann(pod, "worker")
         if (pod.get("status") or {}).get("phase") != "Running":
             return False
+        # a persistent pod is NAME-0 but its per-run Secrets are named after the worker: found by the worker's name. Any annotation the renewal needs
+        # (such as the token role) is read from the pod's own annotations, which are the pod template's.
+        persistent = ann(pod, "persistent") is not None and bool(NAME_RE.match(worker or ""))
+        if persistent:
+            name = pod_name(worker)
         secret = self.kube.get_run_secret(name)
         meta = (secret or {}).get("metadata") or {}
         labels = meta.get("labels") or {}
@@ -4390,6 +4658,7 @@ SETTINGS = (
     ("CW_STACK_PULL_TENANT_ID", False, "guid"),    # the tenant id (not a secret)
     ("CW_REPO_MIN_SHAPE", False, "name"),          # comma-separated OWNER/NAME=SHAPE: the smallest pod shape a launch for that repository may use (a floor)
     ("CW_VAULT_CHECK_DIR", False, "path"),         # the checkout the vault access check runs from; needed only after a vault firewall refusal (see vault_check_dir_problem)
+    ("CW_MAX_PERSISTENT", False, "number"),        # the most persistent orchestrators (StatefulSets of the launcher's label) the namespace may hold (an integer 1 to 20; default 2)
     ("CW_VAULT_BLOCK_DURATION", False, "duration"),   # how long the launcher refuses vault commands after a vault firewall refusal (default 10m, 1m to 60m)
 )
 SETTING_KINDS = {name: kind for name, _, kind in SETTINGS}
@@ -4542,6 +4811,7 @@ VALIDATORS = {
     "CW_STACK_PULL_TENANT_ID": ("a GUID", lambda v: bool(_GUID.fullmatch(v))),
     "CW_REPO_MIN_SHAPE": ("a comma-separated list of OWNER/NAME=SHAPE entries (SHAPE one of %s), no repository twice" % ", ".join(FLOOR_ORDER), lambda v: repo_min_shapes(v) is not None),
     "CW_VAULT_CHECK_DIR": ("an absolute path with no .. segment", _path_ok),
+    "CW_MAX_PERSISTENT": ("an integer from 1 to 20", lambda v: bool(PERSISTENT_PATTERN.fullmatch(v)) and 1 <= int(v) <= PERSISTENT_MAX_LIMIT),
     "CW_VAULT_BLOCK_DURATION": ("a duration of 1 to 3 digits and m or h, from 1m to 60m (for example 10m or 1h)", _duration_ok),
 }
 _SETTING_LINE = re.compile(r"([A-Z][A-Z0-9_]*)=(.*)")
@@ -4785,6 +5055,8 @@ def build_parser():
     c.add_argument("--stack-model-secret", metavar="NAME", help="with --stack: the NAME of the vault secret whose value arrives as the run secret %s (audit: the name and 'delivered'); never a value" % STACK_MODEL_KEY)
     c.add_argument("--agent", help="worker (default) or orchestrator: the agent the pod runs (CW_AGENT); any other value is refused before anything is made")
     c.add_argument("--boss", help="with --agent orchestrator: the name of its boss (FLEET_BOSS)")
+    c.add_argument("--persistent", action="store_true",
+                   help="with --agent orchestrator and the per-run git-token Secret: an always-on orchestrator as ONE StatefulSet (restart always, no deadline, no idle limit); ended only by an explicit stop; refused for a worker or a stack launch")
     c.add_argument("--wait", type=int, default=300)
     c.add_argument("--pull-secret", help="name of an existing image-pull Secret (pull-only) for imagePullSecrets")
     c.add_argument("--run-secret-fd", action="append", default=[], metavar="NAME=N",
