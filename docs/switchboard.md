@@ -4957,7 +4957,7 @@ between 0.2 and 10), after which the child is killed and the command goes on. Th
 audit (shadow) and its own `gate.fail_open`. What the shim adds is a line in `gate-failopen.jsonl` in the state directory (mode
 0600, at most 256 KB) for the cases only the shim can see: `would_refuse` (the check exited 10), `fail_open` (it timed out, could not
 run or exited with anything else, or there is no switchboard). **The file is written by any local process, so the daemon must read it as
-untrusted text** (clipped, data only); nothing reads it yet.
+untrusted text** (clipped, data only). The daemon reads it each pass (`bin/switchboard/gate_spool.py`, ask #2216): the new lines from a saved position (`gate-spool-state.json`: inode and offset, so no line is read twice and a rotation by the shim, to `.1`, is followed), the file renamed to `.1` once it is read to the end and holds 3/4 of the limit, so the shim never finds it full. Fail-opens are counted per repository per hour: sweep kind S11 raises one finding per repository per hour when they exceed `sweep.failopen_per_hour` (default 20), naming the count and the commonest reason. An `over_review` line is shown as `over_review` on its pull request's decision entry. A spool that cannot be read is said once (`gate_spool.unreadable`), never stops a pass.
 
 Shapes it probes: `pr ready <n>` and `pr merge <n>` with a number, `-R/--repo owner/repo`, or a PR URL
 (`https://github.com/owner/repo/pull/N`); a bare number uses the caller's own repo from `whoami --json` (the #138 identity, unchanged).

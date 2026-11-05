@@ -162,6 +162,7 @@ The **Holds** column is descriptive: only the layer numbers are enforced.
 | `switchboard/profile_pieces.py` | 5 | the profile pieces shared by the install, the doctor and the commands that write a profile | |
 | `switchboard/installer.py` | 5 | the installer: the service, its units and the `install` command | |
 | `switchboard/docker_reaper.py` | 5 | the docker reaper: orphan containers and their reaping (ask #321) | |
+| `switchboard/gate_spool.py` | 5 | the gate spool reader: new lines of the shim's `gate-failopen.jsonl`, rotation, fail-open counts and over-review lines (ask #2216) | |
 | `switchboard/observing.py` | 3 | observing the fleet: what a pass reads of the agents' sessions | |
 | `switchboard/workers_report.py` | 4 | workers report, and a stop without a report is triaged (PR 13) | |
 | `switchboard/batch_decision.py` | 3 | a batch: related findings raised as one decision | |
@@ -209,7 +210,9 @@ Kinds (the number is exact, except `size`, a ceiling with headroom: see rule 7):
 | `switchboard/disk_prune.py` | `fleet-switchboard` | entry-import | 6 | the part relies on a standard-library module the entry imported; it gets its own import line |
 | `switchboard/disk_prune.py` | `fleet-switchboard` | namespace | 8 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 | `switchboard/docker_reaper.py` | `fleet-switchboard` | entry-import | 10 | the part relies on a standard-library module the entry imported; it gets its own import line |
+| `switchboard/gate_spool.py` | `fleet-switchboard` | entry-import | 3 | the part relies on standard-library modules the entry imported (`json`, `os`, `Path`); it gets its own import lines |
 | `switchboard/docker_reaper.py` | `fleet-switchboard` | namespace | 14 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
+| `switchboard/gate_spool.py` | `fleet-switchboard` | namespace | 1 | one namespace: the part reads the entry's `_plain` |
 | `switchboard/facts.py` | `switchboard/docker_reaper.py` | namespace | 2 | one namespace: the part reads a name another part defines; its rewiring gives it an import |
 | `switchboard/heavy_budget.py` | `cloud_worker.py` | import | 1 | a name the part reads from another unit without a declared edge |
 | `switchboard/heavy_budget.py` | `fleet-switchboard` | entry-import | 9 | the part relies on a standard-library module the entry imported; it gets its own import line |
