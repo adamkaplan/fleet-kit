@@ -18,6 +18,8 @@ the tests and the change and judges them; it never runs them.
 - **R-TEST-9 Fixtures are synthetic.** A fixture uses neutral names and invented data with the same shape as the real case; nothing private is committed. _check: search: a fixture holding a private name or real data._
 - **R-TEST-10 The unchanged still holds.** A change states what must stay the same and has a test that shows it does (a golden output, a regression case). _check: test: a golden or regression case for what must stay the same._
 
+
+
 ## This repository
 
 - **How the tests run.** `bin/test-switchboard` (stdlib only, no network); CI runs it on macOS and Ubuntu. A change to `bin/` carries a test in it that fails on the previous code.
