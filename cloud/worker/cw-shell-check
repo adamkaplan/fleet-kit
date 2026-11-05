@@ -12,7 +12,9 @@ A pure read of the permission list; writes nothing.
 """
 import fnmatch
 import json
+import os
 import re
+import shlex
 import sys
 
 DEFAULT_LIST = "/usr/local/share/cw/opencode-worker.json"
@@ -171,6 +173,86 @@ def decide(rows, part):
             row, verdict = pattern, action
     return verdict, row
 
+# The path rule: a command that writes outside /work and /tmp is refused (the ask #2205 rule).
+WRITE_ROOTS = ("/work", "/tmp")
+# The paths the image itself writes at run, allowed by name: the tmpfs the entrypoint uses (CW_TMP_DIR, /run/cw-tmp: the
+# OpenCode data and config dirs), the worker user's tool caches in the home (/home/worker/.cache for pip and the like,
+# /home/worker/.npm for npm), the git identity file (git config user.name/user.email writes /home/worker/.gitconfig), and the null device and std streams.
+IMAGE_WRITES = ("/run/cw-tmp", "/home/worker/.cache", "/home/worker/.npm", "/home/worker/.gitconfig",
+                "/dev/null", "/dev/stdout", "/dev/stderr", "/dev/tty")
+REDIRECT = re.compile(r"^(?:\d*|&)(>>|>\|?)(.*)$")
+
+
+def resolve(path, cwd):
+    """The absolute normal form of a path (~, $HOME, .., relative to cwd); None if it holds another variable."""
+    home = os.environ.get("HOME") or "/home/worker"
+    if path == "~" or path.startswith("~/"):
+        path = home + path[1:]
+    path = path.replace("${HOME}", home).replace("$HOME", home)
+    if "$" in path or "`" in path:
+        return None
+    return os.path.normpath(os.path.join(cwd, path))
+
+
+def allowed_path(path):
+    return any(path == r or path.startswith(r + "/") for r in WRITE_ROOTS + IMAGE_WRITES)
+
+
+def write_targets(part, cwd):
+    """(targets, new cwd) of one part: the paths the part writes to, as written."""
+    try:
+        toks = shlex.split(part)
+    except ValueError:
+        return [], cwd
+    targets, words, i = [], [], 0
+    while i < len(toks):
+        m = REDIRECT.match(toks[i])
+        if m and not m.group(2).startswith("&"):
+            if m.group(2):
+                targets.append(m.group(2))
+            elif i + 1 < len(toks):
+                i += 1
+                targets.append(toks[i])
+        else:
+            words.append(toks[i])
+        i += 1
+    while words and re.match(r"^\w+=", words[0]):
+        words.pop(0)
+    if words and words[0] == "sudo":
+        words.pop(0)
+    if not words:
+        return targets, cwd
+    cmd, args = os.path.basename(words[0]), words[1:]
+    plain = [a for a in args if not a.startswith("-")]
+    if cmd == "cd":
+        dest = resolve(plain[0], cwd) if plain else resolve("~", cwd)
+        return targets, dest or cwd
+    if cmd in ("tee", "touch", "mkdir", "rm", "rmdir", "truncate", "unlink", "shred"):
+        targets += plain
+    elif cmd in ("cp", "mv", "install", "ln"):
+        tdir = [args[k + 1] for k, a in enumerate(args[:-1]) if a in ("-t", "--target-directory")]
+        targets += tdir or plain[-1:]
+        if cmd == "mv":
+            targets += plain[:-1]
+    elif cmd == "sed" and any(re.match(r"^-[a-zA-Z]*i|^--in-place", a) for a in args):
+        script = any(a in ("-e", "-f") or a.startswith("--expression") for a in args)
+        targets += plain if script else plain[1:]
+    elif cmd == "dd":
+        targets += [a[3:] for a in args if a.startswith("of=")]
+    return targets, cwd
+
+
+def outside_write(text_parts):
+    """The first path the parts write to outside the allowed roots, or None."""
+    cwd = "/work/repo"
+    for part in text_parts:
+        targets, cwd = write_targets(part, cwd)
+        for t in targets:
+            full = resolve(t, cwd)
+            if full is None or not allowed_path(full):
+                return full or t
+    return None
+
 
 def main(argv):
     args = argv[1:]
@@ -196,6 +278,10 @@ def main(argv):
     reasons = sorted(set(unsure))
     for reason in reasons:
         print("unsure : %s" % reason)
+    outside = outside_write(split_parts(text, []))
+    if outside is not None:
+        sys.stderr.write("cw-shell-check: refused, writes outside /work and /tmp: %s\n" % outside)
+        return 1
     if denied:
         return 1
     return 3 if reasons else 0

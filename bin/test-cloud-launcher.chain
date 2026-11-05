@@ -131,6 +131,7 @@ cloud/worker/tests/test_reach.py
 cloud/worker/tests/test_root_scanner.py
 cloud/worker/tests/test_scan_allowlist_node.py
 cloud/worker/tests/test_shell_check.py
+cloud/worker/tests/test_shell_check_paths.py
 cloud/worker/tests/test_stack_pull.py
 cloud/worker/tests/test_stack_up.py
 cloud/worker/tests/test_token_table.py
