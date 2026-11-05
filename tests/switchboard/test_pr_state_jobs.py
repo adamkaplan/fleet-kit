@@ -264,10 +264,10 @@ def load():
             self.assertEqual(len(in_progress), 1, "the jobs request per run in progress")
             self.assertEqual(sorted(set(identity)), sorted(rollup_runs), "newest() reads the identity of each run of the rollup")
             self.assertEqual(len(identity), len(set(identity)), "each identity is read once: the later passes are served from the cache")
-            self.assertEqual(len(in_progress) + len(identity), 3, "the total GitHub requests for one pending head")
+            self.assertEqual(len(in_progress) + len(identity), 1 + len(rollup_runs), "the total GitHub requests for one pending head")
             # a second examination of the same head, past the retry gate: the jobs request again (1), the run identities from the cache (0 more)
             self.go(advance=sb.CI_RECORD_LIST_TTL + 1)
             self.assertEqual(len([a for a in self.asked if "/jobs" in a]) - len(in_progress), 1, "the second examination: the jobs request again, once")
-            self.assertEqual(len(identity), 2, "the second examination: 0 more identity reads, served from the cache")
+            self.assertEqual(len(identity), len(rollup_runs), "the second examination: 0 more identity reads, served from the cache")
 
     return TestPrStateJobs
