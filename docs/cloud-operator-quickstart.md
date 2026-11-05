@@ -62,7 +62,7 @@ Each setting's name, whether the file requires it, and its kind (name, https URL
 | `CW_CLUSTER_ADMIN_SECRET` | no | secret-name | the name of the vault secret that holds the cluster administrator kubeconfig (default `cw-cluster-admin-kubeconfig`): 1 to 127 letters, digits and hyphens; the name, never its content |
 | `CW_STACK_MODEL_SECRET` | no | secret-name | with `launch --cloud --stack` only: the name of the vault secret (same vault as the others) that holds the stack-only model credential: 1 to 127 letters, digits and hyphens; the name, never its value. Ignored without `--stack`. See "A stack-only model credential" |
 | `CW_CLUSTER_TOKEN_DURATION` | no | duration | the cluster token's requested life: 1 to 3 digits and `m` or `h`, from `1m` to `60m` (default `20m`; `1h` is the same as `60m`) |
-| `CW_GIT_TOKEN_CMD` | no | command | a command that prints the one-hour git token; default is the GitHub App mint beside the launcher (`app_token.py`) |
+| `CW_GIT_TOKEN_CMD` | no | command | a command that prints the one-hour git token on stdout; default is the GitHub App mint beside the launcher (`app_token.py`), which hands the token to the launcher over a pipe and never prints it. To run the mint by hand, see "Running the mint by hand" in `cloud/launcher/README.md` (a file route in a private directory with no symbolic link in its path, never a redirect; a descriptor that is the same pipe or file as standard output or standard error is refused) |
 | `CW_APP_ID_CMD`, `CW_APP_KEY_CMD` | no | command | commands that print the GitHub App's id and key instead of the vault read (`app_token.py`) |
 | `CW_APP_INSTALLATION_CMD` | no | command | obsolete: accepted and ignored, never run. The installation is looked up per repository (see the next paragraph); the vault no longer needs `cw-app-installation-id` |
 | `CW_STACK_REGISTRY` | no | registry-host | the stack registry (lower case, ending `.azurecr.io`; no scheme, path, port or IP); with the next two, a stack pod pulls prebuilt images (see `cloud/README.md`); all three or none |
@@ -545,6 +545,7 @@ Over one day a cloud pull request took nine pushes and others two to four, becau
 ### A rule for every cloud coder brief
 
 Before any push, run bin/cloud-pr-preflight at the repository root and paste its three sections in the pull request comment; a branch-only failure, a not-run file or an unchained test file must be fixed first, and every existing test file it lists as edited must be justified there.
+When the branch adds or changes a tests/switchboard/test_*.py file, the run prints one more block, the checks of tools/new-test-checks, between the first and the second section, and a FAIL there must be fixed first too.
 
 ## Pre-push preflight modes
 
