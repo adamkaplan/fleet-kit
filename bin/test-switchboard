@@ -55596,7 +55596,7 @@ class TestJobEndRecord(StandInPids, unittest.TestCase):
     def setUp(self):
         self.root = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, str(self.root), True)
-        patcher = mock.patch.dict(os.environ, {sb.JOBS_DIR_ENV: str(self.root)})
+        patcher = mock.patch.dict(os.environ, {sb.JOBS_DIR_ENV: str(self.root), "XDG_STATE_HOME": str(self.root / "xdg-state"), "XDG_CONFIG_HOME": str(self.root / "xdg-config")})
         patcher.start()
         self.addCleanup(patcher.stop)
         self.procs, self.pids, self.audited = {}, [], []
