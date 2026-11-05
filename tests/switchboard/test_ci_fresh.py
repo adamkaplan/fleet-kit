@@ -576,22 +576,31 @@ class TestCiFreshRefusalAndEvidence(FreshCase):
         _, bare, _ = merge_gate.decide(dict(self.FACTS, behind=None))
         self.assertEqual(bare, "main moved after the last green run (tested on bbbbbbbb, tip now aaaaaaaa): its CI must run again on the current merge ref")
 
+    @staticmethod
+    def merge_ref_runner(argv, **kwargs):
+        """The merge ref of the pull request is fresh: its first parent is the head of the base branch."""
+        path = argv[2]
+        out = json.dumps([{"sha": "b" * 40}, {"sha": HEAD}]) if "/commits/refs/pull/" in path else "main" if path.endswith("/pulls/5") else "b" * 40
+        return subprocess.CompletedProcess(argv, 0, out, "")
+
     def test_s8_the_evidence_line_of_a_fresh_run_is_read_back_from_the_recorded_verdict(self):
         import tempfile
         with tempfile.TemporaryDirectory() as state:
             facts = judge(CountingGh(base=TIP))
             self.assertEqual(facts["ci_line"], "fresh: CI ran on the tip " + TIP[:12])
-            ctx = types.SimpleNamespace(unreadable=None, facts=dict(facts, state="OPEN", body=""), plan_problem=None, engine=types.SimpleNamespace(audit=None), pr="acme/app#5", config={},
-                                        repo="acme/app", state=state, source="plan.md", entries=[],
+            ctx = types.SimpleNamespace(unreadable=None, facts=dict(facts, state="OPEN", body=""), plan_problem=None, engine=types.SimpleNamespace(audit=None, gh_runner=self.merge_ref_runner), pr="acme/app#5", config={},
+                                        repo="acme/app", number=5, state=state, source="plan.md", entries=[],
                                         plan={"result": "pass", "plan_hash": "sha256:x", "scenarios_parsed": [{"id": "S1", "evaluator": "ci", "claim": "pr"}]})
-            done = _host().sb.ci_record_core(ctx, lambda: 0, quiet=True)
+            with mock.patch.object(_host().sb, "load_config", lambda *a, **k: {"gh": "gh"}):   # the merge ref reader names the gh binary by the config
+                done = _host().sb.ci_record_core(ctx, lambda: 0, quiet=True)
             self.assertEqual((done["status"], done["recorded"]), ("recorded", ["S1"]))
             entries, problem = plan_ledger.read_ledger(state)
             self.assertIsNone(problem)
             (verdict,) = [e for e in entries if e.get("kind") == "verdict"]
             self.assertEqual(verdict["evidence"], "CI green at %s on the tip %s: every check run complete and passing" % (HEAD[:12], TIP[:12]))
             stale = judge(CountingGh())
-            again = _host().sb.ci_record_core(types.SimpleNamespace(**dict(vars(ctx), facts=dict(stale, state="OPEN", body=""))), lambda: 0, quiet=True)
+            with mock.patch.object(_host().sb, "load_config", lambda *a, **k: {"gh": "gh"}):
+                again = _host().sb.ci_record_core(types.SimpleNamespace(**dict(vars(ctx), facts=dict(stale, state="OPEN", body=""))), lambda: 0, quiet=True)
             self.assertEqual((again["status"], again["recorded"]), ("not-green", []))
             self.assertEqual(len([e for e in plan_ledger.read_ledger(state)[0] if e.get("kind") == "verdict"]), 1)   # nothing more was recorded
 
