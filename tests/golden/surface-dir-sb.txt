@@ -329,6 +329,11 @@ HELD_EXAMPLE
 HELD_LINKS_WAIT_SECONDS
 HELD_PARTS
 HELD_QUESTIONS
+HELD_ROUTE_ENDPOINT
+HELD_ROUTE_PANE
+HELD_SENDS
+HELD_SENDS_KEEP
+HELD_SENDS_SECONDS
 HELD_TABLE
 HELD_TOAST_AFTER
 HELD_WHY
@@ -343,6 +348,7 @@ HarnessRequestsSource
 HeadlessRefused
 HeadlessRestartFacts
 HeavyOrphanFacts
+HeldSendFacts
 HerdrClient
 HerdrError
 IGNORED_SAFE
@@ -1153,6 +1159,7 @@ _health_fault
 _heir_ok
 _held_class_tokens
 _held_defects
+_held_first_words
 _held_none
 _held_pre_mermaid
 _held_skip_space
@@ -1762,6 +1769,7 @@ escalate_decision
 escalate_notice
 escalated_lock
 escalation_reason
+expire_held_sends
 explainer_block
 explainer_defects
 explainer_insert
@@ -1848,13 +1856,19 @@ heavy_stop_reporter
 heavy_stop_send
 held_defects
 held_merge_order_hints
+held_rows
 held_scan
+held_send_applies
+held_sends_tick
 held_top_end
 herdr_integration_status
 herdr_live_check
 herdr_socket_path
 hmac
 hold_reason
+hold_send
+hold_send_endpoint
+hold_send_fact
 home_link_is_ours
 home_link_path
 how_long
@@ -2281,6 +2295,7 @@ registry_retired_owners
 registry_retired_strict
 registry_route
 rehold_reason
+release_held_sends
 release_impact_hold
 release_stale_binding
 reload_in_place
@@ -2467,6 +2482,7 @@ sync_for
 sync_skills
 synthetic_lines
 sys
+tell_dropped_sends
 tell_launch_refused
 tempfile
 testers_status

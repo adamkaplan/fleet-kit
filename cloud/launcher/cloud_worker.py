@@ -10,11 +10,13 @@ secret value is read once from an inherited descriptor and goes to kubectl's std
 """
 import argparse
 import base64
+import bisect
 import copy
 import fcntl
 import datetime as dt
 import pwd
 import hashlib
+import heapq
 import json
 import os
 import re
@@ -44,6 +46,33 @@ SHAPES = {"XS": {"cpu": "1", "memory": "2Gi", "usd_per_hour": 0.05, "stack": Fal
 DEFAULT_SHAPE = "XS"        # a create that names no shape and is not a stack launch (S, M by name only)
 DEFAULT_ORCHESTRATOR_SHAPE = "O"   # an orchestrator launch that names no shape takes its own small row (the role table carries no shape: this is the one place)
 DEFAULT_STACK_SHAPE = "S"   # a stack launch that names no shape (its row must carry stack: true)
+
+# Per-shape requests (#1978): ONE table, shape S only; a shape with no row has no requests key. The limits stay the SHAPES rows.
+SHAPE_REQUESTS = {"S": {"cpu": "500m", "memory": "2Gi"}}
+
+
+def parse_quantity(q):
+    """A Kubernetes quantity as an exact number (CPUs or bytes): plain numbers and the suffixes m, Ki, Mi, Gi."""
+    from fractions import Fraction
+    q = str(q)
+    for suffix, mult in (("Ki", 1024), ("Mi", 1024 ** 2), ("Gi", 1024 ** 3), ("m", Fraction(1, 1000))):
+        if q.endswith(suffix):
+            return Fraction(q[:-len(suffix)]) * mult
+    return Fraction(q)
+
+
+def requests_fit(shape_name, resources):
+    """True when resources hold requests of exactly cpu and memory, each equal to the table's value for the shape and not above the same limit."""
+    if not isinstance(resources, dict) or set(resources) != {"limits", "requests"}:
+        return False
+    req, lim = resources.get("requests"), resources.get("limits")
+    table = SHAPE_REQUESTS.get(shape_name)
+    try:
+        return bool(table) and req == table and set(lim) == {"cpu", "memory"} and all(
+            parse_quantity(req[k]) <= parse_quantity(lim[k]) for k in ("cpu", "memory"))
+    except (TypeError, ValueError, ZeroDivisionError, KeyError):
+        return False
+
 MAX_TOKEN_SECONDS = 3600
 
 # The cluster login (ONE route, used by the launch wiring and by the reaper's own refresh; the numbers of the refresh live here).
@@ -68,6 +97,8 @@ ORPHAN_SECRET_AFTER_SECONDS = 3600      # a per-run Secret whose pod is absent i
 ORPHAN_SECRET_ACTION = "orphan-secret-removed"   # the audit action of that removal (one line per Secret; its reason holds the name and the age)
 ORPHAN_SECRET_REASON = "orphan secret: its pod is absent"
 PW_SECRET_NAME = re.compile(r"(.+-[0-9a-f]{4})-pw")   # '<worker>-<4 hex digits>-pw': the password Secret of the pod named by the group
+REAP_PARALLEL = 4                       # the stops of one pass run at most this many at a time
+REAP_STOP_SECONDS = 420                 # one stop's own limit: past it the wait is abandoned for this pass and the pod is left whole
 RENEW_CADENCE_SECONDS = 600             # the renewal and the login refresh run at least this often, on their own thread, whatever a pass is doing
 RESTART_ACTION = "reaper-restart"       # the audit action of the reaper's exit after the installed code changed (the service manager starts it again)
 CODE_IDENTITY_FILES = ("cloud/launcher/cloud_worker.py", "cloud/launcher/run_record.py", "bin/path_walk.py", "cloud/launcher/token_mint.py", "bin/registry.py", "bin/record_json.py")   # the module and the kit modules it imports
@@ -83,6 +114,7 @@ IGNORED_NOTICE = ("cluster login: %s is ignored in the unattended refresh (the r
 # renewal's numbers and names are here.
 GIT_TOKEN_KEY = "git-token"                      # the Secret key the pod's credential helper and gh wrapper read at every call
 GIT_TOKEN_RENEW_AFTER_SECONDS = 1800             # renew when the token is this old: 30 minutes of its life are left (a failed pass or two, a kubelet delay, a short sleep)
+SAFE_TO_EVICT_KEY = "cluster-autoscaler.kubernetes.io/safe-to-evict"  # not a cw/ key: the autoscaler reads it, the launcher reads nothing from it
 GIT_TOKEN_MINTED = "cw/git-token-minted"         # the Secret annotation that says when the token was minted (the Secret's creation time stands in when it is absent)
 GIT_TOKEN_MINT_SECONDS = 60                      # the mint child's run limit
 GIT_TOKEN_MAX_CHARS = 4096                       # the most a token may be
@@ -107,6 +139,19 @@ def wip_note(worker):
 def wip_note_due(started, now, already):
     """True once the pod is 40 minutes old and the note was not sent yet. started: a datetime or None; already: the annotation's value."""
     return not already and started is not None and (now - started).total_seconds() >= WIP_NOTE_AFTER_SECONDS
+
+
+# The idle nudge: a pod idle for 15 minutes with no results file is asked, once, to continue with its brief.
+IDLE_NUDGE = "Continue with the remaining steps of your brief and push each commit. If you are finished, write /work/results.txt."
+IDLE_NUDGE_AFTER_SECONDS = 15 * 60
+IDLE_NUDGE_MARK = "idle-nudge"                   # the pod annotation (cw/idle-nudge) that says the nudge was sent: once, never twice
+
+
+def idle_nudge_due(busy, last_activity, now, idle_seconds, already, role, results_exists):
+    """True only for a pod that is not busy, idle for 15 minutes or more, whose idle limit is longer than 15 minutes, not nudged yet,
+    not the orchestrator, and whose results file does not exist."""
+    return (not busy and last_activity is not None and (now - last_activity).total_seconds() >= IDLE_NUDGE_AFTER_SECONDS
+            and idle_seconds > IDLE_NUDGE_AFTER_SECONDS and not already and role != "orchestrator" and results_exists is False)
 
 
 # Run INSIDE the pod by `kubectl exec python3 -c <this> <text>`: the pod's own headless server, the password file the activity probe reads.
@@ -136,6 +181,7 @@ STACK_SECURITY_CONTEXT = {"allowPrivilegeEscalation": True, "capabilities": {"dr
 # The window stays under the switchboard's own bound on the launcher call (LAUNCH_SECONDS, 900).
 STACK_RACE_WINDOW_SECONDS = 600
 STACK_RACE_PAUSE_SECONDS = 15
+LAUNCH_OUTER_SECONDS = 900   # the switchboard's own bound on the launch call: a wait for a node ends here
 WAIT_POLL_SECONDS = 2   # the pause between two reads of a pending pod
 STACK_RACE_RE = re.compile(r"RuntimeClass handler \S+ does not support user namespaces: the handler \S+ is not known")
 
@@ -257,7 +303,7 @@ def _stack_rest_differs(pod):
         or len(ks) != 1 or [k.get("name") for k in ks] != ["worker"]   # one container, named worker: no sidecar, even one with the stack context
         or any(not set(k) <= STACK_CONTAINER_KEYS or not isinstance(k.get("image"), str) or not k.get("image") for k in ks)
         or any(set(e) != {"name", "value"} for k in ks for e in k.get("env", []))   # no valueFrom / secretKeyRef; no envFrom (key allow-list)
-        or any(set((k.get("resources") or {})) != {"limits"} or set(k["resources"]["limits"]) != {"cpu", "memory"} for k in ks)   # limits stay
+        or any((set((k.get("resources") or {})) != {"limits"} and not requests_fit(pod.get("metadata", {}).get("annotations", {}).get("cw/shape"), k.get("resources"))) or set(k["resources"]["limits"]) != {"cpu", "memory"} for k in ks)   # limits stay; requests only the table's
         or any(k.get("readinessProbe") != {"tcpSocket": {"port": 4096}} for k in ks)
         or any(set(m) - {"name", "mountPath", "readOnly"} or {**STACK_MOUNT_PATHS, PULLER_VOLUME_NAME: PULLER_MOUNT_PATH}.get(m.get("name")) != m.get("mountPath")
                for k in ks for m in k.get("volumeMounts", []))
@@ -391,27 +437,407 @@ SCRUB_OUTPUT_MAX = 2 * SCRUB_INPUT_MAX   # a limit above the input maximum: reda
 MIN_FRAGMENT = 8
 
 
+POD_EVENTS_MAX, POD_EVENT_CHARS = 20, 200
+_ADDRESS_RE = re.compile(r"(?<![\w.-])(?:\d{1,3}\.){3}\d{1,3}(?::\d{1,5})?(?![\w.-])|(?<![\w.-])(?:(?:[A-Za-z0-9-]+\.)+[A-Za-z][A-Za-z0-9-]*|localhost):\d{1,5}(?![\w.-])|\[[0-9A-Fa-f:.]*:[0-9A-Fa-f:.]*\](?::\d{1,5})?|(?<![\w:])[0-9A-Fa-f:]{1,45}:(?:\d{1,3}\.){3}\d{1,3}(?![\w.:-])|(?<![\w:])(?:(?:[0-9A-Fa-f]{1,4}:){1,7}:(?:[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4}){0,6})?|::(?:[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4}){0,6})?)(?:%[A-Za-z0-9_.-]{1,16})?(?![\w:])|(?<![\w:])(?:[0-9A-Fa-f]{1,4}:){7}[0-9A-Fa-f]{1,4}(?![\w:])")
+
+
+def mask_addresses(text):
+    """An IPv4 address (with its port), a host name with a dot or `localhost` followed by a port, and an IPv6 address (compressed, full or bracketed with a port) become `[address]`; a word glued to a colon and digits that is no such name (`exit code:137`), a node name, a clock and a ratio are kept."""
+    return _ADDRESS_RE.sub("[address]", str(text))
+
+
+class KnownSet:
+    """A set of known secret forms. It HOLDS its forms (it is not a set, and no public attribute exposes them), keeps a
+    `version` (bumped AFTER every change of the content, under an RLock the instance owns, and only when the content
+    changed) and the structure `scrub` built for it (`built`); both are read-only from outside, and `keep` stores a
+    structure only for the version the set has now. A call whose structure is current never reads the set. An argument
+    that is an iterable is read into a list BEFORE the lock is taken. No subclass, no pickle."""
+    __slots__ = ("_forms", "_lock", "_version", "_built", "__weakref__")
+    __hash__ = None
+
+    def __init_subclass__(cls, **kw):
+        raise TypeError("a KnownSet may not be subclassed")
+
+    def __init__(self, forms=()):
+        if getattr(self, "_lock", None) is not None:
+            raise TypeError("a KnownSet is initialised once")
+        items = list(forms)  # read first: a raise leaves the object uninitialised
+        self._forms = set(items)
+        self._version = 0
+        self._built = None
+        self._lock = threading.RLock()  # set last: it marks the object as initialised
+
+    @property
+    def version(self):
+        return self._version
+
+    @property
+    def built(self):
+        return self._built
+
+    def keep(self, version, built):
+        """Store the structure built for `version`; refused (False) when the set has moved on."""
+        with self._lock:
+            if version != self._version:
+                return False
+            self._built = built
+            return True
+
+    @staticmethod
+    def _read(arg):
+        """The argument as a list, read outside the lock; a raise half-way gives what was read and the error."""
+        items = []
+        try:
+            for x in arg:
+                items.append(x)
+        except BaseException as exc:  # applied below, then raised again
+            return items, exc
+        return items, None
+
+    def _bulk(self, name, args):
+        reads = [self._read(a) for a in args]  # BEFORE the lock
+        err = next((e for _, e in reads if e is not None), None)
+        if err is not None and name in ("difference_update", "intersection_update", "symmetric_difference_update"):
+            raise err  # an operation that removes forms: a half-read argument changes nothing (set and version unchanged)
+        with self._lock:
+            before = frozenset(self._forms)
+            try:
+                getattr(self._forms, name)(*[r for r, _ in reads])
+            finally:
+                if self._forms != before:
+                    self._version += 1  # AFTER the content changed, under the lock
+        if err is not None:
+            raise err
+
+    def add(self, item):
+        with self._lock:
+            if item not in self._forms:
+                self._forms.add(item)
+                self._version += 1
+
+    def discard(self, item):
+        with self._lock:
+            if item in self._forms:
+                self._forms.discard(item)
+                self._version += 1
+
+    def remove(self, item):
+        with self._lock:
+            if item not in self._forms:
+                raise KeyError(item)  # nothing changed: no bump
+            self._forms.remove(item)
+            self._version += 1
+
+    def pop(self):
+        with self._lock:
+            if not self._forms:
+                raise KeyError("pop from an empty set")  # nothing changed: no bump
+            item = self._forms.pop()
+            self._version += 1
+            return item
+
+    def clear(self):
+        with self._lock:
+            if self._forms:
+                self._forms.clear()
+                self._version += 1
+
+    def update(self, *args):
+        self._bulk("update", args)
+
+    def difference_update(self, *args):
+        self._bulk("difference_update", args)
+
+    def intersection_update(self, *args):
+        self._bulk("intersection_update", args)
+
+    def symmetric_difference_update(self, *args):
+        self._bulk("symmetric_difference_update", args)
+
+    def _inplace(self, name, other):
+        if not isinstance(other, (set, frozenset, KnownSet)):
+            return NotImplemented
+        self._bulk({"__ior__": "update", "__iand__": "intersection_update", "__isub__": "difference_update",
+                    "__ixor__": "symmetric_difference_update"}[name], (other,))
+        return self
+
+    def __ior__(self, other):
+        return self._inplace("__ior__", other)
+
+    def __iand__(self, other):
+        return self._inplace("__iand__", other)
+
+    def __isub__(self, other):
+        return self._inplace("__isub__", other)
+
+    def __ixor__(self, other):
+        return self._inplace("__ixor__", other)
+
+    def __iter__(self):
+        with self._lock:
+            return iter(frozenset(self._forms))  # ONE C-level copy: a set changed during a scrub never raises
+
+    def __len__(self):
+        with self._lock:
+            return len(self._forms)
+
+    def __contains__(self, item):
+        with self._lock:
+            return item in self._forms
+
+    def __bool__(self):
+        with self._lock:
+            return bool(self._forms)
+
+    def __eq__(self, other):
+        if not isinstance(other, (set, frozenset, KnownSet)):
+            return NotImplemented
+        mine = frozenset(self)
+        return mine == frozenset(other)
+
+    def __ne__(self, other):
+        r = self.__eq__(other)
+        return r if r is NotImplemented else not r
+
+    def __repr__(self):
+        return "KnownSet(%d forms)" % len(self)  # never the forms
+
+    def __reduce__(self):
+        raise TypeError("a KnownSet is not pickled")
+
+    def __reduce_ex__(self, protocol):
+        raise TypeError("a KnownSet is not pickled")
+
+    def copy(self):
+        return KnownSet(self)
+
+    def __copy__(self):
+        return KnownSet(self)
+
+    def __deepcopy__(self, memo):
+        return KnownSet(self)
+
+
+_SCRUB_MARK = "[redacted]"
+_SCRUB_SLOT = [None]  # (snapshot, order, index) for a set that keeps no version of its own
+
+
+def _scrub_built(secrets_known):
+    """The secrets in their order (longest first, then by text) and the index of every 8-character piece of every secret
+    to the ranks of the secrets that hold it. Built once for each state of the set; a `KnownSet` keeps its own version."""
+    version = getattr(secrets_known, "version", None)  # a KnownSet: read its version FIRST
+    built = getattr(secrets_known, "built", None) if version is not None else _SCRUB_SLOT[0]
+    if version is not None and built is not None and built[0] != version:
+        built = None
+    if version is None or built is None:
+        snap = frozenset(secrets_known)  # ONE C-level copy, taken first: a set that changes during the call cannot raise here
+        if version is not None or built is None or built[0] != snap:
+            order = sorted({v for v in snap if v and len(v.strip()) >= MIN_FRAGMENT}, key=lambda v: (-len(v), v))
+            index = {}
+            for n, sec in enumerate(order):
+                for k in range(len(sec) - MIN_FRAGMENT + 1):
+                    ranks = index.setdefault(sec[k:k + MIN_FRAGMENT], [])
+                    if not ranks or ranks[-1] != n:
+                        ranks.append(n)
+            built = (version if version is not None else snap, order, index)
+            if version is not None:
+                secrets_known.keep(version, built)  # kept for the version read FIRST
+            else:
+                _SCRUB_SLOT[0] = built
+    return built
+
+
+class _ScrubSpans:
+    """The text under redaction: the original string and a sorted list of spans [a, b) of it that now show `disp` (a marker,
+    or a marker with the rest of an earlier one). A position is a key (p, off): the original character p, or the character
+    `off` of the display of the span that starts at p. One edit costs the edit, never a copy of the text."""
+
+    def __init__(self, text, order, index, cand):
+        self.text, self.n, self.order, self.index, self.cand = text, len(text), order, index, cand
+        self.sa, self.sb, self.sd = [], [], []
+        self.rh, self.inq = sorted(cand), set(cand)  # a sorted list is a heap
+        self.cur, self.ptr, self.heap = -1, (-1, 0), []
+
+    def read(self, key, want):
+        """Up to `want` characters of the current text from `key`; None when `key` is not a character of it."""
+        p, off = key
+        sa, sb, sd = self.sa, self.sb, self.sd
+        k = bisect.bisect_left(sa, p)
+        parts = []
+        if k < len(sa) and sa[k] == p:
+            disp = sd[k]
+            if off >= len(disp):
+                return None
+            piece = disp[off:off + want]
+            parts.append(piece)
+            want -= len(piece)
+            p = sb[k]
+            k += 1
+        elif off or (k and sb[k - 1] > p):
+            return None
+        while want > 0 and p < self.n:
+            e = sa[k] if k < len(sa) else self.n
+            piece = self.text[p:min(e, p + want)]
+            parts.append(piece)
+            want -= len(piece)
+            p += len(piece)
+            if want > 0 and k < len(sa):
+                piece = sd[k][:want]
+                parts.append(piece)
+                want -= len(piece)
+                p = sb[k]
+                k += 1
+            else:
+                break
+        return "".join(parts)
+
+    def advance(self, key, count):
+        """The key of the character `count` characters after `key`."""
+        p, off = key
+        sa, sb, sd = self.sa, self.sb, self.sd
+        k = bisect.bisect_left(sa, p)
+        if k < len(sa) and sa[k] == p:
+            if count < len(sd[k]) - off:
+                return (p, off + count)
+            count -= len(sd[k]) - off
+            p = sb[k]
+            k += 1
+        while True:
+            e = sa[k] if k < len(sa) else self.n
+            if count < e - p:
+                return (p + count, 0)
+            count -= e - p
+            p = e
+            if k >= len(sa):
+                return (self.n, 0)
+            if count < len(sd[k]):
+                return (p, count)
+            count -= len(sd[k])
+            p = sb[k]
+            k += 1
+
+    def prev(self, key):
+        p, off = key
+        if off:
+            return (p, off - 1)
+        k = bisect.bisect_left(self.sa, p) - 1
+        if k >= 0 and self.sb[k] == p:
+            return (self.sa[k], len(self.sd[k]) - 1)
+        return (p - 1, 0) if p else None
+
+    def add(self, rank, key):
+        if rank < self.cur:
+            return
+        c = self.cand.get(rank)
+        if c is None:
+            c = self.cand[rank] = set()
+        c.add(key)
+        if rank == self.cur:
+            if key >= self.ptr:
+                heapq.heappush(self.heap, key)
+        elif rank not in self.inq:
+            self.inq.add(rank)
+            heapq.heappush(self.rh, rank)
+
+    def write(self, start, end):
+        """Replace the characters from `start` to `end` by one marker, then look up the windows that overlap what was written."""
+        (p0, o0), (p1, o1) = start, end
+        sa = self.sa
+        k0 = bisect.bisect_left(sa, p0)
+        prefix = self.sd[k0][:o0] if k0 < len(sa) and sa[k0] == p0 else ""
+        k1 = bisect.bisect_left(sa, p1)
+        suffix, b = "", p1
+        if k1 < len(sa) and sa[k1] == p1 and o1 > 0:
+            suffix, b = self.sd[k1][o1:], self.sb[k1]
+            k1 += 1
+        sa[k0:k1], self.sb[k0:k1], self.sd[k0:k1] = [p0], [b], [prefix + _SCRUB_MARK + suffix]
+        lp = len(prefix)
+        self.ptr = (p0, lp + len(_SCRUB_MARK)) if suffix else end
+        back, kk = [], (p0, lp)
+        for _ in range(MIN_FRAGMENT - 1):
+            kk = self.prev(kk)
+            if kk is None:
+                break
+            back.append(kk)
+        back.reverse()
+        keys = back + [(p0, lp + t) for t in range(len(_SCRUB_MARK) + len(suffix))]
+        ctx = self.read(keys[0], len(keys) + MIN_FRAGMENT - 1)
+        for t, key in enumerate(keys):
+            window = ctx[t:t + MIN_FRAGMENT]
+            if len(window) == MIN_FRAGMENT:
+                for rank in self.index.get(window, ()):
+                    self.add(rank, key)
+
+    def sweep(self, rank, whole, sec):
+        """One pass over the candidate positions of one secret: its whole occurrences `whole`, or (None) its runs."""
+        self.heap = heap = list(self.cand.get(rank, ()))
+        heapq.heapify(heap)
+        self.ptr = (-1, 0)
+        while heap:
+            key = heapq.heappop(heap)
+            if key < self.ptr:
+                continue
+            if whole is not None:
+                if self.read(key, len(whole)) != whole:
+                    continue
+                end = self.advance(key, len(whole))
+            else:
+                head = self.read(key, MIN_FRAGMENT)
+                if head is None or len(head) < MIN_FRAGMENT or head not in sec:
+                    continue
+                lo = len(self.read(key, len(sec)))
+                if self.read(key, lo) not in sec:  # a piece of a piece is a piece: the longest one is found by halving
+                    low, hi = MIN_FRAGMENT, lo - 1
+                    while low < hi:
+                        mid = (low + hi + 1) // 2
+                        if self.read(key, mid) in sec:
+                            low = mid
+                        else:
+                            hi = mid - 1
+                    lo = low
+                end = self.advance(key, lo)
+            self.write(key, end)
+
+    def run(self):
+        while self.rh:
+            rank = heapq.heappop(self.rh)
+            self.inq.discard(rank)
+            self.cur = rank
+            sec = self.order[rank]
+            for whole in {sec, sec.strip()}:
+                self.sweep(rank, whole, sec)
+            self.sweep(rank, None, sec)
+            self.cand.pop(rank, None)
+        parts, pos = [], 0
+        for a, b, disp in zip(self.sa, self.sb, self.sd):
+            parts.append(self.text[pos:a])
+            parts.append(disp)
+            pos = b
+        parts.append(self.text[pos:])
+        return "".join(parts)
+
+
+def _scrub_secrets(text, secrets_known):
+    """Every known secret and every 8+ character piece of one removed from `text`: ONE probe of the index for each position,
+    then each secret is applied only at the positions that hold a piece of it; the text is rebuilt once."""
+    built = _scrub_built(secrets_known)
+    order, index = built[1], built[2]
+    cand, get = {}, index.get
+    for i in range(len(text) - MIN_FRAGMENT + 1):
+        for rank in get(text[i:i + MIN_FRAGMENT], ()):
+            if rank in cand:
+                cand[rank].add((i, 0))
+            else:
+                cand[rank] = {(i, 0)}
+    return _ScrubSpans(text, order, index, cand).run() if cand else text
+
+
 def scrub(text, secrets_known=(), limit=300):
     """THE one place kubectl output (and anything built from it) is made safe to show, log or audit: the exact values
     of this run's secrets and any 8+ character piece of one, token-shaped strings and long base64/hex runs are removed,
     then the text is cut to `limit`. Control characters become '?'."""
     text = str(text)[:SCRUB_INPUT_MAX]
-    for sec in sorted({v for v in secrets_known if v and len(v.strip()) >= MIN_FRAGMENT}, key=len, reverse=True):
-        for v in {sec, sec.strip()}:
-            text = text.replace(v, "[redacted]")
-        out, i = [], 0
-        while i < len(text):  # any run of 8+ characters that is a piece of the secret
-            head = text[i:i + MIN_FRAGMENT]
-            if len(head) == MIN_FRAGMENT and head in sec:
-                j = i + MIN_FRAGMENT
-                while j < len(text) and text[i:j + 1] in sec:
-                    j += 1
-                out.append("[redacted]")
-                i = j
-            else:
-                out.append(text[i])
-                i += 1
-        text = "".join(out)
+    text = _scrub_secrets(text, secrets_known)
     for pat, repl in CREDENTIAL_SHAPES:
         text = pat.sub(repl, text)
     for pat in TOKEN_SHAPES:
@@ -1347,7 +1773,7 @@ class Kube:
         self.context = (env.get("CW_KUBE_CONTEXT") or "").strip()
         self.kubeconfig = (env.get("CW_KUBECONFIG") or "").strip()
         self.dir = None
-        self.known = set()  # values of this run's secrets, known to scrub(); never logged
+        self.known = KnownSet()  # values of this run's secrets, known to scrub(); never logged
         if token_mode(env):
             self._generate_kubeconfig(env)
 
@@ -1625,6 +2051,12 @@ def safe_value(value):
     return value if isinstance(value, str) and SAFE_VALUE.fullmatch(value) else "?"
 
 
+def _one_line(text):
+    """The first line of a cluster message, word by word through `safe_value` (a word that is not plain letters or digits becomes `?`), cut."""
+    words = ((text or "").strip().splitlines() or [""])[0].split(":")[-1].split()
+    return " ".join(w if re.fullmatch(r"[A-Za-z]+|[0-9]+", w) and safe_value(w) != "?" else "?" for w in words)[:120]
+
+
 def _node_label(labels, keys):
     """The first of `keys` the node carries, or "unknown" (never a guess, never a value of another label). The value is `safe_value`."""
     for key in keys:
@@ -1680,12 +2112,51 @@ def pod_deadline_floor(max_hard):
     return parse_duration(max_hard or DEFAULT_MAX_HARD) + POD_DEADLINE_GRACE_SECONDS
 
 
-def check_shape(a):
-    """Set a.shape when it names none (XS, or S for a stack launch) and refuse an unknown name, or a row that cannot run a stack, with --stack."""
-    if getattr(a, "shape", None) is None:
-        a.shape = DEFAULT_STACK_SHAPE if getattr(a, "stack", False) else DEFAULT_ORCHESTRATOR_SHAPE if getattr(a, "agent", None) == "orchestrator" else DEFAULT_SHAPE
-    if a.shape not in SHAPES:
+FLOOR_ORDER = ("XS", "S", "M")   # the shapes a repository floor may name, smallest first; the orchestrator row O is not one of them and ranks below XS
+
+
+def shape_rank(shape):
+    """The rank of a shape for the floor comparisons: its place in FLOOR_ORDER, or -1 (below XS) for any other row, the orchestrator row O included."""
+    return FLOOR_ORDER.index(shape) if shape in FLOOR_ORDER else -1
+
+
+def repo_min_shapes(raw):
+    """THE parse of CW_REPO_MIN_SHAPE: {repository key: shape} from comma-separated OWNER/NAME=SHAPE pairs, or None when any entry is malformed (no
+    '=', an unknown shape, a repository that is not OWNER/NAME, a repeated repository, a control character). The repository part is parsed by `_repo_key`,
+    the one parse the allow-list uses. The settings file's validator and check_shape both call it."""
+    if any(ord(c) < 32 or ord(c) == 127 for c in raw):
+        return None
+    floors = {}
+    for entry in raw.split(","):
+        repo, sep, shape = entry.partition("=")
+        key = _repo_key(repo.strip())
+        shape = shape.strip()
+        if not sep or key is None or shape not in FLOOR_ORDER or key in floors:
+            return None
+        floors[key] = shape
+    return floors
+
+
+def check_shape(a, env=None):
+    """Set a.shape when it names none (XS, or S for a stack launch or an orchestrator) and refuse an unknown name, or a row that cannot run a stack, with --stack.
+    With `env` holding CW_REPO_MIN_SHAPE and a repository listed in it, the listed shape is a floor: an unnamed shape becomes the larger of the floor and
+    the shape the flags give, and a named shape below the floor is refused. An unlisted repository or an unset setting changes nothing."""
+    floor = None
+    raw = ((env or {}).get("CW_REPO_MIN_SHAPE") or "").strip()
+    if raw:
+        floors = repo_min_shapes(raw)
+        if floors is None:
+            raise CloudError("refused: CW_REPO_MIN_SHAPE is not a list of OWNER/NAME=SHAPE entries; nothing was created", EXIT_USAGE)
+        floor = floors.get(_repo_key(getattr(a, "repo", None) or "") or "")
+    named = getattr(a, "shape", None)
+    if named is not None and named not in SHAPES:
         raise CloudError("shape must be one of %s" % ", ".join(SHAPES), EXIT_USAGE)
+    if named is not None and floor is not None and shape_rank(named) < shape_rank(floor):
+        raise CloudError("refused: %s needs at least shape %s (CW_REPO_MIN_SHAPE), not %s; name a larger shape or change the setting; nothing was created" % (scrub(a.repo, (), 120), floor, named), EXIT_USAGE)
+    if named is None:
+        a.shape = DEFAULT_STACK_SHAPE if getattr(a, "stack", False) else DEFAULT_ORCHESTRATOR_SHAPE if getattr(a, "agent", None) == "orchestrator" else DEFAULT_SHAPE
+        if floor is not None and shape_rank(floor) > shape_rank(a.shape):
+            a.shape = floor
     if getattr(a, "stack", False) and not SHAPES[a.shape]["stack"]:
         raise CloudError("--stack needs a shape that can run a nested Docker stack (%s), not %s" % (", ".join(k for k, v in SHAPES.items() if v["stack"]), a.shape), EXIT_USAGE)
 
@@ -1738,7 +2209,7 @@ def render_pod(a, worker, name, now, hard, env, run_names=()):
             puller = {k: env[k].strip() for k in STACK_REGISTRY_KEYS}
     pod = {"apiVersion": "v1", "kind": "Pod", "metadata": {
         "name": name, "labels": {"app": LABEL, "cw/worker": worker, "azure.workload.identity/use": "true"},
-        "annotations": {"cw/worker": worker, "cw/started": iso(now), "cw/hard-deadline": iso(hard),
+        "annotations": {SAFE_TO_EVICT_KEY: "false", "cw/worker": worker, "cw/started": iso(now), "cw/hard-deadline": iso(hard),
                         "cw/idle-seconds": e["CW_IDLE_SECONDS"], "cw/shape": a.shape,
                         "cw/max-hard": iso(now + dt.timedelta(seconds=parse_duration(a.max_hard or DEFAULT_MAX_HARD))),
                         **({"cw/run-id": a.run_id} if getattr(a, "run_id", None) else {}),
@@ -1750,7 +2221,7 @@ def render_pod(a, worker, name, now, hard, env, run_names=()):
                   "securityContext": copy.deepcopy(POD_SECURITY_CONTEXT),
                  "containers": [{"name": "worker", "image": image,
                                  "securityContext": {"allowPrivilegeEscalation": False, "capabilities": {"drop": ["ALL"]}}, "env": [{"name": k, "value": v} for k, v in e.items()],
-                                 "resources": {"limits": {"cpu": shape["cpu"], "memory": shape["memory"]}},
+                                 "resources": {"limits": {"cpu": shape["cpu"], "memory": shape["memory"]}, **({"requests": dict(SHAPE_REQUESTS[a.shape])} if a.shape in SHAPE_REQUESTS else {})},
                                  "readinessProbe": {"tcpSocket": {"port": 4096}},
                                  "lifecycle": copy.deepcopy(PRESTOP_LIFECYCLE),
                                  "volumeMounts": [{"name": "pw", "mountPath": "/run/cw", "readOnly": True},
@@ -1782,6 +2253,23 @@ def render_pod(a, worker, name, now, hard, env, run_names=()):
     if bad:
         raise CloudError("refusing a pod spec with a forbidden field: %s" % ", ".join(bad), EXIT_USAGE)
     return pod
+
+
+class _StopKube:
+    """One stop's view of the cluster door: the same calls, but once the stop is abandoned every call raises, so a late thread changes nothing."""
+    def __init__(self, kube, dead):
+        self._kube, self._dead = kube, dead
+
+    def __getattr__(self, name):
+        attr = getattr(self._kube, name)
+        if not callable(attr) or name == "scrub":
+            return attr
+
+        def call(*a, **k):
+            if self._dead.is_set():
+                raise CloudError("stop abandoned")
+            return attr(*a, **k)
+        return call
 
 
 class Launcher:
@@ -1862,7 +2350,7 @@ class Launcher:
             check_repo_allowed(a.repo, self.env)  # before anything is read or made
             if not NAME_RE.match(worker):
                 raise CloudError("bad worker name %r" % worker, EXIT_USAGE)
-            check_shape(a)   # resolves an unnamed shape; before any cluster, vault or token call
+            check_shape(a, self.env)   # resolves an unnamed shape; before any cluster, vault or token call
             now = self.clock()
             hard = now + dt.timedelta(seconds=parse_duration(a.hard))
             max_hard = now + dt.timedelta(seconds=parse_duration(a.max_hard))
@@ -1926,6 +2414,7 @@ class Launcher:
             return {"worker": worker, "url": "https://worker-%s.%s:4096" % (name, domain),
                     "auth_ref": "file:/run/cw/%s.password" % worker, "runtime_id": "pod/" + name,
                     "idle_deadline": iso(now + dt.timedelta(seconds=parse_duration(a.idle))), "hard_deadline": iso(hard),
+                    "idle_seconds": parse_duration(a.idle), "hard_seconds": parse_duration(a.hard),
                     "password_fd": a.password_fd}
         old = self._catch_signals()
         try:
@@ -2158,6 +2647,7 @@ class Launcher:
     def _wait_ready(self, name, seconds, on_pending=None):
         end = self.clock() + dt.timedelta(seconds=seconds)
         waited = 0.0   # the second bound: the seconds slept here, for a clock that does not advance
+        scaling = unread = False   # what the cluster says of a pending pod (the plain wait only: the stack path passes its own watch)
         while True:
             pod = self.kube.get_pod(name)
             status = (pod or {}).get("status", {})
@@ -2167,10 +2657,40 @@ class Launcher:
                 return
             if on_pending:
                 on_pending(pod)
-            if self.clock() >= end or waited >= seconds:
-                raise CloudError("timed out waiting for the worker", EXIT_TIMEOUT)
+            else:
+                scaling, unread = self._why_pending(name, pod, scaling)
+            more = max(0, LAUNCH_OUTER_SECONDS - seconds) if scaling else 0   # a scale-up under way: keep waiting to the outer bound
+            if self.clock() >= end + dt.timedelta(seconds=more) or waited >= seconds + more:
+                raise CloudError(self._timeout_text(scaling, unread), EXIT_TIMEOUT)
             self._nap(WAIT_POLL_SECONDS)
             waited += WAIT_POLL_SECONDS
+
+    @staticmethod
+    def _timeout_text(scaling, unread):
+        if scaling:
+            return "timed out waiting for a node to be added for the worker"
+        return "timed out waiting for the worker" + ("; events could not be read" if unread else "")
+
+    def _why_pending(self, name, pod, scaling):
+        """Read why a pod is not Ready (reads only). Returns (a scale-up is under way, the events could not be read). Raises CloudError at once
+        when the autoscaler says it will not add a node. A pod that is not Unschedulable (a starting pod) is not asked: nothing is read."""
+        conds = ((pod or {}).get("status") or {}).get("conditions") or []
+        if not any(c.get("type") == "PodScheduled" and c.get("status") == "False" and c.get("reason") == "Unschedulable" for c in conds):
+            return scaling, False
+        try:
+            events = self.kube.pod_events(name)
+        except (CloudError, ValueError, KeyError):
+            return False, True
+        verdict = None   # the latest autoscaler event of the two kinds
+        for ev in events:
+            if ev.get("reason") in ("TriggeredScaleUp", "NotTriggerScaleUp"):
+                verdict = ev
+        if verdict is None:
+            return False, False
+        if verdict["reason"] == "TriggeredScaleUp":
+            return True, False
+        count = len(self.kube.list_pods_all())
+        raise CloudError("the worker pod cannot be scheduled: %s; the namespace holds %d pods" % (_one_line(verdict.get("message")), count))
 
     # -- end hook, stop, delete --
     def run_hook(self, name):
@@ -2221,6 +2741,8 @@ class Launcher:
                 if where:
                     info["record"] = where
                     print("cloud-worker: run record: %s" % where, file=sys.stderr)
+            if info.get("record"):   # BEFORE the hook and the delete: what the pod object says of the pod, and its events when it is not Running
+                self._record_pod_state(info["record"], pod, name)
             phase = (pod.get("status") or {}).get("phase")
             if phase == "Failed" and getattr(a, "cause", None):
                 info["cause"] = "pod_failed"
@@ -2331,10 +2853,56 @@ class Launcher:
         try:
             raw = res.get("skipped")
             return {"pushed": bool(res.get("pushed")), "wip_branch": text(res.get("wip_branch"), 200) or None,
+                    "head_on": text(res.get("head_on"), 100) or None,
                     "skipped": [text(x, 200) for x in raw if isinstance(x, str)][:50] if isinstance(raw, list) else [],
                     "note": text(res.get("note")), "error": text(res.get("error")) or ("end hook gave an unreadable error" if res.get("error") else "")}
         except Exception:
             return {"pushed": False, "wip_branch": None, "skipped": [], "note": "", "error": "end hook answer unreadable"}
+
+    def _pod_state_of(self, pod, name):
+        """The pod's own state from the pod object already read (phase, each container's state, the node) and, ONLY when the phase is
+        not Running, its newest POD_EVENTS_MAX events through scrub and the address mask. A failed events read says `unreadable`. Never raises."""
+        scrub = self.kube.scrub
+        status, spec = pod.get("status") or {}, pod.get("spec") or {}
+        phase = status.get("phase")
+        containers = []
+        for c in (status.get("containerStatuses") or [])[:20]:
+            st = c.get("state") or {}
+            kind = next((k for k in ("terminated", "waiting", "running") if k in st), "unknown")
+            one = {"name": mask_addresses(scrub(c.get("name") or "", 63)), "state": kind}
+            detail = st.get(kind) or {}
+            if detail.get("reason"):
+                one["reason"] = mask_addresses(scrub(detail["reason"], 100))
+            if kind == "terminated":
+                one["exit_code"] = detail.get("exitCode")
+            containers.append(one)
+        state = {"phase": scrub(phase or "", 30), "containers": containers, "node": mask_addresses(scrub(spec.get("nodeName") or "", 253)),
+                 "events": [], "events_read": "no"}
+        if phase == "Running":
+            return state
+        try:
+            uid = (pod.get("metadata") or {}).get("uid")
+            items = [e for e in self.kube.pod_events(name) if not (uid and (e.get("involvedObject") or {}).get("uid") not in (None, uid))]
+            stamp = lambda e: str(e.get("lastTimestamp") or e.get("eventTime") or (e.get("metadata") or {}).get("creationTimestamp") or "")
+            items.sort(key=stamp)
+            events = []
+            for e in items[-POD_EVENTS_MAX:]:
+                text = "%s %s: %s" % (e.get("type") or "", e.get("reason") or "", e.get("message") or "")
+                events.append(mask_addresses(self.kube.scrub(text, 1000))[:POD_EVENT_CHARS])
+            state["events"], state["events_read"] = events, "yes"
+        except Exception:   # a Forbidden answer, a timeout, a bad reply: one word, and the stop goes on
+            state["events"], state["events_read"] = [], "unreadable"
+        return state
+
+    def _record_pod_state(self, directory, pod, name):
+        try:
+            state = self._pod_state_of(pod, name)
+        except Exception:
+            state = "unreadable"
+        try:
+            self.recorder.add_pod_state(directory, state)
+        except Exception:   # add_pod_state never raises; a stop is never held back by the record
+            pass
 
     def _hook_record(self, info, hook):
         if info.get("record"):
@@ -2485,10 +3053,53 @@ class Launcher:
                 print("cloud-worker: WARNING: no usable record for %s; using the pod's own deadline" % ann(pod, "worker"), file=sys.stderr)
         return min(hard, parse_iso(ann(pod, "max-hard", iso(hard))))  # a record never lengthens a life past the cap
 
+    def _run_stops(self, jobs):
+        """Stop the pods of one pass, at most REAP_PARALLEL at a time, each on its own per-stop copy of the launcher (own last_hook, run id, hub
+        mark, record deadline and cluster view). Returns [(result, error, last_hook)] in the order of `jobs`. A stop past REAP_STOP_SECONDS is
+        abandoned: its thread is left to end by itself (our kubectl client is not reachable), every later call of it raises, the pod is left
+        whole and un-annotated, and ONE audit line says so; the next pass tries again."""
+        done, running, nxt, got = {}, {}, 0, []
+
+        def work(i, ctx):   # a late (abandoned) thread never replaces the limit result: dict.setdefault of one key is atomic in CPython
+            _, worker, reason, nonce = jobs[i]
+            try:
+                done.setdefault(i, (ctx.stop(argparse.Namespace(worker=worker, reason=reason, run_id=nonce,
+                                                      cause="hard" if reason == "hard limit" else "idle"), reason), None, ctx.last_hook))
+            except CloudError as e:
+                done.setdefault(i, (None, e, ctx.last_hook))
+            except BaseException as e:   # as before: not ours to swallow, re-raised by the pass
+                done.setdefault(i, (None, e, None))
+        while nxt < len(jobs) or running:
+            for i, (dead, t0, ctx) in list(running.items()):
+                took = int((self.clock() - t0).total_seconds())
+                if i in done:
+                    del running[i]
+                elif took >= REAP_STOP_SECONDS:
+                    dead.set()
+                    del running[i]
+                    done[i] = (None, CloudError("stop hit its limit: %d seconds (limit %d)" % (took, REAP_STOP_SECONDS), 1), None)
+                    self.audit(jobs[i][1], "pod/" + pod_name(jobs[i][1]), "stop", 0.0, False, str(done[i][1]))
+            while nxt < len(jobs) and len(running) < REAP_PARALLEL:
+                dead = threading.Event()
+                ctx = copy.copy(self)
+                ctx.kube, ctx.last_hook, ctx._orchestrator, ctx.foreign = _StopKube(self.kube, dead), None, None, []
+                ctx.recorder = copy.copy(self.recorder)
+                ctx.audit = lambda *a, _d=dead, **k: None if _d.is_set() else self.audit(*a, **k)
+                running[nxt] = (dead, self.clock(), ctx)
+                threading.Thread(target=work, args=(nxt, ctx), daemon=True).start()
+                nxt += 1
+            if running:
+                time.sleep(0.005)
+        for i in range(len(jobs)):
+            if isinstance(done[i][1], BaseException) and not isinstance(done[i][1], CloudError):
+                raise done[i][1]
+        return [done[i] for i in range(len(jobs))]
+
     def reap(self):
         """One pass: stop every pod past its hard deadline or idle too long. Returns [(worker, reason, exit)]."""
-        out, now, live = [], self.clock(), []
+        out, now, live, jobs = [], self.clock(), [], []
         self.reap_results, self.last_hook = {}, None
+        acts = {}   # name -> the activity this pass already read (passed to send_idle_nudges: one read per pod per pass)
         pods = self.kube.list_pods()
         # The renewal is the FIRST step: a slow activity read or stop below can no longer hold it back (the audit of 29 October).
         renewed = self.renew_git_tokens(self._before_hard_limit(pods, now), now)
@@ -2506,6 +3117,7 @@ class Launcher:
             else:
                 live.append(pod)   # before its hard limit and not stopped below: the git token renewal's candidates
                 act = self.activity(pod["metadata"]["name"])
+                acts[pod["metadata"]["name"]] = act
                 if act is None:
                     # Fail mode, decided: an unreadable activity is not a reason to kill work, so the pod runs until
                     # its hard limit; it is reported so it is not silent.
@@ -2514,22 +3126,26 @@ class Launcher:
                 if act and not act[0] and act[1] is not None and (now - act[1]).total_seconds() >= int(ann(pod, "idle-seconds", "600")):
                     reason = "idle"
             if reason:
-                self.last_hook = None
                 if pod in live:
                     live.remove(pod)
-                try:
-                    # by the run's own nonce where the pod carries one: a pod of another run under this name is left whole
-                    res = self.stop(argparse.Namespace(worker=worker, reason=reason, run_id=ann(pod, "run-id") or None,
-                                                       cause="hard" if reason == "hard limit" else "idle"), reason)
+                out.append(None)   # this pod's place in the result: filled after the stops ran
+                # by the run's own nonce where the pod carries one: a pod of another run under this name is left whole
+                jobs.append((len(out) - 1, worker, reason, ann(pod, "run-id") or None))
+        for (slot, worker, reason, _), (res, err, hook) in zip(jobs, self._run_stops(jobs)):
+            try:
+                if err is not None:
+                    raise err
+                if res is not None:
                     self.reap_results[worker] = {k: res.get(k) for k in ("pushed", "wip_branch", "skipped", "record")}
-                    out.append((worker, reason, 0))
+                    out[slot] = (worker, reason, 0)
                     self.retire_row(worker, reason)   # the pod is ended: its registry row is retired, once (DW-3)
-                except CloudError as e:
-                    self.reap_results[worker] = dict(self.last_hook or {})
-                    out.append((worker, reason, e.code))
+            except CloudError as e:
+                self.reap_results[worker] = dict(hook or {})
+                out[slot] = (worker, reason, e.code)
         out.extend(renewed)
         self.remove_orphan_secrets(pods, now)
         self.send_wip_notes(live, now)
+        self.send_idle_nudges(live, now, acts)
         return out
 
     def _note_vanished_pods(self, pods, now):
@@ -2668,6 +3284,34 @@ class Launcher:
                 self.audit(worker, "pod/" + name, "wip-note", self._cost_or_zero(pod), True, "")
             except Exception as e:
                 print("cloud-worker: the 40-minute note was not sent: %s" % self.kube.scrub(e, 120), file=sys.stderr)
+
+    def send_idle_nudges(self, pods, now, acts=None):
+        """ONE fixed line to a stalled builder (see idle_nudge_due). The cw/idle-nudge annotation is set BEFORE the send; one audit line.
+        A results check that cannot run means do not nudge. Never raises."""
+        for pod in pods:
+            try:
+                worker, name = ann(pod, "worker"), pod["metadata"]["name"]
+                if (pod.get("status") or {}).get("phase") != "Running" or not NAME_RE.match(worker or ""):
+                    continue
+                if ann(pod, "idle-nudge") or ann(pod, "role", "worker") == "orchestrator":
+                    continue
+                act = (acts or {}).get(name) or self.activity(name)
+                if not act or act[0] or act[1] is None:
+                    continue
+                idle = int(ann(pod, "idle-seconds", "600"))
+                if not idle_nudge_due(False, act[1], now, idle, "", ann(pod, "role", "worker"), False):
+                    continue
+                try:   # one read-only exec: it prints yes or no; a failure to run means do not nudge
+                    seen = self.kube.exec(name, "sh", "-c", "test -e /work/results.txt && echo yes || echo no").strip()
+                except CloudError:
+                    continue
+                if seen != "no":
+                    continue
+                self.kube.annotate(name, (pod.get("metadata") or {}).get("uid"), **{IDLE_NUDGE_MARK: "sent"})
+                self.send_note(name, IDLE_NUDGE)
+                self.audit(worker, "pod/" + name, "idle-nudge", self._cost_or_zero(pod), True, "")
+            except Exception as e:
+                print("cloud-worker: the idle nudge was not sent: %s" % self.kube.scrub(e, 120), file=sys.stderr)
 
     def send_note(self, name, text):
         self.kube.exec(name, "python3", "-c", NOTE_SENDER_CODE, text)
@@ -2916,6 +3560,7 @@ SETTINGS = (
     ("CW_STACK_REGISTRY", False, "registry-host"),  # the stack registry's host name (pull-only for a stack pod); all three CW_STACK_ keys are set together or not at all
     ("CW_STACK_PULL_CLIENT_ID", False, "guid"),    # the client id of the pull identity (not a secret)
     ("CW_STACK_PULL_TENANT_ID", False, "guid"),    # the tenant id (not a secret)
+    ("CW_REPO_MIN_SHAPE", False, "name"),          # comma-separated OWNER/NAME=SHAPE: the smallest pod shape a launch for that repository may use (a floor)
     ("CW_VAULT_CHECK_DIR", False, "path"),         # the checkout the vault access check runs from; needed only after a vault firewall refusal (see vault_check_dir_problem)
 )
 SETTING_KINDS = {name: kind for name, _, kind in SETTINGS}
@@ -3061,6 +3706,7 @@ VALIDATORS = {
     "CW_STACK_REGISTRY": ("a lower-case registry host name ending in .azurecr.io: no scheme, path, port, user or IP address", _registry_host_ok),
     "CW_STACK_PULL_CLIENT_ID": ("a GUID", lambda v: bool(_GUID.fullmatch(v))),
     "CW_STACK_PULL_TENANT_ID": ("a GUID", lambda v: bool(_GUID.fullmatch(v))),
+    "CW_REPO_MIN_SHAPE": ("a comma-separated list of OWNER/NAME=SHAPE entries (SHAPE one of %s), no repository twice" % ", ".join(FLOOR_ORDER), lambda v: repo_min_shapes(v) is not None),
     "CW_VAULT_CHECK_DIR": ("an absolute path with no .. segment", _path_ok),
 }
 _SETTING_LINE = re.compile(r"([A-Z][A-Z0-9_]*)=(.*)")
@@ -3282,7 +3928,7 @@ def build_parser():
     c = cmd("create")
     c.add_argument("--repo", required=True)
     c.add_argument("--branch", required=True)
-    c.add_argument("--idle", default="10m")
+    c.add_argument("--idle", default="30m")
     c.add_argument("--hard", default="2h")
     c.add_argument("--max-hard", default=DEFAULT_MAX_HARD)
     c.add_argument("--shape", default=None, help="the pod shape, one of %s; unset: %s (%s with --stack, %s with --agent orchestrator)" % (", ".join(SHAPES), DEFAULT_SHAPE, DEFAULT_STACK_SHAPE, DEFAULT_ORCHESTRATOR_SHAPE))

@@ -150,7 +150,9 @@ class Preflight(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         cls.srv.shutdown()
+        cls.srv.server_close()
         cls.other.shutdown()
+        cls.other.server_close()
 
     def setUp(self):
         Stub.rules, Stub.protected, Stub.fail, Stub.methods, Stub.redirect = list(FULL), False, None, [], None
