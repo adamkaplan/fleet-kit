@@ -66629,6 +66629,7 @@ TestFakeSupportModule, TestSupportImportsMutant, TestSupportImportsScratch, Test
 # The census of process kinds (#1501).
 _census = importlib.import_module("test_github_census")
 TestSamples, TestCensus, TestMutants, TestCensusDocumentation = _census.TestSamples, _census.TestCensus, _census.TestMutants, _census.TestDocumentation
+TestIndependentImpactNoPaths, TestNoPathsMutants = importlib.import_module("test_1041").build(TestImpactHold, FAKE_GH, LEDGER_HEAD, LEDGER_NEW_HEAD)
 TestMacosReader = _census.TestMacosReader   # #1847
 TestNewModuleDemands = importlib.import_module("test_new_module_demands").TestNewModuleDemands
 TestGuardSet = importlib.import_module("test_guard_set").TestGuardSet   # #2055
