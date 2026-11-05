@@ -311,7 +311,13 @@ class GhHub:
     def find(self, branch):
         """The open pull request of the branch as {number, isDraft, headRefOid}, or None."""
         found = json.loads(self._gh("pr", "list", "--head", branch, "--state", "open", "--json", "number,isDraft,headRefOid") or "[]")
-        return found[0] if found else None
+        if not found:
+            return None
+        row = found[0]   # the pod's cw-gh prints the raw REST row (draft, head.sha); the gh field form (isDraft, headRefOid) is read too
+        head = row.get("head")
+        return {"number": row.get("number"),
+                "isDraft": row["isDraft"] if "isDraft" in row else row.get("draft"),
+                "headRefOid": row["headRefOid"] if "headRefOid" in row else (head.get("sha") if isinstance(head, dict) else None)}
 
     def ready(self, number):
         self._gh("pr", "ready", str(number))

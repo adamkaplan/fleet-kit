@@ -94,5 +94,67 @@ class TestPrReady(unittest.TestCase):
         self.assertEqual(cea.pr_line("", record_json.parse_bounded), "PR not marked ready: no answer recorded")
 
 
+FAKE_GH = """#!/bin/sh
+echo "$@" >> "$FAKE_LOG"
+case "$1 $2" in
+  "pr list") printf '[{"number": 9, "draft": %s, "head": {"ref": "feat", "sha": "%s"}, "state": "open"}]\\n' "$FAKE_DRAFT" "$FAKE_SHA" ;;
+esac
+"""
+
+
+class TestMainRealHub(unittest.TestCase):
+    """main() with hub=None: the REAL GhHub against a fake cw-gh on PATH that prints REST rows (draft, head.sha), as the pod's client does."""
+    def go(self, draft, comment):
+        from unittest import mock
+        import io, contextlib
+        d, sha = repo()
+        bindir = tempfile.mkdtemp()
+        log = os.path.join(bindir, "log")
+        with open(os.path.join(bindir, "gh"), "w") as f:
+            f.write(FAKE_GH)
+        os.chmod(os.path.join(bindir, "gh"), 0o755)
+        env = {"PATH": bindir + os.pathsep + os.environ["PATH"], "CW_WORKDIR": d, "CW_WORKER": "w", "FAKE_LOG": log, "FAKE_DRAFT": draft, "FAKE_SHA": sha}
+        if comment:
+            env["CW_REVIEW_COMMENT"] = comment
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, env), mock.patch.object(end_hook, "run", lambda w, n: {"pushed": False, "wip_branch": None}), contextlib.redirect_stdout(out):
+            rc = end_hook.main()
+        calls = open(log).read().splitlines() if os.path.exists(log) else []
+        return rc, json.loads(out.getvalue()), calls
+
+    def test_draft_is_marked_ready_and_comment_posted(self):
+        rc, res, calls = self.go("true", "/review please")
+        self.assertEqual(rc, 0)
+        self.assertEqual(res["pr_note"], "PR #9 marked ready, review requested")
+        self.assertIn("pr ready 9", calls)
+        self.assertIn("pr comment 9 --body /review please", calls)
+
+    def test_no_comment_configured_posts_none(self):
+        rc, res, calls = self.go("true", "")
+        self.assertIn("marked ready, no review comment is configured", res["pr_note"])
+        self.assertEqual([c for c in calls if c.startswith("pr comment")], [])
+
+    def test_not_a_draft_is_left_alone(self):
+        rc, res, calls = self.go("false", "/review")
+        self.assertIn("is not a draft", res["pr_note"])
+        self.assertEqual([c for c in calls if c.startswith("pr ready")], [])
+
+
+class TestReviewCommentSource(unittest.TestCase):
+    def test_launcher_reads_per_repo_comment_default_none(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("launcher_cloud_worker", os.path.join(os.path.dirname(HERE), "cloud_worker.py"))
+        cw = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cw)
+        d = tempfile.mkdtemp()
+        p = os.path.join(d, "c.json")
+        with open(p, "w") as f:
+            json.dump({"acme/widget": "/review", "acme/bad": "x\ny"}, f)
+        self.assertEqual(cw.review_comment("Acme/Widget", p), "/review")
+        self.assertEqual(cw.review_comment("acme/other", p), "")
+        self.assertEqual(cw.review_comment("acme/bad", p), "")
+        self.assertEqual(cw.review_comment("acme/widget", os.path.join(d, "none.json")), "")
+
+
 if __name__ == "__main__":
     unittest.main()
