@@ -2697,6 +2697,9 @@ class _StopKube:
         return call
 
 
+KEPT_ENDED_NOTE = "kept pod ended: its work is unreachable by exec; the pod is left for a person"
+
+
 class Launcher:
     def __init__(self, kube, env, clock=None, sleep=time.sleep):
         self.kube, self.env, self.sleep = kube, env, sleep
@@ -3217,6 +3220,12 @@ class Launcher:
                 self._hook_record(info, {"ran": False, "pushed": False, "wip_branch": None, "skipped": [], "note": "pod was %s; end hook not run" % phase})
                 return {"worker": worker, "runtime_id": "pod/" + name, "pushed": False, "wip_branch": None,
                         "skipped": [], "note": "pod was %s; end hook not run" % phase, "record": info.get("record", "")}
+            if phase in ("Failed", "Succeeded"):   # kept, and ended: no exec can reach its work. Tried ONCE: marked, left for a person, never retried
+                note = self._mark(name, uid, unreachable="true")
+                info["hook_note"] = KEPT_ENDED_NOTE + ("; " + note if note else "")
+                print("cloud-worker: " + KEPT_ENDED_NOTE, file=sys.stderr)
+                return {"worker": worker, "runtime_id": "pod/" + name, "pushed": False, "wip_branch": None,
+                        "skipped": [], "note": KEPT_ENDED_NOTE, "record": info.get("record", ""), "left": True}
             info["refresh"] = REFRESH_NONE
             try:
                 res = self.run_hook(name)
@@ -3806,6 +3815,8 @@ class Launcher:
         finally:
             steps["vanished"] = mono() - t0
         for pod in pods:
+            if ann(pod, "unreachable") == "true" and (pod.get("status") or {}).get("phase") in ("Failed", "Succeeded"):
+                continue   # a kept pod that ended and was tried once: left for a person; no stop, no record, no audit
             worker = ann(pod, "worker")
             reason = None
             failed = (pod.get("status") or {}).get("phase") == "Failed"
