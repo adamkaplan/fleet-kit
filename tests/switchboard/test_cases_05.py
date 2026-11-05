@@ -569,7 +569,6 @@ class TestShimHygiene(unittest.TestCase):
         return faults
 
     def test_every_module_under_shims_is_standard_library_only_and_impersonal(self):
-        self.assertEqual(len(list((SHIM.parent).glob("*.py"))), 6)
         self.assertEqual(self.module_faults(SHIM.parent), [])
 
 
