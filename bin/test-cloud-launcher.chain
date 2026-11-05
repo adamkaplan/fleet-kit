@@ -40,6 +40,7 @@ cloud/launcher/tests/test_failed_pod_record.py
 cloud/launcher/tests/test_fixture_root.py
 cloud/launcher/tests/test_git_token_renewal.py
 cloud/launcher/tests/test_git_token_retry.py
+cloud/launcher/tests/test_hub_entry_keys.py
 cloud/launcher/tests/test_hub_restart_client.py
 cloud/launcher/tests/test_hub_safe_to_evict.py
 cloud/launcher/tests/test_idle_default_note.py
