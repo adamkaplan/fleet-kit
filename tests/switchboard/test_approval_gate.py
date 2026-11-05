@@ -9,6 +9,7 @@ import inspect
 import json
 import re
 import sys
+import subprocess
 import tempfile
 import types
 import unittest
@@ -266,6 +267,8 @@ class TestApprovalGateCommands(unittest.TestCase):
             joined = " ".join(argv)
             if argv[0] == HOST.FAKE_GH and re.search(r"/issues/7(\s|$|/)", joined):
                 return HOST.LedgerBase.route(me, argv, **kwargs)
+            if argv[0] == "git":   # #2159: the merge step's drops read; this fixture has no repository, and a read that cannot be made refuses nothing
+                return subprocess.CompletedProcess(argv, 1, "", "no repository in this fixture")
             return HOST.TestMergeGateCommand.route(me, argv, **kwargs)
         host_class = type("ApprovalHost", (HOST.TestMergeGateCommand,), {"runTest": lambda self: None, "route": route})
         self.h = host_class("runTest")
