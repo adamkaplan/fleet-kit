@@ -4,7 +4,7 @@
 # issue or PR is closed (withdrawn); S5 a cos-tier decision that has aged. It never edits GitHub and never changes a tier.
 
 SWEEP_DEFAULTS = {"enabled": False, "aged_cos_hours": 2, "comment_window_days": 7, "max_findings": 20,
-                  "realarm_hours": 6, "person_names": ["the owner"], "calls_per_pass": 12}
+                  "realarm_hours": 6, "person_names": ["the owner"], "calls_per_pass": 16}
 SWEEP_S6A_GRACE = 900         # a PR younger than this is not yet "marker without label": the label is applied after it opens
 SWEEP_S1A_GRACE = 600         # a decision section whose issue changed this recently may be mid-escalation (one label off, the next not yet on)
 SWEEP_TTL = 900               # seconds a repo's lists are kept before they are read again
@@ -12,6 +12,7 @@ SWEEP_CALLS_PER_PASS = SWEEP_DEFAULTS["calls_per_pass"]   # default of `sweep.ca
 SWEEP_CALLS_CAP = 100
 SWEEP_CONFIRM_RESERVE = 2     # of them, kept for the single-issue reads (is this decision's issue closed?)
 SWEEP_PASS_SECONDS = 8        # no new read is started once the sweep has spent this long in a pass
+OPEN_LIST_PAGES = 10         # #1886: pages (of 100) every read of OPEN items follows (1,000); beyond it one named alert a day
 SWEEP_LIST_PAGES = 2          # pages one list read follows (200 records); more is shown as capped
 SWEEP_PR_COMMENTS = 5         # the last comments of an item that are searched for the phrases
 SWEEP_FILE = "sweep.json"
@@ -242,8 +243,70 @@ def sweep_state(engine):
     return state
 
 
+def open_page_suffix(page):
+    """#1886: the first page is asked exactly as before (no `page` parameter: PC-1); later pages add `&page=N`."""
+    return "" if page == 1 else "&page=%d" % page
+
+
+def open_pages(read, repo=None):
+    """#1886: `read(page)` -> a list or a non-list (a failed read); the pages of an open-item list up to OPEN_LIST_PAGES, stopping at a short page."""
+    out = []
+    for page in range(1, OPEN_LIST_PAGES + 1):
+        got = read(page)
+        if not isinstance(got, list):
+            if page > 1:
+                raise IntentError("gh", "page %d of an open list was not a list" % page)
+            return got
+        out.extend(got)
+        if len(got) < GITHUB_PAGE_SIZE:
+            break
+        if page == OPEN_LIST_PAGES and repo is not None:
+            note_open_cut(repo)
+    return out
+
+
+_UNSENT_DAY = {}   # #1886: repository -> the day its `open_list.cut_unsent` line was written (memory only: a restart may write one more; one entry per repository)
+_OPEN_CUTS = set()   # #1886: the repositories whose read of open items stopped at OPEN_LIST_PAGES in this pass (one entry per repository)
+
+
+def note_open_cut(repo):
+    """#1886: a read of open items of `repo` stopped at the ceiling with a full last page."""
+    _OPEN_CUTS.add(str(repo).lower())   # one spelling per repository
+
+
+def take_open_cuts():
+    """#1886: the sorted repositories cut in this pass; the set is emptied."""
+    out = sorted(_OPEN_CUTS)
+    _OPEN_CUTS.clear()
+    return out
+
+
+def open_list_alert(engine, repo, now):
+    """#1886: ONE alert a day when an open-item list of `repo` stops at OPEN_LIST_PAGES: to the Chief of Staff through the reminder route, one audit line, a day marker."""
+    alerts = load_module("open_list_alert")
+    day = _day(now)
+    if not alerts.due(engine.state_dir, repo, day, load_module("record_json").parse_bounded):
+        return
+    discovery = getattr(engine, "discovery", None)
+    cos = next((n for n, o in sorted(discovery.agents.items()) if (o.fleet or {}).get("role") == "chief-of-staff"), None) if discovery is not None else None
+    ceiling = OPEN_LIST_PAGES * GITHUB_PAGE_SIZE
+    text = ("The open items of %s were cut: %s or more are open and the read stops at %d pages (%d items, OPEN_LIST_PAGES); the oldest are not read by the checks that read this list."
+            % (repo, format(ceiling, ","), OPEN_LIST_PAGES, ceiling))
+    audit = getattr(engine, "audit", None)
+    if cos is None:
+        if audit is not None and _UNSENT_DAY.get(repo) != day:   # at most once per repository and day
+            _UNSENT_DAY[repo] = day
+            audit.append(engine.actor, "open_list.cut_unsent", repo, {"repo": repo})
+        return
+    add_repeat_reminder(engine.state_dir, cos, now, now, text, "open-list-cut", repo, day, wake_class=WAKE_LOAD)
+    if audit is not None:
+        audit.append(engine.actor, "open_list.cut", repo, {"repo": repo, "ceiling": ceiling, "pages": OPEN_LIST_PAGES})
+    if not alerts.mark(engine.state_dir, repo, day, load_module("record_json").parse_bounded) and audit is not None:
+        audit.append(engine.actor, "open_list.marker_failed", repo, {"repo": repo})
+
+
 def sweep_pages_used(records, truncated):
-    return SWEEP_LIST_PAGES if truncated else max(1, -(-len(records) // GITHUB_PAGE_SIZE))
+    return max(1, -(-len(records) // GITHUB_PAGE_SIZE))
 
 
 def sweep_read_repo(hub, repo, now, window_days, regex, budget, strong):
@@ -252,7 +315,10 @@ def sweep_read_repo(hub, repo, now, window_days, regex, budget, strong):
     one-item list: the calls this pass may still make; each read is charged what it used."""
     since = iso(now - window_days * 86400)
     items, truncated = {}, False
-    records, cut = hub.read_pages("repos/%s/issues?state=open&per_page=100" % repo, cap=SWEEP_LIST_PAGES)
+    records, cut = hub.read_pages("repos/%s/issues?state=open&per_page=100" % repo, cap=OPEN_LIST_PAGES)
+    open_cut = bool(cut)
+    if open_cut:
+        note_open_cut(repo)
     budget[0] -= sweep_pages_used(records, cut)
     truncated = truncated or cut
     for record in records:
@@ -294,12 +360,12 @@ def sweep_read_repo(hub, repo, now, window_days, regex, budget, strong):
             fires, refs = sweep_strong_statement(strong, comment.get("body"), repo, [repo], matched)  # the last one wins
             items[number]["latest_strong"], items[number]["latest_refs"] = fires, refs
             items[number]["latest_source"] = {"source": "comment:%s" % comment.get("id"), "match": matched[0] if matched else ""} if fires else None
-    return {"at": now, "items": items, "truncated": truncated, "error": None, "closed_holds": closed_holds}
+    return {"at": now, "items": items, "truncated": truncated, "error": None, "closed_holds": closed_holds, "open_cut": open_cut}
 
 
 def sweep_refresh(engine, state, repos, now, cfg, regex, budget):
     """Read stale repos, the least recently read first, while the pass's call budget (less the reserve for the
-    single-issue reads) allows a whole repo (its two lists, up to SWEEP_LIST_PAGES pages each). Oldest first means
+    single-issue reads) allows a whole repo (its open list up to OPEN_LIST_PAGES pages, its closed list one, its comments up to SWEEP_LIST_PAGES). Oldest first means
     every repo is reached in turn: none starves. A failed read keeps the old picture and is retried after SWEEP_TTL."""
     hub = getattr(engine, "hub", None)
     if hub is None:

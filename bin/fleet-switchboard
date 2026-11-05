@@ -7858,6 +7858,11 @@ def publish_decisions(engine):
         ci_record_pass(engine, now)   # #107: records ci verdicts for open PRs under a plan; reads GitHub, writes only the ledger and audit
     except Exception as err:
         engine._note("ci_record.error", None, {"error": _one_line("%s: %s" % (type(err).__name__, err), 200)})
+    for repo in take_open_cuts():   # #1886: the daily alert for every read of this pass that stopped at the ceiling
+        try:
+            open_list_alert(engine, repo, now)
+        except Exception as err:
+            engine._note("open_list.error", repo, {"error": _one_line("%s: %s" % (type(err).__name__, err), 200), "repo": repo})
     try:
         pane_health_pass(engine, now)   # the control plane: detached or dead panes, reads only, wakes the Chief of Staff
     except Exception as err:
@@ -9816,6 +9821,16 @@ def _records(values, key=None):
     return [r for r in records if isinstance(r, dict)]
 
 
+def _page_records(values, key, path, number):
+    """The records of ONE page, or GitHubUnavailable (#1983): a page is a list of objects, or an object whose `key` list holds objects; an empty list is a valid last page."""
+    for value in values:
+        if isinstance(value, dict) and key and isinstance(value.get(key), list):
+            value = value[key]
+        if not isinstance(value, list) or not all(isinstance(r, dict) for r in value):
+            raise GitHubUnavailable("%s page %d is not a list of objects" % (path, number))
+    return _records(values, key)
+
+
 def _is_orchestrator(observation):
     return (observation.fleet or {}).get("role") == "orchestrator"
 
@@ -10936,8 +10951,15 @@ class GitHubHub:
             with self.lock:
                 self._markers_dirty = True  # a cursor that could not be written is written next pass
 
+    def read_open_pages(self, path):
+        records, cut = self.read_pages(path, cap=OPEN_LIST_PAGES)
+        named = re.match(r"^repos/([^/]+/[^/]+)/", path)   # the repository, read the way gh_api reads it
+        if cut and named:
+            note_open_cut(named.group(1))
+        return records, cut
+
     def read_pages(self, path, key=None, timeout=None, older=None, cap=None):
-        """One list read, at most GITHUB_PAGE_CAP pages of GITHUB_PAGE_SIZE. Returns (records, truncated). `older`
+        """One list read, at most `cap` (default GITHUB_PAGE_CAP) pages of GITHUB_PAGE_SIZE. Returns (records, truncated). `older`
         is (field, since): a listing newest first stops at the first page that ends before `since`."""
         joiner = "&" if "?" in path else "?"
         records = []
@@ -10945,13 +10967,13 @@ class GitHubHub:
         number = 0
         while True:
             number += 1
-            page = _records(self.gh_api("%s%spage=%d" % (path, joiner, number), paginate=False, timeout=timeout), key)
+            page = _page_records(self.gh_api("%s%spage=%d" % (path, joiner, number), paginate=False, timeout=timeout), key, path, number)
             records.extend(page)
             if len(page) < GITHUB_PAGE_SIZE:
                 return records, False
             if older and isinstance(page[-1].get(older[0]), str) and page[-1][older[0]] < older[1]:
                 return records, False
-            if bounded and number >= min(GITHUB_PAGE_CAP, cap or GITHUB_PAGE_CAP):
+            if bounded and number >= (cap or GITHUB_PAGE_CAP):
                 return records, True
 
     # -- gh api, and the catch-up read
@@ -14037,7 +14059,7 @@ class IntentReader:
     def open_asks(self, charter, repo=None):
         """The open sub-issues of a charter, derived from GitHub on every call."""
         repo = repo or self.repo
-        found = self._api("repos/%s/issues/%d/sub_issues?per_page=100" % (repo, charter), repo)
+        found = open_pages(lambda page: self._api("repos/%s/issues/%d/sub_issues?per_page=100%s" % (repo, charter, open_page_suffix(page)), repo), repo)
         asks = []
         for data in found if isinstance(found, list) else []:
             issue = IssueIntent.from_api(data)
@@ -18123,6 +18145,7 @@ class CiRecordState:
     def __init__(self):
         self.lists = {}     # normalised repo -> (read at, records)
         self.good = {}      # normalised repo -> (read at, records, cut): the list of the LAST read of it in this process that SUCCEEDED; a failed read removes it (memory only)
+        self.was_cut = {}   # normalised repo -> the ceiling flag of the last SUCCESSFUL read (a failed read leaves it)
         self.checked = {}   # (normalised repo, number) -> {"list_head", "at", "retry_at", "fails"}: the LAST-CHECKED time decides
         self.recorded = 0   # verdicts this process recorded
         self.already = 0    # verdicts this process found already recorded (a manual `gates ci-record` first leaves these, not `recorded`)
@@ -18171,10 +18194,13 @@ def ci_record_pass(engine, now):
                 break
             key = plan_ledger.normal_repo(repo)
             try:
-                records, cut = hub.read_pages("repos/%s/pulls?state=open&per_page=100" % repo, cap=2)
+                records, cut = hub.read_pages("repos/%s/pulls?state=open&per_page=100" % repo, cap=OPEN_LIST_PAGES)
                 budget[0] -= sweep_pages_used(records, cut)
+                if cut:
+                    note_open_cut(repo)
                 state.lists[key] = (now, records)
-                state.good[key] = (now, records, bool(cut) or len(records) >= LABEL_HOLD_LIST_CUT)
+                state.good[key] = (now, records, bool(cut))
+                state.was_cut[key] = bool(cut)   # the flag of the last SUCCESSFUL read: a failed read leaves it, so the held rows of a cut list are kept until the next good read
                 read_mark(engine, "pulls:" + key, not cut, "the open pull request list was cut", now)   # #811
             except GitHubUnavailable as err:
                 budget[0] -= 1
