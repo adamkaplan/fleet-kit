@@ -19,7 +19,7 @@ Launcher, reaper, end hook and token mint for cloud workers, built to `docs/clou
   `cluster login failed: ...` (a login failure exits non-zero). A restarted reaper stops by name and finds no pod for one the last
   pass already stopped, so nothing is stopped twice. Only one reaper runs at a time: it takes an exclusive lock (a 0600 file named for the user's namespace in `~/.local/state/cw-cloud/locks`, found through the password database, so a different audit file, state directory or login (a token file, a kube context, a kubeconfig) is still a rival; one user runs one reaper per namespace. The lock directory itself is checked for owner and mode, its parents are not walked, which is adequate for a lock) before its first pass and a second one exits at once with `not started: another reaper holds the lock` (the kernel drops the lock when a holder dies, however it dies). A stop uses the pod's own run id where the pod carries one. The installer writes the service file only when the target is a plain file of the user's own (never through a symlink), by temp file and rename, and its uninstall removes only a file the template makes (a regular file of the user's own with other content is overwritten by install, by rename, as the installer's own path; a symlink, a non-regular file, a foreign or group-writable file is refused). Path settings must be absolute paths of plain characters. A `path_walk` earlier on `sys.path` (the launcher directory or `PYTHONPATH`) would win over the kit's: that is the same user's own environment, not a boundary. While the Mac sleeps the reaper pauses. The installer's `--cloud-reaper-only` option installs and loads that service and nothing else: it writes the reaper's service file (mode 0600) and the state directory, and leaves the config, the profile pieces, the command link, the plugin link, the switchboard's own service and the daemon alone. It first checks the settings file (`cloud.env`: a regular file of the user's own, mode 0600, with the cluster login names `CW_CLOUD_SERVER`, `CW_CLOUD_NAMESPACE` and `CW_CLOUD_TOKEN_FILE` (the last from the install's environment) and the vault names `CW_VAULT_NAME`, `CW_VAULT_SUBSCRIPTION`) and refuses with one named line, writing nothing; the full `--with-cloud-reaper` install does not check. The way back is `install --uninstall --cloud-reaper-only`, which removes only the reaper's service file; plain `--uninstall` (and `--uninstall --no-service`) removes more than the reaper: the herdr plugin link (unless `--no-herdr-link`), the plugin, agent and skill pieces, the wrapper and the command link. Prerequisites: the Mac must be awake (the reaper pauses when it sleeps) and the vault must be reachable from this machine (a source-address allowlist: from another network the refresh is refused and the reaper keeps its old token until it ends).
 
-  **Renewal cadence, slow passes and the end hook's nothing-to-push rule.** The reaper renews each git token that is 30 minutes old as the first step of every pass and, on a thread of its own, refreshes its own cluster login and renews the due tokens at least every 10 minutes (`RENEW_CADENCE_SECONDS`) whatever a pass is doing, and a renewal answered Unauthorized refreshes the login and is retried once in the same pass. A pass that takes longer than `SLOW_PASS_SECONDS` (600 seconds) writes one line on the reaper's own log and one audit line (action `slow-reap-pass`) with its seconds, and a short pass writes none. The reaper runs today on the operator's Mac as a launchd job, so a stalled reaper is seen within one pass by that line and not an hour later, and a pass that is slow because the Mac swaps or sleeps shows it in the seconds. The reaper restarts itself when the installed code changes: it compares a digest of its own code on disk (`cloud_worker.py` and the kit modules it imports) between two passes, never inside a stop, writes one audit line (action `reaper-restart`), exits with status 0 and the service manager starts it again. A change of its service file (its environment or arguments) still needs the install command. A HUNG cluster call holds the reaper's renewal lock for as long as the call's own timeout (120 seconds): no regression. The end hook decides whether there is nothing to push after a bounded fetch with prune (20 seconds at most, no retry): it fetches first and falls back to the local references only when the fetch fails (then one line says the answer is from local references): a clean tree with no commit beyond its remote-tracking refs skips the push, prints one line `cw-prestop: nothing to push` and ends ok, while one unpushed commit is pushed as before and its failure is reported.
+  **Renewal cadence, slow passes and the end hook's nothing-to-push rule.** The reaper renews each git token that is 30 minutes old as the first step of every pass and, on a thread of its own, refreshes its own cluster login and renews the due tokens at least every 10 minutes (`RENEW_CADENCE_SECONDS`) whatever a pass is doing, and a renewal answered Unauthorized refreshes the login and is retried once in the same pass. A pass that takes longer than `SLOW_PASS_SECONDS` (600 seconds) writes one line on the reaper's own log and one audit line (action `slow-reap-pass`) with its seconds, and a short pass writes none. The reaper runs today on the operator's Mac as a launchd job, so a stalled reaper is seen within one pass by that line and not an hour later, and a pass that is slow because the Mac swaps or sleeps shows it in the seconds. The reaper restarts itself when the installed code changes: it compares a digest of its own code on disk (`cloud_worker.py` and the kit modules it imports) between two passes, never inside a stop, writes one audit line (action `reaper-restart`), exits with status 0 and the service manager starts it again. A change of its service file (its environment or arguments) still needs the install command. A HUNG cluster call holds the reaper's renewal lock for as long as the call's own timeout (120 seconds): no regression. The end hook decides whether there is nothing to push after a bounded fetch with prune (20 seconds at most, no retry): it fetches first and falls back to the local references only when the fetch fails (then one line says the answer is from local references): a clean tree with no commit beyond its remote-tracking refs skips the push, prints one line `cw-prestop: nothing to push` and ends ok, while one unpushed commit is pushed as before and its failure is reported. The stops of one pass run four at a time (`REAP_PARALLEL`), each on its own copy of the launcher's per-stop state, and the list a pass returns keeps the order of the pods; one stop has its own limit (`REAP_STOP_SECONDS`, 420 seconds): when it is hit the wait is abandoned for that pass (the launcher cannot reach its kubectl client, so the thread is left to end by itself and every call it makes after that is dropped), the pod is left whole and un-annotated, one audit line (action `stop`, ok false) says `stop hit its limit: N seconds (limit M)` with the worker, and the stop is tried again at the next pass.
   **The reaper's own cluster login and the minter.** The reaper keeps its own login fresh (the token file, renewed when under 20 minutes
   are left). The UNATTENDED reaper pins its mint command (`strict`, below); the interactive launch path keeps its previous behaviour, since it
   runs in the person's own shell, which can read the vault with the person's own login anyway. The launch path keeps its previous behaviour: `CW_KUBECTL`, `CW_CLUSTER_ADMIN_CMD` and `CW_CLOUD_NAMESPACE` can still be set by whoever controls the launcher's environment (an interactive shell with the person's own login): unchanged. The new guards protect the UNATTENDED reaper service. With the minter credential (a ServiceAccount that can only create tokens for `cw-operator`) the administrator credential no longer travels this route: the residual risk is the minter's token for `cw-operator` only. This is a stated limit, not a fix. The unattended reaper uses a fixed route: it ignores `CW_KUBECTL`, `CW_CLUSTER_ADMIN_CMD` and `CW_CLUSTER_TOKEN_CMD` (neither
@@ -151,7 +151,7 @@ The switchboard (`bin/cloud_worker.py`) calls this launcher; the settings below 
 | `CW_CLUSTER_TOKEN_CMD` | a command that prints a cluster token; when unset the default below is used |
 | `CW_VAULT_SUBSCRIPTION`, `CW_VAULT_NAME` | the vault that holds the cluster administrator credential (secret `CW_CLUSTER_ADMIN_SECRET`, default `cw-cluster-admin-kubeconfig`; or a command in `CW_CLUSTER_ADMIN_CMD`) |
 | `CW_CLUSTER_TOKEN_DURATION` | the token's requested life, default `20m`, at most `60m` (kubectl's own floor is 10 minutes) |
-| `CW_GIT_TOKEN_CMD` | prints the one-hour git token for the repository (default: `app_token.py OWNER/NAME`, same settings as `run_task.py`); the managed reaper runs the same command to renew the token every 30 minutes |
+| `CW_GIT_TOKEN_CMD` | prints the one-hour git token for the repository on stdout (an override's contract); the default is `app_token.py OWNER/NAME --fd N`, which hands the token over a pipe the launcher reads and never prints it (same settings as `run_task.py`); the managed reaper runs the same command to renew the token every 30 minutes |
 | `CW_OPENCODE_BIN` | the `opencode` program (default `opencode` on `PATH`); the launcher runs `opencode auth export` (fixed arguments, scrubbed environment, output through a pipe, in memory) and keeps only the one `github-copilot` entry, as a one-entry array. Refused by name: command missing or failing, no entry, two entries, an inactive entry, an entry that is not `oauth`; nothing is created |
 | `CW_PULL_SECRET` | optional: the image pull secret name passed to `create` |
 | `CW_HUB_CHANNEL_URL` | the address of the hub's channel an orchestrator or hub pod is told (`FLEET_CLOUD_CHANNEL_URL`); an `http` or `https` URL with a host, an optional port and an optional one-segment path; not a secret; default `http://cloud-hub.cw.svc:8443/message`. **Set (this or `CW_HUB_REGISTRY_SECRET`) = the hub setting is on: every launch registers** with the hub (a worker launch included), and a launch needs the headless Service `cw-agents` |
@@ -188,6 +188,7 @@ The switchboard (`bin/cloud_worker.py`) calls this launcher; the settings below 
   a cloud record has it, so `send`, `read` and `retire` by name cannot be routed to the wrong one. A failed or cut `launch --cloud` stops
   the pod with the run id of its own `create` (`--run-id`); a launcher whose `stop` takes no `--run-id` yet is stopped by name and the audit line says so.
 - **`retire`** runs the launcher's `stop` (end hook, then pod and secrets); a failing end hook keeps the pod. No token or tunnel is kept.
+- **The registry row (#1510).** The switchboard-side launch writes the agent's registry row at launch through the registry's own write function (`kind` cloud, no pane and no endpoint: the endpoint is not recorded because `send` by the registry has no fallback and no address a Mac lane can reach exists yet, ask #1587); `retire` and `cloud-clear` retire it once; the reaper's own stop of a pod writes nothing, the clear retires the row later. A registry failure never refuses a launch or keeps a pod: it is one line on standard error and one audit line.
 
 **The cap on shape M per lane (ask #1640).** A lane may hold at most 4 shape-M cloud workers at once (`MAX_M_PER_LANE` in `bin/cloud_worker.py`), because a lane's batch of 4-CPU pods once filled the cluster and left every other lane's launches unplaceable. The refusal reads: `refused: lane LANE already holds 4 shape-M cloud workers (A, B, C, D): retire one (retire NAME) or launch a smaller shape (--shape S)`; it exits 2 before any token, launcher or cluster call. The count reads the record directory alone: a record counts while it exists, holds the shape M and its hard deadline has not passed (the lane is its `reports-to` boss, or `(no boss)`); a retire or a clear ends it. A launch of another shape, of a name that already has a record, or of a lane below the cap is unchanged. Limits: a launch still in flight has no record yet; two launches of one lane at the same moment can pass together; records written before this change hold no shape and are not counted.
 
@@ -205,6 +206,8 @@ The script runs each entry once, stops at the first red with `RESULT: FAIL`, and
 
 Residual risk: two members adding names that sort next to each other (the same place in the list) still conflict in git (adjacent inserts), and the first member to add in an empty gap next to the fixed last line conflicts with it. Only entries far apart merge cleanly. A test documents this limit.
 
+A test that is not yet measured is named by one line in cloud/launcher/tests/chain_unmeasured.list (sorted, at its alphabetical place), never on the `Not yet measured:` README line; the residual risk is the same as above: two names at the same sorted place still conflict, and only names far apart merge cleanly.
+
 ## Chain times (ask #1390)
 
 Cause: the whole chain of `bin/test-cloud-launcher` ran one entry after another. On the macOS `test-cloud` leg that took 24 to 30 minutes (24 on the default branch at batch 6, 25.7 on one pull request and 30.2 on another, whose step limit of 30 minutes then cut the leg with no test failing); on Ubuntu it took 15.6 minutes. The cost was the entries themselves, mostly real subprocess starts of the fake cluster client, not fixed sleeps, and the macOS runner is about twice as slow.
@@ -213,13 +216,15 @@ The fix is parallel lanes, not removing or moving a test: the entries named in `
 
 Chain time after the change: macOS 11.6 minutes, Ubuntu 5.1 minutes (one run of the pull request's head; the step timeout is 20 minutes). The per-entry seconds below are from that run, so they include the slowdown of running beside other entries.
 
-Slowest five on macOS: `test_cloud_prestop.py` (314 s), `test_git_token_renewal.py` (310 s), `test_run_record.py` (239 s), `test_app_token.py` (122 s), `test_driver.py` (120 s).
+Slowest five on macOS: `test_cloud_prestop.py` (314 s), `test_git_token_renewal.py` (310 s), `test_run_record.py` (239 s), `test_mint_roles.py` (177 s), `test_m_cap.py` (157 s).
 
-Slowest five on Ubuntu: `test_run_record.py` (153 s), `test_git_token_renewal.py` (106 s), `test_driver.py` (93 s), `test_cloud_stack_wait.py` (58 s), `test_cloud_quick_bounds.py` (45 s).
+Slowest five on Ubuntu: `test_run_record.py` (153 s), `test_git_token_renewal.py` (106 s), `test_driver.py` (93 s), `test_mint_roles.py` (80 s), `test_cloud_stack_wait.py` (58 s).
 
-Not yet measured: `cloud/launcher/tests/test_cloud_quick_budget.py`, `cloud/launcher/tests/test_cloud_split.py`, `cloud/launcher/tests/test_end_hook_nothing_to_push.py`, `cloud/launcher/tests/test_fixture_root.py`, `cloud/launcher/tests/test_git_token_retry.py`, `cloud/launcher/tests/test_m_cap.py`, `cloud/launcher/tests/test_mint_retry.py`, `cloud/launcher/tests/test_mint_roles.py`, `cloud/launcher/tests/test_orchestrator_row.py`, `cloud/launcher/tests/test_orphan_secrets.py`, `cloud/launcher/tests/test_probe_redirect.py`, `cloud/launcher/tests/test_read_retired_last_message.py`, `cloud/launcher/tests/test_reaper_renewal.py`, `cloud/launcher/tests/test_reaper_restart.py`, `cloud/launcher/tests/test_reaper_row.py`, `cloud/launcher/tests/test_render_namespace.py`, `cloud/launcher/tests/test_scratch_clean.py`, `cloud/launcher/tests/test_stop_no_checkout.py`, `cloud/launcher/tests/test_token_at_limit.py`, `cloud/worker/tests/test_cloud_prepush_background.py`
+Not yet measured: the names are in cloud/launcher/tests/chain_unmeasured.list, one per line (a member adds a new chain test there).
 
 A change that adds a chain entry adds its name to this line; the next measurement moves it into the tables.
+
+Lane sums after ask #1695 (31 Oct 2026, computed from the macOS seconds above, not yet measured on CI): lane 0 785 s, lane 1 822 s, lane 2 773 s (from 696, 665, 596), after `test_cloud_split.py`, `test_m_cap.py`, `test_mint_roles.py` and `test_git_token_retry.py` moved from serial to the end of the parallel list (positions 22, 23, 24, 25 = lanes 0, 1, 2, 0); the Ubuntu seconds of those four are one run on an idle pod, not CI.
 
 ### macOS (per entry)
 
@@ -252,6 +257,7 @@ A change that adds a chain entry adds its name to this line; the next measuremen
 | `cloud/launcher/tests/test_model_credential.py` | 2 | serial |
 | `cloud/launcher/tests/test_orchestrator_agent.py` | 43 | serial |
 | `cloud/launcher/tests/test_reaper_managed.py` | 66 | serial |
+| `cloud/launcher/tests/test_registry_endpoint.py` | 1 | serial |
 | `cloud/launcher/tests/test_retire_gone_pod.py` | 10 | serial |
 | `cloud/launcher/tests/test_stack_model_key.py` | 8 | serial |
 | `cloud/launcher/tests/test_stack_registry_check.py` | 2 | serial |
@@ -285,11 +291,16 @@ A change that adds a chain entry adds its name to this line; the next measuremen
 | `cloud/worker/tests/test_pr_edit_hardening.py` | 45 | parallel |
 | `cloud/worker/tests/test_push_rules.py` | 1 | serial |
 | `cloud/worker/tests/test_pr_edit.py` | 41 | parallel |
+| `cloud/worker/tests/test_pod_inspect.py` | 3 | parallel |
 | `cloud/launcher/tests/test_cloud_quick_scans_run.py` | 34 | parallel |
 | `cloud/worker/tests/test_guard_table.py` | 44 | parallel |
 | `cloud/worker/tests/test_cw_gh_comments.py` | 37 | parallel |
 | `cloud/worker/tests/test_cloud_prepush_hardening.py` | 34 | parallel |
 | `cloud/worker/tests/test_stack_pull.py` | 35 | parallel |
+| `cloud/launcher/tests/test_cloud_split.py` | 49 | parallel |
+| `cloud/launcher/tests/test_m_cap.py` | 157 | parallel |
+| `cloud/launcher/tests/test_mint_roles.py` | 177 | parallel |
+| `cloud/launcher/tests/test_git_token_retry.py` | 40 | parallel |
 
 ### Ubuntu (per entry)
 
@@ -322,6 +333,7 @@ A change that adds a chain entry adds its name to this line; the next measuremen
 | `cloud/launcher/tests/test_model_credential.py` | 1 | serial |
 | `cloud/launcher/tests/test_orchestrator_agent.py` | 17 | serial |
 | `cloud/launcher/tests/test_reaper_managed.py` | 23 | serial |
+| `cloud/launcher/tests/test_registry_endpoint.py` | 1 | serial |
 | `cloud/launcher/tests/test_retire_gone_pod.py` | 5 | serial |
 | `cloud/launcher/tests/test_stack_model_key.py` | 3 | serial |
 | `cloud/launcher/tests/test_stack_registry_check.py` | 1 | serial |
@@ -355,11 +367,32 @@ A change that adds a chain entry adds its name to this line; the next measuremen
 | `cloud/worker/tests/test_pr_edit_hardening.py` | 5 | parallel |
 | `cloud/worker/tests/test_push_rules.py` | 1 | serial |
 | `cloud/worker/tests/test_pr_edit.py` | 5 | parallel |
+| `cloud/worker/tests/test_pod_inspect.py` | 2 | parallel |
 | `cloud/launcher/tests/test_cloud_quick_scans_run.py` | 30 | parallel |
 | `cloud/worker/tests/test_guard_table.py` | 4 | parallel |
 | `cloud/worker/tests/test_cw_gh_comments.py` | 1 | parallel |
 | `cloud/worker/tests/test_cloud_prepush_hardening.py` | 24 | parallel |
 | `cloud/worker/tests/test_stack_pull.py` | 0 | parallel |
+| `cloud/launcher/tests/test_cloud_split.py` | 8 | parallel |
+| `cloud/launcher/tests/test_m_cap.py` | 11 | parallel |
+| `cloud/launcher/tests/test_mint_roles.py` | 80 | parallel |
+| `cloud/launcher/tests/test_git_token_retry.py` | 2 | parallel |
+
+## The vault block (ask #1427)
+
+Cause: when the vault's firewall refused this machine's address, every caller started its own `az keyvault secret show`. The three callers are the cluster launch, each pass of the reaper loop (every minute) and each token mint. Nothing told a later caller that the answer was already known, so about ten vault calls were in flight at once, each took tens of seconds to fail, and the same refusals were repeated for hours.
+
+What the block is: after a firewall refusal (the vault's own `Forbidden` or `ForbiddenByFirewall` answer, and only that: a timeout, a missing secret, a login problem or a malformed answer never creates one) the launcher writes one small private file holding the time, a one-line reason and the retry time. It holds no secret, no address and no vault name. While it lasts, every command that needs the vault (launch, stop, retire, the token mint and the model-secret read of a stack launch) refuses at once with one line that names the reason and the retry time, and starts no `az` call. The reaper loop skips its pass and logs one line.
+
+Where it lives: the file `vault-block.json` in the switchboard's state directory (`$XDG_STATE_HOME/` the switchboard's directory, default `~/.local/state`), mode 0600, written by rename. Beside it, `vault-block.lock` is the probe lock.
+
+How long: ten minutes by default. The setting `CW_VAULT_BLOCK_DURATION` in the launcher's settings file (`cloud.env`) sets it, from 1m to 60m (for example `10m` or `1h`).
+
+After the time: exactly one command probes the vault (it takes the lock file; a lock older than a vault call can last is ignored). A success removes the block and a refusal renews it. A command that arrives during the probe uses the block and starts no call. With no block yet, callers that arrive together take the lock one after another, so a refusing vault is asked once and the others find the block.
+
+How to clear it by hand: delete the file `vault-block.json` in the switchboard state directory (for example when the firewall was opened and waiting is not wanted).
+
+Never longer than the setting from now, and the probe lock: a block never outlasts the setting measured from now (its end is the earliest of the file's modification time, its change time and now, plus the setting's length), so a system clock that was set back, which leaves the file's times in the future, cannot make a block last until the clock catches up: such a file's time is reset to now and the block ends one setting's length later. The probe lock is opened without following a symbolic link and without blocking, and counts only when it is a plain file of this user. A lock that is anything else (a named pipe, a symbolic link, a directory, a file of another user) is replaced at once, with ONE line on stderr that names it (when it cannot be removed, the command goes on without a lock and makes at most one vault call); to clear it by hand, delete `vault-block.lock`. A plain lock left by a process that is gone is ignored silently, and a lock dated far from now is ignored too. No wait loop runs without a sleep and a bound.
 
 ## Decisions (for the PR description)
 **v2 server auth/TLS (the contract's OPEN item).** Per-worker random password (32 bytes, `secrets`), stored only as
@@ -401,7 +434,7 @@ The managed reaper's loop (`reap --loop`) does it, as one more step of each pass
 
 - **When.** For each running pod, when the token is `GIT_TOKEN_RENEW_AFTER_SECONDS` (1800, so 30 minutes of its life are left) old. The age is the Secret's
   `cw/git-token-minted` annotation, or the Secret's creation time when it has none. A pass that finds the token older than an hour (the machine slept) renews at once.
-- **How.** It mints through the SAME route as the launch (`run_git_token_cmd`: `CW_GIT_TOKEN_CMD`, else `app_token.py OWNER/NAME`), so one repository, the exact
+- **How.** It mints through the SAME route as the launch (`run_git_token_cmd`: `CW_GIT_TOKEN_CMD`, else `app_token.py OWNER/NAME` with a pipe named by `--fd`), so one repository, the exact
   permissions and the 61-minute cap hold by construction, and replaces only the `git-token` key by one merge patch whose body goes on standard input. The patch is bound to the exact Secret that was checked: its body carries that Secret's `metadata.uid` and `metadata.resourceVersion`, so the API server refuses it (Conflict) if the Secret changed or was made again while the mint ran (a relaunch of the same worker gets the same names); the labels are read again after the mint as a second guard. A refusal keeps the old state, writes one audit line (`the secret changed during the mint: not renewed`), names the worker in the report and is retried at the next pass. The token is
   never in an argument, an environment value, a file, an output, an audit line or a record. The pod needs no change: its credential helper and `gh` wrapper read the file at every
   call, and the file is a whole-directory projected volume (no `subPath`) that the kubelet refreshes, usually within a minute or two.
@@ -476,10 +509,18 @@ token file by hand. The reaper does that now, by itself, and runs unattended for
 ## Server-side guards: `app_token.py` and `preflight.py`
 
 A guard is enforced where the action takes effect (the repository's rules, the token's scope), not in a wrapper.
-These two programs are the server side of that. Neither writes a file; neither prints a secret.
+These two programs are the server side of that. The mint writes a file only when a person names `--out` (one new file, mode 0600); the preflight writes none; neither prints a secret.
 
-**`app_token.py OWNER/REPO`** prints a one-hour GitHub App installation token for that one repository, and nothing
-else, on stdout. It refuses (exit 1, one line on stderr naming the key, never a value) to print a token unless:
+**The cause (ask #1043):** the mint printed the one-hour repository token on standard output, where terminals, transcripts and logs capture it; two recorded cases (a misordered redirect, and a debugging run of a clone) each showed a live token.
+**`app_token.py OWNER/REPO`** now mints a one-hour GitHub App installation token for that one repository and writes it only to a route the
+caller names, never to stdout or stderr. The fix removes stdout as a delivery channel. The routes (exactly one per run):
+
+- `--fd N`: a descriptor (3 or more, open, writable, not a terminal) the caller passes down, normally a pipe the launcher reads. No file exists. This is the route for programs.
+- `--out PATH`: a new file, mode 0600, created only after every check passed, in a directory you own with no group or world access; it is refused when PATH exists and never overwritten. This is the route for a person.
+- no route: the token is minted, then revoked (nobody received it), and stderr says one line with the token's byte count; stdout stays empty, exit 0.
+
+A bad route (0, 1 or 2, a closed or read-only descriptor, a terminal, a second descriptor of the very file or pipe that standard output or standard error is (`3>&1`, `3>&2`), both routes, a bad directory, a symbolic link in any part of the directory path) exits 2 before anything is minted. The path route accepts the system's own root-owned links in a directory others cannot write, or a sticky one (such as `/var` and `/tmp` on a Mac); a `..` component and every other link are refused. A delivery
+that fails revokes the token and exits non-zero. Success is silent. It refuses (exit 1, one line on stderr naming the key, never a value) to deliver a token unless:
 
 - the installation is found, not stored: the mint asks GitHub (`GET /repos/OWNER/REPO/installation`, signed with the App's
   own short-lived token) which installation covers the repository, and refuses unless that answer is one installation whose
@@ -500,6 +541,34 @@ accepting the old set). The exact refusal GitHub gives for a permission granted 
 The private key travels only through a pipe to `openssl`; only `https://api.github.com` is used (`CW_GITHUB_API_BASE`
 may name a loopback `http` address, for tests).
 
+The revoke covers the whole span from the mint to the end of the delivery: any exception or signal (an interrupt, SIGTERM, SIGHUP, a broken pipe, a full disk, an error in the code between the mint and the route) revokes the token once with its own value, removes the file this run created (only that one) and exits non-zero.
+A path over the file system's name or path limit is refused before anything is minted (exit 2, no request to GitHub); the limit is the smaller of the file system's `PC_NAME_MAX` and `PC_PATH_MAX` names and a fixed cap of 4096 bytes in total.
+A revoke that fails (GitHub refuses the DELETE or the connection fails) prints one line on stderr, `app-token: the token could not be revoked (status N)`, where N is the HTTP status or the word `unreachable` (never the token), and the exit status is non-zero, for the no-route run and the failed-delivery run; a good revoke prints no such line.
+The no-route run revokes the token before it forgets it: the kept token is dropped only after the revoke call has ended, and the token is kept from the moment the mint knows it.
+An interrupt of any kind ends with the token revoked and the interrupted status (130 for Ctrl-C, 143 for SIGTERM, 129 for SIGHUP): an interrupt during the revoke request makes the revoke once more and is then raised again, never swallowed; a revoke that still did not complete prints the one line above.
+Two more same-user limits of the path route, stated: a root-owned link accepted in a directory another non-root user owns is inside the same-user limit F1; a signal between creating the file and its guarding try leaves an empty 0600 file with no token.
+Two same-user limits remain, stated rather than fixed (a complete fix walks every path component with a directory descriptor and touches the link allowance above, so it is not cheap): F1, an ancestor of the path swapped for a link by the same user after the check redirects the delivery, and F2, the cleanup removes whatever is at the file's name. The attacker would already hold the caller's own user id, can read the delivered file and trace the mint: no new access.
+
+### Running the mint by hand
+
+Run it only with the file route, in a private directory you own, and never with a redirect or a command substitution (a slip there is
+how a token reached a screen):
+
+```
+mkdir -m 700 "$HOME/.cw-token-dir"
+python3 cloud/launcher/app_token.py acme-org/widget-service --out "$HOME/.cw-token-dir/token"
+# use the file (for example: read it into the program that needs it), then remove it:
+rm -r "$HOME/.cw-token-dir"
+```
+
+The run prints nothing on success. With no route it only reports a byte count and revokes the token, so it is a safe way to check that the
+mint works. The one line on stderr (here for a token of 49 bytes; the count is the token's own) reads:
+
+```
+app-token: minted a token of 49 bytes and did not deliver it: name a route with --fd N or --out PATH
+```
+ The file is created with mode 0600 and the mint refuses an existing path. Do not print the file in a shared session or a log.
+
 **`preflight.py OWNER/REPO [--branch NAME] [--accept-classic]`** reads, with GET only, whether the default branch
 refuses direct pushes (a `pull_request` rule that requires at least one approving review, or a `merge_queue` rule, in an active ruleset that covers the branch; `evaluate` and `disabled` rulesets and rulesets not covering the branch are refused by name; ref patterns follow GitHub: `*` stops at `/`, `**` crosses it, and a pattern the program does not understand, such as a character class, covers nothing), force-pushes (`non_fast_forward`) and deletion
 (`deletion`). Exit 0 prints `preflight ok: <rules>` (with `; WARN open: <actions>` when a new check is open: an App bypass actor, auto-merge, no required status check, a merge queue; each also has its own `preflight: WARN open action <name>: ...` line, and the launch continues; the one table `CHECK_MODES` in `preflight.py` decides WARN or BLOCK, and a flip to BLOCK is a reviewed change); exit 1 names each missing rule; exit 2 means the answer could not
@@ -507,8 +576,7 @@ be read. A branch protected only by classic branch protection fails closed (a re
 requirement); `--accept-classic` is the explicit, owner-approved override and prints a warning. It overrides only that one failure (the review requirement on a branch GitHub reports as protected), never an unreadable answer, an unprotected branch, or a missing `non_fast_forward` or `deletion` rule. Redirects are never followed, and `OWNER/REPO` may not contain a `.` or `..` segment. It cannot see bypass
 actors: the live refusal check on a disposable repository is the real proof.
 
-*Organization rulesets.* An App installation token can never read an organization ruleset (GitHub asks for the
-organization `Administration` permission at write; this project does not grant it). When the read of an organization
+*Organization rulesets.* An organization ruleset is read at repository level (`GET /repos/<owner>/<repo>/rulesets/<id>?includes_parents=true`) with the token the preflight already uses, because that token cannot read it by the organization's own path (HTTP 403; GitHub asks for the organization `Administration` permission, which this project does not grant). The answer carries no bypass list, so the bypass actors of organization rulesets are not returned to this token and are not seen. A counted organization ruleset is named by its identifier on one line of the output, `organization ruleset <id>: read at repository level, counted`; a repository ruleset prints nothing new. When the read of an organization
 ruleset is refused with HTTP 403, that ruleset is not counted and the output says so, one line each:
 `organization ruleset <id>: not readable with this token, not counted`. The repository passes on the rules the
 preflight can verify. If it fails only because those rules are not counted (exit 1: `protection comes from an
@@ -557,3 +625,74 @@ The App already holds checks: read (the owner confirmed it on 29 October), so th
 A passing failure of the preflight's mint (the vault command, a network error or timeout, an HTTP 5xx or 429 answer, or a 403 with a Retry-After) is retried inside the preflight: 4 tries, with waits of 2, 5 and 10 seconds between them, one line on standard error per retry (`mint try N of 4 failed: <reason>; trying again in S seconds`, never a value); a Retry-After over 10 seconds ends the retries at once. A refusal (a 404, a 422, a 403 without Retry-After, any `refusing:` check, the expiry or permission checks) is never retried: it ends after one try. A launch that still cannot mint says its tries and the last reason (`no token could be minted after 4 tries: <reason>`) and writes one audit line (action `create.failed`, reason `preflight: ...`) through the launcher's own audit file.
 
 The launch's own mint of the pod's git token runs a command (`app_token.py`, or `CW_GIT_TOKEN_CMD`): `app_token.py` exits with status 75 for a passing failure (the vault command, a network error or timeout, an HTTP 5xx or 429 answer, or a 403 with a Retry-After) and keeps its old status for every refusal. The launch retries the command only on status 75: up to 4 tries with waits of 2, 5 and 10 seconds, one line on standard error per retry (`git token try N of 4 failed: <last line>; trying again in S seconds`, never a value), and a final refusal that says `after 4 tries`; a Retry-After over 10 seconds cannot be read from an exit status, so it does not end the retries early. A custom token command is retried only when it exits with 75; a command that exits with any other status is never retried.
+## Retire of a gone worker (ask #1327)
+
+Cause: the name-freeing change (a retire of a worker whose pod is already gone frees its name) was read on its own and left six gaps. (1) The stop audit did not name the Secrets it removed, so the trail of what a stop deleted was incomplete. (2) The not-found match was a substring match: any error text that held `NotFound` and the object name read as gone. (3) The Secret read still used the loose match. (4) A name with a trailing newline passed the name pattern, because the end anchor `$` matches before a final newline. (5) The record was not bound to a pod identity, so a retire that raced a relaunch under the same name could delete the new pod's Secrets. (6) The hub entry of a gone orchestrator was left behind.
+
+What each part does now, in plain sentences:
+
+- The stop audit names the Secrets it removed: when the pod is gone, the audit line of `stop` ends with `secrets removed: ` and the names (`cw-NAME-pw`, `cw-NAME-run`), or `none`. Names only, never content.
+- The not-found match is anchored to the whole message of the one object asked for. The text of the cluster client, after one trailing newline is trimmed, must equal `Error from server (NotFound): <kind> "<exact name>" not found` for the pod read and for both Secret reads. Any other text, such as another object, another kind, extra words after it or the words inside another sentence, raises and never reads as gone.
+- A name with a trailing newline is refused: every name check uses a full match, in the launcher and in the switchboard's record and password paths, so such a name reaches no cluster call and no file path. Every valid name is still accepted.
+- The worker record carries the pod's uid and a retire acts only on the pod with that uid. The uid is read when `create` made the pod (`pod_uid` in the create answer); `retire` hands it to `stop --pod-uid UID`: a new pod under the same name is left whole with its Secrets (exit `6`, nothing deleted). A pod that reads as gone is retired by name only when a second read finds no live pod. A record without a uid acts by name, as before. Known residual: a relaunch of the same worker name that has created its Secrets but not yet its pod, between the second read of the retire and its Secret delete, can lose the new run's Secrets; the lane launches again.
+- A create whose read of the new pod fails or gives no usable uid cannot record the pod's uid: it says so in one stderr line and in its audit line, the worker record holds no pod identity, and a retire acts by name. A usable uid is 1 to 64 letters, digits, dots, dashes or underscores; anything else (no pod, text, a list, no uid, an empty, spaced, control-character or over-long one) is the same case. A successful `launch --cloud` shows that line once on its own stderr (the launcher's create answer carries it as `identity_note`).
+- A signal (an interrupt or a termination request) during that read of the new pod's uid ends the create with its usual cleanup: the pod and its Secrets are removed once, the audit line of the failed create is written and the interrupted exit status is kept; an ordinary failure of the read gives the note and no cleanup, and the pod is kept.
+- A retire of a gone orchestrator removes its hub entry and reports a failure to do so. The switchboard sends `--hub-entry` for a record whose agent is `orchestrator`, and the launcher calls the same unregister call the live path uses. A failure of that call exits non-zero with an `ok: false` audit line and the record kept, and is never swallowed; a second retire finishes the work.
+
+Test: `cloud/launcher/tests/test_retire_gone_exact.py` (against the fake cluster of the launcher tests, with a mutant for the uid and one for the hub entry).
+
+
+**A repository's smallest pod shape (`CW_REPO_MIN_SHAPE`, #1443).** What it is: one optional key of the launcher's settings file, a comma-separated list of `OWNER/NAME=SHAPE` pairs (SHAPE is `XS`, `S` or `M`; the repository is compared exactly and case-insensitively, like `CW_ALLOWED_REPOS`; for example `acme-org/widget-service=S`). The shape is a floor for that repository's launches. Why it exists: `check_shape` chose the pod shape from the launch's own flags only (`--shape`, `--stack`, the orchestrator agent) and never from the repository, so three pods of one large repository were killed for memory (exit 137, OOMKilled) on the light shape (1 CPU, 2 GiB) within 2.5 to 7.3 minutes of starting. The rule: for a listed repository a launch with no `--shape` gets the larger of the floor and the shape the flags would give (a stack launch or an orchestrator stays at least `S`); a `--shape` smaller than the floor is refused before anything is created (exit 2, one line naming the repository, the floor and `CW_REPO_MIN_SHAPE`); the same or a larger shape is accepted; an unlisted repository, or an unset setting, changes nothing. How to set it: add one line `CW_REPO_MIN_SHAPE=OWNER/NAME=SHAPE` (more pairs after commas) to the settings file, or export it when there is no file; an entry without `=`, with an unknown shape, a malformed repository or a repeated repository refuses the whole file, naming the key and no value. This change holds no repository name: the entry for a real repository is the operator's own line in the settings file.
+
+## A pod that ends Failed (ask #1442)
+
+Cause. A cloud pod that ended in the Failed phase (for example a container killed for memory, exit 137, or a pod evicted by its node) showed only
+"does not answer" in `status`, because every read of a worker goes through the agent inside the pod. The reaper asked the dead pod for its activity,
+found it unreadable, reported `activity unreadable` every minute and kept the pod for two hours, until its hard limit. No run record was written,
+because the stop path that writes it is never reached for a pod nobody can enter, so nobody could see why the pod had failed. The missing read was
+the pod's own status and events (`get_pod` and `pod_events`), which the launcher already could make and did not make for a Failed pod.
+
+What the record holds. The first reaper pass or `status` that sees the pod Failed reads, once, the pod's reason, each container's terminated reason
+and exit code, and the last 10 events (each cut to 300 characters), every text through the launcher's own scrub, and writes a run record
+(`run.json`, exit reason `pod failed`) with the reason, the exit code and the events. A later pass finds that record by the run id of the pod and
+does nothing for it: no activity read, no second record, no second report. A Failed pod without the `kept` annotation is deleted ten minutes
+after its record; one that holds unpushed work (`kept`) stays.
+
+How a lane reads it. `status` prints `pod failed: <reason>` (the reason cut to 160 characters, for example `OOMKilled (exit 137)`) for such a pod,
+instead of `does not answer`; the full reason, exit code and events are in the record's `run.json` under the run record directory.
+
+Two limits of what `status` and the reaper do. The switchboard prints the launcher's reason on one line: every control character removed, scrubbed once more by its own scrub, and a `pod_failed` value that is not text is treated like an answer it cannot read (the line for an unavailable launcher status), never an error. The reaper reads, records and deletes only a pod that carries a worker annotation: a pod with the launcher's label and none is left alone; a record that cannot be written leaves the pod in place, is reported once as `record not written`, and is written on the first pass that can.
+
+Three more limits of the record of a Failed pod. A record written when the pod could not be read has, as its reason, the text of the read error (not the pod's own reason) and is not refreshed: the pod is read once. The worker annotation of a pod is checked against the worker-name rule (the switchboard's agent name rule) before it becomes a part of a path: a pod whose annotation does not match is treated as a pod with no annotation, never read, recorded or deleted. The reaper's told-once set (the reports of an unwritable record, of an unreadable deadline and of a record time that cannot be read) clears the entry of an unwritable record when that record is written; a pod deleted by someone else leaves a few bytes in the set until the process ends. The event text stored in the record is not stripped of control characters (the JSON escapes them); only the status line prints, and it is stripped.
+
+## A worker lost with its node
+
+**Cause: inferred until these reads are made.** On 29 October four pods that sat on one node were killed in the same second (the event `Killing: Stopping container worker`, no other event) while pods on other nodes were untouched, and the launcher's audit has no stop line for them. The cause is INFERRED to be the removal or disturbance of that node. The launcher's own login cannot read nodes (it may not list them), so the holder of the ADMINISTRATOR login confirms the cause with these read-only commands (placeholders in capitals):
+
+```
+kubectl get events --all-namespaces --field-selector involvedObject.kind=Node
+kubectl describe node NODE_NAME
+kubectl get pods --all-namespaces -o wide
+kubectl -n kube-system get configmap cluster-autoscaler-status -o yaml
+az aks nodepool show --resource-group RESOURCE_GROUP_NAME --cluster-name CLUSTER_NAME --name NODEPOOL_NAME
+az aks nodepool list --resource-group RESOURCE_GROUP_NAME --cluster-name CLUSTER_NAME
+az monitor activity-log list --resource-group RESOURCE_GROUP_NAME --start-time START_TIME --end-time END_TIME
+```
+
+Also read the API server's audit log of pod deletes in the window through the cloud's log query (a query such as `AUDIT_LOG_QUERY` over the diagnostic logs, which names who deleted each pod). Read the Events, Conditions and Taints parts of `kubectl describe node`.
+
+The alternative causes and the read that rules each in or out:
+
+- A person's delete or another operator's cleanup: the audit log of pod deletes names the requester.
+- An eviction for node pressure: the event says `Evicted`, not `Killing`, and the pod is Failed.
+- The autoscaler's scale-down: the node would be gone; the status record and the node events confirm or rule it out.
+- A reboot, a drain or an image upgrade: the node survives; the node pool's recent operations, the node's events and conditions confirm it.
+- A taint eviction after the node was NotReady: the node events say not ready and the taints show it.
+
+**What the annotation does.** Every pod the launcher renders (a worker, a stack worker, and an orchestrator) carries `cluster-autoscaler.kubernetes.io/safe-to-evict: "false"`. It protects ONLY against the autoscaler's scale-down. It does not protect against a node upgrade or maintenance eviction (only a pod disruption budget limits those, a separate cluster-wide object this change does not add), a reboot, a drain for an upgrade, a node failure, a taint eviction or a spot eviction.
+
+**What it costs.** A node that holds a worker is not scaled down until the worker ends: an idle worker ends at its idle limit (`--idle`), a worker at its hard limit, at most the maximum hard limit (8 hours by default), and a pod the reaper cannot end at the cluster-side deadline floor (the maximum hard limit plus five minutes). A persistent orchestrator has no deadline: once ask 1509 (the persistent orchestrator) lands, its pod template is rendered by the same function and carries the mark, and its node is then not scaled down while it lives.
+
+**What is saved.** The pre-stop hook (`cw-prestop`) pushes unpushed work to the worker's `wip` branch when the pod is deleted, but no stop line and no run record is written. A worker lost with its node is told apart from one the launcher stopped by the cloud end alert of ask 1480 (pull request 1486), which reports a created worker whose pod is gone with no stop line as a gone pod after that ask's own waiting rule.
+
+**Review comment (optional, per repository).** `cloud/launcher/repo-review-comments.json` (beside the launcher; absent by default, so no comment is posted anywhere) maps a lowercased `OWNER/NAME` to one line of text (at most 500 characters, no control characters, no credential shape). `launch` passes that text into the pod as `CW_REVIEW_COMMENT`; when the end hook marks the pod's draft pull request ready it posts the text once as a comment. A repository with no entry gets no variable and no comment. An owner sets it by a reviewed pull request that adds the entry: `{"owner/name": "/review"}`.

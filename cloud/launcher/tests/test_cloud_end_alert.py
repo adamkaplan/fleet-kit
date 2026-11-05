@@ -1,5 +1,6 @@
 """Ask #1480: a cloud worker the launcher ended alerts its boss and the Chief of Staff, once per run and reason. Offline: a scratch state
 directory, a fixture audit file, a recording send function. Mutants are copies of the module's text in memory, never a file."""
+import pathlib
 import json, os, shutil, sys, tempfile, types, unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -72,10 +73,10 @@ class TestAlerts(World):
             self.stop(name, reason, run="r" + name)
         self.run_pass()
         self.assertEqual(len(self.sent), 6)
-        for name, label, pushed in (("worker1", "idle", "yes"), ("worker2", "hard limit", "no"), ("worker3", "idle", "yes")):
+        for name, label, pushed in (("worker1", "idle", "unpushed work saved to worker1/wip"), ("worker2", "hard limit", "nothing unpushed"), ("worker3", "idle", "unpushed work saved to worker3/wip")):
             self.assertEqual(sorted(to for to, t in self.sent if name in t), ["chief-of-staff", "coder-lead"])
             for text in (t for to, t in self.sent if name in t):
-                for fact in (name, "reason " + label, "at 2026-01-01T10:00:00Z", "work pushed: " + pushed, "run record: %s-20260101T000000Z-0f1e2d" % name):
+                for fact in (name, "reason " + label, "at 2026-01-01T10:00:00Z", pushed, "run record: %s-20260101T000000Z-0f1e2d" % name):
                     self.assertIn(fact, text)
                 self.assertNotIn(self.dir, text)
                 self.assertNotIn("a1b2c3", text)
@@ -100,7 +101,7 @@ class TestAlerts(World):
 
     def test_s3_the_sent_keys_are_bounded_and_the_state_is_private(self):
         real.save_state(self.cursor, 0, [(str(i), "idle") for i in range(700)])
-        self.assertEqual(len(PARSE(open(self.cursor).read())["sent"]), 500)
+        self.assertEqual(len(PARSE(pathlib.Path(self.cursor).read_text())["sent"]), 500)
         self.assertEqual(oct(os.stat(self.cursor).st_mode & 0o777), "0o600")
 
     def test_s3_a_corrupt_cursor_starts_at_the_end(self):
@@ -219,7 +220,7 @@ class TestUntrusted(World):
         self.stop("worker7", "idle")
         self.run_pass()
         for to, text in self.sent:
-            self.assertIn("work pushed: yes;", text)
+            self.assertIn("; unknown;", text)
             self.assertIn("run record: worker7-20260101T000000Z-0f1e2d.", text)
             for bad in ("x.example", "sk-", "yyyy", "\n"):
                 self.assertNotIn(bad, text)
@@ -270,7 +271,7 @@ class TestUntrusted(World):
         self.assertIn("Bad Boss", [to for to, t in self.sent])
 
     def test_m3_a_branch_copying_mutant_is_caught(self):
-        broken = mutant('return "yes" if hook["pushed"] else "no"', 'return "yes %s" % hook.get("wip_branch") if hook["pushed"] else "no"')
+        broken = mutant('return "unpushed work saved to " + name(wip) if name(wip) else "unknown"', 'return "unpushed work saved to " + str(wip) if wip else "unknown"')
         self.worker("worker7")
         self.stop("worker7", "idle")
         self.run_pass(broken)
@@ -282,6 +283,104 @@ class TestUntrusted(World):
         real.save_state(self.cursor, os.path.getsize(self.audit) + 5000, [])
         self.run_pass(broken)
         self.assertEqual(len(self.sent), 10)   # the real code sends 0
+
+
+KEY_BRANCH = "sk-ABCDEFGHIJKLMNOPQRSTUVWX"
+HOSTILE_RECORDS = (   # (class, end hook branch, run-record directory name): the name has no slash, so its basename keeps the hostile text
+    ("url", "https://x.example/a?token=abc123&u=1", "worker7-https:..y.example?token=abc123"),
+    ("key", "feature-" + KEY_BRANCH, "worker7-" + KEY_BRANCH + "-ghp_" + "A" * 36),
+    ("newline-long", "first\nsecond-" + "b" * 600, "worker7-line1\nline2-" + "c" * 150),
+)
+FACT_COUNT = 5
+
+
+class TestS9ThreeHostileRecords(World):
+    def hostile(self, branch, dirname, module=real, valid_name=False):
+        """One hostile record through a pass; returns (facts present in every message, branch occurrences, URL or key shapes).
+        The pass reads the run record only for a name of the launcher's pattern: with the hostile name the pushed word is `unknown` and the
+        branch is never read; with valid_name the same hostile branch IS read (that is where a branch-copying build leaks)."""
+        self.setUp()
+        record_name = "worker7-20260101T000000Z-0f1e2d"
+        if valid_name:
+            dirname = record_name
+        self.worker("worker7")
+        reason = "idle; run-id=h1; run record " + os.path.join(self.dir, "runs", dirname)
+        record_dir = real.raw_dir(reason)   # the path the pass will read the run record from
+        try:
+            os.makedirs(record_dir, exist_ok=True)
+            with open(os.path.join(record_dir, "run.json"), "w") as f:
+                json.dump({"end_hook": {"pushed": True, "wip_branch": branch}}, f)
+        except OSError:
+            pass   # a name too long for the file system: the pass then reads nothing and says unknown
+        self.line({"ts": "2026-01-01T10:00:00Z", "action": "stop", "worker": "worker7", "ok": True, "cause": "idle", "reason": reason})
+        self.run_pass(module)
+        if len(self.sent) != 2:
+            raise AssertionError("expected 2 messages, got %d" % len(self.sent))
+        present, occurrences, shapes = FACT_COUNT, 0, 0
+        for to, text in self.sent:
+            facts = ["worker7", "reason idle limit", "at 2026-01-01T10:00:00Z",
+                     "; unknown;",
+                     ("run record: %s." % record_name) if valid_name else "run record: unknown."]
+            present = min(present, sum(1 for fact in facts if fact in text))
+            for piece in [branch] + [x for x in branch.split("\n") if x]:
+                if piece in text:
+                    occurrences += 1
+                    raise AssertionError("leaked branch %r in %r" % (piece, text))
+            shapes += sum(text.count(bad) for bad in ("http", "sk-", "ghp_", "token"))
+            if shapes:
+                raise AssertionError("URL or key shape in %r" % text)
+            if any(ord(c) < 32 or ord(c) == 127 for c in text):
+                raise AssertionError("control character in %r" % text)
+            if not valid_name and (dirname[8:].split("\n")[0] in text or "line2" in text):
+                raise AssertionError("leaked directory name in %r" % text)
+        return present, occurrences, shapes
+
+    def three(self, module=real, valid_name=False):
+        total, branch, shapes = FACT_COUNT, 0, 0
+        for kind, b, d in HOSTILE_RECORDS:
+            present, occ, sh = self.hostile(b, d, module, valid_name)
+            total, branch, shapes = min(total, present), branch + occ, shapes + sh
+        return total, branch, shapes, len(HOSTILE_RECORDS)
+
+    def test_s9_three_hostile_records_leave_five_facts_and_nothing_else(self):
+        present, branch, shapes, n = self.three()
+        self.assertEqual(self.three(valid_name=True), (5, 0, 0, 3))   # the same branches in a record the pass does read
+        # facts are counted per record as those found in each of its 2 messages (the minimum over messages), then the minimum over records
+        print("S9: %d of %d facts present, %d occurrences of the branch, %d URL or key shapes in %d of 3 hostile records"
+              % (present, FACT_COUNT, branch, shapes, n))
+        self.assertEqual((present, branch, shapes, n), (5, 0, 0, 3))
+
+    def test_s9_m3_the_branch_copying_mutant_fails_the_hostile_test_and_the_control_passes(self):
+        old = 'return "unpushed work saved to " + name(wip) if name(wip) else "unknown"'
+        with open(SOURCE) as f:
+            applied = f.read().count(old) == 1   # computed before the replace
+        broken = mutant(old, 'return "unpushed work saved to " + str(wip) if wip else "unknown"')
+        planted = HOSTILE_RECORDS[0][1]   # the branch of the first valid-name record, where the copy leaks first
+        control = 0
+        try:
+            self.three(real, valid_name=True)
+            control = 1
+        except AssertionError:
+            pass
+        with self.assertRaises(AssertionError) as caught:
+            self.three(broken, valid_name=True)
+        failed = 1 if isinstance(caught.exception, AssertionError) else 0
+        named = 1 if planted in str(caught.exception) else 0
+        print("S9 mutant M3: control passes %d of 1" % control)
+        print("S9 mutant M3: the hostile test fails on the leaking build %d of 1, mutation applied %s" % (failed, applied))
+        print("S9 mutant M3: the failure names the leaked branch %d of 1" % named)
+        self.assertEqual((control, failed, named, applied), (1, 1, 1, True))
+
+    def test_s9_a_mutant_that_copies_the_directory_name_is_caught_on_the_records(self):
+        broken = mutant('return dirname if re.fullmatch(re.escape(worker) + "-" + RECORD_STAMP, dirname or "") else None', "return dirname or None")
+        caught = 0
+        for kind, b, d in HOSTILE_RECORDS:
+            try:
+                self.hostile(b, d, broken)
+            except AssertionError:
+                caught += 1
+        print("S9 mutant name: the directory-name copy is caught in %d of 3 records" % caught)
+        self.assertEqual(caught, 3)
 
 
 class TestCauseRules(World):
@@ -326,7 +425,7 @@ class TestCauseRules(World):
         self.run_pass()
         self.assertEqual(len(self.sent), 2)
         for to, text in self.sent:
-            self.assertIn("work pushed: unknown", text)
+            self.assertIn("; unknown; run record", text)
             self.assertIn("run record: unknown", text)
 
     def test_s14_another_hour_alerts_again(self):
@@ -504,8 +603,8 @@ class TestDocs(unittest.TestCase):
 
 
 class TestMessageSlot(unittest.TestCase):
-    OLD = {False: "[cloud worker ended] worker7 was ended by the launcher: reason idle limit; at 2026-01-01T10:00:00Z; work pushed: yes; run record: unknown.",
-           True: "[cloud worker ended] worker7 was ended by the launcher: reason idle limit; at 2026-01-01T10:00:00Z; work pushed: yes; run record: unknown."
+    OLD = {False: "[cloud worker ended] worker7 was ended by the launcher: reason idle limit; at 2026-01-01T10:00:00Z; yes; run record: unknown.",
+           True: "[cloud worker ended] worker7 was ended by the launcher: reason idle limit; at 2026-01-01T10:00:00Z; yes; run record: unknown."
                  " The end hook could not push: the pod was kept and the work may be unpushed."}
 
     def text(self, module=real, **more):
