@@ -49,6 +49,7 @@ switchboard/branch_ff.py
 switchboard/stage_event.py
 switchboard/scratch_dir.py
 switchboard/docker_reaper.py
+switchboard/gate_spool.py
 switchboard/workers_report.py
 switchboard/batch_decision.py
 switchboard/sweep.py
