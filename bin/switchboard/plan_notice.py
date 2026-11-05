@@ -166,7 +166,7 @@ def plan_wake_pass(engine, state, repos, now, budget=None):
         del wake.delivered[old]
     if changed:
         try:
-            state_write(Path(engine.state_dir) / PLAN_WAKE_FILE, json.dumps({"announced": wake.announced}, sort_keys=True) + "\n", fsync=True)
+            state_write(Path(engine.state_dir) / PLAN_WAKE_FILE, json.dumps({"announced": wake.announced, "approved": wake.approved}, sort_keys=True) + "\n", fsync=True)
         except OSError as err:
             engine._note("plan_wake.error", "", {"error": "plan-wake.json was not saved, so a restart may announce again: %s" % _one_line(type(err).__name__, 40)})
 
