@@ -165,14 +165,16 @@ class TestStopFinalMessage(unittest.TestCase):
         os.utime(str(old), (time.time() - 8 * 86400,) * 2)
         block, why = w.last(str(rec), "cb-1788a")
         self.assertIsNone(why)
-        self.assertIn("20000 more characters", block)
-        self.assertIn("17000 characters left out", block)
+        head, kept = sb.load_module("cloud_retired").LAST_HEAD, sb.load_module("cloud_retired").LAST_FILE
+        left_out = len(text) - head - kept   # the three cuts come from the named limits, whatever their values
+        self.assertIn("%d more characters" % kept, block)
+        self.assertIn("%d characters left out" % left_out, block)
         self.assertFalse(old.exists())
         self.assertTrue(young.exists())
         path = base / (rec.name + ".txt")
-        self.assertEqual(len(path.read_text()), 20000)
+        self.assertEqual(len(path.read_text()), kept)
         self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
-        self.assertEqual(len(block.split("\n")[1]), 3000)
+        self.assertEqual(len(block.split("\n")[1]), head)
 
     # ---- the retire command (PC-5) ----
     def retire_run(self, code, reports_to="boss-lane"):
@@ -619,8 +621,8 @@ class TestStopFinalMessageBare(unittest.TestCase):
         w = StopWorld(self)
         rec = w.pod("cp-1788r", "my final words")
         reason = "word " * 22 + TOKEN + " " + "end " * 8
-        self.assertEqual(reason.index(TOKEN), 110)
-        self.assertGreater(len(reason), 140)   # the token (40 characters) starts at 110 and ends past the cut at 120
+        self.assertLess(reason.index(TOKEN), 120)   # the token starts before the cut at 120 ...
+        self.assertGreater(reason.index(TOKEN) + len(TOKEN), 120)   # ... and ends past it: it straddles the cut
         cloud = sb.load_module("cloud_worker").bind(sb.__dict__)
         engine = mock.Mock()
         engine.send = lambda sender, to, text: w.sent.append((to, text))
@@ -674,7 +676,7 @@ class TestStopFinalMessageBare(unittest.TestCase):
         mod = sb.load_module("cloud_retired")
         for unit, times in self.U21_TEXTS:
             text = unit * times
-            self.assertTrue(190000 <= len(text) <= 200000, len(text))
+            self.assertTrue(0.95 * mod.LAST_SCRUB_MAX <= len(text) <= mod.LAST_SCRUB_MAX, len(text))   # a text near the scrub's input maximum
             c = Counter()
             c.n = 0
             c.limit = 330 * len(text)

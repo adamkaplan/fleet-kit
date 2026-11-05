@@ -105,11 +105,11 @@ class TestHeldSends(Base):
 
     def test_s5_the_cap_is_50_and_the_oldest_is_told_it_was_dropped(self):
         self.status("platform", "blocked")
-        for n in range(51):
+        for n in range(sb.HELD_SENDS_KEEP + 1):
             self.world.tick(1)
             self.assertEqual(self.cli("platform", "msg%d" % n)[0], 0)
         rows = self.held()
-        self.assertEqual(len(rows), 50)
+        self.assertEqual(len(rows), sb.HELD_SENDS_KEEP)
         self.assertNotIn("msg0", [r["text"] for _, r in rows])
         drops = [a for a in self.world.admissions("coder") if "was dropped" in a["text"]]
         self.assertEqual(len(drops), 1)
@@ -245,11 +245,11 @@ class TestHeldSends(Base):
 
     def test_s5_endpoint_cap_is_50_and_the_oldest_is_told_it_was_dropped(self):
         self.endpoint_world()
-        for n in range(51):
+        for n in range(sb.HELD_SENDS_KEEP + 1):
             self.world.tick(1)
             self.assertEqual(self.cli("cloudy", "msg%d" % n)[0], 0)
         rows = self.held("endpoint")
-        self.assertEqual(len(rows), 50)
+        self.assertEqual(len(rows), sb.HELD_SENDS_KEEP)
         self.assertNotIn("msg0", [r["text"] for _, r in rows])
         (drop,) = self.drops_to("coder")
         self.assertIn("cloudy", drop["text"])
@@ -355,7 +355,7 @@ class TestHeldSends(Base):
 
     def test_d6_a_sender_with_no_pane_is_told_only_by_the_audit_line_when_its_send_is_dropped(self):
         self.status("platform", "blocked")
-        for n in range(51):
+        for n in range(sb.HELD_SENDS_KEEP + 1):
             self.world.tick(1)
             self.assertEqual(self.cli_as("script", "platform", "msg%d" % n)[0], 0)
         (line,) = self.audit_events("held.drop")
