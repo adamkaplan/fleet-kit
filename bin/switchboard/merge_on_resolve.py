@@ -63,7 +63,7 @@ def mor_structure(runner, git_dir, approved, head, tip):
 
 def mor_run(ctx, repo, number, view):
     """One pull request. `view` is `gh pr view --json state,labels,comments,headRefOid,baseRefName`. Returns (outcome, reason) and, for a reason, calls ctx["tell"] once per head.
-    ctx: runner, git_dir, prepare(repo, number, base) -> (tip ref, head ref), is_held(labels), drops(repo, number), union(repo, number), merge(repo, number) -> (code, lines), tell(repo, number, key, text)."""
+    ctx: runner, git_dir, prepare(repo, number, base) -> (tip ref, head ref), is_held(labels), drops(repo, number), union(repo, number), merge(repo, number, checked head) -> (code, lines), tell(repo, number, key, text)."""
     head, ref = view.get("headRefOid"), "%s#%d" % (repo, number)
     labels = [l.get("name") if isinstance(l, dict) else l for l in view.get("labels") or []]
     approved, ok = mor_read(view.get("comments"), ctx["read"])
@@ -90,7 +90,7 @@ def mor_run(ctx, repo, number, view):
         said = ctx[name](repo, number)
         if said:
             return refuse(said.splitlines()[0][:200])
-    code, lines = ctx["merge"](repo, number)
+    code, lines = ctx["merge"](repo, number, head)
     if code != 0:
         return refuse("the merge gates refused: %s" % (lines[-1] if lines else "no message")[:200])
     ctx["tell"](repo, number, "%s:%s:merged" % (ref, head), "merge-on-resolve: %s was merged at %s in the lane's name: only git-made merges of the tip followed the read of %s" % (ref, head[:8], approved[:8]))

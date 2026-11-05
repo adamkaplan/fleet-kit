@@ -89,7 +89,10 @@ class Hub:
                     "merge": self.merge, "read": lambda c: sb.review_read(c, fleet_login), "tell": lambda r, n, key, text: self.notices.append((key, text))}
         self.merge_code = merge_code
 
-    def merge(self, repo, number):
+    def merge(self, repo, number, expected_head=None):
+        live = git(self.fx.dir, "rev-parse", "HEAD")   # the gate reads its own head; a moved head refuses
+        if expected_head != live:
+            return 1, ["the head moved after it was checked"]
         self.merges.append((repo, number))
         return self.merge_code, ["merged"] if self.merge_code == 0 else ["refused by a gate"]
 
@@ -144,6 +147,21 @@ class TestMergeOnResolve(unittest.TestCase):
         hub = Hub(self.fx, merge_code=1)
         self.assertEqual(self.run_case(hub, self.fx.view())[0], "refused")
         self.assertIn("refused by a gate", hub.notices[0][1])
+
+    def test_the_head_moving_after_the_structure_check_merges_nothing_control_first(self):
+        self.fx.clean_merge()
+        hub = Hub(self.fx)
+        self.assertEqual(self.run_case(hub, self.fx.view())[0], "merged")   # control: a still head merges, with the checked sha
+        self.assertEqual(len(hub.merges), 1)
+        fx = self.fx
+        moved = Hub(fx, drops=None)
+        view = fx.view()
+        moved.ctx["union"] = lambda r, n: fx.code_commit()   # a push lands while the slow gates run
+        outcome = self.run_case(moved, view)
+        self.assertEqual(outcome[0], "refused")
+        self.assertEqual(moved.merges, [])
+        self.assertIn("head moved", outcome[1])
+        self.assertIn("was not merged", moved.notices[-1][1])
 
     def test_a_changes_requested_read_after_the_approve_merges_nothing(self):
         self.fx.clean_merge()

@@ -18455,8 +18455,8 @@ def merge_on_resolve_env(engine):
                 return None, None
             return "refs/tips/base", "refs/tips/head%d" % number
 
-        def merge(_repo, _number):
-            code, lines, record = gate.pass_and_merge(reading, gh, gate.settings(config), engine.state_dir, repo, number, "switchboard-daemon", None, engine.now, MERGE_GATE_SLEEP)
+        def merge(_repo, _number, expected_head=None):
+            code, lines, record = gate.pass_and_merge(reading, gh, gate.settings(config), engine.state_dir, repo, number, "switchboard-daemon", None, engine.now, MERGE_GATE_SLEEP, expected_head=expected_head)
             _gates_audit(engine, "merge_gate.pass_merge", "%s#%d" % (repo, number), dict(record, by="switchboard-daemon"))
             return code, lines
 
