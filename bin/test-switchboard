@@ -73533,6 +73533,18 @@ class TestGhShimMergeGate(Base):
         self.state = self.home / "state"
         self.state.mkdir()
 
+    def test_approving_a_deployment_gate_runs_the_real_gh_unchanged(self):
+        """#1706 regression: a POST to actions/runs/N/pending_deployments (its 'comment' field is no comment body; 'environment_ids[]' is a valid key) runs the real gh unchanged; a comment endpoint is still signed."""
+        ep = "repos/acme/app/actions/runs/123/pending_deployments"
+        argv = ["api", "-X", "POST", ep, "-F", "environment_ids[]=456", "-f", "state=approved", "-f", "comment=approve"]
+        done, log = self.run_shim(*argv)
+        self.assertEqual((done.returncode, log and log["argv"]), (0, argv), done.stderr)
+        done, log = self.run_shim("api", "-X", "POST", ep, "--input", "-")
+        self.assertEqual((done.returncode, log and log["argv"]), (0, ["api", "-X", "POST", ep, "--input", "-"]), done.stderr)
+        control = ["api", "-X", "POST", "repos/acme/app/issues/5/comments", "-f", "body=hello"]
+        done, log = self.run_shim(*control)
+        self.assertNotEqual(log and log["argv"], control)
+
     HEAD = "a" * 40
 
     shim_file = None   # where the shim claims to live (its sibling files are looked for there)
