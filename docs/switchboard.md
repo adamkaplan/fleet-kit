@@ -232,6 +232,11 @@ message. A `send` from another agent skips the batch.
   There is nothing to fetch and nothing to acknowledge: once the message is in
   the agent's transcript, it has been delivered. Messages are capped in length;
   overflow is listed by `fleet-switchboard pending <agent>`.
+- **A send to a cloud pod says the pod's state.** Before it prompts, `send` reads the pod once through the launcher's `status` and prints
+  `state of <name>: running=yes|no idle_deadline=... hard_deadline=... last_event=...` (`last_event` is the last activity time when the
+  session is idle, and `unknown` when it is busy or unreadable). For a pod past its hard deadline, retired, unknown or unread it prints a
+  WARNING and not `delivered to <name>`; the message is still sent to the endpoint, so nothing is lost.
+  A busy pod has no `idle_since`, so its `idle_deadline` and `last_event` both read `unknown` while it is busy.
 - **Never typed.** The switchboard never calls `herdr agent prompt` and never
   writes into a pane's input box.
 - **A note that outlives your attention.** If 10 minutes pass with no prompt
@@ -6240,6 +6245,8 @@ Now every reader of record JSON uses the shared bounded-depth parse `parse_bound
 | `registry.py:_old_retired` | `retired.json` | a problem: nothing read | TestRetireCloseHeadless s13 | `json.loads` in place of `parse_bounded` |
 
 `TestRecordJsonReaders` derives the list of readers from the source (every `json.loads`, `json.load` and `from json import loads` call in `bin/`, found with `ast`) and fails when a reader is in neither the covered set nor its table of exempt sites (daemon-written state, command output, request bodies, log lines), and when a table entry is stale.
+
+The launcher's `status` answer (`launcher_status_record` in cloud_worker.py, read by `send_state`) is not a record file: it is checked with `nesting_too_deep` (the scan `parse_bounded` uses, `WATCH_MAX_DEPTH` levels) and then decoded with `json.JSONDecoder().decode`; a deeper or unreadable answer is "the launcher's answer was not JSON" and the send says the state is unknown.
 
 ## Stage events (ask #1575)
 

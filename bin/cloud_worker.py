@@ -840,9 +840,17 @@ def _launch(args, runner, now, reserve):
                 remove_record(state, name)
             raise
     _registry_note(engine, "upsert", state, name, {"session": session, "repo": repo, "role": args.role, "kind": "cloud", "run_id": run_id, "state": "working"})   # a cloud worker is an agent (#903)
+    _first_push()._watch_first_push(state, name, args, repo, branch, brief, now(), record.get("hard_deadline"))   # #2057: the launch's watch for its checkpoint
     print(_limits_note(args, record), file=sys.stderr)   # stderr, before the one JSON line
     print(json.dumps({"name": name, "session": session, "runtime_id": record["runtime_id"], "url": record["url"], "cloud": True}, sort_keys=True))
     return H["EXIT_OK"]
+
+
+def _first_push():
+    """The send state and the first-push notice (bin/cloud_first_push.py, beside this file; a part of it), bound to this file's names."""
+    module = H["load_module"]("cloud_first_push")
+    module.H, module.D = H, _Stayed()
+    return module
 
 
 def _model_served(engine, name, model, v2):
@@ -965,12 +973,18 @@ def cmd_send(args, runner, now, record):
     if args.issue is not None:
         meta["fleet"]["issue"] = args.issue if isinstance(args.issue, int) else str(args.issue)
     session = _session_of(record)
+    with Cluster() as probe:   # the pod's state, read ONCE, before the prompt (its own login: the launcher's status needs one)
+        state_line, warning = _first_push().send_state(runner, args.name, record, probe)
+    sys.stderr.write("%s: %s\n" % (H["PROG"], state_line))
     with Cluster() as cluster, tunnel(cluster, record) as live:
         reply = remote_v2(state, live, config["call_timeout_seconds"]).prompt(session, text, meta, delivery="queue")
     _audit(engine, "cloud.send", args.name, {"from": sender, "chars": len(text)})
     message_id = reply.get("id") if isinstance(reply, dict) else None
     print(message_id or "sent")
-    sys.stderr.write("%s: delivered to %s\n" % (H["PROG"], args.name))
+    if warning:
+        sys.stderr.write("%s: WARNING: %s: the message was sent to its endpoint but is NOT reported delivered\n" % (H["PROG"], warning))
+    else:
+        sys.stderr.write("%s: delivered to %s\n" % (H["PROG"], args.name))
     return H["EXIT_OK"]
 
 

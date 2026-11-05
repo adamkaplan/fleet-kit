@@ -66229,6 +66229,10 @@ TestSignedLinkScrub = importlib.import_module("test_signed_link_scrub").build(Ba
 TestCharterOtherRepo = importlib.import_module("test_charter_other_repo").build(CharterRig, Base)
 TestCiQueue = importlib.import_module("test_ci_queue").build(HandoffCase, FAKE_GH)   # #1961
 TestLaunchQueue = importlib.import_module("test_launch_queue").build(HandoffCase)
+TestCloudSendState = importlib.import_module("test_cloud_send_state").TestCloudSendState   # #2057
+TestFirstPushNotice = importlib.import_module("test_first_push_notice").TestFirstPushNotice   # #2057
+TestFirstPushWiring = importlib.import_module("test_first_push_notice").TestFirstPushWiring   # #2057
+TestFirstPushMutants = importlib.import_module("test_first_push_notice").TestFirstPushMutants   # #2057
 TestHeldSends = importlib.import_module("test_held_sends").TestHeldSends   # #2051
 # The reminder-cancel tests of #1401.
 _reminder_cancel = importlib.import_module("test_reminder_cancel")
