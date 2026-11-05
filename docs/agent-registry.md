@@ -21,9 +21,18 @@ rebuilt from another record.
 | `bin/reassign.py:34` | `retired.json` | uses `read_retired` so a reassign refuses a retired worker | nobody (reader only) | `reassign` / `reassign --undo` | primary (reader) |
 | `bin/fleet-switchboard:5066` | `last-reports.json` | per sender: last report state and time, last send per recipient | `record_last_report` (`report`, `send`) | the daemon's retire-on-final-report, `status`, `dead_hint`, fact sources, report fold | primary |
 | `bin/dead_hint.py:3` | `last-reports.json` | reads one entry for the dead-agent hint | nobody (reader only) | `dead_hint.hint`, called by the pane pass | primary (reader) |
-| `bin/fleet-switchboard:4331` | `boss-overrides.json` | per worker: the boss a reassign set, bound to one session | `reassign` (bin/reassign.py, under a lock) | discovery overlay (`Engine.discover`, headless records), `reattach_caller_problem` | primary (clear machinery) |
+| `bin/fleet-switchboard:1849` | `boss-overrides.json` | per worker: the boss a reassign set, bound to one session | `reassign` (bin/reassign.py, under a lock) | discovery overlay (`Engine.discover`, headless records), `reattach_caller_problem` | primary (clear machinery) |
 | `bin/reassign.py:4` | `boss-overrides.json` | the same file: reads and writes the overrides | `run_reassign` | `overlay` | primary (clear machinery) |
-| `bin/fleet-switchboard:3382` | `boss-resolution` | no file: `resolve_boss` and `boss_name` map `reports_to` (or the role alias) to a registered agent from the discovery | nobody | sends, reports, decisions, reattach, pane pass, `steers_into_turn` | derived from discovery (clear machinery) |
+| `bin/switchboard/batch_decision.py:172` | `boss-resolution` | no file: `resolve_boss` and `boss_name` map `reports_to` (or the role alias) to a registered agent from the discovery | nobody | sends, reports, decisions, reattach, pane pass, `steers_into_turn` | derived from discovery (clear machinery) |
+| `bin/fleet-switchboard:2533` | `boss-resolution` | no file: the entry's callers of `resolve_boss` and `boss_name` (defined in `bin/switchboard/batch_decision.py`) map `reports_to` (or the role alias) to a registered agent from the discovery | nobody | sends, reports, decisions, reattach, pane pass, `steers_into_turn` | derived from discovery (clear machinery) |
+| `bin/switchboard/batch_decision.py:55` | `discovery.agents` | reads the agents of the newest `discover()` (moved out of the entry unchanged) | nobody | the part's own pass or command | derived (reader) |
+| `bin/switchboard/docker_reaper.py:287` | `discovery.agents` | reads the agents of the newest `discover()` (moved out of the entry unchanged) | nobody | the part's own pass or command | derived (reader) |
+| `bin/switchboard/heavy_budget.py:185` | `discovery.agents` | reads the agents of the newest `discover()` (moved out of the entry unchanged) | nobody | the part's own pass or command | derived (reader) |
+| `bin/switchboard/plan_notice.py:49` | `discovery.agents` | reads the agents of the newest `discover()` (moved out of the entry unchanged) | nobody | the part's own pass or command | derived (reader) |
+| `bin/switchboard/sweep.py:941` | `discovery.agents` | reads the agents of the newest `discover()` (moved out of the entry unchanged) | nobody | the part's own pass or command | derived (reader) |
+| `bin/switchboard/workers_report.py:116` | `discovery.agents` | reads the agents of the newest `discover()` (moved out of the entry unchanged) | nobody | the part's own pass or command | derived (reader) |
+| `bin/switchboard/heavy_budget.py:146` | `boss-resolution` | resolves a worker's boss through `resolve_boss` (moved out of the entry unchanged) | nobody | the part's own pass or command | derived (reader) |
+| `bin/switchboard/heavy_budget.py:182` | `last-reports.json` | reads the last report of a sender (moved out of the entry unchanged) | nobody | the part's own pass or command | derived (reader) |
 | `bin/switchboard/decisions_a.py:209` | `boss-resolution` | the decisions list resolves each worker's boss through `resolve_boss` | nobody | the Decisions list (`decisions_from_reports`) | derived (reader) |
 | `bin/switchboard/decisions_b.py:459` | `boss-resolution` | the external-decision host resolves a decision's boss through `boss_name` | nobody | external decision sync | derived (reader) |
 | `bin/impact_hold.py:426` | `boss-resolution` | the impact hold resolves a boss through `boss_name`/`resolve_boss` | nobody | impact hold routing | derived |
@@ -31,8 +40,15 @@ rebuilt from another record.
 | `bin/reassign.py:237` | `boss-resolution` | `reassign` resolves the current boss for consent | nobody | `reassign` | derived |
 | `bin/fleet-switchboard:2385` | `discovery.agents` | the agents of the newest `discover()`: name, session, pane, role, charter, repo, workspace, cwd, reports_to | `Engine.discover` (each pass and on demand) | the whole daemon: fact routing, status, pane pass, decisions, chiefs lookup, badges, toasts | primary (the live list), derived from herdr and the v2 service |
 | `bin/cloud_worker.py:976` | `discovery.agents` | looks up a local agent by name before routing | nobody | `route` | derived (reader) |
+| `bin/switchboard/job_runs.py:348` | `discovery.agents` | the agents of the newest `discover()`: a dead job's starter is found among them by session and name | nobody | `JobFacts` | derived (reader) |
+| `bin/switchboard/job_runs.py:350` | `boss-resolution` | the starter's boss, by `boss_name` over the discovery | nobody | `JobFacts` | derived (reader) |
+| `bin/switchboard/shadow_classifier.py:32` | `discovery.agents` | the discovered agents, read to find the open asks of the chief of staff for the shadow classifier | nobody | `open_asks_of`, `run_shadow_classifier` | derived (reader) |
+| `bin/switchboard/work_moves.py:16` | `discovery.agents` | the sender found among the discovered agents | nobody | `move` | derived (reader) |
+| `bin/switchboard/worktree_lifecycle.py:304` | `discovery.agents` | the newest discovery, read to say who asks a reclaim | nobody | `reclaim-worktrees` | derived (reader) |
+| `bin/switchboard/worktree_lifecycle.py:164` | `pane-health.json` | named in a comment only: the agents a worktree sweep treats as known are those of the pane-health registry and the last discovery | nobody | `worktree_session_in_use` (through `known_agent`) | derived (reader) |
 | `bin/switchboard/judge.py:53` | `discovery.agents` | the judge's own sessions: the session ids of the discovered agents | nobody | the policy judge's socket | derived (reader) |
 | `bin/switchboard/decisions_a.py:209` | `discovery.agents` | the decisions list reads the discovered agents to find each worker's boss | nobody | the Decisions list | derived (reader) |
+| `bin/switchboard/claims_note.py:95` | `discovery.agents` | the claims notice pass hands the discovered agents to `route_of` to find the recipients of a pull request's own events | nobody | the claims notice (ask #1716) | derived (reader) |
 | `bin/switchboard/decisions_b.py:457` | `discovery.agents` | the external-decision host reads the newest discovery | nobody | external decision sync | derived (reader) |
 | `bin/impact_hold.py:401` | `discovery.agents` | looks up the orchestrator of a block | nobody | impact hold | derived (reader) |
 | `bin/lanes.py:55` | `discovery.agents` | looks up lanes by agent | nobody | lane resolution | derived (reader) |
@@ -49,12 +65,15 @@ rebuilt from another record.
 | `bin/decision_core.py:1032` | `decisions.json` | comment only: names the file as the local store | nobody | nobody | derived |
 | `bin/switchboard/judge_request.py:433` | `decisions.json` | reads the open decisions to give the judge the ask's context | nobody (reader only) | the policy judge's request | derived (reader) |
 | `bin/switchboard/decisions_a.py:274` | `decisions.json` | comment only: the decisions list never rewrites the projection by itself | nobody | nobody | derived |
+| `bin/switchboard/cockpit.py:4` | `decisions.json` | reads the open decisions (and the registry rows) to build the Cockpit's read-only fleet feed | nobody (reader only; it writes `cockpit.json` only) | the fleet feed (`cockpit --json`, `$STATE/cockpit.json`) | derived (reader) |
+| `bin/switchboard/cockpit.py:4` | `last-reports.json` | reads each agent's last report time and blocked text for the feed's lane and blocked cards | nobody (reader only) | the fleet feed | derived (reader) |
 | `bin/switchboard/decisions_b.py:281` | `decisions.json` | comment only: names the projection among what the store keeps | nobody | nobody | derived |
 | `bin/switchboard/plan_review.py:544` | `boss-resolution` | plan review escalates to the planner's boss through `boss_name`, then `resolve_boss` | nobody | plan review escalation | derived (reader) |
 | `bin/switchboard/plan_review.py:542` | `discovery.agents` | plan review reads the newest discovery to find the planner's boss | nobody | plan review escalation | derived (reader) |
 | `bin/switchboard/reminders.py:346` | `boss-resolution` | a reminder's recipient is resolved through `resolve_boss` | nobody | reminder delivery | derived (reader) |
 | `bin/switchboard/reminders.py:176` | `discovery.agents` | a reminder condition reads the discovered agents (recipient and sender) | nobody | reminder delivery | derived (reader) |
 | `bin/switchboard/reminders.py:143` | `last-reports.json` | a reminder's "no report since" condition reads the sender's last report time | nobody | reminder delivery | primary |
+| `bin/cloud_first_push.py:83` | `last-reports.json` | the first-push notice pass reads whether the pod has reported since its launch | nobody (reader only) | `first_push_tick` (the first-push notice, #2057) | primary (reader) |
 | `bin/switchboard/decision.py:86` | `boss-resolution` | the delivery decision compares a send's sender with the observation's boss through `boss_name` | nobody | the delivery decision | derived (reader) |
 | `bin/switchboard/facts.py:120` | `discovery.agents` | a fact source reads the discovered agents to find the chiefs of staff | nobody | fact sources | derived (reader) |
 | `bin/switchboard/v2_transport.py:24` | `pane-health.json` | comment only: the heartbeat-health bound is named for the derived file; nothing reads its time here | nobody | nobody | derived |
@@ -178,6 +197,8 @@ One predicate, `registry.no_pane_to_judge(row)`, says a row has no pane to judge
 Such a row is **alive** or **unknown**, never dead. The liveness check (`bin/endpoint_liveness.py`) is ON DEMAND (the doctor's charters check; the daemon pass never calls it). It needs a cloud record (`state/cloud/NAME.json`; none: `unknown`, and a local agent of the same name never makes a cloud row alive) and makes one bounded request through it, `fleet-switchboard read NAME --cloud-only` (tunnel and the pod's own password, handled inside that read, never here); it does not read the row's endpoint value. It answers `alive` with the time, or `unknown` for a failed, slow, refused or partial answer, and `unknown` removes nothing. One time limit (`LIVENESS_SECONDS`) bounds the request and the wait.
 
 A charter's `pane:` line may read `cloud:<agent name>`. `fleet-doctor` reports such a charter live when the row's endpoint answers and unknown when it does not, never as a dead pane. A local agent with a pane is judged as before.
+
+A charter's `pane:` line may also read `host:<hostname>/<agent>` (ask #1984): `bin/host_liveness.py` judges it by the named host's list of agents, alive when the agent is on the list, dead when the host answered and the agent is absent, and unreachable (neither alive nor dead, reported as unknown) when the host could not be asked.
 
 ## One dead verdict: `registry.shows_dead` (#1668)
 
