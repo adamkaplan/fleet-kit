@@ -2262,7 +2262,9 @@ class Kube:
     def add_secrets(self, *values, life=None):
         for v in values:
             if v:
-                reg = getattr(self, "registry", None) or self.known
+                reg = getattr(self, "registry", None)
+                if reg is None:
+                    reg = self.known
                 if hasattr(reg, "add_forms"):
                     reg.add_forms(secret_forms(v), life)
                 else:   # a plain KnownSet / set put in place of the registry: no lives, the forms stay
@@ -3857,7 +3859,7 @@ class Launcher:
         finally:
             steps["list"] = mono() - t0
         t0 = mono()
-        _sw = getattr(getattr(self.kube, "registry", None) or getattr(self.kube, "known", None), "sweep", None)
+        _sw = getattr(self.kube.registry if getattr(self.kube, "registry", None) is not None else getattr(self.kube, "known", None), "sweep", None)
         if _sw:
             try:
                 if not pods:   # an empty or unreadable list cannot be told from a truncated read: drop nothing

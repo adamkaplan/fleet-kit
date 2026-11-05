@@ -390,6 +390,42 @@ class S6NoValueInOutput(unittest.TestCase):
         self.assertEqual(hits, 0, "a fixture value appears in an output")
 
 
+class RealKube(unittest.TestCase):
+    """The registry of a Kube built by its own __init__ (an empty registry is falsy: `is not None`, never `or`)."""
+    PIECE = PW[:16]
+    SRC = pathlib.Path(cw.__file__).read_text()
+    OLD = 'reg = getattr(self, "registry", None)\n                if reg is None:\n                    reg = self.known'
+    NEW = 'reg = getattr(self, "registry", None) or self.known'
+
+    def run_life(self, kube_cls):
+        kube = kube_cls({"CW_KUBE_CONTEXT": "c"})
+        url = "https://user:" + PW + "@git.example/r.git"
+        kube.add_secrets(url, life=("pod", "p1"))
+        kube.add_secrets(MODEL)
+        text = "clone failed for " + self.PIECE
+        before = kube.scrub(text)
+        self.assertNotIn(self.PIECE, before, "the password piece was not redacted while live")
+        self.assertEqual(kube.registry.sweep(1.0, {"other"}), 0)
+        gone = kube.registry.sweep(2.0, {"other"})
+        self.assertGreater(gone, 0, "no form left after two sweeps with the pod absent")
+        self.assertIn(self.PIECE, kube.scrub(text), "the form stayed after its pod left")
+        self.assertNotIn("k" * 20, kube.scrub("x sk-" + "k" * 20), "a model-entry form left")
+        return gone
+
+    def test_real_kube(self):
+        n = self.run_life(cw.Kube)
+        self.assertIn(self.OLD, self.SRC)   # control first: the fix is in place
+        bad_src = self.SRC.replace(self.OLD, self.NEW)
+        self.assertNotEqual(bad_src, self.SRC)   # applied, computed
+        self.assertEqual(self.SRC.replace(self.OLD, self.OLD), self.SRC)   # a no-op changes nothing
+        ns = {"__name__": "mut", "__file__": cw.__file__}
+        exec(compile(bad_src, "mut", "exec"), ns)
+        with self.assertRaises(AssertionError) as cm:
+            self.run_life(ns["Kube"])
+        self.assertIn("no form left after two sweeps with the pod absent", str(cm.exception))
+        print("real Kube: forms gone %d; mutant (old `or`) fails with the text" % n)
+
+
 class Mutants(unittest.TestCase):
     """S3 and S2 mutants: a scratch copy of the sweep, text asserted once, mutation asserted applied."""
 
