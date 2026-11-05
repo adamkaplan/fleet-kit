@@ -152,6 +152,8 @@ The child sees only:
 
 `CW_GITHUB_API_BASE`, `CW_PREFLIGHT_TOKEN_CMD`, `CW_GIT_TOKEN_CMD`, proxy variables, `GH_`/`GITHUB_` token variables, `HOME` and `PATH` set in your shell are ignored by `launch --cloud` and `run-task`: nothing in the environment can point the check at another host, and your `HOME`, `PATH` and `PYTHON*` cannot run code inside it. The token route's own settings (`CW_APP_*_CMD`, `CW_OPENSSL`, `AZURE_CONFIG_DIR`) are trusted operator configuration: they are run or read as given.
 
+**The cap on shape M per lane (ask #1640).** A lane may hold at most 4 shape-M cloud workers at once (`MAX_M_PER_LANE` in `bin/cloud_worker.py`), because a lane's batch of 4-CPU pods once filled the cluster and left every other lane's launches unplaceable. The refusal reads: `refused: lane LANE already holds 4 shape-M cloud workers (A, B, C, D): retire one (retire NAME) or launch a smaller shape (--shape S)`; it exits 2 before any token, launcher or cluster call. The count reads the record directory alone: a record counts while it exists, holds the shape M and its hard deadline has not passed (the lane is its `reports-to` boss, or `(no boss)`); a retire or a clear ends it. A launch of another shape, of a name that already has a record, or of a lane below the cap is unchanged. Limits: a launch still in flight has no record yet; two launches of one lane at the same moment can pass together; records written before this change hold no shape and are not counted.
+
 ## 2b. The vault access check
 
 The vault only answers machines on its firewall's list. When a vault read is **refused for that reason** (and only then), `launch --cloud`
@@ -311,6 +313,14 @@ Before you apply: replace the placeholder `IMAGE_DIGEST` with the settings' `CW_
 - Delay: kubelet refreshes mounted Secret contents within about a minute, so a newly launched agent can need up to ~60 s before it can message through the hub.
 - Smoke check: the hub has no unauthenticated health path (`GET /decisions` needs a token), so readiness is a TCP check on 8443. From a pod in `cw`, `nc -z cloud-hub 8443` must succeed.
 - Rollback that keeps the Secrets: `kubectl -n cw delete deployment,service -l app.kubernetes.io/part-of=cloud-hub`. Do not add `secret` to that list: `kubectl delete deployment,service,secret -l <label>` also deletes BOTH Secrets (the registry and the per-agent passwords), and running agents cannot message after such a rollback until they are relaunched.
+- The autoscaler's do-not-evict mark (ask #1524): the hub's pod template carries the annotation `cluster-autoscaler.kubernetes.io/safe-to-evict` with the string `false`.
+  - The apply of the changed Deployment is the administrator's step, because the launcher's own account cannot change a Deployment. First run a server dry run of the patch, then the patch itself: `kubectl -n NAMESPACE_NAME patch deployment cloud-hub --type merge --dry-run=server -p PATCH`, then `kubectl -n NAMESPACE_NAME patch deployment cloud-hub --type merge -p PATCH`, where PATCH is `{"spec":{"template":{"metadata":{"annotations":{"cluster-autoscaler.kubernetes.io/safe-to-evict":"false"}}}}}`.
+  - Apply only that one annotation, never the whole file: the file also holds the two registry Secrets, created empty, and applying it again resets them, so every registered agent and the daemon's digest are lost. The file holds the mark now, so a later apply of the whole template from the file would carry the mark.
+  - The patch rolls the hub pod once, which is one more restart for every lane: announce it to the lanes and do it at a quiet moment; the registry Secrets and digests are untouched. The annotation put by hand on the RUNNING hub pod protects THAT pod only, and it is lost when that pod is replaced (a restart, a rollout or a node loss makes a new pod from the Deployment's template, which has no annotation yet). The patch puts the annotation in the template, so every pod made afterwards carries it. Until the patch is applied, the 5-minute by-hand marking of the live pod stays: it protects the pod that is running at that moment, and a replacement pod is unmarked until the next marking.
+  - The change protects only against the autoscaler's scale-down; that it prevents the kills is inferred and not shown, and it is not a fix of the outage.
+  - The mark does not stop a node upgrade, a node failure, a spot eviction, or a reboot or drain for maintenance.
+  - There is no disruption budget for a one-replica hub: a budget that allows no unavailable pod blocks every drain and upgrade of its node indefinitely, a cluster-wide effect, and a second replica with a budget is a separate ask.
+  - The follow-up ask for hub availability is #1525: today a restart loses the dedupe keys (memory only, bounded) and a report claimed but not yet delivered, while the registry survives in the Secrets.
 
 State: the decisions file is on an emptyDir at `/var/hub`; it is lost when the pod restarts. Tests (offline, no cluster): `python3 cloud/launcher/tests/test_cloud_hub_manifest.py`.
 
@@ -535,6 +545,7 @@ Over one day a cloud pull request took nine pushes and others two to four, becau
 ### A rule for every cloud coder brief
 
 Before any push, run bin/cloud-pr-preflight at the repository root and paste its three sections in the pull request comment; a branch-only failure, a not-run file or an unchained test file must be fixed first, and every existing test file it lists as edited must be justified there.
+When the branch adds or changes a tests/switchboard/test_*.py file, the run prints one more block, the checks of tools/new-test-checks, between the first and the second section, and a FAIL there must be fixed first too.
 
 ## Pre-push preflight modes
 
@@ -548,8 +559,42 @@ Cause: in a cloud pod the full preflight of the pre-push command (`bin/cloud-pr-
 - `CLOUD_PREPUSH_PREFLIGHT=full` asks `bin/cloud-prepush` for the full mode; `quick` (the default) is printed as `preflight mode: quick`; any other value is refused with exit 2. Continuous integration stays the full check.
 <!-- preflight-modes:end -->
 
+## The image now carries PostgreSQL 16 (ask #1353)
+
+The build step is unchanged (an operator rebuilds the image and publishes it as before). What is new: the Dockerfile has a build stage that compiles PostgreSQL 16.15 and two extensions (vector 0.8.7, message queue 1.13.1), PostgreSQL is pinned by version and source sha256 (verified before unpacking) and each extension by an immutable git commit (verified with `git rev-parse HEAD` before any build step); the build-time secret scan covers the built PostgreSQL tree; only the installed files reach the image. Nothing starts at pod start. Size cost and pod start time: measured by the operator at the first real build; record both, with the build digest, in the pull request. Rollback is unchanged: point the workers at the previous image digest. Start command and the versions: `cloud/README.md`, "PostgreSQL 16 and two extensions in the image".
+
 **Token roles.** The mint takes a role (`app_token.py OWNER/REPO --role ROLE`, default `worker`; an unknown role is refused before any network call) from one table of permission sets, `PERMISSIONS_BY_ROLE` in `cloud/launcher/app_token.py`. The worker role asks for, and accepts, exactly `contents: write, pull_requests: write, issues: read, metadata: read`. The orchestrator role asks for, and accepts, exactly `issues: write, pull_requests: read, checks: read, metadata: read` (no `contents` key at all). A launch with `--agent orchestrator` mints under the orchestrator role and records it on the pod as the annotation `cw/role: orchestrator` (a worker pod carries no annotation: its spec is unchanged); the reaper's renewal mints under the role the annotation names, and a pod made before the annotation renews as a worker. A custom mint command (`CW_GIT_TOKEN_CMD`) ignores the role, so the guarantee that an orchestrator never holds contents write holds only for the default mint command. An orchestrator pod made before this change has no role annotation and renews as a worker until it ends, so it is relaunched to take the narrower set. The orchestrator pod holds no App key, App id, vault setting or mint command.
 
 The App already holds checks: read (the owner confirmed it on 29 October), so the orchestrator set needs no App change today; if a later set needs a permission the App lacks, the owner adds it and accepts it on each installation, never this change.
 
 **What the orchestrator's token can and cannot do.** It can read issues, pull requests, check results and repository metadata, and it can write to issues only. It cannot push, create a branch, read a file, open, edit, approve or merge a pull request, change a workflow, a setting, a secret or a ruleset, or mint a token.
+
+## A worker lost with its node
+
+**Cause: inferred until these reads are made.** On 29 October four pods that sat on one node were killed in the same second (the event `Killing: Stopping container worker`, no other event) while pods on other nodes were untouched, and the launcher's audit has no stop line for them. The cause is INFERRED to be the removal or disturbance of that node. The launcher's own login cannot read nodes (it may not list them), so the holder of the ADMINISTRATOR login confirms the cause with these read-only commands (placeholders in capitals):
+
+```
+kubectl get events --all-namespaces --field-selector involvedObject.kind=Node
+kubectl describe node NODE_NAME
+kubectl get pods --all-namespaces -o wide
+kubectl -n kube-system get configmap cluster-autoscaler-status -o yaml
+az aks nodepool show --resource-group RESOURCE_GROUP_NAME --cluster-name CLUSTER_NAME --name NODEPOOL_NAME
+az aks nodepool list --resource-group RESOURCE_GROUP_NAME --cluster-name CLUSTER_NAME
+az monitor activity-log list --resource-group RESOURCE_GROUP_NAME --start-time START_TIME --end-time END_TIME
+```
+
+Also read the API server's audit log of pod deletes in the window through the cloud's log query (a query such as `AUDIT_LOG_QUERY` over the diagnostic logs, which names who deleted each pod). Read the Events, Conditions and Taints parts of `kubectl describe node`.
+
+The alternative causes and the read that rules each in or out:
+
+- A person's delete or another operator's cleanup: the audit log of pod deletes names the requester.
+- An eviction for node pressure: the event says `Evicted`, not `Killing`, and the pod is Failed.
+- The autoscaler's scale-down: the node would be gone; the status record and the node events confirm or rule it out.
+- A reboot, a drain or an image upgrade: the node survives; the node pool's recent operations, the node's events and conditions confirm it.
+- A taint eviction after the node was NotReady: the node events say not ready and the taints show it.
+
+**What the annotation does.** Every pod the launcher renders (a worker, a stack worker, and an orchestrator) carries `cluster-autoscaler.kubernetes.io/safe-to-evict: "false"`. It protects ONLY against the autoscaler's scale-down. It does not protect against a node upgrade or maintenance eviction (only a pod disruption budget limits those, a separate cluster-wide object this change does not add), a reboot, a drain for an upgrade, a node failure, a taint eviction or a spot eviction.
+
+**What it costs.** A node that holds a worker is not scaled down until the worker ends: an idle worker ends at its idle limit (`--idle`), a worker at its hard limit, at most the maximum hard limit (8 hours by default), and a pod the reaper cannot end at the cluster-side deadline floor (the maximum hard limit plus five minutes). A persistent orchestrator has no deadline: once ask 1509 (the persistent orchestrator) lands, its pod template is rendered by the same function and carries the mark, and its node is then not scaled down while it lives.
+
+**What is saved.** The pre-stop hook (`cw-prestop`) pushes unpushed work to the worker's `wip` branch when the pod is deleted, but no stop line and no run record is written. A worker lost with its node is told apart from one the launcher stopped by the cloud end alert of ask 1480 (pull request 1486), which reports a created worker whose pod is gone with no stop line as a gone pod after that ask's own waiting rule.

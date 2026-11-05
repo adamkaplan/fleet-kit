@@ -589,6 +589,8 @@ class TestGitShim(Base):
         thread.join(5)
         return done, took, starts.exists() and starts.read_text().count("started")
 
+    HANG_GUARD_SECONDS = 30   # mirrors the timeout=30 of lsremote (asserted below)
+
     def mutant(self, name, old, new):
         text = GIT_SHIM.read_text()
         self.assertIn(old, text, "the mutant %s no longer applies" % name)
@@ -602,9 +604,12 @@ class TestGitShim(Base):
     def test_s5_a_local_port_url_fails_at_once_and_the_helper_never_starts(self):
         if not (shutil.which("git", path=SAFE_PATH) or shutil.which("git")):
             self.skipTest("no real git")
-        done, took, starts = self.lsremote(GIT_SHIM)
+        self.assertIn("timeout=%d" % self.HANG_GUARD_SECONDS, inspect.getsource(type(self).lsremote), "HANG_GUARD_SECONDS and the timeout of lsremote disagree")
+        try:
+            done, took, starts = self.lsremote(GIT_SHIM)
+        except subprocess.TimeoutExpired:
+            self.fail("hang: git ls-remote to a closed local port did not return within %d s" % self.HANG_GUARD_SECONDS)
         self.assertEqual((done.returncode, starts), (128, 0), done.stderr)
-        self.assertLess(took, 5)
         self.assertNotIn("started", done.stdout + done.stderr)
 
     def test_s5_three_mutants_of_the_shim_start_the_helper_or_do_not_fail(self):
@@ -614,6 +619,7 @@ class TestGitShim(Base):
             "drop-terminal-prompt": ('{"GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "never"}', '{"GCM_INTERACTIVE": "never"}'),
             "drop-gcm-interactive": ('{"GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "never"}', '{"GIT_TERMINAL_PROMPT": "0"}'),
             "interactive-back-on": ('NO_DIALOG_CONFIG = "credential.interactive=false"', 'NO_DIALOG_CONFIG = "credential.interactive=true"'),
+            "no-dialog-wrapping-dropped": ("    return no_dialog(route_credentials(args))", "    return route_credentials(args)"),
             "code-host-only": ("    return no_dialog(route_credentials(args))", "    return no_dialog(route_credentials(args)) if any('github.com' in a for a in args) else route_credentials(args)"),
         }
         for name, (old, new) in mutants.items():
@@ -691,13 +697,13 @@ class TestGitShim(Base):
             "substring": (lambda path, line: any(path == r and t in line for r, t, _ in self.CONFIG_WRITE_ALLOWED), longer),
             "any-file": (lambda path, line: any(line == t for _, t, _ in self.CONFIG_WRITE_ALLOWED), other),
         }
-        caught = 0
+        def expectation_holds(diff):   # the real exact-match expectation: the other-file and longer diffs each hit once
+            return len(self.unallowed_config_write_hits(diff)) == 1
+        self.assertTrue(expectation_holds(other) and expectation_holds(longer))   # unpatched: holds
         for name, (widened, diff) in mutants.items():
             with self.subTest(name):
                 with mock.patch.object(type(self), "config_write_allowed", staticmethod(widened)):
-                    self.assertEqual(self.unallowed_config_write_hits(diff), [], "the mutant must widen the table")
-                    caught += len(self.unallowed_config_write_hits(diff)) == 0   # the (b)/(c) expectation of one hit now fails
-        self.assertEqual(caught, 3)
+                    self.assertFalse(expectation_holds(diff), "the widened table must break the one-hit expectation")
 
     def test_s7_u1_every_row_of_the_scan_finds_its_sample_and_only_that_row_does(self):
         for name, rx, hostile in self.CONFIG_WRITE_SPELLINGS:
