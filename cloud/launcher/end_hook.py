@@ -181,6 +181,21 @@ class NothingToPush(dict):
 FETCH_TIMEOUT_SECONDS = 20
 
 
+def clean_local(workdir, ctx):
+    """True when, from local references only, nothing is unsaved: no commit is unreachable from every remote-tracking ref and from
+    the clone's starting commit (the oldest entry of the HEAD reflog), and the working tree is clean. Any doubt is False."""
+    try:
+        if git(workdir, "status", "--porcelain", "--untracked-files=all", check=False, ctx=ctx).stdout.strip():
+            return False
+        start = git(workdir, "reflog", "show", "--format=%H", "HEAD", check=False, ctx=ctx).stdout.split()
+        if not start:
+            return False
+        out = git(workdir, "rev-list", "--max-count=1", "--all", "--not", "--remotes", start[-1], check=False, ctx=ctx)
+        return out.returncode == 0 and out.stdout.strip() == ""
+    except (RuntimeError, OSError):
+        return False
+
+
 def refresh_refs(workdir, remote, ctx):
     """One bounded `git fetch --prune` (no loop, no retry). True if it worked; False on any failure or on the timeout. Its output is
     discarded and never printed or logged."""
@@ -289,6 +304,8 @@ def run(workdir, worker, prestop=False, repo=None, ctx=None):
             if git(workdir, "diff", "--cached", "--quiet", "--no-ext-diff", "--no-textconv", check=False, ctx=ctx).returncode != 0:
                 git(workdir, "-c", "user.name=cw-worker", "-c", "user.email=cw-worker@invalid",
                     "commit", *(["--no-verify"] if prestop else []), "-m", "WIP: work in progress saved by %s at the end of the worker" % worker, ctx=ctx)
+    if not paths and clean_local(workdir, ctx):   # a clean tree with no commit of its own: nothing to save, no remote call
+        return NothingToPush({"pushed": False, "wip_branch": None, "skipped": skipped, "local_only": False, **extra})
     # Nothing to push: first a bounded fetch with prune refreshes the remote-tracking refs, so a remote branch deleted or moved since the
     # last fetch is seen. Only if that fetch itself fails (refused, network, timeout) is the answer taken from the local references.
     refreshed = refresh_refs(workdir, url if prestop else "origin", ctx)

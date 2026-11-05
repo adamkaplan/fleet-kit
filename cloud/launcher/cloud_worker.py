@@ -2934,6 +2934,7 @@ class _StopKube:
         return call
 
 
+KEPT_RUNNING_MARK = "kept_running_tried"
 KEPT_ENDED_NOTE = "kept pod ended: its work is unreachable by exec; the pod is left for a person"
 
 
@@ -3613,6 +3614,9 @@ class Launcher:
                 info["hook_note"] = NO_REPOSITORY_NOTE
             self.last_hook = {k: view[k] for k in ("pushed", "wip_branch", "error")}
             self._hook_record(info, dict(view, ran=True, refresh=info["refresh"]))
+            if view["error"] and res.get("refresh") == "needed" and phase == "Running":
+                # An ended token after the one refresh and the one retry: the stop's own record and audit line are the one pair; the pod is marked and the reaper skips it.
+                self._mark(target, pod["metadata"].get("uid"), **{KEPT_RUNNING_MARK: "true"})
             if view["error"]:
                 note = self._mark(target, pod["metadata"].get("uid"), kept="true")  # the pod is kept (and its workload): the commit is not safe yet
                 raise CloudError("end hook could not push, pod kept: %s%s; %s" % (view["error"], "; " + note if note else "", RECOVERY_ROUTE), EXIT_HOOK)
@@ -4244,6 +4248,8 @@ class Launcher:
             if ended and ann(pod, "kept") == "true" and (ann(pod, "unreachable") == "true"
                                                          or ((pod.get("metadata") or {}).get("name"), (pod.get("metadata") or {}).get("uid")) in self.ended_tried):
                 continue   # a kept pod that ended and was tried once: left for a person; no stop, no record, no audit
+            if (pod.get("status") or {}).get("phase") == "Running" and ann(pod, "kept") == "true" and ann(pod, KEPT_RUNNING_MARK.replace("_", "-")) == "true":
+                continue   # a kept running pod whose push failed on an ended token was tried once: no stop, no record, no audit; never deleted
             worker = ann(pod, "worker")
             reason = None
             if PERSISTENT_ANNOTATION in ((pod.get("metadata") or {}).get("annotations") or {}):
