@@ -152,4 +152,17 @@ H
   PATH="$bin:$PATH"; export PATH
 fi
 
+# #1200 (S14): the record of the pull requests this pod creates through its client, one number a line. The directory is private to this
+# user (0700, inside the worker-private $TMP); the client creates the file (0600, never through a symlink) when it records a number, so
+# a pod with no pull request of its own has no file and the guard refuses an edit (pr-edit-no-record). The agent and the client are the
+# same user: the record is not a security boundary (see docs/cloud-worker-interface.md); the shell guard row only refuses a command that
+# names it. Exported before the exec so the agent's command and its shell tool inherit it.
+if [ -L "$TMP/pr-record" ]; then   # chmod follows a link: never touch what a link points at
+  echo "worker: the pr-record path is a symlink; refusing to start" >&2
+  exit 1
+fi
+( umask 077; mkdir -p "$TMP/pr-record" )
+chmod 700 "$TMP/pr-record"
+export CW_PR_RECORD="$TMP/pr-record/numbers"
+
 exec "$@"

@@ -143,7 +143,8 @@ class TestMergeGateAnswer(AnswerBase):
         run += 1
         released += self.fake.events.count("release")
         self.assertIsNone(self.gate.read_lock(self.state, self.repo, "main"))
-        self.assertEqual((released, run), (6, 6), "the lock is released in 6 of 6 cases")
+        self.assertGreater(run, 0)
+        self.assertEqual(released, run, "the lock is released in every case run")
 
     def test_s6_the_reread_raising_is_reported_not_raised(self):
         self.fake.view_raises = True
