@@ -1,5 +1,6 @@
 """Ask #1025 slice A: the stack-only model credential. Offline: fake kubectl, fake az (a fake vault), fake clock; every value is built here.
 Scenarios: S1 S10 (the documentation), S2 (the setting), S3 S4 S5 (delivery, scan, audit), S8 (refusal before any pod), S9 (mutants), U1 (no option, no change)."""
+import pathlib
 import ast
 import base64
 import io
@@ -128,9 +129,9 @@ class Delivery(DeliveryBase):
         c, out, err = self.run_cli("create", "coder7", "--repo", "acme-org/widget-service", "--branch", "main", "--run-id", RUN_ID, "--stack")
         self.assertEqual(c, 0, err)
         self.assertNotIn("stack-model", json.dumps(self.st()))
-        self.assertNotIn("stack-model", open(self.env["CW_CLOUD_AUDIT"]).read())
+        self.assertNotIn("stack-model", pathlib.Path(self.env["CW_CLOUD_AUDIT"]).read_text())
         import test_cloud_stack as ts
-        stored = json.load(open(os.path.join(HERE, "fixtures", "stack_pod.json")))
+        stored = json.loads(pathlib.Path(os.path.join(HERE, "fixtures", "stack_pod.json")).read_text())
         for k, (a, n) in ts.STACK_CASES.items():
             self.assertEqual(json.loads(json.dumps(ts.build(a, n), sort_keys=True)), json.loads(json.dumps(stored[k], sort_keys=True)))
             self.assertNotIn("stack-model-key", json.dumps(stored[k]))
@@ -187,7 +188,7 @@ class Refusals(unittest.TestCase):
 
     def test_the_value_is_read_by_name_and_trimmed(self):
         self.assertEqual(self.bin.stack_model_secret(self.env), (NAME, STACK))
-        self.assertIn("--name " + NAME, open(self.log).read())
+        self.assertIn("--name " + NAME, pathlib.Path(self.log).read_text())
 
     def test_s8_missing_empty_over_cap_unreadable_are_refused_naming_the_name_only(self):
         for mode in ("empty", "big", "fail"):

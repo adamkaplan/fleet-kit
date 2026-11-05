@@ -1068,6 +1068,11 @@ class TestJobTool(unittest.TestCase):
     (no polling of a clock), so a loaded machine only makes it slower."""
 
     def setUp(self):
+        tmp_state = tempfile.mkdtemp()   # main() reads the state directory first (the installed-tree guard, #1380): never the real one
+        self.addCleanup(shutil.rmtree, tmp_state, True)
+        state_patch = mock.patch.dict(os.environ, {"XDG_STATE_HOME": tmp_state})
+        state_patch.start()
+        self.addCleanup(state_patch.stop)
         self.root = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, str(self.root), True)
         patcher = mock.patch.dict(os.environ, {sb.JOBS_DIR_ENV: str(self.root)})
@@ -1539,6 +1544,13 @@ class TestAgentsVerify(unittest.TestCase):
     """`agents verify`: the running service's registered agents against the rules each kit definition declares (not a count: the service adds default
     rules of its own and their number changes between versions)."""
 
+    def setUp(self):
+        tmp_state = tempfile.mkdtemp()   # main() reads the state directory first (the installed-tree guard, #1380): never the real one
+        self.addCleanup(shutil.rmtree, tmp_state, True)
+        state_patch = unittest.mock.patch.dict(os.environ, {"XDG_STATE_HOME": tmp_state})
+        state_patch.start()
+        self.addCleanup(state_patch.stop)
+
     DEFAULTS_10 = [{"action": "read", "resource": "*.env", "effect": "ask"}, {"action": "*", "resource": "*", "effect": "allow"}] + [
         {"action": "default%d" % n, "resource": "*", "effect": "allow"} for n in range(8)]
     DEFAULTS_5 = DEFAULTS_10[:5]
@@ -1718,8 +1730,10 @@ class TestReviewLawsStarterSet(Base):
         for line in body.splitlines():
             if line.startswith("## "):
                 break
-            if line.strip():
+            if line.startswith("- "):   # a rule is a list item; a closing paragraph (#2134) is guidance, not a rule
                 lines.append(line)
+            elif line.strip():
+                self.assertFalse(line.startswith(("-", "*", "R-")), "a malformed rule line: %r" % line[:80])
         return lines
 
     def install(self, *argv):
@@ -2174,7 +2188,7 @@ class TestReconcileOnRead(unittest.TestCase):
 
     def test_s3_a_half_known_live_check_removes_nothing(self):
         reg = self.registry()
-        for live in ({"pane": False, "process": None}, {"pane": True, "process": False}, {"pane": None, "process": False}):
+        for live in ({"pane": False, "process": None}, {"pane": None, "process": False}):
             self.assertEqual(self.mod.reconcile_on_read(self.dir, reg.read(self.dir), lambda n, a, live=live: live, reg), [], live)
         self.assertIn("ghost", reg.read(self.dir)["agents"])
 
@@ -2213,7 +2227,7 @@ class TestReconcileOnRead(unittest.TestCase):
             "pane unchecked": (whole, {"pane": None, "process": False}, 0),
             "process unchecked": (whole, {"pane": False, "process": None}, 0),
             "process present": (whole, {"pane": False, "process": True}, 0),
-            "pane present": (whole, {"pane": True, "process": False}, 0),
+            "pane present": (whole, {"pane": True, "process": True}, 0),
             "both gone": (whole, {"pane": False, "process": False}, 1),
             "recorded live": ({"whole": True, "agents": {"ghost": {"state": "working"}}}, {"pane": False, "process": False}, 0),
         }
@@ -2238,10 +2252,10 @@ class TestReconcileOnRead(unittest.TestCase):
 
             def pane_process_info(self, pane):
                 return list(self.procs)
-        agent = {"pane": "p_1"}
+        agent = {"pane": "p_1", "session": "ses_a"}
         gone, unknown = {"pane": False, "process": False}, {"pane": None, "process": None}
         cases = {
-            "listed and present, process running": (Herdr([{"pane_id": "p_1"}], procs=[{"cmdline": "x"}]), {"pane": True, "process": True}),
+            "listed and present, process running": (Herdr([{"pane_id": "p_1"}], procs=[{"cmdline": "opencode -s ses_a"}]), {"pane": True, "process": True}),
             "listed and present, no process": (Herdr([{"pane_id": "p_1"}]), {"pane": True, "process": False}),
             "listed and absent": (Herdr([{"pane_id": "p_2"}, {"pane_id": "p_3"}]), gone),
             "empty list": (Herdr([]), gone),

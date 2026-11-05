@@ -97,7 +97,7 @@ def base_other_keys():
 
 def without_ref_rules(cfg):
     cfg = copy.deepcopy(cfg)
-    gone = ("git*push*main*", "git*push*master*")
+    gone = ("git*push*main*", "git*push*master*", "gh api*/issues/comments/*", "gh api*/issues/comments/* *", "gh api*/issues/comments/*?*")
     for b in (cfg["permission"]["bash"], cfg["agent"]["worker"]["permission"]["bash"]):
         for k in [k for k in b if k in gone or k.startswith("*git*push*")]:
             del b[k]

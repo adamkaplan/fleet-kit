@@ -1,0 +1,12 @@
+[
+ "[switchboard] 1 for platform (delayed: sent 11:15Z, held 31 min, delivered 11:46Z): late",
+ "[switchboard] 1 for platform (delayed: sent 10:46Z, held 60 min, delivered 11:46Z): late",
+ "[switchboard] 1 for platform (delayed: sent 09:33Z, held 2 h, delivered 11:46Z): late",
+ "[switchboard] 1 for platform (delayed: sent 2027-01-15 10:46Z, held 25 h, delivered 11:46Z): late",
+ "[switchboard] 1 for platform (sent 11:46Z, delivered 11:46Z; supersedes 1 earlier message from coder on this issue, still waiting: sent 11:38Z): newer",
+ "[switchboard] 1 for platform (sent 11:46Z, delivered 11:46Z; supersedes 2 earlier messages from coder on this issue, still waiting: sent 11:35Z, 11:38Z): newer",
+ "[switchboard] 1 for platform (delayed: sent 11:05Z, held 41 min, delivered 11:46Z; supersedes 1 earlier message from coder on this issue, still waiting: sent 10:56Z): newer",
+ "[switchboard] 1 for platform (sent 11:46Z, delivered 11:46Z; supersedes 1 earlier message from coder on this issue, still waiting: sent 2027-01-15 10:46Z): newer",
+ "[switchboard] 3 for platform (delayed: sent 11:15Z, held 31 min, newest sent 11:45Z, delivered 11:46Z): m1 [newest first]",
+ "[switchboard] 3 for platform (delayed: sent 10:40Z, held 66 min, newest sent 11:45Z, delivered 11:46Z): m1 [newest first]"
+]
