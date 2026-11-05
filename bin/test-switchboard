@@ -42341,6 +42341,8 @@ class TestLaunchRefusedMessage(TestLaunchMemoryGate):
         'CW_ALLOWED_REPOS has an entry ': 'refused before any pod exists: it says nothing was created',
         'CW_TOOLING_REPO is not OWNER/N': 'refused before any pod exists: it says nothing was created',
         'the stack model secret %s %s; ': 'refused before any pod exists: it says nothing was created',
+        'the stack model secret %s coul': 'refused before any pod exists: it says nothing was created',
+        '%s; nothing was created': 'refused before any pod exists: it says nothing was created (the cluster login refusal of the stack model, relayed)',
         'the git token command gave no ': 'refused before any pod exists: it says nothing was created',
         '--agent orchestrator needs --r': 'refused before any pod exists: it says nothing was created',
         '--shape %r is not a pod shape ': 'refused before any pod exists: it says nothing was created',
