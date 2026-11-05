@@ -487,6 +487,10 @@ def run_pass(sb, engine, now, alive=None, launcher_audit=None):
             state.pop("reaper_gap", None)   # summed once per gap: cleared as it is sent
         if loss.get("outage") and isinstance(state.get("reaper_outage"), dict):
             state["reaper_outage"]["sent"] = True
+        if stopped_cleanly(state, loss):
+            _deliver(engine, sb, loss, [loss.get("lane")], text)   # #2202: the launcher's own records show a clean stop: the lane only
+            raised.append(dict(loss, text=text, earlier=earlier))
+            continue
         _deliver(engine, sb, loss, [loss.get("lane"), "chief-of-staff"], text)
         raised.append(dict(loss, text=text, earlier=earlier))
     if rest:
@@ -503,6 +507,14 @@ def run_pass(sb, engine, now, alive=None, launcher_audit=None):
         except OSError as err:
             engine.audit.append(engine.actor, "lost_worker.state_not_saved", None, {"why": sb._one_line(str(err), 160)})
     return raised
+
+
+def stopped_cleanly(state, loss):
+    """#2202: True when the launcher audit or run record (folded into `stop` and `report`) shows this worker stopped or reported at or after the loss's last event."""
+    if loss.get("kind") == "reaper_missed" or not isinstance(loss.get("lane"), str) or not loss["lane"]:
+        return False
+    name = loss.get("name")
+    return any(isinstance(t.get(name), (int, float)) and t[name] >= loss["at"] for t in (state.get("stop", {}), state.get("report", {})))
 
 
 def _deliver(engine, sb, loss, recipients, text):
