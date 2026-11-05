@@ -43,8 +43,8 @@ class TestSentLedgerBounds(Base):
                 for n in range(1, 11):
                     ledger.confirm(sid, ["%s:%d" % (sid, n)], float(base + n))
             sessions = ledger.load()[0]
-            self.assertTrue(all(len(mine) <= 5 for mine in sessions.values()), "the per-session cap")
-            self.assertEqual(sum(len(mine) for mine in sessions.values()), 8, "the total cap")
+            self.assertTrue(all(len(mine) <= caps["SENT_HARD_PER_SESSION"] for mine in sessions.values()), "the per-session cap")
+            self.assertEqual(sum(len(mine) for mine in sessions.values()), caps["SENT_HARD_TOTAL"], "the total cap")
             self.assertEqual(sorted(v for mine in sessions.values() for v in mine.values()), [18.0, 19.0, 20.0, 26.0, 27.0, 28.0, 29.0, 30.0], "oldest first")
 
 
