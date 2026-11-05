@@ -29,6 +29,7 @@ cloud/launcher/tests/test_cloud_split.py
 cloud/launcher/tests/test_cloud_stack.py
 cloud/launcher/tests/test_cloud_stack_wait.py
 cloud/launcher/tests/test_cloud_status_summary.py
+cloud/launcher/tests/test_cloud_tests_write_tmp.py
 cloud/launcher/tests/test_cloud_turn_end.py
 cloud/launcher/tests/test_cloud_worker.py
 cloud/launcher/tests/test_cluster_token_refresh.py
@@ -96,6 +97,7 @@ cloud/launcher/tests/test_stop_no_checkout.py
 cloud/launcher/tests/test_stub_cleanup.py
 cloud/launcher/tests/test_token_at_limit.py
 cloud/launcher/tests/test_token_read_at_call.py
+cloud/launcher/tests/test_untracked_report.py
 cloud/launcher/tests/test_vault_block.py
 cloud/launcher/tests/test_vault_check_pins.py
 cloud/launcher/tests/test_worker_copies.py
