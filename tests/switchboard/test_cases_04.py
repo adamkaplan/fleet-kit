@@ -2092,7 +2092,7 @@ class TestCloudWatchTick(unittest.TestCase):
     def test_U2_no_directory_no_error_no_directory_created(self):
         calls = self.finish()
         self.assertEqual(calls["tick"], 1)
-        self.assertEqual(self.audit, [])
+        self.assertEqual([a for a in self.audit if str(a[1]).startswith("cloud-watch")], [])   # the watch says nothing; other daemon notes (the push watch) are not its business
         self.assertFalse(self.dir.exists())
 
 

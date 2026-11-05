@@ -27,7 +27,7 @@ RECORDED_BIN_HEAD = """bin/y.py:
 """
 RECORDED_BIN_TAIL = """  authority code: no
   matrix: no matrix line is demanded
-  units: add this row to the Units table of docs/architecture.md (header `| Unit | Layer | Job | Also may use |`, rows sorted by name), after the row of `work_sync.py`:
+  units: add the file docs/architecture/units/y.py.row holding this one row (a file of its own: no shared line to conflict on):
     | `y.py` | <layer 0-6> | <the one job of the module> | |
   closure: %s
 """

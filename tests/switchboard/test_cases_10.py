@@ -485,6 +485,8 @@ fleet-switchboard:_call
 switchboard/docker_reaper.py:_docker_inspect
 switchboard/caches.py:_fresh
 switchboard/docker_reaper.py:_last
+switchboard/gate_spool.py:_load
+switchboard/gate_spool.py:_spool_line
 fleet-switchboard:_load_markers
 fleet-switchboard:_real_locations
 switchboard/profile_pieces.py:_read_json_object

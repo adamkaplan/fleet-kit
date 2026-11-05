@@ -1664,7 +1664,7 @@ class TestPlanningSkill(unittest.TestCase):
             path = Path(tmp) / "plan.md"
             path.write_text(plan)
             out = subprocess.run([sys.executable, str(REPO / "bin" / "fleet-switchboard"), "plan", "check", "--file", str(path), "--done-when", done],
-                                 capture_output=True, text=True)
+                                 capture_output=True, text=True, env=dict(os.environ, HOME=tmp, XDG_STATE_HOME=tmp, XDG_CONFIG_HOME=tmp, FLEET_SWITCHBOARD_STATE=tmp))   # an isolated location, never the real one
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertIn("plan check: PASS", out.stdout)
 

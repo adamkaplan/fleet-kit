@@ -400,7 +400,8 @@ def build():
             tree = ast.parse(inspect.getsource(SBP().bounded_text))
             called = {n.func.attr if isinstance(n.func, ast.Attribute) else getattr(n.func, "id", "") for n in ast.walk(tree) if isinstance(n, ast.Call)}
             self.assertFalse(called & {"open", "read_text", "run", "Popen", "check_output", "system", "read_bytes"}, called)
-            self.assertLess(len((BIN / "plan_ledger.py").read_text().splitlines()), 1500)
+            import test_architecture
+            self.assertLessEqual(len((BIN / "plan_ledger.py").read_text().splitlines()), test_architecture.SOURCE_LIMIT)   # short: within the one source limit of the architecture test
             self.assertEqual(SBP().clip("a" * 501, 500), "a" * 499 + "\u2026")
             self.assertGreater(SBP().EVIDENCE_LIMIT, SBP().FIELD_LIMIT)   # the evidence has the longer limit; both are positive
             self.assertGreater(SBP().FIELD_LIMIT, 0)
