@@ -8459,7 +8459,8 @@ def pod_silence_summary(worker):
     no flag and no caller argument: this function takes a pod name from the daemon's own live records and returns the line only to pod_silence.scan, which
     sends it to the recorded boss; a lane has no way to call it (not a command, not a request kind). Raises (a refusal text) when the pod cannot be read."""
     cloud = load_module("cloud_worker").bind(globals())
-    code, body, note = cloud.run_launcher(None, "inspect", worker, (), 60)
+    with cloud.Cluster() as cluster:   # the launcher's inspect needs a cluster login, like every other caller
+        code, body, note = cloud.run_launcher(None, "inspect", worker, (), 60, cluster=cluster)
     if code != 0 or not isinstance(body, dict):
         raise RuntimeError("the pod was not read (%s)" % (" ".join(str(note or "exit %s" % code).split())[:120]))
     line = cloud._inspect_short(body)
