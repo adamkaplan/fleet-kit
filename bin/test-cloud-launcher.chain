@@ -116,9 +116,9 @@ cloud/worker/tests/test_entrypoint_import.py
 cloud/worker/tests/test_entrypoint_question.py
 cloud/worker/tests/test_guard_table.py
 cloud/worker/tests/test_identity_image.py
-cloud/worker/tests/test_pr_branch_source.py
 cloud/worker/tests/test_plan_check_in_pod.py
 cloud/worker/tests/test_pod_inspect.py
+cloud/worker/tests/test_pr_branch_source.py
 cloud/worker/tests/test_pr_edit.py
 cloud/worker/tests/test_pr_edit_hardening.py
 cloud/worker/tests/test_pr_record.py
