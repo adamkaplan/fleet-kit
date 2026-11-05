@@ -171,6 +171,18 @@ def check_off(mod):   # S6
         check_properties(mod, rig, 1)
 
 
+A_SILENT = "a host with no docker and the switch absent says nothing of a prune"
+
+
+def check_silent(mod):   # U3
+    with Rig(mod, {"disk_guard": {}}, docker=None) as rig:
+        facts = rig.step()
+        facts = rig.step(10, 40)
+        need(rig.events("disk.prune_failed") == [], "%s: %d disk.prune_failed line(s)" % (A_SILENT, len(rig.events("disk.prune_failed"))))
+        need(len(facts) == 1 and "prune" not in facts[0].summary.replace("disk prune --dry-run", "").replace("would be pruned", ""), "%s: the notice has a prune line: %r" % (A_SILENT, facts))
+        need(rig.calls == [], "no docker call: %r" % rig.calls)
+
+
 class TestDiskGuardPrune(unittest.TestCase):
     """The guard's prune (ask #2157), on a fake docker; the mutants are copies of the guard's source."""
 
@@ -212,6 +224,21 @@ class TestDiskGuardPrune(unittest.TestCase):
                     sb.validate_disk_guard({"prune": bad}, "t")
         with self.assertRaises(sb.ConfigError):
             sb.validate_config({"opencode": "x", "disk_guard": {"prune": "yes"}})
+
+    def test_u3_no_docker_and_the_switch_absent_says_nothing_and_a_number_or_a_string_is_refused(self):
+        check_silent(sb)
+        for bad in (5, "yes"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(sb.ConfigError) as caught:
+                    sb.validate_disk_guard({"prune": bad}, "t")
+                self.assertIn("disk_guard.prune", str(caught.exception))
+
+    def test_u3_a_mutant_that_looks_docker_up_first_fails_beside_a_passing_control(self):
+        check_silent(self.copy("silent_control", []))
+        mutant = self.copy("docker_first", [("if docker is None and not asked:", "if False:")])
+        with self.assertRaises(AssertionError) as caught:
+            check_silent(mutant)
+        self.assertIn(A_SILENT, str(caught.exception))
 
     def test_u1_with_the_prune_off_the_audit_the_notice_and_the_file_are_as_they_were(self):
         notice = ("disk low: 40 GB free on the volume holding the state directory (the guard is 50 GB, hard line 10 GB). `fleet-switchboard disk prune --dry-run` shows what "

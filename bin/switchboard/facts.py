@@ -143,7 +143,10 @@ class DiskFacts:
             if self.pruned < episode:
                 self.prune_text = "no build-cache prune: one ran less than an hour ago"
             return
+        asked = guard.get("prune") is True   # decided BEFORE docker is looked up: only a host that asked for the prune hears of a missing docker (PC-3)
         docker = _docker_executable("docker")
+        if docker is None and not asked:
+            return   # the switch is absent and there is no docker: the default (Docker Desktop only) is off, and the guard says nothing of a prune
         if docker is None:
             self._prune_done(engine, now)
             self._failed(engine, {"reason": "docker is not installed or not on PATH"})
