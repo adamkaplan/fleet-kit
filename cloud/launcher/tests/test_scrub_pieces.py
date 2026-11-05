@@ -42,9 +42,14 @@ TOKEN = "ghp_" + TOKEN_BODY
 KEY_LINES = ["QUJDREVGR0hJSktMTU5PUA1234", "WFlaMDEyMzQ1Njc4OTBhYmNk5678"]
 KEY = "-----BEGIN PRIVATE KEY-----\n" + "\n".join(KEY_LINES) + "\n-----END PRIVATE KEY-----"
 MODEL = "mk-7Hq2xZ"
-VALUES = (URL, TOKEN, KEY, MODEL)
+# a second URL whose password is a tail of another form: the longer match `appuser:Z1X09b!X` is chosen first, and `!X` of the shorter
+# overlapping one (the password alone, with a window of the userinfo) survived the old choice among overlapping matches
+PW2 = "Z1X09b!X"
+URL2 = "postgres://%s:%s@db.internal:5432/app" % (USER, urllib.parse.quote(PW2, safe=""))
+VALUES = (URL, TOKEN, KEY, MODEL, URL2)
+TAILS = [USER + ":" + PW2, PW2, "x" + USER + ":" + PW2 + "y"]
 # (shape, planted text): each whole value and each piece a reader could use
-PLANTED = [("url", URL), ("url", urllib.parse.quote(PW, safe="")), ("url", PW), ("url", USER + ":" + PW), ("url", b64(USER + ":" + PW)),
+PLANTED = [("url", URL), ("url", urllib.parse.quote(PW, safe="")), ("url", PW), ("url", USER + ":" + PW), ("url", USER + ":" + PW + "@"), ("url", b64(USER + ":" + PW)),
            ("url", b64(PW)), ("url", urllib.parse.quote(PW, safe="")), ("url", PW.encode().hex()), ("url", urllib.parse.quote(USER + ":" + PW, safe="")),
            ("token", TOKEN), ("token", TOKEN_BODY), ("token", b64(TOKEN_BODY)),
            ("key", KEY), ("key", KEY_LINES[0]), ("key", KEY_LINES[1]), ("key", b64(KEY_LINES[0])),
@@ -73,8 +78,18 @@ def survivors(mod):
     return left, changed
 
 
+def tails(mod):
+    """Texts of which a character of the planted secret is left beside a marker: the union of overlapping matches leaves none."""
+    known, left = known_set(mod), 0
+    for text in TAILS:
+        out = mod.scrub("connect with %s failed twice" % text, known, 2000)
+        left += not (out.startswith("connect with ") and out.endswith(" failed twice") and "!X" not in out and "appuser" not in out)
+    return left
+
+
 def check(mod):
     left, changed = survivors(mod)
+    left += [1] * tails(mod)
     assert not left, "%s: %d of %d planted values and pieces" % (ANCHOR, len(left), len(PLANTED))
     assert not changed, "plain text around a planted value changed in %d texts" % len(changed)
 
@@ -125,7 +140,22 @@ class ScrubPieces(unittest.TestCase):
         with self.assertRaises(AssertionError) as caught:
             check(mutant)
         self.assertIn(ANCHOR, str(caught.exception))
-        print("S3 control 1 of 1, mutant fails 1 of 1 with the anchored text, mutation applied 1 of 1")
+        old_choice = load("scrub_pieces_overlap", self._overlap_source())  # the old choice among overlapping matches
+        with self.assertRaises(AssertionError) as caught2:
+            check(old_choice)
+        self.assertIn(ANCHOR, str(caught2.exception))
+        print("S3 control 1 of 1, mutants fail 2 of 2 with the anchored text, mutations applied 2 of 2, tails left by the old choice %d" % tails(old_choice))
+
+    def _overlap_source(self):
+        old = "    return first.run(union.run())\n"
+        self.assertEqual(self.src.count(old), 1)
+        new = self.src.replace(old, "    return first.run()\n")
+        self.assertNotEqual(new, self.src)
+        return new
+
+    def test_S3_tails_of_overlapping_matches(self):
+        self.assertEqual(tails(self.cw), 0)
+        self.assertGreater(tails(load("scrub_pieces_overlap2", self._overlap_source())), 0)
 
 
 if __name__ == "__main__":

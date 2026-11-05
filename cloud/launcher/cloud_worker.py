@@ -657,6 +657,7 @@ class _ScrubSpans:
         self.sa, self.sb, self.sd = [], [], []
         self.rh, self.inq = sorted(cand), set(cand)  # a sorted list is a heap
         self.cur, self.ptr, self.heap = -1, (-1, 0), []
+        self.found = None
 
     def read(self, key, want):
         """Up to `want` characters of the current text from `key`; None when `key` is not a character of it."""
@@ -796,9 +797,41 @@ class _ScrubSpans:
                             hi = mid - 1
                     lo = low
                 end = self.advance(key, lo)
-            self.write(key, end)
+            if self.found is None:
+                self.write(key, end)
+            else:  # the union pass: the match is kept on the ORIGINAL text, nothing is written
+                self.found.append((key[0], end[0]))
+                self.ptr = end
 
-    def run(self):
+    def absorb(self, found):
+        """A match of one secret may overlap one of another that was redacted first: what the first left of it (a tail) is redacted
+        too, so the UNION of overlapping matches is gone. `found` holds the matches on the original text; the text is not read again."""
+        merged = []
+        for a, b in sorted(found):
+            if merged and a < merged[-1][1]:
+                merged[-1][1] = max(merged[-1][1], b)
+            else:
+                merged.append([a, b])
+        sa, sb, sd = self.sa, self.sb, self.sd
+        for a, b in merged:
+            pos = a
+            while pos < b:
+                k = bisect.bisect_right(sa, pos) - 1
+                if k >= 0 and sb[k] > pos:  # inside a written span: skip it
+                    pos = sb[k]
+                    continue
+                gap_end = min(b, sa[k + 1]) if k + 1 < len(sa) else b
+                if k >= 0 and sb[k] == pos:
+                    sb[k] = gap_end
+                elif k + 1 < len(sa) and sa[k + 1] == gap_end:
+                    sa[k + 1] = pos
+                else:
+                    sa.insert(k + 1, pos)
+                    sb.insert(k + 1, gap_end)
+                    sd.insert(k + 1, _SCRUB_MARK)
+                pos = gap_end
+
+    def run(self, found=()):
         while self.rh:
             rank = heapq.heappop(self.rh)
             self.inq.discard(rank)
@@ -808,6 +841,9 @@ class _ScrubSpans:
                 self.sweep(rank, whole, sec)
             self.sweep(rank, None, sec)
             self.cand.pop(rank, None)
+        if self.found is not None:
+            return self.found
+        self.absorb(found)
         parts, pos = [], 0
         for a, b, disp in zip(self.sa, self.sb, self.sd):
             parts.append(self.text[pos:a])
@@ -829,7 +865,12 @@ def _scrub_secrets(text, secrets_known):
                 cand[rank].add((i, 0))
             else:
                 cand[rank] = {(i, 0)}
-    return _ScrubSpans(text, order, index, cand).run() if cand else text
+    if not cand:
+        return text
+    first = _ScrubSpans(text, order, index, {r: set(c) for r, c in cand.items()})
+    union = _ScrubSpans(text, order, index, cand)
+    union.found = []
+    return first.run(union.run())
 
 
 def scrub(text, secrets_known=(), limit=300):

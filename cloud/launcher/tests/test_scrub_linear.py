@@ -1103,15 +1103,30 @@ class S19FurtherMutants(unittest.TestCase):
 
 class U2Fixture(unittest.TestCase):
     def test_U2_forms_and_set_equal_the_tip(self):
-        derived = sorted(set().union(*[cw.secret_forms(v) for v in FORM_VALUES]))
+        """The property (ask #2144; owner's rule of 4 November 21:27Z): on the fixture, no piece of a planted secret survives the scrub of the
+        set the launcher builds, the plain text around it is unchanged, and the scrub makes one pass. No exact set is pinned."""
         k = cw.Kube({})
         k.add_secrets(FORM_VALUES[0])
         k.add_secrets(*FORM_VALUES[1:])
         k.add_secrets(FORM_VALUES[0], "")
-        self.assertEqual(derived, FORMS_FIXTURE)
         self.assertIsInstance(k.known, cw.KnownSet)
-        self.assertEqual(k.known, set(FORMS_FIXTURE))
-        print("U2: forms %d of %d, set equal" % (len(derived), len(FORMS_FIXTURE)))
+        print("U2: %s" % fixture_property(k))
+
+
+def fixture_property(kube):
+    """Plant each fixture value in plain text: 0 windows of 8 characters of it left, the text around it unchanged, one probe per position."""
+    left = around = planted = 0
+    for v in FORM_VALUES:
+        text = "before %s after" % v
+        out = kube.scrub(text, 10 ** 6)
+        planted += 1
+        left += any(v[i:i + cw.MIN_FRAGMENT] in out for i in range(len(v) - cw.MIN_FRAGMENT + 1))
+        around += out.startswith("before ") and out.endswith(" after")
+    assert left == 0, "a piece of a known secret survived the scrub in %d of %d texts" % (left, planted)
+    assert around == planted, "plain text around a planted secret changed in %d of %d texts" % (planted - around, planted)
+    probes = line_hits(cw.scrub, cw._scrub_secrets.__code__, "for rank in get(", "before %s after" % FORM_VALUES[0], kube.known, 10 ** 6)
+    assert probes <= 2 * (len(FORM_VALUES[0]) + 13), "the scrub made more than one pass over the text"
+    return "planted %d, pieces surviving %d, plain text unchanged %d of %d, probes %d" % (planted, left, around, planted, probes)
 
 
 def removing_check(cls):
@@ -1218,9 +1233,10 @@ class S20VersionRule(unittest.TestCase):
         kube = cw.Kube({})
         kube.add_secrets(FORM_VALUES[0])
         kube.add_secrets(*FORM_VALUES[1:])
-        self.assertTrue(isinstance(kube.known, cw.KnownSet) and kube.known == set(FORMS_FIXTURE))
+        self.assertIsInstance(kube.known, cw.KnownSet)
+        fixture_property(kube)
         print("S20 13 of 13 operations bump by one, no-change calls leave the version %d of 11, raising remove and pop leave the version unchanged %d of 2, half-way update bumps once 1 of 1, "
-              "equality with a plain set and a frozenset 2 of 2, len, in and iteration 3 of 3, the set of a Kube equal by content 1 of 1" % (stayed, unchanged))
+              "equality with a plain set and a frozenset 2 of 2, len, in and iteration 3 of 3, no piece of a planted secret survives in the set of a Kube 1 of 1" % (stayed, unchanged))
 
 
 
