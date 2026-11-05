@@ -197,7 +197,7 @@ def build(PR4Base):
             self.fifty_world("s-fifty2", 51)
             engine_class = type(self.world.engine)
             source = inspect.getsource(engine_class.deliver)
-            old, new = "merge_wake_facts(plan.recipient, plan.pending)", "merge_wake_facts(plan.recipient, plan.pending[:25])"
+            old, new = "merge_wake_facts(plan.recipient, merge_reminder_copies(plan.pending))", "merge_wake_facts(plan.recipient, merge_reminder_copies(plan.pending)[:25])"
             self.assertEqual(source.count(old), 1, msg="the replaced text is in the source once")
             mutated = source.replace(old, new)
             self.assertNotEqual(mutated, source, msg="mutation not applied: half merge")
@@ -480,12 +480,12 @@ def build(PR4Base):
             source = next(s for s in self.world.engine.sources if isinstance(s, sb.ReminderFacts))
             return [f.summary for f in source() if f.summary.startswith(letter) and f.summary.endswith("(condition unreadable)")]
 
-        def test_s13_the_unreadable_note_is_kept_and_the_text_stays_within_the_cap(self):
+        def test_s13_the_unreadable_note_is_kept_and_the_body_is_not_cut(self):
             for size, letter in zip((sb.TEXT_CAP - 23, sb.TEXT_CAP - 22, sb.TEXT_CAP, 5, 3990), "xyzwv"):
                 with self.subTest(size=size):
                     texts = self.unreadable_texts(size, letter)
                     self.assertEqual(len(texts), 1)
-                    self.assertLessEqual(len(texts[0]), sb.TEXT_CAP)
+                    self.assertGreaterEqual(len(texts[0]), size + len(" (condition unreadable)"))   # #1355 on the tip: the fact is never cut, compose carries an over-cap text in parts; the note ends it and is kept
 
         def held_passes(self, passes=3):
             item = self.unreadable_world()
