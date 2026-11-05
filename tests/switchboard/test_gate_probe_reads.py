@@ -13,7 +13,7 @@ PROBE_LIMIT = 3.0   # the shim's limit, in seconds
 DELAY = 0.6         # what the fake hub takes for each read
 HEAD = "a" * 40
 
-FAKE_GH = """#!/usr/bin/env python3
+GH_SCRIPT = """#!/usr/bin/env python3
 import json, sys, time
 start = time.time()
 time.sleep(%(delay)r)
@@ -38,7 +38,7 @@ class TestGateProbeReads(unittest.TestCase):
         self.addCleanup(lambda: __import__("shutil").rmtree(str(self.tmp), ignore_errors=True))
         self.log = self.tmp / "reads.jsonl"
         gh = self.tmp / "gh"
-        gh.write_text(FAKE_GH % {"delay": DELAY, "head": HEAD, "log": str(self.log)})
+        gh.write_text(GH_SCRIPT % {"delay": DELAY, "head": HEAD, "log": str(self.log)})
         gh.chmod(0o755)
         self.cfg = self.tmp / "config"
         (self.cfg / "fleet-switchboard").mkdir(parents=True)
