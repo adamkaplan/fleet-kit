@@ -7,6 +7,7 @@ The families are derived from the code, never listed twice:
   * every failure kind of the shared login has a case (the kinds are read out of the source), and
   * the mode of the written file is checked with two mutants (a build that writes it without the owner-only mode fails).
 """
+import pathlib
 import base64
 import datetime
 import hashlib
@@ -867,14 +868,14 @@ class MintGuards(Refresh):
         script = self.marker_script()
         path = self.settings_file(0o660)   # a file others can write, holding no such value
         self.assertIsNotNone(cw.settings_file_problem(self.env))
-        self.assertNotIn("CW_CLUSTER_TOKEN_CMD", open(path).read())
+        self.assertNotIn("CW_CLUSTER_TOKEN_CMD", pathlib.Path(path).read_text())
         self.assertEqual(self.outcome(env=dict(self.env, CW_CLUSTER_TOKEN_CMD=script)), "ok")   # the value came from the process only: ignored
         self.assertFalse(os.path.exists(self.marker))
 
     def test_a_value_that_came_from_the_file_is_ignored_too_and_the_file_check_reads_that_file(self):
         script = self.marker_script()
         path = self.settings_file(0o600, "CW_CLUSTER_TOKEN_CMD=%s\n" % script)
-        self.assertIn(script, open(path).read())   # the value is in the file
+        self.assertIn(script, pathlib.Path(path).read_text())   # the value is in the file
         self.assertIsNone(cw.settings_file_problem(self.env))
         self.assertEqual(self.outcome(), "ok")
         self.assertFalse(os.path.exists(self.marker))

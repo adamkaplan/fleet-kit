@@ -18,6 +18,7 @@ a test fakes them. Python 3.9 standard library only; `pr_reading` (the shared pu
 """
 import fcntl
 import json
+import math
 import os
 import re
 import sys
@@ -579,6 +580,35 @@ def pass_and_merge(reading, gh, conf, state, repo, number, holder, pid, clock, s
         release(state, repo, before["branch"], holder)   # the shim frees it too; both are harmless
     if code != 0:
         said = (err or out or "").strip().splitlines()
-        return done(10 if code == 10 else 1, "merge-gate --pass --merge: the merge was refused or failed (exit %d), the lock is released: %s" % (code, (said[0] if said else "no message")[:300]),
-                    "refused: merge exit %d" % code)
+        audit["merge_exit"] = code
+        audit["merge_said"] = (said[0] if said else "no message")[:300]
+        if code == 10:
+            return done(10, "merge-gate --pass --merge: the merge was refused or failed (exit %d), the lock is released: %s" % (code, (said[0] if said else "no message")[:300]),
+                        "refused: merge exit %d" % code)
+        try:
+            mcode, mout, _ = gh(["pr", "view", str(number), "-R", repo, "--json", "state,headRefOid,mergeCommit"])
+        except Exception:
+            mcode, mout = 1, ""
+        try:
+            mdata = json.loads(mout) if mcode == 0 else None
+        except (TypeError, ValueError):
+            mdata = None
+        if isinstance(mdata, dict) and not isinstance(mdata.get("state"), str):
+            mdata = None
+        seen = "could not be read"
+        if isinstance(mdata, dict):
+            seen = "%s at head %s" % (mdata.get("state"), str(mdata.get("headRefOid"))[:8]) if mdata.get("headRefOid") else "%s (no head given)" % mdata.get("state")
+            if mdata.get("state") == "MERGED" and mdata.get("headRefOid") == head:
+                audit["merge_state"] = seen
+                return done(0, "merged %s at head %s (squash); gh exited %d: %s" % (ref, head[:8], code, audit["merge_said"]), "merged")
+        audit["merge_state"] = seen
+        try:
+            now = clock()
+            if not isinstance(now, (int, float)) or isinstance(now, bool) or not math.isfinite(now) or now < 0:
+                raise ValueError("clock")
+            stamp = time.strftime("%H:%M:%SZ", time.gmtime(now))
+        except Exception:
+            stamp = "an unknown time"
+        return done(1, "merge-gate --pass --merge: refused or failed (exit %d), the pull request state is unknown at %s (%s): read the pull request: %s" % (
+            code, stamp, seen, audit["merge_said"]), "refused: merge exit %d" % code)
     return done(0, "merged %s at head %s (squash, --match-head-commit)" % (ref, head[:8]), "merged")
