@@ -763,8 +763,12 @@ def sweep_findings(engine, state, decisions, home, now, cfg, regex, defer=(), de
         pass   # an unreadable registry raises nothing: the lookup itself says "unknown"
     spool = getattr(engine, "gate_spool", None)   # S11 (#2216): one finding per repository per hour whose gate fail-opens (read from the shim's spool) exceed the rate
     for repo, (count, reason) in (spool.busy(now, cfg.get("failopen_per_hour", SWEEP_DEFAULTS["failopen_per_hour"])) if spool is not None else {}).items():
-        found.add(("S11", "%s@%d" % (repo, int(now // 3600))))
-        state.details[("S11", "%s@%d" % (repo, int(now // 3600)))] = "%d gate fail-opens of %s in the last hour; commonest reason: %s" % (count, repo, reason)
+        last = spool.__dict__.setdefault("last_raise", {})   # the time of the last raise per repository: a burst busy across an hour boundary is still one finding per hour
+        if now - last.get(repo, -1e18) < 3600:
+            continue
+        last[repo] = now
+        found.add(("S11", repo))
+        state.details[("S11", repo)] = "%d gate fail-opens of %s in the last hour; commonest reason: %s" % (count, repo, reason)
     state.unattributed = unattributed
     return sorted(found)
 

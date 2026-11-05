@@ -86,6 +86,21 @@ class TestGateSpool(Base):
         self.clock[0] += 2 * 3600
         self.assertEqual(self.find()[0], [], "a quiet hour (the burst is older than an hour) raises none")
 
+    def test_s11_a_repository_busy_across_an_hour_boundary_raises_one_finding(self):
+        self.clock[0] = 3600 * 500000 + 3000.0   # 50 minutes into an hour
+        self.write(*[self.fail_open(BUSY, i) for i in range(25)])
+        self.reader()
+        first = self.find()[0]
+        self.clock[0] += 1200   # 10:50 -> 11:10: a new clock hour, still inside the sliding hour
+        self.write(*[self.fail_open(BUSY, 100 + i) for i in range(25)])
+        self.reader()
+        second = self.find()[0]
+        self.assertEqual(len(first) + len(second), 1, (first, second))
+        self.clock[0] += 3600   # an hour after the raise, still busy: raised again
+        self.write(*[self.fail_open(BUSY, 200 + i) for i in range(25)])
+        self.reader()
+        self.assertEqual(len(self.find()[0]), 1)
+
     def test_s3_the_rate_is_a_setting_with_a_stated_default(self):
         self.assertEqual(sb.SWEEP_DEFAULTS["failopen_per_hour"], 20)
         for bad in (0, -1, True, "5"):
