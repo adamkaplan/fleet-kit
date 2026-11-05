@@ -2941,6 +2941,17 @@ def hold_probe(args, lookup, gh, write):
         return (RETRY_HOLD if write else None), None, None
 
 
+def api_write_endpoint(module, args):
+    """The reduced endpoint of a `gh api` write for its audit line (allow-listed words only, numbers as '#'; no body, no query, no host), else None."""
+    try:
+        if command_words(args)[:1] != ["api"]:
+            return None
+        found = module.parse_api(args)[0]
+        return reduce_endpoint("api " + found[0]) if found else "api"
+    except Exception:
+        return None
+
+
 def audit_write(args, lookup, outcome, write, repo=None, number=None):
     """One audit line for a gh write (never a command line); best effort, never changes the command."""
     try:
@@ -2948,7 +2959,7 @@ def audit_write(args, lookup, outcome, write, repo=None, number=None):
             return
         module = load_hold()
         if module is not None:
-            module.write_audit(args, my_name(lookup), outcome, repo, number)
+            module.write_audit(args, my_name(lookup), outcome, repo, number, api_write_endpoint(module, args))
     except Exception:
         pass
 
