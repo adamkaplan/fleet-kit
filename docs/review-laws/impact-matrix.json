@@ -673,6 +673,8 @@
           "decide",
           "delayed_since",
           "describe_items",
+          "finding_part",
+          "finding_parts",
           "hold_reason",
           "in_late_scope",
           "is_withdrawal",
@@ -716,15 +718,15 @@
         "bin/switchboard/profile_pieces.py": [
           "InstallError"
         ],
-        "bin/switchboard/scratch_dir.py": [
-          "ScratchBoundFacts",
-          "scratch_bytes"
-        ],
         "bin/switchboard/installer.py": [
           "reaper_only_conflict"
         ],
         "bin/switchboard/stage_event.py": [
           "stage_check_config"
+        ],
+        "bin/switchboard/scratch_dir.py": [
+          "ScratchBoundFacts",
+          "scratch_bytes"
         ]
       },
       "registrar_allow": {

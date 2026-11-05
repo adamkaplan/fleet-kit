@@ -179,7 +179,7 @@ Kinds (the number is exact, except `size`, a ceiling with headroom: see rule 7):
 | `switchboard/answer_delivery.py` | `fleet-switchboard` | entry-import | 5 | the part relies on a standard-library module the entry imported; it gets its own import line |
 | `switchboard/answer_delivery.py` | `fleet-switchboard` | namespace | 33 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 | `switchboard/audit.py` | `fleet-switchboard` | entry-import | 12 | the part relies on a standard-library module the entry imported; it gets its own import line |
-| `switchboard/audit.py` | `fleet-switchboard` | namespace | 2 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
+| `switchboard/audit.py` | `fleet-switchboard` | namespace | 3 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports; the third is `refuse_real_location`, the test-run guard of the audit path, which stays in the entry beside the state and config guards it shares its locations with |
 | `switchboard/bootstrap.py` | `fleet-switchboard` | entry-import | 4 | the part relies on a standard-library module the entry imported; it gets its own import line |
 | `switchboard/bootstrap.py` | `fleet-switchboard` | namespace | 15 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 | `switchboard/caches.py` | `fleet-switchboard` | entry-import | 3 | the part relies on a standard-library module the entry imported; it gets its own import line |
