@@ -10,6 +10,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -83,6 +84,15 @@ ENDED_TOKEN_RE = re.compile(r"Authentication failed|Invalid username or token|Ba
 
 class TokenEnded(RuntimeError):
     """A git call refused because the token had ended: the one case in which the hook signals a refresh (see main)."""
+
+
+def head_branch(contained):
+    """The first branch of `git branch -r --contains` with its origin/ prefix off: at most 100 characters of [A-Za-z0-9._/-], else `unknown`."""
+    lines = [x.strip() for x in (contained or "").splitlines() if x.strip()]
+    lines = [x for x in lines if "->" not in x and x != "origin/HEAD"]
+    name = lines[0].split(" ")[0] if lines else ""
+    name = name[len("origin/"):] if name.startswith("origin/") else name
+    return name if name and len(name) <= 100 and re.fullmatch(r"[A-Za-z0-9._/-]+", name) else "unknown"
 
 
 def git(workdir, *args, check=True, ctx=None, opts=True):
@@ -180,8 +190,75 @@ def refresh_refs(workdir, remote, ctx):
         return False
     return p.returncode == 0
 
+NO_REPOSITORY_NOTE = "no repository in the pod; nothing to push"
+
+
+def probe_path(path):
+    """'absent' only when lstat of the path, or of a parent on the way, says FileNotFoundError or NotADirectoryError; 'dir' for a real
+    directory. Any other OSError (permission, loop, name too long) propagates; a link at the path, a dangling link on the way, or a
+    non-directory at the path raises RuntimeError. Never the os.path helpers: they turn an error into "not found"."""
+    path = os.path.abspath(path)
+    parts = [p for p in path.split(os.sep) if p]
+    cur = os.sep
+    for i, part in enumerate(parts):
+        cur = os.path.join(cur, part)
+        try:
+            st = os.lstat(cur)
+        except (FileNotFoundError, NotADirectoryError):
+            return "absent"
+        if stat.S_ISLNK(st.st_mode):
+            if i == len(parts) - 1:
+                raise RuntimeError("%s is a link, not a directory" % path)
+            try:
+                os.stat(cur)
+            except (FileNotFoundError, NotADirectoryError):
+                raise RuntimeError("%s is a dangling link" % cur)
+        elif i == len(parts) - 1 and not stat.S_ISDIR(st.st_mode):
+            raise RuntimeError("%s is not a directory" % path)
+    return "dir"
+
+
+def has_marker(directory):
+    """True when directory holds a .git entry (file or directory); False only when lstat says it is absent; other errors propagate."""
+    try:
+        os.lstat(os.path.join(directory, ".git"))
+        return True
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+
+
+def first_entry(directory):
+    """True when the directory holds any entry at all (a listing error propagates)."""
+    with os.scandir(directory) as it:
+        for _ in it:
+            return True
+    return False
+
+
+def no_checkout(workdir):
+    """True only when the repository directory is absent or empty AND the workspace is absent or empty. Any entry in the
+    workspace, or a directory the hook cannot read, raises (the hook exits 1, the pod is kept)."""
+    state = probe_path(workdir)
+    if state == "dir":
+        if has_marker(workdir):
+            return False
+        if first_entry(workdir):
+            raise RuntimeError("%s holds files but no .git: not deleting the pod" % workdir)
+        return True
+    workspace = os.path.dirname(os.path.abspath(workdir))
+    if probe_path(workspace) == "absent":
+        return True
+    if first_entry(workspace):
+        raise RuntimeError("no repository at %s but the workspace %s is not empty: not deleting the pod" % (workdir, workspace))
+    return True
+
 
 def run(workdir, worker, prestop=False, repo=None, ctx=None):
+    # Three answers: no checkout at all (see no_checkout: nothing was cloned, nothing can be lost; this answer carries
+    # no_repository), a checkout whose push fails (RuntimeError from git: the caller prints `error`, exit 1), and
+    # nothing unpushed or pushed (as before). A state the hook cannot read is an error, never "no repository".
+    if no_checkout(workdir):
+        return {"pushed": False, "wip_branch": None, "skipped": [], "no_repository": True, "note": NO_REPOSITORY_NOTE}
     url = HOST_URL + "%s.git" % repo if prestop else None
     status = git(workdir, "status", "--porcelain", "-z", "--untracked-files=all", ctx=ctx).stdout
     paths = [e[3:] for e in status.split("\0") if len(e) > 3]
@@ -206,7 +283,7 @@ def run(workdir, worker, prestop=False, repo=None, ctx=None):
             git(workdir, "fetch", "--prune", "origin")
     contained = git(workdir, "branch", "-r", "--contains", "HEAD", ctx=ctx).stdout.strip()
     if contained:
-        return {"pushed": False, "wip_branch": None, "skipped": skipped}
+        return {"pushed": False, "wip_branch": None, "skipped": skipped, "head_on": head_branch(contained)}
     branch = "%s/wip" % worker
     # prestop: a plain push to the explicit URL, never forced and no lease: a non-fast-forward answer is a failure, not an overwrite
     if prestop:
@@ -214,6 +291,80 @@ def run(workdir, worker, prestop=False, repo=None, ctx=None):
     else:
         git(workdir, "push", "--force-with-lease", "origin", "HEAD:refs/heads/" + branch)
     return {"pushed": True, "wip_branch": branch, "skipped": skipped}
+
+
+# ---- the end-hook ask: a finished pod's pull request is marked ready (and the repository's review comment posted once) when the pod ends ----
+GH_TIMEOUT = 30
+
+
+class GhHub:
+    """The pull request calls through the pod's `gh` client. Each raises RuntimeError on any failure."""
+    def _gh(self, *args):
+        try:
+            r = subprocess.run(["gh", *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=GH_TIMEOUT)
+        except (OSError, subprocess.SubprocessError) as e:
+            raise RuntimeError(type(e).__name__)
+        if r.returncode != 0:
+            raise RuntimeError("gh exit %d" % r.returncode)
+        return r.stdout
+
+    def find(self, branch):
+        """The open pull request of the branch as {number, isDraft, headRefOid}, or None."""
+        found = json.loads(self._gh("pr", "list", "--head", branch, "--state", "open", "--json", "number,isDraft,headRefOid") or "[]")
+        if not found:
+            return None
+        row = found[0]   # the pod's cw-gh prints the raw REST row (draft, head.sha); the gh field form (isDraft, headRefOid) is read too
+        head = row.get("head")
+        return {"number": row.get("number"),
+                "isDraft": row["isDraft"] if "isDraft" in row else row.get("draft"),
+                "headRefOid": row["headRefOid"] if "headRefOid" in row else (head.get("sha") if isinstance(head, dict) else None)}
+
+    def ready(self, number):
+        self._gh("pr", "ready", str(number))
+
+    def comment(self, number, text):
+        self._gh("pr", "comment", str(number), "--body", text)
+
+
+def pr_note(workdir, res, hub=None, comment=None):
+    """One line for the end notice: `PR #N marked ready, review requested` or `PR not marked ready: <reason>`. Never raises."""
+    try:
+        if res.get("no_repository"):
+            return "PR not marked ready: no repository"
+        if res.get("pushed"):
+            return "PR not marked ready: unpushed work was left"
+        ctx = Ctx("/nonexistent")
+        try:
+            branch = git(workdir, "rev-parse", "--abbrev-ref", "HEAD", ctx=ctx).stdout.strip()
+            sha = git(workdir, "rev-parse", "HEAD", ctx=ctx).stdout.strip()
+        finally:
+            ctx.close()
+        if not branch or branch == "HEAD":
+            return "PR not marked ready: no branch"
+        hub = hub or GhHub()
+        pr = hub.find(branch)
+        if not pr:
+            return "PR not marked ready: no pull request"
+        number = pr.get("number")
+        if not pr.get("isDraft"):
+            return "PR not marked ready: #%s is not a draft" % number
+        if pr.get("headRefOid") != sha:
+            return "PR not marked ready: head is not the pushed commit"
+        hub.ready(number)
+        if comment is None:
+            comment = os.environ.get("CW_REVIEW_COMMENT", "")
+        if comment:
+            hub.comment(number, comment)
+            return "PR #%s marked ready, review requested" % number
+        return "PR #%s marked ready, no review comment is configured" % number
+    except Exception as e:
+        return "PR not marked ready: the call failed (%s)" % type(e).__name__
+
+
+def with_pr(workdir, res, hub=None, comment=None):
+    """The hook's answer with `pr_note` added."""
+    res["pr_note"] = pr_note(workdir, res, hub, comment)
+    return res
 
 
 MAX_NAMES = 50
@@ -275,9 +426,13 @@ def prestop_main():
     workdir, worker = os.environ.get("CW_WORKDIR", "/work/repo"), os.environ.get("CW_WORKER", "")
     if not valid_worker(worker):
         return report(workdir, "the worker name is not valid", names=False)
-    if not os.path.exists(os.path.join(workdir, ".git")):
+    try:
+        gst = os.lstat(os.path.join(workdir, ".git"))
+    except (FileNotFoundError, NotADirectoryError):
         return report(workdir, "there is no git repository here", names=False)
-    if not os.path.isdir(os.path.join(workdir, ".git")):
+    except OSError as e:
+        return report(workdir, "cannot read %s/.git: %s" % (workdir, type(e).__name__), names=False)
+    if not stat.S_ISDIR(gst.st_mode):
         return report(workdir, ".git is a file: a linked worktree or a separate git directory is not supported", names=False)
     repo = os.environ.get("CW_REPO", "")
     if not REPO_RE.match(repo) or ".." in repo:
@@ -317,7 +472,7 @@ def main():
         print(json.dumps({"pushed": False, "wip_branch": None, "error": "CW_WORKER is not set"}))
         return 1
     try:
-        print(json.dumps(run(workdir, worker)))
+        print(json.dumps(with_pr(workdir, run(workdir, worker))))
         return 0
     except TokenEnded as e:
         # ONE word to the stop side: ask for a fresh token and run me once more. The hook holds no credential for the minter and asks no one itself.

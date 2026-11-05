@@ -115,7 +115,7 @@ def suite(name, out="", timeout=None):
 OLD_JOB = [("bin/check-public-names", "python3 bin/check-public-names", None),
            suite("bin/test-heartbeat"), suite("bin/test-health-records"), suite("bin/test-fleet-doctor"),
            suite("bin/test-fleet-doctor-config"), suite("bin/test-fleet-doctor-heartbeat"), suite("bin/test-switchboard"),
-           suite("bin/test-workflow-split"), suite("bin/test-gh-hold", "-hold"), suite("bin/test-app-mint", "-app"),
+           suite("bin/test-workflow-split"), suite("bin/test-path-suites", "-paths", "15"), suite("bin/test-gh-hold", "-hold"), suite("bin/test-app-mint", "-app"),
            suite("bin/test-cloud-neutral-names"), suite("cloud/tests/test-cloud", "", "10"),
            ("bin/fleet-scenario validate", "bin/fleet-scenario validate", None),
            ("bin/fleet-scenario coverage", "bin/fleet-scenario coverage --enforce --through-pr 4", None)]
@@ -128,8 +128,8 @@ LAUNCHER_TIMEOUT = "20"   # the cloud launcher step's timeout-minutes; the one p
 NEW_JOB = [suite("bin/test-cloud-worker"), suite("bin/test-cloud-launcher", "", LAUNCHER_TIMEOUT)] + [suite(n, "", t) for n, t in ADDED + RELAY]
 MOVED = [n for n, _, _ in NEW_JOB]
 OLD_CHECKS = ["test (ubuntu-latest)", "test (macos-latest)"]
-CONCURRENCY = {"group": "test-${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}",
-               "cancel-in-progress": "${{ github.event_name == 'pull_request' }}"}
+CONCURRENCY = {"group": "test-${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}${{ github.event.action == 'reopened' && '-reopened' || '' }}",
+               "cancel-in-progress": "${{ github.event_name == 'pull_request' && github.event.action != 'reopened' }}"}
 TRIGGERS = ["pull_request", "push", "schedule", "workflow_dispatch"]
 MATRIX = ["ubuntu-latest", "macos-latest"]
 
@@ -170,14 +170,17 @@ def plain(name, run):
 TEST_STEPS = [CHECKOUT, PYTHON,
               {"name": "bin/check-public-names", "env": {"FLEET_PRIVATE_NAMES": "${{ secrets.PRIVATE_NAMES }}"}, "run": "python3 bin/check-public-names"},
               step("bin/test-heartbeat", always=False), step("bin/test-health-records"), step("bin/test-fleet-doctor"),
-              step("bin/test-fleet-doctor-config"), step("bin/test-fleet-doctor-heartbeat"), step("bin/test-switchboard"),
-              step("bin/test-workflow-split"), step("bin/test-gh-hold", "-hold"), step("bin/test-app-mint", "-app"),
+              step("bin/test-fleet-doctor-config"), step("bin/test-fleet-doctor-heartbeat"),
+              # #2131: ubuntu runs the file in the `shards` job (not on the nightly); macOS and the nightly run it whole here.
+              step("bin/test-switchboard", always=False, **{"if": "${{ !cancelled() && (matrix.os != 'ubuntu-latest' || github.event_name == 'schedule') }}"}),
+              step("bin/test-workflow-split"), step("bin/test-path-suites", "-paths", **{"timeout-minutes": "15"}), step("bin/test-gh-hold", "-hold"), step("bin/test-app-mint", "-app"),
               {"name": "Size ceilings on the merge result", "if": "${{ github.event_name == 'pull_request' && github.base_ref == 'integration' && !cancelled() }}",
                "env": {"BASE": "${{ github.base_ref }}", "HEAD_SHA": "${{ github.event.pull_request.head.sha }}"},
                "run": "git fetch origin \"$BASE\"\npython3 bin/size_ceilings.py check --tip \"origin/$BASE\" --head \"$HEAD_SHA\""},
               step("bin/test-cloud-neutral-names"),
               step("cloud/tests/test-cloud", **{"timeout-minutes": "10", "env": {"CLOUD_TEST_SKIP_DOCKER": "1"}}),
               plain("node --test plugins/fleet-decisions-tui/health.test.mjs", "node --test plugins/fleet-decisions-tui/health.test.mjs"),
+              plain("node --test the other plugin tests", "node --test plugins/fleet-decisions-tui/click.test.mjs plugins/fleet-decisions-tui/kind.test.mjs plugins/fleet-hooks/index.test.mjs"),
               plain("bin/fleet-scenario validate", "bin/fleet-scenario validate"),
               plain("bin/fleet-scenario coverage", "bin/fleet-scenario coverage --enforce --through-pr 4")]
 CLOUD_STEPS = [CHECKOUT, PYTHON, step("bin/test-cloud-worker"), step("bin/test-cloud-launcher", **{"timeout-minutes": LAUNCHER_TIMEOUT})] + [
@@ -225,7 +228,7 @@ class Pins(unittest.TestCase):
 
     def test_s1_a_second_job_runs_the_cloud_suites_in_parallel_on_both_systems(self):
         jobs = self.jobs()
-        self.assertEqual(sorted(jobs), ["plan", "test", "test-cloud"])
+        self.assertLessEqual({"plan", "test", "test-cloud"}, set(jobs))   # extra jobs (#2131 `shards`) are checked by their own pin
         for jid in ("test", "test-cloud"):
             self.assertEqual(jobs[jid]["needs"], "plan", jid)   # both need only the plan: no needs between test and test-cloud
             self.assertEqual(jobs[jid]["strategy"], STRATEGY, jid)
@@ -278,9 +281,26 @@ class Pins(unittest.TestCase):
         self.assertEqual(sorted(self.wf["on"]), sorted(TRIGGERS))
         self.assertEqual(self.wf["on"]["push"], {"branches": ["main"]})
         for jid, job in self.jobs().items():
-            self.assertNotIn("if", job, jid)   # a skipped job would leave a required name unreported (ask #990)
+            if jid in ("plan", "test", "test-cloud"):
+                self.assertNotIn("if", job, jid)   # a skipped job would leave a required name unreported (ask #990)
+            else:
+                # #2131: a job with a fixed (non-matrix-os) name, like `shards`, may be skipped, on the nightly only
+                self.assertNotIn("matrix.name", job["name"], jid)
+                self.assertNotIn("matrix.cloud", job["name"], jid)
+                self.assertIn("schedule", job.get("if", ""), jid)
         image = [s for s in self.jobs()["test"]["steps"] if s.get("name") == "cloud/tests/test-cloud"]
         self.assertEqual([s.get("timeout-minutes") for s in image], ["10"])
+
+    def test_shards_cover_every_shard_of_the_switchboard_file_on_ubuntu(self):
+        job = self.jobs()["shards"]
+        self.assertEqual(job["needs"], "plan")
+        self.assertEqual(job["runs-on"], "ubuntu-latest")
+        shards = job["strategy"]["matrix"]["shard"]
+        self.assertEqual(shards, [str(i) for i in range(1, len(shards) + 1)])   # 1..N with no gap, whatever N is
+        runs = [s["run"] for s in job["steps"] if "bin/test-switchboard" in s.get("run", "")]
+        self.assertEqual(len(runs), 1)
+        self.assertIn("--shard ${{ matrix.shard }}/%d" % len(shards), runs[0])
+        self.assertIn("grep -qx 'RESULT: PASS'", runs[0])
 
 
     def test_shape_the_workflow_and_both_jobs_have_exactly_the_expected_keys_and_values(self):
@@ -289,7 +309,7 @@ class Pins(unittest.TestCase):
         self.assertEqual(self.wf["on"], ON)
         self.assertEqual(self.wf["permissions"], PERMISSIONS)
         self.assertEqual(self.wf["concurrency"], CONCURRENCY)
-        self.assertEqual(sorted(self.jobs()), ["plan", "test", "test-cloud"])
+        self.assertLessEqual({"plan", "test", "test-cloud"}, set(self.jobs()))
         self.assertEqual(sorted(self.jobs()["plan"]), ["defaults", "name", "outputs", "runs-on", "steps"])
         for jid in ("test", "test-cloud"):
             job = self.jobs()[jid]
@@ -399,10 +419,10 @@ class Mutants(unittest.TestCase):
             self.assertTrue(result.failures or result.errors, t)
 
     def test_s6_concurrency_group_changed(self):
-        self.fails("github.event.pull_request.number || github.sha }}", "github.sha }}", "test_s6_the_concurrency_block_is_the_current_one_and_no_job_has_its_own")
+        self.fails("github.event.pull_request.number || github.sha }}${{", "github.sha }}${{", "test_s6_the_concurrency_block_is_the_current_one_and_no_job_has_its_own")
 
     def test_s6_cancel_in_progress_always_true(self):
-        self.fails("${{ github.event_name == 'pull_request' }}", "true", "test_s6_the_concurrency_block_is_the_current_one_and_no_job_has_its_own")
+        self.fails("${{ github.event_name == 'pull_request' && github.event.action != 'reopened' }}", "true", "test_s6_the_concurrency_block_is_the_current_one_and_no_job_has_its_own")
 
     def test_s6_a_job_level_concurrency_block(self):
         self.fails("  test-cloud:\n", "  test-cloud:\n    concurrency:\n      group: x\n", "test_s6_the_concurrency_block_is_the_current_one_and_no_job_has_its_own")
@@ -499,7 +519,7 @@ class Mutants(unittest.TestCase):
         text = WORKFLOW.read_text()
         i = text.index("\n  test:\n")
         self.killed(text[:i] + text[i:].replace("    steps:\n", "    steps:\n      - run: echo x\n", 1), self.STEPS)
-        self.killed(mutate(text, "\n  # The cloud suites run beside", "\n      - run: echo x\n\n  # The cloud suites run beside"), self.STEPS)
+        self.killed(mutate(text, "\n  # bin/test-switchboard in 8 shards", "\n      - run: echo x\n\n  # bin/test-switchboard in 8 shards"), self.STEPS)
 
     def relay_step(self, name):
         return "      - name: %s\n        if: ${{ !cancelled() }}\n        timeout-minutes: 10\n        run: |\n          %s 2>&1 | tee \"$RUNNER_TEMP/out.txt\"\n          grep -qx 'RESULT: PASS' \"$RUNNER_TEMP/out.txt\"\n" % (name, name)

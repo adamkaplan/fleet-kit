@@ -1,0 +1,4 @@
+{
+ "command": "clear-head",
+ "help": "usage: fleet-switchboard clear-head [-h] --sha SHA pr positional arguments: pr The pull request: OWNER/REPO#N or its URL options: -h, --help show this help message and exit --sha SHA The full 40-hex sha that was read and cleared"
+}

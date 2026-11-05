@@ -59,12 +59,12 @@ run_to() {
   : >"$OUT"
   "$@" >"$OUT" 2>&1 &
   cmdpid=$!
-  ( sleep "$secs"; kill -9 "$cmdpid" 2>/dev/null ) >/dev/null 2>&1 &
-  watchpid=$!
+  # The watcher polls at one-second steps and ends by itself; the doctor never signals it, so
+  # it cannot run the inherited cleanup trap.
+  ( w=0; while [ "$w" -lt "$secs" ]; do sleep 1; kill -0 "$cmdpid" 2>/dev/null || exit 0; w=$((w+1)); done
+    kill -9 "$cmdpid" 2>/dev/null ) >/dev/null 2>&1 &
   wait "$cmdpid" 2>/dev/null
   rc=$?
-  kill "$watchpid" 2>/dev/null
-  wait "$watchpid" 2>/dev/null
   LAST_OUT=$(cat "$OUT" 2>/dev/null)
   return $rc
 }
@@ -535,6 +535,27 @@ print(("FAIL\t" + "; ".join(bad)) if bad else "ok\t%d forwarder repo(s), none do
   fi
 fi
 
+# =========================================================== 8d. a listed pane with no recorded session (#1884)
+# The daemon's own record of a streak (`status --json`, "undecidable"): the loop cannot decide it and never calls it dead. WARN-only; only reads.
+if [ -n "$sb_real" ] && [ -x "$sb_real" ]; then
+  run_to 40 "$sb_real" status --json
+  und=$(printf '%s' "$LAST_OUT" | python3 -c '
+import json,sys
+try:
+    d=json.loads(sys.stdin.read()).get("undecidable") or {}
+except Exception:
+    sys.exit(0)
+import unicodedata
+for n in sorted(d):
+    n_shown="".join("?" if unicodedata.category(c) in ("Cc","Zl","Zp") else c for c in str(n))
+    print("agent %s: listed pane with no recorded session, undecidable for %s passes: reattach or retire it" % (n_shown, d[n]))' 2>/dev/null)
+  if [ -n "$und" ]; then
+    while IFS= read -r und_line; do emit WARN agents "$und_line"; done <<EOF_UND
+$und
+EOF_UND
+  fi
+fi
+
 # =========================================================== 8e. the waiting-on-the-person sweep (#117)
 # The daemon's last sweep (counts by kind) from `fleet-switchboard status --json`. WARN-only.
 if [ -n "$sb_real" ] && [ -x "$sb_real" ]; then
@@ -615,16 +636,36 @@ for it in issues:
                 kv[k.strip()]=v.strip()
         if kv.get("status","").lower()!="active": continue
         pane=kv.get("pane","")
-        if not (re.match(r"^w[0-9A-Za-z]+:p[0-9A-Za-z]+$", pane) or re.match(r"^cloud:[A-Za-z0-9][A-Za-z0-9._-]{0,63}$", pane)): continue
+        if not (re.match(r"^w[0-9A-Za-z]+:p[0-9A-Za-z]+$", pane) or re.match(r"^cloud:[A-Za-z0-9][A-Za-z0-9._-]{0,63}$", pane) or re.match(r"^host:[A-Za-z0-9][A-Za-z0-9._-]{0,63}/[A-Za-z0-9][A-Za-z0-9._-]{0,63}$", pane)): continue
         print("%s\t%s" % (it.get("number"), pane))
     except Exception:
         continue' "$TMPDIR_FD/charters.json" >"$TMPDIR_FD/active.txt" 2>/dev/null
 
+    host_live=0; host_unknown=0; host_desc=""
     total=0; drift=0; drift_desc=""; cloud_total=0; cloud_live=0; cloud_unknown=0; cloud_desc=""
     while IFS="$(printf '\t')" read -r num pane; do
       [ -n "$pane" ] || continue
       total=$((total+1))
       case "$pane" in
+        host:*)   # #1984: a host charter is alive (on the host's list), dead (the host answered, the agent is absent) or unreachable (neither)
+          cloud_total=$((cloud_total+1))
+          hv="$(python3 - "$(dirname "$0")" "${pane#host:}" <<'PYEOF' 2>/dev/null
+import importlib.util, os, sys
+bin_dir, spec_text = sys.argv[1], sys.argv[2]
+try:
+    spec = importlib.util.spec_from_file_location("host_liveness", os.path.join(bin_dir, "host_liveness.py")); mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+    host, _, agent = spec_text.partition("/")
+    print(mod.check(host, agent)["verdict"])
+except Exception:
+    print("unreachable")
+PYEOF
+)"
+          case "$hv" in
+            alive) host_live=$((host_live+1)) ;;
+            dead) drift=$((drift+1)); drift_desc="$drift_desc #$num->$pane" ;;
+            *) host_unknown=$((host_unknown+1)); host_desc="$host_desc #$num->$pane" ;;
+          esac
+          continue ;;
         cloud:*)   # #1181: a cloud agent has no pane: live when its row's endpoint answers, unknown when not, never a dead pane
           cloud_total=$((cloud_total+1))
           cl="$(python3 - "$(dirname "$0")" "${pane#cloud:}" <<'PYEOF' 2>/dev/null
@@ -653,6 +694,8 @@ PYEOF
     done <"$TMPDIR_FD/active.txt"
 
     if [ "$cloud_live" != "0" ]; then emit ok charters "$cloud_live cloud charter(s) live (the endpoint answered)"; fi
+    if [ "$host_live" != "0" ]; then emit ok charters "$host_live host charter(s) live (the agent is on its host's list)"; fi
+    if [ "$host_unknown" != "0" ]; then emit WARN charters "$host_unknown host charter(s) unknown (the host could not be asked; neither alive nor dead):$host_desc"; fi
     if [ "$cloud_unknown" != "0" ]; then emit WARN charters "$cloud_unknown cloud charter(s) unknown (the endpoint did not answer; not a dead pane):$cloud_desc"; fi
     if [ "$total" = "0" ]; then
       emit WARN charters "no active charters found with label $L_ORCH"

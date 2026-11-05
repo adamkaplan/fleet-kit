@@ -38,6 +38,24 @@ To bump Node: update `NODE_VERSION` (a full 22.x.y release; the only place the v
 `NODE_SHA256_ARM64`) at the top of the Node block in `cloud/worker/Dockerfile`, keep the version equal to the product repository's `.node-version`, then rebuild and publish the image
 (an operator step) and record the previous digest as the rollback.
 
+### PostgreSQL 16 and two extensions in the image (ask #1353)
+
+**Cause.** The recorded case: measurement pods of a product repository spend about 20 of 60 minutes compiling PostgreSQL 16 and two extensions (vector, message queue) from source on every run. The image now carries them, built once.
+
+**What is built.** A separate build stage (`pgbuild`, with the compilers) builds PostgreSQL, the vector extension and the message-queue extension into `/opt/pg`; the `final` stage copies only that directory, root-owned. No compiler is in the final image. PostgreSQL has a version constant and a 64-hex sha256 constant at the top of the block in `cloud/worker/Dockerfile` (`PG_VERSION` / `PG_SHA256`: the project's release tarball, 16.x), checked with `sha256sum -c` BEFORE it is unpacked. Each extension is pinned to an immutable 40-hex git COMMIT, not a tag (a tag can be moved): `PGVECTOR_VERSION` / `PGVECTOR_COMMIT` and `PGMQ_VERSION` / `PGMQ_COMMIT`; the version is only the directory and label. The build clones the publisher's repository, checks out the commit and fails unless `git rev-parse HEAD` equals it, BEFORE any build step (`git` is in the `buildpack-deps` base). To bump PostgreSQL: edit `PG_VERSION` AND `PG_SHA256`. To bump an extension: edit its version AND its commit; find the commit with `git ls-remote https://github.com/pgvector/pgvector refs/tags/v<version>` (for an annotated tag, the commit is the `^{}` line), and confirm it twice (a second `ls-remote`, and the tag's page on GitHub). Then run `python3 cloud/worker/tests/test_dockerfile_postgres.py` and rebuild. The build-time secret scan also reads `/opt/pg`: the `scan` stage copies the built PostgreSQL tree in before it scans.
+
+Versions: PostgreSQL 16.15, vector 0.8.7, message queue (pgmq) 1.13.1. The server is built without readline, ICU, zlib and OpenSSL, so it needs no run-time library beyond the base. Size cost: measured by the operator at the first real build (before and after, and the pod start time). Not measured here for the image; the installed tree `/opt/pg` was 35 MB in a local arm64 build of the build stage (a developer measurement, not the operator's amd64 build).
+
+**Nothing starts at pod start.** The entrypoint is unchanged; no server runs and no port listens until a lane starts it. It runs only as the unprivileged `worker` user, with its data directory on the scratch volume (`/run/cw-tmp`), so the data ends with the pod. The one-line start (initdb, then pg_ctl on a local socket only):
+
+```sh
+/opt/pg/bin/initdb -D /run/cw-tmp/pgdata -U worker --locale=C.UTF-8 -E UTF8 && /opt/pg/bin/pg_ctl -D /run/cw-tmp/pgdata -o "-c listen_addresses= -c unix_socket_directories=/run/cw-tmp" -l /run/cw-tmp/pg.log start
+```
+
+Then `/opt/pg/bin/psql -h /run/cw-tmp -U worker -d postgres -c "create extension vector"` (and `pgmq`). The network policy, the guard and the permission files are unchanged.
+
+**Rollback.** Point the workers at the previous image digest (kept in the registry until the new image has run live).
+
 ## Per-run secrets in the image
 
 The launcher mounts per-run files read-only under `/run/cw` (`CW_RUN_DIR`). The entrypoint, which never prints a value:
@@ -204,8 +222,8 @@ cloud/launcher/run_task.py WORKER OWNER/NAME BRANCH BRIEF_FILE [--pull-secret NA
 ```
 
 The target repository is an argument and has no default. The driver reads the model entry (the one `github-copilot` entry of OpenCode's own
-credential store, read with `opencode auth export` in a scrubbed environment through a pipe, in memory; `CW_OPENCODE_BIN` names the program) and a git token (the output of `CW_GIT_TOKEN_CMD`;
-default `app_token.py OWNER/NAME` beside the driver, the one-hour GitHub App token) in memory, creates the pod through
+credential store, read with `opencode auth export` in a scrubbed environment through a pipe, in memory; `CW_OPENCODE_BIN` names the program) and a git token (the stdout of `CW_GIT_TOKEN_CMD`;
+default `app_token.py OWNER/NAME --fd N` beside the driver, which hands the one-hour GitHub App token over a pipe of its own, never standard output or standard error, and never prints it) in memory, creates the pod through
 the launcher with both handed over inherited pipes (`--run-secret-fd`), port-forwards, opens a session, sends the brief,
 waits for idle, then stops the worker (the end hook pushes the work; the pod and its Secrets are deleted).
 
@@ -283,6 +301,15 @@ Cause: in a cloud pod the full preflight of the pre-push command (`bin/cloud-pr-
 - A `bin/test-switchboard` selector is looked up by class and method name in the script and in the `tests/switchboard/test_cases_NN.py` files it imports its classes from, so it survives a move between them; a class found in none of them does not resolve, and the tests that check the quick list (`test_cloud_quick_guards.py`, `test_cloud_preflight_quick.py`, `test_cloud_quick_selector.py`) fail. The check is the tests', not a run-time one.
 - `CLOUD_PREPUSH_PREFLIGHT=full` asks `bin/cloud-prepush` for the full mode; `quick` (the default) is printed as `preflight mode: quick`; any other value is refused with exit 2. Continuous integration stays the full check.
 <!-- preflight-modes:end -->
+
+### The background run (ask #1616)
+
+Cause: the foreground command bounds each test file at 120 seconds and the whole run at 1500 seconds, and nothing of it survives the end of its starting command; on a pod the slow files of the full check run longer than that and are reported as "could not run", so no pod reported a full-suite result.
+
+- Start: `CLOUD_PREPUSH_PREFLIGHT=full bin/cloud-prepush --background <base>` starts the same run (same selection, same preflight, same base comparison) detached (its own session, no stdin, output in `run.log`), prints the result file's path and the log's path, and exits 0 at once. The run has its own default bounds, 300 seconds per file and 7200 seconds in all; `CLOUD_PREPUSH_TIMEOUT` and `CLOUD_PREPUSH_TOTAL` override them. `CLOUD_PREPUSH_RESULT` names the result directory (default a fresh private directory under the temporary directory); `result.json` and `run.log` survive the end of the run.
+- Result file: one JSON document, replaced atomically at the start and after every file: `version`, `started`, `finished` (null while running), `status` (`running` or `finished`), `selection`, and per file the `branch` and `base` result (`pass`, `fail`, `could not run`, `running`, `not started`) with seconds.
+- Read: `bin/cloud-prepush --read FILE` (the result file or its directory) prints the lines the foreground run prints, plus a `RUNNING <file> (branch|base)` line for a file in progress and `cloud-prepush: still running: N of M files done`. Exit 0: finished, no difference; 1: finished with a difference or a file that could not run; 4: still running (never 0: a file not yet run is `not started`, never passed); 2: the file is missing or unreadable.
+- Polling: a background process does not count as activity for the idle limit (only a busy session does), so a builder that starts the run and ends its turn is stopped as idle. A builder keeps polling with short foreground calls, one command at a time: `sleep 60; bin/cloud-prepush --read DIR`, until the exit status is not 4. A launch of a builder that will run the full check asks for an idle limit above the longest poll.
 
 It needs git and python3 only, makes no network call and writes nothing outside its temporary directory. It is advice, never the gate: continuous integration stays the gate and its result is the only evidence. Tests: `cloud/worker/tests/test_cloud_prepush.py` and `cloud/worker/tests/test_cloud_prepush_preflight.py`.
 
@@ -564,3 +591,5 @@ minutes) belongs to the launcher.
 - The fixer image is pinned by tag, not digest: pin it for a release (the OpenCode binary is already pinned with its sha256).
 - `cloud/tests/test-cloud` is not yet run by CI (this change is limited to `cloud/`); it needs Docker for the image cases
   (`CLOUD_TEST_SKIP_DOCKER=1` skips them explicitly).
+
+**The reaper pass line and the renewal tick line (#1742).** The reaper writes one `reaper pass line` for each pass and one `renewal tick line` for each tick of its renewal thread, on its own log (standard error), not in the audit. Each line holds its numbers: `cpu_seconds`, the CPU seconds of the thread that ran the pass or the tick, and `audit_lines_parsed`, the audit lines read and parsed in it for the renewal's failure lookup; the pass line holds those two numbers and the seconds and counts of the seven steps of the pass (`list`, `renew`, `vanished`, `activity`, `stops`, `orphans` and `notes`, with the number of pods for `activity` and `stops`, and the `total`), and nothing else. They are counts only: no pod name, no worker name, no address, no value. To see whether the reaper spends CPU between passes, read the renewal tick lines: a tick with a high `cpu_seconds` or a high `audit_lines_parsed` is where the CPU went; a tail is read once per tick, so `audit_lines_parsed` is at most the lines of the audit tail (about 262,144 bytes). The step with the most seconds in the pass line is where a slow pass spent its time.
