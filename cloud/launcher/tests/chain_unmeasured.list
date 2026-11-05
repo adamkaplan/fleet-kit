@@ -1,3 +1,4 @@
+cloud/launcher/tests/test_cloud_inspect.py
 cloud/launcher/tests/test_cloud_model_served.py
 cloud/launcher/tests/test_cloud_quick_budget.py
 cloud/launcher/tests/test_create_says_why.py

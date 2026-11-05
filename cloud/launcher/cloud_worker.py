@@ -3659,6 +3659,71 @@ class Launcher:
             raise CloudError("unknown worker %s" % a.worker, EXIT_USAGE)
         return [self.record(p) for p in pods]
 
+    # -- inspect: ONE read-only look inside a running pod (slice 2 of ask #2115) --
+    def inspect(self, a):
+        """What the pod is doing NOW, read-only: ONE `kubectl exec` of the pod's `cw-pod-inspect` (one JSON line). A pod whose image has no such command
+        (or whose answer is not that line) is read by the fallback: git in /work/repo and `cw-worker-activity` through exec; every other field is listed in
+        `missing`. EVERY text is scrubbed here (Kube.scrub) before it is returned: nothing the pod printed leaves raw."""
+        if not NAME_RE.match(a.worker or ""):
+            raise CloudError("bad worker name %r" % a.worker, EXIT_USAGE)
+        name = pod_name(a.worker)
+        if not self.kube.get_pod(name):
+            raise CloudError("unknown worker %s" % a.worker, EXIT_USAGE)
+        try:
+            raw, source = json.loads(self.kube.exec(name, "cw-pod-inspect")), "cw-pod-inspect"
+            if not isinstance(raw, dict):
+                raise ValueError("not an object")
+        except (CloudError, ValueError):
+            raw, source = self._inspect_fallback(name), "fallback"
+        return self._inspect_clean(a.worker, raw, source)
+
+    def _inspect_fallback(self, name):
+        """The reads that need no helper in the image: git through exec for the branch, the unpushed commits and the dirty tree; the activity
+        tool for the idle seconds. What it cannot read is named in `missing`."""
+        def git(*args):
+            try:
+                return self.kube.exec(name, "git", "-C", "/work/repo", *args)
+            except CloudError:
+                return None
+        raw, missing = {}, []
+        branch = git("rev-parse", "--abbrev-ref", "HEAD")
+        raw["branch"] = branch.strip() if branch is not None and branch.strip() else None
+        shas = git("rev-list", "--max-count=50", "HEAD", "--not", "--remotes")
+        raw["unpushed"] = {"count": len(shas.split()), "shas": shas.split()[:10]} if shas is not None else None
+        dirty = git("status", "--porcelain")
+        raw["dirty"] = len([x for x in dirty.splitlines() if x.strip()]) if dirty is not None else None
+        act = self.activity(name)
+        raw["idle_seconds"] = (max(0, int((self.clock() - act[1]).total_seconds())) if act and not act[0] and act[1] else None)
+        raw["in_flight"], raw["last_calls"], raw["last_text"], raw["last_push"] = None, [], "", None
+        raw["missing"] = ["in_flight", "last_calls", "last_text", "last_push"] + [k for k in ("idle_seconds", "branch", "unpushed", "dirty") if raw.get(k) is None]
+        return raw
+
+    def _inspect_clean(self, worker, raw, source):
+        """The ONE shape that is printed. Every text is cut and scrubbed; a number is an int or None; a sha is hex or dropped."""
+        scrub_ = self.kube.scrub
+
+        def num(v):
+            return int(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+        def text(v, limit):
+            return scrub_(v, limit) if isinstance(v, str) else None
+        flight = raw.get("in_flight") if isinstance(raw.get("in_flight"), dict) else None
+        flight = {"tool": text(flight.get("tool"), 80) or "?", "seconds": num(flight.get("seconds"))} if flight else None
+        calls = [{"tool": text(c.get("tool"), 80) or "?", "status": text(c.get("status"), 40) or "?", "seconds_ago": num(c.get("seconds_ago"))}
+                 for c in (raw.get("last_calls") if isinstance(raw.get("last_calls"), list) else [])[:10] if isinstance(c, dict)]
+        un = raw.get("unpushed") if isinstance(raw.get("unpushed"), dict) else None
+        if un is not None:
+            shas = [s[:12] for s in (un.get("shas") if isinstance(un.get("shas"), list) else []) if isinstance(s, str) and re.fullmatch(r"[0-9a-f]{7,40}", s)][:10]
+            un = {"count": num(un.get("count")) or 0, "shas": shas}
+        bad = [c for c in calls if c["status"].lower() in ("error", "failed", "failure", "timeout", "aborted")]
+        last_error = "%s %s %ss ago" % (bad[0]["tool"], bad[0]["status"], bad[0]["seconds_ago"]) if bad else None
+        missing = [text(m, 40) for m in (raw.get("missing") if isinstance(raw.get("missing"), list) else []) if isinstance(m, str)][:20]
+        if source == "fallback" or last_error is None and "last_calls" in missing:
+            missing = missing + (["last_error"] if "last_error" not in missing else [])
+        return {"worker": worker, "source": source, "in_flight": flight, "last_calls": calls, "last_text": text(raw.get("last_text"), 300) or "",
+                "idle_seconds": num(raw.get("idle_seconds")), "branch": text(raw.get("branch"), 200), "unpushed": un, "dirty": num(raw.get("dirty")),
+                "last_push": text(raw.get("last_push"), 100), "last_error": last_error, "missing": missing}
+
     def snapshot(self, a):
         """ONE read-only look at the cluster: the pods of the namespace (name, worker, phase, node, hard deadline) and, when the login may
         LIST the nodes, the nodes themselves (pool, size, creation time). The node list is optional: a login without `list` on nodes still
@@ -4738,6 +4803,7 @@ def build_parser():
     d.add_argument("--force", action="store_true")
     d.add_argument("--reason", default="")
     cmd("status")
+    cmd("inspect")   # ONE read-only look inside a running pod: the call in flight, the recent calls, git, the last push
     cmd("snapshot", worker=False)   # ONE read-only look at the cluster: the pods of the namespace and, when the login may list them, the nodes
     cmd("capacity", worker=False)   # ONE read-only look at room: the nodes' allocatable, the pods' requests, the Pending count, the last FailedScheduling line
     cmd("report")

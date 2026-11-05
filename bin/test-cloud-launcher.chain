@@ -9,6 +9,7 @@ cloud/launcher/tests/test_cloud_docs_wording.py
 cloud/launcher/tests/test_cloud_end_alert.py
 cloud/launcher/tests/test_cloud_hub_manifest.py
 cloud/launcher/tests/test_cloud_hub_network.py
+cloud/launcher/tests/test_cloud_inspect.py
 cloud/launcher/tests/test_cloud_k1.py
 cloud/launcher/tests/test_cloud_model_served.py
 cloud/launcher/tests/test_cloud_pod_replaced.py
@@ -105,6 +106,7 @@ cloud/worker/tests/test_entrypoint_question.py
 cloud/worker/tests/test_guard_table.py
 cloud/worker/tests/test_identity_image.py
 cloud/worker/tests/test_plan_check_in_pod.py
+cloud/worker/tests/test_pod_inspect.py
 cloud/worker/tests/test_pr_edit.py
 cloud/worker/tests/test_pr_edit_hardening.py
 cloud/worker/tests/test_push_rules.py
