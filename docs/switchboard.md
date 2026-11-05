@@ -2916,6 +2916,8 @@ at 60` (also `in 20m, overdue 45m`; a bare overdue number takes the checkpoint's
 line that cannot be read, or a time more than 30 days out (or a number over 6 digits), makes no reminder and adds one line to the launch's stderr; it is never an error. A launch
 with no brief and no flag is silent. Each route says at once how long from now each reminder is and at what clock time, built from the stored time and the clock it used as now (`launch --checkpoint`, the brief's CHECKPOINT line and `remind` use the same words): `in 15 min, at 2030-01-02T15:05:05Z`, or `<length> ago, at <time>` for a time already past, with the length exact to the second. `launch` prints it as `checkpoint reminders (now <time>): worker reminder <line>; overdue reminder <line>` and `remind` as `reminder for <name> <line> (now <time>)`.
 
+A cloud launch arms them too (#1790): from the CHECKPOINT line or the flags as above, and with no line and no flag, or a line that cannot be read, the default 25m/40m (the worker's reminder at 25 minutes, the launching lane's overdue wake at 40), with one line on stderr saying which default; a failed arming prints one line and never fails the launch. A local launch is as described above.
+
 A reminder may carry an optional `condition`, checked only once it is due: `{"unless_report_from": <worker>, "since":
 <launch time>}` and `{"while_running": <worker>}`. The check is one read of the boss's transcript and inbox (what the
 decisions list already reads for reports; `synthetic_lines`) plus the rider file, and none at all for a reminder with no
