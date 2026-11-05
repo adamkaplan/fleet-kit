@@ -66978,6 +66978,7 @@ _olc = importlib.import_module("test_open_list_ceiling"); TestOpenListCeiling, T
 TestOpenListPassCalls = importlib.import_module("test_open_list_pass_calls").build(TestASlowCatchUpDoesNotFreezeThePass)   # #1886 Eighth (3)
 _olcuts = importlib.import_module("test_open_list_cuts"); TestOpenListCuts, TestOpenListPagesRead, TestOpenListDerivedText, TestOpenListCutsMutants, TestOpenListWholeReads, TestOpenListCutsWired = _olcuts.TestOpenListCuts, _olcuts.TestOpenListPagesRead, _olcuts.TestOpenListDerivedText, _olcuts.TestOpenListCutsMutants, _olcuts.TestOpenListWholeReads, _olcuts.TestOpenListCutsWired
 _cc = importlib.import_module("test_comment_cursor"); TestCommentCursor, TestOverlapListWhole, TestCommentCursorMutants = _cc.TestCommentCursor, _cc.TestOverlapListWhole, _cc.TestCommentCursorMutants   # #1889
+TestCommentWindowGapFill = _cc.TestCommentWindowGapFill   # #2192: a comment window is read to its start by time
 _rpstrict = importlib.import_module("test_read_pages_strict"); TestReadPagesStrict, TestReadPagesStrictMutant = _rpstrict.TestReadPagesStrict, _rpstrict.TestReadPagesStrictMutant
 TestCiOutsideBin = importlib.import_module("test_ci_outside_bin").TestCiOutsideBin
 _psj = importlib.import_module("test_pr_state_jobs")
