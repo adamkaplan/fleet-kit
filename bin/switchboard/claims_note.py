@@ -50,7 +50,7 @@ def claims_note_plan(engine, state, repos, prepo, pnumber, cache):
         if comment is None or own is None:
             found = (None, "no plan comment or no plan issue is held for %s#%d" % (prepo, pnumber))
         else:
-            done_when = parse_intent(own.get("body"))[1] or parse_intent((records.get(parent_of(own)) or {}).get("body"))[1]
+            done_when = governing_done_when(parse_intent(own.get("body"))[1], lambda: parse_intent((records.get(parent_of(own)) or {}).get("body"))[1])
             try:
                 result = check_module.check(comment["body"], done_when, None)
                 parsed = check_module.parse_scenarios(check_module.scenario_block(comment["body"]))
