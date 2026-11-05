@@ -150,6 +150,7 @@
       ],
       "authority": [
         "bin/plan_ledger.py",
+        "bin/epic_record.py",
         "bin/impact_floor.py",
         "bin/chat_clear.py",
         "bin/merge_gate.py",
@@ -203,6 +204,7 @@
           "templates/**",
           "tools/cos-permissions-proof/**",
           "bin/plan_ledger.py",
+          "bin/epic_record.py",
           "bin/impact_floor.py",
           "bin/chat_clear.py",
           "bin/merge_gate.py",
@@ -399,6 +401,7 @@
         "bin/agent_calls.py",
         "bin/agent_presence.py",
         "bin/awaiting_live.py",
+        "bin/ci_fresh.py",
         "bin/ci_runs.py",
         "bin/cloud_client.py",
         "bin/cloud_worker.py",
@@ -414,6 +417,7 @@
         "bin/item_verdicts.py",
         "bin/plan_review.py",
         "bin/pr_events.py",
+        "bin/pr_reading.py",
         "bin/push_watch.py",
         "bin/queue_ejections.py",
         "bin/record_json.py",
@@ -474,6 +478,12 @@
           "*"
         ],
         "bin/turn_start.py": [
+          "*"
+        ],
+        "bin/ci_fresh.py": [
+          "*"
+        ],
+        "bin/pr_reading.py": [
           "*"
         ],
         "bin/queued_wait.py": [
@@ -999,6 +1009,7 @@
         "bin/cloud_end_alert.py": "loaded only by `cloud_end_tick` and `cloud_turn_tick` (via `load_module`), both called only by `finish_pass` (after `cloud_watch_tick`), not by the clear",
         "bin/pod_silence.py": "loaded only by `pod_silence_tick` (via `load_module`), called only by `finish_pass` (after `cloud_turn_tick`), not by the clear",
         "bin/cloud_relay_daemon.py": "loaded only by `run_daemon`'s pass loop (`pass_if_configured`), not by the clear; it is still a top tier authority path (it writes ledger entries), so this lists only that the clear cannot reach it",
+        "bin/epic_record.py": "loaded only by the gates commands (gates, gates ask-close, item-gates) and the epic prove and verdict commands, never by the clear: no function the clear reaches calls it",
         "bin/external_adapter.py": "loaded only by the external-decision adapter path, which the clear does not run",
         "bin/health_records.py": "loaded only by the health and pane pass, which the clear does not run",
         "bin/lanes.py": "loaded only by `cmd_move`: the lane command, not the clear",
@@ -1009,7 +1020,6 @@
         "bin/orders_copy.py": "loaded only by `cmd_orders_copy`, not the clear",
         "bin/path_suites.py": "loaded only by the gates finding (an information line), `heavy --changed`/`--list` and `preflight-pr --merged`: the suite map and its runs, not the clear",
         "bin/plan_approval.py": "loaded only by `check_approval`, the send command's approval check (#951), which the clear never calls",
-        "bin/pr_reading.py": "loaded only by `cmd_merge_gate`: the merge gate command, not the clear",
         "bin/resume_brief.py": "loaded only by `cmd_launch`, not the clear",
         "bin/review_checkout.py": "loaded only by `cmd_review_checkout`, the reviewer checkout command, not the clear",
         "bin/tester_agent.py": "loaded only by the launch refusal of a tester, not the clear",

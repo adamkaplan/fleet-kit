@@ -6,22 +6,31 @@ class FactError(ValueError):
 
 DISK_GUARD_DEFAULTS = {"min_free_gb": 50, "hard_free_gb": 10}
 DISK_REARM_PERCENT = 110                # an episode ends when the free space is back at the threshold plus 10% (integer arithmetic: 50 * 1.1 is 55.00000000000001)
-DISK_GUARD_FILE = "disk-guard.json"     # {"low": bool, "episode": <epoch the episode began>, "hard": bool}: so a restart does not start a second episode
+DISK_GUARD_FILE = "disk-guard.json"     # {"low": bool, "episode": <epoch the episode began>, "hard": bool}: so a restart does not start a second episode; "pruned": <epoch of the last build-cache prune> once one was tried (ask #2157)
+DISK_GUARD_KEYS = tuple(DISK_GUARD_DEFAULTS) + ("prune",)
+DISK_PRUNE_ARGV = ("docker", "builder", "prune", "-f", "--filter", "until=6h")   # the ONLY prune the guard runs: never `-a`, `image prune`, `volume prune` or `system prune`
+DISK_PRUNE_GUARD_TIMEOUT = 60           # seconds: the prune never holds a pass longer
+DISK_PRUNE_INFO_TIMEOUT = 10            # seconds for `docker info`, asked only when `disk_guard.prune` is absent
+DISK_PRUNE_MIN_GAP = 3600               # never two prunes within an hour of each other
 
 
 def validate_disk_guard(raw, source):
-    """`disk_guard`: absent or null = the defaults; false = off; else {"min_free_gb", "hard_free_gb"} (numbers, hard at most min)."""
+    """`disk_guard`: absent or null = the defaults; false = off; else {"min_free_gb", "hard_free_gb"} (numbers, hard at most min) and "prune" (a boolean: absent = on only for Docker Desktop)."""
     if raw is None or raw is False:
         return
     if not isinstance(raw, dict):
         raise ConfigError("%s: 'disk_guard' must be false, null or an object, got %r" % (source, raw))
-    unknown = sorted(set(raw) - set(DISK_GUARD_DEFAULTS))
+    unknown = sorted(set(raw) - set(DISK_GUARD_KEYS))
     if unknown:
-        raise ConfigError("%s: 'disk_guard' has unknown key(s) %s (it takes %s)" % (source, ", ".join(unknown), ", ".join(DISK_GUARD_DEFAULTS)))
+        raise ConfigError("%s: 'disk_guard' has unknown key(s) %s (it takes %s)" % (source, ", ".join(unknown), ", ".join(DISK_GUARD_KEYS)))
+    if "prune" in raw and not isinstance(raw["prune"], bool):
+        raise ConfigError("%s: 'disk_guard.prune' must be true or false, got %r" % (source, raw["prune"]))
     for key, value in raw.items():
+        if key == "prune":
+            continue   # a boolean, checked above
         if not _is_number(value) or value < 0:
             raise ConfigError("%s: 'disk_guard.%s' must be a number of gigabytes of at least 0, got %r" % (source, key, value))
-    merged = dict(DISK_GUARD_DEFAULTS, **raw)
+    merged = dict(DISK_GUARD_DEFAULTS, **{k: v for k, v in raw.items() if k != "prune"})
     if merged["hard_free_gb"] > merged["min_free_gb"]:
         raise ConfigError("%s: 'disk_guard.hard_free_gb' (%r) must not be more than 'min_free_gb' (%r)" % (source, merged["hard_free_gb"], merged["min_free_gb"]))
 
@@ -68,6 +77,9 @@ class DiskFacts:
     def __init__(self):
         self.engine = None
         self.episode = None   # (episode epoch, hard flag) while low, from the file or this process
+        self.pruned = None    # epoch of the last prune attempt, from the file or this process (ask #2157)
+        self.loaded = False
+        self.prune_text = None   # what the guard says of the prune in this episode's notice (None: nothing, as before the prune existed)
 
     def bind(self, engine):
         self.engine = engine
@@ -82,13 +94,26 @@ class DiskFacts:
             pass
         return None
 
+    def _load_pruned(self, state_dir):
+        try:
+            with open(str(Path(state_dir) / DISK_GUARD_FILE)) as handle:
+                raw = json.loads(handle.read(4096))
+            if _is_number(raw.get("pruned")):
+                return float(raw["pruned"])
+        except (OSError, ValueError, AttributeError, TypeError):
+            pass
+        return None
+
     def _save(self, engine, low, episode, hard):
         try:
             path = Path(engine.state_dir) / DISK_GUARD_FILE   # written only on a change of episode: a handful of times a year
             temp = path.with_name("%s.%d.tmp" % (DISK_GUARD_FILE, os.getpid()))
             fd = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
             with os.fdopen(fd, "w") as handle:
-                handle.write(json.dumps({"low": bool(low), "episode": episode, "hard": bool(hard)}, sort_keys=True))
+                record = {"low": bool(low), "episode": episode, "hard": bool(hard)}
+                if self.pruned is not None:
+                    record["pruned"] = self.pruned   # only once a prune was tried: with the prune off the file is what it always was
+                handle.write(json.dumps(record, sort_keys=True))
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(str(temp), str(path))
@@ -98,6 +123,70 @@ class DiskFacts:
             except (OSError, UnboundLocalError):
                 pass
             engine._note("disk.guard_file", None, {"error": _plain("%s: %s" % (type(err).__name__, err), 160)})   # said once per change: after a restart a second episode could begin
+
+    def _prune_wanted(self, guard, docker, runner):
+        """True or False: `disk_guard.prune` when set; else on only when `docker info --format {{.OperatingSystem}}` says Docker Desktop."""
+        if guard.get("prune") is not None:
+            return guard["prune"]
+        try:
+            done = runner([docker, "info", "--format", "{{.OperatingSystem}}"], capture_output=True, text=True, timeout=DISK_PRUNE_INFO_TIMEOUT, stdin=subprocess.DEVNULL)
+        except (OSError, subprocess.SubprocessError, ValueError):
+            return False
+        return done.returncode == 0 and "docker desktop" in (done.stdout or "").lower()
+
+    def _prune(self, engine, guard, before, episode, now):
+        """At most once per episode and never within an hour of the last one (the time is in the guard's file): ONE `docker builder prune -f --filter until=6h`."""
+        runner = getattr(engine, "disk_prune_runner", None)
+        if runner is None or guard.get("prune") is False:
+            return   # a test engine has none; the switch is off: nothing runs, nothing is said
+        if self.pruned is not None and (self.pruned >= episode or now - self.pruned < DISK_PRUNE_MIN_GAP):
+            if self.pruned < episode:
+                self.prune_text = "no build-cache prune: one ran less than an hour ago"
+            return
+        asked = guard.get("prune") is True   # decided BEFORE docker is looked up: only a host that asked for the prune hears of a missing docker (PC-3)
+        docker = _docker_executable("docker")
+        if docker is None and not asked:
+            return   # the switch is absent and there is no docker: the default (Docker Desktop only) is off, and the guard says nothing of a prune
+        if docker is None:
+            self._prune_done(engine, now)
+            self._failed(engine, {"reason": "docker is not installed or not on PATH"})
+            self.prune_text = "no build-cache prune: docker is not installed or not on PATH"
+            return
+        try:
+            wanted = self._prune_wanted(guard, docker, runner)
+        except Exception:
+            wanted = False
+        if not wanted:
+            return
+        argv = [docker] + list(DISK_PRUNE_ARGV[1:])
+        command = " ".join(DISK_PRUNE_ARGV)
+        self._prune_done(engine, now)   # written BEFORE the run: a crash or a restart does not repeat it inside the hour
+        try:
+            done = runner(argv, capture_output=True, text=True, timeout=DISK_PRUNE_GUARD_TIMEOUT, stdin=subprocess.DEVNULL)
+        except subprocess.TimeoutExpired:
+            reason = "docker did not answer within %d seconds" % DISK_PRUNE_GUARD_TIMEOUT
+        except (OSError, subprocess.SubprocessError, ValueError) as err:
+            reason = _plain("%s: %s" % (type(err).__name__, err), 120)
+        else:
+            if done.returncode != 0:
+                reason = "exit status %s: %s" % (done.returncode, _plain(done.stderr or done.stdout or "", 100))
+            else:
+                after = disk_free(engine.state_dir)
+                freed = max(0, after[0] - int(before)) if after is not None else 0
+                if engine.audit is not None:
+                    engine.audit.append(engine.actor, "disk.pruned", None, {"command": command, "exit_status": 0, "bytes_freed": freed})
+                self.prune_text = "the guard ran `%s` and freed %.1f GB" % (command, freed / 1e9)
+                return
+        self._failed(engine, {"command": command, "reason": reason})
+        self.prune_text = "the guard tried `%s` and it failed: %s" % (command, reason)
+
+    def _failed(self, engine, detail):
+        if engine.audit is not None:   # appended, not `_note`d: a second episode that fails the same way is still news
+            engine.audit.append(engine.actor, "disk.prune_failed", None, detail)
+
+    def _prune_done(self, engine, now):
+        self.pruned = now
+        self._save(engine, True, self.episode[0], self.episode[1])
 
     def __call__(self):
         engine = self.engine
@@ -111,10 +200,14 @@ class DiskFacts:
         free_gb, now = found[0] / 1e9, engine.now()
         if self.episode is None:
             self.episode = self._load(engine.state_dir)
+        if not self.loaded:
+            self.loaded = True
+            self.pruned = self._load_pruned(engine.state_dir)
         if self.episode is not None and free_gb >= guard["min_free_gb"] * DISK_REARM_PERCENT / 100:
             if engine.audit is not None:   # appended, not `_note`d: a second episode that recovers at the same figure is still news
                 engine.audit.append(engine.actor, "disk.recovered", None, {"free_gb": int(free_gb), "min_free_gb": guard["min_free_gb"], "episode": int(self.episode[0])})
             self.episode = None
+            self.prune_text = None
             self._save(engine, False, None, False)
         discovery = getattr(engine, "discovery", None)
         chiefs = sorted(n for n, o in discovery.agents.items() if (o.fleet or {}).get("role") == "chief-of-staff") if discovery is not None and not discovery.problems else []
@@ -134,8 +227,16 @@ class DiskFacts:
             self._save(engine, True, episode, True)
         if not chiefs:
             return []
+        if free_gb < guard["min_free_gb"]:
+            try:
+                self._prune(engine, guard, found[0], episode, now)
+            except Exception as err:   # the guard's pass is never blocked or stopped by a prune
+                self._failed(engine, {"reason": _plain("%s: %s" % (type(err).__name__, err), 160)})
+                self.prune_text = "the build-cache prune failed: %s" % _plain(str(err), 80)
         text = "disk low: %d GB free on the volume holding the state directory (the guard is %g GB, hard line %g GB). `%s disk prune --dry-run` shows what would be " \
                "pruned (docker build cache and images older than a week, never volumes; it measures the state directory's volume, so check where docker keeps its data)" % (free_gb, guard["min_free_gb"], guard["hard_free_gb"], PROG)
+        if self.prune_text:
+            text += ". " + self.prune_text
         return [Fact("disk.low:%d" % int(episode), name, "disk", text, episode, sender="switchboard") for name in chiefs]
 
 

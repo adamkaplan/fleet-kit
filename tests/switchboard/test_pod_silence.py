@@ -172,6 +172,44 @@ class TestPodSilenceTick(unittest.TestCase):
 BODY = {"worker": "other-pod", "in_flight": None, "last_calls": [], "idle_seconds": 1300, "branch": "b", "unpushed": {"count": 0}, "dirty": False, "last_push": "p"}
 
 
+class StubCluster:
+    def __enter__(self):
+        return "CLUSTER"
+
+    def __exit__(self, *a):
+        return False
+
+
+class TestSummaryCluster(unittest.TestCase):
+    def summary(self, launcher):
+        cloud = load_real("cloud_worker").bind(sb.__dict__)
+        fake = types.SimpleNamespace(run_launcher=launcher, _inspect_short=cloud._inspect_short, Cluster=StubCluster)
+        fake.bind = lambda g: fake
+        with unittest.mock.patch.object(sb, "load_module", lambda n: fake if n == "cloud_worker" else load_real(n)):
+            return sb.pod_silence_summary("other-pod")
+
+    def test_summary_passes_an_open_cluster(self):
+        seen = []
+
+        def good(runner, command, worker, options=(), timeout=0, cluster=None):
+            seen.append(cluster)
+            return 0, dict(BODY), ""
+        self.assertIn("other-pod: no call in flight", self.summary(good))   # control
+        self.assertEqual(seen, ["CLUSTER"])
+
+    def test_a_launcher_given_no_cluster_fails_with_the_anchored_text(self):
+        def needs(runner, command, worker, options=(), timeout=0, cluster=None):
+            if cluster is None:
+                return 1, None, "token unavailable"
+            return 0, dict(BODY), ""
+        self.assertIn("other-pod", self.summary(needs))
+        def mutant(runner, command, worker, options=(), timeout=0, cluster=None):
+            return needs(runner, command, worker, options, timeout, None)
+        with self.assertRaises(RuntimeError) as ctx:
+            self.summary(mutant)
+        self.assertEqual(str(ctx.exception).count("the pod was not read (token unavailable)"), 1)
+
+
 class TestDaemonSummary(unittest.TestCase):
     def test_daemon_reads_another_lanes_pod_in_process_while_the_command_refuses_a_lane(self):
         cloud = load_real("cloud_worker").bind(sb.__dict__)
@@ -180,7 +218,7 @@ class TestDaemonSummary(unittest.TestCase):
         def fake_launcher(runner, command, worker, options=(), timeout=0, **kw):
             calls.append((command, worker, tuple(options)))
             return 0, dict(BODY), ""
-        fake = types.SimpleNamespace(run_launcher=fake_launcher, _inspect_short=cloud._inspect_short)
+        fake = types.SimpleNamespace(run_launcher=fake_launcher, _inspect_short=cloud._inspect_short, Cluster=StubCluster)
         fake.bind = lambda g: fake
         with unittest.mock.patch.object(sb, "load_module", lambda n: fake if n == "cloud_worker" else load_real(n)):
             line = sb.pod_silence_summary("other-pod")
