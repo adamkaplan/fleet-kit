@@ -18049,6 +18049,25 @@ def cos_ready_check():
     return plan_ledger.cos_lacking(text)
 
 
+GATE_FLOOR_FIELDS = "files,baseRefOid"   # what `pr_floor_report` asks of `gh pr view` besides the picture's fields (#2215)
+
+
+def once_pr_view_runner(inner):
+    """(#2215) `inner` (a gh runner) that answers a repeated, identical `gh pr view` of one call from its first successful answer: `gates-check` reads a pull request
+    once for the picture and once for the floor, which is one read now (the floor's fields ride on the first). Everything else, and a failed read, goes through."""
+    seen = {}
+
+    def run(argv, *a, **kw):
+        key = tuple(argv) if len(argv) > 3 and list(argv[1:3]) == ["pr", "view"] else None
+        if key is not None and key in seen:
+            return seen[key]
+        done = inner(argv, *a, **kw)
+        if key is not None and getattr(done, "returncode", 1) == 0:
+            seen[key] = done
+        return done
+    return run
+
+
 def cmd_gates_check(args, runner, now):
     """`gates-check <pr> --for ready|merge`. Read-only (state counters aside). 0 allow, 10 refuse, 3 fail-open."""
     exit_code, payload = plan_ledger.EXIT_FAIL_OPEN, {"verdict": "fail-open"}
