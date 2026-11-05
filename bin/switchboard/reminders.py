@@ -1245,7 +1245,7 @@ cmd_remind.header_cache = True    # #1520
 
 CI_QUEUE_GATE_LEGS = ("test (ubuntu-latest)", "test-cloud (ubuntu-latest)", "test (macos-latest)", "test-cloud (macos-latest)")   # bin/merge_gate.py UBUNTU_LEGS + MAC_LEGS (a test holds them equal)
 CI_QUEUE_GATE_FEEDERS = ("plan",)   # a job no gate names but that builds the matrix of the jobs a gate does name: never a cut candidate
-CI_QUEUE_WORKFLOWS = Path(__file__).resolve().parents[2] / ".github" / "workflows"   # #2197: the workflow files whose job names a gate reads
+CI_QUEUE_WORKFLOWS = Path(__file__).resolve().parents[1] / ".github" / "workflows"   # #2197: the workflow files whose job names a gate reads
 CI_QUEUE_PAGES = 10                 # pages of 100 read for one run's jobs (bounded)
 CI_QUEUE_RUN_PAGES = 40             # pages of 100 read for the run list (bounded)
 

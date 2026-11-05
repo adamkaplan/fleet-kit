@@ -309,6 +309,19 @@ def build(HandoffCase, FAKE_GH):
             self.assertEqual(len([c for c in cut if "shards" in c["what"] or "matrix" in c["what"]]), 0)
             self.assertEqual([(c["what"], c["job_minutes_per_day"]) for c in cut], [("stale-report", 7)])
 
+        def test_s2_the_default_workflow_folder_is_the_real_one_and_no_shard_is_a_cut(self):
+            folder = Path(sb.CI_QUEUE_WORKFLOWS)
+            self.assertTrue(folder.is_dir(), str(folder))
+            self.assertTrue((folder / "test.yml").is_file())
+            runs, jobs = fixture()
+            extra = jobs[1] + [job("shards (%d/8)" % i, 1395, 1395, 1400) for i in range(1, 9)]
+            with captured() as (out, err):
+                code = sb.main(["ci-queue", "--repo", "o/r", "--until", at(24 * 60), "--json"], runner=self.serve([], extra={1: extra}), now=lambda: NOW,
+                               socket_call=self.world.herdr.socket)
+            self.assertEqual(code, 0, err.getvalue())
+            cut = [c["what"] for c in json.loads(out.getvalue())["candidates"] if c["kind"] == "cut"]
+            self.assertEqual([w for w in cut if "shards" in w], [])
+
         def test_s2_the_command_reads_the_workflow_files_for_the_gate_names(self):
             folder, _ = self.gate_jobs()
             runs, jobs = fixture()
