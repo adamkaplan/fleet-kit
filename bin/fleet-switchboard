@@ -2293,7 +2293,7 @@ class Switchboard:
         if source is not None and any(str(f.key).startswith("reminder:") for f in plan.pending):
             # #1401: a reminder superseded by a re-arm or cancelled after it became a fact is not delivered; the drop names both reminders
             kept_facts = []
-            for fact in plan.pending:
+            for fact in source.newest_first(plan.pending):
                 try:
                     replaced = source.recheck_delivery(fact)
                 except ReminderError as err:   # as the other reads of the file: the pass step fails, the reminder stays queued, the next pass decides again
@@ -2302,9 +2302,10 @@ class Switchboard:
                     return {"sent": False, "action": "deferred", "reason": why}
                 if replaced is None:
                     kept_facts.append(fact)
-                elif self.audit is not None:
+                elif self.audit is not None and replaced != "swept":   # #1711: a swept copy has its own drop_superseded line
                     self.audit.append(self.actor, "reminder.drop_in_flight", plan.recipient,
                                       {"dropped": fact.key[len("reminder:"):], "kept": replaced})
+            kept_facts = [f for f in plan.pending if any(f is k for k in kept_facts)]   # the order the plan had
             if len(kept_facts) != len(plan.pending):
                 plan.pending = kept_facts
                 if not kept_facts:
@@ -2938,7 +2939,7 @@ class Switchboard:
             if self.audit is not None:
                 self.audit.append(self.actor, "hold", recipient, {"reason": plan.reason, "keys": [fact.key]})
             if fact.kind == "send" and fact.key.startswith("send:") and self.state_dir is not None and held_send_applies(plan.observation):
-                return hold_send_fact(self, fact, now)   # #2051: a send to a blocked agent is held, never refused
+                return hold_send_fact(self, fact, now)   # #2051: a send to an agent with any hold reason is held, never refused
             note_held_send(self.state_dir, recipient, fact.sender, now, plan.observation)
             return {"sent": False, "action": "hold", "reason": plan.reason}
         return self.deliver(plan, interrupt=interrupt)
@@ -9077,7 +9078,7 @@ def blocked_tick(engine, discovery, held):
     return done
 
 
-# ------------------------------------------------- held sends (#2051): a send to a blocked agent waits, it is not refused
+# ------------------------------------------------- held sends (#2051): a send to an agent with any hold reason waits, it is not refused
 
 HELD_SENDS = "held-sends.json"       # {recipient: {"rows": [{"key", "from", "at", "text", "issue", "repo", "route"}]}}: a send held while its recipient was blocked
 HELD_SENDS_KEEP = 50                 # rows kept per recipient: the 51st send drops the oldest, and its sender is told
@@ -9086,8 +9087,8 @@ HELD_ROUTE_PANE, HELD_ROUTE_ENDPOINT = "pane", "endpoint"
 
 
 def held_send_applies(observation):
-    """A send is held only for the `blocked` reason (a permission request or a question): nothing else would end by itself."""
-    return observation is not None and observation.status == "blocked" and not observation.conflict and not observation.problem
+    """#1400: a send is held for every hold reason (blocked, unknown status, a problem, a conflict); only a recipient that cannot be observed (gone) is refused."""
+    return observation is not None and hold_reason(observation) is not None
 
 
 def _held_first_words(text):
@@ -12110,7 +12111,7 @@ def launch_memory_check(args, engine, state, runner, now):
         except OSError:
             pass   # the cache is only an optimisation: a failed write costs the next launch one wait, deliberately silent
     if reason is not None:
-        audit("launch.memory_ok", {"reason": _one_line(reason, 200), "measured": ("free %d%%, swapouts %d" % first) if first else "not measured"})
+        audit("launch.memory_ok", {"reason": scrubbed_flag_text(reason), "measured": ("free %d%%, swapouts %d" % first) if first else "not measured"})
         return None
     if first is None:
         sys.stderr.write("%s: memory test not available: launching\n" % PROG)
@@ -12227,6 +12228,8 @@ def _cmd_launch(args, runner, now, socket_call=None):
     problem = launch_agent_problem(engine.config, runner, args.agent)
     if problem:
         raise LaunchError(problem)
+    if args.reports_to:   # #1046: a boss nobody can answer to is refused before anything is created (a registered name, a retired one, the role alias or a cloud record passes)
+        load_module("cloud_worker").bind(globals()).check_report_to(engine, state, args, engine.discover(engine.now()).agents)
     brief = read_brief(args.brief_file, sys.stdin)
     mismatch = launch_brief_mismatch(args, engine, repo, brief)   # #1350: before anything starts
     if mismatch:
@@ -20137,6 +20140,10 @@ def preflight_changed(runner, root):
 
 def cmd_preflight_pr(args, runner, now):
     """`preflight-pr`: run each class of PREFLIGHT_CLASSES under `heavy`, print one PASS or FAIL line per class, exit 1 when any fails. Only runs tests."""
+    if getattr(args, "body", None) is not None:   # off by default: only reads the description and the plan (bin/switchboard/body_check.py)
+        return cmd_body_check(args.body, runner, now, dict(parse_pr_ref=parse_pr_ref, build_engine=build_engine, read_pr_json=read_pr_json, load_config=load_config,
+                              parse_plan_source=parse_plan_source, IntentReader=IntentReader, GhAccounts=GhAccounts, fetch_plan=fetch_plan,
+                              plan_ledger=plan_ledger, plan_check=plan_check, PLAN_LINE_RE=PLAN_LINE_RE))
     top = runner(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True)
     if top.returncode != 0:
         sys.stderr.write("%s: preflight-pr: not inside a git work tree\n" % PROG)
@@ -20275,6 +20282,7 @@ def add_preflight_pr_parsers(sub):
                                "token-shaped directory name. Only runs tests: it never pushes, labels or records a verdict. "
                                "With --merged the same classes run on a local merge of the base into the head (a temporary worktree, removed afterwards).")
     pre.add_argument("--merged", action="store_true", help="Run on a local merge of the current base into the head, so a change green alone and red against the moved base is found before the push")
+    pre.add_argument("--body", metavar="PR", help="Only read the pull request (owner/repo#N) and its plan: refuse a description whose first section is not the cause the plan's cause-first scenario asks for (writes nothing)")
 
 
 def add_disk_parsers(sub):
@@ -20460,12 +20468,15 @@ def _checked_policy_thresholds(thresholds, source):
 
 _SECRET_PATTERNS = (
     (re.compile(r"(?i)\b(bearer|basic)\s+[A-Za-z0-9._~+/=-]{6,}"), r"\1 [redacted]"),
-    (re.compile(r"(?i)\b([A-Za-z0-9_.-]*(?:token|secret|passw(?:or)?d|api[_-]?key|credential|auth)[A-Za-z0-9_.-]*)"
-                r"(\s*[=:]\s*|\s+)(\"[^\"]*\"|'[^']*'|\S+)"), r"\1\2[redacted]"),
+    (re.compile(r"(?i)(?<![A-Za-z0-9_.-])(?=[A-Za-z0-9_.-]*?(?:token|secret|passw(?:or)?d|api[_-]?key|credential|auth))([A-Za-z0-9_.-]+)"
+                r"([\"']?)(\s*[=:]\s*|\s+)(\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|[\"'][^\n]*|\S+)"), r"\1\2\3[redacted]"),
     (re.compile(r"\b(?:sk-[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{20,}"
                 r"|AKIA[0-9A-Z]{12,}|xox[abprs]-[A-Za-z0-9-]{8,})"), "[redacted]"),
-    (re.compile(r"(://[^/\s:@]+:)[^@\s/]+@"), r"\1[redacted]@"),
-    (re.compile(r"\beyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]*"), "[redacted]"),   # a JWT (#773)
+    (re.compile(r"(://[^/\s:@]+:)\S{1,256}@"), r"\1[redacted]@"),   # the password may hold a slash or a raw @ (the last @ within 256 characters of one word)
+    # a whole key block (begin marker, body, the block's own first end marker): the body is any run of characters that does not begin another private-key marker (a tempered pattern), so every scan stops at the next marker (linear); a block with no end marker is redacted to the end of the text
+    (re.compile(r"-----BEGIN[A-Z ]*PRIVATE KEY(?: BLOCK)?-----(?:(?!-----BEGIN[A-Z ]{0,40}PRIVATE KEY)(?!-----END[A-Z ]{0,40}PRIVATE KEY)[\s\S])*(?:-----END[A-Z ]{0,40}PRIVATE KEY(?: BLOCK)?-----)?"), "[redacted]"),
+    (re.compile(r"-----(?:BEGIN|END)[A-Z ]*PRIVATE KEY(?: BLOCK)?-----"), "[redacted]"),   # a lone marker
+    (re.compile(r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}(?:\.[A-Za-z0-9_-]*)?"), "[redacted]"),   # a JWT (#773)
 )
 
 
@@ -20484,6 +20495,16 @@ def redact_command_text(text, extra=()):
     return text
 
 
+OVERRIDE_TEXT_LIMIT = 160
+
+
+def scrubbed_flag_text(text, limit=OVERRIDE_TEXT_LIMIT):
+    """Free text of an override audit line (`--boss-unregistered`: the reason and the boss text; `--memory-ok`: the reason) as the audit keeps it:
+    secret shapes replaced (the scrub above), control characters removed (one line), then cut to `limit` characters (160 by default).
+    A text without a secret shape stays as typed."""
+    text = redact_command_text(text)
+    text = re.sub(r"[\x00-\x1f\x7f-\x9f]+", " ", text)
+    return _one_line(text, limit)
 
 
 # PR 10: move a v1 session into v2 (`import-v1`)
@@ -20619,6 +20640,7 @@ def build_parser():
     launch.add_argument("--workspace", help="The herdr workspace for the new tab (default: the workspace of this session, else $HERDR_WORKSPACE_ID)")
     launch.add_argument("--role", help="metadata.fleet.role")
     launch.add_argument("--reports-to", dest="reports_to", help="metadata.fleet.reports_to")
+    launch.add_argument("--boss-unregistered", dest="boss_unregistered", metavar="REASON", help="Launch although --reports-to names no registered identity (audited with the reason)")
     launch.add_argument("--issue", type=issue_arg, help="metadata.fleet.issue (owner/repo#N also sets --repo)")
     launch.add_argument("--repo", help="metadata.fleet.repo, OWNER/REPO: the project the agent works in. Its gh "
                                        "account (config gh_users) is the agent's GH_TOKEN")
@@ -21158,6 +21180,40 @@ def cmd_key(args, runner=None, now=None):
         return EXIT_ERROR
     print("key saved")
     return EXIT_OK
+
+
+BRIEF_HEADER_FILE = Path("skills") / "fleet-coordination" / "operator-brief-header.txt"   # the one source of the standard brief header (ask #1046)
+
+
+def brief_header_text(path=None):
+    """The standard brief header printed from its one source file: a title, then each rule as `[id] text`. Nothing is retyped here."""
+    source = Path(path) if path else KIT_ROOT / BRIEF_HEADER_FILE
+    lines = ["Standard brief header (fleet-switchboard brief header):"]
+    for line in source.read_text().splitlines():
+        if line.strip() and not line.startswith("#"):
+            ident, _, text = line.partition(" | ")
+            lines.append("- [%s] %s" % (ident.strip(), text.strip()))
+    return "\n".join(lines)
+
+
+def cmd_brief(args, runner, now):
+    """`brief header --role operator`: print the standard header a person starts a brief from (files only; it reads no setting value)."""
+    try:
+        print(brief_header_text())
+    except OSError as err:
+        sys.stderr.write("%s: brief: the header source %s cannot be read (%s)\n" % (PROG, BRIEF_HEADER_FILE, _one_line(str(err), 100)))
+        return EXIT_ERROR
+    return EXIT_OK
+
+
+cmd_brief.direct = True   # files only: no daemon start
+
+
+def add_brief_parsers(sub):
+    brief = sub.add_parser("brief", help="Print the standard header of a brief for a cloud operator (`brief header --role operator`)")
+    brief_sub = brief.add_subparsers(dest="brief_action", required=True)
+    header = brief_sub.add_parser("header", help="Print the standard header: the admin route by setting key name, the secret rules, delete by exact name, stop at the first surprise")
+    header.add_argument("--role", required=True, choices=("operator",), help="whose brief: operator")
 
 
 # ----------------------------------------------------------------- the service
