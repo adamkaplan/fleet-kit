@@ -67028,6 +67028,7 @@ TestGhShimBracketBodyKeys = importlib.import_module("test_gh_shim_sign_input").T
 TestGhShimAllowlist = importlib.import_module("test_gh_shim_sign_input").TestGhShimAllowlist
 TestGhShimBodyFieldKeyIsExact = importlib.import_module("test_gh_shim_sign_input").TestGhShimBodyFieldKeyIsExact
 TestGhShimMethodFlagBeforeApi = importlib.import_module("test_gh_shim_sign_input").TestGhShimMethodFlagBeforeApi
+_ghb = importlib.import_module("test_gh_shim_body"); TestGhBodyGuard, TestGhBodyRefusalIsPure, TestGhBodyMutants = _ghb.TestGhBodyGuard, _ghb.TestGhBodyRefusalIsPure, _ghb.TestGhBodyMutants   # #1751
 TestUnconsumedSteer = importlib.import_module("test_unconsumed_steer").build(Base, TestSteerToWorking)   # #1844
 TestUnconsumedRecord = importlib.import_module("test_unconsumed_record").TestUnconsumedRecord   # #1844
 _noparent = importlib.import_module("test_charter_noparent"); TestCharterNoParent, TestCharterNoParentSet = _noparent.TestCharterNoParent, _noparent.build(CharterRig, Base, TestCharterSetGuard)

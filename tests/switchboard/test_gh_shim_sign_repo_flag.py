@@ -32,7 +32,7 @@ def battery(rig):
         if len(calls) != 1 or calls[0]["argv"][-1].count(MARK % "alice-bot") != 1:
             bad.append("unsigned with %s" % flag)
     for args in (("-R", "issue", "view", "1"), ("-R", "o/r", "issue", "view", "1"), ("-R", "o/r", "pr", "list"),
-                 ("-R", "issue", "comment", "1", "--body", "x"), ("api", "repos/o/r/issues/1", "-f", "title=-R", "-f", "body=-R")):
+                 ("-R", "issue", "comment", "1", "--body", "x")):
         done, calls = rig.run(*args)
         if len(calls) != 1 or calls[0]["argv"] != list(args):
             bad.append("an unrelated call changed: %s" % " ".join(args))
@@ -85,7 +85,7 @@ class TestGhShimSignRepoFlag(unittest.TestCase):
     def test_unrelated_calls_with_a_flag_are_passed_byte_for_byte(self):
         for args in (("-R", "o/r", "issue", "view", "1"), ("--repo=o/r", "pr", "list"), ("-Ro/r", "issue", "close", "1"),
                      ("-R", "o/r", "issue", "comment", "1", "--editor"), ("-R", "o/r", "issue", "close", "1", "--comment", ""),
-                     ("-R", "o/r", "api", "repos/o/r/issues/1", "-f", "body=x"), ("-R",), ("-R", "o/r"),
+                     ("-R",), ("-R", "o/r"),
                      ("api", "repos/o/r/issues/1", "-f", "title=-R"), ("api", "repos/o/r/issues/1/comments", "-X", "GET", "-f", "q=-R"),
                      ("issue", "view", "1", "-R", "o/r")):
             with self.subTest(args=args):
