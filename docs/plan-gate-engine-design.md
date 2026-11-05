@@ -131,9 +131,7 @@ cheap. A repo whose fail-open rate from timeouts exceeds 5% is not eligible to e
 switchboard. Any local process can write that file; the daemon reads it as untrusted text: each line is clipped, treated as
 data (never markup, never a command), and only counted and shown.
 
-**No recursion.** The shim calls `gates-check`, which calls `gh`. That inner `gh` carries the own-call marker (#141) so the
-shim passes it through unchanged and never re-enters the gate. A test runs a check with the marker and proves the shim does not
-call `gates-check` again.
+**No recursion.** The shim calls `gates-check`, which calls `gh`. That inner `gh` is the real gh named by its resolved path (`own_gh_path`, #1216; the marker of #141 is retired), so it never reaches the shim and never re-enters the gate. A test runs a check and proves the shim does not call `gates-check` again.
 
 ## The way out: who can run which command
 
