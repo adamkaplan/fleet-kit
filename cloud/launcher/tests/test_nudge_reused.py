@@ -82,7 +82,8 @@ class TestMutant(unittest.TestCase):
     def test_mutant_without_the_comparison_fails(self):
         s = stub("100.0 200.0")
         one_pass(mutant(OLD_IF, 'if seen != "no":'), s, [tn.pod()])
-        self.assertEqual(len(s.sent), 1, "a re-used pod was not nudged")
+        with self.assertRaisesRegex(AssertionError, "a re-used pod was not nudged"):
+            self.assertEqual(len(s.sent), 1, "a re-used pod was not nudged")
 
 
 if __name__ == "__main__":
