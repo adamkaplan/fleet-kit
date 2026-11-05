@@ -66766,6 +66766,7 @@ TestDerivedClosure, TestRefusalInAPart, TestMovingADefinition, TestTheDerivation
 # The shadow test (#1339): an added definition under a closure name in another file is refused by the clear.
 _shadow = importlib.import_module("test_shadow")
 TestShadowRule, TestShadowGlue, TestShadowStatuses, TestReasonsAreOneCleanLine = _shadow.TestShadowRule, _shadow.TestShadowGlue, _shadow.TestShadowStatuses, _shadow.TestReasonsAreOneCleanLine
+_pwd = importlib.import_module("test_plan_wake_drops"); _pwd.HOST = sys.modules[__name__]; TestPlanWakeDrops = _pwd.build()   # #1784
 # The Cockpit feed test (#1423): the read-only feed of what the fleet needs from a person.
 _cockpit = importlib.import_module("test_cockpit")
 TestFeedShape, TestIdsAndEtags, TestCapsAndScrub, TestDocument, TestWriting, TestReadOnly, TestBranches, TestSources, TestScrubFailsClosed, TestScrubPatterns, TestHardening, TestFileRead, TestDocumentTable = _cockpit.TestFeedShape, _cockpit.TestIdsAndEtags, _cockpit.TestCapsAndScrub, _cockpit.TestDocument, _cockpit.TestWriting, _cockpit.TestReadOnly, _cockpit.TestBranches, _cockpit.TestSources, _cockpit.TestScrubFailsClosed, _cockpit.TestScrubPatterns, _cockpit.TestHardening, _cockpit.TestFileRead, _cockpit.TestDocumentTable
