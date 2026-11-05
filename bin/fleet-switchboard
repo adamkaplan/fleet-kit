@@ -14794,10 +14794,10 @@ def recording_commands():
             if name.startswith("cmd_") and callable(fn) and isinstance(getattr(fn, "records", None), str)}
 
 
-def pr_picture(engine, repo, number, state):
+def pr_picture(engine, repo, number, state, extra_fields=""):
     """(facts, body, notice senders) of a PR, best effort: ({}, "", []) with a reason string when it cannot be read."""
     try:
-        raw = read_pr_json(engine, repo, number)
+        raw = read_pr_json(engine, repo, number, extra_fields)
         facts = ci_fresh_fact(engine, repo, number, pr_facts_from(raw))   # #1755
     except (NoticeError, AttributeError) as err:
         return None, "", [], _one_line(str(err), 160)
@@ -14934,7 +14934,7 @@ def _ledger_context(args, runner, now, writable, parts=None, floor=False, plan_r
     repo, number, pr = _ledger_pr(args)
     entries, problem = plan_ledger.read_ledger(state)
     record_step("a GitHub read of %s" % pr)
-    facts, body, senders, unreadable = pr_picture(engine, repo, number, state)
+    facts, body, senders, unreadable = pr_picture(engine, repo, number, state, GATE_FLOOR_FIELDS if floor else "")   # #2215: the gate's one read of the pull request also carries the floor's fields
     if writable:   # #770: an item's entries are written only by the item commands
         why = item_entry_refusal(engine, repo, number, entries, unreadable, True)
         if why:
@@ -18092,7 +18092,7 @@ def cmd_gates_check(args, runner, now):
             def work():
                 try:
                     ns = types.SimpleNamespace(pr=args.pr, plan=args.plan, ask=args.ask, head=None)
-                    ctx = _ledger_context(ns, runner, now, False, floor=True)
+                    ctx = _ledger_context(ns, once_pr_view_runner(runner or subprocess.run), now, False, floor=True)   # #2215: the same `gh pr view` is asked once
                     box["report"] = plan_ledger.evaluate_gates(ctx.plan, ctx.entries, ctx.problem,
                                                                 ctx.facts if ctx.facts.get("head") or ctx.facts.get("body") else None, ctx.pr,
                                                                 now=now())
