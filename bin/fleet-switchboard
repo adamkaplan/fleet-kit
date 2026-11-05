@@ -14560,6 +14560,7 @@ def cmd_run(args, runner, now, wait):
         while run_lock_held(state):
             time.sleep(STANDBY_SECONDS)
     engine.temp_janitor_runner = runner   # the weekly temp janitor runs only in the real daemon, by this attribute and by nothing a caller passes (#762)
+    engine.disk_prune_runner = runner   # the disk guard's build-cache prune (ask #2157) runs only in the real daemon
     engine.docker_reap_runner = runner   # the daily reap of expired labelled docker objects runs only in the real daemon
     hub = attach_github(engine, config, state, runner, now)
     start_event_feed(engine, config, now)
