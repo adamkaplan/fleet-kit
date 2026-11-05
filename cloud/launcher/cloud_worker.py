@@ -2033,6 +2033,45 @@ def last_audit_line(path, action, runtime_id=None):
     return None
 
 
+_TAIL_COUNT = threading.local()   # audit lines parsed by AuditTail, per thread: a pass or a tick reads its own thread's count
+
+
+def tail_lines_parsed():
+    return getattr(_TAIL_COUNT, "n", 0)
+
+
+class AuditTail:
+    """One read of the audit file's tail (the same 262,144-byte window as last_audit_line), made at the FIRST question and kept: for each
+    (action, runtime id) the newest line's (ok, reason). A line that is not JSON is skipped; the newest line wins. `parsed` counts the lines parsed."""
+
+    def __init__(self, path):
+        self.path, self.parsed, self.newest, self.loaded = path, 0, {}, False
+
+    def _load(self):
+        self.loaded = True
+        try:
+            with open(self.path, "rb") as f:
+                f.seek(0, os.SEEK_END)
+                f.seek(max(0, f.tell() - 262144))
+                lines = f.read().decode(errors="replace").splitlines()
+        except OSError:
+            return
+        for raw in reversed(lines):
+            self.parsed += 1
+            _TAIL_COUNT.n = tail_lines_parsed() + 1
+            try:
+                rec = json.loads(raw)
+            except ValueError:
+                continue
+            if isinstance(rec, dict):
+                self.newest.setdefault((rec.get("action"), rec.get("runtime_id")), (rec.get("ok"), rec.get("reason")))
+
+    def get(self, action, runtime_id):
+        if not self.loaded:
+            self._load()
+        return self.newest.get((action, runtime_id))
+
+
 class TokenRefresh:
     """What one refresh attempt came to: the state, the reason (never a value) and the token that was written."""
 
@@ -2800,6 +2839,7 @@ class Launcher:
 
         def go(info):
             info["rid"] = "pod/" + name
+            issue_no = parse_issue_number(getattr(a, "issue", None))   # before anything is made
             check_repo_allowed(a.repo, self.env)  # before anything is read or made
             if not NAME_RE.fullmatch(worker):
                 raise CloudError("bad worker name %r" % worker, EXIT_USAGE)
@@ -2842,7 +2882,7 @@ class Launcher:
                     self._make(made, "run", self.kube.create_run_secret, name, name, run_values, *([a.run_id] if getattr(a, "run_id", None) else []))
                 if hub:
                     made["reg"] = (self._registry_secret(), worker)   # set before the call: a half write is undone by the cleanup
-                    self._register(worker, run_values[CHANNEL_SECRET_KEY], spec, self.env.get("CW_CLOUD_DOMAIN", "example.internal"), password)
+                    self._register(worker, run_values[CHANNEL_SECRET_KEY], spec, self.env.get("CW_CLOUD_DOMAIN", "example.internal"), password, a.repo, issue_no)
                 self._make(made, "pod", self.kube.apply, spec)
                 if getattr(a, "stack", False):
                     self._start_stack_pod(worker, name, spec, made, a.wait)
@@ -2925,11 +2965,15 @@ class Launcher:
     def _registry_secret(self):
         return self.env.get("CW_HUB_REGISTRY_SECRET") or DEFAULT_REGISTRY_SECRET
 
-    def _register(self, agent, channel_secret, spec, domain, password):
-        """The hub's registry: {agent: sha256 hex of the channel secret} and {agent: {url, session, password_file}}. Only the hash is stored."""
+    def _register(self, agent, channel_secret, spec, domain, password, repo=None, issue=None):
+        """The hub's registry: {agent: sha256 hex of the channel secret} and {agent: {url, session, password_file, repo[, issue]}}. Only the hash is stored."""
         digest = hashlib.sha256(channel_secret.encode()).hexdigest()
         name = spec["metadata"]["name"]
         entry = {"url": hub_agent_url(name, self.env.get("CW_CLOUD_NAMESPACE", "cw")), "session": "", "password_file": "%s/%s" % (HUB_PW_DIR, agent)}
+        if repo is not None:
+            entry["repo"] = repo
+        if issue is not None:
+            entry["issue"] = issue
 
         def change(sec, agents):
             sec[agent], agents[agent] = digest, entry
@@ -3738,11 +3782,26 @@ class Launcher:
         """One pass: stop every pod past its hard deadline or idle too long. Returns [(worker, reason, exit)]."""
         out, now, live, jobs = [], self.clock(), [], []
         self.reap_results, self.last_hook = {}, None
+        mono = time.monotonic
+        steps = self.step_seconds = {"list": 0.0, "renew": 0.0, "vanished": 0.0, "activity": 0.0, "activity_n": 0, "stops": 0.0, "stops_n": 0, "orphans": 0.0, "notes": 0.0, "total": None}
+        t_pass = t0 = mono()
+        steps["start"] = t_pass   # a pass that raises is measured from here at its finally
         acts = {}   # name -> the activity this pass already read (passed to send_idle_nudges: one read per pod per pass)
-        pods = self.kube.list_pods()
+        try:
+            pods = self.kube.list_pods()
+        finally:
+            steps["list"] = mono() - t0
+        t0 = mono()
         # The renewal is the FIRST step: a slow activity read or stop below can no longer hold it back (the audit of 29 October).
-        renewed = self.renew_git_tokens(self._before_hard_limit(pods, now), now)
-        self._note_vanished_pods(pods, now)
+        try:
+            renewed = self.renew_git_tokens(self._before_hard_limit(pods, now), now)
+        finally:
+            steps["renew"] = mono() - t0
+        t0 = mono()
+        try:
+            self._note_vanished_pods(pods, now)
+        finally:
+            steps["vanished"] = mono() - t0
         for pod in pods:
             worker = ann(pod, "worker")
             reason = None
@@ -3789,7 +3848,12 @@ class Launcher:
                 continue
             else:
                 live.append(pod)   # before its hard limit and not stopped below: the git token renewal's candidates
-                act = self.activity(pod["metadata"]["name"])
+                t0 = mono()
+                try:
+                    act = self.activity(pod["metadata"]["name"])
+                finally:
+                    steps["activity"] += mono() - t0
+                    steps["activity_n"] += 1
                 acts[pod["metadata"]["name"]] = act
                 if act is None:
                     # Fail mode, decided: an unreadable activity is not a reason to kill work, so the pod runs until
@@ -3804,7 +3868,13 @@ class Launcher:
                 out.append(None)   # this pod's place in the result: filled after the stops ran
                 # by the run's own nonce where the pod carries one: a pod of another run under this name is left whole
                 jobs.append((len(out) - 1, worker, reason, ann(pod, "run-id") or None))
-        for (slot, worker, reason, _), (res, err, hook) in zip(jobs, self._run_stops(jobs)):
+        t0 = mono()
+        try:
+            stopped = self._run_stops(jobs)
+        finally:
+            steps["stops"] += mono() - t0
+            steps["stops_n"] += len(jobs)
+        for (slot, worker, reason, _), (res, err, hook) in zip(jobs, stopped):
             try:
                 if err is not None:
                     raise err
@@ -3816,9 +3886,22 @@ class Launcher:
                 self.reap_results[worker] = dict(hook or {})
                 out[slot] = (worker, reason, e.code)
         out.extend(renewed)
-        self.remove_orphan_secrets(pods, now)
-        self.send_wip_notes(live, now)
-        self.send_idle_nudges(live, now, acts)
+        t0 = mono()
+        try:
+            self.remove_orphan_secrets(pods, now)
+        finally:
+            steps["orphans"] = mono() - t0
+        t0 = mono()
+        try:
+            self.send_wip_notes(live, now)
+        finally:
+            steps["notes"] = mono() - t0
+        t0 = mono()
+        try:
+            self.send_idle_nudges(live, now, acts)
+        finally:
+            steps["notes"] += mono() - t0   # the nudges are counted with the notes: both are the pass's sends
+        steps["total"] = mono() - t_pass
         return out
 
     def _note_vanished_pods(self, pods, now):
@@ -3995,7 +4078,11 @@ class Launcher:
         (worker, "git token renewed", 0) or (worker, "git token not renewed: WHY", 1). A pod that needs nothing (no per-run Secret, not due)
         adds nothing. One pod's trouble never stops the pass; the old token stays until a patch has landed."""
         with self.renew_lock:
-            return self._renew_locked(pods, now)
+            self._tail = AuditTail(self.audit_path)   # one lookup for this call; it reads nothing until a failure asks
+            try:
+                return self._renew_locked(pods, now)
+            finally:
+                self._tail = None
 
     def _renew_locked(self, pods, now):
         out, relogged = [], False
@@ -4029,7 +4116,8 @@ class Launcher:
 
     def _last_renewal_audit(self, rid):
         """(ok, reason) of the newest renew-git-token audit line of this pod, or None (reads the file's tail only)."""
-        return last_audit_line(self.audit_path, "renew-git-token", rid)
+        tail = getattr(self, "_tail", None)
+        return tail.get("renew-git-token", rid) if tail is not None else last_audit_line(self.audit_path, "renew-git-token", rid)
 
     def _audit_renewal_failure(self, worker, pod, why):
         """One audit line per CHANGE of reason (a persistent failure is not written again every pass; the success line is the 'cleared' line)."""
@@ -4586,6 +4674,17 @@ def stack_registry_check(a, env, out):
     return 0
 
 
+def parse_issue_number(value):
+    """None when no issue is named; else an int above 0; anything else is a usage error."""
+    if value is None:
+        return None
+    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+        return value
+    if isinstance(value, str) and re.fullmatch(r"[1-9][0-9]{0,9}", value):
+        return int(value)
+    raise CloudError("--issue must be a whole number above 0, got %r; nothing was created" % str(value)[:40], EXIT_USAGE)
+
+
 def build_parser():
     p = argparse.ArgumentParser(prog="cloud-worker")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -4602,6 +4701,7 @@ def build_parser():
     k.add_argument("--identity", default=PULLER_IDENTITY)
     c = cmd("create")
     c.add_argument("--repo", required=True)
+    c.add_argument("--issue", default=None, help="the issue number (a whole number above 0) written into the hub entry of a registered worker")
     c.add_argument("--branch", required=True)
     c.add_argument("--idle", default="30m")
     c.add_argument("--hard", default="2h")
@@ -4754,6 +4854,7 @@ class RenewalTicker:
         now = self.clock()
         self.last = now
         self.ticks += 1
+        cpu0, parsed0 = time.thread_time(), tail_lines_parsed()
         try:
             with self.L.renew_lock:
                 refresh = self.refresher.run()
@@ -4765,6 +4866,8 @@ class RenewalTicker:
                 self.L.renew_git_tokens(self.L._before_hard_limit(self.L.kube.list_pods(), now), now)
         except Exception as e:   # the thread goes on: the next tick tries again
             print("cloud-worker: the renewal thread: %s" % scrub(e, (), 200), file=sys.stderr)
+        finally:
+            print("cloud-worker: renewal tick line: cpu_seconds=%.3f audit_lines_parsed=%d" % (time.thread_time() - cpu0, tail_lines_parsed() - parsed0), file=sys.stderr)
 
     def _run(self):
         while not self._stop.is_set():
@@ -4782,6 +4885,23 @@ class RenewalTicker:
         self._stop.set()
         if self.thread is not None and self.thread is not threading.current_thread():
             self.thread.join(5)   # a tick in flight ends first
+
+
+def step_text(st):
+    """The seconds of the seven steps of a pass, for the pass line: numbers only, no name or value.
+
+    Never raises (it runs inside a finally) and never prints a negative number: a bad dictionary gives the line without a step part."""
+    try:
+        if not st:
+            return ""
+        def sec(v):
+            return max(0.0, float(v))
+        total = st["total"] if st["total"] is not None else time.monotonic() - st["start"]   # a pass that raised never set its total: the wall seconds from its start
+        return " steps list=%.1f renew=%.1f vanished=%.1f activity=%.1f (%d) stops=%.1f (%d) orphans=%.1f notes=%.1f total=%.1f" % (
+            sec(st["list"]), sec(st["renew"]), sec(st["vanished"]), sec(st["activity"]), int(st["activity_n"]), sec(st["stops"]), int(st["stops_n"]),
+            sec(st["orphans"]), sec(st["notes"]), sec(total))
+    except Exception:
+        return ""
 
 
 def _reap_main(env, a, sleep, clock=None, refresher=None, kube=None, ticker_wait=None, tree=None):
@@ -4835,7 +4955,13 @@ def _reap_main(env, a, sleep, clock=None, refresher=None, kube=None, ticker_wait
                 ticker = RenewalTicker(L, refresher, clock, ticker_wait)
                 ticker.start()
             began = clock()
-            work = L.reap() if L is not None else []   # the pass's own work: the workers' results
+            if L is not None:
+                L.step_seconds = None   # the pass line shows the steps of THIS pass only
+            cpu0, parsed0 = time.thread_time(), tail_lines_parsed()
+            try:
+                work = L.reap() if L is not None else []   # the pass's own work: the workers' results
+            finally:
+                print("cloud-worker: reaper pass line: cpu_seconds=%.3f audit_lines_parsed=%d%s" % (time.thread_time() - cpu0, tail_lines_parsed() - parsed0, step_text(getattr(L, "step_seconds", None))), file=sys.stderr)
             took = (clock() - began).total_seconds()
             if L is not None:
                 L.note_slow_pass(took)

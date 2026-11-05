@@ -1891,9 +1891,9 @@ class TestSteerToWorking(Base):
                                now=self.world.clock.now, wait=lambda sock, seconds: False, socket_call=self.world.herdr.socket)
             return code, out.getvalue(), err.getvalue()
         before = len(self.world.v2.__dict__.get("sent", [])) if hasattr(self.world.v2, "sent") else 0
-        code, out, err = send("x" * 6000)
+        code, out, err = send("x" * 3990)
         self.assertEqual(code, sb.EXIT_USAGE)
-        self.assertIn("message is 6000 characters", err)
+        self.assertIn("message is 3990 characters", err)
         self.assertIn("nothing was sent", err)
         self.assertEqual(out, "")
         allowed = int(re.search(r"allowed text for this message is (\d+) characters", err).group(1))
@@ -1923,6 +1923,133 @@ class TestSteerToWorking(Base):
         allowed = int(re.search(r"allowed text for this message is (\d+) characters", str(cm.exception)).group(1))
         self.assertTrue(3000 < allowed < 4000, allowed)   # about 3,754, never the 8,444 of the short older fact
         self.assertTrue(deliver("y" * allowed).get("sent"), "the resend of the allowed length is not cut")
+
+    # ---- #1399: `send --file` carries a long message in numbered parts
+    def long_file(self, text, name="long.txt"):
+        folder = tempfile.mkdtemp(prefix="send-file-")
+        self.addCleanup(shutil.rmtree, folder, True)
+        path = os.path.join(folder, name)
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        return path
+
+    @staticmethod
+    def whole_lines(count=187):
+        return "\n".join("line %04d %s" % (n, "w" * 37) for n in range(count))   # about 9,000 characters of whole lines
+
+    def delivered(self):
+        return [a["text"] for a in self.world.admissions("platform")]
+
+    def send_file(self, text, *extra):
+        return self.cli_send("--file", self.long_file(text), *extra)
+
+    def test_1399_s2_a_9000_character_file_is_queued_as_three_parts_in_order_under_the_cap(self):
+        self.work()
+        text = self.whole_lines()
+        self.assertTrue(8900 < len(text) < 9100)
+        code, out, err = self.send_file(text)
+        self.assertEqual(code, 0, err)
+        texts = self.delivered()
+        self.assertEqual(len(texts), 3)
+        for n, got in enumerate(texts, 1):
+            self.assertIn("part %d of 3" % n, got)
+            self.assertNotIn("[cut at", got)
+            self.assertLess(len(got), sb.MESSAGE_CAP)
+        self.assertEqual(sorted(texts, key=lambda t: re.search(r"part (\d) of 3", t).group(1)), texts)
+        for number in range(187):   # every line arrived, once
+            self.assertEqual(sum("line %04d " % number in got for got in texts), 1)
+        found = [int(n) for got in texts for n in re.findall(r"line (\d{4}) ", got.split("\n- send from", 1)[1])]
+        self.assertEqual(found, sorted(found))   # the text itself runs in order across the parts
+        self.assertIn("3 parts queued", err)   # S7: the sender is told
+
+    def test_1399_s3_send_and_remind_split_with_the_one_function(self):
+        self.assertIs(sb.send_plan.__globals__["text_parts"], sb.finding_parts.__globals__["text_parts"])
+        text = self.whole_lines() + "\n" + "L" * 5000   # a long line too
+        chunks, _ = sb.text_parts(text, sb.SEND_PART_BUDGET - 40)
+        parts, problem = sb.send_plan(argparse.Namespace(text=[], file=self.long_file(text)))
+        self.assertIsNone(problem)
+        self.assertEqual([p.split("\n", 1)[1] for p in parts], chunks)
+        fact = sb.Fact("k", "platform", "reminder", text, 0)
+        self.assertEqual(sb.finding_parts(fact, sb.SEND_PART_BUDGET - 40), (chunks, ""))
+        calls = []
+        real = sb.text_parts
+        with mock.patch.dict(sb.send_plan.__globals__, {"text_parts": lambda *a: calls.append(a) or real(*a)}):
+            sb.send_plan(argparse.Namespace(text=[], file=self.long_file(text)))
+        self.assertEqual(len(calls), 1)
+
+    def test_1399_s4_a_file_under_the_cap_is_one_message_with_no_part_header(self):
+        self.work()
+        code, out, err = self.send_file("a short message\nfrom a file")
+        self.assertEqual(code, 0, err)
+        (got,) = self.delivered()
+        self.assertNotIn("part 1 of", got)
+        self.assertIn("a short message", got)
+        self.assertNotIn("parts queued", err)
+
+    def test_1399_s5_command_line_text_over_the_cap_is_refused_with_the_file_hint_and_nothing_is_queued(self):
+        self.work()
+        code, out, err = self.cli_send("x" * 5000)
+        self.assertEqual(code, 2)
+        for needle in ("5000 characters", "4000", "--file"):
+            self.assertIn(needle, err)
+        self.assertEqual(self.delivered(), [])
+
+    def test_1399_s6_a_file_that_cannot_be_used_is_refused_and_nothing_is_queued(self):
+        self.work()
+        folder = tempfile.mkdtemp(prefix="send-file-")
+        self.addCleanup(shutil.rmtree, folder, True)
+        link = os.path.join(folder, "link.txt")
+        os.symlink("/etc/hosts", link)
+        cases = {"missing": os.path.join(folder, "none.txt"), "oversized": self.long_file("x" * (sb.TEXT_FILE_MAX + 1)),
+                 "a directory": folder, "symlink": link}
+        for why, path in cases.items():
+            with self.subTest(why=why):
+                code, out, err = self.cli_send("--file", path)
+                self.assertEqual(code, 2, err)
+                self.assertIn("nothing sent", err)
+        self.assertIn("symlink", err)
+        self.assertEqual(self.delivered(), [])
+        inside = os.path.join(folder, "inside.txt")   # a symlink that stays in the user's directories is fine
+        os.symlink(self.long_file("through a link"), inside)
+        code, _, err = self.cli_send("--file", inside)
+        self.assertEqual(code, 0, err)
+        code, _, err = self.cli_send("--file", self.long_file("a"), "and words")
+        self.assertEqual(code, 2)
+        code, _, err = self.cli_send()
+        self.assertEqual(code, 2)
+
+    def test_1399_s7_a_failed_part_is_named_and_no_later_part_is_sent(self):
+        self.work()
+        real = sb._send_one
+        calls = []
+
+        def fail_second(args, runner, now):
+            calls.append(args.text[0])
+            return sb.EXIT_HELD if len(calls) == 2 else real(args, runner, now)
+        with mock.patch.dict(sb.send_plan.__globals__, {"_send_one": fail_second}):
+            code, out, err = self.send_file(self.whole_lines())
+        self.assertEqual(code, sb.EXIT_HELD)
+        self.assertIn("part 2 of 3", err)
+        self.assertEqual(len(calls), 2)   # part 3 was never attempted
+        self.assertEqual(len(self.delivered()), 1)
+        self.assertNotIn("parts queued", err)
+
+    def test_1399_s8_the_mutants_are_caught(self):
+        def cut(text, budget):
+            return [text[:budget]], ""
+
+        real = sb.text_parts
+        reversed_order = lambda text, budget: (real(text, budget)[0][::-1], "")
+        mutants = {"cut at the cap": ("text_parts", cut), "parts out of order": ("text_parts", reversed_order),
+                   "no header": ("part_label", lambda n, total: "")}
+        tests = (self.test_1399_s2_a_9000_character_file_is_queued_as_three_parts_in_order_under_the_cap,)
+        for label, (name, mutant) in mutants.items():
+            with self.subTest(mutant=label):
+                with mock.patch.dict(sb.send_plan.__globals__, {name: mutant}):
+                    with self.assertRaises(AssertionError):
+                        for test in tests:
+                            test()
+                self.setUp()
 
 
 
@@ -12987,7 +13114,7 @@ class TestOneCharter(CharterRig, Base):
 
     READERS = {   # (file, function) -> "kind: reason". registry: decides who owns a charter and reads the registry's charter (#969); writer / display: writes or shows the registry row; own: reads ONE agent's own launch context and enumerates no other agent
         # (CHECKED against the code below); set: asks only whether a number is a charter, never counts or names an owner
-        ("bin/fleet-switchboard", "guard"): "registry: the charter set guard, on the registry lock's own read",
+        ("bin/switchboard/work_moves.py", "guard"): "registry: the charter set guard, on the registry lock's own read",
         ("bin/impact_hold.py", "_lane_of_issue"): "registry: the lane lookup", ("bin/lanes.py", "charter_orchestrators"): "registry: move's lookup",
         ("bin/fleet-switchboard", "adoption_heir"): "registry: the heir of an orphan", ("bin/fleet-switchboard", "plan_wake_route"): "registry: the orchestrator a plan wakes",
         ("bin/fleet-switchboard", "asks_of_caller"): "registry: the asks an agent is accountable for", ("bin/fleet-switchboard", "register_item_tester"): "registry: the launching orchestrator's charter gates a registration",
@@ -12997,7 +13124,7 @@ class TestOneCharter(CharterRig, Base):
         ("bin/registry.py", "orchestrator_charters"): "registry: the one reading", ("bin/registry.py", "duplicate_charters"): "registry: duplicates", ("bin/registry.py", "set_charter"): "writer: the audited setter",
         ("bin/registry.py", "change"): "writer: the registry's own writer", ("bin/fleet-switchboard", "registry_charter"): "writer: the pass's rule over the registry row",
         ("bin/fleet-switchboard", "pane_health_pass"): "writer: writes the registry row through registry_charter", ("bin/switchboard/agents_verify.py", "charters_report"): "display: both records, read-only",
-        ("bin/switchboard/agents_verify.py", "cmd_agents_charters"): "display: the report", ("bin/fleet-switchboard", "cmd_charter"): "writer: the audited command",
+        ("bin/switchboard/agents_verify.py", "cmd_agents_charters"): "display: the report", ("bin/switchboard/work_moves.py", "cmd_charter"): "writer: the audited command",
         ("bin/fleet-switchboard", "record_launch_charter"): "writer: a launch writes the registry row (first sight; a relaunch under the name is a new launch)",
         ("bin/impact_hold.py", "clear_lane"): "display: carries the lookup's `charter` into the notice line", ("bin/impact_hold.py", "_notify_clear_body"): "display: words the notice line",
         ("bin/switchboard/handoff.py", "seam_applies"): "set: is this issue number known as a charter",
@@ -42115,6 +42242,7 @@ class TestLaunchRefusedMessage(TestLaunchMemoryGate):
         '%s is being launched by anothe': 'refused before any pod exists: it says nothing was created',
         'the vault check lock %s was no': 'refused before any pod exists: it says nothing was created',
         'the vault access check stopped': 'refused before any pod exists: it says nothing was created',
+        '--issue %r is not a whole numb': 'refused before any pod exists: it says nothing was created',
         'the cloud worker was not creat': 'the pod creation failed: no worker exists, so refused is right',
         'the brief line %r needs docker': 'refused before any pod exists: it says nothing was created',
     }
@@ -60780,11 +60908,13 @@ class TestV2LightGuards(Base):
         ("Switchboard.deliver", 1): ("ledger", "the sent-keys ledger reserves before a write: not a read", ()),
         ("Switchboard.deliver", 2): ("ledger", "the sent-keys ledger: not a read", ()),
         ("Switchboard.deliver", 3): ("ledger", "the sent-keys ledger: not a read", ()),
+        ("Switchboard.deliver", 4): ("no-read", "the queued-wait note of a delivery: writes the daemon's own state file, never reads a session", ()),
         ("Switchboard.waiting_earlier", 1): (2, "waiting", (("V2Reads.inbox", 1),)),
         ("Switchboard.convert_lapsed_notes", 1): (2, "idle", (("V2Reads.inbox", 1),)),
         ("Switchboard.unread_count", 1): (2, "idle", (("V2Reads.inbox", 1),)),
         ("Switchboard.send", 1): ("no-read", "whether a folded question keeps its issue: nothing is read", ()),
         ("Switchboard.report", 1): ("no-read", "reads the daemon's own last-reports.json (a state file), never a session", ()),
+        ("Switchboard.run_pass", 1): ("covered", "the queued-wait pass: its inbox read is made only when light is off; pinned by test_queued_behind_turn test_the_owners_light_switch_means_the_queued_wait_pass_reads_no_inbox", ()),
         ("brief_in_transcript", 1): (6, "brief", ()),
         ("inbox_human_prompts", 1): (0, "newest", ()),
         ("WorkerFacts.last_reply", 1): (3, "stop", ()),
@@ -66633,6 +66763,7 @@ TestFakeSupportModule, TestSupportImportsMutant, TestSupportImportsScratch, Test
 # The census of process kinds (#1501).
 _census = importlib.import_module("test_github_census")
 TestSamples, TestCensus, TestMutants, TestCensusDocumentation = _census.TestSamples, _census.TestCensus, _census.TestMutants, _census.TestDocumentation
+TestIndependentImpactNoPaths, TestNoPathsMutants = importlib.import_module("test_1041").build(TestImpactHold, FAKE_GH, LEDGER_HEAD, LEDGER_NEW_HEAD)
 TestMacosReader = _census.TestMacosReader   # #1847
 TestNewModuleDemands = importlib.import_module("test_new_module_demands").TestNewModuleDemands
 TestGuardSet = importlib.import_module("test_guard_set").TestGuardSet   # #2055
@@ -66700,6 +66831,7 @@ TestLaunchBriefCheck = importlib.import_module("test_launch_brief_check").build(
 TestIntentEditToldOnce = importlib.import_module("test_intent_told_once").build(TestIntentEditWiring, GithubRig)   # #1437
 TestRunLauncherShapes, TestStatusLines, TestTurnEnd, TestDictCallersUnchanged = (_ss := importlib.import_module("test_status_shape")).TestRunLauncherShapes, _ss.TestStatusLines, _ss.TestTurnEnd, _ss.TestDictCallersUnchanged
 TestEveryKindDelayedMark = importlib.import_module("test_every_kind_delayed_mark").TestEveryKindDelayedMark
+TestQueuedBehindTurn = importlib.import_module("test_queued_behind_turn").TestQueuedBehindTurn
 TestHeaderDate, TestHeaderDateCallSites, TestHeaderInfiniteTime = (_hd := importlib.import_module("test_header_date")).TestHeaderDate, _hd.TestHeaderDateCallSites, _hd.TestHeaderInfiniteTime
 TestSignedLinkScrub = importlib.import_module("test_signed_link_scrub").build(Base, GithubRig)
 TestErroredTurn = importlib.import_module("test_errored_turn").build(Base, World, FAKE_OPENCODE, FAKE_HERDR)
@@ -70158,10 +70290,6 @@ class TestAgentCredentialsDoc(unittest.TestCase):
 
 
 
-FACT_KIND_MODES = {"send": "cut marker (refused to the sender)", "wake": "merged within a 3000-character budget", "sweep": "parts", "triage": "parts",
-                   "alert": "parts", "reminder": "parts", "disk": "parts", "cpu": "parts", "mem": "parts", "cpu-top": "parts",
-                   "spotlight": "parts", "janitor": "parts", "plan": "parts"}
-OVER_CAP_FINDING_KINDS = tuple(k for k, v in FACT_KIND_MODES.items() if v == "parts")
 
 
 class TestMessageTimes(unittest.TestCase):
