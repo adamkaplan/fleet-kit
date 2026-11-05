@@ -99,14 +99,19 @@ def plan_wake_pass(engine, state, repos, now, budget=None):
             plan_hash = check_module.plan_hash(body)
             wake.newest[(repo, number)] = plan_hash   # #1542: the present hash, for the delivery re-check
             wake.current[(repo, number)] = plan_hash   # #1784: recorded before the approved and cited skips
+            remembered = "%s#%d:%s" % (repo, number, plan_hash)
+            if remembered in wake.approved:
+                continue   # #2193: judged approved before, whatever the audit tail holds now
             if consensus is None:
                 consensus = plan_wake_consensus(engine)
             if (plan_hash in consensus or module.approved_by_comment(plan, plan_hash, by_issue.get(number, []), signed_by_fleet)
                     or module.cited_by_pr(repo, number, plan, pulls, parse_iso)):
+                wake.approved[remembered], changed = now, True
                 continue
             if sends is None:
                 sends = _audit_tail(engine.state_dir)   # #790: the sends the audit already holds, read once per pass and only for a plan no other form approved
             if module.approved_by_send(plan, plan_hash, sends, signed_by_fleet):
+                wake.approved[remembered], changed = now, True
                 continue
             url = module.plan_url(repo, number, plan["id"])
             key = "%s#%d:%s" % (repo, number, plan_hash)
