@@ -17783,6 +17783,9 @@ def merge_drops(runner, git_dir, tip, head):
     own = collections.Counter()   # the PR's own removals (three-dot), per (file, stripped line); from the branch's non-merge commits, as the three-dot diff is empty once the tip is merged in
     for commit in _git_out(runner, git_dir, ["rev-list", "--no-merges", "%s..%s" % (tip, head)]).split():
         own.update((f, t.strip()) for f, _, t in _diff_lines(runner, git_dir, commit + "^", commit, "-"))
+    base = _git_out(runner, git_dir, ["merge-base", tip, head]).strip()
+    three = collections.Counter((f, t.strip()) for f, _, t in _diff_lines(runner, git_dir, base, head, "-"))   # three-dot: a removal made in a merge resolution (a port) is the PR's own too
+    own = own | three   # per-key maximum
     dropped = []
     for d in _diff_lines(runner, git_dir, tip, tree, "-"):   # the tip's lines the merge result lacks
         key = (d[0], d[2].strip())

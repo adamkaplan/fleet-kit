@@ -120,6 +120,25 @@ class TestMergeDrops(MergeDropsBase):
         self.assertEqual(len(out), 1, out)
         self.assertIn("return None", out[0])
 
+    def test_the_branchs_own_removal_behind_the_tip_is_not_a_drop(self):
+        git(self.dir, "checkout", "-q", "-b", "pr")
+        self.write("app.py", "".join("line %d\n" % n for n in range(1, 11) if n != 3))   # the branch's own removal
+        self.commit("own removal")
+        self.tip_moves()   # the tip keeps line 3 and moves on
+        self.assertEqual(self.run_cmd(), (0, []))
+
+    def test_the_branchs_own_removal_made_in_a_merge_resolution_is_not_a_drop(self):
+        git(self.dir, "checkout", "-q", "-b", "pr")
+        self.write("other.py", "keep one\nkeep two\nown addition\n")
+        self.commit("the change")
+        self.tip_moves()
+        git(self.dir, "checkout", "-q", "pr")
+        git(self.dir, "merge", "-q", "--no-commit", "integration")
+        self.write("app.py", "".join("line %d\n" % n for n in range(1, 6)) + "HeldSendFacts(state_dir)\n" + "".join("line %d\n" % n for n in range(6, 11) if n != 8))   # the port removes line 8: the PR's own change
+        git(self.dir, "add", "-A")
+        git(self.dir, "commit", "-q", "-m", "merge the tip; port")
+        self.assertEqual(self.run_cmd()[0], 0)
+
     def test_a_conflicting_merge_says_resolve_first(self):
         git(self.dir, "checkout", "-q", "-b", "pr")
         self.write("app.py", "mine\n")
