@@ -1,0 +1,1 @@
+| `launch_brief_check.py` | 0 | `launch --issue N` refuses a brief that names another issue or a stale PR head, before anything starts (#1350) | |

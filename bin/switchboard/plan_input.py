@@ -58,6 +58,12 @@ def fetch_plan(reader, repo, number, comment_id=None):
     return text, "%s of %s#%d" % (source, repo, number), parse_intent(body)[1], defects
 
 
+def governing_done_when(own, parent):
+    """#2200, the ONE choice of the Done-when a work item's plan is checked against: the issue's own, the ask's (`parent`) only when it has none. `parent` is a Done-when
+    or a function that reads it (so `plan check` reads the ask only when needed). Used by `load_plan` and by the plan-wake pass."""
+    return own or (parent() if callable(parent) else parent)
+
+
 def _parent_ask_done_when(reader, repo, number):
     """The Done-when of the ASK that is the native sub-issue parent of issue `number` of `repo`, or None. Like `IntentReader.ask_of`, a parent counts as the ask only
     when it has a parent of its own (the charter): the issue under a charter is itself the ask, and a charter's Done-when is never borrowed. Anything that is not
@@ -136,9 +142,8 @@ def load_plan(args, runner, now):
         elif done_when:
             plan_own = issue_done if issue_done and issue_done != done_when else None
         else:
-            done_when = issue_done
-            if not done_when:   # a work item states no Done-when of its own: its ask's is the authority (the sub-issue parent, never a "Work item of" line)
-                done_when = _parent_ask_done_when(reader, repo, number)
+            # a work item states no Done-when of its own: its ask's is the authority (the sub-issue parent, never a "Work item of" line)
+            done_when = governing_done_when(issue_done, lambda: _parent_ask_done_when(reader, repo, number))
     if args.ask and args.file and not args.done_when:
         raise PlanInputError("--ask needs a plan read from GitHub; for --file give --done-when TEXT")
     result = plan_check.check(text, done_when, plan_own)
@@ -253,6 +258,8 @@ def parse_pairs(text):
         if new_mark is None or new_mark[1] != "NEW" or new_mark[2] != want:
             raise PlanApplyRefused("OLD %d has no NEW %d after it" % (want, want), 1)
         pairs.append([texts[index], texts[index + 1]])
+    if pairs[-1][1].endswith("\n"):   # the newline that ends the file belongs to the file, as the newline before a next header does to no text
+        pairs[-1][1] = pairs[-1][1][:-1]
     why, last = "", pairs[-1][1]
     cut = last.rfind("\n\nWhy:")
     if cut >= 0:

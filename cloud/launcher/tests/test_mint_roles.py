@@ -320,7 +320,7 @@ class LaunchSideMint(unittest.TestCase):
         mod = types.ModuleType("launch_side_copy")
         mod.__file__ = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(self.mint))), "bin", "cloud_worker.py")
         os.makedirs(os.path.dirname(mod.__file__), exist_ok=True)
-        for sibling in ("cloud_cluster.py", "path_walk.py"):   # the copy loads its cluster module from beside its own (faked) path: the real ones
+        for sibling in ("cloud_cluster.py", "cloud_inspect.py", "path_walk.py"):   # the copy loads its cluster module from beside its own (faked) path: the real ones
             shutil.copy(os.path.join(ROOT, "bin", sibling), os.path.dirname(mod.__file__))
         exec(compile(src, mod.__file__, "exec"), mod.__dict__)
         mod._capture = lambda argv, env=None: (lambda p: (p.returncode, p.stdout, p.stderr))(

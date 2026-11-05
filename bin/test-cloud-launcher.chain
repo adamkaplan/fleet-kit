@@ -73,6 +73,7 @@ cloud/launcher/tests/test_preflight_repo_read.py
 cloud/launcher/tests/test_preflight_step.py
 cloud/launcher/tests/test_probe_redirect.py
 cloud/launcher/tests/test_read_retired_last_message.py
+cloud/launcher/tests/test_readonly_root.py
 cloud/launcher/tests/test_reap_concurrent.py
 cloud/launcher/tests/test_reaper_audit_tail.py
 cloud/launcher/tests/test_reaper_managed.py
@@ -80,6 +81,7 @@ cloud/launcher/tests/test_reaper_renewal.py
 cloud/launcher/tests/test_reaper_restart.py
 cloud/launcher/tests/test_reaper_row.py
 cloud/launcher/tests/test_reaper_unauthorized.py
+cloud/launcher/tests/test_refusal_label.py
 cloud/launcher/tests/test_registry_endpoint.py
 cloud/launcher/tests/test_render_namespace.py
 cloud/launcher/tests/test_repo_min_shape.py

@@ -1834,6 +1834,7 @@ getpass
 github_calls_status
 github_status
 goal_line
+governing_done_when
 gzip
 handoff_ask
 handoff_markdown

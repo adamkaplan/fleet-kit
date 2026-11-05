@@ -885,5 +885,26 @@ class TestLostWorkerSlowPass(unittest.TestCase):
         self.assertIn("a slow reaper pass is not a reaper failure", str(caught.exception))
 
 
+class TestChiefOnlyWhenNeeded(unittest.TestCase):
+    """#2202: a loss the launcher's own record shows as an ok stop goes to its lane only; any other loss still goes to the lane and the Chief of Staff."""
+
+    def delivered(self, stop):
+        mod = load()
+        r = Rig(mod)
+        r.created("w1")
+        if stop:
+            r.stopped("w1")
+        loss = {"key": "pod_no_stop:w1:%s" % (NOW - 7200), "kind": "pod_no_stop", "name": "w1", "ask": "ask-7", "at": NOW - 7200, "lane": "lane-a", "line": "x"}
+        mod._losses = lambda *a, **k: [dict(loss)]   # the loss is given; only its delivery is under test
+        r.passes()
+        return sorted(to for to, _ in r.engine.sent)
+
+    def test_s4_clean_stop_goes_to_the_lane_only(self):
+        self.assertEqual(self.delivered(True), ["lane-a"])
+
+    def test_s4_no_stop_goes_to_the_lane_and_the_chief(self):
+        self.assertEqual(self.delivered(False), ["chief-of-staff", "lane-a"])
+
+
 if __name__ == "__main__":
     unittest.main()

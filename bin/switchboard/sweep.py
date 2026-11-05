@@ -28,6 +28,8 @@ SWEEP_KINDS = {"S6a": "first-line marker without the merge-captain label (our PR
                "S8": "a decision waits for an issue that is closed or missing",
                "S9": "a merge or hold label left on a closed, unmerged PR",
                "S10": "a charter recorded by two orchestrators in the registry (the lane of its pull requests is unknown)"}
+SWEEP_KINDS["S11"] = "gate fail-opens of a repository over the rate in an hour (merges and readies went through unchecked)"   # ask #2216: read from the shim's gate spool
+SWEEP_DEFAULTS["failopen_per_hour"] = 20   # ask #2216: more gate fail-opens of one repository than this in an hour is one S11 finding (setting `sweep.failopen_per_hour`)
 SWEEP_WAIT_VERBS = ("held for", "hold for", "waiting on", "waits on", "awaiting", "blocked on", "pending", "needs")
 
 
@@ -61,6 +63,9 @@ def validate_sweep_config(config, source):
     calls = section["calls_per_pass"]
     if not isinstance(calls, int) or isinstance(calls, bool) or not 4 <= calls <= SWEEP_CALLS_CAP:
         raise ConfigError("%s.calls_per_pass' must be a whole number from 4 to %d, got %r" % (where, SWEEP_CALLS_CAP, calls))
+    rate = section["failopen_per_hour"]
+    if not isinstance(rate, int) or isinstance(rate, bool) or rate < 1:
+        raise ConfigError("%s.failopen_per_hour' must be a whole number of 1 or more, got %r" % (where, rate))
     names = section["person_names"]
     if not isinstance(names, list) or not names or not all(isinstance(n, str) and re.fullmatch(r"[\w@ .-]{1,40}", n)
                                                            for n in names):
@@ -389,8 +394,8 @@ def sweep_read_repo(hub, repo, now, window_days, regex, budget, strong):
         names = {(l.get("name") if isinstance(l, dict) else l) for l in record.get("labels") or []}
         if number is not None and _is_pr(record) and not _issue_pr_merged(record) and _label_kind(names, CAPTAIN_MERGE_LABELS[:1] + CAPTAIN_HOLD_LABELS):   # #559: a merged PR is the daemon's to clean, never a finding
             closed_holds[number] = sorted(_label_kind(names, CAPTAIN_MERGE_LABELS[:1] + CAPTAIN_HOLD_LABELS))
-    comments, cut = hub.read_comments("sweep", repo, since, cap=COMMENT_WINDOW_PAGES)
-    budget[0] -= sweep_pages_used(comments, cut)
+    comments, cut = hub.read_comments("sweep", repo, since, cap=COMMENT_WINDOW_PAGES, budget=budget)
+    budget[0] -= getattr(hub, "_comment_main_pages", None) or sweep_pages_used(comments, cut)   # charge once: gap pages were charged by the gap fill
     truncated = truncated or cut
     for comment in reversed(comments):  # oldest first, so the last N are the newest
         number = _url_number(comment.get("issue_url"))
@@ -756,6 +761,14 @@ def sweep_findings(engine, state, decisions, home, now, cfg, regex, defer=(), de
                 state.sources[("S10", ref_text(crepo, charter))] = {"source": "registry", "match": "recorded by %s" % ", ".join(names)}
     except Exception:
         pass   # an unreadable registry raises nothing: the lookup itself says "unknown"
+    spool = getattr(engine, "gate_spool", None)   # S11 (#2216): one finding per repository per hour whose gate fail-opens (read from the shim's spool) exceed the rate
+    for repo, (count, reason) in (spool.busy(now, cfg.get("failopen_per_hour", SWEEP_DEFAULTS["failopen_per_hour"])) if spool is not None else {}).items():
+        last = spool.__dict__.setdefault("last_raise", {})   # the time of the last raise per repository: a burst busy across an hour boundary is still one finding per hour
+        if now - last.get(repo, -1e18) < 3600:
+            continue
+        last[repo] = now
+        found.add(("S11", repo))
+        state.details[("S11", repo)] = "%d gate fail-opens of %s in the last hour; commonest reason: %s" % (count, repo, reason)
     state.unattributed = unattributed
     return sorted(found)
 
@@ -787,6 +800,8 @@ def sweep_verify(engine, state, kind, ref, now, cfg, regex, budget):
     be checked now (no budget, a failed or truncated read): it is neither raised nor audited this pass."""
     if kind in ("S5", "S7", "S10"):
         return True  # about the decision list, or the registry, derived this very pass
+    if kind == "S11":
+        return True  # read from the gate spool this very pass
     hub = getattr(engine, "hub", None)
     repo, _, number = ref.rpartition("#")
     if hub is None or not number.isdigit():
@@ -992,6 +1007,12 @@ def sweep_decisions(engine, decisions, now, errors=()):
                      "deferred": deferred, "unchecked": unchecked, "not_checked": state.s5_unchecked, "not_checked_oldest_seconds": int(max(state.s5_oldest, 0)),
                      "unattributed": getattr(state, "unattributed", 0), "s5_skipped": dict(getattr(state, "s5_skipped", {}))}
 
+    spool = getattr(engine, "gate_spool", None)   # #2216: an over_review line from the gate spool is shown on its pull request's entry
+    for d in (decisions if spool is not None else ()):
+        ref = sweep_ref_of(d, home)
+        lines = spool.over_reviews().get("%s#%d" % ref) if ref and ref[0] else None
+        if lines:
+            d["over_review"] = list(lines)
     sweep_write(engine, state)
     return kept if cfg["enabled"] else decisions
 

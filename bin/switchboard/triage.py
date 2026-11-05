@@ -570,7 +570,9 @@ def triage_read_unit(hub, repo, unit, now, budget):
         records, cut = hub.read_pages("repos/%s/pulls?state=closed&sort=updated&direction=desc&per_page=%d" % (repo, TRIAGE_MERGED_PER_PAGE), cap=1)
     elif unit == "comments":
         since = iso(now - TRIAGE_COMMENT_DAYS * 86400)
-        records, cut = hub.read_comments("triage", repo, since, cap=COMMENT_WINDOW_PAGES)
+        records, cut = hub.read_comments("triage", repo, since, cap=COMMENT_WINDOW_PAGES, budget=budget)
+        budget[0] -= getattr(hub, "_comment_main_pages", None) or sweep_pages_used(records, cut)   # charge once: gap pages were charged by the gap fill
+        return records, cut
     else:
         label = unit.split(":", 1)[1]
         records, cut = hub.read_pages("repos/%s/issues?state=closed&labels=%s&per_page=100" % (repo, quote(label, safe="")),

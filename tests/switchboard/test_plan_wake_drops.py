@@ -325,4 +325,50 @@ def build():
             self.assertEqual(self.lines(), [], msg="the reload dropped the held line; announced is remembered, so it is not raised again")
             self.assertEqual(len(self.audit("plan_wake.announced")), 1)
 
+        def legacy_world(self, announce_legacy):
+            """#2200: a plan with a trailing marker line; its legacy hash (marker included) is the one held."""
+            record = self.post(3, self.plan(), agent="platform")
+            hashes = sb.plan_check.plan_hashes(record["body"])
+            self.assertGreaterEqual(len(hashes), 2)   # the new hash and at least one earlier scheme; how many schemes there are is not pinned
+            if announce_legacy:
+                self.engine.plan_wake = sb.PlanWakeState(self.engine.state_dir)
+                self.engine.plan_wake.announced["acme/api#3:%s" % hashes[-1]] = self.world.clock.now()
+            return record, hashes
+
+        def test_s2_a_plan_announced_under_its_legacy_hash_raises_no_notice_and_records_the_new_key(self):
+            record, hashes = self.legacy_world(True)
+            with mock.patch.object(sb, "_audit_tail", lambda state_dir: []):
+                self.go(2)
+            self.assertEqual(self.lines(), [])
+            self.assertEqual(len(self.audit("plan_wake.announced")), 0)
+            self.assertIn("acme/api#3:%s" % hashes[0], self.engine.plan_wake.announced)
+
+        def test_s2_a_plan_approved_under_its_legacy_hash_records_the_new_key_and_is_not_unapproved(self):
+            record, hashes = self.legacy_world(False)
+            self.engine.plan_wake = sb.PlanWakeState(self.engine.state_dir)
+            self.engine.plan_wake.approved["acme/api#3:%s" % hashes[-1]] = self.world.clock.now()
+            with mock.patch.object(sb, "_audit_tail", lambda state_dir: []):
+                self.go(2)
+            self.assertEqual(self.lines(), [])
+            self.assertIn("acme/api#3:%s" % hashes[0], self.engine.plan_wake.approved)
+
+        def test_s3_an_edited_plan_with_a_legacy_key_held_is_announced_exactly_once(self):
+            record, hashes = self.legacy_world(True)
+            record["body"] += "\nan edit\n" + self.MARK % "platform"
+            record["updated_at"] = sb.iso(self.world.clock.now())
+            with mock.patch.object(sb, "_audit_tail", lambda state_dir: []):
+                self.go(3)
+            self.assertEqual(len(self.lines()), 1)
+            self.assertEqual(len(self.audit("plan_wake.announced")), 1)
+
+        def test_s5_a_work_item_with_its_own_done_when_is_checked_against_it_not_its_asks(self):
+            self.add(3, parent=2, body="## Intent\nx\nDone when: " + "an entirely different own outcome that the plan does not state")
+            self.post(3, self.plan())
+            with mock.patch.object(sb, "_audit_tail", lambda state_dir: []):
+                self.go()
+            got = self.audit("plan_wake.announced")
+            self.assertEqual(len(got), 1)
+            self.assertEqual(got[0]["detail"].get("check") if "detail" in got[0] else got[0].get("check"), "FAIL")
+            self.assertEqual(got[0].get("detail", got[0]).get("stale"), False)
+
     return TestPlanWakeDrops

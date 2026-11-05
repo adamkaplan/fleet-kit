@@ -525,6 +525,8 @@ class World:
             return self.herdr(argv, **kwargs)
         if argv[0] in sb.MEMORY_PROBES.values():   # a healthy, flat machine: the memory test of a new launch (#779) passes
             return subprocess.CompletedProcess(argv, 0, "System-wide memory free percentage: 80%\n" if argv[0].endswith("memory_pressure") else "Swapouts:  5.\n", "")
+        if argv[0] == "git":   # #2159: the merge step's tip read cannot be made in a world without a network; it then refuses nothing
+            return subprocess.CompletedProcess(argv, 128, "", "no network in a test world")
         raise AssertionError("a test reached for a real binary: %r" % argv[0])
 
     def fact(self, to, key, summary="something happened", **extra):

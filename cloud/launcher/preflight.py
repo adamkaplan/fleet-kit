@@ -114,6 +114,28 @@ def _rate_limited(e):
         return True  # cannot tell: refuse
 
 
+REFUSAL_LINE_MAX = 160
+
+
+def refusal_label():
+    """The label the mint chose where it refused (the closed list app_token.LABELS), never matched from text."""
+    label = app_token.REFUSAL.get("label")
+    return label if label in app_token.LABELS else "other"
+
+
+def refusal_line():
+    """The mint's own reason as ONE line of at most 160 printable characters through the launcher's scrub (the same
+    function that scrubs the launcher's output). A scrub that cannot be loaded leaves a fixed line, never the raw one."""
+    try:
+        from cloud_worker import scrub
+    except Exception:  # a copy of this program without the launcher beside it
+        return "the reason is on the standard error of the mint"
+    line = " ".join(str(app_token.REFUSAL.get("line", ""))[:2000].split())
+    line = re.sub(r"\d{1,3}(?:\.\d{1,3}){3}|(?:[0-9A-Fa-f]{0,4}:){2,}[0-9A-Fa-f]{0,4}", "[address]", line)  # an address
+    line = re.sub(r"\d{5,}", "[id]", line)  # an identifier
+    return scrub(line, (), REFUSAL_LINE_MAX)
+
+
 MINT_TRIES = 4
 MINT_WAITS = (2, 5, 10)  # seconds between the tries; a Retry-After over the last one ends the retries
 _sleep = time.sleep      # the one wait (tests replace it with a fake clock)
@@ -133,10 +155,10 @@ def _mint_with_retry(target):
             fail = dict(app_token.LAST_FAILURE)
         reason = str(fail.get("reason") or "")
         if not fail.get("transient"):
-            raise Unreadable("no token could be minted" + (": " + reason if reason else ""))
+            raise Unreadable("no token could be minted (%s): %s" % (refusal_label(), refusal_line()))
         asked = fail.get("retry_after")
         if n >= MINT_TRIES:
-            raise Unreadable("no token could be minted after %s: %s" % (_tries(n), reason))
+            raise Unreadable("no token could be minted after %s: no token could be minted (%s): %s" % (_tries(n), refusal_label(), refusal_line()))
         if asked is not None and asked > MINT_WAITS[-1]:
             raise Unreadable("no token could be minted after %s: %s (GitHub asked for %d seconds, more than the %d seconds waited: not retried)"
                              % (_tries(n), reason, asked, MINT_WAITS[-1]))

@@ -35,156 +35,7 @@ The **Holds** column is descriptive: only the layer numbers are enforced.
 
 | Unit | Layer | Job | Also may use |
 |---|---|---|---|
-| `awaiting_live.py` | 0 | the age cap on the `awaiting-live` exemption from triage | |
-| `brief_advisory.py` | 0 | the pure rules that read an impact brief for the advisory case, the Decisions row and the held-body rationale line (#1215) | |
-| `charter_check.py` | 0 | the one check of the endpoints of a command that moves or copies between charters | |
-| `ci_fresh.py` | 0 | the pure decision that a green run counts only when it ran on the current tip of the base branch (ask #1755) | |
-| `ci_runs.py` | 0 | the newest run of each check decides the CI verdict | |
-| `cloud_end_alert.py` | 0 | the pass that reads the launcher's audit file and tells a cloud worker's boss and the Chief of Staff, once per run and reason, that the launcher ended it (ask #1480; the send function and the bounded parse are handed in) | |
-| `cloud_quick.py` | 0 | the shared selection helper of the cloud pre-push quick mode: picks the tests that read the changed files, holds the scan list and the heavy-test list, resolves a scan selector (standard library only) | |
-| `closed_labels.py` | 0 | a closed issue never keeps asking for an answer | |
-| `dead_hint.py` | 0 | what is known about a dead agent and what to do about it (pure text) | |
-| `header_cache.py` | 0 | the shared file cache of the ask header (Intent, Done-when, state, updated_at, parent): one file per issue, ages, bounds (#1520) | |
-| `comment_cursor.py` | 0 | the cursor file of the incremental comment reads: the newest comment held per consumer and repository (#1889) | |
-| `impact_brief.py` | 0 | the impact brief: what a held change can do, built from the diff and the records only (pure, no clock, no network) (#1215) | |
-| `lost_worker.py` | 0 | a lost worker is told once to its lane and the Chief of Staff, with its cause (#1481) | |
-| `push_watch.py` | 0 | the lane that launched a cloud worker is told of its pushes and of its quiet after a push, from a read of the worker's branches (#1740) | |
-| `merged_labels.py` | 0 | a merged pull request does not keep its hold | |
-| `open_list_alert.py` | 0 | the once-a-day memory of the alert that an open-item list is longer than the ceiling (#1886) | |
-| `plan_approval.py` | 0 | the check of an approval sent as a message (pure) | |
-| `record_json.py` | 0 | the one bounded-depth parse of untrusted record JSON, shared by every reader of it (#1314) | |
-| `turn_start.py` | 0 | when each working session's current turn began, as the daemon first saw it, for `steer_after_minutes` (#1540) | |
-| `queued_wait.py` | 0 | how long a message delivered by queue waited before the session took it, and the `message.consumed` record (#1801) | |
-| `unconsumed_record.py` | 0 | what the daemon tried to steer and which reminder ids it delivered, for #1844 | |
-| `red_ci.py` | 0 | which check conclusions are red, green or say nothing, and the once-per-key memory (pure table) | |
-| `path_walk.py` | 0 | one walk up from a trusted path, shared by the cloud launcher and the installer | |
-| `repo_exclusion.py` | 0 | repositories the owner keeps out of the fleet's view are never watched or read | |
-| `report_fold.py` | 0 | folding a report into an earlier send | |
-| `launch_brief_check.py` | 0 | `launch --issue N` refuses a brief that names another issue or a stale PR head, before anything starts (#1350) | |
-| `required_checks.py` | 0 | parsing the required-check block of a reader's brief and reading a review comment against it (#2203) | |
-| `resume_brief.py` | 0 | a brief given to `launch --resume` is delivered or the command says it was not | |
-| `cloud_channel.py` | 1 | the receiving end of a message between two cloud agents | |
-| `cloud_relay.py` | 2 | the hub half of pod, hub and daemon calls for report, prove, verdict and gates: a bounded in-memory queue and the refusals | |
-| `cloud_client.py` | 1 | the sending end of a message or report through the cloud channel | |
-| `cloud_cluster.py` | 5 | the launcher process, the settings reader, the vault recovery, the cluster client and the tunnel of the cloud launch (#1647); a part of `cloud_worker.py` | |
-| `cloud_first_push.py` | 2 | the state line of a send to a cloud pod and the one `no first push` notice of a launch's checkpoint (#2057); a part of `cloud_worker.py` | |
-| `external_adapter.py` | 1 | a generic client for an outside system that holds decisions and work items | |
-| `agent_calls.py` | 2 | GitHub calls made from agents' shells, counted per account and per hour | |
-| `github_census.py` | 2 | the 5-minute sample line per account and the census of process kinds behind GitHub calls the records do not count (read only) | |
-| `agent_presence.py` | 2 | the one rule for the presence of a worker that has no terminal | |
-| `agent_reconcile.py` | 2 | what a view does with an agent that has no live data | |
-| `endpoint_liveness.py` | 2 | the liveness of an agent row that has no pane to judge (on demand only) | |
-| `health_records.py` | 2 | health recorders: what the daemon has already read, turned into records | |
-| `pr_events.py` | 2 | `pr-state` read from the forwarder's webhook events | |
-| `pr_reading.py` | 2 | the one reading of a pull request that `merge-gate` and the clear packet share | |
-| `size_ceilings.py` | 2 | the one reading of the `size` rows of Known violations and of a file's line count, and the check of a merge result against them (#1605) | |
-| `registry.py` | 2 | the one agent registry (interface frozen in `docs/agent-registry.md`) | |
-| `installed_guard.py` | 2 | is the installed tree the default branch, clean: the one reading of its git state, the entry check and the install of its hooks (#1380) | |
-| `guard_alert.py` | 2 | the standalone alert of a bad installed tree, run from the state directory with nothing of the kit (#1380) | |
-| `guard_record_head_move.py` | 2 | the standalone recorder a git hook runs at each move of the installed tree's HEAD (#1380) | |
-| `decision_core.py` | 3 | the pure core of the Decision subsystem | |
-| `cpu_guard.py` | 4 | the CPU guard: numbers, a clock and a state directory in; a verdict out | |
-| `decision_sync.py` | 4 | the sync engine between the Decision list and an external decision system | |
-| `decisions_pull.py` | 4 | rewrite the local decisions file from a remote source | |
-| `disk_janitor.py` | 4 | the temp-directory janitor | |
-| `fleet_health.py` | 4 | the load of each orchestrator and the threshold alert | |
-| `queue_ejections.py` | 4 | a pull request ejected from the merge queue wakes its orchestrator | |
-| `spotlight_guard.py` | 4 | is each guarded folder still kept out of the Spotlight index | |
-| `switchboard/reminders.py` | 4 | the reminders file, `remind`, checkpoint reminders, budget notice and the GitHub event constants | |
-| `triage_digest.py` | 4 | the stale digest's memory and rules | |
-| `triage_ownerless.py` | 4 | ownerless, quiet issues of a team repository | |
-| `triage_plan_open.py` | 4 | a plan or work-item issue still open after the pull request that implements it merged | |
-| `work_sync.py` | 4 | one external work item per worker assignment, for an outside dashboard | |
-| `chat_clear.py` | 5 | clearing a held PR by saying so in the owner's chat: the offers and the checks | |
-| `clear_carry.py` | 5 | an owner's clear carries over a pure merge of main | |
-| `cloud_channel_server.py` | 5 | an HTTP listener in front of the cloud channel | |
-| `cloud_cli.py` | 5 | the pod-side command to send and report through the cloud channel | |
-| `cloud_cost_report.py` | 5 | USD per day of the cloud fleet, from the launcher's audit lines (read only) | |
-| `cloud_hub.py` | 5 | the cloud switchboard's front door | |
-| `cloud_retired.py` | 5 | the read of a retired cloud worker from its run record, and the boss kept at its removal (#1546); a part of `cloud_worker.py` | |
-| `cloud_way_back_check.py` | 5 | a read-only check of the way back from the cloud to local | |
-| `cloud_worker.py` | 5 | remote (cloud) workers for the switchboard | |
-| `delegated_clear.py` | 5 | the Chief of Staff's clear under the owner's standing order | |
-| `endpoint_send.py` | 5 | the send path's route to an agent that holds no pane | |
-| `epic_record.py` | 4 | an epic-claimed scenario's record on its owning issue: the states and the lines `gates` prints (moved from `plan_ledger.py`) | |
-| `heavy_slots.py` | 5 | CPU slots for heavy commands (`fleet-switchboard heavy`) | |
-| `heavy_slots_watch.py` | 5 | the watchdog and the orphan check of the heavy wrapper (#2034); a part of heavy_slots.py | |
-| `host_liveness.py` | 2 | the liveness of an orchestrator that a charter names by a host (alive, dead or unreachable), on demand only | |
-| `impact_floor.py` | 5 | the impact hold's deterministic floor and decision table | |
-| `impact_hold.py` | 5 | who may clear, hold or release an impact hold | |
-| `item_verdicts.py` | 5 | verdicts for a work item that has no pull request | |
-| `lanes.py` | 5 | move an ask from one orchestrator's charter to another's, with a handover | |
-| `launch_testers.py` | 5 | testers and reviewers from the launch record | |
-| `merge_gate.py` | 5 | the fleet's own merge queue | |
-| `orders_copy.py` | 5 | `orders copy`: a charter's standing orders copied to another charter | |
-| `path_suites.py` | 5 | which test suites exercise a changed path, and the local merge `heavy --changed` runs them on | |
-| `plan_check.py` | 5 | the mechanical check of a plan's scenarios | |
-| `plan_ledger.py` | 5 | the evidence ledger and the gates view of plan-driven development | |
-| `plan_review.py` | 5 | the plan review engine's pure core | |
-| `pod_silence.py` | 0 | a running cloud pod with no push and no report for 20 minutes tells its boss one summary line, once per quiet period (ask #2115; the send and summary functions are handed in) | |
-| `reassign.py` | 5 | reassign a running worker to another orchestrator | |
-| `reds.py` | 5 | classify a pull request's failing tests | |
-| `review_checkout.py` | 5 | a pull request's exact head tree, diff and base copies in one private directory | |
-| `switchboard/body_check.py` | 5 | `preflight-pr --body`: a description against the plan's cause-first scenario | |
-| `switchboard/decisions_a.py` | 5 | the escalated-request, PR-notice and order-notice sections of the decisions code | |
-| `switchboard/decisions_b.py` | 5 | the external-decision host and the sources behind the decision port | |
-| `switchboard/import_v1.py` | 5 | the v1 import converter, the v2 shape checker and the `import-v1` command | |
-| `switchboard/judge.py` | 5 | the policy judge's socket, request handling and replies | |
-| `switchboard/judge_request.py` | 5 | the policy judge's request: what is asked and with what context | |
-| `switchboard/plan_review.py` | 5 | the `plan review` command family (slice R2) | |
-| `switchboard/plan_input.py` | 5 | `plan check` and `plan template`: where a plan is read from, and the plan loaded | |
-| `switchboard/review_laws_install.py` | 5 | `review-laws install`: the review laws copied into a repository | |
-| `switchboard/pr_explain.py` | 5 | `pr-explain` and the checks of a held pull request body | |
-| `switchboard/pins.py` | 5 | `pins`: the existing tests that name what the diff changes or removes (read-only) | |
-| `switchboard/sent_view.py` | 5 | `sent`: a sender's own recent messages with their sent, delivered and picked-up times | |
-| `switchboard/branch_ff.py` | 5 | `clear-head` and `branch-ff`: a cleared head recorded by the Chief of Staff, and a pull request's branch moved to it, fast-forward only | |
-| `switchboard/v2_transport.py` | 1 | the OpenCode v2 client and its HTTP transport | |
-| `tester_agent.py` | 0 | the list of agents a `launch --role tester` accepts, read from the `agents/roles.tsv` file of the checkout (#1963) | |
-| `switchboard/jev.py` | 1 | the Jev client: the decision model, the classifier and the policy judge's questions | |
-| `switchboard/stage_event.py` | 4 | the stage-event marker of a configured bot's comment: the first line only, validated and rebuilt (ask #1575) | |
-| `switchboard/audit.py` | 2 | the audit log | |
-| `switchboard/facts.py` | 4 | the fact sources: the world read into facts | |
-| `switchboard/decision.py` | 3 | the delivery decision: what is sent, to whom, and refused when too long | |
-| `switchboard/engine.py` | 3 | the engine: the single-instance lock and the pass | |
-| `switchboard/triage.py` | 4 | the triage pass (rule family T), shadow by default, written nothing to GitHub | |
-| `switchboard/cockpit.py` | 4 | the Cockpit feed: `cockpit.json` and `cockpit --json`, read-only | |
-| `switchboard/claims_note.py` | 4 | the notice of the scenarios a pull request's `CLAIMS:` line leaves out, once per body, from the held units | |
-| `switchboard/alert_labels.py` | 4 | an alert label on an open issue wakes that repository's orchestrator | |
-| `switchboard/link_scrub.py` | 4 | the signed-link scrub of a GitHub comment summary | |
-| `switchboard/handoff.py` | 5 | the handoff: a brief, not a fork | |
-| `switchboard/agents_verify.py` | 5 | `agents verify`: did the service register our agents as written | |
-| `switchboard/launch_model.py` | 5 | `launch --model` and `--reasoning`: the choice checked against the local service's model list before a session exists | |
-| `switchboard/bot_reviews.py` | 5 | the review bots at a pull request's head: the `gates` lines, the once-per-bot-and-head wake item | |
-| `switchboard/scratch_dir.py` | 5 | `scratch`: the caller's own scratch directory under the state directory, the size bound and the daemon's once-a-day audit line | |
-| `switchboard/secret_spans.py` | 5 | where the first secret-shaped match is: a fixed rule label and numbers, never the text | |
-| `switchboard/answer_delivery.py` | 5 | how an answer reaches the asker, behind the AnswerDelivery port | |
-| `switchboard/caches.py` | 5 | the bounded file cache and the audit tail a report reads | |
-| `switchboard/bootstrap.py` | 5 | the `bootstrap` command | |
-| `switchboard/profile_pieces.py` | 5 | the profile pieces shared by the install, the doctor and the commands that write a profile | |
-| `switchboard/installer.py` | 5 | the installer: the service, its units and the `install` command | |
-| `switchboard/docker_reaper.py` | 5 | the docker reaper: orphan containers and their reaping (ask #321) | |
-| `switchboard/observing.py` | 3 | observing the fleet: what a pass reads of the agents' sessions | |
-| `switchboard/workers_report.py` | 4 | workers report, and a stop without a report is triaged (PR 13) | |
-| `switchboard/batch_decision.py` | 3 | a batch: related findings raised as one decision | |
-| `switchboard/sweep.py` | 5 | the "waiting on the person" sweep (#117) | |
-| `switchboard/plan_notice.py` | 5 | a posted or edited plan tells its approver once per hash (#765) | |
-| `switchboard/disk_prune.py` | 5 | `disk prune`: reclaim old docker build cache and images | |
-| `switchboard/heavy_budget.py` | 4 | a time budget for each heavy reader (#494) | |
-| `switchboard/config_reload.py` | 4 | the config is reloaded when the file changes, and what `status` says of it | |
-| `switchboard/daemon_restart.py` | 5 | `daemon restart`: stop by the recorded pid, then ensure | |
-| `switchboard/labels_ensure.py` | 5 | `labels ensure` | |
-| `switchboard/orders_cos.py` | 5 | `orders --cos`: the Chief of Staff's standing orders | |
-| `switchboard/faults.py` | 0 | the fault switches that make a step fail on purpose in tests | |
-| `switchboard/shadow_classifier.py` | 3 | shadow mode in the engine: the classifier that records what it would do | |
-| `switchboard/worktree_lifecycle.py` | 5 | the worktree lifecycle: register, sweep and reclaim (#321) | |
-| `switchboard/verification.py` | 2 | the webhook signature: signing and checking a body | |
-| `switchboard/judge_rule.py` | 3 | the judge's rule | |
-| `switchboard/review_laws.py` | 5 | `review record` and `review laws` | |
-| `switchboard/job_runs.py` | 5 | `job`: a long run that survives being asked about | |
-| `switchboard/standing_authority.py` | 2 | the standing authority read from the charter and orders | |
-| `switchboard/work_moves.py` | 5 | `move` and `reassign`: where a worker's work goes | |
-| `cloud_relay_daemon.py` | 5 | the daemon half of the cloud hub relay: pulls pod requests from the hub and runs them with the same rules as the local commands | |
-| `fleet-switchboard` | 6 | the entry: today also every section not yet moved to a part (the assembler, the engine, the commands) | |
+(The unit rows are not here: each unit is one file `docs/architecture/units/<unit>.row`, so two changes that add units never edit the same line; see `docs/architecture/units/README.md`. The test reads them as this table's rows.)
 
 ## The clear's closure follows the parts
 
@@ -210,7 +61,9 @@ Kinds (the number is exact, except `size`, a ceiling with headroom: see rule 7):
 | `switchboard/disk_prune.py` | `fleet-switchboard` | entry-import | 6 | the part relies on a standard-library module the entry imported; it gets its own import line |
 | `switchboard/disk_prune.py` | `fleet-switchboard` | namespace | 8 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 | `switchboard/docker_reaper.py` | `fleet-switchboard` | entry-import | 10 | the part relies on a standard-library module the entry imported; it gets its own import line |
+| `switchboard/gate_spool.py` | `fleet-switchboard` | entry-import | 3 | the part relies on standard-library modules the entry imported (`json`, `os`, `Path`); it gets its own import lines |
 | `switchboard/docker_reaper.py` | `fleet-switchboard` | namespace | 14 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
+| `switchboard/gate_spool.py` | `fleet-switchboard` | namespace | 1 | one namespace: the part reads the entry's `_plain` |
 | `switchboard/facts.py` | `switchboard/docker_reaper.py` | namespace | 2 | one namespace: the part reads a name another part defines; its rewiring gives it an import |
 | `switchboard/heavy_budget.py` | `cloud_worker.py` | import | 1 | a name the part reads from another unit without a declared edge |
 | `switchboard/heavy_budget.py` | `fleet-switchboard` | entry-import | 9 | the part relies on a standard-library module the entry imported; it gets its own import line |
@@ -237,7 +90,7 @@ Kinds (the number is exact, except `size`, a ceiling with headroom: see rule 7):
 | `impact_hold.py` | `-` | size | 2,000 | the brief-bound clear (#1215) took it past the limit; to be split (ceiling = the test's own formula: 1510 lines, plus 500, rounded up to a multiple of 500) |
 | `delegated_clear.py` | `-` | size | 1,900 | the registrar lint lives with the clear it protects; a follow-up slice moves it to its own part and lowers the ceiling |
 | `switchboard/reminders.py` | `-` | size | 2,000 | the due-reminder ceiling, the `reminder.waiting` audit line and the late count (#1728) took it past the limit; the waiting and ceiling code moves to its own part in a follow-up and the row is then deleted |
-| `cloud_worker.py` | `-` | size | 1,604 | #2135 (the inspect command, +48) and #1572 (the registry note, +26) took it from 1490 to 1564 (limit 1500); a ceiling = largest measured 1564 plus a small margin; the inspect section is the next one to move to a part |
+| `cloud_worker.py` | `-` | size | 1,604 | #2135 (the inspect command, +48) and #1572 (the registry note, +26) took it from 1490 to 1564 (limit 1500); a ceiling = largest measured 1564 plus a small margin; the inspect section moved to bin/cloud_inspect.py |
 | `switchboard/agents_verify.py` | `fleet-switchboard` | entry-import | 6 | the part relies on a standard-library module the entry imported; it gets its own import line |
 | `switchboard/agents_verify.py` | `fleet-switchboard` | namespace | 7 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 | `switchboard/alert_labels.py` | `fleet-switchboard` | entry-import | 5 | the part relies on a standard-library module the entry imported; it gets its own import line |
@@ -268,6 +121,8 @@ Kinds (the number is exact, except `size`, a ceiling with headroom: see rule 7):
 | `switchboard/bot_reviews.py` | `fleet-switchboard` | entry-import | 1 | the part relies on a standard-library module the entry imported; it gets its own import line |
 | `switchboard/scratch_dir.py` | `fleet-switchboard` | entry-import | 5 | the part relies on a standard-library module the entry imported; it gets its own import line |
 | `switchboard/bot_reviews.py` | `fleet-switchboard` | namespace | 4 | one namespace: the part reads the entry's `_is_bot`, `_login`, `_id` and `GitHubItem` |
+| `switchboard/approval_gate.py` | `fleet-switchboard` | entry-import | 4 | the part relies on standard-library modules the entry imported; it gets its own import lines |
+| `switchboard/approval_gate.py` | `fleet-switchboard` | namespace | 7 | one namespace: the part reads seven names the entry defines (the merge gate's, the ledger context's and the audit's helpers) |
 | `switchboard/scratch_dir.py` | `fleet-switchboard` | namespace | 10 | one namespace: the part reads the entry's names (`build_engine`, `identify_caller`, `agent_scratch_dir`, `_write_small`); its rewiring gives it imports |
 | `switchboard/secret_spans.py` | `fleet-switchboard` | namespace | 2 | one namespace: the finder reads the entry's `_SECRET_PATTERNS` and `redact_command_text` (it must see the very patterns the net applies) |
 | `switchboard/handoff.py` | `fleet-switchboard` | namespace | 40 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
@@ -283,7 +138,7 @@ Kinds (the number is exact, except `size`, a ceiling with headroom: see rule 7):
 | `switchboard/claims_note.py` | `fleet-switchboard` | namespace | 13 | one namespace: the part reads the entry's names (the pull request records, the plan link and the plan facts) |
 | `switchboard/claims_note.py` | `plan_check.py` | import | 1 | a name the part reads from another unit without a declared edge |
 | `switchboard/claims_note.py` | `switchboard/plan_notice.py` | namespace | 1 | one namespace: the part reads a name another part defines (`plan_wake_state`); its rewiring gives it an import |
-| `switchboard/claims_note.py` | `switchboard/plan_input.py` | namespace | 1 | one namespace: the part reads `parse_plan_source` |
+| `switchboard/claims_note.py` | `switchboard/plan_input.py` | namespace | 2 | one namespace: the part reads `parse_plan_source` and `governing_done_when` |
 | `switchboard/v2_transport.py` | `fleet-switchboard` | entry-import | 15 | the part relies on a standard-library module the entry imported; it gets its own import line |
 | `switchboard/v2_transport.py` | `fleet-switchboard` | namespace | 2 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 | `fleet-switchboard` | `-` | size | 24,500 | the entry still holds every section not yet moved to a part; each move slice lowers the ceiling |
@@ -370,6 +225,9 @@ A site is listed by the function it sits in and its kind, with a count: `import(
 | `cloud_worker.py` | `_load_cluster:exec_module` | 1 | uses an identifier of the import machinery (exec_module) |
 | `cloud_worker.py` | `_load_cluster:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
 | `cloud_worker.py` | `_load_cluster:sys.modules` | 1 | uses `sys` beyond its plain attributes |
+| `cloud_worker.py` | `_load_inspect:exec_module` | 1 | uses an identifier of the import machinery (exec_module) |
+| `cloud_worker.py` | `_load_inspect:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
+| `cloud_worker.py` | `_load_inspect:sys.modules` | 1 | uses `sys` beyond its plain attributes |
 | `cloud_worker.py` | `_registry_note:load_module(string)` | 1 | names a loading builtin by a string (a name in a list counts: over-counting by design) |
 | `cloud_worker.py` | `_first_push:load_module(string)` | 1 | names a loading builtin by a string (a name in a list counts: over-counting by design) |
 | `cloud_worker.py` | `_retired:load_module(string)` | 1 | names a loading builtin by a string (a name in a list counts: over-counting by design) |
