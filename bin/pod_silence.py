@@ -26,11 +26,18 @@ def _load(path, parse):
 
 
 def _save(path, workers):
+    line = json.dumps({"workers": workers}) + "\n"
+    try:
+        with open(str(path), "r", encoding="utf-8") as handle:
+            if handle.read(len(line) + 1) == line:
+                return   # nothing changed: an idle pass does not rewrite the file (TestWriteOnlyOnChange)
+    except (OSError, ValueError):
+        pass
     temp = "%s.%d.tmp" % (path, os.getpid())
     fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
         with os.fdopen(fd, "w") as handle:
-            handle.write(json.dumps({"workers": workers}) + "\n")
+            handle.write(line)
         os.replace(temp, path)
     except BaseException:
         try:
