@@ -461,3 +461,72 @@ class TestCommentCursorMutants(Base):
         self.assertEqual(counts, [1])
         self.assertEqual(len(result.failures), 1, msg=str(result.errors))
         self.assertIn("a loose record is held once however often the API serves it", result.failures[0][1])
+
+
+class AscendingWorld(CommentWorld):
+    """CommentWorld that also answers direction=asc, as GitHub does."""
+
+    def gh_api(self, path, paginate=True, timeout=None):
+        query = dict(part.split("=", 1) for part in path.split("?", 1)[1].split("&"))
+        if query.get("direction") != "asc":
+            return super().gh_api(path, paginate, timeout)
+        self.requests.append(path)
+        page = int(query.get("page", "1"))
+        rows = sorted((c for c in self.comments if c["updated_at"] >= query["since"]), key=lambda c: (c["created_at"], c["id"]))
+        out = rows[(page - 1) * 100:page * 100]
+        for c in out:
+            self.served[c["id"]] = self.served.get(c["id"], 0) + 1
+        return [out]
+
+
+class TestCommentWindowGapFill(HubCase):
+    """A window left with a gap is read to its start by time: each pass reads a few pages of the missing part, oldest first, within the pass's budget."""
+    TOTAL = 3700
+
+    def passes(self, world, budget=12, limit=40):
+        hub, used, rounds = self.hub(world), [], 0
+        sb.take_comment_cuts()
+        got = None
+        while rounds < limit:
+            rounds += 1
+            before = len(world.requests)
+            left = [budget]
+            got, cut = hub.read_comments("sweep", REPO, self.since, cap=sb.COMMENT_WINDOW_PAGES, budget=left)
+            used.append(len(world.requests) - before)
+            if not cut:
+                break
+        return hub, got, cut, used, rounds
+
+    def test_s2_the_gap_is_filled_and_closed_over_passes(self):
+        world = AscendingWorld(NOW - 7 * DAY, self.TOTAL)
+        hub, got, cut, used, rounds = self.passes(world)
+        unread = len(world.comments) - len({c["id"] for c in got})
+        self.assertEqual((unread, len(hub._comment_gaps), cut), (0, 0, False), msg="unread %d, open gaps %d after %d passes" % (unread, len(hub._comment_gaps), rounds))
+        self.assertGreater(rounds, 1)
+
+    def test_s3_no_warning_after_the_gap_closes(self):
+        world = AscendingWorld(NOW - 7 * DAY, self.TOTAL)
+        hub, got, cut, used, rounds = self.passes(world)
+        self.assertEqual({k: v for k, v in sb.take_comment_cuts().items() if k == ("sweep", REPO)}, {}, msg="warning kept after the gap closed")
+        self.clock[0] += DAY
+        hub.read_comments("sweep", REPO, self.since, cap=sb.COMMENT_WINDOW_PAGES, budget=[12])
+        self.assertNotIn(("sweep", REPO), sb._COMMENT_CUTS)
+
+    def test_s4_each_comment_once_and_no_pass_over_its_budget(self):
+        world = AscendingWorld(NOW - 7 * DAY, self.TOTAL)
+        hub, got, cut, used, rounds = self.passes(world, budget=12)
+        ids = [c["id"] for c in got]
+        self.assertEqual(len(ids), len(set(ids)))
+        # the window start (boundary) and the edge of each pass are served again (since is inclusive): one per pass at most
+        twice = sum(n - 1 for n in world.served.values())
+        self.assertLessEqual(twice, 100 + rounds)   # the page that meets the held comments serves up to 100 of them again
+        self.assertEqual(len([u for u in used if u > 30 + 12]), 0)
+        self.assertTrue(all(u <= 12 for u in used[1:]))
+
+    def test_a_pass_with_no_budget_reads_no_gap_pages(self):
+        world = AscendingWorld(NOW - 7 * DAY, self.TOTAL)
+        hub = self.hub(world)
+        hub.read_comments("sweep", REPO, self.since, cap=sb.COMMENT_WINDOW_PAGES, budget=[5])
+        before = len(world.requests)
+        hub.read_comments("sweep", REPO, self.since, cap=sb.COMMENT_WINDOW_PAGES, budget=[0])
+        self.assertEqual([p for p in world.requests[before:] if "direction=asc" in p], [])
