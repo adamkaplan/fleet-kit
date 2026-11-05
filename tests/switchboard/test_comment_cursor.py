@@ -162,7 +162,7 @@ class TestCommentCursor(PublishMixin, HubCase):
 
         def one_read(now):
             self.clock[0] = now
-            hub.read_comments("sweep", REPO, sb.iso(now - 7 * DAY), cap=sb.COMMENT_WINDOW_PAGES)
+            hub.read_comments("sweep", REPO, sb.iso(now - 7 * DAY), cap=sb.COMMENT_WINDOW_PAGES, budget=[0])   # budget 0: no gap page is read, the gap stays open
             for repo, (held, days) in sb.take_comment_cuts().items():
                 sb.comment_window_alert(engine, repo, held, days, now)
 
@@ -248,8 +248,8 @@ class TestCommentCursor(PublishMixin, HubCase):
         sb.take_comment_cuts()
         world = CommentWorld(NOW - 7 * DAY, 3500, start=2 * DAY, step=100)
         hub = self.hub(world)
-        hub.read_comments("sweep", REPO, self.since, cap=sb.COMMENT_WINDOW_PAGES)
-        hub.read_comments("triage", REPO, sb.iso(NOW - 14 * DAY), cap=sb.COMMENT_WINDOW_PAGES)
+        hub.read_comments("sweep", REPO, self.since, cap=sb.COMMENT_WINDOW_PAGES, budget=[0])   # budget 0: the gaps stay open
+        hub.read_comments("triage", REPO, sb.iso(NOW - 14 * DAY), cap=sb.COMMENT_WINDOW_PAGES, budget=[0])
         self.assertEqual(sorted(sb._COMMENT_CUTS), [("sweep", REPO), ("triage", REPO)])
         taken = sb.take_comment_cuts()
         self.assertEqual(list(taken), [REPO])   # one alert a day per repository
@@ -336,6 +336,44 @@ class TestCommentCursor(PublishMixin, HubCase):
         bodies = [c["body"] for c in got]
         self.assertEqual((bodies.count("loose with id"), bodies.count("loose without id"), bodies.count("other loose without id")), (1, 1, 1), msg="a loose record is held once however often the API serves it")
         self.assertEqual(len(got), 9)
+
+    def gap_passes(self, budget_each, passes=12):
+        """#2192: a window of 3,500 comments (more than one pass reads) read over several passes; returns the world, the hub, the pages read per pass and the last merged list."""
+        sb.take_comment_cuts()
+        world = CommentWorld(NOW - 7 * DAY, 3500, start=2 * DAY, step=100)
+        hub = self.hub(world)
+        pages, got = [], []
+        for _ in range(passes):
+            before = len(world.requests)
+            budget = [budget_each]
+            got, _cut = hub.read_comments("sweep", REPO, self.since, cap=sb.COMMENT_WINDOW_PAGES, budget=budget)
+            pages.append(len(world.requests) - before)
+        return world, hub, pages, got
+
+    def test_s2_a_gap_is_filled_oldest_first_and_closed_over_passes(self):
+        world, hub, pages, got = self.gap_passes(34)
+        missing = {c["id"] for c in world.comments} - {c["id"] for c in got}
+        self.assertEqual((len(missing), len(hub._comment_gaps)), (0, 0), msg="%d comments never returned, %d gaps open" % (len(missing), len(hub._comment_gaps)))
+        control_world, control_hub, _, control_got = self.gap_passes(0)   # budget 0: no gap page is read (today's behaviour)
+        self.assertGreater(len(control_world.comments) - len(control_got), 0)
+        self.assertEqual(len(control_hub._comment_gaps), 1)
+
+    def test_s3_no_warning_after_the_gap_closes(self):
+        world, hub, pages, got = self.gap_passes(34)
+        sb.take_comment_cuts()
+        self.clock[0] = NOW + DAY
+        hub.read_comments("sweep", REPO, sb.iso(NOW + DAY - 7 * DAY), cap=sb.COMMENT_WINDOW_PAGES, budget=[34])
+        self.assertEqual(sb.take_comment_cuts(), {})
+        _, _, _, _ = self.gap_passes(0)
+        self.assertEqual(list(sb.take_comment_cuts()), [REPO], msg="control: an open gap says the warning")
+
+    def test_s4_each_comment_is_returned_once_and_no_pass_reads_over_its_budget(self):
+        world, hub, pages, got = self.gap_passes(34)
+        ids = [c["id"] for c in got]
+        self.assertEqual((len(ids) - len(set(ids)), len([n for n in pages if n > 34])), (0, 0), msg="pages per pass %s" % pages)
+        self.assertEqual(set(ids), {c["id"] for c in world.comments})
+        small = self.gap_passes(33)[2]
+        self.assertEqual(len([n for n in small if n > 33]), 0, msg="pages per pass %s" % small)
 
     def test_both_windows_are_named_when_both_consumers_are_cut(self):
         sb.take_comment_cuts()
