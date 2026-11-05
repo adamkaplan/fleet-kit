@@ -89,7 +89,8 @@ The **Holds** column is descriptive: only the layer numbers are enforced.
 | `fleet_health.py` | 4 | the load of each orchestrator and the threshold alert | |
 | `queue_ejections.py` | 4 | a pull request ejected from the merge queue wakes its orchestrator | |
 | `spotlight_guard.py` | 4 | is each guarded folder still kept out of the Spotlight index | |
-| `switchboard/reminders.py` | 4 | the reminders file, `remind`, checkpoint reminders, budget notice and the GitHub event constants | |
+| `switchboard/reminders.py` | 4 | the reminders file, `remind`, budget notice and the GitHub event constants | |
+| `switchboard/checkpoint_reminders.py` | 4 | the checkpoint reminders a launch sets from the brief's CHECKPOINT and the overdue wake (cut out of `reminders.py` unchanged: the part was past the 1,500-line ceiling) | |
 | `triage_digest.py` | 4 | the stale digest's memory and rules | |
 | `triage_ownerless.py` | 4 | ownerless, quiet issues of a team repository | |
 | `triage_plan_open.py` | 4 | a plan or work-item issue still open after the pull request that implements it merged | |
