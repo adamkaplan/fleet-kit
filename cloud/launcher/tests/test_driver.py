@@ -1,6 +1,7 @@
 """Slice K2 (#563): the operator driver (run_task.py). Scenarios S5 (every end cleans up, no secret in a file) and the
 checklist cases of a secret-handling driver. Offline: the fake kubectl (it becomes a stub headless server on port-forward), no
 cluster. The planted values are synthetic, in several lengths and encodings."""
+import pathlib
 import base64
 import json
 import os
@@ -255,7 +256,7 @@ class Driver(base.Base):
                     f.write(text)
                 exit_file = os.path.join(self.tmp.name, "export.exit")
                 if code:
-                    open(exit_file, "w").write(str(code))
+                    pathlib.Path(exit_file).write_text(str(code))
                 try:
                     p, out = self.run_driver()
                 finally:
