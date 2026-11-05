@@ -3,6 +3,7 @@ Offline: a loopback stub of the GitHub API, a throwaway RSA key, the real mint a
 
 Every set here is derived from `app_token.EXPECTED_PERMISSIONS` (one table); each check has a mutant that must be caught.
 The Mac shim (shims/app_mint.py) has its own, different set and is not touched."""
+import pathlib
 import io
 import json
 import os
@@ -52,7 +53,7 @@ def refused(perms, module=app_token):
 
 
 def mutant_module(old, new):
-    src = open(os.path.join(os.path.dirname(HERE), "app_token.py")).read()
+    src = pathlib.Path(os.path.join(os.path.dirname(HERE), "app_token.py")).read_text()
     assert old in src, old
     mod = type(sys)("app_token_mutant")
     mod.__file__ = os.path.join(os.path.dirname(HERE), "app_token.py")
@@ -261,8 +262,10 @@ class NoPod(td.Driver):
         tam.Stub.answer = {"token": tam.TOKEN, "expires_at": tam.iso(3500), "repositories": [{"name": "widget-service", "full_name": td.REPO, "owner": {"id": 9}}],
                            "permissions": {k: v for k, v in TABLE.items() if k != "issues"}}
         with open(self.gitcmd, "w") as f:
-            f.write('#!/bin/sh\nCW_APP_ID_CMD="echo 12345" CW_APP_INSTALLATION_CMD="echo 678" CW_APP_KEY_CMD="cat \'%s\'" CW_GITHUB_API_BASE="%s" '
-                    'exec "%s" "%s" "$GH_REPO"\n' % (key, self.base, sys.executable, os.path.join(os.path.dirname(HERE), "app_token.py")))
+            f.write('#!/bin/sh\nd="%s/route-$$" && mkdir -m 700 "$d" || exit 1\n'
+                    'CW_APP_ID_CMD="echo 12345" CW_APP_INSTALLATION_CMD="echo 678" CW_APP_KEY_CMD="cat \'%s\'" CW_GITHUB_API_BASE="%s" '
+                    '"%s" "%s" "$GH_REPO" --out "$d/token"; s=$?\n[ $s -eq 0 ] && cat "$d/token"\nrm -rf "$d"\nexit $s\n'
+                    % (d, key, self.base, sys.executable, os.path.join(os.path.dirname(HERE), "app_token.py")))
 
     def test_s6_a_token_without_issues_read_refuses_before_any_pod_exists(self):
         p, out = self.run_driver()
@@ -276,6 +279,8 @@ class NoPod(td.Driver):
         tam.Stub.answer["permissions"] = dict(TABLE)   # the same driver with the full table mints and goes on
         p, out = self.run_driver()
         self.assertNotIn("lacks the permission", out)
+        self.assertEqual(p.returncode, 0, out)   # the token really came through the override: the launch created its Secret and pod with it
+        self.assertIn('"create"', self.read(self.env["FAKE_KUBE_CALLS"]))
 
 
 for _n in [n for n in dir(td.Driver) if n.startswith("test")]:
