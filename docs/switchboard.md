@@ -306,7 +306,7 @@ depends on it.
 | `fleet-switchboard <command>` | Short-lived CLI, run by you and by agents | `launch`, `send`, `remind`, `intent`, `pending`, `status`, `audit`, `poke`. `send` applies the delivery rule and delivers itself; it does not need the daemon |
 | Harness adapter | A class shared by the daemon and the CLI, one per harness kind | Everything harness-specific: launch, observe, note, wake |
 | herdr plugin manifest | `herdr-plugin.toml` | Starts the daemon; turns herdr events into pokes |
-| Files | `$XDG_STATE_HOME/fleet-switchboard/` (mode 0700): `audit.jsonl`, `reminders.json`, `github-read.json` (a read marker per repo: a disposable cursor, below), the lock. Config in `$XDG_CONFIG_HOME/fleet-switchboard/config.json`, because the kit supports Python 3.9, which has no `tomllib` | See [Data](#data) |
+| Files | `$XDG_STATE_HOME/fleet-switchboard/` (mode 0700): `audit.jsonl`, `reminders.json`, `intent-told.json` (who was told which Intent edit, #1437), `github-read.json` (a read marker per repo: a disposable cursor, below), the lock. Config in `$XDG_CONFIG_HOME/fleet-switchboard/config.json`, because the kit supports Python 3.9, which has no `tomllib` | See [Data](#data) |
 | Decision model client (PR 7) | A class in `bin/fleet-switchboard`, stdlib `urllib`. The OpenRouter key comes from the switchboard's config and never enters an agent's environment | Jev calls for the classifier and the shadow judges |
 | `fleet-hooks` plugin (PR 8–9) | A v2 plugin of a few lines, loaded from the Lab's config | Forwards v2's `permission` hook, and `prompt` if needed, to `fleet-switchboard`; holds no logic |
 | GitHub forwarders (PR 5) | One `gh webhook forward` child process per watched repo, supervised by the daemon, which receives on a listener bound to 127.0.0.1 | Relays GitHub webhooks to the daemon |
@@ -668,6 +668,8 @@ touches a record with a pod, names every record it removes, writes the audit
 line and the registry note that `retire` writes, and makes no `stop` call
 (there is no pod). `retire` of such a record ends it cleanly, as it always
 did.
+
+**The capacity block of `launch --cloud` (#1793).** Before it creates the pod, `launch --cloud` prints one read-only block on standard error (the standard output stays the one JSON line): for each worker shape of the launcher's `SHAPES` table the number of nodes with room, the Pending pod count and the last `FailedScheduling` line (scrubbed, at most 200 characters), with `nodes: not read` or `events: not read` for a read the login is refused, one bounded read of 5 seconds, and it never refuses, delays or changes the launch. Room is counted from the pods this login can see, so it is an upper bound (the pods of other namespaces are not seen).
 
 **`read` of a retired cloud worker (#1546).** After a pod is retired, `read NAME` no longer fails with the tunnel error. It looks for a live cloud record and then for a local agent first; only when nothing answers to the name does it look for a run record of that name under the run-record directory (code: `bin/cloud_retired.py`). It then prints a first line saying the text is from the record of a retired run and when it ended (the time in the run record, or, for a record with no end time, the time in its directory name), then the last text of the worker in the newest run record (the latest end; of two with the same end, the later directory name), and exits 0. `read --cloud` asks for a live cloud record only, so it is not reached by this fallback.
 
@@ -2836,7 +2838,13 @@ dropped by it. Re-arming with `--key` stores the new ttl (or none). Tests: `Test
 `remind --key <text>` names the purpose: arming again with the same key replaces your pending reminder of that key (one pending per
 owner and key; another owner's or another key's reminder is never touched), and `remind --list` shows the key. A fired, undelivered
 reminder is dropped when a newer one of the same owner and key is due and will be delivered (one `reminder.drop_superseded` audit line names both ids). A
-delivery 5 minutes or more after its due time says "late by N min". Arming a text over 4000 characters (the delivery cap) prints a
+delivery 5 minutes or more after its due time says "late by N min".
+
+A reminder copy delivered more than 30 minutes after it fired begins with the line "delayed: sent HH:MMZ" (the sent time in UTC; the mark replaces
+the "late by" note); a copy delivered within 30 minutes is unchanged (#1468). Queued copies with the same sender, recipient and text (keyed or not)
+are delivered as ONE line with the count and the newest sent time ("(30 copies, newest sent HH:MMZ)"); every copy is acknowledged, so none is delivered
+again. Another sender, recipient or text is never merged. Cause: each fired copy was its own `reminder:<id>` fact and `merge_wake_facts` merges only
+`WAKE_KINDS` (sweep, triage), so an unkeyed reminder and a keyed one that was not superseded (no #1285 drop) came one per turn. Arming a text over 4000 characters (the delivery cap) prints a
 warning with the number of characters over. A newer reminder still in the future does NOT drop an older fired one: the older is delivered (with its late note) and the newer fires as usual, so a lane never gets nothing. A keyed reminder needs a known sender (an unidentified caller is refused). The key is cut at 80 characters, so two longer keys with the same first 80 characters are one key. The match is the owner and the key, not the recipient `to`. A cut body ends with an ellipsis before the note. The late note is added before the 4000 cap and kept: the body is cut, not the note. Without `--key` nothing changes. When the daemon drops it, the setter gets ONE notice naming the reminder, its text and the
 reason (the issue closed, the pull request merged), audited as `reminder.drop_notice`; the notice is sent only by the sweep
 that removes the reminder, so it is never repeated. An issue already closed at creation is refused (exit 2, "already
@@ -6513,6 +6521,12 @@ State files the gate reads or writes (`STATE_FILE_TABLE`, checked by `test_every
 | `--cancel` | removes one of your own reminders by id | `remind_manage` tests |
 | `late by` | a note after 5 minutes, before the cap | exact text and cap tests |
 | `TEXT_CAP` | the 4000 cap equals `MESSAGE_CAP`; arming warns | 4003 vs 4000 |
+
+## An Intent edit is told once (#1437)
+
+An Intent edit is delivered once per recipient, however many wakes follow. The edit is named by the issue (with its repo), the edit time (`updated_at`) and a body hash (a hash of the changed Intent and Done-when text), so a second real edit of the same issue is a new edit and is delivered once too. The record of who was told is kept in `intent-told.json` in the state directory (bounded in size and age), so it survives a restart; a missing or corrupt file reads as empty and is audited, never an error. A failed write of the record is audited once per failure episode (no message text); a restart after a failed write repeats the edit once.
+
+The cause: the `intent.edit` fact is made again on every pass, and the held item drops only when the engine finds its key in the transcript, so an edit that was delivered but never matched came back at every wake; the record is what stops that.
 
 ## Header cache (#1520)
 
