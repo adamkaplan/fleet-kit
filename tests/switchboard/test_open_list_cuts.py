@@ -35,7 +35,7 @@ def real_hub(total, requests=None):
         number = int(re.search(r"[?&]page=(\d+)", path).group(1))
         return [items[(number - 1) * 100:number * 100]]
     hub.gh_api = gh_api
-    hub.read_comments = lambda consumer, repo, since, cap: hub.read_pages(   # #1889: what read_pages answered for the comments path
+    hub.read_comments = lambda consumer, repo, since, cap, budget=None: hub.read_pages(   # #1889: what read_pages answered for the comments path
         "repos/%s/issues/comments?since=%s&sort=created&direction=desc&per_page=100" % (repo, since), older=("created_at", since), cap=cap)
     return hub
 
