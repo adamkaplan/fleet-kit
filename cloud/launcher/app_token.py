@@ -199,6 +199,14 @@ def b64(b):
     return base64.urlsafe_b64encode(b).rstrip(b"=").decode()
 
 
+def _vault_reason(exc, secret):
+    """The short, scrubbed reason the vault command did not run: a timeout names the 60 s, an OSError its own reason."""
+    if isinstance(exc, subprocess.TimeoutExpired):
+        return "the key vault did not answer within 60 s"
+    why = re.sub(r"[^A-Za-z0-9 .,:_-]", "?", str(getattr(exc, "strerror", None) or type(exc).__name__))[:60]
+    return "the key vault could not be reached: %s" % why
+
+
 def vault(env_name, secret):
     cmd = os.environ.get(env_name)
     if cmd:
@@ -214,7 +222,7 @@ def vault(env_name, secret):
         if len(p.stdout) > MAX_BYTES:
             die("the vault command for %s printed more than %d bytes" % (secret, MAX_BYTES))
     except (OSError, subprocess.TimeoutExpired):
-        die("could not run the command for %s" % secret, transient=True)
+        die(_vault_reason(sys.exc_info()[1], secret), transient=True)
     val = p.stdout.strip() if secret != "cw-app-key" else p.stdout
     if p.returncode != 0 or not val.strip():
         die("the vault command for %s failed or printed nothing" % secret, transient=True)
