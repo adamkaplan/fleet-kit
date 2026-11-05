@@ -692,17 +692,23 @@ class S10OneReader(Fixture):
         {"name": "worker", "state": {"terminated": {"reason": "Error", "exitCode": 2}}}]}
     SOURCES = (os.path.join(REPO_ROOT, "cloud", "launcher", "cloud_worker.py"), os.path.join(REPO_ROOT, "bin", "cloud_worker.py"))
 
+    # Exactly two named readers are allowed, for different scopes:
+    #  _failed_facts  (#1446): reads containerStatuses AND initContainerStatuses, state AND lastState: it explains a pod that ended Failed.
+    #  _pod_state_of  (#1802): reads only containerStatuses 'state': it tells the live state of a running pod.
+    # A third reader is a mutant.
+    ALLOWED = ("_failed_facts", "_pod_state_of")
+
     @staticmethod
     def readers(text):
-        """The number of functions (blocks from a 'def ' line to the next) whose body holds the key "terminated" or "exitCode"."""
+        """The names of the functions (blocks from a 'def ' line to the next) whose body holds the key "terminated" or "exitCode"."""
         blocks, cur = [], None
         for line in text.splitlines():
             if line.lstrip().startswith("def "):
-                cur = []
+                cur = (line.strip().split("(")[0][4:], [])
                 blocks.append(cur)
             elif cur is not None:
-                cur.append(line)
-        return sum(1 for b in blocks if any('"terminated"' in l or '"exitCode"' in l for l in b))
+                cur[1].append(line)
+        return [n for n, b in blocks if any('"terminated"' in l or '"exitCode"' in l for l in b)]
 
     def hostile_places(self, pods):
         texts = []
@@ -739,23 +745,24 @@ class S10OneReader(Fixture):
         self.assertEqual(good, 5, getattr(self, "fail_test", None))
         hostile = self.hostile_places(pods)
         self.assertEqual(hostile, 0)
-        found = 0
+        names = []
         for path in self.SOURCES:
             with open(path) as f:
-                found += self.readers(f.read())
-        self.assertEqual(found, 1, "readers found: %d" % found)
-        print("S10: pods giving the reader's reason and code in the record and the status line %d of 5, readers found %d (second readers %d), "
-              "hostile text in %d places" % (good, found, found - 1, hostile))
+                names += self.readers(f.read())
+        found = len(names)
+        self.assertEqual(sorted(set(names)), sorted(self.ALLOWED), "readers found: %s" % names)
+        self.assertEqual(found, len(set(names)), "a reader is defined twice: %s" % names)
+        print("S10: pods giving the reader's reason and code in the record and the status line %d of 5, readers found %d (allowed %d), "
+              "hostile text in %d places" % (good, found, len(self.ALLOWED), hostile))
         # (a) the scan mutant: a second small function appended to the source text, in memory
         with open(self.SOURCES[0]) as f:
             real = f.read()
         mutant = real + "\n\ndef second_reader(t):\n    return t.get(\"exitCode\")\n"
-        self.assertEqual(self.readers(real), 1)
-        count = self.readers(mutant)
-        self.assertEqual(count, 2)
-        with self.assertRaises(AssertionError) as cm:
-            self.assertEqual(count, 1, "readers found: %d" % count)
-        self.assertIn("2", str(cm.exception))
+        self.assertEqual(sorted(set(self.readers(real))), sorted(self.ALLOWED))
+        third = self.readers(mutant)
+        count = len(third) - 1
+        self.assertIn("second_reader", third)
+        self.assertNotEqual(sorted(set(third)), sorted(self.ALLOWED))   # the scan's own check would refuse it
         caught_scan = 1
         # (b) the hostile mutant: the raw reason, unscrubbed
         old, new = "return self.kube.scrub(text, 300), code", "return text, code"
@@ -768,6 +775,23 @@ class S10OneReader(Fixture):
         self.assertGreaterEqual(places, 1)
         print("S10 mutants: control passes 1 of 1, scan mutant fails %d of 1 (second readers %d), hostile mutant caught %d of 1 "
               "(hostile places %d), mutation applied %s" % (caught_scan, count - 1, int(places >= 1), places, old in inspect.getsource(cw.Launcher._failed_facts)))
+
+
+class S12InitAndLastState(Fixture):
+    """An init-container failure and a lastState OOMKilled keep their reason and exit code (#1446's reader, not #1802's)."""
+    def test_init_and_last_state_keep_reason_and_code(self):
+        cases = {
+            "initfail": {"phase": "Failed", "initContainerStatuses": [{"name": "init", "state": {"terminated": {"reason": "Error", "exitCode": 3}}}],
+                         "containerStatuses": [{"name": "worker", "state": {"waiting": {"reason": "PodInitializing"}}}]},
+            "lastoom": {"phase": "Failed", "containerStatuses": [{"name": "worker", "state": {"waiting": {"reason": "CrashLoopBackOff"}},
+                        "lastState": {"terminated": {"reason": "OOMKilled", "exitCode": 137}}}]},
+        }
+        for w, st in cases.items():
+            self.fail(w, st)
+        self.reap()
+        recs = {r["worker"]: r for r in self.records()}
+        self.assertEqual((recs["initfail"]["pod_failed_reason"], recs["initfail"]["exit_code"]), ("Error (exit 3)", 3))
+        self.assertEqual((recs["lastoom"]["pod_failed_reason"], recs["lastoom"]["exit_code"]), ("OOMKilled (exit 137)", 137))
 
 
 if __name__ == "__main__":
