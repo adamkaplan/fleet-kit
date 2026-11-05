@@ -659,6 +659,7 @@
           "MessageTooLong",
           "Plan",
           "_line_of",
+          "clock_day",
           "clock_utc",
           "collapse_riders",
           "compose",
@@ -851,6 +852,7 @@
         "bin/pr_reading.py": "loaded only by `cmd_merge_gate`: the merge gate command, not the clear",
         "bin/resume_brief.py": "loaded only by `cmd_launch`, not the clear",
         "bin/review_checkout.py": "loaded only by `cmd_review_checkout`, the reviewer checkout command, not the clear",
+        "bin/tester_agent.py": "loaded only by the launch refusal of a tester, not the clear",
         "bin/triage_ownerless.py": "loaded only by the triage passes, which the clear does not run",
         "bin/triage_plan_open.py": "loaded only by the triage plan-open pass, which the clear does not run"
       }

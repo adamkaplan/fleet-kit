@@ -6326,6 +6326,7 @@ ADOPT_BY_DAEMON = "the switchboard"
 # Every function that reads a worker's boss from the raw `reports_to` text, and why it may. Anything else must go through `boss_name` (the lookup that
 # resolves the role alias and the boss record). A test scans this file for `reports_to` readers and fails when one is not in this table.
 BOSS_READ_SITES = {
+    "bin/cloud_worker.py:_final_message": "a cloud worker's own endpoint record (not a discovered agent): its reports_to is read from the record the retire already holds and validated as an agent name; only the address of the one final message",
     "bin/fleet-switchboard:headless_target": "a retired worker is not discovered: its STORED metadata (boss record applied), resolved through `resolve_boss`, as `reattach_caller_problem` does",
     "bin/lost_worker.py:_losses": "a cloud worker is not discovered: the launching lane is the `reports_to` text of its own cloud record, only the address of an alert (the loss is told to the Chief of Staff too)",
     "bin/push_watch.py:run_pass": "a cloud worker is not discovered: the launching lane is the `reports_to` text of its own cloud record, only the address of a push item (the item is told to that lane and nobody else)",
@@ -9882,7 +9883,8 @@ def cloud_end_tick(engine, discovery):
     return load_module("cloud_end_alert").scan_audit(cloud_audit_path(), Path(state_dir) / CLOUD_END_ALERT_FILE, Path(state_dir) / "cloud",
                                                      _read_small(state_dir, LAST_REPORT_FILE), lambda to, text: engine.send("switchboard", to, text),
                                                      load_module("record_json").parse_bounded,
-                                                     lambda worker, detail: engine.audit is not None and engine.audit.append(engine.actor, "cloud_end_alert.send_failed", worker, detail))
+                                                     lambda worker, detail: engine.audit is not None and engine.audit.append(engine.actor, "cloud_end_alert.send_failed", worker, detail),
+                                                     lambda directory, worker: load_module("cloud_worker").bind(globals())._retired().last_message(directory, state_dir, worker))
 
 
 def cloud_turn_activity(worker):
@@ -9940,7 +9942,11 @@ def push_watch_tick(engine, discovery):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     ns = types.SimpleNamespace(parse_iso=parse_iso, _one_line=_one_line, parse_bounded=load_module("record_json").parse_bounded)
-    return module.run_pass(ns, engine, engine.now(), lambda path: engine.gh_api(path, paginate=False), (getattr(engine, "config", None) or {}).get("push_watch"))
+    hub = getattr(engine, "hub", None)   # the GitHub reader is the hub (Switchboard has no gh_api); with none, skip the pass
+    if hub is None:
+        engine.audit.append(engine.actor, "push_watch.skipped", None, "no GitHub hub")
+        return []
+    return module.run_pass(ns, engine, engine.now(), lambda path: hub.gh_api(path, paginate=False), (getattr(engine, "config", None) or {}).get("push_watch"))
 
 
 def finish_pass(engine, discovery, report):
@@ -9970,6 +9976,10 @@ def finish_pass(engine, discovery, report):
         cloud_end_tick(engine, discovery)
     except Exception as err:
         engine._failed("cloud-end-alert", "cloud-end-alert", err, report)
+    try:
+        load_module("cloud_worker").bind(globals())._first_push().first_push_tick(engine, discovery)   # #2057: a cloud pod with no first push by its checkpoint is named once to its orchestrator
+    except Exception as err:
+        engine._failed("first-push", "first-push", err, report)
     try:
         cloud_turn_tick(engine, discovery)
     except Exception as err:
@@ -14757,6 +14767,11 @@ def _cmd_launch(args, runner, now, socket_call=None):
     if getattr(args, "stack", False) and not getattr(args, "cloud", False):   # before anything is read or called: the option is the cloud launcher's
         sys.stderr.write("%s: --stack needs --cloud: the nested Docker stack is a cloud worker's pod; nothing was created\n" % PROG)
         return EXIT_USAGE
+    if getattr(args, "role", None) == "tester" and getattr(args, "agent", None):   # #1963: before every route; the allowed agents are read from the checkout's agents/roles.tsv
+        problem = load_module("tester_agent").line_for(args.agent, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+        if problem:
+            sys.stderr.write(problem + "\n")
+            return EXIT_USAGE
     if getattr(args, "cloud", False):   # a worker in the cloud (#371): its own module; nothing below runs
         return run_cloud("cmd_launch", args, runner, now)
     refuse_cloud_name(args.name)   # a name that has a cloud record is not launched locally (#640)
@@ -17377,7 +17392,7 @@ def tree_file_exists(runner=None):
 
 
 def _evidence(args):
-    text = plan_ledger.clip(redact_command_text(args.evidence), plan_ledger.EVIDENCE_LIMIT)
+    text = plan_ledger.bounded_text(redact_command_text(args.evidence), plan_ledger.EVIDENCE_LIMIT, "evidence")
     if not text:
         raise LedgerCommandError("--evidence is required: a link, or what you ran and saw")
     return text
@@ -23048,8 +23063,10 @@ def cmd_preflight_pr(args, runner, now):
                 return EXIT_ERROR
             args.merged = False
             code = cmd_preflight_pr_in(args, runner, now, merged.path)
+            code = EXIT_ERROR if run_new_test_checks(runner, merged.path, now) and code == EXIT_OK else code
             return EXIT_ERROR if run_new_bin_guards(ps, runner, merged.path, added, now) and code == EXIT_OK else code
     code = cmd_preflight_pr_in(args, runner, now, root)
+    code = EXIT_ERROR if run_new_test_checks(runner, root, now) and code == EXIT_OK else code
     ps = load_module("path_suites")   # #1457: without --merged the one table of NEW_BIN_GUARDS runs too, when the change adds a file under bin/; a change that adds none prints nothing more
     return EXIT_ERROR if run_new_bin_guards(ps, runner, root, preflight_added(runner, root), now) and code == EXIT_OK else code
 
@@ -23093,6 +23110,14 @@ def run_new_bin_guards(ps, runner, root, added, now):
         failed += verdict != "PASS"
         print("%s %s (%ds): %s" % (verdict, guard[0], max(0, int(now() - started)), " ".join(command)))
     return failed
+
+
+def run_new_test_checks(runner, root, now):
+    if (d := runner(["git", "diff", "--name-only", "--diff-filter=AM", "origin/HEAD...HEAD", "--", "tests/switchboard/"], cwd=root, capture_output=True, text=True)).returncode == 0 and not any(n.startswith("tests/switchboard/test_") for n in d.stdout.split()): return 0
+    if not os.path.exists(tool := os.path.join(root, "tools", "new-test-checks")): return print("SKIP new-test-checks: tools/new-test-checks is not in this tree") or 0   # #1967: a new or changed tests/switchboard/test_*.py is read before the push
+    started, done = now(), runner([sys.executable, os.path.abspath(__file__), "heavy", "--", sys.executable, tool, "--preflight"], cwd=root, capture_output=True, text=True)
+    if done.returncode == 0 and not done.stdout.strip(): return 0   # no such file against the base: nothing is printed
+    print("%s new-test-checks (%ds)" % ("PASS" if done.returncode == 0 else "FAIL", max(0, int(now() - started)))); sys.stderr.write(done.stdout if done.returncode else ""); return int(done.returncode != 0)
 
 
 def cmd_preflight_pr_in(args, runner, now, root):
