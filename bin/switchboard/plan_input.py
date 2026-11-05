@@ -258,6 +258,8 @@ def parse_pairs(text):
         if new_mark is None or new_mark[1] != "NEW" or new_mark[2] != want:
             raise PlanApplyRefused("OLD %d has no NEW %d after it" % (want, want), 1)
         pairs.append([texts[index], texts[index + 1]])
+    if pairs[-1][1].endswith("\n"):   # the newline that ends the file belongs to the file, as the newline before a next header does to no text
+        pairs[-1][1] = pairs[-1][1][:-1]
     why, last = "", pairs[-1][1]
     cut = last.rfind("\n\nWhy:")
     if cut >= 0:
