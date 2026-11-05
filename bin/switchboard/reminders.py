@@ -1440,7 +1440,7 @@ def cmd_ci_queue(args, runner, now):
         sys.stderr.write("%s: ci-queue: %s\n" % (PROG, _one_line(str(err), 120)))
         return EXIT_ERROR
     report = ci_queue_measure([r for r in runs if (_ci_time(r.get("created_at")) or 0) <= end], jobs_by_run, end, args.hours,
-                              CI_QUEUE_GATE_LEGS, docs_only)
+                              CI_QUEUE_GATE_LEGS + ci_queue_workflow_jobs(CI_QUEUE_WORKFLOWS), docs_only)
     print(json.dumps(report, indent=1, sort_keys=True) if args.json else "\n".join(ci_queue_lines(report)))
     return EXIT_OK
 

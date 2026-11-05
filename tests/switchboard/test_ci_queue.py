@@ -225,8 +225,9 @@ def build(HandoffCase, FAKE_GH):
             self.assertEqual((REPO / "docs" / "ci-queue-report.md").read_text().count("decided by the owner"), 1)
             self.assertIn("tester's live measure", (REPO / "docs" / "ci-queue-report.md").read_text())
 
-        def serve(self, requests):
+        def serve(self, requests, extra=None):
             runs, jobs = fixture()
+            jobs.update(extra or {})
 
             def route(argv, **kwargs):
                 if argv[0] != FAKE_GH:
@@ -307,4 +308,21 @@ def build(HandoffCase, FAKE_GH):
             cut = [c for c in space["candidates"] if c["kind"] == "cut"]
             self.assertEqual(len([c for c in cut if "shards" in c["what"] or "matrix" in c["what"]]), 0)
             self.assertEqual([(c["what"], c["job_minutes_per_day"]) for c in cut], [("stale-report", 7)])
+
+        def test_s2_the_command_reads_the_workflow_files_for_the_gate_names(self):
+            folder, _ = self.gate_jobs()
+            runs, jobs = fixture()
+            jobs[1] = jobs[1] + [job("shards (2/3)", 1395, 1395, 1400)]
+            original = sb.CI_QUEUE_WORKFLOWS
+            sb.CI_QUEUE_WORKFLOWS = folder
+            try:
+                with captured() as (out, err):
+                    code = sb.main(["ci-queue", "--repo", "o/r", "--until", at(24 * 60), "--json"], runner=self.serve([], extra={1: jobs[1]}), now=lambda: NOW,
+                                   socket_call=self.world.herdr.socket)
+            finally:
+                sb.CI_QUEUE_WORKFLOWS = original
+            self.assertEqual(code, 0, err.getvalue())
+            cut = [c["what"] for c in json.loads(out.getvalue())["candidates"] if c["kind"] == "cut"]
+            self.assertEqual(len([w for w in cut if "shards" in w]), 0)
+            self.assertIn("stale-report", cut)
     return TestCiQueue
