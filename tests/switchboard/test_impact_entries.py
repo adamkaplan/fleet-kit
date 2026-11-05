@@ -144,8 +144,8 @@ class TestImpactEntriesMissing(unittest.TestCase):
         import impact_floor
         return guard.unlisted(BIN, impact_floor.load_matrix(matrix_path)["owner_hold"])
 
-    # bin/cloud_end_alert.py is named by the guard on the integration tip too (before this change): the control records it, the planted gaps add to it
-    BASELINE = ["bin/cloud_end_alert.py"]
+    # the guard names nothing on the untouched copy (bin/cloud_end_alert.py, once unlisted on the tip, has its entry file); the planted gaps are the only names
+    BASELINE = []
 
     def test_s4_the_control_the_untouched_copy_names_only_the_baseline(self):
         t, path = self.planted("no-such-entry")

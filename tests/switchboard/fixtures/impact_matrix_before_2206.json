@@ -299,6 +299,7 @@
         "only"
       ],
       "exempt": {
+        "bin/cloud_end_alert.py": "chief_not_needed only decides whether the Chief of Staff is among the recipients of a pod-end message (#2202); it clears, releases and merges nothing. Trace: its only caller is the pass in bin/cloud_end_alert.py that builds the send list, and its value only drops the chief from a recipient list handed to the send function; no value of it feeds an authority function.",
         "bin/brief_advisory.py": "is_advisory and owner_hold_wanted only read a brief that bin/impact_brief.py built and answer whether the daemon writes an owner-hold label for a pull request the floor already holds; they clear, release and merge nothing. Trace: the only callers are impact_plan in bin/impact_hold.py and the Decisions row in bin/decision_core.py; the clear itself (bin/delegated_clear.py) does not read them, and a pull request whose brief names a material risk is held as before.",
         "bin/path_suites.py": "gate_finding words an INFORMATION line (a pull request changes a path and names none of the suites that exercise it). Trace: its only caller is the gates finding in bin/fleet-switchboard, which prints the line for people to read and never changes a gate verdict; no role, tier, identity, verdict, clear or merge is produced or read (ask #1045).",
         "bin/agent_calls.py": "release_notice gives back a once-an-hour message claim for an account's budget notice. Trace: its only caller is the budget notice command in bin/fleet-switchboard, which calls it after claim_notice when the reminder could not be added; it truncates a rate-limit file in the state directory and returns nothing, so no role, tier, identity, verdict or clear is produced or read.",
@@ -463,6 +464,7 @@
         "bin/switchboard/stage_event.py",
         "bin/switchboard/scratch_dir.py",
         "bin/switchboard/docker_reaper.py",
+        "bin/switchboard/gate_spool.py",
         "bin/switchboard/workers_report.py",
         "bin/switchboard/batch_decision.py",
         "bin/switchboard/sweep.py",
@@ -849,6 +851,11 @@
           "lab_fact_source",
           "read_janitor_record"
         ],
+        "bin/switchboard/gate_spool.py": [
+          "GateSpoolFacts",
+          "_spool_chunk",
+          "_spool_line"
+        ],
         "bin/switchboard/workers_report.py": [
           "ReportError",
           "ask_report_owed",
@@ -1015,6 +1022,7 @@
         "bin/epic_record.py": "loaded only by the gates commands (gates, gates ask-close, item-gates) and the epic prove and verdict commands, never by the clear: no function the clear reaches calls it",
         "bin/external_adapter.py": "loaded only by the external-decision adapter path, which the clear does not run",
         "bin/health_records.py": "loaded only by the health and pane pass, which the clear does not run",
+        "bin/issue_line.py": "loaded only by `cmd_issue_line`, the issue-line command, not the clear",
         "bin/lanes.py": "loaded only by `cmd_move`: the lane command, not the clear",
         "bin/launch_brief_check.py": "loaded only by `launch_brief_mismatch`, the launch-time reader of the brief (#1350), which the clear cannot reach",
         "bin/launch_testers.py": "loaded only by the tester launch command, not the clear",
