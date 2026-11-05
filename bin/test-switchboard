@@ -22804,6 +22804,9 @@ class TestSweep(Base):
         ("held_check", "no held_check on a held PR", {"held_check": KeyError}, {}, "not ready"),
         ("held_check", "a raising held_check", {"held_check": lambda: 1 / 0}, {}, "not checked"),
         ("held_check", "a held_check that finds a defect", {"held_check": lambda: ["no table"]}, {}, "not ready"),
+        ("approval", "G0c enforced and no approval event at the plan hash", {"approval": {"G0c": {"tracked": True, "status": "missing", "detail": "no plan.approved event", "missing": ["no plan.approved event"]}}}, {}, "not ready"),
+        ("approval", "G0c enforced and the events could not be read", {"approval": {"G0c": {"tracked": True, "status": "missing", "detail": "events could not be read", "missing": ["events could not be read"]}}}, {}, "not ready"),
+        ("approval", "G0c enforced and an approval event at the plan hash", {"approval": {"G0c": {"tracked": True, "status": "ok", "detail": "approved at plan hash", "missing": []}}}, {}, "ready"),
         ("floor", "floor without a decision", {"floor": {"decision": None, "unreadable": None, "rehold": None}}, {}, "not checked"),
         ("floor", "floor of the wrong type", {"floor": "hold"}, {}, "not checked"),
         ("floor", "re-hold unreadable", {"floor": {"decision": "hold", "unreadable": "bad json", "rehold": None}}, {}, "not checked"),
@@ -66885,6 +66888,7 @@ class TestLoadAlert(Base):
 sys.path.insert(0, str(REPO / "tests" / "switchboard"))
 _architecture = importlib.import_module("test_architecture")
 TestArchitectureDocument, TestArchitectureDocumentFailurePaths = _architecture.TestArchitectureDocument, _architecture.TestArchitectureDocumentFailurePaths
+_approval_gate = importlib.import_module("test_approval_gate"); _approval_gate.HOST = sys.modules[__name__]; TestApprovalGateReader, TestApprovalGateCommands, TestApprovalPair = _approval_gate.TestApprovalGateReader, _approval_gate.TestApprovalGateCommands, _approval_gate.TestApprovalPair   # #1735
 TestSharesDeadVerdict = importlib.import_module("test_dead_verdict").TestSharesDeadVerdict   # #1668
 # The closure test (ask #1092, slice S13) is run the same way: the clear's closure follows the parts (tools/derive-closure).
 _closure = importlib.import_module("test_closure")
@@ -67403,6 +67407,10 @@ class TestSupportRebinding(unittest.TestCase):
         for path in sorted((REPO / "tests" / "switchboard").glob("test_*.py")):   # the test files the classes moved to follow the same rule
             with self.subTest(file=path.name):
                 self.assertEqual(self.rebindings(path.read_text(), self.moved_names()), [], "a moved name rebound in %s does not reach the moved code (rebound)" % path.name)
+
+# Self-registration (#2206): every Test* class of tests/switchboard/test_*.py that no line above binds is bound here, so a new test file needs no loader line.
+DISCOVERED_TEST_CLASSES = importlib.import_module("support.discovery").bind_discovered(__name__, Path(__file__).resolve().parent.parent / "tests" / "switchboard")
+
 
 def main(argv):
     watch_parent()

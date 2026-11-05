@@ -44,6 +44,7 @@ switchboard/profile_pieces.py
 switchboard/installer.py
 switchboard/sent_view.py
 switchboard/bot_reviews.py
+switchboard/approval_gate.py
 switchboard/branch_ff.py
 switchboard/stage_event.py
 switchboard/scratch_dir.py
