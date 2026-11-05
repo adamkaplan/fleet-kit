@@ -680,6 +680,7 @@ NOT_SETTINGS = {
     "CW_AGENT": "set by the launcher into an orchestrator pod's environment from --agent (worker or orchestrator); the entrypoint reads it inside the pod",
     "FLEET_CLOUD_CHANNEL_URL": "set by the launcher into an orchestrator pod's environment from the CW_HUB_CHANNEL_URL row (or its default); the cloud command reads it in the pod",
     "FLEET_CLOUD_TOKEN_FILE": "set by the launcher into an orchestrator pod's environment: the fixed path of the channel secret's file in the pod's memory-backed directory",
+    "CW_REVIEW_COMMENT": "set by the launcher into the pod's environment from cloud/launcher/repo-review-comments.json (optional, per repository, absent = not set); the end hook reads it inside the pod",
     "CW_WORKDIR": "the pod's own working directory (default /work/repo), read by the hook and the record inside the pod",
     # the other login kind: a file with CW_CLOUD_SERVER (required) is the token route; these select kubectl's own context instead
     "CW_KUBE_CONTEXT": "the other login kind (kubectl's own context); a lane with the settings file has the required CW_CLOUD_SERVER and so the token route, and the two never mix",

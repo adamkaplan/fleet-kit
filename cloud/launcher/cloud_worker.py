@@ -2048,6 +2048,45 @@ def last_audit_line(path, action, runtime_id=None):
     return None
 
 
+_TAIL_COUNT = threading.local()   # audit lines parsed by AuditTail, per thread: a pass or a tick reads its own thread's count
+
+
+def tail_lines_parsed():
+    return getattr(_TAIL_COUNT, "n", 0)
+
+
+class AuditTail:
+    """One read of the audit file's tail (the same 262,144-byte window as last_audit_line), made at the FIRST question and kept: for each
+    (action, runtime id) the newest line's (ok, reason). A line that is not JSON is skipped; the newest line wins. `parsed` counts the lines parsed."""
+
+    def __init__(self, path):
+        self.path, self.parsed, self.newest, self.loaded = path, 0, {}, False
+
+    def _load(self):
+        self.loaded = True
+        try:
+            with open(self.path, "rb") as f:
+                f.seek(0, os.SEEK_END)
+                f.seek(max(0, f.tell() - 262144))
+                lines = f.read().decode(errors="replace").splitlines()
+        except OSError:
+            return
+        for raw in reversed(lines):
+            self.parsed += 1
+            _TAIL_COUNT.n = tail_lines_parsed() + 1
+            try:
+                rec = json.loads(raw)
+            except ValueError:
+                continue
+            if isinstance(rec, dict):
+                self.newest.setdefault((rec.get("action"), rec.get("runtime_id")), (rec.get("ok"), rec.get("reason")))
+
+    def get(self, action, runtime_id):
+        if not self.loaded:
+            self._load()
+        return self.newest.get((action, runtime_id))
+
+
 class TokenRefresh:
     """What one refresh attempt came to: the state, the reason (never a value) and the token that was written."""
 
@@ -2542,6 +2581,12 @@ def _pod_repo(pod):
     return _pod_env(pod, "CW_REPO")
 
 
+FAILED_EVENTS_MAX = 10
+FAILED_EVENT_CHARS = 300
+FAILED_POD_KEEP_SECONDS = 600   # a Failed pod without unpushed work is deleted this long after its record
+FAILED_UNWRITTEN_TOLD = set()   # the Failed pods whose unwritable record was already reported (one report, not one per pass)
+
+
 def ann(pod, key, default=None):
     return pod["metadata"].get("annotations", {}).get("cw/" + key, default)
 
@@ -2672,6 +2717,25 @@ def hub_on(env):
     return bool((env.get("CW_HUB_CHANNEL_URL") or "").strip() or (env.get("CW_HUB_REGISTRY_SECRET") or "").strip())
 
 
+REVIEW_COMMENTS = os.path.join(os.path.dirname(os.path.realpath(__file__)), "repo-review-comments.json")   # optional; absent = no comment anywhere
+
+
+def review_comment(repo, path=None):
+    """The review comment configured for repo (a JSON object beside this file: lowercased OWNER/NAME -> one-line text, at most 500 characters), or ''.
+    Optional per repository: a missing, unreadable or malformed file, a missing key or a bad value gives '' (no comment is posted). Never raises."""
+    try:
+        with open(path or REVIEW_COMMENTS, "rb") as f:
+            raw = f.read(65537)
+        data = json.loads(raw) if len(raw) <= 65536 else {}
+        v = data.get(str(repo).lower()) if isinstance(data, dict) else None
+        if isinstance(v, str) and v.strip() and len(v) <= 500 and not re.search("[\\x00-\\x1f\\x7f-\\x9f]", v) \
+                and not any(p.search(v) for p in CREDENTIAL_PATTERNS):
+            return v.strip()
+    except Exception:
+        pass
+    return ""
+
+
 def render_pod(a, worker, name, now, hard, env, run_names=()):
     image = a.image or env.get("CW_CLOUD_IMAGE")
     if not image:
@@ -2686,6 +2750,9 @@ def render_pod(a, worker, name, now, hard, env, run_names=()):
          "CW_AUDIT_RUNTIME_ID": "pod/" + name}
     if endpoint:
         e["CW_TOKEN_ENDPOINT"] = endpoint
+    comment = review_comment(a.repo)
+    if comment:   # the repository's review comment, posted once by the end hook; none configured = no variable
+        e["CW_REVIEW_COMMENT"] = comment
     agent = getattr(a, "agent", None) or "worker"
     if agent not in AGENTS:
         raise CloudError("--agent must be one of %s, got %r; nothing was created" % (" or ".join(AGENTS), str(agent)[:40]), EXIT_USAGE)
@@ -2937,6 +3004,7 @@ class Launcher:
             info["rid"] = "pod/" + name + ("-0" if persistent else "")
             if persistent:
                 info["persistent"] = True
+            issue_no = parse_issue_number(getattr(a, "issue", None))   # before anything is made
             check_repo_allowed(a.repo, self.env)  # before anything is read or made
             if not NAME_RE.fullmatch(worker):
                 raise CloudError("bad worker name %r" % worker, EXIT_USAGE)
@@ -2988,7 +3056,7 @@ class Launcher:
                 if hub:
                     made["reg"] = (self._registry_secret(), worker)   # set before the call: a half write is undone by the cleanup
                     self._register(worker, run_values[CHANNEL_SECRET_KEY], spec if not persistent else {"metadata": {"name": name + "-0"}},
-                                   self.env.get("CW_CLOUD_DOMAIN", "example.internal"), password, persistent)
+                                   self.env.get("CW_CLOUD_DOMAIN", "example.internal"), password, persistent, a.repo, issue_no)
                 self._make(made, "sts" if persistent else "pod", self.kube.apply, spec)
                 if getattr(a, "stack", False):
                     self._start_stack_pod(worker, name, spec, made, a.wait)
@@ -3076,13 +3144,17 @@ class Launcher:
     def _registry_secret(self):
         return self.env.get("CW_HUB_REGISTRY_SECRET") or DEFAULT_REGISTRY_SECRET
 
-    def _register(self, agent, channel_secret, spec, domain, password, persistent=False):
-        """The hub's registry: {agent: sha256 hex of the channel secret} and {agent: {url, session, password_file}}. Only the hash is stored."""
+    def _register(self, agent, channel_secret, spec, domain, password, persistent=False, repo=None, issue=None):
+        """The hub's registry: {agent: sha256 hex of the channel secret} and {agent: {url, session, password_file[, persistent][, repo][, issue]}}. Only the hash is stored."""
         digest = hashlib.sha256(channel_secret.encode()).hexdigest()
         name = spec["metadata"]["name"]
         entry = {"url": hub_agent_url(name, self.env.get("CW_CLOUD_NAMESPACE", "cw")), "session": "", "password_file": "%s/%s" % (HUB_PW_DIR, agent)}
         if persistent:   # only a persistent orchestrator's entry has the key
             entry["persistent"] = True
+        if repo is not None:
+            entry["repo"] = repo
+        if issue is not None:
+            entry["issue"] = issue
 
         def change(sec, agents):
             sec[agent], agents[agent] = digest, entry
@@ -3549,6 +3621,7 @@ class Launcher:
             raw = res.get("skipped")
             return {"pushed": bool(res.get("pushed")), "wip_branch": text(res.get("wip_branch"), 200) or None,
                     "head_on": text(res.get("head_on"), 100) or None,
+                    "pr_note": text(res.get("pr_note"), 120),
                     "skipped": [text(x, 200) for x in raw if isinstance(x, str)][:50] if isinstance(raw, list) else [],
                     "note": text(res.get("note")), "error": text(res.get("error")) or ("end hook gave an unreadable error" if res.get("error") else "")}
         except Exception:
@@ -3707,6 +3780,14 @@ class Launcher:
 
     def record(self, pod):
         name = pod["metadata"]["name"]
+        if (pod.get("status") or {}).get("phase") == "Failed" and not self._failed_name_fits(pod):   # not this launcher's pod: nothing is read of it
+            return {"worker": ann(pod, "worker"), "runtime_id": "pod/" + name, "phase": "Failed", "idle_since": None,
+                    "deadlines": {"idle": None, "hard": ann(pod, "hard-deadline")}, "cost_estimate_usd": self.cost(pod)}
+        if (pod.get("status") or {}).get("phase") == "Failed":   # a dead pod answers nothing: its reason is read, once, from the cluster
+            note, _ = self._failed_note(pod)
+            return {"worker": ann(pod, "worker"), "runtime_id": "pod/" + name, "phase": "Failed", "idle_since": None,
+                    "deadlines": {"idle": None, "hard": ann(pod, "hard-deadline")}, "cost_estimate_usd": self.cost(pod),
+                    "pod_failed": note["pod_failed_reason"][:160], "status_line": "pod failed: " + note["pod_failed_reason"][:160]}
         act = self.activity(name)
         if ann(pod, "persistent") is not None:   # under the worker's name (NAME-0 is only its runtime id): persistent, no deadline, its age and accrued cost
             hours = max((self.clock() - parse_iso(ann(pod, "started"))).total_seconds() / 3600, 0)
@@ -3719,6 +3800,111 @@ class Launcher:
                 "deadlines": {"idle": iso(since + dt.timedelta(seconds=idle_for)) if since else None, "hard": ann(pod, "hard-deadline")},
                 "cost_estimate_usd": self.cost(pod)}
 
+    # -- a pod that ended Failed (#1442) --
+    def _failed_facts(self, name):
+        """ONE read of a Failed pod's own status and of its events: (reason text, exit code or None, [events]). Every text goes through the
+        launcher's scrub; at most FAILED_EVENTS_MAX events, each cut to FAILED_EVENT_CHARS. A read that fails is said in the reason."""
+        try:
+            whole = self.kube.get_pod(name) or {}
+        except CloudError as e:
+            whole = {"_unread": self.kube.scrub(e, 120)}
+        try:
+            seen = self.kube.pod_events(name)
+        except CloudError:
+            seen = []
+        status = whole.get("status") or {}
+        terminated = []
+        for key in ("containerStatuses", "initContainerStatuses"):
+            for c in status.get(key) or []:
+                for where in ("state", "lastState"):
+                    t = (c.get(where) or {}).get("terminated")
+                    if isinstance(t, dict):
+                        terminated.append(t)
+        chosen = ([t for t in terminated if t.get("exitCode") not in (0, None)] or terminated or [{}])[0]
+        code = chosen.get("exitCode") if isinstance(chosen.get("exitCode"), int) else None
+        events = []
+        for ev in [e for e in seen if isinstance(e, dict)][-FAILED_EVENTS_MAX:]:
+            events.append(self.kube.scrub("%s: %s" % (ev.get("reason") or "", ev.get("message") or ""), FAILED_EVENT_CHARS))
+        last = ([e for e in seen if isinstance(e, dict)] or [{}])[-1]
+        word = chosen.get("reason") or None
+        if word and code is not None:
+            text = "%s (exit %d)" % (word, code)
+        elif word or code is not None:
+            text = word or "exit %d" % code
+        else:
+            text = status.get("reason") or whole.get("_unread") or last.get("reason") or "no reason was given"
+        return self.kube.scrub(text, 300), code, events, self.kube.scrub(status.get("message") or "", 300)
+
+    def _failed_name_fits(self, pod):
+        """True when the pod's worker annotation is a worker name (NAME_RE, the whole text): only then it may become a part of a path."""
+        worker = ann(pod, "worker")
+        return isinstance(worker, str) and bool(NAME_RE.fullmatch(worker))
+
+    def _failed_key(self, pod):
+        return ann(pod, "run-id") or (pod.get("metadata") or {}).get("uid") or pod["metadata"]["name"]
+
+    def _failed_find(self, pod):
+        """The record of this Failed pod (found by the pod's run id), as a dict, or None."""
+        worker, tail = ann(pod, "worker") or "", hashlib.sha1(self._failed_key(pod).encode()).hexdigest()[:6]
+        root = self.recorder.root()
+        try:
+            names = sorted(os.listdir(root))
+        except OSError:
+            return None
+        for n in names:
+            if n.startswith(worker + "-") and n.endswith("-" + tail):   # the name is a guide; the record's own fields decide
+                try:
+                    with open(os.path.join(root, n, "run.json")) as f:
+                        info = json.load(f)
+                except (OSError, ValueError):
+                    continue
+                if isinstance(info, dict) and info.get("pod_run_id") == self._failed_key(pod) and info.get("exit_reason") == "pod failed" \
+                        and info.get("worker") == worker:
+                    return info
+        return None
+
+    def _failed_aged(self, worker, pod, note, now):
+        """True when the record is old enough for the pod to go, False when not, None when its time cannot be read. Such a record counts as
+        no usable record: the pod is left (neither rewritten nor deleted), the caller says so once, and the other pods of the pass go on."""
+        try:
+            return (now - parse_iso(note["recorded_at"])).total_seconds() >= FAILED_POD_KEEP_SECONDS
+        except (ValueError, TypeError):
+            return None
+
+    def _failed_note(self, pod):
+        """(record, new): the run record of a Failed pod; read ONCE (the pod's status and events) and written once; a second call finds it."""
+        if not self._failed_name_fits(pod):   # no path part is built from a text that is not a worker name: nothing is read or written
+            return {"unwritten": True, "skipped": True, "pod_failed_reason": "", "pod_message": "the pod carries no usable worker name"}, False
+        found = self._failed_find(pod)
+        if found:
+            return found, False
+        name, now = pod["metadata"]["name"], self.clock()
+        text, code, events, message = self._failed_facts(name)
+        worker = ann(pod, "worker") or ""
+        run_id = "%s-%s-%s" % (worker, now.strftime("%Y%m%dT%H%M%SZ"), hashlib.sha1(self._failed_key(pod).encode()).hexdigest()[:6])
+        info = {"worker": worker, "repository": _pod_repo(pod), "run_id": run_id, "pod_run_id": self._failed_key(pod), "start": ann(pod, "started") or "",
+                "end": iso(now), "recorded_at": iso(now), "exit_reason": "pod failed", "pod_failed_reason": text, "exit_code": code,
+                "pod_message": message, "events": events, "head_sha": None, "transcript": "unavailable", "reason": "the pod ended Failed; no session could be read"}
+        directory = None
+        try:
+            base = run_record.private_root(self.recorder.root())
+            directory = os.path.join(base, run_id)
+            if not os.path.realpath(directory).startswith(os.path.realpath(base) + os.sep):   # a second line of defence
+                directory = None
+                raise OSError("the record directory is outside the record root")
+            os.makedirs(directory, mode=0o700, exist_ok=True)
+            run_record.write_private(directory, "run.json", json.dumps(info, sort_keys=True) + "\n")
+        except OSError as e:
+            if directory:
+                try:
+                    os.rmdir(directory)   # an empty directory of a record that was not written is not left behind
+                except OSError:
+                    pass
+            info["pod_message"] = self.kube.scrub("the record could not be written: %s" % e, 200)
+            info["unwritten"] = True
+            return info, False   # not written: the next pass tries again
+        return info, True
+
     def status(self, a):
         if a.worker and not NAME_RE.fullmatch(a.worker):
             raise CloudError("bad worker name %r" % a.worker, EXIT_USAGE)
@@ -3728,6 +3914,71 @@ class Launcher:
         if a.worker and not pods[0]:
             raise CloudError("unknown worker %s" % a.worker, EXIT_USAGE)
         return [self.record(p) for p in pods]
+
+    # -- inspect: ONE read-only look inside a running pod (slice 2 of ask #2115) --
+    def inspect(self, a):
+        """What the pod is doing NOW, read-only: ONE `kubectl exec` of the pod's `cw-pod-inspect` (one JSON line). A pod whose image has no such command
+        (or whose answer is not that line) is read by the fallback: git in /work/repo and `cw-worker-activity` through exec; every other field is listed in
+        `missing`. EVERY text is scrubbed here (Kube.scrub) before it is returned: nothing the pod printed leaves raw."""
+        if not NAME_RE.match(a.worker or ""):
+            raise CloudError("bad worker name %r" % a.worker, EXIT_USAGE)
+        name = pod_name(a.worker)
+        if not self.kube.get_pod(name):
+            raise CloudError("unknown worker %s" % a.worker, EXIT_USAGE)
+        try:
+            raw, source = json.loads(self.kube.exec(name, "cw-pod-inspect")), "cw-pod-inspect"
+            if not isinstance(raw, dict):
+                raise ValueError("not an object")
+        except (CloudError, ValueError):
+            raw, source = self._inspect_fallback(name), "fallback"
+        return self._inspect_clean(a.worker, raw, source)
+
+    def _inspect_fallback(self, name):
+        """The reads that need no helper in the image: git through exec for the branch, the unpushed commits and the dirty tree; the activity
+        tool for the idle seconds. What it cannot read is named in `missing`."""
+        def git(*args):
+            try:
+                return self.kube.exec(name, "git", "-C", "/work/repo", *args)
+            except CloudError:
+                return None
+        raw, missing = {}, []
+        branch = git("rev-parse", "--abbrev-ref", "HEAD")
+        raw["branch"] = branch.strip() if branch is not None and branch.strip() else None
+        shas = git("rev-list", "--max-count=50", "HEAD", "--not", "--remotes")
+        raw["unpushed"] = {"count": len(shas.split()), "shas": shas.split()[:10]} if shas is not None else None
+        dirty = git("status", "--porcelain")
+        raw["dirty"] = len([x for x in dirty.splitlines() if x.strip()]) if dirty is not None else None
+        act = self.activity(name)
+        raw["idle_seconds"] = (max(0, int((self.clock() - act[1]).total_seconds())) if act and not act[0] and act[1] else None)
+        raw["in_flight"], raw["last_calls"], raw["last_text"], raw["last_push"] = None, [], "", None
+        raw["missing"] = ["in_flight", "last_calls", "last_text", "last_push"] + [k for k in ("idle_seconds", "branch", "unpushed", "dirty") if raw.get(k) is None]
+        return raw
+
+    def _inspect_clean(self, worker, raw, source):
+        """The ONE shape that is printed. Every text is cut and scrubbed; a number is an int or None; a sha is hex or dropped."""
+        scrub_ = self.kube.scrub
+
+        def num(v):
+            return int(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+        def text(v, limit):
+            return scrub_(v, limit) if isinstance(v, str) else None
+        flight = raw.get("in_flight") if isinstance(raw.get("in_flight"), dict) else None
+        flight = {"tool": text(flight.get("tool"), 80) or "?", "seconds": num(flight.get("seconds"))} if flight else None
+        calls = [{"tool": text(c.get("tool"), 80) or "?", "status": text(c.get("status"), 40) or "?", "seconds_ago": num(c.get("seconds_ago"))}
+                 for c in (raw.get("last_calls") if isinstance(raw.get("last_calls"), list) else [])[:10] if isinstance(c, dict)]
+        un = raw.get("unpushed") if isinstance(raw.get("unpushed"), dict) else None
+        if un is not None:
+            shas = [s[:12] for s in (un.get("shas") if isinstance(un.get("shas"), list) else []) if isinstance(s, str) and re.fullmatch(r"[0-9a-f]{7,40}", s)][:10]
+            un = {"count": num(un.get("count")) or 0, "shas": shas}
+        bad = [c for c in calls if c["status"].lower() in ("error", "failed", "failure", "timeout", "aborted")]
+        last_error = "%s %s %ss ago" % (bad[0]["tool"], bad[0]["status"], bad[0]["seconds_ago"]) if bad else None
+        missing = [text(m, 40) for m in (raw.get("missing") if isinstance(raw.get("missing"), list) else []) if isinstance(m, str)][:20]
+        if source == "fallback" or last_error is None and "last_calls" in missing:
+            missing = missing + (["last_error"] if "last_error" not in missing else [])
+        return {"worker": worker, "source": source, "in_flight": flight, "last_calls": calls, "last_text": text(raw.get("last_text"), 300) or "",
+                "idle_seconds": num(raw.get("idle_seconds")), "branch": text(raw.get("branch"), 200), "unpushed": un, "dirty": num(raw.get("dirty")),
+                "last_push": text(raw.get("last_push"), 100), "last_error": last_error, "missing": missing}
 
     def snapshot(self, a):
         """ONE read-only look at the cluster: the pods of the namespace (name, worker, phase, node, hard deadline) and, when the login may
@@ -3865,11 +4116,26 @@ class Launcher:
         """One pass: stop every pod past its hard deadline or idle too long. Returns [(worker, reason, exit)]."""
         out, now, live, jobs = [], self.clock(), [], []
         self.reap_results, self.last_hook = {}, None
+        mono = time.monotonic
+        steps = self.step_seconds = {"list": 0.0, "renew": 0.0, "vanished": 0.0, "activity": 0.0, "activity_n": 0, "stops": 0.0, "stops_n": 0, "orphans": 0.0, "notes": 0.0, "total": None}
+        t_pass = t0 = mono()
+        steps["start"] = t_pass   # a pass that raises is measured from here at its finally
         acts = {}   # name -> the activity this pass already read (passed to send_idle_nudges: one read per pod per pass)
-        pods = self.kube.list_pods()
+        try:
+            pods = self.kube.list_pods()
+        finally:
+            steps["list"] = mono() - t0
+        t0 = mono()
         # The renewal is the FIRST step: a slow activity read or stop below can no longer hold it back (the audit of 29 October).
-        renewed = self.renew_git_tokens(self._before_hard_limit(pods, now), now)
-        self._note_vanished_pods(pods, now)
+        try:
+            renewed = self.renew_git_tokens(self._before_hard_limit(pods, now), now)
+        finally:
+            steps["renew"] = mono() - t0
+        t0 = mono()
+        try:
+            self._note_vanished_pods(pods, now)
+        finally:
+            steps["vanished"] = mono() - t0
         for pod in pods:
             worker = ann(pod, "worker")
             reason = None
@@ -3881,16 +4147,55 @@ class Launcher:
                 else:
                     out.append((worker, PERSISTENT_UNREADABLE, 1))
                 continue
+            failed = (pod.get("status") or {}).get("phase") == "Failed"
             try:
                 hard = self.hard_deadline(pod)
             except (ValueError, TypeError):
-                out.append((worker, "unreadable deadline", 1))  # one bad pod never stops the pass
-                continue
-            if now >= hard:
+                if not failed:
+                    out.append((worker, "unreadable deadline", 1))  # one bad pod never stops the pass
+                    continue
+                hard = None   # a Failed pod is still handled below; its deadline is said once, not on every pass
+                said = (worker, self._failed_key(pod), "deadline")
+                if self._failed_name_fits(pod) and said not in FAILED_UNWRITTEN_TOLD:
+                    FAILED_UNWRITTEN_TOLD.add(said)
+                    out.append((worker, "unreadable deadline", 1))
+            if hard is not None and now >= hard:
                 reason = "hard limit"
+            elif failed:
+                # A pod that ended Failed answers nothing: read why ONCE, keep the record, report it once; delete it ten minutes after
+                # its record unless it holds unpushed work (kept). A second pass reads no activity of it.
+                if not self._failed_name_fits(pod):   # no worker annotation, or one that is not a worker name: not this launcher's pod, never read, recorded or deleted
+                    continue
+                note, fresh = self._failed_note(pod)
+                told = (worker, self._failed_key(pod))
+                if note.get("unwritten"):   # the pod stays; said once, written on the first pass that can
+                    if told not in FAILED_UNWRITTEN_TOLD:
+                        FAILED_UNWRITTEN_TOLD.add(told)
+                        out.append((worker, "record not written: " + note["pod_message"], 1))
+                    continue
+                FAILED_UNWRITTEN_TOLD.discard(told)
+                if fresh:
+                    out.append((worker, "pod failed: " + note["pod_failed_reason"][:160], 0))
+                elif ann(pod, "kept") != "true" and note.get("recorded_at") and self._failed_aged(worker, pod, note, now) is None:
+                    said = (worker, self._failed_key(pod), "time")
+                    if said not in FAILED_UNWRITTEN_TOLD:
+                        FAILED_UNWRITTEN_TOLD.add(said)
+                        out.append((worker, "record time unreadable; the pod is left", 1))
+                elif ann(pod, "kept") != "true" and note.get("recorded_at") and self._failed_aged(worker, pod, note, now):
+                    try:
+                        self._remove(pod["metadata"]["name"], ann(pod, "run-id") or None, (pod.get("metadata") or {}).get("uid"))
+                        self.audit(worker, "pod/" + pod["metadata"]["name"], "stop", self.cost(pod), True, "failed pod: record kept ten minutes", None, "pod_failed")
+                    except CloudError as e:
+                        out.append((worker, "failed pod not deleted: " + self.kube.scrub(e, 120), e.code))
+                continue
             else:
                 live.append(pod)   # before its hard limit and not stopped below: the git token renewal's candidates
-                act = self.activity(pod["metadata"]["name"])
+                t0 = mono()
+                try:
+                    act = self.activity(pod["metadata"]["name"])
+                finally:
+                    steps["activity"] += mono() - t0
+                    steps["activity_n"] += 1
                 acts[pod["metadata"]["name"]] = act
                 if act is None:
                     # Fail mode, decided: an unreadable activity is not a reason to kill work, so the pod runs until
@@ -3905,7 +4210,13 @@ class Launcher:
                 out.append(None)   # this pod's place in the result: filled after the stops ran
                 # by the run's own nonce where the pod carries one: a pod of another run under this name is left whole
                 jobs.append((len(out) - 1, worker, reason, ann(pod, "run-id") or None))
-        for (slot, worker, reason, _), (res, err, hook) in zip(jobs, self._run_stops(jobs)):
+        t0 = mono()
+        try:
+            stopped = self._run_stops(jobs)
+        finally:
+            steps["stops"] += mono() - t0
+            steps["stops_n"] += len(jobs)
+        for (slot, worker, reason, _), (res, err, hook) in zip(jobs, stopped):
             try:
                 if err is not None:
                     raise err
@@ -3917,9 +4228,22 @@ class Launcher:
                 self.reap_results[worker] = dict(hook or {})
                 out[slot] = (worker, reason, e.code)
         out.extend(renewed)
-        self.remove_orphan_secrets(pods, now)
-        self.send_wip_notes(live, now)
-        self.send_idle_nudges(live, now, acts)
+        t0 = mono()
+        try:
+            self.remove_orphan_secrets(pods, now)
+        finally:
+            steps["orphans"] = mono() - t0
+        t0 = mono()
+        try:
+            self.send_wip_notes(live, now)
+        finally:
+            steps["notes"] = mono() - t0
+        t0 = mono()
+        try:
+            self.send_idle_nudges(live, now, acts)
+        finally:
+            steps["notes"] += mono() - t0   # the nudges are counted with the notes: both are the pass's sends
+        steps["total"] = mono() - t_pass
         return out
 
     def _note_vanished_pods(self, pods, now):
@@ -4102,7 +4426,11 @@ class Launcher:
         (worker, "git token renewed", 0) or (worker, "git token not renewed: WHY", 1). A pod that needs nothing (no per-run Secret, not due)
         adds nothing. One pod's trouble never stops the pass; the old token stays until a patch has landed."""
         with self.renew_lock:
-            return self._renew_locked(pods, now)
+            self._tail = AuditTail(self.audit_path)   # one lookup for this call; it reads nothing until a failure asks
+            try:
+                return self._renew_locked(pods, now)
+            finally:
+                self._tail = None
 
     def _renew_locked(self, pods, now):
         out, relogged = [], False
@@ -4139,7 +4467,8 @@ class Launcher:
 
     def _last_renewal_audit(self, rid):
         """(ok, reason) of the newest renew-git-token audit line of this pod, or None (reads the file's tail only)."""
-        return last_audit_line(self.audit_path, "renew-git-token", rid)
+        tail = getattr(self, "_tail", None)
+        return tail.get("renew-git-token", rid) if tail is not None else last_audit_line(self.audit_path, "renew-git-token", rid)
 
     def _audit_renewal_failure(self, worker, pod, why):
         """One audit line per CHANGE of reason (a persistent failure is not written again every pass; the success line is the 'cleared' line)."""
@@ -4703,6 +5032,17 @@ def stack_registry_check(a, env, out):
     return 0
 
 
+def parse_issue_number(value):
+    """None when no issue is named; else an int above 0; anything else is a usage error."""
+    if value is None:
+        return None
+    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+        return value
+    if isinstance(value, str) and re.fullmatch(r"[1-9][0-9]{0,9}", value):
+        return int(value)
+    raise CloudError("--issue must be a whole number above 0, got %r; nothing was created" % str(value)[:40], EXIT_USAGE)
+
+
 def build_parser():
     p = argparse.ArgumentParser(prog="cloud-worker")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -4719,6 +5059,7 @@ def build_parser():
     k.add_argument("--identity", default=PULLER_IDENTITY)
     c = cmd("create")
     c.add_argument("--repo", required=True)
+    c.add_argument("--issue", default=None, help="the issue number (a whole number above 0) written into the hub entry of a registered worker")
     c.add_argument("--branch", required=True)
     c.add_argument("--idle", default="30m")
     c.add_argument("--hard", default="2h")
@@ -4757,6 +5098,7 @@ def build_parser():
     d.add_argument("--force", action="store_true")
     d.add_argument("--reason", default="")
     cmd("status")
+    cmd("inspect")   # ONE read-only look inside a running pod: the call in flight, the recent calls, git, the last push
     cmd("snapshot", worker=False)   # ONE read-only look at the cluster: the pods of the namespace and, when the login may list them, the nodes
     cmd("capacity", worker=False)   # ONE read-only look at room: the nodes' allocatable, the pods' requests, the Pending count, the last FailedScheduling line
     cmd("report")
@@ -4873,6 +5215,7 @@ class RenewalTicker:
         now = self.clock()
         self.last = now
         self.ticks += 1
+        cpu0, parsed0 = time.thread_time(), tail_lines_parsed()
         try:
             with self.L.renew_lock:
                 refresh = self.refresher.run()
@@ -4884,6 +5227,8 @@ class RenewalTicker:
                 self.L.renew_git_tokens(self.L._before_hard_limit(self.L.kube.list_pods(), now), now)
         except Exception as e:   # the thread goes on: the next tick tries again
             print("cloud-worker: the renewal thread: %s" % scrub(e, (), 200), file=sys.stderr)
+        finally:
+            print("cloud-worker: renewal tick line: cpu_seconds=%.3f audit_lines_parsed=%d" % (time.thread_time() - cpu0, tail_lines_parsed() - parsed0), file=sys.stderr)
 
     def _run(self):
         while not self._stop.is_set():
@@ -4901,6 +5246,23 @@ class RenewalTicker:
         self._stop.set()
         if self.thread is not None and self.thread is not threading.current_thread():
             self.thread.join(5)   # a tick in flight ends first
+
+
+def step_text(st):
+    """The seconds of the seven steps of a pass, for the pass line: numbers only, no name or value.
+
+    Never raises (it runs inside a finally) and never prints a negative number: a bad dictionary gives the line without a step part."""
+    try:
+        if not st:
+            return ""
+        def sec(v):
+            return max(0.0, float(v))
+        total = st["total"] if st["total"] is not None else time.monotonic() - st["start"]   # a pass that raised never set its total: the wall seconds from its start
+        return " steps list=%.1f renew=%.1f vanished=%.1f activity=%.1f (%d) stops=%.1f (%d) orphans=%.1f notes=%.1f total=%.1f" % (
+            sec(st["list"]), sec(st["renew"]), sec(st["vanished"]), sec(st["activity"]), int(st["activity_n"]), sec(st["stops"]), int(st["stops_n"]),
+            sec(st["orphans"]), sec(st["notes"]), sec(total))
+    except Exception:
+        return ""
 
 
 def _reap_main(env, a, sleep, clock=None, refresher=None, kube=None, ticker_wait=None, tree=None):
@@ -4954,7 +5316,13 @@ def _reap_main(env, a, sleep, clock=None, refresher=None, kube=None, ticker_wait
                 ticker = RenewalTicker(L, refresher, clock, ticker_wait)
                 ticker.start()
             began = clock()
-            work = L.reap() if L is not None else []   # the pass's own work: the workers' results
+            if L is not None:
+                L.step_seconds = None   # the pass line shows the steps of THIS pass only
+            cpu0, parsed0 = time.thread_time(), tail_lines_parsed()
+            try:
+                work = L.reap() if L is not None else []   # the pass's own work: the workers' results
+            finally:
+                print("cloud-worker: reaper pass line: cpu_seconds=%.3f audit_lines_parsed=%d%s" % (time.thread_time() - cpu0, tail_lines_parsed() - parsed0, step_text(getattr(L, "step_seconds", None))), file=sys.stderr)
             took = (clock() - began).total_seconds()
             if L is not None:
                 L.note_slow_pass(took)
