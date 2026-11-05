@@ -66986,6 +66986,9 @@ TestScratchGuard = importlib.import_module("test_scratch_command").TestScratchGu
 # The host-disk tests of #2081.
 TestHostDisk = importlib.import_module("test_host_disk").TestHostDisk
 
+# The disk guard's build-cache prune of #2157.
+TestDiskGuardPrune = importlib.import_module("test_disk_guard_prune").TestDiskGuardPrune
+
 # The delivery-lag tests of #1402.
 _delivery_lag = importlib.import_module("test_delivery_lag")
 _delivery_lag.World = World
