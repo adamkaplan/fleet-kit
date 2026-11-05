@@ -9,6 +9,7 @@ import sys
 import tempfile
 import types
 import unittest
+import datetime
 import io
 from contextlib import redirect_stderr, redirect_stdout
 
@@ -317,18 +318,368 @@ class TestDocs(unittest.TestCase):
             self.check(cut)
 
 
-class TestPins(unittest.TestCase):
-    OLD_LINES = ["            return self._renew_locked(pods, now)", '        return last_audit_line(self.audit_path, "renew-git-token", rid)']
+class StepClock:
+    """A fake monotonic clock: a fake step moves it by its own seconds."""
+    def __init__(self):
+        self.t = 0.0
 
-    def test_s7_two_removed_lines(self):
-        p = stub_support.start(self, ["git", "diff", "-U0", TIP, "--", "cloud/launcher/cloud_worker.py", "cloud/launcher/tests"], cwd=ROOT,
-                               stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-        out = p.communicate()[0].decode(errors="replace")
-        if p.returncode != 0:
-            self.skipTest("the integration tip is not in this checkout")
-        removed = [x[1:] for x in out.splitlines() if x.startswith("-") and not x.startswith("---")]
-        print("S7: %d removed lines" % len(removed))
-        self.assertEqual(sorted(removed), sorted(self.OLD_LINES))
+    def monotonic(self):
+        return self.t
+
+    def thread_time(self):
+        return 0.0
+
+    def __getattr__(self, name):
+        return getattr(__import__("time"), name)
+
+
+STEP_NAMES = ("list", "renew", "vanished", "activity", "stops", "orphans", "notes")
+STEP_LINE = "steps list=1.0 renew=2.0 vanished=0.5 activity=0.6 (3) stops=4.0 (1) orphans=0.5 notes=1.5 total=10.1"
+
+
+def step_pass_text(test, mod):
+    clock = StepClock()
+    cls = mod.Launcher
+    f = LineFixture(test, mod)
+    mod.time = clock
+    L = f.w.L
+    L.reap = types.MethodType(cls.reap, L)
+    for i, pod in enumerate(f.w.pods):
+        pod["metadata"]["annotations"]["cw/note"] = PLANTS[1] + " " + PLANTS[2]
+
+    def step(seconds, answer=None):
+        def call(*a, **k):
+            clock.t += seconds
+            return answer
+        return call
+    L.kube.list_pods = step(1.0, f.w.pods)
+    L.renew_git_tokens = step(2.0, [])
+    L._note_vanished_pods = step(0.5)
+    L.hard_deadline = lambda pod: T0 + datetime.timedelta(days=1)
+    idle = f.w.pods[2]["metadata"]["name"]
+
+    def activity(name):
+        clock.t += 0.2
+        return (False, T0 - datetime.timedelta(days=1)) if name == idle else (True, T0)
+    L.activity = activity
+    L.stop = lambda ns, reason: (step(4.0)(), {})[1]
+    L.retire_row = lambda worker, reason: None
+    L.remove_orphan_secrets = step(0.5)
+    L.send_wip_notes = step(1.5)
+    text = f.pass_text()
+    if " steps list=" not in text:
+        raise AssertionError("no step seconds")
+    return text
+
+
+class TestStepSeconds(unittest.TestCase):
+    def test_s8_step_seconds(self):
+        ctext = step_pass_text(self, build_module())   # the control first
+        line = [x for x in ctext.splitlines() if "reaper pass line" in x]
+        self.assertEqual(len(line), 1)
+        self.assertTrue(line[0].endswith(STEP_LINE), line[0])
+        self.assertEqual([p for p in (PLANTS[0], "pod-b", "pod-c") + PLANTS[1:] if p in ctext], [])
+        print("S8: control passes: %s" % line[0].split("audit_lines_parsed=", 1)[1].split(" ", 1)[1])
+        old = 'getattr(L, "step_seconds", None)'
+        mut = build_module((old, "None"))
+        with self.assertRaisesRegex(AssertionError, "^no step seconds$"):
+            step_pass_text(self, mut)
+        with open(os.path.join(ROOT, "cloud", "README.md")) as f:
+            para = TestDocs.paragraph(f.read())
+        found = [n for n in STEP_NAMES if "`%s`" % n in para]
+        self.assertEqual(len(found), 7)
+        print("S8: 7 of 7 step seconds + 2 counts + total equal; 0 of 3 pod names, 0 planted; mutant fails 'no step seconds'; %d of 7 names in README" % len(found))
+
+
+S10_STEPS = (("list", "list=1.5"), ("renew", "renew=2.5"), ("vanished", "vanished=1.0"), ("activity", "activity=0.9 (2)"),
+             ("orphans", "orphans=1.0"), ("notes", "notes=2.0"))
+
+# the total of the steps done, from the fake clock: list 1.5; 1.0+2.5; 1.0+2.0+1.0; 1.0+2.0+0.5+0.9; 3.5+0.6+4.0+1.0; 3.5+0.6+4.0+0.5+2.0
+S10_TOTALS = {"list": 1.5, "renew": 3.5, "vanished": 4.0, "activity": 4.4, "orphans": 9.1, "notes": 10.6}
+
+
+def raising_pass_text(test, mod, raising):
+    """The fake world of S8 with ONE step raising after its fake seconds plus 0.5; returns the pass line (or fails with the anchored text)."""
+    clock = StepClock()
+    cls = mod.Launcher
+    f = LineFixture(test, mod)
+    mod.time = clock
+    L = f.w.L
+    L.reap = types.MethodType(cls.reap, L)
+
+    def step(name, seconds, answer=None):
+        def call(*a, **k):
+            clock.t += seconds
+            if name == raising:
+                clock.t += 0.5
+                raise RuntimeError("fake step failure")
+            return answer
+        return call
+    L.kube.list_pods = step("list", 1.0, f.w.pods)
+    L.renew_git_tokens = step("renew", 2.0, [])
+    L._note_vanished_pods = step("vanished", 0.5)
+    L.hard_deadline = lambda pod: T0 + datetime.timedelta(days=1)
+    idle = f.w.pods[2]["metadata"]["name"]
+    reads = []
+
+    def activity(name):
+        reads.append(name)
+        clock.t += 0.2
+        if raising == "activity" and len(reads) == 2:
+            clock.t += 0.5
+            raise RuntimeError("fake step failure")
+        return (False, T0 - datetime.timedelta(days=1)) if name == idle else (True, T0)
+    L.activity = activity
+    L.stop = lambda ns, reason: (step("stops", 4.0)(), {})[1]
+    L.retire_row = lambda worker, reason: None
+    L.remove_orphan_secrets = step("orphans", 0.5)
+    L.send_wip_notes = step("notes", 1.5)
+    err = io.StringIO()
+    with redirect_stderr(err), redirect_stdout(io.StringIO()):
+        try:
+            mod._reap_main({"CW_CLOUD_NAMESPACE": "cw"}, types.SimpleNamespace(loop=0), lambda s: None, clock=lambda: T0,
+                           refresher=f.refresher, kube=L.kube)
+        except RuntimeError:
+            pass
+    lines = [x for x in err.getvalue().splitlines() if "reaper pass line" in x]
+    want = dict(S10_STEPS)[raising]
+    if len(lines) != 1 or (" " + want) not in lines[0] or (" total=%.1f" % S10_TOTALS[raising]) not in lines[0]:
+        raise AssertionError("a raising step lost its seconds: %s" % raising)
+    return lines[0]
+
+
+class TestRaisingSteps(unittest.TestCase):
+    def test_s10_each_of_six_steps_raises(self):
+        raising_pass_text(self, build_module(), "list")   # the control first
+        for name, want in S10_STEPS:
+            line = raising_pass_text(self, build_module(), name)
+            print("S10: %s raises: %s" % (name, line.split("audit_lines_parsed=", 1)[1]))
+            self.assertIn(" " + want, line)
+            self.assertIn(" total=%.1f" % S10_TOTALS[name], line)
+            print("S10: %s run: total expected %.1f" % (name, S10_TOTALS[name]))
+        for name, _ in S10_STEPS:
+            old = 'steps["%s"] %s mono() - t0' % (name, "+=" if name == "activity" else "=")
+            src = source()
+            self.assertEqual(len([x for x in src.split("\n") if x.strip() == old]), 1, old)
+            # the timer is read after the call, outside the finally: the finally line is moved out one level, after the try block
+            lines = src.split("\n")
+            idx = [k for k, l in enumerate(lines) if l.strip() == old]
+            k = idx[0]
+            self.assertEqual(lines[k - 1].strip(), "finally:")
+            self.assertEqual(lines[k - 3].strip(), "try:")   # try / the call / finally / the timer
+            tail = 2 if name == "activity" else 1
+            body = [x[4:] for x in lines[k - 2:k - 1]] + [x[4:] for x in lines[k:k + tail]]
+            lines[k - 3:k + tail] = body   # the call, then the timer after it: no try, no finally
+            mutated = "\n".join(lines)
+            self.assertNotEqual(mutated, src)   # the mutation applied
+            tmp = tempfile.mkdtemp(prefix="s10-")   # the scratch copy lives under /tmp, never in the repository
+            with open(os.path.join(tmp, "cloud_worker.py"), "w") as f:
+                f.write(mutated)
+            mod = types.ModuleType("cloud_worker_s10_" + name)
+            mod.__file__ = SOURCE_PATH
+            exec(compile(mutated, SOURCE_PATH, "exec"), mod.__dict__)
+            mod.json = CountingJson()
+            with self.assertRaisesRegex(AssertionError, "^a raising step lost its seconds: %s$" % name):
+                raising_pass_text(self, mod, name)
+            print("S10: copy with the %s timer after the call fails: a raising step lost its seconds" % name)
+
+
+class GapClock(StepClock):
+    """The fake monotonic clock that adds `gap` seconds at each boundary: the read that starts a step right after the read that ended the step before."""
+    def __init__(self, gap):
+        StepClock.__init__(self)
+        self.gap, self.reads_since_exit, self.gaps = gap, 0, 0
+
+    def exited(self):
+        self.reads_since_exit = 1
+
+    def monotonic(self):
+        if self.reads_since_exit == 1:
+            self.reads_since_exit = 2   # the read that ends the step
+        elif self.reads_since_exit == 2:
+            self.reads_since_exit = 0   # the read that starts the next step: a boundary
+            self.t += self.gap
+            self.gaps += 1
+        return self.t
+
+
+def s11_world(test, mod, gap=0.0, raise_second_read=False):
+    """The fake world of S8; the fake clock adds `gap` seconds at each boundary of the steps; the 2nd activity read may raise."""
+    clock = GapClock(gap)
+    cls = mod.Launcher
+    f = LineFixture(test, mod)
+    mod.time = clock
+    L = f.w.L
+    L.reap = types.MethodType(cls.reap, L)
+    state = {"steps": 0.0}
+
+    def step(seconds, answer=None):
+        def call(*a, **k):
+            try:
+                clock.t += seconds
+                state["steps"] += seconds
+                return answer
+            finally:
+                clock.exited()
+        return call
+    L.kube.list_pods = step(1.0, f.w.pods)
+    L.renew_git_tokens = step(2.0, [])
+    L._note_vanished_pods = step(0.5)
+    L.hard_deadline = lambda pod: T0 + datetime.timedelta(days=1)
+    idle = f.w.pods[2]["metadata"]["name"]
+    reads = []
+
+    def activity(name):
+        reads.append(name)
+        try:
+            clock.t += 0.2
+            state["steps"] += 0.2
+            if raise_second_read and len(reads) == 2:
+                clock.t += 0.5
+                state["steps"] += 0.5
+                raise RuntimeError("fake step failure")
+            return (False, T0 - datetime.timedelta(days=1)) if name == idle else (True, T0)
+        finally:
+            clock.exited()
+    L.activity = activity
+    L.stop = lambda ns, reason: (step(4.0)(), {})[1]
+    L.retire_row = lambda worker, reason: None
+    L.remove_orphan_secrets = step(0.5)
+    L.send_wip_notes = step(1.5)
+    state["clock"] = clock
+    return f, L, clock, state
+
+
+def s11_pass(test, f):
+    err = io.StringIO()
+    with redirect_stderr(err), redirect_stdout(io.StringIO()):
+        try:
+            f.mod._reap_main({"CW_CLOUD_NAMESPACE": "cw"}, types.SimpleNamespace(loop=0), lambda s: None, clock=lambda: T0,
+                             refresher=f.refresher, kube=f.w.L.kube)
+        except RuntimeError:
+            pass
+    return [x for x in err.getvalue().splitlines() if "reaper pass line" in x]
+
+
+def s11_total(test, mod):
+    f, L, clock, state = s11_world(test, mod, gap=0.25, raise_second_read=True)
+    lines = s11_pass(test, f)
+    want = state["steps"] + 0.25 * state["clock"].gaps
+    if len(lines) != 1 or (" total=%.1f" % want) not in lines[0]:
+        raise AssertionError("the total left out the seconds between steps")
+    return lines[0], want, state["clock"].gaps
+
+
+def s11_early(test, mod):
+    f, L, clock, state = s11_world(test, mod)
+    first = s11_pass(test, f)
+    assert len(first) == 1 and STEP_LINE in first[0], first   # a pass that completed: its numbers are on the launcher
+    def boom():
+        raise RuntimeError("fake clock failure")
+    L.clock = boom
+    lines = s11_pass(test, f)
+    if len(lines) != 1 or " steps " in lines[0] or any(n in lines[0] for n in ("list=1.0", "renew=2.0", "total=10.1")):
+        raise AssertionError("the steps of the pass before were shown")
+    return lines[0]
+
+
+class TestTotalWithGaps(unittest.TestCase):
+    def test_s11_total_and_early_raise(self):
+        line, want, nb = s11_total(self, build_module())   # the controls first
+        early = s11_early(self, build_module())
+        self.assertIn(" total=%.1f" % want, line)
+        self.assertNotIn(" steps ", early)
+        print("S11: control: raise in the 2nd activity read, %d boundaries of 0.25: expected total %.2f; line: %s" % (nb, want, line.split("audit_lines_parsed=", 1)[1]))
+        print("S11: control: early raise line: %s" % early.split("audit_lines_parsed=", 1)[1].strip() + " (no step part)")
+        old = 'st["total"] if st["total"] is not None else time.monotonic() - st["start"]'
+        with self.assertRaisesRegex(AssertionError, "^the total left out the seconds between steps$"):
+            s11_total(self, build_module((old, "done")))
+        print("S11: copy with the total as the sum of the steps fails: the total left out the seconds between steps")
+        old = "                L.step_seconds = None   # the pass line shows the steps of THIS pass only\n"
+        with self.assertRaisesRegex(AssertionError, "^the steps of the pass before were shown$"):
+            s11_early(self, build_module((old, "                pass\n")))
+        print("S11: copy that does not clear the dictionary fails: the steps of the pass before were shown")
+
+
+class DipClock(StepClock):
+    """The fake monotonic clock of S8 that returns a value `back` seconds SMALLER at its `at`-th read only (the 2nd read ends the pod list)."""
+    def __init__(self, at=2, back=5.0):
+        StepClock.__init__(self)
+        self.n, self.at, self.back = 0, at, back
+
+    def monotonic(self):
+        self.n += 1
+        return self.t - self.back if self.n == self.at else self.t
+
+
+def s12_numbers(test, mod):
+    clock = DipClock()
+    real = StepClock
+    try:
+        globals()["StepClock"] = lambda: clock   # the S8 world builds its clock through StepClock()
+        text = step_pass_text(test, mod)
+    finally:
+        globals()["StepClock"] = real
+    line = [x for x in text.splitlines() if "reaper pass line" in x]
+    assert len(line) == 1, line
+    import re
+    nums = [float(x) for x in re.findall(r"=(-?\d+\.\d)", line[0].split(" steps ", 1)[1])]
+    if any(n < 0 for n in nums):
+        raise AssertionError("a negative number was printed")
+    return line[0], nums
+
+
+class TestClockStepsBack(unittest.TestCase):
+    def test_s12_clock_steps_back(self):
+        line, nums = s12_numbers(self, build_module())   # the control first
+        self.assertEqual(len(nums), 8)
+        print("S12: control: a read 5 seconds smaller at the end of the pod list; %d seconds in the line, min %.1f: %s" % (len(nums), min(nums), line.split(" steps ", 1)[1]))
+        with self.assertRaisesRegex(AssertionError, "^a negative number was printed$"):
+            s12_numbers(self, build_module(("return max(0.0, float(v))", "return float(v)")))
+        print("S12: copy without the clamp fails: a negative number was printed")
+
+
+BAD_DICTS = (None, {"list": 0.0, "renew": 0.0, "vanished": 0.0, "activity": 0.0, "activity_n": 0, "stops": 0.0, "stops_n": 0, "orphans": 0.0, "notes": 0.0, "total": None},
+             {"list": 0.0, "renew": 0.0, "vanished": 0.0, "activity": 0.0, "activity_n": "x", "stops": 0.0, "stops_n": 0, "orphans": 0.0, "notes": 0.0, "total": 1.0, "start": 0.0})
+
+
+def s13_check(test, mod):
+    for d in BAD_DICTS:
+        try:
+            got = mod.step_text(d)
+        except Exception:
+            raise AssertionError("step_text raised inside the finally")
+        assert got == "", got
+    f, L, clock, state = s11_world(test, mod)
+
+    def reap():
+        L.step_seconds = BAD_DICTS[2]
+        raise RuntimeError("the pass's own error")
+    L.reap = reap
+    err = io.StringIO()
+    with redirect_stderr(err), redirect_stdout(io.StringIO()):
+        try:
+            mod._reap_main({"CW_CLOUD_NAMESPACE": "cw"}, types.SimpleNamespace(loop=0), lambda s: None, clock=lambda: T0,
+                           refresher=f.refresher, kube=L.kube)
+        except RuntimeError as e:
+            own = str(e)
+        except Exception:
+            raise AssertionError("step_text raised inside the finally")
+        else:
+            raise AssertionError("the pass did not end with its own error")
+    lines = [x for x in err.getvalue().splitlines() if "reaper pass line" in x]
+    assert len(lines) == 1 and " steps " not in lines[0], lines
+    return own, lines[0]
+
+
+class TestBadDictionaries(unittest.TestCase):
+    def test_s13_step_text_never_raises(self):
+        own, line = s13_check(self, build_module())   # the control first
+        self.assertEqual(own, "the pass's own error")
+        print("S13: control: 3 of 3 dictionaries (missing, no start with total None, activity_n 'x') give no step part, 0 raised; the pass ended with its own error %r; line: %s" % (own, line.split("audit_lines_parsed=", 1)[1].strip() or "(no step part)"))
+        with self.assertRaisesRegex(AssertionError, "^step_text raised inside the finally$"):
+            s13_check(self, build_module(("    except Exception:\n        return \"\"\n", "    except ZeroDivisionError:\n        return \"\"\n")))
+        print("S13: copy without the guard fails: step_text raised inside the finally")
 
 
 if __name__ == "__main__":

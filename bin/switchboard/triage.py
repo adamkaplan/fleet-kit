@@ -367,8 +367,11 @@ class TriageState:
         self.batch_waiting = {}  # #921: repo -> how many open issues wait for the batch (their change merged into the integration branch), this pass
         self.reasons = {}        # (rule, ref) -> the worded reason of a finding that carries one (`awaiting-live expired`)
         self.logged, self.woken_logged, self.facts, self.current = set(), set(), {}, {}
+        self.fact_pairs = {}     # #1542: digest key -> the items the digest lists, for the delivery re-check
+        self.fact_hidden = {}    # #1542: digest key -> True when the digest hides items ("+N more") or carries a note outside its pairs
         self.started, self.day, self.day_counts = 0, None, {}
         self.summarised = None
+        self.basis = {}          # digest fact key -> (shown pairs, total due, invalid refs, other-owner count, kinds) its text was made from: judged again at the end of a pass
         self.seen = None         # #349: the stale digest's memory (bin/triage_digest.py), loaded at the first pass
         self.meta = None         # #406: its cadence (warm-up done, the last delivery), kept in the same file
 
@@ -562,7 +565,7 @@ def triage_read_unit(hub, repo, unit, now, budget):
     TRIAGE_COMMENT_DAYS), closed:<label> (closed issues that still carry a label)."""
     if unit == "issues":
         path = "repos/%s/issues?state=open&per_page=100" % repo
-        records, cut = hub.read_pages(path, cap=TRIAGE_LIST_PAGES)
+        records, cut = hub.read_open_pages(path)
     elif unit == "merged":   # #384: ONE page of the recently closed pull requests; those with a merge date name the issues they implemented
         records, cut = hub.read_pages("repos/%s/pulls?state=closed&sort=updated&direction=desc&per_page=%d" % (repo, TRIAGE_MERGED_PER_PAGE), cap=1)
     elif unit == "comments":
@@ -1054,6 +1057,7 @@ def triage_pass(engine, decisions, now, errors=()):
         plan_wake_pass(engine, state, repos, now, budget)   # #765: the plans posted or edited, from the units just held
     except Exception as err:
         engine._note("plan_wake.error", "", {"error": _one_line("%s: %s" % (type(err).__name__, err), 160)})
+    claims_note_pass(engine, state, repos, now)   # #1716: the claims a pull request's body leaves out, from the held units (never raises)
     triage_mark_reads(engine, state, repos, errors, now)
     try:
         alert_wake_pass(engine, state, cfg, now)   # #851: an alert issue wakes its repository's orchestrator once, from the lists just held
@@ -1062,6 +1066,7 @@ def triage_pass(engine, decisions, now, errors=()):
     candidates, unchecked_units, truncated = triage_findings(engine, state, repos, decisions, cfg, now, errors)
     findings, unchecked, unchecked_other, oldest = [], 0, 0, 0.0
     why = {}   # #605: repo -> {reason: count}, and its other-owner share and oldest age, for the report
+    held = set()   # #1542: candidates this pass could not judge: still present for the delivery re-check
 
     def verify(rule, ref, evidence):
         """True/False/None for one finding; keeps the confirmed, verified and attempted records."""
@@ -1093,6 +1098,7 @@ def triage_pass(engine, decisions, now, errors=()):
         if verdict:
             findings.append((rule, ref, dict(evidence, **state.enriched.pop(pair, {}))))
         elif verdict is None:
+            held.add(pair)
             unchecked += 1
             unchecked_other += rule == "OO"
             oldest = max(oldest, now - state.verified.get(pair, state.first_seen[pair]))
@@ -1103,6 +1109,9 @@ def triage_pass(engine, decisions, now, errors=()):
             entry["other_owner"] += rule == "OO"
             entry["oldest"] = max(entry["oldest"], now - state.verified.get(pair, state.first_seen[pair]))
     findings.sort()
+    seen_all = (not any(unchecked_units.values()) and not state.unreadable and not truncated and unchecked == 0
+                and all((state.units.get((r, u)) or {}).get("error", True) is None and now - state.units[(r, u)]["at"] < TRIAGE_TTL for r in repos for u in units))   # every unit of every repository read this pass (a failed refresh keeps the old copy with an error; one not refreshed is past its TTL)
+    state.present = ({(r, ref) for r, ref, _ in findings} | held) if seen_all else None   # #1542: what the delivery re-check reads, only after a pass that saw every unit it judges; else None (the item is kept, marked unverified)
     day = int(now // 86400)
     counts, other_owner = {}, 0
     for rule, ref, evidence in findings:
@@ -1134,6 +1143,8 @@ def triage_pass(engine, decisions, now, errors=()):
     if held is not None and held.unapproved:   # #765: the plans that look unapproved, one status line (a hint: see docs/switchboard.md)
         state.current["plans_unapproved"] = held.unapproved[:load_triage_plan_open().MAX_LISTED]
         state.current["plans_unapproved_more"] = max(0, len(held.unapproved) - load_triage_plan_open().MAX_LISTED)
+    if held is not None and (held.dropped or held.repeats):   # #1784: held plan lines dropped for a replaced hash, and re-offers of a delivered line not delivered
+        state.current["plan_wake_counts"] = {"dropped": held.dropped, "repeats_not_delivered": held.repeats}
     triage_write(engine, state)
     flagged = [(r, ref) for r, ref, _ in findings if r == "OO" and now - state.alarmed.get((r, ref), 0) >= cfg["realarm_hours"] * 3600]
     owner_t6 = triage_owner_tier_t6(engine, decisions)
@@ -1188,6 +1199,7 @@ def triage_pass(engine, decisions, now, errors=()):
                 state.woken_logged.add(once)
             engine._note("triage.finding", ref, {"rule": rule, "ref": ref, "what": TRIAGE_KINDS[rule],
                                                  "evidence": evidence, "woken": (rule, ref) in woken, "applied": False})
+    triage_rejudge_facts(state, now)   # a digest still waiting for delivery is judged again from the items as they are now
     triage_daily_summary(engine, state, cfg, now, day, repos)
 
 
@@ -1251,6 +1263,55 @@ def triage_digest_commit(engine, state, shown, invalid, now):
     triage_digest.write_seen(engine.state_dir, state.seen, state.meta)
 
 
+def triage_digest_text(state, total, shown, kinds, other_owner, invalid):
+    if not shown:   # only the once-only flag of an invalid park: one message, and nothing else in it
+        return "triage: no stale item to show; parked without a valid `Parked until: YYYY-MM-DD` line (treated as not parked): %s." % ", ".join(invalid)
+    summary = "triage: %d finding%s: %s%s. %s. Resolve, route or escalate each; the triage changes nothing on GitHub." % (
+        total, "" if total == 1 else "s", ", ".join("%s %s%s" % (ref, rule, " (%s)" % state.reasons[(rule, ref)] if (rule, ref) in state.reasons else "") for rule, ref in shown),
+        " (+%d more)" % (total - len(shown)) if total > len(shown) else "",
+        "; ".join("%s = %s" % (k, TRIAGE_KINDS[k]) for k in kinds))
+    if other_owner:
+        summary += " Also %d other-owner flag(s): not ours, nothing to do." % other_owner
+    if invalid:
+        summary += " Parked without a valid `Parked until: YYYY-MM-DD` line (treated as not parked): %s." % ", ".join(invalid)
+    return summary
+
+
+def triage_validly_parked(item, now):
+    """The item as it is now: the label and one valid date still ahead and within the limit, and not awaiting (select's own test)."""
+    return item is not None and triage_parked_now(item, now) and not any("awaiting" in str(l) for l in item["labels"])
+
+
+def triage_rejudge_facts(state, now):
+    """A pending digest fact is judged again before it is delivered: an item now validly parked is dropped from it (and from its invalid-park flag),
+    and a fact left with nothing is ended."""
+    items = triage_digest_items(state)
+    for key, (shown, total, invalid, other_owner, kinds) in list(state.basis.items()):
+        if key not in state.facts:
+            del state.basis[key]
+            continue
+        keep = [p for p in shown if not triage_validly_parked(items.get(p[1]), now)]
+        keep_invalid = [r for r in invalid if not triage_validly_parked(items.get(r), now)]
+        if len(keep) == len(shown) and len(keep_invalid) == len(invalid):
+            continue
+        for ref in {p[1] for p in shown if p not in keep} | {r for r in invalid if r not in keep_invalid}:   # a validly parked item's remembered records are forgotten with it
+            for rule in TRIAGE_KINDS:
+                state.alarmed.pop((rule, ref), None)
+                state.reasons.pop((rule, ref), None)
+                if state.seen is not None:
+                    state.seen.pop("%s %s" % (rule, ref), None)
+            if state.seen is not None:
+                state.seen.pop("PARKED " + ref, None)
+        created = state.facts[key][1]
+        new_total = total - (len(shown) - len(keep))
+        if not keep and not keep_invalid:
+            del state.facts[key], state.basis[key]
+        else:
+            kinds = list(kinds) if new_total > len(keep) else sorted({r for r, _ in keep})   # kinds of all that is due, as the original rule: hidden items keep theirs
+            state.facts[key] = (triage_digest_text(state, new_total, keep, kinds, other_owner, keep_invalid), created)
+            state.basis[key] = (keep, new_total, keep_invalid, other_owner, kinds)
+
+
 def triage_queue_fact(state, due, now, cfg, other_owner=0, invalid=()):
     """Queue THE one digest of the pass and return its text (the cost figure counts it). Only the shown items are marked."""
     shown = due[:cfg["max_findings"]]
@@ -1258,22 +1319,22 @@ def triage_queue_fact(state, due, now, cfg, other_owner=0, invalid=()):
     key = "triage:%s:%d" % (digest, int(now // (cfg["realarm_hours"] * 3600)))
     kinds = sorted({r for r, _ in due})
     if not due:   # only the once-only flag of an invalid park: still one message, and nothing else in it
-        summary = "triage: no stale item to show; parked without a valid `Parked until: YYYY-MM-DD` line (treated as not parked): %s." % ", ".join(invalid)
-        state.facts["triage:parked:%s" % hashlib.sha256(summary.encode()).hexdigest()[:10]] = (summary, now)
+        summary = triage_digest_text(state, 0, [], kinds, other_owner, invalid)
+        pkey = "triage:parked:%s" % hashlib.sha256(summary.encode()).hexdigest()[:10]
+        state.facts[pkey] = (summary, now)
+        state.basis[pkey] = ([], 0, list(invalid), other_owner, [])
         return summary
-    summary = "triage: %d finding%s: %s%s. %s. Resolve, route or escalate each; the triage changes nothing on GitHub." % (
-        len(due), "" if len(due) == 1 else "s", ", ".join("%s %s%s" % (ref, rule, " (%s)" % state.reasons[(rule, ref)] if (rule, ref) in state.reasons else "") for rule, ref in shown),
-        " (+%d more)" % (len(due) - len(shown)) if len(due) > len(shown) else "",
-        "; ".join("%s = %s" % (k, TRIAGE_KINDS[k]) for k in kinds))
-    if other_owner:
-        summary += " Also %d other-owner flag(s): not ours, nothing to do." % other_owner
-    if invalid:
-        summary += " Parked without a valid `Parked until: YYYY-MM-DD` line (treated as not parked): %s." % ", ".join(invalid)
+    summary = triage_digest_text(state, len(due), shown, kinds, other_owner, invalid)
     for pair in shown:
         state.alarmed[pair] = now
     state.facts[key] = (summary, now)
+    state.fact_pairs[key] = list(shown)   # #1542: the items the digest lists, for the delivery re-check
+    state.fact_hidden[key] = len(due) > len(shown) or bool(other_owner) or bool(invalid)   # #1542: a digest that hides items or carries a note outside its pairs is never dropped
+    state.basis[key] = (list(shown), len(due), list(invalid), other_owner, kinds)   # what the text was made from, so a later pass can judge it again
     for old in [k for k, (_, at) in state.facts.items() if now - at > cfg["realarm_hours"] * 7200 and "summary" not in k]:
         del state.facts[old]
+        state.fact_pairs.pop(old, None)   # #1542: forgotten with its fact
+        state.fact_hidden.pop(old, None)
     state.carried = set(shown)   # #849: what this digest carried and remembered; an overflow beyond the cap stays due
     return summary
 

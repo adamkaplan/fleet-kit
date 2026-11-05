@@ -1,51 +1,10 @@
 """Shared fakes and helpers of bin/test-switchboard (moved text, unchanged): wire_fakes."""
-import argparse
 import ast
-import traceback
-import base64
-import calendar
-import collections
-import contextlib
-import errno
 import copy
-import datetime as _dt
-import fcntl
-import gzip
-import fnmatch
-import hashlib
-import hmac
-import importlib.machinery
-import importlib.util
-import inspect
-import http.client
-import io
-import itertools
-import select
 import json
-import os
 from pathlib import Path
 import re
-from urllib.parse import unquote
-import shlex
-import shutil
-import textwrap
-import zipfile
-import signal
-import socket
-import stat
-import tarfile
 import subprocess
-import sys
-import sysconfig
-import tempfile
-import threading
-import time
-import types
-import unittest
-import uuid
-import urllib.parse
-from unittest import mock
-from support.paths import BIN, REPO
 from support.core import FakeRunner
 from support.loader import sb
 
@@ -770,7 +729,7 @@ class FakeV2:
 
 HERDR_ALLOWED = (["agent", "list"], ["agent", "get"], ["pane", "report-metadata"], ["notification", "show"],
                  ["pane", "process-info"], ["pane", "close"], ["workspace", "list"], ["workspace", "create"],
-                 ["plugin", "list"], ["pane", "get"], ["pane", "read"], ["tab", "close"], ["tab", "get"], ["tab", "list"])  # PR 16; #973: the bell migration reads the tab labels once; the control plane reads a pane and closes a stale tab: `status` reads herdr's plugin list; `bootstrap` makes a workspace
+                 ["plugin", "list"], ["pane", "get"], ["pane", "read"], ["tab", "close"], ["tab", "get"], ["tab", "list"], ["pane", "list"])  # PR 16; #973: the bell migration reads the tab labels once; the control plane reads a pane and closes a stale tab: `status` reads herdr's plugin list; `bootstrap` makes a workspace
 
 
 SOCKET_ALLOWED = ("layout.apply",)
