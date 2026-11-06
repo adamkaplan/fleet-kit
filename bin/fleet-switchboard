@@ -8441,6 +8441,26 @@ def cloud_audit_path():
     return os.environ.get("CW_CLOUD_AUDIT") or os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"), "cw-cloud", "audit.jsonl")
 
 
+def cloud_head_checks(engine, repo, sha):
+    """#2267: the check state of one pushed head for the end notice: GET only, the one bounded reader of check runs (ci_runs); 'unknown' on any failure."""
+    try:
+        ci_mod = load_module("ci_runs")
+        runs, refusal = ci_mod.read_check_runs(lambda path: engine.intents._api(path, repo), repo, sha)
+        if refusal:
+            return "unknown"
+        runs = [r for r in ci_mod.latest_check_runs(runs, repo) if isinstance(r, dict)]
+    except Exception:
+        return "unknown"
+    if not runs:
+        return "none yet"
+    bad = sorted({str(r.get("name")) for r in runs if r.get("status") == "completed" and r.get("conclusion") in ("failure", "timed_out", "cancelled", "action_required", "startup_failure")})
+    if bad:
+        return "failed: " + ", ".join(bad[:5])
+    if any(r.get("status") != "completed" for r in runs):
+        return "pending"
+    return "passed"
+
+
 def cloud_end_tick(engine, discovery):
     """#1480: a cloud worker the launcher ended (idle, hard limit, pod gone, failed pod) tells its boss and the Chief of Staff in the same pass, once per run
     and reason. Reads the launcher's audit file from a stored cursor; sends through the daemon's own `send`. Returns what was handed to it."""
@@ -8451,7 +8471,8 @@ def cloud_end_tick(engine, discovery):
                                                      _read_small(state_dir, LAST_REPORT_FILE), lambda to, text: engine.send("switchboard", to, text),
                                                      load_module("record_json").parse_bounded,
                                                      lambda worker, detail: engine.audit is not None and engine.audit.append(engine.actor, "cloud_end_alert.send_failed", worker, detail),
-                                                     lambda directory, worker: load_module("cloud_worker").bind(globals())._retired().last_message(directory, state_dir, worker))
+                                                     lambda directory, worker: load_module("cloud_worker").bind(globals())._retired().last_message(directory, state_dir, worker),
+                                                     head_checks=lambda repo, sha: cloud_head_checks(engine, repo, sha))
 
 
 def cloud_turn_activity(worker):
