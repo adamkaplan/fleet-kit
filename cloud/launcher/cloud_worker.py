@@ -2937,8 +2937,8 @@ class _StopKube:
 KEPT_ENDED_NOTE = "kept pod ended: its work is unreachable by exec; the pod is left for a person"
 
 
-# The results check of the idle nudge: ONE read in the pod. It prints "no" (no /work/results.txt), or "<file mtime> <newest user message time>" in epoch
-# seconds (the session's messages, as cw-pod-inspect reads them), or "unreadable". The file is "finished" only when it is NEWER than that message.
+# The results check of the idle nudge: ONE read in the pod. It prints "no" (no /work/results.txt), or "<file mtime> <newest user message time> <1 if the last non-empty line is exactly STATUS: done else 0>"
+# (epoch seconds; the session's messages, as cw-pod-inspect reads them), or "unreadable". The file is "finished" only with the marker AND NEWER than that message.
 RESULTS_PROBE_CODE = """
 import base64, json, os, sys, urllib.request
 p = "/work/results.txt"
@@ -2961,19 +2961,21 @@ try:
                 t = (info.get("time") or {}).get("created")
                 if isinstance(t, (int, float)):
                     best = max(best or 0, t / 1000.0 if t > 1e11 else t)
-    print(os.path.getmtime(p), best if best is not None else "unreadable")
+    lines = [l.strip() for l in open(p, errors="replace").read().splitlines() if l.strip()]
+    done = 1 if lines and lines[-1] == "STATUS: done" else 0
+    print(os.path.getmtime(p), best if best is not None else "unreadable", done)
 except Exception:
     print("unreadable")
 """
 
 
-def results_older_than_prompt(seen):
-    """True when the probe's answer is "<file mtime> <last user message time>" and the file is NOT newer than that message. Any other answer is False."""
+def results_not_finished(seen):
+    """True when the probe's answer is "<mtime> <last user message time> <marker>" and the file is NOT finished: no STATUS: done marker, or not newer than that message. Any other answer is False."""
     try:
-        mtime, prompt = [float(x) for x in seen.split()]
+        mtime, prompt, marker = [float(x) for x in seen.split()]
     except ValueError:
         return False
-    return mtime <= prompt
+    return marker != 1 or mtime <= prompt
 
 
 class Launcher:
@@ -4530,7 +4532,7 @@ class Launcher:
                     seen = self.kube.exec(name, "python3", "-c", RESULTS_PROBE_CODE).strip()
                 except CloudError:
                     continue
-                if seen != "no" and not results_older_than_prompt(seen):
+                if seen != "no" and not results_not_finished(seen):
                     continue
                 self.kube.annotate(name, (pod.get("metadata") or {}).get("uid"), **{IDLE_NUDGE_MARK: "sent"})
                 self.send_note(name, IDLE_NUDGE)
