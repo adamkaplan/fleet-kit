@@ -12495,6 +12495,9 @@ def _cmd_launch(args, runner, now, socket_call=None):
             return EXIT_USAGE
     if getattr(args, "cloud", False):   # a worker in the cloud (#371): its own module; nothing below runs
         code = run_cloud("cmd_launch", args, runner, now)
+        if code == EXIT_OK and args.name in load_module("cloud_worker").cloud_launch_again.RETURNED:   # a second launch of a name returned the worker (#1619): it was armed by the first
+            load_module("cloud_worker").cloud_launch_again.RETURNED.discard(args.name)
+            return code
         return arm_cloud_checkpoints(args, runner, now) if code == EXIT_OK else code   # #1790
     refuse_cloud_name(args.name)   # a name that has a cloud record is not launched locally (#640)
     engine, state, _ = build_engine(runner, now, "cli", socket_call=socket_call)
