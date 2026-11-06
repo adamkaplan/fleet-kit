@@ -346,6 +346,7 @@
         "bin/switchboard/decisions_a.py",
         "bin/switchboard/reminders.py",
         "bin/switchboard/plan_review.py",
+        "bin/switchboard/merge_ready.py",
         "bin/switchboard/triage.py",
         "bin/switchboard/alert_labels.py",
         "bin/switchboard/link_scrub.py",
@@ -551,6 +552,8 @@
         "bin/switchboard/plan_review.py": [
           "ReviewError",
           "_read_capped"
+        ],
+        "bin/switchboard/merge_ready.py": [
         ],
         "bin/switchboard/triage.py": [
           "_alert_bad_label",
