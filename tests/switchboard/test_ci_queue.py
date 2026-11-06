@@ -275,10 +275,13 @@ def build(HandoffCase, FAKE_GH):
                 self.assertTrue(self.gate_legs(mutant))
 
         def test_u2_cmd_remind_and_its_attributes_are_the_lines_before_the_new_code(self):
+            # cmd_remind moved with the checkpoint reminders to their own part (the cut of #2228): its attributes end that part, and the ci-queue block stays in reminders.py after the prune code
+            part = (REPO / "bin" / "switchboard" / "checkpoint_reminders.py").read_text()
+            self.assertTrue(part.rstrip("\n").endswith("cmd_remind.ensure_on_use = True   # the daemon is alive when it runs\ncmd_remind.header_cache = True    # #1520"))
             text = (REPO / "bin" / "switchboard" / "reminders.py").read_text()
-            head = text.split("\n\n\n# ---- ci-queue", 1)[0]
-            self.assertTrue(head.endswith("cmd_remind.ensure_on_use = True   # the daemon is alive when it runs\ncmd_remind.header_cache = True    # #1520"))
-            self.assertEqual(text.count("def cmd_remind("), 1)
+            self.assertEqual(part.count("def cmd_remind("), 1)
+            self.assertEqual(text.count("def cmd_remind("), 0)
+            self.assertEqual(text.count("\n\n\n# ---- ci-queue"), 1)
 
         def test_s2_an_unexpanded_matrix_placeholder_is_never_a_cut_candidate(self):
             runs = [run(1, "test", "pull_request", "aa", 0)]

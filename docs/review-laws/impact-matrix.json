@@ -544,6 +544,7 @@
           "reminder_bound",
           "reminders_lock",
           "remove_reminders",
+          "stale_working",
           "wake_class_of",
           "write_reminders"
         ],

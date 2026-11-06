@@ -762,12 +762,31 @@ class ReminderFacts:
 WAITING_REPEAT = 1800   # #1728: seconds between two `reminder.waiting` lines for the same reminder and reason
 
 
+def stale_working(engine, observation, facts):
+    """#2243: herdr reads 'working' but v2 runs no turn for the session (session.active does not list it) and the turn has not started
+    within the reminder bound (turn-start.json: the daemon first saw 'working' longer ago than the bound; an unknown age is young): the
+    status is stale. A wake with a reminder (alone or mixed with other facts) is then a NEW turn, never queued behind a turn that is not
+    running. An unreadable answer is not stale."""
+    try:
+        if getattr(observation, "status", None) != "working" or not any(f.kind == "reminder" for f in facts or []):
+            return False
+        v2 = getattr(engine, "v2", None)
+        active = v2.session_active() if v2 is not None else None
+        if not isinstance(active, dict) or active.get(observation.session_id) or engine.state_dir is None:
+            return False
+        bound = min([getattr(f, "bound", None) or 600 for f in facts if f.kind == "reminder"])
+        age = load_module("turn_start").age(engine.state_dir, observation.session_id, engine.now(), load_module("record_json").parse_bounded)
+        return age is not None and age > bound
+    except Exception:
+        return False
+
+
 def waiting_reason(engine, plan, now):
     """#1728: why the reminders of this plan do not reach the lane now, or None (a wake that goes in at once, or a steer)."""
     if plan.action != "wake":
         return "%s: %s" % (plan.action, plan.reason)
     observation = plan.observation
-    if observation is None or observation.status != "working":
+    if observation is None or observation.status != "working" or stale_working(engine, observation, plan.pending):
         return None
     age = None
     try:

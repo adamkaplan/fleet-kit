@@ -337,10 +337,13 @@ def _longest_slow(state, now):
 
 
 def _ask_of(name, record):
+    issue = record.get("issue")
+    if isinstance(issue, (int, str)) and not isinstance(issue, bool) and re.fullmatch(r"[1-9][0-9]{0,9}", str(issue)):
+        return "#" + str(issue)   # the issue the launch named, when the record keeps it
     for field in ("branch", "ask"):
         if isinstance(record.get(field), str) and record[field]:
             return _clean(record[field], 80)
-    return re.sub(r"[-_.]?\d+$", "", name) or name
+    return name   # the worker's own full name: never stripped, so pods of one prefix are never one ask
 
 
 def _losses(state, sb, engine, alive, now, records):
