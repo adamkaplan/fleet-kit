@@ -23,7 +23,7 @@ A plan is one canonical comment, edited in place; every revision adds a new shor
 
 1. **Done-when**: copy the ask's clauses, numbered `(1) ... (2) ...`. They are the authority; never reword them.
    A work item with no Done-when of its own takes the Done-when of its parent ask (its native sub-issue parent): `plan check` and the structure gate (G0a) read it there, and a Done-when the work item carries itself must still match exactly.
-   A pull request that proves only some of a plan's scenarios puts `CLAIMS: S3 S4 S5` directly under its `PLAN:` line: the proof gate (G1) counts only those, the others stay claimed by the epic, and a claim naming an undeclared scenario is refused (the union of claims is enforced at the ask's last merge). So every per-pull-request scenario must be claimed by some pull request (else the last merge is refused; a `CU` waiver passes).
+   A pull request that proves only some of a plan's scenarios puts `CLAIMS: S3 S4 S5` directly under its `PLAN:` line: the proof gate (G1) counts only those, the others stay claimed by the epic, and a claim naming an undeclared scenario is refused (the union of claims is enforced at the ask's last merge). Every per-pull-request scenario must be claimed by some pull request (else the last merge is refused; a `CU` waiver passes).
 2. **Clauses to scenarios**: every clause needs a behaviour scenario (`S`); behaviour that must NOT change is a
    `U` scenario. Each has `covers` (`DW-n` or `PC-n`), `text` (Given/when/then), `proof` (`test | live | measure |
    screenshot | review`; `review` quotes text), `pass` (a concrete observable: a status, a number, a quoted value), `discriminates` (the wrong
@@ -98,7 +98,7 @@ Bad: `pass: works`, `discriminates: a wrong build would fail this`, "add a `comm
 ## Wordings `plan check` accepts
 
 - every declared `DW`/`PC` is covered by a scenario;
-- `discriminates` names a concrete wrong build (a stub that returns an empty list);
+- `discriminates` names a concrete wrong build;
 - `pass` has an observable number or status (`exit status is 0`);
 - the declared clauses joined equal the ask's Done-when;
 - check a slice with `--ask <its own work item>`.
@@ -106,9 +106,9 @@ Bad: `pass: works`, `discriminates: a wrong build would fail this`, "add a `comm
 ## After the plan
 
 The worker proves each scenario with `fleet-switchboard prove S1 --pr <pr>
---evidence <link-or-what-you-ran>`, an evaluator records `verdict`, and `fleet-switchboard gates <pr>` shows what is still
-open. The order does not matter: a coder's only extra step is `prove`. The Chief of Staff may waive a hotfix, logged; the plan is then due within a day.
+--evidence <link-or-what-you-ran>`, an evaluator records `verdict`, and `fleet-switchboard gates <pr>` shows what is open.
+Order does not matter: a coder's only extra step is `prove`. The Chief of Staff may waive a hotfix, logged; the plan is then due within a day.
 `CARRIES: #N`: see plan-template.
-A launch arms a checkpoint and an overdue wake: a cloud launch with no CHECKPOINT line or flags gets the default 25m/40m.
+A launch arms a checkpoint and an overdue wake: a cloud launch without CHECKPOINT line or flags gets the default 25m/40m.
 Apply an approved plan edit with `fleet-switchboard plan apply` (see plan-template).
-A builder told to run the guard set runs `tools/guard-set --run` (one command, one class at a time, each with its timeout).
+A builder told to run the guard set runs `tools/guard-set --run`.
