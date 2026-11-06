@@ -1,5 +1,4 @@
 """Shared fakes and helpers of bin/test-switchboard (moved text, unchanged): carry_git."""
-import os
 import subprocess
 
 
@@ -12,10 +11,7 @@ class GitHubOverGit:
         self.calls, self.fail, self.changed_files_override = [], None, None
 
     def git(self, *args, check=True):
-        env = dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_COUNT="3",   # identity passed through the environment: no `git config` (a pod's git wrapper refuses it), nothing global read or written
-                   GIT_CONFIG_KEY_0="user.email", GIT_CONFIG_VALUE_0="dev@example.test", GIT_CONFIG_KEY_1="user.name", GIT_CONFIG_VALUE_1="Dev",
-                   GIT_CONFIG_KEY_2="commit.gpgsign", GIT_CONFIG_VALUE_2="false")
-        done = subprocess.run(["git", "-C", self.dir] + list(args), capture_output=True, text=True, env=env)
+        done = subprocess.run(["git", "-C", self.dir, "-c", "user.email=dev@example.test", "-c", "user.name=Dev", "-c", "commit.gpgsign=false"] + list(args), capture_output=True, text=True)   # identity by `git -c`: no `git config` (a pod's git wrapper refuses it, and GIT_CONFIG_* too)
         if check and done.returncode != 0:
             raise RuntimeError("git %s: %s" % (" ".join(args), done.stderr.strip()))
         return done.stdout
