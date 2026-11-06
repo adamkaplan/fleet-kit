@@ -918,7 +918,7 @@ class TestAssembler(unittest.TestCase):
 
     def test_a_load_of_the_copied_entry_leaves_sys_modules_as_it_was(self):
         before = dict(sys.modules)
-        root = self._copy(["fleet-switchboard", "switchboard/v2_transport.py", "switchboard/facts.py", "switchboard/judge_request.py", "switchboard/judge.py", "switchboard/import_v1.py", "switchboard/handoff.py"])
+        root = self._copy(["fleet-switchboard"] + self._shipped_parts())
         _load("t_assembled", root / "fleet-switchboard")
         self.doCleanups()   # what unittest runs after the test
         self.assertEqual(set(sys.modules), set(before))
