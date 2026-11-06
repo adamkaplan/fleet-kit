@@ -540,13 +540,15 @@ class _Stayed:
         return globals()[name]
 
 
-def _load_cluster():
-    """Load bin/cloud_cluster.py (beside this file; a part of it) with `D` set, and bind each of its names here (a name patched here does not reach it: patch it there)."""
-    spec = importlib.util.spec_from_file_location("cloud_cluster", str(_OWN_BIN / "cloud_cluster.py"))
+def _load_part(name):
+    """Load bin/<name>.py (beside this file; a part of it) with `D` set, register it in sys.modules under `name`, and bind its names here when it has `bind` (a name patched here does not reach it: patch it there)."""
+    spec = importlib.util.spec_from_file_location(name, str(_OWN_BIN / (name + ".py")))
     module = importlib.util.module_from_spec(spec)
     module.D = _Stayed()
-    sys.modules["cloud_cluster"] = module
+    sys.modules[name] = module
     spec.loader.exec_module(module)
+    if hasattr(module, "bind"):
+        module.bind(globals())
     return module
 
 
@@ -561,22 +563,12 @@ CLUSTER_NAMES = (
     "unknown_report_to",
     "check_report_to",
 )
-cloud_cluster = _load_cluster()
+cloud_cluster = _load_part("cloud_cluster")
 for _name in CLUSTER_NAMES:
     globals()[_name] = getattr(cloud_cluster, _name)
 
 
-def _load_launch_again():
-    """Load bin/cloud_launch_again.py (beside this file; a part of it, ask #1619) and bind its names here."""
-    spec = importlib.util.spec_from_file_location("cloud_launch_again", str(_OWN_BIN / "cloud_launch_again.py"))
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["cloud_launch_again"] = module
-    spec.loader.exec_module(module)
-    module.bind(globals())
-    return module
-
-
-cloud_launch_again = _load_launch_again()
+cloud_launch_again = _load_part("cloud_launch_again")
 
 
 
@@ -1562,43 +1554,14 @@ def cmd_cloud_clear(args, runner, now):
 
 # ---------------------------------------------------------------- inspect: what a pod of the caller is doing now (ask #2115, bin/cloud_inspect.py)
 
-def _load_inspect():
-    """Load bin/cloud_inspect.py (beside this file; a part of it) with `D` set, and bind each of its names here (a name patched here does not reach it: patch it there)."""
-    spec = importlib.util.spec_from_file_location("cloud_inspect", str(_OWN_BIN / "cloud_inspect.py"))
-    module = importlib.util.module_from_spec(spec)
-    module.D = _Stayed()
-    sys.modules["cloud_inspect"] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-def _load_pr_labels():
-    """Load bin/cloud_pr_labels.py (beside this file; a part of it, ask #2269)."""
-    spec = importlib.util.spec_from_file_location("cloud_pr_labels", str(_OWN_BIN / "cloud_pr_labels.py"))
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["cloud_pr_labels"] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-cloud_pr_labels = _load_pr_labels()
-cloud_inspect = _load_inspect()
+cloud_pr_labels = _load_part("cloud_pr_labels")
+cloud_inspect = _load_part("cloud_inspect")
 for _name in ("INSPECT_SECONDS", "_inspect_short", "cmd_inspect"):
     globals()[_name] = getattr(cloud_inspect, _name)
 
 
 # ---------------------------------------------------------------- the shape-M count of a lane (ask #2259, bin/cloud_lane_cap.py)
 
-def _load_lane_cap():
-    """Load bin/cloud_lane_cap.py (beside this file; a part of it) with `D` set, and bind each of its names here (a name patched here does not reach it: patch it there)."""
-    spec = importlib.util.spec_from_file_location("cloud_lane_cap", str(_OWN_BIN / "cloud_lane_cap.py"))
-    module = importlib.util.module_from_spec(spec)
-    module.D = _Stayed()
-    sys.modules["cloud_lane_cap"] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-cloud_lane_cap = _load_lane_cap()
+cloud_lane_cap = _load_part("cloud_lane_cap")
 for _name in ("lane_m_workers", "_ended", "_stopped_ids"):
     globals()[_name] = getattr(cloud_lane_cap, _name)
