@@ -663,6 +663,16 @@ class TestGitShim(Base):
          "points git at /dev/null: writes no git configuration"),
         ("tests/switchboard/test_merge_drops.py", " " * 26 + 'env={"PATH": "/usr/bin:/bin", "HOME": str(cwd), "GIT_CONFIG_' + _G.upper() + '": "/dev/null", "GIT_CONFIG_' + _S.upper() + '": "/dev/null",',
          "points git at /dev/null: writes no git configuration (#2161)"),
+        # #2214 (read-only root filesystem): the launcher points git's global-configuration variable at a file on the pod's tmpfs, because the home git file is a
+        # file that cannot be mounted over. That names a path for git to READ; it writes no global configuration. Each row is the exact added line.
+        ("cloud/launcher/cloud_worker.py", "READONLY_ROOT_GIT" + "CONFIG" + ' = "/run/cw-tmp/git' + 'config"   # ~/.git' + "config is a FILE: git is pointed at the tmpfs instead of mounting over it",
+         "names a tmpfs path for git to read (#2214): writes no git configuration"),
+        ("cloud/launcher/cloud_worker.py", " " * 8 + 'worker_container["env"].append({"name": "GIT_CONFIG_' + _G.upper() + '", "value": READONLY_ROOT_GIT' + "CONFIG" + "})",
+         "sets the pod's git global-configuration variable to that tmpfs path (#2214): writes no git configuration"),
+        ("cloud/launcher/tests/test_readonly_root.py", " " * 4 + 'test.assertIn({"name": "GIT_CONFIG_' + _G.upper() + '", "value": "/run/cw-tmp/git' + 'config"}, c["env"])',
+         "asserts that variable in the container env (#2214): writes no git configuration"),
+        ("cloud/launcher/tests/test_readonly_root.py", " " * 4 + 'test.assertFalse(any(m["mountPath"] == "/home/worker" or m["mountPath"].endswith(".git' + 'config") for m in c["volumeMounts"]))',
+         "asserts no mount over the home git file (#2214): writes no git configuration"),
     )
 
     @classmethod
