@@ -4428,6 +4428,7 @@ class Launcher:
             steps["notes"] += mono() - t0   # the final note is counted with the notes
         t0 = mono()
         try:
+            nudge_prune(self, pods)   # the FULL pod list, not the subset `live`
             self.send_idle_nudges(live, now, acts)
         finally:
             steps["notes"] += mono() - t0   # the nudges are counted with the notes: both are the pass's sends
@@ -4586,7 +4587,6 @@ class Launcher:
     def send_idle_nudges(self, pods, now, acts=None):
         """ONE fixed line to a stalled builder (see idle_nudge_due). The cw/idle-nudge annotation is set BEFORE the send; one audit line.
         A results check that cannot run means do not nudge. Never raises."""
-        nudge_prune(self, pods)
         for pod in pods:
             try:
                 worker, name = ann(pod, "worker"), pod["metadata"]["name"]

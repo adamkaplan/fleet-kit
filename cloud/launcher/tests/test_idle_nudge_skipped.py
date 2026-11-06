@@ -113,8 +113,11 @@ class TestSkipped(unittest.TestCase):
             self.fn(s, [a, b], NOW)
         self.assertEqual(set(s._nudge_unknown), {"u1", "u2"})
         s.__dict__.setdefault("_nudge_skipped", {}).update({("u2", "x"): True, ("u1", "x"): True})
-        with contextlib.redirect_stderr(io.StringIO()):
-            self.fn(s, [a], NOW)
+        # b is in the full list but not in `live`: keeps its entries
+        cw.nudge_prune(s, [a, b])
+        self.assertEqual(set(s._nudge_unknown), {"u1", "u2"})
+        self.assertEqual(set(k[0] for k in s._nudge_skipped), {"u1", "u2"})
+        cw.nudge_prune(s, [a])
         self.assertEqual(set(s._nudge_unknown), {"u1"})
         self.assertEqual(set(k[0] for k in s._nudge_skipped), {"u1"})
 
