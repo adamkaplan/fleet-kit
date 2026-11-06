@@ -2349,7 +2349,7 @@ class Switchboard:
             plan = copy.copy(plan)
             plan.pending = kept
         pending = merge_wake_facts(plan.recipient, merge_reminder_copies(plan.pending))   # #1275: the sweep, triage and load-alert items of one wake are ONE message
-        in_turn = getattr(observation, "status", None) == "working"
+        in_turn = getattr(observation, "status", None) == "working" and not stale_working(self, observation, plan.pending)   # #2243: a stale 'working' (v2 runs no turn) is a new turn for a reminder
         parts_file = (self.state_dir / "finding-parts.json") if self.state_dir is not None else None   # #1302: how many parts of an over-cap finding were delivered (survives a restart; derived from nothing else)
         try:
             parts_done = json.loads(parts_file.read_text()) if parts_file is not None and parts_file.exists() else {}
@@ -2406,7 +2406,7 @@ class Switchboard:
             except Exception as err:   # an unreadable record or module is an unknown age = young = queue
                 age = None
                 self._note("turn_start.error", None, {"reason": _one_line("%s: %s" % (type(err).__name__, err), 200)})
-            busy = steers_into_turn(self.config, observation, carried, getattr(self, "discovery", None), age, self.now())
+            busy = in_turn and steers_into_turn(self.config, observation, carried, getattr(self, "discovery", None), age, self.now())
         if busy:
             delivery = "steer"
         detail = {"mode": plan.action, "session": observation.session_id, "message_id": message_id,
