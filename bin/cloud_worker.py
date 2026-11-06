@@ -843,6 +843,8 @@ def _launch(args, runner, now, reserve):
             record["agent"] = args.agent   # the local role name, for the operator: the pod runs CLOUD_WORKER_AGENT
             if args.reports_to:
                 record["reports_to"] = args.reports_to
+            if issue is not None:
+                record["issue"] = int(issue)   # the issue the launch named (#2246), checked above: an int only
             if isinstance(args.shape, str) and args.shape:
                 record["shape"] = args.shape
             cloud_pr_labels.record_labels(record, args)   # #2269
@@ -1041,24 +1043,6 @@ def _show_identity_note(body, cluster):
     note = body.get("identity_note")
     if isinstance(note, str) and note:
         print("%s: WARNING: %s" % (H["PROG"], _one(cluster.clean(note, 300), 300)), file=sys.stderr)
-
-
-def _record_from_create(name, body):
-    if body is None:
-        raise CloudError("the launcher printed no record")
-    if body.get("worker") != name:
-        raise CloudError("the launcher answered for another worker")
-    record = {key: body.get(key) for key in RECORD_FIELDS}
-    record["idle_seconds"] = body.get("idle_seconds")   # the limits the launcher applied (ask #1474)
-    record["hard_seconds"] = body.get("hard_seconds")
-    if any(not isinstance(record[key], str) or not record[key] for key in ("url", "runtime_id")):
-        raise CloudError("the launcher's record has no url or runtime_id")
-    problem = endpoint_problem(record["url"])
-    if problem:
-        raise CloudError("the launcher named an endpoint that is refused: %s" % problem)
-    if isinstance(body.get("pod_uid"), str) and POD_UID_RE.fullmatch(body["pod_uid"]):
-        record["pod_uid"] = body["pod_uid"]   # the pod's identity at create time: a retire acts only on the pod that has it
-    return record
 
 
 def _stop_after_failure(engine, runner, name, run_id, reason, cluster):
@@ -1561,6 +1545,11 @@ for _name in ("INSPECT_SECONDS", "_inspect_short", "cmd_inspect"):
 
 
 # ---------------------------------------------------------------- the shape-M count of a lane (ask #2259, bin/cloud_lane_cap.py)
+
+# the record a launch stores (ask #2246, bin/cloud_record_create.py)
+cloud_record_create = _load_part("cloud_record_create")
+_record_from_create = cloud_record_create._record_from_create
+
 
 cloud_lane_cap = _load_part("cloud_lane_cap")
 for _name in ("lane_m_workers", "_ended", "_stopped_ids"):

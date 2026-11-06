@@ -16,6 +16,7 @@ PARTS = {
     "cloud_launch_again": (),   # reached as cloud_launch_again.<name>; it binds the globals (checked below)
     "cloud_inspect": ("INSPECT_SECONDS", "_inspect_short", "cmd_inspect"),
     "cloud_lane_cap": ("lane_m_workers", "_ended", "_stopped_ids"),
+    "cloud_record_create": ("_record_from_create",),
 }
 ANCHOR = "a part was loaded but not registered"
 
