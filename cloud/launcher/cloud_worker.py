@@ -2941,7 +2941,7 @@ KEPT_ENDED_NOTE = "kept pod ended: its work is unreachable by exec; the pod is l
 # The results check of the idle nudge: ONE read in the pod. It prints "no" (no /work/results.txt), or "<file mtime> <newest user message time> <1 if the last non-empty line is exactly STATUS: done else 0>"
 # (epoch seconds; the session's messages, as cw-pod-inspect reads them), or "unreadable". The file is "finished" only with the marker AND NEWER than that message.
 RESULTS_PROBE_CODE = """
-import base64, json, os, sys, urllib.request
+import base64, json, os, sys, urllib.parse, urllib.request
 p = "/work/results.txt"
 if not os.path.exists(p):
     print("no"); sys.exit(0)
@@ -2951,17 +2951,26 @@ try:
     auth = "Basic " + base64.b64encode(("opencode:" + pw).encode()).decode()
     def get(path):
         r = urllib.request.urlopen(urllib.request.Request("http://127.0.0.1:%s%s" % (port, path), headers={"Authorization": auth}), timeout=10)
-        return json.loads(r.read().decode()).get("data")
-    sessions = get("/api/session")
+        return json.loads(r.read().decode())
+    sessions = get("/api/session").get("data")
     sessions = list(sessions.values()) if isinstance(sessions, dict) else sessions
     best = None
     for s in sessions:
-        for m in get("/api/session/%s/message" % s["id"]) or []:
-            info = m.get("info") or m
-            if info.get("role") == "user":
-                t = (info.get("time") or {}).get("created")
-                if isinstance(t, (int, float)):
-                    best = max(best or 0, t / 1000.0 if t > 1e11 else t)
+        q = ""
+        for _page in range(5):
+            body = get("/api/session/%s/message%s" % (s["id"], q))
+            items = body.get("data") if isinstance(body, dict) else body
+            for m in items or []:
+                info = m.get("info") or m
+                if m.get("type") == "user" or info.get("role") == "user":
+                    t = (info.get("time") or {}).get("created")
+                    if isinstance(t, (int, float)):
+                        best = max(best or 0, t / 1000.0 if t > 1e11 else t)
+            cur = body.get("cursor") if isinstance(body, dict) else None
+            nxt = cur.get("next") if isinstance(cur, dict) else None
+            if not nxt:
+                break
+            q = "?cursor=" + urllib.parse.quote(str(nxt))
     lines = [l.strip() for l in open(p, errors="replace").read().splitlines() if l.strip()]
     done = 1 if lines and lines[-1] == "STATUS: done" else 0
     print(os.path.getmtime(p), best if best is not None else "unreadable", done)

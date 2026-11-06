@@ -108,8 +108,10 @@ class Api(http.server.BaseHTTPRequestHandler):
         if self.path == "/api/session":
             data = [{"id": "s1"}]
         else:
-            data = [{"info": {"role": "user", "time": {"created": int(self.server.prompt * 1000)}}}, {"info": {"role": "assistant", "time": {"created": 9999999999999}}}]
-        body = json.dumps({"data": data}).encode()
+            data = [{"id": "m1", "text": "", "time": {"created": int(self.server.prompt * 1000)}, "type": "user"},
+                    {"agent": "", "content": "", "cost": 0, "finish": "", "id": "m2", "model": "", "rawFinish": "", "time": {"created": 9999999999999}, "tokens": {}, "type": "assistant"},
+                    {"id": "m3", "outcome": "", "time": {"created": 9999999999998}, "type": "idle"}]
+        body = json.dumps({"cursor": {}, "data": data}).encode()
         self.send_response(200)
         self.end_headers()
         self.wfile.write(body)
@@ -148,6 +150,33 @@ class TestRealExec(unittest.TestCase):
     def test_newer_file_with_the_marker_is_finished(self):
         s = self.run_real(True, True)
         self.assertEqual((s.sent, s.audits, s.marks), ([], [], []))
+
+    def test_probe_prints_a_number_for_the_real_shape(self):
+        out = self.probe(cw.RESULTS_PROBE_CODE)
+        self.assertNotIn("unreadable", out)
+        self.assertEqual(len(out.split()), 3)
+
+    def test_mutant_role_only_prints_unreadable(self):
+        code = cw.RESULTS_PROBE_CODE.replace('m.get("type") == "user" or ', "")
+        self.assertNotEqual(code, cw.RESULTS_PROBE_CODE)
+        self.assertEqual(self.probe(cw.RESULTS_PROBE_CODE).split()[1].replace(".", "").isdigit(), True)  # control first
+        self.assertIn("unreadable", self.probe(code))
+
+    def probe(self, code):
+        import subprocess
+        with tempfile.TemporaryDirectory() as d:
+            res = os.path.join(d, "results.txt")
+            open(res, "w").write("x\nSTATUS: done\n")
+            open(os.path.join(d, "pw"), "w").write("x\n")
+            srv = http.server.HTTPServer(("127.0.0.1", 0), Api)
+            srv.prompt = time.time() - 1000
+            threading.Thread(target=srv.serve_forever, daemon=True).start()
+            try:
+                env = dict(os.environ, CW_ACTIVITY_PORT=str(srv.server_port), CW_ACTIVITY_PASSWORD_FILE=os.path.join(d, "pw"))
+                return subprocess.run([sys.executable, "-c", code.replace("/work/", d + "/")], env=env, capture_output=True, text=True).stdout
+            finally:
+                srv.shutdown()
+                srv.server_close()
 
     def test_control_real_path_nudges_without_marker_or_when_older(self):
         for marker, newer in ((False, True), (True, False)):
