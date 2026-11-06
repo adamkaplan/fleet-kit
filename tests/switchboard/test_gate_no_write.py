@@ -56,7 +56,11 @@ class TestGateNoWrite(base.TestGateProbeReads):
         for flag in spellings:
             with self.subTest(flag=flag):
                 self.assertFalse(mod.gate_read_only(["gh", "api", "x", flag]))
+        for flag in ("-if", "-iFa=b", "-iXPOST", "-iX"):   # bundled short flags
+            with self.subTest(flag=flag):
+                self.assertFalse(mod.gate_read_only(["gh", "api", "x", flag]))
         self.assertTrue(mod.gate_read_only(["gh", "api", "x", "-H", "Accept: a"]))
+        self.assertTrue(mod.gate_read_only(["gh", "api", "x", "-i", "-X", "GET"]))
 
     def test_control_the_rule_before_this_pr_gets_these_cases_wrong(self):
         def old(argv):   # gate_read_only as on origin/integration
