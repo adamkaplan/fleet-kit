@@ -78,6 +78,91 @@ class TestHook(unittest.TestCase):
         self.assertEqual(code, 1)
 
 
+class TestCleanLocal(unittest.TestCase):
+    """clean_local must call WORK every kind of unsaved state (a false "clean" loses work) and a truly clean clone clean."""
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.d = tmp.name
+        seed = self.d + "/seed"
+        subprocess.run(["git", "init", "-q", "-b", "main", seed], check=True)
+        run_git(seed, "commit", "-q", "--allow-empty", "-m", "one")
+        subprocess.run(["git", "clone", "-q", "--bare", seed, self.d + "/remote.git"], check=True)
+        subprocess.run(["git", "clone", "-q", self.d + "/remote.git", self.d + "/repo"], check=True)
+        self.w = self.d + "/repo"
+
+    def clean(self, fn=None):
+        return (fn or end_hook.clean_local)(self.w, None)
+
+    def mutant(self):
+        import inspect
+        src = inspect.getsource(end_hook.clean_local)
+        cut = 'roots.update(out("reflog", "show", "--format=%H", line).split())'
+        self.assertIn(cut, src)
+        src = src.replace(cut, "pass").replace("roots = set(start)", "roots = set()")
+        ns = dict(vars(end_hook))
+        exec(src, ns)
+        return ns["clean_local"]
+
+    def test_a_truly_clean_clone_is_clean(self):
+        self.assertTrue(self.clean())
+
+    def test_each_false_clean_case_is_not_clean(self):
+        def detached():
+            run_git(self.w, "checkout", "-q", "--detach")
+            run_git(self.w, "commit", "-q", "--allow-empty", "-m", "orphan")
+            run_git(self.w, "checkout", "-q", "main")
+
+        def stash():
+            open(self.w + "/f", "w").write("x")
+            run_git(self.w, "add", "f")
+            run_git(self.w, "commit", "-q", "-m", "f")
+            run_git(self.w, "reset", "-q", "--hard", "origin/main")
+            open(self.w + "/g", "w").write("x")
+            run_git(self.w, "add", "g")
+            run_git(self.w, "stash")
+
+        def worktree():
+            run_git(self.w, "worktree", "add", "-q", "--detach", self.d + "/wt")
+            open(self.d + "/wt/u", "w").write("x")
+
+        def worktree_commit():
+            run_git(self.w, "worktree", "add", "-q", "--detach", self.d + "/wt")
+            run_git(self.d + "/wt", "commit", "-q", "--allow-empty", "-m", "in wt")
+
+        def staged():
+            open(self.w + "/s", "w").write("x")
+            run_git(self.w, "add", "s")
+
+        def untracked():
+            open(self.w + "/u", "w").write("x")
+
+        def local_branch():
+            run_git(self.w, "checkout", "-q", "-b", "mine")
+            run_git(self.w, "commit", "-q", "--allow-empty", "-m", "mine")
+            run_git(self.w, "checkout", "-q", "main")
+        for name, plant in (("detached orphan commit", detached), ("stash", stash), ("second worktree untracked", worktree),
+                            ("second worktree commit", worktree_commit), ("staged file", staged), ("untracked file", untracked),
+                            ("local-only branch commit", local_branch)):
+            with self.subTest(name):
+                self.tearDown_clone()
+                plant()
+                self.assertFalse(self.clean(), name + " was called clean")
+
+    def tearDown_clone(self):
+        subprocess.run("rm -rf %s/repo %s/wt && git clone -q %s/remote.git %s/repo && git -C %s worktree prune"
+                       % (self.d, self.d, self.d, self.d, self.w), shell=True, check=True)
+
+    def test_a_mutant_without_the_reflog_check_is_caught(self):
+        def plant():
+            run_git(self.w, "checkout", "-q", "--detach")
+            run_git(self.w, "commit", "-q", "--allow-empty", "-m", "orphan")
+            run_git(self.w, "checkout", "-q", "main")
+        plant()
+        self.assertFalse(self.clean(), "control: the real clean_local must see the orphan")
+        self.assertTrue(self.clean(self.mutant()), "the mutant must call the orphan clean")   # so the real test would fail on it
+
+
 class Scen(tr.Harness):
     def count(self):
         n = 0

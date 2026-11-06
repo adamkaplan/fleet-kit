@@ -182,16 +182,38 @@ FETCH_TIMEOUT_SECONDS = 20
 
 
 def clean_local(workdir, ctx):
-    """True when, from local references only, nothing is unsaved: no commit is unreachable from every remote-tracking ref and from
-    the clone's starting commit (the oldest entry of the HEAD reflog), and the working tree is clean. Any doubt is False."""
+    """True when, from local references only, nothing is unsaved. WORK is any commit reachable from the reflog of HEAD or of any local
+    branch, from refs/stash, from any local branch, or from any worktree's HEAD, that no remote-tracking ref and not the clone's
+    starting commit (the oldest entry of the HEAD reflog) reaches; also any change (staged, untracked) in this or any other worktree.
+    Any git command that fails, or any doubt, is NOT clean.
+
+    Cause (S1): a read-only reader pod was kept and retried because the end hook did not decide from local state before the remote
+    call: it always ran `git fetch` first, and with an ended token that fetch failed (or a local branch had no remote counterpart),
+    so the pod was kept as "unsaved" and the stop was retried on every pass. A clean tree needs no remote call."""
+    def out(*args):
+        p = git(workdir, *args, check=False, ctx=ctx)
+        if p.returncode != 0:
+            raise RuntimeError("git failed")
+        return p.stdout
     try:
-        if git(workdir, "status", "--porcelain", "--untracked-files=all", check=False, ctx=ctx).stdout.strip():
-            return False
-        start = git(workdir, "reflog", "show", "--format=%H", "HEAD", check=False, ctx=ctx).stdout.split()
+        start = out("reflog", "show", "--format=%H", "HEAD").split()
         if not start:
             return False
-        out = git(workdir, "rev-list", "--max-count=1", "--all", "--not", "--remotes", start[-1], check=False, ctx=ctx)
-        return out.returncode == 0 and out.stdout.strip() == ""
+        roots = set(start)
+        for line in out("for-each-ref", "--format=%(refname)", "refs/heads").split():
+            roots.add(line)
+            roots.update(out("reflog", "show", "--format=%H", line).split())
+        roots.update(out("for-each-ref", "--format=%(objectname)", "refs/stash").split())
+        for line in out("worktree", "list", "--porcelain").splitlines():
+            if line.startswith("worktree "):
+                wt = line[9:]
+                if out("-C", wt, "status", "--porcelain", "--untracked-files=all").strip():
+                    return False
+            elif line.startswith("HEAD "):
+                roots.add(line[5:])
+        roots = [r for r in roots if set(r) != {"0"}]
+        res = out("rev-list", "--max-count=1", *roots, "--not", "--remotes", start[-1], "--")
+        return res.strip() == ""
     except (RuntimeError, OSError):
         return False
 
