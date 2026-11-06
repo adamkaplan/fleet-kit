@@ -299,8 +299,8 @@ def _audit_model_nondefault(worker, model, level):
         lib.write_audit(lib.audit_path(os.environ), {"ts": lib.iso(datetime.datetime.now(datetime.timezone.utc)), "worker": worker, "runtime_id": "",
                                                      "action": "model-nondefault", "cost_estimate_usd": 0.0, "ok": True, "model": model, "level": level or "",
                                                      "actor": pwd.getpwuid(os.getuid()).pw_name})
-    except Exception:
-        pass
+    except Exception as err:
+        print("cloud-worker: WARNING: the model-nondefault audit line could not be written (%s)" % type(err).__name__, file=sys.stderr)
 
 
 def _read_password(read_fd):

@@ -73,6 +73,7 @@ class DefaultModel(tcw.Base):
         self.assertEqual(code, 0, err)
         (body,) = self.bodies()
         self.assertEqual(body["model"], {"providerID": "github-copilot", "id": "claude-opus-5.5", "variant": "high"})
+        self.assertTrue(self.audit.exists() and self.audit.stat().st_size > 0, "the audit line went to the launcher audit file")
         (line,) = self.nondefault()
         self.assertEqual((line["worker"], line["model"], line["level"]), ("coder7", "github-copilot/claude-opus-5.5", "high"))
 
@@ -87,6 +88,21 @@ class DefaultModel(tcw.Base):
                          {"model": "github-copilot/claude-opus-5.5"})
         self.assertEqual(calls, [("o", "github-copilot/claude-opus-5.5", None)])
 
+    def test_the_default_given_explicitly_is_not_audited_and_the_same_model_at_another_level_is(self):
+        ns = load_part(PART.read_text())
+        calls = []
+        args = lambda **kw: type("A", (), dict({"model": None, "reasoning": None, "agent": "coder", "name": "w"}, **kw))()
+        ns["launch_model_cloud"](args(model="github-copilot/claude-sonnet-5.5", reasoning="medium"), "github-copilot", lambda *a: calls.append(a))
+        self.assertEqual(calls, [])
+        ns["launch_model_cloud"](args(model="github-copilot/claude-sonnet-5.5", reasoning="high"), "github-copilot", lambda *a: calls.append(a))
+        self.assertEqual(calls, [("w", "github-copilot/claude-sonnet-5.5", "high")])
+
+    def test_the_default_obeys_the_provider_check(self):
+        ns = load_part(PART.read_text())
+        args = type("A", (), {"model": None, "reasoning": None, "agent": "coder", "name": "w"})()
+        with self.assertRaisesRegex(Exception, "a cloud worker holds credentials for the provider other only"):
+            ns["launch_model_cloud"](args, "other")
+
     def test_the_default_choice_is_in_launch_model_py(self):
         text = (ROOT / "bin" / "switchboard" / "launch_model.py").read_text()
         self.assertRegex(text, r'CLOUD_DEFAULT_MODEL, CLOUD_DEFAULT_LEVEL = "github-copilot/claude-sonnet-5\.5", "medium"')
@@ -96,7 +112,7 @@ class Mutant(unittest.TestCase):
     def test_a_launch_model_without_the_default_fails_with_an_anchored_text(self):
         path = ROOT / "bin" / "switchboard" / "launch_model.py"
         text = path.read_text()
-        mutant = text.replace('else {"model": CLOUD_DEFAULT_MODEL, "reasoning": CLOUD_DEFAULT_LEVEL}', "else {}")
+        mutant = text.replace("model, level = CLOUD_DEFAULT_MODEL, CLOUD_DEFAULT_LEVEL", "return {}")
         self.assertNotEqual(mutant, text, "the mutation did not apply")
         args = type("A", (), {"model": None, "reasoning": None, "agent": "coder", "name": "w"})()
         control, broken = load_part(text), load_part(mutant)

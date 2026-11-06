@@ -82,7 +82,9 @@ def launch_model_cloud(args, provider, audit=None):
     model or level is not that default calls `audit(worker, model, level)` once (the launcher's audit line `model-nondefault`)."""
     model, level = getattr(args, "model", None), getattr(args, "reasoning", None)
     if model is None and level is None:
-        return {} if getattr(args, "agent", None) == "orchestrator" else {"model": CLOUD_DEFAULT_MODEL, "reasoning": CLOUD_DEFAULT_LEVEL}
+        if getattr(args, "agent", None) == "orchestrator":
+            return {}
+        model, level = CLOUD_DEFAULT_MODEL, CLOUD_DEFAULT_LEVEL   # the default goes through the same provider check below
     if model is None:
         raise LaunchError("--reasoning needs --model PROVIDER/MODEL: the level is one of that model's own levels; add --model or drop --reasoning")
     choice = launch_model_syntax(model, level)
