@@ -18277,8 +18277,13 @@ def gate_read_only(argv):
     if args[:2] in (["pr", "view"], ["pr", "diff"], ["pr", "list"], ["pr", "checks"], ["run", "view"], ["run", "list"], ["issue", "view"], ["issue", "list"], ["repo", "view"]):
         return True
     if args[:1] == ["api"]:
-        flags = [a for a in args[1:] if a.startswith("-")]
-        return not any(f in ("-X", "--method", "-f", "-F", "--field", "--raw-field", "--input") or f.startswith(("-X", "--method=", "--field=", "--raw-field=", "--input=")) for f in flags)
+        rest = args[1:]
+        verbs = [rest[i + 1] if a in ("-X", "--method") and i + 1 < len(rest) else a.split("=", 1)[1] if a.startswith("--method=") else a[2:] if a.startswith("-X") and a != "-X" else None
+                 for i, a in enumerate(rest) if a in ("-X", "--method") or a.startswith(("-X", "--method="))]
+        if any(v.upper() != "GET" for v in verbs):   # #2230: `--method GET` is a read (`_gh_write(..., "GET")` says it so): only another verb makes it a write
+            return False
+        flags = [a for a in rest if a.startswith("-")]
+        return not any(f in ("-f", "-F", "--field", "--raw-field", "--input") or f.startswith(("--field=", "--raw-field=", "--input=")) for f in flags)
     return False
 
 
@@ -18343,7 +18348,7 @@ def _gates_check(args, runner, now):
             def work():
                 try:
                     ns = types.SimpleNamespace(pr=args.pr, plan=args.plan, ask=args.ask, head=None)
-                    ctx = _ledger_context(ns, once_pr_view_runner(runner), now, False, floor=True)   # #2215: the same `gh pr view` is asked once
+                    ctx = _ledger_context(ns, once_pr_view_runner(runner), now, False, floor=(args.check_for == "merge"))   # #2215: the same `gh pr view` is asked once; #2230: the floor (G6, G6b) and the approval (G0c) count only for a merge (REQUIRED_FOR), so a ready check no longer waits on their reads
                     box["report"] = plan_ledger.evaluate_gates(ctx.plan, ctx.entries, ctx.problem,
                                                                 ctx.facts if ctx.facts.get("head") or ctx.facts.get("body") else None, ctx.pr,
                                                                 now=now())
