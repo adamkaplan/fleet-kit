@@ -74,7 +74,7 @@ class Rig:
         with open(os.path.join(self.dir, "lost-workers.json"), "w") as handle:
             json.dump({"offsets": {}, "alerted": {}}, handle)
 
-    def created(self, name, deadline=NOW - 60, lane="lane-a", branch="ask-7"):
+    def created(self, name, deadline=NOW - 400, lane="lane-a", branch="ask-7"):
         line(self.engine.audit.path, ts=stamp(NOW - 7200), actor="x", event="cloud.created", subject=name, detail={"hard_deadline": stamp(deadline)})
         self.engine.cloud_watch["records"].append({"worker": name, "reports_to": lane, "branch": branch})
 
@@ -139,7 +139,7 @@ def scenarios(mod):
     check("S5b done then hard limit", r.passes() == [] and r.engine.sent == [])
     r = Rig(mod)   # pushed false alone proves nothing: a pod with that and neither a stop nor a report is still lost
     r.created("w4")
-    line(r.launcher, ts=stamp(NOW - 30), worker="w4", runtime_id="pod/w4", action="send", ok=True, reason="pushed=false")
+    line(r.launcher, ts=stamp(NOW - 3000), worker="w4", runtime_id="pod/w4", action="send", ok=True, reason="pushed=false")
     check("S5c pushed false alone is not a clean end", len(r.passes()) == 1)
 
     r = Rig(mod)   # S6: the third launch of an ask
@@ -220,7 +220,7 @@ class TestLostWorkerReadRound(unittest.TestCase):
         r = Rig(mod)
         path = r.engine.audit.path
         r.created("lost", deadline=NOW + 600)   # created with no stop, oldest creation, due only at the second pass
-        line(path, ts=stamp(NOW - 7000), actor="x", event="cloud.created", subject="old", detail={"hard_deadline": stamp(NOW - 60)})
+        line(path, ts=stamp(NOW - 7000), actor="x", event="cloud.created", subject="old", detail={"hard_deadline": stamp(NOW - 400)})
         line(r.launcher, ts=stamp(NOW - 5000), worker="old", runtime_id="pod/old", action="stop", ok=True, reason="finished")
         for n in range(3):
             r.created("f%d" % n)
@@ -257,14 +257,14 @@ class TestLostWorkerReadRound(unittest.TestCase):
         for n in range(40):
             r.created("old%d" % n)
         for n in range(2):
-            line(r.engine.audit.path, ts=stamp(NOW - 300), actor="x", event="cloud.created", subject="new%d" % n, detail={"hard_deadline": stamp(NOW - 60)})
+            line(r.engine.audit.path, ts=stamp(NOW - 300), actor="x", event="cloud.created", subject="new%d" % n, detail={"hard_deadline": stamp(NOW - 400)})
         self.assertEqual(sorted(x["name"] for x in r.passes()), ["new0", "new1"])
         self.assertEqual(r.passes(), [])
 
     def test_s10b_valid_memory_alerts_across_a_restart_gap(self):
         r = self.rig()
         r.passes()
-        line(r.engine.audit.path, ts=stamp(NOW - 3 * 3600), actor="x", event="cloud.created", subject="gap", detail={"hard_deadline": stamp(NOW - 60)})
+        line(r.engine.audit.path, ts=stamp(NOW - 3 * 3600), actor="x", event="cloud.created", subject="gap", detail={"hard_deadline": stamp(NOW - 400)})
         self.assertEqual([x["name"] for x in r.passes()], ["gap"])
 
     def test_mutant_that_applies_the_one_hour_rule_with_a_valid_memory_is_caught(self):
@@ -272,7 +272,7 @@ class TestLostWorkerReadRound(unittest.TestCase):
         real = mod._load
         mod._load = lambda sb, path: (real(sb, path)[0], "none")
         r = Rig(mod)
-        line(r.engine.audit.path, ts=stamp(NOW - 3 * 3600), actor="x", event="cloud.created", subject="gap", detail={"hard_deadline": stamp(NOW - 60)})
+        line(r.engine.audit.path, ts=stamp(NOW - 3 * 3600), actor="x", event="cloud.created", subject="gap", detail={"hard_deadline": stamp(NOW - 400)})
         self.assertEqual(r.passes(), [])   # the mutant alerts nothing: the s10b case above fails on it
 
     def test_s11_name_cleaned_and_corrupt_memory(self):
@@ -291,7 +291,7 @@ class TestLostWorkerReadRound(unittest.TestCase):
         self.assertEqual(r.engine.sent, [])
         with open(r.engine.audit.path) as handle:
             self.assertEqual(len([x for x in handle if "lost_worker.memory_corrupt" in x]), 1)
-        line(r.engine.audit.path, ts=stamp(NOW - 100), actor="x", event="cloud.created", subject="w2", detail={"hard_deadline": stamp(NOW - 60)})
+        line(r.engine.audit.path, ts=stamp(NOW - 100), actor="x", event="cloud.created", subject="w2", detail={"hard_deadline": stamp(NOW - 400)})
         self.assertEqual([x["name"] for x in r.passes()], ["w2"])
         self.assertTrue(json.load(open(os.path.join(r.dir, "lost-workers.json")))["offsets"])
 
@@ -394,14 +394,14 @@ class TestLostWorkerReadRound(unittest.TestCase):
         got += r.passes(at=NOW - 300)
         r.alive.clear()
         r.created("oldpod", deadline=NOW - 3 * 3600)
-        line(r.engine.audit.path, ts=stamp(NOW - 300), actor="x", event="cloud.created", subject="newpod", detail={"hard_deadline": stamp(NOW - 60)})
+        line(r.engine.audit.path, ts=stamp(NOW - 300), actor="x", event="cloud.created", subject="newpod", detail={"hard_deadline": stamp(NOW - 400)})
         line(r.engine.audit.path, ts=stamp(NOW - 3 * 3600), actor="x", event="cloud.create_failed", subject="oldref", detail={})
         line(r.engine.audit.path, ts=stamp(NOW - 100), actor="x", event="cloud.create_failed", subject="newref", detail={})
         got += r.passes()
         self.assertEqual(sorted((x["kind"], x["name"]) for x in got),
                          [("local_worker", "newloc"), ("pod_no_stop", "newpod"), ("refused_launch", "newref")])
         self.assertFalse(json.load(open(state_path))["catchup"])
-        line(r.engine.audit.path, ts=stamp(NOW - 3 * 3600), actor="x", event="cloud.created", subject="gap", detail={"hard_deadline": stamp(NOW - 60)})
+        line(r.engine.audit.path, ts=stamp(NOW - 3 * 3600), actor="x", event="cloud.created", subject="gap", detail={"hard_deadline": stamp(NOW - 400)})
         self.assertEqual([x["name"] for x in r.passes()], ["gap"])   # outside a catch-up a restart gap is still alerted
 
     def test_s6_a_detector_down_for_hours_says_once_how_many_it_missed(self):
@@ -481,8 +481,8 @@ class TestLostWorkerReadRound(unittest.TestCase):
         self.assertEqual([x["name"] for x in r.passes()], ["w1"])
 
     BAD = [None, "x", 5, [1], {"a": 1}, True, 10 ** 30, {"a": {"b": [1]}}]
-    VALID = {"reaper_ok": [5], "catchup": [True], "stop": [{"a": 1}], "report": [{"a": 1}], "gone": [{"a": 1}], "slow_bad": [5]}   # the one bad value of the table that is a good value of that key
-    KEYS = ("offsets", "alerted", "created", "stop", "report", "refused", "seen", "gone", "reaper", "reaper_ok", "reaper_outage", "reaper_gap",
+    VALID = {"reaper_ok": [5], "catchup": [True], "stop": [{"a": 1}], "report": [{"a": 1}], "active": [{"a": 1}], "gone": [{"a": 1}], "slow_bad": [5]}   # the one bad value of the table that is a good value of that key
+    KEYS = ("offsets", "alerted", "created", "stop", "report", "active", "refused", "seen", "gone", "reaper", "reaper_ok", "reaper_outage", "reaper_gap",
             "reaper_new", "catchup", "slow", "slow_bad")
 
     def bad_table(self):
@@ -649,7 +649,7 @@ class TestLostWorkerMemoryOnly(unittest.TestCase):
         os.unlink(os.path.join(self.r.dir, "lost-workers.json"))
         os.mkdir(os.path.join(self.r.dir, "lost-workers.json"))   # a directory at the memory path: neither written nor set aside
         for name, age in (("recent", 300), ("old", 3 * 3600)):
-            line(self.r.engine.audit.path, ts=stamp(NOW - age), actor="x", event="cloud.created", subject=name, detail={"hard_deadline": stamp(NOW - 60)})
+            line(self.r.engine.audit.path, ts=stamp(NOW - age), actor="x", event="cloud.created", subject=name, detail={"hard_deadline": stamp(NOW - 400)})
 
     def corrupt_lines(self):
         with open(self.r.engine.audit.path) as handle:
@@ -679,14 +679,14 @@ class TestLostWorkerMemoryOnly(unittest.TestCase):
     def test_failed_save_does_not_repeat_the_first_run_rule(self):
         r = Rig(self.mod)
         os.unlink(os.path.join(r.dir, "lost-workers.json"))
-        line(r.engine.audit.path, ts=stamp(NOW - 300), actor="x", event="cloud.created", subject="recent", detail={"hard_deadline": stamp(NOW - 60)})
-        line(r.engine.audit.path, ts=stamp(NOW - 3 * 3600), actor="x", event="cloud.created", subject="old", detail={"hard_deadline": stamp(NOW - 60)})
+        line(r.engine.audit.path, ts=stamp(NOW - 300), actor="x", event="cloud.created", subject="recent", detail={"hard_deadline": stamp(NOW - 400)})
+        line(r.engine.audit.path, ts=stamp(NOW - 3 * 3600), actor="x", event="cloud.created", subject="old", detail={"hard_deadline": stamp(NOW - 400)})
         real = self.mod._save
         self.mod._save = lambda path, state: (_ for _ in ()).throw(OSError("disk full"))
         self.assertEqual([x["name"] for x in r.passes()], ["recent"])
         self.assertEqual(r.passes(), [])   # not re-alerted
         self.mod._save = real
-        line(r.engine.audit.path, ts=stamp(NOW - 100), actor="x", event="cloud.created", subject="newer", detail={"hard_deadline": stamp(NOW - 60)})
+        line(r.engine.audit.path, ts=stamp(NOW - 100), actor="x", event="cloud.created", subject="newer", detail={"hard_deadline": stamp(NOW - 400)})
         self.assertEqual([x["name"] for x in r.passes()], ["newer"])
 
     def load_mutant(self, *pairs):
@@ -705,7 +705,7 @@ class TestLostWorkerMemoryOnly(unittest.TestCase):
         os.mkdir(path)
         self.mod.ALERTED_MAX, self.mod.PASS_CAP = 30, 10 ** 6
         for i in range(100):
-            line(r.engine.audit.path, ts=stamp(NOW - 300 - i), actor="x", event="cloud.created", subject="k%03d" % i, detail={"hard_deadline": stamp(NOW - 60)})
+            line(r.engine.audit.path, ts=stamp(NOW - 300 - i), actor="x", event="cloud.created", subject="k%03d" % i, detail={"hard_deadline": stamp(NOW - 400)})
         r.passes()
         mem = self.mod._PROC_ALERTED[path]
         self.assertEqual(len(mem), 30)
