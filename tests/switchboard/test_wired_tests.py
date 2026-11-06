@@ -413,7 +413,8 @@ class TestWiredCheckPlanted(unittest.TestCase):
         self.assertEqual(self.source.count(line), 1)
         self.assertEqual(self.source.count("bind_discovered("), 1)
         out = problems(self.tmp, self.source.replace(line, "").replace("bind_discovered(", "bind_nothing("), {})
-        out = [o for o in out if not o.startswith("test_loader_merge.py:")]   # a file only discovery reaches (#2206) is unimported once discovery is off: that is the point
+        only_discovery = problems(self.tmp, self.source.replace("bind_discovered(", "bind_nothing("), {})   # what turning discovery off alone reports: the files and classes only discovery reaches (#2206 and every file since) are unimported then, that is the point
+        out = [o for o in out if o not in only_discovery]   # what is left is what the removed binding added
         self.assertEqual(len(out), 1, out)
         self.assertIn("test_github_census.py", out[0])
         self.assertIn("TestMacosReader", out[0])

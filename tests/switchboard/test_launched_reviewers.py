@@ -427,7 +427,7 @@ def build():
         def test_s6_the_documentation_says_in_one_sentence_why_the_relay_stays_list_only(self):
             text = (REPO / "docs" / "switchboard.md").read_text()
             self.assertEqual(len([s for s in re.split(r"(?<=\.)\s+", text) if "reads no agent's launch record" in s and "relay daemon holds the configuration parts" in s]), 1)
-            self.assertIn("testers and reviewers from the launch record", (REPO / "docs" / "architecture.md").read_text())
+            self.assertIn("testers and reviewers from the launch record", (REPO / "docs" / "architecture" / "units" / "launch_testers.py.row").read_text())   # the unit table is one row file per unit since #2213
 
     class TestLaunchedReviewerGuards(Fixture):
         """The two guards the mutants below must break: each asserts the check's own refusal text FIRST."""
