@@ -19,7 +19,7 @@ NO_INTENT = "Done when: it works\n\nNext: step\n"
 ONLY_LINE = "Next: step\n"
 DROP_WORDS = "would drop the Intent or the Done-when"
 
-FAKE_GH = """#!/usr/bin/env python3
+FAKE_REAL_GH_BODY_READER = """#!/usr/bin/env python3
 import json, os, sys
 argv = sys.argv[1:]
 home = os.environ["FAKE_DIR"]
@@ -55,7 +55,7 @@ def load_module(path=None):
 class BodyRig(Rig):
     def __init__(self, gh_body_source=None, shim_source=None):
         Rig.__init__(self, shim_source)
-        (self.bin / "gh").write_text(FAKE_GH)
+        (self.bin / "gh").write_text(FAKE_REAL_GH_BODY_READER)
         if gh_body_source is not None:
             (self.shims / "gh_body.py").write_text(gh_body_source)
 

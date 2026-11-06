@@ -36067,7 +36067,6 @@ _adoption_cells()
 
 
 
-CHANGE_KINDS = ("base", "record", "matrix", "rating", "head", "none")   # (#999) what can change under a hold the daemon put on, with the head unchanged: the ONE table every row below derives from
 class TestImpactReleaseEveryPass(TestImpactRejudge):
     """#999: the daemon judges every pull request that carries labels it added at EVERY pass, so a hold the rule no longer makes is released whatever changed
     (the base branch, a record, the matrix, a rating) with the head unchanged. The REAL pass over a fake GitHub that answers only what `gh pr view` answers
@@ -80381,7 +80380,8 @@ NOT_ISOLATED_BY_BASE = {
     "TestTriageHiddenMutants", "TestTwoBranchesAddingATestFile", "TestUnconsumedRecord", "TestUnreadableSummary",
     ),
     "makes its own temporary directory or state (a tempfile.mkdtemp, a patched environment or its own isolating setUp) and never reads the real one": (
-    "TestEveryTestClassIsolates",
+    "TestEveryTestClassIsolates", "BodyRig", "TestDirectReads", "TestGateProbeReads", "TestGhBodyGuard", "TestGhBodyMutants", "TestGhBodyRefusalIsPure",
+    "TestImpactEntriesLoader", "TestImpactEntriesMerge", "TestImpactEntriesMissing",   # (#2247) each makes its own private directory (a mkdtemp or a TemporaryDirectory); the files came with #2215, #2219, #2220
     "Case", "HeaderCacheBase", "TestCloudWatchBounds", "TestCloudWatchTick", "TestGatePass", "TestHostDisk", "TestIsolation", "TestSafety",
     "TestStopFinalMessage", "TestStopFinalMessageBare", "TestStopFinalMessageEdges", "TestStopFinalMessageHardening", "TestStopFinalMessageTwoRuns",
     ),

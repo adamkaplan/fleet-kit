@@ -510,7 +510,7 @@ fleet-switchboard:janitor_agent_roots
 fleet-switchboard:json
 switchboard/docker_reaper.py:lab_facts
 fleet-switchboard:launch_memory_check
-fleet-switchboard:load_config
+fleet-switchboard:_load_config_file
 fleet-switchboard:pane_exit_audit_tail
 fleet-switchboard:pr_state_read
 fleet-switchboard:pull_state

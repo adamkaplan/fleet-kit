@@ -50,6 +50,7 @@ class GateSpoolFacts:
 
     def __init__(self):
         self.engine, self.saved, self.events, self.over, self.said, self.loaded = None, {"ino": None, "off": 0}, [], {}, set(), False
+        self.written = None   # the last body saved
 
     def bind(self, engine):
         self.engine = engine
@@ -74,9 +75,12 @@ class GateSpoolFacts:
         path = Path(state_dir) / GATE_SPOOL_STATE
         temp = path.with_name("%s.%d.tmp" % (GATE_SPOOL_STATE, os.getpid()))
         body = json.dumps({"ino": self.saved["ino"], "off": self.saved["off"], "events": [list(e) for e in self.events], "over": self.over}, sort_keys=True)
+        if body == self.written and path.exists():   # an idle pass changes nothing: the file is rewritten when the position or the kept events moved, not every pass (#2247)
+            return
         with open(str(temp), "w") as handle:
             handle.write(body)
         os.replace(str(temp), str(path))
+        self.written = body
 
     def _take(self, lines, now):
         for text in lines:
