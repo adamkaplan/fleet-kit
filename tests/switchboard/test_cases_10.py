@@ -78,7 +78,7 @@ class TestWhoCanClear(unittest.TestCase):
  ],
  "floor-credentials": [
   [
-   "it changes a credentials path (cloud/launcher/token_mint.py): that stays the owner's own clear"
+   "it changes a credentials path (cloud/launcher/app_token.py): that stays the owner's own clear"
   ],
   [
    "the score is High: High is the owner's"
@@ -164,7 +164,7 @@ class TestWhoCanClear(unittest.TestCase):
 
     def rows(self):
         """The 9 rows of S2: name, report, files, closure, expected."""
-        credentials = next(p for p in self.matrix["owner_hold"]["top_tier_paths"]["credentials"] if not self.floor.matches(p, self.rule["clear_code_paths"]) and "*" not in p)
+        credentials = next(p for p in sorted(self.matrix["owner_hold"]["top_tier_paths"]["credentials"]) if not self.floor.matches(p, self.rule["clear_code_paths"]) and "*" not in p)
         identity = next(p for p in self.matrix["owner_hold"]["top_tier_paths"]["identity"] if not self.floor.matches(p, self.rule["clear_code_paths"]) and "*" not in p)
         floor_rows = []
         for cls, path in (("credentials", credentials), ("identity", identity), ("authority", "migrations/0002.sql")):
