@@ -181,6 +181,46 @@ class NothingToPush(dict):
 FETCH_TIMEOUT_SECONDS = 20
 
 
+def clean_local(workdir, ctx):
+    """True when, from local references only, nothing is unsaved. WORK is any commit reachable from the reflog of HEAD or of any local
+    branch, from every entry of the refs/stash reflog, from any tag, from any local branch, or from any worktree's HEAD, that no remote-tracking ref and not the clone's
+    starting commit (the oldest entry of the HEAD reflog) reaches; also any change (staged, untracked) in this or any other worktree.
+    Any git command that fails, or any doubt, is NOT clean.
+
+    Cause (S1): a read-only reader pod was kept and retried because the end hook did not decide from local state before the remote
+    call: it always ran `git fetch` first, and with an ended token that fetch failed (or a local branch had no remote counterpart),
+    so the pod was kept as "unsaved" and the stop was retried on every pass. A clean tree needs no remote call."""
+    def out(*args):
+        p = git(workdir, *args, check=False, ctx=ctx)
+        if p.returncode != 0:
+            raise RuntimeError("git failed")
+        return p.stdout
+    try:
+        start = out("reflog", "show", "--format=%H", "HEAD").split()
+        if not start:
+            return False
+        roots = set(start)
+        for line in out("for-each-ref", "--format=%(refname)", "refs/heads").split():
+            roots.add(line)
+            roots.update(out("reflog", "show", "--format=%H", line).split())
+        roots.update(out("for-each-ref", "--format=%(objectname)", "refs/stash").split())
+        if out("for-each-ref", "--format=%(refname)", "refs/stash").strip():
+            roots.update(out("reflog", "show", "--format=%H", "refs/stash").split())
+        roots.update(out("for-each-ref", "--format=%(refname)", "refs/tags").split())
+        for line in out("worktree", "list", "--porcelain").splitlines():
+            if line.startswith("worktree "):
+                wt = line[9:]
+                if out("-C", wt, "status", "--porcelain", "--untracked-files=all").strip():
+                    return False
+            elif line.startswith("HEAD "):
+                roots.add(line[5:])
+        roots = [r for r in roots if set(r) != {"0"}]
+        res = out("rev-list", "--max-count=1", *roots, "--not", "--remotes", start[-1], "--")
+        return res.strip() == ""
+    except (RuntimeError, OSError):
+        return False
+
+
 def refresh_refs(workdir, remote, ctx):
     """One bounded `git fetch --prune` (no loop, no retry). True if it worked; False on any failure or on the timeout. Its output is
     discarded and never printed or logged."""
@@ -289,6 +329,8 @@ def run(workdir, worker, prestop=False, repo=None, ctx=None):
             if git(workdir, "diff", "--cached", "--quiet", "--no-ext-diff", "--no-textconv", check=False, ctx=ctx).returncode != 0:
                 git(workdir, "-c", "user.name=cw-worker", "-c", "user.email=cw-worker@invalid",
                     "commit", *(["--no-verify"] if prestop else []), "-m", "WIP: work in progress saved by %s at the end of the worker" % worker, ctx=ctx)
+    if not paths and clean_local(workdir, ctx):   # a clean tree with no commit of its own: nothing to save, no remote call
+        return NothingToPush({"pushed": False, "wip_branch": None, "skipped": skipped, "local_only": False, **extra})
     # Nothing to push: first a bounded fetch with prune refreshes the remote-tracking refs, so a remote branch deleted or moved since the
     # last fetch is seen. Only if that fetch itself fails (refused, network, timeout) is the answer taken from the local references.
     refreshed = refresh_refs(workdir, url if prestop else "origin", ctx)
