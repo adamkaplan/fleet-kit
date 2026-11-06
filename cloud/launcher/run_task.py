@@ -104,6 +104,8 @@ class Driver:
     def git_token(self):
         raw = self.env.get("CW_GIT_TOKEN_CMD")
         cmd = shlex.split(raw) if raw else [sys.executable, os.path.join(HERE, "app_token.py"), self.a.repo]
+        if not raw and getattr(self.a, "agent", None) == "orchestrator":
+            cmd += ["--role", "orchestrator"]
         try:   # THE mint call, shared with the reaper's renewal (cloud_worker.run_git_token_cmd)
             token = cw.run_git_token_cmd(cmd, self.a.repo, self.env)
         except cw.CloudError as e:
@@ -164,6 +166,10 @@ class Driver:
         args = ["create", self.a.worker, "--repo", self.a.repo, "--branch", self.a.branch,
                 "--run-secret-fd", "model-auth=%d" % pipes[0][0], "--run-secret-fd", "git-token=%d" % pipes[1][0],
                 "--password-fd", str(pw_w), "--run-id", self.nonce]
+        if getattr(self.a, "agent", None):
+            args += ["--agent", self.a.agent]
+            if getattr(self.a, "boss", None):
+                args += ["--boss", self.a.boss]
         if self.a.pull_secret:
             args += ["--pull-secret", self.a.pull_secret]
         if self.a.image:
@@ -369,7 +375,7 @@ class Driver:
                 self.stopped = False
             self.stop_failed = not self.stopped
         if self.stop_failed:
-            self.say("the worker is kept (its end hook could not push, see above); delete it only after the work is saved: %s"
+            self.say("the worker is kept (its end hook could not push, see above); delete it only after the work is saved (to save it, send the pod one message to commit its tree on a NEW branch and push it there plainly, read the branch from origin, then retire normally): %s"
                      % self.kube.delete_command("pod", self.name))
         if self.created:
             self.secret_line()
@@ -436,11 +442,13 @@ def main(argv=None, env=None):
     p.add_argument("brief_file")
     p.add_argument("--pull-secret")
     p.add_argument("--image")
+    p.add_argument("--agent", choices=cw.AGENTS, help="worker (default) or orchestrator: an orchestrator's git token is minted under its own role")
+    p.add_argument("--boss")
     try:
         a = p.parse_args(argv)
     except SystemExit as e:
         return 2 if e.code else 0
-    if not cw.NAME_RE.match(a.worker) or not REPO_RE.fullmatch(a.repo) or not re.match(r"^[A-Za-z0-9._/-]{1,200}$", a.branch):
+    if not cw.NAME_RE.fullmatch(a.worker) or not REPO_RE.fullmatch(a.repo) or not re.match(r"^[A-Za-z0-9._/-]{1,200}$", a.branch):
         print("run-task: bad worker name, repository (OWNER/NAME) or branch", file=sys.stderr)
         return 2
     try:

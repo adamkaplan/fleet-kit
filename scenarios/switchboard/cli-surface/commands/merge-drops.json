@@ -1,0 +1,4 @@
+{
+ "command": "merge-drops",
+ "help": "usage: fleet-switchboard merge-drops [-h] [--git-dir GIT_DIR] [--tip TIP] [--branch BRANCH] Compares the branch head with the tip in a git directory: every '-' line of the tip-to-head diff that is not among the branch's own removals (the three- dot diff). Prints each hunk (file, line range). A hunk whose file and first line a merge commit of the branch names is allowed. Exit 0 when clean. options: -h, --help show this help message and exit --git-dir GIT_DIR A checkout or bare repository holding both refs (default: the current directory) --tip TIP The integration tip (default origin/integration) --branch BRANCH The branch head to judge (default HEAD)"
+}

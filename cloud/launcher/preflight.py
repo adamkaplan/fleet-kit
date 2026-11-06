@@ -43,6 +43,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -113,15 +114,66 @@ def _rate_limited(e):
         return True  # cannot tell: refuse
 
 
+REFUSAL_LINE_MAX = 160
+
+
+def refusal_label():
+    """The label the mint chose where it refused (the closed list app_token.LABELS), never matched from text."""
+    label = app_token.REFUSAL.get("label")
+    return label if label in app_token.LABELS else "other"
+
+
+def refusal_line():
+    """The mint's own reason as ONE line of at most 160 printable characters through the launcher's scrub (the same
+    function that scrubs the launcher's output). A scrub that cannot be loaded leaves a fixed line, never the raw one."""
+    try:
+        from cloud_worker import scrub
+    except Exception:  # a copy of this program without the launcher beside it
+        return "the reason is on the standard error of the mint"
+    line = " ".join(str(app_token.REFUSAL.get("line", ""))[:2000].split())
+    line = re.sub(r"\d{1,3}(?:\.\d{1,3}){3}|(?:[0-9A-Fa-f]{0,4}:){2,}[0-9A-Fa-f]{0,4}", "[address]", line)  # an address
+    line = re.sub(r"\d{5,}", "[id]", line)  # an identifier
+    return scrub(line, (), REFUSAL_LINE_MAX)
+
+
+MINT_TRIES = 4
+MINT_WAITS = (2, 5, 10)  # seconds between the tries; a Retry-After over the last one ends the retries
+_sleep = time.sleep      # the one wait (tests replace it with a fake clock)
+
+
+def _tries(n):
+    return "%d %s" % (n, "try" if n == 1 else "tries")
+
+
+def _mint_with_retry(target):
+    """app_token.mint, retried only after a PASSING failure (app_token.LAST_FAILURE['transient']); a refusal is raised after one try."""
+    for n in range(1, MINT_TRIES + 1):
+        app_token.LAST_FAILURE.clear()
+        try:
+            return app_token.mint(target)
+        except SystemExit:  # app_token already said why, on stderr
+            fail = dict(app_token.LAST_FAILURE)
+        reason = str(fail.get("reason") or "")
+        if not fail.get("transient"):
+            raise Unreadable("no token could be minted (%s): %s" % (refusal_label(), refusal_line()))
+        asked = fail.get("retry_after")
+        if n >= MINT_TRIES:
+            raise Unreadable("no token could be minted after %s: no token could be minted (%s): %s" % (_tries(n), refusal_label(), refusal_line()))
+        if asked is not None and asked > MINT_WAITS[-1]:
+            raise Unreadable("no token could be minted after %s: %s (GitHub asked for %d seconds, more than the %d seconds waited: not retried)"
+                             % (_tries(n), reason, asked, MINT_WAITS[-1]))
+        wait = max(MINT_WAITS[n - 1], asked or 0)
+        print("mint try %d of %d failed: %s; trying again in %d seconds" % (n, MINT_TRIES, reason, wait), file=sys.stderr)
+        _sleep(wait)
+
+
 def get_token(target):
     cmd = os.environ.get("CW_PREFLIGHT_TOKEN_CMD")
     if not cmd:
-        try:
-            token = app_token.mint(target)
-            say("token permissions: " + app_token.render_permissions())  # the mint refused anything else
-            return token
-        except SystemExit:  # app_token already said why, on stderr; a mint that fails is an unreadable answer
-            raise Unreadable("no token could be minted")
+        token = _mint_with_retry(target)
+        say("token permissions: " + app_token.render_permissions())  # the mint refused anything else
+        say("orchestrator permissions: " + app_token.render_permissions(None, "orchestrator"))  # the set of the other role, from the same table
+        return token
     try:
         p = subprocess.run(["sh", "-c", cmd], capture_output=True, text=True, timeout=60)
     except (OSError, subprocess.TimeoutExpired):
@@ -173,7 +225,7 @@ def covers(conditions, branch, default_branch):
     return (inc and not exc), odd
 
 
-def judge(rules, branch, default_branch, fetch, unreadable=None, bypass=None):
+def judge(rules, branch, default_branch, fetch, unreadable=None, bypass=None, target=None):
     """Keep only the rules of rulesets that are active and cover the branch. Returns (problems, kept rules), or
     (problems, None) when a ruleset cannot be read.
 
@@ -198,7 +250,7 @@ def judge(rules, branch, default_branch, fetch, unreadable=None, bypass=None):
             return problems, None
         key = (st, src, rid)
         if key not in verdict:
-            path = ("/repos/%s/rulesets/%d" if st == "Repository" else "/orgs/%s/rulesets/%d") % (src, rid)
+            path = ("/repos/%s/rulesets/%d" % (src, rid)) if st == "Repository" else ("/repos/%s/rulesets/%d?includes_parents=true" % (target, rid))
             try:
                 rs = fetch(path)
             except Unreadable as e:
@@ -220,6 +272,7 @@ def judge(rules, branch, default_branch, fetch, unreadable=None, bypass=None):
                 problems.append("ruleset %d does not cover the branch%s" % (
                     rid, " (a pattern was not understood: %s)" % ", ".join(odd) if odd else ""))
             verdict[key] = enf == "active" and cov
+            if verdict[key] and st == "Organization": say("organization ruleset %d: read at repository level, counted" % rid)
             if verdict[key] and bypass is not None and isinstance(rs.get("bypass_actors"), list):
                 bypass.extend((rid, a) for a in rs["bypass_actors"] if isinstance(a, dict))
         if verdict[key] is None:
@@ -319,7 +372,9 @@ def main(argv):
             base = app_token.api_base()
         except SystemExit:  # already said why on stderr
             raise Unreadable("the API base is refused")
+        print("step: token mint", file=sys.stderr, flush=True)
         token = get_token(target)
+        print("step: repository read", file=sys.stderr, flush=True)
         repo = get(base, "/repos/" + target, token)
         branch = branch or (repo.get("default_branch") if isinstance(repo, dict) else None)
         if not isinstance(branch, str) or not branch:
@@ -338,7 +393,7 @@ def main(argv):
         return 2
     unreadable = {}
     bypass = []
-    problems, valid = judge(rules, branch, repo.get("default_branch"), lambda path: get(base, path, token), unreadable, bypass)
+    problems, valid = judge(rules, branch, repo.get("default_branch"), lambda path: get(base, path, token), unreadable, bypass, target)
     if valid is None:
         return 2
     missing, has_pr, types, review_problem = evaluate(valid)

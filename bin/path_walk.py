@@ -30,7 +30,20 @@ def parents_problem(path):
         except OSError:
             return "has a parent that cannot be read"
         if stat.S_ISLNK(found.st_mode):
-            return "has a parent that is a symlink"
+            # A link the OS itself provides (root-owned, e.g. macOS /var -> private/var) is followed, and its target is judged by this same walk.
+            # A link owned by anyone else (the user or an attacker) is refused, as before.
+            if found.st_uid != 0:
+                return "has a parent that is a symlink"
+            target = os.path.realpath(here)
+            if target == here or target == "/":
+                return "has a parent that is a symlink"
+            inner = parents_problem(target + "/x")
+            if inner:
+                return inner
+            try:
+                found = os.stat(target)
+            except OSError:
+                return "has a parent that cannot be read"
         if not stat.S_ISDIR(found.st_mode):
             return "has a parent that is not a directory"
         if found.st_uid not in (0, os.getuid()):

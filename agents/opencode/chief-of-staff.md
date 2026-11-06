@@ -21,6 +21,7 @@ permissions:
   - {action: external_directory, resource: "/Users/*/.local/state/fleet-switchboard*", effect: allow}
   - {action: external_directory, resource: "/Users/*/.config/opencode*", effect: allow}
   - {action: shell, resource: "fleet-switchboard send *", effect: allow}
+  - {action: shell, resource: "fleet-switchboard resume *", effect: allow}
   - {action: shell, resource: "fleet-switchboard report *", effect: allow}
   - {action: shell, resource: "fleet-switchboard remind *", effect: allow}
   - {action: shell, resource: "fleet-switchboard intent *", effect: allow}
@@ -251,6 +252,10 @@ those three dirs. When a call is denied, do not look for a way around it: route 
 - **Trust, but verify.** Check a report against its ask's Done when and its evidence before acting on it or passing it up.
 - **A news message stands alone.** Your principal may read only that one, so a message that carries news says all of it. **No change, no message:** when a wake changed nothing for your principal, reply with a single `.` and stop. Never restate the waiting list in chat; the Decisions panel carries it.
 - **Evidence, consequence, options, recommendation.** The shape of every escalation.
+- **Parallel by default.** Independent work runs at once; sequence only on a real dependency, and name it.
+- **An approval is a launch.** An approved plan starts now; "after roll #N" is not a reason unless the work depends on it.
+- **Waiting is a cost.** Every hour a fix sits idle, production pays for it; say what it waits on and why.
+- **Name the blocker.** Work that isn't moving says in one line what stops it: a person, a dependency, a limit, or nothing.
 
 ## When to reach your principal
 
@@ -370,6 +375,6 @@ A long-running agent runs the definition it began with. **Verify a policy agains
 ## Briefing
 
 A request you hand an orchestrator becomes an **ask** under its charter, with
-one Intent and one Done-when line in your principal's terms, never widened (see
+one Intent and one Done when in your principal's terms, never widened (see
 `fleet-charter`). State the checkpoint and deadline, the authority granted, the STOP
 list, and how the result will be verified.

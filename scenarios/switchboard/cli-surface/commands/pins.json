@@ -1,0 +1,4 @@
+{
+ "command": "pins",
+ "help": "usage: fleet-switchboard pins [-h] [--base BASE] Reads `git diff` against the base and `git grep` over the existing tests; prints one line per test with the term it matched, never a test the diff adds, bounded to 200 lines. It writes nothing and calls no network. Run the listed classes before you push. options: -h, --help show this help message and exit --base BASE The ref to diff against (default origin/integration)"
+}

@@ -2,6 +2,7 @@
 
 The old names are assembled from a fragment so this file itself carries none of them.
 """
+import pathlib
 import json, os, re, sys, unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -30,13 +31,27 @@ NAMES = {
 NEW = set(NAMES.values())
 STANDARD_TOOLS = {"cat", "git", "head", "ls", "sh"}   # the image's own tools, run by the record and the report read (not names this project coined)
 OLD = re.compile(P, re.I)
+# The channel's interface names, set by the switchboard, and byte-identical copies of its own files (and the recorded copy of the orchestrator definition, pinned equal to it by test_s3_image_definition_equals_recorded_copy): the ONLY places the old prefix may stay.
+# The names are stripped before the scan; the copies (exact paths) are skipped whole. The word planted in any other file still fails.
+CHANNEL_NAMES = tuple(P.upper() + x for x in ("_AGENT_NAME", "_BOSS", "_CLOUD_CHANNEL_URL", "_CLOUD_TOKEN_FILE"))
+CHANNEL_NAMES += tuple(P.upper() + x for x in ("_CLOUD_CHANNEL_LISTEN", "_CLOUD_HUB_AGENTS", "_CLOUD_HUB_SECRETS", "_CLOUD_HUB_DECISIONS", "_CLOUD_AGENT_NAMESPACE"))   # the hub manifest's own names
+CHANNEL_NAMES += (P.upper() + "_CLOUD_WORKER_BIN",)   # the launcher lookup's own variable (the moved TestLauncherLookup, #1688)
+CHANNEL_COPIES = tuple(_l.split("\t")[1] for _l in pathlib.Path(os.path.join(ROOT, "cloud", "worker", "copies.tsv")).read_text(encoding="utf-8").splitlines() if _l)
+
+
+def old_name_in(rel, text):
+    if rel in CHANNEL_COPIES:
+        return False
+    for name in CHANNEL_NAMES:
+        text = text.replace(name, "")
+    return bool(OLD.search(text))
 # The one allowed carrier: the in-pod copy of bin/plan_check.py must stay byte-identical to it (a drift test pins that),
 # and bin/plan_check.py itself carries the name in its prose; so the copy cannot be reworded.
 ALLOWED_COPY = {"cloud/worker/plan_check.py"}
 
 
 def files():
-    for top in ("cloud", "bin/test-cloud-launcher", "docs/cloud-worker-interface.md"):
+    for top in ("cloud", "bin/test-cloud-launcher", "bin/test-cloud-launcher.chain", "docs/cloud-worker-interface.md"):
         full = os.path.join(ROOT, top)
         if os.path.isfile(full):
             yield top, full
@@ -47,7 +62,7 @@ def files():
 
 
 # Platform and third-party keys the launcher sets: never renamed, never in the table above.
-PLATFORM_KEYS = ["azure.workload.identity/use"]
+PLATFORM_KEYS = ["azure.workload.identity/use", "cluster-autoscaler.kubernetes.io/safe-to-evict"]
 
 
 class S5Names(base.Base):
@@ -67,9 +82,31 @@ class S5Names(base.Base):
             if rel in ALLOWED_COPY:
                 continue
             with open(p, errors="replace") as f:
-                if OLD.search(f.read()):
+                if old_name_in(rel, f.read()):
                     bad.append(rel)
         self.assertEqual(bad, [])
+
+    def test_the_channel_allow_list_is_exact_and_a_planted_word_elsewhere_fails(self):
+        self.assertTrue(all(os.path.isfile(os.path.join(ROOT, c)) for c in CHANNEL_COPIES))
+        self.assertFalse(old_name_in("cloud/launcher/cloud_worker.py", "x " + CHANNEL_NAMES[0] + " y"))
+        self.assertTrue(old_name_in("cloud/launcher/cloud_worker.py", "x " + P.upper() + "_OTHER_NAME"))
+        self.assertTrue(old_name_in("cloud/README.md", "the " + P + " word"))
+        self.assertTrue(old_name_in("cloud/worker/bin/cloud_new.py", P))   # a copy not on the list is scanned
+
+    def test_hub_manifest_scan_stays_live(self):
+        import tempfile, shutil
+        src = os.path.join(ROOT, "cloud", "k8s", "cloud-hub.yaml")
+        with tempfile.TemporaryDirectory() as d:
+            cp = os.path.join(d, "cloud-hub.yaml")
+            shutil.copy(src, cp)
+            text = pathlib.Path(cp).read_text()
+            rel = "cloud/k8s/cloud-hub.yaml"
+            self.assertFalse(old_name_in(rel, text))
+            self.assertFalse(old_name_in(rel, " ".join(P.upper() + x for x in (
+                "_CLOUD_CHANNEL_LISTEN", "_CLOUD_HUB_AGENTS", "_CLOUD_HUB_SECRETS", "_CLOUD_HUB_DECISIONS", "_CLOUD_AGENT_NAMESPACE"))))
+            self.assertTrue(old_name_in(rel, text + "\n" + P.upper() + "_CLOUD_HUB_OTHER: x\n"))
+            self.assertTrue(old_name_in(rel, text + "\n# the " + P + " word\n"))
+            self.assertTrue(old_name_in(rel, text + "\n# the " + P + " word\n" + P.upper() + "_CLOUD_AGENT_NAMESPACE: x\n"))
 
     def test_table_maps_only_to_cw_names(self):
         for old, new in NAMES.items():
@@ -83,10 +120,10 @@ class S5Names(base.Base):
         pod = [p for p in self.st()["applied"] if p["kind"] == "Pod"][0]
         c = pod["spec"]["containers"][0]
         emitted = {e["name"] for e in c["env"]}
-        emitted |= (set(pod["metadata"]["labels"]) - {"app"} - set(PLATFORM_KEYS)) | set(pod["metadata"]["annotations"])
+        emitted |= (set(pod["metadata"]["labels"]) - {"app"} - set(PLATFORM_KEYS)) | (set(pod["metadata"]["annotations"]) - set(PLATFORM_KEYS))
         emitted.add(pod["metadata"]["labels"]["app"])
         emitted.add(pod["spec"]["serviceAccountName"])
-        calls = [json.loads(x) for x in open(self.env["FAKE_KUBE_CALLS"])]
+        calls = [json.loads(x) for x in pathlib.Path(self.env["FAKE_KUBE_CALLS"]).read_text().splitlines()]
         emitted |= {a[a.index("-n") + 1] for a in calls}
         emitted |= {a[a.index("--") + 1] for a in calls if "exec" in a and "--" in a}
         emitted |= {a.split("=", 1)[0] for a in sum(calls, []) if a.startswith("cw/")}
@@ -97,7 +134,7 @@ class S5Names(base.Base):
         df = os.path.join(ROOT, "cloud", "worker", "Dockerfile")
         if not os.path.exists(df):
             self.skipTest("cloud/worker/Dockerfile is not on this branch yet; the image half of this check is skipped")
-        text = open(df).read()
+        text = pathlib.Path(df).read_text()
         for tool in ("cw-end-hook", "cw-worker-activity"):
             self.assertTrue(any(tool in l and re.search(r"COPY|chmod|install", l) for l in text.splitlines()), tool)
 
@@ -119,7 +156,7 @@ class S6Reaper(base.Base):
         self.assertEqual([r[:2] for r in res], [("coder7", "hard limit")])
         self.assertIsNone(self.pod())
         self.assertIn("stray", self.st()["pods"])
-        listing = [json.loads(x) for x in open(self.env["FAKE_KUBE_CALLS"])]
+        listing = [json.loads(x) for x in pathlib.Path(self.env["FAKE_KUBE_CALLS"]).read_text().splitlines()]
         self.assertTrue(any("-l" in c and "app=cw-worker" in c for c in listing))
 
     def clean(self):

@@ -22,6 +22,19 @@ def iso(seconds):
     return (dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=seconds)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def via_route(argv, env):
+    """Run the mint with the named route (a pipe, --fd): the result's stdout is what came through the route (the token), and the real stdout must be empty."""
+    r, w = os.pipe()
+    try:
+        p = subprocess.run(argv + ["--fd", str(w)], env=env, capture_output=True, text=True, timeout=60, pass_fds=(w,))
+    finally:
+        os.close(w)
+    with os.fdopen(r) as f:
+        token = f.read()
+    assert p.stdout == "", "the mint wrote to standard output"
+    return subprocess.CompletedProcess(p.args, p.returncode, token, p.stderr)
+
+
 class Stub(http.server.BaseHTTPRequestHandler):
     answer = {}
     redirect_code = 307
@@ -141,7 +154,9 @@ class Mint(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         cls.srv.shutdown()
+        cls.srv.server_close()
         cls.other.shutdown()
+        cls.other.server_close()
         cls.tmp.cleanup()
 
     def setUp(self):
@@ -166,7 +181,7 @@ class Mint(unittest.TestCase):
                  CW_APP_KEY_CMD="cat '%s'" % self.keyfile, CW_GITHUB_API_BASE=self.base, CW_OPENSSL=self.wrap)
         e.update(env)
         argv = [sys.executable, "-c", runner, MINT, repo] if runner else [sys.executable, MINT, repo]
-        return subprocess.run(argv, env=e, capture_output=True, text=True, timeout=60)
+        return via_route(argv, e)
 
     def test_prints_only_the_token_and_signs_a_valid_short_jwt(self):
         p = self.run_mint()
@@ -340,7 +355,7 @@ class Mint(unittest.TestCase):
         for cls in ("RecursionError", "ValueError", "UnicodeDecodeError", "MemoryError"):
             Stub.lookup, Stub.raw, Stub.seen = (200, None), b"[" * 10 + b"]" * 10, []
             p = self.run_mint(runner=RAISE_ON_NESTING, RAISE_CLASS=cls)
-            self.assertEqual((p.returncode, p.stdout, Stub.seen), (1, "", []), cls)
+            self.assertEqual((p.returncode, p.stdout, Stub.seen), (75, "", []), cls)
             self.assertIn("nothing was minted", p.stderr, cls)
             self.assertIn("not usable JSON", p.stderr, cls)
             self.assertNotIn("Traceback", p.stderr, cls)
@@ -350,7 +365,7 @@ class Mint(unittest.TestCase):
         refusals are accepted: the parse refusal ("not usable JSON") or the wrong-shape refusal. Never a crash, never a mint."""
         Stub.lookup, Stub.raw, Stub.seen = (200, None), b"[" * 10000 + b"]" * 10000, []
         p = self.run_mint()
-        self.assertEqual((p.returncode, p.stdout, Stub.seen), (1, "", []))
+        self.assertEqual((p.returncode, p.stdout, Stub.seen), (75 if "not usable JSON" in p.stderr else 1, "", []))
         self.assertTrue("not usable JSON" in p.stderr or "something other than one installation" in p.stderr, p.stderr)
         self.assertNotIn("Traceback", p.stderr)
 
@@ -374,7 +389,7 @@ class Mint(unittest.TestCase):
                 app_token.github_json("GET", "/x", "jwt")
         finally:
             app_token.open_url = orig
-        self.assertEqual(cm.exception.code, 1)
+        self.assertEqual(cm.exception.code, 75)
 
     def test_a_rate_limit_says_so_and_when_to_retry(self):
         for hdr, want in (("30", "Retry after 30 seconds"), ("Wed, 21 Oct 2026 07:28:00 GMT", "Retry later"), (None, "Retry later")):
@@ -382,7 +397,7 @@ class Mint(unittest.TestCase):
             Stub.retry_after = hdr
             p = self.run_mint()
             Stub.retry_after = None
-            self.assertEqual((p.returncode, p.stdout, Stub.seen), (1, "", []))
+            self.assertEqual((p.returncode, p.stdout, Stub.seen), (75, "", []))
             for w in ("rate limit", "refused", "nothing was minted", want):
                 self.assertIn(w, p.stderr, (hdr, w))
             self.assertNotIn("GMT", p.stderr)
@@ -455,7 +470,7 @@ class Mint(unittest.TestCase):
         self.assertFalse(os.path.exists(marker))
         env = {k: v for k, v in os.environ.items() if k != "CW_APP_INSTALLATION_CMD"}
         env.update(CW_APP_ID_CMD="echo 12345", CW_APP_KEY_CMD="cat '%s'" % self.keyfile, CW_GITHUB_API_BASE=self.base, CW_OPENSSL=self.wrap)
-        p = subprocess.run([sys.executable, MINT, REAL], env=env, capture_output=True, text=True, timeout=60)
+        p = via_route([sys.executable, MINT, REAL], env)
         self.assertEqual((p.returncode, p.stdout), (0, TOKEN), p.stderr)
 
     def test_s5_the_stored_id_is_ignored_even_when_not_a_number(self):
@@ -500,13 +515,13 @@ class Mint(unittest.TestCase):
         for name, status, body in (("404", 404, {}), ("301", 301, {}), ("403", 403, {}), ("500", 500, {})):
             Stub.lookup, Stub.seen = (status, body), []
             p = self.run_mint()
-            self.assertEqual((p.returncode, p.stdout, Stub.seen), (1, "", []), name)
+            self.assertEqual((p.returncode, p.stdout, Stub.seen), (75 if status == 500 else 1, "", []), name)
             self.assertNotIn(Stub.gets[-1][1].split()[1], p.stderr)
             self.assertNotIn(self.keymark, p.stderr)
         Stub.lookup = (301, {})
         self.assertIn("redirect", self.run_mint().stderr)
         down = self.run_mint(CW_GITHUB_API_BASE="http://127.0.0.1:1")  # a network error
-        self.assertEqual((down.returncode, down.stdout), (1, ""))
+        self.assertEqual((down.returncode, down.stdout), (75, ""))
         self.assertIn("failed", down.stderr)
 
     def test_a_token_call_for_an_unselected_repository_says_to_add_it_to_the_installation(self):
@@ -552,7 +567,7 @@ class Mint(unittest.TestCase):
             f.write(src_text)
         e = dict(os.environ, CW_APP_ID_CMD="echo 12345", CW_APP_KEY_CMD="cat '%s'" % self.keyfile, CW_GITHUB_API_BASE=self.base, CW_OPENSSL=self.wrap, RAISE_CLASS="RecursionError")
         argv = [sys.executable, "-c", runner, path, repo] if runner else [sys.executable, path, repo]
-        return subprocess.run(argv, env=e, capture_output=True, text=True, timeout=60)
+        return via_route(argv, e)
 
     def mint_refused_variant(self, text, answer):
         """True when the build refuses a mint answer (a second repository, or an owner id that differs) with no token on stdout."""
@@ -580,7 +595,7 @@ class Mint(unittest.TestCase):
             if answer == "nested":
                 Stub.lookup, Stub.raw, Stub.seen = (200, None), b"[" * 10000 + b"]" * 10000, []
                 p = self.run_copy(text, runner=RAISE_ON_NESTING)
-                return p.returncode == 1 and p.stderr.startswith("app-token: ") and "Traceback" not in p.stderr
+                return p.returncode == 75 and p.stderr.startswith("app-token: ") and "Traceback" not in p.stderr
             if answer == "kelvin":
                 Stub.lookup, Stub.seen = (200, {"id": 5, "account": {"id": 9, "login": "\u212a" + "ite-org"}}), []
                 p = self.run_copy(text, "kite-org/widget-service")

@@ -1,0 +1,1 @@
+| `switchboard/daemon_restart.py` | 5 | `daemon restart`: stop by the recorded pid, then ensure | |

@@ -1,0 +1,9 @@
+bin/cloud_cli.py	cloud/worker/bin/cloud_cli.py
+bin/cloud_client.py	cloud/worker/bin/cloud_client.py
+agents/opencode/orchestrator.md	cloud/worker/agents/orchestrator.md
+bin/cloud_hub.py	cloud/worker/bin/cloud_hub.py
+bin/cloud_channel.py	cloud/worker/bin/cloud_channel.py
+bin/cloud_channel_server.py	cloud/worker/bin/cloud_channel_server.py
+bin/cloud_relay.py	cloud/worker/bin/cloud_relay.py
+agents/opencode/orchestrator.md	cloud/worker/tests/golden/orchestrator.md
+bin/plan_check.py	cloud/worker/plan_check.py

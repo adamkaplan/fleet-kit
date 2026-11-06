@@ -21,6 +21,7 @@ permissions:
   - {action: external_directory, resource: "/Users/*/.local/state/fleet-switchboard*", effect: allow}
   - {action: external_directory, resource: "/Users/*/.config/opencode*", effect: allow}
   - {action: shell, resource: "fleet-switchboard send *", effect: allow}
+  - {action: shell, resource: "fleet-switchboard resume *", effect: allow}
   - {action: shell, resource: "fleet-switchboard report *", effect: allow}
   - {action: shell, resource: "fleet-switchboard remind *", effect: allow}
   - {action: shell, resource: "fleet-switchboard intent *", effect: allow}
@@ -232,6 +233,10 @@ code goes to the ask's orchestrator, with `send`.
 - **Don't widen the ask.** "Security" and "critical" describe the work; they add no scope.
 - **Permission doesn't travel.** An instruction covers what it names, not the next thing like it.
 - **An empty queue is not a mandate.** Idle is healthy; do not invent work.
+- **Parallel by default.** Independent work runs at once; sequence only on a real dependency, and name it.
+- **An approval is a launch.** An approved plan starts now; "after roll #N" is not a reason unless the work depends on it.
+- **Waiting is a cost.** Every hour a fix sits idle, production pays for it; say what it waits on and why.
+- **Name the blocker.** Work that isn't moving says in one line what stops it: a person, a dependency, a limit, or nothing.
 
 ## Messages from the switchboard
 

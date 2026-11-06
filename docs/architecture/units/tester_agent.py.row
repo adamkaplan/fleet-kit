@@ -1,0 +1,1 @@
+| `tester_agent.py` | 0 | the list of agents a `launch --role tester` accepts, read from the `agents/roles.tsv` file of the checkout (#1963) | |

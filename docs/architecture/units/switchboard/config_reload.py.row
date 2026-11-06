@@ -1,0 +1,1 @@
+| `switchboard/config_reload.py` | 4 | the config is reloaded when the file changes, and what `status` says of it | |
