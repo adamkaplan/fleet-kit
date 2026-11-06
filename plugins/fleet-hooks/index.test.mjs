@@ -553,3 +553,45 @@ test("#846: the other branches of the hook never drop the shims", () => {
   const unreadable = { get env() { throw new Error("getter"); } };
   assert.doesNotThrow(() => hook(unreadable));
 });
+
+// ---- #1011: the Chief of Staff's orders in the system prompt ----
+import { makeSystemHook, wireSystem, COS_ROLE } from "./index.js";
+const ordersWorld = (raw) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "orders-"));
+  const file = path.join(dir, "standing-orders.md");
+  fs.writeFileSync(file, raw);
+  return { file, hook: makeSystemHook({ file }) };
+};
+const callOf = (hook, agent) => { const out = { system: ["base"] }; hook({ agent }, out); return out.system.join("\n"); };
+const countOf = (hay, needle) => hay.split(needle).length - 1;
+
+test("S2/S3: the CoS system prompt holds the stripped text before and after a compaction and an edit", () => {
+  const w = ordersWorld("<!-- header -->\nDecisions one at a time.\nTell the owner about every pull request.\n");
+  const text = "Decisions one at a time.\nTell the owner about every pull request.";
+  assert.equal(countOf(callOf(w.hook, COS_ROLE), text), 1);
+  // a compaction rewrites the conversation, never the system prompt: the next call still carries it
+  assert.equal(countOf(callOf(w.hook, COS_ROLE), text), 1);
+  fs.writeFileSync(w.file, "New rule.\n");
+  const after = callOf(w.hook, COS_ROLE);
+  assert.equal(countOf(after, "New rule."), 1);
+  assert.equal(countOf(after, "Decisions one at a time."), 0);
+});
+
+test("S4: a worker or other role gets no orders", () => {
+  const w = ordersWorld("Rule one.\n");
+  for (const role of ["worker", "agent-a", undefined]) assert.equal(countOf(callOf(w.hook, role), "Rule one."), 0);
+});
+
+test("S5: a file over 8 KB is refused with a visible note and none of it is sent", () => {
+  const w = ordersWorld("Line of orders\n".repeat(700));
+  const sent = callOf(w.hook, COS_ROLE);
+  assert.ok(sent.includes("8 KB"));
+  assert.equal(countOf(sent, "Line of orders"), 0);
+});
+
+test("mutant guard: wireSystem registers the hook, and a service without the hook is reported", () => {
+  const seen = [];
+  assert.equal(wireSystem({ experimental: { chat: { system: { hook: (n, f) => seen.push([n, f]) } } } }, () => {}), true);
+  assert.equal(seen[0][0], "transform");
+  assert.equal(wireSystem({}, () => {}), false);
+});
