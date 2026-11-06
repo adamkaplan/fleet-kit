@@ -20,9 +20,22 @@ WRITE_WORD_PAIRS = {("pr", v) for v in ("comment", "edit", "create", "close", "r
 GUARD_NAMES = ("github_write", "github_audited")
 
 
+def argv_words(node):
+    """The constant words of a list or tuple literal, or of `'...'.split()` on a string literal (None for any other node)."""
+    if isinstance(node, ast.Tuple):   # a tuple of flag names is no argv: only one that names the gh itself
+        words = [e.value for e in node.elts if isinstance(e, ast.Constant) and isinstance(e.value, str)]
+        return words if "gh" in words else None
+    if isinstance(node, ast.List):
+        return [e.value for e in node.elts if isinstance(e, ast.Constant) and isinstance(e.value, str)]
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "split" and isinstance(node.func.value, ast.Constant) and isinstance(node.func.value.value, str):
+        words = node.func.value.value.split()
+        return words if "gh" in words else None
+    return None
+
+
 def write_shaped(node):
-    """True for a list literal that is the argv (or a part of it) of a GitHub write."""
-    words = [e.value for e in node.elts if isinstance(e, ast.Constant) and isinstance(e.value, str)]
+    """True for a list or tuple literal, or a `'...'.split()`, that is the argv (or a part of it) of a GitHub write."""
+    words = argv_words(node)
     if "graphql" in words:   # a fixed read query (fields are its variables)
         return False
     if "api" not in words:   # `-f`, `-F` and `--field` are a write only to `gh api`; the long flags always
@@ -44,12 +57,15 @@ def audited_by(expr):
 
 
 def gate_closure(sources):
-    """True when a function named `gh` (the merge gate's runner of every call it makes) is decorated with `github_audited`: a call `gh([...])` is then audited at the closure."""
-    for text in sources.values():
-        for node in ast.walk(ast.parse(text)):
-            if isinstance(node, ast.FunctionDef) and node.name == "gh" and any(audited_by(d) for d in node.decorator_list):
-                return True
-    return False
+    """The set of files whose `gh([...])` calls are audited at the closure: the file that defines `merge_gate_gh` holding a `gh` decorated with `github_audited` (the merge gate's runner of every call it makes),
+    and bin/merge_gate.py, whose functions receive that runner as their `gh` parameter. A `gh(...)` call in any other file is not audited by it."""
+    for name, text in sources.items():
+        for fn in ast.walk(ast.parse(text)):
+            if isinstance(fn, ast.FunctionDef) and fn.name == "merge_gate_gh":
+                for node in ast.walk(fn):
+                    if isinstance(node, ast.FunctionDef) and node.name == "gh" and any(audited_by(d) for d in node.decorator_list):
+                        return {name, "bin/merge_gate.py"}
+    return set()
 
 
 def unaudited_writes(sources):
@@ -64,9 +80,9 @@ def unaudited_writes(sources):
                 ok = ok or any(audited_by(d) for d in node.decorator_list)
             if isinstance(node, ast.With):
                 ok = ok or any(audited_by(i.context_expr) for i in node.items)
-            if isinstance(node, ast.Call) and closure and call_name(node) == "gh":
+            if isinstance(node, ast.Call) and name in closure and call_name(node) == "gh":
                 ok = True
-            if isinstance(node, ast.List) and not ok and write_shaped(node):
+            if isinstance(node, (ast.List, ast.Tuple, ast.Call)) and not ok and argv_words(node) is not None and write_shaped(node):
                 found.append("%s:%d" % (name, node.lineno))
             for child in ast.iter_child_nodes(node):
                 walk(child, ok)
@@ -217,6 +233,15 @@ class TestGithubWriteGuard(unittest.TestCase):
     def test_the_guard_does_not_count_sites(self):
         two = "def f(run):\n    run(['gh', 'api', 'x', '-X', 'PUT'])\n    run(['gh', 'api', 'y', '-X', 'PUT'])\n"
         self.assertEqual(unaudited_writes({"a.py": two}), ["a.py:2", "a.py:3"])
+
+    def test_a_gh_call_outside_the_gate_is_not_exempt(self):
+        for plant in ("def f(gh):\n    gh(['pr', 'merge', '9'])\n", "def f(gh):\n    gh(['api', '-X', 'PATCH', 'repos/a/b/pulls/1'])\n"):
+            sources = dict(real_sources(), **{"bin/switchboard/planted.py": plant})
+            self.assertEqual(unaudited_writes(sources), ["bin/switchboard/planted.py:2"])
+
+    def test_a_tuple_and_a_split_argv_are_named(self):
+        for plant in ("def f(run):\n    run(('gh', 'api', 'x', '--method', 'PUT'))\n", "def f(run):\n    run('gh pr merge 9'.split())\n"):
+            self.assertEqual(unaudited_writes({"a.py": plant}), ["a.py:2"])
 
 
 if __name__ == "__main__":
