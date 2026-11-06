@@ -106,4 +106,35 @@ def build(PR4Base):
             sent = self.deliveries()
             self.assertEqual(len(sent), 1)
             self.assertTrue(sent[0]["in_turn"])
+        def zero_world(self):
+            """the default: steer_after_minutes 0, so no steering and (before #2243-b) no turn-start file."""
+            config = {"steer_after_minutes": 0}
+            self.world = self.make_world(config=config)
+            self.write_config(dict({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR}, **config))
+            self.world.add_agent("w-idle", fleet={"role": "coder", "reports_to": "platform", "issue": 10})
+            self.world.add_agent("w-other", fleet={"role": "coder", "reports_to": "platform", "issue": 11})
+
+        def test_setting_zero_stale_working_is_a_new_turn(self):
+            self.zero_world()
+            self.stale()
+            now = self.world.clock.now()
+            sb.add_reminder(self.world.state, "w-idle", now - 5, now - 600, "roll the build")
+            self.run_passes(1, {})
+            sent = self.deliveries()
+            self.assertEqual(len(sent), 1)
+            self.assertFalse(sent[0]["in_turn"])
+            self.assertFalse(sent[0].get("busy"))
+
+        def test_setting_zero_real_turn_still_queues_and_never_steers(self):
+            self.zero_world()
+            self.world.v2.start_turn(self.world.sessions["w-idle"], "work", fleet=False, lasts=10 ** 7)
+            self.stale()
+            now = self.world.clock.now()
+            sb.add_reminder(self.world.state, "w-idle", now - 5, now - 60, "roll the build")
+            self.run_passes(1, {})
+            sent = self.deliveries()
+            self.assertEqual(len(sent), 1)
+            self.assertTrue(sent[0]["in_turn"])
+            self.assertEqual(sent[0]["delivery"], "queue")
+            self.assertFalse(sent[0].get("busy"))
     return TestReminderIdleWake

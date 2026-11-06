@@ -2746,7 +2746,7 @@ class Switchboard:
         self._early_facts = {}   # #467: facts the early decisions step reads for this pass only; never carried over from an earlier one
         self.reads.begin_pass()
         discovery = self.discover(now)
-        if self.config.get("steer_after_minutes") and self.state_dir is not None:   # #1540: only with the key on is the turn-start file touched
+        if self.state_dir is not None:   # #2243: the turn start is always recorded (stale_working reads it); steering stays gated by the setting
             try:
                 load_module("turn_start").note(self.state_dir, [(o.session_id, o.status) for o in discovery.agents.values()], now,
                                                   load_module("record_json").parse_bounded, fresh=self.turn_start_fresh)
