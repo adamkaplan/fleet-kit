@@ -94,7 +94,7 @@ class Scene:
         self.launcher = L(self.kube, self.env, lambda: T0, lambda s: None)
         self.launcher.add_labels = self.call
         self.heads = {}
-        self.launcher.pr_head = lambda token, repo, n: self.heads.get(n, ("coder/b", "open"))
+        self.launcher.pr_head = lambda token, repo, n: (lambda h: h if len(h) == 3 else h + (repo,))(self.heads.get(n, ("coder/b", "open")))
 
     def call(self, token, repo, n, labels):
         self.calls.append((repo, n, list(labels)))
@@ -155,6 +155,13 @@ class PrLabel(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             s = Scene([pod()], {"w1": "41\n42\n43\n"}, tmp)
             s.heads = {41: ("someone-else/x", "open"), 42: ("coder/x", "open"), 43: ("coder/y", "closed")}
+            s.reap()
+            self.assertEqual([c[1] for c in s.calls], [42])
+
+    def test_fork_head_is_not_labelled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s = Scene([pod()], {"w1": "41\n42\n"}, tmp)
+            s.heads = {41: ("coder/x", "open", "someone-else/fleet-kit"), 42: ("coder/x", "open")}
             s.reap()
             self.assertEqual([c[1] for c in s.calls], [42])
 

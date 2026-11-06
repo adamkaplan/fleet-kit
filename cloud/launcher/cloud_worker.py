@@ -2638,14 +2638,15 @@ def github_add_labels(token, repo, number, labels):
 
 
 def github_pr_head(token, repo, number):
-    """GET /repos/R/pulls/N: (head branch name, state). Raises on any failure."""
+    """GET /repos/R/pulls/N: (head branch name, state, head repository full name). Raises on any failure."""
     import urllib.request
     import token_mint
     req = urllib.request.Request("https://api.github.com/repos/%s/pulls/%d" % (repo, number), method="GET",
                                  headers={"Authorization": "Bearer " + token, "Accept": "application/vnd.github+json", "User-Agent": "cw-launcher"})
     with token_mint.open_no_redirect(req, SCOPE_PROBE_SECONDS) as r:
         data = json.loads(r.read(1000000).decode("utf-8", "replace"))
-    return str(((data.get("head") or {}).get("ref")) or ""), str(data.get("state") or "")
+    head = data.get("head") or {}
+    return str(head.get("ref") or ""), str(data.get("state") or ""), str((head.get("repo") or {}).get("full_name") or "")
 
 
 SAFE_VALUE = re.compile(r"[A-Za-z0-9._-]{1,63}", re.ASCII)
@@ -4640,8 +4641,8 @@ class Launcher:
                             check_repo_allowed(repo, self.env)
                             token = run_git_token_cmd(git_token_cmd(repo, self.env), repo, dict(os.environ, **self.env), register=lambda *v: self.kube.add_secrets(*v))
                             self.kube.add_secrets(token)
-                        ref, state = (self.pr_head or github_pr_head)(token, repo, int(number))
-                        if state != "open" or not ((own_branch and ref == own_branch) or ref.startswith(worker + "/")):
+                        ref, state, head_repo = (self.pr_head or github_pr_head)(token, repo, int(number))
+                        if state != "open" or head_repo.lower() != repo.lower() or not ((own_branch and ref == own_branch) or ref.startswith(worker + "/")):
                             raise RuntimeError("skipped: head branch %s (%s) is not one this worker could have pushed" % (safe_value(ref), safe_value(state)))
                         (self.add_labels or github_add_labels)(token, repo, int(number), labels)
                         ok, why = True, "labelled %s" % ", ".join(labels)
@@ -4664,7 +4665,7 @@ class Launcher:
                 print("cloud-worker: the pod's pull requests were not labelled: %s" % self.kube.scrub(e, 120), file=sys.stderr)
         return out
 
-    pr_head = None   # a test replaces it: (token, repo, number) -> (head ref, state)
+    pr_head = None   # a test replaces it: (token, repo, number) -> (head ref, state, head repository full name)
     add_labels = None   # a test replaces it: (token, repo, number, labels)
 
     def send_final_notes(self, pods, now):
