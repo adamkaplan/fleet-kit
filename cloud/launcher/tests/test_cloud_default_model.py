@@ -116,8 +116,13 @@ class Mutant(unittest.TestCase):
         self.assertNotEqual(mutant, text, "the mutation did not apply")
         args = type("A", (), {"model": None, "reasoning": None, "agent": "coder", "name": "w"})()
         control, broken = load_part(text), load_part(mutant)
-        self.assertEqual(control["launch_model_cloud"](args, "github-copilot"), {"model": "github-copilot/claude-sonnet-5.5", "reasoning": "medium"})
-        self.assertEqual(broken["launch_model_cloud"](args, "github-copilot"), {}, "default missing: no model for a worker launch")
+        def check(ns):
+            self.assertEqual(ns["launch_model_cloud"](args, "github-copilot"), {"model": "github-copilot/claude-sonnet-5.5", "reasoning": "medium"},
+                             "the default model is missing from a worker launch")
+        check(control)   # control first: the real part passes
+        with self.assertRaises(AssertionError) as caught:
+            check(broken)
+        self.assertIn("the default model is missing from a worker launch", str(caught.exception))
 
 
 if __name__ == "__main__":
