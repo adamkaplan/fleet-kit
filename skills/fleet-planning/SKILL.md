@@ -110,5 +110,5 @@ The worker proves each scenario with `fleet-switchboard prove S1 --pr <pr>
 Order does not matter: a coder's only extra step is `prove`. The Chief of Staff may waive a hotfix, logged; the plan is then due within a day.
 `CARRIES: #N`: see plan-template.
 A launch arms a checkpoint and an overdue wake: a cloud launch without CHECKPOINT line or flags gets the default 25m/40m.
-Apply an approved plan edit with `fleet-switchboard plan apply` (see plan-template).
 A builder told to run the guard set runs `tools/guard-set --run`.
+Apply an approved plan edit with `fleet-switchboard plan apply` (see plan-template).
