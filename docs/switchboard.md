@@ -2732,7 +2732,7 @@ delete` or `gh label edit --name` on it, `gh api` label DELETE, PUT or a `labels
 fleet name `whoami` gives) is in `allowed_removers`. It only ever ADDS refusals: reads, other repositories and unlabelled pull requests run as
 before, and a repository with no entry costs no GitHub call. Repository names match case-insensitively, with or without `.git`, spaces or a
 host; label names compare with NFKC and case folded; a target may be a number, a URL, a branch name or nothing (the real `gh` then says which pull
-request it is). One bounded read (`FLEET_SHIM_HOLD_SECONDS`, default 5, between 0.2 and 10) answers which pull request and which labels, with
+request it is). One bounded read (`FLEET_SHIM_HOLD_SECONDS`, default 5, between 0.2 and 10, is the limit of each read, counted from the read; one command's reads together may take three times that, after which every further read fails closed with "the command's read budget is spent") answers which pull request and which labels, with
 the account the write would use.
 
 **Fail closed.** A label read that fails, times out or answers something unreadable, a config that cannot be read or whose entry is

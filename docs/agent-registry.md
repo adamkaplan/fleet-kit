@@ -70,7 +70,8 @@ rebuilt from another record.
 | `bin/switchboard/decisions_b.py:281` | `decisions.json` | comment only: names the projection among what the store keeps | nobody | nobody | derived |
 | `bin/switchboard/plan_review.py:544` | `boss-resolution` | plan review escalates to the planner's boss through `boss_name`, then `resolve_boss` | nobody | plan review escalation | derived (reader) |
 | `bin/switchboard/plan_review.py:542` | `discovery.agents` | plan review reads the newest discovery to find the planner's boss | nobody | plan review escalation | derived (reader) |
-| `bin/switchboard/reminders.py:346` | `boss-resolution` | a reminder's recipient is resolved through `resolve_boss` | nobody | reminder delivery | derived (reader) |
+| `bin/switchboard/checkpoint_reminders.py:88` | `boss-resolution` | the overdue wake's recipient is resolved through `resolve_boss` (moved out of reminders.py unchanged) | nobody | reminder delivery | derived (reader) |
+| `bin/switchboard/checkpoint_reminders.py:88` | `discovery.agents` | the overdue wake reads the agents of the newest `discover()` (moved out of reminders.py unchanged) | nobody | reminder delivery | derived (reader) |
 | `bin/switchboard/reminders.py:176` | `discovery.agents` | a reminder condition reads the discovered agents (recipient and sender) | nobody | reminder delivery | derived (reader) |
 | `bin/switchboard/reminders.py:143` | `last-reports.json` | a reminder's "no report since" condition reads the sender's last report time | nobody | reminder delivery | primary |
 | `bin/cloud_first_push.py:83` | `last-reports.json` | the first-push notice pass reads whether the pod has reported since its launch | nobody (reader only) | `first_push_tick` (the first-push notice, #2057) | primary (reader) |

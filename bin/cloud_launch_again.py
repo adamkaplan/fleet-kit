@@ -32,6 +32,9 @@ def _launch_line(record, **extra):
     return line
 
 
+RETURNED = set()   # names a launch only returned (an existing worker): read and cleared by the entry's `_cmd_launch`
+
+
 def _launch_again(args, runner, engine, state, record, repo, branch):
     """A launch of a name that has a record. Returns the exit code when the launch is decided here (the worker returned, still starting, finished,
     or refused), or None when the record was cleared (its pod is gone and its hard deadline passed) and a new worker is to be made."""
@@ -42,6 +45,7 @@ def _launch_again(args, runner, engine, state, record, repo, branch):
     if not H["_ended"](record):
         if record.get("state") == "starting":
             return _finish_starting(args, runner, engine, state, record, repo, branch)
+        RETURNED.add(name)   # the entry arms no checkpoint reminders for a worker that was only returned (the first launch armed them)
         print("exists: returned worker %s (pod %s)" % (name, record["runtime_id"]), file=sys.stderr)
         print(json.dumps(_launch_line(record, existing=True), sort_keys=True))
         return H["H"]["EXIT_OK"]

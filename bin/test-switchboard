@@ -10783,9 +10783,9 @@ class FrictionBase(Base):
 class TestFrictionWake(FrictionBase):
     def test_it_is_off_by_default_and_the_defaults_are_the_documented_ones(self):
         self.assertNotIn("friction_wake", sb.DEFAULTS)
-        self.assertEqual([s.__name__ for s in sb.fact_sources(self.home)],
-                         ["lab_facts", "worker_facts", "reminder_facts", "report_rider_facts", "held_send_facts", "foreground_facts",
-                          "orders_facts", "sweep_facts", "triage_facts", "plan_wake_facts", "alert_wake_facts", "red_ci_facts", "job_facts", "pane_facts", "pane_exit_facts", "headless_restart_facts", "disk_facts", "cpu_facts", "spotlight_facts", "docker_reap_facts", "temp_janitor_facts", "heavy_orphan_facts", "scratch_bound_facts"])
+        names = [s.__name__ for s in sb.fact_sources(self.home)]   # the registry is derived elsewhere (every facts class is registered); here: the wake is no fact source of its own, and no source is listed twice
+        self.assertEqual(len(names), len(set(names)))
+        self.assertEqual([n for n in names if "friction" in n.lower()], [])
         self.assertNotIn("friction_wake", sb.validate_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR}))
         self.assertEqual(sb.FRICTION_DEFAULTS, {"enabled": False, "hour": 9, "to": "cos", "cos_to": "improver", "text": None})
         self.make("off")
@@ -17780,6 +17780,10 @@ class TestHandoff(HandoffCase):
         # (#1123) plus ONE site in `_review_api`, the shared helper of `review post` and `review dismiss`: their writes (a review, a dismissal) are deliberate and the only ones added;
         # the reader code (IntentReader, checked above, and checkout/measure) stays read-only
         # #2260: no count of write sites is pinned; TestGithubWriteAudit finds each write by its shape and requires it to go through the audit helper
+        # the sites are named by where they live, not counted: a new file that writes has to be named here on purpose (`comment --edit`, #1714, is the signed edit of one's own comment: agents_verify.gh_call)
+        holders = sorted(p.name for p in SWITCHBOARD_SOURCE_FILES if '"--method"' in p.read_text())
+        self.assertEqual(holders, ["agents_verify.py", "fleet-switchboard", "handoff.py"])
+        # the exact count was removed: a pinned count, and it never proved auditing; that every write is audited is ask #2260
         self.assertEqual(len(re.findall(r"_review_api\([^)]*\"(?:POST|PUT)\"", source)), 2)   # the post (the verdict and its own-account fallback share one call site, the event is a variable) and the dismissal: each goes through the helper
 
 
@@ -42156,7 +42160,7 @@ class TestLaunchRefusedMessage(TestLaunchMemoryGate):
             ' > getattr(args, "headless", Fals|raise LaunchError("--headless opens no t': (B + ["--headless"], []),
             ' > (args.name or "").startswith(L|raise LaunchError("names starting %r are': (["launch", sb.LANE_NAME_PREFIX + "x"] + B[2:], []),
             ' > problem|raise LaunchError(problem)': (B, [P("launch_agent_problem", return_value="the agent is not known")]),
-            ' > getattr(args, "role", None) == > problem|return EXIT_USAGE': (B + ["--role", "tester"], [P("load_module", side_effect=lambda name, _real=sb.load_module: types.SimpleNamespace(line_for=lambda agent, root: "fleet-switchboard: launch: --role tester needs an agent: x is not one") if name == "tester_agent" else _real(name))]),
+            ' > getattr(args, "role", None) == > problem|return EXIT_USAGE': (B + ["--role", "tester"], [P("load_module", new=lambda name, _real=sb.load_module: types.SimpleNamespace(line_for=lambda agent, root: "fleet-switchboard: launch: --role tester needs an agent: x is not one") if name == "tester_agent" else _real(name))]),
             ' > mismatch|return EXIT_USAGE': (B, [P("launch_brief_mismatch", return_value="the brief names another issue")]),
             ' > args.new_workspace > args.workspace|raise LaunchError("--new-workspace makes': (B + ["--new-workspace", "lab"], []),
             ' > args.new_workspace > problems|raise LaunchError("; ".join(problems))': (newws, [P("launch_problems", return_value=["p1", "p2"])]),
@@ -67040,6 +67044,7 @@ TestGhShimAllowlist = importlib.import_module("test_gh_shim_sign_input").TestGhS
 TestGhShimBodyFieldKeyIsExact = importlib.import_module("test_gh_shim_sign_input").TestGhShimBodyFieldKeyIsExact
 TestGhShimMethodFlagBeforeApi = importlib.import_module("test_gh_shim_sign_input").TestGhShimMethodFlagBeforeApi
 _ghb = importlib.import_module("test_gh_shim_body"); TestGhBodyGuard, TestGhBodyRefusalIsPure, TestGhBodyMutants = _ghb.TestGhBodyGuard, _ghb.TestGhBodyRefusalIsPure, _ghb.TestGhBodyMutants   # #1751
+TestGhBodyReadHasItsOwnClock = _ghb.TestGhBodyReadHasItsOwnClock   # #2256
 TestUnconsumedSteer = importlib.import_module("test_unconsumed_steer").build(Base, TestSteerToWorking)   # #1844
 TestUnconsumedRecord = importlib.import_module("test_unconsumed_record").TestUnconsumedRecord   # #1844
 _noparent = importlib.import_module("test_charter_noparent"); TestCharterNoParent, TestCharterNoParentSet = _noparent.TestCharterNoParent, _noparent.build(CharterRig, Base, TestCharterSetGuard)
