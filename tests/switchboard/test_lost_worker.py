@@ -906,5 +906,24 @@ class TestChiefOnlyWhenNeeded(unittest.TestCase):
         self.assertEqual(self.delivered(False), ["chief-of-staff", "lane-a"])
 
 
+class TestAskIsItsOwn(unittest.TestCase):
+    """#2246: a lost worker is counted under its own ask, never under its name prefix."""
+
+    def test_s2_readers_of_two_issues_and_a_builder_of_a_third_are_each_their_own_ask(self):
+        mod = load()
+        recs = {"cr2244": {"issue": 2243}, "cr2250": {"issue": 2249}, "cb2251": {"branch": "c2251-a"}}
+        asks = {n: mod._ask_of(n, r) for n, r in recs.items()}
+        self.assertEqual(len(set(asks.values())), 3)
+        self.assertEqual(sum(1 for n, a in asks.items() if a in ("cr", "cb")), 0)
+
+    def test_s3_repeat_counts_only_its_own_ask(self):
+        mod = load()
+        asks = [mod._ask_of("cr%d" % i, {}) for i in (1, 2, 3)]
+        self.assertEqual(len(set(asks)), 3)
+
+    def test_the_full_name_is_the_last_resort(self):
+        self.assertEqual(load()._ask_of("cr2244", {}), "cr2244")
+
+
 if __name__ == "__main__":
     unittest.main()
