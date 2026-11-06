@@ -183,12 +183,37 @@ def nudge_skip(self, pod, worker, name, quiet, reason, now=None):
                 last[k] = now
                 self.audit(worker, "pod/" + name, "idle-nudge-skipped", self._cost_or_zero(pod), True, reason)
                 return
-        seen = self.__dict__.setdefault("_nudge_skipped", set())
+        seen = self.__dict__.setdefault("_nudge_skipped", {})
         key = ((pod.get("metadata") or {}).get("uid") or name, str(quiet))
         if key in seen:
             return
-        seen.add(key)
+        seen[key] = True
         self.audit(worker, "pod/" + name, "idle-nudge-skipped", self._cost_or_zero(pod), True, reason)
+    except Exception:
+        pass
+
+
+NUDGE_MEMORY_CAP = 2000
+
+
+def nudge_prune(self, pods):
+    """Forget the skip memory of pods no longer in the list; backstop: keep at most NUDGE_MEMORY_CAP entries each, dropping the oldest. Never raises."""
+    try:
+        live = set()
+        for p in pods:
+            m = p.get("metadata") or {}
+            live.update(x for x in (m.get("uid"), m.get("name")) if x)
+        seen, last = self.__dict__.get("_nudge_skipped"), self.__dict__.get("_nudge_unknown")
+        if seen is not None:
+            for k in [k for k in seen if k[0] not in live]:
+                del seen[k]
+            for k in list(seen)[:max(0, len(seen) - NUDGE_MEMORY_CAP)]:
+                del seen[k]
+        if last is not None:
+            for k in [k for k in last if k not in live]:
+                del last[k]
+            for k in list(last)[:max(0, len(last) - NUDGE_MEMORY_CAP)]:
+                del last[k]
     except Exception:
         pass
 
@@ -4561,6 +4586,7 @@ class Launcher:
     def send_idle_nudges(self, pods, now, acts=None):
         """ONE fixed line to a stalled builder (see idle_nudge_due). The cw/idle-nudge annotation is set BEFORE the send; one audit line.
         A results check that cannot run means do not nudge. Never raises."""
+        nudge_prune(self, pods)
         for pod in pods:
             try:
                 worker, name = ann(pod, "worker"), pod["metadata"]["name"]

@@ -104,6 +104,28 @@ class TestSkipped(unittest.TestCase):
         run(self.fn, f, mkpod(2))
         self.assertEqual(f.sent, [])
 
+    def test_s6_gone_pods_pruned(self):
+        s = Stub()
+        a, b = mkpod(1), mkpod(2)
+        a["status"]["startTime"] = b["status"]["startTime"] = (NOW - dt.timedelta(hours=1)).isoformat()
+        s.activity = lambda name: (False, None)   # idle unknown -> _nudge_unknown
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.fn(s, [a, b], NOW)
+        self.assertEqual(set(s._nudge_unknown), {"u1", "u2"})
+        s._nudge_skipped[("u2", "x")] = True
+        s._nudge_skipped[("u1", "x")] = True
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.fn(s, [a], NOW)
+        self.assertEqual(set(s._nudge_unknown), {"u1"})
+        self.assertEqual(set(k[0] for k in s._nudge_skipped), {"u1"})
+
+    def test_s7_cap(self):
+        s = Stub()
+        s._nudge_unknown = {"u%d" % i: NOW for i in range(2005)}
+        cw.nudge_prune(s, [{"metadata": {"uid": "u%d" % i}} for i in range(2005)])
+        self.assertEqual(len(s._nudge_unknown), 2000)
+        self.assertNotIn("u0", s._nudge_unknown)
+
 
 class TestMutant(unittest.TestCase):
     def test_s5_control_then_mutant(self):
