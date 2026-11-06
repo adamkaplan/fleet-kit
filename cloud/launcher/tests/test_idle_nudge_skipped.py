@@ -30,6 +30,7 @@ class Multi(Stub):
         self.audits.append(a)
 
     def activity(self, name):
+        self.cur = name
         return self.plan[name][0]
 
     def _exec(self, name, *cmd, **kw):
@@ -54,9 +55,8 @@ def passes(fn, count=2):
     out = []
     for _ in range(count):
         before = len(s.audits)
-        for p in pods:
-            s.cur = p["metadata"]["name"]
-            run(fn, s, p)
+        with contextlib.redirect_stderr(io.StringIO()):
+            fn(s, pods, NOW)   # the whole list in one pass: a pod missing from the list is forgotten
         out.append([a for a in s.audits[before:] if a[2] == "idle-nudge-skipped"])
     return out
 
@@ -112,8 +112,7 @@ class TestSkipped(unittest.TestCase):
         with contextlib.redirect_stderr(io.StringIO()):
             self.fn(s, [a, b], NOW)
         self.assertEqual(set(s._nudge_unknown), {"u1", "u2"})
-        s._nudge_skipped[("u2", "x")] = True
-        s._nudge_skipped[("u1", "x")] = True
+        s.__dict__.setdefault("_nudge_skipped", {}).update({("u2", "x"): True, ("u1", "x"): True})
         with contextlib.redirect_stderr(io.StringIO()):
             self.fn(s, [a], NOW)
         self.assertEqual(set(s._nudge_unknown), {"u1"})
