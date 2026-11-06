@@ -1,5 +1,6 @@
 cloud/launcher/tests/test_app_token_route.py
 cloud/launcher/tests/test_brief_header.py
+cloud/launcher/tests/test_cloud_default_model.py
 cloud/launcher/tests/test_cloud_inspect.py
 cloud/launcher/tests/test_cloud_model_served.py
 cloud/launcher/tests/test_cloud_quick_budget.py

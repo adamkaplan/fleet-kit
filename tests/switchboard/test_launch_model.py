@@ -270,12 +270,13 @@ def build_cloud(root=None):
             record = body["metadata"]["fleet"]
             self.assertEqual((record["model"], record["reasoning"]), ("github-copilot/model-a", "medium"))
 
-        def test_s8_a_launch_with_neither_option_has_no_model_key_and_no_record_keys(self):
+        def test_s8_a_launch_with_neither_option_gets_the_default_model_at_medium(self):
             code, out, err = self.launch_with("--cloud")
             self.assertEqual(code, 0, err)
             (body,) = self.session_bodies()
-            self.assertNotIn("model", body)
-            self.assertFalse({"model", "reasoning"} & set(body["metadata"]["fleet"]))
+            self.assertEqual(body["model"], {"providerID": "github-copilot", "id": "claude-sonnet-5.5", "variant": "medium"})
+            record = body["metadata"]["fleet"]
+            self.assertEqual((record["model"], record["reasoning"]), ("github-copilot/claude-sonnet-5.5", "medium"))
 
         def test_m1_an_empty_model_or_level_is_refused_in_one_line_in_the_cloud_route(self):
             for case in (("--model", ""), ("--model", "github-copilot/model-a", "--reasoning", ""), ("--reasoning", "")):

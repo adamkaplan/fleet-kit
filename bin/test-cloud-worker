@@ -82,7 +82,7 @@ class FakeRemote:
                 if self.command == "GET" and "/message" in self.path:
                     return self._answer(200, {"data": list(reversed(outer.messages))})
                 if self.command == "GET" and self.path == "/api/model":
-                    return self._answer(200, {"data": [{"providerID": "github-copilot", "id": "model-a"}]})
+                    return self._answer(200, {"data": [{"providerID": "github-copilot", "id": "model-a"}, {"providerID": "github-copilot", "id": "claude-sonnet-5.5"}]})
                 return self._answer(404, {"error": "no such route"})
 
             do_GET = do_POST = _handle
