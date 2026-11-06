@@ -12485,9 +12485,6 @@ def _cmd_launch(args, runner, now, socket_call=None):
     if getattr(args, "stack", False) and not getattr(args, "cloud", False):   # before anything is read or called: the option is the cloud launcher's
         sys.stderr.write("%s: --stack needs --cloud: the nested Docker stack is a cloud worker's pod; nothing was created\n" % PROG)
         return EXIT_USAGE
-    if getattr(args, "persistent", False) and not getattr(args, "cloud", False):   # before anything is read or called: the option is the cloud launcher's
-        sys.stderr.write("%s: --persistent needs --cloud: an always-on orchestrator is a cloud pod; nothing was created\n" % PROG)
-        return EXIT_USAGE
     if getattr(args, "role", None) == "tester" and getattr(args, "agent", None):   # #1963: before every route; the allowed agents are read from the checkout's agents/roles.tsv
         problem = load_module("tester_agent").line_for(args.agent, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
         if problem:
@@ -21782,7 +21779,6 @@ def add_core_parsers(sub):
     launch.add_argument("--stack", action="store_true", help="With --cloud: a pod that can run a nested Docker stack (the Sysbox runtime class, its own user namespace, no capability added, no privileged mode). Off by default; the launch without it is unchanged. The first pod on a fresh node may wait for the node's runtime: the launcher retries")
     launch.add_argument("--no-wait", dest="no_wait", action="store_true", help="With --cloud: request the pod and return at once (state starting); run the same launch command again to finish it (the session and the brief, once) when the pod is ready. Not with --stack")
     launch.add_argument("--no-commit", action="store_true", help="With --cloud: this pod is launched NOT to commit (a measure or a read): the launcher never tells it to push its work. Implied by --role tester and --role reviewer.")
-    launch.add_argument("--persistent", action="store_true", help="With --cloud and --agent orchestrator: an always-on orchestrator (one StatefulSet, restart always, no hard or idle limit; only an explicit stop ends it, and its cost is unbounded in time). Refused for a worker or a --stack launch")
     pending = sub.add_parser("pending", help="What is pending for an agent, and why it waits or is held")
     pending.add_argument("name", help="The agent's fleet name")
     pending.add_argument("--json", action="store_true", help="Emit machine-readable JSON instead")
@@ -22091,7 +22087,7 @@ CLOUD_ENV_SETTING_NAMES = ("CW_ALLOWED_REPOS", "CW_TOOLING_REPO", "CW_CLOUD_IMAG
                             "CW_OPENCODE_BIN", "CW_RUN_RECORD_DIR", "CW_CLOUD_SPEND_CAP_USD", "CW_CLUSTER_TOKEN_CMD",
                             "CW_CLUSTER_ADMIN_CMD", "CW_GIT_TOKEN_CMD", "CW_APP_ID_CMD", "CW_APP_INSTALLATION_CMD",
                             "CW_APP_KEY_CMD", "CW_CLUSTER_ADMIN_SECRET", "CW_CLUSTER_TOKEN_DURATION", "CW_HUB_CHANNEL_URL",
-                            "CW_HUB_REGISTRY_SECRET", "CW_VAULT_CHECK_DIR", "CW_MAX_PERSISTENT")
+                            "CW_HUB_REGISTRY_SECRET", "CW_VAULT_CHECK_DIR")
 REAPER_CLUSTER_NAMES = ("CW_CLOUD_SERVER", "CW_CLOUD_NAMESPACE", "CW_CLOUD_TOKEN_FILE")   # the cluster login the reaper needs (the token file: the install's environment, else a default)
 REAPER_VAULT_NAMES = ("CW_VAULT_NAME", "CW_VAULT_SUBSCRIPTION")   # the vault names (CW_CLUSTER_ADMIN_SECRET has a default: optional)
 # The reaper's NON-SECRET settings the installer copies from its own environment into the service (names of a cluster or a
