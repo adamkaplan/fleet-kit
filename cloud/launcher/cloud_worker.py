@@ -162,6 +162,62 @@ def idle_nudge_due(busy, last_activity, now, idle_seconds, already, role, result
             and idle_seconds > IDLE_NUDGE_AFTER_SECONDS and not already and role != "orchestrator" and results_exists is False)
 
 
+def nudge_skip(self, pod, worker, name, quiet, reason, now=None):
+    """DIAGNOSIS ONLY: one 'idle-nudge-skipped' audit line per (pod uid, quiet period) for a pod whose idle limit is longer than 15 minutes;
+    remembered in memory, so a reaper restart may write one more line. Never raises, never changes the nudge."""
+    try:
+        if int(ann(pod, "idle-seconds", "600")) <= IDLE_NUDGE_AFTER_SECONDS:
+            return
+        if now is not None:   # a pod launched under 15 minutes ago (or with no known start) gets no line at all
+            from datetime import datetime as _dt
+            meta = pod.get("metadata") or {}
+            began = (pod.get("status") or {}).get("startTime") or meta.get("creationTimestamp")
+            began = _dt.fromisoformat(str(began).replace("Z", "+00:00"))
+            if (now - began).total_seconds() < IDLE_NUDGE_AFTER_SECONDS:
+                return
+            if reason.endswith("(idle unknown)"):   # idle time not known: ONE line per pod per 15 minutes, not tied to idle time
+                last = self.__dict__.setdefault("_nudge_unknown", {})
+                k = meta.get("uid") or name
+                if k in last and (now - last[k]).total_seconds() < IDLE_NUDGE_AFTER_SECONDS:
+                    return
+                last[k] = now
+                self.audit(worker, "pod/" + name, "idle-nudge-skipped", self._cost_or_zero(pod), True, reason)
+                return
+        seen = self.__dict__.setdefault("_nudge_skipped", {})
+        key = ((pod.get("metadata") or {}).get("uid") or name, str(quiet))
+        if key in seen:
+            return
+        seen[key] = True
+        self.audit(worker, "pod/" + name, "idle-nudge-skipped", self._cost_or_zero(pod), True, reason)
+    except Exception:
+        pass
+
+
+NUDGE_MEMORY_CAP = 2000
+
+
+def nudge_prune(self, pods):
+    """Forget the skip memory of pods no longer in the list; backstop: keep at most NUDGE_MEMORY_CAP entries each, dropping the oldest. Never raises."""
+    try:
+        live = set()
+        for p in pods:
+            m = p.get("metadata") or {}
+            live.update(x for x in (m.get("uid"), m.get("name")) if x)
+        seen, last = self.__dict__.get("_nudge_skipped"), self.__dict__.get("_nudge_unknown")
+        if seen is not None:
+            for k in [k for k in seen if k[0] not in live]:
+                del seen[k]
+            for k in list(seen)[:max(0, len(seen) - NUDGE_MEMORY_CAP)]:
+                del seen[k]
+        if last is not None:
+            for k in [k for k in last if k not in live]:
+                del last[k]
+            for k in list(last)[:max(0, len(last) - NUDGE_MEMORY_CAP)]:
+                del last[k]
+    except Exception:
+        pass
+
+
 # Run INSIDE the pod by `kubectl exec python3 -c <this> <text>`: the pod's own headless server, the password file the activity probe reads.
 # It prompts the newest session with the note (queued). It prints nothing and holds no credential beyond the server password it already reads.
 NOTE_SENDER_CODE = (
@@ -4372,6 +4428,7 @@ class Launcher:
             steps["notes"] += mono() - t0   # the final note is counted with the notes
         t0 = mono()
         try:
+            nudge_prune(self, pods)   # the FULL pod list, not the subset `live`
             self.send_idle_nudges(live, now, acts)
         finally:
             steps["notes"] += mono() - t0   # the nudges are counted with the notes: both are the pass's sends
@@ -4535,9 +4592,18 @@ class Launcher:
                 worker, name = ann(pod, "worker"), pod["metadata"]["name"]
                 if (pod.get("status") or {}).get("phase") != "Running" or not NAME_RE.fullmatch(worker or ""):
                     continue
+                if ann(pod, "idle-nudge") and ann(pod, "role", "worker") != "orchestrator":
+                    nudge_skip(self, pod, worker, name, "-", "already-nudged", now)
                 if ann(pod, "idle-nudge") or ann(pod, "role", "worker") == "orchestrator":
                     continue
                 act = (acts or {}).get(name) or self.activity(name)
+                # These three have no known idle time: the line says so and is rate-limited by the clock, not by idle time.
+                if not act:
+                    nudge_skip(self, pod, worker, name, "-", "probe-unreadable (idle unknown)", now)
+                elif act[0]:
+                    nudge_skip(self, pod, worker, name, "-", "busy (idle unknown)", now)
+                elif act[1] is None:
+                    nudge_skip(self, pod, worker, name, "-", "no-activity-time (idle unknown)", now)
                 if not act or act[0] or act[1] is None:
                     continue
                 idle = int(ann(pod, "idle-seconds", "600"))
@@ -4546,7 +4612,10 @@ class Launcher:
                 try:   # one read-only exec: it prints yes or no; a failure to run means do not nudge
                     seen = self.kube.exec(name, "python3", "-c", RESULTS_PROBE_CODE).strip()
                 except CloudError:
+                    nudge_skip(self, pod, worker, name, act[1], "exec-failed", now)
                     continue
+                if seen != "no" and not results_not_finished(seen):
+                    nudge_skip(self, pod, worker, name, act[1], "results-finished", now)
                 if seen != "no" and not results_not_finished(seen):
                     continue
                 self.kube.annotate(name, (pod.get("metadata") or {}).get("uid"), **{IDLE_NUDGE_MARK: "sent"})
