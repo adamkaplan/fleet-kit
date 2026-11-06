@@ -12,12 +12,12 @@ class TipGh:
     def __init__(self, sb):
         self.sb, self.runs, self.jobs, self.calls, self.fault = sb, [], {}, [], False
 
-    def add(self, now, run_id, head, pr, jobs=(), conclusion=None, age=60, status="completed", branch="integration"):
+    def add(self, now, run_id, head, pr, jobs=(), conclusion=None, age=60, status="completed", branch="integration", done=None, kind="failure"):
         failed = [j for j in jobs]
         self.runs.append({"id": run_id, "head_sha": head, "head_branch": branch, "status": status, "event": "workflow_dispatch",
-                          "conclusion": conclusion or ("failure" if failed else "success"), "created_at": self.sb.iso(now - age),
+                          "conclusion": conclusion or ("failure" if failed else "success"), "created_at": self.sb.iso(now - age), "updated_at": self.sb.iso(now - (age if done is None else done)),
                           "head_commit": {"message": "A change (#%d)\n\nbody" % pr if pr else "A direct push"}})
-        self.jobs[run_id] = [{"name": n, "conclusion": "failure"} for n in failed] + [{"name": "ok-job", "conclusion": "success"}]
+        self.jobs[run_id] = [{"name": n, "conclusion": kind} for n in failed] + [{"name": "ok-job", "conclusion": "success"}]
 
     def __call__(self, argv, **kwargs):
         path = list(argv)[-1]
@@ -102,6 +102,45 @@ def build(Base, World, FAKE_GH, EjectionHub, sb):
             self.assertIn("lint", line)
             self.assertNotIn("unit tests", line)
             self.assertIn("already red", line)
+
+        def test_timed_out_jobs_count_as_failed_and_the_same_red_is_not_told_again(self):
+            self.add(1, "a" * 40, 11, age=300)
+            self.add(2, "b" * 40, 12, ["unit tests"], age=200, kind="timed_out")
+            self.go()
+            self.assertEqual(len(self.sent), 2)
+            self.assertIn("unit tests", self.sent[0][1])
+            self.add(3, "c" * 40, 13, ["unit tests"], age=30, kind="startup_failure")
+            self.go()
+            self.assertEqual(len(self.sent), 2)
+
+        def test_an_unreadable_job_list_is_stored_unknown_and_the_next_red_is_not_announced(self):
+            self.add(1, "a" * 40, 11, age=300)
+            self.add(2, "b" * 40, 12, ["x"], age=200)
+            self.gh.jobs[2] = [{"name": "ok-job", "conclusion": "success"}]   # red run, no failed job to name
+            self.go()
+            ledger = json.loads(open(self.engine.state_dir / "tip-watch.json").read())
+            self.assertIsNone(ledger["heads"]["b" * 40]["failed"])
+            sent = len(self.sent)
+            self.add(3, "c" * 40, 13, ["x"], age=30)
+            self.gh.jobs[3] = [{"name": "ok-job", "conclusion": "success"}]
+            self.go()
+            self.assertEqual(len(self.sent), sent)
+
+        def test_a_long_run_is_measured_from_its_completion_not_its_start(self):
+            self.add(2, "b" * 40, 12, ["unit tests"], age=self.module.WAKE_WINDOW + 500, done=60)
+            self.go()
+            self.assertEqual(len(self.sent), 2)
+
+        def test_recipients_already_told_survive_a_restart(self):
+            self.add(2, "b" * 40, 12, ["unit tests"], age=30)
+            real = self.engine.send.side_effect
+            self.engine.send.side_effect = lambda sender, to, text, **k: {"sent": False} if to == "lane" else real(sender, to, text, **k)
+            self.go()
+            self.assertEqual([to for to, _ in self.sent], ["chief"])
+            self.engine.send.side_effect = real
+            self.engine.__dict__.pop("tip_watch")   # restart
+            self.go(wait=self.module.RETRY_SECONDS)
+            self.assertEqual([to for to, _ in self.sent], ["chief", "lane"])
 
         def test_a_red_head_with_no_pull_request_tells_the_chief_alone(self):
             self.add(2, "b" * 40, 0, ["unit tests"], age=30)

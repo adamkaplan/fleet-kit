@@ -91,7 +91,19 @@ def read_ledger(sb, engine):
 def write_ledger(sb, engine, heads):
     while len(heads) > LEDGER_MAX:
         del heads[min(heads, key=lambda k: heads[k]["ts"])]
-    sb._write_small(engine.state_dir, STATE_FILE, {"heads": heads})
+    sent = {h: {"failed": v["failed"], "to": sorted(v["to"])} for h, v in engine.__dict__.get("tip_watch", {}).get("sent", {}).items()}
+    sb._write_small(engine.state_dir, STATE_FILE, {"heads": heads, "sent": sent})
+
+
+def read_sent(sb, engine):
+    """{sha: {"failed": [names] or None, "to": set}}: the recipients already told of a head whose notice is not complete."""
+    raw = sb._read_small(engine.state_dir, STATE_FILE)
+    out = {}
+    for sha, v in ((raw.get("sent") if isinstance(raw, dict) else None) or {}).items():
+        if isinstance(sha, str) and SHA.fullmatch(sha) and isinstance(v, dict) and isinstance(v.get("to"), list):
+            f = v.get("failed")
+            out[sha] = {"failed": [str(n)[:200] for n in f[:200]] if isinstance(f, list) else None, "to": {str(t)[:100] for t in v["to"][:20]}}
+    return out
 
 
 def watched(sb, engine, repo):
@@ -108,7 +120,9 @@ def run_pass(sb, engine, now, calls):
     discovery = getattr(engine, "discovery", None)
     if discovery is None or discovery.problems:
         return 0
-    memory = engine.__dict__.setdefault("tip_watch", {"listed": {}, "runs": {}, "retry": {}, "said": set(), "sent": {}})
+    memory = engine.__dict__.setdefault("tip_watch", {"listed": {}, "runs": {}, "retry": {}, "said": set(), "sent": None})
+    if memory["sent"] is None:
+        memory["sent"] = read_sent(sb, engine)
     heads = read_ledger(sb, engine)
     before = {k: dict(v) for k, v in heads.items()}
     runner = getattr(engine, "gh_runner", None) or sb.subprocess.run
@@ -128,20 +142,23 @@ def run_pass(sb, engine, now, calls):
                 if repo not in memory["said"]:
                     memory["said"].add(repo)
                     engine.audit.append(engine.actor, "tip_watch.read_failed", repo, {"error": sb._one_line(str(err), 160)})
-        previous = None   # the failed jobs of the head before: None when unknown
+        previous = []   # the failed jobs of the head before
         known = True
+        unknown_red = False   # the head before was red and its jobs could not be read
         for began, head, run in newest_by_head(memory["runs"].get(repo)):
             if head in heads and heads[head].get("repo") in (repo, None):
-                previous, known = heads[head]["failed"], heads[head]["failed"] is not None
+                previous = heads[head]["failed"] or []
+                unknown_red = heads[head]["failed"] is None
+                known = not unknown_red
                 continue
             if run.get("status") != "completed":
                 break   # a run still going: the heads after it wait, so the order is kept
             conclusion = run.get("conclusion")
             if conclusion == "success":
                 heads[head] = {"ts": began, "failed": [], "noted": True, "repo": repo}
-                previous, known = [], True
+                previous, known, unknown_red = [], True, False
                 continue
-            if conclusion != "failure":   # cancelled, skipped, neutral: decides nothing
+            if conclusion in (None, "skipped", "cancelled", "neutral", "stale"):   # cancelled, skipped, neutral: decides nothing
                 continue
             if now < memory["retry"].get(head, 0):
                 break
@@ -153,7 +170,9 @@ def run_pass(sb, engine, now, calls):
                 try:
                     done = reader.json("repos/%s/actions/runs/%d/jobs?filter=latest&per_page=100" % (repo, run["id"]))
                     jobs = done.get("jobs") if isinstance(done, dict) else None
-                    failed = sorted({safe(j.get("name") or "", 200) for j in jobs if isinstance(j, dict) and j.get("conclusion") == "failure"} - {""}) if isinstance(jobs, list) else None
+                    failed = sorted({safe(j.get("name") or "", 200) for j in jobs if isinstance(j, dict) and j.get("conclusion") not in (None, "success", "skipped", "cancelled", "neutral")} - {""}) if isinstance(jobs, list) else None
+                    if failed == []:
+                        failed = None   # a red run with no readable failed job: unknown, never []
                 except Exception as err:
                     memory["retry"][head] = now + RETRY_SECONDS
                     if head not in memory["said"]:
@@ -166,18 +185,22 @@ def run_pass(sb, engine, now, calls):
             repeated = bool(known and previous)
             if repeated:
                 news = [n for n in news if n not in previous]
-            old = now - began > WAKE_WINDOW
-            if (repeated and failed is not None and not news) or old:
+            done_at = _epoch(run.get("updated_at"))
+            old = now - (done_at if done_at is not None else began) > WAKE_WINDOW
+            if (repeated and failed is not None and not news) or old or (unknown_red and failed is None):
                 heads[head] = {"ts": began, "failed": failed, "noted": True, "repo": repo}
-                previous, known = failed, failed is not None
+                previous, known, unknown_red = failed or [], failed is not None, failed is None
                 continue
             if not _tell(sb, engine, hub, discovery, memory, safe, repo, head, run, failed, news, repeated, now):
                 break
             heads[head] = {"ts": began, "failed": failed, "noted": True, "repo": repo}
-            previous, known = failed, failed is not None
+            previous, known, unknown_red = failed or [], failed is not None, failed is None
             before = _save(sb, engine, heads, before)
+    pruned = {h: v for h, v in memory["sent"].items() if h not in heads}
+    if len(pruned) != len(memory["sent"]):
+        memory["sent"] = pruned
+        before = {}
     _save(sb, engine, heads, before)
-    memory["sent"] = {h: v for h, v in memory["sent"].items() if h not in heads}
     return spent
 
 
@@ -207,6 +230,10 @@ def _tell(sb, engine, hub, discovery, memory, safe, repo, head, run, failed, new
             sent = False
         if sent:
             state["to"].add(to)
+            try:
+                write_ledger(sb, engine, read_ledger(sb, engine))   # the recipients told survive a restart
+            except OSError:
+                pass
         else:
             ok = False
     if not ok:
