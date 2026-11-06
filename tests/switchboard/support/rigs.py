@@ -19,9 +19,6 @@ def build_carry_repo(directory):
         target.write_text(text)
 
     g("init", "-q", "-b", "main")
-    g("config", "user.email", "dev@example.test")
-    g("config", "user.name", "Dev")
-    g("config", "commit.gpgsign", "false")
     write("README.md", "widget api\n")
     write("a.txt", "one\ntwo\nthree\nfour\nfive\nsix\nseven\n")
     write("src/x.py", "def x():\n    return 1\n")
