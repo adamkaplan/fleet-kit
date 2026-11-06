@@ -37,6 +37,7 @@ SEEN_MAX = 500
 EVIDENCE_MAX = 200
 REAPER_ID = "reaper"
 SLOW_WINDOW = 7200            # the reaper's slow passes of the last two hours say how late a stop may be
+GRACE_SECONDS = 600           # #2255: after its hard deadline a pod is lost only when it also shows no activity for this long: ten reaper passes (REAPER_INTERVAL_SECONDS is 60), room for a slow pass and a stop that lands late
 SLOW_MAX = 50                 # most slow passes kept
 SLOW_RE = re.compile(r"the pass took (\d{1,7}) seconds \(limit (\d{1,7})\)")
 
@@ -137,6 +138,7 @@ def _is_slow_line(item):
 def _fold(state, sb, lines, source):
     """Fold audit lines into the per-worker facts: created, stopped, reported, refused launches, reaper failures."""
     created, stop, report = state.setdefault("created", {}), state.setdefault("stop", {}), state.setdefault("report", {})
+    active = state.setdefault("active", {})   # #2255: name -> newest launcher action or push told for the pod
     for item, raw in lines:
         ts = sb.parse_iso(item.get("ts")) if isinstance(item.get("ts"), str) else None
         if ts is None:
@@ -145,6 +147,8 @@ def _fold(state, sb, lines, source):
             name, event, detail = item.get("subject"), item.get("event"), item.get("detail") if isinstance(item.get("detail"), dict) else {}
             if not isinstance(name, str) or not name:
                 continue
+            if event == "push_watch.sent" or event == "push_watch.quiet":
+                active[name] = max(ts, active.get(name, 0))
             if event == "cloud.created":
                 created[name] = {"at": ts, "deadline": sb.parse_iso(detail.get("hard_deadline")) if isinstance(detail.get("hard_deadline"), str) else None,
                                  "line": raw}
@@ -155,6 +159,8 @@ def _fold(state, sb, lines, source):
         else:
             name, action, ok = item.get("worker"), item.get("action"), item.get("ok")
             _note_slow(state, item, ts)
+            if isinstance(name, str) and name and item.get("runtime_id") != REAPER_ID:
+                active[name] = max(ts, active.get(name, 0))   # any launcher action for the pod: renew, nudge, note, stop
             if item.get("runtime_id") == REAPER_ID and ok in (True, False) and not _is_slow_line(item):
                 state.setdefault("reaper_new", []).append([ts, ok, _clean(item.get("reason") or action or "", 120)])   # settled by `_reaper` in this pass
             elif isinstance(name, str) and name and ok is True:
@@ -166,6 +172,8 @@ def _fold(state, sb, lines, source):
         gone = min(stop, key=lambda k: stop[k])
         stop.pop(gone)
         created.pop(gone, None)
+    while len(active) > SEEN_MAX:
+        active.pop(min(active, key=lambda k: active[k]))
     for table in ("created", "stop", "report", "refused"):
         data = state.get(table, {})
         while len(data) > SEEN_MAX:
@@ -255,6 +263,7 @@ _CLEANERS = {
     "created": _table(lambda v: isinstance(v, dict) and _num(v.get("at")) and (v.get("deadline") is None or _num(v.get("deadline"))) and _is_text(v.get("line"))),
     "stop": _table(_num),
     "report": _table(_num),
+    "active": _table(_num),
     "refused": _table(lambda v: isinstance(v, dict) and _is_text(v.get("name")) and _num(v.get("at")) and _is_text(v.get("line"))),
     "seen": _table(lambda v: isinstance(v, dict) and _num(v.get("at")) and _is_text(v.get("ask")) and (v.get("lane") is None or _is_text(v.get("lane")))),
     "gone": _table(_num),
@@ -356,9 +365,13 @@ def _losses(state, sb, engine, alive, now, records):
             continue
         if state.get("stop", {}).get(name, 0) >= c["at"] or state.get("report", {}).get(name, 0) >= c["at"]:
             continue
+        seen = state.get("active", {}).get(name, 0)
+        newest = max(c["at"], seen)   # #2255: the newest of the launch, a launcher action and a push
+        if now - deadline < GRACE_SECONDS or (seen > c["at"] and now - seen < GRACE_SECONDS):
+            continue   # within the grace, or active in it: not lost (a stop within it ends the pod)
         record = records.get(name, {})
         loss = {"key": "pod_no_stop:%s:%s" % (name, c["at"]), "kind": "pod_no_stop", "name": name, "ask": _ask_of(name, record),
-                "at": c["at"], "lane": record.get("reports_to"), "line": c["line"]}
+                "at": newest, "lane": record.get("reports_to"), "line": c["line"]}
         if now - deadline < longest:
             # late, not lost: a stop can run one reaper pass late. Its own key; ask "-" so it adds nothing to the ask's earlier-lost count.
             loss.update(key="pod_late:%s:%s" % (name, c["at"]), ask="-", text="[lost worker] %s (ask %s) late, not lost: the reaper's last pass took %d seconds; its hard deadline passed %s." % (
