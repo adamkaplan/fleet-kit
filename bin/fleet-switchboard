@@ -524,6 +524,37 @@ def state_dir_path(guard=True):
     return refuse_real_location(path, "state") if guard else path
 
 
+def github_audited(resolve, ok_of=None, refused=None):
+    """(#2260) The decorator of a function that makes ONE GitHub write: the audit line is written by `github_write` (switchboard/audit.py) before the function runs, and its outcome after;
+    when the line cannot be written the function does not run. `resolve(*args, **kwargs)` returns (audit or None, actor, verb, endpoint, repo, number) or None for a call that is no write
+    (a GET). `ok_of(result)` says whether a returned value is a success (a call that raises is a failure). `refused(err, *args, **kwargs)` returns the function's own failure value for
+    a refusal (default: the refusal is raised)."""
+    def wrap(fn):
+        @functools.wraps(fn)
+        def inner(*args, **kwargs):
+            known = resolve(*args, **kwargs)
+            if known is None:
+                return fn(*args, **kwargs)
+            try:
+                guard = github_write(*known)
+                outcome = guard.__enter__()
+            except GithubAuditRefused as err:
+                if refused is None:
+                    raise
+                return refused(err, *args, **kwargs)
+            try:
+                result = fn(*args, **kwargs)
+            except BaseException as err:
+                if not guard.__exit__(type(err), err, err.__traceback__):
+                    raise
+                raise
+            outcome["ok"] = True if ok_of is None else bool(ok_of(result))
+            guard.__exit__(None, None, None)
+            return result
+        return inner
+    return wrap
+
+
 RETIRE_IDLE_MIN, RETIRE_IDLE_MAX = 1, 10080   # minutes: `retire_idle_minutes` is a finite number in this range (a week at most)
 
 
@@ -18359,6 +18390,30 @@ def add_merge_gate_parsers(sub):
     gate.add_argument("--json", action="store_true")
 
 
+def gate_write_shape(argv):
+    """(#2260) (verb, endpoint) of a gh argv that writes, for its audit line: a `gh api` call's method (-X or --method, as one word or joined: -XPATCH, --method=PATCH; else POST) and path; any other write's own two words (`pr merge`). Never a field or an input."""
+    args = list(argv)
+    if args[:1] == ["api"]:
+        verb = "POST"
+        for i, a in enumerate(args):
+            if a in ("-X", "--method") and i + 1 < len(args):
+                verb = args[i + 1]
+            elif a.startswith("--method="):
+                verb = a[len("--method="):]
+            elif a.startswith("-X") and len(a) > 2:
+                verb = a[2:]
+        return verb, next((a for a in args[1:] if not a.startswith("-") and "/" in a), "api")
+    return args[0].upper() if len(args) < 2 else args[1].upper(), " ".join(args[:2])
+
+
+def gate_write_number(argv):
+    """(#2260) The pull request or issue number a gh write names: the number of `pr merge N`, or of `repos/R/pulls/N` (None when it names none)."""
+    args = list(argv)
+    if args[:1] == ["api"]:
+        return None
+    return int(args[2]) if len(args) > 2 and args[2].isdigit() else None
+
+
 def merge_gate_gh(config, runner, repo):
     """`gh(argv, own=True) -> (code, stdout, stderr)` for `repo`'s account, never raising; every call runs the real gh by its resolved path (own_gh_path, config['gh']), so it never reaches the shim,
     EXCEPT with `own=False` (the one merge call of `--pass --merge`): that call goes through the gh as configured (`gh_by_name`: the shim where PATH finds it), so the shim's own checks (the review check among them) run."""
@@ -18371,6 +18426,8 @@ def merge_gate_gh(config, runner, repo):
     env = dict(env if env is not None else os.environ)
     env.pop(OWN_GH_ENV, None)   # no marker: the real gh is reached by its path (own_gh_path), not through the shim
 
+    @github_audited(lambda argv, own=True: None if gate_read_only([config["gh"]] + list(argv)) else (github_state_audit(), "cli") + gate_write_shape(argv) + (repo, gate_write_number(argv)),
+                    ok_of=lambda result: result[0] == 0, refused=lambda err, *a, **k: (1, "", str(err)))
     def gh(argv, own=True):
         try:
             done = runner([config["gh"] if own else config.get("gh_by_name", config["gh"])] + argv, capture_output=True, text=True, timeout=config["call_timeout_seconds"], stdin=subprocess.DEVNULL,
@@ -19718,6 +19775,8 @@ def _review_caller(runner, now):
     return kind[1]
 
 
+@github_audited(lambda engine, runner, now, repo, path, method=None, *a, **k: None if method is None else (engine.audit, engine.actor, method, path, repo, None),
+                ok_of=lambda result: result[0], refused=lambda err, *a, **k: (False, None, str(err)))
 def _review_api(engine, runner, now, repo, path, method=None, payload=None, fresh=False):
     """(ok, parsed or None, one-line detail) of ONE `gh api` call with the repository's own account (a GET unless `method`). `fresh` runs the GET straight through the runner: never the conditional-read cache."""
     config = engine.config
@@ -23132,6 +23191,7 @@ class OrdersFacts:
                     orders=True)
 
 
+@github_audited(lambda reader, repo, number, body: (github_state_audit(), "cli", "PATCH", "repos/%s/issues/%d" % (repo, number), repo, number))
 def write_issue_body(reader, repo, number, body):
     """The one writer of an issue's body: `gh api repos/R/issues/N --method PATCH --input -` with
     {"body": ...} as its input and nothing else, through the reader's injected runner. IntentError when
@@ -23578,6 +23638,7 @@ class DecisionError(Exception):
 GH_ERROR_MAX = 1 << 20   # characters of a failed gh call's own text kept in its error: the audit line's own physical bound
 
 
+@github_audited(lambda engine, runner, repo, path, method, *a, **k: None if str(method).upper() == "GET" else (engine.audit, engine.actor, method, path, repo, None))
 def _gh_write(engine, runner, repo, path, method, data=None, tolerate_missing=False):
     """One write through gh with the repo's own account, its token only in the child's environment. The
     configured `gh`, `gh api <path> --method M [--input -]`. IntentError when it fails (a 404 is quiet when

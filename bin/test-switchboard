@@ -17675,7 +17675,7 @@ class TestHandoff(HandoffCase):
     def test_the_record_comes_before_the_launch_and_every_write_is_audited(self):
         self.main()
         self.assertLess(self.order.index("gh"), self.order.index("session.create"))
-        events = [(e["event"], e["phase"]) for e in self.world.audit() if e["event"].startswith(("github.", "v2.session"))]
+        events = [(e["event"], e["phase"]) for e in self.world.audit() if e["event"].startswith(("github.", "v2.session")) and e["event"] != "github.write"]   # #2260: the helper's own line is proved by TestGithubWriteAudit
         self.assertEqual(events[:2], [("github.comment", "intent"), ("github.comment", "result")])
         comment = [e for e in self.world.audit() if e["event"] == "github.comment"]
         self.assertEqual(comment[0]["detail"]["issue"], 2)
@@ -17779,6 +17779,7 @@ class TestHandoff(HandoffCase):
         # the handoff comment, (PR 17) `write_issue_body` and (PR 18) `_gh_write`: labels and comments
         # (#1123) plus ONE site in `_review_api`, the shared helper of `review post` and `review dismiss`: their writes (a review, a dismissal) are deliberate and the only ones added;
         # the reader code (IntentReader, checked above, and checkout/measure) stays read-only
+        # #2260: no count of write sites is pinned; TestGithubWriteAudit finds each write by its shape and requires it to go through the audit helper
         # the sites are named by where they live, not counted: a new file that writes has to be named here on purpose (`comment --edit`, #1714, is the signed edit of one's own comment: agents_verify.gh_call)
         holders = sorted(p.name for p in SWITCHBOARD_SOURCE_FILES if '"--method"' in p.read_text())
         self.assertEqual(holders, ["agents_verify.py", "fleet-switchboard", "handoff.py"])
@@ -66960,6 +66961,7 @@ _architecture = importlib.import_module("test_architecture")
 TestArchitectureDocument, TestArchitectureDocumentFailurePaths = _architecture.TestArchitectureDocument, _architecture.TestArchitectureDocumentFailurePaths
 _approval_gate = importlib.import_module("test_approval_gate"); _approval_gate.HOST = sys.modules[__name__]; TestApprovalGateReader, TestApprovalGateCommands, TestApprovalPair = _approval_gate.TestApprovalGateReader, _approval_gate.TestApprovalGateCommands, _approval_gate.TestApprovalPair   # #1735
 TestSharesDeadVerdict = importlib.import_module("test_dead_verdict").TestSharesDeadVerdict   # #1668
+_github_write_audit = importlib.import_module("test_github_write_audit"); _github_write_audit.HOST = sys.modules[__name__]; TestGithubWriteAudit, TestGithubWriteGuard = _github_write_audit.TestGithubWriteAudit, _github_write_audit.TestGithubWriteGuard   # #2260
 # The closure test (ask #1092, slice S13) is run the same way: the clear's closure follows the parts (tools/derive-closure).
 _closure = importlib.import_module("test_closure")
 TestDerivedClosure, TestRefusalInAPart, TestMovingADefinition, TestTheDerivationIsHeld = _closure.TestDerivedClosure, _closure.TestRefusalInAPart, _closure.TestMovingADefinition, _closure.TestTheDerivationIsHeld

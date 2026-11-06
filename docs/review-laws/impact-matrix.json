@@ -606,7 +606,11 @@
         ],
         "bin/switchboard/audit.py": [
           "AuditLog",
+          "GithubAuditRefused",
           "_sensitive",
+          "github_state_audit",
+          "github_write",
+          "github_write_subject",
           "redact",
           "utc_now"
         ],
