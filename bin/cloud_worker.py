@@ -559,7 +559,7 @@ CLUSTER_NAMES = (
     "VAULT_LOCK_POLL", "VAULT_OWNER", "MAX_TOKEN_SECONDS", "HANDLED_SIGNALS", "TOKEN_CMD_SECONDS", "CLUSTER_DROP", "POD_RE", "MODEL_PROVIDER", "_LIB",
     "_lib", "_scrub_lib", "use_settings", "_OWNER_RE", "_NAME_RE", "_repo_key", "check_allowed", "_capture", "_jwt_lifetime", "_duration",
     "firewall_refused", "VaultRecovery", "_token_refusal", "cluster_token", "_cluster_token_bounded", "private_root", "_ps", "stop_recorded_tunnels",
-    "sweep_stale", "Cluster", "tunnel",
+    "sweep_stale", "Cluster", "tunnel", "_audit_model_nondefault",
     "unknown_report_to",
     "check_report_to",
 )
@@ -729,7 +729,7 @@ def _launch(args, runner, now, reserve):
         raise LaunchError("--cloud needs --repo OWNER/REPO and --branch BRANCH")
     if not re.fullmatch(r"[A-Za-z0-9._/-]{1,200}", branch) or branch.startswith("-"):
         raise LaunchError("--branch is not a branch name: %r" % branch)
-    choice = H["launch_model_cloud"](args, MODEL_PROVIDER) if (getattr(args, "model", None) is not None or getattr(args, "reasoning", None) is not None) else {}   # #1642: before any setting, token or cluster call
+    choice = H["launch_model_cloud"](args, MODEL_PROVIDER, _audit_model_nondefault)   # #1642: before any setting, token or cluster call
     source = use_settings()   # before any setting is read: the allow-list, the preflight and the launcher all read this one source
     print("%s: cloud settings from %s" % (H["PROG"], source), file=sys.stderr)
     issue = getattr(args, "issue", None)

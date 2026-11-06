@@ -291,6 +291,18 @@ def _audit_refused_preflight(name, err):
         pass
 
 
+def _audit_model_nondefault(worker, model, level):
+    """ONE line in the launcher's own audit file (action model-nondefault) for a launch whose model or level is not the default. Never raises."""
+    try:
+        lib = _lib()
+        import pwd
+        lib.write_audit(lib.audit_path(os.environ), {"ts": lib.iso(datetime.datetime.now(datetime.timezone.utc)), "worker": worker, "runtime_id": "",
+                                                     "action": "model-nondefault", "cost_estimate_usd": 0.0, "ok": True, "model": model, "level": level or "",
+                                                     "actor": pwd.getpwuid(os.getuid()).pw_name})
+    except Exception:
+        pass
+
+
 def _read_password(read_fd):
     chunks = b""
     while len(chunks) <= D["PASSWORD_MAX"] + 1:

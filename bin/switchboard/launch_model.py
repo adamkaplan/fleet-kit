@@ -72,16 +72,23 @@ def launch_model_note(fleet):
     return "  model %s%s" % (model, " reasoning %s" % level if level else "") if isinstance(model, str) else ""
 
 
-def launch_model_cloud(args, provider):
+CLOUD_DEFAULT_MODEL, CLOUD_DEFAULT_LEVEL = "github-copilot/claude-sonnet-5.5", "medium"   # a non-orchestrator cloud launch with no --model
+
+
+def launch_model_cloud(args, provider, audit=None):
     """The choice of a cloud launch ({} when none): the same shape rules as a local launch, and a model of another provider than the launcher's `provider`
-    is refused with one line (the pod holds that provider's credentials only). The level is NOT checked here: the pod's own model list decides, on session.create."""
+    is refused with one line (the pod holds that provider's credentials only). The level is NOT checked here: the pod's own model list decides, on session.create.
+    A non-orchestrator launch with no --model gets CLOUD_DEFAULT_MODEL at CLOUD_DEFAULT_LEVEL; an orchestrator launch without options stays {}. Any launch whose
+    model or level is not that default calls `audit(worker, model, level)` once (the launcher's audit line `model-nondefault`)."""
     model, level = getattr(args, "model", None), getattr(args, "reasoning", None)
     if model is None and level is None:
-        return {}
+        return {} if getattr(args, "agent", None) == "orchestrator" else {"model": CLOUD_DEFAULT_MODEL, "reasoning": CLOUD_DEFAULT_LEVEL}
     if model is None:
         raise LaunchError("--reasoning needs --model PROVIDER/MODEL: the level is one of that model's own levels; add --model or drop --reasoning")
     choice = launch_model_syntax(model, level)
     if model.partition("/")[0] != provider:
         raise LaunchError("refused: --model PROVIDER/MODEL: a cloud worker holds credentials for the provider %s only (a model of another provider needs the provider "
                           "credential work, #1085): use a %s model or launch locally" % (provider, provider))
+    if audit is not None and (model, level) != (CLOUD_DEFAULT_MODEL, CLOUD_DEFAULT_LEVEL):
+        audit(getattr(args, "name", None), model, level)
     return choice
