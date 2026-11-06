@@ -23,15 +23,19 @@ from support.wire_fakes import FAKE_HERDR, FAKE_OPENCODE
 
 
 def _host():
-    """The runner's module (bin/test-switchboard): the discovery imports this file while the runner is loading, so the host is found by its file name, as the loader lines of the other files hand it over."""
+    """The runner's module (bin/test-switchboard): the discovery imports this file while the runner is loading, so the host is found by its file name, as the loader lines of the other files hand it over.
+    None when the file is imported alone: the daemon tests then skip, the pure ones still run."""
     for module in list(sys.modules.values()):
         if str(getattr(module, "__file__", "") or "").endswith("test-switchboard") and hasattr(module, "TestClearCarryInTheDaemon"):
             return module
-    raise ImportError("the test-switchboard runner is not loaded")
+    return None
 
 
 HOST = _host()
-TestClearCarryInTheDaemon = HOST.TestClearCarryInTheDaemon
+if HOST is not None:
+    TestClearCarryInTheDaemon = HOST.TestClearCarryInTheDaemon
+else:   # imported alone: only the names the daemon tests read at definition time, so the file imports; the class is skipped
+    TestClearCarryInTheDaemon = type("_HostClearCarry", (Base,), {"REPO": "acme-org/widget-api", "PR": "acme-org/widget-api#7", **{n: None for n in ("route", "events", "adds", "clear", "hold")}})
 
 
 class BatchOverGit(GitHubOverGit):
@@ -404,6 +408,7 @@ class TestBatchCarry(unittest.TestCase):
         self.assertEqual([m["number"] for m in members], [11, 11], "the mutant without the check lists the member twice")
 
 
+@unittest.skipIf(HOST is None, "runs under bin/test-switchboard, which holds the daemon fixtures of TestClearCarryInTheDaemon")
 class TestBatchCarryInTheDaemon(Base):
     """(#955) In the daemon: one audit line per batch head, no label, every reader of "is it held" agrees, the owner's revoke takes it back for good, and a new head is judged afresh."""
 
