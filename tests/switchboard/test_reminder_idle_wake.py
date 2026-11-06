@@ -39,28 +39,44 @@ def build(PR4Base):
             return {"first": sb.add_reminder(self.world.state, "w-idle", now + 10, now - 600, "roll the build")["id"],
                     "second": sb.add_reminder(self.world.state, "w-idle", now + 250, now - 600, "check the roll")["id"]}
 
-        def test_repro_idle(self):
-            due = self.two_due()
-            print("IDLE", self.run_passes(40, due))
-            print([e["detail"] for e in self.world.audit() if e["event"] in ("reminder.ceiling", "reminder.waiting", "v2.synthetic") and e.get("subject") == "w-idle"])
+        def deliveries(self):
+            return [e["detail"] for e in self.world.audit() if e["event"] == "v2.synthetic" and e.get("subject") == "w-idle" and "keys" in e["detail"]]
 
-        def test_repro_stale(self):
-            self.stale()
-            due = self.two_due()
-            print("STALE", self.run_passes(40, due))
-            print([e["detail"] for e in self.world.audit() if e["event"] in ("reminder.ceiling", "reminder.waiting", "v2.synthetic") and e.get("subject") == "w-idle"])
-        def test_repro_stale_late(self):
+        def test_s2_idle_lane_reminders_delivered_in_the_next_pass(self):
+            found = self.run_passes(40, self.two_due())
+            self.assertEqual(sorted(found), ["first", "second"])
+            self.assertLessEqual(found["first"], 1)
+            self.assertLessEqual(found["second"], 250 // PASS + 1)
+
+        def test_s3_ceiling_wake_delivery_starts_a_turn(self):
             self.stale()
             now = self.world.clock.now()
-            due = {"a": sb.add_reminder(self.world.state, "w-idle", now - 700, now - 3600, "roll the build")["id"]}
-            print("STALELATE", self.run_passes(5, due))
-            print([e["detail"] for e in self.world.audit() if e["event"] in ("reminder.ceiling", "reminder.waiting", "v2.synthetic") and e.get("subject") == "w-idle"])
+            sb.add_reminder(self.world.state, "w-idle", now - 700, now - 3600, "roll the build")
+            self.run_passes(1, {})
+            events = [e for e in self.world.audit() if e.get("subject") == "w-idle"]
+            self.assertTrue([e for e in events if e["event"] == "reminder.ceiling"])
+            sent = self.deliveries()
+            self.assertEqual(len(sent), 1)
+            self.assertFalse(sent[0]["in_turn"])
+            self.assertEqual(sent[0]["delivery"], "queue")
+            self.assertTrue(sent[0]["resume"])
+            self.assertFalse(sent[0].get("busy"))
 
-        def test_repro_engaged(self):
-            self.world.you("w-idle"); self.world.tick(1000)
-            self.world.v2.advance()
-            print("STATUS", self.world.herdr.status(self.world.panes["w-idle"]))
-            due = self.two_due()
-            print("ENGAGED", self.run_passes(40, due))
-            print([e["detail"] for e in self.world.audit() if e["event"] in ("reminder.ceiling", "reminder.waiting", "v2.synthetic") and e.get("subject") == "w-idle"])
+        def test_s4_stale_working_reminders_are_a_new_turn(self):
+            self.stale()
+            self.run_passes(40, self.two_due())
+            sent = self.deliveries()
+            self.assertEqual(len(sent), 2)
+            self.assertEqual([d["in_turn"] for d in sent], [False, False])
+            self.assertEqual([d["delivery"] for d in sent], ["queue", "queue"])
+
+        def test_real_turn_keeps_queue(self):
+            self.world.v2.start_turn(self.world.sessions["w-idle"], "work", fleet=False, lasts=10 ** 7)
+            self.stale()
+            now = self.world.clock.now()
+            sb.add_reminder(self.world.state, "w-idle", now - 5, now - 60, "roll the build")
+            self.run_passes(1, {})
+            sent = self.deliveries()
+            self.assertEqual(len(sent), 1)
+            self.assertTrue(sent[0]["in_turn"])
     return TestReminderIdleWake
