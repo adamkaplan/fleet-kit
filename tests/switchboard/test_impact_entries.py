@@ -40,6 +40,11 @@ class TestImpactEntriesLoader(unittest.TestCase):
         force = after["owner_hold"]["floor"]["adamkaplan/fleet-kit"]["force"]   # the one deliberate addition: the entry directory is protected from the matrix file
         self.assertIn("docs/review-laws/impact-entries/**", force)
         force.remove("docs/review-laws/impact-entries/**")
+        for part, roots in before["owner_hold"]["delegated_clear"]["module_roots"].items():   # a part's closure roots may grow (a new definition, e.g. #2244 stale_working), never lose one
+            now = after["owner_hold"]["delegated_clear"]["module_roots"][part]
+            self.assertEqual(sorted(set(roots) - set(now)), [], "a closure root of %s was dropped" % part)
+            self.assertEqual(len(now), len(set(now)), "a duplicate root in %s" % part)
+            after["owner_hold"]["delegated_clear"]["module_roots"][part] = roots
         for keys in self.MOVED:   # blank the moved lists, the rest must be identical
             for tree in (before, after):
                 box = self.at(tree, keys[:-1])
