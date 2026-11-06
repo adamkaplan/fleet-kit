@@ -1721,7 +1721,7 @@ def _make_bind(make_guard):
 
     def bind(namespace, check):
         """Rebind every moved function to `namespace`, install it there under its own name, and return the names bound; the effects are built around `check`."""
-        if any(done is namespace for done in bound):
+        if any(done is namespace for done in bound) or any(getattr(namespace.get(name), "_impact_hold_bound", None) is namespace for name in MOVED):   # the second test outlives a reload of this module (its `bound` list is then a new, empty one): the namespace's own functions say it was bound (they name THIS namespace, never a copy of it)
             raise RuntimeError("impact_hold is already bound to this namespace: a second bind is refused")
         bound.append(namespace)
         if not callable(check):
@@ -1733,6 +1733,7 @@ def _make_bind(make_guard):
             function = rebuilt(original.__wrapped__ if guards else original, namespace)
             if guards:   # the refusal is the namespace's own copy (it names PROG and sys there)
                 function = rebuilt(guard(guards[0], namespace[guards[1].__name__])(function), namespace)
+            function._impact_hold_bound = namespace   # the namespace itself, so a copy of its dict is not 'bound'
             namespace[name] = function
         return MOVED
     return bind

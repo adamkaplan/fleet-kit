@@ -1182,6 +1182,19 @@ def _body():
             self.assertEqual(deletes, [])
             self.assertEqual(code, 1)
 
+        def test_a_bind_after_a_reload_of_the_module_is_still_refused(self):
+            """The cause of the CI reds (#2247): a test that loads another copy of the entry replaces `sys.modules['impact_hold']`, so `load_module` built a NEW module whose `bound` list was empty and `bind(ns, permissive)` ran. The namespace's own functions now say it is bound, whatever module asks."""
+            import importlib.util
+            held = sys.modules.get("impact_hold")
+            spec = importlib.util.spec_from_file_location("impact_hold", str(BIN / "impact_hold.py"))
+            fresh = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(fresh)
+            self.assertIsNot(fresh, held)
+            originals = {name: getattr(sb, name) for name in self.EFFECTS}
+            self.assertEqual(self.outcome(lambda: fresh.bind(sb.__dict__, lambda: False)), "refused")
+            for name in self.EFFECTS:
+                self.assertIs(getattr(sb, name), originals[name])
+
         def effect_args(self, name):
             """the arguments of one real call of the effect `name`, by parameter name"""
             clear = sb.private_parser().parse_known_args(["impact", "clear", self.PR, "--under-order", "17", "--reason", "the review confirms nothing touches credentials nor identity"])[0]
