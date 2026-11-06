@@ -244,6 +244,7 @@ fleet-switchboard launch coder7 --cloud --stack --agent coder --repo acme-org/wi
 - Protection on the default branch (pull request or merge queue, no force-push, no deletion) is what stops it merging or rewriting
   history; the preflight only checks that this protection exists.
 - It holds no cluster credential and no other model provider entry.
+- A cloud pod records a proof or a verdict with `cw-cloud relay prove|verdict` when the hub has the lane (otherwise the command says so), not with `prove` or `verdict` of a clone; `prove` and `verdict` of a clone refuse in a pod with one line naming that command.
 - It ends at its idle or hard deadline whether or not anyone retires it.
 
 ## 4b. The reaper runs by itself (opt-in)

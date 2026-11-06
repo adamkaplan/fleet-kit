@@ -15603,6 +15603,8 @@ def cmd_prove(args, runner, now):
     reason (stderr), then ONE final line (#1049): `recorded #<id> ...`, `already recorded #<id> ...` or, when any was refused, `not recorded: ...`.
     Exit 0 when every named scenario is recorded; EXIT_PARTIAL when any was refused. What applies to the whole
     command (no plan, a failing plan check, no caller, no evidence, an unknown head) stays a usage error: nothing is recorded."""
+    if os.environ.get("CW_WORKER"):   # #1875: a cloud pod records through the hub relay, first, before any configuration read
+        raise LedgerCommandError("prove is not run from a cloud pod: record it with `cw-cloud relay prove`")
     ctx = _ledger_context(args, runner, now, True)
     record_step("the agent registry (who is calling)")
     caller = identify_caller(ctx.engine.herdr, ctx.engine.v2, os.environ)
@@ -15686,6 +15688,8 @@ def cmd_verdict(args, runner, now):
     """`verdict <scenario> --pr <repo#N> --as <evaluator> --result ...`: record the evaluator's verdict for a scenario. Only
     the evaluator the scenario names, only by an agent registered for it (`plan_evaluators`), never by a writer of the PR.
     It ends with one line (#1049): `recorded #<id> ...`, `already recorded #<id> ...` (the same record again writes nothing) or `not recorded: <reason>`."""
+    if os.environ.get("CW_WORKER"):   # #1875: a cloud pod records through the hub relay, first, before any configuration read
+        raise LedgerCommandError("verdict is not run from a cloud pod: record it with `cw-cloud relay verdict`")
     ctx = _ledger_context(args, runner, now, True)
     every = bool(getattr(args, "all_scenarios", False))
     if every:   # `--all`: every per-PR scenario this evaluator judges, in one command; never another evaluator's
