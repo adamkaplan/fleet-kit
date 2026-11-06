@@ -132,6 +132,7 @@ cloud/worker/tests/test_pod_inspect.py
 cloud/worker/tests/test_pr_branch_source.py
 cloud/worker/tests/test_pr_edit.py
 cloud/worker/tests/test_pr_edit_hardening.py
+cloud/worker/tests/test_pr_label.py
 cloud/worker/tests/test_pr_record.py
 cloud/worker/tests/test_push_rules.py
 cloud/worker/tests/test_question_denied.py

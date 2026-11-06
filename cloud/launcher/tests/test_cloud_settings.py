@@ -25,6 +25,7 @@ OPTIONAL_SAMPLES = {"CW_TOOLING_REPO": "acme-org/tooling", "CW_CLOUD_CA_FILE": "
                     "CW_STACK_PULL_TENANT_ID": "66666666-7777-8888-9999-000000000000", "CW_MAX_PERSISTENT": "3"}
 OPTIONAL_SAMPLES["CW_FINAL_NOTE_MINUTES"] = "10"   # ask #1757: the final note's minutes
 OPTIONAL_SAMPLES["CW_REPO_MIN_SHAPE"] = "acme-org/widget-service=S"
+OPTIONAL_SAMPLES["CW_READONLY_ROOT_LANES"] = "lane-a,lane-b"
 SAMPLES = {   # one value per secret shape (built here, never a real secret)
     "a JWT": "eyJhbGciOiJIUzI1" + "." + "eyJzdWIiOiJ4eHh4",
     "a PEM header": "-----BEGIN " + "PRIVATE KEY-----",
@@ -68,6 +69,7 @@ HOSTILE = {   # per key: values that must be refused (each through the REAL pars
     "CW_CLUSTER_TOKEN_CMD": ["-x"], "CW_CLUSTER_ADMIN_CMD": ["--x"], "CW_GIT_TOKEN_CMD": ["-x"], "CW_APP_ID_CMD": ["-x"],
     "CW_APP_INSTALLATION_CMD": ["-x"], "CW_APP_KEY_CMD": ["-x"],
     "CW_VAULT_CHECK_DIR": ["check", "/a/../b", "-x"],
+    "CW_READONLY_ROOT_LANES": ["Lane", "a/b", "lane;x", "-lane", "a,,b!"],
     "CW_REPO_MIN_SHAPE": ["acme-org/widget-service", "acme-org/widget-service=L", "widget-service=S", "acme-org/a=S,ACME-ORG/A=M"],
     "CW_STACK_REGISTRY": ["https://acme-registry.azurecr.io", "acme-registry.azurecr.io/x", "acme-registry.azurecr.io:443", "10.0.0.1", "azurecr.io", "acme-registry",
                           "acme.example.com", "-acme.azurecr.io", "Acme.azurecr.io", "user@acme.azurecr.io", "ghp_" + "A1b2C3d4E5f6G7h8.azurecr.io", "0x7f000001"],
