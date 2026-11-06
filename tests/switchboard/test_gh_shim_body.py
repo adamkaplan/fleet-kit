@@ -7,9 +7,11 @@ text of the files it was handed). Reads never reach the write log. Fakes only: n
 import importlib.util
 import itertools
 import json
+import pathlib
 import subprocess
 import sys
 import unittest
+import unittest.mock
 
 from test_gh_shim_sign import REPO, SHIM_DIR, Rig
 
@@ -195,7 +197,7 @@ class TestGhBodyMutants(unittest.TestCase):
     MUTANTS = (("gh", "the guard is not called", "or body_probe(args, gh, write, lookup)", "or None", "not refused"),
                ("gh_body.py", "only the Intent heading is compared", "return bool(HEAD_RE.search(body)) and bool(DONE_RE.search(body))",
                 "return bool(HEAD_RE.search(body))", "not refused: --body without a part"),
-               ("gh_body.py", "a failed read is read as a body with no parts", "    if data is None:\n        return UNREAD\n",
+               ("gh_body.py", "a failed read is read as a body with no parts", "    if data is None:\n        return UNREAD_WHY % (probe.why or \"no reason given\")\n",
                 "    if data is None:\n        return None\n", "an unreadable current body passed"))
 
     def run_with(self, name, source):
@@ -211,6 +213,76 @@ class TestGhBodyMutants(unittest.TestCase):
                 self.assertEqual(source.count(old), 1, label)
                 failures = self.run_with(name, source.replace(old, new, 1))
                 self.assertTrue(any(text in f for f in failures), (label, failures))
+
+
+class TestGhBodyReadHasItsOwnClock(unittest.TestCase):
+    """#2256: the body read's time limit is counted from the read; a failed read names its reason."""
+    OLD_TEXT = "could not be read, or is empty"
+
+    def setUp(self):
+        import os
+        import tempfile
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.gh = os.path.join(self.dir.name, "gh")
+        self.env = {"FLEET_SHIM_HOLD_SECONDS": "0.5"}
+        self.patch = unittest.mock.patch.dict(os.environ, self.env)
+        self.patch.start()
+        self.addCleanup(self.patch.stop)
+
+    def fake(self, body):
+        with open(self.gh, "w") as handle:
+            handle.write("#!/bin/sh\n" + body + "\n")
+        import os
+        os.chmod(self.gh, 0o755)
+
+    def check(self, module, spend=0.0):
+        import time
+        probe = module.Probe(self.gh, lambda: None, None)
+        time.sleep(spend)
+        return module.check_current(probe, ["issue", "view", "1", "--json", "body"], "no parts here\n")
+
+    def test_S2_earlier_work_that_spends_the_limit_does_not_stop_the_read(self):
+        self.fake("cat <<'EOF'\n" + json.dumps({"body": BOTH}) + "\nEOF")
+        got = self.check(load_module(), spend=0.6)
+        self.assertEqual(sum(1 for _ in [got] if got and self.OLD_TEXT in got), 0, got)
+        self.assertIn("would drop the Intent", got)   # the edit was checked
+
+    def test_S2_control_today_s_code_refuses_with_the_old_text(self):
+        import subprocess as sp
+        source = sp.run(["git", "show", "origin/integration:shims/gh_body.py"], cwd=str(REPO), capture_output=True, text=True, check=True).stdout
+        path = pathlib.Path(self.dir.name) / "old_gh_body.py"
+        path.write_text(source)
+        self.fake("cat <<'EOF'\n" + json.dumps({"body": BOTH}) + "\nEOF")
+        got = self.check(load_module(path), spend=0.6)
+        self.assertIn(self.OLD_TEXT, got)
+
+    def test_S3_a_failed_read_names_its_reason(self):
+        module = load_module()
+        cases = (("sleep 5", "timed out"), ("exit 3", "status 3"), ("echo not json", "not JSON"), ("echo '[1]'", "not a JSON object"))
+        unnamed = 0
+        for script, reason in cases:
+            with self.subTest(reason=reason):
+                self.fake(script)
+                os_env = unittest.mock.patch.dict("os.environ", {"FLEET_SHIM_HOLD_SECONDS": "0.3"})
+                with os_env:
+                    got = self.check(module)
+                self.assertIn(reason, got)
+                self.assertNotIn(self.OLD_TEXT, got)
+                unnamed += 0 if reason in got else 1
+        self.assertEqual(unnamed, 0)
+
+    def test_command_budget_caps_three_hanging_targets(self):
+        import time
+        module = load_module()
+        self.fake("sleep 5")
+        probe = module.Probe(self.gh, lambda: None, None)   # limit 0.5 s per read, 1.5 s per command
+        started = time.monotonic()
+        got = [module.check_current(probe, ["issue", "view", t, "--json", "body"], "x\n") for t in "123"]
+        got.append(module.check_current(probe, ["issue", "view", "4", "--json", "body"], "x\n"))
+        self.assertLess(time.monotonic() - started, 2.5)
+        self.assertTrue(all(g and "timed out" in g or "read budget is spent" in g for g in got), got)
+        self.assertIn("the command's read budget is spent", got[3])
 
 
 if __name__ == "__main__":
