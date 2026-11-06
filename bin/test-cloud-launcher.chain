@@ -61,7 +61,6 @@ cloud/launcher/tests/test_model_credential.py
 cloud/launcher/tests/test_needs_docker_hermetic.py
 cloud/launcher/tests/test_no_commit_mark.py
 cloud/launcher/tests/test_no_open_files.py
-cloud/launcher/tests/test_nudge_reused.py
 cloud/launcher/tests/test_orchestrator_agent.py
 cloud/launcher/tests/test_orchestrator_hub_session.py
 cloud/launcher/tests/test_orchestrator_row.py
