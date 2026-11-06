@@ -134,8 +134,9 @@ class TestShimGuardsTool(unittest.TestCase):
 
     def test_s6_the_six_existing_modules_demand_nothing(self):
         modules = sorted(p.name for p in (REPO / "shims").glob("*.py"))
-        self.assertEqual(len(modules), 6)
-        yes = {"gh_hold.py": 3, "stash_guard.py": 1}
+        # the property is "every module under shims/ demands nothing" (no size pin: #2219 added gh_body.py); the authority-code modules are named with their function counts
+        yes = {"gh_body.py": 1, "gh_hold.py": 3, "stash_guard.py": 1}
+        self.assertLessEqual(set(yes), set(modules))
         total = 0
         for name in modules:
             done = shim_run(TOOL, REPO, "shims/" + name)
@@ -151,7 +152,7 @@ class TestShimGuardsTool(unittest.TestCase):
                 total += yes[name]
             else:
                 self.assertEqual(line, "  authority code: no", name)
-        self.assertEqual(total, 4)
+        self.assertEqual(total, sum(yes.values()))
 
     def test_s8_the_globs_are_read_from_the_matrix_not_typed(self):
         with tempfile.TemporaryDirectory() as tmp:
