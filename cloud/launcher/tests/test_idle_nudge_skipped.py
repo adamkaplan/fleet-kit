@@ -1,5 +1,7 @@
 """Diagnosis only: a RUNNING pod idle 15+ minutes whose idle limit is longer leaves ONE 'idle-nudge-skipped' audit line per quiet period."""
+import contextlib
 import datetime as dt
+import io
 import os
 import sys
 import unittest
@@ -14,6 +16,7 @@ cw, NOW, Stub, run = tn.cw, tn.NOW, tn.Stub, tn.run
 def mkpod(n, idle="3600", marked=False):
     p = tn.pod(idle=idle, marked=marked)
     p["metadata"]["name"], p["metadata"]["uid"] = "p%d" % n, "u%d" % n
+    p["status"]["startTime"] = (NOW - dt.timedelta(hours=1)).isoformat()
     return p
 
 
@@ -64,8 +67,9 @@ class TestSkipped(unittest.TestCase):
     def test_s2_one_line_each_then_none(self):
         one, two = passes(self.fn)
         got = {a[1]: a[5] for a in one}
-        self.assertEqual(got, {"pod/p3": "already-nudged", "pod/p4": "results-finished", "pod/p6": "exec-failed"})
-        self.assertEqual(len(one), 3)
+        self.assertEqual(got, {"pod/p1": "busy (idle unknown)", "pod/p2": "no-activity-time (idle unknown)", "pod/p3": "already-nudged",
+                               "pod/p4": "results-finished", "pod/p5": "probe-unreadable (idle unknown)", "pod/p6": "exec-failed"})
+        self.assertEqual(len(one), 6)
         self.assertEqual(two, [])
 
     def test_s3_short_idle_or_limit_no_line(self):
@@ -75,12 +79,22 @@ class TestSkipped(unittest.TestCase):
         run(self.fn, s2, mkpod(2, idle="900"))
         self.assertEqual([a for a in s.audits + s2.audits + getattr(s, 'skips', []) + getattr(s2, 'skips', []) if a[2] == "idle-nudge-skipped"], [])
 
-    def test_busy_or_ten_minutes_idle_no_line(self):
+    def test_young_pod_no_line(self):
         s = Stub(busy=True)
-        run(self.fn, s, mkpod(1))
-        s2 = Stub(idle_minutes=10)
-        run(self.fn, s2, mkpod(2))
-        self.assertEqual([a for a in s.audits + s2.audits if a[2] == "idle-nudge-skipped"], [])
+        p = mkpod(1)
+        p["status"]["startTime"] = (NOW - dt.timedelta(minutes=10)).isoformat()
+        run(self.fn, s, p)
+        self.assertEqual(s.__dict__.get("skips", []), [])
+
+    def test_busy_rate_limited_fake_clock(self):
+        s = Stub(busy=True)
+        p = mkpod(1)
+        p["status"]["startTime"] = (NOW - dt.timedelta(minutes=30)).isoformat()
+        lines = lambda: len(s.__dict__.get("skips", []))
+        for minutes, want in ((0, 1), (5, 1), (14, 1), (15, 2), (20, 2)):
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.fn(s, [p], NOW + dt.timedelta(minutes=minutes))
+            self.assertEqual(lines(), want, minutes)
 
     def test_s4_nudge_unchanged(self):
         s = Stub()
@@ -94,7 +108,7 @@ class TestSkipped(unittest.TestCase):
 class TestMutant(unittest.TestCase):
     def test_s5_control_then_mutant(self):
         one, _ = passes(cw.Launcher.send_idle_nudges)
-        self.assertEqual(len(one), 3)   # control first
+        self.assertEqual(len(one), 6)   # control first
         m = tn.mutant("nudge_skip(self, ", "(lambda *a: None)(")
         one, _ = passes(m)
         self.assertEqual(len(one), 0)
