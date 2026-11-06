@@ -50,6 +50,7 @@ class _Server(ThreadingHTTPServer):
     daemon_threads = True
 
     def __init__(self, address, handler, max_handlers, audit=lambda line: None):
+        self.request_queue_size = max(self.request_queue_size, max_handlers)
         super().__init__(address, handler)
         self.audit = audit
         self.max_handlers = max_handlers

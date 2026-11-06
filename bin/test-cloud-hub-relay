@@ -76,6 +76,20 @@ class Hub:
         body = {k: v for k, v in body.items() if v is not None}
         return self.call("POST", "/relay", body, who)
 
+    def held_call(self, who="pod-a", **over):
+        """relay_call through a connection with no client socket timeout: a held call is ended by an answer, not by a wall clock."""
+        body = {"call_id": "c1", "command": "prove", "pr": "acme-org/widget-service#12", "head": HEAD, "args": {"scenario": "S1"}}
+        body.update(over)
+        body = {k: v for k, v in body.items() if v is not None}
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=None)
+        h = {"Authorization": "Bearer " + (SECRETS.get(who) or who)} if who else {}
+        try:
+            conn.request("POST", "/relay", body=json.dumps(body).encode(), headers=h)
+            r = conn.getresponse()
+            return r.status, json.loads(r.read() or b"null")
+        finally:
+            conn.close()
+
     def daemon_answer(self, status=200, reason="", record=None):
         """The stub daemon: pull once, answer each pending request."""
         _, got = self.call("GET", "/relay/pending", who="daemon")
@@ -299,6 +313,25 @@ class TestClient(unittest.TestCase):
             cloud_cli.make_post = orig
         self.assertEqual(urls, ["http://hub.svc:8080/relay"])
 
+class _WaitingObserver(dict):
+    """The relay's held-waits dict that sets an event once the sum of its values reaches the target."""
+    def __init__(self, event, target):
+        super().__init__()
+        self.event, self.target = event, target
+
+    def _check(self):
+        if sum(self.values()) >= self.target:
+            self.event.set()
+
+    def __setitem__(self, key, value):
+        super().__setitem__(key, value)
+        self._check()
+
+    def __delitem__(self, key):
+        super().__delitem__(key)
+        self._check()
+
+
 class TestBoundsAndCaps(unittest.TestCase):
     def test_caps_derive_from_max_handlers(self):
         for mh, total in ((4, 2), (16, 8), (None, 16)):
@@ -327,7 +360,7 @@ class TestBoundsAndCaps(unittest.TestCase):
         import socket
         saved = dict(SECRETS)
         self.addCleanup(lambda: (SECRETS.clear(), SECRETS.update(saved)))   # the module-level dict is restored whatever happens
-        with Hub(wait=8.0, max_per_pod=50) as hub:   # default max_handlers=32 -> relay cap 16
+        with Hub(wait=None, max_per_pod=50) as hub:   # default max_handlers=32 -> relay cap 16
             self.assertEqual(hub.server.max_handlers, 32)
             self.assertEqual(hub.relay.max_inflight, 16)
             self.assertEqual((cloud_relay.MAX_WAIT_PER_POD, cloud_relay.MAX_WAIT_TOTAL), (4, 16))
@@ -337,18 +370,89 @@ class TestBoundsAndCaps(unittest.TestCase):
             for name in agents: SECRETS[name] = "secret-" + name
             Path(hub.tmp.name, "secrets.json").write_text(json.dumps({k: sha(v) for k, v in SECRETS.items()}))
             Path(hub.tmp.name, "agents.json").write_text(json.dumps(agents))
+            registered = threading.Event()
+            hub.relay.waiting = _WaitingObserver(registered, 16)   # set when all 16 held waits are registered
             threads = []
+            handlers = []   # the handler threads the hub's server starts (its daemon threads are not listed by the server itself)
+            orig_handler = hub.server.process_request_thread
+            def tracked_handler(*a, **kw):
+                handlers.append(threading.current_thread())
+                return orig_handler(*a, **kw)
+            hub.server.process_request_thread = tracked_handler
+            def show_join():   # runs after release_all: the joins are in the log, printed only when the guard printed it
+                if shown[0]: sys.stderr.write("\n".join(elog[shown[0]:]) + "\n")
+            self.addCleanup(show_join)
+            def release_all():   # no time bound on the held waits: every one is answered here, so a failure never hangs the run (the hub's server is already closed here: the answer goes to the relay itself)
+                end = time.monotonic() + 10
+                while hub.relay.pending and time.monotonic() < end:
+                    for req in hub.relay.list_pending():
+                        hub.relay.result(req["id"], {"status": 200, "reason": "ok"})
+                    time.sleep(0.01)
+                for t in threads:
+                    t.join(10)
+                note("join of the held call threads done")
+                stuck = [t for t in threads if t.is_alive()]
+                self.assertFalse(stuck, "%d held relay call threads did not end within 10 seconds" % len(stuck))
+                for h in list(handlers):   # the answers are delivered: the server's handler threads must end before the test ends
+                    h.join(10)
+                note("join of the handler threads done")
+                live = [h.name for h in handlers if h.is_alive()]
+                self.assertFalse(live, "hub handler threads did not end within 10 seconds: %s" % live)
+            self.addCleanup(release_all)
+            elog, shown, t0, elock = [], [0], [None], threading.Lock()   # the test's own event log, printed on failure only
+            def note(msg):
+                with elock:
+                    t0[0] = time.monotonic() if t0[0] is None else t0[0]
+                    elog.append("%8.4f %s" % (time.monotonic() - t0[0], msg))
+            real_held = hub.held_call
+            def logged_held(**kw):
+                note("start held call %s/%s" % (kw.get("who"), kw.get("call_id")))
+                try:
+                    res = real_held(**kw)
+                except BaseException as e:
+                    note("end held call %s/%s: %s: %s" % (kw.get("who"), kw.get("call_id"), type(e).__name__, e))
+                    raise
+                note("end held call %s/%s: %s %s" % (kw.get("who"), kw.get("call_id"), res[0], str(res[1])[:100]))
+                return res
+            hub.held_call = logged_held
             for i in range(4):          # 4 pods x 4 held waits = 16 held
                 for j in range(4):
-                    t = threading.Thread(target=hub.relay_call, kwargs={"who": "pod-%d" % i, "call_id": "c%d" % j, "pr": "acme-org/r%d#1" % i}); t.start(); threads.append(t)
-            self.wait_for(lambda: sum(hub.relay.waiting.values()) == 16)
+                    t = threading.Thread(target=hub.held_call, kwargs={"who": "pod-%d" % i, "call_id": "c%d" % j, "pr": "acme-org/r%d#1" % i}); t.start(); threads.append(t)
+            def all_registered():
+                if registered.wait(0.02):
+                    return True
+                if not registered.is_set() and not all(t.is_alive() for t in threads):
+                    note("guard fired: %d waits registered, %d of 16 calls alive" % (sum(hub.relay.waiting.values()), sum(t.is_alive() for t in threads)))
+                    sys.stderr.write("\n".join(elog[:]) + "\n"); shown[0] = len(elog)
+                    raise AssertionError("a held relay call ended before all 16 were registered")
+                return False
+            self.wait_for(all_registered)
             self.assertEqual(sum(hub.relay.waiting.values()), 16)
+            gate, seen, over, refused = threading.Lock(), {"live": 16}, threading.Event(), threading.Event()   # the relay's admission, watched: an event decides, never a socket timeout
+            real_admit, real_release = hub.relay.admit, hub.relay.release
+            def watched_admit():
+                ok = real_admit()
+                with gate:
+                    if not ok:
+                        refused.set()
+                    else:
+                        seen["live"] += 1
+                        if seen["live"] > hub.relay.max_inflight:
+                            over.set()
+                return ok
+            def watched_release():
+                real_release()
+                with gate:
+                    seen["live"] -= 1
+            hub.relay.admit, hub.relay.release = watched_admit, watched_release
             socks = []
             for _ in range(hub.server.max_handlers):   # as many slow bodies as the hub has handlers: without the in-flight cap they would take every one
                 s = socket.create_connection(("127.0.0.1", hub.port))
                 s.settimeout(5)
                 s.sendall(b"POST /relay HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer secret-pod-0\r\nContent-Length: 100\r\n\r\n{")
                 socks.append(s)
+            TestBoundsAndCaps.wait_for(lambda: over.is_set() or refused.is_set(), 30.0)   # an event; the limit is a hang guard that raises its own text
+            self.assertFalse(over.is_set(), "over-admitted: a pod relay handler was admitted beyond the cap of %d" % hub.relay.max_inflight)
             for s in socks:             # every excess one is refused 503 straight away, its body unread
                 first = s.recv(4096).split(b"\r\n")[0]
                 self.assertIn(b" 503 ", first)
@@ -378,9 +482,12 @@ class TestBoundsAndCaps(unittest.TestCase):
             case.doCleanups()
 
     @staticmethod
+    # the limit is a HANG GUARD only: it never decides a verdict, it fails a broken mechanism with its own text
     def wait_for(cond, limit=10.0):
         end = time.monotonic() + limit
-        while time.monotonic() < end and not cond():
+        while not cond():
+            if time.monotonic() >= end:
+                raise AssertionError("wait_for: the state was not reached within %s seconds" % limit)
             time.sleep(0.01)
 
     def test_slow_body_trickle_cut_at_deadline(self):
@@ -545,6 +652,538 @@ def mutant(module, old, new, rename=None):
     if hasattr(module, "Refusal"):
         mod.Refusal = module.Refusal
     return mod
+
+
+class TestEventWait(unittest.TestCase):
+    """The event wait of the saturation test: it raises, survives a delayed registration, and has mutants with controls."""
+    @staticmethod
+    def silent_wait_for(cond, limit=10.0):   # the old body: returns without raising when the state is not reached
+        end = time.monotonic() + limit
+        while time.monotonic() < end and not cond():
+            time.sleep(0.01)
+
+    @staticmethod
+    def s2_counts(wait_for):
+        try:
+            wait_for(lambda: False, 0.3)
+            raised = 0
+        except AssertionError as e:
+            raised = int("wait_for: the state was not reached within 0.3 seconds" in str(e))
+        try:
+            wait_for(lambda: True, 5.0)
+            returned = 1
+        except AssertionError:
+            returned = 0
+        return raised, returned
+
+    def test_s2_wait_for_raises_with_its_text_and_returns_at_once(self):
+        raised, returned = self.s2_counts(TestBoundsAndCaps.wait_for)
+        print("S2: never-true condition raises %d of 1 with the text, true condition returns %d of 1" % (raised, returned))
+        self.assertEqual((raised, returned), (1, 1))
+
+    def test_s2_mutant_silent_wait_for_is_caught(self):
+        control = self.s2_counts(TestBoundsAndCaps.wait_for) == (1, 1)
+        mutant = self.s2_counts(self.silent_wait_for)
+        applied = self.silent_wait_for is not TestBoundsAndCaps.wait_for
+        print("S2 mutant: control passes %d of 1, mutant fails %d of 1, mutation applied %s" % (int(control), int(mutant != (1, 1)), applied))
+        self.assertTrue(control and applied)
+        self.assertNotEqual(mutant, (1, 1))
+
+    @staticmethod
+    def control_report(tracebacks, events):
+        """The text of a failed control: its full tracebacks, then its event log in order."""
+        return "the inner failure of the control:\n" + "".join(tracebacks) + "\nevent log (seconds from the start of the scenario):\n" + "\n".join("%9.3f %s" % (t, text) for t, text in events)
+
+    def saturation(self, delay, hub_wait):
+        """The saturation scenario of the pinned test with the LAST of the 16 relay calls delayed by `delay` seconds."""
+        self.events = []   # the event log of this scenario: (monotonic offset from its start, text); the test prints it only on failure
+        t0 = time.monotonic()
+        log = lambda text: self.events.append((time.monotonic() - t0, text))
+        log("scenario start")
+        import socket
+        saved = dict(SECRETS)
+        self.addCleanup(lambda: (SECRETS.clear(), SECRETS.update(saved)))
+        with Hub(wait=hub_wait, max_per_pod=50) as hub:
+            agents = {"pod-%d" % i: {"url": "http://127.0.0.1:1", "session": "s", "password_file": "x", "repo": "acme-org/r%d" % i, "issue": i} for i in range(4)}
+            for name in agents: SECRETS[name] = "secret-" + name
+            Path(hub.tmp.name, "secrets.json").write_text(json.dumps({k: sha(v) for k, v in SECRETS.items()}))
+            Path(hub.tmp.name, "agents.json").write_text(json.dumps(agents))
+            registered = threading.Event()
+            hub.relay.waiting = _WaitingObserver(registered, 16)
+            threads = []
+            handlers = []   # the handler threads the hub's server starts (its daemon threads are not listed by the server itself)
+            orig_handler = hub.server.process_request_thread
+            def tracked_handler(*a, **kw):
+                handlers.append(threading.current_thread())
+                return orig_handler(*a, **kw)
+            hub.server.process_request_thread = tracked_handler
+            def release_all():
+                end = time.monotonic() + 10
+                while hub.relay.pending and time.monotonic() < end:
+                    for req in hub.relay.list_pending():
+                        hub.relay.result(req["id"], {"status": 200, "reason": "ok"})
+                    time.sleep(0.01)
+                for t in threads:
+                    t.join(10)
+                log("join: the 16 held call threads were joined")
+                stuck = [t for t in threads if t.is_alive()]
+                self.assertFalse(stuck, "%d held relay call threads did not end within 10 seconds" % len(stuck))
+                for h in list(handlers):   # the answers are delivered: the server's handler threads must end before the test ends
+                    h.join(10)
+                log("join: the hub handler threads were joined")
+                live = [h.name for h in handlers if h.is_alive()]
+                self.assertFalse(live, "hub handler threads did not end within 10 seconds: %s" % live)
+            self.addCleanup(release_all)
+            ended = []   # (call index, kind, text) of every held call that ended
+            n_of = lambda i, j: i * 4 + j
+            def call(i, j, wait):
+                log("call %d start (delay %s)" % (n_of(i, j), wait))
+                time.sleep(wait)
+                log("call %d sent" % n_of(i, j))
+                try:
+                    ended.append((n_of(i, j), "returned", "status %s" % (hub.held_call(who="pod-%d" % i, call_id="c%d" % j, pr="acme-org/r%d#1" % i)[0],)))
+                except BaseException as e:
+                    ended.append((n_of(i, j), type(e).__name__, str(e)[:120]))
+                log("call %d end: %s" % (n_of(i, j), ended[-1][1:]))
+            for n in range(16):
+                t = threading.Thread(target=call, args=(n // 4, n % 4, delay if n == 15 else 0)); t.start(); threads.append(t)
+            def all_registered():
+                if time.monotonic() - t0 > 29.9: log("guard: the 30 s limit of the wait is reached")
+                if registered.wait(0.02):
+                    return True
+                if not all(t.is_alive() for t in threads):
+                    log("guard: a held call ended before all were registered, the wait raises")
+                    k = ended[0] if ended else None
+                    raise AssertionError("a held relay call ended before all 16 were registered" + (": call %d ended: %s: %s" % k if k else ""))
+                return False
+            TestBoundsAndCaps.wait_for(all_registered, 30.0)
+            log("wait: the condition ended the wait, all 16 registered (the delayed call registered last)")
+            self.assertEqual(sum(hub.relay.waiting.values()), 16)
+            socks = []
+            for _ in range(hub.server.max_handlers):
+                s = socket.create_connection(("127.0.0.1", hub.port)); s.settimeout(5)
+                s.sendall(b"POST /relay HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer secret-pod-0\r\nContent-Length: 100\r\n\r\n{")
+                socks.append(s)
+            for s in socks:
+                self.assertIn(b" 503 ", s.recv(4096).split(b"\r\n")[0])
+            self.assertEqual(hub.relay.inflight, 16)
+            status, got = hub.call("GET", "/relay/pending", who="daemon")
+            self.assertEqual((status, len(got["requests"])), (200, 10))
+            for s in socks: s.close()
+            while hub.relay.pending:
+                for req in hub.relay.list_pending():
+                    hub.call("POST", "/relay/result/" + req["id"], {"status": 200, "reason": "ok"}, who="daemon")
+            for t in threads: t.join()
+            return sum(1 for _ in threads)
+
+    def test_s3_last_call_delayed_three_seconds_still_registers_16(self):
+        n = self.saturation(3.0, None)
+        print("S3: count reached 16 with the last call delayed 3 s: %d of 1" % int(n == 16))
+        self.assertEqual(n, 16)
+
+    def test_s3_mutant_bound_held_wait_fails_with_the_early_end_text(self):
+        control = TestEventWait("test_s3_last_call_delayed_three_seconds_still_registers_16")
+        res = unittest.TestResult(); control.run(res)
+        control_ok = res.wasSuccessful()
+        self.assertTrue(control_ok, self.control_report([tb for _, tb in res.failures + res.errors], getattr(control, "events", [])))
+        mutant_case = TestEventWait("test_s3_last_call_delayed_three_seconds_still_registers_16")
+        mutant_text = None
+        try:
+            mutant_case.saturation(3.0, 2.0)
+        except AssertionError as e:
+            mutant_text = str(e)
+        finally:
+            mutant_case.doCleanups()
+        caught = mutant_text is not None and "a held relay call ended before all 16 were registered" in mutant_text
+        print("S3 mutant: control passes %d of 1, mutant fails %d of 1 with the early-end text, mutation applied %s" % (int(control_ok), int(caught), True))
+        self.assertTrue(control_ok)
+        self.assertIn("a held relay call ended before all 16 were registered", mutant_text or "")
+
+    def test_s7_over_admission_is_seen_as_an_event_and_a_dead_observation_falls_to_the_guard(self):
+        import inspect, textwrap
+        name = "test_real_constants_held_plus_slow_bodies_daemon_and_channel_alive"
+
+        import traceback
+        events, failures, t0 = [], [], time.monotonic()   # the event log of the scenario run by `run`, kept by this test
+        log = lambda text: events.append((time.monotonic() - t0, text))
+
+        DEAD_TEXT = "the observation is dead: the in-flight count is above the cap and over was never set"
+        def run(case, meth, remove_admit, dead_watch=False):
+            events.clear(); failures.clear(); log("scenario start (no delayed call in this scenario)")
+            real_held, real_wait = Hub.held_call, TestBoundsAndCaps.__dict__["wait_for"]
+            def held(self_, *a, **kw):
+                n = kw.get("who", "?") + "/" + kw.get("call_id", "?")
+                log("held call %s start" % n)
+                try:
+                    return real_held(self_, *a, **kw)
+                finally:
+                    log("held call %s end" % n)
+            relays, dead_ev, stop = [], threading.Event(), threading.Event()
+            def watch():   # the observed state: in-flight above the cap while the wait's condition (over or refused) is still false
+                while not stop.is_set():
+                    if relays and not cond_box[0]() and relays[0].inflight > relays[0].max_inflight:
+                        dead_ev.set(); return
+                    stop.wait(0.01)
+            cond_box = [None]
+            watcher = threading.Thread(target=watch, daemon=True)
+            def waited(cond, limit=10.0):
+                try:
+                    if dead_watch and limit == 30.0:   # the over wait of the copy: the limit stays the hang guard, the state ends the wait
+                        cond_box[0] = cond; watcher.start()
+                        real_wait.__func__(lambda: cond() or dead_ev.is_set(), limit)
+                        if not cond():
+                            log("observed state: in-flight above the cap, over unset, nothing refused"); raise AssertionError(DEAD_TEXT)
+                    else:
+                        real_wait.__func__(cond, limit)
+                    log("wait: the condition ended the wait")
+                except AssertionError:
+                    log("guard: the wait limit of %s s ended the wait, it raised" % limit); raise
+            Hub.held_call = held; TestBoundsAndCaps.wait_for = staticmethod(waited)
+            old = cloud_relay.Relay.admit
+            if remove_admit and dead_watch:   # the cap removed but the relay still counts, so its in-flight count can be observed above the cap
+                def counting_admit(self):
+                    relays.append(self)
+                    with self.lock:
+                        self.inflight += 1
+                    return True
+                cloud_relay.Relay.admit = counting_admit
+            elif remove_admit:
+                cloud_relay.Relay.admit = lambda self: True
+            try:
+                meth()
+                return None
+            except BaseException as e:   # the kind and text of the failure
+                failures.append("".join(traceback.format_exception(type(e), e, e.__traceback__)))
+                return e
+            finally:
+                cloud_relay.Relay.admit = old
+                stop.set()
+                if watcher.ident is not None: watcher.join(5)
+                case.doCleanups()
+                log("join: the cleanups of the case ran (the handler threads are joined)")
+                Hub.held_call = real_held; TestBoundsAndCaps.wait_for = real_wait
+        case = TestBoundsAndCaps(name)
+        e1 = run(case, getattr(case, name), True)
+        m_over = int(isinstance(e1, AssertionError) and "over-admitted" in str(e1))
+        m_timeout = int(isinstance(e1, TimeoutError) or (e1 is not None and "timed out" in str(e1)))
+        case = TestBoundsAndCaps(name)
+        control = int(run(case, getattr(case, name), False) is None)
+        self.assertEqual(control, 1, self.control_report(failures, events))
+        src = textwrap.dedent(inspect.getsource(TestBoundsAndCaps.__dict__[name]))
+        self.assertEqual(src.count("over.set()"), 1)
+        self.assertEqual(src.count("30.0"), 1)
+        dead_src = src.replace("over.set()", "pass")
+        ns = dict(globals())
+        exec(compile(dead_src, "<dead-observation>", "exec"), ns)
+        case = TestBoundsAndCaps(name)
+        e3 = run(case, lambda: ns[name](case), True, True)
+        dead = int(isinstance(e3, AssertionError) and DEAD_TEXT in str(e3))
+        applied = dead_src != src
+        print("S7: mutant fails %d of 1 with over-admitted and %d of 1 with a TimeoutError, control passes %d of 1, dead observation fails %d of 1 with the observed-state text, mutations applied %s" % (m_over, m_timeout, control, dead, applied))
+        self.assertEqual((m_over, m_timeout, control, dead, applied), (1, 0, 1, 1, True))
+
+    def s13_run(self, transform=None, end_one=False):
+        """Run the saturation test (or a copy of its source, changed by `transform`) and return (failure text or None, its standard error, event lines)."""
+        import inspect, textwrap, re, contextlib
+        name = "test_real_constants_held_plus_slow_bodies_daemon_and_channel_alive"
+        src = textwrap.dedent(inspect.getsource(TestBoundsAndCaps.__dict__[name]))
+        ns = dict(globals())
+        if transform:
+            src = transform(src)
+        exec(compile(src, "<s13-copy>", "exec"), ns)
+        case = TestBoundsAndCaps(name)
+        real_held, err, text = Hub.held_call, io.StringIO(), None
+        if end_one:
+            def held(self_, *a, **kw):
+                if kw.get("who") == "pod-0" and kw.get("call_id") == "c0":
+                    return 200, "ended at once by construction"
+                return real_held(self_, *a, **kw)
+            Hub.held_call = held
+        try:
+            with contextlib.redirect_stderr(err):
+                try:
+                    ns[name](case)
+                except AssertionError as e:
+                    text = str(e)
+                finally:
+                    case.doCleanups()
+        finally:
+            Hub.held_call = real_held
+        lines = [l for l in err.getvalue().splitlines() if re.match(r"^\s*\d+\.\d{4} ", l)]
+        return text, err.getvalue(), lines
+
+    @staticmethod
+    def s13_check(text, lines):
+        """The failing copy must say why and print its ordered event log; raises with the anchored text when the log is missing."""
+        starts = [l for l in lines if " start held call " in l]
+        ends = [l for l in lines if " end held call " in l]
+        guard = [l for l in lines if "guard fired: " in l and "waits registered" in l]
+        times = [float(l.split()[0]) for l in lines]
+        if not (len(starts) >= 16 and len(ends) >= 1 and len(guard) == 1 and times == sorted(times)):
+            raise AssertionError("the event log was not printed")
+        if "a held relay call ended before all 16 were registered" not in (text or ""):
+            raise AssertionError("the copy did not fail with the early-end text: %r" % text)
+        return len(lines)
+
+    def test_s13_the_saturation_test_copy_that_ends_a_call_fails_with_its_event_log(self):
+        ctext, cerr, clines = self.s13_run()   # the CONTROL: the real test, unmutated, runs first
+        control_passed = int(ctext is None)
+        control_lines = len(clines)
+        self.assertEqual((ctext, clines), (None, []), "the control failed or printed log lines:\n" + cerr)
+        text, err, lines = self.s13_run(end_one=True)
+        n = self.s13_check(text, lines)
+        early = int("a held relay call ended before all 16 were registered" in (text or ""))
+        guard_n = len([l for l in lines if "guard fired: " in l and "waits registered" in l])
+        first = [l for l in lines if "end held call" in l][0]
+        print("S13: copy that ends a call fails with the early-end text %d of 1, %d ordered event lines (>= 17), guard line with registered waits %d of 1, real test passes %d of 1 with %d log lines, the ended call: %s" % (early, n, guard_n, control_passed, control_lines, first.strip()))
+        self.assertEqual((early, guard_n, control_passed, control_lines), (1, 1, 1, 0))
+        self.assertGreaterEqual(n, 17)
+        import textwrap, inspect
+        src = textwrap.dedent(inspect.getsource(TestBoundsAndCaps.__dict__["test_real_constants_held_plus_slow_bodies_daemon_and_channel_alive"]))
+        drop = r'sys.stderr.write("\n".join(elog[:]) + "\n"); shown[0] = len(elog)'
+        self.assertEqual(src.count(drop), 1)
+        mtext, merr, mlines = self.s13_run(lambda s: s.replace(drop, "pass"), end_one=True)
+        applied = src.replace(drop, "pass") != src
+        with self.assertRaises(AssertionError) as cm:
+            self.s13_check(mtext, mlines)
+        nolog = int(str(cm.exception) == "the event log was not printed")
+        print("S13 mutant: the copy without the log lines fails %d of 1 with %r, mutation applied %s" % (nolog, str(cm.exception), applied))
+        self.assertEqual((nolog, applied), (1, True))
+
+    def test_s5_control_passes_and_existing_cap_mutant_is_caught(self):
+        name = "test_real_constants_held_plus_slow_bodies_daemon_and_channel_alive"
+        res = unittest.TestResult(); TestBoundsAndCaps(name).run(res)
+        res2 = unittest.TestResult(); TestBoundsAndCaps("test_mutant_admit_removed_the_saturation_test_fails").run(res2)
+        self.assertEqual(res.failures + res.errors, [], "the inner control failed:\n" + "".join(tb for _, tb in res.failures + res.errors))
+        print("S5: control passes %d of 1, existing cap mutant caught %d of 1" % (int(res.wasSuccessful()), int(res2.wasSuccessful())))
+        self.assertTrue(res.wasSuccessful() and res2.wasSuccessful())
+
+
+class TestHeldCallSource(unittest.TestCase):
+    """Scenarios S8 S9 S10: the source of the saturation test, and the report of the S5 inner control."""
+    SAT = "test_real_constants_held_plus_slow_bodies_daemon_and_channel_alive"
+
+    @staticmethod
+    def check_held_source(path):
+        try:
+            text = Path(path).read_text()
+        except OSError:
+            text = ""
+        start = text.find("    def " + TestHeldCallSource.SAT)
+        block = text[start:].split("\n    def ")[0:1] if start >= 0 else []
+        lines = [l for l in (block[0].splitlines() if block else []) if "threading.Thread(target=hub." in l and '"call_id": "c%d" % j' in l]
+        held = sum("target=hub.held_call" in l for l in lines)
+        relay = sum("target=hub.relay_call" in l for l in lines)
+        if relay:
+            raise AssertionError("a held call goes through the helper with a client timeout")
+        if not held:
+            raise AssertionError("the saturation test was not found in the source")
+        return held, relay
+
+    def fails_with(self, check, path):
+        try:
+            check(path)
+        except AssertionError as e:
+            return str(e)
+        return None
+
+    def test_s8_held_calls_go_through_held_call_and_a_relay_call_mutant_is_caught(self):
+        here = Path(__file__).resolve()
+        held, relay = self.check_held_source(here)
+        src = here.read_text()
+        old = "target=hub.held_call, kwargs={\"who\": \"pod-%d\" % i"
+        self.assertEqual(src.count(old), 1)
+        mutated = src.replace(old, old.replace("held_call", "relay_call"))
+        applied = mutated != src
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "copy"
+            p.write_text(mutated)
+            text = self.fails_with(self.check_held_source, p)
+        caught = int(text == "a held call goes through the helper with a client timeout")
+        print("S8: control passes 1 of 1 (%d held calls, %d on relay_call), mutant fails %d of 1 with the anchored text, mutation applied %s" % (held, relay, caught, applied))
+        self.assertEqual((held, relay, caught, applied), (1, 0, 1, True))
+
+    def test_s9_unreadable_answers_fail_and_a_zero_count_pass_is_caught(self):
+        import inspect, textwrap
+        want = "the saturation test was not found in the source"
+        with tempfile.TemporaryDirectory() as d:
+            nofile = Path(d) / "missing"
+            unreadable = Path(d)   # a directory: reading it raises OSError
+            without = Path(d) / "without"
+            without.write_text("class T:\n    def test_other(self):\n        pass\n")
+            got = [self.fails_with(self.check_held_source, p) for p in (nofile, unreadable, without)]
+            fsrc = textwrap.dedent(inspect.getsource(TestHeldCallSource.__dict__["check_held_source"]).replace("TestHeldCallSource.SAT", "'%s'" % TestHeldCallSource.SAT))
+            self.assertEqual(fsrc.count("    if not held:\n"), 1)
+            msrc = fsrc.replace("    if not held:\n", "    if False:\n").replace("@staticmethod\n", "")
+            applied = msrc != fsrc
+            ns = dict(globals())
+            exec(compile(msrc, "<zero-passes>", "exec"), ns)
+            mut = [self.fails_with(ns["check_held_source"], p) for p in (nofile, unreadable, without)]
+        n = sum(g == want for g in got)
+        control = int(self.check_held_source(Path(__file__).resolve())[0] == 1)
+        caught = int(all(m is None for m in mut))   # the copy passes on finding nothing: the same inputs show it
+        print("S9: %d of 3 inputs fail with the anchored text, control with the real source passes %d of 1, the zero-count copy is caught %d of 1, mutation applied %s" % (n, control, caught, applied))
+        self.assertEqual((n, control, caught, applied), (3, 1, 1, True))
+
+    def test_s10_the_inner_failure_of_the_s5_control_is_reported_with_its_traceback(self):
+        import inspect, textwrap
+        name = "test_s5_control_passes_and_existing_cap_mutant_is_caught"
+        src = textwrap.dedent(inspect.getsource(TestEventWait.__dict__[name]))
+        line = "res.failures + res.errors"
+        self.assertEqual(src.count(line), 2)   # the report line holds it twice
+        report_lines = [l for l in src.splitlines() if line in l]
+        self.assertEqual(len(report_lines), 1)
+        mutated = src.replace(report_lines[0], report_lines[0][:len(report_lines[0]) - len(report_lines[0].lstrip())] + "pass")
+        applied = mutated != src
+        marker = "INNERMARK-by-construction"
+
+        def run(code):
+            ns = dict(globals())
+            exec(compile(code, "<s5>", "exec"), ns)
+            case = TestEventWait(name)
+            real = TestBoundsAndCaps.__dict__["test_real_constants_held_plus_slow_bodies_daemon_and_channel_alive"]
+
+            def boom(self_):
+                raise AssertionError(marker)
+            TestBoundsAndCaps.test_real_constants_held_plus_slow_bodies_daemon_and_channel_alive = boom
+            try:
+                ns[name](case)
+                return None
+            except AssertionError as e:
+                return str(e)
+            finally:
+                TestBoundsAndCaps.test_real_constants_held_plus_slow_bodies_daemon_and_channel_alive = real
+        real_text = run(src)
+        mut_text = run(mutated)
+        reported = int(real_text is not None and marker in real_text and "Traceback" in real_text)
+        mut_caught = int(mut_text is not None and marker not in mut_text)   # the check fails: "the inner failure was not reported"
+        print("S10: the failing control is reported with its traceback %d of 1, the copy with the outer text only fails the check %d of 1 (the inner failure was not reported), mutation applied %s" % (reported, mut_caught, applied))
+        self.assertEqual((reported, mut_caught, applied), (1, 1, True))
+        res = unittest.TestResult(); TestEventWait(name).run(res)   # the real control passes
+        self.assertTrue(res.wasSuccessful(), "".join(tb for _, tb in res.failures + res.errors))
+
+    def test_s11_the_controls_of_s3_and_s7_report_their_inner_failure_and_an_event_log(self):
+        import contextlib, inspect, re, textwrap
+        marker = "INNERMARK-s11-by-construction"
+        ev_line = re.compile(r"^\s*\d+\.\d{3} \S", re.M)   # one event line: a monotonic offset, then its text
+        s3 = "test_s3_mutant_bound_held_wait_fails_with_the_early_end_text"
+        s7 = "test_s7_over_admission_is_seen_as_an_event_and_a_dead_observation_falls_to_the_guard"
+        sat = "test_real_constants_held_plus_slow_bodies_daemon_and_channel_alive"
+        real_sat = TestBoundsAndCaps.__dict__[sat]
+        real_scen = TestEventWait.__dict__["saturation"]
+
+        def run(name, code, fail):
+            ns = dict(globals())
+            exec(compile(code, "<s11>", "exec"), ns)
+            case = TestEventWait(name)
+            if fail:   # a control that fails by construction: the real scenario runs, then raises the marker
+                def boom_sat(self_):
+                    real_sat(self_)
+                    raise AssertionError(marker)
+                def boom_scen(self_, delay, hub_wait):
+                    real_scen(self_, 0.2, None)
+                    raise AssertionError(marker)
+                TestBoundsAndCaps.test_real_constants_held_plus_slow_bodies_daemon_and_channel_alive = boom_sat
+                TestEventWait.saturation = boom_scen
+            out = io.StringIO()
+            try:
+                with contextlib.redirect_stdout(out):
+                    ns[name](case)
+                return None, out.getvalue()
+            except AssertionError as e:
+                return str(e), out.getvalue()
+            finally:
+                TestBoundsAndCaps.test_real_constants_held_plus_slow_bodies_daemon_and_channel_alive = real_sat
+                TestEventWait.saturation = real_scen
+                case.doCleanups()
+
+        def check(text):   # the check of this scenario: the report of a failing control holds the inner failure and the log
+            if text is None or marker not in text or "Traceback" not in text:
+                raise AssertionError("the inner failure was not reported")
+            if len(ev_line.findall(text)) < 3:
+                raise AssertionError("the event log was not printed")
+            return len(ev_line.findall(text))
+
+        def verdict(name, code):
+            try:
+                return check(run(name, code, True)[0]), None
+            except AssertionError as e:
+                return None, str(e)
+        results = []
+        for name, line, outer, drop_from, drop_to in (
+                (s3, "self.assertTrue(control_ok, self.control_report([tb for _, tb in res.failures + res.errors], getattr(control, \"events\", [])))", "self.assertTrue(control_ok)", "getattr(control, \"events\", [])", "[]"),
+                (s7, "self.assertEqual(control, 1, self.control_report(failures, events))", "self.assertEqual(control, 1)", "self.control_report(failures, events)", "self.control_report(failures, [])")):
+            src = textwrap.dedent(inspect.getsource(TestEventWait.__dict__[name]))
+            self.assertEqual(src.count(line), 1)
+            self.assertEqual(src.count(drop_from), 1)
+            m_outer, m_drop = src.replace(line, outer), src.replace(line, line.replace(drop_from, drop_to))
+            applied = m_outer != src and m_drop != src and m_outer != m_drop
+            n_events, control_err = verdict(name, src)   # the unmutated test is the CONTROL, first
+            passed_text, passed_out = run(name, src, False)
+            _, outer_err = verdict(name, m_outer)
+            _, drop_err = verdict(name, m_drop)
+            results.append((name[:7], n_events or 0, int(passed_text is None), len(ev_line.findall(passed_out)), int(outer_err == "the inner failure was not reported"), int(drop_err == "the event log was not printed"), applied))
+        for r in results:
+            print("S11 %s: failing control reported with its traceback and %d ordered event lines, real control passes %d of 1 and prints %d log lines, copy with the outer text only fails %d of 1 (the inner failure was not reported), copy without the log fails %d of 1 (the event log was not printed), mutations applied %s" % r)
+        self.assertEqual([(r[2], r[3], r[4], r[5], r[6]) for r in results], [(1, 0, 1, 1, True)] * 2)
+        self.assertTrue(all(r[1] >= 3 for r in results))
+
+
+class TestListenBacklog(unittest.TestCase):
+    """S14: the hub server's listen backlog is never below its handler cap (control first, then a mutant without the line)."""
+    LINE = "        self.request_queue_size = max(self.request_queue_size, max_handlers)\n"
+
+    def backlogs(self, module):
+        import socket
+        seen = []
+        real = socket.socket.listen
+
+        def listen(sock, *args):
+            seen.append(args[0] if args else None)
+            return real(sock, *args)
+        socket.socket.listen = listen
+        self.addCleanup(setattr, socket.socket, "listen", real)
+        out = []
+        for cap in (32, 50, 3):
+            before = len(seen)
+            server = module._Server(("127.0.0.1", 0), object, cap)
+            try:
+                out.append(seen[before] if len(seen) > before else None)
+            finally:
+                server.server_close()
+        return out
+
+    def check(self, module):
+        got = self.backlogs(module)
+        for value, floor in zip(got, (32, 50, 5)):
+            if value is None or value < floor:
+                raise AssertionError("the listen backlog is below the handler cap: %s for caps 32/50/3" % got)
+        return got
+
+    def mutation_applied(self, original, changed):
+        return changed != original and self.LINE in original and self.LINE not in changed
+
+    def test_s14_backlog_is_never_below_the_handler_cap_and_a_mutant_is_caught(self):
+        import cloud_channel_server
+        got = self.check(cloud_channel_server)
+        src = Path(cloud_channel_server.__file__).read_text()
+        self.assertEqual(src.count(self.LINE), 1)
+        mut = mutant(cloud_channel_server, self.LINE, "")
+        changed = src.replace(self.LINE, "")
+        applied = self.mutation_applied(src, changed)
+        self.assertTrue(applied, "the mutation of S14 was not applied")
+        with self.assertRaises(AssertionError) as noop:   # control of the check: a no-op mutation is not applied
+            self.assertTrue(self.mutation_applied(src, src.replace(self.LINE, self.LINE)), "the mutation of S14 was not applied")
+        self.assertIn("the mutation of S14 was not applied", str(noop.exception))
+        text = None
+        try:
+            self.check(mut)
+        except AssertionError as e:
+            text = str(e)
+        self.assertIsNotNone(text)
+        self.assertIn("the listen backlog is below the handler cap", text)
+        self.assertIn("[5, 5, 5]", text)
+        print("S14: backlogs %d/%d/%d for caps 32/50/3 (%d of 3 at or above their floor); control 1 of 1, mutant 1 of 1 with the text (5 for 32, 5 for 50), mutation applied %s" % (got[0], got[1], got[2], sum(v >= f for v, f in zip(got, (32, 50, 5))), applied))
 
 
 class TestHostileBodies(unittest.TestCase):
