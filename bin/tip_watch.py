@@ -1,0 +1,227 @@
+"""The integration tip's CI is watched after each merge (ask #2247).
+
+Nothing ran CI on the integration tip after a merge, so a merge that turned the tip red went unseen and pull requests were then merged against 'the reds the
+tip already has'. This is the daemon's look at the runs of the tip branch. Per watched repository it lists the recent runs of the branch `BRANCH` (ONE read, no
+oftener than LIST_SECONDS), takes the newest finished run of each head in the order the runs began, and for a head whose run FAILED reads that run's jobs (one
+read) to name the failed ones. A head is noticed ONCE, to the Chief of Staff and to the lane that merged it (the pull request named by the merge commit's title,
+routed like any pull request; with none found, the Chief of Staff alone), naming the merge commit, its pull request and the failed jobs, when
+  - the head before it passed, or is not known (unknown counts as green: the first red seen is news), or
+  - the tip was already red and this head fails a job the head before it did not (only the NEW failed jobs are named).
+The same red repeated on the next head says nothing; a head whose run passed is only remembered. A cancelled or skipped run decides nothing; a run still going waits.
+A failure older than WAKE_WINDOW is history: it is remembered as the baseline and told to nobody. Reads are GET only and bounded by the caller's per-pass
+budget. What was handled is kept in `tip-watch.json` (state directory) so a restart tells nobody twice. A job name is untrusted text: `queue_ejections.safe` makes it data.
+
+The logic is here; `bin/fleet-switchboard` calls `run_pass` from the daemon's pass with a namespace `sb` of its own helpers (`NEEDS`)."""
+
+import calendar
+import re
+import time
+
+BRANCH = "integration"   # the branch whose tip is watched
+STATE_FILE = "tip-watch.json"
+LIST_SECONDS = 300       # a repository's runs are listed no oftener than this
+LIST_PAGE = 30
+WAKE_WINDOW = 3600       # a red head older than this is history, not news
+RETRY_SECONDS = 300
+MAX_JOBS = 10            # failed job names in one line
+LEDGER_MAX = 200
+NEEDS = ("_RedsReader", "GitHubItem", "PROG", "_read_small", "_write_small", "_one_line", "load_module", "chiefs_of_staff")
+
+ISO = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ")
+PR_TITLE = re.compile(r"\(#(\d{1,9})\)|^Merge pull request #(\d{1,9})")
+SHA = re.compile(r"[0-9a-f]{7,40}")
+
+
+def _epoch(text):
+    if isinstance(text, str) and ISO.fullmatch(text):
+        return calendar.timegm(time.strptime(text, "%Y-%m-%dT%H:%M:%SZ"))
+    return None
+
+
+def pr_of(run):
+    """The pull request a merge commit's title names, or None."""
+    message = ((run.get("head_commit") or {}).get("message") or "") if isinstance(run, dict) else ""
+    found = PR_TITLE.findall(str(message).split("\n", 1)[0])
+    if not found:
+        return None
+    number = [a or b for a, b in found][-1]
+    return int(number)
+
+
+def newest_by_head(runs, branch=BRANCH):
+    """[(began, head, run)] oldest first: the newest run of each head of `branch`; a run that is not a dict, has no usable head or time is ignored."""
+    best = {}
+    for run in runs if isinstance(runs, list) else []:
+        if not isinstance(run, dict) or run.get("head_branch") != branch or not isinstance(run.get("head_sha"), str) or not SHA.fullmatch(run["head_sha"]):
+            continue
+        began = _epoch(run.get("created_at"))
+        if began is None or not isinstance(run.get("id"), int) or isinstance(run.get("id"), bool):
+            continue
+        old = best.get(run["head_sha"])
+        if old is None or (began, run["id"]) > (old[0], old[2]["id"]):
+            best[run["head_sha"]] = (began, run["head_sha"], run)
+    first = {}
+    for run in runs if isinstance(runs, list) else []:   # a head is placed where its FIRST run began (a rerun does not move it)
+        if isinstance(run, dict) and run.get("head_sha") in best and _epoch(run.get("created_at")) is not None:
+            first[run["head_sha"]] = min(first.get(run["head_sha"], 1 << 60), _epoch(run["created_at"]))
+    return sorted(((first[h], h, r) for _, h, r in best.values()), key=lambda t: (t[0], t[1]))
+
+
+def build_line(sb_safe, repo, head, pr, failed, repeated):
+    names = ", ".join('"%s"' % sb_safe(n, 100) for n in failed[:MAX_JOBS]) + (" and %d more" % (len(failed) - MAX_JOBS) if len(failed) > MAX_JOBS else "")
+    what = "failed %d job%s" % (len(failed), "" if len(failed) == 1 else "s")
+    lead = "The %s tip of %s is red after the merge %s" % (BRANCH, repo, head[:8]) if not repeated else \
+           "The %s tip of %s was already red and the merge %s adds new failing jobs" % (BRANCH, repo, head[:8])
+    via = " (pull request #%d)" % pr if pr else " (its pull request is not known)"
+    return "%s%s: its CI run %s: %s. Fix it forward or revert that merge; the next merges are not to be judged against this red." % (lead, via, what, names or "(job names unreadable)")
+
+
+def read_ledger(sb, engine):
+    """{"heads": {sha: {"ts", "failed": [names] or None, "noted": bool}}, "last": sha or None}. A damaged file reads as empty."""
+    raw = sb._read_small(engine.state_dir, STATE_FILE)
+    heads = {}
+    for sha, value in ((raw.get("heads") if isinstance(raw, dict) else None) or {}).items():
+        if isinstance(sha, str) and SHA.fullmatch(sha) and isinstance(value, dict) and isinstance(value.get("ts"), (int, float)):
+            failed = value.get("failed")
+            heads[sha] = {"ts": value["ts"], "noted": bool(value.get("noted")), "repo": value.get("repo") if isinstance(value.get("repo"), str) else None,
+                          "failed": [str(n)[:200] for n in failed[:200]] if isinstance(failed, list) else None}
+    return heads
+
+
+def write_ledger(sb, engine, heads):
+    while len(heads) > LEDGER_MAX:
+        del heads[min(heads, key=lambda k: heads[k]["ts"])]
+    sb._write_small(engine.state_dir, STATE_FILE, {"heads": heads})
+
+
+def watched(sb, engine, repo):
+    if sb.load_module("repo_exclusion").is_excluded(engine.config, repo):
+        return False
+    return repo.lower() in {r.lower() for r in engine.repos_in_play()}
+
+
+def run_pass(sb, engine, now, calls):
+    """One pass. `calls` is the pass's budget of gh reads. Never raises into the caller. Returns the number of reads spent."""
+    hub = getattr(engine, "hub", None)
+    if engine.audit is None or engine.state_dir is None or hub is None or not hasattr(hub, "route_of"):
+        return 0
+    discovery = getattr(engine, "discovery", None)
+    if discovery is None or discovery.problems:
+        return 0
+    memory = engine.__dict__.setdefault("tip_watch", {"listed": {}, "runs": {}, "retry": {}, "said": set(), "sent": {}})
+    heads = read_ledger(sb, engine)
+    before = {k: dict(v) for k, v in heads.items()}
+    runner = getattr(engine, "gh_runner", None) or sb.subprocess.run
+    safe = sb.load_module("queue_ejections").safe
+    spent = 0
+    for repo in sorted(engine.repos_in_play()):
+        if not watched(sb, engine, repo):
+            continue
+        reader = sb._RedsReader(engine.config, runner, engine.now, repo)
+        if now - memory["listed"].get(repo, -LIST_SECONDS) >= LIST_SECONDS and spent < calls:
+            spent += 1
+            memory["listed"][repo] = now
+            try:
+                body = reader.json("repos/%s/actions/runs?branch=%s&per_page=%d" % (repo, BRANCH, LIST_PAGE))
+                memory["runs"][repo] = body.get("workflow_runs") if isinstance(body, dict) and isinstance(body.get("workflow_runs"), list) else []
+            except Exception as err:   # said once per repository; listed again after the interval
+                if repo not in memory["said"]:
+                    memory["said"].add(repo)
+                    engine.audit.append(engine.actor, "tip_watch.read_failed", repo, {"error": sb._one_line(str(err), 160)})
+        previous = None   # the failed jobs of the head before: None when unknown
+        known = True
+        for began, head, run in newest_by_head(memory["runs"].get(repo)):
+            if head in heads and heads[head].get("repo") in (repo, None):
+                previous, known = heads[head]["failed"], heads[head]["failed"] is not None
+                continue
+            if run.get("status") != "completed":
+                break   # a run still going: the heads after it wait, so the order is kept
+            conclusion = run.get("conclusion")
+            if conclusion == "success":
+                heads[head] = {"ts": began, "failed": [], "noted": True, "repo": repo}
+                previous, known = [], True
+                continue
+            if conclusion != "failure":   # cancelled, skipped, neutral: decides nothing
+                continue
+            if now < memory["retry"].get(head, 0):
+                break
+            if head not in memory["sent"] and spent >= calls:
+                break   # the rest wait for the next pass
+            failed = None
+            if head not in memory["sent"]:
+                spent += 1
+                try:
+                    done = reader.json("repos/%s/actions/runs/%d/jobs?filter=latest&per_page=100" % (repo, run["id"]))
+                    jobs = done.get("jobs") if isinstance(done, dict) else None
+                    failed = sorted({safe(j.get("name") or "", 200) for j in jobs if isinstance(j, dict) and j.get("conclusion") == "failure"} - {""}) if isinstance(jobs, list) else None
+                except Exception as err:
+                    memory["retry"][head] = now + RETRY_SECONDS
+                    if head not in memory["said"]:
+                        memory["said"].add(head)
+                        engine.audit.append(engine.actor, "tip_watch.read_failed", "%s@%s" % (repo, head[:8]), {"error": sb._one_line(str(err), 160)})
+                    break
+            else:
+                failed = memory["sent"][head]["failed"]
+            news = list(failed or [])
+            repeated = bool(known and previous)
+            if repeated:
+                news = [n for n in news if n not in previous]
+            old = now - began > WAKE_WINDOW
+            if (repeated and failed is not None and not news) or old:
+                heads[head] = {"ts": began, "failed": failed, "noted": True, "repo": repo}
+                previous, known = failed, failed is not None
+                continue
+            if not _tell(sb, engine, hub, discovery, memory, safe, repo, head, run, failed, news, repeated, now):
+                break
+            heads[head] = {"ts": began, "failed": failed, "noted": True, "repo": repo}
+            previous, known = failed, failed is not None
+            before = _save(sb, engine, heads, before)
+    _save(sb, engine, heads, before)
+    memory["sent"] = {h: v for h, v in memory["sent"].items() if h not in heads}
+    return spent
+
+
+def _tell(sb, engine, hub, discovery, memory, safe, repo, head, run, failed, news, repeated, now):
+    """True when every recipient was told (a recipient already told is not told again). The Chief of Staff always; the merging lane too when it is known."""
+    chiefs = sb.chiefs_of_staff(discovery)
+    if not chiefs:
+        memory["retry"][head] = now + RETRY_SECONDS
+        return False
+    number = pr_of(run)
+    lane = None
+    if number is not None:
+        item = sb.GitHubItem("tip:%s" % head, "tip", "", repo, [], [("pr", number)], sb.PROG, now, numbers=[number])
+        try:
+            lane = hub.route_of(item, discovery.agents, now)[0]
+        except Exception:
+            lane = None
+    line = build_line(safe, repo, head, number, news, repeated)
+    state = memory["sent"].setdefault(head, {"failed": failed, "to": set()})
+    ok = True
+    for to in [chiefs[0]] + ([lane] if lane and lane != chiefs[0] else []):
+        if to in state["to"]:
+            continue
+        try:
+            sent = bool(engine.send(sb.PROG, to, line).get("sent"))
+        except Exception:
+            sent = False
+        if sent:
+            state["to"].add(to)
+        else:
+            ok = False
+    if not ok:
+        memory["retry"][head] = now + RETRY_SECONDS
+        return False
+    engine.audit.append(engine.actor, "tip_watch.noticed", "%s@%s" % (repo, head[:8]), {"pr": number, "to": sorted(state["to"]), "jobs": len(news), "repeated": repeated})
+    return True
+
+
+def _save(sb, engine, heads, before):
+    if heads == before:
+        return before
+    try:
+        write_ledger(sb, engine, heads)
+    except OSError as err:
+        engine._note("tip_watch.error", None, {"error": "%s not written: %s" % (STATE_FILE, sb._one_line(str(err), 100))})
+        return before
+    return {k: dict(v) for k, v in heads.items()}
