@@ -51,3 +51,48 @@ def save(state_dir, cursors, parse):
     except OSError:
         return False
     return True
+
+
+GAP_FILE = "comment-gaps.json"
+GAP_MAX_BYTES = 1 << 20
+GAP_MAX_KEYS = 20
+GAP_MAX_IDS = 6400
+
+
+def load_gaps(state_dir, parse):
+    """#2238: {"<consumer>|<repository>": {"edge": ISO, "ids": [ids read so far]}} of the windows whose gap was open; {} when absent, too large or malformed."""
+    try:
+        with open(str(Path(state_dir) / GAP_FILE), "rb") as handle:
+            raw = handle.read(GAP_MAX_BYTES + 1)
+        if len(raw) > GAP_MAX_BYTES:
+            return {}
+        data = parse(raw.decode("utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    out = {}
+    for k, v in data.items():
+        if isinstance(k, str) and isinstance(v, dict) and isinstance(v.get("edge"), str) and isinstance(v.get("ids"), list):
+            out[k] = {"edge": v["edge"], "ids": [i for i in v["ids"] if isinstance(i, (int, str))][-GAP_MAX_IDS:]}
+    return dict(sorted(out.items(), key=lambda kv: kv[1]["edge"])[-GAP_MAX_KEYS:])
+
+
+def save_gaps(state_dir, gaps, parse):
+    """Writes the open gaps atomically (mode 0600) when the content changes; bounded in keys, ids and bytes. False when it could not be written."""
+    new = {k: {"edge": v["edge"], "ids": list(v["ids"])[-GAP_MAX_IDS:]} for k, v in sorted(gaps.items(), key=lambda kv: kv[1]["edge"])[-GAP_MAX_KEYS:]}
+    if load_gaps(state_dir, parse) == new:
+        return True
+    path = Path(state_dir) / GAP_FILE
+    text = json.dumps(new, sort_keys=True) + "\n"
+    if len(text.encode("utf-8")) > GAP_MAX_BYTES:
+        return False
+    tmp = path.with_name(GAP_FILE + ".tmp")
+    try:
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as handle:
+            handle.write(text)
+        os.replace(str(tmp), str(path))
+    except OSError:
+        return False
+    return True

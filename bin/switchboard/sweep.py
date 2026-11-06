@@ -922,7 +922,14 @@ def sweep_decisions(engine, decisions, now, errors=()):
     regex = sweep_phrase_re(cfg["person_names"])
     state.strong = sweep_strong_re(cfg["person_names"])
     budget = [cfg.get("calls_per_pass", SWEEP_CALLS_PER_PASS)]
-    sweep_refresh(engine, state, repos, now, cfg, regex, budget)
+    hub = getattr(engine, "hub", None)
+    if hasattr(hub, "reserve_comment_gaps"):
+        hub.reserve_comment_gaps("sweep", repos, budget)   # #2238: an open comment gap's page is set aside before the main reads
+    try:
+        sweep_refresh(engine, state, repos, now, cfg, regex, budget)
+    finally:
+        if hasattr(hub, "release_comment_gaps"):
+            hub.release_comment_gaps(budget)   # #2238: what was set aside and not used goes back
     share = [(budget[0] + 1) // 2]  # the single reads are split: half for S4, the rest (and S4's unused) to verifying
     start = share[0]
     kept, stale = sweep_withdraw(engine, state, watched, home, now, cfg, share)
