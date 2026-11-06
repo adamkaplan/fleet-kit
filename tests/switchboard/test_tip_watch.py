@@ -11,7 +11,7 @@ class TipGh:
 
     def __init__(self, sb):
         self.sb, self.runs, self.jobs, self.calls, self.fault = sb, [], {}, [], False
-        self.between, self.files, self.logs = {}, {}, {}   # head -> [(sha, pr)] merged since the run before it; pr -> [file names]; job id -> log text
+        self.fail, self.total, self.between, self.files, self.logs = [], None, {}, {}, {}   # head -> [(sha, pr)] merged since the run before it; pr -> [file names]; job id -> log text
 
     def add(self, now, run_id, head, pr, jobs=(), conclusion=None, age=60, status="completed", branch="integration", done=None, kind="failure"):
         failed = [j for j in jobs]
@@ -24,13 +24,21 @@ class TipGh:
         path = list(argv)[-1]
         self.calls.append(path)
         done = lambda text, code=0: subprocess.CompletedProcess(argv, code, text, "gh: HTTP 500" if code else "")
+        if any(f in path for f in self.fail):
+            return done("", 1)
         if self.fault and "/jobs" in path:
             return done("", 1)
         if path.startswith("repos/acme/widget/actions/runs?branch=integration"):
             return done(json.dumps({"workflow_runs": self.runs}))
         if path.startswith("repos/acme/widget/compare/"):
             head = path.split("...")[1].split("?")[0]
-            return done(json.dumps({"commits": [{"sha": sha, "commit": {"message": "A change (#%d)\n\nbody" % pr}} for sha, pr in self.between.get(head, [(head, 0)])]}))
+            allc = self.between.get(head, [(head, 0)])
+            page = int(path.split("&page=")[1]) if "&page=" in path else 1
+            chunk = allc[(page - 1) * 100:page * 100] if self.total else allc
+            body = {"commits": [{"sha": sha, "commit": {"message": "A change (#%d)\n\nbody" % pr}} for sha, pr in chunk]}
+            if self.total:
+                body["total_commits"] = len(allc)
+            return done(json.dumps(body))
         if path.startswith("repos/acme/widget/pulls/"):
             return done(json.dumps([{"filename": f} for f in self.files.get(int(path.split("/")[4]), [])]))
         if "/actions/jobs/" in path and path.split("?")[0].endswith("/logs"):
@@ -230,5 +238,70 @@ def build(Base, World, FAKE_GH, EjectionHub, sb):
         def test_control_the_newest_head_is_not_blamed_for_a_range(self):
             self.nine({22: ["tests/switchboard/test_gh_shim_body.py"]}, 'File "tests/switchboard/test_gh_shim_body.py"')
             self.assertNotIn("after the merge dddddddd (pull request #23)", self.sent[0][1])
+
+        def unread_says_unknown(self):
+            self.assertEqual([to for to, _ in self.sent], ["chief"])
+            line = self.sent[0][1]
+            self.assertIn("range unread; likeliest: unknown", line)
+            self.assertNotIn("after the merge dddddddd", line)
+
+        def test_a_compare_failure_says_range_unread_to_the_chief_alone(self):
+            self.gh.fail = ["/compare/"]
+            self.nine({}, "")
+            self.unread_says_unknown()
+
+        def test_a_pulls_files_failure_says_unknown_to_the_chief_alone(self):
+            self.gh.fail = ["/pulls/"]
+            self.nine({21: ["bin/gh_shim_body.py"]}, "tests/switchboard/test_gh_shim_body.py::test_x FAILED")
+            self.assertEqual([to for to, _ in self.sent], ["chief"])
+            self.assertIn("likeliest: unknown", self.sent[0][1])
+
+        def test_a_log_failure_says_unknown_to_the_chief_alone(self):
+            self.gh.fail = ["/logs"]
+            self.nine({21: ["bin/gh_shim_body.py"]}, "tests/switchboard/test_gh_shim_body.py::test_x FAILED")
+            self.assertEqual([to for to, _ in self.sent], ["chief"])
+            self.assertIn("likeliest: unknown", self.sent[0][1])
+
+        def test_an_empty_compare_says_range_unread(self):
+            self.gh.between["d" * 40] = []
+            self.add(1, "a" * 40, 11, age=300)
+            self.add(2, "d" * 40, 23, ["shards (3/8)"], age=30)
+            self.go()
+            self.unread_says_unknown()
+
+        def many(self, count, total=False):
+            self.add(1, "a" * 40, 11, age=300)
+            self.add(2, "d" * 40, 23, ["shards (3/8)"], age=30)
+            self.gh.between["d" * 40] = [("%040x" % (i + 1), 100 + i) for i in range(count)]
+            self.gh.total = total
+            self.gh.logs[200] = "tests/switchboard/test_nothing_here.py::t FAILED"
+            return self.go()
+
+        def test_a_range_over_the_cap_is_counted_against_the_pass_and_capped_per_run(self):
+            spent = self.many(40)
+            extra = [c for c in self.gh.calls if "/compare/" in c or "/pulls/" in c or c.endswith("/logs")]
+            self.assertEqual(len(extra), self.module.MAX_RANGE_READS)
+            self.assertEqual(spent, 2 + self.module.MAX_RANGE_READS)   # list + jobs + the range reads
+            self.assertIn("likeliest: unknown", self.sent[0][1])
+
+        def test_the_pass_budget_bounds_the_range_reads(self):
+            self.add(1, "a" * 40, 11, age=300)
+            self.add(2, "d" * 40, 23, ["shards (3/8)"], age=30)
+            self.gh.between["d" * 40] = [("%040x" % (i + 1), 100 + i) for i in range(5)]
+            spent = self.go(calls=4)
+            self.assertLessEqual(spent, 4)
+            self.assertLessEqual(len(self.gh.calls), 4)
+
+        def test_a_range_over_one_page_reads_the_newest_page_and_says_at_least(self):
+            self.many(130, total=True)
+            line = self.sent[0][1]
+            self.assertIn("at least 30 merges", line)
+            self.assertIn("#229", line)   # the newest merge is named
+            self.assertTrue(any("page=2" in c for c in self.gh.calls))
+
+        def test_the_lane_name_is_clipped(self):
+            self.engine.hub = EjectionHub(owner="L" * 500)
+            self.nine({22: ["tests/switchboard/test_gh_shim_body.py"]}, 'File "tests/switchboard/test_gh_shim_body.py"')
+            self.assertNotIn("L" * 100, self.sent[0][1])
 
     return TestTipWatch

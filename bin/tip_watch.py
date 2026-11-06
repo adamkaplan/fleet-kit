@@ -25,6 +25,7 @@ LIST_PAGE = 30
 WAKE_WINDOW = 3600       # a red head older than this is history, not news
 RETRY_SECONDS = 300
 MAX_RANGE = 30           # merges of a range read and named
+MAX_RANGE_READS = 12     # extra GETs one run may spend on its range (compare, logs, files), also bounded by the pass budget
 MAX_LOG = 400000         # characters of one job log looked at
 MAX_LOG_JOBS = 3         # failed jobs whose logs are read for the failing test file
 MAX_PR_FILES = 100       # files of one pull request looked at
@@ -75,7 +76,7 @@ def failing_files(text):
 
 
 def touches(changed, test_file):
-    """True when `changed` (paths a pull request touched) holds the test file or the file it tests (test_x.py tests x.py / x)."""
+    """(Matching is also by file stem alone: a same-named file in another directory matches.) True when `changed` (paths a pull request touched) holds the test file or the file it tests (test_x.py tests x.py / x)."""
     stem = test_file.rsplit("/", 1)[-1][:-3].replace("-", "_")
     tested = stem[5:] if stem.startswith("test_") else stem[4:] if stem.startswith("test") else stem
     for path in changed:
@@ -113,12 +114,15 @@ def build_line(sb_safe, repo, head, pr, failed, repeated, span=None):
     lead = "The %s tip of %s is red after the merge %s" % (BRANCH, repo, head[:8]) if not repeated else \
            "The %s tip of %s was already red and the merge %s adds new failing jobs" % (BRANCH, repo, head[:8])
     via = " (pull request #%d)" % pr if pr else " (its pull request is not known)"
+    if span and span.get("unread"):   # known to span several merges, the range cannot be read: nobody is blamed
+        return "%s: its CI run %s: %s. The run held several merges since the last run; range unread; likeliest: unknown. Fix it forward or revert the culprit; the next merges are not to be judged against this red." % (
+            lead.replace(" after the merge", " in the run of the head"), what, names or "(job names unreadable)")
     if span:   # the run held several merges: the newest head is not blamed, the range is named
-        merges = "; ".join("%s #%s (%s)" % (m["sha"][:8], m["pr"], m["lane"] or "lane unknown") for m in span["merges"])
+        merges = "; ".join("%s #%s (%s)" % (m["sha"][:8], m["pr"], sb_safe(m["lane"], 60) if m["lane"] else "lane unknown") for m in span["merges"])
         more = " and %d more" % span["more"] if span.get("more") else ""
-        likely = "likeliest: #%s (%s)" % (span["likely"]["pr"], span["likely"]["lane"] or "lane unknown") if span.get("likely") else "likeliest: unknown"
-        return "%s: its CI run %s: %s. The run held %d merges since the last run: %s%s. %s. Fix it forward or revert the likeliest merge; the next merges are not to be judged against this red." % (
-            lead.replace(" after the merge", " in the run of the head"), what, names or "(job names unreadable)", len(span["merges"]) + span.get("more", 0), merges, more, likely)
+        likely = "likeliest: #%s (%s)" % (span["likely"]["pr"], sb_safe(span["likely"]["lane"], 60) if span["likely"]["lane"] else "lane unknown") if span.get("likely") else "likeliest: unknown"
+        return "%s: its CI run %s: %s. The run held %s%d merges since the last run: %s%s. %s. Fix it forward or revert the likeliest merge; the next merges are not to be judged against this red." % (
+            lead.replace(" after the merge", " in the run of the head"), what, names or "(job names unreadable)", "at least " if span.get("partial") else "", len(span["merges"]) + span.get("more", 0), merges, more, likely)
     return "%s%s: its CI run %s: %s. Fix it forward or revert that merge; the next merges are not to be judged against this red." % (lead, via, what, names or "(job names unreadable)")
 
 
@@ -241,7 +245,10 @@ def run_pass(sb, engine, now, calls):
                 heads[head] = {"ts": began, "failed": failed, "noted": True, "repo": repo}
                 previous, known, unknown_red = failed or [], failed is not None, failed is None
                 continue
-            if not _tell(sb, engine, hub, discovery, memory, safe, repo, head, run, failed, news, repeated, now, reader, before_head, failed_ids):
+            budget = [min(MAX_RANGE_READS, max(0, calls - spent))]   # extra reads of this run's range, counted against the pass
+            told = _tell(sb, engine, hub, discovery, memory, safe, repo, head, run, failed, news, repeated, now, reader, before_head, failed_ids, budget)
+            spent += min(MAX_RANGE_READS, max(0, calls - spent)) - budget[0]
+            if not told:
                 break
             heads[head] = {"ts": began, "failed": failed, "noted": True, "repo": repo}
             previous, known, unknown_red = failed or [], failed is not None, failed is None
@@ -264,17 +271,34 @@ def _lane(sb, hub, discovery, repo, head, number, now):
         return None
 
 
-def _span(sb, hub, discovery, memory, repo, head, before_head, reader, failed_ids, now):
-    """None for a run of one merge (or when the range cannot be read: as before); else {"merges": [{"sha","pr","lane"}], "more": n, "likely": merge or None}.
-    GET only: one compare, the logs of up to MAX_LOG_JOBS failed jobs, the files of each merge until one matches."""
+def _span(sb, hub, discovery, memory, repo, head, before_head, reader, failed_ids, now, budget=None):
+    """None for a run of one merge; {"unread": True} when the run spans several heads but the range cannot be read (nobody is blamed); else
+    {"merges": [{"sha","pr","lane"}], "more": n, "partial": bool, "likely": merge or None}. GET only; every read is taken from `budget` (a one-item list)."""
     if not before_head or before_head == head:
         return None
     cached = memory.setdefault("span", {})
     if head in cached:
         return cached[head]
+    if budget is None:
+        budget = [MAX_RANGE_READS]
+    unread = {"unread": True}
+
+    def get(path):
+        if budget[0] <= 0:
+            raise RuntimeError("range read budget spent")
+        budget[0] -= 1
+        return reader.json(path)
+
+    partial = False
     try:
-        body = reader.json("repos/%s/compare/%s...%s?per_page=100" % (repo, before_head, head))
+        base = "repos/%s/compare/%s...%s?per_page=100" % (repo, before_head, head)
+        body = get(base)
+        total = body.get("total_commits") if isinstance(body, dict) else None
         commits = body.get("commits") if isinstance(body, dict) else None
+        if isinstance(total, int) and isinstance(commits, list) and total > len(commits):   # compare lists the OLDEST first: read the last page, the newest
+            partial = True
+            body = get(base + "&page=%d" % (-(-total // 100)))
+            commits = body.get("commits") if isinstance(body, dict) else None
         merges = []
         for c in commits if isinstance(commits, list) else []:
             message = ((c.get("commit") or {}).get("message") or "") if isinstance(c, dict) else ""
@@ -282,8 +306,10 @@ def _span(sb, hub, discovery, memory, repo, head, before_head, reader, failed_id
             if number is not None and isinstance(c.get("sha"), str) and SHA.fullmatch(c["sha"]):
                 merges.append({"sha": c["sha"], "pr": number})
     except Exception:
-        return None
-    if len(merges) < 2:
+        return unread
+    if not merges:
+        return unread
+    if len(merges) < 2 and not partial:
         return None
     more = max(0, len(merges) - MAX_RANGE)
     merges = merges[-MAX_RANGE:]
@@ -291,6 +317,9 @@ def _span(sb, hub, discovery, memory, repo, head, before_head, reader, failed_id
         m["lane"] = _lane(sb, hub, discovery, repo, m["sha"], m["pr"], now)
     tests = []
     for job in failed_ids[:MAX_LOG_JOBS]:
+        if budget[0] <= 0:
+            break
+        budget[0] -= 1
         try:
             done = reader.accounts.read(reader.runner, "repos/%s/actions/jobs/%d/logs" % (repo, job), repo, reader.config["call_timeout_seconds"], stdin=subprocess.DEVNULL)
             if done.returncode == 0:
@@ -300,26 +329,29 @@ def _span(sb, hub, discovery, memory, repo, head, before_head, reader, failed_id
     likely = None
     for m in reversed(merges) if tests else []:   # the newest matching merge first
         try:
-            files = reader.json("repos/%s/pulls/%d/files?per_page=%d" % (repo, m["pr"], MAX_PR_FILES))
+            files = get("repos/%s/pulls/%d/files?per_page=%d" % (repo, m["pr"], MAX_PR_FILES))
         except Exception:
-            continue
+            likely = None   # a newer merge unread: an older match would be a guess
+            break
         names = [f.get("filename") for f in files if isinstance(f, dict) and isinstance(f.get("filename"), str)] if isinstance(files, list) else []
         if any(touches(names, t) for t in tests):
             likely = m
             break
-    cached[head] = {"merges": merges, "more": more, "likely": likely}
+    cached[head] = {"merges": merges, "more": more, "partial": partial, "likely": likely}
     return cached[head]
 
 
-def _tell(sb, engine, hub, discovery, memory, safe, repo, head, run, failed, news, repeated, now, reader=None, before_head=None, failed_ids=()):
+def _tell(sb, engine, hub, discovery, memory, safe, repo, head, run, failed, news, repeated, now, reader=None, before_head=None, failed_ids=(), budget=None):
     """True when every recipient was told (a recipient already told is not told again). The Chief of Staff always; the merging lane too when it is known."""
     chiefs = sb.chiefs_of_staff(discovery)
     if not chiefs:
         memory["retry"][head] = now + RETRY_SECONDS
         return False
     number = pr_of(run)
-    span = _span(sb, hub, discovery, memory, repo, head, before_head, reader, failed_ids, now) if reader is not None else None
-    if span:
+    span = _span(sb, hub, discovery, memory, repo, head, before_head, reader, failed_ids, now, budget) if reader is not None else None
+    if span and span.get("unread"):
+        lane, number = None, None   # the Chief of Staff alone
+    elif span:
         lane = span["likely"]["lane"] if span["likely"] else None   # the likeliest pull request's lane; else the Chief of Staff alone
         number = span["likely"]["pr"] if span["likely"] else None
     else:
