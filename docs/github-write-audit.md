@@ -31,5 +31,6 @@ one helper (`github_write`, bin/switchboard/audit.py), before the write, and the
 Scope and limits:
 
 - The `cloud_*` launcher files (`bin/cloud_*.py`) are out of the guard's scan; the plan for #2260 puts the launcher out of scope.
+- The guard reads literal argvs only: a variable `gh` in a tuple, or `shlex.split` of a string, is not seen.
 - In the merge gate, `gate_read_only` is an allow-list of reads (`pr view|diff|list|checks`, `run view|list`, `issue view|list`, `repo view`, a `gh api` without a method, field or input flag). Any other `gh` call through the gate is audited as a write, and no other call goes through the gate today. If a new read is added (for example `api graphql` or `pr status`), add it to `gate_read_only`.
 - The verb of a `gh api` write is read from `-X X`, `-XX`, `--method X` and `--method=X`; with none it is POST.

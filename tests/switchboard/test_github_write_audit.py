@@ -42,7 +42,7 @@ def write_shaped(node):
         words_flags = FLAGS - {"-f", "-F", "--field", "--raw-field"}
     else:
         words_flags = FLAGS
-    if any(w in words_flags or w.startswith(("--method=", "--field=", "--raw-field=", "--input=")) for w in words):
+    if any(w in words_flags or w.startswith(("--method=", "--field=", "--raw-field=", "--input=")) or (w.startswith("-X") and len(w) > 2) for w in words):
         return True
     return any((a, b) in WRITE_WORD_PAIRS for a, b in zip(words, words[1:]))
 
@@ -240,7 +240,7 @@ class TestGithubWriteGuard(unittest.TestCase):
             self.assertEqual(unaudited_writes(sources), ["bin/switchboard/planted.py:2"])
 
     def test_a_tuple_and_a_split_argv_are_named(self):
-        for plant in ("def f(run):\n    run(('gh', 'api', 'x', '--method', 'PUT'))\n", "def f(run):\n    run('gh pr merge 9'.split())\n"):
+        for plant in ("def f(run):\n    run(('gh', 'api', 'x', '--method', 'PUT'))\n", "def f(run):\n    run('gh pr merge 9'.split())\n", "def f(run):\n    run(['gh', 'api', 'x', '-XPATCH'])\n"):
             self.assertEqual(unaudited_writes({"a.py": plant}), ["a.py:2"])
 
 
