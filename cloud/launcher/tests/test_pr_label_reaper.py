@@ -160,10 +160,10 @@ class PrLabel(unittest.TestCase):
 
     def test_fork_head_is_not_labelled(self):
         with tempfile.TemporaryDirectory() as tmp:
-            s = Scene([pod()], {"w1": "41\n42\n"}, tmp)
-            s.heads = {41: ("coder/x", "open", "someone-else/fleet-kit"), 42: ("coder/x", "open")}
+            s = Scene([pod()], {"w1": "51\n52\n"}, tmp)
+            s.heads = {51: ("coder/x", "open", "someone-else/fleet-kit"), 52: ("coder/x", "open")}
             s.reap()
-            self.assertEqual([c[1] for c in s.calls], [42])
+            self.assertEqual([c[1] for c in s.calls], [52])
 
     def test_failed_done_mark_is_not_looped(self):
         with tempfile.TemporaryDirectory() as tmp:
