@@ -33,6 +33,8 @@ DROP = ("gh: refused: this body would drop the Intent or the Done-when of the is
         "or send the whole body with both parts")
 UNREAD = ("gh: refused: the current body of the issue could not be read, or is empty, so a body write cannot be checked: retry "
           "(or change one line with `fleet-switchboard issue-line`)")
+UNREAD_WHY = ("gh: refused: the current body of the issue could not be read (%s), so a body write cannot be checked: retry "
+              "(or change one line with `fleet-switchboard issue-line`)")
 UNCLASSIFIED = ("gh: refused: this write to an issue cannot be classified (the new body cannot be read from it), so it cannot be checked: send the body "
                 "with -f body=..., -F body=@file or --input with a JSON object, or use `fleet-switchboard issue-line`")
 GRAPHQL = ("gh: refused: a GraphQL updateIssue cannot be checked against the body it replaces: use `gh issue edit` with a body that keeps both parts, "
@@ -68,7 +70,7 @@ class Probe:
             seconds = float(os.environ.get("FLEET_SHIM_HOLD_SECONDS", 5.0))
         except ValueError:
             seconds = 5.0
-        self.deadline = time.monotonic() + min(10.0, max(0.2, seconds))
+        self.seconds, self.why = min(10.0, max(0.2, seconds)), None   # the body read's OWN limit, counted from the read, not from here
 
     def stdin_text(self):
         if self.text is None:
@@ -108,25 +110,39 @@ class Probe:
         return text
 
     def fetch(self, argv):
-        """The JSON object gh prints for a read, or None on any failure (including the spent deadline)."""
-        left = self.deadline - time.monotonic()
-        if left <= 0 or not self.gh:
+        """The JSON object gh prints for a read, or None on any failure; self.why then says which (a time-out, an exit status, unparsable output)."""
+        left = self.seconds
+        if not self.gh:
+            self.why = "no gh to read it with"
             return None
         try:
             env = dict(self.env_of() or os.environ)
             env["GH_PROMPT_DISABLED"] = "1"
             env["GH_PAGER"] = "cat"
             done = subprocess.run([self.gh] + argv, capture_output=True, text=True, timeout=left, stdin=subprocess.DEVNULL, env=env)
-            data = json.loads(done.stdout) if done.returncode == 0 and done.stdout else None
-        except Exception:
+            if done.returncode != 0:
+                self.why = "the read exited with status %d" % done.returncode
+                return None
+            data = json.loads(done.stdout) if done.stdout else None
+        except subprocess.TimeoutExpired:
+            self.why = "the read timed out after %.1f seconds" % left
             return None
-        return data if isinstance(data, dict) else None
+        except ValueError:
+            self.why = "the read printed output that is not JSON"
+            return None
+        except Exception as error:
+            self.why = "the read could not run (%s)" % type(error).__name__
+            return None
+        if not isinstance(data, dict):
+            self.why = "the read printed output that is not a JSON object"
+            return None
+        return data
 
 
 def check_current(probe, argv, new_body):
     data = probe.fetch(argv)
     if data is None:
-        return UNREAD
+        return UNREAD_WHY % (probe.why or "no reason given")
     if isinstance(data.get("pull_request"), dict):
         return None
     return refusal(data.get("body") or "", new_body)
