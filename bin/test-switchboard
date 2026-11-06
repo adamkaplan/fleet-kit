@@ -80116,6 +80116,7 @@ Brief_test_brief_fix_TestClassifyRoots, Brief_test_brief_fix_TestDeletionsAndCla
     _brief_modules["test_brief_fix"].TestMutants, _brief_modules["test_brief_fix"].TestTablesDerivedFromTheCode)
 Brief_test_brief_order_TestRefusalOrder = _brief_modules["test_brief_order"].TestRefusalOrder
 Pod_header_TestPodHeader = _load_brief_tests("test_pod_header").TestPodHeader   # #2205
+Record_issue_TestRecordIssue = _load_brief_tests("test_record_issue").TestRecordIssue   # #2246
 Brief_impact_brief_BriefTests, Brief_impact_brief_MutantTests = _brief_modules["test-impact-brief"].BriefTests, _brief_modules["test-impact-brief"].MutantTests
 Brief_installed_guard_TreeCase, Brief_installed_guard_TestTheEntryGuard, Brief_installed_guard_TestTheDaemon, Brief_installed_guard_TestTheHooks, Brief_installed_guard_TestTheDocument, Brief_installed_guard_TestAdviceNamesAWorktree = (
     _brief_modules["test_installed_guard"].TreeCase, _brief_modules["test_installed_guard"].TestTheEntryGuard, _brief_modules["test_installed_guard"].TestTheDaemon, _brief_modules["test_installed_guard"].TestTheHooks,
