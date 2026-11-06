@@ -17675,7 +17675,7 @@ class TestHandoff(HandoffCase):
     def test_the_record_comes_before_the_launch_and_every_write_is_audited(self):
         self.main()
         self.assertLess(self.order.index("gh"), self.order.index("session.create"))
-        events = [(e["event"], e["phase"]) for e in self.world.audit() if e["event"].startswith(("github.", "v2.session"))]
+        events = [(e["event"], e["phase"]) for e in self.world.audit() if e["event"].startswith(("github.", "v2.session")) and e["event"] != "github.write"]   # #2260: the helper's own line is proved by TestGithubWriteAudit
         self.assertEqual(events[:2], [("github.comment", "intent"), ("github.comment", "result")])
         comment = [e for e in self.world.audit() if e["event"] == "github.comment"]
         self.assertEqual(comment[0]["detail"]["issue"], 2)
@@ -17779,7 +17779,7 @@ class TestHandoff(HandoffCase):
         # the handoff comment, (PR 17) `write_issue_body` and (PR 18) `_gh_write`: labels and comments
         # (#1123) plus ONE site in `_review_api`, the shared helper of `review post` and `review dismiss`: their writes (a review, a dismissal) are deliberate and the only ones added;
         # the reader code (IntentReader, checked above, and checkout/measure) stays read-only
-        self.assertEqual(source.count('"--method"'), 5)
+        # #2260: no count of write sites is pinned; TestGithubWriteAudit finds each write by its shape and requires it to go through the audit helper
         self.assertEqual(len(re.findall(r"_review_api\([^)]*\"(?:POST|PUT)\"", source)), 2)   # the post (the verdict and its own-account fallback share one call site, the event is a variable) and the dismissal: each goes through the helper
 
 
