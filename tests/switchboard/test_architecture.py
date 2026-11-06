@@ -54,10 +54,30 @@ def _section(text, heading):
     return match.group(1) if match else ""
 
 
-def parse_document(text):
-    """The Units table as {path: (layer, job, also-may-use set)} and the Known violations table as {(from, to, kind): (ceiling, why)}."""
+UNIT_ROWS = Path("docs") / "architecture" / "units"   # ask #2206: one `<unit>.row` file per unit, so two changes that add units never edit one line
+
+
+def unit_row_lines(root):
+    """The rows of the per-unit files under `root`, one line each; a file that is not one row is reported by `row_file_problems`."""
+    base = Path(root) / UNIT_ROWS
+    return [line for path in sorted(base.rglob("*.row")) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()] if base.is_dir() else []
+
+
+def row_file_problems(root):
+    """Every per-unit file that is not exactly one row for the unit its path names."""
+    base, problems = Path(root) / UNIT_ROWS, []
+    for path in sorted(base.rglob("*.row")) if base.is_dir() else []:
+        rel = path.relative_to(base).as_posix()[:-len(".row")]
+        lines = [l for l in path.read_text(encoding="utf-8").splitlines() if l.strip()]
+        if len(lines) != 1 or not lines[0].startswith("| `") or _cells(lines[0])[0].strip("`") != rel:
+            problems.append("%s%s is not exactly one Units row for %s" % (UNIT_ROWS.as_posix() + "/", rel + ".row", rel))
+    return problems
+
+
+def parse_document(text, root=None):
+    """The Units rows (the table of `text`, then the per-unit files under `root`) as {path: (layer, job, also-may-use set)} and the Known violations table as {(from, to, kind): (ceiling, why)}."""
     units, violations = {}, {}
-    for line in _section(text, "Units").splitlines():
+    for line in _section(text, "Units").splitlines() + (unit_row_lines(root) if root is not None else []):
         if line.startswith("| `"):
             unit, layer, job, also = (_cells(line) + [""] * 4)[:4]
             units[unit.strip("`")] = (int(layer), job, {u.strip().strip("`") for u in also.split(",") if u.strip()})
@@ -487,8 +507,8 @@ def _cycles(graph):
 
 def check(root, text):
     """Every way the code and the document disagree, one sentence each. Empty when they agree."""
-    units, allowed = parse_document(text)
-    problems = []
+    units, allowed = parse_document(text, root)
+    problems = row_file_problems(root)
     files = set(unit_files(root))
     for unit in sorted(files - set(units)):
         problems.append("%s is a unit file with no row in the Units table" % unit)
@@ -550,14 +570,14 @@ class TestArchitectureDocument(unittest.TestCase):
         self.assertEqual(check(REPO, self.text), [], "docs/architecture.md and the code disagree")
 
     def test_every_unit_has_a_layer_a_job_and_the_layers_are_named(self):
-        units, _allowed = parse_document(self.text)
+        units, _allowed = parse_document(self.text, REPO)
         self.assertGreater(len(units), 50)
         named = set(int(m) for m in re.findall(r"^\| (\d) \| \w+ \|", _section(self.text, "Layers"), re.M))
         self.assertEqual(named, set(LAYERS), "the Layers table names layers 0 to 6")
         self.assertEqual({layer for layer, _job, _also in units.values()} - named, set())
 
     def test_the_manifest_and_the_table_name_the_same_parts(self):
-        units, _allowed = parse_document(self.text)
+        units, _allowed = parse_document(self.text, REPO)
         listed = [n.strip() for n in (REPO / "bin" / "fleet-switchboard.parts").read_text().splitlines() if n.strip() and not n.lstrip().startswith("#")]
         self.assertEqual(sorted(n for n in listed if n != ENTRY), sorted(u for u in units if u.startswith("switchboard/")))
 
@@ -568,7 +588,7 @@ class TestArchitectureDocument(unittest.TestCase):
                 self.assertRegex(section, r"(?<![\w.])%s(?![\w])" % re.escape(name), "the rule uses %s: the document must name it, as a whole word" % name)
 
     def test_the_entry_is_the_only_unit_of_layer_six_and_every_part_is_below_it(self):
-        units, _allowed = parse_document(self.text)
+        units, _allowed = parse_document(self.text, REPO)
         self.assertEqual([u for u, v in units.items() if v[0] == 6], [ENTRY])
         self.assertTrue(all(v[0] < units[ENTRY][0] for u, v in units.items() if u.startswith("switchboard/")))
 
@@ -609,6 +629,56 @@ class TestArchitectureDocumentFailurePaths(unittest.TestCase):
         problems = check(root, text)
         self.assertIn("switchboard/extra.py is a unit file with no row in the Units table", problems)
         self.assertIn("switchboard/gone.py is a row of the Units table but there is no such file", problems)
+
+    def _row_file(self, root, unit, line):
+        path = root / "docs" / "architecture" / "units" / (unit + ".row")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(line + "\n")
+
+    def test_a_unit_row_in_its_own_file_counts_and_a_planted_gap_is_named(self):
+        root, text = self.build(parts={"a.py": "X = 1\n"})
+        text = "".join(l for l in text.splitlines(True) if not l.startswith("| `switchboard/a.py`"))
+        self.assertIn("switchboard/a.py is a unit file with no row in the Units table", check(root, text))   # the planted module with no row
+        self._row_file(root, "switchboard/a.py", "| `switchboard/a.py` | 2 | a job | |")
+        self.assertEqual(check(root, text), [])
+        self._row_file(root, "switchboard/gone.py", "| `switchboard/gone.py` | 2 | a job | |")   # the planted row with no file
+        self.assertIn("switchboard/gone.py is a row of the Units table but there is no such file", check(root, text))
+
+    def test_a_row_file_that_is_not_one_row_for_its_own_unit_is_named(self):
+        root, text = self.build(parts={"a.py": "X = 1\n"})
+        self._row_file(root, "switchboard/a.py", "| `switchboard/other.py` | 2 | a job | |")
+        self.assertIn("docs/architecture/units/switchboard/a.py.row is not exactly one Units row for switchboard/a.py", check(root, text))
+
+    def test_two_branches_that_each_add_one_unit_merge_without_a_conflict_where_one_table_conflicts(self):
+        import subprocess
+
+        def git(cwd, *args):
+            return subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *args], cwd=str(cwd), capture_output=True, text=True)
+
+        def conflicts(branch_a, branch_b, files):
+            root = Path(tempfile.mkdtemp())
+            self.addCleanup(shutil.rmtree, str(root), True)
+            git(root, "init", "-q", "-b", "main")
+            for name, body in files.items():
+                (root / name).parent.mkdir(parents=True, exist_ok=True)
+                (root / name).write_text(body)
+            git(root, "add", "-A")
+            git(root, "commit", "-qm", "base")
+            for branch, edits in (("a", branch_a), ("b", branch_b)):
+                git(root, "checkout", "-q", "-b", branch, "main")
+                for name, body in edits.items():
+                    (root / name).parent.mkdir(parents=True, exist_ok=True)
+                    (root / name).write_text(body)
+                git(root, "add", "-A")
+                git(root, "commit", "-qm", branch)
+            out = git(root, "merge-tree", "--write-tree", "a", "b")
+            return out.stdout.count("CONFLICT")
+
+        table = "| `a.py` | 0 | j | |\n| `z.py` | 0 | j | |\n"
+        one_list = conflicts({"t.md": "| `a.py` | 0 | j | |\n| `b.py` | 0 | j | |\n| `z.py` | 0 | j | |\n"}, {"t.md": "| `a.py` | 0 | j | |\n| `c.py` | 0 | j | |\n| `z.py` | 0 | j | |\n"}, {"t.md": table})
+        self.assertGreaterEqual(one_list, 1, "today's form: one table, two added rows, a conflict")
+        per_file = conflicts({"units/b.py.row": "| `b.py` | 0 | j | |\n"}, {"units/c.py.row": "| `c.py` | 0 | j | |\n"}, {"units/a.py.row": "| `a.py` | 0 | j | |\n"})
+        self.assertEqual(per_file, 0)
 
     def test_a_part_that_uses_a_name_the_entry_defines_is_an_upward_dependency_until_a_row_allows_it(self):
         parts = {"low.py": "def go():\n    return shared() + OTHER\n"}

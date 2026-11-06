@@ -1,0 +1,1 @@
+| `switchboard/gate_spool.py` | 5 | the gate spool reader: new lines of the shim's `gate-failopen.jsonl`, rotation, fail-open counts and over-review lines (ask #2216) | |

@@ -75,14 +75,15 @@ def _runs(gh, repo, query, what):
 
 
 def _newest_per_workflow(runs):
-    """The newest run of each workflow (by creation time, then id): the one that decides for that workflow."""
-    best = {}
+    """The newest run of each workflow (by creation time, then id): the one that decides for that workflow. It carries `attempts`: how many runs of that workflow there are."""
+    best, count = {}, {}
     for run in runs:
+        count[run.get("workflow_id", run.get("name"))] = count.get(run.get("workflow_id", run.get("name")), 0) + 1
         key = run.get("workflow_id", run.get("name"))
         rank = (epoch(run.get("created_at")) or 0, run.get("id") if isinstance(run.get("id"), int) else 0)
         if key not in best or rank > best[key][0]:
             best[key] = (rank, run)
-    return [item[1] for item in best.values()]
+    return [dict(item[1], attempts=count[k]) for k, item in best.items()]
 
 
 def read_pr_runs(gh, repo, number, head):
@@ -98,8 +99,29 @@ def read_pr_runs(gh, repo, number, head):
                 sha = (item.get("base") or {}).get("sha") if isinstance(item.get("base"), dict) else None
                 base = sha if isinstance(sha, str) and len(sha) == 40 else None
         out.append({"id": run.get("id"), "workflow": str(run.get("name") or "workflow"), "workflow_id": run.get("workflow_id"),
-                    "status": run.get("status"), "conclusion": run.get("conclusion"), "created": epoch(run.get("created_at")), "base": base})
+                    "status": run.get("status"), "conclusion": run.get("conclusion"), "created": epoch(run.get("created_at")), "base": base,
+                    "attempts": run.get("attempts", 1)})
     return out
+
+
+def read_behind(gh, repo, run_base, tip, _seen={}):   # `ahead_by` of the compare, one read per pair kept in memory (ask #1755)
+    if (n := _seen.get(key := (repo, run_base, tip))) is None:
+        n = (_json(gh, ["api", "repos/%s/compare/%s...%s" % (repo, run_base, tip)], "the commits behind") or {}).get("ahead_by")
+        if not isinstance(n, int) or isinstance(n, bool) or not 0 <= n <= 1000000: raise ReadError("the commits behind were not counted")
+        if len(_seen) >= 256: _seen.pop(next(iter(list(_seen)), None), None)
+        _seen[key] = n
+    return n
+
+
+def read_fresh(gh, repo, number, head, base_ref):   # (run base of the earliest deciding run, tip, behind); None for what could not be read
+    base = tip = behind = None
+    try:
+        runs = read_pr_runs(gh, repo, number, head) if head and isinstance(base_ref, str) and base_ref else []
+        base = min(runs, key=lambda r: r["created"] or 0)["base"] if runs and all(r["base"] for r in runs) else None
+        tip = read_tip(gh, repo, base_ref) if head and isinstance(base_ref, str) and base_ref else None
+        behind = read_behind(gh, repo, base, tip) if base and base != tip else None
+    except (ReadError, AttributeError, TypeError): pass
+    return base, tip, behind
 
 
 def run_result(run):
@@ -118,6 +140,15 @@ def read_failing_jobs(gh, repo, run_id):
     jobs = data.get("jobs") if isinstance(data, dict) else None
     names = [str(j.get("name")) for j in jobs or [] if isinstance(j, dict) and j.get("conclusion") in ("failure", "timed_out", "cancelled", "startup_failure")]
     return names[:5] or ["(no failing job named)"]
+
+
+def read_jobs(gh, repo, run_id):
+    """[{"name", "conclusion", "steps"}] of the jobs of a run (the latest attempt, at most 100; at most 20 steps each: {"name", "conclusion"}): the legs of a matrix are jobs. An unreadable list raises ReadError."""
+    data = _json(gh, ["api", "repos/%s/actions/runs/%s/jobs?filter=latest&per_page=100" % (repo, run_id)], "the jobs of run %s" % run_id)
+    jobs = data.get("jobs") if isinstance(data, dict) else None
+    if not isinstance(jobs, list):
+        raise ReadError("the jobs of run %s answered no list" % run_id)
+    return [{"name": str(j.get("name")), "conclusion": str(j.get("conclusion") or j.get("status") or ""), "steps": [{"name": str(s.get("name")), "conclusion": str(s.get("conclusion") or s.get("status") or "")} for s in (j.get("steps") or []) if isinstance(s, dict)][:20]} for j in jobs if isinstance(j, dict)]
 
 
 def read_branch_runs(gh, repo, branch, workflow_ids=None):

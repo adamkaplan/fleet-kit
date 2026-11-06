@@ -45,13 +45,43 @@ def strip_question(cfg):
     return c
 
 
+RECORD_BASH_PATTERNS = ("*CW_PR_RECORD*", "*pr-record*")   # ask 1200: the closed list of what its change adds
+RECORD_EDIT_ENTRY = {"*pr-record*": "deny"}   # the editing tool's entry for the record paths
+
+
+def strip_record_entries(cfg):
+    """A deep copy without ONLY the entries ask 1200 adds (the two bash patterns and the exact edit entry), in both blocks."""
+    c = copy.deepcopy(cfg)
+    blocks = [c["permission"]] + [a.get("permission", {}) for a in c.get("agent", {}).values()]
+    for b in blocks:
+        for pat in RECORD_BASH_PATTERNS:
+            b.get("bash", {}).pop(pat, None)
+        if b.get("edit") == RECORD_EDIT_ENTRY:
+            del b["edit"]
+    return c
+
+
+def _merge_base(ref):
+    r = subprocess.run(["git", "merge-base", "HEAD", ref], cwd=ROOT, capture_output=True)
+    out = r.stdout.decode().strip() if r.returncode == 0 else ""
+    return out or ref
+
+
 def base_file(rel, mode="text"):
     """The base commit's copy of a file through git (origin/integration, else origin/main); (ref, content) or (None, None)."""
     for ref in ("origin/integration", "origin/main"):
-        r = subprocess.run(["git", "show", ref + ":" + rel], cwd=ROOT, capture_output=True)
+        r = subprocess.run(["git", "show", _merge_base(ref) + ":" + rel], cwd=ROOT, capture_output=True)
         if r.returncode == 0:
             return ref, r.stdout
     return None, None
+
+
+def permission_block(data):
+    """The front matter's rules (ask #1286 protects them); comment lines and the prose below are not part of the pin."""
+    parts = data.split(b"---\n", 2)
+    assert len(parts) == 3, "no front matter"
+    lines = [l for l in parts[1].splitlines() if not l.lstrip().startswith(b"#")]
+    return lines[lines.index(b"permission:"):]
 
 
 def loud_skip(test, what):
@@ -67,7 +97,7 @@ def base_other_keys():
 
 def without_ref_rules(cfg):
     cfg = copy.deepcopy(cfg)
-    gone = ("git*push*main*", "git*push*master*")
+    gone = ("git*push*main*", "git*push*master*", "gh api*/issues/comments/*", "gh api*/issues/comments/* *", "gh api*/issues/comments/*?*")
     for b in (cfg["permission"]["bash"], cfg["agent"]["worker"]["permission"]["bash"]):
         for k in [k for k in b if k in gone or k.startswith("*git*push*")]:
             del b[k]
@@ -91,7 +121,23 @@ class T(unittest.TestCase):
         if base is None:
             loud_skip(self, "the base permission file")
         # pin change of #1549: the push rules for main and master are compared in test_push_rules.py, not here
-        self.assertEqual(without_ref_rules(strip_question(load())), without_ref_rules(base))
+        self.assertEqual(without_ref_rules(strip_record_entries(strip_question(load()))), without_ref_rules(base))
+
+    def test_record_entries_strip_only_the_closed_list(self):
+        cfg = load()
+        stripped = strip_record_entries(cfg)
+        self.assertNotEqual(stripped, cfg, "mutation not applied")
+        for b in (stripped["permission"], stripped["agent"]["worker"]["permission"]):
+            self.assertNotIn("edit", b)
+            self.assertFalse(set(RECORD_BASH_PATTERNS) & set(b["bash"]))
+        for mut in ("bash", "edit"):
+            m = copy.deepcopy(cfg)
+            if mut == "bash":
+                m["permission"]["bash"]["gh extra thing*"] = "allow"
+            else:
+                m["agent"]["worker"]["permission"]["edit"]["*other*"] = "deny"
+            self.assertNotEqual(m, cfg, "mutation not applied")
+            self.assertNotEqual(strip_record_entries(m), strip_record_entries(cfg))
 
     def test_s4_empty_agent_block_is_not_dropped(self):
         cfg = load()
@@ -141,14 +187,29 @@ class T(unittest.TestCase):
         refused += 1
         self.assertEqual(refused, 5)
 
-    def test_s3_image_definition_unchanged(self):
-        with open(os.path.join(ROOT, "agents/opencode/orchestrator.md"), "rb") as a, open(os.path.join(ROOT, ORCH_REL), "rb") as b:
-            img = b.read()
-            self.assertEqual(a.read(), img)
-        ref, data = base_file(ORCH_REL)
-        if ref is None:
-            loud_skip(self, "the base orchestrator definition")
-        self.assertEqual(img, data)
+    PERMISSION_PIN = [b"permission:", b"  edit: deny", b"  read: allow", b"  question: allow", b"  todowrite: allow", b"  bash: allow", b"  external_directory: allow"]
+
+    def test_s3_permission_block_pinned(self):
+        """Guard 1 (ask #1286): the whole permission block of both copies is pinned exactly; only comment lines are exempt."""
+        for rel in ("agents/opencode/orchestrator.md", ORCH_REL):
+            with open(os.path.join(ROOT, rel), "rb") as f:
+                self.assertEqual(permission_block(f.read()), self.PERMISSION_PIN, rel)
+
+    def test_s3_permission_block_mutants_refused(self):
+        with open(os.path.join(ROOT, ORCH_REL), "rb") as f:
+            base = f.read()
+        for old, new in ((b"  question: allow\n", b"  question: deny\n"), (b"  edit: deny\n", b"  edit: allow\n"), (b"  bash: allow\n", b"  bash: ask\n")):
+            m = base.replace(old, new)
+            self.assertNotEqual(m, base)
+            self.assertNotEqual(permission_block(m), self.PERMISSION_PIN, old)
+
+    def test_s3_image_definition_equals_recorded_copy(self):
+        """Guard 2: both copies equal the recorded copy byte for byte; a change to the definition updates the recorded copy in the same pull request."""
+        with open(os.path.join(ROOT, "cloud/worker/tests/golden/orchestrator.md"), "rb") as f:
+            gold = f.read()
+        for rel in ("agents/opencode/orchestrator.md", ORCH_REL):
+            with open(os.path.join(ROOT, rel), "rb") as f:
+                self.assertEqual(f.read(), gold, rel)
 
     def test_no_orchestrator_block_in_config(self):
         self.assertEqual(sorted(load()["agent"]), ["worker"])

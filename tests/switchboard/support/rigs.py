@@ -1,52 +1,8 @@
 """Shared fakes and helpers of bin/test-switchboard (moved text, unchanged): rigs."""
-import argparse
-import ast
-import traceback
-import base64
-import calendar
-import collections
-import contextlib
-import errno
-import copy
-import datetime as _dt
-import fcntl
-import gzip
-import fnmatch
-import hashlib
-import hmac
-import importlib.machinery
-import importlib.util
-import inspect
-import http.client
 import io
-import itertools
-import select
 import json
-import os
 from pathlib import Path
-import re
-from urllib.parse import unquote
-import shlex
-import shutil
-import textwrap
 import zipfile
-import signal
-import socket
-import stat
-import tarfile
-import subprocess
-import sys
-import sysconfig
-import tempfile
-import threading
-import time
-import types
-import unittest
-import uuid
-import urllib.parse
-from unittest import mock
-import importlib
-from support.paths import BIN, REPO
 from support.carry_git import GitHubOverGit
 
 
@@ -63,9 +19,9 @@ def build_carry_repo(directory):
         target.write_text(text)
 
     g("init", "-q", "-b", "main")
-    g("config", "user.email", "dev@example.test")
-    g("config", "user.name", "Dev")
-    g("config", "commit.gpgsign", "false")
+    # The code under test runs its own git (merge, commit) in this repository: the identity lives in the repository's own config FILE (plain file I/O, no `git config` command), so no global identity is needed.
+    with open(directory / ".git" / "config", "a") as config:
+        config.write("[user]\n\temail = dev@example.test\n\tname = Dev\n[commit]\n\tgpgsign = false\n")
     write("README.md", "widget api\n")
     write("a.txt", "one\ntwo\nthree\nfour\nfive\nsix\nseven\n")
     write("src/x.py", "def x():\n    return 1\n")

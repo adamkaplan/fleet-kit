@@ -1,0 +1,1 @@
+| `cloud_launch_again.py` | 5 | the helpers of the idempotent and no-wait launch of the cloud launch (#1619); a part of `cloud_worker.py` | |

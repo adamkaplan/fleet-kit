@@ -149,7 +149,8 @@ A JSON object keyed by agent name:
     "url": "http://<agent-host>:<port>",
     "session": "<session id>",
     "password_file": "/path/to/password-file",
-    "issue": "<optional>"
+    "issue": 7,
+    "repo": "acme-org/widget-service"
   }
 }
 ```
@@ -161,7 +162,12 @@ A JSON object keyed by agent name:
 - `session`: letters, digits, `_`, `-`, 1 to 100 characters.
 - `password_file`: file holding the agent's OpenCode password (at most 4096 characters, no control characters, trailing newline
   removed); sent as Basic auth with user `opencode`.
-- `issue`: optional; named in the message header and sent in the prompt metadata.
+- `issue`: optional; a whole number above 0 (a number, never text); named in the message header and sent in the prompt metadata. The
+  launcher writes it at registration from the create's `--issue`, and leaves the key out when the create names no issue.
+- `repo`: the repository (`OWNER/NAME`) of the create, written by the launcher at registration.
+
+The launcher, not the person or the agent, writes `repo` and `issue` in the entry of every registered worker, in the one place
+that registers it.
 
 A recipient not in the file is refused 404. A bad record is a 503. The hub posts to `<url>/api/session/<session>/prompt` with
 delivery `queue` and a 10 second timeout; a non-2xx answer from the agent is a 503.
@@ -202,7 +208,7 @@ It prints one line (`sent to <recipient>` or `reported <kind> to <boss>`, or the
 | 1 | Refused or unavailable: the channel answered an error, or no token file, or retries ran out. |
 | 2 | Bad usage or missing environment: wrong arguments, empty text, text over the limit, bad KIND, `FLEET_AGENT_NAME`, `FLEET_BOSS` or `FLEET_CLOUD_CHANNEL_URL` missing or invalid. |
 
-The command makes up to 3 tries with one key. It retries only on a transport failure or a 5xx, with a backoff of 0.5 s doubling, and a 4xx is returned at once. Each request has a 10 second timeout.
+The command makes up to 6 tries with one key (five waits of 0.5, 1, 2, 4 and 8 seconds, a window of about 15 seconds). It retries only on a transport failure or a 5xx, with a backoff of 0.5 s doubling, and a 4xx is returned at once. Each request has a 10 second timeout.
 
 ## Delivery framing and dedupe limits
 
@@ -216,6 +222,10 @@ The command makes up to 3 tries with one key. It retries only on a transport fai
   delivered again. If delivery fails, the key is forgotten so a retry delivers.
 - The remembered keys are held in memory only, at most 10000 pairs, the least recently seen key is forgotten first (a repeat refreshes a key). A hub restart forgets all of them, so
   a duplicate is possible after a restart (and after a key ages out of the 10000).
+
+### A restart of the hub's pod
+
+A restart of the hub's pod loses the remembered dedupe keys, the relay queue, a report claimed and not yet delivered, and the decisions file on the pod's volume. The lane's send retries for a window of 15 seconds (six tries, waits of 0.5, 1, 2, 4 and 8 seconds) with the same key, so a restart of the hub's pod shorter than that is bridged. When the hub stays down longer, the send ends with one line that says the channel is unavailable and nothing is queued on disk: the lane sends again. The documented limit stays: a message whose first delivery reached the agent and whose retry reaches the new hub after a restart is delivered twice, because the keys are held in memory only. A second replica is REJECTED for now: its cost is one more pod requesting 100m CPU and 128Mi memory, it needs the remembered keys and the relay queue shared (a new component) and one owner step, a patch of replicas plus a pod disruption budget; a pod disruption budget on one replica would block every voluntary node drain and does not stop a node loss, so none is added, and the owner can overrule. The window is measured by a tester after the merge in the probe namespace. The pod's relay command keeps one attempt and prints its call id. A hub that hangs instead of refusing holds a send for up to 10 seconds per try, so a lane can wait about 75 seconds in the worst case before the command returns exit status 1.
 
 ## Hardening guards
 

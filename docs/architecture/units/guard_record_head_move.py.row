@@ -1,0 +1,1 @@
+| `guard_record_head_move.py` | 2 | the standalone recorder a git hook runs at each move of the installed tree's HEAD (#1380) | |

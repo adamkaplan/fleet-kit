@@ -4,6 +4,7 @@ The pod holds no credential for the minter. The end hook, on a push refused beca
 the stop side mints through the renewal's route, replaces only the git-token key, waits for the projection, and runs the hook once more.
 Scenarios S1-S11, U1 and U2 of the plan; each mutant the plan lists is built here by patching the real code and must fail its check.
 """
+import pathlib
 import argparse
 import base64
 import contextlib
@@ -13,6 +14,7 @@ import json
 import os
 import re
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
@@ -149,7 +151,7 @@ class TestRefresh(Stop):
         with mock.patch.object(cw.Kube, "exec", spy):
             self.check_s4()
         self.assertEqual([c for c in calls if any(NEW in x for x in c)], [])   # no exec ever carries the token
-        bodies = [json.loads(l) for l in open(self.state + ".stdin")]
+        bodies = [json.loads(l) for l in pathlib.Path(self.state + ".stdin").read_text().splitlines()]
         self.assertEqual([sorted(b["data"]) for b in bodies], [["git-token"]])   # one patch, one key: the kubelet's own swap puts it in the pod
 
     def test_s9_a_mutant_that_rewrites_the_pod_file_in_place_is_caught(self):
@@ -242,7 +244,7 @@ class TestRefresh(Stop):
 
     def test_the_new_token_is_never_wider_than_the_mint_route_allows(self):
         # the 61-minute cap and the one-repository, exact-permission checks stay in the minter the refresh reuses (app_token.py, unchanged here)
-        text = open(os.path.join(ROOT, "cloud", "launcher", "app_token.py")).read()
+        text = pathlib.Path(os.path.join(ROOT, "cloud", "launcher", "app_token.py")).read_text()
         self.assertIn("refusing: the token lives longer than 61 minutes", text)
 
 
@@ -295,8 +297,14 @@ class TestNote(tr.Harness):
 
 
 class TestHook(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.work = os.path.join(tmp.name, "repo")
+        os.makedirs(os.path.join(self.work, ".git"))
+
     def run_hook(self, says, verb="push"):
-        env = {"CW_WORKER": WORKER, "CW_WORKDIR": os.path.dirname(HERE), "FAKE_GIT_SAYS": says, "FAKE_GIT_VERB": verb}
+        env = {"CW_WORKER": WORKER, "CW_WORKDIR": self.work, "FAKE_GIT_SAYS": says, "FAKE_GIT_VERB": verb}
         out = io.StringIO()
         with mock.patch.object(end_hook, "GIT_BIN", FAKE_GIT), mock.patch.dict(os.environ, env), contextlib.redirect_stdout(out):
             code = end_hook.main()
@@ -349,7 +357,7 @@ class TestDocsAndPins(unittest.TestCase):
 
     def test_u1_the_guard_and_permission_files_are_byte_identical_to_the_base(self):
         pins = {"cloud/worker/guard.sh": "ba4d51aa043d450a4832210fb6492295e7bd7c7e61a4abd2a70cc75baea19bca",
-                "cloud/worker/opencode-worker.json": "9547d9f9611d04959fe9a36266ae78b97c235a7fb48a15c940943881fde33530"}
+                "cloud/worker/opencode-worker.json": "ef70ab381b46434cee486b57c23898117cc49b9b6150df42366db40b2e92d075"}
         for path, digest in pins.items():
             with open(os.path.join(ROOT, path), "rb") as f:
                 self.assertEqual(hashlib.sha256(f.read()).hexdigest(), digest, path)

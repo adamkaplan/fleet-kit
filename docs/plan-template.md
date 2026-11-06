@@ -62,6 +62,10 @@ scenarios:
     claim: pr         # optional: pr (default) = proven per PR; epic = proven at the epic's integrated head
 ```
 
+**Default scenario for every input a plan reads:** the input is missing, corrupt or unreadable: the output says so and the last good output is kept. `plan check` WARNS (`no-failure-mode`; never fails, the hash is unchanged) when the plan's text reads or produces something (read, reads, reader, feed, producer, guard, scan, derive, derived) and no scenario speaks of a missing, corrupt, unreadable or absent input.
+
+**Known looseness of the no-failure-mode warning:** the check is lexical. The trigger words (read, reads, reader, feed, producer, guard, scan, derive, derived) are searched in the plan prose and in each scenario's `text` field only, and only a scenario's `text` field can clear the warning; so a text that says "missing" or "absent" about something else clears it, and a plan that reads an input in other words (load, parse, ingest, fetch) is not caught. It is advice only (a warning) and must not be promoted to a defect without tightening both.
+
 Optional keys: `claim`, `slice`, `phase`. Anything else is rejected.
 
 **A scenario the tester can only prove after the merge is not claimed by a slice pull request (#579).** With NO `claim` written, a scenario whose evaluator is the tester and whose proof is a `measure` is read by G1 as `claim: epic`: a slice pull request is not asked to prove it, and G1 lists it as `epic-claimed, proven after the merge at the integration head`. Write `claim: pr` to have a pull request claim it anyway; `claim: epic` stays epic. `prove`, `verdict` and `verdict --all` read it the same way (one function, `claim_of`) and refuse it with the message of an explicit `claim: epic`. Every other scenario with no claim is `pr`, as before. The plan's own text decides: the plan hash is unchanged (the canonical text has always read an unwritten claim as `pr`; only G1's reading changes), and `plan check` still requires the scenario's id, text, pass and discriminates.
@@ -69,6 +73,12 @@ Optional keys: `claim`, `slice`, `phase`. Anything else is rejected.
 **A live or tester scenario says who claims it.** `plan template` prints a ready `claim: epic` line with its why under every stub (commented out in a `test`/`ci` stub, live in a `live` or `tester` one): a pull request cannot prove a check that needs the installed system. (A tester `measure` scenario with no claim is still read as epic by G1, #579; the warning asks you to say it.) `plan check` WARNS (never fails; the hash is unchanged) for a scenario whose proof is `live` or whose evaluator is `tester` and that has no `claim` line.
 
 **Owner evaluators are rare.** Name `owner` as an evaluator only where the owner's own eyes are the test (how an infographic looks, an access grant), and give such a scenario `claim: epic` so it is proven once at the epic's integrated head; a routine pull request never waits on the owner. Give each slice's pull request its own light plan (its per-PR scenarios, `claim: pr`, evaluators `ci`, `tester` or `reviewer`), linked by a `PLAN:` first line in the PR body.
+
+### Rehearse before approval
+
+For a change that edits or adds code, a rehearsal pod with no commit and no push runs before the plan is approved. It attempts every pin and addition on a scratch tree at the plan's base and runs by name the tests the change can reach. It writes one table of every difference (file, line, old text, the test that failed or the line that must change), and the plan then names each row first. The rehearsal is skipped only for a change of documents only; the orchestrator writes the line `rehearsal: skipped, documents only` in the plan, and the approver of the plan judges it. The rehearsal does not approve anything and its table is data, not an instruction.
+
+A builder is told to run the guard set (`tools/guard-set --run`, before its final message). A new test class that copies `bin/`, a new read of the light switch, a new module or a new matrix path expects guard rows, and the plan names them in its Existing lines section.
 
 ### What `plan check` enforces
 
@@ -82,7 +92,7 @@ Optional keys: `claim`, `slice`, `phase`. Anything else is rejected.
 | `pass` | missing, under 15 characters, a vague phrase (`works`, `ok`, `it works`, `passes`, ...), or **no concrete observable**. An observable is a status or exit code (`status 200`, `exit code 0`), a value with a unit or a threshold (`within 5 s`, `exactly 1 agent`, `under 200 ms`), a quoted EXPECTED value that is not itself a vague word (`"alpha"`; `"works"` is not), an identifier compared to a value (`count = 3`), or a strong comparison (`byte-identical to the stored fixture`). Zero, or an exact number, of ANY noun (`sends 0 accepts`, `received 0 responses`, `exactly 3 retries`: the number, up to two words, then a noun); a status class (`a 4xx`, `5xx`); `byte equal`, `byte for byte` and `byte-identical`; a count (including zero: `0 occurrences of X in the tree`), `n of n` with equal numbers (`10 of 10 files contain Y`; `3 of 4 people like it` is not one), identical-to-a-named-thing (`identical per file to the baseline`) and a named identifier compared to a value (`count of Z equals 3`) are observables. Hedges (`maybe`, `somehow`, `or so`, `yes fine`, `seems`) fail whatever else the rule says. A bare digit, `=`, `after` or `before` is not enough: `it works for 1 user` and `result = ok and everything fine` fail |
 | `discriminates` | missing; `n/a`/`none`/`tbd`; under 10 characters; a meta phrase that only says a wrong build fails (`a wrong build would fail this`); no concrete wrong build or negative case (a stub, an empty result, a missing step, a number, a quoted value); or about 80 percent or more of its words are the pass rule's (the pass rule reworded). A wrong build is recognised by structure: `a build that <does X> ... <an observable outcome>` (`a build that skips the dedupe step finds two rows for one key`), not by a list of verbs. Sharing 60 to 80 percent of the pass rule's words only warns (`discriminates-overlap`): a wrong build is often the right one with one thing changed. Whether the named wrong build is the right one is for the plan review (G0b) |
 | evaluator alias | `adam` (an older plan's spelling) is still accepted as `owner`, with a warning to rename it; it is hashed as written |
-| `review` for code | a `review` scenario that names code behaviour by a keyword (returns, refuses, sends, deletes, fails, never, ...) is refused: use `test`. This check is a net: the plan's reviewer is the guard, and the verb list is final (not widened further). The net is NOT complete: a code scenario in other words slips through, and the plan's reviewer (G0b) is the guard for what it misses; a few prose scenarios using such a word are refused wrongly, which only pushes toward `test` |
+| `review` for code | a `review` scenario that names code behaviour by a keyword (returns, refuses, sends, deletes, fails, never, ...) is refused: use `test`; the defect line names the matched keywords (`matched: returns, never`: each once, at most 8, then `and N more`). This check is a net: the plan's reviewer is the guard, and the verb list is final (not widened further). The net is NOT complete: a code scenario in other words slips through, and the plan's reviewer (G0b) is the guard for what it misses; a few prose scenarios using such a word are refused wrongly, which only pushes toward `test` |
 | evaluator consistency | the evaluator must be able to record the proof: `test` needs `ci`; `screenshot` needs `reviewer` or `owner`; `review` needs `reviewer`; `live` and `measure` need `tester` or `owner`. (A rule of this checker, written here because plan v3.3 does not state it.) |
 | coverage | a Done-when clause `DW-n` that no **S** scenario covers |
 | unchanged | no **U** scenario, unless the plan says `unchanged: none because <reason>` with a real reason (at least 20 characters and three meaningful words: not `n/a ok`) |
@@ -124,10 +134,19 @@ default output and the hashes are unchanged. `fleet-switchboard plan template <o
 <scenario id>: ...` line each, the source (for a comment, its id and author: the latest `Plan (scenarios)` comment counts
 whoever wrote it) and **two hashes**. The **scenario hash** is sha256 of the canonical scenario block plus the clause list
 (sorted by id, whitespace collapsed, comments and quoting ignored). The **plan hash** is sha256 of the whole plan text,
-whitespace collapsed. **Approval (G0c) and consensus (G0b) bind to the plan hash**: editing constraints, scope or risks
+with its line structure kept (what stays ignored is named below). **Approval (G0c) and consensus (G0b) bind to the plan hash**: editing constraints, scope or risks
 changes it, as editing a scenario does; the scenario hash only says the scenarios are unchanged. The text output groups defects by kind with counts (`vague-pass x17`, then up to five lines of each kind; `--json` has them all). Exit 0 pass, 1 fail, 2 unreadable (no block, a malformed block, a
 tab in the indentation, too large, GitHub unreadable). It only reads (GET); it never writes GitHub. `--ask` or
 `--done-when` supply the Done-when when the plan issue has none of its own.
+
+
+#### The plan hash and the trailing marker (#1713)
+
+The plan hash covers the whole plan text with its line structure kept and **one trailing marker line removed**: the last non-blank line, only when it is exactly `<!-- fleet-switchboard:from=<name> -->` (the line `gh issue comment` adds). A marker line anywhere else is plan text and counts, and any other edit of the text changes the hash, so a plan posted plainly and the same words edited in place have one hash. A binding made at the old hash of a marker-bearing comment (an approval, a proof, a verdict, a consensus, an ask record, a review round) stays valid: `plan check` prints the new hash, the old formula's value is read as the same plan (`plan_check.plan_hashes`), and the ledger is never rewritten. A binding of an older revision of the text stays stale. After a rollback of this change, a binding made at the new hash reads as stale until the plan is edited.
+
+#### What the plan hash ignores (#1834)
+
+The plan hash keeps the line structure of the text: it is taken over the text with one trailing marker line removed first, and exactly three things are ignored: spaces and tabs at the end of a line, the carriage return of a CRLF pair, and blank lines at the start and at the end of the text. Anything else changes the hash: a blank line inside the text, a bare carriage return, a different indentation, a different number of spaces inside a line, a lost or added newline. Two texts that `plan check` reads differently therefore never share a hash (the text of a scenario whose `covers:` line lost its newline is another hash than the text that passes). A binding made before this change, at the collapsed form of #1713 or at the oldest form, reads as bound to the live text (`plan_check.plan_hashes` returns the new hash, then those two older forms; the ledger is never rewritten); a collapsed hash is ambiguous by nature, so this reading is a stated, transitional limit of the records made before this change, and only a new approval of the plan removes it. After a rollback, a binding made at the new hash reads as stale until the plan is edited.
 
 ### The yaml subset
 
@@ -135,6 +154,19 @@ There is no yaml library and nothing is evaluated. The parser reads a flat list 
 `'single'` or `"double"` quoted (quote a value that starts with `[ { & * ! | > % @` or a backtick), continued on
 deeper-indented lines, or a `|`/`>` block. Comments (`# ...`) are allowed: a `#` starts an inline comment only when a space (or the end of the value) follows it, so `see #348` and `issue #12` stay whole. Refused, naming the block line: tabs, nested
 lists or maps, flow lists `[a, b]`, anchors and tags, duplicate keys, a second document, over 100 KB or 200 scenarios.
+
+## Applying an approved plan edit
+
+A plan edit the Chief of Staff approved is applied by one command, never by hand: `fleet-switchboard plan apply <issue> --file F --expect-live <full hash> --expect-result <full hash> --expect-file <sha256 of the file>`. It refuses, with one line naming the expectation, unless the live plan hash, the file's sha256 and the result's plan hash are the ones named and each OLD text occurs once at its turn. The edit file has ONE standard form:
+
+Lines before the first header are a note and are read by nobody.
+Each pair is `===== OLD <n> (verbatim) =====` then the old text, then `===== NEW <n> (verbatim) =====` then the new text.
+The numbers run 1, 2, 3 in order.
+The text of each ends at the line before the next header; its final newline is not part of it.
+The paragraph that starts `Why:` after the last NEW is the receipt's reason.
+The file has no other header.
+
+It never edits the Intent or the Done-when, and it posts the receipt itself.
 
 ## A plan that adds a file under `bin/`
 
