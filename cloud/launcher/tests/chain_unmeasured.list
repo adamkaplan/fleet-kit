@@ -72,4 +72,5 @@ cloud/worker/tests/test_pr_label.py
 cloud/worker/tests/test_pr_record.py
 cloud/worker/tests/test_reach.py
 cloud/worker/tests/test_shell_check.py
+cloud/worker/tests/test_shell_check_paths.py
 cloud/worker/tests/test_token_table.py
