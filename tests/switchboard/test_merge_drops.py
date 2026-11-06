@@ -73,6 +73,35 @@ class TestMergeDrops(MergeDropsBase):
         self.assertIn("app.py", out[0])
         self.assertIn("HeldSendFacts(state_dir)", out[0])
 
+    def test_a_pure_removal_revert_of_a_tip_commit_on_a_branch_on_the_tip_passes(self):
+        self.tip_moves()
+        git(self.dir, "checkout", "-q", "-b", "pr")
+        git(self.dir, "revert", "--no-edit", "integration")
+        self.assertEqual(self.run_cmd(), (0, []))
+
+    def test_a_revert_that_rewrites_a_tip_line_on_a_branch_on_the_tip_with_no_merge_passes(self):
+        git(self.dir, "checkout", "-q", "integration")
+        self.write("app.py", "".join(("line 3 tip\n" if n == 3 else "line %d\n" % n) for n in range(1, 11)))   # the tip CHANGES line 3
+        self.commit("tip rewrites line 3")
+        git(self.dir, "checkout", "-q", "-b", "pr")
+        git(self.dir, "revert", "--no-edit", "integration")   # the revert rewrites the tip's line back: a replacement hunk, no merge on the branch
+        self.assertEqual(self.run_cmd(), (0, []))
+
+    def test_a_branch_on_the_tip_that_merged_an_older_side_and_dropped_a_tip_line_is_refused(self):
+        git(self.dir, "checkout", "-q", "-b", "old")
+        self.write("other.py", "keep one\nkeep two\nown addition\n")
+        self.commit("older side")
+        git(self.dir, "checkout", "-q", "integration")
+        self.tip_moves()
+        git(self.dir, "checkout", "-q", "-b", "pr")
+        git(self.dir, "merge", "-q", "--no-commit", "--no-ff", "old")
+        self.write("app.py", "".join("line %d\n" % n for n in range(1, 11)))
+        git(self.dir, "add", "-A")
+        git(self.dir, "commit", "-q", "-m", "merge the older side")
+        code, out = self.run_cmd()
+        self.assertEqual(code, 1, out)
+        self.assertIn("HeldSendFacts(state_dir)", out[0])
+
     def test_s3_a_removal_of_the_branch_itself_passes(self):
         git(self.dir, "checkout", "-q", "-b", "pr")
         self.write("other.py", "keep one\n")   # the pull request means to remove `keep two`

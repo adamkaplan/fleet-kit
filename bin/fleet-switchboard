@@ -18562,10 +18562,13 @@ def merge_drops(runner, git_dir, tip, head):
     # is where that side left it; so a removal made while porting through a merge resolution is its own, a line the PR modified before it merged the tip in is its own, and the tip having moved since changes nothing.
     # A side that already holds the whole tip has no such base (its diff would hold real drops): skipped.
     own_lines, fork_cache = [], {}   # per side: (fork, {file: set of fork line numbers the PR's own side removed or rewrote})
-    sides = [head] + [m + "^1" for m in _git_out(runner, git_dir, ["rev-list", "--merges", "%s..%s" % (tip, head)]).split()]
+    merge_shas = _git_out(runner, git_dir, ["rev-list", "--merges", "%s..%s" % (tip, head)]).split()
+    sides = [head] + [m + "^1" for m in merge_shas]
     for side in sides:
         fork = _git_out(runner, git_dir, ["merge-base", tip, side]).strip()
-        if fork and fork != tip_sha and fork != _git_out(runner, git_dir, ["rev-parse", side]).strip():
+        # a head directly on the tip with no merge in tip..head: its own removals are the diff tip..head (fix forward of #2159); with a merge in it the diff would hold real drops
+        on_tip = side == head and fork == tip_sha and not merge_shas
+        if fork and (fork != tip_sha or on_tip) and fork != _git_out(runner, git_dir, ["rev-parse", side]).strip():
             removed = _diff_lines(runner, git_dir, fork, side, "-")
             own = own | collections.Counter((f, t.strip()) for f, _, t in removed)   # per-key maximum
             at = {}
