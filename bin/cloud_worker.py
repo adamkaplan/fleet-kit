@@ -1546,6 +1546,7 @@ for _name in ("INSPECT_SECONDS", "_inspect_short", "cmd_inspect"):
 
 # ---------------------------------------------------------------- the shape-M count of a lane (ask #2259, bin/cloud_lane_cap.py)
 
+# the record a launch stores (ask #2246, bin/cloud_record_create.py)
 cloud_record_create = _load_part("cloud_record_create")
 _record_from_create = cloud_record_create._record_from_create
 
