@@ -240,6 +240,27 @@ def pr_create(args):
     out = parse_json(request("POST", "/repos/%s/pulls" % repo, payload))
     print(out.get("html_url", ""))
     record_pr(out.get("number"))
+    label_pr(repo, out.get("number"))
+
+
+def label_pr(repo, n):
+    """CW_PR_LABELS (comma-separated): the pull request gets exactly those labels, one POST right after the create. A label the repository lacks is reported once on stderr; the pull request stays."""
+    names = []
+    for x in (os.environ.get("CW_PR_LABELS") or "").split(","):
+        if x.strip() and x.strip() not in names:
+            names.append(x.strip())
+    if not names or not isinstance(n, int):
+        return
+    try:
+        have = {str(l.get("name")) for l in (get_json("/repos/%s/labels?per_page=100" % repo) or []) if isinstance(l, dict)}
+        for x in names:
+            if x not in have:
+                sys.stderr.write("cw-gh: the repository has no label %r; it is not applied\n" % x)
+        names = [x for x in names if x in have]
+        if names:
+            request("POST", "/repos/%s/issues/%d/labels" % (repo, n), {"labels": names})
+    except Fail as e:
+        sys.stderr.write("cw-gh: the labels were not applied: %s\n" % e)
 
 
 def record_pr(n):
