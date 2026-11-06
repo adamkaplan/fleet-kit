@@ -190,7 +190,7 @@ class TestExitStatuses(unittest.TestCase):
             KeyedGitHub.answer = (status, {}, b'{"message": "no"}')
             refused.append(self.mint())
         other = {"token": TOKEN, "expires_at": "2099-01-01T00:00:00Z", "repositories": [{"name": "other", "full_name": "acme-org/other", "owner": {"id": 9}}],
-                 "permissions": {"contents": "write", "pull_requests": "write", "issues": "read", "metadata": "read"}}
+                 "permissions": {"contents": "write", "pull_requests": "write", "issues": "read", "metadata": "read", "actions": "read"}}
         KeyedGitHub.answer = (201, {}, json.dumps(other).encode())
         refused.append(self.mint())
         a = sum(p.returncode == 75 for p in passing)

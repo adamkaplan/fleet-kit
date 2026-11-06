@@ -24,7 +24,7 @@ import test_driver as td  # noqa: E402
 import test_preflight as tp  # noqa: E402
 
 TABLE = app_token.EXPECTED_PERMISSIONS
-TEXT = "contents: write, pull_requests: write, issues: read, metadata: read"
+TEXT = "contents: write, pull_requests: write, issues: read, metadata: read, actions: read"
 PLACES = ["cloud/launcher/README.md", "docs/agent-credentials.md", "docs/cloud-guard-parity.md", "docs/cloud-operator-quickstart.md"]
 PHRASE_FILES = ["cloud/launcher/README.md", "docs/agent-credentials.md"]
 PHRASES = {"read": re.compile(r"read issues and their comments"),
@@ -86,7 +86,7 @@ class Fx(unittest.TestCase):
 
 class Table(Fx):
     def test_the_table_is_exactly_the_four_and_the_rendered_text_is_derived_from_it(self):
-        self.assertEqual(TABLE, {"contents": "write", "pull_requests": "write", "issues": "read", "metadata": "read"})
+        self.assertEqual(TABLE, {"contents": "write", "pull_requests": "write", "issues": "read", "metadata": "read", "actions": "read"})
         self.assertEqual(app_token.render_permissions(), TEXT)
         self.assertEqual(list(tam.PERMS.items()), list(TABLE.items()))   # the older suite's fixture is the same table
 

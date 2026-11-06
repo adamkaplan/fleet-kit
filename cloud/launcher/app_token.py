@@ -48,14 +48,14 @@ MAX_BYTES = 1_000_000  # the most of any GitHub answer or vault command output t
 # One table of sets BY ROLE. The orchestrator's set has no contents key at all: it reads issues, pull requests and check
 # results and writes to issues only.
 PERMISSIONS_BY_ROLE = {
-    "worker": {"contents": "write", "pull_requests": "write", "issues": "read", "metadata": "read"},
+    "worker": {"contents": "write", "pull_requests": "write", "issues": "read", "metadata": "read", "actions": "read"},
     "orchestrator": {"issues": "write", "pull_requests": "read", "checks": "read", "metadata": "read"},
 }
 EXPECTED_PERMISSIONS = PERMISSIONS_BY_ROLE["worker"]  # the worker's set: the name every existing importer uses
 
 
 def render_permissions(perms=None, role="worker"):
-    """The set as text: for the worker `contents: write, pull_requests: write, issues: read, metadata: read`."""
+    """The set as text: for the worker `contents: write, pull_requests: write, issues: read, metadata: read, actions: read`."""
     return ", ".join("%s: %s" % kv for kv in (PERMISSIONS_BY_ROLE[role] if perms is None else perms).items())
 
 

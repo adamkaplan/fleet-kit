@@ -114,7 +114,7 @@ A cloud worker called the real `gh` binary by its path instead of the `gh` wrapp
 
 There are two real boundaries, and everything else in the pod is a convenience.
 
-- **Boundary 1, the token's scope.** The installation token has exactly contents write, pull requests write, issues read and metadata read (`app_token.py` refuses any other set). What those permissions allow is the table below.
+- **Boundary 1, the token's scope.** The installation token has exactly contents write, pull requests write, issues read, metadata read and actions read (`app_token.py` refuses any other set). What those permissions allow is the table below.
 - **Boundary 2, the repository's rules.** Rulesets, the merge queue and review requirements decide what the permitted actions can reach: a merge, a push to the default branch, a force-push. The preflight reads them before a worker is launched (`cloud/launcher/preflight.py`).
 
 The wrappers and the client are conveniences, never a boundary: the `gh` and `git` wrappers (`guard.sh`), the OpenCode deny rules, the worker prompt, and `cw-gh` (the client that replaces the real `gh`). They catch accidents and make conduct rules visible. A worker that wants to act around them can, by design, with the routes listed under "What remains reachable by design".
@@ -150,6 +150,7 @@ One row per action, derived from GitHub's own "Permissions required for GitHub A
 | Repository settings, rulesets, branch protection, webhooks, secrets | refused | administration, secrets and webhooks not granted | documented |
 | Issue and issue-comment reads (view, list) | allowed | issues: read | documented, to be probed live |
 | Issue create, edit, close | refused | issues: write not granted, only read (comments, labels and assignees on a PR are the PR rows above) | documented, to be probed live |
+| Actions runs and their logs: list and read (this repository only) | allowed | actions: read (no write: no cancel, re-run or dispatch) | documented, to be probed live |
 <!-- token-table:end -->
 
 ### The client that replaces the real `gh`
@@ -207,7 +208,7 @@ An orchestrator pod gets exactly five more environment names, all non-secret: `C
 
 **Branch names.** The pod's shell guard refuses a push (or any git command line) that contains the words `main` or `master` anywhere in it, so a branch name that contains them (for example `impact/sync-main`) is refused: name branches without those words.
 
-**Token roles.** The mint takes a role (`app_token.py OWNER/REPO --role ROLE`, default `worker`; an unknown role is refused before any network call) from one table of permission sets, `PERMISSIONS_BY_ROLE` in `cloud/launcher/app_token.py`. The worker role asks for, and accepts, exactly `contents: write, pull_requests: write, issues: read, metadata: read`. The orchestrator role asks for, and accepts, exactly `issues: write, pull_requests: read, checks: read, metadata: read` (no `contents` key at all). A launch with `--agent orchestrator` mints under the orchestrator role and records it on the pod as the annotation `cw/role: orchestrator` (a worker pod carries no annotation: its spec is unchanged); the reaper's renewal mints under the role the annotation names, and a pod made before the annotation renews as a worker. A custom mint command (`CW_GIT_TOKEN_CMD`) ignores the role, so the guarantee that an orchestrator never holds contents write holds only for the default mint command. An orchestrator pod made before this change has no role annotation and renews as a worker until it ends, so it is relaunched to take the narrower set. The orchestrator pod holds no App key, App id, vault setting or mint command.
+**Token roles.** The mint takes a role (`app_token.py OWNER/REPO --role ROLE`, default `worker`; an unknown role is refused before any network call) from one table of permission sets, `PERMISSIONS_BY_ROLE` in `cloud/launcher/app_token.py`. The worker role asks for, and accepts, exactly `contents: write, pull_requests: write, issues: read, metadata: read, actions: read`. The orchestrator role asks for, and accepts, exactly `issues: write, pull_requests: read, checks: read, metadata: read` (no `contents` key at all). A launch with `--agent orchestrator` mints under the orchestrator role and records it on the pod as the annotation `cw/role: orchestrator` (a worker pod carries no annotation: its spec is unchanged); the reaper's renewal mints under the role the annotation names, and a pod made before the annotation renews as a worker. A custom mint command (`CW_GIT_TOKEN_CMD`) ignores the role, so the guarantee that an orchestrator never holds contents write holds only for the default mint command. An orchestrator pod made before this change has no role annotation and renews as a worker until it ends, so it is relaunched to take the narrower set. The orchestrator pod holds no App key, App id, vault setting or mint command.
 
 The App already holds checks: read (the owner confirmed it on 29 October), so the orchestrator set needs no App change today; if a later set needs a permission the App lacks, the owner adds it and accepts it on each installation, never this change.
 

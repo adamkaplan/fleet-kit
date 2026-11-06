@@ -65,4 +65,5 @@ bounded only by the repository's rules; your STOP rules above are conduct rules 
 - Repository settings, rulesets, branch protection, webhooks, secrets: refused (administration, secrets and webhooks not granted; documented)
 - Issue and issue-comment reads (view, list): allowed (issues: read; documented, to be probed live)
 - Issue create, edit, close: refused (issues: write not granted, only read (comments, labels and assignees on a PR are the PR rows above); documented, to be probed live)
+- Actions runs and their logs: list and read (this repository only): allowed (actions: read (no write: no cancel, re-run or dispatch); documented, to be probed live)
 <!-- token-table:end -->

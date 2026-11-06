@@ -31,9 +31,9 @@ import test_orchestrator_agent as toa  # noqa: E402
 
 REPO = "acme-org/widget-service"
 # The recorded request bodies, written out literally (the worker's is what the mint sent before the table had roles).
-WORKER_SET = {"contents": "write", "pull_requests": "write", "issues": "read", "metadata": "read"}
+WORKER_SET = {"contents": "write", "pull_requests": "write", "issues": "read", "metadata": "read", "actions": "read"}
 ORCH_SET = {"issues": "write", "pull_requests": "read", "checks": "read", "metadata": "read"}
-WORKER_TEXT = "contents: write, pull_requests: write, issues: read, metadata: read"
+WORKER_TEXT = "contents: write, pull_requests: write, issues: read, metadata: read, actions: read"
 ORCH_TEXT = "issues: write, pull_requests: read, checks: read, metadata: read"
 STEP = "the owner adds %s to the App's permissions and accepts them on each installation"
 SETS = {"worker": WORKER_SET, "orchestrator": ORCH_SET}
@@ -114,7 +114,7 @@ class RequestBodies(Fx):
                 self.assertEqual((p.returncode, p.stdout), (0, tam.TOKEN), p.stderr)
                 body = tam.Stub.seen[0][2]
                 self.assertEqual(json.dumps(body), json.dumps({"repositories": ["widget-service"], "permissions": {
-                    "contents": "write", "pull_requests": "write", "issues": "read", "metadata": "read"}}))
+                    "contents": "write", "pull_requests": "write", "issues": "read", "metadata": "read", "actions": "read"}}))
         self.assertEqual(list(app_token.EXPECTED_PERMISSIONS.items()), list(WORKER_SET.items()))
         self.assertIs(app_token.EXPECTED_PERMISSIONS, app_token.PERMISSIONS_BY_ROLE["worker"])
 
@@ -286,8 +286,8 @@ class Mutants(unittest.TestCase):
         self.assertTrue([b for b in bad if b.startswith("check orchestrator")])
 
     def test_s6_a_worker_set_that_differs_fails_the_request(self):
-        m = mutant("cloud/launcher/app_token.py", '"pull_requests": "write", "issues": "read", "metadata": "read"},\n    "orch',
-                   '"pull_requests": "read", "issues": "read", "metadata": "read"},\n    "orch')
+        m = mutant("cloud/launcher/app_token.py", '"pull_requests": "write", "issues": "read", "metadata": "read", "actions": "read"},\n    "orch',
+                   '"pull_requests": "read", "issues": "read", "metadata": "read", "actions": "read"},\n    "orch')
         self.assertIn("body worker", table_failures(m))
 
 
@@ -440,6 +440,63 @@ class Documents(unittest.TestCase):
         text = read(self.FILES[0])
         self.assertTrue(self.check(text.replace(ORCH_TEXT, "")))
         self.assertTrue(self.check(text.replace("it can write to issues only", "")))
+
+
+class ActionsReadSet(unittest.TestCase):
+    """The worker's set holds actions: read; the exact-set check refuses a wrong answer; the set and the token table agree (ask #2050)."""
+    ROW = ', "actions": "read"},\n    "orch'
+
+    @staticmethod
+    def agree(m):
+        """Failures of a module's worker set against the table file: its header and its Actions row."""
+        bad = []
+        head = read("cloud/token-table.txt").splitlines()[0]
+        text = ", ".join("%s: %s" % (k.replace("_", " "), v) for k, v in m.PERMISSIONS_BY_ROLE["worker"].items())
+        if "(" + text + ")" not in head:
+            bad.append("header " + text)
+        if m.PERMISSIONS_BY_ROLE["worker"].get("actions") != "read" or not any(
+                r.startswith("Actions runs and their logs") for r in read("cloud/token-table.txt").splitlines()):
+            bad.append("actions row")
+        return bad
+
+    def test_the_worker_set_has_five_keys_actions_read_only(self):
+        w = app_token.PERMISSIONS_BY_ROLE["worker"]
+        self.assertEqual(len(w), 5)
+        self.assertEqual(w["actions"], "read")
+
+    def test_the_orchestrator_set_is_unchanged(self):
+        self.assertEqual(list(app_token.PERMISSIONS_BY_ROLE["orchestrator"].items()), list(ORCH_SET.items()))
+        self.assertNotIn("actions", app_token.PERMISSIONS_BY_ROLE["orchestrator"])
+
+    def test_the_exact_set_check_refuses_an_answer_without_actions_or_with_actions_write(self):
+        w = dict(WORKER_SET)
+        wrong = [{k: v for k, v in w.items() if k != "actions"}, dict(w, actions="write")]
+        for perms in wrong:
+            with self.subTest(perms=perms), mock.patch.object(sys, "stderr", io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    app_token.check_permissions(perms, "worker")
+        with mock.patch.object(sys, "stderr", io.StringIO()):
+            app_token.check_permissions(dict(w), "worker")
+
+    def test_the_real_set_agrees_with_the_table(self):
+        self.assertEqual(self.agree(app_token), [])
+
+    def test_a_set_without_the_key_disagrees_with_the_table(self):
+        self.assertEqual(self.agree(app_token), [])   # the control first
+        m = mutant("cloud/launcher/app_token.py", self.ROW, '},\n    "orch')
+        real = app_token.PERMISSIONS_BY_ROLE["worker"]
+        got = m.PERMISSIONS_BY_ROLE["worker"]
+        self.assertEqual(sorted(set(real) - set(got)), ["actions"])   # applied: computed from the two texts' sets
+        bad = self.agree(m)
+        self.assertTrue(bad)
+        self.assertTrue(any(b.startswith("header ") for b in bad) and "actions row" in bad, bad)
+
+    def test_a_no_op_mutation_fails_the_computation(self):
+        with self.assertRaises(AssertionError):
+            mutant("cloud/launcher/app_token.py", self.ROW, self.ROW)
+
+    def test_the_mint_request_of_a_set_without_actions_fails_the_body_check(self):
+        self.assertIn("body worker", table_failures(mutant("cloud/launcher/app_token.py", self.ROW, '},\n    "orch')))
 
 
 if __name__ == "__main__":
