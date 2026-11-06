@@ -16681,7 +16681,7 @@ def pr_floor_report(engine, repo, number, rated_pairs=(), paged=None):
     """Read one PR's files and decide: {"pr", "head", "floor_paths", "complete", "rated", "decision", "reasons", "globs"}. Reads only (one
     `gh pr view`). `rated_pairs` is the independent rating's (severity, probability) list, an input that can only ADD a hold. `paged` (a dict, #967) gets the paged file list ("files") or why it could not be read ("error", a
     FileListError) when the floor had to read it, so a caller that needs the same list does not read it a second time."""
-    raw = read_pr_json(engine, repo, number, "files,baseRefOid,headRefName")
+    raw = read_pr_json(engine, repo, number, GATE_FLOOR_FIELDS)
     files = [f for f in (raw.get("files") if isinstance(raw.get("files"), list) else []) if isinstance(f, dict)]
     globs, exclude, force = impact_floor.floor_for(repo, engine.config)
     paths, renamed = [], []
@@ -18169,7 +18169,7 @@ def cos_ready_check():
     return plan_ledger.cos_lacking(text)
 
 
-GATE_FLOOR_FIELDS = "files,baseRefOid"   # what `pr_floor_report` asks of `gh pr view` besides the picture's fields (#2215)
+GATE_FLOOR_FIELDS = "files,baseRefOid,headRefName"   # what `pr_floor_report` asks of `gh pr view` besides the picture's fields (#2215, #955: headRefName)
 
 
 def once_pr_view_runner(inner):
