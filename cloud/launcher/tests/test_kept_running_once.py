@@ -153,6 +153,28 @@ class TestCleanLocal(unittest.TestCase):
         subprocess.run("rm -rf %s/repo %s/wt && git clone -q %s/remote.git %s/repo && git -C %s worktree prune"
                        % (self.d, self.d, self.d, self.d, self.w), shell=True, check=True)
 
+    def test_older_stash_entry_holding_the_work_is_not_clean(self):
+        run_git(self.w, "commit", "-q", "--allow-empty", "-m", "work")
+        open(self.w + "/g", "w").write("x")
+        run_git(self.w, "add", "g")
+        run_git(self.w, "stash")           # older entry: its parent is the local-only commit
+        run_git(self.w, "reset", "-q", "--hard", "origin/main")
+        open(self.w + "/h", "w").write("y")
+        run_git(self.w, "add", "h")
+        run_git(self.w, "stash")           # newest entry: only on the starting commit
+        self.assertFalse(self.clean())
+
+    def test_lightweight_and_annotated_tags_on_local_commit_are_not_clean(self):
+        for kind in ("light", "annotated"):
+            with self.subTest(kind):
+                self.tearDown_clone()
+                run_git(self.w, "checkout", "-q", "--detach")
+                run_git(self.w, "commit", "-q", "--allow-empty", "-m", "tagged")
+                run_git(self.w, "tag", *(["-a", "-m", "m"] if kind == "annotated" else []), "t1")
+                run_git(self.w, "checkout", "-q", "main")
+                run_git(self.w, "reflog", "expire", "--expire=now", "--all")
+                self.assertFalse(self.clean())
+
     def test_a_mutant_without_the_reflog_check_is_caught(self):
         def plant():
             run_git(self.w, "checkout", "-q", "--detach")

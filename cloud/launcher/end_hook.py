@@ -183,7 +183,7 @@ FETCH_TIMEOUT_SECONDS = 20
 
 def clean_local(workdir, ctx):
     """True when, from local references only, nothing is unsaved. WORK is any commit reachable from the reflog of HEAD or of any local
-    branch, from refs/stash, from any local branch, or from any worktree's HEAD, that no remote-tracking ref and not the clone's
+    branch, from every entry of the refs/stash reflog, from any tag, from any local branch, or from any worktree's HEAD, that no remote-tracking ref and not the clone's
     starting commit (the oldest entry of the HEAD reflog) reaches; also any change (staged, untracked) in this or any other worktree.
     Any git command that fails, or any doubt, is NOT clean.
 
@@ -204,6 +204,9 @@ def clean_local(workdir, ctx):
             roots.add(line)
             roots.update(out("reflog", "show", "--format=%H", line).split())
         roots.update(out("for-each-ref", "--format=%(objectname)", "refs/stash").split())
+        if out("for-each-ref", "--format=%(refname)", "refs/stash").strip():
+            roots.update(out("reflog", "show", "--format=%H", "refs/stash").split())
+        roots.update(out("for-each-ref", "--format=%(refname)", "refs/tags").split())
         for line in out("worktree", "list", "--porcelain").splitlines():
             if line.startswith("worktree "):
                 wt = line[9:]
