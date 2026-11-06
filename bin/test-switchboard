@@ -36064,7 +36064,6 @@ _adoption_cells()
 
 
 
-CHANGE_KINDS = ("base", "record", "matrix", "rating", "head", "none")   # (#999) what can change under a hold the daemon put on, with the head unchanged: the ONE table every row below derives from
 class TestImpactReleaseEveryPass(TestImpactRejudge):
     """#999: the daemon judges every pull request that carries labels it added at EVERY pass, so a hold the rule no longer makes is released whatever changed
     (the base branch, a record, the matrix, a rating) with the head unchanged. The REAL pass over a fake GitHub that answers only what `gh pr view` answers
