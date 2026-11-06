@@ -8,7 +8,7 @@ rest reads the NEW body out of each form that writes one:
   gh api to repos/O/R/issues/N (or repositories/ID/issues/N) with -f/-F body=..., -F body=@file, -F body=@-, --input FILE or --input -,
   gh api graphql with a query that names updateIssue (refused: it names a node id, so the body it replaces cannot be read).
 
-The current body is read through the real gh with the account the write would use and the one deadline of the hold check. FAIL CLOSED: a current body
+The current body is read through the real gh with the account the write would use and FLEET_SHIM_HOLD_SECONDS as the limit of EACH read (counted from the read), and a command-wide budget of three times that limit, after which every further read fails closed ("the command's read budget is spent"). FAIL CLOSED: a current body
 that cannot be read or is empty, a form whose new body cannot be read, and a call that fails here for any reason refuse a WRITE. A current body with
 neither part is not an ask: the write passes. Pull requests (an `issues/N` endpoint whose answer has `pull_request`) are not touched. Nothing else is.
 Stdin that was read is handed back: fd 0 is replaced by a file holding the same text, so the shim and gh read it as before.
@@ -71,6 +71,7 @@ class Probe:
         except ValueError:
             seconds = 5.0
         self.seconds, self.why = min(10.0, max(0.2, seconds)), None   # the body read's OWN limit, counted from the read, not from here
+        self.budget = 3 * self.seconds   # the whole command's read time: three times the per-read limit
 
     def stdin_text(self):
         if self.text is None:
@@ -111,7 +112,19 @@ class Probe:
 
     def fetch(self, argv):
         """The JSON object gh prints for a read, or None on any failure; self.why then says which (a time-out, an exit status, unparsable output)."""
-        left = self.seconds
+        if self.budget <= 0:
+            self.why = "the command's read budget is spent"
+            return None
+        left = min(self.seconds, self.budget)
+        started = time.monotonic()
+        try:
+            return self.run_read(argv, left)
+        finally:
+            self.budget -= time.monotonic() - started
+            if self.budget <= 0 and self.why is None:
+                self.budget = 0
+
+    def run_read(self, argv, left):
         if not self.gh:
             self.why = "no gh to read it with"
             return None

@@ -260,6 +260,7 @@ class TestGhBodyReadHasItsOwnClock(unittest.TestCase):
     def test_S3_a_failed_read_names_its_reason(self):
         module = load_module()
         cases = (("sleep 5", "timed out"), ("exit 3", "status 3"), ("echo not json", "not JSON"), ("echo '[1]'", "not a JSON object"))
+        unnamed = 0
         for script, reason in cases:
             with self.subTest(reason=reason):
                 self.fake(script)
@@ -268,6 +269,20 @@ class TestGhBodyReadHasItsOwnClock(unittest.TestCase):
                     got = self.check(module)
                 self.assertIn(reason, got)
                 self.assertNotIn(self.OLD_TEXT, got)
+                unnamed += 0 if reason in got else 1
+        self.assertEqual(unnamed, 0)
+
+    def test_command_budget_caps_three_hanging_targets(self):
+        import time
+        module = load_module()
+        self.fake("sleep 5")
+        probe = module.Probe(self.gh, lambda: None, None)   # limit 0.5 s per read, 1.5 s per command
+        started = time.monotonic()
+        got = [module.check_current(probe, ["issue", "view", t, "--json", "body"], "x\n") for t in "123"]
+        got.append(module.check_current(probe, ["issue", "view", "4", "--json", "body"], "x\n"))
+        self.assertLess(time.monotonic() - started, 2.5)
+        self.assertTrue(all(g and "timed out" in g or "read budget is spent" in g for g in got), got)
+        self.assertIn("the command's read budget is spent", got[3])
 
 
 if __name__ == "__main__":
