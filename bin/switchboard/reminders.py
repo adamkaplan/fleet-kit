@@ -762,12 +762,25 @@ class ReminderFacts:
 WAITING_REPEAT = 1800   # #1728: seconds between two `reminder.waiting` lines for the same reminder and reason
 
 
+def stale_working(engine, observation, facts):
+    """#2243: herdr reads 'working' but v2 runs no turn for the session (session.active does not list it), and every fact is a reminder: the
+    status is stale, so the reminder is a NEW turn, never queued or steered behind a turn that is not running. An unreadable answer is not stale."""
+    try:
+        if getattr(observation, "status", None) != "working" or not facts or not all(f.kind == "reminder" for f in facts):
+            return False
+        v2 = getattr(engine, "v2", None)
+        active = v2.session_active() if v2 is not None else None
+        return isinstance(active, dict) and not active.get(observation.session_id)
+    except Exception:
+        return False
+
+
 def waiting_reason(engine, plan, now):
     """#1728: why the reminders of this plan do not reach the lane now, or None (a wake that goes in at once, or a steer)."""
     if plan.action != "wake":
         return "%s: %s" % (plan.action, plan.reason)
     observation = plan.observation
-    if observation is None or observation.status != "working":
+    if observation is None or observation.status != "working" or stale_working(engine, observation, plan.pending):
         return None
     age = None
     try:
