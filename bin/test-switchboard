@@ -80383,11 +80383,13 @@ NOT_ISOLATED_BY_BASE = {
     "TestPlanWakeMutants", "TestPodSilence", "TestPodSilenceTick", "TestReadPagesStrict", "TestReadPagesStrictMutant", "TestSeenAllMutants",
     "TestStopFinalMessageBareMutant", "TestStopFinalMessageEdgesMutant", "TestStopFinalMessageHardeningMutant", "TestStopFinalMessageMutants", "TestStopFinalMessageTwoRunsMutant", "TestSummaryCluster",
     "TestTriageHiddenMutants", "TestTwoBranchesAddingATestFile", "TestUnconsumedRecord", "TestUnreadableSummary",
+    "TestAskIsItsOwn",   # (#2247) pure: _ask_of on strings and dicts; the file came with #2254
     ),
     "makes its own temporary directory or state (a tempfile.mkdtemp, a patched environment or its own isolating setUp) and never reads the real one": (
     "TestEveryTestClassIsolates", "BodyRig", "TestDirectReads", "TestGateProbeReads", "TestGhBodyGuard", "TestGhBodyMutants", "TestGhBodyRefusalIsPure",
     "TestImpactEntriesLoader", "TestImpactEntriesMerge", "TestImpactEntriesMissing",   # (#2247) each makes its own private directory (a mkdtemp or a TemporaryDirectory); the files came with #2215, #2219, #2220
     "Case", "HeaderCacheBase", "TestCloudWatchBounds", "TestCloudWatchTick", "TestGatePass", "TestHostDisk", "TestIsolation", "TestSafety",
+    "TestBatchCarry", "TestGhBodyReadHasItsOwnClock",   # (#2247) each makes its own TemporaryDirectory; they came with #1028 and #2257
     "TestStopFinalMessage", "TestStopFinalMessageBare", "TestStopFinalMessageEdges", "TestStopFinalMessageHardening", "TestStopFinalMessageTwoRuns",
     ),
 }
