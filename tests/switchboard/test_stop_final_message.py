@@ -846,5 +846,105 @@ class TestStopFinalMessageBareMutant(unittest.TestCase):
         self.assertEqual(code, 0, "control of U20: %s" % out)
 
 
+class TestEndNoticeHeadLine(unittest.TestCase):
+    """#2267 S2, S3: the end notice's one line for the last pushed head and its checks."""
+
+    def world(self, name, hook, head_sha="a" * 40, repo="o/r"):
+        w = StopWorld(self)
+        rec = w.pod(name, "words")
+        (rec / "run.json").write_text(json.dumps({"head_sha": head_sha, "end_hook": hook}))
+        (w.cloud / (name + ".json")).write_text(json.dumps({"worker": name, "reports_to": "boss-lane", "repo": repo}))
+        w.stop(name, "hard", rec)
+        return w
+
+    def run_scan(self, w, reader):
+        w.mod_scan = w.mod.scan_audit(w.audit, w.state_file, w.cloud, w.reports, lambda to, text: w.sent.append((to, text)),
+                                      sb.load_module("record_json").parse_bounded, None, None, head_checks=reader)
+
+    PUSHED = {"pushed": False, "wip_branch": None, "head_on": "feat/x"}
+
+    def test_S2_green_red_and_pending_each_give_one_line_with_branch_sha_and_state(self):
+        for state, want in (("passed", "checks passed"), ("failed: lint, unit", "checks failed: lint, unit"), ("pending", "checks pending")):
+            w = self.world("cb-2267a", self.PUSHED)
+            self.run_scan(w, lambda repo, sha, state=state: state)
+            msg = w.to("boss-lane")[0]
+            self.assertIn("Last head: feat/x@aaaaaaaa, %s." % want, msg)
+            self.assertEqual(msg.count("Last head:"), 1)
+
+    def test_S2_control_without_a_reader_the_notice_has_no_such_line(self):
+        w = self.world("cb-2267b", self.PUSHED)
+        self.run_scan(w, None)
+        self.assertNotIn("Last head", w.to("boss-lane")[0])
+
+    def test_S3_nothing_pushed_says_so_and_is_sent(self):
+        w = self.world("cb-2267c", {"pushed": False, "wip_branch": None, "head_on": None})
+        self.run_scan(w, lambda repo, sha: "passed")
+        self.assertIn("Last head: nothing pushed.", w.to("boss-lane")[0])
+
+    def test_S3_a_failing_or_slow_reader_says_unknown_and_the_notice_is_still_sent(self):
+        def boom(repo, sha):
+            raise OSError("down")
+        for reader in (boom, lambda repo, sha: None):
+            w = self.world("cb-2267d", self.PUSHED)
+            self.run_scan(w, reader)
+            self.assertEqual(len(w.to("boss-lane")), 1)
+            self.assertEqual(len(w.to("chief-of-staff")), 1)
+            self.assertIn("Last head: feat/x@aaaaaaaa, checks unknown.", w.to("boss-lane")[0])
+
+    def test_S3_a_missing_sha_says_head_unknown(self):
+        w = self.world("cb-2267e", self.PUSHED, head_sha=None)
+        self.run_scan(w, lambda repo, sha: "passed")
+        self.assertIn("Last head: head unknown.", w.to("boss-lane")[0])
+
+    def test_wip_branch_is_named_with_sha_or_sha_unknown(self):
+        hook = {"pushed": True, "wip_branch": "w1/wip", "head_on": None}
+        w = self.world("cb-2267f", hook)
+        self.run_scan(w, lambda repo, sha: "passed")
+        self.assertIn("Last head: wip branch w1/wip@aaaaaaaa, checks passed.", w.to("boss-lane")[0])
+        w = self.world("cb-2267g", hook, head_sha=None)
+        self.run_scan(w, lambda repo, sha: "passed")
+        self.assertIn("Last head: wip branch w1/wip, sha unknown.", w.to("boss-lane")[0])
+        w = self.world("cb-2267h", dict(hook, wip_branch="bad branch!"))
+        self.run_scan(w, lambda repo, sha: "passed")
+        self.assertIn("Last head: head unknown.", w.to("boss-lane")[0])
+
+    def line(self, hook, state="passed", sha="a" * 40):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        Path(d, "run.json").write_text(json.dumps({"head_sha": sha, "end_hook": hook}))
+        return sb.load_module("cloud_end_alert").head_line(d, "o/r", lambda repo, s: state, sb.load_module("record_json").parse_bounded)
+
+    def test_head_line_sanitises_state_and_branch(self):
+        self.assertEqual(self.line(self.PUSHED, "bad\x00<x>\nstate"), "Last head: feat/x@aaaaaaaa, checks bad?? x ?state.".replace("?? x ?", "?<x>?").replace("<x>", "?x?"))
+        self.assertEqual(self.line(self.PUSHED, "ok"), "Last head: feat/x@aaaaaaaa, checks ok.")
+        for bad in ("feat/x y", "a;b", "unknown", "x" * 101, 5):
+            self.assertEqual(self.line(dict(self.PUSHED, head_on=bad)), "Last head: head unknown.")
+
+
+class TestCloudHeadChecks(unittest.TestCase):
+    """#2267: the daemon's cloud_head_checks over a stubbed engine.intents._api."""
+
+    def check(self, api):
+        eng = mock.Mock()
+        eng.intents._api = api
+        return sb.cloud_head_checks(eng, "o/r", "a" * 40)
+
+    @staticmethod
+    def page(*runs):
+        return {"check_runs": [dict(id=i + 1, name=n, status=s, conclusion=c, started_at="2026-01-01T00:00:0%dZ" % i) for i, (n, s, c) in enumerate(runs)], "total_count": len(runs)}
+
+    def test_each_state(self):
+        self.assertEqual(self.check(lambda path, repo: self.page(("a", "completed", "success"))), "passed")
+        self.assertEqual(self.check(lambda path, repo: self.page(("a", "completed", "success"), ("b", "in_progress", None))), "pending")
+        self.assertEqual(self.check(lambda path, repo: self.page(("lint", "completed", "failure"), ("a", "completed", "success"))), "failed: lint")
+        self.assertEqual(self.check(lambda path, repo: self.page()), "none yet")
+
+    def test_refusal_and_exception_give_unknown(self):
+        self.assertEqual(self.check(lambda path, repo: None), "unknown")
+        def boom(path, repo):
+            raise OSError("down")
+        self.assertEqual(self.check(boom), "unknown")
+
+
 if __name__ == "__main__":
     unittest.main()
