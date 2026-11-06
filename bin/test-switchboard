@@ -31865,8 +31865,8 @@ class TestPlanGatesCheck(LedgerBase):
         base = {"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR}
         self.assertNotIn("plan_gates", sb.validate_config(dict(base)))
         good = sb.validate_config(dict(base, plan_gates={"repos": {"a/b": {}}}))["plan_gates"]
-        self.assertEqual(good["repos"]["a/b"], {"mode": "shadow", "enabled": True, "budget_ms": 3000,
-                                                 "enforce_gates": ["G0a", "G1"]})
+        self.assertEqual(good["repos"]["a/b"], {"mode": "shadow", "enabled": True,
+                                                 "enforce_gates": ["G0a", "G1"]})   # #2215 S4: no budget_ms here; it is derived from the shim's limit when read
         self.assertEqual(sb.validate_config(dict(base, plan_gates={"repos": {"a/b": {"enforce_gates": ["G6", "G1"]}}}))
                          ["plan_gates"]["repos"]["a/b"]["enforce_gates"], ["G1", "G6"], "kept in gate order")
         for bad in ([], {"repo": {}}, {"repos": {"nope": {}}}, {"repos": {"a/b": {"mode": "off"}}}, {"repos": {"a/b": {"enabled": "yes"}}},

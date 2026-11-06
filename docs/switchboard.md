@@ -4926,7 +4926,7 @@ not opted in (allowed, no output); repos match without regard to case. `mode` is
 recorded as `gate.would_refuse`, and the answer is always allow) or `enforce` (refuse with exit 10). `enabled: false` is the
 per-repo kill switch: it takes effect at the next command, no restart. The global kill switch is the file `plan-gates.off` in the
 state directory: while it exists every repo is allowed, each such check is logged (`gate.killed`) and `status` says so loudly.
-`budget_ms` (default 3000, 500 to 30000) bounds one check; past it the check fails open. **Worst case for one gated command** is
+`budget_ms` (500 to 30000; when unset, the shim's limit minus 1 s, derived from `GATE_SECONDS` in `shims/gh` and its `FLEET_SHIM_GATE_SECONDS` override, so the check answers just before the shim gives up; one set in the config wins) bounds one check; past it the check fails open. **Worst case for one gated command** is
 the budget plus the shim's own identity lookup (up to 3 s).
 
 **Fail-open.** A timeout, a crash, an unreadable GitHub, a missing config all answer 3 and record `gate.fail_open` (the first of
