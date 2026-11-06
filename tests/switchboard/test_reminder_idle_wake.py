@@ -18,6 +18,8 @@ def build(PR4Base):
         def stale(self):
             """herdr reads 'working' for the lane while v2 has no turn: the status is stale."""
             self.world.herdr.panes[self.world.panes["w-idle"]]["status"] = "working"
+            self.world.engine.run_pass()   # the daemon records the first sight of 'working'
+            self.world.tick(700)           # longer ago than the reminder bound (10 minutes)
 
         def run_passes(self, count, due):
             """Runs `count` passes, other traffic every pass; returns {reminder id: the pass number it was delivered in (1 = the first pass at or after due)}."""
@@ -43,10 +45,12 @@ def build(PR4Base):
             return [e["detail"] for e in self.world.audit() if e["event"] == "v2.synthetic" and e.get("subject") == "w-idle" and "keys" in e["detail"]]
 
         def test_s2_idle_lane_reminders_delivered_in_the_next_pass(self):
+            self.stale()
             found = self.run_passes(40, self.two_due())
             self.assertEqual(sorted(found), ["first", "second"])
             self.assertLessEqual(found["first"], 1)
             self.assertLessEqual(found["second"], 250 // PASS + 1)
+            self.assertEqual([d["in_turn"] for d in self.deliveries()], [False, False])
 
         def test_s3_ceiling_wake_delivery_starts_a_turn(self):
             self.stale()
@@ -69,6 +73,29 @@ def build(PR4Base):
             self.assertEqual(len(sent), 2)
             self.assertEqual([d["in_turn"] for d in sent], [False, False])
             self.assertEqual([d["delivery"] for d in sent], ["queue", "queue"])
+
+        def test_young_working_status_keeps_queue(self):
+            self.world.herdr.panes[self.world.panes["w-idle"]]["status"] = "working"
+            self.world.engine.run_pass()   # the daemon records the first sight of 'working'
+            self.world.tick(PASS)          # 30 seconds old, far under the reminder bound; session.active lags
+            now = self.world.clock.now()
+            sb.add_reminder(self.world.state, "w-idle", now - 5, now - 60, "roll the build")
+            self.run_passes(1, {})
+            sent = self.deliveries()
+            self.assertEqual(len(sent), 1)
+            self.assertTrue(sent[0]["in_turn"])
+
+        def test_reminder_mixed_with_other_facts_is_a_new_turn_when_stale(self):
+            self.stale()
+            now = self.world.clock.now()
+            sb.add_reminder(self.world.state, "w-idle", now - 5, now - 600, "roll the build")
+            self.world.fact("w-idle", "other:1", "traffic for the lane")
+            self.run_passes(1, {})
+            sent = self.deliveries()
+            self.assertEqual(len(sent), 1)
+            self.assertFalse(sent[0]["in_turn"])
+            self.assertIn("reminder:", " ".join(sent[0]["keys"]))
+            self.assertIn("other:1", sent[0]["keys"])
 
         def test_real_turn_keeps_queue(self):
             self.world.v2.start_turn(self.world.sessions["w-idle"], "work", fleet=False, lasts=10 ** 7)
