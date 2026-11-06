@@ -2298,19 +2298,30 @@ def gate_spool(event, repo, number, check, detail):
     state = os.environ.get("FLEET_SWITCHBOARD_STATE") or os.path.join(
         os.environ.get("XDG_STATE_HOME") or os.path.join(os.path.expanduser("~"), ".local", "state"), "fleet-switchboard")
     path = os.path.join(state, GATE_SPOOL)
+    global GATE_SPOOL_WHY
+    GATE_SPOOL_WHY = ""
+    if not os.path.isdir(state):
+        GATE_SPOOL_WHY = "no state directory %s" % state
+        return False
     try:
-        if os.path.isdir(state) and (not os.path.exists(path) or os.path.getsize(path) < GATE_SPOOL_LIMIT):
-            line = json.dumps({"ts": int(time.time()), "event": event, "pr": "%s#%d" % (repo or "unknown", number or 0), "for": check,
-                               "detail": str(detail)[:200]}, sort_keys=True)
-            fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
-            with os.fdopen(fd, "a") as out:
-                out.write(line + "\n")
-            return True   # written
-    except OSError:
-        pass
+        if os.path.exists(path) and os.path.getsize(path) >= GATE_SPOOL_LIMIT:
+            try:   # full: rotate (replacing an older .1) and start a fresh file
+                os.replace(path, path + ".1")
+            except OSError as err:
+                GATE_SPOOL_WHY = "spool %s is full and not rotatable (%s)" % (path, err.strerror or err)
+                return False
+        line = json.dumps({"ts": int(time.time()), "event": event, "pr": "%s#%d" % (repo or "unknown", number or 0), "for": check,
+                           "detail": str(detail)[:200]}, sort_keys=True)
+        fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        with os.fdopen(fd, "a") as out:
+            out.write(line + "\n")
+        return True   # written
+    except OSError as err:
+        GATE_SPOOL_WHY = "cannot write %s (%s)" % (path, err.strerror or err)
     return False
 
 
+GATE_SPOOL_WHY = ""
 OVER_REVIEW_FLAG = "--over-review"
 
 
@@ -2473,8 +2484,8 @@ def review_probe(args, found, reason, lookup, gh):
             shown = gate_clean(reason)[:100]   # the reason alone is clipped, so the head and the overridden reviews always fit the logged line
             logged = gate_spool("over_review", repo, number, "merge", "by %s at %s | over: %s | reason: %s" % (who, head[:12], names[:60], shown))
             if not logged:   # an override nobody can audit is not made
-                return "gh: merge of %s#%d refused: blocking review(s): %s. The --over-review could not be logged (no writable switchboard state), so it was not made" % (
-                    repo, number, names)
+                return "gh: merge of %s#%d refused: blocking review(s): %s. The --over-review could not be logged (%s), so it was not made" % (
+                    repo, number, names, GATE_SPOOL_WHY or "no writable switchboard state")
             sys.stderr.write("gh: merging %s#%d over a blocking review on purpose (%s); logged\n" % (repo, number, names))
             return None
         why = ("--over-review needs a reason of at least 10 characters" if found else

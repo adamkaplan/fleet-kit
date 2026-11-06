@@ -1467,7 +1467,7 @@ class TestGhShimGateProbe(Base):
         config.write_text(json.dumps({"plan_gates": {"repos": repos}} if repos is not None else {}))
 
     def run_shim(self, *args, env=None, binary=True):
-        environ = {"PATH": "%s:%s:%s" % (SHIM.parent, self.bin, SAFE_PATH), "HOME": str(self.home),
+        environ = {"PATH": "%s:%s:%s" % ((self.shim_copy or SHIM).parent, self.bin, SAFE_PATH), "HOME": str(self.home),
                    "FLEET_SWITCHBOARD_STATE": str(self.state), "FLEET_SHIM_LOOKUP_SECONDS": SHIM_LOOKUP_SECONDS,
                    "FLEET_SHIM_GATE_SECONDS": SHIM_LOOKUP_SECONDS}   # the gate question's bound too: the largest the shim allows
         if binary:
@@ -1477,7 +1477,7 @@ class TestGhShimGateProbe(Base):
         if self.log.exists():
             self.log.unlink()
         started = time.time()
-        done = subprocess.run([sys.executable, str(SHIM), *args], capture_output=True, text=True, env=environ, timeout=60)
+        done = subprocess.run([sys.executable, str(self.shim_copy or SHIM), *args], capture_output=True, text=True, env=environ, timeout=60)
         self.elapsed = time.time() - started
         seen = json.loads(self.log.read_text()) if self.log.exists() else None
         return done, seen
@@ -1627,6 +1627,43 @@ class TestGhShimGateProbe(Base):
             self.assertIn("at least 10 characters", done.stderr)
         done, seen = self.merge("--over-review", "a reason that nobody needs", reviews=[])           # nothing to override: just stripped
         self.assertEqual((done.returncode, "--over-review" in " ".join(seen["argv"])), (7, False))
+
+    shim_copy = None   # a patched copy of the shim a test runs instead
+
+    def small_limit_shim(self):
+        """A copy of the shim (with its sibling files) whose spool limit is 200 bytes: no test pins the real size."""
+        import shutil
+        copy = self.home / "smallshim"
+        copy.mkdir()
+        for f in SHIM.parent.iterdir():
+            if f.is_file():
+                shutil.copy(f, copy / f.name)
+        text = (copy / SHIM.name).read_text()
+        self.assertIn("GATE_SPOOL_LIMIT = 262144", text)
+        (copy / SHIM.name).write_text(text.replace("GATE_SPOOL_LIMIT = 262144", "GATE_SPOOL_LIMIT = 200"))
+        self.shim_copy = copy / SHIM.name
+
+    def test_a_full_gate_spool_rotates_and_the_over_review_is_logged_and_made(self):
+        block = [self.review("CHANGES_REQUESTED", "reviewer-a")]
+        if True:
+            self.small_limit_shim()
+            (self.state / "gate-failopen.jsonl").write_text("x" * 500 + "\n")
+            done, seen = self.merge("--over-review", "the owner accepted the risk in chat", reviews=block)
+            self.assertEqual((done.returncode, done.stdout.strip()), (7, "real gh out"), done.stderr)
+            self.assertEqual((self.state / "gate-failopen.jsonl.1").read_text(), "x" * 500 + "\n")
+            (line,) = [l for l in self.spool() if l["event"] == "over_review"]
+            self.assertIn("the owner accepted", line["detail"])
+            (self.state / "gate-failopen.jsonl").write_text("y" * 500 + "\n")   # an older .1 is replaced
+            done, seen = self.merge("--over-review", "the owner accepted the risk again", reviews=block)
+            self.assertEqual(done.returncode, 7, done.stderr)
+            self.assertEqual((self.state / "gate-failopen.jsonl.1").read_text(), "y" * 500 + "\n")
+
+    def test_an_unwritable_state_still_refuses_the_over_review_and_names_the_reason(self):
+        block = [self.review("CHANGES_REQUESTED", "reviewer-a")]
+        shutil_rm = self.state.rmdir()
+        done, seen = self.merge("--over-review", "the owner accepted the risk in chat", reviews=block)
+        self.assertEqual((done.returncode, seen), (10, None))
+        self.assertIn("could not be logged (no state directory %s)" % self.state, done.stderr)
 
     def test_a_reviews_api_or_switchboard_failure_lets_the_merge_through_with_a_visible_warning(self):
         done, seen = self.merge(env={"FAKE_REVIEWS_EXIT": "1"})
@@ -1952,8 +1989,11 @@ class TestGhShimGateProbe(Base):
         self.assertEqual(stat.S_IMODE(os.stat(str(path)).st_mode), 0o600)
         path.write_text("x" * 300000)
         self.run_shim("pr", "merge", "12", "-R", "acme/app", env={"FAKE_GATE_EXIT": "3"})
-        self.assertEqual(len(path.read_text()), 300000, "a full spool takes no more lines")
+        self.assertEqual(path.read_text().count("\n"), 1)
+        self.assertEqual((self.state / "gate-failopen.jsonl.1").read_text(), "x" * 300000, "a full spool is rotated, never grows past its limit")
+        self.assertLess(len(path.read_text()), 1000)
         path.unlink()
+        (self.state / "gate-failopen.jsonl.1").unlink()
         self.state.rmdir()
         self.run_shim("pr", "merge", "12", "-R", "acme/app", env={"FAKE_GATE_EXIT": "3"})   # no state dir: nothing written, nothing fails
 
