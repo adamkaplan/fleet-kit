@@ -102,6 +102,13 @@ class TestMergeReady(Base):
         self.assertEqual(code, 0, (out, err))
         self.assertIn("rev's block at aaaaaaaa lifted by their later approval at bbbbbbbb", out)
 
+    def test_s2_an_approval_whose_body_blocks_does_not_lift_the_earlier_block(self):
+        self.gh.reviews = [review("CHANGES_REQUESTED", OLD, "rev", rid=1), review("APPROVED", HEAD, "rev", body="BLOCK: still wrong", rid=2)]
+        self.refused("rev requested changes or blocked at aaaaaaaa")   # the earlier block is named; old code lifted it
+        code, out, err = self.run_ready()
+        self.assertNotIn("lifted", out)
+        self.assertIn("rev requested changes or blocked at bbbbbbbb", out)   # the approval itself counts as a block at its commit
+
     def test_s2_a_block_followed_only_by_another_reviewers_approval_is_refused(self):
         self.gh.reviews = [review("CHANGES_REQUESTED", OLD, "a", rid=1), review("APPROVED", HEAD, "b", rid=2)]
         self.refused("a requested changes or blocked at aaaaaaaa (an earlier head than bbbbbbbb)")

@@ -78,7 +78,7 @@ def merge_ready_facts(engine, runner, repo, number):
             failed.append("review: %s's review at %s was dismissed by %s (a dismissed request for changes or block counts as refused)" % (who, at, by))
         elif state == "CHANGES_REQUESTED" or _MR_BLOCK_WORD.match(body) or _MR_BLOCK_FINDING.search(body):
             mine = reviews.index(review)   # the same reviewer's LATER approval at a later commit lifts it (never another reviewer's, never a dismissed one)
-            later = [r for i, r in enumerate(reviews) if _when(i) > _when(mine) and _mr_login(r.get("user")) == who and str(r.get("state") or "").upper() == "APPROVED"
+            later = [r for i, r in enumerate(reviews) if _when(i) > _when(mine) and _mr_login(r.get("user")) == who and str(r.get("state") or "").upper() == "APPROVED" and not (_MR_BLOCK_WORD.match(str(r.get("body") or "")) or _MR_BLOCK_FINDING.search(str(r.get("body") or "")))
                      and str(r.get("commit_id") or "") != str(review.get("commit_id") or "")]
             if later:
                 lifted_notes.append("%s's block at %s lifted by their later approval at %s" % (who, at, str(later[-1].get("commit_id") or "")[:8] or "an unknown commit"))
