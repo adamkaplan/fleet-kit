@@ -13,7 +13,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[3]
 PARTS = {
     "cloud_cluster": "CLUSTER_NAMES",
-    "cloud_launch_again": ("brief_path", "_launch_line", "_launch_again", "_finish_starting", "no_wait_options", "park"),
+    "cloud_launch_again": (),   # reached as cloud_launch_again.<name>; it binds the globals (checked below)
     "cloud_inspect": ("INSPECT_SECONDS", "_inspect_short", "cmd_inspect"),
     "cloud_lane_cap": ("lane_m_workers", "_ended", "_stopped_ids"),
 }
