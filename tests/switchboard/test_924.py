@@ -16,6 +16,7 @@ def load():
 
 
 def _body():
+    HOSTILE_RATING_DEFAULTS = {"impact_severity": "Negligible", "impact_probability": "Improbable", "impact_reason": "floor-authority", "impact_action": "none", "impact_class": "data", "block": "/nonexistent/block.txt"}
     TestPR8Source, TestImpactHold = HOST.TestPR8Source, HOST.TestImpactHold
 
     def hostile_parser_cases():
@@ -191,8 +192,93 @@ def _body():
             setattr(TestPR8Source924, _name, None)
 
 
+    class RegistrarVocabulary:
+        """The vocabulary table and the finder of the registrar lint (#924), moved from TestImpactHold; they are put back on it below, so its inherited test reads them as before."""
+
+        # The vocabulary of a registrar (ONE table, #924): everything else is a finding. A registrar sets up ITS OWN parsers: it reads its own parameter (`sub`), the names it binds itself, literals, and the names below.
+        REGISTRAR_VALUES = frozenset({"AGENTS_VERIFY_TIMEOUT", "BATCH_ROWS_MAX", "BLOCK_TABLE_TEXT", "CHARTER_HELP", "COS_WORKSPACE_LABEL", "DAEMON_HEALTH_WAIT", "DECISIONS_STALE_SECONDS", "IMPACT_RATING_FIELDS", "MEASURE_SCAN_MAX", "ORDERS_HEADING",
+                                      "ORDER_MAX_CHARS", "PROG", "REPORT_MAX", "REPORT_STATES", "RESUME_COMMAND", "RESUME_REASON", "RESUME_SECONDS", "add_decision_list_flags", "float", "int", "issue_arg"})   # constants and converters the registrars read
+        REGISTRAR_MODULES = frozenset({"argparse", "plan_ledger", "scenario"})   # modules: only `Name.UPPER_CASE_CONSTANT` is read from them (`argparse.SUPPRESS`), never anything else, never the name alone
+        REGISTRAR_ATTRIBUTES = frozenset({"add_argument", "add_parser", "add_subparsers", "add_mutually_exclusive_group", "add_argument_group", "set_defaults", "replace", "split", "join", "format", "default", "dest", "nargs"})   # what a registrar calls or reads on its own objects
+        @classmethod
+        def registrar_findings(cls, tree):
+            """What each `add_<name>_parsers` function of `tree` does beyond setting up its own parsers: {name: {finding}}. An ALLOW-LIST derived by walking the registrar, not a ban list: a name it reads must be its own (a parameter, or a name it binds: an assignment, a loop, a `with`, a comprehension,
+            a nested function's parameter) or in the vocabulary table above; a module name only as the base of an UPPER_CASE constant; an attribute only from the table (and never a dunder or a private name); and no attribute or subscript is ever the target of an assignment, a loop, a `with`,
+            a comprehension or a `del`. Every shape that reaches another module (sys, globals, __dict__, __setattr__, type, object, an alias of a module) is outside the vocabulary."""
+            import ast
+            found = {}
+            for node in tree.body:
+                if not (isinstance(node, ast.FunctionDef) and re.fullmatch(r"add_[a-z0-9_]+_parsers", node.name)):
+                    continue
+                own = set()
+                for x in ast.walk(node):
+                    if isinstance(x, ast.arg):
+                        own.add(x.arg)
+                    elif isinstance(x, ast.Name) and isinstance(x.ctx, ast.Store):
+                        own.add(x.id)
+                    elif isinstance(x, ast.FunctionDef) and x is not node:
+                        own.add(x.name)
+                def note(what):
+                    found.setdefault(node.name, set()).add(what)
+                parents = {child: parent for parent in ast.walk(node) for child in ast.iter_child_nodes(parent)}
+                for x in ast.walk(node):
+                    if isinstance(x, ast.Name) and isinstance(x.ctx, ast.Load) and x.id not in own:
+                        if x.id in cls.REGISTRAR_MODULES:
+                            parent = parents.get(x)
+                            if not (isinstance(parent, ast.Attribute) and parent.value is x and parent.attr.isupper()):
+                                note("the module %s used for more than one of its constants" % x.id)
+                        elif x.id not in cls.REGISTRAR_VALUES:
+                            note("the name %s is outside the registrar vocabulary" % x.id)
+                    if isinstance(x, ast.Attribute):
+                        if isinstance(x.ctx, (ast.Store, ast.Del)):
+                            note("an assignment or delete of an attribute (%s)" % ast.unparse(x)[:40])
+                        elif x.attr.startswith("_"):
+                            note("attribute " + x.attr)
+                        elif not (x.attr in cls.REGISTRAR_ATTRIBUTES or (x.attr.isupper() and isinstance(x.value, ast.Name) and x.value.id in cls.REGISTRAR_MODULES)):
+                            note("the attribute %s is outside the registrar vocabulary" % x.attr)
+                    if isinstance(x, ast.Subscript) and isinstance(x.ctx, (ast.Store, ast.Del)):
+                        note("an assignment or delete of a subscript")
+                    if isinstance(x, (ast.Global, ast.Nonlocal)):
+                        note("a global statement")
+                    if isinstance(x, ast.Constant) and x.value == "review" and node.name != "add_review_parsers":
+                        note('the string "review"')
+            return found
+
+    for _name in ("REGISTRAR_VALUES", "REGISTRAR_MODULES", "REGISTRAR_ATTRIBUTES", "registrar_findings"):
+        setattr(TestImpactHold, _name, vars(RegistrarVocabulary)[_name])
+
+
     class TestImpactHold924(TestImpactHold):
         """The tests of #924 that were added to TestImpactHold, moved from bin/test-switchboard."""
+
+        # ---- #924 round 4: the check is a closure cell of each effect, never a parameter and never read from the namespace at bind time
+
+        def hostile(self, body):
+            """Run `body(seen)` as a registrar of the real `main`; (seen, the DELETE writes, main's code, its stderr)"""
+            self.delegate(); self.floor_pr(path="migrations/0002.sql"); self.files_of_pr("migrations/0002.sql"); self.passes()
+            seen = {}
+            def registrar(sub):
+                with captured():
+                    body(seen)
+            patcher = mock.patch.object(sb, "add_zzz_parsers", registrar, create=True)
+            patcher.start()
+            try:
+                with captured() as (o, e):
+                    code = sb.main(["version"], runner=self.route, now=self.world.clock.now)
+            finally:
+                patcher.stop()
+            return seen, [w for w in self.writes if w[0] == "DELETE"], code, e.getvalue()
+
+        @staticmethod
+        def outcome(call):
+            """'ran' when the call returned success or nothing; 'refused' for the refusal (a return of 1, the RuntimeError); 'error: X' for any other failure (it also did nothing)"""
+            try:
+                result = call()
+            except RuntimeError as err:
+                return "refused" if "registrar ran" in str(err) or "already bound" in str(err) or "not bound" in str(err) else "error: RuntimeError"
+            except Exception as err:
+                return "error: %s" % type(err).__name__
+            return "refused" if result == 1 else "ran"
 
         @property
         def RATING_ROOT_WHY(self):   # one row for each of `rating_roots`, in the matrix (`rating_roots_why`): the one table the code, the matrix text and docs/switchboard.md share
