@@ -165,6 +165,17 @@ class PrLabel(unittest.TestCase):
             s.reap()
             self.assertEqual([c[1] for c in s.calls], [52])
 
+    def test_refusals_on_any_branch_name_and_repo_case(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s = Scene([pod()], {"w1": "61\n62\n63\n"}, tmp)
+            s.heads = {61: ("perf/z", "closed"), 62: ("perf/x", "open", "someone-else/widget"), 63: ("perf/y", "open", "Acme/Widget")}
+            s.reap()
+            self.assertEqual([c[1] for c in s.calls], [63])
+            why = " ".join(str(x) for l in s.lines() for x in l.values())
+            self.assertIn("skipped: the pull request is closed", why)
+            self.assertIn("its head repository is not this worker's repository", why)
+            self.assertNotIn("head branch", why)
+
     def test_failed_done_mark_is_not_looped(self):
         with tempfile.TemporaryDirectory() as tmp:
             s = Scene([pod()], {"w1": "41\n42\n"}, tmp)

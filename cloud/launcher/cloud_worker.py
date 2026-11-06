@@ -4710,9 +4710,9 @@ class Launcher:
                             check_repo_allowed(repo, self.env)
                             token = run_git_token_cmd(git_token_cmd(repo, self.env), repo, dict(os.environ, **self.env), register=lambda *v: self.kube.add_secrets(*v))
                             self.kube.add_secrets(token)
-                        ref, state, head_repo = (self.pr_head or github_pr_head)(token, repo, int(number))
+                        _ref, state, head_repo = (self.pr_head or github_pr_head)(token, repo, int(number))
                         if state != "open" or head_repo.lower() != repo.lower():
-                            raise RuntimeError("skipped: the pull request is %s and its head is in %s, not %s" % (safe_value(state), safe_value(head_repo), safe_value(repo)))
+                            raise RuntimeError("skipped: %s" % ("the pull request is " + safe_value(state) if state != "open" else "its head repository is not this worker's repository"))
                         (self.add_labels or github_add_labels)(token, repo, int(number), labels)
                         ok, why = True, "labelled %s" % ", ".join(labels)
                     except Exception as e:
