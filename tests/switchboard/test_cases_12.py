@@ -367,6 +367,8 @@ class TestAgentShellCalls(Base):
 
     def test_s7_only_the_account_the_class_and_the_time_are_stored(self):
         done = self.shim("api", "repos/acme/app/issues/5?token=queryvalue", "-f", "note=secretbody", env={"GH_TOKEN": "secrettoken"})
+        refused = self.shim("api", "repos/acme/app/issues/5", "-f", "body=secretbody", env={"GH_TOKEN": "secrettoken"})   # a write body is refused before it is counted
+        self.assertNotEqual(refused.returncode, 7)
         text = (self.state / "agent-calls.jsonl").read_text()
         for leak in ("secrettoken", "faketoken", "secretbody", "queryvalue", "acme/app"):
             self.assertNotIn(leak, text)
@@ -443,6 +445,7 @@ class TestAgentShellCalls(Base):
 
     def test_lane_s7_no_value_reaches_the_record_beside_the_lane(self):
         self.shim("api", "repos/acme/app/issues/5?token=queryvalue", "-f", "note=secretbody", env={"GH_TOKEN": "secrettoken"})
+        self.shim("api", "repos/acme/app/issues/5", "-f", "body=secretbody", env={"GH_TOKEN": "secrettoken"})   # refused: the body text is in no record
         row = json.loads((self.state / "agent-calls.jsonl").read_text().splitlines()[0])
         self.assertLessEqual({"account", "endpoint", "lane", "ts"}, set(row))
         self.assertNotRegex(json.dumps(row), r"secrettoken|secretbody|queryvalue")

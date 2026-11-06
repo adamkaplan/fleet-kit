@@ -17779,7 +17779,16 @@ class TestHandoff(HandoffCase):
         # the sites are named by where they live, not counted: a new file that writes has to be named here on purpose (`comment --edit`, #1714, is the signed edit of one's own comment: agents_verify.gh_call)
         holders = sorted(p.name for p in SWITCHBOARD_SOURCE_FILES if '"--method"' in p.read_text())
         self.assertEqual(holders, ["agents_verify.py", "fleet-switchboard", "handoff.py"])
-        self.assertGreaterEqual(source.count('"--method"'), 5)   # the sites before #1714 are still there
+        # every `"--method"` site, as (file, enclosing def): a new write site must be added to this list on purpose
+        sites = []
+        for p in SWITCHBOARD_SOURCE_FILES:
+            lines = p.read_text().splitlines()
+            for i, line in enumerate(lines):
+                if '"--method"' in line:
+                    owner = next(m.group(1) for m in (re.match(r"\s*def (\w+)", l) for l in reversed(lines[:i + 1])) if m)
+                    sites.append((p.name, owner))
+        self.assertEqual(sorted(sites), sorted([("agents_verify.py", "gh_call"), ("fleet-switchboard", "_gh_write"), ("fleet-switchboard", "_review_api"),
+                                       ("fleet-switchboard", "gate_read_only"), ("fleet-switchboard", "write_issue_body"), ("handoff.py", "post_ask_comment")]))
         self.assertEqual(len(re.findall(r"_review_api\([^)]*\"(?:POST|PUT)\"", source)), 2)   # the post (the verdict and its own-account fallback share one call site, the event is a variable) and the dismissal: each goes through the helper
 
 
