@@ -308,6 +308,135 @@ def check_delivers(module, test):
         test.assertNotIn("tok-leak", s.everything(raw))
 
 
+def vanish(module, head, kind="close"):
+    """One request whose client goes before the answer; (stderr text, audit lines, status of the next request, slot freed)."""
+    import io
+    import struct
+    saved, sys.stderr = sys.stderr, io.StringIO()
+    try:
+        with Running(module, timeout=0.5, max_handlers=1) as s:
+            sock = socket.create_connection(("127.0.0.1", s.port()), timeout=5)
+            sock.sendall(head)
+            if kind == "reset":
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+            sock.close()
+            deadline = time.monotonic() + 2   # hang guard only: the handler is awaited through its audit line or its slot
+            while time.monotonic() < deadline and not s.lines and s.server._slots._value == 1:
+                time.sleep(0.01)
+            freed = s.server._slots.acquire(timeout=10)
+            if freed:
+                s.server._slots.release()
+            nxt = s.post(GOOD)[0]
+            err = sys.stderr.getvalue()
+            return err, list(s.lines), nxt, freed
+    finally:
+        sys.stderr = saved
+
+
+def check_vanished_client(module, test):
+    for head, status, reason in ((request_bytes("tok-a", 50), 408, "refused status=408 reason=body timeout"),
+                                 (request_bytes(None, None), 401, "refused status=401 reason=no token")):
+        err, lines, nxt, freed = vanish(module, head)
+        test.assertTrue(freed, "the handler did not finish")
+        test.assertTrue(err == "", "a vanished client left a traceback")
+        test.assertIn(reason, lines)
+        test.assertEqual(lines.count("undelivered status=%d: the client had gone" % status), 1)
+        test.assertEqual(nxt, 200)
+
+
+READ_CLAUSE = """            except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
+                self.close_connection = True
+                audit("client had gone during the read")
+                return
+"""
+
+
+def mutation_applied(original, changed):
+    return changed != original and original.count(READ_CLAUSE) == 1 and READ_CLAUSE not in changed
+
+
+def mutation_applied_cut(original, changed, cut):
+    return changed != original and original.count(cut) == 1 and cut not in changed
+
+
+def check_reset_during_read(module, test):
+    err, lines, nxt, freed = vanish(module, request_bytes("tok-a", 50), kind="reset")
+    test.assertTrue(freed, "the handler did not finish")
+    tail = [l for l in err.strip().splitlines() if l.strip() and not l.startswith("---")]
+    test.assertTrue(err == "", "a reset during the read escaped: %s" % tail[-1:])
+    test.assertEqual(lines.count("client had gone during the read"), 1)
+    test.assertEqual([l for l in lines if l != "client had gone during the read" and not l.startswith("delivered")], [])
+    test.assertEqual(nxt, 200)
+    return err, lines, nxt, freed
+
+
+SYNTH = ("tok-synth-7q", "/synth-path-7q", "synth-body-words-7q")
+
+
+def check_undelivered_holds_nothing(module, test):
+    body = SYNTH[2].encode()
+    head = (b"POST " + SYNTH[1].encode() + b" HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer " + SYNTH[0].encode()
+            + b"\r\nContent-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body)
+    err, lines, nxt, freed = vanish(module, head)
+    test.assertTrue(freed, "the handler did not finish")
+    test.assertTrue(any(l.startswith("undelivered status=404") for l in lines), "no undelivered line")
+    seen = err + " ".join(lines)
+    test.assertTrue(not any(v in seen for v in SYNTH), "the undelivered line held a text of the request")
+    return sum(v in seen for v in SYNTH)
+
+
+class TestVanishedClient(unittest.TestCase):
+    CUT = "except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):"
+
+    def test_s2_closing_clients(self):
+        check_vanished_client(load(), self)
+        print("S2: stderr 0 chars (2 of 2), undelivered lines 1 each with status 408 and 401, next request answered 2 of 2")
+
+    def test_s4_mutant_leaves_a_traceback(self):
+        check_vanished_client(load(), self)
+        changed = SOURCE.replace(self.CUT, "except ZeroDivisionError:")
+        applied = mutation_applied_cut(SOURCE, changed, self.CUT)
+        self.assertTrue(applied, "the mutation was not applied")
+        with self.assertRaises(AssertionError) as caught:
+            check_vanished_client(load(changed), self)
+        self.assertIn("a vanished client left a traceback", str(caught.exception))
+        with self.assertRaises(AssertionError) as noop:   # control of the check itself
+            self.assertTrue(mutation_applied_cut(SOURCE, SOURCE.replace(self.CUT, self.CUT), self.CUT), "the mutation was not applied")
+        self.assertIn("the mutation was not applied", str(noop.exception))
+        print("S4: control 1 of 1, mutant 1 of 1 with the text, mutation applied %s (computed from the two texts)" % applied)
+
+    def test_s3_resetting_client(self):
+        writing = vanish(load(), request_bytes(None, None), kind="reset")
+        self.assertTrue(writing[3], "the handler did not finish")
+        self.assertEqual(writing[0], "")
+        self.assertEqual(writing[2], 200)
+        check_reset_during_read(load(), self)
+        print("S3: writing-case stderr %d chars, reading case quiet, next request served True" % len(writing[0]))
+
+    def test_s8_reset_during_the_read(self):
+        err, lines, nxt, freed = check_reset_during_read(load(), self)
+        changed = SOURCE.replace(READ_CLAUSE, "")
+        applied = mutation_applied(SOURCE, changed)
+        self.assertTrue(applied, "the mutation was not applied")
+        with self.assertRaises(AssertionError) as caught:
+            check_reset_during_read(load(changed), self)
+        text = str(caught.exception)
+        self.assertIn("a reset during the read escaped", text)
+        self.assertIn("ConnectionResetError", text)
+        print("S8: stderr %d chars, audit lines %d (client had gone during the read), slot freed %s, next request %d; "
+              "control 1 of 1, mutant 1 of 1 with the text (ConnectionResetError), mutation applied %s"
+              % (len(err), lines.count("client had gone during the read"), freed, nxt, applied))
+
+    def test_u2_no_text_of_the_request(self):
+        count = check_undelivered_holds_nothing(load(), self)
+        old = 'audit("undelivered status=%d: the client had gone" % status)'
+        self.assertEqual(SOURCE.count(old), 1)
+        with self.assertRaises(AssertionError) as caught:
+            check_undelivered_holds_nothing(mutant(old, 'audit("undelivered status=%d: the client had gone %s" % (status, self.path))'), self)
+        self.assertIn("the undelivered line held a text of the request", str(caught.exception))
+        print("U2: %d of 3 synthetic values in audit or stderr; control 1 of 1, mutant 1 of 1 with the text" % count)
+
+
 def check_bad_json_400(module, test):
     with Running(module) as s:
         test.assertEqual(s.post(b"not json")[0], 400)
@@ -396,6 +525,8 @@ CHECKS = [
     ("namespace_required", check_namespace_required, "max_handlers=None, *, namespace):", "max_handlers=None, namespace=None):"),
     ("namespace_required_serve", check_namespace_required, "audit, *, namespace):", "audit, namespace=None):"),
     ("bearer_reused", check_bearer_reused, "BEARER = cloud_channel.BEARER", "BEARER = \"Bearer  \""),
+    ("vanished_client", check_vanished_client, "except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):", "except ZeroDivisionError:"),
+    ("reset_during_read", check_reset_during_read, READ_CLAUSE, ""),
 ]
 
 
