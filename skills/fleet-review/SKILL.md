@@ -34,6 +34,8 @@ Each reviewer also checks a change that deletes something or raises an alert aga
 
 When a review finding names a gap in one member of a table, list, set or rule family (a row, a kind, an input, a rule), the fix covers every member in the same head: derive the set from the code, never a hand-listed copy, parametrise the tests over it with one mutant per member, and say in the PR body which members were checked; reviewers name the class, not only the instance.
 
+For every test you rely on, say whether it ran a real component or a fake, and which; a test that touched only a fake is reported as such and is never proof of the real component.
+
 When a function decides from text (an error message, a substring, a pattern, a name list), the first-round finding asks for an allow-list, a structured field or exact equality, and for a completeness test derived from the code, with one mutant per member, so the class is closed in one round and not found one instance at a time. The rule and its example are in `docs/review-laws/structural-rule.md` of the kit.
 
 A mutant counts as caught only with a passing control (the same command on the unmutated copy exits 0) and an anchored failure text (the mutated check is named in the failure); a harness that counts any non-zero exit as a catch proves nothing. Readers check the control in the test and in the PR body and, where they run the mutant, run the control first, and name its absence as a finding in the first round.
