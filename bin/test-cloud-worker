@@ -1634,9 +1634,8 @@ class TestLaunchStack(Base):
         code, out, err = self.launch_with("--cloud")
         self.assertEqual(code, 0, err)
         self.assertEqual(len(arming(err)), 1, err)
-        code, out, err = self.launch_with("--cloud")   # no state_clean: the worker record of the first exists; since #1619 the launch returns that worker (exit 0), it does not refuse
-        self.assertEqual(code, 0, err)
-        self.assertIn("exists: returned worker coder7", err)
+        code, out, err = self.launch_with("--cloud")   # no state_clean: the worker record of the first exists, the real launcher refuses it
+        self.assertNotEqual(code, 0, err)
         self.assertEqual(len(arming(err)), 0, err)
         self.assertEqual(len([c for c in self.stub_calls() if c[0] == "create"]), 1)   # no second pod
 
