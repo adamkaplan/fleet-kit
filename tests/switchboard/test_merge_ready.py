@@ -96,9 +96,28 @@ class TestMergeReady(Base):
         self.gh.base = "release"
         self.refused("is into release, not the default branch main")
 
-    def test_s2_a_block_at_an_earlier_head_is_refused_though_a_later_review_approves(self):
-        self.gh.reviews = [review("CHANGES_REQUESTED", OLD, "rev", rid=1), review("APPROVED", HEAD, "rev", rid=2)]   # the latest per reviewer is an approval
-        self.refused("rev requested changes or blocked at aaaaaaaa (an earlier head than bbbbbbbb)")
+    def test_s2_a_block_lifted_by_the_same_reviewers_later_approval_is_ready_and_named(self):
+        self.gh.reviews = [review("CHANGES_REQUESTED", OLD, "rev", rid=1), review("APPROVED", HEAD, "rev", rid=2)]
+        code, out, err = self.run_ready()
+        self.assertEqual(code, 0, (out, err))
+        self.assertIn("rev's block at aaaaaaaa lifted by their later approval at bbbbbbbb", out)
+
+    def test_s2_a_block_followed_only_by_another_reviewers_approval_is_refused(self):
+        self.gh.reviews = [review("CHANGES_REQUESTED", OLD, "a", rid=1), review("APPROVED", HEAD, "b", rid=2)]
+        self.refused("a requested changes or blocked at aaaaaaaa (an earlier head than bbbbbbbb)")
+
+    def test_s2_a_block_whose_later_approval_was_dismissed_is_refused(self):
+        self.gh.reviews = [review("CHANGES_REQUESTED", OLD, "rev", rid=1), review("DISMISSED", HEAD, "rev", rid=2)]
+        self.gh.events = [{"event": "review_dismissed", "actor": {"login": "maint"}, "dismissed_review": {"review_id": 2, "state": "approved"}}]
+        self.refused("rev requested changes or blocked at aaaaaaaa")
+
+    def test_s2_a_block_and_an_approval_at_the_same_commit_is_refused(self):
+        self.gh.reviews = [review("CHANGES_REQUESTED", OLD, "rev", rid=1), review("APPROVED", OLD, "rev", rid=2)]
+        self.refused("rev requested changes or blocked at aaaaaaaa")
+
+    def test_s2_a_block_never_followed_by_an_approval_is_refused(self):
+        self.gh.reviews = [review("COMMENTED", OLD, "rev", body="BLOCK: no", rid=1)]
+        self.refused("rev requested changes or blocked at aaaaaaaa")
 
     def test_s2_a_block_written_in_a_comment_review_is_refused(self):
         self.gh.reviews = [review("COMMENTED", HEAD, "bot", body="BLOCK: the base is wrong")]

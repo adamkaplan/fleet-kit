@@ -1,7 +1,7 @@
 # ---------------------------------------------------------------- `merge-ready` (ask #2265)
 #
 # Before an admin merge a lane runs `merge-ready <owner/repo#N>`. It states, in one place, the facts four wrong admin merges got wrong: the base is the repository's
-# default branch; no review at ANY commit asked for changes or blocked (a dismissed request for changes or block is named with who dismissed it and counts as refused; a dismissed approval is a note); the captain label the
+# default branch; no review at ANY commit asked for changes or blocked, unless the SAME reviewer later approved at a later commit (that lifts their own earlier block and is named; another reviewer's approval or a dismissed one does not) (a dismissed request for changes or block is named with who dismissed it and counts as refused; a dismissed approval is a note); the captain label the
 # repository's `captain_labels` entry names is on the pull request; every required check is green at the current head. It reads (GET only) and prints READY (exit 0) or one
 # line per failed fact (exit 1). `--override "<who ordered it>: <reason>"` records an owner-ordered fix-forward merge: it appends ONE line to the switchboard's own
 # audit file (a local write, never a GitHub write), prints OVERRIDDEN, and exits 6. It does not merge anything and it blocks nothing.
@@ -65,6 +65,9 @@ def merge_ready_facts(engine, runner, repo, number):
         if event.get("event") == "review_dismissed" and isinstance(event.get("dismissed_review"), dict):
             dismissers[event["dismissed_review"].get("review_id")] = _mr_login(event.get("actor"))
             was[event["dismissed_review"].get("review_id")] = str(event["dismissed_review"].get("state") or "").upper()
+    def _when(i):
+        return (str(reviews[i].get("submitted_at") or ""), i)
+    lifted_notes = []
     for review in reviews:   # EVERY review at EVERY commit, never the latest per reviewer
         state, body = str(review.get("state") or "").upper(), str(review.get("body") or "")
         at, who = str(review.get("commit_id") or "")[:8] or "an unknown commit", _mr_login(review.get("user"))
@@ -74,12 +77,18 @@ def merge_ready_facts(engine, runner, repo, number):
         elif state == "DISMISSED":
             failed.append("review: %s's review at %s was dismissed by %s (a dismissed request for changes or block counts as refused)" % (who, at, by))
         elif state == "CHANGES_REQUESTED" or _MR_BLOCK_WORD.match(body) or _MR_BLOCK_FINDING.search(body):
+            mine = reviews.index(review)   # the same reviewer's LATER approval at a later commit lifts it (never another reviewer's, never a dismissed one)
+            later = [r for i, r in enumerate(reviews) if _when(i) > _when(mine) and _mr_login(r.get("user")) == who and str(r.get("state") or "").upper() == "APPROVED"
+                     and str(r.get("commit_id") or "") != str(review.get("commit_id") or "")]
+            if later:
+                lifted_notes.append("%s's block at %s lifted by their later approval at %s" % (who, at, str(later[-1].get("commit_id") or "")[:8] or "an unknown commit"))
+                continue
             failed.append("review: %s requested changes or blocked at %s%s" % (who, at, "" if at == head[:8] else " (an earlier head than %s)" % (head[:8] or "unknown")))
     captain = (engine.config.get("captain_labels") or {}).get(repo)
     names = {str(l.get("name")) for l in _mr_dicts(pr.get("labels") or [])}
     if captain and captain not in names:
         failed.append("captain: the required captain label %s is missing" % captain)
-    notes = notes_base + ([] if captain else ["no captain rule"]) + dismissed_notes
+    notes = notes_base + ([] if captain else ["no captain rule"]) + dismissed_notes + lifted_notes
     required, configured = set(), False
     try:
         protection = _mr_dicts(_mr_get(engine, runner, repo, "repos/%s/branches/%s/protection/required_status_checks" % (repo, base)))
