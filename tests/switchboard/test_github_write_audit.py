@@ -16,7 +16,7 @@ REPO = Path(__file__).resolve().parents[2]
 HOST = None   # set by bin/test-switchboard
 SECRET = "ghp_FAKE_SECRET_0123456789"
 FLAGS = {"--method", "-X", "--input", "-f", "-F", "--field", "--raw-field"}
-VERBS = {("pr", v) for v in ("comment", "edit", "create", "close", "ready", "merge", "reopen")} | {("issue", v) for v in ("comment", "edit", "create", "close", "reopen")} | {("label", v) for v in ("create", "edit", "delete")}
+WRITE_WORD_PAIRS = {("pr", v) for v in ("comment", "edit", "create", "close", "ready", "merge", "reopen")} | {("issue", v) for v in ("comment", "edit", "create", "close", "reopen")} | {("label", v) for v in ("create", "edit", "delete")}
 GUARD_NAMES = ("github_write", "github_audited")
 
 
@@ -31,7 +31,7 @@ def write_shaped(node):
         words_flags = FLAGS
     if any(w in words_flags or w.startswith(("--method=", "--field=", "--raw-field=", "--input=")) for w in words):
         return True
-    return any((a, b) in VERBS for a, b in zip(words, words[1:]))
+    return any((a, b) in WRITE_WORD_PAIRS for a, b in zip(words, words[1:]))
 
 
 def call_name(node):
