@@ -1,6 +1,9 @@
 {
   "permission": {
     "question": "deny",
+    "edit": {
+      "*pr-record*": "deny"
+    },
     "bash": {
       "*": "allow",
       "gh pr merge*": "deny",
@@ -103,6 +106,9 @@
       "gh api*/issues/*/comments": "allow",
       "gh api*/issues/*/comments *": "allow",
       "gh api*/issues/*/comments?*": "allow",
+      "gh api*/issues/comments/*": "allow",
+      "gh api*/issues/comments/* *": "allow",
+      "gh api*/issues/comments/*?*": "allow",
       "gh api*/pulls/*/reviews": "allow",
       "gh api*/pulls/*/reviews *": "allow",
       "gh api*/pulls/*/reviews?*": "allow",
@@ -142,6 +148,8 @@
       "gh api*PATCH*": "deny",
       "gh api*PUT*": "deny",
       "gh api*DELETE*": "deny",
+      "*CW_PR_RECORD*": "deny",
+      "*pr-record*": "deny",
       "*git*push*!main": "deny",
       "*git*push*!main!*": "deny",
       "*git*push*!main\"*": "deny",
@@ -2070,6 +2078,9 @@
     "worker": {
       "permission": {
         "question": "deny",
+        "edit": {
+          "*pr-record*": "deny"
+        },
         "bash": {
           "*": "allow",
           "gh pr merge*": "deny",
@@ -2172,6 +2183,9 @@
           "gh api*/issues/*/comments": "allow",
           "gh api*/issues/*/comments *": "allow",
           "gh api*/issues/*/comments?*": "allow",
+          "gh api*/issues/comments/*": "allow",
+          "gh api*/issues/comments/* *": "allow",
+          "gh api*/issues/comments/*?*": "allow",
           "gh api*/pulls/*/reviews": "allow",
           "gh api*/pulls/*/reviews *": "allow",
           "gh api*/pulls/*/reviews?*": "allow",
@@ -2211,6 +2225,8 @@
           "gh api*PATCH*": "deny",
           "gh api*PUT*": "deny",
           "gh api*DELETE*": "deny",
+          "*CW_PR_RECORD*": "deny",
+          "*pr-record*": "deny",
           "*git*push*!main": "deny",
           "*git*push*!main!*": "deny",
           "*git*push*!main\"*": "deny",

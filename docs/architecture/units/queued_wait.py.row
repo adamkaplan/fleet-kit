@@ -1,0 +1,1 @@
+| `queued_wait.py` | 0 | how long a message delivered by queue waited before the session took it, and the `message.consumed` record (#1801) | |

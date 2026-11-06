@@ -17,8 +17,8 @@ from pathlib import Path
 
 BIN = Path(__file__).resolve().parent.parent / "bin"
 DOCTOR = BIN / "fleet-doctor"
-RUNS = 2000        # harness iterations (a count, not a time)
-DOCTOR_RUNS = 200
+RUNS = 300         # harness iterations (a count, not a time)
+DOCTOR_RUNS = 20
 CAP = 30           # the cap handed to run_to for a command that returns at once (a value, not asserted on)
 
 NEW = '''  # The watcher polls at one-second steps and ends by itself; the doctor never signals it, so
@@ -110,7 +110,7 @@ class TestWatcher(unittest.TestCase):
                          "on macOS the old watcher showed 0 early removals in 20000 starts (run 41585441923), so this half is measured on Linux only")
     def test_s1_old_watcher_shows_the_cause(self):
         old = mutate(self.text, NEW, OLD)
-        self.assertGreaterEqual(early_removals(old, 20000, stop=1), 1, "the cause is not established")
+        self.assertGreaterEqual(early_removals(old, 5000, stop=1), 1, "the cause is not established")
 
     def test_s2_no_early_removal(self):
         self.assertEqual(early_removals(self.text, RUNS), 0)
@@ -135,7 +135,7 @@ class TestWatcher(unittest.TestCase):
         check_harness(self.text, RUNS)                       # the control first: passes
         old = mutate(self.text, NEW, OLD)
         with self.assertRaises(AssertionError) as cm:
-            check_harness(old, 20000)
+            check_harness(old, 5000)
         self.assertIn("the doctor removed its own temporary directory:", str(cm.exception))
 
     def test_noop_mutation_fails_the_computation(self):

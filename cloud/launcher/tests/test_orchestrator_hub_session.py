@@ -40,7 +40,7 @@ class Launch(tcw.Base):
         brief = self.home / "brief.txt"
         brief.write_text("Build the thing.\n")
         return self.main("launch", "orch1", "--cloud", "--agent", "orchestrator", "--repo", "acme-org/widget-service", "--branch", "main",
-                         "--role", "orchestrator", "--reports-to", "boss1", "--brief-file", str(brief))
+                         "--role", "orchestrator", "--reports-to", "orch", "--brief-file", str(brief))
 
     def hub_calls(self):
         return [c for c in self.stub_calls() if c[0] == "hub-session"]

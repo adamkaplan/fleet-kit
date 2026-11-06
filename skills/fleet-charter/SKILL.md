@@ -93,8 +93,8 @@ to, or the Chief of Staff with their yes, changes either line. You do not edit
 them. If one is wrong or too small, propose the change with
 `fleet-switchboard send <chief-of-staff> --issue <ask> "<proposal>"`, and carry
 on inside the ask as written. The switchboard reads these lines from the issue
-body and heads every message about it with them, so keep them to one Intent line
-and one Done-when line.
+body and heads every message about it with them, so write one Intent line and one
+Done when (a line, or a numbered list under its label), once.
 
 ```
 gh issue create --repo OWNER/REPO --title "<assignment>" --body "<brief>"
@@ -238,6 +238,9 @@ Use plain `gh` for what you say on GitHub. The switchboard tells you about comme
 on your issues, and the harness signs the ones you post (an invisible HTML comment),
 so they do not come back to you as events. `fleet-switchboard comment` does the same
 by hand where the harness has no shim.
+
+To change one line of an issue body, run `fleet-switchboard issue-line owner/repo#N --next-step TEXT` (or `--parked YYYY-MM-DD`): it is the way to change one line of an issue body, it never changes the Intent or the Done-when, and a whole-body write must keep the `## Intent` heading and the `Done when:` line or the gh shim refuses it.
+
 To change one of your own comments that is not your last (a plan, a receipt), use
 `fleet-switchboard comment --edit COMMENT_URL --body-file FILE` (never a `gh api` call); an
 approved plan also needs `--approval ID`, and the approval lapses with the new hash.

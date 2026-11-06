@@ -375,7 +375,7 @@ class Driver:
                 self.stopped = False
             self.stop_failed = not self.stopped
         if self.stop_failed:
-            self.say("the worker is kept (its end hook could not push, see above); delete it only after the work is saved: %s"
+            self.say("the worker is kept (its end hook could not push, see above); delete it only after the work is saved (to save it, send the pod one message to commit its tree on a NEW branch and push it there plainly, read the branch from origin, then retire normally): %s"
                      % self.kube.delete_command("pod", self.name))
         if self.created:
             self.secret_line()
@@ -448,7 +448,7 @@ def main(argv=None, env=None):
         a = p.parse_args(argv)
     except SystemExit as e:
         return 2 if e.code else 0
-    if not cw.NAME_RE.match(a.worker) or not REPO_RE.fullmatch(a.repo) or not re.match(r"^[A-Za-z0-9._/-]{1,200}$", a.branch):
+    if not cw.NAME_RE.fullmatch(a.worker) or not REPO_RE.fullmatch(a.repo) or not re.match(r"^[A-Za-z0-9._/-]{1,200}$", a.branch):
         print("run-task: bad worker name, repository (OWNER/NAME) or branch", file=sys.stderr)
         return 2
     try:

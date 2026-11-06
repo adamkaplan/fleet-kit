@@ -53,21 +53,31 @@ class TestGuardSet(unittest.TestCase):
             self.assertEqual(l, "python3 bin/test-switchboard " + e["class"] + want)
 
     def test_a_class_with_no_loader_line_is_caught_by_the_wired_guard_control_first(self):
-        guard = "TestEveryTestFileIsWired"
+        # in-process: the copy's own test_wired_tests module (loaded from the tree copy) runs the guard's test; no child run per step
+        import importlib.util
         with tempfile.TemporaryDirectory() as d:
             tree = Path(d) / "tree"
             shutil.copytree(REPO, tree, ignore=shutil.ignore_patterns(".git", "__pycache__"))
+            spec = importlib.util.spec_from_file_location("guard_tree_wired", tree / "tests" / "switchboard" / "test_wired_tests.py")
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            self.assertEqual(mod.TESTS, tree / "tests" / "switchboard")      # the copy's own paths, not the repository's
+            self.assertEqual(mod.RUNNER, tree / "bin" / "test-switchboard")
 
             def guard_run():
-                return subprocess.run([sys.executable, "bin/test-switchboard", guard], capture_output=True, text=True, cwd=tree)
-            c = guard_run()
-            self.assertEqual(c.returncode, 0, c.stdout + c.stderr)  # the control passes on the unmutated copy
+                result = unittest.TestResult()
+                mod.TestEveryTestFileIsWired("test_the_real_directory_is_wired").run(result)
+                return result, "".join(t for _, t in result.failures + result.errors)
+            c, text = guard_run()
+            self.assertTrue(c.wasSuccessful(), text)  # the control passes on the unmutated copy
+            self.assertGreaterEqual(c.testsRun, 1)     # the named guard test ran (not a skipped-everything pass)
+            self.assertEqual(c.skipped, [], "the guard test ran, it was not skipped")   # a skipped guard is a pass that checked nothing
+            # since #2210 a Test* class is bound by the runner's self-registration; a class with no loader line AND not named Test* is the one nothing reaches
             (tree / "tests" / "switchboard" / "test_planted_unloaded.py").write_text(
-                "import unittest\n\nclass TestPlantedNoLoader(unittest.TestCase):\n    def test_a(self):\n        pass\n")
-            r = guard_run()
-            out = r.stdout + r.stderr
-            self.assertNotEqual(r.returncode, 0, out)
-            self.assertIn("test_the_real_directory_is_wired", out)
+                "import unittest\n\nclass PlantedNoLoader(unittest.TestCase):\n    def test_a(self):\n        pass\n")
+            r, out = guard_run()
+            self.assertFalse(r.wasSuccessful(), out)
+            self.assertIn("test_the_real_directory_is_wired", [t.id().rsplit(".", 1)[-1] for t, _ in r.failures + r.errors])  # the in-process form of the removed assertIn of the test name
             self.assertIn("test_planted_unloaded.py", out)
 
     def test_documents_carry_the_sentence(self):
@@ -76,6 +86,36 @@ class TestGuardSet(unittest.TestCase):
         t = (REPO / "docs/plan-template.md").read_text()
         for w in ("copies `bin/`", "light switch", "new module", "matrix path"):
             self.assertIn(w, t)
+
+
+    def test_the_two_classes_of_the_whole_file_run_are_listed_and_printed(self):
+        data = json.loads(LIST.read_text())
+        out = run().stdout.splitlines()
+        self.assertEqual(len(out), len(data["classes"]) + len(data["extras"]))
+        for c in ("TestOwnMarkerNotHonoured", "TestTheEntryGuard"):
+            self.assertEqual(sum(1 for l in out if l == "python3 bin/test-switchboard " + c), 1, c)
+
+    def test_a_scan_that_drops_the_second_directory_is_caught_control_first(self):
+        needle = ', REPO / "tests" / "test_installed_guard.py"'
+        text = TOOL.read_text()
+        self.assertIn(needle, text)
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "tools").mkdir()
+            for n in ("tests", "bin", "docs"):
+                (root / n).symlink_to(REPO / n)
+            copy = root / "tools" / "guard-set"
+
+            def go():
+                return subprocess.run([sys.executable, str(copy), "--check"], capture_output=True, text=True)
+            copy.write_text(text)
+            control = go()
+            self.assertEqual(control.returncode, 0, control.stdout + control.stderr)  # the control passes first
+            copy.write_text(text.replace(needle, "", 1))
+            r = go()
+            self.assertEqual(r.returncode, 1)
+            self.assertIn("every class of the guard set exists", r.stdout)
+            self.assertIn("TestTheEntryGuard", r.stdout)
 
 
 if __name__ == "__main__":

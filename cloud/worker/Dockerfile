@@ -26,6 +26,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends make \
  && rm -rf /var/lib/apt/lists/*
 # ---- end #1165 ----
 
+# #2047: system libraries (and fonts for screenshots) of Playwright's headless Chromium shell, which exits 127 without them.
+RUN apt-get update && apt-get install -y --no-install-recommends libasound2t64 libatk-bridge2.0-0t64 libatk1.0-0t64 libatspi2.0-0t64 libcairo2 libcups2t64 libdbus-1-3 libdrm2 libfontconfig1 libfreetype6 libgbm1 libglib2.0-0t64 libnspr4 libnss3 libpango-1.0-0 libx11-6 libxcb1 libxcomposite1 libxdamage1 libxext6 libxfixes3 libxkbcommon0 libxrandr2 fonts-liberation fonts-noto-color-emoji fonts-unifont fonts-freefont-ttf \
+ && rm -rf /var/lib/apt/lists/*
+
 # ---- #1165 identity: ONE system-level git file, written at image build (nothing at run time, nothing in the home directory) ----
 # The pair below is the ONE constant. A repository's own configured identity, and a local `git config user.name/user.email`,
 # still win over it (git's own order: system, then global, then local). The entrypoint exports no identity variable.
@@ -82,6 +86,8 @@ COPY worker/bin/cloud_cli.py /usr/local/bin/cw-cloud
 COPY worker/bin/cloud_client.py worker/bin/cloud_hub.py worker/bin/cloud_channel.py worker/bin/cloud_channel_server.py worker/bin/cloud_relay.py /usr/local/bin/
 COPY worker/cw-plan-check worker/plan_check.py /usr/local/bin/
 COPY worker/cw-stack-up /usr/local/bin/
+COPY worker/cw-shell-check /usr/local/bin/
+RUN chmod 0755 /usr/local/bin/cw-shell-check
 RUN chmod 0755 /usr/local/bin/start-dockerd /usr/local/bin/cw-stack-pull /usr/local/bin/worker-entrypoint \
       /usr/local/bin/cw-end-hook /usr/local/bin/cw-prestop /usr/local/bin/cw-token-mint /usr/local/bin/cw-worker-activity \
       /usr/local/bin/cw-gh /usr/local/bin/cw-probe-reach /usr/local/bin/cw-plan-check /usr/local/bin/cw-cloud \

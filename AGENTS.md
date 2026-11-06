@@ -27,3 +27,5 @@ a regular expression (case-insensitive), `case:<regex>` (case-sensitive), `ignor
 
 Run the suites before you open a PR: `bin/test-switchboard`, `bin/test-fleet-doctor`, `bin/test-fleet-doctor-config`,
 `bin/test-fleet-doctor-heartbeat`, `bin/test-heartbeat`, `bin/test-health-records`, `bin/test-gh-hold`, `bin/test-workflow-split` (each prints `RESULT: PASS`), `node --test plugins/fleet-hooks/index.test.mjs` and `node --test plugins/fleet-decisions-tui/health.test.mjs`.
+
+A test never pins an exact set or size (an argument list, environment names, settings, flags, file sizes, line or word counts, or any set a normal change grows): it checks behaviour and real safety properties (no secret in an output, no untrusted interpolation, a required item present). A reviewer flags such a test and never asks for one.

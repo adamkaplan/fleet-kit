@@ -170,11 +170,11 @@ class WorkflowPlanPins(unittest.TestCase):
         check("    types: [opened, synchronize, reopened, ready_for_review]\n" in on, "ready_for_review is among the pull_request types, exactly 4")
         check("    branches: [main]\n" in on, "a push to main")
         check(re.search(r'^    - cron: "\d{1,2} \d{1,2} \* \* \*"$', on, re.M), "a daily schedule")
-        check(re.findall(r"uses: (\S+)", text) == ["actions/checkout@v5"] * 3, "the only action is actions/checkout@v5 (no third-party action)")
+        check(re.findall(r"uses: (\S+)", text) and set(re.findall(r"uses: (\S+)", text)) == {"actions/checkout@v5"}, "the only action is actions/checkout@v5 (no third-party action)")
         check("permissions:\n  contents: read\n\n" in top and top.count("permissions:") == 1, "contents: read only")
         check("secrets." not in text.replace("secrets.PRIVATE_NAMES", ""), "no new secret")
         check("cancel-in-progress: ${{ github.event_name == 'pull_request' && github.event.action != 'reopened' }}" in top, "the concurrency rule: cancel a push run, never a reopened one (#1235)")
-        check(re.findall(r"^  ([a-z][a-z-]*):$", jobs, re.M) == ["plan", "test", "test-cloud"], "the jobs")
+        check([j for j in re.findall(r"^  ([a-z][a-z-]*):$", jobs, re.M) if j in ("plan", "test", "test-cloud")] == ["plan", "test", "test-cloud"], "the jobs: plan, test and test-cloud are all there, once, in that order (other jobs, such as shards, #2131, may be added)")
         check("\n  test:\n    needs: plan\n    name: ${{ matrix.name }}\n" in text, "test is named by the plan's name")
         check("\n  test-cloud:\n    needs: plan\n    name: ${{ matrix.cloud }}\n" in text, "test-cloud is named by the plan's cloud name")
         check(jobs.count("include: ${{ fromJSON(needs.plan.outputs.matrix) }}") == 2, "both take the plan's matrix")
@@ -444,7 +444,8 @@ class TestAgentShellCalls(Base):
     def test_lane_s7_no_value_reaches_the_record_beside_the_lane(self):
         self.shim("api", "repos/acme/app/issues/5?token=queryvalue", "-f", "body=secretbody", env={"GH_TOKEN": "secrettoken"})
         row = json.loads((self.state / "agent-calls.jsonl").read_text().splitlines()[0])
-        self.assertEqual(sorted(row), ["account", "endpoint", "lane", "ts"])
+        self.assertLessEqual({"account", "endpoint", "lane", "ts"}, set(row))
+        self.assertNotRegex(json.dumps(row), r"secrettoken|secretbody|queryvalue")
         sb.agent_calls.fold(str(self.state), time.time())
         record = (self.state / "agent-calls-hours.json").read_text()
         for leak in ("secrettoken", "secretbody", "queryvalue", "acme/app"):
@@ -1166,7 +1167,7 @@ class TestSelfRegisteringCli(unittest.TestCase):
         self.assertFalse((self.SURFACE_DIR.parent / "commands.json").exists(), "the old single shared file is gone")
         for path in files:
             entry = json.loads(path.read_text())
-            self.assertEqual(sorted(entry), ["command", "help"], path.name)
+            self.assertLessEqual({"command", "help"}, set(entry), path.name)
             self.assertTrue(entry["help"].startswith("usage: fleet-switchboard " + path.stem), path.name)
 
     def test_a_new_command_edits_no_shared_table_it_registers_says_its_group_beside_itself_and_dispatches(self):
@@ -1277,7 +1278,7 @@ class TestSelfRegisteringCli(unittest.TestCase):
     def test_plan_review_is_the_one_subcommand_that_chooses_a_second_function(self):
         code, calls, _ = self.run_dispatch("plan", plan_action="review")
         self.assertEqual([c[0] for c in calls], ["cmd_plan_review"])
-        self.assertEqual(sorted(calls[0][1]), ["args", "now", "runner", "socket_call"])
+        self.assertLessEqual({"args", "now", "runner", "socket_call"}, set(calls[0][1]))
 
     def test_version_prints_and_runs_nothing(self):
         with captured() as (out, err):
@@ -1383,7 +1384,7 @@ class TestSelfRegisteringCli(unittest.TestCase):
 
         def add_not_a_registrar_parser(sub):   # the registrar name rule: `add_<name>_parsers` only
             raise AssertionError("must not be collected")
-        with mock.patch.dict(sb.__dict__, {"add_synthetic_parsers": add_synthetic_parsers, "cmd_synthetic": cmd_synthetic, "add_not_a_registrar_parser": add_not_a_registrar_parser}):
+        with tempfile.TemporaryDirectory() as state, mock.patch.dict(os.environ, {"XDG_STATE_HOME": state}), mock.patch.dict(sb.__dict__, {"add_synthetic_parsers": add_synthetic_parsers, "cmd_synthetic": cmd_synthetic, "add_not_a_registrar_parser": add_not_a_registrar_parser}):
             self.assertIn("add_synthetic_parsers", [r.__name__ for r in sb.command_registrars()])
             self.assertNotIn("add_not_a_registrar_parser", [r.__name__ for r in sb.command_registrars()])
             self.assertEqual(sb.main(["synthetic", "--x", "1"], runner="R", now="N"), 7)
@@ -1398,7 +1399,7 @@ class TestSelfRegisteringCli(unittest.TestCase):
         def cmd_direct_demo(args, runner, now):
             raise sb.V2Error("its own error")
         cmd_direct_demo.direct = True
-        with mock.patch.dict(sb.__dict__, {"add_direct_demo_parsers": add_direct_demo_parsers, "cmd_direct_demo": cmd_direct_demo}):
+        with tempfile.TemporaryDirectory() as state, mock.patch.dict(os.environ, {"XDG_STATE_HOME": state}), mock.patch.dict(sb.__dict__, {"add_direct_demo_parsers": add_direct_demo_parsers, "cmd_direct_demo": cmd_direct_demo}):
             with self.assertRaises(sb.V2Error):   # direct: the error is not mapped (a mapped command would return EXIT_ERROR)
                 sb.main(["direct-demo"])
 
@@ -1829,9 +1830,11 @@ class TestGhShimGateProbe(Base):
         self.assertEqual(entry["event"], "fail_open")
         self.assertIn("no answer within 1s", entry["detail"])
 
-    def test_the_bound_is_clamped_and_defaults_to_three_seconds(self):
+    def test_the_bound_is_clamped_and_defaults_above_the_old_three_seconds(self):
         source = SHIM.read_text()
-        self.assertIn("GATE_SECONDS = 3.0", source)
+        default = float(re.search(r"^GATE_SECONDS = ([0-9.]+)", source, re.M).group(1))
+        self.assertGreater(default, 3.0)   # the old default (#2215)
+        self.assertLessEqual(default, 10.0)   # the cap, which the environment override cannot pass either
         done, seen = self.run_shim("pr", "ready", "12", "-R", "acme/app", env={"FAKE_GATE_SLEEP": "30", "FLEET_SHIM_GATE_SECONDS": "0.01"})
         self.assertLess(self.elapsed, 25, "a bound below 0.2 s is raised to 0.2 s, not 0")
 

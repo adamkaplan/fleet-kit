@@ -62,11 +62,13 @@ Each setting's name, whether the file requires it, and its kind (name, https URL
 | `CW_CLUSTER_ADMIN_SECRET` | no | secret-name | the name of the vault secret that holds the cluster administrator kubeconfig (default `cw-cluster-admin-kubeconfig`): 1 to 127 letters, digits and hyphens; the name, never its content |
 | `CW_STACK_MODEL_SECRET` | no | secret-name | with `launch --cloud --stack` only: the name of the vault secret (same vault as the others) that holds the stack-only model credential: 1 to 127 letters, digits and hyphens; the name, never its value. Ignored without `--stack`. See "A stack-only model credential" |
 | `CW_CLUSTER_TOKEN_DURATION` | no | duration | the cluster token's requested life: 1 to 3 digits and `m` or `h`, from `1m` to `60m` (default `20m`; `1h` is the same as `60m`) |
-| `CW_GIT_TOKEN_CMD` | no | command | a command that prints the one-hour git token; default is the GitHub App mint beside the launcher (`app_token.py`) |
+| `CW_FINAL_NOTE_MINUTES` | no | number | the minutes before a worker's hard limit at which the launcher tells it to send its final message, once: a whole number from `1` to `60` (default `10`) |
+| `CW_GIT_TOKEN_CMD` | no | command | a command that prints the one-hour git token on stdout; default is the GitHub App mint beside the launcher (`app_token.py`), which hands the token to the launcher over a pipe and never prints it. To run the mint by hand, see "Running the mint by hand" in `cloud/launcher/README.md` (a file route in a private directory with no symbolic link in its path, never a redirect; a descriptor that is the same pipe or file as standard output or standard error is refused) |
 | `CW_APP_ID_CMD`, `CW_APP_KEY_CMD` | no | command | commands that print the GitHub App's id and key instead of the vault read (`app_token.py`) |
 | `CW_APP_INSTALLATION_CMD` | no | command | obsolete: accepted and ignored, never run. The installation is looked up per repository (see the next paragraph); the vault no longer needs `cw-app-installation-id` |
 | `CW_STACK_REGISTRY` | no | registry-host | the stack registry (lower case, ending `.azurecr.io`; no scheme, path, port or IP); with the next two, a stack pod pulls prebuilt images (see `cloud/README.md`); all three or none |
 | `CW_STACK_PULL_CLIENT_ID`, `CW_STACK_PULL_TENANT_ID` | no | guid | the pull identity's client id and tenant id (GUIDs, not secrets); set together with `CW_STACK_REGISTRY` |
+| `CW_MAX_PERSISTENT` | no | number | the most persistent orchestrators the namespace holds (an integer from 1 to 20, default 2; see "A persistent orchestrator") |
 | `CW_VAULT_CHECK_DIR` | no (needed once the vault refuses this machine) | path | the checkout of the vault access check, an absolute path (see section 2b) |
 
 How the installation is found: the mint signs a short-lived App token and asks GitHub which installation covers the repository (`GET /repos/OWNER/REPO/installation`), then mints the one-repository token for that installation. The answer must be one installation whose account is the repository's owner. A repository the App is not installed on is refused before any pod is created, with a message that says so. To cover a new repository, install the App on the account that owns it (an App installed on two accounts serves both) and add the repository to the installation; nothing in the vault changes.
@@ -113,6 +115,8 @@ CW_CLOUD_NAMESPACE=cw
 # CW_APP_KEY_CMD=/home/user/bin/print-app-key
 # optional, but needed when the vault refuses this machine: the vault access check's checkout
 # CW_VAULT_CHECK_DIR=/home/user/vault-check
+# optional: the most persistent orchestrators the namespace holds (1 to 20, default 2)
+# CW_MAX_PERSISTENT=2
 ```
 
 Before reading the vault, do whatever your deployment requires (for example a sign-in or an access request). This repository does not
@@ -206,6 +210,18 @@ The orchestrator row is `O` (250m CPU, 768 MiB, 0.02 USD/hour), a list-price est
 - Does not belong in `XS`: a nested Docker stack (`--stack` refuses `XS`), an image build, a long full test suite or a build with a large memory peak: name `--shape S` or `M` for those.
 - A pod killed for memory is fixed afterwards: raise the shape for that work with `--shape S`.
 
+### A persistent orchestrator (`launch --cloud --agent orchestrator --persistent`)
+
+An orchestrator launched with `--persistent` is an always-on pod: ONE StatefulSet of one replica (its pod is `NAME-0`), restart policy Always, no hard deadline and no idle limit. It ends only on an explicit stop (`retire NAME`, or `cloud-worker stop NAME`): the stop runs the end hook, deletes the StatefulSet FIRST and waits for it (a delete that does not finish within 120 seconds makes the stop fail and keeps the pod, both Secrets and the hub entry; stop again to retry), then the pod, both per-run Secrets and the hub entry. It keeps every other limit of a worker: the shape row, the per-run Secrets, the forbidden-field and stored-credential guards, the repository allow-list and the spend cap (priced for one day of the shape). `--persistent` is valid only with `--agent orchestrator` and the per-run git-token Secret; a worker, a `--stack` launch or a launch without that route is refused with exit status 2 and nothing is created.
+
+- What the reaper does: it leaves a persistent orchestrator alone (never a stop by deadline or idle). It judges the pod only through its StatefulSet (read by name, exact answer only); a StatefulSet it cannot read, or that does not own the pod, leaves the pod untouched and the pass reports one line, `persistent workload unreadable: left alone`, with the worker's name; that report fails the reaper's exit code on every pass until the workload is readable again (loud on purpose; nothing is stopped). The reaper still renews the pod's git token (the Secret is found by the worker's name).
+- Cost: 24 times the hourly estimate of the orchestrator's shape row per day: with the default orchestrator shape (`O`, USD 0.02 an hour) that is USD 0.48 a day, plus the node's own price. The cost is UNBOUNDED IN TIME by design: only an explicit stop ends an always-on orchestrator. The status shows each running one under the worker's name as persistent with its age and its accrued cost, and the daily cost report prints it as an open pod. The launch's spend cap counts the persistent pod at 24 hours of its shape. The node that holds it is NOT protected from an autoscaler scale-down by this change: the autoscaler's do-not-evict mark is not set here, and the node is protected only once ask 1519 lands.
+- A maximum: `CW_MAX_PERSISTENT` (a setting of the table above: an integer from 1 to 20, default 2) is the most persistent orchestrators (StatefulSets of the launcher's label) the namespace holds; a launch above it, or when the count cannot be read, is refused with exit status 2 and nothing is created. The maximum is a ceiling checked at launch, not a lock: two launches at the same moment can each count below the maximum and both succeed.
+- There is no `cw/role` annotation on the template at this head (the token role of ask 1508 composes in a plain merge). Renewal runs only for a pod judged owned by a readable StatefulSet, so a lost read stops renewal.
+- `delete NAME --force` refuses a persistent orchestrator (exit status 2, naming the stop command); only the stop ends it. A stop or a delete of a worker whose pod is absent takes ONE strict read of the StatefulSet named like the worker and refuses, keeping everything, on every answer but the exact not-found; the Role rule for StatefulSets (the administrator's step) must therefore be applied BEFORE this change is installed, or every stop of a worker with a gone pod, a plain one too, fails until it is.
+- Unpushed work in the pod's own scratch volume is lost if the pod is rescheduled to another node (a restart in place keeps it): a persistent orchestrator must push before it ends.
+- OWNER STEP: the operator's Role (`cloud/k8s/operator-rbac.yaml`) gains ONE rule, the `apps` group, resource `statefulsets`, verbs get, list, watch, create and delete (five verbs; the launcher creates the StatefulSet with create and never patches one). The administrator applies it to the cluster; this change never does, and a launch without the rule is refused with the missing rule named.
+
 ### A worker with a nested Docker stack
 
 Add `--stack` (and, if you want, `--shape S|M`; XS cannot run a stack) to the same command for a worker that runs a Docker Compose stack inside its pod:
@@ -220,6 +236,7 @@ fleet-switchboard launch coder7 --cloud --stack --agent coder --repo acme-org/wi
 - With `--stack`, `--shape` is `S` (2 CPU, 4 GiB) or `M` (4 CPU, 8 GiB). Leave it out for `S` (4 GiB): the measured stack lane peaked at 0.8 to 1.35 GiB. The memory limit stays; the pod is never unlimited.
 - The first pod on a fresh node may wait for the node's runtime to be ready (a short delay, a few minutes at most); the launcher notices that case and creates the pod again after a pause of 15 seconds (`STACK_RACE_PAUSE_SECONDS`), for as long as a retry fits in a window of 600 seconds (`STACK_RACE_WINDOW_SECONDS`); a fresh node can take 3 to 5 minutes. If the window ends, the launcher says so once (the attempts and the seconds spent) and leaves no pod. You do not retry it.
 - `--stack` needs `--cloud`, and an unknown `--shape`, and `XS`, are refused with `--stack`. `--stack` without `--cloud` is refused first of all; an unknown shape is refused right after the allow-list check (step 1 of section 2). Both exit 2 before any token is minted or any cluster call is made, and the order of section 2 is unchanged. `--shape` without `--stack` is passed to the launcher as before.
+- `--no-commit` (with `--cloud`): the pod is launched NOT to commit (a measure or a read), and the launcher never sends it the minute-40 note that orders a push. `--role tester` and `--role reviewer` imply it.
 
 ## 4. What a worker can and cannot do
 
@@ -538,6 +555,20 @@ The copy is not run or tested by the launcher; whether the installed `az` accept
 
 Revoke or rotate at the provider. The next stack launch then fails at the provider, not in the launcher.
 
+## Briefing a cloud operator
+
+Do not assemble an operator's brief by hand from older ones: a pinned checkout hash goes stale within a day, and a rule said to be "in an earlier brief" is not in the brief the operator reads. Start every operator brief from the standard header, which the switchboard prints from one source file (`skills/fleet-coordination/operator-brief-header.txt`):
+
+```
+fleet-switchboard brief header --role operator
+```
+
+It names the cluster admin route by its settings key (`CW_CLUSTER_ADMIN_CMD`, `CW_CLUSTER_ADMIN_SECRET`), never a value; pins no checkout hash; and carries the secret rules, the rule to send the token mint's diagnostics to the null device, the rule to delete by exact name and the rule to stop and report at the first surprise. Paste its output at the top of the brief, then add the task.
+
+`launch` also refuses a `--reports-to` name that is not a registered identity (a running, recorded or retired agent, a cloud worker, or the role alias `chief-of-staff`), before anything is created: it lists the nearest registered names. `--boss-unregistered REASON` goes on anyway and writes one `launch.boss_unregistered` audit line. If the registry cannot be read, the launch warns and goes on. The override --boss-unregistered REASON is not restricted to a person: an agent may pass it. It writes one launch.boss_unregistered audit line (the actor, the worker, the boss text and the reason). A worker launched so has a boss nobody answers to: only the operator or the Chief of Staff can end it. The reasons of both overrides, --boss-unregistered and --memory-ok, are scrubbed of secret shapes, made one line and cut to 160 characters before they are audited. The boss text of --boss-unregistered is scrubbed too, and cut to 60 characters.
+
+One temporary rule of `launch --cloud` (a named constant in `bin/cloud_worker.py`): a brief that links an issue of the repository prints one warning until a worker can read issues (ask #1019). A brief that names docker or buildx without `--stack` also prints one warning (the worker would have no nested Docker).
+
 ## Checking a cloud pull request before the push
 
 Over one day a cloud pull request took nine pushes and others two to four, because each cloud coder learned the repository's checks from a red run: a new test file not chained in `bin/test-cloud-launcher`, an existing test of another file broken by the change, or an existing pinned test edited to make a new behaviour pass; and a cloud pod cannot run the whole suite. Run `bin/cloud-pr-preflight` at the repository root before any push (offline; it copies the default branch to a clean temporary directory and removes it on exit). It prints three sections: the completeness scan of the test list, a per-file table of every test under `cloud/launcher/tests` and `cloud/worker/tests` run one at a time on the branch and on the default branch (`CLOUD_PREFLIGHT_TIMEOUT`, default 120 seconds each), and every existing test file the branch changes, which you must justify in the pull request (it only lists them: an edited existing test does not change the exit status). A file failing on the branch only is named and fails the command; one failing the same on both is listed as environment-only; a timeout is "not run" and fails unless the file is on the short allow-list in the script. Paste the table into the pull request before pushing. Exit 0 means the scan found nothing unchained, no test fails on the branch only and none timed out unallowed, and (with `--expect`) no added file is stray; the edited-test list in section 3 never fails the run by itself, you justify it in the pull request. `--expect` takes path PREFIXES (`cloud/` allows anything under it); a rename shows as one added and one deleted file (a known limit); "environment-only" (the identical failure on both sides) can also hide a test that fails for a real reason on both sides, and the output line says so. The terminate, hangup and interrupt signals also remove the temporary copy and stop any running test; `CLOUD_PREFLIGHT_TIMEOUT` must be a whole number of seconds or the command refuses (exit 2).
@@ -545,6 +576,7 @@ Over one day a cloud pull request took nine pushes and others two to four, becau
 ### A rule for every cloud coder brief
 
 Before any push, run bin/cloud-pr-preflight at the repository root and paste its three sections in the pull request comment; a branch-only failure, a not-run file or an unchained test file must be fixed first, and every existing test file it lists as edited must be justified there.
+When the branch adds or changes a tests/switchboard/test_*.py file, the run prints one more block, the checks of tools/new-test-checks, between the first and the second section, and a FAIL there must be fixed first too.
 
 ## Pre-push preflight modes
 
@@ -561,9 +593,44 @@ Cause: in a cloud pod the full preflight of the pre-push command (`bin/cloud-pr-
 ## The image now carries PostgreSQL 16 (ask #1353)
 
 The build step is unchanged (an operator rebuilds the image and publishes it as before). What is new: the Dockerfile has a build stage that compiles PostgreSQL 16.15 and two extensions (vector 0.8.7, message queue 1.13.1), PostgreSQL is pinned by version and source sha256 (verified before unpacking) and each extension by an immutable git commit (verified with `git rev-parse HEAD` before any build step); the build-time secret scan covers the built PostgreSQL tree; only the installed files reach the image. Nothing starts at pod start. Size cost and pod start time: measured by the operator at the first real build; record both, with the build digest, in the pull request. Rollback is unchanged: point the workers at the previous image digest. Start command and the versions: `cloud/README.md`, "PostgreSQL 16 and two extensions in the image".
+Known limit of the text redaction: a password in a URL that holds a raw space (`://user:pass word@host`) is not covered, because a space ends a word and the pattern cannot tell the rest of the text from the password; percent-encode the space.
+
+Two more stated limits of the text redaction: a begin marker with no end marker redacts the text to its end, and a URL password that holds a space is not redacted.
+
+The local route: the local launch makes one more discovery of the local agents before the report-to check; it is a read with no behaviour change.
 
 **Token roles.** The mint takes a role (`app_token.py OWNER/REPO --role ROLE`, default `worker`; an unknown role is refused before any network call) from one table of permission sets, `PERMISSIONS_BY_ROLE` in `cloud/launcher/app_token.py`. The worker role asks for, and accepts, exactly `contents: write, pull_requests: write, issues: read, metadata: read`. The orchestrator role asks for, and accepts, exactly `issues: write, pull_requests: read, checks: read, metadata: read` (no `contents` key at all). A launch with `--agent orchestrator` mints under the orchestrator role and records it on the pod as the annotation `cw/role: orchestrator` (a worker pod carries no annotation: its spec is unchanged); the reaper's renewal mints under the role the annotation names, and a pod made before the annotation renews as a worker. A custom mint command (`CW_GIT_TOKEN_CMD`) ignores the role, so the guarantee that an orchestrator never holds contents write holds only for the default mint command. An orchestrator pod made before this change has no role annotation and renews as a worker until it ends, so it is relaunched to take the narrower set. The orchestrator pod holds no App key, App id, vault setting or mint command.
 
 The App already holds checks: read (the owner confirmed it on 29 October), so the orchestrator set needs no App change today; if a later set needs a permission the App lacks, the owner adds it and accepts it on each installation, never this change.
 
 **What the orchestrator's token can and cannot do.** It can read issues, pull requests, check results and repository metadata, and it can write to issues only. It cannot push, create a branch, read a file, open, edit, approve or merge a pull request, change a workflow, a setting, a secret or a ruleset, or mint a token.
+
+## A worker lost with its node
+
+**Cause: inferred until these reads are made.** On 29 October four pods that sat on one node were killed in the same second (the event `Killing: Stopping container worker`, no other event) while pods on other nodes were untouched, and the launcher's audit has no stop line for them. The cause is INFERRED to be the removal or disturbance of that node. The launcher's own login cannot read nodes (it may not list them), so the holder of the ADMINISTRATOR login confirms the cause with these read-only commands (placeholders in capitals):
+
+```
+kubectl get events --all-namespaces --field-selector involvedObject.kind=Node
+kubectl describe node NODE_NAME
+kubectl get pods --all-namespaces -o wide
+kubectl -n kube-system get configmap cluster-autoscaler-status -o yaml
+az aks nodepool show --resource-group RESOURCE_GROUP_NAME --cluster-name CLUSTER_NAME --name NODEPOOL_NAME
+az aks nodepool list --resource-group RESOURCE_GROUP_NAME --cluster-name CLUSTER_NAME
+az monitor activity-log list --resource-group RESOURCE_GROUP_NAME --start-time START_TIME --end-time END_TIME
+```
+
+Also read the API server's audit log of pod deletes in the window through the cloud's log query (a query such as `AUDIT_LOG_QUERY` over the diagnostic logs, which names who deleted each pod). Read the Events, Conditions and Taints parts of `kubectl describe node`.
+
+The alternative causes and the read that rules each in or out:
+
+- A person's delete or another operator's cleanup: the audit log of pod deletes names the requester.
+- An eviction for node pressure: the event says `Evicted`, not `Killing`, and the pod is Failed.
+- The autoscaler's scale-down: the node would be gone; the status record and the node events confirm or rule it out.
+- A reboot, a drain or an image upgrade: the node survives; the node pool's recent operations, the node's events and conditions confirm it.
+- A taint eviction after the node was NotReady: the node events say not ready and the taints show it.
+
+**What the annotation does.** Every pod the launcher renders (a worker, a stack worker, and an orchestrator) carries `cluster-autoscaler.kubernetes.io/safe-to-evict: "false"`. It protects ONLY against the autoscaler's scale-down. It does not protect against a node upgrade or maintenance eviction (only a pod disruption budget limits those, a separate cluster-wide object this change does not add), a reboot, a drain for an upgrade, a node failure, a taint eviction or a spot eviction.
+
+**What it costs.** A node that holds a worker is not scaled down until the worker ends: an idle worker ends at its idle limit (`--idle`), a worker at its hard limit, at most the maximum hard limit (8 hours by default), and a pod the reaper cannot end at the cluster-side deadline floor (the maximum hard limit plus five minutes). A persistent orchestrator has no deadline: once ask 1509 (the persistent orchestrator) lands, its pod template is rendered by the same function and carries the mark, and its node is then not scaled down while it lives.
+
+**What is saved.** The pre-stop hook (`cw-prestop`) pushes unpushed work to the worker's `wip` branch when the pod is deleted, but no stop line and no run record is written. A worker lost with its node is told apart from one the launcher stopped by the cloud end alert of ask 1480 (pull request 1486), which reports a created worker whose pod is gone with no stop line as a gone pod after that ask's own waiting rule.
