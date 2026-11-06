@@ -224,6 +224,7 @@ def main():
     if rc:
         mb = base
     failed = False
+    left = []
     tmp = tempfile.mkdtemp(prefix="cloud-preflight-")
     try:
         # clean copy of the default branch: archive extracted under the temp dir (no worktree metadata in the repo)
@@ -297,7 +298,8 @@ def main():
                 print("NOT RUN: " + reason)
             for line in cloud_quick.cannot_lines(every):
                 print(line)
-            failed |= bool(cannot)
+            left = cloud_quick.left_to_ci(reads, cannot)
+            failed |= bool(cannot) and not left
             if changed_files and not reads:
                 print("\nRESULT: FAIL")
                 return 1  # decided from the reader picks alone: no scan is started
@@ -348,7 +350,9 @@ def main():
         if not_run:
             print("\nRESULT: NOT RUN (budget)")
             return BUDGET_STATUS
-        print("\nRESULT: PASS")
+        print("\nRESULT: PASS" + (" (quick mode; left to CI: %d)" % len(left) if left else ""))
+        if left:
+            print(cloud_quick.left_line(left))
         return 0
     finally:
         kill_children()

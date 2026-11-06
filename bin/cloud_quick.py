@@ -67,6 +67,17 @@ def not_run_reason(reads, changed):
     return "no check that can run in quick reads %s (cannot run in quick: %s)" % (names, ", ".join(sorted(cannot)))
 
 
+def left_to_ci(reads_can_run, reads_cannot):
+    """The ONE rule of both commands (ask #1730): when at least one reader can run, the readers that cannot are left to CI
+    (not a failure); when none can run the old not-clean decision stays (an empty list here)."""
+    return sorted(reads_cannot) if reads_can_run and reads_cannot else []
+
+
+def left_line(left):
+    """The last line of a quick run that left checks to CI."""
+    return "left to CI (not run in quick): " + ", ".join(sorted(left))
+
+
 def cannot_lines(reads):
     """One line per reader a quick run cannot start: never silently skipped."""
     return ["NOT RUN: %s cannot run in quick" % r for r in split_readers(reads)[1]]
