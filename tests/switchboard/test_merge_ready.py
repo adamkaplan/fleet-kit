@@ -61,7 +61,7 @@ class TestMergeReady(Base):
     def setUp(self):
         super().setUp()
         self.world = World(self, agents=("coder",))
-        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "hold_labels": {REPO: {"label": HOLD, "message": "held", "allowed_removers": ["coordinator"]}}})
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "captain_labels": {REPO: HOLD}})
         self.gh = FakeGitHub()
 
     def runner(self, argv, **kwargs):
@@ -104,13 +104,15 @@ class TestMergeReady(Base):
         self.gh.events = [{"event": "review_dismissed", "actor": {"login": "maint"}, "dismissed_review": {"review_id": 5}}]
         self.refused("rev's review at aaaaaaaa was dismissed by maint")
 
-    def test_s2_a_missing_hold_label_is_refused(self):
+    def test_s2_a_missing_captain_label_is_refused(self):
         self.gh.labels = []
-        self.refused("the required hold label needs:captain is missing")
+        self.refused("the required captain label needs:captain is missing")
 
-    def test_s2_a_repository_without_a_hold_rule_is_unknown_never_ready(self):
+    def test_s2_a_repository_without_a_captain_rule_is_ready_and_says_so(self):
         self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
-        self.refused("hold rule unknown")
+        self.gh.labels = []
+        code, out, err = self.run_ready()
+        self.assertEqual((code, out.strip()), (0, "READY " + PR + " (no captain rule)"), err)
 
     def test_s2_a_required_check_that_is_red_or_missing_is_refused(self):
         self.gh.checks = [{"name": "test", "conclusion": "FAILURE"}]
