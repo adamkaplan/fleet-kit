@@ -250,7 +250,7 @@ class TestGhBodyReadHasItsOwnClock(unittest.TestCase):
 
     def test_S2_control_today_s_code_refuses_with_the_old_text(self):
         import subprocess as sp
-        source = sp.run(["git", "show", "origin/integration:shims/gh_body.py"], cwd=str(REPO), capture_output=True, text=True, check=True).stdout
+        source = sp.run(["git", "show", "18923d472731d74b58033e1a9ddd6f0accf631c4:shims/gh_body.py"], cwd=str(REPO), capture_output=True, text=True, check=True).stdout
         path = pathlib.Path(self.dir.name) / "old_gh_body.py"
         path.write_text(source)
         self.fake("cat <<'EOF'\n" + json.dumps({"body": BOTH}) + "\nEOF")
