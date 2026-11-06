@@ -846,5 +846,56 @@ class TestStopFinalMessageBareMutant(unittest.TestCase):
         self.assertEqual(code, 0, "control of U20: %s" % out)
 
 
+class TestEndNoticeHeadLine(unittest.TestCase):
+    """#2267 S2, S3: the end notice's one line for the last pushed head and its checks."""
+
+    def world(self, name, hook, head_sha="a" * 40, repo="o/r"):
+        w = StopWorld(self)
+        rec = w.pod(name, "words")
+        (rec / "run.json").write_text(json.dumps({"head_sha": head_sha, "end_hook": hook}))
+        (w.cloud / (name + ".json")).write_text(json.dumps({"worker": name, "reports_to": "boss-lane", "repo": repo}))
+        w.stop(name, "hard", rec)
+        return w
+
+    def run_scan(self, w, reader):
+        w.mod_scan = w.mod.scan_audit(w.audit, w.state_file, w.cloud, w.reports, lambda to, text: w.sent.append((to, text)),
+                                      sb.load_module("record_json").parse_bounded, None, None, head_checks=reader)
+
+    PUSHED = {"pushed": False, "wip_branch": None, "head_on": "feat/x"}
+
+    def test_S2_green_red_and_pending_each_give_one_line_with_branch_sha_and_state(self):
+        for state, want in (("passed", "checks passed"), ("failed: lint, unit", "checks failed: lint, unit"), ("pending", "checks pending")):
+            w = self.world("cb-2267a", self.PUSHED)
+            self.run_scan(w, lambda repo, sha, state=state: state)
+            msg = w.to("boss-lane")[0]
+            self.assertIn("Last head: feat/x@aaaaaaaa, %s." % want, msg)
+            self.assertEqual(msg.count("Last head:"), 1)
+
+    def test_S2_control_without_a_reader_the_notice_has_no_such_line(self):
+        w = self.world("cb-2267b", self.PUSHED)
+        self.run_scan(w, None)
+        self.assertNotIn("Last head", w.to("boss-lane")[0])
+
+    def test_S3_nothing_pushed_says_so_and_is_sent(self):
+        w = self.world("cb-2267c", {"pushed": False, "wip_branch": None, "head_on": None})
+        self.run_scan(w, lambda repo, sha: "passed")
+        self.assertIn("Last head: nothing pushed.", w.to("boss-lane")[0])
+
+    def test_S3_a_failing_or_slow_reader_says_unknown_and_the_notice_is_still_sent(self):
+        def boom(repo, sha):
+            raise OSError("down")
+        for reader in (boom, lambda repo, sha: None):
+            w = self.world("cb-2267d", self.PUSHED)
+            self.run_scan(w, reader)
+            self.assertEqual(len(w.to("boss-lane")), 1)
+            self.assertEqual(len(w.to("chief-of-staff")), 1)
+            self.assertIn("Last head: feat/x@aaaaaaaa, checks unknown.", w.to("boss-lane")[0])
+
+    def test_S3_a_missing_sha_says_head_unknown(self):
+        w = self.world("cb-2267e", self.PUSHED, head_sha=None)
+        self.run_scan(w, lambda repo, sha: "passed")
+        self.assertIn("Last head: head unknown.", w.to("boss-lane")[0])
+
+
 if __name__ == "__main__":
     unittest.main()
