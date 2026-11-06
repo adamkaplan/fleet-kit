@@ -22,6 +22,15 @@ tcw = importlib.util.module_from_spec(_spec)
 sys.modules["cw_test_default_model_mod"] = tcw
 _loader.exec_module(tcw)
 
+PART = ROOT / "bin" / "switchboard" / "launch_model.py"
+
+
+def load_part(text):
+    ns = {"re": re, "LaunchError": Exception, "_one_line": lambda t, n: t[:n]}
+    exec(text, ns)
+    return ns
+
+
 DEFAULT = {"providerID": "github-copilot", "id": "claude-sonnet-5.5", "variant": "medium"}
 
 
@@ -68,11 +77,15 @@ class DefaultModel(tcw.Base):
         self.assertEqual((line["worker"], line["model"], line["level"]), ("coder7", "github-copilot/claude-opus-5.5", "high"))
 
     def test_an_orchestrator_launch_keeps_todays_behaviour(self):
-        code, out, err = self.launch_with("--cloud", "--agent", "orchestrator")
-        self.assertEqual(code, 0, err)
-        (body,) = self.bodies()
-        self.assertNotIn("model", body)
-        self.assertEqual(self.nondefault(), [])
+        """The stub launcher takes no --agent, so this is the function the launch calls (loaded like the Mutant test below)."""
+        ns = load_part(PART.read_text())
+        calls = []
+        orch = lambda **kw: type("A", (), dict({"model": None, "reasoning": None, "agent": "orchestrator", "name": "o"}, **kw))()
+        self.assertEqual(ns["launch_model_cloud"](orch(), "github-copilot", lambda *a: calls.append(a)), {})
+        self.assertEqual(calls, [])
+        self.assertEqual(ns["launch_model_cloud"](orch(model="github-copilot/claude-opus-5.5"), "github-copilot", lambda *a: calls.append(a)),
+                         {"model": "github-copilot/claude-opus-5.5"})
+        self.assertEqual(calls, [("o", "github-copilot/claude-opus-5.5", None)])
 
     def test_the_default_choice_is_in_launch_model_py(self):
         text = (ROOT / "bin" / "switchboard" / "launch_model.py").read_text()
@@ -85,12 +98,8 @@ class Mutant(unittest.TestCase):
         text = path.read_text()
         mutant = text.replace('else {"model": CLOUD_DEFAULT_MODEL, "reasoning": CLOUD_DEFAULT_LEVEL}', "else {}")
         self.assertNotEqual(mutant, text, "the mutation did not apply")
-        ns = {"re": re, "LaunchError": Exception, "_one_line": lambda t, n: t[:n]}
         args = type("A", (), {"model": None, "reasoning": None, "agent": "coder", "name": "w"})()
-        exec(text, dict(ns))  # control: the real part compiles
-        control, broken = dict(ns), dict(ns)
-        exec(text, control)
-        exec(mutant, broken)
+        control, broken = load_part(text), load_part(mutant)
         self.assertEqual(control["launch_model_cloud"](args, "github-copilot"), {"model": "github-copilot/claude-sonnet-5.5", "reasoning": "medium"})
         self.assertEqual(broken["launch_model_cloud"](args, "github-copilot"), {}, "default missing: no model for a worker launch")
 
