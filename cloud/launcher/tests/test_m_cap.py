@@ -82,7 +82,7 @@ class TestScenarios(Cap):
         self.assertEqual(code, 2, err)
         self.assertEqual(len(lines), 1, err)
         self.assertIn("holds %d shape-M" % CAP, lines[0])
-        self.assertEqual(len(named), min(CAP, 10), lines[0])
+        self.assertEqual(len(named), min(CAP, 10), lines[0])   # the refusal lists at most 10 names (held[:10] in bin/cloud_worker.py)
         self.assertIn("retire one", lines[0])
         self.assertIn("--shape S", lines[0])
         self.assertEqual(self.calls(), 0)
