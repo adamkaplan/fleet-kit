@@ -571,11 +571,14 @@ class TestCommentWindowGapFill(HubCase):
         empty, over = 0, 0
         for _ in range(8):
             before = len(world.requests)
-            budget = [0]   # the other repositories' main reads used the whole pass budget
+            budget = [3]
+            hub.reserve_comment_gaps("sweep", [REPO], budget)   # the pass's start: one page set aside for the open gap
+            budget[0] = 0   # the other repositories' main reads then used the whole of what was left
             hub.read_comments("sweep", REPO, self.since, cap=sb.COMMENT_WINDOW_PAGES, budget=budget)
+            hub.release_comment_gaps(budget)
             gap = len(self.asc(world, before))
             empty += gap == 0
-            over += gap > 1
+            over += gap > 1 or budget[0] < 0
         self.assertEqual((empty, over), (0, 0), msg="%d passes read no gap page, %d read more than their share" % (empty, over))
 
     def test_s4_a_window_larger_than_a_pass_closes_over_restarts_and_is_read_once(self):

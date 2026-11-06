@@ -1051,8 +1051,15 @@ def triage_pass(engine, decisions, now, errors=()):
     seconds = cfg.get("pass_seconds", TRIAGE_PASS_SECONDS)
     units = ["issues", "comments", "merged"] + ["closed:" + l for l in sorted(triage_awaiting_labels(engine))]
     state.wanted = len(repos) * len(units)
-    triage_refresh(engine, state, repos, units, now, budget, max(1, budget[0] // 3), seconds)  # a third kept for fresh checks
-    triage_read_live(engine, state, repos, now, budget, max(1, cfg.get("calls_per_pass", TRIAGE_CALLS_PER_PASS) // 3), seconds)
+    hub = getattr(engine, "hub", None)
+    if hasattr(hub, "reserve_comment_gaps"):
+        hub.reserve_comment_gaps("triage", repos, budget)   # #2238: an open comment gap's page is set aside before the main reads
+    try:
+        triage_refresh(engine, state, repos, units, now, budget, max(1, budget[0] // 3), seconds)  # a third kept for fresh checks
+        triage_read_live(engine, state, repos, now, budget, max(1, cfg.get("calls_per_pass", TRIAGE_CALLS_PER_PASS) // 3), seconds)
+    finally:
+        if hasattr(hub, "release_comment_gaps"):
+            hub.release_comment_gaps(budget)   # #2238: what was set aside and not used goes back
     triage_refresh_ownerless(engine, state, cfg, now, budget, seconds)   # #605: the team repositories' whole lists, after the shared units
     try:
         plan_wake_pass(engine, state, repos, now, budget)   # #765: the plans posted or edited, from the units just held

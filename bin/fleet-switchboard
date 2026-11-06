@@ -11141,7 +11141,8 @@ class GitHubHub:
         """The part of the window before gaps[key] was never read: read it oldest first from the window's start (since=<edge>, ascending), at most
         COMMENT_GAP_PAGES pages a pass and never more than the caller's budget[0] (charged here), merging by id; the gap closes where the read meets the held comments."""
         edges = self.__dict__.setdefault("_comment_gap_edges", {})
-        pages = COMMENT_GAP_PAGES if budget is None else min(COMMENT_GAP_PAGES, max(1, budget[0]))   # #2238: an open gap reads at least one page a pass
+        reserved = self.__dict__.setdefault("_comment_gap_reserve", {}).pop(key, 0)   # #2238: the page(s) the caller set aside at the pass's start (already charged)
+        pages = COMMENT_GAP_PAGES if budget is None else min(COMMENT_GAP_PAGES, budget[0] + reserved)
         edge = max(edges.get(key) or since, since)
         path = "repos/%s/issues/comments?since=%s&sort=created&direction=asc&per_page=100" % (repo, edge)
         for number in range(1, pages + 1):
@@ -11149,7 +11150,10 @@ class GitHubHub:
             page = [r for r in raw
                     if isinstance(r, dict) and isinstance(r.get("created_at"), str) and r.get("id") is not None]
             if budget is not None:
-                budget[0] -= 1
+                if reserved:
+                    reserved -= 1
+                else:
+                    budget[0] -= 1
             for record in page:
                 if record["created_at"] >= since:
                     have.setdefault(record["id"], record)
@@ -11161,6 +11165,26 @@ class GitHubHub:
                 return
             if page[0]["created_at"] == page[-1]["created_at"]:
                 return   # a whole page in one second cannot advance the edge; the window's start passing it ends this gap
+
+    def reserve_comment_gaps(self, consumer, repos, budget):
+        """#2238: at the start of a pass, before the main reads, set aside one page of `budget` for each repository whose gap is open (in memory or kept from
+        the last stop), as far as the budget allows; the gap fill uses it, release_comment_gaps gives back what was not used. A budget of 0 reserves nothing."""
+        parse, store = load_module("record_json").parse_bounded, load_module("comment_cursor")
+        kept = self.__dict__.get("_comment_gap_kept")
+        if kept is None:
+            kept = self._comment_gap_kept = store.load_gaps(self.state_dir, parse)
+        gaps, reserve = self.__dict__.get("_comment_gaps", {}), self.__dict__.setdefault("_comment_gap_reserve", {})
+        for repo in repos:
+            if budget[0] > 0 and (consumer, repo) not in reserve and ((consumer, repo) in gaps or "%s|%s" % (consumer, repo) in kept):
+                reserve[(consumer, repo)] = 1
+                budget[0] -= 1
+
+    def release_comment_gaps(self, budget):
+        """#2238: the pages set aside and not used (the repository was not read this pass) go back to the pass's budget."""
+        reserve = self.__dict__.get("_comment_gap_reserve")
+        if reserve:
+            budget[0] += sum(reserve.values())
+            reserve.clear()
 
     def _keep_comment_gap(self, key, since, have, gaps, kept, parse, store):
         """#2238: the open gap's edge and the ids read so far go to the state directory (bounded); a closed gap's entry is removed."""
