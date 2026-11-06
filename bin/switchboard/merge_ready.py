@@ -125,6 +125,7 @@ def cmd_merge_ready(args, runner, now):
 
 
 cmd_merge_ready.direct = True   # no error mapping, no daemon start; GET only
+cmd_merge_ready.guard_records = True   # its name says `merge`: on a tree the installed-tree guard cannot read it refuses, so a READY never comes from a tree that is not known to be the installed one
 
 
 def add_merge_ready_parsers(sub):
