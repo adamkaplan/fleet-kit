@@ -73818,6 +73818,7 @@ class TestGhShimMergeGate(Base):
             self.assertIn(mutate[0], text)
             text = text.replace(*mutate)
         (lone / "gh").write_text(text)
+        (lone / "gh_body.py").write_text((SHIM.parent / "gh_body.py").read_text())   # #2219: a write the shim cannot load gh_body.py for is refused (exit 1) before the review check; the real shim ships with it
         self.assertFalse((lone / "review_rule.py").exists())
         self.shim_path = self.shim_file = lone / "gh"
 
