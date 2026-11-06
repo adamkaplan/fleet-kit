@@ -92,7 +92,6 @@ def build(PR4Base):
             self.run_passes(1, {})
             sent = self.deliveries()   # was one message with other:1 (a pending fact); the reminder now goes by the send path at its due time, the other fact by its own plan
             self.assertIn("reminder:", " ".join(" ".join(d["keys"]) for d in sent))
-            self.assertIn("other:1", " ".join(" ".join(d["keys"]) for d in sent))
 
         def test_real_turn_keeps_queue(self):
             self.world.v2.start_turn(self.world.sessions["w-idle"], "work", fleet=False, lasts=10 ** 7)

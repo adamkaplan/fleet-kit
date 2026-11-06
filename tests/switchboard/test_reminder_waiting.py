@@ -1,4 +1,5 @@
-"""#1728 part 1: a due reminder the daemon does not deliver in a pass writes one `reminder.waiting` audit line (once per reason, again on a
+"""Amendment 2 of #2243 removed the wait logic and the `reminder.waiting` and ceiling lines; the tests that pinned them were replaced by the delivered-within-one-pass tests of test_reminder_due_send.py (named there). Kept here: the bound settings, the status counts and the merged steer of fifty reminders.
+#1728 part 1: a due reminder the daemon does not deliver in a pass writes one `reminder.waiting` audit line (once per reason, again on a
 changed reason or after 30 minutes). One case per candidate path. PR4Base lives in the entry file: bin/test-switchboard passes it to build()."""
 from unittest import mock
 from support.loader import captured, sb
@@ -43,39 +44,6 @@ def build(PR4Base):
         def lines(self):
             return [e for e in self.world.audit() if e["event"] == "reminder.waiting"]
 
-        def test_each_path_writes_one_line_with_its_reason_and_a_second_pass_none(self):
-            self.world.engine.run_pass()
-            lines = self.lines()
-            wanted = {"w-batch": "wait: batching until", "w-hold": "hold: w-hold is blocked", "w-note": "note: you prompted",
-                      "w-gone": "condition unreadable", "w-turn": "lane in a turn of 10 minutes, queued"}
-            self.assertGreaterEqual(len(lines), len(wanted), "one line per path")
-            for name, reason in wanted.items():
-                (line,) = [e for e in lines if e["detail"]["id"] == self.ids[name]]
-                self.assertIn(reason, line["detail"]["reason"], name)
-                self.assertEqual(line["detail"]["late_min"], 0 if name == "w-batch" else 1)
-            self.world.tick(10)
-            self.world.engine.run_pass()
-            self.assertEqual(len(self.lines()), len(lines), "a second pass writes none")
-
-        def test_thirty_minutes_later_a_waiting_reminder_is_said_again(self):
-            self.world.engine.run_pass()
-            first = len(self.lines())
-            self.world.tick(31 * 60)
-            self.world.engine.run_pass()
-            self.assertGreater(len(self.lines()), first)
-
-        def test_a_mutant_that_writes_a_line_per_pass_is_caught(self):
-            self.world.engine.run_pass()
-            first = len(self.lines())
-            self.world.tick(10)
-            self.world.engine.run_pass()
-            self.assertEqual(len(self.lines()), first)               # control: the unmutated code
-            with mock.patch.object(sb.ReminderFacts, "says_again", lambda self, item_id, reason, now: True):
-                self.world.tick(10)
-                self.world.engine.run_pass()
-                with self.assertRaisesRegex(AssertionError, r"^\d+ != %d" % first):
-                    self.assertEqual(len(self.lines()), first)
-
         def late_one(self, minutes, **kwargs):
             now = self.world.clock.now()
             return sb.add_reminder(self.world.state, "w-batch", now - minutes * 60, now - 3600, "ship the widget-api build", **kwargs)["id"]
@@ -89,34 +57,6 @@ def build(PR4Base):
             plain = sb.add_reminder(self.world.state, "w-batch", now, now, "look")
             launch = sb.add_reminder(self.world.state, "w-batch", now, now, "report", condition={"while_running": "w-batch"})
             self.assertEqual([sb.reminder_bound(sb.DEFAULTS, i) for i in (plain, launch)], [600, 300])
-
-        def test_s9_a_due_reminder_is_a_pending_fact_after_one_pass_and_a_delivery_carries_every_due_one(self):
-            self.world.add_agent("w-free", fleet={"role": "coder", "reports_to": "platform", "issue": 20})
-            first, second = self.remind("w-free"), self.remind("w-free")
-            facts, _ = self.world.engine.collect_facts()
-            self.assertEqual(len([f for f in facts if f.recipient == "w-free" and f.key.startswith("reminder:")]), 2)
-            del self.world.engine.deliver                       # the real delivery
-            self.world.engine.run_pass()
-            sent = [e for e in self.world.audit() if e["event"] == "v2.synthetic" and e.get("subject") == "w-free" and e["detail"].get("keys")]
-            carried = [k for e in sent for k in e["detail"].get("keys", [])]
-            self.assertEqual(len(sent), 1)
-            self.assertEqual(len([k for k in carried if k in ("reminder:" + first, "reminder:" + second)]), 2)
-
-        def test_s10_a_reminder_past_its_bound_is_delivered_by_the_next_pass_by_a_queued_wake(self):
-            self.late_one(11)
-            del self.world.engine.deliver
-            self.world.engine.run_pass()
-            self.assertEqual(len(self.ceilings()), 1)           # control: the unmutated code
-            self.assertEqual(self.ceilings()[0]["detail"]["delivery"], "queued wake")
-            self.assertTrue([e for e in self.world.audit() if e["event"] == "v2.synthetic" and e.get("subject") == "w-batch"])
-
-        def test_s10_a_mutant_that_leaves_it_waiting_is_caught(self):
-            self.late_one(11)
-            del self.world.engine.deliver
-            with mock.patch.object(sb.ReminderFacts, "ceiling", lambda self, plan, now: []):
-                self.world.engine.run_pass()
-                with self.assertRaisesRegex(AssertionError, r"^0 != 1"):
-                    self.assertEqual(len(self.ceilings()), 1)
 
         def long_lane(self, name, issue):
             self.world.add_agent(name, fleet={"role": "coder", "reports_to": "platform", "issue": issue})
@@ -136,21 +76,6 @@ def build(PR4Base):
             now = self.world.clock.now()
             sb.add_reminder(self.world.state, name, now - 11 * 60, now - 3600, "look at the build")
             self.world.engine.__dict__.pop("deliver", None)      # the real delivery
-
-        def test_s4_a_due_reminder_in_a_turn_of_three_bounds_is_steered_not_queued(self):
-            self.steer_world()
-            self.world.engine.run_pass()
-            self.assertEqual((self.steered("s-long"), len(self.sent_to("s-long"))), (1, 1))   # 1 of 1: queue count 0
-
-        def test_s4_a_mutant_that_waits_for_the_turn_to_end_is_caught(self):
-            self.steer_world()
-            self.world.engine.run_pass()
-            self.assertEqual(self.steered("s-long"), 1)          # control: the unmutated code
-            self.steer_world("s-long2", 31)
-            with mock.patch.object(sb, "reminder_bound", lambda config, item: 10 ** 9):   # the mutant: no bound, so the reminder waits for the turn
-                self.world.engine.run_pass()
-                with self.assertRaisesRegex(AssertionError, r"^0 != 1"):
-                    self.assertEqual(self.steered("s-long2"), 1)
 
         def fifty_world(self, name="s-fifty", issue=50):
             """A lane in a turn of 3x the bound, steering on after 10 minutes, and 50 due reminders (distinct ids) due 10..590 s ago: all inside the bound."""
@@ -317,15 +242,6 @@ def build(PR4Base):
             with self.assertRaisesRegex(AssertionError, r"the status count diverged from reminder_bound", msg="mutant not caught: a writer that forgets the for"):
                 self.assertEqual(status, real, msg="the status count diverged from reminder_bound")
 
-        def test_s6_a_real_open_permission_request_holds_the_due_reminder(self):
-            self.steer_world()
-            self.world.herdr.panes[self.world.panes["s-long"]]["status"] = "blocked"
-            self.world.v2.ask_permission(self.world.sessions["s-long"])
-            self.world.engine.run_pass()
-            self.assertEqual(len(self.sent_to("s-long")), 0)
-            holds = [e for e in self.lines() if e["detail"]["reason"].startswith("hold:") and "s-long" in e["detail"]["reason"]]
-            self.assertEqual(len(holds), 1)
-
         def test_s7b_a_line_past_the_parse_bound_is_skipped_not_a_crash(self):
             import json, tempfile
             base = 1_800_000_000
@@ -443,32 +359,6 @@ def build(PR4Base):
         def carrying(self, item):
             return len([e for e in self.sent_to("u-free") if "reminder:" + item in e["detail"]["keys"]])
 
-        def test_s11_an_unreadable_condition_past_its_bound_is_delivered_with_a_note_and_one_ceiling_line(self):
-            item = self.unreadable_world()
-            self.world.tick(2 * 60)                              # due, inside the bound (5 minutes)
-            self.world.engine.run_pass()
-            self.assertEqual(self.carrying(item), 0)
-            self.world.tick(5 * 60)                              # past the bound
-            self.world.engine.run_pass()
-            self.assertEqual(self.carrying(item), 1)
-            mine = [e for e in self.ceilings() if e["detail"]["id"] == item and e["detail"].get("why") == "condition unreadable"]
-            self.assertEqual(len(mine), 1)
-            self.assertEqual(mine[0]["detail"]["why"], "condition unreadable")
-            facts = [e for e in self.world.audit() if e["event"] == "v2.synthetic" and e.get("subject") == "u-free"]
-            self.assertIn("condition unreadable", str(facts))
-
-        def test_s12_a_mutant_that_leaves_it_waiting_is_caught(self):
-            item = self.unreadable_world()
-            self.world.tick(8 * 60)
-            self.world.engine.run_pass()
-            self.assertEqual(self.carrying(item), 1)             # control: the unmutated code
-            item = self.unreadable_world_again()
-            with mock.patch.object(sb, "reminder_bound", lambda config, item: 10 ** 9):   # the mutant: the flag is never set
-                self.world.tick(8 * 60)
-                self.world.engine.run_pass()
-                with self.assertRaisesRegex(AssertionError, r"^0 != 1"):
-                    self.assertEqual(self.carrying(item), 1)
-
         def unreadable_world_again(self):
             now = self.world.clock.now()
             item = sb.add_reminder(self.world.state, "u-free", now + 60, now - 3600, "check the widget again", condition={"while_running": "u-free"})["id"]
@@ -497,19 +387,4 @@ def build(PR4Base):
                 self.world.engine.run_pass()
             return [e for e in self.ceilings() if e["detail"]["id"] == item and e["detail"].get("why") == "condition unreadable"]
 
-        def test_s14_the_unreadable_ceiling_line_is_written_once_per_id(self):
-            self.assertEqual(len(self.held_passes()), 1)         # control: the unmutated code
-
-        def test_s15_a_mutant_without_the_once_per_id_guard_is_caught(self):
-            class Forgetful(set):
-                def __contains__(self, item):
-                    return False
-            real = sb.ReminderFacts.__call__
-            def mutant(self, *a, **k):
-                self.__dict__["_ceiled_unreadable"] = Forgetful(self.__dict__.get("_ceiled_unreadable", ()))
-                return real(self, *a, **k)
-            with mock.patch.object(sb.ReminderFacts, "__call__", mutant):
-                lines = self.held_passes()
-                with self.assertRaisesRegex(AssertionError, r"^3 != 1"):
-                    self.assertEqual(len(lines), 1)
     return TestReminderWaiting

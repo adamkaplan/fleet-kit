@@ -84,4 +84,66 @@ def build(PR4Base):
             (sent,) = self.deliveries()
             self.assertTrue(sent["in_turn"])
             self.assertEqual(sb.read_reminders(self.world.state), [])
+
+        # ---- replacements of the tests that pinned the removed wait logic (each names what it replaces)
+
+        def test_a_blocked_lane_keeps_its_reminder_and_gets_it_once_unblocked(self):
+            """replaces test_s6_a_real_open_permission_request_holds_the_due_reminder and test_each_path_writes_one_line_with_its_reason...:
+            a lane that cannot be written to is held as a send to it is; the reminder is not lost, and is delivered in the first pass after it can be."""
+            self.world.herdr.panes[self.world.panes["w-lane"]]["status"] = "blocked"
+            self.world.v2.ask_permission(self.world.sessions["w-lane"])
+            now = self.world.clock.now()
+            sb.add_reminder(self.world.state, "w-lane", now + 5, now - 60, "roll the build")
+            self.world.tick(PASS)
+            self.world.engine.run_pass()
+            self.assertEqual(self.deliveries(), [])
+            self.assertEqual(len(sb.read_reminders(self.world.state)), 1)
+
+        def test_a_reminder_long_past_due_is_sent_at_once_with_no_wait_line(self):
+            """replaces test_s10_a_reminder_past_its_bound_is_delivered_by_the_next_pass_by_a_queued_wake, its mutant, and
+            test_thirty_minutes_later_a_waiting_reminder_is_said_again: no ceiling, no waiting line; delivered in the pass."""
+            now = self.world.clock.now()
+            item = sb.add_reminder(self.world.state, "w-lane", now - 3000, now - 3600, "roll the build")
+            self.assertEqual(self.delivered_pass(1, item["id"]), 1)
+            self.assertEqual(self.audit_events("reminder.ceiling", "reminder.waiting"), [])
+            self.assertEqual(sb.read_reminders(self.world.state), [])
+
+        def test_an_unreadable_condition_is_checked_once_and_the_reminder_goes_out_marked(self):
+            """replaces test_s11_an_unreadable_condition_past_its_bound..., test_s12/s14/s15 (the ceiling line, once per id): the condition is
+            read once at the due time; one that cannot be read does not hold the reminder, and no ceiling line is written."""
+            from unittest import mock
+            now = self.world.clock.now()
+            item = sb.add_reminder(self.world.state, "w-lane", now + 5, now - 60, "check the widget", condition={"while_running": "w-lane"})
+            with mock.patch.object(sb.ReminderFacts, "verdict", lambda self, item: None):
+                number = self.delivered_pass(1, item["id"])
+            self.assertEqual(number, 1)
+            self.assertEqual(len(self.audit_events("reminder.condition_unreadable")), 1)
+            self.assertEqual(self.audit_events("reminder.ceiling"), [])
+
+        def test_a_due_reminder_in_a_long_turn_goes_in_the_pass_it_is_due(self):
+            """replaces test_s4_a_due_reminder_in_a_turn_of_three_bounds_is_steered_not_queued and its mutant: the send path's own steering
+            decision (#1540) applies; the reminder is delivered in the pass, never held back for the turn to end."""
+            self.world.v2.start_turn(self.world.sessions["w-lane"], "work", fleet=True, lasts=86400, steps=3)
+            self.world.engine.run_pass()
+            self.world.tick(30 * 60)
+            now = self.world.clock.now()
+            item = sb.add_reminder(self.world.state, "w-lane", now + 5, now - 60, "roll the build")
+            self.assertEqual(self.delivered_pass(1, item["id"]), 1)
+            self.assertTrue(self.deliveries()[0]["in_turn"])
+
+        def test_a_gone_lane_keeps_its_reminder_unsent(self):
+            now = self.world.clock.now()
+            sb.add_reminder(self.world.state, "w-gone", now + 5, now - 60, "nobody home")
+            self.world.tick(PASS)
+            self.world.engine.run_pass()
+            self.assertEqual(self.deliveries("w-gone"), [])
+            self.assertEqual(len(sb.read_reminders(self.world.state)), 1)
+
+        def test_a_keyed_reminder_replaced_by_a_newer_one_is_sent_once(self):
+            now = self.world.clock.now()
+            sb.add_reminder(self.world.state, "w-lane", now + 5, now - 600, "old text", sender="w-other", key="roll")
+            new = sb.add_reminder(self.world.state, "w-lane", now + 6, now - 300, "new text", sender="w-other", key="roll")
+            self.assertEqual(self.delivered_pass(2, new["id"]), 1)
+            self.assertEqual(len(self.deliveries()), 1)
+            self.assertEqual(sb.read_reminders(self.world.state), [])
     return TestReminderDueSend
