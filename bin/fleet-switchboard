@@ -2204,6 +2204,8 @@ class Switchboard:
         early, self._early_facts = getattr(self, "_early_facts", {}), {}   # #467: a source the early decisions step already read this pass is not read twice
         for source in self.sources:
             name = getattr(source, "__name__", "source")
+            if isinstance(source, ReminderFacts):
+                continue   # #2243: released at its due time (run_pass), never a pending fact
             try:
                 found = early[id(source)] if id(source) in early else source()
             except Exception as err:  # one bad source must not stop the others
@@ -2402,7 +2404,7 @@ class Switchboard:
             plan = copy.copy(plan)
             plan.pending = kept
         pending = merge_wake_facts(plan.recipient, merge_reminder_copies(plan.pending))   # #1275: the sweep, triage and load-alert items of one wake are ONE message
-        in_turn = getattr(observation, "status", None) == "working" and not stale_working(self, observation, plan.pending)   # #2243: a stale 'working' (v2 runs no turn) is a new turn for a reminder
+        in_turn = getattr(observation, "status", None) == "working"
         parts_file = (self.state_dir / "finding-parts.json") if self.state_dir is not None else None   # #1302: how many parts of an over-cap finding were delivered (survives a restart; derived from nothing else)
         try:
             parts_done = json.loads(parts_file.read_text()) if parts_file is not None and parts_file.exists() else {}
@@ -2799,7 +2801,7 @@ class Switchboard:
         self._early_facts = {}   # #467: facts the early decisions step reads for this pass only; never carried over from an earlier one
         self.reads.begin_pass()
         discovery = self.discover(now)
-        if self.state_dir is not None:   # #2243: the turn start is always recorded (stale_working reads it); steering stays gated by the setting
+        if self.state_dir is not None:   # the turn start is always recorded; steering stays gated by the setting
             try:
                 load_module("turn_start").note(self.state_dir, [(o.session_id, o.status) for o in discovery.agents.values()], now,
                                                   load_module("record_json").parse_bounded, fresh=self.turn_start_fresh)
@@ -2828,6 +2830,12 @@ class Switchboard:
             except Exception as err:
                 self._failed(observation.name, "unconsumed", err, report)
         run_shadow_classifier(self, discovery, now)  # PR 7: logs, acts on nothing
+        for source in self.sources:   # #2243, amendment 2: a due reminder is handed to the ordinary send path at its due time, no pending fact of its own
+            if isinstance(source, ReminderFacts):
+                try:
+                    report["sent"].extend(o for o in source.release(discovery, now) if o.get("sent"))
+                except Exception as err:
+                    self._failed("reminders", "release", err, report)
         facts, _ = self.collect_facts()
         try:
             facts = filter_stopped_news(self, facts, discovery)
@@ -2847,7 +2855,6 @@ class Switchboard:
                 plan = self.plan(recipient, by_recipient[recipient], discovery, now)
                 if plan is None:
                     continue
-                reminder_waiting(self, plan, now)   # #1728
                 if plan.action == "wait":
                     report["waiting"].append(recipient)
                 elif plan.action == "hold":
