@@ -598,3 +598,50 @@ class TestCommentWindowGapFill(HubCase):
         self.assertEqual({k: v for k, v in sb.take_comment_cuts().items() if k == ("sweep", REPO)}, {})
 
 
+
+
+class TestSweepGapOnRealWiring(HubCase):
+    """#2238 through the real wiring: sweep_decisions (reserve, main reads, release) over the real hub; other repositories' main reads use the whole budget."""
+    OTHERS = ("aaa/one", "aaa/two")
+    OTHER_OPEN_PAGES = 2
+
+    def engine(self, hub, calls):
+        agents = {}
+        return types.SimpleNamespace(
+            config={"github_repos": [REPO] + list(self.OTHERS), "sweep": dict(sb.SWEEP_DEFAULTS, enabled=True, person_names=["Alex"], calls_per_pass=calls)},
+            discovery=types.SimpleNamespace(agents=agents), hub=hub, state_dir=str(self.state_dir), actor="daemon",
+            audit=types.SimpleNamespace(append=lambda *a: self.audit.append(a)), now=lambda: self.clock[0], _note=lambda *a, **k: None)
+
+    def run_pass(self, calls=16):
+        world = AscendingWorld(NOW - 7 * DAY, 6141)
+        hub = self.hub(world)
+        pages = self.OTHER_OPEN_PAGES
+        calls_made = []
+
+        def gh_api(path, paginate=True, timeout=None):
+            calls_made.append(path)
+            if "/issues/comments" in path:
+                if REPO in path:
+                    return world.gh_api(path, paginate, timeout)
+                return [[]]
+            if path.startswith("repos/%s/issues?state=open" % REPO) or "state=closed" in path:
+                return [[]]
+            if "state=open" in path:   # the other repositories: full pages, so their main reads are long
+                page = int(path.rsplit("&page=", 1)[1].split("&")[0])
+                return [[{"number": 1000 * page + i, "title": "t", "body": "", "labels": [], "user": {"login": "u"}} for i in range(100)] if page < pages else []]
+            return [[]]
+        hub.gh_api = gh_api
+        hub.read_comments("sweep", REPO, self.since, cap=sb.COMMENT_WINDOW_PAGES, budget=[12])   # opens the gap
+        self.assertIn(("sweep", REPO), hub._comment_gaps)
+        eng = self.engine(hub, calls)
+        eng.sweep = sb.SweepState()
+        eng.sweep.repos[REPO] = {"at": 1, "items": {}, "truncated": False, "error": None, "closed_holds": {}, "open_cut": False}   # read once, long ago: the others go first
+        del calls_made[:]
+        sb.sweep_decisions(eng, [], NOW, [])
+        gap = [p for p in calls_made if "direction=asc" in p]
+        return calls_made, gap
+
+    def test_an_open_gap_reads_a_page_while_the_pass_stays_within_calls_per_pass(self):
+        calls_made, gap = self.run_pass(16)
+        self.assertGreaterEqual(len(gap), 1, msg="the gap read no page (%d calls made)" % len(calls_made))
+        self.assertLessEqual(len(calls_made), 16, msg="%d gh calls for a budget of 16" % len(calls_made))
