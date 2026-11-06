@@ -569,7 +569,7 @@ def _is_number(value):
 
 _WARNED_CONFIG = set()
 UNKNOWN_CONFIG = {}   # (section, key) -> the nearest known key or None: what `status` shows, kept for the life of the process
-TOP_LEVEL_EXTRA_KEYS = {"worktree_reclaim", "orphan_reaper", "order_notice_burst_minutes", "external_decisions", "friction_wake", "blocked_alert", "sweep", "triage", "plan_evaluators", "red_ci_required", "default_branches", "plan_gates", "plan_review", "impact_hold", "load_alert", "source_budgets", "hold_labels", "captain_labels", "header_cache", "app_installations", "app_key_path", "app_key_command", "app_permissions", "app_api_base", "relay_holders"}
+TOP_LEVEL_EXTRA_KEYS = {"worktree_reclaim", "orphan_reaper", "order_notice_burst_minutes", "external_decisions", "friction_wake", "blocked_alert", "sweep", "triage", "plan_evaluators", "red_ci_required", "default_branches", "plan_gates", "plan_review", "impact_hold", "load_alert", "source_budgets", "hold_labels", "captain_labels", "merge_base", "header_cache", "app_installations", "app_key_path", "app_key_command", "app_permissions", "app_api_base", "relay_holders"}
 
 
 CONFIG_DECLARATION_TEXT = re.compile(rb'^[ \t]*CONFIG_KEY[ \t]*(?::[^=\n]*)?=[ \t]*[\'"]([^\'"\n]*)[\'"]', re.M)   # only the fallback for a file that does not parse
@@ -827,6 +827,7 @@ def validate_config(raw, source="config"):
     validate_plan_review_config(config, source)  # #109 part 2, R2
     validate_hold_labels_config(config, source)  # #376
     validate_captain_labels(config, source)
+    validate_merge_base(config, source)
     validate_app_config(config, source)  # #609
     return config
 
@@ -885,6 +886,16 @@ def validate_captain_labels(config, source):
         return
     if not isinstance(raw, dict) or len(raw) > 20 or not all(isinstance(r, str) and r and isinstance(b, str) and b.strip() for r, b in raw.items()):
         raise ConfigError("%s: 'captain_labels' must be an object of at most 20 repository -> non-empty label name" % source)
+
+
+def validate_merge_base(config, source):
+    """`merge_base`: repository -> the branch name `merge-ready` expects a pull request to be based on (at most 20); a repository without an entry uses its default branch."""
+    raw = config.get("merge_base")
+    if raw is None:
+        config.pop("merge_base", None)
+        return
+    if not isinstance(raw, dict) or len(raw) > 20 or not all(isinstance(r, str) and r and isinstance(b, str) and b.strip() for r, b in raw.items()):
+        raise ConfigError("%s: 'merge_base' must be an object of at most 20 repository -> non-empty branch name" % source)
 
 
 def validate_app_config(config, source):

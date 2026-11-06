@@ -2585,6 +2585,7 @@ validate_hold_labels_config
 validate_intent_config
 validate_jev_config
 validate_load_alert_config
+validate_merge_base
 validate_order_burst
 validate_orphan_config
 validate_plan_evaluators

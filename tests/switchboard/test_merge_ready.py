@@ -90,7 +90,7 @@ class TestMergeReady(Base):
 
     def test_s3_every_fact_right_says_ready_and_exits_0(self):
         code, out, err = self.run_ready()
-        self.assertEqual((code, out.strip()), (0, "READY " + PR), err)
+        self.assertEqual((code, out.strip()), (0, "READY " + PR + " (base main: the default branch)"), err)
 
     def test_s2_a_pull_request_into_another_base_is_refused(self):
         self.gh.base = "release"
@@ -113,7 +113,7 @@ class TestMergeReady(Base):
         self.gh.reviews = [review("DISMISSED", OLD, "rev", rid=5)]
         self.gh.events = [{"event": "review_dismissed", "actor": {"login": "github-actions"}, "dismissed_review": {"review_id": 5, "state": "approved"}}]
         code, out, err = self.run_ready()
-        self.assertEqual((code, out.strip()), (0, "READY %s (rev's approval at aaaaaaaa was dismissed by github-actions (not a refusal))" % PR), err)
+        self.assertEqual((code, out.strip()), (0, "READY %s (base main: the default branch) (rev's approval at aaaaaaaa was dismissed by github-actions (not a refusal))" % PR), err)
 
     def test_s2_a_dismissed_request_for_changes_is_refused_naming_the_dismisser(self):
         self.gh.reviews = [review("DISMISSED", OLD, "rev", rid=5)]
@@ -131,14 +131,14 @@ class TestMergeReady(Base):
         self.refused("required check lint has no result")
         self.gh.checks = [{"name": "test", "conclusion": "SUCCESS"}, {"name": "lint", "conclusion": "SUCCESS"}]
         code, out, err = self.run_ready()
-        self.assertEqual((code, out.strip()), (0, "READY " + PR), err)
+        self.assertEqual((code, out.strip()), (0, "READY " + PR + " (base main: the default branch)"), err)
         self.gh.checks = [{"name": "test", "conclusion": "FAILURE"}, {"name": "lint", "conclusion": "SUCCESS"}]
         self.refused("required check test is FAILURE")
 
     def test_s2_neither_protection_nor_rulesets_is_a_note_not_a_refusal(self):
         self.gh.required, self.gh.rules = None, []
         code, out, err = self.run_ready()
-        self.assertEqual((code, out.strip()), (0, "READY %s (no required checks configured)" % PR), err)
+        self.assertEqual((code, out.strip()), (0, "READY %s (base main: the default branch) (no required checks configured: main has no branch protection and no ruleset rule)" % PR), err)
 
     def test_s2_a_ruleset_read_that_errors_is_refused_naming_the_error(self):
         self.gh.required = None
@@ -146,6 +146,24 @@ class TestMergeReady(Base):
         self.runner = lambda argv, **kw: (subprocess.CompletedProcess(argv, 1, "", "HTTP 500") if any("/rules/branches/" in a for a in argv)
                                           else inner(argv, **kw)) if os.path.basename(argv[0]) == "gh" else self.world.route(argv, **kw)
         self.refused("the required checks could not be read")
+
+    def test_s2_a_configured_merge_base_is_what_the_pull_request_is_compared_with_and_is_named(self):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "captain_labels": {REPO: HOLD}, "merge_base": {REPO: "integration"}})
+        self.refused("is into main, not the configured merge base integration")
+        self.gh.base = "integration"
+        code, out, err = self.run_ready()
+        self.assertEqual((code, out.strip()), (0, "READY %s (base integration: the configured merge_base)" % PR), err)
+
+    def test_s2_a_merge_base_of_another_repository_changes_nothing(self):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "captain_labels": {REPO: HOLD}, "merge_base": {"acme/other": "integration"}})
+        code, out, err = self.run_ready()
+        self.assertEqual((code, out.strip()), (0, "READY %s (base main: the default branch)" % PR), err)
+
+    def test_u1_a_malformed_merge_base_is_refused_by_the_config(self):
+        for bad in ([], {"a/b": ""}, {"a/b": 3}, {"r%d/x" % i: "b" for i in range(21)}):
+            with self.assertRaises((SystemExit, sb.ConfigError), msg=repr(bad)):
+                self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "merge_base": bad})
+                self.run_ready()
 
     def test_s2_a_missing_captain_label_is_refused(self):
         self.gh.labels = []
@@ -155,7 +173,7 @@ class TestMergeReady(Base):
         self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
         self.gh.labels = []
         code, out, err = self.run_ready()
-        self.assertEqual((code, out.strip()), (0, "READY " + PR + " (no captain rule)"), err)
+        self.assertEqual((code, out.strip()), (0, "READY " + PR + " (base main: the default branch) (no captain rule)"), err)
 
     def test_s2_a_required_check_that_is_red_or_missing_is_refused(self):
         self.gh.checks = [{"name": "test", "conclusion": "FAILURE"}]
@@ -201,7 +219,7 @@ class TestMergeReady(Base):
 
     def test_an_override_on_a_pull_request_that_is_ready_records_nothing(self):
         code, out, err = self.run_ready("--override", "the owner: just in case")
-        self.assertEqual((code, out.strip()), (0, "READY " + PR))
+        self.assertEqual((code, out.strip()), (0, "READY " + PR + " (base main: the default branch)"))
         self.assertEqual([x for x in self.world.audit() if x["event"] == "merge_ready.override"], [])
 
     def test_s5_the_coordination_skill_and_the_switchboard_document_tell_a_lane_to_run_merge_ready_before_an_admin_merge(self):

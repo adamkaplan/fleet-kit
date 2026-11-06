@@ -51,10 +51,13 @@ def merge_ready_facts(engine, runner, repo, number):
     head, base = str(pr.get("headRefOid") or ""), str(pr.get("baseRefName") or "")
     failed, dismissed_notes = [], []
     default = (_mr_dicts(_mr_get(engine, runner, repo, "repos/%s" % repo)) or [{}])[0].get("default_branch")
-    if not default:
+    pinned = (engine.config.get("merge_base") or {}).get(repo)
+    expected, expected_name = (pinned, "the configured merge base %s" % pinned) if pinned else (default, "the default branch %s" % default)
+    notes_base = ["base %s: %s" % (base, "the configured merge_base" if pinned else "the default branch")]
+    if not expected:
         failed.append("base: the default branch of %s could not be read" % repo)
-    elif base != default:
-        failed.append("base: the pull request is into %s, not the default branch %s" % (base or "(none)", default))
+    elif base != expected:
+        failed.append("base: the pull request is into %s, not %s" % (base or "(none)", expected_name))
     reviews = _mr_dicts(_mr_get(engine, runner, repo, "repos/%s/pulls/%d/reviews" % (repo, number), True))
     events = _mr_dicts(_mr_get(engine, runner, repo, "repos/%s/issues/%d/events" % (repo, number), True))
     dismissers, was = {}, {}
@@ -76,7 +79,7 @@ def merge_ready_facts(engine, runner, repo, number):
     names = {str(l.get("name")) for l in _mr_dicts(pr.get("labels") or [])}
     if captain and captain not in names:
         failed.append("captain: the required captain label %s is missing" % captain)
-    notes = ([] if captain else ["no captain rule"]) + dismissed_notes
+    notes = notes_base + ([] if captain else ["no captain rule"]) + dismissed_notes
     required, configured = set(), False
     try:
         protection = _mr_dicts(_mr_get(engine, runner, repo, "repos/%s/branches/%s/protection/required_status_checks" % (repo, base)))
@@ -97,7 +100,7 @@ def merge_ready_facts(engine, runner, repo, number):
         failed.append("checks: the required checks could not be read (%s)" % _one_line(str(err), 120))
         return failed, notes
     if not configured:
-        notes.append("no required checks configured")
+        notes.append("no required checks configured: %s has no branch protection and no ruleset rule" % base)
     else:
         seen = {}
         for check in _mr_dicts(pr.get("statusCheckRollup") or []):
