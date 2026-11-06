@@ -66957,6 +66957,7 @@ _architecture = importlib.import_module("test_architecture")
 TestArchitectureDocument, TestArchitectureDocumentFailurePaths = _architecture.TestArchitectureDocument, _architecture.TestArchitectureDocumentFailurePaths
 _approval_gate = importlib.import_module("test_approval_gate"); _approval_gate.HOST = sys.modules[__name__]; TestApprovalGateReader, TestApprovalGateCommands, TestApprovalPair = _approval_gate.TestApprovalGateReader, _approval_gate.TestApprovalGateCommands, _approval_gate.TestApprovalPair   # #1735
 TestSharesDeadVerdict = importlib.import_module("test_dead_verdict").TestSharesDeadVerdict   # #1668
+_github_write_audit = importlib.import_module("test_github_write_audit"); _github_write_audit.HOST = sys.modules[__name__]; TestGithubWriteAudit, TestGithubWriteGuard = _github_write_audit.TestGithubWriteAudit, _github_write_audit.TestGithubWriteGuard   # #2260
 # The closure test (ask #1092, slice S13) is run the same way: the clear's closure follows the parts (tools/derive-closure).
 _closure = importlib.import_module("test_closure")
 TestDerivedClosure, TestRefusalInAPart, TestMovingADefinition, TestTheDerivationIsHeld = _closure.TestDerivedClosure, _closure.TestRefusalInAPart, _closure.TestMovingADefinition, _closure.TestTheDerivationIsHeld
