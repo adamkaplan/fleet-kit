@@ -565,7 +565,7 @@ class TestCommentWindowGapFill(HubCase):
         self.assertEqual(len(below), 0, msg="%d gap pages read again below the kept edge %s" % (len(below), edge))
 
     def test_s3_an_open_gap_gets_a_page_each_pass_when_others_used_the_budget(self):
-        world = AscendingWorld(NOW - 7 * DAY, 3700)
+        world = AscendingWorld(NOW - 7 * DAY, 6141)
         hub = self.hub(world)
         hub.read_comments("sweep", REPO, self.since, cap=sb.COMMENT_WINDOW_PAGES, budget=[12])
         empty, over = 0, 0

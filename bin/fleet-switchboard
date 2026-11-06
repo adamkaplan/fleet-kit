@@ -11141,7 +11141,7 @@ class GitHubHub:
         """The part of the window before gaps[key] was never read: read it oldest first from the window's start (since=<edge>, ascending), at most
         COMMENT_GAP_PAGES pages a pass and never more than the caller's budget[0] (charged here), merging by id; the gap closes where the read meets the held comments."""
         edges = self.__dict__.setdefault("_comment_gap_edges", {})
-        pages = COMMENT_GAP_PAGES if budget is None else min(COMMENT_GAP_PAGES, budget[0])
+        pages = COMMENT_GAP_PAGES if budget is None else min(COMMENT_GAP_PAGES, max(1, budget[0]))   # #2238: an open gap reads at least one page a pass
         edge = max(edges.get(key) or since, since)
         path = "repos/%s/issues/comments?since=%s&sort=created&direction=asc&per_page=100" % (repo, edge)
         for number in range(1, pages + 1):
@@ -11161,6 +11161,24 @@ class GitHubHub:
                 return
             if page[0]["created_at"] == page[-1]["created_at"]:
                 return   # a whole page in one second cannot advance the edge; the window's start passing it ends this gap
+
+    def _keep_comment_gap(self, key, since, have, gaps, kept, parse, store):
+        """#2238: the open gap's edge and the ids read so far go to the state directory (bounded); a closed gap's entry is removed."""
+        name = "%s|%s" % key
+        edge = self.__dict__.get("_comment_gap_edges", {}).get(key)
+        if key in gaps and edge:
+            ids = self.__dict__.setdefault("_comment_gap_ids", {}).setdefault(key, set())
+            ids.update(i for i in have if isinstance(i, (int, str)))
+            entry = {"edge": edge, "ids": sorted(ids, key=str)[-store.GAP_MAX_IDS:]}
+            if kept.get(name) == entry:
+                return
+            kept[name] = entry
+        elif name in kept and key not in gaps:
+            del kept[name]
+            self.__dict__.get("_comment_gap_ids", {}).pop(key, None)
+        else:
+            return
+        store.save_gaps(self.state_dir, kept, parse)
 
     def read_comments(self, consumer, repo, since, cap, budget=None):
         """#1889: the comments of `repo` created since `since`, newest first, as read_pages gave them, read incrementally. A first read (nothing held in memory
@@ -11206,10 +11224,20 @@ class GitHubHub:
         self._comment_main_pages = max(1, -(-len(records) // GITHUB_PAGE_SIZE))   # CHARGE-ONCE RULE: the callers charge only this (the main read); the gap fill charges its own pages
         if cut and oldest is not None:
             gaps[key] = oldest   # what lies before this was not read, until the window's start passes it
+        kept = self.__dict__.get("_comment_gap_kept")
+        if kept is None:
+            kept = self._comment_gap_kept = store.load_gaps(self.state_dir, parse)   # #2238: the gaps open at the last stop
+        if key in gaps and key not in self.__dict__.setdefault("_comment_gap_edges", {}) and "%s|%s" % key in kept:
+            old = kept["%s|%s" % key]
+            if old["edge"] >= since:   # an edge before the window's start is dropped
+                self._comment_gap_edges[key] = old["edge"]
+                self.__dict__.setdefault("_comment_gap_ids", {})[key] = set(old["ids"])
         if key in gaps:
             self._fill_comment_gap(key, repo, since, have, gaps, budget)
         if key in gaps and gaps[key] < since:
             del gaps[key]
+            self._comment_gap_edges.pop(key, None)
+        self._keep_comment_gap(key, since, have, gaps, kept, parse, store)
         newest = max((v["created_at"] for v in have.values()), default=None)
         if newest is not None and cursors.get(name) != newest:   # an empty merge keeps the old cursor (harmless: the next read asks since it again)
             cursors[name] = newest
