@@ -2606,6 +2606,35 @@ def ann(pod, key, default=None):
     return pod["metadata"].get("annotations", {}).get("cw/" + key, default)
 
 
+PR_LABEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9 :._/-]{0,49}", re.ASCII)   # #2269: a label name the launch may carry (no comma: the list is comma-separated)
+PR_LABELLED_MARK = "pr-labelled"                  # the pod annotation (cw/pr-labelled): the pull request numbers already handled, comma-separated; once each
+PR_RECORD_READ = "import os,sys;p=os.path.join(os.environ.get('CW_TMP_DIR','/run/cw-tmp'),'pr-record','numbers');sys.stdout.write(open(p).read(20000) if os.path.isfile(p) else '')"
+PR_LABELS_TOLD = set()                            # (worker, number) whose failure was already reported
+
+
+def clean_pr_labels(raw):
+    """The launch's labels: each a plain name (PR_LABEL_RE), no duplicates, at most 10; anything else refuses before anything is made."""
+    out = []
+    for label in raw or []:
+        if not isinstance(label, str) or not PR_LABEL_RE.fullmatch(label):
+            raise CloudError("--pr-label must be a plain label name (letters, digits, space and : . _ / -, at most 50); nothing was created", EXIT_USAGE)
+        if label not in out:
+            out.append(label)
+    if len(out) > 10:
+        raise CloudError("at most 10 --pr-label values; nothing was created", EXIT_USAGE)
+    return out
+
+
+def github_add_labels(token, repo, number, labels):
+    """POST /repos/R/issues/N/labels with exactly these labels (GitHub never creates here: a label that is missing answers 404 or 422). Raises on any failure."""
+    import urllib.request
+    import token_mint
+    req = urllib.request.Request("https://api.github.com/repos/%s/issues/%d/labels" % (repo, number), data=json.dumps({"labels": list(labels)}).encode(), method="POST",
+                                 headers={"Authorization": "Bearer " + token, "Accept": "application/vnd.github+json", "User-Agent": "cw-launcher", "Content-Type": "application/json"})
+    with token_mint.open_no_redirect(req, SCOPE_PROBE_SECONDS) as r:
+        r.read(100000)
+
+
 SAFE_VALUE = re.compile(r"[A-Za-z0-9._-]{1,63}", re.ASCII)
 POD_UID_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")   # the form of a pod uid: the create records it, the retire hands it back (bin/cloud_worker.py holds the equal text)
 
@@ -2778,6 +2807,9 @@ def render_pod(a, worker, name, now, hard, env, run_names=()):
          "CW_AUDIT_RUNTIME_ID": "pod/" + name}
     if endpoint:
         e["CW_TOKEN_ENDPOINT"] = endpoint
+    pr_labels = clean_pr_labels(getattr(a, "pr_label", None))   # #2269: refused before anything is made when one is not a plain label
+    if pr_labels:
+        e["CW_PR_LABELS"] = ",".join(pr_labels)
     comment = review_comment(a.repo)
     if comment:   # the repository's review comment, posted once by the end hook; none configured = no variable
         e["CW_REVIEW_COMMENT"] = comment
@@ -2815,6 +2847,7 @@ def render_pod(a, worker, name, now, hard, env, run_names=()):
                         "cw/max-hard": iso(now + dt.timedelta(seconds=parse_duration(a.max_hard or DEFAULT_MAX_HARD))),
                         **({"cw/run-id": a.run_id} if getattr(a, "run_id", None) else {}),
                         **({"cw/no-commit": "true"} if getattr(a, "no_commit", False) else {}),   # launched NOT to commit (a measure or a read): no wip note
+                        **({"cw/pr-labels": ",".join(pr_labels)} if pr_labels else {}),   # #2269: the labels the reaper puts on the pod's pull requests
                         **({"cw/role": agent} if agent == "orchestrator" else {})}},   # a worker pod's spec is byte-for-byte what it was: no annotation means worker
         "spec": {"restartPolicy": "Never", "activeDeadlineSeconds": pod_deadline_floor(a.max_hard),
                  "terminationGracePeriodSeconds": POD_TERMINATION_GRACE_SECONDS,
@@ -4375,6 +4408,10 @@ class Launcher:
             self.send_idle_nudges(live, now, acts)
         finally:
             steps["notes"] += mono() - t0   # the nudges are counted with the notes: both are the pass's sends
+        try:
+            out.extend(self.label_pod_prs(live, now))   # #2269: the pull requests a pod recorded get the labels its launch named
+        except Exception as err:
+            print("cloud-worker: pod pull requests were not labelled: %s" % self.kube.scrub(err, 120), file=sys.stderr)
         steps["total"] = mono() - t_pass
         return out
 
@@ -4557,6 +4594,48 @@ class Launcher:
 
     def send_note(self, name, text):
         self.kube.exec(name, "python3", "-c", NOTE_SENDER_CODE, text)
+
+    def label_pod_prs(self, pods, now):
+        """#2269: for each running pod launched with labels (cw/pr-labels), read the pod's pull request record by exec (one number a line) and add the
+        labels to each number not yet handled (cw/pr-labelled), once, with the repository's token. Never creates a label; a number outside the record
+        is never touched. A failure is said once (one report entry and one audit line). Returns report entries; never raises."""
+        out, token = [], None
+        for pod in pods:
+            try:
+                worker, name = ann(pod, "worker"), pod["metadata"]["name"]
+                raw = ann(pod, "pr-labels")
+                if not raw or (pod.get("status") or {}).get("phase") != "Running" or not NAME_RE.match(worker or ""):
+                    continue
+                labels = [x for x in raw.split(",") if PR_LABEL_RE.fullmatch(x)]
+                if not labels:
+                    continue
+                done = set((ann(pod, PR_LABELLED_MARK) or "").split(","))
+                seen = [x for x in self.kube.exec(name, "python3", "-c", PR_RECORD_READ).split() if x.isascii() and x.isdigit() and 0 < int(x) < 10 ** 9]
+                todo = [x for x in dict.fromkeys(str(int(x)) for x in seen) if x not in done]
+                if not todo:
+                    continue
+                repo = _pod_repo(pod)
+                for number in todo:
+                    try:
+                        if token is None:
+                            check_repo_allowed(repo, self.env)
+                            token = run_git_token_cmd(git_token_cmd(repo, self.env), repo, dict(os.environ, **self.env), register=lambda *v: self.kube.add_secrets(*v))
+                            self.kube.add_secrets(token)
+                        (self.add_labels or github_add_labels)(token, repo, int(number), labels)
+                        ok, why = True, "labelled %s" % ", ".join(labels)
+                    except Exception as e:
+                        ok, why = False, "not labelled: %s" % self.kube.scrub(e, 120)
+                    done.add(number)
+                    self.kube.annotate(name, (pod.get("metadata") or {}).get("uid"), **{PR_LABELLED_MARK: ",".join(sorted(x for x in done if x))})   # before the report: once
+                    self.audit(worker, "pod/" + name, "pr-label", 0.0, ok, "#%s %s" % (number, why))
+                    if not ok and (worker, number) not in PR_LABELS_TOLD:
+                        PR_LABELS_TOLD.add((worker, number))
+                        out.append((worker, "pull request #%s %s" % (number, why), 1))
+            except Exception as e:
+                print("cloud-worker: the pod's pull requests were not labelled: %s" % self.kube.scrub(e, 120), file=sys.stderr)
+        return out
+
+    add_labels = None   # a test replaces it: (token, repo, number, labels)
 
     def send_final_notes(self, pods, now):
         """When a worker pod has N minutes left to its hard deadline (N = CW_FINAL_NOTE_MINUTES, default 10) and lived at least 2N minutes in all,
@@ -5267,6 +5346,7 @@ def build_parser():
     c.add_argument("--stack-model-secret", metavar="NAME", help="with --stack: the NAME of the vault secret whose value arrives as the run secret %s (audit: the name and 'delivered'); never a value" % STACK_MODEL_KEY)
     c.add_argument("--agent", help="worker (default) or orchestrator: the agent the pod runs (CW_AGENT); any other value is refused before anything is made")
     c.add_argument("--no-commit", action="store_true", help="this pod is launched NOT to commit (a measure or a read): the launcher never tells it to push its work")
+    c.add_argument("--pr-label", action="append", default=None, metavar="LABEL", help="a label the pod's pull requests get (repeatable); the reaper adds it, never creates it")
     c.add_argument("--boss", help="with --agent orchestrator: the name of its boss (FLEET_BOSS)")
     c.add_argument("--persistent", action="store_true",
                    help="with --agent orchestrator and the per-run git-token Secret: an always-on orchestrator as ONE StatefulSet (restart always, no deadline, no idle limit); ended only by an explicit stop; refused for a worker or a stack launch")

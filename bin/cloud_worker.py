@@ -804,6 +804,7 @@ def _launch(args, runner, now, reserve):
     options += cloud_launch_again.no_wait_options(args)   # --no-wait (#1619)
     if getattr(args, "no_commit", False) or getattr(args, "role", None) in ("tester", "reviewer"):   # a measure or a read never commits
         options.append(NO_COMMIT_OPTION)
+    options += cloud_pr_labels.create_options(args)   # --pr-label (#2269)
     if persistent:   # only on request: any other launch hands the launcher exactly what it always did
         options.append(CREATE_OPTION["persistent"])
     if os.environ.get("CW_PULL_SECRET"):
@@ -863,6 +864,7 @@ def _launch(args, runner, now, reserve):
                 record["reports_to"] = args.reports_to
             if isinstance(args.shape, str) and args.shape:
                 record["shape"] = args.shape
+            cloud_pr_labels.record_labels(record, args)   # #2269
             save_record(state, record)
         except (CloudError, OSError) as err:
             remove_record(state, name)
@@ -1591,6 +1593,16 @@ def _load_inspect():
     return module
 
 
+def _load_pr_labels():
+    """Load bin/cloud_pr_labels.py (beside this file; a part of it, ask #2269)."""
+    spec = importlib.util.spec_from_file_location("cloud_pr_labels", str(_OWN_BIN / "cloud_pr_labels.py"))
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["cloud_pr_labels"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+cloud_pr_labels = _load_pr_labels()
 cloud_inspect = _load_inspect()
 for _name in ("INSPECT_SECONDS", "_inspect_short", "cmd_inspect"):
     globals()[_name] = getattr(cloud_inspect, _name)
