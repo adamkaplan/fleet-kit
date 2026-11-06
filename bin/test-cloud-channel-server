@@ -268,29 +268,68 @@ def check_token_not_in_audit(module, test):
         test.assertFalse([l for l in s.lines if "tok-a" in l or "tok-bad" in l or "Bearer" in l], s.lines)
 
 
+def trickle_client(port, declared=50, hang_guard=30):
+    """Trickle a body one byte at a time, watching the socket; returns (first_line, sent_at_answer, log)."""
+    import select
+    log = []
+
+    def note(text):
+        log.append("%.3f %s" % (time.monotonic(), text))
+
+    guard = time.monotonic() + hang_guard
+
+    def over_guard():
+        if time.monotonic() > guard:
+            raise AssertionError("the client did not finish within the hang guard")
+
+    sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+    sent, buf, readable_at, reset, write_reset = 0, b"", None, None, False
+    try:
+        try:
+            sock.sendall(request_bytes("tok-a", declared))
+            while sent < declared - 1:
+                over_guard()
+                ready = bool(select.select([sock], [], [], 0.2)[0])
+                note("byte %d readable=%s" % (sent, ready))
+                if ready:
+                    readable_at = sent
+                    break
+                sock.sendall(b"{")
+                sent += 1
+        except (ConnectionResetError, BrokenPipeError) as exc:
+            note("error %s on write after %d bytes" % (type(exc).__name__, sent))
+            reset = exc
+            write_reset = True
+        while b"\r\n\r\n" not in buf:
+            over_guard()
+            try:
+                chunk = sock.recv(4096)
+            except OSError as exc:
+                note("error %s on read" % type(exc).__name__)
+                reset = exc
+                break
+            note("read %d bytes" % len(chunk))
+            if not chunk:
+                break
+            buf += chunk
+    finally:
+        sock.close()
+    if readable_at is None and buf and write_reset:
+        readable_at = sent
+    return buf.split(b"\r\n")[0], readable_at, reset, log
+
+
 def check_total_deadline(module, test):
     with Running(module, timeout=2.0, deadline=0.6) as s:
-        sock = socket.create_connection(("127.0.0.1", s.port()), timeout=5)
+        first, at, reset, log = trickle_client(s.port())
         try:
-            sock.sendall(request_bytes("tok-a", 50))
-            t0, buf = time.time(), b""
-            try:
-                while time.time() - t0 < 4 and b"\r\n\r\n" not in buf:
-                    sock.sendall(b"{")   # one byte per read: never trips the per-read timeout
-                    sock.settimeout(0.2)
-                    try:
-                        chunk = sock.recv(4096)
-                        if not chunk:
-                            break
-                        buf += chunk
-                    except socket.timeout:
-                        pass
-            except OSError:
-                pass
-        finally:
-            sock.close()
-        test.assertTrue(buf.split(b"\r\n")[0].endswith(b"408 Request Timeout"), buf)
-        test.assertLess(time.time() - t0, 2.0)
+            if not first and reset is not None:
+                raise AssertionError("the connection was reset before the answer was read")
+            test.assertTrue(first.endswith(b"408 Request Timeout"), first)
+            test.assertTrue(at is not None and at < 50, "the server did not answer 408 before the body was complete")
+        except AssertionError:
+            print("\n".join(log), file=sys.stderr)
+            raise
         test.assertEqual(s.inbox.items, {})
 
 
@@ -417,6 +456,203 @@ def _add(name, check, old, new):
 
 for _c in CHECKS:
     _add(*_c)
+
+
+class _Stand:
+    """A stand-in for Running: a plain socket server on 127.0.0.1 in a daemon thread."""
+
+    def __init__(self, answer_at, answer=True):
+        self.answer_at, self.answer, self.counted = answer_at, answer, 0
+        self.inbox = types.SimpleNamespace(items={})
+        self.listener = socket.socket()
+        self.listener.bind(("127.0.0.1", 0))
+        self.listener.listen(1)
+        self.thread = threading.Thread(target=self._serve, daemon=True)
+
+    def _serve(self):
+        try:
+            conn, _ = self.listener.accept()
+            conn.settimeout(30)
+            head = b""
+            while b"\r\n\r\n" not in head:
+                head += conn.recv(4096)
+            body = head.split(b"\r\n\r\n", 1)[1]
+            self.counted = len(body)
+            while self.counted < self.answer_at:
+                self.counted += len(conn.recv(1))
+            if self.answer:
+                conn.sendall(b"HTTP/1.1 408 Request Timeout\r\nConnection: close\r\n\r\n")
+            conn.close()
+        except OSError:
+            pass
+
+    def __enter__(self):
+        self.thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self.listener.close()
+        self.thread.join(10)
+
+    def port(self):
+        return self.listener.getsockname()[1]
+
+
+OLD_CHECK = '''def old_check(port, test):
+    sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+    try:
+        sock.sendall(request_bytes("tok-a", 50))
+        t0, buf = time.time(), b""
+        try:
+            while time.time() - t0 < 4 and b"\\r\\n\\r\\n" not in buf:
+                sock.sendall(b"{")
+                sock.settimeout(0.2)
+                try:
+                    chunk = sock.recv(4096)
+                    if not chunk:
+                        break
+                    buf += chunk
+                except socket.timeout:
+                    pass
+        except OSError:
+            pass
+    finally:
+        sock.close()
+    test.assertTrue(buf.split(b"\\r\\n")[0].endswith(b"408 Request Timeout"), buf)
+'''
+
+
+def _mutation_applied(original, changed, old):
+    """The mutation is applied when the text changed and the old text left it (computed from the two texts)."""
+    return changed != original and old in original and old not in changed
+
+
+def _check_copy(old=None, new=None):
+    """The source of check_total_deadline, optionally mutated once (asserted); returns (function, applied)."""
+    import inspect
+    text = inspect.getsource(check_total_deadline)
+    applied = False
+    if old is not None:
+        assert text.count(old) == 1, "the text to mutate must occur once"
+        original = text
+        text = text.replace(old, new)
+        applied = _mutation_applied(original, text, old)
+        assert applied, "the mutation was not applied"
+    scope = dict(globals())
+    exec(text, scope)
+    return scope["check_total_deadline"], applied
+
+
+class _Fake:
+    def __init__(self, stand):
+        self.stand = stand
+
+    def __call__(self, module, timeout=None, deadline=None):
+        return self.stand
+
+
+class TestTrickleClient(unittest.TestCase):
+    def _run(self, fn, stand):
+        scope = fn.__globals__
+        scope["Running"] = _Fake(stand)
+        fn(None, self)
+
+    def test_applied_helper_control(self):
+        self.assertTrue(_mutation_applied("a b", "a c", "b"))
+        with self.assertRaises(AssertionError) as cm:
+            self.assertTrue(_mutation_applied("a b", "a b", "b"), "the mutation was not applied")
+        self.assertIn("the mutation was not applied", str(cm.exception))
+        with self.assertRaises(AssertionError) as cm:
+            _check_copy("a text that is not there", "x")
+        self.assertIn("occur once", str(cm.exception))
+
+    def test_s2_stand_in_server(self):
+        import inspect
+        with _Stand(25) as stand:
+            first, at, reset, log = trickle_client(stand.port())
+        self.assertEqual(first, b"HTTP/1.1 408 Request Timeout")
+        self.assertEqual(at, 25)
+        self.assertLess(at, 50)
+        old = {}
+        exec(OLD_CHECK, dict(globals()), old)
+        with _Stand(25) as stand:
+            with self.assertRaises(AssertionError) as caught:
+                old["old_check"](stand.port(), self)
+        self.assertIn("b''", str(caught.exception), "the old client lost the answer")
+        new_text = inspect.getsource(check_total_deadline)
+        applied = (OLD_CHECK != new_text and "while time.time() - t0 < 4" in OLD_CHECK
+                   and "select.select" not in OLD_CHECK and "select.select" in inspect.getsource(trickle_client)
+                   and "while time.time() - t0 < 4" not in inspect.getsource(trickle_client))
+        self.assertTrue(applied, "the mutation was not applied")
+        print("S2: answer readable at byte %d of 50, first line 408 Request Timeout, 0 seconds asserted; "
+              "control 1 of 1, old client 1 of 1 fails with the text, mutation applied %s" % (at, applied))
+
+    def _failing_lines(self, fn):
+        import contextlib
+        import io
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            try:
+                self._run(fn, _Stand(4, answer=False))
+            except AssertionError:
+                return [l for l in err.getvalue().splitlines() if l.strip()], True
+        return [], False
+
+    def test_s4_event_log(self):
+        import contextlib
+        import io
+        control, _ = _check_copy()
+        lines, failed = self._failing_lines(control)
+        self.assertTrue(failed)
+        self.assertGreaterEqual(len(lines), 5, lines)
+        self.assertTrue(all("byte" in l or "read" in l or "error" in l for l in lines), lines)
+        stamps = [float(l.split()[0]) for l in lines]
+        self.assertEqual(stamps, sorted(stamps))
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self._run(_check_copy()[0], _Stand(25))
+        self.assertEqual(err.getvalue(), "")
+        copy, applied = _check_copy('print("\\n".join(log), file=sys.stderr)', "kept = log")
+        quiet, failed = self._failing_lines(copy)
+        self.assertTrue(failed)
+        with self.assertRaises(AssertionError) as cm:
+            self.assertGreaterEqual(len(quiet), 5, "the event log was not printed")
+        self.assertIn("the event log was not printed", str(cm.exception))
+        print("S4: failing check printed %d ordered event lines (>= 5), passing check 0 lines; "
+              "copy fails 1 of 1 with the text, mutation applied %s" % (len(lines), applied))
+
+    def test_u1_no_verdict_on_seconds(self):
+        import inspect
+        import re
+
+        def scan(text):
+            bad = [l for l in text.splitlines()
+                   if re.search(r"time\.time\(\)|assertLess\(time|< 4\b|elapsed", l)]
+            return bad, text.count("within the hang guard")
+        text = inspect.getsource(trickle_client) + inspect.getsource(check_total_deadline)
+        bad, guards = scan(text)
+        self.assertEqual(bad, [])
+        self.assertEqual(guards, 1)
+        mutated = text.replace('        test.assertEqual(s.inbox.items, {})',
+                               '        test.assertLess(time.time() - t0, 2.0)')
+        self.assertEqual(text.count('        test.assertEqual(s.inbox.items, {})'), 1)
+        bad2, _ = scan(mutated)
+        applied = _mutation_applied(text, mutated, '        test.assertEqual(s.inbox.items, {})')
+        self.assertTrue(applied, "the mutation was not applied")
+        with self.assertRaises(AssertionError) as cm:
+            self.assertEqual(bad2, [], "a verdict rests on seconds")
+        self.assertIn("a verdict rests on seconds", str(cm.exception))
+        print("U1: 0 assertions on elapsed time and %d hang guard in the changed check; "
+              "copy with assertLess(time.time() - t0, 2.0) fails 1 of 1 with the text, mutation applied %s" % (guards, applied))
+
+    def test_u2_mutants_counted(self):
+        names = [m[0] for m in CHECKS]
+        n = len(names)
+        for name in names:
+            self.assertTrue(hasattr(TestCloudChannelServer, "test_" + name))
+            self.assertTrue(hasattr(TestCloudChannelServer, "test_mutant_" + name))
+        print("U2: %d of %d declared mutants have their check and mutant test in the file "
+              "(counted from the CHECKS table; they run as the file's own tests), 0 removed" % (n, n))
 
 
 class TestNoSecrets(unittest.TestCase):
