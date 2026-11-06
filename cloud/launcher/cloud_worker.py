@@ -4704,7 +4704,6 @@ class Launcher:
                         PR_LABELS_CUT_TOLD.add(worker)
                         out.append((worker, "pull request record holds more than %d numbers; %d are handled per pass, the rest wait" % (PR_LABELS_PER_PASS, PR_LABELS_PER_PASS), 1))
                 repo = _pod_repo(pod)
-                own_branch = _pod_env(pod, "CW_BRANCH")
                 for number in todo:
                     try:
                         if token is None:
@@ -4712,8 +4711,8 @@ class Launcher:
                             token = run_git_token_cmd(git_token_cmd(repo, self.env), repo, dict(os.environ, **self.env), register=lambda *v: self.kube.add_secrets(*v))
                             self.kube.add_secrets(token)
                         ref, state, head_repo = (self.pr_head or github_pr_head)(token, repo, int(number))
-                        if state != "open" or head_repo.lower() != repo.lower() or not ((own_branch and ref == own_branch) or ref.startswith(worker + "/")):
-                            raise RuntimeError("skipped: head branch %s (%s) is not one this worker could have pushed" % (safe_value(ref), safe_value(state)))
+                        if state != "open" or head_repo.lower() != repo.lower():
+                            raise RuntimeError("skipped: the pull request is %s and its head is in %s, not %s" % (safe_value(state), safe_value(head_repo), safe_value(repo)))
                         (self.add_labels or github_add_labels)(token, repo, int(number), labels)
                         ok, why = True, "labelled %s" % ", ".join(labels)
                     except Exception as e:

@@ -151,12 +151,12 @@ class PrLabel(unittest.TestCase):
             s.reap()
             self.assertEqual(len(s.calls), 25)
 
-    def test_spoofed_head_is_not_labelled(self):
+    def test_any_branch_name_is_labelled_but_a_closed_pr_is_not(self):
         with tempfile.TemporaryDirectory() as tmp:
             s = Scene([pod()], {"w1": "41\n42\n43\n"}, tmp)
-            s.heads = {41: ("someone-else/x", "open"), 42: ("coder/x", "open"), 43: ("coder/y", "closed")}
+            s.heads = {41: ("perf/x", "open"), 42: ("coder/x", "open"), 43: ("coder/y", "closed")}
             s.reap()
-            self.assertEqual([c[1] for c in s.calls], [42])
+            self.assertEqual([c[1] for c in s.calls], [41, 42])
 
     def test_fork_head_is_not_labelled(self):
         with tempfile.TemporaryDirectory() as tmp:
