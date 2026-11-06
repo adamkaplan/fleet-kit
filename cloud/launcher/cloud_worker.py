@@ -4551,17 +4551,15 @@ class Launcher:
                 worker, name = ann(pod, "worker"), pod["metadata"]["name"]
                 if (pod.get("status") or {}).get("phase") != "Running" or not NAME_RE.fullmatch(worker or ""):
                     continue
-                if ann(pod, "idle-nudge") and ann(pod, "role", "worker") != "orchestrator":
-                    nudge_skip(self, pod, worker, name, "-", "already-nudged")
-                if ann(pod, "idle-nudge") or ann(pod, "role", "worker") == "orchestrator":
+                if ann(pod, "role", "worker") == "orchestrator":
                     continue
                 act = (acts or {}).get(name) or self.activity(name)
-                if not act:
-                    nudge_skip(self, pod, worker, name, "-", "probe-unreadable")
-                elif act[0]:
-                    nudge_skip(self, pod, worker, name, "-", "busy")
-                elif act[1] is None:
-                    nudge_skip(self, pod, worker, name, "-", "no-activity-time")
+                # A line is written only when the idle time is KNOWN to be at least the wait. An unreadable probe, a busy pod and a pod
+                # without an activity time have no known idle time, so they get no line.
+                if ann(pod, "idle-nudge"):
+                    if act and not act[0] and act[1] is not None and (now - act[1]).total_seconds() >= IDLE_NUDGE_AFTER_SECONDS:
+                        nudge_skip(self, pod, worker, name, act[1], "already-nudged")
+                    continue
                 if not act or act[0] or act[1] is None:
                     continue
                 idle = int(ann(pod, "idle-seconds", "600"))

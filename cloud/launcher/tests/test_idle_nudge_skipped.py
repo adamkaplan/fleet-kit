@@ -64,9 +64,8 @@ class TestSkipped(unittest.TestCase):
     def test_s2_one_line_each_then_none(self):
         one, two = passes(self.fn)
         got = {a[1]: a[5] for a in one}
-        self.assertEqual(got, {"pod/p1": "busy", "pod/p2": "no-activity-time", "pod/p3": "already-nudged",
-                               "pod/p4": "results-finished", "pod/p5": "probe-unreadable", "pod/p6": "exec-failed"})
-        self.assertEqual(len(one), 6)
+        self.assertEqual(got, {"pod/p3": "already-nudged", "pod/p4": "results-finished", "pod/p6": "exec-failed"})
+        self.assertEqual(len(one), 3)
         self.assertEqual(two, [])
 
     def test_s3_short_idle_or_limit_no_line(self):
@@ -75,6 +74,13 @@ class TestSkipped(unittest.TestCase):
         s2 = Stub(busy=True)
         run(self.fn, s2, mkpod(2, idle="900"))
         self.assertEqual([a for a in s.audits + s2.audits + getattr(s, 'skips', []) + getattr(s2, 'skips', []) if a[2] == "idle-nudge-skipped"], [])
+
+    def test_busy_or_ten_minutes_idle_no_line(self):
+        s = Stub(busy=True)
+        run(self.fn, s, mkpod(1))
+        s2 = Stub(idle_minutes=10)
+        run(self.fn, s2, mkpod(2))
+        self.assertEqual([a for a in s.audits + s2.audits if a[2] == "idle-nudge-skipped"], [])
 
     def test_s4_nudge_unchanged(self):
         s = Stub()
@@ -88,7 +94,7 @@ class TestSkipped(unittest.TestCase):
 class TestMutant(unittest.TestCase):
     def test_s5_control_then_mutant(self):
         one, _ = passes(cw.Launcher.send_idle_nudges)
-        self.assertEqual(len(one), 6)   # control first
+        self.assertEqual(len(one), 3)   # control first
         m = tn.mutant("nudge_skip(self, ", "(lambda *a: None)(")
         one, _ = passes(m)
         self.assertEqual(len(one), 0)
