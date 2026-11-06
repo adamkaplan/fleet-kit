@@ -67003,6 +67003,7 @@ TestSamples, TestCensus, TestMutants, TestCensusDocumentation = _census.TestSamp
 TestIndependentImpactNoPaths, TestNoPathsMutants = importlib.import_module("test_1041").build(TestImpactHold, FAKE_GH, LEDGER_HEAD, LEDGER_NEW_HEAD)
 TestMacosReader = _census.TestMacosReader   # #1847
 TestNewModuleDemands = importlib.import_module("test_new_module_demands").TestNewModuleDemands
+TestPinScanSearch, TestPinScanWords, TestPinScanModes, TestPinScanChecks = (_pp := importlib.import_module("test_pin_scan")).TestPinScanSearch, _pp.TestPinScanWords, _pp.TestPinScanModes, _pp.TestPinScanChecks   # #2092
 TestGuardSet = importlib.import_module("test_guard_set").TestGuardSet   # #2055
 TestTriageParkedDigest = importlib.import_module("test_triage_parked_digest").build(Base, TestTriageDigest, sb)   # #2090
 # The bin-set table test (#1457).

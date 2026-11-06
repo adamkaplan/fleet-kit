@@ -1,0 +1,354 @@
+#!/usr/bin/env python3
+"""pin-scan: the OTHER lines of the repository that a plan's edits would break, printed before the plan is sent (ask #2092).
+
+    tools/pin-scan --plan EDITS.json [--root DIR] [--no-checks] [--check NAME=CMD ...]
+    tools/pin-scan --plan - [--root DIR]          (the list on standard input)
+
+The input is a MODE. --plan is the only mode today; a mode is a function that turns its input into the list of edits {file, old, new}
+(MODES below), and the search and the checks read that list alone, so another mode (a diff's removed text) is one more entry.
+
+EDITS.json is a list of planned edits: [{"file": "...", "old": "exact old text", "new": "new text"}].
+
+Part 1, a search (nothing is run, nothing is written). Each line of a tracked file that is not itself covered by an edit and that is
+  quote    quotes the old text or one of its distinctive lines (a stripped line of 12 or more characters);
+  digest   holds the SHA-256 of a changed file (the digest of the file as it is now);
+  quote-words  the same words in another punctuation (prose that states a code set, a test that spells it as a tuple);
+  count    holds a number equal to the row or entry count of the changed table (the run of `|` or ` | `-separated rows, `-` items or quoted
+           entries that holds the old text), with a word of rows or entries (or `len(`) on the line and the table's name in the file's path or within 3 lines;
+  mutant   passes the old text to a mutation helper (a call named mutat*, plant*, anchor or replace on the line or the 3 lines before).
+is printed as `file:line: kind: text`, one per line. A line that is a mutant is not also printed as a quote.
+
+Part 2, the scanning checks (skipped by --no-checks). The edits are applied to a scratch copy (git worktree of HEAD under /tmp,
+removed at the end) and each check is run there; a failing check prints `FAIL name: file:line` (the last file:line its output
+names, else the check's command). The real tree is never written. --check NAME=CMD replaces the default checks.
+
+After the checks, every tracked test_*.py that READS an edited file (its path, file name or module name appears in it) is run there
+(60 s each) and, if it failed, again at the unedited HEAD; only the failures that are NEW with the edits print as `FAIL reader FILE: test (reads EDITED)`.
+
+Exit 0 always when it ran (it informs); exit 2 with one plain line for an unreadable list or an old text absent from its file.
+Standard library only."""
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DEFAULT_CHECKS = [
+    ("wired-tests", "env -u PYTHONDONTWRITEBYTECODE python3 bin/test-switchboard -k TestEveryTestFileIsWired -k TestWiredCheckPlanted -k TestSupportRebinding"),
+    ("neutral-names", "bash bin/test-cloud-neutral-names"),
+    ("chain-list", "env -u PYTHONDONTWRITEBYTECODE python3 cloud/launcher/tests/test_chain_list.py"),
+    ("chain-time", "env -u PYTHONDONTWRITEBYTECODE python3 cloud/launcher/tests/test_chain_time.py"),
+]
+MIN_LINE = 12
+READER_TIMEOUT = 60
+MAX_FILES = 6
+MUTANT_CALL = re.compile(r"(mutat\w*|plant\w*|anchor\w*|replace)\s*\(", re.I)
+ROW_WORDS = re.compile(r"\b(rows?|entr(?:y|ies)|rules?|items?|actions?)\b|len\(", re.I)
+
+
+NGRAM = 6
+
+
+def words(text):
+    return re.sub(r"[^a-z0-9]+", " ", text.lower()).split()
+
+
+def grams(old):
+    """The word runs (6 words, or the whole line when it has 5) of each distinctive line of the old text, in a punctuation-blind form."""
+    out = set()
+    for ln in distinctive(old):
+        w = words(ln)
+        n = min(NGRAM, len(w))
+        if n >= 5:
+            out.update(" ".join(w[i:i + n]) for i in range(len(w) - n + 1))
+    return out
+
+
+class Bad(Exception):
+    pass
+
+
+def git_files(root):
+    out = subprocess.run(["git", "ls-files", "-z"], cwd=root, capture_output=True).stdout.decode("utf-8", "replace")
+    return [f for f in out.split("\0") if f]
+
+
+def read_text(root, rel):
+    try:
+        with open(os.path.join(root, rel), "rb") as fh:
+            data = fh.read()
+    except OSError:
+        return None
+    if b"\0" in data:
+        return None
+    return data.decode("utf-8", "replace")
+
+
+def distinctive(old):
+    seen = []
+    for ln in old.splitlines():
+        s = ln.strip()
+        if len(s) >= MIN_LINE and s not in seen:
+            seen.append(s)
+    return seen
+
+
+def table_block(text, old):
+    """(count, name_words) of the run of table-like lines that holds `old` in `text`; (None, []) when none."""
+    at = text.find(old)
+    if at < 0:
+        return None, []
+    lines = text.splitlines()
+    n = text.count("\n", 0, at)
+    def kind(s):
+        s = s.strip()
+        if s.startswith("|"):
+            return "|"
+        if s.startswith("- "):
+            return "-"
+        if s[:1] in "\"'":
+            return "q"
+        if not s.startswith("#") and " | " in s:
+            return "|"
+        return None
+    k = kind(lines[n]) if n < len(lines) else None
+    if not k:
+        return None, []
+    a = b = n
+    while a > 0 and kind(lines[a - 1]) == k:
+        a -= 1
+    while b + 1 < len(lines) and kind(lines[b + 1]) == k:
+        b += 1
+    block = lines[a:b + 1]
+    if k == "|":
+        sep = any(re.fullmatch(r"[\s|:-]+", x) for x in block)
+        block = [x for x in block if not re.fullmatch(r"[\s|:-]+", x)]
+        if sep:
+            block = block[1:]   # the header row
+    return len(block), []
+
+
+def search(root, edits):
+    files = git_files(root)
+    edited = {e["file"] for e in edits}
+    found = []
+    digests = {}
+    counts = []
+    for e in edits:
+        text = read_text(root, e["file"])
+        if text is None or e["old"] not in text:
+            raise Bad("the old text is not in %s" % e["file"])
+        digests[hashlib.sha256(text.encode("utf-8")).hexdigest()] = e["file"]
+        n, _ = table_block(text, e["old"])
+        if n is not None and e["old"].count("\n") != e["new"].count("\n"):
+            stem = os.path.splitext(os.path.basename(e["file"]))[0]
+            counts.append((n, e["file"], {stem, stem.replace("-", "_"), stem.replace("_", "-"), stem.replace("_", " ").replace("-", " ")}))
+    quotes = []
+    for e in edits:
+        quotes.append((e["file"], e["old"], distinctive(e["old"])))
+    spans = {}   # an edited file: the line numbers its own edits cover (those are not "other" lines)
+    for e in edits:
+        text = read_text(root, e["file"])
+        a = text.find(e["old"])
+        first = text.count("\n", 0, a) + 1
+        spans.setdefault(e["file"], set()).update(range(first, first + e["old"].count("\n") + 1))
+    texts = {rel: read_text(root, rel) for rel in files}
+    common = set()   # a distinctive line found in more than MAX_FILES files is boilerplate, not a pin
+    for f, old, parts in quotes:
+        for part in parts:
+            if "\n" in old and sum(1 for t in texts.values() if t and part in t) > MAX_FILES:
+                common.add(part)
+    quotes = [(f, old, [x for x in parts if x not in common]) for f, old, parts in quotes]
+    allgrams = set()
+    for e in edits:
+        allgrams |= grams(e["old"])
+    for rel in files:
+        text = texts[rel]
+        if text is None:
+            continue
+        lines = text.splitlines()
+        for i, ln in enumerate(lines):
+            if i + 1 in spans.get(rel, ()):
+                continue
+            hit = None
+            for f, old, parts in quotes:
+                for p in ([old] if "\n" not in old and len(old.strip()) >= 1 else []) + parts:
+                    if p and p in ln:
+                        hit = p
+                        break
+                if hit:
+                    break
+            if not hit and allgrams:
+                w = words(ln)
+                joined = " ".join(w)
+                if any(g in joined for g in allgrams):
+                    hit = "~"
+            if hit:
+                ctx = "\n".join(lines[max(0, i - 3):i + 1])
+                kind = "mutant" if MUTANT_CALL.search(ctx) else ("quote" if hit != "~" else "quote-words")
+                found.append((rel, i + 1, kind, ln.strip()))
+                continue
+            for d, f in digests.items():
+                if d in ln:
+                    found.append((rel, i + 1, "digest", ln.strip()))
+            for n, f, names in counts:
+                if re.search(r"(?<![\w.])%d(?![\w.])" % n, ln) and ROW_WORDS.search(ln):
+                    near = rel + "\n" + "\n".join(lines[max(0, i - 3):i + 4])
+                    if any(nm and nm in near for nm in names):
+                        found.append((rel, i + 1, "count", ln.strip()))
+    return found
+
+
+def readers(wt, edits):
+    """(test file, edited file) for each tracked test file that READS an edited file: its path, its file name or its module name appears in the test."""
+    out = []
+    edited = {e["file"] for e in edits}
+    for rel in git_files(wt):
+        base = os.path.basename(rel)
+        if rel in edited or not base.startswith("test_") or not base.endswith(".py"):
+            continue
+        text = read_text(wt, rel)
+        if text is None:
+            continue
+        for f in sorted(edited):
+            stem = os.path.splitext(os.path.basename(f))[0]
+            names = {f, os.path.basename(f)}
+            if f.endswith(".py"):
+                names.add(stem)
+            if any(re.search(r"(?<![\w.-])%s(?![\w-])" % re.escape(n), text) for n in names if n):
+                out.append((rel, f))
+                break
+    return out
+
+
+def run_test_file(wt, rel):
+    """The set of failing test names of one test file ('<file>' alone when it did not run to the end)."""
+    env = {k: v for k, v in os.environ.items() if k != "PYTHONDONTWRITEBYTECODE"}
+    try:
+        r = subprocess.run([sys.executable, rel], cwd=wt, capture_output=True, text=True, timeout=READER_TIMEOUT, env=env)
+    except subprocess.TimeoutExpired:
+        return {rel + " (timed out)"}
+    if r.returncode == 0:
+        return set()
+    names = set(re.findall(r"^(?:FAIL|ERROR): (.+)$", r.stderr + r.stdout, re.M))
+    return names or {rel + " (exit %d)" % r.returncode}
+
+
+def run_readers(wt, edits):
+    """Run every reader of an edited file with the edits, then (only those that failed) at the unedited HEAD; return the NEW failures."""
+    new = []
+    failing = []
+    for rel, f in readers(wt, edits):
+        bad = run_test_file(wt, rel)
+        if bad:
+            failing.append((rel, f, bad))
+    if not failing:
+        return new
+    originals = {}
+    for e in edits:
+        p = os.path.join(wt, e["file"])
+        with open(p, encoding="utf-8") as fh:
+            originals[p] = fh.read()
+    subprocess.run(["git", "checkout", "--", "."], cwd=wt, capture_output=True)
+    try:
+        for rel, f, bad in failing:
+            was = run_test_file(wt, rel)
+            new.extend((rel, f, n) for n in sorted(bad - was))
+    finally:
+        for p, t in originals.items():
+            with open(p, "w", encoding="utf-8") as fh:
+                fh.write(t)
+    return new
+
+
+def run_checks(root, edits, checks, readers_on=True):
+    scratch = tempfile.mkdtemp(prefix="pin-scan-", dir="/tmp")
+    wt = os.path.join(scratch, "wt")
+    failed = []
+    try:
+        r = subprocess.run(["git", "worktree", "add", "--detach", wt, "HEAD"], cwd=root, capture_output=True, text=True)
+        if r.returncode:
+            raise Bad("cannot make the scratch copy: " + r.stderr.strip()[:200])
+        for e in edits:
+            p = os.path.join(wt, e["file"])
+            with open(p, encoding="utf-8") as fh:
+                t = fh.read()
+            with open(p, "w", encoding="utf-8") as fh:
+                fh.write(t.replace(e["old"], e["new"], 1))
+        for name, cmd in checks:
+            try:
+                r = subprocess.run(cmd, shell=True, cwd=wt, capture_output=True, text=True, timeout=900)
+            except subprocess.TimeoutExpired:
+                failed.append((name, "timed out: " + cmd))
+                continue
+            if r.returncode:
+                out = (r.stdout + "\n" + r.stderr)
+                hits = re.findall(r'(?:File ")?([\w./-]+\.\w+)(?::|", line )(\d+)', out)
+                where = "%s:%s" % hits[-1] if hits else cmd
+                failed.append((name, where))
+        if readers_on:
+            for rel, f, n in run_readers(wt, edits):
+                failed.append(("reader " + rel, "%s (reads %s)" % (n, f)))
+    finally:
+        subprocess.run(["git", "worktree", "remove", "--force", wt], cwd=root, capture_output=True)
+        shutil.rmtree(scratch, ignore_errors=True)
+    return failed
+
+
+def edits_from_plan(arg):
+    try:
+        raw = sys.stdin.read() if arg == "-" else open(arg, encoding="utf-8").read()
+        edits = json.loads(raw)
+        assert isinstance(edits, list) and all(isinstance(e, dict) and {"file", "old", "new"} <= set(e) for e in edits)
+    except (OSError, ValueError, AssertionError):
+        raise Bad("the edits are not a readable JSON list of {file, old, new}")
+    return edits
+
+
+MODES = {"--plan": edits_from_plan}
+
+
+def main(argv):
+    root = HERE
+    checks = None
+    run = True
+    src = None
+    i = 0
+    try:
+        while i < len(argv):
+            a = argv[i]
+            if a == "--root":
+                root = os.path.abspath(argv[i + 1]); i += 2
+            elif a == "--no-checks":
+                run = False; i += 1
+            elif a == "--check":
+                name, _, cmd = argv[i + 1].partition("=")
+                checks = (checks or []) + [(name, cmd)]; i += 2
+            elif a in MODES:
+                if src is not None or i + 1 >= len(argv):
+                    raise Bad("usage: tools/pin-scan --plan EDITS.json [--root DIR] [--no-checks] [--check NAME=CMD]")
+                src = (a, argv[i + 1]); i += 2
+            else:
+                raise Bad("usage: tools/pin-scan --plan EDITS.json [--root DIR] [--no-checks] [--check NAME=CMD]")
+        if src is None:
+            raise Bad("usage: tools/pin-scan --plan EDITS.json [--root DIR] [--no-checks] [--check NAME=CMD]")
+        edits = MODES[src[0]](src[1])
+        found = search(root, edits)
+        for rel, n, kind, text in sorted(set(found)):
+            print("%s:%d: %s: %s" % (rel, n, kind, text[:160]))
+        print("found %d line(s)" % len(set(found)))
+        if run:
+            for name, where in run_checks(root, edits, checks or DEFAULT_CHECKS):
+                print("FAIL %s: %s" % (name, where))
+    except Bad as e:
+        print("pin-scan: %s" % e)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
