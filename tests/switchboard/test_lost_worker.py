@@ -925,5 +925,71 @@ class TestAskIsItsOwn(unittest.TestCase):
         self.assertEqual(load()._ask_of("cr2244", {}), "cr2244")
 
 
+class TestPodReportedLostOnlyWhenSilent(unittest.TestCase):
+    """#2255: the case of 6 November 2026: a pod past its hard deadline that is stopped seconds later, or still noting and pushing, is not lost."""
+    G1 = "        if now - deadline <= GRACE:\n"
+    G2 = "        if now - newest <= GRACE and newest > c[\"at\"]:\n"
+
+    def module(self, mutant=False):
+        src = (REPO / "bin" / "lost_worker.py").read_text()
+        if mutant:   # today's rule: no grace and no activity read
+            for gate in (self.G1, self.G2):
+                self.assertEqual(src.count(gate), 1)
+                src = src.replace(gate, gate.replace(gate.strip()[3:-1], "False"))
+        mod = types.ModuleType("lost_worker_gate")
+        exec(compile(src, "lost_worker_gate", "exec"), mod.__dict__)
+        return mod
+
+    def lost(self, mod, setup, at=NOW):
+        r = Rig(mod)
+        setup(r)
+        return [x for x in r.passes(at=at) if x["kind"] == "pod_no_stop"]
+
+    def seconds_past(self, r):   # the pod tg: deadline 3 s before the check, launcher actions after the launch
+        r.created("tg", deadline=NOW - 3)
+
+    def noting(self, r):   # renewal, nudge, wip note, final note after the launch, the last one 10 s ago; deadline 8 minutes ago
+        r.created("tg", deadline=NOW - 480)
+        for back, action in ((3000, "renew"), (2400, "idle-nudge"), (1200, "wip-note"), (10, "final-note")):
+            line(r.launcher, ts=stamp(NOW - back), worker="tg", runtime_id="pod/tg", action=action, ok=True, reason="")
+
+    def pushing(self, r):
+        r.created("ti", deadline=NOW - 480)
+        line(r.engine.audit.path, ts=stamp(NOW - 20), actor="x", event="push_watch.sent", subject="ti", detail={})
+
+    def silent(self, r):
+        r.created("cf", deadline=NOW - 3000)
+        line(r.launcher, ts=stamp(NOW - 6000), worker="cf", runtime_id="pod/cf", action="renew", ok=True, reason="")
+
+    def check_s2(self, mod):
+        self.assertEqual(self.lost(mod, self.seconds_past), [], "S2 a pod seconds past its deadline is not lost")
+
+    def check_s3(self, mod):
+        self.assertEqual(self.lost(mod, self.noting), [], "S3 a pod still noting is not lost")
+        self.assertEqual(self.lost(mod, self.pushing), [], "S3 a pod still pushing is not lost")
+
+    def check_s4(self, mod):
+        got = self.lost(mod, self.silent)
+        self.assertEqual(len(got), 1, "S4 a silent pod is reported once")
+        self.assertEqual(got[0]["at"], NOW - 6000, "S4 the last event is the newest action, not the launch")
+
+    def test_s2_a_pod_stopped_seconds_after_its_deadline_raises_no_notice(self):
+        self.check_s2(self.module())
+
+    def test_s3_a_pod_still_noting_or_pushing_raises_no_notice(self):
+        self.check_s3(self.module())
+
+    def test_s4_a_silent_pod_is_still_reported_with_its_newest_event(self):
+        self.check_s4(self.module())
+
+    def test_controls_today_s_rule_raises_the_false_notices(self):
+        old = self.module(mutant=True)
+        self.check_s4(old)   # the control: the silent pod is reported on today's rule too
+        for check, text in ((self.check_s2, "S2 a pod seconds"), (self.check_s3, "S3 a pod still")):
+            with self.assertRaises(AssertionError) as caught:
+                check(old)
+            self.assertIn(text, str(caught.exception))
+
+
 if __name__ == "__main__":
     unittest.main()
