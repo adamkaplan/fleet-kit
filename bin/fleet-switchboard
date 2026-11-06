@@ -18278,14 +18278,34 @@ def once_pr_view_runner(inner):
     return run
 
 
+# #2230: the ONE table of `gh api` flags that carry a field or body (each makes the call a POST): long names (exact and `--x=VALUE`) and short names (exact and attached `-xVALUE`)
+GH_API_FIELD_LONG = ("--field", "--raw-field", "--input")
+GH_API_FIELD_SHORT = ("-f", "-F")
+GH_API_BUNDLE_WRITE = "fFX"   # a short-flag cluster such as `-if a=b` or `-iXPOST` (pflag bundles shorthands): any of these letters in it is a field or a method: not a read
+
+
+def gh_api_field_flag(a):
+    """True for a `gh api` flag that carries a field or body: a long spelling, a short one (exact or attached), or a bundled cluster that holds one."""
+    if any(a == n or a.startswith(n + "=") for n in GH_API_FIELD_LONG):
+        return True
+    if a.startswith("--") or not a.startswith("-"):
+        return False
+    return a.startswith(GH_API_FIELD_SHORT) or (not a.startswith("-X") and any(c in a[1:] for c in GH_API_BUNDLE_WRITE))
+
+
 def gate_read_only(argv):
     """(#2215) True for a gh argv that only READS: pr view|diff|list|checks, run view|list, issue view|list, repo view, or a `gh api` without a method, field or input flag. A write is never one."""
     args = list(argv[1:])
     if args[:2] in (["pr", "view"], ["pr", "diff"], ["pr", "list"], ["pr", "checks"], ["run", "view"], ["run", "list"], ["issue", "view"], ["issue", "list"], ["repo", "view"]):
         return True
     if args[:1] == ["api"]:
-        flags = [a for a in args[1:] if a.startswith("-")]
-        return not any(f in ("-X", "--method", "-f", "-F", "--field", "--raw-field", "--input") or f.startswith(("-X", "--method=", "--field=", "--raw-field=", "--input=")) for f in flags)
+        rest = args[1:]
+        verbs = [rest[i + 1] if a in ("-X", "--method") and i + 1 < len(rest) else a.split("=", 1)[1] if a.startswith("--method=") else a[2:] if a.startswith("-X") and a != "-X" else None
+                 for i, a in enumerate(rest) if a in ("-X", "--method") or a.startswith(("-X", "--method="))]
+        if any((v or "").upper() != "GET" for v in verbs):   # #2230: `--method GET` is a read (`_gh_write(..., "GET")` says it so): only another verb makes it a write
+            return False
+        flags = [a for a in rest if a.startswith("-")]
+        return not any(gh_api_field_flag(f) for f in flags)
     return False
 
 
@@ -18350,7 +18370,7 @@ def _gates_check(args, runner, now):
             def work():
                 try:
                     ns = types.SimpleNamespace(pr=args.pr, plan=args.plan, ask=args.ask, head=None)
-                    ctx = _ledger_context(ns, once_pr_view_runner(runner), now, False, floor=True)   # #2215: the same `gh pr view` is asked once
+                    ctx = _ledger_context(ns, once_pr_view_runner(runner), now, False, floor=(args.check_for == "merge"))   # #2215: the same `gh pr view` is asked once; #2230: the floor (G6, G6b) and the approval (G0c) count only for a merge (REQUIRED_FOR), so a ready check no longer waits on their reads
                     box["report"] = plan_ledger.evaluate_gates(ctx.plan, ctx.entries, ctx.problem,
                                                                 ctx.facts if ctx.facts.get("head") or ctx.facts.get("body") else None, ctx.pr,
                                                                 now=now())
