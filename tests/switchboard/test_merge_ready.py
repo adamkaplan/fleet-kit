@@ -24,6 +24,7 @@ class FakeGitHub:
         self.reviews, self.events = [], []
         self.checks = [{"name": "test", "conclusion": "SUCCESS"}]
         self.required = {"contexts": ["test"], "checks": [{"context": "test"}]}
+        self.rules = []   # the rules that apply to the base branch (rulesets)
         self.calls = []
 
     def __call__(self, argv, **kwargs):
@@ -41,7 +42,11 @@ class FakeGitHub:
             elif path.endswith("/events"):
                 answer = self.events
             elif path.endswith("/required_status_checks"):
+                if self.required is None:   # a repository with rulesets, no branch protection
+                    return subprocess.CompletedProcess(argv, 1, "", "gh: Branch not protected (HTTP 404)")
                 answer = self.required
+            elif "/rules/branches/" in path:
+                answer = self.rules
             else:
                 return subprocess.CompletedProcess(argv, 1, "", "HTTP 404")
         else:
@@ -103,6 +108,44 @@ class TestMergeReady(Base):
         self.gh.reviews = [review("DISMISSED", OLD, "rev", rid=5)]
         self.gh.events = [{"event": "review_dismissed", "actor": {"login": "maint"}, "dismissed_review": {"review_id": 5}}]
         self.refused("rev's review at aaaaaaaa was dismissed by maint")
+
+    def test_s2_a_dismissed_approval_is_ready_with_a_note(self):
+        self.gh.reviews = [review("DISMISSED", OLD, "rev", rid=5)]
+        self.gh.events = [{"event": "review_dismissed", "actor": {"login": "github-actions"}, "dismissed_review": {"review_id": 5, "state": "approved"}}]
+        code, out, err = self.run_ready()
+        self.assertEqual((code, out.strip()), (0, "READY %s (rev's approval at aaaaaaaa was dismissed by github-actions (not a refusal))" % PR), err)
+
+    def test_s2_a_dismissed_request_for_changes_is_refused_naming_the_dismisser(self):
+        self.gh.reviews = [review("DISMISSED", OLD, "rev", rid=5)]
+        self.gh.events = [{"event": "review_dismissed", "actor": {"login": "maint"}, "dismissed_review": {"review_id": 5, "state": "changes_requested"}}]
+        self.refused("rev's review at aaaaaaaa was dismissed by maint")
+
+    def test_s2_a_dismissed_approval_whose_body_blocks_is_refused(self):
+        self.gh.reviews = [review("DISMISSED", OLD, "rev", body="BLOCK: no", rid=5)]
+        self.gh.events = [{"event": "review_dismissed", "actor": {"login": "maint"}, "dismissed_review": {"review_id": 5, "state": "approved"}}]
+        self.refused("dismissed by maint")
+
+    def test_s2_required_checks_are_read_from_the_rulesets_when_there_is_no_branch_protection(self):
+        self.gh.required = None
+        self.gh.rules = [{"type": "pull_request"}, {"type": "required_status_checks", "parameters": {"required_status_checks": [{"context": "test"}, {"context": "lint"}]}}]
+        self.refused("required check lint has no result")
+        self.gh.checks = [{"name": "test", "conclusion": "SUCCESS"}, {"name": "lint", "conclusion": "SUCCESS"}]
+        code, out, err = self.run_ready()
+        self.assertEqual((code, out.strip()), (0, "READY " + PR), err)
+        self.gh.checks = [{"name": "test", "conclusion": "FAILURE"}, {"name": "lint", "conclusion": "SUCCESS"}]
+        self.refused("required check test is FAILURE")
+
+    def test_s2_neither_protection_nor_rulesets_is_a_note_not_a_refusal(self):
+        self.gh.required, self.gh.rules = None, []
+        code, out, err = self.run_ready()
+        self.assertEqual((code, out.strip()), (0, "READY %s (no required checks configured)" % PR), err)
+
+    def test_s2_a_ruleset_read_that_errors_is_refused_naming_the_error(self):
+        self.gh.required = None
+        inner = self.gh
+        self.runner = lambda argv, **kw: (subprocess.CompletedProcess(argv, 1, "", "HTTP 500") if any("/rules/branches/" in a for a in argv)
+                                          else inner(argv, **kw)) if os.path.basename(argv[0]) == "gh" else self.world.route(argv, **kw)
+        self.refused("the required checks could not be read")
 
     def test_s2_a_missing_captain_label_is_refused(self):
         self.gh.labels = []

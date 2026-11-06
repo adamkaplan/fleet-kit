@@ -1,7 +1,7 @@
 # ---------------------------------------------------------------- `merge-ready` (ask #2265)
 #
 # Before an admin merge a lane runs `merge-ready <owner/repo#N>`. It states, in one place, the facts four wrong admin merges got wrong: the base is the repository's
-# default branch; no review at ANY commit asked for changes or blocked (a dismissed review is named with who dismissed it and counts as refused); the captain label the
+# default branch; no review at ANY commit asked for changes or blocked (a dismissed request for changes or block is named with who dismissed it and counts as refused; a dismissed approval is a note); the captain label the
 # repository's `captain_labels` entry names is on the pull request; every required check is green at the current head. It reads (GET only) and prints READY (exit 0) or one
 # line per failed fact (exit 1). `--override "<who ordered it>: <reason>"` records an owner-ordered fix-forward merge: it appends ONE line to the switchboard's own
 # audit file (a local write, never a GitHub write), prints OVERRIDDEN, and exits 6. It does not merge anything and it blocks nothing.
@@ -49,7 +49,7 @@ def merge_ready_facts(engine, runner, repo, number):
     """The list of failed facts (one line each) for the pull request. Raises NoticeError when a read fails: nothing is guessed."""
     pr = read_pr_json(engine, repo, number)
     head, base = str(pr.get("headRefOid") or ""), str(pr.get("baseRefName") or "")
-    failed = []
+    failed, dismissed_notes = [], []
     default = (_mr_dicts(_mr_get(engine, runner, repo, "repos/%s" % repo)) or [{}])[0].get("default_branch")
     if not default:
         failed.append("base: the default branch of %s could not be read" % repo)
@@ -57,29 +57,48 @@ def merge_ready_facts(engine, runner, repo, number):
         failed.append("base: the pull request is into %s, not the default branch %s" % (base or "(none)", default))
     reviews = _mr_dicts(_mr_get(engine, runner, repo, "repos/%s/pulls/%d/reviews" % (repo, number), True))
     events = _mr_dicts(_mr_get(engine, runner, repo, "repos/%s/issues/%d/events" % (repo, number), True))
-    dismissers = {}
+    dismissers, was = {}, {}
     for event in events:
         if event.get("event") == "review_dismissed" and isinstance(event.get("dismissed_review"), dict):
             dismissers[event["dismissed_review"].get("review_id")] = _mr_login(event.get("actor"))
+            was[event["dismissed_review"].get("review_id")] = str(event["dismissed_review"].get("state") or "").upper()
     for review in reviews:   # EVERY review at EVERY commit, never the latest per reviewer
         state, body = str(review.get("state") or "").upper(), str(review.get("body") or "")
         at, who = str(review.get("commit_id") or "")[:8] or "an unknown commit", _mr_login(review.get("user"))
-        if state == "DISMISSED":
-            failed.append("review: %s's review at %s was dismissed by %s (a dismissed review counts as refused)" % (who, at, dismissers.get(review.get("id"), "someone not found in the events")))
+        by = dismissers.get(review.get("id"), "someone not found in the events")
+        if state == "DISMISSED" and was.get(review.get("id")) == "APPROVED" and not (_MR_BLOCK_WORD.match(body) or _MR_BLOCK_FINDING.search(body)):
+            dismissed_notes.append("%s's approval at %s was dismissed by %s (not a refusal)" % (who, at, by))
+        elif state == "DISMISSED":
+            failed.append("review: %s's review at %s was dismissed by %s (a dismissed request for changes or block counts as refused)" % (who, at, by))
         elif state == "CHANGES_REQUESTED" or _MR_BLOCK_WORD.match(body) or _MR_BLOCK_FINDING.search(body):
             failed.append("review: %s requested changes or blocked at %s%s" % (who, at, "" if at == head[:8] else " (an earlier head than %s)" % (head[:8] or "unknown")))
     captain = (engine.config.get("captain_labels") or {}).get(repo)
     names = {str(l.get("name")) for l in _mr_dicts(pr.get("labels") or [])}
     if captain and captain not in names:
         failed.append("captain: the required captain label %s is missing" % captain)
-    notes = [] if captain else ["no captain rule"]
+    notes = ([] if captain else ["no captain rule"]) + dismissed_notes
+    required, configured = set(), False
     try:
-        protection = (_mr_dicts(_mr_get(engine, runner, repo, "repos/%s/branches/%s/protection/required_status_checks" % (repo, base))) or [{}])[0]
+        protection = _mr_dicts(_mr_get(engine, runner, repo, "repos/%s/branches/%s/protection/required_status_checks" % (repo, base)))
+        if protection:   # branch protection, when present
+            configured = True
+            required |= set(protection[0].get("contexts") or []) | {c.get("context") for c in _mr_dicts(protection[0].get("checks") or [])}
     except NoticeError as err:
-        protection = None
+        if "404" not in str(err):
+            failed.append("checks: the required checks could not be read (%s)" % _one_line(str(err), 120))
+            return failed, notes
+    try:   # the rulesets that apply to the base branch
+        for rule in _mr_dicts(_mr_get(engine, runner, repo, "repos/%s/rules/branches/%s" % (repo, base))):
+            if rule.get("type") == "required_status_checks":
+                configured = True
+                params = rule.get("parameters") if isinstance(rule.get("parameters"), dict) else {}
+                required |= {c.get("context") for c in _mr_dicts(params.get("required_status_checks") or [])}
+    except NoticeError as err:
         failed.append("checks: the required checks could not be read (%s)" % _one_line(str(err), 120))
-    if protection is not None:
-        required = set(protection.get("contexts") or []) | {c.get("context") for c in _mr_dicts(protection.get("checks") or [])}
+        return failed, notes
+    if not configured:
+        notes.append("no required checks configured")
+    else:
         seen = {}
         for check in _mr_dicts(pr.get("statusCheckRollup") or []):
             seen[str(check.get("name") or check.get("context"))] = str(check.get("conclusion") or check.get("state") or check.get("status") or "").upper()
@@ -112,7 +131,7 @@ def cmd_merge_ready(args, runner, now):
         return EXIT_ERROR   # a read that failed is never READY
     ref = "%s#%d" % (repo, number)
     if not failed:
-        print("READY %s%s" % (ref, " (no captain rule)" if notes else ""))
+        print("READY %s%s" % (ref, "".join(" (%s)" % n for n in notes)))
         return EXIT_OK
     if given is not None:
         engine.audit.append("cli", "merge_ready.override", ref, {"failed": failed, "who": given[0], "reason": given[1]})
@@ -130,7 +149,7 @@ cmd_merge_ready.guard_records = True   # its name says `merge`: on a tree the in
 def add_merge_ready_parsers(sub):
     ready = sub.add_parser("merge-ready", help="Before an admin merge: READY, or one line per failed fact (base, reviews at every commit, hold label, required checks); read-only",
                            description="Reads the pull request (GET only) and says READY (exit 0) only when its base is the default branch, no review at any commit requested changes or "
-                                       "blocked (a dismissed one counts as refused and names who dismissed it), the repository's required hold label is present and every required "
+                                       "blocked (a dismissed request for changes or block counts as refused and names who dismissed it; a dismissed approval is a note), the repository's required hold label is present and every required "
                                        "check is green at the head. Otherwise one line per failed fact, exit 1. --override records an owner-ordered merge in the local audit (exit 6).")
     ready.add_argument("pr", help="The pull request: owner/repo#N or its URL")
     ready.add_argument("--override", metavar="WHO: REASON", help="Record an owner-ordered fix-forward merge by name: one line in the switchboard audit, OVERRIDDEN printed, exit 6")
