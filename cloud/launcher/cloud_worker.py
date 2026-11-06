@@ -2609,6 +2609,8 @@ def ann(pod, key, default=None):
 PR_LABEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9 :._/-]{0,49}", re.ASCII)   # #2269: a label name the launch may carry (no comma: the list is comma-separated)
 PR_LABELLED_MARK = "pr-labelled"                  # the pod annotation (cw/pr-labelled): the pull request numbers already handled, comma-separated; once each
 PR_RECORD_READ = "import os,sys;p=os.path.join(os.environ.get('CW_TMP_DIR','/run/cw-tmp'),'pr-record','numbers');sys.stdout.write(open(p).read(20000) if os.path.isfile(p) else '')"
+PR_LABELS_PER_PASS = 20                           # numbers read from a pod's record per pass; the rest wait for later passes
+PR_LABELS_CUT_TOLD = set()                        # workers whose cut was already said
 PR_LABELS_TOLD = set()                            # (worker, number) whose failure was already reported
 
 
@@ -2633,6 +2635,17 @@ def github_add_labels(token, repo, number, labels):
                                  headers={"Authorization": "Bearer " + token, "Accept": "application/vnd.github+json", "User-Agent": "cw-launcher", "Content-Type": "application/json"})
     with token_mint.open_no_redirect(req, SCOPE_PROBE_SECONDS) as r:
         r.read(100000)
+
+
+def github_pr_head(token, repo, number):
+    """GET /repos/R/pulls/N: (head branch name, state). Raises on any failure."""
+    import urllib.request
+    import token_mint
+    req = urllib.request.Request("https://api.github.com/repos/%s/pulls/%d" % (repo, number), method="GET",
+                                 headers={"Authorization": "Bearer " + token, "Accept": "application/vnd.github+json", "User-Agent": "cw-launcher"})
+    with token_mint.open_no_redirect(req, SCOPE_PROBE_SECONDS) as r:
+        data = json.loads(r.read(1000000).decode("utf-8", "replace"))
+    return str(((data.get("head") or {}).get("ref")) or ""), str(data.get("state") or "")
 
 
 SAFE_VALUE = re.compile(r"[A-Za-z0-9._-]{1,63}", re.ASCII)
@@ -4614,27 +4627,44 @@ class Launcher:
                 todo = [x for x in dict.fromkeys(str(int(x)) for x in seen) if x not in done]
                 if not todo:
                     continue
+                if len(todo) > PR_LABELS_PER_PASS:
+                    todo = todo[:PR_LABELS_PER_PASS]
+                    if worker not in PR_LABELS_CUT_TOLD:
+                        PR_LABELS_CUT_TOLD.add(worker)
+                        out.append((worker, "pull request record holds more than %d numbers; %d are handled per pass, the rest wait" % (PR_LABELS_PER_PASS, PR_LABELS_PER_PASS), 1))
                 repo = _pod_repo(pod)
+                own_branch = _pod_env(pod, "CW_BRANCH")
                 for number in todo:
                     try:
                         if token is None:
                             check_repo_allowed(repo, self.env)
                             token = run_git_token_cmd(git_token_cmd(repo, self.env), repo, dict(os.environ, **self.env), register=lambda *v: self.kube.add_secrets(*v))
                             self.kube.add_secrets(token)
+                        ref, state = (self.pr_head or github_pr_head)(token, repo, int(number))
+                        if state != "open" or not ((own_branch and ref == own_branch) or ref.startswith(worker + "/")):
+                            raise RuntimeError("skipped: head branch %s (%s) is not one this worker could have pushed" % (safe_value(ref), safe_value(state)))
                         (self.add_labels or github_add_labels)(token, repo, int(number), labels)
                         ok, why = True, "labelled %s" % ", ".join(labels)
                     except Exception as e:
                         ok, why = False, "not labelled: %s" % self.kube.scrub(e, 120)
                     done.add(number)
-                    self.kube.annotate(name, (pod.get("metadata") or {}).get("uid"), **{PR_LABELLED_MARK: ",".join(sorted(x for x in done if x))})   # before the report: once
+                    mark_failed = False
+                    try:
+                        self.kube.annotate(name, (pod.get("metadata") or {}).get("uid"), **{PR_LABELLED_MARK: ",".join(sorted(x for x in done if x))})   # before the report: once
+                    except Exception as e:
+                        mark_failed = True
+                        why += "; the done mark failed: %s" % self.kube.scrub(e, 80)
                     self.audit(worker, "pod/" + name, "pr-label", 0.0, ok, "#%s %s" % (number, why))
                     if not ok and (worker, number) not in PR_LABELS_TOLD:
                         PR_LABELS_TOLD.add((worker, number))
                         out.append((worker, "pull request #%s %s" % (number, why), 1))
+                    if mark_failed:
+                        break   # not retried within this pass
             except Exception as e:
                 print("cloud-worker: the pod's pull requests were not labelled: %s" % self.kube.scrub(e, 120), file=sys.stderr)
         return out
 
+    pr_head = None   # a test replaces it: (token, repo, number) -> (head ref, state)
     add_labels = None   # a test replaces it: (token, repo, number, labels)
 
     def send_final_notes(self, pods, now):

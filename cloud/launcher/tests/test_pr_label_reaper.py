@@ -93,6 +93,8 @@ class Scene:
 
         self.launcher = L(self.kube, self.env, lambda: T0, lambda s: None)
         self.launcher.add_labels = self.call
+        self.heads = {}
+        self.launcher.pr_head = lambda token, repo, n: self.heads.get(n, ("coder/b", "open"))
 
     def call(self, token, repo, n, labels):
         self.calls.append((repo, n, list(labels)))
@@ -139,6 +141,31 @@ class PrLabel(unittest.TestCase):
             self.assertEqual((len(first), len(second)), (1, 0), "one failure line, said once")
             self.assertEqual(len(s.calls), 1, "no retry and no label creation")
             self.assertEqual([x["ok"] for x in s.lines()], [False])
+
+    def test_bound_twenty_per_pass(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s = Scene([pod()], {"w1": "".join("%d\n" % n for n in range(1, 26))}, tmp)
+            out = s.reap()
+            self.assertEqual(len(s.calls), 20)
+            self.assertEqual(len([r for r in out if r and "per pass" in r[1]]), 1)
+            s.reap()
+            self.assertEqual(len(s.calls), 25)
+
+    def test_spoofed_head_is_not_labelled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s = Scene([pod()], {"w1": "41\n42\n43\n"}, tmp)
+            s.heads = {41: ("someone-else/x", "open"), 42: ("coder/x", "open"), 43: ("coder/y", "closed")}
+            s.reap()
+            self.assertEqual([c[1] for c in s.calls], [42])
+
+    def test_failed_done_mark_is_not_looped(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s = Scene([pod()], {"w1": "41\n42\n"}, tmp)
+            def boom(*a, **k):
+                raise RuntimeError("annotate down")
+            s.kube.annotate = boom
+            s.reap()
+            self.assertEqual(len(s.calls), 1)
 
     def test_s5_no_option_no_calls(self):
         with tempfile.TemporaryDirectory() as tmp:
