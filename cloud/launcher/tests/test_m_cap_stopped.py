@@ -29,13 +29,20 @@ class Stopped(base.Cap):
         patch.start()
         self.addCleanup(patch.stop)
 
+    def put(self, name, **kw):
+        super().put(name, **kw)
+        path = self.state / "cloud" / (name + ".json")
+        record = json.loads(path.read_text())
+        record["hard_seconds"] = 3600   # the record starts at 2098-12-31T23:00:00Z
+        path.write_text(json.dumps(record))
+
     def write_audit(self, *lines):
         self.audit.parent.mkdir(parents=True, exist_ok=True)
         self.audit.write_text("".join(l if isinstance(l, str) else json.dumps(l) + "\n" for l in lines))
 
     @staticmethod
-    def line(name, action, ok=True):
-        return {"action": action, "runtime_id": "rt-" + name, "ok": ok, "worker": name}
+    def line(name, action, ok=True, ts="2098-12-31T23:30:00Z"):
+        return {"action": action, "runtime_id": "rt-" + name, "ok": ok, "worker": name, "ts": ts}
 
     def count(self):
         return tcw.sb.load_module("cloud_worker").bind(tcw.sb.__dict__).lane_m_workers(self.state, "lane-a")
@@ -83,6 +90,12 @@ class TestScenarios(Stopped):
                          self.line("coder2", "stop"), self.line("coder2", "create"), self.line("coder3", "create"))
         self.assertEqual(self.count(), ["coder1", "coder2", "coder3"])
 
+    def test_s5_an_older_stop_before_the_record_start_does_not_free_it(self):
+        self.put("coder1")
+        self.put("coder2")
+        self.write_audit(self.line("coder1", "create", ts="2098-12-31T21:00:00Z"), self.line("coder1", "stop", ts="2098-12-31T22:00:00Z"), self.line("coder2", "create"), self.line("coder2", "stop"))
+        self.assertEqual(self.count(), ["coder1"])   # coder1's create line was never written; an older run's stop predates the record; coder2's stop is later
+
 
 class TestMutant(unittest.TestCase):
     """A scratch copy of the code OUTSIDE the repository, run in a child process by stub_support.start."""
@@ -111,7 +124,7 @@ class TestMutant(unittest.TestCase):
         applied, code, out = self.child([])
         print("S5 control: exit %d of 0 expected" % code)
         self.assertEqual((applied, code), (0, 0), out[-800:])
-        applied, code, out = self.child([('            if record.get("runtime_id") not in stopped:', "            if True:")])
+        applied, code, out = self.child([('            if when is None or began is None or when <= began:', "            if True:")])
         print("S5 mutant: exit %d, mutations applied %d of 1" % (code, applied))
         self.assertEqual((applied, code), (1, 1), out[-800:])
         self.assertIn(ANCHOR, out)

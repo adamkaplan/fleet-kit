@@ -15,9 +15,25 @@ D: object   # the names that stayed in bin/cloud_worker.py, set by its loader be
 AUDIT_WINDOW_BYTES = 262144   # the same tail window the launcher reads (cloud/launcher/cloud_worker.py last_audit_line)
 
 
+def _epoch(text):
+    try:
+        return datetime.datetime.strptime(text, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+def _started(record):
+    """The record's own start (epoch): hard_deadline minus hard_seconds, else idle_deadline minus idle_seconds; None when neither can be computed."""
+    for deadline, seconds in (("hard_deadline", "hard_seconds"), ("idle_deadline", "idle_seconds")):
+        end, length = _epoch(record.get(deadline)), record.get(seconds)
+        if end is not None and isinstance(length, (int, float)) and not isinstance(length, bool):
+            return end - length
+    return None
+
+
 def _stopped_ids():
-    """The runtime ids whose newest ok `stop` line follows their newest ok `create` line, read from the tail of the launcher's audit file.
-    A missing or unreadable audit gives the empty set: every worker then counts."""
+    """The runtime ids (each with the epoch of its newest ok `stop` line) whose stop follows their newest ok `create` line, read from the tail of the launcher's audit file.
+    A missing or unreadable audit gives an empty map: every worker then counts."""
     try:
         with open(D["_lib"]().audit_path(os.environ), "rb") as handle:
             handle.seek(0, os.SEEK_END)
@@ -35,10 +51,11 @@ def _stopped_ids():
         if not isinstance(rid, str) or not rid or line.get("ok") is not True:
             continue
         if line.get("action") == "create":
-            state[rid] = False
+            state[rid] = None
         elif line.get("action") in ("stop", "delete") and rid in state:
-            state[rid] = True
-    return {rid for rid, stopped in state.items() if stopped}
+            when = _epoch(line.get("ts"))
+            state[rid] = when if when is not None else state[rid]
+    return {rid: when for rid, when in state.items() if when is not None}
 
 
 def lane_m_workers(state, lane):
@@ -49,7 +66,8 @@ def lane_m_workers(state, lane):
             continue
         if (record.get("reports_to") or "(no boss)") == lane:
             stopped = _stopped_ids() if stopped is None else stopped
-            if record.get("runtime_id") not in stopped:
+            began, when = _started(record), stopped.get(record.get("runtime_id"))
+            if when is None or began is None or when <= began:   # a stop counts only when later than the record's own start
                 found.append(str(record.get("worker")))
     return sorted(found)
 
