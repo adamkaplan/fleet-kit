@@ -44,6 +44,29 @@ class TestGateNoWrite(base.TestGateProbeReads):
                      ["gh", "api", "x", "--method", "GET", "-f", "a=b"], ["gh", "api", "x", "--input", "-"], ["gh", "api", "x", "-X", "POST", "--method", "GET"]):
             self.assertFalse(ro(argv), argv)
 
+    def test_a_missing_method_value_is_a_write_not_an_exception(self):
+        ro = direct.load().gate_read_only
+        for argv in (["gh", "api", "x", "-X"], ["gh", "api", "x", "--method"], ["gh", "api", "x", "-X", "GET", "--method"]):
+            self.assertFalse(ro(argv), argv)
+
+    def test_every_field_flag_spelling_makes_the_call_a_write(self):
+        mod = direct.load()
+        spellings = [s for n in mod.GH_API_FIELD_LONG for s in (n, n + "=a=b")] + [s for n in mod.GH_API_FIELD_SHORT for s in (n, n + "a=b")]
+        self.assertEqual(len(spellings), 2 * len(mod.GH_API_FIELD_LONG) + 2 * len(mod.GH_API_FIELD_SHORT))
+        for flag in spellings:
+            with self.subTest(flag=flag):
+                self.assertFalse(mod.gate_read_only(["gh", "api", "x", flag]))
+        self.assertTrue(mod.gate_read_only(["gh", "api", "x", "-H", "Accept: a"]))
+
+    def test_control_the_rule_before_this_pr_gets_these_cases_wrong(self):
+        def old(argv):   # gate_read_only as on origin/integration
+            args = list(argv[1:])
+            flags = [a for a in args[1:] if a.startswith("-")]
+            return not any(f in ("-X", "--method", "-f", "-F", "--field", "--raw-field", "--input") or f.startswith(("-X", "--method=", "--field=", "--raw-field=", "--input=")) for f in flags)
+        new = direct.load().gate_read_only
+        wrong = [a for a in (["gh", "api", "x", "--method", "GET"], ["gh", "api", "x", "-fa=b"], ["gh", "api", "x", "-Fa=b"]) if old(a) != new(a)]
+        self.assertEqual(len(wrong), 3)
+
 
 for name in [n for n in dir(base.TestGateProbeReads) if n.startswith("test_")]:
     setattr(TestGateNoWrite, name, None)   # only this file's own tests

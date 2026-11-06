@@ -18271,6 +18271,15 @@ def once_pr_view_runner(inner):
     return run
 
 
+# #2230: the ONE table of `gh api` flags that carry a field or body (each makes the call a POST): long names (exact and `--x=VALUE`) and short names (exact and attached `-xVALUE`)
+GH_API_FIELD_LONG = ("--field", "--raw-field", "--input")
+GH_API_FIELD_SHORT = ("-f", "-F")
+
+
+def gh_api_field_flag(a):
+    return any(a == n or a.startswith(n + "=") for n in GH_API_FIELD_LONG) or (not a.startswith("--") and a.startswith(GH_API_FIELD_SHORT))
+
+
 def gate_read_only(argv):
     """(#2215) True for a gh argv that only READS: pr view|diff|list|checks, run view|list, issue view|list, repo view, or a `gh api` without a method, field or input flag. A write is never one."""
     args = list(argv[1:])
@@ -18280,10 +18289,10 @@ def gate_read_only(argv):
         rest = args[1:]
         verbs = [rest[i + 1] if a in ("-X", "--method") and i + 1 < len(rest) else a.split("=", 1)[1] if a.startswith("--method=") else a[2:] if a.startswith("-X") and a != "-X" else None
                  for i, a in enumerate(rest) if a in ("-X", "--method") or a.startswith(("-X", "--method="))]
-        if any(v.upper() != "GET" for v in verbs):   # #2230: `--method GET` is a read (`_gh_write(..., "GET")` says it so): only another verb makes it a write
+        if any((v or "").upper() != "GET" for v in verbs):   # #2230: `--method GET` is a read (`_gh_write(..., "GET")` says it so): only another verb makes it a write
             return False
         flags = [a for a in rest if a.startswith("-")]
-        return not any(f in ("-f", "-F", "--field", "--raw-field", "--input") or f.startswith(("--field=", "--raw-field=", "--input=")) for f in flags)
+        return not any(gh_api_field_flag(f) for f in flags)
     return False
 
 
