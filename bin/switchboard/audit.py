@@ -220,3 +220,61 @@ class AuditLog:
                         ok=False, error="%s: %s" % (type(err).__name__, err))
             raise
         self.append(actor, event, subject, outcome or None, phase="result", call=call, ok=True)
+
+
+# ----------------------------------------------------------------- the audit of a GitHub write (#2260)
+
+GITHUB_WRITE_EVENT = "github.write"
+
+
+class GithubAuditRefused(IntentError):
+    """The audit line of a GitHub write could not be written: the write was not made."""
+
+    def __init__(self, why):
+        super().__init__("audit", "the audit line of a GitHub write could not be written, nothing was written: %s" % why)
+
+
+def github_write_subject(repo, endpoint, number):
+    if number is None:
+        found = re.search(r"/(?:issues|pulls|pull)/(\d+)", str(endpoint))
+        number = int(found.group(1)) if found else None
+    return number, "%s#%d" % (repo, number) if number is not None else str(repo)
+
+
+def github_state_audit():
+    """The audit log of the state directory, for a writer that holds no engine (a command run by hand); None when it cannot be opened (the write is then refused)."""
+    try:
+        return AuditLog(ensure_state_dir() / "audit.jsonl")
+    except Exception:
+        return None
+
+
+class github_write:
+    """The ONE audit of a GitHub write: `intent` (the actor, the verb, the endpoint without its query, the repository and number) is appended BEFORE the write, and refused
+    (GithubAuditRefused) when it cannot be written (no audit, or the append fails): then nothing is written. `result` (ok or not) is appended after. The request body is never
+    recorded. Used as a context manager, or by `github_audited`."""
+
+    def __init__(self, audit, actor, verb, endpoint, repo, number=None):
+        if audit is None:
+            raise GithubAuditRefused("there is no audit log (a read-only switchboard)")
+        number, self.subject = github_write_subject(repo, endpoint, number)
+        self.audit, self.actor = audit, actor or "cli"
+        self.detail = {"verb": str(verb).upper(), "endpoint": str(endpoint).split("?", 1)[0], "repo": repo, "number": number}
+        self.call = uuid.uuid4().hex[:12]
+        self.outcome = {}
+        try:
+            self.audit.append(self.actor, GITHUB_WRITE_EVENT, self.subject, self.detail, phase="intent", call=self.call)
+        except Exception as err:
+            raise GithubAuditRefused(type(err).__name__) from None
+
+    def __enter__(self):
+        return self.outcome
+
+    def __exit__(self, kind, err, tb):
+        ok = err is None and self.outcome.get("ok", True)
+        extra = {} if err is None else {"error": type(err).__name__}
+        try:
+            self.audit.append(self.actor, GITHUB_WRITE_EVENT, self.subject, None, phase="result", call=self.call, ok=bool(ok), **extra)
+        except Exception:
+            pass   # the write has been made: its result line failing changes nothing, the intent line is on disk
+        return False

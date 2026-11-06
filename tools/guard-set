@@ -4,12 +4,20 @@
     tools/guard-set [--list FILE]          print `python3 bin/test-switchboard <Class>` per class, then the extras
     tools/guard-set --check [--list FILE]  exit 1 naming each class that no test file defines ("every class of the guard set exists")
 
-A brief says "run the guard set"; a builder runs the printed lines one at a time. A class with a "timeout" (seconds) is printed AFTER the command as a trailing `# timeout N` comment.
+    tools/guard-set --run [--list FILE]    run every printed line in the foreground, one process at a time, each with its own timeout (default 600 s); one summary line per class, a final RESULT line, exit 1 naming each failed or timed-out class
+
+A brief says "run the guard set"; a builder runs `tools/guard-set --run`. A class with a "timeout" (seconds) is printed AFTER the command as a trailing `# timeout N` comment.
 Standard library only.
 """
 import ast
 import json
+import os
+import re
+import shlex
+import signal
+import subprocess
 import sys
+import time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -37,6 +45,59 @@ def lines(data):
     return out + list(data.get("extras", []))
 
 
+DEFAULT_TIMEOUT = 600
+
+
+def entries(data):
+    """(name, argv, timeout) per printed line, in order; an entry may carry its own "cmd" (a shell-free argv string)."""
+    out = []
+    for e in data["classes"]:
+        cmd = e.get("cmd") or "python3 bin/test-switchboard %s" % e["class"]
+        out.append((e["class"], shlex.split(cmd), e.get("timeout") or DEFAULT_TIMEOUT))
+    for x in data.get("extras", []):
+        out.append((x, shlex.split(x), DEFAULT_TIMEOUT))
+    return out
+
+
+def run_one(argv, timeout):
+    """Run in the foreground, wait; on timeout kill the whole process group. Returns (output, timed_out)."""
+    p = subprocess.Popen(argv, cwd=REPO, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, start_new_session=True)
+    try:
+        out, _ = p.communicate(timeout=timeout)
+        return p.returncode, out, False
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(p.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        out, _ = p.communicate()
+        return -9, out or "", True
+
+
+def run_all(data):
+    failed = []
+    for name, argv, timeout in entries(data):
+        t0 = time.time()
+        code, out, timed_out = run_one(argv, timeout)
+        secs = time.time() - t0
+        m = re.search(r"^Ran (\d+) tests?", out, re.M)
+        ran = int(m.group(1)) if m else 0
+        f = re.search(r"FAILED \((.*?)\)", out)
+        nfail = sum(int(n) for n in re.findall(r"(?:failures|errors)=(\d+)", f.group(1))) if f else 0
+        if code != 0 and not nfail:
+            nfail = 1
+        reason = " TIMEOUT after %ds (killed)" % timeout if timed_out else ""
+        print("%s: tests run %d, failed %d, %.1f s%s" % (name, ran, nfail, secs, reason), flush=True)
+        if code != 0:
+            failed.append(name + (" (timed out)" if timed_out else ""))
+            print(out[-2000:], flush=True)
+    if failed:
+        print("RESULT: FAIL, failed: %s" % ", ".join(failed))
+        return 1
+    print("RESULT: PASS")
+    return 0
+
+
 def main(argv):
     path = REPO / "docs" / "guard-set.json"
     if "--list" in argv:
@@ -48,6 +109,8 @@ def main(argv):
         for m in missing:
             print("every class of the guard set exists: FAIL, no test file defines %s" % m)
         return 1 if missing else 0
+    if "--run" in argv:
+        return run_all(data)
     print("\n".join(lines(data)))
     return 0
 

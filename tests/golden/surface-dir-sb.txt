@@ -2573,6 +2573,7 @@ v2_version_of
 valid_description
 validate_app_config
 validate_blocked_alert_config
+validate_captain_labels
 validate_config
 validate_decisions_config
 validate_default_branches
