@@ -53,6 +53,7 @@ def handoff_markdown(issue, parsed):
     return "\n".join(lines)
 
 
+@github_audited(lambda engine, issue, body, author=None, repo=None: (engine.audit, engine.actor, "POST", "repos/%s/issues/%d/comments" % (repo or engine.intents.repo, issue), repo or engine.intents.repo, int(issue)))
 def post_ask_comment(engine, issue, body, author=None, repo=None):
     """Comment on the ask through the configured `gh`. The GitHub writes the switchboard makes: the handoff
     brief, so the record survives (docs: Hand off), and an agent's own comment (`comment`). Signed with
