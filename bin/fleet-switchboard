@@ -18419,7 +18419,7 @@ def merge_gate_gh(config, runner, repo):
     env = dict(env if env is not None else os.environ)
     env.pop(OWN_GH_ENV, None)   # no marker: the real gh is reached by its path (own_gh_path), not through the shim
 
-    @github_audited(lambda argv, own=True: None if gate_read_only(["gh"] + list(argv)) else (github_state_audit(), "cli") + gate_write_shape(argv) + (repo, gate_write_number(argv)),
+    @github_audited(lambda argv, own=True: None if gate_read_only([config["gh"]] + list(argv)) else (github_state_audit(), "cli") + gate_write_shape(argv) + (repo, gate_write_number(argv)),
                     ok_of=lambda result: result[0] == 0, refused=lambda err, *a, **k: (1, "", str(err)))
     def gh(argv, own=True):
         try:
