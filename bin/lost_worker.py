@@ -151,7 +151,7 @@ def _fold(state, sb, lines, source):
             if event == "cloud.created":
                 created[name] = {"at": ts, "deadline": sb.parse_iso(detail.get("hard_deadline")) if isinstance(detail.get("hard_deadline"), str) else None,
                                  "line": raw}
-            elif event in ("push_watch.sent", "push_watch.quiet"):
+            elif event == "push_watch.sent":
                 active[name] = max(ts, active.get(name, 0))
             elif event == "cloud.stopped":
                 stop[name] = max(ts, stop.get(name, 0))

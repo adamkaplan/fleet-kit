@@ -982,6 +982,19 @@ class TestPodReportedLostOnlyWhenSilent(unittest.TestCase):
     def test_s4_a_silent_pod_is_still_reported_with_its_newest_event(self):
         self.check_s4(self.module())
 
+    def quiet_only(self, r):   # the only line in the grace is push_watch.quiet: no push, not a sign of life
+        r.created("tq", deadline=NOW - 480)
+        line(r.engine.audit.path, ts=stamp(NOW - 20), actor="x", event="push_watch.quiet", subject="tq", detail={})
+
+    def test_a_push_watch_quiet_line_is_not_a_sign_of_life(self):
+        self.assertEqual(len(self.lost(self.module(), self.quiet_only)), 1)
+        src = (REPO / "bin" / "lost_worker.py").read_text()
+        old = src.replace('event == "push_watch.sent"', 'event in ("push_watch.sent", "push_watch.quiet")')
+        self.assertNotEqual(old, src)
+        mod = types.ModuleType("lost_worker_head")
+        exec(compile(old, "lost_worker_head", "exec"), mod.__dict__)
+        self.assertEqual(self.lost(mod, self.quiet_only), [], "control: head holds it back")
+
     def test_controls_today_s_rule_raises_the_false_notices(self):
         old = self.module(mutant=True)
         self.check_s4(old)   # the control: the silent pod is reported on today's rule too
