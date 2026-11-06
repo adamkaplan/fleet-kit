@@ -40,7 +40,7 @@ def _stopped_ids():
             handle.seek(max(0, handle.tell() - AUDIT_WINDOW_BYTES))
             lines = handle.read().decode(errors="replace").splitlines()
     except Exception:
-        return set()
+        return {}
     state = {}
     for raw in lines:
         try:
