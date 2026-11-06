@@ -27,3 +27,9 @@ Every GitHub write path, and whether an audit line is written today (before this
 
 `_gh_write` with GET (reads) is not a write. After this change every row above writes one line through
 one helper (`github_write`, bin/switchboard/audit.py), before the write, and the write is not made when the line cannot be written.
+
+Scope and limits:
+
+- The `cloud_*` launcher files (`bin/cloud_*.py`) are out of the guard's scan; the plan for #2260 puts the launcher out of scope.
+- In the merge gate, `gate_read_only` is an allow-list of reads (`pr view|diff|list|checks`, `run view|list`, `issue view|list`, `repo view`, a `gh api` without a method, field or input flag). Any other `gh` call through the gate is audited as a write, and no other call goes through the gate today. If a new read is added (for example `api graphql` or `pr status`), add it to `gate_read_only`.
+- The verb of a `gh api` write is read from `-X X`, `-XX`, `--method X` and `--method=X`; with none it is POST.
