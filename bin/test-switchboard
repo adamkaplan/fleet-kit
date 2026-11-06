@@ -61224,7 +61224,11 @@ class TestV2LightGuards(Base):
             with self.subTest(guard="%s#%d" % key, member=sb.V2_LIGHT_OFF[member] if isinstance(member, int) else member):
                 world, probe = self.scenario(driver)
                 base = self.forbidden(world)
-                self.assertEqual(set(base) - self.ALLOWED, set(), "under light no session read but the write gate's: %s" % dict(base))
+                # A delivery (a write the engine makes whenever something is due, which on a slow runner can come within a scenario's passes) reads the person's last prompt (type=user) and the
+                # recipient's inbox once each. So the inbox reads of the run may not outnumber its write-gate reads: a read with no delivery behind it is still an optional read and fails here.
+                gate = base.get(("session.message.list", "type=user"), 0)
+                extra_reads = {k: v for k, v in base.items() if k not in self.ALLOWED and not (k == ("session.inbox.list", "") and v <= gate)}
+                self.assertEqual(set(extra_reads), set(), "under light no session read but the write gate's: %s" % dict(base))
                 flipped_world, flipped = self.scenario(driver, flip=[found[key]] + [found[t] for t in together])
                 # a reader's guard sits behind its caller's: it is reached only once the caller's is gone, so a pair is reached in the removed run
                 self.assertGreater((flipped if together else probe).touched(*found[key]), 0, "the case never reached this guard")
