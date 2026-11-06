@@ -2664,7 +2664,7 @@ def ann(pod, key, default=None):
 
 PR_LABEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9 :._/-]{0,49}", re.ASCII)   # #2269: a label name the launch may carry (no comma: the list is comma-separated)
 PR_LABELLED_MARK = "pr-labelled"                  # the pod annotation (cw/pr-labelled): the pull request numbers already handled, comma-separated; once each
-PR_RECORD_READ = "import os,sys;p=os.path.join(os.environ.get('CW_TMP_DIR','/run/cw-tmp'),'pr-record','numbers');sys.stdout.write(open(p).read(20000) if os.path.isfile(p) else '')"
+PR_RECORD_READ = "import os,sys;d=os.environ.get('CW_TMP_DIR','/run/cw-tmp');o=[]\nfor p in (os.path.join(d,'pr-record','numbers'),'/run/cw-tmp/pr-record-numbers'):\n if os.path.isfile(p):o+=open(p).read(20000).split()\nsys.stdout.write(' '.join(dict.fromkeys(o)))"
 PR_LABELS_PER_PASS = 20                           # numbers read from a pod's record per pass; the rest wait for later passes
 PR_LABELS_CUT_TOLD = set()                        # workers whose cut was already said
 PR_LABELS_TOLD = set()                            # (worker, number) whose failure was already reported
@@ -2880,6 +2880,7 @@ def render_pod(a, worker, name, now, hard, env, run_names=()):
     pr_labels = clean_pr_labels(getattr(a, "pr_label", None))   # #2269: refused before anything is made when one is not a plain label
     if pr_labels:
         e["CW_PR_LABELS"] = ",".join(pr_labels)
+        e["CW_PR_RECORD"] = "/run/cw-tmp/pr-record-numbers"   # #2277 fix-forward: the published image's client appends here
     comment = review_comment(a.repo)
     if comment:   # the repository's review comment, posted once by the end hook; none configured = no variable
         e["CW_REVIEW_COMMENT"] = comment

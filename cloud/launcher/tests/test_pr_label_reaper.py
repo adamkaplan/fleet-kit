@@ -217,5 +217,55 @@ class Mutant(unittest.TestCase):
         self.assertIn(ANCHOR, p.stdout)
 
 
+RECORD_ANCHOR = "the pod env does not carry CW_PR_RECORD"
+
+
+def rendered_env(mod, labels):
+    import argparse
+    a = argparse.Namespace(repo="acme/widget", branch="main", idle="10m", hard="2h", max_hard="8h", shape="S", image=None, run_id=None,
+                           pull_secret=None, pr_label=labels)
+    pod_ = mod.render_pod(a, "coder7", "cw-coder7", T0, T0 + dt.timedelta(hours=2), {"CW_CLOUD_IMAGE": "x", "CW_TOKEN_ENDPOINT": "http://t"}, ())
+    return {e["name"]: e.get("value") for c in pod_["spec"]["containers"] for e in c.get("env", [])}
+
+
+class PrRecordEnv(unittest.TestCase):
+    def test_env_with_and_without_label(self):
+        mod = target_module()
+        self.assertEqual(rendered_env(mod, [HOLD]).get("CW_PR_RECORD"), "/run/cw-tmp/pr-record-numbers", RECORD_ANCHOR)
+        self.assertNotIn("CW_PR_RECORD", rendered_env(mod, None))
+
+    def test_reader_reads_new_path_deduplicated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            new = os.path.join(tmp, "pr-record-numbers")
+            os.makedirs(os.path.join(tmp, "pr-record"))
+            with open(new, "w") as f:
+                f.write("41\n42\n")
+            with open(os.path.join(tmp, "pr-record", "numbers"), "w") as f:
+                f.write("42\n43\n")
+            code = real.PR_RECORD_READ.replace("/run/cw-tmp/pr-record-numbers", new)
+            out = subprocess.run([sys.executable, "-c", code], env={"CW_TMP_DIR": tmp}, stdout=subprocess.PIPE, text=True).stdout
+            self.assertEqual(sorted(out.split()), ["41", "42", "43"])
+            self.assertEqual(len(out.split()), 3)
+
+
+class RecordEnvMutant(unittest.TestCase):
+    def test_mutant_without_env_line_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(LAUNCHER, "cloud_worker.py")) as f:
+                src = f.read()
+            line = [l for l in src.splitlines(True) if 'e["CW_PR_RECORD"]' in l]
+            assert len(line) == 1
+            ctl, mut = os.path.join(tmp, "c.py"), os.path.join(tmp, "m.py")
+            open(ctl, "w").write(src)
+            open(mut, "w").write(src.replace(line[0], ""))
+            cmd = [sys.executable, "-m", "unittest", "test_pr_label_reaper.PrRecordEnv.test_env_with_and_without_label"]
+            run = lambda path: subprocess.run(cmd, cwd=HERE, env=dict(os.environ, **{MODULE_ENV: path}), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=90)
+            c = run(ctl)
+            self.assertEqual(c.returncode, 0, c.stdout)
+            p = run(mut)
+        self.assertEqual(p.returncode, 1, p.stdout)
+        self.assertIn(RECORD_ANCHOR, p.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()
