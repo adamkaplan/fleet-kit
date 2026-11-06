@@ -164,7 +164,26 @@ def retired_boss(cloud_dir, worker, parse):
     return None
 
 
-def scan_audit(audit_file, state_file, cloud_dir, last_reports, send, parse, audit=None, last_text=None):
+def head_line(record_dir, repo, head_checks, parse):
+    """#2267: the last head the pod pushed (branch, short sha) and its check state; `head_checks(repo, sha)` is handed in (this module reads no network)."""
+    run = read_small(os.path.join(record_dir, "run.json"), parse) if record_dir else None
+    hook = run.get("end_hook") if isinstance(run, dict) else None
+    if isinstance(hook, dict) and hook.get("head_on") is None and hook.get("wip_branch") is None and not hook.get("error"):
+        return "Last head: nothing pushed."
+    branch = hook.get("head_on") if isinstance(hook, dict) else None
+    sha = run.get("head_sha") if isinstance(run, dict) else None
+    if not (isinstance(branch, str) and re.fullmatch(r"[A-Za-z0-9._/-]{1,100}", branch) and branch != "unknown"
+            and isinstance(sha, str) and re.fullmatch(r"[0-9a-f]{40}", sha)):
+        return "Last head: head unknown."
+    try:
+        state = head_checks(repo, sha) if isinstance(repo, str) and repo else None
+    except Exception:
+        state = None
+    state = state if isinstance(state, str) and state else "unknown"
+    return "Last head: %s@%s, checks %s." % (branch, sha[:8], re.sub(r"[^A-Za-z0-9 :,._/#()-]", "?", state)[:200])
+
+
+def scan_audit(audit_file, state_file, cloud_dir, last_reports, send, parse, audit=None, last_text=None, head_checks=None):
     """One pass. `send(recipient, text)` is the daemon's own send path. Returns [(recipient, text)] handed to it. `last_text(directory, worker)` (ask #1788)
     gives (block, None) or (None, why): the boss's copy, not the Chief of Staff's, ends with the pod's last text, framed as untrusted."""
     try:
@@ -218,6 +237,8 @@ def scan_audit(audit_file, state_file, cloud_dir, last_reports, send, parse, aud
         pushed = pushed_text(raw_dir(reason), parse) if name else "unknown"
         text = message_text(worker, label, when_text(line.get("ts")), pushed, name, line["ok"] is False)
         text += " " + pr_line(raw_dir(reason), parse) + "."
+        if head_checks is not None and cause in ("idle", "hard"):
+            text += " " + head_line(raw_dir(reason) if name else "", (record or {}).get("repo"), head_checks, parse)
         keys.append(key)
         to_list = [CHIEF] + ([boss] if isinstance(boss, str) and AGENT_NAME.fullmatch(boss) and boss != CHIEF else [])
         boss_text = text
