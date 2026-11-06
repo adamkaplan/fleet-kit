@@ -260,7 +260,7 @@ class github_write:
         number, self.subject = github_write_subject(repo, endpoint, number)
         self.audit, self.actor = audit, actor or "cli"
         self.detail = {"verb": str(verb).upper(), "endpoint": str(endpoint).split("?", 1)[0], "repo": repo, "number": number}
-        self.call = uuid.uuid4().hex[:12]
+        self.call = secrets.token_hex(6)   # not uuid4: the tests count uuid4 draws to make ids repeat (#2247), so a write's audit call id must not take one
         self.outcome = {}
         try:
             self.audit.append(self.actor, GITHUB_WRITE_EVENT, self.subject, self.detail, phase="intent", call=self.call)
