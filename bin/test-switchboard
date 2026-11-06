@@ -17777,7 +17777,7 @@ class TestHandoff(HandoffCase):
         # (#1123) plus ONE site in `_review_api`, the shared helper of `review post` and `review dismiss`: their writes (a review, a dismissal) are deliberate and the only ones added;
         # the reader code (IntentReader, checked above, and checkout/measure) stays read-only
         # the sites are named by where they live, not counted: a new file that writes has to be named here on purpose (`comment --edit`, #1714, is the signed edit of one's own comment: agents_verify.gh_call)
-        holders = sorted(p.name for p in sorted((REPO / "bin").glob("fleet-switchboard")) + sorted((REPO / "bin" / "switchboard").glob("*.py")) if '"--method"' in p.read_text())
+        holders = sorted(p.name for p in SWITCHBOARD_SOURCE_FILES if '"--method"' in p.read_text())
         self.assertEqual(holders, ["agents_verify.py", "fleet-switchboard", "handoff.py"])
         self.assertGreaterEqual(source.count('"--method"'), 5)   # the sites before #1714 are still there
         self.assertEqual(len(re.findall(r"_review_api\([^)]*\"(?:POST|PUT)\"", source)), 2)   # the post (the verdict and its own-account fallback share one call site, the event is a variable) and the dismissal: each goes through the helper
