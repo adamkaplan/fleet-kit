@@ -543,3 +543,55 @@ class TestCommentWindowGapFill(HubCase):
         before = len(world.requests)
         hub.read_comments("sweep", REPO, self.since, cap=sb.COMMENT_WINDOW_PAGES, budget=[0])
         self.assertEqual([p for p in world.requests[before:] if "direction=asc" in p], [])
+
+    def restart(self, world):
+        """A daemon restart: a new hub over the same state directory; memory is gone."""
+        sb.take_comment_cuts()
+        return self.hub(world)
+
+    def asc(self, world, since_index=0):
+        return [p for p in world.requests[since_index:] if "direction=asc" in p]
+
+    def test_s2_a_restart_resumes_the_fill_at_its_edge(self):
+        world = AscendingWorld(NOW - 7 * DAY, 6141)
+        hub = self.hub(world)
+        for _ in range(4):
+            hub.read_comments("sweep", REPO, self.since, cap=sb.COMMENT_WINDOW_PAGES, budget=[12])
+        edge = hub._comment_gap_edges[("sweep", REPO)]
+        hub = self.restart(world)
+        before = len(world.requests)
+        hub.read_comments("sweep", REPO, self.since, cap=sb.COMMENT_WINDOW_PAGES, budget=[12])
+        below = [p for p in self.asc(world, before) if p.split("since=")[1].split("&")[0] < edge]
+        self.assertEqual(len(below), 0, msg="%d gap pages read again below the kept edge %s" % (len(below), edge))
+
+    def test_s3_an_open_gap_gets_a_page_each_pass_when_others_used_the_budget(self):
+        world = AscendingWorld(NOW - 7 * DAY, 3700)
+        hub = self.hub(world)
+        hub.read_comments("sweep", REPO, self.since, cap=sb.COMMENT_WINDOW_PAGES, budget=[12])
+        empty, over = 0, 0
+        for _ in range(8):
+            before = len(world.requests)
+            budget = [0]   # the other repositories' main reads used the whole pass budget
+            hub.read_comments("sweep", REPO, self.since, cap=sb.COMMENT_WINDOW_PAGES, budget=budget)
+            gap = len(self.asc(world, before))
+            empty += gap == 0
+            over += gap > 1
+        self.assertEqual((empty, over), (0, 0), msg="%d passes read no gap page, %d read more than their share" % (empty, over))
+
+    def test_s4_a_window_larger_than_a_pass_closes_over_restarts_and_is_read_once(self):
+        world = AscendingWorld(NOW - 7 * DAY, 6141)
+        hub, rounds, seen = self.hub(world), 0, {}
+        sb.take_comment_cuts()
+        cut = True
+        while cut and rounds < 80:
+            rounds += 1
+            if rounds % 3 == 0:
+                hub = self.restart(world)   # a restart every third pass, in the middle of the fill
+            got, cut = hub.read_comments("sweep", REPO, self.since, cap=sb.COMMENT_WINDOW_PAGES, budget=[4])
+            for c in got:
+                seen[c["id"]] = c
+        self.assertEqual((len(hub._comment_gaps), cut), (0, False), msg="open gaps %d after %d passes" % (len(hub._comment_gaps), rounds))
+        self.assertEqual(len(world.comments) - len(seen), 0)
+        self.assertEqual({k: v for k, v in sb.take_comment_cuts().items() if k == ("sweep", REPO)}, {})
+
+
