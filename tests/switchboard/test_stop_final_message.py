@@ -896,6 +896,55 @@ class TestEndNoticeHeadLine(unittest.TestCase):
         self.run_scan(w, lambda repo, sha: "passed")
         self.assertIn("Last head: head unknown.", w.to("boss-lane")[0])
 
+    def test_wip_branch_is_named_with_sha_or_sha_unknown(self):
+        hook = {"pushed": True, "wip_branch": "w1/wip", "head_on": None}
+        w = self.world("cb-2267f", hook)
+        self.run_scan(w, lambda repo, sha: "passed")
+        self.assertIn("Last head: wip branch w1/wip@aaaaaaaa, checks passed.", w.to("boss-lane")[0])
+        w = self.world("cb-2267g", hook, head_sha=None)
+        self.run_scan(w, lambda repo, sha: "passed")
+        self.assertIn("Last head: wip branch w1/wip, sha unknown.", w.to("boss-lane")[0])
+        w = self.world("cb-2267h", dict(hook, wip_branch="bad branch!"))
+        self.run_scan(w, lambda repo, sha: "passed")
+        self.assertIn("Last head: head unknown.", w.to("boss-lane")[0])
+
+    def line(self, hook, state="passed", sha="a" * 40):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        Path(d, "run.json").write_text(json.dumps({"head_sha": sha, "end_hook": hook}))
+        return sb.load_module("cloud_end_alert").head_line(d, "o/r", lambda repo, s: state, sb.load_module("record_json").parse_bounded)
+
+    def test_head_line_sanitises_state_and_branch(self):
+        self.assertEqual(self.line(self.PUSHED, "bad\x00<x>\nstate"), "Last head: feat/x@aaaaaaaa, checks bad?? x ?state.".replace("?? x ?", "?<x>?").replace("<x>", "?x?"))
+        self.assertEqual(self.line(self.PUSHED, "ok"), "Last head: feat/x@aaaaaaaa, checks ok.")
+        for bad in ("feat/x y", "a;b", "unknown", "x" * 101, 5):
+            self.assertEqual(self.line(dict(self.PUSHED, head_on=bad)), "Last head: head unknown.")
+
+
+class TestCloudHeadChecks(unittest.TestCase):
+    """#2267: the daemon's cloud_head_checks over a stubbed engine.intents._api."""
+
+    def check(self, api):
+        eng = mock.Mock()
+        eng.intents._api = api
+        return sb.cloud_head_checks(eng, "o/r", "a" * 40)
+
+    @staticmethod
+    def page(*runs):
+        return {"check_runs": [dict(id=i + 1, name=n, status=s, conclusion=c, started_at="2026-01-01T00:00:0%dZ" % i) for i, (n, s, c) in enumerate(runs)], "total_count": len(runs)}
+
+    def test_each_state(self):
+        self.assertEqual(self.check(lambda path, repo: self.page(("a", "completed", "success"))), "passed")
+        self.assertEqual(self.check(lambda path, repo: self.page(("a", "completed", "success"), ("b", "in_progress", None))), "pending")
+        self.assertEqual(self.check(lambda path, repo: self.page(("lint", "completed", "failure"), ("a", "completed", "success"))), "failed: lint")
+        self.assertEqual(self.check(lambda path, repo: self.page()), "none yet")
+
+    def test_refusal_and_exception_give_unknown(self):
+        self.assertEqual(self.check(lambda path, repo: None), "unknown")
+        def boom(path, repo):
+            raise OSError("down")
+        self.assertEqual(self.check(boom), "unknown")
+
 
 if __name__ == "__main__":
     unittest.main()

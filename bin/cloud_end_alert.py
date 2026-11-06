@@ -172,7 +172,12 @@ def head_line(record_dir, repo, head_checks, parse):
         return "Last head: nothing pushed."
     branch = hook.get("head_on") if isinstance(hook, dict) else None
     sha = run.get("head_sha") if isinstance(run, dict) else None
-    if not (isinstance(branch, str) and re.fullmatch(r"[A-Za-z0-9._/-]{1,100}", branch) and branch != "unknown"
+    wip = hook.get("wip_branch") if isinstance(hook, dict) and branch is None else None
+    if isinstance(wip, str) and re.fullmatch(r"[A-Za-z0-9._/-]{1,100}", wip) and not re.search(r"sk-|gh[opsu]_|github_pat|AKIA|xox|eyJ|[A-Za-z0-9]{30}", wip):
+        if not (isinstance(sha, str) and re.fullmatch(r"[0-9a-f]{40}", sha)):
+            return "Last head: wip branch %s, sha unknown." % wip
+        branch = "wip branch " + wip
+    elif not (isinstance(branch, str) and re.fullmatch(r"[A-Za-z0-9._/-]{1,100}", branch) and branch != "unknown"
             and isinstance(sha, str) and re.fullmatch(r"[0-9a-f]{40}", sha)):
         return "Last head: head unknown."
     try:
