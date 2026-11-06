@@ -19,6 +19,9 @@ def build_carry_repo(directory):
         target.write_text(text)
 
     g("init", "-q", "-b", "main")
+    # The code under test runs its own git (merge, commit) in this repository: the identity lives in the repository's own config FILE (plain file I/O, no `git config` command), so no global identity is needed.
+    with open(directory / ".git" / "config", "a") as config:
+        config.write("[user]\n\temail = dev@example.test\n\tname = Dev\n[commit]\n\tgpgsign = false\n")
     write("README.md", "widget api\n")
     write("a.txt", "one\ntwo\nthree\nfour\nfive\nsix\nseven\n")
     write("src/x.py", "def x():\n    return 1\n")

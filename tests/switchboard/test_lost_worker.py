@@ -74,7 +74,7 @@ class Rig:
         with open(os.path.join(self.dir, "lost-workers.json"), "w") as handle:
             json.dump({"offsets": {}, "alerted": {}}, handle)
 
-    def created(self, name, deadline=NOW - 60, lane="lane-a", branch="ask-7"):
+    def created(self, name, deadline=NOW - 400, lane="lane-a", branch="ask-7"):
         line(self.engine.audit.path, ts=stamp(NOW - 7200), actor="x", event="cloud.created", subject=name, detail={"hard_deadline": stamp(deadline)})
         self.engine.cloud_watch["records"].append({"worker": name, "reports_to": lane, "branch": branch})
 
@@ -139,7 +139,7 @@ def scenarios(mod):
     check("S5b done then hard limit", r.passes() == [] and r.engine.sent == [])
     r = Rig(mod)   # pushed false alone proves nothing: a pod with that and neither a stop nor a report is still lost
     r.created("w4")
-    line(r.launcher, ts=stamp(NOW - 30), worker="w4", runtime_id="pod/w4", action="send", ok=True, reason="pushed=false")
+    line(r.launcher, ts=stamp(NOW - 3000), worker="w4", runtime_id="pod/w4", action="send", ok=True, reason="pushed=false")
     check("S5c pushed false alone is not a clean end", len(r.passes()) == 1)
 
     r = Rig(mod)   # S6: the third launch of an ask
@@ -220,7 +220,7 @@ class TestLostWorkerReadRound(unittest.TestCase):
         r = Rig(mod)
         path = r.engine.audit.path
         r.created("lost", deadline=NOW + 600)   # created with no stop, oldest creation, due only at the second pass
-        line(path, ts=stamp(NOW - 7000), actor="x", event="cloud.created", subject="old", detail={"hard_deadline": stamp(NOW - 60)})
+        line(path, ts=stamp(NOW - 7000), actor="x", event="cloud.created", subject="old", detail={"hard_deadline": stamp(NOW - 400)})
         line(r.launcher, ts=stamp(NOW - 5000), worker="old", runtime_id="pod/old", action="stop", ok=True, reason="finished")
         for n in range(3):
             r.created("f%d" % n)
@@ -257,14 +257,14 @@ class TestLostWorkerReadRound(unittest.TestCase):
         for n in range(40):
             r.created("old%d" % n)
         for n in range(2):
-            line(r.engine.audit.path, ts=stamp(NOW - 300), actor="x", event="cloud.created", subject="new%d" % n, detail={"hard_deadline": stamp(NOW - 60)})
+            line(r.engine.audit.path, ts=stamp(NOW - 300), actor="x", event="cloud.created", subject="new%d" % n, detail={"hard_deadline": stamp(NOW - 400)})
         self.assertEqual(sorted(x["name"] for x in r.passes()), ["new0", "new1"])
         self.assertEqual(r.passes(), [])
 
     def test_s10b_valid_memory_alerts_across_a_restart_gap(self):
         r = self.rig()
         r.passes()
-        line(r.engine.audit.path, ts=stamp(NOW - 3 * 3600), actor="x", event="cloud.created", subject="gap", detail={"hard_deadline": stamp(NOW - 60)})
+        line(r.engine.audit.path, ts=stamp(NOW - 3 * 3600), actor="x", event="cloud.created", subject="gap", detail={"hard_deadline": stamp(NOW - 400)})
         self.assertEqual([x["name"] for x in r.passes()], ["gap"])
 
     def test_mutant_that_applies_the_one_hour_rule_with_a_valid_memory_is_caught(self):
@@ -272,7 +272,7 @@ class TestLostWorkerReadRound(unittest.TestCase):
         real = mod._load
         mod._load = lambda sb, path: (real(sb, path)[0], "none")
         r = Rig(mod)
-        line(r.engine.audit.path, ts=stamp(NOW - 3 * 3600), actor="x", event="cloud.created", subject="gap", detail={"hard_deadline": stamp(NOW - 60)})
+        line(r.engine.audit.path, ts=stamp(NOW - 3 * 3600), actor="x", event="cloud.created", subject="gap", detail={"hard_deadline": stamp(NOW - 400)})
         self.assertEqual(r.passes(), [])   # the mutant alerts nothing: the s10b case above fails on it
 
     def test_s11_name_cleaned_and_corrupt_memory(self):
@@ -291,7 +291,7 @@ class TestLostWorkerReadRound(unittest.TestCase):
         self.assertEqual(r.engine.sent, [])
         with open(r.engine.audit.path) as handle:
             self.assertEqual(len([x for x in handle if "lost_worker.memory_corrupt" in x]), 1)
-        line(r.engine.audit.path, ts=stamp(NOW - 100), actor="x", event="cloud.created", subject="w2", detail={"hard_deadline": stamp(NOW - 60)})
+        line(r.engine.audit.path, ts=stamp(NOW - 100), actor="x", event="cloud.created", subject="w2", detail={"hard_deadline": stamp(NOW - 400)})
         self.assertEqual([x["name"] for x in r.passes()], ["w2"])
         self.assertTrue(json.load(open(os.path.join(r.dir, "lost-workers.json")))["offsets"])
 
@@ -394,14 +394,14 @@ class TestLostWorkerReadRound(unittest.TestCase):
         got += r.passes(at=NOW - 300)
         r.alive.clear()
         r.created("oldpod", deadline=NOW - 3 * 3600)
-        line(r.engine.audit.path, ts=stamp(NOW - 300), actor="x", event="cloud.created", subject="newpod", detail={"hard_deadline": stamp(NOW - 60)})
+        line(r.engine.audit.path, ts=stamp(NOW - 300), actor="x", event="cloud.created", subject="newpod", detail={"hard_deadline": stamp(NOW - 400)})
         line(r.engine.audit.path, ts=stamp(NOW - 3 * 3600), actor="x", event="cloud.create_failed", subject="oldref", detail={})
         line(r.engine.audit.path, ts=stamp(NOW - 100), actor="x", event="cloud.create_failed", subject="newref", detail={})
         got += r.passes()
         self.assertEqual(sorted((x["kind"], x["name"]) for x in got),
                          [("local_worker", "newloc"), ("pod_no_stop", "newpod"), ("refused_launch", "newref")])
         self.assertFalse(json.load(open(state_path))["catchup"])
-        line(r.engine.audit.path, ts=stamp(NOW - 3 * 3600), actor="x", event="cloud.created", subject="gap", detail={"hard_deadline": stamp(NOW - 60)})
+        line(r.engine.audit.path, ts=stamp(NOW - 3 * 3600), actor="x", event="cloud.created", subject="gap", detail={"hard_deadline": stamp(NOW - 400)})
         self.assertEqual([x["name"] for x in r.passes()], ["gap"])   # outside a catch-up a restart gap is still alerted
 
     def test_s6_a_detector_down_for_hours_says_once_how_many_it_missed(self):
@@ -481,8 +481,8 @@ class TestLostWorkerReadRound(unittest.TestCase):
         self.assertEqual([x["name"] for x in r.passes()], ["w1"])
 
     BAD = [None, "x", 5, [1], {"a": 1}, True, 10 ** 30, {"a": {"b": [1]}}]
-    VALID = {"reaper_ok": [5], "catchup": [True], "stop": [{"a": 1}], "report": [{"a": 1}], "gone": [{"a": 1}], "slow_bad": [5]}   # the one bad value of the table that is a good value of that key
-    KEYS = ("offsets", "alerted", "created", "stop", "report", "refused", "seen", "gone", "reaper", "reaper_ok", "reaper_outage", "reaper_gap",
+    VALID = {"reaper_ok": [5], "catchup": [True], "stop": [{"a": 1}], "report": [{"a": 1}], "active": [{"a": 1}], "gone": [{"a": 1}], "slow_bad": [5]}   # the one bad value of the table that is a good value of that key
+    KEYS = ("offsets", "alerted", "created", "stop", "report", "active", "refused", "seen", "gone", "reaper", "reaper_ok", "reaper_outage", "reaper_gap",
             "reaper_new", "catchup", "slow", "slow_bad")
 
     def bad_table(self):
@@ -649,7 +649,7 @@ class TestLostWorkerMemoryOnly(unittest.TestCase):
         os.unlink(os.path.join(self.r.dir, "lost-workers.json"))
         os.mkdir(os.path.join(self.r.dir, "lost-workers.json"))   # a directory at the memory path: neither written nor set aside
         for name, age in (("recent", 300), ("old", 3 * 3600)):
-            line(self.r.engine.audit.path, ts=stamp(NOW - age), actor="x", event="cloud.created", subject=name, detail={"hard_deadline": stamp(NOW - 60)})
+            line(self.r.engine.audit.path, ts=stamp(NOW - age), actor="x", event="cloud.created", subject=name, detail={"hard_deadline": stamp(NOW - 400)})
 
     def corrupt_lines(self):
         with open(self.r.engine.audit.path) as handle:
@@ -679,14 +679,14 @@ class TestLostWorkerMemoryOnly(unittest.TestCase):
     def test_failed_save_does_not_repeat_the_first_run_rule(self):
         r = Rig(self.mod)
         os.unlink(os.path.join(r.dir, "lost-workers.json"))
-        line(r.engine.audit.path, ts=stamp(NOW - 300), actor="x", event="cloud.created", subject="recent", detail={"hard_deadline": stamp(NOW - 60)})
-        line(r.engine.audit.path, ts=stamp(NOW - 3 * 3600), actor="x", event="cloud.created", subject="old", detail={"hard_deadline": stamp(NOW - 60)})
+        line(r.engine.audit.path, ts=stamp(NOW - 300), actor="x", event="cloud.created", subject="recent", detail={"hard_deadline": stamp(NOW - 400)})
+        line(r.engine.audit.path, ts=stamp(NOW - 3 * 3600), actor="x", event="cloud.created", subject="old", detail={"hard_deadline": stamp(NOW - 400)})
         real = self.mod._save
         self.mod._save = lambda path, state: (_ for _ in ()).throw(OSError("disk full"))
         self.assertEqual([x["name"] for x in r.passes()], ["recent"])
         self.assertEqual(r.passes(), [])   # not re-alerted
         self.mod._save = real
-        line(r.engine.audit.path, ts=stamp(NOW - 100), actor="x", event="cloud.created", subject="newer", detail={"hard_deadline": stamp(NOW - 60)})
+        line(r.engine.audit.path, ts=stamp(NOW - 100), actor="x", event="cloud.created", subject="newer", detail={"hard_deadline": stamp(NOW - 400)})
         self.assertEqual([x["name"] for x in r.passes()], ["newer"])
 
     def load_mutant(self, *pairs):
@@ -705,7 +705,7 @@ class TestLostWorkerMemoryOnly(unittest.TestCase):
         os.mkdir(path)
         self.mod.ALERTED_MAX, self.mod.PASS_CAP = 30, 10 ** 6
         for i in range(100):
-            line(r.engine.audit.path, ts=stamp(NOW - 300 - i), actor="x", event="cloud.created", subject="k%03d" % i, detail={"hard_deadline": stamp(NOW - 60)})
+            line(r.engine.audit.path, ts=stamp(NOW - 300 - i), actor="x", event="cloud.created", subject="k%03d" % i, detail={"hard_deadline": stamp(NOW - 400)})
         r.passes()
         mem = self.mod._PROC_ALERTED[path]
         self.assertEqual(len(mem), 30)
@@ -923,6 +923,85 @@ class TestAskIsItsOwn(unittest.TestCase):
 
     def test_the_full_name_is_the_last_resort(self):
         self.assertEqual(load()._ask_of("cr2244", {}), "cr2244")
+
+
+class TestPodReportedLostOnlyWhenSilent(unittest.TestCase):
+    """#2255: the case of 6 November 2026: a pod past its hard deadline that is stopped seconds later, or still noting and pushing, is not lost."""
+    G1 = "        if now - deadline <= GRACE:\n"
+    G2 = "        if now - newest <= GRACE and newest > c[\"at\"]:\n"
+
+    def module(self, mutant=False):
+        src = (REPO / "bin" / "lost_worker.py").read_text()
+        if mutant:   # today's rule: no grace and no activity read
+            for gate in (self.G1, self.G2):
+                self.assertEqual(src.count(gate), 1)
+                src = src.replace(gate, gate.replace(gate.strip()[3:-1], "False"))
+        mod = types.ModuleType("lost_worker_gate")
+        exec(compile(src, "lost_worker_gate", "exec"), mod.__dict__)
+        return mod
+
+    def lost(self, mod, setup, at=NOW):
+        r = Rig(mod)
+        setup(r)
+        return [x for x in r.passes(at=at) if x["kind"] == "pod_no_stop"]
+
+    def seconds_past(self, r):   # the pod tg: deadline 3 s before the check, launcher actions after the launch
+        r.created("tg", deadline=NOW - 3)
+
+    def noting(self, r):   # renewal, nudge, wip note, final note after the launch, the last one 10 s ago; deadline 8 minutes ago
+        r.created("tg", deadline=NOW - 480)
+        for back, action in ((3000, "renew"), (2400, "idle-nudge"), (1200, "wip-note"), (10, "final-note")):
+            line(r.launcher, ts=stamp(NOW - back), worker="tg", runtime_id="pod/tg", action=action, ok=True, reason="")
+
+    def pushing(self, r):
+        r.created("ti", deadline=NOW - 480)
+        line(r.engine.audit.path, ts=stamp(NOW - 20), actor="x", event="push_watch.sent", subject="ti", detail={})
+
+    def silent(self, r):
+        r.created("cf", deadline=NOW - 3000)
+        line(r.launcher, ts=stamp(NOW - 6000), worker="cf", runtime_id="pod/cf", action="renew", ok=True, reason="")
+
+    def check_s2(self, mod):
+        self.assertEqual(self.lost(mod, self.seconds_past), [], "S2 a pod seconds past its deadline is not lost")
+
+    def check_s3(self, mod):
+        self.assertEqual(self.lost(mod, self.noting), [], "S3 a pod still noting is not lost")
+        self.assertEqual(self.lost(mod, self.pushing), [], "S3 a pod still pushing is not lost")
+
+    def check_s4(self, mod):
+        got = self.lost(mod, self.silent)
+        self.assertEqual(len(got), 1, "S4 a silent pod is reported once")
+        self.assertEqual(got[0]["at"], NOW - 6000, "S4 the last event is the newest action, not the launch")
+
+    def test_s2_a_pod_stopped_seconds_after_its_deadline_raises_no_notice(self):
+        self.check_s2(self.module())
+
+    def test_s3_a_pod_still_noting_or_pushing_raises_no_notice(self):
+        self.check_s3(self.module())
+
+    def test_s4_a_silent_pod_is_still_reported_with_its_newest_event(self):
+        self.check_s4(self.module())
+
+    def quiet_only(self, r):   # the only line in the grace is push_watch.quiet: no push, not a sign of life
+        r.created("tq", deadline=NOW - 480)
+        line(r.engine.audit.path, ts=stamp(NOW - 20), actor="x", event="push_watch.quiet", subject="tq", detail={})
+
+    def test_a_push_watch_quiet_line_is_not_a_sign_of_life(self):
+        self.assertEqual(len(self.lost(self.module(), self.quiet_only)), 1)
+        src = (REPO / "bin" / "lost_worker.py").read_text()
+        old = src.replace('event == "push_watch.sent"', 'event in ("push_watch.sent", "push_watch.quiet")')
+        self.assertNotEqual(old, src)
+        mod = types.ModuleType("lost_worker_head")
+        exec(compile(old, "lost_worker_head", "exec"), mod.__dict__)
+        self.assertEqual(self.lost(mod, self.quiet_only), [], "control: head holds it back")
+
+    def test_controls_today_s_rule_raises_the_false_notices(self):
+        old = self.module(mutant=True)
+        self.check_s4(old)   # the control: the silent pod is reported on today's rule too
+        for check, text in ((self.check_s2, "S2 a pod seconds"), (self.check_s3, "S3 a pod still")):
+            with self.assertRaises(AssertionError) as caught:
+                check(old)
+            self.assertIn(text, str(caught.exception))
 
 
 if __name__ == "__main__":

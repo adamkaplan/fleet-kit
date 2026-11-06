@@ -39,6 +39,7 @@ rebuilt from another record.
 | `bin/lanes.py:197` | `boss-resolution` | the lane rule resolves a boss | nobody | lane resolution | derived |
 | `bin/reassign.py:237` | `boss-resolution` | `reassign` resolves the current boss for consent | nobody | `reassign` | derived |
 | `bin/fleet-switchboard:2385` | `discovery.agents` | the agents of the newest `discover()`: name, session, pane, role, charter, repo, workspace, cwd, reports_to | `Engine.discover` (each pass and on demand) | the whole daemon: fact routing, status, pane pass, decisions, chiefs lookup, badges, toasts | primary (the live list), derived from herdr and the v2 service |
+| `bin/tip_watch.py:218` | `discovery.agents` | the agents of the newest `discover()`, handed to `route_of` to find the lane of the merging pull request | nobody | the tip watch's tell | derived (reader) |
 | `bin/cloud_worker.py:976` | `discovery.agents` | looks up a local agent by name before routing | nobody | `route` | derived (reader) |
 | `bin/switchboard/job_runs.py:348` | `discovery.agents` | the agents of the newest `discover()`: a dead job's starter is found among them by session and name | nobody | `JobFacts` | derived (reader) |
 | `bin/switchboard/job_runs.py:350` | `boss-resolution` | the starter's boss, by `boss_name` over the discovery | nobody | `JobFacts` | derived (reader) |
