@@ -1,0 +1,1 @@
+| `cloud_record_create.py` | 5 | the record a launch stores from the launcher's answer (`_record_from_create`, #2246); a part of `cloud_worker.py` | |
