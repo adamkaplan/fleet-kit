@@ -8047,6 +8047,12 @@ def publish_decisions(engine):
                            ((engine.config.get("impact_hold") or {}).get("calls_per_pass") or IMPACT_PASS_CALLS))
     except Exception as err:
         engine._note("queue_ejection.error", None, {"error": _one_line("%s: %s" % (type(err).__name__, err), 200)})
+    try:
+        tip_watch = load_module("tip_watch")   # #2247: a merge that turns the integration tip's CI red is named to the Chief of Staff and the merging lane, once per head
+        tip_watch.run_pass(types.SimpleNamespace(**{n: globals()[n] for n in tip_watch.NEEDS}), engine, now,
+                           ((engine.config.get("impact_hold") or {}).get("calls_per_pass") or IMPACT_PASS_CALLS))
+    except Exception as err:
+        engine._note("tip_watch.error", None, {"error": _one_line("%s: %s" % (type(err).__name__, err), 200)})
     apply_notice_effects(engine)
     store = decision_store(engine)
     try:

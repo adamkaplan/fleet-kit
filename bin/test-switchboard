@@ -67007,6 +67007,7 @@ TestMacosReader = _census.TestMacosReader   # #1847
 TestNewModuleDemands = importlib.import_module("test_new_module_demands").TestNewModuleDemands
 TestGuardSet = importlib.import_module("test_guard_set").TestGuardSet   # #2055
 TestTriageParkedDigest = importlib.import_module("test_triage_parked_digest").build(Base, TestTriageDigest, sb)   # #2090
+TestTipWatch = importlib.import_module("test_tip_watch").build(Base, World, FAKE_GH, EjectionHub, sb)   # #2247
 # The bin-set table test (#1457).
 _bin_set_table = importlib.import_module("test_bin_set_table")
 TestTheBinSetClassesAreAllInTheTable = _bin_set_table.TestTheBinSetClassesAreAllInTheTable
