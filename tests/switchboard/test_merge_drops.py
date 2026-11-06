@@ -21,9 +21,8 @@ def git(cwd, *argv):
 
 
 def conflicting_merge(cwd, other):
-    """`git merge --no-commit other` that must stop on a conflict with MERGE_HEAD set (exit 1). It runs in the pinned environment of `git` above (no global or system
-    config, a fixed identity, a fixed conflict style, no editor or pager), so no runner's git version or configuration changes it; a merge that did not start fails the test here, not later."""
-    env = {"PATH": "/usr/bin:/bin", "HOME": str(cwd), "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1",
+    """`git merge --no-commit other` that must stop on a conflict with MERGE_HEAD set (exit 1). It runs in the pinned environment of `git` above (a HOME and XDG_CONFIG_HOME inside the fixture, so no user config is read; a fixed identity, a fixed conflict style, no editor or pager), so no runner's git version or configuration changes it; a merge that did not start fails the test here, not later."""
+    env = {"PATH": "/usr/bin:/bin", "HOME": str(cwd), "XDG_CONFIG_HOME": str(cwd),
            "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@x", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@x", "GIT_EDITOR": "true", "GIT_PAGER": "cat"}
     done = subprocess.run(["git", "-C", str(cwd), "-c", "merge.conflictStyle=merge", "-c", "core.autocrlf=false", "merge", "-q", "--no-commit", "--no-ff", other],
                           capture_output=True, text=True, stdin=subprocess.DEVNULL, env=env)
