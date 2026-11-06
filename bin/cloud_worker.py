@@ -703,17 +703,6 @@ def brief_warnings(args, repo, brief):
     return notes
 
 
-def lane_m_workers(state, lane):
-    """The sorted names of the lane's live shape-M workers, from the record directory alone (no token, no cluster call)."""
-    found = []
-    for record in list_records(state):
-        if not isinstance(record, dict) or "problem" in record or record.get("shape") != "M" or _ended(record):
-            continue
-        if (record.get("reports_to") or "(no boss)") == lane:
-            found.append(str(record.get("worker")))
-    return sorted(found)
-
-
 def _launch(args, runner, now, reserve):
     """`launch NAME --cloud --repo OWNER/REPO --branch B --agent A`: the allow-list first, then (with a cluster token minted for this command) the
     model entry and a one-hour git token go to the launcher as per-run secrets, the pod is created, and the session and the brief are sent through
@@ -1207,16 +1196,6 @@ def cmd_read(args, runner, now):
 
 # ---------------------------------------------------------------- status
 
-def _ended(record, clock=None):
-    """True when the worker's hard deadline has passed: its pod is gone by design, so there is nothing to probe (and no token to mint for it)."""
-    text = record.get("hard_deadline")
-    try:
-        when = datetime.datetime.strptime(text, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc)
-    except (TypeError, ValueError):
-        return False
-    return when.timestamp() < (time.time() if clock is None else clock)
-
-
 # ---------------------------------------------------------------- the one cluster read (the status summary)
 
 SNAPSHOT_SECONDS = 30   # the bound of the WHOLE cloud summary read, ONE monotonic deadline: each step (the vault read, the token create, the launcher
@@ -1594,3 +1573,20 @@ def _load_inspect():
 cloud_inspect = _load_inspect()
 for _name in ("INSPECT_SECONDS", "_inspect_short", "cmd_inspect"):
     globals()[_name] = getattr(cloud_inspect, _name)
+
+
+# ---------------------------------------------------------------- the shape-M count of a lane (ask #2259, bin/cloud_lane_cap.py)
+
+def _load_lane_cap():
+    """Load bin/cloud_lane_cap.py (beside this file; a part of it) with `D` set, and bind each of its names here (a name patched here does not reach it: patch it there)."""
+    spec = importlib.util.spec_from_file_location("cloud_lane_cap", str(_OWN_BIN / "cloud_lane_cap.py"))
+    module = importlib.util.module_from_spec(spec)
+    module.D = _Stayed()
+    sys.modules["cloud_lane_cap"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+cloud_lane_cap = _load_lane_cap()
+for _name in ("lane_m_workers", "_ended", "_stopped_ids"):
+    globals()[_name] = getattr(cloud_lane_cap, _name)
