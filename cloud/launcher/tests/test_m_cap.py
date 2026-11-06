@@ -163,8 +163,13 @@ class TestScratch(unittest.TestCase):
 
     def child(self, edits, test, old=False):
         src = (ROOT / "bin" / "cloud_worker.py").read_text()
+        part = (ROOT / "bin" / "cloud_lane_cap.py").read_text()   # the count moved here (ask #2259)
         applied = 0
         for old_text, new_text in edits:
+            if src.count(old_text) == 0 and part.count(old_text) == 1:
+                part = part.replace(old_text, new_text, 1)
+                applied += 1
+                continue
             self.assertEqual(src.count(old_text), 1, "the line to change is not as expected: " + old_text)
             src = src.replace(old_text, new_text, 1)
             applied += 1
@@ -179,6 +184,7 @@ class TestScratch(unittest.TestCase):
         shutil.copy(ROOT / "cloud" / "launcher" / "tests" / "cw_cases_lookup.py", os.path.join(d, "cloud", "launcher", "tests"))
         shutil.copy(ROOT / "cloud" / "launcher" / "tests" / "cw_cases_vault.py", os.path.join(d, "cloud", "launcher", "tests"))
         Path(d, "bin", "cloud_worker.py").write_text(src)
+        Path(d, "bin", "cloud_lane_cap.py").write_text(part)
         env = dict(os.environ, TMPDIR=d)
         if old:
             env[OLD_ONLY] = "1"
