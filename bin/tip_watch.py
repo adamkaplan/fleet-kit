@@ -15,6 +15,7 @@ The logic is here; `bin/fleet-switchboard` calls `run_pass` from the daemon's pa
 
 import calendar
 import re
+import subprocess
 import time
 
 BRANCH = "integration"   # the branch whose tip is watched
@@ -23,6 +24,10 @@ LIST_SECONDS = 300       # a repository's runs are listed no oftener than this
 LIST_PAGE = 30
 WAKE_WINDOW = 3600       # a red head older than this is history, not news
 RETRY_SECONDS = 300
+MAX_RANGE = 30           # merges of a range read and named
+MAX_LOG = 400000         # characters of one job log looked at
+MAX_LOG_JOBS = 3         # failed jobs whose logs are read for the failing test file
+MAX_PR_FILES = 100       # files of one pull request looked at
 MAX_JOBS = 10            # failed job names in one line
 LEDGER_MAX = 200
 NEEDS = ("_RedsReader", "GitHubItem", "PROG", "_read_small", "_write_small", "_one_line", "load_module", "chiefs_of_staff")
@@ -30,6 +35,7 @@ NEEDS = ("_RedsReader", "GitHubItem", "PROG", "_read_small", "_write_small", "_o
 ISO = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ")
 PR_TITLE = re.compile(r"\(#(\d{1,9})\)|^Merge pull request #(\d{1,9})")
 SHA = re.compile(r"[0-9a-f]{7,40}")
+LOG_FILE = re.compile(r'File "([^"\n]{1,300}?\.py)"|((?:[\w.\-]+/)*test_?[\w.\-]*\.py)(?=::|:\d|\b)')
 
 
 def _epoch(text):
@@ -41,11 +47,45 @@ def _epoch(text):
 def pr_of(run):
     """The pull request a merge commit's title names, or None."""
     message = ((run.get("head_commit") or {}).get("message") or "") if isinstance(run, dict) else ""
+    return pr_in(message)
+
+
+def pr_in(message):
     found = PR_TITLE.findall(str(message).split("\n", 1)[0])
     if not found:
         return None
     number = [a or b for a, b in found][-1]
     return int(number)
+
+
+def failing_files(text):
+    """The test files a job log names (File "..." lines and test ids), in order of first sight, repository-relative where the path shows it."""
+    out = []
+    for quoted, bare in LOG_FILE.findall(text[:MAX_LOG]):
+        path = (quoted or bare).replace("\\", "/")
+        for marker in ("/work/", "/repo/", "/checkout/", "/home/runner/work/"):
+            if marker in path and "tests/" in path:
+                path = path[path.index("tests/"):]
+        if "tests/" in path:
+            path = path[path.index("tests/"):]
+        if path.startswith("test") or "/test" in path:
+            if path not in out:
+                out.append(path)
+    return out
+
+
+def touches(changed, test_file):
+    """True when `changed` (paths a pull request touched) holds the test file or the file it tests (test_x.py tests x.py / x)."""
+    stem = test_file.rsplit("/", 1)[-1][:-3].replace("-", "_")
+    tested = stem[5:] if stem.startswith("test_") else stem[4:] if stem.startswith("test") else stem
+    for path in changed:
+        if path == test_file or path.endswith("/" + test_file) or test_file.endswith("/" + path):
+            return True
+        base = path.rsplit("/", 1)[-1]
+        base = (base[:-3] if base.endswith(".py") else base).replace("-", "_")
+        if tested and base == tested:
+            return True
+    return False
 
 
 def newest_by_head(runs, branch=BRANCH):
@@ -67,12 +107,18 @@ def newest_by_head(runs, branch=BRANCH):
     return sorted(((first[h], h, r) for _, h, r in best.values()), key=lambda t: (t[0], t[1]))
 
 
-def build_line(sb_safe, repo, head, pr, failed, repeated):
+def build_line(sb_safe, repo, head, pr, failed, repeated, span=None):
     names = ", ".join('"%s"' % sb_safe(n, 100) for n in failed[:MAX_JOBS]) + (" and %d more" % (len(failed) - MAX_JOBS) if len(failed) > MAX_JOBS else "")
     what = "failed %d job%s" % (len(failed), "" if len(failed) == 1 else "s")
     lead = "The %s tip of %s is red after the merge %s" % (BRANCH, repo, head[:8]) if not repeated else \
            "The %s tip of %s was already red and the merge %s adds new failing jobs" % (BRANCH, repo, head[:8])
     via = " (pull request #%d)" % pr if pr else " (its pull request is not known)"
+    if span:   # the run held several merges: the newest head is not blamed, the range is named
+        merges = "; ".join("%s #%s (%s)" % (m["sha"][:8], m["pr"], m["lane"] or "lane unknown") for m in span["merges"])
+        more = " and %d more" % span["more"] if span.get("more") else ""
+        likely = "likeliest: #%s (%s)" % (span["likely"]["pr"], span["likely"]["lane"] or "lane unknown") if span.get("likely") else "likeliest: unknown"
+        return "%s: its CI run %s: %s. The run held %d merges since the last run: %s%s. %s. Fix it forward or revert the likeliest merge; the next merges are not to be judged against this red." % (
+            lead.replace(" after the merge", " in the run of the head"), what, names or "(job names unreadable)", len(span["merges"]) + span.get("more", 0), merges, more, likely)
     return "%s%s: its CI run %s: %s. Fix it forward or revert that merge; the next merges are not to be judged against this red." % (lead, via, what, names or "(job names unreadable)")
 
 
@@ -143,9 +189,11 @@ def run_pass(sb, engine, now, calls):
                     memory["said"].add(repo)
                     engine.audit.append(engine.actor, "tip_watch.read_failed", repo, {"error": sb._one_line(str(err), 160)})
         previous = []   # the failed jobs of the head before
+        prior = None    # the head of the run before
         known = True
         unknown_red = False   # the head before was red and its jobs could not be read
         for began, head, run in newest_by_head(memory["runs"].get(repo)):
+            before_head, prior = prior, head
             if head in heads and heads[head].get("repo") in (repo, None):
                 previous = heads[head]["failed"] or []
                 unknown_red = heads[head]["failed"] is None
@@ -165,11 +213,13 @@ def run_pass(sb, engine, now, calls):
             if head not in memory["sent"] and spent >= calls:
                 break   # the rest wait for the next pass
             failed = None
+            failed_ids = []
             if head not in memory["sent"]:
                 spent += 1
                 try:
                     done = reader.json("repos/%s/actions/runs/%d/jobs?filter=latest&per_page=100" % (repo, run["id"]))
                     jobs = done.get("jobs") if isinstance(done, dict) else None
+                    failed_ids = [j["id"] for j in jobs if isinstance(j, dict) and isinstance(j.get("id"), int) and j.get("conclusion") not in (None, "success", "skipped", "cancelled", "neutral")] if isinstance(jobs, list) else []
                     failed = sorted({safe(j.get("name") or "", 200) for j in jobs if isinstance(j, dict) and j.get("conclusion") not in (None, "success", "skipped", "cancelled", "neutral")} - {""}) if isinstance(jobs, list) else None
                     if failed == []:
                         failed = None   # a red run with no readable failed job: unknown, never []
@@ -191,7 +241,7 @@ def run_pass(sb, engine, now, calls):
                 heads[head] = {"ts": began, "failed": failed, "noted": True, "repo": repo}
                 previous, known, unknown_red = failed or [], failed is not None, failed is None
                 continue
-            if not _tell(sb, engine, hub, discovery, memory, safe, repo, head, run, failed, news, repeated, now):
+            if not _tell(sb, engine, hub, discovery, memory, safe, repo, head, run, failed, news, repeated, now, reader, before_head, failed_ids):
                 break
             heads[head] = {"ts": began, "failed": failed, "noted": True, "repo": repo}
             previous, known, unknown_red = failed or [], failed is not None, failed is None
@@ -204,21 +254,77 @@ def run_pass(sb, engine, now, calls):
     return spent
 
 
-def _tell(sb, engine, hub, discovery, memory, safe, repo, head, run, failed, news, repeated, now):
+def _lane(sb, hub, discovery, repo, head, number, now):
+    if number is None:
+        return None
+    item = sb.GitHubItem("tip:%s" % head, "tip", "", repo, [], [("pr", number)], sb.PROG, now, numbers=[number])
+    try:
+        return hub.route_of(item, discovery.agents, now)[0]
+    except Exception:
+        return None
+
+
+def _span(sb, hub, discovery, memory, repo, head, before_head, reader, failed_ids, now):
+    """None for a run of one merge (or when the range cannot be read: as before); else {"merges": [{"sha","pr","lane"}], "more": n, "likely": merge or None}.
+    GET only: one compare, the logs of up to MAX_LOG_JOBS failed jobs, the files of each merge until one matches."""
+    if not before_head or before_head == head:
+        return None
+    cached = memory.setdefault("span", {})
+    if head in cached:
+        return cached[head]
+    try:
+        body = reader.json("repos/%s/compare/%s...%s?per_page=100" % (repo, before_head, head))
+        commits = body.get("commits") if isinstance(body, dict) else None
+        merges = []
+        for c in commits if isinstance(commits, list) else []:
+            message = ((c.get("commit") or {}).get("message") or "") if isinstance(c, dict) else ""
+            number = pr_in(message)
+            if number is not None and isinstance(c.get("sha"), str) and SHA.fullmatch(c["sha"]):
+                merges.append({"sha": c["sha"], "pr": number})
+    except Exception:
+        return None
+    if len(merges) < 2:
+        return None
+    more = max(0, len(merges) - MAX_RANGE)
+    merges = merges[-MAX_RANGE:]
+    for m in merges:
+        m["lane"] = _lane(sb, hub, discovery, repo, m["sha"], m["pr"], now)
+    tests = []
+    for job in failed_ids[:MAX_LOG_JOBS]:
+        try:
+            done = reader.accounts.read(reader.runner, "repos/%s/actions/jobs/%d/logs" % (repo, job), repo, reader.config["call_timeout_seconds"], stdin=subprocess.DEVNULL)
+            if done.returncode == 0:
+                tests += [t for t in failing_files(done.stdout if isinstance(done.stdout, str) else "") if t not in tests]
+        except Exception:
+            continue
+    likely = None
+    for m in reversed(merges) if tests else []:   # the newest matching merge first
+        try:
+            files = reader.json("repos/%s/pulls/%d/files?per_page=%d" % (repo, m["pr"], MAX_PR_FILES))
+        except Exception:
+            continue
+        names = [f.get("filename") for f in files if isinstance(f, dict) and isinstance(f.get("filename"), str)] if isinstance(files, list) else []
+        if any(touches(names, t) for t in tests):
+            likely = m
+            break
+    cached[head] = {"merges": merges, "more": more, "likely": likely}
+    return cached[head]
+
+
+def _tell(sb, engine, hub, discovery, memory, safe, repo, head, run, failed, news, repeated, now, reader=None, before_head=None, failed_ids=()):
     """True when every recipient was told (a recipient already told is not told again). The Chief of Staff always; the merging lane too when it is known."""
     chiefs = sb.chiefs_of_staff(discovery)
     if not chiefs:
         memory["retry"][head] = now + RETRY_SECONDS
         return False
     number = pr_of(run)
-    lane = None
-    if number is not None:
-        item = sb.GitHubItem("tip:%s" % head, "tip", "", repo, [], [("pr", number)], sb.PROG, now, numbers=[number])
-        try:
-            lane = hub.route_of(item, discovery.agents, now)[0]
-        except Exception:
-            lane = None
-    line = build_line(safe, repo, head, number, news, repeated)
+    span = _span(sb, hub, discovery, memory, repo, head, before_head, reader, failed_ids, now) if reader is not None else None
+    if span:
+        lane = span["likely"]["lane"] if span["likely"] else None   # the likeliest pull request's lane; else the Chief of Staff alone
+        number = span["likely"]["pr"] if span["likely"] else None
+    else:
+        lane = _lane(sb, hub, discovery, repo, head, number, now)
+    line = build_line(safe, repo, head, number, news, repeated, span)
     state = memory["sent"].setdefault(head, {"failed": failed, "to": set()})
     ok = True
     for to in [chiefs[0]] + ([lane] if lane and lane != chiefs[0] else []):
