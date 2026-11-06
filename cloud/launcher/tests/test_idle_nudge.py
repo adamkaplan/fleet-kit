@@ -16,7 +16,7 @@ import test_git_token_renewal as tr  # noqa: E402
 cw = tr.cw
 NOW = dt.datetime(2026, 11, 3, 12, 0, 0, tzinfo=dt.timezone.utc)
 CONTROL_SRC = textwrap.dedent(inspect.getsource(cw.Launcher.send_idle_nudges))
-SKIP_RESULTS = '            if seen != "no":\n                continue\n'
+SKIP_RESULTS = '            if seen != "no" and not results_not_finished(seen):\n                continue\n'
 MARK_CALL = "            self.kube.annotate(name, (pod.get(\"metadata\") or {}).get(\"uid\"), **{IDLE_NUDGE_MARK: \"sent\"})\n"
 
 
