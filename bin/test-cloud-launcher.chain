@@ -54,6 +54,7 @@ cloud/launcher/tests/test_issues_read.py
 cloud/launcher/tests/test_kept_failed_once.py
 cloud/launcher/tests/test_kept_running_once.py
 cloud/launcher/tests/test_known_forms.py
+cloud/launcher/tests/test_launch_idempotent.py
 cloud/launcher/tests/test_m_cap.py
 cloud/launcher/tests/test_mint_retry.py
 cloud/launcher/tests/test_mint_roles.py
@@ -61,7 +62,6 @@ cloud/launcher/tests/test_model_credential.py
 cloud/launcher/tests/test_needs_docker_hermetic.py
 cloud/launcher/tests/test_no_commit_mark.py
 cloud/launcher/tests/test_no_open_files.py
-cloud/launcher/tests/test_nudge_reused.py
 cloud/launcher/tests/test_orchestrator_agent.py
 cloud/launcher/tests/test_orchestrator_hub_session.py
 cloud/launcher/tests/test_orchestrator_row.py
@@ -98,6 +98,7 @@ cloud/launcher/tests/test_stack_model_key.py
 cloud/launcher/tests/test_stack_registry_check.py
 cloud/launcher/tests/test_stack_registry_pod.py
 cloud/launcher/tests/test_stop_cause.py
+cloud/launcher/tests/test_stop_failed_pod.py
 cloud/launcher/tests/test_stop_no_checkout.py
 cloud/launcher/tests/test_stub_cleanup.py
 cloud/launcher/tests/test_token_at_limit.py

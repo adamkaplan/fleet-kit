@@ -2938,45 +2938,6 @@ KEPT_RUNNING_MARK = "kept_running_tried"
 KEPT_ENDED_NOTE = "kept pod ended: its work is unreachable by exec; the pod is left for a person"
 
 
-# The results check of the idle nudge: ONE read in the pod. It prints "no" (no /work/results.txt), or "<file mtime> <newest user message time>" in epoch
-# seconds (the session's messages, as cw-pod-inspect reads them), or "unreadable". The file is "finished" only when it is NEWER than that message.
-RESULTS_PROBE_CODE = """
-import base64, json, os, sys, urllib.request
-p = "/work/results.txt"
-if not os.path.exists(p):
-    print("no"); sys.exit(0)
-try:
-    port = os.environ.get("CW_ACTIVITY_PORT", "4096")
-    pw = open(os.environ.get("CW_ACTIVITY_PASSWORD_FILE", "/run/cw/server-password")).read().strip()
-    auth = "Basic " + base64.b64encode(("opencode:" + pw).encode()).decode()
-    def get(path):
-        r = urllib.request.urlopen(urllib.request.Request("http://127.0.0.1:%s%s" % (port, path), headers={"Authorization": auth}), timeout=10)
-        return json.loads(r.read().decode()).get("data")
-    sessions = get("/api/session")
-    sessions = list(sessions.values()) if isinstance(sessions, dict) else sessions
-    best = None
-    for s in sessions:
-        for m in get("/api/session/%s/message" % s["id"]) or []:
-            info = m.get("info") or m
-            if info.get("role") == "user":
-                t = (info.get("time") or {}).get("created")
-                if isinstance(t, (int, float)):
-                    best = max(best or 0, t / 1000.0 if t > 1e11 else t)
-    print(os.path.getmtime(p), best if best is not None else "unreadable")
-except Exception:
-    print("unreadable")
-"""
-
-
-def results_older_than_prompt(seen):
-    """True when the probe's answer is "<file mtime> <last user message time>" and the file is NOT newer than that message. Any other answer is False."""
-    try:
-        mtime, prompt = [float(x) for x in seen.split()]
-    except ValueError:
-        return False
-    return mtime <= prompt
-
-
 class Launcher:
     def __init__(self, kube, env, clock=None, sleep=time.sleep):
         self.kube, self.env, self.sleep = kube, env, sleep
@@ -3138,7 +3099,9 @@ class Launcher:
                     self._register(worker, run_values[CHANNEL_SECRET_KEY], spec if not persistent else {"metadata": {"name": name + "-0"}},
                                    self.env.get("CW_CLOUD_DOMAIN", "example.internal"), password, persistent, a.repo, issue_no)
                 self._make(made, "sts" if persistent else "pod", self.kube.apply, spec)
-                if getattr(a, "stack", False):
+                if getattr(a, "no_wait", False):
+                    pass   # the caller asked to return once the pod is requested: it reads the pod's readiness itself
+                elif getattr(a, "stack", False):
                     self._start_stack_pod(worker, name, spec, made, a.wait)
                 else:
                     self._wait_ready(name + "-0" if persistent else name, a.wait)
@@ -4083,7 +4046,8 @@ class Launcher:
             meta = pod.get("metadata") or {}
             pods.append({"name": meta.get("name"), "worker": ann(pod, "worker"),
                          "phase": safe_value((pod.get("status") or {}).get("phase")) if (pod.get("status") or {}).get("phase") else None,
-                         "node": (pod.get("spec") or {}).get("nodeName"), "hard_deadline": ann(pod, "hard-deadline")})
+                         "node": (pod.get("spec") or {}).get("nodeName"), "hard_deadline": ann(pod, "hard-deadline"),
+                         "ready": any(c.get("type") == "Ready" and c.get("status") == "True" for c in ((pod.get("status") or {}).get("conditions") or []) if isinstance(c, dict))})
         nodes, nodes_read, nodes_error = [], True, None
         try:
             for node in self.kube.list_nodes():
@@ -4530,10 +4494,10 @@ class Launcher:
                 if not idle_nudge_due(False, act[1], now, idle, "", ann(pod, "role", "worker"), False):
                     continue
                 try:   # one read-only exec: it prints yes or no; a failure to run means do not nudge
-                    seen = self.kube.exec(name, "python3", "-c", RESULTS_PROBE_CODE).strip()
+                    seen = self.kube.exec(name, "sh", "-c", "test -e /work/results.txt && echo yes || echo no").strip()
                 except CloudError:
                     continue
-                if seen != "no" and not results_older_than_prompt(seen):
+                if seen != "no":
                     continue
                 self.kube.annotate(name, (pod.get("metadata") or {}).get("uid"), **{IDLE_NUDGE_MARK: "sent"})
                 self.send_note(name, IDLE_NUDGE)
@@ -5257,6 +5221,7 @@ def build_parser():
     c.add_argument("--persistent", action="store_true",
                    help="with --agent orchestrator and the per-run git-token Secret: an always-on orchestrator as ONE StatefulSet (restart always, no deadline, no idle limit); ended only by an explicit stop; refused for a worker or a stack launch")
     c.add_argument("--wait", type=int, default=300)
+    c.add_argument("--no-wait", action="store_true", help="return once the pod is requested, without waiting for it to be ready (the caller reads the pod's state later)")
     c.add_argument("--pull-secret", help="name of an existing image-pull Secret (pull-only) for imagePullSecrets")
     c.add_argument("--run-secret-fd", action="append", default=[], metavar="NAME=N",
                    help="repeatable; the value is read from inherited descriptor N and piped to kubectl's stdin into the run's one Secret, mounted read-only at /run/cw/NAME (0400), deleted with the pod")
