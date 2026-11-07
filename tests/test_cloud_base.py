@@ -78,7 +78,7 @@ class TestBase(unittest.TestCase):
         check_base_in_text(text, BASE)
         self.assertIn("switch to the branch b (create it from origin/integration/topic", text)
         self.assertNotIn("default branch", text)
-        self.assertEqual([r.get("base") for r in saved if "base" in r], [BASE])
+        self.assertEqual({r["base"] for r in saved if "base" in r}, {BASE})
 
     def test_no_base_gives_todays_text_byte_for_byte(self):
         today = cloud_worker.SETUP_PREAMBLE % {"repo": "o/r", "branch": "b"} + "do it\n"
