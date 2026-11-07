@@ -2,6 +2,7 @@
 
 A fake audit file, fake run record directories, a recording send and a temporary state directory. Nothing is stopped, nothing is called on a cluster."""
 import argparse
+import gzip
 import json
 import os
 import random
@@ -919,6 +920,203 @@ class TestEndNoticeHeadLine(unittest.TestCase):
         self.assertEqual(self.line(self.PUSHED, "ok"), "Last head: feat/x@aaaaaaaa, checks ok.")
         for bad in ("feat/x y", "a;b", "unknown", "x" * 101, 5):
             self.assertEqual(self.line(dict(self.PUSHED, head_on=bad)), "Last head: head unknown.")
+
+
+class TestEndNoticeOwnPushes(unittest.TestCase):
+    """Fix forward of #2267: a pod that pushed to its own branch (the end hook saw only the launch branch) is not 'nothing pushed'."""
+
+    NOTHING = {"pushed": False, "wip_branch": None, "head_on": None}
+    PUSHED = {"pushed": False, "wip_branch": None, "head_on": "feat/x"}
+    SHA = "b" * 40
+
+    def audit_with(self, *lines):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        path = os.path.join(d, "audit.jsonl")
+        Path(path).write_text("".join(json.dumps(x) + "\n" for x in lines))
+        return path
+
+    def sent(self, worker, branch, sha):
+        return {"event": "push_watch.sent", "subject": worker, "detail": {"to": "boss", "sha": sha[:8], "branch": branch, "head": sha}}
+
+    def born(self, worker):
+        return {"event": "cloud.created", "subject": worker, "detail": {}}
+
+    def world(self, name, hook, audit_path, head_sha=None):
+        w = StopWorld(self)
+        rec = w.pod(name, "words")
+        (rec / "run.json").write_text(json.dumps({"head_sha": head_sha, "end_hook": hook}))
+        (w.cloud / (name + ".json")).write_text(json.dumps({"worker": name, "reports_to": "boss-lane", "repo": "o/r"}))
+        w.stop(name, "hard", rec)
+        parse = sb.load_module("record_json").parse_bounded
+        mod = sb.load_module("cloud_end_alert")
+        w.mod.scan_audit(w.audit, w.state_file, w.cloud, w.reports, lambda to, text: w.sent.append((to, text)), parse, None, None,
+                         head_checks=lambda repo, sha: "passed", last_push=mod.push_reader(audit_path, parse))
+        return w.to("boss-lane")[0]
+
+    def test_own_push_in_the_audit_is_named_when_the_hook_saw_nothing(self):
+        path = self.audit_with(self.sent("cb-own1", "old/b", "c" * 40), self.sent("other", "z/z", "d" * 40), self.sent("cb-own1", "cb-own1/work", self.SHA))
+        self.assertIn("Last head: cb-own1/work@bbbbbbbb, checks passed.", self.world("cb-own1", self.NOTHING, path))
+
+    def test_control_no_push_anywhere_says_nothing_pushed(self):
+        path = self.audit_with(self.born("cb-own2"), self.sent("other", "z/z", "d" * 40))
+        self.assertIn("Last head: nothing pushed.", self.world("cb-own2", self.NOTHING, path))
+
+    def test_a_small_live_file_without_the_pods_creation_is_head_unknown(self):
+        path = self.audit_with(self.sent("other", "z/z", "d" * 40), self.born("someone-else"))   # no cloud.created of cb-own20 in view
+        self.assertLess(os.path.getsize(path), sb.load_module("cloud_end_alert").READ_BYTES)
+        self.assertIn("Last head: head unknown.", self.world("cb-own20", self.NOTHING, path))
+
+    def test_an_empty_audit_file_is_head_unknown(self):
+        self.assertIn("Last head: head unknown.", self.world("cb-own23", self.NOTHING, self.audit_with()))
+
+    def test_the_readers_answers_for_the_pods_own_creation(self):
+        mod, parse = sb.load_module("cloud_end_alert"), sb.load_module("record_json").parse_bounded
+        path = self.audit_with(self.born("someone-else"))
+        self.assertEqual(mod.push_reader(path, parse)("cb-own24"), mod.UNPROVEN)   # another pod's creation is not this pod's
+        path = self.audit_with(self.born("cb-own24"))
+        self.assertIsNone(mod.push_reader(path, parse)("cb-own24"))
+
+    def test_an_audit_that_cannot_be_read_claims_nothing_on_purpose(self):
+        """The documented fail-open exception (the end hook's answer shows): do not turn it into UNPROVEN."""
+        mod, parse = sb.load_module("cloud_end_alert"), sb.load_module("record_json").parse_bounded
+        self.assertIsNone(mod.push_reader(None, parse)("cb-own25"))
+        self.assertIsNone(mod.push_reader("/nonexistent/audit.jsonl", parse)("cb-own25"))
+        path = self.audit_with(self.born("cb-own25"))
+        with mock.patch.object(mod.os, "read", side_effect=OSError("x")):
+            self.assertIsNone(mod.push_reader(path, parse)("cb-own25"))
+
+    def test_a_rotated_audit_with_the_pods_creation_in_the_archive_is_head_unknown(self):
+        path = self.audit_with(self.sent("other", "z/z", "d" * 40))
+        with gzip.open(os.path.join(os.path.dirname(path), "audit-2026-11-01.jsonl.gz"), "wt") as gz:   # the archive holds the creation and the push
+            gz.write(json.dumps(self.born("cb-own21")) + "\n" + json.dumps(self.sent("cb-own21", "own/b", self.SHA)) + "\n")
+        self.assertIn("Last head: head unknown.", self.world("cb-own21", self.NOTHING, path))
+
+    def test_the_pods_creation_in_view_and_a_push_after_it_is_named(self):
+        path = self.audit_with(self.born("cb-own22"), self.sent("cb-own22", "own/b", self.SHA))
+        self.assertIn("Last head: own/b@bbbbbbbb", self.world("cb-own22", self.NOTHING, path))
+
+    def test_the_hooks_own_head_wins(self):
+        path = self.audit_with(self.sent("cb-own3", "cb-own3/work", self.SHA))
+        self.assertIn("Last head: feat/x@aaaaaaaa, checks passed.", self.world("cb-own3", self.PUSHED, path, head_sha="a" * 40))
+
+    def test_unreadable_audit_keeps_the_old_behaviour(self):
+        self.assertIn("Last head: nothing pushed.", self.world("cb-own4", self.NOTHING, "/nonexistent/audit.jsonl"))
+
+    def test_each_guard_of_the_reader_drops_its_own_hostile_line(self):
+        for branch, sha in (("bad branch\n<x>", self.SHA), ("a" * 31, self.SHA), ("ghp_x", self.SHA), ("sk-ab", self.SHA), ("AKIAxx", self.SHA), ("xoxb-1", self.SHA), ("eyJx", self.SHA), ("github_pat_x", self.SHA), ("unknown", self.SHA),
+                            ("a/" * 50 + "b", self.SHA), ("ok/b", "bbbbbbbb"), ("ok/b", "B" * 40), ("ok/b", 5), (5, self.SHA)):
+            path = self.audit_with(self.born("cb-own5"), {"event": "push_watch.sent", "subject": "cb-own5", "detail": {"branch": branch, "head": sha}})
+            self.assertIn("Last head: nothing pushed.", self.world("cb-own5", self.NOTHING, path), (branch, sha))
+
+    def test_garbage_and_misshapen_lines_are_skipped_and_an_earlier_push_wins(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        path = os.path.join(d, "audit.jsonl")
+        Path(path).write_text("\n".join([json.dumps(self.sent("cb-own13", "ok/b", self.SHA)), "push_watch.sent {not json", json.dumps(["push_watch.sent"]),
+                                          json.dumps({"event": "push_watch.sent", "subject": "cb-own13", "detail": "str"})]) + "\n")
+        self.assertIn("Last head: ok/b@bbbbbbbb", self.world("cb-own13", self.NOTHING, path))
+
+    def test_a_line_written_by_the_real_appender_is_read_back(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        path = os.path.join(d, "audit.jsonl")
+        sb.AuditLog(path).append("daemon", "push_watch.sent", "cb-own14", {"to": "boss", "sha": self.SHA[:8], "branch": "own/b", "head": self.SHA})   # redaction is by key name
+        self.assertIn("Last head: own/b@bbbbbbbb", self.world("cb-own14", self.NOTHING, path))
+
+    def test_another_pods_creation_does_not_reset_this_pods_push(self):
+        other = {"event": "cloud.created", "subject": "someone-else", "detail": {}}
+        path = self.audit_with(self.sent("cb-own15", "own/b", self.SHA), other)
+        self.assertIn("Last head: own/b@bbbbbbbb", self.world("cb-own15", self.NOTHING, path))
+
+    def test_no_audit_path_reads_no_file_named_none(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        Path(d, "None").write_text(json.dumps(self.sent("cb-own16", "own/b", self.SHA)) + "\n")
+        here = os.getcwd()
+        os.chdir(d)
+        self.addCleanup(os.chdir, here)
+        self.assertIsNone(sb.load_module("cloud_end_alert").push_reader(None, sb.load_module("record_json").parse_bounded)("cb-own16"))
+
+    def test_a_valid_push_survives_a_newer_hostile_line(self):
+        path = self.audit_with(self.sent("cb-own7", "ok/b", self.SHA), self.sent("cb-own7", "bad branch", "c" * 40))
+        self.assertIn("Last head: ok/b@bbbbbbbb", self.world("cb-own7", self.NOTHING, path))
+
+    def test_a_push_of_an_earlier_pod_of_the_same_name_is_not_this_pods(self):
+        created = {"event": "cloud.created", "subject": "cb-own8", "detail": {}}
+        path = self.audit_with(self.sent("cb-own8", "old/b", self.SHA), created)
+        self.assertIn("Last head: nothing pushed.", self.world("cb-own8", self.NOTHING, path))
+        path = self.audit_with(self.sent("cb-own8", "old/b", self.SHA), created, self.sent("cb-own8", "new/b", "c" * 40))
+        self.assertIn("Last head: new/b@cccccccc", self.world("cb-own8", self.NOTHING, path))
+
+    def test_only_the_tail_of_a_large_audit_is_read_and_a_cut_push_line_is_not_reported(self):
+        mod = sb.load_module("cloud_end_alert")
+        pad = json.dumps({"event": "x", "subject": "p", "detail": {"t": "y" * 1000}}) + "\n"
+        push = json.dumps(self.sent("cb-own9", "gone/b", self.SHA)) + "\n"
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        path = os.path.join(d, "audit.jsonl")
+        want = mod.READ_BYTES - len(push) // 2   # bytes after the push line: the read window then starts in the middle of the push line
+        empty = len(json.dumps({"event": "x", "subject": "p", "detail": {"t": ""}})) + 1
+        body = push + json.dumps({"event": "x", "subject": "p", "detail": {"t": "y" * (want - empty)}}) + "\n"
+        Path(path).write_text(body)
+        self.assertTrue(0 < len(body) - mod.READ_BYTES < len(push), "fixture: the window must start inside the push line")
+        self.assertIn("Last head: head unknown.", self.world("cb-own9", self.NOTHING, path))   # not proven: the window does not show the pod's start
+        Path(path).write_text(pad * (mod.READ_BYTES // len(pad) // 2) + json.dumps({"event": "cloud.created", "subject": "cb-own9", "detail": {}}) + "\n" + pad * (mod.READ_BYTES // len(pad) // 2 + 5))
+        self.assertGreater(os.path.getsize(path), mod.READ_BYTES)
+        self.assertIn("Last head: nothing pushed.", self.world("cb-own9", self.NOTHING, path))   # proven: the pod's creation is in view
+        Path(path).write_text(pad * (mod.READ_BYTES // len(pad) + 5) + json.dumps(self.sent("cb-own9", "near/b", self.SHA)) + "\n")
+        self.assertIn("Last head: near/b@bbbbbbbb", self.world("cb-own9", self.NOTHING, path))
+
+    def test_a_clean_hook_branch_without_a_sha_falls_back_to_the_own_push(self):
+        path = self.audit_with(self.sent("cb-own17", "own/b", self.SHA))
+        self.assertIn("Last head: own/b@bbbbbbbb", self.world("cb-own17", self.PUSHED, path, head_sha=None))
+
+    def test_another_event_naming_push_watch_sent_is_no_push(self):
+        path = self.audit_with(self.born("cb-own18"), {"event": "push_watch.quiet", "subject": "cb-own18", "detail": {"note": "push_watch.sent", "branch": "own/b", "head": self.SHA}})
+        self.assertIn("Last head: nothing pushed.", self.world("cb-own18", self.NOTHING, path))
+
+    def test_a_hook_with_an_error_and_no_head_falls_back_to_the_own_push(self):
+        path = self.audit_with(self.sent("cb-own10", "own/b", self.SHA))
+        self.assertIn("Last head: own/b@bbbbbbbb", self.world("cb-own10", {"error": "x", "head_on": None, "wip_branch": None}, path))
+
+    def test_a_fifo_or_symlink_audit_is_not_read(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        fifo = os.path.join(d, "f")
+        os.mkfifo(fifo)
+        real = self.audit_with(self.sent("cb-own11", "own/b", self.SHA))
+        link = os.path.join(d, "l")
+        os.symlink(real, link)
+        for path in (fifo, link):
+            self.assertIn("Last head: nothing pushed.", self.world("cb-own11", self.NOTHING, path))
+
+    def test_the_daemon_tick_wires_the_reader_to_its_audit_file(self):
+        w = StopWorld(self)
+        rec = w.pod("cb-own12", "words")
+        (rec / "run.json").write_text(json.dumps({"head_sha": None, "end_hook": self.NOTHING}))
+        (w.cloud / "cb-own12.json").write_text(json.dumps({"worker": "cb-own12", "reports_to": "boss-lane", "repo": "o/r"}))
+        engine = mock.Mock()
+        engine.state_dir = str(w.state)
+        engine.audit.path = self.audit_with(self.sent("cb-own12", "own/b", self.SHA))
+        with mock.patch.dict(os.environ, {"CW_CLOUD_AUDIT": str(w.audit)}), mock.patch.object(sb, "cloud_head_checks", lambda e, repo, sha: "passed"):
+            sb.cloud_end_tick(engine, None)   # the first pass only marks the end of the file
+            w.stop("cb-own12", "hard", rec)
+            sb.cloud_end_tick(engine, None)
+        self.assertTrue(engine.send.called)
+        self.assertIn("Last head: own/b@bbbbbbbb, checks passed.", " ".join(str(c) for c in engine.send.call_args_list))
+
+    def test_a_raising_reader_keeps_the_old_behaviour(self):
+        w = StopWorld(self)
+        rec = w.pod("cb-own6", "words")
+        (rec / "run.json").write_text(json.dumps({"head_sha": None, "end_hook": self.NOTHING}))
+        (w.cloud / "cb-own6.json").write_text(json.dumps({"worker": "cb-own6", "reports_to": "boss-lane", "repo": "o/r"}))
+        w.stop("cb-own6", "hard", rec)
+        def boom(worker):
+            raise OSError("x")
+        w.mod.scan_audit(w.audit, w.state_file, w.cloud, w.reports, lambda to, text: w.sent.append((to, text)),
+                         sb.load_module("record_json").parse_bounded, None, None, head_checks=lambda r, s: "passed", last_push=boom)
+        self.assertIn("Last head: nothing pushed.", w.to("boss-lane")[0])
 
 
 class TestCloudHeadChecks(unittest.TestCase):

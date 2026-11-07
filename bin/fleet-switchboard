@@ -8532,7 +8532,8 @@ def cloud_end_tick(engine, discovery):
                                                      load_module("record_json").parse_bounded,
                                                      lambda worker, detail: engine.audit is not None and engine.audit.append(engine.actor, "cloud_end_alert.send_failed", worker, detail),
                                                      lambda directory, worker: load_module("cloud_worker").bind(globals())._retired().last_message(directory, state_dir, worker),
-                                                     head_checks=lambda repo, sha: cloud_head_checks(engine, repo, sha))
+                                                     head_checks=lambda repo, sha: cloud_head_checks(engine, repo, sha),
+                                                     last_push=load_module("cloud_end_alert").push_reader(getattr(getattr(engine, "audit", None), "path", None), load_module("record_json").parse_bounded))
 
 
 def cloud_turn_activity(worker):

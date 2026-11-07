@@ -141,6 +141,32 @@ class TestPushWatch(Case):
         self.run_pass(NOW + 1)
         self.assertEqual(len([t for t in self.to("lane-a") if "pushed" in t]), 1)
 
+    def test_the_sent_audit_line_names_the_branch_and_the_full_head_and_the_end_notice_reader_takes_it(self):
+        self.world.refs = {"w-a/wip": SHA_A}
+        self.run_pass(NOW)
+        self.run_pass(NOW + 1)
+        sent = [l for l in self.engine.audit.lines if l[0] == "push_watch.sent" and l[1] == "w-a"]
+        self.assertEqual(len(sent), 1)
+        self.assertEqual((sent[0][2]["branch"], sent[0][2]["head"], sent[0][2]["sha"]), ("w-a/wip", SHA_A, SHA_A[:8]))
+        path = Path(self.tmp.name) / "audit.jsonl"
+        path.write_text(json.dumps({"event": "push_watch.sent", "subject": "w-a", "detail": sent[0][2]}) + "\n")
+        reader = importlib.util.module_from_spec(importlib.util.spec_from_file_location("cea_2267", REPO / "bin" / "cloud_end_alert.py"))
+        reader.__spec__.loader.exec_module(reader)
+        self.assertEqual(reader.push_reader(str(path), json.loads)("w-a"), ("w-a/wip", SHA_A))
+
+    def test_a_hostile_branch_is_cleaned_at_the_write_site_and_a_plain_one_is_kept(self):
+        for ref, want in (("w-a/wip", "w-a/wip"), ("w-a/wip`<x>@y\"" + "z" * 200, None)):
+            self.setUp()   # a fresh fixture per case
+            self.world.refs = {ref: SHA_A}
+            self.run_pass(NOW)
+            self.run_pass(NOW + 1)
+            sent = [l[2]["branch"] for l in self.engine.audit.lines if l[0] == "push_watch.sent" and l[1] == "w-a"]
+            self.assertEqual(len(sent), 1, ref)
+            self.assertNotRegex(sent[0], r"[\x00-\x1f`<>@\"]")
+            self.assertLessEqual(len(sent[0]), 100)
+            self.assertTrue(sent[0].startswith("w-a/wip"))
+            if want:
+                self.assertEqual(sent[0], want)
 
     def test_s2_the_launching_lane_gets_one_item_and_the_other_lane_none(self):
         self.world.refs = {"w-a/wip": SHA_A}
