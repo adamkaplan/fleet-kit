@@ -141,7 +141,6 @@ class TestPushWatch(Case):
         self.run_pass(NOW + 1)
         self.assertEqual(len([t for t in self.to("lane-a") if "pushed" in t]), 1)
 
-
     def test_the_sent_audit_line_names_the_branch_and_the_full_head_and_the_end_notice_reader_takes_it(self):
         self.world.refs = {"w-a/wip": SHA_A}
         self.run_pass(NOW)
@@ -154,6 +153,15 @@ class TestPushWatch(Case):
         reader = importlib.util.module_from_spec(importlib.util.spec_from_file_location("cea_2267", REPO / "bin" / "cloud_end_alert.py"))
         reader.__spec__.loader.exec_module(reader)
         self.assertEqual(reader.push_reader(str(path), json.loads)("w-a"), ("w-a/wip", SHA_A))
+
+    def test_a_hostile_branch_is_cleaned_at_the_write_site(self):
+        self.world.refs = {"w-a/wip`<x>\n" + "z" * 200: SHA_A}
+        self.run_pass(NOW)
+        self.run_pass(NOW + 1)
+        for l in self.engine.audit.lines:
+            if l[0] == "push_watch.sent":
+                self.assertLessEqual(len(l[2]["branch"]), 100)
+                self.assertNotRegex(l[2]["branch"], r"[\x00-\x1f`<>]")
 
     def test_s2_the_launching_lane_gets_one_item_and_the_other_lane_none(self):
         self.world.refs = {"w-a/wip": SHA_A}

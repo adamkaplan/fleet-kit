@@ -966,10 +966,25 @@ class TestEndNoticeOwnPushes(unittest.TestCase):
         self.assertIn("Last head: nothing pushed.", self.world("cb-own4", self.NOTHING, "/nonexistent/audit.jsonl"))
 
     def test_each_guard_of_the_reader_drops_its_own_hostile_line(self):
-        for n, (branch, sha) in enumerate((("bad branch\n<x>", self.SHA), ("sk-abcdefghijkl", self.SHA), ("ghp_" + "a" * 36, self.SHA),
-                                           ("ok/b", "bbbbbbbb"), ("ok/b", "B" * 40), ("ok/b", 5), (5, self.SHA))):
-            path = self.audit_with(self.sent("cb-own5", branch, self.SHA if sha is None else "c" * 40) | {"detail": {"branch": branch, "head": sha}})
+        for branch, sha in (("bad branch\n<x>", self.SHA), ("a" * 31, self.SHA), ("ghp_x", self.SHA), ("sk-ab", self.SHA), ("unknown", self.SHA),
+                            ("a/" * 50 + "b", self.SHA), ("ok/b", "bbbbbbbb"), ("ok/b", "B" * 40), ("ok/b", 5), (5, self.SHA)):
+            path = self.audit_with({"event": "push_watch.sent", "subject": "cb-own5", "detail": {"branch": branch, "head": sha}})
             self.assertIn("Last head: nothing pushed.", self.world("cb-own5", self.NOTHING, path), (branch, sha))
+
+    def test_garbage_and_misshapen_lines_are_skipped_and_an_earlier_push_wins(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        path = os.path.join(d, "audit.jsonl")
+        Path(path).write_text("\n".join([json.dumps(self.sent("cb-own13", "ok/b", self.SHA)), "push_watch.sent {not json", json.dumps(["push_watch.sent"]),
+                                          json.dumps({"event": "push_watch.sent", "subject": "cb-own13", "detail": "str"})]) + "\n")
+        self.assertIn("Last head: ok/b@bbbbbbbb", self.world("cb-own13", self.NOTHING, path))
+
+    def test_a_line_written_by_the_real_appender_is_read_back(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        path = os.path.join(d, "audit.jsonl")
+        sb.AuditLog(path).append("daemon", "push_watch.sent", "cb-own14", {"to": "boss", "sha": self.SHA[:8], "branch": "own/b", "head": self.SHA})   # redaction is by key name
+        self.assertIn("Last head: own/b@bbbbbbbb", self.world("cb-own14", self.NOTHING, path))
 
     def test_a_valid_push_survives_a_newer_hostile_line(self):
         path = self.audit_with(self.sent("cb-own7", "ok/b", self.SHA), self.sent("cb-own7", "bad branch", "c" * 40))
@@ -982,13 +997,21 @@ class TestEndNoticeOwnPushes(unittest.TestCase):
         path = self.audit_with(self.sent("cb-own8", "old/b", self.SHA), created, self.sent("cb-own8", "new/b", "c" * 40))
         self.assertIn("Last head: new/b@cccccccc", self.world("cb-own8", self.NOTHING, path))
 
-    def test_only_the_tail_of_a_large_audit_is_read_and_a_cut_first_line_is_skipped(self):
+    def test_only_the_tail_of_a_large_audit_is_read_and_a_cut_push_line_is_not_reported(self):
         mod = sb.load_module("cloud_end_alert")
-        pad = {"event": "x", "subject": "p", "detail": {"t": "y" * 1000}}
-        lines = [self.sent("cb-own9", "gone/b", self.SHA)] + [pad] * (mod.READ_BYTES // 1000 + 5)
-        self.assertIn("Last head: nothing pushed.", self.world("cb-own9", self.NOTHING, self.audit_with(*lines)))
-        lines = [pad] * (mod.READ_BYTES // 1000 + 5) + [self.sent("cb-own9", "near/b", self.SHA)]
-        self.assertIn("Last head: near/b@bbbbbbbb", self.world("cb-own9", self.NOTHING, self.audit_with(*lines)))
+        pad = json.dumps({"event": "x", "subject": "p", "detail": {"t": "y" * 1000}}) + "\n"
+        push = json.dumps(self.sent("cb-own9", "gone/b", self.SHA)) + "\n"
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        path = os.path.join(d, "audit.jsonl")
+        want = mod.READ_BYTES - len(push) // 2   # bytes after the push line: the read window then starts in the middle of the push line
+        filler = json.dumps({"event": "x", "subject": "p", "detail": {"t": ""}}) + "\n"
+        body = push + json.dumps({"event": "x", "subject": "p", "detail": {"t": "y" * (want - len(filler))}}) + "\n"
+        Path(path).write_text(body)
+        self.assertTrue(0 < len(body) - mod.READ_BYTES < len(push))
+        self.assertIn("Last head: nothing pushed.", self.world("cb-own9", self.NOTHING, path))
+        Path(path).write_text(pad * (mod.READ_BYTES // len(pad) + 5) + json.dumps(self.sent("cb-own9", "near/b", self.SHA)) + "\n")
+        self.assertIn("Last head: near/b@bbbbbbbb", self.world("cb-own9", self.NOTHING, path))
 
     def test_a_hook_with_an_error_and_no_head_falls_back_to_the_own_push(self):
         path = self.audit_with(self.sent("cb-own10", "own/b", self.SHA))

@@ -188,9 +188,10 @@ def push_reader(audit_path, parse):
         except (OSError, TypeError, ValueError):
             return None
         try:
-            if not stat.S_ISREG(os.fstat(fd).st_mode):
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode):
                 return None
-            size = os.fstat(fd).st_size
+            size = info.st_size
             os.lseek(fd, max(0, size - READ_BYTES), os.SEEK_SET)
             chunk = os.read(fd, READ_BYTES)
         except OSError:
