@@ -823,7 +823,7 @@ def _launch(args, runner, now, reserve):
                     os.close(write_fd)
             del model, token, run_secrets
             if code != 0:
-                _audit(engine, "cloud.create_failed", name, {"exit": code, "reason": _one(note, 160)})
+                _audit(engine, "cloud.create_failed", name, dict({"exit": code, "reason": _one(note, 160)}, **({"boss": args.reports_to} if args.reports_to else {})))
                 raise LaunchError("the cloud worker was not created: %s" % _reason(code, note))
             try:
                 password = _read_password(read_fd)
