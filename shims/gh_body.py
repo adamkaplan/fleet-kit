@@ -30,13 +30,18 @@ DONE_RE = re.compile(r"^Done when:", re.M)
 UPDATE_RE = re.compile(r"\bupdateIssue\b")
 MAX_TEXT = 1048576
 WHY_CHARS = 200   # the read's stderr as the refusal shows it: the first this many characters, one line
-TOKEN_ENV_NAMES = ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN")
+WHY_READ = 4096   # only this much of the stderr is ever scanned (a limit on the work, whatever the read printed)
+TOKEN_ENV_NAMES = ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN")   # the same four as shims/gh (a test compares them)
+# A net, not a promise: the shapes of `_SECRET_PATTERNS` in bin/fleet-switchboard (this file stands alone), every run of name characters bounded so no scan is quadratic.
 SECRET_PATTERNS = (
-    (re.compile(r"(?i)\b(bearer|basic)\s+[A-Za-z0-9._~+/=-]{6,}"), r"\1 [redacted]"),
-    (re.compile(r"(?i)(?<![A-Za-z0-9_.-])([A-Za-z0-9_.-]*(?:token|secret|passw(?:or)?d|api[_-]?key|credential|auth)[A-Za-z0-9_.-]*[\"']?\s*[=:]\s*)"
-                r"(\"[^\"]*\"|'[^']*'|\S+)"), r"\1[redacted]"),
-    (re.compile(r"\b(?:sk-[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{12,}|xox[abprs]-[A-Za-z0-9-]{8,})"), "[redacted]"),
+    (re.compile(r"(?i)\b(bearer|basic|token|digest|negotiate)\s+[A-Za-z0-9._~+/=-]{6,}"), r"\1 [redacted]"),
+    (re.compile(r"(?i)(?<![A-Za-z0-9_.-])([A-Za-z0-9_.-]{0,64}(?:token|secret|passw(?:or)?d|api[_-]?key|credential|auth)[A-Za-z0-9_.-]{0,64}[\"']?\s{0,4}[=:]\s{0,4})"
+                r"(\"[^\"]{0,512}\"|'[^']{0,512}'|\S+)"), r"\1[redacted]"),
+    (re.compile(r"(?i)(--?(?:token|password|passwd|secret|api-key)[ =])\S+"), r"\1[redacted]"),
+    (re.compile(r"\b(?:sk-[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9]{10,}|github_pat_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{12,}|xox[abprs]-[A-Za-z0-9-]{8,})"), "[redacted]"),
+    (re.compile(r"\b[0-9a-fA-F]{40}\b"), "[redacted]"),
     (re.compile(r"(://[^/\s:@]+:)\S{1,256}@"), r"\1[redacted]@"),
+    (re.compile(r"(://)[^/\s@:]{1,256}@"), r"\1[redacted]@"),
     (re.compile(r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}(?:\.[A-Za-z0-9_-]*)?"), "[redacted]"),
 )
 DROP = ("gh: refused: this body would drop the Intent or the Done-when of the issue; change one line with `fleet-switchboard issue-line`, "
@@ -70,15 +75,23 @@ def refusal(current_body, new_body):
 
 
 def clean_stderr(text, env=None, limit=WHY_CHARS):
-    """The first `limit` characters of a read's stderr as ONE line: control characters removed, anything token-shaped (and any token the read ran with) redacted."""
-    text = "".join(c if c.isprintable() else " " for c in str(text or ""))   # a newline or a control character is a space: one line
+    """The first `limit` characters of a read's stderr as ONE line of printable ASCII: control and other characters become spaces, anything token-shaped (and any
+    token the read ran with, also URL- or JSON-escaped) is redacted. Only the first WHY_READ characters are scanned; when there were more, the last word of them,
+    which may be a token cut in two, is dropped."""
+    raw = str(text or "")
+    cut = len(raw) > WHY_READ
+    raw = raw[:WHY_READ]
+    raw = "".join(c if c.isascii() and c.isprintable() else " " for c in raw)
+    if cut:
+        raw = raw.rstrip().rpartition(" ")[0]
     for name in TOKEN_ENV_NAMES:
         value = (env or {}).get(name)
         if value and len(value) >= 4:
-            text = text.replace(value, "[redacted]")
+            for form in {value, urllib.parse.quote(value, safe=""), json.dumps(value)[1:-1]}:
+                raw = raw.replace(form, "[redacted]")
     for pattern, replacement in SECRET_PATTERNS:
-        text = pattern.sub(replacement, text)
-    return " ".join(text.split())[:limit]
+        raw = pattern.sub(replacement, raw)
+    return " ".join(raw.split())[:limit]
 
 
 class Unclassified(Exception):
@@ -154,7 +167,7 @@ class Probe:
             env = dict(self.env_of() or os.environ)
             env["GH_PROMPT_DISABLED"] = "1"
             env["GH_PAGER"] = "cat"
-            done = subprocess.run([self.gh] + argv, capture_output=True, text=True, timeout=left, stdin=subprocess.DEVNULL, env=env)
+            done = subprocess.run([self.gh] + argv, capture_output=True, text=True, errors="replace", timeout=left, stdin=subprocess.DEVNULL, env=env)
             if done.returncode != 0:
                 said = clean_stderr(done.stderr, env)
                 self.why = "the read exited with status %d%s" % (done.returncode, ": " + said if said else "")

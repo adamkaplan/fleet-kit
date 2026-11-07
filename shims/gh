@@ -2942,18 +2942,23 @@ def hold_probe(args, lookup, gh, write):
 
 
 def body_read_env(gh, lookup, args, write):
-    """The env_of of the body guard's read: the account of the write it guards, worked out ONCE, strictly like the write (#2256). A lookup that fails is
-    retried once with a fresh deadline and then raises (the guard says so) instead of leaving the read to the inherited or stored login, which may be an
-    account that cannot read the repository (HTTP 404, exit 1)."""
-    found = []
+    """The env_of of the body guard's read: the account of the write it guards, worked out ONCE (a failure too, which is raised again, not looked up again), strictly
+    like the write (#2256). A lookup that fails is retried once with a fresh deadline and then raises; the guard turns that into a refusal of the write that names the
+    exception's type. It never leaves a WRITE's read to the inherited or stored login, which may be an account that cannot read the repository (HTTP 404, exit 1)."""
+    done = []
 
     def env_of():
-        if not found:
+        if not done:
             try:
-                found.append(account_env(gh, lookup, strict=write, args=args))
-            except AccountLookupFailed:
-                found.append(account_env(gh, Lookup(write=True), strict=True, args=args))
-        return found[0]
+                try:
+                    done.append((account_env(gh, lookup, strict=write, args=args), None))
+                except AccountLookupFailed:
+                    done.append((account_env(gh, Lookup(write=write), strict=write, args=args), None))
+            except Exception as err:
+                done.append((None, err))
+        if done[0][1] is not None:
+            raise done[0][1]
+        return done[0][0]
     return env_of
 
 

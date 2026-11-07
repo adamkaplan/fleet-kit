@@ -8,10 +8,12 @@ import importlib.util
 import itertools
 import json
 import pathlib
+import shlex
 import subprocess
 import sys
 import unittest
 import unittest.mock
+import urllib.parse
 
 from test_gh_shim_sign import REPO, SHIM_DIR, Rig
 
@@ -215,9 +217,8 @@ class TestGhBodyMutants(unittest.TestCase):
                 self.assertTrue(any(text in f for f in failures), (label, failures))
 
 
-class TestGhBodyReadHasItsOwnClock(unittest.TestCase):
-    """#2256: the body read's time limit is counted from the read; a failed read names its reason."""
-    OLD_TEXT = "could not be read, or is empty"
+class FakeGhMixin:
+    """A fake real gh (a shell script) in a temporary directory, and a read of it through the guard."""
 
     def setUp(self):
         import os
@@ -241,6 +242,12 @@ class TestGhBodyReadHasItsOwnClock(unittest.TestCase):
         probe = module.Probe(self.gh, lambda: None, None)
         time.sleep(spend)
         return module.check_current(probe, ["issue", "view", "1", "--json", "body"], "no parts here\n")
+
+
+
+class TestGhBodyReadHasItsOwnClock(FakeGhMixin, unittest.TestCase):
+    """#2256: the body read's time limit is counted from the read; a failed read names its reason."""
+    OLD_TEXT = "could not be read, or is empty"
 
     def test_S2_earlier_work_that_spends_the_limit_does_not_stop_the_read(self):
         self.fake("cat <<'EOF'\n" + json.dumps({"body": BOTH}) + "\nEOF")
@@ -285,88 +292,146 @@ class TestGhBodyReadHasItsOwnClock(unittest.TestCase):
         self.assertIn("the command's read budget is spent", got[3])
 
 
-class TestGhBodyReadNamesItsStderr(unittest.TestCase):
+class TestGhBodyReadNamesItsStderr(FakeGhMixin, unittest.TestCase):
     """#2256 fix forward: a read that exits non-zero names the first part of its stderr (one line, redacted) in the refusal."""
-    BASE = "9728245b"   # the integration tip before this change: its refusal names the status only
+    WORDS = "the read exited with status 1"
     FAKE_TOKEN = "ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2"
-    setUp, fake, check = TestGhBodyReadHasItsOwnClock.setUp, TestGhBodyReadHasItsOwnClock.fake, TestGhBodyReadHasItsOwnClock.check
+
+    def setUp(self):
+        FakeGhMixin.setUp(self)
+        self.env_patch = unittest.mock.patch.dict("os.environ", {"FLEET_SHIM_HOLD_SECONDS": "10"})   # a loaded runner must not turn a read into a time-out
+        self.env_patch.start()
+        self.addCleanup(self.env_patch.stop)
 
     def failing(self, module, said, env=None):
-        self.fake("printf '%s' " + json.dumps(said) + " >&2\nexit 1")
+        said_file = pathlib.Path(self.dir.name) / "said"
+        said_file.write_text(said)
+        self.fake("cat " + shlex.quote(str(said_file)) + " >&2\nexit 1")
         probe = module.Probe(self.gh, lambda: env, None)
         return module.check_current(probe, ["issue", "view", "1", "--json", "body"], "no parts here\n")
 
     def test_the_refusal_shows_the_stderr_of_the_read(self):
         got = self.failing(load_module(), "HTTP 404: Not Found")
-        self.assertIn("(the read exited with status 1: HTTP 404: Not Found)", got)
+        self.assertIn("(%s: HTTP 404: Not Found)" % self.WORDS, got)
 
     def test_a_silent_read_keeps_the_old_wording(self):
         self.fake("exit 1")
-        got = self.check(load_module())
-        self.assertIn("(the read exited with status 1)", got)
+        self.assertIn("(%s)" % self.WORDS, self.check(load_module()))
 
-    def test_a_token_in_the_stderr_is_redacted(self):
+    def test_a_benign_message_comes_through_unchanged(self):
+        said = "HTTP 404: Not Found (https://api.github.com/repos/o/r/issues/1)"
+        self.assertIn(": " + said + ")", self.failing(load_module(), said))
+
+    def test_every_secret_shape_is_redacted_and_the_context_is_kept(self):
         env = {"GH_TOKEN": "plainsecretvalue99"}
-        for said in ("bad %s here" % self.FAKE_TOKEN, "Authorization: Bearer abcdef123456", "token=abc123xyz", "failed with plainsecretvalue99 ok",
-                     "https://user:hunter2pass@example.com/x"):
-            with self.subTest(said=said):
-                got = self.failing(load_module(), said, env)
-                for secret in (self.FAKE_TOKEN, "abcdef123456", "abc123xyz", "plainsecretvalue99", "hunter2pass"):
+        samples = (self.FAKE_TOKEN, "Bearer abcdef123456", "Basic dXNlcjpwYXNz", "Authorization: token abcdef123456", "token=abc123xyz", "password: 'two words'",
+                   "--token abc123xyz", "plainsecretvalue99", "https://user:hunter2pass@example.com/x",
+                   "https://opaquetoken987@example.com/x", "sk-" + "abcdefgh12345678", "github_pat_" + "A" * 24, "AKIA" + "ABCDEFGHIJKL", "xoxb-" + "12345678abcd",
+                   "eyJhbGciOi.eyJzdWIiOiIx.sig", "0123456789abcdef0123456789abcdef01234567")
+        secrets = (self.FAKE_TOKEN, "abcdef123456", "dXNlcjpwYXNz", "abc123xyz", "two words", "plainsecretvalue99", "hunter2pass", "opaquetoken987", "abcdefgh12345678",
+                   "A" * 24, "ABCDEFGHIJKL", "12345678abcd", "eyJzdWIiOiIx", "0123456789abcdef0123456789abcdef01234567")
+        for sample in samples:
+            with self.subTest(sample=sample[:12]):
+                got = self.failing(load_module(), "before " + sample + " after", env)
+                for secret in secrets:
                     self.assertNotIn(secret, got)
+                self.assertIn("before", got)
                 self.assertIn("[redacted]", got)
+        got = self.failing(load_module(), "quoted " + urllib.parse.quote("pla in/secretX", safe="") + " end", {"GH_TOKEN": "pla in/secretX"})
+        self.assertNotIn("secretX", got)
+        got = self.failing(load_module(), "json " + json.dumps("a\"b\\c-secret") + " end", {"GITHUB_TOKEN": 'a"b\\c-secret'})
+        self.assertNotIn("c-secret", got)
 
-    def test_the_text_is_one_line_cut_to_the_limit_without_control_characters(self):
+    def test_the_text_is_one_line_of_printable_ascii_cut_to_a_limit(self):
         module = load_module()
-        self.fake("printf 'a\\033[31mb\\nsecond line\\r\\n' >&2\nhead -c 500 /dev/zero | tr '\\000' x >&2\nexit 1")
-        got = self.check(module)
+        got = self.failing(module, "a\x1b[31mb\nsecond line\r\n\u202e\u00e9" + "x" * 500)
         self.assertNotIn("\n", got)
-        self.assertNotIn("\x1b", got)
-        shown = got.split("status 1: ", 1)[1].split("), so a body write", 1)[0]
-        self.assertEqual(len(shown), module.WHY_CHARS)
-        self.assertTrue(shown.startswith("a [31mb second line"))
+        self.assertTrue(all(c.isascii() and c.isprintable() for c in got), got)
+        shown = got.split(self.WORDS + ": ", 1)[1]
+        self.assertLessEqual(len(module.clean_stderr("y" * 500)), 200)   # the limit of the plan: 200 characters
+        self.assertGreater(len(shown), 100)
+        self.assertLess(len(shown), 500 + 100)
+        self.assertLess(got.index("31mb"), got.index("second line"))
+        self.assertEqual(module.clean_stderr("short"), "short")
 
-    def test_control_today_s_code_shows_no_stderr(self):
-        source = subprocess.run(["git", "show", self.BASE + ":shims/gh_body.py"], cwd=str(REPO), capture_output=True, text=True, check=True).stdout
+    def test_a_huge_stderr_is_cheap_and_a_token_at_the_scan_limit_is_not_shown(self):
+        import time
+        module = load_module()
+        started = time.monotonic()
+        for text in ("token" * 400000, "auth" * 400000, "a" * 2000000, "x= " * 300000):
+            module.clean_stderr(text)
+        self.assertLess(time.monotonic() - started, 5.0)
+        tail = " " + self.FAKE_TOKEN
+        for cut in range(len(self.FAKE_TOKEN)):
+            text = "z" * (module.WHY_READ - 1 - cut) + tail
+            self.assertNotIn(self.FAKE_TOKEN[:8], module.clean_stderr(text, limit=10 ** 6))
+
+    def test_undecodable_stderr_does_not_hide_the_status(self):
+        self.fake("printf '\\377\\376 bad' >&2\nexit 1")
+        self.assertIn(self.WORDS, self.check(load_module()))
+
+    def test_the_old_line_is_the_control(self):
+        """The mutant puts the old line back: the same read shows no stderr, and the test of the text above fails on it."""
+        source = (SHIM_DIR / "gh_body.py").read_text()
+        old = ('                said = clean_stderr(done.stderr, env)\n                self.why = "the read exited with status %d%s" % (done.returncode, ": " + said if said else "")\n')
+        self.assertEqual(source.count(old), 1)
         path = pathlib.Path(self.dir.name) / "old_gh_body.py"
-        path.write_text(source)
+        path.write_text(source.replace(old, '                self.why = "the read exited with status %d" % done.returncode\n', 1))
         got = self.failing(load_module(path), "HTTP 404: Not Found")
-        self.assertIn("(the read exited with status 1)", got)
+        self.assertIn("(%s)" % self.WORDS, got)
         self.assertNotIn("404", got)
 
     def shim(self):
         import importlib.machinery
         loader = importlib.machinery.SourceFileLoader("gh_shim_under_test", str(SHIM_DIR / "gh"))
-        spec = importlib.util.spec_from_loader("gh_shim_under_test", loader)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+        module = importlib.util.module_from_spec(importlib.util.spec_from_loader("gh_shim_under_test", loader))
+        loader.exec_module(module)
         return module
 
-    def test_the_read_is_strict_like_the_write_and_retries_a_failed_lookup_once(self):
+    def test_the_four_token_names_are_the_same_in_every_copy(self):
+        shim, mint = self.shim(), load_module(SHIM_DIR / "app_mint.py")
+        self.assertEqual(load_module().TOKEN_ENV_NAMES, shim.TOKEN_ENV_NAMES)
+        self.assertEqual(load_module().TOKEN_ENV_NAMES, mint.TOKEN_ENV_NAMES)
+
+    def test_the_read_is_strict_for_a_write_and_retries_a_failed_lookup_once(self):
         shim = self.shim()
         calls = []
 
         def account_env(gh, lookup, strict=False, **kwargs):
-            calls.append(strict)
+            calls.append((strict, lookup.deadline))
             if len(calls) == 1:
                 raise shim.AccountLookupFailed("identity")
             return {"GH_TOKEN": "x"}
         with unittest.mock.patch.object(shim, "account_env", account_env):
-            env_of = shim.body_read_env("gh", shim.Lookup(write=True), ["issue", "edit", "1"], True)
+            first = shim.Lookup(write=True)
+            env_of = shim.body_read_env("gh", first, ["issue", "edit", "1"], True)
             self.assertEqual(env_of(), {"GH_TOKEN": "x"})
             self.assertEqual(env_of(), {"GH_TOKEN": "x"})   # worked out once
-        self.assertEqual(calls, [True, True])
+        self.assertEqual([c[0] for c in calls], [True, True])
+        self.assertNotEqual(calls[0][1], calls[1][1])   # the retry has a fresh deadline
 
-    def test_a_lookup_that_keeps_failing_is_said_in_the_refusal_not_read_with_the_stored_login(self):
+    def test_a_read_that_is_not_for_a_write_is_not_strict(self):
         shim = self.shim()
-        module = load_module()
-        self.fake("exit 0")
+        seen = []
+        with unittest.mock.patch.object(shim, "account_env", lambda gh, lookup, strict=False, **kw: seen.append(strict) or None):
+            self.assertIsNone(shim.body_read_env("gh", shim.Lookup(), [], False)())
+        self.assertEqual(seen, [False])
+
+    def test_the_wiring_a_lookup_that_keeps_failing_refuses_the_write_by_name_and_looks_up_once(self):
+        shim = self.shim()
+        ran = pathlib.Path(self.dir.name) / "ran"
+        self.fake("touch " + shlex.quote(str(ran)) + "\nexit 0")
+        calls = []
 
         def account_env(gh, lookup, strict=False, **kwargs):
+            calls.append(strict)
             raise shim.AccountLookupFailed("identity")
         with unittest.mock.patch.object(shim, "account_env", account_env):
-            probe = module.Probe(self.gh, shim.body_read_env(self.gh, shim.Lookup(write=True), [], True), None)
-            got = module.check_current(probe, ["issue", "view", "1", "--json", "body"], "x\n")
+            got = shim.body_probe(["issue", "edit", "1", "2", "--body", "no parts\n"], self.gh, True, shim.Lookup(write=True))
         self.assertIn("AccountLookupFailed", got)
+        self.assertIn("refused", got)
+        self.assertFalse(ran.exists())   # the stored login never read
+        self.assertEqual(calls, [True, True])   # one lookup and its one retry for the whole command (two targets)
 
 
 if __name__ == "__main__":
