@@ -9,6 +9,7 @@ import importlib.util
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -139,6 +140,26 @@ class EndHookSnapshot(unittest.TestCase):
         head = git(p.work, "rev-parse", "HEAD").strip()
         self.assertIn(head, git(p.remote, "rev-list", "refs/heads/coder7/wip").split())
         self.assertEqual(p.fingerprint(), before)
+
+    def test_an_unborn_head_with_no_wip_branch_is_saved_as_a_root_commit(self):
+        t = os.path.join(self.tmp.name, "u")
+        os.makedirs(t)
+        u = Pod.__new__(Pod)
+        u.tmp, u.worker = t, "coder7"
+        os.makedirs(os.path.join(t, "o"))
+        u.remote, u.work = os.path.join(t, "o", "r.git"), os.path.join(t, "work")
+        git(t, "init", "-q", "--bare", u.remote)
+        git(t, "init", "-q", "-b", "base", u.work)
+        git(u.work, "remote", "add", "origin", "https://github.com/o/r.git")
+        os.makedirs(os.path.join(t, "bin"))
+        shutil.copy(os.path.join(self.tmp.name, "bin", "git-credential-cw"), os.path.join(t, "bin"))
+        u.driver = os.path.join(t, "driver.py")
+        shutil.copy(self.pod.driver, u.driver)
+        u.write("x.txt", "x\n")
+        r = u.snapshot()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertTrue(json.loads(r.stdout)["saved"])
+        self.assertEqual(git(u.remote, "show", "refs/heads/coder7/wip:x.txt"), "x\n")
 
     def test_s3_the_new_commit_has_the_old_wip_head_as_its_parent(self):
         p = self.pod

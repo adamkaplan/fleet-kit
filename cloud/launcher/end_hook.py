@@ -571,16 +571,15 @@ def snapshot(workdir, worker, repo, ctx):
             wip = listed[0]
             git(workdir, "fetch", "--no-tags", "-q", url, "refs/heads/" + branch, ctx=ctx)
         parents = [x for x in dict.fromkeys([wip, head]) if x]
-        if wip and git(workdir, "rev-parse", "%s^{tree}" % wip, ctx=ctx).stdout.strip() == tree:
-            parents = []
+        same = bool(wip) and git(workdir, "rev-parse", "%s^{tree}" % wip, ctx=ctx).stdout.strip() == tree
         commit = wip
-        if parents:
+        if not same:
             args = [a for x in parents for a in ("-p", x)]
             commit = git(workdir, *SNAP_IDENT, "commit-tree", tree, *args, "-m", "WIP: work in progress saved by %s while it runs" % worker, ctx=ctx).stdout.strip()
             git(workdir, "push", "--no-verify", url, "%s:refs/heads/%s" % (commit, branch), ctx=ctx)
         with open(saved_path, "w") as f:
             f.write("%s %s\n" % (tree, commit))
-        return {"saved": bool(parents), "tree": tree, "wip_branch": branch}
+        return {"saved": not same, "tree": tree, "wip_branch": branch}
     finally:
         shutil.rmtree(tmp, True)
 
@@ -589,6 +588,8 @@ def ff_over_snapshots(workdir, worker, url, ctx):
     """True when the remote <worker>/wip is the commit of this pod's own last running save, is not an ancestor of HEAD and a fast-forward commit of HEAD's tree
     (parents: that wip head, HEAD) was pushed. False means: no such case, the plain push of HEAD follows."""
     branch = "%s/wip" % worker
+    if not os.path.isfile(os.path.join(workdir, ".git", SNAP_SAVED_FILE)):
+        return False   # never saved by a running save: the earlier path, no extra call
     listed = git(workdir, "ls-remote", url, "refs/heads/" + branch, ctx=ctx).stdout.split()
     if not listed:
         return False
