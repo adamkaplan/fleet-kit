@@ -120,6 +120,7 @@ class TestBase(unittest.TestCase):
                 return False
 
         for recorded, expect_base in ((BASE, True), (None, False)):
+            del sent[:]
             record = {"worker": "coder5", "state": "starting", "runtime_id": "r1", "url": "https://pod.example", "session": "ses1"}
             if recorded:
                 record["base"] = recorded
