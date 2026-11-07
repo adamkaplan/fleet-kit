@@ -528,7 +528,7 @@ def prestop_main():
         ctx.close()
 
 
-# ---- the wip save (ask #2304): the reaper's save of a RUNNING pod's work to <worker>/wip, by exec, `cw-end-hook --snapshot` ----
+# ---- the wip save (ask #2304): the reaper's save of a RUNNING pod's work to <worker>/wip, by exec: the launcher ships this file on stdin to `python3 -I - --snapshot` ----
 SNAP_SAVED_FILE = "cw-wip-saved"   # inside .git: the tree hash of the last save (never the branch, the index or a file of the tree)
 MAX_SNAPSHOT_FILE = 50 * 1024 * 1024   # a bigger file is left out of a running save (it is read whole)
 SNAP_IDENT = ["-c", "user.name=cw-worker", "-c", "user.email=cw-worker@invalid"]

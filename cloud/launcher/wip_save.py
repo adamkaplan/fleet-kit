@@ -1,5 +1,5 @@
 """The reaper's save of a running pod's work (ask #2304): every SAVE_EVERY_SECONDS, for each running non-orchestrator pod, ONE `kubectl exec -i` that ships the
-launcher's OWN cloud/launcher/end_hook.py on stdin and runs it with the pod's `python3 - --snapshot` (the pod's installed cw-end-hook may be an older image's copy
+launcher's OWN cloud/launcher/end_hook.py on stdin and runs it with the pod's `python3 -I - --snapshot` (-I: the agent-writable working directory is not on sys.path, PYTHON* variables are ignored) (the pod's installed cw-end-hook may be an older image's copy
 without --snapshot; stdin has no argument-size limit), which pushes the pod's commits and files to <worker>/wip as a new fast-forward commit (cloud/launcher/end_hook.py,
 `snapshot`) without touching the pod's branch, index or files. A pod whose tree is the one last saved writes nothing. A failure is said once (one audit line
 and one line on stderr) until a save works again. State lives on the launcher object, in memory: a restarted reaper starts the clock again.
@@ -48,7 +48,7 @@ def save_pass(launcher, pods, now, name_ok):
                 continue
             row["last"] = now
             try:
-                res = json.loads(launcher.kube.exec(name, "python3", "-", "--snapshot", keep_stdout=True, timeout=EXEC_TIMEOUT_SECONDS, stdin=source).strip().splitlines()[-1])
+                res = json.loads(launcher.kube.exec(name, "python3", "-I", "-", "--snapshot", keep_stdout=True, timeout=EXEC_TIMEOUT_SECONDS, stdin=source).strip().splitlines()[-1])
                 if res.get("error"):
                     raise RuntimeError(str(res["error"]))
             except Exception as e:

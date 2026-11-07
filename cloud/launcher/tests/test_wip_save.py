@@ -94,7 +94,7 @@ class Pod:
         assert a in src and b in src
         src = src.replace(a, 'HOST_URL = %r' % ("file://" + self.tmp + "/")).replace(b, 'HELPER_DIR = %r' % os.path.join(self.tmp, "bin"))
         env = dict(os.environ, CW_WORKDIR=self.work, CW_WORKER=self.worker, CW_REPO="o/r", **GIT_ENV)
-        return subprocess.run([sys.executable, "-", "--snapshot"], input=src, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=60)
+        return subprocess.run([sys.executable, "-I", "-", "--snapshot"], input=src, env=env, cwd=self.work, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=60)
 
     def wip(self):
         out = git(self.remote, "rev-parse", "-q", "--verify", "refs/heads/%s/wip" % self.worker, check=False).strip()
@@ -137,6 +137,15 @@ class EndHookSnapshot(unittest.TestCase):
         self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
         self.assertFalse(json.loads(again.stdout)["saved"])
         self.assertEqual(p.count(), 1)
+
+    def test_a_planted_module_in_the_working_directory_is_not_run(self):
+        p = self.pod
+        marker = os.path.join(self.tmp.name, "hijacked")
+        p.write("json.py", "open(%r, 'w').close()\n" % marker)   # the agent plants json.py where the exec starts
+        r = p.snapshot_shipped()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertFalse(os.path.exists(marker), "python3 -I keeps the working directory off sys.path")
+        self.assertTrue(json.loads(r.stdout)["saved"])
 
     def test_s2_a_changed_tree_is_saved_once_and_the_pod_is_untouched(self):
         p = self.pod
@@ -429,7 +438,7 @@ class FakeKube:
     def exec(self, name, *args, **kw):
         self.execs.append((name,) + args)
         self.stdins.append(kw.get("stdin"))
-        if args[:3] == ("python3", "-", "--snapshot"):
+        if args[:4] == ("python3", "-I", "-", "--snapshot"):
             if self.answer is not None:
                 return self.answer
             r = self.pod_by_name[name].snapshot()
@@ -487,10 +496,18 @@ class Scene:
             return []
 
     def snapshots(self):
-        return [e for e in self.kube.execs if e[1:4] == ("python3", "-", "--snapshot")]
+        return [e for e in self.kube.execs if e[1:5] == ("python3", "-I", "-", "--snapshot")]
 
 
 class ReaperSave(unittest.TestCase):
+    def test_a_missing_end_hook_file_saves_nothing_and_says_so_once_on_stderr(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        s = Scene([kube_pod()], {"w1": Pod(tmp.name)}, tmp.name)
+        with mock.patch.object(real.wip_save, "HOOK_PATH", os.path.join(tmp.name, "nope.py")):
+            s.reap(0)
+        self.assertEqual(s.snapshots(), [])
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -580,9 +597,9 @@ class KubeExecStdin(unittest.TestCase):
 
     def test_stdin_adds_dash_i_and_goes_to_kubectls_stdin_only(self):
         with mock.patch.object(real.subprocess, "run", return_value=mock.Mock(returncode=0, stdout="{}", stderr="")) as run:
-            self.kube().exec("p1", "python3", "-", "--snapshot", stdin="print(1)\n", keep_stdout=True)
+            self.kube().exec("p1", "python3", "-I", "-", "--snapshot", stdin="print(1)\n", keep_stdout=True)
         cmd = run.call_args[0][0]
-        self.assertEqual(cmd[cmd.index("exec"):], ["exec", "-i", "p1", "--", "python3", "-", "--snapshot"])
+        self.assertEqual(cmd[cmd.index("exec"):], ["exec", "-i", "p1", "--", "python3", "-I", "-", "--snapshot"])
         self.assertEqual(run.call_args[1]["input"], "print(1)\n")
         self.assertNotIn("print(1)", " ".join(cmd))
 
