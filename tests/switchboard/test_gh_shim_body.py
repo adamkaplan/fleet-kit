@@ -7,11 +7,14 @@ text of the files it was handed). Reads never reach the write log. Fakes only: n
 import importlib.util
 import itertools
 import json
+import os
 import pathlib
+import shlex
 import subprocess
 import sys
 import unittest
 import unittest.mock
+import urllib.parse
 
 from test_gh_shim_sign import REPO, SHIM_DIR, Rig
 
@@ -215,9 +218,8 @@ class TestGhBodyMutants(unittest.TestCase):
                 self.assertTrue(any(text in f for f in failures), (label, failures))
 
 
-class TestGhBodyReadHasItsOwnClock(unittest.TestCase):
-    """#2256: the body read's time limit is counted from the read; a failed read names its reason."""
-    OLD_TEXT = "could not be read, or is empty"
+class FakeGhMixin:
+    """A fake real gh (a shell script) in a temporary directory, and a read of it through the guard."""
 
     def setUp(self):
         import os
@@ -241,6 +243,11 @@ class TestGhBodyReadHasItsOwnClock(unittest.TestCase):
         probe = module.Probe(self.gh, lambda: None, None)
         time.sleep(spend)
         return module.check_current(probe, ["issue", "view", "1", "--json", "body"], "no parts here\n")
+
+
+class TestGhBodyReadHasItsOwnClock(FakeGhMixin, unittest.TestCase):
+    """#2256: the body read's time limit is counted from the read; a failed read names its reason."""
+    OLD_TEXT = "could not be read, or is empty"
 
     def test_S2_earlier_work_that_spends_the_limit_does_not_stop_the_read(self):
         self.fake("cat <<'EOF'\n" + json.dumps({"body": BOTH}) + "\nEOF")
@@ -283,6 +290,199 @@ class TestGhBodyReadHasItsOwnClock(unittest.TestCase):
         self.assertLess(time.monotonic() - started, 2.5)
         self.assertTrue(all(g and "timed out" in g or "read budget is spent" in g for g in got), got)
         self.assertIn("the command's read budget is spent", got[3])
+
+
+class TestGhBodyReadNamesItsStderr(FakeGhMixin, unittest.TestCase):
+    """#2256 fix forward: a read that exits non-zero names the first part of its stderr (one line, redacted) in the refusal."""
+    WORDS = "the read exited with status 1"
+    FAKE_TOKEN = "ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2"
+
+    def setUp(self):
+        FakeGhMixin.setUp(self)
+        self.env_patch = unittest.mock.patch.dict("os.environ", {"FLEET_SHIM_HOLD_SECONDS": "10"})   # a loaded runner must not turn a read into a time-out
+        self.env_patch.start()
+        self.addCleanup(self.env_patch.stop)
+
+    def failing(self, module, said, env=None):
+        said_file = pathlib.Path(self.dir.name) / "said"
+        said_file.write_text(said, encoding="utf-8")
+        self.fake("PATH=" + shlex.quote(os.environ.get("PATH", "/usr/bin:/bin")) + "\ncat " + shlex.quote(str(said_file)) + " >&2\nexit 1")
+        probe = module.Probe(self.gh, lambda: env, None)
+        return module.check_current(probe, ["issue", "view", "1", "--json", "body"], "no parts here\n")
+
+    def test_the_refusal_shows_the_stderr_of_the_read(self):
+        got = self.failing(load_module(), "HTTP 404: Not Found")
+        self.assertIn("(%s: HTTP 404: Not Found)" % self.WORDS, got)
+
+    def test_a_silent_read_keeps_the_old_wording(self):
+        self.fake("exit 1")
+        self.assertIn("(%s)" % self.WORDS, self.check(load_module()))
+
+    def test_stderr_of_only_blanks_and_controls_keeps_the_old_wording(self):
+        self.assertIn("(%s)" % self.WORDS, self.failing(load_module(), "\n\x1b \t\x07\n"))
+
+    def test_a_benign_message_comes_through_unchanged(self):
+        said = "HTTP 404: Not Found (https://api.github.com/repos/o/r/issues/1)"
+        self.assertIn(": " + said + ")", self.failing(load_module(), said))
+
+    def test_every_secret_shape_is_redacted_and_the_context_is_kept(self):
+        env = {"GH_TOKEN": "plainsecretvalue99"}
+        samples = (self.FAKE_TOKEN, "Bearer abcdef123456", "Basic dXNlcjpwYXNz", "Authorization: token abcdef123456", "token=abc123xyz", "password: 'two words'",
+                   "--token abc123xyz", "plainsecretvalue99", "https://user:hunter2pass@example.com/x",
+                   "https://opaquetoken987@example.com/x", "sk-" + "abcdefgh12345678", "github_pat_" + "A" * 24, "AKIA" + "ABCDEFGHIJKL", "xoxb-" + "12345678abcd",
+                   "eyJhbGciOi.eyJzdWIiOiIx.sig", "0123456789abcdef0123456789abcdef01234567")
+        secrets = (self.FAKE_TOKEN, "abcdef123456", "dXNlcjpwYXNz", "abc123xyz", "two words", "plainsecretvalue99", "hunter2pass", "opaquetoken987", "abcdefgh12345678",
+                   "A" * 24, "ABCDEFGHIJKL", "12345678abcd", "eyJzdWIiOiIx", "0123456789abcdef0123456789abcdef01234567")
+        for sample in samples:
+            with self.subTest(sample=sample[:12]):
+                got = self.failing(load_module(), "before " + sample + " after", env)
+                for secret in secrets:
+                    self.assertNotIn(secret, got)
+                self.assertIn("before", got)
+                self.assertIn("[redacted]", got)
+        got = self.failing(load_module(), "quoted " + urllib.parse.quote("pla in/secretX", safe="") + " end", {"GH_TOKEN": "pla in/secretX"})
+        self.assertNotIn("secretX", got)
+        got = self.failing(load_module(), "json " + json.dumps("a\"b\\c-secret") + " end", {"GITHUB_TOKEN": 'a"b\\c-secret'})
+        self.assertNotIn("c-secret", got)
+
+    def test_the_text_is_one_line_of_printable_ascii_cut_to_a_limit(self):
+        module = load_module()
+        got = self.failing(module, "a\x1b[31mb\nsecond line\r\n\u202e\u00e9" + "x" * 500)
+        self.assertNotIn("\n", got)
+        self.assertTrue(all(c.isascii() and c.isprintable() for c in got), got)
+        shown = got.split(self.WORDS + ": ", 1)[1].split(")", 1)[0]
+        self.assertEqual(len(shown), module.WHY_CHARS)   # cut at the limit: the rest of the 500 is not shown
+        self.assertEqual(module.clean_stderr("y" * 500), "y" * module.WHY_CHARS)
+        self.assertLess(got.index("31mb"), got.index("second line"))
+        self.assertEqual(module.clean_stderr("short"), "short")
+
+    def test_only_the_first_part_of_a_huge_stderr_is_scanned_and_a_token_at_the_limit_is_not_shown(self):
+        module = load_module()
+        seen = []
+
+        class Recording:
+            def __init__(self, pattern):
+                self.pattern = pattern
+
+            def sub(self, replacement, text):
+                seen.append(len(text))
+                return self.pattern.sub(replacement, text)
+        with unittest.mock.patch.object(module, "SECRET_PATTERNS", tuple((Recording(p), r) for p, r in module.SECRET_PATTERNS)):
+            module.clean_stderr("token " * 400000)
+        self.assertTrue(seen and max(seen) > 0)   # it ran, over a bounded part
+        self.assertLessEqual(max(seen), module.WHY_READ)
+        tail = " " + self.FAKE_TOKEN
+        for cut in range(len(self.FAKE_TOKEN)):
+            text = "z" * (module.WHY_READ - 1 - cut) + tail
+            self.assertNotIn(self.FAKE_TOKEN[:max(cut, 1)], module.clean_stderr(text, limit=10 ** 6))
+
+    def test_a_token_at_the_cut_of_the_default_limit_is_not_shown_half(self):
+        module = load_module()
+        for gap in range(1, len(self.FAKE_TOKEN)):
+            with self.subTest(gap=gap):
+                text = "z" * (module.WHY_CHARS - gap - 1) + " " + self.FAKE_TOKEN
+                self.assertNotIn(self.FAKE_TOKEN[:gap], module.clean_stderr(text))
+
+    def test_undecodable_stderr_does_not_hide_the_status(self):
+        self.fake("printf '\\377\\376 bad' >&2\nexit 1")
+        got = self.check(load_module())
+        self.assertIn(self.WORDS + ": ", got)
+        self.assertIn("bad", got)
+        self.assertTrue(all(c.isascii() and c.isprintable() for c in got), got)
+
+    def test_the_old_code_is_the_control(self):
+        """With the stderr taken away (as before this change) the same read shows no stderr: the text test above fails on it."""
+        module = load_module()
+        with unittest.mock.patch.object(module, "clean_stderr", lambda *args, **kwargs: ""):
+            got = self.failing(module, "HTTP 404: Not Found")
+        self.assertIn("(%s)" % self.WORDS, got)
+        self.assertNotIn("404", got)
+
+    def test_each_pattern_is_needed_by_a_shape_only_it_catches(self):
+        module = load_module()
+        shapes = ("Bearer abcdef123456", "token=abc123xyz", "--password hunter22x", self.FAKE_TOKEN, "0123456789abcdef0123456789abcdef01234567",
+                  "https://user:hunter2pass@example.com/x", "https://opaquetoken987@example.com/x", "eyJhbGciOi.eyJzdWIiOiIx.sig")
+        secrets = ("abcdef123456", "abc123xyz", "hunter22x", self.FAKE_TOKEN, "0123456789abcdef0123456789abcdef01234567", "hunter2pass", "opaquetoken987", "eyJzdWIiOiIx")
+        for shape, secret in zip(shapes, secrets):
+            with self.subTest(shape=shape[:12]):
+                self.assertNotIn(secret, module.clean_stderr(shape))
+                leaks = []
+                for at in range(len(module.SECRET_PATTERNS)):
+                    with unittest.mock.patch.object(module, "SECRET_PATTERNS", module.SECRET_PATTERNS[:at] + module.SECRET_PATTERNS[at + 1:]):
+                        leaks.append(secret in module.clean_stderr(shape))
+                self.assertTrue(any(leaks))   # some pattern is the one that hides this shape
+
+    def test_a_token_that_holds_a_control_character_is_found_before_the_characters_go(self):
+        got = self.failing(load_module(), "x ab\tcd-secret9 y", {"GH_TOKEN": "ab\tcd-secret9"})
+        self.assertNotIn("secret9", got)
+
+    def test_a_token_of_the_environment_the_read_inherits_is_redacted(self):
+        with unittest.mock.patch.dict("os.environ", {"GH_TOKEN": "inheritedvalue77", "GITHUB_TOKEN": "", "GH_ENTERPRISE_TOKEN": "", "GITHUB_ENTERPRISE_TOKEN": ""}):
+            got = self.failing(load_module(), "oops inheritedvalue77 here", None)
+        self.assertNotIn("inheritedvalue77", got)
+
+    def test_the_account_env_of_the_write_is_the_env_the_read_runs_with(self):
+        shim = self.shim()
+        strictly = []
+        seen = pathlib.Path(self.dir.name) / "seen"
+        self.fake("printf '%s' \"$GH_TOKEN\" > " + shlex.quote(str(seen)) + "\nexit 0")
+        with unittest.mock.patch.object(shim, "account_env", lambda gh, lookup, strict=False, **kw: strictly.append(strict) or dict(os.environ, GH_TOKEN="sentinel-account")):
+            shim.body_probe(["issue", "edit", "1", "--body", "no parts\n"], self.gh, True, shim.Lookup(write=True))
+        self.assertEqual(seen.read_text(), "sentinel-account")
+
+
+    def shim(self):
+        import importlib.machinery
+        loader = importlib.machinery.SourceFileLoader("gh_shim_under_test", str(SHIM_DIR / "gh"))
+        module = importlib.util.module_from_spec(importlib.util.spec_from_loader("gh_shim_under_test", loader))
+        loader.exec_module(module)
+        return module
+
+    def test_the_four_token_names_are_the_same_in_every_copy(self):
+        shim, mint = self.shim(), load_module(SHIM_DIR / "app_mint.py")
+        self.assertEqual(load_module().TOKEN_ENV_NAMES, shim.TOKEN_ENV_NAMES)
+        self.assertEqual(load_module().TOKEN_ENV_NAMES, mint.TOKEN_ENV_NAMES)
+
+    def test_the_read_is_strict_for_a_write_and_retries_a_failed_lookup_once(self):
+        shim = self.shim()
+        calls = []
+
+        def account_env(gh, lookup, strict=False, **kwargs):
+            calls.append((strict, lookup))
+            if len(calls) == 1:
+                raise shim.AccountLookupFailed("identity")
+            return {"GH_TOKEN": "x"}
+        with unittest.mock.patch.object(shim, "account_env", account_env):
+            first = shim.Lookup(write=True)
+            env_of = shim.body_read_env("gh", first, ["issue", "edit", "1"], True)
+            self.assertEqual(env_of(), {"GH_TOKEN": "x"})
+            self.assertEqual(env_of(), {"GH_TOKEN": "x"})   # worked out once
+        self.assertEqual([c[0] for c in calls], [True, True])
+        self.assertIs(calls[0][1], first)
+        self.assertIsNot(calls[0][1], calls[1][1])   # the retry has a fresh lookup (a fresh deadline)
+
+    def test_a_read_that_is_not_for_a_write_is_not_strict(self):
+        shim = self.shim()
+        seen = []
+        with unittest.mock.patch.object(shim, "account_env", lambda gh, lookup, strict=False, **kw: seen.append(strict) or None):
+            self.assertIsNone(shim.body_read_env("gh", shim.Lookup(), [], False)())
+        self.assertEqual(seen, [False])
+
+    def test_the_wiring_a_lookup_that_keeps_failing_refuses_the_write_by_name_and_looks_up_once(self):
+        shim = self.shim()
+        ran = pathlib.Path(self.dir.name) / "ran"
+        self.fake("touch " + shlex.quote(str(ran)) + "\nexit 0")
+        calls = []
+
+        def account_env(gh, lookup, strict=False, **kwargs):
+            calls.append(strict)
+            raise shim.AccountLookupFailed("identity")
+        with unittest.mock.patch.object(shim, "account_env", account_env):
+            got = shim.body_probe(["issue", "edit", "1", "2", "--body", "no parts\n"], self.gh, True, shim.Lookup(write=True))
+        self.assertIn("AccountLookupFailed", got)
+        self.assertIn("refused", got)
+        self.assertFalse(ran.exists())   # the stored login never read
+        self.assertEqual(calls, [True, True])   # one lookup and its one retry for the whole command (two targets)
 
 
 if __name__ == "__main__":

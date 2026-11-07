@@ -2941,11 +2941,32 @@ def hold_probe(args, lookup, gh, write):
         return (RETRY_HOLD if write else None), None, None
 
 
+def body_read_env(gh, lookup, args, write):
+    """The env_of of the body guard's read: the account of the write it guards, worked out ONCE (a failure too, which is raised again, not looked up again), strictly
+    like the write (#2256). A lookup that fails is retried once with a fresh deadline and then raises; the guard turns that into a refusal of the write that names the
+    exception's type. It never leaves a WRITE's read to the inherited or stored login, which may be an account that cannot read the repository (HTTP 404, exit 1)."""
+    done = []
+
+    def env_of():
+        if not done:
+            try:
+                try:
+                    done.append((account_env(gh, lookup, strict=write, args=args), None))
+                except AccountLookupFailed:   # only a strict (write) lookup raises this
+                    done.append((account_env(gh, Lookup(write=True), strict=True, args=args), None))
+            except Exception as err:
+                done.append((None, err))
+        if done[0][1] is not None:
+            raise done[0][1]
+        return done[0][0]
+    return env_of
+
+
 def body_probe(args, gh, write, lookup):   # #1751: gh_body.py beside this file, loaded by path; a WRITE it cannot load or run is refused
     try:
         spec = importlib.util.spec_from_file_location("gh_body", os.path.join(os.path.dirname(os.path.realpath(__file__)), "gh_body.py"))
         module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
-        return module.guard(args, write, api_parsed, gh, lambda: account_env(gh, lookup, args=args))
+        return module.guard(args, write, api_parsed, gh, body_read_env(gh, lookup, args, write))
     except Exception:
         return "gh: refused: the body guard could not be loaded, retry" if write else None
 
