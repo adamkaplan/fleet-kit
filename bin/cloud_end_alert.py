@@ -164,12 +164,48 @@ def retired_boss(cloud_dir, worker, parse):
     return None
 
 
-def head_line(record_dir, repo, head_checks, parse):
-    """#2267: the last head the pod pushed (branch, short sha) and its check state; `head_checks(repo, sha)` is handed in (this module reads no network)."""
+BRANCH_OK = re.compile(r"[A-Za-z0-9._/-]{1,100}")
+SECRETISH = re.compile(r"sk-|gh[opsu]_|github_pat|AKIA|xox|eyJ|[A-Za-z0-9]{30}")
+
+
+def push_reader(audit_path, parse):
+    """The `last_push` reader of scan_audit: worker -> (branch, full sha) of the pod's newest `push_watch.sent` line of the switchboard audit, or None.
+    Reads the last READ_BYTES of the file only; any failure gives None."""
+    def read(worker):
+        try:
+            size = os.stat(str(audit_path)).st_size
+            with open(str(audit_path), "rb") as handle:
+                handle.seek(max(0, size - READ_BYTES))
+                chunk = handle.read(READ_BYTES)
+        except (OSError, TypeError, ValueError):
+            return None
+        found = None
+        for raw in chunk.split(b"\n"):
+            if b"push_watch.sent" not in raw:
+                continue
+            try:
+                item = parse(raw.decode("utf-8"))
+            except (ValueError, UnicodeDecodeError, TypeError):
+                continue
+            detail = item.get("detail") if isinstance(item, dict) else None
+            if not isinstance(detail, dict) or item.get("event") != "push_watch.sent" or item.get("subject") != worker:
+                continue
+            branch, sha = detail.get("branch"), detail.get("head")
+            if isinstance(branch, str) and BRANCH_OK.fullmatch(branch) and not SECRETISH.search(branch) and isinstance(sha, str) and re.fullmatch(r"[0-9a-f]{40}", sha):
+                found = (branch, sha)   # later lines are newer
+        return found
+    return read
+
+
+def head_line(record_dir, repo, head_checks, parse, pushed=None):
+    """#2267: the last head the pod pushed (branch, short sha) and its check state; `head_checks(repo, sha)` is handed in (this module reads no network).
+    `pushed` is the pod's newest own push (branch, sha) from the switchboard audit: used when the end hook found nothing or no head."""
     run = read_small(os.path.join(record_dir, "run.json"), parse) if record_dir else None
     hook = run.get("end_hook") if isinstance(run, dict) else None
     if isinstance(hook, dict) and hook.get("head_on") is None and hook.get("wip_branch") is None and not hook.get("error"):
-        return "Last head: nothing pushed."
+        if not pushed:
+            return "Last head: nothing pushed."
+        return finish_head(repo, pushed[0], pushed[1], head_checks)
     branch = hook.get("head_on") if isinstance(hook, dict) else None
     sha = run.get("head_sha") if isinstance(run, dict) else None
     wip = hook.get("wip_branch") if isinstance(hook, dict) and branch is None else None
@@ -179,7 +215,12 @@ def head_line(record_dir, repo, head_checks, parse):
         branch = "wip branch " + wip
     elif not (isinstance(branch, str) and re.fullmatch(r"[A-Za-z0-9._/-]{1,100}", branch) and branch != "unknown"
             and isinstance(sha, str) and re.fullmatch(r"[0-9a-f]{40}", sha)):
-        return "Last head: head unknown."
+        return finish_head(repo, pushed[0], pushed[1], head_checks) if pushed else "Last head: head unknown."
+    return finish_head(repo, branch, sha, head_checks)
+
+
+def finish_head(repo, branch, sha, head_checks):
+    """The head line for a clean branch and a full sha: the check state is read through the handed-in reader."""
     try:
         state = head_checks(repo, sha) if isinstance(repo, str) and repo else None
     except Exception:
@@ -188,7 +229,7 @@ def head_line(record_dir, repo, head_checks, parse):
     return "Last head: %s@%s, checks %s." % (branch, sha[:8], re.sub(r"[^A-Za-z0-9 :,._/#()-]", "?", state)[:200])
 
 
-def scan_audit(audit_file, state_file, cloud_dir, last_reports, send, parse, audit=None, last_text=None, head_checks=None):
+def scan_audit(audit_file, state_file, cloud_dir, last_reports, send, parse, audit=None, last_text=None, head_checks=None, last_push=None):
     """One pass. `send(recipient, text)` is the daemon's own send path. Returns [(recipient, text)] handed to it. `last_text(directory, worker)` (ask #1788)
     gives (block, None) or (None, why): the boss's copy, not the Chief of Staff's, ends with the pod's last text, framed as untrusted."""
     try:
@@ -243,7 +284,11 @@ def scan_audit(audit_file, state_file, cloud_dir, last_reports, send, parse, aud
         text = message_text(worker, label, when_text(line.get("ts")), pushed, name, line["ok"] is False)
         text += " " + pr_line(raw_dir(reason), parse) + "."
         if head_checks is not None and cause in ("idle", "hard"):
-            text += " " + head_line(raw_dir(reason) if name else "", (record or {}).get("repo"), head_checks, parse)
+            try:
+                own = last_push(worker) if last_push is not None else None
+            except Exception:
+                own = None
+            text += " " + head_line(raw_dir(reason) if name else "", (record or {}).get("repo"), head_checks, parse, own)
         keys.append(key)
         to_list = [CHIEF] + ([boss] if isinstance(boss, str) and AGENT_NAME.fullmatch(boss) and boss != CHIEF else [])
         boss_text = text
