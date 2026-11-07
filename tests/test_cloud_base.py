@@ -136,7 +136,7 @@ class TestBase(unittest.TestCase):
                 (Path(state) / "coder5.brief").write_text("do it\n")
                 stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
                 stack.enter_context(contextlib.redirect_stderr(io.StringIO()))
-                self.assertEqual(launch_again._finish_starting(args, None, None, state, record, "o/r", "b"), 0)
+                self.assertEqual(launch_again._finish_starting(args, None, types.SimpleNamespace(config={"call_timeout_seconds": 5}), state, record, "o/r", "b"), 0)
             self.assertEqual(len(sent), 1)
             if expect_base:
                 check_base_in_text(sent[-1], BASE)
