@@ -41,7 +41,7 @@ def launch(base="unset", source=None, part_source=None):
                  run_launcher=lambda *a, **k: (created.append(a) or 0, {}, ""),
                  _read_password=lambda fd: "pw", _record_from_create=lambda n, b: {"runtime_id": "r1", "url": "https://pod.example"},
                  _write_private=lambda *a: None, save_record=lambda state, rec: saved.append(dict(rec)), load_record=lambda *a: None, _audit=lambda *a, **k: None,
-                 tunnel=lambda cluster, record: contextlib.nullcontext(object()), remote_v2=lambda *a: Pod(), _registry_note=lambda *a, **k: None)
+                 tunnel=lambda cluster, record: contextlib.nullcontext(object()), remote_v2=lambda *a: Pod(), _registry_note=lambda *a, **k: None, _model_served=lambda *a, **k: None)
     problem = None
     with tempfile.TemporaryDirectory() as state, contextlib.ExitStack() as stack:
         heads = {"launch_repo": lambda a: "o/r", "build_engine": lambda *a: (engine, state, None), "read_brief": lambda *a: "do it\n", "fleet_record": lambda *a: {}}
