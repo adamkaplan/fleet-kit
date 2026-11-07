@@ -33,6 +33,7 @@ import urllib.parse
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import run_record  # noqa: E402  (the run record: one module, one function the stop calls)
+import wip_save  # noqa: E402  (#2304: the save of a running pod's work to <worker>/wip, every ten minutes)
 
 NAME_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")  # the switchboard's agent name rule
 NAME_OBJECT = re.compile(r"[a-z0-9][a-z0-9.-]{0,252}")   # a Kubernetes object name (what an ownerReference may name)
@@ -103,6 +104,7 @@ REAP_STOP_SECONDS = 420                 # one stop's own limit: past it the wait
 RENEW_CADENCE_SECONDS = 600             # the renewal and the login refresh run at least this often, on their own thread, whatever a pass is doing
 RESTART_ACTION = "reaper-restart"       # the audit action of the reaper's exit after the installed code changed (the service manager starts it again)
 CODE_IDENTITY_FILES = ("cloud/launcher/cloud_worker.py", "cloud/launcher/run_record.py", "bin/path_walk.py", "cloud/launcher/token_mint.py", "bin/registry.py", "bin/record_json.py")   # the module and the kit modules it imports
+CODE_IDENTITY_FILES = CODE_IDENTITY_FILES + ("cloud/launcher/wip_save.py",)   # #2304: the save step is part of the reaper's code identity
 RENEW_POLL_SECONDS = 15                 # how often that thread looks at the clock
 IGNORED_SETTING_ACTION = "ignored-setting-notice"   # the audit action of the notice that a setting is ignored by the unattended refresh
 IGNORED_SETTINGS = ("CW_KUBECTL", "CW_CLUSTER_ADMIN_CMD", "CW_CLUSTER_TOKEN_CMD")   # the names the strict route ignores
@@ -2635,8 +2637,9 @@ class Kube:
             raise CloudError("the hub password Secret %s is not found" % secret)
         self.run(["patch", "secret", secret, "--type=merge", "--patch-file=/dev/stdin"], stdin=json.dumps(body))
 
-    def exec(self, name, *cmd, keep_stdout=False, timeout=120):
-        return self.run(["exec", name, "--"] + list(cmd), keep_stdout=keep_stdout, timeout=timeout, retry=False)
+    def exec(self, name, *cmd, keep_stdout=False, timeout=120, stdin=None):
+        pre = ["exec", "-i"] if stdin is not None else ["exec"]   # #2304: -i only when a script is shipped on stdin
+        return self.run(pre + [name, "--"] + list(cmd), stdin=stdin, keep_stdout=keep_stdout, timeout=timeout, retry=False)
 
 
 def _pod_env(pod, key):
@@ -4471,6 +4474,7 @@ class Launcher:
             self.send_wip_notes(live, now)
         finally:
             steps["notes"] = mono() - t0
+        wip_save.save_pass(self, live, now, NAME_RE.fullmatch)   # #2304: every ten minutes, each running pod's work to <worker>/wip (never raises)
         t0 = mono()
         try:
             self.send_final_notes(live, now)
