@@ -263,6 +263,21 @@ class EndHookSnapshot(unittest.TestCase):
         self.assertTrue([l for l in ls.splitlines() if l.endswith("\td")][0].startswith("120000"))
         self.assertNotIn("OUTSIDE-MARKER", git(p.remote, "grep", "-I", "MARKER", "refs/heads/coder7/wip", check=False))
 
+    def test_the_network_calls_leave_the_pods_repository_alone_and_a_fifo_marker_does_not_hang(self):
+        p = self.pod
+        p.write("b.txt", "1\n")
+        p.snapshot()
+        p.write("b.txt", "2\n")
+        marker = os.path.join(p.work, ".git", "cw-wip-saved")
+        os.remove(marker)
+        os.mkfifo(marker)   # a planted FIFO: read without blocking, as no marker
+        r = p.snapshot()
+        self.assertEqual(r.returncode, 1, "the write of the marker is refused, not hung")
+        os.remove(marker)
+        self.assertEqual(p.snapshot().returncode, 0)
+        self.assertFalse(os.path.exists(os.path.join(p.work, ".git", "FETCH_HEAD")))
+        self.assertEqual(git(p.work, "for-each-ref", "refs/cw").strip(), "")
+
     def test_a_garbled_marker_file_is_not_a_crash(self):
         p = self.pod
         p.write("b.txt", "1\n")

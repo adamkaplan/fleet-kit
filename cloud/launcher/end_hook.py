@@ -530,6 +530,7 @@ def prestop_main():
 
 # ---- the wip save (ask #2304): the reaper's save of a RUNNING pod's work to <worker>/wip, by exec, `cw-end-hook --snapshot` ----
 SNAP_SAVED_FILE = "cw-wip-saved"   # inside .git: the tree hash of the last save (never the branch, the index or a file of the tree)
+MAX_SNAPSHOT_FILE = 50 * 1024 * 1024   # a bigger file is left out of a running save (it is read whole)
 SNAP_IDENT = ["-c", "user.name=cw-worker", "-c", "user.email=cw-worker@invalid"]
 
 
@@ -564,8 +565,12 @@ def _read_nofollow(root, rel):
         try:
             if not stat.S_ISREG(os.fstat(f).st_mode):
                 raise OSError("not a regular file")
+            if os.fstat(f).st_size > MAX_SNAPSHOT_FILE:
+                raise OSError("a file over the size cap")
             with os.fdopen(f, "rb", closefd=False) as fh:
-                data = fh.read()
+                data = fh.read(MAX_SNAPSHOT_FILE + 1)
+            if len(data) > MAX_SNAPSHOT_FILE:
+                raise OSError("a file over the size cap")
         finally:
             os.close(f)
         return ("exec" if st.st_mode & 0o100 else "file"), data
@@ -607,6 +612,48 @@ def stage_paths(workdir, paths, ctx):
         _gitb(workdir, ctx, "update-index", "-z", "--add", "--index-info", data=b"".join(lines))
 
 
+def net_repo(parent, workdir, ctx):
+    """A private bare repository for the calls that reach the network (ls-remote, fetch, commit-tree over the fetched head, push): it has NO configuration of
+    its own (the pod's .git/config, which the agent may edit while a save runs, is never read by a network call) and reads the pod's objects through
+    an alternates file. Returns its path."""
+    net = os.path.join(parent, "net")
+    git(parent, "init", "-q", "--bare", "--template=", net, ctx=ctx, opts=True)
+    with open(os.path.join(net, "objects", "info", "alternates"), "w") as f:
+        f.write(os.path.join(os.path.realpath(workdir), ".git", "objects") + "\n")
+    return net
+
+
+def remote_head(net, url, branch, ctx):
+    """The commit the remote's refs/heads/<branch> names, or "" (the exact ref name: ls-remote also matches the tail of a longer one)."""
+    for line in git(net, "ls-remote", url, "refs/heads/" + branch, ctx=ctx).stdout.splitlines():
+        sha, _, ref = line.partition("\t")
+        if ref == "refs/heads/" + branch and re.fullmatch(r"[0-9a-f]{40,64}", sha):
+            return sha
+    return ""
+
+
+def read_marker(path):
+    """The words of the marker file (tree, commit), or []: opened without blocking and without following a link, a regular file only."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    except OSError:
+        return []
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return []
+        return os.read(fd, 400).decode("utf-8", "replace").split()
+    finally:
+        os.close(fd)
+
+
+def write_marker(path, text):
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    try:
+        os.write(fd, text.encode())
+    finally:
+        os.close(fd)
+
+
 def snapshot(workdir, worker, repo, ctx):
     """Save the pod's commits and files to <worker>/wip as ONE new commit, without touching the pod's branch, index or files: a copy of the
     index in a temporary GIT_INDEX_FILE, `git add -A` into the copy, write-tree, commit-tree with the old wip head as parent (and the pod's HEAD as a
@@ -633,30 +680,23 @@ def snapshot(workdir, worker, repo, ctx):
             verb = ["reset", "-q", "HEAD"] if has_head else ["rm", "--cached", "-q", "--ignore-unmatch"]
             _gitb(workdir, ctx, "--literal-pathspecs", *verb, "--pathspec-from-file=-", "--pathspec-file-nul", data=b"\0".join(staged))
         tree = git(workdir, "write-tree", ctx=ctx).stdout.strip()
-        try:
-            with open(saved_path) as f:
-                if f.read().split()[0] == tree:
-                    return {"saved": False, "tree": tree, "wip_branch": branch}
-        except (OSError, IndexError, ValueError):
-            pass
+        if read_marker(saved_path)[:1] == [tree]:
+            return {"saved": False, "tree": tree, "wip_branch": branch}
         head = git(workdir, "rev-parse", "--verify", "-q", "HEAD", check=False, ctx=ctx).stdout.strip()
         if head and git(workdir, "rev-parse", "%s^{tree}" % head, ctx=ctx).stdout.strip() == tree and git(workdir, "branch", "-r", "--contains", head, ctx=ctx).stdout.strip():
             return {"saved": False, "tree": tree, "wip_branch": branch}   # a clean tree whose commit is on a remote branch: nothing of the pod's own to save
-        wip = ""
-        listed = git(workdir, "ls-remote", url, "refs/heads/" + branch, ctx=ctx).stdout.split()
-        if listed:
-            wip = listed[0]
-            git(workdir, "fetch", "--no-tags", "-q", url, "refs/heads/" + branch, ctx=ctx)
+        net = net_repo(tmp, workdir, ctx)
+        wip = remote_head(net, url, branch, ctx)
+        if wip:
+            git(net, "fetch", "--no-tags", "-q", url, "refs/heads/" + branch + ":refs/cw/wip", ctx=ctx)
         parents = [x for x in dict.fromkeys([wip, head]) if x]
-        same = bool(wip) and git(workdir, "rev-parse", "%s^{tree}" % wip, ctx=ctx).stdout.strip() == tree
+        same = bool(wip) and git(net, "rev-parse", "%s^{tree}" % wip, ctx=ctx).stdout.strip() == tree
         commit = wip
         if not same:
             args = [a for x in parents for a in ("-p", x)]
-            commit = git(workdir, *SNAP_IDENT, "commit-tree", tree, *args, "-m", "WIP: work in progress saved by %s while it runs" % worker, ctx=ctx).stdout.strip()
-            config_refusal(workdir, repo, ctx)   # again, right before the push
-            git(workdir, "push", "--no-verify", url, "%s:refs/heads/%s" % (commit, branch), ctx=ctx)
-        with open(saved_path, "w") as f:
-            f.write("%s %s\n" % (tree, commit))
+            commit = git(net, *SNAP_IDENT, "commit-tree", tree, *args, "-m", "WIP: work in progress saved by %s while it runs" % worker, ctx=ctx).stdout.strip()
+            git(net, "push", "--no-verify", url, "%s:refs/heads/%s" % (commit, branch), ctx=ctx)
+        write_marker(saved_path, "%s %s\n" % (tree, commit))
         return {"saved": not same, "tree": tree, "wip_branch": branch}
     finally:
         shutil.rmtree(tmp, True)
@@ -668,24 +708,24 @@ def ff_over_snapshots(workdir, worker, url, ctx):
     branch = "%s/wip" % worker
     if not os.path.isfile(os.path.join(workdir, ".git", SNAP_SAVED_FILE)):
         return False   # never saved by a running save: the earlier path, no extra call
-    listed = git(workdir, "ls-remote", url, "refs/heads/" + branch, ctx=ctx).stdout.split()
-    if not listed:
-        return False
-    wip = listed[0]
+    ours = read_marker(os.path.join(workdir, ".git", SNAP_SAVED_FILE))[1:]
+    tmp = tempfile.mkdtemp(prefix="cw-ff-", dir=os.path.join(workdir, ".git"))
     try:
-        with open(os.path.join(workdir, ".git", SNAP_SAVED_FILE)) as f:
-            ours = f.read().split()[1:]
-    except (OSError, ValueError):
-        ours = []
-    if ours != [wip]:
-        return False   # the wip head is not the commit of our own last save: a diverged branch of someone else stays refused by the plain push
-    git(workdir, "fetch", "--no-tags", "-q", url, "refs/heads/" + branch, ctx=ctx)
-    if git(workdir, "merge-base", "--is-ancestor", wip, "HEAD", check=False, ctx=ctx).returncode == 0:
-        return False
-    commit = git(workdir, *SNAP_IDENT, "commit-tree", "HEAD^{tree}", "-p", wip, "-p", "HEAD", "-m", "WIP: work in progress saved by %s at the end of the worker" % worker,
-                 ctx=ctx).stdout.strip()
-    git(workdir, "push", "--no-verify", url, "%s:refs/heads/%s" % (commit, branch), ctx=ctx)
-    return True
+        net = net_repo(tmp, workdir, ctx)
+        wip = remote_head(net, url, branch, ctx)
+        if not wip or ours != [wip]:
+            return False   # no wip, or its head is not the commit of our own last save: a diverged branch of someone else stays refused by the plain push
+        head = git(workdir, "rev-parse", "HEAD", ctx=ctx).stdout.strip()
+        git(net, "fetch", "--no-tags", "-q", url, "refs/heads/" + branch + ":refs/cw/wip", ctx=ctx)
+        if git(net, "merge-base", "--is-ancestor", wip, head, check=False, ctx=ctx).returncode == 0:
+            return False
+        tree = git(workdir, "rev-parse", "HEAD^{tree}", ctx=ctx).stdout.strip()
+        commit = git(net, *SNAP_IDENT, "commit-tree", tree, "-p", wip, "-p", head, "-m", "WIP: work in progress saved by %s at the end of the worker" % worker,
+                     ctx=ctx).stdout.strip()
+        git(net, "push", "--no-verify", url, "%s:refs/heads/%s" % (commit, branch), ctx=ctx)
+        return True
+    finally:
+        shutil.rmtree(tmp, True)
 
 
 def snapshot_main():
