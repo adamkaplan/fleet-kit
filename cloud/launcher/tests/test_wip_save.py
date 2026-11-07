@@ -265,6 +265,9 @@ class EndHookSnapshot(unittest.TestCase):
 
     def test_the_network_calls_leave_the_pods_repository_alone_and_a_fifo_marker_does_not_hang(self):
         p = self.pod
+        fetch_head = os.path.join(p.work, ".git", "FETCH_HEAD")   # written by the scratch pod's own setup fetch
+        with open(fetch_head, "rb") as f:
+            before = f.read()
         p.write("b.txt", "1\n")
         p.snapshot()
         p.write("b.txt", "2\n")
@@ -275,7 +278,8 @@ class EndHookSnapshot(unittest.TestCase):
         self.assertEqual(r.returncode, 1, "the write of the marker is refused, not hung")
         os.remove(marker)
         self.assertEqual(p.snapshot().returncode, 0)
-        self.assertFalse(os.path.exists(os.path.join(p.work, ".git", "FETCH_HEAD")))
+        with open(fetch_head, "rb") as f:
+            self.assertEqual(f.read(), before, "no network call wrote into the pod's repository")
         self.assertEqual(git(p.work, "for-each-ref", "refs/cw").strip(), "")
 
     def test_a_garbled_marker_file_is_not_a_crash(self):
