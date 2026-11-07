@@ -485,5 +485,61 @@ class TestGhBodyReadNamesItsStderr(FakeGhMixin, unittest.TestCase):
         self.assertEqual(calls, [True, True])   # one lookup and its one retry for the whole command (two targets)
 
 
+class TestGhBodyReadNamesTheRepositoryOfTheWrite(unittest.TestCase):
+    """The read is made of the repository the write names, wherever -R stands (fix forward of #2256): a fake gh that records argv."""
+    SPELLINGS = (("-R r", ["-R", "o/r"]), ("-Rr", ["-Ro/r"]), ("-R=r", ["-R=o/r"]), ("--repo r", ["--repo", "o/r"]), ("--repo=r", ["--repo=o/r"]))
+
+    def setUp(self):
+        self.rig = BodyRig()
+        self.addCleanup(self.rig.close)
+        self.file = self.rig.path("body.md", BOTH)
+
+    def read_argv(self, args, current=BOTH):
+        done, calls, seen = self.rig.go(args, current=current)
+        return done, calls, seen
+
+    def test_the_read_carries_the_repository_named_after_the_number_in_every_spelling(self):
+        for label, flag in self.SPELLINGS:
+            with self.subTest(spelling=label):
+                done, calls, seen = self.read_argv(["issue", "edit", "7", *flag, "--body-file", self.file])
+                self.assertEqual(done.returncode, 0, done.stderr)
+                self.assertEqual(seen, [["issue", "view", "7", "--json", "body", "-R", "o/r"]])
+                self.assertEqual(len(calls), 1)
+
+    def test_the_repository_before_the_verb_still_works_and_the_last_one_named_is_read(self):
+        for label, flag in self.SPELLINGS:
+            with self.subTest(spelling=label):
+                _, _, seen = self.read_argv(["-R", "x/y", "issue", "edit", "7", *flag, "--body-file", self.file])
+                self.assertEqual(seen[-1][-2:], ["-R", "o/r"])
+                _, _, seen = self.read_argv(["issue", *flag[:1], *flag[1:], "edit", "7", "--body-file", self.file])
+                self.assertEqual(seen[-1][-2:], ["-R", "o/r"])
+        _, _, seen = self.read_argv(["issue", "edit", "7", "--body-file", self.file, "-R", "o/r"])
+        self.assertEqual(seen[-1][-2:], ["-R", "o/r"])
+
+    def test_no_repository_named_reads_without_one(self):
+        _, _, seen = self.read_argv(["issue", "edit", "7", "--body-file", self.file])
+        self.assertNotIn("-R", seen[0])
+
+    def test_a_flag_value_that_looks_like_a_repository_flag_is_not_one(self):
+        _, _, seen = self.read_argv(["issue", "edit", "7", "--title", "-Rzzz", "--body-file", self.file])
+        self.assertNotIn("-R", seen[0])
+
+    def test_a_body_that_drops_the_intent_is_still_refused(self):
+        bad = self.rig.path("bad.md", NO_INTENT)
+        done, calls, seen = self.read_argv(["issue", "edit", "7", "-R", "o/r", "--body-file", bad])
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn(DROP_WORDS, done.stderr)
+        self.assertEqual(calls, [])
+
+    def test_the_old_code_is_the_control_its_read_has_no_repository(self):
+        source = (SHIM_DIR / "gh_body.py").read_text()
+        old = "        named = repo_flag(args, i - 1)\n        if named:\n            repos.append(named[0])\n            i += named[1] - 1\n            continue\n"
+        self.assertEqual(source.count(old), 1)
+        rig = BodyRig(gh_body_source=source.replace(old, "", 1))
+        self.addCleanup(rig.close)
+        _, _, seen = rig.go(["issue", "edit", "7", "-R", "o/r", "--body-file", self.file])
+        self.assertNotIn("-R", seen[0])
+
+
 if __name__ == "__main__":
     unittest.main()

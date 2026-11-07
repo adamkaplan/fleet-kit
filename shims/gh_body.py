@@ -58,6 +58,21 @@ FAILED = "gh: refused: the body guard failed, retry (the fleet shim refuses this
 ISSUE_VALUE = {"-R", "--repo", "-t", "--title", "-m", "--milestone", "-a", "--add-assignee", "--remove-assignee", "-l", "--add-label",
                "--remove-label", "-p", "--add-project", "--remove-project", "-b", "--body", "-F", "--body-file"}
 
+REPO_FLAGS = ("-R", "--repo")   # the one table of the spellings that name the repository; every loop below reads it through repo_flag
+
+
+def repo_flag(args, i):
+    """(the repository named by args[i], the words it takes) when args[i] spells -R V, -RV, -R=V, --repo V or --repo=V, else None."""
+    a = args[i]
+    if a in REPO_FLAGS:
+        return (args[i + 1], 2) if i + 1 < len(args) else None
+    for flag in REPO_FLAGS:
+        if flag.startswith("--") and a.startswith(flag + "="):
+            return a[len(flag) + 1:], 1
+        if not flag.startswith("--") and a.startswith(flag) and not a.startswith("--") and len(a) > len(flag):
+            return a[len(flag):].lstrip("="), 1
+    return None
+
 
 def has_parts(body):
     return bool(HEAD_RE.search(body)) and bool(DONE_RE.search(body))
@@ -208,15 +223,12 @@ def issue_edit(probe, args):
     words, repos, i, edit_at = [], [], 0, None
     while i < len(args):
         a = args[i]
-        if a in ("-R", "--repo") and i + 1 < len(args):
-            repos.append(args[i + 1])
-            i += 2
+        named = repo_flag(args, i)
+        if named:
+            repos.append(named[0])
+            i += named[1]
             continue
-        if a.startswith("--repo="):
-            repos.append(a[7:])
-        elif a.startswith("-R") and not a.startswith("--") and len(a) > 2:
-            repos.append(a[2:].lstrip("="))
-        elif not a.startswith("-"):
+        if not a.startswith("-"):
             words.append(a)
             if len(words) == 2:
                 edit_at = i
@@ -232,6 +244,11 @@ def issue_edit(probe, args):
             targets += args[i:]
             break
         kind, value = None, None
+        named = repo_flag(args, i - 1)
+        if named:
+            repos.append(named[0])
+            i += named[1] - 1
+            continue
         if a in ("--body", "-b", "--body-file", "-F"):
             kind = "body" if a in ("--body", "-b") else "file"
             value = args[i] if i < len(args) else None
@@ -362,7 +379,7 @@ def guard(args, write, api_parser, gh, env_of, stdin=None):
         for a in args:
             if skip:
                 skip = False
-            elif a in ("-R", "--repo"):
+            elif a in REPO_FLAGS:
                 skip = True
             elif not a.startswith("-"):
                 words.append(a)
