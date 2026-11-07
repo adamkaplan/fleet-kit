@@ -85,6 +85,17 @@ class Pod:
         return subprocess.run([sys.executable, self.driver, os.path.join(LAUNCHER, "end_hook.py"), "file://" + self.tmp + "/",
                                os.path.join(self.tmp, "bin"), "--snapshot"], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=60)
 
+    def snapshot_shipped(self):
+        """The launcher's way, for real: the script text on the stdin of a real `python3 - --snapshot` (no driver, no stub). The only change to the text
+        is the two seam constants (the host URL and the helper directory), since a scratch machine has no github.com and no /run/cw-tmp."""
+        with open(os.path.join(LAUNCHER, "end_hook.py"), encoding="utf-8") as f:
+            src = f.read()
+        a, b = 'HOST_URL = "https://github.com/"', 'HELPER_DIR = "/run/cw-tmp/bin"'
+        assert a in src and b in src
+        src = src.replace(a, 'HOST_URL = %r' % ("file://" + self.tmp + "/")).replace(b, 'HELPER_DIR = %r' % os.path.join(self.tmp, "bin"))
+        env = dict(os.environ, CW_WORKDIR=self.work, CW_WORKER=self.worker, CW_REPO="o/r", **GIT_ENV)
+        return subprocess.run([sys.executable, "-", "--snapshot"], input=src, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=60)
+
     def wip(self):
         out = git(self.remote, "rev-parse", "-q", "--verify", "refs/heads/%s/wip" % self.worker, check=False).strip()
         return out or None
@@ -110,6 +121,22 @@ class EndHookSnapshot(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.pod = Pod(self.tmp.name)
+
+    def test_the_shipped_script_on_stdin_of_a_real_python_saves_a_wip_commit(self):
+        p = self.pod
+        p.write("b.txt", "new file\n")
+        before = p.fingerprint()
+        self.assertIsNone(p.wip())
+        r = p.snapshot_shipped()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertTrue(json.loads(r.stdout)["saved"])
+        self.assertIsNotNone(p.wip())
+        self.assertEqual(git(p.remote, "show", "refs/heads/coder7/wip:b.txt"), "new file\n")
+        self.assertEqual(p.fingerprint(), before)
+        again = p.snapshot_shipped()   # an unchanged tree writes nothing
+        self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
+        self.assertFalse(json.loads(again.stdout)["saved"])
+        self.assertEqual(p.count(), 1)
 
     def test_s2_a_changed_tree_is_saved_once_and_the_pod_is_untouched(self):
         p = self.pod
@@ -391,7 +418,7 @@ def kube_pod(name="w1", worker="coder7", role=None, persistent=False):
 
 class FakeKube:
     def __init__(self, pods, pod_by_name):
-        self.pods, self.pod_by_name, self.execs, self.answer = pods, pod_by_name, [], None
+        self.pods, self.pod_by_name, self.execs, self.answer, self.stdins = pods, pod_by_name, [], None, []
 
     def list_pods(self):
         return list(self.pods)
@@ -401,7 +428,8 @@ class FakeKube:
 
     def exec(self, name, *args, **kw):
         self.execs.append((name,) + args)
-        if args[:2] == ("cw-end-hook", "--snapshot"):
+        self.stdins.append(kw.get("stdin"))
+        if args[:3] == ("python3", "-", "--snapshot"):
             if self.answer is not None:
                 return self.answer
             r = self.pod_by_name[name].snapshot()
@@ -459,7 +487,7 @@ class Scene:
             return []
 
     def snapshots(self):
-        return [e for e in self.kube.execs if e[1:3] == ("cw-end-hook", "--snapshot")]
+        return [e for e in self.kube.execs if e[1:4] == ("python3", "-", "--snapshot")]
 
 
 class ReaperSave(unittest.TestCase):
@@ -475,6 +503,8 @@ class ReaperSave(unittest.TestCase):
         before = p.fingerprint()
         s.reap(0)
         self.assertEqual(p.count(), 1, ANCHOR)
+        with open(os.path.join(LAUNCHER, "end_hook.py"), encoding="utf-8") as f:
+            self.assertEqual(s.kube.stdins, [f.read()], "the launcher's own end_hook.py is shipped, not the pod's copy")
         self.assertEqual(p.fingerprint(), before, "the pod's branch, index and files are untouched")
         s.reap(5)
         self.assertEqual(len(s.snapshots()), 1, "not asked again before ten minutes")
@@ -540,6 +570,27 @@ class Mutant(unittest.TestCase):
             p = self.run_test(mutant_copy(tmp))
         self.assertEqual(p.returncode, 1, p.stdout)
         self.assertIn(ANCHOR, p.stdout)
+
+
+class KubeExecStdin(unittest.TestCase):
+    def kube(self):
+        k = real.Kube.__new__(real.Kube)
+        k.bin, k.kubeconfig, k.context, k.ns, k.env = "kubectl", None, "ctx", "ns", {}
+        return k
+
+    def test_stdin_adds_dash_i_and_goes_to_kubectls_stdin_only(self):
+        with mock.patch.object(real.subprocess, "run", return_value=mock.Mock(returncode=0, stdout="{}", stderr="")) as run:
+            self.kube().exec("p1", "python3", "-", "--snapshot", stdin="print(1)\n", keep_stdout=True)
+        cmd = run.call_args[0][0]
+        self.assertEqual(cmd[cmd.index("exec"):], ["exec", "-i", "p1", "--", "python3", "-", "--snapshot"])
+        self.assertEqual(run.call_args[1]["input"], "print(1)\n")
+        self.assertNotIn("print(1)", " ".join(cmd))
+
+    def test_without_stdin_the_exec_is_as_before(self):
+        with mock.patch.object(real.subprocess, "run", return_value=mock.Mock(returncode=0, stdout="x", stderr="")) as run:
+            self.kube().exec("p1", "cw-end-hook")
+        self.assertEqual(run.call_args[0][0][-4:], ["exec", "p1", "--", "cw-end-hook"])
+        self.assertIsNone(run.call_args[1]["input"])
 
 
 if __name__ == "__main__":

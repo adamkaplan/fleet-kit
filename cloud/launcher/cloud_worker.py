@@ -2635,8 +2635,9 @@ class Kube:
             raise CloudError("the hub password Secret %s is not found" % secret)
         self.run(["patch", "secret", secret, "--type=merge", "--patch-file=/dev/stdin"], stdin=json.dumps(body))
 
-    def exec(self, name, *cmd, keep_stdout=False, timeout=120):
-        return self.run(["exec", name, "--"] + list(cmd), keep_stdout=keep_stdout, timeout=timeout, retry=False)
+    def exec(self, name, *cmd, keep_stdout=False, timeout=120, stdin=None):
+        pre = ["exec", "-i"] if stdin is not None else ["exec"]   # #2304: -i only when a script is shipped on stdin
+        return self.run(pre + [name, "--"] + list(cmd), stdin=stdin, keep_stdout=keep_stdout, timeout=timeout, retry=False)
 
 
 def _pod_env(pod, key):
