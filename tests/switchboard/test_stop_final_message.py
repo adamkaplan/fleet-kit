@@ -967,6 +967,16 @@ class TestEndNoticeOwnPushes(unittest.TestCase):
         self.assertLess(os.path.getsize(path), sb.load_module("cloud_end_alert").READ_BYTES)
         self.assertIn("Last head: head unknown.", self.world("cb-own20", self.NOTHING, path))
 
+    def test_an_empty_audit_file_is_head_unknown(self):
+        self.assertIn("Last head: head unknown.", self.world("cb-own23", self.NOTHING, self.audit_with()))
+
+    def test_the_readers_answers_for_the_pods_own_creation(self):
+        mod, parse = sb.load_module("cloud_end_alert"), sb.load_module("record_json").parse_bounded
+        path = self.audit_with(self.born("someone-else"))
+        self.assertEqual(mod.push_reader(path, parse)("cb-own24"), mod.UNPROVEN)   # another pod's creation is not this pod's
+        path = self.audit_with(self.born("cb-own24"))
+        self.assertIsNone(mod.push_reader(path, parse)("cb-own24"))
+
     def test_a_rotated_audit_with_the_pods_creation_in_the_archive_is_head_unknown(self):
         path = self.audit_with(self.sent("other", "z/z", "d" * 40))
         with gzip.open(os.path.join(os.path.dirname(path), "audit-2026-11-01.jsonl.gz"), "wt") as gz:   # the archive holds the creation and the push
