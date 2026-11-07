@@ -224,7 +224,9 @@ class Slices(unittest.TestCase):
         self.assertNotIn("git*push*master*", top)
 
     def test_s4b_the_push_rules_are_the_generated_set_in_both_blocks(self):
-        want = generate_all()
+        # #2304: the two rows whose closers read as a character class ('[main]' and '[master]') are not in the set
+        want = {k: v for k, v in generate_all().items() if k not in (PREFIX + "[main]*", PREFIX + "[master]*")}
+        self.assertEqual(len(want), len(generate_all()) - 2)
         for b in blocks(self.conf):
             self.assertEqual(push_patterns(b), list(want))
             self.assertEqual({k: b[k] for k in push_patterns(b)}, want)
