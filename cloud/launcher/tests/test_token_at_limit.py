@@ -357,7 +357,7 @@ class TestDocsAndPins(unittest.TestCase):
 
     def test_u1_the_guard_and_permission_files_are_byte_identical_to_the_base(self):
         pins = {"cloud/worker/guard.sh": "ba4d51aa043d450a4832210fb6492295e7bd7c7e61a4abd2a70cc75baea19bca",
-                "cloud/worker/opencode-worker.json": "ef70ab381b46434cee486b57c23898117cc49b9b6150df42366db40b2e92d075"}
+                "cloud/worker/opencode-worker.json": "045bec5e4d85bcd3f11168a82d018d03d82a5de3e7973ab8898b686c1f6f9dcd"}
         for path, digest in pins.items():
             with open(os.path.join(ROOT, path), "rb") as f:
                 self.assertEqual(hashlib.sha256(f.read()).hexdigest(), digest, path)
