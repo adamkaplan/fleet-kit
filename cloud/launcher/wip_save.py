@@ -7,7 +7,7 @@ import json
 import sys
 
 SAVE_EVERY_SECONDS = 600
-EXEC_TIMEOUT_SECONDS = 100
+EXEC_TIMEOUT_SECONDS = 60
 SAVE_ACTION = "wip-save"
 ORCHESTRATOR_ROLE = "orchestrator"
 
@@ -39,7 +39,7 @@ def save_pass(launcher, pods, now, name_ok):
                 if res.get("error"):
                     raise RuntimeError(str(res["error"]))
             except Exception as e:
-                why = launcher.kube.scrub(e, 200) or type(e).__name__
+                why = "".join(c if c.isprintable() else "?" for c in launcher.kube.scrub(e, 200)) or type(e).__name__
                 if row["said"] != why:
                     row["said"] = why
                     launcher.audit(worker, "pod/" + name, SAVE_ACTION, 0.0, False, "the work was not saved to %s/wip: %s" % (worker, why))

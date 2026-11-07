@@ -533,6 +533,34 @@ SNAP_SAVED_FILE = "cw-wip-saved"   # inside .git: the tree hash of the last save
 SNAP_IDENT = ["-c", "user.name=cw-worker", "-c", "user.email=cw-worker@invalid"]
 
 
+def stage_paths(workdir, paths, ctx):
+    """Put the working-tree state of `paths` into the index copy WITHOUT any filter: git hash-object --no-filters writes the blobs and update-index
+    --index-info records them (a missing path is removed; a symbolic link keeps its target; a directory or a name with a newline is left out)."""
+    lines, files = [], []
+    for rel in paths:
+        full = os.path.join(workdir, rel)
+        if "\n" in rel:
+            continue
+        try:
+            st = os.lstat(full)
+        except FileNotFoundError:
+            lines.append("0 %s\t%s\0" % ("0" * 40, rel))
+            continue
+        if stat.S_ISREG(st.st_mode):
+            files.append((rel, "100755" if st.st_mode & 0o111 else "100644"))
+        elif stat.S_ISLNK(st.st_mode):
+            sha = subprocess.run([GIT_BIN, "-C", workdir] + ctx.opts + ["hash-object", "-w", "--no-filters", "--stdin"], input=os.readlink(full).encode(),
+                                 capture_output=True, env=ctx.env, check=True).stdout.decode().strip()
+            lines.append("120000 %s\t%s\0" % (sha, rel))
+    if files:
+        out = subprocess.run([GIT_BIN, "-C", workdir] + ctx.opts + ["hash-object", "-w", "--no-filters", "--stdin-paths"], input="".join(r + "\n" for r, _ in files).encode(),
+                             capture_output=True, env=ctx.env, check=True).stdout.decode().split()
+        lines += ["%s %s\t%s\0" % (mode, sha, rel) for (rel, mode), sha in zip(files, out)]
+    if lines:
+        subprocess.run([GIT_BIN, "-C", workdir] + ctx.opts + ["update-index", "-z", "--add", "--index-info"], input="".join(lines).encode(),
+                       capture_output=True, env=ctx.env, check=True)
+
+
 def snapshot(workdir, worker, repo, ctx):
     """Save the pod's commits and files to <worker>/wip as ONE new commit, without touching the pod's branch, index or files: a copy of the
     index in a temporary GIT_INDEX_FILE, `git add -A` into the copy, write-tree, commit-tree with the old wip head as parent (and the pod's HEAD as a
@@ -550,13 +578,11 @@ def snapshot(workdir, worker, repo, ctx):
             shutil.copyfile(real_index, index)
         ctx.env["GIT_INDEX_FILE"] = index
         config_refusal(workdir, repo, ctx)   # again, right before the add: the agent is running while a save is made
-        # what changed: the untracked files and the tracked files that differ from the index copy; a secret-looking path is never staged (a tracked one keeps its old version)
+        # what to stage: the untracked files and every tracked file (read without filters); a secret-looking path is never staged (a tracked one keeps its old version)
         changed = (git(workdir, "ls-files", "--others", "--exclude-standard", "-z", ctx=ctx).stdout.split("\0")
-                   + git(workdir, "diff", "--name-only", "-z", "--no-ext-diff", "--no-textconv", ctx=ctx).stdout.split("\0"))
+                   + git(workdir, "ls-files", "-z", ctx=ctx).stdout.split("\0"))   # every tracked path is re-read without filters (diff would run a clean filter)
         keep = sorted({x for x in changed if x and not is_secret(x)})
-        if keep:
-            subprocess.run([GIT_BIN, "--literal-pathspecs", "-C", workdir] + ctx.opts + ["add", "-A", "--pathspec-from-file=-", "--pathspec-file-nul"],
-                           input="\0".join(keep).encode(), capture_output=True, env=ctx.env, check=True)
+        stage_paths(workdir, keep, ctx)   # no `git add`: no clean filter or attribute of the live repository can run
         staged = [x for x in git(workdir, "diff", "--cached", "--name-only", "-z", "--no-ext-diff", "--no-textconv", ctx=ctx).stdout.split("\0") if x and is_secret(x)]
         if staged:   # a secret-looking path the agent staged itself: back to the committed version (or out of the copy when HEAD has none)
             has_head = git(workdir, "rev-parse", "--verify", "-q", "HEAD", check=False, ctx=ctx).returncode == 0
