@@ -14,6 +14,9 @@ NOW_MS = 1_800_000_000_000
 MIN = 60_000
 
 
+ASKED = []   # the paths the server was asked for, in order
+
+
 def serve(sessions, messages):
     """A server of /api/session (sessions), /api/session/<id>/message (messages[id]) and an empty /api/session/active; (server, port)."""
     class Handler(BaseHTTPRequestHandler):
@@ -21,6 +24,7 @@ def serve(sessions, messages):
             pass
 
         def do_GET(self):
+            ASKED.append(self.path)
             if self.path == "/api/session/active":
                 body = {"data": {}}
             elif self.path == "/api/session":
@@ -87,7 +91,19 @@ class ActivityMessage(unittest.TestCase):
         sessions = [{"id": "ses_a", "time": {"created": 1, "updated": NOW_MS - 50 * MIN}}, {"id": "../x", "time": {"created": 1, "updated": NOW_MS - 45 * MIN}},
                     {"id": "ses_b", "time": {"created": 1, "updated": NOW_MS - 60 * MIN}}]
         messages = {"ses_a": [{"time": {"created": NOW_MS - 30 * MIN}}, {"time": {"created": NOW_MS - 55 * MIN}}], "ses_b": [{"time": {"created": NOW_MS - 10 * MIN}}, "junk", {"time": "x"}]}
+        messages["../x"] = [{"time": {"created": NOW_MS - 1 * MIN}}]   # a bad id must not be asked for, whatever the server holds under it
+        del ASKED[:]
         self.assertEqual(self.read(sessions, messages)["last_activity"], iso(NOW_MS - 10 * MIN))
+        self.assertEqual(sorted(p for p in ASKED if p.endswith("/message")), ["/api/session/ses_a/message", "/api/session/ses_b/message"])
+
+    def test_at_most_50_sessions_are_asked_the_most_recently_updated_first(self):
+        sessions = [{"id": "ses_%d" % i, "time": {"created": 1, "updated": NOW_MS - (100 - i) * MIN}} for i in range(60)]
+        del ASKED[:]
+        self.read(sessions, {})
+        asked = [p for p in ASKED if p.endswith("/message")]
+        self.assertEqual(len(asked), 50)
+        self.assertIn("/api/session/ses_59/message", asked)
+        self.assertNotIn("/api/session/ses_0/message", asked)
 
     def test_idle_seconds_are_1200_not_2400_for_the_scene(self):
         got = self.read(*self.scene())

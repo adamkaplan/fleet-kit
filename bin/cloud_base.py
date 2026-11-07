@@ -54,3 +54,8 @@ def apply(record, args):
     _KEPT.update(orig=current, text=text)
     H["SETUP_PREAMBLE"] = text
     record["base"] = base
+
+
+def apply_recorded(record):
+    """The finishing call of a --no-wait launch: the setup text for the base the first launch recorded (none recorded: today's text)."""
+    apply(record, type("Recorded", (), {"base": record.get("base")})())

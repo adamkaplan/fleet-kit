@@ -109,6 +109,7 @@ def _finish_starting(args, runner, engine, state, record, repo, branch):
                     brief_path(state, name).unlink()
                 except OSError:
                     pass
+                H["cloud_pr_labels"].cloud_base.apply_recorded(record)   # #2305: the base of the first launch is in the record
                 if brief:
                     v2.prompt(record["session"], H["SETUP_PREAMBLE"] % {"repo": repo, "branch": branch} + brief, {"fleet": {"from": "switchboard", "brief": True}})
     except (H["H"]["V2Error"], H["H"]["V2Unreachable"], H["CloudError"], OSError, KeyError, TypeError) as err:

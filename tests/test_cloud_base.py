@@ -19,7 +19,7 @@ DEFAULT_SENTENCE = "create it from the default branch if it does not exist yet"
 BASE = "integration/topic"
 
 
-def launch(base="unset", source=None, part_source=None):
+def launch(base="unset", source=None, part_source=None, keep=False):
     """(prompt text, saved records, created pods, SystemExit-or-Refusal or None) of the REAL `_launch`, the cluster and the pod stubbed.
     `part_source`: a textual variant of bin/cloud_base.py, put in place of the part for this launch."""
     module = fpn.CW() if source is None else fpn.mutated_module(source)
@@ -48,7 +48,8 @@ def launch(base="unset", source=None, part_source=None):
         for key, value in stubs.items():
             stack.enter_context(mock.patch.object(module, key, value, create=True))
         stack.enter_context(mock.patch.dict(module.H, heads))
-        stack.enter_context(mock.patch.object(module, "SETUP_PREAMBLE", module.SETUP_PREAMBLE))   # restored after the launch, whatever the part set
+        if not keep:   # restored after the launch, whatever the part set (a test of the leak keeps what the part left)
+            stack.enter_context(mock.patch.object(module, "SETUP_PREAMBLE", module.SETUP_PREAMBLE))
         if part_source is not None:
             variant = types.ModuleType("cloud_base_variant")
             exec(compile(part_source, "cloud_base_variant", "exec"), variant.__dict__)
@@ -76,7 +77,7 @@ class TestBase(unittest.TestCase):
         text, saved, _, problem = launch(BASE)
         self.assertIsNone(problem)
         check_base_in_text(text, BASE)
-        self.assertIn("switch to the branch b (create it from origin/integration/topic", text)
+        self.assertIn("switch to the branch b (create it from origin/integration/topic (git fetch origin integration/topic first) if it does not exist yet)", text)
         self.assertNotIn("default branch", text)
         self.assertEqual({r["base"] for r in saved if "base" in r}, {BASE})
 
@@ -90,9 +91,57 @@ class TestBase(unittest.TestCase):
             self.assertFalse([r for r in saved if "base" in r])
 
     def test_a_launch_with_a_base_does_not_leak_into_the_next_launch_without_one(self):
-        launch(BASE)
-        text, _, _, _ = launch("unset")
-        self.assertIn(DEFAULT_SENTENCE, text)
+        module = fpn.CW()
+        before = module.SETUP_PREAMBLE
+        try:
+            self.assertIn(BASE, launch(BASE, keep=True)[0])
+            self.assertNotEqual(module.SETUP_PREAMBLE, before)   # the part did change the text of this process...
+            text, _, _, _ = launch("unset", keep=True)
+            self.assertIn(DEFAULT_SENTENCE, text)   # ...and the next launch without a base got today's text back
+            self.assertEqual(module.SETUP_PREAMBLE, before)
+        finally:
+            module.SETUP_PREAMBLE = before
+
+    def test_a_no_wait_launch_finished_later_sends_the_recorded_base(self):
+        module = fpn.CW()
+        launch_again = module.cloud_launch_again
+        sent = []
+
+        class Pod:
+            def prompt(self, session, text, *a, **k):
+                sent.append(text)
+
+        class Cluster:
+            def __init__(self, *a, **k):
+                pass
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+
+        for recorded, expect_base in ((BASE, True), (None, False)):
+            record = {"worker": "coder5", "state": "starting", "runtime_id": "r1", "url": "https://pod.example", "session": "ses1"}
+            if recorded:
+                record["base"] = recorded
+            args = argparse.Namespace(name="coder5", agent="worker", role="coder", reports_to="lead", issue=None, charter=None, dir=None)
+            stubs = dict(VaultRecovery=lambda *a: None, Cluster=Cluster, _pod_known=lambda r: True, _pod_of=lambda r, s: {"ready": True, "phase": "Running"},
+                         _cluster_snapshot=lambda *a: None, tunnel=lambda cluster, record: contextlib.nullcontext(object()), remote_v2=lambda *a: Pod(),
+                         _read_private=lambda *a: "do it\n", save_record=lambda *a: None, _registry_note=lambda *a, **k: None)
+            with tempfile.TemporaryDirectory() as state, contextlib.ExitStack() as stack:
+                for key, value in stubs.items():
+                    stack.enter_context(mock.patch.object(module, key, value, create=True))
+                stack.enter_context(mock.patch.object(module, "SETUP_PREAMBLE", module.SETUP_PREAMBLE))
+                stack.enter_context(mock.patch.dict(module.H, {"fleet_record": lambda *a: {}}))
+                stack.enter_context(mock.patch.object(launch_again, "brief_path", lambda st, n: Path(state) / (n + ".brief")))
+                (Path(state) / "coder5.brief").write_text("do it\n")
+                stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+                stack.enter_context(contextlib.redirect_stderr(io.StringIO()))
+                self.assertEqual(launch_again._finish_starting(args, None, None, state, record, "o/r", "b"), 0)
+            self.assertEqual(len(sent), 1)
+            if expect_base:
+                check_base_in_text(sent[-1], BASE)
+            else:
+                self.assertIn(DEFAULT_SENTENCE, sent[-1])
 
     def test_the_base_is_not_handed_to_the_launcher(self):
         _, _, created, _ = launch(BASE)
