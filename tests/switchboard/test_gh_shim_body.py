@@ -244,7 +244,6 @@ class FakeGhMixin:
         return module.check_current(probe, ["issue", "view", "1", "--json", "body"], "no parts here\n")
 
 
-
 class TestGhBodyReadHasItsOwnClock(FakeGhMixin, unittest.TestCase):
     """#2256: the body read's time limit is counted from the read; a failed read names its reason."""
     OLD_TEXT = "could not be read, or is empty"
@@ -347,20 +346,27 @@ class TestGhBodyReadNamesItsStderr(FakeGhMixin, unittest.TestCase):
         got = self.failing(module, "a\x1b[31mb\nsecond line\r\n\u202e\u00e9" + "x" * 500)
         self.assertNotIn("\n", got)
         self.assertTrue(all(c.isascii() and c.isprintable() for c in got), got)
-        shown = got.split(self.WORDS + ": ", 1)[1]
-        self.assertLessEqual(len(module.clean_stderr("y" * 500)), 200)   # the limit of the plan: 200 characters
-        self.assertGreater(len(shown), 100)
-        self.assertLess(len(shown), 500 + 100)
+        shown = got.split(self.WORDS + ": ", 1)[1].split("), so a body write", 1)[0]
+        self.assertEqual(len(shown), module.WHY_CHARS)   # cut at the limit: the rest of the 500 is not shown
+        self.assertEqual(module.clean_stderr("y" * 500), "y" * module.WHY_CHARS)
         self.assertLess(got.index("31mb"), got.index("second line"))
         self.assertEqual(module.clean_stderr("short"), "short")
 
-    def test_a_huge_stderr_is_cheap_and_a_token_at_the_scan_limit_is_not_shown(self):
-        import time
+    def test_only_the_first_part_of_a_huge_stderr_is_scanned_and_a_token_at_the_limit_is_not_shown(self):
         module = load_module()
-        started = time.monotonic()
-        for text in ("token" * 400000, "auth" * 400000, "a" * 2000000, "x= " * 300000):
-            module.clean_stderr(text)
-        self.assertLess(time.monotonic() - started, 5.0)
+        seen = []
+
+        class Recording:
+            def __init__(self, pattern):
+                self.pattern = pattern
+
+            def sub(self, replacement, text):
+                seen.append(len(text))
+                return self.pattern.sub(replacement, text)
+        with unittest.mock.patch.object(module, "SECRET_PATTERNS", tuple((Recording(p), r) for p, r in module.SECRET_PATTERNS)):
+            module.clean_stderr("token" * 400000)
+        self.assertTrue(seen)
+        self.assertLessEqual(max(seen), module.WHY_READ)
         tail = " " + self.FAKE_TOKEN
         for cut in range(len(self.FAKE_TOKEN)):
             text = "z" * (module.WHY_READ - 1 - cut) + tail
@@ -368,18 +374,34 @@ class TestGhBodyReadNamesItsStderr(FakeGhMixin, unittest.TestCase):
 
     def test_undecodable_stderr_does_not_hide_the_status(self):
         self.fake("printf '\\377\\376 bad' >&2\nexit 1")
-        self.assertIn(self.WORDS, self.check(load_module()))
+        got = self.check(load_module())
+        self.assertIn(self.WORDS + ": ", got)
+        self.assertIn("bad", got)
+        self.assertTrue(all(c.isascii() and c.isprintable() for c in got), got)
 
-    def test_the_old_line_is_the_control(self):
-        """The mutant puts the old line back: the same read shows no stderr, and the test of the text above fails on it."""
+    def test_the_old_code_is_the_control(self):
+        """The statement that takes the stderr is made to say nothing (as the code before this change did): the text test above then fails."""
         source = (SHIM_DIR / "gh_body.py").read_text()
-        old = ('                said = clean_stderr(done.stderr, env)\n                self.why = "the read exited with status %d%s" % (done.returncode, ": " + said if said else "")\n')
+        old = "said = clean_stderr(done.stderr, env)"
         self.assertEqual(source.count(old), 1)
         path = pathlib.Path(self.dir.name) / "old_gh_body.py"
-        path.write_text(source.replace(old, '                self.why = "the read exited with status %d" % done.returncode\n', 1))
+        path.write_text(source.replace(old, 'said = ""', 1))
         got = self.failing(load_module(path), "HTTP 404: Not Found")
         self.assertIn("(%s)" % self.WORDS, got)
         self.assertNotIn("404", got)
+
+    def test_each_pattern_is_needed_by_a_shape_only_it_catches(self):
+        module = load_module()
+        shapes = ("Bearer abcdef123456", "token=abc123xyz", "--password hunter22x", self.FAKE_TOKEN, "0123456789abcdef0123456789abcdef01234567",
+                  "https://user:hunter2pass@example.com/x", "https://opaquetoken987@example.com/x", "eyJhbGciOi.eyJzdWIiOiIx.sig")
+        secrets = ("abcdef123456", "abc123xyz", "hunter22x", self.FAKE_TOKEN, "0123456789abcdef0123456789abcdef01234567", "hunter2pass", "opaquetoken987", "eyJzdWIiOiIx")
+        self.assertEqual(len(shapes), len(module.SECRET_PATTERNS))
+        for at, (shape, secret) in enumerate(zip(shapes, secrets)):
+            with self.subTest(pattern=at):
+                self.assertNotIn(secret, module.clean_stderr(shape))
+                left = module.SECRET_PATTERNS[:at] + module.SECRET_PATTERNS[at + 1:]
+                with unittest.mock.patch.object(module, "SECRET_PATTERNS", left):
+                    self.assertIn(secret, module.clean_stderr(shape))
 
     def shim(self):
         import importlib.machinery
@@ -398,7 +420,7 @@ class TestGhBodyReadNamesItsStderr(FakeGhMixin, unittest.TestCase):
         calls = []
 
         def account_env(gh, lookup, strict=False, **kwargs):
-            calls.append((strict, lookup.deadline))
+            calls.append((strict, lookup))
             if len(calls) == 1:
                 raise shim.AccountLookupFailed("identity")
             return {"GH_TOKEN": "x"}
@@ -408,7 +430,8 @@ class TestGhBodyReadNamesItsStderr(FakeGhMixin, unittest.TestCase):
             self.assertEqual(env_of(), {"GH_TOKEN": "x"})
             self.assertEqual(env_of(), {"GH_TOKEN": "x"})   # worked out once
         self.assertEqual([c[0] for c in calls], [True, True])
-        self.assertNotEqual(calls[0][1], calls[1][1])   # the retry has a fresh deadline
+        self.assertIs(calls[0][1], first)
+        self.assertIsNot(calls[0][1], calls[1][1])   # the retry has a fresh lookup (a fresh deadline)
 
     def test_a_read_that_is_not_for_a_write_is_not_strict(self):
         shim = self.shim()

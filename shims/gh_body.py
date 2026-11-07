@@ -32,7 +32,7 @@ MAX_TEXT = 1048576
 WHY_CHARS = 200   # the read's stderr as the refusal shows it: the first this many characters, one line
 WHY_READ = 4096   # only this much of the stderr is ever scanned (a limit on the work, whatever the read printed)
 TOKEN_ENV_NAMES = ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN")   # the same four as shims/gh (a test compares them)
-# A net, not a promise: the shapes of `_SECRET_PATTERNS` in bin/fleet-switchboard (this file stands alone), every run of name characters bounded so no scan is quadratic.
+# A net, not a promise (a token with no known prefix that is not one the read ran with is not caught): the shapes of `_SECRET_PATTERNS` in bin/fleet-switchboard (this file stands alone), every run of name characters bounded so no scan is quadratic.
 SECRET_PATTERNS = (
     (re.compile(r"(?i)\b(bearer|basic|token|digest|negotiate)\s+[A-Za-z0-9._~+/=-]{6,}"), r"\1 [redacted]"),
     (re.compile(r"(?i)(?<![A-Za-z0-9_.-])([A-Za-z0-9_.-]{0,64}(?:token|secret|passw(?:or)?d|api[_-]?key|credential|auth)[A-Za-z0-9_.-]{0,64}[\"']?\s{0,4}[=:]\s{0,4})"
@@ -81,14 +81,19 @@ def clean_stderr(text, env=None, limit=WHY_CHARS):
     raw = str(text or "")
     cut = len(raw) > WHY_READ
     raw = raw[:WHY_READ]
+
+    def known(text):   # the tokens the read ran with (a value of 4 or more characters), as they are, URL-escaped and JSON-escaped
+        for name in TOKEN_ENV_NAMES:
+            value = (env or {}).get(name)
+            if value and len(value) >= 4:
+                for form in {value, urllib.parse.quote(value, safe=""), json.dumps(value)[1:-1]}:
+                    text = text.replace(form, "[redacted]")
+        return text
+    raw = known(raw)   # before the control characters go, so a value that holds one is still found
     raw = "".join(c if c.isascii() and c.isprintable() else " " for c in raw)
     if cut:
         raw = raw.rstrip().rpartition(" ")[0]
-    for name in TOKEN_ENV_NAMES:
-        value = (env or {}).get(name)
-        if value and len(value) >= 4:
-            for form in {value, urllib.parse.quote(value, safe=""), json.dumps(value)[1:-1]}:
-                raw = raw.replace(form, "[redacted]")
+    raw = known(raw)
     for pattern, replacement in SECRET_PATTERNS:
         raw = pattern.sub(replacement, raw)
     return " ".join(raw.split())[:limit]
