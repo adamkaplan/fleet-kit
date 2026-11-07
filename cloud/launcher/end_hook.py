@@ -647,7 +647,7 @@ def read_marker(path):
 
 
 def write_marker(path, text):
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
     try:
         os.write(fd, text.encode())
     finally:
