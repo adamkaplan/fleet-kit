@@ -557,6 +557,12 @@ def snapshot(workdir, worker, repo, ctx):
         if keep:
             subprocess.run([GIT_BIN, "--literal-pathspecs", "-C", workdir] + ctx.opts + ["add", "-A", "--pathspec-from-file=-", "--pathspec-file-nul"],
                            input="\0".join(keep).encode(), capture_output=True, env=ctx.env, check=True)
+        staged = [x for x in git(workdir, "diff", "--cached", "--name-only", "-z", "--no-ext-diff", "--no-textconv", ctx=ctx).stdout.split("\0") if x and is_secret(x)]
+        if staged:   # a secret-looking path the agent staged itself: back to the committed version (or out of the copy when HEAD has none)
+            has_head = git(workdir, "rev-parse", "--verify", "-q", "HEAD", check=False, ctx=ctx).returncode == 0
+            verb = ["reset", "-q", "HEAD"] if has_head else ["rm", "--cached", "-q", "--ignore-unmatch"]
+            subprocess.run([GIT_BIN, "--literal-pathspecs", "-C", workdir] + ctx.opts + verb + ["--pathspec-from-file=-", "--pathspec-file-nul"],
+                           input="\0".join(staged).encode(), capture_output=True, env=ctx.env, check=True)
         tree = git(workdir, "write-tree", ctx=ctx).stdout.strip()
         try:
             with open(saved_path) as f:

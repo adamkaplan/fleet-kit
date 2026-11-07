@@ -149,12 +149,32 @@ class EndHookSnapshot(unittest.TestCase):
         git(p.work, "push", "-q", p.remote, "base")
         p.write(".env", "TOKEN=2\n")   # a tracked secret-looking file, modified
         p.write(":(exclude)q.key", "k\n")
+        p.write(":(top)m.txt", "magic\n")   # not secret-looking: reaches `git add`, which must take the name literally
+        p.write("staged.pem", "s\n")
+        git(p.work, "add", "-f", "staged.pem")   # a secret-looking file the agent staged itself
         p.write("b.txt", "1\n")
         self.assertEqual(p.snapshot().returncode, 0)
         names = git(p.remote, "ls-tree", "-r", "--name-only", "refs/heads/coder7/wip").split("\n")
         self.assertIn("b.txt", names)
         self.assertNotIn(":(exclude)q.key", names)
+        self.assertNotIn("staged.pem", names)
+        self.assertIn(":(top)m.txt", names)
         self.assertEqual(git(p.remote, "show", "refs/heads/coder7/wip:.env"), "TOKEN=1\n")
+
+    def test_a_diverged_remote_wip_is_never_forced_over(self):
+        p = self.pod
+        p.write("b.txt", "1\n")
+        p.snapshot()
+        other = os.path.join(self.tmp.name, "other2")
+        git(self.tmp.name, "clone", "-q", p.remote, other)
+        git(other, "checkout", "-q", "coder7/wip")
+        git(other, "-c", "user.name=o", "-c", "user.email=o@invalid", "commit", "-q", "--allow-empty", "-m", "theirs")
+        git(other, "push", "-q", "origin", "HEAD:refs/heads/coder7/wip")
+        theirs = p.wip()
+        p.write("b.txt", "2\n")
+        r = p.snapshot()   # the old wip head is fetched as the parent: a fast-forward over theirs, or a refusal; theirs stays reachable
+        self.assertIn(theirs, git(p.remote, "rev-list", "refs/heads/coder7/wip").split())
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
 
     def test_a_garbled_marker_file_is_not_a_crash(self):
         p = self.pod
