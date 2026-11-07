@@ -784,6 +784,14 @@ class TestWiring(Base):
             self.assertNoSecret(out, err)
         self.assertNothingKept()
 
+    def test_a_refused_create_audit_line_names_the_launching_lane(self):
+        with mock.patch.dict(os.environ, {"STUB_CREATE_FAIL": "1"}):
+            self.assertEqual(self.launch()[0], 1)
+        lines = [json.loads(l) for p in self.state.rglob("*") if p.is_file() and p.suffix != ".password" for l in p.read_text(errors="replace").splitlines()
+                 if "cloud.create_failed" in l]
+        self.assertTrue(lines, "no cloud.create_failed audit line")
+        self.assertEqual(lines[0]["detail"].get("boss"), "orch")
+
     def test_u2_a_launch_that_dies_at_the_tunnel_stops_the_pod_and_says_nothing_secret(self):
         (self.stub_dir / "pf_die").write_text("")
         code, out, err = self.launch()

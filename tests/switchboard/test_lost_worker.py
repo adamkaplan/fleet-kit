@@ -947,6 +947,16 @@ class TestRefusedLaunchIsToldToItsLane(unittest.TestCase):
         got, to, _ = self.refused(load(), "")
         self.assertEqual(to, ["chief-of-staff"])   # an empty boss is no lane
 
+    def test_a_boss_that_is_not_a_lane_name_is_no_lane(self):
+        for bad in (5, "x" * 90, "lane\nx", "Lane A", "lane-a, kind=pod_no_stop"):
+            got, to, _ = self.refused(load(), bad)
+            self.assertEqual(to, ["chief-of-staff"], repr(bad))
+
+    def test_the_alert_key_is_unchanged_and_an_old_line_with_no_boss_is_told_once(self):
+        got, to, _ = self.refused(load(), "lane-a", None)
+        self.assertEqual(sorted(x["key"].split("@")[0] for x in got), ["refused_launch:w0", "refused_launch:w1"])
+        self.assertEqual(sorted(to), ["chief-of-staff", "lane-a"])
+
     def test_a_loss_of_another_kind_keeps_its_recipients(self):
         mod = load()
         r = Rig(mod)

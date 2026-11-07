@@ -6734,7 +6734,7 @@ The four kinds it sends for:
 |---|---|
 | `pod_no_stop` | a `cloud.created` line, its hard deadline passed, no stop line in either audit (stops of any reason, `done` included, never alert here) and no final report line |
 | `local_worker` | a local worker seen alive in an earlier pass, now gone from discovery and not retired in the registry |
-| `refused_launch` | a `cloud.create_failed` line; its `boss` (the launching lane) is the only recipient and is named as `lane=` in the text (#2303); with no readable boss the Chief of Staff alone is told |
+| `refused_launch` | a `cloud.create_failed` line; its `boss` (the launching lane) is the only recipient and is named as `lane=` in the text (#2303); with no readable boss (absent, or not a lane name, as in lines written before #2303) the Chief of Staff alone is told |
 | `reaper_missed` | a failed line of the reaper's own login refresh in the launcher audit (runtime id `reaper`) |
 
 A worker the cloud launcher ends (idle, hard limit, pod gone, failed pod) is announced by the launcher's sender (#1480), not here. Tests: `tests/switchboard/test_lost_worker.py`.
