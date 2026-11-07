@@ -962,10 +962,63 @@ class TestEndNoticeOwnPushes(unittest.TestCase):
         path = self.audit_with(self.sent("cb-own3", "cb-own3/work", self.SHA))
         self.assertIn("Last head: feat/x@aaaaaaaa, checks passed.", self.world("cb-own3", self.PUSHED, path, head_sha="a" * 40))
 
-    def test_unreadable_or_hostile_audit_keeps_the_old_behaviour(self):
+    def test_unreadable_audit_keeps_the_old_behaviour(self):
         self.assertIn("Last head: nothing pushed.", self.world("cb-own4", self.NOTHING, "/nonexistent/audit.jsonl"))
-        bad = self.audit_with(self.sent("cb-own5", "bad branch\n<x>", self.SHA), self.sent("cb-own5", "ok/b", "xyz"))
-        self.assertIn("Last head: nothing pushed.", self.world("cb-own5", self.NOTHING, bad))
+
+    def test_each_guard_of_the_reader_drops_its_own_hostile_line(self):
+        for n, (branch, sha) in enumerate((("bad branch\n<x>", self.SHA), ("sk-abcdefghijkl", self.SHA), ("ghp_" + "a" * 36, self.SHA),
+                                           ("ok/b", "bbbbbbbb"), ("ok/b", "B" * 40), ("ok/b", 5), (5, self.SHA))):
+            path = self.audit_with(self.sent("cb-own5", branch, self.SHA if sha is None else "c" * 40) | {"detail": {"branch": branch, "head": sha}})
+            self.assertIn("Last head: nothing pushed.", self.world("cb-own5", self.NOTHING, path), (branch, sha))
+
+    def test_a_valid_push_survives_a_newer_hostile_line(self):
+        path = self.audit_with(self.sent("cb-own7", "ok/b", self.SHA), self.sent("cb-own7", "bad branch", "c" * 40))
+        self.assertIn("Last head: ok/b@bbbbbbbb", self.world("cb-own7", self.NOTHING, path))
+
+    def test_a_push_of_an_earlier_pod_of_the_same_name_is_not_this_pods(self):
+        created = {"event": "cloud.created", "subject": "cb-own8", "detail": {}}
+        path = self.audit_with(self.sent("cb-own8", "old/b", self.SHA), created)
+        self.assertIn("Last head: nothing pushed.", self.world("cb-own8", self.NOTHING, path))
+        path = self.audit_with(self.sent("cb-own8", "old/b", self.SHA), created, self.sent("cb-own8", "new/b", "c" * 40))
+        self.assertIn("Last head: new/b@cccccccc", self.world("cb-own8", self.NOTHING, path))
+
+    def test_only_the_tail_of_a_large_audit_is_read_and_a_cut_first_line_is_skipped(self):
+        mod = sb.load_module("cloud_end_alert")
+        pad = {"event": "x", "subject": "p", "detail": {"t": "y" * 1000}}
+        lines = [self.sent("cb-own9", "gone/b", self.SHA)] + [pad] * (mod.READ_BYTES // 1000 + 5)
+        self.assertIn("Last head: nothing pushed.", self.world("cb-own9", self.NOTHING, self.audit_with(*lines)))
+        lines = [pad] * (mod.READ_BYTES // 1000 + 5) + [self.sent("cb-own9", "near/b", self.SHA)]
+        self.assertIn("Last head: near/b@bbbbbbbb", self.world("cb-own9", self.NOTHING, self.audit_with(*lines)))
+
+    def test_a_hook_with_an_error_and_no_head_falls_back_to_the_own_push(self):
+        path = self.audit_with(self.sent("cb-own10", "own/b", self.SHA))
+        self.assertIn("Last head: own/b@bbbbbbbb", self.world("cb-own10", {"error": "x", "head_on": None, "wip_branch": None}, path))
+
+    def test_a_fifo_or_symlink_audit_is_not_read(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        fifo = os.path.join(d, "f")
+        os.mkfifo(fifo)
+        real = self.audit_with(self.sent("cb-own11", "own/b", self.SHA))
+        link = os.path.join(d, "l")
+        os.symlink(real, link)
+        for path in (fifo, link):
+            self.assertIn("Last head: nothing pushed.", self.world("cb-own11", self.NOTHING, path))
+
+    def test_the_daemon_tick_wires_the_reader_to_its_audit_file(self):
+        w = StopWorld(self)
+        rec = w.pod("cb-own12", "words")
+        (rec / "run.json").write_text(json.dumps({"head_sha": None, "end_hook": self.NOTHING}))
+        (w.cloud / "cb-own12.json").write_text(json.dumps({"worker": "cb-own12", "reports_to": "boss-lane", "repo": "o/r"}))
+        engine = mock.Mock()
+        engine.state_dir = str(w.state)
+        engine.audit.path = self.audit_with(self.sent("cb-own12", "own/b", self.SHA))
+        with mock.patch.dict(os.environ, {"CW_CLOUD_AUDIT": str(w.audit)}), mock.patch.object(sb, "cloud_head_checks", lambda e, repo, sha: "passed"):
+            sb.cloud_end_tick(engine, None)   # the first pass only marks the end of the file
+            w.stop("cb-own12", "hard", rec)
+            sb.cloud_end_tick(engine, None)
+        self.assertTrue(engine.send.called)
+        self.assertIn("Last head: own/b@bbbbbbbb, checks passed.", " ".join(str(c) for c in engine.send.call_args_list))
 
     def test_a_raising_reader_keeps_the_old_behaviour(self):
         w = StopWorld(self)

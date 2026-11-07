@@ -168,30 +168,53 @@ BRANCH_OK = re.compile(r"[A-Za-z0-9._/-]{1,100}")
 SECRETISH = re.compile(r"sk-|gh[opsu]_|github_pat|AKIA|xox|eyJ|[A-Za-z0-9]{30}")
 
 
+FULL_SHA = re.compile(r"[0-9a-f]{40}")
+
+
+def clean_branch(branch):
+    """The branch text if it is safe to put in a notice (one name, no secret shape), else None."""
+    if isinstance(branch, str) and BRANCH_OK.fullmatch(branch) and branch != "unknown" and not SECRETISH.search(branch):
+        return branch
+    return None
+
+
 def push_reader(audit_path, parse):
     """The `last_push` reader of scan_audit: worker -> (branch, full sha) of the pod's newest `push_watch.sent` line of the switchboard audit, or None.
-    Reads the last READ_BYTES of the file only; any failure gives None."""
+    Reads the last READ_BYTES of a regular file only; any failure gives None (the notice then says what the end hook shows, as before).
+    A later `cloud.created` line of the same name starts a new pod: its older pushes are dropped."""
     def read(worker):
         try:
-            size = os.stat(str(audit_path)).st_size
-            with open(str(audit_path), "rb") as handle:
-                handle.seek(max(0, size - READ_BYTES))
-                chunk = handle.read(READ_BYTES)
+            fd = os.open(str(audit_path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         except (OSError, TypeError, ValueError):
             return None
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                return None
+            size = os.fstat(fd).st_size
+            os.lseek(fd, max(0, size - READ_BYTES), os.SEEK_SET)
+            chunk = os.read(fd, READ_BYTES)
+        except OSError:
+            return None
+        finally:
+            os.close(fd)
         found = None
         for raw in chunk.split(b"\n"):
-            if b"push_watch.sent" not in raw:
+            if b"push_watch.sent" not in raw and b"cloud.created" not in raw:
                 continue
             try:
                 item = parse(raw.decode("utf-8"))
             except (ValueError, UnicodeDecodeError, TypeError):
                 continue
-            detail = item.get("detail") if isinstance(item, dict) else None
-            if not isinstance(detail, dict) or item.get("event") != "push_watch.sent" or item.get("subject") != worker:
+            if not isinstance(item, dict) or item.get("subject") != worker:
                 continue
-            branch, sha = detail.get("branch"), detail.get("head")
-            if isinstance(branch, str) and BRANCH_OK.fullmatch(branch) and not SECRETISH.search(branch) and isinstance(sha, str) and re.fullmatch(r"[0-9a-f]{40}", sha):
+            if item.get("event") == "cloud.created":
+                found = None
+                continue
+            detail = item.get("detail")
+            if item.get("event") != "push_watch.sent" or not isinstance(detail, dict):
+                continue
+            branch, sha = clean_branch(detail.get("branch")), detail.get("head")
+            if branch and isinstance(sha, str) and FULL_SHA.fullmatch(sha):
                 found = (branch, sha)   # later lines are newer
         return found
     return read
@@ -209,12 +232,11 @@ def head_line(record_dir, repo, head_checks, parse, pushed=None):
     branch = hook.get("head_on") if isinstance(hook, dict) else None
     sha = run.get("head_sha") if isinstance(run, dict) else None
     wip = hook.get("wip_branch") if isinstance(hook, dict) and branch is None else None
-    if isinstance(wip, str) and re.fullmatch(r"[A-Za-z0-9._/-]{1,100}", wip) and not re.search(r"sk-|gh[opsu]_|github_pat|AKIA|xox|eyJ|[A-Za-z0-9]{30}", wip):
-        if not (isinstance(sha, str) and re.fullmatch(r"[0-9a-f]{40}", sha)):
+    if clean_branch(wip):
+        if not (isinstance(sha, str) and FULL_SHA.fullmatch(sha)):
             return "Last head: wip branch %s, sha unknown." % wip
         branch = "wip branch " + wip
-    elif not (isinstance(branch, str) and re.fullmatch(r"[A-Za-z0-9._/-]{1,100}", branch) and branch != "unknown"
-            and isinstance(sha, str) and re.fullmatch(r"[0-9a-f]{40}", sha)):
+    elif not (clean_branch(branch) and isinstance(sha, str) and FULL_SHA.fullmatch(sha)):
         return finish_head(repo, pushed[0], pushed[1], head_checks) if pushed else "Last head: head unknown."
     return finish_head(repo, branch, sha, head_checks)
 
@@ -287,7 +309,7 @@ def scan_audit(audit_file, state_file, cloud_dir, last_reports, send, parse, aud
             try:
                 own = last_push(worker) if last_push is not None else None
             except Exception:
-                own = None
+                own = None   # fail mode: no own push is known, the line says what the end hook shows (as before this reader)
             text += " " + head_line(raw_dir(reason) if name else "", (record or {}).get("repo"), head_checks, parse, own)
         keys.append(key)
         to_list = [CHIEF] + ([boss] if isinstance(boss, str) and AGENT_NAME.fullmatch(boss) and boss != CHIEF else [])
