@@ -141,6 +141,29 @@ class EndHookSnapshot(unittest.TestCase):
         self.assertIn(head, git(p.remote, "rev-list", "refs/heads/coder7/wip").split())
         self.assertEqual(p.fingerprint(), before)
 
+    def test_a_secret_looking_name_cannot_slip_through_as_a_pathspec_or_as_a_tracked_change(self):
+        p = self.pod
+        p.write(".env", "TOKEN=1\n")
+        git(p.work, "add", ".env")
+        git(p.work, "commit", "-q", "-m", "tracked secret")
+        git(p.work, "push", "-q", p.remote, "base")
+        p.write(".env", "TOKEN=2\n")   # a tracked secret-looking file, modified
+        p.write(":(exclude)q.key", "k\n")
+        p.write("b.txt", "1\n")
+        self.assertEqual(p.snapshot().returncode, 0)
+        names = git(p.remote, "ls-tree", "-r", "--name-only", "refs/heads/coder7/wip").split("\n")
+        self.assertIn("b.txt", names)
+        self.assertNotIn(":(exclude)q.key", names)
+        self.assertEqual(git(p.remote, "show", "refs/heads/coder7/wip:.env"), "TOKEN=1\n")
+
+    def test_a_garbled_marker_file_is_not_a_crash(self):
+        p = self.pod
+        p.write("b.txt", "1\n")
+        open(os.path.join(p.work, ".git", "cw-wip-saved"), "w").close()
+        r = p.snapshot()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertTrue(json.loads(r.stdout)["saved"])
+
     def test_an_unborn_head_with_no_wip_branch_is_saved_as_a_root_commit(self):
         t = os.path.join(self.tmp.name, "u")
         os.makedirs(t)

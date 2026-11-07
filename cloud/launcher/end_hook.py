@@ -549,18 +549,20 @@ def snapshot(workdir, worker, repo, ctx):
         if os.path.isfile(real_index):
             shutil.copyfile(real_index, index)
         ctx.env["GIT_INDEX_FILE"] = index
-        others = git(workdir, "ls-files", "--others", "--exclude-standard", "-z", ctx=ctx).stdout.split("\0")
-        git(workdir, "add", "-A", ctx=ctx)
-        secret = [x for x in others if x and is_secret(x)]
-        if secret:
-            subprocess.run([GIT_BIN, "-C", workdir] + ctx.opts + ["rm", "--cached", "-q", "--ignore-unmatch", "--pathspec-from-file=-", "--pathspec-file-nul"],
-                           input="\0".join(secret).encode(), capture_output=True, env=ctx.env, check=True)
+        config_refusal(workdir, repo, ctx)   # again, right before the add: the agent is running while a save is made
+        # what changed: the untracked files and the tracked files that differ from the index copy; a secret-looking path is never staged (a tracked one keeps its old version)
+        changed = (git(workdir, "ls-files", "--others", "--exclude-standard", "-z", ctx=ctx).stdout.split("\0")
+                   + git(workdir, "diff", "--name-only", "-z", "--no-ext-diff", "--no-textconv", ctx=ctx).stdout.split("\0"))
+        keep = sorted({x for x in changed if x and not is_secret(x)})
+        if keep:
+            subprocess.run([GIT_BIN, "--literal-pathspecs", "-C", workdir] + ctx.opts + ["add", "-A", "--pathspec-from-file=-", "--pathspec-file-nul"],
+                           input="\0".join(keep).encode(), capture_output=True, env=ctx.env, check=True)
         tree = git(workdir, "write-tree", ctx=ctx).stdout.strip()
         try:
             with open(saved_path) as f:
                 if f.read().split()[0] == tree:
                     return {"saved": False, "tree": tree, "wip_branch": branch}
-        except OSError:
+        except (OSError, IndexError, ValueError):
             pass
         head = git(workdir, "rev-parse", "--verify", "-q", "HEAD", check=False, ctx=ctx).stdout.strip()
         if head and git(workdir, "rev-parse", "%s^{tree}" % head, ctx=ctx).stdout.strip() == tree and git(workdir, "branch", "-r", "--contains", head, ctx=ctx).stdout.strip():
@@ -576,6 +578,7 @@ def snapshot(workdir, worker, repo, ctx):
         if not same:
             args = [a for x in parents for a in ("-p", x)]
             commit = git(workdir, *SNAP_IDENT, "commit-tree", tree, *args, "-m", "WIP: work in progress saved by %s while it runs" % worker, ctx=ctx).stdout.strip()
+            config_refusal(workdir, repo, ctx)   # again, right before the push
             git(workdir, "push", "--no-verify", url, "%s:refs/heads/%s" % (commit, branch), ctx=ctx)
         with open(saved_path, "w") as f:
             f.write("%s %s\n" % (tree, commit))
@@ -597,7 +600,7 @@ def ff_over_snapshots(workdir, worker, url, ctx):
     try:
         with open(os.path.join(workdir, ".git", SNAP_SAVED_FILE)) as f:
             ours = f.read().split()[1:]
-    except OSError:
+    except (OSError, ValueError):
         ours = []
     if ours != [wip]:
         return False   # the wip head is not the commit of our own last save: a diverged branch of someone else stays refused by the plain push
