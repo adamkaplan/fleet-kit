@@ -178,10 +178,14 @@ def clean_branch(branch):
     return None
 
 
+UNPROVEN = ("", "")   # the reader's answer when its window cannot show whether the pod pushed (a long audit, no `cloud.created` of the pod in view)
+
+
 def push_reader(audit_path, parse):
     """The `last_push` reader of scan_audit: worker -> (branch, full sha) of the pod's newest `push_watch.sent` line of the switchboard audit, or None.
     Reads the last READ_BYTES of a regular file only; any failure gives None (the notice then says what the end hook shows, as before).
-    A later `cloud.created` line of the same name starts a new pod: its older pushes are dropped."""
+    A later `cloud.created` line of the same name starts a new pod: its older pushes are dropped. When the file is longer than the window, no push is in
+    view and no `cloud.created` of the pod is either, the answer is UNPROVEN (the notice says "head unknown", never "nothing pushed")."""
     def read(worker):
         if audit_path is None:
             return None
@@ -200,7 +204,7 @@ def push_reader(audit_path, parse):
             return None
         finally:
             os.close(fd)
-        found = None
+        found, covered = None, size <= READ_BYTES
         for raw in chunk.split(b"\n"):
             if b"push_watch.sent" not in raw and b"cloud.created" not in raw:
                 continue
@@ -211,7 +215,7 @@ def push_reader(audit_path, parse):
             if not isinstance(item, dict) or item.get("subject") != worker:
                 continue
             if item.get("event") == "cloud.created":
-                found = None
+                found, covered = None, True
                 continue
             detail = item.get("detail")
             if item.get("event") != "push_watch.sent" or not isinstance(detail, dict):
@@ -219,7 +223,7 @@ def push_reader(audit_path, parse):
             branch, sha = clean_branch(detail.get("branch")), detail.get("head")
             if branch and isinstance(sha, str) and FULL_SHA.fullmatch(sha):
                 found = (branch, sha)   # later lines are newer
-        return found
+        return found or (None if covered else UNPROVEN)
     return read
 
 
@@ -231,7 +235,7 @@ def head_line(record_dir, repo, head_checks, parse, pushed=None):
     if isinstance(hook, dict) and hook.get("head_on") is None and hook.get("wip_branch") is None and not hook.get("error"):
         if not pushed:
             return "Last head: nothing pushed."
-        return finish_head(repo, pushed[0], pushed[1], head_checks)
+        return "Last head: head unknown." if pushed == UNPROVEN else finish_head(repo, pushed[0], pushed[1], head_checks)
     branch = hook.get("head_on") if isinstance(hook, dict) else None
     sha = run.get("head_sha") if isinstance(run, dict) else None
     wip = hook.get("wip_branch") if isinstance(hook, dict) and branch is None else None
@@ -240,7 +244,7 @@ def head_line(record_dir, repo, head_checks, parse, pushed=None):
             return "Last head: wip branch %s, sha unknown." % wip
         branch = "wip branch " + wip
     elif not (clean_branch(branch) and isinstance(sha, str) and FULL_SHA.fullmatch(sha)):
-        return finish_head(repo, pushed[0], pushed[1], head_checks) if pushed else "Last head: head unknown."
+        return finish_head(repo, pushed[0], pushed[1], head_checks) if pushed and pushed != UNPROVEN else "Last head: head unknown."
     return finish_head(repo, branch, sha, head_checks)
 
 

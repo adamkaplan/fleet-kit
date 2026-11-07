@@ -156,7 +156,7 @@ class TestPushWatch(Case):
 
     def test_a_hostile_branch_is_cleaned_at_the_write_site_and_a_plain_one_is_kept(self):
         for ref, want in (("w-a/wip", "w-a/wip"), ("w-a/wip`<x>@y\"" + "z" * 200, None)):
-            self.setUp()
+            self.setUp()   # a fresh fixture per case
             self.world.refs = {ref: SHA_A}
             self.run_pass(NOW)
             self.run_pass(NOW + 1)

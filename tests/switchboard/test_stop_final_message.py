@@ -1023,9 +1023,20 @@ class TestEndNoticeOwnPushes(unittest.TestCase):
         body = push + json.dumps({"event": "x", "subject": "p", "detail": {"t": "y" * (want - empty)}}) + "\n"
         Path(path).write_text(body)
         self.assertTrue(0 < len(body) - mod.READ_BYTES < len(push), "fixture: the window must start inside the push line")
-        self.assertIn("Last head: nothing pushed.", self.world("cb-own9", self.NOTHING, path))
+        self.assertIn("Last head: head unknown.", self.world("cb-own9", self.NOTHING, path))   # not proven: the window does not show the pod's start
+        Path(path).write_text(pad * (mod.READ_BYTES // len(pad) // 2) + json.dumps({"event": "cloud.created", "subject": "cb-own9", "detail": {}}) + "\n" + pad * (mod.READ_BYTES // len(pad) // 2 + 5))
+        self.assertGreater(os.path.getsize(path), mod.READ_BYTES)
+        self.assertIn("Last head: nothing pushed.", self.world("cb-own9", self.NOTHING, path))   # proven: the pod's creation is in view
         Path(path).write_text(pad * (mod.READ_BYTES // len(pad) + 5) + json.dumps(self.sent("cb-own9", "near/b", self.SHA)) + "\n")
         self.assertIn("Last head: near/b@bbbbbbbb", self.world("cb-own9", self.NOTHING, path))
+
+    def test_a_clean_hook_branch_without_a_sha_falls_back_to_the_own_push(self):
+        path = self.audit_with(self.sent("cb-own17", "own/b", self.SHA))
+        self.assertIn("Last head: own/b@bbbbbbbb", self.world("cb-own17", self.PUSHED, path, head_sha=None))
+
+    def test_another_event_naming_push_watch_sent_is_no_push(self):
+        path = self.audit_with({"event": "push_watch.quiet", "subject": "cb-own18", "detail": {"note": "push_watch.sent", "branch": "own/b", "head": self.SHA}})
+        self.assertIn("Last head: nothing pushed.", self.world("cb-own18", self.NOTHING, path))
 
     def test_a_hook_with_an_error_and_no_head_falls_back_to_the_own_push(self):
         path = self.audit_with(self.sent("cb-own10", "own/b", self.SHA))
