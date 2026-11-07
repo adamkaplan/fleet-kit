@@ -823,10 +823,7 @@ def _launch(args, runner, now, reserve):
                     os.close(write_fd)
             del model, token, run_secrets
             if code != 0:
-                failed = {"exit": code, "reason": _one(note, 160)}
-                if args.reports_to:
-                    failed["boss"] = args.reports_to   # #2303: the lane that launched it is told of the refusal
-                _audit(engine, "cloud.create_failed", name, failed)
+                _audit(engine, "cloud.create_failed", name, {"exit": code, "reason": _one(note, 160), **({"boss": args.reports_to} if args.reports_to else {})})   # #2303: the launching lane
                 raise LaunchError("the cloud worker was not created: %s" % _reason(code, note))
             try:
                 password = _read_password(read_fd)

@@ -952,6 +952,11 @@ class TestRefusedLaunchIsToldToItsLane(unittest.TestCase):
             got, to, _ = self.refused(load(), bad)
             self.assertEqual(to, ["chief-of-staff"], repr(bad))
 
+    def test_a_valid_but_unusual_lane_name_is_a_lane(self):
+        for good in ("2fa-lane", "l" * 40, "chief-of-staff"):
+            got, to, _ = self.refused(load(), good)
+            self.assertEqual(to, [good])
+
     def test_the_alert_key_is_unchanged_and_an_old_line_with_no_boss_is_told_once(self):
         got, to, _ = self.refused(load(), "lane-a", None)
         self.assertEqual(sorted(x["key"].split("@")[0] for x in got), ["refused_launch:w0", "refused_launch:w1"])

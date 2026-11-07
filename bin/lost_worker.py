@@ -156,7 +156,7 @@ def _fold(state, sb, lines, source):
             elif event == "cloud.stopped":
                 stop[name] = max(ts, stop.get(name, 0))
             elif event == "cloud.create_failed":
-                state.setdefault("refused", {})["%s@%s" % (name, item["ts"])] = {"name": name, "at": ts, "line": raw, "boss": detail.get("boss") if isinstance(detail.get("boss"), str) and re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", detail["boss"], re.ASCII) else None}   # a lane name as the launcher spells it; any other text is no lane
+                state.setdefault("refused", {})["%s@%s" % (name, item["ts"])] = {"name": name, "at": ts, "line": raw, "boss": detail.get("boss") if isinstance(detail.get("boss"), str) and re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", detail["boss"], re.ASCII) else None}   # a lane name as agent_presence spells it; any other text is no lane
         else:
             name, action, ok = item.get("worker"), item.get("action"), item.get("ok")
             _note_slow(state, item, ts)
