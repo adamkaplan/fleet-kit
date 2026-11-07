@@ -55,7 +55,8 @@ class ActivityMessage(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         pw = os.path.join(tmp.name, "pw")
-        open(pw, "w").write("x\n")
+        with open(pw, "w") as f:
+            f.write("x\n")
         empty = tempfile.TemporaryDirectory()
         self.addCleanup(empty.cleanup)
         env = dict(os.environ, CW_ACTIVITY_PORT=str(port), CW_ACTIVITY_PASSWORD_FILE=pw, CW_ACTIVITY_UNDER_TEST="1", CW_ACTIVITY_PROC=empty.name)
@@ -95,14 +96,16 @@ class ActivityMessage(unittest.TestCase):
         self.assertEqual(int(NOW_MS / 1000 - last), 1200)
 
     def test_control_and_mutant_the_read_without_the_messages_reports_the_sessions_time(self):
-        src = open(SCRIPT).read()
+        with open(SCRIPT) as f:
+            src = f.read()
         old = ' + newest_messages(port, auth, sessions)\n'
         self.assertEqual(src.count(old), 1, "anchored text")
         mutant = src.replace(old, "\n")
         self.assertNotEqual(mutant, src)
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "activity.py")
-            open(path, "w").write(mutant)
+            with open(path, "w") as f:
+                f.write(mutant)
             got = self.read(*self.scene(), script=path)
         self.assertEqual(got["last_activity"], iso(NOW_MS - 40 * MIN), "the mutant must read the sessions' time only")
 
