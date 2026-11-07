@@ -176,6 +176,19 @@ class EndHookSnapshot(unittest.TestCase):
         self.assertIn(theirs, git(p.remote, "rev-list", "refs/heads/coder7/wip").split())
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
 
+    def test_deletions_links_and_the_executable_bit_are_saved_without_git_add(self):
+        p = self.pod
+        os.remove(os.path.join(p.work, "a.txt"))
+        os.symlink("b.txt", os.path.join(p.work, "ln"))
+        p.write("run.sh", "#!/bin/sh\n")
+        os.chmod(os.path.join(p.work, "run.sh"), 0o755)
+        r = p.snapshot()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        ls = git(p.remote, "ls-tree", "-r", "refs/heads/coder7/wip")
+        self.assertNotIn("a.txt", ls)
+        self.assertIn("120000", [l.split()[0] for l in ls.splitlines() if l.endswith("\tln")][0])
+        self.assertIn("100755", [l.split()[0] for l in ls.splitlines() if l.endswith("\trun.sh")][0])
+
     def test_a_garbled_marker_file_is_not_a_crash(self):
         p = self.pod
         p.write("b.txt", "1\n")
