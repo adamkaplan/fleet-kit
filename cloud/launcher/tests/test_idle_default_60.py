@@ -27,7 +27,7 @@ class IdleDefault(base.Base):
         with redirect_stdout(io.StringIO()):
             code = (module or cw).main(["create", worker, *REPO, *extra], self.env, self.clock, lambda s: self.clock.advance(seconds=s))
         self.assertEqual(code, 0)
-        return self.pod()["metadata"]["annotations"]["cw/idle-seconds"]
+        return self.pod(worker)["metadata"]["annotations"]["cw/idle-seconds"]
 
     def test_a_coder_launch_without_idle_is_3600(self):
         self.assertEqual(self.idle_of("coder7"), "3600")
