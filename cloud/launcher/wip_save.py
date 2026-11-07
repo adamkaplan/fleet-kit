@@ -18,6 +18,8 @@ def _ann(pod, key, default=None):
 
 def save_pass(launcher, pods, now, name_ok):
     """One pass over the pods the reaper holds. Returns a list of (pod name, 'saved'|'unchanged'|'failed'), for the tests. Never raises."""
+    if not callable(getattr(launcher.kube, "exec", None)):
+        return []   # a kube that cannot exec has no pod to reach
     state = launcher.__dict__.setdefault("wip_save_state", {})
     seen, out = set(), []
     for pod in pods:

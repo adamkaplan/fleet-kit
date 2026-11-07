@@ -112,8 +112,8 @@ cloud/launcher/tests/test_token_read_at_call.py
 cloud/launcher/tests/test_untracked_report.py
 cloud/launcher/tests/test_vault_block.py
 cloud/launcher/tests/test_vault_check_pins.py
-cloud/launcher/tests/test_worker_copies.py
 cloud/launcher/tests/test_wip_save.py
+cloud/launcher/tests/test_worker_copies.py
 cloud/worker/tests/test_activity.py
 cloud/worker/tests/test_base_merge_base.py
 cloud/worker/tests/test_cloud_prepush.py

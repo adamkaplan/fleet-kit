@@ -104,6 +104,7 @@ REAP_STOP_SECONDS = 420                 # one stop's own limit: past it the wait
 RENEW_CADENCE_SECONDS = 600             # the renewal and the login refresh run at least this often, on their own thread, whatever a pass is doing
 RESTART_ACTION = "reaper-restart"       # the audit action of the reaper's exit after the installed code changed (the service manager starts it again)
 CODE_IDENTITY_FILES = ("cloud/launcher/cloud_worker.py", "cloud/launcher/run_record.py", "bin/path_walk.py", "cloud/launcher/token_mint.py", "bin/registry.py", "bin/record_json.py")   # the module and the kit modules it imports
+CODE_IDENTITY_FILES = CODE_IDENTITY_FILES + ("cloud/launcher/wip_save.py",)   # #2304: the save step is part of the reaper's code identity
 RENEW_POLL_SECONDS = 15                 # how often that thread looks at the clock
 IGNORED_SETTING_ACTION = "ignored-setting-notice"   # the audit action of the notice that a setting is ignored by the unattended refresh
 IGNORED_SETTINGS = ("CW_KUBECTL", "CW_CLUSTER_ADMIN_CMD", "CW_CLUSTER_TOKEN_CMD")   # the names the strict route ignores
