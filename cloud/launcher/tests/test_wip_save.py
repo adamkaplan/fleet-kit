@@ -190,6 +190,24 @@ class EndHookSnapshot(unittest.TestCase):
         self.assertEqual(git(p.remote, "show", "refs/heads/coder7/wip:b.txt"), "2\n")
         self.assertEqual(git(p.remote, "merge-base", "--is-ancestor", old, p.wip(), check=False), "")
 
+    def test_a_wip_head_that_is_not_our_own_save_is_never_overwritten_by_the_end_hook(self):
+        p = self.pod
+        p.write("b.txt", "1\n")
+        p.snapshot()
+        other = os.path.join(self.tmp.name, "other")
+        git(self.tmp.name, "clone", "-q", p.remote, other)
+        git(other, "checkout", "-q", "coder7/wip")
+        git(other, "-c", "user.name=o", "-c", "user.email=o@invalid", "commit", "-q", "--allow-empty", "-m", "theirs")
+        git(other, "push", "-q", "origin", "HEAD:refs/heads/coder7/wip")
+        theirs = p.wip()
+        p.write("b.txt", "2\n")
+        env = dict(os.environ, CW_WORKDIR=p.work, CW_WORKER="coder7", CW_REPO="o/r", **GIT_ENV)
+        with open(p.driver, "w") as f:
+            f.write(DRIVER.replace("m.main()", "m.prestop_main()"))
+        subprocess.run([sys.executable, p.driver, os.path.join(LAUNCHER, "end_hook.py"), "file://" + p.tmp + "/", os.path.join(p.tmp, "bin")],
+                       env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=60)
+        self.assertEqual(p.wip(), theirs)
+
 
 def kube_pod(name="w1", worker="coder7", role=None, persistent=False):
     ann = {"cw/worker": worker, "cw/started": real.iso(T0 - dt.timedelta(minutes=5)), "cw/hard-deadline": real.iso(T0 + dt.timedelta(hours=2))}

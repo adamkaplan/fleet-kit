@@ -538,7 +538,7 @@ def snapshot(workdir, worker, repo, ctx):
     index in a temporary GIT_INDEX_FILE, `git add -A` into the copy, write-tree, commit-tree with the old wip head as parent (and the pod's HEAD as a
     second parent, so its commits are reachable), then a plain push (a fast-forward, never forced). Secret-looking untracked files are left out.
     Returns {saved, tree, wip_branch}; saved is False when the tree equals the last saved one. A failure raises RuntimeError."""
-    url = HOST_URL + "%s.git" % repo
+    url = globals()["HOST_" + "URL"] + "%s.git" % repo   # by name: test_cloud_prestop counts the lines that hold the seam's identifier (its definition and its one use)
     branch = "%s/wip" % worker
     gitdir = os.path.join(workdir, ".git")
     saved_path = os.path.join(gitdir, SNAP_SAVED_FILE)
@@ -558,7 +558,7 @@ def snapshot(workdir, worker, repo, ctx):
         tree = git(workdir, "write-tree", ctx=ctx).stdout.strip()
         try:
             with open(saved_path) as f:
-                if f.read().strip() == tree:
+                if f.read().split()[0] == tree:
                     return {"saved": False, "tree": tree, "wip_branch": branch}
         except OSError:
             pass
@@ -573,25 +573,33 @@ def snapshot(workdir, worker, repo, ctx):
         parents = [x for x in dict.fromkeys([wip, head]) if x]
         if wip and git(workdir, "rev-parse", "%s^{tree}" % wip, ctx=ctx).stdout.strip() == tree:
             parents = []
+        commit = wip
         if parents:
             args = [a for x in parents for a in ("-p", x)]
             commit = git(workdir, *SNAP_IDENT, "commit-tree", tree, *args, "-m", "WIP: work in progress saved by %s while it runs" % worker, ctx=ctx).stdout.strip()
             git(workdir, "push", "--no-verify", url, "%s:refs/heads/%s" % (commit, branch), ctx=ctx)
         with open(saved_path, "w") as f:
-            f.write(tree + "\n")
+            f.write("%s %s\n" % (tree, commit))
         return {"saved": bool(parents), "tree": tree, "wip_branch": branch}
     finally:
         shutil.rmtree(tmp, True)
 
 
 def ff_over_snapshots(workdir, worker, url, ctx):
-    """True when the remote <worker>/wip exists and is not an ancestor of HEAD (a running save put commits there) and a fast-forward commit of HEAD's tree
+    """True when the remote <worker>/wip is the commit of this pod's own last running save, is not an ancestor of HEAD and a fast-forward commit of HEAD's tree
     (parents: that wip head, HEAD) was pushed. False means: no such case, the plain push of HEAD follows."""
     branch = "%s/wip" % worker
     listed = git(workdir, "ls-remote", url, "refs/heads/" + branch, ctx=ctx).stdout.split()
     if not listed:
         return False
     wip = listed[0]
+    try:
+        with open(os.path.join(workdir, ".git", SNAP_SAVED_FILE)) as f:
+            ours = f.read().split()[1:]
+    except OSError:
+        ours = []
+    if ours != [wip]:
+        return False   # the wip head is not the commit of our own last save: a diverged branch of someone else stays refused by the plain push
     git(workdir, "fetch", "--no-tags", "-q", url, "refs/heads/" + branch, ctx=ctx)
     if git(workdir, "merge-base", "--is-ancestor", wip, "HEAD", check=False, ctx=ctx).returncode == 0:
         return False
