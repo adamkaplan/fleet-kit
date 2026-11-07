@@ -2,6 +2,7 @@
 
 A fake audit file, fake run record directories, a recording send and a temporary state directory. Nothing is stopped, nothing is called on a cluster."""
 import argparse
+import gzip
 import json
 import os
 import random
@@ -938,6 +939,9 @@ class TestEndNoticeOwnPushes(unittest.TestCase):
     def sent(self, worker, branch, sha):
         return {"event": "push_watch.sent", "subject": worker, "detail": {"to": "boss", "sha": sha[:8], "branch": branch, "head": sha}}
 
+    def born(self, worker):
+        return {"event": "cloud.created", "subject": worker, "detail": {}}
+
     def world(self, name, hook, audit_path, head_sha=None):
         w = StopWorld(self)
         rec = w.pod(name, "words")
@@ -955,8 +959,23 @@ class TestEndNoticeOwnPushes(unittest.TestCase):
         self.assertIn("Last head: cb-own1/work@bbbbbbbb, checks passed.", self.world("cb-own1", self.NOTHING, path))
 
     def test_control_no_push_anywhere_says_nothing_pushed(self):
-        path = self.audit_with(self.sent("other", "z/z", "d" * 40))
+        path = self.audit_with(self.born("cb-own2"), self.sent("other", "z/z", "d" * 40))
         self.assertIn("Last head: nothing pushed.", self.world("cb-own2", self.NOTHING, path))
+
+    def test_a_small_live_file_without_the_pods_creation_is_head_unknown(self):
+        path = self.audit_with(self.sent("other", "z/z", "d" * 40), self.born("someone-else"))   # no cloud.created of cb-own20 in view
+        self.assertLess(os.path.getsize(path), sb.load_module("cloud_end_alert").READ_BYTES)
+        self.assertIn("Last head: head unknown.", self.world("cb-own20", self.NOTHING, path))
+
+    def test_a_rotated_audit_with_the_pods_creation_in_the_archive_is_head_unknown(self):
+        path = self.audit_with(self.sent("other", "z/z", "d" * 40))
+        with gzip.open(os.path.join(os.path.dirname(path), "audit-2026-11-01.jsonl.gz"), "wt") as gz:   # the archive holds the creation and the push
+            gz.write(json.dumps(self.born("cb-own21")) + "\n" + json.dumps(self.sent("cb-own21", "own/b", self.SHA)) + "\n")
+        self.assertIn("Last head: head unknown.", self.world("cb-own21", self.NOTHING, path))
+
+    def test_the_pods_creation_in_view_and_a_push_after_it_is_named(self):
+        path = self.audit_with(self.born("cb-own22"), self.sent("cb-own22", "own/b", self.SHA))
+        self.assertIn("Last head: own/b@bbbbbbbb", self.world("cb-own22", self.NOTHING, path))
 
     def test_the_hooks_own_head_wins(self):
         path = self.audit_with(self.sent("cb-own3", "cb-own3/work", self.SHA))
@@ -968,7 +987,7 @@ class TestEndNoticeOwnPushes(unittest.TestCase):
     def test_each_guard_of_the_reader_drops_its_own_hostile_line(self):
         for branch, sha in (("bad branch\n<x>", self.SHA), ("a" * 31, self.SHA), ("ghp_x", self.SHA), ("sk-ab", self.SHA), ("AKIAxx", self.SHA), ("xoxb-1", self.SHA), ("eyJx", self.SHA), ("github_pat_x", self.SHA), ("unknown", self.SHA),
                             ("a/" * 50 + "b", self.SHA), ("ok/b", "bbbbbbbb"), ("ok/b", "B" * 40), ("ok/b", 5), (5, self.SHA)):
-            path = self.audit_with({"event": "push_watch.sent", "subject": "cb-own5", "detail": {"branch": branch, "head": sha}})
+            path = self.audit_with(self.born("cb-own5"), {"event": "push_watch.sent", "subject": "cb-own5", "detail": {"branch": branch, "head": sha}})
             self.assertIn("Last head: nothing pushed.", self.world("cb-own5", self.NOTHING, path), (branch, sha))
 
     def test_garbage_and_misshapen_lines_are_skipped_and_an_earlier_push_wins(self):
@@ -1035,7 +1054,7 @@ class TestEndNoticeOwnPushes(unittest.TestCase):
         self.assertIn("Last head: own/b@bbbbbbbb", self.world("cb-own17", self.PUSHED, path, head_sha=None))
 
     def test_another_event_naming_push_watch_sent_is_no_push(self):
-        path = self.audit_with({"event": "push_watch.quiet", "subject": "cb-own18", "detail": {"note": "push_watch.sent", "branch": "own/b", "head": self.SHA}})
+        path = self.audit_with(self.born("cb-own18"), {"event": "push_watch.quiet", "subject": "cb-own18", "detail": {"note": "push_watch.sent", "branch": "own/b", "head": self.SHA}})
         self.assertIn("Last head: nothing pushed.", self.world("cb-own18", self.NOTHING, path))
 
     def test_a_hook_with_an_error_and_no_head_falls_back_to_the_own_push(self):

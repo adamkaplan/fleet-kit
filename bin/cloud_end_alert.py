@@ -184,8 +184,9 @@ UNPROVEN = ("", "")   # the reader's answer when its window cannot show whether 
 def push_reader(audit_path, parse):
     """The `last_push` reader of scan_audit: worker -> (branch, full sha) of the pod's newest `push_watch.sent` line of the switchboard audit, or None.
     Reads the last READ_BYTES of a regular file only; any failure gives None (the notice then says what the end hook shows, as before).
-    A later `cloud.created` line of the same name starts a new pod: its older pushes are dropped. When the file is longer than the window, no push is in
-    view and no `cloud.created` of the pod is either, the answer is UNPROVEN (the notice says "head unknown", never "nothing pushed")."""
+    A later `cloud.created` line of the same name starts a new pod: its older pushes are dropped. "Nothing pushed" (None) is the answer ONLY when the
+    pod's own `cloud.created` line is in view and no push of the pod follows it; when it is not in view (a long file, a rotated archive, a missing line)
+    and no push is found, the answer is UNPROVEN (the notice says "head unknown"), whatever the file's size."""
     def read(worker):
         if audit_path is None:
             return None
@@ -204,7 +205,7 @@ def push_reader(audit_path, parse):
             return None
         finally:
             os.close(fd)
-        found, covered = None, size <= READ_BYTES
+        found, covered = None, False
         for raw in chunk.split(b"\n"):
             if b"push_watch.sent" not in raw and b"cloud.created" not in raw:
                 continue
