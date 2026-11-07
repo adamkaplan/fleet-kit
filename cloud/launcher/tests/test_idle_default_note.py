@@ -61,7 +61,7 @@ class SwitchboardSide(bint.Base):
     def test_a_launch_without_idle_says_the_default_limits_and_a_stop_time(self):
         err = self.run_launch()
         self.assertIsNone(note_problem(err))
-        self.assertEqual(self.note(err), "launch --cloud: idle limit 60m (default), hard limit 2h (default), stops at 2099-10-14T12:10:00Z")
+        self.assertEqual(self.note(err), "launch --cloud: idle limit 1h (default), hard limit 2h (default), stops at 2099-10-14T12:10:00Z")
 
     def test_a_launch_with_idle_says_that_value_and_no_default_beside_it(self):
         err = self.run_launch("--idle", "45m")
@@ -212,7 +212,7 @@ class FollowsTheLauncher(lbase.Base):
         real = self.answer_of(cw)
         self.assertEqual((real["idle_seconds"], real["hard_seconds"]), (3600, 7200))
         n1 = self.note_of(real)
-        self.assertIn("idle limit 60m (default)", n1)
+        self.assertIn("idle limit 1h (default)", n1)
         self.assertIn("hard limit 2h (default)", n1)
         self.assertIsNone(follow_problem(n1, real))
         self.setUp()   # a fresh fake cluster for the changed launcher
@@ -228,7 +228,7 @@ class FollowsTheLauncher(lbase.Base):
         key = "applied(record.get(key))"
         self.assertEqual(body.count(key), 1)
         ns = dict(sb_module(self).__dict__)
-        exec(body.replace(key, '("60m" if key == "idle_seconds" else "2h")'), ns)
+        exec(body.replace(key, '("1h" if key == "idle_seconds" else "2h")'), ns)
         lit = ns["_limits_note"](types.SimpleNamespace(idle=None, hard=None), {k: ans.get(k) for k in ("idle_deadline", "hard_deadline", "idle_seconds", "hard_seconds")})
         problem = follow_problem(lit, ans)
         failed = int(problem is not None and "the note did not follow the launcher" in problem)
