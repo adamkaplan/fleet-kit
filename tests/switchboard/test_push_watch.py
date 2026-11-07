@@ -154,14 +154,19 @@ class TestPushWatch(Case):
         reader.__spec__.loader.exec_module(reader)
         self.assertEqual(reader.push_reader(str(path), json.loads)("w-a"), ("w-a/wip", SHA_A))
 
-    def test_a_hostile_branch_is_cleaned_at_the_write_site(self):
-        self.world.refs = {"w-a/wip`<x>\n" + "z" * 200: SHA_A}
-        self.run_pass(NOW)
-        self.run_pass(NOW + 1)
-        for l in self.engine.audit.lines:
-            if l[0] == "push_watch.sent":
-                self.assertLessEqual(len(l[2]["branch"]), 100)
-                self.assertNotRegex(l[2]["branch"], r"[\x00-\x1f`<>]")
+    def test_a_hostile_branch_is_cleaned_at_the_write_site_and_a_plain_one_is_kept(self):
+        for ref, want in (("w-a/wip", "w-a/wip"), ("w-a/wip`<x>@y\"" + "z" * 200, None)):
+            self.setUp()
+            self.world.refs = {ref: SHA_A}
+            self.run_pass(NOW)
+            self.run_pass(NOW + 1)
+            sent = [l[2]["branch"] for l in self.engine.audit.lines if l[0] == "push_watch.sent" and l[1] == "w-a"]
+            self.assertEqual(len(sent), 1, ref)
+            self.assertNotRegex(sent[0], r"[\x00-\x1f`<>@\"]")
+            self.assertLessEqual(len(sent[0]), 100)
+            self.assertTrue(sent[0].startswith("w-a/wip"))
+            if want:
+                self.assertEqual(sent[0], want)
 
     def test_s2_the_launching_lane_gets_one_item_and_the_other_lane_none(self):
         self.world.refs = {"w-a/wip": SHA_A}

@@ -7,11 +7,11 @@ The launcher writes one JSON line per action to its audit file. This pass reads 
 hard, pod_gone or pod_failed; decided from that field alone), it sends ONE message to the
 Chief of Staff always and ONE to the boss recorded in the worker's cloud record when that name is a valid agent name, unless the worker already
 reported done. The message holds five facts, plus, for pod_failed, the pod's termination reason and exit code (added by a later change): the worker, the reason, the time, pushed (yes, no or unknown) and the run record's name (or
-unknown); never a branch, an address, a log line or a transcript.
+unknown); never an address, a log line or a transcript.
 
 The state is one small private file (0600): {"offset": bytes already read, "sent": [[run id, cause], ...] (the last 500)}. A missing or corrupt
 file starts at the END of the audit file, so old history is never replayed. The state is saved BEFORE the messages go: a crash loses a message,
-it never sends one twice. Pure of the daemon: the send function, the paths, the last reports and the shared bounded parse (record_json.parse_bounded) are handed in.
+it never sends one twice. For idle and hard ends one more line names the pod's last head, `branch@sha8` and its check state (#2267), from the end hook or, when that found no head, from the pod's own newest push (`last_push`, push_reader; the branch is checked against a strict pattern). Pure of the daemon: the send function, the paths, the last reports and the shared bounded parse (record_json.parse_bounded) are handed in.
 """
 import datetime
 import json
@@ -183,6 +183,8 @@ def push_reader(audit_path, parse):
     Reads the last READ_BYTES of a regular file only; any failure gives None (the notice then says what the end hook shows, as before).
     A later `cloud.created` line of the same name starts a new pod: its older pushes are dropped."""
     def read(worker):
+        if audit_path is None:
+            return None
         try:
             fd = os.open(str(audit_path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         except (OSError, TypeError, ValueError):
@@ -254,7 +256,8 @@ def finish_head(repo, branch, sha, head_checks):
 
 def scan_audit(audit_file, state_file, cloud_dir, last_reports, send, parse, audit=None, last_text=None, head_checks=None, last_push=None):
     """One pass. `send(recipient, text)` is the daemon's own send path. Returns [(recipient, text)] handed to it. `last_text(directory, worker)` (ask #1788)
-    gives (block, None) or (None, why): the boss's copy, not the Chief of Staff's, ends with the pod's last text, framed as untrusted."""
+    gives (block, None) or (None, why): the boss's copy, not the Chief of Staff's, ends with the pod's last text, framed as untrusted.
+    `last_push(worker)` gives (branch, full sha) of the pod's newest own push or None (see push_reader)."""
     try:
         size = os.stat(str(audit_file)).st_size
     except OSError:

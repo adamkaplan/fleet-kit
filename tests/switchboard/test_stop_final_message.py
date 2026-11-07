@@ -966,7 +966,7 @@ class TestEndNoticeOwnPushes(unittest.TestCase):
         self.assertIn("Last head: nothing pushed.", self.world("cb-own4", self.NOTHING, "/nonexistent/audit.jsonl"))
 
     def test_each_guard_of_the_reader_drops_its_own_hostile_line(self):
-        for branch, sha in (("bad branch\n<x>", self.SHA), ("a" * 31, self.SHA), ("ghp_x", self.SHA), ("sk-ab", self.SHA), ("unknown", self.SHA),
+        for branch, sha in (("bad branch\n<x>", self.SHA), ("a" * 31, self.SHA), ("ghp_x", self.SHA), ("sk-ab", self.SHA), ("AKIAxx", self.SHA), ("xoxb-1", self.SHA), ("eyJx", self.SHA), ("github_pat_x", self.SHA), ("unknown", self.SHA),
                             ("a/" * 50 + "b", self.SHA), ("ok/b", "bbbbbbbb"), ("ok/b", "B" * 40), ("ok/b", 5), (5, self.SHA)):
             path = self.audit_with({"event": "push_watch.sent", "subject": "cb-own5", "detail": {"branch": branch, "head": sha}})
             self.assertIn("Last head: nothing pushed.", self.world("cb-own5", self.NOTHING, path), (branch, sha))
@@ -985,6 +985,20 @@ class TestEndNoticeOwnPushes(unittest.TestCase):
         path = os.path.join(d, "audit.jsonl")
         sb.AuditLog(path).append("daemon", "push_watch.sent", "cb-own14", {"to": "boss", "sha": self.SHA[:8], "branch": "own/b", "head": self.SHA})   # redaction is by key name
         self.assertIn("Last head: own/b@bbbbbbbb", self.world("cb-own14", self.NOTHING, path))
+
+    def test_another_pods_creation_does_not_reset_this_pods_push(self):
+        other = {"event": "cloud.created", "subject": "someone-else", "detail": {}}
+        path = self.audit_with(self.sent("cb-own15", "own/b", self.SHA), other)
+        self.assertIn("Last head: own/b@bbbbbbbb", self.world("cb-own15", self.NOTHING, path))
+
+    def test_no_audit_path_reads_no_file_named_none(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        Path(d, "None").write_text(json.dumps(self.sent("cb-own16", "own/b", self.SHA)) + "\n")
+        here = os.getcwd()
+        os.chdir(d)
+        self.addCleanup(os.chdir, here)
+        self.assertIsNone(sb.load_module("cloud_end_alert").push_reader(None, sb.load_module("record_json").parse_bounded)("cb-own16"))
 
     def test_a_valid_push_survives_a_newer_hostile_line(self):
         path = self.audit_with(self.sent("cb-own7", "ok/b", self.SHA), self.sent("cb-own7", "bad branch", "c" * 40))
@@ -1005,10 +1019,10 @@ class TestEndNoticeOwnPushes(unittest.TestCase):
         self.addCleanup(shutil.rmtree, d, True)
         path = os.path.join(d, "audit.jsonl")
         want = mod.READ_BYTES - len(push) // 2   # bytes after the push line: the read window then starts in the middle of the push line
-        filler = json.dumps({"event": "x", "subject": "p", "detail": {"t": ""}}) + "\n"
-        body = push + json.dumps({"event": "x", "subject": "p", "detail": {"t": "y" * (want - len(filler))}}) + "\n"
+        empty = len(json.dumps({"event": "x", "subject": "p", "detail": {"t": ""}})) + 1
+        body = push + json.dumps({"event": "x", "subject": "p", "detail": {"t": "y" * (want - empty)}}) + "\n"
         Path(path).write_text(body)
-        self.assertTrue(0 < len(body) - mod.READ_BYTES < len(push))
+        self.assertTrue(0 < len(body) - mod.READ_BYTES < len(push), "fixture: the window must start inside the push line")
         self.assertIn("Last head: nothing pushed.", self.world("cb-own9", self.NOTHING, path))
         Path(path).write_text(pad * (mod.READ_BYTES // len(pad) + 5) + json.dumps(self.sent("cb-own9", "near/b", self.SHA)) + "\n")
         self.assertIn("Last head: near/b@bbbbbbbb", self.world("cb-own9", self.NOTHING, path))
