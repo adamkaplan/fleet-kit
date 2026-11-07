@@ -67,10 +67,9 @@ def repo_flag(args, i):
     if a in REPO_FLAGS:
         return (args[i + 1], 2) if i + 1 < len(args) else None
     for flag in REPO_FLAGS:
-        if flag.startswith("--") and a.startswith(flag + "="):
-            return a[len(flag) + 1:], 1
-        if not flag.startswith("--") and a.startswith(flag) and not a.startswith("--") and len(a) > len(flag):
-            return a[len(flag):].lstrip("="), 1
+        rest = a[len(flag):]
+        if a.startswith(flag) and rest and (not flag.startswith("--") or rest.startswith("=")):
+            return (rest[1:] if rest.startswith("=") else rest), 1
     return None
 
 
