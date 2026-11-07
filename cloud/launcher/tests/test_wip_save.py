@@ -228,7 +228,8 @@ class EndHookSnapshot(unittest.TestCase):
             f.write(DRIVER.replace("sys.exit(m.main())", "m.GIT_BIN = %r\nsys.exit(m.main())" % wrapper))
         p.write("b.txt", "1\n")
         self.assertEqual(p.snapshot().returncode, 0)
-        pushes = [l for l in open(log).read().splitlines() if " push " in l]
+        with open(log) as fh:
+            pushes = [l for l in fh.read().splitlines() if " push " in l]
         self.assertEqual(len(pushes), 1)
         for bad in (" -f", "--force", " +", ":+"):
             self.assertNotIn(bad, pushes[0].split("refs/heads")[0] + " " if bad != " +" else pushes[0])
@@ -240,6 +241,27 @@ class EndHookSnapshot(unittest.TestCase):
         self.assertEqual(p.snapshot().returncode, 0)
         ls = git(p.remote, "ls-tree", "-r", "refs/heads/coder7/wip")
         self.assertTrue([l for l in ls.splitlines() if l.endswith("\tm.sh")][0].startswith("100644"))
+
+    def test_a_tracked_directory_replaced_by_a_link_is_saved_as_a_link_and_not_read_through(self):
+        p = self.pod
+        os.makedirs(os.path.join(p.work, "d"))
+        p.write("d/x", "inside\n")
+        git(p.work, "add", "-A")
+        git(p.work, "commit", "-q", "-m", "d")
+        git(p.work, "push", "-q", p.remote, "base")
+        outside = os.path.join(self.tmp.name, "outside")
+        os.makedirs(outside)
+        with open(os.path.join(outside, "x"), "w") as f:
+            f.write("OUTSIDE-MARKER\n")
+        os.remove(os.path.join(p.work, "d", "x"))
+        os.rmdir(os.path.join(p.work, "d"))
+        os.symlink(outside, os.path.join(p.work, "d"))
+        r = p.snapshot()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        ls = git(p.remote, "ls-tree", "-r", "refs/heads/coder7/wip")
+        self.assertNotIn("d/x", ls)
+        self.assertTrue([l for l in ls.splitlines() if l.endswith("\td")][0].startswith("120000"))
+        self.assertNotIn("OUTSIDE-MARKER", git(p.remote, "grep", "-I", "MARKER", "refs/heads/coder7/wip", check=False))
 
     def test_a_garbled_marker_file_is_not_a_crash(self):
         p = self.pod
