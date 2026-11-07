@@ -149,7 +149,7 @@ class EndHookSnapshot(unittest.TestCase):
         git(p.work, "push", "-q", p.remote, "base")
         p.write(".env", "TOKEN=2\n")   # a tracked secret-looking file, modified
         p.write(":(exclude)q.key", "k\n")
-        p.write(":(top)m.txt", "magic\n")   # not secret-looking: reaches `git add`, which must take the name literally
+        p.write(":(top)m.txt", "magic\n")   # not secret-looking: staged by name, taken literally
         p.write("staged.pem", "s\n")
         git(p.work, "add", "-f", "staged.pem")   # a secret-looking file the agent staged itself
         p.write("b.txt", "1\n")
@@ -206,6 +206,40 @@ class EndHookSnapshot(unittest.TestCase):
         os.symlink("real", os.path.join(p.work, "via"))   # a link on the way: via/d is never read through
         self.assertEqual(p.snapshot().returncode, 0)
         self.assertNotIn("via/d", git(p.remote, "ls-tree", "-r", "--name-only", "refs/heads/coder7/wip").split("\n"))
+
+    def test_a_staged_secret_with_pathspec_magic_in_its_name_is_backed_out(self):
+        p = self.pod
+        p.write(":(top)x.pem", "s\n")
+        git(p.work, "add", "-f", "--", ":(literal):(top)x.pem")
+        p.write("b.txt", "1\n")
+        self.assertEqual(p.snapshot().returncode, 0)
+        names = git(p.remote, "ls-tree", "-r", "--name-only", "refs/heads/coder7/wip").split("\n")
+        self.assertIn("b.txt", names)
+        self.assertNotIn(":(top)x.pem", names)
+
+    def test_the_pushes_are_never_forced(self):
+        p = self.pod
+        log = os.path.join(self.tmp.name, "git-args")
+        wrapper = os.path.join(self.tmp.name, "gitw")
+        with open(wrapper, "w") as f:
+            f.write('#!/bin/sh\necho "$@" >> %s\nexec /usr/bin/git "$@"\n' % log)
+        os.chmod(wrapper, 0o755)
+        with open(p.driver, "w") as f:
+            f.write(DRIVER.replace("sys.exit(m.main())", "m.GIT_BIN = %r\nsys.exit(m.main())" % wrapper))
+        p.write("b.txt", "1\n")
+        self.assertEqual(p.snapshot().returncode, 0)
+        pushes = [l for l in open(log).read().splitlines() if " push " in l]
+        self.assertEqual(len(pushes), 1)
+        for bad in (" -f", "--force", " +", ":+"):
+            self.assertNotIn(bad, pushes[0].split("refs/heads")[0] + " " if bad != " +" else pushes[0])
+
+    def test_the_executable_bit_is_the_owners(self):
+        p = self.pod
+        p.write("m.sh", "x\n")
+        os.chmod(os.path.join(p.work, "m.sh"), 0o611)
+        self.assertEqual(p.snapshot().returncode, 0)
+        ls = git(p.remote, "ls-tree", "-r", "refs/heads/coder7/wip")
+        self.assertTrue([l for l in ls.splitlines() if l.endswith("\tm.sh")][0].startswith("100644"))
 
     def test_a_garbled_marker_file_is_not_a_crash(self):
         p = self.pod

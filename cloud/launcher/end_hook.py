@@ -568,7 +568,7 @@ def _read_nofollow(root, rel):
                 data = fh.read()
         finally:
             os.close(f)
-        return ("exec" if st.st_mode & 0o111 else "file"), data
+        return ("exec" if st.st_mode & 0o100 else "file"), data
     finally:
         os.close(fd)
 
@@ -598,7 +598,10 @@ def stage_paths(workdir, paths, ctx):
         mode = {"file": b"100644", "exec": b"100755", "link": b"120000"}[kind]
         if entries.get(rel) == (mode, hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest().encode()):
             continue
-        sha = _gitb(workdir, ctx, "hash-object", "-w", "--no-filters", "--stdin", data=data).strip()
+        try:
+            sha = _gitb(workdir, ctx, "hash-object", "-w", "--no-filters", "--stdin", data=data).strip()
+        except RuntimeError:
+            continue   # one file that cannot be hashed does not stop the save
         lines.append(mode + b" " + sha + b"\t" + rel + b"\0")
     if lines:
         _gitb(workdir, ctx, "update-index", "-z", "--add", "--index-info", data=b"".join(lines))
