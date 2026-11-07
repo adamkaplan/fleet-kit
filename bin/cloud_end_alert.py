@@ -184,7 +184,7 @@ UNPROVEN = ("", "")   # the reader's answer when its window cannot show whether 
 def push_reader(audit_path, parse):
     """The `last_push` reader of scan_audit: worker -> (branch, full sha) of the pod's newest `push_watch.sent` line of the switchboard audit, or None.
     Reads the last READ_BYTES of a regular file only; an audit that cannot be read at all (none configured, missing, a link or pipe, a read error) gives None: a deliberate exception, the reader then claims nothing and the notice says what the end hook shows, as before.
-    A later `cloud.created` line of the same name starts a new pod: its older pushes are dropped. "Nothing pushed" (None) is the answer ONLY when the
+    A later `cloud.created` line of the same name starts a new pod: its older pushes are dropped. For a readable audit, "nothing pushed" (None) is the answer ONLY when the
     pod's own `cloud.created` line is in view and no push of the pod follows it; when it is not in view (a long file, a rotated archive, a missing line)
     and no push is found, the answer is UNPROVEN (the notice says "head unknown"), whatever the file's size."""
     def read(worker):

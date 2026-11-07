@@ -977,6 +977,15 @@ class TestEndNoticeOwnPushes(unittest.TestCase):
         path = self.audit_with(self.born("cb-own24"))
         self.assertIsNone(mod.push_reader(path, parse)("cb-own24"))
 
+    def test_an_audit_that_cannot_be_read_claims_nothing_on_purpose(self):
+        """The documented fail-open exception (the end hook's answer shows): do not turn it into UNPROVEN."""
+        mod, parse = sb.load_module("cloud_end_alert"), sb.load_module("record_json").parse_bounded
+        self.assertIsNone(mod.push_reader(None, parse)("cb-own25"))
+        self.assertIsNone(mod.push_reader("/nonexistent/audit.jsonl", parse)("cb-own25"))
+        path = self.audit_with(self.born("cb-own25"))
+        with mock.patch.object(mod.os, "read", side_effect=OSError("x")):
+            self.assertIsNone(mod.push_reader(path, parse)("cb-own25"))
+
     def test_a_rotated_audit_with_the_pods_creation_in_the_archive_is_head_unknown(self):
         path = self.audit_with(self.sent("other", "z/z", "d" * 40))
         with gzip.open(os.path.join(os.path.dirname(path), "audit-2026-11-01.jsonl.gz"), "wt") as gz:   # the archive holds the creation and the push
