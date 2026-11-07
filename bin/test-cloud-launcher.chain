@@ -114,6 +114,7 @@ cloud/launcher/tests/test_vault_block.py
 cloud/launcher/tests/test_vault_check_pins.py
 cloud/launcher/tests/test_worker_copies.py
 cloud/worker/tests/test_activity.py
+cloud/worker/tests/test_activity_message.py
 cloud/worker/tests/test_base_merge_base.py
 cloud/worker/tests/test_cloud_prepush.py
 cloud/worker/tests/test_cloud_prepush_background.py
