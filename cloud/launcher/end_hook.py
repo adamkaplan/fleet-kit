@@ -533,32 +533,75 @@ SNAP_SAVED_FILE = "cw-wip-saved"   # inside .git: the tree hash of the last save
 SNAP_IDENT = ["-c", "user.name=cw-worker", "-c", "user.email=cw-worker@invalid"]
 
 
+def _gitb(workdir, ctx, *args, data=None):
+    """One pinned git call in bytes (names are not always UTF-8); a failure raises RuntimeError with the last line of its stderr."""
+    p = subprocess.run([GIT_BIN, "-C", workdir] + ctx.opts + list(args), input=data, capture_output=True, env=ctx.env)
+    if p.returncode != 0:
+        raise RuntimeError((p.stderr.decode("utf-8", "replace").strip().splitlines() or ["git %s failed" % args[0]])[-1])
+    return p.stdout
+
+
+def _read_nofollow(root, rel):
+    """(kind, bytes) of a path below `root`, never following a link: every directory on the way and the file are opened with O_NOFOLLOW from the
+    previous directory's descriptor. kind is 'file', 'exec', 'link' or None (missing). A link on the way, a non-regular file or an unreadable one raises OSError."""
+    parts = rel.split(b"/")
+    fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for name in parts[:-1]:
+            nxt = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = nxt
+        name = parts[-1]
+        try:
+            st = os.stat(name, dir_fd=fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return None, b""
+        if stat.S_ISLNK(st.st_mode):
+            return "link", os.fsencode(os.readlink(name, dir_fd=fd))
+        if not stat.S_ISREG(st.st_mode):
+            raise OSError("not a regular file")
+        f = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
+        try:
+            if not stat.S_ISREG(os.fstat(f).st_mode):
+                raise OSError("not a regular file")
+            with os.fdopen(f, "rb", closefd=False) as fh:
+                data = fh.read()
+        finally:
+            os.close(f)
+        return ("exec" if st.st_mode & 0o111 else "file"), data
+    finally:
+        os.close(fd)
+
+
 def stage_paths(workdir, paths, ctx):
-    """Put the working-tree state of `paths` into the index copy WITHOUT any filter: git hash-object --no-filters writes the blobs and update-index
-    --index-info records them (a missing path is removed; a symbolic link keeps its target; a directory or a name with a newline is left out)."""
-    lines, files = [], []
+    """Put the working-tree state of `paths` (bytes) into the index copy WITHOUT any filter and without trusting a name: each file is read by
+    _read_nofollow, hashed in Python, and written by `git hash-object -w --no-filters --stdin` only when it differs from the index entry; update-index
+    --index-info records it (a missing path is removed). A path that cannot be read (a link on the way, a special file, an error) is left as it is. A name with a newline is left out."""
+    import hashlib
+    entries = {}
+    for rec in _gitb(workdir, ctx, "ls-files", "-s", "-z").split(b"\0"):
+        meta, _, name = rec.partition(b"\t")
+        if name:
+            entries[name] = tuple(meta.split()[:2])
+    lines = []
     for rel in paths:
-        full = os.path.join(workdir, rel)
-        if "\n" in rel:
+        if b"\n" in rel or not rel or rel.startswith(b"/") or b".." in rel.split(b"/"):
             continue
         try:
-            st = os.lstat(full)
-        except FileNotFoundError:
-            lines.append("0 %s\t%s\0" % ("0" * 40, rel))
+            kind, data = _read_nofollow(os.fsencode(workdir), rel)
+        except OSError:
             continue
-        if stat.S_ISREG(st.st_mode):
-            files.append((rel, "100755" if st.st_mode & 0o111 else "100644"))
-        elif stat.S_ISLNK(st.st_mode):
-            sha = subprocess.run([GIT_BIN, "-C", workdir] + ctx.opts + ["hash-object", "-w", "--no-filters", "--stdin"], input=os.readlink(full).encode(),
-                                 capture_output=True, env=ctx.env, check=True).stdout.decode().strip()
-            lines.append("120000 %s\t%s\0" % (sha, rel))
-    if files:
-        out = subprocess.run([GIT_BIN, "-C", workdir] + ctx.opts + ["hash-object", "-w", "--no-filters", "--stdin-paths"], input="".join(r + "\n" for r, _ in files).encode(),
-                             capture_output=True, env=ctx.env, check=True).stdout.decode().split()
-        lines += ["%s %s\t%s\0" % (mode, sha, rel) for (rel, mode), sha in zip(files, out)]
+        if kind is None:
+            if rel in entries:
+                lines.append(b"0 " + b"0" * 40 + b"\t" + rel + b"\0")
+            continue
+        mode = {"file": b"100644", "exec": b"100755", "link": b"120000"}[kind]
+        if entries.get(rel) == (mode, hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest().encode()):
+            continue
+        sha = _gitb(workdir, ctx, "hash-object", "-w", "--no-filters", "--stdin", data=data).strip()
+        lines.append(mode + b" " + sha + b"\t" + rel + b"\0")
     if lines:
-        subprocess.run([GIT_BIN, "-C", workdir] + ctx.opts + ["update-index", "-z", "--add", "--index-info"], input="".join(lines).encode(),
-                       capture_output=True, env=ctx.env, check=True)
+        _gitb(workdir, ctx, "update-index", "-z", "--add", "--index-info", data=b"".join(lines))
 
 
 def snapshot(workdir, worker, repo, ctx):
@@ -579,16 +622,13 @@ def snapshot(workdir, worker, repo, ctx):
         ctx.env["GIT_INDEX_FILE"] = index
         config_refusal(workdir, repo, ctx)   # again, right before the add: the agent is running while a save is made
         # what to stage: the untracked files and every tracked file (read without filters); a secret-looking path is never staged (a tracked one keeps its old version)
-        changed = (git(workdir, "ls-files", "--others", "--exclude-standard", "-z", ctx=ctx).stdout.split("\0")
-                   + git(workdir, "ls-files", "-z", ctx=ctx).stdout.split("\0"))   # every tracked path is re-read without filters (diff would run a clean filter)
-        keep = sorted({x for x in changed if x and not is_secret(x)})
-        stage_paths(workdir, keep, ctx)   # no `git add`: no clean filter or attribute of the live repository can run
-        staged = [x for x in git(workdir, "diff", "--cached", "--name-only", "-z", "--no-ext-diff", "--no-textconv", ctx=ctx).stdout.split("\0") if x and is_secret(x)]
+        changed = _gitb(workdir, ctx, "ls-files", "--others", "--exclude-standard", "-z").split(b"\0") + _gitb(workdir, ctx, "ls-files", "-z").split(b"\0")   # every tracked path is re-read without filters (diff would run a clean filter)
+        stage_paths(workdir, sorted({x for x in changed if x and not is_secret(x.decode("utf-8", "surrogateescape"))}), ctx)
+        staged = [x for x in _gitb(workdir, ctx, "diff", "--cached", "--name-only", "-z", "--no-ext-diff", "--no-textconv").split(b"\0") if x and is_secret(x.decode("utf-8", "surrogateescape"))]
         if staged:   # a secret-looking path the agent staged itself: back to the committed version (or out of the copy when HEAD has none)
             has_head = git(workdir, "rev-parse", "--verify", "-q", "HEAD", check=False, ctx=ctx).returncode == 0
             verb = ["reset", "-q", "HEAD"] if has_head else ["rm", "--cached", "-q", "--ignore-unmatch"]
-            subprocess.run([GIT_BIN, "--literal-pathspecs", "-C", workdir] + ctx.opts + verb + ["--pathspec-from-file=-", "--pathspec-file-nul"],
-                           input="\0".join(staged).encode(), capture_output=True, env=ctx.env, check=True)
+            _gitb(workdir, ctx, "--literal-pathspecs", *verb, "--pathspec-from-file=-", "--pathspec-file-nul", data=b"\0".join(staged))
         tree = git(workdir, "write-tree", ctx=ctx).stdout.strip()
         try:
             with open(saved_path) as f:
@@ -670,7 +710,7 @@ def snapshot_main():
         return fail("the repository configuration is not a plain one")
     except TokenEnded as e:
         return fail(str(e))
-    except (RuntimeError, OSError, subprocess.SubprocessError) as e:
+    except (RuntimeError, OSError, ValueError, subprocess.SubprocessError) as e:
         return fail(re.sub(r"https?://\S+", "<url>", " ".join(str(e).split()))[:120])
     finally:
         ctx.close()

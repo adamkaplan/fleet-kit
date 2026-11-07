@@ -189,6 +189,24 @@ class EndHookSnapshot(unittest.TestCase):
         self.assertIn("120000", [l.split()[0] for l in ls.splitlines() if l.endswith("\tln")][0])
         self.assertIn("100755", [l.split()[0] for l in ls.splitlines() if l.endswith("\trun.sh")][0])
 
+    def test_a_decoy_name_cannot_make_the_save_read_another_file(self):
+        p = self.pod
+        p.write(".env", "SECRET=1\n")
+        p.write('"\\056env"', "decoy\n")   # git would unquote this name to .env in a --stdin-paths list
+        os.symlink("/etc", os.path.join(p.work, "lnk"))
+        r = p.snapshot()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        tree = git(p.remote, "ls-tree", "-r", "--name-only", "refs/heads/coder7/wip").split("\n")
+        self.assertNotIn(".env", tree)
+        self.assertNotIn("SECRET=1", git(p.remote, "grep", "-I", "SECRET", "refs/heads/coder7/wip", check=False))
+        os.rename(os.path.join(p.work, "lnk"), os.path.join(p.work, "lnk2"))
+        os.mkdir(os.path.join(p.work, "lnk"))
+        os.symlink("/etc", os.path.join(p.work, "lnk", "d"))
+        os.rename(os.path.join(p.work, "lnk"), os.path.join(p.work, "real"))
+        os.symlink("real", os.path.join(p.work, "via"))   # a link on the way: via/d is never read through
+        self.assertEqual(p.snapshot().returncode, 0)
+        self.assertNotIn("via/d", git(p.remote, "ls-tree", "-r", "--name-only", "refs/heads/coder7/wip").split("\n"))
+
     def test_a_garbled_marker_file_is_not_a_crash(self):
         p = self.pod
         p.write("b.txt", "1\n")
