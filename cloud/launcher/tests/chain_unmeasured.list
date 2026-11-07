@@ -14,6 +14,7 @@ cloud/launcher/tests/test_fixture_root.py
 cloud/launcher/tests/test_hub_entry_keys.py
 cloud/launcher/tests/test_hub_restart_client.py
 cloud/launcher/tests/test_hub_safe_to_evict.py
+cloud/launcher/tests/test_idle_default_60.py
 cloud/launcher/tests/test_idle_default_note.py
 cloud/launcher/tests/test_idle_nudge.py
 cloud/launcher/tests/test_idle_nudge_skipped.py

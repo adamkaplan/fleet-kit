@@ -1,4 +1,4 @@
-"""#1474: a cloud launch says its idle and hard limits, and the create's idle default is 30 minutes.
+"""#1474: a cloud launch says its idle and hard limits, and the create's idle default is cw.DEFAULT_IDLE (60 minutes).
 
 S2/S4: the stderr note of `launch --cloud` (stdout stays one JSON line). S6: the create's default, the explicit value and the reaper's
 fallback for a pod made before the change. S5: the interface document. A mutant is a copy of the code in memory, never a file."""
@@ -32,7 +32,7 @@ def _load_bin_tests():
 bint = _load_bin_tests()   # the switchboard side's fake launcher and its Base
 _FAKE_OLD = '"hard_deadline": "2099-10-14T14:00:00Z"}'
 assert bint.STUB.count(_FAKE_OLD) == 1   # the fake launcher's answer, given the two keys of the real one (bin/test-cloud-worker is not edited)
-bint.STUB = bint.STUB.replace(_FAKE_OLD, '"hard_deadline": "2099-10-14T14:00:00Z", "idle_seconds": 1800, "hard_seconds": 7200}')
+bint.STUB = bint.STUB.replace(_FAKE_OLD, '"hard_deadline": "2099-10-14T14:00:00Z", "idle_seconds": 3600, "hard_seconds": 7200}')
 NOTE = re.compile(r"^launch --cloud: idle limit (\S+?)( \(default\))?, hard limit (\S+?)( \(default\))?, stops at (\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ)$")
 
 
@@ -61,12 +61,12 @@ class SwitchboardSide(bint.Base):
     def test_a_launch_without_idle_says_the_default_limits_and_a_stop_time(self):
         err = self.run_launch()
         self.assertIsNone(note_problem(err))
-        self.assertEqual(self.note(err), "launch --cloud: idle limit 30m (default), hard limit 2h (default), stops at 2099-10-14T12:10:00Z")
+        self.assertEqual(self.note(err), "launch --cloud: idle limit 60m (default), hard limit 2h (default), stops at 2099-10-14T12:10:00Z")
 
     def test_a_launch_with_idle_says_that_value_and_no_default_beside_it(self):
-        err = self.run_launch("--idle", "60m")
+        err = self.run_launch("--idle", "45m")
         self.assertIsNone(note_problem(err))
-        self.assertEqual(self.note(err), "launch --cloud: idle limit 60m, hard limit 2h (default), stops at 2099-10-14T12:10:00Z")
+        self.assertEqual(self.note(err), "launch --cloud: idle limit 45m, hard limit 2h (default), stops at 2099-10-14T12:10:00Z")
 
     def test_a_launch_with_both_flags_says_no_default_and_the_note_comes_before_the_json(self):
         err = self.run_launch("--idle", "45m", "--hard", "3h")
@@ -106,10 +106,10 @@ class CreateDefault(lbase.Base):
         self.assertEqual(code, 0, err)
         return json.loads(out)
 
-    def test_a_create_without_idle_gives_1800_seconds_and_a_deadline_30_minutes_out(self):
+    def test_a_create_without_idle_gives_the_default_seconds_and_a_deadline_that_far_out(self):
         out = self.create("coder7")
-        self.assertEqual(self.pod()["metadata"]["annotations"]["cw/idle-seconds"], "1800")
-        self.assertEqual(out["idle_deadline"], cw.iso(lbase.T0 + lbase.dt.timedelta(minutes=30)))
+        self.assertEqual(self.pod()["metadata"]["annotations"]["cw/idle-seconds"], str(cw.parse_duration(cw.DEFAULT_IDLE)))
+        self.assertEqual(out["idle_deadline"], cw.iso(lbase.T0 + lbase.dt.timedelta(seconds=cw.parse_duration(cw.DEFAULT_IDLE))))
 
     def test_a_create_with_idle_10m_gives_600_seconds(self):
         out = self.create("coder7", "--idle", "10m")
@@ -129,17 +129,17 @@ class CreateDefault(lbase.Base):
         path = os.path.join(ROOT, "cloud", "launcher", "cloud_worker.py")
         with open(path) as f:
             source = f.read()
-        good = 'c.add_argument("--idle", default="30m")'
+        good = 'DEFAULT_IDLE = "60m"'
         self.assertEqual(source.count(good), 1)
         mutant = types.ModuleType("mutant_cloud_worker")
         mutant.__file__ = path
-        exec(compile(source.replace(good, 'c.add_argument("--idle", default="10m")'), path, "exec"), mutant.__dict__)
-        self.assertIn('default="10m"', source.replace(good, 'c.add_argument("--idle", default="10m")'))   # the mutation was applied
+        exec(compile(source.replace(good, 'DEFAULT_IDLE = "10m"'), path, "exec"), mutant.__dict__)
+        self.assertIn('"10m"', source.replace(good, 'DEFAULT_IDLE = "10m"'))   # the mutation was applied
         with redirect_stdout(io.StringIO()):
             code = mutant.main(["create", "coder7", "--repo", "acme-org/widget-service", "--branch", "main"], self.env, self.clock,
                                lambda s: self.clock.advance(seconds=s))
         self.assertEqual(code, 0)
-        self.assertNotEqual(self.pod()["metadata"]["annotations"]["cw/idle-seconds"], "1800")   # the 30m check would fail on it
+        self.assertNotEqual(self.pod()["metadata"]["annotations"]["cw/idle-seconds"], str(cw.parse_duration(cw.DEFAULT_IDLE)))   # the default check would fail on it
 
 
 class InterfaceDocument(unittest.TestCase):
@@ -147,10 +147,10 @@ class InterfaceDocument(unittest.TestCase):
         with open(os.path.join(ROOT, "docs", "cloud-worker-interface.md")) as f:
             self.text = f.read()
 
-    def test_the_document_says_30m_default_and_where_it_is_read_from(self):
-        self.assertIn("`--idle 30m` (default)", self.text)
+    def test_the_document_says_60m_default_and_where_it_is_read_from(self):
+        self.assertIn("`--idle 60m` (default; `30m` with `--agent orchestrator`)", self.text)
         self.assertNotIn("`--idle 10m` (default)", self.text)
-        self.assertIn("read from the `--idle` default of the launcher's `create`", self.text)
+        self.assertIn("read from the launcher's `DEFAULT_IDLE`", self.text)
 
 
 def fmt_seconds(n):
@@ -169,7 +169,7 @@ def follow_problem(note, answer):
 def default_problem(case):
     """The create check of the default: the pod's idle-seconds annotation."""
     got = case.pod()["metadata"]["annotations"]["cw/idle-seconds"]
-    return None if got == "1800" else "idle-seconds is not 1800: %s" % got
+    return None if got == "3600" else "idle-seconds is not 3600: %s" % got
 
 
 LAUNCHER_PATH = os.path.join(ROOT, "cloud", "launcher", "cloud_worker.py")
@@ -191,7 +191,7 @@ def mutated_launcher(replacements):
     return module, applied
 
 
-IDLE_DEFAULT = 'c.add_argument("--idle", default="30m")'
+IDLE_DEFAULT = 'DEFAULT_IDLE = "60m"'
 HARD_DEFAULT = 'c.add_argument("--hard", default="2h")'
 
 
@@ -210,13 +210,13 @@ class FollowsTheLauncher(lbase.Base):
 
     def test_S7_the_note_follows_the_launcher_and_a_literal_default_does_not(self):
         real = self.answer_of(cw)
-        self.assertEqual((real["idle_seconds"], real["hard_seconds"]), (1800, 7200))
+        self.assertEqual((real["idle_seconds"], real["hard_seconds"]), (3600, 7200))
         n1 = self.note_of(real)
-        self.assertIn("idle limit 30m (default)", n1)
+        self.assertIn("idle limit 60m (default)", n1)
         self.assertIn("hard limit 2h (default)", n1)
         self.assertIsNone(follow_problem(n1, real))
         self.setUp()   # a fresh fake cluster for the changed launcher
-        changed, applied = mutated_launcher([(IDLE_DEFAULT, 'c.add_argument("--idle", default="45m")'), (HARD_DEFAULT, 'c.add_argument("--hard", default="3h")')])
+        changed, applied = mutated_launcher([(IDLE_DEFAULT, 'DEFAULT_IDLE = "45m"'), (HARD_DEFAULT, 'c.add_argument("--hard", default="3h")')])
         ans = self.answer_of(changed)
         n2 = self.note_of(ans)
         followed = int("idle limit 45m (default)" in n2) + int("hard limit 3h (default)" in n2)
@@ -228,7 +228,7 @@ class FollowsTheLauncher(lbase.Base):
         key = "applied(record.get(key))"
         self.assertEqual(body.count(key), 1)
         ns = dict(sb_module(self).__dict__)
-        exec(body.replace(key, '("30m" if key == "idle_seconds" else "2h")'), ns)
+        exec(body.replace(key, '("60m" if key == "idle_seconds" else "2h")'), ns)
         lit = ns["_limits_note"](types.SimpleNamespace(idle=None, hard=None), {k: ans.get(k) for k in ("idle_deadline", "hard_deadline", "idle_seconds", "hard_seconds")})
         problem = follow_problem(lit, ans)
         failed = int(problem is not None and "the note did not follow the launcher" in problem)
@@ -261,12 +261,12 @@ class ZDefaultMutantFailsTheRealCheck(lbase.Base):   # sorts after RealChecksCat
         self.assertEqual(code, 0, err)
         control = int(default_problem(self) is None)
         self.setUp()
-        mutant, applied = mutated_launcher([(IDLE_DEFAULT, 'c.add_argument("--idle", default="10m")')])
+        mutant, applied = mutated_launcher([(IDLE_DEFAULT, 'DEFAULT_IDLE = "10m"')])
         with redirect_stdout(io.StringIO()):
             self.assertEqual(mutant.main(CREATE_ARGS, self.env, self.clock, lambda s: self.clock.advance(seconds=s)), 0)
         problem = default_problem(self)
-        caught = int(problem is not None and problem.startswith("idle-seconds is not 1800"))
-        print("S4 mutants: print-nothing caught %d of 1 with expected one note line, control %d of 1; S6 mutant: 10m default caught %d of 1 with idle-seconds is not 1800, control %d of 1" % (
+        caught = int(problem is not None and problem.startswith("idle-seconds is not 3600"))
+        print("S4 mutants: print-nothing caught %d of 1 with expected one note line, control %d of 1; S6 mutant: 10m default caught %d of 1 with idle-seconds is not 3600, control %d of 1" % (
             RealChecksCatchTheMutants.print_line[0] if hasattr(RealChecksCatchTheMutants, "print_line") else 0,
             RealChecksCatchTheMutants.print_line[1] if hasattr(RealChecksCatchTheMutants, "print_line") else 0, caught, control))
         self.assertEqual((caught, control, applied), (1, 1, 1))

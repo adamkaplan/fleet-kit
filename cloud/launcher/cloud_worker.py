@@ -398,6 +398,8 @@ FORBIDDEN_POD_FIELDS = {
 
 def forbidden_pod_fields(pod):
     return [name for name, has in FORBIDDEN_POD_FIELDS.items() if has(pod)]
+DEFAULT_IDLE = "60m"               # a create with no --idle (ask #2305: a coder pod outlives a long model wait)
+DEFAULT_ORCHESTRATOR_IDLE = "30m"  # an orchestrator keeps the older default
 DEFAULT_MAX_HARD = "8h"  # OPEN in the contract: value
 # The cluster-side floor: every pod carries spec.activeDeadlineSeconds = the --max-hard cap + this grace, so the kubelet
 # ends a pod even when no reaper runs. The cap, not the current hard deadline: Kubernetes lets that field be lowered on
@@ -5438,7 +5440,7 @@ def build_parser():
     c.add_argument("--repo", required=True)
     c.add_argument("--issue", default=None, help="the issue number (a whole number above 0) written into the hub entry of a registered worker")
     c.add_argument("--branch", required=True)
-    c.add_argument("--idle", default="30m")
+    c.add_argument("--idle", default=None, help="the idle limit; unset: %s (%s with --agent orchestrator)" % (DEFAULT_IDLE, DEFAULT_ORCHESTRATOR_IDLE))
     c.add_argument("--hard", default="2h")
     c.add_argument("--max-hard", default=DEFAULT_MAX_HARD)
     c.add_argument("--shape", default=None, help="the pod shape, one of %s; unset: %s (%s with --stack, %s with --agent orchestrator)" % (", ".join(SHAPES), DEFAULT_SHAPE, DEFAULT_STACK_SHAPE, DEFAULT_ORCHESTRATOR_SHAPE))
@@ -5749,6 +5751,8 @@ def main(argv=None, env=None, clock=None, sleep=time.sleep):
         a = build_parser().parse_args(argv)
     except SystemExit as e:
         return EXIT_USAGE if e.code else 0
+    if a.cmd == "create" and a.idle is None:
+        a.idle = DEFAULT_ORCHESTRATOR_IDLE if a.agent == "orchestrator" else DEFAULT_IDLE
     if not explicit:   # the real process reads the settings file; a caller that passes its own environment has made its own choice
         try:
             apply_settings(env)
