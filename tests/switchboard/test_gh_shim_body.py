@@ -485,5 +485,101 @@ class TestGhBodyReadNamesItsStderr(FakeGhMixin, unittest.TestCase):
         self.assertEqual(calls, [True, True])   # one lookup and its one retry for the whole command (two targets)
 
 
+class TestGhBodyReadNamesTheRepositoryOfTheWrite(unittest.TestCase):
+    """The read is made of the repository the write names, wherever -R stands (fix forward of #2256): a fake gh that records argv."""
+    SPELLINGS = (("-R r", ["-R", "o/r"]), ("-Rr", ["-Ro/r"]), ("-R=r", ["-R=o/r"]), ("--repo r", ["--repo", "o/r"]), ("--repo=r", ["--repo=o/r"]))
+    PROBE = ["issue", "view", "7", "--json", "body"]
+
+    def setUp(self):
+        self.rig = BodyRig()
+        self.addCleanup(self.rig.close)
+        self.file = self.rig.path("body.md", BOTH)
+
+    def test_every_flag_of_the_table_is_spelled_in_every_form_here(self):
+        module = load_module()
+        for flag in module.REPO_FLAGS:
+            self.assertTrue(any(flag in spelled[0] for _, spelled in self.SPELLINGS), flag)
+
+    def test_the_read_carries_the_repository_named_after_the_number_in_every_spelling(self):
+        for label, flag in self.SPELLINGS:
+            with self.subTest(spelling=label):
+                done, calls, seen = self.rig.go(["issue", "edit", "7", *flag, "--body-file", self.file])
+                self.assertEqual(done.returncode, 0, done.stderr)
+                self.assertEqual(seen, [self.PROBE + ["-R", "o/r"]])
+                self.assertEqual(len(calls), 1)
+
+    def test_the_repository_before_the_verb_still_works_and_the_last_one_named_is_read(self):
+        for label, flag in self.SPELLINGS:
+            with self.subTest(spelling=label):
+                _, _, seen = self.rig.go(["-R", "x/y", "issue", "edit", "7", *flag, "--body-file", self.file])
+                self.assertEqual(seen, [self.PROBE + ["-R", "o/r"]])
+                _, _, seen = self.rig.go([*flag, "issue", "edit", "7", "--body-file", self.file])
+                self.assertEqual(seen, [self.PROBE + ["-R", "o/r"]])
+                _, _, seen = self.rig.go(["issue", "edit", "7", "--body-file", self.file, *flag])
+                self.assertEqual(seen, [self.PROBE + ["-R", "o/r"]])
+                _, _, seen = self.rig.go(["issue", "edit", "7", *flag, "-R", "z/z", "--body-file", self.file])
+                self.assertEqual(seen, [self.PROBE + ["-R", "z/z"]])
+
+    def test_two_repository_flags_after_the_verb_do_not_hide_the_next_word(self):
+        _, calls, seen = self.rig.go(["issue", "edit", "7", "-R", "a/b", "--repo=c/d", "--body-file", self.file])
+        self.assertEqual(seen, [self.PROBE + ["-R", "c/d"]])
+        self.assertEqual(len(calls), 1)
+
+    def test_no_repository_named_reads_without_one(self):
+        _, _, seen = self.rig.go(["issue", "edit", "7", "--body-file", self.file])
+        self.assertEqual(seen, [self.PROBE])
+
+    def test_a_flag_value_that_looks_like_a_repository_flag_is_not_one(self):
+        for flags in (["--title", "-Rzzz"], ["--add-label", "--repo=x/y"], ["--title", "-R"]):
+            with self.subTest(flags=flags):
+                _, _, seen = self.rig.go(["issue", "edit", "7", *flags, "--body-file", self.file])
+                self.assertEqual(seen, [self.PROBE])
+
+    def test_a_dangling_or_empty_repository_flag_does_not_crash(self):
+        for tail in (["-R"], ["--repo"]):
+            _, _, seen = self.rig.go(["issue", "edit", "7", "--body-file", self.file, *tail])
+            self.assertEqual(seen, [self.PROBE])
+        _, _, seen = self.rig.go(["issue", "edit", "7", "--repo=", "--body-file", self.file])
+        self.assertEqual(seen, [self.PROBE + ["-R", ""]])
+        _, _, seen = self.rig.go(["issue", "edit", "7", "-R==x", "--body-file", self.file])
+        self.assertEqual(seen, [self.PROBE + ["-R", "=x"]])
+
+    def test_an_attached_body_flag_strips_one_equals_as_gh_does(self):
+        # gh reads the body "=## Intent..." and the file "=<path>": the guard must not read them as the compliant text and file
+        done, calls, _ = self.rig.go(["issue", "edit", "7", "-b==" + BOTH])
+        self.assertNotEqual(done.returncode, 0)
+        self.assertEqual(calls, [])
+        done, calls, _ = self.rig.go(["issue", "edit", "7", "-F==" + self.file])
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn("cannot be", done.stderr)
+        self.assertEqual(calls, [])
+        done, calls, _ = self.rig.go(["issue", "edit", "7", "-b=" + BOTH])   # one "=" is the separator: this passes
+        self.assertEqual(done.returncode, 0, done.stderr)
+
+    def test_a_word_after_the_double_dash_that_reads_as_a_flag_is_refused_unread(self):
+        for word in ("-R", "--repo=x/y", "-"):
+            done, calls, seen = self.rig.go(["issue", "edit", "7", "--body-file", self.file, "--", word])
+            self.assertNotEqual(done.returncode, 0)
+            self.assertEqual((calls, seen), ([], []))
+
+    def test_a_body_that_drops_the_intent_is_still_refused(self):
+        bad = self.rig.path("bad.md", NO_INTENT)
+        done, calls, seen = self.rig.go(["issue", "edit", "7", "-R", "o/r", "--body-file", bad])
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn(DROP_WORDS, done.stderr)
+        self.assertEqual(calls, [])
+
+    def test_the_old_code_is_the_control_its_read_has_no_repository_in_any_spelling(self):
+        source = (SHIM_DIR / "gh_body.py").read_text()
+        old = "        named = repo_flag(args, i - 1)\n"
+        self.assertEqual(source.count(old), 1)
+        rig = BodyRig(gh_body_source=source.replace(old, "        named = None\n", 1))
+        self.addCleanup(rig.close)
+        for label, flag in self.SPELLINGS:
+            with self.subTest(spelling=label):
+                _, _, seen = rig.go(["issue", "edit", "7", *flag, "--body-file", self.file])
+                self.assertEqual(seen, [self.PROBE])
+
+
 if __name__ == "__main__":
     unittest.main()
