@@ -32,7 +32,7 @@ MAX_TEXT = 1048576
 WHY_CHARS = 200   # the read's stderr as the refusal shows it: the first this many characters, one line
 WHY_READ = 4096   # only this much of the stderr is ever scanned (a limit on the work, whatever the read printed)
 TOKEN_ENV_NAMES = ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN")   # the same four as shims/gh (a test compares them)
-# A net, not a promise (a token with no known prefix that is not one the read ran with is not caught): the shapes of `_SECRET_PATTERNS` in bin/fleet-switchboard (this file stands alone), every run of name characters bounded so no scan is quadratic.
+# A deliberate subset of `_SECRET_PATTERNS` in bin/fleet-switchboard (the shapes a gh error carries; this file stands alone, a test shows what each one catches). A net, not a promise (a token with no known prefix that is not one the read ran with is not caught): the shapes of `_SECRET_PATTERNS` in bin/fleet-switchboard (this file stands alone), every run of name characters bounded so no scan is quadratic.
 SECRET_PATTERNS = (
     (re.compile(r"(?i)\b(bearer|basic|token|digest|negotiate)\s+[A-Za-z0-9._~+/=-]{6,}"), r"\1 [redacted]"),
     (re.compile(r"(?i)(?<![A-Za-z0-9_.-])([A-Za-z0-9_.-]{0,64}(?:token|secret|passw(?:or)?d|api[_-]?key|credential|auth)[A-Za-z0-9_.-]{0,64}[\"']?\s{0,4}[=:]\s{0,4})"
@@ -77,7 +77,7 @@ def refusal(current_body, new_body):
 def clean_stderr(text, env=None, limit=WHY_CHARS):
     """The first `limit` characters of a read's stderr as ONE line of printable ASCII: control and other characters become spaces, anything token-shaped (and any
     token the read ran with, also URL- or JSON-escaped) is redacted. Only the first WHY_READ characters are scanned; when there were more, the last word of them,
-    which may be a token cut in two, is dropped."""
+    which may be a token cut in two, is dropped. Redacting BEFORE the cut to `limit` is deliberate: a token is never shown half."""
     raw = str(text or "")
     cut = len(raw) > WHY_READ
     raw = raw[:WHY_READ]

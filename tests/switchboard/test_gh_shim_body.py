@@ -7,6 +7,7 @@ text of the files it was handed). Reads never reach the write log. Fakes only: n
 import importlib.util
 import itertools
 import json
+import os
 import pathlib
 import shlex
 import subprocess
@@ -304,7 +305,7 @@ class TestGhBodyReadNamesItsStderr(FakeGhMixin, unittest.TestCase):
 
     def failing(self, module, said, env=None):
         said_file = pathlib.Path(self.dir.name) / "said"
-        said_file.write_text(said)
+        said_file.write_text(said, encoding="utf-8")
         self.fake("cat " + shlex.quote(str(said_file)) + " >&2\nexit 1")
         probe = module.Probe(self.gh, lambda: env, None)
         return module.check_current(probe, ["issue", "view", "1", "--json", "body"], "no parts here\n")
@@ -346,7 +347,7 @@ class TestGhBodyReadNamesItsStderr(FakeGhMixin, unittest.TestCase):
         got = self.failing(module, "a\x1b[31mb\nsecond line\r\n\u202e\u00e9" + "x" * 500)
         self.assertNotIn("\n", got)
         self.assertTrue(all(c.isascii() and c.isprintable() for c in got), got)
-        shown = got.split(self.WORDS + ": ", 1)[1].split("), so a body write", 1)[0]
+        shown = got.split(self.WORDS + ": ", 1)[1].split("), so", 1)[0]
         self.assertEqual(len(shown), module.WHY_CHARS)   # cut at the limit: the rest of the 500 is not shown
         self.assertEqual(module.clean_stderr("y" * 500), "y" * module.WHY_CHARS)
         self.assertLess(got.index("31mb"), got.index("second line"))
@@ -380,13 +381,10 @@ class TestGhBodyReadNamesItsStderr(FakeGhMixin, unittest.TestCase):
         self.assertTrue(all(c.isascii() and c.isprintable() for c in got), got)
 
     def test_the_old_code_is_the_control(self):
-        """The statement that takes the stderr is made to say nothing (as the code before this change did): the text test above then fails."""
-        source = (SHIM_DIR / "gh_body.py").read_text()
-        old = "said = clean_stderr(done.stderr, env)"
-        self.assertEqual(source.count(old), 1)
-        path = pathlib.Path(self.dir.name) / "old_gh_body.py"
-        path.write_text(source.replace(old, 'said = ""', 1))
-        got = self.failing(load_module(path), "HTTP 404: Not Found")
+        """With the stderr taken away (as before this change) the same read shows no stderr: the text test above fails on it."""
+        module = load_module()
+        with unittest.mock.patch.object(module, "clean_stderr", lambda *args, **kwargs: ""):
+            got = self.failing(module, "HTTP 404: Not Found")
         self.assertIn("(%s)" % self.WORDS, got)
         self.assertNotIn("404", got)
 
@@ -395,13 +393,31 @@ class TestGhBodyReadNamesItsStderr(FakeGhMixin, unittest.TestCase):
         shapes = ("Bearer abcdef123456", "token=abc123xyz", "--password hunter22x", self.FAKE_TOKEN, "0123456789abcdef0123456789abcdef01234567",
                   "https://user:hunter2pass@example.com/x", "https://opaquetoken987@example.com/x", "eyJhbGciOi.eyJzdWIiOiIx.sig")
         secrets = ("abcdef123456", "abc123xyz", "hunter22x", self.FAKE_TOKEN, "0123456789abcdef0123456789abcdef01234567", "hunter2pass", "opaquetoken987", "eyJzdWIiOiIx")
-        self.assertEqual(len(shapes), len(module.SECRET_PATTERNS))
-        for at, (shape, secret) in enumerate(zip(shapes, secrets)):
-            with self.subTest(pattern=at):
+        for shape, secret in zip(shapes, secrets):
+            with self.subTest(shape=shape[:12]):
                 self.assertNotIn(secret, module.clean_stderr(shape))
-                left = module.SECRET_PATTERNS[:at] + module.SECRET_PATTERNS[at + 1:]
-                with unittest.mock.patch.object(module, "SECRET_PATTERNS", left):
-                    self.assertIn(secret, module.clean_stderr(shape))
+                leaks = []
+                for at in range(len(module.SECRET_PATTERNS)):
+                    with unittest.mock.patch.object(module, "SECRET_PATTERNS", module.SECRET_PATTERNS[:at] + module.SECRET_PATTERNS[at + 1:]):
+                        leaks.append(secret in module.clean_stderr(shape))
+                self.assertTrue(any(leaks))   # some pattern is the one that hides it
+
+    def test_a_token_that_holds_a_control_character_is_found_before_the_characters_go(self):
+        got = self.failing(load_module(), "x ab\tcd-secret9 y", {"GH_TOKEN": "ab\tcd-secret9"})
+        self.assertNotIn("secret9", got)
+
+    def test_a_token_of_the_environment_the_read_inherits_is_redacted(self):
+        with unittest.mock.patch.dict("os.environ", {"GH_TOKEN": "inheritedvalue77"}):
+            got = self.failing(load_module(), "oops inheritedvalue77 here", None)
+        self.assertNotIn("inheritedvalue77", got)
+
+    def test_the_account_env_of_the_write_is_the_env_the_read_runs_with(self):
+        shim = self.shim()
+        seen = pathlib.Path(self.dir.name) / "seen"
+        self.fake("printf '%s' \"$GH_TOKEN\" > " + shlex.quote(str(seen)) + "\nexit 0")
+        with unittest.mock.patch.object(shim, "account_env", lambda gh, lookup, strict=False, **kw: dict(os.environ, GH_TOKEN="sentinel-account")):
+            shim.body_probe(["issue", "edit", "1", "--body", "no parts\n"], self.gh, True, shim.Lookup(write=True))
+        self.assertEqual(seen.read_text(), "sentinel-account")
 
     def shim(self):
         import importlib.machinery

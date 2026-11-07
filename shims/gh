@@ -2952,8 +2952,8 @@ def body_read_env(gh, lookup, args, write):
             try:
                 try:
                     done.append((account_env(gh, lookup, strict=write, args=args), None))
-                except AccountLookupFailed:
-                    done.append((account_env(gh, Lookup(write=write), strict=write, args=args), None))
+                except AccountLookupFailed:   # only a strict (write) lookup raises this
+                    done.append((account_env(gh, Lookup(write=True), strict=True, args=args), None))
             except Exception as err:
                 done.append((None, err))
         if done[0][1] is not None:
