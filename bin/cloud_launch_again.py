@@ -98,6 +98,7 @@ def _finish_starting(args, runner, engine, state, record, repo, branch):
                     hcode, _, hnote = H["run_launcher"](runner, "hub-session", name, ["--session", record["session"]], 120, cluster=cluster)
                     if hcode != 0:
                         raise H["CloudError"]("the hub entry could not be given the session: %s" % H["_reason"](hcode, hnote))
+                H["cloud_pr_labels"].cloud_base.apply_recorded(record)   # #2305: the base of the first launch is in the record; checked again, before the record is marked ready and the brief file removed
                 brief = None
                 try:
                     brief = H["_read_private"](brief_path(state, name), BRIEF_MAX) if brief_path(state, name).exists() else None
