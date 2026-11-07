@@ -42,6 +42,7 @@ def check(args):
 def apply(record, args):
     """Record the base in the worker record and put it in the setup text of this launch; with no base, today's text (restored if an earlier launch of this process changed it)."""
     base = base_of(args)
+    check(args)   # a recorded base is read back from a file: it is checked again before it reaches the pod's text
     current = H["SETUP_PREAMBLE"]
     if current is _KEPT.get("text"):
         current = _KEPT["orig"]
