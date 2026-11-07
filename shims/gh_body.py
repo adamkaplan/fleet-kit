@@ -271,6 +271,8 @@ def issue_edit(probe, args):
     new = body[1] if body[0] == "body" else probe.file_text(body[1])
     if not targets:
         raise Unclassified()
+    if any(t.startswith("-") for t in targets):
+        raise Unclassified()   # a target after -- that reads as a flag would change the read, not name an issue
     for target in targets:
         found = check_current(probe, ["issue", "view", target, "--json", "body"] + (["-R", repos[-1]] if repos else []), new)
         if found:
