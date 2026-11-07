@@ -236,6 +236,8 @@ class Slices(unittest.TestCase):
             keys = list(b)
             n = len(push_patterns(b))
             self.assertEqual(keys[-n:], push_patterns(b))
+            # #2304: no push rule may read as a character class ('[' then ']') to an fnmatch matcher such as cw-shell-check's
+            self.assertEqual([k for k in push_patterns(b) if "[" in k and "]" in k[k.index("["):]], [])
         self.assertEqual(order_problems(blocks(self.conf)[0]), [])
         self.assertEqual(order_problems(blocks(self.conf)[1]), [])
 
