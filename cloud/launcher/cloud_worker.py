@@ -33,6 +33,7 @@ import urllib.parse
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import run_record  # noqa: E402  (the run record: one module, one function the stop calls)
+import wip_save  # noqa: E402  (#2304: the save of a running pod's work to <worker>/wip, every ten minutes)
 
 NAME_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")  # the switchboard's agent name rule
 NAME_OBJECT = re.compile(r"[a-z0-9][a-z0-9.-]{0,252}")   # a Kubernetes object name (what an ownerReference may name)
@@ -4469,6 +4470,7 @@ class Launcher:
             self.send_wip_notes(live, now)
         finally:
             steps["notes"] = mono() - t0
+        wip_save.save_pass(self, live, now, NAME_RE.fullmatch)   # #2304: every ten minutes, each running pod's work to <worker>/wip (never raises)
         t0 = mono()
         try:
             self.send_final_notes(live, now)

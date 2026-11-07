@@ -346,6 +346,8 @@ def run(workdir, worker, prestop=False, repo=None, ctx=None):
     if contained:
         return {"pushed": False, "wip_branch": None, "skipped": skipped, "head_on": head_branch(contained), **extra}
     branch = "%s/wip" % worker
+    if prestop and ff_over_snapshots(workdir, worker, url, ctx):   # #2304: a running save made wip not an ancestor of HEAD: push a fast-forward instead
+        return {"pushed": True, "wip_branch": branch, "skipped": skipped, **extra}
     # prestop: a plain push to the explicit URL, never forced and no lease: a non-fast-forward answer is a failure, not an overwrite
     if prestop:
         git(workdir, "push", "--no-verify", url, "HEAD:refs/heads/" + branch, ctx=ctx)
@@ -526,7 +528,113 @@ def prestop_main():
         ctx.close()
 
 
+# ---- the wip save (ask #2304): the reaper's save of a RUNNING pod's work to <worker>/wip, by exec, `cw-end-hook --snapshot` ----
+SNAP_SAVED_FILE = "cw-wip-saved"   # inside .git: the tree hash of the last save (never the branch, the index or a file of the tree)
+SNAP_IDENT = ["-c", "user.name=cw-worker", "-c", "user.email=cw-worker@invalid"]
+
+
+def snapshot(workdir, worker, repo, ctx):
+    """Save the pod's commits and files to <worker>/wip as ONE new commit, without touching the pod's branch, index or files: a copy of the
+    index in a temporary GIT_INDEX_FILE, `git add -A` into the copy, write-tree, commit-tree with the old wip head as parent (and the pod's HEAD as a
+    second parent, so its commits are reachable), then a plain push (a fast-forward, never forced). Secret-looking untracked files are left out.
+    Returns {saved, tree, wip_branch}; saved is False when the tree equals the last saved one. A failure raises RuntimeError."""
+    url = HOST_URL + "%s.git" % repo
+    branch = "%s/wip" % worker
+    gitdir = os.path.join(workdir, ".git")
+    saved_path = os.path.join(gitdir, SNAP_SAVED_FILE)
+    tmp = tempfile.mkdtemp(prefix="cw-snap-", dir=gitdir)
+    try:
+        real_index = os.path.join(gitdir, "index")
+        index = os.path.join(tmp, "index")
+        if os.path.isfile(real_index):
+            shutil.copyfile(real_index, index)
+        ctx.env["GIT_INDEX_FILE"] = index
+        others = git(workdir, "ls-files", "--others", "--exclude-standard", "-z", ctx=ctx).stdout.split("\0")
+        git(workdir, "add", "-A", ctx=ctx)
+        secret = [x for x in others if x and is_secret(x)]
+        if secret:
+            subprocess.run([GIT_BIN, "-C", workdir] + ctx.opts + ["rm", "--cached", "-q", "--ignore-unmatch", "--pathspec-from-file=-", "--pathspec-file-nul"],
+                           input="\0".join(secret).encode(), capture_output=True, env=ctx.env, check=True)
+        tree = git(workdir, "write-tree", ctx=ctx).stdout.strip()
+        try:
+            with open(saved_path) as f:
+                if f.read().strip() == tree:
+                    return {"saved": False, "tree": tree, "wip_branch": branch}
+        except OSError:
+            pass
+        head = git(workdir, "rev-parse", "--verify", "-q", "HEAD", check=False, ctx=ctx).stdout.strip()
+        if head and git(workdir, "rev-parse", "%s^{tree}" % head, ctx=ctx).stdout.strip() == tree and git(workdir, "branch", "-r", "--contains", head, ctx=ctx).stdout.strip():
+            return {"saved": False, "tree": tree, "wip_branch": branch}   # a clean tree whose commit is on a remote branch: nothing of the pod's own to save
+        wip = ""
+        listed = git(workdir, "ls-remote", url, "refs/heads/" + branch, ctx=ctx).stdout.split()
+        if listed:
+            wip = listed[0]
+            git(workdir, "fetch", "--no-tags", "-q", url, "refs/heads/" + branch, ctx=ctx)
+        parents = [x for x in dict.fromkeys([wip, head]) if x]
+        if wip and git(workdir, "rev-parse", "%s^{tree}" % wip, ctx=ctx).stdout.strip() == tree:
+            parents = []
+        if parents:
+            args = [a for x in parents for a in ("-p", x)]
+            commit = git(workdir, *SNAP_IDENT, "commit-tree", tree, *args, "-m", "WIP: work in progress saved by %s while it runs" % worker, ctx=ctx).stdout.strip()
+            git(workdir, "push", "--no-verify", url, "%s:refs/heads/%s" % (commit, branch), ctx=ctx)
+        with open(saved_path, "w") as f:
+            f.write(tree + "\n")
+        return {"saved": bool(parents), "tree": tree, "wip_branch": branch}
+    finally:
+        shutil.rmtree(tmp, True)
+
+
+def ff_over_snapshots(workdir, worker, url, ctx):
+    """True when the remote <worker>/wip exists and is not an ancestor of HEAD (a running save put commits there) and a fast-forward commit of HEAD's tree
+    (parents: that wip head, HEAD) was pushed. False means: no such case, the plain push of HEAD follows."""
+    branch = "%s/wip" % worker
+    listed = git(workdir, "ls-remote", url, "refs/heads/" + branch, ctx=ctx).stdout.split()
+    if not listed:
+        return False
+    wip = listed[0]
+    git(workdir, "fetch", "--no-tags", "-q", url, "refs/heads/" + branch, ctx=ctx)
+    if git(workdir, "merge-base", "--is-ancestor", wip, "HEAD", check=False, ctx=ctx).returncode == 0:
+        return False
+    commit = git(workdir, *SNAP_IDENT, "commit-tree", "HEAD^{tree}", "-p", wip, "-p", "HEAD", "-m", "WIP: work in progress saved by %s at the end of the worker" % worker,
+                 ctx=ctx).stdout.strip()
+    git(workdir, "push", "--no-verify", url, "%s:refs/heads/%s" % (commit, branch), ctx=ctx)
+    return True
+
+
+def snapshot_main():
+    """--snapshot: one JSON line {saved, tree, wip_branch, error}; exit 0 on success (saved or nothing changed), 1 on a failure."""
+    workdir, worker, repo = os.environ.get("CW_WORKDIR", "/work/repo"), os.environ.get("CW_WORKER", ""), os.environ.get("CW_REPO", "")
+    fail = lambda why: (print(json.dumps({"saved": False, "error": why})), 1)[1]
+    if not valid_worker(worker) or not REPO_RE.match(repo) or ".." in repo:
+        return fail("the worker or repository name is not valid")
+    try:
+        if not stat.S_ISDIR(os.lstat(os.path.join(workdir, ".git")).st_mode):
+            return fail(".git is not a directory")
+    except OSError:
+        return fail("there is no git repository here")
+    helper = find_helper()
+    if not helper:
+        return fail("the pod's credential helper was not found")
+    ctx = Ctx(helper)
+    try:
+        config_refusal(workdir, repo, ctx)
+        print(json.dumps(snapshot(workdir, worker, repo, ctx)))
+        return 0
+    except OriginElsewhere:
+        return fail("origin points elsewhere")
+    except ConfigRefused:
+        return fail("the repository configuration is not a plain one")
+    except TokenEnded as e:
+        return fail(str(e))
+    except (RuntimeError, OSError, subprocess.SubprocessError) as e:
+        return fail(re.sub(r"https?://\S+", "<url>", " ".join(str(e).split()))[:120])
+    finally:
+        ctx.close()
+
+
 def main():
+    if "--snapshot" in sys.argv[1:]:
+        return snapshot_main()
     if "--prestop" in sys.argv[1:]:
         return prestop_main()
     workdir, worker = os.environ.get("CW_WORKDIR", "/work/repo"), os.environ.get("CW_WORKER", "")
