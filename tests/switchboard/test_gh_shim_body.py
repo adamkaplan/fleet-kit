@@ -544,6 +544,21 @@ class TestGhBodyReadNamesTheRepositoryOfTheWrite(unittest.TestCase):
         _, _, seen = self.rig.go(["issue", "edit", "7", "-R==x", "--body-file", self.file])
         self.assertEqual(seen, [self.PROBE + ["-R", "=x"]])
 
+    def test_an_attached_body_flag_strips_one_equals_as_gh_does(self):
+        # gh reads the body "=## Intent..." and the file "=<path>": the guard must not read them as the compliant text and file
+        done, calls, _ = self.rig.go(["issue", "edit", "7", "-b==" + BOTH])
+        self.assertNotEqual(done.returncode, 0)
+        self.assertEqual(calls, [])
+        done, calls, _ = self.rig.go(["issue", "edit", "7", "-F==" + self.file])
+        self.assertNotEqual(done.returncode, 0)
+        self.assertEqual(calls, [])
+        done, calls, _ = self.rig.go(["issue", "edit", "7", "-b=" + BOTH])   # one "=" is the separator: this passes
+        self.assertEqual(done.returncode, 0, done.stderr)
+
+    def test_a_repository_flag_after_the_double_dash_is_a_target_not_a_repository(self):
+        _, _, seen = self.rig.go(["issue", "edit", "7", "--body-file", self.file, "--", "-R"])
+        self.assertEqual(seen, [self.PROBE, ["issue", "view", "-R", "--json", "body"]])   # the word is a second target, no repository
+
     def test_a_body_that_drops_the_intent_is_still_refused(self):
         bad = self.rig.path("bad.md", NO_INTENT)
         done, calls, seen = self.rig.go(["issue", "edit", "7", "-R", "o/r", "--body-file", bad])

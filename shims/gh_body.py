@@ -58,7 +58,7 @@ FAILED = "gh: refused: the body guard failed, retry (the fleet shim refuses this
 ISSUE_VALUE = {"-R", "--repo", "-t", "--title", "-m", "--milestone", "-a", "--add-assignee", "--remove-assignee", "-l", "--add-label",
                "--remove-label", "-p", "--add-project", "--remove-project", "-b", "--body", "-F", "--body-file"}
 
-REPO_FLAGS = ("-R", "--repo")   # the one table of the spellings that name the repository; every loop below reads it through repo_flag
+REPO_FLAGS = ("-R", "--repo")   # the one table of the spellings that name the repository; every loop reads this table, the issue-edit loops through repo_flag
 
 
 def repo_flag(args, i):
@@ -257,7 +257,7 @@ def issue_edit(probe, args):
         elif a.startswith("--body-file="):
             kind, value = "file", a[12:]
         elif a.startswith(("-b", "-F")) and not a.startswith("--"):
-            kind, value = ("body" if a[1] == "b" else "file"), a[2:].lstrip("=") if a[2:3] == "=" else a[2:]
+            kind, value = ("body" if a[1] == "b" else "file"), a[3:] if a[2:3] == "=" else a[2:]   # one "=" is the separator, as pflag reads it
         elif a in ISSUE_VALUE:
             i += 1
         elif not a.startswith("-") or a == "-":
