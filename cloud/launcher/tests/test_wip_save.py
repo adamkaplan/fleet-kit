@@ -500,13 +500,14 @@ class Scene:
 
 
 class ReaperSave(unittest.TestCase):
-    def test_a_missing_end_hook_file_saves_nothing_and_says_so_once_on_stderr(self):
+    def test_a_missing_end_hook_file_saves_nothing_and_says_so_on_stderr(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         s = Scene([kube_pod()], {"w1": Pod(tmp.name)}, tmp.name)
         with mock.patch.object(real.wip_save, "HOOK_PATH", os.path.join(tmp.name, "nope.py")):
-            s.reap(0)
+            err = s.reap(0)
         self.assertEqual(s.snapshots(), [])
+        self.assertIn("no end hook to ship", err)
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
