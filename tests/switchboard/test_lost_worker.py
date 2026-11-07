@@ -906,6 +906,64 @@ class TestChiefOnlyWhenNeeded(unittest.TestCase):
         self.assertEqual(self.delivered(False), ["chief-of-staff", "lane-a"])
 
 
+class TestRefusedLaunchIsToldToItsLane(unittest.TestCase):
+    """#2303: a refused launch is told to the lane named in its `cloud.create_failed` line, never to the Chief of Staff; no readable lane: the Chief of Staff alone."""
+
+    def refused(self, mod, *bosses):
+        r = Rig(mod)
+        for n, boss in enumerate(bosses):
+            detail = {"exit": 1, "reason": "cluster full"}
+            if boss is not None:
+                detail["boss"] = boss
+            line(r.engine.audit.path, ts=stamp(NOW - 100 - n), actor="x", event="cloud.create_failed", subject="w%d" % n, detail=detail)
+        got = r.passes()
+        r.passes()   # a second pass repeats nothing
+        return got, sorted(to for to, _ in r.engine.sent), r.engine.sent
+
+    def today(self):
+        src = (REPO / "bin" / "lost_worker.py").read_text()
+        for new, old in (('"lane": r.get("boss") or None,', '"lane": record.get("reports_to"),'), ('if loss["kind"] == "refused_launch":', 'if False:')):
+            self.assertEqual(src.count(new), 1, new)
+            src = src.replace(new, old)
+        mod = types.ModuleType("lost_worker_today")
+        exec(compile(src, "lost_worker_today", "exec"), mod.__dict__)
+        return mod
+
+    def check_s2(self, mod):
+        got, to, sent = self.refused(mod, "lane-a", "lane-b")
+        self.assertEqual(to.count("chief-of-staff"), 0, "S2 the Chief of Staff is told none")
+        self.assertEqual(to, ["lane-a", "lane-b"], "S2 each lane once")
+        self.assertTrue(all(("lane=" + t) in m for t, m in sent), "S2 the text names the lane")
+
+    def check_s3(self, mod):
+        got, to, _ = self.refused(mod, None)
+        self.assertEqual(to, ["chief-of-staff"], "S3 the Chief of Staff alone, once")
+
+    def test_s2_each_lane_is_told_once_and_the_chief_none(self):
+        self.check_s2(load())
+
+    def test_s3_an_unreadable_lane_reaches_the_chief_once(self):
+        self.check_s3(load())
+        got, to, _ = self.refused(load(), "")
+        self.assertEqual(to, ["chief-of-staff"])   # an empty boss is no lane
+
+    def test_a_loss_of_another_kind_keeps_its_recipients(self):
+        mod = load()
+        r = Rig(mod)
+        r.created("w1")
+        r.passes()
+        self.assertEqual(sorted(to for to, _ in r.engine.sent), ["chief-of-staff", "lane-a"])
+
+    def test_s5_control_today_s_code_tells_the_chief_of_both(self):
+        old = self.today()
+        got, to, _ = self.refused(old, "lane-a", "lane-b")
+        self.assertEqual(to.count("chief-of-staff"), 2)   # the control: the Chief of Staff is told of both, no lane is
+        self.assertNotIn("lane-a", to)
+        with self.assertRaises(AssertionError) as caught:
+            self.check_s2(old)
+        self.assertIn("S2 the Chief of Staff is told none", str(caught.exception))
+
+
 class TestAskIsItsOwn(unittest.TestCase):
     """#2246: a lost worker is counted under its own ask, never under its name prefix."""
 
