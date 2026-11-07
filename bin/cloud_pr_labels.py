@@ -5,6 +5,12 @@ them in the pod's CW_PR_LABELS and an annotation, and its reaper labels what the
 """
 
 OPTION = "--pr-label"
+cloud_base = None   # bin/cloud_base.py (--base, #2305), loaded by bind; its two hooks run beside this part's two
+
+
+def bind(namespace):
+    global cloud_base
+    cloud_base = namespace["_load_part"]("cloud_base")
 
 
 def labels_of(args):
@@ -18,6 +24,7 @@ def labels_of(args):
 
 def create_options(args):
     """The launcher's create options for the labels: `--pr-label L` each; nothing when none were given (a launch hands the launcher exactly what it did)."""
+    cloud_base.check(args)   # #2305: a refused --base stops the launch before the launcher is called
     out = []
     for label in labels_of(args):
         out += [OPTION, label]
@@ -26,6 +33,7 @@ def create_options(args):
 
 def record_labels(record, args):
     """Write `pr_labels` (a list of strings) into the worker record when the launch named labels; otherwise the record is left as it was."""
+    cloud_base.apply(record, args)   # #2305: the base in the record and in the setup text
     labels = labels_of(args)
     if labels:
         record["pr_labels"] = labels
