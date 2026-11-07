@@ -31,8 +31,13 @@ def save_pass(launcher, pods, now, name_ok):
     try:
         source = hook_source()
     except (OSError, ValueError) as e:
-        print("cloud-worker: the wip save has no end hook to ship: %s" % type(e).__name__, file=sys.stderr)
+        why = type(e).__name__
+        if launcher.__dict__.get("wip_save_hook_said") != why:   # said once, until the file reads again
+            launcher.__dict__["wip_save_hook_said"] = why
+            launcher.audit("", "file/end_hook.py", SAVE_ACTION, 0.0, False, "the wip save has no end hook to ship: %s" % why)
+            print("cloud-worker: the wip save has no end hook to ship: %s" % why, file=sys.stderr)
         return []
+    launcher.__dict__["wip_save_hook_said"] = None
     state = launcher.__dict__.setdefault("wip_save_state", {})
     seen, out = set(), []
     for pod in pods:

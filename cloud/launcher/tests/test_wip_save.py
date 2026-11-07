@@ -509,6 +509,30 @@ class ReaperSave(unittest.TestCase):
         self.assertEqual(s.snapshots(), [])
         self.assertIn("no end hook to ship", err)
 
+    def test_a_missing_end_hook_file_is_said_once_over_two_passes_and_again_after_it_reads(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        s = Scene([kube_pod()], {"w1": Pod(tmp.name)}, tmp.name)
+        with mock.patch.object(real.wip_save, "HOOK_PATH", os.path.join(tmp.name, "nope.py")):
+            err = s.reap(0) + s.reap(11)
+            self.assertEqual((len(s.lines()), err.count("no end hook to ship")), (1, 1))
+        s.reap(22)   # the file reads again: the state is cleared
+        with mock.patch.object(real.wip_save, "HOOK_PATH", os.path.join(tmp.name, "nope.py")):
+            err = s.reap(33)
+        self.assertEqual((len(s.lines()), err.count("no end hook to ship")), (2, 1))
+
+    def test_an_exec_that_raises_is_said_once_over_two_passes(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        s = Scene([kube_pod()], {"w1": Pod(tmp.name)}, tmp.name)
+
+        def boom(name, *args, **kw):
+            raise TimeoutError("timed out")
+        s.kube.exec = boom
+        err = s.reap(0) + s.reap(11)
+        self.assertEqual(len(s.lines()), 1)
+        self.assertEqual(err.count("was not saved"), 1)
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
