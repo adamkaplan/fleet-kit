@@ -551,12 +551,13 @@ class TestGhBodyReadNamesTheRepositoryOfTheWrite(unittest.TestCase):
         self.assertEqual(calls, [])
         done, calls, _ = self.rig.go(["issue", "edit", "7", "-F==" + self.file])
         self.assertNotEqual(done.returncode, 0)
+        self.assertIn("cannot be", done.stderr)
         self.assertEqual(calls, [])
         done, calls, _ = self.rig.go(["issue", "edit", "7", "-b=" + BOTH])   # one "=" is the separator: this passes
         self.assertEqual(done.returncode, 0, done.stderr)
 
     def test_a_word_after_the_double_dash_that_reads_as_a_flag_is_refused_unread(self):
-        for word in ("-R", "--repo=x/y"):
+        for word in ("-R", "--repo=x/y", "-"):
             done, calls, seen = self.rig.go(["issue", "edit", "7", "--body-file", self.file, "--", word])
             self.assertNotEqual(done.returncode, 0)
             self.assertEqual((calls, seen), ([], []))
