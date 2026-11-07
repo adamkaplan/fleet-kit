@@ -81,7 +81,7 @@ class Pod:
 
     def snapshot(self):
         env = dict(os.environ, CW_WORKDIR=self.work, CW_WORKER=self.worker, CW_REPO="o/r", **GIT_ENV)
-        return subprocess.run([sys.executable, self.driver, os.path.join(LAUNCHER, "end_hook.py"), "file://" + os.path.join(self.tmp, "o") + "/",
+        return subprocess.run([sys.executable, self.driver, os.path.join(LAUNCHER, "end_hook.py"), "file://" + self.tmp + "/",
                                os.path.join(self.tmp, "bin"), "--snapshot"], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=60)
 
     def wip(self):
@@ -183,7 +183,7 @@ class EndHookSnapshot(unittest.TestCase):
         drv = DRIVER.replace("m.main()", "m.prestop_main()")
         with open(p.driver, "w") as f:
             f.write(drv)
-        r = subprocess.run([sys.executable, p.driver, os.path.join(LAUNCHER, "end_hook.py"), "file://" + os.path.join(p.tmp, "o") + "/", os.path.join(p.tmp, "bin")],
+        r = subprocess.run([sys.executable, p.driver, os.path.join(LAUNCHER, "end_hook.py"), "file://" + p.tmp + "/", os.path.join(p.tmp, "bin")],
                            env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=60)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertNotEqual(p.wip(), old)
