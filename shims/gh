@@ -2941,11 +2941,27 @@ def hold_probe(args, lookup, gh, write):
         return (RETRY_HOLD if write else None), None, None
 
 
+def body_read_env(gh, lookup, args, write):
+    """The env_of of the body guard's read: the account of the write it guards, worked out ONCE, strictly like the write (#2256). A lookup that fails is
+    retried once with a fresh deadline and then raises (the guard says so) instead of leaving the read to the inherited or stored login, which may be an
+    account that cannot read the repository (HTTP 404, exit 1)."""
+    found = []
+
+    def env_of():
+        if not found:
+            try:
+                found.append(account_env(gh, lookup, strict=write, args=args))
+            except AccountLookupFailed:
+                found.append(account_env(gh, Lookup(write=True), strict=True, args=args))
+        return found[0]
+    return env_of
+
+
 def body_probe(args, gh, write, lookup):   # #1751: gh_body.py beside this file, loaded by path; a WRITE it cannot load or run is refused
     try:
         spec = importlib.util.spec_from_file_location("gh_body", os.path.join(os.path.dirname(os.path.realpath(__file__)), "gh_body.py"))
         module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
-        return module.guard(args, write, api_parsed, gh, lambda: account_env(gh, lookup, args=args))
+        return module.guard(args, write, api_parsed, gh, body_read_env(gh, lookup, args, write))
     except Exception:
         return "gh: refused: the body guard could not be loaded, retry" if write else None
 

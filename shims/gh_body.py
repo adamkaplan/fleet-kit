@@ -29,6 +29,16 @@ HEAD_RE = re.compile(r"^## Intent[ \t]*\r?$", re.M)
 DONE_RE = re.compile(r"^Done when:", re.M)
 UPDATE_RE = re.compile(r"\bupdateIssue\b")
 MAX_TEXT = 1048576
+WHY_CHARS = 200   # the read's stderr as the refusal shows it: the first this many characters, one line
+TOKEN_ENV_NAMES = ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN")
+SECRET_PATTERNS = (
+    (re.compile(r"(?i)\b(bearer|basic)\s+[A-Za-z0-9._~+/=-]{6,}"), r"\1 [redacted]"),
+    (re.compile(r"(?i)(?<![A-Za-z0-9_.-])([A-Za-z0-9_.-]*(?:token|secret|passw(?:or)?d|api[_-]?key|credential|auth)[A-Za-z0-9_.-]*[\"']?\s*[=:]\s*)"
+                r"(\"[^\"]*\"|'[^']*'|\S+)"), r"\1[redacted]"),
+    (re.compile(r"\b(?:sk-[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{12,}|xox[abprs]-[A-Za-z0-9-]{8,})"), "[redacted]"),
+    (re.compile(r"(://[^/\s:@]+:)\S{1,256}@"), r"\1[redacted]@"),
+    (re.compile(r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}(?:\.[A-Za-z0-9_-]*)?"), "[redacted]"),
+)
 DROP = ("gh: refused: this body would drop the Intent or the Done-when of the issue; change one line with `fleet-switchboard issue-line`, "
         "or send the whole body with both parts")
 UNREAD = ("gh: refused: the current body of the issue could not be read, or is empty, so a body write cannot be checked: retry "
@@ -57,6 +67,18 @@ def refusal(current_body, new_body):
     if not isinstance(new_body, str) or not has_parts(new_body):
         return DROP
     return None
+
+
+def clean_stderr(text, env=None, limit=WHY_CHARS):
+    """The first `limit` characters of a read's stderr as ONE line: control characters removed, anything token-shaped (and any token the read ran with) redacted."""
+    text = "".join(c if c.isprintable() else " " for c in str(text or ""))   # a newline or a control character is a space: one line
+    for name in TOKEN_ENV_NAMES:
+        value = (env or {}).get(name)
+        if value and len(value) >= 4:
+            text = text.replace(value, "[redacted]")
+    for pattern, replacement in SECRET_PATTERNS:
+        text = pattern.sub(replacement, text)
+    return " ".join(text.split())[:limit]
 
 
 class Unclassified(Exception):
@@ -134,7 +156,8 @@ class Probe:
             env["GH_PAGER"] = "cat"
             done = subprocess.run([self.gh] + argv, capture_output=True, text=True, timeout=left, stdin=subprocess.DEVNULL, env=env)
             if done.returncode != 0:
-                self.why = "the read exited with status %d" % done.returncode
+                said = clean_stderr(done.stderr, env)
+                self.why = "the read exited with status %d%s" % (done.returncode, ": " + said if said else "")
                 return None
             data = json.loads(done.stdout) if done.stdout else None
         except subprocess.TimeoutExpired:

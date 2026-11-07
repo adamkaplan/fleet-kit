@@ -285,5 +285,89 @@ class TestGhBodyReadHasItsOwnClock(unittest.TestCase):
         self.assertIn("the command's read budget is spent", got[3])
 
 
+class TestGhBodyReadNamesItsStderr(unittest.TestCase):
+    """#2256 fix forward: a read that exits non-zero names the first part of its stderr (one line, redacted) in the refusal."""
+    BASE = "9728245b"   # the integration tip before this change: its refusal names the status only
+    FAKE_TOKEN = "ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2"
+    setUp, fake, check = TestGhBodyReadHasItsOwnClock.setUp, TestGhBodyReadHasItsOwnClock.fake, TestGhBodyReadHasItsOwnClock.check
+
+    def failing(self, module, said, env=None):
+        self.fake("printf '%s' " + json.dumps(said) + " >&2\nexit 1")
+        probe = module.Probe(self.gh, lambda: env, None)
+        return module.check_current(probe, ["issue", "view", "1", "--json", "body"], "no parts here\n")
+
+    def test_the_refusal_shows_the_stderr_of_the_read(self):
+        got = self.failing(load_module(), "HTTP 404: Not Found")
+        self.assertIn("(the read exited with status 1: HTTP 404: Not Found)", got)
+
+    def test_a_silent_read_keeps_the_old_wording(self):
+        self.fake("exit 1")
+        got = self.check(load_module())
+        self.assertIn("(the read exited with status 1)", got)
+
+    def test_a_token_in_the_stderr_is_redacted(self):
+        env = {"GH_TOKEN": "plainsecretvalue99"}
+        for said in ("bad %s here" % self.FAKE_TOKEN, "Authorization: Bearer abcdef123456", "token=abc123xyz", "failed with plainsecretvalue99 ok",
+                     "https://user:hunter2pass@example.com/x"):
+            with self.subTest(said=said):
+                got = self.failing(load_module(), said, env)
+                for secret in (self.FAKE_TOKEN, "abcdef123456", "abc123xyz", "plainsecretvalue99", "hunter2pass"):
+                    self.assertNotIn(secret, got)
+                self.assertIn("[redacted]", got)
+
+    def test_the_text_is_one_line_cut_to_the_limit_without_control_characters(self):
+        module = load_module()
+        self.fake("printf 'a\\033[31mb\\nsecond line\\r\\n' >&2\nhead -c 500 /dev/zero | tr '\\000' x >&2\nexit 1")
+        got = self.check(module)
+        self.assertNotIn("\n", got)
+        self.assertNotIn("\x1b", got)
+        shown = got.split("status 1: ", 1)[1].split("), so a body write", 1)[0]
+        self.assertEqual(len(shown), module.WHY_CHARS)
+        self.assertTrue(shown.startswith("a [31mb second line"))
+
+    def test_control_today_s_code_shows_no_stderr(self):
+        source = subprocess.run(["git", "show", self.BASE + ":shims/gh_body.py"], cwd=str(REPO), capture_output=True, text=True, check=True).stdout
+        path = pathlib.Path(self.dir.name) / "old_gh_body.py"
+        path.write_text(source)
+        got = self.failing(load_module(path), "HTTP 404: Not Found")
+        self.assertIn("(the read exited with status 1)", got)
+        self.assertNotIn("404", got)
+
+    def shim(self):
+        import importlib.machinery
+        loader = importlib.machinery.SourceFileLoader("gh_shim_under_test", str(SHIM_DIR / "gh"))
+        spec = importlib.util.spec_from_loader("gh_shim_under_test", loader)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def test_the_read_is_strict_like_the_write_and_retries_a_failed_lookup_once(self):
+        shim = self.shim()
+        calls = []
+
+        def account_env(gh, lookup, strict=False, **kwargs):
+            calls.append(strict)
+            if len(calls) == 1:
+                raise shim.AccountLookupFailed("identity")
+            return {"GH_TOKEN": "x"}
+        with unittest.mock.patch.object(shim, "account_env", account_env):
+            env_of = shim.body_read_env("gh", shim.Lookup(write=True), ["issue", "edit", "1"], True)
+            self.assertEqual(env_of(), {"GH_TOKEN": "x"})
+            self.assertEqual(env_of(), {"GH_TOKEN": "x"})   # worked out once
+        self.assertEqual(calls, [True, True])
+
+    def test_a_lookup_that_keeps_failing_is_said_in_the_refusal_not_read_with_the_stored_login(self):
+        shim = self.shim()
+        module = load_module()
+        self.fake("exit 0")
+
+        def account_env(gh, lookup, strict=False, **kwargs):
+            raise shim.AccountLookupFailed("identity")
+        with unittest.mock.patch.object(shim, "account_env", account_env):
+            probe = module.Probe(self.gh, shim.body_read_env(self.gh, shim.Lookup(write=True), [], True), None)
+            got = module.check_current(probe, ["issue", "view", "1", "--json", "body"], "x\n")
+        self.assertIn("AccountLookupFailed", got)
+
+
 if __name__ == "__main__":
     unittest.main()
