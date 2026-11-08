@@ -98,7 +98,7 @@ Bad: `pass: works`, `discriminates: a wrong build would fail this`, "add a `comm
 ## Wordings `plan check` accepts
 
 - every declared `DW`/`PC` is covered by a scenario;
-- `discriminates` names a concrete wrong build;
+- `discriminates` names a concrete wrong build (a stub that returns an empty list);
 - `pass` has an observable number or status (`exit status is 0`);
 - the declared clauses joined equal the ask's Done-when;
 - check a slice with `--ask <its own work item>`.
