@@ -71606,11 +71606,14 @@ class TestPullFileListRead(LedgerBase):
         module = types.ModuleType("impact_hold_mutant")
         exec(compile(source.replace(old, new), "impact_hold_mutant", "exec"), module.__dict__)
         saved = {name: sb.__dict__[name] for name in module.MOVED}
+        marks = {name: saved[name].__dict__.pop("_impact_hold_bound") for name in module.MOVED if "_impact_hold_bound" in saved[name].__dict__}   # #2287: the daemon's own functions name their namespace as bound; the mutant copy is a different module bound once, here, so the mark is lifted for this one bind and put back
         try:
             module.bind(sb.__dict__, sb.EFFECT_CHECK)   # the mutant copy is bound once, with the daemon's own check
             bound = {name: sb.__dict__[name] for name in module.MOVED}
         finally:
             sb.__dict__.update(saved)
+            for name, mark in marks.items():
+                saved[name].__dict__["_impact_hold_bound"] = mark
         return mock.patch.dict(sb.__dict__, bound)
 
     def producers(self):
