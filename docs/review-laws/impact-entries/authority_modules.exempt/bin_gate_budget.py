@@ -1,0 +1,2 @@
+bin/gate_budget.py
+shim_gate_seconds and default_budget_ms only read the gh shim limit on one gates-check (shims/gh GATE_SECONDS, moved by FLEET_SHIM_GATE_SECONDS) and return a time in milliseconds; "gate" in the names is the shim time limit, not a decision. Trace: the only caller is plan_ledger in bin/plan_ledger.py, which uses the number as the inner timeout budget of a gates-check; no role, tier, identity, verdict or clear is produced or read.
