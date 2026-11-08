@@ -157,7 +157,8 @@ def build(PR4Base):
             """a load alert is a member of the lane's wake message: `release` sends nothing for it and keeps it, and `collect_facts` hands it on as exactly one fact"""
             item = self.wake_class_reminder()
             self.world.tick(PASS)
-            self.assertEqual(self.world.engine.sources[[type(x) for x in self.world.engine.sources].index(sb.ReminderFacts)].release(self.world.engine.discover(self.world.clock.now()), self.world.clock.now()), [])
+            source, now = next(x for x in self.world.engine.sources if isinstance(x, sb.ReminderFacts)), self.world.clock.now()
+            self.assertEqual(source.release(self.world.engine.discover(now), now), [])
             self.assertEqual(self.deliveries(), [])
             self.assertEqual([r["id"] for r in sb.read_reminders(self.world.state)], [item["id"]])
             self.assertEqual([f.key for f in self.world.engine.collect_facts()[0]], ["reminder:" + item["id"]])
