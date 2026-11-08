@@ -9751,9 +9751,9 @@ class TestReminders(PR4Base):
         self.assertEqual([f.key for f in facts], ["reminder:" + old["id"]])
         self.assertEqual([e for e in self.world.audit() if e["event"] == "reminder.drop_superseded"], [])
 
-    def test_older_is_delivered_when_newer_verdict_is_unresolved(self):
-        old, new, facts = self._gated_newer(None)
-        self.assertEqual([f.key for f in facts], ["reminder:" + old["id"]])
+    def test_older_is_dropped_when_newer_verdict_is_unresolved_because_the_newer_is_delivered(self):
+        old, new, facts = self._gated_newer(None)   # #2243 (#2292): a condition that cannot be read at the due time does not hold the reminder, so the newer is delivered
+        self.assertEqual([f.key for f in facts], ["reminder:" + new["id"]])
 
     def test_older_is_dropped_when_newer_will_be_delivered(self):
         old, new, facts = self._gated_newer("deliver")

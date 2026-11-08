@@ -711,8 +711,8 @@ class ReminderFacts:
                                              {"id": item["id"], "due": iso(item["at"]), "ttl": int(ttl)})
                 continue
             kept = self.superseded(item, everything)
-            if kept is not None and kept.get("condition") and self.verdict(kept) != "deliver":
-                kept = None   # the newer one is gated or unresolved: it may not be delivered, so deliver the older
+            if kept is not None and kept.get("condition") and self.verdict(kept) not in ("deliver", None):
+                kept = None   # the newer one is gated by a met condition: it will not be delivered, so deliver the older (#2243: an unreadable condition delivers, so the newer replaces the older)
             if kept is not None:
                 if drop_superseded_item(self.state_dir, item["id"], kept["id"]) and self.engine is not None and self.engine.audit is not None:
                     self.engine.audit.append(self.engine.actor, "reminder.drop_superseded", item["to"],
