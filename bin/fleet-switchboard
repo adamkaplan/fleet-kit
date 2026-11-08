@@ -10636,7 +10636,7 @@ class GitHubHub:
                     if not wakes:
                         continue
                     if note:
-                        fact.summary += "\n(%s)" % note
+                        fact.summary += " (%s)" % note   # still one line
                     found.append(fact)
         return found
 
@@ -14562,6 +14562,16 @@ def _payload_issue(payload):
     return number, updated, created
 
 
+def _intent_edit_line(number, repo, login, changes):
+    """The Chief of Staff's notice of an Intent edit: ONE line, never the text of the sections (the link has it).
+    The editor's login and the repo are untrusted text: one line, clipped."""
+    who = _one_line(login, 40) if isinstance(login, str) and login.strip() else "github"
+    sections = ", ".join(label for label, _old, _new in changes)
+    where = "%s#%d" % (repo, number) if repo else "#%d" % number
+    link = ": https://github.com/%s/issues/%d" % (repo, number) if repo else ""
+    return _one_line("%s: Intent / Done when changed by %s (%s)%s" % (where, who, sections, link), 300)
+
+
 def intent_change_fact(payload, recipient="chief-of-staff"):
     """The Chief of Staff's item for an Intent edit, or None when the edit left
     the Intent section alone. Key `intent.edit:<issue>:<updated_at>`, so a
@@ -14573,7 +14583,7 @@ def intent_change_fact(payload, recipient="chief-of-staff"):
     login = (payload.get("sender") or {}).get("login")
     repo = (payload.get("repository") or {}).get("full_name")
     repo = repo if isinstance(repo, str) and REPO_RE.match(repo) else None
-    summary = "\n".join(["The Intent section of #%d was edited on GitHub:" % number] + _change_lines(changes))
+    summary = _intent_edit_line(number, repo, login, changes)
     # PR 15: the same number in two repos is two issues, so the key that stops a repeat names the repo
     key = "intent.edit:%s:%s" % ("%s#%d" % (repo, number) if repo else number, updated)
     return Fact(key, recipient, "intent.edit", summary, created, issue=number,

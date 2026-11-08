@@ -505,22 +505,21 @@ class TestIntentChange(unittest.TestCase):
 
     OLD = "## Intent\nAdd a health check\nDone when: GET /health returns 200\n"
 
-    def test_an_intent_edit_is_an_item_for_the_chief_of_staff_showing_old_and_new(self):
+    def test_an_intent_edit_is_a_one_line_item_for_the_chief_of_staff(self):
         new = "## Intent\nAdd a readiness check\nDone when: GET /health returns 200\n"
         change = sb.intent_change_fact(self.payload(self.OLD, new))
         self.assertEqual((change.key, change.recipient, change.issue, change.kind, change.sender),
                          ("intent.edit:7:2027-01-15T08:00:00Z", "chief-of-staff", 7, "intent.edit", "alice"))
-        self.assertEqual(change.summary.splitlines(), [
-            "The Intent section of #7 was edited on GitHub:", "Intent: Add a health check -> Add a readiness check"])
+        self.assertEqual(change.summary, "#7: Intent / Done when changed by alice (Intent)")   # no repo in this payload: no link
         self.assertEqual(change.created, datetime.datetime(2027, 1, 15, 8, 0, tzinfo=datetime.timezone.utc).timestamp())
 
-    def test_a_done_when_change_is_shown_too_and_a_missing_side_is_none(self):
+    def test_a_done_when_change_names_its_section_and_never_shows_the_text(self):
         new = "## Intent\nAdd a health check\n"
         summary = sb.intent_change_fact(self.payload(self.OLD, new), "cos").summary
-        self.assertIn("Done when: GET /health returns 200 -> (none)", summary)
-        self.assertNotIn("Intent: Add a health check ->", summary)
+        self.assertIn("(Done when)", summary)
+        self.assertNotIn("health", summary.replace("#7", ""))
         added = sb.intent_change_fact(self.payload("nothing here", self.OLD)).summary
-        self.assertIn("Intent: (none) -> Add a health check", added)
+        self.assertIn("(Intent, Done when)", added)
 
     def test_an_edit_that_leaves_the_intent_alone_is_nothing(self):
         new = self.OLD + "\n## Notes\nmore text\n"

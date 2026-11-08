@@ -8009,7 +8009,8 @@ class TestIntentEditWiring(Base):
         self.assertEqual(self.edit()[0], 202)
         (fact,) = self.intent_facts()
         self.assertEqual((fact.recipient, fact.issue, fact.sender), ("cos", 12, "you"))
-        self.assertIn("Done when: returns 200 -> returns 200 and JSON", fact.summary)
+        self.assertIn("Intent / Done when changed by you (Done when)", fact.summary)
+        self.assertNotIn("JSON", fact.summary)
 
     def test_it_also_asks_for_a_toast_through_the_one_toast_path(self):
         self.edit()
