@@ -80405,8 +80405,8 @@ NOT_ISOLATED_BY_BASE = {
     "TestStopFinalMessage", "TestStopFinalMessageBare", "TestStopFinalMessageEdges", "TestStopFinalMessageHardening", "TestStopFinalMessageTwoRuns",
     "TestEndNoticeHeadLine", "TestPodReportedLostOnlyWhenSilent",   # (#2247) each builds its own temp directory through its rig (StopWorld mkdtemp; Rig mkdtemp); the files came with #2267 and #2255
     "TestGithubWriteAudit", "TestGuardSetRun",   # (#2247) each makes its own temp directory (a mkdtemp; a TemporaryDirectory per test); the files came with #2263 and #2270
-    "TestEndNoticeOwnPushes", "TestRefusedLaunchIsToldToItsLane",   # (#2247) each makes its own temp directory (a tempfile.mkdtemp, with StopWorld or Rig) and reads no real state; the classes came with #2313 and #2303
-    "TestGhBodyReadNamesItsStderr", "TestGhBodyReadNamesTheRepositoryOfTheWrite",   # (#2247) each runs a fake gh in its own temporary directory (FakeGhMixin; BodyRig) and reads no real state; the classes came with #2256's fix forwards
+    "TestEndNoticeOwnPushes", "TestRefusedLaunchIsToldToItsLane",   # (#2247) each makes its own temp directory (a tempfile.mkdtemp, with StopWorld or Rig) and reads no real state; the classes came with #2313 and #2310
+    "TestGhBodyReadNamesItsStderr", "TestGhBodyReadNamesTheRepositoryOfTheWrite",   # (#2247) each runs a fake gh in its own temporary directory (FakeGhMixin; BodyRig) and reads no real state; the classes came with #2307 and #2309
     ),
 }
 
