@@ -74275,7 +74275,7 @@ class TestGhShimMergeGate(Base):
                 "FLEET_SWITCHBOARD_STATE": "/tmp/evil-fsb", "FLEET_SWITCHBOARD_BIN": "/tmp/evil-bin", "MADE_UP_VARIABLE": "1", "PATH": "/tmp/evil-path", "GH_TOKEN": "x"}
     DENY_LIST = '    env = {k: v for k, v in os.environ.items() if not k.startswith(("XDG_", "FLEET_SWITCHBOARD_"))}'
     ALLOW_LIST = '    env = {"PATH": ENV_PATH}\n    for name in ENV_ALLOW:\n        if name in os.environ:\n            env[name] = os.environ[name]'
-    TAIL = '    return env'
+    TAIL = '    return env\n'   # the whole line: '    return env_of' (the body guard's read, #2307) also starts with it
 
     def family_problems(self):
         """Which hostile families reach a switchboard through `sb_env`: the names, or the PATH when it is the caller's."""
