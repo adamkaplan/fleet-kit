@@ -9925,7 +9925,6 @@ class TestReminders(PR4Base):
         (message,) = self.world.admissions("platform")
         self.assertEqual(message["keys"], ["reminder:" + item["id"]])
         self.assertEqual(sb.read_reminders(self.world.state), [], "pruned in the pass that saw it delivered")
-        self.assertIn("reminder.prune", [e["event"] for e in self.world.audit()])
         self.world.tick(5)
         self.assertEqual(self.world.engine.run_pass()["sent"], [])
 
@@ -9946,7 +9945,7 @@ class TestReminders(PR4Base):
     def test_a_crash_between_delivery_and_pruning_sends_nothing_twice(self):
         item = self.remind(delay=10)
         self.world.tick(10)
-        with mock.patch.object(sb, "prune_delivered_reminders", side_effect=RuntimeError("killed")):
+        with mock.patch.object(sb, "remove_reminders", side_effect=RuntimeError("killed")):   # #2243 (#2292): the release removes what it delivered; a crash there leaves it in the store
             self.world.engine.run_pass()
         self.assertEqual(len(sb.read_reminders(self.world.state)), 1)
         self.world.engine = self.world.new_engine()
@@ -9958,8 +9957,10 @@ class TestReminders(PR4Base):
     def test_a_corrupt_file_is_reported_and_never_overwritten(self):
         path = self.world.state / sb.REMINDERS
         path.write_text("{not json")
-        self.assertEqual(self.world.engine.collect_facts()[1][0].split(":")[0], "reminder_facts")
-        self.assertIn("source.error", [e["event"] for e in self.world.audit()])
+        report = self.world.engine.run_pass()   # #2243 (#2292): the reminders are released by the pass, not read as a fact source
+        self.assertIn(("reminders", "release"), [(e["subject"], e["step"]) for e in report["errors"]])
+        self.assertTrue(all("ReminderError" in e["error"] for e in report["errors"]), report["errors"])
+        self.assertIn("error", [e["event"] for e in self.world.audit()])
         with self.assertRaises(sb.ReminderError):
             self.remind()
         self.assertEqual(path.read_text(), "{not json")
