@@ -7,10 +7,11 @@ from support.loader import sb
 from support.herdr_world import World
 from support.wire_fakes import FAKE_HERDR, FAKE_OPENCODE
 
-NOW = 1_800_000_000.0
+NOW = 1_800_000_000.0   # 2027-01-15
 REPO = "acme/widgets"
 WAITS = "This waits for the owner's review."
 WAITING_BODY = "waiting on the owner"
+REF = REPO + "#5"
 
 
 class Hub:
@@ -19,10 +20,18 @@ class Hub:
         self.pr, self.comment = pr, comment
 
     def read_pages(self, path, cap=1):
+        if "/comments" in path:
+            return self.comments(), False
         return ([self.pr] if "state=open" in path else []), False
 
+    def comments(self):
+        return [{"issue_url": "https://api.github.com/repos/%s/issues/5" % REPO, "created_at": "2027-01-15T07:00:00Z", "id": 1, "body": self.comment}] if self.comment else []
+
+    def _read_one(self, repo, path, now, fresh=False):
+        return self.pr
+
     def read_comments(self, who, repo, since, cap=1, budget=None):
-        return ([{"issue_url": "https://api.github.com/repos/%s/issues/5" % REPO, "created_at": "2099-01-01T00:00:00Z", "id": 1, "body": self.comment}] if self.comment else []), False
+        return self.comments(), False
 
 
 class TestSweepS2Automatic(Base):
@@ -33,40 +42,54 @@ class TestSweepS2Automatic(Base):
         self.engine = types.SimpleNamespace(state_dir=Path(self.world.state), now=lambda: NOW, config={}, hub=None,
                                             _note=lambda *a: None)
 
-    def s2(self, labels, body, comment):
+    def judge(self, labels, body, comment):
+        """(the sweep's finding set, whether the confirming read still says S2) for one PR, through the real read and finding code."""
         cfg = dict(sb.SWEEP_DEFAULTS)
         regex = sb.sweep_phrase_re(cfg["person_names"])
         pr = {"number": 5, "pull_request": {"url": "u"}, "labels": [{"name": n} for n in labels], "body": body, "user": {"login": "cloud-pod"},
-              "created_at": "2020-01-01T00:00:00Z", "updated_at": "2020-01-01T00:00:00Z"}
+              "state": "open", "created_at": "2027-01-01T00:00:00Z", "updated_at": "2027-01-01T00:00:00Z"}
+        hub = Hub(pr, comment)
+        self.engine.hub = hub
         state = types.SimpleNamespace(repos={}, sources={}, unattributed=0, strong=sb.sweep_strong_re(cfg["person_names"]))
-        state.repos[REPO] = sb.sweep_read_repo(Hub(pr, comment), REPO, NOW, 7, regex, [50], state.strong)
-        found = sb.sweep_findings(self.engine, state, [], REPO, NOW, cfg, regex)
-        return [f for f in found if f[0] == "S2"], [f for f in found if f[0] == "S6b"]
+        state.repos[REPO] = sb.sweep_read_repo(hub, REPO, NOW, 7, regex, [50], state.strong)
+        found = set(sb.sweep_findings(self.engine, state, [], REPO, NOW, cfg, regex))
+        verify = sb.sweep_verify(self.engine, state, "S2", REF, NOW, cfg, regex, [50])
+        return found, verify
+
+    def assert_s2(self, labels, body, comment, want):
+        found, verify = self.judge(labels, body, comment)
+        self.assertEqual(("S2", REF) in found, want, "the finding")
+        if want:
+            self.assertTrue(verify, "the confirming read agrees")
+        else:
+            self.assertFalse(verify, "the confirming read agrees")
 
     def test_a_needs_captain_review_label_with_an_automatic_line_is_not_held_for_the_person(self):
-        s2, _ = self.s2(["needs:captain"], "MERGE: automatic\n\nPlan: n/a", WAITS)
-        self.assertEqual(s2, [])
-        s2, _ = self.s2(["needs:captain"], "\n  MERGE: automatic\nbody", None)
-        self.assertEqual(s2, [])
+        self.assert_s2(["needs:captain"], "MERGE: automatic\n\nPlan: n/a", WAITS, False)
 
-    def test_a_captain_line_with_waiting_text_is_still_s2(self):
-        with mock.patch.object(sb, "CAPTAIN_MARKER_UNTIL", None):   # the line is no longer read as a hold: the real clock must not decide the test
-            s2, _ = self.s2([], "MERGE: captain\n\n" + WAITING_BODY, WAITS)
-        self.assertEqual(len(s2), 1)
-        s2, _ = self.s2(["needs:captain"], "MERGE: automatic\n" + WAITING_BODY, None)
-        self.assertEqual(s2, [])
-        s2, _ = self.s2(["needs:captain"], "Some text\nMERGE: automatic\n", WAITS)   # not the FIRST line: no automatic marker
-        self.assertEqual(len(s2), 1)
+    def test_an_automatic_line_after_a_blank_line_and_indented_still_counts(self):
+        self.assert_s2(["needs:captain"], "\n  MERGE: automatic\n" + WAITING_BODY, None, False)
+
+    def test_the_review_label_is_never_read_as_a_hold_for_a_pr_without_the_line(self):
+        self.assert_s2(["needs:captain"], "A change.\n" + WAITING_BODY, None, True)
+
+    def test_a_captain_line_with_waiting_text_and_no_label_is_s2_once_the_line_is_not_read(self):
+        with mock.patch.object(sb, "CAPTAIN_MARKER_UNTIL", None):   # the real clock must not decide the test
+            self.assert_s2([], "MERGE: captain\n\n" + WAITING_BODY, WAITS, True)
+
+    def test_an_automatic_line_that_is_not_the_first_line_is_not_exempt(self):
+        self.assert_s2(["needs:captain"], "Some text\nMERGE: automatic\n", WAITS, True)
 
     def test_no_markers_and_text_that_waits_is_s2(self):
-        s2, _ = self.s2([], "A change.\n" + WAITING_BODY, None)
-        self.assertEqual(len(s2), 1)
-        s2, _ = self.s2([], "A change.", WAITS)
-        self.assertEqual(len(s2), 1)
+        self.assert_s2([], "A change.\n" + WAITING_BODY, None, True)
+        self.assert_s2([], "A change.", WAITS, True)
 
     def test_an_automatic_line_beside_an_owner_hold_label_is_not_exempt(self):
-        s2, s6b = self.s2(["fleet:merge-captain"], "MERGE: automatic\n" + WAITING_BODY, WAITS)
-        self.assertEqual(s2, [])   # captain: S2 never applies
-        self.assertEqual(len(s6b), 1)   # the disagreement is S6b as before
-        s2, _ = self.s2(["fleet:hold-security"], "MERGE: automatic\n" + WAITING_BODY, None)
-        self.assertEqual(len(s2), 1)
+        for label in ("fleet:hold-security", "fleet:hold-owner", "x:hold-policy"):
+            with self.subTest(label=label):
+                self.assert_s2([label], "MERGE: automatic\n" + WAITING_BODY, None, True)
+
+    def test_the_merge_captain_label_with_an_automatic_line_keeps_s6b_and_raises_no_s2(self):
+        found, _ = self.judge(["fleet:merge-captain"], "MERGE: automatic\n" + WAITING_BODY, WAITS)
+        self.assertNotIn(("S2", REF), found)
+        self.assertIn(("S6b", REF), found)
