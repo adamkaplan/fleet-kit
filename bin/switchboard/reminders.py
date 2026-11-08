@@ -681,6 +681,8 @@ class ReminderFacts:
         engine, outcomes = self.engine, []
         by_recipient = {}
         for fact in self():
+            if getattr(fact, "wake_class", None):
+                continue   # a load alert is a member of its lane's ONE wake message (merge_wake_facts): the wake path delivers it, `prune_delivered_reminders` forgets it
             by_recipient.setdefault(fact.recipient, []).append(fact)
         for recipient in sorted(by_recipient):
             if recipient not in discovery.agents:
