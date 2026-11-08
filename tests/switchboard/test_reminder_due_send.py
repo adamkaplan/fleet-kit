@@ -2,6 +2,8 @@
 Reproduces two cases of a real fleet (6 November 2026, 18:20Z): (a) a due reminder logged 'invariant broken: a due reminder of a lane neither held
 nor cancelled is not a pending fact' and was not delivered; (b) a due reminder of a lane whose status reads working got `reminder.ceiling`
 'queued wake' lines and no delivery for 28 minutes."""
+from unittest import mock
+
 from support.loader import sb
 from support.wire_fakes import FAKE_HERDR, FAKE_OPENCODE
 
@@ -146,4 +148,47 @@ def build(PR4Base):
             self.assertEqual(self.delivered_pass(2, new["id"]), 1)
             self.assertEqual(len(self.deliveries()), 1)
             self.assertEqual(sb.read_reminders(self.world.state), [])
+
+        def wake_class_reminder(self):
+            now = self.world.clock.now()
+            return sb.add_repeat_reminder(self.world.state, "w-lane", now, now, "Load alert: orch is overloaded", "load-alert", "orch", "2|stalled", wake_class=sb.WAKE_LOAD)
+
+        def test_release_leaves_a_wake_class_reminder_for_its_lane_s_one_wake_message(self):
+            """a load alert is a member of the lane's wake message: `release` sends nothing for it and keeps it, and `collect_facts` hands it on as exactly one fact"""
+            item = self.wake_class_reminder()
+            self.world.tick(PASS)
+            self.assertEqual(self.world.engine.sources[[type(x) for x in self.world.engine.sources].index(sb.ReminderFacts)].release(self.world.engine.discover(self.world.clock.now()), self.world.clock.now()), [])
+            self.assertEqual(self.deliveries(), [])
+            self.assertEqual([r["id"] for r in sb.read_reminders(self.world.state)], [item["id"]])
+            self.assertEqual([f.key for f in self.world.engine.collect_facts()[0]], ["reminder:" + item["id"]])
+
+        def test_a_wake_class_reminder_is_delivered_once_then_pruned_with_an_audit_line(self):
+            item = self.wake_class_reminder()
+            self.world.tick(PASS)
+            self.world.engine.run_pass()
+            self.assertEqual(len(self.deliveries()), 1)
+            self.assertEqual(sb.read_reminders(self.world.state), [], "forgotten by the end of the pass that saw its key delivered")
+            self.assertEqual([e["detail"]["ids"] for e in self.audit_events("reminder.prune")], [[item["id"]]])
+            self.world.tick(PASS)
+            self.world.engine.run_pass()
+            self.assertEqual(len(self.deliveries()), 1)
+
+        def test_a_non_wake_reminder_is_no_pending_fact_and_a_crash_in_its_removal_is_reported_and_sends_nothing_twice(self):
+            """the removal that follows the send fails once: the error names the release step, the reminder stays, the next pass sends nothing again and the store is emptied"""
+            sb.add_reminder(self.world.state, "w-lane", self.world.clock.now(), self.world.clock.now() - 60, "roll the build")
+            self.assertEqual(self.world.engine.collect_facts()[0], [])
+            real, calls = sb.remove_reminders, []
+            def once(*a, **k):
+                calls.append(1)
+                if len(calls) == 1:
+                    raise RuntimeError("killed")
+                return real(*a, **k)
+            self.world.tick(PASS)
+            with mock.patch.object(sb, "remove_reminders", once):
+                report = self.world.engine.run_pass()
+            self.assertIn(("reminders", "release"), [(e["subject"], e["step"]) for e in report["errors"]])
+            self.assertEqual(len(self.deliveries()), 1)
+            self.world.tick(PASS)
+            self.assertEqual(self.world.engine.run_pass()["sent"], [])
+            self.assertEqual((len(self.deliveries()), sb.read_reminders(self.world.state)), (1, []))
     return TestReminderDueSend
