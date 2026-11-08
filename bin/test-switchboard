@@ -8005,7 +8005,7 @@ class TestIntentEditWiring(Base):
     def intent_facts(self):
         return [f for f in self.hub.facts() if f.kind == "intent.edit"]
 
-    def test_an_intent_edit_is_an_old_to_new_item_for_the_chief_of_staff(self):
+    def test_an_intent_edit_is_a_one_line_item_for_the_chief_of_staff(self):
         self.assertEqual(self.edit()[0], 202)
         (fact,) = self.intent_facts()
         self.assertEqual((fact.recipient, fact.issue, fact.sender), ("cos", 12, "you"))
@@ -8107,6 +8107,7 @@ class TestIntentEditFilter(TestIntentEditWiring):
         self.edit_issue(12)
         (fact,) = self.intent_facts()
         self.assertIn("chain unreadable: woken to be safe", fact.summary)
+        self.assertEqual(len(fact.summary.splitlines()), 1)
         self.hub._resolve = orig
 
     def test_the_owner_logins_are_validated_like_the_ignored_authors(self):

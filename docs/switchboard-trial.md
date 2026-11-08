@@ -93,7 +93,7 @@ Each of these is something the stack claims; watch whether it holds.
    message under that ask, within seconds. A repeat of the same comment is not
    delivered twice.
 3. **An Intent edit is surfaced.** Edit the ask's `## Intent` line on GitHub.
-   `cos` gets a message showing old and new, and herdr shows a toast.
+   `cos` gets a one-line message naming who changed it and which sections, with the issue link (the text is at the link), and herdr shows a toast with old and new.
 4. **A worker finishes while you talk to someone else.** Have `platform`
    launch a `coder` (`fleet-switchboard launch`). The coder should end with
    `fleet-switchboard report done "<one line>"`; `platform` then gets a note,
