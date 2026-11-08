@@ -8106,8 +8106,7 @@ class TestIntentEditFilter(TestIntentEditWiring):
         self.hub._resolve = broken
         self.edit_issue(12)
         (fact,) = self.intent_facts()
-        self.assertIn("chain unreadable: woken to be safe", fact.summary)
-        self.assertEqual(len(fact.summary.splitlines()), 1)
+        self.assertTrue(fact.summary.endswith("(chain unreadable: woken to be safe)") and "\n" not in fact.summary)
         self.hub._resolve = orig
 
     def test_the_owner_logins_are_validated_like_the_ignored_authors(self):
