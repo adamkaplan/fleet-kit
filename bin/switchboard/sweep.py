@@ -155,6 +155,12 @@ SWEEP_NEGATION_RE = re.compile(r"\b(?:not|no longer|never|isn't|aren't|wasn't|do
 SWEEP_QUOTED_RE = re.compile(r"(?s:```.*?```)|`[^`\n]*`|^[ \t]*>.*$", re.M)
 
 
+def sweep_automatic_pr(labels, marker):
+    """True for an explicitly automatic PR (first body line `MERGE: automatic`) with no owner-hold marker (the `merge-captain` or a `hold-*` label).
+    Such a PR is never "held for the person" (S2): a lane's own review label (`needs:captain`) is not an owner hold."""
+    return marker == "automatic" and not _label_kind(labels, CAPTAIN_MERGE_LABELS[:1] + CAPTAIN_HOLD_LABELS)
+
+
 def sweep_says_waiting(regex, text):
     """True when the text, outside code blocks, inline code and quoted lines, says an item waits on the person and does
     not negate it ("not waiting on the owner", "no longer needs the owner"). Quoted text is somebody else's sentence."""
@@ -674,7 +680,7 @@ def sweep_findings(engine, state, decisions, home, now, cfg, regex, defer=(), de
                         found.add(("S1a", ref_text(repo, number)))
                 elif labelled and not item["section"]:
                     found.add(("S1b", ref_text(repo, number)))
-            elif not item["captain"] and (item["body_waits"] or any(item["comments"][-SWEEP_PR_COMMENTS:])):
+            elif not item["captain"] and not sweep_automatic_pr(item["labels"], item["marker"]) and (item["body_waits"] or any(item["comments"][-SWEEP_PR_COMMENTS:])):
                 found.add(("S2", ref_text(repo, number)))
                 s2.add((repo, number))
                 waiting = [i for i, w in enumerate(item["comments"][-SWEEP_PR_COMMENTS:]) if w]
@@ -871,7 +877,7 @@ def sweep_verify(engine, state, kind, ref, now, cfg, regex, budget):
         else:
             waits_in_comments = any(sweep_says_waiting(regex, c.get("body")) for c in recent[-SWEEP_PR_COMMENTS:])
     if kind == "S2":
-        return is_pr and not is_captain({"labels": names, "body": body}) and (sweep_says_waiting(regex, body) or waits_in_comments)
+        return is_pr and not is_captain({"labels": names, "body": body}) and not sweep_automatic_pr(names, pr_marker(body)) and (sweep_says_waiting(regex, body) or waits_in_comments)
     if kind == "S3":
         if awaiting_label(engine.config) in names:
             return False  # it carries the person's label: a human-tier decision, whatever the list copy said
