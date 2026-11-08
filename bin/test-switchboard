@@ -74272,7 +74272,7 @@ class TestGhShimMergeGate(Base):
 
     FAMILIES = {"PYTHONPATH": "/tmp/evil-py", "PYTHONHOME": "/tmp/evil-home", "PYTHONUSERBASE": "/tmp/evil-user", "PYTHONSTARTUP": "/tmp/evil-start", "LD_PRELOAD": "/tmp/evil.so",
                 "LD_LIBRARY_PATH": "/tmp/evil-lib", "DYLD_INSERT_LIBRARIES": "/tmp/evil.dylib", "DYLD_LIBRARY_PATH": "/tmp/evil-dy", "XDG_STATE_HOME": "/tmp/evil-state",
-                "FLEET_SWITCHBOARD_STATE": "/tmp/evil-fsb", "FLEET_SWITCHBOARD_BIN": "/tmp/evil-bin", "MADE_UP_VARIABLE": "1", "PATH": "/tmp/evil-path", "GH_TOKEN": "x"}
+                "FLEET_SWITCHBOARD_STATE": "/tmp/evil-fsb", "FLEET_SWITCHBOARD_BIN": "/tmp/evil-bin", "MADE_UP_VARIABLE": "1", "FLEET_SHIM_GATE_SECONDS": "0.2", "PATH": "/tmp/evil-path", "GH_TOKEN": "x"}
     DENY_LIST = '    env = {k: v for k, v in os.environ.items() if not k.startswith(("XDG_", "FLEET_SWITCHBOARD_"))}'
     ALLOW_LIST = '    env = {"PATH": ENV_PATH}\n    for name in ENV_ALLOW:\n        if name in os.environ:\n            env[name] = os.environ[name]'
     TAIL = '    return env\n'   # the whole line: '    return env_of' (the body guard's read, #2307) also starts with it

@@ -51,12 +51,16 @@ class TestImpactEntriesLoader(unittest.TestCase):
             self.assertEqual(len(now), len(set(now)), "a duplicate root in %s" % part)
             after["owner_hold"]["delegated_clear"]["module_roots"][part] = roots
         roots_after = after["owner_hold"]["delegated_clear"]["module_roots"]
+        new_parts_seen = []
         for part in sorted(set(roots_after) - set(before["owner_hold"]["delegated_clear"]["module_roots"])):   # a new module of the closure (e.g. #2274 merge_ready) adds a part, never replaces one
             self.assertIn(part, after["owner_hold"]["delegated_clear"]["closure_files"], "a new closure part %s is also a closure file" % part)
+            new_parts_seen.append(part)
             del roots_after[part]
         files_was, files_now = before["owner_hold"]["delegated_clear"]["closure_files"], after["owner_hold"]["delegated_clear"]["closure_files"]
         self.assertEqual(sorted(set(files_was) - set(files_now)), [], "a closure file was dropped")
         self.assertEqual(len(files_now), len(set(files_now)), "a duplicate closure file")
+        new_parts = sorted(set(files_now) - set(files_was))
+        self.assertEqual(new_parts, sorted(new_parts_seen), "a closure file added with no closure part of its own")
         after["owner_hold"]["delegated_clear"]["closure_files"] = files_was
         for keys in self.MOVED:   # blank the moved lists, the rest must be identical
             for tree in (before, after):

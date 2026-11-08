@@ -21,6 +21,9 @@ def budget(repo="acme/app", **env):
 
 class TestGateBudget(unittest.TestCase):
     def setUp(self):
+        patch = mock.patch.dict(os.environ)   # restored at cleanup: the pop below must not leak into other tests
+        patch.start()
+        self.addCleanup(patch.stop)
         os.environ.pop("FLEET_SHIM_GATE_SECONDS", None)
 
     def test_default_sits_between_the_old_budget_and_the_shim_limit(self):
