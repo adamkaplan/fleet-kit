@@ -184,6 +184,8 @@ class PodSessionStub:
         return {"id": "ses1"}
     def prompt(self, *a, **k):
         pass
+    def model_list(self):   # the rows _model_served reads: the launch default (github-copilot/claude-sonnet-5.5#medium) is served
+        return [{"providerID": "github-copilot", "id": "claude-sonnet-5.5", "variants": [{"id": "low"}, {"id": "medium"}, {"id": "high"}]}]
 
 
 def drive_launch(module, state):
