@@ -9752,8 +9752,8 @@ class TestReminders(PR4Base):
         self.assertEqual([e for e in self.world.audit() if e["event"] == "reminder.drop_superseded"], [])
 
     def test_older_is_dropped_when_newer_verdict_is_unresolved_because_the_newer_is_delivered(self):
-        old, new, facts = self._gated_newer(None)   # #2243 (#2292): a condition that cannot be read at the due time does not hold the reminder, so the newer is delivered
-        self.assertEqual([f.key for f in facts], ["reminder:" + new["id"]])
+        old, new, facts = self._gated_newer(None)
+        self.assertEqual([f.key for f in facts], ["reminder:" + new["id"]], "#2243 (#2292): an unreadable condition delivers, so the newer replaces the older")
 
     def test_older_is_dropped_when_newer_will_be_delivered(self):
         old, new, facts = self._gated_newer("deliver")
@@ -9920,8 +9920,7 @@ class TestReminders(PR4Base):
     def test_a_due_reminder_is_delivered_then_pruned_once_it_is_in_the_transcript(self):
         item = self.remind(delay=10)
         self.world.tick(10)
-        report = self.world.engine.run_pass()
-        self.assertEqual(len(report["sent"]), 1)
+        self.assertEqual(len(self.world.engine.run_pass()["sent"]), 1)
         (message,) = self.world.admissions("platform")
         self.assertEqual(message["keys"], ["reminder:" + item["id"]])
         self.assertEqual(sb.read_reminders(self.world.state), [], "pruned in the pass that saw it delivered")
@@ -9959,8 +9958,7 @@ class TestReminders(PR4Base):
         path.write_text("{not json")
         report = self.world.engine.run_pass()   # #2243 (#2292): the reminders are released by the pass, not read as a fact source
         self.assertIn(("reminders", "release"), [(e["subject"], e["step"]) for e in report["errors"]])
-        self.assertTrue(all("ReminderError" in e["error"] for e in report["errors"]), report["errors"])
-        self.assertIn("error", [e["event"] for e in self.world.audit()])
+        self.assertTrue(all("ReminderError" in e["error"] for e in report["errors"]) and "error" in [e["event"] for e in self.world.audit()], report["errors"])
         with self.assertRaises(sb.ReminderError):
             self.remind()
         self.assertEqual(path.read_text(), "{not json")
@@ -71612,8 +71610,7 @@ class TestPullFileListRead(LedgerBase):
             bound = {name: sb.__dict__[name] for name in module.MOVED}
         finally:
             sb.__dict__.update(saved)
-            for name, mark in marks.items():
-                saved[name].__dict__["_impact_hold_bound"] = mark
+            [saved[name].__dict__.__setitem__("_impact_hold_bound", mark) for name, mark in marks.items()]
         return mock.patch.dict(sb.__dict__, bound)
 
     def producers(self):
