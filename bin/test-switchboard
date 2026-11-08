@@ -9917,7 +9917,7 @@ class TestReminders(PR4Base):
         self.assertEqual(len(sb.merge_reminder_copies(self.reminder_facts())), 4)
         self.assertEqual(len(other), 2)
 
-    def test_a_due_reminder_is_delivered_then_pruned_once_it_is_in_the_transcript(self):
+    def test_a_due_reminder_is_delivered_and_leaves_the_store_in_the_pass_and_is_sent_once(self):
         item = self.remind(delay=10)
         self.world.tick(10)
         self.assertEqual(len(self.world.engine.run_pass()["sent"]), 1)
@@ -71610,7 +71610,7 @@ class TestPullFileListRead(LedgerBase):
             bound = {name: sb.__dict__[name] for name in module.MOVED}
         finally:
             sb.__dict__.update(saved)
-            [saved[name].__dict__.__setitem__("_impact_hold_bound", mark) for name, mark in marks.items()]
+            for name, mark in marks.items(): saved[name].__dict__["_impact_hold_bound"] = mark
         return mock.patch.dict(sb.__dict__, bound)
 
     def producers(self):

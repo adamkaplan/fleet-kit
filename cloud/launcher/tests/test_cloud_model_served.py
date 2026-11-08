@@ -157,7 +157,7 @@ class TestServed(Launch):
         print("S4: sessions created with the model %d, model-list reads served %d, model-list reads with the default %d, exit 0 for both %d" % (
             len([b for b in sessions if (b or {}).get("model", {}).get("id") == "model-01" and b["model"].get("variant") == "medium"]),
             served, without, code1 == 0 and code2 == 0))
-        print("U2: extra pod calls without a model %d, with a served model %d, pod text outside the pattern in the line 0" % (extra + without, served))
+        print("U2: pod model-list calls of a launch with the default %d, with a served model %d, pod text outside the pattern in the line 0" % (extra, served))
         self.assertEqual(code2, 0, err2)
         self.assertEqual((served, without), (1, 1), "one read for a served model, one for the default: never more")
         sessions2 = [b for m, p, b in self.remote.bodies if m == "POST" and p == "/api/session"]
