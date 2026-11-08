@@ -17,7 +17,7 @@ Staff; an epic or workspace plan, the Chief of Staff, then the owner.
 
 ## One plan comment
 
-A plan is one canonical comment, edited in place; every revision adds a new short receipt comment (what changed and why, two to four lines, with the new plan hash); a plan is never reposted as a second plan comment.
+A plan is one canonical comment, edited in place; every revision adds a new short receipt comment (what changed and why, two to four lines, new plan hash); a plan is never reposted as a second plan comment.
 
 ## The method, in order
 
@@ -57,8 +57,7 @@ detail) plus **one detail comment** whose first line is a heading containing `Pl
 
 ## Challenge it
 
-A `plan review` command launches read-only reviewers and records their verdicts (not built yet: ask the Chief of Staff for a hand-run review). The tier is computed from the ask or epic the plan serves, not
-chosen per item. Up to three rounds; a standing objection then goes to the Chief of Staff, then the owner.
+A `plan review` command launches read-only reviewers and records their verdicts (not built yet: ask the Chief of Staff). The tier is computed from the ask or epic, not the item. Up to three rounds; a standing objection then goes to the Chief of Staff, then the owner.
 
 ## What the reviewers attack
 
