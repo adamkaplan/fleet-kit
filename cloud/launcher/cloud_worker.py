@@ -1192,6 +1192,9 @@ PREFLIGHT_ENV_NAMES = (
     "CW_APP_KEY_CMD",
     "CW_TOKEN_SERVICE_URL",   # the service route of the mint (app_token.py): with these two the child reaches the service, not the vault
     "CW_TOKEN_SERVICE_CALLER_TOKEN_CMD",
+    "CW_CLOUD_SERVER",        # the service route pins its URL to these (host, namespace) and verifies TLS with the CA file; no secret in any of them
+    "CW_CLOUD_NAMESPACE",
+    "CW_CLOUD_CA_FILE",
 )
 # Never taken from the caller: PATH (a fixed one is built here), HOME and TMPDIR (a private empty directory), PYTHON* (the child runs `python -I`),
 # AZURE_CONFIG_DIR (kept only when an absolute existing directory, else the account's ~/.azure), CW_OPENSSL (kept only when it is an absolute executable file).

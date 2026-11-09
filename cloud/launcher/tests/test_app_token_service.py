@@ -317,5 +317,18 @@ class ClientBranch(unittest.TestCase):
         print("S11 mutants: %d of %d undone copies fail with their own text, %d controls pass, the no-op fails the computation" % (len(cases), len(cases), len(cases)))
 
 
+class PreflightEnv(unittest.TestCase):
+    def test_the_preflight_child_gets_what_the_service_route_needs(self):
+        sys.path.insert(0, LAUNCHER)
+        import cloud_worker
+        env = {"CW_TOKEN_SERVICE_URL": "https://s.example/api/v1/namespaces/cw/services/token-mint:8080/proxy/mint", "CW_CLOUD_SERVER": "https://s.example",
+               "CW_CLOUD_NAMESPACE": "cw", "CW_CLOUD_CA_FILE": "/etc/ca.pem", "CW_CLUSTER_TOKEN_CMD": "echo x"}
+        got = cloud_worker._preflight_env(env, "/tmp")
+        for k in ("CW_TOKEN_SERVICE_URL", "CW_CLOUD_SERVER", "CW_CLOUD_NAMESPACE", "CW_CLOUD_CA_FILE"):
+            self.assertEqual(got.get(k), env[k], k)
+        self.assertNotIn("CW_CLUSTER_TOKEN_CMD", got)
+        print("preflight: 4 of 4 service-route names reach the child, the cluster-login command does not")
+
+
 if __name__ == "__main__":
     unittest.main()

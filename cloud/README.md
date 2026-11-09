@@ -603,9 +603,10 @@ API's service proxy; the service reviews the caller's token and serves the opera
 launcher's allowed list and one role, and answers with GitHub's own token, repositories, permissions and expiry.
 
 - The setting `CW_TOKEN_SERVICE_URL` (`https://<server>/api/v1/namespaces/cw/services/token-mint:8080/proxy/mint`) makes `app_token.py` ask
-  the service; the answer gets the same checks as the signing route. With it unset the signing route runs as before: that is the rollback.
+  the service; the answer gets the signing route's checks on token characters, repository, expiry and permissions (not the installation owner id, which only the signer can compare). With it unset the signing route runs as before: that is the rollback.
   `CW_TOKEN_SERVICE_CALLER_TOKEN_CMD` may name a command that prints the cluster token; unset, the launcher's own cluster login is used.
-  Preflight note: the child reaches the service only if `CW_TOKEN_SERVICE_CALLER_TOKEN_CMD` prints a cluster token that the launcher holds.
+  Preflight note: the repository preflight's child gets `CW_CLOUD_SERVER`, `CW_CLOUD_NAMESPACE` and `CW_CLOUD_CA_FILE` (no secrets) with the two service settings,
+  but not the launcher's cluster-login settings: it reaches the service only if `CW_TOKEN_SERVICE_CALLER_TOKEN_CMD` prints a cluster token that the launcher holds.
   The client sends the cluster token in `Authorization` and in `X-Caller-Token` (the API server removes `Authorization` of a proxied request;
   the service reads and reviews only `X-Caller-Token`), verifies TLS against `CW_CLOUD_CA_FILE` when it is set, and refuses a service URL that is
   not exactly the one above (the host of `CW_CLOUD_SERVER`, the namespace `CW_CLOUD_NAMESPACE`) before it sends the token.
