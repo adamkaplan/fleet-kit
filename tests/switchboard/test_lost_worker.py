@@ -1079,19 +1079,13 @@ class TestPodReportedLostOnlyWhenSilent(unittest.TestCase):
         self.assertEqual(late[0]["at"], NOW + 3000 - 60)
         self.assertEqual([x for x in r.passes(at=NOW + 3000 + 800) if x["kind"] == "pod_no_stop"], [])
 
-    def test_the_grace_is_ten_reaper_passes_on_both_sides(self):
-        mod = self.module()
-        self.assertEqual(mod.GRACE, 600)   # the approved plan value: ten 60 s reaper passes
-        self.assertEqual(mod.GRACE, 10 * mod.REAPER_PASS)
+    def check_grace_edges(self, mod):
         def notices(setup, at=NOW):
             r = Rig(mod)
             setup(r)
             return [x for x in r.passes(at=at) if x["kind"] == "pod_no_stop"]
         def deadline_at(back):
             return lambda r: r.created("bd", deadline=NOW - back)
-        self.assertEqual(notices(deadline_at(mod.GRACE)), [], "the grace itself still holds")
-        self.assertEqual(len(notices(deadline_at(mod.GRACE + 1))), 1)
-        self.assertEqual(notices(deadline_at(mod.GRACE // 2)), [], "inside the grace, with no activity")
         def acted(back, event=None):
             def setup(r):
                 r.created("ba", deadline=NOW - 3000)
@@ -1100,12 +1094,32 @@ class TestPodReportedLostOnlyWhenSilent(unittest.TestCase):
                 else:
                     line(r.launcher, ts=stamp(NOW - back), worker="ba", runtime_id="pod/ba", action="note", ok=True, reason="")
             return setup
+        mid = 300   # between three reaper passes and the plan's ten
+        self.assertEqual(notices(deadline_at(mid)), [], "G1 a deadline five minutes ago, no activity")
+        self.assertEqual(notices(deadline_at(mod.GRACE)), [], "G1 the grace itself still holds")
+        self.assertEqual(len(notices(deadline_at(mod.GRACE + 1))), 1, "G1 one second past the grace is lost")
         for event in (None, "push_watch.sent"):
-            self.assertEqual(notices(acted(mod.GRACE, event)), [], "activity exactly one grace ago still holds")
+            self.assertEqual(notices(acted(mid, event)), [], "G2 activity five minutes ago holds")
+            self.assertEqual(notices(acted(mod.GRACE, event)), [], "G2 activity exactly one grace ago holds")
             got = notices(acted(mod.GRACE + 1, event))
-            self.assertEqual(len(got), 1)
+            self.assertEqual(len(got), 1, "G2 activity one second past the grace is lost")
             self.assertEqual(got[0]["at"], NOW - mod.GRACE - 1, "the notice names the newest action or push")
-        self.assertEqual(len(notices(acted(-mod.GRACE * 100))), 1, "future-dated activity is no sign of life")
+        self.assertEqual(len(notices(acted(-mod.GRACE * 100))), 1, "G3 future-dated activity is no sign of life")
+
+    def test_the_grace_holds_on_both_sides_and_future_activity_is_no_sign(self):
+        self.check_grace_edges(self.module())
+
+    def test_the_edges_fail_on_today_s_rule_and_on_a_short_grace(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.check_grace_edges(self.module(mutant=True))
+        self.assertIn("G1", str(caught.exception))
+        src = (REPO / "bin" / "lost_worker.py").read_text()
+        short = src.replace("GRACE = 10 * REAPER_PASS", "GRACE = 3 * REAPER_PASS")
+        self.assertNotEqual(short, src)
+        mod = types.ModuleType("lost_worker_short")
+        exec(compile(short, "lost_worker_short", "exec"), mod.__dict__)
+        with self.assertRaises(AssertionError):
+            self.check_grace_edges(mod)
 
     def test_controls_today_s_rule_raises_the_false_notices(self):
         old = self.module(mutant=True)
