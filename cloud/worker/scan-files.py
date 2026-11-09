@@ -10,6 +10,9 @@ Prints "HIT\tpath: name" per file and pattern, never the matched value; a hit th
 file AND pattern, all three) is printed as "ALLOW\tpath: name" instead and is not a hit. The reported path is
 "/" + the path under --prefix. With SCAN_TRIPLES=1 each hit also prints "TRIPLE\t<path> <sha256> <pattern>" (no value). Exit 0 = no hit, 1 = hits, 2 = something could not
 be read (never a pass).
+With --dpkg <root> the files that are unmodified files of installed distro packages (in a /var/lib/dpkg/info .list AND with
+their md5 in the same package's .md5sums) are not reported; "SKIPPED\t<n>" is printed last. An unusable dpkg database
+means an empty skip set and a stderr line (fail closed).
 """
 import hashlib
 import os

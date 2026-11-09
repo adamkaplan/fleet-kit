@@ -6,6 +6,9 @@ Reads an image archive as a stream, one layer at a time, without extracting anyt
 gzip; zstd only where python can read it). EVERY regular file of EVERY layer is scanned (also a file a later layer
 deletes: the deletion is only a whiteout entry in the later layer), each layer once, plus the image configuration
 (environment, history) as bytes. Files are searched with scan-files.py's byte scanner (raw and NUL-stripped).
+Files that are UNMODIFIED files of installed distro packages (in a dpkg .list AND with their md5 in the same package's
+.md5sums, read from the MERGED view of the image's layers) are not scanned; the decision is made after the last layer. An
+unusable dpkg database means nothing is skipped (stderr says so). See cloud/README.md.
 Prints "layer <n> <digest>: <files> files, <MiB> MiB, <hits> hits" per layer, "layer <n>: /<path>: <pattern>" per hit
 (never a value) and a totals line. Exit 0 = every layer scanned, no hit; 1 = hits; 2 = a layer, member or the archive
 could not be read: "not scanned", never a pass.
