@@ -148,8 +148,6 @@ def _fold(state, sb, lines, source):
             name, event, detail = item.get("subject"), item.get("event"), item.get("detail") if isinstance(item.get("detail"), dict) else {}
             if not isinstance(name, str) or not name:
                 continue
-            if event == "push_watch.sent" or event == "push_watch.quiet":
-                active[name] = max(ts, active.get(name, 0))
             if event == "cloud.created":
                 created[name] = {"at": ts, "deadline": sb.parse_iso(detail.get("hard_deadline")) if isinstance(detail.get("hard_deadline"), str) else None,
                                  "line": raw}

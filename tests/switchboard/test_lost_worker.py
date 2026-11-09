@@ -764,7 +764,7 @@ class TestLostWorkerSlowPass(unittest.TestCase):
     def s2_case(self, mod):
         r = Rig(mod)
         self.slow(r)
-        r.created("w1", deadline=NOW - 600)
+        r.created("w1", deadline=NOW - 700)
         return r, r.passes()
 
     def check_s2(self, mod):
@@ -788,7 +788,7 @@ class TestLostWorkerSlowPass(unittest.TestCase):
     def test_s4_a_late_pod_then_its_stop_raises_nothing_more(self):
         r = Rig(load())
         self.slow(r)
-        r.created("w1", deadline=NOW - 600)
+        r.created("w1", deadline=NOW - 700)
         self.assertEqual(len(self.pod_lines(r, r.passes())), 1)
         r.stopped("w1")
         self.assertEqual(self.pod_lines(r, r.passes(at=NOW + 10)), [])
@@ -801,7 +801,7 @@ class TestLostWorkerSlowPass(unittest.TestCase):
     def test_s4_a_malformed_slow_line_falls_back_with_one_audit_line(self):
         r = Rig(load())
         self.slow(r, reason="took long")
-        r.created("w1", deadline=NOW - 600)
+        r.created("w1", deadline=NOW - 700)
         got = r.passes()
         self.assertEqual([x["key"].split(":")[0] for x in self.pod_lines(r, got)], ["pod_no_stop"])
         self.assertEqual(self.audit_lines(r), 1)
@@ -812,7 +812,7 @@ class TestLostWorkerSlowPass(unittest.TestCase):
         r = Rig(load())
         os.unlink(r.launcher)
         os.mkdir(r.launcher)   # exists and cannot be read as a file
-        r.created("w1", deadline=NOW - 600)
+        r.created("w1", deadline=NOW - 700)
         got = r.passes()
         self.assertEqual([x["key"].split(":")[0] for x in got], ["pod_no_stop"])
         self.assertEqual(self.audit_lines(r), 1)
@@ -822,7 +822,7 @@ class TestLostWorkerSlowPass(unittest.TestCase):
     def test_a_late_alert_is_not_an_earlier_lost_worker_of_its_ask(self):
         r = Rig(load())
         self.slow(r)
-        r.created("a1", deadline=NOW - 600)
+        r.created("a1", deadline=NOW - 700)
         r.passes()
         r.created("a2", deadline=NOW - 1800)
         got = {x["name"]: x["text"] for x in r.passes(at=NOW + 1)}
@@ -831,7 +831,7 @@ class TestLostWorkerSlowPass(unittest.TestCase):
     def test_a_pod_later_truly_lost_still_raises_its_own_key(self):
         r = Rig(load())
         self.slow(r)
-        r.created("w1", deadline=NOW - 600)
+        r.created("w1", deadline=NOW - 700)
         r.passes()
         got = self.pod_lines(r, r.passes(at=NOW + 2000))
         self.assertEqual([x["key"].split(":")[0] for x in got], ["pod_no_stop"])
