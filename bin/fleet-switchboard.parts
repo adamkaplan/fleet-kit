@@ -38,6 +38,7 @@ switchboard/standing_authority.py
 switchboard/work_moves.py
 switchboard/cockpit.py
 switchboard/launch_model.py
+switchboard/land.py
 switchboard/secret_spans.py
 switchboard/caches.py
 switchboard/bootstrap.py

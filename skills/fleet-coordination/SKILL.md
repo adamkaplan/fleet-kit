@@ -441,3 +441,7 @@ Full suites and browser/e2e runs go through `fleet-switchboard heavy -- <cmd>`: 
 An agent that is asked to run a mutation or fault-injection check (a tester or the orchestrator's own worker, never a reviewer, who runs nothing) runs each run through `fleet-switchboard heavy` with a time limit (`heavy -- timeout N <command>`), in its own process group which it stops as a whole when the limit is hit, and runs in the background only as a named job with a time limit and a job record (the job-start rule), never as a loose background process. The wrapper also stops a tree that passes its ceiling, but do not rely on that for a mutant that can loop.
 
 To change one line of an issue body, run `fleet-switchboard issue-line owner/repo#N --next-step TEXT` (or `--parked YYYY-MM-DD`): it is the way to change one line of an issue body, it never changes the Intent or the Done-when, and a whole-body write must keep the `## Intent` heading and the `Done when:` line or the gh shim refuses it.
+
+## janus-infra repositories (spire land)
+
+In a repository listed in the config key `land_repos` (default `janus-infra/*`; an empty list puts everyone back on pull requests) the work ends with `spire land`, not a pull request: done = commit, run `.spire/tool/bin/spire land`, report `landed <sha>` or the exit code and what stopped it. exit 22 = held for a person: stop and say so. There is no branch PR, PR body, explainer, plan or claims line, and no in-pod reviewer subagent (the council is the review). Every other repository keeps the pull request rules above.

@@ -45,3 +45,7 @@ A Mermaid diagram appears only where it shows data flow, system design or compon
 
 No advice, no review findings, no "consider", no summary of the code's quality, no restating the PR's own text, no second block, no
 image or link inside the block. If the before or the after cannot be said in two lines, say so in the PR and say what is unclear; do not pad.
+
+## janus-infra repositories (spire land)
+
+In a repository of the config key `land_repos` (default `janus-infra/*`) there is no pull request and so no explainer block: done = commit, run `.spire/tool/bin/spire land`, report `landed <sha>` or the exit code; exit 22 = held for a person: stop and say so. No PR body, plan or claims line, no reviewer subagents. Every other repository keeps the rules of this skill.
