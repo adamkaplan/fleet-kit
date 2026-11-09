@@ -76,5 +76,6 @@ cloud/worker/tests/test_pr_branch_source.py
 cloud/worker/tests/test_pr_label.py
 cloud/worker/tests/test_pr_record.py
 cloud/worker/tests/test_reach.py
+cloud/worker/tests/test_scan_dpkg_skip.py
 cloud/worker/tests/test_shell_check.py
 cloud/worker/tests/test_token_table.py

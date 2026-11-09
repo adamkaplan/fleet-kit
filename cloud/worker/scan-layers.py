@@ -6,6 +6,9 @@ Reads an image archive as a stream, one layer at a time, without extracting anyt
 gzip; zstd only where python can read it). EVERY regular file of EVERY layer is scanned (also a file a later layer
 deletes: the deletion is only a whiteout entry in the later layer), each layer once, plus the image configuration
 (environment, history) as bytes. Files are searched with scan-files.py's byte scanner (raw and NUL-stripped).
+Files that are UNMODIFIED files of installed distro packages (in a dpkg .list AND with their md5 in the same package's
+.md5sums, read from the MERGED view of the image's layers) are not scanned; the decision is made after the last layer. An
+unusable dpkg database means nothing is skipped (stderr says so). See cloud/README.md.
 Prints "layer <n> <digest>: <files> files, <MiB> MiB, <hits> hits" per layer, "layer <n>: /<path>: <pattern>" per hit
 (never a value) and a totals line. Exit 0 = every layer scanned, no hit; 1 = hits; 2 = a layer, member or the archive
 could not be read: "not scanned", never a pass.
@@ -54,6 +57,63 @@ def open_layer(raw):
     if head[:4] == b"\x28\xb5\x2f\xfd":
         return zstd_open(raw)
     return raw
+
+
+DBFILE = re.compile(r"/var/lib/dpkg/info/[^/]+\.(list|md5sums)")
+
+
+def image_skipmap(layer_infos):
+    """The skip map of one image from its layers in order. Whiteouts (.wh.<name>) delete the path and what is under it in
+    the lower layers; an opaque marker (.wh..wh..opq) deletes what is under its directory; a later entry at a path
+    replaces the lower one (a regular file or hardlink replaces a symlink or a dpkg file; a directory replaces a symlink)."""
+    sym, db = {}, {}
+    prefixes = set()
+
+    def under(p):
+        return [k for d in (sym, db) for k in d if k.startswith(p.rstrip("/") + "/")]
+
+    def drop(p, tree):
+        for d in (sym, db):
+            d.pop(p, None)
+        if tree or p in prefixes:
+            for k in under(p):
+                sym.pop(k, None)
+                db.pop(k, None)
+
+    def note(p):
+        parts = p.split("/")
+        for i in range(2, len(parts)):
+            prefixes.add("/".join(parts[:i]))
+
+    for info in layer_infos:
+        for p in info["wh"]:
+            drop(p, True)
+        for p in info["opq"]:
+            for k in under(p):
+                sym.pop(k, None)
+                db.pop(k, None)
+        for p in info["dirs"]:
+            sym.pop(p, None)
+            db.pop(p, None)
+        for p in info["repl"]:
+            drop(p, False)
+        for p, _m in info["recs"]:
+            drop(p, False)
+        for p, t in info["syms"]:
+            drop(p, False)
+            sym[p] = t
+            note(p)
+        for p, data in info["db"].items():
+            db[p] = data
+            note(p)
+    lists, sums = {}, {}
+    for p, data in db.items():
+        d, _, f = p.rpartition("/")
+        if d != sf.DPKG_INFO:
+            continue
+        stem, _, ext = f.rpartition(".")
+        (lists if ext == "list" else sums)[stem] = data
+    return sf.build_skipmap(lists, sums, lambda p: sym.get(p))
 
 
 def norm(p):
@@ -149,45 +209,98 @@ def main(argv):
             if name in found:
                 report_hit("config", name)
 
-    for _cfg, layers in images:
+    # Pass over the layers (each once). Per layer we keep what the dpkg rule needs: every regular file's md5, the hits
+    # (decided at the end, when the merged view of the dpkg database is known), the symlinks, directories, whiteouts and
+    # the dpkg list/md5sums files. Nothing else is kept.
+    infos = {}   # layer path -> info
+    order = []   # layer paths, in the order they are scanned
+    layer_imgs = {}
+    img_layers = []
+    for idx, (_cfg, layers) in enumerate(images):
+        img_layers.append(list(layers))
         for lp in layers:
+            layer_imgs.setdefault(lp, []).append(idx)
             if lp in seen:
                 continue
             seen.add(lp)
             n += 1
-            nfiles = nbytes = lhits = 0
-            short = os.path.basename(lp)[:12] if lp.startswith("blobs/") else lp.split("/")[0][:12]
+            order.append(lp)
+            info = infos[lp] = {"n": n, "recs": [], "pending": [], "syms": [], "dirs": [], "repl": [], "wh": [], "opq": [],
+                                "db": {}, "files": 0, "bytes": 0, "short": os.path.basename(lp)[:12] if lp.startswith("blobs/") else lp.split("/")[0][:12]}
             try:
                 with open_layer(blob(lp)) as stream, tarfile.open(fileobj=stream, mode="r|") as lt:
                     for m in lt:
-                        if not m.isreg():  # directories, symlinks, devices; a hardlink's data is in the layer that holds it
-                            continue
                         path = "/" + norm(m.name)
+                        if m.isdir():
+                            info["dirs"].append(path)
+                            continue
+                        if m.issym():
+                            info["syms"].append((path, m.linkname))
+                            continue
+                        if not m.isreg():  # devices; a hardlink's data is in the layer that holds it (it replaces the path)
+                            info["repl"].append(path)
+                            continue
+                        base = path.rpartition("/")[2]
+                        if base == ".wh..wh..opq":
+                            info["opq"].append(path.rpartition("/")[0] or "/")
+                        elif base.startswith(".wh."):
+                            info["wh"].append(path.rpartition("/")[0] + "/" + base[4:])
                         found = set()
                         if CRED_NAMES.search(path) and not path.endswith(".pub"):
                             found.add("credential-file")
                         fo = lt.extractfile(m)
                         h = hashlib.sha256()
-                        sf.scan_fileobj(fo, pats, found, h)
-                        nfiles += 1
-                        nbytes += m.size
-                        lh, la = sf.classify(path, found, h.hexdigest(), allow, pats,
-                                             lambda kind, p, name: print(
-                                                 f"layer {n}: {p}: {name}" if kind == "HIT"
-                                                 else f"allowlisted: layer {n}: {p}: {name}"))
-                        lhits += lh
-                        hits += lh
-                        allowed_t += la
+                        m5 = sf.md5()
+                        dbm = DBFILE.fullmatch(path)
+                        if dbm:  # a dpkg list or md5sums file: kept (bounded), and scanned like every file
+                            data = fo.read(sf.DPKG_MAX + 1)
+                            info["db"][path] = data if len(data) <= sf.DPKG_MAX else None
+                            fo = io.BytesIO(data)
+                        sf.scan_fileobj(fo, pats, found, sf.Multi(h, m5))
+                        info["files"] += 1
+                        info["bytes"] += m.size
+                        info["recs"].append((path, m5.hexdigest()))
+                        if found:
+                            info["pending"].append((path, found, h.hexdigest(), m5.hexdigest()))
             except Exception as e:  # a corrupt zstd/gzip/tar stream, a missing codec: all 'not scanned'
-                print(f"scan-secrets: cannot read layer {n} {short}: not scanned ({type(e).__name__})", file=sys.stderr)
+                print(f"scan-secrets: cannot read layer {n} {info['short']}: not scanned ({type(e).__name__})", file=sys.stderr)
                 errors += 1
-            print(f"layer {n} {short}: {nfiles} files, {nbytes / 1048576:.1f} MiB, {lhits} hits")
-            files_t += nfiles
-            bytes_t += nbytes
+
+    # The merged view of the dpkg database of each image (layers in order, whiteouts applied), then the skip map.
+    skipmaps = []
+    for idx, lps in enumerate(img_layers):
+        try:
+            skipmaps.append(image_skipmap([infos[lp] for lp in lps]))
+        except sf.DpkgError as e:
+            skipmaps.append({})
+            print(f"scan-secrets: dpkg database not usable in image {idx + 1} ({e}): skip set EMPTY, every file is scanned", file=sys.stderr)
+
+    def owned(lp, path, md5hex):  # an unmodified file of an installed distro package in EVERY image that holds the layer
+        return all(md5hex in skipmaps[i].get(path, ()) for i in layer_imgs[lp])
+
+    skipped_t = 0
+    for lp in order:
+        info = infos[lp]
+        lhits = 0
+        for path, found, sha, md5hex in info["pending"]:
+            if owned(lp, path, md5hex):
+                found = found & {"credential-file"}
+            lh, la = sf.classify(path, found, sha, allow, pats,
+                                 lambda kind, p, name: print(
+                                     f"layer {info['n']}: {p}: {name}" if kind == "HIT"
+                                     else f"allowlisted: layer {info['n']}: {p}: {name}"))
+            lhits += lh
+            hits += lh
+            allowed_t += la
+        skipped_t += sum(1 for path, md5hex in info["recs"] if owned(lp, path, md5hex))
+        print(f"layer {info['n']} {info['short']}: {info['files']} files, {info['bytes'] / 1048576:.1f} MiB, {lhits} hits")
+        files_t += info["files"]
+        bytes_t += info["bytes"]
     if n == 0 and not errors:
         print("scan-secrets: no layers found in the image: not scanned", file=sys.stderr)
         return 2
     print(f"total: {n} layers, {files_t} files, {bytes_t / 1048576:.1f} MiB, {hits} hits, {allowed_t} allowlisted")
+    print(f"dpkg: {skipped_t} unmodified files of installed distro packages not scanned")
     if errors:
         return 2
     if hits:
