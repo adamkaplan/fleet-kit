@@ -21,6 +21,13 @@ test("the row says what it waits on and the command that resumes it, and a daemo
   assert.ok(got.some((l) => /fleet-switchboard resume cos/.test(l)))
   assert.equal(rows(rec({ at: NOW / 1000 - 7 * 3600 })).length, 0)
 })
+test("at the sidebar width the wait and the command are wrapped, not cut; a record with no time of its last write expires", () => {
+  const got = alarmRows(rec({ text: "cos has been blocked for 25 minutes; waits on: an ended turn", resume: "fleet-switchboard resume cos" }), NOW, 34).map(text).join(" ")
+  assert.match(got, /an ended turn/)
+  assert.match(got, /resume: fleet-switchboard resume cos/)
+  assert.equal(rows(rec({ at: undefined })).length, 0)
+  assert.equal(rows(rec({ at: "now" })).length, 0)
+})
 test("a control character in the daemon's text never reaches the screen", () => {
   const got = alarmRows(rec({ agent: "cos\x1b[2J", text: "a\x1b]0;x\x07b" }), NOW, 80).map(text).join("|")
   assert.doesNotMatch(got, /[\x00-\x1f]/)
