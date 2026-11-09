@@ -82,7 +82,7 @@ class FakeRemote:
                 if self.command == "GET" and "/message" in self.path:
                     return self._answer(200, {"data": list(reversed(outer.messages))})
                 if self.command == "GET" and self.path == "/api/model":
-                    return self._answer(200, {"data": [{"providerID": "github-copilot", "id": "model-a"}]})
+                    return self._answer(200, {"data": [{"providerID": "github-copilot", "id": "model-a"}, {"providerID": "github-copilot", "id": "claude-sonnet-5.5"}]})
                 return self._answer(404, {"error": "no such route"})
 
             do_GET = do_POST = _handle
@@ -109,7 +109,7 @@ tf = os.environ.get("CW_CLOUD_TOKEN_FILE")
 login = {"command": command, "argv": argv, "env": dict(os.environ), "token_ok": bool(tf) and hashlib.sha256(open(tf).read().encode()).hexdigest() == os.environ.get("STUB_TOKEN_SHA"),
          "token_mode": oct(os.stat(tf).st_mode & 0o777) if tf else None}
 open(os.environ["STUB_DIR"] + "/login.log", "a").write(json.dumps(login) + "\\n")
-CREATE_OPTIONS = ("--repo", "--branch", "--idle", "--hard", "--max-hard", "--shape", "--image", "--stack", "--wait", "--pull-secret", "--run-secret-fd", "--no-commit", "--run-id", "--password-fd", "--json")   # what the launcher's create knows (main, fb4b9f2)
+CREATE_OPTIONS = ("--repo", "--branch", "--idle", "--hard", "--max-hard", "--shape", "--image", "--stack", "--wait", "--pull-secret", "--run-secret-fd", "--no-commit", "--pr-label", "--run-id", "--password-fd", "--json")   # what the launcher's create knows (main, fb4b9f2)
 if command == "create":
     unknown = [a for a in argv[2:] if a.startswith("--") and a not in CREATE_OPTIONS]
     if unknown:
@@ -783,6 +783,14 @@ class TestWiring(Base):
             self.assertIn("did not open", err)
             self.assertNoSecret(out, err)
         self.assertNothingKept()
+
+    def test_a_refused_create_audit_line_names_the_launching_lane(self):
+        with mock.patch.dict(os.environ, {"STUB_CREATE_FAIL": "1"}):
+            self.assertEqual(self.launch()[0], 1)
+        lines = [json.loads(l) for p in self.state.rglob("*") if p.is_file() and p.suffix != ".password" for l in p.read_text(errors="replace").splitlines()
+                 if "cloud.create_failed" in l]
+        self.assertTrue(lines, "no cloud.create_failed audit line")
+        self.assertEqual(lines[0]["detail"].get("boss"), "orch")
 
     def test_u2_a_launch_that_dies_at_the_tunnel_stops_the_pod_and_says_nothing_secret(self):
         (self.stub_dir / "pf_die").write_text("")
@@ -1634,8 +1642,9 @@ class TestLaunchStack(Base):
         code, out, err = self.launch_with("--cloud")
         self.assertEqual(code, 0, err)
         self.assertEqual(len(arming(err)), 1, err)
-        code, out, err = self.launch_with("--cloud")   # no state_clean: the worker record of the first exists, the real launcher refuses it
-        self.assertNotEqual(code, 0, err)
+        code, out, err = self.launch_with("--cloud")   # no state_clean: the worker record of the first exists; since #1619 the launch returns that worker (exit 0), it does not refuse
+        self.assertEqual(code, 0, err)
+        self.assertIn("exists: returned worker coder7", err)
         self.assertEqual(len(arming(err)), 0, err)
         self.assertEqual(len([c for c in self.stub_calls() if c[0] == "create"]), 1)   # no second pod
 
@@ -1662,6 +1671,13 @@ class TestLaunchStack(Base):
                 argv = self.create_argv()
                 self.assertEqual(argv.count("--no-commit"), 1 if extra else 0)
                 self.assertEqual([x for x in argv if x != "--no-commit"], base)   # the other options are identical
+
+    def test_2269_pr_label_reaches_create_and_the_record(self):
+        code, out, err = self.launch_with("--cloud", "--pr-label", "needs:captain", "--pr-label", "x")
+        self.assertEqual(code, 0, err)
+        argv = self.create_argv()
+        self.assertEqual([argv[i + 1] for i, a in enumerate(argv) if a == "--pr-label"], ["needs:captain", "x"])
+        self.assertEqual(json.loads((self.state / "cloud" / "coder7.json").read_text())["pr_labels"], ["needs:captain", "x"])
 
     def test_s9_the_fake_launcher_refuses_an_option_it_does_not_know(self):
         text = self.stub.read_text().replace('"--stack", ', "")

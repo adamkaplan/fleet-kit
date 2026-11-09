@@ -48,7 +48,7 @@ NO_COMMIT_OPTION = "--no-commit"   # the pod is launched NOT to commit (a measur
 CREATE_OPTION = {"repo": "--repo", "branch": "--branch", "run_id": "--run-id", "idle": "--idle", "hard": "--hard", "shape": "--shape", "stack": "--stack", "agent": "--agent", "boss": "--boss", "stack_model_secret": "--stack-model-secret", "persistent": "--persistent", "issue": "--issue", "no_wait": "--no-wait"}
 LAUNCHER_SHAPES = ("XS", "S", "M", "O")   # the launcher's SHAPES keys (O: the orchestrator row, 250m and 768 MiB, meant for --agent orchestrator; a worker on it is likely to be killed for memory); the launcher's own default (XS; S with --stack; O with --agent orchestrator) applies when --shape is not given
 LAUNCHER_STACK_SHAPES = ("S", "M")   # the rows with stack: true; --stack with another shape is refused here, before any call
-MAX_M_PER_LANE = 4   # the most live shape-M (4 CPU) cloud workers one lane may hold: a lane's batch of 4-CPU pods once filled the cluster and left every other lane's launches unplaceable
+MAX_M_PER_LANE = 10  # the most live shape-M (4 CPU) cloud workers one lane may hold: a lane's batch of 4-CPU pods once filled the cluster and left every other lane's launches unplaceable
 POD_DIR_ROOTS = ("/work", "/home/worker")   # the only roots a cloud session directory may be under (a local path does not exist in the pod)
 WORK_REPO = "/work/repo"      # where the worker clones the repository: the launcher's end hook (CW_WORKDIR default) pushes from here
 SETUP_PREAMBLE = """Setup (do this first, before the task below):
@@ -540,13 +540,15 @@ class _Stayed:
         return globals()[name]
 
 
-def _load_cluster():
-    """Load bin/cloud_cluster.py (beside this file; a part of it) with `D` set, and bind each of its names here (a name patched here does not reach it: patch it there)."""
-    spec = importlib.util.spec_from_file_location("cloud_cluster", str(_OWN_BIN / "cloud_cluster.py"))
+def _load_part(name):
+    """Load bin/<name>.py (beside this file; a part of it) with `D` set, register it in sys.modules under `name`, and bind its names here when it has `bind` (a name patched here does not reach it: patch it there)."""
+    spec = importlib.util.spec_from_file_location(name, str(_OWN_BIN / (name + ".py")))
     module = importlib.util.module_from_spec(spec)
     module.D = _Stayed()
-    sys.modules["cloud_cluster"] = module
+    sys.modules[name] = module
     spec.loader.exec_module(module)
+    if hasattr(module, "bind"):
+        module.bind(globals())
     return module
 
 
@@ -557,26 +559,16 @@ CLUSTER_NAMES = (
     "VAULT_LOCK_POLL", "VAULT_OWNER", "MAX_TOKEN_SECONDS", "HANDLED_SIGNALS", "TOKEN_CMD_SECONDS", "CLUSTER_DROP", "POD_RE", "MODEL_PROVIDER", "_LIB",
     "_lib", "_scrub_lib", "use_settings", "_OWNER_RE", "_NAME_RE", "_repo_key", "check_allowed", "_capture", "_jwt_lifetime", "_duration",
     "firewall_refused", "VaultRecovery", "_token_refusal", "cluster_token", "_cluster_token_bounded", "private_root", "_ps", "stop_recorded_tunnels",
-    "sweep_stale", "Cluster", "tunnel",
+    "sweep_stale", "Cluster", "tunnel", "_audit_model_nondefault",
     "unknown_report_to",
     "check_report_to",
 )
-cloud_cluster = _load_cluster()
+cloud_cluster = _load_part("cloud_cluster")
 for _name in CLUSTER_NAMES:
     globals()[_name] = getattr(cloud_cluster, _name)
 
 
-def _load_launch_again():
-    """Load bin/cloud_launch_again.py (beside this file; a part of it, ask #1619) and bind its names here."""
-    spec = importlib.util.spec_from_file_location("cloud_launch_again", str(_OWN_BIN / "cloud_launch_again.py"))
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["cloud_launch_again"] = module
-    spec.loader.exec_module(module)
-    module.bind(globals())
-    return module
-
-
-cloud_launch_again = _load_launch_again()
+cloud_launch_again = _load_part("cloud_launch_again")
 
 
 
@@ -703,17 +695,6 @@ def brief_warnings(args, repo, brief):
     return notes
 
 
-def lane_m_workers(state, lane):
-    """The sorted names of the lane's live shape-M workers, from the record directory alone (no token, no cluster call)."""
-    found = []
-    for record in list_records(state):
-        if not isinstance(record, dict) or "problem" in record or record.get("shape") != "M" or _ended(record):
-            continue
-        if (record.get("reports_to") or "(no boss)") == lane:
-            found.append(str(record.get("worker")))
-    return sorted(found)
-
-
 def _launch(args, runner, now, reserve):
     """`launch NAME --cloud --repo OWNER/REPO --branch B --agent A`: the allow-list first, then (with a cluster token minted for this command) the
     model entry and a one-hour git token go to the launcher as per-run secrets, the pod is created, and the session and the brief are sent through
@@ -748,7 +729,7 @@ def _launch(args, runner, now, reserve):
         raise LaunchError("--cloud needs --repo OWNER/REPO and --branch BRANCH")
     if not re.fullmatch(r"[A-Za-z0-9._/-]{1,200}", branch) or branch.startswith("-"):
         raise LaunchError("--branch is not a branch name: %r" % branch)
-    choice = H["launch_model_cloud"](args, MODEL_PROVIDER) if (getattr(args, "model", None) is not None or getattr(args, "reasoning", None) is not None) else {}   # #1642: before any setting, token or cluster call
+    choice = H["launch_model_cloud"](args, MODEL_PROVIDER, _audit_model_nondefault)   # #1642: before any setting, token or cluster call
     source = use_settings()   # before any setting is read: the allow-list, the preflight and the launcher all read this one source
     print("%s: cloud settings from %s" % (H["PROG"], source), file=sys.stderr)
     issue = getattr(args, "issue", None)
@@ -804,6 +785,7 @@ def _launch(args, runner, now, reserve):
     options += cloud_launch_again.no_wait_options(args)   # --no-wait (#1619)
     if getattr(args, "no_commit", False) or getattr(args, "role", None) in ("tester", "reviewer"):   # a measure or a read never commits
         options.append(NO_COMMIT_OPTION)
+    options += cloud_pr_labels.create_options(args)   # --pr-label (#2269)
     if persistent:   # only on request: any other launch hands the launcher exactly what it always did
         options.append(CREATE_OPTION["persistent"])
     if os.environ.get("CW_PULL_SECRET"):
@@ -841,7 +823,7 @@ def _launch(args, runner, now, reserve):
                     os.close(write_fd)
             del model, token, run_secrets
             if code != 0:
-                _audit(engine, "cloud.create_failed", name, {"exit": code, "reason": _one(note, 160)})
+                _audit(engine, "cloud.create_failed", name, {"exit": code, "reason": _one(note, 160), **({"boss": args.reports_to} if args.reports_to else {})})   # #2303: the launching lane
                 raise LaunchError("the cloud worker was not created: %s" % _reason(code, note))
             try:
                 password = _read_password(read_fd)
@@ -863,6 +845,7 @@ def _launch(args, runner, now, reserve):
                 record["reports_to"] = args.reports_to
             if isinstance(args.shape, str) and args.shape:
                 record["shape"] = args.shape
+            cloud_pr_labels.record_labels(record, args)   # #2269
             save_record(state, record)
         except (CloudError, OSError) as err:
             remove_record(state, name)
@@ -1206,16 +1189,6 @@ def cmd_read(args, runner, now):
 
 
 # ---------------------------------------------------------------- status
-
-def _ended(record, clock=None):
-    """True when the worker's hard deadline has passed: its pod is gone by design, so there is nothing to probe (and no token to mint for it)."""
-    text = record.get("hard_deadline")
-    try:
-        when = datetime.datetime.strptime(text, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc)
-    except (TypeError, ValueError):
-        return False
-    return when.timestamp() < (time.time() if clock is None else clock)
-
 
 # ---------------------------------------------------------------- the one cluster read (the status summary)
 
@@ -1581,16 +1554,14 @@ def cmd_cloud_clear(args, runner, now):
 
 # ---------------------------------------------------------------- inspect: what a pod of the caller is doing now (ask #2115, bin/cloud_inspect.py)
 
-def _load_inspect():
-    """Load bin/cloud_inspect.py (beside this file; a part of it) with `D` set, and bind each of its names here (a name patched here does not reach it: patch it there)."""
-    spec = importlib.util.spec_from_file_location("cloud_inspect", str(_OWN_BIN / "cloud_inspect.py"))
-    module = importlib.util.module_from_spec(spec)
-    module.D = _Stayed()
-    sys.modules["cloud_inspect"] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-cloud_inspect = _load_inspect()
+cloud_pr_labels = _load_part("cloud_pr_labels")
+cloud_inspect = _load_part("cloud_inspect")
 for _name in ("INSPECT_SECONDS", "_inspect_short", "cmd_inspect"):
     globals()[_name] = getattr(cloud_inspect, _name)
+
+
+# ---------------------------------------------------------------- the shape-M count of a lane (ask #2259, bin/cloud_lane_cap.py)
+
+cloud_lane_cap = _load_part("cloud_lane_cap")
+for _name in ("lane_m_workers", "_ended", "_stopped_ids"):
+    globals()[_name] = getattr(cloud_lane_cap, _name)

@@ -524,6 +524,37 @@ def state_dir_path(guard=True):
     return refuse_real_location(path, "state") if guard else path
 
 
+def github_audited(resolve, ok_of=None, refused=None):
+    """(#2260) The decorator of a function that makes ONE GitHub write: the audit line is written by `github_write` (switchboard/audit.py) before the function runs, and its outcome after;
+    when the line cannot be written the function does not run. `resolve(*args, **kwargs)` returns (audit or None, actor, verb, endpoint, repo, number) or None for a call that is no write
+    (a GET). `ok_of(result)` says whether a returned value is a success (a call that raises is a failure). `refused(err, *args, **kwargs)` returns the function's own failure value for
+    a refusal (default: the refusal is raised)."""
+    def wrap(fn):
+        @functools.wraps(fn)
+        def inner(*args, **kwargs):
+            known = resolve(*args, **kwargs)
+            if known is None:
+                return fn(*args, **kwargs)
+            try:
+                guard = github_write(*known)
+                outcome = guard.__enter__()
+            except GithubAuditRefused as err:
+                if refused is None:
+                    raise
+                return refused(err, *args, **kwargs)
+            try:
+                result = fn(*args, **kwargs)
+            except BaseException as err:
+                if not guard.__exit__(type(err), err, err.__traceback__):
+                    raise
+                raise
+            outcome["ok"] = True if ok_of is None else bool(ok_of(result))
+            guard.__exit__(None, None, None)
+            return result
+        return inner
+    return wrap
+
+
 RETIRE_IDLE_MIN, RETIRE_IDLE_MAX = 1, 10080   # minutes: `retire_idle_minutes` is a finite number in this range (a week at most)
 
 
@@ -538,7 +569,7 @@ def _is_number(value):
 
 _WARNED_CONFIG = set()
 UNKNOWN_CONFIG = {}   # (section, key) -> the nearest known key or None: what `status` shows, kept for the life of the process
-TOP_LEVEL_EXTRA_KEYS = {"worktree_reclaim", "orphan_reaper", "order_notice_burst_minutes", "external_decisions", "friction_wake", "blocked_alert", "sweep", "triage", "plan_evaluators", "red_ci_required", "default_branches", "plan_gates", "plan_review", "impact_hold", "load_alert", "source_budgets", "hold_labels", "header_cache", "app_installations", "app_key_path", "app_key_command", "app_permissions", "app_api_base", "relay_holders"}
+TOP_LEVEL_EXTRA_KEYS = {"worktree_reclaim", "orphan_reaper", "order_notice_burst_minutes", "external_decisions", "friction_wake", "blocked_alert", "sweep", "triage", "plan_evaluators", "red_ci_required", "default_branches", "plan_gates", "plan_review", "impact_hold", "load_alert", "source_budgets", "hold_labels", "captain_labels", "merge_base", "header_cache", "app_installations", "app_key_path", "app_key_command", "app_permissions", "app_api_base", "relay_holders"}
 
 
 CONFIG_DECLARATION_TEXT = re.compile(rb'^[ \t]*CONFIG_KEY[ \t]*(?::[^=\n]*)?=[ \t]*[\'"]([^\'"\n]*)[\'"]', re.M)   # only the fallback for a file that does not parse
@@ -795,6 +826,8 @@ def validate_config(raw, source="config"):
     validate_plan_gates_config(config, source)  # #107 slice 3a
     validate_plan_review_config(config, source)  # #109 part 2, R2
     validate_hold_labels_config(config, source)  # #376
+    validate_captain_labels(config, source)
+    validate_merge_base(config, source)
     validate_app_config(config, source)  # #609
     return config
 
@@ -843,6 +876,26 @@ def validate_hold_labels_config(config, source):
         module.validate_config(config["hold_labels"])
     except ValueError as err:
         raise ConfigError("%s: %s" % (source, err)) from None
+
+
+def validate_captain_labels(config, source):
+    """`captain_labels`: repository -> the label that means "the merge door must not take it; only a captain admin-merges it" (at most 20). Read by `merge-ready`. Absent: no captain rule."""
+    raw = config.get("captain_labels")
+    if raw is None:
+        config.pop("captain_labels", None)
+        return
+    if not isinstance(raw, dict) or len(raw) > 20 or not all(isinstance(r, str) and r and isinstance(b, str) and b.strip() for r, b in raw.items()):
+        raise ConfigError("%s: 'captain_labels' must be an object of at most 20 repository -> non-empty label name" % source)
+
+
+def validate_merge_base(config, source):
+    """`merge_base`: repository -> the branch name `merge-ready` expects a pull request to be based on (at most 20); a repository without an entry uses its default branch."""
+    raw = config.get("merge_base")
+    if raw is None:
+        config.pop("merge_base", None)
+        return
+    if not isinstance(raw, dict) or len(raw) > 20 or not all(isinstance(r, str) and r and isinstance(b, str) and b.strip() for r, b in raw.items()):
+        raise ConfigError("%s: 'merge_base' must be an object of at most 20 repository -> non-empty branch name" % source)
 
 
 def validate_app_config(config, source):
@@ -2151,6 +2204,8 @@ class Switchboard:
         early, self._early_facts = getattr(self, "_early_facts", {}), {}   # #467: a source the early decisions step already read this pass is not read twice
         for source in self.sources:
             name = getattr(source, "__name__", "source")
+            if isinstance(source, ReminderFacts):
+                continue   # #2243: released at its due time (run_pass), never a pending fact
             try:
                 found = early[id(source)] if id(source) in early else source()
             except Exception as err:  # one bad source must not stop the others
@@ -2349,7 +2404,7 @@ class Switchboard:
             plan = copy.copy(plan)
             plan.pending = kept
         pending = merge_wake_facts(plan.recipient, merge_reminder_copies(plan.pending))   # #1275: the sweep, triage and load-alert items of one wake are ONE message
-        in_turn = getattr(observation, "status", None) == "working" and not stale_working(self, observation, plan.pending)   # #2243: a stale 'working' (v2 runs no turn) is a new turn for a reminder
+        in_turn = getattr(observation, "status", None) == "working"
         parts_file = (self.state_dir / "finding-parts.json") if self.state_dir is not None else None   # #1302: how many parts of an over-cap finding were delivered (survives a restart; derived from nothing else)
         try:
             parts_done = json.loads(parts_file.read_text()) if parts_file is not None and parts_file.exists() else {}
@@ -2746,7 +2801,7 @@ class Switchboard:
         self._early_facts = {}   # #467: facts the early decisions step reads for this pass only; never carried over from an earlier one
         self.reads.begin_pass()
         discovery = self.discover(now)
-        if self.config.get("steer_after_minutes") and self.state_dir is not None:   # #1540: only with the key on is the turn-start file touched
+        if self.state_dir is not None:   # the turn start is always recorded; steering stays gated by the setting
             try:
                 load_module("turn_start").note(self.state_dir, [(o.session_id, o.status) for o in discovery.agents.values()], now,
                                                   load_module("record_json").parse_bounded, fresh=self.turn_start_fresh)
@@ -2775,6 +2830,12 @@ class Switchboard:
             except Exception as err:
                 self._failed(observation.name, "unconsumed", err, report)
         run_shadow_classifier(self, discovery, now)  # PR 7: logs, acts on nothing
+        for source in self.sources:   # #2243, amendment 2: a due reminder is handed to the ordinary send path at its due time, no pending fact of its own
+            if isinstance(source, ReminderFacts):
+                try:
+                    report["sent"].extend(o for o in source.release(discovery, now) if o.get("sent"))
+                except Exception as err:
+                    self._failed("reminders", "release", err, report)
         facts, _ = self.collect_facts()
         try:
             facts = filter_stopped_news(self, facts, discovery)
@@ -2794,7 +2855,6 @@ class Switchboard:
                 plan = self.plan(recipient, by_recipient[recipient], discovery, now)
                 if plan is None:
                     continue
-                reminder_waiting(self, plan, now)   # #1728
                 if plan.action == "wait":
                     report["waiting"].append(recipient)
                 elif plan.action == "hold":
@@ -5575,7 +5635,7 @@ BOSS_READ_SITES = {
     "bin/cloud_end_alert.py:scan_audit": "a cloud worker's own endpoint record (not a discovered agent): its reports_to is read from the record; the message goes to the lane name `send` resolves (the same lookup), with the Chief of Staff as the second recipient",
     "bin/cloud_worker.py:_may_retire": "the one caller rule of `retire` and `cloud-clear`: a cloud worker's own endpoint record (not a discovered agent: out of scope of the boss record)",
     "bin/cloud_retired.py:keep_boss": "keeps the boss of a removed cloud worker from the worker's own endpoint record (not a discovered agent) so `read` can answer for it after the record is gone",
-    "bin/cloud_worker.py:lane_m_workers": "the lane of a record, for the M cap: a cloud worker's own endpoint record (not a discovered agent), read as written",
+    "bin/cloud_lane_cap.py:lane_m_workers": "the lane of a record, for the M cap: a cloud worker's own endpoint record (not a discovered agent), read as written",
     "bin/cloud_inspect.py:cmd_inspect": "a cloud worker's own endpoint record (not a discovered agent): its reports_to is read from the record and compared with the caller, the same rule as `_may_retire` but the boss alone",
 }
 
@@ -8047,6 +8107,12 @@ def publish_decisions(engine):
                            ((engine.config.get("impact_hold") or {}).get("calls_per_pass") or IMPACT_PASS_CALLS))
     except Exception as err:
         engine._note("queue_ejection.error", None, {"error": _one_line("%s: %s" % (type(err).__name__, err), 200)})
+    try:
+        tip_watch = load_module("tip_watch")   # #2247: a merge that turns the integration tip's CI red is named to the Chief of Staff and the merging lane, once per head
+        tip_watch.run_pass(types.SimpleNamespace(**{n: globals()[n] for n in tip_watch.NEEDS}), engine, now,
+                           ((engine.config.get("impact_hold") or {}).get("calls_per_pass") or IMPACT_PASS_CALLS))
+    except Exception as err:
+        engine._note("tip_watch.error", None, {"error": _one_line("%s: %s" % (type(err).__name__, err), 200)})
     apply_notice_effects(engine)
     store = decision_store(engine)
     try:
@@ -8435,6 +8501,26 @@ def cloud_audit_path():
     return os.environ.get("CW_CLOUD_AUDIT") or os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"), "cw-cloud", "audit.jsonl")
 
 
+def cloud_head_checks(engine, repo, sha):
+    """#2267: the check state of one pushed head for the end notice: GET only, the one bounded reader of check runs (ci_runs); 'unknown' on any failure."""
+    try:
+        ci_mod = load_module("ci_runs")
+        runs, refusal = ci_mod.read_check_runs(lambda path: engine.intents._api(path, repo), repo, sha)
+        if refusal:
+            return "unknown"
+        runs = [r for r in ci_mod.latest_check_runs(runs, repo) if isinstance(r, dict)]
+    except Exception:
+        return "unknown"
+    if not runs:
+        return "none yet"
+    bad = sorted({str(r.get("name")) for r in runs if r.get("status") == "completed" and r.get("conclusion") in ("failure", "timed_out", "cancelled", "action_required", "startup_failure")})
+    if bad:
+        return "failed: " + ", ".join(bad[:5])
+    if any(r.get("status") != "completed" for r in runs):
+        return "pending"
+    return "passed"
+
+
 def cloud_end_tick(engine, discovery):
     """#1480: a cloud worker the launcher ended (idle, hard limit, pod gone, failed pod) tells its boss and the Chief of Staff in the same pass, once per run
     and reason. Reads the launcher's audit file from a stored cursor; sends through the daemon's own `send`. Returns what was handed to it."""
@@ -8445,7 +8531,9 @@ def cloud_end_tick(engine, discovery):
                                                      _read_small(state_dir, LAST_REPORT_FILE), lambda to, text: engine.send("switchboard", to, text),
                                                      load_module("record_json").parse_bounded,
                                                      lambda worker, detail: engine.audit is not None and engine.audit.append(engine.actor, "cloud_end_alert.send_failed", worker, detail),
-                                                     lambda directory, worker: load_module("cloud_worker").bind(globals())._retired().last_message(directory, state_dir, worker))
+                                                     lambda directory, worker: load_module("cloud_worker").bind(globals())._retired().last_message(directory, state_dir, worker),
+                                                     head_checks=lambda repo, sha: cloud_head_checks(engine, repo, sha),
+                                                     last_push=load_module("cloud_end_alert").push_reader(getattr(getattr(engine, "audit", None), "path", None), load_module("record_json").parse_bounded))
 
 
 def cloud_turn_activity(worker):
@@ -12489,6 +12577,9 @@ def _cmd_launch(args, runner, now, socket_call=None):
             return EXIT_USAGE
     if getattr(args, "cloud", False):   # a worker in the cloud (#371): its own module; nothing below runs
         code = run_cloud("cmd_launch", args, runner, now)
+        if code == EXIT_OK and args.name in load_module("cloud_worker").cloud_launch_again.RETURNED:   # a second launch of a name returned the worker (#1619): it was armed by the first
+            load_module("cloud_worker").cloud_launch_again.RETURNED.discard(args.name)
+            return code
         return arm_cloud_checkpoints(args, runner, now) if code == EXIT_OK else code   # #1790
     refuse_cloud_name(args.name)   # a name that has a cloud record is not launched locally (#640)
     engine, state, _ = build_engine(runner, now, "cli", socket_call=socket_call)
@@ -16681,7 +16772,7 @@ def pr_floor_report(engine, repo, number, rated_pairs=(), paged=None):
     """Read one PR's files and decide: {"pr", "head", "floor_paths", "complete", "rated", "decision", "reasons", "globs"}. Reads only (one
     `gh pr view`). `rated_pairs` is the independent rating's (severity, probability) list, an input that can only ADD a hold. `paged` (a dict, #967) gets the paged file list ("files") or why it could not be read ("error", a
     FileListError) when the floor had to read it, so a caller that needs the same list does not read it a second time."""
-    raw = read_pr_json(engine, repo, number, "files,baseRefOid")
+    raw = read_pr_json(engine, repo, number, "files,baseRefOid,headRefName")   # = GATE_FLOOR_FIELDS (#2215): TestGateProbeReads fails if the two differ (a second read)
     files = [f for f in (raw.get("files") if isinstance(raw.get("files"), list) else []) if isinstance(f, dict)]
     globs, exclude, force = impact_floor.floor_for(repo, engine.config)
     paths, renamed = [], []
@@ -16759,7 +16850,8 @@ def pr_floor_report(engine, repo, number, rated_pairs=(), paged=None):
             "changed_paths": [p for p in paths if isinstance(p, str)][:200], "unknown": unknown, "rated": [list(r) for r in rated],
             "registrar_reasons": impact_floor.registrar_reasons(registrar),   # #964: a registrar edit that touches the clear's closure (or cannot be read) is the owner's own clear, never delegated
             "decision": decision, "reasons": reasons, "owner_decision": owner[0], "owner_reasons": owner[1], "draft": raw.get("isDraft") is True,
-            "base": raw.get("baseRefOid")}
+            "base": raw.get("baseRefOid"),
+            "head_ref": raw.get("headRefName") if isinstance(raw.get("headRefName"), str) else None}   # (#955) a pull request from the integration branch may be a batch
 
 
 @effect_guard(lambda arguments: arguments["args"].impact_action == "clear", refused_command("impact clear"))   # #924: at the point of effect: the clear never runs in a process where a registrar ran
@@ -18168,7 +18260,7 @@ def cos_ready_check():
     return plan_ledger.cos_lacking(text)
 
 
-GATE_FLOOR_FIELDS = "files,baseRefOid"   # what `pr_floor_report` asks of `gh pr view` besides the picture's fields (#2215)
+GATE_FLOOR_FIELDS = "files,baseRefOid,headRefName"   # what `pr_floor_report` asks of `gh pr view` besides the picture's fields (#2215, #955: headRefName)
 
 
 def once_pr_view_runner(inner):
@@ -18349,6 +18441,30 @@ def add_merge_gate_parsers(sub):
     gate.add_argument("--json", action="store_true")
 
 
+def gate_write_shape(argv):
+    """(#2260) (verb, endpoint) of a gh argv that writes, for its audit line: a `gh api` call's method (-X or --method, as one word or joined: -XPATCH, --method=PATCH; else POST) and path; any other write's own two words (`pr merge`). Never a field or an input."""
+    args = list(argv)
+    if args[:1] == ["api"]:
+        verb = "POST"
+        for i, a in enumerate(args):
+            if a in ("-X", "--method") and i + 1 < len(args):
+                verb = args[i + 1]
+            elif a.startswith("--method="):
+                verb = a[len("--method="):]
+            elif a.startswith("-X") and len(a) > 2:
+                verb = a[2:]
+        return verb, next((a for a in args[1:] if not a.startswith("-") and "/" in a), "api")
+    return args[0].upper() if len(args) < 2 else args[1].upper(), " ".join(args[:2])
+
+
+def gate_write_number(argv):
+    """(#2260) The pull request or issue number a gh write names: the number of `pr merge N`, or of `repos/R/pulls/N` (None when it names none)."""
+    args = list(argv)
+    if args[:1] == ["api"]:
+        return None
+    return int(args[2]) if len(args) > 2 and args[2].isdigit() else None
+
+
 def merge_gate_gh(config, runner, repo):
     """`gh(argv, own=True) -> (code, stdout, stderr)` for `repo`'s account, never raising; every call runs the real gh by its resolved path (own_gh_path, config['gh']), so it never reaches the shim,
     EXCEPT with `own=False` (the one merge call of `--pass --merge`): that call goes through the gh as configured (`gh_by_name`: the shim where PATH finds it), so the shim's own checks (the review check among them) run."""
@@ -18361,6 +18477,8 @@ def merge_gate_gh(config, runner, repo):
     env = dict(env if env is not None else os.environ)
     env.pop(OWN_GH_ENV, None)   # no marker: the real gh is reached by its path (own_gh_path), not through the shim
 
+    @github_audited(lambda argv, own=True: None if gate_read_only([config["gh"]] + list(argv)) else (github_state_audit(), "cli") + gate_write_shape(argv) + (repo, gate_write_number(argv)),
+                    ok_of=lambda result: result[0] == 0, refused=lambda err, *a, **k: (1, "", str(err)))
     def gh(argv, own=True):
         try:
             done = runner([config["gh"] if own else config.get("gh_by_name", config["gh"])] + argv, capture_output=True, text=True, timeout=config["call_timeout_seconds"], stdin=subprocess.DEVNULL,
@@ -19708,6 +19826,8 @@ def _review_caller(runner, now):
     return kind[1]
 
 
+@github_audited(lambda engine, runner, now, repo, path, method=None, *a, **k: None if method is None else (engine.audit, engine.actor, method, path, repo, None),
+                ok_of=lambda result: result[0], refused=lambda err, *a, **k: (False, None, str(err)))
 def _review_api(engine, runner, now, repo, path, method=None, payload=None, fresh=False):
     """(ok, parsed or None, one-line detail) of ONE `gh api` call with the repository's own account (a GET unless `method`). `fresh` runs the GET straight through the runner: never the conditional-read cache."""
     config = engine.config
@@ -21769,12 +21889,14 @@ def add_core_parsers(sub):
     launch.add_argument("--memory-ok", dest="memory_ok", metavar="REASON", help="Skip the memory test of a new launch (audited with the reason)")
     launch.add_argument("--cloud", action="store_true", help="Run the worker in the cloud (needs --repo and --branch; --dir is its path in the pod, default /work; the pod always runs its own 'worker' agent: --agent is only recorded)")
     launch.add_argument("--branch", help="With --cloud: the branch the worker starts on")
-    launch.add_argument("--idle", help="With --cloud: stop after this long idle (default 30m)")
+    launch.add_argument("--base", help="With --cloud: the branch the worker's branch is created from (a branch name of the repository, checked like --branch); the setup text names it in place of the default branch. Without it the text is unchanged")
+    launch.add_argument("--idle", help="With --cloud: stop after this long idle (default 60m; 30m for an orchestrator)")
     launch.add_argument("--hard", help="With --cloud: stop after this long whatever it does (default 2h)")
     launch.add_argument("--shape", help="With --cloud: the pod shape, XS (1 CPU, 2 GiB; the launcher's default, no nested Docker), S (2 CPU, 4 GiB; the default with --stack), M (4 CPU, 8 GiB) or O (250m CPU, 768 MiB; the default of --agent orchestrator)")
     launch.add_argument("--stack", action="store_true", help="With --cloud: a pod that can run a nested Docker stack (the Sysbox runtime class, its own user namespace, no capability added, no privileged mode). Off by default; the launch without it is unchanged. The first pod on a fresh node may wait for the node's runtime: the launcher retries")
     launch.add_argument("--no-wait", dest="no_wait", action="store_true", help="With --cloud: request the pod and return at once (state starting); run the same launch command again to finish it (the session and the brief, once) when the pod is ready. Not with --stack")
     launch.add_argument("--no-commit", action="store_true", help="With --cloud: this pod is launched NOT to commit (a measure or a read): the launcher never tells it to push its work. Implied by --role tester and --role reviewer.")
+    launch.add_argument("--pr-label", dest="pr_label", action="append", default=None, metavar="LABEL", help="With --cloud: a label the pull requests this pod opens get (repeatable); the launcher's reaper adds it to each pull request the pod recorded, and never creates a label")
     launch.add_argument("--persistent", action="store_true", help="With --cloud and --agent orchestrator: an always-on orchestrator (one StatefulSet, restart always, no hard or idle limit; only an explicit stop ends it, and its cost is unbounded in time). Refused for a worker or a --stack launch")
     pending = sub.add_parser("pending", help="What is pending for an agent, and why it waits or is held")
     pending.add_argument("name", help="The agent's fleet name")
@@ -23122,6 +23244,7 @@ class OrdersFacts:
                     orders=True)
 
 
+@github_audited(lambda reader, repo, number, body: (github_state_audit(), "cli", "PATCH", "repos/%s/issues/%d" % (repo, number), repo, number))
 def write_issue_body(reader, repo, number, body):
     """The one writer of an issue's body: `gh api repos/R/issues/N --method PATCH --input -` with
     {"body": ...} as its input and nothing else, through the reader's injected runner. IntentError when
@@ -23568,6 +23691,7 @@ class DecisionError(Exception):
 GH_ERROR_MAX = 1 << 20   # characters of a failed gh call's own text kept in its error: the audit line's own physical bound
 
 
+@github_audited(lambda engine, runner, repo, path, method, *a, **k: None if str(method).upper() == "GET" else (engine.audit, engine.actor, method, path, repo, None))
 def _gh_write(engine, runner, repo, path, method, data=None, tolerate_missing=False):
     """One write through gh with the repo's own account, its token only in the child's environment. The
     configured `gh`, `gh api <path> --method M [--input -]`. IntentError when it fails (a 404 is quiet when

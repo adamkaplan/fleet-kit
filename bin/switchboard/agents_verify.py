@@ -266,6 +266,8 @@ def edit_one_line(text, limit=300):
     return " ".join(str(text or "").split())[:limit]
 
 
+@github_audited(lambda reader, repo, path, method, payload=None: None if str(method).upper() == "GET" else (github_state_audit(), "cli", method, path, repo, None),
+                refused=lambda err, *a, **k: (_ for _ in ()).throw(CommentEditFailed("audit", str(err))))
 def gh_call(reader, repo, path, method, payload=None):
     """One `gh api` call through the configured gh reader (as post_ask_comment runs it); the parsed answer."""
     env = reader.env_for(repo)

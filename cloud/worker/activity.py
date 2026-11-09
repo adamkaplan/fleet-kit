@@ -14,6 +14,7 @@ import base64
 import datetime as dt
 import json
 import os
+import re
 import sys
 import urllib.error
 import urllib.request
@@ -152,6 +153,27 @@ def to_dt(ms):
     return dt.datetime.fromtimestamp(ms / 1000 if ms > 1e11 else ms, dt.timezone.utc)
 
 
+def newest_messages(port, auth, sessions):
+    """The `time.created` of the newest message of each session (GET /api/session/<id>/message: {"data": [{"time": {"created": ms, "completed": ms?}}]}):
+    a message still being written has `created` and no `completed`, so it counts from the moment it starts. An unreadable or odd answer for one
+    session adds nothing (the sessions' own times still count); the session id must be a plain id before it is put in a path."""
+    out = []
+    newest = sorted((s for s in sessions if isinstance(s, dict)), key=lambda s: (to_dt((s.get('time') or {}).get('updated') if isinstance(s.get('time'), dict) else None) or dt.datetime.min.replace(tzinfo=dt.timezone.utc)), reverse=True)
+    for s in newest[:50]:   # the 50 most recently updated: a bound on the reads of one call
+        sid = s.get("id") if isinstance(s, dict) else None
+        if not isinstance(sid, str) or not re.fullmatch(r"[A-Za-z0-9_]{1,80}", sid):
+            continue
+        try:
+            messages = get(port, auth, "/api/session/%s/message" % sid, list)
+        except Exception:   # one session's list that cannot be read adds nothing: the sessions' own times still count
+            continue
+        stamps = [to_dt((m.get("time") or {}).get("created")) for m in messages if isinstance(m, dict) and isinstance(m.get("time"), dict)]
+        stamps = [t for t in stamps if t]
+        if stamps:
+            out.append(max(stamps))
+    return out
+
+
 def fail(reason):
     print("activity: " + reason, file=sys.stderr)
     return 1
@@ -175,7 +197,7 @@ def main():
         return fail("server unreachable")
     except ValueError:
         return fail("bad JSON")
-    times = [to_dt((s.get("time") or {}).get("updated")) for s in sessions if isinstance(s, dict) and isinstance(s.get("time"), dict)]
+    times = [to_dt((s.get("time") or {}).get("updated")) for s in sessions if isinstance(s, dict) and isinstance(s.get("time"), dict)] + newest_messages(port, auth, sessions)
     times = [t for t in times if t]
     if times:
         last = max(times)

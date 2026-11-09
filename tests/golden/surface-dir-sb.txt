@@ -2573,6 +2573,7 @@ v2_version_of
 valid_description
 validate_app_config
 validate_blocked_alert_config
+validate_captain_labels
 validate_config
 validate_decisions_config
 validate_default_branches
@@ -2584,6 +2585,7 @@ validate_hold_labels_config
 validate_intent_config
 validate_jev_config
 validate_load_alert_config
+validate_merge_base
 validate_order_burst
 validate_orphan_config
 validate_plan_evaluators

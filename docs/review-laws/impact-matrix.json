@@ -346,6 +346,7 @@
         "bin/switchboard/decisions_a.py",
         "bin/switchboard/reminders.py",
         "bin/switchboard/plan_review.py",
+        "bin/switchboard/merge_ready.py",
         "bin/switchboard/triage.py",
         "bin/switchboard/alert_labels.py",
         "bin/switchboard/link_scrub.py",
@@ -541,16 +542,16 @@
           "pass_subject",
           "read_record_file",
           "read_reminders",
-          "reminder_bound",
           "reminders_lock",
           "remove_reminders",
-          "stale_working",
           "wake_class_of",
           "write_reminders"
         ],
         "bin/switchboard/plan_review.py": [
           "ReviewError",
           "_read_capped"
+        ],
+        "bin/switchboard/merge_ready.py": [
         ],
         "bin/switchboard/triage.py": [
           "_alert_bad_label",
@@ -606,7 +607,11 @@
         ],
         "bin/switchboard/audit.py": [
           "AuditLog",
+          "GithubAuditRefused",
           "_sensitive",
+          "github_state_audit",
+          "github_write",
+          "github_write_subject",
           "redact",
           "utc_now"
         ],

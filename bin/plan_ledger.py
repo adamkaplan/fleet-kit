@@ -23,6 +23,7 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import urlsplit
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__))); import gate_budget  # noqa: E402,E702  (the sibling, found when loaded by path too)
 
 LEDGER_FILE = "plan-ledger.jsonl"
 HEAD_FILE = "plan-ledger.head"   # {"seq", "hash"} of the newest entry: a second place the chain's end is written
@@ -1174,7 +1175,6 @@ def render_gates(report, pr):
 
 MODES = ("shadow", "enforce")
 CHECK_FOR = ("ready", "merge")
-DEFAULT_BUDGET_MS = 3000
 BUDGET_RANGE = (500, 30000)
 # the gates each check requires, among those the engine tracks (G0b, G0c and G2/G3 are untracked and cannot refuse)
 REQUIRED_FOR = {"ready": ("G0a", "G1"), "merge": ("G0a", "G0c", "G1", "G4", "G6", "G6b")}
@@ -1216,15 +1216,15 @@ def validate_plan_gates(raw, source):
         enabled = entry.get("enabled", True)
         if not isinstance(enabled, bool):
             raise ValueError("%s: 'plan_gates.repos.%s.enabled' must be true or false" % (source, name))
-        budget = entry.get("budget_ms", DEFAULT_BUDGET_MS)
-        if not (isinstance(budget, int) and not isinstance(budget, bool) and BUDGET_RANGE[0] <= budget <= BUDGET_RANGE[1]):
+        budget = entry.get("budget_ms")   # NEW: absent stays absent; repo_setting() derives it from the shim's limit when it is read
+        if budget is not None and not (isinstance(budget, int) and not isinstance(budget, bool) and BUDGET_RANGE[0] <= budget <= BUDGET_RANGE[1]):
             raise ValueError("%s: 'plan_gates.repos.%s.budget_ms' must be a whole number from %d to %d"
                              % (source, name, *BUDGET_RANGE))
         gates = entry.get("enforce_gates", list(DEFAULT_ENFORCED))
         if not (isinstance(gates, list) and gates and all(g in ENFORCEABLE for g in gates) and len(set(gates)) == len(gates)):
             raise ValueError("%s: 'plan_gates.repos.%s.enforce_gates' must be a non-empty list of distinct gates from %s "
                              "(default %s), got %r" % (source, name, ", ".join(ENFORCEABLE), ", ".join(DEFAULT_ENFORCED), gates))
-        repos[name] = {"mode": mode, "enabled": enabled, "budget_ms": budget, "enforce_gates": [g for g in ENFORCEABLE if g in gates]}
+        repos[name] = dict({"mode": mode, "enabled": enabled, "enforce_gates": [g for g in ENFORCEABLE if g in gates]}, **({} if budget is None else {"budget_ms": budget}))
         if "item_checks" in entry:   # #770: declared and validated by bin/item_verdicts.py; carried here untouched, and absent when the repo does not list it
             repos[name]["item_checks"] = entry["item_checks"]
         if "ci_current_tip" in entry:   # #1755: only an explicit false turns the rule off; carried as it is
@@ -1251,7 +1251,7 @@ def repo_setting(config, repo):
     """The repo's {"mode", "enabled", "budget_ms"} from the validated config, or None when it is not opted in."""
     for name, entry in ((config.get("plan_gates") or {}).get("repos") or {}).items():
         if normal_repo(name) == normal_repo(repo):
-            return dict(entry, name=name)
+            return dict(entry, name=name, budget_ms=entry.get("budget_ms") or gate_budget.default_budget_ms())
     return None
 
 

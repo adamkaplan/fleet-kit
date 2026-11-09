@@ -8,7 +8,7 @@ rest reads the NEW body out of each form that writes one:
   gh api to repos/O/R/issues/N (or repositories/ID/issues/N) with -f/-F body=..., -F body=@file, -F body=@-, --input FILE or --input -,
   gh api graphql with a query that names updateIssue (refused: it names a node id, so the body it replaces cannot be read).
 
-The current body is read through the real gh with the account the write would use and the one deadline of the hold check. FAIL CLOSED: a current body
+The current body is read through the real gh with the account the write would use and FLEET_SHIM_HOLD_SECONDS as the limit of EACH read (counted from the read), and a command-wide budget of three times that limit, after which every further read fails closed ("the command's read budget is spent"). FAIL CLOSED: a current body
 that cannot be read or is empty, a form whose new body cannot be read, and a call that fails here for any reason refuse a WRITE. A current body with
 neither part is not an ask: the write passes. Pull requests (an `issues/N` endpoint whose answer has `pull_request`) are not touched. Nothing else is.
 Stdin that was read is handed back: fd 0 is replaced by a file holding the same text, so the shim and gh read it as before.
@@ -29,10 +29,27 @@ HEAD_RE = re.compile(r"^## Intent[ \t]*\r?$", re.M)
 DONE_RE = re.compile(r"^Done when:", re.M)
 UPDATE_RE = re.compile(r"\bupdateIssue\b")
 MAX_TEXT = 1048576
+WHY_CHARS = 200   # the read's stderr as the refusal shows it: the first this many characters, one line
+WHY_READ = 4096   # only this much of the stderr is ever scanned (a limit on the work, whatever the read printed)
+TOKEN_ENV_NAMES = ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN")   # the same four as shims/gh (a test compares them)
+# A deliberate subset of `_SECRET_PATTERNS` in bin/fleet-switchboard (the shapes a gh error carries; this file stands alone, a test shows what each one catches). A net, not a promise (a token with no known prefix that is not one the read ran with is not caught): the shapes of `_SECRET_PATTERNS` in bin/fleet-switchboard (this file stands alone), every run of name characters bounded so no scan is quadratic.
+SECRET_PATTERNS = (
+    (re.compile(r"(?i)\b(bearer|basic|token|digest|negotiate)\s+[A-Za-z0-9._~+/=-]{6,}"), r"\1 [redacted]"),
+    (re.compile(r"(?i)(?<![A-Za-z0-9_.-])([A-Za-z0-9_.-]{0,64}(?:token|secret|passw(?:or)?d|api[_-]?key|credential|auth)[A-Za-z0-9_.-]{0,64}[\"']?\s{0,4}[=:]\s{0,4})"
+                r"(\"[^\"]{0,512}\"|'[^']{0,512}'|\S+)"), r"\1[redacted]"),
+    (re.compile(r"(?i)(--?(?:token|password|passwd|secret|api-key)[ =])\S+"), r"\1[redacted]"),
+    (re.compile(r"\b(?:sk-[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9]{10,}|github_pat_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{12,}|xox[abprs]-[A-Za-z0-9-]{8,})"), "[redacted]"),
+    (re.compile(r"\b[0-9a-fA-F]{40}\b"), "[redacted]"),
+    (re.compile(r"(://[^/\s:@]+:)\S{1,256}@"), r"\1[redacted]@"),
+    (re.compile(r"(://)[^/\s@:]{1,256}@"), r"\1[redacted]@"),
+    (re.compile(r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}(?:\.[A-Za-z0-9_-]*)?"), "[redacted]"),
+)
 DROP = ("gh: refused: this body would drop the Intent or the Done-when of the issue; change one line with `fleet-switchboard issue-line`, "
         "or send the whole body with both parts")
 UNREAD = ("gh: refused: the current body of the issue could not be read, or is empty, so a body write cannot be checked: retry "
           "(or change one line with `fleet-switchboard issue-line`)")
+UNREAD_WHY = ("gh: refused: the current body of the issue could not be read (%s), so a body write cannot be checked: retry "
+              "(or change one line with `fleet-switchboard issue-line`)")
 UNCLASSIFIED = ("gh: refused: this write to an issue cannot be classified (the new body cannot be read from it), so it cannot be checked: send the body "
                 "with -f body=..., -F body=@file or --input with a JSON object, or use `fleet-switchboard issue-line`")
 GRAPHQL = ("gh: refused: a GraphQL updateIssue cannot be checked against the body it replaces: use `gh issue edit` with a body that keeps both parts, "
@@ -40,6 +57,20 @@ GRAPHQL = ("gh: refused: a GraphQL updateIssue cannot be checked against the bod
 FAILED = "gh: refused: the body guard failed, retry (the fleet shim refuses this write rather than let it through)"
 ISSUE_VALUE = {"-R", "--repo", "-t", "--title", "-m", "--milestone", "-a", "--add-assignee", "--remove-assignee", "-l", "--add-label",
                "--remove-label", "-p", "--add-project", "--remove-project", "-b", "--body", "-F", "--body-file"}
+
+REPO_FLAGS = ("-R", "--repo")   # the one table of the spellings that name the repository; every loop reads this table, the issue-edit loops through repo_flag
+
+
+def repo_flag(args, i):
+    """(the repository named by args[i], the words it takes) when args[i] spells -R V, -RV, -R=V, --repo V or --repo=V, else None."""
+    a = args[i]
+    if a in REPO_FLAGS:
+        return (args[i + 1], 2) if i + 1 < len(args) else None
+    for flag in REPO_FLAGS:
+        rest = a[len(flag):]
+        if a.startswith(flag) and rest and (not flag.startswith("--") or rest.startswith("=")):
+            return (rest[1:] if rest.startswith("=") else rest), 1
+    return None
 
 
 def has_parts(body):
@@ -57,6 +88,31 @@ def refusal(current_body, new_body):
     return None
 
 
+def clean_stderr(text, env=None, limit=WHY_CHARS):
+    """The first `limit` characters of a read's stderr as ONE line of printable ASCII: control and other characters become spaces, anything token-shaped (and any
+    token the read ran with, also URL- or JSON-escaped) is redacted. Only the first WHY_READ characters are scanned; when there were more, the last word of them,
+    which may be a token cut in two, is dropped. Redacting BEFORE the cut to `limit` is deliberate: a token is never shown half."""
+    raw = str(text or "")
+    cut = len(raw) > WHY_READ
+    raw = raw[:WHY_READ]
+
+    def known(text):   # the tokens the read ran with (a value of 4 or more characters), as they are, URL-escaped and JSON-escaped
+        for name in TOKEN_ENV_NAMES:
+            value = (env or {}).get(name)
+            if value and len(value) >= 4:
+                for form in {value, urllib.parse.quote(value, safe=""), json.dumps(value)[1:-1]}:
+                    text = text.replace(form, "[redacted]")
+        return text
+    raw = known(raw)   # before the control characters go, so a value that holds one is still found
+    raw = "".join(c if c.isascii() and c.isprintable() else " " for c in raw)
+    if cut:
+        raw = raw.rstrip().rpartition(" ")[0]
+    raw = known(raw)
+    for pattern, replacement in SECRET_PATTERNS:
+        raw = pattern.sub(replacement, raw)
+    return " ".join(raw.split())[:limit]
+
+
 class Unclassified(Exception):
     pass
 
@@ -68,7 +124,8 @@ class Probe:
             seconds = float(os.environ.get("FLEET_SHIM_HOLD_SECONDS", 5.0))
         except ValueError:
             seconds = 5.0
-        self.deadline = time.monotonic() + min(10.0, max(0.2, seconds))
+        self.seconds, self.why = min(10.0, max(0.2, seconds)), None   # the body read's OWN limit, counted from the read, not from here
+        self.budget = 3 * self.seconds   # the whole command's read time: three times the per-read limit
 
     def stdin_text(self):
         if self.text is None:
@@ -108,25 +165,52 @@ class Probe:
         return text
 
     def fetch(self, argv):
-        """The JSON object gh prints for a read, or None on any failure (including the spent deadline)."""
-        left = self.deadline - time.monotonic()
-        if left <= 0 or not self.gh:
+        """The JSON object gh prints for a read, or None on any failure; self.why then says which (a time-out, an exit status, unparsable output)."""
+        if self.budget <= 0:
+            self.why = "the command's read budget is spent"
+            return None
+        left = min(self.seconds, self.budget)
+        started = time.monotonic()
+        try:
+            return self.run_read(argv, left)
+        finally:
+            self.budget -= time.monotonic() - started
+            if self.budget <= 0 and self.why is None:
+                self.budget = 0
+
+    def run_read(self, argv, left):
+        if not self.gh:
+            self.why = "no gh to read it with"
             return None
         try:
             env = dict(self.env_of() or os.environ)
             env["GH_PROMPT_DISABLED"] = "1"
             env["GH_PAGER"] = "cat"
-            done = subprocess.run([self.gh] + argv, capture_output=True, text=True, timeout=left, stdin=subprocess.DEVNULL, env=env)
-            data = json.loads(done.stdout) if done.returncode == 0 and done.stdout else None
-        except Exception:
+            done = subprocess.run([self.gh] + argv, capture_output=True, text=True, errors="replace", timeout=left, stdin=subprocess.DEVNULL, env=env)
+            if done.returncode != 0:
+                said = clean_stderr(done.stderr, env)
+                self.why = "the read exited with status %d%s" % (done.returncode, ": " + said if said else "")
+                return None
+            data = json.loads(done.stdout) if done.stdout else None
+        except subprocess.TimeoutExpired:
+            self.why = "the read timed out after %.1f seconds" % left
             return None
-        return data if isinstance(data, dict) else None
+        except ValueError:
+            self.why = "the read printed output that is not JSON"
+            return None
+        except Exception as error:
+            self.why = "the read could not run (%s)" % type(error).__name__
+            return None
+        if not isinstance(data, dict):
+            self.why = "the read printed output that is not a JSON object"
+            return None
+        return data
 
 
 def check_current(probe, argv, new_body):
     data = probe.fetch(argv)
     if data is None:
-        return UNREAD
+        return UNREAD_WHY % (probe.why or "no reason given")
     if isinstance(data.get("pull_request"), dict):
         return None
     return refusal(data.get("body") or "", new_body)
@@ -138,15 +222,12 @@ def issue_edit(probe, args):
     words, repos, i, edit_at = [], [], 0, None
     while i < len(args):
         a = args[i]
-        if a in ("-R", "--repo") and i + 1 < len(args):
-            repos.append(args[i + 1])
-            i += 2
+        named = repo_flag(args, i)
+        if named:
+            repos.append(named[0])
+            i += named[1]
             continue
-        if a.startswith("--repo="):
-            repos.append(a[7:])
-        elif a.startswith("-R") and not a.startswith("--") and len(a) > 2:
-            repos.append(a[2:].lstrip("="))
-        elif not a.startswith("-"):
+        if not a.startswith("-"):
             words.append(a)
             if len(words) == 2:
                 edit_at = i
@@ -162,6 +243,11 @@ def issue_edit(probe, args):
             targets += args[i:]
             break
         kind, value = None, None
+        named = repo_flag(args, i - 1)
+        if named:
+            repos.append(named[0])
+            i += named[1] - 1
+            continue
         if a in ("--body", "-b", "--body-file", "-F"):
             kind = "body" if a in ("--body", "-b") else "file"
             value = args[i] if i < len(args) else None
@@ -171,7 +257,7 @@ def issue_edit(probe, args):
         elif a.startswith("--body-file="):
             kind, value = "file", a[12:]
         elif a.startswith(("-b", "-F")) and not a.startswith("--"):
-            kind, value = ("body" if a[1] == "b" else "file"), a[2:].lstrip("=") if a[2:3] == "=" else a[2:]
+            kind, value = ("body" if a[1] == "b" else "file"), a[3:] if a[2:3] == "=" else a[2:]   # one "=" is the separator, as pflag reads it
         elif a in ISSUE_VALUE:
             i += 1
         elif not a.startswith("-") or a == "-":
@@ -185,6 +271,8 @@ def issue_edit(probe, args):
     new = body[1] if body[0] == "body" else probe.file_text(body[1])
     if not targets:
         raise Unclassified()
+    if any(t.startswith("-") for t in targets):
+        raise Unclassified()   # a target after -- that reads as a flag would change the read, not name an issue
     for target in targets:
         found = check_current(probe, ["issue", "view", target, "--json", "body"] + (["-R", repos[-1]] if repos else []), new)
         if found:
@@ -292,7 +380,7 @@ def guard(args, write, api_parser, gh, env_of, stdin=None):
         for a in args:
             if skip:
                 skip = False
-            elif a in ("-R", "--repo"):
+            elif a in REPO_FLAGS:
                 skip = True
             elif not a.startswith("-"):
                 words.append(a)

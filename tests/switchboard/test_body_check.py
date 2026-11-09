@@ -156,8 +156,11 @@ class TestBodyCheck(unittest.TestCase):
         self.assertEqual(len(sentences), 1, "docs/switchboard.md: the sentence naming 'preflight-pr --body' occurs %d times, expected 1" % len(sentences))
         arch = (REPO / "docs" / "architecture.md").read_text()
         head, _, known = arch.partition("\n## Known violations")
+        # since #2213 the unit rows live one per file under docs/architecture/units/; the table in architecture.md holds none
         unit = [l for l in head.splitlines() if l.startswith("| `switchboard/body_check.py` |")]
-        self.assertEqual(len(unit), 1, "docs/architecture.md: the unit-table row of switchboard/body_check.py occurs %d times, expected 1" % len(unit))
+        row_file = REPO / "docs" / "architecture" / "units" / "switchboard" / "body_check.py.row"
+        unit += [l for l in row_file.read_text().splitlines() if l.startswith("| `switchboard/body_check.py` |")] if row_file.is_file() else []
+        self.assertEqual(len(unit), 1, "docs/architecture/units/switchboard/body_check.py.row: the unit-table row of switchboard/body_check.py occurs %d times, expected 1" % len(unit))
         rows = [l for l in known.splitlines() if l.startswith("|") and "switchboard/body_check.py" in l]
         self.assertEqual(len(rows), 0, "docs/architecture.md: %d Known-violations rows name switchboard/body_check.py, expected 0" % len(rows))
 

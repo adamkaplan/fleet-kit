@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -116,6 +117,71 @@ class TestGuardSet(unittest.TestCase):
             self.assertEqual(r.returncode, 1)
             self.assertIn("every class of the guard set exists", r.stdout)
             self.assertIn("TestTheEntryGuard", r.stdout)
+
+
+class TestGuardSetRun(unittest.TestCase):
+    """tools/guard-set --run (#2266): fixture classes only; no count of real classes is pinned."""
+
+    def _list(self, d, entries):
+        path = Path(d) / "list.json"
+        path.write_text(json.dumps({"classes": entries, "extras": []}))
+        return path
+
+    def _fx(self, d, name, body):
+        script = Path(d) / (name + ".py")
+        script.write_text("import sys, time, os\nlog = %r\n" % str(Path(d) / "log.txt")
+                          + "open(log, 'a').write('start %s %%f\\n' %% time.time())\n" % name + body
+                          + "open(log, 'a').write('end %s %%f\\n' %% time.time())\n" % name)
+        return {"class": name, "cmd": "%s %s" % (sys.executable, script)}
+
+    def test_runs_in_order_one_at_a_time_and_names_the_failed_class(self):
+        ok = "time.sleep(0.2)\nprint('Ran 3 tests in 0.2s')\n"
+        bad = "time.sleep(0.2)\nprint('Ran 2 tests in 0.2s')\nprint('FAILED (failures=1)')\nopen(log, 'a').write('end FxBad %f\\n' % time.time())\nsys.exit(1)\n"
+        with tempfile.TemporaryDirectory() as d:
+            es = [self._fx(d, "FxA", ok), self._fx(d, "FxBad", bad), self._fx(d, "FxC", ok)]
+            r = run("--run", "--list", str(self._list(d, es)))
+            self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+            self.assertRegex(r.stdout, r"FxA: tests run 3, failed 0, [0-9.]+ s")
+            self.assertRegex(r.stdout, r"FxBad: tests run 2, failed 1, [0-9.]+ s")
+            self.assertIn("RESULT: FAIL, failed: FxBad", r.stdout)
+            self.assertNotIn("FxA (", r.stdout.split("RESULT:")[1])
+            events = [l.split() for l in (Path(d) / "log.txt").read_text().splitlines()]
+            starts = [e[1] for e in events if e[0] == "start"]
+            self.assertEqual(starts, ["FxA", "FxBad", "FxC"])  # in order, the failing one did not stop the next
+            alive = 0
+            overlaps = 0
+            for e in events:   # the log is appended in time order
+                alive += 1 if e[0] == "start" else 0
+                if e[0] == "start" and alive > 1:
+                    overlaps += 1
+                if e[0] == "end":
+                    alive -= 1
+            self.assertEqual(overlaps, 0)
+
+    def test_all_pass_prints_result_pass(self):
+        with tempfile.TemporaryDirectory() as d:
+            r = run("--run", "--list", str(self._list(d, [self._fx(d, "FxOk", "print('Ran 1 test in 0s')\n")])))
+            self.assertEqual(r.returncode, 0, r.stdout)
+            self.assertIn("RESULT: PASS", r.stdout)
+
+    def test_a_class_past_its_timeout_is_stopped_with_the_reason_and_the_next_runs(self):
+        with tempfile.TemporaryDirectory() as d:
+            es = [self._fx(d, "FxSlow", "time.sleep(30)\n"), self._fx(d, "FxNext", "print('Ran 1 test in 0s')\n")]
+            es[0]["timeout"] = 1
+            t0 = time.time()
+            r = run("--run", "--list", str(self._list(d, es)))
+            self.assertLess(time.time() - t0, 20)
+            self.assertEqual(r.returncode, 1)
+            self.assertIn("TIMEOUT after 1s (killed)", r.stdout)
+            self.assertIn("RESULT: FAIL, failed: FxSlow (timed out)", r.stdout)
+            self.assertIn("FxNext: tests run 1, failed 0", r.stdout)   # the class after the timed-out one ran
+
+    def test_documents_say_run_the_tool_and_no_longer_one_by_one(self):
+        for f in ("docs/plan-template.md", "skills/fleet-coordination/SKILL.md", "skills/fleet-planning/SKILL.md"):
+            t = (REPO / f).read_text()
+            self.assertIn("tools/guard-set --run", t, f)
+            self.assertNotIn("one class at a time before", t, f)
+            self.assertNotIn("runs them one class at a time", t, f)
 
 
 if __name__ == "__main__":

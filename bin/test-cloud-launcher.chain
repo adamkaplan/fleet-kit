@@ -6,6 +6,7 @@ cloud/launcher/tests/test_brief_header.py
 cloud/launcher/tests/test_chain_list.py
 cloud/launcher/tests/test_chain_time.py
 cloud/launcher/tests/test_cloud_allowlist.py
+cloud/launcher/tests/test_cloud_default_model.py
 cloud/launcher/tests/test_cloud_docs_wording.py
 cloud/launcher/tests/test_cloud_end_alert.py
 cloud/launcher/tests/test_cloud_hub_manifest.py
@@ -48,14 +49,18 @@ cloud/launcher/tests/test_git_token_retry.py
 cloud/launcher/tests/test_hub_entry_keys.py
 cloud/launcher/tests/test_hub_restart_client.py
 cloud/launcher/tests/test_hub_safe_to_evict.py
+cloud/launcher/tests/test_idle_default_60.py
 cloud/launcher/tests/test_idle_default_note.py
 cloud/launcher/tests/test_idle_nudge.py
+cloud/launcher/tests/test_idle_nudge_skipped.py
 cloud/launcher/tests/test_issues_read.py
 cloud/launcher/tests/test_kept_failed_once.py
 cloud/launcher/tests/test_kept_running_once.py
 cloud/launcher/tests/test_known_forms.py
 cloud/launcher/tests/test_launch_idempotent.py
+cloud/launcher/tests/test_load_part.py
 cloud/launcher/tests/test_m_cap.py
+cloud/launcher/tests/test_m_cap_stopped.py
 cloud/launcher/tests/test_mint_retry.py
 cloud/launcher/tests/test_mint_roles.py
 cloud/launcher/tests/test_model_credential.py
@@ -71,6 +76,7 @@ cloud/launcher/tests/test_persistent_merge_fix.py
 cloud/launcher/tests/test_persistent_orchestrator.py
 cloud/launcher/tests/test_pod_requests.py
 cloud/launcher/tests/test_pod_state.py
+cloud/launcher/tests/test_pr_label_reaper.py
 cloud/launcher/tests/test_preflight.py
 cloud/launcher/tests/test_preflight_repo_read.py
 cloud/launcher/tests/test_preflight_step.py
@@ -107,8 +113,10 @@ cloud/launcher/tests/test_token_read_at_call.py
 cloud/launcher/tests/test_untracked_report.py
 cloud/launcher/tests/test_vault_block.py
 cloud/launcher/tests/test_vault_check_pins.py
+cloud/launcher/tests/test_wip_save.py
 cloud/launcher/tests/test_worker_copies.py
 cloud/worker/tests/test_activity.py
+cloud/worker/tests/test_activity_message.py
 cloud/worker/tests/test_base_merge_base.py
 cloud/worker/tests/test_cloud_prepush.py
 cloud/worker/tests/test_cloud_prepush_background.py
@@ -130,6 +138,7 @@ cloud/worker/tests/test_pod_inspect.py
 cloud/worker/tests/test_pr_branch_source.py
 cloud/worker/tests/test_pr_edit.py
 cloud/worker/tests/test_pr_edit_hardening.py
+cloud/worker/tests/test_pr_label.py
 cloud/worker/tests/test_pr_record.py
 cloud/worker/tests/test_push_rules.py
 cloud/worker/tests/test_question_denied.py

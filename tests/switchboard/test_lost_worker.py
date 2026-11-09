@@ -906,6 +906,79 @@ class TestChiefOnlyWhenNeeded(unittest.TestCase):
         self.assertEqual(self.delivered(False), ["chief-of-staff", "lane-a"])
 
 
+class TestRefusedLaunchIsToldToItsLane(unittest.TestCase):
+    """#2303: a refused launch is told to the lane named in its `cloud.create_failed` line, never to the Chief of Staff; no readable lane: the Chief of Staff alone."""
+
+    def refused(self, mod, *bosses):
+        r = Rig(mod)
+        for n, boss in enumerate(bosses):
+            detail = {"exit": 1, "reason": "cluster full"}
+            if boss is not None:
+                detail["boss"] = boss
+            line(r.engine.audit.path, ts=stamp(NOW - 100 - n), actor="x", event="cloud.create_failed", subject="w%d" % n, detail=detail)
+        got = r.passes()
+        r.passes()   # a second pass repeats nothing
+        return got, sorted(to for to, _ in r.engine.sent), r.engine.sent
+
+    def today(self):
+        src = (REPO / "bin" / "lost_worker.py").read_text()
+        for new, old in (('"lane": r.get("boss") or None,', '"lane": record.get("reports_to"),'), ('if loss["kind"] == "refused_launch":', 'if False:')):
+            self.assertEqual(src.count(new), 1, new)
+            src = src.replace(new, old)
+        mod = types.ModuleType("lost_worker_today")
+        exec(compile(src, "lost_worker_today", "exec"), mod.__dict__)
+        return mod
+
+    def check_s2(self, mod):
+        got, to, sent = self.refused(mod, "lane-a", "lane-b")
+        self.assertEqual(to.count("chief-of-staff"), 0, "S2 the Chief of Staff is told none")
+        self.assertEqual(to, ["lane-a", "lane-b"], "S2 each lane once")
+        self.assertTrue(all(("lane=" + t) in m for t, m in sent), "S2 the text names the lane")
+
+    def check_s3(self, mod):
+        got, to, _ = self.refused(mod, None)
+        self.assertEqual(to, ["chief-of-staff"], "S3 the Chief of Staff alone, once")
+
+    def test_s2_each_lane_is_told_once_and_the_chief_none(self):
+        self.check_s2(load())
+
+    def test_s3_an_unreadable_lane_reaches_the_chief_once(self):
+        self.check_s3(load())
+        got, to, _ = self.refused(load(), "")
+        self.assertEqual(to, ["chief-of-staff"])   # an empty boss is no lane
+
+    def test_a_boss_that_is_not_a_lane_name_is_no_lane(self):
+        for bad in (5, "x" * 90, "lane\nx", "Lane A", "lane-a, kind=pod_no_stop"):
+            got, to, _ = self.refused(load(), bad)
+            self.assertEqual(to, ["chief-of-staff"], repr(bad))
+
+    def test_a_valid_but_unusual_lane_name_is_a_lane(self):
+        for good in ("2fa-lane", "l" * 40, "chief-of-staff"):
+            got, to, _ = self.refused(load(), good)
+            self.assertEqual(to, [good])
+
+    def test_the_alert_key_is_unchanged_and_an_old_line_with_no_boss_is_told_once(self):
+        got, to, _ = self.refused(load(), "lane-a", None)
+        self.assertEqual(sorted(x["key"].split("@")[0] for x in got), ["refused_launch:w0", "refused_launch:w1"])
+        self.assertEqual(sorted(to), ["chief-of-staff", "lane-a"])
+
+    def test_a_loss_of_another_kind_keeps_its_recipients(self):
+        mod = load()
+        r = Rig(mod)
+        r.created("w1")
+        r.passes()
+        self.assertEqual(sorted(to for to, _ in r.engine.sent), ["chief-of-staff", "lane-a"])
+
+    def test_s5_control_today_s_code_tells_the_chief_of_both(self):
+        old = self.today()
+        got, to, _ = self.refused(old, "lane-a", "lane-b")
+        self.assertEqual(to.count("chief-of-staff"), 2)   # the control: the Chief of Staff is told of both, no lane is
+        self.assertNotIn("lane-a", to)
+        with self.assertRaises(AssertionError) as caught:
+            self.check_s2(old)
+        self.assertIn("S2 the Chief of Staff is told none", str(caught.exception))
+
+
 class TestAskIsItsOwn(unittest.TestCase):
     """#2246: a lost worker is counted under its own ask, never under its name prefix."""
 
@@ -927,63 +1000,92 @@ class TestAskIsItsOwn(unittest.TestCase):
 
 class TestPodReportedLostOnlyWhenSilent(unittest.TestCase):
     """#2255: the case of 6 November 2026: a pod past its hard deadline that is stopped seconds later, or still noting and pushing, is not lost."""
-    GATE = 'if now - deadline < GRACE_SECONDS or (seen > c["at"] and now - seen < GRACE_SECONDS):'
+    G1 = "        if now - deadline <= GRACE:\n"
+    G2 = "        if now - newest <= GRACE and newest > c[\"at\"]:\n"
 
     def module(self, mutant=False):
         src = (REPO / "bin" / "lost_worker.py").read_text()
         if mutant:   # today's rule: no grace and no activity read
-            self.assertEqual(src.count(self.GATE), 1)
-            src = src.replace(self.GATE, "if False:")
-            self.assertEqual(src.count('"at": newest,'), 1)
-            src = src.replace('"at": newest,', '"at": c["at"],')
-        path = os.path.join(tempfile.mkdtemp(), "lost_worker_case.py")
-        with open(path, "w") as handle:
-            handle.write(src)
-        spec = importlib.util.spec_from_file_location("lost_worker_case", path)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        return module
+            for gate in (self.G1, self.G2):
+                self.assertEqual(src.count(gate), 1)
+                src = src.replace(gate, gate.replace(gate.strip()[3:-1], "False"))
+        mod = types.ModuleType("lost_worker_gate")
+        exec(compile(src, "lost_worker_gate", "exec"), mod.__dict__)
+        return mod
 
-    def rig(self, mod):
+    def lost(self, mod, setup, at=NOW):
         r = Rig(mod)
-        r.created("tg", deadline=NOW - 3)   # launched two hours ago, deadline three seconds ago
-        return r
+        setup(r)
+        return [x for x in r.passes(at=at) if x["kind"] == "pod_no_stop"]
 
-    def lost(self, r, at=NOW):
-        return [x for x in r.passes(at=at) if x["kind"] == "pod_no_stop" and x["name"] == "tg"]
+    def seconds_past(self, r):   # the pod tg: deadline 3 s before the check, launcher actions after the launch
+        r.created("tg", deadline=NOW - 3)
 
-    def test_s2_a_pod_just_past_its_deadline_is_not_lost(self):
-        self.assertEqual(self.lost(self.rig(self.module())), [])
+    def noting(self, r):   # renewal, nudge, wip note, final note after the launch, the last one 10 s ago; deadline 700 s ago
+        r.created("tg", deadline=NOW - 700)
+        for back, action in ((3000, "renew"), (2400, "idle-nudge"), (1200, "wip-note"), (10, "final-note")):
+            line(r.launcher, ts=stamp(NOW - back), worker="tg", runtime_id="pod/tg", action=action, ok=True, reason="")
 
-    def test_s2_control_today_raises_the_false_notice(self):
-        self.assertEqual(len(self.lost(self.rig(self.module(True)))), 1)
+    def pushing(self, r):
+        r.created("ti", deadline=NOW - 700)
+        line(r.engine.audit.path, ts=stamp(NOW - 20), actor="x", event="push_watch.sent", subject="ti", detail={})
 
-    def test_s3_launcher_activity_in_the_grace_is_not_lost_and_a_later_notice_names_it(self):
-        r = self.rig(self.module())
-        line(r.launcher, ts=stamp(NOW + 3000 - 60), worker="tg", runtime_id="pod/tg", action="note", ok=True, reason="wip")
-        self.assertEqual(self.lost(r, at=NOW + 3000), [])
-        late = self.lost(r, at=NOW + 3000 + 700)
+    def silent(self, r):
+        r.created("cf", deadline=NOW - 3000)
+        line(r.launcher, ts=stamp(NOW - 6000), worker="cf", runtime_id="pod/cf", action="renew", ok=True, reason="")
+
+    def check_s2(self, mod):
+        self.assertEqual(self.lost(mod, self.seconds_past), [], "S2 a pod seconds past its deadline is not lost")
+
+    def check_s3(self, mod):
+        self.assertEqual(self.lost(mod, self.noting), [], "S3 a pod still noting is not lost")
+        self.assertEqual(self.lost(mod, self.pushing), [], "S3 a pod still pushing is not lost")
+
+    def check_s4(self, mod):
+        got = self.lost(mod, self.silent)
+        self.assertEqual(len(got), 1, "S4 a silent pod is reported once")
+        self.assertEqual(got[0]["at"], NOW - 6000, "S4 the last event is the newest action, not the launch")
+
+    def test_s2_a_pod_stopped_seconds_after_its_deadline_raises_no_notice(self):
+        self.check_s2(self.module())
+
+    def test_s3_a_pod_still_noting_or_pushing_raises_no_notice(self):
+        self.check_s3(self.module())
+
+    def test_s4_a_silent_pod_is_still_reported_with_its_newest_event(self):
+        self.check_s4(self.module())
+
+    def quiet_only(self, r):   # the only line in the grace is push_watch.quiet: no push, not a sign of life
+        r.created("tq", deadline=NOW - 700)
+        line(r.engine.audit.path, ts=stamp(NOW - 20), actor="x", event="push_watch.quiet", subject="tq", detail={})
+
+    def test_a_push_watch_quiet_line_is_not_a_sign_of_life(self):
+        self.assertEqual(len(self.lost(self.module(), self.quiet_only)), 1)
+        src = (REPO / "bin" / "lost_worker.py").read_text()
+        old = src.replace('event == "push_watch.sent"', 'event in ("push_watch.sent", "push_watch.quiet")')
+        self.assertNotEqual(old, src)
+        mod = types.ModuleType("lost_worker_head")
+        exec(compile(old, "lost_worker_head", "exec"), mod.__dict__)
+        self.assertEqual(self.lost(mod, self.quiet_only), [], "control: head holds it back")
+
+    def test_a_later_notice_names_the_last_action_and_is_told_once(self):
+        mod = self.module()
+        r = Rig(mod)
+        r.created("tg", deadline=NOW - 3)
+        line(r.launcher, ts=stamp(NOW + 3000 - 60), worker="tg", runtime_id="pod/tg", action="wip-note", ok=True, reason="")
+        self.assertEqual([x for x in r.passes(at=NOW + 3000) if x["kind"] == "pod_no_stop"], [])
+        late = [x for x in r.passes(at=NOW + 3000 + 700) if x["kind"] == "pod_no_stop"]
         self.assertEqual(len(late), 1)
-        self.assertIn(stamp(NOW + 3000 - 60)[:19], late[0]["text"])
-        self.assertNotIn("last event " + stamp(NOW - 7200)[:19], late[0]["text"])
+        self.assertEqual(late[0]["at"], NOW + 3000 - 60)
+        self.assertEqual([x for x in r.passes(at=NOW + 3000 + 800) if x["kind"] == "pod_no_stop"], [])
 
-    def test_s3_a_push_in_the_grace_is_not_lost(self):
-        r = self.rig(self.module())
-        line(r.engine.audit.path, ts=stamp(NOW + 3000 - 60), actor="x", event="push_watch.sent", subject="tg", detail={"sha": "abcd1234"})
-        self.assertEqual(self.lost(r, at=NOW + 3000), [])
-
-    def test_s3_control_today_raises_and_names_the_launch(self):
-        r = self.rig(self.module(True))
-        line(r.launcher, ts=stamp(NOW + 3000 - 60), worker="tg", runtime_id="pod/tg", action="note", ok=True, reason="wip")
-        got = self.lost(r, at=NOW + 3000)
-        self.assertEqual(len(got), 1)
-        self.assertIn("last event " + stamp(NOW - 7200)[:19], got[0]["text"])
-
-    def test_s4_a_silent_pod_past_the_grace_is_lost_once(self):
-        r = self.rig(self.module())
-        line(r.launcher, ts=stamp(NOW - 7000), worker="tg", runtime_id="pod/tg", action="renew", ok=True, reason="")   # early activity, long before the grace
-        self.assertEqual(len(self.lost(r, at=NOW + 3000)), 1)
-        self.assertEqual(self.lost(r, at=NOW + 3100), [])   # once only
+    def test_controls_today_s_rule_raises_the_false_notices(self):
+        old = self.module(mutant=True)
+        self.check_s4(old)   # the control: the silent pod is reported on today's rule too
+        for check, text in ((self.check_s2, "S2 a pod seconds"), (self.check_s3, "S3 a pod still")):
+            with self.assertRaises(AssertionError) as caught:
+                check(old)
+            self.assertIn(text, str(caught.exception))
 
 
 if __name__ == "__main__":

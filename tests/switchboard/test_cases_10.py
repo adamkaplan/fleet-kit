@@ -78,7 +78,7 @@ class TestWhoCanClear(unittest.TestCase):
  ],
  "floor-credentials": [
   [
-   "it changes a credentials path (cloud/launcher/token_mint.py): that stays the owner's own clear"
+   "it changes a credentials path (cloud/launcher/app_token.py): that stays the owner's own clear"
   ],
   [
    "the score is High: High is the owner's"
@@ -164,7 +164,7 @@ class TestWhoCanClear(unittest.TestCase):
 
     def rows(self):
         """The 9 rows of S2: name, report, files, closure, expected."""
-        credentials = next(p for p in self.matrix["owner_hold"]["top_tier_paths"]["credentials"] if not self.floor.matches(p, self.rule["clear_code_paths"]) and "*" not in p)
+        credentials = next(p for p in sorted(self.matrix["owner_hold"]["top_tier_paths"]["credentials"]) if not self.floor.matches(p, self.rule["clear_code_paths"]) and "*" not in p)
         identity = next(p for p in self.matrix["owner_hold"]["top_tier_paths"]["identity"] if not self.floor.matches(p, self.rule["clear_code_paths"]) and "*" not in p)
         floor_rows = []
         for cls, path in (("credentials", credentials), ("identity", identity), ("authority", "migrations/0002.sql")):
@@ -444,6 +444,7 @@ class TestRecordJsonReaders(unittest.TestCase):
     # every other json.loads / json.load site in bin/: daemon-written state, command output, a socket body or a line of a log, with a reason
     EXEMPT_REASON = "not a record file another process writes: daemon-written state, command output, a request body or a log line"
     # path_suites.py:check_manual and load_manual read the repository's OWN checked-in manual (tools/path-suites.json), a trusted repo file, not untrusted record text
+    # cloud_lane_cap.py:_stopped_ids is the launcher audit tail, read-only, to free a stopped worker's shape-M slot (#2259)
     EXEMPT = """
 agent_calls.py:_read_json
 agent_calls.py:_spool_lines
@@ -455,6 +456,7 @@ cloud_channel_server.py:do_POST
 cloud_cli.py:post
 cloud_cluster.py:run_launcher
 cloud_cost_report.py:read_lines
+cloud_lane_cap.py:_stopped_ids
 cloud_hub.py:_read_json
 cloud_hub.py:_read_json_aged
 cloud_hub.py:kube_http
@@ -510,7 +512,7 @@ fleet-switchboard:janitor_agent_roots
 fleet-switchboard:json
 switchboard/docker_reaper.py:lab_facts
 fleet-switchboard:launch_memory_check
-fleet-switchboard:load_config
+fleet-switchboard:_load_config_file
 fleet-switchboard:pane_exit_audit_tail
 fleet-switchboard:pr_state_read
 fleet-switchboard:pull_state

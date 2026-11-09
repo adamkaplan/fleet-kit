@@ -309,7 +309,7 @@ def run_pass(sb, engine, now, gh, config=None, launcher_audit=None):
                     unsent = True
                     break
                 mem["told"] = (mem.get("told", []) + [csha])[-TOLD_MAX:]
-                engine.audit.append(engine.actor, "push_watch.sent", name, {"to": lane, "sha": csha[:8]})
+                engine.audit.append(engine.actor, "push_watch.sent", name, {"to": lane, "sha": csha[:8], "branch": _clean(branch, 100), "head": csha})
             if unsent:
                 continue
             b["told"] = (b["told"] + [sha])[-TOLD_MAX:]

@@ -39,6 +39,7 @@ rebuilt from another record.
 | `bin/lanes.py:197` | `boss-resolution` | the lane rule resolves a boss | nobody | lane resolution | derived |
 | `bin/reassign.py:237` | `boss-resolution` | `reassign` resolves the current boss for consent | nobody | `reassign` | derived |
 | `bin/fleet-switchboard:2385` | `discovery.agents` | the agents of the newest `discover()`: name, session, pane, role, charter, repo, workspace, cwd, reports_to | `Engine.discover` (each pass and on demand) | the whole daemon: fact routing, status, pane pass, decisions, chiefs lookup, badges, toasts | primary (the live list), derived from herdr and the v2 service |
+| `bin/tip_watch.py:218` | `discovery.agents` | the agents of the newest `discover()`, handed to `route_of` to find the lane of the merging pull request | nobody | the tip watch's tell | derived (reader) |
 | `bin/cloud_worker.py:976` | `discovery.agents` | looks up a local agent by name before routing | nobody | `route` | derived (reader) |
 | `bin/switchboard/job_runs.py:348` | `discovery.agents` | the agents of the newest `discover()`: a dead job's starter is found among them by session and name | nobody | `JobFacts` | derived (reader) |
 | `bin/switchboard/job_runs.py:350` | `boss-resolution` | the starter's boss, by `boss_name` over the discovery | nobody | `JobFacts` | derived (reader) |
@@ -70,7 +71,8 @@ rebuilt from another record.
 | `bin/switchboard/decisions_b.py:281` | `decisions.json` | comment only: names the projection among what the store keeps | nobody | nobody | derived |
 | `bin/switchboard/plan_review.py:544` | `boss-resolution` | plan review escalates to the planner's boss through `boss_name`, then `resolve_boss` | nobody | plan review escalation | derived (reader) |
 | `bin/switchboard/plan_review.py:542` | `discovery.agents` | plan review reads the newest discovery to find the planner's boss | nobody | plan review escalation | derived (reader) |
-| `bin/switchboard/reminders.py:346` | `boss-resolution` | a reminder's recipient is resolved through `resolve_boss` | nobody | reminder delivery | derived (reader) |
+| `bin/switchboard/checkpoint_reminders.py:88` | `boss-resolution` | the overdue wake's recipient is resolved through `resolve_boss` (moved out of reminders.py unchanged) | nobody | reminder delivery | derived (reader) |
+| `bin/switchboard/checkpoint_reminders.py:88` | `discovery.agents` | the overdue wake reads the agents of the newest `discover()` (moved out of reminders.py unchanged) | nobody | reminder delivery | derived (reader) |
 | `bin/switchboard/reminders.py:176` | `discovery.agents` | a reminder condition reads the discovered agents (recipient and sender) | nobody | reminder delivery | derived (reader) |
 | `bin/switchboard/reminders.py:143` | `last-reports.json` | a reminder's "no report since" condition reads the sender's last report time | nobody | reminder delivery | primary |
 | `bin/cloud_first_push.py:83` | `last-reports.json` | the first-push notice pass reads whether the pod has reported since its launch | nobody (reader only) | `first_push_tick` (the first-push notice, #2057) | primary (reader) |

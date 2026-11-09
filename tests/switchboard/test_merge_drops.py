@@ -20,6 +20,15 @@ def git(cwd, *argv):
     return done.stdout.strip()
 
 
+def conflicting_merge(cwd, other):
+    """`git merge --no-commit other` that must stop on a conflict with MERGE_HEAD set (exit 1). It runs in the pinned environment of `git` above (a HOME and XDG_CONFIG_HOME inside the fixture, so no user config is read; a fixed identity, a fixed conflict style, no editor or pager), so no runner's git version or configuration changes it; a merge that did not start fails the test here, not later."""
+    env = {"PATH": "/usr/bin:/bin", "HOME": str(cwd), "XDG_CONFIG_HOME": str(cwd),
+           "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@x", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@x", "GIT_EDITOR": "true", "GIT_PAGER": "cat"}
+    done = subprocess.run(["git", "-C", str(cwd), "-c", "merge.conflictStyle=merge", "-c", "core.autocrlf=false", "merge", "-q", "--no-commit", "--no-ff", other],
+                          capture_output=True, text=True, stdin=subprocess.DEVNULL, env=env)
+    assert done.returncode == 1 and (Path(cwd) / ".git" / "MERGE_HEAD").exists(), "the merge did not stop on its conflict: %r %r" % (done.returncode, done.stderr + done.stdout)
+
+
 class MergeDropsBase(unittest.TestCase):
     def setUp(self):
         if HOST is None:
@@ -189,7 +198,7 @@ class TestMergeDrops(MergeDropsBase):
         self.write("app.py", "".join(("line 3 tip\n" if n == 3 else "line %d\n" % n) for n in range(1, 11)))
         self.commit("tip modifies line 3")
         git(self.dir, "checkout", "-q", "pr")
-        git(self.dir, "merge", "-q", "--no-commit", "integration") if False else subprocess.run(["git", "-C", str(self.dir), "merge", "-q", "--no-commit", "integration"], capture_output=True)
+        conflicting_merge(self.dir, "integration")   # the same pinned environment as every other git call here, and a check that the merge really is under way
         self.write("app.py", "".join(("line 3 tip, extra=None\n" if n == 3 else "line %d\n" % n) for n in range(1, 11)))   # the PR's extension of the tip's line
         git(self.dir, "add", "-A")
         git(self.dir, "commit", "-q", "-m", "merge the tip")
