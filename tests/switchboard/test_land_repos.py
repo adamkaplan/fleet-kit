@@ -117,7 +117,7 @@ class TestGatesSkipped(unittest.TestCase):
         done, calls = self.run_cmd("gates-check", "janus-infra/widget", None, "--json")
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
         self.assertEqual(json.loads(done.stdout)["verdict"], "allow")
-        self.assertIn("spire land", json.loads(done.stdout)["reason"])
+        self.assertIn("land_repos", json.loads(done.stdout)["reason"])
         self.assertEqual(calls, [], "no gate reads the pull request")
 
     def test_s3_control_the_same_check_of_another_repository_reads_the_pull_request(self):
@@ -136,6 +136,11 @@ class TestGatesSkipped(unittest.TestCase):
         done, calls = self.run_cmd("merge-gate", "janus-infra/widget", [])
         self.assertTrue(calls, "land_repos [] puts it back")
 
+    def test_merge_gate_pass_of_a_land_repository_is_refused_not_reported_as_done(self):
+        done, calls = self.run_cmd("merge-gate", "janus-infra/widget", None, "--pass", "--merge")
+        self.assertNotEqual(done.returncode, 0)
+        self.assertEqual(calls, [])
+
 
 class TestLandCompletion(Case):
     """The push watch: a Land-trailer commit on the default branch of a land repository completes the worker with the sha."""
@@ -145,7 +150,7 @@ class TestLandCompletion(Case):
         self.reports, self.main = [], []
         self.engine.config = {}
         self.engine.report = lambda sender, state, text, *a, **k: (self.reports.append((sender, state, text)), {"sent": True})[1]
-        self.ns.uses_spire_land = land_module().uses_spire_land
+        self.ns.is_land_repo = land_module().is_land_repo
         self.engine.cloud_watch = {"records": [record("w-a", "lane-a", "janus-infra/widget")]}
         gh = self.world.__call__
         self.paths = []
@@ -216,6 +221,66 @@ class TestLandCompletion(Case):
         self.run_pass(NOW)
         self.run_pass(NOW + 60)
         self.assertEqual(len([l for l in self.engine.audit.lines if l[0] == "push_watch.read_failed"]), 1)
+
+
+    def test_a_trailer_quoted_in_the_body_is_not_a_landing(self):
+        self.main = [self.land(SHA, "Discuss\n\nLanded-by: quoted\n\nSigned-off-by: someone")]
+        self.run_pass(NOW)
+        self.assertEqual(self.reports, [])
+
+    def test_two_land_commits_of_one_read_are_one_completion(self):
+        self.main = [self.land(SHA, "b\n\nLanded-by: x"), self.land("f" * 40, "a\n\nLanded-by: x")]
+        self.run_pass(NOW)
+        self.run_pass(NOW + 60)
+        self.assertEqual(len(self.reports), 1)
+
+    def test_a_worker_name_inside_a_longer_name_is_not_a_match(self):
+        self.engine.cloud_watch = {"records": [record("w-a", "lane-a", "janus-infra/widget"), record("w-ab", "lane-b", "janus-infra/widget")]}
+        self.launcher_line(worker="w-ab", action="create")
+        self.main = [self.land(SHA, "x\n\nLand-worker: w-ab")]
+        self.run_pass(NOW)
+        self.assertEqual([r[0] for r in self.reports], ["w-ab"])
+
+    def test_the_daemons_own_tick_gives_the_push_watch_the_land_reader(self):
+        sb = SourceFileLoader("sb_land_tick", str(REPO / "bin" / "fleet-switchboard")).load_module()
+        seen = []
+        engine = types.SimpleNamespace(state_dir=None, hub=types.SimpleNamespace(gh_api=lambda *a, **k: []), config={}, now=lambda: NOW, audit=None, actor="switchboard")
+        real = SourceFileLoader("pw_probe", str(REPO / "bin" / "push_watch.py")).load_module()
+        real_run = real.run_pass
+        import importlib.util
+        orig = importlib.util.spec_from_file_location
+
+        def spy(name, path, *a, **k):
+            spec = orig(name, path, *a, **k)
+            if name == "push_watch":
+                loader_exec = spec.loader.exec_module
+                def exec_module(module):
+                    loader_exec(module)
+                    inner = module.run_pass
+                    module.run_pass = lambda ns, *x, **y: (seen.append(ns), [])[1]
+                spec.loader.exec_module = exec_module
+            return spec
+        importlib.util.spec_from_file_location = spy
+        try:
+            sb.push_watch_tick(engine, None)
+        finally:
+            importlib.util.spec_from_file_location = orig
+        self.assertEqual(len(seen), 1)
+        self.assertTrue(seen[0].is_land_repo({}, "janus-infra/widget"))
+        self.assertFalse(seen[0].is_land_repo({}, "acme/other"))
+
+
+class TestSweepSkip(unittest.TestCase):
+    def test_sweep_refresh_does_not_read_a_land_repository_and_reads_another(self):
+        sb = SourceFileLoader("sb_land_sweep", str(REPO / "bin" / "fleet-switchboard")).load_module()
+        read = []
+        sb.sweep_read_repo = lambda hub, repo, *a, **k: (read.append(repo), {"at": 0, "items": {}, "truncated": False, "error": None})[1]
+        for config, expected in (({}, ["acme/other"]), ({"land_repos": []}, ["acme/other", "janus-infra/widget"])):
+            read[:] = []
+            engine = types.SimpleNamespace(hub=object(), config=config, now=lambda: NOW)
+            state = types.SimpleNamespace(repos={}, started=NOW, strong=None)
+            sb.sweep_refresh(engine, state, ["janus-infra/widget", "acme/other"], NOW, {"comment_window_days": 7}, None, [50])
+            self.assertEqual(sorted(read), expected)
 
 
 if __name__ == "__main__":

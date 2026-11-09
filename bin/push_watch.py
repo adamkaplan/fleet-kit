@@ -49,20 +49,29 @@ def _clean(text, limit):   # no @ (no mention can fire) and no double quote (the
 # whose commit carries a Land trailer is the worker's completion: ONE `done` report from the worker, through the engine's own report path (the path the worker's own
 # `report done` takes), with the sha. ASSUMPTION (the playbook janus-infra/spire-venue#8193 was not readable): a trailer is a line of the commit message that starts
 # `Landed-by:` or `Land-<key>:`. With more than one live worker in the repository a commit completes only the worker whose name its message holds.
-LAND_TRAILER = re.compile(r"^(?:Landed-by|Land-[A-Za-z0-9-]+)[ \t]*:[ \t]*\S", re.M)
+LAND_TRAILER = re.compile(r"^(?:Landed-by|Land-[A-Za-z0-9-]+)[ \t]*:[ \t]*\S")
 LAND_READ = 20   # the newest commits of the default branch read per worker per pass
 
 
 def land_trailer(message):
-    return isinstance(message, str) and bool(LAND_TRAILER.search(message))
+    """True when the LAST paragraph of the message (its trailer block) has a Land trailer line; a line quoted in the body does not count."""
+    if not isinstance(message, str):
+        return False
+    paragraphs = [p for p in re.split(r"\n[ \t]*\n", message.strip().replace("\r", "")) if p.strip()]
+    return bool(paragraphs) and any(LAND_TRAILER.match(line) for line in paragraphs[-1].split("\n"))
 
 
 def _landed(sb, engine, now, gh, name, record, mem, state, repos_live, full_config):
     """The completion of a worker of a `spire land` repository: the newest Land-trailer commit on the default branch, made after the launch, not told before.
     Returns the sha told, or None. A read that fails is audited once and retried at the next pass; a send that fails is not marked."""
     repo = record.get("repo")
-    uses = getattr(sb, "uses_spire_land", None)
-    if uses is None or not uses(full_config, repo):
+    uses = getattr(sb, "is_land_repo", None)
+    if uses is None:
+        if not mem.get("noland"):
+            mem["noland"] = True
+            engine.audit.append(engine.actor, "push_watch.read_failed", name, {"why": "no land reader: a land repository completes nothing"})
+        return None
+    if not uses(full_config, repo):
         return None
     default = record.get("default_branch")
     default = default if isinstance(default, str) and re.fullmatch(r"[A-Za-z0-9._/-]{1,100}", default) else "main"
@@ -91,7 +100,7 @@ def _landed(sb, engine, now, gh, name, record, mem, state, repos_live, full_conf
                 break
         if when is None or when <= since:
             continue   # made before the launch (or undated): a baseline, not this worker's landing
-        if repos_live > 1 and name.lower() not in message.lower():
+        if repos_live > 1 and not re.search(r"(?<![A-Za-z0-9_-])%s(?![A-Za-z0-9_-])" % re.escape(name), message, re.I):
             if sha not in mem.setdefault("land_ambiguous", []):
                 mem["land_ambiguous"] = (mem["land_ambiguous"] + [sha])[-TOLD_MAX:]
                 engine.audit.append(engine.actor, "push_watch.land_ambiguous", name, {"sha": sha[:8], "why": "more than one live worker in the repository and the message names none"})
@@ -106,7 +115,8 @@ def _landed(sb, engine, now, gh, name, record, mem, state, repos_live, full_conf
             return None
         if not (isinstance(outcome, dict) and outcome.get("sent")):
             return None   # not delivered: not marked, retried at the next pass
-        mem["landed"] = (mem.get("landed", []) + [sha])[-TOLD_MAX:]
+        older = [c2["sha"] for c2 in commits if c2["sha"] != sha and land_trailer(((c2.get("commit") or {}).get("message")) if isinstance(c2.get("commit"), dict) else None)]
+        mem["landed"] = (mem.get("landed", []) + older + [sha])[-TOLD_MAX:]   # ONE completion: an older Land commit of the same read is not a second one
         state["reported"][name] = max(now, state["reported"].get(name, 0))   # the worker is completed: no quiet item follows
         engine.audit.append(engine.actor, "push_watch.landed", name, {"sha": sha, "repo": _clean(repo, 80), "branch": _clean(default, 60)})
         return sha

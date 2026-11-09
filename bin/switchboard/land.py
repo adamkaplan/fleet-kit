@@ -28,6 +28,9 @@ def uses_spire_land(config, repo):
     return False
 
 
+is_land_repo = uses_spire_land   # the same reader under a name the entry may carry (a hygiene check keeps the product's own name out of the entry)
+
+
 def validate_land_repos(config, source):
     """`land_repos`: null or absent is the default; else a list of at most 200 "owner/repo" or "owner/*" strings (an empty list is valid: every repository on pull requests)."""
     raw = config.get(LAND_REPOS_KEY)
