@@ -48,4 +48,4 @@ image or link inside the block. If the before or the after cannot be said in two
 
 ## janus-infra repositories (spire land)
 
-In a repository of the config key `land_repos` (default `janus-infra/*`) there is no pull request and so no explainer block: done = commit, run `.spire/tool/bin/spire land`, report `landed <sha>` or the exit code; exit 22 = held for a person: stop and say so. No PR body, plan or claims line, no reviewer subagents. Every other repository keeps the rules of this skill.
+When your setup text says "This repository lands with `spire land`" there is no pull request and so no explainer block: done = commit, run `.spire/tool/bin/spire land`, report `landed <sha>` or the exit code; exit 22 = held for a person: stop and say so. No PR body, plan or claims line, no reviewer subagents. Without that line, the rules of this skill stay.

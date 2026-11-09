@@ -60,4 +60,4 @@ A test never pins an exact set or size (an argument list, environment names, set
 
 ## janus-infra repositories (spire land)
 
-In a repository of the config key `land_repos` (default `janus-infra/*`) do not run the reviewer subagents: done = commit, run `.spire/tool/bin/spire land`, report `landed <sha>` or the exit code; exit 22 = held for a person: stop and say so. The council is the review there, and no PR body or explainer is written. Every other repository keeps the rules of this skill.
+When your setup text says "This repository lands with `spire land`" do not run the reviewer subagents: done = commit, run `.spire/tool/bin/spire land`, report `landed <sha>` or the exit code; exit 22 = held for a person: stop and say so. The council is the review there, and no PR body or explainer is written. Without that line, the rules of this skill stay.

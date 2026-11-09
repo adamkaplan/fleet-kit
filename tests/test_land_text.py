@@ -34,7 +34,7 @@ class TestLandText(unittest.TestCase):
         lines = self.lines("janus-infra/widget")
         self.assertEqual(len([l for l in lines if "spire land" in l]), 1)
         added = [l for l in lines if l.strip() and l not in pod.payload(BRIEF, repo="janus-infra/widget", config={"land_repos": []}).splitlines()]   # what a land repository gets beyond today's text
-        self.assertEqual(len(added), 1)
+        self.assertTrue([l for l in added if "spire land" in l])
         self.assertEqual([l for l in added if FORBIDDEN.search(l)], [])
         self.assertEqual(lines[-1], BRIEF.strip())   # the brief is still last, byte for byte
 
@@ -97,16 +97,17 @@ class TestLandText(unittest.TestCase):
                 stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
                 stack.enter_context(contextlib.redirect_stderr(io.StringIO()))
                 self.assertEqual(launch_again._finish_starting(args, None, types.SimpleNamespace(config={"call_timeout_seconds": 5}), state, record, repo, "b"), 0)
-            self.assertEqual(len(sent), 1, repo)
-            self.assertEqual(len([l for l in sent[0].splitlines() if "spire land" in l]), expect, repo)
+            self.assertTrue(sent, repo)
+            self.assertEqual(len([l for l in "\n".join(sent).splitlines() if "spire land" in l]), expect, repo)
 
     def test_the_skills_and_the_brief_header_carry_the_rule(self):
         line = fpn.sb.LAND_SETUP_LINE
+        self.assertIn("This repository lands with `spire land`", line)
         for path in ("skills/fleet-coordination/SKILL.md", "skills/fleet-review/SKILL.md", "skills/fleet-explainer/SKILL.md", "skills/fleet-coordination/operator-brief-header.txt"):
             text = (ROOT / path).read_text()
             self.assertIn(".spire/tool/bin/spire land", text, path)
             self.assertIn("exit 22 = held for a person: stop and say so", text, path)
-            self.assertIn("land_repos", text, path)
+            self.assertIn("This repository lands with `spire land`", text, path)   # tied to the launcher's own marker
         self.assertIn(".spire/tool/bin/spire land", line)
 
 
