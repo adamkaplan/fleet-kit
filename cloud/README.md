@@ -383,6 +383,42 @@ value), a `total:` line and, only when every layer was read and nothing hit, `al
 history)`. Exit 0 / 1 hits / 2 a layer, a member or the archive could not be read (`not scanned`, never a pass; a layer that
 is zstd where python has no zstd is exit 2). `scan-secrets.sh <image>` is `docker save` + `--archive`.
 
+### What is and is not scanned (unmodified distro files are skipped)
+
+The scan reads every file WE put in the image, and skips only the files the distro's package manager put there and that are
+still exactly as the package shipped them. A file is NOT scanned only when BOTH hold: (a) it is named in an installed
+package's file list (`/var/lib/dpkg/info/<package>.list`), and (b) its md5 equals the entry for it in the SAME package's
+`/var/lib/dpkg/info/<package>.md5sums`. Why: distro binaries contain chance matches (an `ASIA` plus sixteen capitals in a
+table of instruction names in `libLLVM`, in `libgnutls`, `libunistring`), and one allowlist line per binary and per
+distro update is the wrong fix. Scanned as before: our `COPY`'d files and scripts, configuration, the downloaded Node and
+opencode binaries, `/opt/pg` (built by us), a file dpkg owns whose md5 DIFFERS (a modified distro file still fails),
+a file no package owns, the dpkg database files themselves, a credential file by NAME (`.netrc`, `.ssh/id_*`, ...: the name
+check is never skipped), and the image configuration (env, labels) and history. The allowlist and its format are unchanged
+and still apply to everything that is scanned.
+
+Rules of the skip set: a path with a `..` is never in it; a directory symlink in a listed path is followed inside the root
+(so `/lib/x/f` finds `/usr/lib/x/f` on a usr-merged image), but a `..` that would climb out of the root, a loop, or a
+symlink as the file itself is not resolvable and not skipped; a package with a list but no md5sums skips nothing; a name in
+md5sums but not in the same package's list skips nothing. FAIL CLOSED: if the dpkg database is missing, unreadable, has no
+package list, or any list or md5sums file is malformed, the skip set is EMPTY, every file is scanned and the scan says so on
+stderr (`dpkg database not usable (...): skip set EMPTY, every file is scanned`). Output: `dpkg: N unmodified files of installed
+distro packages not scanned`.
+
+`--dir` reads the database inside the root it scans. `--archive` (and so `publish-image.sh`) keeps the per-layer scan as it
+is (every layer once, a deleted file still seen, an unreadable layer exit 2, the digest scanned and the tag re-resolved by
+`publish-image.sh` unchanged) and, in the same pass, records each regular file's md5 and the dpkg files, symlinks,
+directories and whiteouts of each layer. After the last layer it builds the MERGED view of the database (layers in order; a
+`.wh.<name>` whiteout or an opaque directory deletes what is below; a later layer's file replaces the earlier one) and only
+then decides, per file, whether it is an unmodified distro file; a file whose md5 differs from the final md5sums is a hit in
+the layer that holds it, also when a later layer replaces it. Hits and layer lines are printed after the last layer.
+
+Why this is safe: the scan guards against a credential written by accident. Whoever can alter the Dockerfile or the package
+database controls the build and the image anyway (they could drop the scan stage); the rule gives them nothing they did not
+have. A file that is not exactly what its package shipped is scanned. The md5 comparison is not a defence against a
+deliberate collision, which would need a second preimage of a distro file. Accepted gap: the rule trusts ANY package dpkg has installed, not only distro ones: a `.deb` we build ourselves and install with `dpkg -i` gets its own list and md5sums and is then not scanned, so do not package files that may hold credentials. Also: a credential that a distro package
+itself ships unmodified (including Docker's third-party apt packages) is not found; those packages come from signed
+repositories, and the pinned download checks (sha256) cover what we fetch directly.
+
 The in-build stage (`--dir /` over the merged filesystem) stays as a cheap early gate: it stops a bad build before anything
 is exported. It cannot see a file deleted in a later layer, so it is not the gate.
 
