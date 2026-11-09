@@ -10,6 +10,7 @@ Pure text handling: subjects and paths are untrusted and are put in a quoted dat
 import json
 import os
 import re
+import urllib.parse
 
 STATE_FILE = "push-watch.json"
 READ_BYTES = 1 << 20
@@ -42,6 +43,88 @@ _clean_plain = _clean
 
 def _clean(text, limit):   # no @ (no mention can fire) and no double quote (the quoted data line cannot be ended early)
     return _clean_plain(str(text).replace("@", "").replace('"', "'"), limit)
+
+
+# Ask #2320: a repository that lands by `spire land` (config `land_repos`, read by the switchboard's `uses_spire_land`) has no pull request. A push to its default branch
+# whose commit carries a Land trailer is the worker's completion: ONE `done` report from the worker, through the engine's own report path (the path the worker's own
+# `report done` takes), with the sha. ASSUMPTION (the playbook janus-infra/spire-venue#8193 was not readable): a trailer is a line of the commit message that starts
+# `Landed-by:` or `Land-<key>:`. With more than one live worker in the repository a commit completes only the worker whose name its message holds.
+LAND_TRAILER = re.compile(r"^(?:Landed-by|Land-[A-Za-z0-9-]+)[ \t]*:[ \t]*\S")
+LAND_READ = 20   # the newest commits of the default branch read per worker per pass
+
+
+def land_trailer(message):
+    """True when the LAST paragraph of the message (its trailer block) has a Land trailer line; a line quoted in the body does not count."""
+    if not isinstance(message, str):
+        return False
+    paragraphs = [p for p in re.split(r"\n[ \t]*\n", message.strip().replace("\r", "")) if p.strip()]
+    return bool(paragraphs) and any(LAND_TRAILER.match(line) for line in paragraphs[-1].split("\n"))
+
+
+def _landed(sb, engine, now, gh, name, record, mem, state, repos_live, full_config):
+    """The completion of a worker of a `spire land` repository: the newest Land-trailer commit on the default branch, made after the launch, not told before.
+    Returns the sha told, or None. A read that fails is audited once and retried at the next pass; a send that fails is not marked."""
+    repo = record.get("repo")
+    uses = getattr(sb, "is_land_repo", None)
+    if uses is None or not uses(full_config, repo):   # (the daemon's tick always passes the reader: a test of it is in test_land_repos.py)
+        return None
+    default = record.get("default_branch")
+    default = default if isinstance(default, str) and re.fullmatch(r"[A-Za-z0-9._/-]{1,100}", default) else "main"
+    since = _launched(sb, state, name, record)
+    if since is None:
+        since = mem.setdefault("land_since", now)
+    try:
+        commits = [c for c in _dicts(gh("repos/%s/commits?sha=%s&per_page=%d" % (repo, urllib.parse.quote(default, safe=""), LAND_READ))) if isinstance(c.get("sha"), str)]
+    except Exception as err:
+        if not mem.get("landfailed"):
+            mem["landfailed"] = True
+            engine.audit.append(engine.actor, "push_watch.read_failed", name, {"why": sb._one_line(str(err), 160), "reading": "default branch of a land repository"})
+        return None
+    mem.pop("landfailed", None)
+    for c in commits:   # newest first
+        sha = c["sha"]
+        inner = c.get("commit") if isinstance(c.get("commit"), dict) else {}
+        message = inner.get("message")
+        if not re.fullmatch(r"[0-9a-f]{40}", sha) or sha in mem.get("landed", []) or not land_trailer(message):
+            continue
+        when = None
+        for who in ("committer", "author"):
+            date = (inner.get(who) or {}).get("date") if isinstance(inner.get(who), dict) else None
+            when = sb.parse_iso(date) if isinstance(date, str) else None
+            if when is not None:
+                break
+        if when is None or when <= since:
+            continue   # made before the launch (or undated): a baseline, not this worker's landing
+        if repos_live > 1 and not re.search(r"(?<![A-Za-z0-9_-])%s(?![A-Za-z0-9_-])" % re.escape(name), message, re.I):
+            if sha not in mem.setdefault("land_ambiguous", []):
+                mem["land_ambiguous"] = (mem["land_ambiguous"] + [sha])[-TOLD_MAX:]
+                engine.audit.append(engine.actor, "push_watch.land_ambiguous", name, {"sha": sha[:8], "why": "more than one live worker in the repository and the message names none"})
+            continue
+        text = "landed %s on %s of %s (Land trailer seen by the push watch)" % (sha[:12], _clean(default, 60), _clean(repo, 80))
+        try:
+            outcome = engine.report(name, "done", text)
+        except Exception as err:
+            if not mem.get("landfailed"):
+                mem["landfailed"] = True
+                engine.audit.append(engine.actor, "push_watch.read_failed", name, {"why": sb._one_line(str(err), 160), "reading": "land completion report"})
+            return None
+        if not (isinstance(outcome, dict) and outcome.get("sent")):
+            return None   # not delivered: not marked, retried at the next pass
+        older = [c2["sha"] for c2 in commits if c2["sha"] != sha and land_trailer(((c2.get("commit") or {}).get("message")) if isinstance(c2.get("commit"), dict) else None)]
+        mem["landed"] = (mem.get("landed", []) + older + [sha])[-TOLD_MAX:]   # ONE completion: an older Land commit of the same read is not a second one
+        state["reported"][name] = max(now, state["reported"].get(name, 0))   # the worker is completed: no quiet item follows
+        engine.audit.append(engine.actor, "push_watch.landed", name, {"sha": sha, "repo": _clean(repo, 80), "branch": _clean(default, 60)})
+        return sha
+    return None
+
+
+def _launched(sb, state, name, record):
+    """The epoch the worker was launched, from the launcher's create line or its hard deadline; None when neither is known."""
+    launched = (state.get("created") or {}).get(name)
+    if launched is None:
+        hard, secs = sb.parse_iso(str(record.get("hard_deadline"))), record.get("hard_seconds")
+        launched = hard - secs if hard is not None and isinstance(secs, (int, float)) and not isinstance(secs, bool) else None
+    return launched
 
 
 def _hms(epoch):
@@ -230,6 +313,8 @@ def run_pass(sb, engine, now, gh, config=None, launcher_audit=None):
                 mem["noboss"] = True
                 engine.audit.append(engine.actor, "push_watch.read_failed", name, {"why": "no reports_to: tells no lane"})
             continue
+        if _landed(sb, engine, now, gh, name, record, mem, state, sum(1 for n in live if records[n].get("repo") == repo), getattr(engine, "config", None)):
+            continue   # completed by its landing (#2320): nothing more to tell of its branches
         task_ = record.get("branch")
         if isinstance(task_, str) and task_ and (task_ in DENIED_BRANCHES or task_ == record.get("default_branch") or any(o != name and (task_ == o or task_.startswith(o + "/")) for o in records) or len(claimed.get(task_, ())) > 1):
             record = dict(record, branch=None)   # the default branch, or a branch two records name, is not this worker's

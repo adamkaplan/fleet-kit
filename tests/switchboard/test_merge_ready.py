@@ -88,6 +88,14 @@ class TestMergeReady(Base):
         self.assertEqual(len(lines), 1, "one line names the fact %r: %r" % (text, out))
         return out
 
+    def test_2320_a_land_repository_has_no_captain_rule_and_the_control_still_needs_the_label(self):
+        self.gh.labels = []
+        self.refused("captain: the required captain label %s is missing" % HOLD)
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "captain_labels": {REPO: HOLD}, "land_repos": ["acme/*"]})
+        code, out, err = self.run_ready()
+        self.assertEqual(code, 0, (out, err))
+        self.assertIn("no captain rule", out)
+
     def test_s3_every_fact_right_says_ready_and_exits_0(self):
         code, out, err = self.run_ready()
         self.assertEqual((code, out.strip()), (0, "READY " + PR + " (base main: the default branch)"), err)
