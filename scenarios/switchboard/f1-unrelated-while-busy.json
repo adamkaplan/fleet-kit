@@ -1,0 +1,37 @@
+{
+  "id": "F1",
+  "title": "An unrelated message while the Chief of Staff is busy",
+  "problem": 2,
+  "since_pr": 8,
+  "tiers": ["offline", "lab-model"],
+  "config": {"classifier_mode": "act"},
+  "cast": {
+    "cos": {"role": "chief-of-staff", "issue": 610}
+  },
+  "issues": {
+    "610": {"intent": "Draft the migration plan", "done_when": "the plan is in the repo"}
+  },
+  "steps": [
+    {"at": "0s", "actor": "cos", "do": "turn", "lasts": "90s", "steps": 9,
+     "why": "The Chief of Staff is busy on ask 610 for a minute and a half"},
+    {"at": "20s", "actor": "you", "do": "message", "to": "cos", "text": "Also, can you look at the billing export?",
+     "why": "The answers file says this is confidently something new"},
+    {"at": "40s", "actor": "cos", "do": "handoff", "issue": 610,
+     "brief": "Done so far: outline agreed, sections 1 to 3 drafted\nNext steps: draft section 4, then open the PR\nWatch out for: the outline excludes billing",
+     "why": "Offline, this step stands in for what the model does with the decoration; lab-model plays the real model instead"},
+    {"at": "60s", "actor": "world", "do": "wait"}
+  ],
+  "expect": [
+    {"name": "decorated", "that": "delivered", "to": "cos", "key": "decoration:*", "mode": "note", "count": 1,
+     "text": "fleet-switchboard handoff --issue 610",
+     "why": "One decoration, a note that rides with your message, naming the command that hands the current ask off"},
+    {"name": "names-the-current-ask", "that": "message_shows", "to": "cos", "text": "Draft the migration plan"},
+    {"name": "classified-new", "that": "classified", "agent": "cos", "step": 1, "as": "new"},
+    {"name": "handed-off", "that": "handed_off", "issue": 610,
+     "why": "The brief is a comment on the ask, and a cos-subagent session exists for it"},
+    {"name": "hands-off-then-answers", "that": "judged", "agent": "cos", "threshold": 0.8,
+     "question": "Did the Chief of Staff hand its current work to a background subagent with a written brief before it answered the new message?",
+     "why": "lab-model only; not evaluated offline"}
+  ],
+  "control": {"fault": "no-classify", "fails": ["decorated", "names-the-current-ask", "classified-new"]}
+}

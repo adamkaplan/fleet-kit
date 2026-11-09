@@ -1,0 +1,26 @@
+{
+  "id": "J1",
+  "title": "The classifier runs in shadow mode",
+  "problem": 2,
+  "since_pr": 7,
+  "tiers": ["offline", "lab-scripted"],
+  "cast": {
+    "cos": {"role": "chief-of-staff"}
+  },
+  "steps": [
+    {"at": "0s", "actor": "you", "do": "message", "to": "cos", "text": "Please work on the migration plan", "lasts": "20s",
+     "why": "Your first message: the Chief of Staff is now busy for 20 s"},
+    {"at": "30s", "actor": "you", "do": "message", "to": "cos", "text": "Also, can you look at the billing export?", "lasts": "40s",
+     "why": "The answers file says this is confidently something new. In shadow mode that is logged and nothing more"},
+    {"at": "50s", "actor": "world", "do": "pass",
+     "why": "An engine pass after the message, while the Chief of Staff is busy"},
+    {"at": "90s", "actor": "world", "do": "wait"}
+  ],
+  "expect": [
+    {"name": "classified-new", "that": "classified", "agent": "cos", "step": 1, "as": "new",
+     "why": "The audit holds the question and Jev's answer"},
+    {"name": "no-decoration", "that": "message_count", "to": "cos", "count": 0,
+     "why": "The switchboard wrote nothing to the Chief of Staff: no decoration, no handoff"}
+  ],
+  "control": {"fault": "no-classify", "fails": ["classified-new"]}
+}

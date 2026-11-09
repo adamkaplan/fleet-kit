@@ -1,0 +1,1 @@
+| `ci_fresh.py` | 0 | the pure decision that a green run counts only when it ran on the current tip of the base branch (ask #1755) | |
