@@ -115,7 +115,7 @@ def _landed(sb, engine, now, gh, name, record, mem, state, repos_live, full_conf
 
 def _launched(sb, state, name, record):
     """The epoch the worker was launched, from the launcher's create line or its hard deadline; None when neither is known."""
-    launched = state.get("created", {}).get(name)
+    launched = (state.get("created") or {}).get(name)
     if launched is None:
         hard, secs = sb.parse_iso(str(record.get("hard_deadline"))), record.get("hard_seconds")
         launched = hard - secs if hard is not None and isinstance(secs, (int, float)) and not isinstance(secs, bool) else None

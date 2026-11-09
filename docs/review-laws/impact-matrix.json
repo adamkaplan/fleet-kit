@@ -375,7 +375,8 @@
         "bin/switchboard/plan_notice.py",
         "bin/switchboard/heavy_budget.py",
         "bin/switchboard/config_reload.py",
-        "bin/switchboard/labels_ensure.py"
+        "bin/switchboard/labels_ensure.py",
+        "bin/switchboard/land.py"
       ],
       "daemon_file": "bin/fleet-switchboard",
       "module_roots": {
@@ -806,6 +807,9 @@
           "ensure_labels",
           "label_names",
           "read_open_items"
+        ],
+        "bin/switchboard/land.py": [
+          "validate_land_repos"
         ]
       },
       "registrar_allow": {
