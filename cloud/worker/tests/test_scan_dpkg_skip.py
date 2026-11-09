@@ -73,7 +73,8 @@ class DirRules(Base):
         db(self.d, "foo", {self.F: BODY})
         rc, out, _ = self.scan()
         self.assertEqual(rc, 1)
-        self.assertEqual([l for l in out.splitlines() if l.endswith(": aws-access-key")], ["opt/ours/f: aws-access-key"])
+        self.assertIn("opt/ours/f: aws-access-key", out.splitlines())
+        self.assertNotIn("usr/lib/x/libfoo.so: aws-access-key", out.splitlines())
 
     def test_md5sums_without_list_entry_is_a_hit(self):
         put(self.d, self.F, BODY)
@@ -155,8 +156,8 @@ class DirRules(Base):
         os.link(os.path.join(self.d, "opt/ours/g"), os.path.join(self.d, "opt/ours/h"))
         rc, out, _ = self.scan()
         self.assertEqual(rc, 1)
-        self.assertEqual(sorted(l for l in out.splitlines() if l.endswith("aws-access-key")),
-                         ["opt/ours/g: aws-access-key", "opt/ours/h: aws-access-key"])
+        self.assertIn("opt/ours/g: aws-access-key", out.splitlines())
+        self.assertIn("opt/ours/h: aws-access-key", out.splitlines())
 
     def test_credential_file_by_name_is_still_a_hit(self):
         data = b"machine example.org login u\n"
@@ -169,10 +170,10 @@ class DirRules(Base):
     def test_the_database_files_are_scanned_too(self):
         put(self.d, self.F, BODY)
         db(self.d, "foo", {self.F: BODY})
-        with open(os.path.join(self.d, INFO, "foo.list"), "ab") as f:
-            f.write(b"# " + KEY + b"\n")
-        rc, _, err = self.scan()
-        self.assertEqual(rc, 1)  # the list now has a non-absolute line: malformed, so nothing is skipped either
+        put(self.d, f"{INFO}/foo.conffiles", b"/etc/x " + KEY + b"\n")
+        rc, out, _ = self.scan()
+        self.assertEqual(rc, 1)
+        self.assertIn(f"{INFO}/foo.conffiles: aws-access-key", out.splitlines())
 
 
 class MetaStillScanned(Base):
@@ -312,6 +313,21 @@ class ArchiveRules(Base):
         self.assertEqual(rc, 1)
         self.assertIn("config: aws-access-key", out.splitlines())
 
+    def test_config_history_is_still_scanned(self):
+        a = os.path.join(self.tmp, "i.tar")
+        archive(a, [dbents("foo", {F: BODY}) + [(F, BODY)]])
+        with tarfile.open(a) as t:
+            members = {m.name: t.extractfile(m).read() for m in t.getmembers()}
+        members["cfg.json"] = json.dumps({"config": {"Env": ["A=b"]}, "history": [{"created_by": "echo " + KEY.decode()}]}).encode()
+        with tarfile.open(a, "w") as t:
+            for n, d in members.items():
+                ti = tarfile.TarInfo(n)
+                ti.size = len(d)
+                t.addfile(ti, io.BytesIO(d))
+        rc, out, _ = run(["--archive", a])
+        self.assertEqual(rc, 1)
+        self.assertIn("config: aws-access-key", out.splitlines())
+
     def test_unreadable_layer_is_exit_2(self):
         a = os.path.join(self.tmp, "i.tar")
         archive(a, [dbents("foo", {F: BODY}) + [(F, BODY)]])
@@ -395,11 +411,46 @@ class Mutants(Base):
         self.check("scan-files.py", 'raise DpkgError(f"malformed md5sums of {pkg}")', "continue", setup, 1, 0)
 
     def test_mutant_fail_closed_message_removed(self):
-        w = self.mutant("scan-files.py", "skip set EMPTY, every file is scanned", "ok")
         put(self.d, F, BODY)
+        rc, out, err = run(["--dir", self.d])  # control first
+        self.assertEqual(rc, 1)
+        self.assertIn("dpkg database not usable", err)
+        self.assertEqual(err.count("skip set EMPTY"), 1)
+        w = self.mutant("scan-files.py", "skip set EMPTY, every file is scanned", "ok")
         rc, out, err = run(["--dir", self.d], worker=w)
+        self.assertEqual(rc, 1)
         self.assertNotIn("skip set EMPTY", err)
-        self.assertEqual(run(["--dir", self.d])[2].count("skip set EMPTY"), 1)
+
+    def test_mutant_everything_skipped(self):
+        def setup(d):
+            put(d, F, BODY)
+            put(d, "opt/ours/f", BODY)
+            db(d, "foo", {F: BODY})
+        self.assertIn("opt/ours/f: aws-access-key", self.dirscan(WORKER, setup)[1].splitlines())
+        shutil.rmtree(self.d)
+        os.makedirs(self.d)
+        w = self.mutant("scan-files.py", "if m5 is not None and m5.hexdigest() in skipmap[shown]:", "if True:")
+        rc, out, _ = self.dirscan(w, setup)
+        self.assertNotIn("opt/ours/f: aws-access-key", out.splitlines())
+
+    def test_mutant_count_line_removed(self):
+        def setup(d):
+            put(d, F, BODY)
+            db(d, "foo", {F: BODY})
+        self.assertIn("dpkg: 1 unmodified files of installed distro packages not scanned", self.dirscan(WORKER, setup)[1].splitlines())
+        shutil.rmtree(self.d)
+        os.makedirs(self.d)
+        w = self.mutant("scan-secrets.sh", "unmodified files of installed distro packages not scanned", "files skipped")
+        self.assertNotIn("dpkg: 1 unmodified files of installed distro packages not scanned", self.dirscan(w, setup)[1].splitlines())
+
+    def test_mutant_archive_config_not_scanned(self):
+        a = os.path.join(self.tmp, "i.tar")
+        archive(a, [dbents("foo", {F: BODY}) + [(F, BODY)]], env="K=" + KEY.decode())
+        rc, out, _ = run(["--archive", a])
+        self.assertIn("config: aws-access-key", out.splitlines())
+        w = self.mutant("scan-layers.py", 'report_hit("config", name)', "pass")
+        rc, out, _ = run(["--archive", a], worker=w)
+        self.assertNotIn("config: aws-access-key", out.splitlines())
 
     def test_mutant_archive_md5_not_compared(self):
         a = os.path.join(self.tmp, "i.tar")

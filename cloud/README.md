@@ -415,7 +415,7 @@ the layer that holds it, also when a later layer replaces it. Hits and layer lin
 Why this is safe: the scan guards against a credential written by accident. Whoever can alter the Dockerfile or the package
 database controls the build and the image anyway (they could drop the scan stage); the rule gives them nothing they did not
 have. A file that is not exactly what its package shipped is scanned. The md5 comparison is not a defence against a
-deliberate collision, which would need a second preimage of a distro file. Accepted gap: a credential that a distro package
+deliberate collision, which would need a second preimage of a distro file. Accepted gap: the rule trusts ANY package dpkg has installed, not only distro ones: a `.deb` we build ourselves and install with `dpkg -i` gets its own list and md5sums and is then not scanned, so do not package files that may hold credentials. Also: a credential that a distro package
 itself ships unmodified (including Docker's third-party apt packages) is not found; those packages come from signed
 repositories, and the pinned download checks (sha256) cover what we fetch directly.
 
