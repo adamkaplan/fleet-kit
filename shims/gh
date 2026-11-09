@@ -1,0 +1,3192 @@
+#!/usr/bin/env python3
+"""gh, signing what an agent says on GitHub.
+
+The agents share one GitHub account, so an event's author cannot say who wrote a
+comment, and each comment an agent posted came back to it as a wake. The
+switchboard drops anything signed with an HTML comment (`<!-- fleet-switchboard:
+from=NAME -->`, invisible when GitHub renders it). This shim is put first on an
+agent's PATH by the `fleet-hooks` plugin's shell hook, so an agent keeps typing
+plain `gh issue comment ...` and the signature is added without its help.
+
+It signs the body of `gh issue comment`, `gh pr comment`, `gh pr review`,
+`gh issue create` and `gh pr create` when the body comes from --body/-b,
+--body-file/-F (a file, or - for stdin); the --comment/-c text of `gh issue close`
+and `gh pr close`; and the `body` field of a POST or PATCH made with `gh api` to
+a comment or review endpoint (SIGNED_API below), whether the body comes from a field
+or from a JSON object read with --input (a file, or - for stdin; an object with no body
+passes unchanged; JSON that cannot be read, a body that is not a string or a missing
+file is refused). A `gh api graphql` call whose query names a body-writing mutation
+(GRAPHQL_BODY_MUTATIONS below: addComment, addPullRequestReview and the like) is refused
+with one line that names the REST or `gh pr comment` form to use: GraphQL text is not
+signed. Everything else runs the real gh unchanged. A signed form whose text cannot be read is refused with one line and
+nothing is posted: it is never posted unsigned.
+"""
+import importlib.util
+import json
+import os
+import posixpath
+import re
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.parse
+
+MARK = "<!-- fleet-switchboard:from=%s -->"
+SIGNED_RE = re.compile(r"<!--\s*fleet-switchboard:from=[A-Za-z0-9_-]{1,64}\s*-->")
+NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+SIGNED_COMMANDS = {("issue", "comment"), ("pr", "comment"), ("pr", "review"), ("issue", "create"), ("pr", "create")}
+CLOSE_COMMANDS = {("issue", "close"), ("pr", "close")}   # signed through their --comment/-c text
+SIGNED_API = (("issue-comments", r"issues/[0-9]+/comments"), ("issue-comment", r"issues/comments/[0-9]+"),
+              ("review-comments", r"pulls/[0-9]+/comments"), ("reviews", r"pulls/[0-9]+/reviews"),
+              ("pr-review-comment", r"pulls/comments/[0-9]+"), ("pr-review-reply", r"pulls/[0-9]+/comments/[0-9]+/replies"))   # `gh api` endpoints (under repos/OWNER/REPO/) whose POST or PATCH body is signed
+GRAPHQL_BODY_MUTATIONS = {   # GraphQL mutations that write a comment or review body: refused (not signed), with the form to use instead
+    "addComment": "gh pr comment, gh issue comment or POST repos/OWNER/REPO/issues/N/comments",
+    "addPullRequestReview": "gh pr review or POST repos/OWNER/REPO/pulls/N/reviews",
+    "addPullRequestReviewComment": "POST repos/OWNER/REPO/pulls/N/comments",
+    "addPullRequestReviewThread": "POST repos/OWNER/REPO/pulls/N/comments",
+    "addPullRequestReviewThreadReply": "POST repos/OWNER/REPO/pulls/N/comments/ID/replies",
+    "updateIssueComment": "PATCH repos/OWNER/REPO/issues/comments/ID",
+    "updatePullRequestReview": "gh pr comment, gh issue comment or POST repos/OWNER/REPO/issues/N/comments",
+    "updatePullRequestReviewComment": "PATCH repos/OWNER/REPO/pulls/comments/ID",
+}
+LOOKUP_SECONDS = 3.0
+WRITE_LOOKUP_SECONDS = 10.0   # a WRITE waits longer for the account lookup: a slow answer must not make it run as the wrong account
+REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+READ_REPO_RE = re.compile(r"[a-z0-9_.-]+/[a-z0-9_.-]+")   # the exact, lower-case spelling the launcher records (a worker's `read_repo`)
+TOKEN_ENV_NAMES = ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN")
+
+
+COUNT_ACCOUNT = [None]
+COUNT_LANE = [None]   # the caller's fleet name (else its role), set when the identity lookup ran for the call: nothing is looked up for the counter
+LANE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+CALLS_SPOOL = "agent-calls.jsonl"
+CALLS_LIMIT = 262144
+CALLS_ON = "agent-calls-hours.json"   # the daemon makes this file: counting is on only while a daemon folds the spool
+NO_NETWORK_GROUPS = ("auth", "config", "alias", "completion", "extension", "help", "version")
+
+APP_SKIP_GROUPS = ("config", "completion", "help", "version")   # only the groups that provably make no call skip the App path: `extension` and `alias` can run programs that call out, `auth` handles tokens
+
+
+# the endpoint class: an ALLOW-LIST, never a filter of what is there (#867). Only the words below can appear in it: a name (repository, owner, user,
+# team, branch, file) is not on any list, so it cannot be recorded. The same code is in shims/gh (`reduce_endpoint`) and bin/agent_calls.py: a test runs both.
+GROUPS = frozenset("api pr issue repo browse release run workflow gist search auth label ruleset status project cache codespace secret variable ssh-key "
+                   "gpg-key org extension alias config completion help version attestation agent-task copilot preview skill".split())
+VERBS = frozenset("view list create edit close reopen merge comment review checks diff status checkout ready delete download watch clone fork sync rerun "
+                  "cancel enable disable get set remove lock unlock transfer pin unpin develop archive unarchive rename upload verify trusted-root login logout "
+                  "refresh token setup-git switch import export".split())
+API_TOP = frozenset("orgs users user teams search gists notifications rate_limit graphql installation app repositories enterprises marketplace_listing "
+                    "emojis meta licenses gitignore codes_of_conduct events feeds octocat zen versions applications authorizations assignments classrooms".split())
+API_SUB = frozenset("issues pulls comments commits contents git refs trees blobs tags branches releases assets labels milestones events actions runs jobs "
+                    "workflows artifacts check-runs check-suites statuses status reviews files requested_reviewers timeline parent sub_issues reactions collaborators "
+                    "hooks deployments environments rulesets protection merge compare readme languages contributors forks stargazers subscribers pages dependabot "
+                    "code-scanning secret-scanning teams topics traffic license rate_limit logs attempts rerun cancel dispatches installation subscription "
+                    "assignees invitations keys comments pending_deployments approvals dependencies blocked_by blocking copilot".split())
+
+
+def reduce_endpoint(text):
+    """`api issues/#` for a call whatever its form (a URL with a host, a leading slash, a query, a repository path, a name anywhere): only allow-listed words
+    survive. `api <top word>` for orgs, users, teams, search and the like (the name after it is dropped); a repository path keeps its own words after
+    `repos/<owner>/<name>/`, numbers as `#`, and stops at the first word not on the list. A command that is not `api` keeps its first word and a second one only when
+    that is a known verb. Anything unknown is the first word alone, or `other`. Idempotent."""
+    words = str(text).split()
+    if not words:
+        return "other"
+    first = re.sub(r"[^a-z0-9_-]", "", words[0].lower())
+    if first not in GROUPS:
+        return "other"
+    if first != "api":
+        second = re.sub(r"[^a-z0-9_-]", "", words[1].lower()) if len(words) > 1 else ""
+        return first + (" " + second if second in VERBS else "")
+    if len(words) < 2:
+        return "api"
+    path = re.sub(r"^[a-zA-Z][a-zA-Z0-9+.-]*://[^/]*", "", words[1].split("?")[0].split("#")[0] if "://" in words[1] else words[1].split("?")[0])
+    segs = [s for s in path.split("/") if s]
+    if not segs:
+        return "api repo"
+    if segs[0] == "repos":
+        segs = segs[3:]
+    elif segs[0] in API_TOP:
+        return "api " + segs[0]
+    kept = []
+    for seg in segs[:12]:
+        if re.fullmatch(r"[0-9]+|#", seg):
+            kept.append("#")
+        elif seg in API_SUB:
+            kept.append(seg)
+        else:
+            break
+    return "api " + ("/".join(kept) or "repo")
+
+
+def call_endpoint(args):
+    """The class of a gh call for the counter, reduced to allow-listed words only (`api issues/#`, `pr view`): never a value, a repository, an owner or a name."""
+    words = command_words(args)
+    if not words:
+        return None
+    return reduce_endpoint(" ".join(words[:2]))
+
+
+def call_lane():
+    """The lane of this call: the fleet name (else the role) from the SAME identity answer the shim already fetched, else `unknown`. The caller's environment is never
+    read for it (a caller could name any lane). A name or a role only: never a value of an argument."""
+    candidate = COUNT_LANE[0]
+    return candidate if isinstance(candidate, str) and LANE_RE.match(candidate) else "unknown"
+
+
+def count_call(args):
+    """Best effort, never fails or delays the command: one line (time, account name, endpoint class) for the daemon's hourly count. The switchboard's
+    own calls are counted by the daemon, not here. Nothing else is recorded: no token, no argument, no body, no repo."""
+    try:
+        words = command_words(args)
+        if not words or words[0] in NO_NETWORK_GROUPS:
+            return
+        endpoint = call_endpoint(args)
+        state = os.environ.get("FLEET_SWITCHBOARD_STATE") or os.path.join(
+            os.environ.get("XDG_STATE_HOME") or os.path.join(os.path.expanduser("~"), ".local", "state"), "fleet-switchboard")
+        path = os.path.join(state, CALLS_SPOOL)
+        if endpoint and os.path.exists(os.path.join(state, CALLS_ON)) and (not os.path.exists(path) or os.path.getsize(path) < CALLS_LIMIT):
+            line = json.dumps({"ts": int(time.time()), "account": COUNT_ACCOUNT[0] or "default", "endpoint": endpoint, "lane": call_lane()}, sort_keys=True)
+            fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+            with os.fdopen(fd, "a") as out:
+                out.write(line + "\n")
+    except Exception:
+        pass
+
+
+# ---- the read cache and the low-budget warning (#867, clauses 3 and 4)
+# A repeated identical `gh api <path>` read of one agent on one account is answered from a short cache (at most CACHE_FRESH seconds), then revalidated with the
+# entity tag (a 304 does not count against GitHub's budget). The key is account + path + agent; any write by that agent drops its entries first. Every error in
+# here falls through to the real call. Only the exact shape `gh api <path>` (a GET with no flag) with stdout not a terminal is cached: anything else runs as before.
+CACHE_DIR = "gh-read-cache"
+CACHE_FRESH = 30          # seconds a cached answer is served without asking GitHub
+CACHE_STALE_MAX = 600     # seconds: the oldest answer served while the account is nearly out of budget, and the longest any entry is kept
+CACHE_BODY_MAX = 1048576
+CACHE_FILES_MAX = 200
+LOW_FRACTION = 0.15       # below this share of the hourly budget the shim says so, and serves a cached read instead of spending
+USAGE_FILE = "github-usage.json"   # the daemon's once-a-minute reading of the account's real usage (bin/agent_calls.py)
+USAGE_FRESH = 600
+WARN_EVERY = 60
+
+
+def state_directory():
+    return os.environ.get("FLEET_SWITCHBOARD_STATE") or os.path.join(
+        os.environ.get("XDG_STATE_HOME") or os.path.join(os.path.expanduser("~"), ".local", "state"), "fleet-switchboard")
+
+
+NEVER_CACHED = frozenset("rate_limit user applications installation app notifications authorizations check-runs check-suites statuses status runs jobs".split())
+# paths whose answer is a STATE (the budget itself, the account, a build or check in progress) that a caller reads to see what is true now, not a fact that lasts:
+# never cached and never served from the cache. Checked on the normalised path, on every segment.
+
+
+def normal_api_path(path):
+    """The path as GitHub reads it: no scheme or host, no query or fragment, percent-decoding applied, lower case, no empty segment, no `api/v3` prefix of an enterprise host."""
+    import urllib.parse
+    text = path.split("#")[0].split("?")[0]
+    text = re.sub(r"^[a-zA-Z][a-zA-Z0-9+.-]*://[^/]*", "", text)
+    text = urllib.parse.unquote(urllib.parse.unquote(text)).lower()
+    segments = [seg for seg in text.split("/") if seg]
+    if segments[:2] == ["api", "v3"]:
+        segments = segments[2:]
+    return segments
+
+
+def never_cached(path):
+    """True for a path that reports a state (see NEVER_CACHED): its first word, or any word after `repos/<owner>/<name>/` (the owner and the name are a name, not a word)."""
+    try:
+        segments = normal_api_path(path)
+        if not segments or any(seg.startswith("..") for seg in segments):
+            return True
+        words = segments[3:] if segments[0] == "repos" else segments[:1]
+        return any(seg in NEVER_CACHED for seg in words)
+    except Exception:
+        return True
+
+
+def cacheable_read(args):
+    """The path of a call that is exactly `gh api <path>` (nothing else: no flag, no method, no field) and not one of the paths that report a state, else None."""
+    if len(args) == 2 and args[0] == "api" and args[1] and not args[1].startswith("-") and "\n" not in args[1] and len(args[1]) <= 2000 and not never_cached(args[1]):
+        return args[1]
+    return None
+
+
+def cache_directory(create=False):
+    """The cache directory (0700, owned by this user, not a link), or None. Only while a daemon has switched counting on (the fleet is in use)."""
+    state = state_directory()
+    if os.environ.get("FLEET_SHIM_CACHE") == "off" or not os.path.exists(os.path.join(state, CALLS_ON)):
+        return None
+    path = os.path.join(state, CACHE_DIR)
+    try:
+        if create and not os.path.lexists(path):
+            os.makedirs(path, mode=0o700, exist_ok=True)
+        info = os.lstat(path)
+    except OSError:
+        return None
+    import stat
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+        return None
+    if stat.S_IMODE(info.st_mode) != 0o700:
+        try:
+            os.chmod(path, 0o700)
+        except OSError:
+            return None
+    return path
+
+
+def _digest(*parts):
+    import hashlib
+    return hashlib.sha256("\0".join(parts).encode("utf-8", "replace")).hexdigest()
+
+
+def cache_file(directory, agent, account, path):
+    return os.path.join(directory, "%s-%s.json" % (_digest(agent)[:16], _digest(account, agent, path)[:40]))
+
+
+def cache_load(file, now):
+    """(age, etag, body) of a stored answer, or None (missing, unreadable, malformed, or older than CACHE_STALE_MAX)."""
+    try:
+        with open(file) as handle:
+            entry = json.loads(handle.read(CACHE_BODY_MAX + 4096))
+        ts, etag, body = entry["ts"], entry.get("etag"), entry["body"]
+        if not isinstance(ts, (int, float)) or isinstance(ts, bool) or not isinstance(body, str) or not (etag is None or isinstance(etag, str)):
+            return None
+        age = now - ts
+        return (age, etag, body) if -5 <= age <= CACHE_STALE_MAX else None
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def cache_store(directory, file, etag, body, now):
+    """Write one entry (0600, a temp file renamed into place), then keep the directory bounded in count and age. Never raises."""
+    tmp = None
+    try:
+        fd, tmp = tempfile.mkstemp(dir=directory, prefix=".tmp-")
+        with os.fdopen(fd, "w") as out:
+            out.write(json.dumps({"ts": now, "etag": etag, "body": body}))
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, file)
+        tmp = None
+        names = [n for n in os.listdir(directory) if n.endswith(".json")]
+        dated = []
+        for name in names:
+            try:
+                dated.append((os.stat(os.path.join(directory, name)).st_mtime, name))
+            except OSError:
+                pass
+        dated.sort()
+        for mtime, name in dated[:max(0, len(dated) - CACHE_FILES_MAX)] + [d for d in dated if now - d[0] > CACHE_STALE_MAX]:
+            try:
+                os.unlink(os.path.join(directory, name))
+            except OSError:
+                pass
+    except Exception:
+        pass
+    finally:
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+
+WRITE_GRACE = 10   # seconds after an agent's write began during which its reads neither use nor fill the cache (a write that is still running may not have taken effect yet)
+
+
+def _marker(directory, agent):
+    return os.path.join(directory, ".w-" + _digest(agent)[:16])
+
+
+def write_marker(directory, agent):
+    """(nonce, time) of the agent's last write mark, or None."""
+    try:
+        with open(_marker(directory, agent)) as handle:
+            row = json.loads(handle.read(500))
+        return (str(row["n"]), float(row["ts"]))
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def cache_mark(agent):
+    """Note that `agent` has a write under way (or just ended): a new nonce and the time. A read that began before this does not store its answer. Never raises."""
+    try:
+        directory = cache_directory()
+        if directory is None or not agent:
+            return
+        tmp = _marker(directory, agent) + ".%d" % os.getpid()
+        with open(tmp, "w") as handle:
+            handle.write(json.dumps({"n": "%d-%s" % (os.getpid(), os.urandom(6).hex()), "ts": time.time()}))
+        os.replace(tmp, _marker(directory, agent))
+    except Exception:
+        pass
+
+
+def cache_drop(agent):
+    """A write by `agent`: mark it, then drop every cached answer of that agent (never another agent's). Never raises."""
+    try:
+        cache_mark(agent)
+        directory = cache_directory()
+        if directory is None or not agent:
+            return
+        prefix = _digest(agent)[:16] + "-"
+        for name in os.listdir(directory):
+            if name.startswith(prefix):
+                try:
+                    os.unlink(os.path.join(directory, name))
+                except OSError:
+                    pass
+    except Exception:
+        pass
+
+
+def budget_low(account):
+    """(remaining, limit) when the daemon's fresh reading says this account is below LOW_FRACTION of its budget, else None."""
+    try:
+        with open(os.path.join(state_directory(), USAGE_FILE)) as handle:
+            body = json.loads(handle.read(200001))
+        row = body["accounts"][account]
+        remaining, limit, at = row["remaining"], row["limit"], body["at"]
+        numbers = (remaining, limit, at)
+        if not all(isinstance(n, (int, float)) and not isinstance(n, bool) for n in numbers) or limit <= 0 or time.time() - at > USAGE_FRESH:
+            return None
+        return (int(remaining), int(limit)) if remaining < LOW_FRACTION * limit else None
+    except Exception:
+        return None
+
+
+def warn_low(account, low):
+    """One line on stderr before a call that would spend, at most once a minute per account. Never raises."""
+    try:
+        directory = os.path.join(state_directory(), "gh-low-warned")
+        stamp = os.path.join(directory, _digest(account)[:16])
+        try:
+            if time.time() - os.stat(stamp).st_mtime < WARN_EVERY:
+                return
+        except OSError:
+            pass
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+        with open(stamp, "w"):
+            pass
+        sys.stderr.write("gh: warning: the GitHub account %s has %d of %d requests left this hour (under %d%%); repeated reads are answered from a short cache\n"
+                         % (account, low[0], low[1], int(LOW_FRACTION * 100)))
+    except Exception:
+        pass
+
+
+# ---- the top spender (#949): below the low-budget line the lane that spent most in the last hour is told, once an hour per account, and only its non-cached reads wait.
+# There is NO per-agent cap, count or quota here or in any configuration: the top spender is a RANKING of the last hour, recomputed from the daemon's record at every
+# call, never a limit and never remembered. The wait is bounded and ends the moment no account the caller tops is low; nothing is refused.
+#
+# WHAT A CALLER CAN SET. This block reads NO environment variable of its own:
+#   - the state directory is the account's home from the password database (never HOME, XDG_STATE_HOME or FLEET_SWITCHBOARD_STATE);
+#   - the switchboard program is the one beside this shim (never FLEET_SWITCHBOARD_BIN);
+#   - the retired FLEET_SWITCHBOARD_OWN_GH is read nowhere in this file (the switchboard's own calls run the real gh by path);
+#   - the timeouts are constants;
+#   - it looks at EVERY low account (never the one a configuration variable maps this call to).
+# The one thing it cannot defend is the identity itself: "who is this caller" is the switchboard's answer from the caller's own session and pane. A caller can only
+# make ITSELF wait less, never another agent wait more or the message stop. A test derives every environment name this file reads and lists the ones that switch
+# the wait off.
+SLOW_SECONDS = 2.0            # the longest any one uncached read of the top spender waits
+NOTICE_EVERY = 3600           # at most one message per account in this many seconds
+TRY_EVERY = 300               # at most one ATTEMPT to send per account in this many seconds, whether or not it made a message (a failing or slow switchboard costs one call in this many, not every call)
+WHO_EVERY = 60                # the identity answer is remembered this long (a stamp in the state directory), so a read does not start a process to ask again
+WHO_SECONDS = 3.0             # the identity question's own deadline
+NOT_AGENTS = frozenset(("daemon", "unknown", "other"))   # lanes that are not an agent a message can name
+FIXED_STATE = [None]          # test seams, set by a test's own wrapper in the same process, never from the environment
+FIXED_PROGRAM = [None]
+
+
+def fixed_state_directory():
+    """The switchboard's state directory as the account's home says (the password database), not as any variable says. None when it cannot be told."""
+    if FIXED_STATE[0]:
+        return FIXED_STATE[0]
+    try:
+        import pwd
+        return os.path.join(pwd.getpwuid(os.getuid()).pw_dir, ".local", "state", "fleet-switchboard")
+    except Exception:
+        return None
+
+
+def fixed_switchboard():
+    """The switchboard program: the one beside this shim (`../bin/fleet-switchboard` of this file's real path), else the one `install` linked in the account's home
+    (the password database's). Never FLEET_SWITCHBOARD_BIN."""
+    if FIXED_PROGRAM[0]:
+        return FIXED_PROGRAM[0]
+    candidates = [os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "bin", "fleet-switchboard")]
+    try:
+        import pwd
+        candidates.append(os.path.join(pwd.getpwuid(os.getuid()).pw_dir, ".local", "bin", "fleet-switchboard"))
+    except Exception:
+        pass
+    for candidate in candidates:
+        real = os.path.realpath(candidate)
+        if os.path.isfile(real) and os.access(real, os.X_OK):
+            return real
+    return None
+
+
+def low_accounts(state):
+    """{account: (remaining, limit)} for every account the daemon's fresh reading puts below LOW_FRACTION of its budget."""
+    try:
+        with open(os.path.join(state, USAGE_FILE)) as handle:
+            body = json.loads(handle.read(200001))
+        at, found = body["at"], {}
+        if not isinstance(at, (int, float)) or isinstance(at, bool) or time.time() - at > USAGE_FRESH:
+            return {}
+        for account, row in body["accounts"].items():
+            remaining, limit = row["remaining"], row["limit"]
+            if all(isinstance(n, (int, float)) and not isinstance(n, bool) for n in (remaining, limit)) and limit > 0 and remaining < LOW_FRACTION * limit:
+                found[account] = (int(remaining), int(limit))
+        return found
+    except Exception:
+        return {}
+
+
+def top_spender(account, state=None):
+    """(agent, its calls, all agent calls) for the lane that spent most on `account` in the last hour (this hour and the one before it, from the daemon's hourly
+    record), or None. The daemon and an unknown lane are never named. A ranking only: nothing is stored."""
+    try:
+        with open(os.path.join(state or fixed_state_directory(), CALLS_ON)) as handle:
+            hours = json.loads(handle.read(2000001))["hours"]
+        now_hour = int(time.time()) // 3600 * 3600
+        spent = {}
+        for key in (str(now_hour), str(now_hour - 3600)):
+            for lane, accounts in ((hours.get(key) or {}).get("lanes") or {}).items():
+                cell = (accounts or {}).get(account)
+                if isinstance(lane, str) and lane not in NOT_AGENTS and LANE_RE.match(lane) and isinstance(cell, dict):
+                    spent[lane] = spent.get(lane, 0) + sum(n for n in cell.values() if isinstance(n, int) and not isinstance(n, bool) and n > 0)
+        spent = {lane: n for lane, n in spent.items() if n > 0}
+        if not spent:
+            return None
+        top = sorted(spent.items(), key=lambda kv: (-kv[1], kv[0]))[0]
+        return top[0], top[1], sum(spent.values())
+    except Exception:
+        return None
+
+
+def tell_top_spender(state, account):
+    """Ask the switchboard to tell the top spender's orchestrator, when no message went for this account in the last hour (the stamp's age: one stat). The
+    switchboard itself checks the budget, ranks the lanes, claims the hour under a lock and builds the message: all this passes it is the account's name, so
+    a direct call to it cannot invent a message. Never raises, never waits long."""
+    try:
+        binary = fixed_switchboard()
+        if not binary:
+            return
+        stamp = os.path.join(state, "gh-low-told", _digest(account)[:16])
+        try:
+            info = os.stat(stamp)
+            if info.st_size > 0 and 0 <= time.time() - info.st_mtime < NOTICE_EVERY:
+                return
+        except OSError:
+            pass
+        if not fresh_stamp(os.path.join(state, "gh-low-tried", _digest(account)[:16]), TRY_EVERY):
+            return   # an attempt was made a few minutes ago (it may have failed): not again per call
+        subprocess.run([binary, "budget-notice", "--account", str(account)], capture_output=True, timeout=8)
+    except Exception:
+        pass
+
+
+def fresh_stamp(path, every):
+    """True when `path` is older than `every` seconds or missing, and then touches it (the attempt is claimed BEFORE it is made). False when it is fresh. Never raises."""
+    try:
+        try:
+            if 0 <= time.time() - os.stat(path).st_mtime < every:
+                return False
+        except OSError:
+            pass
+        os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+        with open(path, "w") as handle:
+            handle.write("1")
+        return True
+    except Exception:
+        return False   # cannot stamp: do not try, the plain call is the answer
+
+
+def caller_name(state=None):
+    """The caller's fleet name from the fixed switchboard's identity answer (its session, never an environment variable of this file's), or None. The answer is
+    remembered WHO_EVERY seconds per parent process in the state directory, a failed question too (None), so it is asked once and not per call."""
+    try:
+        binary = fixed_switchboard()
+        if not binary:
+            return None
+        memo = os.path.join(state, "gh-who", _digest("%s:%s:%s" % (os.getuid(), os.getppid(), binary))[:16]) if state else None
+        if memo:
+            try:
+                if 0 <= time.time() - os.stat(memo).st_mtime < WHO_EVERY:
+                    with open(memo) as handle:
+                        said = handle.read(100)
+                    return said if NAME_RE.match(said) else None
+            except OSError:
+                pass
+        name = None
+        try:
+            done = subprocess.run([binary, "whoami", "--json"], capture_output=True, text=True, timeout=WHO_SECONDS)
+            name = json.loads(done.stdout).get("name") if done.returncode == 0 else None
+            name = name if isinstance(name, str) and NAME_RE.match(name) else None
+        finally:
+            if memo:
+                try:
+                    os.makedirs(os.path.dirname(memo), mode=0o700, exist_ok=True)
+                    with open(memo, "w") as handle:
+                        handle.write(name or "")
+                except OSError:
+                    pass
+        return name
+    except Exception:
+        return None
+
+
+def low_budget_read(agent=None):
+    """For a READ that will reach GitHub (the cache did not answer it; a write or a cached read never gets here): below the line, for every low account, tell its top
+    spender's orchestrator (the attempt is bounded: once an hour when it worked, once per TRY_EVERY when it did not) and wait SLOW_SECONDS when this caller is a top
+    spender. `agent` is the identity the call already knows, else it is asked (and remembered). Reads nothing from the environment (see above). Never raises, never refuses."""
+    try:
+        state = fixed_state_directory()
+        if not state:
+            return
+        tops = {}
+        for account in low_accounts(state):
+            top = top_spender(account, state)
+            if top is not None:
+                tops[account] = top
+        if not tops:
+            return
+        # IDENTITY FIRST: only the top spender of a low account makes the message attempt (a subprocess) and waits; any other caller, and a caller whose identity
+        # cannot be told (remembered WHO_EVERY seconds as unknown: fail open), does a local ranking read and nothing more.
+        name = agent if isinstance(agent, str) and NAME_RE.match(agent) else caller_name(state)
+        if name is None:
+            return
+        mine = [account for account, top in tops.items() if top[0] == name]
+        if not mine:
+            return
+        for account in mine:
+            tell_top_spender(state, account)
+        time.sleep(SLOW_SECONDS)
+    except Exception:
+        pass
+
+
+def split_response(raw):
+    """(status, headers, body bytes) of `gh api -i` output, or None when it is not that shape."""
+    cut = raw.find(b"\r\n\r\n")
+    sep = 4
+    if cut < 0:
+        cut, sep = raw.find(b"\n\n"), 2
+    if cut < 0:
+        return None
+    head = raw[:cut].decode("latin-1").splitlines()
+    first = head[0].split() if head else []
+    if len(first) < 2 or not first[0].startswith("HTTP/") or not first[1].isdigit():
+        return None
+    headers = {}
+    for line in head[1:]:
+        key, colon, value = line.partition(":")
+        if colon:
+            headers[key.strip().lower()] = value.strip()
+    return int(first[1]), headers, raw[cut + sep:]
+
+
+def cached_read(gh, env, args, agent, account, low):
+    """Serve `gh api <path>` from the cache or through one conditional request. Returns an exit status, or None when the normal call should run (nothing was spent)."""
+    path = cacheable_read(args)
+    if path and ("{" in path or os.environ.get("GH_HOST") or os.environ.get("GH_REPO")):
+        path = None   # gh fills `{owner}`, `{repo}` and `{branch}` from the working directory, and these variables change the target: the key could not tell
+    directory = cache_directory(create=True) if path and agent else None
+    if directory is None or sys.stdout.isatty():
+        return None
+    now = time.time()
+    marker = write_marker(directory, agent)
+    if marker is not None and abs(now - marker[1]) <= WRITE_GRACE:
+        return None   # this agent's write began a moment ago: nothing is served from the cache and nothing is stored; the plain call runs
+    file = cache_file(directory, agent, account, path)
+    entry = cache_load(file, now)
+    if entry is not None and (entry[0] <= CACHE_FRESH or low is not None):
+        sys.stdout.buffer.write(entry[2].encode("utf-8"))   # fresh, or the account is nearly out of budget: no request at all
+        sys.stdout.buffer.flush()
+        return 0
+    argv = [gh, "api", "-i"] + (["-H", "If-None-Match: " + entry[1]] if entry is not None and entry[1] else []) + [path]
+    low_budget_read(agent)   # an uncached read reaches GitHub here: the top spender's message attempt and bounded wait (a cached answer returned above, with none)
+    done = subprocess.run(argv, capture_output=True, env=env)   # the one request (the real gh does not time out either)
+    # from here a request is SPENT: whatever happens below, this returns its status and never lets the caller run a second request
+    count_now = True
+    try:
+        parsed = split_response(done.stdout)
+        if parsed is None:   # not an answer this can interpret: say what gh said
+            sys.stdout.buffer.write(done.stdout)
+            sys.stderr.buffer.write(done.stderr)
+            return done.returncode
+        status, headers, body = parsed
+        raced = write_marker(directory, agent) != marker   # a write by this agent began or ended since the request began: this answer may be older than the write
+        if status == 304 and entry is not None:
+            count_now = False   # a 304 costs nothing, so it is not counted
+            if not raced:
+                cache_store(directory, file, entry[1], entry[2], now)
+            sys.stdout.buffer.write(entry[2].encode("utf-8"))
+            sys.stdout.buffer.flush()
+            return 0
+        if 200 <= status < 300 and len(body) <= CACHE_BODY_MAX and not raced:
+            try:
+                cache_store(directory, file, headers.get("etag"), body.decode("utf-8"), now)
+            except Exception:
+                pass
+        sys.stdout.buffer.write(body)
+        sys.stdout.buffer.flush()
+        sys.stderr.buffer.write(done.stderr)
+        return done.returncode
+    except Exception:
+        return done.returncode
+    finally:
+        try:
+            if count_now:
+                count_call(args)
+        except Exception:
+            pass
+
+
+def real_gh():
+    """The first executable named gh on PATH that is not this shim's own directory."""
+    own = os.path.realpath(os.path.dirname(os.path.abspath(__file__)))
+    override = os.environ.get("FLEET_REAL_GH")
+    if override and os.access(override, os.X_OK):
+        return override
+    for entry in os.environ.get("PATH", "").split(os.pathsep):
+        if not entry or os.path.realpath(entry) == own:
+            continue
+        candidate = os.path.join(entry, "gh")
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+def switchboard_binary():
+    """The switchboard executable, or None. FLEET_SWITCHBOARD_BIN when set (a value that is SET wins, even a bad one), else
+    the one `install` linked, as the fleet-hooks plugin does: resolved, an executable file, nothing looked up on PATH."""
+    binary = os.environ.get("FLEET_SWITCHBOARD_BIN")
+    if not binary:
+        try:
+            binary = os.path.realpath(os.path.join(os.path.expanduser("~"), ".local", "bin", "fleet-switchboard"))
+        except (OSError, ValueError):
+            return None
+        if not (os.path.isfile(binary) and os.access(binary, os.X_OK)):
+            return None
+    return binary if os.path.isabs(binary) else None
+
+
+def config_users():
+    """`gh_users` of the switchboard's config (repo or `owner/*` -> gh account), {} when there is none or it cannot be read."""
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
+    try:
+        with open(os.path.join(base, "fleet-switchboard", "config.json")) as handle:
+            users = json.load(handle).get("gh_users")
+    except (OSError, ValueError, AttributeError):
+        return {}
+    return users if isinstance(users, dict) else {}
+
+
+def lookup_seconds(write=False):
+    """The whole identity lookup of one gh call (who am I, which account, its token) shares ONE deadline of this many seconds
+    (default 3 for a read and 10 for a write, FLEET_SHIM_LOOKUP_SECONDS sets both, kept between 0.2 and 10): a wedged daemon or v2 adds at most
+    that, then a read runs as it is and a write is refused (never run as the inherited account)."""
+    default = WRITE_LOOKUP_SECONDS if write else LOOKUP_SECONDS
+    try:
+        return min(10.0, max(0.2, float(os.environ.get("FLEET_SHIM_LOOKUP_SECONDS", default))))
+    except ValueError:
+        return default
+
+
+class Lookup:
+    """One identity lookup per gh call: a single `whoami --json` (name and repo together; an older switchboard that does not
+    know the flag is asked for the plain name, within the same deadline), under a shared deadline."""
+
+    def __init__(self, write=False):
+        self.deadline = time.monotonic() + lookup_seconds(write)
+        self._ident = None
+        self.failed = False   # a lookup that should have answered did not (timed out, could not run, exited non-zero)
+
+    def left(self):
+        return max(0.0, self.deadline - time.monotonic())
+
+    def run(self, argv, **kwargs):
+        """The command's result, or None when the deadline is spent, it timed out or could not run."""
+        if self.left() <= 0:
+            self.failed = True
+            return None
+        try:
+            return subprocess.run(argv, capture_output=True, text=True, timeout=self.left(), **kwargs)
+        except (OSError, subprocess.SubprocessError):
+            self.failed = True
+            return None
+
+    def identity(self):
+        """{"name", "repo"}: either may be missing. {} with no switchboard."""
+        if self._ident is not None:
+            return self._ident
+        self._ident = {}
+        binary = switchboard_binary()
+        if not binary:
+            return self._ident
+        done = self.run(sb_argv(binary, "whoami", "--json"), env=sb_env())
+        try:
+            data = json.loads(done.stdout) if done is not None and done.returncode == 0 else None
+        except ValueError:
+            data = None
+        if isinstance(data, dict):
+            name, repo = data.get("name"), data.get("repo")
+            COUNT_LANE[0] = name if isinstance(name, str) and NAME_RE.match(name) else (data.get("role") if isinstance(data.get("role"), str) else None)
+            self._ident = {"name": name if isinstance(name, str) and NAME_RE.match(name) else None,
+                           "repo": repo if isinstance(repo, str) and REPO_RE.match(repo) else None,
+                           "own": data.get("own") is not False,
+                           "role": data.get("role") if isinstance(data.get("role"), str) else None}   # False: the repo is only the default (`intent_repo`), the caller has none of its own
+            if "read_repo" in data:   # #618: the one extra repository the worker may READ; present but not an exact `owner/name` is False (unreadable: the guard refuses)
+                extra = data["read_repo"]
+                self._ident["read_repo"] = extra if isinstance(extra, str) and READ_REPO_RE.fullmatch(extra) else False
+            return self._ident
+        plain = self.run(sb_argv(binary, "whoami"), env=sb_env())   # an older switchboard: the name only
+        if plain is not None and plain.returncode != 0:
+            self.failed = True                 # neither form answered: a failure, not an old switchboard
+        name = plain.stdout.strip() if plain is not None and plain.returncode == 0 else ""
+        self._ident = {"name": name if NAME_RE.match(name) else None, "repo": None}
+        COUNT_LANE[0] = self._ident["name"]
+        return self._ident
+
+
+class NoAccountMapped(Exception):
+    """git's credential helper was asked, `gh_users` is set, and this caller has no repository or no account mapped for it: git must not authenticate as a guess."""
+
+
+class NoOwnRepository(NoAccountMapped):
+    """The credential route for a caller with no repository of its own: only the configured DEFAULT repository is known for it, and the default repository's account
+    is never a guess git may use (#473). The launcher records a worker's repository from its working directory; a worker with none is refused here."""
+
+
+class AppMintRefused(Exception):
+    """A repository is mapped to the GitHub App (`app_installations`) and its installation token could not be had, or the App configuration cannot be trusted:
+    the call is refused, and the stored login is never used instead (shims/app_mint.py)."""
+
+
+class AccountLookupFailed(Exception):
+    """The account lookup failed where an account WAS expected (a mapping exists): a write must not fall back to the inherited token."""
+
+
+READ_SUBCOMMANDS = {"view", "list", "status", "diff", "checks", "download", "watch", "get", "clone", "ls", "show", "tree", "search", "contents"}
+READ_GROUPS = {"search", "status", "browse", "completion", "help", "version", "auth", "config", "alias", "extension", "ext", "attestation"}
+
+
+def command_words(args):
+    """The positional words of a gh command, skipping flags and the value of `-R`/`--repo` (a flag before the verb, as in `gh pr -R o/r merge 5`, must
+    not hide the verb)."""
+    words, skip = [], False
+    for a in args:
+        if skip:
+            skip = False
+        elif a in ("-R", "--repo"):
+            skip = True
+        elif not a.startswith("-"):
+            words.append(a)
+    return words
+
+
+def is_write(args):
+    """True unless the gh command is KNOWN to only read: a read group (auth, config, search, status, ...), a read sub-command (view, list, status, diff,
+    checks, download, watch, ...), or `gh api` with no method other than GET and no fields. Anything else, including a verb this does not list
+    (`workflow run`, `run rerun`, `secret set`, `gist`, `pr checkout`, an alias), counts as a WRITE: the shim fails closed on what it cannot tell."""
+    try:
+        words = command_words(args)
+        if not words:
+            return False   # `gh --version`, `gh --help`
+        if words[0] == "api":
+            try:
+                return api_parsed(args).effective_method != "GET"   # gh's own rule: an explicit last method, else POST with a field or --input
+            except Refused:
+                return True   # an argv the parser refuses is a write: fail closed
+        if words[:2] == ["auth", "git-credential"]:
+            return True   # git's credential helper (the `git` shim routes push and fetch to it): bound to the repo's account, and a failed lookup refuses, never the stored login
+        if words[0] in READ_GROUPS:
+            return False
+        return not (len(words) >= 2 and words[1] in READ_SUBCOMMANDS)
+    except Exception:
+        return True   # cannot tell: treat as a write, the safe side
+
+
+def is_git_credential(args):
+    try:
+        return command_words(args)[:2] == ["auth", "git-credential"]
+    except Exception:
+        return False
+
+
+EXPLICIT_REPO_GROUPS = {"issue", "pr"}
+URL_REPO_RE = re.compile(r"^https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/(?:issues|pull)/[0-9]+(?:[/?#].*)?$")
+
+
+VALUE_FLAGS = {"-b", "--body", "-F", "--body-file", "-t", "--title", "-l", "--label", "-a", "--assignee", "-m", "--milestone", "-p", "--project",
+               "-r", "--reviewer", "-B", "--base", "-H", "--head", "-q", "--jq", "--json", "--template", "-s", "--state",
+               "-S", "--search", "-L", "--limit", "--author", "--app", "--add-label", "--remove-label", "--add-assignee", "--remove-assignee",
+               "--add-reviewer", "--remove-reviewer", "--add-project", "--remove-project", "--reason"}
+TARGET_VERBS = {"view", "comment", "edit", "close", "reopen", "ready", "checks", "diff", "lock", "unlock", "status"}
+
+
+def explicit_repo(args):
+    """The repo a `gh issue ...` or `gh pr ...` command NAMES, or None: from the real `-R`/`--repo` flag (never from the value of another flag such as
+    `--body` or `--title`) or from an issue or pull request URL that is the target argument right after the verb. Never for `merge`: a merge keeps
+    the caller's own rule. Only `issue` and `pr` commands: nothing else (`repo`, `secret`, `workflow`, `run`, `api`) picks an account by what it names.
+    Two different repos named, or anything it cannot tell, give None (the command then runs as it always did)."""
+    try:
+        words = command_words(args)
+        if len(words) < 2 or words[0] not in EXPLICIT_REPO_GROUPS or words[1] == "merge":
+            return None
+        found, skip = set(), False
+        for i, a in enumerate(args):
+            if skip:
+                skip = False
+            elif a in ("-R", "--repo") and i + 1 < len(args):
+                found.add(args[i + 1])
+                skip = True
+            elif a.startswith("--repo="):
+                found.add(a.split("=", 1)[1])
+            elif a.startswith("-R") and len(a) > 2 and not a.startswith("--"):
+                found.add(a[2:].lstrip("="))
+            elif a in VALUE_FLAGS:
+                skip = True      # the next argument is that flag's value (a body or title may hold anything): never read it as a repo
+        if not found and words[1] in TARGET_VERBS:
+            verb_at = args.index(words[1]) if words[1] in args else -1
+            if verb_at >= 0 and verb_at + 1 < len(args):
+                m = URL_REPO_RE.match(args[verb_at + 1])
+                if m:
+                    found.add(m.group(1))
+        found = {f for f in found if isinstance(f, str)}
+        if len(found) != 1:
+            return None
+        repo = found.pop()
+        return repo if REPO_RE.match(repo) else None
+    except Exception:
+        return None
+
+
+MATCHER = [None, False]   # (module, tried): repo_match.py beside this file, loaded by path
+
+
+def load_matcher():
+    """The shared repository matcher (the launch guard's rules), or None when it cannot be loaded (callers then refuse a write: fail closed)."""
+    if not MATCHER[1]:
+        MATCHER[1] = True
+        try:
+            path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "repo_match.py")
+            spec = importlib.util.spec_from_file_location("repo_match", path)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            MATCHER[0] = module
+        except Exception:
+            MATCHER[0] = None
+    return MATCHER[0]
+
+
+
+
+UNNAMED_REPO_GROUPS = {"search", "gist", "status", "browse", "attestation", "extension", "ext", "alias", "org", "project", "codespace", "ssh-key", "gpg-key"}
+
+
+def named_repos(args):
+    """(set of the repository spellings a gh command NAMES, True when something it names cannot be read). Read from the real `-R`/`--repo` flag, from a
+    GitHub URL given as an argument, from a `gh api` path (`repos/OWNER/NAME/...`) and from the argument of `gh repo ...`; never from the value of another
+    flag (a body or title may say anything). Used only for a worker that has a read-only extra repository (#618)."""
+    found, bad, skip = set(), False, False
+    words = command_words(args)
+    for i, a in enumerate(args):
+        if skip:
+            skip = False
+        elif a in ("-R", "--repo"):
+            skip = True
+            found.add(args[i + 1] if i + 1 < len(args) else "")   # no value at all: an empty name, refused by the caller
+        elif a in VALUE_FLAGS:
+            skip = True
+        elif a.startswith("--repo="):
+            found.add(a.split("=", 1)[1])
+        elif a.startswith("-R") and not a.startswith("--"):
+            found.add(a[2:].lstrip("="))
+        elif not a.startswith("-"):
+            m = re.match(r"^(?:https?://)?(?:www\.)?github\.com[/:]([^/\s?#]*)/([^/\s?#]*)", a, re.I)
+            if m:
+                found.add("%s/%s" % m.groups())
+    if words[:1] == ["api"]:
+        try:
+            rest = ["api"] + [p for _i, p in api_parsed(args).positionals]
+        except Refused:
+            rest = []   # an argv the parser refuses: len(rest) != 2 below, so it is refused whole
+        path = re.sub(r"^https://api\.github\.com/", "", (rest[1] if len(rest) > 1 else "").split("?")[0].split("#")[0]).lstrip("/")
+        m = re.match(r"^repos/([^/]*)/([^/]*)", path)
+        if len(rest) != 2 or "\\" in path or "%" in path or "//" in path or any(seg in (".", "..") for seg in path.split("/")):
+            bad = True   # a dot segment (plain, percent-encoded, mixed case), a backslash or an empty segment can walk out of the repository that was matched: refused whole
+        elif m:
+            found.add("%s/%s" % m.groups())
+        elif path not in ("user", "rate_limit", "meta"):
+            bad = True   # graphql, search, repositories/ID, orgs/..., anything else could reach a repository it does not name: refused
+    elif len(words) >= 3 and words[0] == "repo":
+        found.add(words[2])
+    return found, bad
+
+
+def read_scope(args, lookup, write):
+    """The guard for a worker launched with `--read-repo` (#618): None (not such a worker, or nothing to say: the command runs as it always did),
+    ("refuse", one line) or ("read", the extra repository). A SHIM guard, not a GitHub guard.
+
+    For such a worker, every repository a command names must be the worker's own repository (any spelling the shared matcher reads as it) or EXACTLY the
+    recorded extra one: anything else, an unreadable spelling, or two different repositories, is refused. A command on the extra repository runs as THAT
+    repository's account when it only reads, and is refused when it writes. A record that cannot be read (`read_repo` false) refuses every command that
+    reaches GitHub. Fails closed on its own trouble. A worker without the key is never touched; a lookup that failed says nothing about the record."""
+    try:
+        ident = lookup.identity()
+        if "read_repo" not in ident:
+            return None
+        extra = ident["read_repo"]
+        words = command_words(args)
+        if words and words[0] in UNNAMED_REPO_GROUPS:
+            return ("refuse", "gh: refused: `gh %s` can reach any repository without naming it, so a worker with a read-only repository may not run it" % words[0])
+        if words and words[0] in NO_NETWORK_GROUPS and words[0] != "auth":
+            return None
+        if not extra:
+            return ("refuse", "gh: this worker's read-only repository record cannot be read, so the fleet shim refuses every GitHub command "
+                              "(it will not run with no restriction). Relaunch it with `fleet-switchboard launch ... --read-repo OWNER/NAME`")
+        matcher = load_matcher()
+        if matcher is None or matcher.normal_repo(extra) != extra:
+            return ("refuse", "gh: the fleet shim cannot read its repository matcher, so it refuses commands for a worker with a read-only repository")
+        found, bad = named_repos(args)
+        own = matcher.normal_repo(ident.get("repo")) if ident.get("own") and ident.get("repo") else None
+        kinds = set()
+        for raw in found:
+            if raw == extra:
+                kinds.add("extra")
+            elif matcher.normal_repo(raw) is not None and matcher.normal_repo(raw) == own:
+                kinds.add("own")
+            else:
+                return ("refuse", "gh: refused: this worker may use its own repository and read %s (read only), not %s" % (extra, _clean_reason(raw) or "(empty)"))
+        if bad or len(kinds) > 1 or (len(found) > 1 and "extra" in kinds):
+            return ("refuse", "gh: refused: this command names more than one repository, or one that cannot be read: a worker with a read-only repository names exactly one")
+        if kinds == {"extra"}:
+            if write:
+                return ("refuse", "gh: refused: %s is read only for this worker (a shim guard: it may run issue view, pr view, api GET and other reads, never a write)" % extra)
+            return ("read", extra)
+        return None
+    except Exception:
+        return ("refuse", "gh: the read-only repository check failed, retry (the fleet shim refuses rather than run with no restriction)")
+
+
+def read_account_env(gh, lookup, extra):
+    """The environment for a READ of the extra repository: GH_TOKEN of the account `gh_users` maps it to, nothing else. A missing map, mapping or token refuses
+    (NoAccountMapped / AccountLookupFailed): a read of the extra repository never runs as the inherited or the worker's own account."""
+    users = config_users()
+    matcher = load_matcher()
+    account = matcher.account_for(users, extra) if matcher is not None and users else None
+    if not isinstance(account, str) or not account:
+        raise NoAccountMapped("repository %s" % extra)
+    COUNT_ACCOUNT[0] = account
+    clean = {k: v for k, v in os.environ.items() if k not in TOKEN_ENV_NAMES}
+    got = (lookup or Lookup()).run([gh, "auth", "token", "--user", account], stdin=subprocess.DEVNULL, env=clean)
+    token = got.stdout.strip() if got is not None and got.returncode == 0 else ""
+    if not token:
+        raise AccountLookupFailed("token")
+    return dict(os.environ, GH_TOKEN=token)
+
+
+def warn_text(args):
+    """Warn on stderr when a body or comment reads badly (shims/body_warn.py beside this file). Only a warning: any doubt or trouble prints nothing."""
+    try:
+        if not any(a[:2] == "-b" or a == "--body" or a.startswith("--body=") for a in args[2:]):
+            return   # no inline text flag: nothing is loaded; a --body-file or stdin is never opened or read
+        spec = importlib.util.spec_from_file_location("body_warn", os.path.join(os.path.dirname(os.path.realpath(__file__)), "body_warn.py"))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        line = module.warning(args)
+        if line:
+            sys.stderr.write(line)
+    except Exception:
+        pass
+
+
+APP_MODULE = [None, False]   # (module, tried): app_mint.py beside this file, loaded by path
+APP_CHILD = []                # the real gh child while a token file exists: a killed shim stops it too
+APP_DIRS = []                 # private directories holding a token for the real gh (hosts.yml); removed when the call ends
+
+
+def load_app():
+    if not APP_MODULE[1]:
+        APP_MODULE[1] = True
+        try:
+            path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "app_mint.py")
+            spec = importlib.util.spec_from_file_location("app_mint", path)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            APP_MODULE[0] = module
+        except Exception:
+            APP_MODULE[0] = None
+    return APP_MODULE[0]
+
+
+def app_config():
+    """(module, Config) when the owner maps any repository to the App, else None (the feature is off and nothing here runs). A config that names the App but cannot
+    be trusted, or a module that cannot be loaded, refuses (AppMintRefused): never the stored login."""
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
+    try:
+        with open(os.path.join(base, "fleet-switchboard", "config.json")) as handle:
+            named = "app_installations" in handle.read()
+    except FileNotFoundError:
+        return None
+    except Exception:
+        named = True   # a config that cannot be read is not known to name no App mapping
+    if not named:
+        return None
+    module = load_app()
+    if module is None:
+        raise AppMintRefused("gh: refused: the GitHub App module could not be loaded, so no call is made with the stored login")
+    try:
+        config = module.read_config()
+    except module.ConfigError as err:
+        raise AppMintRefused("gh: refused: the GitHub App configuration cannot be used (%s)" % _clean_reason(str(err)))
+    return (module, config) if config is not None else None
+
+
+def app_terminated(number, frame):
+    for child in APP_CHILD:
+        try:
+            child.terminate()
+        except OSError:
+            pass
+    sys.exit(128 + number)
+
+
+def app_cleanup():
+    while APP_DIRS:
+        shutil.rmtree(APP_DIRS.pop(), ignore_errors=True)
+
+
+def app_env(app, repo):
+    """The environment for the real gh when `repo` is mapped to the App: the installation token as a private hosts.yml in GH_CONFIG_DIR (neither argv nor an
+    environment value), every token variable removed. None when `repo` is not mapped. AppMintRefused when it is and no acceptable token can be had."""
+    module, config = app
+    if config.entry(repo) is None:
+        return None
+    try:
+        token = module.token_for(config, repo)
+        directory = module.write_hosts_dir(token)
+    except (module.MintRefused, OSError) as err:
+        raise AppMintRefused("gh: refused: no GitHub App token for %s (%s); the stored login is not used" % (_clean_reason(str(repo)), _clean_reason(str(err))))
+    APP_DIRS.append(directory)
+    for number in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(number, app_terminated)   # a killed shim still removes its token file (the finally in main)
+    return module.child_env(directory)
+
+
+def account_env(gh, lookup=None, strict=False, credential=False, args=None, read_repo=None):
+    """The environment for the real gh with GH_TOKEN of the account that `gh_users` maps to the repo of the caller's RESOLVED
+    identity (`fleet-switchboard whoami --json`: its session, never an inherited variable), the same map and the same
+    `gh auth token --user` the daemon uses; so an inherited token never decides who an agent acts as. None leaves the
+    environment as it is: no mapping, no switchboard (or one too old to answer), no repo, no token, the lookup deadline
+    spent, any trouble. The token is only put in the child's environment: never printed, logged or put in argv."""
+    app = None
+    try:
+        if read_repo:
+            return read_account_env(gh, lookup, read_repo)
+        users = config_users()
+        words = command_words(args or [])
+        app = app_config() if (credential or not words or words[0] not in APP_SKIP_GROUPS) and not (args and not words) else None   # `gh --version` makes no call
+        if not users and app is None:
+            return None   # no per-repository accounts are configured: nothing to bind to, whatever the caller is
+        if not switchboard_binary():
+            if credential:
+                raise NoAccountMapped("this shell (no switchboard to say which repository it is)")
+            if app is not None:
+                raise AppMintRefused("gh: refused: the App is configured and no switchboard can say which repository this is, so the stored login is not used")
+            return None
+        lookup = lookup or Lookup()
+        ident = lookup.identity()
+        repo = ident.get("repo")
+        if credential and ident.get("own") is False and not lookup.failed:
+            # the caller has no repository of its own (`own` false: the repo is only the config's default). Nothing a git push names says which account it is for, and
+            # the default repository's account is a guess that pushes as the wrong account: refuse. Nothing here reads a directory's remote.
+            raise NoOwnRepository("this worker")
+        if (not repo or ident.get("own") is False) and not lookup.failed:
+            # a caller with no repo of its own (the Chief of Staff: whoami gives only the default `intent_repo`, own false) acts as the account of the
+            # repo the command names; with nothing named it keeps the default repo's account as before
+            repo = explicit_repo(args or []) or repo
+        if not repo:
+            if strict and lookup.failed:
+                raise AccountLookupFailed("identity")
+            if credential:
+                raise NoAccountMapped("this shell (it has no repository identity)")
+            if app is not None:
+                raise AppMintRefused("gh: refused: the App is configured and this shell has no repository identity, so the stored login is not used")
+            return None
+        matcher = load_matcher()
+        if matcher is None or matcher.normal_repo(repo) is None:
+            if credential or strict:
+                raise NoAccountMapped("repository %s" % _clean_reason(str(repo)))   # a repository that cannot be read is unmatched and refused, never defaulted
+            return None
+        if app is not None:
+            if ident.get("own") is False and ident.get("role") != "chief-of-staff" and app[1].entry(repo) is not None:
+                # no repository of its own AND not the Chief of Staff (by the RECORDED role; a missing role counts as not): the repository above is the default or the one the
+                # command names, and neither is this caller's to write in
+                raise AppMintRefused("gh: refused: only the Chief of Staff, by its recorded role, may act for a repository it does not own: %s is mapped to the App and this caller has no repository of its own" % _clean_reason(str(repo)))
+            if ident.get("own") is not False:   # a caller WITH its own repository never gets another mapped repository's token by naming it (-R, a URL): refused, naming both
+                named = explicit_repo(args or [])
+                if named and matcher.normal_repo(named) is not None and matcher.normal_repo(named) != matcher.normal_repo(repo) and app[1].entry(named) is not None:
+                    raise AppMintRefused("gh: refused: this worker's repository is %s and the command names %s, which is mapped to the App: a worker acts only for its own repository" % (_clean_reason(str(repo)), _clean_reason(str(named))))
+            target = repo   # a caller with no repository of its own already has `repo` = the repository the command names (above)
+            got_env = app_env(app, target)   # a repository mapped to the App uses its installation token and nothing else
+            if got_env is not None:
+                COUNT_ACCOUNT[0] = "app"
+                return got_env
+        account = matcher.account_for(users, repo)
+        if not isinstance(account, str) or not account:
+            if credential and users:
+                raise NoAccountMapped("repository %s" % repo)
+            return None
+        COUNT_ACCOUNT[0] = account   # for the call counter: the account's NAME only
+        clean = {k: v for k, v in os.environ.items() if k not in TOKEN_ENV_NAMES}
+        got = lookup.run([gh, "auth", "token", "--user", account], stdin=subprocess.DEVNULL, env=clean)
+        token = got.stdout.strip() if got is not None and got.returncode == 0 else ""
+        if not token and strict:
+            raise AccountLookupFailed("token")
+        return dict(os.environ, GH_TOKEN=token) if token else None
+    except (AccountLookupFailed, NoAccountMapped, AppMintRefused):
+        raise
+    except Exception as err:
+        if read_repo:
+            raise AppMintRefused("gh: refused: the account for reading %s could not be worked out (%s), so the fleet shim will not run it with the inherited or stored token" % (_clean_reason(str(read_repo)), type(err).__name__))   # #618: a read-only extra repository never falls through to any other token
+        if credential:
+            raise NoAccountMapped("this shell (its account could not be worked out)")   # the credential route never guesses: any trouble refuses
+        if app is not None:
+            raise AppMintRefused("gh: refused: the App is configured and the account could not be worked out, so the stored login is not used")
+        return None
+
+
+def _clean_reason(text, limit=120):
+    return "".join(c if 32 <= ord(c) < 127 else " " for c in text)[:limit]
+
+
+def my_name(lookup=None):
+    """The calling agent's fleet name, or "agent": the name only says who, the signature is what matters."""
+    try:
+        return (lookup or Lookup()).identity().get("name") or "agent"
+    except Exception:
+        return "agent"
+
+
+def sign(body, name):
+    return body if SIGNED_RE.search(body) else body.rstrip("\n") + "\n\n" + MARK % name + "\n"
+
+
+BODY_FLAGS = ((("--body", "-b"), "body"), (("--body-file", "-F"), "file"))
+COMMENT_FLAGS = ((("--comment", "-c"), "body"),)
+
+
+def body_flag(args, specs=BODY_FLAGS):
+    """(index, kind, inline) of the LAST body flag among args[2:]: kind "body" or "file"; inline is the
+    value when it is part of the same argument (`--body=x`, `-bx`), else None (the value is args[index+1])."""
+    found = None
+    i = 2
+    while i < len(args):
+        arg = args[i]
+        if arg == "--":
+            break
+        for names, kind in specs:
+            for name in names:
+                if arg == name:
+                    found = (i, kind, None)
+                elif arg.startswith(name + "=") or (not name.startswith("--") and arg.startswith(name) and len(arg) > 2
+                                                    and not arg.startswith("--")):
+                    found = (i, kind, arg[len(name) + 1:] if arg[len(name):len(name) + 1] == "=" else arg[len(name):])
+        i += 1
+    return found
+
+
+class Unsignable(Exception):
+    """A signed form whose text cannot be signed: the call is refused, never posted unsigned."""
+
+
+class Refused(Unsignable):
+    """A call refused with its own one line (shown after "gh: refused: ")."""
+
+
+def read_text(path):
+    try:
+        with open(path, "r") as handle:
+            return handle.read()
+    except (OSError, UnicodeError) as err:
+        raise Unsignable("the text of %s cannot be read (%s)" % (path, type(err).__name__))
+
+
+def temp_signed(text, name):
+    handle, temp = tempfile.mkstemp(prefix="fleet-gh-", suffix=".md")
+    with os.fdopen(handle, "w") as out:
+        out.write(sign(text, name))
+    return temp
+
+
+def signed_call(args, name, specs=BODY_FLAGS, commands=SIGNED_COMMANDS):
+    """(new argv, stdin text or None, temp file(s) to remove or None), or None when there is nothing to sign.
+    Raises Unsignable for a --body-file that cannot be read."""
+    if len(args) < 3 or (args[0], args[1]) not in commands:
+        return None
+    flag = body_flag(args, specs)
+    if flag is None:
+        return None
+    index, kind, inline = flag
+    value_at = index if inline is not None else index + 1
+    value = inline if inline is not None else (args[index + 1] if index + 1 < len(args) else None)
+    if value is None:
+        return None
+    new = list(args)
+    if kind == "body":
+        signed = sign(value, name)
+        if inline is not None:
+            new[index] = args[index].replace(value, signed, 1) if args[index].startswith("--") else args[index][:2] + signed
+        else:
+            new[value_at] = signed
+        return new, None, None
+    if value == "-":
+        return new, sign(sys.stdin.read(), name), None
+    temp = temp_signed(read_text(value), name)
+    if inline is not None:
+        new[index] = args[index][:len(args[index]) - len(value)] + temp
+    else:
+        new[value_at] = temp
+    return new, None, temp
+
+
+def close_call(args, namer):
+    """`gh issue close` and `gh pr close`: the --comment/-c text is signed; no comment (or an empty one) passes through."""
+    flag = body_flag(args, COMMENT_FLAGS) if len(args) >= 3 and (args[0], args[1]) in CLOSE_COMMANDS else None
+    if flag is None:
+        return None
+    index, _kind, inline = flag
+    value = inline if inline is not None else (args[index + 1] if index + 1 < len(args) else None)
+    if not value:
+        return None
+    return signed_call(args, namer(), COMMENT_FLAGS, CLOSE_COMMANDS)
+
+
+API_ENDPOINT_RE = re.compile(r"^/?repos/[^/?#]+/[^/?#]+/(?:%s)/?(?:\?.*)?$" % "|".join(p for _label, p in SIGNED_API))
+
+
+# ---- #1696 round 6: ONE PARSER of the argv of `gh api`, following gh's flag library (spf13/pflag). Every reader of that argv in this shim (api_parse,
+# api_scan, input_value, the signing positions) is a view of ITS result; nothing else reads the words. PINNED to gh 2.103.3 (2026-10-26): the table below is
+# `gh api --help` of that version; a gh upgrade is a conscious update of this table. (gh api has no -R/--repo of its own: a leading -R is leading_repo_flags.)
+GH_API_PINNED = "2.103.3"
+GH_API_FLAGS = (   # (long name, short letter or "", takes a value)
+    ("allow-escape-sequences", "", False), ("cache", "", True), ("field", "F", True), ("header", "H", True),
+    ("hostname", "", True), ("include", "i", False), ("input", "", True), ("jq", "q", True), ("method", "X", True),
+    ("paginate", "", False), ("preview", "p", True), ("raw-field", "f", True), ("silent", "", False), ("slurp", "", False),
+    ("template", "t", True), ("verbose", "", False), ("help", "h", False))
+GH_API_LONG = {name: (name, short, value) for name, short, value in GH_API_FLAGS}
+GH_API_SHORT = {short: (name, short, value) for name, short, value in GH_API_FLAGS if short}
+BOOL_TRUE, BOOL_FALSE = ("1", "t", "T", "TRUE", "true", "True"), ("0", "f", "F", "FALSE", "false", "False")
+
+
+class ApiArgv:
+    """The result of parse_api_argv. flags: [(name, token index, joined text or None, value)] in order; the joined text is the part of the token that holds the
+    value (so args[index][:len-len(joined)] + new rewrites it), None when the value is the next word (index + 1)."""
+    def __init__(self):
+        self.flags, self.positionals = [], []
+
+    def values(self, name):
+        return [f for f in self.flags if f[0] == name]
+
+    @property
+    def method(self):   # the explicit last -X/--method, upper-cased; None when none
+        found = self.values("method")
+        return found[-1][3].upper() if found else None
+
+    @property
+    def fields(self):   # [(token index, flag name, joined, text)] of every field flag; the key/value split is on the FIRST '='
+        return [(f[1], f[0], f[2], f[3]) for f in self.flags if f[0] in ("field", "raw-field")]
+
+    @property
+    def headers(self):   # [(lower-cased name, value)] of every header
+        return [(v.partition(":")[0].strip().lower(), v.partition(":")[2].strip()) for _n, _i, _j, v in self.values("header")]
+
+    @property
+    def input(self):
+        found = self.values("input")
+        return found[-1] if found else None
+
+    @property
+    def hostname(self):
+        found = self.values("hostname")
+        return found[-1][3] if found else None
+
+    @property
+    def effective_method(self):   # gh's own rule: POST when a field or --input is given and no explicit method
+        return self.method or ("POST" if self.fields or self.input else "GET")
+
+
+def _api_refuse(token, rule):
+    raise Refused("%s: %s (the shim reads gh api's argv as gh's flag library does, and refuses what it cannot classify)" % (_clean_reason(token[:40]), rule))
+
+
+def parse_api_argv(args):
+    """Parse args (args[0] == "api") as pflag does. Raises Refused for an unknown flag, a missing value, a boolean with a non-bool value, an unknown short letter,
+    or a second positional. `--` ends the flags; a lone `-` and every word after the first non-flag are positionals (options may follow the endpoint)."""
+    out, i = ApiArgv(), 1
+    while i < len(args):
+        arg = args[i]
+        if arg == "--":
+            out.positionals.extend((j, args[j]) for j in range(i + 1, len(args)))
+            break
+        if arg.startswith("--"):
+            name, eq, value = arg[2:].partition("=")
+            spec = GH_API_LONG.get(name)
+            if spec is None:
+                _api_refuse(arg, "unknown flag --%s" % name)
+            if spec[2]:
+                if eq:
+                    out.flags.append((name, i, value, value))
+                elif i + 1 < len(args):
+                    out.flags.append((name, i, None, args[i + 1]))
+                    i += 1
+                else:
+                    _api_refuse(arg, "flag --%s needs a value" % name)
+            elif eq and value not in BOOL_TRUE + BOOL_FALSE:
+                _api_refuse(arg, "boolean flag --%s given the value %r, which is not true or false" % (name, value[:20]))
+            elif not eq or value in BOOL_TRUE:
+                out.flags.append((name, i, None, "true"))
+        elif arg.startswith("-") and len(arg) > 1:
+            rest = arg[1:]
+            while rest:
+                spec = GH_API_SHORT.get(rest[0])
+                if spec is None:
+                    _api_refuse(arg, "unknown short flag -%s" % rest[0])
+                tail = rest[1:]
+                if len(tail) > 1 and tail[0] == "=":
+                    tail = tail[1:]   # pflag strips ONE '=' straight after the letter (only when something follows it)
+                if spec[2]:
+                    if tail:
+                        out.flags.append((spec[0], i, tail, tail))
+                    elif i + 1 < len(args):
+                        out.flags.append((spec[0], i, None, args[i + 1]))
+                        i += 1
+                    else:
+                        _api_refuse(arg, "flag -%s needs a value" % rest[0])
+                    break
+                if rest[1:2] == "=" and len(rest) > 2:   # a boolean short with a joined value ends the cluster; only a bool literal is read
+                    if tail not in BOOL_TRUE + BOOL_FALSE:
+                        _api_refuse(arg, "boolean flag -%s given the value %r, which is not true or false" % (rest[0], tail[:20]))
+                    if tail in BOOL_TRUE:
+                        out.flags.append((spec[0], i, None, "true"))
+                    break
+                out.flags.append((spec[0], i, None, "true"))
+                rest = rest[1:]
+        else:
+            out.positionals.append((i, arg))
+        i += 1
+    if len(out.positionals) > 1:
+        _api_refuse(out.positionals[1][1], "a second positional (gh api takes one endpoint)")
+    return out
+
+
+def api_start(args):
+    words = command_word_positions(args)
+    return words[0][0] if words and words[0][1] == "api" else None
+
+
+ALLOWED_KEYS = ("body", "event", "commit_id", "path", "position", "line", "side", "start_line", "start_side", "in_reply_to", "subject_type")   # #1696 PC-12: the only keys that pass on a comment or review endpoint
+
+
+def key_known(key):
+    """True for a key on the fixed allowlist: `body` in any case (it is the signed key), the others exactly."""
+    return key.lower() == "body" or key in ALLOWED_KEYS
+
+
+def early_method_flag(words):
+    """True when the words before the api word hold a method flag (-X, -XPATCH, --method, --method=PATCH): the real gh does not take one there."""
+    return any(w in ("-X", "--method") or w.startswith("--method=") or (w.startswith("-X") and not w.startswith("--")) for w in words)
+
+
+def refuse_early_method(args, at):
+    if early_method_flag(args[:at]):
+        raise Refused("a method flag (-X, --method) before the api word is refused: the real gh does not accept it there, so the call cannot be signed; write it after api")
+
+
+def api_parsed(args):
+    at = api_start(args)
+    if at is None:
+        raise Refused("not a gh api call")
+    refuse_early_method(args, at)
+    return parse_api_argv(args[at:])
+
+
+def api_parse(args):
+    """(positionals, method or None, fields) of a `gh api` call: a view of parse_api_argv; fields are (index, flag, inline, text) of every field flag, in order."""
+    parsed = parse_api_argv(args)
+    flagmap = {"field": "-F", "raw-field": "-f"}
+    positionals, method = [p for _i, p in parsed.positionals], parsed.method
+    fields = [(i, flagmap[n], j, v) for i, n, j, v in parsed.fields]
+    return [api_endpoint(p) for p in positionals], method, fields
+
+
+def input_value(args):
+    """(index, inline, value) of the LAST --input of a `gh api` call, or None."""
+    found = parse_api_argv(args).input
+    return None if found is None else (found[1], found[2], found[3])
+
+
+def read_input_json(value):
+    """(text, parsed object) of an --input value (a file, or - for stdin); Unsignable when it cannot be read or is not JSON."""
+    if value == "-":
+        try:
+            text = sys.stdin.read()
+        except (OSError, UnicodeError):
+            raise Unsignable("the --input text cannot be read")
+    else:
+        text = read_text(value)
+    try:
+        return text, json.loads(text)
+    except ValueError:
+        raise Unsignable("the --input JSON cannot be parsed")
+
+
+_read_input_json_text = read_input_json
+
+
+def read_input_json(value):
+    """A named --input file is opened without blocking, must be a regular file (a FIFO, directory or device is refused BEFORE any read), and is read
+    from that one open descriptor as exact bytes; stdin goes the old way."""
+    if value == "-":
+        return _read_input_json_text(value)
+    try:
+        fd = os.open(value, os.O_RDONLY | os.O_NONBLOCK)
+    except OSError as err:
+        raise Unsignable("the --input text cannot be read (%s)" % type(err).__name__)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise Unsignable("the --input file %s is not a regular file" % value)
+        with os.fdopen(fd, "rb", closefd=False) as handle:
+            raw = handle.read()
+    except OSError as err:
+        raise Unsignable("the --input text cannot be read (%s)" % type(err).__name__)
+    finally:
+        os.close(fd)
+    try:
+        text = raw.decode("utf-8")
+        return text, json.loads(text)
+    except ValueError:
+        raise Unsignable("the --input JSON cannot be parsed")
+
+
+def passed_copy(args, index, inline, value, text):
+    """An --input object with no body passes on as a temporary copy of the exact bytes already read (the real gh never reads the original path again)."""
+    new = list(args)
+    if value == "-":
+        return new, text, None
+    handle, temp = tempfile.mkstemp(prefix="fleet-gh-", suffix=".json")
+    with os.fdopen(handle, "wb") as fh:
+        fh.write(text.encode("utf-8"))
+    if inline is None:
+        new[index + 1] = temp
+    else:
+        new[index] = "--input=" + temp
+    return new, None, temp
+
+
+def scalar(value):
+    return value is None or isinstance(value, (str, int, float, bool))
+
+
+def input_call(args, name, found):
+    index, inline, value = found
+    text, data = read_input_json(value)
+    if not isinstance(data, dict):
+        raise Refused("the --input JSON is not an object (an array or a scalar), so its body cannot be found and signed: send a JSON object")
+    signed = False
+    for key in data:
+        if not (isinstance(key, str) and (key_known(key) or key.lower() == "comments")):
+            raise Refused("the --input key %s is not one of the known keys, so the call cannot be checked and nothing was posted" % repr(key)[:40])
+        if key.lower() != "comments" and not scalar(data[key]):
+            raise Refused("the --input value of %s is not a string, number, boolean or null, so it cannot be checked" % key[:40])
+    for key in [k for k in data if k.lower() == "body"]:
+        if not isinstance(data[key], str):
+            raise Unsignable("the --input body is not a string")
+        data[key] = sign(data[key], name)
+        signed = True
+    for key in [k for k in data if k.lower() == "comments"]:
+        if not isinstance(data[key], list) or not all(isinstance(item, dict) for item in data[key]):
+            raise Refused("the --input comments is not a list of objects, so the bodies in it cannot be signed")
+        for item in data[key]:
+            for sub in item:
+                if not (isinstance(sub, str) and key_known(sub)) or not scalar(item[sub]):
+                    raise Refused("the --input comment key %s is not a known key with a plain value, so the call cannot be checked" % repr(sub)[:40])
+            for sub in [k for k in item if k.lower() == "body"]:
+                if not isinstance(item[sub], str):
+                    raise Unsignable("the --input comment body is not a string")
+                item[sub] = sign(item[sub], name)
+                signed = True
+    if not signed:
+        return passed_copy(args, index, inline, value, text)
+    out = json.dumps(data)
+    new = list(args)
+    if value == "-":
+        return new, out, None
+    handle, temp = tempfile.mkstemp(prefix="fleet-gh-", suffix=".json")
+    with os.fdopen(handle, "w") as fh:
+        fh.write(out)
+    if inline is None:
+        new[index + 1] = temp
+    else:
+        new[index] = "--input=" + temp
+    return new, None, temp
+
+
+def graphql_call(args):
+    """A `gh api graphql` call whose query names a body-writing mutation is refused (Refused); a query that cannot be read is refused. Else None
+    (when stdin was read for the query it is passed on)."""
+    positionals, _method, fields = api_parse(args)
+    if "graphql" not in positionals and UNKNOWN_ENDPOINT not in positionals:
+        return None
+    texts, stdin_text = [], None
+    for _i, flag, _inline, text in fields:
+        key, eq, value = text.partition("=")
+        if key != "query" or not eq:
+            continue
+        if flag in ("-F", "--field") and value.startswith("@"):
+            if value == "@-":
+                stdin_text = sys.stdin.read() if stdin_text is None else stdin_text
+                texts.append(stdin_text)
+            else:
+                texts.append(read_text(value[1:]))
+        else:
+            texts.append(value)
+    found = input_value(args)
+    if found is not None:
+        text, data = read_input_json(found[2])
+        if found[2] == "-":
+            stdin_text = text
+        if not isinstance(data, dict):
+            raise Refused("the GraphQL --input is not a JSON object, so it is refused; only one query object passes")
+        if isinstance(data.get("query"), str):
+            texts.append(data["query"])
+    if not texts:
+        raise Refused("the GraphQL request has no readable query text, so it is refused; only one query passes")
+    for text in texts:
+        verdict = graphql_verdict(text)
+        if verdict:
+            raise Refused(verdict)
+    return list(args), stdin_text, None
+
+
+def api_call(args, namer):
+    """`gh api` POST or PATCH to a comment or review endpoint (SIGNED_API): every `body` field is signed (`-f`, `-F`, `--field`, `--raw-field`; `-F body=@file`
+    and `@-` are read, signed and passed as a temporary file or stdin). `--input FILE` or `--input -` is read as JSON: a string `body` is signed, an object
+    with no body passes, anything else is refused. A `gh api graphql` call naming a body mutation is refused. A read and another endpoint are not touched."""
+    if not args or args[0] != "api":
+        return None
+    positionals, method, fields = api_parse(args)
+    if "graphql" in positionals:
+        return graphql_call(args)
+    if not any(API_ENDPOINT_RE.match(p) for p in positionals):
+        return None
+    found = input_value(args)
+    if found is not None:
+        if (method or "POST") not in ("POST", "PATCH"):
+            return None
+        return input_call(args, namer(), found)
+    if (method or ("POST" if fields else "GET")) not in ("POST", "PATCH"):
+        return None
+    bodies = [f for f in fields if f[3].split("=", 1)[0] == "body" and "=" in f[3]]
+    if not bodies:
+        return None
+    name = namer()
+    new, stdin_text, temps = list(args), None, []
+    for index, flag, inline, text in bodies:
+        value = text.split("=", 1)[1]
+        if flag in ("-F", "--field") and value.startswith("@"):
+            if value == "@-":
+                stdin_text = sign(sys.stdin.read() if stdin_text is None else stdin_text, name)
+                continue
+            temps.append(temp_signed(read_text(value[1:]), name))
+            replaced = "body=@" + temps[-1]
+        else:
+            replaced = "body=" + sign(value, name)
+        if inline is None:
+            new[index + 1] = replaced
+        else:
+            new[index] = args[index][:len(args[index]) - len(inline)] + replaced
+    return new, stdin_text, temps or None
+
+
+def leading_repo_flags(args):
+    """How many leading arguments are `-R`/`--repo` flags with their values (`-R o/r`, `--repo o/r`, `--repo=o/r`, `-Ro/r`): a value that looks like a verb is a value."""
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg in ("-R", "--repo"):
+            if i + 1 >= len(args):
+                break
+            i += 2
+        elif arg.startswith("--repo=") or (arg.startswith("-R") and len(arg) > 2 and not arg.startswith("--")):
+            i += 1
+        else:
+            break
+    return i
+
+
+def sign_plan(args, lookup):
+    """The plan for a call, or None when it is not a signed form. Raises Unsignable when a signed form's text cannot be signed. The name is looked up
+    only when a body is about to be signed, so an unrelated call costs no lookup. A `-R`/`--repo` flag before the command words is skipped to find the
+    form and kept in the new argv."""
+    lead = leading_repo_flags(args)
+    core = args[lead:]
+    at = api_start(core)
+    if at:
+        refuse_early_method(core, at)
+    if len(core) >= 3 and (core[0], core[1]) in SIGNED_COMMANDS:
+        handler = lambda namer: signed_call(core, namer())
+    elif len(core) >= 3 and (core[0], core[1]) in CLOSE_COMMANDS:
+        handler = lambda namer: close_call(core, namer)
+    elif core and core[0] == "api":
+        handler = lambda namer: api_call(core, namer)
+    else:
+        return None
+    try:
+        plan = handler(lambda: my_name(lookup))
+    except Unsignable:
+        raise
+    except Exception as err:
+        raise Unsignable("signing failed (%s)" % type(err).__name__)
+    return plan if plan is None or not lead else (args[:lead] + plan[0], plan[1], plan[2])
+
+
+class DeferredRefusal(tuple):
+    """What sign_plan returns for a graphql call it refused: the refusal is kept (.err) and written by run() AFTER the existing hold, plan-gate and merge-gate
+    decisions, so those refusals (exit 10) keep their text and exit code."""
+    err = None
+
+
+_sign_plan_now = sign_plan
+
+
+def sign_plan(args, lookup):
+    try:
+        return _sign_plan_now(args, lookup)
+    except Unsignable as err:
+        core = args[leading_repo_flags(args):]
+        if not core or core[0] != "api" or not (api_gated(core) or isinstance(err, Refused)):
+            raise
+        late = DeferredRefusal((list(args), None, None))
+        late.err = err
+        return late
+
+
+# ---- #1696 round 2 (H4, M1): wrappers over the defs above; new lines only.
+from urllib.parse import unquote, urlsplit
+
+UNKNOWN_ENDPOINT = "\x00unknown"
+REST_ROOTS = (API_TOP - {"graphql"}) | {"repos"}
+
+
+def api_clean(text):
+    """The endpoint positional with backslashes made slashes and percent escapes decoded repeatedly until stable (at most 5 rounds); None when the path part
+    holds a control character or whitespace, an undecodable or endless percent sequence."""
+    for _round in range(6):
+        text = text.replace("\\", "/")
+        head = re.split(r"[?#]", text, maxsplit=1)[0]
+        if any(ord(c) <= 0x20 or ord(c) == 0x7f for c in head):
+            return None
+        try:
+            decoded = unquote(text, errors="strict")
+        except UnicodeDecodeError:
+            return None
+        if decoded == text:
+            return None if "%" in head else text
+        text = decoded
+    return None
+
+
+def api_endpoint(text):
+    """DECIDE BY MEANING: one canonical form of an endpoint positional. An https or http URL (or //host) whose parsed host is exactly api.github.com (any case,
+    userinfo, port 443 and a trailing dot allowed) is reduced to its path. A positional of ANY other host is not GitHub's and is returned untouched (the call goes
+    to the user's own gh with that host: kept as it was, whatever the path says). Else the path (; params, ?query, #fragment dropped, dot segments resolved,
+    leading slashes stripped, lower case) is classified: graphql -> the bare word graphql; a known REST root -> that canonical path (the signed comment shapes
+    match it once); anything else, or text that cannot be cleaned -> UNKNOWN_ENDPOINT."""
+    clean = api_clean(text)
+    if clean is None:
+        return UNKNOWN_ENDPOINT
+    path = clean
+    if re.match(r"^[A-Za-z][A-Za-z0-9+.-]*://", clean) or clean.startswith("//"):
+        try:
+            parts = urlsplit(clean)
+            host, port = parts.hostname, parts.port
+        except ValueError:
+            return UNKNOWN_ENDPOINT
+        if parts.scheme.lower() not in ("", "https", "http") or not host or host.rstrip(".") != "api.github.com" or port not in (None, 443):
+            return text
+        path = parts.path
+    path = re.split(r"[?#]", path, maxsplit=1)[0]
+    path = "/".join(seg.split(";", 1)[0] for seg in path.split("/"))
+    path = posixpath.normpath("/" + path).lstrip("/").lower()
+    first = path.split("/", 1)[0]
+    if first == "graphql":
+        return "graphql"
+    return path if first in REST_ROOTS else UNKNOWN_ENDPOINT
+
+
+def api_gated(args):
+    """True when the endpoint is graphql or not classifiable (graphql_call decides by the request text)."""
+    positionals = api_parse(args)[0]
+    return "graphql" in positionals or UNKNOWN_ENDPOINT in positionals
+
+
+_api_call_now = api_call
+
+
+def api_call(args, namer):
+    """The classes of the endpoint: graphql and UNKNOWN go to graphql_call (the request text decides); a REST shape is checked for a mutation in an inline
+    query field, then handled as before (the signed comment shapes are signed). An endpoint of another host is left alone (the user's own gh)."""
+    if args and args[0] == "api":
+        if api_gated(args):
+            return graphql_call(args)
+    return _api_call_now(args, namer)
+
+
+_graphql_call_old = graphql_call
+
+
+def graphql_temp_copy(path, temps):
+    """H4: a named query file is opened without blocking, must be a regular file (refused BEFORE any read), and the exact bytes read from that one
+    descriptor go to a temp copy. The temp mode is the library default (mkstemp: 0600); the name is fleet-gh-*.gql, in the default temp dir."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    except OSError as err:
+        raise Unsignable("the query text cannot be read (%s)" % type(err).__name__)
+    try:
+        mode = os.fstat(fd).st_mode
+        if not stat.S_ISREG(mode):
+            raise Unsignable("the query file %s is not a regular file" % path)
+        with os.fdopen(fd, "rb", closefd=False) as handle:
+            raw = handle.read()
+    except OSError as err:
+        raise Unsignable("the query text cannot be read (%s)" % type(err).__name__)
+    finally:
+        os.close(fd)
+    handle, temp = tempfile.mkstemp(prefix="fleet-gh-", suffix=".gql")
+    temps.append(temp)
+    with os.fdopen(handle, "wb") as out:
+        out.write(raw)
+    return temp
+
+
+def graphql_call(args):
+    """H4: the query files (-F query=@file, --input FILE) are read once, as regular files, and the real gh gets temp copies of those bytes."""
+    positionals, _method, fields = api_parse(args)
+    if "graphql" not in positionals and UNKNOWN_ENDPOINT not in positionals:
+        return None
+    new, temps = list(args), []
+    try:
+        for index, flag, inline, text in fields:
+            key, eq, value = text.partition("=")
+            if key == "query" and eq and flag in ("-F", "--field") and value.startswith("@") and value != "@-":
+                replaced = "query=@" + graphql_temp_copy(value[1:], temps)
+                if inline is None:
+                    new[index + 1] = replaced
+                else:
+                    new[index] = args[index][:len(args[index]) - len(inline)] + replaced
+        found = input_value(args)
+        if found is not None and found[2] != "-":
+            copy = graphql_temp_copy(found[2], temps)
+            if found[1] is None:
+                new[found[0] + 1] = copy
+            else:
+                new[found[0]] = "--input=" + copy
+        plan = _graphql_call_old(new)
+    except BaseException:
+        for path in temps:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        raise
+    return plan[0], plan[1], temps or None
+
+
+# ---- #1696 round 4: DECIDE BY EFFECT. A `gh api` request with no body that uses GET passes on any path; a body or any other method passes only on an
+# allow-listed REST path (signed where it is a comment or review shape); graphql passes only when a real parser reads ONE operation of type query (or a
+# mutation whose every root field is on MUTATION_ALLOW). Everything the parser does not fully understand is refused.
+MUTATION_ALLOW = frozenset({"mergePullRequest"})   # the only mutation root field that passes: it cannot carry a comment or review body (U3)
+SIGNED_API_MORE = (("review-events", r"pulls/[0-9]+/reviews/[0-9]+/events"),)   # a review body written by POST .../reviews/ID/events: signed like the others
+API_ENDPOINT_RE = re.compile(r"^/?repos/[^/?#]+/[^/?#]+/(?:%s)/?(?:\?.*)?$" % "|".join(p for _label, p in SIGNED_API + SIGNED_API_MORE))
+REST_SIGNED_METHODS = {label: ("POST", "PATCH", "DELETE") for label, _p in SIGNED_API + SIGNED_API_MORE}   # every signed shape: the old tests use POST, PATCH and DELETE on all of them
+REST_WRITES = (   # (label, path after repos/OWNER/REPO/, methods): the unsigned REST write shapes lanes use (N, NAME: one path segment)
+    ("issue-create", r"issues", ("POST",)), ("issue-update", r"issues/[^/]+", ("PATCH", "POST")), ("issue-labels", r"issues/[^/]+/labels", ("POST", "PUT", "DELETE")),
+    ("issue-label", r"issues/[^/]+/labels/[^/]+", ("DELETE",)), ("sub-issues", r"issues/[^/]+/sub_issues", ("POST",)),
+    ("pull-update", r"pulls/[^/]+", ("PATCH", "POST")), ("pull-merge", r"pulls/[^/]+/merge", ("PUT",)), ("label-create", r"labels", ("POST",)), ("label-delete", r"labels/[^/]+", ("DELETE",)),
+    ("deployment-gate", r"actions/runs/[0-9]+/pending_deployments", ("POST",)))   # approving a deployment gate: its 'comment' field is not a comment body
+
+
+def api_scan(args, headers=None):
+    """(method, has_input, field texts, positionals) of a `gh api` call: a view of parse_api_argv (method is None when none is given); headers, if a list, receives
+    the header texts."""
+    parsed = parse_api_argv(args)
+    if headers is not None:
+        headers.extend(v for _n, _i, _j, v in parsed.values("header"))
+    return parsed.method, parsed.input is not None, [v for _i, _n, _j, v in parsed.fields], [p for _i, p in parsed.positionals]
+
+
+class GqlError(Exception):
+    pass
+
+
+_GQL_PUNCT = "!$&():=@[]{|}"
+
+
+def gql_tokens(text):
+    """Tokens (kind, value) of a GraphQL document; raises GqlError on anything that is not comment, space, comma, name, punctuation, string, block string or number."""
+    out, i, n = [], 0, len(text)
+    while i < n:
+        c = text[i]
+        if c in " \t\r\n,\ufeff":
+            i += 1
+        elif c == "#":
+            while i < n and text[i] not in "\r\n":
+                i += 1
+        elif text.startswith("...", i):
+            out.append(("spread", "..."))
+            i += 3
+        elif c in _GQL_PUNCT:
+            out.append(("p", c))
+            i += 1
+        elif c.isascii() and (c.isalpha() or c == "_"):
+            j = i + 1
+            while j < n and text[j].isascii() and (text[j].isalnum() or text[j] == "_"):
+                j += 1
+            out.append(("name", text[i:j]))
+            i = j
+        elif text.startswith('"""', i):
+            j = i + 3
+            while True:
+                if j >= n:
+                    raise GqlError("unterminated block string")
+                if text.startswith('\\"""', j):
+                    j += 4
+                elif text.startswith('"""', j):
+                    break
+                else:
+                    j += 1
+            out.append(("str", ""))
+            i = j + 3
+        elif c == '"':
+            j = i + 1
+            while True:
+                if j >= n or text[j] in "\r\n":
+                    raise GqlError("unterminated string")
+                if text[j] == "\\":
+                    if j + 1 >= n:
+                        raise GqlError("unterminated string")
+                    if text[j + 1] == "u":
+                        if not re.fullmatch(r"[0-9A-Fa-f]{4}", text[j + 2:j + 6]):
+                            raise GqlError("bad unicode escape")
+                        j += 6
+                    elif text[j + 1] in '"\\/bfnrt':
+                        j += 2
+                    else:
+                        raise GqlError("bad string escape")
+                elif text[j] == '"':
+                    break
+                else:
+                    j += 1
+            out.append(("str", ""))
+            i = j + 1
+        else:
+            m = re.compile(r"-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?").match(text, i)
+            if not m or not m.group():
+                raise GqlError("unexpected character %r" % c)
+            if m.end() < n and (text[m.end()] in "._" or text[m.end()].isalnum()):
+                raise GqlError("bad number")
+            out.append(("num", m.group()))
+            i = m.end()
+    return out
+
+
+def gql_operation(text):
+    """(operation type, [root field names]) of a document that holds exactly ONE operation and nothing else; GqlError for anything not fully understood
+    (fragments, directives, a second operation, unbalanced or trailing text, a bad token)."""
+    toks = gql_tokens(text)
+    pos = [0]
+
+    def peek():
+        return toks[pos[0]] if pos[0] < len(toks) else (None, None)
+
+    def take(kind=None, value=None):
+        tok = peek()
+        if tok[0] is None or (kind and tok[0] != kind) or (value and tok[1] != value):
+            raise GqlError("unexpected %s" % (tok[1] if tok[0] else "end of text"))
+        pos[0] += 1
+        return tok
+
+    def value():
+        kind, val = peek()
+        if (kind, val) == ("p", "$"):
+            take()
+            take("name")
+        elif kind in ("str", "num", "name"):
+            take()
+        elif (kind, val) == ("p", "["):
+            take()
+            while peek() != ("p", "]"):
+                value()
+            take()
+        elif (kind, val) == ("p", "{"):
+            take()
+            while peek() != ("p", "}"):
+                take("name")
+                take("p", ":")
+                value()
+            take()
+        else:
+            raise GqlError("unexpected %s" % (val if kind else "end of text"))
+
+    def typ():
+        if peek() == ("p", "["):
+            take()
+            typ()
+            take("p", "]")
+        else:
+            take("name")
+        if peek() == ("p", "!"):
+            take()
+
+    def selection_set():
+        roots = []
+        take("p", "{")
+        if peek() == ("p", "}"):
+            raise GqlError("empty selection set")
+        while peek() != ("p", "}"):
+            name = take("name")[1]
+            if peek() == ("p", ":"):
+                take()
+                name = take("name")[1]
+            roots.append(name)
+            if peek() == ("p", "("):
+                take()
+                if peek() == ("p", ")"):
+                    raise GqlError("empty arguments")
+                while peek() != ("p", ")"):
+                    take("name")
+                    take("p", ":")
+                    value()
+                take()
+            if peek() == ("p", "{"):
+                selection_set()
+        take()
+        return roots
+
+    kind, word = peek()
+    if (kind, word) == ("p", "{"):
+        op = "query"
+    elif kind == "name" and word in ("query", "mutation", "subscription"):
+        take()
+        op = word
+        if peek()[0] == "name":
+            take()
+        if peek() == ("p", "("):
+            take()
+            if peek() == ("p", ")"):
+                raise GqlError("empty variable definitions")
+            while peek() != ("p", ")"):
+                take("p", "$")
+                take("name")
+                take("p", ":")
+                typ()
+                if peek() == ("p", "="):
+                    take()
+                    value()
+            take()
+    elif kind is None:
+        raise GqlError("empty document")
+    else:
+        raise GqlError("unsupported %s" % word)
+    roots = selection_set()
+    if peek()[0] is not None:
+        raise GqlError("more than one operation or text after the operation")
+    return op, roots
+
+
+def graphql_verdict(text):
+    """None when the document may pass, else the refusal text."""
+    try:
+        op, roots = gql_operation(text)
+    except GqlError as err:
+        return "the GraphQL text cannot be fully read (%s), so it is refused; only one query passes" % err
+    except RecursionError:
+        return "the GraphQL text is nested too deeply to be read, so it is refused"
+    if op == "query":
+        return None
+    if op == "subscription":
+        return "a GraphQL subscription is refused; only one query passes"
+    for root in roots:
+        if root in GRAPHQL_BODY_MUTATIONS:
+            return "the GraphQL mutation %s writes a body that cannot be signed and nothing was posted; use %s" % (root, GRAPHQL_BODY_MUTATIONS[root])
+    bad = [r for r in roots if r not in MUTATION_ALLOW]
+    if bad:
+        return "the GraphQL mutation %s is refused: only %s may be sent as a mutation; add a root field to MUTATION_ALLOW in shims/gh to allow another" % (
+            ", ".join(bad), ", ".join(sorted(MUTATION_ALLOW)))
+    return None
+
+
+def api_refuse_unknown(method, shown):
+    raise Refused("a gh api %s with a body or a method other than GET is refused on %s: it is not on the REST_WRITES / SIGNED_API allow-list in shims/gh; "
+                  "add its path and method there to allow it" % (method, shown))
+
+
+OVERRIDE_HEADERS = ("x-http-method-override", "x-http-method", "x-method-override")
+RAW_PREFIXES = ("https://api.github.com", "http://api.github.com", "//api.github.com")
+RAW_RULE = ("the endpoint would change if cleaned: the shim matches the raw path only; write it plainly as repos/OWNER/REPO/... "
+            "(one optional leading slash, no backslash, %-escape, dot segment, semicolon, space, #, double or trailing slash)")
+
+
+def api_raw_path(text):
+    """The RAW path of an endpoint positional for a write: None when cleaning would change its text (or it is another host's), else the path as written
+    (one leading slash and the exact api.github.com prefix dropped, the ?query cut off, nothing decoded or resolved). Never normalises."""
+    rest = text
+    for prefix in RAW_PREFIXES:
+        if rest.startswith(prefix + "/"):
+            rest = rest[len(prefix):]
+            break
+    if rest.startswith("/"):
+        rest = rest[1:]
+    path = rest.split("?", 1)[0]
+    if "#" in rest or "://" in path or any(ord(c) <= 0x20 or ord(c) == 0x7f for c in path) or any(c in path for c in "\\%;"):
+        return None
+    if "//" in path or path.endswith("/") or not path or any(seg in (".", "..") for seg in path.split("/")):
+        return None
+    return path
+
+
+def api_other_host(text):
+    """True for a scheme://host or //host positional whose host is not api.github.com in any spelling (it is not GitHub's: off the allow-list)."""
+    if not (re.match(r"^[A-Za-z][A-Za-z0-9+.-]*://", text) or text.startswith("//")):
+        return False
+    try:
+        parts = urlsplit(text)
+        host = parts.hostname
+    except ValueError:
+        return False
+    return not (host and host.rstrip(".") == "api.github.com" and parts.scheme.lower() in ("", "https", "http"))
+
+
+def api_decide(args, namer, previous):
+    """The one decision, by effect, on the RAW path for a write. See the round 4 comment above."""
+    headers = []
+    method, has_input, fields, raw_positionals = api_scan(args, headers)
+    for header in headers:
+        if header.partition(":")[0].strip().lower() in OVERRIDE_HEADERS:
+            raise Refused("a method-override header (X-HTTP-Method-Override, X-HTTP-Method, X-Method-Override) is refused: it can turn a read into a write, so the shim cannot tell the real method")
+    for raw in raw_positionals:
+        if "?" in raw and api_endpoint(raw) == "graphql":
+            raise Refused("a '?' (URL query string) on the graphql endpoint is refused: its query text would not be read; send the query as a plain POST with a query field")
+    has_body = has_input or bool(fields)
+    effective = method if method is not None else ("POST" if has_body else "GET")
+    if effective == "GET":
+        if has_body and any(api_endpoint(p) == "graphql" for p in raw_positionals):
+            raise Refused("a GET to graphql that carries a field or --input is refused: send the query as a plain POST with a query field, or drop the fields")
+        if not has_input:
+            return None
+    if not raw_positionals:
+        return None
+    for raw in raw_positionals:
+        path = api_raw_path(raw)
+        if path is None and api_other_host(raw):
+            api_refuse_unknown(effective or "(no method)", "the endpoint (%s)" % raw[:60])
+        if path is None:
+            raise Refused("a gh api %s with a body or a method other than GET is refused on (%s): %s" % (effective or "(no method)", raw[:60], RAW_RULE))
+        if path == "graphql":
+            continue
+        found = None
+        for label, pattern in SIGNED_API + SIGNED_API_MORE:
+            if re.fullmatch(r"repos/[^/]+/[^/]+/" + pattern, path):
+                found = (label, REST_SIGNED_METHODS.get(label, ()), True)
+        for label, pattern, methods in REST_WRITES:
+            if re.fullmatch(r"repos/[^/]+/[^/]+/" + pattern, path):
+                found = (label, methods, False)
+        if found is None:
+            for text in (f.partition("=")[2] for f in fields if f.partition("=")[0] == "query" and "=" in f):
+                verdict = graphql_verdict(text)
+                if verdict and "mutation" in verdict:
+                    raise Refused(verdict)
+            api_refuse_unknown(effective or "(no method)", "the endpoint (%s)" % raw[:60])
+        if effective not in found[1]:
+            api_refuse_unknown(effective or "(no method)", "the endpoint %s (%s allows %s)" % (raw[:60], found[0], "/".join(found[1])))
+        if found[2] and effective in ("POST", "PATCH"):
+            query = raw.partition("#")[0].partition("?")[2]
+            query_keys = [urllib.parse.unquote(part.partition("=")[0]) for part in re.split(r"[&;]", query) if part]
+            for key in query_keys + [f.partition("=")[0] for f in fields]:
+                if "%" in key or key not in ALLOWED_KEYS or (key == "body" and key in query_keys):
+                    raise Refused("the key %s (not a known key, or a body in the URL query string) on a comment or review endpoint cannot be signed: send body, event, commit_id, path, position, line, side, start_line, start_side, in_reply_to or subject_type as -f or in an --input JSON object" % repr(key)[:40])
+        if found[2] and has_input and any(f.partition("=")[0].lower() == "body" for f in fields):
+            raise Refused("a -f or -F body field with --input on a comment or review endpoint is sent by gh as a URL query parameter and cannot be signed: put the body in the --input JSON object")
+        if found[2] and len(api_parse(args)[2]) != len(fields):
+            raise Refused("the flags of this gh api call to a comment or review endpoint cannot be read, so its body cannot be signed and nothing was posted")
+    if any(api_raw_path(p) == "graphql" for p in raw_positionals):
+        return graphql_call(args)
+    return previous(args, namer)
+
+
+_api_call_round3 = api_call
+
+
+def api_call(args, namer):
+    if not args or args[0] != "api":
+        return _api_call_round3(args, namer)
+    return api_decide(args, namer, _api_call_round3)
+
+
+# ---- the gate probe (plan-driven development: enforcing in a repo whose mode is enforce). docs/plan-gate-engine-design.md, E1 and E3.
+#
+# Before `gh pr ready` or `gh pr merge` of a PR the shim asks `fleet-switchboard gates-check <repo#N> --for ready|merge`, with
+# its own time bound. Exit 10 (a refusal that applies in the repo's mode) stops the command: the one-line reason goes to stderr and
+# the real gh does not run. Everything else (fail-open, timeout, a missing switchboard, a shape not understood, the kill switches,
+# a valid waiver, a shadow repo) runs the real gh. In an enforcing repo a merge is bound to the checked head and --auto is refused.
+# `gh pr create` has no PR number before it runs, so it is not probed here. The probe is skipped altogether for a repo that is
+# not listed under `plan_gates` in the switchboard config, and for the switchboard's own gh calls (no recursion).
+GATE_SECONDS = 8.0
+GATE_SPOOL = "gate-failopen.jsonl"
+GATE_SPOOL_LIMIT = 262144
+BOOL_SHORT = {"pr merge": {"d": "--delete-branch", "m": "--merge", "r": "--rebase", "s": "--squash"}, "pr ready": {}}
+BOOL_LONG = {"pr merge": {"--delete-branch", "--admin", "--auto", "--disable-auto", "--merge", "--rebase", "--squash"},
+             "pr ready": set()}
+VALUE_SHORT = {"R": "--repo", "b": "--body", "F": "--body-file", "A": "--author-email", "t": "--subject"}
+VALUE_LONG = {"--repo", "--body", "--body-file", "--author-email", "--subject", "--match-head-commit"}
+PR_URL_RE = re.compile(r"^https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/([0-9]+)(?:/[^?#]*)?(?:[?#].*)?$")
+MATCH_FLAG = "--match-head-commit"
+
+
+def gate_seconds():
+    try:
+        return min(10.0, max(0.2, float(os.environ.get("FLEET_SHIM_GATE_SECONDS", GATE_SECONDS))))
+    except ValueError:
+        return GATE_SECONDS
+
+
+def gate_parse(args):
+    """Parse a `pr ready` or `pr merge` command line the way gh (cobra) does: `--flag value`, `--flag=value`, `-R value`,
+    `-Rvalue`, combined short booleans (`-sd`), `--bool=false`. Returns None for a shape not understood (an unknown flag,
+    `ready --undo`, `--`, more than one positional), else {"check", "repo", "ref", "auto", "match": [(start, stop, value)]}
+    where `ref` is the positional argument or None, and each `match` span is the args slice of one --match-head-commit."""
+    if len(args) < 2 or args[0] != "pr" or args[1] not in ("ready", "merge"):
+        return None
+    verb = "pr " + args[1]
+    out = {"check": args[1], "repo": None, "ref": None, "auto": False, "match": []}
+    positional, i = [], 2
+    while i < len(args):
+        arg = args[i]
+        start = i
+        if arg == "--" or arg == "-":
+            return None
+        value, name = None, None
+        if arg.startswith("--"):
+            name, eq, inline = arg.partition("=")
+            if name in VALUE_LONG:
+                if eq:
+                    value, i = inline, i + 1
+                else:
+                    value, i = (args[i + 1] if i + 1 < len(args) else None), i + 2
+            elif name in BOOL_LONG[verb]:
+                if eq and inline.lower() not in ("true", "false", "1", "0", "t", "f"):
+                    return None
+                if name == "--auto":
+                    out["auto"] = (not eq) or inline.lower() in ("true", "1", "t")
+                i += 1
+                continue
+            else:
+                return None
+        elif arg.startswith("-"):
+            letters, j = arg[1:], 0
+            while j < len(letters):
+                letter = letters[j]
+                if letter in BOOL_SHORT[verb]:
+                    j += 1
+                    continue
+                if letter in VALUE_SHORT:
+                    name = VALUE_SHORT[letter]
+                    rest = letters[j + 1:]
+                    if rest:
+                        value, i = rest[1:] if rest.startswith("=") else rest, i + 1
+                    else:
+                        value, i = (args[i + 1] if i + 1 < len(args) else None), i + 2
+                    break
+                return None
+            else:
+                i += 1
+                continue
+        else:
+            positional.append(arg)
+            i += 1
+            continue
+        if name == "--repo":
+            if not value or not REPO_RE.match(value):
+                return None
+            out["repo"] = value
+        elif name == MATCH_FLAG:
+            out["match"].append((start, min(i, len(args)), value))
+    if len(positional) > 1:
+        return None
+    out["ref"] = positional[0] if positional else None
+    return out
+
+
+def gate_run_gh(gh, argv, deadline, env):
+    try:
+        done = subprocess.run([gh] + argv, capture_output=True, text=True, timeout=max(0.05, deadline - time.time()),
+                              stdin=subprocess.DEVNULL, env=env)
+    except (subprocess.SubprocessError, OSError):
+        return None
+    return done.stdout.strip() if done.returncode == 0 else None
+
+
+def gate_resolve(parsed, gh, env, deadline):
+    """(repo, number) of the PR the real gh would act on, or (None, why). Never guesses: a repo comes from the PR URL, -R, GH_REPO,
+    or the real gh's own answer for the current directory; a PR with no number (no argument, a branch name) is asked of the real gh."""
+    ref = parsed["ref"]
+    if ref is not None:
+        url = PR_URL_RE.match(ref)
+        if url:
+            return url.group(1), int(url.group(2))
+        if ref.isdigit() and int(ref) >= 1:
+            repo = parsed["repo"] or os.environ.get("GH_REPO")
+            if repo and not REPO_RE.match(repo):
+                return None, "GH_REPO is not owner/repo"
+            if not repo:
+                if gh is None:
+                    return None, "no real gh to ask which repo this directory is"
+                repo = gate_run_gh(gh, ["repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"], deadline, env)
+                if not repo or not REPO_RE.match(repo):
+                    return None, "could not resolve the repo of this directory"
+            return repo, int(ref)
+    if gh is None:
+        return None, "no real gh to ask"
+    argv = ["pr", "view"] + ([ref] if ref is not None else [])
+    repo = parsed["repo"] or os.environ.get("GH_REPO")
+    if repo:
+        if not REPO_RE.match(repo):
+            return None, "GH_REPO is not owner/repo"
+        argv += ["-R", repo]
+    found = gate_run_gh(gh, argv + ["--json", "url", "-q", ".url"], deadline, env)
+    url = PR_URL_RE.match(found or "")
+    if not url:
+        return None, "could not resolve the PR (%s)" % (ref or "the current branch")
+    return url.group(1), int(url.group(2))
+
+
+def gate_clean(text):
+    """One printable line: control characters (terminal escapes) removed."""
+    return "".join(ch for ch in str(text) if ch.isprintable()).strip()
+
+
+def gate_repos():
+    """The lower-cased repos listed under `plan_gates.repos` in the switchboard config; {} when none (then nothing is probed)."""
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
+    try:
+        with open(os.path.join(base, "fleet-switchboard", "config.json")) as handle:
+            repos = (json.load(handle).get("plan_gates") or {}).get("repos")
+    except (OSError, ValueError, AttributeError):
+        return set()
+    return {str(name).lower() for name in repos} if isinstance(repos, dict) else set()
+
+
+def gate_spool(event, repo, number, check, detail):
+    """One line for the daemon to read later (best effort, never fails the command). The file is writable by any local
+    process, so the daemon treats it as untrusted text: clipped, data only."""
+    state = os.environ.get("FLEET_SWITCHBOARD_STATE") or os.path.join(
+        os.environ.get("XDG_STATE_HOME") or os.path.join(os.path.expanduser("~"), ".local", "state"), "fleet-switchboard")
+    path = os.path.join(state, GATE_SPOOL)
+    try:
+        if os.path.isdir(state) and (not os.path.exists(path) or os.path.getsize(path) < GATE_SPOOL_LIMIT):
+            line = json.dumps({"ts": int(time.time()), "event": event, "pr": "%s#%d" % (repo or "unknown", number or 0), "for": check,
+                               "detail": str(detail)[:200]}, sort_keys=True)
+            fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+            with os.fdopen(fd, "a") as out:
+                out.write(line + "\n")
+            return True   # written
+    except OSError:
+        pass
+    return False
+
+
+OVER_REVIEW_FLAG = "--over-review"
+
+
+def take_over_review(args):
+    """(args without --over-review, found, reason): `--over-review <reason>` or `--over-review=<reason>` on `pr merge` is the shim's own flag: it is
+    stripped before the real gh sees it (gh would reject it)."""
+    if len(args) < 2 or args[0] != "pr" or args[1] != "merge":
+        return args, False, ""
+    out, found, reason, i = [], False, "", 0
+    while i < len(args):
+        arg = args[i]
+        if arg == OVER_REVIEW_FLAG:
+            found = True
+            nxt = args[i + 1] if i + 1 < len(args) else ""
+            # the next word is the reason, unless it is a flag, a bare PR number or a PR URL (then it is the PR and the reason is missing)
+            if nxt and not nxt.startswith("-") and not nxt.isdigit() and not PR_URL_RE.match(nxt):
+                reason, i = nxt, i + 2
+            else:
+                i += 1
+            continue
+        if arg.startswith(OVER_REVIEW_FLAG + "="):
+            found, reason, i = True, arg.split("=", 1)[1], i + 1
+            continue
+        out.append(arg)
+        i += 1
+    return out, found, " ".join(reason.split())
+
+
+REVIEW_TAG_RE = re.compile(r"^\s*Review of ([0-9a-fA-F]{7,40})\s*[:\-]\s*(CHANGES[ _]REQUESTED|REQUEST[ _]CHANGES|APPROVED?)\b", re.I)
+REVIEW_FROM_RE = re.compile(r"fleet-switchboard:from=([A-Za-z0-9_-]{1,32})")
+
+
+def tagged_blockers(reviews, head):
+    """Independent reviews in this fleet are posted as COMMENTED reviews (one shared account cannot request changes on its own PRs), so the real
+    signal is the body's first line: `Review of <head sha>: CHANGES REQUESTED` or `APPROVE`. For each reviewer (login plus the `from=` tag a signed body
+    carries) the LATEST tagged review AT THE PR'S CURRENT HEAD decides: CHANGES REQUESTED blocks until a later one at that head says APPROVE. A tag for
+    another head, and any untagged comment, never blocks. Returns ["login/tag: CHANGES REQUESTED (Review of <sha>)"]."""
+    if not isinstance(head, str) or len(head) < 7:
+        return []
+    latest = {}
+    for review in reviews if isinstance(reviews, list) else []:
+        if not isinstance(review, dict):
+            continue
+        body = review.get("body") if isinstance(review.get("body"), str) else ""
+        first = body.strip().splitlines()[0] if body.strip() else ""
+        found = REVIEW_TAG_RE.match(first)
+        if not found:
+            continue
+        sha = found.group(1).lower()
+        if not head.lower().startswith(sha):
+            continue                                   # a verdict on another head says nothing about this one
+        author = ((review.get("author") or {}).get("login")) if isinstance(review.get("author"), dict) else None
+        tag = REVIEW_FROM_RE.search(body)
+        key = "%s%s" % (author or "?", "/" + tag.group(1) if tag else "")
+        word = found.group(2).upper().replace("_", " ")
+        latest[key] = ("CHANGES REQUESTED", sha) if word.startswith(("CHANGES", "REQUEST")) else ("APPROVE", sha)
+    return sorted("%s: CHANGES REQUESTED (Review of %s)" % (k, v[1][:8]) for k, v in latest.items() if v[0] == "CHANGES REQUESTED")
+
+
+REVIEW_RULE_MODULE = [None]
+
+
+class ReviewRuleUnreadable(Exception):
+    """shims/review_rule.py could not be loaded or used: the merge is REFUSED (never skipped), or a copy of this shim without its sibling would lose the guardrail.
+    args = (path, cause)."""
+
+
+def review_rule_load():
+    """The rule module, loaded once. ANY failure (missing file, syntax error, import error, a SystemExit or other BaseException at import, no `review_blockers`) raises ReviewRuleUnreadable(path, cause)."""
+    if REVIEW_RULE_MODULE[0] is None:
+        path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "review_rule.py")
+        if not os.path.isfile(path):
+            raise ReviewRuleUnreadable(path, "missing")
+        try:
+            spec = importlib.util.spec_from_file_location("review_rule", path)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+        except SyntaxError:
+            raise ReviewRuleUnreadable(path, "syntax error")
+        except ImportError:
+            raise ReviewRuleUnreadable(path, "import error")
+        except SystemExit:
+            raise ReviewRuleUnreadable(path, "exit at import")
+        except BaseException as err:
+            raise ReviewRuleUnreadable(path, "load error (%s)" % type(err).__name__)
+        if not callable(getattr(module, "review_blockers", None)):
+            raise ReviewRuleUnreadable(path, "no function review_blockers")
+        REVIEW_RULE_MODULE[0] = module
+    return REVIEW_RULE_MODULE[0]
+
+
+def review_blockers(reviews, head="", decision=""):
+    """The ONE rule lives in review_rule.py beside this file (shared with `fleet-switchboard gates`). The load AND the call are guarded: any failure or a result that is not a list of str raises ReviewRuleUnreadable, which `review_probe` turns into a REFUSAL."""
+    module = review_rule_load()
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "review_rule.py")
+    try:
+        got = module.review_blockers(reviews, head, decision)
+    except SystemExit:
+        raise ReviewRuleUnreadable(path, "exit in review_blockers")
+    except BaseException as err:
+        raise ReviewRuleUnreadable(path, "raised in review_blockers (%s)" % type(err).__name__)
+    if not isinstance(got, list) or not all(isinstance(x, str) for x in got):
+        raise ReviewRuleUnreadable(path, "wrong return type from review_blockers")
+    return got
+
+
+def review_probe(args, found, reason, lookup, gh):
+    """For `gh pr merge` in ANY repo (`--admin` too): refuse while a reviewer's latest decisive review is CHANGES_REQUESTED (not dismissed, not
+    superseded by that reviewer's later approval) or the switchboard holds a blocking `review record` at the PR's CURRENT head, naming them.
+    `--over-review <reason>` (at least 10 characters) goes ahead on purpose and is spooled for the audit (who, PR, head, reason). FAIL MODE: a read
+    that cannot be made (reviews API, switchboard) lets the merge through with one visible warning line: a flake never blocks, and is never silent.
+    A GUARDRAIL against accidents, not a boundary: the real gh, an unrecognised flag shape (fail open) or `--over-review` with any reason bypasses it;
+    the boundary is GitHub's branch protection / required reviews. The check reads the PR's head and the merge then runs unbound, so a push in
+    between can land an unchecked head (a short, documented window; the enforcing gates bind `--match-head-commit` themselves). Returns the refusal text, or None."""
+    try:
+        if len(args) < 2 or args[0] != "pr" or args[1] != "merge":
+            return None
+        review_rule_load()   # FIRST, before any skip path: an unloadable rule refuses a merge whatever else happens
+        parsed = gate_parse(args)
+        if parsed is None:
+            sys.stderr.write("gh: review check skipped (the merge command shape was not understood)\n")
+            return None
+        deadline = time.time() + gate_seconds()
+        env = None
+        try:
+            env = account_env(gh, lookup)
+        except AppMintRefused as err:
+            return str(err)   # mapped to the App and no token: refused, the stored login is never used for the read
+        except Exception:
+            env = None
+        repo, number = gate_resolve(parsed, gh, env, deadline)
+        if repo is None:
+            sys.stderr.write("gh: review check skipped (%s)\n" % gate_clean(str(number)))
+            return None
+        raw = gate_run_gh(gh, ["pr", "view", str(number), "-R", repo, "--json", "reviews,headRefOid,reviewDecision"], deadline, env)
+        try:
+            data = json.loads(raw) if raw else None
+        except ValueError:
+            data = None
+        if not isinstance(data, dict):
+            sys.stderr.write("gh: review check skipped (the reviews of %s#%d could not be read): not checked\n" % (repo, number))
+            return None
+        head = data.get("headRefOid") if isinstance(data.get("headRefOid"), str) else ""
+        blockers = ["%s: CHANGES_REQUESTED" % who for who in review_blockers(data.get("reviews"), head, data.get("reviewDecision"))]
+        blockers += [gate_clean(b) for b in tagged_blockers(data.get("reviews"), head)]
+        binary = switchboard_binary()
+        if binary and head:
+            done = lookup.run(sb_argv(binary, "review", "blockers", "%s#%d" % (repo, number), "--head", head), env=sb_env())
+            if done is not None and done.returncode == 0:
+                blockers += [gate_clean(line.strip()) for line in done.stdout.splitlines() if line.strip()][:5]
+            else:
+                sys.stderr.write("gh: review check: the switchboard's recorded verdicts could not be read: only GitHub's reviews were checked\n")
+        elif not binary or not head:
+            sys.stderr.write("gh: review check: the switchboard's recorded verdicts could not be read (no switchboard or no head): only GitHub's reviews were checked\n")
+        if not blockers:
+            return None
+        names = "; ".join(blockers[:5])
+        if found and len(reason) >= 10:
+            who = lookup.identity().get("name") or "agent"
+            shown = gate_clean(reason)[:100]   # the reason alone is clipped, so the head and the overridden reviews always fit the logged line
+            logged = gate_spool("over_review", repo, number, "merge", "by %s at %s | over: %s | reason: %s" % (who, head[:12], names[:60], shown))
+            if not logged:   # an override nobody can audit is not made
+                return "gh: merge of %s#%d refused: blocking review(s): %s. The --over-review could not be logged (no writable switchboard state), so it was not made" % (
+                    repo, number, names)
+            sys.stderr.write("gh: merging %s#%d over a blocking review on purpose (%s); logged\n" % (repo, number, names))
+            return None
+        why = ("--over-review needs a reason of at least 10 characters" if found else
+               "resolve them, or pass --over-review '<reason of at least 10 characters>' (it is logged)")
+        return "gh: merge of %s#%d refused: blocking review(s): %s. %s" % (repo, number, names, why)
+    except ReviewRuleUnreadable as err:
+        path, cause = (list(err.args) + ["unknown"])[:2]
+        return "gh: review rule unreadable: %s: %s: merge refused" % (gate_clean(os.path.basename(str(path))), gate_clean(cause))
+    except Exception:
+        sys.stderr.write("gh: review check skipped (an unexpected error): not checked\n")
+        return None
+
+
+def gate_probe(args, lookup, gh=None):
+    """Ask the switchboard whether this ready or merge is allowed. Returns None (run the real gh as given), ("refuse", line)
+    (print the line, exit non-zero, do not run gh) or ("args", new_args) (run gh with these). Never raises: every doubt is a
+    fail-open, recorded in the spool when the shim could not tell which PR it was. `gates-check` exits 10 only for a refusal that
+    applies in the repo's mode, and the shim also requires the reply to say `enforce`, so a shadow repo never refuses here."""
+    try:
+        if len(args) < 2 or args[0] != "pr" or args[1] not in ("ready", "merge"):
+            return None
+        listed = gate_repos()
+        if not listed:
+            return None   # no plan_gates: nothing is probed and nothing is asked
+        check = args[1]
+        parsed = gate_parse(args)
+        if parsed is None:
+            gate_spool("fail_open", None, None, check, "shape not understood: not checked")
+            return None
+        binary = switchboard_binary()
+        deadline = time.time() + gate_seconds()
+        env = None
+        if gh is not None:
+            try:
+                env = account_env(gh, lookup)
+            except AppMintRefused as err:
+                return ("refuse", str(err))
+            except Exception:
+                env = None
+        repo, number = gate_resolve(parsed, gh, env, deadline)
+        if repo is None:
+            gate_spool("fail_open", None, None, check, number)   # `number` carries the reason here
+            return None
+        if repo.lower() not in listed:
+            return None
+        if not binary:
+            gate_spool("fail_open", repo, number, check, "no switchboard to ask")
+            return None
+        try:
+            done = subprocess.run(sb_argv(binary, "gates-check", "%s#%d" % (repo, number), "--for", check, "--json"),
+                                  capture_output=True, text=True, timeout=gate_seconds(), stdin=subprocess.DEVNULL,
+                                  env=sb_env())
+        except subprocess.TimeoutExpired:
+            gate_spool("fail_open", repo, number, check, "no answer within %gs" % gate_seconds())
+            return None
+        except (OSError, subprocess.SubprocessError) as err:
+            gate_spool("fail_open", repo, number, check, "could not run gates-check: %s" % err)
+            return None
+        try:
+            payload = json.loads(done.stdout)
+            if not isinstance(payload, dict):
+                payload = {}
+        except ValueError:
+            payload = {}
+        if done.returncode not in (0, 10):
+            gate_spool("fail_open", repo, number, check, "gates-check exited %d" % done.returncode)
+            return None
+        if payload.get("mode") != "enforce":
+            if done.returncode == 10:
+                gate_spool("fail_open", repo, number, check, "exit 10 without an enforce reply: not refused")
+            return None
+        if done.returncode == 10:
+            message = gate_clean(str(payload.get("message") or "").splitlines()[0] if payload.get("message") else "")
+            if not message:
+                message = "fleet-switchboard: %s of %s#%d refused by the plan gates (no detail given)." % (check, repo, number)
+            gate_spool("refused", repo, number, check, message)
+            return ("refuse", message[:600])
+        if check == "merge":
+            return gate_bind_merge(args, parsed, repo, number, payload)
+        return None
+    except Exception:
+        return None   # a probe must never stop a command
+
+
+def gate_bind_merge(args, parsed, repo, number, payload):
+    """In an enforcing repo the merge is bound to the head that was checked (a push between the check and the merge makes the
+    real merge fail), and `--auto` is refused: it merges later, at a head nobody checked. Every --match-head-commit the caller
+    gave (any spelling, repeated, empty or without a value) is dropped and replaced by one with the checked head; a caller value
+    that names another head is refused."""
+    ref = "%s#%d" % (repo, number)
+    if parsed["auto"]:
+        return ("refuse", "fleet-switchboard: merge of %s refused: --auto merges later at a head nobody checked while this repo enforces "
+                          "the plan gates. Way out: merge when ready, with --match-head-commit <sha>." % ref)
+    head = payload.get("head")
+    if not isinstance(head, str) or not re.fullmatch(r"[0-9a-f]{40}", head):
+        gate_spool("fail_open", repo, number, "merge", "no head to bind the merge to")
+        return None
+    for _, _, given in parsed["match"]:
+        if given and given.strip().lower() != head:
+            return ("refuse", "fleet-switchboard: merge of %s refused: --match-head-commit %s is not the head the gates were checked at (%s). "
+                              "Way out: re-run with the current head." % (ref, gate_clean(given)[:40], head))
+    new = list(args)
+    for start, stop, _ in sorted(parsed["match"], reverse=True):
+        del new[start:stop]
+    return ("args", new + [MATCH_FLAG, head])
+
+
+# ---- the merge gate (#962): the fleet's own merge queue. Before `gh pr merge` into a GATED branch of a repository listed under `merge_gate.repos` in the
+# switchboard config, the shim asks `fleet-switchboard merge-gate <repo#N> --check --json`. That command decides everything (the owner's own terminal and a
+# logged waiver of the chief of staff pass; any other caller needs a gate pass for the exact head and branch tip and the merge lock) and exits 10 to refuse.
+# FAIL CLOSED for a listed repository: no switchboard, no answer in time or any exit but 0 and 10 refuses with one line. Nothing is asked for a repository that
+# is not listed. A merge that goes through is bound to the checked head (`--match-head-commit`), `--auto` is refused, and the lock is released when the merge returns.
+MERGE_GATE_SECONDS = 30.0
+MG_HOME = None     # a test hook: a module attribute, never read from the environment (a worker's environment must not move the gate)
+MG_BINARY = None   # the same, for the switchboard program asked
+
+
+def merge_gate_seconds():
+    try:
+        return min(120.0, max(1.0, float(os.environ.get("FLEET_SHIM_MERGE_GATE_SECONDS", MERGE_GATE_SECONDS))))
+    except ValueError:
+        return MERGE_GATE_SECONDS
+
+
+def mg_home():
+    """The account's real home (the password database), not $HOME or $XDG_CONFIG_HOME: a worker cannot point the gate at an empty configuration."""
+    if MG_HOME:
+        return MG_HOME
+    try:
+        import pwd
+        return pwd.getpwuid(os.getuid()).pw_dir
+    except Exception:
+        return None
+
+
+def mg_binary():
+    """The switchboard program the install linked, under the real home: never FLEET_SWITCHBOARD_BIN or anything else from the environment."""
+    if MG_BINARY:
+        return MG_BINARY
+    home = mg_home()
+    if not home:
+        return None
+    binary = os.path.realpath(os.path.join(home, ".local", "bin", "fleet-switchboard"))
+    return binary if os.path.isfile(binary) and os.access(binary, os.X_OK) else None
+
+
+ENV_ALLOW = ("LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "TERM", "HERDR_SOCKET_PATH",
+             "HERDR_PANE_ID", "HERDR_TAB_ID", "HERDR_WORKSPACE_ID", "OPENCODE_SESSION_ID", "FLEET_SWITCHBOARD_ROLE", "FLEET_SWITCHBOARD_REPO")   # who the caller says it is: the switchboard verifies it against the session
+ENV_PATH = "/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin"   # a fixed PATH: the caller's cannot choose the `python3` a switchboard script starts with
+
+
+def sb_env():
+    """The FIXED environment every switchboard the shim starts runs in, built from an ALLOW LIST and never by filtering the caller's: a fixed PATH, HOME as the
+    account's real home, the locale and temp names, and the identity names the switchboard verifies against the session. Everything else the caller set
+    (`PYTHON*`, `LD_*`, `DYLD_*`, `XDG_*`, `FLEET_SWITCHBOARD_*`, a made-up name) never reaches it, so a worker cannot hand the switchboard a library, a state
+    directory or a configuration of its own. No marker is ever added (#1216)."""
+    env = {"PATH": ENV_PATH}
+    for name in ENV_ALLOW:
+        if name in os.environ:
+            env[name] = os.environ[name]
+    home = mg_home()
+    if home:
+        env["HOME"] = home
+    return env
+
+
+def sb_argv(binary, *rest):
+    """The command that starts the switchboard: when the program is a Python script (its first line names python) it is started as `<fixed python> -I <program>`
+    (isolated: no `PYTHON*` variable and no user site are read), the python found on the FIXED path, never on the caller's; any other program is started as it is."""
+    try:
+        with open(binary, "rb") as handle:
+            first = handle.readline(200)
+        python = shutil.which("python3", path=ENV_PATH) if first.startswith(b"#!") and b"python" in first else None
+    except OSError:
+        python = None
+    return ([python, "-I", binary] if python else [binary]) + list(rest)
+
+
+def merge_gate_repos():
+    """The lower-cased repos listed under `merge_gate.repos` in the config of the account's real home; empty when none (then nothing is asked)."""
+    home = mg_home()
+    if not home:
+        return None   # no home: not known, the caller treats it as "cannot tell" and fails closed
+    try:
+        with open(os.path.join(home, ".config", "fleet-switchboard", "config.json")) as handle:
+            section = json.load(handle).get("merge_gate")
+    except FileNotFoundError:
+        return set()
+    except (OSError, ValueError, AttributeError):
+        return None
+    if section is None:
+        return set()
+    repos = section.get("repos", {}) if isinstance(section, dict) else None
+    return {str(name).lower() for name in repos} if isinstance(repos, dict) else None   # a section that is there and malformed is not "nothing listed"
+
+
+API_MERGE_RE = re.compile(r"^repos/([^/]+/[^/]+)/pulls/([0-9]+)/merge$", re.I)
+API_WRITE_FLAGS = ("-f", "-F", "--field", "--raw-field", "--input")
+GRAPHQL_MERGE_WORDS = ("mergePullRequest", "enablePullRequestAutoMerge")
+
+
+VALUE_FLAGS = {"-R", "--repo", "--hostname", "-b", "--body", "-F", "--body-file", "-t", "--title", "--subject", "-A", "--author-email", "--match-head-commit",
+               "-B", "--base", "-H", "--head", "--header", "--assignee", "--label", "--milestone", "--project", "--reviewer",
+               "-q", "--jq", "--json", "-X", "--method", "-f", "--field", "--raw-field", "--input", "--cache", "--preview", "--state", "-S", "--search",
+               "-L", "--limit", "--template"}
+PR_VERBS = {"checkout", "checks", "close", "comment", "create", "diff", "edit", "list", "lock", "ready", "reopen", "review", "status", "unlock",
+            "update-branch", "view", "revert", "merge", "help"}
+
+
+def command_word_positions(args):
+    """[(index, word)] of the command words: the arguments that are not flags and not the value of a flag that takes one. A flag may stand anywhere between the
+    words (gh accepts `-R repo` and `--repo=repo` before the group, between the group and the verb, or after), so the verb is not at a fixed position."""
+    out, i = [], 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "--":
+            break
+        if arg.startswith("-") and len(arg) > 1:
+            i += 2 if arg in VALUE_FLAGS else 1
+            continue
+        out.append((i, arg))
+        i += 1
+    return out
+
+
+def canonical_pr_merge(args):
+    """`gh pr merge` written with a flag between its words (`pr -R repo merge N`, `-R repo pr merge N`) is the same call as `pr merge -R repo N`: it is
+    returned in that one canonical form, which every check reads. A `pr` command whose second word is not a known verb but which has `merge` among its words
+    (an unknown flag's value was taken for the verb) is also read as a merge: the shim would rather refuse than miss one. Anything else comes back unchanged."""
+    words = command_word_positions(args)
+    if len(words) < 2 or words[0][1] != "pr":
+        return args
+    merge = next((w for w in words[1:2] if w[1] == "merge"), None)
+    if merge is None and words[1][1] not in PR_VERBS:
+        merge = next((w for w in words[2:] if w[1] == "merge"), None)
+    if merge is None:
+        return args
+    return ["pr", "merge"] + [a for i, a in enumerate(args) if i not in (words[0][0], merge[0])]
+
+
+def resolve_dots(parts):
+    """(segments, climbed): `.` dropped and `..` taking the segment before it away, as GitHub resolves a path; `climbed` is True when a `..` would go above the first
+    segment (`repos`): such a path is never tied to a repository."""
+    out, climbed = [], False
+    for part in parts:
+        if part == ".":
+            continue
+        if part == "..":
+            if len(out) <= 1:
+                climbed = True
+            else:
+                out.pop()
+            continue
+        out.append(part)
+    return out, climbed
+
+
+def api_path_parts(arg):
+    """THE one normaliser of a `gh api` path, as GitHub reads it: percent-decoded (until stable), cut at a query string or fragment, repeated slashes collapsed, no leading
+    or trailing slash, `.` and `..` segments resolved. Returns (path, climbed). Case is folded by the matchers (re.I), never here, so a repository keeps its spelling."""
+    path = arg
+    for _ in range(3):
+        decoded = urllib.parse.unquote(path)
+        if decoded == path:
+            break
+        path = decoded
+    path = re.sub(r"/{2,}", "/", re.split(r"[?#]", path.replace("\\", "/"), 1)[0]).strip("/")
+    parts, climbed = resolve_dots(path.split("/"))
+    return "/".join(parts), climbed
+
+
+def api_path(arg):
+    return api_path_parts(arg)[0]
+
+
+def merge_route(args):
+    """Which merge route a command is, so the gate covers the class and not one spelling: ("pr", None) for `pr merge` (any shape), ("api", (repo, n)) for a
+    write to `repos/R/pulls/N/merge`, ("api-unknown", why) for a merge-looking `gh api` whose pull request cannot be told (a placeholder, a variable,
+    a query read from a file), ("graphql", None) for a GraphQL merge mutation, else None. Pure string analysis; nothing is run."""
+    args = canonical_pr_merge(args)
+    if len(args) >= 2 and args[0] == "pr" and args[1] == "merge":
+        return ("pr", None)
+    words = command_word_positions(args)
+    if not words or words[0][1] != "api":
+        return None
+    rest = [a for i, a in enumerate(args) if i != words[0][0]]
+    try:
+        parsed = api_parsed(args)
+    except Refused as err:
+        return ("api-unknown", "the argv of that gh api call cannot be classified: %s" % _clean_reason(str(err), 100))   # the existing exit-10 refusal path
+    method, write = parsed.method or "GET", bool(parsed.fields or parsed.input)
+    text = " ".join(rest)
+    if any(a == "graphql" for a in rest if not a.startswith("-")):
+        if any(word in text for word in GRAPHQL_MERGE_WORDS) or "--input" in rest or "@" in text:
+            return ("graphql", None)
+        return None
+    if method == "GET" and not write:
+        return None
+    for arg in rest:
+        if arg.startswith("-"):
+            continue
+        path, climbed = api_path_parts(arg)
+        if climbed and re.search(r"pulls/[^/]*/merge", urllib.parse.unquote(arg), re.I):
+            return ("api-unknown", "the path of that merge call climbs above its repository")
+        found = API_MERGE_RE.match(path)
+        if found and not re.search(r"[{}$<>:]", found.group(1)):
+            return ("api", (found.group(1), int(found.group(2))))
+        if found or re.search(r"(^|/)pulls/[^/]*/merge", path, re.I):
+            return ("api-unknown", "the pull request of that merge call cannot be told")
+    return None
+
+
+def mg_refuse(why):
+    return ("refuse", "gh: %s (the merge gate fails closed; the owner's own terminal or a logged waiver of the chief of staff goes around it)" % why)
+
+
+def merge_gate_probe(args, lookup, gh):
+    """None (run as given), ("refuse", one line) or ("go", args, release_ref): the merge may run with these args; `release_ref` is the pull request whose lock is
+    released when the merge returns (None when no lock was used). No environment variable lifts this check (the retired FLEET_SWITCHBOARD_OWN_GH is read nowhere
+    in this file): the switchboard's own gh calls run the real gh by path and never reach this shim. Routes covered: `pr merge` in any shape (one the shim cannot parse is refused), `gh api` writes to
+    `pulls/N/merge`, GraphQL merge mutations. Not covered, and said in the docs: an alias the shim cannot see, the web UI, a push to the branch."""
+    try:
+        args = canonical_pr_merge(args)
+        route = merge_route(args)
+        if route is None:
+            return None
+        listed = merge_gate_repos()
+        if listed is not None and not listed:
+            return None
+        if listed is None:
+            return mg_refuse("merge refused: the merge gate's configuration could not be read")
+        kind = route[0]
+        parsed, repo, number = None, None, None
+        if kind == "graphql":
+            return mg_refuse("a GraphQL merge mutation cannot be tied to a pull request while a repository is gated: use `gh pr merge`")
+        if kind == "api-unknown":
+            return mg_refuse("merge refused: %s" % route[1])
+        deadline = time.time() + merge_gate_seconds()
+        env = None
+        if gh is not None:
+            try:
+                env = account_env(gh, lookup)
+            except AppMintRefused as err:
+                return ("refuse", str(err))
+            except Exception:
+                env = None
+        if kind == "pr":
+            parsed = gate_parse(args)
+            if parsed is None:   # a shape the shim cannot parse: refused, unless it names a repository that is not gated
+                named = next((args[i + 1] for i, a in enumerate(args[:-1]) if a in ("-R", "--repo") and REPO_RE.match(args[i + 1])), None)
+                if named and named.lower() not in listed:
+                    return None
+                return mg_refuse("merge refused: the shape of this `pr merge` command was not understood")
+            repo, number = gate_resolve(parsed, gh, env, deadline)
+            if repo is None:
+                return mg_refuse("merge refused: the pull request could not be resolved (%s)" % gate_clean(str(number)))
+        else:
+            repo, number = route[1]
+        if repo.lower() not in listed:
+            return None
+        ref = "%s#%d" % (repo, number)
+        binary = mg_binary()
+        if not binary:
+            return mg_refuse("merge of %s refused: the merge gate cannot be asked (no switchboard)" % ref)
+        try:
+            done = subprocess.run(sb_argv(binary, "merge-gate", ref, "--check", "--json"), capture_output=True, text=True, timeout=merge_gate_seconds(),
+                                  stdin=subprocess.DEVNULL, env=sb_env())
+        except (subprocess.SubprocessError, OSError):
+            return mg_refuse("merge of %s refused: the merge gate did not answer in time; retry, or ask the chief of staff for a logged waiver" % ref)
+        try:
+            payload = json.loads(done.stdout.strip().splitlines()[-1]) if done.stdout.strip() else {}
+        except ValueError:
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        if done.returncode == 10:
+            reason = (payload.get("reason") or done.stderr or "").strip().splitlines()
+            line = gate_clean(reason[0] if reason else "")
+            if line and not line.startswith("merge of"):
+                line = "merge of %s refused: %s" % (ref, line)
+            return ("refuse", "gh: " + (line or "merge of %s refused by the merge gate" % ref)[:400])
+        if done.returncode != 0 or payload.get("allowed") is not True:
+            return mg_refuse("merge of %s refused: the merge gate could not decide (exit %d)" % (ref, done.returncode))
+        head = payload.get("head")
+        if not isinstance(head, str) or not re.fullmatch(r"[0-9a-f]{40}", head):
+            return mg_refuse("merge of %s refused: the merge gate gave no head to bind the merge to" % ref)
+        release = ref if payload.get("locked") is True else None
+        if kind == "api":
+            return ("go", args, release)
+        bound = gate_bind_merge(args, parsed, repo, number, {"head": head})
+        if bound is None or bound[0] == "refuse":
+            return ("refuse", bound[1] if bound else "gh: merge of %s refused: the merge could not be bound to the checked head" % ref)
+        return ("go", bound[1], release)
+    except Exception:
+        return mg_refuse("merge refused: the merge gate hit an unexpected error")
+
+
+def merge_gate_release(ref):
+    """Release the merge lock of `ref` (best effort: a lock that is not released is recovered by its lease)."""
+    try:
+        binary = mg_binary()
+        if binary:
+            subprocess.run(sb_argv(binary, "merge-gate", ref, "--release"), capture_output=True, text=True, timeout=merge_gate_seconds(),
+                           stdin=subprocess.DEVNULL, env=sb_env())
+    except Exception:
+        pass
+
+
+HOLD_MODULE = [None, False]   # (module, tried): gh_hold.py beside this file, loaded by path (a plain `import` would need a package)
+
+
+def load_hold():
+    """The hold-label and audit module, or None when it cannot be loaded."""
+    if not HOLD_MODULE[1]:
+        HOLD_MODULE[1] = True
+        try:
+            path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "gh_hold.py")
+            spec = importlib.util.spec_from_file_location("gh_hold", path)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            module.API_PARSER[0] = api_parsed
+            HOLD_MODULE[0] = module
+        except Exception:
+            HOLD_MODULE[0] = None
+    return HOLD_MODULE[0]
+
+
+RETRY_HOLD = "gh: hold-label check failed, retry (the fleet shim hit an unexpected error and refuses this write rather than let it through)"
+
+
+def hold_probe(args, lookup, gh, write):
+    """(refusal text or None, repo or None, number or None): see gh_hold.py. A missing or broken module refuses a WRITE while the config names a hold
+    (fail closed) and is otherwise silent; that fallback re-reads the config text itself (a missing file means nothing is configured, any other read
+    error counts as naming a hold). Any other unexpected error in the probe refuses a write and lets a read run. The label read uses the account the write would use."""
+    try:
+        if command_words(args)[:1] == ["api"]:
+            try:
+                api_parsed(args)
+            except Refused as err:
+                return "gh: refused: %s" % _clean_reason(str(err), 400), None, None   # an argv the parser refuses is refused here too (read or write), one line
+        module = load_hold()
+        if module is None:
+            try:
+                with open(os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config"),
+                                       "fleet-switchboard", "config.json")) as handle:
+                    named = "hold_labels" in handle.read()
+            except FileNotFoundError:
+                named = False
+            except Exception:
+                named = True                      # a config that cannot be read is not known to name no hold: a write is refused
+            return ("gh: the hold-label check could not be loaded, retry (the fleet shim refuses this write rather than let it through)"
+                    if named and write else None), None, None
+        env = None
+        try:
+            env = account_env(gh, lookup, args=args)
+        except AppMintRefused as err:
+            return str(err), None, None
+        except Exception:
+            env = None
+        got = module.check(args, module.Ctx(gh, env, lambda: lookup.identity().get("name"), write))
+        return got.refusal, got.repo, got.number
+    except Exception:
+        # an unexpected error in this glue (the check itself never raises): a WRITE is refused, a read runs
+        return (RETRY_HOLD if write else None), None, None
+
+
+def body_read_env(gh, lookup, args, write):
+    """The env_of of the body guard's read: the account of the write it guards, worked out ONCE (a failure too, which is raised again, not looked up again), strictly
+    like the write (#2256). A lookup that fails is retried once with a fresh deadline and then raises; the guard turns that into a refusal of the write that names the
+    exception's type. It never leaves a WRITE's read to the inherited or stored login, which may be an account that cannot read the repository (HTTP 404, exit 1)."""
+    done = []
+
+    def env_of():
+        if not done:
+            try:
+                try:
+                    done.append((account_env(gh, lookup, strict=write, args=args), None))
+                except AccountLookupFailed:   # only a strict (write) lookup raises this
+                    done.append((account_env(gh, Lookup(write=True), strict=True, args=args), None))
+            except Exception as err:
+                done.append((None, err))
+        if done[0][1] is not None:
+            raise done[0][1]
+        return done[0][0]
+    return env_of
+
+
+def body_probe(args, gh, write, lookup):   # #1751: gh_body.py beside this file, loaded by path; a WRITE it cannot load or run is refused
+    try:
+        spec = importlib.util.spec_from_file_location("gh_body", os.path.join(os.path.dirname(os.path.realpath(__file__)), "gh_body.py"))
+        module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+        return module.guard(args, write, api_parsed, gh, body_read_env(gh, lookup, args, write))
+    except Exception:
+        return "gh: refused: the body guard could not be loaded, retry" if write else None
+
+
+def api_write_endpoint(module, args):
+    """The reduced endpoint of a `gh api` write for its audit line (allow-listed words only, numbers as '#'; no body, no query, no host), else None."""
+    try:
+        if command_words(args)[:1] != ["api"]:
+            return None
+        found = module.parse_api(args)[0]
+        return reduce_endpoint("api " + found[0]) if found else "api"
+    except Exception:
+        return None
+
+
+def audit_write(args, lookup, outcome, write, repo=None, number=None):
+    """One audit line for a gh write (never a command line); best effort, never changes the command."""
+    try:
+        if not write or is_git_credential(args):
+            return
+        module = load_hold()
+        if module is not None:
+            module.write_audit(args, my_name(lookup), outcome, repo, number, api_write_endpoint(module, args))
+    except Exception:
+        pass
+
+
+def refusal_text(err):
+    """The one line a refused credential request says. A worker with no repository of its own gets the fix by name; any other refusal names the repository."""
+    if isinstance(err, NoOwnRepository):
+        return ("gh: this worker has no repository of its own (it was launched without --repo and its working directory had no usable origin), so git cannot "
+                "authenticate as a guess: the default repository's account is never used. Relaunch it with `fleet-switchboard launch ... --repo OWNER/NAME`\n")
+    return "gh: no GitHub account is mapped for %s: git cannot authenticate as a guess (add the repository or its owner to gh_users)\n" % _clean_reason(str(err))
+
+
+SHARED_TEMP_DIRS = ("/tmp", "/private/tmp")
+
+
+def shared_body_file(args, env=None):
+    """The --body-file / -F path (absolute) whose PARENT directory is a shared temp directory, else None. String analysis only: the path is
+    never opened, stat'ed or read, and '..' is folded lexically. The shared directories are /tmp, /private/tmp and the parent of this
+    agent's own TMPDIR (the profile's shared temp root, which the launch exports as FLEET_AGENT_TMPDIR). Fails open: any error is None."""
+    try:
+        env = os.environ if env is None else env
+        if not args or args[0] == "api":   # `gh api -F key=value` is a field, not a file
+            return None
+        shared = {posixpath.normpath(d) for d in SHARED_TEMP_DIRS}
+        own = env.get("FLEET_AGENT_TMPDIR") or ""
+        if own.startswith("/") and posixpath.normpath(own) != "/":
+            shared.add(posixpath.dirname(posixpath.normpath(own)))
+        i = 0
+        while i < len(args):
+            arg = args[i]
+            if arg == "--":
+                return None
+            value = None
+            if arg in ("--body-file", "-F"):
+                value = args[i + 1] if i + 1 < len(args) else None
+            elif arg.startswith("--body-file="):
+                value = arg[len("--body-file="):]
+            elif arg.startswith("-F") and not arg.startswith("--"):
+                value = arg[2:].lstrip("=") if arg[2:3] == "=" else arg[2:]
+            if value is not None and value.startswith("/"):
+                if posixpath.dirname(posixpath.normpath(value)) in shared:
+                    return value
+            i += 1
+    except Exception:
+        return None
+    return None
+
+
+def warn_shared_body_file(args):
+    """One stderr line when a body file sits directly in a shared temp directory (#767). Never refuses, never changes anything."""
+    try:
+        path = shared_body_file(args)
+        if path:
+            sys.stderr.write("gh: warning: %s is directly in a shared temp directory, where another agent can write the same name: put it under $TMPDIR "
+                             "(for example $TMPDIR/body.md, or a directory from `mktemp -d`)\n" % re.sub(r"[^\x20-\x7e]", "?", path)[:200])
+    except Exception:
+        pass
+
+
+def main(args):
+    try:
+        return run(args)
+    finally:
+        app_cleanup()   # a token file made for this call never outlives it
+
+
+def run(args):
+    gh = real_gh()
+    if gh is None:
+        sys.stderr.write("gh: not found on PATH (the fleet shim found no real gh behind it)\n")
+        return 127
+    plan = None
+    warn_shared_body_file(args)
+    args = canonical_pr_merge(args)   # THE one parse of the call shape: every probe below (hold, review, plan gate, merge gate) reads the same canonical `pr merge` (#962)
+    args, over_found, over_reason = take_over_review(args)   # the shim's own flag never reaches gh or the signing
+    write = is_write(args)
+    lookup = Lookup(write=write)   # one identity lookup, one deadline, for the name and the account together
+    scope = read_scope(args, lookup, write)   # a worker with a read-only extra repository (#618): refused here, or told which repository to read as
+    if scope is not None and scope[0] == "refuse":
+        sys.stderr.write(scope[1].strip() + "\n")
+        audit_write(args, lookup, "refused", write)
+        return 1
+    held, hold_repo, hold_number = hold_probe(args, lookup, gh, write)   # a hold label refuses before anything else is asked (#376)
+    held = held or body_probe(args, gh, write, lookup)   # #1751: a body write that drops the Intent or the Done-when is refused (gh_body.py)
+    if held:
+        sys.stderr.write(held.strip() + "\n")
+        audit_write(args, lookup, "refused", write, hold_repo, hold_number)
+        return 1
+    try:
+        plan = sign_plan(args, lookup)
+    except Unsignable as err:
+        sys.stderr.write("gh: refused: %s\n" % _clean_reason(str(err), 400) if isinstance(err, Refused) else
+                         "gh: refused: %s, so it cannot be signed and nothing was posted\n" % _clean_reason(str(err)))
+        audit_write(args, lookup, "refused", write, hold_repo, hold_number)
+        return 1
+    refusal = review_probe(args, over_found, over_reason, lookup, gh)
+    if refusal is not None:
+        sys.stderr.write(refusal + "\n")
+        audit_write(args, lookup, "refused", write, hold_repo, hold_number)
+        return 10
+    verdict = gate_probe(args, lookup, gh)
+    if verdict is not None and verdict[0] == "refuse":
+        sys.stderr.write(gate_clean(verdict[1]) + "\n")
+        audit_write(args, lookup, "refused", write, hold_repo, hold_number)
+        return 10
+    if verdict is not None:
+        args = verdict[1]
+    merged = merge_gate_probe(args, lookup, gh)
+    release_ref = None
+    if merged is not None and merged[0] == "refuse":
+        sys.stderr.write(gate_clean(merged[1]) + "\n")
+        audit_write(args, lookup, "refused", write, hold_repo, hold_number)
+        return 10
+    if merged is not None:
+        args, release_ref = merged[1], merged[2]
+    if isinstance(plan, DeferredRefusal):   # the graphql refusal comes after every older refusal above
+        sys.stderr.write("gh: refused: %s\n" % _clean_reason(str(plan.err), 400) if isinstance(plan.err, Refused) else
+                         "gh: refused: %s, so it cannot be signed and nothing was posted\n" % _clean_reason(str(plan.err)))
+        audit_write(args, lookup, "refused", write, hold_repo, hold_number)
+        return 1
+    credential = is_git_credential(args)
+    extra = {"credential": True} if credential else {}   # only the git credential route passes the keyword: every other call is exactly as it was
+    if scope is not None:
+        extra["read_repo"] = scope[1]
+    try:
+        env = account_env(gh, lookup, strict=is_write(args), args=args, **extra)
+    except NoAccountMapped as err:
+        sys.stderr.write(refusal_text(err))
+        return 1
+    except AppMintRefused as err:
+        sys.stderr.write(str(err) + "\n")
+        audit_write(args, lookup, "refused", write, hold_repo, hold_number)
+        return 1
+    except AccountLookupFailed:
+        try:
+            env = account_env(gh, Lookup(write=True), strict=True, args=args, **extra)   # retry the lookup ONCE with a fresh deadline
+        except NoAccountMapped as err:
+            sys.stderr.write(refusal_text(err))
+            return 1
+        except AppMintRefused as err:
+            sys.stderr.write(str(err) + "\n")
+            return 1
+        except AccountLookupFailed:
+            sys.stderr.write("gh: account lookup failed, retry (the fleet shim could not find which GitHub account this write is for, and will not "
+                             "fall back to the inherited token)\n")
+            audit_write(args, lookup, "refused", write, hold_repo, hold_number)
+            return 1
+    audit_write(args, lookup, "passed", write, hold_repo, hold_number)
+    warn_text(args)
+    served = None
+    agent = None
+    try:
+        words = command_words(args)
+        if words and words[0] not in NO_NETWORK_GROUPS:
+            ident = lookup.identity() if (write or cacheable_read(args)) else {}
+            agent = ident.get("name")
+            if write:
+                cache_drop(agent)   # a write by this agent: its cached answers go before the write runs
+            account = COUNT_ACCOUNT[0] or "default"
+            low = budget_low(account)
+            if low is not None:
+                warn_low(account, low)
+            if not write and plan is None and not APP_DIRS:
+                served = cached_read(gh, env, args, agent, account, low)
+    except Exception:
+        served = None   # the cache never fails the command
+    if served is not None:
+        return served
+    if not write and command_words(args) and command_words(args)[0] not in NO_NETWORK_GROUPS:
+        low_budget_read(agent)   # only a READ that reaches GitHub (not a write, not a cached answer): the top spender's message, and its bounded wait
+    count_call(args)
+    if plan is None and release_ref:   # a merge under the lock: the lock is released when the merge returns, whatever it returned
+        try:
+            return subprocess.run([gh] + args, env=env).returncode
+        finally:
+            merge_gate_release(release_ref)
+    if plan is None:
+        if APP_DIRS:   # a token file has to be removed after the call: gh runs as a child, not in place of this process
+            child = subprocess.Popen([gh] + args, env=env)
+            APP_CHILD.append(child)
+            return child.wait()
+        if env is not None:
+            os.execve(gh, [gh] + args, env)
+        os.execv(gh, [gh] + args)
+    argv, stdin_text, temp = plan
+    try:
+        done = subprocess.run([gh] + argv, input=stdin_text, text=True if stdin_text is not None else None, env=env)
+        if write:
+            cache_mark(lookup.identity().get("name"))   # the write has ended (an exec'd write cannot say so: the grace window covers it)
+        return done.returncode
+    finally:
+        for path in ([temp] if isinstance(temp, str) else temp or []):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -1,0 +1,25 @@
+{
+  "id": "B1",
+  "title": "Five events for one agent within 60 s",
+  "problem": 3,
+  "since_pr": 2,
+  "tiers": ["offline", "lab-scripted"],
+  "cast": {
+    "platform": {"role": "orchestrator", "charter": 1}
+  },
+  "steps": [
+    {"at": "0s", "actor": "world", "do": "fact", "to": "platform", "key": "lab.fact:b1-1", "summary": "First of five events"},
+    {"at": "15s", "actor": "world", "do": "fact", "to": "platform", "key": "lab.fact:b1-2", "summary": "Second of five events"},
+    {"at": "30s", "actor": "world", "do": "fact", "to": "platform", "key": "lab.fact:b1-3", "summary": "Third of five events"},
+    {"at": "45s", "actor": "world", "do": "fact", "to": "platform", "key": "lab.fact:b1-4", "summary": "Fourth of five events"},
+    {"at": "60s", "actor": "world", "do": "fact", "to": "platform", "key": "lab.fact:b1-5", "summary": "Fifth of five events"},
+    {"at": "5m", "actor": "world", "do": "wait"}
+  ],
+  "expect": [
+    {"name": "one-message", "that": "message_count", "to": "platform", "count": 1},
+    {"name": "one-turn", "that": "model_saw", "agent": "platform", "key": "lab.fact:b1-*", "when": "turn_start", "count": 1,
+     "why": "One machine turn for the whole burst, not five"},
+    {"name": "all-five", "that": "delivered", "to": "platform", "key": "lab.fact:b1-*", "keys": 5, "mode": "wake"}
+  ],
+  "control": {"fault": "no-batch", "fails": ["one-message", "one-turn"]}
+}

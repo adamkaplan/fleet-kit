@@ -1,0 +1,4 @@
+{
+ "command": "close-pane",
+ "help": "usage: fleet-switchboard close-pane [-h] pane positional arguments: pane The herdr pane id options: -h, --help show this help message and exit"
+}

@@ -1,0 +1,55 @@
+{
+  "name": "opencode-todolist",
+  "version": "0.4.2",
+  "description": "OpenCode V2 plugin restoring session todo list tools (todowrite/todoread) with a sidebar todo strip",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./tui": {
+      "import": "./tui/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "src",
+    "tui",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json && node build.tui.mjs",
+    "build:tui": "node build.tui.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test tests/*.test.ts",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "todo",
+    "todowrite",
+    "todoread"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/aiev/opencode-todolist.git"
+  },
+  "license": "MIT",
+  "peerDependencies": {
+    "@opentui/core": ">=0.5.10",
+    "@opentui/solid": ">=0.5.10",
+    "solid-js": ">=1.9.0"
+  },
+  "devDependencies": {
+    "@opencode/plugin": "^2.0.16",
+    "@opencode/theme": "^2.0.16",
+    "@types/node": "^22.0.0",
+    "esbuild": "^0.25.0",
+    "esbuild-plugin-solid": "^0.6.0",
+    "tsx": "^4.22.3",
+    "typescript": "^5.8.0"
+  }
+}

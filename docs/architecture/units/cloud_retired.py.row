@@ -1,0 +1,1 @@
+| `cloud_retired.py` | 5 | the read of a retired cloud worker from its run record, and the boss kept at its removal (#1546); a part of `cloud_worker.py` | |

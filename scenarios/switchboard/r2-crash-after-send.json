@@ -1,0 +1,28 @@
+{
+  "id": "R2",
+  "title": "The daemon crashes between sending and reading back",
+  "problem": null,
+  "since_pr": 2,
+  "tiers": ["offline", "lab-scripted"],
+  "cast": {
+    "platform": {"role": "orchestrator", "charter": 1}
+  },
+  "steps": [
+    {"at": "0s", "actor": "world", "do": "kill-daemon",
+     "why": "Only the passes below run until the restart"},
+    {"at": "0s", "actor": "world", "do": "fact", "to": "platform", "key": "lab.fact:r2-a", "summary": "First event"},
+    {"at": "90s", "actor": "world", "do": "pass", "faults": ["crash-after-send"],
+     "why": "The pass sends the wake for r2-a, then the process dies before it audits the result"},
+    {"at": "91s", "actor": "world", "do": "pass", "faults": ["no-dedupe"],
+     "why": "The restarted daemon's read-back misses that message and sends r2-a again: the id derived from the keys makes v2 admit it once (invariant 3)"},
+    {"at": "100s", "actor": "world", "do": "fact", "to": "platform", "key": "lab.fact:r2-b", "summary": "Second event"},
+    {"at": "100s", "actor": "world", "do": "restart-daemon"},
+    {"at": "5m", "actor": "world", "do": "wait"}
+  ],
+  "expect": [
+    {"name": "a-once", "that": "delivered", "to": "platform", "key": "lab.fact:r2-a", "count": 1},
+    {"name": "b-once", "that": "delivered", "to": "platform", "key": "lab.fact:r2-b", "count": 1},
+    {"name": "two-messages", "that": "message_count", "to": "platform", "count": 2}
+  ],
+  "control": {"fault": "no-dedupe", "fails": ["a-once"]}
+}

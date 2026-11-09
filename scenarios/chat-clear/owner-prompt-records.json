@@ -1,0 +1,70 @@
+{
+ "_comment": "The shape of the owner's prompt records as `session.message.list type=user` returns them in the Chief of Staff's session (read-only, keys and value types only). Every text is the same replaced filler: no real message text is kept. A message the fleet wrote carries metadata.fleet; the records of that kind below are the negative cases and are synthetic.",
+ "person": [
+  {
+   "agents": [],
+   "files": [],
+   "id": "msg_fixture01",
+   "text": "text replaced by the fixture",
+   "time": {
+    "created": 1760000000000
+   },
+   "type": "user"
+  },
+  {
+   "agents": [],
+   "files": [],
+   "id": "msg_fixture02",
+   "text": "text replaced by the fixture text replaced by the fixture text replaced by the fixture text replaced by the fixture text replaced by the fixture text replaced by the fixture text replaced by the fixture text replaced by the fixture ",
+   "time": {
+    "created": 1760000010000
+   },
+   "type": "user"
+  },
+  {
+   "agents": [],
+   "files": [],
+   "id": "msg_fixture03",
+   "text": "text replaced by the fixture text replaced by the fixture text replaced by the fixture text replaced by the fixture text replaced by the fixture text replaced by the fixture text replaced by the fixture text replaced by the fixture text replaced by the fixture text replaced by the fixture text replaced by the fixture text replaced by the fixture text replaced by the fixture text replaced by the fixture text replaced by the fixture text replaced by the fixture text replaced by the fixture text replaced by the fixture text replaced by the fixture text replaced by the fixture text replaced by the fixture text replaced by the fixture text replaced by the fixture text replaced by the fixture text replaced by the fixture text replaced by the fixture text replaced by the fixture text replaced by the fixture text replaced by the fixture text replaced by the fixture text replaced by the fixture text replaced by the fixture text replaced by the fixture text replaced by the fixture text replaced by the fixture text replaced by the fixture text replaced by the fixture text replaced by the fixture text replaced by the fixture text replaced by the fixture text replaced by the fixture text replaced by the fixture text replaced by the fixture text replaced by the fixture text replaced by the fixture text replaced by the fixture text replaced by the fixture text replaced by the fixture text replaced by the fixture text replaced by the fixture text replaced by the fixture text replaced by the fixture text replaced by the fixture text replaced by the fixture text replaced by the fixture text replaced by the fixture text replaced by the fixture text replaced by the fixture text replaced by the fixture text replaced by the fixture text replaced by the fixture text replaced by the fixture text replaced by the fixture text replaced by the fixture text replaced by the fixture text replaced by the fixture text replaced by the fixture text replaced by the fixture text replaced by the fixture text replaced by the fixture ",
+   "time": {
+    "created": 1760000020000
+   },
+   "type": "user"
+  }
+ ],
+ "fleet": [
+  {
+   "agents": [],
+   "files": [],
+   "id": "msg_fixture04",
+   "text": "text replaced by the fixture",
+   "time": {
+    "created": 1760000030000
+   },
+   "type": "user",
+   "metadata": {
+    "fleet": {
+     "from": "fleet-task"
+    }
+   }
+  },
+  {
+   "agents": [],
+   "files": [],
+   "id": "msg_fixture05",
+   "text": "[switchboard] text replaced by the fixture",
+   "time": {
+    "created": 1760000040000
+   },
+   "type": "user",
+   "metadata": {
+    "fleet": {
+     "keys": [
+      "k"
+     ]
+    }
+   }
+  }
+ ],
+ "filler": "text replaced by the fixture"
+}

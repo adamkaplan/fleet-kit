@@ -1,0 +1,1 @@
+One file per unit of the switchboard (ask #2206): `<unit path relative to bin/>.row` holds that unit's one table row (`| `unit` | layer | job | also may use |`). A change that adds a unit adds one file here and edits no shared line, so two such changes never conflict. `tests/switchboard/test_architecture.py` reads these files as the Units table.

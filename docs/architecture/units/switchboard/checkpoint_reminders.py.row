@@ -1,0 +1,1 @@
+| `switchboard/checkpoint_reminders.py` | 4 | the checkpoint reminders a launch sets from the brief's CHECKPOINT and the overdue wake (cut out of `reminders.py` unchanged: the part was past the 1,500-line ceiling) | |
