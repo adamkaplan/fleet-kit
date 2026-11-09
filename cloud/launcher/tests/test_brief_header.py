@@ -1,7 +1,6 @@
 """Ask #1046: a standard operator brief header, and a launch that refuses a report-to name nobody can answer to. Offline: fake cluster pieces,
 fake registry in a temporary state directory. Scenarios: S2 S3 (the header), S4 S5 (the check), S6 (mutants), S7 (documentation), S9 S11 (cloud
 shape and temporary rules), U2 (no secret), U3 (the one constant in one place)."""
-import hashlib
 import inspect
 import io
 import os
@@ -24,7 +23,7 @@ PREFIX = "fl" + "eet"   # assembled from a fragment: the neutral-names scan of c
 SOURCE = os.path.join(ROOT, "skills", PREFIX + "-coordination", "operator-brief-header.txt")
 PLANTED = "planted-" + "Hq7Lz2" * 5   # a fake setting value
 SB = os.path.join(ROOT, "bin", PREFIX + "-switchboard")
-HEADER_OUTPUT_SHA256 = "6535bd79e08c4335073de6c4eeb6f902c98d802c1c80874a7b1191b9a9bfb1ad"   # the output with the done-land rule (ask #2320)
+TITLE_START = "Standard brief header"
 
 
 def read(path):
@@ -817,10 +816,61 @@ class HeaderFileAndOutput(unittest.TestCase):
         self.assertIn("`[id] text`", comment)
         self.assertNotIn("and nothing else", comment)
 
-    def test_s14_the_printed_output_is_the_recorded_one(self):
+    @staticmethod
+    def header_problems(out, rules):
+        """Properties of a printed header against the rules of the one source file; returns the list of broken ones."""
+        bad = []
+        lines = out.splitlines()
+        if not lines or not lines[0].startswith(TITLE_START):
+            bad.append("the output does not start with its title")
+        body = lines[1:]
+        for ident, text in rules:
+            if not text:
+                bad.append("empty rule " + ident)
+            mine = [l for l in body if l.startswith("- [%s] " % ident) or l.startswith("[%s] " % ident)]
+            if len(mine) != 1:
+                bad.append("%s printed %d times" % (ident, len(mine)))
+            elif mine[0].split("] ", 1)[1] != text:
+                bad.append("%s line is not `[id] text`" % ident)
+        ids = [i for i, _ in rules]
+        printed = [l.split("]", 1)[0].lstrip("- [") for l in body if l.strip()]
+        if printed != ids:
+            bad.append("the printed rules are not the rules of the source, in order: %r" % printed)
+        return bad
+
+    def test_s14_the_printed_header_has_the_properties_of_its_source(self):
         code, out, err = run_header()
         self.assertEqual(code, 0, err)
-        self.assertEqual(hashlib.sha256(out.encode()).hexdigest(), HEADER_OUTPUT_SHA256)
+        rules = rules_of(SOURCE)
+        self.assertEqual(self.header_problems(out, rules), [])
+        by_id = dict(rules)
+        self.assertIn("done-land", by_id)   # the rule for a repository that lands (ask #2320)
+        for word in ("spire land", "landed <sha>", "exit 22"):
+            self.assertIn(word, by_id["done-land"])
+        self.assertTrue(out.startswith(TITLE_START))
+
+    def test_s14_control_a_dropped_or_doubled_rule_or_an_empty_one_is_caught(self):
+        sb = load_sb()
+        rules = rules_of(SOURCE)
+        lines = open(SOURCE).read().splitlines(True)
+        victim = [l for l in lines if l.startswith("done-land |")]
+        self.assertEqual(len(victim), 1)
+        variants = {
+            "dropped": [l for l in lines if l not in victim],
+            "doubled": lines + victim,
+            "empty": [l if l not in victim else "done-land | \n" for l in lines],
+        }
+        for name, kept in variants.items():
+            with self.subTest(variant=name), tempfile.TemporaryDirectory() as work:
+                path = os.path.join(work, "header.txt")
+                with open(path, "w") as f:
+                    f.write("".join(kept))
+                self.assertNotEqual(self.header_problems(sb.brief_header_text(path), rules), [], name)
+        with tempfile.TemporaryDirectory() as work:   # and the unchanged copy passes the same check
+            path = os.path.join(work, "header.txt")
+            with open(path, "w") as f:
+                f.write("".join(lines))
+            self.assertEqual(self.header_problems(sb.brief_header_text(path), rules), [])
 
 
 class DocsRedactionLimits(unittest.TestCase):
