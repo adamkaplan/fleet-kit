@@ -7,6 +7,7 @@
 // so is a figure that file does not carry. Tool calls per minute are approximate (permission evaluations), marked "≈".
 import { readFileSync, statSync } from "node:fs"
 import { join } from "node:path"
+import { wrapText } from "./decisions.mjs"
 
 export const NOT_RECORDED = "not recorded"
 export const RECORDS_FILE = "health-records.json"
@@ -290,12 +291,11 @@ export function alarmRows(file, now, width) {
   if (!agent || !isNum(rec.since)) return []
   const rows = []
   if (rec.ended === null || rec.ended === undefined) {
-    if (isNum(rec.at) && now - rec.at * 1000 > ALARM_STALE_MS) return []
+    if (!isNum(rec.at) || now - rec.at * 1000 > ALARM_STALE_MS) return [] // no time of the last write: nothing says it is still alive
     rows.push(`! ${agent} blocked ${Math.max(0, Math.floor((now - rec.since * 1000) / 60000))} minutes`)
-    const text = clean(rec.text, 400)
-    if (text) rows.push(text)
+    rows.push(...wrapText(clean(rec.text, 400), width, 6)) // wrapped, not cut: the wait and the command are the point of the row
     const resume = clean(rec.resume, 120)
-    if (resume) rows.push(`resume: ${resume}`)
+    if (resume) rows.push(...wrapText(`resume: ${resume}`, width, 3))
   } else {
     if (!isNum(rec.ended) || now - rec.ended * 1000 > ALARM_KEEP_MS) return []
     rows.push(`${agent} block ended (${Math.max(0, Math.floor((rec.ended - rec.since) / 60))} minutes)`)
