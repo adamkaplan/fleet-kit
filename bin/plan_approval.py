@@ -207,7 +207,8 @@ def evaluate(value, comments, done_when, plan_check):
     """{"ok": bool, "line": the one stderr line (failure only), "plan_hash", "done_when_hash"}.
     `comments`: the issue's comments; `done_when`: the issue's own, else its ask's (None when neither has one)."""
     def refuse(line, plan_hash=None):
-        return {"ok": False, "line": "approval not recorded: %s; the message was delivered" % line, "plan_hash": plan_hash}
+        return {"ok": False, "line": "approval not recorded: %s; the message was delivered" % line, "plan_hash": plan_hash,
+                "plan_hashes": plan_check.plan_hashes(text) if plan_hash else None}
     if not HEX64_RE.match(value or ""):
         return refuse("the full 64-character hash is needed (a prefix or an empty value never approves)")
     plans = [c for c in comments if isinstance(c, dict) and isinstance(c.get("body"), str)
@@ -216,7 +217,8 @@ def evaluate(value, comments, done_when, plan_check):
         return refuse("the issue has %d plan comments, and an approval needs exactly 1" % len(plans))
     text = plans[0]["body"]
     current = plan_check.plan_hash(text)
-    if "sha256:" + value.lower() != current:
+    hashes = plan_check.plan_hashes(text)
+    if plan_check.canonical_hash("sha256:" + value.lower(), hashes) != hashes[0]:
         return refuse("the plan has changed (current %s)" % current, current)
     if not (done_when or "").strip():
         return refuse("there is no Done-when on the issue or its ask to check the plan against (current %s)" % current, current)
@@ -228,4 +230,4 @@ def evaluate(value, comments, done_when, plan_check):
         return refuse("the plan declares no clauses block to compare with the Done-when (current %s)" % current, current)
     if not plan_check.verify_declared(declared, done_when):
         return refuse("the plan's clauses no longer equal the current Done-when (current %s)" % current, current)
-    return {"ok": True, "line": "", "plan_hash": current, "done_when_hash": "sha256:" + done_when_hash(done_when)}
+    return {"ok": True, "line": "", "plan_hash": current, "plan_hashes": hashes, "done_when_hash": "sha256:" + done_when_hash(done_when)}

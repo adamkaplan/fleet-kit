@@ -11,7 +11,7 @@ class GitHubOverGit:
         self.calls, self.fail, self.changed_files_override = [], None, None
 
     def git(self, *args, check=True):
-        done = subprocess.run(["git", "-C", self.dir] + list(args), capture_output=True, text=True)
+        done = subprocess.run(["git", "-C", self.dir, "-c", "user.email=dev@example.test", "-c", "user.name=Dev", "-c", "commit.gpgsign=false"] + list(args), capture_output=True, text=True)   # identity by `git -c`: no `git config` (a pod's git wrapper refuses it, and GIT_CONFIG_* too)
         if check and done.returncode != 0:
             raise RuntimeError("git %s: %s" % (" ".join(args), done.stderr.strip()))
         return done.stdout

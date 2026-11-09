@@ -65,6 +65,7 @@ class TestPodNiceness(unittest.TestCase):
 
     def run_mutant(self, source):
         copy = self.home / "heavy_slots.py"
+        (copy.parent / "heavy_slots_watch.py").write_text((HEAVY.parent / "heavy_slots_watch.py").read_text())
         copy.write_text(source)
         script = "import sys; sys.path.insert(0, %r); import test_pod_niceness as t; t.check_without_marker(t.load(%r))" % (str(Path(__file__).parent), str(copy))
         return subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, cwd=str(Path(__file__).parent))
@@ -84,6 +85,7 @@ class TestPodNiceness(unittest.TestCase):
         script = "import sys; sys.path.insert(0, %r); import test_pod_niceness as t; t.check_in_pod(t.load(%r))"
         def run(text):
             copy = self.home / "heavy_slots.py"
+            (copy.parent / "heavy_slots_watch.py").write_text((HEAVY.parent / "heavy_slots_watch.py").read_text())
             copy.write_text(text)
             return subprocess.run([sys.executable, "-c", script % (str(Path(__file__).parent), str(copy))], capture_output=True, text=True, cwd=str(Path(__file__).parent))
         control = run(source)
@@ -97,7 +99,7 @@ class TestPodNiceness(unittest.TestCase):
     def wrapper(self, env_more):
         """Run the real wrapper on a child that prints its niceness and the slot record it can see; return (niceness, record count while running)."""
         env = dict(os.environ, XDG_STATE_HOME=str(self.home), PATH=os.environ["PATH"])
-        for key in ("FLEET_HEAVY_SLOT", "FLEET_HEAVY", "CI", "CW_AUDIT_RUNTIME_ID", "CW_HARD_DEADLINE"):
+        for key in ("FLEET_HEAVY_SLOT", "FLEET_HEAVY", "CI", "CW_AUDIT_RUNTIME_ID", "CW_HARD_DEADLINE", sb.UNDER_TEST_ENV):   # the slot wrapper reads the daemon's own config by design: it is not a test, so the guard marker is not passed to it
             env.pop(key, None)
         env.update(env_more)
         stub = self.home / "nobin"

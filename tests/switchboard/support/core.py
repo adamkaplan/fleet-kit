@@ -110,6 +110,10 @@ class Base(unittest.TestCase):
             calm = mock.patch.object(target, name, value)
             calm.start()
             self.addCleanup(calm.stop)
+        # a test world never reads the host's free disk: the disk guard runs in every pass and a small CI runner would raise disk.low in unrelated tests.
+        ample = mock.patch.object(shutil, "disk_usage", lambda path: shutil._ntuple_diskusage(1000 * 10 ** 9, 500 * 10 ** 9, 500 * 10 ** 9))
+        ample.start()
+        self.addCleanup(ample.stop)
         (self.home / "cos-definition.md").write_text(COS_ALLOWING)
         for name in (sb.LAB_ENV, sb.FAULT_ENV, "HERDR_PANE_ID", "OPENCODE_SESSION_ID"):
             os.environ.pop(name, None)

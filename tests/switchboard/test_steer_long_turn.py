@@ -67,7 +67,7 @@ def build(Base, TestSteerToWorking):
             (intent,) = self.intents()
             self.assertEqual(intent["detail"]["delivery"], "queue")
             self.assertNotIn("busy", intent["detail"])
-            self.assertFalse(self.turn_file().exists())   # off: nothing is read or written
+            self.assertTrue(self.turn_file().exists())   # #2243: the start is always recorded; the setting off only means it is never read for steering
 
         def test_a_young_turn_queues(self):
             self.on(30)

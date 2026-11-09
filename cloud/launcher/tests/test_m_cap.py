@@ -8,6 +8,7 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -25,6 +26,7 @@ sys.modules["cw_test_cloud_worker_mod"] = tcw
 _loader.exec_module(tcw)
 
 FUTURE, PAST = "2099-01-01T00:00:00Z", "2001-01-01T00:00:00Z"
+CAP = int(re.search(r"^MAX_M_PER_LANE = (\d+)", (ROOT / "bin" / "cloud_worker.py").read_text(), re.M).group(1))   # the cap itself, read from the code
 OLD_ONLY = "M_CAP_SCRATCH_OLD"   # set only in the scratch copy of the code before the change
 
 
@@ -44,7 +46,7 @@ class Cap(tcw.Base):
         brief = self.home / "brief.txt"
         brief.write_text("Build the thing.\n")
         return self.main("launch", name, "--cloud", "--agent", "coder", "--repo", "acme-org/widget-service", "--branch", "main", "--role", "coder",
-                         "--reports-to", lane, "--shape", shape, "--brief-file", str(brief))
+                         "--reports-to", lane, "--boss-unregistered", "the cap test names lanes that no registry holds", "--shape", shape, "--brief-file", str(brief))
 
     def calls(self):
         return len(self.stub_calls()) + len(self.jsonl("kubectl.log")) + len(self.jsonl("login.log"))
@@ -69,32 +71,33 @@ class TestScenarios(Cap):
         self.assertEqual(records, [])
 
     def test_s3_a_fifth_shape_m_launch_stops_at_the_cap_with_no_call(self):
-        for n in range(1, 5):
-            self.put("coder%d" % n)
-        code, out, err = self.ask("coder5")
+        names = ["coder%d" % n for n in range(1, CAP + 1)]
+        for n in names:
+            self.put(n)
+        code, out, err = self.ask("extra1")
         lines = [l for l in err.splitlines() if "already holds" in l and "lane-a" in l]
-        named = [n for n in ("coder1", "coder2", "coder3", "coder4") if n in (lines or [""])[0]]
+        named = [n for n in names if n in (lines or [""])[0]]
         print("S3: refusal exit %d, lines naming the lane %d, workers named %d, token minter calls %d, launcher calls %d, cluster calls %d"
               % (code, len(lines), len(named), len(self.jsonl("login.log")), len(self.stub_calls()), len(self.jsonl("kubectl.log"))))
         self.assertEqual(code, 2, err)
         self.assertEqual(len(lines), 1, err)
-        self.assertIn("holds 4 shape-M", lines[0])
-        self.assertIn("coder1, coder2, coder3, coder4", lines[0])
+        self.assertIn("holds %d shape-M" % CAP, lines[0])
+        self.assertEqual(len(named), min(CAP, 10), lines[0])   # the refusal lists at most 10 names (held[:10] in bin/cloud_worker.py)
         self.assertIn("retire one", lines[0])
         self.assertIn("--shape S", lines[0])
         self.assertEqual(self.calls(), 0)
 
     def test_s4_other_shapes_names_and_lanes_proceed_as_before(self):
-        for n in range(1, 5):
+        for n in range(1, CAP + 1):
             self.put("coder%d" % n)
-        for n in range(5, 8):
-            self.put("coder%d" % n, lane="lane-c")
+        for n in range(1, CAP):
+            self.put("lanec%d" % n, lane="lane-c")
         self.put("sidekick", lane="lane-c", shape="S")   # a record of another shape must not count toward lane-c
         results = []
-        results.append(self.ask("coder8", shape="S"))                 # another shape, full lane
+        results.append(self.ask("extra1", shape="S"))                 # another shape, full lane
         results.append(self.ask("coder1"))                             # a name that has a record
-        results.append(self.ask("coder9", lane="lane-b"))              # another lane, 0 records
-        results.append(self.ask("coder10", lane="lane-c"))             # 3 shape-M records and one shape-S record: the 4th shape M is accepted
+        results.append(self.ask("extra2", lane="lane-b"))              # another lane, 0 records
+        results.append(self.ask("extra3", lane="lane-c"))              # CAP-1 shape-M records and one shape-S record: the last shape M is accepted
         refused = sum(1 for _, _, e in results if self.cap_refused(e))
         print("S4: launches proceeding as before %d of 4, refusals by the cap %d" % (4 - refused, refused))
         self.assertEqual(refused, 0, [e for _, _, e in results])
@@ -163,8 +166,13 @@ class TestScratch(unittest.TestCase):
 
     def child(self, edits, test, old=False):
         src = (ROOT / "bin" / "cloud_worker.py").read_text()
+        part = (ROOT / "bin" / "cloud_lane_cap.py").read_text()   # the count moved here (ask #2259)
         applied = 0
         for old_text, new_text in edits:
+            if src.count(old_text) == 0 and part.count(old_text) == 1:
+                part = part.replace(old_text, new_text, 1)
+                applied += 1
+                continue
             self.assertEqual(src.count(old_text), 1, "the line to change is not as expected: " + old_text)
             src = src.replace(old_text, new_text, 1)
             applied += 1
@@ -179,12 +187,14 @@ class TestScratch(unittest.TestCase):
         shutil.copy(ROOT / "cloud" / "launcher" / "tests" / "cw_cases_lookup.py", os.path.join(d, "cloud", "launcher", "tests"))
         shutil.copy(ROOT / "cloud" / "launcher" / "tests" / "cw_cases_vault.py", os.path.join(d, "cloud", "launcher", "tests"))
         Path(d, "bin", "cloud_worker.py").write_text(src)
+        Path(d, "bin", "cloud_lane_cap.py").write_text(part)
         env = dict(os.environ, TMPDIR=d)
         if old:
             env[OLD_ONLY] = "1"
         argv = [sys.executable, os.path.join(d, "cloud", "launcher", "tests", Path(__file__).name), "TestScenarios." + test]
-        p = stub_support.start(self, argv, cwd=d, env=env, stdout=open(os.path.join(d, "out.txt"), "w"), stderr=open(os.path.join(d, "err.txt"), "w"))
-        code = p.wait(timeout=90)
+        with open(os.path.join(d, "out.txt"), "w") as out_f, open(os.path.join(d, "err.txt"), "w") as err_f:
+            p = stub_support.start(self, argv, cwd=d, env=env, stdout=out_f, stderr=err_f)
+            code = p.wait(timeout=90)
         return applied, code, Path(d, "out.txt").read_text() + Path(d, "err.txt").read_text()
 
     def test_s2_the_old_code_accepts_the_sixth_launch(self):

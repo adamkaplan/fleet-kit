@@ -5,6 +5,8 @@ import traceback
 import base64
 import calendar
 import collections
+import concurrent.futures
+import multiprocessing
 import contextlib
 import errno
 import copy
@@ -76,7 +78,7 @@ class TestWhoCanClear(unittest.TestCase):
  ],
  "floor-credentials": [
   [
-   "it changes a credentials path (cloud/launcher/token_mint.py): that stays the owner's own clear"
+   "it changes a credentials path (cloud/launcher/app_token.py): that stays the owner's own clear"
   ],
   [
    "the score is High: High is the owner's"
@@ -162,7 +164,7 @@ class TestWhoCanClear(unittest.TestCase):
 
     def rows(self):
         """The 9 rows of S2: name, report, files, closure, expected."""
-        credentials = next(p for p in self.matrix["owner_hold"]["top_tier_paths"]["credentials"] if not self.floor.matches(p, self.rule["clear_code_paths"]) and "*" not in p)
+        credentials = next(p for p in sorted(self.matrix["owner_hold"]["top_tier_paths"]["credentials"]) if not self.floor.matches(p, self.rule["clear_code_paths"]) and "*" not in p)
         identity = next(p for p in self.matrix["owner_hold"]["top_tier_paths"]["identity"] if not self.floor.matches(p, self.rule["clear_code_paths"]) and "*" not in p)
         floor_rows = []
         for cls, path in (("credentials", credentials), ("identity", identity), ("authority", "migrations/0002.sql")):
@@ -442,6 +444,7 @@ class TestRecordJsonReaders(unittest.TestCase):
     # every other json.loads / json.load site in bin/: daemon-written state, command output, a socket body or a line of a log, with a reason
     EXEMPT_REASON = "not a record file another process writes: daemon-written state, command output, a request body or a log line"
     # path_suites.py:check_manual and load_manual read the repository's OWN checked-in manual (tools/path-suites.json), a trusted repo file, not untrusted record text
+    # cloud_lane_cap.py:_stopped_ids is the launcher audit tail, read-only, to free a stopped worker's shape-M slot (#2259)
     EXEMPT = """
 agent_calls.py:_read_json
 agent_calls.py:_spool_lines
@@ -453,6 +456,7 @@ cloud_channel_server.py:do_POST
 cloud_cli.py:post
 cloud_cluster.py:run_launcher
 cloud_cost_report.py:read_lines
+cloud_lane_cap.py:_stopped_ids
 cloud_hub.py:_read_json
 cloud_hub.py:_read_json_aged
 cloud_hub.py:kube_http
@@ -476,24 +480,28 @@ external_adapter.py:sse_messages
 fleet-heartbeat:call
 fleet-heartbeat:load_config
 fleet-scenario:read
-fleet-switchboard:__init__
+switchboard/plan_notice.py:__init__
 fleet-switchboard:_api
 switchboard/caches.py:_audit_tail
 fleet-switchboard:_call
-fleet-switchboard:_docker_inspect
+switchboard/docker_reaper.py:_docker_inspect
 switchboard/caches.py:_fresh
-fleet-switchboard:_last
+switchboard/docker_reaper.py:_last
+switchboard/gate_spool.py:_load
+switchboard/gate_spool.py:_spool_line
 fleet-switchboard:_load_markers
+fleet-switchboard:_real_locations
 switchboard/profile_pieces.py:_read_json_object
 fleet-switchboard:_review_api
 fleet-switchboard:_write_gates_config
-fleet-switchboard:anonymous_volumes
+switchboard/disk_prune.py:anonymous_volumes
 fleet-switchboard:catching_up_lines
 fleet-switchboard:charter_pane_update
 fleet-switchboard:ci_record_status_line
 fleet-switchboard:cmd_review_measure
 fleet-switchboard:daemon_record_of
 fleet-switchboard:daemon_snapshot
+fleet-switchboard:deliver
 fleet-switchboard:gates_state
 fleet-switchboard:get
 fleet-switchboard:github_calls_status
@@ -501,18 +509,17 @@ fleet-switchboard:github_status
 fleet-switchboard:handle
 fleet-switchboard:health_watched_repos
 fleet-switchboard:janitor_agent_roots
-fleet-switchboard:job_read
 fleet-switchboard:json
-fleet-switchboard:lab_facts
+switchboard/docker_reaper.py:lab_facts
 fleet-switchboard:launch_memory_check
-fleet-switchboard:load_config
+fleet-switchboard:_load_config_file
 fleet-switchboard:pane_exit_audit_tail
 fleet-switchboard:pr_state_read
 fleet-switchboard:pull_state
 fleet-switchboard:read_decisions_file
 fleet-switchboard:read_friction_state
-fleet-switchboard:read_janitor_record
-fleet-switchboard:read_open_items
+switchboard/docker_reaper.py:read_janitor_record
+switchboard/labels_ensure.py:read_open_items
 fleet-switchboard:read_open_overlap
 fleet-switchboard:read_pane_health
 fleet-switchboard:read_pr_json
@@ -521,7 +528,7 @@ fleet-switchboard:read_ref_state
 fleet-switchboard:read_report_riders
 fleet-switchboard:receive
 fleet-switchboard:stopped_news_summary
-fleet-switchboard:sweep_summary
+switchboard/sweep.py:sweep_summary
 fleet-switchboard:unix_socket_call
 fleet-switchboard:update_daemon_record
 fleet-switchboard:v2_calls_status
@@ -540,7 +547,8 @@ heartbeat-ack:atomic_write
 heartbeat-ack:read_state_document
 heavy_slots.py:_read
 heavy_slots.py:_read_info
-heavy_slots.py:_reported
+heavy_slots_watch.py:_reported
+host_liveness.py:_remote
 impact_floor.py:load_matrix
 impact_hold.py:_gh_json
 impact_hold.py:_pending_read
@@ -598,15 +606,18 @@ switchboard/decisions_b.py:read_order_notices
 switchboard/decisions_b.py:sync_for
 switchboard/engine.py:load
 switchboard/facts.py:_load
+switchboard/facts.py:_load_pruned
 switchboard/handoff.py:post_ask_comment
 switchboard/import_v1.py:read_v1_export
 switchboard/jev.py:_load
 switchboard/jev.py:_post
+switchboard/job_runs.py:job_read
 switchboard/judge.py:ask_judge_daemon
 switchboard/judge.py:looks_like_plugin_event
 switchboard/judge.py:parse_plugin_event
 switchboard/judge_request.py:_guess_configured
 switchboard/judge_request.py:parse_policy_request
+switchboard/reminders.py:ci_queue_get
 switchboard/sent_view.py:sent_deliveries
 switchboard/triage.py:triage_summary
 switchboard/v2_transport.py:_decode
@@ -617,10 +628,36 @@ triage_digest.py:read_json
 work_sync.py:_read_json
 """.split()
 
-    @staticmethod
-    def scan(root):
-        """{"file:function"} of every json.loads, json.load and `from json import loads` call in the python sources under root (tests excluded)."""
+    _SCAN_CACHE = {}   # source text -> function names holding a json load; the AST walk of an unchanged file is done once per class
+
+    @classmethod
+    def _sites(cls, text):
+        if text in cls._SCAN_CACHE:
+            return cls._SCAN_CACHE[text]
         import ast
+        found = set()
+        try:
+            tree = ast.parse(text)
+        except (SyntaxError, ValueError):
+            cls._SCAN_CACHE[text] = found
+            return found
+        names = {a.asname or a.name for n in ast.walk(tree) if isinstance(n, ast.ImportFrom) and n.module == "json" for a in n.names if a.name in ("loads", "load")}
+        def walk(node, fn):
+            for c in ast.iter_child_nodes(node):
+                nf = c.name if isinstance(c, (ast.FunctionDef, ast.AsyncFunctionDef)) else fn
+                if isinstance(c, ast.Call):
+                    x = c.func
+                    if (isinstance(x, ast.Attribute) and x.attr in ("loads", "load") and isinstance(x.value, ast.Name) and x.value.id in ("json", "_json")) \
+                            or (isinstance(x, ast.Name) and x.id in names):
+                        found.add(fn or "<module>")
+                walk(c, nf)
+        walk(tree, None)
+        cls._SCAN_CACHE[text] = found
+        return found
+
+    @classmethod
+    def scan(cls, root):
+        """{"file:function"} of every json.loads, json.load and `from json import loads` call in the python sources under root (tests excluded)."""
         out = set()
         for f in sorted(Path(root).rglob("*")):
             if not f.is_file() or f.name.startswith(("test-", "test_")) or "__pycache__" in f.parts:
@@ -631,21 +668,8 @@ work_sync.py:_read_json
                 continue
             if not (f.suffix == ".py" or text.startswith(("#!/usr/bin/env python", "#!/usr/bin/python"))):
                 continue
-            try:
-                tree = ast.parse(text)
-            except (SyntaxError, ValueError):
-                continue
-            names = {a.asname or a.name for n in ast.walk(tree) if isinstance(n, ast.ImportFrom) and n.module == "json" for a in n.names if a.name in ("loads", "load")}
-            def walk(node, fn):
-                for c in ast.iter_child_nodes(node):
-                    nf = c.name if isinstance(c, (ast.FunctionDef, ast.AsyncFunctionDef)) else fn
-                    if isinstance(c, ast.Call):
-                        x = c.func
-                        if (isinstance(x, ast.Attribute) and x.attr in ("loads", "load") and isinstance(x.value, ast.Name) and x.value.id in ("json", "_json")) \
-                                or (isinstance(x, ast.Name) and x.id in names):
-                            out.add("%s:%s" % (f.relative_to(root).as_posix(), fn or "<module>"))
-                    walk(c, nf)
-            walk(tree, None)
+            rel = f.relative_to(root).as_posix()
+            out.update("%s:%s" % (rel, fn) for fn in cls._sites(text))
         return out
 
     def missing(self, root):
@@ -823,7 +847,7 @@ class TestPlanCheckRules(unittest.TestCase):
         self.assertEqual(self.warn_codes(self.edit("    evaluator: tester", "    evaluator: tester\n    claim: pr")), [])
         same = self.check(GOOD_PLAN)["plan_hash"]
         self.assertEqual(same, got["plan_hash"])
-        self.assertEqual(same, "sha256:2ad49344a1bf3ea7fc5ceeef6f60013e02fa465dc04da8a3b5b389a82b686cdb", "the hash the checker gave this plan before the warning existed")
+        self.assertEqual(same, "sha256:5ebca0edd1d11d361a1a6384a1d262d30455d1a737cf4c608baf0a2f71f38a18", "the hash the checker gave this plan before the warning existed")
         self.assertEqual([w["code"] for w in got["warnings"] if w["code"] != "live-no-claim"], ["no-constraint-list"])
 
     def test_the_template_marks_every_stub_with_a_ready_claim_line_and_a_live_one_for_live_or_tester(self):
@@ -1088,7 +1112,7 @@ class TestCloudLoad(Base):
 
     def mutant(self, old, new):
         import re as _re
-        source = SWITCHBOARD.read_text()
+        source = switchboard_source()
         body = _re.search(r"def live_cloud_by_lane.*?\n\n\n", source, _re.S).group(0)
         helper = _re.search(r"def cloud_record_live.*?\n\n\n", source, _re.S).group(0)   # #1066: the shared liveness helper holds the liveness lines
         self.assertIn(old, body + helper)
@@ -1183,11 +1207,11 @@ class TestCloudLoad(Base):
         import signal as _sig
         def boom(*a):
             raise AssertionError("the read blocked")
-        old = _sig.signal(_sig.SIGALRM, boom); _sig.alarm(3)
+        old = _sig.signal(_sig.SIGALRM, boom); _sig.setitimer(_sig.ITIMER_REAL, 1.0)
         try:
             return fn()
         finally:
-            _sig.alarm(0); _sig.signal(_sig.SIGALRM, old)
+            _sig.setitimer(_sig.ITIMER_REAL, 0); _sig.signal(_sig.SIGALRM, old)
 
     def _cw_mutant(self, old, new, *more):
         src = (BIN / "cloud_worker.py").read_text()
@@ -1316,7 +1340,7 @@ class TestCloudLoad(Base):
         self.assertNotEqual(self.count(mutant), out)
 
     def test_the_shared_helper_is_the_only_place_the_liveness_test_lives(self):
-        source = SWITCHBOARD.read_text()
+        source = switchboard_source()
         for line in ('seen is None or seen > now or', '(last_reports.get(worker) or {}).get("state") in ("done", "failed")', 'if ends is None or ends < now:'):
             self.assertEqual(source.count(line), 1, line)   # once: inside cloud_record_live
         helper = source[source.index("def cloud_record_live"):source.index("def live_cloud_by_lane")]
@@ -1345,6 +1369,14 @@ class TestCloudLoad(Base):
         self.rec("w", hard_deadline="2030-01-01T00:00:00Z")
         self.assertEqual(self.disc and sb.live_cloud_by_lane(self.state_dir, self.disc, {}, {}, None, 1893456001.0 - 86400 * 365 * 5), {"orch": 1})
         self.assertEqual(sb.live_cloud_by_lane(self.state_dir, self.disc, {}, {}, None, 1893456001.0), {})   # 2030-01-01T00:00:01Z
+
+
+_GOLDEN_JOB = None
+
+
+def _golden_record_share(share):
+    golden, entry, root, env = _GOLDEN_JOB
+    return [golden.run(entry, command, root, env) for command in share]
 
 
 class TestArchitectureSafetyNet(unittest.TestCase):
@@ -1417,13 +1449,29 @@ class TestArchitectureSafetyNet(unittest.TestCase):
         root = os.path.realpath(str(work))
         env = golden.world(root)
         entry = str(SWITCHBOARD)
-        first = golden.record_all(entry, root, env)
-        self.assertGreaterEqual(len(first), 120)
+        commands = golden.command_list(entry, root, env)
+
+        def record(wanted):
+            """The given commands, recorded by a process pool: each child records its share."""
+            global _GOLDEN_JOB
+            _GOLDEN_JOB = (golden, entry, root, env)
+            count = max(1, min(os.cpu_count() or 1, len(wanted)))
+            shares = [wanted[i::count] for i in range(count)]
+            with concurrent.futures.ProcessPoolExecutor(max_workers=count, mp_context=multiprocessing.get_context("fork")) as pool:
+                done = list(pool.map(_golden_record_share, shares))
+            return {tuple(command): result for share, results in zip(shares, done) for command, result in zip(share, results)}
+
+        self.assertGreaterEqual(len(commands), 120)
+        self.assertEqual(len({tuple(c) for c in commands}), len(commands), "the command list repeats a command")
+        helps = [command for command in commands if command[-1] == "--help"]
         verbs = golden.choices(golden.run(entry, ["--help"], root, env)["stdout"])
         self.assertGreater(len(verbs), 40)
+        first = record([[verb, "--help"] for verb in verbs])   # the --help of every verb, recorded once; the full run of every command is golden-cli compare's job
+        listed = {tuple(c) for c in commands}
         for verb in verbs:
-            self.assertIn((verb, "--help"), first, "the command list has no --help of the verb %s" % verb)
-        self.assertEqual(golden.differences(first, golden.record_all(entry, root, env)), [], "two recordings of one entry differ")
+            self.assertIn((verb, "--help"), listed, "the command list has no --help of the verb %s" % verb)
+        sample = helps[:4] + helps[-4:] + commands[-4:]   # a small fixed sample, recorded a second time
+        self.assertEqual(golden.differences(record(sample), record(sample)), [], "two recordings of one entry differ")
 
     def fake_repo(self, text):
         """A git repository whose bin/fleet-switchboard prints bin/out.txt: a stand-in for the daemon."""

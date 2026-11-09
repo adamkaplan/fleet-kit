@@ -1,5 +1,6 @@
 """Ask #1480: a cloud worker the launcher ended alerts its boss and the Chief of Staff, once per run and reason. Offline: a scratch state
 directory, a fixture audit file, a recording send function. Mutants are copies of the module's text in memory, never a file."""
+import pathlib
 import json, os, shutil, sys, tempfile, types, unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -66,19 +67,36 @@ class World(unittest.TestCase):
 
 
 class TestAlerts(World):
-    def test_s2_three_stops_make_six_messages_naming_the_facts(self):
+    def test_s2_three_stops_name_the_facts_and_route_by_need(self):
         for name, reason, pushed in (("worker1", "idle", True), ("worker2", "hard limit", False), ("worker3", "idle", True)):
             self.worker(name, pushed=pushed)
             self.stop(name, reason, run="r" + name)
         self.run_pass()
-        self.assertEqual(len(self.sent), 6)
-        for name, label, pushed in (("worker1", "idle", "yes"), ("worker2", "hard limit", "no"), ("worker3", "idle", "yes")):
-            self.assertEqual(sorted(to for to, t in self.sent if name in t), ["chief-of-staff", "coder-lead"])
+        for name, label, pushed in (("worker1", "idle", "unpushed work saved to worker1/wip"), ("worker2", "hard limit", "nothing unpushed"), ("worker3", "idle", "unpushed work saved to worker3/wip")):
+            # #2202 OLD: every end went to ["chief-of-staff", "coder-lead"]; NEW: worker2 (clean, nothing unpushed) goes to its boss only
+            want = ["coder-lead"] if name == "worker2" else ["chief-of-staff", "coder-lead"]
+            self.assertEqual(sorted(to for to, t in self.sent if name in t), want)
             for text in (t for to, t in self.sent if name in t):
-                for fact in (name, "reason " + label, "at 2026-01-01T10:00:00Z", "work pushed: " + pushed, "run record: %s-20260101T000000Z-0f1e2d" % name):
+                for fact in (name, "reason " + label, "at 2026-01-01T10:00:00Z", pushed, "run record: %s-20260101T000000Z-0f1e2d" % name):
                     self.assertIn(fact, text)
                 self.assertNotIn(self.dir, text)
                 self.assertNotIn("a1b2c3", text)
+
+    def test_s2_clean_end_nothing_unpushed_goes_to_the_boss_only(self):
+        self.worker("w1", pushed=False)
+        self.stop("w1", "idle")
+        self.run_pass()
+        self.assertEqual([to for to, t in self.sent if "w1" in t], ["coder-lead"])
+
+    def test_s3_ends_that_need_the_chief_reach_her(self):
+        cases = {"saved": dict(), "failed": dict(ok=False), "kept": dict(ok=False, reason="hard limit"), "noboss": dict(boss=None)}
+        self.worker("saved", pushed=True); self.stop("saved", "idle", run="r1")
+        self.worker("failed", pushed=False); self.stop("failed", "idle", run="r2", ok=False)
+        self.worker("kept", pushed=False); self.stop("kept", "hard limit", run="r3", ok=False)
+        self.worker("noboss", boss=None, pushed=False); self.stop("noboss", "idle", run="r4")
+        self.run_pass()
+        for name in cases:
+            self.assertIn("chief-of-staff", [to for to, t in self.sent if name in t], name)
 
     def test_s3_seven_lines_of_one_run_and_three_passes_send_two_messages(self):
         self.worker("worker7")
@@ -100,7 +118,7 @@ class TestAlerts(World):
 
     def test_s3_the_sent_keys_are_bounded_and_the_state_is_private(self):
         real.save_state(self.cursor, 0, [(str(i), "idle") for i in range(700)])
-        self.assertEqual(len(PARSE(open(self.cursor).read())["sent"]), 500)
+        self.assertEqual(len(PARSE(pathlib.Path(self.cursor).read_text())["sent"]), 500)
         self.assertEqual(oct(os.stat(self.cursor).st_mode & 0o777), "0o600")
 
     def test_s3_a_corrupt_cursor_starts_at_the_end(self):
@@ -219,7 +237,7 @@ class TestUntrusted(World):
         self.stop("worker7", "idle")
         self.run_pass()
         for to, text in self.sent:
-            self.assertIn("work pushed: yes;", text)
+            self.assertIn("; unknown;", text)
             self.assertIn("run record: worker7-20260101T000000Z-0f1e2d.", text)
             for bad in ("x.example", "sk-", "yyyy", "\n"):
                 self.assertNotIn(bad, text)
@@ -270,7 +288,7 @@ class TestUntrusted(World):
         self.assertIn("Bad Boss", [to for to, t in self.sent])
 
     def test_m3_a_branch_copying_mutant_is_caught(self):
-        broken = mutant('return "yes" if hook["pushed"] else "no"', 'return "yes %s" % hook.get("wip_branch") if hook["pushed"] else "no"')
+        broken = mutant('return "unpushed work saved to " + name(wip) if name(wip) else "unknown"', 'return "unpushed work saved to " + str(wip) if wip else "unknown"')
         self.worker("worker7")
         self.stop("worker7", "idle")
         self.run_pass(broken)
@@ -318,7 +336,7 @@ class TestS9ThreeHostileRecords(World):
         present, occurrences, shapes = FACT_COUNT, 0, 0
         for to, text in self.sent:
             facts = ["worker7", "reason idle limit", "at 2026-01-01T10:00:00Z",
-                     "work pushed: yes;" if valid_name else "work pushed: unknown;",
+                     "; unknown;",
                      ("run record: %s." % record_name) if valid_name else "run record: unknown."]
             present = min(present, sum(1 for fact in facts if fact in text))
             for piece in [branch] + [x for x in branch.split("\n") if x]:
@@ -350,10 +368,10 @@ class TestS9ThreeHostileRecords(World):
         self.assertEqual((present, branch, shapes, n), (5, 0, 0, 3))
 
     def test_s9_m3_the_branch_copying_mutant_fails_the_hostile_test_and_the_control_passes(self):
-        old = 'return "yes" if hook["pushed"] else "no"'
+        old = 'return "unpushed work saved to " + name(wip) if name(wip) else "unknown"'
         with open(SOURCE) as f:
             applied = f.read().count(old) == 1   # computed before the replace
-        broken = mutant(old, 'return "yes %s" % hook.get("wip_branch") if hook["pushed"] else "no"')
+        broken = mutant(old, 'return "unpushed work saved to " + str(wip) if wip else "unknown"')
         planted = HOSTILE_RECORDS[0][1]   # the branch of the first valid-name record, where the copy leaks first
         control = 0
         try:
@@ -424,7 +442,7 @@ class TestCauseRules(World):
         self.run_pass()
         self.assertEqual(len(self.sent), 2)
         for to, text in self.sent:
-            self.assertIn("work pushed: unknown", text)
+            self.assertIn("; unknown; run record", text)
             self.assertIn("run record: unknown", text)
 
     def test_s14_another_hour_alerts_again(self):
@@ -602,8 +620,8 @@ class TestDocs(unittest.TestCase):
 
 
 class TestMessageSlot(unittest.TestCase):
-    OLD = {False: "[cloud worker ended] worker7 was ended by the launcher: reason idle limit; at 2026-01-01T10:00:00Z; work pushed: yes; run record: unknown.",
-           True: "[cloud worker ended] worker7 was ended by the launcher: reason idle limit; at 2026-01-01T10:00:00Z; work pushed: yes; run record: unknown."
+    OLD = {False: "[cloud worker ended] worker7 was ended by the launcher: reason idle limit; at 2026-01-01T10:00:00Z; yes; run record: unknown.",
+           True: "[cloud worker ended] worker7 was ended by the launcher: reason idle limit; at 2026-01-01T10:00:00Z; yes; run record: unknown."
                  " The end hook could not push: the pod was kept and the work may be unpushed."}
 
     def text(self, module=real, **more):

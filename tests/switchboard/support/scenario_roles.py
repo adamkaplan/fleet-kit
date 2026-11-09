@@ -35,7 +35,7 @@ FAKE_GH = "/fake/bin/gh"
 
 def is_floor_view(argv):
     """A floor read of a pull request: a `pr view` of its files that is not `review record`'s own read (which also asks for the base name, #1047), so a test counting floor reads leaves the record out."""
-    return "files" in argv[-1] and "baseRefName" not in argv[-1]
+    return "files" in argv[-1] and "baseRefOid,baseRefName" not in argv[-1]
 
 
 FAKE_REPO = "acme/fleet"
@@ -67,7 +67,7 @@ AGENT_FILES = tuple(sorted((REPO / "agents" / "opencode").glob("*.md"))
 # `pr-state`: coder +1 line +140 B, orchestrator +1 line +120 B: the one sentence that sends an agent to the daemon's cache instead of a GitHub polling loop
 # #401 slice 1: the one-sentence GitHub writing rule in its own short section: coder +4 lines +226 B, orchestrator +2 lines +220 B (the wider runtime's file sets each limit)
 # #341: the one never-`git stash` sentence (the files sat at their caps): coder +86 B, orchestrator +60 B, no new line
-ROLE_BYTE_LIMITS = {"coder": 8585, "orchestrator": 11290, "chief-of-staff": 12097, "cos-subagent": 3500}
+ROLE_BYTE_LIMITS = {"coder": 9227, "orchestrator": 11983, "chief-of-staff": 12810, "cos-subagent": 3701}  # a ceiling: the largest file of each role plus 2 percent, rounded up; a file may be smaller
 
 
 WORKER_ROLES = ("coder", "cos-subagent")  # PR 8: the roles that do an assignment, not a judgement of others

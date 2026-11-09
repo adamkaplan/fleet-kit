@@ -13,7 +13,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from support.paths import BIN, REPO
+from support.paths import BIN, REPO, load_matrix
 
 TOOL = REPO / "tools" / "new-module-demands"
 MATRIX = REPO / "docs" / "review-laws" / "impact-matrix.json"
@@ -27,7 +27,7 @@ RECORDED_BIN_HEAD = """bin/y.py:
 """
 RECORDED_BIN_TAIL = """  authority code: no
   matrix: no matrix line is demanded
-  units: add this row to the Units table of docs/architecture.md (header `| Unit | Layer | Job | Also may use |`, rows sorted by name), after the row of `work_sync.py`:
+  units: add the file docs/architecture/units/y.py.row holding this one row (a file of its own: no shared line to conflict on):
     | `y.py` | <layer 0-6> | <the one job of the module> | |
   closure: %s
 """
@@ -114,7 +114,7 @@ class TestShimGuardsTool(unittest.TestCase):
             shim_check_tool_accepts_shims(self, shim, len(ps.NEW_SHIM_GUARDS))
             for row in ps.NEW_SHIM_GUARDS:
                 self.assertIn("    - %s: %s" % (row[0], row[4]), shim.stdout)
-            hold = json.loads(MATRIX.read_text())["owner_hold"]
+            hold = load_matrix(MATRIX)["owner_hold"]
             read = [g for v in hold["top_tier_paths"].values() for g in v if g == "shims/**"] + [g for r in hold["floor"].values() for g in r["globs"] if g == "shims/**"]
             self.assertEqual(len(read), 2)
             self.assertEqual((shim.stdout.count("identity: shims/**"), shim.stdout.count(".globs: shims/**")), (1, 1))
@@ -134,8 +134,9 @@ class TestShimGuardsTool(unittest.TestCase):
 
     def test_s6_the_six_existing_modules_demand_nothing(self):
         modules = sorted(p.name for p in (REPO / "shims").glob("*.py"))
-        self.assertEqual(len(modules), 6)
-        yes = {"gh_hold.py": 3, "stash_guard.py": 1}
+        # the property is "every module under shims/ demands nothing" (no size pin: #2219 added gh_body.py); the authority-code modules are named with their function counts
+        yes = {"gh_body.py": 1, "gh_hold.py": 3, "stash_guard.py": 1}
+        self.assertLessEqual(set(yes), set(modules))
         total = 0
         for name in modules:
             done = shim_run(TOOL, REPO, "shims/" + name)
@@ -151,14 +152,14 @@ class TestShimGuardsTool(unittest.TestCase):
                 total += yes[name]
             else:
                 self.assertEqual(line, "  authority code: no", name)
-        self.assertEqual(total, 4)
+        self.assertEqual(total, sum(yes.values()))
 
     def test_s8_the_globs_are_read_from_the_matrix_not_typed(self):
         with tempfile.TemporaryDirectory() as tmp:
-            for rel in ("tools/new-module-demands", "bin/path_suites.py", "docs/architecture.md"):
+            for rel in ("tools/new-module-demands", "bin/path_suites.py", "bin/impact_floor.py", "docs/architecture.md"):
                 (Path(tmp) / rel).parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy(str(REPO / rel), str(Path(tmp) / rel))
-            matrix = json.loads(MATRIX.read_text())
+            matrix = load_matrix(MATRIX)
             hold = matrix["owner_hold"]
 
             def strip(node):

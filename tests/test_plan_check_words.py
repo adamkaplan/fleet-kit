@@ -155,9 +155,9 @@ class Corpus(unittest.TestCase):
         for name, text in CORPUS:
             a, b = old.check(text, DW), plan_check.check(text, DW)
             self.assertEqual((a["result"], a["plan_hash"], a["scenario_hash"], [d["code"] for d in a["defects"]]),
-                             (b["result"], b["plan_hash"], b["scenario_hash"], [d["code"] for d in b["defects"]]), name)
+                             (b["result"], plan_check.plan_hash_collapsed(text), b["scenario_hash"], [d["code"] for d in b["defects"]]), name)
             self.assertEqual(a["warnings"], b["warnings"], name)
-            for k in set(a) - {"defects"}:
+            for k in set(a) - {"defects", "plan_hash"}:
                 self.assertEqual(a[k], b[k], name)
             for x, y in zip(a["defects"], b["defects"]):
                 codes_seen.add(x["code"])
@@ -166,7 +166,7 @@ class Corpus(unittest.TestCase):
                     self.assertEqual({k: v for k, v in x.items() if k != "message"}, {k: v for k, v in y.items() if k != "message"})
                 else:
                     self.assertEqual(x, y, name)
-            ra, rb = old.render(a, "t"), plan_check.render(b, "t")
+            ra, rb = old.render(a, "t"), plan_check.render(dict(b, plan_hash=plan_check.plan_hash_collapsed(text)), "t")
             self.assertEqual(len(ra), len(rb), name)
             for x, y in zip(ra, rb):
                 self.assertTrue(y == x or (y.startswith(x + TAIL) and "review-for-code" in "".join(ra)), (name, x, y))

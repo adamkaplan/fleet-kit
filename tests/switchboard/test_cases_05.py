@@ -52,7 +52,7 @@ from support.helper_fakes2 import PolicyCountingJev
 from support.installs_and_keys import API, DECISIONS_PLUGIN, GOOD_DONE_WHEN, ORDERS_CHARTER_BODY, WEB
 from support.loader import SWITCHBOARD, SWITCHBOARD_SOURCE_FILES, _load, captured, class_source, class_source_fn, sb, sc, switchboard_source
 from support.orders_and_adapters import EXTERNAL_ADAPTER, FakeWorkHost, cos_orders_file, put_cos_orders, report, worker
-from support.paths import BIN, REPO
+from support.paths import BIN, REPO, load_matrix
 from support.policy_and_import import FAKE_V1, FLEET_HOOKS, FORBIDDEN_IN_PUBLIC_TEXT, NODE, POLICY_REPLAY, TRIAL, V1_CHILD, V1_CHILD_ID, V1_MAIN_ID, convert, policy_raw_config, v1_export
 from support.scenario_roles import AGENT_FILES, JEV_REPLAY, WORKER_ROLES, _stdlib_roots, role_of
 from support.service_and_merge import feed_line
@@ -172,7 +172,7 @@ class TestApprovalExemptionGuard(unittest.TestCase):
     NEEDLES = ("plan_approval", "plan.approved")
 
     def setUp(self):
-        self.matrix = json.loads((REPO / "docs/review-laws/impact-matrix.json").read_text())
+        self.matrix = load_matrix(REPO / "docs/review-laws/impact-matrix.json")
         hold = self.matrix["owner_hold"]
         names = hold["delegated_clear"]["clear_code_paths"] + hold["top_tier_paths"]["authority"]
         self.modules = sorted({p for p in names if p.startswith("bin/") and p.endswith(".py")})
@@ -197,6 +197,8 @@ class TestApprovalExemptionGuard(unittest.TestCase):
         self.assertEqual(self.offenders(self.real_texts()), [], self.MESSAGE)
 
     def test_mutant_an_import_in_a_closure_module_fails_the_scan(self):
+        if not self.exemption_stands():
+            self.skipTest("the exemption is gone")
         texts = self.real_texts()
         texts["bin/merge_gate.py"] = "import plan_approval\n" + texts["bin/merge_gate.py"]
         self.assertEqual(self.offenders(texts), ["bin/merge_gate.py"], self.MESSAGE)
@@ -569,7 +571,6 @@ class TestShimHygiene(unittest.TestCase):
         return faults
 
     def test_every_module_under_shims_is_standard_library_only_and_impersonal(self):
-        self.assertEqual(len(list((SHIM.parent).glob("*.py"))), 6)
         self.assertEqual(self.module_faults(SHIM.parent), [])
 
 
@@ -741,7 +742,7 @@ class TestJudgeToolWritesNothingElsewhere(unittest.TestCase):
         """The policy section: its part files, and the statements of it that stay in the entry (S2 keeps the ones the clear's closure reads), between the DEFAULTS line and the next section."""
         entry = switchboard_source()
         kept = entry[entry.index('DEFAULTS["policy"] = None'):entry.index("# PR 10: move a v1 session")]
-        return "\n".join([kept] + [path.read_text() for path in SWITCHBOARD_SOURCE_FILES if path.name in ("judge_request.py", "judge.py")])   # the policy judge's own parts: another part (plan review, which launches lanes) is not the policy section
+        return "\n".join([kept] + [path.read_text() for path in SWITCHBOARD_SOURCE_FILES if path.name in ("judge_request.py", "judge.py", "standing_authority.py")])   # the policy judge's own parts: another part (plan review, which launches lanes) is not the policy section
 
     def test_no_herdr_and_no_github_write_is_reachable_from_the_section(self):
         tree = ast.parse(self.section())

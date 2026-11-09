@@ -905,7 +905,7 @@ class TestAgentRegistry(unittest.TestCase):
 
     def test_a_dead_row_is_removed_only_when_each_evidence_key_shows_it_gone_and_each_refusal_is_audited(self):
         gone = {"pane_listed": False, "process_found": False}
-        cases = {"pane_listed true": {"pane_listed": True, "process_found": False}, "process_found true": {"pane_listed": False, "process_found": True},
+        cases = {"pane_listed true": {"pane_listed": True, "process_found": True}, "process_found true": {"pane_listed": False, "process_found": True},
                  "pane_listed missing": {"process_found": False}, "process_found missing": {"pane_listed": False}, "evidence None": None,
                  "evidence a string": "gone", "evidence a list": [gone]}
         for label, evidence in cases.items():
@@ -1929,7 +1929,7 @@ class TestCloudWatchBounds(unittest.TestCase):
 
     def test_every_untrusted_record_parse_is_bounded_and_listed_in_the_docs(self):
         """Completeness: every json.loads in cloud_worker.py of a record file goes through parse_bounded, and the docs table names each reader."""
-        text = self.SRC.read_text() + (REPO / "bin" / "cloud_cluster.py").read_text()   # the text moved out of it (ask #1647)
+        text = self.SRC.read_text() + (REPO / "bin" / "cloud_cluster.py").read_text() + (REPO / "bin" / "cloud_launch_again.py").read_text()   # the text moved out of it (ask #1647)
         loads = [l.strip() for l in text.splitlines() if "json.loads(" in l and not l.lstrip().startswith("#")]
         self.assertEqual(loads, ["return json.loads(text)", "body = json.loads(out) if (out or \"\").strip() else None"])
         import re

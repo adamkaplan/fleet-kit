@@ -10,9 +10,43 @@ test patch resolves exactly as it did, and puts the functions back in that names
 it once; a module that is missing or fails to load stops the daemon loudly (never a daemon without the rule). The functions below are therefore written against the
 daemon's globals and are not meant to be called from this module's own namespace. Python 3.9 standard library only.
 """
+from functools import wraps
+from inspect import signature as _signature
 import types
 
+def _make_guard(check):
+    """#924: the refusal of an effect at its FIRST statement. `check` (the latch's) is the closure cell of the wrapper: never a parameter of an effect, never read from a namespace."""
+    def guard(when, refuse):
+        def decorate(effect):
+            signature = _signature(effect)
+
+            @wraps(effect)
+            def guarded_effect(*args, **kwargs):
+                arguments = signature.bind(*args, **kwargs).arguments   # an unknown keyword (`_effect_check=` too) is a TypeError before anything runs
+                if when(arguments) and check():
+                    return refuse(arguments)
+                return effect(*args, **kwargs)
+            guarded_effect.guard = (when, refuse)
+            return guarded_effect
+        return decorate
+    return guard
+
+
+def _refuse_clear_core(arguments):
+    raise RuntimeError("a command registrar ran in this process, or impact_hold is not bound: an impact clear is refused")
+
+
+def _refuse_clear_command(arguments):
+    sys.stderr.write("%s: impact clear: refused: a command registrar ran in this process, or impact_hold is not bound\n" % PROG)
+    return EXIT_ERROR
+
+
+_unbound = _make_guard(lambda: True)   # the module's own copies of the two effects: a check that always refuses
+
+
 MOVED = ('rating_at',
+         '_refuse_clear_core',
+         '_refuse_clear_command',
          'applied_for_repo',
          '_plan_hold',
          'rehold_reason',
@@ -21,6 +55,12 @@ MOVED = ('rating_at',
          'write_impact_state',
          '_impact_state_noted',
          'impact_carry_decision',
+         'impact_batch_decision',
+         '_batch_record',
+         '_batch_clear_key',
+         '_batch_void_open',
+         '_batch_release',
+         'batch_carried',
          'apply_impact_hold',
          '_consume_record',
          '_labels_ours',
@@ -107,7 +147,7 @@ def gate_floor_fact(engine, state, repo, number, head):
         if not head or report.get("head") != head:
             raise ValueError("the pull request moved while its floor was read (%s, then %s)" % ((head or "?")[:8], (report.get("head") or "?")[:8]))
         clears, problem = read_impact_state(state)
-        cleared = (clears["clears"].get(report["pr"]) or {}).get("head") == head
+        cleared = (clears["clears"].get(report["pr"]) or {}).get("head") == head or batch_carried(engine, clears, repo, report["pr"], head)   # (#955) the batch carry is read here too
         return {"decision": report["owner_decision"], "reasons": list(report["owner_reasons"]), "cleared": cleared, "unreadable": problem,
                 "rehold": None if problem else rehold_reason(engine, clears, repo, report["pr"], head)}   # the OWNER-HOLD decision: the one the daemon's labels follow (#451)
     except Exception as err:   # an unreadable diff, a matrix error, a missing file: all the same answer
@@ -141,7 +181,7 @@ def read_impact_state(state_dir):
     if not isinstance(raw, dict):
         return empty, "%s is not an object" % IMPACT_STATE_FILE
     found = {k: raw[k] if isinstance(raw.get(k), dict) else {} for k in ("clears", "applied")}
-    for extra in ("posted", "matrix_error", "carried", "carry_void", "carry_wait"):   # only when the file has them: a state file that never had them reads exactly as it always did
+    for extra in ("posted", "matrix_error", "carried", "carry_void", "carry_wait", "batch_void"):   # only when the file has them: a state file that never had them reads exactly as it always did
         if isinstance(raw.get(extra), dict):
             found[extra] = raw[extra]   # posted, matrix_error: slice 3 (#451); carried, carry_void: the carry (#510)
     return found, None
@@ -207,10 +247,135 @@ def impact_carry_decision(engine, repo, number, head):
         return None
 
 
+def batch_carried(engine, state, repo, pr, head):
+    """(#955) True when the clears of this batch pull request's members CARRIED to exactly this head (`impact_batch_decision`) and the carry is still switched on: the ONE reading every reader of
+    "is it held" uses for a batch (the daemon's pass, the dry run, gate G6 and the sweep). The batch has no clear of its own: nothing but this record, bound to the head, lifts its hold."""
+    carried = (state.get("carried") or {}).get(pr) or {}
+    return bool(head) and carried.get("route") == "batch" and carried.get("head") == head and impact_floor.carry_enabled(engine.config, repo)
+
+
+def _batch_clear_key(state):
+    """A short stamp of the recorded clears and carried heads of the pull requests that are not batches: [how many clears, newest clear time, how many carried, newest carry time, sum of the cleared heads' length].
+    It changes when ANY member's clear is recorded, taken back or carried (a batch refusal that was only 'not cleared yet' is judged again then)."""
+    clears = [v for v in (state.get("clears") or {}).values() if isinstance(v, dict)]
+    carried = [v for v in (state.get("carried") or {}).values() if isinstance(v, dict) and v.get("route") != "batch"]
+    newest = lambda rows: max([r["at"] for r in rows if isinstance(r.get("at"), (int, float))] or [0])
+    return "%d:%s:%d:%s" % (len(clears), newest(clears), len(carried), newest(carried))
+
+
+def _batch_void_open(void, state):
+    """True when a kept batch refusal for this head is to be judged again: it was only a failed read (up to BATCH_READ_TRIES times) or only a member not cleared at its merged head, and the members' clears
+    changed since. A definite refusal (no `soft`) is never open. Bounded and memoised by the clear state."""
+    soft = void.get("soft")
+    if soft == "uncleared":
+        return void.get("key") != _batch_clear_key(state)
+    if soft == "read":
+        return isinstance(void.get("tries"), int) and void["tries"] < 3 or void.get("key") != _batch_clear_key(state)
+    return False
+
+
+def impact_batch_decision(engine, repo, number, report):
+    """None when no batch carry is to be tried (the switch is off, this head was already decided, or the pull request is not a batch), else the verdict of `clear_carry.batch_decide` for the batch at
+    `report["head"]`. Reads GitHub, so it is called WITHOUT the impact-state lock. Never raises. A member's state is read from the recorded clears and from the floor's own report of that member (no second rule)."""
+    try:
+        if not impact_floor.carry_enabled(engine.config, repo) or not report.get("head") or report.get("rehold"):
+            return None
+        pr, head = "%s#%d" % (repo, number), report["head"]
+        state, problem = read_impact_state(engine.state_dir)
+        void = (state.get("batch_void", {}).get(pr) or {})
+        if problem or (state.get("carried", {}).get(pr) or {}).get("head") == head:
+            return None   # an unreadable state carries nothing
+        if void.get("head") == head and not _batch_void_open(void, state):
+            return None   # a DEFINITE refusal is kept for the head; a failed read or a member not cleared yet is judged again (`_batch_void_open`)
+        if (state["clears"].get(pr) or {}).get("head") == head:
+            return None
+        cc = load_module("clear_carry")
+        if report.get("head_ref") != cc.BATCH_BRANCH:
+            return None   # only a pull request from the integration branch is a batch (the floor's own read says so: no extra call): every other one is judged as before
+        runner = getattr(engine, "gh_runner", None) or subprocess.run
+        get = impact_carry_get(engine, runner, repo)
+
+        def member_state(member, member_head):
+            mpr = "%s#%d" % (repo, member)
+            found = pr_floor_report(engine, repo, member)
+            if found.get("head") != member_head or found.get("owner_decision") not in ("hold", "second-review", "none"):
+                raise cc.CarryUnread("the floor of #%d was read at head %s, not at the merged head %s" % (member, str(found.get("head"))[:8], str(member_head)[:8]))
+            current, _ = read_impact_state(engine.state_dir)
+            clear = current["clears"].get(mpr) or {}
+            carried = current.get("carried", {}).get(mpr) or {}
+            cleared_head, by = clear.get("head"), clear.get("by")
+            route = None
+            if carried.get("head") == member_head and carried.get("route") != "batch":
+                cleared_head, by = member_head, "%s (carried)" % (by or "the owner")
+                route = "%s%s" % (carried.get("route") or "pure", (", confirmation " + str(carried.get("confirmation"))) if carried.get("confirmation") else "")
+            return {"held": found["owner_decision"] == "hold", "cleared_head": cleared_head, "route": route, "by": (("%s, order %s" % (by, clear["via"])) if clear.get("via") and by == clear.get("by") else by)}
+
+        def closure_of(member, files, member_head):
+            rule = (impact_floor.load_matrix().get("owner_hold") or {}).get("delegated_clear") or {}
+            mapped, base_sha, reasons = None, None, []
+            wanted = [f for f in files if impact_floor.matches(f["path"], rule.get("closure_files") or []) and not impact_floor.matches(f["path"], rule.get("clear_code_paths") or []) and f["status"] == "modified"]
+            if wanted:
+                info = get("repos/%s/pulls/%d" % (repo, member))
+                base_sha = (info.get("base") or {}).get("sha")
+                compared = get("repos/%s/compare/%s...%s?per_page=1" % (repo, base_sha, member_head))
+                base_sha = ((compared or {}).get("merge_base_commit") or {}).get("sha")
+            for f in wanted:
+                mapped = delegated_clear_map(engine, runner, repo, {"filename": f["path"], "sha": f["sha"], "patch": f["patch"], "status": f["status"]}, base_sha, rule)
+                if mapped is None:
+                    return None
+                reasons.extend(mapped)
+            return reasons
+
+        verdict = cc.batch_decide(get, repo, number, head, member_state, closure_of, impact_floor.carry_never_paths())
+        if report.get("review_action") == "hold":
+            verdict["carried"], verdict["reason"] = False, "the independent review of the batch holds it: the batch needs a clear of its own"
+        return verdict
+    except Exception as err:
+        engine._note("impact.carry_error", "%s#%d" % (repo, number), {"error": _one_line("%s: %s" % (type(err).__name__, err), 160)})
+        return None
+
+
+def _batch_record(engine, repo, number, report, verdict):
+    """Record a batch verdict, once per head, under the lock: a carry is `carried[pr]` (route `batch`, members and heads) and ONE `gate.batch_carried` line; a refusal is `batch_void[pr]` and ONE
+    `gate.batch_carry_held` line that names the members and lines no clear covers. No label is read or written. Returns True when the batch is carried."""
+    pr, head = report["pr"], report["head"]
+    with impact_state_lock(engine.state_dir):
+        state, problem = read_impact_state(engine.state_dir)
+        _impact_state_noted(engine, problem)
+        if (state["clears"].get(pr) or {}).get("head") == head:
+            return False
+        members = [{"pr": "%s#%d" % (repo, m["number"]), "head": m["head"], "held": m["held"], "cleared_by": m["by"], **({"route": m["route"]} if m.get("route") else {})} for m in verdict["members"]]
+        if verdict["carried"]:   # the members' clears are read again under the lock: one revoked since the verdict was made is not carried
+            gone = [x["pr"] for x in members if x["held"] and (state["clears"].get(x["pr"]) or {}).get("head") != x["head"] and (state.get("carried", {}).get(x["pr"]) or {}).get("head") != x["head"]]
+            if gone:
+                verdict = dict(verdict, carried=False, soft="uncleared", reason="the clear of %s was taken back or changed while the batch was judged" % ", ".join(gone[:5]))
+        if verdict["carried"]:
+            state.setdefault("carried", {})[pr] = {"head": head, "route": "batch", "members": members, "at": int(engine.now())}
+            state.setdefault("batch_void", {}).pop(pr, None)
+            write_impact_state(engine.state_dir, state)
+            engine.audit.append(engine.actor, "gate.batch_carried", pr, {"head": head, "members": members, "merges": verdict["merges"], "lines": verdict["lines"],
+                                                                         "why": "no line of the batch is outside the union of the members' changes, and each held member was cleared at its merged head"})
+            return True
+        previous = state.get("batch_void", {}).get(pr) or {}
+        again = previous.get("head") == head
+        void = {"head": head, "reason": _one_line(verdict["reason"] or "", 400)}
+        if verdict.get("soft"):   # not a definite refusal: judged again (a failed read a few times, 'not cleared yet' when a clear is recorded)
+            void.update(soft=verdict["soft"], key=_batch_clear_key(state), tries=(previous.get("tries", 0) + 1) if again and isinstance(previous.get("tries"), int) else 1)
+        state.setdefault("batch_void", {})[pr] = void
+        write_impact_state(engine.state_dir, state)
+        if not again or previous.get("reason") != void["reason"]:   # one audit line per head and reason, not one per pass
+            engine.audit.append(engine.actor, "gate.batch_carry_held", pr, {"head": head, "reason": _one_line(verdict["reason"] or "", 1200), "members": members, "uncovered": verdict["uncovered"][:10], "final": not verdict.get("soft")})
+        return False
+
+
 def apply_impact_hold(engine, repo, number, report, record):
     """Write the hold: add `<user>:merge-captain` and `<user>:hold-impact` to the PR, only those missing, never remove anything. Skipped
     when the owner cleared THIS head, or when his clear of an earlier head CARRIES to this one (a pure merge of main, `impact_hold.carry_clear`, off by default: see
     bin/clear_carry.py). Returns the number of gh calls spent. The labels are ensured once per repo per process."""
+    batch = impact_batch_decision(engine, repo, number, report)   # (#955) a batch pull request: the clears of its members, read before and outside the lock
+    if batch is not None and _batch_record(engine, repo, number, report, batch):
+        _batch_release(engine, repo, number, report, record)   # (#955) like the single-pull-request carry: the hold the daemon already wrote is released
+        return 0
     carry = impact_carry_decision(engine, repo, number, report["head"])   # reads GitHub: before, and outside, the lock
     with impact_state_lock(engine.state_dir):   # the clear check, the label write and the record are ONE step against an owner clear
         spent = _apply_impact_hold_locked(engine, repo, number, report, record, carry)
@@ -222,6 +387,36 @@ def apply_impact_hold(engine, repo, number, report, record):
         except Exception as err:   # the carry is recorded: nothing here may fail the pass
             engine._note("gate.clear_notify_failed", "%s#%d" % (repo, number), {"error": _one_line("%s: %s" % (type(err).__name__, err), 160)})
     return spent
+
+
+def _batch_release(engine, repo, number, report, record):
+    """(#955, mirrors the carry of one pull request) A batch that carried and had been held before: drop the daemon's record of its labels, remove the labels it added (`gate.hold_released`), and turn a first-line
+    `MERGE: captain` marker into `MERGE: automatic` (`neutralise_marker`, head-checked: the marker is read by the gate while no merge label says otherwise), then tell the Chief of Staff (`gate.clear_carried`
+    notice, kind carry). Never raises: the carry is recorded and nothing here may fail the pass. Labels the daemon did not add (an author's) are not touched."""
+    pr, head = report["pr"], report["head"]
+    try:
+        with impact_state_lock(engine.state_dir):
+            state, problem = read_impact_state(engine.state_dir)
+            if problem or not batch_carried(engine, state, repo, pr, head):
+                return
+            lifted = _labels_ours(label_names(engine.config), state, pr, wide=True)
+            if state["applied"].pop(pr, None) is not None:
+                write_impact_state(engine.state_dir, state)
+        runner = getattr(engine, "gh_runner", None) or subprocess.run
+        if lifted:
+            raw = read_pr_json(engine, repo, number)
+            if raw.get("headRefOid") == head:
+                live = raw.get("labels")
+                have = {(l.get("name") if isinstance(l, dict) else l) for l in (live if isinstance(live, list) else [])}
+                remove = [l for l in lifted if l in have]
+                if remove:
+                    change_issue_labels(engine, runner, repo, number, remove=remove)
+                    engine.audit.append(engine.actor, "gate.hold_released", pr, {"head": head, "removed": remove, "reasons": ["the clears of the batch's members carried to this head"]})
+        for line in neutralise_marker(engine, runner, repo, number, head):
+            engine._note("gate.batch_marker_remains", pr, {"line": _one_line(line, 200)})
+        notify_clear(engine, "carry", repo, number, head, previous=None, body=(record or {}).get("body"))
+    except Exception as err:
+        engine._note("gate.clear_notify_failed", pr, {"error": _one_line("%s: %s" % (type(err).__name__, err), 160)})
 
 
 def _consume_record(state, pr, clear=None):
@@ -259,7 +454,7 @@ def _apply_impact_hold_locked(engine, repo, number, report, record, carry=None):
     state, problem = read_impact_state(engine.state_dir)
     _impact_state_noted(engine, problem)   # fails toward hold: a state file nobody can read hides no hold, and the owner can clear again
     cleared = state["clears"].get(pr) or {}
-    if cleared.get("head") == head:
+    if cleared.get("head") == head or batch_carried(engine, state, repo, pr, head):   # (#955) a batch whose members' clears carried to this head is not labelled
         return 0
     carried_before = state.get("carried", {}).get(pr) or {}
     if carried_before.get("head") == head and cleared.get("head") == carried_before.get("from") and impact_floor.carry_enabled(engine.config, repo):
@@ -344,6 +539,10 @@ def _apply_impact_hold_locked(engine, repo, number, report, record, carry=None):
         if marker is not None:
             detail["marker"] = marker
         engine.audit.append(engine.actor, "gate.hold_reapplied", pr, detail)
+    else:   # (#2223) a first hold: the labels now say captain, so a body that says `MERGE: automatic` is set to captain the same careful way (restore_marker); a failure is audited once and never blocks the hold
+        marker = restore_marker(engine, runner, repo, number, head, raw)
+        if marker is not None:
+            engine.audit.append(engine.actor, "gate.hold_marker_failed" if "error" in marker else "gate.hold_marker", pr, dict(marker, head=head))
     return spent
 
 
@@ -959,6 +1158,7 @@ def authors_hold_labels(names, raw, already):
     return [label for label in ours if label in have and label not in already]
 
 
+@_unbound(lambda arguments: True, _refuse_clear_core)   # `bind` rebuilds it around the daemon's check; until then the module's own copy refuses
 def impact_clear_core(engine, runner, repo, number, who, reason, remove=None, head=None, via=None, verify=None, under_order=None, brief=None):
     """The owner's clear: record it head-bound (the daemon does not re-add the hold for that head) and remove `hold-impact`, plus (#742) every other
     hold label of the fleet's prefix the PR carries at that head (`merge-captain` and each `hold-<reason>`, whoever added it). A DELEGATED clear (`under_order`)
@@ -1241,6 +1441,7 @@ def clear_who(engine, runner, repo, number, report=None):
     return module.who_can_clear(got["rule"], got["report"], got["files"], impact_floor.matches, got["closure"], block, delegation, pr=pr)
 
 
+@_unbound(lambda arguments: True, _refuse_clear_command)
 def cmd_impact_clear(args, runner, now):
     """`impact clear <repo#N> --reason TEXT`: the owner's own terminal only (the Chief of Staff cannot: G6 is never waivable by it)."""
     kind = gates_caller_kind(runner, now)
@@ -1281,19 +1482,28 @@ def cmd_impact_clear(args, runner, now):
                 pr = "%s#%d" % (repo, number)
                 had = state["clears"].pop(pr, None)
                 carried = state.get("carried", {}).pop(pr, None)
+                if isinstance(carried, dict) and carried.get("route") == "batch":   # (#955) the owner took a batch carry back: THIS head is not carried again (a new head is judged afresh)
+                    state.setdefault("batch_void", {})[pr] = {"head": carried.get("head"), "reason": "the owner revoked the carry"}
                 state.get("carry_void", {}).pop(pr, None)
                 state.get("carry_wait", {}).pop(pr, None)
+                voided = []
+                for batch_pr, record in sorted((state.get("carried") or {}).items()):   # (#955) a batch carried on THIS pull request's clear is no longer carried: its record is voided for its head
+                    if isinstance(record, dict) and record.get("route") == "batch" and any(isinstance(m, dict) and m.get("pr") == pr and m.get("held") for m in record.get("members") or []):
+                        state["carried"].pop(batch_pr)
+                        state.setdefault("batch_void", {})[batch_pr] = {"head": record.get("head"), "reason": "the clear of member %s was taken back" % pr}
+                        voided.append(batch_pr)
                 if had is not None:
                     _consume_record(state, pr, had)   # an older record of the daemon's labels is stale (a newer one, applied after the clear, is kept)
-                if had is not None or carried is not None:   # nothing to take back: nothing is written
+                if had is not None or carried is not None or voided:   # nothing to take back: nothing is written
                     write_impact_state(engine.state_dir, state)
                     engine.audit.append(engine.actor, "gate.clear_revoked", pr, dict({"by": kind[1], "reason": plan_ledger.clip(redact_command_text(reason), 300),
-                                                                                    "cleared_head": (had or {}).get("head"), "carried_head": (carried or {}).get("head")},
+                                                                                    "cleared_head": (had or {}).get("head"), "carried_head": (carried or {}).get("head")} if not voided else
+                                                                                    {"by": kind[1], "reason": plan_ledger.clip(redact_command_text(reason), 300), "cleared_head": (had or {}).get("head"), "carried_head": (carried or {}).get("head"), "voided_batches": voided},
                                                                                    **({"under_order": delegated["number"]} if delegated else {})))
         except (ImpactStateBusy, RuntimeError) as err:
             sys.stderr.write("%s: impact clear --revoke: %s; nothing was changed\n" % (PROG, _one_line(str(err), 200)))
             return EXIT_ERROR
-        print("revoked the owner's clear of %s%s: the daemon holds it again at its next pass, and nothing carries" % (pr, " (and its carry)" if carried else "") if (had or carried) else "%s has no clear to revoke" % pr)
+        print("revoked the owner's clear of %s%s: the daemon holds it again at its next pass, and nothing carries" % (pr, " (and its carry)" if carried else "") + ("; the carry of %s is void too" % ", ".join(voided) if voided else "") if (had or carried or voided) else "%s has no clear to revoke" % pr)
         return EXIT_OK
     try:
         extra = {}
@@ -1403,7 +1613,7 @@ def impact_plan(engine, report, labels, state, records, records_problem):
         return "none", []
     if report.get("owner_decision") == "hold":
         carried = (state.get("carried", {}).get(pr) or {}).get("head") == report["head"] and impact_floor.carry_enabled(engine.config, report["pr"].rpartition("#")[0])
-        if (state["clears"].get(pr) or {}).get("head") == report["head"] or carried:   # the owner's clear, or a clear carried over a pure merge of main (#510)
+        if (state["clears"].get(pr) or {}).get("head") == report["head"] or carried or batch_carried(engine, state, report["pr"].rpartition("#")[0], pr, report["head"]):   # the owner's clear, or a clear carried over a pure merge of main (#510)
             return "cleared", []
         return _plan_hold(names, state, pr, have)
     if not records_problem and rehold_reason(engine, state, pr.rpartition("#")[0], pr, report.get("head")):   # (#830) held again at a new head
@@ -1498,15 +1708,36 @@ def release_impact_hold(engine, repo, number, report, record):
 
 
 
-def bind(namespace):
-    """Rebind every moved function to `namespace` (the daemon's globals), install it there under its own name, and return the names bound."""
-    here = globals()
-    for name in MOVED:
-        original = here[name]
-        bound = types.FunctionType(original.__code__, namespace, original.__name__, original.__defaults__, original.__closure__)
-        bound.__kwdefaults__ = original.__kwdefaults__
-        bound.__dict__.update(original.__dict__)   # the attributes a command declares (`ledger`, `ensure_on_use`, ...)
-        bound.__doc__ = original.__doc__
-        bound.__module__ = namespace.get("__name__", bound.__module__)
-        namespace[name] = bound
-    return MOVED
+def _make_bind(make_guard):
+    """#924: the latch check reaches the two effects ONCE, as the guard's closure cell (never a parameter, never read from the namespace). `make_guard` is deleted from the module below; `bind` refuses a second call into a namespace. Limits: docs/switchboard.md."""
+    bound = []
+
+    def rebuilt(function, namespace):   # the same code, run in `namespace` (the daemon's globals) like every moved function
+        made = types.FunctionType(function.__code__, namespace, function.__name__, function.__defaults__, function.__closure__)
+        made.__kwdefaults__ = dict(function.__kwdefaults__) if function.__kwdefaults__ else None
+        made.__dict__.update(function.__dict__)   # the attributes a command declares (`ledger`, `ensure_on_use`, ...)
+        made.__doc__, made.__module__ = function.__doc__, namespace.get("__name__", function.__module__)
+        return made
+
+    def bind(namespace, check):
+        """Rebind every moved function to `namespace`, install it there under its own name, and return the names bound; the effects are built around `check`."""
+        if any(done is namespace for done in bound) or any(getattr(namespace.get(name), "_impact_hold_bound", None) is namespace for name in MOVED):   # the second test outlives a reload of this module (its `bound` list is then a new, empty one): the namespace's own functions say it was bound (they name THIS namespace, never a copy of it)
+            raise RuntimeError("impact_hold is already bound to this namespace: a second bind is refused")
+        bound.append(namespace)
+        if not callable(check):
+            raise TypeError("impact_hold.bind needs the latch's check")
+        guard, here = make_guard(check), globals()
+        for name in MOVED:
+            original = here[name]
+            guards = getattr(original, "guard", None)
+            function = rebuilt(original.__wrapped__ if guards else original, namespace)
+            if guards:   # the refusal is the namespace's own copy (it names PROG and sys there)
+                function = rebuilt(guard(guards[0], namespace[guards[1].__name__])(function), namespace)
+            function._impact_hold_bound = namespace   # the namespace itself, so a copy of its dict is not 'bound'
+            namespace[name] = function
+        return MOVED
+    return bind
+
+
+bind = _make_bind(_make_guard)
+del _make_bind, _make_guard

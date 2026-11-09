@@ -1,0 +1,1 @@
+| `cloud_base.py` | 3 | the `--base` option of the cloud launch (#2305): the check of the branch name, the worker record key `base` and the setup text naming it; a part of `cloud_worker.py`, loaded by `cloud_pr_labels.py` | |

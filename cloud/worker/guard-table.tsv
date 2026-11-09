@@ -6,6 +6,7 @@
 # Later asks add ONLY their own rows in their own section below (ask 1166: issue writes; ask 1200: pr edit body). Do not edit existing rows.
 # ---- ask 1083 rows ----
 issue-comments-read	allowed	gh	GET	repos/OWNER/NAME/issues/N/comments		api repos/acme-org/widget-service/issues/7/comments
+issue-comment-by-id-read	allowed	gh	GET	repos/OWNER/NAME/issues/comments/ID		api repos/acme-org/widget-service/issues/comments/7
 issue-comments-list-form	allowed	gh	GET	repos/OWNER/NAME/issues/N/comments?QUERY		api repos/acme-org/widget-service/issues/7/comments?per_page=5
 pull-reviews-read	allowed	gh	GET	repos/OWNER/NAME/pulls/N/reviews		api repos/acme-org/widget-service/pulls/7/reviews
 pull-comments-read	allowed	gh	GET	repos/OWNER/NAME/pulls/N/comments		api repos/acme-org/widget-service/pulls/7/comments
@@ -32,3 +33,5 @@ pr-edit-url-other-repo	denied	gh	PATCH	pr edit URL or --repo	editing a pull requ
 pr-edit-api	denied	gh	PATCH	repos/OWNER/NAME/pulls/N	writing a pull request through the raw API	api -X PATCH repos/acme-org/widget-service/pulls/7
 pr-edit-no-hold-line	denied	gh	PATCH	client only: the new body drops or changes the line MERGE: captain	a body without the hold line	pr edit 7 --body-file /tmp/nohold
 pr-edit-read-failed	denied	gh	PATCH	client only: the read of the pull request failed	the pull request could not be read	pr edit 10 --body-file /tmp/f
+shell-record-var	denied	gh	ANY	any shell command naming CW_PR_RECORD	a command that names the pod record of its own pull requests	api CW_PR_RECORD
+shell-record-dir	denied	gh	ANY	any shell command naming pr-record	a command that names the pod record of its own pull requests	api pr-record
