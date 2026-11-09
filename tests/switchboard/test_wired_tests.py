@@ -18,8 +18,8 @@ RUNNER = REPO / "bin" / "test-switchboard"
 TESTS = REPO / "tests" / "switchboard"
 MIN_REASON = 20
 
-# file name or file.py::ClassName -> reason (at least 20 characters). Today empty: every class is bound or a base.
-EXEMPT_FILES = {}
+# file name or file.py::ClassName -> reason (at least 20 characters). Every class is bound or a base, but the mixin below.
+EXEMPT_FILES = {"test_cos_blocked_owner.py::BlockedReportOwnerAlarm": "a mixin: its two tests run through TestBlockedReport in bin/test-switchboard (the guard table names them there)"}
 
 
 def test_classes(path):

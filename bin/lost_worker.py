@@ -39,7 +39,7 @@ REAPER_ID = "reaper"
 SLOW_WINDOW = 7200            # the reaper's slow passes of the last two hours say how late a stop may be
 SLOW_MAX = 50                 # most slow passes kept
 REAPER_PASS = 60              # the reaper's pass interval (the launcher's once-a-minute floor, REAP_FLOOR_SECONDS); a copy: this module does not import the launcher
-GRACE = 3 * REAPER_PASS       # 180 s: three reaper passes after the hard deadline before a pod with no stop line is lost (a stop can be a pass or two late); a real loss is told at most this much later
+GRACE = 10 * REAPER_PASS      # 600 s (#2255 plan): ten reaper passes after the hard deadline before a pod with no stop line is lost (room for a slow pass and a stop that lands late); a real loss is told at most this much later
 SLOW_RE = re.compile(r"the pass took (\d{1,7}) seconds \(limit (\d{1,7})\)")
 
 _PROC_ALERTED = {}            # per memory path: keys this process already alerted or skipped: survives a memory file that cannot be saved or set aside
@@ -366,7 +366,8 @@ def _losses(state, sb, engine, alive, now, records):
             continue
         if now - deadline <= GRACE:
             continue   # within the grace after the hard deadline: not lost yet (a stop runs a pass or two late)
-        newest = max(c["at"], state.get("active", {}).get(name, 0))
+        last_active = state.get("active", {}).get(name, 0)
+        newest = max(c["at"], last_active if last_active <= now else 0)   # a sign of life dated after now (clock skew, damaged memory) is no sign: it cannot hold the notice back
         if now - newest <= GRACE and newest > c["at"]:
             continue   # a launcher action or a push within the grace: the pod still answers
         record = records.get(name, {})

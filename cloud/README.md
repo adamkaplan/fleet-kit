@@ -594,3 +594,23 @@ minutes) belongs to the launcher.
   (`CLOUD_TEST_SKIP_DOCKER=1` skips them explicitly).
 
 **The reaper pass line and the renewal tick line (#1742).** The reaper writes one `reaper pass line` for each pass and one `renewal tick line` for each tick of its renewal thread, on its own log (standard error), not in the audit. Each line holds its numbers: `cpu_seconds`, the CPU seconds of the thread that ran the pass or the tick, and `audit_lines_parsed`, the audit lines read and parsed in it for the renewal's failure lookup; the pass line holds those two numbers and the seconds and counts of the seven steps of the pass (`list`, `renew`, `vanished`, `activity`, `stops`, `orphans` and `notes`, with the number of pods for `activity` and `stops`, and the `total`), and nothing else. They are counts only: no pod name, no worker name, no address, no value. To see whether the reaper spends CPU between passes, read the renewal tick lines: a tick with a high `cpu_seconds` or a high `audit_lines_parsed` is where the CPU went; a tail is read once per tick, so `audit_lines_parsed` is at most the lines of the audit tail (about 262,144 bytes). The step with the most seconds in the pass line is where a slow pass spent its time.
+
+## The token service (ask #2002)
+
+A small service in the cluster (`cloud/launcher/token_service.py`, manifest `cloud/k8s/token-mint.yaml`) holds the GitHub App's id and key
+and mints the pod's git token, so the machine that launches pods no longer reads the key. The operator account calls it through the cluster
+API's service proxy; the service reviews the caller's token and serves the operator account only. It accepts one repository on the
+launcher's allowed list and one role, and answers with GitHub's own token, repositories, permissions and expiry.
+
+- The setting `CW_TOKEN_SERVICE_URL` (`https://<server>/api/v1/namespaces/cw/services/token-mint:8080/proxy/mint`) makes `app_token.py` ask
+  the service; the answer gets the signing route's checks on token characters, repository, expiry and permissions (not the installation owner id, which only the signer can compare). With it unset the signing route runs as before: that is the rollback.
+  `CW_TOKEN_SERVICE_CALLER_TOKEN_CMD` may name a command that prints the cluster token; unset, the launcher's own cluster login is used.
+  Preflight note: the repository preflight's child gets `CW_CLOUD_SERVER`, `CW_CLOUD_NAMESPACE` and `CW_CLOUD_CA_FILE` (no secrets) with the two service settings,
+  but not the launcher's cluster-login settings: it reaches the service only if `CW_TOKEN_SERVICE_CALLER_TOKEN_CMD` prints a cluster token that the launcher holds.
+  The client sends the cluster token in `Authorization` and in `X-Caller-Token` (the API server removes `Authorization` of a proxied request;
+  the service reads and reviews only `X-Caller-Token`), verifies TLS against `CW_CLOUD_CA_FILE` when it is set, and refuses a service URL that is
+  not exactly the one above (the host of `CW_CLOUD_SERVER`, the namespace `CW_CLOUD_NAMESPACE`) before it sends the token.
+- A passing failure of the service (502, a timeout, no connection) exits 75 and the launcher tries again; a refusal exits 1.
+- The owner applies the manifests (`token-mint-review.yaml` holds the one cluster-wide permission), creates the Secret `token-mint-app`
+  (keys `app-id`, `app-key`) and publishes the image.
+- Tests: `cloud/launcher/tests/test_token_service.py` and `cloud/launcher/tests/test_app_token_service.py` (fakes only).

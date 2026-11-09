@@ -416,7 +416,7 @@ def sweep_refresh(engine, state, repos, now, cfg, regex, budget):
     hub = getattr(engine, "hub", None)
     if hub is None:
         return
-    stale = sorted((r for r in repos if now - state.repos.get(r, {"at": 0})["at"] >= SWEEP_TTL),
+    stale = sorted((r for r in repos if now - state.repos.get(r, {"at": 0})["at"] >= SWEEP_TTL and not is_land_repo(engine.config, r)),   # #2320: a `spire land` repository has no pull request to sweep
                    key=lambda r: (state.repos.get(r, {"at": 0})["at"], r))
     for repo in stale:
         if budget[0] - SWEEP_CONFIRM_RESERVE < 2 or engine.now() - state.started >= SWEEP_PASS_SECONDS:
