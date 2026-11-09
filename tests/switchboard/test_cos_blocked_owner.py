@@ -122,5 +122,34 @@ class TestCosBlockedOwner(Base):
         self.assertIn(NOT_THE_BLOCKED_AGENT, mutant.failures[0][1])
 
 
+class BlockedReportOwnerAlarm:
+    """The two killer tests of the blocked-section guard table; mixed into TestBlockedReport (bin/test-switchboard), which supplies block(), wait() and audits()."""
+
+    def alarm(self):
+        return sb._read_small(self.world.state, sb.OWNER_ALARM_STATE).get("alarm")
+
+    def test_a_blocked_chief_of_staff_is_recorded_for_the_owner_once_and_the_end_is_recorded(self):   # #2059
+        world = World(self, agents=(), config={})
+        world.add_agent("cos", fleet={"role": "chief-of-staff"})
+        self.world = world
+        world.herdr.panes[world.panes["cos"]]["status"] = "blocked"
+        world.engine.send("x", "cos", "hello")
+        world.engine.run_pass()
+        world.tick(1500)
+        world.engine.run_pass()
+        found = self.alarm()
+        self.assertEqual((found["agent"], found["minutes"], found["ended"]), ("cos", 25, None))
+        world.herdr.panes[world.panes["cos"]]["status"] = "idle"
+        world.tick(60)
+        world.engine.run_pass()
+        self.assertIsNotNone(self.alarm()["ended"])
+
+    def test_a_blocked_worker_leaves_no_owner_alarm(self):   # #2059
+        self.block()
+        self.wait(25)
+        self.assertEqual(len(self.audits()), 1)
+        self.assertIsNone(self.alarm())
+
+
 if __name__ == "__main__":
     unittest.main()

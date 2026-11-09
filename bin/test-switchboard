@@ -75617,7 +75617,7 @@ class TestUndeliveredWake(Base):
                 self.assertTrue(result.failures or result.errors, "the mutant %r survives %s" % (name, test))
 
 
-class TestBlockedReport(Base):
+class TestBlockedReport(_cos_blocked_owner.BlockedReportOwnerAlarm, Base):
     """A blocked agent with messages held for it is reported to its boss and the Chief of Staff (docs/switchboard.md, "A blocked agent is reported")."""
 
     def setUp(self):
@@ -76047,31 +76047,6 @@ class TestBlockedReport(Base):
         world.engine.run_pass()
         (report,) = self.audits()
         self.assertEqual((report["subject"], report["detail"]["told"], self.reminders_to("cos")), ("cos", [], []))
-
-    def alarm(self):
-        return sb._read_small(self.world.state, sb.OWNER_ALARM_STATE).get("alarm")
-
-    def test_a_blocked_chief_of_staff_is_recorded_for_the_owner_once_and_the_end_is_recorded(self):   # #2059
-        world = World(self, agents=(), config={})
-        world.add_agent("cos", fleet={"role": "chief-of-staff"})
-        self.world = world
-        world.herdr.panes[world.panes["cos"]]["status"] = "blocked"
-        world.engine.send("x", "cos", "hello")
-        world.engine.run_pass()
-        world.tick(1500)
-        world.engine.run_pass()
-        found = self.alarm()
-        self.assertEqual((found["agent"], found["minutes"], found["ended"]), ("cos", 25, None))
-        world.herdr.panes[world.panes["cos"]]["status"] = "idle"
-        world.tick(60)
-        world.engine.run_pass()
-        self.assertIsNotNone(self.alarm()["ended"])
-
-    def test_a_blocked_worker_leaves_no_owner_alarm(self):   # #2059
-        self.block()
-        self.wait(25)
-        self.assertEqual(len(self.audits()), 1)
-        self.assertIsNone(self.alarm())
 
     def test_no_chief_of_staff_and_a_boss_that_is_itself_means_nobody_is_told_but_the_report_is_audited(self):
         world = World(self, agents=(), config={})
