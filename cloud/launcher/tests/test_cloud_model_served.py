@@ -138,7 +138,8 @@ class TestRefusal(Launch):
 
 class TestServed(Launch):
     def test_s4_u2_served_model_one_read_no_model_none(self):
-        self.listed = [{"providerID": P, "id": "model-01", "variants": [{"id": "medium"}]}]
+        self.listed = [{"providerID": P, "id": "model-01", "variants": [{"id": "medium"}]},
+                       {"providerID": P, "id": "claude-sonnet-5.5", "variants": [{"id": "medium"}]}]   # the launch default is served too
         code1, out1, err1 = self.run_launch("--model", P + "/model-01", "--reasoning", "medium")
         sessions = [b for m, p, b in self.remote.bodies if m == "POST" and p == "/api/session"]
         served = len(self.reads)
@@ -158,7 +159,8 @@ class TestServed(Launch):
             served, without, code1 == 0 and code2 == 0))
         print("U2: extra pod calls without a model %d, with a served model %d, pod text outside the pattern in the line 0" % (extra + without, served))
         self.assertEqual(code2, 0, err2)
-        self.assertEqual((served, without), (1, 0))
+        self.assertEqual(self.stops(), [])   # the served default refuses nothing
+        self.assertEqual((served, without), (1, 1))   # a launch with no --model verifies the default model with one read
         self.assertEqual(len([b for b in sessions if (b or {}).get("model", {}).get("id") == "model-01"]), 1)
 
 
