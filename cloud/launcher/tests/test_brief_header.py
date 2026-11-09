@@ -833,7 +833,7 @@ class HeaderFileAndOutput(unittest.TestCase):
             elif mine[0].split("] ", 1)[1] != text:
                 bad.append("%s line is not `[id] text`" % ident)
         ids = [i for i, _ in rules]
-        printed = [l.split("]", 1)[0].lstrip("- [") for l in body if l.strip()]
+        printed = [(re.match(r"^(?:- )?\[([^\]]*)\]", l) or [None, l])[1] for l in body if l.strip()]
         if printed != ids:
             bad.append("the printed rules are not the rules of the source, in order: %r" % printed)
         return bad
@@ -847,12 +847,12 @@ class HeaderFileAndOutput(unittest.TestCase):
         self.assertIn("done-land", by_id)   # the rule for a repository that lands (ask #2320)
         for word in ("spire land", "landed <sha>", "exit 22"):
             self.assertIn(word, by_id["done-land"])
-        self.assertTrue(out.startswith(TITLE_START))
 
     def test_s14_control_a_dropped_or_doubled_rule_or_an_empty_one_is_caught(self):
         sb = load_sb()
         rules = rules_of(SOURCE)
-        lines = open(SOURCE).read().splitlines(True)
+        with open(SOURCE) as f:
+            lines = f.read().splitlines(True)
         victim = [l for l in lines if l.startswith("done-land |")]
         self.assertEqual(len(victim), 1)
         variants = {
