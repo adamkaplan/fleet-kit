@@ -11,15 +11,19 @@ _LAND_ENTRY = re.compile(r"[A-Za-z0-9_.-]+/(?:[A-Za-z0-9_.-]+|\*)")   # matched 
 
 def uses_spire_land(config, repo):
     """True when `repo` ("owner/repo") lands by `spire land` under the configuration's `land_repos` (case-insensitive; "owner/*" matches every repository of
-    the owner). An absent key means the default; an empty list means none. A value that is not a list of names means the default (the loader refuses it first)."""
+    the owner). An absent key means the default; an empty list means none. A value that is not a list of names matches nothing (the loader refuses it first)."""
     if not isinstance(repo, str) or not _LAND_ENTRY.fullmatch(repo) or repo.endswith("/*"):
         return False
     raw = (config or {}).get(LAND_REPOS_KEY) if isinstance(config, dict) else None
     entries = LAND_REPOS_DEFAULT if raw is None else raw
     if not isinstance(entries, (list, tuple)) or len(entries) > LAND_REPOS_MAX or not all(isinstance(e, str) and _LAND_ENTRY.fullmatch(e) for e in entries):
-        entries = LAND_REPOS_DEFAULT   # a malformed value fails to the default, never to nobody (the loader refuses it first)
+        entries = LAND_REPOS_DEFAULT   # the launch text's rule: a malformed value fails to the default, never to nobody (the loader refuses it first)
+    if not isinstance(entries, (list, tuple)):
+        return False
     owner, _, name = repo.lower().partition("/")
     for entry in entries:
+        if not isinstance(entry, str) or not _LAND_ENTRY.fullmatch(entry):
+            continue
         e_owner, _, e_name = entry.lower().partition("/")
         if e_owner == owner and e_name in ("*", name):
             return True
