@@ -366,7 +366,8 @@ def _losses(state, sb, engine, alive, now, records):
             continue
         if now - deadline <= GRACE:
             continue   # within the grace after the hard deadline: not lost yet (a stop runs a pass or two late)
-        newest = max(c["at"], state.get("active", {}).get(name, 0))
+        seen = state.get("active", {}).get(name, 0)
+        newest = max(c["at"], seen if seen <= now else 0)   # a sign of life dated after now (clock skew, damaged memory) is no sign: it cannot hold the notice back
         if now - newest <= GRACE and newest > c["at"]:
             continue   # a launcher action or a push within the grace: the pod still answers
         record = records.get(name, {})

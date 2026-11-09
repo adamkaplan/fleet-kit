@@ -1079,6 +1079,34 @@ class TestPodReportedLostOnlyWhenSilent(unittest.TestCase):
         self.assertEqual(late[0]["at"], NOW + 3000 - 60)
         self.assertEqual([x for x in r.passes(at=NOW + 3000 + 800) if x["kind"] == "pod_no_stop"], [])
 
+    def test_the_grace_is_ten_reaper_passes_on_both_sides(self):
+        mod = self.module()
+        self.assertEqual(mod.GRACE, 600)   # the approved plan value: ten 60 s reaper passes
+        self.assertEqual(mod.GRACE, 10 * mod.REAPER_PASS)
+        def notices(setup, at=NOW):
+            r = Rig(mod)
+            setup(r)
+            return [x for x in r.passes(at=at) if x["kind"] == "pod_no_stop"]
+        def deadline_at(back):
+            return lambda r: r.created("bd", deadline=NOW - back)
+        self.assertEqual(notices(deadline_at(mod.GRACE)), [], "the grace itself still holds")
+        self.assertEqual(len(notices(deadline_at(mod.GRACE + 1))), 1)
+        self.assertEqual(notices(deadline_at(mod.GRACE // 2)), [], "inside the grace, with no activity")
+        def acted(back, event=None):
+            def setup(r):
+                r.created("ba", deadline=NOW - 3000)
+                if event:
+                    line(r.engine.audit.path, ts=stamp(NOW - back), actor="x", event=event, subject="ba", detail={})
+                else:
+                    line(r.launcher, ts=stamp(NOW - back), worker="ba", runtime_id="pod/ba", action="note", ok=True, reason="")
+            return setup
+        for event in (None, "push_watch.sent"):
+            self.assertEqual(notices(acted(mod.GRACE, event)), [], "activity exactly one grace ago still holds")
+            got = notices(acted(mod.GRACE + 1, event))
+            self.assertEqual(len(got), 1)
+            self.assertEqual(got[0]["at"], NOW - mod.GRACE - 1, "the notice names the newest action or push")
+        self.assertEqual(len(notices(acted(-mod.GRACE * 100))), 1, "future-dated activity is no sign of life")
+
     def test_controls_today_s_rule_raises_the_false_notices(self):
         old = self.module(mutant=True)
         self.check_s4(old)   # the control: the silent pod is reported on today's rule too
