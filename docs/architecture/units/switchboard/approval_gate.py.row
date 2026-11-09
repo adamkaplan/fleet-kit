@@ -1,0 +1,1 @@
+| `switchboard/approval_gate.py` | 5 | the approval gate G0c: the one reader of the plan.approved events and the merge gate's refusal | |

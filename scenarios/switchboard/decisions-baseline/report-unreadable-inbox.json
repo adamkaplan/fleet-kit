@@ -1,0 +1,46 @@
+{
+ "RuntimeError": {
+  "decisions": [
+   {
+    "agent": "bad",
+    "ask": 2,
+    "considered": "could not read what bad was sent (inbox read failed): listed as not answered",
+    "headline": "which one?",
+    "id": "api#2wu",
+    "kind": "report",
+    "repo": "acme/api",
+    "since": "2027-01-15T08:00:01Z",
+    "tier": "orchestrator",
+    "title": "which one?"
+   }
+  ],
+  "errors": [
+   {
+    "error": "cannot read what bad was sent: inbox read failed",
+    "source": "reports"
+   }
+  ]
+ },
+ "V2Error": {
+  "decisions": [
+   {
+    "agent": "bad",
+    "ask": 2,
+    "considered": "could not read what bad was sent (v2 says 500): listed as not answered",
+    "headline": "which one?",
+    "id": "api#2wu",
+    "kind": "report",
+    "repo": "acme/api",
+    "since": "2027-01-15T08:00:01Z",
+    "tier": "orchestrator",
+    "title": "which one?"
+   }
+  ],
+  "errors": [
+   {
+    "error": "cannot read what bad was sent: v2 says 500",
+    "source": "reports"
+   }
+  ]
+ }
+}
