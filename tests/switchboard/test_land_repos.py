@@ -70,7 +70,7 @@ class TestConfigLoader(unittest.TestCase):
         self.assertIn("land_repos", str(caught.exception))
 
 
-FAKE_GH = """#!/usr/bin/env python3
+LAND_FAKE_GH = """#!/usr/bin/env python3
 import json, sys
 with open(%(log)r, "a") as handle:
     handle.write(json.dumps(sys.argv[1:]) + "\\n")
@@ -92,7 +92,7 @@ class TestGatesSkipped(unittest.TestCase):
         self.addCleanup(lambda: __import__("shutil").rmtree(str(self.tmp), ignore_errors=True))
         self.log = self.tmp / "gh.log"
         gh = self.tmp / "gh"
-        gh.write_text(FAKE_GH % {"log": str(self.log)})
+        gh.write_text(LAND_FAKE_GH % {"log": str(self.log)})
         gh.chmod(0o755)
         self.gh = gh
         (self.tmp / "state").mkdir()
