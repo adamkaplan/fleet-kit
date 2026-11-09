@@ -50,7 +50,7 @@ class TestReader(unittest.TestCase):
         self.assertTrue(self.land.uses_spire_land(config, "acme/ONE"))
         self.assertTrue(self.land.uses_spire_land(config, "beta/anything"))
         self.assertFalse(self.land.uses_spire_land(config, "acme/two"))
-        self.assertFalse(self.land.uses_spire_land(config, "janus-infra/widget"), "a list replaces the default")
+        self.assertFalse(self.land.uses_spire_land(config, "janus-infra/widget"), "a repository the list does not name is not on the land path")
 
     def test_a_glob_or_a_malformed_name_is_never_a_repository(self):
         for repo in ("janus-infra/*", "janus-infra", "janus-infra/widget\n", None, 7, ""):
@@ -135,6 +135,10 @@ class TestGatesSkipped(unittest.TestCase):
 
     def test_s3_with_the_key_absent_the_repository_is_on_the_gates(self):
         done, calls = self.run_cmd("gates-check", "janus-infra/widget", ABSENT, "--json")
+        self.assertTrue(any(c[:2] == ["pr", "view"] for c in calls), (calls, done.stdout, done.stderr))
+
+    def test_s3_with_the_key_null_the_repository_is_on_the_gates(self):
+        done, calls = self.run_cmd("gates-check", "janus-infra/widget", None, "--json")
         self.assertTrue(any(c[:2] == ["pr", "view"] for c in calls), (calls, done.stdout, done.stderr))
 
     def test_s4_with_land_repos_empty_the_repository_is_back_on_the_gates(self):
