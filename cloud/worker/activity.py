@@ -14,6 +14,7 @@ import base64
 import datetime as dt
 import json
 import os
+import re
 import sys
 import urllib.error
 import urllib.request
@@ -39,10 +40,138 @@ def is_busy(active):
     return any(not isinstance(v, dict) or v.get("type") in (None, "running") for v in active.values())
 
 
+def _stat(proc, pid):
+    """(state, ppid) of a pid from <proc>/<pid>/stat; the name field may hold spaces, so split after the last ')'."""
+    with open("%s/%s/stat" % (proc, pid)) as f:
+        rest = f.read().rsplit(")", 1)[1].split()
+    return rest[0], int(rest[1])
+
+
+# comm is cut at 15 characters by the kernel, so the long shim names (containerd-shim-runc-v1/v2) match by argv[0]
+DAEMONS = ("dockerd", "containerd", "containerd-shim", "containerd-shim-runc-v1", "containerd-shim-runc-v2", "docker-proxy")
+
+
+def _comm_and_start(proc, pid):
+    """(comm, start in clock ticks since boot or None) of a pid from <proc>/<pid>/stat (field 22)."""
+    with open("%s/%s/stat" % (proc, pid)) as f:
+        text = f.read()
+    comm = text.split("(", 1)[1].rsplit(")", 1)[0]
+    rest = text.rsplit(")", 1)[1].split()
+    try:
+        return comm, int(rest[19])
+    except (IndexError, ValueError):
+        return comm, None
+
+
+def _is_daemon(proc, pid, comm):
+    names = {comm}
+    try:
+        with open("%s/%s/cmdline" % (proc, pid), "rb") as f:
+            names.add(os.path.basename(f.read().split(b"\0")[0].decode("utf-8", "replace")))
+    except OSError:
+        pass
+    return bool(names & set(DAEMONS))
+
+
+def _boot_epoch(proc):
+    """Boot time in epoch seconds from <proc>/stat btime, or None when unreadable."""
+    try:
+        with open("%s/stat" % proc) as f:
+            for line in f:
+                if line.startswith("btime "):
+                    return int(line.split()[1])
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def _proc_root():
+    """/proc, unless a test points the check at a stub: CW_ACTIVITY_PROC counts only with the test marker set too."""
+    if os.environ.get("CW_ACTIVITY_UNDER_TEST") == "1" and os.environ.get("CW_ACTIVITY_PROC"):
+        return os.environ["CW_ACTIVITY_PROC"]
+    return "/proc"
+
+
+def _pid1_is_the_agent(proc):
+    """True only when pid 1 runs `opencode serve` (the pod: agent and server in one process); on any other host pid 1 is
+    init and every process descends from it, so the check must not run there."""
+    with open("%s/1/cmdline" % proc, "rb") as f:
+        argv = f.read().split(b"\0")
+    return os.path.basename(argv[0].decode("utf-8", "replace")) == "opencode" and "serve" in [a.decode("utf-8", "replace") for a in argv[1:3]]
+
+
+def has_live_child(proc=None, session_start=None):
+    """True when a live process descends from pid 1 (the agent AND its headless server, one process) other than pid 1
+    and the whole subtree of the tool's call root (the tool's ancestor whose parent is pid 1; none when the tool runs outside
+    pid 1, as under kubectl exec, so nothing is excluded); zombies do not
+    count. Never raises: any read error means no child."""
+    try:
+        proc = proc or _proc_root()
+        if not _pid1_is_the_agent(proc):
+            return False
+        ppid = {}
+        state = {}
+        comm = {}
+        start = {}
+        boot = _boot_epoch(proc) if session_start is not None else None
+        hz = os.sysconf("SC_CLK_TCK")
+        for name in os.listdir(proc):
+            if name.isdigit():
+                try:
+                    state[int(name)], ppid[int(name)] = _stat(proc, name)
+                    comm[int(name)], start[int(name)] = _comm_and_start(proc, name)
+                except (OSError, ValueError, IndexError):
+                    pass
+        call_root = None
+        pid = os.getpid()
+        seen = set()
+        while pid in ppid and pid not in seen:
+            seen.add(pid)
+            if ppid[pid] == 1:
+                call_root = pid
+                break
+            pid = ppid[pid]
+        for pid, parent in ppid.items():
+            if pid == 1 or state[pid] in ("Z", "X"):
+                continue
+            if boot is not None and start[pid] is not None and boot + start[pid] / hz < session_start:
+                continue
+            chain = {pid}
+            while parent > 1 and parent in ppid and parent not in chain:
+                chain.add(parent)
+                parent = ppid[parent]
+            if parent == 1 and call_root not in chain and not any(_is_daemon(proc, p, comm[p]) for p in chain):
+                return True
+        return False
+    except Exception:
+        return False
+
+
 def to_dt(ms):
     if isinstance(ms, bool) or not isinstance(ms, (int, float)):
         return None
     return dt.datetime.fromtimestamp(ms / 1000 if ms > 1e11 else ms, dt.timezone.utc)
+
+
+def newest_messages(port, auth, sessions):
+    """The `time.created` of the newest message of each session (GET /api/session/<id>/message: {"data": [{"time": {"created": ms, "completed": ms?}}]}):
+    a message still being written has `created` and no `completed`, so it counts from the moment it starts. An unreadable or odd answer for one
+    session adds nothing (the sessions' own times still count); the session id must be a plain id before it is put in a path."""
+    out = []
+    newest = sorted((s for s in sessions if isinstance(s, dict)), key=lambda s: (to_dt((s.get('time') or {}).get('updated') if isinstance(s.get('time'), dict) else None) or dt.datetime.min.replace(tzinfo=dt.timezone.utc)), reverse=True)
+    for s in newest[:50]:   # the 50 most recently updated: a bound on the reads of one call
+        sid = s.get("id") if isinstance(s, dict) else None
+        if not isinstance(sid, str) or not re.fullmatch(r"[A-Za-z0-9_]{1,80}", sid):
+            continue
+        try:
+            messages = get(port, auth, "/api/session/%s/message" % sid, list)
+        except Exception:   # one session's list that cannot be read adds nothing: the sessions' own times still count
+            continue
+        stamps = [to_dt((m.get("time") or {}).get("created")) for m in messages if isinstance(m, dict) and isinstance(m.get("time"), dict)]
+        stamps = [t for t in stamps if t]
+        if stamps:
+            out.append(max(stamps))
+    return out
 
 
 def fail(reason):
@@ -68,7 +197,7 @@ def main():
         return fail("server unreachable")
     except ValueError:
         return fail("bad JSON")
-    times = [to_dt((s.get("time") or {}).get("updated")) for s in sessions if isinstance(s, dict) and isinstance(s.get("time"), dict)]
+    times = [to_dt((s.get("time") or {}).get("updated")) for s in sessions if isinstance(s, dict) and isinstance(s.get("time"), dict)] + newest_messages(port, auth, sessions)
     times = [t for t in times if t]
     if times:
         last = max(times)
@@ -77,7 +206,10 @@ def main():
             last = dt.datetime.fromisoformat(os.environ["CW_STARTED"].replace("Z", "+00:00"))
         except (KeyError, ValueError):
             last = dt.datetime.now(dt.timezone.utc)
-    print(json.dumps({"busy": is_busy(active), "last_activity": last.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}))
+    created = [to_dt((s.get("time") or {}).get("created")) for s in sessions if isinstance(s, dict) and isinstance(s.get("time"), dict)]
+    created = [t for t in created if t]
+    session_start = min(created).timestamp() if created else None  # the OLDEST session: a child of an older session still counts
+    print(json.dumps({"busy": is_busy(active) or has_live_child(session_start=session_start), "last_activity": last.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}))
     return 0
 
 

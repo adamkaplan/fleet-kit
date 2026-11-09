@@ -1,0 +1,1 @@
+| `header_cache.py` | 0 | the shared file cache of the ask header (Intent, Done-when, state, updated_at, parent): one file per issue, ages, bounds (#1520) | |

@@ -661,6 +661,18 @@ class TestGitShim(Base):
     CONFIG_WRITE_ALLOWED = (   # (file, exact added line, purpose)
         ("tests/switchboard/test_cases_12.py", " " * 23 + "GIT_CONFIG_" + _G.upper() + '="/dev/null", GIT_CONFIG_' + _S.upper() + '="/dev/null")',
          "points git at /dev/null: writes no git configuration"),
+        ("tests/switchboard/test_merge_drops.py", " " * 26 + 'env={"PATH": "/usr/bin:/bin", "HOME": str(cwd), "GIT_CONFIG_' + _G.upper() + '": "/dev/null", "GIT_CONFIG_' + _S.upper() + '": "/dev/null",',
+         "points git at /dev/null: writes no git configuration (#2161)"),
+        # #2214 (read-only root filesystem): the launcher points git's global-configuration variable at a file on the pod's tmpfs, because the home git file is a
+        # file that cannot be mounted over. That names a path for git to READ; it writes no global configuration. Each row is the exact added line.
+        ("cloud/launcher/cloud_worker.py", "READONLY_ROOT_GIT" + "CONFIG" + ' = "/run/cw-tmp/git' + 'config"   # ~/.git' + "config is a FILE: git is pointed at the tmpfs instead of mounting over it",
+         "names a tmpfs path for git to read (#2214): writes no git configuration"),
+        ("cloud/launcher/cloud_worker.py", " " * 8 + 'worker_container["env"].append({"name": "GIT_CONFIG_' + _G.upper() + '", "value": READONLY_ROOT_GIT' + "CONFIG" + "})",
+         "sets the pod's git global-configuration variable to that tmpfs path (#2214): writes no git configuration"),
+        ("cloud/launcher/tests/test_readonly_root.py", " " * 4 + 'test.assertIn({"name": "GIT_CONFIG_' + _G.upper() + '", "value": "/run/cw-tmp/git' + 'config"}, c["env"])',
+         "asserts that variable in the container env (#2214): writes no git configuration"),
+        ("cloud/launcher/tests/test_readonly_root.py", " " * 4 + 'test.assertFalse(any(m["mountPath"] == "/home/worker" or m["mountPath"].endswith(".git' + 'config") for m in c["volumeMounts"]))',
+         "asserts no mount over the home git file (#2214): writes no git configuration"),
     )
 
     @classmethod
@@ -763,7 +775,11 @@ class TestGhShim(Base):
         fake.write_text("#!/usr/bin/env python3\nimport json,os,sys\n"
                         "files={a: open(a).read() for a in sys.argv[1:] if os.path.isfile(a)}\n"
                         "json.dump({'argv': sys.argv[1:], 'stdin': None if sys.stdin.isatty() else sys.stdin.read(), 'files': files}, "
-                        "open(%r,'w'))\nprint('real gh out'); sys.stderr.write('real gh err\\n'); sys.exit(int(os.environ.get('FAKE_GH_EXIT','0')))\n"
+                        "open(%r,'w'))\n"
+                        # the body guard (#2219) reads the current body of an issue before it lets a body write through: answer that read with a body that is not an ask's
+                        "if (sys.argv[1:3] == ['issue','view'] and '--json' in sys.argv) or (sys.argv[1:2] == ['api'] and len(sys.argv) == 3):\n"
+                        "    print('{\"body\": \"plain text, not an ask\"}'); sys.exit(0)\n"
+                        "print('real gh out'); sys.stderr.write('real gh err\\n'); sys.exit(int(os.environ.get('FAKE_GH_EXIT','0')))\n"
                         % str(self.log))
         fake.chmod(0o755)
         self.who = self.home / "whoami"

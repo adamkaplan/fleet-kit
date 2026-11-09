@@ -74,7 +74,7 @@ class Rig:
         with open(os.path.join(self.dir, "lost-workers.json"), "w") as handle:
             json.dump({"offsets": {}, "alerted": {}}, handle)
 
-    def created(self, name, deadline=NOW - 60, lane="lane-a", branch="ask-7"):
+    def created(self, name, deadline=NOW - 400, lane="lane-a", branch="ask-7"):
         line(self.engine.audit.path, ts=stamp(NOW - 7200), actor="x", event="cloud.created", subject=name, detail={"hard_deadline": stamp(deadline)})
         self.engine.cloud_watch["records"].append({"worker": name, "reports_to": lane, "branch": branch})
 
@@ -139,7 +139,7 @@ def scenarios(mod):
     check("S5b done then hard limit", r.passes() == [] and r.engine.sent == [])
     r = Rig(mod)   # pushed false alone proves nothing: a pod with that and neither a stop nor a report is still lost
     r.created("w4")
-    line(r.launcher, ts=stamp(NOW - 30), worker="w4", runtime_id="pod/w4", action="send", ok=True, reason="pushed=false")
+    line(r.launcher, ts=stamp(NOW - 3000), worker="w4", runtime_id="pod/w4", action="send", ok=True, reason="pushed=false")
     check("S5c pushed false alone is not a clean end", len(r.passes()) == 1)
 
     r = Rig(mod)   # S6: the third launch of an ask
@@ -214,6 +214,29 @@ class TestLostWorkerReadRound(unittest.TestCase):
     def alerts(self, r):
         return [m for m in r.engine.sent if m[0] == "lane-a"]
 
+    def run_full_tables(self):
+        mod = load()
+        mod.SEEN_MAX = 5
+        r = Rig(mod)
+        path = r.engine.audit.path
+        r.created("lost", deadline=NOW + 600)   # created with no stop, oldest creation, due only at the second pass
+        line(path, ts=stamp(NOW - 7000), actor="x", event="cloud.created", subject="old", detail={"hard_deadline": stamp(NOW - 400)})
+        line(r.launcher, ts=stamp(NOW - 5000), worker="old", runtime_id="pod/old", action="stop", ok=True, reason="finished")
+        for n in range(3):
+            r.created("f%d" % n)
+        first = r.passes()   # five creations: the cap is not passed yet
+        for n in range(3):
+            r.stopped("f%d" % n)
+        for n in range(3):   # later stops pass the cap
+            line(r.launcher, ts=stamp(NOW - 20), worker="x%d" % n, runtime_id="pod/x%d" % n, action="stop", ok=True, reason="finished")
+        return [x for x in first + r.passes(at=NOW + 1000) if x["kind"] == "pod_no_stop"]
+
+    def test_2164_s2_a_stopped_worker_is_never_alerted_after_the_trim(self):
+        self.assertEqual([x for x in self.run_full_tables() if x["name"] == "old"], [])
+
+    def test_2164_s3_a_worker_with_no_stop_is_still_alerted(self):
+        self.assertEqual(len([x for x in self.run_full_tables() if x["name"] == "lost"]), 1)
+
     def test_s9_cap_and_backlog(self):
         r = self.rig()
         for n in range(25):
@@ -234,14 +257,14 @@ class TestLostWorkerReadRound(unittest.TestCase):
         for n in range(40):
             r.created("old%d" % n)
         for n in range(2):
-            line(r.engine.audit.path, ts=stamp(NOW - 300), actor="x", event="cloud.created", subject="new%d" % n, detail={"hard_deadline": stamp(NOW - 60)})
+            line(r.engine.audit.path, ts=stamp(NOW - 300), actor="x", event="cloud.created", subject="new%d" % n, detail={"hard_deadline": stamp(NOW - 400)})
         self.assertEqual(sorted(x["name"] for x in r.passes()), ["new0", "new1"])
         self.assertEqual(r.passes(), [])
 
     def test_s10b_valid_memory_alerts_across_a_restart_gap(self):
         r = self.rig()
         r.passes()
-        line(r.engine.audit.path, ts=stamp(NOW - 3 * 3600), actor="x", event="cloud.created", subject="gap", detail={"hard_deadline": stamp(NOW - 60)})
+        line(r.engine.audit.path, ts=stamp(NOW - 3 * 3600), actor="x", event="cloud.created", subject="gap", detail={"hard_deadline": stamp(NOW - 400)})
         self.assertEqual([x["name"] for x in r.passes()], ["gap"])
 
     def test_mutant_that_applies_the_one_hour_rule_with_a_valid_memory_is_caught(self):
@@ -249,7 +272,7 @@ class TestLostWorkerReadRound(unittest.TestCase):
         real = mod._load
         mod._load = lambda sb, path: (real(sb, path)[0], "none")
         r = Rig(mod)
-        line(r.engine.audit.path, ts=stamp(NOW - 3 * 3600), actor="x", event="cloud.created", subject="gap", detail={"hard_deadline": stamp(NOW - 60)})
+        line(r.engine.audit.path, ts=stamp(NOW - 3 * 3600), actor="x", event="cloud.created", subject="gap", detail={"hard_deadline": stamp(NOW - 400)})
         self.assertEqual(r.passes(), [])   # the mutant alerts nothing: the s10b case above fails on it
 
     def test_s11_name_cleaned_and_corrupt_memory(self):
@@ -268,7 +291,7 @@ class TestLostWorkerReadRound(unittest.TestCase):
         self.assertEqual(r.engine.sent, [])
         with open(r.engine.audit.path) as handle:
             self.assertEqual(len([x for x in handle if "lost_worker.memory_corrupt" in x]), 1)
-        line(r.engine.audit.path, ts=stamp(NOW - 100), actor="x", event="cloud.created", subject="w2", detail={"hard_deadline": stamp(NOW - 60)})
+        line(r.engine.audit.path, ts=stamp(NOW - 100), actor="x", event="cloud.created", subject="w2", detail={"hard_deadline": stamp(NOW - 400)})
         self.assertEqual([x["name"] for x in r.passes()], ["w2"])
         self.assertTrue(json.load(open(os.path.join(r.dir, "lost-workers.json")))["offsets"])
 
@@ -371,14 +394,14 @@ class TestLostWorkerReadRound(unittest.TestCase):
         got += r.passes(at=NOW - 300)
         r.alive.clear()
         r.created("oldpod", deadline=NOW - 3 * 3600)
-        line(r.engine.audit.path, ts=stamp(NOW - 300), actor="x", event="cloud.created", subject="newpod", detail={"hard_deadline": stamp(NOW - 60)})
+        line(r.engine.audit.path, ts=stamp(NOW - 300), actor="x", event="cloud.created", subject="newpod", detail={"hard_deadline": stamp(NOW - 400)})
         line(r.engine.audit.path, ts=stamp(NOW - 3 * 3600), actor="x", event="cloud.create_failed", subject="oldref", detail={})
         line(r.engine.audit.path, ts=stamp(NOW - 100), actor="x", event="cloud.create_failed", subject="newref", detail={})
         got += r.passes()
         self.assertEqual(sorted((x["kind"], x["name"]) for x in got),
                          [("local_worker", "newloc"), ("pod_no_stop", "newpod"), ("refused_launch", "newref")])
         self.assertFalse(json.load(open(state_path))["catchup"])
-        line(r.engine.audit.path, ts=stamp(NOW - 3 * 3600), actor="x", event="cloud.created", subject="gap", detail={"hard_deadline": stamp(NOW - 60)})
+        line(r.engine.audit.path, ts=stamp(NOW - 3 * 3600), actor="x", event="cloud.created", subject="gap", detail={"hard_deadline": stamp(NOW - 400)})
         self.assertEqual([x["name"] for x in r.passes()], ["gap"])   # outside a catch-up a restart gap is still alerted
 
     def test_s6_a_detector_down_for_hours_says_once_how_many_it_missed(self):
@@ -458,9 +481,9 @@ class TestLostWorkerReadRound(unittest.TestCase):
         self.assertEqual([x["name"] for x in r.passes()], ["w1"])
 
     BAD = [None, "x", 5, [1], {"a": 1}, True, 10 ** 30, {"a": {"b": [1]}}]
-    VALID = {"reaper_ok": [5], "catchup": [True], "stop": [{"a": 1}], "report": [{"a": 1}], "gone": [{"a": 1}]}   # the one bad value of the table that is a good value of that key
-    KEYS = ("offsets", "alerted", "created", "stop", "report", "refused", "seen", "gone", "reaper", "reaper_ok", "reaper_outage", "reaper_gap",
-            "reaper_new", "catchup")
+    VALID = {"reaper_ok": [5], "catchup": [True], "stop": [{"a": 1}], "report": [{"a": 1}], "active": [{"a": 1}], "gone": [{"a": 1}], "slow_bad": [5]}   # the one bad value of the table that is a good value of that key
+    KEYS = ("offsets", "alerted", "created", "stop", "report", "active", "refused", "seen", "gone", "reaper", "reaper_ok", "reaper_outage", "reaper_gap",
+            "reaper_new", "catchup", "slow", "slow_bad")
 
     def bad_table(self):
         return {key: [b for b in self.BAD if not any(type(b) is type(v) and b == v for v in self.VALID.get(key, []))] for key in self.KEYS}
@@ -626,7 +649,7 @@ class TestLostWorkerMemoryOnly(unittest.TestCase):
         os.unlink(os.path.join(self.r.dir, "lost-workers.json"))
         os.mkdir(os.path.join(self.r.dir, "lost-workers.json"))   # a directory at the memory path: neither written nor set aside
         for name, age in (("recent", 300), ("old", 3 * 3600)):
-            line(self.r.engine.audit.path, ts=stamp(NOW - age), actor="x", event="cloud.created", subject=name, detail={"hard_deadline": stamp(NOW - 60)})
+            line(self.r.engine.audit.path, ts=stamp(NOW - age), actor="x", event="cloud.created", subject=name, detail={"hard_deadline": stamp(NOW - 400)})
 
     def corrupt_lines(self):
         with open(self.r.engine.audit.path) as handle:
@@ -656,14 +679,14 @@ class TestLostWorkerMemoryOnly(unittest.TestCase):
     def test_failed_save_does_not_repeat_the_first_run_rule(self):
         r = Rig(self.mod)
         os.unlink(os.path.join(r.dir, "lost-workers.json"))
-        line(r.engine.audit.path, ts=stamp(NOW - 300), actor="x", event="cloud.created", subject="recent", detail={"hard_deadline": stamp(NOW - 60)})
-        line(r.engine.audit.path, ts=stamp(NOW - 3 * 3600), actor="x", event="cloud.created", subject="old", detail={"hard_deadline": stamp(NOW - 60)})
+        line(r.engine.audit.path, ts=stamp(NOW - 300), actor="x", event="cloud.created", subject="recent", detail={"hard_deadline": stamp(NOW - 400)})
+        line(r.engine.audit.path, ts=stamp(NOW - 3 * 3600), actor="x", event="cloud.created", subject="old", detail={"hard_deadline": stamp(NOW - 400)})
         real = self.mod._save
         self.mod._save = lambda path, state: (_ for _ in ()).throw(OSError("disk full"))
         self.assertEqual([x["name"] for x in r.passes()], ["recent"])
         self.assertEqual(r.passes(), [])   # not re-alerted
         self.mod._save = real
-        line(r.engine.audit.path, ts=stamp(NOW - 100), actor="x", event="cloud.created", subject="newer", detail={"hard_deadline": stamp(NOW - 60)})
+        line(r.engine.audit.path, ts=stamp(NOW - 100), actor="x", event="cloud.created", subject="newer", detail={"hard_deadline": stamp(NOW - 400)})
         self.assertEqual([x["name"] for x in r.passes()], ["newer"])
 
     def load_mutant(self, *pairs):
@@ -682,7 +705,7 @@ class TestLostWorkerMemoryOnly(unittest.TestCase):
         os.mkdir(path)
         self.mod.ALERTED_MAX, self.mod.PASS_CAP = 30, 10 ** 6
         for i in range(100):
-            line(r.engine.audit.path, ts=stamp(NOW - 300 - i), actor="x", event="cloud.created", subject="k%03d" % i, detail={"hard_deadline": stamp(NOW - 60)})
+            line(r.engine.audit.path, ts=stamp(NOW - 300 - i), actor="x", event="cloud.created", subject="k%03d" % i, detail={"hard_deadline": stamp(NOW - 400)})
         r.passes()
         mem = self.mod._PROC_ALERTED[path]
         self.assertEqual(len(mem), 30)
@@ -726,6 +749,332 @@ class TestLostWorkerMemoryOnly(unittest.TestCase):
         self.mod._PROC_AUDITED = OnePath()
         with self.assertRaises(AssertionError):
             self.check_audit_per_path()
+
+
+class TestLostWorkerSlowPass(unittest.TestCase):
+    """#2096: a stop behind a slow reaper pass is told as late, not lost."""
+
+    def slow(self, r, n=870, at=NOW - 300, reason=None):
+        line(r.launcher, ts=stamp(at), worker="", runtime_id="reaper", action="slow-reap-pass", ok=False,
+             reason=reason or "the pass took %d seconds (limit 600)" % n)
+
+    def pod_lines(self, r, got):
+        return [x for x in got if x["kind"] == "pod_no_stop"]
+
+    def s2_case(self, mod):
+        r = Rig(mod)
+        self.slow(r)
+        r.created("w1", deadline=NOW - 600)
+        return r, r.passes()
+
+    def check_s2(self, mod):
+        r, got = self.s2_case(mod)
+        late = [x for x in got if "late, not lost" in x.get("text", "") and "870 seconds" in x["text"]]
+        lost = [x for x in got if x["kind"] == "pod_no_stop" and "late, not lost" not in x["text"]]
+        self.assertEqual(len(late), 1, "a late stop behind a slow pass is late, not lost")
+        self.assertEqual(len(lost), 0, "a late stop behind a slow pass is late, not lost")
+
+    def test_s2_a_late_pod_is_told_as_late_naming_the_pass(self):
+        self.check_s2(load())
+
+    def test_s3_a_pod_well_past_its_deadline_is_lost_as_today(self):
+        r = Rig(load())
+        self.slow(r)
+        r.created("w1", deadline=NOW - 1800)
+        got = r.passes()
+        self.assertEqual([x for x in got if "late, not lost" in x["text"]], [])
+        self.assertEqual(len([x for x in got if x["key"].startswith("pod_no_stop:w1")]), 1)
+
+    def test_s4_a_late_pod_then_its_stop_raises_nothing_more(self):
+        r = Rig(load())
+        self.slow(r)
+        r.created("w1", deadline=NOW - 600)
+        self.assertEqual(len(self.pod_lines(r, r.passes())), 1)
+        r.stopped("w1")
+        self.assertEqual(self.pod_lines(r, r.passes(at=NOW + 10)), [])
+        self.assertEqual(self.pod_lines(r, r.passes(at=NOW + 2000)), [])
+
+    def audit_lines(self, r):
+        with open(r.engine.audit.path) as handle:
+            return len([x for x in handle if "lost_worker.slow_pass_unreadable" in x])
+
+    def test_s4_a_malformed_slow_line_falls_back_with_one_audit_line(self):
+        r = Rig(load())
+        self.slow(r, reason="took long")
+        r.created("w1", deadline=NOW - 600)
+        got = r.passes()
+        self.assertEqual([x["key"].split(":")[0] for x in self.pod_lines(r, got)], ["pod_no_stop"])
+        self.assertEqual(self.audit_lines(r), 1)
+        r.passes(at=NOW + 5)
+        self.assertEqual(self.audit_lines(r), 1)
+
+    def test_s4_an_unreadable_launcher_audit_falls_back_with_one_audit_line(self):
+        r = Rig(load())
+        os.unlink(r.launcher)
+        os.mkdir(r.launcher)   # exists and cannot be read as a file
+        r.created("w1", deadline=NOW - 600)
+        got = r.passes()
+        self.assertEqual([x["key"].split(":")[0] for x in got], ["pod_no_stop"])
+        self.assertEqual(self.audit_lines(r), 1)
+        r.passes(at=NOW + 5)
+        self.assertEqual(self.audit_lines(r), 1)
+
+    def test_a_late_alert_is_not_an_earlier_lost_worker_of_its_ask(self):
+        r = Rig(load())
+        self.slow(r)
+        r.created("a1", deadline=NOW - 600)
+        r.passes()
+        r.created("a2", deadline=NOW - 1800)
+        got = {x["name"]: x["text"] for x in r.passes(at=NOW + 1)}
+        self.assertIn("first loss of this ask", got["a2"])
+
+    def test_a_pod_later_truly_lost_still_raises_its_own_key(self):
+        r = Rig(load())
+        self.slow(r)
+        r.created("w1", deadline=NOW - 600)
+        r.passes()
+        got = self.pod_lines(r, r.passes(at=NOW + 2000))
+        self.assertEqual([x["key"].split(":")[0] for x in got], ["pod_no_stop"])
+
+    def test_s5_a_mutant_that_ignores_the_pass_length_is_caught(self):
+        source = (REPO / "bin" / "lost_worker.py").read_text()
+        needle = "if now - deadline < longest:"
+        self.assertEqual(source.count(needle), 1)
+        control = load()   # the control first: the unmutated detector passes
+        self.check_s2(control)
+        mutant = types.ModuleType("lost_worker_mutant")
+        exec(compile(source.replace(needle, "if False:"), "lost_worker_mutant", "exec"), mutant.__dict__)
+        with self.assertRaises(AssertionError) as caught:
+            self.check_s2(mutant)
+        self.assertIn("a late stop behind a slow pass is late, not lost", str(caught.exception))
+
+
+    def reaper_missed(self, got):
+        return [x for x in got if x["kind"] == "reaper_missed"]
+
+    def check_not_a_failure(self, mod):
+        r = Rig(mod)
+        for i in range(3):
+            self.slow(r, n=700 + i, at=NOW - 600 * (i + 1))
+        got = self.reaper_missed(r.passes())
+        self.assertEqual(len(got), 0, "a slow reaper pass is not a reaper failure")
+
+    def test_2101_three_slow_passes_alone_raise_no_reaper_missed(self):
+        self.check_not_a_failure(load())
+
+    def test_2101_a_day_of_slow_passes_and_one_failed_refresh_raises_one(self):
+        r = Rig(load())
+        for i in range(30):
+            self.slow(r, n=650 + i, at=NOW - 100 - 10 * i)
+        line(r.launcher, ts=stamp(NOW - 5), worker="", runtime_id="reaper", action="refresh-cluster-token", ok=False, reason="login failed")
+        got = self.reaper_missed(r.passes())
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0]["key"], "reaper_missed:outage@%s" % (NOW - 5))
+        self.assertIn("1 failed reaper line(s)", got[0]["line"])
+        self.assertIn("login failed", got[0]["line"])
+
+    def test_2101_a_mutant_that_counts_slow_passes_again_is_caught(self):
+        source = (REPO / "bin" / "lost_worker.py").read_text()
+        needle = " and not _is_slow_line(item):"
+        self.assertEqual(source.count(needle), 1)
+        self.check_not_a_failure(load())   # the control first
+        mutant = types.ModuleType("lost_worker_mutant2")
+        exec(compile(source.replace(needle, ":"), "lost_worker_mutant2", "exec"), mutant.__dict__)
+        with self.assertRaises(AssertionError) as caught:
+            self.check_not_a_failure(mutant)
+        self.assertIn("a slow reaper pass is not a reaper failure", str(caught.exception))
+
+
+class TestChiefOnlyWhenNeeded(unittest.TestCase):
+    """#2202: a loss the launcher's own record shows as an ok stop goes to its lane only; any other loss still goes to the lane and the Chief of Staff."""
+
+    def delivered(self, stop):
+        mod = load()
+        r = Rig(mod)
+        r.created("w1")
+        if stop:
+            r.stopped("w1")
+        loss = {"key": "pod_no_stop:w1:%s" % (NOW - 7200), "kind": "pod_no_stop", "name": "w1", "ask": "ask-7", "at": NOW - 7200, "lane": "lane-a", "line": "x"}
+        mod._losses = lambda *a, **k: [dict(loss)]   # the loss is given; only its delivery is under test
+        r.passes()
+        return sorted(to for to, _ in r.engine.sent)
+
+    def test_s4_clean_stop_goes_to_the_lane_only(self):
+        self.assertEqual(self.delivered(True), ["lane-a"])
+
+    def test_s4_no_stop_goes_to_the_lane_and_the_chief(self):
+        self.assertEqual(self.delivered(False), ["chief-of-staff", "lane-a"])
+
+
+class TestRefusedLaunchIsToldToItsLane(unittest.TestCase):
+    """#2303: a refused launch is told to the lane named in its `cloud.create_failed` line, never to the Chief of Staff; no readable lane: the Chief of Staff alone."""
+
+    def refused(self, mod, *bosses):
+        r = Rig(mod)
+        for n, boss in enumerate(bosses):
+            detail = {"exit": 1, "reason": "cluster full"}
+            if boss is not None:
+                detail["boss"] = boss
+            line(r.engine.audit.path, ts=stamp(NOW - 100 - n), actor="x", event="cloud.create_failed", subject="w%d" % n, detail=detail)
+        got = r.passes()
+        r.passes()   # a second pass repeats nothing
+        return got, sorted(to for to, _ in r.engine.sent), r.engine.sent
+
+    def today(self):
+        src = (REPO / "bin" / "lost_worker.py").read_text()
+        for new, old in (('"lane": r.get("boss") or None,', '"lane": record.get("reports_to"),'), ('if loss["kind"] == "refused_launch":', 'if False:')):
+            self.assertEqual(src.count(new), 1, new)
+            src = src.replace(new, old)
+        mod = types.ModuleType("lost_worker_today")
+        exec(compile(src, "lost_worker_today", "exec"), mod.__dict__)
+        return mod
+
+    def check_s2(self, mod):
+        got, to, sent = self.refused(mod, "lane-a", "lane-b")
+        self.assertEqual(to.count("chief-of-staff"), 0, "S2 the Chief of Staff is told none")
+        self.assertEqual(to, ["lane-a", "lane-b"], "S2 each lane once")
+        self.assertTrue(all(("lane=" + t) in m for t, m in sent), "S2 the text names the lane")
+
+    def check_s3(self, mod):
+        got, to, _ = self.refused(mod, None)
+        self.assertEqual(to, ["chief-of-staff"], "S3 the Chief of Staff alone, once")
+
+    def test_s2_each_lane_is_told_once_and_the_chief_none(self):
+        self.check_s2(load())
+
+    def test_s3_an_unreadable_lane_reaches_the_chief_once(self):
+        self.check_s3(load())
+        got, to, _ = self.refused(load(), "")
+        self.assertEqual(to, ["chief-of-staff"])   # an empty boss is no lane
+
+    def test_a_boss_that_is_not_a_lane_name_is_no_lane(self):
+        for bad in (5, "x" * 90, "lane\nx", "Lane A", "lane-a, kind=pod_no_stop"):
+            got, to, _ = self.refused(load(), bad)
+            self.assertEqual(to, ["chief-of-staff"], repr(bad))
+
+    def test_a_valid_but_unusual_lane_name_is_a_lane(self):
+        for good in ("2fa-lane", "l" * 40, "chief-of-staff"):
+            got, to, _ = self.refused(load(), good)
+            self.assertEqual(to, [good])
+
+    def test_the_alert_key_is_unchanged_and_an_old_line_with_no_boss_is_told_once(self):
+        got, to, _ = self.refused(load(), "lane-a", None)
+        self.assertEqual(sorted(x["key"].split("@")[0] for x in got), ["refused_launch:w0", "refused_launch:w1"])
+        self.assertEqual(sorted(to), ["chief-of-staff", "lane-a"])
+
+    def test_a_loss_of_another_kind_keeps_its_recipients(self):
+        mod = load()
+        r = Rig(mod)
+        r.created("w1")
+        r.passes()
+        self.assertEqual(sorted(to for to, _ in r.engine.sent), ["chief-of-staff", "lane-a"])
+
+    def test_s5_control_today_s_code_tells_the_chief_of_both(self):
+        old = self.today()
+        got, to, _ = self.refused(old, "lane-a", "lane-b")
+        self.assertEqual(to.count("chief-of-staff"), 2)   # the control: the Chief of Staff is told of both, no lane is
+        self.assertNotIn("lane-a", to)
+        with self.assertRaises(AssertionError) as caught:
+            self.check_s2(old)
+        self.assertIn("S2 the Chief of Staff is told none", str(caught.exception))
+
+
+class TestAskIsItsOwn(unittest.TestCase):
+    """#2246: a lost worker is counted under its own ask, never under its name prefix."""
+
+    def test_s2_readers_of_two_issues_and_a_builder_of_a_third_are_each_their_own_ask(self):
+        mod = load()
+        recs = {"cr2244": {"issue": 2243}, "cr2250": {"issue": 2249}, "cb2251": {"branch": "c2251-a"}}
+        asks = {n: mod._ask_of(n, r) for n, r in recs.items()}
+        self.assertEqual(len(set(asks.values())), 3)
+        self.assertEqual(sum(1 for n, a in asks.items() if a in ("cr", "cb")), 0)
+
+    def test_s3_repeat_counts_only_its_own_ask(self):
+        mod = load()
+        asks = [mod._ask_of("cr%d" % i, {}) for i in (1, 2, 3)]
+        self.assertEqual(len(set(asks)), 3)
+
+    def test_the_full_name_is_the_last_resort(self):
+        self.assertEqual(load()._ask_of("cr2244", {}), "cr2244")
+
+
+class TestPodReportedLostOnlyWhenSilent(unittest.TestCase):
+    """#2255: the case of 6 November 2026: a pod past its hard deadline that is stopped seconds later, or still noting and pushing, is not lost."""
+    G1 = "        if now - deadline <= GRACE:\n"
+    G2 = "        if now - newest <= GRACE and newest > c[\"at\"]:\n"
+
+    def module(self, mutant=False):
+        src = (REPO / "bin" / "lost_worker.py").read_text()
+        if mutant:   # today's rule: no grace and no activity read
+            for gate in (self.G1, self.G2):
+                self.assertEqual(src.count(gate), 1)
+                src = src.replace(gate, gate.replace(gate.strip()[3:-1], "False"))
+        mod = types.ModuleType("lost_worker_gate")
+        exec(compile(src, "lost_worker_gate", "exec"), mod.__dict__)
+        return mod
+
+    def lost(self, mod, setup, at=NOW):
+        r = Rig(mod)
+        setup(r)
+        return [x for x in r.passes(at=at) if x["kind"] == "pod_no_stop"]
+
+    def seconds_past(self, r):   # the pod tg: deadline 3 s before the check, launcher actions after the launch
+        r.created("tg", deadline=NOW - 3)
+
+    def noting(self, r):   # renewal, nudge, wip note, final note after the launch, the last one 10 s ago; deadline 8 minutes ago
+        r.created("tg", deadline=NOW - 480)
+        for back, action in ((3000, "renew"), (2400, "idle-nudge"), (1200, "wip-note"), (10, "final-note")):
+            line(r.launcher, ts=stamp(NOW - back), worker="tg", runtime_id="pod/tg", action=action, ok=True, reason="")
+
+    def pushing(self, r):
+        r.created("ti", deadline=NOW - 480)
+        line(r.engine.audit.path, ts=stamp(NOW - 20), actor="x", event="push_watch.sent", subject="ti", detail={})
+
+    def silent(self, r):
+        r.created("cf", deadline=NOW - 3000)
+        line(r.launcher, ts=stamp(NOW - 6000), worker="cf", runtime_id="pod/cf", action="renew", ok=True, reason="")
+
+    def check_s2(self, mod):
+        self.assertEqual(self.lost(mod, self.seconds_past), [], "S2 a pod seconds past its deadline is not lost")
+
+    def check_s3(self, mod):
+        self.assertEqual(self.lost(mod, self.noting), [], "S3 a pod still noting is not lost")
+        self.assertEqual(self.lost(mod, self.pushing), [], "S3 a pod still pushing is not lost")
+
+    def check_s4(self, mod):
+        got = self.lost(mod, self.silent)
+        self.assertEqual(len(got), 1, "S4 a silent pod is reported once")
+        self.assertEqual(got[0]["at"], NOW - 6000, "S4 the last event is the newest action, not the launch")
+
+    def test_s2_a_pod_stopped_seconds_after_its_deadline_raises_no_notice(self):
+        self.check_s2(self.module())
+
+    def test_s3_a_pod_still_noting_or_pushing_raises_no_notice(self):
+        self.check_s3(self.module())
+
+    def test_s4_a_silent_pod_is_still_reported_with_its_newest_event(self):
+        self.check_s4(self.module())
+
+    def quiet_only(self, r):   # the only line in the grace is push_watch.quiet: no push, not a sign of life
+        r.created("tq", deadline=NOW - 480)
+        line(r.engine.audit.path, ts=stamp(NOW - 20), actor="x", event="push_watch.quiet", subject="tq", detail={})
+
+    def test_a_push_watch_quiet_line_is_not_a_sign_of_life(self):
+        self.assertEqual(len(self.lost(self.module(), self.quiet_only)), 1)
+        src = (REPO / "bin" / "lost_worker.py").read_text()
+        old = src.replace('event == "push_watch.sent"', 'event in ("push_watch.sent", "push_watch.quiet")')
+        self.assertNotEqual(old, src)
+        mod = types.ModuleType("lost_worker_head")
+        exec(compile(old, "lost_worker_head", "exec"), mod.__dict__)
+        self.assertEqual(self.lost(mod, self.quiet_only), [], "control: head holds it back")
+
+    def test_controls_today_s_rule_raises_the_false_notices(self):
+        old = self.module(mutant=True)
+        self.check_s4(old)   # the control: the silent pod is reported on today's rule too
+        for check, text in ((self.check_s2, "S2 a pod seconds"), (self.check_s3, "S3 a pod still")):
+            with self.assertRaises(AssertionError) as caught:
+                check(old)
+            self.assertIn(text, str(caught.exception))
 
 
 if __name__ == "__main__":

@@ -113,9 +113,7 @@ def block(path, source, sources, closure):
     else:
         out.append("  authority code: no")
         out.append("  matrix: no matrix line is demanded")
-    rows = unit_rows(units_text)
-    before = [r for r in rows if r[0] < os.path.basename(path)]
-    out.append("  units: add this row to the Units table of docs/architecture.md (header `%s`, rows sorted by name), after the row of `%s`:" % (UNITS_HEAD, max(r[0] for r in before) if before else "(first row)"))
+    out.append("  units: add the file docs/architecture/units/%s.row holding this one row (a file of its own: no shared line to conflict on):" % os.path.basename(path))
     out.append("    " + unit_row(path))
     out.append("  closure: " + closure)
     return "\n".join(out)
@@ -167,8 +165,7 @@ def main(argv):
             print("new-module-demands: %s cannot be read as a python file" % path)
             return 2
     guards = load_by_path(os.path.join(ROOT, "bin", "path_suites.py"), "path_suites_for_demands").NEW_BIN_GUARDS
-    with open(os.path.join(ROOT, MATRIX), encoding="utf-8") as handle:
-        matrix = json.load(handle)
+    matrix = load_by_path(os.path.join(ROOT, "bin", "impact_floor.py"), "impact_floor_for_demands").load_matrix(os.path.join(ROOT, MATRIX))   # the ONE matrix loader: the JSON plus its entry files (#2206 part 3)
     with open(os.path.join(ROOT, "docs", "architecture.md"), encoding="utf-8") as handle:
         units_text = handle.read()
     closure = closure_state()

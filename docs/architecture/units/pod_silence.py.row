@@ -1,0 +1,1 @@
+| `pod_silence.py` | 0 | a running cloud pod with no push and no report for 20 minutes tells its boss one summary line, once per quiet period (ask #2115; the send and summary functions are handed in) | |

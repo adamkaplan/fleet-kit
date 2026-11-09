@@ -5,7 +5,7 @@ Run at the repository root:  bin/cloud-pr-preflight [--quick]
 --quick (ask #1299): section 2 runs only the test files that read a changed file plus the named scans of bin/cloud_quick.py
 (each a file and one selector), on the branch and on the clean base; same three sections and exit codes. Default: every file. CLOUD_PREFLIGHT_MODE=quick is the same as --quick (bin/cloud-prepush sets it).
 A quick run that selects nothing for a non-empty change fails (never clean).
-Offline. Prints three sections; exits 0 when 1 and 2 pass (and no --expect stray file); section 3 only lists edits to justify.
+Offline. Prints three sections; exits 0 when 1 and 2 pass (and no --expect stray file); section 3 only lists edits to justify. When the branch adds or changes a tests/switchboard/test_*.py file it also prints the block of tools/new-test-checks and a failed check fails the run.
   1. completeness scan of bin/test-cloud-launcher
   2. every test file of cloud/launcher/tests and cloud/worker/tests, one at a time, on the branch and on a clean
      copy of the default branch (made under the system temp dir, removed on every exit path; no git stash, no network,
@@ -260,6 +260,17 @@ def main():
             print("NOT RUN: %s is neither chained in %s nor in EXCEPTIONS" % (rel, CHAIN))
         failed |= bool(bad)
         print("scan: " + ("FAIL" if bad else "ok"))
+        rc, out = git("diff", "--name-only", "--no-renames", "--diff-filter=AM", mb, "--", "tests/switchboard/", cwd=root)   # #1967: a new or changed switchboard test file is read before the push
+        if any(x.count("/") == 2 and os.path.basename(x).startswith("test_") and x.endswith(".py") for x in out.splitlines()):
+            print("\n== new test file checks (tools/new-test-checks) ==")
+            tool = os.path.join(root, "tools", "new-test-checks")
+            if not os.path.exists(tool):
+                print("SKIP new-test-checks: tools/new-test-checks is not in this tree")
+            else:
+                done = subprocess.run([sys.executable, tool, "--base", mb], cwd=root, capture_output=True, text=True)
+                print((done.stdout + done.stderr).rstrip("\n") or "(no findings)")
+                print("new-test-checks: " + ("FAIL" if done.returncode else "ok"))
+                failed |= bool(done.returncode)
 
         sel_of = {}
         if quick:
