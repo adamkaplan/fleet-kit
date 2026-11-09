@@ -18,8 +18,8 @@ CALLER = "caller-synthetic-" + "Mn4" * 5
 REAL = "acme-org/widget-service"
 PERMS = {"contents": "write", "pull_requests": "write", "issues": "read", "metadata": "read"}
 ORCH = {"issues": "write", "pull_requests": "read", "checks": "read", "metadata": "read"}
-SKIP_CHECK = ('    check_permissions(ans.get("permissions"), role)\n    MINTED.clear()\n    return token\n\n\ndef main(')
-SKIPPED = '    MINTED.clear()\n    return token\n\n\ndef main('
+SKIP_CHECK = ('    check_permissions(ans.get("permissions"), role)\n    if not keep:\n        MINTED.clear()\n    return token\n\n\nUSAGE')
+SKIPPED = '    if not keep:\n        MINTED.clear()\n    return token\n\n\nUSAGE'
 
 
 def iso(seconds):
@@ -55,6 +55,19 @@ class Fake(http.server.BaseHTTPRequestHandler):
         self.send_response(204)
         self.send_header("Content-Length", "0")
         self.end_headers()
+
+
+def via_route(argv, env):
+    """Run the mint with the named route (a pipe, --fd): the result's stdout is what came through the route (the token); the real stdout must be empty."""
+    r, w = os.pipe()
+    try:
+        p = subprocess.run(argv + ["--fd", str(w)], env=env, capture_output=True, text=True, timeout=60, pass_fds=(w,))
+    finally:
+        os.close(w)
+    with os.fdopen(r) as f:
+        token = f.read()
+    assert p.stdout == "", "the mint wrote to standard output"
+    return subprocess.CompletedProcess(p.args, p.returncode, token, p.stderr)
 
 
 def apply_mutation(original, old, new):
@@ -95,7 +108,7 @@ class ServiceBranch(unittest.TestCase):
         e.update(PATH=self.bin + os.pathsep + os.environ["PATH"], CW_TOKEN_SERVICE_URL=url or self.url,
                  CW_TOKEN_SERVICE_CALLER_TOKEN_CMD="echo " + CALLER, CW_GITHUB_API_BASE="http://127.0.0.1:%d" % self.srv.server_port)
         e.update(env)
-        return subprocess.run([sys.executable, mint] + list(args), env=e, capture_output=True, text=True, timeout=60)
+        return via_route([sys.executable, mint] + list(args), e)
 
     def test_s3_two_roles_print_one_token_and_nothing_else(self):
         for args, perms in (((REAL,), PERMS), ((REAL, "--role", "orchestrator"), ORCH)):
@@ -205,7 +218,7 @@ class ClientBranch(unittest.TestCase):
         if ca:
             e["CW_CLOUD_CA_FILE"] = self.cert
         e.update(env)
-        return subprocess.run([sys.executable, mint] + [REAL], env=e, capture_output=True, text=True, timeout=60)
+        return via_route([sys.executable, mint, REAL], e)
 
     def test_s11_b_the_ca_file_is_trusted_and_without_it_the_service_is_refused(self):
         p = self.run_client()
