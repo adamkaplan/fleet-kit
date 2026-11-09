@@ -432,7 +432,7 @@ What the per-layer scan covers and does NOT cover:
 ### The allowlist (known false positives)
 
 Scanning packaged binaries as bytes finds strings that only look like credentials (the `gh` binary, a locale table in
-`libunistring`, format strings in `libgnutls`). `worker/scan-allowlist.txt` lists them as exact triples, one per line, each
+`libunistring`, format strings in `libgnutls`, an instruction-name table in `libLLVM`). `worker/scan-allowlist.txt` lists them as exact triples, one per line, each
 with a reason:
 
 ```text
