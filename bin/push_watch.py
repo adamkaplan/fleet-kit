@@ -66,12 +66,7 @@ def _landed(sb, engine, now, gh, name, record, mem, state, repos_live, full_conf
     Returns the sha told, or None. A read that fails is audited once and retried at the next pass; a send that fails is not marked."""
     repo = record.get("repo")
     uses = getattr(sb, "is_land_repo", None)
-    if uses is None:
-        if not mem.get("noland"):
-            mem["noland"] = True
-            engine.audit.append(engine.actor, "push_watch.read_failed", name, {"why": "no land reader: a land repository completes nothing"})
-        return None
-    if not uses(full_config, repo):
+    if uses is None or not uses(full_config, repo):   # (the daemon's tick always passes the reader: a test of it is in test_land_repos.py)
         return None
     default = record.get("default_branch")
     default = default if isinstance(default, str) and re.fullmatch(r"[A-Za-z0-9._/-]{1,100}", default) else "main"
