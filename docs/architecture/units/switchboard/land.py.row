@@ -1,1 +1,1 @@
-| `switchboard/land.py` | 5 | `land_repos`: which repositories land by `spire land` and have no pull request (ask #2320), and the one setup line a launch for them carries | |
+| `switchboard/land.py` | 5 | `land_repos`: which repositories land by `spire land` and have no pull request (ask #2320) | |
