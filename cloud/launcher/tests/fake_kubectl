@@ -1,0 +1,326 @@
+#!/usr/bin/env python3
+"""A fake kubectl for the offline tests: state is one JSON file (FAKE_KUBE_STATE). Supports only what cloud-worker uses."""
+import fcntl, json, os, subprocess, sys
+HERE = os.path.dirname(os.path.abspath(__file__))
+path = os.environ["FAKE_KUBE_STATE"]
+args = sys.argv[1:]
+if os.environ.get("FAKE_KUBE_CALLS"):
+    with open(os.environ["FAKE_KUBE_CALLS"], "a") as f:
+        f.write(json.dumps(args) + "\n")
+if args[0] == "--kubeconfig":
+    if os.environ.get("FAKE_KUBE_CFGDUMP"):  # what the launcher generated, as kubectl would read it
+        with open(os.environ["FAKE_KUBE_CFGDUMP"], "a") as f:
+            f.write(json.dumps({"path": args[1], "mode": os.stat(args[1]).st_mode & 0o777,
+                                "dirmode": os.stat(os.path.dirname(args[1])).st_mode & 0o777,
+                                "config": open(args[1]).read()}) + "\n")
+    args = args[2:]
+assert args[0] == "--context", "no explicit --context"
+assert args[2] == "-n"
+args = args[4:]
+lock = open(path + ".lock", "w")   # one kubectl at a time reads and writes the state, like one API server
+fcntl.flock(lock, fcntl.LOCK_EX)
+st = json.load(open(path))
+if os.environ.get("FAKE_SCAN_DIR"):  # leak check on every call: no file under the scratch dir may hold a planted value
+    for root, _, names in os.walk(os.environ["FAKE_SCAN_DIR"]):
+        for n in names:
+            try:
+                body = open(os.path.join(root, n), errors="replace").read()
+            except OSError:
+                continue
+            if any(v and v in body for v in os.environ.get("FAKE_SCAN_VALUES", "").split(",")):
+                open(path + ".leaks", "a").write(n + "\n")
+if os.environ.get("FAKE_KUBE_SEEN"):  # what a child could see of its parent: the environment and the parent's command line
+    with open(os.environ["FAKE_KUBE_SEEN"], "a") as f:
+        f.write(json.dumps({"env": {k: v for k, v in os.environ.items() if k not in ("FAKE_SCAN_VALUES", "FAKE_KUBE_ECHO")}, "parent": subprocess.run(["ps", "-o", "command=", "-p", str(os.getppid())], capture_output=True, text=True).stdout}) + "\n")
+if os.environ.get("FAKE_KUBE_HANG") == args[0]:  # a call that never ends: the test signals the caller meanwhile
+    open(os.environ["FAKE_KUBE_HANG_MARK"], "w").write(args[0])
+    fcntl.flock(lock, fcntl.LOCK_UN)
+    import time
+    time.sleep(120)
+if st.get("fail_delete") and args[0] == "delete":
+    print("Error from server (Forbidden): delete denied", file=sys.stderr); sys.exit(1)
+cmd = args[0]
+if st.get("fail_cmd") == ("apply" if cmd == "create" and args[1:2] == ["-f"] else cmd) and not (cmd == "delete" and st.get("fail_cmd_only_run") and not args[2].endswith("-run")):
+    # a failure that ECHOES the planted values on stderr and on stdout (a real server error can quote what it was sent)
+    echo = os.environ.get("FAKE_KUBE_ECHO", "")
+    print(json.dumps({"error": echo, "pushed": False}))
+    print("Error from server (Forbidden): quota says %s" % echo, file=sys.stderr); sys.exit(1)
+def save():  # atomic: a test reading the state meanwhile never sees a half-written file
+    with open(path + ".tmp%d" % os.getpid(), "w") as f:
+        json.dump(st, f)
+    os.replace(path + ".tmp%d" % os.getpid(), path)
+def missing(what):
+    print('Error from server (NotFound): %s not found' % what, file=sys.stderr); sys.exit(1)
+def exists(what):
+    print('Error from server (AlreadyExists): %s already exists' % what, file=sys.stderr); sys.exit(1)
+def sts_pod(sts):   # the pod the StatefulSet's controller makes: NAME-0, owned by it, the template's labels, annotations and spec
+    tmpl, name = sts["spec"]["template"], sts["metadata"]["name"]
+    st["uid_counter"] = st.get("uid_counter", 0) + 1
+    st.setdefault("pods", {})[name + "-0"] = {
+        "metadata": {"name": name + "-0", "labels": dict(tmpl["metadata"].get("labels", {})), "annotations": dict(tmpl["metadata"].get("annotations", {})),
+                     "uid": "uid-%d" % st["uid_counter"], "ownerReferences": [{"apiVersion": "apps/v1", "kind": "StatefulSet", "name": name, "uid": sts["metadata"]["uid"], "controller": True}]},
+        "spec": dict(tmpl["spec"], hostname=name + "-0", subdomain=sts["spec"]["serviceName"]),
+        "status": {"phase": "Pending" if st.get("never_ready") else "Running", "conditions": [] if st.get("never_ready") else [{"type": "Ready", "status": "True"}], "podIP": "10.1.2.4"}}
+def sts_recreate(pod):   # a pod deleted ALONE comes back: its controller is still there
+    for ref in (pod or {}).get("metadata", {}).get("ownerReferences", []):
+        if ref.get("kind") == "StatefulSet" and ref["name"] in st.get("sts", {}):
+            sts_pod(st["sts"][ref["name"]])
+            st.setdefault("recreated", []).append(pod["metadata"]["name"])
+if cmd == "apply" or (cmd == "create" and args[1:2] == ["-f"]):   # `create -f` is exclusive, like a real cluster; `apply` replaces
+    obj = json.load(sys.stdin)
+    if st.get("fail_apply") and obj["kind"] == "StatefulSet":
+        print("Error from server (Forbidden): quota exceeded", file=sys.stderr); sys.exit(1)
+    if obj["kind"] == "StatefulSet":   # the controller makes the one pod NAME-0 at once
+        if obj["metadata"]["name"] in st.get("sts", {}):
+            exists('statefulsets.apps "%s"' % obj["metadata"]["name"])
+        st.setdefault("applied", []).append(obj)
+        st["uid_counter"] = st.get("uid_counter", 0) + 1
+        obj["metadata"]["uid"] = "sts-uid-%d" % st["uid_counter"]
+        st.setdefault("sts", {})[obj["metadata"]["name"]] = obj
+        if not st.get("sts_no_pod"):
+            sts_pod(obj)
+        save(); sys.exit(0)
+    if st.get("fail_apply"):
+        print("Error from server (Forbidden): quota exceeded", file=sys.stderr); sys.exit(1)
+    if cmd == "create":
+        if obj["metadata"]["name"] in st.get("secrets" if obj["kind"] == "Secret" else "pods", {}):
+            exists('%ss "%s"' % (obj["kind"].lower(), obj["metadata"]["name"]))
+    st.setdefault("applied", []).append(obj)
+    if obj["kind"] == "Secret":
+        st.setdefault("secrets", {})[obj["metadata"]["name"]] = 1
+        if "password" in obj.get("stringData", {}):
+            st.setdefault("secret_bodies", {})[obj["metadata"]["name"]] = {"password": obj["stringData"]["password"]}
+        st.setdefault("secret_labels", {})[obj["metadata"]["name"]] = obj["metadata"].get("labels", {})
+    else:
+        for k in st.pop("late_kills", []):   # the stop's Secret deletes land after the recreate was decided
+            st.get("secrets", {}).pop(k, None)
+        st["uid_counter"] = st.get("uid_counter", 0) + 1
+        obj["metadata"]["uid"] = "uid-%d" % st["uid_counter"]
+        plan = st.get("plan", [])   # per-create outcomes: "race" (event), "vanish" (Pending, gone at its second get), "race_vanish" (both), else ok
+        step = plan.pop(0) if plan else None
+        st["plan"] = plan
+        if step in ("vanish", "race_vanish") or (step or "").startswith("vanish:"):
+            obj["vanish_after_get"] = True
+            # "vanish:pw,run": an outside deletion (a stop, the reaper) takes these Secrets too, at the moment the pod goes
+            obj["vanish_kills"] = [k for k in (step.split(":", 1)[1].split(",") if ":" in step else []) if k]
+        event = None   # a sandbox failure the cluster records for THIS pod object (events outlive a deleted pod, as on a real cluster)
+        if step in ("race", "race_vanish"):
+            event = "RuntimeClass handler sysbox-runc does not support user namespaces: the handler sysbox-runc is not known"
+        elif st.get("race_creates", 0) > 0:   # the next N pod creates hit the fresh-node race
+            st["race_creates"] -= 1
+            event = "RuntimeClass handler sysbox-runc does not support user namespaces: the handler sysbox-runc is not known"
+        elif st.get("other_failure"):
+            event = st["other_failure"]
+        obj["status"] = {"phase": "Pending" if st.get("never_ready") or event or step == "never_ready_pod" or (step or "").startswith("vanish") and step != "race_vanish" else "Running",
+                         "conditions": [] if st.get("never_ready") or event or step == "never_ready_pod" or (step or "").startswith("vanish") and step != "race_vanish" else [{"type": "Ready", "status": "True"}], "podIP": "10.1.2.3"}
+        if event:
+            st.setdefault("events", []).append({"reason": "FailedCreatePodSandBox", "message": "Failed to create pod sandbox: " + event,
+                                                "involvedObject": {"kind": "Pod", "name": obj["metadata"]["name"], "uid": obj["metadata"]["uid"]}})
+        st.setdefault("pods", {})[obj["metadata"]["name"]] = obj
+    save()
+elif cmd == "create" and args[1:3] == ["secret", "generic"]:
+    if st.get("fail_secret"):
+        print("Error from server (Forbidden): secrets is forbidden", file=sys.stderr); sys.exit(1)
+    if args[3] in st.get("secrets", {}):
+        exists('secrets "%s"' % args[3])
+    data = {}
+    for a in args[4:]:  # --from-file=KEY=PATH: PATH must be /dev/stdin (a value is never a file name); keep sizes and keys only
+        key, fpath = a[len("--from-file="):].split("=", 1)
+        assert fpath == "/dev/stdin", "a run secret must come from stdin"
+        body = sys.stdin.read()
+        with open(path + ".stdin", "a") as f:  # stdin of 'create secret' is recorded apart from argv
+            f.write(body + "\n")
+        data[key] = len(body)
+        st.setdefault("secret_bodies", {}).setdefault(args[3], {})[key] = body
+    st.setdefault("secrets", {})[args[3]] = 1
+    st.setdefault("secret_labels", {}).pop(args[3], None)   # a new Secret starts without labels
+    st.setdefault("secret_keys", {})[args[3]] = data
+    save()
+elif cmd == "patch" and args[1] == "secret":
+    assert "--patch-file=/dev/stdin" in args, "a patch must come from stdin"
+    body = sys.stdin.read()
+    with open(path + ".stdin", "a") as f:
+        f.write(body + "\n")
+    import base64
+    patch = json.loads(body)
+    pm = patch.get("metadata", {})
+    if args[2] not in st.get("secrets", {}): missing('secrets "%s"' % args[2])
+    if "uid" in pm and pm["uid"] != st.get("secret_meta", {}).get(args[2], {}).get("uid"):
+        sys.stderr.write('Error from server (Conflict): Precondition failed: UID in precondition: %s, UID in object meta: other\n' % pm["uid"]); sys.exit(1)
+    if "resourceVersion" in pm and str(pm["resourceVersion"]) != str(st.get("secret_rv", {}).get(args[2], 1)):
+        sys.stderr.write('Error from server (Conflict): Operation cannot be fulfilled on secrets "%s": the object has been modified\n' % args[2]); sys.exit(1)
+    if st.get("patch_noop"):   # a patch the cluster answers and does not apply (the launcher must not believe it)
+        sys.exit(0)
+    for k, v in list(patch.get("data", {}).items()):
+        if v is None:   # a merge patch with null removes the key
+            st.get("secret_bodies", {}).get(args[2], {}).pop(k, None); st.get("secret_keys", {}).get(args[2], {}).pop(k, None); patch["data"].pop(k); continue
+        st.setdefault("secret_keys", {}).setdefault(args[2], {})[k] = len(base64.b64decode(v))
+        st.setdefault("secret_bodies", {}).setdefault(args[2], {})[k] = base64.b64decode(v).decode()
+    if patch.get("metadata", {}).get("annotations"):   # a merge patch of metadata.annotations
+        st.setdefault("secret_meta", {}).setdefault(args[2], {}).setdefault("annotations", {}).update(patch["metadata"]["annotations"])
+    st.setdefault("secret_rv", {})[args[2]] = st.get("secret_rv", {}).get(args[2], 1) + 1   # every write moves the resourceVersion
+    save()
+elif cmd == "label" and args[1] == "secret":
+    st.setdefault("secret_labels", {})[args[2]] = dict(kv.split("=", 1) for kv in args[3:])
+    if not st.get("label_keeps_rv"): st.setdefault("secret_rv", {})[args[2]] = st.get("secret_rv", {}).get(args[2], 1) + 1
+    save()
+elif cmd == "port-forward":  # become the stub headless server on the local port, so the caller can end us
+    sys.path.insert(0, os.path.join(HERE, "..", "..", "worker", "tests"))
+    import stub_support
+    stub_support.exec_stub(args[2].split(":")[0])
+elif cmd == "get" and args[1] == "secret":
+    if args[2] not in st.get("secrets", {}): missing('secrets "%s"' % args[2])
+    meta = {"name": args[2], "labels": st.get("secret_labels", {}).get(args[2], {}), "resourceVersion": str(st.get("secret_rv", {}).get(args[2], 1))}
+    meta.update(st.get("secret_meta", {}).get(args[2], {}))   # a test may give it a creationTimestamp; a patch adds annotations
+    import base64 as _b64
+    print(json.dumps({"metadata": meta, "data": {k: _b64.b64encode(v.encode()).decode() for k, v in st.get("secret_bodies", {}).get(args[2], {}).items()}}))
+elif cmd == "get" and args[1] == "events":
+    name = args[3].split("involvedObject.name=")[1]
+    print(json.dumps({"items": [e for e in st.get("events", []) if e["involvedObject"]["name"] == name]}))
+elif cmd == "get" and args[1] == "statefulset":
+    if st.get("sts_get_stdout") is not None or st.get("sts_get_stderr") is not None:   # a planted answer, whatever the name (the near-miss table)
+        sys.stdout.write(st.get("sts_get_stdout") or ""); sys.stderr.write(st.get("sts_get_stderr") or ""); sys.exit(st.get("sts_get_code", 1))
+    if args[2] not in st.get("sts", {}): missing('statefulsets.apps "%s"' % args[2])
+    print(json.dumps(st["sts"][args[2]]))
+elif cmd == "get" and args[1] == "statefulsets":
+    if st.get("sts_list_fail"):
+        print('Error from server (Forbidden): statefulsets.apps is forbidden: User "cw-operator" cannot list resource "statefulsets" in API group "apps" in the namespace "cw"', file=sys.stderr); sys.exit(1)
+    items = list(st.get("sts", {}).values())
+    if "-l" in args:
+        k, v = args[args.index("-l") + 1].split("=", 1)
+        items = [s for s in items if s["metadata"].get("labels", {}).get(k) == v]
+    print(json.dumps({"items": items}))
+elif cmd == "get" and args[1] == "pod":
+    if args[2] not in st.get("pods", {}) or st.get("hide_pod"): missing('pods "%s"' % args[2])   # hide_pod: the pod was never visible to a get
+    pod = st["pods"][args[2]]
+    if pod.get("vanish_after_get"):   # the pod is seen once, then the object is gone (the runtime restart on a fresh node)
+        if pod.get("seen_once"):
+            del st["pods"][args[2]]
+            for k in pod.get("vanish_kills", []):
+                if k.startswith("swap-"):   # a Secret of the same name that carries another run's id
+                    st.setdefault("secret_labels", {})[args[2] + "-" + k[5:]] = {"cw/run-id": "ffffffffffffffff"}
+                elif k.startswith("late-"):   # a stop in flight: the Secrets go on the NEXT call after the pod's
+                    st.setdefault("late_kills", []).append(args[2] + "-" + k[5:])
+                elif k.startswith("ready-"):   # a stop in flight: the Secrets go on the first get that sees the next pod Running
+                    st.setdefault("ready_kills", []).append(args[2] + "-" + k[6:])
+                else:
+                    st.get("secrets", {}).pop(args[2] + "-" + k, None)
+            save(); missing('pods "%s"' % args[2])
+        pod["seen_once"] = True; save()
+    if pod.get("status", {}).get("phase") == "Running" and st.get("ready_kills"):
+        for k in st.pop("ready_kills"):
+            st.get("secrets", {}).pop(k, None)
+        save()
+    print(json.dumps(dict(pod, metadata=dict({"uid": "uid-%s" % args[2]}, **pod["metadata"]))))   # a planted pod has the uid a real one always has
+    if st.get("swap_after_get"):   # the pod is replaced right after the read (the millisecond between a read and a delete)
+        st["uid_counter"] = st.get("uid_counter", 0) + 1
+        st["pods"][args[2]] = {"metadata": {"name": args[2], "uid": "uid-new-%d" % st["uid_counter"], "annotations": {"cw/run-id": st.pop("swap_after_get"), "cw/started": "2026-01-01T00:00:00Z", "cw/shape": "S"}},
+                               "status": {"phase": "Running"}}
+        save()
+elif cmd == "get" and args[1] == "pods":
+    items = list(st.get("pods", {}).values())
+    if "-l" in args:  # honour a label selector `key=value`
+        k, v = args[args.index("-l") + 1].split("=", 1)
+        items = [p for p in items if p["metadata"].get("labels", {}).get(k) == v]
+    print(json.dumps({"items": items}))
+elif cmd == "get" and args[1] == "nodes":
+    # the nodes of the cluster: the summary reads their pool label, their size label and their creation time. A login without `list` on
+    # nodes is refused by the API server, exactly as a real one is.
+    if st.get("fail_nodes"):
+        print("Error from server (Forbidden): nodes is forbidden: the login may not list the nodes of the cluster", file=sys.stderr); sys.exit(1)
+    print(json.dumps({"items": st.get("nodes", [])}))
+elif cmd == "create" and args[1:2] == ["token"]:
+    # the narrow login's token: the switchboard mints one per command. A fake value, never a real credential.
+    print(st.get("token", "fake-cluster-token"))
+elif cmd == "patch" and args[1] == "pod":
+    assert "--patch-file=/dev/stdin" in args, "a patch must come from stdin"
+    patch = json.loads(sys.stdin.read())
+    pod = st.get("pods", {}).get(args[2])
+    if pod is None: missing('pods "%s"' % args[2])
+    real_uid = pod["metadata"].get("uid") or "uid-%s" % args[2]
+    if "uid" in patch.get("metadata", {}) and patch["metadata"]["uid"] != real_uid:
+        sys.stderr.write('Error from server (Conflict): Precondition failed: UID in precondition: %s, UID in object meta: %s\n' % (patch["metadata"]["uid"], real_uid)); sys.exit(1)
+    pod["metadata"].setdefault("annotations", {}).update(patch["metadata"].get("annotations", {}))
+    save()
+elif cmd == "delete" and args[1] == "--raw":   # a delete bound to a uid (DeleteOptions preconditions)
+    name = args[2].rsplit("/", 1)[1]
+    opts = json.loads(sys.stdin.read())
+    pod = st.get("pods", {}).get(name)
+    if pod is None: missing('pods "%s"' % name)
+    real_uid = pod["metadata"].get("uid") or "uid-%s" % name
+    if opts.get("preconditions", {}).get("uid") not in (None, real_uid):
+        sys.stderr.write('Error from server (Conflict): Precondition failed: UID in precondition: %s, UID in object meta: %s\n' % (opts["preconditions"]["uid"], real_uid)); sys.exit(1)
+    del st["pods"][name]
+    sts_recreate(pod)
+    save()
+elif cmd == "delete" and args[1] == "statefulset":
+    name = args[2]
+    st.setdefault("sts_deletes", []).append(name)
+    if st.get("sts_delete_hang"):   # the delete does not finish within its timeout: kubectl says so and the object stays
+        save(); print('error: timed out waiting for the condition on statefulsets/%s' % name, file=sys.stderr); sys.exit(1)
+    st.get("sts", {}).pop(name, None)
+    st.get("pods", {}).pop(name + "-0", None)   # its pod goes with it
+    save()
+elif cmd == "delete" and args[1] == "pod" and st.get("pods", {}).get(args[2], {}).get("metadata", {}).get("ownerReferences"):   # a pod with an owner reference comes back
+    sts_recreate(st["pods"].pop(args[2]))
+    save()
+elif cmd == "delete":
+    kind, name = args[1], args[2]
+    (st.get("pods" if kind == "pod" else "secrets", {})).pop(name, None)
+    if kind == "secret": st.get("secret_labels", {}).pop(name, None)
+    save()
+elif cmd == "exec":
+    name, tool = args[1], args[3]
+    if tool in ("ls", "cat", "git") and os.environ.get("FAKE_KUBE_EXEC_SLEEP"):   # a slow read: the record's calls only, never the end hook
+        import time
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        time.sleep(float(os.environ["FAKE_KUBE_EXEC_SLEEP"]))
+        fcntl.flock(lock, fcntl.LOCK_EX)
+    if tool == "cw-worker-activity":
+        print(json.dumps(st["activity"][name]))
+    elif tool == "ls":   # /run/cw of the pod: the password and the run secrets, as the mounts name them
+        print("server-password")
+        for k in st.get("secret_bodies", {}).get(name + "-run", {}): print(k)
+    elif tool == "cat":
+        fname = args[4].rsplit("/", 1)[1]
+        bodies = st.get("secret_bodies", {})
+        body = bodies.get(name + "-pw", {}).get("password") if fname == "server-password" else bodies.get(name + "-run", {}).get(fname)
+        if body is None:
+            print("cat: No such file", file=sys.stderr); sys.exit(1)
+        sys.stdout.write(body)
+    elif tool == "sh":   # the report read: the script must refuse a link or a non-regular file, as the real one does
+        script, path = args[5], args[7]
+        fs = st.get("report_fs", {}).get(name)   # {"type": file|symlink|dir, "content": ..., "target": what a followed link reaches}
+        if fs is None and name in st.get("report", {}):
+            fs = {"type": "file", "content": st["report"][name]}
+        if fs is None:
+            print("head: cannot open '%s' for reading: No such file or directory" % path, file=sys.stderr); sys.exit(1)
+        if fs["type"] != "file" and "-L" in script:
+            print("not a regular file", file=sys.stderr); sys.exit(3)
+        sys.stdout.write(fs["content"] if fs["type"] == "file" else fs.get("target", ""))
+    elif tool == "git":
+        if st.get("head_sha"): print(st["head_sha"])
+        else: sys.exit(1)
+    elif tool == "cw-end-hook" and st.get("swap_pod_during_hook"):   # the hook runs, and meanwhile the next run's pod takes the name
+        st["uid_counter"] = st.get("uid_counter", 0) + 1
+        st["pods"][name] = {"metadata": {"name": name, "uid": "uid-new-%d" % st["uid_counter"],
+                                         "annotations": {"cw/run-id": st["swap_pod_during_hook"], "cw/started": "2026-01-01T00:00:00Z", "cw/shape": "S"}},
+                            "status": {"phase": "Running"}}
+        if st.get("swap_secrets"):   # ... with its per-run Secrets
+            for suffix in ("-pw", "-run"):
+                st.setdefault("secrets", {})[name + suffix] = 1
+                st.setdefault("secret_labels", {})[name + suffix] = {"cw/run-id": st["swap_pod_during_hook"]}
+        save()
+        print(json.dumps(st.get("hook_result_after_swap", {"pushed": True, "wip_branch": "w/wip"})))
+        if st.get("hook_fails_after_swap"): sys.exit(1)
+    elif tool == "cw-end-hook" and st.get("hook_result"):  # a canned end hook answer
+        print(json.dumps(st["hook_result"]))
+        if st["hook_result"].get("error"): sys.exit(1)
+    elif tool == "cw-end-hook":
+        env = dict(os.environ, **st["hook_env"])
+        p = subprocess.run([sys.executable, os.path.join(HERE, "..", "end_hook.py")], env=env, capture_output=True, text=True)
+        sys.stdout.write(p.stdout)
+        if p.returncode:
+            sys.stdout.write(p.stdout); sys.exit(p.returncode)
+else:
+    sys.exit("fake kubectl: unsupported " + " ".join(args))

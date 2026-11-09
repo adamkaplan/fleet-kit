@@ -1,0 +1,1 @@
+| `gate_budget.py` | 0 | the default inner budget of gates-check, derived from the gh shim's limit (#2215) | |

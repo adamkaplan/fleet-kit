@@ -1,0 +1,114 @@
+{
+  "id": "T1",
+  "title": "An orchestrator's report and awaiting-cos label are the Chief of Staff's to work, not yours, until it escalates them",
+  "problem": null,
+  "since_pr": 18,
+  "tiers": [
+    "offline"
+  ],
+  "tags": [],
+  "cast": {
+    "cos": {
+      "role": "chief-of-staff"
+    },
+    "platform": {
+      "role": "orchestrator",
+      "reports_to": "cos",
+      "charter": 1
+    }
+  },
+  "issues": {
+    "1": {
+      "intent": null
+    },
+    "2": {
+      "intent": "Add a health check",
+      "done_when": "GET /health returns 200",
+      "parent": 1
+    }
+  },
+  "steps": [
+    {
+      "at": "10s",
+      "actor": "platform",
+      "do": "report",
+      "state": "question",
+      "text": "Which database?",
+      "issue": 2,
+      "why": "The orchestrator needs a decision: it goes up to its boss, which has no boss"
+    },
+    {
+      "at": "15s",
+      "actor": "platform",
+      "do": "awaiting",
+      "issue": 2,
+      "on": true,
+      "label": "cos",
+      "title": "Which database?",
+      "why": "And on the issue, with the Chief of Staff's label: never the one that is yours"
+    },
+    {
+      "at": "45s",
+      "actor": "world",
+      "do": "wait",
+      "why": "The webhook and a pass have run"
+    },
+    {
+      "at": "60s",
+      "actor": "cos",
+      "do": "decide",
+      "action": "escalate",
+      "ref": "#2",
+      "reason": "The choice costs money: the owner decides",
+      "why": "No standing order covers it, so the Chief of Staff escalates"
+    },
+    {
+      "at": "90s",
+      "actor": "world",
+      "do": "wait"
+    }
+  ],
+  "expect": [
+    {
+      "name": "cos-works-both",
+      "that": "decisions",
+      "at": "45s",
+      "as": "cos",
+      "tier": "cos",
+      "count": 1,
+      "text": "Which database?"
+    },
+    {
+      "name": "not-yours-yet",
+      "that": "decisions",
+      "at": "45s",
+      "as": "you",
+      "count": 0
+    },
+    {
+      "name": "yours-once-escalated",
+      "that": "decisions",
+      "at": "90s",
+      "as": "you",
+      "count": 1,
+      "text": "Which database?"
+    },
+    {
+      "name": "labels-moved",
+      "that": "issue_labels",
+      "issue": 2,
+      "has": [
+        "user"
+      ],
+      "lacks": [
+        "cos"
+      ]
+    }
+  ],
+  "control": {
+    "fault": "tier-flat",
+    "fails": [
+      "not-yours-yet"
+    ]
+  }
+}

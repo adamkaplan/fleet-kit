@@ -1,0 +1,37 @@
+{
+  "id": "O5",
+  "title": "Two repos, two gh accounts, a charter each with different orders: each orchestrator gets only its own repo's orders",
+  "problem": 3,
+  "since_pr": 17,
+  "tiers": ["offline"],
+  "tags": ["multi-repo"],
+  "cast": {
+    "api-orch": {"role": "orchestrator", "charter": 1, "repo": "acme/api"},
+    "web-orch": {"role": "orchestrator", "charter": 1, "repo": "acme/web"}
+  },
+  "repos": {
+    "acme/api": {"account": "alice-bot"},
+    "acme/web": {"account": "acme-ci"}
+  },
+  "issues": {
+    "acme/api#1": {"intent": null, "authority": "approve deploys of the api"},
+    "acme/web#1": {"intent": null, "authority": "never touch the billing page"}
+  },
+  "steps": [
+    {"at": "0s", "actor": "you", "do": "away"},
+    {"at": "30s", "actor": "api-orch", "do": "turn", "lasts": "5s",
+     "why": "A first turn: the orders note, sent at the first pass, rides in front of it"},
+    {"at": "40s", "actor": "web-orch", "do": "turn", "lasts": "5s"},
+    {"at": "3m", "actor": "world", "do": "wait",
+     "why": "Each repo answers only to its own account's token: the same charter number 1 holds different orders in each"}
+  ],
+  "expect": [
+    {"name": "api-has-its-own", "that": "delivered", "to": "api-orch", "key": "orders:acme/api#1:*", "mode": "note",
+     "count": 1, "text": "approve deploys of the api"},
+    {"name": "web-has-its-own", "that": "delivered", "to": "web-orch", "key": "orders:acme/web#1:*", "mode": "note",
+     "count": 1, "text": "never touch the billing page"},
+    {"name": "api-has-only-its-own", "that": "message_count", "to": "api-orch", "count": 1},
+    {"name": "web-has-only-its-own", "that": "message_count", "to": "web-orch", "count": 1}
+  ],
+  "control": {"fault": "one-account", "fails": ["api-has-its-own", "web-has-its-own"]}
+}

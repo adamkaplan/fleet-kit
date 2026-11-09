@@ -1,0 +1,19 @@
+{
+ "audit": [
+  [
+   "github",
+   {
+    "error": "GitHub is read by the daemon: this process holds no hub, so the issues that wait on you are not listed"
+   }
+  ]
+ ],
+ "decisions": [
+  "first"
+ ],
+ "errors": [
+  {
+   "error": "GitHub is read by the daemon: this process holds no hub, so the issues that wait on you are not listed",
+   "source": "github"
+  }
+ ]
+}

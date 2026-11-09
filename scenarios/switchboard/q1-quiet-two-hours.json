@@ -1,0 +1,22 @@
+{
+  "id": "Q1",
+  "title": "Two hours with no events",
+  "problem": 3,
+  "since_pr": 4,
+  "tiers": ["offline"],
+  "cast": {
+    "platform": {"role": "orchestrator", "charter": 1},
+    "coder": {"role": "coder", "reports_to": "platform", "issue": 2}
+  },
+  "steps": [
+    {"at": "0s", "actor": "you", "do": "message", "to": "platform", "text": "how is the health check going?"},
+    {"at": "2h", "actor": "world", "do": "wait",
+     "why": "Two simulated hours: the worker does nothing, and nothing arrives. The Lab tier (30 minutes) is not built: its control is the old typed heartbeat"}
+  ],
+  "expect": [
+    {"name": "no-turns", "that": "no_machine_turn", "agent": "platform",
+     "why": "No timer wakes the orchestrator; only your one message ran a model call"},
+    {"name": "no-messages", "that": "message_count", "to": "platform", "count": 0}
+  ],
+  "control": {"baseline": "timer-heartbeat", "fails": ["no-turns"]}
+}
