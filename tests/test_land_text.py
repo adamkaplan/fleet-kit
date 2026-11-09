@@ -59,7 +59,7 @@ class TestLandText(unittest.TestCase):
         self.assertFalse(uses({"land_repos": ["a/b"]}, "a/c"))
         self.assertFalse(uses({"land_repos": ["acme/*"]}, "janus-infra/widget"))
         self.assertFalse(uses({}, ""))
-        for bad in ("janus-infra/*", 5, [1], None):   # a malformed value fails to the default, never to nobody
+        for bad in ("janus-infra/*", 5, [1], None, ["nowhere"], ["janus-infra/x"] * 201):   # a malformed value fails to the default, never to nobody
             self.assertTrue(uses({"land_repos": bad}, "janus-infra/x"), bad)
 
     def test_setup_text_without_the_marker_is_returned_unchanged(self):

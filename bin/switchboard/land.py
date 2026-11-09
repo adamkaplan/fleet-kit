@@ -16,12 +16,10 @@ def uses_spire_land(config, repo):
         return False
     raw = (config or {}).get(LAND_REPOS_KEY) if isinstance(config, dict) else None
     entries = LAND_REPOS_DEFAULT if raw is None else raw
-    if not isinstance(entries, (list, tuple)) or not all(isinstance(e, str) for e in entries):
+    if not isinstance(entries, (list, tuple)) or len(entries) > LAND_REPOS_MAX or not all(isinstance(e, str) and _LAND_ENTRY.fullmatch(e) for e in entries):
         entries = LAND_REPOS_DEFAULT   # a malformed value fails to the default, never to nobody (the loader refuses it first)
     owner, _, name = repo.lower().partition("/")
     for entry in entries:
-        if not isinstance(entry, str) or not _LAND_ENTRY.fullmatch(entry):
-            continue
         e_owner, _, e_name = entry.lower().partition("/")
         if e_owner == owner and e_name in ("*", name):
             return True
