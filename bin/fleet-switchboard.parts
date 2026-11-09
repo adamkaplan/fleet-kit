@@ -38,7 +38,6 @@ switchboard/standing_authority.py
 switchboard/work_moves.py
 switchboard/cockpit.py
 switchboard/launch_model.py
-switchboard/land.py
 switchboard/secret_spans.py
 switchboard/caches.py
 switchboard/bootstrap.py
@@ -63,3 +62,4 @@ switchboard/daemon_restart.py
 switchboard/labels_ensure.py
 switchboard/orders_cos.py
 switchboard/checkpoint_reminders.py
+switchboard/land.py
