@@ -24,7 +24,7 @@ PREFIX = "fl" + "eet"   # assembled from a fragment: the neutral-names scan of c
 SOURCE = os.path.join(ROOT, "skills", PREFIX + "-coordination", "operator-brief-header.txt")
 PLANTED = "planted-" + "Hq7Lz2" * 5   # a fake setting value
 SB = os.path.join(ROOT, "bin", PREFIX + "-switchboard")
-HEADER_OUTPUT_SHA256 = "79ee69b86fb787c543317ea9973a9c4ad2915ae2dcb494bb2dc8b6bbf7bc3002"   # the output at the commit before the change
+HEADER_OUTPUT_SHA256 = "884c08fda792fb02858fd35cabcf9182d52ab950d7692b65e346a0d1fcce547a"   # the output with the done-land rule (ask #2320)
 
 
 def read(path):
