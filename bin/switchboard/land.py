@@ -2,12 +2,12 @@
 # 'owner/*' globs; default ["janus-infra/*"]; an empty list = every repository on pull requests, the way back). Pure: no read, no call.
 
 LAND_REPOS_DEFAULT = ("janus-infra/*",)
-LAND_SETUP_LINE = ("- This repository lands with `spire land`, not a pull request: when done, commit, run `.spire/tool/bin/spire land` and report `landed <sha>`, "
-                   "or the exit code and what stopped it; exit 22 = held for a person: stop and say so. No branch pull request, PR body or explainer, and no in-pod review subagents (the council is the review).\n")
+LAND_SETUP_LINE = ("- This repository lands with `spire land`: when done, commit, run `.spire/tool/bin/spire land` and report `landed <sha>`, "
+                   "or the exit code and what stopped it; exit 22 = held for a person: stop and say so.\n")
 
 
 def uses_spire_land(config, repo):
-    """True when `repo` ('owner/repo') matches an entry of the config's `land_repos`. A missing key means the default; an empty list means nobody; a value that is not a list of text means the default."""
+    """True when `repo` ('owner/repo') matches an entry of the config's `land_repos`. A missing key means the default (so does a malformed value: the switch fails to its default, it is never silently off); an empty list means nobody; a value that is not a list of text means the default."""
     patterns = config.get("land_repos", LAND_REPOS_DEFAULT) if isinstance(config, dict) else LAND_REPOS_DEFAULT
     if not isinstance(patterns, (list, tuple)) or not all(isinstance(p, str) for p in patterns):
         patterns = LAND_REPOS_DEFAULT
