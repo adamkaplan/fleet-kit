@@ -23,4 +23,4 @@ def setup_with_land(preamble, config, repo):
     if not uses_spire_land(config, repo) or marker not in preamble:
         return preamble
     head, _, tail = preamble.rpartition(marker)
-    return head + "\n" + LAND_SETUP_LINE + marker + tail
+    return head + LAND_SETUP_LINE + marker + tail
