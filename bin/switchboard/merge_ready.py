@@ -84,7 +84,7 @@ def merge_ready_facts(engine, runner, repo, number):
                 lifted_notes.append("%s's block at %s lifted by their later approval at %s" % (who, at, str(later[-1].get("commit_id") or "")[:8] or "an unknown commit"))
                 continue
             failed.append("review: %s requested changes or blocked at %s%s" % (who, at, "" if at == head[:8] else " (an earlier head than %s)" % (head[:8] or "unknown")))
-    captain = (engine.config.get("captain_labels") or {}).get(repo)
+    captain = None if uses_spire_land(engine.config, repo) else (engine.config.get("captain_labels") or {}).get(repo)   # #2320: a `spire land` repository has no captain rule
     names = {str(l.get("name")) for l in _mr_dicts(pr.get("labels") or [])}
     if captain and captain not in names:
         failed.append("captain: the required captain label %s is missing" % captain)

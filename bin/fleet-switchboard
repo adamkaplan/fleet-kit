@@ -569,7 +569,7 @@ def _is_number(value):
 
 _WARNED_CONFIG = set()
 UNKNOWN_CONFIG = {}   # (section, key) -> the nearest known key or None: what `status` shows, kept for the life of the process
-TOP_LEVEL_EXTRA_KEYS = {"worktree_reclaim", "orphan_reaper", "order_notice_burst_minutes", "external_decisions", "friction_wake", "blocked_alert", "sweep", "triage", "plan_evaluators", "red_ci_required", "default_branches", "plan_gates", "plan_review", "impact_hold", "load_alert", "source_budgets", "hold_labels", "captain_labels", "merge_base", "header_cache", "app_installations", "app_key_path", "app_key_command", "app_permissions", "app_api_base", "relay_holders"}
+TOP_LEVEL_EXTRA_KEYS = {"worktree_reclaim", "orphan_reaper", "order_notice_burst_minutes", "external_decisions", "friction_wake", "blocked_alert", "sweep", "triage", "plan_evaluators", "red_ci_required", "default_branches", "plan_gates", "plan_review", "impact_hold", "load_alert", "source_budgets", "hold_labels", "captain_labels", "merge_base", "header_cache", "app_installations", "app_key_path", "app_key_command", "app_permissions", "app_api_base", "relay_holders", "land_repos"}
 
 
 CONFIG_DECLARATION_TEXT = re.compile(rb'^[ \t]*CONFIG_KEY[ \t]*(?::[^=\n]*)?=[ \t]*[\'"]([^\'"\n]*)[\'"]', re.M)   # only the fallback for a file that does not parse
@@ -828,6 +828,7 @@ def validate_config(raw, source="config"):
     validate_hold_labels_config(config, source)  # #376
     validate_captain_labels(config, source)
     validate_merge_base(config, source)
+    validate_land_repos(config, source)   # #2320
     validate_app_config(config, source)  # #609
     return config
 
@@ -17646,6 +17647,8 @@ def impact_would_hold_pass(engine, now):
     unjudged, live, heads = 0, set(), {}
     for key, (_, listed) in sorted(state.lists.items()):
         ours_prs = applied_for_repo(ours_applied, key)
+        if not ours_prs and uses_spire_land(engine.config, key):   # #2320: a `spire land` repository has no pull request to hold (a hold this daemon already put on one is still judged, so it can be released)
+            continue
         for record in sorted(listed, key=lambda r: judged_at.get((key, r.get("number")), 0) if isinstance(r, dict) else 0):   # the one judged longest ago first: a small budget never starves a pull request
             number = record.get("number") if isinstance(record, dict) else None
             head = ((record.get("head") or {}).get("sha")) if isinstance(record, dict) else None
@@ -18338,7 +18341,10 @@ def _gates_check(args, runner, now):
         runner = direct_read_runner(runner or subprocess.run, repo, config)   # #2215: a read goes to the real gh, not through the shim
         engine, _, _ = build_engine(runner, now, "cli", writable=True)
         engine.pr_view_once = {}   # #2215
-        if setting is None or not setting["enabled"]:
+        if uses_spire_land(config, repo):   # #2320: a `spire land` repository has no pull request: no gate G0 to G8 applies
+            payload = {"verdict": "allow", "reason": "spire land repository (land_repos): the merge gates do not apply"}
+            exit_code = plan_ledger.EXIT_ALLOW
+        elif setting is None or not setting["enabled"]:
             payload = {"verdict": "allow", "reason": "not opted in" if setting is None else "disabled (kill switch)"}
             exit_code = plan_ledger.EXIT_ALLOW
         elif gates_off_path(state).exists():
@@ -18497,6 +18503,11 @@ def cmd_merge_gate(args, runner, now):
         raise LedgerCommandError(str(err)) from None
     ref = "%s#%d" % (repo, number)
     config = load_runnable_config()
+    if uses_spire_land(config, repo):   # #2320: a `spire land` repository has no pull request to merge: the merge door asks no gate and takes no lock
+        print("%s lands by spire land (land_repos): no merge gate applies" % repo)
+        if args.json:
+            print(json.dumps({"allowed": True, "reason": "spire land repository (land_repos)", "head": None, "locked": False}, sort_keys=True))
+        return EXIT_OK
     conf = gate.settings(config)
     gh = merge_gate_gh(config, runner, repo)
     state = state_dir_path()
