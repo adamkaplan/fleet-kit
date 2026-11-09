@@ -16,6 +16,7 @@ export const DECISIONS_FILE = "decisions.json"
 export const WATCHED = [RECORDS_FILE, LOAD_FILE, PANE_FILE, DECISIONS_FILE]
 export const ALARM_FILE = "owner-alarm.json"   // the Chief of Staff's blocked alarm (written by the daemon's blocked report)
 export const ALARM_KEEP_MS = 3600_000          // an ended alarm's row is kept an hour
+export const ALARM_STALE_MS = 6 * 3600_000   // the daemon rewrites a block's record at every repeat (60 minutes by default): older and not ended is a daemon that stopped
 WATCHED.push(ALARM_FILE)
 export const RECORDS_STALE_MS = 600_000   // the daemon rewrites health-records.json at least every 5 minutes (its heartbeat)
 export const LOAD_STALE_MS = 3 * 3600_000 // load.json is rewritten only when its content changes: an hour or two quiet is normal
@@ -263,10 +264,10 @@ function cut(segs, width) {
 
 // All rows of the health section: a heading, then each block's two lines. [] when there is no workspace to show (nothing is drawn).
 export function healthRows(inputs, now, width) {
-  if (!inputs.__inner) { // the owner's alarm row above the block; any other input is drawn as before
-    const alarm = alarmRows(inputs.alarm, now, width)
-    if (alarm.length > 0) return [...alarm, ...healthRows({ ...inputs, __inner: true }, now, width)]
-  }
+  return [...alarmRows(inputs.alarm, now, width), ...workspaceRows(inputs, now, width)] // the owner's alarm above the block
+}
+
+function workspaceRows(inputs, now, width) {
   const blocks = buildBlocks(inputs, now)
   if (blocks.length === 0) return []
   const rows = [{ segs: [["Workspaces", "b"], [" · activity ≈ (calls or steps)", "m"]] }]
@@ -280,18 +281,24 @@ export function healthRows(inputs, now, width) {
   return rows
 }
 
-// One row for the Chief of Staff's blocked alarm (owner-alarm.json): a blocked record always; an ended one for an hour; a missing,
-// malformed or older record nothing.
+// The Chief of Staff's blocked alarm (owner-alarm.json): a headline, the line that says what it waits on, and the command that resumes it.
+// A blocked record shows while the daemon still rewrites it (ALARM_STALE_MS: the daemon stopped, or the agent is gone, otherwise it would
+// count up for ever); an ended one for an hour; a missing, malformed or older record shows nothing. The daemon's text is cleaned like every name.
 export function alarmRows(file, now, width) {
   const rec = obj(obj(file).alarm)
   const agent = clean(rec.agent, 24)
   if (!agent || !isNum(rec.since)) return []
-  let label
+  const rows = []
   if (rec.ended === null || rec.ended === undefined) {
-    label = `! ${agent} blocked ${Math.max(0, Math.floor((now - rec.since * 1000) / 60000))} minutes`
+    if (isNum(rec.at) && now - rec.at * 1000 > ALARM_STALE_MS) return []
+    rows.push(`! ${agent} blocked ${Math.max(0, Math.floor((now - rec.since * 1000) / 60000))} minutes`)
+    const text = clean(rec.text, 400)
+    if (text) rows.push(text)
+    const resume = clean(rec.resume, 120)
+    if (resume) rows.push(`resume: ${resume}`)
   } else {
     if (!isNum(rec.ended) || now - rec.ended * 1000 > ALARM_KEEP_MS) return []
-    label = `${agent} block ended (${Math.max(0, Math.floor((rec.ended - rec.since) / 60))} minutes)`
+    rows.push(`${agent} block ended (${Math.max(0, Math.floor((rec.ended - rec.since) / 60))} minutes)`)
   }
-  return [{ segs: [[label.slice(0, width), "b"]] }, { segs: [["", ""]] }]
+  return [...rows.map((label, i) => ({ segs: [[label.slice(0, width), i === 0 ? "b" : "m"]] })), { segs: [["", ""]] }]
 }

@@ -9493,8 +9493,8 @@ def owner_alarm_write(state_dir, change):
     """A note, never a precondition: a state file that cannot be written (a full disk, a bad file) costs the row, not the pass."""
     try:
         blocked_update(state_dir, OWNER_ALARM_STATE, change)
-    except (OSError, ValueError):
-        pass
+    except (OSError, ValueError) as error:
+        print("owner-alarm: not written (%s)" % type(error).__name__, file=sys.stderr)   # the row is lost, the pass goes on; the daemon's log says so
 
 
 def owner_alarm_start(state_dir, name, since_iso, now, text):
