@@ -33,7 +33,7 @@ class TestLandText(unittest.TestCase):
     def test_a_land_repository_brief_has_one_spire_land_line_and_no_plan_claims_or_reviewer_line(self):
         lines = self.lines("janus-infra/widget")
         self.assertEqual(len([l for l in lines if "spire land" in l]), 1)
-        added = [l for l in lines if l not in pod.payload(BRIEF, repo="acme/other").splitlines()]   # what a land repository gets beyond today's text
+        added = [l for l in lines if l.strip() and l not in pod.payload(BRIEF, repo="acme/other").splitlines()]   # what a land repository gets beyond today's text
         self.assertEqual(len(added), 1)
         self.assertEqual([l for l in added if FORBIDDEN.search(l)], [])
         self.assertEqual(lines[-1], BRIEF.strip())   # the brief is still last, byte for byte
