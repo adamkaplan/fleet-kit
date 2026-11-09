@@ -68,6 +68,20 @@ class TestCosBlockedOwner(Base):
         self.assertIsNotNone(self.record()["ended"])
         self.assertIn("block has ended", self.record()["text"])
 
+    def test_a_record_that_cannot_be_written_is_noted_and_the_report_still_goes_out(self):   # S6
+        world = self.build()
+        world.tick(1500)
+        real = sb.blocked_update
+        def refuse(state_dir, name, change):
+            if name == sb.OWNER_ALARM_STATE:
+                raise OSError("disk full")
+            return real(state_dir, name, change)
+        with mock.patch.object(sb, "blocked_update", refuse), mock.patch.object(sb.sys, "stderr") as err:
+            world.engine.run_pass()
+        self.assertIsNone(self.record())
+        self.assertEqual(len(self.lines()), 1, "the audited report is made without the record")
+        self.assertIn("owner-alarm: not written (OSError)", "".join(c.args[0] for c in err.write.call_args_list))
+
     def test_a_chief_of_staff_blocked_with_nothing_held_raises_nothing(self):   # S3
         world = self.build(held=False)
         world.tick(5000)

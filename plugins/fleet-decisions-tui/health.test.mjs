@@ -5,6 +5,7 @@ import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import { LEGEND, NOT_RECORDED, blockLines, buildBlocks, healthRows, loadInputs, sparkline, bars, toolSeries, concernsHealth } from "./health.mjs"
+import "./alarm.test.mjs" // the owner-alarm panel tests run with this file (CI names health.test.mjs)
 
 const NOW = Date.UTC(2026, 9, 14, 12, 30, 0)
 const pane = {
