@@ -103,6 +103,38 @@ class TestLandText(unittest.TestCase):
             self.assertTrue(sent, repo)
             self.assertEqual(len([l for l in "\n".join(sent).splitlines() if "spire land" in l]), expect, repo)
 
+    OLD_LINE = "- This repository lands with `spire land`: when done, commit, run `.spire/tool/bin/spire land` and report `landed <sha>`, or the exit code and what stopped it; exit 22 = held for a person: stop and say so.\n"   # the launch line before this fix
+
+    def detached_problems(self, text):
+        """What is wrong with a launch text's land step: a `spire land` run outside the detached `nohup sh -c '...' &` command, or no detached command, poll or progress report."""
+        detached = r"nohup sh -c '\.spire/tool/bin/spire land > /work/land\.log 2>&1;[^']*' > /dev/null 2>&1 &"
+        bad = []
+        rest = re.sub(detached, "", text)
+        bad += [("foreground run", m) for m in re.findall(r"\.spire/tool/bin/spire land", rest)]
+        for need in ("sleep 120; tail -n 20 /work/land.log", "land step"):
+            if need not in text:
+                bad.append(("missing", need))
+        if not re.search(detached, text):
+            bad.append(("missing", "the detached command"))
+        return bad
+
+    def test_the_launch_text_runs_land_detached_and_never_in_the_foreground(self):
+        self.assertEqual(self.detached_problems("\n".join(self.lines("janus-infra/widget", ON))), [])
+
+    def test_control_the_old_launch_line_through_the_real_path_is_caught(self):
+        with mock.patch.object(fpn.sb, "LAND_SETUP_LINE", self.OLD_LINE):
+            text = "\n".join(self.lines("janus-infra/widget", ON))
+        self.assertIn(("foreground run", ".spire/tool/bin/spire land"), self.detached_problems(text))
+        self.assertIn(("missing", "the detached command"), self.detached_problems(text))
+        self.assertIn(("foreground run", ".spire/tool/bin/spire land"), self.detached_problems(".spire/tool/bin/spire land > /work/land.log 2>&1 &"))   # redirected but not under nohup
+
+    def test_no_text_claims_a_janus_infra_default_for_land_repos(self):
+        for path in ("docs/switchboard.md", "skills/fleet-coordination/SKILL.md", "skills/fleet-review/SKILL.md", "skills/fleet-explainer/SKILL.md"):
+            for line in (ROOT / path).read_text().splitlines():
+                if "land_repos" in line or "spire land" in line:
+                    self.assertNotRegex(line, r"janus-infra/\*`?\s*by default|default `\[\"janus-infra", path)
+        self.assertEqual(fpn.sb.uses_spire_land({}, "janus-infra/widget"), False)   # the code's default: no repository
+
     def test_the_skills_and_the_brief_header_carry_the_rule(self):
         line = fpn.sb.LAND_SETUP_LINE
         self.assertIn("This repository lands with `spire land`", line)
@@ -110,6 +142,9 @@ class TestLandText(unittest.TestCase):
             text = (ROOT / path).read_text()
             self.assertIn(".spire/tool/bin/spire land", text, path)
             self.assertIn("exit 22 = held for a person: stop and say so", text, path)
+            self.assertIn("nohup sh -c '.spire/tool/bin/spire land > /work/land.log 2>&1;", text, path)
+            self.assertIn(fpn.sb.LAND_STEP, text, path)   # the step is the launcher's own, word for word (no drift)
+            self.assertEqual(self.detached_problems(text), [], path)
             self.assertIn("This repository lands with `spire land`", text, path)   # tied to the launcher's own marker
         self.assertIn(".spire/tool/bin/spire land", line)
 

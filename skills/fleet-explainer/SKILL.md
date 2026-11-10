@@ -47,4 +47,4 @@ No advice, no review findings, no "consider", no restating the PR's own text, no
 
 ## janus-infra repositories (spire land)
 
-When your setup text says "This repository lands with `spire land`" there is no pull request and no explainer block: commit, run `.spire/tool/bin/spire land`, report `landed <sha>` or the exit code; exit 22 = held for a person: stop and say so. Without that line, this skill stands.
+When your setup text says "This repository lands with `spire land`" there is no pull request and no explainer block: commit, run it DETACHED: `nohup sh -c '.spire/tool/bin/spire land > /work/land.log 2>&1; r=$?; { echo; echo "exit $r"; } >> /work/land.log' > /dev/null 2>&1 &`, then poll with short calls (`sleep 120; tail -n 20 /work/land.log`, each under 5 minutes) and report `fleet-switchboard report working "land step <where it is>"` about every 10 minutes; never one foreground `spire land` call (it is moved to a background shell and your turn ends unwoken). The run is over when the log's last line is `exit <code>`: report `landed <sha>` or the exit code and what stopped it; exit 22 = held for a person: stop and say so. Without that line, this skill stands.
