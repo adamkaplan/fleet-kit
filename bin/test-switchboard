@@ -9957,8 +9957,7 @@ class TestReminders(PR4Base):
         path = self.world.state / sb.REMINDERS
         path.write_text("{not json")
         report = self.world.engine.run_pass()   # #2243 (#2292): the reminders are released by the pass, not read as a fact source
-        self.assertIn(("reminders", "release"), [(e["subject"], e["step"]) for e in report["errors"]])
-        self.assertTrue(all("ReminderError" in e["error"] for e in report["errors"]) and "error" in [e["event"] for e in self.world.audit()], report["errors"])
+        self.assertTrue(("reminders", "release") in [(e["subject"], e["step"]) for e in report["errors"]] and all("ReminderError" in e["error"] for e in report["errors"]) and "error" in [e["event"] for e in self.world.audit()], report["errors"])
         with self.assertRaises(sb.ReminderError):
             self.remind()
         self.assertEqual(path.read_text(), "{not json")
