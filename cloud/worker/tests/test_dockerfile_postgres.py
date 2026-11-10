@@ -89,6 +89,8 @@ def problems(t):
             out.append(n + " comparison must come after the checkout and before any build step")
     if "||" in flat:
         out.append("check or chain masked")
+    if "--without-openssl" in flat:
+        out.append("the server was built without OpenSSL")
     code = "\n".join(x for x in blk.replace("\\\n", " ").split("\n") if not x.startswith("#"))
     if len(re.findall(r"sha256sum -c", code)) != 1:
         out.append("expected 1 sha256 check (PostgreSQL)")
@@ -183,6 +185,13 @@ class T(unittest.TestCase):
         for name, m in ms:
             self.assertNotEqual(m, t, name + " not applied")
             self.assertTrue(problems(m), name + " accepted")
+
+    def test_mutant_without_openssl_is_refused(self):
+        t = read(DF)
+        self.assertEqual(problems(t), [])  # control first: the real file is clean
+        self.assertNotIn("--without-openssl", t)
+        m = self.mut("--without-zlib", "--without-zlib --without-openssl")
+        self.assertIn("the server was built without OpenSSL", problems(m))
 
     def test_s12_scan_covers_opt_pg(self):
         t = read(DF)
