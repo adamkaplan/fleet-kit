@@ -20,8 +20,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PATH = "/chat/completions"
 UPSTREAM_SECONDS = 155        # the council's client gives up at 150 s: nothing is buffered past 160 s
-ANSWER_MAX_BYTES = 16 * 1024 * 1024
+ANSWER_MAX_BYTES = 4 * 1024 * 1024
+SOCKET_SECONDS = 30            # a client that stalls while sending its request is cut off
+MAX_IN_FLIGHT = 32             # more requests than this at once get 503
+BLOCKED_FIELDS = ("max_completion_tokens", "stream_options")   # fields that could ask for more than max_tokens allows
 SETTING_KEYS = ("models", "max_request_chars", "max_answer_tokens", "daily_budget", "provider_url", "key_file")
+LOOPBACK_RE = re.compile(r"http://(?:127\.0\.0\.1|localhost)(?::[0-9]{1,5})?(?:/.*)?")
 URL_RE = re.compile(r"https?://[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?(?::[0-9]{1,5})?(?:/[A-Za-z0-9._/-]*)?")
 
 
@@ -49,9 +53,28 @@ def load_settings(path):
             raise SettingsError("%s must be a whole number above 0" % key)
     if not (isinstance(data["provider_url"], str) and URL_RE.fullmatch(data["provider_url"])):
         raise SettingsError("provider_url must be an http or https URL without user, query or fragment")
+    if not data["provider_url"].startswith("https://") and not LOOPBACK_RE.fullmatch(data["provider_url"]):
+        raise SettingsError("provider_url must be https (http only for a loopback address): the key travels in it")
     if not (isinstance(data["key_file"], str) and os.path.isabs(data["key_file"])):
         raise SettingsError("key_file must be an absolute path")
     return data
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    """A redirect would carry the key's header to another host: none is followed (the 3xx is an error)."""
+    def redirect_request(self, *args, **kw):
+        return None
+
+
+def _no_duplicates(pairs):
+    keys = [k for k, _ in pairs]
+    if len(keys) != len(set(keys)):
+        raise ValueError("duplicate key")
+    return dict(pairs)
+
+
+def _no_constant(name):
+    raise ValueError("not a JSON number")
 
 
 class Gateway:
@@ -59,7 +82,8 @@ class Gateway:
         self.s = settings
         self.log = log or (lambda line: (sys.stderr.write(line + "\n"), sys.stderr.flush()))
         self.clock = clock or (lambda: datetime.datetime.now(datetime.timezone.utc).date())
-        self.opener = opener or urllib.request.build_opener()
+        self.opener = opener or urllib.request.build_opener(NoRedirect)
+        self.slots = threading.BoundedSemaphore(MAX_IN_FLIGHT)
         self.lock = threading.Lock()
         self.day, self.count = None, 0
 
@@ -80,13 +104,15 @@ class Gateway:
 
     def forward(self, body):
         """(status, answer bytes) from the provider; the key is added here and goes nowhere else."""
-        req = urllib.request.Request(self.s["provider_url"].rstrip("/") + PATH, data=body, method="POST",
-                                     headers={"Authorization": "Bearer " + self.key(), "content-type": "application/json"})
         try:
+            req = urllib.request.Request(self.s["provider_url"].rstrip("/") + PATH, data=body, method="POST",
+                                         headers={"Authorization": "Bearer " + self.key(), "content-type": "application/json"})
             with self.opener.open(req, timeout=UPSTREAM_SECONDS) as res:
                 return res.status, res.read(ANSWER_MAX_BYTES)
         except urllib.error.HTTPError as err:
-            return err.code, err.read(ANSWER_MAX_BYTES)
+            if err.code in (400, 404, 408, 409, 413, 422, 429) or err.code >= 500:
+                return err.code, ("the provider answered status %d" % err.code).encode()   # its own error text is not passed on
+            return 502, None   # a redirect, an authorization refusal: the provider's text may speak of the key
         except (OSError, ValueError):
             return 502, None
 
@@ -102,8 +128,8 @@ class Gateway:
         raw = read_body(length)
         try:
             text = raw.decode("utf-8")
-            data = json.loads(text)
-        except ValueError:
+            data = json.loads(text, object_pairs_hook=_no_duplicates, parse_constant=_no_constant)
+        except (ValueError, RecursionError):
             return 400, "the body is not JSON", None, "-", 0
         if len(text) > s["max_request_chars"]:
             return 413, "the request is over the limit of %d characters" % s["max_request_chars"], None, "-", 0
@@ -117,12 +143,15 @@ class Gateway:
             return 400, "max_tokens must be a whole number from 1 to %d" % s["max_answer_tokens"], None, model, 0
         if data.get("stream"):
             return 400, "streaming is not served", None, model, 0
+        if any(f in data for f in BLOCKED_FIELDS) or data.get("n", 1) != 1:
+            return 400, "a field that could raise the answer's size is not served", None, model, 0
         ok, used = self.take()
         if not ok:
             return 429, "the daily budget of %d requests is spent; it renews at 00:00 UTC" % s["daily_budget"], None, model, used
         status, answer = self.forward(raw)
-        if answer is None:
-            return 502, "the provider could not be reached", None, model, used
+        if answer is None or (status >= 400 and answer.startswith(b"the provider answered")):
+            note = answer.decode() if answer else "the provider could not be reached"
+            return (status if answer else 502), note, None, model, used
         return status, None, answer, model, used
 
 
@@ -130,14 +159,21 @@ def make_handler(gw):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
         server_version = "council-gateway"
+        timeout = SOCKET_SECONDS
 
         def log_message(self, *args):   # the library's own access line carries the path: silenced
             pass
 
         def serve(self):
             raw_length = self.headers.get("Content-Length")
-            length = int(raw_length) if raw_length and raw_length.isdigit() and len(raw_length) < 12 else None
-            status, reason, answer, model, used = gw.handle(self.command, self.path, length, self.rfile.read)
+            length = int(raw_length) if raw_length and raw_length.isascii() and raw_length.isdigit() and len(raw_length) < 12 else None
+            if gw.slots.acquire(blocking=False):
+                try:
+                    status, reason, answer, model, used = gw.handle(self.command, self.path, length, self.rfile.read)
+                finally:
+                    gw.slots.release()
+            else:
+                status, reason, answer, model, used = 503, "too many requests at once", None, "-", 0
             if answer is None:
                 answer = json.dumps({"error": {"message": reason}}).encode()
             self.close_connection = True   # a refusal may leave an unread body behind: one request per connection

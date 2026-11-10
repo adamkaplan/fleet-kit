@@ -666,5 +666,6 @@ The owner's steps (nothing here is run by the pull request):
 2. Set the defaults in the `council-gateway-settings` ConfigMap of the manifest: `provider_url` (replace `PROVIDER_HOST`), the three model ids, the
    daily budget (500), the request cap (400000 characters), the answer cap (24000 tokens), and put the image digest in place of `IMAGE_DIGEST`.
 3. Apply: `kubectl -n cw create configmap council-gateway-code --from-file=cloud/gateway/council_gateway.py`, then
-   `kubectl -n cw apply -f cloud/k8s/council-gateway.yaml`.
+   `kubectl -n cw label configmap council-gateway-code app.kubernetes.io/part-of=council-gateway`, then
+   `kubectl -n cw apply -f cloud/k8s/council-gateway.yaml`. Whoever can edit that ConfigMap changes the code that reads the key: keep it to the owner.
 4. Set `CW_COUNCIL_URL=http://council-gateway.cw.svc:8080` in the launcher's settings file (`cloud.env`).

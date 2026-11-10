@@ -35,6 +35,7 @@ class FakeProvider:
     """Records every request it receives (path, headers, body) and answers a fixed OpenAI-style answer."""
     def __init__(self):
         self.seen = []
+        self.mode = None   # None answers; ("redirect", url) answers 302; ("error", status) answers that status with a body that holds the key
         outer = self
 
         class H(BaseHTTPRequestHandler):
@@ -44,6 +45,19 @@ class FakeProvider:
             def do_POST(self):
                 body = self.rfile.read(int(self.headers["Content-Length"]))
                 outer.seen.append({"path": self.path, "headers": {k.lower(): v for k, v in self.headers.items()}, "body": body})
+                if outer.mode and outer.mode[0] == "redirect":
+                    self.send_response(302)
+                    self.send_header("Location", outer.mode[1])
+                    self.send_header("content-length", "0")
+                    self.end_headers()
+                    return
+                if outer.mode and outer.mode[0] == "error":
+                    out = json.dumps({"error": {"message": "bad key " + KEY}}).encode()
+                    self.send_response(outer.mode[1])
+                    self.send_header("content-length", str(len(out)))
+                    self.end_headers()
+                    self.wfile.write(out)
+                    return
                 out = json.dumps({"choices": [{"message": {"content": ANSWER_TEXT}, "finish_reason": "stop"}], "usage": {"completion_tokens": 3}}).encode()
                 self.send_response(200)
                 self.send_header("content-type", "application/json")
@@ -127,7 +141,7 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(seen["headers"]["authorization"], "Bearer " + KEY)
         self.assertEqual(seen["path"], "/v1/chat/completions")
         self.assertEqual(json.loads(seen["body"]), body)   # the body is passed through unchanged
-        self.assertEqual(sum(KEY in v for v in ["Bearer host-gateway", "application/json"]), 0)   # what the caller sent held no key
+        self.assertNotIn(KEY, answer)   # the answer to the caller holds no key
         self.assertNotIn("x-api-key", seen["headers"])
 
     def test_s2_control_without_the_caller_header(self):
@@ -182,6 +196,45 @@ class GatewayTests(unittest.TestCase):
         h.post(council_body(), path="/x")
         self.assertEqual(h.post(council_body())[0], 200)
 
+    def test_s3_duplicate_keys_nan_and_size_fields_are_refused(self):
+        h = Harness(self)
+        dup = b'{"model": "anthropic/claude-haiku-5.5", "max_tokens": 10, "max_tokens": 999999, "messages": []}'
+        self.assertEqual(h.post(None, raw=dup)[0], 400)
+        self.assertEqual(h.post(None, raw=b'{"model": "anthropic/claude-haiku-5.5", "max_tokens": NaN}')[0], 400)
+        self.assertEqual(h.post(None, raw=b"[" * 100000)[0], 400)
+        self.assertEqual(h.post(council_body(max_completion_tokens=999999))[0], 400)
+        self.assertEqual(h.post(council_body(n=5))[0], 400)
+        self.assertEqual(len(h.provider.seen), 0)
+
+    def test_s3_a_length_far_over_the_cap_is_refused_before_the_body_is_read(self):
+        h = Harness(self, max_chars=100)
+        self.assertEqual(h.post(None, raw=b"x" * 1000)[0], 413)
+        self.assertEqual(len(h.provider.seen), 0)
+
+    def test_s2_a_redirect_is_not_followed_and_the_key_goes_nowhere_else(self):
+        h = Harness(self)
+        other = FakeProvider()
+        self.addCleanup(other.close)
+        h.provider.mode = ("redirect", other.url.replace("/v1", "") + "/elsewhere")
+        self.assertEqual(h.post(council_body())[0], 502)
+        self.assertEqual(len(other.seen), 0)
+
+    def test_s5_provider_error_text_is_not_passed_on(self):
+        h = Harness(self)
+        h.provider.mode = ("error", 429)
+        status, text = h.post(council_body())
+        self.assertEqual(status, 429)
+        self.assertNotIn(KEY, text)
+        h.provider.mode = ("error", 401)
+        status, text = h.post(council_body())
+        self.assertEqual(status, 502)
+        self.assertNotIn(KEY, text)
+
+    def test_a_missing_key_file_answers_502_not_a_dropped_connection(self):
+        h = Harness(self)
+        os.remove(os.path.join(h.tmp, "key"))
+        self.assertEqual(h.post(council_body())[0], 502)
+
     def test_s5_log_has_one_line_per_request_and_no_body_or_key(self):
         check_log(self, GATEWAY)
 
@@ -225,7 +278,7 @@ class SettingsTests(unittest.TestCase):
                 json.dump(d, f)
             return p
         self.assertEqual(mod.load_settings(write(good))["daily_budget"], 500)
-        for key, bad in (("models", []), ("daily_budget", 0), ("provider_url", "ftp://x"), ("key_file", "relative"), ("max_request_chars", "9")):
+        for key, bad in (("provider_url", "http://provider.example/v1"), ("models", []), ("daily_budget", 0), ("provider_url", "ftp://x"), ("key_file", "relative"), ("max_request_chars", "9")):
             with self.assertRaises(mod.SettingsError):
                 mod.load_settings(write(dict(good, **{key: bad})))
         missing = dict(good)
