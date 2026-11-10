@@ -278,7 +278,7 @@ def order_problems(keys):
     return [k for k in MOVED_DENY_ORDER if keys.index(k) < last_allow]
 
 
-PINNED = {'guard.sh': 'ba4d51aa043d450a4832210fb6492295e7bd7c7e61a4abd2a70cc75baea19bca'}
+PINNED = {'guard.sh': '2aa92c336797d47437a4f039bbf3fa3129d61780482069c459e680f2d4c94371'}
 PINNED_JSON_WITHOUT_ADDED_ROWS = "c14522cff99b9223d881b9f80a3d3397f55ae15a5d6f12a2380b89c9de6fd4be"
 # Rows added to opencode-worker.json, in file order. A pin changes only in the ask whose approved plan names the rows:
 # Lower and capitalised method words after -X or --method are denied too (the glob is case sensitive; a mixed form such as pOsT is not covered here, the client refuses it).
