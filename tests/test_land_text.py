@@ -23,6 +23,7 @@ fpn.PodSessionStub.model_list = lambda self: [dict(zip(("providerID", "id"), fpn
 
 ROOT = Path(__file__).resolve().parent.parent
 BRIEF = "Build the thing.\n"
+ON = {"land_repos": ["janus-infra/*"]}   # the path is off until the key names a repository (#2327)
 FORBIDDEN = re.compile(r"PLAN|CLAIMS|review|\bPR\b|pull request|explainer", re.I)
 
 
@@ -31,7 +32,7 @@ class TestLandText(unittest.TestCase):
         return pod.payload(BRIEF, repo=repo, config=config).splitlines()
 
     def test_a_land_repository_brief_has_one_spire_land_line_and_no_plan_claims_or_reviewer_line(self):
-        lines = self.lines("janus-infra/widget")
+        lines = self.lines("janus-infra/widget", ON)
         self.assertEqual(len([l for l in lines if "spire land" in l]), 1)
         added = [l for l in lines if l.strip() and l not in pod.payload(BRIEF, repo="janus-infra/widget", config={"land_repos": []}).splitlines()]   # what a land repository gets beyond today's text
         self.assertTrue([l for l in added if "spire land" in l])
@@ -49,18 +50,19 @@ class TestLandText(unittest.TestCase):
 
     def test_the_helper(self):
         uses = fpn.sb.uses_spire_land
-        self.assertTrue(uses({}, "janus-infra/x"))
-        self.assertTrue(uses({}, "JANUS-infra/Widget"))
-        self.assertFalse(uses({}, "janus-infra/"))
-        self.assertFalse(uses({}, "janus-infra-x/y"))
-        self.assertFalse(uses({}, "acme/other"))
+        self.assertFalse(uses({}, "janus-infra/x"), "absent key: off")
+        self.assertTrue(uses(ON, "janus-infra/x"))
+        self.assertTrue(uses(ON, "JANUS-infra/Widget"))
+        self.assertFalse(uses(ON, "janus-infra/"))
+        self.assertFalse(uses(ON, "janus-infra-x/y"))
+        self.assertFalse(uses(ON, "acme/other"))
         self.assertFalse(uses({"land_repos": []}, "janus-infra/x"))
         self.assertTrue(uses({"land_repos": ["a/b"]}, "a/b"))
         self.assertFalse(uses({"land_repos": ["a/b"]}, "a/c"))
         self.assertFalse(uses({"land_repos": ["acme/*"]}, "janus-infra/widget"))
         self.assertFalse(uses({}, ""))
-        for bad in ("janus-infra/*", 5, [1], None, ["nowhere"], ["janus-infra/x"] * 201):   # a malformed value fails to the default, never to nobody
-            self.assertTrue(uses({"land_repos": bad}, "janus-infra/x"), bad)
+        for bad in ("janus-infra/*", 5, [1], None, ["nowhere"], ["janus-infra/x"] * 201):   # a malformed value fails to the default (off)
+            self.assertFalse(uses({"land_repos": bad}, "janus-infra/x"), bad)
 
     def test_setup_text_without_the_marker_is_returned_unchanged(self):
         self.assertEqual(fpn.sb.setup_with_land("no marker", {}, "janus-infra/x"), "no marker")
@@ -96,7 +98,7 @@ class TestLandText(unittest.TestCase):
                 (Path(state) / "coder5.brief").write_text(BRIEF)
                 stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
                 stack.enter_context(contextlib.redirect_stderr(io.StringIO()))
-                self.assertEqual(launch_again._finish_starting(args, None, types.SimpleNamespace(config={"call_timeout_seconds": 5}), state, record, repo, "b"), 0)
+                self.assertEqual(launch_again._finish_starting(args, None, types.SimpleNamespace(config=dict(ON, call_timeout_seconds=5)), state, record, repo, "b"), 0)
             self.assertTrue(sent, repo)
             self.assertEqual(len([l for l in "\n".join(sent).splitlines() if "spire land" in l]), expect, repo)
 

@@ -15,7 +15,7 @@ One block, between `<!-- pr-explainer:begin -->` and `<!-- pr-explainer:end -->`
 (`PLAN:`, `MERGE:`, `canon:`), so a gate that reads the first line still sees it:
 
 1. **Every PR: the why-block**, a short ```text block with exactly two lines: `before: ...` the behaviour as it was, `after: ...` the
-   behaviour now. Behaviour, not code: what a person or a caller sees, in plain words or two lines of pseudo-code.
+   behaviour now. Behaviour, not code: what a person or a caller sees, in plain words.
 
 ## Held pull requests
 
@@ -27,7 +27,7 @@ A PR held for the owner opens, right after the opening lines and in this order, 
 4. Optional: a real screenshot or rendered image of the actual screen, card or message, before and after. Never a box-and-arrow diagram.
 5. `## Questions for you`: a numbered list, each item one question ending `Recommendation: ...`; or the one line `Questions: none (reason)`.
 
-The rest of the body follows. A Mermaid diagram goes below, in the technical section for reviewers; it is not judged there unless it is the generated summary flowchart, which fails anywhere in a held body; in the top any diagram fails. `pr-explain --check` and gate `G6b` name each missing part and the question number that lacks its recommendation.
+The rest of the body follows. In the top any diagram fails; the generated summary flowchart fails anywhere in a held body. `pr-explain --check` and gate `G6b` name each missing part and the question that lacks its recommendation.
 
 ## The command
 
@@ -35,17 +35,16 @@ The rest of the body follows. A Mermaid diagram goes below, in the technical sec
 nothing.
 `--body-file F` (or `-` for the PR's own body) prints the whole new body with the block in **once**: a block already there is replaced,
 never doubled. Write it with your own `gh pr edit <n> --body-file ...`. `--check` judges the description a PR has: exactly one block, a
-real before and after (no `<placeholder>` left), and no generated summary flowchart: a body without any diagram passes.
+real before and after (no `<placeholder>` left), and no generated summary flowchart.
 
 ## Diagrams
 
-A Mermaid diagram appears only where it shows data flow, system design or component design, never at the top of a body and never as a summary of what changes, what it touches, what is irreversible and the risk. A real data-flow or component diagram goes below the top sections, where it explains something; the tool never writes one, and a body that holds the four-box summary flowchart (boxes `Changes:`, `Touches:`, `Irreversible:`, `Risk:`) fails `--check`.
+A Mermaid diagram appears only where it shows data flow, system design or component design, never at the top of a body and never as a summary of the change. It goes below the top sections; the tool never writes one, and a body that holds the four-box summary flowchart (boxes `Changes:`, `Touches:`, `Irreversible:`, `Risk:`) fails `--check`.
 
 ## What the explainer must not do
 
-No advice, no review findings, no "consider", no summary of the code's quality, no restating the PR's own text, no second block, no
-image or link inside the block. If the before or the after cannot be said in two lines, say so in the PR and say what is unclear; do not pad.
+No advice, no review findings, no "consider", no restating the PR's own text, no second block, no image or link inside the block. If the before or the after cannot be said in two lines, say so in the PR and say what is unclear; do not pad.
 
 ## janus-infra repositories (spire land)
 
-When your setup text says "This repository lands with `spire land`" there is no pull request and so no explainer block: done = commit, run `.spire/tool/bin/spire land`, report `landed <sha>` or the exit code; exit 22 = held for a person: stop and say so. No PR body, plan or claims line, no reviewer subagents. Without that line, the rules of this skill stay.
+When your setup text says "This repository lands with `spire land`" there is no pull request and no explainer block: commit, run `.spire/tool/bin/spire land`, report `landed <sha>` or the exit code; exit 22 = held for a person: stop and say so. Without that line, this skill stands.
