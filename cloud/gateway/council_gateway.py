@@ -14,6 +14,7 @@ import os
 import re
 import sys
 import threading
+import time
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -23,7 +24,9 @@ UPSTREAM_SECONDS = 155        # the council's client gives up at 150 s: nothing 
 ANSWER_MAX_BYTES = 4 * 1024 * 1024
 SOCKET_SECONDS = 30            # a client that stalls while sending its request is cut off
 MAX_IN_FLIGHT = 32             # more requests than this at once get 503
-BLOCKED_FIELDS = ("max_completion_tokens", "stream_options")   # fields that could ask for more than max_tokens allows
+READ_SECONDS = 30              # the whole request must arrive within this (a trickle holds nothing longer)
+ALLOWED_FIELDS = ("model", "temperature", "max_tokens", "reasoning", "messages", "tools")   # exactly what the council sends; any other field is refused
+EFFORT_RE = re.compile(r"[a-z]{1,16}")
 SETTING_KEYS = ("models", "max_request_chars", "max_answer_tokens", "daily_budget", "provider_url", "key_file")
 LOOPBACK_RE = re.compile(r"http://(?:127\.0\.0\.1|localhost)(?::[0-9]{1,5})?(?:/.*)?")
 URL_RE = re.compile(r"https?://[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?(?::[0-9]{1,5})?(?:/[A-Za-z0-9._/-]*)?")
@@ -82,7 +85,7 @@ class Gateway:
         self.s = settings
         self.log = log or (lambda line: (sys.stderr.write(line + "\n"), sys.stderr.flush()))
         self.clock = clock or (lambda: datetime.datetime.now(datetime.timezone.utc).date())
-        self.opener = opener or urllib.request.build_opener(NoRedirect)
+        self.opener = opener or urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect)
         self.slots = threading.BoundedSemaphore(MAX_IN_FLIGHT)
         self.lock = threading.Lock()
         self.day, self.count = None, 0
@@ -108,7 +111,8 @@ class Gateway:
             req = urllib.request.Request(self.s["provider_url"].rstrip("/") + PATH, data=body, method="POST",
                                          headers={"Authorization": "Bearer " + self.key(), "content-type": "application/json"})
             with self.opener.open(req, timeout=UPSTREAM_SECONDS) as res:
-                return res.status, res.read(ANSWER_MAX_BYTES)
+                answer = res.read(ANSWER_MAX_BYTES + 1)
+                return (res.status, answer) if len(answer) <= ANSWER_MAX_BYTES else (502, None)
         except urllib.error.HTTPError as err:
             if err.code in (400, 404, 408, 409, 413, 422, 429) or err.code >= 500:
                 return err.code, ("the provider answered status %d" % err.code).encode()   # its own error text is not passed on
@@ -125,7 +129,10 @@ class Gateway:
             return 400, "a Content-Length is required", None, "-", 0
         if length > s["max_request_chars"] * 4:
             return 413, "the request is over the limit of %d characters" % s["max_request_chars"], None, "-", 0
-        raw = read_body(length)
+        try:
+            raw = read_body(length)
+        except (OSError, TimeoutError):
+            return 408, "the request did not arrive in time", None, "-", 0
         try:
             text = raw.decode("utf-8")
             data = json.loads(text, object_pairs_hook=_no_duplicates, parse_constant=_no_constant)
@@ -143,12 +150,19 @@ class Gateway:
             return 400, "max_tokens must be a whole number from 1 to %d" % s["max_answer_tokens"], None, model, 0
         if data.get("stream"):
             return 400, "streaming is not served", None, model, 0
-        if any(f in data for f in BLOCKED_FIELDS) or data.get("n", 1) != 1:
-            return 400, "a field that could raise the answer's size is not served", None, model, 0
-        ok, used = self.take()
-        if not ok:
-            return 429, "the daily budget of %d requests is spent; it renews at 00:00 UTC" % s["daily_budget"], None, model, used
-        status, answer = self.forward(raw)
+        reasoning = data.get("reasoning", {})
+        if (any(f not in ALLOWED_FIELDS for f in data) or not isinstance(reasoning, dict) or set(reasoning) - {"effort"}
+                or not (isinstance(reasoning.get("effort", "low"), str) and EFFORT_RE.fullmatch(reasoning.get("effort", "low")))):
+            return 400, "the request holds a field the council does not send (allowed: %s; reasoning only effort)" % ", ".join(ALLOWED_FIELDS), None, model, 0
+        if not self.slots.acquire(blocking=False):
+            return 503, "too many requests at once", None, model, 0
+        try:
+            ok, used = self.take()
+            if not ok:
+                return 429, "the daily budget of %d requests is spent; it renews at 00:00 UTC" % s["daily_budget"], None, model, used
+            status, answer = self.forward(raw)
+        finally:
+            self.slots.release()
         if answer is None or (status >= 400 and answer.startswith(b"the provider answered")):
             note = answer.decode() if answer else "the provider could not be reached"
             return (status if answer else 502), note, None, model, used
@@ -164,16 +178,24 @@ def make_handler(gw):
         def log_message(self, *args):   # the library's own access line carries the path: silenced
             pass
 
+        def read_whole(self, n):
+            """n bytes of the request body within READ_SECONDS in all (not per read), else TimeoutError."""
+            deadline, got = time.monotonic() + READ_SECONDS, b""
+            while len(got) < n:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    raise TimeoutError
+                self.connection.settimeout(left)
+                chunk = self.rfile.read1(min(65536, n - len(got))) if hasattr(self.rfile, "read1") else self.rfile.read(min(65536, n - len(got)))
+                if not chunk:
+                    raise TimeoutError
+                got += chunk
+            return got
+
         def serve(self):
             raw_length = self.headers.get("Content-Length")
             length = int(raw_length) if raw_length and raw_length.isascii() and raw_length.isdigit() and len(raw_length) < 12 else None
-            if gw.slots.acquire(blocking=False):
-                try:
-                    status, reason, answer, model, used = gw.handle(self.command, self.path, length, self.rfile.read)
-                finally:
-                    gw.slots.release()
-            else:
-                status, reason, answer, model, used = 503, "too many requests at once", None, "-", 0
+            status, reason, answer, model, used = gw.handle(self.command, self.path, length, self.read_whole)
             if answer is None:
                 answer = json.dumps({"error": {"message": reason}}).encode()
             self.close_connection = True   # a refusal may leave an unread body behind: one request per connection

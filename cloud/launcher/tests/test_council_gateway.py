@@ -204,7 +204,20 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(h.post(None, raw=b"[" * 100000)[0], 400)
         self.assertEqual(h.post(council_body(max_completion_tokens=999999))[0], 400)
         self.assertEqual(h.post(council_body(n=5))[0], 400)
+        for extra in ({"models": ["x"]}, {"plugins": []}, {"provider": {}}, {"n": True}, {"tool_choice": "auto"}, {"reasoning": {"max_tokens": 9}}, {"reasoning": "high"}):
+            self.assertEqual(h.post(council_body(**extra))[0], 400, extra)
         self.assertEqual(len(h.provider.seen), 0)
+
+    def test_s3_a_trickling_request_is_cut_off_and_holds_no_slot(self):
+        import socket
+        h = Harness(self)
+        h.mod.READ_SECONDS = 1
+        sock = socket.create_connection(("127.0.0.1", h.server.server_address[1]), timeout=20)
+        sock.sendall(b"POST /chat/completions HTTP/1.1\r\nHost: x\r\nContent-Length: 500\r\n\r\n{")
+        self.assertIn(b" 408 ", sock.recv(4096).split(b"\r\n")[0])
+        sock.close()
+        self.assertEqual(h.post(council_body())[0], 200)
+        self.assertEqual(len(h.provider.seen), 1)
 
     def test_s3_a_length_far_over_the_cap_is_refused_before_the_body_is_read(self):
         h = Harness(self, max_chars=100)
