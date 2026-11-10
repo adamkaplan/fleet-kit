@@ -9,6 +9,8 @@
 # published. A registry login must already exist: this script never reads or prints a credential. The tool is chosen by
 # argument from a fixed list and run from an absolute path (from --tool-dir, else a fixed list of system directories): the
 # environment does not choose it. The staging digest must be a single-image (linux/amd64) manifest: an index or manifest list is refused (exit 3) before anything is exported.
+# WITH CW_SECRET_DIR set it logs in itself, with the registry token in the file acr-token of that private directory (0700, files 0600, one line
+# `username:password`, read by cloud/launcher/secret_files.py) into a private temporary docker config removed at exit; it runs no `az`.
 set -euo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 die() { echo "publish-image: $1" >&2; exit "${2:-3}"; }
@@ -48,6 +50,21 @@ digest_of() { # the digest of the staging tag NOW
   [[ $d =~ ^sha256:[0-9a-f]{64}$ ]] || return 1
   printf '%s' "$d"
 }
+
+if [ -n "${CW_SECRET_DIR:-}" ]; then   # the registry login: the token file, repository-scoped, never az
+  cred=$(python3 -I -c 'import sys; sys.path.insert(0, sys.argv[1]); import secret_files as k
+try: print(k.read(sys.argv[2], "acr-token", 4096))
+except k.SecretError as e: print(e.line, file=sys.stderr); sys.exit(1)' "$HERE/../launcher" "$CW_SECRET_DIR") || die "the registry token could not be read from the secret directory: nothing published"
+  [[ $cred == ?*:?* ]] || die "the secret file acr-token must hold username:password: nothing published"
+  mkdir -m 700 "$work/auth"; export DOCKER_CONFIG="$work/auth" REGISTRY_AUTH_FILE="$work/auth/auth.json"
+  for host in "${staging%%/*}" "${release%%/*}"; do   # the password goes in on standard input, never in an argument
+    case $tool in
+      crane) printf '%s' "${cred#*:}" | "$bin" auth login "$host" -u "${cred%%:*}" --password-stdin >/dev/null || die "registry login to $host failed: nothing published" ;;
+      skopeo) printf '%s' "${cred#*:}" | "$bin" login "$host" -u "${cred%%:*}" --password-stdin >/dev/null || die "registry login to $host failed: nothing published" ;;
+    esac
+  done
+  unset cred
+fi
 
 D=$(digest_of) || die "cannot resolve the digest of $staging: nothing published"
 src=${staging%:*}@$D

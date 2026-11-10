@@ -11,6 +11,13 @@ This image takes everything it needs from the environment and mounted files at s
 (`cloud/launcher/run_task.py`) runs one task end to end.
 The launcher's settings file may set `CW_AZURE_CONFIG_DIR` (an absolute path of an existing directory): the launcher then uses it as `AZURE_CONFIG_DIR` for every vault read of a launch, replacing the caller's own value; unset, nothing changes.
 
+The settings file may set `CW_SECRET_DIR` (an absolute path of a directory under the user's home: a real directory, not a link, owned by the running user, mode 0700): the launcher then reads the vault's secrets from files of that directory instead of `az`, in the interactive and the unattended route, and runs no program for it. One regular file per secret, named exactly as the vault's secret: `cw-app-id`, `cw-app-key` (used by `app_token.py`), the cluster login's kubeconfig (the file named by `CW_CLUSTER_ADMIN_SECRET` when that is set, else `cw-minter-kubeconfig`; `fk-cloud-workers-admin-kubeconfig` works by name) and the stack model secret (`cw-stack-model-key` or the name given). Each file is mode 0600, owned by the running user, not a link, at most 64 KiB, and holds the raw secret text (no encoding). A wrong mode, owner, link, size, a missing or empty file is refused as a vault error with a one-line reason naming the file, never its content. `CW_APP_ID_CMD`, `CW_APP_KEY_CMD` and `CW_CLUSTER_ADMIN_CMD` still win where they are honoured; unset, every read is as before. The stack read still needs `CW_VAULT_SUBSCRIPTION` and `CW_VAULT_NAME` in the settings file (its check is not changed), and the strict route still checks that a fixed `az` path exists (it never runs it). The image publish (`worker/publish-image.sh`) with `CW_SECRET_DIR` set in its environment logs in with `crane` using the file `acr-token` (one line `username:password`, the token of a scope map that allows `content/read` and `content/write` on `cw/worker` and `cw/worker-candidate` only), the password on standard input into a private temporary docker config, and runs no `az` after the build. The one-time creation of the token (with the owner's Azure session; give the token an expiry of at most one year):
+
+```sh
+az acr scope-map create -r acme-registry -n cw-publish --repository cw/worker content/read content/write --repository cw/worker-candidate content/read content/write
+az acr token create -r acme-registry -n cw-publish-token --scope-map cw-publish --expiration-in-days 365   # prints the password once: write it into the file `acr-token` with `umask 077`, never an argument
+```
+
 Cloud workers serve the organisation's repositories only; no task, test or demo of the tooling that runs the workers runs in a cloud worker.
 
 ## What is in the image

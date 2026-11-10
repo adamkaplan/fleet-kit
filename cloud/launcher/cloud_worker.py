@@ -1188,6 +1188,7 @@ PREFLIGHT_ENV_NAMES = (
     "CW_VAULT_SUBSCRIPTION",   # the vault the GitHub App's id and key are read from (app_token.py)
     "CW_VAULT_NAME",           # the same
     "CW_APP_ID_CMD",           # optional commands that print the App id and key instead of the vault (app_token.py)
+    "CW_SECRET_DIR",           # the private directory the App id and key are read from instead of the vault (a path, not a secret)
     "CW_APP_INSTALLATION_CMD",   # obsolete: accepted and ignored (the installation is looked up), so an old config still validates
     "CW_APP_KEY_CMD",
     "CW_TOKEN_SERVICE_URL",   # the service route of the mint (app_token.py): with these two the child reaches the service, not the vault
@@ -1854,6 +1855,33 @@ def settings_file_problem(env):
     return None
 
 
+def _secret_files():
+    """The module of the secret-directory read, imported when first needed (the token service's image copies cloud_worker.py without it)."""
+    return __import__("secret_files")   # by name, not an import statement: the image test counts the modules a statement names
+
+
+def secret_dir(env):
+    """The directory of the setting CW_SECRET_DIR, or "" when it is unset."""
+    return (env.get("CW_SECRET_DIR") or "").strip()
+
+
+def secret_ran(env, name, limit=1000000, trim=True):
+    """The secret-file read in the shape of a captured command: (0, value, "") or (1, "", "") when refused (the one line is printed, never a value)."""
+    module = _secret_files()
+    try:
+        return (0, module.read(secret_dir(env), name, limit, trim), "")
+    except module.SecretError as err:
+        print("secret directory: " + err.line, file=sys.stderr)
+        return (1, "", "")
+
+
+def secret_or_capture(settings, name, capture, argv, **kw):
+    """One changed line of bin/cloud_worker.py: the stack secret's read is the secret directory's when the setting is set, else `capture(argv, **kw)` as before."""
+    if secret_dir(settings):
+        return secret_ran(settings, name, kw.get("limit", 1000000))
+    return capture(argv, **kw)
+
+
 def cluster_token(env, duration, capture=None, now=None, recovery=None, strict=False):
     """THE cluster login: a token for the namespaced operator account, in memory, at most an hour.
 
@@ -1891,6 +1919,8 @@ def cluster_token(env, duration, capture=None, now=None, recovery=None, strict=F
             namespace, kubectl = env.get("CW_CLOUD_NAMESPACE", "cw"), env.get("CW_KUBECTL", "kubectl")
         if admin:
             argv = ["sh", "-c", admin]
+        elif secret_dir(env):   # the secret-file route, no az; CW_CLUSTER_ADMIN_SECRET names the file, else the minter kubeconfig `cw-minter-kubeconfig`
+            argv = None
         else:
             sub, vault = (env.get("CW_VAULT_SUBSCRIPTION") or "").strip(), (env.get("CW_VAULT_NAME") or "").strip()
             if not sub or not vault:
@@ -1899,6 +1929,8 @@ def cluster_token(env, duration, capture=None, now=None, recovery=None, strict=F
             argv = [az, "keyvault", "secret", "show", "--subscription", sub, "--vault-name", vault,
                     "--name", env.get("CW_CLUSTER_ADMIN_SECRET") or "cw-cluster-admin-kubeconfig", "--query", "value", "-o", "tsv"]
         def read():
+            if argv is None:
+                return secret_ran(env, env.get("CW_CLUSTER_ADMIN_SECRET") or "cw-minter-kubeconfig")
             return capture(argv, env=child_env)
         flight = VaultFlight.enter(env)   # BEFORE any vault call: a block (or a probe in flight) refuses here, at once
         ran = None
@@ -5066,6 +5098,7 @@ SETTINGS = (
     ("CW_VAULT_CHECK_DIR", False, "path"),         # the checkout the vault access check runs from; needed only after a vault firewall refusal (see vault_check_dir_problem)
     ("CW_MAX_PERSISTENT", False, "number"),        # the most persistent orchestrators (StatefulSets of the launcher's label) the namespace may hold (an integer 1 to 20; default 2)
     ("CW_VAULT_BLOCK_DURATION", False, "duration"),   # how long the launcher refuses vault commands after a vault firewall refusal (default 10m, 1m to 60m)
+    ("CW_SECRET_DIR", False, "path"),               # the private directory (0700, under the home) of 0600 files named as the vault's secrets; the vault reads then read the files, no az
     ("CW_AZURE_CONFIG_DIR", False, "path"),        # the az sign-in directory every vault read of a launch uses (replaces the caller's AZURE_CONFIG_DIR); an absolute existing directory
     ("CW_COUNCIL_URL", False, "name"),             # the address of the Copilot bridge front (cloud/k8s/copilot-bridge.yaml) a worker pod is told as COUNCIL_MODEL_URL; an address, never a key
 )
@@ -5239,6 +5272,7 @@ VALIDATORS = {
     "CW_VAULT_CHECK_DIR": ("an absolute path with no .. segment", _path_ok),
     "CW_MAX_PERSISTENT": ("an integer from 1 to 20", lambda v: bool(PERSISTENT_PATTERN.fullmatch(v)) and 1 <= int(v) <= PERSISTENT_MAX_LIMIT),
     "CW_VAULT_BLOCK_DURATION": ("a duration of 1 to 3 digits and m or h, from 1m to 60m (for example 10m or 1h)", _duration_ok),
+    "CW_SECRET_DIR": ("an absolute path of a directory under the home directory, with no .. segment", lambda v: _secret_files().dir_ok(v)),
     "CW_AZURE_CONFIG_DIR": ("an absolute path of an existing directory, with no .. segment", _dir_ok),
     "CW_COUNCIL_URL": ("an http or https URL: a host, an optional port, an optional /v1, no user, query or fragment", lambda v: bool(re.fullmatch(r"https?://[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?(?::[0-9]{1,5})?(?:/v1)?", v))),
 }
@@ -5348,6 +5382,8 @@ def apply_settings(env=None, path=None):
     if text is None:
         return "environment"
     values = parse_settings(text, path)
+    if re.search(r"^[ \t]*CW_SECRET_DIR=[ \t]*$", text, re.M):   # an empty value is refused (it would silently keep the vault route)
+        raise _bad(path, "sets CW_SECRET_DIR to nothing: it must be an absolute directory under the home directory")
     if re.search(r"^[ \t]*CW_AZURE_CONFIG_DIR=[ \t]*$", text, re.M):   # an empty value counts as not set elsewhere; for this one it is refused (ask #2335: it would silently keep the caller's sign-in)
         raise _bad(path, "sets CW_AZURE_CONFIG_DIR to nothing: it must be an absolute path of an existing directory")
     part = [k for k in STACK_REGISTRY_KEYS if k in values]
