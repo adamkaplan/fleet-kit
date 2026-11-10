@@ -48,10 +48,10 @@
 #CFG allowed | --get-regexp | --get-regexp user | a read
 #CFG allowed | --list | --list | a read
 #CFG allowed | --list --show-origin | --list --show-origin | a read
-# THE SCOPE (ask #2354): in_tmp_scope below is true only when the command runs in a throwaway repository under /tmp (physical paths, links
+# THE SCOPE (ask #2354, #2360): in_tmp_scope below is true only when the command runs in a repository whose physical git directory (bare or not) is under /tmp (physical paths, links
 # resolved; the -C directory counts; TMPDIR must itself resolve under /tmp; never /work/repo or a path that contains it or lies in it).
-# Only in scope: (a) a push to the default branch whose remote is a local path or file:// URL under /tmp, (b) `git config KEY VALUE` for a
-# key not in the table below, (c) GIT_CONFIG_GLOBAL and GIT_CONFIG_SYSTEM naming a plain file under /tmp (the #ENVCFG rows). Out of scope: as before.
+# Only in scope: (a) a push (also forced: --force, --force-with-lease, a + refspec; never --mirror, --all, a glob) whose remote is a local path or file:// URL under /tmp, (b) `git config KEY VALUE` for a
+# key not in the table below, (c) GIT_CONFIG_GLOBAL and GIT_CONFIG_SYSTEM naming a plain file under /tmp or the checkout server/tests (the #ENVCFG rows). Out of scope: as before.
 # THE EXCLUDED KEYS (in scope `git config KEY VALUE` is allowed for every key but these; keys compared in lower case; the README names them):
 #CFGX excluded | alias.* | a command that runs a program
 #CFGX excluded | push.default | changes what a push sends
@@ -82,8 +82,8 @@
 # THE git ENVIRONMENT TABLE (the same rule for the variables of the family GIT_CONFIG_*): `#ENVCFG <refused|allowed> | <name> | <form> | <why>`.
 #   Only these pass, an exact allow-list (never a prefix); every other GIT_CONFIG_* set and not empty is refused with the one line.
 #ENVCFG allowed | GIT_CONFIG_NOSYSTEM | 1 | only the value 1
-#ENVCFG allowed | GIT_CONFIG_SYSTEM | /dev/null, or in scope a regular file under /tmp | /dev/null always; a file only in scope (in_tmp_scope: the repository the command runs in is a throwaway one under /tmp, never /work/repo), a regular file (not a link), at most 64 KiB, owned by the running user, physical path under /tmp
-#ENVCFG allowed | GIT_CONFIG_GLOBAL | /dev/null, or in scope a regular file under /tmp | /dev/null always; a file only in scope (in_tmp_scope: the repository the command runs in is a throwaway one under /tmp, never /work/repo), a regular file (not a link), at most 64 KiB, owned by the running user, physical path under /tmp
+#ENVCFG allowed | GIT_CONFIG_SYSTEM | /dev/null, or in scope a regular file under /tmp or /work/repo/server/tests | /dev/null always; a file only in scope (in_tmp_scope: the git directory of the repository the command runs in, bare or not, is under /tmp, never /work/repo), a regular file (not a link), at most 64 KiB, owned by the running user, physical path under /tmp or under the checkout server/tests
+#ENVCFG allowed | GIT_CONFIG_GLOBAL | /dev/null, or in scope a regular file under /tmp or /work/repo/server/tests | /dev/null always; a file only in scope (in_tmp_scope: the git directory of the repository the command runs in, bare or not, is under /tmp, never /work/repo), a regular file (not a link), at most 64 KiB, owned by the running user, physical path under /tmp or under the checkout server/tests
 #ENVCFG allowed | GIT_CONFIG_COUNT | 1 to 16 | a whole number; KEY_n and VALUE_n for n below it; a KEY_n beyond it is refused
 #ENVCFG allowed | user.name | any printable value on one line | identity (the key is compared in lower case)
 #ENVCFG allowed | user.email | any printable value on one line | identity
@@ -94,7 +94,7 @@
 #ENVCFG allowed | url.<base>.insteadOf | https://github.com/ | only for a base that is an absolute local path or a file:// URL of one (no .. segment), and only this value
 #ENVCFG allowed | http.<url>.extraHeader | X-Test: 1 | only scoped to http(s)://127.0.0.1 or localhost (port and path optional, no user information)
 #ENVCFG refused | GIT_CONFIG_PARAMETERS | x | carries any setting
-#ENVCFG refused | GIT_CONFIG_GLOBAL or GIT_CONFIG_SYSTEM of any other value | /tmp/x | out of scope any value but /dev/null; in scope a link, a directory, a file over 64 KiB, a path with .. or . segments, a file of another owner or outside /tmp
+#ENVCFG refused | GIT_CONFIG_GLOBAL or GIT_CONFIG_SYSTEM of any other value | /tmp/x | out of scope any value but /dev/null; in scope a link, a directory, a file over 64 KiB, a path with .. or . segments, a file of another owner or outside /tmp and server/tests
 #ENVCFG refused | GIT_CONFIG_COUNT outside 1 to 16 | 17 | not a whole number from 1 to 16
 #ENVCFG refused | a key outside the list | core.hooksPath | runs a program (also core.sshCommand, core.fsmonitor, core.pager, include.*, alias.*, push.default, any other credential.*, any other http.* and the unscoped http.extraHeader)
 #ENVCFG refused | credential.helper with a value | store | a helper runs a program
@@ -221,9 +221,11 @@ in_tmp_scope() {   # true only for a command that runs in a throwaway repository
     is_td=$(phys "$TMPDIR") || return 1
     case "$is_td" in "$is_t"|"$is_t"/*) ;; *) return 1 ;; esac
   fi
-  is_top=$(cd -P -- "$sc_dir" 2>/dev/null && sgit rev-parse --show-toplevel 2>/dev/null) || return 1
-  is_top=$(phys "$is_top") || return 1
-  tmp_under "$is_top" || return 1
+  is_gd=$(cd -P -- "$sc_dir" 2>/dev/null && sgit rev-parse --absolute-git-dir 2>/dev/null) || return 1   # ask #2360: the physical git directory decides, a bare repository has no work tree
+  is_gd=$(phys "$is_gd") || return 1
+  tmp_under "$is_gd" || return 1
+  is_top=$(cd -P -- "$sc_dir" 2>/dev/null && sgit rev-parse --show-toplevel 2>/dev/null) || is_top=""
+  if [ -n "$is_top" ]; then is_top=$(phys "$is_top") || return 1; tmp_under "$is_top" || return 1; fi   # a work tree, when there is one, must be under /tmp too
   is_cd=$(cd -P -- "$sc_dir" 2>/dev/null && sgit rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || return 1
   is_cd=$(phys "$is_cd") || return 1   # a worktree or a .git file that shares the work checkout's repository is out of scope
   tmp_under "$is_cd" || return 1
@@ -237,8 +239,10 @@ scope_file() {   # $1: a path named by GIT_CONFIG_GLOBAL or GIT_CONFIG_SYSTEM: r
   sf_n=$(wc -c < "$1" 2>/dev/null) || env_cfg_refuse
   [ "${sf_n:-65537}" -le 65536 ] 2>/dev/null || env_cfg_refuse
   sf_d=$(phys "${1%/*}/") || env_cfg_refuse
-  tmp_under "$sf_d/${1##*/}" || env_cfg_refuse
-  return 0
+  tmp_under "$sf_d/${1##*/}" && return 0
+  sf_t=$(phys /work/repo/server/tests) || env_cfg_refuse   # ask #2360: in scope, a fixture file under the checkout's server/tests (physical path)
+  case "$sf_d/${1##*/}" in "$sf_t"/?*) return 0 ;; esac
+  env_cfg_refuse
 }
 cfg_scoped_ok() {   # in scope: `git config [--local] KEY VALUE` for a key not in the #CFGX table
   [ "${1:-}" = --local ] && shift
@@ -279,9 +283,10 @@ push_scope_check() {   # the words after `push`: true in scope when the remote i
     if [ "$ps_k" = 1 ]; then ps_k=0; continue; fi   # the value word of -o, --push-option, --receive-pack, --exec
     case "$a" in
       -o|--push-option|--receive-pack|--exec) ps_k=1 ;;
+      --force|--force-with-lease|--force-with-lease=*|--force-if-includes) ;;   # ask #2360: forced, allowed only when the whole push is in scope
       --dry-run|--verbose|--quiet|--set-upstream|--tags|--follow-tags|--no-verify|--progress|--atomic|--porcelain|--prune|--delete|--thin|--no-thin) ;;
       --push-option=*|--receive-pack=*|--exec=*) ;;
-      -|-*[!unvqd46-]*|--*) return 1 ;;
+      -|-*[!unvqdf46-]*|--*) return 1 ;;
     esac
   done
   ps_r=$(push_remote "$@")
@@ -375,16 +380,17 @@ do_git() {
   [ "${1:-}" = push ] || return 0
   shift
   n=0; cur=""
+  push_scoped=0; push_scope_check "$@" && push_scoped=1   # ask #2354: a local remote under /tmp, in a repository under /tmp
   for a in "$@"; do
     case "$a" in
-      --force|--force-with-lease|--force-with-lease=*|--force-if-includes|--mirror) refuse "force-pushing" ;;
+      --mirror) refuse "force-pushing" ;;
+      --force|--force-with-lease|--force-with-lease=*|--force-if-includes) [ "$push_scoped" = 1 ] || refuse "force-pushing" ;;
       --all|--branches) refuse "pushing to the default branch" ;;
       --*) ;;
       -*[!a-zA-Z]*) ;;
-      -*f*) refuse "force-pushing" ;;
+      -*f*) [ "$push_scoped" = 1 ] || refuse "force-pushing" ;;
     esac
   done
-  push_scoped=0; push_scope_check "$@" && push_scoped=1   # ask #2354: a local remote under /tmp, in a repository under /tmp
   skip=0
   for a in "$@"; do
     if [ "$skip" = 1 ]; then skip=0; continue; fi
@@ -399,7 +405,7 @@ do_git() {
     n=$((n + 1))
     [ "$n" -eq 1 ] && continue   # the remote
     case "$a" in *\**) refuse "pushing by a glob refspec" ;; esac
-    case "$a" in +*) refuse "force-pushing" ;; esac
+    case "$a" in +*) [ "$push_scoped" = 1 ] || refuse "force-pushing" ;; esac
     case "$a" in
       *:*) dst=${a#*:} ;;
       *) dst=$a ;;
