@@ -564,7 +564,7 @@ class ReminderFacts:
         return "%s (%s)" % (item["text"], tail)
 
     def verdict(self, item):
-        """For a due conditional reminder: None (cannot tell yet: it stays), "deliver", or the reason to drop it.
+        """For a due conditional reminder: None (the condition is unreadable: it delivers, audited as reminder.condition_unreadable), "deliver", or the reason to drop it.
         One read of the boss's transcript and inbox, and only for a reminder that is due and has a condition."""
         condition, discovery = item["condition"], self.engine.discovery if self.engine else None
         moot = self.until_holds(condition)
@@ -681,6 +681,8 @@ class ReminderFacts:
         engine, outcomes = self.engine, []
         by_recipient = {}
         for fact in self():
+            if getattr(fact, "wake_class", None):
+                continue   # a load alert is a member of its lane's ONE wake message (merge_wake_facts): the wake path delivers it, `prune_delivered_reminders` forgets it
             by_recipient.setdefault(fact.recipient, []).append(fact)
         for recipient in sorted(by_recipient):
             if recipient not in discovery.agents:
@@ -711,8 +713,8 @@ class ReminderFacts:
                                              {"id": item["id"], "due": iso(item["at"]), "ttl": int(ttl)})
                 continue
             kept = self.superseded(item, everything)
-            if kept is not None and kept.get("condition") and self.verdict(kept) != "deliver":
-                kept = None   # the newer one is gated or unresolved: it may not be delivered, so deliver the older
+            if kept is not None and kept.get("condition") and self.verdict(kept) not in ("deliver", None):
+                kept = None   # the newer one is gated by a met condition: it will not be delivered, so deliver the older (#2243: an unreadable condition delivers, so the newer replaces the older)
             if kept is not None:
                 if drop_superseded_item(self.state_dir, item["id"], kept["id"]) and self.engine is not None and self.engine.audit is not None:
                     self.engine.audit.append(self.engine.actor, "reminder.drop_superseded", item["to"],

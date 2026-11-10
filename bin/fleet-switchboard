@@ -2205,10 +2205,10 @@ class Switchboard:
         early, self._early_facts = getattr(self, "_early_facts", {}), {}   # #467: a source the early decisions step already read this pass is not read twice
         for source in self.sources:
             name = getattr(source, "__name__", "source")
-            if isinstance(source, ReminderFacts):
-                continue   # #2243: released at its due time (run_pass), never a pending fact
             try:
                 found = early[id(source)] if id(source) in early else source()
+                if isinstance(source, ReminderFacts):   # #2243: a due reminder is released at its due time (run_pass), never a pending fact; only a wake-class one (a load alert) joins its lane's ONE wake message
+                    found = [f for f in found if getattr(f, "wake_class", None)]
             except Exception as err:  # one bad source must not stop the others
                 problems.append("%s: %s" % (name, _one_line(str(err))))
                 self._note("source.error", name, {"error": _one_line(str(err))})

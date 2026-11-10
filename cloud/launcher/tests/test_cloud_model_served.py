@@ -146,19 +146,22 @@ class TestServed(Launch):
         self.assertEqual(self.stops(), [])
         self.reads.clear()
         self.remote.requests.clear()
-        # a second launch of another name, without a model
+        # a second launch of another name, without a model: since #2301 it means the default (sonnet-5.5 at medium), which goes through the same one read
+        self.listed = self.listed + [{"providerID": P, "id": "claude-sonnet-5.5", "variants": [{"id": "medium"}]}]
         brief = self.home / "brief2.txt"
         brief.write_text("Build the thing.\n")
         code2, out2, err2 = self.main("launch", "coder8", "--cloud", "--agent", "coder", "--repo", "acme-org/widget-service", "--branch", "main",
                                       "--role", "coder", "--reports-to", "orch", "--brief-file", str(brief))
         without = len(self.reads)
         extra = len([r for r in self.remote.requests if r[1] == "/api/model"])
-        print("S4: sessions created with the model %d, model-list reads served %d, model-list reads without a model %d, exit 0 for both %d" % (
+        print("S4: sessions created with the model %d, model-list reads served %d, model-list reads with the default %d, exit 0 for both %d" % (
             len([b for b in sessions if (b or {}).get("model", {}).get("id") == "model-01" and b["model"].get("variant") == "medium"]),
             served, without, code1 == 0 and code2 == 0))
-        print("U2: extra pod calls without a model %d, with a served model %d, pod text outside the pattern in the line 0" % (extra + without, served))
+        print("U2: pod model-list calls of a launch with the default %d, with a served model %d, pod text outside the pattern in the line 0" % (extra, served))
         self.assertEqual(code2, 0, err2)
-        self.assertEqual((served, without), (1, 0))
+        self.assertEqual((served, without), (1, 1), "one read for a served model, one for the default: never more")
+        sessions2 = [b for m, p, b in self.remote.bodies if m == "POST" and p == "/api/session"]
+        self.assertEqual(len([b for b in sessions2 if (b or {}).get("model", {}).get("id") == "claude-sonnet-5.5"]), 1)
         self.assertEqual(len([b for b in sessions if (b or {}).get("model", {}).get("id") == "model-01"]), 1)
 
 

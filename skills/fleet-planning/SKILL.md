@@ -17,13 +17,13 @@ Staff; an epic or workspace plan, the Chief of Staff, then the owner.
 
 ## One plan comment
 
-A plan is one canonical comment, edited in place; every revision adds a new short receipt comment (what changed and why, two to four lines, with the new plan hash); a plan is never reposted as a second plan comment.
+A plan is one canonical comment, edited in place; every revision adds a new short receipt comment (what changed and why, two to four lines, new plan hash); a plan is never reposted as a second plan comment.
 
 ## The method, in order
 
 1. **Done-when**: copy the ask's clauses, numbered `(1) ... (2) ...`. They are the authority; never reword them.
    A work item with no Done-when of its own takes the Done-when of its parent ask (its native sub-issue parent): `plan check` and the structure gate (G0a) read it there, and a Done-when the work item carries itself must still match exactly.
-   A pull request that proves only some of a plan's scenarios puts `CLAIMS: S3 S4 S5` directly under its `PLAN:` line: the proof gate (G1) counts only those, the others stay claimed by the epic, and a claim naming an undeclared scenario is refused (the union of claims is enforced at the ask's last merge). Every per-pull-request scenario must be claimed by some pull request (else the last merge is refused; a `CU` waiver passes).
+   A pull request that proves only some of a plan's scenarios puts `CLAIMS: S3 S4 S5` directly under its `PLAN:` line: the proof gate (G1) counts only those, the others stay claimed by the epic, and a claim naming an undeclared scenario is refused (the union of claims is enforced at the ask's last merge). So every per-pull-request scenario must be claimed by some pull request (else the last merge is refused; a `CU` waiver passes).
 2. **Clauses to scenarios**: every clause needs a behaviour scenario (`S`); behaviour that must NOT change is a
    `U` scenario. Each has `covers` (`DW-n` or `PC-n`), `text` (Given/when/then), `proof` (`test | live | measure |
    screenshot | review`; `review` quotes text), `pass` (a concrete observable: a status, a number, a quoted value), `discriminates` (the wrong
@@ -57,8 +57,7 @@ detail) plus **one detail comment** whose first line is a heading containing `Pl
 
 ## Challenge it
 
-A `plan review` command launches read-only reviewers and records their verdicts (not built yet: ask the Chief of Staff for a hand-run review). The tier is computed from the ask or epic the plan serves, not
-chosen per item. Up to three rounds; a standing objection then goes to the Chief of Staff, then the owner.
+A `plan review` command launches read-only reviewers and records their verdicts (not built yet: ask the Chief of Staff). The tier is computed from the ask or epic, not the item. Up to three rounds; a standing objection then goes to the Chief of Staff, then the owner.
 
 ## What the reviewers attack
 
@@ -98,7 +97,7 @@ Bad: `pass: works`, `discriminates: a wrong build would fail this`, "add a `comm
 ## Wordings `plan check` accepts
 
 - every declared `DW`/`PC` is covered by a scenario;
-- `discriminates` names a concrete wrong build;
+- `discriminates` names a concrete wrong build (a stub that returns an empty list);
 - `pass` has an observable number or status (`exit status is 0`);
 - the declared clauses joined equal the ask's Done-when;
 - check a slice with `--ask <its own work item>`.

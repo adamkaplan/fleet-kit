@@ -9751,9 +9751,9 @@ class TestReminders(PR4Base):
         self.assertEqual([f.key for f in facts], ["reminder:" + old["id"]])
         self.assertEqual([e for e in self.world.audit() if e["event"] == "reminder.drop_superseded"], [])
 
-    def test_older_is_delivered_when_newer_verdict_is_unresolved(self):
+    def test_older_is_dropped_when_newer_verdict_is_unresolved_because_the_newer_is_delivered(self):
         old, new, facts = self._gated_newer(None)
-        self.assertEqual([f.key for f in facts], ["reminder:" + old["id"]])
+        self.assertEqual([f.key for f in facts], ["reminder:" + new["id"]], "#2243 (#2292): an unreadable condition delivers, so the newer replaces the older")
 
     def test_older_is_dropped_when_newer_will_be_delivered(self):
         old, new, facts = self._gated_newer("deliver")
@@ -9917,15 +9917,13 @@ class TestReminders(PR4Base):
         self.assertEqual(len(sb.merge_reminder_copies(self.reminder_facts())), 4)
         self.assertEqual(len(other), 2)
 
-    def test_a_due_reminder_is_delivered_then_pruned_once_it_is_in_the_transcript(self):
+    def test_a_due_reminder_is_delivered_and_leaves_the_store_in_the_pass_and_is_sent_once(self):
         item = self.remind(delay=10)
         self.world.tick(10)
-        report = self.world.engine.run_pass()
-        self.assertEqual(len(report["sent"]), 1)
+        self.assertEqual(len(self.world.engine.run_pass()["sent"]), 1)
         (message,) = self.world.admissions("platform")
         self.assertEqual(message["keys"], ["reminder:" + item["id"]])
         self.assertEqual(sb.read_reminders(self.world.state), [], "pruned in the pass that saw it delivered")
-        self.assertIn("reminder.prune", [e["event"] for e in self.world.audit()])
         self.world.tick(5)
         self.assertEqual(self.world.engine.run_pass()["sent"], [])
 
@@ -9946,7 +9944,7 @@ class TestReminders(PR4Base):
     def test_a_crash_between_delivery_and_pruning_sends_nothing_twice(self):
         item = self.remind(delay=10)
         self.world.tick(10)
-        with mock.patch.object(sb, "prune_delivered_reminders", side_effect=RuntimeError("killed")):
+        with mock.patch.object(sb, "remove_reminders", side_effect=RuntimeError("killed")):   # #2243 (#2292): the release removes what it delivered; a crash there leaves it in the store
             self.world.engine.run_pass()
         self.assertEqual(len(sb.read_reminders(self.world.state)), 1)
         self.world.engine = self.world.new_engine()
@@ -9958,8 +9956,8 @@ class TestReminders(PR4Base):
     def test_a_corrupt_file_is_reported_and_never_overwritten(self):
         path = self.world.state / sb.REMINDERS
         path.write_text("{not json")
-        self.assertEqual(self.world.engine.collect_facts()[1][0].split(":")[0], "reminder_facts")
-        self.assertIn("source.error", [e["event"] for e in self.world.audit()])
+        report = self.world.engine.run_pass()   # #2243 (#2292): the reminders are released by the pass, not read as a fact source
+        self.assertTrue(("reminders", "release") in [(e["subject"], e["step"]) for e in report["errors"]] and all("ReminderError" in e["error"] for e in report["errors"]) and "error" in [e["event"] for e in self.world.audit()], report["errors"])
         with self.assertRaises(sb.ReminderError):
             self.remind()
         self.assertEqual(path.read_text(), "{not json")
@@ -71606,11 +71604,13 @@ class TestPullFileListRead(LedgerBase):
         module = types.ModuleType("impact_hold_mutant")
         exec(compile(source.replace(old, new), "impact_hold_mutant", "exec"), module.__dict__)
         saved = {name: sb.__dict__[name] for name in module.MOVED}
+        marks = {name: saved[name].__dict__.pop("_impact_hold_bound") for name in module.MOVED if "_impact_hold_bound" in saved[name].__dict__}   # #2287: the daemon's own functions name their namespace as bound; the mutant copy is a different module bound once, here, so the mark is lifted for this one bind and put back
         try:
             module.bind(sb.__dict__, sb.EFFECT_CHECK)   # the mutant copy is bound once, with the daemon's own check
             bound = {name: sb.__dict__[name] for name in module.MOVED}
         finally:
             sb.__dict__.update(saved)
+            for name, mark in marks.items(): saved[name].__dict__["_impact_hold_bound"] = mark
         return mock.patch.dict(sb.__dict__, bound)
 
     def producers(self):
