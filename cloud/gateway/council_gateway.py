@@ -4,6 +4,10 @@
 Standard library only. It reads ONE settings file (JSON; the path is argv[1] or COUNCIL_GATEWAY_SETTINGS) and the provider key from the file the
 settings name. It answers ONE route, POST /chat/completions (the OpenAI-style request the land tool's council sends), and forwards the body
 UNCHANGED to <provider_url>/chat/completions with the header `Authorization: Bearer <key>` (the caller's own Authorization header is dropped).
+The allow-list is exactly anthropic/claude-haiku-5.5 and anthropic/claude-sonnet-5.5. Any model id containing "opus" is banned: 403 with
+the error "model banned from the council: opus", never forwarded. For sonnet the gateway FORCES reasoning.effort to "medium" (the caller's value is
+overwritten; the body is re-encoded); haiku passes the caller's value and its body goes on unchanged. GET /usage (pods may read it) answers the
+counts of forwarded requests per UTC day and per model: no body, no key.
 Refused before anything is forwarded: any other path or method (403), a model outside the allow-list (403), a body over max_request_chars (413),
 a bad body, a missing or over-large max_tokens, or a streaming request (400). Past daily_budget requests in one UTC day: 429 with the reason.
 The day's count is in memory: a restart resets it. One count line per request goes to the log; it never holds a request body, an answer body or the key.
@@ -27,6 +31,10 @@ MAX_IN_FLIGHT = 32             # more requests than this at once get 503
 READ_SECONDS = 30              # the whole request must arrive within this (a trickle holds nothing longer)
 ALLOWED_FIELDS = ("model", "temperature", "max_tokens", "reasoning", "messages", "tools")   # exactly what the council sends; any other field is refused
 EFFORT_RE = re.compile(r"[a-z]{1,16}")
+BAN_WORD = "opus"
+BAN_ERROR = "model banned from the council: " + BAN_WORD
+FORCED_EFFORT = {"sonnet": "medium"}   # model-id word -> the effort the gateway writes whatever the caller sent
+USAGE_PATH = "/usage"
 SETTING_KEYS = ("models", "max_request_chars", "max_answer_tokens", "daily_budget", "provider_url", "key_file")
 LOOPBACK_RE = re.compile(r"http://(?:127\.0\.0\.1|localhost)(?::[0-9]{1,5})?(?:/.*)?")
 URL_RE = re.compile(r"https?://[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?(?::[0-9]{1,5})?(?:/[A-Za-z0-9._/-]*)?")
@@ -51,6 +59,8 @@ def load_settings(path):
     models = data["models"]
     if not (isinstance(models, list) and models and all(isinstance(m, str) and m for m in models)):
         raise SettingsError("models must be a non-empty list of model names")
+    if any(BAN_WORD in m.lower() for m in models):
+        raise SettingsError("models must not hold a banned model (%s)" % BAN_WORD)
     for key in ("max_request_chars", "max_answer_tokens", "daily_budget"):
         if type(data[key]) is not int or data[key] < 1:
             raise SettingsError("%s must be a whole number above 0" % key)
@@ -89,8 +99,15 @@ class Gateway:
         self.slots = threading.BoundedSemaphore(MAX_IN_FLIGHT)
         self.lock = threading.Lock()
         self.day, self.count = None, 0
+        self.usage = {}   # "YYYY-MM-DD" -> {model: forwarded-request count}
 
-    def take(self):
+    def usage_body(self):
+        """Counts per day and per model as JSON bytes: nothing else."""
+        with self.lock:
+            days = {d: dict(m) for d, m in self.usage.items()}
+        return json.dumps({"days": days}, sort_keys=True).encode()
+
+    def take(self, model="-"):
         """Count one request against today's budget: (allowed, number used today)."""
         with self.lock:
             today = self.clock()
@@ -99,6 +116,8 @@ class Gateway:
             if self.count >= self.s["daily_budget"]:
                 return False, self.count
             self.count += 1
+            per_day = self.usage.setdefault(today.isoformat(), {})
+            per_day[model] = per_day.get(model, 0) + 1
             return True, self.count
 
     def key(self):
@@ -123,8 +142,10 @@ class Gateway:
     def handle(self, method, path, length, read_body):
         """(status, reason or None, body bytes or None, model or '-', used today). read_body(n) reads the request."""
         s = self.s
+        if method == "GET" and path == USAGE_PATH:
+            return 200, None, self.usage_body(), "-", 0
         if method != "POST" or path != PATH:
-            return 403, "only POST " + PATH + " is served", None, "-", 0
+            return 403, "only POST " + PATH + " and GET " + USAGE_PATH + " are served", None, "-", 0
         if length is None:
             return 400, "a Content-Length is required", None, "-", 0
         if length > s["max_request_chars"] * 4:
@@ -143,6 +164,8 @@ class Gateway:
         if not isinstance(data, dict):
             return 400, "the body must be a JSON object", None, "-", 0
         model = data.get("model")
+        if isinstance(model, str) and BAN_WORD in model.lower():
+            return 403, BAN_ERROR, None, "-", 0
         if not (isinstance(model, str) and model in s["models"]):
             return 403, "the model is not on the allow-list", None, "-", 0
         tokens = data.get("max_tokens")
@@ -157,9 +180,13 @@ class Gateway:
         if not self.slots.acquire(blocking=False):
             return 503, "too many requests at once", None, model, 0
         try:
-            ok, used = self.take()
+            ok, used = self.take(model)
             if not ok:
                 return 429, "the daily budget of %d requests is spent; it renews at 00:00 UTC" % s["daily_budget"], None, model, used
+            for word, effort in FORCED_EFFORT.items():
+                if word in model:
+                    data["reasoning"] = {"effort": effort}
+                    raw = json.dumps(data).encode()
             status, answer = self.forward(raw)
         finally:
             self.slots.release()

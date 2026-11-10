@@ -46,7 +46,7 @@ class Manifest(unittest.TestCase):
             self.assertNotIn(word, self.text)
         cm = next(d for d in self.docs if d["kind"] == "ConfigMap")
         settings = json.loads(cm["data"]["settings.json"])
-        self.assertEqual(settings["models"], ["anthropic/claude-haiku-5.5", "anthropic/claude-sonnet-5.5", "anthropic/claude-opus-5.5"])
+        self.assertEqual(settings["models"], ["anthropic/claude-haiku-5.5", "anthropic/claude-sonnet-5.5"])
         self.assertEqual((settings["max_request_chars"], settings["max_answer_tokens"], settings["daily_budget"]), (400000, 24000, 500))
 
     def test_s6_the_launcher_label_is_the_policy_label(self):

@@ -21,7 +21,8 @@ GATEWAY = os.path.join(ROOT, "cloud", "gateway", "council_gateway.py")
 KEY = "provider-key-0123456789abcdef"
 BODY_TEXT = "the secret question about the repository"
 ANSWER_TEXT = "the secret answer of the provider"
-MODELS = ["anthropic/claude-haiku-5.5", "anthropic/claude-sonnet-5.5", "anthropic/claude-opus-5.5"]
+MODELS = ["anthropic/claude-haiku-5.5", "anthropic/claude-sonnet-5.5"]
+OPUS = "anthropic/claude-opus-5.5"
 
 
 def load(path):
@@ -172,11 +173,70 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(h.post(council_body(text="ok"))[0], 200)   # control: an allowed request is forwarded
         self.assertEqual(len(h.provider.seen), 1)
 
-    def test_s3_all_three_council_models_are_served(self):
+    def test_s3_both_council_models_are_served(self):
         h = Harness(self)
         for m in MODELS:
             self.assertEqual(h.post(council_body(model=m))[0], 200)
         self.assertEqual([json.loads(s["body"])["model"] for s in h.provider.seen], MODELS)
+
+    def test_opus_is_banned_with_the_named_error_and_never_forwarded(self):
+        h = Harness(self)
+        for m in (OPUS, "Anthropic/Claude-OPUS-9", "x/opus"):
+            status, text = h.post(council_body(model=m))
+            self.assertEqual(status, 403, m)
+            self.assertEqual(json.loads(text)["error"]["message"], "model banned from the council: opus")
+        self.assertEqual(len(h.provider.seen), 0)
+        with self.assertRaises(h.mod.SettingsError):
+            path = os.path.join(h.tmp, "s.json")
+            with open(path, "w") as f:
+                json.dump({"models": MODELS + [OPUS], "max_request_chars": 9, "max_answer_tokens": 9, "daily_budget": 9,
+                           "provider_url": "https://p.example/v1", "key_file": "/k"}, f)
+            h.mod.load_settings(path)
+
+    def test_sonnet_effort_is_forced_to_medium_whatever_was_sent(self):
+        h = Harness(self)
+        for sent in ("low", "high", "xhigh"):
+            self.assertEqual(h.post(council_body(model=MODELS[1], reasoning={"effort": sent}))[0], 200)
+        body = council_body(model=MODELS[1])
+        del body["reasoning"]
+        self.assertEqual(h.post(body)[0], 200)
+        seen = [json.loads(x["body"]) for x in h.provider.seen]
+        self.assertEqual([b["reasoning"] for b in seen], [{"effort": "medium"}] * 4)
+        self.assertEqual(seen[0]["messages"], council_body()["messages"])   # the rest of the body is untouched
+
+    def test_haiku_passes_the_callers_effort(self):
+        h = Harness(self)
+        for sent in ("low", "high"):
+            self.assertEqual(h.post(council_body(model=MODELS[0], reasoning={"effort": sent}))[0], 200)
+        self.assertEqual([json.loads(x["body"])["reasoning"]["effort"] for x in h.provider.seen], ["low", "high"])
+
+    def test_a_model_outside_the_list_is_refused(self):
+        h = Harness(self)
+        for m in ("anthropic/claude-haiku-4", "openai/gpt-x", "anthropic/claude-sonnet-5.5-extra", None, 5):
+            self.assertEqual(h.post(council_body(model=m))[0], 403, m)
+        self.assertEqual(len(h.provider.seen), 0)
+
+    def test_usage_counts_per_day_and_model_with_no_body_or_key(self):
+        h = Harness(self)
+
+        def usage():
+            with urllib.request.urlopen(h.url + "/usage", timeout=20) as res:
+                return res.status, res.read().decode()
+        self.assertEqual(json.loads(usage()[1]), {"days": {}})
+        h.post(council_body(model=MODELS[0]))
+        h.post(council_body(model=MODELS[0]))
+        h.post(council_body(model=MODELS[1]))
+        h.post(council_body(model=OPUS))   # refused: not counted
+        h.today += datetime.timedelta(days=1)
+        h.post(council_body(model=MODELS[1]))
+        status, text = usage()
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(text), {"days": {"2026-11-10": {MODELS[0]: 2, MODELS[1]: 1}, "2026-11-11": {MODELS[1]: 1}}})
+        for secret in (KEY, BODY_TEXT, ANSWER_TEXT):
+            self.assertNotIn(secret, text)
+        self.assertEqual(len(h.provider.seen), 4)   # reading usage reaches the provider 0 times
+        self.assertEqual(len(h.lines), 7)           # one count line per request, usage reads included
+        self.assertNotIn(KEY, "\n".join(h.lines))
 
     def test_s4_daily_budget_and_next_day(self):
         h = Harness(self, budget=3)

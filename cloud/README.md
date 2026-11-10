@@ -655,15 +655,18 @@ launcher's allowed list and one role, and answers with GitHub's own token, repos
 
 The land tool's council needs `COUNCIL_MODEL_URL` in the pod, and a pod holds no provider key. `cloud/gateway/council_gateway.py` (standard
 library only) runs in the cluster, holds the key in its own Secret and forwards ONE route, `POST /chat/completions`, to the provider with the
-key added there. It refuses any other path, any model outside its allow-list, a request over its size cap and an answer asked for over its cap;
-past a day's budget it answers 429 with the reason. It logs one count line per request and never a body or the key. The count is in memory: a
+key added there. The owner's allow-list (10 November) is exactly `anthropic/claude-haiku-5.5` and `anthropic/claude-sonnet-5.5`; any model id
+containing `opus` is banned (403, `model banned from the council: opus`, never forwarded). For sonnet the gateway forces `reasoning.effort` to
+`medium` whatever the caller sent; haiku passes the caller's value. It refuses any other path, any model outside the list, a request over its size
+cap and an answer asked for over its cap; past a day's budget (kept in the settings file) it answers 429 with the reason. `GET /usage` (pods may
+read it) answers the counts of forwarded requests per day and per model: no bodies, no key. It logs one count line per request and never a body or the key. The count is in memory: a
 restart resets the day. Manifests: `cloud/k8s/council-gateway.yaml` (settings ConfigMap, Service, Deployment of one replica, a NetworkPolicy that
 admits only pods labelled `app=cw-worker`, and a policy letting those pods reach the gateway). The Secret is a reference: no value is in the repository.
 
 The owner's steps (nothing here is run by the pull request):
 
 1. Create the secret: `kubectl -n cw create secret generic council-gateway-key --from-file=key=PATH_TO_KEY_FILE`.
-2. Set the defaults in the `council-gateway-settings` ConfigMap of the manifest: `provider_url` (replace `PROVIDER_HOST`), the three model ids, the
+2. Set the defaults in the `council-gateway-settings` ConfigMap of the manifest: `provider_url` (replace `PROVIDER_HOST`), the two model ids (haiku and sonnet; never an opus), the
    daily budget (500), the request cap (400000 characters), the answer cap (24000 tokens), and put the image digest in place of `IMAGE_DIGEST`.
 3. Apply: `kubectl -n cw create configmap council-gateway-code --from-file=cloud/gateway/council_gateway.py`, then
    `kubectl -n cw label configmap council-gateway-code app.kubernetes.io/part-of=council-gateway`, then

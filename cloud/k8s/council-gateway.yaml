@@ -19,7 +19,7 @@
     }
   },
   "data": {
-    "settings.json": "{\n  \"models\": [\n    \"anthropic/claude-haiku-5.5\",\n    \"anthropic/claude-sonnet-5.5\",\n    \"anthropic/claude-opus-5.5\"\n  ],\n  \"max_request_chars\": 400000,\n  \"max_answer_tokens\": 24000,\n  \"daily_budget\": 500,\n  \"provider_url\": \"https://PROVIDER_HOST/v1\",\n  \"key_file\": \"/etc/council-key/key\"\n}\n"
+    "settings.json": "{\n  \"models\": [\n    \"anthropic/claude-haiku-5.5\",\n    \"anthropic/claude-sonnet-5.5\"\n  ],\n  \"max_request_chars\": 400000,\n  \"max_answer_tokens\": 24000,\n  \"daily_budget\": 500,\n  \"provider_url\": \"https://PROVIDER_HOST/v1\",\n  \"key_file\": \"/etc/council-key/key\"\n}\n"
   }
 }
 ---
