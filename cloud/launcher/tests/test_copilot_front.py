@@ -267,6 +267,7 @@ class Budget(Base):
         self.fake.usages[:] = [dict(DETAILS)]
         f = self.run_front(BRIDGE_UNPRICED_NANO="5000000")
         self.assertEqual(f.request("POST", "/chat/completions", chat("gpt-4o"))[0], 200)
+        f.request("GET", "/usage")   # the count line of the call is written before this answer
         log = f.stop()
         self.assertEqual([json.loads(l)["nano"] for l in log.splitlines() if '"nano"' in l], [7400000])
         self.assertNotIn("unpriced", log)
