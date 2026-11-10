@@ -651,3 +651,26 @@ launcher's allowed list and one role, and answers with GitHub's own token, repos
 - The owner applies the manifests (`token-mint-review.yaml` holds the one cluster-wide permission), creates the Secret `token-mint-app`
   (keys `app-id`, `app-key`) and publishes the image.
 - Tests: `cloud/launcher/tests/test_token_service.py` and `cloud/launcher/tests/test_app_token_service.py` (fakes only).
+
+## The Copilot bridge (ask #2341)
+
+A council model endpoint for the worker pods, built from the open-source bridge `copilot-api` 0.7.0 (npm tarball sha1
+`cdc6b4973c8c014f90c3df8fdbe1e9f5c4d00b9d`, tag commit `36847c22741f2b397ecb29a001105085fe14b545`; `cloud/copilot-bridge/package-lock.json` pins every
+dependency by integrity and the image installs with `npm ci --ignore-scripts --omit=dev`). The bridge keeps the owner's GitHub token in a file
+`github_token` (mode 0600) under the data directory and prints a token only with `--show-token`, which is never passed. It has no bind option and listens on
+every interface by default; its HTTP server reads the `HOST` variable, so the entrypoint sets `HOST=127.0.0.1` for it. The policy front
+(`cloud/copilot-bridge/bridge-front.mjs`, Node standard library only) is the only listener a pod can reach: it forwards `POST /chat/completions` and
+`POST /v1/chat/completions` only, answers `GET /usage`, refuses a body over `BRIDGE_MAX_BODY` (400000 bytes), refuses an id containing `opus` (any case) with
+403 and `model banned from the council: opus`, maps every other model to `claude-sonnet-5.5` at `medium` (`claude-haiku-5.5` passes with the caller's effort),
+adds each answer's `copilot_usage.total_nano_aiu` (else the sum of `token_details`, else a configured constant and one `unpriced` log line) to the UTC day's spend per model, answers 429 with `daily AI credit budget spent: <spent> of <budget> credits` once the day's spend has reached `BRIDGE_DAILY_CREDITS` (credits, 1 credit = 1e9 nano-AIU; 10000 in the manifest; the request that crosses completes; `GET /usage` shows credits, requests and refused per day and model), and logs one count line per request: never a body, an answer, a header or a token.
+The bridge forwards the whole body to Copilot unchanged, so the front sets both `reasoning.effort` and `reasoning_effort`.
+
+The owner's steps (nothing here is applied by the repository):
+
+1. Create the Secret from the vault: `kubectl -n cw create secret generic copilot-github-token --from-file=github_token=<the file>` (the key is `github_token`).
+2. Build and push the image from `cloud/copilot-bridge/`, and put its digest in place of `IMAGE_PLACEHOLDER` in `cloud/k8s/copilot-bridge.yaml`.
+3. Apply `cloud/k8s/copilot-bridge.yaml` (Deployment, Service `copilot-bridge`, NetworkPolicy admitting only pods labelled `app=cw-worker`).
+4. Set `CW_COUNCIL_URL=http://copilot-bridge.cw.svc:8080` in the launcher's settings file: a worker pod then carries `COUNCIL_MODEL_URL` with that value and no key.
+Rollback: unset the setting, delete the Deployment (`kubectl -n cw delete deployment,service,networkpolicy -l app.kubernetes.io/part-of=copilot-bridge`), revoke the sign-in at GitHub.
+
+Tests: `test_copilot_front.py`, `test_copilot_manifest.py`, `test_council_url_render.py` in `cloud/launcher/tests/` (fakes only).

@@ -28,6 +28,7 @@ OPTIONAL_SAMPLES["CW_FINAL_NOTE_MINUTES"] = "10"   # ask #1757: the final note's
 OPTIONAL_SAMPLES["CW_REPO_MIN_SHAPE"] = "acme-org/widget-service=S"
 OPTIONAL_SAMPLES["CW_READONLY_ROOT_LANES"] = "lane-a,lane-b"
 OPTIONAL_SAMPLES["CW_AZURE_CONFIG_DIR"] = "/tmp"   # an existing directory; the setting is refused when it is missing
+OPTIONAL_SAMPLES["CW_COUNCIL_URL"] = "http://copilot-bridge.cw.svc:8080"   # ask #2341
 SAMPLES = {   # one value per secret shape (built here, never a real secret)
     "a JWT": "eyJhbGciOiJIUzI1" + "." + "eyJzdWIiOiJ4eHh4",
     "a PEM header": "-----BEGIN " + "PRIVATE KEY-----",
@@ -89,6 +90,7 @@ HOSTILE = {   # per key: values that must be refused (each through the REAL pars
     "CW_VAULT_BLOCK_DURATION": ["-5m", "0m", "61m", "2h", "1000m", "10", "m", "10s", "1.5h", "10 m", "/tmp/10m", "10m5s", "\u0662\u0660m", "-1h", "0h"],
 }
 HOSTILE["CW_AZURE_CONFIG_DIR"] = ["azure", "/a/../b", "-x", "/no/such/dir-azure-test"]   # relative, a .. segment, an option, a missing directory
+HOSTILE["CW_COUNCIL_URL"] = ["ftp://bridge.example", "bridge.example:8080", "http://", "http://user@bridge.example", "http://bridge.example?x=1", "http://bridge.example#f", "https://bridge.example/a/b", "file:///etc/passwd", "http://bridge example", "http://bridge.example/opaque-segment", "http://bridge.example/.."]   # ask #2341
 CONTROL = ["\t", "\x00", "\r", "\x0b", "\x0c", "\x1c", "\x1b", "\x7f", "\x01"]
 
 
@@ -687,6 +689,8 @@ NOT_SETTINGS = {
     "CW_AUDIT_RUNTIME_ID": "set by the launcher into the pod's environment (pod/NAME): an identifier, not a choice",
     "CW_CLOUD_TOKEN_FILE": "set by the launch wiring for its child from the in-memory mint (a private temp file it removes); no operator names it",
     "CW_AGENT": "set by the launcher into an orchestrator pod's environment from --agent (worker or orchestrator); the entrypoint reads it inside the pod",
+    "CW_PR_LABELS": "set by the launcher into the pod's environment from the --pr-label options (ask #2269); the end hook reads it inside the pod; no operator names it",
+    "CW_PR_RECORD": "set by the launcher into the pod's environment: the fixed path of the file the pod's client appends pull request numbers to (ask #2277); read inside the pod",
     "FLEET_CLOUD_CHANNEL_URL": "set by the launcher into an orchestrator pod's environment from the CW_HUB_CHANNEL_URL row (or its default); the cloud command reads it in the pod",
     "FLEET_CLOUD_TOKEN_FILE": "set by the launcher into an orchestrator pod's environment: the fixed path of the channel secret's file in the pod's memory-backed directory",
     "CW_REVIEW_COMMENT": "set by the launcher into the pod's environment from cloud/launcher/repo-review-comments.json (optional, per repository, absent = not set); the end hook reads it inside the pod",
