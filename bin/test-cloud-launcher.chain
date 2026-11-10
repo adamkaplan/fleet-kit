@@ -58,8 +58,6 @@ cloud/launcher/tests/test_idle_nudge_skipped.py
 cloud/launcher/tests/test_issues_read.py
 cloud/launcher/tests/test_kept_failed_once.py
 cloud/launcher/tests/test_kept_running_once.py
-cloud/launcher/tests/test_secret_dir.py
-cloud/launcher/tests/test_secret_dir_publish.py
 cloud/launcher/tests/test_known_forms.py
 cloud/launcher/tests/test_launch_idempotent.py
 cloud/launcher/tests/test_load_part.py
@@ -105,6 +103,8 @@ cloud/launcher/tests/test_safe_to_evict.py
 cloud/launcher/tests/test_scratch_clean.py
 cloud/launcher/tests/test_scrub_linear.py
 cloud/launcher/tests/test_scrub_pieces.py
+cloud/launcher/tests/test_secret_dir.py
+cloud/launcher/tests/test_secret_dir_publish.py
 cloud/launcher/tests/test_stack_model_key.py
 cloud/launcher/tests/test_stack_registry_check.py
 cloud/launcher/tests/test_stack_registry_pod.py
