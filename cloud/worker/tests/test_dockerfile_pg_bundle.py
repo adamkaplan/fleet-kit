@@ -38,6 +38,19 @@ def walk_imports(start="token_service.py"):
     return found
 
 
+def copy_problems(bin_dir, launcher_dir, names):
+    """Each named copy must exist in launcher_dir and equal bin_dir's file byte for byte; returns the problems."""
+    out = []
+    for n in names:
+        try:
+            with open(os.path.join(bin_dir, n), "rb") as a, open(os.path.join(launcher_dir, n), "rb") as b:
+                if a.read() != b.read():
+                    out.append(n + " copy differs")
+        except OSError:
+            out.append(n + " copy is missing")
+    return out
+
+
 def tolerated_all():
     """Modules imported only lazily inside a try block that tolerates failure (cloud_worker.retire_row: `import registry`), not at start:
     listed here, not shipped."""
@@ -64,7 +77,7 @@ def final_stage(t):
 SERVER_WORDS = ("pg_ctl", "pg_ctlcluster", "initdb", "postgres", "systemctl", "service")
 # Commands whose arguments only name a file or text (never run it): a server word after them is not a start.
 INERT = ("chmod", "chown", "chgrp", "cp", "mv", "ln", "ls", "rm", "mkdir", "touch", "install", "echo", "printf", "cat", "test", "stat", "readlink",
-         "grep", "sed", "tar", "useradd", "groupadd", "apt-get", "apt", "dpkg", "curl", "wget", "[")
+         "useradd", "groupadd")
 
 
 def starts_server(f):
@@ -74,7 +87,7 @@ def starts_server(f):
         m = re.match(r"(RUN|CMD|ENTRYPOINT) (.*)", line)
         if not m:
             continue
-        for seg in re.split(r"&&|\|\||;|\||\(|\)|\$\(|`", m.group(2)):
+        for seg in re.split(r"&|;|\||\(|\)|\$\(|`", m.group(2)):
             words = [w.strip("\"'[],") for w in seg.split()]
             while words and (re.match(r"\w+=", words[0]) or words[0] in ("sudo", "exec", "nohup", "env", "su", "gosu", "then", "do", "else", "if", "!", "time")):
                 words = words[1:]
@@ -150,17 +163,28 @@ class T(unittest.TestCase):
             if n.endswith(".py") and os.path.isfile(os.path.join(BIN, n)) and n not in BIN_COPIES:
                 with open(os.path.join(BIN, n), "rb") as a, open(os.path.join(LAUNCHER, n), "rb") as b:
                     self.assertNotEqual(a.read(), b.read(), n + " is a copy of bin/ but is not in BIN_COPIES")
+        self.assertEqual(copy_problems(BIN, LAUNCHER, bins), [])
+        for n in os.listdir(LAUNCHER):  # a launcher file sharing a bin/ name is either a listed copy or a different file
+            if n.endswith(".py") and os.path.isfile(os.path.join(BIN, n)) and n not in BIN_COPIES:
+                with open(os.path.join(BIN, n), "rb") as a, open(os.path.join(LAUNCHER, n), "rb") as b:
+                    self.assertNotEqual(a.read(), b.read(), n + " is a copy of bin/ but is not in BIN_COPIES")
         for n in bins:
             with open(os.path.join(BIN, n), "rb") as a, open(os.path.join(LAUNCHER, n), "rb") as b:
                 self.assertEqual(a.read(), b.read(), n + " copy differs")
-            self.assertTrue(os.path.isfile(os.path.join(LAUNCHER, n)))
         self.assertEqual(sorted(got), ["app_token.py", "cloud_worker.py", "path_walk.py", "registry.py", "run_record.py", "token_mint.py", "token_service.py", "wip_save.py"])
 
     def test_copy_mutant_fails_comparison(self):
-        with open(os.path.join(BIN, "path_walk.py"), "rb") as a, open(os.path.join(LAUNCHER, "path_walk.py"), "rb") as b:
-            src, copy = a.read(), b.read()
-        self.assertEqual(src, copy)  # control
-        self.assertNotEqual(src + b" ", copy)  # a one-byte edit differs
+        import tempfile
+        with tempfile.TemporaryDirectory() as b, tempfile.TemporaryDirectory() as l:
+            for d in (b, l):
+                with open(os.path.join(d, "x.py"), "wb") as f:
+                    f.write(b"a = 1\n")
+            self.assertEqual(copy_problems(b, l, ["x.py"]), [])  # control
+            with open(os.path.join(l, "x.py"), "ab") as f:
+                f.write(b" ")
+            self.assertEqual(copy_problems(b, l, ["x.py"]), ["x.py copy differs"])
+            os.remove(os.path.join(l, "x.py"))
+            self.assertEqual(copy_problems(b, l, ["x.py"]), ["x.py copy is missing"])
 
     def test_registry_is_tolerated_not_shipped(self):
         self.assertNotIn("launcher/registry.py", flat(final_stage(read(DF))))
@@ -176,7 +200,7 @@ class T(unittest.TestCase):
         t = read(DF)
         self.assertEqual(problems(t), [])  # control
         for cmd in ("/opt/pg/bin/pg_ctl start", "/usr/bin/postgres -D /x", "/opt/pg/bin/initdb -D /x",
-                    "if true; then pg_ctl start; fi", "bash -c 'postgres -D /x'", "sudo -u pg pg_ctl start", "timeout 5 postgres",
+                    "if true; then pg_ctl start; fi", "bash -c 'postgres -D /x'", "sudo -u pg pg_ctl start", "timeout 5 postgres", "echo hi & postgres", "chmod 1 x & pg_ctl start",
                     "systemctl start x", "service postgresql start"):
             m = read(DF).rstrip("\n") + "\nRUN " + cmd + "\n"
             self.assertIn("a line starts a server", " ".join(problems(m)), cmd)
