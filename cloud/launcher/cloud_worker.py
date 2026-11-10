@@ -47,8 +47,13 @@ DEFAULT_SHAPE = "XS"        # a create that names no shape and is not a stack la
 DEFAULT_ORCHESTRATOR_SHAPE = "O"   # an orchestrator launch that names no shape takes its own small row (the role table carries no shape: this is the one place)
 DEFAULT_STACK_SHAPE = "S"   # a stack launch that names no shape (its row must carry stack: true)
 
-# Per-shape requests (#1978): ONE table, shape S only; a shape with no row has no requests key. The limits stay the SHAPES rows.
-SHAPE_REQUESTS = {"S": {"cpu": "500m", "memory": "2Gi"}}
+# Per-shape requests (#1978): ONE table, shapes S and M; a shape with no row has no requests key. The limits stay the SHAPES rows.
+SHAPE_REQUESTS = {"S": {"cpu": "500m", "memory": "2Gi"}, "M": {"cpu": "2", "memory": "8Gi"}}
+
+
+def capacity_shapes():
+    """The SHAPES rows as the capacity read counts room: a shape's REQUEST when SHAPE_REQUESTS has a row, else its limit (the scheduler's own rule)."""
+    return {name: dict(row, **SHAPE_REQUESTS.get(name, {})) for name, row in SHAPES.items()}
 
 
 def parse_quantity(q):
