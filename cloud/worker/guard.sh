@@ -98,11 +98,12 @@
 #ENVCFG allowed | gc.auto | 0 | only this value
 #ENVCFG allowed | credential.helper | an empty value | only empty (it clears a helper)
 #ENVCFG allowed | url.<base>.insteadOf | https://github.com/ | only for a base that is an absolute local path or a file:// URL of one (no .. segment), and only this value
+#ENVCFG allowed | http.extraHeader | Authorization: Basic <base64> | clause 7 (ask #2360): only in scope, ONE line starting `Authorization: Basic ` and a base64 word; a second line, another header or out of scope is refused
 #ENVCFG allowed | http.<url>.extraHeader | X-Test: 1 | only scoped to http(s)://127.0.0.1 or localhost (port and path optional, no user information)
 #ENVCFG refused | GIT_CONFIG_PARAMETERS | x | carries any setting
 #ENVCFG refused | GIT_CONFIG_GLOBAL or GIT_CONFIG_SYSTEM of any other value | /tmp/x | out of scope any value but /dev/null; in scope a link, a directory, a file over 64 KiB, a path with .. or . segments, a file of another owner or outside /tmp and server/tests
 #ENVCFG refused | GIT_CONFIG_COUNT outside 1 to 16 | 17 | not a whole number from 1 to 16
-#ENVCFG refused | a key outside the list | core.hooksPath | runs a program (also core.sshCommand, core.fsmonitor, core.pager, include.*, alias.*, push.default, any other credential.*, any other http.* and the unscoped http.extraHeader)
+#ENVCFG refused | a key outside the list | core.hooksPath | runs a program (also core.sshCommand, core.fsmonitor, core.pager, include.*, alias.*, push.default, any other credential.*, any other http.* and http.extraHeader out of scope or with a value other than one Authorization: Basic line)
 #ENVCFG refused | credential.helper with a value | store | a helper runs a program
 #ENVCFG refused | a missing or empty KEY_n, or a KEY_n beyond the count | GIT_CONFIG_KEY_3 | git ignores or misreads it
 tool=${1:-}; [ $# -gt 0 ] && shift
@@ -132,6 +133,11 @@ env_cfg_text() {   # $1: a value: printable characters, one line, not empty
   printf '%s' "$1" | LC_ALL=C grep -q '[^ -~]' && env_cfg_refuse
   return 0
 }
+env_cfg_basic() {   # $1: a header value: ONE line, `Authorization: Basic ` and a base64 word
+  env_cfg_text "$1"
+  printf '%s' "$1" | grep -Eq '^Authorization: Basic [A-Za-z0-9+/=]+$' || env_cfg_refuse
+  return 0
+}
 env_cfg_local() {   # $1: an absolute local path (letters, digits, dot, underscore, dash, slash; no .. segment) or a file:// URL of one
   p=${1#file://}
   printf '%s' "$p" | grep -Eq '^/[A-Za-z0-9._/-]*$' || env_cfg_refuse
@@ -151,6 +157,7 @@ env_cfg_pair() {   # $1: a key, $2: its value: only the listed settings pass (th
     url.?*.insteadof)
       b=${1#????}; b=${b%??????????}
       env_cfg_local "$b"; [ "$2" = https://github.com/ ] || env_cfg_refuse ;;
+    http.extraheader) in_tmp_scope || env_cfg_refuse; env_cfg_basic "$2" ;;   # ask #2360 clause 7: in scope only, one Authorization: Basic line
     http.?*.extraheader)
       b=${1#?????}; b=${b%????????????}
       printf '%s' "$b" | grep -Eq '^https?://(127\.0\.0\.1|localhost)(:[0-9]+)?(/[A-Za-z0-9._~%/-]*)?$' || env_cfg_refuse
@@ -259,6 +266,7 @@ cfg_scoped_ok() {   # in scope: `git config [--local] KEY VALUE` for a key not i
   case "$2" in -*) return 1 ;; esac
   ck=$(printf '%s' "$1" | tr 'A-Z' 'a-z')
   case "$ck" in *.*) ;; *) return 1 ;; esac
+  case "$ck" in http.extraheader|http.*.extraheader) printf '%s' "$2" | grep -Eq '^Authorization: Basic [A-Za-z0-9+/=]+$' || return 1 ;; esac   # ask #2360 clause 7
   case "$ck" in
     alias.*|push.default|core.hookspath|core.sshcommand|core.fsmonitor|core.pager|core.editor|core.askpass|core.gitproxy) return 1 ;;
     credential.*|include.*|includeif.*|url.*|http.proxy*|http.sslcainfo|http.cookiefile|http.*.proxy*|http.*.sslcainfo|http.*.cookiefile) return 1 ;;
