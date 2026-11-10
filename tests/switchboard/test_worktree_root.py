@@ -6,15 +6,13 @@ import sys
 import tempfile
 import types
 import unittest
-from importlib.machinery import SourceFileLoader
 from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from support.loader import captured  # noqa: E402
+from support.loader import captured, sb  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[2]
-sb = SourceFileLoader("sb_worktree_root", str(REPO / "bin" / "fleet-switchboard")).load_module()
 
 
 class Reached(Exception):

@@ -358,6 +358,7 @@
         "bin/switchboard/faults.py",
         "bin/switchboard/shadow_classifier.py",
         "bin/switchboard/worktree_lifecycle.py",
+        "bin/switchboard/worktree_root.py",
         "bin/switchboard/review_laws.py",
         "bin/switchboard/job_runs.py",
         "bin/switchboard/standing_authority.py",
@@ -684,6 +685,12 @@
           "worktree_session_in_use",
           "worktree_session_index",
           "worktree_sweep"
+        ],
+        "bin/switchboard/worktree_root.py": [
+          "_inside",
+          "_real",
+          "_root_problem",
+          "validate_worktree_root"
         ],
         "bin/switchboard/review_laws.py": [
           "_private_parse",
