@@ -689,6 +689,8 @@ NOT_SETTINGS = {
     "CW_AUDIT_RUNTIME_ID": "set by the launcher into the pod's environment (pod/NAME): an identifier, not a choice",
     "CW_CLOUD_TOKEN_FILE": "set by the launch wiring for its child from the in-memory mint (a private temp file it removes); no operator names it",
     "CW_AGENT": "set by the launcher into an orchestrator pod's environment from --agent (worker or orchestrator); the entrypoint reads it inside the pod",
+    "CW_PR_LABELS": "set by the launcher into the pod's environment from the --pr-label options (ask #2269); the end hook reads it inside the pod; no operator names it",
+    "CW_PR_RECORD": "set by the launcher into the pod's environment: the fixed path of the file the pod's client appends pull request numbers to (ask #2277); read inside the pod",
     "FLEET_CLOUD_CHANNEL_URL": "set by the launcher into an orchestrator pod's environment from the CW_HUB_CHANNEL_URL row (or its default); the cloud command reads it in the pod",
     "FLEET_CLOUD_TOKEN_FILE": "set by the launcher into an orchestrator pod's environment: the fixed path of the channel secret's file in the pod's memory-backed directory",
     "CW_REVIEW_COMMENT": "set by the launcher into the pod's environment from cloud/launcher/repo-review-comments.json (optional, per repository, absent = not set); the end hook reads it inside the pod",
