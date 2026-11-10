@@ -48,11 +48,42 @@
 #CFG allowed | --get-regexp | --get-regexp user | a read
 #CFG allowed | --list | --list | a read
 #CFG allowed | --list --show-origin | --list --show-origin | a read
+# THE SCOPE (ask #2354): in_tmp_scope below is true only when the command runs in a throwaway repository under /tmp (physical paths, links
+# resolved; the -C directory counts; TMPDIR must itself resolve under /tmp; never /work/repo or a path that contains it or lies in it).
+# Only in scope: (a) a push to the default branch whose remote is a local path or file:// URL under /tmp, (b) `git config KEY VALUE` for a
+# key not in the table below, (c) GIT_CONFIG_GLOBAL and GIT_CONFIG_SYSTEM naming a plain file under /tmp (the #ENVCFG rows). Out of scope: as before.
+# THE EXCLUDED KEYS (in scope `git config KEY VALUE` is allowed for every key but these; keys compared in lower case; the README names them):
+#CFGX excluded | alias.* | a command that runs a program
+#CFGX excluded | push.default | changes what a push sends
+#CFGX excluded | core.hooksPath | runs hooks from another directory
+#CFGX excluded | core.sshCommand | runs a program
+#CFGX excluded | core.fsmonitor | runs a program
+#CFGX excluded | core.pager | runs a program
+#CFGX excluded | core.editor | runs a program
+#CFGX excluded | core.askpass | runs a program
+#CFGX excluded | core.gitProxy | runs a program
+#CFGX excluded | credential.* | a credential helper runs a program
+#CFGX excluded | include.* | makes git read another file
+#CFGX excluded | includeIf.* | makes git read another file
+#CFGX excluded | url.* | rewrites a remote
+#CFGX excluded | http.proxy* | reaches the network by a proxy
+#CFGX excluded | http.sslcainfo | trusts another certificate file
+#CFGX excluded | http.cookiefile | reads another file
+#CFGX excluded | remote.*.proxy | reaches the network by a proxy
+#CFGX excluded | remote.*.receivepack | runs a program
+#CFGX excluded | remote.*.uploadpack | runs a program
+#CFGX excluded | uploadpack.packObjectsHook | runs a program
+#CFGX excluded | diff.external | runs a program
+#CFGX excluded | filter.* | runs a program
+#CFGX excluded | merge.*.driver | runs a program
+#CFGX excluded | gpg.*.program | runs a program
+#CFGX excluded | sendemail.* | mail settings
+#CFGX excluded | protocol.ext.allow | allows the ext transport (a program)
 # THE git ENVIRONMENT TABLE (the same rule for the variables of the family GIT_CONFIG_*): `#ENVCFG <refused|allowed> | <name> | <form> | <why>`.
 #   Only these pass, an exact allow-list (never a prefix); every other GIT_CONFIG_* set and not empty is refused with the one line.
 #ENVCFG allowed | GIT_CONFIG_NOSYSTEM | 1 | only the value 1
-#ENVCFG allowed | GIT_CONFIG_SYSTEM | /dev/null | only this value, never a path a program wrote
-#ENVCFG allowed | GIT_CONFIG_GLOBAL | /dev/null | only this value, never a path a program wrote
+#ENVCFG allowed | GIT_CONFIG_SYSTEM | /dev/null, or in scope a regular file under /tmp | /dev/null always; a file only in scope (in_tmp_scope: the repository the command runs in is a throwaway one under /tmp, never /work/repo), a regular file (not a link), at most 64 KiB, owned by the running user, physical path under /tmp
+#ENVCFG allowed | GIT_CONFIG_GLOBAL | /dev/null, or in scope a regular file under /tmp | /dev/null always; a file only in scope (in_tmp_scope: the repository the command runs in is a throwaway one under /tmp, never /work/repo), a regular file (not a link), at most 64 KiB, owned by the running user, physical path under /tmp
 #ENVCFG allowed | GIT_CONFIG_COUNT | 1 to 16 | a whole number; KEY_n and VALUE_n for n below it; a KEY_n beyond it is refused
 #ENVCFG allowed | user.name | any printable value on one line | identity (the key is compared in lower case)
 #ENVCFG allowed | user.email | any printable value on one line | identity
@@ -63,7 +94,7 @@
 #ENVCFG allowed | url.<base>.insteadOf | https://github.com/ | only for a base that is an absolute local path or a file:// URL of one (no .. segment), and only this value
 #ENVCFG allowed | http.<url>.extraHeader | X-Test: 1 | only scoped to http(s)://127.0.0.1 or localhost (port and path optional, no user information)
 #ENVCFG refused | GIT_CONFIG_PARAMETERS | x | carries any setting
-#ENVCFG refused | GIT_CONFIG_GLOBAL or GIT_CONFIG_SYSTEM of any other value | /tmp/x | a config file a program wrote
+#ENVCFG refused | GIT_CONFIG_GLOBAL or GIT_CONFIG_SYSTEM of any other value | /tmp/x | out of scope any value but /dev/null; in scope a link, a directory, a file over 64 KiB, a path with .. or . segments, a file of another owner or outside /tmp
 #ENVCFG refused | GIT_CONFIG_COUNT outside 1 to 16 | 17 | not a whole number from 1 to 16
 #ENVCFG refused | a key outside the list | core.hooksPath | runs a program (also core.sshCommand, core.fsmonitor, core.pager, include.*, alias.*, push.default, any other credential.*, any other http.* and the unscoped http.extraHeader)
 #ENVCFG refused | credential.helper with a value | store | a helper runs a program
@@ -125,8 +156,8 @@ env_cfg_pair() {   # $1: a key, $2: its value: only the listed settings pass (th
 env_cfg() {   # git's environment configuration is the environment form of the two -c refusals: any of it set and not empty is refused
   [ -n "${GIT_CONFIG_PARAMETERS:-}" ] && env_cfg_refuse
   case "${GIT_CONFIG_NOSYSTEM:-}" in ""|1) ;; *) env_cfg_refuse ;; esac
-  case "${GIT_CONFIG_GLOBAL:-}" in ""|/dev/null) ;; *) env_cfg_refuse ;; esac
-  case "${GIT_CONFIG_SYSTEM:-}" in ""|/dev/null) ;; *) env_cfg_refuse ;; esac
+  case "${GIT_CONFIG_GLOBAL:-}" in ""|/dev/null) ;; *) scope_file "$GIT_CONFIG_GLOBAL" ;; esac
+  case "${GIT_CONFIG_SYSTEM:-}" in ""|/dev/null) ;; *) scope_file "$GIT_CONFIG_SYSTEM" ;; esac
   cnt=${GIT_CONFIG_COUNT:-}
   case "$cnt" in ""|[1-9]|1[0-6]) ;; *) env_cfg_refuse ;; esac
   keys=$(env | grep '^GIT_CONFIG_KEY_[A-Za-z0-9_]*=.')
@@ -149,7 +180,122 @@ EOF
   return 0
 }
 
+# ---- the scope (ask #2354) ----
+sc_dir=.; sc_off=0
+sgit() {   # the real git for the scope's own reads: no configuration of the environment is trusted before the scope is known
+  env -u GIT_CONFIG_COUNT -u GIT_CONFIG_PARAMETERS -u GIT_CONFIG_KEY_0 -u GIT_CONFIG_VALUE_0 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_CONFIG_NOSYSTEM=1 "$real_git" "$@"
+}
+scope_args() {   # the words after `git`: remember the last -C directory (chained), and whether the repository is chosen another way
+  sc_dir=.; sc_off=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -C) [ $# -ge 2 ] || break; case "$2" in /*) sc_dir=$2 ;; *) sc_dir=$sc_dir/$2 ;; esac; shift 2 ;;
+      -c|--config-env|--namespace|--exec-path) shift 2 || break ;;
+      --git-dir|--work-tree) sc_off=1; shift 2 || break ;;
+      --git-dir=*|--work-tree=*) sc_off=1; shift ;;
+      -*) shift ;;
+      *) break ;;
+    esac
+  done
+}
+phys() {   # $1: a directory: its physical path (links resolved), or fails
+  [ -n "$1" ] || return 1
+  ( cd -P -- "$1" 2>/dev/null && pwd -P )
+}
+tmp_under() {   # $1: a physical path: true when strictly under the physical /tmp and unrelated to the work checkout /work/repo
+  tu_t=$(phys /tmp) || return 1
+  tu_w=$(phys /work/repo) || tu_w=/work/repo
+  case "$1" in *"
+"*) return 1 ;; esac
+  case "$1" in "$tu_t"/?*) ;; *) return 1 ;; esac
+  case "$1" in "$tu_w"|"$tu_w"/*|/work/repo|/work/repo/*) return 1 ;; esac
+  case "$tu_w/" in "$1"/*) return 1 ;; esac
+  case "/work/repo/" in "$1"/*) return 1 ;; esac
+  return 0
+}
+in_tmp_scope() {   # true only for a command that runs in a throwaway repository under /tmp (see the SCOPE note at the top)
+  [ "$sc_off" = 0 ] || return 1
+  [ -z "${GIT_DIR:-}${GIT_WORK_TREE:-}${GIT_COMMON_DIR:-}${GIT_NAMESPACE:-}" ] || return 1
+  is_t=$(phys /tmp) || return 1
+  if [ -n "${TMPDIR:-}" ]; then   # TMPDIR must itself resolve under /tmp
+    is_td=$(phys "$TMPDIR") || return 1
+    case "$is_td" in "$is_t"|"$is_t"/*) ;; *) return 1 ;; esac
+  fi
+  is_top=$(cd -P -- "$sc_dir" 2>/dev/null && sgit rev-parse --show-toplevel 2>/dev/null) || return 1
+  is_top=$(phys "$is_top") || return 1
+  tmp_under "$is_top" || return 1
+  is_cd=$(cd -P -- "$sc_dir" 2>/dev/null && sgit rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || return 1
+  is_cd=$(phys "$is_cd") || return 1   # a worktree or a .git file that shares the work checkout's repository is out of scope
+  tmp_under "$is_cd" || return 1
+  return 0
+}
+scope_file() {   # $1: a path named by GIT_CONFIG_GLOBAL or GIT_CONFIG_SYSTEM: refuse unless in scope and a plain file under /tmp
+  in_tmp_scope || env_cfg_refuse
+  case "$1" in /*) ;; *) env_cfg_refuse ;; esac
+  case "$1/" in */../*|*/./*|*//*) env_cfg_refuse ;; esac
+  [ -f "$1" ] && [ ! -L "$1" ] && [ -O "$1" ] || env_cfg_refuse
+  sf_n=$(wc -c < "$1" 2>/dev/null) || env_cfg_refuse
+  [ "${sf_n:-65537}" -le 65536 ] 2>/dev/null || env_cfg_refuse
+  sf_d=$(phys "${1%/*}/") || env_cfg_refuse
+  tmp_under "$sf_d/${1##*/}" || env_cfg_refuse
+  return 0
+}
+cfg_scoped_ok() {   # in scope: `git config [--local] KEY VALUE` for a key not in the #CFGX table
+  [ "${1:-}" = --local ] && shift
+  [ $# -eq 2 ] || return 1
+  case "$1" in -*) return 1 ;; esac
+  case "$2" in -*) return 1 ;; esac
+  ck=$(printf '%s' "$1" | tr 'A-Z' 'a-z')
+  case "$ck" in *.*) ;; *) return 1 ;; esac
+  case "$ck" in
+    alias.*|push.default|core.hookspath|core.sshcommand|core.fsmonitor|core.pager|core.editor|core.askpass|core.gitproxy) return 1 ;;
+    credential.*|include.*|includeif.*|url.*|http.proxy*|http.sslcainfo|http.cookiefile|http.*.proxy*|http.*.sslcainfo|http.*.cookiefile) return 1 ;;
+    remote.*.proxy*|remote.*.receivepack|remote.*.uploadpack|uploadpack.packobjectshook|diff.external|filter.*|merge.*.driver|gpg.*.program|sendemail.*|protocol.ext.allow) return 1 ;;
+  esac
+  return 0
+}
+push_remote() {   # the words after `push`: the remote word, as the loop below counts it (empty when none)
+  pr_n=0; pr_skip=0; pr_r=""
+  for a in "$@"; do
+    if [ "$pr_skip" = 2 ]; then pr_r=$a; pr_skip=0; continue; fi
+    if [ "$pr_skip" = 1 ]; then pr_skip=0; continue; fi
+    case "$a" in
+      --repo) pr_skip=2; pr_n=$((pr_n + 1)); continue ;;
+      --repo=*) pr_r=${a#--repo=}; pr_n=$((pr_n + 1)); continue ;;
+      -o|--push-option|--receive-pack|--exec) pr_skip=1; continue ;;
+      -[!-]*o) pr_skip=1; continue ;;
+      --push-option=*|--receive-pack=*|--exec=*) continue ;;
+      -*) continue ;;
+    esac
+    pr_n=$((pr_n + 1))
+    [ "$pr_n" -eq 1 ] && [ -z "$pr_r" ] && pr_r=$a
+  done
+  printf '%s' "$pr_r"
+}
+push_scope_check() {   # the words after `push`: true in scope when the remote is a local path or file:// URL under /tmp
+  in_tmp_scope || return 1
+  ps_r=$(push_remote "$@")
+  if [ -z "$ps_r" ]; then
+    ps_c=$(sgit -C "$sc_dir" symbolic-ref --quiet --short HEAD 2>/dev/null || true)
+    ps_r=""
+    [ -n "$ps_c" ] && ps_r=$(sgit -C "$sc_dir" config --get "branch.$ps_c.pushremote" 2>/dev/null || true)
+    [ -n "$ps_r" ] || ps_r=$(sgit -C "$sc_dir" config --get remote.pushdefault 2>/dev/null || true)
+    [ -n "$ps_c" ] && [ -z "$ps_r" ] && ps_r=$(sgit -C "$sc_dir" config --get "branch.$ps_c.remote" 2>/dev/null || true)
+    [ -n "$ps_r" ] || ps_r=origin
+  fi
+  case "$ps_r" in
+    /*|file://*) ps_u=$ps_r ;;
+    -*|*:*|*..*|*/*) return 1 ;;
+    *) ps_u=$(sgit -C "$sc_dir" remote get-url --push "$ps_r" 2>/dev/null) || return 1 ;;
+  esac
+  case "$ps_u" in *%*) return 1 ;; file:///*) ps_u=${ps_u#file://} ;; file:*) return 1 ;; /*) ;; *) return 1 ;; esac
+  ps_d=$(phys "$ps_u") || return 1
+  tmp_under "$ps_d" || return 1
+  return 0
+}
+
 do_git() {
+  scope_args "$@"
   env_cfg
   # skip git's own options before the subcommand
   while [ $# -gt 0 ]; do
@@ -197,6 +343,7 @@ do_git() {
       "") if [ "$pos" = 1 ]; then n_ok=1; elif [ "$pos" = 2 ]; then case "$key" in user.name|user.email) n_ok=1 ;; esac; fi ;;
     esac
     [ "$wr" = 0 ] && [ "$ok" = 1 ] && [ "$n_ok" = 1 ] && return 0
+    if in_tmp_scope; then cfg_scoped_ok "$@" && return 0; refuse "changing git configuration"; fi   # ask #2354: in scope, any key but the #CFGX ones
     set -- config "$@"
     for a in "$@"; do bad_cfg "$a"; done
     refuse "changing git configuration"
@@ -213,6 +360,7 @@ do_git() {
       -*f*) refuse "force-pushing" ;;
     esac
   done
+  push_scoped=0; push_scope_check "$@" && push_scoped=1   # ask #2354: a local remote under /tmp, in a repository under /tmp
   skip=0
   for a in "$@"; do
     if [ "$skip" = 1 ]; then skip=0; continue; fi
@@ -235,14 +383,14 @@ do_git() {
     dst=${dst#refs/heads/}
     if [ "$dst" = HEAD ]; then
       cur=$("$real_git" symbolic-ref --quiet --short HEAD 2>/dev/null || true)
-      [ -n "$cur" ] && is_default "$cur" && refuse "pushing to the default branch"
+      [ -n "$cur" ] && is_default "$cur" && [ "$push_scoped" != 1 ] && refuse "pushing to the default branch"
       continue
     fi
-    is_default "$dst" && refuse "pushing to the default branch"
+    is_default "$dst" && [ "$push_scoped" != 1 ] && refuse "pushing to the default branch"
   done
   if [ "$n" -lt 2 ]; then   # `git push` or `git push <remote>`: the current branch goes
     cur=$("$real_git" symbolic-ref --quiet --short HEAD 2>/dev/null || true)
-    [ -n "$cur" ] && is_default "$cur" && refuse "pushing to the default branch"
+    [ -n "$cur" ] && is_default "$cur" && [ "$push_scoped" != 1 ] && refuse "pushing to the default branch"
   fi
   return 0
 }
