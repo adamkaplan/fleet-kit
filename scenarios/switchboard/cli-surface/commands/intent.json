@@ -1,0 +1,4 @@
+{
+ "command": "intent",
+ "help": "usage: fleet-switchboard intent [-h] issue positional arguments: issue The issue number options: -h, --help show this help message and exit"
+}

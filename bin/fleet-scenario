@@ -1,0 +1,831 @@
+#!/usr/bin/env python3
+"""fleet-scenario — checks and lists the switchboard's scenario files.
+
+A scenario is one promised behaviour, written as JSON in scenarios/switchboard/:
+who is in the cast, what happens and when, what must and must not follow, and
+the control that switches the safeguard off so the scenario must fail. The
+format is in docs/switchboard.md, section "Scenario testing".
+
+    fleet-scenario validate [paths...]   every *.json in scenarios/switchboard/ by default
+    fleet-scenario list
+    fleet-scenario coverage [--enforce] [--through-pr N]  exit 1 when enforced and a problem due by PR N has no scenario
+
+The test runners import this file for `validate`, `load`, `load_dir` and
+`coverage`. Python 3.9+, standard library only.
+"""
+import argparse
+import copy
+import importlib.machinery
+import importlib.util
+import json
+from pathlib import Path
+import re
+import sys
+
+PROG = "fleet-scenario"
+BIN = Path(__file__).resolve().parent
+DEFAULT_DIR = BIN.parent / "scenarios" / "switchboard"
+
+
+def _load_switchboard():
+    """The fault list has one home, bin/fleet-switchboard; read it from there."""
+    path = BIN / "fleet-switchboard"
+    loader = importlib.machinery.SourceFileLoader("fleet_scenario_switchboard", str(path))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+KNOWN_FAULTS = tuple(_load_switchboard().KNOWN_FAULTS)
+
+PROBLEMS = (1, 2, 3, 4)
+# The PR whose scenarios first cover each problem (docs/switchboard.md, Catalog):
+# `coverage --through-pr N` enforces only the problems due by PR N.
+PROBLEM_DUE_PR = {3: 2, 4: 4, 1: 6, 2: 7}
+TIERS = ("offline", "lab-scripted", "lab-model")
+ROLES = ("chief-of-staff", "orchestrator", "coder", "cos-subagent")
+ACTORS = ("you", "world")
+MODES = ("note", "wake")
+WHEN = ("any", "turn_start", "between_steps", "after_reply")
+DECISIONS = ("once", "always", "reject")
+DELIVERIES = ("queue", "steer")
+STATUSES = ("working", "idle", "done", "blocked")
+OF = ("session", "message")
+OUTCOMES = ("completed", "error")
+# The systems a control can run instead of the switchboard. `fleet-heartbeat`
+# is today's: it types a wake into the agent's input box, with `agent prompt`.
+BASELINES = ("fleet-heartbeat", "timer-heartbeat")
+WATCH_STATES = tuple(_load_switchboard().WATCH_STATES)
+# PR 9: the tool-call policy judge's vocabulary has one home too, in the engine.
+POLICY_TOOL_NAMES = tuple(_load_switchboard().POLICY_TOOLS)
+POLICY_RESULTS = tuple(_load_switchboard().POLICY_REQUEST_OUTCOMES)  # allow, ask, deny
+# PR 13: the states `fleet-switchboard report` takes
+REPORT_STATE_NAMES = tuple(_load_switchboard().REPORT_STATES)
+# PR 17: what `fleet-switchboard orders` does, and the states v2 gives a compaction message
+ORDERS_ACTIONS = ("add", "remove")
+COMPACTION_STATUSES = ("running", "completed", "failed")
+# PR 18: what `fleet-switchboard decisions` does, the tiers a view filters by, the two labels, and who looks
+DECISION_ACTIONS = ("escalate", "resolve", "answer")
+TIER_NAMES = ("cos", "human", "orchestrator", "all")
+LABEL_KINDS = ("user", "cos")
+
+# One vocabulary for every runner: each action and each oracle with its
+# fields, name -> {field: (required, check)}. A step or expectation may carry
+# only its kind's fields, plus `why` (a comment for people), in every tier, so
+# a typo fails validation instead of quietly changing what is checked.
+#
+# Naming: `to` is the agent a step sends to, or the recipient an expectation
+# reads; `agent` is the agent whose own behaviour is checked (its model calls,
+# screen, status, tools) or acted on (`close-pane`); `key` is a fact key, a
+# glob in an expectation; `text` is literal text; `count` is how many.
+_CAST = "cast"  # the check for a field that must name a cast member
+_STEP = "step"  # the check for a field that must be the index of a step
+_SYNTHETIC = {"to": (True, _CAST), "key": (True, "name"), "text": (True, "text"), "id": (False, "name"),
+              "resume": (False, "bool"), "delivery": (False, "delivery")}
+STEP_FIELDS = {
+    "turn": {"lasts": (False, "duration"), "steps": (False, "count1")},
+    "message": {"to": (True, _CAST), "text": (True, "text"), "lasts": (False, "duration")},
+    "draft": {"to": (True, _CAST), "text": (True, "line")},
+    "away": {},
+    "permission": {"to": (False, _CAST), "decision": (False, "decision")},
+    "comment": {"issue": (True, "issue"), "body": (True, "text"), "id": (False, "count1"),
+                "from": (False, "name"), "repo": (False, "repo")},  # repo: PR 15
+    "kill-daemon": {},
+    "restart-daemon": {},
+    "close-pane": {"agent": (True, _CAST)},
+    "edit-intent": {"issue": (True, "issue"), "intent": (False, "text_or_null"),
+                    "done_when": (False, "text_or_null")},
+    "delete-state": {},
+    "synthetic": _SYNTHETIC,
+    "note": _SYNTHETIC,
+    "wake": _SYNTHETIC,
+    "wait": {},
+    "launch": {"agent": (True, _CAST), "brief": (False, "text"), "new_workspace": (False, "name")},  # PR 15
+    "leave": {"agent": (True, _CAST)},  # PR 15: the agent's pane is gone
+    "fact": {"to": (True, _CAST), "key": (True, "name"), "summary": (True, "text"), "kind": (False, "name"),
+             "issue": (False, "issue"), "from": (False, "name"), "batch": (False, "bool")},
+    "pass": {"faults": (False, "faults")},
+    # GitHub (PR 5)
+    "kill-forwarder": {},
+    "occupy-hook": {},
+    # PR 8: the Chief of Staff's `fleet-switchboard handoff`, played by the offline runner for it
+    "handoff": {"issue": (True, "issue"), "brief": (True, "text")},
+    # PR 9: a cast member's tool call, judged by `judge-tool`; `configured` is the outcome the rules chose
+    "tool-call": {"tool": (True, "policy_tool"), "arguments": (True, "text"),
+                  "configured": (False, "policy_result")},
+    # PR 10: copy a v1 session into v2, from a fixture file (a path under the repo's scenarios/)
+    "import-v1": {"agent": (True, _CAST), "fixture": (True, "name")},
+    # PR 13: a cast member's `fleet-switchboard report <state> [--issue N] "one line"`
+    "report": {"state": (True, "report_state"), "text": (True, "line"), "issue": (False, "issue")},
+    # PR 14: Decisions. A label put on or taken off an issue; a boss's message to a worker; the projection deleted
+    "awaiting": {"issue": (True, "issue"), "on": (True, "bool"), "title": (False, "text"),
+                 "repo": (False, "repo"), "label": (False, "label_kind")},  # repo: PR 15; label: PR 18, user or cos
+    "send": {"to": (True, _CAST), "text": (True, "line"), "issue": (False, "issue")},
+    "delete-decisions": {},
+    # PR 16: you run a command that needs the daemon (it starts one if none runs); `bootstrap` opens the Chief of
+    # Staff; a pane is closed as a person would close it
+    "use": {"command": (True, "name")},
+    "bootstrap": {},
+    "close-agent": {"agent": (True, _CAST)},
+    # PR 16: the person edits the daemon's config file: a watched repo is added, or the file is left broken
+    "edit-config": {"add_repo": (False, "repo"), "broken": (False, "bool")},
+    # PR 17: standing orders. A cast member's `fleet-switchboard orders add|remove` on a charter; the owner's own
+    # edit of the charter on GitHub (adds a bullet); a compaction message of that status in an agent's transcript
+    "orders": {"charter": (True, "issue"), "action": (True, "orders_action"), "text": (False, "line"),
+               "number": (False, "count1")},
+    "edit-orders": {"charter": (True, "issue"), "text": (True, "line")},
+    "compact": {"agent": (True, _CAST), "status": (True, "compaction_status")},
+    # PR 18: a cast member's `fleet-switchboard decisions escalate|resolve|answer` on the decision whose id or title
+    # holds `ref` (resolve and answer go through the policy judge first, as a shell call does); the owner's edit of
+    # the Chief of Staff's orders file (adds a line)
+    "decide": {"action": (True, "decision_action"), "ref": (True, "text"), "value": (False, "line"),
+               "note": (False, "line"), "reason": (False, "line")},
+    "edit-cos-orders": {"text": (True, "line")},
+}
+ACTIONS = tuple(STEP_FIELDS)
+# Who may take each action: "you", "world", or "cast" (any cast member).
+STEP_ACTORS = {
+    "turn": ("cast",), "message": ("you",), "draft": ("you",), "away": ("you",),
+    "permission": ("you", "cast"), "comment": ("world",), "kill-daemon": ("world",),
+    "restart-daemon": ("world",), "close-pane": ("world",), "edit-intent": ("you", "world"),
+    "synthetic": ("world",), "note": ("world",), "wake": ("world",), "wait": ("world",),
+    "fact": ("world",), "pass": ("world",), "launch": ("world",), "delete-state": ("world",),
+    "kill-forwarder": ("world",), "occupy-hook": ("world",), "leave": ("world",),
+    "handoff": ("cast",),
+    "tool-call": ("cast",),  # PR 9
+    "import-v1": ("world",),
+    "report": ("cast",),  # PR 13
+    "awaiting": ("you", "world", "cast"),  # PR 14
+    "send": ("cast",),
+    "delete-decisions": ("world",),
+    "use": ("you",),  # PR 16
+    "bootstrap": ("world",),
+    "close-agent": ("world",),
+    "edit-config": ("world",),  # PR 16
+    "orders": ("cast",),  # PR 17
+    "edit-orders": ("you", "world"),
+    "compact": ("world",),
+    "decide": ("cast",),  # PR 18
+    "edit-cos-orders": ("you", "world"),
+}
+EXPECT_FIELDS = {
+    "delivered": {"to": (True, _CAST), "key": (True, "name"), "mode": (False, "mode"),
+                  "count": (False, "count0"), "keys": (False, "count1"), "text": (False, "text")},
+    "message_count": {"to": (True, _CAST), "count": (True, "count0")},
+    "model_saw": {"agent": (True, _CAST), "key": (True, "name"), "when": (False, "when"),
+                  "count": (False, "count0")},
+    "no_machine_turn": {"agent": (True, _CAST)},
+    "within": {"agent": (True, _CAST), "step": (True, _STEP), "seconds": (True, "seconds"),
+               "key": (False, "name")},
+    "draft_intact": {"agent": (True, _CAST), "text": (True, "line")},
+    "message_has_intent": {"to": (True, _CAST), "issue": (True, "issue")},
+    "classified": {"agent": (True, _CAST), "step": (True, _STEP), "as": (True, "name")},
+    "handed_off": {"issue": (True, "issue")},
+    "toast": {"agent": (False, _CAST), "text": (False, "text"), "count": (False, "count1")},
+    "tool_outcome": {"agent": (True, _CAST), "tool": (False, "name"), "outcome": (True, "outcome")},
+    "judged": {"agent": (True, _CAST), "question": (True, "text"), "threshold": (False, "probability")},
+    "status_is": {"agent": (True, _CAST), "status": (True, "status"), "at": (True, "duration")},
+    "pane_runs_v2": {"agent": (True, _CAST)},
+    "no_typing": {"agent": (True, _CAST)},
+    "metadata_roundtrip": {"agent": (True, _CAST), "of": (True, "of"), "key": (False, "name"),
+                           "text": (False, "text"), "fleet": (False, "fleet")},
+    "github_watch": {"state": (True, "watch_state"), "repo": (False, "name")},
+    # PR 15: many repos, one fleet
+    "repo_watch": {"repo": (True, "repo"), "how": (True, "watch_how")},
+    "repo_membership": {"repo": (True, "repo"), "joined": (True, "bool"), "left": (True, "bool")},
+    "status_says": {"text": (True, "text")},
+    "launch_refused": {"agent": (True, _CAST), "text": (False, "text")},
+    # PR 6
+    "message_shows": {"to": (True, _CAST), "text": (True, "name")},
+    "intent_gap": {"issue": (True, "issue")},
+    # PR 9: what `judge-tool` answered for the tool-call step with that index
+    "policy_outcome": {"agent": (True, _CAST), "step": (True, _STEP), "outcome": (True, "policy_result"),
+                       "reason": (False, "text"), "judged": (False, "bool"), "cached": (False, "bool"),
+                       "jev_calls": (False, "count0")},
+    # PR 10
+    "imported_messages": {"agent": (True, _CAST), "count": (False, "count0")},
+    "lists_asks": {"agent": (True, _CAST), "issue": (True, "issue")},
+    # PR 14: the list `fleet-switchboard decisions` shows at a time: how many decisions (whose title holds
+    # `text`, if given), and what the command says
+    # PR 18: `as` is who looks (a cast member, whose role and repo pick the view, or `you`), `tier` the --tier flag
+    "decisions": {"at": (True, "duration"), "count": (True, "count0"), "text": (False, "text"),
+                  "as": (False, "viewer"), "tier": (False, "tier_name")},
+    "decisions_say": {"at": (True, "duration"), "text": (True, "text")},
+    # PR 16: the first line `fleet-switchboard status` prints; what the bootstrap step printed; how many v2 sessions
+    # carry that cast member's fleet name
+    "status_first_line": {"text": (True, "text")},
+    "bootstrap_says": {"step": (True, _STEP), "text": (True, "text")},
+    "fleet_sessions": {"agent": (True, _CAST), "count": (True, "count0")},
+    # PR 16: the daemon's own account of its config in `status`, at that time: it holds `text`
+    "config_says": {"at": (True, "duration"), "text": (True, "text")},
+    # PR 17: the orders on the charter issue (those holding `text`, if given), and how many `orders add|remove`
+    # by that agent were refused
+    "orders_on_github": {"charter": (True, "issue"), "count": (True, "count0"), "text": (False, "text")},
+    "orders_refused": {"agent": (True, _CAST), "count": (True, "count0")},
+    # PR 18: the labels an issue carries on the fake GitHub, by kind; the replies made to an agent's pending
+    # permission requests (those with `decision`, if given)
+    "issue_labels": {"issue": (True, "issue"), "has": (False, "label_kinds"), "lacks": (False, "label_kinds")},
+    "permission_answered": {"agent": (True, _CAST), "count": (True, "count0"), "decision": (False, "decision")},
+}
+EXPECTATIONS = tuple(EXPECT_FIELDS)
+STEP_COMMON = ("at", "actor", "do", "why")
+EXPECT_COMMON = ("that", "name", "why")
+# A control variant patches the scenario it controls:
+# {"steps": {"<index>": {field: value}}, "expect": {"<name or index>": {field: value}},
+#  "issues": {"<number>": {field: value}}}.
+# The patched scenario must itself be valid.
+VARIANT_KEYS = ("steps", "expect", "issues", "repos")
+
+REQUIRED = ("id", "title", "problem", "since_pr", "tiers", "cast", "steps", "expect", "control")
+OPTIONAL = ("tags", "issues", "config", "repos")
+CAST_KEYS = ("role", "reports_to", "issue", "charter", "repo")
+# authority (PR 9): a charter's Standing authority line; workspace (PR 15): its `workspace:` line
+ISSUE_KEYS = ("intent", "done_when", "parent", "authority", "workspace")
+# PR 15: a repo of the play. `account`: the gh account that owns it (its token is the only one that can read it);
+# `webhook` false: that account cannot create a webhook; `exists` false: it does not exist yet.
+REPO_KEYS = ("account", "webhook", "exists")
+WATCH_HOWS = ("forwarder", "polling", "failed", "absent")
+REPO_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+CONTROL_KINDS = ("fault", "baseline", "variant")
+
+ID_RE = re.compile(r"^[A-Z]{1,2}[0-9]+$")
+ISSUE_RE = re.compile(r"^(?:[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#)?[1-9][0-9]*$")  # PR 15: owner/repo#N too
+DURATION_RE = re.compile(r"^([0-9]+)(s|m|h)$")
+UNIT_SECONDS = {"s": 1, "m": 60, "h": 3600}
+
+
+class ScenarioError(Exception):
+    """A scenario file that cannot be read or does not validate."""
+
+
+def _int(value):
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def duration_seconds(text):
+    """'0s', '10s', '2m', '2h' -> seconds. None if it is not a duration."""
+    match = DURATION_RE.match(text) if isinstance(text, str) else None
+    return int(match.group(1)) * UNIT_SECONDS[match.group(2)] if match else None
+
+
+def _field_ok(check, value, cast, steps=0):
+    if check == _CAST:
+        return isinstance(value, str) and value in cast
+    if check == _STEP:
+        return _int(value) and 0 <= value < steps
+    if check == "duration":
+        return duration_seconds(value) is not None
+    if check == "text":
+        return isinstance(value, str)
+    if check == "line":
+        return isinstance(value, str) and "\n" not in value
+    if check == "text_or_null":
+        return value is None or isinstance(value, str)
+    if check == "name":
+        return isinstance(value, str) and bool(value.strip())
+    if check == "issue":
+        return _int(value) and value >= 1
+    if check == "bool":
+        return isinstance(value, bool)
+    if check == "count0":
+        return _int(value) and value >= 0
+    if check == "count1":
+        return _int(value) and value >= 1
+    if check == "seconds":
+        return isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0
+    if check == "probability":
+        return isinstance(value, (int, float)) and not isinstance(value, bool) and 0 <= value <= 1
+    if check == "mode":
+        return value in MODES
+    if check == "when":
+        return value in WHEN
+    if check == "decision":
+        return value in DECISIONS
+    if check == "delivery":
+        return value in DELIVERIES
+    if check == "status":
+        values = value if isinstance(value, list) and value else [value]
+        return all(isinstance(v, str) and v in STATUSES for v in values)
+    if check == "of":
+        return value in OF
+    if check == "outcome":
+        return value in OUTCOMES
+    if check == "watch_state":
+        return value in WATCH_STATES
+    if check == "fleet":
+        return value is None or isinstance(value, dict)
+    if check == "repo":  # PR 15
+        return isinstance(value, str) and bool(REPO_NAME_RE.match(value))
+    if check == "watch_how":
+        return value in WATCH_HOWS
+    if check == "faults":
+        return isinstance(value, list) and bool(value) and all(v in KNOWN_FAULTS for v in value)
+    if check == "policy_tool":  # PR 9
+        return value in POLICY_TOOL_NAMES
+    if check == "policy_result":  # PR 9
+        return value in POLICY_RESULTS
+    if check == "report_state":  # PR 13
+        return value in REPORT_STATE_NAMES
+    if check == "orders_action":  # PR 17
+        return value in ORDERS_ACTIONS
+    if check == "compaction_status":
+        return value in COMPACTION_STATUSES
+    if check == "decision_action":  # PR 18
+        return value in DECISION_ACTIONS
+    if check == "tier_name":
+        return value in TIER_NAMES
+    if check == "label_kind":
+        return value in LABEL_KINDS
+    if check == "label_kinds":
+        return isinstance(value, list) and bool(value) and all(v in LABEL_KINDS for v in value)
+    if check == "viewer":
+        return value == "you" or (isinstance(value, str) and value in cast)
+    raise AssertionError("no such check: %s" % check)
+
+
+_CHECK_TEXT = {_CAST: "a cast name", _STEP: "the index of a step in this scenario",
+               "duration": "a duration such as \"30s\"", "text": "a string",
+               "line": "a string of one line", "text_or_null": "a string or null",
+               "name": "a non-empty string", "issue": "an issue number (integer >= 1)", "bool": "true or false",
+               "count0": "an integer >= 0", "count1": "an integer >= 1", "seconds": "a number > 0",
+               "probability": "a number from 0 to 1", "mode": " or ".join(MODES),
+               "when": "one of " + ", ".join(WHEN), "decision": "one of " + ", ".join(DECISIONS),
+               "delivery": " or ".join(DELIVERIES),
+               "status": "one of %s, or a non-empty list of them" % ", ".join(STATUSES),
+               "of": " or ".join(OF), "outcome": " or ".join(OUTCOMES),
+               "watch_state": "one of " + ", ".join(WATCH_STATES), "fleet": "an object or null",
+               "faults": "a non-empty list of known fault names", "repo": "a repo such as acme/api",
+               "watch_how": "one of " + ", ".join(WATCH_HOWS)}
+_CHECK_TEXT.update({"policy_tool": "one of " + ", ".join(POLICY_TOOL_NAMES),  # PR 9
+                    "policy_result": "one of " + ", ".join(POLICY_RESULTS),
+                    "report_state": "one of " + ", ".join(REPORT_STATE_NAMES),  # PR 13
+                    "orders_action": "one of " + ", ".join(ORDERS_ACTIONS),  # PR 17
+                    "compaction_status": "one of " + ", ".join(COMPACTION_STATUSES),
+                    "decision_action": "one of " + ", ".join(DECISION_ACTIONS),  # PR 18
+                    "tier_name": "one of " + ", ".join(TIER_NAMES),
+                    "label_kind": " or ".join(LABEL_KINDS),
+                    "label_kinds": "a non-empty list of " + ", ".join(LABEL_KINDS),
+                    "viewer": "you, or a cast name"})
+
+
+def _validate_fields(where, item, kind, table, common, cast, errors, steps=0):
+    """Check `item`'s own fields against `table[kind]`."""
+    if kind not in table:
+        return
+    fields = table[kind]
+    for key in sorted(set(item) - set(fields) - set(common)):
+        errors.append("%s: unknown field %r for %r" % (where, key, kind))
+    for key, (required, check) in sorted(fields.items()):
+        if key not in item:
+            if required:
+                errors.append("%s.%s: required for %r" % (where, key, kind))
+        elif not _field_ok(check, item[key], cast, steps):
+            errors.append("%s.%s: must be %s, got %r" % (where, key, _CHECK_TEXT[check], item[key]))
+
+
+def _validate_cast(cast, errors):
+    if not isinstance(cast, dict):
+        errors.append("cast: must be an object of name -> member")
+        return {}
+    for name, member in cast.items():
+        where = "cast.%s" % name
+        if name in ACTORS:
+            errors.append("%s: %r is reserved for steps' actors" % (where, name))
+        if not isinstance(member, dict):
+            errors.append("%s: must be an object" % where)
+            continue
+        for key in sorted(set(member) - set(CAST_KEYS)):
+            errors.append("%s: unknown key %r" % (where, key))
+        if member.get("role") not in ROLES:
+            errors.append("%s.role: must be one of %s, got %r" % (where, ", ".join(ROLES), member.get("role")))
+        if "reports_to" in member:
+            boss = member["reports_to"]
+            if boss not in cast or boss == name:
+                errors.append("%s.reports_to: must name another cast member, got %r" % (where, boss))
+        for key in ("issue", "charter"):
+            if key in member and not (_int(member[key]) and member[key] >= 1):
+                errors.append("%s.%s: must be an issue number (integer >= 1), got %r" % (where, key, member[key]))
+        if "repo" in member and not _field_ok("repo", member["repo"], cast):
+            errors.append("%s.repo: must be a repo such as acme/api, got %r" % (where, member["repo"]))
+    return cast
+
+
+def _validate_issues(issues, errors):
+    if not isinstance(issues, dict):
+        errors.append("issues: must be an object of issue number -> issue")
+        return
+    for number, issue in issues.items():
+        where = "issues.%s" % number
+        if not ISSUE_RE.match(number):
+            errors.append("%s: key must be an issue number string such as \"12\"" % where)
+        if not isinstance(issue, dict):
+            errors.append("%s: must be an object" % where)
+            continue
+        for key in sorted(set(issue) - set(ISSUE_KEYS)):
+            errors.append("%s: unknown key %r" % (where, key))
+        # null means the issue has no such section, which is itself a case to test.
+        if "intent" not in issue:
+            errors.append("%s.intent: required (a string, or null for an issue with no Intent section)" % where)
+        for key in ("intent", "done_when"):
+            if key in issue and not (issue[key] is None or isinstance(issue[key], str)):
+                errors.append("%s.%s: must be a string or null" % (where, key))
+        if "parent" in issue and not (_int(issue["parent"]) and issue["parent"] >= 1):
+            errors.append("%s.parent: must be an issue number (integer >= 1)" % where)
+        if "authority" in issue and not (issue["authority"] is None or isinstance(issue["authority"], str)):
+            errors.append("%s.authority: must be a string or null" % where)  # PR 9
+        if "workspace" in issue and not (isinstance(issue["workspace"], str) and issue["workspace"]):
+            errors.append("%s.workspace: must be a non-empty string" % where)  # PR 15
+
+
+def _validate_repos(repos, errors):
+    if not isinstance(repos, dict) or not repos:
+        errors.append("repos: must be a non-empty object of owner/repo -> {account, webhook, exists}")
+        return
+    for name, repo in repos.items():
+        where = "repos.%s" % name
+        if not REPO_NAME_RE.match(name):
+            errors.append("%s: key must be a repo such as acme/api" % where)
+        if not isinstance(repo, dict):
+            errors.append("%s: must be an object" % where)
+            continue
+        for key in sorted(set(repo) - set(REPO_KEYS)):
+            errors.append("%s: unknown key %r" % (where, key))
+        if "account" in repo and not (isinstance(repo["account"], str) and repo["account"].strip()):
+            errors.append("%s.account: must be a gh account name" % where)
+        for key in ("webhook", "exists"):
+            if key in repo and not isinstance(repo[key], bool):
+                errors.append("%s.%s: must be true or false" % (where, key))
+
+
+# ---- scenario-level config (PR 4)
+
+# Timing the engine reads, which a scenario may shorten so the Lab need not wait
+# real minutes; both runners apply it. Each is a positive number, as in the
+# engine's own config.
+CONFIG_KEYS = ("batch_seconds", "engaged_minutes")
+# PR 8: settings that name a mode, not a duration: key -> its allowed values.
+CONFIG_CHOICES = {"classifier_mode": ("shadow", "act")}
+
+
+def _validate_config(config, errors):
+    if not isinstance(config, dict) or not config:
+        errors.append("config: must be a non-empty object (known keys: %s)" % ", ".join(CONFIG_KEYS + tuple(CONFIG_CHOICES)))
+        return
+    for key in sorted(set(config) - set(CONFIG_KEYS) - set(CONFIG_CHOICES)):
+        errors.append("config: unknown key %r (known: %s)" % (key, ", ".join(CONFIG_KEYS + tuple(CONFIG_CHOICES))))
+    for key, allowed in CONFIG_CHOICES.items():
+        if key in config and config[key] not in allowed:
+            errors.append("config.%s: must be one of %s, got %r" % (key, ", ".join(allowed), config[key]))
+    for key in CONFIG_KEYS:
+        value = config.get(key)
+        if key in config and not (isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0):
+            errors.append("config.%s: must be a number > 0, got %r" % (key, value))
+
+
+def _validate_steps(steps, cast, errors):
+    if not isinstance(steps, list):
+        errors.append("steps: must be a list")
+        return
+    previous = 0
+    for index, step in enumerate(steps):
+        where = "steps[%d]" % index
+        if not isinstance(step, dict):
+            errors.append("%s: must be an object" % where)
+            continue
+        at = duration_seconds(step.get("at"))
+        if at is None:
+            errors.append("%s.at: must be a duration such as \"0s\", \"10s\", \"2m\" or \"2h\", got %r"
+                          % (where, step.get("at")))
+        elif at < previous:
+            errors.append("%s.at: %s is earlier than the step before it; times must not decrease"
+                          % (where, step["at"]))
+        else:
+            previous = at
+        actor, do = step.get("actor"), step.get("do")
+        is_cast = isinstance(actor, str) and actor in cast and actor not in ACTORS
+        if not (actor in ACTORS or is_cast):
+            errors.append("%s.actor: must be \"you\", \"world\" or a cast name, got %r" % (where, actor))
+        if do not in ACTIONS:
+            errors.append("%s.do: must be one of %s, got %r" % (where, ", ".join(ACTIONS), do))
+            continue
+        allowed = STEP_ACTORS[do]
+        if (actor in ACTORS or is_cast) and ("cast" if is_cast else actor) not in allowed:
+            errors.append("%s.actor: %r cannot %s; allowed: %s" % (
+                where, actor, do, ", ".join("a cast member" if a == "cast" else a for a in allowed)))
+        _validate_fields(where, step, do, STEP_FIELDS, STEP_COMMON, cast, errors)
+        if do == "permission":
+            if actor == "you" and "to" not in step:
+                errors.append("%s.to: required for your answer to a permission ask" % where)
+            if is_cast and ("to" in step or "decision" in step):
+                errors.append("%s: an agent's permission ask takes no `to` or `decision`" % where)
+
+
+def _validate_expect(expect, cast, steps, errors):
+    labels = set()
+    if not isinstance(expect, list) or not expect:
+        errors.append("expect: must be a non-empty list")
+        return labels
+    names = set()
+    for index, item in enumerate(expect):
+        where = "expect[%d]" % index
+        if not isinstance(item, dict):
+            errors.append("%s: must be an object" % where)
+            continue
+        if item.get("that") not in EXPECTATIONS:
+            errors.append("%s.that: must be one of %s, got %r"
+                          % (where, ", ".join(EXPECTATIONS), item.get("that")))
+        else:
+            labels.add(item["that"])
+            _validate_fields(where, item, item["that"], EXPECT_FIELDS, EXPECT_COMMON, cast, errors, steps)
+            if item["that"] == "metadata_roundtrip" and item.get("of") == "message" \
+                    and ("key" in item) == ("text" in item):
+                errors.append("%s: a message's metadata_roundtrip names the message by exactly one of "
+                              "`key` or `text`" % where)
+        if "name" in item:
+            name = item["name"]
+            if not isinstance(name, str) or not name:
+                errors.append("%s.name: must be a non-empty string" % where)
+            elif name in names:
+                errors.append("%s.name: %r is used twice; names must be unique" % (where, name))
+            else:
+                names.add(name)
+                labels.add(name)
+    return labels
+
+
+class VariantError(ValueError):
+    """A control variant that does not patch this scenario."""
+
+
+def apply_variant(scenario, variant):
+    """The scenario with a control variant patched in. Raises VariantError."""
+    if not isinstance(variant, dict):
+        raise VariantError("must be an object")
+    unknown = sorted(set(variant) - set(VARIANT_KEYS))
+    if unknown:
+        raise VariantError("unknown key(s) %s (known: %s)" % (", ".join(map(repr, unknown)), ", ".join(VARIANT_KEYS)))
+    out = copy.deepcopy(scenario)
+    steps, expect = out.get("steps"), out.get("expect")
+    for index, patch in sorted((variant.get("steps") or {}).items()):
+        if not (isinstance(index, str) and index.isdigit() and isinstance(steps, list)
+                and int(index) < len(steps) and isinstance(steps[int(index)], dict)):
+            raise VariantError("steps: %r is not the index of a step" % (index,))
+        if not isinstance(patch, dict) or not patch:
+            raise VariantError("steps.%s: must be a non-empty object of fields" % index)
+        steps[int(index)].update(copy.deepcopy(patch))
+    for name, patch in sorted((variant.get("repos") or {}).items()):
+        if not isinstance(patch, dict) or not patch:
+            raise VariantError("repos.%s: must be a non-empty object of fields" % name)
+        out.setdefault("repos", {}).setdefault(name, {}).update(copy.deepcopy(patch))
+    for number, patch in sorted((variant.get("issues") or {}).items()):
+        if not isinstance(patch, dict) or not patch:
+            raise VariantError("issues.%s: must be a non-empty object of fields" % number)
+        out.setdefault("issues", {}).setdefault(number, {}).update(copy.deepcopy(patch))
+    for label, patch in sorted((variant.get("expect") or {}).items()):
+        hits = [e for i, e in enumerate(expect if isinstance(expect, list) else [])
+                if isinstance(e, dict) and (e.get("name") == label or str(i) == label)]
+        if not hits:
+            raise VariantError("expect: %r matches no expectation's name or index" % (label,))
+        if not isinstance(patch, dict) or not patch:
+            raise VariantError("expect.%s: must be a non-empty object of fields" % label)
+        for item in hits:
+            item.update(copy.deepcopy(patch))
+    return out
+
+
+def _validate_control(control, labels, scenario, errors):
+    if not isinstance(control, dict):
+        errors.append("control: must be an object")
+        return
+    kinds = [kind for kind in CONTROL_KINDS if kind in control]
+    if len(kinds) != 1:
+        errors.append("control: must have exactly one of %s, found %s"
+                      % (", ".join(CONTROL_KINDS), ", ".join(kinds) or "none"))
+    for key in sorted(set(control) - set(CONTROL_KINDS) - {"fails"}):
+        errors.append("control: unknown key %r" % key)
+    if "fault" in control and control["fault"] not in KNOWN_FAULTS:
+        errors.append("control.fault: unknown fault %r (known: %s)" % (control["fault"], ", ".join(KNOWN_FAULTS)))
+    if "baseline" in control and control["baseline"] not in BASELINES:
+        errors.append("control.baseline: must name the system run instead, one of %s, got %r"
+                      % (", ".join(BASELINES), control["baseline"]))
+    if "variant" in control and scenario is None and not isinstance(control["variant"], dict):
+        errors.append("control.variant: must be an object")
+    elif "variant" in control and scenario is not None:
+        try:
+            patched = apply_variant(scenario, control["variant"])
+        except VariantError as err:
+            errors.append("control.variant: %s" % err)
+        else:
+            errors.extend("control.variant makes %s" % e for e in _validate_body(patched))
+    fails = control.get("fails")
+    if not isinstance(fails, list) or not fails:
+        errors.append("control.fails: must be a non-empty list of the expectations the control breaks")
+        return
+    for entry in fails:
+        if entry not in labels:
+            errors.append("control.fails: %r matches no expectation's name or 'that'" % (entry,))
+
+
+def _validate_body(obj):
+    """Cast, issues, steps and expect: what a control variant can change. Returns (errors)."""
+    errors = []
+    cast = _validate_cast(obj["cast"], errors) if "cast" in obj else {}
+    if "issues" in obj:
+        _validate_issues(obj["issues"], errors)
+    if "repos" in obj:
+        _validate_repos(obj["repos"], errors)
+    if "steps" in obj:
+        _validate_steps(obj["steps"], cast, errors)
+    steps = len(obj["steps"]) if isinstance(obj.get("steps"), list) else 0
+    if "expect" in obj:
+        _validate_expect(obj["expect"], cast, steps, errors)
+    return errors
+
+
+def validate(obj):
+    """Every reason `obj` is not a valid scenario. An empty list means it is."""
+    if not isinstance(obj, dict):
+        return ["scenario: must be a JSON object"]
+    errors = []
+    for key in sorted(set(obj) - set(REQUIRED) - set(OPTIONAL)):
+        errors.append("unknown top-level key %r" % key)
+    for key in REQUIRED:
+        if key not in obj:
+            errors.append("%s: required" % key)
+
+    if "id" in obj and not (isinstance(obj["id"], str) and ID_RE.match(obj["id"])):
+        errors.append("id: must match %s, such as \"N1\", got %r" % (ID_RE.pattern, obj["id"]))
+    if "title" in obj and not (isinstance(obj["title"], str) and obj["title"].strip()):
+        errors.append("title: must be a non-empty string")
+    if "problem" in obj and not (obj["problem"] is None or (_int(obj["problem"]) and obj["problem"] in PROBLEMS)):
+        errors.append("problem: must be 1, 2, 3, 4 or null, got %r" % (obj["problem"],))
+    if "since_pr" in obj and not (_int(obj["since_pr"]) and obj["since_pr"] >= 1):
+        errors.append("since_pr: must be an integer >= 1, got %r" % (obj["since_pr"],))
+    if "tiers" in obj:
+        tiers = obj["tiers"]
+        if (not isinstance(tiers, list) or not tiers or any(t not in TIERS for t in tiers)
+                or len(set(tiers)) != len(tiers)):
+            errors.append("tiers: must be a non-empty list of distinct values from %s, got %r"
+                          % (", ".join(TIERS), tiers))
+    if "tags" in obj and not (isinstance(obj["tags"], list) and all(isinstance(t, str) and t for t in obj["tags"])):
+        errors.append("tags: must be a list of non-empty strings")
+
+    if "config" in obj:
+        _validate_config(obj["config"], errors)
+    body = _validate_body(obj)
+    errors.extend(body)
+    cast = obj["cast"] if isinstance(obj.get("cast"), dict) else {}
+    steps = len(obj["steps"]) if isinstance(obj.get("steps"), list) else 0
+    labels = _validate_expect(obj["expect"], cast, steps, []) if "expect" in obj else set()
+    if "control" in obj:
+        # A variant is patched in and checked only on a scenario that is valid
+        # without it, so each mistake is reported once, where it is.
+        _validate_control(obj["control"], labels, None if body else obj, errors)
+    return errors
+
+
+def read(path):
+    """Parse one file. Returns (obj, errors); obj is None when it is not JSON."""
+    try:
+        return json.loads(Path(path).read_text()), []
+    except FileNotFoundError:
+        return None, ["no such file"]
+    except ValueError as err:
+        return None, ["not valid JSON: %s" % err]
+    except OSError as err:
+        return None, ["cannot read: %s" % (err.strerror or err)]
+
+
+def load(path):
+    """One valid scenario, or ScenarioError naming every problem with it."""
+    obj, errors = read(path)
+    if obj is not None:
+        errors = validate(obj)
+    if errors:
+        raise ScenarioError("%s: %s" % (path, "; ".join(errors)))
+    return obj
+
+
+def scenario_files(directory):
+    return sorted(Path(directory).glob("*.json"))
+
+
+def load_dir(directory=DEFAULT_DIR):
+    """Every scenario in `directory`, sorted by file name. Raises on the first bad one."""
+    scenarios = [load(path) for path in scenario_files(directory)]
+    seen = {}
+    for path, scenario in zip(scenario_files(directory), scenarios):
+        if scenario["id"] in seen:
+            raise ScenarioError("%s: id %s is also used by %s" % (path, scenario["id"], seen[scenario["id"]]))
+        seen[scenario["id"]] = path
+    return scenarios
+
+
+def coverage(scenarios):
+    """{problem: [scenario ids]} for each of problems 1-4, empty when uncovered."""
+    covered = {problem: [] for problem in PROBLEMS}
+    for scenario in scenarios:
+        if scenario.get("problem") in covered:
+            covered[scenario["problem"]].append(scenario["id"])
+    return {problem: sorted(ids) for problem, ids in covered.items()}
+
+
+# --------------------------------------------------------------------- the CLI
+
+def _expand(paths):
+    files, errors = [], []
+    for raw in paths:
+        path = Path(raw)
+        if path.is_dir():
+            files.extend(scenario_files(path))
+        elif path.exists():
+            files.append(path)
+        else:
+            errors.append("%s: no such file or directory" % raw)
+    return files, errors
+
+
+def cmd_validate(args):
+    files, failures = _expand(args.paths or [str(DEFAULT_DIR)])
+    ids = {}
+    for path in files:
+        obj, errors = read(path)
+        if obj is not None:
+            errors = validate(obj)
+            if not errors:
+                if obj["id"] in ids:
+                    errors = ["id %s is also used by %s" % (obj["id"], ids[obj["id"]])]
+                ids.setdefault(obj["id"], path)
+        failures.extend("%s: %s" % (path, error) for error in errors)
+    for line in failures:
+        sys.stderr.write("%s: %s\n" % (PROG, line))
+    print("%d scenario file(s) checked, %d error(s)" % (len(files), len(failures)))
+    return 1 if failures else 0
+
+
+def _load_for_report(directory):
+    try:
+        return load_dir(directory), None
+    except ScenarioError as err:
+        return None, str(err)
+
+
+def cmd_list(args):
+    scenarios, error = _load_for_report(args.dir)
+    if error:
+        sys.stderr.write("%s: %s\n" % (PROG, error))
+        return 1
+    row = "%-5s %-7s %-6s %-28s %s"
+    print(row % ("ID", "PROBLEM", "SINCE", "TIERS", "TITLE"))
+    for s in sorted(scenarios, key=lambda s: s["id"]):
+        print(row % (s["id"], "-" if s["problem"] is None else s["problem"], "PR %d" % s["since_pr"],
+                     ",".join(s["tiers"]), s["title"]))
+    return 0
+
+
+def cmd_coverage(args):
+    scenarios, error = _load_for_report(args.dir)
+    if error:
+        sys.stderr.write("%s: %s\n" % (PROG, error))
+        return 1
+    covered = coverage(scenarios)
+    through = getattr(args, "through_pr", None)
+    for problem, ids in covered.items():
+        late = through is not None and PROBLEM_DUE_PR[problem] > through
+        print("problem %d: %s" % (problem, ", ".join(ids) or
+                                  ("(not due until PR %d)" % PROBLEM_DUE_PR[problem] if late else "(no scenario)")))
+    missing = [problem for problem, ids in covered.items() if not ids
+               and (through is None or PROBLEM_DUE_PR[problem] <= through)]
+    if args.enforce and missing:
+        sys.stderr.write("%s: no scenario covers problem(s) %s\n" % (PROG, ", ".join(map(str, missing))))
+        return 1
+    return 0
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog=PROG, description="Check and list switchboard scenarios (docs/switchboard.md#scenario-testing).")
+    sub = parser.add_subparsers(dest="action", required=True)
+    check = sub.add_parser("validate", help="Validate scenario files (default: every *.json in %s)"
+                           % DEFAULT_DIR.relative_to(BIN.parent))
+    check.add_argument("paths", nargs="*", help="Files or directories")
+    for name, text in (("list", "One line per scenario"),
+                       ("coverage", "Which scenarios cover each of problems 1-4")):
+        command = sub.add_parser(name, help=text)
+        command.add_argument("--dir", type=Path, default=DEFAULT_DIR, help="Scenario directory")
+        if name == "coverage":
+            command.add_argument("--enforce", action="store_true",
+                                 help="Exit 1 when any of problems 1-4 has no scenario")
+            command.add_argument("--through-pr", type=int, metavar="N",
+                                 help="Enforce only the problems whose scenarios are due by PR N")
+    return parser
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    return {"validate": cmd_validate, "list": cmd_list, "coverage": cmd_coverage}[args.action](args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,29 @@
+{
+  "id": "SG1",
+  "title": "Spike, real GitHub scratch repo: the forwarder, signed events, sub_issues, a second forwarder, a kill, catch-up",
+  "problem": null,
+  "since_pr": 5,
+  "tiers": ["lab-scripted"],
+  "tags": ["spike"],
+  "cast": {
+    "platform": {"role": "orchestrator", "charter": 1}
+  },
+  "issues": {
+    "2": {"intent": "A scratch sub-issue for the spike", "parent": 1}
+  },
+  "steps": [
+    {"at": "30s", "actor": "world", "do": "comment", "issue": 2, "id": 1001, "body": "Arrives over the websocket, signed",
+     "why": "Passes when the forwarder created and activated the hook and the event reached the listener signed"},
+    {"at": "1m", "actor": "world", "do": "occupy-hook",
+     "why": "A second forwarder for the same repo must get Hook already exists"},
+    {"at": "90s", "actor": "world", "do": "kill-forwarder",
+     "why": "Record whether the hook is cleaned up or left inactive"},
+    {"at": "2m", "actor": "world", "do": "comment", "issue": 2, "id": 1002, "body": "Sent while the forwarder is down: absent, then recovered by catch-up"},
+    {"at": "6m", "actor": "world", "do": "wait"}
+  ],
+  "expect": [
+    {"name": "first-once", "that": "delivered", "to": "platform", "key": "github.comment:*", "keys": 2},
+    {"name": "second-seen", "that": "github_watch", "state": "conflict"}
+  ],
+  "control": {"fault": "no-dedupe", "fails": ["first-once"]}
+}

@@ -1,0 +1,30 @@
+{
+  "id": "F2",
+  "title": "A message about the work in progress",
+  "problem": 2,
+  "since_pr": 8,
+  "tiers": ["offline", "lab-model"],
+  "config": {"classifier_mode": "act"},
+  "cast": {
+    "cos": {"role": "chief-of-staff", "issue": 610}
+  },
+  "issues": {
+    "610": {"intent": "Draft the migration plan", "done_when": "the plan is in the repo"}
+  },
+  "steps": [
+    {"at": "0s", "actor": "cos", "do": "turn", "lasts": "90s", "steps": 9},
+    {"at": "20s", "actor": "you", "do": "message", "to": "cos", "text": "How far along is the migration plan?",
+     "why": "The answers file says this is about the work in progress"},
+    {"at": "60s", "actor": "world", "do": "wait"}
+  ],
+  "expect": [
+    {"name": "classified-current", "that": "classified", "agent": "cos", "step": 1, "as": "current"},
+    {"name": "no-decoration", "that": "message_count", "to": "cos", "count": 0,
+     "why": "It reaches the Chief of Staff as usual: nothing is added, nothing is handed off"},
+    {"name": "answers-from-the-work", "that": "judged", "agent": "cos", "threshold": 0.8,
+     "question": "Did the Chief of Staff answer the question about the migration plan itself, without starting a handoff?",
+     "why": "lab-model only; not evaluated offline"}
+  ],
+  "control": {"variant": {"steps": {"1": {"text": "Also, can you look at the billing export?"}}},
+              "fails": ["classified-current", "no-decoration"]}
+}

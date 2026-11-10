@@ -1,0 +1,108 @@
+{
+  "id": "O3",
+  "title": "The owner adds an order on GitHub: a new note arrives, and the judge reads it at the next tool call",
+  "problem": 3,
+  "since_pr": 17,
+  "tiers": [
+    "offline"
+  ],
+  "tags": [],
+  "cast": {
+    "platform": {
+      "role": "orchestrator",
+      "charter": 1,
+      "issue": 2
+    }
+  },
+  "issues": {
+    "1": {
+      "intent": null,
+      "authority": "keep pull requests small"
+    },
+    "2": {
+      "intent": "Ship the release",
+      "done_when": "the release is live",
+      "parent": 1
+    }
+  },
+  "steps": [
+    {
+      "at": "0s",
+      "actor": "you",
+      "do": "away"
+    },
+    {
+      "at": "10s",
+      "actor": "you",
+      "do": "message",
+      "to": "platform",
+      "text": "what is next?",
+      "why": "The first note is read"
+    },
+    {
+      "at": "60s",
+      "actor": "you",
+      "do": "edit-orders",
+      "charter": 1,
+      "text": "approve deploys in this repo",
+      "why": "You edit the charter issue on GitHub yourself"
+    },
+    {
+      "at": "90s",
+      "actor": "platform",
+      "do": "tool-call",
+      "tool": "shell",
+      "arguments": "gh workflow run deploy.yml",
+      "why": "A deploy: without the order the judge asks you; with it, it does not"
+    },
+    {
+      "at": "2m",
+      "actor": "you",
+      "do": "message",
+      "to": "platform",
+      "text": "and now?",
+      "why": "The edited orders are read"
+    },
+    {
+      "at": "5m",
+      "actor": "world",
+      "do": "wait"
+    }
+  ],
+  "expect": [
+    {
+      "name": "new-note-with-the-edit",
+      "that": "delivered",
+      "to": "platform",
+      "key": "orders:*#1:*",
+      "mode": "note",
+      "count": 2,
+      "keys": 2
+    },
+    {
+      "name": "it-names-the-new-order",
+      "that": "delivered",
+      "to": "platform",
+      "key": "orders:*#1:*",
+      "mode": "note",
+      "count": 1,
+      "text": "approve deploys in this repo"
+    },
+    {
+      "name": "deploy-allowed",
+      "that": "policy_outcome",
+      "agent": "platform",
+      "step": 3,
+      "outcome": "allow",
+      "judged": true,
+      "jev_calls": 1,
+      "why": "The order covers it: the judge's question saw it"
+    }
+  ],
+  "control": {
+    "fault": "orders-never-judged",
+    "fails": [
+      "deploy-allowed"
+    ]
+  }
+}

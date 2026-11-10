@@ -1,0 +1,25 @@
+{
+  "id": "E1",
+  "title": "A command that needs the daemon starts it when it is dead, and the message is delivered",
+  "problem": null,
+  "since_pr": 16,
+  "tiers": ["offline"],
+  "cast": {
+    "platform": {"role": "orchestrator", "charter": 1},
+    "coder": {"role": "coder", "reports_to": "platform", "issue": 2}
+  },
+  "issues": {
+    "2": {"intent": "Add a health check", "done_when": "GET /health returns 200"}
+  },
+  "steps": [
+    {"at": "10s", "actor": "world", "do": "kill-daemon", "why": "The daemon dies, or nobody started it after a reboot"},
+    {"at": "20s", "actor": "world", "do": "fact", "to": "platform", "key": "lab.fact:after-death", "summary": "The coder pushed a fix", "batch": false},
+    {"at": "60s", "actor": "you", "do": "use", "command": "decisions", "why": "You run any command that needs the daemon: it starts one first"},
+    {"at": "2m", "actor": "world", "do": "wait"}
+  ],
+  "expect": [
+    {"name": "delivered-after-revival", "that": "delivered", "to": "platform", "key": "lab.fact:after-death", "count": 1,
+     "why": "Nobody ran `ensure`: the command did, and the next pass delivered the fact that waited"}
+  ],
+  "control": {"fault": "no-ensure-on-use", "fails": ["delivered-after-revival"]}
+}

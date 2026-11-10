@@ -1,0 +1,4 @@
+{
+ "command": "pending",
+ "help": "usage: fleet-switchboard pending [-h] [--json] name positional arguments: name The agent's fleet name options: -h, --help show this help message and exit --json Emit machine-readable JSON instead"
+}
