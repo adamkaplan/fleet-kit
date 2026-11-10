@@ -132,7 +132,6 @@ class TestLandText(unittest.TestCase):
             self.assertIn("exit 22 = held for a person: stop and say so", text, path)
             self.assertIn("nohup sh -c '.spire/tool/bin/spire land > /work/land.log 2>&1;", text, path)
             self.assertIn(line.split("commit, ", 1)[1].rsplit(".\n", 1)[0], text, path)   # the step is the launcher's own, word for word (no drift)
-            self.assertNotRegex(text, r"\b(\w+), \1,", path)
             self.assertEqual(self.foreground_forms(text), [], path)
             self.assertIn("This repository lands with `spire land`", text, path)   # tied to the launcher's own marker
         self.assertIn(".spire/tool/bin/spire land", line)

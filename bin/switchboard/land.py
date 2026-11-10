@@ -44,7 +44,7 @@ def validate_land_repos(config, source):
 
 
 # ---- the launch text (this branch): the one landing line a launch for a land repository carries
-LAND_STEP = ('run it DETACHED: `nohup sh -c \'.spire/tool/bin/spire land > /work/land.log 2>&1; echo "exit $?" >> /work/land.log\' > /dev/null 2>&1 &`, then poll with short calls (`sleep 120; tail -n 20 /work/land.log`, each under 5 minutes) and report `fleet-switchboard report working "land step <where it is>"` about every 10 minutes; never one foreground `spire land` call (it is moved to a background shell and your turn ends unwoken). The run is over when the log\'s last line is `exit <code>`: report `landed <sha>` or the exit code and what stopped it; exit 22 = held for a person: stop and say so')
+LAND_STEP = ('run it DETACHED: `nohup sh -c \'.spire/tool/bin/spire land > /work/land.log 2>&1; r=$?; { echo; echo "exit $r"; } >> /work/land.log\' > /dev/null 2>&1 &`, then poll with short calls (`sleep 120; tail -n 20 /work/land.log`, each under 5 minutes) and report `fleet-switchboard report working "land step <where it is>"` about every 10 minutes; never one foreground `spire land` call (it is moved to a background shell and your turn ends unwoken). The run is over when the log\'s last line is `exit <code>`: report `landed <sha>` or the exit code and what stopped it; exit 22 = held for a person: stop and say so')
 LAND_SETUP_LINE = ("- This repository lands with `spire land`: when done, commit, "
                    + LAND_STEP + ".\n")
 
