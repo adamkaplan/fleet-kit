@@ -20,7 +20,7 @@ class Reached(Exception):
 
 
 class Home(unittest.TestCase):
-    """A temporary HOME with ~/Code, a main checkout in it and a place outside it that is not the temp directory's own children of ~/Code."""
+    """A temporary HOME with ~/Code, a main checkout in it, and a separate temp directory (tempfile.tempdir points at it)."""
 
     def setUp(self):
         self.base = Path(os.path.realpath(tempfile.mkdtemp(prefix="wtroot-")))
@@ -99,6 +99,14 @@ class TestCheck(Home):
         (self.code / "fresh").symlink_to(target)
         self.assertIsNotNone(sb.check_worktree_path({}, str(self.code / "fresh")))
 
+    def test_s2_a_link_elsewhere_that_resolves_to_a_top_level_entry_is_refused(self):
+        real = self.code / "fresh"
+        real.mkdir()
+        away = self.base / "away"
+        away.mkdir()
+        (away / "wt").symlink_to(real)
+        self.assertIsNotNone(sb.check_worktree_path({}, str(away / "wt")))
+
     def test_s2_a_path_that_is_not_absolute_is_refused(self):
         for path in ("fresh", "", None, 5):
             with self.subTest(path=path):
@@ -153,17 +161,22 @@ class TestLaunch(Home):
         os.chdir(under)
         self.assertEqual(self.launch(".")[0], "reached")
 
+    def test_s2_a_link_in_code_to_a_worktree_elsewhere_is_refused_by_launch(self):
+        far = self.worktree(self.base / "far" / "job-far", "job-far")
+        (self.code / "linked").symlink_to(far)
+        self.assertNotEqual(self.launch(str(self.code / "linked"))[0], "reached")
+
     def test_s2_the_owners_main_checkout_in_code_is_not_refused(self):
         self.assertEqual(self.launch(str(self.main))[0], "reached")
 
-    def test_s2_control_without_the_check_the_same_top_level_worktree_starts(self):
+    def test_s2_control_without_the_check_the_top_level_worktree_case_starts(self):
         """A bypass control (the check switched off, which is what the launch did before this change): the same launch goes on, so the refusal above is the check's own."""
         top = self.worktree(self.code / "job-top", "job-top")
         self.assertEqual(self.launch(top, check=False)[0], "reached")
 
 
 class TestText(unittest.TestCase):
-    def test_s3_the_skill_names_the_root_once_and_no_line_makes_a_top_level_worktree(self):
+    def test_s3_the_skill_names_the_root_and_no_line_makes_a_top_level_worktree(self):
         flat = " ".join((REPO / "skills" / "fleet-coordination" / "SKILL.md").read_text().split())
         self.assertIn("worktree_root", flat)
         self.assertIn("~/Code/.fleet", flat)
