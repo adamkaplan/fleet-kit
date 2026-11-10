@@ -1,0 +1,32 @@
+{
+  "id": "P5",
+  "title": "Jev is slow or unreachable",
+  "problem": null,
+  "since_pr": 9,
+  "tiers": ["offline"],
+  "tags": ["lab-scripted-owed-sp1"],
+  "cast": {
+    "chief-of-staff": {"role": "chief-of-staff"},
+    "platform": {"role": "orchestrator", "reports_to": "chief-of-staff", "charter": 1, "issue": 2}
+  },
+  "issues": {
+    "1": {"intent": null},
+    "2": {"intent": "Add a health check", "done_when": "GET /health returns 200", "parent": 1}
+  },
+  "steps": [
+    {"at": "0s", "actor": "platform", "do": "tool-call", "tool": "shell", "configured": "ask",
+     "arguments": "npm run deploy-status",
+     "why": "Jev times out: the configured ask stands"},
+    {"at": "1s", "actor": "platform", "do": "tool-call", "tool": "shell", "configured": "allow",
+     "arguments": "curl https://status.invalid/api",
+     "why": "Jev is unreachable: the configured allow stands, and the call is not held up"},
+    {"at": "30s", "actor": "world", "do": "wait"}
+  ],
+  "expect": [
+    {"name": "timeout-keeps-ask", "that": "policy_outcome", "agent": "platform", "step": 0, "outcome": "ask",
+     "judged": false, "reason": "configured outcome stands"},
+    {"name": "unreachable-keeps-allow", "that": "policy_outcome", "agent": "platform", "step": 1, "outcome": "allow",
+     "judged": false, "reason": "unreachable"}
+  ],
+  "control": {"fault": "judge-loosens", "fails": ["timeout-keeps-ask"]}
+}

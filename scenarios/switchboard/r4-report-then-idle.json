@@ -1,0 +1,92 @@
+{
+  "id": "R4",
+  "title": "A worker reports done, then stops: the boss hears once",
+  "problem": 4,
+  "since_pr": 13,
+  "tiers": [
+    "offline"
+  ],
+  "tags": [
+    "lab-scripted-owed-sp1"
+  ],
+  "cast": {
+    "platform": {
+      "role": "orchestrator",
+      "charter": 1
+    },
+    "coder": {
+      "role": "coder",
+      "reports_to": "platform",
+      "issue": 2
+    }
+  },
+  "issues": {
+    "2": {
+      "intent": "Add a health check",
+      "done_when": "GET /health returns 200"
+    }
+  },
+  "steps": [
+    {
+      "at": "0s",
+      "actor": "you",
+      "do": "away",
+      "why": "You have not prompted the orchestrator"
+    },
+    {
+      "at": "0s",
+      "actor": "coder",
+      "do": "turn",
+      "lasts": "20s",
+      "steps": 2,
+      "why": "The worker is given its task and works for 20 s"
+    },
+    {
+      "at": "15s",
+      "actor": "coder",
+      "do": "report",
+      "state": "done",
+      "text": "PR is up and green",
+      "issue": 2,
+      "why": "It tells its boss at its deliverable, before it stops"
+    },
+    {
+      "at": "3m",
+      "actor": "world",
+      "do": "wait",
+      "why": "Past the batch window and several passes: a bare idle would have woken the boss by now"
+    }
+  ],
+  "expect": [
+    {
+      "name": "report-woke",
+      "that": "delivered",
+      "to": "platform",
+      "key": "report:coder:*",
+      "mode": "wake",
+      "count": 1,
+      "text": "done: PR is up and green"
+    },
+    {
+      "name": "idle-is-silent",
+      "that": "delivered",
+      "to": "platform",
+      "key": "worker.idle:*",
+      "count": 0,
+      "why": "The stop that follows a report is only a rider, and a rider alone sends nothing"
+    },
+    {
+      "name": "one-message",
+      "that": "message_count",
+      "to": "platform",
+      "count": 1
+    }
+  ],
+  "control": {
+    "fault": "idle-wakes",
+    "fails": [
+      "idle-is-silent",
+      "one-message"
+    ]
+  }
+}

@@ -1,0 +1,28 @@
+{
+  "id": "I2",
+  "title": "An issue has no Intent section",
+  "problem": 1,
+  "since_pr": 6,
+  "tiers": ["offline"],
+  "cast": {
+    "platform": {"role": "orchestrator", "charter": 1},
+    "coder": {"role": "coder", "reports_to": "platform", "issue": 2}
+  },
+  "issues": {
+    "1": {"intent": null},
+    "2": {"intent": null, "parent": 1}
+  },
+  "steps": [
+    {"at": "0s", "actor": "world", "do": "fact", "to": "platform", "key": "send:coder:i2-pr", "kind": "send",
+     "issue": 2, "from": "coder", "summary": "PR is up"},
+    {"at": "5m", "actor": "world", "do": "wait"}
+  ],
+  "expect": [
+    {"name": "says-no-intent", "that": "message_shows", "to": "platform", "text": "Ask #2: no intent recorded"},
+    {"name": "listed-in-status", "that": "intent_gap", "issue": 2}
+  ],
+  "control": {
+    "variant": {"issues": {"2": {"intent": "Add a health check", "done_when": "GET /health returns 200"}}},
+    "fails": ["says-no-intent", "listed-in-status"]
+  }
+}

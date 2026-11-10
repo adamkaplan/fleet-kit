@@ -1,0 +1,38 @@
+{
+  "id": "F3",
+  "title": "A message about an ask a background subagent owns",
+  "problem": 2,
+  "since_pr": 8,
+  "tiers": ["offline", "lab-model"],
+  "config": {"classifier_mode": "act"},
+  "cast": {
+    "cos": {"role": "chief-of-staff"},
+    "cos-615": {"role": "cos-subagent", "reports_to": "cos", "issue": 615}
+  },
+  "issues": {
+    "615": {"intent": "Fix the project agents that show \"Agent unavailable\"",
+            "done_when": "both project agents answer a chat message in production"}
+  },
+  "steps": [
+    {"at": "0s", "actor": "cos", "do": "turn", "lasts": "90s", "steps": 9,
+     "why": "The Chief of Staff is busy with something else"},
+    {"at": "1s", "actor": "cos-615", "do": "turn", "lasts": "5m", "steps": 5,
+     "why": "The subagent works on ask 615 throughout the play"},
+    {"at": "20s", "actor": "you", "do": "message", "to": "cos",
+     "text": "Those project agents still show Agent unavailable, but only on staging",
+     "why": "The answers file says this is about ask 615"},
+    {"at": "60s", "actor": "world", "do": "wait"}
+  ],
+  "expect": [
+    {"name": "names-the-owner", "that": "delivered", "to": "cos", "key": "decoration:*", "mode": "note", "count": 1,
+     "text": "fleet-switchboard send cos-615 --issue 615",
+     "why": "The decoration names the ask's owner and the exact command to reach it"},
+    {"name": "carries-the-ask", "that": "message_has_intent", "to": "cos", "issue": 615,
+     "why": "Grouped under the ask's Intent and Done when"},
+    {"name": "classified-the-ask", "that": "classified", "agent": "cos", "step": 2, "as": "615"},
+    {"name": "forwards-then-carries-on", "that": "judged", "agent": "cos", "threshold": 0.8,
+     "question": "Did the Chief of Staff send cos-615 the detail that the failure is only on staging, and then carry on with what it was doing?",
+     "why": "lab-model only; not evaluated offline"}
+  ],
+  "control": {"fault": "no-classify", "fails": ["names-the-owner", "carries-the-ask", "classified-the-ask"]}
+}

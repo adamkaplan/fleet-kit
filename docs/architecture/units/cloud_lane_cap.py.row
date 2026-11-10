@@ -1,0 +1,1 @@
+| `cloud_lane_cap.py` | 5 | the shape-M count of a lane (a stopped worker is not counted) and the hard-deadline test; a part of `cloud_worker.py` (#2259) | |

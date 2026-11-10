@@ -1,0 +1,9 @@
+{
+ "errors": [],
+ "tiers": {
+  "10": "human",
+  "11": "human",
+  "12": "cos",
+  "14": "human"
+ }
+}

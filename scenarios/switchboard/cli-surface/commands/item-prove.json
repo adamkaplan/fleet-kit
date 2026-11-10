@@ -1,0 +1,4 @@
+{
+ "command": "item-prove",
+ "help": "usage: fleet-switchboard item-prove [-h] --item ITEM [--plan PLAN] [--ask ASK] [--head HEAD] --evidence EVIDENCE [--result {pass,fail}] [--command COMMAND] scenario [scenario ...] positional arguments: scenario The scenario id in the item's plan (S1, U2, ...) options: -h, --help show this help message and exit --item ITEM The work item: owner/repo#N of an ISSUE (a pull request is refused: use prove/verdict --pr) --plan PLAN Only repeats the plan the issue body links with `PLAN:` --ask ASK The ask whose Done-when the plan must cover --head HEAD The item's reference commit (default: the one pinned at registration) --evidence EVIDENCE A link, or what you ran and saw --result {pass,fail} --command COMMAND The command you ran, if any"
+}

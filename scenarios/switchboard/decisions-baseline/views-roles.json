@@ -1,0 +1,87 @@
+{
+ "api-coder": {
+  "ids": [
+   "api#9",
+   "web#4",
+   "api#2df",
+   "web#2mv"
+  ],
+  "text": "Decisions: all repos, tier human (for you)\napi#9    waiting 12m  -          Both labels on one issue\nweb#4    waiting 12m  -          Pick the cache layer\napi#2df  waiting 11m  api-coder  permission: shell echo hi\nweb#2mv  waiting 11m  web-coder  question: Which database?\n",
+  "view": {
+   "repo": null,
+   "role": "coder",
+   "text": "all repos, tier human (for you)",
+   "tiers": [
+    "human"
+   ]
+  }
+ },
+ "api-orch": {
+  "ids": [
+   "api#2",
+   "api#9",
+   "api#101",
+   "api#2df",
+   "api#6cc",
+   "api#7hz"
+  ],
+  "text": "Decisions: repo acme/api, all tiers (for orchestrator)\napi#2    waiting 12m  [cos]  api-coder  Which database?\napi#9    waiting 12m  [human]  -          Both labels on one issue\napi#101  waiting 11m  [cos]  -          Cleanup of stale issues\napi#2df  waiting 11m  [human]  api-coder  permission: shell echo hi\napi#6cc  waiting 11m  [orchestrator]  api-coder  Which table should hold the totals?\napi#7hz  waiting 11m  [cos]  api-orch   blocked: cannot build until the key is rotated\n",
+  "view": {
+   "repo": "acme/api",
+   "role": "orchestrator",
+   "text": "repo acme/api, all tiers (for orchestrator)",
+   "tiers": null
+  }
+ },
+ "cos": {
+  "ids": [
+   "api#2",
+   "api#9",
+   "web#4",
+   "api#101",
+   "api#2df",
+   "web#2mv",
+   "api#6cc",
+   "api#7hz",
+   "web#8gj"
+  ],
+  "text": "Decisions: all repos, all tiers (for chief-of-staff)\napi#2    waiting 12m  [cos]  api-coder  Which database?\napi#9    waiting 12m  [human]  -          Both labels on one issue\nweb#4    waiting 12m  [human]  -          Pick the cache layer\napi#101  waiting 11m  [cos]  -          Cleanup of stale issues\napi#2df  waiting 11m  [human]  api-coder  permission: shell echo hi\nweb#2mv  waiting 11m  [human]  web-coder  question: Which database?\napi#6cc  waiting 11m  [orchestrator]  api-coder  Which table should hold the totals?\napi#7hz  waiting 11m  [cos]  api-orch   blocked: cannot build until the key is rotated\nweb#8gj  waiting 11m  [cos]  web-orch   Which region for the cache?\n",
+  "view": {
+   "repo": null,
+   "role": "chief-of-staff",
+   "text": "all repos, all tiers (for chief-of-staff)",
+   "tiers": null
+  }
+ },
+ "web-orch": {
+  "ids": [
+   "web#4",
+   "web#2mv",
+   "web#8gj"
+  ],
+  "text": "Decisions: repo acme/web, all tiers (for orchestrator)\nweb#4    waiting 12m  [human]  -          Pick the cache layer\nweb#2mv  waiting 11m  [human]  web-coder  question: Which database?\nweb#8gj  waiting 11m  [cos]  web-orch   Which region for the cache?\n",
+  "view": {
+   "repo": "acme/web",
+   "role": "orchestrator",
+   "text": "repo acme/web, all tiers (for orchestrator)",
+   "tiers": null
+  }
+ },
+ "you": {
+  "ids": [
+   "api#9",
+   "web#4",
+   "api#2df",
+   "web#2mv"
+  ],
+  "text": "Decisions: all repos, tier human (for you)\napi#9    waiting 12m  -          Both labels on one issue\nweb#4    waiting 12m  -          Pick the cache layer\napi#2df  waiting 11m  api-coder  permission: shell echo hi\nweb#2mv  waiting 11m  web-coder  question: Which database?\n",
+  "view": {
+   "repo": null,
+   "role": null,
+   "text": "all repos, tier human (for you)",
+   "tiers": [
+    "human"
+   ]
+  }
+ }
+}

@@ -1,0 +1,17 @@
+[
+ "create",
+ "coder7",
+ "--repo",
+ "acme-org/widget-service",
+ "--branch",
+ "main",
+ "--run-id",
+ "<run-id>",
+ "--json",
+ "--password-fd",
+ "<fd>",
+ "--run-secret-fd",
+ "model-auth=<fd>",
+ "--run-secret-fd",
+ "git-token=<fd>"
+]
