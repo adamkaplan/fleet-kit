@@ -281,7 +281,7 @@ push_scope_check() {   # the words after `push`: true in scope when the remote i
       -o|--push-option|--receive-pack|--exec) ps_k=1 ;;
       --dry-run|--verbose|--quiet|--set-upstream|--tags|--follow-tags|--no-verify|--progress|--atomic|--porcelain|--prune|--delete|--thin|--no-thin) ;;
       --push-option=*|--receive-pack=*|--exec=*) ;;
-      -*[!unvqd46-]*|--*) return 1 ;;
+      -|-*[!unvqd46-]*|--*) return 1 ;;
     esac
   done
   ps_r=$(push_remote "$@")
@@ -296,8 +296,8 @@ push_scope_check() {   # the words after `push`: true in scope when the remote i
   case "$ps_r" in
     /*|file://*)   # a path or URL word: git still uses a configured remote of that name, and any rewrite rule of a configuration file
       case "${GIT_CONFIG_GLOBAL:-/dev/null}${GIT_CONFIG_SYSTEM:-/dev/null}" in /dev/null/dev/null) ;; *) return 1 ;; esac
-      [ -z "$(sgit -C "$sc_dir" config --get "remote.$ps_r.url" 2>/dev/null)$(sgit -C "$sc_dir" config --get "remote.$ps_r.pushurl" 2>/dev/null)" ] || return 1
-      [ -z "$(sgit -C "$sc_dir" config --get-regexp '^url\..*\.(push)?insteadof$' 2>/dev/null)" ] || return 1
+      [ -z "$("$real_git" -C "$sc_dir" config --get "remote.$ps_r.url" 2>/dev/null)$("$real_git" -C "$sc_dir" config --get "remote.$ps_r.pushurl" 2>/dev/null)" ] || return 1
+      [ -z "$("$real_git" -C "$sc_dir" config --get-regexp '^url\..*\.(push)?insteadof$' 2>/dev/null)" ] || return 1   # the real configuration: $HOME, XDG and /etc files too
       ps_u=$ps_r ;;
     -*|*:*|*..*|*/*) return 1 ;;
     *) ps_u=$("$real_git" -C "$sc_dir" remote get-url --push --all "$ps_r" 2>/dev/null) || return 1 ;;   # the real configuration (env_cfg has judged it): rewrites apply
@@ -306,6 +306,12 @@ push_scope_check() {   # the words after `push`: true in scope when the remote i
     case "$ps_one" in *%*) return 1 ;; file:///*) ps_one=${ps_one#file://} ;; file:*) return 1 ;; /*) ;; *) return 1 ;; esac
     ps_d=$(phys "$ps_one") || return 1
     tmp_under "$ps_d" || return 1
+    ps_g=$(sgit -C "$ps_d" rev-parse --absolute-git-dir 2>/dev/null) || return 1   # the destination's own git directory (a .git file may lead elsewhere)
+    ps_g=$(phys "$ps_g") || return 1
+    tmp_under "$ps_g" || return 1
+    ps_g=$(sgit -C "$ps_d" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || return 1
+    ps_g=$(phys "$ps_g") || return 1
+    tmp_under "$ps_g" || return 1
   done <<EOF
 $ps_u
 EOF

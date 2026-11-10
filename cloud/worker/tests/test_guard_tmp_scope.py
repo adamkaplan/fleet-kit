@@ -147,6 +147,19 @@ class Scope(unittest.TestCase):
         self.allowed(["push", "-u", "origin", "main"])
         self.allowed(["push", "-o", "x", "origin", "main"])
 
+    def test_s3_a_destination_whose_git_file_leads_out_and_a_home_rewrite_do_not_open_the_push(self):
+        dest = os.path.join(self.root, "gitfile-dest")
+        os.makedirs(dest)
+        with open(os.path.join(dest, ".git"), "w") as f:
+            f.write("gitdir: %s\n" % (self.outrepo + "/.git" if self.outrepo else "/usr"))
+        self.refused(["push", dest, "main"], PUSH)
+        home = os.path.join(self.root, "home")
+        os.makedirs(home, exist_ok=True)
+        with open(os.path.join(home, ".gitconfig"), "w") as f:
+            f.write('[url "https://github.com/o/r"]\n\tpushInsteadOf = %s\n' % self.remote)
+        self.refused(["push", self.remote, "main"], PUSH, env={"HOME": home})
+        self.refused(["push", "-", self.remote, "main"], PUSH)
+
     def test_s3_in_scope_force_a_glob_and_all_stay_refused(self):
         self.refused(["push", "--force", "origin", "main"], FORCE)
         self.refused(["push", "-f", "origin", "main"], FORCE)
