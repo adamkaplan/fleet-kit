@@ -91,7 +91,8 @@ def problems(t):
         out.append("check or chain masked")
     if not re.search(r"^ARG PGMQ_VERSION=1\.13\.0$", blk, re.M):
         out.append("the queue extension is not the version the repository creates")
-    if "--without-openssl" in flat:
+    cf = re.search(r"\./configure [^\n&]*", flat)
+    if not cf or not re.search(r"(?<![\w-])--with-openssl\b", cf.group(0)) or "--without-openssl" in flat:
         out.append("the server was built without OpenSSL")
     code = "\n".join(x for x in blk.replace("\\\n", " ").split("\n") if not x.startswith("#"))
     if len(re.findall(r"sha256sum -c", code)) != 1:
@@ -192,9 +193,12 @@ class T(unittest.TestCase):
     def test_mutant_without_openssl_is_refused(self):
         t = read(DF)
         self.assertEqual(problems(t), [])  # control first: the real file is clean
-        self.assertNotIn("--without-openssl", t)
-        m = self.mut("--without-zlib", "--without-zlib --without-openssl")
+        self.assertIn("--with-openssl", t)
+        m = self.mut(" --with-openssl", "")
+        self.assertNotIn("--with-openssl", m)
         self.assertIn("the server was built without OpenSSL", problems(m))
+        m2 = self.mut("--with-openssl", "--without-openssl")
+        self.assertIn("the server was built without OpenSSL", problems(m2))
 
     def test_mutant_pgmq_version_is_the_repositorys(self):
         t = read(DF)

@@ -129,7 +129,7 @@ ARG PGMQ_COMMIT=32c075bb6dbed66a303d1a792393c93e36c09a97
 RUN set -eu; curl -fsSL "https://ftp.postgresql.org/pub/source/v${PG_VERSION}/postgresql-${PG_VERSION}.tar.bz2" -o /tmp/pg.tar.bz2 \
  && echo "${PG_SHA256}  /tmp/pg.tar.bz2" | sha256sum -c - \
  && mkdir -p /src/pg && tar -xjf /tmp/pg.tar.bz2 -C /src/pg --strip-components=1 && rm /tmp/pg.tar.bz2 \
- && cd /src/pg && ./configure --prefix=/opt/pg --without-readline --without-icu --without-zlib \
+ && cd /src/pg && ./configure --prefix=/opt/pg --without-readline --without-icu --without-zlib --with-openssl \
  && make -j"$(nproc)" && make install
 RUN set -eu; git clone --filter=blob:none https://github.com/pgvector/pgvector /src/pgvector \
  && cd /src/pgvector && git checkout --detach "${PGVECTOR_COMMIT}" \
