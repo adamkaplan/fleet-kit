@@ -284,9 +284,13 @@ push_scope_check() {   # the words after `push`: true in scope when the remote i
     [ -n "$ps_r" ] || ps_r=origin
   fi
   case "$ps_r" in
-    /*|file://*) ps_u=$ps_r ;;
+    /*|file://*)   # a path or URL word: git still uses a configured remote of that name, and any rewrite rule of a configuration file
+      case "${GIT_CONFIG_GLOBAL:-/dev/null}${GIT_CONFIG_SYSTEM:-/dev/null}" in /dev/null/dev/null) ;; *) return 1 ;; esac
+      [ -z "$(sgit -C "$sc_dir" config --get "remote.$ps_r.url" 2>/dev/null)$(sgit -C "$sc_dir" config --get "remote.$ps_r.pushurl" 2>/dev/null)" ] || return 1
+      [ -z "$(sgit -C "$sc_dir" config --get-regexp '^url\..*\.(push)?insteadof$' 2>/dev/null)" ] || return 1
+      ps_u=$ps_r ;;
     -*|*:*|*..*|*/*) return 1 ;;
-    *) ps_u=$(sgit -C "$sc_dir" remote get-url --push "$ps_r" 2>/dev/null) || return 1 ;;
+    *) ps_u=$("$real_git" -C "$sc_dir" remote get-url --push "$ps_r" 2>/dev/null) || return 1 ;;   # the real configuration (env_cfg has judged it): rewrites apply
   esac
   case "$ps_u" in *%*) return 1 ;; file:///*) ps_u=${ps_u#file://} ;; file:*) return 1 ;; /*) ;; *) return 1 ;; esac
   ps_d=$(phys "$ps_u") || return 1

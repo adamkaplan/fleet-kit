@@ -118,6 +118,16 @@ class Scope(unittest.TestCase):
         git(r, "remote", "set-url", "origin", self.remote)
         self.allowed(["push", "origin", "main"])
 
+    def test_s3_a_remote_named_like_a_url_and_a_rewrite_rule_do_not_open_the_push(self):
+        os.makedirs(os.path.join(self.root, "x"), exist_ok=True)
+        name = "file://" + self.root + "/x"
+        git(self.repo, "config", "remote.%s.url" % name, "https://github.com/o/nonexist.git")
+        self.addCleanup(git, self.repo, "config", "--remove-section", "remote." + name)
+        self.refused(["push", name, "main"], PUSH)
+        g = self.gfile("rewrite", '[url "https://github.com/o/nonexist.git"]\n\tpushInsteadOf = %s\n' % self.remote)
+        self.refused(["push", "origin", "main"], PUSH, env={"GIT_CONFIG_GLOBAL": g})
+        self.refused(["push", self.remote, "main"], PUSH, env={"GIT_CONFIG_GLOBAL": g})
+
     def test_s3_in_scope_force_a_glob_and_all_stay_refused(self):
         self.refused(["push", "--force", "origin", "main"], FORCE)
         self.refused(["push", "-f", "origin", "main"], FORCE)
