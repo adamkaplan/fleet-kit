@@ -70,6 +70,7 @@ cloud/worker/tests/test_cloud_prepush_background.py
 cloud/worker/tests/test_comment_by_id.py
 cloud/worker/tests/test_cw_gh.py
 cloud/worker/tests/test_dockerfile_browser.py
+cloud/worker/tests/test_dockerfile_pg_bundle.py
 cloud/worker/tests/test_dockerfile_postgres.py
 cloud/worker/tests/test_entrypoint.py
 cloud/worker/tests/test_entrypoint_import.py
