@@ -85,7 +85,7 @@ class Refused(Base):
                     cw.apply_settings(env, self.path)
                 text = str(caught.exception)
                 self.assertIn("CW_AZURE_CONFIG_DIR", text)
-                self.assertNotIn(value, text)
+                self.assertTrue(not value or value not in text)
                 self.assertNotIn("\n", text.strip())
                 self.assertEqual(env, {"AZURE_CONFIG_DIR": self.caller_dir})   # nothing was applied
 
