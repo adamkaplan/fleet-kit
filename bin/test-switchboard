@@ -67019,6 +67019,7 @@ TestTipWatch = importlib.import_module("test_tip_watch").build(Base, World, FAKE
 # The bin-set table test (#1457).
 _bin_set_table = importlib.import_module("test_bin_set_table")
 TestTheBinSetClassesAreAllInTheTable = _bin_set_table.TestTheBinSetClassesAreAllInTheTable
+_cos_blocked_owner = importlib.import_module("test_cos_blocked_owner"); TestCosBlockedOwner = _cos_blocked_owner.TestCosBlockedOwner
 # The heavy wrapper's progress line (#1762).
 TestHeavyProgress = importlib.import_module("test_heavy_progress").TestHeavyProgress
 # The shard tests (#2108).
@@ -75617,7 +75618,7 @@ class TestUndeliveredWake(Base):
                 self.assertTrue(result.failures or result.errors, "the mutant %r survives %s" % (name, test))
 
 
-class TestBlockedReport(Base):
+class TestBlockedReport(_cos_blocked_owner.BlockedReportOwnerAlarm, Base):
     """A blocked agent with messages held for it is reported to its boss and the Chief of Staff (docs/switchboard.md, "A blocked agent is reported")."""
 
     def setUp(self):

@@ -95,6 +95,11 @@ RUN chmod 0755 /usr/local/bin/start-dockerd /usr/local/bin/cw-stack-pull /usr/lo
  && chmod 0644 /usr/local/bin/plan_check.py \
  && chmod 0755 /usr/local/share/cw/guard.sh && chmod 0644 /usr/local/share/cw/opencode-worker.json /usr/local/share/cw/worker.md /usr/local/share/cw/orchestrator.md
 RUN chmod 0755 /usr/local/bin/cw-stack-up && chown root:root /usr/local/bin/cw-stack-up
+# The token service (cloud/k8s/token-mint.yaml runs `python3 /opt/cloud/launcher/token_service.py`): the launcher modules it imports,
+# directly or through cloud_worker (token_service -> app_token, cloud_worker; app_token -> token_mint; cloud_worker -> run_record, wip_save).
+# Root-owned, mode 0644, no secret, not executable; the secret scan below reads them. end_hook and token_mint keep their COPY lines above.
+COPY launcher/token_service.py launcher/app_token.py launcher/token_mint.py launcher/cloud_worker.py launcher/run_record.py launcher/wip_save.py /opt/cloud/launcher/
+RUN chown -R root:root /opt/cloud && chmod 0755 /opt/cloud /opt/cloud/launcher && chmod 0644 /opt/cloud/launcher/*.py
 
 USER worker
 WORKDIR /home/worker
@@ -153,3 +158,17 @@ FROM worker AS final
 COPY --from=scan /scan-ok /usr/local/share/cw/scan-ok
 # #1353: PostgreSQL 16 and the two extensions, installed files only (root-owned, no compiler, nothing starts them): see the pgbuild stage.
 COPY --from=pgbuild /opt/pg /opt/pg
+# ask #2329: /opt/pg-bundle, the Debian-style tree that scripts/dev/ephemeral-pg.sh reads through PG_BUNDLE, built by COPIES (cp -a) of /opt/pg:
+# no download, no build tool, no server started. The relocatable build resolves share beside bin, so /opt/pg/share/postgresql is also
+# copied to usr/lib/postgresql/16/share/postgresql. Root-owned, read-only for others; the run user is unchanged (set again below).
+USER root
+RUN set -eu; b=/opt/pg-bundle; l="$b/usr/lib/postgresql/16"; e="$b/usr/share/postgresql/16/extension"; s=/opt/pg/share/postgresql \
+ && mkdir -p "$l" "$e" \
+ && cp -a /opt/pg/bin /opt/pg/lib "$l/" \
+ && cp -a /opt/pg/share "$l/share" \
+ && cp -a "$s"/extension/vector.control "$s"/extension/vector--*.sql "$s"/extension/pgmq.control "$s"/extension/pgmq--*.sql "$e/" \
+ && cp -a "$s/postgresql.conf.sample" "$b/usr/share/postgresql/postgresql.conf.sample" \
+ && chown -R root:root "$b" && chmod -R go-w,a+rX "$b"
+ENV \
+  PG_BUNDLE=/opt/pg-bundle
+USER worker

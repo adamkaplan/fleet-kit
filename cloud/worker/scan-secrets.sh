@@ -23,6 +23,7 @@ P
 ALLOWLIST=${SCAN_ALLOWLIST:-$HERE/scan-allowlist.txt}
 ALLOWED=0   # hits the allowlist suppressed (printed, counted)
 
+DPKG=0     # --dir only: files that are unmodified files of installed distro packages are not scanned (README)
 SKIPS=()   # top-level names of --dir that are not scanned (--skip)
 # Roots to scan: the children of $1 that are real (not symlinks) and not skipped. Skips are exact top-level
 # names, never a name matched at any depth (a directory called "proc" deeper down IS scanned).
@@ -44,7 +45,10 @@ scan_dir() {
   [ -r "$ALLOWLIST" ] || { echo "scan-secrets: cannot read the allowlist $ALLOWLIST: not scanned" >&2; exit 2; }
   # the files are read as bytes by scan-files.py (binary, UTF-16 and NUL-padded files included); an error is exit 2
   pf=$(mktemp); printf '%s\n' "$PATTERNS" > "$pf"
-  rc=0; out=$(python3 "$HERE/scan-files.py" --allow "$ALLOWLIST" --prefix "$dir" "$pf" "${roots[@]}" 2>"$pf.err") || rc=$?
+  local -a dp=()
+  if [ "$DPKG" = 1 ]; then dp=(--dpkg "$dir"); fi
+  rc=0; out=$(python3 "$HERE/scan-files.py" --allow "$ALLOWLIST" --prefix "$dir" ${dp[@]+"${dp[@]}"} "$pf" "${roots[@]}" 2>"$pf.err") || rc=$?
+  if [ "$rc" -le 1 ] && [ -s "$pf.err" ]; then cat "$pf.err" >&2; fi   # the dpkg notes (also the fail-closed line)
   [ "$rc" -le 1 ] || { cat "$pf.err" >&2; rm -f "$pf" "$pf.err"; echo "scan-secrets: could not read some files under $dir: not scanned" >&2; exit 2; }
   rm -f "$pf" "$pf.err"
   if [ -n "$out" ]; then
@@ -54,6 +58,7 @@ scan_dir() {
         HIT$'\t'*) f=${f#HIT$'\t'}; echo "${f#/}"; hits=$((hits + 1)) ;;
         ALLOW$'\t'*) f=${f#ALLOW$'\t'}; echo "allowlisted: ${f#/}"; ALLOWED=$((ALLOWED + 1)) ;;
         TRIPLE$'\t'*) echo "triple: ${f#TRIPLE$'\t'}" ;;
+        SKIPPED$'\t'*) echo "dpkg: ${f#SKIPPED$'\t'} unmodified files of installed distro packages not scanned" ;;
       esac
     done <<<"$out"
   fi
@@ -79,6 +84,7 @@ if [ "${1:-}" = "--dir" ] && [ -n "${2:-}" ]; then
     [ "$1" = "--skip" ] && [ -n "${2:-}" ] || { echo "usage: $0 --dir <dir> [--skip <name>]..." >&2; exit 2; }
     SKIPS+=("$2"); shift 2
   done
+  DPKG=1
   report "" scan_dir "$d"
 fi
 # --meta <image>: the image configuration (env, labels, cmd) and history, with the same patterns. It reads no layer,
