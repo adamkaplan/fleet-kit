@@ -70,6 +70,7 @@ Each setting's name, whether the file requires it, and its kind (name, https URL
 | `CW_STACK_PULL_CLIENT_ID`, `CW_STACK_PULL_TENANT_ID` | no | guid | the pull identity's client id and tenant id (GUIDs, not secrets); set together with `CW_STACK_REGISTRY` |
 | `CW_MAX_PERSISTENT` | no | number | the most persistent orchestrators the namespace holds (an integer from 1 to 20, default 2; see "A persistent orchestrator") |
 | `CW_VAULT_CHECK_DIR` | no (needed once the vault refuses this machine) | path | the checkout of the vault access check, an absolute path (see section 2b) |
+| `CW_KEYCHAIN_SERVICE` | no | name | the macOS login-keychain service that holds the vault's secrets (items `cw-app-id`, `cw-app-key`, `cw-minter-kubeconfig`, one printable line each: the secret base64-encoded, or `gz:` and base64 of zlib for a long one); the vault reads then run `/usr/bin/security`, never `az`; a locked keychain is refused as `keychain-unavailable`; unset, the vault is read as before |
 | `CW_AZURE_CONFIG_DIR` | no | path | the `az` sign-in directory every vault read of a launch uses: an absolute path of an existing directory; it replaces the caller's `AZURE_CONFIG_DIR` (needed when the shell's own sign-in cannot read the vault) |
 
 How the installation is found: the mint signs a short-lived App token and asks GitHub which installation covers the repository (`GET /repos/OWNER/REPO/installation`), then mints the one-repository token for that installation. The answer must be one installation whose account is the repository's owner. A repository the App is not installed on is refused before any pod is created, with a message that says so. To cover a new repository, install the App on the account that owns it (an App installed on two accounts serves both) and add the repository to the installation; nothing in the vault changes.
@@ -118,6 +119,8 @@ CW_CLOUD_NAMESPACE=cw
 # CW_VAULT_CHECK_DIR=/home/user/vault-check
 # optional: the most persistent orchestrators the namespace holds (1 to 20, default 2)
 # CW_MAX_PERSISTENT=2
+# optional: read the vault's secrets from the macOS login keychain (service name) instead of the vault
+# CW_KEYCHAIN_SERVICE=cw-launcher
 # optional: the az sign-in directory every vault read uses (an absolute path of an existing directory; replaces the shell's AZURE_CONFIG_DIR)
 # CW_AZURE_CONFIG_DIR=/home/user/.azure-vault
 ```

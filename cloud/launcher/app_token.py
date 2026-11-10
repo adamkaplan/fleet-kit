@@ -37,6 +37,7 @@ import urllib.parse
 import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import keychain_read  # noqa: E402
 import token_mint  # noqa: E402
 
 API = "https://api.github.com"
@@ -147,6 +148,7 @@ def revoke_request(token):
 
 
 LABELS = ("vault firewall", "vault auth", "vault other", "App key", "installation", "permissions", "GitHub error", "other")
+LABELS += ("keychain-unavailable",)   # the keychain read timed out: the login keychain is locked or asks for access
 REFUSAL = {}  # the last refusal: {"label": one of LABELS, "line": the reason}; the preflight reads it after it catches the exit
 
 
@@ -228,6 +230,12 @@ def _vault_reason(exc, secret):
 
 def vault(env_name, secret):
     cmd = os.environ.get(env_name)
+    service = (os.environ.get("CW_KEYCHAIN_SERVICE") or "").strip()
+    if service and not cmd:   # the keychain route (the command settings win): /usr/bin/security, never az, the value in memory only
+        try:
+            return keychain_read.read(service, secret, MAX_BYTES, trim=secret != "cw-app-key")
+        except keychain_read.KeychainError as err:
+            die(err.line, err.kind, transient=err.kind == "keychain-unavailable")
     if cmd:
         argv = ["sh", "-c", cmd]
     else:
