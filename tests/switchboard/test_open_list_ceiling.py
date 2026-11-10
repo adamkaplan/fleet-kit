@@ -118,7 +118,7 @@ class TestOpenListCeiling(Base):
         hub = PagedHub(1000)
         budget = [sb.SWEEP_CALLS_PER_PASS]
         state = sb.SweepState()
-        engine = types.SimpleNamespace(hub=hub, now=lambda: NOW)
+        engine = types.SimpleNamespace(hub=hub, now=lambda: NOW, config={})   # sweep_refresh reads engine.config (#2320)
         state.started = NOW
         sb.sweep_refresh(engine, state, ["acme/api"], NOW, {"comment_window_days": 7}, sb.sweep_phrase_re(["Alex"]), budget)
         self.assertEqual(len(state.repos), 1)
