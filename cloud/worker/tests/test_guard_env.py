@@ -189,7 +189,7 @@ class GuardEnv(unittest.TestCase):
 
     def test_s6_control_first_then_a_mutant_that_allows_core_hooksPath_fails_with_the_anchored_text(self):
         self.refused_all()   # the control: the unmutated wrapper refuses every form
-        p = self.mutant("user.name|user.email) env_cfg_text", "user.name|user.email|core.hookspath) env_cfg_text")
+        p = self.mutant("user.email|user.name) env_cfg_text", "user.email|user.name|core.hookspath) env_cfg_text")
         self.assertEqual(self.run_guard(pairs(("core.hooksPath", "/tmp/h")), p).returncode, 0)   # the mutant lets it through
         with self.assertRaisesRegex(AssertionError, "a refused git setting was let through"):
             self.refused_all(p)

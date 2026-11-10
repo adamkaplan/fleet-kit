@@ -104,7 +104,7 @@ env_cfg_local() {   # $1: an absolute local path (letters, digits, dot, undersco
 env_cfg_pair() {   # $1: a key, $2: its value: only the listed settings pass (the key is compared in lower case; a URL part keeps its case)
   lk=$(printf '%s' "$1" | tr 'A-Z' 'a-z')
   case "$lk" in
-    user.name|user.email) env_cfg_text "$2" ;;
+    user.email|user.name) env_cfg_text "$2" ;;
     core.excludesfile) [ "$2" = /etc/gitignore ] || env_cfg_refuse ;;
     maintenance.auto) [ "$2" = false ] || env_cfg_refuse ;;
     gc.auto) [ "$2" = 0 ] || env_cfg_refuse ;;
