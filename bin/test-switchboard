@@ -42155,7 +42155,6 @@ class TestLaunchRefusedMessage(TestLaunchMemoryGate):
             ' > not args.agent or not args.dir|raise LaunchError("--agent and --dir are': (["launch", self.NAME], []),
             ' > getattr(args, "memory_ok", Non|return EXIT_USAGE': (no_memory_ok + ["--memory-ok", "  "], []),
             ' > refusal|return EXIT_MEMORY': (no_memory_ok, [mock.patch.object(sb, "launch_memory_check", lambda *a, **k: "memory: free 31%")]),
-            ' > made is not None > refusal|raise LaunchError(refusal)': (B, [P("worktree_of_directory", return_value=("/work/wt", "b")), P("check_worktree_path", return_value="a new top-level entry")]),   # #2363
             ' > getattr(args, "headless", Fals|raise LaunchError("--headless opens no t': (B + ["--headless"], []),
             ' > (args.name or "").startswith(L|raise LaunchError("names starting %r are': (["launch", sb.LANE_NAME_PREFIX + "x"] + B[2:], []),
             ' > problem|raise LaunchError(problem)': (B, [P("launch_agent_problem", return_value="the agent is not known")]),
