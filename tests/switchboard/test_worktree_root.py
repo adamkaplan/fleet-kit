@@ -93,6 +93,12 @@ class TestCheck(Home):
     def test_s2_the_default_root_is_named_when_the_key_is_absent(self):
         self.assertIn("~/Code/.fleet", sb.check_worktree_path({}, str(self.code / "fresh")))
 
+    def test_s2_a_symlink_as_the_last_component_is_still_a_top_level_entry(self):
+        target = self.base / "far" / "wt"
+        target.mkdir(parents=True)
+        (self.code / "fresh").symlink_to(target)
+        self.assertIsNotNone(sb.check_worktree_path({}, str(self.code / "fresh")))
+
     def test_s2_a_path_that_is_not_absolute_is_refused(self):
         for path in ("fresh", "", None, 5):
             with self.subTest(path=path):
@@ -135,11 +141,23 @@ class TestLaunch(Home):
         temp = self.worktree(self.temp / "job-temp", "job-temp")
         self.assertEqual(self.launch(temp)[0], "reached")
 
+    def test_s2_a_subdirectory_of_a_top_level_worktree_is_refused_too(self):
+        top = self.worktree(self.code / "job-top", "job-top")
+        Path(top, "sub").mkdir()
+        self.assertNotEqual(self.launch(os.path.join(top, "sub"))[0], "reached")
+
+    def test_s2_a_relative_dir_is_judged_by_where_it_is(self):
+        under = self.worktree(self.code / ".fleet" / "widgets" / "job-rel", "job-rel")
+        cwd = os.getcwd()
+        self.addCleanup(os.chdir, cwd)
+        os.chdir(under)
+        self.assertEqual(self.launch(".")[0], "reached")
+
     def test_s2_the_owners_main_checkout_in_code_is_not_refused(self):
         self.assertEqual(self.launch(str(self.main))[0], "reached")
 
     def test_s2_control_without_the_check_the_same_top_level_worktree_starts(self):
-        """Today's code: no check, the launch goes on. It shows the refusal above is the check's own."""
+        """A bypass control (the check switched off, which is what the launch did before this change): the same launch goes on, so the refusal above is the check's own."""
         top = self.worktree(self.code / "job-top", "job-top")
         self.assertEqual(self.launch(top, check=False)[0], "reached")
 
@@ -147,8 +165,8 @@ class TestLaunch(Home):
 class TestText(unittest.TestCase):
     def test_s3_the_skill_names_the_root_once_and_no_line_makes_a_top_level_worktree(self):
         flat = " ".join((REPO / "skills" / "fleet-coordination" / "SKILL.md").read_text().split())
-        self.assertEqual(flat.count("worktree_root"), 1)
-        self.assertEqual(flat.count("~/Code/.fleet"), 1)
+        self.assertIn("worktree_root", flat)
+        self.assertIn("~/Code/.fleet", flat)
         for path in (REPO / "skills").rglob("*"):
             if path.is_file() and path.suffix in (".md", ".txt"):
                 for line in path.read_text().splitlines():

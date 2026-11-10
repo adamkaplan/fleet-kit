@@ -21,7 +21,7 @@ def _inside(path, base):
 
 def worktree_root(config):
     """The configured root as a text with `~` kept (the default when the key is absent or null)."""
-    raw = (config or {}).get(WORKTREE_ROOT_KEY) if isinstance(config, dict) else None
+    raw = config.get(WORKTREE_ROOT_KEY) if isinstance(config, dict) else None
     return raw if isinstance(raw, str) and raw else WORKTREE_ROOT_DEFAULT
 
 
@@ -55,6 +55,7 @@ def check_worktree_path(config, path):
     if not isinstance(path, str) or not path or not os.path.isabs(path):
         return "the worktree path must be absolute; make worktrees under %s as <root>/<repo>/<name>" % root
     code = _real(CODE_DIR)
-    if os.path.dirname(os.path.realpath(path)) == code:
-        return "%s would be a new top-level entry of %s: make the worktree under the worktree root %s as <repo>/<name> (config key worktree_root)" % (path, CODE_DIR, root)
+    for parent in (os.path.dirname(os.path.realpath(path)), os.path.realpath(os.path.dirname(os.path.abspath(path)))):   # the resolved path, and the path as named (a symlink at the last component is still an entry of ~/Code)
+        if parent == code:
+            return "%s would be a new top-level entry of %s: make the worktree under the worktree root %s as <repo>/<name> (config key worktree_root)" % (path.replace("\n", " ")[:160], CODE_DIR, root)
     return None

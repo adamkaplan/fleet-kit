@@ -12663,8 +12663,9 @@ def _cmd_launch(args, runner, now, socket_call=None):
     if refusal:
         sys.stderr.write("%s: %s\n" % (PROG, refusal))
         return EXIT_MEMORY
-    if worktree_of_directory(subprocess.run, args.dir) is not None:   # #2363: a NEW local worker's linked worktree is never a new top-level entry of ~/Code (a main checkout is the owner's own)
-        refusal = check_worktree_path(engine.config, args.dir)
+    made = worktree_of_directory(subprocess.run, args.dir)   # #2363: a NEW local worker's LINKED worktree (its top level, whatever subdirectory --dir names) is never a new top-level entry of ~/Code.
+    if made is not None:   # On purpose not checked: a main checkout or clone (the owner's own), a directory that is not a worktree, and one git cannot read.
+        refusal = check_worktree_path(engine.config, made[0])
         if refusal:
             raise LaunchError(refusal)
     if getattr(args, "headless", False) and (args.workspace or args.new_workspace):
