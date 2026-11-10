@@ -80394,7 +80394,7 @@ NOT_ISOLATED_BY_BASE = {
     "TestTriageHiddenMutants", "TestTwoBranchesAddingATestFile", "TestUnconsumedRecord", "TestUnreadableSummary",
     "TestCloudHeadChecks",   # (#2247) pure: cloud_head_checks over a mock engine and a stubbed _api, no state path; the file came with #2267
     "TestGithubWriteGuard",   # (#2247) pure: reads the repository sources read-only and scans strings in memory, no state path; the file came with #2263
-    "TestAskIsItsOwn", "TestGateBudget", "TestReader", "TestConfigLoader", "TestSweepSkip",   # (#2247) pure (test_land_repos.py came with #2323: the land_repos reader, validate_config on dicts, sweep_refresh over stubs): _ask_of on strings and dicts (file from #2254); the shim source text and a number through plan_ledger.repo_setting over an in-memory config (file from #2296); no state path
+    "TestGateBudget", "TestReader", "TestConfigLoader", "TestSweepSkip", "TestAskIsItsOwn",   # (#2247) pure: _ask_of on strings and dicts; the file came with #2254 (and TestGateBudget: the shim source text and a number over an in-memory config, #2296; TestReader, TestConfigLoader, TestSweepSkip: the land_repos reader, validate_config on dicts, sweep_refresh over stubs, #2323)
     ),
     "makes its own temporary directory or state (a tempfile.mkdtemp, a patched environment or its own isolating setUp) and never reads the real one": (
     "TestEveryTestClassIsolates", "BodyRig", "TestDirectReads", "TestGateProbeReads", "TestGhBodyGuard", "TestGhBodyMutants", "TestGhBodyRefusalIsPure",
