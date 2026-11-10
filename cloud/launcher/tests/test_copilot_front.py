@@ -25,13 +25,18 @@ class Fake:
 
     def __init__(self):
         self.seen = []
+        self.usages = []   # one copilot_usage block (or None) per answer, in order; empty: no block
         outer = self
 
         class H(http.server.BaseHTTPRequestHandler):
             def do_POST(self):
                 n = int(self.headers.get("content-length") or 0)
                 outer.seen.append({"path": self.path, "headers": {k.lower(): v for k, v in self.headers.items()}, "body": json.loads(self.rfile.read(n))})
-                out = json.dumps({"choices": [{"message": {"role": "assistant", "content": ANSWER}}]}).encode()
+                answer = {"choices": [{"message": {"role": "assistant", "content": ANSWER}}]}
+                u = outer.usages.pop(0) if outer.usages else None
+                if u is not None:
+                    answer["copilot_usage"] = u
+                out = json.dumps(answer).encode()
                 self.send_response(200)
                 self.send_header("content-type", "application/json")
                 self.send_header("content-length", str(len(out)))
@@ -151,7 +156,7 @@ class Paths(Base):
         usage = json.loads(text)
         day = usage["day"]
         self.assertEqual(usage["days"][day]["requests"], 1)
-        self.assertEqual(usage["days"][day]["models"], {"claude-sonnet-5.5": 1})
+        self.assertEqual(usage["days"][day]["models"], {"claude-sonnet-5.5": {"credits": "0.0100", "requests": 1, "refused": 0}})   # unpriced: the fallback constant
         for s in (ANSWER, "hello", "messages", "xxxx"):
             self.assertNotIn(s, text)
 
@@ -184,24 +189,104 @@ class Hardening(Base):
         self.assertEqual(used["days"][used["day"]]["requests"], 1)   # the refused one was not counted
 
 
+def total(nano):
+    return {"total_nano_aiu": nano}
+
+
+DETAILS = {"token_details": [
+    {"token_type": "input", "token_count": 17, "batch_size": 1000000, "cost_per_batch": 200000000000},
+    {"token_type": "output", "token_count": 4, "batch_size": 1000000, "cost_per_batch": 1000000000000}]}
+
+
+def check_spend(script, test):
+    """S2: three answers of 7400000, 370000 and 7400000 nano-AIU add up to 0.01517 credits."""
+    fake = Fake()
+    try:
+        fake.usages[:] = [total(7400000), total(370000), total(7400000)]
+        f = Running(script, fake)
+        try:
+            for m in ("gpt-4o", "claude-haiku-5.5", "gpt-4o"):
+                test.assertEqual(f.request("POST", "/chat/completions", chat(m))[0], 200)
+            used = json.loads(f.request("GET", "/usage")[1])
+        finally:
+            f.stop()
+    finally:
+        fake.close()
+    row = used["days"][used["day"]]
+    test.assertEqual(row["credits"], "0.0152", "requests were counted, not credits" if row["credits"] == "3.0000" else row)
+    test.assertEqual({m: v["credits"] for m, v in row["models"].items()}, {"claude-sonnet-5.5": "0.0148", "claude-haiku-5.5": "0.0004"})
+
+
 class Budget(Base):
-    def test_s4_daily_budget(self):
+    def test_s4_daily_credit_budget(self):
         clock = os.path.join(self.tmp, "day")
         with open(clock, "w") as fh:
             fh.write("2026-11-10")
-        f = self.run_front(BRIDGE_DAILY_BUDGET=3, BRIDGE_CLOCK_FILE=clock)
-        codes = [f.request("POST", "/chat/completions", chat("gpt-4o"))[0] for _ in range(3)]
+        f = self.run_front(BRIDGE_DAILY_CREDITS="0.01", BRIDGE_CLOCK_FILE=clock)
+        self.fake.usages[:] = [total(7400000)] * 4
+        codes = [f.request("POST", "/chat/completions", chat("gpt-4o"))[0] for _ in range(2)]   # the second crosses the budget
         status, text = f.request("POST", "/chat/completions", chat("gpt-4o"))
-        self.assertEqual(codes, [200, 200, 200])
+        self.assertEqual(codes, [200, 200])
         self.assertEqual(status, 429)
-        self.assertIn("budget", json.loads(text)["error"])
-        self.assertEqual(len(self.fake.seen), 3)
+        self.assertEqual(json.loads(text)["error"], "daily AI credit budget spent: 0.0148 of 0.01 credits")
+        self.assertEqual(len(self.fake.seen), 2)
         with open(clock, "w") as fh:
             fh.write("2026-11-11")
         self.assertEqual(f.request("POST", "/chat/completions", chat("gpt-4o"))[0], 200)
-        self.assertEqual(len(self.fake.seen), 4)
+        self.assertEqual(len(self.fake.seen), 3)
         days = json.loads(f.request("GET", "/usage")[1])["days"]
-        self.assertEqual({d: v["requests"] for d, v in days.items()}, {"2026-11-10": 3, "2026-11-11": 1})
+        self.assertEqual({d: (v["requests"], v["refused"]) for d, v in days.items()}, {"2026-11-10": (2, 1), "2026-11-11": (1, 0)})
+
+    def test_s2_s5_spend_adds_up_and_usage_fields(self):
+        self.fake.usages[:] = [total(7400000), total(370000), total(7400000)]
+        f = self.run_front(BRIDGE_DAILY_CREDITS="5")
+        for m in ("gpt-4o", "claude-haiku-5.5", "gpt-4o"):
+            self.assertEqual(f.request("POST", "/chat/completions", chat(m))[0], 200)
+        status, text = f.request("GET", "/usage")
+        used = json.loads(text)
+        self.assertEqual(used["budget"], 5)
+        row = used["days"][used["day"]]
+        self.assertEqual((row["credits"], row["requests"], row["refused"]), ("0.0152", 3, 0))
+        self.assertEqual(row["models"], {"claude-sonnet-5.5": {"credits": "0.0148", "requests": 2, "refused": 0}, "claude-haiku-5.5": {"credits": "0.0004", "requests": 1, "refused": 0}})
+        for t in (ANSWER, "hello", "messages"):
+            self.assertNotIn(t, text)
+
+    def test_s3_token_details_and_the_unpriced_fallback(self):
+        self.fake.usages[:] = [dict(DETAILS), {}, None]
+        f = self.run_front(BRIDGE_UNPRICED_NANO="5000000")
+        for _ in range(3):
+            self.assertEqual(f.request("POST", "/chat/completions", chat("gpt-4o"))[0], 200)
+        used = json.loads(f.request("GET", "/usage")[1])
+        row = used["days"][used["day"]]["models"]["claude-sonnet-5.5"]
+        self.assertEqual(row["credits"], "0.0174")   # 7400000 + 2 * 5000000 nano
+        log = f.stop()
+        self.assertEqual(len([l for l in log.splitlines() if "unpriced" in l]), 2)   # one line per unpriced answer
+        self.assertEqual(len([l for l in log.splitlines() if '"nano"' in l]), 3)
+
+    def test_s3_details_alone_give_7400000(self):
+        self.fake.usages[:] = [dict(DETAILS)]
+        f = self.run_front(BRIDGE_UNPRICED_NANO="5000000")
+        self.assertEqual(f.request("POST", "/chat/completions", chat("gpt-4o"))[0], 200)
+        log = f.stop()
+        self.assertEqual([json.loads(l)["nano"] for l in log.splitlines() if '"nano"' in l], [7400000])
+        self.assertNotIn("unpriced", log)
+
+    def test_s7_mutant_control_first_then_the_mutant_fails_with_the_anchored_text(self):
+        with open(FRONT, encoding="utf-8") as fh:
+            src = fh.read()
+        check_spend(FRONT, self)   # the control: the unmutated front passes
+        old = "        mrow.nano += nano;\n"
+        new = "        mrow.nano += NANO;\n"   # one credit per request: requests are counted
+        self.assertEqual(src.count(old), 1, "the text to mutate must occur once")
+        mutated = src.replace(old, new)
+        self.assertTrue(mutated != src and old not in mutated, "the mutation was not applied")   # a no-op mutant fails here
+        scratch = tempfile.mkdtemp(prefix="front-mutant-")
+        self.addCleanup(shutil.rmtree, scratch, True)
+        path = os.path.join(scratch, "bridge-front.mjs")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(mutated)
+        with self.assertRaisesRegex(AssertionError, r"requests were counted, not credits"):
+            check_spend(path, self)
 
 
 def log_problems(script, test):

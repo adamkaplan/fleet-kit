@@ -60,8 +60,8 @@
                 "value": "/run/home"
               },
               {
-                "name": "BRIDGE_DAILY_BUDGET",
-                "value": "500"
+                "name": "BRIDGE_DAILY_CREDITS",
+                "value": "10000"
               },
               {
                 "name": "BRIDGE_RATE_LIMIT_SECONDS",
