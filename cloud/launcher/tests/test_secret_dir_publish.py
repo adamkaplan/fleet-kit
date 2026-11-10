@@ -1,7 +1,7 @@
-"""Ask #2357 (S10): the publish script with CW_KEYCHAIN_SERVICE set logs in to the registry with the keychain's token through a fake `crane` and
-runs no `az` (a fake az that fails and logs). The fake `security` is reached by a sitecustomize that points keychain_read.PROGRAM at it.
-Offline; the archive is built by cloud/tests/make-archives.py; every value is built here."""
-import base64, os, subprocess, sys, tempfile, unittest
+"""Ask #2357 (S10): the publish script with CW_SECRET_DIR set logs in to the registry with the token file through a fake `crane` and
+runs no `az` (a fake az that fails and logs). The token file `acr-token` is in a private directory under the real home (the script runs python -I).
+Offline; no test touches a keychain; the archive is built by cloud/tests/make-archives.py; every value is built here."""
+import os, subprocess, sys, tempfile, unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 LAUNCHER = os.path.dirname(HERE)
@@ -21,8 +21,6 @@ case $1 in
 esac
 """
 AZ = "#!/bin/sh\necho \"az $*\" >> \"$STUB_LOG\"\nexit 1\n"
-SECURITY = "#!/bin/sh\necho \"security $*\" >> \"%(log)s\"\ncase \"$*\" in *' -a acr-token '*) cat \"%(item)s\" ;; *) exit 44 ;; esac\n"
-SITE = "import sys\nsys.path.insert(0, %r)\nimport keychain_read\nkeychain_read.PROGRAM = %r\n"
 
 
 class Publish(unittest.TestCase):
@@ -38,15 +36,15 @@ class Publish(unittest.TestCase):
         open(self.log, "w").close()
         for name, text in (("crane", CRANE), ("az", AZ)):
             self.script(os.path.join(self.bin, name), text)
-        item = os.path.join(d, "item")
-        with open(item, "w") as f:
-            f.write(base64.b64encode((USER + ":" + PASSWORD).encode()).decode() + "\n")
-        self.security = self.script(os.path.join(d, "security"), SECURITY % {"log": self.log, "item": item})
-        site = os.path.join(d, "site")
-        os.makedirs(site)
-        with open(os.path.join(site, "sitecustomize.py"), "w") as f:
-            f.write(SITE % (LAUNCHER, self.security))
-        self.site = site
+        home = os.path.expanduser("~")
+        holder = tempfile.TemporaryDirectory(dir=home, prefix=".cw-secret-test-")
+        self.addCleanup(holder.cleanup)
+        self.secrets = os.path.join(holder.name, "secrets")
+        os.mkdir(self.secrets, 0o700)
+        self.item = os.path.join(self.secrets, "acr-token")
+        with open(self.item, "w") as f:
+            f.write(USER + ":" + PASSWORD + "\n")
+        os.chmod(self.item, 0o600)
         subprocess.run([sys.executable, os.path.join(ROOT, "cloud", "tests", "make-archives.py"), d, "ghp_" + "f" * 36], check=True, capture_output=True)
 
     def script(self, path, text):
@@ -57,7 +55,7 @@ class Publish(unittest.TestCase):
 
     def run_publish(self, **extra):
         env = {"PATH": self.bin + ":/usr/bin:/bin", "STUB_LOG": self.log, "STUB_STATE": self.state, "STUB_D1": D1,
-               "STUB_ARCHIVE": os.path.join(self.d, "oci-clean.tar"), "PYTHONPATH": self.site}
+               "STUB_ARCHIVE": os.path.join(self.d, "oci-clean.tar")}
         env.update(extra)
         return subprocess.run([PUB, "--tool", "crane", "--tool-dir", self.bin, "--staging", "acme-registry.example/cw/worker-candidate:abc",
                                "--release", "acme-registry.example/cw/worker:v1"], env=env, capture_output=True, text=True)
@@ -67,33 +65,40 @@ class Publish(unittest.TestCase):
             return f.read()
 
     def test_s10_with_the_service_set_crane_logs_in_with_the_token_and_az_is_never_called(self):
-        done = self.run_publish(CW_KEYCHAIN_SERVICE="cw-launcher")
+        done = self.run_publish(CW_SECRET_DIR=self.secrets)
         self.assertEqual(done.returncode, 0, done.stderr)
         calls = self.calls()
-        self.assertNotIn("az ", calls.replace("crane ", ""), "az was called with a keychain service set")
         self.assertEqual([l for l in calls.splitlines() if l.startswith("az")], [])
         self.assertIn("crane auth login acme-registry.example -u " + USER + " --password-stdin", calls)
         with open(os.path.join(self.state, "stdin")) as f:
             self.assertEqual(f.read(), PASSWORD)   # the password came on standard input
-        self.assertIn("-s cw-launcher -a acr-token -w", calls)
         self.assertNotIn(PASSWORD, calls + done.stdout + done.stderr)   # in no argument and no output
-        self.assertNotIn(base64.b64encode((USER + ":" + PASSWORD).encode()).decode(), calls + done.stdout + done.stderr)
         self.assertIn("crane copy acme-registry.example/cw/worker-candidate@" + D1 + " acme-registry.example/cw/worker:v1", calls)
         with open(os.path.join(self.state, "dockerconfig")) as f:
-            self.assertFalse(os.path.exists(f.read().strip()))   # the private login directory is gone
+            config = f.read().strip()
+        self.assertTrue(config)
+        self.assertFalse(os.path.exists(config))   # the private login directory is gone
 
     def test_unset_the_script_does_no_login(self):
         done = self.run_publish()
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertNotIn("auth login", self.calls())
-        self.assertNotIn("security", self.calls())
+        self.assertNotIn("az ", self.calls())
 
     def test_a_missing_token_item_publishes_nothing(self):
-        os.remove(os.path.join(self.d, "item"))
-        done = self.run_publish(CW_KEYCHAIN_SERVICE="cw-launcher")
+        os.remove(self.item)
+        done = self.run_publish(CW_SECRET_DIR=self.secrets)
         self.assertEqual(done.returncode, 3)
         self.assertNotIn("copy", self.calls())
+        self.assertNotIn("az ", self.calls())
         self.assertIn("nothing published", done.stderr)
+
+    def test_a_token_file_with_a_loose_mode_publishes_nothing(self):
+        os.chmod(self.item, 0o644)
+        done = self.run_publish(CW_SECRET_DIR=self.secrets)
+        self.assertEqual(done.returncode, 3)
+        self.assertNotIn("copy", self.calls())
+        self.assertNotIn(PASSWORD, done.stdout + done.stderr)
 
     def test_the_scope_map_in_the_runbook_names_two_repositories(self):
         with open(os.path.join(ROOT, "cloud", "README.md")) as f:

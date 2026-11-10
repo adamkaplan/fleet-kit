@@ -147,7 +147,6 @@ def revoke_request(token):
 
 
 LABELS = ("vault firewall", "vault auth", "vault other", "App key", "installation", "permissions", "GitHub error", "other")
-LABELS += ("keychain-unavailable",)   # the keychain read timed out: the login keychain is locked or asks for access
 REFUSAL = {}  # the last refusal: {"label": one of LABELS, "line": the reason}; the preflight reads it after it catches the exit
 
 
@@ -229,13 +228,13 @@ def _vault_reason(exc, secret):
 
 def vault(env_name, secret):
     cmd = os.environ.get(env_name)
-    service = (os.environ.get("CW_KEYCHAIN_SERVICE") or "").strip()
-    if service and not cmd:   # the keychain route (the command settings win): /usr/bin/security, never az, the value in memory only
-        import keychain_read   # here, not at the top: a copy of this file without the keychain module still mints when the setting is unset
+    directory = (os.environ.get("CW_SECRET_DIR") or "").strip()
+    if directory and not cmd:   # the secret-file route (the command settings win): no az, the value in memory only
+        import secret_files   # here, not at the top: a copy of this file without the module still mints when the setting is unset
         try:
-            return keychain_read.read(service, secret, MAX_BYTES, trim=secret != "cw-app-key")
-        except keychain_read.KeychainError as err:
-            die(err.line, err.kind, transient=err.kind == "keychain-unavailable")
+            return secret_files.read(directory, secret, MAX_BYTES, trim=secret != "cw-app-key")
+        except secret_files.SecretError as err:
+            die(err.line, err.kind)
     if cmd:
         argv = ["sh", "-c", cmd]
     else:
