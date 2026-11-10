@@ -95,6 +95,11 @@ class Mutant(unittest.TestCase):
             check_m(base.load(text))
         self.assertTrue(str(cm.exception).startswith(NOT_LOWERED), str(cm.exception))
 
+    def test_a_no_op_mutation_fails_the_computation(self):
+        with self.assertRaises(AssertionError) as cm:
+            base.mutate(base.source(), M_ROW, M_ROW)
+        self.assertIn("the mutation was not applied", str(cm.exception))
+
 
 if __name__ == "__main__":
     unittest.main()
