@@ -14,6 +14,11 @@ BIN = os.path.join(ROOT, "bin")
 IMPORT = re.compile(r"(?m)^[ \t]*(?:import ([\w., ]+)|from (\w+)[\w.]* import)")
 
 
+# bin/ modules shipped as byte-identical copies in cloud/launcher (bin/ is outside the build context); the launcher's own files that share a
+# name with a bin/ file (cloud_worker, token_mint) are different files and are not copies.
+BIN_COPIES = ("path_walk.py",)
+
+
 def walk_imports(start="token_service.py"):
     """Every module token_service.py reaches (import x / from x import y, at any indentation), resolved in cloud/launcher then bin;
     the standard library and anything else not found there is ignored. Returns {file name: directory}."""
@@ -131,7 +136,7 @@ class T(unittest.TestCase):
     def test_closure_is_shipped_and_copies_equal(self):
         got = walk_imports()
         self.assertIn("path_walk.py", got)
-        bins = sorted(n for n in got if os.path.isfile(os.path.join(BIN, n)) and n not in tolerated_all())
+        bins = sorted(n for n in got if n in BIN_COPIES or got[n] == BIN and n not in tolerated_all())
         for n in bins:
             with open(os.path.join(BIN, n), "rb") as a, open(os.path.join(LAUNCHER, n), "rb") as b:
                 self.assertEqual(a.read(), b.read(), n + " copy differs")
