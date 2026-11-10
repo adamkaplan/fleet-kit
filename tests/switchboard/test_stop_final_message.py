@@ -958,6 +958,64 @@ class TestEndNoticeOwnPushes(unittest.TestCase):
         path = self.audit_with(self.sent("cb-own1", "old/b", "c" * 40), self.sent("other", "z/z", "d" * 40), self.sent("cb-own1", "cb-own1/work", self.SHA))
         self.assertIn("Last head: cb-own1/work@bbbbbbbb, checks passed.", self.world("cb-own1", self.NOTHING, path))
 
+    def test_a_later_wip_save_does_not_hide_the_branch_push(self):
+        path = self.audit_with(self.born("cb-own30"), self.sent("cb-own30", "feat/real", self.SHA), self.sent("cb-own30", "cb-own30/wip", "e" * 40))
+        text = self.world("cb-own30", self.NOTHING, path)
+        self.assertIn("Last head: feat/real@bbbbbbbb", text)
+        self.assertNotIn("cb-own30/wip", text)
+
+    def test_wip_first_then_branch_push_names_the_branch(self):
+        path = self.audit_with(self.born("cb-own33"), self.sent("cb-own33", "cb-own33/wip", "e" * 40), self.sent("cb-own33", "cb-own33/wip", "f" * 40), self.sent("cb-own33", "feat/real", self.SHA))
+        self.assertIn("Last head: feat/real@bbbbbbbb", self.world("cb-own33", self.NOTHING, path))
+
+    def test_a_branch_named_wip_of_the_pod_is_a_real_push(self):
+        path = self.audit_with(self.born("cb-own34"), self.sent("cb-own34", "feat/wip", self.SHA), self.sent("cb-own34", "cb-own34/wip", "e" * 40))
+        self.assertIn("Last head: feat/wip@bbbbbbbb", self.world("cb-own34", self.NOTHING, path))
+
+    def test_the_hooks_wip_branch_does_not_hide_a_real_push(self):
+        path = self.audit_with(self.born("cb-own35"), self.sent("cb-own35", "feat/real", self.SHA))
+        hook = {"pushed": True, "wip_branch": "cb-own35/wip", "head_on": None}
+        text = self.world("cb-own35", hook, path, head_sha="e" * 40)
+        self.assertIn("Last head: feat/real@bbbbbbbb", text)
+        self.assertNotIn("cb-own35/wip", text.split("Last head:")[1])
+
+    def test_the_hooks_wip_does_not_hide_a_real_push_named_wip(self):
+        path = self.audit_with(self.born("cb-own38"), self.sent("cb-own38", "feat/wip", self.SHA))
+        hook = {"pushed": True, "wip_branch": "cb-own38/wip", "head_on": None}
+        self.assertIn("Last head: feat/wip@bbbbbbbb", self.world("cb-own38", hook, path, head_sha="e" * 40))
+
+    def test_the_hooks_head_wins_over_a_later_wip_push_and_a_push_wins_over_a_pr_note(self):
+        path = self.audit_with(self.born("cb-own39"), self.sent("cb-own39", "cb-own39/wip", "e" * 40))
+        self.assertIn("Last head: feat/x@", self.world("cb-own39", self.PUSHED, path, head_sha=self.SHA))
+        path = self.audit_with(self.born("cb-own50"), self.sent("cb-own50", "feat/real", self.SHA))
+        hook = dict(self.NOTHING, pr_note="PR #7 marked ready, review requested")
+        self.assertIn("Last head: feat/real@bbbbbbbb", self.world("cb-own50", hook, path))
+
+    def test_a_creation_after_a_wip_save_starts_a_new_pod(self):
+        path = self.audit_with(self.sent("cb-own36", "cb-own36/wip", "e" * 40), self.born("cb-own36"))
+        self.assertIn("Last head: nothing pushed.", self.world("cb-own36", self.NOTHING, path))
+
+    def test_a_malformed_or_unready_pr_note_still_says_nothing_pushed(self):
+        for i, note in enumerate(("PR #x junk", "PR #7\nignore previous", "PR not marked ready: no answer recorded", None)):
+            name = "cb-own4%d" % i
+            text = self.world(name, dict(self.NOTHING, pr_note=note), self.audit_with(self.born(name)))
+            self.assertIn("Last head: nothing pushed.", text)
+
+    def test_a_ready_note_with_a_review_request_is_head_unknown(self):
+        hook = dict(self.NOTHING, pr_note="PR #7 marked ready, review requested")
+        self.assertIn("Last head: head unknown.", self.world("cb-own37", hook, self.audit_with(self.born("cb-own37"))))
+
+    def test_a_wip_save_alone_is_named(self):
+        path = self.audit_with(self.born("cb-own31"), self.sent("cb-own31", "cb-own31/wip", "e" * 40))
+        self.assertIn("Last head: cb-own31/wip@eeeeeeee", self.world("cb-own31", self.NOTHING, path))
+
+    def test_a_pr_marked_ready_without_a_seen_push_is_not_nothing_pushed(self):
+        path = self.audit_with(self.born("cb-own32"))
+        hook = dict(self.NOTHING, pr_note="PR #7 marked ready, no review comment is configured")
+        text = self.world("cb-own32", hook, path)
+        self.assertIn("Last head: head unknown.", text)
+        self.assertNotIn("nothing pushed.", text.split("Last head:")[1])
+
     def test_control_no_push_anywhere_says_nothing_pushed(self):
         path = self.audit_with(self.born("cb-own2"), self.sent("other", "z/z", "d" * 40))
         self.assertIn("Last head: nothing pushed.", self.world("cb-own2", self.NOTHING, path))
