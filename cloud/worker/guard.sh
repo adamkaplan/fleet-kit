@@ -266,7 +266,8 @@ cfg_scoped_ok() {   # in scope: `git config [--local] KEY VALUE` for a key not i
   case "$2" in -*) return 1 ;; esac
   ck=$(printf '%s' "$1" | tr 'A-Z' 'a-z')
   case "$ck" in *.*) ;; *) return 1 ;; esac
-  case "$ck" in http.extraheader|http.*.extraheader) printf '%s' "$2" | grep -Eq '^Authorization: Basic [A-Za-z0-9+/=]+$' || return 1 ;; esac   # ask #2360 clause 7
+  case "$ck" in http.extraheader|http.*.extraheader) case "$2" in *"
+"*|*""*) return 1 ;; esac; printf '%s' "$2" | grep -Eq '^Authorization: Basic [A-Za-z0-9+/=]+$' || return 1 ;; esac   # ask #2360 clause 7
   case "$ck" in
     alias.*|push.default|core.hookspath|core.sshcommand|core.fsmonitor|core.pager|core.editor|core.askpass|core.gitproxy) return 1 ;;
     credential.*|include.*|includeif.*|url.*|http.proxy*|http.sslcainfo|http.cookiefile|http.*.proxy*|http.*.sslcainfo|http.*.cookiefile) return 1 ;;

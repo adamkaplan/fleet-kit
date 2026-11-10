@@ -436,6 +436,9 @@ class Scope(unittest.TestCase):
         # the git config form, in scope
         self.allowed(["config", "http.extraHeader", "Authorization: Basic dXNlcjpwYXNz"])
         self.refused(["config", "http.extraHeader", "X-A: 1"], CONFIG)
+        for v in ("Authorization: Basic YWJj\nX-Evil: 1", "X-Evil: 1\nAuthorization: Basic YWJj", "Authorization: Basic YWJj\r"):
+            self.refused(["config", "http.extraHeader", v], CONFIG)
+            self.refused(["config", "http.https://a.example/.extraHeader", v], CONFIG)
         self.refused(["config", "http.extraHeader", "Authorization: Bearer x"], CONFIG)
         self.refused(["config", "url.https://example.com/.insteadOf", "https://github.com/"], CONFIG)
         if self.outrepo:
