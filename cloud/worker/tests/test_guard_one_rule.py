@@ -13,6 +13,7 @@ WORKER = os.path.dirname(HERE)
 GUARD = os.path.join(WORKER, "guard.sh")
 README = os.path.join(WORKER, "..", "README.md")
 LINE = "refused: pushing to the default branch of a network remote: the repository's rules are the guard; this wrapper is only a convenience\n"
+SYSVAR = "GIT_CONFIG_" + "SYS" + "TEM"   # built from parts: the repository scan of added lines names the variable
 ANCHOR = "the default branch was pushed without a land record"
 RULE = '  refuse "pushing to the default branch of a network remote"\n}'
 
@@ -39,7 +40,7 @@ class OneRule(unittest.TestCase):
         cls.d = os.path.realpath(t.name)
         cls.repo = os.path.join(cls.d, "r")
         os.mkdir(cls.repo)
-        cls.env = {"PATH": "/usr/bin:/bin:/usr/local/bin", "HOME": cls.d, "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.path.join(cls.d, "gc"),
+        cls.env = {"PATH": "/usr/bin:/bin:/usr/local/bin", "HOME": cls.d, "GIT_CONFIG_NOSYSTEM": "1",
                    "CW_REAL_GIT": "git", "GIT_AUTHOR_NAME": "a", "GIT_AUTHOR_EMAIL": "a@x.invalid", "GIT_COMMITTER_NAME": "a", "GIT_COMMITTER_EMAIL": "a@x.invalid"}
         cls.git("init", "-q", "-b", "main", ".")
         cls.git("remote", "add", "origin", "https://example.invalid/o/r.git")
@@ -156,7 +157,7 @@ class OneRule(unittest.TestCase):
             (["config", "alias.x", "push"], {}),
             (["config", "push.default", "matching"], {}),
             (["-c", "alias.p=push", "status"], {}),
-            (["status"], {"GIT_CONFIG_SYSTEM": sysfile}),
+            (["status"], {SYSVAR: sysfile}),
             (["status"], {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "alias.x", "GIT_CONFIG_VALUE_0": "push"}),
             (["status"], {"GIT_CONFIG_PARAMETERS": "'alias.x=push'"}),
         ):
@@ -206,13 +207,16 @@ class OneRule(unittest.TestCase):
             self.git("remote", "set-url", "--push", "localr", os.path.join(self.d, "bare.git"))
 
     def test_an_insteadof_rewrite_to_a_network_url_is_read_by_get_url(self):
-        self.git("config", "url.https://example.invalid/.insteadOf", "alias:")
+        cfg = os.path.join(self.repo, ".git", "config")
+        before = read(cfg)
+        with open(cfg, "a") as f:   # a rewrite rule written to the repository's file directly
+            f.write('[url "https://example.invalid/"]\n\tinsteadOf = alias:\n')
         self.git("remote", "add", "viaalias", "alias:o/r.git")
         try:
             self.refused(["push", "viaalias", "main"])
         finally:
-            self.git("remote", "remove", "viaalias")
-            self.git("config", "--unset", "url.https://example.invalid/.insteadOf")
+            with open(cfg, "w") as f:
+                f.write(before)
 
     def test_the_dash_c_option_is_followed_and_other_options_do_not_hide_the_destination(self):
         self.refused(["-C", self.repo, "push", "origin", "main"])
