@@ -47,7 +47,7 @@ To bump Node: update `NODE_VERSION` (a full 22.x.y release; the only place the v
 
 Versions: PostgreSQL 16.15, vector 0.8.7, message queue (pgmq) 1.13.0 (the version the repository's schema file creates). The server is built without readline, ICU and zlib; the build no longer passes `--without-openssl`, and the OpenSSL run-time library (libssl3) comes with the base image's curl. Size cost: measured by the operator at the first real build (before and after, and the pod start time). Not measured here for the image; the installed tree `/opt/pg` was 35 MB in a local arm64 build of the build stage (a developer measurement, not the operator's amd64 build).
 
-**Nothing starts at pod start.** The entrypoint is unchanged; no server runs and no port listens until a lane starts it. It runs only as the unprivileged `worker` user, with its data directory on the scratch volume (`/run/cw-tmp`), so the data ends with the pod. The one-line start (initdb, then pg_ctl on a local socket only):
+**Nothing starts at pod start.** The entrypoint script is unchanged; the pod's first process is `tini -g` (installed from the distribution archive), which runs the script and then the server beneath it, reaps orphans and forwards signals. No server runs and no port listens until a lane starts it. It runs only as the unprivileged `worker` user, with its data directory on the scratch volume (`/run/cw-tmp`), so the data ends with the pod. The one-line start (initdb, then pg_ctl on a local socket only):
 
 ```sh
 /opt/pg/bin/initdb -D /run/cw-tmp/pgdata -U worker --locale=C.UTF-8 -E UTF8 && /opt/pg/bin/pg_ctl -D /run/cw-tmp/pgdata -o "-c listen_addresses= -c unix_socket_directories=/run/cw-tmp" -l /run/cw-tmp/pg.log start
