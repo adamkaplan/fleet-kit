@@ -274,11 +274,14 @@ push_remote() {   # the words after `push`: the remote word, as the loop below c
 }
 push_scope_check() {   # the words after `push`: true in scope when the remote is a local path or file:// URL under /tmp
   in_tmp_scope || return 1
-  for a in "$@"; do   # fail closed: git takes a unique prefix of a long option and lets a positional repository beat --repo, so only exact known long flags are read
+  ps_k=0
+  for a in "$@"; do   # fail closed: git takes a unique prefix of a long option, attaches a value to a short one and lets a positional repository beat --repo, so only exact known flags are read
+    if [ "$ps_k" = 1 ]; then ps_k=0; continue; fi   # the value word of -o, --push-option, --receive-pack, --exec
     case "$a" in
+      -o|--push-option|--receive-pack|--exec) ps_k=1 ;;
       --dry-run|--verbose|--quiet|--set-upstream|--tags|--follow-tags|--no-verify|--progress|--atomic|--porcelain|--prune|--delete|--thin|--no-thin) ;;
-      --push-option|--receive-pack|--exec|--push-option=*|--receive-pack=*|--exec=*) ;;
-      --*) return 1 ;;
+      --push-option=*|--receive-pack=*|--exec=*) ;;
+      -*[!unvqd46-]*|--*) return 1 ;;
     esac
   done
   ps_r=$(push_remote "$@")
@@ -297,11 +300,15 @@ push_scope_check() {   # the words after `push`: true in scope when the remote i
       [ -z "$(sgit -C "$sc_dir" config --get-regexp '^url\..*\.(push)?insteadof$' 2>/dev/null)" ] || return 1
       ps_u=$ps_r ;;
     -*|*:*|*..*|*/*) return 1 ;;
-    *) ps_u=$("$real_git" -C "$sc_dir" remote get-url --push "$ps_r" 2>/dev/null) || return 1 ;;   # the real configuration (env_cfg has judged it): rewrites apply
+    *) ps_u=$("$real_git" -C "$sc_dir" remote get-url --push --all "$ps_r" 2>/dev/null) || return 1 ;;   # the real configuration (env_cfg has judged it): rewrites apply
   esac
-  case "$ps_u" in *%*) return 1 ;; file:///*) ps_u=${ps_u#file://} ;; file:*) return 1 ;; /*) ;; *) return 1 ;; esac
-  ps_d=$(phys "$ps_u") || return 1
-  tmp_under "$ps_d" || return 1
+  while IFS= read -r ps_one; do   # every push URL of the remote must be local under /tmp (git pushes to all of them)
+    case "$ps_one" in *%*) return 1 ;; file:///*) ps_one=${ps_one#file://} ;; file:*) return 1 ;; /*) ;; *) return 1 ;; esac
+    ps_d=$(phys "$ps_one") || return 1
+    tmp_under "$ps_d" || return 1
+  done <<EOF
+$ps_u
+EOF
   return 0
 }
 

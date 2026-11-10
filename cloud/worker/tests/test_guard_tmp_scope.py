@@ -134,6 +134,19 @@ class Scope(unittest.TestCase):
             self.refused(["push"] + opt + ["web", "main"], PUSH)
         self.allowed(["push", "--dry-run", "origin", "main"])
 
+    def test_s3_short_clusters_and_a_second_push_url_do_not_open_the_push(self):
+        git(self.repo, "remote", "add", "r2", "/usr")
+        git(self.repo, "remote", "add", "multi", self.remote)
+        git(self.repo, "config", "--add", "remote.multi.pushurl", self.remote)
+        git(self.repo, "config", "--add", "remote.multi.pushurl", "https://github.com/o/r.git")
+        self.addCleanup(git, self.repo, "remote", "remove", "r2")
+        self.addCleanup(git, self.repo, "remote", "remove", "multi")
+        self.refused(["push", "-oxo", "r2", "ok", "main"], PUSH)
+        self.refused(["push", "-uoo", "r2", "ok", "main"], PUSH)
+        self.refused(["push", "multi", "main"], PUSH)
+        self.allowed(["push", "-u", "origin", "main"])
+        self.allowed(["push", "-o", "x", "origin", "main"])
+
     def test_s3_in_scope_force_a_glob_and_all_stay_refused(self):
         self.refused(["push", "--force", "origin", "main"], FORCE)
         self.refused(["push", "-f", "origin", "main"], FORCE)
@@ -316,7 +329,7 @@ class Scope(unittest.TestCase):
         git(self.repo, "remote", "set-url", "origin", "https://github.com/o/r.git")
         self.addCleanup(git, self.repo, "remote", "set-url", "origin", self.remote)
         self.refused(["push", "origin", "main"], PUSH)   # the control
-        p = self.mutant('  case "$ps_u" in *%*) return 1 ;; file:///*) ps_u=${ps_u#file://} ;; file:*) return 1 ;; /*) ;; *) return 1 ;; esac\n', "  return 0\n")
+        p = self.mutant('    case "$ps_one" in *%*) return 1 ;; file:///*) ps_one=${ps_one#file://} ;; file:*) return 1 ;; /*) ;; *) return 1 ;; esac\n', "    return 0\n")
         self.assertEqual(self.guard(["push", "origin", "main"], guard=p).returncode, 0)   # the mutant lets the https remote through
 
 
