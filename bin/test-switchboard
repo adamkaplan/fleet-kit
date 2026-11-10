@@ -67020,7 +67020,7 @@ TestTipWatch = importlib.import_module("test_tip_watch").build(Base, World, FAKE
 # The bin-set table test (#1457).
 _bin_set_table = importlib.import_module("test_bin_set_table")
 TestTheBinSetClassesAreAllInTheTable = _bin_set_table.TestTheBinSetClassesAreAllInTheTable
-_cos_blocked_owner = importlib.import_module("test_cos_blocked_owner"); TestCosBlockedOwner = _cos_blocked_owner.TestCosBlockedOwner
+_cos_blocked_owner = importlib.import_module("test_cos_blocked_owner"); TestCosBlockedOwner, BlockedReportOwnerAlarm = _cos_blocked_owner.TestCosBlockedOwner, _cos_blocked_owner.BlockedReportOwnerAlarm   # the mixin is bound too: TestBlockedReport derives from it
 # The heavy wrapper's progress line (#1762).
 TestHeavyProgress = importlib.import_module("test_heavy_progress").TestHeavyProgress
 # The shard tests (#2108).
