@@ -96,9 +96,10 @@ RUN chmod 0755 /usr/local/bin/start-dockerd /usr/local/bin/cw-stack-pull /usr/lo
  && chmod 0755 /usr/local/share/cw/guard.sh && chmod 0644 /usr/local/share/cw/opencode-worker.json /usr/local/share/cw/worker.md /usr/local/share/cw/orchestrator.md
 RUN chmod 0755 /usr/local/bin/cw-stack-up && chown root:root /usr/local/bin/cw-stack-up
 # The token service (cloud/k8s/token-mint.yaml runs `python3 /opt/cloud/launcher/token_service.py`): the launcher modules it imports,
-# directly or through cloud_worker (token_service -> app_token, cloud_worker; app_token -> token_mint; cloud_worker -> run_record, wip_save).
+# directly or through cloud_worker (token_service -> app_token, cloud_worker; app_token -> token_mint; cloud_worker -> run_record, wip_save,
+# path_walk). path_walk.py is a byte-identical copy of bin/path_walk.py (bin/ is outside the build context); a CI test pins it.
 # Root-owned, mode 0644, no secret, not executable; the secret scan below reads them. end_hook and token_mint keep their COPY lines above.
-COPY launcher/token_service.py launcher/app_token.py launcher/token_mint.py launcher/cloud_worker.py launcher/run_record.py launcher/wip_save.py /opt/cloud/launcher/
+COPY launcher/token_service.py launcher/app_token.py launcher/token_mint.py launcher/cloud_worker.py launcher/run_record.py launcher/wip_save.py launcher/path_walk.py /opt/cloud/launcher/
 RUN chown -R root:root /opt/cloud && chmod 0755 /opt/cloud /opt/cloud/launcher && chmod 0644 /opt/cloud/launcher/*.py
 
 USER worker

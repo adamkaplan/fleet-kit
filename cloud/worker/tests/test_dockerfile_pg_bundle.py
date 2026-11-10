@@ -8,7 +8,35 @@ import unittest
 HERE = os.path.dirname(os.path.abspath(__file__))
 DF = os.path.join(os.path.dirname(os.path.dirname(HERE)), "worker", "Dockerfile")
 
-TOKEN_FILES = ("token_service.py", "app_token.py", "token_mint.py", "cloud_worker.py", "run_record.py", "wip_save.py")
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(HERE)))
+LAUNCHER = os.path.join(ROOT, "cloud", "launcher")
+BIN = os.path.join(ROOT, "bin")
+IMPORT = re.compile(r"(?m)^[ \t]*(?:import ([\w., ]+)|from (\w+)[\w.]* import)")
+
+
+def walk_imports(start="token_service.py"):
+    """Every module token_service.py reaches (import x / from x import y, at any indentation), resolved in cloud/launcher then bin;
+    the standard library and anything else not found there is ignored. Returns {file name: directory}."""
+    found, todo = {}, [os.path.join(LAUNCHER, start)]
+    found[start] = LAUNCHER
+    while todo:
+        f = todo.pop()
+        for m in IMPORT.finditer(read(f)):
+            mods = [x.strip().split(" as ")[0].split(".")[0] for x in m.group(1).split(",")] if m.group(1) else [m.group(2)]
+            for mod in mods:
+                for d in (LAUNCHER, BIN):
+                    if os.path.isfile(os.path.join(d, mod + ".py")):
+                        if mod + ".py" not in found:
+                            found[mod + ".py"] = d
+                            todo.append(os.path.join(d, mod + ".py"))
+                        break
+    return found
+
+
+def tolerated_all():
+    """Modules imported only lazily inside a try block that tolerates failure (cloud_worker.retire_row: `import registry`), not at start:
+    listed here, not shipped."""
+    return {"registry.py"}
 
 
 def read(p):
@@ -26,6 +54,21 @@ def flat(t):
 def final_stage(t):
     i = t.find("FROM worker AS final")
     return flat(t[i:]) if i >= 0 else ""
+
+
+def starts_server(f):
+    """True when pg_ctl, initdb, postgres, systemctl or service is a COMMAND word (any path prefix) of a RUN line of the stage."""
+    for line in f.split("\n"):
+        m = re.match(r"(RUN|CMD|ENTRYPOINT) (.*)", line)
+        if not m:
+            continue
+        for seg in re.split(r"&&|\|\||;|\||\(|\)|\$\(|`", m.group(2)):
+            words = seg.split()
+            while words and (re.match(r"\w+=", words[0]) or words[0] in ("sudo", "exec", "nohup", "env", "su", "gosu")):
+                words = words[1:]
+            if words and os.path.basename(words[0].strip("\"'")) in ("pg_ctl", "initdb", "postgres", "systemctl", "service"):
+                return True
+    return False
 
 
 def problems(t):
@@ -51,7 +94,7 @@ def problems(t):
         out.append("the bundle is not root-owned and read-only")
     if len(re.findall(r"(?m)^ENV PG_BUNDLE=/opt/pg-bundle$", f)) != 1:
         out.append("ENV PG_BUNDLE must appear once")
-    if re.search(r"(?m)^(CMD|ENTRYPOINT|EXPOSE)\b", f) or re.search(r"pg_ctl|initdb|\bpostgres\b|systemctl|\bservice\b", re.sub(r"/opt/pg\S*|usr/\S*|postgresql\S*", "", f)):
+    if re.search(r"(?m)^(CMD|ENTRYPOINT|EXPOSE)\b", f) or starts_server(f):
         out.append("a line starts a server or adds a port")
     users = re.findall(r"(?m)^USER (\S+)$", t)
     if not users or users[-1] != "worker":
@@ -65,8 +108,9 @@ def problems(t):
     w = flat(t[t.find("AS worker"):t.find("FROM worker AS scan")])
     m = re.search(r"(?m)^COPY ((?:launcher/\S+ )+)/opt/cloud/launcher/$", w)
     got = sorted(x[len("launcher/"):] for x in m.group(1).split()) if m else []
-    if got != sorted(TOKEN_FILES):
-        out.append("the token service files were not copied")
+    need = sorted(set(walk_imports()) - tolerated_all())
+    if got != need:
+        out.append("a module the token service imports is not shipped" if m and set(need) - set(got) else "the token service files were not copied")
     elif not re.search(r"chown -R root:root /opt/cloud && [^\n]*chmod 0644 /opt/cloud/launcher/\*\.py", w):
         out.append("the token service files are not root-owned 0644")
     for keep in ("COPY launcher/end_hook.py /usr/local/bin/cw-end-hook", "COPY launcher/token_mint.py /usr/local/bin/cw-token-mint"):
@@ -84,17 +128,29 @@ class T(unittest.TestCase):
         self.assertEqual(len(re.findall(r"(?m)^ENV PG_BUNDLE=/opt/pg-bundle$", final_stage(t))), 1)
         self.assertEqual(re.findall(r"(?m)^USER (\S+)$", t)[-1], "worker")
 
-    def test_token_files_exist_and_cover_imports(self):
-        d = os.path.join(os.path.dirname(os.path.dirname(HERE)), "launcher")
-        for n in TOKEN_FILES:
-            self.assertTrue(os.path.isfile(os.path.join(d, n)), n)
-        # every launcher module imported at the top by the set is itself in the set
-        have = {n[:-3] for n in TOKEN_FILES}
-        local = {n[:-3] for n in os.listdir(d) if n.endswith(".py")}
-        for n in TOKEN_FILES:
-            for mod in re.findall(r"(?m)^(?:import|from) (\w+)", read(os.path.join(d, n))):
-                if mod in local:
-                    self.assertIn(mod, have, n + " imports " + mod)
+    def test_closure_is_shipped_and_copies_equal(self):
+        got = walk_imports()
+        self.assertIn("path_walk.py", got)
+        bins = sorted(n for n in got if os.path.isfile(os.path.join(BIN, n)) and n not in tolerated_all())
+        for n in bins:
+            with open(os.path.join(BIN, n), "rb") as a, open(os.path.join(LAUNCHER, n), "rb") as b:
+                self.assertEqual(a.read(), b.read(), n + " copy differs")
+            self.assertTrue(os.path.isfile(os.path.join(LAUNCHER, n)))
+        print("closure:", sorted(got), "shipped bin modules:", bins)
+        self.assertEqual(problems(read(DF)), [])
+
+    def test_missing_module_mutant_control_first(self):
+        t = read(DF)
+        self.assertEqual(problems(t), [])  # control
+        m = self.mutate(" launcher/path_walk.py /opt/cloud/launcher/", " /opt/cloud/launcher/")
+        self.assertIn("a module the token service imports is not shipped", problems(m))
+
+    def test_server_start_mutants_control_first(self):
+        t = read(DF)
+        self.assertEqual(problems(t), [])  # control
+        for cmd in ("/opt/pg/bin/pg_ctl start", "/usr/bin/postgres -D /x", "/opt/pg/bin/initdb -D /x"):
+            m = read(DF).rstrip("\n") + "\nRUN " + cmd + "\n"
+            self.assertIn("a line starts a server", " ".join(problems(m)), cmd)
 
     def mutate(self, old, new):
         t = read(DF)
