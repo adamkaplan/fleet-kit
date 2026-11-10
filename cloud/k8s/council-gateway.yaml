@@ -1,0 +1,259 @@
+# The council gateway (ask #2322): ConfigMap of settings, Service, Deployment (one replica), and two NetworkPolicies, all in the workers namespace.
+# The provider key is NOT here: the Deployment REFERENCES a Secret named council-gateway-key (key `key`); the owner creates it (cloud/README.md).
+# The gateway's code is NOT baked into the image: the owner creates the ConfigMap council-gateway-code from cloud/gateway/council_gateway.py.
+# IMAGE_DIGEST is a placeholder: replace it with the settings' CW_CLOUD_IMAGE (name@sha256:...). PROVIDER_HOST in the settings is the owner's to set.
+# NetworkPolicy: council-gateway-ingress admits ONLY pods labelled app=cw-worker (the label the launcher puts on worker pods), on port 8080;
+# council-workers-to-gateway lets those pods open that one connection (the namespace's default-deny blocks egress otherwise). The gateway's own
+# egress (DNS, the provider on port 443) is the namespace's allow-egress policy (cloud-hub-network.yaml).
+# Rollback: kubectl -n cw delete deployment,service,configmap,networkpolicy -l app.kubernetes.io/part-of=council-gateway
+# (JSON is valid YAML: the file is written as JSON documents so the offline test needs no YAML library.)
+---
+{
+  "apiVersion": "v1",
+  "kind": "ConfigMap",
+  "metadata": {
+    "name": "council-gateway-settings",
+    "namespace": "cw",
+    "labels": {
+      "app.kubernetes.io/part-of": "council-gateway"
+    }
+  },
+  "data": {
+    "settings.json": "{\n  \"models\": [\n    \"anthropic/claude-haiku-5.5\",\n    \"anthropic/claude-sonnet-5.5\",\n    \"anthropic/claude-opus-5.5\"\n  ],\n  \"max_request_chars\": 400000,\n  \"max_answer_tokens\": 24000,\n  \"daily_budget\": 500,\n  \"provider_url\": \"https://PROVIDER_HOST/v1\",\n  \"key_file\": \"/etc/council-key/key\"\n}\n"
+  }
+}
+---
+{
+  "apiVersion": "v1",
+  "kind": "Service",
+  "metadata": {
+    "name": "council-gateway",
+    "namespace": "cw",
+    "labels": {
+      "app.kubernetes.io/part-of": "council-gateway"
+    }
+  },
+  "spec": {
+    "type": "ClusterIP",
+    "selector": {
+      "app": "council-gateway"
+    },
+    "ports": [
+      {
+        "name": "http",
+        "port": 8080,
+        "targetPort": 8080
+      }
+    ]
+  }
+}
+---
+{
+  "apiVersion": "apps/v1",
+  "kind": "Deployment",
+  "metadata": {
+    "name": "council-gateway",
+    "namespace": "cw",
+    "labels": {
+      "app.kubernetes.io/part-of": "council-gateway"
+    }
+  },
+  "spec": {
+    "replicas": 1,
+    "selector": {
+      "matchLabels": {
+        "app": "council-gateway"
+      }
+    },
+    "template": {
+      "metadata": {
+        "labels": {
+          "app": "council-gateway",
+          "app.kubernetes.io/part-of": "council-gateway"
+        }
+      },
+      "spec": {
+        "automountServiceAccountToken": false,
+        "securityContext": {
+          "runAsNonRoot": true,
+          "runAsUser": 1000,
+          "seccompProfile": {
+            "type": "RuntimeDefault"
+          }
+        },
+        "imagePullSecrets": [
+          {
+            "name": "cw-pull"
+          }
+        ],
+        "containers": [
+          {
+            "name": "gateway",
+            "image": "IMAGE_DIGEST",
+            "command": [
+              "python3",
+              "/opt/gateway/council_gateway.py",
+              "/etc/council/settings.json"
+            ],
+            "env": [
+              {
+                "name": "COUNCIL_GATEWAY_PORT",
+                "value": "8080"
+              }
+            ],
+            "ports": [
+              {
+                "containerPort": 8080
+              }
+            ],
+            "readinessProbe": {
+              "tcpSocket": {
+                "port": 8080
+              },
+              "periodSeconds": 10
+            },
+            "resources": {
+              "requests": {
+                "cpu": "50m",
+                "memory": "64Mi"
+              },
+              "limits": {
+                "cpu": "500m",
+                "memory": "256Mi"
+              }
+            },
+            "securityContext": {
+              "allowPrivilegeEscalation": false,
+              "readOnlyRootFilesystem": true,
+              "capabilities": {
+                "drop": [
+                  "ALL"
+                ]
+              }
+            },
+            "volumeMounts": [
+              {
+                "name": "code",
+                "mountPath": "/opt/gateway",
+                "readOnly": true
+              },
+              {
+                "name": "settings",
+                "mountPath": "/etc/council",
+                "readOnly": true
+              },
+              {
+                "name": "key",
+                "mountPath": "/etc/council-key",
+                "readOnly": true
+              }
+            ]
+          }
+        ],
+        "volumes": [
+          {
+            "name": "code",
+            "configMap": {
+              "name": "council-gateway-code"
+            }
+          },
+          {
+            "name": "settings",
+            "configMap": {
+              "name": "council-gateway-settings"
+            }
+          },
+          {
+            "name": "key",
+            "secret": {
+              "secretName": "council-gateway-key",
+              "defaultMode": 288
+            }
+          }
+        ]
+      }
+    }
+  }
+}
+---
+{
+  "apiVersion": "networking.k8s.io/v1",
+  "kind": "NetworkPolicy",
+  "metadata": {
+    "name": "council-gateway-ingress",
+    "namespace": "cw",
+    "labels": {
+      "app.kubernetes.io/part-of": "council-gateway"
+    }
+  },
+  "spec": {
+    "podSelector": {
+      "matchLabels": {
+        "app": "council-gateway"
+      }
+    },
+    "policyTypes": [
+      "Ingress"
+    ],
+    "ingress": [
+      {
+        "from": [
+          {
+            "podSelector": {
+              "matchLabels": {
+                "app": "cw-worker"
+              }
+            }
+          }
+        ],
+        "ports": [
+          {
+            "port": 8080,
+            "protocol": "TCP"
+          }
+        ]
+      }
+    ]
+  }
+}
+---
+{
+  "apiVersion": "networking.k8s.io/v1",
+  "kind": "NetworkPolicy",
+  "metadata": {
+    "name": "council-workers-to-gateway",
+    "namespace": "cw",
+    "labels": {
+      "app.kubernetes.io/part-of": "council-gateway"
+    }
+  },
+  "spec": {
+    "podSelector": {
+      "matchLabels": {
+        "app": "cw-worker"
+      }
+    },
+    "policyTypes": [
+      "Egress"
+    ],
+    "egress": [
+      {
+        "to": [
+          {
+            "podSelector": {
+              "matchLabels": {
+                "app": "council-gateway"
+              }
+            }
+          }
+        ],
+        "ports": [
+          {
+            "port": 8080,
+            "protocol": "TCP"
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -2894,6 +2894,7 @@ def render_pod(a, worker, name, now, hard, env, run_names=()):
     comment = review_comment(a.repo)
     if comment:   # the repository's review comment, posted once by the end hook; none configured = no variable
         e["CW_REVIEW_COMMENT"] = comment
+    if (env.get("CW_COUNCIL_URL") or "").strip(): e["COUNCIL_MODEL_URL"] = env["CW_COUNCIL_URL"].strip()   # #2322: the council gateway's address, never a key
     agent = getattr(a, "agent", None) or "worker"
     if agent not in AGENTS:
         raise CloudError("--agent must be one of %s, got %r; nothing was created" % (" or ".join(AGENTS), str(agent)[:40]), EXIT_USAGE)
@@ -5065,6 +5066,7 @@ SETTINGS = (
     ("CW_VAULT_CHECK_DIR", False, "path"),         # the checkout the vault access check runs from; needed only after a vault firewall refusal (see vault_check_dir_problem)
     ("CW_MAX_PERSISTENT", False, "number"),        # the most persistent orchestrators (StatefulSets of the launcher's label) the namespace may hold (an integer 1 to 20; default 2)
     ("CW_VAULT_BLOCK_DURATION", False, "duration"),   # how long the launcher refuses vault commands after a vault firewall refusal (default 10m, 1m to 60m)
+    ("CW_COUNCIL_URL", False, "name"),             # the council gateway's address (an http or https URL) a worker pod is told as COUNCIL_MODEL_URL; never a key
 )
 SETTING_KINDS = {name: kind for name, _, kind in SETTINGS}
 SETTING_REQUIRED = tuple(name for name, required, _ in SETTINGS if required)
@@ -5232,6 +5234,7 @@ VALIDATORS = {
     "CW_VAULT_CHECK_DIR": ("an absolute path with no .. segment", _path_ok),
     "CW_MAX_PERSISTENT": ("an integer from 1 to 20", lambda v: bool(PERSISTENT_PATTERN.fullmatch(v)) and 1 <= int(v) <= PERSISTENT_MAX_LIMIT),
     "CW_VAULT_BLOCK_DURATION": ("a duration of 1 to 3 digits and m or h, from 1m to 60m (for example 10m or 1h)", _duration_ok),
+    "CW_COUNCIL_URL": ("an http or https URL: a host, an optional port, an optional path, no user, query or fragment", lambda v: bool(re.fullmatch(r"https?://[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?(?::[0-9]{1,5})?(?:/[A-Za-z0-9._/-]{0,100})?", v))),
 }
 _SETTING_LINE = re.compile(r"([A-Z][A-Z0-9_]*)=(.*)")
 

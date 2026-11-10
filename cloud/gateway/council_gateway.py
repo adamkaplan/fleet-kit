@@ -1,0 +1,181 @@
+#!/usr/bin/env python3
+"""The council gateway (ask #2322): a worker pod's model requests go through here, so a pod never holds the provider key.
+
+Standard library only. It reads ONE settings file (JSON; the path is argv[1] or COUNCIL_GATEWAY_SETTINGS) and the provider key from the file the
+settings name. It answers ONE route, POST /chat/completions (the OpenAI-style request the land tool's council sends), and forwards the body
+UNCHANGED to <provider_url>/chat/completions with the header `Authorization: Bearer <key>` (the caller's own Authorization header is dropped).
+Refused before anything is forwarded: any other path or method (403), a model outside the allow-list (403), a body over max_request_chars (413),
+a bad body, a missing or over-large max_tokens, or a streaming request (400). Past daily_budget requests in one UTC day: 429 with the reason.
+The day's count is in memory: a restart resets it. One count line per request goes to the log; it never holds a request body, an answer body or the key.
+"""
+import datetime
+import json
+import os
+import re
+import sys
+import threading
+import urllib.error
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+PATH = "/chat/completions"
+UPSTREAM_SECONDS = 155        # the council's client gives up at 150 s: nothing is buffered past 160 s
+ANSWER_MAX_BYTES = 16 * 1024 * 1024
+SETTING_KEYS = ("models", "max_request_chars", "max_answer_tokens", "daily_budget", "provider_url", "key_file")
+URL_RE = re.compile(r"https?://[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?(?::[0-9]{1,5})?(?:/[A-Za-z0-9._/-]*)?")
+
+
+class SettingsError(Exception):
+    pass
+
+
+def load_settings(path):
+    """The settings as a dict, or SettingsError (the message names a key, never a value)."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError) as err:
+        raise SettingsError("the settings file cannot be read as JSON (%s)" % type(err).__name__) from None
+    if not isinstance(data, dict):
+        raise SettingsError("the settings file must hold one JSON object")
+    for key in SETTING_KEYS:
+        if key not in data:
+            raise SettingsError("the setting %s is missing" % key)
+    models = data["models"]
+    if not (isinstance(models, list) and models and all(isinstance(m, str) and m for m in models)):
+        raise SettingsError("models must be a non-empty list of model names")
+    for key in ("max_request_chars", "max_answer_tokens", "daily_budget"):
+        if type(data[key]) is not int or data[key] < 1:
+            raise SettingsError("%s must be a whole number above 0" % key)
+    if not (isinstance(data["provider_url"], str) and URL_RE.fullmatch(data["provider_url"])):
+        raise SettingsError("provider_url must be an http or https URL without user, query or fragment")
+    if not (isinstance(data["key_file"], str) and os.path.isabs(data["key_file"])):
+        raise SettingsError("key_file must be an absolute path")
+    return data
+
+
+class Gateway:
+    def __init__(self, settings, log=None, clock=None, opener=None):
+        self.s = settings
+        self.log = log or (lambda line: (sys.stderr.write(line + "\n"), sys.stderr.flush()))
+        self.clock = clock or (lambda: datetime.datetime.now(datetime.timezone.utc).date())
+        self.opener = opener or urllib.request.build_opener()
+        self.lock = threading.Lock()
+        self.day, self.count = None, 0
+
+    def take(self):
+        """Count one request against today's budget: (allowed, number used today)."""
+        with self.lock:
+            today = self.clock()
+            if today != self.day:
+                self.day, self.count = today, 0
+            if self.count >= self.s["daily_budget"]:
+                return False, self.count
+            self.count += 1
+            return True, self.count
+
+    def key(self):
+        with open(self.s["key_file"], encoding="utf-8") as f:
+            return f.read().strip()
+
+    def forward(self, body):
+        """(status, answer bytes) from the provider; the key is added here and goes nowhere else."""
+        req = urllib.request.Request(self.s["provider_url"].rstrip("/") + PATH, data=body, method="POST",
+                                     headers={"Authorization": "Bearer " + self.key(), "content-type": "application/json"})
+        try:
+            with self.opener.open(req, timeout=UPSTREAM_SECONDS) as res:
+                return res.status, res.read(ANSWER_MAX_BYTES)
+        except urllib.error.HTTPError as err:
+            return err.code, err.read(ANSWER_MAX_BYTES)
+        except (OSError, ValueError):
+            return 502, None
+
+    def handle(self, method, path, length, read_body):
+        """(status, reason or None, body bytes or None, model or '-', used today). read_body(n) reads the request."""
+        s = self.s
+        if method != "POST" or path != PATH:
+            return 403, "only POST " + PATH + " is served", None, "-", 0
+        if length is None:
+            return 400, "a Content-Length is required", None, "-", 0
+        if length > s["max_request_chars"] * 4:
+            return 413, "the request is over the limit of %d characters" % s["max_request_chars"], None, "-", 0
+        raw = read_body(length)
+        try:
+            text = raw.decode("utf-8")
+            data = json.loads(text)
+        except ValueError:
+            return 400, "the body is not JSON", None, "-", 0
+        if len(text) > s["max_request_chars"]:
+            return 413, "the request is over the limit of %d characters" % s["max_request_chars"], None, "-", 0
+        if not isinstance(data, dict):
+            return 400, "the body must be a JSON object", None, "-", 0
+        model = data.get("model")
+        if not (isinstance(model, str) and model in s["models"]):
+            return 403, "the model is not on the allow-list", None, "-", 0
+        tokens = data.get("max_tokens")
+        if type(tokens) is not int or not 1 <= tokens <= s["max_answer_tokens"]:
+            return 400, "max_tokens must be a whole number from 1 to %d" % s["max_answer_tokens"], None, model, 0
+        if data.get("stream"):
+            return 400, "streaming is not served", None, model, 0
+        ok, used = self.take()
+        if not ok:
+            return 429, "the daily budget of %d requests is spent; it renews at 00:00 UTC" % s["daily_budget"], None, model, used
+        status, answer = self.forward(raw)
+        if answer is None:
+            return 502, "the provider could not be reached", None, model, used
+        return status, None, answer, model, used
+
+
+def make_handler(gw):
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+        server_version = "council-gateway"
+
+        def log_message(self, *args):   # the library's own access line carries the path: silenced
+            pass
+
+        def serve(self):
+            raw_length = self.headers.get("Content-Length")
+            length = int(raw_length) if raw_length and raw_length.isdigit() and len(raw_length) < 12 else None
+            status, reason, answer, model, used = gw.handle(self.command, self.path, length, self.rfile.read)
+            if answer is None:
+                answer = json.dumps({"error": {"message": reason}}).encode()
+            self.close_connection = True   # a refusal may leave an unread body behind: one request per connection
+            line = "council-gateway status=%d model=%s used_today=%d budget=%d bytes_in=%d" % (status, model, used, gw.s["daily_budget"], length or 0)
+            gw.log(line)
+            self.send_response(status)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(answer)))
+            self.send_header("connection", "close")
+            self.end_headers()
+            self.wfile.write(answer)
+
+        do_POST = do_GET = do_PUT = do_DELETE = do_PATCH = do_HEAD = do_OPTIONS = serve
+    return Handler
+
+
+def make_server(settings, host="0.0.0.0", port=8080, **kw):
+    gw = Gateway(settings, **kw)
+    server = ThreadingHTTPServer((host, port), make_handler(gw))
+    server.daemon_threads = True
+    server.gateway = gw
+    return server
+
+
+def main(argv):
+    path = argv[1] if len(argv) > 1 else os.environ.get("COUNCIL_GATEWAY_SETTINGS", "")
+    try:
+        settings = load_settings(path)
+    except SettingsError as err:
+        sys.stderr.write("council-gateway: refused to start: %s\n" % err)
+        return 2
+    port = int(os.environ.get("COUNCIL_GATEWAY_PORT", "8080"))
+    server = make_server(settings, port=port)
+    sys.stderr.write("council-gateway: listening on port %d\n" % port)
+    sys.stderr.flush()
+    server.serve_forever()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

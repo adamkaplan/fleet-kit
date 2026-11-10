@@ -6,6 +6,9 @@ cloud/launcher/tests/test_cloud_inspect.py
 cloud/launcher/tests/test_cloud_model_served.py
 cloud/launcher/tests/test_cloud_quick_budget.py
 cloud/launcher/tests/test_cloud_tests_write_tmp.py
+cloud/launcher/tests/test_council_gateway.py
+cloud/launcher/tests/test_council_gateway_manifest.py
+cloud/launcher/tests/test_council_url_render.py
 cloud/launcher/tests/test_create_says_why.py
 cloud/launcher/tests/test_end_hook_nothing_to_push.py
 cloud/launcher/tests/test_end_hook_pr_ready.py

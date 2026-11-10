@@ -35,6 +35,9 @@ cloud/launcher/tests/test_cloud_tests_write_tmp.py
 cloud/launcher/tests/test_cloud_turn_end.py
 cloud/launcher/tests/test_cloud_worker.py
 cloud/launcher/tests/test_cluster_token_refresh.py
+cloud/launcher/tests/test_council_gateway.py
+cloud/launcher/tests/test_council_gateway_manifest.py
+cloud/launcher/tests/test_council_url_render.py
 cloud/launcher/tests/test_create_says_why.py
 cloud/launcher/tests/test_cw_minter_manifest.py
 cloud/launcher/tests/test_cw_names.py

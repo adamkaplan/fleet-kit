@@ -27,6 +27,7 @@ OPTIONAL_SAMPLES = {"CW_TOOLING_REPO": "acme-org/tooling", "CW_CLOUD_CA_FILE": "
 OPTIONAL_SAMPLES["CW_FINAL_NOTE_MINUTES"] = "10"   # ask #1757: the final note's minutes
 OPTIONAL_SAMPLES["CW_REPO_MIN_SHAPE"] = "acme-org/widget-service=S"
 OPTIONAL_SAMPLES["CW_READONLY_ROOT_LANES"] = "lane-a,lane-b"
+OPTIONAL_SAMPLES["CW_COUNCIL_URL"] = "http://council-gateway.cw.svc:8080"   # ask #2322: the council gateway's address
 SAMPLES = {   # one value per secret shape (built here, never a real secret)
     "a JWT": "eyJhbGciOiJIUzI1" + "." + "eyJzdWIiOiJ4eHh4",
     "a PEM header": "-----BEGIN " + "PRIVATE KEY-----",
@@ -86,6 +87,7 @@ HOSTILE = {   # per key: values that must be refused (each through the REAL pars
     "CW_CLUSTER_TOKEN_DURATION": ["-5m", "0m", "61m", "2h", "1000m", "20", "m", "20s", "1.5h", "20 m", "/tmp/20m", "20m5s", "\u0662\u0660m", "-1h", "0h"],
     "CW_MAX_PERSISTENT": ["0", "21", "00", "01", "+5", "-5", "-1", "\u0662", "\u0661\u0662", "2\x01", "2\t", "1.5", "abc", "100"],
     "CW_VAULT_BLOCK_DURATION": ["-5m", "0m", "61m", "2h", "1000m", "10", "m", "10s", "1.5h", "10 m", "/tmp/10m", "10m5s", "\u0662\u0660m", "-1h", "0h"],
+    "CW_COUNCIL_URL": ["ftp://gw.example", "http://user@gw.example", "http://gw.example/x?y=1", "gw.example", "http://gw example", "$(x)", "http://gw.example/#f"],
 }
 CONTROL = ["\t", "\x00", "\r", "\x0b", "\x0c", "\x1c", "\x1b", "\x7f", "\x01"]
 
