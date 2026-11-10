@@ -79,6 +79,12 @@
 #CFGX excluded | gpg.*.program | runs a program
 #CFGX excluded | sendemail.* | mail settings
 #CFGX excluded | protocol.ext.allow | allows the ext transport (a program)
+#CFGX excluded | gpg.program | runs a program
+#CFGX excluded | core.worktree | points the repository at another work tree
+#CFGX excluded | core.alternateRefsCommand | runs a program
+#CFGX excluded | sequence.editor | runs a program
+#CFGX excluded | pager.* | runs a program
+#CFGX excluded | remote.*.vcs | runs a program
 # THE git ENVIRONMENT TABLE (the same rule for the variables of the family GIT_CONFIG_*): `#ENVCFG <refused|allowed> | <name> | <form> | <why>`.
 #   Only these pass, an exact allow-list (never a prefix); every other GIT_CONFIG_* set and not empty is refused with the one line.
 #ENVCFG allowed | GIT_CONFIG_NOSYSTEM | 1 | only the value 1
@@ -190,7 +196,9 @@ scope_args() {   # the words after `git`: remember the last -C directory (chaine
   while [ $# -gt 0 ]; do
     case "$1" in
       -C) [ $# -ge 2 ] || break; case "$2" in /*) sc_dir=$2 ;; *) sc_dir=$sc_dir/$2 ;; esac; shift 2 ;;
-      -c|--config-env|--namespace|--exec-path) shift 2 || break ;;
+      -c|--config-env) sc_off=1; shift 2 || break ;;   # ask #2360 (security review): a -c setting can move a remote, so the command is out of scope
+      --config-env=*) sc_off=1; shift ;;
+      --namespace|--exec-path) shift 2 || break ;;
       --git-dir|--work-tree) sc_off=1; shift 2 || break ;;
       --git-dir=*|--work-tree=*) sc_off=1; shift ;;
       -*) shift ;;
@@ -254,7 +262,7 @@ cfg_scoped_ok() {   # in scope: `git config [--local] KEY VALUE` for a key not i
   case "$ck" in
     alias.*|push.default|core.hookspath|core.sshcommand|core.fsmonitor|core.pager|core.editor|core.askpass|core.gitproxy) return 1 ;;
     credential.*|include.*|includeif.*|url.*|http.proxy*|http.sslcainfo|http.cookiefile|http.*.proxy*|http.*.sslcainfo|http.*.cookiefile) return 1 ;;
-    remote.*.proxy*|remote.*.receivepack|remote.*.uploadpack|uploadpack.packobjectshook|diff.external|filter.*|merge.*.driver|gpg.*.program|sendemail.*|protocol.ext.allow) return 1 ;;
+    remote.*.proxy*|remote.*.receivepack|remote.*.uploadpack|uploadpack.packobjectshook|diff.external|filter.*|merge.*.driver|gpg.*.program|sendemail.*|protocol.ext.allow|gpg.program|core.worktree|core.alternaterefscommand|sequence.editor|pager.*|remote.*.vcs) return 1 ;;
   esac
   return 0
 }

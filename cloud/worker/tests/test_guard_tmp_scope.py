@@ -22,7 +22,8 @@ ANCHOR = "a relaxation applied outside the temporary directory"
 EXCLUDED = ["alias.*", "push.default", "core.hooksPath", "core.sshCommand", "core.fsmonitor", "core.pager", "core.editor", "core.askpass",
             "core.gitProxy", "credential.*", "include.*", "includeIf.*", "url.*", "http.proxy*", "http.sslcainfo", "http.cookiefile",
             "remote.*.proxy", "remote.*.receivepack", "remote.*.uploadpack", "uploadpack.packObjectsHook", "diff.external", "filter.*",
-            "merge.*.driver", "gpg.*.program", "sendemail.*", "protocol.ext.allow"]
+            "merge.*.driver", "gpg.*.program", "sendemail.*", "protocol.ext.allow", "gpg.program", "core.worktree", "core.alternateRefsCommand",
+            "sequence.editor", "pager.*", "remote.*.vcs"]
 
 
 def read(p):
@@ -171,6 +172,12 @@ class Scope(unittest.TestCase):
         self.refused(["push", "--all", "origin"], PUSH)
         self.refused(["push", "--mirror", "origin"], FORCE)
         self.refused(["push", "--force", "--mirror", "origin"], FORCE)
+
+    def test_s3_a_dash_c_setting_puts_the_push_out_of_scope(self):
+        for pre in (["-c", "remote.origin.pushurl=https://github.com/x/y.git"], ["-c", "url.https://github.com/.insteadOf=" + self.root + "/"],
+                    ["--config-env=remote.origin.pushurl=FOO"], ["-c", "a.b=c"]):
+            self.refused(pre + ["push", "--force", "origin", "feat"], FORCE, env={"FOO": "https://github.com/x/y.git"})
+            self.refused(pre + ["push", "origin", "main"], PUSH, env={"FOO": "https://github.com/x/y.git"})
 
     def test_s3_in_scope_force_to_another_remote_form_is_refused(self):
         r = self.repo
