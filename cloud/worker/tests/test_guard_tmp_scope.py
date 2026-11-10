@@ -160,12 +160,65 @@ class Scope(unittest.TestCase):
         self.refused(["push", self.remote, "main"], PUSH, env={"HOME": home})
         self.refused(["push", "-", self.remote, "main"], PUSH)
 
-    def test_s3_in_scope_force_a_glob_and_all_stay_refused(self):
-        self.refused(["push", "--force", "origin", "main"], FORCE)
-        self.refused(["push", "-f", "origin", "main"], FORCE)
-        self.refused(["push", "origin", "+main"], FORCE)
+    def test_s3_in_scope_force_is_allowed_for_a_local_remote_and_a_glob_all_and_mirror_stay_refused(self):
+        for f in (["--force"], ["--force-with-lease"], ["--force-with-lease=feat"], ["-f"], ["--force-if-includes"]):
+            self.allowed(["push"] + f + ["origin", "feat"])
+        self.allowed(["push", "origin", "+feat"])
+        self.allowed(["push", "--force", self.remote, "feat"])
+        self.allowed(["push", "--force", "file://" + self.remote, "feat"])
+        self.refused(["push", "origin", "+refs/heads/*:refs/heads/*"], GLOB)
         self.refused(["push", "origin", "refs/heads/*:refs/heads/*"], GLOB)
         self.refused(["push", "--all", "origin"], PUSH)
+        self.refused(["push", "--mirror", "origin"], FORCE)
+        self.refused(["push", "--force", "--mirror", "origin"], FORCE)
+
+    def test_s3_in_scope_force_to_another_remote_form_is_refused(self):
+        r = self.repo
+        self.addCleanup(git, r, "remote", "set-url", "origin", self.remote)
+        for url in ("https://github.com/o/r.git", "ssh://git@github.com/o/r.git", "/usr"):
+            git(r, "remote", "set-url", "origin", url)
+            for f in (["--force", "origin", "feat"], ["--force-with-lease", "origin", "feat"], ["origin", "+feat"], ["-f", "origin", "feat"]):
+                self.refused(["push"] + f, FORCE)
+
+    # ---- ask #2360: a bare repository, by its git directory ----
+    def bare(self, name="bare-scope.git"):
+        p = os.path.join(self.root, name)
+        if not os.path.isdir(p):
+            git(self.root, "init", "-q", "--bare", p)
+        return p
+
+    def test_s2_a_bare_repository_under_tmp_is_in_scope_and_other_places_are_not(self):
+        b = self.bare()
+        self.allowed(["config", "receive.denyNonFastForwards", "true"], cwd=b)
+        self.allowed(["config", "http.receivepack", "true"], cwd=b)
+        self.allowed(["-C", b, "config", "receive.denyNonFastForwards", "true"], cwd=self.root)
+        self.refused(["config", "core.hooksPath", "/x"], CONFIG, cwd=b)
+        self.refused(["-C", b, "config", "alias.x", "!id"], CONFIG, cwd=self.root)
+        link = os.path.join(self.root, "bare-link-work")
+        if os.path.lexists(link):
+            os.unlink(link)
+        os.symlink("/work/repo", link)
+        outs = [(["config", "http.receivepack", "true"], d) for d in (self.work and [self.work, link, "/work/repo/.git"] or [])]
+        if self.out:
+            ob = os.path.join(self.outroot, "bare.git")
+            git(self.outroot, "init", "-q", "--bare", ob)
+            outs.append((["config", "http.receivepack", "true"], ob))
+            lk = os.path.join(self.root, "link-to-outbare")
+            if not os.path.lexists(lk):
+                os.symlink(ob, lk)
+            outs.append((["config", "http.receivepack", "true"], lk))
+        if self.work:
+            inside = "/work/repo/.git"
+            outs.append((["-C", os.path.join(self.root, "..", "..", "work", "repo", ".git"), "config", "http.receivepack", "true"], self.root))
+        for args, cwd in outs:
+            self.refused(args, CONFIG, cwd=cwd)
+
+    def test_s3_a_bare_repository_remote_takes_a_forced_push(self):
+        self.allowed(["push", "--force", "origin", "feat"])
+        b = self.bare("bare-origin2.git")
+        r = self.mk(self.root, "repo-b", b)
+        self.allowed(["push", "origin", "+feat"], cwd=r)
+        self.allowed(["push", "--force-with-lease", "origin", "feat"], cwd=r)
 
     def refused_outside(self, guard=None):
         """every command that must stay refused because it is outside the temporary scope; a wrong allowance names the anchored text"""
@@ -309,6 +362,43 @@ class Scope(unittest.TestCase):
                 self.refused(["status"], ENV, cwd=self.outrepo, env={name: good})   # out of scope: the same file
             self.refused(["status"], ENV, cwd="/", env={name: good})
 
+    def test_s5_a_fixture_under_the_checkout_server_tests_is_let_through_in_scope_only(self):
+        d = "/work/repo/server/tests"
+        if not os.path.isdir(d):
+            if not os.path.isdir("/work/repo"):
+                self.skipTest("no checkout")
+            os.makedirs(d)
+            self.addCleanup(shutil.rmtree, "/work/repo/server", True)
+        fx = os.path.join(d, "fixture-2360-%d.gitconfig" % os.getpid())
+        with open(fx, "w") as f:
+            f.write("[user]\n\tname = x\n")
+        self.addCleanup(os.unlink, fx)
+        for name in ("GIT_CONFIG_SYSTEM", "GIT_CONFIG_GLOBAL"):
+            self.allowed(["status"], env={name: fx})
+            self.refused(["status"], ENV, env={name: d + "/../" + os.path.basename(fx)})
+            self.refused(["status"], ENV, env={name: d + "/../../" + os.path.basename(fx)})
+            self.refused(["status"], ENV, env={name: "/work/repo/other"})
+            self.refused(["status"], ENV, env={name: "/work/repo/server/testsx/f"})
+            lk = os.path.join(self.root, "fxlink")
+            if os.path.lexists(lk):
+                os.unlink(lk)
+            os.symlink(fx, lk)
+            self.refused(["status"], ENV, env={name: lk})
+            dl = os.path.join(self.root, "fxdir")   # a link to a directory outside server/tests
+            if not os.path.lexists(dl):
+                os.symlink("/work/repo", dl)
+            self.refused(["status"], ENV, env={name: dl + "/server/tests/" + os.path.basename(fx)})
+            if self.outrepo:
+                self.refused(["status"], ENV, cwd=self.outrepo, env={name: fx})   # out of scope
+            self.refused(["status"], ENV, cwd=self.bare(), env={name: "/etc/hostname"})
+            self.allowed(["status"], cwd=self.bare(), env={name: self.gfile()})
+            if self.out:
+                p = os.path.join(self.outroot, "fx")
+                with open(p, "w") as f:
+                    f.write("x")
+                self.refused(["status"], ENV, env={name: p})
+        self.refused(["status"], ENV, cwd="/", env={"GIT_CONFIG_SYSTEM": fx})
+
     # ---- S6: the unchanged refusals ----
     def test_s6_the_unscoped_settings_stay_refused_in_scope_and_out(self):
         def pairs(k, v):
@@ -337,6 +427,28 @@ class Scope(unittest.TestCase):
         p = self.mutant('  [ "$sc_off" = 0 ] || return 1\n', "  return 0\n")
         with self.assertRaisesRegex(AssertionError, ANCHOR):
             self.refused_outside(guard=p)
+
+    def test_s8_a_guard_without_the_git_directory_check_fails_with_the_anchored_text(self):
+        if not self.outrepo:
+            self.skipTest("no writable directory outside /tmp")
+        ob = os.path.join(self.outroot, "mbare.git")
+        git(self.outroot, "init", "-q", "--bare", ob)
+        def run(g):
+            r = self.guard(["config", "http.receivepack", "true"], cwd=ob, guard=g)
+            if r.returncode == 0:
+                self.fail("%s: a bare repository outside /tmp let through" % ANCHOR)
+            self.assertEqual((r.returncode, r.stderr), (3, CONFIG))
+        run(None)   # the control
+        p = self.mutant('  tmp_under "$is_gd" || return 1\n', "")
+        with self.assertRaisesRegex(AssertionError, ANCHOR):
+            run(p)
+
+    def test_s8_a_guard_that_allows_force_everywhere_is_caught(self):
+        git(self.repo, "remote", "set-url", "origin", "https://github.com/o/r.git")
+        self.addCleanup(git, self.repo, "remote", "set-url", "origin", self.remote)
+        self.refused(["push", "--force", "origin", "feat"], FORCE)   # the control
+        p = self.mutant('--force|--force-with-lease|--force-with-lease=*|--force-if-includes) [ "$push_scoped" = 1 ] || refuse "force-pushing" ;;', '--force|--force-with-lease|--force-with-lease=*|--force-if-includes) ;;')
+        self.assertEqual(self.guard(["push", "--force", "origin", "feat"], guard=p).returncode, 0)
 
     def test_s7_a_guard_that_allows_every_remote_form_in_scope_is_caught(self):
         git(self.repo, "remote", "set-url", "origin", "https://github.com/o/r.git")
