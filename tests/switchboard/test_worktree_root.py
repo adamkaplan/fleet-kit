@@ -145,10 +145,8 @@ class TestLaunch(Home):
 
 
 class TestText(unittest.TestCase):
-    SKILL = (REPO / "skills" / "fleet-coordination" / "SKILL.md").read_text()
-
     def test_s3_the_skill_names_the_root_once_and_no_line_makes_a_top_level_worktree(self):
-        flat = " ".join(self.SKILL.split())
+        flat = " ".join((REPO / "skills" / "fleet-coordination" / "SKILL.md").read_text().split())
         self.assertEqual(flat.count("worktree_root"), 1)
         self.assertEqual(flat.count("~/Code/.fleet"), 1)
         for path in (REPO / "skills").rglob("*"):
