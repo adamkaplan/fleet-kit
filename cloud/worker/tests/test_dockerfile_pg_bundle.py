@@ -61,17 +61,26 @@ def final_stage(t):
     return flat(t[i:]) if i >= 0 else ""
 
 
+SERVER_WORDS = ("pg_ctl", "pg_ctlcluster", "initdb", "postgres", "systemctl", "service")
+# Commands whose arguments only name a file or text (never run it): a server word after them is not a start.
+INERT = ("chmod", "chown", "chgrp", "cp", "mv", "ln", "ls", "rm", "mkdir", "touch", "install", "echo", "printf", "cat", "test", "stat", "readlink",
+         "grep", "sed", "tar", "useradd", "groupadd", "apt-get", "apt", "dpkg", "curl", "wget", "[")
+
+
 def starts_server(f):
-    """True when pg_ctl, initdb, postgres, systemctl or service is a COMMAND word (any path prefix) of a RUN line of the stage."""
+    """True when a RUN/CMD/ENTRYPOINT line of the stage holds a server word (any path prefix) in a segment (split at && || ; | ( ) $( and a
+    backtick) whose command is not an inert one: this catches `then pg_ctl`, `bash -c 'postgres'`, `timeout 5 postgres`, `sudo -u x pg_ctl`."""
     for line in f.split("\n"):
         m = re.match(r"(RUN|CMD|ENTRYPOINT) (.*)", line)
         if not m:
             continue
         for seg in re.split(r"&&|\|\||;|\||\(|\)|\$\(|`", m.group(2)):
-            words = seg.split()
-            while words and (re.match(r"\w+=", words[0]) or words[0] in ("sudo", "exec", "nohup", "env", "su", "gosu")):
+            words = [w.strip("\"'[],") for w in seg.split()]
+            while words and (re.match(r"\w+=", words[0]) or words[0] in ("sudo", "exec", "nohup", "env", "su", "gosu", "then", "do", "else", "if", "!", "time")):
                 words = words[1:]
-            if words and os.path.basename(words[0].strip("\"'")) in ("pg_ctl", "initdb", "postgres", "systemctl", "service"):
+            if words and os.path.basename(words[0]) in INERT:
+                continue
+            if any(os.path.basename(w) in SERVER_WORDS for w in words):
                 return True
     return False
 
@@ -136,12 +145,25 @@ class T(unittest.TestCase):
     def test_closure_is_shipped_and_copies_equal(self):
         got = walk_imports()
         self.assertIn("path_walk.py", got)
-        bins = sorted(n for n in got if n in BIN_COPIES or got[n] == BIN and n not in tolerated_all())
+        bins = sorted(set(BIN_COPIES) | {n for n in got if got[n] == BIN and n not in tolerated_all()})
+        for n in os.listdir(LAUNCHER):  # a launcher file sharing a bin/ name is either a listed copy or a different file
+            if n.endswith(".py") and os.path.isfile(os.path.join(BIN, n)) and n not in BIN_COPIES:
+                with open(os.path.join(BIN, n), "rb") as a, open(os.path.join(LAUNCHER, n), "rb") as b:
+                    self.assertNotEqual(a.read(), b.read(), n + " is a copy of bin/ but is not in BIN_COPIES")
         for n in bins:
             with open(os.path.join(BIN, n), "rb") as a, open(os.path.join(LAUNCHER, n), "rb") as b:
                 self.assertEqual(a.read(), b.read(), n + " copy differs")
             self.assertTrue(os.path.isfile(os.path.join(LAUNCHER, n)))
-        print("closure:", sorted(got), "shipped bin modules:", bins)
+        self.assertEqual(sorted(got), ["app_token.py", "cloud_worker.py", "path_walk.py", "registry.py", "run_record.py", "token_mint.py", "token_service.py", "wip_save.py"])
+
+    def test_copy_mutant_fails_comparison(self):
+        with open(os.path.join(BIN, "path_walk.py"), "rb") as a, open(os.path.join(LAUNCHER, "path_walk.py"), "rb") as b:
+            src, copy = a.read(), b.read()
+        self.assertEqual(src, copy)  # control
+        self.assertNotEqual(src + b" ", copy)  # a one-byte edit differs
+
+    def test_registry_is_tolerated_not_shipped(self):
+        self.assertNotIn("launcher/registry.py", flat(final_stage(read(DF))))
         self.assertEqual(problems(read(DF)), [])
 
     def test_missing_module_mutant_control_first(self):
@@ -153,9 +175,14 @@ class T(unittest.TestCase):
     def test_server_start_mutants_control_first(self):
         t = read(DF)
         self.assertEqual(problems(t), [])  # control
-        for cmd in ("/opt/pg/bin/pg_ctl start", "/usr/bin/postgres -D /x", "/opt/pg/bin/initdb -D /x"):
+        for cmd in ("/opt/pg/bin/pg_ctl start", "/usr/bin/postgres -D /x", "/opt/pg/bin/initdb -D /x",
+                    "if true; then pg_ctl start; fi", "bash -c 'postgres -D /x'", "sudo -u pg pg_ctl start", "timeout 5 postgres",
+                    "systemctl start x", "service postgresql start"):
             m = read(DF).rstrip("\n") + "\nRUN " + cmd + "\n"
             self.assertIn("a line starts a server", " ".join(problems(m)), cmd)
+        for cmd in ("echo postgres", "chmod 0755 /opt/pg/bin/postgres", "cp -a /opt/pg/bin/initdb /x"):
+            m = read(DF).rstrip("\n") + "\nRUN " + cmd + "\n"
+            self.assertNotIn("a line starts a server", " ".join(problems(m)), cmd)
 
     def mutate(self, old, new):
         t = read(DF)
