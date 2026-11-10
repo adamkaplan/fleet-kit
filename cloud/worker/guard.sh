@@ -48,6 +48,26 @@
 #CFG allowed | --get-regexp | --get-regexp user | a read
 #CFG allowed | --list | --list | a read
 #CFG allowed | --list --show-origin | --list --show-origin | a read
+# THE git ENVIRONMENT TABLE (the same rule for the variables of the family GIT_CONFIG_*): `#ENVCFG <refused|allowed> | <name> | <form> | <why>`.
+#   Only these pass, an exact allow-list (never a prefix); every other GIT_CONFIG_* set and not empty is refused with the one line.
+#ENVCFG allowed | GIT_CONFIG_NOSYSTEM | 1 | only the value 1
+#ENVCFG allowed | GIT_CONFIG_SYSTEM | /dev/null | only this value, never a path a program wrote
+#ENVCFG allowed | GIT_CONFIG_GLOBAL | /dev/null | only this value, never a path a program wrote
+#ENVCFG allowed | GIT_CONFIG_COUNT | 1 to 16 | a whole number; KEY_n and VALUE_n for n below it; a KEY_n beyond it is refused
+#ENVCFG allowed | user.name | any printable value on one line | identity (the key is compared in lower case)
+#ENVCFG allowed | user.email | any printable value on one line | identity
+#ENVCFG allowed | core.excludesFile | /etc/gitignore | only this value
+#ENVCFG allowed | maintenance.auto | false | only this value
+#ENVCFG allowed | gc.auto | 0 | only this value
+#ENVCFG allowed | credential.helper | an empty value | only empty (it clears a helper)
+#ENVCFG allowed | url.<base>.insteadOf | https://github.com/ | only for a base that is an absolute local path or a file:// URL of one (no .. segment), and only this value
+#ENVCFG allowed | http.<url>.extraHeader | X-Test: 1 | only scoped to http(s)://127.0.0.1 or localhost (port and path optional, no user information)
+#ENVCFG refused | GIT_CONFIG_PARAMETERS | x | carries any setting
+#ENVCFG refused | GIT_CONFIG_GLOBAL or GIT_CONFIG_SYSTEM of any other value | /tmp/x | a config file a program wrote
+#ENVCFG refused | GIT_CONFIG_COUNT outside 1 to 16 | 17 | not a whole number from 1 to 16
+#ENVCFG refused | a key outside the list | core.hooksPath | runs a program (also core.sshCommand, core.fsmonitor, core.pager, include.*, alias.*, push.default, any other credential.*, any other http.* and the unscoped http.extraHeader)
+#ENVCFG refused | credential.helper with a value | store | a helper runs a program
+#ENVCFG refused | a missing or empty KEY_n, or a KEY_n beyond the count | GIT_CONFIG_KEY_3 | git ignores or misreads it
 tool=${1:-}; [ $# -gt 0 ] && shift
 tail_msg="the repository's rules are the guard; this wrapper is only a convenience"
 refuse() { echo "refused: $1: $tail_msg" >&2; exit 3; }
@@ -68,9 +88,64 @@ bad_cfg() {   # $1: a git config name or name=value: an alias or a push.default 
   case "$k" in alias.*) refuse "defining a git alias" ;; push.default*) refuse "overriding push.default" ;; esac
 }
 
+env_cfg_refuse() { refuse "git configuration from the environment (GIT_CONFIG_*)"; }
+env_cfg_text() {   # $1: a value: printable characters, one line, not empty
+  case "$1" in "") env_cfg_refuse ;; *"
+"*) env_cfg_refuse ;; esac
+  printf '%s' "$1" | LC_ALL=C grep -q '[^ -~]' && env_cfg_refuse
+  return 0
+}
+env_cfg_local() {   # $1: an absolute local path (letters, digits, dot, underscore, dash, slash; no .. segment) or a file:// URL of one
+  p=${1#file://}
+  printf '%s' "$p" | grep -Eq '^/[A-Za-z0-9._/-]*$' || env_cfg_refuse
+  case "$p/" in */../*) env_cfg_refuse ;; esac
+  return 0
+}
+env_cfg_pair() {   # $1: a key, $2: its value: only the listed settings pass (the key is compared in lower case; a URL part keeps its case)
+  case "$1" in *"
+"*) env_cfg_refuse ;; esac   # grep judges one line at a time: a key of two lines is refused
+  lk=$(printf '%s' "$1" | tr 'A-Z' 'a-z')
+  case "$lk" in
+    user.email|user.name) env_cfg_text "$2" ;;
+    core.excludesfile) [ "$2" = /etc/gitignore ] || env_cfg_refuse ;;
+    maintenance.auto) [ "$2" = false ] || env_cfg_refuse ;;
+    gc.auto) [ "$2" = 0 ] || env_cfg_refuse ;;
+    credential.helper) [ -z "$2" ] || env_cfg_refuse ;;
+    url.?*.insteadof)
+      b=${1#????}; b=${b%??????????}
+      env_cfg_local "$b"; [ "$2" = https://github.com/ ] || env_cfg_refuse ;;
+    http.?*.extraheader)
+      b=${1#?????}; b=${b%????????????}
+      printf '%s' "$b" | grep -Eq '^https?://(127\.0\.0\.1|localhost)(:[0-9]+)?(/[A-Za-z0-9._~%/-]*)?$' || env_cfg_refuse
+      env_cfg_text "$2" ;;
+    *) env_cfg_refuse ;;
+  esac
+}
+# env_cfg: see the #ENVCFG rows; only the listed settings pass, any other GIT_CONFIG_* set and not empty is refused
 env_cfg() {   # git's environment configuration is the environment form of the two -c refusals: any of it set and not empty is refused
-  [ -n "${GIT_CONFIG_COUNT:-}${GIT_CONFIG_PARAMETERS:-}${GIT_CONFIG_GLOBAL:-}${GIT_CONFIG_SYSTEM:-}" ] && refuse "git configuration from the environment (GIT_CONFIG_*)"
-  env | grep -q '^GIT_CONFIG_KEY_[A-Za-z0-9_]*=.' && refuse "git configuration from the environment (GIT_CONFIG_*)"
+  [ -n "${GIT_CONFIG_PARAMETERS:-}" ] && env_cfg_refuse
+  case "${GIT_CONFIG_NOSYSTEM:-}" in ""|1) ;; *) env_cfg_refuse ;; esac
+  case "${GIT_CONFIG_GLOBAL:-}" in ""|/dev/null) ;; *) env_cfg_refuse ;; esac
+  case "${GIT_CONFIG_SYSTEM:-}" in ""|/dev/null) ;; *) env_cfg_refuse ;; esac
+  cnt=${GIT_CONFIG_COUNT:-}
+  case "$cnt" in ""|[1-9]|1[0-6]) ;; *) env_cfg_refuse ;; esac
+  keys=$(env | grep '^GIT_CONFIG_KEY_[A-Za-z0-9_]*=.')
+  if [ -n "$keys" ]; then
+    [ -n "$cnt" ] || env_cfg_refuse
+    while IFS= read -r kl; do
+      kn=${kl%%=*}; kn=${kn#GIT_CONFIG_KEY_}
+      case "$kn" in [1-9]|1[0-5]|0) [ "$kn" -lt "$cnt" ] || env_cfg_refuse ;; *) env_cfg_refuse ;; esac
+    done <<EOF
+$keys
+EOF
+  fi
+  i=0
+  while [ -n "$cnt" ] && [ "$i" -lt "$cnt" ]; do
+    eval "ek=\${GIT_CONFIG_KEY_$i:-}; ev=\${GIT_CONFIG_VALUE_$i:-}"
+    [ -n "$ek" ] || env_cfg_refuse
+    env_cfg_pair "$ek" "$ev"
+    i=$((i + 1))
+  done
   return 0
 }
 

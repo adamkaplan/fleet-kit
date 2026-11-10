@@ -1,5 +1,6 @@
 cloud/launcher/tests/test_app_token_route.py
 cloud/launcher/tests/test_app_token_service.py
+cloud/launcher/tests/test_azure_config_dir.py
 cloud/launcher/tests/test_brief_header.py
 cloud/launcher/tests/test_cloud_default_model.py
 cloud/launcher/tests/test_cloud_inspect.py
@@ -77,6 +78,7 @@ cloud/worker/tests/test_dockerfile_pg_bundle.py
 cloud/worker/tests/test_dockerfile_postgres.py
 cloud/worker/tests/test_entrypoint.py
 cloud/worker/tests/test_entrypoint_import.py
+cloud/worker/tests/test_guard_env.py
 cloud/worker/tests/test_plan_check_in_pod.py
 cloud/worker/tests/test_pr_branch_source.py
 cloud/worker/tests/test_pr_label.py
