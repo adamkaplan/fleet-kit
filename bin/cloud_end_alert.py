@@ -135,10 +135,15 @@ def pr_line(record_dir, parse):
     """The end-hook ask: the one line the end hook recorded about the pull request, only if it is one of the fixed forms; else a fixed unknown."""
     run = read_small(os.path.join(record_dir, "run.json"), parse) if record_dir else None
     hook = run.get("end_hook") if run else None
+    return valid_pr_note(hook) or "PR not marked ready: no answer recorded"
+
+
+def valid_pr_note(hook):
+    """The end hook's `pr_note` if it is one of the fixed forms, else None."""
     note = hook.get("pr_note") if isinstance(hook, dict) else None
     if isinstance(note, str) and len(note) <= 120 and re.fullmatch(r"PR (#[0-9]{1,9} marked ready(, review requested|, no review comment is configured)|not marked ready: [A-Za-z0-9 #(),._-]+)", note):
         return note
-    return "PR not marked ready: no answer recorded"
+    return None
 
 
 def message_text(worker, label, when, pushed, record_name, kept=False, failure=None):
@@ -223,7 +228,7 @@ def push_reader(audit_path, parse):
                 continue
             branch, sha = clean_branch(detail.get("branch")), detail.get("head")
             if branch and isinstance(sha, str) and FULL_SHA.fullmatch(sha):
-                if branch.endswith("/wip"):
+                if branch == worker + "/wip":
                     wip = (branch, sha)     # the reaper's save: only when the pod has no other push
                 else:
                     found = (branch, sha)   # later lines are newer
@@ -238,12 +243,15 @@ def head_line(record_dir, repo, head_checks, parse, pushed=None):
     hook = run.get("end_hook") if isinstance(run, dict) else None
     if isinstance(hook, dict) and hook.get("head_on") is None and hook.get("wip_branch") is None and not hook.get("error"):
         if not pushed:
-            note = hook.get("pr_note")   # a PR marked ready is proof of a push the push watch may not see (a branch of the pod's own choosing): not "nothing pushed"
-            return "Last head: head unknown." if isinstance(note, str) and note.startswith("PR #") else "Last head: nothing pushed."
+            # a PR marked ready proves a push the push watch may not see (a branch of the pod's own choosing): not "nothing pushed"
+            note = valid_pr_note(hook)
+            return "Last head: head unknown." if note and note.startswith("PR #") else "Last head: nothing pushed."
         return "Last head: head unknown." if pushed == UNPROVEN else finish_head(repo, pushed[0], pushed[1], head_checks)
     branch = hook.get("head_on") if isinstance(hook, dict) else None
     sha = run.get("head_sha") if isinstance(run, dict) else None
     wip = hook.get("wip_branch") if isinstance(hook, dict) and branch is None else None
+    if clean_branch(wip) and pushed and pushed != UNPROVEN and not pushed[0].endswith("/wip"):
+        return finish_head(repo, pushed[0], pushed[1], head_checks)   # a real push of the pod beats the wip save
     if clean_branch(wip):
         if not (isinstance(sha, str) and FULL_SHA.fullmatch(sha)):
             return "Last head: wip branch %s, sha unknown." % wip
