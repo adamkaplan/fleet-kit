@@ -9,6 +9,7 @@ import socket
 import subprocess
 import tempfile
 import threading
+import time
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -68,6 +69,19 @@ class Running:
         self.proc = subprocess.Popen([NODE, script], env=e, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         self.lines = [self.proc.stdout.readline()]   # the "listening" line
         assert "listening" in self.lines[0], self.lines[0]
+        self.reader = threading.Thread(target=self._read, daemon=True)   # the log is collected as it is written
+        self.reader.start()
+
+    def _read(self):
+        for line in self.proc.stdout:
+            self.lines.append(line)
+
+    def wait_for_counts(self, n, seconds=5.0):
+        """The front writes a request's count line after it has sent the answer: wait (50 ms steps) until n count lines are in the log."""
+        for _ in range(int(seconds / 0.05)):
+            if sum('"status"' in l for l in self.lines) >= n:
+                return
+            time.sleep(0.05)
 
     def request(self, method, path, body=None, headers=None, raw=None):
         c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=20)
@@ -81,8 +95,9 @@ class Running:
     def stop(self):
         if self.proc.poll() is None:
             self.proc.terminate()
-        rest, _ = self.proc.communicate(timeout=20)   # waits for the process and closes its pipe
-        self.lines += rest.splitlines(True)
+        self.proc.wait(timeout=20)
+        self.reader.join(timeout=20)   # the reader ends at the end of the pipe
+        self.proc.stdout.close()
         return "".join(self.lines)
 
 
@@ -213,6 +228,7 @@ def log_problems(script, test):
             f.request("POST", "/chat/completions", chat("gpt-4o", text=BODY_TEXT + " " + TOKEN), {"Authorization": "Bearer " + TOKEN})
             f.request("POST", "/chat/completions", chat("claude-opus-5", text=BODY_TEXT), {"Authorization": "Bearer " + TOKEN})
             f.request("GET", "/models", headers={"Authorization": "Bearer " + TOKEN})
+            f.wait_for_counts(3)
         finally:
             log = f.stop()
     finally:
