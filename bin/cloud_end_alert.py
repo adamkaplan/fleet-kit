@@ -205,7 +205,7 @@ def push_reader(audit_path, parse):
             return None
         finally:
             os.close(fd)
-        found, covered = None, False
+        found, wip, covered = None, None, False
         for raw in chunk.split(b"\n"):
             if b"push_watch.sent" not in raw and b"cloud.created" not in raw:
                 continue
@@ -216,15 +216,18 @@ def push_reader(audit_path, parse):
             if not isinstance(item, dict) or item.get("subject") != worker:
                 continue
             if item.get("event") == "cloud.created":
-                found, covered = None, True
+                found, wip, covered = None, None, True
                 continue
             detail = item.get("detail")
             if item.get("event") != "push_watch.sent" or not isinstance(detail, dict):
                 continue
             branch, sha = clean_branch(detail.get("branch")), detail.get("head")
             if branch and isinstance(sha, str) and FULL_SHA.fullmatch(sha):
-                found = (branch, sha)   # later lines are newer
-        return found or (None if covered else UNPROVEN)
+                if branch.endswith("/wip"):
+                    wip = (branch, sha)     # the reaper's save: only when the pod has no other push
+                else:
+                    found = (branch, sha)   # later lines are newer
+        return found or wip or (None if covered else UNPROVEN)
     return read
 
 
@@ -235,7 +238,8 @@ def head_line(record_dir, repo, head_checks, parse, pushed=None):
     hook = run.get("end_hook") if isinstance(run, dict) else None
     if isinstance(hook, dict) and hook.get("head_on") is None and hook.get("wip_branch") is None and not hook.get("error"):
         if not pushed:
-            return "Last head: nothing pushed."
+            note = hook.get("pr_note")   # a PR marked ready is proof of a push the push watch may not see (a branch of the pod's own choosing): not "nothing pushed"
+            return "Last head: head unknown." if isinstance(note, str) and note.startswith("PR #") else "Last head: nothing pushed."
         return "Last head: head unknown." if pushed == UNPROVEN else finish_head(repo, pushed[0], pushed[1], head_checks)
     branch = hook.get("head_on") if isinstance(hook, dict) else None
     sha = run.get("head_sha") if isinstance(run, dict) else None

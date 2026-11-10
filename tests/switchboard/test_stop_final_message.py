@@ -958,6 +958,23 @@ class TestEndNoticeOwnPushes(unittest.TestCase):
         path = self.audit_with(self.sent("cb-own1", "old/b", "c" * 40), self.sent("other", "z/z", "d" * 40), self.sent("cb-own1", "cb-own1/work", self.SHA))
         self.assertIn("Last head: cb-own1/work@bbbbbbbb, checks passed.", self.world("cb-own1", self.NOTHING, path))
 
+    def test_a_later_wip_save_does_not_hide_the_branch_push(self):
+        path = self.audit_with(self.born("cb-own30"), self.sent("cb-own30", "feat/real", self.SHA), self.sent("cb-own30", "cb-own30/wip", "e" * 40))
+        text = self.world("cb-own30", self.NOTHING, path)
+        self.assertIn("Last head: feat/real@bbbbbbbb", text)
+        self.assertNotIn("wip", text.split("Last head:")[1])
+
+    def test_a_wip_save_alone_is_named(self):
+        path = self.audit_with(self.born("cb-own31"), self.sent("cb-own31", "cb-own31/wip", "e" * 40))
+        self.assertIn("Last head: cb-own31/wip@eeeeeeee", self.world("cb-own31", self.NOTHING, path))
+
+    def test_a_pr_marked_ready_without_a_seen_push_is_not_nothing_pushed(self):
+        path = self.audit_with(self.born("cb-own32"))
+        hook = dict(self.NOTHING, pr_note="PR #7 marked ready, no review comment is configured")
+        text = self.world("cb-own32", hook, path)
+        self.assertIn("Last head: head unknown.", text)
+        self.assertNotIn("nothing pushed.", text.split("Last head:")[1])
+
     def test_control_no_push_anywhere_says_nothing_pushed(self):
         path = self.audit_with(self.born("cb-own2"), self.sent("other", "z/z", "d" * 40))
         self.assertIn("Last head: nothing pushed.", self.world("cb-own2", self.NOTHING, path))
