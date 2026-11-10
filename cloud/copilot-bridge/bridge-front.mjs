@@ -20,6 +20,9 @@ const CLOCK_FILE = env.BRIDGE_CLOCK_FILE || "";   // a test hook set only in the
 const SONNET = "claude-sonnet-5.5";
 const HAIKU = "claude-haiku-5.5";
 const BANNED_TEXT = "model banned from the council: opus";
+// Only these fields of a request go on to the bridge (the bridge passes the body to Copilot unchanged): nothing else can name a model or a route.
+const FIELDS = ["messages", "stream", "temperature", "top_p", "max_tokens", "tools", "tool_choice", "stop", "n", "seed", "response_format", "presence_penalty", "frequency_penalty"];
+const MAX_TOKENS = 64000;
 const PATHS = new Set(["/chat/completions", "/v1/chat/completions"]);
 
 const days = new Map();   // day -> { requests, refused, models: { id: count } }
@@ -92,10 +95,15 @@ const server = http.createServer((req, res) => {
     if (row.requests >= BUDGET) { row.refused += 1; return answer(429, { error: "daily request budget of " + BUDGET + " reached for " + day }, "budget"); }
     row.requests += 1;
     row.models[verdict.model] = (row.models[verdict.model] || 0) + 1;
-    body.model = verdict.model;
-    const effort = verdict.effort || (body.reasoning && typeof body.reasoning.effort === "string" ? body.reasoning.effort : (typeof body.reasoning_effort === "string" ? body.reasoning_effort : null));
-    if (effort) { body.reasoning = { effort }; body.reasoning_effort = effort; } else { delete body.reasoning; delete body.reasoning_effort; }
-    const payload = Buffer.from(JSON.stringify(body));
+    let payload;
+    try {   // a body that cannot be re-serialised (for example nested too deep) is a 400, never a crash
+      const effort = verdict.effort || (body.reasoning && typeof body.reasoning.effort === "string" ? body.reasoning.effort : (typeof body.reasoning_effort === "string" ? body.reasoning_effort : null));
+      const out = { model: verdict.model };
+      for (const k of FIELDS) if (Object.prototype.hasOwnProperty.call(body, k)) out[k] = body[k];
+      if (typeof out.max_tokens === "number" && out.max_tokens > MAX_TOKENS) out.max_tokens = MAX_TOKENS;
+      if (effort) { out.reasoning = { effort }; out.reasoning_effort = effort; }
+      payload = Buffer.from(JSON.stringify(out));
+    } catch { row.requests -= 1; row.models[verdict.model] -= 1; return answer(400, { error: "the body cannot be processed" }); }
     const up = http.request({ host: UP_HOST, port: UP_PORT, method: "POST", path: "/chat/completions", timeout: TIMEOUT_MS,
       headers: { "content-type": "application/json", "content-length": payload.length } }, (ur) => {   // no incoming header is forwarded: no Authorization
       res.writeHead(ur.statusCode || 502, { "content-type": ur.headers["content-type"] || "application/json" });
@@ -103,11 +111,14 @@ const server = http.createServer((req, res) => {
       ur.on("end", () => finish(ur.statusCode || 502, verdict.model, payload.length));
       ur.on("error", () => { res.destroy(); finish(502, verdict.model, payload.length); });
     });
+    res.on("close", () => up.destroy());   // a caller that goes away ends the upstream call
     up.on("timeout", () => { up.destroy(); if (!res.headersSent) send(res, 504, { error: "the bridge did not answer in time" }); finish(504, verdict.model, payload.length); });
     up.on("error", () => { if (!res.headersSent) send(res, 502, { error: "the bridge is not reachable" }); finish(502, verdict.model, payload.length); });
     up.end(payload);
   });
 });
 server.requestTimeout = TIMEOUT_MS;
+server.maxConnections = 64;
+process.on("uncaughtException", () => logLine({ ts: new Date().toISOString(), event: "error" }));   // never the error text: it could hold a body
 server.headersTimeout = 30000;
 server.listen(PORT, HOST, () => logLine({ ts: new Date().toISOString(), event: "listening", port: PORT, budget: BUDGET, cap: MAX_BODY }));

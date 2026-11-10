@@ -162,6 +162,28 @@ class Paths(Base):
         self.assertEqual(len(self.fake.seen), 1)
 
 
+class Hardening(Base):
+    def test_only_the_allowed_fields_reach_the_bridge(self):
+        f = self.run_front()
+        b = chat("gpt-4o")
+        b.update({"models": ["claude-opus-5"], "fallback": "opus", "extra_body": {"model": "opus"}, "route": "x", "max_tokens": 10 ** 9})
+        self.assertEqual(f.request("POST", "/chat/completions", raw=json.dumps(b).replace('{"model"', '{"__proto__": {"model": "opus"}, "model"', 1).encode())[0], 200)
+        sent = self.fake.seen[0]["body"]
+        self.assertEqual(sorted(sent), ["max_tokens", "messages", "model", "reasoning", "reasoning_effort", "stream", "tools"])
+        self.assertEqual(sent["max_tokens"], 64000)
+
+    def test_a_body_nested_too_deep_is_refused_and_the_front_lives(self):
+        f = self.run_front()
+        deep = ('{"model": "gpt-4o", "messages": [], "x": ' + "[" * 150000 + "]" * 150000 + "}").encode()
+        self.assertEqual(f.request("POST", "/chat/completions", raw=deep)[0], 200)   # the unknown field is dropped before it is re-serialised
+        deep = ('{"model": "gpt-4o", "messages": ' + "[" * 150000 + "]" * 150000 + "}").encode()
+        self.assertEqual(f.request("POST", "/chat/completions", raw=deep)[0], 400)
+        self.assertIsNone(f.proc.poll())
+        self.assertEqual(f.request("GET", "/usage")[0], 200)
+        used = json.loads(f.request("GET", "/usage")[1])
+        self.assertEqual(used["days"][used["day"]]["requests"], 1)   # the refused one was not counted
+
+
 class Budget(Base):
     def test_s4_daily_budget(self):
         clock = os.path.join(self.tmp, "day")
