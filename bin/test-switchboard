@@ -74273,10 +74273,10 @@ class TestGhShimMergeGate(Base):
 
     FAMILIES = {"PYTHONPATH": "/tmp/evil-py", "PYTHONHOME": "/tmp/evil-home", "PYTHONUSERBASE": "/tmp/evil-user", "PYTHONSTARTUP": "/tmp/evil-start", "LD_PRELOAD": "/tmp/evil.so",
                 "LD_LIBRARY_PATH": "/tmp/evil-lib", "DYLD_INSERT_LIBRARIES": "/tmp/evil.dylib", "DYLD_LIBRARY_PATH": "/tmp/evil-dy", "XDG_STATE_HOME": "/tmp/evil-state",
-                "FLEET_SWITCHBOARD_STATE": "/tmp/evil-fsb", "FLEET_SWITCHBOARD_BIN": "/tmp/evil-bin", "MADE_UP_VARIABLE": "1", "PATH": "/tmp/evil-path", "GH_TOKEN": "x"}
+                "FLEET_SWITCHBOARD_STATE": "/tmp/evil-fsb", "FLEET_SWITCHBOARD_BIN": "/tmp/evil-bin", "MADE_UP_VARIABLE": "1", "FLEET_SHIM_GATE_SECONDS": "0.2", "PATH": "/tmp/evil-path", "GH_TOKEN": "x"}
     DENY_LIST = '    env = {k: v for k, v in os.environ.items() if not k.startswith(("XDG_", "FLEET_SWITCHBOARD_"))}'
     ALLOW_LIST = '    env = {"PATH": ENV_PATH}\n    for name in ENV_ALLOW:\n        if name in os.environ:\n            env[name] = os.environ[name]'
-    TAIL = '    return env'
+    TAIL = '    return env\n'   # the whole line: '    return env_of' (the body guard's read, #2307) also starts with it
 
     def family_problems(self):
         """Which hostile families reach a switchboard through `sb_env`: the names, or the PATH when it is the caller's."""
@@ -80395,6 +80395,7 @@ NOT_ISOLATED_BY_BASE = {
     "TestCloudHeadChecks",   # (#2247) pure: cloud_head_checks over a mock engine and a stubbed _api, no state path; the file came with #2267
     "TestGithubWriteGuard",   # (#2247) pure: reads the repository sources read-only and scans strings in memory, no state path; the file came with #2263
     "TestAskIsItsOwn",   # (#2247) pure: _ask_of on strings and dicts; the file came with #2254
+    "TestGateBudget", "TestReader", "TestConfigLoader", "TestSweepSkip",   # (#2247) pure: TestGateBudget reads the shim source text and a number over an in-memory config (#2296); the other three are the land_repos reader, validate_config on dicts and sweep_refresh over stubs (#2323); no state path
     ),
     "makes its own temporary directory or state (a tempfile.mkdtemp, a patched environment or its own isolating setUp) and never reads the real one": (
     "TestEveryTestClassIsolates", "BodyRig", "TestDirectReads", "TestGateProbeReads", "TestGhBodyGuard", "TestGhBodyMutants", "TestGhBodyRefusalIsPure",
@@ -80404,7 +80405,7 @@ NOT_ISOLATED_BY_BASE = {
     "TestPodReportedLostOnlyWhenSilent",   # (#2247) its Rig makes its own tempfile.mkdtemp for the engine, the launcher log and the memory, and reads no real state; the class came with #2261
     "TestStopFinalMessage", "TestStopFinalMessageBare", "TestStopFinalMessageEdges", "TestStopFinalMessageHardening", "TestStopFinalMessageTwoRuns",
     "TestEndNoticeHeadLine", "TestPodReportedLostOnlyWhenSilent",   # (#2247) each builds its own temp directory through its rig (StopWorld mkdtemp; Rig mkdtemp); the files came with #2267 and #2255
-    "TestGithubWriteAudit", "TestGuardSetRun",   # (#2247) each makes its own temp directory (a mkdtemp; a TemporaryDirectory per test); the files came with #2263 and #2270
+    "TestGithubWriteAudit", "TestGuardSetRun", "TestGatesSkipped", "TestLandCompletion", "TestEndNoticeOwnPushes", "TestRefusedLaunchIsToldToItsLane", "TestGhBodyReadNamesItsStderr", "TestGhBodyReadNamesTheRepositoryOfTheWrite",   # (#2247) each makes its own temp directory (a mkdtemp, a TemporaryDirectory, StopWorld, Rig, FakeGhMixin or BodyRig) and reads no real state; the files came with #2263, #2270, #2313, #2310, #2307, #2309 and #2323
     ),
 }
 
@@ -80479,7 +80480,6 @@ class TestEveryTestClassIsolates(unittest.TestCase):
                 with self.assertRaises(sb.RealStateRefused) as caught:
                     build(Plain())
                 self.assertIn(named, str(caught.exception))
-
 
 if __name__ == "__main__":
     # Run directly, the suite takes a CPU slot (`fleet-switchboard heavy`): several full suites at once starve the machine. FLEET_HEAVY=off, a CI run, a run
