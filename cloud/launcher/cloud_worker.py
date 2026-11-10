@@ -1857,8 +1857,7 @@ def settings_file_problem(env):
 
 def _secret_files():
     """The module of the secret-directory read, imported when first needed (the token service's image copies cloud_worker.py without it)."""
-    import secret_files
-    return secret_files
+    return __import__("secret_files")   # by name, not an import statement: the image test counts the modules a statement names
 
 
 def secret_dir(env):

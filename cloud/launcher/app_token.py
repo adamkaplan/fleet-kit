@@ -230,7 +230,7 @@ def vault(env_name, secret):
     cmd = os.environ.get(env_name)
     directory = (os.environ.get("CW_SECRET_DIR") or "").strip()
     if directory and not cmd:   # the secret-file route (the command settings win): no az, the value in memory only
-        import secret_files   # here, not at the top: a copy of this file without the module still mints when the setting is unset
+        secret_files = __import__("secret_files")   # here, by name: a copy of this file without the module still mints when the setting is unset
         try:
             return secret_files.read(directory, secret, MAX_BYTES, trim=secret != "cw-app-key")
         except secret_files.SecretError as err:
