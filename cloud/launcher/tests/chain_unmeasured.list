@@ -1,5 +1,6 @@
 cloud/launcher/tests/test_app_token_route.py
 cloud/launcher/tests/test_app_token_service.py
+cloud/launcher/tests/test_azure_config_dir.py
 cloud/launcher/tests/test_brief_header.py
 cloud/launcher/tests/test_cloud_default_model.py
 cloud/launcher/tests/test_cloud_inspect.py

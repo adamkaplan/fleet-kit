@@ -9,6 +9,7 @@ Part of the cloud-worker prototype (plan scenarios S10 and S12). Two pieces:
 This image takes everything it needs from the environment and mounted files at start and stores nothing. The launcher
 (`cloud/launcher/`) supplies the per-run files; the entrypoint installs them (next section) and the operator driver
 (`cloud/launcher/run_task.py`) runs one task end to end.
+The launcher's settings file may set `CW_AZURE_CONFIG_DIR` (an absolute path of an existing directory): the launcher then uses it as `AZURE_CONFIG_DIR` for every vault read of a launch, replacing the caller's own value; unset, nothing changes.
 
 Cloud workers serve the organisation's repositories only; no task, test or demo of the tooling that runs the workers runs in a cloud worker.
 
