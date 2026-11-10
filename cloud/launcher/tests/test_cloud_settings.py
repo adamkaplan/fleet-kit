@@ -27,6 +27,7 @@ OPTIONAL_SAMPLES = {"CW_TOOLING_REPO": "acme-org/tooling", "CW_CLOUD_CA_FILE": "
 OPTIONAL_SAMPLES["CW_FINAL_NOTE_MINUTES"] = "10"   # ask #1757: the final note's minutes
 OPTIONAL_SAMPLES["CW_REPO_MIN_SHAPE"] = "acme-org/widget-service=S"
 OPTIONAL_SAMPLES["CW_READONLY_ROOT_LANES"] = "lane-a,lane-b"
+OPTIONAL_SAMPLES["CW_AZURE_CONFIG_DIR"] = "/tmp"   # an existing directory; the setting is refused when it is missing
 SAMPLES = {   # one value per secret shape (built here, never a real secret)
     "a JWT": "eyJhbGciOiJIUzI1" + "." + "eyJzdWIiOiJ4eHh4",
     "a PEM header": "-----BEGIN " + "PRIVATE KEY-----",
@@ -87,6 +88,7 @@ HOSTILE = {   # per key: values that must be refused (each through the REAL pars
     "CW_MAX_PERSISTENT": ["0", "21", "00", "01", "+5", "-5", "-1", "\u0662", "\u0661\u0662", "2\x01", "2\t", "1.5", "abc", "100"],
     "CW_VAULT_BLOCK_DURATION": ["-5m", "0m", "61m", "2h", "1000m", "10", "m", "10s", "1.5h", "10 m", "/tmp/10m", "10m5s", "\u0662\u0660m", "-1h", "0h"],
 }
+HOSTILE["CW_AZURE_CONFIG_DIR"] = ["azure", "/a/../b", "-x", "/no/such/dir-azure-test"]   # relative, a .. segment, an option, a missing directory
 CONTROL = ["\t", "\x00", "\r", "\x0b", "\x0c", "\x1c", "\x1b", "\x7f", "\x01"]
 
 
