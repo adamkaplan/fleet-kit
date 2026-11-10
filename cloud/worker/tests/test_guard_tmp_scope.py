@@ -95,7 +95,6 @@ class Scope(unittest.TestCase):
         self.allowed(["push", "origin", "HEAD:refs/heads/master"])
         self.allowed(["push", self.remote, "main"])
         self.allowed(["push", "file://" + self.remote, "main"])
-        self.allowed(["push", "--repo=origin", "main"])
         self.allowed(["push", "origin", "feature"])
         self.allowed(["-C", self.repo, "push", "origin", "main"], cwd=self.root)
 
@@ -127,6 +126,13 @@ class Scope(unittest.TestCase):
         g = self.gfile("rewrite", '[url "https://github.com/o/nonexist.git"]\n\tpushInsteadOf = %s\n' % self.remote)
         self.refused(["push", "origin", "main"], PUSH, env={"GIT_CONFIG_GLOBAL": g})
         self.refused(["push", self.remote, "main"], PUSH, env={"GIT_CONFIG_GLOBAL": g})
+
+    def test_s3_abbreviated_and_repo_options_do_not_move_the_remote(self):
+        git(self.repo, "remote", "add", "web", "https://github.com/o/r.git")
+        self.addCleanup(git, self.repo, "remote", "remove", "web")
+        for opt in (["--ex", self.remote], ["--receive-p", self.remote], ["--rep", self.remote], ["--repo=" + self.remote], ["--repo", self.remote]):
+            self.refused(["push"] + opt + ["web", "main"], PUSH)
+        self.allowed(["push", "--dry-run", "origin", "main"])
 
     def test_s3_in_scope_force_a_glob_and_all_stay_refused(self):
         self.refused(["push", "--force", "origin", "main"], FORCE)

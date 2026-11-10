@@ -274,6 +274,13 @@ push_remote() {   # the words after `push`: the remote word, as the loop below c
 }
 push_scope_check() {   # the words after `push`: true in scope when the remote is a local path or file:// URL under /tmp
   in_tmp_scope || return 1
+  for a in "$@"; do   # fail closed: git takes a unique prefix of a long option and lets a positional repository beat --repo, so only exact known long flags are read
+    case "$a" in
+      --dry-run|--verbose|--quiet|--set-upstream|--tags|--follow-tags|--no-verify|--progress|--atomic|--porcelain|--prune|--delete|--thin|--no-thin) ;;
+      --push-option|--receive-pack|--exec|--push-option=*|--receive-pack=*|--exec=*) ;;
+      --*) return 1 ;;
+    esac
+  done
   ps_r=$(push_remote "$@")
   if [ -z "$ps_r" ]; then
     ps_c=$(sgit -C "$sc_dir" symbolic-ref --quiet --short HEAD 2>/dev/null || true)
