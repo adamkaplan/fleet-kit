@@ -621,7 +621,7 @@ def stack_model_secret(env=None):
             raise Refusal("the stack model secret %s could not be read: %s; nothing was created" % (name, err.line)) from None
         ran = None
         try:
-            ran = lib.keychain_or_capture(env, name, _capture, ["az", "keyvault", "secret", "show", "--subscription", sub, "--vault-name", vault, "--name", name, "--query", "value", "-o", "tsv"],
+            ran = lib.secret_or_capture(env, name, _capture, ["az", "keyvault", "secret", "show", "--subscription", sub, "--vault-name", vault, "--name", name, "--query", "value", "-o", "tsv"],
                            env={k: v for k, v in env.items() if k not in CLUSTER_DROP}, limit=STACK_MODEL_KEY_LIMIT + 1)
         finally:
             flight.done(ran)
