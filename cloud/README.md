@@ -662,7 +662,7 @@ every interface by default; its HTTP server reads the `HOST` variable, so the en
 (`cloud/copilot-bridge/bridge-front.mjs`, Node standard library only) is the only listener a pod can reach: it forwards `POST /chat/completions` and
 `POST /v1/chat/completions` only, answers `GET /usage`, refuses a body over `BRIDGE_MAX_BODY` (400000 bytes), refuses an id containing `opus` (any case) with
 403 and `model banned from the council: opus`, maps every other model to `claude-sonnet-5.5` at `medium` (`claude-haiku-5.5` passes with the caller's effort),
-answers 429 past `BRIDGE_DAILY_BUDGET` requests a day (default 500), and logs one count line per request: never a body, an answer, a header or a token.
+adds each answer's `copilot_usage.total_nano_aiu` (else the sum of `token_details`, else a configured constant and one `unpriced` log line) to the UTC day's spend per model, answers 429 with `daily AI credit budget spent: <spent> of <budget> credits` once the day's spend has reached `BRIDGE_DAILY_CREDITS` (credits, 1 credit = 1e9 nano-AIU; 10000 in the manifest; the request that crosses completes; `GET /usage` shows credits, requests and refused per day and model), and logs one count line per request: never a body, an answer, a header or a token.
 The bridge forwards the whole body to Copilot unchanged, so the front sets both `reasoning.effort` and `reasoning_effort`.
 
 The owner's steps (nothing here is applied by the repository):

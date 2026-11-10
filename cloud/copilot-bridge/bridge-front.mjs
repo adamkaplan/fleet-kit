@@ -13,7 +13,11 @@ const PORT = int(env.BRIDGE_FRONT_PORT, 8080);
 const HOST = env.BRIDGE_FRONT_HOST || "0.0.0.0";
 const UP_HOST = "127.0.0.1";
 const UP_PORT = int(env.BRIDGE_UPSTREAM_PORT, 4141);
-const BUDGET = int(env.BRIDGE_DAILY_BUDGET, 500);
+const NANO = 1e9;   // 1 credit = 1e9 nano-AIU (the unit the bridge reports in copilot_usage.total_nano_aiu)
+const num = (v, d) => (/^[0-9]{1,9}(\.[0-9]{1,9})?$/.test(v || "") && Number(v) > 0 ? Number(v) : d);
+const BUDGET = num(env.BRIDGE_DAILY_CREDITS, 10000);   // credits a day
+const UNPRICED_NANO = num(env.BRIDGE_UNPRICED_NANO, 10000000);   // counted for an answer that carries no usage block
+const MAX_ANSWER = 8000000;   // an answer larger than this is not parsed and is counted as unpriced
 const MAX_BODY = int(env.BRIDGE_MAX_BODY, 400000);
 const TIMEOUT_MS = 160000;
 const CLOCK_FILE = env.BRIDGE_CLOCK_FILE || "";   // a test hook set only in the pod's own environment: a file holding the day (YYYY-MM-DD)
@@ -25,7 +29,7 @@ const FIELDS = ["messages", "stream", "temperature", "top_p", "max_tokens", "too
 const MAX_TOKENS = 64000;
 const PATHS = new Set(["/chat/completions", "/v1/chat/completions"]);
 
-const days = new Map();   // day -> { requests, refused, models: { id: count } }
+const days = new Map();   // day -> { requests, refused, models: { id: { nano, requests, refused } } }
 const today = () => {
   if (CLOCK_FILE) { try { const d = fs.readFileSync(CLOCK_FILE, "utf8").trim(); if (/^\d{4}-\d{2}-\d{2}$/.test(d)) return d; } catch {} }
   return new Date().toISOString().slice(0, 10);
@@ -33,6 +37,25 @@ const today = () => {
 const dayRow = (d) => {
   if (!days.has(d)) { days.set(d, { requests: 0, refused: 0, models: {} }); for (const k of [...days.keys()].sort().slice(0, -14)) days.delete(k); }
   return days.get(d);
+};
+const modelRow = (row, id) => (row.models[id] = row.models[id] || { nano: 0, requests: 0, refused: 0 });
+const spentNano = (row) => Object.values(row.models).reduce((a, m) => a + m.nano, 0);
+const credits = (nano) => (nano / NANO).toFixed(4);
+// The nano-AIU of one answer: copilot_usage.total_nano_aiu, else the sum of token_count * cost_per_batch / batch_size, else null (unpriced).
+const priceOf = (text) => {
+  let u;
+  try { u = JSON.parse(text).copilot_usage; } catch { return null; }
+  if (!u || typeof u !== "object") return null;
+  if (typeof u.total_nano_aiu === "number" && Number.isFinite(u.total_nano_aiu) && u.total_nano_aiu >= 0) return u.total_nano_aiu;
+  if (Array.isArray(u.token_details) && u.token_details.length) {
+    let sum = 0;
+    for (const t of u.token_details) {
+      if (!t || ![t.token_count, t.cost_per_batch, t.batch_size].every(Number.isFinite) || t.batch_size <= 0) return null;
+      sum += (t.token_count * t.cost_per_batch) / t.batch_size;
+    }
+    return Math.round(sum);
+  }
+  return null;
 };
 const logLine = (entry) => process.stdout.write(JSON.stringify(entry) + "\n");
 
@@ -55,17 +78,21 @@ const server = http.createServer((req, res) => {
   const day = today();
   const path = (req.url || "").split("?")[0];
   let done = false;
-  const finish = (status, served, bytes) => {
+  const finish = (status, served, bytes, nano) => {
     if (done) return;
     done = true;
     const entry = { ts: new Date().toISOString(), day, method: req.method === "GET" || req.method === "POST" ? req.method : "other", path: PATHS.has(path) || path === "/usage" ? path : "other", status, model: served, bytes, ms: Date.now() - started };
+    if (typeof nano === "number") entry.nano = nano;
     logLine(entry);
   };
   const answer = (status, obj, served) => { send(res, status, obj); finish(status, served || "-", 0); };
 
   if (req.method === "GET" && path === "/usage") {
     const out = { budget: BUDGET, day, days: {} };
-    for (const [d, row] of days) out.days[d] = { requests: row.requests, refused: row.refused, models: { ...row.models } };
+    for (const [d, row] of days) {
+      out.days[d] = { credits: credits(spentNano(row)), requests: row.requests, refused: row.refused, models: {} };
+      for (const [m, v] of Object.entries(row.models)) out.days[d].models[m] = { credits: credits(v.nano), requests: v.requests, refused: v.refused };
+    }
     return answer(200, out);
   }
   if (req.method !== "POST" || !PATHS.has(path)) return answer(404, { error: "not found" });
@@ -92,9 +119,11 @@ const server = http.createServer((req, res) => {
     const verdict = policy(body.model);
     const row = dayRow(day);
     if (verdict.refuse) { row.refused += 1; return answer(403, { error: BANNED_TEXT }, "refused"); }
-    if (row.requests >= BUDGET) { row.refused += 1; return answer(429, { error: "daily request budget of " + BUDGET + " reached for " + day }, "budget"); }
+    const mrow = modelRow(row, verdict.model);
+    const spent = spentNano(row);
+    if (spent >= BUDGET * NANO) { row.refused += 1; mrow.refused += 1; return answer(429, { error: "daily AI credit budget spent: " + credits(spent) + " of " + BUDGET + " credits" }, "budget"); }
     row.requests += 1;
-    row.models[verdict.model] = (row.models[verdict.model] || 0) + 1;
+    mrow.requests += 1;
     let payload;
     try {   // a body that cannot be re-serialised (for example nested too deep) is a 400, never a crash
       const effort = verdict.effort || (body.reasoning && typeof body.reasoning.effort === "string" ? body.reasoning.effort : (typeof body.reasoning_effort === "string" ? body.reasoning_effort : null));
@@ -103,12 +132,23 @@ const server = http.createServer((req, res) => {
       if (typeof out.max_tokens === "number" && out.max_tokens > MAX_TOKENS) out.max_tokens = MAX_TOKENS;
       if (effort) { out.reasoning = { effort }; out.reasoning_effort = effort; }
       payload = Buffer.from(JSON.stringify(out));
-    } catch { row.requests -= 1; row.models[verdict.model] -= 1; return answer(400, { error: "the body cannot be processed" }); }
+    } catch { row.requests -= 1; mrow.requests -= 1; return answer(400, { error: "the body cannot be processed" }); }
     const up = http.request({ host: UP_HOST, port: UP_PORT, method: "POST", path: "/chat/completions", timeout: TIMEOUT_MS,
       headers: { "content-type": "application/json", "content-length": payload.length } }, (ur) => {   // no incoming header is forwarded: no Authorization
       res.writeHead(ur.statusCode || 502, { "content-type": ur.headers["content-type"] || "application/json" });
       ur.pipe(res);
-      ur.on("end", () => finish(ur.statusCode || 502, verdict.model, payload.length));
+      const got = [];
+      let gotSize = 0;
+      ur.on("data", (c) => { gotSize += c.length; if (gotSize <= MAX_ANSWER) got.push(c); });   // read only for the usage block: never logged, never stored
+      ur.on("end", () => {
+        let nano = 0;
+        if ((ur.statusCode || 502) < 300) {
+          const p = gotSize <= MAX_ANSWER ? priceOf(Buffer.concat(got).toString("utf8")) : null;
+          if (p === null) { nano = UNPRICED_NANO; logLine({ ts: new Date().toISOString(), event: "unpriced", model: verdict.model }); } else nano = p;
+        }
+        mrow.nano += nano;
+        finish(ur.statusCode || 502, verdict.model, payload.length, nano);
+      });
       ur.on("error", () => { res.destroy(); finish(502, verdict.model, payload.length); });
     });
     res.on("close", () => up.destroy());   // a caller that goes away ends the upstream call
