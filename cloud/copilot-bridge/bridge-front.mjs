@@ -21,7 +21,7 @@ const SONNET = "claude-sonnet-5.5";
 const HAIKU = "claude-haiku-5.5";
 const BANNED_TEXT = "model banned from the council: opus";
 // Only these fields of a request go on to the bridge (the bridge passes the body to Copilot unchanged): nothing else can name a model or a route.
-const FIELDS = ["messages", "stream", "temperature", "top_p", "max_tokens", "tools", "tool_choice", "stop", "n", "seed", "response_format", "presence_penalty", "frequency_penalty"];
+const FIELDS = ["messages", "stream", "temperature", "top_p", "max_tokens", "tools", "tool_choice", "stop", "seed", "response_format", "presence_penalty", "frequency_penalty"];
 const MAX_TOKENS = 64000;
 const PATHS = new Set(["/chat/completions", "/v1/chat/completions"]);
 
@@ -117,7 +117,7 @@ const server = http.createServer((req, res) => {
     up.end(payload);
   });
 });
-server.requestTimeout = TIMEOUT_MS;
+server.requestTimeout = 30000;   // the time to RECEIVE a request; the upstream wait has its own 160 s timeout
 server.maxConnections = 64;
 process.on("uncaughtException", () => logLine({ ts: new Date().toISOString(), event: "error" }));   // never the error text: it could hold a body
 server.headersTimeout = 30000;
