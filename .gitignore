@@ -1,0 +1,8 @@
+.DS_Store
+*.swp
+*.bak
+config
+__pycache__/
+*.pyc
+scenario-runs/
+.review/

@@ -1,0 +1,4 @@
+{
+ "command": "ci-queue",
+ "help": "usage: fleet-switchboard ci-queue [-h] [--repo OWNER/REPO] [--hours HOURS] [--until ISO] [--paths-file FILE] [--json] Counts the workflow runs of a window: per run the queue wait and run time, the jobs by workflow and name, the job-minutes by workflow, the peak of jobs queued at once, the observed ceiling of jobs running at once, and the cut, dedupe and move candidates in job-minutes per day. GET requests only. options: -h, --help show this help message and exit --repo OWNER/REPO The repository (default: the configured intent repository) --hours HOURS The window in hours (1 to 168; default 24) --until ISO The end of the window, an ISO time with a zone (default: now) --paths-file FILE The platform-path list read for the move candidates (default: the one of the current directory; unreadable: none) --json Print the report as JSON"
+}

@@ -1,0 +1,112 @@
+{
+  "id": "T5",
+  "title": "Each caller sees its own view: an orchestrator its repo only, the Chief of Staff every repo, you the human tier",
+  "problem": null,
+  "since_pr": 18,
+  "tiers": [
+    "offline"
+  ],
+  "tags": [],
+  "cast": {
+    "cos": {
+      "role": "chief-of-staff"
+    },
+    "api-orch": {
+      "role": "orchestrator",
+      "reports_to": "cos",
+      "repo": "acme/api",
+      "charter": 1
+    },
+    "web-orch": {
+      "role": "orchestrator",
+      "reports_to": "cos",
+      "repo": "acme/web",
+      "charter": 1
+    },
+    "api-coder": {
+      "role": "coder",
+      "reports_to": "api-orch",
+      "repo": "acme/api",
+      "issue": 2
+    }
+  },
+  "steps": [
+    {
+      "at": "10s",
+      "actor": "api-orch",
+      "do": "report",
+      "state": "question",
+      "text": "Which api database?"
+    },
+    {
+      "at": "12s",
+      "actor": "web-orch",
+      "do": "report",
+      "state": "question",
+      "text": "Which web framework?"
+    },
+    {
+      "at": "14s",
+      "actor": "api-coder",
+      "do": "report",
+      "state": "question",
+      "text": "Which api table?"
+    },
+    {
+      "at": "45s",
+      "actor": "world",
+      "do": "wait"
+    }
+  ],
+  "expect": [
+    {
+      "name": "cos-sees-all",
+      "that": "decisions",
+      "at": "45s",
+      "as": "cos",
+      "count": 3
+    },
+    {
+      "name": "api-orch-sees-only-its-repo",
+      "that": "decisions",
+      "at": "45s",
+      "as": "api-orch",
+      "count": 2
+    },
+    {
+      "name": "web-orch-sees-only-its-repo",
+      "that": "decisions",
+      "at": "45s",
+      "as": "web-orch",
+      "count": 1
+    },
+    {
+      "name": "you-see-none",
+      "that": "decisions",
+      "at": "45s",
+      "as": "you",
+      "count": 0
+    },
+    {
+      "name": "never-the-orchestrator-tier",
+      "that": "decisions",
+      "at": "45s",
+      "as": "you",
+      "tier": "orchestrator",
+      "count": 1,
+      "why": "Asked for by flag, it is there: the human's default view just never shows it"
+    }
+  ],
+  "control": {
+    "variant": {
+      "expect": {
+        "api-orch-sees-only-its-repo": {
+          "as": "cos"
+        }
+      }
+    },
+    "fails": [
+      "api-orch-sees-only-its-repo"
+    ]
+  }
+}

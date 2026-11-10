@@ -1,0 +1,28 @@
+{
+  "id": "W3",
+  "title": "A worker stops on a permission prompt",
+  "problem": 4,
+  "since_pr": 4,
+  "tiers": ["offline", "lab-scripted"],
+  "cast": {
+    "platform": {"role": "orchestrator", "charter": 1},
+    "coder": {"role": "coder", "reports_to": "platform", "issue": 2}
+  },
+  "issues": {
+    "2": {"intent": "Add a health check", "done_when": "GET /health returns 200"}
+  },
+  "steps": [
+    {"at": "0s", "actor": "coder", "do": "permission",
+     "why": "The worker asks to run a shell command and waits for you"},
+    {"at": "3m", "actor": "you", "do": "permission", "to": "coder", "decision": "once",
+     "why": "Your answer, so the worker's turn ends and the Lab is left clean"},
+    {"at": "210s", "actor": "world", "do": "wait"}
+  ],
+  "expect": [
+    {"name": "blocked-told", "that": "delivered", "to": "platform", "key": "worker.blocked:*", "mode": "wake",
+     "count": 1, "text": "permission"},
+    {"name": "toast", "that": "toast", "agent": "coder", "text": "waiting for you",
+     "why": "The human is told too, once"}
+  ],
+  "control": {"fault": "no-worker-source", "fails": ["blocked-told", "toast"]}
+}
