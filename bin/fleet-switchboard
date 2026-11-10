@@ -569,7 +569,7 @@ def _is_number(value):
 
 _WARNED_CONFIG = set()
 UNKNOWN_CONFIG = {}   # (section, key) -> the nearest known key or None: what `status` shows, kept for the life of the process
-TOP_LEVEL_EXTRA_KEYS = {"worktree_reclaim", "orphan_reaper", "order_notice_burst_minutes", "external_decisions", "friction_wake", "blocked_alert", "sweep", "triage", "plan_evaluators", "red_ci_required", "default_branches", "plan_gates", "plan_review", "impact_hold", "load_alert", "source_budgets", "hold_labels", "captain_labels", "merge_base", "header_cache", "app_installations", "app_key_path", "app_key_command", "app_permissions", "app_api_base", "relay_holders", "land_repos"}
+TOP_LEVEL_EXTRA_KEYS = {"worktree_reclaim", "orphan_reaper", "order_notice_burst_minutes", "external_decisions", "friction_wake", "blocked_alert", "sweep", "triage", "plan_evaluators", "red_ci_required", "default_branches", "plan_gates", "plan_review", "impact_hold", "load_alert", "source_budgets", "hold_labels", "captain_labels", "merge_base", "header_cache", "app_installations", "app_key_path", "app_key_command", "app_permissions", "app_api_base", "relay_holders", "land_repos", "worktree_root"}
 
 
 CONFIG_DECLARATION_TEXT = re.compile(rb'^[ \t]*CONFIG_KEY[ \t]*(?::[^=\n]*)?=[ \t]*[\'"]([^\'"\n]*)[\'"]', re.M)   # only the fallback for a file that does not parse
@@ -829,6 +829,7 @@ def validate_config(raw, source="config"):
     validate_captain_labels(config, source)
     validate_merge_base(config, source)
     validate_land_repos(config, source)   # #2320
+    validate_worktree_root(config, source)   # #2363
     validate_app_config(config, source)  # #609
     return config
 
@@ -12662,6 +12663,10 @@ def _cmd_launch(args, runner, now, socket_call=None):
     if refusal:
         sys.stderr.write("%s: %s\n" % (PROG, refusal))
         return EXIT_MEMORY
+    if worktree_of_directory(subprocess.run, args.dir) is not None:   # #2363: a NEW local worker's linked worktree is never a new top-level entry of ~/Code (a main checkout is the owner's own)
+        refusal = check_worktree_path(engine.config, args.dir)
+        if refusal:
+            raise LaunchError(refusal)
     if getattr(args, "headless", False) and (args.workspace or args.new_workspace):
         raise LaunchError("--headless opens no terminal, so it takes no --workspace or --new-workspace (`%s watch NAME` opens one later)" % PROG)
     if (args.name or "").startswith(LANE_NAME_PREFIX):
