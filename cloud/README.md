@@ -42,7 +42,7 @@ To bump Node: update `NODE_VERSION` (a full 22.x.y release; the only place the v
 
 **Cause.** The recorded case: measurement pods of a product repository spend about 20 of 60 minutes compiling PostgreSQL 16 and two extensions (vector, message queue) from source on every run. The image now carries them, built once.
 
-**What is built.** A separate build stage (`pgbuild`, with the compilers) builds PostgreSQL, the vector extension and the message-queue extension into `/opt/pg`; the `final` stage copies only that directory, root-owned. No compiler is in the final image. PostgreSQL has a version constant and a 64-hex sha256 constant at the top of the block in `cloud/worker/Dockerfile` (`PG_VERSION` / `PG_SHA256`: the project's release tarball, 16.x), checked with `sha256sum -c` BEFORE it is unpacked. Each extension is pinned to an immutable 40-hex git COMMIT, not a tag (a tag can be moved): `PGVECTOR_VERSION` / `PGVECTOR_COMMIT` and `PGMQ_VERSION` / `PGMQ_COMMIT`; the version is only the directory and label. The build clones the publisher's repository, checks out the commit and fails unless `git rev-parse HEAD` equals it, BEFORE any build step (`git` is in the `buildpack-deps` base). To bump PostgreSQL: edit `PG_VERSION` AND `PG_SHA256`. To bump an extension: edit its version AND its commit; find the commit with `git ls-remote https://github.com/pgvector/pgvector refs/tags/v<version>` (for an annotated tag, the commit is the `^{}` line), and confirm it twice (a second `ls-remote`, and the tag's page on GitHub). Then run `python3 cloud/worker/tests/test_dockerfile_postgres.py` and rebuild. The build-time secret scan also reads `/opt/pg`: the `scan` stage copies the built PostgreSQL tree in before it scans.
+**What is built.** A separate build stage (`pgbuild`, with the compilers) builds PostgreSQL, the vector extension and the message-queue extension into `/opt/pg`; the `final` stage copies only that directory, root-owned. No compiler is in the final image. PostgreSQL has a version constant and a 64-hex sha256 constant at the top of the block in `cloud/worker/Dockerfile` (`PG_VERSION` / `PG_SHA256`: the project's release tarball, 16.x), checked with `sha256sum -c` BEFORE it is unpacked. Each extension is pinned to an immutable 40-hex git COMMIT, not a tag (a tag can be moved): `PGVECTOR_VERSION` / `PGVECTOR_COMMIT` and `PGMQ_VERSION` / `PGMQ_COMMIT`; the version is only the directory and label. The build clones the publisher's repository, checks out the commit and fails unless `git rev-parse HEAD` equals it, BEFORE any build step (`git` is in the `buildpack-deps` base). To bump PostgreSQL: edit `PG_VERSION` AND `PG_SHA256`. To bump an extension: edit its version AND its commit; find the commit with `git ls-remote https://github.com/pgvector/pgvector refs/tags/v<version>` (for an annotated tag, the commit is the `^{}` line), and confirm it twice (a second `ls-remote`, and the tag's page on GitHub). Then run `python3 cloud/worker/tests/test_dockerfile_postgres.py` and rebuild. The build-time secret scan also reads `/opt/pg`: the `scan` stage copies the built PostgreSQL tree in before it scans. The `final` stage also builds `/opt/pg-bundle` from `/opt/pg` with copies (`usr/lib/postgresql/16/{bin,lib,share}`, the vector and pgmq files under `usr/share/postgresql/16/extension`, `usr/share/postgresql/postgresql.conf.sample`; root-owned) and sets `PG_BUNDLE=/opt/pg-bundle`, the layout `scripts/dev/ephemeral-pg.sh` reads; nothing starts a server at boot. The relocatable build resolves `share` beside `bin`, which is why `share` is copied under `usr/lib/postgresql/16` too.
 
 Versions: PostgreSQL 16.15, vector 0.8.7, message queue (pgmq) 1.13.1. The server is built without readline, ICU, zlib and OpenSSL, so it needs no run-time library beyond the base. Size cost: measured by the operator at the first real build (before and after, and the pod start time). Not measured here for the image; the installed tree `/opt/pg` was 35 MB in a local arm64 build of the build stage (a developer measurement, not the operator's amd64 build).
 
@@ -383,6 +383,42 @@ value), a `total:` line and, only when every layer was read and nothing hit, `al
 history)`. Exit 0 / 1 hits / 2 a layer, a member or the archive could not be read (`not scanned`, never a pass; a layer that
 is zstd where python has no zstd is exit 2). `scan-secrets.sh <image>` is `docker save` + `--archive`.
 
+### What is and is not scanned (unmodified distro files are skipped)
+
+The scan reads every file WE put in the image, and skips only the files the distro's package manager put there and that are
+still exactly as the package shipped them. A file is NOT scanned only when BOTH hold: (a) it is named in an installed
+package's file list (`/var/lib/dpkg/info/<package>.list`), and (b) its md5 equals the entry for it in the SAME package's
+`/var/lib/dpkg/info/<package>.md5sums`. Why: distro binaries contain chance matches (an `ASIA` plus sixteen capitals in a
+table of instruction names in `libLLVM`, in `libgnutls`, `libunistring`), and one allowlist line per binary and per
+distro update is the wrong fix. Scanned as before: our `COPY`'d files and scripts, configuration, the downloaded Node and
+opencode binaries, `/opt/pg` (built by us), a file dpkg owns whose md5 DIFFERS (a modified distro file still fails),
+a file no package owns, the dpkg database files themselves, a credential file by NAME (`.netrc`, `.ssh/id_*`, ...: the name
+check is never skipped), and the image configuration (env, labels) and history. The allowlist and its format are unchanged
+and still apply to everything that is scanned.
+
+Rules of the skip set: a path with a `..` is never in it; a directory symlink in a listed path is followed inside the root
+(so `/lib/x/f` finds `/usr/lib/x/f` on a usr-merged image), but a `..` that would climb out of the root, a loop, or a
+symlink as the file itself is not resolvable and not skipped; a package with a list but no md5sums skips nothing; a name in
+md5sums but not in the same package's list skips nothing. FAIL CLOSED: if the dpkg database is missing, unreadable, has no
+package list, or any list or md5sums file is malformed, the skip set is EMPTY, every file is scanned and the scan says so on
+stderr (`dpkg database not usable (...): skip set EMPTY, every file is scanned`). Output: `dpkg: N unmodified files of installed
+distro packages not scanned`.
+
+`--dir` reads the database inside the root it scans. `--archive` (and so `publish-image.sh`) keeps the per-layer scan as it
+is (every layer once, a deleted file still seen, an unreadable layer exit 2, the digest scanned and the tag re-resolved by
+`publish-image.sh` unchanged) and, in the same pass, records each regular file's md5 and the dpkg files, symlinks,
+directories and whiteouts of each layer. After the last layer it builds the MERGED view of the database (layers in order; a
+`.wh.<name>` whiteout or an opaque directory deletes what is below; a later layer's file replaces the earlier one) and only
+then decides, per file, whether it is an unmodified distro file; a file whose md5 differs from the final md5sums is a hit in
+the layer that holds it, also when a later layer replaces it. Hits and layer lines are printed after the last layer.
+
+Why this is safe: the scan guards against a credential written by accident. Whoever can alter the Dockerfile or the package
+database controls the build and the image anyway (they could drop the scan stage); the rule gives them nothing they did not
+have. A file that is not exactly what its package shipped is scanned. The md5 comparison is not a defence against a
+deliberate collision, which would need a second preimage of a distro file. Accepted gap: the rule trusts ANY package dpkg has installed, not only distro ones: a `.deb` we build ourselves and install with `dpkg -i` gets its own list and md5sums and is then not scanned, so do not package files that may hold credentials. Also: a credential that a distro package
+itself ships unmodified (including Docker's third-party apt packages) is not found; those packages come from signed
+repositories, and the pinned download checks (sha256) cover what we fetch directly.
+
 The in-build stage (`--dir /` over the merged filesystem) stays as a cheap early gate: it stops a bad build before anything
 is exported. It cannot see a file deleted in a later layer, so it is not the gate.
 
@@ -594,3 +630,23 @@ minutes) belongs to the launcher.
   (`CLOUD_TEST_SKIP_DOCKER=1` skips them explicitly).
 
 **The reaper pass line and the renewal tick line (#1742).** The reaper writes one `reaper pass line` for each pass and one `renewal tick line` for each tick of its renewal thread, on its own log (standard error), not in the audit. Each line holds its numbers: `cpu_seconds`, the CPU seconds of the thread that ran the pass or the tick, and `audit_lines_parsed`, the audit lines read and parsed in it for the renewal's failure lookup; the pass line holds those two numbers and the seconds and counts of the seven steps of the pass (`list`, `renew`, `vanished`, `activity`, `stops`, `orphans` and `notes`, with the number of pods for `activity` and `stops`, and the `total`), and nothing else. They are counts only: no pod name, no worker name, no address, no value. To see whether the reaper spends CPU between passes, read the renewal tick lines: a tick with a high `cpu_seconds` or a high `audit_lines_parsed` is where the CPU went; a tail is read once per tick, so `audit_lines_parsed` is at most the lines of the audit tail (about 262,144 bytes). The step with the most seconds in the pass line is where a slow pass spent its time.
+
+## The token service (ask #2002)
+
+A small service in the cluster (`cloud/launcher/token_service.py`, manifest `cloud/k8s/token-mint.yaml`) holds the GitHub App's id and key
+and mints the pod's git token, so the machine that launches pods no longer reads the key. The operator account calls it through the cluster
+API's service proxy; the service reviews the caller's token and serves the operator account only. It accepts one repository on the
+launcher's allowed list and one role, and answers with GitHub's own token, repositories, permissions and expiry.
+
+- The setting `CW_TOKEN_SERVICE_URL` (`https://<server>/api/v1/namespaces/cw/services/token-mint:8080/proxy/mint`) makes `app_token.py` ask
+  the service; the answer gets the signing route's checks on token characters, repository, expiry and permissions (not the installation owner id, which only the signer can compare). With it unset the signing route runs as before: that is the rollback.
+  `CW_TOKEN_SERVICE_CALLER_TOKEN_CMD` may name a command that prints the cluster token; unset, the launcher's own cluster login is used.
+  Preflight note: the repository preflight's child gets `CW_CLOUD_SERVER`, `CW_CLOUD_NAMESPACE` and `CW_CLOUD_CA_FILE` (no secrets) with the two service settings,
+  but not the launcher's cluster-login settings: it reaches the service only if `CW_TOKEN_SERVICE_CALLER_TOKEN_CMD` prints a cluster token that the launcher holds.
+  The client sends the cluster token in `Authorization` and in `X-Caller-Token` (the API server removes `Authorization` of a proxied request;
+  the service reads and reviews only `X-Caller-Token`), verifies TLS against `CW_CLOUD_CA_FILE` when it is set, and refuses a service URL that is
+  not exactly the one above (the host of `CW_CLOUD_SERVER`, the namespace `CW_CLOUD_NAMESPACE`) before it sends the token.
+- A passing failure of the service (502, a timeout, no connection) exits 75 and the launcher tries again; a refusal exits 1.
+- The owner applies the manifests (`token-mint-review.yaml` holds the one cluster-wide permission), creates the Secret `token-mint-app`
+  (keys `app-id`, `app-key`) and publishes the image.
+- Tests: `cloud/launcher/tests/test_token_service.py` and `cloud/launcher/tests/test_app_token_service.py` (fakes only).

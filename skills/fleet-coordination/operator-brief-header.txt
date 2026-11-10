@@ -9,3 +9,4 @@ secret-shred | Shred every secret file when you are done, and remove the private
 mint-null | Send the diagnostics of the token mint (standard error) to /dev/null, so no secret reaches the log.
 delete-exact | Delete a pod or a record only by its exact name: never by a pattern, a label or a prefix.
 stop-surprise | At the first surprise, stop and report: say what you saw, and change nothing more.
+done-land | When your setup text says "This repository lands with `spire land`", the done step is: commit, run `.spire/tool/bin/spire land`, report `landed <sha>` or the exit code and what stopped it; exit 22 = held for a person: stop and say so. Without that line the done step is the pull request, as before.

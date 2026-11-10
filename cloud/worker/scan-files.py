@@ -10,11 +10,17 @@ Prints "HIT\tpath: name" per file and pattern, never the matched value; a hit th
 file AND pattern, all three) is printed as "ALLOW\tpath: name" instead and is not a hit. The reported path is
 "/" + the path under --prefix. With SCAN_TRIPLES=1 each hit also prints "TRIPLE\t<path> <sha256> <pattern>" (no value). Exit 0 = no hit, 1 = hits, 2 = something could not
 be read (never a pass).
+With --dpkg <root> the files that are unmodified files of installed distro packages (in a /var/lib/dpkg/info .list AND with
+their md5 in the same package's .md5sums) are not reported; "SKIPPED\t<n>" is printed last. An unusable dpkg database
+means an empty skip set and a stderr line (fail closed).
 """
 import hashlib
 import os
 import re
 import sys
+
+DPKG_INFO = "/var/lib/dpkg/info"
+DPKG_MAX = 64 * 1024 * 1024  # a package list or md5sums file larger than this is malformed (fail closed)
 
 CHUNK = 4 * 1024 * 1024
 OVERLAP = 64 * 1024
@@ -81,6 +87,140 @@ def classify(path, found, sha, allow, pats, emit):
     return hits, allowed
 
 
+class DpkgError(Exception):
+    """The dpkg database cannot be read or is malformed: the skip set is then EMPTY (fail closed)."""
+
+
+class Multi:
+    """update() feeds several hashers (sha256 for the allowlist, md5 for the dpkg comparison)."""
+
+    def __init__(self, *hs):
+        self.hs = hs
+
+    def update(self, data):
+        for h in self.hs:
+            h.update(data)
+
+
+def md5():
+    return hashlib.md5(usedforsecurity=False)
+
+
+def _parts(path):
+    return [c for c in path.split("/") if c not in ("", ".")]
+
+
+def resolve(path, readlink):
+    """The real path of an absolute path inside a root, following symlinks of the directories (readlink(p) -> target or
+    None). A '..' that would climb above the root, and a loop give None (not resolvable: never skipped). The caller checks the last component itself. Absolute targets are read from the root, as in a chroot."""
+    todo = list(reversed(_parts(path)))
+    cur = []
+    hops = 0
+    while todo:
+        c = todo.pop()
+        if c == "..":
+            if not cur:
+                return None
+            cur.pop()
+            continue
+        cur.append(c)
+        t = readlink("/" + "/".join(cur))
+        if t is None:
+            continue
+        hops += 1
+        if hops > 40:
+            return None
+        cur.pop()
+        if t.startswith("/"):
+            cur = []
+        todo.extend(reversed(_parts(t)))
+    return "/" + "/".join(cur)
+
+
+MD5LINE = re.compile(r"([0-9a-f]{32})  (.+)")
+
+
+def build_skipmap(lists, sums, readlink):
+    """The unmodified files of installed distro packages: {real path: {md5 hex}}. lists / sums: {package: bytes} of
+    /var/lib/dpkg/info/<package>.list and .md5sums (None = unreadable). A file counts only when it is in a package's
+    .list AND in the same package's .md5sums; the caller still compares the md5 of the file itself. A path with a '..',
+    an entry that does not resolve inside the root, or a symlink as the file is dropped. A malformed list or md5sums
+    (or an unreadable one, or no list at all) raises DpkgError: everything is scanned then."""
+    if not lists:
+        raise DpkgError("no package list in the dpkg database")
+    out = {}
+    for pkg, lraw in lists.items():
+        sraw = sums.get(pkg)
+        if lraw is None:
+            raise DpkgError(f"cannot read the list of {pkg}")
+        listed = set()
+        for line in lraw.decode("utf-8", "surrogateescape").split("\n"):
+            if not line:
+                continue
+            if not line.startswith("/") or "\x00" in line:
+                raise DpkgError(f"malformed list of {pkg}")
+            listed.add(line)
+        if sraw is None:
+            if pkg in sums:
+                raise DpkgError(f"cannot read the md5sums of {pkg}")
+            continue
+        for line in sraw.decode("utf-8", "surrogateescape").split("\n"):
+            if not line:
+                continue
+            m = MD5LINE.fullmatch(line)
+            if not m or "\x00" in line:
+                raise DpkgError(f"malformed md5sums of {pkg}")
+            path = "/" + m.group(2)
+            if path not in listed or ".." in path.split("/") or m.group(2).startswith("\\"):
+                continue
+            parent, _, base = path.rpartition("/")
+            rp = resolve(parent or "/", readlink)
+            if rp is None:
+                continue
+            real = rp.rstrip("/") + "/" + base
+            if readlink(real) is not None:
+                continue
+            out.setdefault(real, set()).add(m.group(1))
+    # a name that is only in md5sums without a list is never a skip (loop above is driven by the lists)
+    return out
+
+
+def dpkg_from_dir(root):
+    """Read the dpkg database of the tree at root (as a chroot: symlinks are read inside it). Returns the skip map or
+    raises DpkgError."""
+    root = root.rstrip("/")
+
+    def readlink(p):
+        q = root + p
+        try:
+            return os.readlink(q) if os.path.islink(q) else None
+        except OSError:
+            return None
+
+    info = resolve(DPKG_INFO, readlink)
+    if info is None:
+        raise DpkgError("the dpkg database path does not resolve inside the root")
+    d = root + info
+    try:
+        names = sorted(os.listdir(d))
+    except OSError as e:
+        raise DpkgError(f"cannot read {DPKG_INFO} ({type(e).__name__})")
+    lists, sums = {}, {}
+    for n in names:
+        for ext, dst in ((".list", lists), (".md5sums", sums)):
+            if n.endswith(ext) and len(n) > len(ext):
+                f = os.path.join(d, n)
+                try:
+                    if os.path.islink(f) or not os.path.isfile(f) or os.path.getsize(f) > DPKG_MAX:
+                        dst[n[:-len(ext)]] = None
+                        continue
+                    with open(f, "rb") as fh:
+                        dst[n[:-len(ext)]] = fh.read()
+                except OSError:
+                    dst[n[:-len(ext)]] = None
+    return build_skipmap(lists, sums, readlink)
+
+
 def scan_fileobj(fh, pats, found, hasher=None):
     """Search a binary stream chunk by chunk (as it is and NUL-stripped); add the names of the patterns that hit."""
     tail = b""
@@ -110,8 +250,11 @@ def main(argv):
     argv = list(argv)
     allow = set()
     prefix = ""
-    while len(argv) > 2 and argv[1] in ("--allow", "--prefix"):
-        if argv[1] == "--allow":
+    dpkg_root = None
+    while len(argv) > 2 and argv[1] in ("--allow", "--prefix", "--dpkg"):
+        if argv[1] == "--dpkg":
+            dpkg_root = argv[2]
+        elif argv[1] == "--allow":
             try:
                 allow = load_allow(argv[2])
             except AllowlistError as e:
@@ -125,21 +268,34 @@ def main(argv):
         return 2
     pats = load(argv[1])
     hits = 0
+    skipped = 0
     bad = []
+    skipmap = {}
+    if dpkg_root is not None:
+        try:
+            skipmap = dpkg_from_dir(dpkg_root)
+            print(f"scan-secrets: dpkg database read: {len(skipmap)} package files can be skipped when unmodified", file=sys.stderr)
+        except DpkgError as e:
+            skipmap = {}
+            print(f"scan-secrets: dpkg database not usable ({e}): skip set EMPTY, every file is scanned", file=sys.stderr)
 
     def emit(kind, p, name):
         print(f"{kind}\t{p}: {name}")
 
     def one(p):
-        nonlocal hits
+        nonlocal hits, skipped
         found = set()
         h = hashlib.sha256()
+        shown = "/" + p[len(prefix):] if prefix and p.startswith(prefix) else p
+        m5 = md5() if shown in skipmap else None
         try:
-            scan_file(p, pats, found, h)
+            scan_file(p, pats, found, h if m5 is None else Multi(h, m5))
         except OSError:
             bad.append(p)
             return
-        shown = "/" + p[len(prefix):] if prefix and p.startswith(prefix) else p
+        if m5 is not None and m5.hexdigest() in skipmap[shown]:
+            skipped += 1  # an unmodified file of an installed distro package
+            return
         hits += classify(shown, found, h.hexdigest(), allow, pats, emit)[0]
 
     def onerr(e):
@@ -160,6 +316,8 @@ def main(argv):
     if bad:
         print("scan-secrets: could not read some files: not scanned", file=sys.stderr)
         return 2
+    if dpkg_root is not None:
+        print(f"SKIPPED\t{skipped}")
     return 1 if hits else 0
 
 

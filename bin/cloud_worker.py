@@ -883,7 +883,7 @@ def _launch(args, runner, now, reserve):
                         raise CloudError("the hub entry could not be given the session: %s" % _reason(hcode, hnote))
                 if brief:
                     brief = _without_pod_header(brief)   # #2205: the two header lines are sent once, at the top of the preamble
-                    v2.prompt(session, SETUP_PREAMBLE % {"repo": repo, "branch": branch} + brief, {"fleet": {"from": "switchboard", "brief": True}})
+                    v2.prompt(session, H["setup_with_land"](SETUP_PREAMBLE, engine.config, repo) % {"repo": repo, "branch": branch} + brief, {"fleet": {"from": "switchboard", "brief": True}})
         except (H["V2Error"], H["V2Unreachable"], CloudError, OSError, KeyError, TypeError) as err:
             stopped = _stop_after_failure(engine, runner, name, run_id, "launch failed: %s" % _one(cluster.clean(str(err), 80), 80), cluster)
             if stopped:
