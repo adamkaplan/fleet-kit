@@ -26,6 +26,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends make \
  && rm -rf /var/lib/apt/lists/*
 # ---- end #1165 ----
 
+# ask #2353: an init as the pod's first process (reaps orphans, forwards signals): the distribution's tini, no download.
+RUN apt-get update && apt-get install -y --no-install-recommends tini \
+ && rm -rf /var/lib/apt/lists/*
+
 # #2047: system libraries (and fonts for screenshots) of Playwright's headless Chromium shell, which exits 127 without them.
 RUN apt-get update && apt-get install -y --no-install-recommends libasound2t64 libatk-bridge2.0-0t64 libatk1.0-0t64 libatspi2.0-0t64 libcairo2 libcups2t64 libdbus-1-3 libdrm2 libfontconfig1 libfreetype6 libgbm1 libglib2.0-0t64 libnspr4 libnss3 libpango-1.0-0 libx11-6 libxcb1 libxcomposite1 libxdamage1 libxext6 libxfixes3 libxkbcommon0 libxrandr2 fonts-liberation fonts-noto-color-emoji fonts-unifont fonts-freefont-ttf \
  && rm -rf /var/lib/apt/lists/*
@@ -105,7 +109,7 @@ RUN chown -R root:root /opt/cloud && chmod 0755 /opt/cloud /opt/cloud/launcher &
 USER worker
 WORKDIR /home/worker
 EXPOSE 4096
-ENTRYPOINT ["/usr/local/bin/worker-entrypoint"]
+ENTRYPOINT ["/usr/bin/tini", "-g", "--", "/usr/local/bin/worker-entrypoint"]
 # The launcher sets OPENCODE_SERVER_PASSWORD at run time; it is never in the image.
 CMD ["opencode", "serve", "--hostname", "0.0.0.0", "--port", "4096"]
 
