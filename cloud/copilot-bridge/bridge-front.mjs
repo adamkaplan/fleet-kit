@@ -17,6 +17,7 @@ const NANO = 1e9;   // 1 credit = 1e9 nano-AIU (the unit the bridge reports in c
 const num = (v, d) => (/^[0-9]{1,9}(\.[0-9]{1,9})?$/.test(v || "") && Number(v) > 0 ? Number(v) : d);
 const BUDGET = num(env.BRIDGE_DAILY_CREDITS, 10000);   // credits a day
 const UNPRICED_NANO = num(env.BRIDGE_UNPRICED_NANO, 10000000);   // counted for an answer that carries no usage block
+const MAX_NANO = 1e15;   // one answer above 1e6 credits is not believed: it is counted as unpriced
 const MAX_ANSWER = 8000000;   // an answer larger than this is not parsed and is counted as unpriced
 const MAX_BODY = int(env.BRIDGE_MAX_BODY, 400000);
 const TIMEOUT_MS = 160000;
@@ -46,14 +47,14 @@ const priceOf = (text) => {
   let u;
   try { u = JSON.parse(text).copilot_usage; } catch { return null; }
   if (!u || typeof u !== "object") return null;
-  if (typeof u.total_nano_aiu === "number" && Number.isFinite(u.total_nano_aiu) && u.total_nano_aiu >= 0) return u.total_nano_aiu;
+  if (typeof u.total_nano_aiu === "number" && Number.isFinite(u.total_nano_aiu) && u.total_nano_aiu >= 0 && u.total_nano_aiu <= MAX_NANO) return u.total_nano_aiu;
   if (Array.isArray(u.token_details) && u.token_details.length) {
     let sum = 0;
     for (const t of u.token_details) {
-      if (!t || ![t.token_count, t.cost_per_batch, t.batch_size].every(Number.isFinite) || t.batch_size <= 0) return null;
+      if (!t || ![t.token_count, t.cost_per_batch, t.batch_size].every(Number.isFinite) || t.batch_size <= 0 || t.token_count < 0 || t.cost_per_batch < 0) return null;
       sum += (t.token_count * t.cost_per_batch) / t.batch_size;
     }
-    return Math.round(sum);
+    return Number.isFinite(sum) && sum <= MAX_NANO ? Math.round(sum) : null;
   }
   return null;
 };

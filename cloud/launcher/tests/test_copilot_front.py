@@ -263,6 +263,15 @@ class Budget(Base):
         self.assertEqual(len([l for l in log.splitlines() if "unpriced" in l]), 2)   # one line per unpriced answer
         self.assertEqual(len([l for l in log.splitlines() if '"nano"' in l]), 3)
 
+    def test_hostile_numbers_are_unpriced(self):
+        bad = {"token_details": [{"token_count": -5, "batch_size": 1, "cost_per_batch": 10 ** 9}]}
+        self.fake.usages[:] = [bad, total(1e300), {"token_details": [{"token_count": 1e300, "batch_size": 1e-300, "cost_per_batch": 1e300}]}]
+        f = self.run_front(BRIDGE_UNPRICED_NANO="5000000")
+        for _ in range(3):
+            self.assertEqual(f.request("POST", "/chat/completions", chat("gpt-4o"))[0], 200)
+        used = json.loads(f.request("GET", "/usage")[1])
+        self.assertEqual(used["days"][used["day"]]["credits"], "0.0150")
+
     def test_s3_details_alone_give_7400000(self):
         self.fake.usages[:] = [dict(DETAILS)]
         f = self.run_front(BRIDGE_UNPRICED_NANO="5000000")
@@ -299,14 +308,15 @@ def log_problems(script, test):
             f.request("POST", "/chat/completions", chat("gpt-4o", text=BODY_TEXT + " " + TOKEN), {"Authorization": "Bearer " + TOKEN})
             f.request("POST", "/chat/completions", chat("claude-opus-5", text=BODY_TEXT), {"Authorization": "Bearer " + TOKEN})
             f.request("GET", "/models", headers={"Authorization": "Bearer " + TOKEN})
+            f.request("GET", "/usage")   # a barrier: the count lines before it are written when it is answered
         finally:
             log = f.stop()
     finally:
         fake.close()
     counts = [l for l in log.splitlines() if '"status"' in l]
     problems = []
-    if len(counts) != 3:
-        problems.append("%d count lines for 3 requests" % len(counts))
+    if len(counts) != 4:
+        problems.append("%d count lines for 3 requests and the barrier" % len(counts))
     if TOKEN in log or "A1b2C3d4E5f6" in log:
         problems.append("the token was logged")
     if BODY_TEXT in log or "BODY-TEXT" in log:
