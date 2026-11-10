@@ -412,6 +412,44 @@ class Scope(unittest.TestCase):
                 with self.subTest(cwd=cwd, key=env["GIT_CONFIG_KEY_0"]):
                     self.refused(["status"], ENV, cwd=cwd, env=env)
 
+    # ---- S7 (ask #2360 clause 7): the Authorization: Basic header, in scope only ----
+    def test_s7_basic_header_and_local_insteadof_in_scope_only(self):
+        def pairs(*kv):
+            e = {"GIT_CONFIG_COUNT": str(len(kv))}
+            for i, (k, v) in enumerate(kv):
+                e["GIT_CONFIG_KEY_%d" % i], e["GIT_CONFIG_VALUE_%d" % i] = k, v
+            return e
+        ok = ("http.extraHeader", "Authorization: Basic dXNlcjpwYXNz")
+        self.allowed(["status"], env=pairs(ok))
+        self.allowed(["status"], env=pairs(ok, ("url.%s/.insteadOf" % self.root, "https://github.com/")))
+        self.allowed(["status"], env=pairs(("url.file://%s/.insteadOf" % self.root, "https://github.com/")))
+        self.allowed(["status"], cwd=self.bare(), env=pairs(ok))
+        for v in ("Authorization: Basic abc\nX-A: 1", "Authorization: Bearer abc", "X-A: 1", "Authorization: Basic ", "authorization: basic abc", "Authorization: Basic a b"):
+            self.refused(["status"], ENV, env=pairs(("http.extraHeader", v)))
+        self.refused(["status"], ENV, env=pairs(("url.https://example.com/.insteadOf", "https://github.com/")))
+        self.refused(["status"], ENV, env=pairs(("url.%s/.insteadOf" % self.root, "https://example.com/")))
+        self.refused(["status"], ENV, cwd="/", env=pairs(ok))   # out of scope
+        if self.outrepo:
+            self.refused(["status"], ENV, cwd=self.outrepo, env=pairs(ok))
+        if self.work:
+            self.refused(["status"], ENV, cwd=self.work, env=pairs(ok))
+        # the git config form, in scope
+        self.allowed(["config", "http.extraHeader", "Authorization: Basic dXNlcjpwYXNz"])
+        self.refused(["config", "http.extraHeader", "X-A: 1"], CONFIG)
+        self.refused(["config", "http.extraHeader", "Authorization: Bearer x"], CONFIG)
+        self.refused(["config", "url.https://example.com/.insteadOf", "https://github.com/"], CONFIG)
+        if self.outrepo:
+            self.refused(["config", "http.extraHeader", "Authorization: Basic dXNlcjpwYXNz"], CONFIG, cwd=self.outrepo)
+
+    def test_s7_a_guard_without_the_scope_check_lets_the_header_through_out_of_scope(self):
+        env = {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "http.extraHeader", "GIT_CONFIG_VALUE_0": "Authorization: Basic abc"}
+        self.refused(["status"], ENV, cwd="/", env=env)   # the control
+        p = self.mutant('http.extraheader) in_tmp_scope || env_cfg_refuse; env_cfg_basic', 'http.extraheader) env_cfg_basic')
+        r = self.guard(["status"], cwd="/", env=env, guard=p)
+        if r.returncode != 0:
+            self.fail("mutant did not let it through")
+        self.assertEqual(r.returncode, 0, ANCHOR)
+
     # ---- S7: the mutant ----
     def mutant(self, old, new):
         text = read(GUARD)
