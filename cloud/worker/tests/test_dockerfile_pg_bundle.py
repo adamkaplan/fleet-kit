@@ -84,14 +84,17 @@ def starts_server(f):
     """True when a RUN/CMD/ENTRYPOINT line of the stage holds a server word (any path prefix) in a segment (split at && || ; | ( ) $( and a
     backtick) whose command is not an inert one: this catches `then pg_ctl`, `bash -c 'postgres'`, `timeout 5 postgres`, `sudo -u x pg_ctl`."""
     for line in f.split("\n"):
-        m = re.match(r"(RUN|CMD|ENTRYPOINT) (.*)", line)
+        m = re.match(r"\s*(RUN|CMD|ENTRYPOINT) (.*)", line, re.I)
         if not m:
             continue
+        if "<<" in m.group(2):  # a heredoc body is not scanned: refuse it
+            return True
+        subst = "$(" in m.group(2) or "`" in m.group(2)  # a substitution may run what it names: no segment is inert
         for seg in re.split(r"&|;|\||\(|\)|\$\(|`", m.group(2)):
             words = [w.strip("\"'[],") for w in seg.split()]
             while words and (re.match(r"\w+=", words[0]) or words[0] in ("sudo", "exec", "nohup", "env", "su", "gosu", "then", "do", "else", "if", "!", "time")):
                 words = words[1:]
-            if words and os.path.basename(words[0]) in INERT:
+            if words and not subst and os.path.basename(words[0]) in INERT:
                 continue
             if any(os.path.basename(w) in SERVER_WORDS for w in words):
                 return True
@@ -121,7 +124,7 @@ def problems(t):
         out.append("the bundle is not root-owned and read-only")
     if len(re.findall(r"(?m)^ENV PG_BUNDLE=/opt/pg-bundle$", f)) != 1:
         out.append("ENV PG_BUNDLE must appear once")
-    if re.search(r"(?m)^(CMD|ENTRYPOINT|EXPOSE)\b", f) or starts_server(f):
+    if re.search(r"(?mi)^\s*(CMD|ENTRYPOINT|EXPOSE)\b", f) or starts_server(f):
         out.append("a line starts a server or adds a port")
     users = re.findall(r"(?m)^USER (\S+)$", t)
     if not users or users[-1] != "worker":
@@ -164,13 +167,6 @@ class T(unittest.TestCase):
                 with open(os.path.join(BIN, n), "rb") as a, open(os.path.join(LAUNCHER, n), "rb") as b:
                     self.assertNotEqual(a.read(), b.read(), n + " is a copy of bin/ but is not in BIN_COPIES")
         self.assertEqual(copy_problems(BIN, LAUNCHER, bins), [])
-        for n in os.listdir(LAUNCHER):  # a launcher file sharing a bin/ name is either a listed copy or a different file
-            if n.endswith(".py") and os.path.isfile(os.path.join(BIN, n)) and n not in BIN_COPIES:
-                with open(os.path.join(BIN, n), "rb") as a, open(os.path.join(LAUNCHER, n), "rb") as b:
-                    self.assertNotEqual(a.read(), b.read(), n + " is a copy of bin/ but is not in BIN_COPIES")
-        for n in bins:
-            with open(os.path.join(BIN, n), "rb") as a, open(os.path.join(LAUNCHER, n), "rb") as b:
-                self.assertEqual(a.read(), b.read(), n + " copy differs")
         self.assertEqual(sorted(got), ["app_token.py", "cloud_worker.py", "path_walk.py", "registry.py", "run_record.py", "token_mint.py", "token_service.py", "wip_save.py"])
 
     def test_copy_mutant_fails_comparison(self):
@@ -200,7 +196,7 @@ class T(unittest.TestCase):
         t = read(DF)
         self.assertEqual(problems(t), [])  # control
         for cmd in ("/opt/pg/bin/pg_ctl start", "/usr/bin/postgres -D /x", "/opt/pg/bin/initdb -D /x",
-                    "if true; then pg_ctl start; fi", "bash -c 'postgres -D /x'", "sudo -u pg pg_ctl start", "timeout 5 postgres", "echo hi & postgres", "chmod 1 x & pg_ctl start",
+                    "if true; then pg_ctl start; fi", "bash -c 'postgres -D /x'", "sudo -u pg pg_ctl start", "timeout 5 postgres", "echo hi & postgres", "run postgres -D /x", " RUN postgres -D /x", "RUN $(echo postgres) -D /x", "RUN <<EOF\npostgres -D /x\nEOF", "chmod 1 x & pg_ctl start",
                     "systemctl start x", "service postgresql start"):
             m = read(DF).rstrip("\n") + "\nRUN " + cmd + "\n"
             self.assertIn("a line starts a server", " ".join(problems(m)), cmd)
