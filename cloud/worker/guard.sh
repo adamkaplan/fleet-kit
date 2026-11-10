@@ -102,6 +102,8 @@ env_cfg_local() {   # $1: an absolute local path (letters, digits, dot, undersco
   return 0
 }
 env_cfg_pair() {   # $1: a key, $2: its value: only the listed settings pass (the key is compared in lower case; a URL part keeps its case)
+  case "$1" in *"
+"*) env_cfg_refuse ;; esac   # grep judges one line at a time: a key of two lines is refused
   lk=$(printf '%s' "$1" | tr 'A-Z' 'a-z')
   case "$lk" in
     user.email|user.name) env_cfg_text "$2" ;;
