@@ -37,7 +37,6 @@ import urllib.parse
 import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import keychain_read  # noqa: E402
 import token_mint  # noqa: E402
 
 API = "https://api.github.com"
@@ -232,6 +231,7 @@ def vault(env_name, secret):
     cmd = os.environ.get(env_name)
     service = (os.environ.get("CW_KEYCHAIN_SERVICE") or "").strip()
     if service and not cmd:   # the keychain route (the command settings win): /usr/bin/security, never az, the value in memory only
+        import keychain_read   # here, not at the top: a copy of this file without the keychain module still mints when the setting is unset
         try:
             return keychain_read.read(service, secret, MAX_BYTES, trim=secret != "cw-app-key")
         except keychain_read.KeychainError as err:
