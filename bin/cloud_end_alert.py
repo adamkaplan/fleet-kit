@@ -135,10 +135,15 @@ def pr_line(record_dir, parse):
     """The end-hook ask: the one line the end hook recorded about the pull request, only if it is one of the fixed forms; else a fixed unknown."""
     run = read_small(os.path.join(record_dir, "run.json"), parse) if record_dir else None
     hook = run.get("end_hook") if run else None
+    return valid_pr_note(hook) or "PR not marked ready: no answer recorded"
+
+
+def valid_pr_note(hook):
+    """The end hook's `pr_note` if it is one of the fixed forms, else None."""
     note = hook.get("pr_note") if isinstance(hook, dict) else None
     if isinstance(note, str) and len(note) <= 120 and re.fullmatch(r"PR (#[0-9]{1,9} marked ready(, review requested|, no review comment is configured)|not marked ready: [A-Za-z0-9 #(),._-]+)", note):
         return note
-    return "PR not marked ready: no answer recorded"
+    return None
 
 
 def message_text(worker, label, when, pushed, record_name, kept=False, failure=None):
@@ -205,7 +210,7 @@ def push_reader(audit_path, parse):
             return None
         finally:
             os.close(fd)
-        found, covered = None, False
+        found, wip, covered = None, None, False
         for raw in chunk.split(b"\n"):
             if b"push_watch.sent" not in raw and b"cloud.created" not in raw:
                 continue
@@ -216,30 +221,37 @@ def push_reader(audit_path, parse):
             if not isinstance(item, dict) or item.get("subject") != worker:
                 continue
             if item.get("event") == "cloud.created":
-                found, covered = None, True
+                found, wip, covered = None, None, True
                 continue
             detail = item.get("detail")
             if item.get("event") != "push_watch.sent" or not isinstance(detail, dict):
                 continue
             branch, sha = clean_branch(detail.get("branch")), detail.get("head")
             if branch and isinstance(sha, str) and FULL_SHA.fullmatch(sha):
-                found = (branch, sha)   # later lines are newer
-        return found or (None if covered else UNPROVEN)
+                if branch == worker + "/wip":
+                    wip = (branch, sha)     # the reaper's save: only when the pod has no other push
+                else:
+                    found = (branch, sha)   # later lines are newer
+        return found or wip or (None if covered else UNPROVEN)
     return read
 
 
-def head_line(record_dir, repo, head_checks, parse, pushed=None):
+def head_line(record_dir, repo, head_checks, parse, pushed=None, worker=None):
     """#2267: the last head the pod pushed (branch, short sha) and its check state; `head_checks(repo, sha)` is handed in (this module reads no network).
     `pushed` is the pod's newest own push (branch, sha) from the switchboard audit: used when the end hook found nothing or no head."""
     run = read_small(os.path.join(record_dir, "run.json"), parse) if record_dir else None
     hook = run.get("end_hook") if isinstance(run, dict) else None
     if isinstance(hook, dict) and hook.get("head_on") is None and hook.get("wip_branch") is None and not hook.get("error"):
         if not pushed:
-            return "Last head: nothing pushed."
+            # a PR marked ready proves a push the push watch may not see (a branch of the pod's own choosing): not "nothing pushed"
+            note = valid_pr_note(hook)
+            return "Last head: head unknown." if note and note.startswith("PR #") else "Last head: nothing pushed."
         return "Last head: head unknown." if pushed == UNPROVEN else finish_head(repo, pushed[0], pushed[1], head_checks)
     branch = hook.get("head_on") if isinstance(hook, dict) else None
     sha = run.get("head_sha") if isinstance(run, dict) else None
     wip = hook.get("wip_branch") if isinstance(hook, dict) and branch is None else None
+    if clean_branch(wip) and pushed and pushed != UNPROVEN and pushed[0] != "%s/wip" % worker:
+        return finish_head(repo, pushed[0], pushed[1], head_checks)   # a real push of the pod beats the wip save
     if clean_branch(wip):
         if not (isinstance(sha, str) and FULL_SHA.fullmatch(sha)):
             return "Last head: wip branch %s, sha unknown." % wip
@@ -319,7 +331,7 @@ def scan_audit(audit_file, state_file, cloud_dir, last_reports, send, parse, aud
                 own = last_push(worker) if last_push is not None else None
             except Exception:
                 own = None   # fail mode: no own push is known, the line says what the end hook shows (as before this reader)
-            text += " " + head_line(raw_dir(reason) if name else "", (record or {}).get("repo"), head_checks, parse, own)
+            text += " " + head_line(raw_dir(reason) if name else "", (record or {}).get("repo"), head_checks, parse, own, worker)
         keys.append(key)
         to_list = [CHIEF] + ([boss] if isinstance(boss, str) and AGENT_NAME.fullmatch(boss) and boss != CHIEF else [])
         boss_text = text

@@ -1,11 +1,15 @@
 cloud/launcher/tests/test_app_token_route.py
 cloud/launcher/tests/test_app_token_service.py
+cloud/launcher/tests/test_azure_config_dir.py
 cloud/launcher/tests/test_brief_header.py
 cloud/launcher/tests/test_cloud_default_model.py
 cloud/launcher/tests/test_cloud_inspect.py
 cloud/launcher/tests/test_cloud_model_served.py
 cloud/launcher/tests/test_cloud_quick_budget.py
 cloud/launcher/tests/test_cloud_tests_write_tmp.py
+cloud/launcher/tests/test_copilot_front.py
+cloud/launcher/tests/test_copilot_manifest.py
+cloud/launcher/tests/test_council_url_render.py
 cloud/launcher/tests/test_create_says_why.py
 cloud/launcher/tests/test_end_hook_nothing_to_push.py
 cloud/launcher/tests/test_end_hook_pr_ready.py
@@ -74,6 +78,7 @@ cloud/worker/tests/test_dockerfile_pg_bundle.py
 cloud/worker/tests/test_dockerfile_postgres.py
 cloud/worker/tests/test_entrypoint.py
 cloud/worker/tests/test_entrypoint_import.py
+cloud/worker/tests/test_guard_env.py
 cloud/worker/tests/test_plan_check_in_pod.py
 cloud/worker/tests/test_pr_branch_source.py
 cloud/worker/tests/test_pr_label.py

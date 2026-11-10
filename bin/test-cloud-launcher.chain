@@ -3,6 +3,7 @@ bin/test-cloud-retired
 cloud/launcher/tests/test_app_token.py
 cloud/launcher/tests/test_app_token_route.py
 cloud/launcher/tests/test_app_token_service.py
+cloud/launcher/tests/test_azure_config_dir.py
 cloud/launcher/tests/test_brief_header.py
 cloud/launcher/tests/test_chain_list.py
 cloud/launcher/tests/test_chain_time.py
@@ -35,6 +36,9 @@ cloud/launcher/tests/test_cloud_tests_write_tmp.py
 cloud/launcher/tests/test_cloud_turn_end.py
 cloud/launcher/tests/test_cloud_worker.py
 cloud/launcher/tests/test_cluster_token_refresh.py
+cloud/launcher/tests/test_copilot_front.py
+cloud/launcher/tests/test_copilot_manifest.py
+cloud/launcher/tests/test_council_url_render.py
 cloud/launcher/tests/test_create_says_why.py
 cloud/launcher/tests/test_cw_minter_manifest.py
 cloud/launcher/tests/test_cw_names.py
@@ -134,6 +138,7 @@ cloud/worker/tests/test_dockerfile_postgres.py
 cloud/worker/tests/test_entrypoint.py
 cloud/worker/tests/test_entrypoint_import.py
 cloud/worker/tests/test_entrypoint_question.py
+cloud/worker/tests/test_guard_env.py
 cloud/worker/tests/test_guard_table.py
 cloud/worker/tests/test_identity_image.py
 cloud/worker/tests/test_plan_check_in_pod.py

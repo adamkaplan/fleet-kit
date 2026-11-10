@@ -2894,6 +2894,7 @@ def render_pod(a, worker, name, now, hard, env, run_names=()):
     comment = review_comment(a.repo)
     if comment:   # the repository's review comment, posted once by the end hook; none configured = no variable
         e["CW_REVIEW_COMMENT"] = comment
+    if (env.get("CW_COUNCIL_URL") or "").strip(): e["COUNCIL_MODEL_URL"] = env["CW_COUNCIL_URL"].strip()   # ask #2341: an address only, never a key; unset adds nothing
     agent = getattr(a, "agent", None) or "worker"
     if agent not in AGENTS:
         raise CloudError("--agent must be one of %s, got %r; nothing was created" % (" or ".join(AGENTS), str(agent)[:40]), EXIT_USAGE)
@@ -5065,6 +5066,8 @@ SETTINGS = (
     ("CW_VAULT_CHECK_DIR", False, "path"),         # the checkout the vault access check runs from; needed only after a vault firewall refusal (see vault_check_dir_problem)
     ("CW_MAX_PERSISTENT", False, "number"),        # the most persistent orchestrators (StatefulSets of the launcher's label) the namespace may hold (an integer 1 to 20; default 2)
     ("CW_VAULT_BLOCK_DURATION", False, "duration"),   # how long the launcher refuses vault commands after a vault firewall refusal (default 10m, 1m to 60m)
+    ("CW_AZURE_CONFIG_DIR", False, "path"),        # the az sign-in directory every vault read of a launch uses (replaces the caller's AZURE_CONFIG_DIR); an absolute existing directory
+    ("CW_COUNCIL_URL", False, "name"),             # the address of the Copilot bridge front (cloud/k8s/copilot-bridge.yaml) a worker pod is told as COUNCIL_MODEL_URL; an address, never a key
 )
 SETTING_KINDS = {name: kind for name, _, kind in SETTINGS}
 SETTING_REQUIRED = tuple(name for name, required, _ in SETTINGS if required)
@@ -5179,6 +5182,10 @@ def _path_ok(value):
     return os.path.isabs(value) and ".." not in value.split("/")
 
 
+def _dir_ok(value):
+    return _path_ok(value) and os.path.isdir(value)
+
+
 def _number_ok(value):
     return bool(_NUMBER.fullmatch(value)) and 0 < float(value) <= 100000
 
@@ -5232,6 +5239,8 @@ VALIDATORS = {
     "CW_VAULT_CHECK_DIR": ("an absolute path with no .. segment", _path_ok),
     "CW_MAX_PERSISTENT": ("an integer from 1 to 20", lambda v: bool(PERSISTENT_PATTERN.fullmatch(v)) and 1 <= int(v) <= PERSISTENT_MAX_LIMIT),
     "CW_VAULT_BLOCK_DURATION": ("a duration of 1 to 3 digits and m or h, from 1m to 60m (for example 10m or 1h)", _duration_ok),
+    "CW_AZURE_CONFIG_DIR": ("an absolute path of an existing directory, with no .. segment", _dir_ok),
+    "CW_COUNCIL_URL": ("an http or https URL: a host, an optional port, an optional /v1, no user, query or fragment", lambda v: bool(re.fullmatch(r"https?://[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?(?::[0-9]{1,5})?(?:/v1)?", v))),
 }
 _SETTING_LINE = re.compile(r"([A-Z][A-Z0-9_]*)=(.*)")
 
@@ -5339,6 +5348,8 @@ def apply_settings(env=None, path=None):
     if text is None:
         return "environment"
     values = parse_settings(text, path)
+    if re.search(r"^[ \t]*CW_AZURE_CONFIG_DIR=[ \t]*$", text, re.M):   # an empty value counts as not set elsewhere; for this one it is refused (ask #2335: it would silently keep the caller's sign-in)
+        raise _bad(path, "sets CW_AZURE_CONFIG_DIR to nothing: it must be an absolute path of an existing directory")
     part = [k for k in STACK_REGISTRY_KEYS if k in values]
     if part and len(part) != len(STACK_REGISTRY_KEYS):   # all three or none (parse_settings judges one value at a time)
         raise _bad(path, "sets %s but not %s: the stack registry settings are all three or none" % (", ".join(part), ", ".join(k for k in STACK_REGISTRY_KEYS if k not in values)))
@@ -5356,6 +5367,8 @@ def apply_settings(env=None, path=None):
             env.pop(name, None)
         env.update(before)
         raise CloudError("refused: the settings file %s could not be applied; nothing was changed" % path, EXIT_USAGE) from None
+    if "CW_AZURE_CONFIG_DIR" in values:   # the settings sign-in replaces the caller's: every later vault read (the clean child environments, mint_env) sees this one
+        env["AZURE_CONFIG_DIR"] = values["CW_AZURE_CONFIG_DIR"]
     return path
 
 
