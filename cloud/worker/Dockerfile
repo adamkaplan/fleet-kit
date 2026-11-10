@@ -120,8 +120,8 @@ ARG PG_VERSION=16.15
 ARG PG_SHA256=c1575341fa7bd40f5274ea465b34390f4dc64cdd0770af327005caaeb9f6b7ed
 ARG PGVECTOR_VERSION=0.8.7
 ARG PGVECTOR_COMMIT=f37c13f68b57d2c3472b2214fbcff699d6d34876
-ARG PGMQ_VERSION=1.13.1
-ARG PGMQ_COMMIT=8eab18272e50077ab9f72d9787296655f2849dcc
+ARG PGMQ_VERSION=1.13.0
+ARG PGMQ_COMMIT=32c075bb6dbed66a303d1a792393c93e36c09a97
 RUN set -eu; curl -fsSL "https://ftp.postgresql.org/pub/source/v${PG_VERSION}/postgresql-${PG_VERSION}.tar.bz2" -o /tmp/pg.tar.bz2 \
  && echo "${PG_SHA256}  /tmp/pg.tar.bz2" | sha256sum -c - \
  && mkdir -p /src/pg && tar -xjf /tmp/pg.tar.bz2 -C /src/pg --strip-components=1 && rm /tmp/pg.tar.bz2 \
