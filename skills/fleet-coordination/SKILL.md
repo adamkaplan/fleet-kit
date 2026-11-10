@@ -173,7 +173,7 @@ fleet-switchboard launch <name> --agent coder --dir <worktree> --role coder \
 ```
 
 By default the worker is **headless**: a session in the OpenCode service with no
-terminal and no pane id (about 2 MB instead of 200 to 400 MB). To look at it run
+terminal and no pane id (about 2 MB instead of 200 to 400 MB). Worktree: `~/Code/.fleet/<repo>/<name>` (`worktree_root`). To look at it run
 `fleet-switchboard watch NAME` (it opens a terminal on the same session; closing it leaves
 the worker running); `herdr agent read` and `send-keys` do not apply to it, so use `send`,
 `status` and `watch`. Add `--terminal` (or `--workspace`) for a tab, or the person sets

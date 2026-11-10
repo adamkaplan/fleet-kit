@@ -30,6 +30,7 @@ switchboard/pins.py
 switchboard/faults.py
 switchboard/shadow_classifier.py
 switchboard/worktree_lifecycle.py
+switchboard/worktree_root.py
 switchboard/verification.py
 switchboard/judge_rule.py
 switchboard/review_laws.py
