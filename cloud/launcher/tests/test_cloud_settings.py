@@ -88,7 +88,7 @@ HOSTILE = {   # per key: values that must be refused (each through the REAL pars
     "CW_MAX_PERSISTENT": ["0", "21", "00", "01", "+5", "-5", "-1", "\u0662", "\u0661\u0662", "2\x01", "2\t", "1.5", "abc", "100"],
     "CW_VAULT_BLOCK_DURATION": ["-5m", "0m", "61m", "2h", "1000m", "10", "m", "10s", "1.5h", "10 m", "/tmp/10m", "10m5s", "\u0662\u0660m", "-1h", "0h"],
 }
-HOSTILE["CW_COUNCIL_URL"] = ["ftp://bridge.example", "bridge.example:8080", "http://", "http://user@bridge.example", "http://bridge.example?x=1", "http://bridge.example#f", "https://bridge.example/a/b", "file:///etc/passwd", "http://bridge example"]   # ask #2341
+HOSTILE["CW_COUNCIL_URL"] = ["ftp://bridge.example", "bridge.example:8080", "http://", "http://user@bridge.example", "http://bridge.example?x=1", "http://bridge.example#f", "https://bridge.example/a/b", "file:///etc/passwd", "http://bridge example", "http://bridge.example/opaque-segment", "http://bridge.example/.."]   # ask #2341
 CONTROL = ["\t", "\x00", "\r", "\x0b", "\x0c", "\x1c", "\x1b", "\x7f", "\x01"]
 
 

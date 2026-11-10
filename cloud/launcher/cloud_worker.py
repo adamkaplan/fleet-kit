@@ -5234,7 +5234,7 @@ VALIDATORS = {
     "CW_VAULT_CHECK_DIR": ("an absolute path with no .. segment", _path_ok),
     "CW_MAX_PERSISTENT": ("an integer from 1 to 20", lambda v: bool(PERSISTENT_PATTERN.fullmatch(v)) and 1 <= int(v) <= PERSISTENT_MAX_LIMIT),
     "CW_VAULT_BLOCK_DURATION": ("a duration of 1 to 3 digits and m or h, from 1m to 60m (for example 10m or 1h)", _duration_ok),
-    "CW_COUNCIL_URL": ("an http or https URL: a host, an optional port, an optional one-segment path (/v1), no user, query or fragment", lambda v: bool(re.fullmatch(r"https?://[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?(?::[0-9]{1,5})?(?:/[A-Za-z0-9._-]{0,64})?", v))),
+    "CW_COUNCIL_URL": ("an http or https URL: a host, an optional port, an optional /v1, no user, query or fragment", lambda v: bool(re.fullmatch(r"https?://[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?(?::[0-9]{1,5})?(?:/v1)?", v))),
 }
 _SETTING_LINE = re.compile(r"([A-Z][A-Z0-9_]*)=(.*)")
 
