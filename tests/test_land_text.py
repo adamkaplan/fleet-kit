@@ -128,6 +128,13 @@ class TestLandText(unittest.TestCase):
         self.assertIn(("missing", "the detached command"), self.detached_problems(text))
         self.assertIn(("foreground run", ".spire/tool/bin/spire land"), self.detached_problems(".spire/tool/bin/spire land > /work/land.log 2>&1 &"))   # redirected but not under nohup
 
+    def test_no_text_claims_a_janus_infra_default_for_land_repos(self):
+        for path in ("docs/switchboard.md", "skills/fleet-coordination/SKILL.md", "skills/fleet-review/SKILL.md", "skills/fleet-explainer/SKILL.md"):
+            for line in (ROOT / path).read_text().splitlines():
+                if "land_repos" in line or "spire land" in line:
+                    self.assertNotRegex(line, r"janus-infra/\*`?\s*by default|default `\[\"janus-infra", path)
+        self.assertEqual(fpn.sb.uses_spire_land({}, "janus-infra/widget"), False)   # the code's default: no repository
+
     def test_the_skills_and_the_brief_header_carry_the_rule(self):
         line = fpn.sb.LAND_SETUP_LINE
         self.assertIn("This repository lands with `spire land`", line)
