@@ -1,0 +1,10 @@
+{
+  "name": "fleet-copilot-bridge",
+  "version": "1.0.0",
+  "private": true,
+  "description": "The pinned copilot-api bridge behind the policy front (ask #2341). No secret here.",
+  "license": "MIT",
+  "dependencies": {
+    "copilot-api": "0.7.0"
+  }
+}
