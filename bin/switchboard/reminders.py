@@ -564,7 +564,7 @@ class ReminderFacts:
         return "%s (%s)" % (item["text"], tail)
 
     def verdict(self, item):
-        """For a due conditional reminder: None (cannot tell yet: it stays), "deliver", or the reason to drop it.
+        """For a due conditional reminder: None (the condition is unreadable: it delivers, audited as reminder.condition_unreadable), "deliver", or the reason to drop it.
         One read of the boss's transcript and inbox, and only for a reminder that is due and has a condition."""
         condition, discovery = item["condition"], self.engine.discovery if self.engine else None
         moot = self.until_holds(condition)
