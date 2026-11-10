@@ -2721,6 +2721,8 @@ def github_branch_exists(token, repo, branch):
     import urllib.parse
     import urllib.request
     import token_mint
+    if not re.fullmatch(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+", repo or ""):
+        raise ValueError("the repository name is not owner/name")
     req = urllib.request.Request("https://api.github.com/repos/%s/branches/%s" % (repo, urllib.parse.quote(branch, safe="")), method="GET",
                                  headers={"Authorization": "Bearer " + token, "Accept": "application/vnd.github+json", "User-Agent": "cw-launcher"})
     try:
@@ -4293,8 +4295,8 @@ class Launcher:
         """ONE best-effort save of the pod's work to <worker>/wip before it is deleted (the reaper's own wip_save step, once). Returns the words for the
         audit line; a pod that cannot be exec'd (an ended pod cannot) is said so. Never raises."""
         try:
-            if not callable(getattr(self.kube, "exec", None)):
-                return "the pod cannot be exec'd: its work was not saved"
+            if (pod.get("status") or {}).get("phase") in ("Failed", "Succeeded") or not callable(getattr(self.kube, "exec", None)):
+                return "the pod cannot be exec'd (it has ended): its work was not saved"
             res = json.loads(self.kube.exec(pod["metadata"]["name"], "python3", "-I", "-", "--snapshot", keep_stdout=True, timeout=wip_save.EXEC_TIMEOUT_SECONDS,
                                             stdin=wip_save.hook_source()).strip().splitlines()[-1])
             if res.get("error"):
@@ -4314,12 +4316,19 @@ class Launcher:
         except Exception as e:
             return "unknown (%s)" % "".join(c if c.isprintable() else "?" for c in self.kube.scrub(e, 100))
 
+    def _own_pod(self, pod):
+        """True only for a pod this rule may delete: a worker name, the pod named for it, a uid to bind the delete to, no StatefulSet owner, not already going."""
+        meta = pod.get("metadata") or {}
+        return (PERSISTENT_ANNOTATION not in (meta.get("annotations") or {}) and self._failed_name_fits(pod) and meta.get("name") == pod_name(ann(pod, "worker"))
+                and isinstance(meta.get("uid"), str) and bool(POD_UID_RE.fullmatch(meta["uid"])) and not meta.get("deletionTimestamp")
+                and not any(isinstance(r, dict) and r.get("kind") == "StatefulSet" for r in (meta.get("ownerReferences") or [])))
+
     def _expire(self, pod, now):
         """The expiry of a KEPT pod that ended (ask #2343): past its hard deadline by KEPT_GRACE_SECONDS it is saved once (best effort), said once in the
         audit (kept-expired: the worker and whether <worker>/wip exists) and deleted with its two Secrets. False: not this pod's rule (the pass goes on
         with it as before); else the report rows of the pass."""
         try:
-            if PERSISTENT_ANNOTATION in ((pod.get("metadata") or {}).get("annotations") or {}) or not self._failed_name_fits(pod):
+            if not self._own_pod(pod):
                 return False
             if (pod.get("status") or {}).get("phase") not in ("Failed", "Succeeded") or ann(pod, "kept") != "true":
                 return False
@@ -4331,8 +4340,11 @@ class Launcher:
         if late <= KEPT_GRACE_SECONDS:
             return False
         worker = ann(pod, "worker")
-        saved = self._last_save(pod)
-        wip = self._wip_state(pod, worker)
+        said = self.__dict__.setdefault("expiry_said", {})   # the save and the wip read are made ONCE per pod, even when the delete must be tried again
+        key = (name, (pod.get("metadata") or {}).get("uid"))
+        if key not in said:
+            said[key] = (self._last_save(pod), self._wip_state(pod, worker))
+        saved, wip = said[key]
         try:
             self._remove(name, ann(pod, "run-id") or None, (pod.get("metadata") or {}).get("uid"))
         except CloudError as e:
@@ -4347,7 +4359,7 @@ class Launcher:
         out = []
         for pod in pods:
             try:
-                if PERSISTENT_ANNOTATION in ((pod.get("metadata") or {}).get("annotations") or {}) or not self._failed_name_fits(pod) or ann(pod, "kept") == "true":
+                if not self._own_pod(pod) or ann(pod, "kept") == "true":
                     continue
                 if (now - self.hard_deadline(pod)).total_seconds() <= UNKEPT_GRACE_SECONDS:
                     continue

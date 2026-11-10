@@ -137,6 +137,29 @@ class Expiry(Scen):
         self.assertIsNotNone(self.pod("krun"))
         self.assertEqual(self.expired("krun"), [])
 
+    def test_exactly_the_grace_is_kept_and_a_pod_without_a_uid_is_never_deleted(self):
+        self.fail("edge", {"phase": "Failed"}, kept=True)
+        self.at("edge", hours=24)
+        self.reap()
+        self.assertEqual(self.pod("edge") is not None, True, "EXACTLY_24H")
+        self.at("edge", hours=25)
+        st = self.st()
+        st["pods"][cw.pod_name("edge")]["metadata"].pop("uid", None)
+        self.write_state(st)
+        self.reap()
+        self.assertEqual(self.pod("edge") is not None, True, "NO_UID")
+        self.assertEqual(self.expired("edge"), [])
+
+    def test_a_pod_not_named_for_its_worker_is_never_deleted(self):
+        self.fail("named", {"phase": "Failed"}, kept=True)
+        self.at("named", hours=25)
+        st = self.st()
+        st["pods"][cw.pod_name("named")]["metadata"]["annotations"]["cw/worker"] = "someoneelse"
+        self.write_state(st)
+        self.reap()
+        self.assertEqual(self.pod("named") is not None, True)
+        self.assertEqual(self.expired("someoneelse"), [])
+
     def test_the_grace_is_one_day(self):
         self.assertEqual(cw.KEPT_GRACE_SECONDS, 24 * 3600)
         import cloud_ended_pods
