@@ -194,8 +194,8 @@ class GuardEnv(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, "a refused git setting was let through"):
             self.refused_all(p)
 
-    def test_a_mutant_that_allows_the_unscoped_extraHeader_or_any_url_base_is_caught(self):
-        p = self.mutant("http.?*.extraheader)", "http.?*.extraheader|http.extraheader)")
+    def test_a_mutant_that_allows_any_header_host_or_any_url_base_is_caught(self):
+        p = self.mutant("(127\\.0\\.0\\.1|localhost)", "[a-z0-9.]+")
         with self.assertRaisesRegex(AssertionError, "a refused git setting was let through"):
             self.refused_all(p)
         p = self.mutant("env_cfg_local \"$b\"; ", "")
