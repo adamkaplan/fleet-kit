@@ -80394,7 +80394,8 @@ NOT_ISOLATED_BY_BASE = {
     "TestTriageHiddenMutants", "TestTwoBranchesAddingATestFile", "TestUnconsumedRecord", "TestUnreadableSummary",
     "TestCloudHeadChecks",   # (#2247) pure: cloud_head_checks over a mock engine and a stubbed _api, no state path; the file came with #2267
     "TestGithubWriteGuard",   # (#2247) pure: reads the repository sources read-only and scans strings in memory, no state path; the file came with #2263
-    "TestGateBudget", "TestReader", "TestConfigLoader", "TestSweepSkip", "TestAskIsItsOwn",   # (#2247) pure: _ask_of on strings and dicts; the file came with #2254 (and TestGateBudget: the shim source text and a number over an in-memory config, #2296; TestReader, TestConfigLoader, TestSweepSkip: the land_repos reader, validate_config on dicts, sweep_refresh over stubs, #2323)
+    "TestAskIsItsOwn",   # (#2247) pure: _ask_of on strings and dicts; the file came with #2254
+    "TestGateBudget", "TestReader", "TestConfigLoader", "TestSweepSkip",   # (#2247) pure: TestGateBudget reads the shim source text and a number over an in-memory config (#2296); the other three are the land_repos reader, validate_config on dicts and sweep_refresh over stubs (#2323); no state path
     ),
     "makes its own temporary directory or state (a tempfile.mkdtemp, a patched environment or its own isolating setUp) and never reads the real one": (
     "TestEveryTestClassIsolates", "BodyRig", "TestDirectReads", "TestGateProbeReads", "TestGhBodyGuard", "TestGhBodyMutants", "TestGhBodyRefusalIsPure",
@@ -80479,7 +80480,6 @@ class TestEveryTestClassIsolates(unittest.TestCase):
                 with self.assertRaises(sb.RealStateRefused) as caught:
                     build(Plain())
                 self.assertIn(named, str(caught.exception))
-
 
 if __name__ == "__main__":
     # Run directly, the suite takes a CPU slot (`fleet-switchboard heavy`): several full suites at once starve the machine. FLEET_HEAVY=off, a CI run, a run
