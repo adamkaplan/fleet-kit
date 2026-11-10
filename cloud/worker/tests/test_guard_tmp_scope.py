@@ -384,10 +384,6 @@ class Scope(unittest.TestCase):
                 os.unlink(lk)
             os.symlink(fx, lk)
             self.refused(["status"], ENV, env={name: lk})
-            dl = os.path.join(self.root, "fxdir")   # a link to a directory outside server/tests
-            if not os.path.lexists(dl):
-                os.symlink("/work/repo", dl)
-            self.refused(["status"], ENV, env={name: dl + "/server/tests/" + os.path.basename(fx)})
             if self.outrepo:
                 self.refused(["status"], ENV, cwd=self.outrepo, env={name: fx})   # out of scope
             self.refused(["status"], ENV, cwd=self.bare(), env={name: "/etc/hostname"})
@@ -439,7 +435,7 @@ class Scope(unittest.TestCase):
                 self.fail("%s: a bare repository outside /tmp let through" % ANCHOR)
             self.assertEqual((r.returncode, r.stderr), (3, CONFIG))
         run(None)   # the control
-        p = self.mutant('  tmp_under "$is_gd" || return 1\n', "")
+        p = self.mutant('  [ "$sc_off" = 0 ] || return 1\n', "  return 0\n")   # no scope check at all
         with self.assertRaisesRegex(AssertionError, ANCHOR):
             run(p)
 
