@@ -45,6 +45,7 @@ class TestLandText(unittest.TestCase):
         self.assertEqual(other, cloud_worker.SETUP_PREAMBLE % {"repo": "acme/other", "branch": "b"} + BRIEF)
 
     def test_the_switch_decides(self):
+        self.assertNotIn("spire land", pod.payload(BRIEF, repo="janus-infra/widget"), "no key: off")
         self.assertIn("spire land", pod.payload(BRIEF, repo="acme/other", config={"land_repos": ["acme/*"]}))
         self.assertNotIn("spire land", pod.payload(BRIEF, repo="janus-infra/widget", config={"land_repos": []}))
 
