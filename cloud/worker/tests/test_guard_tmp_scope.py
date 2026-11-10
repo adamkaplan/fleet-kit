@@ -369,6 +369,17 @@ class Scope(unittest.TestCase):
                 self.refused(["status"], ENV, cwd=self.outrepo, env={name: good})   # out of scope: the same file
             self.refused(["status"], ENV, cwd="/", env={name: good})
 
+    def real_file(self, path):   # a regular file that exists, owned by the user, removed at the end of the test
+        d = os.path.dirname(path)
+        made = not os.path.isdir(d)
+        os.makedirs(d, exist_ok=True)
+        with open(path, "w") as f:
+            f.write("[user]\n\tname = x\n")
+        self.addCleanup(lambda: os.path.lexists(path) and os.unlink(path))
+        if made:
+            self.addCleanup(shutil.rmtree, d, True)
+        return path
+
     def test_s5_a_fixture_under_the_checkout_server_tests_is_let_through_in_scope_only(self):
         d = "/work/repo/server/tests"
         if not os.path.isdir(d):
@@ -386,6 +397,9 @@ class Scope(unittest.TestCase):
             self.refused(["status"], ENV, env={name: d + "/../../" + os.path.basename(fx)})
             self.refused(["status"], ENV, env={name: "/work/repo/other"})
             self.refused(["status"], ENV, env={name: "/work/repo/server/testsx/f"})
+            # review of 0beb9a46: the two paths above do not exist, so [ -f ] refuses them before the prefix check; these exist
+            self.refused(["status"], ENV, env={name: self.real_file("/work/repo/server/other-2360")})
+            self.refused(["status"], ENV, env={name: self.real_file("/work/repo/server/testsx/f-2360")})
             lk = os.path.join(self.root, "fxlink")
             if os.path.lexists(lk):
                 os.unlink(lk)
