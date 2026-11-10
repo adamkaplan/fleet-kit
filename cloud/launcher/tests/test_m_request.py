@@ -86,6 +86,41 @@ class CapacityRoom(unittest.TestCase):
         self.assertEqual((cw.SHAPES["M"]["cpu"], cw.SHAPES["M"]["memory"]), ("4", "8Gi"))
 
 
+def print_capacity_text(lib):
+    """What bin/cloud_worker.py's _print_capacity prints on stderr for one node with FREE room, given the launcher lib it loads."""
+    import contextlib
+    import importlib.util
+    import io
+    root = os.path.dirname(os.path.dirname(os.path.dirname(HERE)))
+    spec = importlib.util.spec_from_file_location("cw_bin_print_capacity", os.path.join(root, "bin", "cloud_worker.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    body = {"nodes_read": True, "pods_read": True, "nodes": [dict(FREE, name="n1")], "requests": {"n1": {"cpu_m": 4000, "memory_b": 16 * 1024 ** 3}}}   # two M pods already placed (2 CPU / 8Gi each)
+    mod._lib = lambda: lib
+    mod.run_launcher = lambda *a, **k: (0, body, "")
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        mod._print_capacity(None, None)
+    return err.getvalue()
+
+
+class PrintCapacity(unittest.TestCase):
+    def test_the_printed_block_counts_m_by_its_request(self):
+        text = print_capacity_text(cw)
+        line = [l for l in text.split("\n") if l.startswith("  shape M:")]
+        self.assertEqual(len(line), 1, text)
+        self.assertEqual(int(line[0].split(":")[1].split()[0]), 1, text)   # a third M pod fits by its request (3.82 CPU free >= 2); by its limit (4) it would print 0
+
+    def test_a_lib_without_capacity_shapes_is_counted_by_its_limits(self):
+        class Old:
+            SHAPES = cw.SHAPES
+            DEFAULT_ORCHESTRATOR_SHAPE = cw.DEFAULT_ORCHESTRATOR_SHAPE
+            _quantity = staticmethod(cw._quantity)
+        text = print_capacity_text(Old)
+        line = [l for l in text.split("\n") if l.startswith("  shape M:")]
+        self.assertEqual(int(line[0].split(":")[1].split()[0]), 0, text)
+
+
 class Mutant(unittest.TestCase):
     def test_a_mutant_that_keeps_m_at_its_limit_fails_with_the_anchored_text(self):
         original = base.source()
