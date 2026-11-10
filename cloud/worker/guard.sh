@@ -89,13 +89,14 @@ do_git() {
   done
   [ "${1:-}" = push ] || return 0
   shift
-  forced=0; wide=0; remote=""; specs=""; skip=0; rnext=0
+  set -f   # no pathname expansion of the unquoted words below
+  forced=0; wide=0; remote=""; repoopt=""; specs=""; skip=0; rnext=0; first=""
   for a in "$@"; do
     if [ "$skip" = 1 ]; then skip=0; continue; fi
-    if [ "$rnext" = 1 ]; then rnext=0; remote=$a; continue; fi
+    if [ "$rnext" = 1 ]; then rnext=0; repoopt=$a; continue; fi
     case "$a" in
       --repo) rnext=1; continue ;;
-      --repo=*) remote=${a#--repo=}; continue ;;
+      --repo=*) repoopt=${a#--repo=}; continue ;;
       -o|--push-option|--receive-pack|--exec) skip=1; continue ;;
       --push-option=*|--receive-pack=*|--exec=*) continue ;;
       --force|--force-with-lease|--force-with-lease=*|--force-if-includes) forced=1; continue ;;
@@ -103,15 +104,25 @@ do_git() {
       --*) continue ;;
       -[!-]*) case "$a" in *f*) forced=1 ;; esac; case "$a" in *o) skip=1 ;; esac; continue ;;   # a short cluster; ending in o: the next word is its value
     esac
-    if [ -z "$remote" ]; then remote=$a; continue; fi
+    if [ -z "$first" ]; then first=$a; fi
     specs="$specs
 $a"
   done
   cur=$("$real_git" symbolic-ref --quiet --short HEAD 2>/dev/null || true)
-  if [ -z "$remote" ]; then
-    remote=$("$real_git" config --get "branch.$cur.pushRemote" 2>/dev/null || "$real_git" config --get "branch.$cur.remote" 2>/dev/null || echo origin)
+  # git takes the first positional word as the repository, whatever --repo says: with --repo the guard judges both words as remotes and
+  # every positional word as a refspec; without a repository word the branch's remote (else origin) is the remote
+  if [ -n "$repoopt" ]; then
+    net_remote "$repoopt" || { [ -n "$first" ] && net_remote "$first"; } || return 0
+  else
+    if [ -n "$first" ]; then
+      remote=$first
+      specs=${specs#"
+$first"}
+    else
+      remote=$("$real_git" config --get "branch.$cur.pushRemote" 2>/dev/null || "$real_git" config --get "branch.$cur.remote" 2>/dev/null || echo origin)
+    fi
+    net_remote "$remote" || return 0
   fi
-  net_remote "$remote" || return 0
   hit=0; land=""; cnt=0
   [ "$wide" = 1 ] && hit=1
   while IFS= read -r a; do
@@ -119,7 +130,8 @@ $a"
     cnt=$((cnt + 1))
     plus=0; case "$a" in +*) plus=1; a=${a#+} ;; esac
     case "$a" in *:*) dst=${a#*:}; src=${a%%:*} ;; *) dst=$a; src=$a ;; esac
-    dst=${dst#refs/heads/}
+    [ "$a" = : ] && hit=1   # the matching push: every branch that exists on both sides
+    dst=${dst#refs/}; dst=${dst#heads/}   # git also takes heads/<name> for refs/heads/<name>
     case "$dst" in
       *\**|*\?*|*\[*) for d in $(defaults); do case "$d" in $dst) hit=1 ;; esac; done; continue ;;
     esac

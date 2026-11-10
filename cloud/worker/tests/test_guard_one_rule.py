@@ -67,8 +67,8 @@ class OneRule(unittest.TestCase):
         cls.git("commit", "-q", "--allow-empty", "-m", msg)
         return cls.git("rev-parse", "HEAD")
 
-    def run_guard(self, args, guard=GUARD, env=None):
-        return subprocess.run(["sh", guard, "git"] + args, cwd=self.repo, env=env or self.env, capture_output=True, text=True, timeout=30)
+    def run_guard(self, args, guard=GUARD, env=None, cwd=None):
+        return subprocess.run(["sh", guard, "git"] + args, cwd=cwd or self.repo, env=env or self.env, capture_output=True, text=True, timeout=30)
 
     def refused(self, args, guard=GUARD):
         r = self.run_guard(args, guard)
@@ -227,6 +227,23 @@ class OneRule(unittest.TestCase):
         self.passed(["push", "origin", "feature/maintenance"])
         self.passed(["status"])
         self.passed(["fetch", "origin", "main"])
+
+    def test_security_review_forms_abbreviated_destination_repo_option_matching_push_and_other_directory(self):
+        for dst in ("heads/main", "refs/heads/main", "main"):
+            self.refused(["push", "origin", "HEAD:" + dst])
+            self.refused(["push", "origin", "+HEAD:" + dst])
+        self.refused(["push", "origin", self.good + ":heads/main"])   # not the exact land form
+        self.refused(["push", "--repo=../r.git", "origin", "main"])   # git takes the positional word: origin
+        self.refused(["push", "--repo", "../r.git", "origin", "main"])
+        self.refused(["push", "origin", ":"])   # the matching push
+        self.passed(["push", "--repo=../r.git", "feature-x"])
+        # -C is followed: from a directory that is no repository the guard reads the repository it names
+        r = self.run_guard(["-C", self.repo, "push", "origin", "main"], cwd=self.d)
+        self.assertEqual((r.returncode, r.stderr), (3, LINE))
+        r = self.run_guard(["-C", self.repo, "push", "origin", self.good + ":refs/heads/main"], cwd=self.d)
+        self.assertEqual((r.returncode, r.stderr), (0, ""))
+        r = self.run_guard(["-C", self.repo, "push", "origin", self.none + ":refs/heads/main"], cwd=self.d)
+        self.assertEqual(r.returncode, 3)
 
     # S9
     def test_s9_every_row_of_the_table_is_answered_as_listed_and_the_readme_names_exactly_these_forms(self):
