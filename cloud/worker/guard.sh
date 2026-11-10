@@ -97,7 +97,7 @@ do_git() {
     case "$a" in
       --repo) rnext=1; continue ;;
       --repo=*) repoopt=${a#--repo=}; continue ;;
-      -o|--push-option|--receive-pack|--exec) skip=1; continue ;;
+      -o|--push-option|--receive-pack|--exec|--recurse-submodules) skip=1; continue ;;
       --push-option=*|--receive-pack=*|--exec=*) continue ;;
       --force|--force-with-lease|--force-with-lease=*|--force-if-includes) forced=1; continue ;;
       --all|--branches|--mirror) wide=1; continue ;;

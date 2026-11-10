@@ -236,6 +236,7 @@ class OneRule(unittest.TestCase):
         self.refused(["push", "--repo=../r.git", "origin", "main"])   # git takes the positional word: origin
         self.refused(["push", "--repo", "../r.git", "origin", "main"])
         self.refused(["push", "origin", ":"])   # the matching push
+        self.refused(["push", "--recurse-submodules", "check", "origin", "main"])   # the option takes the next word as its value
         self.passed(["push", "--repo=../r.git", "feature-x"])
         # -C is followed: from a directory that is no repository the guard reads the repository it names
         r = self.run_guard(["-C", self.repo, "push", "origin", "main"], cwd=self.d)
