@@ -103,22 +103,25 @@ class TestLandText(unittest.TestCase):
             self.assertTrue(sent, repo)
             self.assertEqual(len([l for l in "\n".join(sent).splitlines() if "spire land" in l]), expect, repo)
 
+    OLD_LINE = "- This repository lands with `spire land`: when done, commit, run `.spire/tool/bin/spire land` and report `landed <sha>`, or the exit code and what stopped it; exit 22 = held for a person: stop and say so.\n"   # the launch line before this fix
+
     def test_the_launch_text_runs_land_detached_and_never_in_the_foreground(self):
         text = "\n".join(self.lines("janus-infra/widget", ON))
         self.assertEqual(self.foreground_forms(text), [], "a foreground `spire land` run is the form that ends the turn")
-        self.assertIn("nohup .spire/tool/bin/spire land > /work/land.log 2>&1", text)
+        self.assertIn("nohup sh -c '.spire/tool/bin/spire land > /work/land.log 2>&1;", text)
         self.assertIn("sleep 120; tail -n 20 /work/land.log", text)
         self.assertIn("land step", text)
 
-    def test_control_the_foreground_form_of_the_old_text_is_caught(self):
-        old = "- This repository lands with `spire land`: when done, commit, run `.spire/tool/bin/spire land` and report `landed <sha>`, or the exit code."
-        self.assertNotEqual(self.foreground_forms(old), [])
-        self.assertEqual(self.foreground_forms("run it DETACHED: `(nohup .spire/tool/bin/spire land > /work/land.log 2>&1) &`"), [])
+    def test_control_the_old_launch_line_through_the_real_path_is_caught(self):
+        with mock.patch.object(fpn.sb, "LAND_SETUP_LINE", self.OLD_LINE):
+            text = "\n".join(self.lines("janus-infra/widget", ON))
+        self.assertNotEqual(self.foreground_forms(text), [])
+        self.assertNotIn("nohup", text)
 
     @staticmethod
     def foreground_forms(text):
-        """Every use of the spire land command not detached to a log (not `nohup ... spire land > log`)."""
-        return [m.group(0) for m in re.finditer(r".{0,6}\.spire/tool/bin/spire land(?! > /work/land\.log)", text) if "nohup" not in m.group(0)]
+        """Every use of `spire land` that is not the detached command (`spire land > /work/land.log`) and not the prose name `spire land`."""
+        return re.findall(r"\.spire/tool/bin/spire land(?! > /work/land\.log)", text)
 
     def test_the_skills_and_the_brief_header_carry_the_rule(self):
         line = fpn.sb.LAND_SETUP_LINE
@@ -127,7 +130,9 @@ class TestLandText(unittest.TestCase):
             text = (ROOT / path).read_text()
             self.assertIn(".spire/tool/bin/spire land", text, path)
             self.assertIn("exit 22 = held for a person: stop and say so", text, path)
-            self.assertIn("nohup .spire/tool/bin/spire land > /work/land.log 2>&1", text, path)
+            self.assertIn("nohup sh -c '.spire/tool/bin/spire land > /work/land.log 2>&1;", text, path)
+            self.assertIn(line.split("commit, ", 1)[1].rsplit(".\n", 1)[0], text, path)   # the step is the launcher's own, word for word (no drift)
+            self.assertNotRegex(text, r"\b(\w+), \1,", path)
             self.assertEqual(self.foreground_forms(text), [], path)
             self.assertIn("This repository lands with `spire land`", text, path)   # tied to the launcher's own marker
         self.assertIn(".spire/tool/bin/spire land", line)
