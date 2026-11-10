@@ -81,10 +81,6 @@ class Refused(Base):
             with self.subTest(value=value[-12:]):
                 self.write({"CW_AZURE_CONFIG_DIR": value})
                 env = {"AZURE_CONFIG_DIR": self.caller_dir}
-                if value == "":   # an empty value counts as not set, as for every setting: nothing changes
-                    cw.apply_settings(env, self.path)
-                    self.assertEqual(env["AZURE_CONFIG_DIR"], self.caller_dir)
-                    continue
                 with self.assertRaises(cw.CloudError) as caught:
                     cw.apply_settings(env, self.path)
                 text = str(caught.exception)

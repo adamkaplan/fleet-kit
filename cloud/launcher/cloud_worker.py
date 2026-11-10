@@ -5345,6 +5345,8 @@ def apply_settings(env=None, path=None):
     if text is None:
         return "environment"
     values = parse_settings(text, path)
+    if re.search(r"^[ \t]*CW_AZURE_CONFIG_DIR=[ \t]*$", text, re.M):   # an empty value counts as not set elsewhere; for this one it is refused (ask #2335: it would silently keep the caller's sign-in)
+        raise _bad(path, "sets CW_AZURE_CONFIG_DIR to nothing: it must be an absolute path of an existing directory")
     part = [k for k in STACK_REGISTRY_KEYS if k in values]
     if part and len(part) != len(STACK_REGISTRY_KEYS):   # all three or none (parse_settings judges one value at a time)
         raise _bad(path, "sets %s but not %s: the stack registry settings are all three or none" % (", ".join(part), ", ".join(k for k in STACK_REGISTRY_KEYS if k not in values)))
