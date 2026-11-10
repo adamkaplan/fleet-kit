@@ -1,5 +1,5 @@
 # The Copilot bridge (ask #2341): one Deployment (1 replica: copilot-api 0.7.0 on the loopback plus the policy front), a ClusterIP Service
-# (the front's port only) and a NetworkPolicy that admits only the fleet's worker pods. Image: cloud/copilot-bridge/Dockerfile.
+# (the front's port only) and a NetworkPolicy that admits only the cluster's worker pods. Image: cloud/copilot-bridge/Dockerfile.
 # NO Secret value is here. The owner's steps are in cloud/README.md ("The Copilot bridge"): create the Secret copilot-github-token (key
 # github_token) from the vault, build and push the image, replace IMAGE_PLACEHOLDER with name@sha256:..., apply this file, set CW_COUNCIL_URL.
 # The bridge binds the loopback only: copilot-api has no bind option and listens on every interface by default, so the entrypoint sets
@@ -50,7 +50,7 @@
         "containers": [
           {
             "name": "bridge",
-            "image": "registry.invalid/fleet/copilot-bridge:IMAGE_PLACEHOLDER",
+            "image": "registry.invalid/cw/copilot-bridge:IMAGE_PLACEHOLDER",
             "command": [
               "/app/entrypoint.sh"
             ],
