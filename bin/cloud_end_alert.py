@@ -236,7 +236,7 @@ def push_reader(audit_path, parse):
     return read
 
 
-def head_line(record_dir, repo, head_checks, parse, pushed=None):
+def head_line(record_dir, repo, head_checks, parse, pushed=None, worker=None):
     """#2267: the last head the pod pushed (branch, short sha) and its check state; `head_checks(repo, sha)` is handed in (this module reads no network).
     `pushed` is the pod's newest own push (branch, sha) from the switchboard audit: used when the end hook found nothing or no head."""
     run = read_small(os.path.join(record_dir, "run.json"), parse) if record_dir else None
@@ -250,7 +250,7 @@ def head_line(record_dir, repo, head_checks, parse, pushed=None):
     branch = hook.get("head_on") if isinstance(hook, dict) else None
     sha = run.get("head_sha") if isinstance(run, dict) else None
     wip = hook.get("wip_branch") if isinstance(hook, dict) and branch is None else None
-    if clean_branch(wip) and pushed and pushed != UNPROVEN and not pushed[0].endswith("/wip"):
+    if clean_branch(wip) and pushed and pushed != UNPROVEN and pushed[0] != "%s/wip" % worker:
         return finish_head(repo, pushed[0], pushed[1], head_checks)   # a real push of the pod beats the wip save
     if clean_branch(wip):
         if not (isinstance(sha, str) and FULL_SHA.fullmatch(sha)):
@@ -331,7 +331,7 @@ def scan_audit(audit_file, state_file, cloud_dir, last_reports, send, parse, aud
                 own = last_push(worker) if last_push is not None else None
             except Exception:
                 own = None   # fail mode: no own push is known, the line says what the end hook shows (as before this reader)
-            text += " " + head_line(raw_dir(reason) if name else "", (record or {}).get("repo"), head_checks, parse, own)
+            text += " " + head_line(raw_dir(reason) if name else "", (record or {}).get("repo"), head_checks, parse, own, worker)
         keys.append(key)
         to_list = [CHIEF] + ([boss] if isinstance(boss, str) and AGENT_NAME.fullmatch(boss) and boss != CHIEF else [])
         boss_text = text

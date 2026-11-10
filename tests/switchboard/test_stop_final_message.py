@@ -979,6 +979,18 @@ class TestEndNoticeOwnPushes(unittest.TestCase):
         self.assertIn("Last head: feat/real@bbbbbbbb", text)
         self.assertNotIn("cb-own35/wip", text.split("Last head:")[1])
 
+    def test_the_hooks_wip_does_not_hide_a_real_push_named_wip(self):
+        path = self.audit_with(self.born("cb-own38"), self.sent("cb-own38", "feat/wip", self.SHA))
+        hook = {"pushed": True, "wip_branch": "cb-own38/wip", "head_on": None}
+        self.assertIn("Last head: feat/wip@bbbbbbbb", self.world("cb-own38", hook, path, head_sha="e" * 40))
+
+    def test_the_hooks_head_wins_over_a_later_wip_push_and_a_push_wins_over_a_pr_note(self):
+        path = self.audit_with(self.born("cb-own39"), self.sent("cb-own39", "cb-own39/wip", "e" * 40))
+        self.assertIn("Last head: feat/x@", self.world("cb-own39", self.PUSHED, path, head_sha=self.SHA))
+        path = self.audit_with(self.born("cb-own50"), self.sent("cb-own50", "feat/real", self.SHA))
+        hook = dict(self.NOTHING, pr_note="PR #7 marked ready, review requested")
+        self.assertIn("Last head: feat/real@bbbbbbbb", self.world("cb-own50", hook, path))
+
     def test_a_creation_after_a_wip_save_starts_a_new_pod(self):
         path = self.audit_with(self.sent("cb-own36", "cb-own36/wip", "e" * 40), self.born("cb-own36"))
         self.assertIn("Last head: nothing pushed.", self.world("cb-own36", self.NOTHING, path))
