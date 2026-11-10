@@ -2926,6 +2926,7 @@ def render_pod(a, worker, name, now, hard, env, run_names=()):
     comment = review_comment(a.repo)
     if comment:   # the repository's review comment, posted once by the end hook; none configured = no variable
         e["CW_REVIEW_COMMENT"] = comment
+    if (env.get("CW_COUNCIL_URL") or "").strip(): e["COUNCIL_MODEL_URL"] = env["CW_COUNCIL_URL"].strip()   # ask #2341: an address only, never a key; unset adds nothing
     agent = getattr(a, "agent", None) or "worker"
     if agent not in AGENTS:
         raise CloudError("--agent must be one of %s, got %r; nothing was created" % (" or ".join(AGENTS), str(agent)[:40]), EXIT_USAGE)
@@ -5099,6 +5100,7 @@ SETTINGS = (
     ("CW_VAULT_BLOCK_DURATION", False, "duration"),   # how long the launcher refuses vault commands after a vault firewall refusal (default 10m, 1m to 60m)
     ("CW_SECRET_DIR", False, "path"),               # the private directory (0700, under the home) of 0600 files named as the vault's secrets; the vault reads then read the files, no az
     ("CW_AZURE_CONFIG_DIR", False, "path"),        # the az sign-in directory every vault read of a launch uses (replaces the caller's AZURE_CONFIG_DIR); an absolute existing directory
+    ("CW_COUNCIL_URL", False, "name"),             # the address of the Copilot bridge front (cloud/k8s/copilot-bridge.yaml) a worker pod is told as COUNCIL_MODEL_URL; an address, never a key
 )
 SETTING_KINDS = {name: kind for name, _, kind in SETTINGS}
 SETTING_REQUIRED = tuple(name for name, required, _ in SETTINGS if required)
@@ -5272,6 +5274,7 @@ VALIDATORS = {
     "CW_VAULT_BLOCK_DURATION": ("a duration of 1 to 3 digits and m or h, from 1m to 60m (for example 10m or 1h)", _duration_ok),
     "CW_SECRET_DIR": ("an absolute path of a directory under the home directory, with no .. segment", lambda v: _secret_files().dir_ok(v)),
     "CW_AZURE_CONFIG_DIR": ("an absolute path of an existing directory, with no .. segment", _dir_ok),
+    "CW_COUNCIL_URL": ("an http or https URL: a host, an optional port, an optional /v1, no user, query or fragment", lambda v: bool(re.fullmatch(r"https?://[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?(?::[0-9]{1,5})?(?:/v1)?", v))),
 }
 _SETTING_LINE = re.compile(r"([A-Z][A-Z0-9_]*)=(.*)")
 
