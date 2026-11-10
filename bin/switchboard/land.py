@@ -16,6 +16,8 @@ def uses_spire_land(config, repo):
         return False
     raw = (config or {}).get(LAND_REPOS_KEY) if isinstance(config, dict) else None
     entries = LAND_REPOS_DEFAULT if raw is None else raw
+    if not isinstance(entries, (list, tuple)) or len(entries) > LAND_REPOS_MAX or not all(isinstance(e, str) and _LAND_ENTRY.fullmatch(e) for e in entries):
+        entries = LAND_REPOS_DEFAULT   # the launch text's rule: a malformed value fails to the default, never to nobody (the loader refuses it first)
     if not isinstance(entries, (list, tuple)):
         return False
     owner, _, name = repo.lower().partition("/")
@@ -39,3 +41,17 @@ def validate_land_repos(config, source):
         return
     if not isinstance(raw, list) or len(raw) > LAND_REPOS_MAX or not all(isinstance(r, str) and _LAND_ENTRY.fullmatch(r) for r in raw):
         raise ConfigError("%s: 'land_repos' must be a list of at most %d \"owner/repo\" or \"owner/*\" names (an empty list puts every repository on pull requests), got %r" % (source, LAND_REPOS_MAX, raw))
+
+
+# ---- the launch text (this branch): the one landing line a launch for a land repository carries
+LAND_SETUP_LINE = ("- This repository lands with `spire land`: when done, commit, run `.spire/tool/bin/spire land` and report `landed <sha>`, "
+                   "or the exit code and what stopped it; exit 22 = held for a person: stop and say so.\n")
+
+
+def setup_with_land(preamble, config, repo):
+    """The setup text of a launch: for a land repository the one landing line goes before `Task:`; for any other repository the text is returned unchanged."""
+    marker = "\nTask:\n"
+    if not uses_spire_land(config, repo) or marker not in preamble:
+        return preamble
+    head, _, tail = preamble.rpartition(marker)
+    return head + LAND_SETUP_LINE + marker + tail

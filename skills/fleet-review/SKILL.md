@@ -57,3 +57,7 @@ If you were asked to review a pull request rather than to author one, you are th
 A reviewer's result reaches GitHub as a review through `fleet-switchboard review post <PR> --head <full head> --verdict approve|request-changes|comment --body-file FILE` (one review, ending with the reader's marker; on the same account's own pull request a refused verdict becomes a comment-type review), and its own blocking review is cleared with `fleet-switchboard review dismiss <PR> --review ID --reason TEXT` (it re-reads the cited line at the current head first; a body-only block or a line it cannot re-check needs `--withdraw`, your explicit statement that you withdraw the finding; never put a `from=` marker in a body: it is refused). Do not use the bare GitHub reviews command. A cloud reader can use both once its token allows it.
 
 A test never pins an exact set or size (an argument list, environment names, settings, flags, file sizes, line or word counts, or any set a normal change grows): it checks behaviour and real safety properties (no secret in an output, no untrusted interpolation, a required item present). A reviewer flags such a test and never asks for one.
+
+## janus-infra repositories (spire land)
+
+When your setup text says "This repository lands with `spire land`" do not run the reviewer subagents: done = commit, run `.spire/tool/bin/spire land`, report `landed <sha>` or the exit code; exit 22 = held for a person: stop and say so. The council is the review there, and no PR body or explainer is written. Without that line, the rules of this skill stay.
