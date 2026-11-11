@@ -462,6 +462,8 @@ END_LOG_LINES = 20       # the last lines of /work/land.log that are posted
 END_LOG_CHARS = 2000     # and at most this many characters of them
 END_POST_CHARS = 6000    # the whole comment
 RUN_JSON_MAX = 1 << 20
+KEY_BEGIN = re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")
+KEY_END = re.compile(r"-----END [A-Z ]*PRIVATE KEY-----")
 
 
 def _run_record_dir(directory, pod):
@@ -498,9 +500,24 @@ def land_log_tail(directory, pod):
         if not isinstance(tail, str) or not tail.strip():
             return None
         scrub = D["_scrub_lib"]()
-        text = D["redact_command_text"](tail[-LAST_SCRUB_MAX:])   # the whole text first (a key block spans lines), then the cut
-        lines = [re.sub(r"[^\x20-\x7e]", "?", scrub(line, (), LAST_SCRUB_MAX)).replace("`", "'") for line in text.splitlines()[-END_LOG_LINES:]]   # per line: the scrub flattens a newline
-        return "\n".join(lines)[-END_LOG_CHARS:] or None
+        text = tail[-LAST_SCRUB_MAX:]
+        for _ in range(21):   # the pod's own endpoint address is removed as in last_message (a rebuilt one too)
+            stripped = _remove_hosts(text)
+            changed, text = stripped != text, stripped
+            if not changed:
+                break
+        else:
+            return None
+        end = KEY_END.search(text)
+        if end and not KEY_BEGIN.search(text[:end.start()]):
+            text = "[redacted key body]" + text[end.end():]   # a key block whose first line was clipped away: all of it up to its end marker goes
+        text = D["redact_command_text"](text)   # the whole text first (a key block spans lines), then the cut
+        lines = text.splitlines()[-END_LOG_LINES:]
+        lines = [re.sub(r"[^\x20-\x7e]", "?", scrub(line, (), LAST_SCRUB_MAX)).replace("`", "'") for line in lines]   # per line: the scrub flattens a newline
+        out = "\n".join(lines)
+        if len(out) > END_LOG_CHARS:
+            out = out[-END_LOG_CHARS:].split("\n", 1)[-1]   # whole lines only: a token is never cut into an unrecognisable suffix
+        return out or None
     except Exception:
         return None
 

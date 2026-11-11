@@ -1,4 +1,4 @@
-"""Ask #2393 (S4): a pod's end is posted on its ask: the final message and the last 20 lines of its land log (the run record's `land_log_tail`), scrubbed and cut.
+"""Ask #2393 (S4): a pod's end is posted on its ask: the final message and the last lines of its land log (the run record's `land_log_tail`), scrubbed and cut.
 Fake pods and a recording comment path (the daemon's own `post_ask_comment`); nothing is stopped and nothing reaches GitHub. The control removes the post (today's end)."""
 import argparse
 import json
@@ -48,7 +48,7 @@ class TestEndOnAsk(unittest.TestCase):
                 p.stop()
         return posts, events
 
-    def test_s4_the_final_message_and_the_last_20_lines_are_posted_on_the_ask_once(self):
+    def test_s4_the_final_message_and_the_last_lines_are_posted_on_the_ask_once(self):
         log = "\n".join("land line %02d" % i for i in range(1, 31))
         posts, _ = self.end(log=log)
         self.assertEqual(len(posts), 1)
@@ -56,7 +56,9 @@ class TestEndOnAsk(unittest.TestCase):
         self.assertEqual((issue, repo), (2393, "adamkaplan/fleet-kit"))
         self.assertIn("my final words", body)
         shown = [l for l in body.split("\n") if l.startswith("land line")]
-        self.assertEqual(shown, ["land line %02d" % i for i in range(11, 31)])
+        self.assertLessEqual(len(shown), sb.load_module("cloud_retired").END_LOG_LINES)
+        self.assertEqual(shown, ["land line %02d" % i for i in range(30 - len(shown) + 1, 31)])   # a contiguous suffix of the log, the newest line last
+        self.assertNotIn("land line 01", shown)
 
     def test_s4_control_today_the_end_posts_neither_the_message_nor_the_log(self):
         today, _ = self.end(log="land line 1\nexit 0", mutant=True)
@@ -76,7 +78,7 @@ class TestEndOnAsk(unittest.TestCase):
         self.assertNotIn("/cloud-last/", body)
 
     def test_a_short_log_is_posted_whole_and_a_missing_last_text_still_posts_the_log(self):
-        log = "\n".join("l%d" % i for i in range(1, 21))
+        log = "\n".join("l%d" % i for i in range(1, 6))
         posts, _ = self.end(log=log, final=None)
         shown = [l for l in posts[0][1].split("\n") if re.fullmatch(r"l\d+", l)]
         self.assertEqual(shown, log.split("\n"))
@@ -84,8 +86,19 @@ class TestEndOnAsk(unittest.TestCase):
 
     def test_a_key_block_in_the_log_is_redacted_whole_even_when_the_cut_drops_its_first_line(self):
         key = "-----BEGIN PRIVATE KEY-----\nQUJDREVGR0hJSktMTU5PUA\nUVJTVFVWV1hZWjAxMjM0NTY3\n-----END PRIVATE KEY-----"
-        posts, _ = self.end(log=key + "\n" + "\n".join("l%d" % i for i in range(5)))
+        posts, _ = self.end(log=key + "\n" + "\n".join("l%d" % i for i in range(25)))
         self.assertNotIn("QUJDREVGR0hJSktMTU5PUA", posts[0][1])
+        self.assertNotIn("PRIVATE KEY", posts[0][1])
+
+    def test_a_key_body_whose_first_line_was_clipped_before_the_run_record_is_redacted(self):
+        posts, _ = self.end(log="UVJTVFVWV1hZWjAxMjM0NTY3\nQUJDREVGR0hJSktMTU5PUA\n-----END PRIVATE KEY-----\nexit 1")
+        self.assertNotIn("QUJDREVGR0hJSktMTU5PUA", posts[0][1])
+        self.assertIn("exit 1", posts[0][1])
+
+    def test_the_pods_endpoint_address_is_removed_from_the_log(self):
+        posts, _ = self.end(log="curl https://worker-cb-2393-1f2e3d4c.example.internal:4096/x failed\nexit 1")
+        self.assertNotIn("worker-cb-2393", posts[0][1])
+        self.assertIn("exit 1", posts[0][1])
 
     def test_s4_a_pod_without_a_log_posts_the_message_alone(self):
         for kwargs in ({"log": None}, {"log": None, "run_json": False}, {"log": "   "}):

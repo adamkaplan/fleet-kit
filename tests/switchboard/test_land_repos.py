@@ -252,13 +252,16 @@ class TestLandCompletion(Case):
         self.run_pass(NOW + 60)
         self.assertEqual(len(self.reports), 1)
 
-    def test_a_land_worker_trailer_naming_a_pod_credits_it_not_without_its_own_proof(self):
+    def test_a_land_worker_trailer_alone_does_not_credit_a_pod(self):
         self.engine.cloud_watch = {"records": [record("w-a", "lane-a", "janus-infra/widget"), record("w-ab", "lane-b", "janus-infra/widget")]}
         self.launcher_line(worker="w-ab", action="create")
         self.ns.reported_text = lambda worker: None   # ask #2393: no pod owns it; the message naming w-ab is no proof
         self.main = [self.land(SHA, "x\n\nLand-worker: w-ab")]
         self.run_pass(NOW)
         self.assertEqual(self.reports, [])
+        self.ns.reported_text = lambda worker: "landed %s" % SHA if worker == "w-ab" else None   # the control: the same world with the pod's own proof
+        self.run_pass(NOW + 60)
+        self.assertEqual([r[0] for r in self.reports], ["w-ab"])
 
     def test_the_daemons_own_tick_gives_the_push_watch_the_land_reader(self):
         sb = SourceFileLoader("sb_land_tick", str(REPO / "bin" / "fleet-switchboard")).load_module()

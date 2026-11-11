@@ -103,7 +103,7 @@ class TestLandAttribution(Case):
         self.assertEqual((len(self.reports), self.said()), (1, []))
 
     def test_a_sibling_pods_own_commit_is_not_told_as_someone_elses_in_any_order_or_pass(self):
-        for owner, other, lane in (("w-a", "w-b", "lane-b"), ("w-b", "w-a", "lane-a")):
+        for owner, other in (("w-a", "w-b"), ("w-b", "w-a")):
             self.setUp()
             self.engine.cloud_watch = {"records": [record("w-a", "lane-a", RAW), record("w-b", "lane-b", RAW)]}
             self.launcher_line(worker="w-b", action="create")
@@ -113,10 +113,18 @@ class TestLandAttribution(Case):
                 self.run_pass(NOW + 60 * step)
             self.assertEqual([r[0] for r in self.reports], [owner])
             self.assertEqual(self.said(), [], "%s's boss was told of someone else's landing" % other)
-        self.setUp()   # the control: only the pod that does not own it watches: the line is said
-        self.ns.reported_text = lambda worker: None
+        self.setUp()   # the control: today's marking of a credited commit removed: the sibling's boss is told of someone else's landing
+        text = (REPO / "bin" / "push_watch.py").read_text()
+        old = 'state["land_said"] = (state.get("land_said", []) + older + [sha])[-TOLD_MAX * 4:]'
+        assert old in text
+        module = types.ModuleType("pw_nomark")
+        exec(compile(text.replace(old, "pass", 1), "push_watch.py", "exec"), module.__dict__)
+        self.engine.cloud_watch = {"records": [record("w-a", "lane-a", RAW), record("w-b", "lane-b", RAW)]}
+        self.launcher_line(worker="w-b", action="create")
+        self.ns.reported_text = lambda worker: "landed %s" % FOREIGN[0] if worker == "w-b" else None
         self.main = [land(FOREIGN[0])]
-        self.run_pass(NOW)
+        for step in range(3):
+            self.run_pass(NOW + 60 * step, module)
         self.assertEqual(len(self.said()), 1)
 
     def test_three_foreign_commits_are_three_lines_one_each_and_the_own_is_not_called_someone_elses(self):
