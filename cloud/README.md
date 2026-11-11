@@ -160,7 +160,7 @@ Its output differs from the real `gh`: `--json` prints the raw REST object and `
 Everything else exits 2 with `cw-gh: '<verb>' is not available in this pod` (the client has no code for it; nothing refuses first):
 
 - `gh issue create`, `gh issue edit`, `gh issue close`, `gh issue comment` and the rest of `gh issue` writes: the token has no issues permission (comments on a pull request are `gh pr comment`).
-- `gh pr merge`, `gh pr review`, `gh pr close, `gh pr reopen`, `gh pr update-branch`: not covered by the client .
+- `gh pr merge`, `gh pr review`, `gh pr close`, `gh pr reopen`, `gh pr update-branch`: not covered by the client. `gh pr edit` covers the body only (`gh pr edit N --body-file F`); the title, base, labels, reviewers and assignees are not covered.
 - `gh label ...`, `gh release ...`, `gh workflow ...`, `gh run rerun` and `gh run cancel`.
 - `gh repo edit`, `gh repo clone`, `gh repo create` and every other `gh repo` verb except `view`; `gh secret ...`, `gh variable ...`, `gh ruleset ...`, `gh deploy-key ...`.
 - `gh extension ...`, `gh alias ...`, `gh config ...`, `gh auth ...`, `gh codespace ...`, `gh gist ...`, `gh search ...`, `gh project ...` and the rest of the real `gh`.
