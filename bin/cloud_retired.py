@@ -448,6 +448,8 @@ def _last_worker_text_at(directory, ident):
 
 NOTES_LINES = 20       # ask #2426: the last lines of the pod's notes file that go with the final message
 NOTES_CHARS = 2000     # and at most this many characters of them (whole lines)
+_NOTES_KEY_BEGIN = re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")
+_NOTES_KEY_END = re.compile(r"-----END [A-Z ]*PRIVATE KEY-----")
 
 
 def pod_notes_tail(directory):
@@ -468,11 +470,15 @@ def pod_notes_tail(directory):
         else:
             return None
         scrub = D["_scrub_lib"]()
+        end = _NOTES_KEY_END.search(text)
+        if end and not _NOTES_KEY_BEGIN.search(text[:end.start()]):
+            text = "[redacted key body]" + text[end.end():]   # a key block whose first line was cut away: all of it up to its end marker goes
         text = D["redact_command_text"](text)
-        lines = [re.sub(r"[^\x20-\x7e]", "?", scrub(line, (), LAST_SCRUB_MAX)).replace("`", "'") for line in text.splitlines()]
+        lines = [re.sub(r"[^\x20-\x7e]", "?", scrub(line, (), LAST_SCRUB_MAX)).replace("`", "'").replace("@", "(at)") for line in text.splitlines()]   # no mention can fire
         out = "\n".join(lines)
         if len(out) > NOTES_CHARS:
-            out = out[-NOTES_CHARS:].split("\n", 1)[-1]
+            cut = out[-NOTES_CHARS:]
+            out = cut.split("\n", 1)[1] if "\n" in cut else ""   # whole lines only: a token is never cut into an unrecognisable suffix
         return out if out.strip() else None
     except Exception:
         return None

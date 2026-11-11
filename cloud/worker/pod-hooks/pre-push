@@ -72,6 +72,9 @@ NOTES_KEEP_LINES=200
 
 note() {   # $1 kind, $2 ref, $3 sha
   (
+    # the pod owns /work: a link or a FIFO at the path is left alone (a write to a FIFO would block the push), nothing is recorded then
+    [ ! -L "$NOTES_LOG" ] || exit 0
+    if [ -e "$NOTES_LOG" ] && [ ! -f "$NOTES_LOG" ]; then exit 0; fi
     r=$(printf '%s' "${REMOTE_NAME:-}" | cut -c1-40)
     case "$r" in ""|*[!A-Za-z0-9._-]*) r="-" ;; esac
     ref=$(printf '%s' "$2" | tr -c 'A-Za-z0-9._/-' '?' | cut -c1-100)

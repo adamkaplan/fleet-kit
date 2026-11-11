@@ -488,6 +488,17 @@ class TestPodNotesInTheFinalMessage(Retired):
             self.assertIsNone(self.part.pod_notes_tail(rec))
         self.assertIsNone(self.part.pod_notes_tail(self.runs / "nothing"))
 
+    def test_a_mention_a_clipped_key_block_and_one_overlong_line_are_neutralised(self):
+        body = "A" * 64
+        text = (body + "\n-----END RSA PRIVATE KEY-----\n2026-11-10T10:00:00Z note @acme-org/reviewers [x](https://example.invalid) <img src=x>\n"
+                + "2026-11-10T10:01:00Z default-branch-push origin refs/heads/main aaaaaaaaaa\n")
+        tail = self.part.pod_notes_tail(self.record_with(text))
+        self.assertNotIn("@", tail)
+        self.assertIn("(at)acme-org/reviewers", tail)
+        self.assertNotIn(body, tail)
+        self.assertIn("default-branch-push", tail)
+        self.assertIsNone(self.part.pod_notes_tail(self.record_with("word " * self.part.NOTES_CHARS)), "one line longer than the clip: nothing partial is shown")
+
     def test_the_control_without_the_reader_call_posts_no_notes(self):
         src = (BIN / "cloud_retired.py").read_text()
         call = "        notes = pod_notes_tail(directory)"

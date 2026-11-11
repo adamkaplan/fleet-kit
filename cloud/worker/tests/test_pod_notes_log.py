@@ -134,6 +134,19 @@ class Hook(unittest.TestCase):
             r = self.run_hook([self.push("main", self.c2, self.c1)], env=env)
             self.assertEqual((r.returncode, r.stdout, r.stderr), (7, "", ""), path)   # the repository's own hook still decides
 
+    def test_a_fifo_or_a_link_at_the_notes_path_neither_blocks_nor_is_followed(self):
+        fifo = os.path.join(self.d, "fifo")
+        os.mkfifo(fifo)
+        target = os.path.join(self.d, "target")
+        with open(target, "w") as f:
+            f.write("keep\n")
+        link = os.path.join(self.d, "link")
+        os.symlink(target, link)
+        for path in (fifo, link):
+            r = self.run_hook([self.push("main", self.c2, self.c1)], env=dict(self.env, CW_NOTES_LOG=path))   # a blocked write would end in the 30 s timeout
+            self.assertEqual((r.returncode, r.stdout, r.stderr), (0, "", ""), path)
+        self.assertEqual(read(target), "keep\n")
+
     def test_s3_mutant_that_fails_the_push_on_a_log_error_is_caught(self):
         text = read(HOOK)
         p = os.path.join(self.d, "mutant-s3")
@@ -224,6 +237,30 @@ class Gh(unittest.TestCase):
 
     def test_s4_a_merge_and_a_ref_or_issue_write_are_each_recorded(self):
         self.check_s4()
+
+    def test_s4_the_other_spellings_of_the_same_calls_are_recorded(self):
+        r = "repos/acme-org/widget-service"
+        for args, kind in (
+            (("api", "-XPUT", r + "/pulls/7/merge"), "api-merge"),
+            (("api", "-iX", "PUT", r + "/pulls/7/merge"), "api-merge"),
+            (("api", "--method=POST", r + "/git/refs"), "ref-write"),
+            (("api", "--field=body=hi", r + "/issues/3/comments"), "issue-write"),
+            (("api", "-fbody=hi", r + "/issues/3/comments"), "issue-write"),
+            (("api", "https://api.github.com/" + r + "/git/refs", "-X", "POST"), "ref-write"),
+            (("pr", "merge", "--repo=acme-org/widget-service", "7"), "pr-merge"),
+            (("pr", "-R", "acme-org/widget-service", "merge", "7"), "pr-merge"),
+        ):
+            before = len(self.lines())
+            self.gh(*args)
+            got = self.lines()
+            self.assertEqual(len(got), before + 1, args)
+            self.assertEqual(got[-1].split()[1], kind, args)
+
+    def test_s4_a_fifo_at_the_notes_path_does_not_block_the_call(self):
+        fifo = os.path.join(self.d, "fifo-gh")
+        os.mkfifo(fifo)
+        r = self.gh("pr", "merge", "7", log=fifo)   # a blocked open ends in the 30 s timeout
+        self.assertIn("not available", r.stderr)
 
     def test_s4_reads_and_other_verbs_are_not_recorded_and_the_answer_is_unchanged(self):
         for args in (("api", "repos/acme-org/widget-service/pulls/7"), ("api", "-X", "GET", "repos/acme-org/widget-service/issues/3/comments"),
