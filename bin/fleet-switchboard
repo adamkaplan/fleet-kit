@@ -10154,6 +10154,21 @@ def pick_owner(agents, numbers, repo=None, default_repo=None, view=None):
 
 # ------------------------------------------------------------------- the hub
 
+def red_ci_lane(hub, repo, pr, now):
+    """Ask #2392: the live owner of a pull request's ask, or None: the router's own links (the issue it closes, a notice, a reference: an orchestrator lane or a worker), else a
+    worker whose record's --branch is the pull request's head branch and that is discovered live. A read that fails raises (the caller keeps the alert)."""
+    agents = (getattr(hub.engine, "discovery", None) or types.SimpleNamespace(agents={})).agents
+    item = _pr_item(repo, pr, now)
+    owner = hub.owner_of(item, agents, now) if item is not None else None
+    if owner:
+        return owner
+    ref = ((pr or {}).get("head") or {}).get("ref") if isinstance(pr, dict) else None
+    for rec in ((getattr(hub.engine, "cloud_watch", None) or {}).get("records") or []) if isinstance(ref, str) else []:
+        if isinstance(rec, dict) and rec.get("repo") == repo and rec.get("branch") == ref and rec.get("worker") in agents:
+            return rec["worker"]
+    return None
+
+
 class GitHubUnavailable(Exception):
     """A `gh api` read that did not answer; the caller tries again later."""
 
@@ -11547,18 +11562,7 @@ class GitHubHub:
                 items.append(_check_item(repo, run, now, "run-", "workflow %s" % (run.get("name") or "run")))
         def present_pull(number):   # #1378: the pull request's present head and state, read only for an unowned red run not yet told
             return self.present_record(repo, "pulls", number)
-        def lane_of(pr):   # ask #2392: the live owner of the pull request's ask: the router's own links (closing issue, notice, reference), else a worker whose --branch is its head
-            agents = (getattr(self.engine, "discovery", None) or types.SimpleNamespace(agents={})).agents
-            item = _pr_item(repo, pr, now)
-            owner = self.owner_of(item, agents, now) if item is not None else None
-            if owner:
-                return owner
-            ref = ((pr or {}).get("head") or {}).get("ref") if isinstance(pr, dict) else None
-            for rec in ((getattr(self.engine, "cloud_watch", None) or {}).get("records") or []) if isinstance(ref, str) else []:
-                if isinstance(rec, dict) and rec.get("repo") == repo and rec.get("branch") == ref and rec.get("worker") in agents:
-                    return rec["worker"]
-            return None
-        red_ci_runs(self.engine, repo, [r for r in (found_runs or []) if isinstance(r, dict) and fresh(r)], now, present_pull, lane_of)   # #1141: the same runs
+        red_ci_runs(self.engine, repo, [r for r in (found_runs or []) if isinstance(r, dict) and fresh(r)], now, present_pull, lambda pr: red_ci_lane(self, repo, pr, now))   # #1141: the same runs
         self.last_failed_primary = bool(failed)
         self.last_incomplete = bool(stopped or failed)   # #494: a step is still to do: the caller keeps the cursor and the marker where they are
         items = [item for item in items if item is not None]
