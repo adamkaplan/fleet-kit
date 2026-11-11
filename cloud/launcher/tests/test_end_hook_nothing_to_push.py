@@ -146,12 +146,24 @@ class S7Fetch(Scratch):
     def lines(self, p):
         return [l for l in p.stdout.splitlines() if l.startswith("cw-prestop:")]
 
+    def side_branch_with_unpushed_work(self):
+        """A local branch holding a commit no remote branch has, HEAD back on base (whose commit the remote has). Since #2237 a clean tree
+        whose HEAD is the clone's starting commit is decided with no remote call at all (clean_local); a pod that holds unpushed work elsewhere is
+        not clean, so the fetch is made and the rest of the decision (stale refs, a refused fetch) is what these tests look at."""
+        git(self.work, "checkout", "-q", "-b", "side")
+        with open(os.path.join(self.work, "side.txt"), "w") as f:
+            f.write("s\n")
+        git(self.work, "add", "-A")
+        git(self.work, "commit", "-q", "-m", "side")
+        git(self.work, "checkout", "-q", "base")
+
     def test_a_clean_tree_with_a_working_fetch_says_nothing_to_push(self):
         p = self.prestop()
         print("count (a): attempts=%d lines=%r exit=%d" % (self.attempts(), self.lines(p), p.returncode))
         self.assertEqual((p.returncode, self.attempts(), self.lines(p)), (0, 0, ["cw-prestop: nothing to push"]))
 
     def test_a_refused_fetch_decides_from_local_references_in_one_line(self):
+        self.side_branch_with_unpushed_work()
         os.rename(self.remote, self.remote + ".moved")   # the remote is unreachable: the fetch fails
         p = self.prestop()
         print("count (b): attempts=%d lines=%r exit=%d" % (self.attempts(), self.lines(p), p.returncode))
@@ -159,7 +171,13 @@ class S7Fetch(Scratch):
         self.assertIn("local references", self.lines(p)[0])
         self.assertFalse(os.path.exists(self.log))
 
+    def test_a_clean_tree_at_the_starting_commit_makes_no_remote_call_even_when_the_remote_is_gone(self):
+        os.rename(self.remote, self.remote + ".moved")
+        p = self.prestop()
+        self.assertEqual((p.returncode, self.attempts(), self.lines(p)), (0, 0, ["cw-prestop: nothing to push"]))   # decided locally: no "fetch failed" note
+
     def test_a_stale_remote_tracking_ref_after_the_remote_branch_is_deleted_tries_the_push(self):
+        self.side_branch_with_unpushed_work()
         git(self.remote, "update-ref", "-d", "refs/heads/base")   # deleted after the last fetch: origin/base is STALE
         p = self.prestop()
         print("count (c): attempts=%d exit=%d" % (self.attempts(), p.returncode))
