@@ -10256,7 +10256,7 @@ def spawn_forwarder(argv, log_path, env=None):
 
 def _alive(proc):
     try:
-        return proc.poll() is None
+        return proc is not None and proc.poll() is None
     except Exception:
         return False
 
@@ -11677,7 +11677,7 @@ class GitHubHub:
             if watch.proc is not None and watch.polling and now - watch.started >= self.catchup_delay:
                 with self.lock:  # the forwarder connected: the repo is no longer polled; one read closes the gap
                     watch.polling, watch.poll_reason, watch.catchup_at = False, None, now
-        if watch.proc is not None and watch.proc.poll() is None and not watch.hook_claim_tried and now - (watch.started or now) >= self.catchup_delay:
+        if _alive(watch.proc) and not watch.hook_claim_tried and now - (watch.started or now) >= self.catchup_delay:
             watch.conflicted = False   # it runs past the connect delay: no one else holds the hook
             self._claim_hook(watch)   # the forwarder has connected: its hook exists
         if watch.proc is None and now >= watch.next_start:

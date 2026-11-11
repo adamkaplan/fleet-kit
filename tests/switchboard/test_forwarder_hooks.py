@@ -180,9 +180,13 @@ class TestForwarderHooks(Base):
         self.assertEqual(runner.deleted(), [])
         self.assertTrue(self.refused, "S2 control: the repo is full when the forwarder starts (GitHub answers 422 to its hook)")
         self.assertEqual(len(set(range(1, CAP - 2)) & set(self.hooks_when_started)), len(range(1, CAP - 2)), "S2 control: the stale hooks stay")
-        runner.calls.clear()
+        roomy = HooksRunner([hook(1)])   # room for the forwarder's own hook, as in the S3 test
+        hub = self.start(roomy, clear=False)
+        self.at[0] += sb.GITHUB_CATCHUP_DELAY + 1   # the forwarder has connected
+        roomy.calls.clear()
         hub.stop()
-        self.assertEqual(runner.deleted(), [], "S3 control: a stop removes none")
+        self.assertEqual(roomy.deleted(), [], "S3 control: a stop removes none")
+        self.assertIn(900, [h["id"] for h in roomy.hooks], "S3 control: the forwarder's own hook stays")
         failing = HooksRunner(self.stale_world(), list_error="HTTP 403")
         hub = self.start(failing, clear=False)
         self.assertEqual([a for a in self.audit if a[0] == "github.hooks"], [], "S4 control: no audit line, no note")
