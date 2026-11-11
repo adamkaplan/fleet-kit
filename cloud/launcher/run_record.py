@@ -47,6 +47,7 @@ SECRET_FILES_MAX = 10
 RECORD_SECONDS = 90.0            # the default overall deadline of the record phase (less than half of the 600 s stop)
 RECORD_SECONDS_MAX = 240.0       # the hard maximum: CW_RECORD_SECONDS above it is cut to it
 CHUNK = 64 * 1024
+RESULTS_KEEP = 4000              # bytes of the pod's /work/results.txt kept in run.json (ask #2392)
 TIMED_OUT = "record timed out"
 
 
@@ -321,6 +322,24 @@ class Recorder:
         sha = (out.strip().splitlines() or [""])[0]
         return sha if re.fullmatch(r"[0-9a-f]{40}", sha) else None
 
+    def results_file(self, pod):
+        """{"done": bool, "text": the scrubbed last RESULTS_KEEP bytes} of the pod's /work/results.txt, or None when it has none or cannot be read. `done`: the last
+        non-empty line is exactly `STATUS: done` (the idle nudge's own test). Never raises an Exception."""
+        try:
+            out = self._exec(pod, "tail", "-c", str(RESULTS_KEEP), "/work/results.txt", keep_stdout=True)
+        except RecordTimeout:
+            return None
+        except Exception:
+            return None
+        if not isinstance(out, str) or not out.strip():
+            return None
+        lines = [x.strip() for x in out.splitlines() if x.strip()]
+        try:
+            text = self.kube.scrub(out, limit=2 * RESULTS_KEEP * 4)
+        except Exception:
+            return None
+        return {"done": bool(lines) and lines[-1] == "STATUS: done", "text": text[:RESULTS_KEEP]}
+
     def record(self, worker, pod, reason, repo="", started="", root=None, persistent=False):
         """Save the run's record. Returns the record directory ('' when none could be made). Never raises an Exception."""
         run_id = "%s-%s-%s" % (worker, time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()), secrets.token_hex(3))
@@ -343,6 +362,7 @@ class Recorder:
                     self._write_transcript(directory, msgs, info)
             finally:
                 info["head_sha"] = self.head_sha(pod)
+                info["results"] = self.results_file(pod)   # ask #2392: the pod's /work/results.txt, kept for the end notice and `read` of an ended pod
         except Exception as e:   # includes RecursionError and MemoryError; an interrupt (BaseException) passes through
             try:
                 info["reason"] = "the record could not be written: %s" % self.kube.scrub(e, limit=200)

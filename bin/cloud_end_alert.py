@@ -146,9 +146,20 @@ def valid_pr_note(hook):
     return None
 
 
-def message_text(worker, label, when, pushed, record_name, kept=False, failure=None):
-    text = ("[cloud worker ended] %s was ended by the launcher: reason %s; at %s; %s; run record: %s."
-            % (worker, label, when, pushed, record_name or "unknown"))
+def reported_done(record_dir, parse):
+    """Ask #2392: True when the run record holds the pod's results file and its last non-empty line was exactly `STATUS: done` (a bool the launcher wrote; nothing of the text is read)."""
+    run = read_small(os.path.join(record_dir, "run.json"), parse) if record_dir else None
+    results = run.get("results") if isinstance(run, dict) else None
+    return isinstance(results, dict) and results.get("done") is True
+
+
+def message_text(worker, label, when, pushed, record_name, kept=False, failure=None, done=False):
+    if done:   # a pod that finished and sat idle is not a failure
+        text = ("[cloud worker ended] %s ended idle after reporting done (its results file says STATUS: done); the launcher stopped it at its %s; at %s; %s; run record: %s."
+                % (worker, label, when, pushed, record_name or "unknown"))
+    else:
+        text = ("[cloud worker ended] %s was ended by the launcher: reason %s; at %s; %s; run record: %s."
+                % (worker, label, when, pushed, record_name or "unknown"))
     if kept:
         text += " The end hook could not push: the pod was kept and the work may be unpushed."
     if failure is not None:
@@ -346,7 +357,8 @@ def scan_audit(audit_file, state_file, cloud_dir, last_reports, send, parse, aud
             boss = retired_boss(cloud_dir, worker, parse)   # the live record is gone: the boss the launcher kept at the removal
         name = record_name_of(worker, record_name)
         pushed = pushed_text(raw_dir(reason), parse) if name else "unknown"
-        text = message_text(worker, label, when_text(line.get("ts")), pushed, name, line["ok"] is False)
+        done = bool(name) and cause in ("idle", "hard") and reported_done(raw_dir(reason), parse)
+        text = message_text(worker, label, when_text(line.get("ts")), pushed, name, line["ok"] is False, None, done)
         text += " " + pr_line(raw_dir(reason), parse) + "."
         if head_checks is not None and cause in ("idle", "hard"):
             try:
