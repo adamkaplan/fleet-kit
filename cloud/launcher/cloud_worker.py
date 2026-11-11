@@ -5919,10 +5919,8 @@ def main(argv=None, env=None, clock=None, sleep=time.sleep):
     if not explicit:   # the real process reads the settings file; a caller that passes its own environment has made its own choice
         try:
             pre = {n: env[n] for n, _, _ in SETTINGS if n in env}
-            if apply_settings(env) != "environment":   # only what the file gave is the reaper's to drop later; a caller's own value is not
-                _REAP_APPLIED = {n: env[n] for n, _, _ in SETTINGS if n in env and pre.get(n) != env[n]}
-            else:
-                _REAP_APPLIED = {}
+            apply_settings(env)
+            _REAP_APPLIED = {n: env[n] for n, _, _ in SETTINGS if n in env and pre.get(n) != env[n]}   # only what the file gave is the reaper's to drop later
         except CloudError as e:
             print("cloud-worker: %s" % e, file=sys.stderr)
             return e.code
