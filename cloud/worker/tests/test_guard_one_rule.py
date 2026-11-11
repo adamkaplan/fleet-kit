@@ -53,6 +53,7 @@ class OneRule(unittest.TestCase):
         cls.notrec = cls.commit("notrec", "Land-Checks: not recorded\nLand-Council: strict ok")
         cls.forged = cls.commit("forged", "Land-Checks: x\nLand-Council: y\n\nthe body goes on after the lines above")
         cls.onlyone = cls.commit("onlyone", "Land-Checks: unit 5 of 5")
+        cls.dupempty = cls.commit("dupempty", "Land-Checks: ok\nLand-Council: ok\nLand-Checks:")
         cls.git("branch", "-f", "feature-x")
 
     @classmethod
@@ -100,6 +101,25 @@ class OneRule(unittest.TestCase):
 
     def test_s2_the_land_form_passes_and_the_other_forms_are_refused(self):
         self.check_s2()
+
+    # security re-review of 217292ce: spellings git accepts that the first guard read as something else
+    def test_re_review_option_spellings_and_command_line_config(self):
+        g = self.good
+        u = "https://example.invalid/r.git"
+        for args in (
+            ["push", "--recurse", "on-demand", "origin", "main"], ["push", "--rece", "x", "origin", "main"], ["push", "--exe", "x", "origin", "main"],
+            ["push", "--push-o", "x", "origin", "main"], ["push", "--rep=" + u, "main"], ["push", "--al", "origin"], ["push", "--mir", "origin"],
+            ["push", "-oo", "origin", "main"], ["push", "-vo", "x", "origin", "main"], ["push", "origin", "@"],
+            ["push", "--force-w", "origin", g + ":refs/heads/main"], ["push", "--force-i", "origin", g + ":refs/heads/main"],
+            ["-c", "remote.newr.url=" + u, "push", "newr", "main"], ["-c", "remote.newr.pushurl=" + u, "push", "newr", "main"],
+            ["-c", "remote.localr.pushurl=" + u, "push", "localr", "main"],
+            ["-c", "url." + u + ".insteadOf=/tmp/x.git", "push", "/tmp/x.git", "main"],
+            ["--attr-source", "HEAD", "push", "origin", "main"], ["--super-prefix", "x", "push", "origin", "main"],
+            ["push", "origin", self.dupempty + ":refs/heads/main"],
+        ):
+            self.refused(args)
+        self.passed(["-c", "user.name=x", "push", "-q", "origin", g + ":refs/heads/main"])
+        self.passed(["push", "-o", "x", "--force", "localr", "main"])
 
     # S8
     def test_s8_a_mutant_without_the_one_rule_fails_with_the_anchored_text(self):

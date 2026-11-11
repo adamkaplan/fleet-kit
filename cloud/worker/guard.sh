@@ -46,11 +46,18 @@ is_default() {   # $1: a branch name, refs/heads/ stripped
 
 net_remote() {   # $1: a remote name or URL: success when it is a network remote
   r=$1
+  case "$r" in */*|*:*) w=$("$real_git" ls-remote --get-url "$r" 2>/dev/null) && [ -n "$w" ] && r=$w ;; esac   # a URL or path as written: url.<base>.insteadOf rewrites it
   case "$r" in
     https://*|http://*|ssh://*|git://*) return 0 ;;
     file://*|/*|./*|../*) return 1 ;;
   esac
-  u=$("$real_git" remote get-url --push -- "$r" 2>/dev/null) || u=$r   # not a remote name: a path (or a URL) as written
+  u=$("$real_git" remote get-url --push --all -- "$r" 2>/dev/null) || u=$r   # not a remote name: a path (or a URL) as written
+  case "$u" in "$r") w=$("$real_git" config --get-all "remote.$r.pushurl" 2>/dev/null); [ -n "$w" ] || w=$("$real_git" ls-remote --get-url "$r" 2>/dev/null); [ -n "$w" ] && u=$w ;; esac   # a remote that only a -c option defines
+  case "$u" in *"
+"*) while IFS= read -r x; do net_remote "$x" && return 0; done <<EOF2
+$u
+EOF2
+    return 1 ;; esac   # several urls: git pushes to each
   case "$u" in
     https://*|http://*|ssh://*|git://*) return 0 ;;
     file://*|/*|./*|../*) return 1 ;;
@@ -65,6 +72,7 @@ land_record() {   # $1: the sha, the exact commit: both land trailers present, n
   for t in Land-Checks Land-Council; do
     vals=$(printf '%s\n' "$tr_out" | sed -n "s/^$t:[[:space:]]*//p" | sed 's/[[:space:]]*$//')
     [ -n "$(printf '%s\n' "$tr_out" | grep "^$t:")" ] || return 1
+    [ -z "$(printf '%s\n' "$tr_out" | grep -E "^$t:[[:space:]]*$")" ] || return 1   # a duplicate that is empty (the line above drops a trailing empty value)
     while IFS= read -r v; do
       [ -n "$v" ] || return 1
       [ "$(printf '%s' "$v" | tr 'A-Z' 'a-z')" = "not recorded" ] && return 1
@@ -75,6 +83,15 @@ EOF
   return 0
 }
 
+cfg_add() {   # git -c <key>=<value>: the guard's own config reads see it too (a remote or url rewrite given on the command line)
+  case "$1" in *=*) k=${1%%=*}; v=${1#*=} ;; *) k=$1; v=true ;; esac
+  n=${GIT_CONFIG_COUNT:-0}
+  export "GIT_CONFIG_KEY_$n=$k" "GIT_CONFIG_VALUE_$n=$v" "GIT_CONFIG_COUNT=$((n + 1))"
+}
+cfg_env() {   # git --config-env=<key>=<ENVVAR>
+  case "$1" in *=*) cfg_add "${1%%=*}=$(printenv -- "${1#*=}" 2>/dev/null)" ;; esac
+}
+
 do_git() {
   # skip git's own options before the subcommand; -C is followed (the guard changes its own directory), --git-dir is exported
   while [ $# -gt 0 ]; do
@@ -82,6 +99,10 @@ do_git() {
       -C) cd "${2:-.}" 2>/dev/null || return 0; shift 2 || return 0 ;;
       --git-dir) GIT_DIR=${2:-}; export GIT_DIR; shift 2 || return 0 ;;
       --git-dir=*) GIT_DIR=${1#--git-dir=}; export GIT_DIR; shift ;;
+      -c) cfg_add "${2:-}"; shift 2 || return 0 ;;
+      --config-env) cfg_env "${2:-}"; shift 2 || return 0 ;;
+      --config-env=*) cfg_env "${1#--config-env=}"; shift ;;
+      --attr-source|--super-prefix) shift 2 || return 0 ;;
       -c|--config-env|--work-tree|--namespace|--exec-path) shift 2 || return 0 ;;
       -*) shift ;;
       *) break ;;
@@ -101,7 +122,19 @@ do_git() {
       --push-option=*|--receive-pack=*|--exec=*) continue ;;
       --force|--force-with-lease|--force-with-lease=*|--force-if-includes) forced=1; continue ;;
       --all|--branches|--mirror) wide=1; continue ;;
+      --?*)   # git takes any unambiguous prefix of a long option (--recurse x, --exe x, --rep=U, --al, --force-w)
+        n=${a#--}; eq=0; val=""
+        case "$n" in *=*) eq=1; val=${n#*=}; n=${n%%=*} ;; esac
+        case "$n" in force*) forced=1 ;; esac
+        for w in all mirror branches; do case "$w" in "$n"*) wide=1 ;; esac; done
+        case "repo" in "$n"*) if [ "$eq" = 1 ]; then repoopt=$val; else rnext=1; fi; continue ;; esac
+        if [ "$eq" = 0 ]; then for w in receive-pack exec push-option recurse-submodules; do case "$w" in "$n"*) skip=1 ;; esac; done; fi
+        continue ;;
       --*) continue ;;
+      -[!-]*)   # a short cluster read letter by letter: f forces; o takes the rest of the cluster, or the next word, as its value
+        rest=${a#-}
+        while [ -n "$rest" ]; do l=${rest%"${rest#?}"}; rest=${rest#?}; case "$l" in f) forced=1 ;; o) [ -z "$rest" ] && skip=1; break ;; esac; done
+        continue ;;
       -[!-]*) case "$a" in *f*) forced=1 ;; esac; case "$a" in *o) skip=1 ;; esac; continue ;;   # a short cluster; ending in o: the next word is its value
     esac
     if [ -z "$first" ]; then first=$a; fi
@@ -135,6 +168,7 @@ $first"}
     case "$dst" in
       *\**|*\?*|*\[*) for d in $(defaults); do case "$d" in $dst) hit=1 ;; esac; done; continue ;;
     esac
+    [ "$dst" = @ ] && dst=HEAD   # @ is HEAD
     if [ "$dst" = HEAD ]; then
       [ -n "$cur" ] && is_default "$cur" && hit=1
       continue
