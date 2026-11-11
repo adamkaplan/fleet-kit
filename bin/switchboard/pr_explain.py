@@ -419,7 +419,7 @@ def cmd_pr_explain(args, runner, now):
     body = pr.get("body") if isinstance(pr.get("body"), str) else ""
     if args.check:
         problems = explainer_defects(body)
-        if pr_is_held(pr.get("labels") or [], body):
+        if not isinstance(pr.get("labels"), list) or pr_is_held(pr.get("labels"), body):   # labels that cannot be read: not "not held" (#2379)
             problems += [p for p in held_defects(body) if p not in problems]   # the summary flowchart is named once
         for problem in problems:
             print("DEFECT: %s" % problem)

@@ -1036,7 +1036,7 @@ def evaluate_gates(plan, entries, ledger_problem, facts, pr, now=None):
             floor = (facts or {}).get("floor")
             # held = the same reading as `pr-explain --check`: a hold label, the merge-captain label or marker, or an uncleared floor hold; a missing
             # `held_check` on a held PR fails closed (missing)
-            held = (facts or {}).get("captain", False) is None or bool((facts or {}).get("captain")) or bool((facts or {}).get("holds")) or (isinstance(floor, dict) and (bool(floor.get("rehold")) or (floor.get("decision") == "hold" and not floor.get("cleared"))))
+            held = (facts or {}).get("captain") is None or bool((facts or {}).get("captain")) or bool((facts or {}).get("holds")) or (isinstance(floor, dict) and (bool(floor.get("rehold")) or (floor.get("decision") == "hold" and not floor.get("cleared"))))
             check = (facts or {}).get("held_check")   # the ONE check (`held_defects` in the switchboard), called only for a held PR
             if not held:
                 row.update(status="n/a", detail="not a held PR")
