@@ -746,13 +746,15 @@ def notice_entry(repo, number, tag, facts, stale, sender, created, note, hold_mi
             "merge_after": iso(created + hold_minutes * 60) if hold_minutes > 0 else None}
 
 
-def captain_entry(notice, facts, escalated, evidence):
-    """A `MERGE: captain` PR as a decision (kind `captain`, same id as its notice, tier `cos`; `human` once the Chief
+def captain_entry(notice, facts, escalated, evidence, labels_unread=False):
+    """A merge-captain PR as a decision (kind `captain`, same id as its notice, tier `cos`; `human` once the Chief
     of Staff escalated it for this head). `evidence` is who reviewed it at the exact head ([{"by", "kind", "state"}]:
     a formal review or a signed comment), [] when none was seen (the notice outlasted its wait), or None when that
     cannot be read: it then stands on the notice alone and says so."""
     head = facts.get("head")
-    if evidence is None:
+    if labels_unread:   # (#2379) the labels could not be read: it may be held, so it stays a decision row and says why
+        text, review = "labels could not be read: held or not is not known", "labels unreadable"
+    elif evidence is None:
         text, review = "review not detectable: on notice alone", "not detectable"
     elif not evidence:  # a readable absence, listed because the notice has waited too long
         text, review = "no review seen at %s: on notice for over the wait limit" % head[:8], "none seen"

@@ -391,7 +391,7 @@ def apply_impact_hold(engine, repo, number, report, record):
 
 def _batch_release(engine, repo, number, report, record):
     """(#955, mirrors the carry of one pull request) A batch that carried and had been held before: drop the daemon's record of its labels, remove the labels it added (`gate.hold_released`), and turn a first-line
-    `MERGE: captain` marker into `MERGE: automatic` (`neutralise_marker`, head-checked: the marker is read by the gate while no merge label says otherwise), then tell the Chief of Staff (`gate.clear_carried`
+    `MERGE: captain` marker into `MERGE: automatic` (`neutralise_marker`, head-checked: the line is no longer read by the gate, and is kept consistent with the label), then tell the Chief of Staff (`gate.clear_carried`
     notice, kind carry). Never raises: the carry is recorded and nothing here may fail the pass. Labels the daemon did not add (an author's) are not touched."""
     pr, head = report["pr"], report["head"]
     try:
@@ -661,7 +661,7 @@ def impact_rehold_open(state_dir, repo, number):
 
 
 def neutralise_marker(engine, runner, repo, number, head, first=None):
-    """#522: the owner's clear lifts the whole hold, so the body's first line `MERGE: captain` becomes `MERGE: automatic` (the gate reads it while no merge label says otherwise).
+    """#522: the owner's clear lifts the whole hold, so the body's first line `MERGE: captain` becomes `MERGE: automatic` (the gate no longer reads it for the hold: the label does; the line is kept consistent).
     The ONE place it is done, called by `impact_clear_core` (the owner's command and his words in the chat both end there; a carry of a clear never does). The body is read fresh
     for `head` only (`first` is the clear's own read of that moment, or None to read one), read again right before the write and written only when it is the same, then read back. Best effort (GitHub has no conditional body write, so an edit landing between the last read and the write is not detected). Never raises: a failure is audited and a line says the marker remains,
     for the owner's clear has already stood. Returns the lines to print."""

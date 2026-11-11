@@ -7492,23 +7492,9 @@ CAPTAIN_HOLD_LABELS = ("hold-security", "hold-credential", "hold-contract", "hol
 OWNER_HOLD_KEY = "hold-owner"   # #891: the owner's own hold: never the daemon's (not added, not adopted, not restored by a re-hold), never lifted by a delegated clear
 
 
-# TRANSITION WINDOW (#133): a PR is held for the person when it carries the `merge-captain` label, OR (until this date, 30
-# days after the labels landed on 2026-10-11) when its body's first non-empty line says `MERGE: captain`. The line is read only inside the window.
-# TO DROP THE MARKER: set this to None (one line), after telling the Chief of Staff; the sweep's "marker without label" finding exists
-# to finish the relabelling before then.
-CAPTAIN_MARKER_UNTIL = "2026-11-10"
-
-
-def marker_window_open(now=None):
-    """True while the first-line marker is still read: CAPTAIN_MARKER_UNTIL is set and `now` (epoch seconds, default the clock) is
-    before the end of that day (UTC)."""
-    if not CAPTAIN_MARKER_UNTIL:
-        return False
-    try:
-        end = datetime.strptime(CAPTAIN_MARKER_UNTIL, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp() + 86400
-    except ValueError:
-        return False
-    return (time.time() if now is None else now) < end
+# THE LABEL IS THE ONLY SIGNAL (#133, #2379): a PR is held for the person when it carries the `merge-captain` label. The body's first line
+# `MERGE: captain` is no longer read for the hold (the transition window ended 2026-11-10); `pr_marker` still reads the word, only so the
+# sweep can note a line that has no label and so `labels apply-from-markers` can finish the relabelling.
 
 
 def pr_marker(body):
@@ -7527,7 +7513,7 @@ def pr_marker(body):
 def _label_kind(names, kinds):
     """The kinds of `kinds` (`merge-captain`, `hold-security`, ...) among label names written `<prefix>:<kind>`."""
     found = []
-    for name in names or ():
+    for name in names if isinstance(names, (list, tuple, set, frozenset)) else ():   # labels that are not a collection name nothing
         text = name.get("name") if isinstance(name, dict) else name
         if isinstance(text, str) and ":" in text and text.rsplit(":", 1)[1] in kinds and text.rsplit(":", 1)[1] not in found:
             found.append(text.rsplit(":", 1)[1])
@@ -7539,18 +7525,18 @@ def pr_hold_reasons(labels):
     return sorted(k[len("hold-"):] for k in _label_kind(labels, CAPTAIN_HOLD_LABELS))
 
 
-def pr_marker_state(labels, body, now=None):
+def pr_marker_state(labels, body):
     """{"captain": bool, "label": 'captain'|'automatic'|None, "marker": 'captain'|'automatic'|None, "findings": [...]}: what holds
     a PR for the person. THE LABEL IS THE SOURCE OF TRUTH: `merge-captain` makes it captain, `merge-automatic` makes it not,
-    whatever the body says; only with no merge label is the first-line marker read, and only inside the transition window.
-    `findings` are `marker-without-label` (the line says captain, no merge label: finish the relabelling) and `disagree` (the
+    whatever the body says; with no merge label the PR is NOT held, the first-line marker holds nothing.
+    `findings` are `marker-without-label` (a NOTE: the line says captain, no merge label, so the line is ignored: finish the relabelling) and `disagree` (the
     label and the line say different things; the label won)."""
     kinds = _label_kind(labels, CAPTAIN_MERGE_LABELS)
     label = "captain" if "merge-captain" in kinds else "automatic" if "merge-automatic" in kinds else None
     marker = pr_marker(body)
     findings = []   # both merge labels at once: held (the cautious reading) and a disagreement, below
     if label is None:
-        captain = marker == "captain" and marker_window_open(now)
+        captain = False
         if marker == "captain":
             findings.append("marker-without-label")
     else:
@@ -7761,7 +7747,7 @@ def pr_facts_from(data):
         return value if isinstance(value, int) and not isinstance(value, bool) else None
     head = data.get("headRefOid") if isinstance(data.get("headRefOid"), str) else None
     return {"title": " ".join(str(data.get("title") or "").split()), "state": data["state"].lower(),
-            "captain": pr_marker_state(data.get("labels"), data.get("body"))["captain"],
+            "captain": pr_marker_state(data.get("labels"), data.get("body"))["captain"] if isinstance(data.get("labels"), list) else None,   # (#2379) labels unread: not "not held" (None: G6 is not open)
             "holds": pr_hold_reasons(data.get("labels")), "captain_findings": pr_marker_state(data.get("labels"), data.get("body"))["findings"],
             "author": pr_login(data.get("author")),
             "reviews": pr_reviews_at(data.get("reviews"), head, pr_login(data.get("author"))),
