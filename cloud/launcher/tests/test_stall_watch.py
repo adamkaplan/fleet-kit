@@ -186,7 +186,7 @@ class Stall(unittest.TestCase):
         w = World()
         w.add("a-pod", msg="Permission denied")
         w.add("b-pod", msg="Permission denied")
-        real, ticks = sw.time.monotonic, iter([0.0, 0.0, 999.0, 999.0, 999.0])
+        real, ticks = sw.time.monotonic, iter([0.0, 0.0] + [999.0] * 50)
         sw.time.monotonic = lambda: next(ticks)
         try:
             w.run()
@@ -203,6 +203,16 @@ class Stall(unittest.TestCase):
         w.add(msg="Permission denied")
         self.assertEqual(w.run(), [])
         self.assertEqual(sw.pass_text(w.launcher), " stall read=1 alerted=0")
+
+    def test_the_hour_holds_at_59_minutes_and_ends_at_60(self):
+        w = World()
+        w.add(msg="Permission denied")
+        counts = []
+        for minute in (0, 59, 60):
+            w.at(minute)
+            w.run()
+            counts.append(len(w.sent))
+        self.assertEqual(counts, [2, 2, 4])
 
     def test_the_mark_is_set_before_the_send_and_nothing_else_is_called(self):
         w = World()
