@@ -34,13 +34,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends tini \
 RUN apt-get update && apt-get install -y --no-install-recommends libasound2t64 libatk-bridge2.0-0t64 libatk1.0-0t64 libatspi2.0-0t64 libcairo2 libcups2t64 libdbus-1-3 libdrm2 libfontconfig1 libfreetype6 libgbm1 libglib2.0-0t64 libnspr4 libnss3 libpango-1.0-0 libx11-6 libxcb1 libxcomposite1 libxdamage1 libxext6 libxfixes3 libxkbcommon0 libxrandr2 fonts-liberation fonts-noto-color-emoji fonts-unifont fonts-freefont-ttf \
  && rm -rf /var/lib/apt/lists/*
 
-# ---- #1165 identity: ONE system-level git file, written at image build (nothing at run time, nothing in the home directory) ----
-# The pair below is the ONE constant. A repository's own configured identity, and a local `git config user.name/user.email`,
-# still win over it (git's own order: system, then global, then local). The entrypoint exports no identity variable.
+# ---- #1165 identity: ONE root-owned read-only file written at image build; the entrypoint copies it into the global git file ----
+# The pair below is the ONE constant (line one: name, line two: email). The entrypoint sets user.name and user.email in the worker
+# user's global git configuration from this file, each only when unset. A repository's own configured identity, and a local
+# `git config user.name/user.email`, still win over it (git's own order: system, then global, then local). No identity variable is exported.
 ARG CW_DEFAULT_IDENT_NAME=cloud-worker
 ARG CW_DEFAULT_IDENT_EMAIL=cloud-worker@users.noreply.github.com
-RUN printf '[user]\n\tname = %s\n\temail = %s\n' "${CW_DEFAULT_IDENT_NAME}" "${CW_DEFAULT_IDENT_EMAIL}" > /etc/gitconfig \
- && chmod 0644 /etc/gitconfig
+RUN printf '%s\n%s\n' "${CW_DEFAULT_IDENT_NAME}" "${CW_DEFAULT_IDENT_EMAIL}" > /etc/cw-default-identity \
+ && chown root:root /etc/cw-default-identity && chmod 0444 /etc/cw-default-identity
 # ---- end #1165 identity ----
 
 # OpenCode v2: a pinned standalone binary (no node or npm), checked against its sha256 before it is unpacked.
