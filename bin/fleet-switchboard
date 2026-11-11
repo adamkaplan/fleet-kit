@@ -8482,6 +8482,7 @@ def cloud_watch_tick(engine, discovery):
     return result
 
 
+CLOUD_STALL_ALERT_FILE = "cloud-stall-alert.json"   # #2399: the private cursor and sent keys of the pass that reads the launcher's `stall-alert` audit lines
 CLOUD_END_ALERT_FILE = "cloud-end-alert.json"   # #1480: the private cursor and the sent keys of the pass that reads the launcher's audit file
 
 
@@ -8534,6 +8535,15 @@ def cloud_end_tick(engine, discovery):
                                                      head_checks=lambda repo, sha: cloud_head_checks(engine, repo, sha),
                                                      branch_tip=lambda repo, branch: cloud_branch_tip(engine, repo, branch),
                                                      last_push=load_module("cloud_end_alert").push_reader(getattr(getattr(engine, "audit", None), "path", None), load_module("record_json").parse_bounded))
+
+
+def cloud_stall_tick(engine, discovery):
+    """#2399: a stall the reaper's watch found (one `stall-alert` audit line) tells the boss and the Chief of Staff, once per line, through the daemon's own `send`."""
+    state_dir = getattr(engine, "state_dir", None)
+    if state_dir is None:
+        return []
+    return load_module("cloud_end_alert").scan_stall(cloud_audit_path(), Path(state_dir) / CLOUD_STALL_ALERT_FILE,
+                                                     lambda to, text: engine.send("switchboard", to, text), load_module("record_json").parse_bounded)
 
 
 def cloud_turn_activity(worker):
@@ -8676,6 +8686,10 @@ def finish_pass(engine, discovery, report):
         load_module("cloud_worker").bind(globals())._first_push().first_push_tick(engine, discovery)   # #2057: a cloud pod with no first push by its checkpoint is named once to its orchestrator
     except Exception as err:
         engine._failed("first-push", "first-push", err, report)
+    try:
+        cloud_stall_tick(engine, discovery)   # #2399
+    except Exception as err:
+        engine._failed("cloud-stall-alert", "cloud-stall-alert", err, report)
     try:
         cloud_turn_tick(engine, discovery)
     except Exception as err:
