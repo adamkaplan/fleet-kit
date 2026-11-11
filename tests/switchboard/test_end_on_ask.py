@@ -13,6 +13,7 @@ from support.loader import sb   # noqa: E402
 from test_stop_final_message import StopWorld, TOKEN   # noqa: E402
 
 NAME = "cp-2393r"
+N = sb.load_module("cloud_worker").bind(sb.__dict__)._retired().END_LOG_LINES   # the clip under test, never a number of this file
 
 
 class TestEndOnAsk(unittest.TestCase):
@@ -37,7 +38,7 @@ class TestEndOnAsk(unittest.TestCase):
                    mock.patch.object(cloud, "Cluster", lambda *a, **k: cluster), mock.patch.object(cloud, "_audit", lambda eng, event, *a, **k: events.append(event)),
                    mock.patch.object(cloud, "_registry_note"), mock.patch.object(cloud, "_keep_boss"), mock.patch.object(cloud, "remove_record")]
         if mutant:   # today's end: nothing is posted on the ask
-            patches.append(mock.patch.object(cloud, "_post_end_on_ask", lambda *a, **k: None))
+            patches.append(mock.patch.object(cloud._retired(), "post_end", lambda *a, **k: None))
         call = cloud.cmd_retire.__wrapped__ if hasattr(cloud.cmd_retire, "__wrapped__") else cloud.cmd_retire
         for p in patches:
             p.start()
@@ -49,16 +50,16 @@ class TestEndOnAsk(unittest.TestCase):
         return posts, events
 
     def test_s4_the_final_message_and_the_last_lines_are_posted_on_the_ask_once(self):
-        log = "\n".join("land line %02d" % i for i in range(1, 31))
+        log = "\n".join("land line %02d" % i for i in range(1, N + 11))
         posts, _ = self.end(log=log)
         self.assertEqual(len(posts), 1)
         issue, body, repo = posts[0]
         self.assertEqual((issue, repo), (2393, "adamkaplan/fleet-kit"))
         self.assertIn("my final words", body)
         shown = [l for l in body.split("\n") if l.startswith("land line")]
-        self.assertIn("land line 30", shown)
-        self.assertLessEqual(len(shown), sb.load_module("cloud_retired").END_LOG_LINES)
-        self.assertEqual(shown, ["land line %02d" % i for i in range(30 - len(shown) + 1, 31)])   # a contiguous suffix of the log, the newest line last
+        self.assertIn("land line %02d" % (N + 10), shown)
+        self.assertLessEqual(len(shown), N)
+        self.assertEqual(shown, ["land line %02d" % i for i in range(N + 10 - len(shown) + 1, N + 11)])   # a contiguous suffix of the log, the newest line last
         self.assertNotIn("land line 01", shown)
 
     def test_s4_control_today_the_end_posts_neither_the_message_nor_the_log(self):
@@ -89,10 +90,10 @@ class TestEndOnAsk(unittest.TestCase):
 
     def test_a_key_block_in_the_log_is_redacted_whole_even_when_the_cut_drops_its_first_line(self):
         key = "-----BEGIN PRIVATE KEY-----\nQUJDREVGR0hJSktMTU5PUA\nUVJTVFVWV1hZWjAxMjM0NTY3\n-----END PRIVATE KEY-----"
-        posts, _ = self.end(log=key + "\n" + "\n".join("l%d" % i for i in range(17)))   # 21 lines: the cut drops only the BEGIN line
+        posts, _ = self.end(log=key + "\n" + "\n".join("l%d" % i for i in range(N - 3)))   # N + 1 lines: the cut drops only the BEGIN line
         self.assertNotIn("QUJDREVGR0hJSktMTU5PUA", posts[0][1])
         self.assertNotIn("UVJTVFVWV1hZWjAxMjM0NTY3", posts[0][1])
-        self.assertIn("\nl16", posts[0][1])
+        self.assertIn("\nl%d" % (N - 4), posts[0][1])
 
     def test_a_key_body_whose_first_line_was_clipped_before_the_run_record_is_redacted(self):
         posts, _ = self.end(log="UVJTVFVWV1hZWjAxMjM0NTY3\nQUJDREVGR0hJSktMTU5PUA\n-----END PRIVATE KEY-----\nexit 1")

@@ -837,14 +837,12 @@ def _launch(args, runner, now, reserve):
             record = _record_from_create(name, body)
             _write_private(password_path(state, name), password + "\n")
             record["auth_ref"] = "file:" + str(password_path(state, name))   # the switchboard's own copy: its path never comes from the launcher
-            record["repo"], record["branch"] = repo, branch
+            record["repo"], record["branch"], record["issue"] = repo, branch, None if args.issue is None else int(args.issue)   # ask #2393: the issue names the ask the pod's end is posted on
             if stack_model:
                 record["stack_model_secret"], record["stack_model_key"] = stack_model[0], "delivered"   # the name and that it was delivered; nothing else
             record["agent"] = args.agent   # the local role name, for the operator: the pod runs CLOUD_WORKER_AGENT
             if args.reports_to:
                 record["reports_to"] = args.reports_to
-            if args.issue is not None:
-                record["issue"] = int(args.issue)   # ask #2393: the pod's end is posted on its ask
             if isinstance(args.shape, str) and args.shape:
                 record["shape"] = args.shape
             cloud_pr_labels.record_labels(record, args)   # #2269
@@ -1433,8 +1431,7 @@ _BOSS_NAME_RE = re.compile(r"[a-z][a-z0-9_-]{0,31}", re.ASCII)
 
 
 def _final_message(engine, state, record, name, reason, body=None):
-    """Ask #1788: after a successful retire, ONE message to the recorded boss: the pod, the reason, and its last text (cut, scrubbed, framed as
-    untrusted: cloud_retired.last_message). Never raises: a failed send is said in the audit and the retire goes on."""
+    """Ask #1788: after a successful retire, ONE message to the boss with the pod's last text (cloud_retired.last_message); never raises."""
     boss = record.get("reports_to")
     if not isinstance(boss, str) or not _BOSS_NAME_RE.fullmatch(boss):
         return
@@ -1445,22 +1442,6 @@ def _final_message(engine, state, record, name, reason, body=None):
         engine.send("switchboard", boss, text)
     except Exception as err:
         _audit(engine, "cloud.final_message_failed", name, {"why": _one(type(err).__name__, 60)})
-
-
-def _post_end_on_ask(engine, state, record, name, reason, body):
-    """Ask #2393: ONCE per end, the pod's final message and the last lines of its land log are posted on its ask issue through the existing comment path
-    (handoff.post_ask_comment), scrubbed and cut (cloud_retired.end_comment); a pod without a log posts the message alone, a pod without an ask posts nothing.
-    Never raises: a failed post is said in the audit and the retire goes on."""
-    issue, repo = record.get("issue"), record.get("repo")
-    if isinstance(issue, bool) or not isinstance(issue, int) or issue < 1 or not isinstance(repo, str) or not repo:
-        return
-    try:
-        where = body.get("record") if isinstance(body, dict) else None
-        block, _why = _retired().last_message(where, state, name) if isinstance(where, str) and where else (None, "no run record")
-        tail = _retired().land_log_tail(where, name) if isinstance(where, str) and where else None
-        H["post_ask_comment"](engine, issue, _retired().end_comment(name, _one(_scrub_lib()(reason, (), 300), 120), block, tail), author=name, repo=repo)
-    except Exception as err:
-        _audit(engine, "cloud.end_post_failed", name, {"why": _one(type(err).__name__, 60)})
 
 
 @refusals
@@ -1508,7 +1489,7 @@ def cmd_retire(args, runner, now, record):
     # The run record (slice 3, #638) is written by the launcher's stop; no call is needed here when it lands: this is its hook point (after the
     # end hook, before the endpoint record goes).
     _final_message(engine, state, record, args.name, reason, body)   # ask #1788: once, after a successful stop only
-    _post_end_on_ask(engine, state, record, args.name, reason, body)   # ask #2393: once, on the pod's ask
+    _retired().post_end(engine, state, record, args.name, reason, body, H["post_ask_comment"], lambda why: _audit(engine, "cloud.end_post_failed", args.name, {"why": why}))   # ask #2393: once, on the pod's ask
     _registry_note(engine, "retire", state, args.name, reason)
     wip, pushed = (body or {}).get("wip_branch"), (body or {}).get("pushed")
     if isinstance(body, dict) and body.get("pod_gone") is True:   # only the launcher's explicit reply: an unreadable pod never says it

@@ -541,3 +541,19 @@ def end_comment(pod, reason, block, tail):
     if tail:
         lines += ["[last lines of /work/land.log, untrusted text]", "```", tail, "```"]
     return re.sub(r"@", "(at)", "\n".join(lines))[:END_POST_CHARS]
+
+
+def post_end(engine, state, record, name, reason, body, post, note):
+    """Ask #2393: ONCE per end, the pod's final message and the last lines of its land log are posted on its ask issue through `post` (handoff.post_ask_comment),
+    scrubbed and cut (end_comment); a pod without a log posts the message alone, a pod without an ask (`issue` and `repo` of its cloud record) posts nothing.
+    Never raises: a failed post is handed to `note(why)` and the retire goes on."""
+    issue, repo = record.get("issue"), record.get("repo")
+    if isinstance(issue, bool) or not isinstance(issue, int) or issue < 1 or not isinstance(repo, str) or not repo:
+        return
+    try:
+        where = body.get("record") if isinstance(body, dict) else None
+        block, _why = last_message(where, state, name) if isinstance(where, str) and where else (None, "no run record")
+        tail = land_log_tail(where, name) if isinstance(where, str) and where else None
+        post(engine, issue, end_comment(name, D["_scrub_lib"]()(reason, (), 300)[:120], block, tail), author=name, repo=repo)
+    except Exception as err:
+        note(type(err).__name__[:60])
