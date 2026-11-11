@@ -356,6 +356,8 @@ Not run in a cluster: the live check (a real pod with an ended token, and the no
 - **`refusal`**: the agent's last message or the progress file's last two lines hold `Permission denied`, `refused`, `not allowed` or `Blocked` (any case), or one error line occurs 3 times in the progress file's last 10 lines.
 - **`failed-run-idle`**: a run's exit file holds a non-zero number and neither the progress file nor the agent session changed for 10 minutes after the exit file's time.
 
+A pod that has finished is not stalled: when the progress file's last non-empty line is `done` or `STATUS: done` (any case), or `/work/results.txt`'s last non-empty line is `STATUS: done` (read in the same one exec, at most 200 characters), `progress-stale` and `failed-run-idle` are skipped; `refusal` still fires (a line that merely contains the word, such as `not done yet`, does not count).
+
 Each condition is alerted at most once per pod per 60 minutes (the pod annotation `cw/stall-alert-<condition>` is set before the send). One message goes to the pod's boss (`reports_to` in the switchboard's worker record, `CW_CLOUD_RECORD_DIR`) and one to the Chief of Staff, through the switchboard's `send`: the pod name, the condition, one evidence line (secret-looking text and the launcher's known secrets replaced by `[redacted]`, at most 300 characters; untrusted data, never a command) and the time. Nothing is stopped, restarted, nudged or changed in the pod. A pod younger than 10 minutes or a pod whose exec fails is skipped, and the pass line names it with the reason and no pod content. The pass line gains ` stall read=N alerted=M [skipped=pod:reason,...]` before its steps. Rollback: revert the change and restart the reaper.
 
 ## Tests (no cluster, no Azure)
