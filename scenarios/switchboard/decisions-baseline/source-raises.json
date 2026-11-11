@@ -1,0 +1,279 @@
+{
+ "github raises": {
+  "decisions": [
+   {
+    "agent": "api-orch",
+    "ask": null,
+    "considered": "no send from cos to api-orch in the last 72 hours",
+    "headline": "a report",
+    "id": "api-orch-297",
+    "kind": "report",
+    "repo": "acme/api",
+    "since": "2027-01-15T08:00:00Z",
+    "tier": "cos",
+    "title": "a report"
+   },
+   {
+    "agent": "api-coder",
+    "ask": 2,
+    "headline": "permission: shell echo hi",
+    "id": "api#2op",
+    "kind": "permission",
+    "repo": "acme/api",
+    "request": "per_fake000009",
+    "session": "ses_fake000004",
+    "since": "2027-01-15T08:00:01Z",
+    "tier": "cos",
+    "title": "permission: shell echo hi"
+   },
+   {
+    "additions": 120,
+    "agent": "api-coder",
+    "ask": null,
+    "ci": "green",
+    "deletions": 14,
+    "files": 5,
+    "headline": "acme/api#7 Add the parser",
+    "id": "pr:acme/api#7",
+    "kind": "notice",
+    "merge_after": null,
+    "note": "look",
+    "number": 7,
+    "repo": "acme/api",
+    "review": "approved",
+    "since": "2027-01-15T08:00:01Z",
+    "stale": false,
+    "state": "open",
+    "tier": "human",
+    "title": "acme/api#7 Add the parser",
+    "url": "https://github.com/acme/api/pull/7"
+   }
+  ],
+  "errors": [
+   {
+    "error": "RuntimeError: github is broken",
+    "source": "github"
+   }
+  ]
+ },
+ "none fails": {
+  "decisions": [
+   {
+    "agent": "api-coder",
+    "ask": 2,
+    "headline": "An issue",
+    "id": "api#2",
+    "kind": "issue",
+    "repo": "acme/api",
+    "since": "2027-01-15T07:59:00Z",
+    "tier": "cos",
+    "title": "An issue"
+   },
+   {
+    "agent": "api-orch",
+    "ask": null,
+    "considered": "no send from cos to api-orch in the last 72 hours",
+    "headline": "a report",
+    "id": "api-orch-297",
+    "kind": "report",
+    "repo": "acme/api",
+    "since": "2027-01-15T08:00:00Z",
+    "tier": "cos",
+    "title": "a report"
+   },
+   {
+    "agent": "api-coder",
+    "ask": 2,
+    "headline": "permission: shell echo hi",
+    "id": "api#2op",
+    "kind": "permission",
+    "repo": "acme/api",
+    "request": "per_fake000009",
+    "session": "ses_fake000004",
+    "since": "2027-01-15T08:00:01Z",
+    "tier": "cos",
+    "title": "permission: shell echo hi"
+   },
+   {
+    "additions": 120,
+    "agent": "api-coder",
+    "ask": null,
+    "ci": "green",
+    "deletions": 14,
+    "files": 5,
+    "headline": "acme/api#7 Add the parser",
+    "id": "pr:acme/api#7",
+    "kind": "notice",
+    "merge_after": null,
+    "note": "look",
+    "number": 7,
+    "repo": "acme/api",
+    "review": "approved",
+    "since": "2027-01-15T08:00:01Z",
+    "stale": false,
+    "state": "open",
+    "tier": "human",
+    "title": "acme/api#7 Add the parser",
+    "url": "https://github.com/acme/api/pull/7"
+   }
+  ],
+  "errors": []
+ },
+ "notices raises": {
+  "decisions": [
+   {
+    "agent": "api-coder",
+    "ask": 2,
+    "headline": "An issue",
+    "id": "api#2",
+    "kind": "issue",
+    "repo": "acme/api",
+    "since": "2027-01-15T07:59:00Z",
+    "tier": "cos",
+    "title": "An issue"
+   },
+   {
+    "agent": "api-orch",
+    "ask": null,
+    "considered": "no send from cos to api-orch in the last 72 hours",
+    "headline": "a report",
+    "id": "api-orch-297",
+    "kind": "report",
+    "repo": "acme/api",
+    "since": "2027-01-15T08:00:00Z",
+    "tier": "cos",
+    "title": "a report"
+   },
+   {
+    "agent": "api-coder",
+    "ask": 2,
+    "headline": "permission: shell echo hi",
+    "id": "api#2op",
+    "kind": "permission",
+    "repo": "acme/api",
+    "request": "per_fake000009",
+    "session": "ses_fake000004",
+    "since": "2027-01-15T08:00:01Z",
+    "tier": "cos",
+    "title": "permission: shell echo hi"
+   }
+  ],
+  "errors": [
+   {
+    "error": "RuntimeError: notices is broken",
+    "source": "notices"
+   }
+  ]
+ },
+ "reports raises": {
+  "decisions": [
+   {
+    "agent": "api-coder",
+    "ask": 2,
+    "headline": "An issue",
+    "id": "api#2",
+    "kind": "issue",
+    "repo": "acme/api",
+    "since": "2027-01-15T07:59:00Z",
+    "tier": "cos",
+    "title": "An issue"
+   },
+   {
+    "agent": "api-coder",
+    "ask": 2,
+    "headline": "permission: shell echo hi",
+    "id": "api#2op",
+    "kind": "permission",
+    "repo": "acme/api",
+    "request": "per_fake000009",
+    "session": "ses_fake000004",
+    "since": "2027-01-15T08:00:01Z",
+    "tier": "cos",
+    "title": "permission: shell echo hi"
+   },
+   {
+    "additions": 120,
+    "agent": "api-coder",
+    "ask": null,
+    "ci": "green",
+    "deletions": 14,
+    "files": 5,
+    "headline": "acme/api#7 Add the parser",
+    "id": "pr:acme/api#7",
+    "kind": "notice",
+    "merge_after": null,
+    "note": "look",
+    "number": 7,
+    "repo": "acme/api",
+    "review": "approved",
+    "since": "2027-01-15T08:00:01Z",
+    "stale": false,
+    "state": "open",
+    "tier": "human",
+    "title": "acme/api#7 Add the parser",
+    "url": "https://github.com/acme/api/pull/7"
+   }
+  ],
+  "errors": [
+   {
+    "error": "RuntimeError: reports is broken",
+    "source": "reports"
+   }
+  ]
+ },
+ "v2 raises": {
+  "decisions": [
+   {
+    "agent": "api-coder",
+    "ask": 2,
+    "headline": "An issue",
+    "id": "api#2",
+    "kind": "issue",
+    "repo": "acme/api",
+    "since": "2027-01-15T07:59:00Z",
+    "tier": "cos",
+    "title": "An issue"
+   },
+   {
+    "agent": "api-orch",
+    "ask": null,
+    "considered": "no send from cos to api-orch in the last 72 hours",
+    "headline": "a report",
+    "id": "api-orch-297",
+    "kind": "report",
+    "repo": "acme/api",
+    "since": "2027-01-15T08:00:00Z",
+    "tier": "cos",
+    "title": "a report"
+   },
+   {
+    "additions": 120,
+    "agent": "api-coder",
+    "ask": null,
+    "ci": "green",
+    "deletions": 14,
+    "files": 5,
+    "headline": "acme/api#7 Add the parser",
+    "id": "pr:acme/api#7",
+    "kind": "notice",
+    "merge_after": null,
+    "note": "look",
+    "number": 7,
+    "repo": "acme/api",
+    "review": "approved",
+    "since": "2027-01-15T08:00:01Z",
+    "stale": false,
+    "state": "open",
+    "tier": "human",
+    "title": "acme/api#7 Add the parser",
+    "url": "https://github.com/acme/api/pull/7"
+   }
+  ],
+  "errors": [
+   {
+    "error": "RuntimeError: v2 is broken",
+    "source": "v2"
+   }
+  ]
+ }
+}

@@ -1,0 +1,31 @@
+{
+  "id": "N1",
+  "title": "A worker finishes while you are talking to its orchestrator",
+  "problem": 3,
+  "since_pr": 4,
+  "tiers": ["offline", "lab-scripted"],
+  "cast": {
+    "platform": {"role": "orchestrator", "charter": 1},
+    "coder": {"role": "coder", "reports_to": "platform", "issue": 2}
+  },
+  "issues": {
+    "2": {"intent": "Add a health check", "done_when": "GET /health returns 200"}
+  },
+  "steps": [
+    {"at": "0s", "actor": "you", "do": "message", "to": "platform", "text": "how is the health check going?",
+     "why": "You prompt the orchestrator: you are engaged with it for the next 10 minutes"},
+    {"at": "2s", "actor": "coder", "do": "turn", "lasts": "20s", "steps": 2,
+     "why": "The worker finishes at about 22 s; the item is ripe after the 90 s batch"},
+    {"at": "2m", "actor": "you", "do": "message", "to": "platform", "text": "and now?",
+     "why": "Your next message: the note that was waiting rides along with it"},
+    {"at": "150s", "actor": "world", "do": "wait"}
+  ],
+  "expect": [
+    {"name": "no-machine-turn", "that": "no_machine_turn", "agent": "platform",
+     "why": "Only your two messages started a model call on the orchestrator"},
+    {"name": "noted", "that": "delivered", "to": "platform", "key": "worker.stopped:*", "mode": "note", "count": 1,
+     "text": "issue #2"},
+    {"name": "one-message", "that": "message_count", "to": "platform", "count": 1}
+  ],
+  "control": {"fault": "no-engagement-gate", "fails": ["no-machine-turn", "noted"]}
+}

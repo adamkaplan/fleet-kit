@@ -1,0 +1,32 @@
+{
+  "id": "F4",
+  "title": "A background subagent finishes while you talk to the Chief of Staff",
+  "problem": 2,
+  "since_pr": 8,
+  "tiers": ["offline", "lab-scripted"],
+  "cast": {
+    "cos": {"role": "chief-of-staff"},
+    "cos-615": {"role": "cos-subagent", "reports_to": "cos", "issue": 615}
+  },
+  "issues": {
+    "615": {"intent": "Fix the project agents that show \"Agent unavailable\"",
+            "done_when": "both project agents answer a chat message in production"}
+  },
+  "steps": [
+    {"at": "0s", "actor": "you", "do": "message", "to": "cos", "text": "how is the staging fix going?",
+     "why": "You talk to the Chief of Staff: you are engaged with it for the next 10 minutes"},
+    {"at": "2s", "actor": "cos-615", "do": "turn", "lasts": "20s", "steps": 2,
+     "why": "The subagent finishes at about 22 s; the item is ripe after the 90 s batch"},
+    {"at": "2m", "actor": "you", "do": "message", "to": "cos", "text": "and now?",
+     "why": "Your next message: the note that was waiting rides along with it"},
+    {"at": "150s", "actor": "world", "do": "wait"}
+  ],
+  "expect": [
+    {"name": "no-machine-turn", "that": "no_machine_turn", "agent": "cos"},
+    {"name": "noted", "that": "delivered", "to": "cos", "key": "worker.stopped:*", "mode": "note", "count": 1,
+     "text": "issue #615",
+     "why": "The finishing is the worker-done fact (PR 4), here for a cos-subagent, delivered with the ask's number"},
+    {"name": "one-message", "that": "message_count", "to": "cos", "count": 1}
+  ],
+  "control": {"fault": "no-engagement-gate", "fails": ["no-machine-turn", "noted"]}
+}

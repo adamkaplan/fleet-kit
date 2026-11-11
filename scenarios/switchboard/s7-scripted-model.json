@@ -1,0 +1,23 @@
+{
+  "id": "S7",
+  "title": "Spike S7: the scripted model replies on cue and runs a shell tool round trip",
+  "problem": null,
+  "since_pr": 1,
+  "tiers": ["lab-scripted"],
+  "tags": ["spike"],
+  "cast": {
+    "coder": {"role": "coder", "issue": 7}
+  },
+  "steps": [
+    {"at": "0s", "actor": "coder", "do": "turn"},
+    {"at": "12s", "actor": "coder", "do": "turn", "lasts": "2s", "steps": 2}
+  ],
+  "expect": [
+    {"that": "within", "name": "reply-on-cue", "agent": "coder", "step": 0, "seconds": 3},
+    {"that": "tool_outcome", "name": "tool-round-trip", "agent": "coder", "tool": "shell", "outcome": "completed"}
+  ],
+  "control": {
+    "variant": {"steps": {"0": {"lasts": "8s"}, "1": {"steps": 1}}},
+    "fails": ["reply-on-cue", "tool-round-trip"]
+  }
+}

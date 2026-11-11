@@ -1,0 +1,37 @@
+[
+ {
+  "argv": "decisions answer api#2df maybe",
+  "as": "cos",
+  "code": 2,
+  "err": "fleet-switchboard: api#2df is a permission request: answer `allow` or `deny`\n",
+  "out": ""
+ },
+ {
+  "argv": "decisions answer api#2df",
+  "as": "cos",
+  "code": 2,
+  "err": "fleet-switchboard: answer api#2df with a value: `allow` or `deny` for a permission request, the text for a question\n",
+  "out": ""
+ },
+ {
+  "argv": "decisions answer api#2lp perhaps",
+  "as": "cos",
+  "code": 2,
+  "err": "fleet-switchboard: this question is yes or no: answer yes or no\n",
+  "out": ""
+ },
+ {
+  "argv": "decisions answer api#2wb many",
+  "as": "cos",
+  "code": 2,
+  "err": "fleet-switchboard: this question wants a number\n",
+  "out": ""
+ },
+ {
+  "argv": "decisions answer api#2wb --as-recommended",
+  "as": "cos",
+  "code": 2,
+  "err": "fleet-switchboard: api#2wb is not a batch: --as-recommended and --row answer a batch; answer this with its own value\n",
+  "out": ""
+ }
+]

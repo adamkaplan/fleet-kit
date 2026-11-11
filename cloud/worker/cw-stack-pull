@@ -1,0 +1,128 @@
+#!/usr/bin/env python3
+"""cw-stack-pull IMAGE...: pull images from the stack registry with a short-lived credential (ask #1022). Run as root through sudo
+(the sudoers rule has env_reset), given image references ONLY.
+
+The registry host, client id and tenant id come from the root-only token directory (never from the caller's environment or arguments).
+Steps: (1) trade the projected service-account token for an Entra access token; (2) trade that for a short-lived registry refresh token;
+(3) `docker login --password-stdin` into a private DOCKER_CONFIG directory on the memory tmpfs, `docker pull` each image, then remove the
+directory (also on failure and on SIGTERM). The credential is never printed, never an argument, never in the environment.
+Exit: 0 pulled, 1 the exchange or a pull failed (the message names the owner step), 2 refused input."""
+import json
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import urllib.error
+import urllib.parse
+import urllib.request
+
+TOKEN_DIR = "/opt/cw-registry/token"
+CRED_BASE = "/run/cw-tmp"
+ENTRA_URL = "https://login.microsoftonline.com/%s/oauth2/v2.0/token"
+ACR_SCOPE = "https://containerregistry.azure.net/.default"
+LOGIN_USER = "00000000-0000-0000-0000-000000000000"
+SERVICE_ACCOUNT = "cw-stack-puller"
+STEP_FEDERATED = ("the Entra exchange was refused or the token expired: owner step: check the federated credential for service account "
+                  + SERVICE_ACCOUNT + " (issuer, subject, audience) on the pull identity")
+STEP_ACRPULL = ("the registry refused the exchange: owner step: the registry's owner grants AcrPull on this registry to the pull identity's principal id")
+
+
+class Refused(Exception):
+    def __init__(self, msg, code=1):
+        super().__init__(msg)
+        self.code = code
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *a, **k):
+        return None
+
+
+def http_post(url, fields):
+    """POST a form; https only, no redirect. Returns (status, parsed JSON or {}). The body is never printed."""
+    if not url.startswith("https://"):
+        raise Refused("refused: not an https address", 2)
+    req = urllib.request.Request(url, data=urllib.parse.urlencode(fields).encode(), method="POST",
+                                 headers={"Content-Type": "application/x-www-form-urlencoded"})
+    try:
+        with urllib.request.build_opener(_NoRedirect).open(req, timeout=30) as r:
+            status, raw = r.status, r.read(1 << 20)
+    except urllib.error.HTTPError as e:
+        status, raw = e.code, b""
+    except (OSError, ValueError):
+        return 0, {}
+    try:
+        data = json.loads(raw or b"{}")
+    except ValueError:
+        data = {}
+    return status, data if isinstance(data, dict) else {}
+
+
+def _read(token_dir, name):
+    with open(os.path.join(token_dir, name)) as f:
+        return f.read().strip()
+
+
+def _docker(argv, cfg, stdin=None, runner=subprocess.run):
+    env = {"PATH": "/usr/local/bin:/usr/bin:/bin", "DOCKER_CONFIG": cfg, "HOME": cfg}
+    return runner(["docker"] + argv, input=stdin, env=env, capture_output=True, text=True, timeout=1800)
+
+
+def run(images, token_dir=TOKEN_DIR, cred_base=CRED_BASE, post=http_post, runner=subprocess.run):
+    if not images:
+        raise Refused("usage: cw-stack-pull IMAGE...", 2)
+    try:
+        host, client, tenant, assertion = (_read(token_dir, n) for n in ("registry-host", "client-id", "tenant-id", "token"))
+    except OSError:
+        raise Refused("no registry token is mounted in this pod: this pod was not made with the stack registry settings", 2)
+    for ref in images:   # only this registry's images, and nothing option-shaped
+        if not ref.startswith(host + "/") or ref.startswith("-") or any(c.isspace() for c in ref):
+            raise Refused("refused: an image is not on the configured registry", 2)
+    status, data = post(ENTRA_URL % urllib.parse.quote(tenant, safe=""), {
+        "grant_type": "client_credentials", "client_id": client, "scope": ACR_SCOPE,
+        "client_assertion_type": "urn:ietf:params:oauth:client-assertion-type:jwt-bearer", "client_assertion": assertion})
+    if status != 200 or not data.get("access_token"):
+        raise Refused(STEP_FEDERATED)
+    status, data = post("https://%s/oauth2/exchange" % host, {"grant_type": "access_token", "service": host, "access_token": data["access_token"]})
+    if status != 200 or not data.get("refresh_token"):
+        raise Refused(STEP_ACRPULL)
+    secret = data["refresh_token"]
+    cfg = tempfile.mkdtemp(prefix="stack-pull-", dir=cred_base)   # mode 0700
+    try:
+        os.chmod(cfg, 0o700)
+        r = _docker(["login", "-u", LOGIN_USER, "--password-stdin", host], cfg, stdin=secret, runner=runner)
+        for n in os.listdir(cfg):   # docker writes its config 0600 already; make it so
+            os.chmod(os.path.join(cfg, n), 0o600)
+        if r.returncode != 0:
+            raise Refused("docker login to the registry failed: owner step: the registry's owner grants AcrPull to the pull identity")
+        for ref in images:
+            r = _docker(["pull", ref], cfg, runner=runner)
+            if r.returncode != 0:
+                raise Refused("docker pull failed for an image (is it published, and does the identity have AcrPull?)")
+            print("pulled %s" % ref)
+        _docker(["logout", host], cfg, runner=runner)
+    finally:
+        shutil.rmtree(cfg, ignore_errors=True)
+
+
+def main(argv, **kw):
+    def _term(*_):
+        raise Refused("terminated", 1)
+    old = signal.signal(signal.SIGTERM, _term)
+    try:
+        run(argv, **kw)
+        return 0
+    except Refused as e:
+        print("cw-stack-pull: %s" % e, file=sys.stderr)
+        return e.code
+    finally:
+        signal.signal(signal.SIGTERM, old)
+
+
+if __name__ == "__main__":
+    if os.geteuid() != 0:
+        print("cw-stack-pull: run it as: sudo cw-stack-pull IMAGE...", file=sys.stderr)
+        sys.exit(2)
+    sys.exit(main(sys.argv[1:]))
