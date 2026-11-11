@@ -8523,6 +8523,16 @@ def cloud_head_checks(engine, repo, sha):
     return "passed"
 
 
+def cloud_branch_tip(engine, repo, branch):
+    """#2392: the full sha a branch of the repository stands at (one GET), or None on any failure."""
+    try:
+        got = engine.intents._api("repos/%s/git/ref/heads/%s" % (repo, urllib.parse.quote(branch, safe="/")), repo)
+        sha = ((got or {}).get("object") or {}).get("sha") if isinstance(got, dict) else None
+        return sha if isinstance(sha, str) else None
+    except Exception:
+        return None
+
+
 def cloud_end_tick(engine, discovery):
     """#1480: a cloud worker the launcher ended (idle, hard limit, pod gone, failed pod) tells its boss and the Chief of Staff in the same pass, once per run
     and reason. Reads the launcher's audit file from a stored cursor; sends through the daemon's own `send`. Returns what was handed to it."""
@@ -8535,6 +8545,7 @@ def cloud_end_tick(engine, discovery):
                                                      lambda worker, detail: engine.audit is not None and engine.audit.append(engine.actor, "cloud_end_alert.send_failed", worker, detail),
                                                      lambda directory, worker: load_module("cloud_worker").bind(globals())._retired().last_message(directory, state_dir, worker),
                                                      head_checks=lambda repo, sha: cloud_head_checks(engine, repo, sha),
+                                                     branch_tip=lambda repo, branch: cloud_branch_tip(engine, repo, branch),
                                                      last_push=load_module("cloud_end_alert").push_reader(getattr(getattr(engine, "audit", None), "path", None), load_module("record_json").parse_bounded))
 
 
