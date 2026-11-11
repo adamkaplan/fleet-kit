@@ -11698,6 +11698,8 @@ class GitHubHub:
     def _hook_api(self, repo, env, args):
         """One bounded `gh api` call on the repo's hooks, through the repo's account. Returns the stdout; raises GitHubUnavailable with a reason that holds no secret."""
         extra = {"env": env} if env is not None else {}
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo) or ".." in repo:   # the repo is part of the path: no dot segment, no odd character
+            raise GitHubUnavailable("not a repository name")
         try:
             done = self.runner([self.config["gh"], "api"] + args, capture_output=True, text=True,
                                timeout=self.config["call_timeout_seconds"], stdin=subprocess.DEVNULL, **extra)
@@ -11742,17 +11744,20 @@ class GitHubHub:
     def _hook_failed(self, watch, reason):
         """A failed list or removal: a note for `status` and ONE audit line per repo (until a cleanup works again). Never an error for the caller."""
         with self.lock:
-            watch.hook_note = "hook cleanup failed, stale webhooks stay (20 per repo cap): %s" % reason
+            watch.hook_note = "hook cleanup failed, stale webhooks stay (20 per repo cap; the account needs the admin:repo_hook scope to clear them): %s" % reason
             first = watch.repo not in self._hook_audited
             self._hook_audited.add(watch.repo)
         if first:
-            self._audit("github.hooks", watch.repo, {"error": reason})
+            self._audit("github.hooks", watch.repo, {"error": reason})   # once per repo for as long as the daemon runs
 
     def _clear_stale_hooks(self, watch, env):
         """Before a forwarder starts: remove every cli forwarder hook of the repo. At a start no forwarder child of THIS daemon runs for the repo, so none is ours and all
         of them are stale (a forwarder of another daemon on the same repo cannot be told apart: its hook looks the same; one daemon per repo is the supported setup, and
         the other forwarder, when it drops, finds that out through its own start). Never raises; a failure is the note and one audit line."""
         watch.hooks_before, watch.hook_id, watch.hook_claim_tried = None, None, False
+        if watch.state == "conflict":
+            return   # someone else forwards, by intent: its hook looks like a stale one, so a retry after a conflict removes nothing
+        found = {}
         try:
             found = self._forwarder_hooks(watch.repo, env)
             for hook_id in sorted(found)[:GITHUB_HOOK_REMOVALS]:
@@ -11760,18 +11765,20 @@ class GitHubHub:
                 found.pop(hook_id)
         except Exception as err:
             self._hook_failed(watch, _one_line(str(err), 200))
+            if found:   # a removal failed: the hooks still there are known, so the forwarder's own can still be told
+                with self.lock:
+                    watch.hooks_before = set(found)
             return
         with self.lock:
             watch.hooks_before, watch.hook_note = set(found), None
-            self._hook_audited.discard(watch.repo)
 
-    def _claim_hook(self, watch):
+    def _claim_hook(self, watch, found=None):
         """Learn which hook this forwarder made: the one forwarder hook that is not among those that existed when it started (gh prints no id). Two or none: not claimed,
         so nothing is removed for it. Never raises."""
         if watch.hook_id is not None or watch.hooks_before is None:
             return
         try:
-            new = set(self._forwarder_hooks(watch.repo, self.child_env(watch.repo))) - watch.hooks_before
+            new = set(found if found is not None else self._forwarder_hooks(watch.repo, self.child_env(watch.repo))) - watch.hooks_before
         except Exception as err:
             self._hook_failed(watch, _one_line(str(err), 200))
             return
@@ -11781,10 +11788,12 @@ class GitHubHub:
     def _release_hook(self, watch):
         """A forwarder is stopped: remove the hook it made, and no other. Never raises."""
         try:
-            self._claim_hook(watch)
-            if watch.hook_id is not None:
-                self._remove_hook(watch.repo, self.child_env(watch.repo), watch.hook_id)
-                watch.hook_id = None
+            env = self.child_env(watch.repo)
+            found = self._forwarder_hooks(watch.repo, env)   # one fresh list: the claim and the removal both rest on what exists NOW
+            self._claim_hook(watch, found)
+            if watch.hook_id is not None and watch.hook_id in found:   # an id that is no longer a cli forwarder hook is never deleted
+                self._remove_hook(watch.repo, env, watch.hook_id)
+            watch.hook_id = None
         except Exception as err:
             self._hook_failed(watch, _one_line(str(err), 200))
 
