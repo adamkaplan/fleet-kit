@@ -1,0 +1,33 @@
+{
+  "id": "R3",
+  "title": "The state directory is deleted while items are pending",
+  "problem": null,
+  "since_pr": 4,
+  "tiers": ["offline", "lab-scripted"],
+  "cast": {
+    "platform": {"role": "orchestrator", "charter": 1},
+    "coder": {"role": "coder", "reports_to": "platform", "issue": 2}
+  },
+  "issues": {
+    "2": {"intent": "Add a health check", "done_when": "GET /health returns 200"}
+  },
+  "steps": [
+    {"at": "0s", "actor": "coder", "do": "turn", "lasts": "20s", "why": "Finishes at about 20 s, while the daemon is down; the stop is triaged after the restart"},
+    {"at": "10s", "actor": "world", "do": "kill-daemon"},
+    {"at": "12s", "actor": "world", "do": "delete-state",
+     "why": "The audit log, the reminders and the Lab fact file all go; the item is still pending"},
+    {"at": "25s", "actor": "world", "do": "restart-daemon"},
+    {"at": "3m", "actor": "world", "do": "fact", "to": "platform", "key": "lab.fact:r3-later",
+     "summary": "Another event", "why": "A later message: with no dedupe it would carry the worker's key again"},
+    {"at": "6m", "actor": "world", "do": "wait"}
+  ],
+  "expect": [
+    {"name": "worker-once", "that": "delivered", "to": "platform", "key": "worker.stopped:*", "count": 1, "keys": 1,
+     "why": "What was delivered is a fact of the transcript, not of the state directory"},
+    {"name": "later", "that": "delivered", "to": "platform", "key": "lab.fact:r3-later", "count": 1},
+    {"name": "two-messages", "that": "message_count", "to": "platform", "count": 2},
+    {"name": "decisions-again", "that": "decisions_say", "at": "6m", "text": "No decisions are waiting on you.",
+     "why": "decisions.json went with the state directory; it is a projection, so the next pass wrote it again"}
+  ],
+  "control": {"fault": "no-dedupe", "fails": ["worker-once"]}
+}

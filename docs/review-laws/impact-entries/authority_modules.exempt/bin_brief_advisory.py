@@ -1,0 +1,2 @@
+bin/brief_advisory.py
+is_advisory and owner_hold_wanted only read a brief that bin/impact_brief.py built and answer whether the daemon writes an owner-hold label for a pull request the floor already holds; they clear, release and merge nothing. Trace: the only callers are impact_plan in bin/impact_hold.py and the Decisions row in bin/decision_core.py; the clear itself (bin/delegated_clear.py) does not read them, and a pull request whose brief names a material risk is held as before.

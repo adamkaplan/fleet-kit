@@ -1,0 +1,27 @@
+# The owner's: the one cluster-wide permission of the token service (ask #2002). It lets the service's account ask the cluster who owns a
+# bearer token (create on tokenreviews) and nothing else.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: token-mint-review
+  labels:
+    app: token-mint
+rules:
+  - apiGroups: ["authentication.k8s.io"]
+    resources: ["tokenreviews"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: token-mint-review
+  labels:
+    app: token-mint
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: token-mint-review
+subjects:
+  - kind: ServiceAccount
+    name: token-mint
+    namespace: cw

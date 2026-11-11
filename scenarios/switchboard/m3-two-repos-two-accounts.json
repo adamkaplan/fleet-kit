@@ -1,0 +1,40 @@
+{
+  "id": "M3",
+  "title": "Two repos, two gh accounts, the same issue number: each agent sees its own repo's Intent and nothing of the other's",
+  "problem": null,
+  "since_pr": 15,
+  "tiers": ["offline"],
+  "tags": ["multi-repo"],
+  "cast": {
+    "api-orch": {"role": "orchestrator", "charter": 1, "repo": "acme/api"},
+    "web-orch": {"role": "orchestrator", "charter": 1, "repo": "acme/web"}
+  },
+  "repos": {
+    "acme/api": {"account": "alice-bot"},
+    "acme/web": {"account": "acme-ci"}
+  },
+  "issues": {
+    "acme/api#1": {"intent": null},
+    "acme/api#2": {"intent": "API: add the health check", "done_when": "the api answers", "parent": 1},
+    "acme/web#1": {"intent": null},
+    "acme/web#2": {"intent": "WEB: build the landing page", "done_when": "the page renders", "parent": 1}
+  },
+  "config": {"batch_seconds": 10},
+  "steps": [
+    {"at": "30s", "actor": "world", "do": "comment", "repo": "acme/api", "issue": 2, "id": 1001,
+     "body": "api: please look",
+     "why": "Each repo answers only to its own account's token; the same number 2 is a different ask in each"},
+    {"at": "40s", "actor": "world", "do": "comment", "repo": "acme/web", "issue": 2, "id": 1002,
+     "body": "web: please look"},
+    {"at": "3m", "actor": "world", "do": "wait"}
+  ],
+  "expect": [
+    {"name": "api-sees-its-own", "that": "delivered", "to": "api-orch", "key": "github.comment:1001", "count": 1,
+     "text": "Ask api#2 Intent: API: add the health check"},
+    {"name": "web-sees-its-own", "that": "delivered", "to": "web-orch", "key": "github.comment:1002", "count": 1,
+     "text": "Ask web#2 Intent: WEB: build the landing page"},
+    {"name": "api-gets-nothing-else", "that": "message_count", "to": "api-orch", "count": 1},
+    {"name": "web-gets-nothing-else", "that": "message_count", "to": "web-orch", "count": 1}
+  ],
+  "control": {"fault": "one-account", "fails": ["api-sees-its-own", "web-sees-its-own"]}
+}
