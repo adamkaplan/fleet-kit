@@ -23,6 +23,7 @@ import re
 import stat
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -56,6 +57,80 @@ class Fail(Exception):
     def __init__(self, msg, code=1):
         super().__init__(str(msg).replace("\n", "?"))   # one line, always
         self.code = code
+
+
+# Ask #2426: LOG ONLY. A merge of a pull request, or a write to an issue or a ref through `api`, is recorded as one line in the pod's notes file, in the
+# shape the pod's pre-push hook writes: "<UTC time> <kind> <remote> <ref> <short sha>" (remote `github`, no sha: `-`). Nothing is refused because of the record,
+# a failing write is silent, and the call goes on exactly as before (a verb this client does not implement is still answered as before).
+NOTES_LOG = os.environ.get("CW_NOTES_LOG") or "/work/.pod-notes.log"
+NOTES_MAX_BYTES = 65536   # past this the file is cut to its last NOTES_KEEP_LINES lines
+NOTES_KEEP_LINES = 200
+WRITE_FLAGS = ("-f", "-F", "--field", "--raw-field", "--input")
+
+
+def note_kind(argv):
+    """(kind, ref) of a call that is to be recorded, or None. pr-merge: `pr merge [N]`; api-merge: a non-GET call to .../pulls/N/merge; ref-write: a non-GET call
+    to .../git/refs...; issue-write: a non-GET call to .../issues/... (a comment, a label, a state). Only the verb and the path are read, never a body."""
+    args = list(argv)
+    if not args:
+        return None
+    if args[0] != "api":
+        rest, skip = [], False
+        for a in args[1:]:   # a leading -R/--repo and its value come off, as main does
+            if skip:
+                skip = False
+            elif a in ("-R", "--repo") and not rest:
+                skip = True
+            else:
+                rest.append(a)
+        if args[0] == "pr" and rest[:1] == ["merge"]:
+            num = next((a for a in rest[1:] if a.isdigit()), "")
+            return "pr-merge", "pull/" + num if num else "pull"
+        return None
+    method, path, i = "", "", 1
+    while i < len(args):
+        a = args[i]
+        if a in ("-X", "--method") and i + 1 < len(args):
+            method, i = args[i + 1].upper(), i + 1
+        elif a.startswith("--method="):
+            method = a.split("=", 1)[1].upper()
+        elif a in ("-R", "--repo", "--jq", "-q", "-H", "--header", "--hostname") and i + 1 < len(args):
+            i += 1
+        elif a in WRITE_FLAGS and i + 1 < len(args):
+            method = method or "POST"   # as the real gh: a body field turns GET into POST
+            i += 1
+        elif not a.startswith("-") and not path:
+            path = a
+        i += 1
+    if not path or method in ("", "GET", "HEAD"):
+        return None
+    p = "/" + path.split("?")[0].strip("/")
+    if re.fullmatch(r"/repos/[^/]+/[^/]+/pulls/\d+/merge", p, re.I):
+        return "api-merge", p[1:]
+    if re.match(r"/repos/[^/]+/[^/]+/git/refs(/|$)", p, re.I):
+        return "ref-write", p[1:]
+    if re.match(r"/repos/[^/]+/[^/]+/issues(/|$)", p, re.I):
+        return "issue-write", p[1:]
+    return None
+
+
+def note_action(argv):
+    """Append one line to NOTES_LOG for a call `note_kind` names. Never raises, never refuses."""
+    try:
+        found = note_kind(argv)
+        if found is None:
+            return
+        ref = re.sub(r"[^A-Za-z0-9._/-]", "?", found[1])[:100]
+        line = "%s %s github %s -\n" % (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), found[0], ref)
+        with open(NOTES_LOG, "a") as f:
+            f.write(line)
+        if os.path.getsize(NOTES_LOG) > NOTES_MAX_BYTES:
+            with open(NOTES_LOG) as f:
+                keep = f.read().splitlines(True)[-NOTES_KEEP_LINES:]
+            with open(NOTES_LOG, "w") as f:
+                f.writelines(keep)
+    except Exception:
+        pass
 
 
 def api_base():
@@ -769,6 +844,7 @@ VERBS = {
 
 
 def main(argv):
+    note_action(argv)   # ask #2426: log only
     args = list(argv)
     group = args.pop(0) if args else ""
     verb = ""

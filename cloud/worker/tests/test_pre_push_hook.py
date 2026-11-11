@@ -35,6 +35,7 @@ class Hook(unittest.TestCase):
         os.mkdir(cls.repo)
         cls.env = {"PATH": "/usr/bin:/bin:/usr/local/bin", "HOME": cls.d, "GIT_CONFIG_NOSYSTEM": "1", "GIT_TERMINAL_PROMPT": "0",
                    "GIT_AUTHOR_NAME": "a", "GIT_AUTHOR_EMAIL": "a@x.invalid", "GIT_COMMITTER_NAME": "a", "GIT_COMMITTER_EMAIL": "a@x.invalid"}
+        cls.env["CW_NOTES_LOG"] = os.path.join(cls.d, "notes.log")   # ask #2426: the hook records pushes; a test never writes the pod's own notes file
         cls.git("init", "-q", "-b", "main", ".")
         cls.base = cls.commit("base", "")
         cls.git("branch", "side")
