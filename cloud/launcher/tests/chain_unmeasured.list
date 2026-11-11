@@ -28,6 +28,7 @@ cloud/launcher/tests/test_kept_running_once.py
 cloud/launcher/tests/test_known_forms.py
 cloud/launcher/tests/test_launch_idempotent.py
 cloud/launcher/tests/test_load_part.py
+cloud/launcher/tests/test_long_run_setting.py
 cloud/launcher/tests/test_m_cap_stopped.py
 cloud/launcher/tests/test_mint_retry.py
 cloud/launcher/tests/test_needs_docker_hermetic.py
@@ -75,11 +76,13 @@ cloud/worker/tests/test_base_merge_base.py
 cloud/worker/tests/test_cloud_prepush_background.py
 cloud/worker/tests/test_comment_by_id.py
 cloud/worker/tests/test_cw_gh.py
+cloud/worker/tests/test_cw_run.py
 cloud/worker/tests/test_dockerfile_browser.py
 cloud/worker/tests/test_dockerfile_pg_bundle.py
 cloud/worker/tests/test_dockerfile_postgres.py
 cloud/worker/tests/test_entrypoint.py
 cloud/worker/tests/test_entrypoint_import.py
+cloud/worker/tests/test_entrypoint_long_run.py
 cloud/worker/tests/test_guard_env.py
 cloud/worker/tests/test_plan_check_in_pod.py
 cloud/worker/tests/test_pr_branch_source.py
