@@ -147,6 +147,22 @@ def receipt_dir(env):
     return os.path.join(base, "fl" + "eet-switchboard", "cloud", "image-proof")
 
 
+def read_trusted(path):
+    """A receipt's text, or None: only a regular file of this user that nobody else can write, never a link (a planted receipt is skipped)."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != current_uid() or stat.S_IMODE(st.st_mode) & 0o022:
+            return None
+        with os.fdopen(fd, "rb", closefd=False) as f:
+            return f.read(65536).decode("utf-8", "replace")
+    finally:
+        os.close(fd)
+
+
 def read_receipts(directory, want):
     """The receipts of exactly this digest: a list of dicts (digest, time, revision, verdict). A file that cannot be read is skipped."""
     found = []
@@ -157,10 +173,8 @@ def read_receipts(directory, want):
     for name in names:
         if not name.endswith(".receipt"):
             continue
-        try:
-            with open(os.path.join(directory, name), "r", encoding="utf-8") as f:
-                text = f.read(65536)
-        except (OSError, UnicodeDecodeError):
+        text = read_trusted(os.path.join(directory, name))
+        if text is None:
             continue
         fields = dict(line.split(": ", 1) for line in text.splitlines() if ": " in line and not line.startswith("item "))
         if fields.get("digest") == want:
@@ -179,9 +193,14 @@ def check_gate(tool, source, want, env, now):
     revision = labels.get(REVISION_LABEL) if isinstance(labels, dict) else ""
     if not isinstance(revision, str) or not re.fullmatch(r"[0-9a-f]{40}", revision):
         raise Refused("the image has no revision label (%s); nothing was changed" % REVISION_LABEL)
-    near = run_crane(env.get("GIT") or "git", ["-C", REPO_ROOT, "merge-base", "--is-ancestor", revision, INTEGRATION_REF], env, "git merge-base", 60)
+    clean = {k: v for k, v in env.items() if not k.startswith("GIT_")}   # no GIT_DIR or the like can point the check at another repository; `git` is the one on PATH
+    try:
+        run_crane("git", ["-C", REPO_ROOT, "fetch", "-q", "origin", "integration"], clean, "git fetch", 60)   # best effort: a stale ref only refuses
+    except Refused:
+        pass
+    near = run_crane("git", ["-C", REPO_ROOT, "merge-base", "--is-ancestor", revision, INTEGRATION_REF], clean, "git merge-base", 60)
     if near.returncode != 0:
-        raise Refused("the image's revision %s is not a commit reachable from %s; nothing was changed" % (revision[:12], INTEGRATION_REF))
+        raise Refused("the image's revision %s is not a commit reachable from %s (run git fetch origin if the ref is old); nothing was changed" % (revision[:12], INTEGRATION_REF))
     receipts = read_receipts(receipt_dir(env), want)
     if not receipts:
         raise Refused("no proof receipt for %s; run cw-image-proof first; nothing was changed" % want[:19])

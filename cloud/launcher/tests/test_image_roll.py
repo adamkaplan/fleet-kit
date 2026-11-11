@@ -69,6 +69,7 @@ class Base(unittest.TestCase):
         stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         Path(state, "fl" + "eet-switchboard", "cloud", "image-proof", "r.receipt").write_text(
             "digest: sha256:%s\ntime: %s\nrevision: %s\nverdict: pass\n" % (HEX_A, stamp, "1" * 40))
+        os.chmod(os.path.join(state, "fl" + "eet-switchboard", "cloud", "image-proof", "r.receipt"), 0o600)
         patcher = mock.patch.dict(os.environ, {"XDG_STATE_HOME": state, "PATH": gitdir + os.pathsep + os.environ.get("PATH", "")})
         patcher.start()
         self.addCleanup(patcher.stop)

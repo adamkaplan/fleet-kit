@@ -91,15 +91,16 @@ def read_revision(env, source):
 def prove(args, env, now=None, sleep=time.sleep):
     now = now or (lambda: datetime.datetime.now(datetime.timezone.utc))
     match = DIGEST_RE.fullmatch(args.digest)
-    if not match or not REPO_RE.fullmatch(args.repo):
+    if not match or not REPO_RE.fullmatch(args.repo) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]*", args.branch):
         raise Refused("usage: DIGEST (name@sha256:<64 hex>) and --repo OWNER/NAME")
     digest = match.group(1)
     launcher = env.get("CW_CLOUD_LAUNCHER") or os.path.join(ROOT, "cloud", "launcher", "cloud-worker")
     kubectl = env.get("CW_KUBECTL") or "kubectl"
     revision = read_revision(env, args.digest)
-    worker = "proof-%s" % digest[7:19]
+    worker = "proof-%s-%s" % (digest[7:19], now().strftime("%d%H%M%S"))
     made = run([launcher, "create", worker, "--repo", args.repo, "--branch", args.branch, "--image", args.digest, "--no-commit", "--json"], env, 900)
     if made is None or made.returncode != 0:
+        run([launcher, "stop", worker, "--reason", "image proof launch failed"], env, 300)   # a launch that failed half-way may have made the pod
         raise Refused("the proof pod could not be launched (exit %s); no receipt was written" % ("?" if made is None else made.returncode))
     results = ""
     try:
@@ -107,7 +108,10 @@ def prove(args, env, now=None, sleep=time.sleep):
             pod = json.loads(made.stdout).get("pod") or worker
         except (ValueError, AttributeError):
             pod = worker
+        if not isinstance(pod, str) or not re.fullmatch(r"[a-z0-9][a-z0-9.-]*", pod):
+            pod = worker
         ns = ["-n", env["CW_CLOUD_NAMESPACE"]] if env.get("CW_CLOUD_NAMESPACE") else []
+        run([kubectl] + ns + [KUBE_RUN, pod, "--", "rm", "-f", RESULTS_PATH], env, 120)   # a results file the image brought with it is never read
         with open(os.path.join(ROOT, "cloud", "worker", "proof-set.md"), encoding="utf-8") as f:
             brief = f.read()
         run([kubectl] + ns + [KUBE_RUN, "-i", pod, "--", "sh", "-c", "cat > /work/proof-set.md"], env, 120, stdin=brief)
@@ -116,7 +120,8 @@ def prove(args, env, now=None, sleep=time.sleep):
             got = run([kubectl] + ns + [KUBE_RUN, pod, "--", "cat", RESULTS_PATH], env, 120)
             if got is not None and got.returncode == 0 and got.stdout.strip():
                 results = got.stdout
-                break
+                if all(any(l.split()[:1] == [item] for l in results.splitlines()) for item in ITEMS):
+                    break   # all six items are in: a partly written file is read again until the deadline
             if time.monotonic() >= deadline:
                 break
             sleep(10)

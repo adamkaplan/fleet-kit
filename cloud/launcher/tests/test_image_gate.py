@@ -79,13 +79,14 @@ class Base(unittest.TestCase):
         Path(self.settings).write_text("A=1\nCW_CLOUD_IMAGE=reg.example/cw@sha256:%s\nB=2\n" % ("c" * 64))
         os.chmod(self.settings, 0o600)
         os.utime(self.settings, (1_000_000_000, 1_000_000_000))
-        self.env = {"CRANE": os.path.join(self.fake, "crane"), "GIT": os.path.join(self.fake, "git"), "FAKE_DIR": self.fake,
-                    "XDG_STATE_HOME": self.state, "PATH": os.environ.get("PATH", ""), "CW_CLOUD_LAUNCHER": os.path.join(self.fake, "launcher"),
+        self.env = {"CRANE": os.path.join(self.fake, "crane"), "FAKE_DIR": self.fake,
+                    "XDG_STATE_HOME": self.state, "PATH": self.fake + os.pathsep + os.environ.get("PATH", ""), "CW_CLOUD_LAUNCHER": os.path.join(self.fake, "launcher"),
                     "CW_KUBECTL": os.path.join(self.fake, "kubectl")}
 
     def receipt(self, digest=HEX, verdict="pass", age_hours=1, revision=REV, name="r.receipt"):
         when = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=age_hours)).strftime("%Y-%m-%dT%H:%M:%SZ")
         Path(self.rdir, name).write_text("digest: sha256:%s\ntime: %s\nrevision: %s\nverdict: %s\n" % (digest, when, revision, verdict))
+        os.chmod(os.path.join(self.rdir, name), 0o600)
 
     def snap(self):
         st = os.stat(self.settings)
@@ -136,6 +137,34 @@ class Gate(Base):
             self.setUp()
             s5_case(self, module, setup)
         self.assertEqual(len(self.cases()), 6)
+
+    def test_a_receipt_of_another_revision_a_future_time_and_a_newer_fail_are_refused(self):
+        module = load(ROLL)
+        for setup in (lambda: self.receipt(revision="2" * 40), lambda: self.receipt(age_hours=-2),
+                      lambda: (self.receipt(name="a.receipt", age_hours=3), self.receipt(name="b.receipt", verdict="fail", age_hours=1))):
+            self.setUp()
+            before = self.snap()
+            setup()
+            self.assertNotEqual(self.roll(module)[0], 0)
+            self.assertEqual(self.snap(), before)
+
+    def test_a_planted_receipt_a_link_or_a_writable_file_is_not_read_and_git_env_is_dropped(self):
+        module = load(ROLL)
+        self.receipt()
+        os.chmod(os.path.join(self.rdir, "r.receipt"), 0o666)
+        self.assertNotEqual(self.roll(module)[0], 0)
+        os.chmod(os.path.join(self.rdir, "r.receipt"), 0o600)
+        self.assertEqual(self.roll(module)[0], 0)
+        self.setUp()
+        self.receipt(name="real")
+        os.symlink(os.path.join(self.rdir, "real"), os.path.join(self.rdir, "l.receipt"))
+        self.assertNotEqual(self.roll(module)[0], 0)
+        self.setUp()
+        self.receipt()
+        self.env["GIT_DIR"] = "/nonexistent"
+        Path(self.fake, "gitenv").write_text("")
+        Path(self.fake, "git").write_text('#!/bin/sh\n[ -n "$GIT_DIR" ] && exit 1\nexit 0\n')
+        self.assertEqual(self.roll(module)[0], 0)
 
     def test_s5_the_revision_is_asked_of_git_against_the_integration_tip(self):
         self.receipt()
@@ -216,13 +245,24 @@ class Receipt(Base):
         code, out, err = self.roll(load(ROLL))
         self.assertNotEqual(code, 0)
 
-    def test_a_launch_that_fails_writes_no_receipt_and_launches_no_stop(self):
+    def test_a_launch_that_fails_writes_no_receipt_and_still_retires(self):
         Path(self.fake, "launchexit").write_text("1")
         proof = load(PROOF)
         args = types.SimpleNamespace(digest=SRC, repo="acme/widget", branch="integration", wait=0)
         with self.assertRaises(proof.Refused):
             proof.prove(args, dict(self.env), now=lambda: NOW, sleep=lambda s: None)
         self.assertEqual(os.listdir(self.rdir), [])
+        self.assertEqual(len([l for l in self.log("launcher") if l.startswith("stop ")]), 1)
+
+    def test_a_partly_written_results_file_is_read_again(self):
+        Path(self.fake, "results").write_text("pg-env pass\n")   # never completes: the deadline ends it and the verdict is fail, with the missing items named
+        proof, (verdict, line) = self.prove()
+        self.assertEqual(verdict, "fail")
+        self.assertIn("failed: hook", line)
+
+    def test_a_duplicated_item_is_a_fail(self):
+        proof = load(PROOF)
+        self.assertEqual(proof.judge("".join("%s pass\n" % i for i in ITEMS) + "hook fail\n")[0], "fail")
 
 
 class Pins(unittest.TestCase):
