@@ -120,6 +120,8 @@ class Stall(unittest.TestCase):
             for k in ("activity", "updated"):
                 if k in fields:
                     out[k] = now.timestamp() - fields[k] * 60
+            if "msg_time" in fields:
+                out["msg_time"] = now.timestamp() - fields["msg_time"] * 60
             if "running" in fields:
                 out["running"] = fields["running"]
             return out
@@ -134,6 +136,10 @@ class Stall(unittest.TestCase):
             w.add(**stale)
             self._session(w, **fields)
             self.assertEqual(conditions(w.run(module)), want, "a working agent was called stalled: %s" % label if not want else "a quiet agent was not alerted: %s" % label)
+        w = World()
+        w.add(**stale)
+        self._session(w, activity=20, updated=20, running=True)   # a running turn past the 15 minutes but under 30 is working
+        self.assertEqual(conditions(w.run(module)), [], "a running turn was called stalled")
         w = World()
         w.add(**stale)
         self._session(w, activity=31, updated=31, running=True)   # the guard: a running turn quiet for 31 minutes is the old stranding
@@ -163,6 +169,26 @@ class Stall(unittest.TestCase):
             self.assertIn("decided from the files", w.audits[0]["evidence"])
             self.assertIn("session", w.audits[0]["evidence"])
 
+    def test_s3_failed_run_idle_running_and_forged_cases(self):
+        def pod(**f):
+            w = World()
+            w.add(progress_age=16, msg_age=16, runs=[("t", 16, "FAILED")], exits=[("t", 2, 16)])
+            self._session(w, **f)
+            return w
+        self.assertEqual(conditions(pod(activity=5, updated=5, running=True).run()), [])
+        self.assertEqual(conditions(pod(activity=15, updated=15, running=True).run()), [])   # running, 15 min quiet: both silent
+        self.assertEqual(conditions(pod(activity=16, updated=16, running=False).run()), ["failed-run-idle", "progress-stale"])
+        w = pod(activity=-10 ** 6, updated=-10 ** 6, running=True)   # a forged future time
+        self.assertEqual(conditions(w.run()), ["failed-run-idle", "progress-stale"])
+        self.assertIn("decided from the files", [a for a in w.audits if a["condition"] == "failed-run-idle"][0]["evidence"])
+
+    def test_s3_a_forged_session_change_time_does_not_hide_a_failed_run(self):
+        for forged in (-10 ** 6, float("inf"), float("nan")):
+            w = World()
+            w.add(progress_age=200, msg_age=200, runs=[("t", 200, "FAILED")], exits=[("t", 2, 200)])
+            self._session(w, msg_time=forged)
+            self.assertIn("failed-run-idle", conditions(w.run()), forged)
+
     def test_s4_a_failed_run_idle_without_session_fields_says_so_and_a_forged_time_does_not_silence(self):
         w = World()
         w.add(progress_age=11, msg_age=11, runs=[("t", 11, "FAILED")], exits=[("t", 2, 11)])
@@ -181,7 +207,8 @@ class Stall(unittest.TestCase):
         with open(SOURCE) as f:
             text = f.read()
         for old, new, anchor in (("working, why = session_state(data, now, STALE_SECONDS)", "working, why = False, ''", "a working agent was called stalled"),
-                                 ("RUNNING_QUIET_SECONDS = 30 * 60", "RUNNING_QUIET_SECONDS = 10 ** 9", "a hung turn was called working")):
+                                 ("RUNNING_QUIET_SECONDS = 30 * 60", "RUNNING_QUIET_SECONDS = 10 ** 9", "a hung turn was called working"),
+                                 ("if running and age < RUNNING_QUIET_SECONDS:", "if False:", "a running turn was called stalled")):
             self.assertEqual(text.count(old), 1, "the mutation did not apply")
             mod = types.ModuleType("stall_watch_mutant")
             exec(compile(text.replace(old, new), "mutant", "exec"), mod.__dict__)

@@ -89,6 +89,8 @@ try:
         u = (ss[-1].get("time") or {}).get("updated")
         if isinstance(u, (int, float)) and not isinstance(u, bool):
             out["msg_time"] = u / 1000.0 if u > 1e11 else u
+            if out["msg_time"] > out["now"] + 60:
+                out["msg_time"] = None
             out["updated"] = out["msg_time"]
         try:
             act = get("/api/session/active").get("data")
@@ -201,6 +203,8 @@ def decide(data):
     ptime = _num(prog.get("mtime")) if prog else None
     tail = [str(x) for x in (prog.get("tail") or [])] if prog else []
     stime = _num(data.get("msg_time"))
+    if stime is not None and not (stime <= now + 60 and abs(stime) != float("inf")):   # a future or non-finite session time is read as missing (a pod could write any value)
+        stime = None
     # (a)
     times = [t for t in [ptime] + [_num(r["mtime"]) for r in runs] if t is not None]
     active = any(r.get("name") not in exited and now - _num(r["mtime"]) < RUN_ACTIVE_SECONDS for r in runs)
