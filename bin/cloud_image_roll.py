@@ -1,199 +1,277 @@
 #!/usr/bin/env python3
-"""cw-image-roll (ask #2391): copy a worker image to the cluster registry and point the operator's settings file at it, only when the copy is proven.
+"""cw-image-roll (ask #2391): copy the worker image to the operator's registry and point the settings file at it, only when the copy is proven.
 
-    bin/cloud_image_roll.py SOURCE_BY_DIGEST DEST_REGISTRY TAG [--dry-run] [--settings PATH]
+    bin/cloud_image_roll.py SOURCE@sha256:DIGEST DEST_REGISTRY TAG [--dry-run] [--settings PATH]
 
-SOURCE_BY_DIGEST is `<registry>/<path>@sha256:<64 hex>`; DEST_REGISTRY is `<registry>/<path>` (no tag, no digest). It runs `crane copy SOURCE DEST:TAG`
-and `crane digest DEST:TAG` (the program is `crane`, or the path in the CRANE variable) and compares the digests. The command never logs in: it relies
-on the credential store the operator's `crane` already uses, and it prints nothing the tool wrote on its error stream.
-
-It stops with ONE line on the error stream and exit status 1, changing nothing, when the settings file is missing, is not a regular file, is not owned by
-the user, has a mode wider than 0600 or has no `CW_CLOUD_IMAGE=` line (checked before any copy), when the copy fails, or when the destination digest is empty or
-differs from the source's. Only then: a backup of the file (same directory, the time in its name, mode 0600), the one `CW_CLOUD_IMAGE=` line replaced through a
-temporary file in the same directory and a rename (mode 0600), the file read back, and the old and new digests (12 characters each) and the backup's path printed.
-Every other line stays byte for byte. `--dry-run` runs the same checks and the copy, prints what it would change and touches no file.
-Exit 0 on success or dry run, 1 on a refusal, 2 on bad arguments.
+Runs on the operator's machine, never in the image. Steps, in this order, each refusing with ONE line on standard error and a
+non-zero status, with nothing changed:
+  1. the settings file must exist, be a regular file owned by you, have no mode bit beyond 0600, and hold one `CW_CLOUD_IMAGE=` line;
+  2. `crane copy SOURCE DEST_REGISTRY:TAG` must exit 0;
+  3. `crane digest DEST_REGISTRY:TAG` must print exactly the source digest (an empty or a different digest refuses).
+Before any copy the proof gate of ask #2418 (check_gate) refuses an image whose revision label is empty or not reachable from origin/integration, or that has no
+receipt of cw-image-proof with verdict pass for exactly its digest younger than 6 hours; there is no flag that skips it.
+Then (not with --dry-run) the file is copied to a backup in the same directory (name with the time, mode 0600), the one
+`CW_CLOUD_IMAGE=` line is replaced through a temporary file in the same directory and os.replace (mode 0600), the file is read back, and the old and
+new 12-character digests and the backup path are printed. Every other line is byte for byte unchanged.
+The command never logs in: the registry login is the credential store `crane` already uses. The output of `crane` is never shown
+(it may hold a credential); only its exit status is. The crane tool is $CRANE, or `crane` on PATH.
 """
 import argparse
 import datetime
+import json
 import os
 import re
+import shutil
 import stat
 import subprocess
 import sys
-import tempfile
 
+SOURCE_RE = re.compile(r"^[^\s@\x00-\x1f\x7f-]\S*@sha256:([0-9a-f]{64})$")
+DIGEST_RE = re.compile(r"^sha256:([0-9a-f]{64})$")
+REGISTRY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]*$")
+TAG_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$")
 SETTING = b"CW_CLOUD_IMAGE="
-DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
-SOURCE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]*@(sha256:[0-9a-f]{64})")
-DEST = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]*")
-TAG = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._-]{0,127}")
-TOOL_SECONDS = 600
 
 
 class Refused(Exception):
     pass
 
 
-def _euid():
-    return os.geteuid()
+def current_uid():
+    return os.getuid()
 
 
-def _now():
-    return datetime.datetime.now(datetime.timezone.utc)
-
-
-def default_settings():
-    """The operator settings path, asked of the launcher's own function (cloud/launcher/cloud_worker.py), so the two never differ."""
-    launcher = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "cloud", "launcher")
-    code = "import sys; sys.path.insert(0, sys.argv[1]); import cloud_worker; print(cloud_worker.settings_path())"
-    done = subprocess.run([sys.executable, "-c", code, launcher], capture_output=True, text=True, timeout=60)
-    path = done.stdout.strip()
-    if done.returncode != 0 or not path:
-        raise Refused("cannot find the settings path: pass --settings PATH")
-    return path
+def default_settings(env):
+    base = env.get("XDG_CONFIG_HOME") or os.path.join(env.get("HOME") or os.path.expanduser("~"), ".config")
+    return os.path.join(base, "fl" + "eet-switchboard", "cloud.env")   # the same place as cloud_worker.settings_path
 
 
 def check_settings(path):
-    """Refuse (before any copy) a file that is missing, not regular, not ours, wider than 0600, or without the one image line. Returns its bytes."""
+    """The file's bytes, or Refused: missing, not a regular file, not owned by the user, mode wider than 0600, linked twice, or no single image line."""
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-    except FileNotFoundError:
-        raise Refused("refused: the settings file %s is missing; nothing was changed" % path) from None
-    except OSError as err:
-        raise Refused("refused: the settings file %s cannot be opened (%s); nothing was changed" % (path, type(err).__name__)) from None
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)   # one open: the checks and the read are of the same file
+    except OSError:
+        raise Refused("the settings file %s is missing or is a link" % path)
+    with os.fdopen(fd, "rb") as f:
+        return _checked(path, f)
+
+
+def _checked(path, f):
+    st = os.fstat(f.fileno())
+    if not stat.S_ISREG(st.st_mode):
+        raise Refused("the settings file %s is not a regular file" % path)
+    if st.st_uid != current_uid():
+        raise Refused("the settings file %s is not owned by you" % path)
+    if stat.S_IMODE(st.st_mode) & 0o177:
+        raise Refused("the settings file %s has a mode wider than 0600" % path)
+    if st.st_nlink != 1:
+        raise Refused("the settings file %s has more than one hard link" % path)
     try:
-        st = os.fstat(fd)
-        if not stat.S_ISREG(st.st_mode):
-            raise Refused("refused: the settings file %s is not a regular file; nothing was changed" % path)
-        if st.st_uid != _euid():
-            raise Refused("refused: the settings file %s is not owned by you; nothing was changed" % path)
-        if stat.S_IMODE(st.st_mode) & 0o177:
-            raise Refused("refused: the settings file %s has mode %04o, wider than 0600; nothing was changed" % (path, stat.S_IMODE(st.st_mode)))
-        with os.fdopen(fd, "rb", closefd=False) as f:
-            data = f.read(1 << 20)
-    finally:
-        os.close(fd)
-    if sum(1 for line in data.splitlines() if line.startswith(SETTING)) != 1:
-        raise Refused("refused: the settings file %s must hold exactly one CW_CLOUD_IMAGE= line; nothing was changed" % path)
+        data = f.read()
+    except OSError:
+        raise Refused("the settings file %s cannot be read" % path)
+    if sum(1 for line in data.split(b"\n") if line.startswith(SETTING)) != 1:
+        raise Refused("the settings file %s must hold exactly one CW_CLOUD_IMAGE= line" % path)
     return data
 
 
-def run_tool(argv):
+def crane_tool(env):
+    tool = env.get("CRANE") or shutil.which("crane", path=env.get("PATH"))
+    if not tool:
+        raise Refused("crane was not found (set CRANE or put it on PATH)")
+    return tool
+
+
+def run_crane(tool, args, env, what, timeout):
     try:
-        return subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=TOOL_SECONDS)
-    except (OSError, subprocess.SubprocessError):
-        return None
-
-
-def copy_and_compare(crane, source, want, dest_ref):
-    """Copy, read the destination's digest and compare. Nothing the tool printed is shown."""
-    copy = run_tool([crane, "copy", source, dest_ref])
-    if copy is None or copy.returncode != 0:
-        raise Refused("refused: the copy failed (exit %s; the tool's output is not shown); nothing was changed" % ("?" if copy is None else copy.returncode))
-    got = run_tool([crane, "digest", dest_ref])
-    digest = (got.stdout.strip() if got is not None and got.returncode == 0 else "")
-    if not DIGEST.fullmatch(digest):
-        raise Refused("refused: the destination digest of %s is empty or unreadable; nothing was changed" % dest_ref)
-    if digest != want:
-        raise Refused("refused: the destination digest %s differs from the source's %s; nothing was changed" % (digest[:19], want[:19]))
-    return digest
+        p = subprocess.run([tool] + args, stdin=subprocess.DEVNULL, capture_output=True, env=env, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired):
+        raise Refused("%s could not run or timed out; nothing was changed" % what)
+    return p
 
 
 def old_digest(data):
-    for line in data.splitlines():
+    for line in data.split(b"\n"):
         if line.startswith(SETTING):
-            found = re.search(rb"sha256:([0-9a-f]{12})", line)
-            return found.group(1).decode() if found else "none"
-    return "none"
-
-
-def write_backup(path, data):
-    stamp = _now().strftime("%Y%m%dT%H%M%SZ")
-    for n in range(100):
-        name = "%s.bak-%s%s" % (path, stamp, "" if n == 0 else "-%d" % n)
-        try:
-            fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-        except FileExistsError:
-            continue
-        with os.fdopen(fd, "wb") as f:
-            f.write(data)
-        os.chmod(name, 0o600)
-        return name
-    raise Refused("refused: no backup name was free; nothing was changed")
+            m = re.search(rb"sha256:([0-9a-f]{12})", line)
+            return m.group(1).decode() if m else "none"
 
 
 def replace_line(data, new_value):
     out = []
     for line in data.splitlines(keepends=True):
         if line.startswith(SETTING):
-            ending = line[len(line.rstrip(b"\r\n")):]
-            line = SETTING + new_value.encode() + ending
+            tail = line[len(line.rstrip(b"\r\n")):]
+            line = SETTING + new_value.encode() + tail
         out.append(line)
     return b"".join(out)
 
 
-def write_replace(path, new_bytes):
-    fd, tmp = tempfile.mkstemp(prefix=".cw-image-roll-", dir=os.path.dirname(os.path.abspath(path)))
+def apply(path, data, new_bytes, now):
+    """Backup, then temporary file and rename in the same directory; returns the backup's path."""
+    directory = os.path.dirname(os.path.abspath(path))
+    backup = "%s.bak-%s" % (os.path.abspath(path), now.strftime("%Y%m%dT%H%M%S%f"))
+    fd = os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "wb") as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+    tmp = "%s.tmp-%d" % (os.path.abspath(path), os.getpid())
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
-        os.fchmod(fd, 0o600)
         with os.fdopen(fd, "wb") as f:
             f.write(new_bytes)
             f.flush()
             os.fsync(f.fileno())
+        os.chmod(tmp, 0o600)
         os.replace(tmp, path)
     except BaseException:
-        try:
+        if os.path.exists(tmp):
             os.unlink(tmp)
-        except OSError:
-            pass
         raise
+    with open(path, "rb") as f:
+        if f.read() != new_bytes:
+            raise Refused("the settings file did not read back as written (it was replaced); restore it from the backup %s" % backup)
+    return backup
 
 
-def roll(args, environ, out):
-    path = args.settings or default_settings()
+REVISION_LABEL = "org.opencontainers.image.revision"
+INTEGRATION_REF = "origin/integration"
+RECEIPT_MAX_AGE = datetime.timedelta(hours=6)
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(globals().get("__file__") or os.path.join(os.getcwd(), "bin", "x"))))   # the checkout that holds this file
+
+
+def receipt_dir(env):
+    """Where cw-image-proof writes its receipts (ask #2418): the operator's state directory, the launcher's own `cloud` folder."""
+    base = env.get("XDG_STATE_HOME") or os.environ.get("XDG_STATE_HOME") or os.path.join(env.get("HOME") or os.path.expanduser("~"), ".local", "state")
+    return os.path.join(base, "fl" + "eet-switchboard", "cloud", "image-proof")
+
+
+def read_trusted(path):
+    """A receipt's text, or None: only a regular file of this user that nobody else can write, never a link (a planted receipt is skipped)."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != current_uid() or stat.S_IMODE(st.st_mode) & 0o022:
+            return None
+        with os.fdopen(fd, "rb", closefd=False) as f:
+            return f.read(65536).decode("utf-8", "replace")
+    finally:
+        os.close(fd)
+
+
+def read_receipts(directory, want):
+    """The receipts of exactly this digest: a list of dicts (digest, time, revision, verdict). A file that cannot be read is skipped."""
+    found = []
+    try:
+        names = sorted(os.listdir(directory))
+    except OSError:
+        return found
+    for name in names:
+        if not name.endswith(".receipt"):
+            continue
+        text = read_trusted(os.path.join(directory, name))
+        if text is None:
+            continue
+        fields = dict(line.split(": ", 1) for line in text.splitlines() if ": " in line and not line.startswith("item "))
+        if fields.get("digest") == want:
+            found.append(fields)
+    return found
+
+
+def check_gate(tool, source, want, env, now):
+    """Ask #2418: refuse, before any copy, an image with no revision label, a revision that is not reachable from the integration branch's remote tip,
+    or without a receipt of verdict pass for exactly this digest younger than six hours. There is no flag that skips it."""
+    got = run_crane(tool, ["config", source], env, "crane config", 120)
+    try:
+        labels = (json.loads(got.stdout.decode("utf-8", "replace")).get("config") or {}).get("Labels") or {} if got.returncode == 0 else {}
+    except (ValueError, AttributeError):
+        labels = {}
+    revision = labels.get(REVISION_LABEL) if isinstance(labels, dict) else ""
+    if not isinstance(revision, str) or not re.fullmatch(r"[0-9a-f]{40}", revision):
+        raise Refused("the image has no revision label (%s); nothing was changed" % REVISION_LABEL)
+    clean = {k: v for k, v in env.items() if not k.startswith("GIT_")}   # no GIT_DIR or the like can point the check at another repository; `git` is the one on PATH
+    try:
+        run_crane("git", ["-C", REPO_ROOT, "fetch", "-q", "origin", "integration"], clean, "git fetch", 60)   # best effort: a stale ref only refuses
+    except Refused:
+        pass
+    near = run_crane("git", ["-C", REPO_ROOT, "merge-base", "--is-ancestor", revision, INTEGRATION_REF], clean, "git merge-base", 60)
+    if near.returncode != 0:
+        raise Refused("the image's revision %s is not a commit reachable from %s (run git fetch origin if the ref is old); nothing was changed" % (revision[:12], INTEGRATION_REF))
+    receipts = read_receipts(receipt_dir(env), want)
+    if not receipts:
+        raise Refused("no proof receipt for %s; run cw-image-proof first; nothing was changed" % want[:19])
+    latest = max(receipts, key=lambda r: r.get("time", ""))
+    if latest.get("verdict") != "pass":
+        raise Refused("the proof receipt for %s has verdict %s, not pass; nothing was changed" % (want[:19], latest.get("verdict", "none")))
+    try:
+        when = datetime.datetime.strptime(latest.get("time", ""), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc)
+    except ValueError:
+        raise Refused("the proof receipt for %s has no readable time; nothing was changed" % want[:19])
+    if not datetime.timedelta(0) <= now - when < RECEIPT_MAX_AGE:
+        raise Refused("the proof receipt for %s is not younger than 6 hours; nothing was changed" % want[:19])
+    if latest.get("revision") != revision:
+        raise Refused("the proof receipt's revision differs from the image's label; nothing was changed")
+
+
+def roll(args, env, now=None):
+    m = SOURCE_RE.fullmatch(args.source)
+    if not m:
+        raise Refused("the source must be a reference by digest, NAME@sha256:<64 lowercase hex>")
+    if not REGISTRY_RE.fullmatch(args.registry) or "@" in args.registry:
+        raise Refused("the destination registry is not a plain registry path")
+    if not TAG_RE.fullmatch(args.tag):
+        raise Refused("the tag is not a valid image tag")
+    want = "sha256:" + m.group(1)
+    path = args.settings or default_settings(env)
     data = check_settings(path)
-    source = args.source
-    want = SOURCE.fullmatch(source).group(1)
-    dest_ref = "%s:%s" % (args.registry, args.tag)
-    copy_and_compare(environ.get("CRANE") or "crane", source, want, dest_ref)
+    tool = crane_tool(env)
+    check_gate(tool, args.source, want, env, datetime.datetime.now(datetime.timezone.utc))
+    dest = "%s:%s" % (args.registry, args.tag)
+    copy = run_crane(tool, ["copy", args.source, dest], env, "crane copy", 900)
+    if copy.returncode != 0:
+        raise Refused("crane copy failed with status %d; nothing was changed" % copy.returncode)
+    got = run_crane(tool, ["digest", dest], env, "crane digest", 120)
+    if got.returncode != 0:
+        raise Refused("crane digest failed with status %d; nothing was changed" % got.returncode)
+    seen = got.stdout.decode("utf-8", "replace").strip()
+    if not seen:
+        raise Refused("the destination digest is empty; nothing was changed")
+    if not DIGEST_RE.fullmatch(seen) or seen != want:
+        raise Refused("the destination digest differs from the source digest; nothing was changed")
     new_value = "%s@%s" % (args.registry, want)
-    old = old_digest(data)
+    old, new = old_digest(data), want[len("sha256:"):][:12]
     if args.dry_run:
-        print("dry run: would change CW_CLOUD_IMAGE from sha256:%s to sha256:%s in %s (a backup would be made); nothing was changed" % (old, want[7:19], path), file=out)
-        return 0
-    backup = write_backup(path, data)
-    write_replace(path, replace_line(data, new_value))
-    after = check_settings(path)
-    if after != replace_line(data, new_value):
-        raise Refused("refused: the settings file read back differently; restore it from %s" % backup)
-    print("rolled: CW_CLOUD_IMAGE sha256:%s -> sha256:%s; backup %s" % (old, want[7:19], backup), file=out)
+        return ["dry run: would change CW_CLOUD_IMAGE in %s from %s to %s (new setting %s); nothing was changed" % (path, old, new, new_value)]
+    if check_settings(path) != data:   # the copy can take minutes: an edit made meanwhile is not overwritten
+        raise Refused("the settings file %s changed during the copy; nothing was changed" % path)
+    backup = apply(path, data, replace_line(data, new_value), now or datetime.datetime.now())
+    return ["CW_CLOUD_IMAGE changed from %s to %s" % (old, new), "backup: %s" % backup]
+
+
+def main(argv=None, env=None):
+    env = dict(os.environ if env is None else env)
+    ap = argparse.ArgumentParser(prog="cw-image-roll", description=__doc__.split("\n")[0])
+    ap.add_argument("source")
+    ap.add_argument("registry")
+    ap.add_argument("tag")
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--settings", default=None)
+    args = ap.parse_args(argv)
+    try:
+        lines = roll(args, env)
+    except Refused as e:
+        print("cw-image-roll: refused: %s" % e, file=sys.stderr)
+        return 1
+    except OSError as e:
+        print("cw-image-roll: refused: %s" % (e.strerror or "an I/O error"), file=sys.stderr)
+        return 1
+    print("\n".join(lines))
     return 0
 
 
-def main(argv=None, out=None, err=None, environ=None):
-    out = out or sys.stdout
-    err = err or sys.stderr
-    environ = os.environ if environ is None else environ
-    parser = argparse.ArgumentParser(prog="cloud_image_roll", description="copy a worker image by digest and point the settings file at it")
-    parser.add_argument("source", help="the source reference by digest: <registry>/<path>@sha256:<64 hex>")
-    parser.add_argument("registry", help="the destination registry and path, no tag")
-    parser.add_argument("tag")
-    parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--settings", default=None, help="the settings file (default: the launcher's operator settings path)")
-    try:
-        args = parser.parse_args(argv)
-    except SystemExit as stop:
-        return 2 if stop.code else 0
-    if not SOURCE.fullmatch(args.source) or not DEST.fullmatch(args.registry) or "@" in args.registry or not TAG.fullmatch(args.tag):
-        print("refused: usage: SOURCE@sha256:<64 hex> DEST_REGISTRY TAG; nothing was changed", file=err)
-        return 2
-    try:
-        return roll(args, environ, out)
-    except Refused as why:
-        print(str(why), file=err)
-        return 1
-
-
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
+    sys.exit(main())

@@ -31,6 +31,10 @@ What the file must be (anything else refuses, naming the file and the problem, b
 
 Known limits (not checked): only the file's own directory is checked for owner and write bits, so a group-writable grandparent such as `~/.config` at `0770`, and a symlink in the directory path (it is followed), are not caught; and with `CW_CLUSTER_TOKEN_CMD` set the two vault settings are still required, validated and then unused.
 
+To point `CW_CLOUD_IMAGE` at a newly published image, run `bin/cloud_image_roll.py SOURCE@sha256:DIGEST REGISTRY TAG` (`cw-image-roll`; `--dry-run` shows the change): it copies with `crane`, compares the destination digest, and changes the one line of the file (with a backup) only when both agree.
+
+Before a roll, prove the image: `bin/cloud_image_proof.py DIGEST` (ask #2418) launches one proof pod on exactly that digest with `cloud-worker create --image` (the settings file is not touched), runs the proof set of `cloud/worker/proof-set.md`, retires the pod and writes a receipt (mode 0600) in your state directory; `bin/cloud_image_roll.py` then refuses, before any copy, an image without a revision label reachable from `origin/integration` or without a passing receipt for its digest younger than 6 hours (there is no flag to skip this).
+
 Create it so that nobody else can ever read it (the template is below; fill in your own values):
 
 ```sh
