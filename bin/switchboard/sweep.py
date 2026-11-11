@@ -682,7 +682,7 @@ def sweep_findings(engine, state, decisions, home, now, cfg, regex, defer=(), de
                 state.sources[("S2", ref_text(repo, number))] = (
                     {"source": "body", "match": "the PR body says it waits"} if item["body_waits"] else
                     {"source": "comment:%s" % (ids[waiting[-1]] if waiting and waiting[-1] < len(ids) else "?"), "match": "a recent comment says it waits"})
-            if item["pr"]:   # #133: the label is the truth; the first-line marker is read only in the transition window
+            if item["pr"]:   # #133: the label is the only signal; a line without a label is a note (S6a), never a hold
                 if "marker-without-label" in item["captain_findings"] and not sweep_within(
                         item.get("created"), now, SWEEP_S6A_GRACE) and sweep_ours(
                         engine, repo, number, item.get("author", ""), item.get("assignees"), notices):

@@ -129,9 +129,9 @@ def _held_none(line):
     return tail in ("", ".") or (tail.startswith("(") and (tail.endswith(")") or tail.endswith(").")))
 
 
-def pr_is_held(labels, body, now=None):
-    """A PR is held for the owner: it carries a hold label, or (the same rule as everywhere) a merge-captain label or the legacy first line."""
-    return bool(pr_hold_reasons(labels)) or is_captain({"labels": labels, "body": body}, now)
+def pr_is_held(labels, body):
+    """A PR is held for the owner: it carries a hold label, or (the same rule as everywhere) a merge-captain label."""
+    return bool(pr_hold_reasons(labels)) or is_captain({"labels": labels, "body": body})
 
 
 _HELD_FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
