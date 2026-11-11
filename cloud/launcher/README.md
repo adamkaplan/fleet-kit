@@ -310,7 +310,7 @@ Lane sums after ask #1695 (31 Oct 2026, computed from the macOS seconds above, n
 | `cloud/launcher/tests/test_issues_read.py` | 45 | parallel |
 | `cloud/launcher/tests/test_stub_cleanup.py` | 41 | parallel |
 | `cloud/worker/tests/test_pr_edit_hardening.py` | 45 | parallel |
-| `cloud/worker/tests/test_push_rules.py` | 1 | serial |
+| `cloud/worker/tests/test_pod_rules.py` | 3 | serial |
 | `cloud/worker/tests/test_pr_edit.py` | 41 | parallel |
 | `cloud/worker/tests/test_pod_inspect.py` | 3 | parallel |
 | `cloud/launcher/tests/test_cloud_quick_scans_run.py` | 34 | parallel |
@@ -388,7 +388,7 @@ Lane sums after ask #1695 (31 Oct 2026, computed from the macOS seconds above, n
 | `cloud/launcher/tests/test_issues_read.py` | 10 | parallel |
 | `cloud/launcher/tests/test_stub_cleanup.py` | 36 | parallel |
 | `cloud/worker/tests/test_pr_edit_hardening.py` | 5 | parallel |
-| `cloud/worker/tests/test_push_rules.py` | 1 | serial |
+| `cloud/worker/tests/test_pod_rules.py` | 3 | serial |
 | `cloud/worker/tests/test_pr_edit.py` | 5 | parallel |
 | `cloud/worker/tests/test_pod_inspect.py` | 2 | parallel |
 | `cloud/launcher/tests/test_cloud_quick_scans_run.py` | 30 | parallel |
