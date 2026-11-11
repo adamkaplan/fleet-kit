@@ -340,6 +340,13 @@ A pod ended by its deadline or by a retire lost its unpushed work unless a fresh
 
 Not run in a cluster: the live check (a real pod with an ended token, and the note reaching a real session) is the operator's, after merge.
 
+## A worker killed by a drain (ask #2376)
+
+A node upgrade drains its node, and the `safe-to-evict: "false"` annotation on worker pods does not stop that drain. A worker can then end before its hard deadline with no stop in the launcher's audit. The saves of work in progress above still apply (the `<worker>/wip` branch), so the loss is bounded.
+
+- **The rule.** When a worker pod ends before its hard deadline and the audit holds no stop for it, the lane that launched it reads the pod's last events (`kubectl -n cw describe pod <pod>`, or the namespace's events), relaunches the worker from its `<worker>/wip` branch with the same brief, and tells its boss that it did so and what the events showed.
+- **The window.** The cluster's node upgrades run only in one weekly window outside working hours, which the owner names. The default proposal is Saturday 07:00 to 11:00 UTC. A drain at any other hour is a finding: the lane reports it to its boss with the events it read, and does not treat it as normal.
+
 ## Tests (no cluster, no Azure)
 
 ```sh
