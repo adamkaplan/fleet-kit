@@ -9613,7 +9613,7 @@ SECONDARY_READS = ("reviews", "check suites", "workflow runs", "items")
 GITHUB_REJECT_AUDITS = 20      # bad-signature audit lines per minute; the rest are only counted
 CONFLICT_TEXT = "Hook already exists"
 GITHUB_FORWARDER_HOOK_URL = "https://webhook-forwarder.github.com/hook"   # the url `gh webhook forward` gives the hook it creates (name "cli"): the only hooks the daemon ever lists for removal
-GITHUB_HOOK_REMOVALS = 30      # at most this many hooks are removed in one start (a repository holds 20)
+GITHUB_HOOK_REMOVALS = 30      # (a bounded cleanup: the list reads one page of 100, far above the cap of 20) at most this many hooks are removed in one start (a repository holds 20)
 WATCH_FILE = "github-watch.json"
 WATCH_STATES = ("starting", "running", "backoff", "conflict")
 
@@ -11711,7 +11711,7 @@ class GitHubHub:
     def _hook_api(self, repo, env, args):
         """One bounded `gh api` call on the repo's hooks, through the repo's account. Returns the stdout; raises GitHubUnavailable with a reason that holds no secret."""
         extra = {"env": env} if env is not None else {}
-        if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo) or ".." in repo:   # the repo is part of the path: no dot segment, no odd character
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo) or any(part in (".", "..") for part in repo.split("/")):   # the repo is part of the path: no dot segment, no odd character
             raise GitHubUnavailable("not a repository name")
         try:
             done = self.runner([self.config["gh"], "api"] + args, capture_output=True, text=True,
@@ -11755,7 +11755,7 @@ class GitHubHub:
         except GitHubUnavailable as err:
             if err.status != 404:
                 raise
-            # 404: it is gone already (the forwarder removed it itself)
+            # 404: most likely gone already (the forwarder removed it itself); a token that may not manage hooks is told by the list call before, which would have failed first
 
     def _hook_failed(self, watch, reason):
         """A failed list or removal: a note for `status` and ONE audit line per repo (for as long as the daemon runs). Never an error for the caller."""
@@ -11806,6 +11806,8 @@ class GitHubHub:
         """A forwarder is stopped: remove the hook it made, and no other. `alive`: its child was running up to the stop (only then may a hook be claimed
         now: a forwarder that already died made no hook that a later one could be taken for). Never raises."""
         try:
+            if watch.hook_id is None and not (alive and self.now() - (watch.started or 0) >= self.catchup_delay):
+                return   # nothing can be claimed or removed: no call
             env = self.child_env(watch.repo)
             found = self._forwarder_hooks(watch.repo, env)   # one fresh list: the claim and the removal both rest on what exists NOW
             if alive and self.now() - (watch.started or 0) >= self.catchup_delay:   # before the forwarder has connected its hook may not exist yet: a hook seen now could be anyone's

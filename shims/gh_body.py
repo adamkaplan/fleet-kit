@@ -350,8 +350,8 @@ def hook_delete(probe, parsed, segs):
     if not segs[4].isdigit() or not segs[4].isascii():
         return None
     endpoint = parsed.positionals[0][1]
-    if parsed.hostname is not None and ("://" in endpoint or endpoint.startswith("//")):
-        return HOOK_OTHER   # gh sends a full URL to ITS host and ignores --hostname: the read would be of another host's hook than the one deleted
+    if "://" in endpoint or endpoint.startswith("//"):
+        return HOOK_OTHER   # gh sends a full URL to ITS host and ignores --hostname and GH_HOST: the plain read could be of another host's hook than the one deleted
     data = probe.fetch(["api"] + ([] if parsed.hostname is None else ["--hostname", parsed.hostname]) + ["repos/%s/%s/hooks/%s" % (segs[1], segs[2], segs[4])])
     if data is None:
         return HOOK_UNREAD % (probe.why or "no reason given")

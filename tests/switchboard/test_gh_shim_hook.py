@@ -108,8 +108,15 @@ class TestGhShimHookDelete(unittest.TestCase):
                 self.assertEqual(calls, [])
                 self.assertEqual(done.returncode, 1)
 
-    def test_the_other_spellings_of_the_host_are_read_first_too(self):
-        for path in ("https://api.github.com/" + HOOK, "http://api.github.com/" + HOOK, "//api.github.com/" + HOOK, "/" + HOOK, HOOK + "?x=1"):
+    def test_a_full_url_is_refused_because_the_read_and_the_delete_could_reach_different_hosts(self):
+        for path in ("https://api.github.com/" + HOOK, "http://api.github.com/" + HOOK, "//api.github.com/" + HOOK):
+            with self.subTest(path=path):
+                done, calls, seen = self.rig.go(delete(path))   # even a real forwarder hook: gh sends a URL to its own host, ignoring GH_HOST and --hostname
+                self.assertEqual(calls, [])
+                self.assertNotEqual(done.returncode, 0)
+
+    def test_the_other_spellings_of_the_path_are_read_first_too(self):
+        for path in ("/" + HOOK, HOOK + "?x=1"):
             with self.subTest(path=path):
                 done, calls, seen = self.rig.go(delete(path), hook_text=hook(name="web"))
                 self.assertEqual(calls, [], "a hook that is not the forwarder's passed")
