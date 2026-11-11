@@ -220,6 +220,25 @@ class Reload(unittest.TestCase):
             s.close()
 
 
+    def test_the_reload_waits_for_the_renewal_lock(self):
+        import threading
+        s = self.scene()
+        lock = threading.RLock()
+        s.write(text(CW_ALLOWED_REPOS=GOOD["CW_ALLOWED_REPOS"] + "," + NEW))
+        done = threading.Event()
+
+        def work():
+            s.mod.reload_settings(s.env, s.applied, s.state, lock)
+            done.set()
+        with lock:   # the renewal thread is mid-renewal
+            th = threading.Thread(target=work)
+            th.start()
+            self.assertFalse(done.wait(0.3), "the reload did not wait")
+            self.assertNotIn(NEW, s.env["CW_ALLOWED_REPOS"])
+        th.join(5)
+        self.assertTrue(done.is_set())
+        self.assertIn(NEW, s.env["CW_ALLOWED_REPOS"])
+
     def test_a_pipe_in_place_of_the_file_never_blocks_the_pass(self):
         s = self.scene()
         os.unlink(s.path)

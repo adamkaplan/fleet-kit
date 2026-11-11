@@ -5431,7 +5431,15 @@ def _settings_signature(path):
         os.close(fd)
 
 
-def reload_settings(env, applied, state):
+def reload_settings(env, applied, state, lock=None):
+    """With `lock` (the launcher's renew_lock) held, so the renewal thread never reads the environment half changed: see _reload_settings."""
+    if lock is None:
+        return _reload_settings(env, applied, state)
+    with lock:
+        return _reload_settings(env, applied, state)
+
+
+def _reload_settings(env, applied, state):
     """Read the settings file again between two reaper passes. `applied` ({name: value} the reaper applied) is updated in place; `state` holds
     the last signature and the last printed reason. Only a table setting whose value still equals the applied one is dropped before the read,
     so apply_settings' clash rule is untouched and a value the caller set itself stays. A failure keeps every old value, prints one line
@@ -5827,7 +5835,7 @@ def _reap_main(env, a, sleep, clock=None, refresher=None, kube=None, ticker_wait
         reload_state = {}
         while True:
             if _REAP_APPLIED is not None:   # the settings file is read again at each pass (the same env the launcher and the ticker read)
-                reload_settings(env, _REAP_APPLIED, reload_state)
+                reload_settings(env, _REAP_APPLIED, reload_state, getattr(L, "renew_lock", None))
             blocked = read_vault_block(env)
             if blocked is not None and time.time() < blocked[1]:   # the vault block (ask #1427): no pass, no az process, ONE log line
                 print("cloud-worker: reaper pass skipped: %s" % vault_block_line(blocked), file=sys.stderr)
