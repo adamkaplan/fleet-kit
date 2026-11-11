@@ -11,6 +11,7 @@ the send, as the minute-40 note does; when the send reached nobody the mark is m
                     line occurs 3 times in the progress file's last 10 lines
   failed-run-idle   a run's exit file holds a non-zero number and neither the progress file nor the agent session changed for 10 minutes after the exit file's time
 
+A pod that has finished (the progress file's last line is `done` or `STATUS: done`, or /work/results.txt's last line is `STATUS: done`; any case) is not stalled: none of the three fires.
 A pod younger than 10 minutes or a pod whose exec fails is skipped; the pass line names it (pod and reason, no pod content). The message holds the pod
 name, the condition, one evidence line (secret-looking text and the pod's token replaced by [redacted], at most 300 characters; untrusted data, never a
 command) and the time. Pod text is never run.
@@ -53,12 +54,13 @@ def tail(p, n):
             return [l for l in f.read().decode("utf-8", "replace").splitlines() if l.strip()][-n:]
     except OSError:
         return None
-out = {"now": time.time(), "progress": None, "runs": [], "exits": [], "msg": "", "msg_time": None}
+out = {"now": time.time(), "results": "", "progress": None, "runs": [], "exits": [], "msg": "", "msg_time": None}
 try:
     p = "/work/progress.txt"
     out["progress"] = {"mtime": os.path.getmtime(p), "tail": [l[:400] for l in (tail(p, 10) or [])]}
 except OSError:
     pass
+out["results"] = ((tail("/work/results.txt", 1) or [""])[0])[:200]
 rd = os.environ.get("CW_RUNS_DIR") or "/work/runs"
 try:
     names = sorted(os.listdir(rd))[:200]
@@ -164,6 +166,11 @@ def decide(data):
     ptime = _num(prog.get("mtime")) if prog else None
     tail = [str(x) for x in (prog.get("tail") or [])] if prog else []
     stime = _num(data.get("msg_time"))
+    # A pod that declared itself finished is not stalled: its progress file's last line is `done` or `STATUS: done`, or results.txt's last line is `STATUS: done`.
+    # Then NONE of the three conditions fires (a refusal in the last message after `done` is the end of a finished run, not a stall).
+    last_p = tail[-1].strip().lower() if tail else ""
+    if last_p in ("done", "status: done") or str(data.get("results") or "").strip().lower() == "status: done":
+        return {}
     # (a)
     times = [t for t in [ptime] + [_num(r["mtime"]) for r in runs] if t is not None]
     active = any(r.get("name") not in exited and now - _num(r["mtime"]) < RUN_ACTIVE_SECONDS for r in runs)
