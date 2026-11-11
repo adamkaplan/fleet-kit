@@ -1,11 +1,11 @@
 """Ask #2402 (phase 2, W0): BOUNDARY PINS. The boundaries that remain after the convenience rules go still hold.
 
 Each pin is a checker that returns the list of problems it finds in a spec or a constant; the real value must give none, and a
-weakened copy (the mutant control) must give some. Offline: no cloud, no network, no clock. Values are read from the code and the
-manifests; the one literal set is the worker's token permissions, which the owner's plan names exactly."""
+weakened copy (the mutant control) must give some. Offline: no cloud, no network (the mint is run with its network calls stubbed). Values are read from the code and the
+manifests wherever they exist; the few literals (the 61-minute life, the private and metadata ranges, the three rule types) are the
+owner's stated limits, kept on purpose so that a change to the code cannot silently weaken them."""
 import copy
 import datetime as dt
-import json
 import os
 import re
 import sys
@@ -18,11 +18,13 @@ ROOT = os.path.dirname(os.path.dirname(LAUNCHER))
 sys.path.insert(0, HERE)
 sys.path.insert(0, LAUNCHER)
 import app_token  # noqa: E402
+import argparse
+import contextlib
+import io
+
 import cloud_worker as cw  # noqa: E402
 import preflight  # noqa: E402
 from test_cloud_hub_network import parse as parse_yaml  # noqa: E402
-from test_cloud_stack import build  # noqa: E402
-from test_cloud_stack import _args  # noqa: E402
 
 K8S = os.path.join(ROOT, "cloud", "k8s")
 WORKER_ACCOUNT = "cw-worker"
@@ -33,15 +35,26 @@ def read(name):
         return f.read()
 
 
+ENV = {"CW_CLOUD_IMAGE": "registry.example.internal/worker:1", "CW_TOKEN_ENDPOINT": "https://tokens.example.internal/mint"}
+T0 = dt.datetime(2026, 11, 5, tzinfo=dt.timezone.utc)
+
+
+def build(names=()):
+    a = argparse.Namespace(repo="acme-org/widget-service", branch="main", idle="10m", hard="2h", max_hard="8h", shape="S", image=None,
+                           run_id=None, pull_secret=None)
+    return cw.render_pod(a, "coder7", cw.pod_name("coder7"), T0, T0 + dt.timedelta(hours=2), ENV, names)
+
+
 def run_names():
-    """The per-run secret keys of a real launch: the two the run task passes (read from its source), plus nothing else."""
+    """The per-run secret keys of a real launch: those the run task passes with --run-secret-fd (read from its source; a test below
+    guards that the read finds the git token and the model entry)."""
     with open(os.path.join(LAUNCHER, "run_task.py"), encoding="utf-8") as f:
         text = f.read()
     return tuple(re.findall(r'"--run-secret-fd", "([a-z-]+)=%d"', text))
 
 
 def pod(names=None):
-    return build(_args(), run_names() if names is None else names)
+    return build(run_names() if names is None else names)
 
 
 # ---- (1) the pod spec -------------------------------------------------------------------------------------------------------
@@ -57,6 +70,8 @@ def spec_problems(p):
             out.append("capabilities do not drop ALL")
         if sc.get("privileged"):
             out.append("privileged")
+        if sc.get("allowPrivilegeEscalation") is not False:
+            out.append("allowPrivilegeEscalation is not false")
     if not s.get("serviceAccountName"):
         out.append("no service account name")
     return out
@@ -73,7 +88,8 @@ def rbac_problems(text):
             account = body
         if kind in ("Role", "ClusterRole") and re.search(r"(?m)^  name:\s*%s\s*$" % WORKER_ACCOUNT, body):
             out.append("a %s is named for the worker account" % kind)
-        if kind in ("RoleBinding", "ClusterRoleBinding") and re.search(r"(?m)^\s*-?\s*name:\s*%s\s*$" % WORKER_ACCOUNT, body):
+        subjects = body.partition("\nsubjects:")[2]   # the binding's own metadata name is not a subject
+        if kind in ("RoleBinding", "ClusterRoleBinding") and re.search(r"(?m)^\s*-?\s*name:\s*%s\s*$" % WORKER_ACCOUNT, subjects):
             out.append("a %s binds the worker account" % kind)
     if account is None:
         out.append("the worker account is not defined")
@@ -89,6 +105,8 @@ def forbidden_problems(table):
         "hostPath": lambda p: p["spec"]["volumes"].append({"name": "h", "hostPath": {"path": "/x"}}),
         "privileged": lambda p: p["spec"]["containers"][0]["securityContext"].update(privileged=True),
         "hostNetwork": lambda p: p["spec"].update(hostNetwork=True),
+        "hostPID": lambda p: p["spec"].update(hostPID=True),
+        "hostIPC": lambda p: p["spec"].update(hostIPC=True),
         "docker.sock": lambda p: p["spec"]["containers"][0]["volumeMounts"].append({"name": "scratch", "mountPath": "/var/run/docker.sock"}),
         "service-account token": lambda p: p["spec"]["volumes"].append(
             {"name": "t", "projected": {"sources": [{"serviceAccountToken": {"path": "t", "audience": "x"}}]}}),
@@ -100,8 +118,8 @@ def forbidden_problems(table):
             mutate(p)
             if not cw.forbidden_pod_fields(p):
                 out.append("a pod with %s is not refused" % name)
-    if cw.forbidden_pod_fields(base) and table is cw.FORBIDDEN_POD_FIELDS:
-        out.append("the plain pod is refused")
+        if cw.forbidden_pod_fields(base):
+            out.append("the plain pod is refused")
     return out
 
 
@@ -114,6 +132,9 @@ class SpecPins(unittest.TestCase):
                               ("automount true", lambda p: p["spec"].update(automountServiceAccountToken=True)),
                               ("root", lambda p: p["spec"]["securityContext"].update(runAsNonRoot=False)),
                               ("caps", lambda p: p["spec"]["containers"][0]["securityContext"].update(capabilities={"drop": []})),
+                              ("privileged", lambda p: p["spec"]["containers"][0]["securityContext"].update(privileged=True)),
+                              ("escalation", lambda p: p["spec"]["containers"][0]["securityContext"].update(allowPrivilegeEscalation=True)),
+                              ("no account", lambda p: p["spec"].pop("serviceAccountName")),
                               ("caps add", lambda p: p["spec"]["containers"][0]["securityContext"]["capabilities"].update(add=["NET_RAW"]))):
             p = pod()
             mutate(p)
@@ -138,7 +159,7 @@ class SpecPins(unittest.TestCase):
         self.assertEqual(forbidden_problems(cw.FORBIDDEN_POD_FIELDS), [])
 
     def test_mutants_of_the_forbidden_table_fail(self):
-        for name in ("hostPath", "privileged", "hostNetwork", "docker.sock", "service-account token"):
+        for name in ("hostPath", "privileged", "hostNetwork", "hostPID", "hostIPC", "docker.sock", "service-account token"):
             self.assertIn(name, cw.FORBIDDEN_POD_FIELDS)
             weak = {k: v for k, v in cw.FORBIDDEN_POD_FIELDS.items() if k != name}
             self.assertNotEqual(forbidden_problems(weak), [], name)
@@ -183,12 +204,16 @@ def secret_problems(p, names):
     return out
 
 
+def pw_sources(p):
+    return next(v for v in p["spec"]["volumes"] if v["name"] == "pw")["projected"]["sources"]
+
+
 class SecretPins(unittest.TestCase):
     def test_the_launch_names_git_token_model_auth_and_the_password(self):
         names = run_names()
         self.assertIn(cw.GIT_TOKEN_KEY, names)
         self.assertIn("model-auth", names)
-        self.assertEqual(cw.RESERVED_RUN_NAMES, {"server-password"})
+        self.assertIn("server-password", cw.RESERVED_RUN_NAMES)
 
     def test_mounted_secrets_are_the_named_ones(self):
         names = run_names()
@@ -199,10 +224,10 @@ class SecretPins(unittest.TestCase):
         names = run_names()
 
         def extra_run_key(p):
-            p["spec"]["volumes"][0]["projected"]["sources"][1]["secret"]["items"].append({"key": "vault", "path": "vault", "mode": 0o400})
+            pw_sources(p)[1]["secret"]["items"].append({"key": "vault", "path": "vault", "mode": 0o400})
 
         def extra_source(p):
-            p["spec"]["volumes"][0]["projected"]["sources"].append({"secret": {"name": "vault-creds"}})
+            pw_sources(p).append({"secret": {"name": "vault-creds"}})
 
         def extra_volume(p):
             p["spec"]["volumes"].append({"name": "v", "secret": {"secretName": "vault"}})
@@ -214,7 +239,7 @@ class SecretPins(unittest.TestCase):
             p["spec"]["containers"][0]["envFrom"] = [{"secretRef": {"name": "n"}}]
 
         def sa_token(p):
-            p["spec"]["volumes"][0]["projected"]["sources"].append({"serviceAccountToken": {"path": "t"}})
+            pw_sources(p).append({"serviceAccountToken": {"path": "t"}})
 
         for f in (extra_run_key, extra_source, extra_volume, env_secret, env_from, sa_token):
             p = pod(names)
@@ -223,83 +248,90 @@ class SecretPins(unittest.TestCase):
 
 
 # ---- (3) the git token ------------------------------------------------------------------------------------------------------
-WORKER_SET = {"contents": "write", "pull_requests": "write", "issues": "read", "metadata": "read"}
+LIFE_LIMIT = 61 * 60   # the owner's limit, kept as a literal on purpose: a change of the module's constant must not move it
+NEVER = ("administration", "workflows", "actions", "secrets", "members", "organization_administration", "repository_hooks")
 
 
 def token_problems(perms, seconds, requested, target):
     out = []
-    if perms != WORKER_SET:
-        out.append("the worker permission set differs")
+    if perms != app_token.EXPECTED_PERMISSIONS:
+        out.append("the permission set is not the module's worker set")
+    for k in NEVER:
+        if k in perms:
+            out.append("the worker set carries %s" % k)
+    if perms.get("contents") != "write" or perms.get("pull_requests") != "write":
+        out.append("the worker set lost contents or pull_requests write")
+    if perms.get("issues") != "read" or perms.get("metadata") != "read":
+        out.append("issues and metadata must stay read")
     if requested.get("permissions") != perms:
         out.append("the request does not carry exactly the set")
     if requested.get("repositories") != [target.split("/", 1)[1]]:
         out.append("the request is not for exactly one repository")
-    if seconds > 61 * 60:
+    if seconds > LIFE_LIMIT:
         out.append("the token may live longer than 61 minutes")
     return out
 
 
-def minted_request(target="acme-org/widget-service"):
-    """Run the real mint with the network and the vault stubbed; returns the request body it sent to GitHub."""
+def run_mint(target, minutes=60, repositories=None):
+    """Run the real mint with the network and the vault stubbed; returns (request body, stderr text, exit or None)."""
     seen = {}
+    repos = repositories or [{"name": target.split("/", 1)[1], "full_name": target, "owner": {"id": 7}}]
 
     def gh(method, path, jwt, body=None, not_found=None, role="worker"):
         seen.update(body or {})
-        expires = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=60)).strftime("%Y-%m-%dT%H:%M:%SZ")
-        return {"token": "t", "expires_at": expires, "permissions": dict(body["permissions"]),
-                "repositories": [{"name": target.split("/", 1)[1], "full_name": target, "owner": {"id": 7}}]}
+        expires = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=minutes)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        return {"token": "t", "expires_at": expires, "permissions": dict(body["permissions"]), "repositories": repos}
 
+    err, code = io.StringIO(), None
     with mock.patch.object(app_token, "vault", lambda env, name: "12345" if "id" in name else "k"), \
             mock.patch.object(app_token, "sign", lambda k, d: b"s"), \
             mock.patch.object(app_token, "find_installation", lambda t, j: (1, 7)), \
             mock.patch.object(app_token, "github_json", gh), \
-            mock.patch.dict(os.environ, {"CW_TOKEN_SERVICE_URL": ""}):
-        app_token.mint(target)
-    return seen
+            mock.patch.object(app_token, "revoke", lambda t: True), \
+            mock.patch.dict(os.environ, {"CW_TOKEN_SERVICE_URL": ""}), contextlib.redirect_stderr(err):
+        try:
+            app_token.mint(target)
+        except SystemExit as e:
+            code = e.code
+    return seen, err.getvalue(), code
 
 
 class TokenPins(unittest.TestCase):
+    target = "acme-org/widget-service"
+
     def test_the_set_the_repository_and_the_life(self):
-        target = "acme-org/widget-service"
-        self.assertEqual(token_problems(app_token.EXPECTED_PERMISSIONS, app_token.MAX_TOKEN_SECONDS, minted_request(target), target), [])
+        req, _, code = run_mint(self.target, minutes=60)
+        self.assertIsNone(code)
+        self.assertEqual(token_problems(app_token.EXPECTED_PERMISSIONS, app_token.MAX_TOKEN_SECONDS, req, self.target), [])
 
     def test_mutants_of_the_token_fail(self):
-        target = "acme-org/widget-service"
-        req = minted_request(target)
-        wide = dict(WORKER_SET, administration="write")
-        self.assertNotEqual(token_problems(wide, 3600, dict(req, permissions=wide), target), [])
-        self.assertNotEqual(token_problems(dict(WORKER_SET, issues="write"), 3600, req, target), [])
-        self.assertNotEqual(token_problems(WORKER_SET, 3600, dict(req, repositories=["a", "b"]), target), [])
-        self.assertNotEqual(token_problems(WORKER_SET, 61 * 60 + 1, req, target), [])
+        req, _, _ = run_mint(self.target)
+        good = app_token.EXPECTED_PERMISSIONS
+        for wide in (dict(good, administration="write"), dict(good, issues="write"), {k: v for k, v in good.items() if k != "contents"}):
+            self.assertNotEqual(token_problems(wide, 3600, dict(req, permissions=wide), self.target), [])
+        self.assertNotEqual(token_problems(good, 3600, dict(req, repositories=["a", "b"]), self.target), [])
+        self.assertNotEqual(token_problems(good, LIFE_LIMIT + 1, req, self.target), [])
 
     def test_a_token_that_lives_too_long_or_covers_two_repositories_is_refused(self):
-        target = "acme-org/widget-service"
-        for field, value in (("expires_at", (dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=90)).strftime("%Y-%m-%dT%H:%M:%SZ")),
-                             ("repositories", [{"name": "widget-service", "full_name": target, "owner": {"id": 7}},
-                                               {"name": "other", "full_name": "acme-org/other", "owner": {"id": 7}}])):
-            def gh(method, path, jwt, body=None, not_found=None, role="worker", field=field, value=value):
-                ans = {"token": "t", "expires_at": (dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=60)).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                       "permissions": dict(body["permissions"]), "repositories": [{"name": "widget-service", "full_name": target, "owner": {"id": 7}}]}
-                ans[field] = value
-                return ans
-            with mock.patch.object(app_token, "vault", lambda env, name: "12345" if "id" in name else "k"), \
-                    mock.patch.object(app_token, "sign", lambda k, d: b"s"), \
-                    mock.patch.object(app_token, "find_installation", lambda t, j: (1, 7)), \
-                    mock.patch.object(app_token, "github_json", gh), \
-                    mock.patch.dict(os.environ, {"CW_TOKEN_SERVICE_URL": ""}), \
-                    mock.patch.object(app_token, "revoke", lambda t: None):
-                with self.assertRaises(SystemExit, msg=field):
-                    app_token.mint(target)
+        _, err, code = run_mint(self.target, minutes=62)
+        self.assertEqual(code, 1)
+        self.assertIn("lives longer than 61 minutes", err)
+        two = [{"name": "widget-service", "full_name": self.target, "owner": {"id": 7}},
+               {"name": "other", "full_name": "acme-org/other", "owner": {"id": 7}}]
+        _, err, code = run_mint(self.target, repositories=two)
+        self.assertEqual(code, 1)
+        self.assertIn("exactly the one target repository", err)
 
     def test_a_widened_answer_is_refused(self):
-        with self.assertRaises(SystemExit):
-            app_token.check_permissions(dict(WORKER_SET, administration="write"))
-        with self.assertRaises(SystemExit):
-            app_token.check_permissions(dict(WORKER_SET, issues="write"))
+        with contextlib.redirect_stderr(io.StringIO()):
+            for wide in (dict(app_token.EXPECTED_PERMISSIONS, administration="write"), dict(app_token.EXPECTED_PERMISSIONS, issues="write")):
+                with self.assertRaises(SystemExit):
+                    app_token.check_permissions(wide)
 
 
 # ---- (4) the egress policy --------------------------------------------------------------------------------------------------
-PRIVATE = ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")
+PRIVATE = ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", "127.0.0.0/8")
+METADATA = ("169.254.0.0/16", "168.63.129.16/32")   # the link-local range (instance metadata) and the platform's wire address
 
 
 def egress_problems(docs):
@@ -309,22 +341,26 @@ def egress_problems(docs):
     if not deny:
         return ["no default-deny policy"]
     spec = deny["spec"]
-    if spec.get("podSelector") != {} or set(spec.get("policyTypes") or []) != {"Ingress", "Egress"} or spec.get("egress") or spec.get("ingress"):
+    if spec.get("podSelector") != {} or not {"Ingress", "Egress"} <= set(spec.get("policyTypes") or []) or spec.get("egress") or spec.get("ingress"):
         out.append("default-deny does not select every pod and deny both directions")
-    open_blocks = [t["ipBlock"] for p in policies.values() for r in (p["spec"].get("egress") or []) for t in (r.get("to") or []) if "ipBlock" in t]
-    if not open_blocks:
+    seen = False
+    for name, p in policies.items():
+        for r in p["spec"].get("egress") or []:
+            if not r.get("to"):
+                out.append("%s has an egress rule with no destination" % name)
+            for t in r.get("to") or []:
+                if "ipBlock" not in t:
+                    continue
+                seen = True
+                b = t["ipBlock"]
+                if not r.get("ports"):
+                    out.append("%s: an ipBlock rule with no port limit" % name)
+                for need in PRIVATE + METADATA:
+                    if need not in (b.get("except") or []):
+                        out.append("%s: the allow rule does not except %s" % (name, need))
+    if not seen:
         out.append("no internet allow rule to check")
-    for b in open_blocks:
-        ex = b.get("except") or []
-        for need in PRIVATE + (cw_metadata_ranges()):
-            if need not in ex:
-                out.append("the allow rule does not except %s" % need)
     return out
-
-
-def cw_metadata_ranges():
-    """The metadata addresses the manifest itself documents as excepted: the link-local range and the platform's wire address."""
-    return ("169.254.0.0/16", "168.63.129.16/32")
 
 
 class EgressPins(unittest.TestCase):
@@ -336,14 +372,13 @@ class EgressPins(unittest.TestCase):
 
     def test_mutants_of_the_policy_fail(self):
         docs = self.docs()
-        no_deny = [d for d in docs if d["metadata"]["name"] != "default-deny"]
-        self.assertNotEqual(egress_problems(no_deny), [])
+        self.assertNotEqual(egress_problems([d for d in docs if d["metadata"]["name"] != "default-deny"]), [])
         half = copy.deepcopy(docs)
         for d in half:
             if d["metadata"]["name"] == "default-deny":
                 d["spec"]["policyTypes"] = ["Ingress"]
         self.assertNotEqual(egress_problems(half), [])
-        for gone in PRIVATE + cw_metadata_ranges():
+        for gone in PRIVATE + METADATA:
             weak = copy.deepcopy(docs)
             for d in weak:
                 for r in d["spec"].get("egress") or []:
@@ -351,6 +386,15 @@ class EgressPins(unittest.TestCase):
                         if "ipBlock" in t:
                             t["ipBlock"]["except"] = [x for x in t["ipBlock"]["except"] if x != gone]
             self.assertNotEqual(egress_problems(weak), [], gone)
+        noport = copy.deepcopy(docs)
+        for d in noport:
+            for r in d["spec"].get("egress") or []:
+                if any("ipBlock" in t for t in r.get("to") or []):
+                    r.pop("ports")
+        self.assertNotEqual(egress_problems(noport), [])
+        open_rule = copy.deepcopy(docs)
+        next(d for d in open_rule if d["metadata"]["name"] == "allow-egress")["spec"]["egress"].append({"ports": [{"port": 22, "protocol": "TCP"}]})
+        self.assertNotEqual(egress_problems(open_rule), [])
 
 
 # ---- (5) preflight and the repository allow-list ----------------------------------------------------------------------------
@@ -358,7 +402,7 @@ def preflight_problems():
     out = []
     try:
         missing, _, _, _ = preflight.evaluate([])
-    except IndexError:   # a table with fewer rows than the code reads: the requirement is gone
+    except IndexError:   # evaluate reads rows by position: a table with fewer rows is a weakened requirement
         return ["the required-rule table is shorter than the code reads"]
     if len(missing) != len(preflight.NEED) or not preflight.NEED:
         out.append("an empty rule list is not reported as missing every required rule")
@@ -402,8 +446,9 @@ class PreflightPins(unittest.TestCase):
                 cw.check_repo_allowed(repo, bad_env)
 
     def test_mutant_of_the_allow_check_fails(self):
-        # a check that lets everything through is caught by the refusal cases above: run them against a stub
-        with mock.patch.object(cw, "check_repo_allowed", lambda repo, env: None):
+        # a widened parse of the list (an extra entry) is noticed by the refusal cases
+        real = cw.allowed_repo_keys
+        with mock.patch.object(cw, "allowed_repo_keys", lambda raw: real(raw) + ["acme-org/gadget"]):
             with self.assertRaises(AssertionError):
                 self.test_unlisted_repository_is_refused()
 
