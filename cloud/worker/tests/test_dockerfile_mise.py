@@ -50,9 +50,8 @@ def problems(t):
         out.append("archive not removed in the same RUN")
     if "||" in run or re.search(r"sha256sum[^&]*;", run):
         out.append("check or chain masked")
-    if re.search(r"python3?\b[^\n]*\bln\b|\bln\b[^\n]*/usr/local/bin/python|update-alternatives", run):
-        out.append("python changed by the mise block")
-    if re.search(r"^(?:RUN|ENV)\b[^\n]*(?:/usr/local/bin/python3?\b|/usr/bin/python3?\b)[^\n]*\bln\b", t, re.M):
+    flat = t.replace("\\\n", " ")
+    if re.search(r"^(?:RUN|ENV)\b[^\n]*(?:\bln\b[^\n]*\bpython3?\b|update-alternatives[^\n]*python)", flat, re.M):
         out.append("python3 or python linked")
     envs = re.findall(r"^ENV\b((?:[^\n]*\\\n)*[^\n]*)", t, re.M)
     for e in envs:
