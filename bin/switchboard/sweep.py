@@ -1,6 +1,6 @@
 # ---- #117: the "waiting on the person" sweep. Deterministic (no model), over what the hub can read in a few bounded,
 # cached list reads per repo. S1 a decision section and the awaiting label disagree; S2 a PR held for the person that is
-# not a `MERGE: captain` PR; S3 something said to wait on the person that is not in the human tier; S4 a decision whose
+# not a merge-captain PR; S3 something said to wait on the person that is not in the human tier; S4 a decision whose
 # issue or PR is closed (withdrawn); S5 a cos-tier decision that has aged. It never edits GitHub and never changes a tier.
 
 SWEEP_DEFAULTS = {"enabled": False, "aged_cos_hours": 2, "comment_window_days": 7, "max_findings": 20,
@@ -535,6 +535,8 @@ def sweep_gate_reading(engine, repo, number, now):
             return None, None, None, _one_line("the ledger could not be read: %s" % ctx.problem, 120)
         if ((ctx.facts or {}).get("carries") or {}).get("unreadable"):   # the dependency named by CARRIES: could not be read: not checked
             return None, None, None, "the carried dependency could not be read"
+        if plan_ledger.labels_unread((ctx.facts or {}).get("captain")):   # (#2379) labels that could not be read: held or not is unknown, G6 would wait: not a ready reading
+            return None, None, None, "the labels could not be read"
         if (ctx.facts or {}).get("body_unreadable"):   # a body that is not text: G5 and the held-body check would say missing
             return None, None, None, "the body could not be read"
         report = plan_ledger.evaluate_gates(ctx.plan, ctx.entries, ctx.problem, ctx.facts if ctx.facts.get("head") or ctx.facts.get("body") else None, ctx.pr, now=now)
@@ -682,7 +684,7 @@ def sweep_findings(engine, state, decisions, home, now, cfg, regex, defer=(), de
                 state.sources[("S2", ref_text(repo, number))] = (
                     {"source": "body", "match": "the PR body says it waits"} if item["body_waits"] else
                     {"source": "comment:%s" % (ids[waiting[-1]] if waiting and waiting[-1] < len(ids) else "?"), "match": "a recent comment says it waits"})
-            if item["pr"]:   # #133: the label is the truth; the first-line marker is read only in the transition window
+            if item["pr"]:   # #133: the label is the only signal; a line without a label is a note (S6a), never a hold
                 if "marker-without-label" in item["captain_findings"] and not sweep_within(
                         item.get("created"), now, SWEEP_S6A_GRACE) and sweep_ours(
                         engine, repo, number, item.get("author", ""), item.get("assignees"), notices):

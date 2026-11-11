@@ -59,11 +59,13 @@ cloud/launcher/tests/test_idle_default_note.py
 cloud/launcher/tests/test_idle_nudge.py
 cloud/launcher/tests/test_idle_nudge_skipped.py
 cloud/launcher/tests/test_issues_read.py
+cloud/launcher/tests/test_kept_expiry.py
 cloud/launcher/tests/test_kept_failed_once.py
 cloud/launcher/tests/test_kept_running_once.py
 cloud/launcher/tests/test_known_forms.py
 cloud/launcher/tests/test_launch_idempotent.py
 cloud/launcher/tests/test_load_part.py
+cloud/launcher/tests/test_long_run_setting.py
 cloud/launcher/tests/test_m_cap.py
 cloud/launcher/tests/test_m_cap_stopped.py
 cloud/launcher/tests/test_mint_retry.py
@@ -91,6 +93,7 @@ cloud/launcher/tests/test_readonly_root.py
 cloud/launcher/tests/test_reap_concurrent.py
 cloud/launcher/tests/test_reaper_audit_tail.py
 cloud/launcher/tests/test_reaper_managed.py
+cloud/launcher/tests/test_reaper_reload.py
 cloud/launcher/tests/test_reaper_renewal.py
 cloud/launcher/tests/test_reaper_restart.py
 cloud/launcher/tests/test_reaper_row.py
@@ -121,6 +124,7 @@ cloud/launcher/tests/test_token_service.py
 cloud/launcher/tests/test_untracked_report.py
 cloud/launcher/tests/test_vault_block.py
 cloud/launcher/tests/test_vault_check_pins.py
+cloud/launcher/tests/test_wip_root.py
 cloud/launcher/tests/test_wip_save.py
 cloud/launcher/tests/test_worker_copies.py
 cloud/worker/tests/test_activity.py
@@ -132,13 +136,17 @@ cloud/worker/tests/test_cloud_prepush_hardening.py
 cloud/worker/tests/test_comment_by_id.py
 cloud/worker/tests/test_cw_gh.py
 cloud/worker/tests/test_cw_gh_comments.py
+cloud/worker/tests/test_cw_run.py
 cloud/worker/tests/test_dockerfile_agent.py
 cloud/worker/tests/test_dockerfile_browser.py
+cloud/worker/tests/test_dockerfile_go.py
 cloud/worker/tests/test_dockerfile_node.py
 cloud/worker/tests/test_dockerfile_pg_bundle.py
 cloud/worker/tests/test_dockerfile_postgres.py
+cloud/worker/tests/test_dockerfile_tini.py
 cloud/worker/tests/test_entrypoint.py
 cloud/worker/tests/test_entrypoint_import.py
+cloud/worker/tests/test_entrypoint_long_run.py
 cloud/worker/tests/test_entrypoint_question.py
 cloud/worker/tests/test_guard_table.py
 cloud/worker/tests/test_identity_image.py
