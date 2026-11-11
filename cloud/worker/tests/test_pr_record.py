@@ -49,7 +49,7 @@ class T(unittest.TestCase):
         self.run_dir, self.tmpfs, self.share, self.work = [os.path.join(self.d, x) for x in ("run", "tmpfs", "share", "work")]
         for x in (self.run_dir, self.tmpfs, self.share, self.work):
             os.mkdir(x)
-        for src, name in (("opencode-worker.json", "opencode-worker.json"), ("agents/worker.md", "worker.md"), ("guard.sh", "guard.sh")):
+        for src, name in (("opencode-worker.json", "opencode-worker.json"), ("agents/worker.md", "worker.md")):
             shutil.copy(os.path.join(WORKER, src), os.path.join(self.share, name))
         subprocess.run(["git", "init", "-q", self.work], check=True)
         subprocess.run(["git", "-C", self.work, "remote", "add", "origin", "https://github.com/%s.git" % P.REPO], check=True)

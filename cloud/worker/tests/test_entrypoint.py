@@ -43,7 +43,7 @@ class Entrypoint(unittest.TestCase):
             os.mkdir(x)
         self.share = os.path.join(self.d, "share")   # what the image's COPY lays down under /usr/local/share/cw
         os.mkdir(self.share)
-        for src, name in (("guard.sh", "guard.sh"), ("opencode-worker.json", "opencode-worker.json"), ("agents/worker.md", "worker.md")):
+        for src, name in (("opencode-worker.json", "opencode-worker.json"), ("agents/worker.md", "worker.md")):
             shutil.copy(os.path.join(CLOUD, "worker", src), os.path.join(self.share, name))
         rec = tempfile.TemporaryDirectory(dir=os.environ.get("CW_TMPDIR"))   # what the stand-in opencode records (its calls and the stdin it was given): outside the tree the tests scan
         self.addCleanup(rec.cleanup)
