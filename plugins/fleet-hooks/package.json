@@ -1,0 +1,8 @@
+{
+  "name": "fleet-hooks",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "A thin OpenCode v2 plugin: forwards permission evaluation to `fleet-switchboard judge-tool`.",
+  "main": "index.js"
+}

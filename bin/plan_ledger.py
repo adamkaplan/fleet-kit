@@ -1,0 +1,1500 @@
+"""plan_ledger: the switchboard-held evidence ledger and the read-only gates view of plan-driven development (#107).
+
+Two halves, both free of GitHub, v2 and the clock (the caller passes what it read):
+
+  - the ledger: an append-only JSON-lines file in the state directory. Every entry carries the hash of the one before
+    it, so an edit, a deletion or a reordering anywhere in the file is found by `read_ledger`. An entry is a PROOF (the
+    worker says what it ran and saw for a scenario) or a VERDICT (an evaluator says pass or fail for a scenario). Each is
+    bound to a plan hash (a change to the plan voids it) and to a PR head (a push voids it);
+  - the gates: `evaluate_gates` turns a checked plan, the ledger and what GitHub says about a PR into one line per gate
+    G0a to G8 of the plan, each with its status, who decides it and what is missing. It enforces nothing.
+
+The rules that need a decision of policy are inputs, not choices made here: who may be an evaluator is configuration.
+"""
+import errno
+import fcntl
+import hashlib
+import json
+import os
+import re
+import signal
+import sys
+import time
+from contextlib import contextmanager
+from pathlib import Path
+from urllib.parse import urlsplit
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__))); import gate_budget  # noqa: E402,E702  (the sibling, found when loaded by path too)
+
+LEDGER_FILE = "plan-ledger.jsonl"
+HEAD_FILE = "plan-ledger.head"   # {"seq", "hash"} of the newest entry: a second place the chain's end is written
+GENESIS = "0" * 64
+EVIDENCE_KINDS = ("proof", "verdict", "consensus", "waiver")   # a consensus entry is written by the plan review engine (a later slice)
+REVIEW_KINDS = ("round", "lane_session", "lane", "response", "escalation", "decision", "abandoned", "reminder", "review_record")   # the plan review engine's records (#109)
+ITEM_KINDS = ("item_tester",)   # #770: the registration of a tester for a work item that has no pull request; written by `launch` only (bin/item_verdicts.py)
+CARRY_KINDS = ("carried",)   # #1129: a proof or verdict that holds at a new head (see `carry_decision`); its own line, the original row is never touched
+CLAIM_KINDS = ("claim",)   # #976: the claim line of a pull request AS IT WAS when its merge was gated (`claim_text`, or None: it claims every per-PR scenario); the union reads it for a merged sibling
+KINDS = EVIDENCE_KINDS + REVIEW_KINDS + ITEM_KINDS + CARRY_KINDS + CLAIM_KINDS
+RESULTS = ("pass", "fail")
+EVIDENCE_LIMIT = 500
+FIELD_LIMIT = 200
+CLAIM_TEXT_LIMIT = 1000   # a `claim` ledger line keeps at most this much of a CLAIMS line (#976)
+EVALUATOR_ALIASES = {"adam": "owner"}
+
+# THE bound of every wait of a recording command (`prove`, `verdict`, `review record`): the ledger lock, each GitHub read, the agent registry. One
+# number, read at the time of the wait (never a copy): a command that has not recorded within it says so and names the read-only check (#1049).
+RECORD_WAIT_SECONDS = 30
+RECORD_PROGRESS_SECONDS = 3   # a wait this long says what it waits for
+LOCK_STEP = "the ledger lock"
+IN_CRITICAL = False   # True while an entry is being written: the command's own alarm is held back, so a timeout never hides a record that landed
+step_hook = None      # the recording command's: called with what is being waited for
+
+
+class LedgerError(Exception):
+    """The ledger cannot be written or read as it must be."""
+
+
+class LedgerRefused(LedgerError):
+    """A record the ledger refuses to write (#1049): nothing was written."""
+
+
+class LedgerLockTimeout(LedgerError):
+    """The ledger lock was not free within RECORD_WAIT_SECONDS: nothing was written."""
+
+
+def _lock_exclusive(fd):
+    """flock(LOCK_EX) bounded by RECORD_WAIT_SECONDS: polls, says what it waits for after RECORD_PROGRESS_SECONDS, and raises
+    LedgerLockTimeout at the bound. A wait with no end is how a recording command once timed out without a word."""
+    started, said, wait = time.monotonic(), False, RECORD_WAIT_SECONDS
+    if step_hook is not None:
+        step_hook(LOCK_STEP)
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except OSError as err:
+            if err.errno not in (errno.EAGAIN, errno.EACCES, errno.EWOULDBLOCK):
+                raise
+        waited = time.monotonic() - started
+        if waited >= wait:
+            raise LedgerLockTimeout("timed out after %ds waiting for %s" % (wait, LOCK_STEP))
+        if not said and waited >= min(RECORD_PROGRESS_SECONDS, wait):
+            said = True
+            sys.stderr.write("fleet-switchboard: waiting for %s (another process holds it; giving up after %ds)\n" % (LOCK_STEP, wait))
+            sys.stderr.flush()
+        time.sleep(0.05)
+
+
+@contextmanager
+def _critical():
+    """Hold the recording command's alarm back while an entry is written (the signal stays pending and the handler drops it while IN_CRITICAL)."""
+    global IN_CRITICAL
+    try:
+        before = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGALRM})
+    except (AttributeError, ValueError, OSError):
+        yield
+        return
+    IN_CRITICAL = True
+    try:
+        yield
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, before)   # a pending alarm is delivered here, while IN_CRITICAL still says to drop it
+        IN_CRITICAL = False
+
+
+def _canonical(entry):
+    return json.dumps({k: v for k, v in entry.items() if k != "hash"}, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=False)
+
+
+def entry_hash(entry):
+    """sha256 over the entry's canonical text (its own `hash` excluded), which includes `prev`: the chain."""
+    return hashlib.sha256(_canonical(entry).encode("utf-8")).hexdigest()
+
+
+def clip(text, limit=FIELD_LIMIT):
+    text = " ".join(str(text or "").split())
+    return text if len(text) <= limit else text[:limit - 1] + "\u2026"
+
+
+def bounded_text(text, limit, what):
+    """`text` with white space collapsed as `clip` does; over `limit` it is REFUSED (LedgerError), never cut."""
+    text = " ".join(str(text or "").split())
+    if len(text) > limit:
+        raise LedgerError("the %s is %d characters and the limit is %d: nothing was recorded; put the long text in one comment or a file and give the link, or shorten it" % (what, len(text), limit))
+    return text
+
+
+def read_ledger(state_dir):
+    """(entries, problem): every line parsed, and None when the chain holds, else a sentence naming the first break
+    (the entries before it are still returned: they are intact, the ones from the break on are not trusted)."""
+    path = Path(state_dir) / LEDGER_FILE
+    # The head pointer is read BEFORE the ledger file: a writer adds the entry and only then moves the pointer, so a file read after the
+    # pointer is never behind it. Reading them the other way round lets an append land between the two reads and look like a cut-off.
+    pointer = _read_head(state_dir)
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return [], None
+    except OSError as err:
+        raise LedgerError("cannot read the ledger: %s" % (err.strerror or err)) from None
+    entries, prev = [], GENESIS
+    for number, line in enumerate(text.splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            return entries, "line %d is not JSON: the ledger was edited" % number
+        if not isinstance(entry, dict) or entry.get("prev") != prev or entry.get("hash") != entry_hash(entry) \
+                or entry.get("seq") != len(entries) + 1:
+            return entries, "entry %d does not follow from the one before it: the ledger was edited" % (len(entries) + 1)
+        entries.append(entry)
+        prev = entry["hash"]
+    if pointer is not None and (len(entries) < pointer["seq"] or entries[pointer["seq"] - 1]["hash"] != pointer["hash"]):
+        return entries, ("the ledger ends before entry %d, where its head pointer says it should (entries were cut off or the "
+                         "file was rewritten)" % pointer["seq"])
+    return entries, None
+
+
+def _read_head(state_dir):
+    try:
+        data = json.loads((Path(state_dir) / HEAD_FILE).read_text(encoding="utf-8"))
+        return data if isinstance(data.get("seq"), int) and isinstance(data.get("hash"), str) and data["seq"] > 0 else None
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def _write_head(state_dir, entry):
+    path = Path(state_dir) / HEAD_FILE
+    temp = path.with_name("%s.%d.tmp" % (HEAD_FILE, os.getpid()))
+    fd = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as handle:
+        handle.write(json.dumps({"seq": entry["seq"], "hash": entry["hash"]}) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(str(temp), str(path))
+
+
+def append_entry(state_dir, entry, now):
+    """Add `entry` to the ledger under an exclusive lock: seq, time, prev and hash are set here. Refuses when the
+    existing chain is broken (a tampered ledger takes no new entry). Returns the stored entry."""
+    return append_checked(state_dir, now, lambda entries, seq: entry)
+
+
+def append_checked(state_dir, now, build):
+    """The same append, with the DECISION inside the critical section: `build(entries, seq)` is called under the exclusive lock with the
+    chain as it stands and the sequence number the entry will get, and returns the entry to write (or raises to refuse). A caller that must
+    check the ledger and then add to it (one open review per lineage, a review id) does both here, so two writers cannot both pass the check."""
+    path = Path(state_dir) / LEDGER_FILE
+    fd = os.open(str(path), os.O_RDWR | os.O_APPEND | os.O_CREAT, 0o600)
+    try:
+        _lock_exclusive(fd)
+        entries, problem = read_ledger(state_dir)
+        if problem:
+            raise LedgerError("the ledger is not trustworthy, nothing was recorded: %s" % problem)
+        entry = build(entries, len(entries) + 1)
+        if entry.get("kind") not in KINDS or (entry.get("kind") in EVIDENCE_KINDS and entry.get("result") not in RESULTS):
+            raise LedgerError("an entry is a proof, a verdict, a consensus or a waiver with a result of pass or fail, or a plan review record")
+        stored = dict(entry, seq=len(entries) + 1, ts=int(now), prev=entries[-1]["hash"] if entries else GENESIS)
+        stored["hash"] = entry_hash(stored)
+        os.write(fd, (json.dumps(stored, sort_keys=True, ensure_ascii=False) + "\n").encode("utf-8"))
+        os.fsync(fd)
+        _write_head(state_dir, stored)
+    finally:
+        os.close(fd)
+    return stored
+
+
+def append_many(state_dir, entries_in, now):
+    """ALL of `entries_in`, or none: every entry is validated first, then the whole batch is chained and written with ONE write under
+    the exclusive lock, so a failure (an invalid entry, a broken chain, a failed write) leaves the ledger as it was. Returns the stored
+    entries."""
+    for entry in entries_in:
+        if entry.get("kind") not in KINDS or (entry.get("kind") in EVIDENCE_KINDS and entry.get("result") not in RESULTS):
+            raise LedgerError("an entry is a proof, a verdict, a consensus or a waiver with a result of pass or fail, or a plan review record")
+    path = Path(state_dir) / LEDGER_FILE
+    fd = os.open(str(path), os.O_RDWR | os.O_APPEND | os.O_CREAT, 0o600)
+    try:
+        _lock_exclusive(fd)
+        have, problem = read_ledger(state_dir)
+        if problem:
+            raise LedgerError("the ledger is not trustworthy, nothing was recorded: %s" % problem)
+        stored, prev = [], have[-1]["hash"] if have else GENESIS
+        for number, entry in enumerate(entries_in, start=len(have) + 1):
+            one = dict(entry, seq=number, ts=int(now), prev=prev)
+            one["hash"] = entry_hash(one)
+            stored.append(one)
+            prev = one["hash"]
+        if stored:
+            data = "".join(json.dumps(one, sort_keys=True, ensure_ascii=False) + "\n" for one in stored).encode("utf-8")
+            if os.write(fd, data) != len(data):
+                raise LedgerError("the ledger write was short: nothing was recorded")
+            os.fsync(fd)
+            _write_head(state_dir, stored[-1])
+    finally:
+        os.close(fd)
+    return stored
+
+
+def append_many_checked(state_dir, build, now):
+    """`append_many` with the DECISION inside the exclusive lock (#770): `build(entries)` is called under the lock with the chain as it stands and returns the list of entries to
+    write, or raises LedgerError to refuse; all of them are chained and written with ONE write, or none. The slow reads (the running agents) are made BEFORE this, never under the
+    lock; only what lives in the ledger is re-checked here."""
+    path = Path(state_dir) / LEDGER_FILE
+    fd = os.open(str(path), os.O_RDWR | os.O_APPEND | os.O_CREAT, 0o600)
+    try:
+        _lock_exclusive(fd)
+        have, problem = read_ledger(state_dir)
+        if problem:
+            raise LedgerError("the ledger is not trustworthy, nothing was recorded: %s" % problem)
+        entries_in = build(have)
+        for entry in entries_in:
+            if entry.get("kind") not in KINDS or (entry.get("kind") in EVIDENCE_KINDS and entry.get("result") not in RESULTS):
+                raise LedgerError("an entry is a proof, a verdict, a consensus or a waiver with a result of pass or fail, or a plan review record")
+        stored, prev = [], have[-1]["hash"] if have else GENESIS
+        for number, entry in enumerate(entries_in, start=len(have) + 1):
+            one = dict(entry, seq=number, ts=int(now), prev=prev)
+            one["hash"] = entry_hash(one)
+            stored.append(one)
+            prev = one["hash"]
+        if stored:
+            data = "".join(json.dumps(one, sort_keys=True, ensure_ascii=False) + "\n" for one in stored).encode("utf-8")
+            if os.write(fd, data) != len(data):
+                raise LedgerError("the ledger write was short: nothing was recorded")
+            os.fsync(fd)
+            _write_head(state_dir, stored[-1])
+    finally:
+        os.close(fd)
+    return stored
+
+
+# What makes two records the SAME record (#1049): the identity (kind, pull request, head, scenario, evaluator or reviewer, and who recorded it: two testers'
+# identical verdicts are two records) and what was judged. The newest entry of an identity decides: a pass after a fail at one head is a new record (readers take the latest), a retry of the newest is not.
+JUDGED_FIELDS = {
+    "proof": ("result", "plan_hash"),
+    "verdict": ("result", "plan_hash"),
+    "review_record": ("verdict", "blocks", "notes", "impact_action", "impact_class", "impact_severity", "impact_probability", "carry_confirmed", "block_sha256"),
+}
+RECORDED_KINDS = tuple(JUDGED_FIELDS)   # the kinds the recording commands write: derived by the tests from the commands
+
+
+def record_identity(entry):
+    # a proof is the author's step: the same proof by another agent is the same record; a verdict or a review by another agent is its own fact
+    return (entry.get("kind"), entry.get("pr"), entry.get("head"), entry.get("scenario"), entry.get("evaluator") or entry.get("reviewer"),
+            None if entry.get("kind") == "proof" else entry.get("by"))
+
+
+STALE_PASS_REASON = "a newer fail is recorded at this head: re-test at a new head or waive"
+
+
+def stale_pass(entries, entry):
+    """True when `entry` is a pass whose key already holds a pass, with a newer fail after it: writing it would flip the verdict back (#1049)."""
+    if entry.get("kind") not in EVIDENCE_KINDS or entry.get("result") != "pass":
+        return False
+    ident = record_identity(entry)
+    same = [e for e in entries if record_identity(e) == ident]
+    if not same or same[-1].get("result") != "fail":
+        return False
+    return any(e.get("result") == "pass" and e.get("plan_hash") == entry.get("plan_hash") for e in same)
+
+
+def already_recorded(entries, entry):
+    """The newest entry with the same identity as `entry` when it also judged the same thing, else None."""
+    ident = record_identity(entry)
+    newest = next((e for e in reversed(entries) if record_identity(e) == ident), None)
+    if newest is None or any(newest.get(f) != entry.get(f) for f in JUDGED_FIELDS.get(entry.get("kind"), ())):
+        return None
+    return newest
+
+
+def append_once(state_dir, entries_in, now):
+    """`append_many` that never records the same record twice: under the exclusive lock, an entry whose identity's newest entry judged the same thing
+    is not written. Returns [(entry, already)] in order: the stored entry, and True when it was already there (nothing written for it). The new ones
+    are written with ONE write, or none; the command's alarm is held back from the lock to the end of the write."""
+    for entry in entries_in:
+        if entry.get("kind") not in KINDS or (entry.get("kind") in EVIDENCE_KINDS and entry.get("result") not in RESULTS):
+            raise LedgerError("an entry is a proof, a verdict, a consensus or a waiver with a result of pass or fail, or a plan review record")
+    path = Path(state_dir) / LEDGER_FILE
+    fd = os.open(str(path), os.O_RDWR | os.O_APPEND | os.O_CREAT, 0o600)
+    try:
+        _lock_exclusive(fd)
+        with _critical():
+            have, problem = read_ledger(state_dir)
+            if problem:
+                raise LedgerError("the ledger is not trustworthy, nothing was recorded: %s" % problem)
+            out, fresh, prev = [], [], have[-1]["hash"] if have else GENESIS
+            for entry in entries_in:
+                found = already_recorded(have + fresh, entry)
+                if found is not None:
+                    out.append((found, True))
+                    continue
+                if stale_pass(have + fresh, entry):
+                    raise LedgerRefused(STALE_PASS_REASON)
+                one = dict(entry, seq=len(have) + len(fresh) + 1, ts=int(now), prev=prev)
+                one["hash"] = entry_hash(one)
+                fresh.append(one)
+                prev = one["hash"]
+                out.append((one, False))
+            if fresh:
+                data = "".join(json.dumps(one, sort_keys=True, ensure_ascii=False) + "\n" for one in fresh).encode("utf-8")
+                if os.write(fd, data) != len(data):
+                    raise LedgerError("the ledger write was short: nothing was recorded")
+                os.fsync(fd)
+                _write_head(state_dir, fresh[-1])
+    finally:
+        os.close(fd)
+    return out
+
+
+# ----------------------------------------------------------------------------------- who may do what
+
+def proof_of(scenario):
+    return " ".join(str(scenario.get("proof", "")).split())
+
+
+def evaluator_of(scenario):
+    name = " ".join(str(scenario.get("evaluator", "")).split())
+    return EVALUATOR_ALIASES.get(name, name)
+
+
+def claim_of(scenario):
+    """`pr` or `epic`: who claims a scenario, read AS WRITTEN (the checker's parsed scenario keeps only the keys the author wrote; its canonical text, and so the plan hash, fills `pr` in and is not
+    touched here). An explicit claim is read as it is written. With NONE written, a scenario whose evaluator is the tester and whose proof is a measure is a live check that can only be made after
+    the merge, so it is not claimed by a slice pull request: it is read as `epic` (proven at the ask's integration check, and listed as such). Every other scenario with no claim is `pr`."""
+    written = " ".join(str(scenario.get("claim") or "").split())
+    if written:
+        return written
+    if evaluator_of(scenario) == "tester" and " ".join(str(scenario.get("proof") or "").split()) == "measure":
+        return "epic"
+    return "pr"
+
+
+def authors_of(entries, pr, notice_senders=(), github_author=None):
+    """The writers of this PR: the author GitHub reports for it (not a field the writer sets), whoever recorded a PROOF
+    for it, and the senders of its notice. An evaluator can never be one of them."""
+    names = {e.get("by") for e in entries if e.get("pr") == pr and e.get("kind") == "proof" and e.get("by") != CI_RECORDER}
+    names.update(notice_senders)
+    names.add(github_author)
+    return {n for n in names if n}
+
+
+def as_current(entries, hashes):
+    """#1713: the same entries with each entry's `plan_hash` and ask head mapped to the NEW form when it is the OLD form of the live text (`hashes` is plan_check.plan_hashes(text)); every other value stays as it is, and the ledger itself is never rewritten."""
+    if not hashes or len(hashes) < 2:
+        return entries
+    new, olds = hashes[0], set(hashes[1:]) - {hashes[0]}
+    old_heads, new_head = {ask_head(o) for o in olds}, ask_head(hashes[0])
+    out = []
+    for entry in entries:
+        if entry.get("plan_hash") in olds or entry.get("head") in old_heads:
+            entry = dict(entry)
+            if entry.get("plan_hash") in olds:
+                entry["plan_hash"] = new
+            if entry.get("head") in old_heads:
+                entry["head"] = new_head
+        out.append(entry)
+    return out
+
+def ask_head(plan_hash):
+    """#1130: the "head" an ask issue's record carries: the first 40 hex digits of the plan hash (`sha256:<hex>`). A revised plan has another hash, so the
+    record is void exactly as a pull request's is when its head moves."""
+    return str(plan_hash).split(":", 1)[-1][:40]
+
+
+def known_writers(entries, pr, notice_senders=()):
+    """True when the switchboard knows at least one agent that wrote this PR (a proof or a notice): until then a verdict is
+    refused, because a writer that has declared nothing could otherwise register as its own evaluator."""
+    return bool(authors_of(entries, pr, notice_senders))
+
+
+def may_record_verdict(evaluator, caller, allowed, authors):
+    """(ok, why not). `allowed` maps an evaluator (ci|tester|reviewer|owner) to the agent names that may record its
+    verdicts; an evaluator with no names is one nobody may record for yet (the default). The caller must not be a
+    writer of the PR."""
+    names = (allowed or {}).get(evaluator) or []
+    if caller == CI_RECORDER:
+        return False, "`%s` is the built-in recorder's name, not an agent: `ci` verdicts are recorded by `gates ci-record`" % CI_RECORDER
+    if caller in authors:
+        return False, ("%s wrote this PR (recorded its proof or sent its notice): an author cannot record a verdict "
+                       "on its own work" % caller)
+    if caller not in names:
+        if not names:
+            return False, ("no agent is registered to record %s verdicts: list its names under `plan_evaluators.%s` "
+                           "in the switchboard config" % (evaluator, evaluator))
+        return False, "%s is not registered to record %s verdicts" % (caller, evaluator)
+    return True, None
+
+
+# ----------------------------------------------------------------------------------- waivers
+
+WAIVABLE = ("G0a", "G0b", "G0c", "G1", "G2/G3", "G4", "G5", "MG", "CU")   # G0 to G5: what the chief of staff may waive for a hotfix; MG: the merge gate (#962); CU: the claim union at an ask's last merge (#976); each at the PR's head
+NEVER_WAIVABLE = {"G6": "the owner's hold on a held PR", "G7": "the epic integration", "G8": "production"}
+WAIVER_REASON_MIN = 20
+WAIVER_SECONDS = 24 * 3600   # a waiver is valid this long (the retroactive-plan due date), and only at the head it names
+
+
+def parse_waiver_gates(text):
+    """([gate ids], error): `G0a,G1,G4` (G2 or G3 mean the one `G2/G3` gate). The error names what was refused and why."""
+    chosen = []
+    for raw in (text or "").replace(" ", "").split(","):
+        if not raw:
+            continue
+        gate = {"G2": "G2/G3", "G3": "G2/G3", "g2/g3": "G2/G3", "mg": "MG", "cu": "CU"}.get(raw, raw[:1].upper() + raw[1:])
+        if gate in NEVER_WAIVABLE:
+            return [], "%s is never waived (%s): refused, nothing was recorded" % (gate, NEVER_WAIVABLE[gate])
+        if gate not in WAIVABLE:
+            return [], "%r is not a gate that can be waived (%s)" % (raw, ", ".join(WAIVABLE))
+        if gate not in chosen:
+            chosen.append(gate)
+    return (chosen, None) if chosen else ([], "name the gates to waive: --gates G0a,G1,...")
+
+
+def valid_waivers(entries, pr, head, now):
+    """{gate: waiver entry}: the waivers of this PR recorded AT THIS HEAD that have not expired at `now`, newest first win. A
+    waiver for another head, for another PR or past its expiry is not here; neither is a gate that can never be waived."""
+    found = {}
+    if not head:
+        return found
+    for entry in entries:
+        if entry.get("kind") != "waiver" or entry.get("pr") != pr or entry.get("head") != head:
+            continue
+        if not isinstance(entry.get("expires"), (int, float)) or entry["expires"] <= now:
+            continue
+        for gate in entry.get("gates") or ():
+            if gate in WAIVABLE:
+                found[gate] = entry
+    return found
+
+
+# ----------------------------------------------------------------------------------- the gates
+
+GATES = (
+    # id, name, scope (P per PR, E per epic, D per deploy), decision owner, tracked here
+    ("G0a", "structure", "P", "the switchboard (rule)", True),
+    ("G0b", "consensus", "P", "the switchboard records the review loop", False),
+    ("G0c", "approval", "P", "the plan's approver (work item: its orchestrator; ask: cos; epic: cos, then the owner)", False),
+    ("G1", "proof", "P", "the evaluator named on each scenario", True),
+    ("G2/G3", "alignment and code", "P", "the reviewer agent", False),
+    ("G4", "checks", "P", "CI, or a second agent's re-run", True),
+    ("G5", "canon", "P", "the orchestrator", True),
+    ("G6", "held PR", "P", "the owner, through cos", True),
+    ("G6b", "held PR explains itself", "P", "the switchboard (rule): a held PR opens with why, a diagram and its questions", True),
+    ("G7", "epic integration", "E", "tester agent and the owner", False),
+    ("G8", "production", "D", "the owners; the owner for production", False),
+)
+UNTRACKED_WHY = {
+    "G0b": "the plan review engine is a later slice: no consensus record exists yet",
+    "G0c": "approval is not recorded by the switchboard yet",
+    "G2/G3": "the alignment review is not recorded by the switchboard yet",
+    "G7": "an epic gate: it applies at the integration branch, not to one PR",
+    "G8": "a deploy gate: it applies at deploy, not to one PR",
+}
+PER_PR_NONE_RE = re.compile(r"(?im)^[\s#>*-]*per-pr scenarios:\s*none\s+because\s+(\S.*)$")
+PLAN_LINK_RE = re.compile(r"(?m)^\s*PLAN:\s*(\S+)")
+CANON_RE = re.compile(r"(?im)^\s*canon:\s*(\S.*)$")
+HIDDEN_RE = re.compile(r"(?ms)^[ \t]*(```|~~~).*?(?:^[ \t]*\1[^\n]*$|\Z)|<!--.*?(?:-->|\Z)")   # a code fence or an HTML comment: text the reader of the rendered body does not take as the body's own
+PLAN_FIRST_RE = re.compile(r"(?m)^[ \t]*PLAN:[^\n]*")
+CLAIMS_UNDER_RE = re.compile(r"\n[ \t]*CLAIMS:[ \t]*(.*)")
+
+
+def visible_body(body):
+    return HIDDEN_RE.sub("", body or "")
+
+
+def claim_text(body):
+    """The text of the `CLAIMS:` line directly under the FIRST `PLAN:` line outside code fences and HTML comments, or None."""
+    shown = visible_body(body)
+    first = PLAN_FIRST_RE.search(shown)
+    found = CLAIMS_UNDER_RE.match(shown, first.end()) if first else None
+    return found.group(1) if found else None
+
+
+CLAIMS_LINE_RE = re.compile(r"(?im)^[ \t]*CLAIMS:")
+
+
+def misplaced_claim(body):
+    """The error for the first `CLAIMS:` line (a line that starts with it, any case, in the RAW body, also in a fence or a comment) other than the one `claim_text`
+    reads, naming its line number and place; None when there is none."""
+    raw = body or ""
+    kept, last = [], 0
+    spans = []
+    for m in HIDDEN_RE.finditer(raw):
+        kept.extend(range(last, m.start()))
+        spans.append((m.start(), m.end(), bool(m.group(1))))
+        last = m.end()
+    kept.extend(range(last, len(raw)))
+    shown = "".join(raw[i] for i in kept)
+    first = PLAN_FIRST_RE.search(shown)
+    found = CLAIMS_UNDER_RE.match(shown, first.end()) if first else None
+    read = kept[found.start() + 1] if found else None
+    plan_at = kept[first.start()] if first else None
+    for m in CLAIMS_LINE_RE.finditer(raw):
+        at = m.start()
+        if at == read:
+            continue
+        line = raw.count("\n", 0, at) + 1
+        hidden = [f for a, b, f in spans if a <= at < b]
+        prev = raw[:at].rsplit("\n", 2)
+        if hidden:
+            place = "inside a code fence" if hidden[0] else "inside an HTML comment"
+            fix = "; write the example inline, not at the start of a line"
+        else:
+            fix = ""
+            if read is not None:
+                place = "a second `CLAIMS:` line"
+            elif plan_at is None:
+                place = "in a body with no `PLAN:` line"
+            elif at < plan_at:
+                place = "above the `PLAN:` line"
+            elif len(prev) < 2 or not prev[-2].strip():
+                place = "after a blank line"
+            else:
+                place = "after another opening line"
+        return "line %d of the body holds a `CLAIMS:` line %s, where it is not read: the `CLAIMS:` line must stand directly under the `PLAN:` line%s" % (line, place, fix)
+    return None
+
+
+def pr_claim(body, scenarios):
+    """(ids, error) for the claim line of a PR body: a `CLAIMS: S3 S4 S5` line directly under the `PLAN:` line names the scenarios THIS pull request proves.
+    `ids` is None when the body has no claim line (the PR behaves as it always did: every scenario read as `pr` is its own). The error says why a claim is
+    REFUSED: it names a scenario the plan does not declare, one the plan claims at the epic (a claim line only narrows), or names nothing."""
+    misplaced = misplaced_claim(body)
+    if misplaced:
+        return None, misplaced
+    text = claim_text(body)
+    if text is None:
+        return None, None
+    names = [n for n in re.split(r"[\s,;]+", text.strip()) if n]
+    if not names:
+        return None, "the `CLAIMS:` line names no scenario: list the scenario ids this pull request proves (`CLAIMS: S3 S4`), or remove the line"
+    by_id = {s.get("id"): s for s in scenarios}
+    unknown = [n for n in names if n not in by_id]
+    if unknown:
+        return None, "the `CLAIMS:` line names %s, which the plan does not declare (it declares %s)" % (", ".join(unknown), ", ".join(sorted(map(str, by_id))[:12]))
+    epic = [n for n in names if claim_of(by_id[n]) != "pr"]
+    if epic:
+        return None, "the `CLAIMS:` line names %s, which the plan claims at the epic: a claim line only narrows what a pull request proves" % ", ".join(epic)
+    return list(dict.fromkeys(names)), None
+
+
+def pr_scenarios(scenarios, body):
+    """(claimed, left, error): the scenarios this PR proves (`claim_of` reads `pr`, narrowed by its claim line), the `pr` ones its claim line leaves to
+    the epic's other pull requests, and the claim line's refusal (then `claimed` is empty)."""
+    mine = [s for s in scenarios if claim_of(s) == "pr"]
+    ids, error = pr_claim(body, scenarios)
+    if error:
+        return [], [], error
+    if ids is None:
+        return mine, [], None
+    return [s for s in mine if s.get("id") in ids], [s for s in mine if s.get("id") not in ids], None
+
+
+def covered_ids(scenarios, bodies):
+    """The ids the claims of these pull request bodies cover; a refused claim line covers nothing. The ONE reader of claimed scenarios for the union and #1347."""
+    covered = set()
+    for body in bodies:
+        claimed, _, error = pr_scenarios(scenarios, body)
+        if not error:
+            covered.update(c.get("id") for c in claimed)
+    return covered
+
+
+def claim_union(scenarios, this_body, others):
+    """(applies, uncovered, last): the claim union of one ask (#976). `others` is [(state, body)] for the OTHER pull requests of the same plan, state `open` or `merged`
+    (one closed without a merge proves nothing and is not passed in). `last` is true when none of them is open: this merge is the ask's last. `applies` is true only when
+    some pull request of the ask has a claim line (a plan nobody narrows behaves exactly as before). `uncovered` lists the per-pull-request scenario ids that the claims of
+    the merged pull requests together with this one (a body with no claim line claims every one) leave out. A claim line that is refused covers nothing."""
+    per = [s.get("id") for s in scenarios if claim_of(s) == "pr"]
+    bodies = [this_body] + [body for _, body in others]
+    narrowed = any(pr_claim(body, scenarios)[0] is not None for body in bodies)
+    last = not any(state == "open" for state, _ in others)
+    covered = covered_ids(scenarios, [this_body] + [body for state, body in others if state == "merged"])
+    return narrowed, [i for i in per if i not in covered], last
+
+
+def claim_counts(scenarios, bodies):
+    """How many of `bodies` cover each per-pull-request id (#1716): one reading of each body through `covered_ids`, kept as one number for each id. Pure."""
+    counts = {}
+    for body in bodies:
+        for i in covered_ids(scenarios, [body]):
+            counts[i] = counts.get(i, 0) + 1
+    return counts
+
+
+def omitted_claims(scenarios, this_body, counts):
+    """The per-pull-request ids this body's claim line leaves out that no OTHER body counted covers (`counts` is `claim_counts` over all bodies, this one included, so an id this body covers has a count of at least 1: an id is omitted when this body has a claim line that covers something, the scenario is per pull request and the counts hold NO body that covers it). No claim line claims every one and a refused line covers nothing: both leave out nothing here (`covered_ids` gives the empty set). Pure."""
+    mine = covered_ids(scenarios, [this_body])
+    return [s.get("id") for s in scenarios if mine and claim_of(s) == "pr" and not counts.get(s.get("id"), 0)]
+
+
+def claim_line(pr, head, body):
+    """The ONE ledger line that binds a pull request's claim as it stood when its merge was gated (#976). `claim_text` None: no claim line."""
+    text = claim_text(body)
+    return {"kind": "claim", "pr": pr, "head": head, "claim_text": None if text is None else clip(text, CLAIM_TEXT_LIMIT)}   # a refused claim covers nothing, so a clipped one is never wider
+
+
+def recorded_claim(entries, pr, first=False, at=None):
+    """(found, claim_text) from the NEWEST `claim` line of `pr`, or the FIRST with `first`. With `at` (epoch seconds, a merged pull request's `merged_at`): the NEWEST line
+    recorded AT OR BEFORE `at`, the claim in force at the merge; a claim line of `pr` with no usable timestamp reads nothing (found False). found is False when none qualifies."""
+    mine = [e for e in entries if e.get("kind") == "claim" and e.get("pr") == pr]
+    if at is not None:
+        if any(isinstance(e.get("ts"), bool) or not isinstance(e.get("ts"), int) for e in mine):
+            return False, None
+        mine = [e for e in mine if e["ts"] <= at]
+    if not mine:
+        return False, None
+    return True, mine[0 if first else -1].get("claim_text")
+
+
+def claim_body(text, link="PLAN: x#1"):
+    """A body that carries a recorded claim text, to be read by `pr_claim` like any other."""
+    return link + ("\nCLAIMS: %s" % text if text is not None else "")
+
+
+def union_refusal(ref, uncovered, closed=()):
+    tail = "; the closed-unmerged pull request%s %s left %s unclaimed (#1347)" % ("s" if len(closed) > 1 else "", ", ".join("#%s" % n for n in closed), "it" if len(uncovered) == 1 else "them") if closed else "; the closed pull requests could not be read" if closed is None else ""
+    return ("merge of %s refused: it is the last pull request of its ask and the claims of its merged pull requests do not cover %s%s; a pull request must claim %s "
+            "(`CLAIMS:` under `PLAN:`), or the chief of staff logs a waiver (`waive %s --gates CU`)" % (
+                ref, ", ".join(uncovered), tail, "it" if len(uncovered) == 1 else "them", ref))
+
+
+def closed_unclaimed(scenarios, peers, closed):
+    """(uncovered, closed_numbers) of one ask with NO subject pull request (#1347): `peers` is [(state, body)] of its `open` and `merged` pull requests, `closed` [(number, body)] of
+    those closed without a merge. Flagged only when the ask has a closed-unmerged pull request, none is open, some claim line narrows a pull request, and a per-pull-request
+    scenario is claimed by no merged one. A closed pull request's claim covers nothing. Otherwise ([], [])."""
+    if not closed or any(state == "open" for state, _ in peers):
+        return [], []
+    bodies = [b for _, b in peers] + [b for _, b in closed]
+    if not any(pr_claim(b, scenarios)[0] is not None for b in bodies):
+        return [], []
+    per = [s.get("id") for s in scenarios if claim_of(s) == "pr"]
+    covered = covered_ids(scenarios, [body for state, body in peers if state == "merged"])
+    uncovered = [i for i in per if i not in covered]
+    return (uncovered, [n for n, _ in closed]) if uncovered else ([], [])
+
+
+def canon_status(body):
+    """(ok, detail) for the G5 checklist line: `canon: <what was updated>`, or `canon: n/a <reason>` with a reason."""
+    found = CANON_RE.search(body or "")
+    if not found:
+        return False, "the PR body has no `canon:` line (docs updated, or `canon: n/a <reason>`)"
+    value = found.group(1).strip()
+    if re.match(r"(?i)^n/?a\b", value):
+        reason = re.sub(r"(?i)^n/?a\b[\s:,-]*", "", value).strip()
+        return (len(reason) >= 5, "`canon: n/a` with a reason" if len(reason) >= 5 else "`canon: n/a` needs a reason")
+    return (len(value) >= 3, "`canon:` line present" if len(value) >= 3 else "the `canon:` line is empty")
+
+
+def scenario_state(scenario, entries, pr, plan_hash, head, authors):
+    """One scenario's G1 picture: {id, evaluator, proof, verdict, status, missing[], void[]}. A proof or verdict counts
+    only for THIS plan hash and THIS head; one for another is shown as void, not hidden."""
+    sid, evaluator = scenario["id"], evaluator_of(scenario)
+    out = {"id": sid, "evaluator": evaluator, "claim": claim_of(scenario), "missing": [], "void": []}
+    carried = carried_seqs(entries, pr, head, plan_hash)   # #1129: {seq of the proof or verdict: its carried line}
+    for kind in ("proof", "verdict"):
+        mine = [e for e in entries if e.get("pr") == pr and e.get("scenario") == sid and e.get("kind") == kind
+                and (kind == "proof" or e.get("evaluator") == evaluator)]
+        fresh = [e for e in mine if e.get("plan_hash") == plan_hash and (e.get("head") == head or e.get("seq") in carried)]
+        newest = fresh[-1] if fresh else None
+        if newest and newest.get("head") != head:
+            out.setdefault("carried", []).append(carried_view(newest, carried[newest["seq"]]))
+        if not newest and mine:
+            why = "plan changed" if mine[-1].get("plan_hash") != plan_hash else "head moved"
+            out["void"].append("%s #%d void: %s" % (kind if kind == "proof" else evaluator + " verdict", mine[-1]["seq"], why))
+        out[kind] = None if not newest else {"seq": newest["seq"], "result": newest["result"], "by": newest.get("by"), "right": newest.get("right"),
+                                                                                    "evidence": newest.get("evidence"), "ts": newest.get("ts")}
+    proof, verdict = out["proof"], out["verdict"]
+    if not proof:
+        out["missing"].append("proof (`prove %s`; the %s judges it, a prover records it)" % (sid, evaluator))
+    elif proof["result"] != "pass":
+        out["missing"].append("proof says fail (the %s judges it, a prover records a new one)" % evaluator)
+    if not verdict:
+        out["missing"].append("%s verdict (`verdict %s --as %s`; only the %s may record it)" % (evaluator, sid, evaluator, evaluator))
+    elif verdict["result"] != "pass":
+        out["missing"].append("%s verdict says fail (only the %s may record a new one): %s [by %s at %s]" % (evaluator, evaluator, (verdict.get("evidence") or "")[:160], verdict.get("by"), verdict.get("ts")))
+    elif verdict["by"] in authors:
+        out["missing"].append("the %s verdict is by an author of the PR (not accepted; only the %s, who is not an author, may record it)" % (evaluator, evaluator))
+    out["status"] = "ok" if not out["missing"] else "missing"
+    return out
+
+
+# ----------------------------------------------------------------------------------- the carry of a proof (#1129)
+
+CARRY_EVALUATORS = ("tester", "live", "reviewer")   # the types of proof that may carry; `ci` ids are re-recorded by the daemon, never carried
+CARRY_FIELDS = ("proof", "scenario", "old_head", "new_head", "facts")
+DOC_TEST_RE = re.compile(r"(^|/)(tests?|docs?)/|(^|/)test-[^/]*$|(^|/)test_[^/]*$|\.(md|rst|txt)$")
+
+
+def carried_seqs(entries, pr, head, plan_hash=None):
+    """{seq of a proof or verdict: its `carried` line} for the carries of `pr` whose new head is `head`. Empty without a head. With `plan_hash`, only a carry line that
+    names THAT plan hash counts (a line of another plan is no evidence: #1217); every reader of a carried row as evidence passes it."""
+    found = {}
+    for entry in entries if head else ():
+        if entry.get("kind") == "carried" and entry.get("pr") == pr and entry.get("new_head") == head and isinstance(entry.get("proof"), int) \
+                and (plan_hash is None or entry.get("plan_hash") == plan_hash):
+            found[entry["proof"]] = entry
+    return found
+
+
+def carried_view(row, line):
+    """What the gate shows of a carried proof: the ORIGINAL head the proof was recorded at, and the carry line that holds it here."""
+    return {"proof": row["seq"], "original_head": row.get("head"), "carried_line": line["seq"], "new_head": line["new_head"]}
+
+
+def is_tests_docs_only(files):
+    return bool(files) and all(DOC_TEST_RE.search(str(f)) for f in files)
+
+
+def carry_decision(row, evaluator, files_changed, merge_of_default, ci_green):
+    """(verdict, reason) for one proof or verdict `row` and a new head: verdict is "carry", "void" (a file the proof names is touched) or "refuse".
+    All three conditions are required: (a) none of the files the proof names is in `files_changed`; (b) the new head is a merge of the default branch or its
+    difference is tests and documentation only; (c) CI is green at the new head. A proof proven by CI, of another type, or naming no file is never carried."""
+    named = [f for f in (row.get("files") or ()) if isinstance(f, str) and f]
+    if evaluator not in CARRY_EVALUATORS:
+        return "refuse", "a %s proof is not carried (CI ids are re-recorded at each green head)" % evaluator
+    if not named:
+        return "refuse", "the proof names no file: it is never carried"
+    touched = sorted(set(named) & set(files_changed))
+    if touched:
+        return "void", "the difference touches a file the proof names: %s" % ", ".join(touched)
+    if not (merge_of_default or is_tests_docs_only(files_changed)):
+        return "refuse", "the difference is code outside a merge of the default branch"
+    if ci_green is not True:
+        return "refuse", "CI is not green at the new head"
+    return "carry", "carried"
+
+
+PATH_TOKEN_RE = re.compile(r"[^\s`'\"<>()\[\]{},;:=|]+")   # a word of a command or of evidence, cut at quotes, brackets and separators
+
+
+def proof_files(command, evidence, exists):
+    """(#1405) The files a proof names when `--file` was not given: sorted, the words of `command` (its arguments) and of `evidence` (the paths quoted in it) that look like a
+    path (a `/` or a `.` inside) and for which `exists(path)` says it is a file of the tree. Nothing else is named, so a word that is no dependency cannot carry a proof."""
+    found = set()
+    for text in (command, evidence):
+        for word in PATH_TOKEN_RE.findall(str(text or "")):
+            word = word.rstrip(".").removeprefix("./")
+            if word and not word.startswith(("/", "-", "..")) and ("/" in word or "." in word[1:]) and exists(word):
+                found.add(word)
+    return sorted(found)
+
+
+def head_view(scenario_id, evaluator, entries, pr, plan_hash, head, files_between):
+    """(#1405) The one `gates` line of a scenario's proof at `head`, or None when it has no proof of this plan: `proven at this head`, `carried ...`, or `void: ...` naming the
+    first named file that changed, that the proof names no file, or `unknown` when the difference cannot be read. `files_between(old_head)` returns the changed files or None
+    (never read as no change). It reuses `carry_decision`'s own reading of the named files."""
+    rows = [e for e in entries if e.get("pr") == pr and e.get("kind") == "proof" and e.get("scenario") == scenario_id and e.get("plan_hash") == plan_hash]
+    if not rows:
+        return None
+    row = rows[-1]
+    if row.get("result") != "pass":   # a failed proof is never proven and never carried
+        return "%s: proof at this head says %s" % (scenario_id, row.get("result") or "fail") if row.get("head") == head else \
+            "%s: void: the proof recorded at %s says %s, so it is never carried" % (scenario_id, str(row.get("head"))[:8], row.get("result") or "fail")
+    if row.get("head") == head:
+        return "%s: proven at this head" % scenario_id
+    named = sorted({f for f in (row.get("files") or ()) if isinstance(f, str) and f})
+    if row["seq"] in carried_seqs(entries, pr, head, plan_hash):
+        return "%s: carried (%s unchanged since %s)" % (scenario_id, ", ".join(named), str(row.get("head"))[:8])
+    if evaluator not in CARRY_EVALUATORS:
+        return "%s: void: head moved (a %s proof is re-recorded at each green head, never carried)" % (scenario_id, evaluator)
+    if not named:
+        return "%s: void: the proof names no file, so it is never carried" % scenario_id
+    changed = files_between(row.get("head"))
+    if changed is None:
+        return "%s: unknown: the difference since %s cannot be read, so nothing is carried" % (scenario_id, str(row.get("head"))[:8])
+    first = next((f for f in named if f in set(changed)), None)
+    if first:
+        return "%s: void: %s changed since %s" % (scenario_id, first, str(row.get("head"))[:8])
+    return "%s: void: the named files are unchanged since %s but it is not carried (it needs a merge of the default branch or tests and documentation only, and green CI)" % (
+        scenario_id, str(row.get("head"))[:8])
+
+
+def carry_line(row, scenario, old_head, new_head, merge_of_default, pr):
+    """The ONE ledger line of a carry: the proof, the old head, the new head and the three facts. The proof's own row is never rewritten."""
+    return {"kind": "carried", "pr": pr, "proof": row["seq"], "scenario": scenario, "plan_hash": row.get("plan_hash"), "old_head": old_head, "new_head": new_head,
+            "facts": {"named_files_untouched": True, "difference": "merge of the default branch" if merge_of_default else "tests and documentation only", "ci": "green"}}
+
+
+CARRIES_LINE_RE = re.compile(r"(?mi)^[ \t]*CARRIES:.*$")
+CARRIES_EXACT_RE = re.compile(r"^[ \t]*CARRIES:[ \t]*#(\d+)[ \t]*$")
+FENCE_RE = re.compile(r"^[ \t]*(```|~~~)")
+
+
+def _outside_fences(body):
+    """The lines of `body` that are not inside a fenced code block."""
+    out, fence = [], None
+    for line in (body or "").splitlines():
+        mark = FENCE_RE.match(line)
+        if mark:
+            fence = None if fence == mark.group(1) else (fence or mark.group(1))
+            continue
+        if fence is None:
+            out.append(line)
+    return out
+
+
+def carries_parse(body):
+    """(#1196) (number, problem): the standing body line `CARRIES: #N` outside fenced code blocks. problem is the reason in words when there is more than one CARRIES
+    line, or a line that is not exactly `#N` (several dependencies, another repository, trailing text); number is then None."""
+    lines = [l for l in _outside_fences(body) if CARRIES_LINE_RE.match(l)]
+    if not lines:
+        return None, None
+    if len(lines) > 1:
+        return None, "more than one CARRIES line: one dependency only"
+    found = CARRIES_EXACT_RE.match(lines[0])
+    if not found:
+        return None, "the CARRIES line %r is not exactly `CARRIES: #N` (one dependency of this repository only)" % lines[0].strip()[:60]
+    return int(found.group(1)), None
+
+
+def carries_of(body):
+    """(#1196) The number N of the standing body line `CARRIES: #N` (outside fenced code), else None (no line, or a refused one: see carries_parse)."""
+    return carries_parse(body)[0]
+
+
+def carries_refusal(dep_pr, dep_state, dep_head, in_branch):
+    """(#1196) The reason a CARRIES line is refused, else None: the named pull request is closed unmerged, or its head commit is not in this branch.
+    A merged dependency is not refused here: the pull request is then read as an ordinary one (the caller drops the line)."""
+    if dep_state == "closed":
+        return "%s is closed unmerged: its commits cannot be carried" % dep_pr
+    if not dep_head or not in_branch:
+        return "%s head %s is not in this branch: the commits it names are not here" % (dep_pr, (dep_head or "?")[:8])
+    return None
+
+
+def clear_names_both(clear, pr, dep_pr):
+    """(#1196) True when the owner's clear record names BOTH pull requests (the carrying one and the dependency)."""
+    names = (clear or {}).get("names")
+    return isinstance(names, list) and pr in names and dep_pr in names
+
+
+def carried_rows(carries, entries, facts):
+    """(#1196) The dependency's scenario rows: its recorded proofs and verdicts are reused ONLY for the commit its head names (`scenario_state` compares the head by
+    commit, never by pull request name); a record for any other commit is void. Returns (rows, reviews)."""
+    dep_pr, dep_head, dep_plan = carries["pr"], carries["head"], carries["plan"]
+    entries = as_current(entries, dep_plan.get("plan_hashes"))   # #1713
+    authors = authors_of(entries, dep_pr, carries.get("notice_senders") or (), carries.get("author"))
+    rows = []
+    for s in dep_plan["scenarios_parsed"]:
+        if claim_of(s) != "pr":
+            continue
+        row = scenario_state(s, entries, dep_pr, dep_plan["plan_hash"], dep_head, authors)
+        row["id"] = "%s %s" % (dep_pr, row["id"])
+        row["carried_from"] = dep_pr
+        rows.append(row)
+    return rows, review_records_at(entries, dep_pr, dep_head)
+
+
+REVIEWERS = ("code", "architecture", "security", "impact", "test")
+REVIEWERS_NOW = ("code", "architecture", "security", "impact", "test")   # the reviewers that exist today
+REVIEW_VERDICTS = ("approve", "request-changes", "comment", "incomplete")
+
+
+# #1047: every function that reads the `uncited` mark, as (file, function): the one table; a completeness test derives the set from the source and fails when one is missing.
+UNCITED_CONSUMERS = (("plan_ledger.py", "review_blocks"), ("plan_ledger.py", "review_records_at"), ("plan_ledger.py", "render_gates"),
+                     ("fleet-switchboard", "pr_state_view"), ("fleet-switchboard", "pr_state_line"), ("fleet-switchboard", "parse_review_block"), ("fleet-switchboard", "cmd_review"))
+
+
+def review_blocks(entry):
+    """The ONE blocking decision for a review record: only a request-changes that names a rule blocks. An uncited request-changes is recorded and
+    shown ("names no rule") but, as the review laws say (R-LAW-1, R-LAW-8), a finding that cites no rule does not block."""
+    return entry.get("verdict") == "request-changes" and entry.get("uncited") is not True
+
+
+def review_records_at(entries, pr, head, expected=REVIEWERS_NOW):
+    """The reviewer records of PR `pr` AT `head` (the latest per reviewer wins): {"expected", "recorded": {reviewer: verdict}, "missing"}.
+    A record at another head does not count: a push voids it. SHADOW: this is shown by `gates`, never counted towards ready, and a record
+    names the session that wrote it, which while agents share one account is a mistake guard and not a boundary."""
+    recorded, uncited, blocking = {}, [], []
+    for entry in entries:
+        if entry.get("kind") == "review_record" and entry.get("pr") == pr and entry.get("head") == head and entry.get("reviewer") in expected:
+            recorded[entry["reviewer"]] = entry.get("verdict")
+            if review_blocks(entry):
+                if entry["reviewer"] not in blocking:
+                    blocking.append(entry["reviewer"])
+            elif entry["reviewer"] in blocking:
+                blocking.remove(entry["reviewer"])
+            if entry.get("uncited") is True and entry.get("verdict") == "request-changes":
+                if entry["reviewer"] not in uncited:
+                    uncited.append(entry["reviewer"])
+            elif entry["reviewer"] in uncited:
+                uncited.remove(entry["reviewer"])
+    return {"expected": list(expected), "recorded": recorded, "uncited": uncited, "blocking": blocking, "missing": [r for r in expected if r not in recorded]}
+
+
+def evaluate_gates(plan, entries, ledger_problem, facts, pr, now=None):
+    """The gate table for one PR. `plan` is {"result", "defects", "scenarios_parsed", "plan_hash"} from the plan checker
+    (None when no plan could be found), `facts` is what `gh pr view` said (head, ci, captain, body, notice_senders).
+
+    Returns {"gates", "ready", "untracked", "scenarios", "head", "plan_hash", "ledger_problem"}. `ready` is true when
+    every tracked gate that applies to a PR is satisfied; the untracked ones are listed, not counted."""
+    head = (facts or {}).get("head")
+    authors = authors_of(entries, pr, (facts or {}).get("notice_senders") or (), (facts or {}).get("author"))
+    entries = as_current(entries, (plan or {}).get("plan_hashes"))   # #1713: a binding at the old hash of a marker-bearing plan reads as the live one
+    carries = (facts or {}).get("carries") or None   # (#1196) the one dependency named by `CARRIES: #N`; None for an ordinary pull request
+    carried_reviews = None
+    rows, scen_rows = [], []
+    for gid, name, scope, owner, tracked in GATES:
+        row = {"gate": gid, "name": name, "scope": scope, "decided_by": owner, "tracked": tracked, "status": "untracked",
+               "missing": [], **((facts or {}).get("approval") or {}).get(gid, {})}   # #1735: the G0c row is decided by bin/switchboard/approval_gate.py and arrives in facts["approval"]["G0c"]
+        if scope != "P":
+            row["status"] = "n/a"
+            row["detail"] = UNTRACKED_WHY.get(gid, "")
+        elif not row["tracked"]:
+            row["detail"] = UNTRACKED_WHY.get(gid, "not recorded yet")
+        elif gid == "G0a":
+            if plan is None:
+                row.update(status="missing", missing=["no plan found: pass --plan, or put `PLAN: <link>` in the PR body"])
+            elif plan["result"] != "pass":
+                row.update(status="missing", missing=["plan check fails: %d defect(s)" % len(plan["defects"])])
+            else:
+                row.update(status="ok", detail="plan hash %s" % plan["plan_hash"])
+            if carries and row["status"] == "ok":   # (#1196) both asks need a plan
+                dep = carries.get("plan")
+                if carries.get("refusal"):
+                    row.update(status="missing", missing=[carries["refusal"]])
+                elif dep is None or dep.get("result") != "pass":
+                    row.update(status="missing", missing=["CARRIES %s: the dependency's plan is missing or fails its check" % carries["pr"]])
+                else:
+                    row["detail"] += "; carried plan %s hash %s" % (carries["pr"], dep["plan_hash"])
+        elif gid == "G1":
+            if plan is None or plan["result"] != "pass":
+                row.update(status="missing", missing=["needs a plan that passes G0a"])
+            elif not head:
+                row.update(status="missing", missing=["the PR head is unknown"])
+            else:
+                claimed, left, claim_error = pr_scenarios(plan["scenarios_parsed"], (facts or {}).get("body"))
+                scen_rows = [scenario_state(s, entries, pr, plan["plan_hash"], head, authors) for s in claimed]
+                if carries and not carries.get("refusal") and carries.get("plan") and carries["plan"].get("result") == "pass" and carries.get("head"):
+                    dep_rows, carried_reviews = carried_rows(carries, entries, facts)
+                    scen_rows = scen_rows + dep_rows
+                elif carries:
+                    scen_rows = scen_rows + [{"id": "%s plan" % carries["pr"], "status": "missing", "missing": [carries.get("refusal") or "the carried plan cannot be read"], "void": [], "evaluator": "-", "proof": None, "verdict": None,
+                                              "carried_from": carries["pr"]}]
+                bad = [s for s in scen_rows if s["status"] != "ok"]
+                row["detail"] = "%d of %d claimed scenarios proven and judged at %s" % (len(scen_rows) - len(bad), len(scen_rows), head[:8])
+                none_because = PER_PR_NONE_RE.search(plan.get("text") or "")
+                if claim_error:
+                    row.update(status="missing", missing=["refused: " + claim_error])
+                elif not claimed:
+                    # G1 never passes vacuously: no per-PR scenario needs an explicit, reasoned statement
+                    if none_because and len(none_because.group(1).strip()) >= 20:
+                        row.update(status="n/a", detail="no per-PR scenarios: %s (the epic gate applies)" % none_because.group(1).strip()[:80])
+                    else:
+                        row.update(status="missing", missing=["no scenario is claimed per PR: state `per-pr scenarios: none because "
+                                                              "<reason>` in the plan, or claim one"])
+                elif bad:
+                    row.update(status="missing", missing=["%s: %s" % (s["id"], "; ".join(s["missing"])) for s in bad])
+                else:
+                    row["status"] = "ok"
+                epic = [s["id"] for s in plan["scenarios_parsed"] if claim_of(s) == "epic"]
+                if left:
+                    row["detail"] += "; left to the epic's other pull requests by the CLAIMS line: %s" % ", ".join(s["id"] for s in left)
+                if epic:
+                    row["detail"] += "; epic-claimed, proven after the merge at the integration head: %s (not required of this pull request: each is recorded on the owning issue, unrecorded, recorded or stale there; read its `gates`)" % ", ".join(epic)
+        elif gid == "G4":
+            ci = (facts or {}).get("ci")
+            applies, legs_ok, legs_said = (facts or {}).get("legs") or (False, True, "")   # #1235: the macOS legs, read from the rollup
+            if ci in ("green", "passing") and applies and not legs_ok:
+                row.update(status="missing", missing=["CI is green at %s but %s" % ((head or "?")[:8], legs_said)])
+            elif (facts or {}).get("ci_line") and ci not in ("green", "passing"):   # #1755: the run was not made on the current tip: stale or unknown is never ok
+                row.update(status="missing", missing=[facts["ci_line"]])
+            elif ci in ("green", "passing"):
+                row.update(status="ok", detail="CI %s at %s%s%s" % (ci, (head or "?")[:8], "; " + facts["ci_line"] if (facts or {}).get("ci_line") else "", "; ubuntu legs green at the head, " + legs_said if applies else ""))
+            elif (facts or {}).get("draft") is True and ci == "none":   # #770: a draft whose workflow skips drafts has no run at all, and "CI is failing" sends the author the wrong way; a draft WITH runs keeps the failing line
+                row.update(status="missing", missing=["draft: no CI run seen; this repo's workflow may skip drafts; mark ready, then wait"])
+            else:
+                row.update(status="missing", missing=["CI is %s (needs green at the head, or a second agent's re-run)" % (ci or "unknown")])
+        elif gid == "G5":
+            ok, detail = canon_status((facts or {}).get("body"))
+            row.update(status="ok" if ok else "missing", detail=detail, missing=[] if ok else [detail])
+        elif gid == "G6":
+            floor = (facts or {}).get("floor")   # the impact floor read fresh for this head (#488); absent = not read, the label alone
+            if isinstance(floor, dict) and (floor.get("unreadable") or floor.get("decision") is None):
+                row.update(status="waiting", missing=["the impact floor could not be read for this head (%s): the owner decides, through cos"
+                                                      % (floor.get("unreadable") or "no decision")])
+            elif carries and isinstance(floor, dict) and floor.get("clear_head") and floor.get("clear_head") != head and not floor.get("cleared") and floor.get("decision") == "hold":
+                row.update(status="waiting", missing=["clear is for another head (%s): a clear of a carrying pull request is recorded at the head that carries %s and never carries to a later head; the owner clears this head"
+                                                      % (floor["clear_head"][:8], carries["pr"])])
+            elif carries and isinstance(floor, dict) and floor.get("decision") == "hold" and floor.get("cleared") and not floor.get("names_both"):
+                row.update(status="waiting", missing=["the owner's clear does not name both pull requests (%s and %s): the owner clears again" % (pr, carries["pr"])])
+            elif isinstance(floor, dict) and floor.get("rehold"):   # (#830) a clear was recorded for ANOTHER head, none for this one, no rating here: held again, whatever the labels say
+                row.update(status="waiting", missing=["held again for the owner at this head: %s; the owner clears this head, or the impact rating at this head says not held"
+                                                      % floor["rehold"]])
+            elif isinstance(floor, dict) and floor.get("decision") == "hold" and not floor.get("cleared"):
+                row.update(status="waiting", missing=["held for the owner (impact floor, read at this head): %s; the owner clears it for this head"
+                                                      % ("; ".join(floor.get("reasons") or []) or "hold")])
+            elif labels_unread((facts or {}).get("captain")):   # the labels (or the fact itself) were not readable: not "not held" (#2379)
+                row.update(status="waiting", missing=["labels could not be read: whether the PR is held for the owner is not known, so it is NOT READY"])
+            elif (facts or {}).get("captain"):
+                row.update(status="waiting", missing=["held for the owner (merge-captain label): the owner decides, through cos"])
+            else:
+                row.update(status="ok", detail="not a held PR")
+        elif gid == "G6b":
+            floor = (facts or {}).get("floor")
+            # held = the same reading as `pr-explain --check`: a hold label, the merge-captain label or marker, or an uncleared floor hold; a missing
+            # `held_check` on a held PR fails closed (missing)
+            held = labels_unread((facts or {}).get("captain")) or bool((facts or {}).get("captain")) or bool((facts or {}).get("holds")) or (isinstance(floor, dict) and (bool(floor.get("rehold")) or (floor.get("decision") == "hold" and not floor.get("cleared"))))
+            check = (facts or {}).get("held_check")   # the ONE check (`held_defects` in the switchboard), called only for a held PR
+            if not held:
+                row.update(status="n/a", detail="not a held PR")
+            elif not callable(check):
+                row.update(status="missing", missing=["the held PR's body could not be checked"])
+            else:
+                defects = check()
+                row.update(status="missing", missing=list(defects)) if defects else row.update(status="ok", detail="the body opens with why, a diagram and its questions")
+        rows.append(row)
+    if ledger_problem:
+        for row in rows:
+            if row["gate"] == "G1" and row["status"] == "ok":
+                row.update(status="missing", missing=["the ledger is not trustworthy: %s" % ledger_problem])
+    waived = []
+    if now is not None and head and not ledger_problem:   # an untrustworthy ledger honours no waiver
+        waivers = valid_waivers(entries, pr, head, now)
+        for row in rows:
+            entry = waivers.get(row["gate"])
+            if entry is not None and row["status"] == "missing":
+                row.update(status="waived", was_missing=row["missing"], missing=[],
+                           detail="waived (by %s, %s, due %s)" % (entry.get("by") or "?", entry.get("reason") or "no reason",
+                                                                time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(entry["expires"]))))
+                waived.append(row["gate"])
+    ready = all(r["status"] in ("ok", "n/a", "untracked", "waived") for r in rows)
+    return {"gates": rows, "ready": ready, "waived": waived, "untracked": [r["gate"] for r in rows if r["status"] == "untracked"],
+            "scenarios": scen_rows, "head": head, "plan_hash": (plan or {}).get("plan_hash"),
+            "ledger_problem": ledger_problem, "reviews": review_records_at(entries, pr, head) if head else None,
+            "carries": ({"pr": carries["pr"], "head": carries.get("head"), "reviews": carried_reviews, "refusal": carries.get("refusal")} if carries else None)}
+
+
+SATISFIED = ("ok", "n/a", "untracked", "waived")
+
+
+def enforced_view(report, enforced):
+    """Add `enforced` (the gates the repo refuses on, or None when it refuses on none: shadow, unlisted or off) and
+    `ready_enforced` (those gates are all satisfied) to `report`. The full-board `ready` is left as it was."""
+    report["enforced"] = list(enforced) if enforced else None
+    rows = {r["gate"]: r for r in report["gates"]}
+    open_enforced = [g for g in (enforced or ()) if rows.get(g) and rows[g]["status"] not in SATISFIED]
+    report["ready_enforced"] = (not open_enforced) if enforced else report["ready"]
+    report["open_enforced"] = open_enforced
+    report["open_not_enforced"] = [r["gate"] for r in report["gates"]
+                                   if r["gate"] not in (enforced or ()) and r["status"] not in SATISFIED] if enforced else []
+    return report
+
+
+def impact_rating_fact(entries, level, roles):
+    """The impact-rating fact `gates` shows (#892): `entries` are the independent reviewer's records at exactly this head, `level` is what the delegated clear's own scoring says of them
+    (the level of the highest record whose recorded role counts AND that carries a usable score; None otherwise), `roles` the matrix's `rating_roles` (the block the scoring reads). Four shapes:
+    none recorded; a role that counts with a score; a role that counts with NO usable score (it clears nothing by score); a role that does not count."""
+    if not entries:
+        return {"recorded": False}
+    if level:
+        return {"recorded": True, "role_counts": True, "scored": True, "level": level}
+    if any(e.get("by_role") in roles for e in entries):
+        return {"recorded": True, "role_counts": True, "scored": False}
+    role = entries[-1].get("by_role")
+    return {"recorded": True, "role_counts": False, "scored": False, "role": role if isinstance(role, str) else None}
+
+
+def impact_rating_line(rating, head):
+    """The ONE line `gates` prints about the independent impact rating at the head (#892). `rating` is `impact_rating_fact`'s answer, or {"problem"} (it could not be read). Output text only."""
+    at = (head or "?")[:8]
+    if rating.get("problem"):
+        return "impact rating at %s: unknown (%s)" % (at, rating["problem"])
+    if not rating.get("recorded"):
+        return "impact rating at %s: no impact rating recorded" % at
+    if rating.get("scored"):
+        return "impact rating at %s: %s; its recorded role counts as the independent rating" % (at, rating.get("level"))
+    if rating.get("role_counts"):
+        return "impact rating at %s: its recorded role counts as the independent rating, but the record carries no usable score (it clears nothing by score)" % at
+    return "impact rating at %s: recorded by role %s; recorded, not counted as the independent rating" % (at, rating.get("role") or "unrecorded")
+
+
+def verdict_lines(report):
+    """#1869: one line per tester or reviewer verdict the report counts: `verdict: <id>: <evaluator> verdict #<seq> by <name>, <right>`; a verdict recorded
+    before the right was kept says `source not recorded`."""
+    out = []
+    for s in report.get("scenarios", []):
+        v = s.get("verdict")
+        if v and s.get("evaluator") in ("tester", "reviewer"):
+            out.append("verdict: %s: %s verdict #%s by %s, %s" % (s["id"], s["evaluator"], v["seq"], v.get("by"), v.get("right") or "source not recorded"))
+    return out
+
+
+def render_gates(report, pr):
+    """The lines `gates` prints."""
+    if report.get("enforced"):
+        names = ", ".join(report["enforced"])
+        state = ("READY for the enforced gates (%s)" % names if report["ready_enforced"]
+                 else "NOT READY for the enforced gates (%s): open %s" % (names, ", ".join(report["open_enforced"])))
+        if report["open_not_enforced"]:
+            state += "; not enforced: %s" % ", ".join(
+                "%s %s" % (g, next(r["status"] for r in report["gates"] if r["gate"] == g)) for g in report["open_not_enforced"])
+    else:
+        state = ("READY on the gates it tracks (this is not approval: see the untracked list)"
+                 if report["ready"] else "NOT READY")
+    lines = ["gates for %s at %s: %s" % (pr, (report.get("head") or "unknown head")[:8], state) + (
+                 "; WAIVED (not passed): %s" % ", ".join(report["waived"]) if report.get("waived") else ""),
+             "plan hash: %s" % (report.get("plan_hash") or "none")]
+    if report.get("ledger_problem"):
+        lines.append("LEDGER: %s" % report["ledger_problem"])
+    for row in report["gates"]:
+        detail = row.get("detail") or ""
+        lines.append("  %-6s %-18s %-9s (%s)%s" % (row["gate"], row["name"], row["status"], row["decided_by"],
+                                                   "  " + detail if detail else ""))
+        lines.extend("           missing: %s" % m for m in row["missing"])
+    for s in report.get("scenarios", []):
+        for note in s["void"]:
+            lines.append("  %s: %s" % (s["id"], note))
+        for view in s.get("carried") or ():   # #1129: a carried proof is shown with the head it was recorded at
+            lines.append("  %s: carried: row #%d recorded at %s, held here by carried line #%d" % (s["id"], view["proof"], str(view["original_head"])[:8], view["carried_line"]))
+    lines.extend("  proof: %s" % l for l in report.get("head_lines") or ())   # #1405: per scenario, proven / carried / void by a named file
+    lines.extend("  %s" % l for l in verdict_lines(report))   # #1869: the seat of each tester or reviewer verdict counted, and where its right came from
+    rating = report.get("impact_rating")
+    if isinstance(rating, dict):
+        lines.append("  " + impact_rating_line(rating, report.get("head")))
+    reviews = report.get("reviews")
+    if reviews:
+        lines.append("  reviewers (plan-review panel verdicts: shadow, not counted by any gate): %d of %d recorded at %s%s" % (
+            len(reviews["recorded"]), len(reviews["expected"]), (report.get("head") or "?")[:8],
+            ": " + ", ".join("%s %s%s" % (kv + (" (names no rule, does not block)" if kv[0] in (reviews.get("uncited") or []) else "",)) for kv in sorted(reviews["recorded"].items())) if reviews["recorded"] else "")
+            + ("; %d blocking review(s)" % len(reviews.get("blocking") or []) if reviews.get("blocking") else "")
+            + ("; %d request-changes names no rule and does not block" % len(reviews["uncited"]) if reviews.get("uncited") else "")
+            + ("; missing %s" % ", ".join(reviews["missing"]) if reviews["missing"] else ""))
+    if report["untracked"]:
+        lines.append("not tracked yet (not counted): %s" % ", ".join(report["untracked"]))
+    return lines
+
+
+# ----------------------------------------------------------------------------------- the gate engine's decision (slice 3a)
+#
+# `gates-check` asks this module one question: given a PR's gate report, the repo's mode and what the check is for, allow
+# or refuse? Nothing here reads GitHub, a file or the clock. Nothing calls it from a shim yet and nothing is enforced.
+
+MODES = ("shadow", "enforce")
+CHECK_FOR = ("ready", "merge")
+BUDGET_RANGE = (500, 30000)
+# the gates each check requires, among those the engine tracks (G0b, G0c and G2/G3 are untracked and cannot refuse)
+REQUIRED_FOR = {"ready": ("G0a", "G1"), "merge": ("G0a", "G0c", "G1", "G4", "G6", "G6b")}
+DEFAULT_ENFORCED = ("G0a", "G1")   # the gates a repo in `enforce` refuses on unless its `enforce_gates` says otherwise
+ENFORCEABLE = ("G0a", "G0c", "G1", "G4", "G6", "G6b")
+EXIT_ALLOW, EXIT_REFUSE, EXIT_FAIL_OPEN = 0, 10, 3   # only EXIT_REFUSE refuses; every other exit is an allow
+
+
+def labels_unread(captain): return captain is None   # (#2379) an absent or None `captain` fact means the labels could not be read: held or not is unknown, never "not held"
+
+
+def normal_repo(name):
+    return str(name or "").strip().lower()
+
+
+def validate_plan_gates(raw, source):
+    """The `plan_gates` section checked and completed: {"repos": {"owner/repo": {"mode", "enabled", "budget_ms"}}}.
+    Raises ValueError naming the key. A repo is matched case-insensitively; two entries that differ only by case are refused."""
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError("%s: 'plan_gates' must be an object, got %s" % (source, type(raw).__name__))
+    unknown = sorted(set(raw) - {"repos", "ci_record"})
+    if unknown:
+        raise ValueError("%s: 'plan_gates' has key(s) this tool does not read: %s" % (source, ", ".join(unknown)))
+    repos, seen = {}, {}
+    for name, entry in (raw.get("repos") or {}).items():
+        if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", name):
+            raise ValueError("%s: 'plan_gates.repos' key %r is not owner/repo" % (source, name))
+        if normal_repo(name) in seen:
+            raise ValueError("%s: 'plan_gates.repos' lists %s twice (repos match without regard to case)" % (source, name))
+        seen[normal_repo(name)] = name
+        if not isinstance(entry, dict):
+            raise ValueError("%s: 'plan_gates.repos.%s' must be an object" % (source, name))
+        extra = sorted(set(entry) - {"mode", "enabled", "budget_ms", "enforce_gates", "item_checks", "ci_workflows", "ci_current_tip"})
+        if extra:
+            raise ValueError("%s: 'plan_gates.repos.%s' has key(s) this tool does not read: %s" % (source, name, ", ".join(extra)))
+        mode = entry.get("mode", "shadow")
+        if mode not in MODES:
+            raise ValueError("%s: 'plan_gates.repos.%s.mode' must be shadow or enforce (to switch a repo off, set enabled: false), got %r"
+                             % (source, name, mode))
+        enabled = entry.get("enabled", True)
+        if not isinstance(enabled, bool):
+            raise ValueError("%s: 'plan_gates.repos.%s.enabled' must be true or false" % (source, name))
+        budget = entry.get("budget_ms")   # NEW: absent stays absent; repo_setting() derives it from the shim's limit when it is read
+        if budget is not None and not (isinstance(budget, int) and not isinstance(budget, bool) and BUDGET_RANGE[0] <= budget <= BUDGET_RANGE[1]):
+            raise ValueError("%s: 'plan_gates.repos.%s.budget_ms' must be a whole number from %d to %d"
+                             % (source, name, *BUDGET_RANGE))
+        gates = entry.get("enforce_gates", list(DEFAULT_ENFORCED))
+        if not (isinstance(gates, list) and gates and all(g in ENFORCEABLE for g in gates) and len(set(gates)) == len(gates)):
+            raise ValueError("%s: 'plan_gates.repos.%s.enforce_gates' must be a non-empty list of distinct gates from %s "
+                             "(default %s), got %r" % (source, name, ", ".join(ENFORCEABLE), ", ".join(DEFAULT_ENFORCED), gates))
+        repos[name] = dict({"mode": mode, "enabled": enabled, "enforce_gates": [g for g in ENFORCEABLE if g in gates]}, **({} if budget is None else {"budget_ms": budget}))
+        if "item_checks" in entry:   # #770: declared and validated by bin/item_verdicts.py; carried here untouched, and absent when the repo does not list it
+            repos[name]["item_checks"] = entry["item_checks"]
+        if "ci_current_tip" in entry:   # #1755: only an explicit false turns the rule off; carried as it is
+            repos[name]["ci_current_tip"] = entry["ci_current_tip"]
+        if "ci_workflows" in entry:   # #1237: workflow names the gate expects a run of at the head
+            flows = entry["ci_workflows"]
+            if not (isinstance(flows, list) and len(flows) <= 20 and all(isinstance(x, str) and x for x in flows)):
+                raise ValueError("%s: 'ci_workflows' must be a list of at most 20 workflow ids or paths" % name)
+            repos[name]["ci_workflows"] = flows
+    record = raw.get("ci_record") if raw.get("ci_record") is not None else {}
+    if not isinstance(record, dict) or set(record) - {"enabled", "calls_per_pass", "pass_seconds"}:
+        raise ValueError("%s: 'plan_gates.ci_record' must be an object with enabled, calls_per_pass and pass_seconds" % source)
+    enabled, calls, seconds = record.get("enabled", True), record.get("calls_per_pass", 30), record.get("pass_seconds", 10)
+    if not isinstance(enabled, bool):
+        raise ValueError("%s: 'plan_gates.ci_record.enabled' must be true or false" % source)
+    if not (isinstance(calls, int) and not isinstance(calls, bool) and 4 <= calls <= 100):
+        raise ValueError("%s: 'plan_gates.ci_record.calls_per_pass' must be a whole number from 4 to 100" % source)
+    if not (isinstance(seconds, (int, float)) and not isinstance(seconds, bool) and 1 <= seconds <= 60):
+        raise ValueError("%s: 'plan_gates.ci_record.pass_seconds' must be a number from 1 to 60" % source)
+    return {"repos": repos, "ci_record": {"enabled": enabled, "calls_per_pass": calls, "pass_seconds": seconds}}
+
+
+def repo_setting(config, repo):
+    """The repo's {"mode", "enabled", "budget_ms"} from the validated config, or None when it is not opted in."""
+    for name, entry in ((config.get("plan_gates") or {}).get("repos") or {}).items():
+        if normal_repo(name) == normal_repo(repo):
+            return dict(entry, name=name, budget_ms=entry.get("budget_ms") or gate_budget.default_budget_ms())
+    return None
+
+
+CI_RECORDER = "switchboard"   # the reserved name of the built-in `ci` recorder (`gates ci-record`); not an agent
+CI_RECORD_FRESH_SECONDS = 7 * 86400
+
+
+def preflight(config, repo, ci_proven=None, cos_ready=None):
+    """(blocking, notes) for switching `repo` to enforce. Blocking: a `ci` recorder must be registered AND able to record. The
+    reserved name `switchboard` (the built-in recorder) is accepted only when `ci_proven()` says it has actually recorded
+    recently (a successful `gates ci-record` in the audit within CI_RECORD_FRESH_SECONDS); an agent name is accepted as
+    registered (it records through `verdict --as ci`). Notes are what the check cannot know: other evaluators are listed when
+    unregistered, and the permission change that lets cos use the escape hatch is a manual precondition."""
+    evaluators = config.get("plan_evaluators") or {}
+    blocking, notes = [], []
+    ci = evaluators.get("ci") or []
+    if not ci:
+        blocking.append("no `ci` recorder is registered: list `%s` (the built-in recorder) or an agent under plan_evaluators.ci" % CI_RECORDER)
+    elif CI_RECORDER in ci and not any(n != CI_RECORDER for n in ci) and not (ci_proven() if callable(ci_proven) else ci_proven):
+        blocking.append("the built-in `ci` recorder is listed but has not recorded recently: run `fleet-switchboard gates ci-record <repo#N>` "
+                        "on a PR whose CI is green (a successful record within 7 days proves it works)")
+    if callable(cos_ready):
+        lacking = cos_ready()
+        if lacking:
+            blocking.append("the chief of staff cannot yet turn enforcement off: %s (the cos permission change, #163, must be merged and "
+                            "installed before enforcement is switched on)" % lacking)
+    notes.append("`owner` verdicts are recorded only from the owner's own terminal (no agent session), never by an agent")
+    for kind in ("reviewer", "tester"):
+        if not evaluators.get(kind):
+            notes.append("no agent is registered for `%s`: a plan that names it cannot get a verdict (register it under "
+                         "plan_evaluators.%s)" % (kind, kind))
+    if not callable(cos_ready):
+        notes.append("manual: the chief of staff must be allowed `gates mode`/`gates off` and `waive` (a permission change held "
+                     "for the owner) before enforcement is switched on: cos is the one who can turn it off")
+    return blocking, notes
+
+
+COS_NEEDS = ("fleet-switchboard waive *", "fleet-switchboard gates mode * shadow")   # kept for callers that name them
+# What the Chief of Staff MUST be able to run (the way out of a refusal), and what it must NOT be able to run (turning enforcement ON is the
+# owner's). Judged by evaluating each probe against the installed definition's shell rules, not by looking for exact resource strings.
+COS_MUST_ALLOW = ("fleet-switchboard waive acme/app#1 --gates G1 --reason hotfix", "fleet-switchboard gates mode acme/app shadow", "fleet-switchboard gates off")
+COS_MUST_DENY = ("fleet-switchboard gates mode acme/app enforce", "fleet-switchboard gates mode acme/app ENFORCE", "fleet-switchboard gates on",
+                 "timeout 30 fleet-switchboard gates mode acme/app enforce", "timeout 30 fleet-switchboard gates mode acme/app ENFORCE", "timeout 5 fleet-switchboard gates on",
+                 "timeout 5 fleet-switchboard waive acme/app#1 --gates G6 --reason hotfix",
+                 "fleet-switchboard waive acme/app#1 --gates G6 --reason hotfix", "fleet-switchboard waive acme/app#1 --gates G8 --reason hotfix")
+
+
+def _frontmatter(text):
+    """The front matter of a definition (between the first two `---` lines), or None when the text has none."""
+    if not text.startswith("---\n") or "\n---\n" not in text[4:]:
+        return None
+    return text[4:].split("\n---\n", 1)[0]
+
+
+def _permission_lines(text):
+    """The lines of the `permissions:` block of a definition's FRONT MATTER only (body prose is never read). A text with no front matter is
+    taken as a bare rule list (a test's or a tool's input)."""
+    front = _frontmatter(text)
+    if front is None:
+        return text.splitlines()
+    lines = front.splitlines()
+    return lines[lines.index("permissions:") + 1:] if "permissions:" in lines else []
+
+
+def cos_rules(text):
+    """The (action, resource, effect) rules of a definition's `permissions:` list, in order. Two shapes are read: the one-line flow
+    form `- {action: shell, resource: "x", effect: allow}` (the installed short list) and the older block form with `action:`,
+    `resource:` and `effect:` on separate lines."""
+    import json as _json
+    import re as _re
+    rules, action, resource = [], None, None
+    for raw in _permission_lines(text):
+        line = raw.strip()
+        flow = _re.fullmatch(r"-\s*\{action:\s*(.+?),\s*resource:\s*(\".*\"),\s*effect:\s*(allow|deny|ask)\s*\}", line)
+        if flow:
+            try:
+                rules.append((flow.group(1).strip().strip('"'), _json.loads(flow.group(2)), flow.group(3)))
+            except ValueError:
+                pass
+            continue
+        line = line[2:].strip() if line.startswith("- ") else line
+        if line.startswith("action:"):
+            action = line.split(":", 1)[1].strip().strip('"')
+        elif line.startswith("resource:"):
+            resource = line.split(":", 1)[1].strip().strip('"')
+        elif line.startswith("effect:") and resource is not None:
+            rules.append((action or "shell", resource, line.split(":", 1)[1].strip().strip('"')))
+            resource = None
+    return rules
+
+
+def _glob_match(pattern, command):
+    """OpenCode's whole-value glob: `*` any run, `?` one character; a trailing ` *` also matches the bare command."""
+    import re as _re
+    rx = "".join(".*" if c == "*" else "." if c == "?" else _re.escape(c) for c in pattern)
+    if pattern.endswith(" *"):
+        rx = rx[:-len(_re.escape(" ") + ".*")] + "(?: .*)?"
+    return _re.fullmatch(rx, command, _re.S) is not None
+
+
+def cos_allows(rules, command):
+    """True when the shell `rules` let `command` run, as v2 decides it: the LAST rule of the shell action (or the base `*`) that matches
+    wins, and a command no rule matches is denied. (So a deny only holds when it comes after the allow that would admit the command.)"""
+    verdict = "deny"
+    for action, resource, effect in rules:
+        if action in ("shell", "bash", "*") and _glob_match(resource, command):
+            verdict = effect
+    return verdict == "allow"
+
+
+def cos_lacking(text):
+    """What the installed chief-of-staff definition (its text, or None when unreadable) gets wrong about the way out of a refusal:
+    "" when it can run `waive` (G0 to G5), `gates mode <repo> shadow` and `gates off`, and CANNOT turn enforcement on (`gates mode ...
+    enforce`, `gates on`) or waive G6 or G8. A cos that could turn it on is as blocking as one that cannot turn it off."""
+    if text is None:
+        return "the installed chief-of-staff definition could not be read"
+    front = _frontmatter(text)
+    if front is not None and any(line.startswith("name:") for line in front.splitlines()):
+        return "its front matter has a `name:` key: OpenCode v2 then ignores the whole `permissions:` list"
+    rules = cos_rules(text)
+    missing = [probe for probe in COS_MUST_ALLOW if not cos_allows(rules, probe)]
+    too_much = [probe for probe in COS_MUST_DENY if cos_allows(rules, probe)]
+    out = []
+    if missing:
+        out.append("it does not allow `%s`" % "`, `".join(missing))
+    if too_much:
+        out.append("it allows `%s` (turning enforcement on, or waiving G6 or G8, is not the chief of staff's)" % "`, `".join(too_much))
+    return "; ".join(out)
+
+
+def effective_mode(config, setting, ci_proven=None, cos_ready=None):
+    """(mode, why): the mode a check really runs in. `enforce` runs only when its preflight passes, wherever the mode is
+    read (the config file can be edited by hand, so the switch command is not the only way in); otherwise it runs as
+    `shadow` and `why` says what blocks it. A repo that is not enforcing has no `why`."""
+    if setting["mode"] != "enforce":
+        return setting["mode"], None
+    blocking, _ = preflight(config, setting.get("name") or "", ci_proven, cos_ready)
+    if blocking:
+        return "shadow", "enforce is not active: " + "; ".join(blocking)
+    return "enforce", None
+
+
+def decide(report, check_for, mode, enforce_gates=None):
+    """(verdict, failed, why): verdict is "allow" or "refuse". `report` is evaluate_gates' output. `failed` lists EVERY required
+    gate that is not satisfied, each marked `enforced` (it is in `enforce_gates`, default G0a and G1). In `enforce` only an
+    enforced failure refuses; a failure of a gate that is not listed is reported and allowed (G4 and G6 are reported until the
+    repo lists them). In `shadow` nothing refuses and every failure is the would-refuse record. A gate that is not tracked or
+    does not apply never fails a check."""
+    listed = set(enforce_gates or DEFAULT_ENFORCED)
+    failed = []
+    for row in report["gates"]:
+        if row["gate"] in REQUIRED_FOR[check_for] and row["status"] in ("missing", "waiting"):
+            failed.append({"gate": row["gate"], "missing": row["missing"][:3], "enforced": row["gate"] in listed})
+    if report.get("ledger_problem") and not any(f["gate"] == "G1" for f in failed):
+        failed.append({"gate": "G1", "missing": ["the ledger is not trustworthy: %s" % report["ledger_problem"]], "enforced": "G1" in listed})
+    verdict = "refuse" if mode == "enforce" and any(f["enforced"] for f in failed) else "allow"
+    why = "; ".join("%s: %s%s" % (f["gate"], "; ".join(f["missing"]) or "not satisfied", "" if f["enforced"] else " (reported, not enforced)")
+                    for f in failed)
+    return verdict, failed, why
+
+
+def consensus_at(entries, plan_hash):
+    """The newest `consensus` entry of the ledger that passed at exactly `plan_hash` (G0b), or None. A record for an earlier
+    hash does not count: editing the plan voids it."""
+    for entry in reversed(entries):
+        if entry.get("kind") == "consensus" and entry.get("plan_hash") == plan_hash and entry.get("result") == "pass":
+            return entry
+    return None
+
+
+def consensus_overridden(entries, plan_hash):
+    """Who overrode the consensus at exactly `plan_hash` (a person or a boss decided past an open objection), or None: an overridden
+    consensus is visible wherever consensus is read."""
+    found = consensus_at(entries, plan_hash)
+    return found.get("overridden_by") if found else None
+
+
+def launch_findings(brief, plan, entries):
+    """What a launch under this brief lacks, as [{"gate", "missing": [...]}] (E4 of the gate engine design): a `PLAN:` link, a
+    plan that passes `plan check` (G0a), and a consensus record at its CURRENT plan hash (G0b). `plan` is the checked plan or
+    None. Empty when nothing is lacking."""
+    if not PLAN_LINK_RE.search(brief or ""):
+        return [{"gate": "G0b", "missing": ["the brief has no `PLAN:` link"]}]
+    found = []
+    if plan is None:
+        return [{"gate": "G0a", "missing": ["the plan the brief links could not be read"]}]
+    if plan["result"] != "pass":
+        found.append({"gate": "G0a", "missing": ["the plan fails `plan check` (%d defect(s))" % len(plan["defects"])]})
+    entries = as_current(entries, plan.get("plan_hashes"))   # #1713
+    if consensus_at(entries, plan["plan_hash"]) is None:
+        found.append({"gate": "G0b", "missing": ["no consensus record at the plan's current hash %s" % plan["plan_hash"][:19]]})
+    return found
+
+
+def refusal_message(prog, check_for, pr, failed, repo):
+    """The ONE line an agent sees when a ready or merge is refused: what is missing, and the two ways out. Only the gates that
+    are enforced are named as the reason; gates that are only reported are not."""
+    gates = [f for f in failed if f.get("enforced", True)]
+    what = "; ".join("%s: %s" % (f["gate"], "; ".join(f["missing"]) or "not satisfied") for f in gates)[:260]
+    return ("%s: %s of %s refused: missing %s. Way out: ask the chief of staff for a logged waiver (`%s waive %s --gates %s "
+            "--reason ...`; never for G6 or G8), or the chief of staff can switch the repo to shadow (`%s gates mode %s shadow`)."
+            % (prog, check_for, pr, what, prog, pr, ",".join(f["gate"] for f in gates) or "G1", prog, repo))
+
+
+REVIEW_LINK_RE = re.compile(r"https?://[^\s\"'`<>\u201c\u201d]+")
+# One quote is one pair of matching marks: "..", \u201c..\u201d, \u2018..\u2019 or `..`.
+REVIEW_QUOTE_RE = re.compile(r"\"([^\"\n]+)\"|\u201c([^\u201d\n]+)\u201d|\u2018([^\u2019\n]+)\u2019|`([^`\n]+)`")
+REVIEW_QUOTE_MIN_WORDS, REVIEW_QUOTE_MIN_CHARS, REVIEW_QUOTE_MIN_LETTERS, REVIEW_TEXT_MAX = 3, 15, 3, 400
+
+
+def _review_norm(text):
+    return " ".join(str(text or "").casefold().split())
+
+
+def _review_link_ok(url):
+    """A link counts with a real host (a dot between non-empty labels, the last of 2+ letters) and a path or fragment."""
+    if len(url) > REVIEW_TEXT_MAX:
+        return False
+    parts = urlsplit(url)
+    host = (parts.hostname or "").rstrip(".")
+    labels = host.split(".")
+    if len(labels) < 2 or not all(labels) or not (len(labels[-1]) >= 2 and labels[-1].isalpha()):
+        return False
+    return len(parts.path.strip("/")) > 0 or len(parts.fragment) > 0
+
+
+def review_evidence_problem(evidence, scenario=None):
+    """None when a `review` verdict's evidence carries a countable quote of the text read or a link to it, else the named reason.
+    A quote has 3+ words or 15+ characters, 3+ letters, at most 400 characters, and is not the scenario's own text, pass or discriminates
+    text; a link has a real host and a path or fragment. The ONE rule: the verdict command calls it once per scenario."""
+    text = evidence or ""
+    own = {_review_norm((scenario or {}).get(k)) for k in ("text", "pass", "discriminates")} - {""}
+    for url in REVIEW_LINK_RE.findall(text):
+        if _review_link_ok(url.rstrip(".,;:)")):
+            return None
+    for match in REVIEW_QUOTE_RE.finditer(text):
+        quote = next(g for g in match.groups() if g is not None).strip()
+        if len(quote) > REVIEW_TEXT_MAX or sum(c.isalpha() for c in quote) < REVIEW_QUOTE_MIN_LETTERS:
+            continue
+        if len(quote.split()) < REVIEW_QUOTE_MIN_WORDS and len(quote) < REVIEW_QUOTE_MIN_CHARS:
+            continue
+        if _review_norm(quote) in own:
+            continue
+        return None
+    return ("a review verdict has no quote and no link: quote the text you read (in quotation marks: 3+ words or 15+ characters, at most "
+            "400, not the scenario's own text) or link to it (a real host such as example.com, and a path or fragment)")

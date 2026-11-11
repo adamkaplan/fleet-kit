@@ -1,0 +1,158 @@
+{
+  "voice": {
+    "model": "google/gemini-3.8-flash-tts",
+    "voice": "Kore",
+    "format": "pcm",
+    "sample_rate": 24000
+  },
+  "timing": {
+    "lead_seconds": 0.7,
+    "gap_seconds": 0.45,
+    "tail_seconds": 1.1
+  },
+  "slides": [
+    {
+      "id": "title",
+      "segments": [
+        {
+          "text": "Fleet Switchboard."
+        },
+        {
+          "text": "Event-driven coordination for fleets of coding agents."
+        }
+      ]
+    },
+    {
+      "id": "problem",
+      "segments": [
+        {
+          "text": "Running a fleet of coding agents breaks in three places."
+        },
+        {
+          "text": "Messages play telephone, and lose meaning with every hop."
+        },
+        {
+          "text": "Work queues behind one agent at a time."
+        },
+        {
+          "text": "And the glue is a timer that types into terminals, interrupting you, and them."
+        }
+      ]
+    },
+    {
+      "id": "idea",
+      "segments": [
+        {
+          "text": "Fleet Switchboard replaces timers and typing with events, and facts."
+        },
+        {
+          "text": "A comment, a finished worker, your message: each becomes a fact."
+        },
+        {
+          "text": "A daemon works out what each agent still needs to hear, and delivers it through the harness's API, never by typing into a pane.",
+          "say": "A daemon works out what each agent still needs to hear, and delivers it through the harness's A P I, never by typing into a pane."
+        }
+      ]
+    },
+    {
+      "id": "delivery",
+      "segments": [
+        {
+          "text": "Delivery follows one rule."
+        },
+        {
+          "text": "While you're talking to an agent, news arrives as a note: it rides along with your next message, and never starts a turn."
+        },
+        {
+          "text": "When you're away, it's a wake, so work keeps moving."
+        },
+        {
+          "text": "Unread notes become wakes after ten minutes, and bursts are batched into one message."
+        }
+      ]
+    },
+    {
+      "id": "intent",
+      "segments": [
+        {
+          "text": "Every message names its ask: an Intent line and a Done-when line, written once, carried everywhere."
+        },
+        {
+          "text": "So reports are checked against what you asked for, and drift stops at the source."
+        },
+        {
+          "text": "Edit an Intent on GitHub, and your chief of staff sees old and new at once, with a toast."
+        }
+      ]
+    },
+    {
+      "id": "foreground",
+      "segments": [
+        {
+          "text": "Your chief of staff stays in conversation with you."
+        },
+        {
+          "text": "A small decision model reads each message. An unrelated one, while it's busy, gets a decoration: hand off first."
+        },
+        {
+          "text": "The work moves to a background subagent, and you get your answer without waiting."
+        }
+      ]
+    },
+    {
+      "id": "judge",
+      "segments": [
+        {
+          "text": "Every consequential tool call is judged in context: the role, the ask, and the standing authority."
+        },
+        {
+          "text": "Four yes-or-no questions, combined in code."
+        },
+        {
+          "text": "The judge only tightens. Allow can become ask or deny, never the reverse."
+        }
+      ]
+    },
+    {
+      "id": "github",
+      "segments": [
+        {
+          "text": "GitHub stays the memory."
+        },
+        {
+          "text": "Webhooks are signed and verified. Agents use plain gh, and the harness signs each comment, so nothing echoes back.",
+          "say": "Webhooks are signed and verified. Agents use plain G H, and the harness signs each comment, so nothing echoes back."
+        },
+        {
+          "text": "State is almost nothing. Delete it, and nothing that matters is lost."
+        }
+      ]
+    },
+    {
+      "id": "proven",
+      "segments": [
+        {
+          "text": "It's proven the hard way."
+        },
+        {
+          "text": "Every behavior is a scenario with a control that must fail when its safeguard is off."
+        },
+        {
+          "text": "Hundreds of tests on fakes, the same scenarios on a real OpenCode and herdr, then a live run with real agents.",
+          "say": "Hundreds of tests on fakes, the same scenarios on a real OpenCode and herder, then a live run with real agents."
+        }
+      ]
+    },
+    {
+      "id": "outro",
+      "segments": [
+        {
+          "text": "Fleet Switchboard."
+        },
+        {
+          "text": "Calm agents. Clear intent. Your attention, protected."
+        }
+      ]
+    }
+  ]
+}

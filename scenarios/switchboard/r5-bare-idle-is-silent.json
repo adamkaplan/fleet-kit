@@ -1,0 +1,68 @@
+{
+  "id": "R5",
+  "title": "A worker stops with no ask and no report: nobody is woken",
+  "problem": 4,
+  "since_pr": 13,
+  "tiers": [
+    "offline"
+  ],
+  "tags": [
+    "lab-scripted-owed-sp1"
+  ],
+  "cast": {
+    "platform": {
+      "role": "orchestrator",
+      "charter": 1
+    },
+    "coder": {
+      "role": "coder",
+      "reports_to": "platform"
+    }
+  },
+  "steps": [
+    {
+      "at": "0s",
+      "actor": "you",
+      "do": "away"
+    },
+    {
+      "at": "0s",
+      "actor": "coder",
+      "do": "turn",
+      "lasts": "20s",
+      "why": "A turn that ends with nothing the boss needs: the answers file says the decision model finds nothing owed"
+    },
+    {
+      "at": "4m",
+      "actor": "world",
+      "do": "wait"
+    }
+  ],
+  "expect": [
+    {
+      "name": "nobody-woken",
+      "that": "message_count",
+      "to": "platform",
+      "count": 0
+    },
+    {
+      "name": "no-machine-turn",
+      "that": "no_machine_turn",
+      "agent": "platform",
+      "why": "The boss's model was not called: the Chief of Staff's old \"no change\" answers are gone"
+    },
+    {
+      "name": "worker-not-nudged",
+      "that": "message_count",
+      "to": "coder",
+      "count": 0
+    }
+  ],
+  "control": {
+    "fault": "idle-wakes",
+    "fails": [
+      "nobody-woken",
+      "no-machine-turn"
+    ]
+  }
+}

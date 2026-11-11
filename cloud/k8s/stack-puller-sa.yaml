@@ -1,0 +1,12 @@
+# The service account of a stack pod that pulls prebuilt images (ask #1022). Its token is NOT auto-mounted: the launcher projects it
+# into one volume only (see cloud/README.md). Set the two annotations to the pull identity's client id and tenant id when applying
+# (placeholders here; the values are not secrets but belong to the deployment, not this repository).
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cw-stack-puller
+  namespace: cw
+  annotations:
+    azure.workload.identity/client-id: "<client id of the pull identity>"
+    azure.workload.identity/tenant-id: "<tenant id>"
+automountServiceAccountToken: false

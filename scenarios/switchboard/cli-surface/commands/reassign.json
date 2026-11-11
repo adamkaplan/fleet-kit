@@ -1,0 +1,4 @@
+{
+ "command": "reassign",
+ "help": "usage: fleet-switchboard reassign [-h] [--to TO_BOSS] [--consent-from CONSENT] [--undo] [--from SENDER] worker positional arguments: worker The worker's fleet name options: -h, --help show this help message and exit --to TO_BOSS The orchestrator that becomes its boss --consent-from CONSENT The worker's CURRENT boss, whose consent is recorded with this command --undo Remove the override: the worker reports to the boss it was launched with again --from SENDER Lab only: the caller's fleet name"
+}

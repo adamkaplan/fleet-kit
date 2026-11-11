@@ -1,0 +1,6 @@
+# Cases of cloud/tests/test-cloud that CI cannot run (CLOUD_TEST_SKIP_DOCKER=1), one per line.
+# test-cloud fails if the skipped cases differ from this list: add a line here only with a reason.
+# docker-build-cases: the image-scan cases build FROM a base image pulled from the network.
+docker-build-cases
+# kubectl-manifests (macOS only, optional): the macOS runner may have no kubectl; the manifest cases run on Ubuntu.
+kubectl-manifests Darwin optional

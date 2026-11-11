@@ -1,0 +1,18 @@
+{
+  "id": "E3",
+  "title": "With no decision-model key, status says plainly that messages are not classified and tool calls are not judged",
+  "problem": null,
+  "since_pr": 16,
+  "tiers": ["offline"],
+  "cast": {
+    "platform": {"role": "orchestrator", "charter": 1}
+  },
+  "steps": [
+    {"at": "10s", "actor": "world", "do": "wait", "why": "A working install that has no key: the classifier and the judge fail open, so nothing looks wrong"}
+  ],
+  "expect": [
+    {"name": "says-so-first", "that": "status_first_line", "text": "No decision-model key: messages are not classified and tool calls are not judged.",
+     "why": "The first line of status, before anything that looks healthy"}
+  ],
+  "control": {"fault": "key-missing-silent", "fails": ["says-so-first"]}
+}
