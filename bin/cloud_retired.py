@@ -481,6 +481,15 @@ def _run_record_dir(directory, pod):
         return None
 
 
+def _redact_block(block):
+    """The pod's last-text block with a key block (whole or clipped) and the switchboard's command-text redaction applied, line by line otherwise unchanged."""
+    text = str(block)
+    end = KEY_END.search(text)
+    if end and not KEY_BEGIN.search(text[:end.start()]):
+        text = "[redacted key body]" + text[end.end():]
+    return D["redact_command_text"](text)
+
+
 def _clean_tail(tail):
     """A run log tail as it may be posted: the pod's endpoint address removed, a key block (also one whose first line was clipped) redacted whole, the
     switchboard's redaction and the launcher's scrub by shape, printable ASCII, no backtick, whole lines only, at most END_LOG_CHARS. None when nothing is left.
@@ -500,6 +509,10 @@ def _clean_tail(tail):
     text = D["redact_command_text"](text)   # the whole text first (a key block spans lines), then the cut
     lines = [re.sub(r"[^\x20-\x7e]", "?", scrub(line, (), LAST_SCRUB_MAX)).replace("`", "'") for line in text.splitlines()]   # per line: the scrub flattens a newline
     out = "\n".join(lines)
+    return _cut_tail(out)
+
+
+def _cut_tail(out):
     if len(out) > END_LOG_CHARS:
         out = out[-END_LOG_CHARS:].split("\n", 1)[-1]   # whole lines only: a token is never cut into an unrecognisable suffix
     return out if out.strip() else None
@@ -577,6 +590,7 @@ def post_end(engine, state, record, name, reason, body, post, note):
     try:
         where = body.get("record") if isinstance(body, dict) else None
         block, _why = last_message(where, state, name) if isinstance(where, str) and where else (None, "no run record")
+        block = _redact_block(block) if block else block   # the last text gets the run logs' redaction too before it is posted
         tail = run_log_entries(where, name) if isinstance(where, str) and where else []
         post(engine, issue, end_comment(name, D["_scrub_lib"]()(reason, (), 300)[:120], block, tail), author=name, repo=repo)
     except Exception as err:

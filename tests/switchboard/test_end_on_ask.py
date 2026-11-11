@@ -112,6 +112,11 @@ class TestEndOnAsk(unittest.TestCase):
         self.assertEqual(["[run log" in b for _i, b, _r in with_logs], [True])
         self.assertEqual([("[run log" in b, "my final words" in b) for _i, b, _r in without], [(False, True)])
 
+    def test_a_key_block_in_the_final_message_is_redacted_too(self):
+        posts, _ = self.end(final="done\n-----BEGIN OPENSSH PRIVATE KEY-----\nQUJDREVGR0hJSktMTU5PUA\n-----END OPENSSH PRIVATE KEY-----\nbye")
+        self.assertNotIn("QUJDREVGR0hJSktMTU5PUA", posts[0][1])
+        self.assertIn("done", posts[0][1])
+
     def test_a_malformed_run_logs_field_posts_the_message_alone(self):
         for bad in ("text", {"a": 1}, 5, [None]):
             posts, _ = self.end(run_logs=bad)
