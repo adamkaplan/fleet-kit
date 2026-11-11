@@ -220,7 +220,11 @@ class SwitchboardSide(unittest.TestCase):
         lib = types.SimpleNamespace(check_repo_preflight=lambda repo, env: "ok", AGENTS=("worker", "orchestrator"))
         names = ("launcher_argv", "use_settings", "check_allowed", "_lib", "load_record", "H", "run_launcher", "Cluster", "model_entry", "git_token", "stack_model_secret", "_audit")
         saved = {k: getattr(b, k) for k in names}
-        h = dict(b.H, LaunchError=type("LaunchError", (Exception,), {}), NAME_RE=re.compile("[a-z0-9]+"), RESERVED_AGENT_NAMES=(), LANE_NAME_PREFIX="lane-", PROG="sb",
+        part = {"re": re, "LaunchError": Exception, "_one_line": lambda t, n: t[:n]}   # the launch-model part, as test_cloud_default_model.py loads it
+        with open(os.path.join(ROOT, "bin", "switchboard", "launch_model.py")) as f:
+            exec(f.read(), part)
+        h = dict(b.H, launch_model_cloud=part["launch_model_cloud"], launch_model_kwargs=part["launch_model_kwargs"],
+                 LaunchError=type("LaunchError", (Exception,), {}), NAME_RE=re.compile("[a-z0-9]+"), RESERVED_AGENT_NAMES=(), LANE_NAME_PREFIX="lane-", PROG="sb",
                  launch_repo=lambda a: a.repo, build_engine=lambda r, n, c: (Eng(), self.state_dir.name, None), read_brief=lambda f, i: "brief")
         args = types.SimpleNamespace(name="coder7", resume=False, headless=False, agent=agent, reports_to="boss1", dir=None, repo=REPO, branch="work-branch",
                                      shape=None, idle=None, hard=None, brief_file=None, stack=False, issue=issue)
