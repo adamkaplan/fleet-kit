@@ -44,8 +44,9 @@ def put_cos_orders(test, text, mtime=None):
 def pr_view_json(title="Add the parser", state="OPEN", additions=120, deletions=14, files=5, checks=None,
                  review="APPROVED", **more):
     checks = [{"__typename": "CheckRun", "status": "COMPLETED", "conclusion": "SUCCESS"}] if checks is None else checks
+    # an unlabelled view reads as unreadable labels (fail closed): the fixture states `labels` (none) unless a test gives them
     return json.dumps(dict({"title": title, "state": state, "additions": additions, "deletions": deletions,
-                            "baseRefName": "main", "headRefOid": "c" * 40,
+                            "baseRefName": "main", "headRefOid": "c" * 40, "labels": [],
                             "changedFiles": files, "statusCheckRollup": checks, "reviewDecision": review}, **more))
 
 
