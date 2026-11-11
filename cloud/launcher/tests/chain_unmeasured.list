@@ -76,6 +76,7 @@ cloud/launcher/tests/test_token_at_limit.py
 cloud/launcher/tests/test_token_service.py
 cloud/launcher/tests/test_untracked_report.py
 cloud/launcher/tests/test_vault_block.py
+cloud/launcher/tests/test_wip_rebasable.py
 cloud/launcher/tests/test_wip_root.py
 cloud/launcher/tests/test_wip_save.py
 cloud/launcher/tests/test_worker_copies.py

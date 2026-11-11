@@ -656,8 +656,8 @@ def write_marker(path, text):
 
 def snapshot(workdir, worker, repo, ctx):
     """Save the pod's commits and files to <worker>/wip as ONE new commit, without touching the pod's branch, index or files: a copy of the
-    index in a temporary GIT_INDEX_FILE, `git add -A` into the copy, write-tree, commit-tree with the old wip head as parent (and the pod's HEAD as a
-    second parent, so its commits are reachable), then a plain push (a fast-forward, never forced). Secret-looking untracked files are left out.
+    index in a temporary GIT_INDEX_FILE, `git add -A` into the copy, write-tree, commit-tree with the pod's HEAD as the ONE parent (the old save is named in a `Previous-Save:` line of the message), then a plain push when
+    the remote tip is an ancestor of the new commit, else one --force-with-lease push naming that tip, to this one reference. Secret-looking untracked files are left out.
     Returns {saved, tree, wip_branch}; saved is False when the tree equals the last saved one. A failure raises RuntimeError."""
     url = globals()["HOST_" + "URL"] + "%s.git" % repo   # by name: test_cloud_prestop counts the lines that hold the seam's identifier (its definition and its one use)
     branch = "%s/wip" % worker
@@ -691,13 +691,24 @@ def snapshot(workdir, worker, repo, ctx):
             git(net, "fetch", "--no-tags", "-q", url, "refs/heads/" + branch + ":refs/cw/wip", ctx=ctx)
         if not head and not wip:   # no commit yet and no earlier save: the commit would have no parent (a root); save nothing until the pod has a commit
             return {"saved": False, "tree": tree, "wip_branch": branch, "note": "no commit yet: nothing saved"}
-        parents = [x for x in dict.fromkeys([wip, head]) if x]
+        parents = [x for x in (head or wip,) if x]   # #2437: the pod's own HEAD only, so a rebase of the branch replays each commit once; the previous save is named in the message (HEAD unreadable but an earlier save exists: that save, never a root)
         same = bool(wip) and git(net, "rev-parse", "%s^{tree}" % wip, ctx=ctx).stdout.strip() == tree
         commit = wip
         if not same:
             args = [a for x in parents for a in ("-p", x)]
-            commit = git(net, *SNAP_IDENT, "commit-tree", tree, *args, "-m", "WIP: work in progress saved by %s while it runs" % worker, ctx=ctx).stdout.strip()
-            git(net, "push", "--no-verify", url, "%s:refs/heads/%s" % (commit, branch), ctx=ctx)
+            message = "WIP: work in progress saved by %s while it runs" % worker
+            if wip:
+                message += "\n\nPrevious-Save: %s" % wip
+            commit = git(net, *SNAP_IDENT, "commit-tree", tree, *args, "-m", message, ctx=ctx).stdout.strip()
+            spec = "%s:refs/heads/%s" % (commit, branch)
+            if not wip or git(net, "merge-base", "--is-ancestor", wip, commit, check=False, ctx=ctx).returncode == 0:
+                git(net, "push", "--no-verify", url, spec, ctx=ctx)
+            else:   # the remote tip is not an ancestor (the pod rebased): a lease on the tip fetched in this call, this one reference only, one try
+                try:
+                    git(net, "push", "--no-verify", "--force-with-lease=refs/heads/%s:%s" % (branch, wip), url, spec, ctx=ctx)
+                except RuntimeError:
+                    print("the save of %s was not pushed: the branch moved since it was read" % branch, file=sys.stderr)
+                    return {"saved": False, "tree": tree, "wip_branch": branch, "note": "the branch moved: nothing saved"}
         write_marker(saved_path, "%s %s\n" % (tree, commit))
         return {"saved": not same, "tree": tree, "wip_branch": branch}
     finally:
@@ -706,7 +717,8 @@ def snapshot(workdir, worker, repo, ctx):
 
 def ff_over_snapshots(workdir, worker, url, ctx):
     """True when the remote <worker>/wip is the commit of this pod's own last running save, is not an ancestor of HEAD and a fast-forward commit of HEAD's tree
-    (parents: that wip head, HEAD) was pushed. False means: no such case, the plain push of HEAD follows."""
+    (parent: HEAD only, the wip head named in a `Previous-Save:` line; #2437) was pushed. False means: no such case, the plain push of HEAD follows.
+    The case still arises with a save whose one parent is HEAD's older state: wip is then never an ancestor of a newer HEAD."""
     branch = "%s/wip" % worker
     if not os.path.isfile(os.path.join(workdir, ".git", SNAP_SAVED_FILE)):
         return False   # never saved by a running save: the earlier path, no extra call
@@ -722,9 +734,10 @@ def ff_over_snapshots(workdir, worker, url, ctx):
         if git(net, "merge-base", "--is-ancestor", wip, head, check=False, ctx=ctx).returncode == 0:
             return False
         tree = git(workdir, "rev-parse", "HEAD^{tree}", ctx=ctx).stdout.strip()
-        commit = git(net, *SNAP_IDENT, "commit-tree", tree, "-p", wip, "-p", head, "-m", "WIP: work in progress saved by %s at the end of the worker" % worker,
-                     ctx=ctx).stdout.strip()
-        git(net, "push", "--no-verify", url, "%s:refs/heads/%s" % (commit, branch), ctx=ctx)
+        commit = git(net, *SNAP_IDENT, "commit-tree", tree, "-p", head, "-m",
+                     "WIP: work in progress saved by %s at the end of the worker\n\nPrevious-Save: %s" % (worker, wip), ctx=ctx).stdout.strip()
+        # one reference, the lease names the tip read above; a failure is the plain push's answer (no retry)
+        git(net, "push", "--no-verify", "--force-with-lease=refs/heads/%s:%s" % (branch, wip), url, "%s:refs/heads/%s" % (commit, branch), ctx=ctx)
         return True
     finally:
         shutil.rmtree(tmp, True)
