@@ -15177,7 +15177,7 @@ def _ledger_context(args, runner, now, writable, parts=None, floor=False, plan_r
     (engine, state, config) when the caller already has them (the daemon's pass); else the engine is built. `plan_read=False` skips the read of the plan
     (the relay's link check needs only the PR and the plan's source: one GitHub read)."""
     engine, state, config = parts if parts is not None else build_engine(runner, now, "cli", writable=writable)
-    if landed and re.match(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+@", (args.pr or "").strip()) and not landed_ref(args.pr):   # only the `owner/repo@...` shape: a pull request reference with an `@` elsewhere takes the old path
+    if landed and LANDED_SHAPE.match((args.pr or "").strip()) and not landed_ref(args.pr):   # only the `owner/repo@...` shape: a pull request reference with an `@` elsewhere takes the old path
         raise LedgerCommandError("refused: a landed subject is `owner/repo@<40 lowercase hex sha>`, got %r: nothing was recorded" % _one_line(args.pr, 80))
     if landed and (lref := landed_ref(args.pr)):   # ask #2373: a landed commit of a land repository is a subject (prove, verdict and gates only)
         return _landed_context(args, engine, state, config, lref, runner, now, plan_read)
@@ -15223,6 +15223,7 @@ def _ledger_context(args, runner, now, writable, parts=None, floor=False, plan_r
 # A repository on the land path (`land_repos`) has no pull request, so `prove`, `verdict` and `gates` (which take a PR) had no subject for it. The subject is `--pr <owner/repo>@<40-hex sha>`:
 # the one argument those commands already take, so no new option is parsed. Reads are GETs through the repository's own account (`impact_carry_get`, as the epic record reads). Every refusal writes nothing.
 
+LANDED_SHAPE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+@")   # the start of a landed reference: a text of this shape that is not a whole one is refused with the landed form
 LANDED_REF = re.compile(r"((?!\.\.?/)[A-Za-z0-9_.-]+/(?!\.\.?@)[A-Za-z0-9_.-]+)@([0-9a-f]{40})")
 LANDED_GATES = ("G0a", "G0b", "G0c", "G1")   # the proof gates a landed commit has; every other gate shows n/a
 

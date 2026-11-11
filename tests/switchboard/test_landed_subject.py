@@ -110,6 +110,8 @@ def build(LedgerBase):
                         for word in words:
                             self.assertIn(word, err)
                         self.assertIn(sha[:12], err)
+                        if sha == HALF:
+                            self.assertNotIn("no trailer " + T[0], err)
             self.assertEqual(self.ledger(), [])
 
         def test_S3_a_read_that_fails_is_not_called_an_unknown_sha_and_nothing_is_recorded(self):
@@ -136,6 +138,7 @@ def build(LedgerBase):
             code, out, err = self.run_as("coder", "prove", "S2", "--pr", ref, "--evidence", "ran: ok", "--plan", "acme/app#8")
             self.assertNotEqual(code, 0)
             self.assertIn("acme/app#8", err)
+            self.assertIn("acme/app#7", err)
             self.assertEqual([r["scenario"] for r in self.ledger()], ["S1"])
 
         def test_S3_the_default_branch_tip_itself_is_a_subject(self):
@@ -233,6 +236,17 @@ def build(LedgerBase):
             (row,) = self.ledger()
             self.assertEqual((row["pr"], row["head"], "subject_kind" in row), ("acme/land#9", LEDGER_HEAD, False))
             self.assertEqual([r for r in self.reads if "/commits/" in r or "/compare/" in r], [])
+
+        def test_S4_a_pull_request_reference_with_an_at_elsewhere_still_takes_the_pull_request_path(self):
+            self.pr["body"] = "PLAN: acme/app#7\ncanon: updated the docs"
+            code, out, err = self.run_as("coder", "prove", "S1", "--pr", "https://github.com/acme/land/pull/9?x=a@b", "--evidence", "ran it: ok")
+            self.assertEqual(code, 0, err)
+            (row,) = self.ledger()
+            self.assertEqual((row["pr"], "subject_kind" in row), ("acme/land#9", False))
+            code, out, err = self.run_as("coder", "prove", "S2", "--pr", "acme/land#9@x", "--evidence", "ran it: ok")
+            self.assertNotEqual(code, 0)
+            self.assertNotIn("a landed subject is", err)
+            self.assertEqual(len(self.ledger()), 1)
 
         def test_S5_control_with_the_landed_path_off_today_s_code_refuses_the_sha_subject(self):
             ref = self.landed()
