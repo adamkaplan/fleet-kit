@@ -4658,8 +4658,11 @@ class Launcher:
         finally:
             steps["notes"] += mono() - t0   # the nudges are counted with the notes: both are the pass's sends
         sw = _stall_watch()
-        if sw is not None:
-            sw.watch_pass(self, live, now, NAME_RE.fullmatch)   # #2399: one read of each pod older than 10 minutes; an alert only, never a stop (never raises)
+        try:
+            if sw is not None:
+                sw.watch_pass(self, live, now, NAME_RE.fullmatch)   # #2399: one read of each pod older than 10 minutes; an alert only, never a stop
+        except Exception as err:
+            print("cloud-worker: the stall watch failed: %s" % type(err).__name__, file=sys.stderr)
         try:
             out.extend(self.label_pod_prs(live, now))   # #2269: the pull requests a pod recorded get the labels its launch named
         except Exception as err:
