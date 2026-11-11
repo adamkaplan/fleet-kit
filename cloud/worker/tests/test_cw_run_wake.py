@@ -67,7 +67,7 @@ class Wake(unittest.TestCase):
     def start(self, f, script, name="job", tool=TOOL, gap="0.2", limit="1.5"):
         env = {"PATH": "/usr/bin:/bin", "CW_RUNS_DIR": self.runs, "CW_PROGRESS_FILE": self.prog, "CW_RUN_TICK": "300",
                "CW_RUN_SERVER": f.url, "CW_RUN_SERVER_PASSWORD_FILE": os.path.join(self.d, "pw"), "CW_RUN_CLIENT": self.client,
-               "FLEET_BOSS": "boss1", "CW_RUN_WAKE_GAP": gap, "CW_RUN_WAKE_LIMIT": limit}
+               "FLEET_BOSS": "boss1", "CW_RUN_TEST": "1", "CW_RUN_WAKE_GAP": gap, "CW_RUN_WAKE_LIMIT": limit}
         r = subprocess.run([sys.executable, tool, "start", "--name", name, "--", "sh", "-c", script], env=env, capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL)
         self.assertEqual(r.returncode, 0, r.stderr)
 
@@ -113,13 +113,16 @@ class Wake(unittest.TestCase):
 
     def test_s3_secret_redacted_capped_and_failing_boss_blocks_nothing(self):
         self.set_client(1)
-        f = self.fake(); self.start(f, "echo %s; head -c 5000 /dev/zero | tr '\\0' 'x' | fold -w 80; echo; exit 13" % TOKEN)
+        f = self.fake(); self.start(f, "yes 'ab cd ef gh ij kl mn op qr st uv wx yz ab cd ef gh ij kl mn op qr st uv wx yz ab cd ef gh ij kl mn op qr st uv wx yz ab cd ef gh ij kl mn op qr st uv wx yz ab cd ef gh ij kl mn op qr st uv wx yz ab cd ef gh ij kl mn op qr st uv wx yz' | head -n 40; echo token=%s; echo password: \"hunter2 xyz\"; exit 13" % TOKEN)
         self.assertEqual(self.finish(), "13")
         self.assertEqual(len(f.messages), 1)
         self.assertEqual(f.messages[0].count(TOKEN), 0)
-        self.assertLessEqual(len(f.messages[0]), 3000)
+        self.assertEqual(len(f.messages[0]), 3000); self.assertTrue(f.messages[0].endswith("..."))
+        self.assertIn("[redacted]", f.messages[0])
+        self.assertNotIn("hunter2", f.messages[0])
         self.assertEqual(len([l for l in self.progress() if l.startswith("run job exited 13")]), 1)
-        self.assertEqual(len(self.bosses()), 1)
+        b = self.bosses()
+        self.assertEqual(len(b), 1); self.assertNotIn(TOKEN, b[0]); self.assertIn("[redacted]", b[0])
 
     def test_s4_busy_twice_then_accepts(self):
         f = self.fake("busy2"); self.start(f, "exit 13")
@@ -130,7 +133,7 @@ class Wake(unittest.TestCase):
     def test_s4_never_accepts_one_not_delivered_line(self):
         f = self.fake("never"); self.start(f, "echo a; exit 13")
         self.assertEqual(self.finish(), "13")
-        self.assertEqual(f.messages, [])
+        self.assertEqual(f.messages, []); self.assertGreaterEqual(f.attempts, 2)
         self.assertEqual(self.progress().count("wake not delivered"), 1)
         self.assertEqual(open(os.path.join(self.runs, "job.log")).read().splitlines().count("wake not delivered"), 1)
 
@@ -141,7 +144,7 @@ class Wake(unittest.TestCase):
         self.assertEqual(self.progress().count("wake not delivered"), 1)
         g = self.fake("nosession"); self.start(g, "exit 13", name="job2")
         self.assertEqual(self.finish("job2"), "13")
-        self.assertEqual(self.progress().count("wake not delivered"), 2)
+        self.assertEqual(self.progress().count("wake not delivered"), 2); self.assertEqual(g.messages, [])
 
     def scenario_second_start(self, tool):
         f = self.fake(); self.start(f, "exit 0", tool=tool)
