@@ -747,7 +747,7 @@ def notice_entry(repo, number, tag, facts, stale, sender, created, note, hold_mi
 
 
 def captain_entry(notice, facts, escalated, evidence):
-    """A `MERGE: captain` PR as a decision (kind `captain`, same id as its notice, tier `cos`; `human` once the Chief
+    """A merge-captain PR as a decision (kind `captain`, same id as its notice, tier `cos`; `human` once the Chief
     of Staff escalated it for this head). `evidence` is who reviewed it at the exact head ([{"by", "kind", "state"}]:
     a formal review or a signed comment), [] when none was seen (the notice outlasted its wait), or None when that
     cannot be read: it then stands on the notice alone and says so."""

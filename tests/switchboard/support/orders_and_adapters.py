@@ -77,7 +77,7 @@ class FakeGhPr:
 HEAD_A, HEAD_B = "a" * 40, "b" * 40
 
 
-def captain_pr(body="MERGE: captain\n\nland it", head=HEAD_A, reviews=None, author="coder-bot", state="OPEN", comments=(), **more):
+def captain_pr(body="Adds the widget.\n\nland it", head=HEAD_A, reviews=None, author="coder-bot", state="OPEN", comments=(), **more):
     """pr_view_json for a PR HELD for the owner (the label is the only signal: `labels` defaults to the one `merge-captain` label; pass
     labels=[] for a PR that is not held) with a body, an author, a head and reviews [(login, state, commit oid)]."""
     more.setdefault("labels", [{"name": "tester:merge-captain"}])

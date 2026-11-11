@@ -246,7 +246,7 @@ def escalate_decision(engine, runner, decision, reason, name):
         with engine._external("decisions.escalate", "request:%s" % key, {"decision": ident, "kind": kind, "by": name,
                                                                           "reason": _one_line(reason or "", 200)}):
             decision_store(engine).mark_escalated(key, engine.now())
-        return "escalated %s to you: the MERGE: captain PR is waiting on you" % ident
+        return "escalated %s to you: the merge-captain PR is waiting on you" % ident
     if engine.state_dir is None or not decision.get("session") or not decision.get("request"):
         raise DecisionError("%s cannot be escalated: it names no request" % ident)
     key = "%s:%s" % (decision["session"], decision["request"])
@@ -260,7 +260,7 @@ def escalate_decision(engine, runner, decision, reason, name):
 def _refuse_notice(decision):
     """A PR notice is information: there is nothing to resolve or answer, and it ends when its PR merges or closes."""
     if decision["kind"] == "captain":
-        raise DecisionError("%s is a MERGE: captain PR: merge or close the PR (it ends then), or escalate it" % decision["id"])
+        raise DecisionError("%s is a merge-captain PR: merge or close the PR (it ends then), or escalate it" % decision["id"])
     if decision["kind"] == "notice":
         raise DecisionError("%s is a PR notice: information, so there is nothing to resolve or answer. It ends when "
                             "the PR merges or closes" % decision["id"])

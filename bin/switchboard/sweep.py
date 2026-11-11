@@ -1,6 +1,6 @@
 # ---- #117: the "waiting on the person" sweep. Deterministic (no model), over what the hub can read in a few bounded,
 # cached list reads per repo. S1 a decision section and the awaiting label disagree; S2 a PR held for the person that is
-# not a `MERGE: captain` PR; S3 something said to wait on the person that is not in the human tier; S4 a decision whose
+# not a merge-captain PR; S3 something said to wait on the person that is not in the human tier; S4 a decision whose
 # issue or PR is closed (withdrawn); S5 a cos-tier decision that has aged. It never edits GitHub and never changes a tier.
 
 SWEEP_DEFAULTS = {"enabled": False, "aged_cos_hours": 2, "comment_window_days": 7, "max_findings": 20,

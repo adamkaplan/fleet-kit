@@ -7747,7 +7747,7 @@ def pr_facts_from(data):
         return value if isinstance(value, int) and not isinstance(value, bool) else None
     head = data.get("headRefOid") if isinstance(data.get("headRefOid"), str) else None
     return {"title": " ".join(str(data.get("title") or "").split()), "state": data["state"].lower(),
-            "captain": pr_marker_state(data.get("labels"), data.get("body"))["captain"],
+            "captain": pr_marker_state(data.get("labels"), data.get("body"))["captain"] if isinstance(data.get("labels"), list) else None,   # (#2379) labels unread: not "not held" (None: G6 is not open)
             "holds": pr_hold_reasons(data.get("labels")), "captain_findings": pr_marker_state(data.get("labels"), data.get("body"))["findings"],
             "author": pr_login(data.get("author")),
             "reviews": pr_reviews_at(data.get("reviews"), head, pr_login(data.get("author"))),

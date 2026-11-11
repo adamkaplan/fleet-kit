@@ -804,11 +804,19 @@ class TestCaptainLabels(Base):
         self.assertEqual((old["captain"], old["captain_findings"]), (False, ["marker-without-label"]))     # the line alone holds nothing; the finding notes it
         self.assertFalse(sb.pr_facts_from(dict(data, labels=[], body="plain"))["captain"])
 
-    def test_every_caller_reads_the_one_helper(self):
-        text = switchboard_source()
-        callers = [l for l in text.splitlines() if "pr_is_captain(" in l and not l.lstrip().startswith(("def ", "return pr_marker"))]
-        self.assertEqual(callers, [], "a caller still reads the first line alone: %r" % callers)
+    def test_labels_that_cannot_be_read_are_not_a_pr_that_is_not_held(self):
+        data = dict(json.loads(pr_view_json()), body="MERGE: captain\nx")
+        for labels in (None, "merge-captain", 5):
+            self.assertIsNone(sb.pr_facts_from(dict(data, labels=labels))["captain"], labels)
+        self.assertIsNone(sb.pr_facts_from({k: v for k, v in data.items() if k != "labels"})["captain"])
+        self.assertFalse(sb.pr_facts_from(dict(data, labels=[]))["captain"])
 
+    def test_nothing_reads_the_first_line_as_a_hold_only_the_one_helper_decides(self):
+        text = switchboard_source()
+        lines = text.splitlines()
+        reads = [l.strip() for l in lines if re.search(r"pr_marker\([^)]*\)\s*(==|!=|in|is)\s*[\"(]?\s*[\"']captain", l) or "pr_is_captain" in l or "CAPTAIN_MARK" in l]
+        self.assertEqual(reads, [], "a reader still takes the first line as a hold: %r" % reads)
+        self.assertEqual([l for l in lines if "marker_window_open" in l or "CAPTAIN_MARKER_UNTIL" in l], [])
 
 class TestLedgerReadRace(unittest.TestCase):
     """A ledger read that races an append is not a cut-off (#673); a real cut-off or rewrite is still reported."""

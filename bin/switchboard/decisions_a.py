@@ -145,7 +145,7 @@ def captain_escalation_leaves(engine, escalated, now):
 
 
 def captain_escalations_to_keep(engine):
-    """The escalations of `MERGE: captain` PR decisions that must survive a pass in which the PR could not be judged: those
+    """The escalations of merge-captain PR decisions that must survive a pass in which the PR could not be judged: those
     whose notice is still on file. An unreadable PR (a restart's first passes, a 404 under the wrong account, an outage) derives
     no captain entry, so its key is not among the pending requests, and pruning on that would demote a decision the Chief of
     Staff escalated. The key leaves when its notice does (the PR merged or closed), or by the head naming it never matching again.
@@ -514,9 +514,6 @@ def apply_notice_effects(engine):
     return False
 
 
-CAPTAIN_MARK = "MERGE: captain"
-
-
 def is_captain(pr):
     """THE one helper: whether a PR is held for the person. `pr` is a dict with `labels` (names or {"name"} dicts) and `body`;
     see `pr_marker_state` for the rule (the label is the only signal)."""
@@ -546,7 +543,7 @@ CAPTAIN_EVIDENCE_MAX = 5    # signed reviewers listed in a decision
 
 
 def captain_evidence(facts, senders):
-    """[{"by", "kind": review|comment, "state"}] of the review of a `MERGE: captain` PR at its exact head: formal
+    """[{"by", "kind": review|comment, "state"}] of the review of a merge-captain PR at its exact head: formal
     reviews by a non-author, plus signed comments naming the head whose signer is not a sender of the PR's notice.
     None when there is none and a source could not be read (review not detectable)."""
     evidence = [dict(r, kind="review") for r in facts.get("reviews") or []]
@@ -732,7 +729,7 @@ def decisions_from_notices(engine, now):
         elif evidence == []:
             evidence = False
         if facts and facts.get("captain") and facts.get("head") and evidence is not False:
-            # a `MERGE: captain` PR is the Chief of Staff's decision, in place of the heads-up (never both)
+            # a merge-captain PR is the Chief of Staff's decision, in place of the heads-up (never both)
             captain_key = "captain:%s#%d@%s" % (repo, number, facts["head"])
             entry = decision_core.captain_entry(entry, facts, captain_key in escalated, evidence)
             if isinstance(engine.request_keys, set):
