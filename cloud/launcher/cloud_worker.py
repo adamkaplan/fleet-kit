@@ -3170,11 +3170,12 @@ def _stall_watch():
 
 def _stall_text(launcher):
     """#2399: the two counts of the pass line (empty when the stall watch is absent or has not run)."""
-    sw = _stall_watch()
+    sw, text = _stall_watch(), ""
     try:
-        return sw.pass_text(launcher) if sw is not None else ""
+        text = sw.pass_text(launcher) if sw is not None else ""
     except Exception:
-        return ""
+        text = ""
+    return text
 
 
 class Launcher:
@@ -6015,7 +6016,7 @@ def _reap_main(env, a, sleep, clock=None, refresher=None, kube=None, ticker_wait
             try:
                 work = L.reap() if L is not None else []   # the pass's own work: the workers' results
             finally:
-                print("cloud-worker: reaper pass line: cpu_seconds=%.3f audit_lines_parsed=%d%s" % (time.thread_time() - cpu0, tail_lines_parsed() - parsed0, step_text(getattr(L, "step_seconds", None)) + _stall_text(L)), file=sys.stderr)
+                print("cloud-worker: reaper pass line: cpu_seconds=%.3f audit_lines_parsed=%d%s" % (time.thread_time() - cpu0, tail_lines_parsed() - parsed0, _stall_text(L) + step_text(getattr(L, "step_seconds", None))), file=sys.stderr)
             took = (clock() - began).total_seconds()
             if L is not None:
                 L.note_slow_pass(took)

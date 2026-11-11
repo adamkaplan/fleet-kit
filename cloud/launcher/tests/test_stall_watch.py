@@ -219,7 +219,7 @@ class Stall(unittest.TestCase):
             text = f.read()
         self.assertEqual(text.count("sw.watch_pass(self, live, now, NAME_RE.fullmatch)"), 1)
         self.assertIn("the stall watch failed", text)
-        self.assertIn("_stall_text(L)), file=sys.stderr)", text)
+        self.assertIn("_stall_text(L) + step_text(", text)
         self.assertEqual(sw.pass_text(None), "")
 
     def test_the_probe_prints_one_json_line_on_a_machine_without_a_server(self):
