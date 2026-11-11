@@ -411,7 +411,7 @@ def guard(args, write, api_parser, gh, env_of, stdin=None):
             # a flag and its value before `api` (`gh --hostname h api -X DELETE ...`, `gh -f a=b api ...`): the allow-list does not see it as `api`, and the shim's read test may take
             # the value for a command word (`--jq search api -X DELETE`). gh hands those flags to `api`, so the method is read from ALL of them; anything but a GET is never passed on
             try:
-                if api_parser(["api"] + args[:at] + args[at + 1:]).effective_method != "GET":
+                if api_parser(["api"] + lead + args[at + 1:]).effective_method != "GET":
                     return UNCLASSIFIED
             except Exception:
                 return UNCLASSIFIED
