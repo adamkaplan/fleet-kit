@@ -406,7 +406,16 @@ def guard(args, write, api_parser, gh, env_of, stdin=None):
     """The refusal line for a body write that would drop the Intent or the Done-when of the issue it replaces, else None. Reads never refuse."""
     if "api" in args:
         at = args.index("api")
-        lead = [a for j, a in enumerate(args[:at]) if not (a in REPO_FLAGS or (j > 0 and args[j - 1] in REPO_FLAGS) or a.startswith("--repo="))]   # a -R/--repo pair is the supported lead (the shim skips it)
+        lead, j = [], 0   # a -R/--repo pair is the supported lead (the shim skips it): dropped only where it STARTS a flag; after a flag (`--jq -R api`) it may be that flag's value, so it stays and the parser sees it
+        while j < at:
+            a = args[j]
+            if a.startswith("--repo=") and (j == 0 or not args[j - 1].startswith("-")):
+                j += 1
+            elif a in REPO_FLAGS and (j == 0 or not args[j - 1].startswith("-")):
+                j += 2
+            else:
+                lead.append(a)
+                j += 1
         if lead and all(a.startswith("-") or (j > 0 and lead[j - 1].startswith("-")) for j, a in enumerate(lead)):
             # a flag and its value before `api` (`gh --hostname h api -X DELETE ...`, `gh -f a=b api ...`): the allow-list does not see it as `api`, and the shim's read test may take
             # the value for a command word (`--jq search api -X DELETE`). gh hands those flags to `api`, so the method is read from ALL of them; anything but a GET is never passed on

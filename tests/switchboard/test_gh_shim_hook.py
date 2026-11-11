@@ -171,6 +171,14 @@ class TestGhShimHookDelete(unittest.TestCase):
         self.assertIsNone(gh_body.guard(["--repo=o/r", "--jq", ".", "api", HOOK], False, parser, None, None))
         self.assertEqual(parsed[-1], ["api", "--jq", ".", HOOK])
 
+    def test_a_repo_flag_that_is_the_value_of_an_earlier_flag_is_not_stripped(self):
+        for lead in (["--jq", "-R"], ["-q", "-R"], ["-q", "--repo"], ["--jq", "--repo=o/r"]):
+            for method in (["-XDELETE"], ["--method=DELETE"], ["-X", "DELETE"]):
+                with self.subTest(lead=lead, method=method):
+                    done, calls, _ = self.rig.go(lead + ["api"] + method + [HOOK], hook_text=hook(name="web"))
+                    self.assertEqual(calls, [], done.stderr)
+                    self.assertNotEqual(done.returncode, 0)
+
     def test_a_missing_guard_module_refuses_the_delete(self):
         (self.rig.shims / "gh_body.py").unlink()
         done, calls, _ = self.rig.go(delete())
