@@ -350,8 +350,8 @@ def hook_delete(probe, parsed, segs):
     if not segs[4].isdigit() or not segs[4].isascii():
         return None
     endpoint = parsed.positionals[0][1]
-    if parsed.hostname is not None and ("://" in endpoint or endpoint.startswith("//")):
-        return HOOK_OTHER   # gh sends a full URL to ITS host and ignores --hostname: the read would be of another host's hook than the one deleted
+    if "://" in endpoint or endpoint.startswith("//"):
+        return HOOK_OTHER   # gh sends a full URL to ITS host and ignores --hostname and GH_HOST: the plain read could be of another host's hook than the one deleted
     data = probe.fetch(["api"] + ([] if parsed.hostname is None else ["--hostname", parsed.hostname]) + ["repos/%s/%s/hooks/%s" % (segs[1], segs[2], segs[4])])
     if data is None:
         return HOOK_UNREAD % (probe.why or "no reason given")
@@ -420,6 +420,8 @@ def guard(args, write, api_parser, gh, env_of, stdin=None):
             return issue_edit(probe, args)
         if words[:1] == ["api"]:
             return api_write(probe, args, api_parser)
+        if "api" in args and all(a.startswith("-") or (j > 0 and args[j - 1].startswith("-")) for j, a in enumerate(args[:args.index("api")])):
+            return UNCLASSIFIED   # a flag and its value before `api` (`gh --hostname h api -X DELETE ...`): the allow-list does not see it as `api` either, so it is never passed on unread
         return None
     except Unclassified:
         return UNCLASSIFIED

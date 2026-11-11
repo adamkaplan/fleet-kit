@@ -7082,7 +7082,7 @@ class FakeGitHub:
     def __init__(self, clock, repo=GH_REPO):
         self.clock, self.repo, self.hub = clock, repo, None
         self.issues, self.comments, self.pulls, self.reviews, self.suites, self.runs = {}, [], {}, {}, [], []
-        self.procs, self.api_calls, self.occupied = [], [], False
+        self.procs, self.api_calls, self.occupied, self.hook_calls = [], [], False, []   # hook_calls: the daemon's own list/delete of the forwarder's cli webhooks (#2397), apart from the reads the tests bound
         self.api_down, self.spawn_error, self.exit_text = False, None, "error: Hook already exists on %s\n" % repo
         self.token, self.exists, self.webhook_ok = None, True, True  # PR 15: who may read it, whether it is there
         self.leak = False
@@ -7176,7 +7176,7 @@ class FakeGitHub:
         if argv[0] != GH_BIN or argv[1] != "api":
             raise AssertionError("a test reached for a real binary: %r" % argv[:2])
         path = argv[-1]
-        self.api_calls.append(path)
+        (self.hook_calls if re.match(r"repos/[^/]+/[^/]+/hooks", path) else self.api_calls).append(path)   # a webhook call is not a read of the repo's items
         if not self.exists or (self.token is not None and (kwargs.get("env") or {}).get("GH_TOKEN") != self.token):
             if self.leak:  # a hostile gh that echoes the credential it was given into its error
                 return subprocess.CompletedProcess(argv, 1, "", "gh: HTTP 401 bad credentials %s\n"
@@ -80385,7 +80385,7 @@ NOT_ISOLATED_BY_BASE = {
     "TestPodReportedLostOnlyWhenSilent",   # (#2247) its Rig makes its own tempfile.mkdtemp for the engine, the launcher log and the memory, and reads no real state; the class came with #2261
     "TestStopFinalMessage", "TestStopFinalMessageBare", "TestStopFinalMessageEdges", "TestStopFinalMessageHardening", "TestStopFinalMessageTwoRuns",
     "TestEndNoticeHeadLine", "TestPodReportedLostOnlyWhenSilent",   # (#2247) each builds its own temp directory through its rig (StopWorld mkdtemp; Rig mkdtemp); the files came with #2267 and #2255
-    "TestGithubWriteAudit", "TestGuardSetRun", "TestGatesSkipped", "TestLandCompletion", "TestEndNoticeOwnPushes", "TestRefusedLaunchIsToldToItsLane", "TestGhBodyReadNamesItsStderr", "TestGhBodyReadNamesTheRepositoryOfTheWrite",   # (#2247) each makes its own temp directory (a mkdtemp, a TemporaryDirectory, StopWorld, Rig, FakeGhMixin or BodyRig) and reads no real state; the files came with #2263, #2270, #2313, #2310, #2307, #2309 and #2323
+    "TestGithubWriteAudit", "TestGuardSetRun", "TestGatesSkipped", "TestLandCompletion", "TestEndNoticeOwnPushes", "TestRefusedLaunchIsToldToItsLane", "TestGhBodyReadNamesItsStderr", "TestGhBodyReadNamesTheRepositoryOfTheWrite", "HookRig", "TestGhShimHookControls", "TestGhShimHookDelete",   # (#2247) each makes its own temp directory (a mkdtemp, a TemporaryDirectory, StopWorld, Rig, FakeGhMixin or BodyRig) and reads no real state; the files came with #2263, #2270, #2313, #2310, #2307, #2309 and #2323
     ),
 }
 

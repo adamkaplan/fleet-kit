@@ -1,5 +1,5 @@
 """#2397: the gh shim allows ONE webhook write, DELETE repos/O/R/hooks/ID, and only for a `cli` hook whose config.url is the webhook forwarder's url: the shim reads the hook first
-(shims/gh_body.py, the pre-read style of the body guard) with the account the delete would use. Fakes only: no test calls GitHub. The control is the shim of origin/integration."""
+(shims/gh_body.py, the pre-read style of the body guard) with the account the delete would use. Fakes only: no test calls GitHub. The controls are mutants of the current shim."
 import json
 import os
 import subprocess
@@ -108,8 +108,15 @@ class TestGhShimHookDelete(unittest.TestCase):
                 self.assertEqual(calls, [])
                 self.assertEqual(done.returncode, 1)
 
-    def test_the_other_spellings_of_the_host_are_read_first_too(self):
-        for path in ("https://api.github.com/" + HOOK, "http://api.github.com/" + HOOK, "//api.github.com/" + HOOK, "/" + HOOK, HOOK + "?x=1"):
+    def test_a_full_url_is_refused_because_the_read_and_the_delete_could_reach_different_hosts(self):
+        for path in ("https://api.github.com/" + HOOK, "http://api.github.com/" + HOOK, "//api.github.com/" + HOOK):
+            with self.subTest(path=path):
+                done, calls, seen = self.rig.go(delete(path))   # even a real forwarder hook: gh sends a URL to its own host, ignoring GH_HOST and --hostname
+                self.assertEqual(calls, [])
+                self.assertNotEqual(done.returncode, 0)
+
+    def test_the_other_spellings_of_the_path_are_read_first_too(self):
+        for path in ("/" + HOOK, HOOK + "?x=1"):
             with self.subTest(path=path):
                 done, calls, seen = self.rig.go(delete(path), hook_text=hook(name="web"))
                 self.assertEqual(calls, [], "a hook that is not the forwarder's passed")
@@ -130,6 +137,13 @@ class TestGhShimHookDelete(unittest.TestCase):
         self.assertIn('GITHUB_FORWARDER_HOOK_URL = "%s"' % URL, text)
         self.assertEqual(load_module().FORWARDER_HOOK_URL, URL)
 
+    def test_a_flag_and_its_value_before_api_cannot_skip_the_check(self):
+        for lead in (["--hostname", "github.com"], ["-H", "x:y"], ["--jq", "."]):
+            with self.subTest(lead=lead):
+                done, calls, _ = self.rig.go(lead + delete(), hook_text=hook(name="web"))
+                self.assertEqual(calls, [], "a hook that is not the forwarder's passed")
+                self.assertNotEqual(done.returncode, 0)
+
     def test_a_missing_guard_module_refuses_the_delete(self):
         (self.rig.shims / "gh_body.py").unlink()
         done, calls, _ = self.rig.go(delete())
@@ -137,21 +151,28 @@ class TestGhShimHookDelete(unittest.TestCase):
         self.assertEqual(done.returncode, 1)
 
 
-def today(name):
-    return subprocess.run(["git", "show", "origin/integration:shims/" + name], capture_output=True, text=True, cwd=str(SHIM_DIR.parent), check=True).stdout
+def source(name):
+    return (SHIM_DIR / name).read_text()
+
+
+def mutant(name, old, new):
+    text = source(name)
+    assert text.count(old) == 1, old   # the control is a mutant of the CURRENT source: it stays true whatever origin/integration holds
+    return text.replace(old, new)
 
 
 class TestGhShimHookControls(unittest.TestCase):
-    def test_today_s_shim_refuses_the_delete_of_a_forwarder_hook(self):
-        rig = HookRig(shim_source=today("gh"), gh_body_source=today("gh_body.py"))
+    def test_without_the_allow_list_row_the_delete_of_a_forwarder_hook_is_refused(self):
+        rig = HookRig(shim_source=mutant("gh", 'r"hooks/[0-9]+"', 'r"hooks/never-matches"'))
         self.addCleanup(rig.close)
         done, calls, _ = rig.go(delete())
-        self.assertEqual(calls, [], "control: nothing passes on today's shim")
+        self.assertEqual(calls, [], "control: nothing passes without the row")
         self.assertIn("REST_WRITES", done.stderr)
 
-    def test_without_the_pre_read_a_hook_of_another_name_would_pass(self):
-        # the allow-list alone (today's gh_body.py with the new table row) would let any hook go: the pre-read is what narrows it
-        rig = HookRig(gh_body_source=today("gh_body.py"))
+    def test_without_the_hook_check_a_hook_of_another_name_would_pass(self):
+        # the allow-list row alone would let any hook go: the pre-read and the name and url check are what narrow it
+        old = 'if data.get("name") == "cli" and isinstance(config, dict) and config.get("url") == FORWARDER_HOOK_URL:'
+        rig = HookRig(gh_body_source=mutant("gh_body.py", old, "if True:"))
         self.addCleanup(rig.close)
         done, calls, _ = rig.go(delete(), hook_text=hook(name="web"))
-        self.assertEqual(len(calls), 1, "control: no pre-read, no narrowing")
+        self.assertEqual(len(calls), 1, "control: no check, no narrowing")

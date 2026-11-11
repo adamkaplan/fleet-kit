@@ -30,7 +30,6 @@ class HooksRunner:
 
     def __init__(self, hooks, list_error=None, delete_error=None):
         self.hooks, self.list_error, self.delete_error, self.calls = list(hooks), list_error, delete_error, []
-        self.forwarders_started = 0
 
     def __call__(self, argv, **kwargs):
         self.calls.append(list(argv))
@@ -160,9 +159,35 @@ class TestForwarderHooks(Base):
         hub = self.start(runner)
         self.assertEqual(len(self.procs), 1)
         self.assertEqual(len(runner.deleted()), len(set(runner.deleted())), "a failed removal is not retried")
-        self.assertLessEqual(len(runner.deleted()), sb.GITHUB_HOOK_REMOVALS)
+        self.assertEqual(len(runner.deleted()), 1, "the cleanup stops at the first failed removal")
         self.assertEqual(len([a for a in self.audit if a[0] == "github.hooks"]), 1)
         self.assertIn("hook cleanup failed", hub.watches[REPO].hook_note)
+
+    def test_the_status_is_compared_exactly_not_as_text(self):
+        for said in ("gh: boom (HTTP 500) see 404", "gh: HTTP 4040", "gh: Not Found (HTTP 1404)"):
+            with self.subTest(said=said):
+                runner = HooksRunner([hook(1)], delete_error=said)
+                hub = self.start(runner)
+                self.assertIn("hook cleanup failed", hub.watches[REPO].hook_note, "a failure that only mentions 404 is a failure")
+        hub = self.build(HooksRunner([]))
+        for said, status in (("gh: Not Found (HTTP 404)", 404), ("gh: boom (HTTP 500) see 404", 500), ("gh: no code here", None)):
+            with self.subTest(said=said):
+                hub.runner = lambda argv, said=said, **kw: subprocess.CompletedProcess(argv, 1, "", said)
+                with self.assertRaises(sb.GitHubUnavailable) as caught:
+                    hub._hook_api(REPO, None, ["repos/%s/hooks" % REPO])
+                self.assertEqual(caught.exception.status, status)
+
+    def test_a_list_answering_404_names_the_scope(self):
+        hub = self.start(HooksRunner([hook(1)], list_error="gh: Not Found (HTTP 404)"))
+        self.assertIn("admin:repo_hook", hub.watches[REPO].hook_note)
+        self.assertEqual(len(self.procs), 1)
+
+    def test_a_dot_segment_in_the_repository_name_is_refused(self):
+        hub = self.build(HooksRunner([]))
+        for repo in ("o/.", "./r", "o/..", "../r"):
+            with self.subTest(repo=repo):
+                with self.assertRaises(sb.GitHubUnavailable):
+                    hub._hook_api(repo, None, ["x"])
 
     def test_a_runner_that_raises_never_stops_the_start(self):
         def broken(argv, **kwargs):
