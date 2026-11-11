@@ -83,6 +83,19 @@ RUN curl -fsSL https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz -o /tmp/go.t
 ENV GOTOOLCHAIN=local
 # ---- end Go ----
 
+# ask #2407: mise, the version manager the land tool calls (`mise install python@3.11`): one pinned release, its sha256 pinned here, checked before it is unpacked.
+# MISE_VERSION and MISE_SHA256 (of mise-${MISE_VERSION}-linux-x64.tar.gz) are the only constants; a bump updates both (cloud/README.md).
+# Only the binary is installed, root-owned at /usr/local/bin/mise, not writable by others. Toolchains install at run time into the run user's own home (mise's default).
+# python3 stays the system Python.
+ARG MISE_VERSION=v2026.11.6
+ARG MISE_SHA256=d6ebb6f5601bdf5a8d1d56028b24fe575f45075b989941ccc920f95161c5fa28
+RUN curl -fsSL https://github.com/jdx/mise/releases/download/${MISE_VERSION}/mise-${MISE_VERSION}-linux-x64.tar.gz -o /tmp/mise.tgz \
+ && echo "${MISE_SHA256}  /tmp/mise.tgz" | sha256sum -c - \
+ && tar -xzf /tmp/mise.tgz -C /tmp \
+ && install -o root -g root -m 0755 /tmp/mise/bin/mise /usr/local/bin/mise \
+ && rm -rf /tmp/mise.tgz /tmp/mise
+# ---- end mise ----
+
 # Non-root worker. It may start dockerd (and nothing else) as root: the daemon only
 # runs inside the Sysbox pod's own user namespace.
 RUN userdel -r ubuntu 2>/dev/null || true \
@@ -107,6 +120,8 @@ COPY worker/bin/cloud_cli.py /usr/local/bin/cw-cloud
 COPY worker/bin/cloud_client.py worker/bin/cloud_hub.py worker/bin/cloud_channel.py worker/bin/cloud_channel_server.py worker/bin/cloud_relay.py /usr/local/bin/
 COPY worker/cw-plan-check worker/plan_check.py /usr/local/bin/
 COPY worker/cw-stack-up /usr/local/bin/
+COPY worker/pod-hooks/pre-push /usr/local/lib/cw-hooks/pre-push
+RUN chown -R root:root /usr/local/lib/cw-hooks && chmod 0755 /usr/local/lib/cw-hooks /usr/local/lib/cw-hooks/pre-push
 COPY worker/cw-shell-check worker/cw-run /usr/local/bin/
 RUN chmod 0755 /usr/local/bin/cw-shell-check /usr/local/bin/cw-run
 RUN chmod 0755 /usr/local/bin/start-dockerd /usr/local/bin/cw-stack-pull /usr/local/bin/worker-entrypoint \
@@ -156,6 +171,7 @@ RUN set -eu; git clone --filter=blob:none https://github.com/pgmq/pgmq /src/pgmq
  && cd /src/pgmq && git checkout --detach "${PGMQ_COMMIT}" \
  && test "$(git rev-parse HEAD)" = "${PGMQ_COMMIT}" \
  && cd pgmq-extension && make PG_CONFIG=/opt/pg/bin/pg_config && make PG_CONFIG=/opt/pg/bin/pg_config install
+RUN set -eu; make -C /src/pg/contrib/pg_trgm PG_CONFIG=/opt/pg/bin/pg_config && make -C /src/pg/contrib/pg_trgm PG_CONFIG=/opt/pg/bin/pg_config install
 # ---- end #1353 PostgreSQL build stage ----
 
 # ---- build-time secret scan (the stages below the line "FROM worker AS scan" are reused by cloud/tests/test-cloud) ----
@@ -180,17 +196,20 @@ FROM worker AS final
 COPY --from=scan /scan-ok /usr/local/share/cw/scan-ok
 # #1353: PostgreSQL 16 and the two extensions, installed files only (root-owned, no compiler, nothing starts them): see the pgbuild stage.
 COPY --from=pgbuild /opt/pg /opt/pg
-# ask #2329: /opt/pg-bundle, the Debian-style tree that scripts/dev/ephemeral-pg.sh reads through PG_BUNDLE, built by COPIES (cp -a) of /opt/pg:
+# ask #2329: the bundle, the Debian-style tree that scripts/dev/ephemeral-pg.sh reads (now from the cache directory), built by COPIES (cp -a) of /opt/pg:
 # no download, no build tool, no server started. The relocatable build resolves share beside bin, so /opt/pg/share/postgresql is also
 # copied to usr/lib/postgresql/16/share/postgresql. Root-owned, read-only for others; the run user is unchanged (set again below).
 USER root
-RUN set -eu; b=/opt/pg-bundle; l="$b/usr/lib/postgresql/16"; e="$b/usr/share/postgresql/16/extension"; s=/opt/pg/share/postgresql \
+# ask #2367: the bundle lives in the land tool's bundle cache directory under /home/worker/.cache (the path its bundle script uses when no variable is set),
+# so the image sets no PG* variable. The directory name is a REQUIRED build argument (no default): the operator passes --build-arg CW_BUNDLE_CACHE_NAME=<name>.
+ARG CW_BUNDLE_CACHE_NAME
+RUN test -n "$CW_BUNDLE_CACHE_NAME"
+RUN set -eu; b="/home/worker/.cache/${CW_BUNDLE_CACHE_NAME}"; l="$b/usr/lib/postgresql/16"; e="$b/usr/share/postgresql/16/extension"; s=/opt/pg/share/postgresql \
  && mkdir -p "$l" "$e" \
  && cp -a /opt/pg/bin /opt/pg/lib "$l/" \
  && cp -a /opt/pg/share "$l/share" \
- && cp -a "$s"/extension/vector.control "$s"/extension/vector--*.sql "$s"/extension/pgmq.control "$s"/extension/pgmq--*.sql "$e/" \
+ && cp -a "$s"/extension/vector.control "$s"/extension/vector--*.sql "$s"/extension/pgmq.control "$s"/extension/pgmq--*.sql "$s"/extension/pg_trgm.control "$s"/extension/pg_trgm--*.sql "$e/" \
  && cp -a "$s/postgresql.conf.sample" "$b/usr/share/postgresql/postgresql.conf.sample" \
- && chown -R root:root "$b" && chmod -R go-w,a+rX "$b"
-ENV \
-  PG_BUNDLE=/opt/pg-bundle
+ && chown -R root:root "$b" && chmod -R go-w,a+rX "$b" \
+ && chown worker:worker /home/worker/.cache
 USER worker

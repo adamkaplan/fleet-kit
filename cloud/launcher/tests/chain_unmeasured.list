@@ -64,6 +64,7 @@ cloud/launcher/tests/test_scrub_linear.py
 cloud/launcher/tests/test_scrub_pieces.py
 cloud/launcher/tests/test_secret_dir.py
 cloud/launcher/tests/test_secret_dir_publish.py
+cloud/launcher/tests/test_stall_watch.py
 cloud/launcher/tests/test_stop_failed_pod.py
 cloud/launcher/tests/test_stop_no_checkout.py
 cloud/launcher/tests/test_token_at_limit.py
@@ -80,6 +81,7 @@ cloud/worker/tests/test_cloud_prepush_background.py
 cloud/worker/tests/test_comment_by_id.py
 cloud/worker/tests/test_cw_gh.py
 cloud/worker/tests/test_cw_run.py
+cloud/worker/tests/test_cw_run_wake.py
 cloud/worker/tests/test_dockerfile_browser.py
 cloud/worker/tests/test_dockerfile_pg_bundle.py
 cloud/worker/tests/test_dockerfile_postgres.py
@@ -92,6 +94,7 @@ cloud/worker/tests/test_plan_check_in_pod.py
 cloud/worker/tests/test_pr_branch_source.py
 cloud/worker/tests/test_pr_label.py
 cloud/worker/tests/test_pr_record.py
+cloud/worker/tests/test_pre_push_hook.py
 cloud/worker/tests/test_reach.py
 cloud/worker/tests/test_scan_dpkg_skip.py
 cloud/worker/tests/test_shell_check.py

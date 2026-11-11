@@ -114,6 +114,7 @@ cloud/launcher/tests/test_secret_dir_publish.py
 cloud/launcher/tests/test_stack_model_key.py
 cloud/launcher/tests/test_stack_registry_check.py
 cloud/launcher/tests/test_stack_registry_pod.py
+cloud/launcher/tests/test_stall_watch.py
 cloud/launcher/tests/test_stop_cause.py
 cloud/launcher/tests/test_stop_failed_pod.py
 cloud/launcher/tests/test_stop_no_checkout.py
@@ -137,9 +138,11 @@ cloud/worker/tests/test_comment_by_id.py
 cloud/worker/tests/test_cw_gh.py
 cloud/worker/tests/test_cw_gh_comments.py
 cloud/worker/tests/test_cw_run.py
+cloud/worker/tests/test_cw_run_wake.py
 cloud/worker/tests/test_dockerfile_agent.py
 cloud/worker/tests/test_dockerfile_browser.py
 cloud/worker/tests/test_dockerfile_go.py
+cloud/worker/tests/test_dockerfile_mise.py
 cloud/worker/tests/test_dockerfile_node.py
 cloud/worker/tests/test_dockerfile_pg_bundle.py
 cloud/worker/tests/test_dockerfile_postgres.py
@@ -148,7 +151,6 @@ cloud/worker/tests/test_entrypoint.py
 cloud/worker/tests/test_entrypoint_import.py
 cloud/worker/tests/test_entrypoint_long_run.py
 cloud/worker/tests/test_entrypoint_question.py
-cloud/worker/tests/test_guard_env.py
 cloud/worker/tests/test_guard_table.py
 cloud/worker/tests/test_identity_image.py
 cloud/worker/tests/test_identity_required.py
@@ -159,6 +161,7 @@ cloud/worker/tests/test_pr_edit.py
 cloud/worker/tests/test_pr_edit_hardening.py
 cloud/worker/tests/test_pr_label.py
 cloud/worker/tests/test_pr_record.py
+cloud/worker/tests/test_pre_push_hook.py
 cloud/worker/tests/test_push_rules.py
 cloud/worker/tests/test_question_denied.py
 cloud/worker/tests/test_reach.py

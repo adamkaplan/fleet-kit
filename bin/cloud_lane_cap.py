@@ -80,3 +80,16 @@ def _ended(record, clock=None):
     except (TypeError, ValueError):
         return False
     return when.timestamp() < (time.time() if clock is None else clock)
+
+
+def _pod_is_gone(runner, record):
+    """True only when the cluster was READ and holds no pod of the record. A read that fails, a snapshot that is not a dict, or a record whose pod
+    cannot be matched by name says False: the caller keeps the pod and the record, as before."""
+    try:
+        if not D["_pod_known"](record):
+            return False
+        with D["Cluster"](timeout=D["SNAPSHOT_SECONDS"]) as cluster:
+            snapshot = D["_cluster_snapshot"](runner, cluster, D["SNAPSHOT_SECONDS"])
+        return isinstance(snapshot.get("pods"), list) and D["_pod_of"](record, snapshot) is None
+    except Exception:
+        return False
