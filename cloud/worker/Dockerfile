@@ -87,6 +87,8 @@ COPY worker/bin/cloud_client.py worker/bin/cloud_hub.py worker/bin/cloud_channel
 COPY worker/cw-plan-check worker/plan_check.py /usr/local/bin/
 COPY worker/cw-stack-up /usr/local/bin/
 COPY worker/cw-shell-check /usr/local/bin/
+COPY worker/pod-hooks/pre-push /usr/local/lib/cw-hooks/pre-push
+RUN chown -R root:root /usr/local/lib/cw-hooks && chmod 0755 /usr/local/lib/cw-hooks /usr/local/lib/cw-hooks/pre-push
 RUN chmod 0755 /usr/local/bin/cw-shell-check
 RUN chmod 0755 /usr/local/bin/start-dockerd /usr/local/bin/cw-stack-pull /usr/local/bin/worker-entrypoint \
       /usr/local/bin/cw-end-hook /usr/local/bin/cw-prestop /usr/local/bin/cw-token-mint /usr/local/bin/cw-worker-activity \

@@ -149,6 +149,7 @@ H
   fi
   # ~/.gitconfig is read by every process of this user, including a fresh-environment `kubectl exec` (the end hook)
   git config --global credential.helper "$bin/git-credential-cw"
+  git config --global core.hooksPath /usr/local/lib/cw-hooks   # the pre-push hook of the image (a convenience, not the guard)
   PATH="$bin:$PATH"; export PATH
 fi
 
