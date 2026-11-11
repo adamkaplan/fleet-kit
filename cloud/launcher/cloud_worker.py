@@ -2927,6 +2927,7 @@ def render_pod(a, worker, name, now, hard, env, run_names=()):
     if comment:   # the repository's review comment, posted once by the end hook; none configured = no variable
         e["CW_REVIEW_COMMENT"] = comment
     if (env.get("CW_COUNCIL_URL") or "").strip(): e["COUNCIL_MODEL_URL"] = env["CW_COUNCIL_URL"].strip()   # ask #2341: an address only, never a key; unset adds nothing
+    if (env.get("CW_LONG_RUN_DENY") or "").strip(): e["CW_LONG_RUN_DENY"] = env["CW_LONG_RUN_DENY"].strip()   # ask #2369: patterns only; unset adds nothing
     agent = getattr(a, "agent", None) or "worker"
     if agent not in AGENTS:
         raise CloudError("--agent must be one of %s, got %r; nothing was created" % (" or ".join(AGENTS), str(agent)[:40]), EXIT_USAGE)
@@ -5101,6 +5102,7 @@ SETTINGS = (
     ("CW_SECRET_DIR", False, "path"),               # the private directory (0700, under the home) of 0600 files named as the vault's secrets; the vault reads then read the files, no az
     ("CW_AZURE_CONFIG_DIR", False, "path"),        # the az sign-in directory every vault read of a launch uses (replaces the caller's AZURE_CONFIG_DIR); an absolute existing directory
     ("CW_COUNCIL_URL", False, "name"),             # the address of the Copilot bridge front (cloud/k8s/copilot-bridge.yaml) a worker pod is told as COUNCIL_MODEL_URL; an address, never a key
+    ("CW_LONG_RUN_DENY", False, "name"),           # 1 to 8 comma-separated shell patterns (letters, digits . - / _ * ?, each at most 80 characters): a worker pod refuses a foreground shell command matching one and lets it run through cw-run; operator settings only
 )
 SETTING_KINDS = {name: kind for name, _, kind in SETTINGS}
 SETTING_REQUIRED = tuple(name for name, required, _ in SETTINGS if required)
@@ -5275,6 +5277,7 @@ VALIDATORS = {
     "CW_SECRET_DIR": ("an absolute path of a directory under the home directory, with no .. segment", lambda v: _secret_files().dir_ok(v)),
     "CW_AZURE_CONFIG_DIR": ("an absolute path of an existing directory, with no .. segment", _dir_ok),
     "CW_COUNCIL_URL": ("an http or https URL: a host, an optional port, an optional /v1, no user, query or fragment", lambda v: bool(re.fullmatch(r"https?://[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?(?::[0-9]{1,5})?(?:/v1)?", v))),
+    "CW_LONG_RUN_DENY": ("1 to 8 comma-separated patterns of letters, digits, dot, dash, slash, underscore, * and ?, each at most 80 characters", lambda v: 1 <= len(v.split(",")) <= 8 and all(re.fullmatch(r"[A-Za-z0-9./_*?][A-Za-z0-9./_*?-]{0,79}", x) for x in v.split(","))),
 }
 _SETTING_LINE = re.compile(r"([A-Z][A-Z0-9_]*)=(.*)")
 

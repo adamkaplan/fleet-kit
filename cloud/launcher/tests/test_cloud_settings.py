@@ -30,6 +30,7 @@ OPTIONAL_SAMPLES["CW_READONLY_ROOT_LANES"] = "lane-a,lane-b"
 OPTIONAL_SAMPLES["CW_SECRET_DIR"] = os.path.join(os.path.expanduser("~"), "cw-secrets")   # ask #2357: the secret directory (under the home)
 OPTIONAL_SAMPLES["CW_AZURE_CONFIG_DIR"] = "/tmp"   # an existing directory; the setting is refused when it is missing
 OPTIONAL_SAMPLES["CW_COUNCIL_URL"] = "http://copilot-bridge.cw.svc:8080"   # ask #2341
+OPTIONAL_SAMPLES["CW_LONG_RUN_DENY"] = "*longcmd*,*other.sh*"   # ask #2369
 SAMPLES = {   # one value per secret shape (built here, never a real secret)
     "a JWT": "eyJhbGciOiJIUzI1" + "." + "eyJzdWIiOiJ4eHh4",
     "a PEM header": "-----BEGIN " + "PRIVATE KEY-----",
@@ -93,6 +94,7 @@ HOSTILE = {   # per key: values that must be refused (each through the REAL pars
 HOSTILE["CW_SECRET_DIR"] = ["secrets", "/tmp/cw-secrets", "/etc", "-x", os.path.expanduser("~") + "/../x"]   # relative, outside the home, an option, a .. segment
 HOSTILE["CW_AZURE_CONFIG_DIR"] = ["azure", "/a/../b", "-x", "/no/such/dir-azure-test"]   # relative, a .. segment, an option, a missing directory
 HOSTILE["CW_COUNCIL_URL"] = ["ftp://bridge.example", "bridge.example:8080", "http://", "http://user@bridge.example", "http://bridge.example?x=1", "http://bridge.example#f", "https://bridge.example/a/b", "file:///etc/passwd", "http://bridge example", "http://bridge.example/opaque-segment", "http://bridge.example/.."]   # ask #2341
+HOSTILE["CW_LONG_RUN_DENY"] = [",".join("*p%d*" % i for i in range(9)), "*a b*", "*a;b*", "*" + "a" * 80, "*a*,", ",*a*", "*a*,,*b*", "$(x)"]   # ask #2369: 9 patterns, a space, a semicolon, 81 characters, an empty entry, a substitution
 CONTROL = ["\t", "\x00", "\r", "\x0b", "\x0c", "\x1c", "\x1b", "\x7f", "\x01"]
 
 

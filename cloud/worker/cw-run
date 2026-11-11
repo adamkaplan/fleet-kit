@@ -1,0 +1,216 @@
+#!/usr/bin/env python3
+"""cw-run: run a long command detached, then poll it with bounded waits (a foreground call that outlives the tool's time limit strands the turn).
+
+  cw-run start [--name NAME] -- COMMAND...   start detached; returns at once
+  cw-run wait NAME [SECONDS]                 wait at most min(SECONDS, 240) (default 120); prints running <n>s or exited <code>, then the last 20 log lines
+  cw-run tail NAME [LINES]                   the last LINES (default 20) log lines
+  cw-run list                                every run and its state
+
+A run lives in /work/runs (NAME.log, NAME.exit, NAME.pid). While it lives one line goes to /work/progress.txt every 5 minutes, and one when it ends.
+"""
+import os, re, subprocess, sys, time
+
+RUNS = os.environ.get("CW_RUNS_DIR") or "/work/runs"
+PROGRESS = os.environ.get("CW_PROGRESS_FILE") or "/work/progress.txt"
+try:
+    TICK = float(os.environ.get("CW_RUN_TICK") or 300)
+except ValueError:
+    TICK = 300.0
+MAX_WAIT = 240
+NAME_OK = re.compile(r"[A-Za-z0-9._-]+")
+
+
+def die(msg, code=2):
+    sys.stderr.write("cw-run: %s\n" % msg)
+    sys.exit(code)
+
+
+def path(name, ext):
+    return os.path.join(RUNS, name + "." + ext)
+
+
+def check_name(name):
+    if not NAME_OK.fullmatch(name or "") or name.startswith(".") or len(name) > 64:
+        die("a name is 1 to 64 letters, digits, dot, dash or underscore (not starting with a dot)")
+    return name
+
+
+def read(p):
+    try:
+        with open(p) as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
+def alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    try:  # a zombie is not alive
+        with open("/proc/%d/stat" % pid) as f:
+            return f.read().rsplit(")", 1)[1].split()[0] != "Z"
+    except (OSError, IndexError):
+        return True
+
+
+def state(name):
+    """('none',) | ('running', elapsed) | ('exited', code)"""
+    pid = read(path(name, "pid"))
+    if pid is None:
+        return ("none",)
+    code = read(path(name, "exit"))
+    if code is not None:
+        return ("exited", code)
+    try:
+        started = os.stat(path(name, "pid")).st_mtime
+    except OSError:
+        return ("none",)
+    if pid.isdigit() and alive(int(pid)):
+        return ("running", int(time.time() - started))
+    return ("exited", "255")   # the supervisor is gone without an exit record
+
+
+def progress(line):
+    try:
+        with open(PROGRESS, "a") as f:
+            f.write(line + "\n")
+    except OSError:
+        pass
+
+
+def last_lines(name, n):
+    try:
+        with open(path(name, "log"), "rb") as f:
+            data = f.read()
+    except OSError:
+        return ""
+    lines = data.decode("utf-8", "replace").splitlines()
+    return "\n".join(lines[-n:] if n > 0 else [])
+
+
+def ensure_dir():
+    if not os.path.isdir(RUNS):
+        os.makedirs(RUNS, mode=0o700, exist_ok=True)
+
+
+def supervise(name, cmd):
+    start = time.time()
+    log = open(path(name, "log"), "ab", buffering=0)
+    code = 127
+    try:
+        try:
+            p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
+        except OSError as e:
+            log.write(("cw-run: cannot start: %s\n" % e).encode())
+            p = None
+        while p is not None:
+            try:
+                rc = p.wait(timeout=TICK)
+                code = rc if rc >= 0 else 128 - rc
+                break
+            except subprocess.TimeoutExpired:
+                progress("cw-run %s still running (%ds)" % (name, int(time.time() - start)))
+    finally:
+        tmp = path(name, "exit.tmp")
+        with open(tmp, "w") as f:
+            f.write("%d\n" % code)
+        os.rename(tmp, path(name, "exit"))
+        progress("cw-run %s exited %d after %ds" % (name, code, int(time.time() - start)))
+
+
+def cmd_start(args):
+    name = None
+    if args[:1] == ["--name"]:
+        if len(args) < 2:
+            die("--name needs a value")
+        name, args = args[1], args[2:]
+    if args[:1] != ["--"] or len(args) < 2:
+        die("usage: cw-run start [--name NAME] -- COMMAND...")
+    cmd = args[1:]
+    if name is None:
+        name = "run-%d" % int(time.time())
+    check_name(name)
+    ensure_dir()
+    if state(name)[0] == "running":
+        die("a run named %s is still running" % name)
+    for ext in ("exit", "log", "pid"):
+        try:
+            os.unlink(path(name, ext))
+        except OSError:
+            pass
+    sup = subprocess.Popen([sys.executable, os.path.abspath(__file__), "_supervise", name, "--"] + cmd,
+                           stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           start_new_session=True, close_fds=True)
+    with open(path(name, "pid"), "w") as f:
+        f.write("%d\n" % sup.pid)
+    print("started %s (pid %d); log %s" % (name, sup.pid, path(name, "log")))
+    print("poll: cw-run wait %s 120   (repeat until it prints exited; at most 240 seconds per wait)" % name)
+    print("then: cw-run tail %s 50" % name)
+
+
+def cmd_wait(args):
+    if not 1 <= len(args) <= 2:
+        die("usage: cw-run wait NAME [SECONDS]")
+    name = check_name(args[0])
+    secs = 120
+    if len(args) == 2:
+        if not re.fullmatch(r"[0-9]{1,9}", args[1]):
+            die("SECONDS is a whole number")
+        secs = int(args[1])
+    secs = min(secs, MAX_WAIT)
+    if state(name)[0] == "none":
+        die("no run named %s" % name)
+    end = time.time() + secs
+    while state(name)[0] == "running" and time.time() < end:
+        time.sleep(min(0.2, max(0.0, end - time.time())))
+    st = state(name)
+    print("running %ds" % st[1] if st[0] == "running" else "exited %s" % st[1])
+    out = last_lines(name, 20)
+    if out:
+        print(out)
+
+
+def cmd_tail(args):
+    if not 1 <= len(args) <= 2:
+        die("usage: cw-run tail NAME [LINES]")
+    name = check_name(args[0])
+    n = 20
+    if len(args) == 2:
+        if not re.fullmatch(r"[0-9]{1,6}", args[1]):
+            die("LINES is a whole number")
+        n = int(args[1])
+    if state(name)[0] == "none":
+        die("no run named %s" % name)
+    out = last_lines(name, n)
+    if out:
+        print(out)
+
+
+def cmd_list(args):
+    if args:
+        die("usage: cw-run list")
+    try:
+        names = sorted(f[:-4] for f in os.listdir(RUNS) if f.endswith(".pid"))
+    except OSError:
+        names = []
+    for n in names:
+        st = state(n)
+        print("%s %s" % (n, "running %ds" % st[1] if st[0] == "running" else "exited %s" % st[1] if st[0] == "exited" else "gone"))
+
+
+def main(argv):
+    if argv[:1] == ["_supervise"]:
+        sep = argv.index("--")
+        return supervise(argv[1], argv[sep + 1:])
+    cmds = {"start": cmd_start, "wait": cmd_wait, "tail": cmd_tail, "list": cmd_list}
+    if not argv or argv[0] not in cmds:
+        die("usage: cw-run start [--name NAME] -- COMMAND... | wait NAME [SECONDS] | tail NAME [LINES] | list")
+    cmds[argv[0]](argv[1:])
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
