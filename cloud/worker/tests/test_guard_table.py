@@ -20,11 +20,6 @@ TOKEN = "synthetic-" + "Zp4Rt9" * 6
 NEW_IDS = {"issue-comments-read", "pull-reviews-read", "pull-comments-read", "api-jq-filter", "issues-other-path"}
 
 
-def load_conf():
-    with open(CONF) as f:
-        return json.load(f)
-
-
 def rows():
     out = []
     for line in open(TABLE).read().splitlines():
@@ -35,21 +30,11 @@ def rows():
     return out
 
 
-def conf_decision(conf, line):
-    bash = conf["permission"]["bash"]
-    assert bash == conf["agent"]["worker"]["permission"]["bash"]
-    res = "allow"
-    for pat, v in bash.items():   # opencode: the last matching rule wins
-        if re.fullmatch(".*".join(re.escape(x) for x in pat.split("*")), line, re.S):
-            res = v
-    return res
-
-
 # ask #2402: rows whose shell-layer refusal was only a deny row of opencode-worker.json (removed); the client still refuses them
 CONF_ONLY = {"issues-other-path", "issues-labels-path", "shell-record-var", "shell-record-dir"}
 
 
-def guard_denies(example, conf=None):
+def guard_denies(example):
     args = example.split()
     r = subprocess.run(["sh", GUARD, "gh"] + args, capture_output=True, text=True, timeout=30, env={"PATH": "/usr/bin:/bin"})
     if r.returncode == 3:
