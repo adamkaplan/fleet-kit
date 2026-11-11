@@ -171,6 +171,18 @@ class TestGhShimHookDelete(unittest.TestCase):
         self.assertIsNone(gh_body.guard(["--repo=o/r", "--jq", ".", "api", HOOK], False, parser, None, None))
         self.assertEqual(parsed[-1], ["api", "--jq", ".", HOOK])
 
+    def test_the_lead_handed_to_the_parser_keeps_a_repo_token_that_may_be_a_flag_value(self):
+        gh_body = load_module()
+        seen = []
+        def parser(args):
+            seen.append(args)
+            return type("P", (), {"effective_method": "GET", "positionals": [], "hostname": None})()
+        for lead, handed in ((["--jq", "--repo=o/r"], ["--jq", "--repo=o/r"]), (["--jq", "-R"], ["--jq", "-R"]), (["--jq", ".", "--repo=o/r"], ["--jq", "."])):
+            with self.subTest(lead=lead):
+                del seen[:]
+                gh_body.guard(lead + ["api", HOOK], False, parser, None, None)
+                self.assertEqual(seen, [["api"] + handed + [HOOK]])
+
     def test_a_repo_flag_that_is_the_value_of_an_earlier_flag_is_not_stripped(self):
         for lead in (["--jq", "-R"], ["-q", "-R"], ["-q", "--repo"], ["--jq", "--repo=o/r"]):
             for method in (["-XDELETE"], ["--method=DELETE"], ["-X", "DELETE"]):
