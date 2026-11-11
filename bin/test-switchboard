@@ -30200,7 +30200,7 @@ class TestPlanLedger(LedgerBase):
         self.assertTrue(report["ledger_problem"])
 
     def test_g6_waits_for_a_held_pr_and_a_pr_not_held_passes_whatever_its_body_says(self):
-        facts = {"head": LEDGER_HEAD, "ci": "green", "captain": True, "captain_findings": [], "body": "plain", "floor": {"decision": "none"}}
+        facts = {"head": LEDGER_HEAD, "ci": "green", "captain": True, "holds": ["hold"], "captain_findings": [], "body": "plain", "floor": {"decision": "none"}}
         row = lambda f: next(r for r in sb.plan_ledger.evaluate_gates(None, [], None, f, self.PR)["gates"] if r["gate"] == "G6")
         self.assertEqual(row(facts)["status"], "waiting")   # a merge-captain label is a hold
         self.assertEqual(row(dict(facts, floor={"decision": "hold"}))["status"], "waiting")

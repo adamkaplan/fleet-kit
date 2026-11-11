@@ -47,6 +47,8 @@ import urllib.parse
 from unittest import mock
 import datetime  # noqa: E402  (this section's only import)
 from support.core import Base, FakeRunner
+from support.orders_and_adapters import FakeGhPr
+from support.herdr_world import World
 from support.fake_hubs import WaitingInputs
 from support.fake_jev import FakeJev, JEV_SETTINGS, KEY_VALUE, confident
 from support.installs_and_keys import InstallCase, KeyCase, PR16_KEY
@@ -770,8 +772,6 @@ class TestCaptainLabels(Base):
             with mock.patch.object(sb.time, "time", return_value=now):
                 self.assertFalse(sb.is_captain({"labels": [], "body": "MERGE: captain\nx"}))
                 self.assertTrue(sb.is_captain({"labels": self.labels("merge-captain"), "body": "x"}))
-        self.assertFalse(hasattr(sb, "CAPTAIN_MARKER_UNTIL"))
-        self.assertFalse(hasattr(sb, "marker_window_open"))
 
     def test_the_label_wins_when_it_disagrees_with_the_line(self):
         auto = {"labels": self.labels("merge-automatic"), "body": "MERGE: captain\nx"}
@@ -811,12 +811,50 @@ class TestCaptainLabels(Base):
         self.assertIsNone(sb.pr_facts_from({k: v for k, v in data.items() if k != "labels"})["captain"])
         self.assertFalse(sb.pr_facts_from(dict(data, labels=[]))["captain"])
 
-    def test_nothing_reads_the_first_line_as_a_hold_only_the_one_helper_decides(self):
-        text = switchboard_source()
-        lines = text.splitlines()
-        reads = [l.strip() for l in lines if re.search(r"pr_marker\([^)]*\)\s*(==|!=|in|is)\s*[\"(]?\s*[\"']captain", l) or "pr_is_captain" in l or "CAPTAIN_MARK" in l]
-        self.assertEqual(reads, [], "a reader still takes the first line as a hold: %r" % reads)
-        self.assertEqual([l for l in lines if "marker_window_open" in l or "CAPTAIN_MARKER_UNTIL" in l], [])
+    def test_g6_is_not_open_when_the_labels_could_not_be_read(self):
+        facts = {"head": "a" * 40, "ci": "green", "captain": None, "captain_findings": [], "body": "plain", "floor": {"decision": "none"}}
+        gate = lambda f: next(r for r in sb.plan_ledger.evaluate_gates(None, [], None, f, "acme/api#1")["gates"] if r["gate"] == "G6")
+        self.assertEqual(gate(facts)["status"], "waiting")
+        self.assertIn("labels could not be read", " ".join(gate(facts)["missing"]))
+        self.assertEqual(gate(dict(facts, captain=False))["status"], "ok")   # control: readable and not held passes
+
+
+class TestUnreadableLabelsAreNotNotHeld(Base):
+    """(#2379) a pull request whose labels could not be read is not a pull request that is not held: the real notice reader and the real escalate path."""
+
+    def setUp(self):
+        super().setUp()
+        self.world = World(self, agents=(), config={"github_repos": ["acme/api"]})
+        self.engine = self.world.engine
+        self.engine.discover(self.world.clock.now())
+
+    def unread_labels_pr(self, number=50):
+        """A noticed pull request whose `gh pr view` answer has no readable `labels` (captain None), through the real readers."""
+        sb.record_pr_notice(self.world.state, "acme/api", number, "platform", "", self.world.clock.now())
+        self.engine.gh_runner = FakeGhPr({number: (0, pr_view_json(headRefOid="c" * 40, body="MERGE: captain\nx"), "")})
+        return self.engine.gh_runner
+
+    def test_unreadable_labels_keep_the_notice_a_captain_row_marked_unreadable(self):
+        self.unread_labels_pr()
+        entries, _errors = sb.decisions_from_notices(self.engine, self.world.clock.now())
+        row = [e for e in entries if e.get("number") == 50]
+        self.assertEqual([e["kind"] for e in row], ["captain"])   # never a plain notice that loses a possible hold
+        self.assertIn("labels could not be read", row[0]["review_evidence"])
+
+    def test_a_pr_with_readable_labels_and_no_hold_stays_a_plain_notice(self):   # the control: the readable-empty case
+        sb.record_pr_notice(self.world.state, "acme/api", 51, "platform", "", self.world.clock.now())
+        self.engine.gh_runner = FakeGhPr({51: (0, pr_view_json(headRefOid="c" * 40, labels=[]), "")})
+        entries, _errors = sb.decisions_from_notices(self.engine, self.world.clock.now())
+        self.assertEqual([e["kind"] for e in entries if e.get("number") == 51], ["notice"])
+
+    def test_escalating_a_notice_whose_labels_are_unreadable_says_so_and_is_not_information_only(self):
+        runner = self.unread_labels_pr()
+        decision = {"id": "pr:api#50", "kind": "notice", "tier": "human", "repo": "acme/api", "number": 50}
+        with self.assertRaises(sb.DecisionReadError) as caught:
+            sb.escalate_notice(self.engine, runner, decision, None, "cos")
+        self.assertIn("labels", str(caught.exception))
+        self.assertNotIn("information only", str(caught.exception))
+
 
 class TestLedgerReadRace(unittest.TestCase):
     """A ledger read that races an append is not a cut-off (#673); a real cut-off or rewrite is still reported."""
