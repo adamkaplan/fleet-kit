@@ -4,7 +4,6 @@ host repository whose pre-receive hook counts the pushes it receives (HOST_URL i
 must fail the no-commit test with the anchored text, its unmutated control passing first."""
 import ast
 import importlib.util
-import json
 import os
 import subprocess
 import sys
