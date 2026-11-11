@@ -1,0 +1,209 @@
+"""Ask #2399: the stall watch (cloud/launcher/stall_watch.py). A fake pod, a fake clock, a recording switchboard. Offline; no cluster."""
+import contextlib
+import datetime as dt
+import io
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import types
+import unittest
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+LAUNCHER = os.path.dirname(HERE)
+sys.path.insert(0, LAUNCHER)
+import stall_watch as sw  # noqa: E402
+
+START = dt.datetime(2026, 11, 11, 12, 0, 0, tzinfo=dt.timezone.utc)
+SOURCE = os.path.join(LAUNCHER, "stall_watch.py")
+TOKEN = "ghp_" + "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8"
+NAME_OK = lambda n: bool(n) and n.replace("-", "").isalnum()  # noqa: E731
+
+
+class FakeKube:
+    """The cluster: annotate writes the pod's annotations (as the real one does), exec answers the probe with the pod's file state at the fake time."""
+    def __init__(self, world):
+        self.world, self.execs = world, []
+
+    def exec(self, name, *cmd, **kw):
+        self.execs.append((name, kw.get("timeout")))
+        pod = self.world.pods[name]
+        if pod["exec_fails"]:
+            raise RuntimeError("kubectl exec failed: secret-pod-text")
+        return json.dumps(pod["probe"](self.world.now)) + "\n"
+
+    def annotate(self, name, uid, **kv):
+        ann = self.world.pods[name]["doc"]["metadata"]["annotations"]
+        for k, v in kv.items():
+            ann["cw/" + k.replace("_", "-")] = str(v)
+
+    def scrub(self, text, limit=300):
+        return str(text).replace(TOKEN, "[redacted]")[:limit]
+
+
+class World:
+    def __init__(self):
+        self.now, self.pods, self.sent, self.err = START, {}, [], ""
+        self.kube = FakeKube(self)
+        self.dir = tempfile.mkdtemp(prefix="stall-")
+        self.launcher = types.SimpleNamespace(kube=self.kube, env={"CW_CLOUD_RECORD_DIR": self.dir})
+        self.send = lambda to, text: self.sent.append((to, text))
+
+    def add(self, name="w1-pod", age_minutes=60, boss="coder-lead", progress_age=1, tail=("working",), runs=(), exits=(), msg="all fine", msg_age=1, exec_fails=False):
+        """progress_age: minutes since the progress file changed. runs: (name, age minutes, last line). exits: (name, code, age minutes)."""
+        def probe(now, n=name):
+            t = lambda minutes: now.timestamp() - minutes * 60  # noqa: E731
+            p = self.pods[n]
+            return {"now": now.timestamp(), "progress": {"mtime": t(p["progress_age"]), "tail": list(p["tail"])},
+                    "runs": [{"name": r[0], "mtime": t(r[1]), "last": r[2]} for r in p["runs"]],
+                    "exits": [{"name": e[0], "code": str(e[1]), "mtime": t(e[2])} for e in p["exits"]], "msg": p["msg"], "msg_time": t(p["msg_age"])}
+        started = (self.now - dt.timedelta(minutes=age_minutes)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        doc = {"metadata": {"name": name, "uid": "u-" + name, "annotations": {"cw/worker": "w1", "cw/started": started}}, "status": {"phase": "Running"}}
+        self.pods[name] = {"doc": doc, "probe": probe, "progress_age": progress_age, "tail": tail, "runs": runs, "exits": exits, "msg": msg, "msg_age": msg_age, "exec_fails": exec_fails}
+        if boss:
+            with open(os.path.join(self.dir, "w1.json"), "w") as f:
+                json.dump({"worker": "w1", "reports_to": boss}, f)
+
+    def run(self, module=sw):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            out = module.watch_pass(self.launcher, [p["doc"] for p in self.pods.values()], self.now, NAME_OK, send=self.send)
+        self.err = err.getvalue()
+        return out
+
+    def at(self, minutes):
+        self.now = START + dt.timedelta(minutes=minutes)
+
+
+def conditions(out):
+    return sorted(c for _, c in out)
+
+
+class Stall(unittest.TestCase):
+    def test_s2_progress_stale_fires_at_16_not_14_and_an_active_run_keeps_it_silent(self):
+        w = World()
+        w.add(progress_age=14, runs=[("build", 14, "x")], exits=[("build", 0, 14)])
+        self.assertEqual(w.run(), [])
+        w = World()
+        w.add(progress_age=16, runs=[("build", 16, "x")], exits=[("build", 0, 16)])
+        self.assertEqual(conditions(w.run()), ["progress-stale"])
+        w = World()
+        w.add(progress_age=16, runs=[("build", 2, "still going")])   # no exit file, log changed 2 minutes ago: active
+        self.assertEqual(w.run(), [])
+
+    def test_s3_refusal_texts_fire_and_a_clean_pod_does_not(self):
+        cases = [dict(msg="Permission denied: shell"), dict(tail=("step 1", "Blocked")), dict(tail=("a", "boom error x", "b", "boom error x", "c", "boom error x", "d")), dict(tail=("step", "blocked"))]
+        for kw in cases:
+            w = World()
+            w.add(**kw)
+            self.assertEqual(conditions(w.run()), ["refusal"], kw)
+        w = World()
+        w.add(msg="all done, pushing", tail=("compiling", "tests passed"))
+        self.assertEqual(w.run(), [])
+
+    def test_s4_failed_run_idle_at_11_not_9_and_not_for_exit_0(self):
+        for idle, code, want in ((9, 2, []), (11, 2, ["failed-run-idle"]), (11, 0, [])):
+            w = World()
+            w.add(progress_age=idle, msg_age=idle, runs=[("t", idle, "FAILED")], exits=[("t", code, idle)])
+            self.assertEqual(conditions(w.run()), want, (idle, code))
+
+    def _s5(self, module):
+        w = World()
+        w.add(progress_age=1, msg="Permission denied: shell")
+        sizes = []
+        for minute in (0, 1, 2, 61):
+            w.at(minute)
+            w.pods["w1-pod"]["progress_age"] = 1 + minute   # the pod's files age with the clock; the refusal text stays
+            w.run(module)
+            sizes.append(len(w.sent))
+            if minute == 2 and sizes[-1] != 2:
+                raise AssertionError("a stall was alerted twice within the hour: %d messages after 3 passes" % sizes[-1])
+        return w, sizes
+
+    def test_s5_one_alert_per_condition_per_hour_to_the_boss_and_the_chief(self):
+        w, sizes = self._s5(sw)
+        self.assertEqual(sizes, [2, 2, 2, 4])   # the boss and the Chief of Staff in pass 1, none in passes 2 and 3, both again at 61 minutes
+        self.assertEqual(sorted({to for to, _ in w.sent}), ["chief-of-staff", "coder-lead"])
+        self.assertEqual(w.pods["w1-pod"]["doc"]["metadata"]["annotations"]["cw/stall-alert-refusal"], "2026-11-11T13:01:00Z")
+
+    def test_s9_a_mutant_without_the_mark_fails_with_the_anchored_text_after_its_control_passes(self):
+        self._s5(sw)   # the control: the unmutated module passes
+        with open(SOURCE) as f:
+            text = f.read()
+        old = "                if mark and (last is None or 0 <= (now - last).total_seconds() < REALERT_SECONDS):\n                    continue"
+        self.assertEqual(text.count(old), 1, "the mutation did not apply")
+        mod = types.ModuleType("stall_watch_mutant")
+        exec(compile(text.replace(old, "                if False:\n                    continue"), "mutant", "exec"), mod.__dict__)
+        with self.assertRaises(AssertionError) as caught:
+            self._s5(mod)
+        self.assertIn("a stall was alerted twice within the hour", str(caught.exception))
+
+    def test_s6_the_evidence_hides_a_token_and_is_cut_to_300_characters(self):
+        w = World()
+        w.add(msg="Permission denied: git push https://x:%s@github.com/o/r %s" % (TOKEN, "y" * 500))
+        w.run()
+        self.assertTrue(w.sent)
+        for _, text in w.sent:
+            self.assertNotIn(TOKEN, text)
+            self.assertNotIn(TOKEN[4:], text)
+            self.assertIn("[redacted]", text)
+        self.assertLessEqual(len(sw.evidence("z " * 400)), 300)
+        self.assertLessEqual(len(sw.evidence("Permission denied " + "y" * 500)), 300)
+        for secret, piece in (("password=hunter2hunter2", "hunter2hunter2"), ("Bearer abcdefghijklmnop12345", "abcdefghijklmnop12345"),
+                              ("AKIAABCDEFGHIJKLMNOP", "AKIAABCDEFGHIJKLMNOP"), ("sk-abcdefghijklmnopqr", "sk-abcdefghijklmnopqr")):
+            self.assertNotIn(piece, sw.evidence("saw " + secret))
+
+    def test_s7_a_young_pod_and_a_failing_exec_send_nothing_and_leave_one_line_each(self):
+        w = World()
+        w.add("young-pod", age_minutes=9, msg="Permission denied")
+        w.add("broken-pod", exec_fails=True)
+        self.assertEqual(w.run(), [])
+        self.assertEqual(w.sent, [])
+        lines = [l for l in w.err.splitlines() if "stall watch skipped" in l]
+        self.assertEqual(len(lines), 2, w.err)
+        self.assertTrue(any("young-pod" in l for l in lines) and any("broken-pod" in l for l in lines))
+        self.assertNotIn("secret-pod-text", w.err)
+        self.assertEqual([n for n, _ in w.kube.execs], ["broken-pod"], "a young pod is not read")
+
+    def test_s8_twelve_pods_are_read_with_one_exec_each_and_the_pass_line_counts_them(self):
+        w = World()
+        for i in range(12):
+            w.add("pod%d-x" % i, boss=None, msg="Permission denied" if i == 0 else "fine")
+        w.run()
+        self.assertEqual(sorted(n for n, _ in w.kube.execs), sorted("pod%d-x" % i for i in range(12)))
+        self.assertTrue(all(t == sw.EXEC_SECONDS for _, t in w.kube.execs))
+        self.assertEqual(sw.pass_text(w.launcher), " stall read=12 alerted=1")
+
+    def test_the_mark_is_set_before_the_send_and_nothing_else_is_called(self):
+        w = World()
+        order = []
+        w.kube.annotate = lambda name, uid, **kv: order.append("annotate")
+        w.send = lambda to, text: order.append("send")
+        w.add(msg="Permission denied")
+        w.run()
+        self.assertEqual(order[:2], ["annotate", "send"])
+        self.assertEqual(set(order), {"annotate", "send"})   # the fake kube offers exec and annotate only: no stop, delete or nudge is reachable
+
+    def test_the_reaper_pass_calls_it_and_the_pass_line_carries_the_counts(self):
+        with open(os.path.join(LAUNCHER, "cloud_worker.py")) as f:
+            text = f.read()
+        self.assertEqual(text.count("sw.watch_pass(self, live, now, NAME_RE.fullmatch)"), 1)
+        self.assertIn("_stall_watch().pass_text(L)", text)
+        self.assertEqual(sw.pass_text(None), "")
+
+    def test_the_probe_prints_one_json_line_on_a_machine_without_a_server(self):
+        d = tempfile.mkdtemp(prefix="stall-probe-")
+        env = dict(os.environ, CW_RUNS_DIR=d, CW_ACTIVITY_PORT="1", CW_ACTIVITY_PASSWORD_FILE=os.path.join(d, "none"))
+        with open(os.path.join(d, "a.log"), "w") as f:
+            f.write("one\ntwo\n")
+        with open(os.path.join(d, "a.exit"), "w") as f:
+            f.write("3\n")
+        done = subprocess.run([sys.executable, "-c", sw.PROBE_CODE], capture_output=True, text=True, env=env, timeout=20)
+        data = json.loads(done.stdout.strip().splitlines()[-1])
+        self.assertEqual(data["runs"][0]["last"], "two")
+        self.assertEqual(data["exits"][0]["code"], "3")
+
+
+if __name__ == "__main__":
+    unittest.main()

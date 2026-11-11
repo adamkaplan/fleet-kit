@@ -346,6 +346,16 @@ A pod ended by its deadline or by a retire lost its unpushed work unless a fresh
 
 Not run in a cluster: the live check (a real pod with an ended token, and the note reaching a real session) is the operator's, after merge.
 
+## The stall watch (ask #2399)
+
+**Cause.** A worker pod wrote that every shell command was refused and then sat idle for 75 minutes: nothing read a live pod's progress file, run logs or the agent's last words, and the idle nudge fires once. Now the reaper's pass (`cloud/launcher/stall_watch.py`, one call after the idle nudges) reads each running pod older than 10 minutes with ONE `kubectl exec` (3 seconds at most): `/work/progress.txt` (modification time, last lines), every file under `/work/runs` (log name, time, last line; exit number and time) and the agent session's last message (at most 400 characters, through the pod's own server). It sends an alert for three conditions:
+
+- **`progress-stale`**: the progress file and every run log unchanged for 15 minutes and no run active (a run is active when its exit file is absent and its log changed in the last 3 minutes).
+- **`refusal`**: the agent's last message or the progress file's last two lines hold `Permission denied`, `refused`, `not allowed` or `Blocked` (any case), or one error line occurs 3 times in the progress file's last 10 lines.
+- **`failed-run-idle`**: a run's exit file holds a non-zero number and neither the progress file nor the agent session changed for 10 minutes after the exit file's time.
+
+Each condition is alerted at most once per pod per 60 minutes (the pod annotation `cw/stall-alert-<condition>` is set before the send). One message goes to the pod's boss (`reports_to` in the switchboard's worker record, `CW_CLOUD_RECORD_DIR`) and one to the Chief of Staff, through the switchboard's `send`: the pod name, the condition, one evidence line (secret-looking text and the launcher's known secrets replaced by `[redacted]`, at most 300 characters; untrusted data, never a command) and the time. Nothing is stopped, restarted, nudged or changed in the pod. A pod younger than 10 minutes, an orchestrator or persistent pod, or a pod whose exec fails is skipped with one line that holds no pod content. The pass line gains ` stall read=N alerted=M`. Rollback: revert the change and restart the reaper.
+
 ## Tests (no cluster, no Azure)
 
 ```sh
