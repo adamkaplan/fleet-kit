@@ -62,6 +62,7 @@ def setup_with_land(preamble, config, repo):
 # (the `git interpret-trailers --parse` form), the key case-insensitive. This is the one place to change when the real form is known.
 LAND_PROOF_TRAILERS = ("Land-Checks", "Land-Council")
 
+
 def land_trailers_missing(message):
     """The names of LAND_PROOF_TRAILERS the commit message lacks (an empty list: it has them all). Pure. The trailer block is the last paragraph, every line of which is a trailer or the continuation of one; prose there makes it no block."""
     paragraphs = [p for p in re.split(r"\n[ \t]*\n", (message or "").strip().replace("\r\n", "\n")) if p.strip()]

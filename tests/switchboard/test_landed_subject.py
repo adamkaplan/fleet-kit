@@ -40,6 +40,7 @@ def build(LedgerBase):
             self.base_route = self.route
             self.route = self.land_route
             self.reads = []
+            self.branch = "main"
             self.failing = {}      # a path fragment -> the stderr of a failing read
 
         def land_route(self, argv, **kwargs):
@@ -51,7 +52,7 @@ def build(LedgerBase):
                         return subprocess.CompletedProcess(argv, 1, "", text)
                 sha = path.rsplit("/", 1)[-1].split("...")[-1]
                 if path.endswith("repos/acme/land"):
-                    return subprocess.CompletedProcess(argv, 0, json.dumps({"default_branch": "main"}), "")
+                    return subprocess.CompletedProcess(argv, 0, json.dumps({"default_branch": self.branch}), "")
                 if "/compare/" in path and sha in ON_BRANCH:
                     return subprocess.CompletedProcess(argv, 0, json.dumps({"status": ON_BRANCH[sha]}), "")
                 if "/commits/" in path and sha in MESSAGES:
@@ -159,6 +160,46 @@ def build(LedgerBase):
             self.assertIsNone(sb.landed_ref("acme/land@" + SHA.upper()[:-1]))
             self.assertIsNone(sb.landed_ref("../land@" + SHA))
 
+        def test_S3_a_malformed_landed_reference_is_refused_with_its_form(self):
+            code, out, err = self.prove_at("acme/land@" + SHA[:7])
+            self.assertNotEqual(code, 0)
+            self.assertIn("a landed subject is", err)
+            self.assertEqual((self.ledger(), self.reads), ([], []))
+
+        def test_S3_an_excluded_repository_is_refused_before_any_read(self):
+            self.extra_config = dict(self.extra_config, excluded_repos=["acme/land"])
+            self.configure()
+            for run in (self.prove_at, self.verdict_at):
+                code, out, err = run(self.landed())
+                self.assertNotEqual(code, 0)
+                self.assertIn("excluded", err)
+            self.assertEqual((self.ledger(), self.reads), ([], []))
+
+        def test_S2_the_default_branch_name_is_quoted_in_the_compare(self):
+            self.branch = "rel/1"
+            self.assertEqual(self.prove_at(self.landed())[0], 0)
+            self.assertIn("repos/acme/land/compare/rel%2F1..." + SHA, self.reads)
+
+        def test_S2_a_landed_commit_whose_scenarios_are_all_proven_and_judged_reads_ready(self):
+            ref = self.landed()
+            code, out, err = self.run_as("coder", "gates", ref, "--json", *self.PLAN)
+            self.assertEqual(code, 1, "ready is false while a scenario is open")
+            self.all_proven_at(ref)
+            code, out, err = self.run_as("coder", "gates", ref, "--json", *self.PLAN)
+            report = json.loads(out)
+            self.assertEqual(code, 0, out)
+            self.assertTrue(report["ready"])
+            rows = {r["gate"]: r["status"] for r in report["gates"]}
+            self.assertEqual(rows["G1"], "ok")
+            self.assertTrue(all(status in ("ok", "n/a", "untracked") for status in rows.values()))
+
+        def all_proven_at(self, ref):
+            for sid in ("S1", "S2", "S3", "U1"):
+                self.assertEqual(self.prove_at(ref, sid)[0], 0)
+            for who, sid, ev in (("cibot", "S1", "ci"), ("tst", "S2", "tester"), ("rev", "S3", "reviewer"), ("cibot", "U1", "ci")):
+                code, out, err = self.verdict_at(ref, who, sid, ev)
+                self.assertEqual(code, 0, (who, sid, err))
+
         def test_S3_a_repository_that_is_not_on_the_land_path_is_refused_naming_it(self):
             code, out, err = self.prove_at(self.landed(SHA, "acme/app"))
             self.assertNotEqual(code, 0)
@@ -188,11 +229,13 @@ def build(LedgerBase):
 
         def test_S5_control_with_the_landed_path_off_today_s_code_refuses_the_sha_subject(self):
             ref = self.landed()
-            with mock.patch.object(sb, "landed_ref", lambda text: None):   # the code as it was: a subject is a pull request or nothing
+            original = sb._ledger_context
+            with mock.patch.object(sb, "_ledger_context", lambda *a, **k: original(*a, **dict(k, landed=False))):   # the commands as they were: a subject is a pull request or nothing
                 for run in (lambda: self.prove_at(ref), lambda: self.run_as("coder", "gates", ref, *self.PLAN)):
                     code, out, err = run()
                     self.assertNotEqual(code, 0)
                     self.assertIn(ref, err)   # the refusal names the subject it would not take
+                    self.assertIn("not a pull request", err)   # the old reader's words (parse_pr_ref), not the landed path's own
             self.assertEqual((self.ledger(), [r for r in self.reads if "/commits/" in r]), ([], []))
             self.assertEqual(self.prove_at(ref)[0], 0, "the same call with the landed path records")
             self.assertEqual(len(self.ledger()), 1)

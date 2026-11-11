@@ -15238,6 +15238,10 @@ def landed_check(engine, config, runner, repo, sha):
     ref = "%s@%s" % (repo, sha)
     if not is_land_repo(config, repo):
         raise LedgerCommandError("refused: %s is not a land repository (`land_repos`): its subject is a pull request, nothing was recorded" % repo)
+    try:
+        refuse_excluded(config, repo)   # an excluded repository is read by nobody, a landed commit included
+    except RepoExcluded as err:
+        raise LedgerCommandError("refused: %s, nothing was recorded" % err) from None
     get = impact_carry_get(engine, runner, repo)
     absent = False
     try:
