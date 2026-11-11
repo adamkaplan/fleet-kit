@@ -841,7 +841,7 @@ class TestUnreadableLabelsAreNotNotHeld(Base):
     def unread_labels_pr(self, number=50):
         """A noticed pull request whose `gh pr view` answer has no readable `labels` (captain None), through the real readers."""
         sb.record_pr_notice(self.world.state, "acme/api", number, "platform", "", self.world.clock.now())
-        self.engine.gh_runner = FakeGhPr({number: (0, pr_view_json(headRefOid="c" * 40, body="MERGE: captain\nx"), "")})
+        self.engine.gh_runner = FakeGhPr({number: (0, json.dumps({k: v for k, v in json.loads(pr_view_json(headRefOid="c" * 40, body="MERGE: captain\nx")).items() if k != "labels"}), "")})
         return self.engine.gh_runner
 
     def test_unreadable_labels_keep_the_notice_a_captain_row_marked_unreadable(self):
