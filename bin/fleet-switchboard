@@ -10216,6 +10216,7 @@ class Watch:
         self.polling, self.poll_reason, self.next_poll, self.last_poll = False, None, 0.0, None
         # the cli webhook this forwarder made: ids of the forwarder hooks that existed when it started (None: unknown), the id it made (None: not known, so none is removed), the note `status` shows
         self.hooks_before, self.hook_id, self.hook_claim_tried, self.hook_note = None, None, False, None
+        self.conflicted = False   # someone else's forwarder held the hook at the last conflict, until a child of ours has run past the connect delay
 
     @property
     def mode(self):
@@ -11677,6 +11678,7 @@ class GitHubHub:
                 with self.lock:  # the forwarder connected: the repo is no longer polled; one read closes the gap
                     watch.polling, watch.poll_reason, watch.catchup_at = False, None, now
         if watch.proc is not None and watch.proc.poll() is None and not watch.hook_claim_tried and now - (watch.started or now) >= self.catchup_delay:
+            watch.conflicted = False   # it runs past the connect delay: no one else holds the hook
             self._claim_hook(watch)   # the forwarder has connected: its hook exists
         if watch.proc is None and now >= watch.next_start:
             self._start(watch, now)
@@ -11762,7 +11764,7 @@ class GitHubHub:
         of them are stale (a forwarder of another daemon on the same repo cannot be told apart: its hook looks the same; one daemon per repo is the supported setup, and
         the other forwarder, when it drops, finds that out through its own start). Never raises; a failure is the note and one audit line."""
         watch.hooks_before, watch.hook_id, watch.hook_claim_tried = None, None, False
-        if watch.state == "conflict":
+        if watch.state == "conflict" or watch.conflicted:
             return   # someone else forwards, by intent: its hook looks like a stale one, so a retry after a conflict removes nothing
         found = {}
         try:
@@ -11849,6 +11851,7 @@ class GitHubHub:
             watch.down_since = now
         if CONFLICT_TEXT in tail:
             with self.lock:
+                watch.conflicted = True
                 watch.state, watch.next_start = "conflict", now + self.conflict_retry
                 watch.last_error = "someone else is already forwarding %s (%s); catch-up reads continue" % (
                     watch.repo, CONFLICT_TEXT)

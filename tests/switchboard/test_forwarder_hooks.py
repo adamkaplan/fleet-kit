@@ -260,3 +260,15 @@ class TestForwarderHooks(Base):
         runner.calls.clear()
         hub.stop()   # no time passed: a hook seen now could be anyone's
         self.assertEqual(runner.deleted(), [])
+
+    def test_a_conflict_is_remembered_over_a_failed_retry(self):
+        runner = HooksRunner(self.stale_world())
+        hub = self.build(runner)
+        watch = hub.watches[REPO]
+        watch.state, watch.conflicted = "backoff", True   # a conflict, then a retry that failed for another reason
+        hub.tick()
+        self.assertEqual(runner.deleted(), [])
+        hub.tick()
+        self.at[0] += sb.GITHUB_CATCHUP_DELAY + 1
+        hub.tick()   # our child ran past the connect delay: nobody else holds the hook
+        self.assertFalse(watch.conflicted)
