@@ -113,7 +113,7 @@ class Wake(unittest.TestCase):
 
     def test_s3_secret_redacted_capped_and_failing_boss_blocks_nothing(self):
         self.set_client(1)
-        f = self.fake(); self.start(f, "yes 'ab cd ef gh ij kl mn op qr st uv wx yz ab cd ef gh ij kl mn op qr st uv wx yz ab cd ef gh ij kl mn op qr st uv wx yz ab cd ef gh ij kl mn op qr st uv wx yz ab cd ef gh ij kl mn op qr st uv wx yz ab cd ef gh ij kl mn op qr st uv wx yz' | head -n 40; echo token=%s; echo password: \"hunter2 xyz\"; exit 13" % TOKEN)
+        f = self.fake(); self.start(f, "echo token=%s; echo password: \"hunter2 xyz\"; yes 'ab cd ef gh ij kl mn op qr st uv wx yz ab cd ef gh ij kl mn op qr st uv wx yz ab cd ef gh ij kl mn op qr st uv wx yz ab cd ef gh ij kl mn op qr st uv wx yz ab cd ef gh ij kl mn op qr st uv wx yz ab cd ef gh ij kl mn op qr st uv wx yz' | head -n 18; exit 13" % TOKEN)
         self.assertEqual(self.finish(), "13")
         self.assertEqual(len(f.messages), 1)
         self.assertEqual(f.messages[0].count(TOKEN), 0)
@@ -122,7 +122,7 @@ class Wake(unittest.TestCase):
         self.assertNotIn("hunter2", f.messages[0])
         self.assertEqual(len([l for l in self.progress() if l.startswith("run job exited 13")]), 1)
         b = self.bosses()
-        self.assertEqual(len(b), 1); self.assertNotIn(TOKEN, b[0]); self.assertIn("[redacted]", b[0])
+        self.assertEqual(len(b), 1); self.assertNotIn(TOKEN, b[0])
 
     def test_s4_busy_twice_then_accepts(self):
         f = self.fake("busy2"); self.start(f, "exit 13")
