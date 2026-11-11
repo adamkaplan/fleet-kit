@@ -138,11 +138,16 @@ class TestGhShimHookDelete(unittest.TestCase):
         self.assertEqual(load_module().FORWARDER_HOOK_URL, URL)
 
     def test_a_flag_and_its_value_before_api_cannot_skip_the_check(self):
-        for lead in (["--hostname", "github.com"], ["-H", "x:y"], ["--jq", "."], ["--jq", "search"], ["-q", "auth"], ["--hostname", "help"]):
+        for lead in (["--hostname", "github.com"], ["-H", "x:y"], ["--jq", "."], ["--jq", "search"], ["-q", "auth"], ["--hostname", "help"], ["-f", "a=b"], ["-F", "a=b"], ["--field", "a=b"], ["--input", "-"]):
             with self.subTest(lead=lead):
                 done, calls, _ = self.rig.go(lead + delete(), hook_text=hook(name="web"))
                 self.assertEqual(calls, [], "a hook that is not the forwarder's passed")
                 self.assertNotEqual(done.returncode, 0)
+
+    def test_a_repo_flag_before_api_is_still_the_supported_lead(self):
+        done, calls, seen = self.rig.go(["-R", "o/r"] + delete())
+        self.assertEqual(len(calls), 1, done.stderr)
+        self.assertEqual(len(seen), 1, "it was read first")
 
     def test_a_missing_guard_module_refuses_the_delete(self):
         (self.rig.shims / "gh_body.py").unlink()

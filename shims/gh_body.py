@@ -404,14 +404,17 @@ def api_write(probe, args, api_parser):
 
 def guard(args, write, api_parser, gh, env_of, stdin=None):
     """The refusal line for a body write that would drop the Intent or the Done-when of the issue it replaces, else None. Reads never refuse."""
-    if "api" in args and all(a.startswith("-") or (j > 0 and args[j - 1].startswith("-")) for j, a in enumerate(args[:args.index("api")])) and args.index("api") > 0:
-        # a flag and its value before `api` (`gh --hostname h api -X DELETE ...`): the allow-list does not see it as `api`, and the shim's read test may take the value for a
-        # command word (`--jq search api -X DELETE`): so this is decided here, before the read test, and a non-GET is never passed on unread
-        try:
-            if api_parser(args[args.index("api"):]).effective_method != "GET":
+    if "api" in args:
+        at = args.index("api")
+        lead = [a for j, a in enumerate(args[:at]) if not (a in REPO_FLAGS or (j > 0 and args[j - 1] in REPO_FLAGS) or a.startswith("--repo="))]   # a -R/--repo pair is the supported lead (the shim skips it)
+        if lead and all(a.startswith("-") or (j > 0 and lead[j - 1].startswith("-")) for j, a in enumerate(lead)):
+            # a flag and its value before `api` (`gh --hostname h api -X DELETE ...`, `gh -f a=b api ...`): the allow-list does not see it as `api`, and the shim's read test may take
+            # the value for a command word (`--jq search api -X DELETE`). gh hands those flags to `api`, so the method is read from ALL of them; anything but a GET is never passed on
+            try:
+                if api_parser(["api"] + args[:at] + args[at + 1:]).effective_method != "GET":
+                    return UNCLASSIFIED
+            except Exception:
                 return UNCLASSIFIED
-        except Exception:
-            return UNCLASSIFIED
     if not write:
         return None
     probe = Probe(gh, env_of, stdin or sys.stdin)
