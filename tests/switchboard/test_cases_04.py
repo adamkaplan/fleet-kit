@@ -2226,3 +2226,5 @@ class TestUnreadLabelsAreNotAHeldReading(Base):
         state = sb.pr_marker_state(names, "x")
         self.assertEqual((state["captain"], state["findings"]), (True, ["disagree"]))
         self.assertTrue(sb.is_captain({"labels": names, "body": "x"}))
+        one = sb.pr_marker_state(names[:1], "x")   # the control: the one merge label alone does not disagree
+        self.assertEqual((one["captain"], one["findings"]), (True, []))
