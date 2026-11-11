@@ -11,63 +11,24 @@
 # Fail mode: an internal failure of the guard itself stops the command (the wrappers run `guard || exit $?`); an option the parser cannot
 # read is let through (fail open), and the default-branch set degrades to main and master when origin/HEAD is unreadable
 # (so `git push origin trunk` then passes when the default is `trunk` and CW_DEFAULT_BRANCH is not set). Over-refusals: a
-# `gh` first word it does not know is refused (it could be an alias); a refspec with `*` is refused. A pod
+# `gh` first word it does not know is refused (it could be an alias); a glob refspec that matches the default branch is refused. A pod
 # started without a git-token gets no wrappers at all: then the OpenCode deny rules are the only pod-side layer.
 # Env: CW_REAL_GIT (the real git, used to read the current branch), CW_DEFAULT_BRANCH (extra default branch names,
 # space or comma separated). `main` and `master` and the branch origin/HEAD points to are always treated as default.
-# THE git config TABLE (the one place the forms are listed): `#CFG <refused|allowed> | <name> | <example args> | <why>`. The test
-# runs every row through the wrapper, and checks that the README paragraph names exactly these names. A row is a FAMILY member:
-# add the form here, in the code below and in cloud/README.md together.
-#CFG refused | --rename-section | --rename-section old new | writes configuration
-#CFG refused | --remove-section | --remove-section old | writes configuration
-#CFG refused | -e | -e | opens the file to edit
-#CFG refused | --edit | --edit | opens the file to edit
-#CFG refused | --add | --add user.x y | writes configuration
-#CFG refused | --unset | --unset user.x | writes configuration
-#CFG refused | --unset-all | --unset-all user.x | writes configuration
-#CFG refused | --replace-all | --replace-all user.x y | writes configuration
-#CFG refused | --file | --file=/tmp/f user.x | a write to (or read of) another file
-#CFG refused | -f | -f /tmp/f user.x | a write to (or read of) another file
-#CFG refused | --blob | --blob=x user.x | another source of configuration
-#CFG refused | an unknown flag or abbreviation | --uns user.x | git accepts a unique prefix of --unset; any flag not listed as a read or display flag is refused
-#CFG refused | edit | edit | the subcommand form (git 2.46 and later)
-#CFG refused | set | set user.x y | the subcommand form
-#CFG refused | unset | unset user.x | the subcommand form
-#CFG refused | rename-section | rename-section a b | the subcommand form
-#CFG refused | remove-section | remove-section a | the subcommand form
-#CFG refused | a value that looks like an option | core.pager --default=x;touch/tmp/p | everything after the key is a value; a word after the key starting with - is refused, never trusted
-#CFG refused | a value word after a read mode's key | --get-all core.x v | refused although git takes it as a read (--get K REGEX, --get-all K REGEX, --get-regexp P VALREGEX): the key count must match the mode
-#CFG refused | an option after the get or list subcommand | list --show-origin | refused although git takes it as a read (config list --show-origin, config get --all K): options come before the key
-#CFG refused | KEY VALUE | user.x y | the plain write form (any key but the two identity keys below)
-#CFG refused | include.path | include.path /tmp/f | a value that makes git read another file
-#CFG refused | includeIf.<cond>.path | includeIf.gitdir:/a/.path /tmp/f | a value that makes git read another file
-#CFG allowed | user.name | user.name x | identity, needed to commit (exactly this key; user.name.x is not it)
-#CFG allowed | user.email | user.email x@y | identity, needed to commit (exactly this key)
-#CFG allowed | --get | --get user.x | a read, at most one key
-#CFG allowed | --get-all | --get-all user.x | a read
-#CFG allowed | --get-regexp | --get-regexp user | a read
-#CFG allowed | --list | --list | a read
-#CFG allowed | --list --show-origin | --list --show-origin | a read
-# THE git ENVIRONMENT TABLE (the same rule for the variables of the family GIT_CONFIG_*): `#ENVCFG <refused|allowed> | <name> | <form> | <why>`.
-#   Only these pass, an exact allow-list (never a prefix); every other GIT_CONFIG_* set and not empty is refused with the one line.
-#ENVCFG allowed | GIT_CONFIG_NOSYSTEM | 1 | only the value 1
-#ENVCFG allowed | GIT_CONFIG_SYSTEM | /dev/null | only this value, never a path a program wrote
-#ENVCFG allowed | GIT_CONFIG_GLOBAL | /dev/null | only this value, never a path a program wrote
-#ENVCFG allowed | GIT_CONFIG_COUNT | 1 to 16 | a whole number; KEY_n and VALUE_n for n below it; a KEY_n beyond it is refused
-#ENVCFG allowed | user.name | any printable value on one line | identity (the key is compared in lower case)
-#ENVCFG allowed | user.email | any printable value on one line | identity
-#ENVCFG allowed | core.excludesFile | /etc/gitignore | only this value
-#ENVCFG allowed | maintenance.auto | false | only this value
-#ENVCFG allowed | gc.auto | 0 | only this value
-#ENVCFG allowed | credential.helper | an empty value | only empty (it clears a helper)
-#ENVCFG allowed | url.<base>.insteadOf | https://github.com/ | only for a base that is an absolute local path or a file:// URL of one (no .. segment), and only this value
-#ENVCFG allowed | http.<url>.extraHeader | X-Test: 1 | only scoped to http(s)://127.0.0.1 or localhost (port and path optional, no user information)
-#ENVCFG refused | GIT_CONFIG_PARAMETERS | x | carries any setting
-#ENVCFG refused | GIT_CONFIG_GLOBAL or GIT_CONFIG_SYSTEM of any other value | /tmp/x | a config file a program wrote
-#ENVCFG refused | GIT_CONFIG_COUNT outside 1 to 16 | 17 | not a whole number from 1 to 16
-#ENVCFG refused | a key outside the list | core.hooksPath | runs a program (also core.sshCommand, core.fsmonitor, core.pager, include.*, alias.*, push.default, any other credential.*, any other http.* and the unscoped http.extraHeader)
-#ENVCFG refused | credential.helper with a value | store | a helper runs a program
-#ENVCFG refused | a missing or empty KEY_n, or a KEY_n beyond the count | GIT_CONFIG_KEY_3 | git ignores or misreads it
+# THE git PUSH TABLE (the one place the forms are listed): `#PUSH <refused|allowed> | <form> | <example args> | <why>`. The test runs every
+# row through the wrapper, and checks that the README paragraph names exactly these forms. The wrapper's git part is this ONE rule: a
+# `git push` to a NETWORK remote (https, http, ssh, git, scp-like; a named remote is read with `git remote get-url --push`) whose destination
+# is the default branch. Every other git command, and every push to a local path or file:// remote or of another branch, passes unchecked.
+#PUSH refused | a refspec naming the default branch | origin HEAD:main | the destination is the default branch
+#PUSH refused | a glob refspec that matches the default branch | origin refs/heads/*:refs/heads/* | a glob can reach the default branch
+#PUSH refused | --all, --branches or --mirror | --all origin | every branch goes, the default branch with them
+#PUSH refused | a bare branch word that is the default branch | origin main | the destination is the default branch
+#PUSH refused | no refspec while the current branch is the default branch | origin | the current branch goes
+#PUSH refused | a sha form that is not the exact land form | origin abc1234:refs/heads/main | a short sha, a leading plus, --force or --force-with-lease
+#PUSH refused | the land form without both land trailers | origin SHA:refs/heads/main | no Land-Checks or no Land-Council trailer, one empty, or the text not recorded
+#PUSH allowed | the land form with both land trailers | origin SHA:refs/heads/main | exactly 40 hexadecimal characters, a non-empty Land-Checks and Land-Council, none not recorded
+#PUSH allowed | a push to a local path or file:// remote | --force /tmp/x main | not a network remote
+#PUSH allowed | a push of another branch, forced or not | --force origin feature | not the default branch
 tool=${1:-}; [ $# -gt 0 ] && shift
 tail_msg="the repository's rules are the guard; this wrapper is only a convenience"
 refuse() { echo "refused: $1: $tail_msg" >&2; exit 3; }
@@ -83,168 +44,159 @@ is_default() {   # $1: a branch name, refs/heads/ stripped
   defaults | grep -qxF -- "$b"
 }
 
-bad_cfg() {   # $1: a git config name or name=value: an alias or a push.default override
-  k=$(printf '%s' "$1" | tr 'A-Z' 'a-z')
-  case "$k" in alias.*) refuse "defining a git alias" ;; push.default*) refuse "overriding push.default" ;; esac
+net_remote() {   # $1: a remote name or URL: success when it is a network remote
+  r=$1
+  case "$r" in */*|*:*) w=$("$real_git" ls-remote --get-url "$r" 2>/dev/null) && [ -n "$w" ] && r=$w ;; esac   # a URL or path as written: url.<base>.insteadOf rewrites it
+  case "$r" in
+    https://*|http://*|ssh://*|git://*) return 0 ;;
+    file://*|/*|./*|../*) return 1 ;;
+  esac
+  u=$("$real_git" remote get-url --push --all -- "$r" 2>/dev/null) || u=$r   # not a remote name: a path (or a URL) as written
+  case "$u" in "$r") w=$("$real_git" config --get-all "remote.$r.pushurl" 2>/dev/null); [ -n "$w" ] || w=$("$real_git" ls-remote --get-url "$r" 2>/dev/null); [ -n "$w" ] && u=$w ;; esac   # a remote that only a -c option defines
+  case "$u" in *"
+"*) while IFS= read -r x; do net_remote "$x" && return 0; done <<EOF2
+$u
+EOF2
+    return 1 ;; esac   # several urls: git pushes to each
+  case "$u" in
+    https://*|http://*|ssh://*|git://*) return 0 ;;
+    file://*|/*|./*|../*) return 1 ;;
+    *:*) case "${u%%:*}" in */*) return 1 ;; *) return 0 ;; esac ;;   # scp-like [user@]host:path (a slash before the colon is a path)
+  esac
+  return 1
 }
 
-env_cfg_refuse() { refuse "git configuration from the environment (GIT_CONFIG_*)"; }
-env_cfg_text() {   # $1: a value: printable characters, one line, not empty
-  case "$1" in "") env_cfg_refuse ;; *"
-"*) env_cfg_refuse ;; esac
-  printf '%s' "$1" | LC_ALL=C grep -q '[^ -~]' && env_cfg_refuse
-  return 0
-}
-env_cfg_local() {   # $1: an absolute local path (letters, digits, dot, underscore, dash, slash; no .. segment) or a file:// URL of one
-  p=${1#file://}
-  printf '%s' "$p" | grep -Eq '^/[A-Za-z0-9._/-]*$' || env_cfg_refuse
-  case "$p/" in */../*) env_cfg_refuse ;; esac
-  return 0
-}
-env_cfg_pair() {   # $1: a key, $2: its value: only the listed settings pass (the key is compared in lower case; a URL part keeps its case)
-  case "$1" in *"
-"*) env_cfg_refuse ;; esac   # grep judges one line at a time: a key of two lines is refused
-  lk=$(printf '%s' "$1" | tr 'A-Z' 'a-z')
-  case "$lk" in
-    user.email|user.name) env_cfg_text "$2" ;;
-    core.excludesfile) [ "$2" = /etc/gitignore ] || env_cfg_refuse ;;
-    maintenance.auto) [ "$2" = false ] || env_cfg_refuse ;;
-    gc.auto) [ "$2" = 0 ] || env_cfg_refuse ;;
-    credential.helper) [ -z "$2" ] || env_cfg_refuse ;;
-    url.?*.insteadof)
-      b=${1#????}; b=${b%??????????}
-      env_cfg_local "$b"; [ "$2" = https://github.com/ ] || env_cfg_refuse ;;
-    http.?*.extraheader)
-      b=${1#?????}; b=${b%????????????}
-      printf '%s' "$b" | grep -Eq '^https?://(127\.0\.0\.1|localhost)(:[0-9]+)?(/[A-Za-z0-9._~%/-]*)?$' || env_cfg_refuse
-      env_cfg_text "$2" ;;
-    *) env_cfg_refuse ;;
-  esac
-}
-# env_cfg: see the #ENVCFG rows; only the listed settings pass, any other GIT_CONFIG_* set and not empty is refused
-env_cfg() {   # git's environment configuration is the environment form of the two -c refusals: any of it set and not empty is refused
-  [ -n "${GIT_CONFIG_PARAMETERS:-}" ] && env_cfg_refuse
-  case "${GIT_CONFIG_NOSYSTEM:-}" in ""|1) ;; *) env_cfg_refuse ;; esac
-  case "${GIT_CONFIG_GLOBAL:-}" in ""|/dev/null) ;; *) env_cfg_refuse ;; esac
-  case "${GIT_CONFIG_SYSTEM:-}" in ""|/dev/null) ;; *) env_cfg_refuse ;; esac
-  cnt=${GIT_CONFIG_COUNT:-}
-  case "$cnt" in ""|[1-9]|1[0-6]) ;; *) env_cfg_refuse ;; esac
-  keys=$(env | grep '^GIT_CONFIG_KEY_[A-Za-z0-9_]*=.')
-  if [ -n "$keys" ]; then
-    [ -n "$cnt" ] || env_cfg_refuse
-    while IFS= read -r kl; do
-      kn=${kl%%=*}; kn=${kn#GIT_CONFIG_KEY_}
-      case "$kn" in [1-9]|1[0-5]|0) [ "$kn" -lt "$cnt" ] || env_cfg_refuse ;; *) env_cfg_refuse ;; esac
+land_record() {   # $1: the sha, the exact commit: both land trailers present, non-empty, none "not recorded"
+  [ "$("$real_git" rev-parse --verify --quiet "$1^{commit}" 2>/dev/null)" = "$1" ] || return 1
+  tr_out=$("$real_git" log -1 --format=%B "$1" 2>/dev/null | "$real_git" interpret-trailers --parse 2>/dev/null) || return 1
+  for t in Land-Checks Land-Council; do
+    vals=$(printf '%s\n' "$tr_out" | sed -n "s/^$t:[[:space:]]*//p" | sed 's/[[:space:]]*$//')
+    [ -n "$(printf '%s\n' "$tr_out" | grep "^$t:")" ] || return 1
+    [ -z "$(printf '%s\n' "$tr_out" | grep -E "^$t:[[:space:]]*$")" ] || return 1   # a duplicate that is empty (the line above drops a trailing empty value)
+    while IFS= read -r v; do
+      [ -n "$v" ] || return 1
+      [ "$(printf '%s' "$v" | tr 'A-Z' 'a-z')" = "not recorded" ] && return 1
     done <<EOF
-$keys
+$vals
 EOF
-  fi
-  i=0
-  while [ -n "$cnt" ] && [ "$i" -lt "$cnt" ]; do
-    eval "ek=\${GIT_CONFIG_KEY_$i:-}; ev=\${GIT_CONFIG_VALUE_$i:-}"
-    [ -n "$ek" ] || env_cfg_refuse
-    env_cfg_pair "$ek" "$ev"
-    i=$((i + 1))
   done
   return 0
 }
 
+cfg_add() {   # git -c <key>=<value>: the guard's own config reads see it too (a remote or url rewrite given on the command line)
+  case "$1" in *=*) k=${1%%=*}; v=${1#*=} ;; *) k=$1; v=true ;; esac
+  n=${GIT_CONFIG_COUNT:-0}
+  export "GIT_CONFIG_KEY_$n=$k" "GIT_CONFIG_VALUE_$n=$v" "GIT_CONFIG_COUNT=$((n + 1))"
+}
+cfg_env() {   # git --config-env=<key>=<ENVVAR>
+  case "$1" in *=*) cfg_add "${1%%=*}=$(printenv -- "${1#*=}" 2>/dev/null)" ;; esac
+}
+
 do_git() {
-  env_cfg
-  # skip git's own options before the subcommand
+  # skip git's own options before the subcommand; -C is followed (the guard changes its own directory), --git-dir is exported
   while [ $# -gt 0 ]; do
     case "$1" in
-      -c|--config-env) bad_cfg "${2:-}"; shift 2 || return 0 ;;
-      --config-env=*) bad_cfg "${1#--config-env=}"; shift ;;
-      -C|--git-dir|--work-tree|--namespace|--exec-path) shift 2 || return 0 ;;
+      -C) cd "${2:-.}" 2>/dev/null || return 0; shift 2 || return 0 ;;
+      --git-dir) GIT_DIR=${2:-}; export GIT_DIR; shift 2 || return 0 ;;
+      --git-dir=*) GIT_DIR=${1#--git-dir=}; export GIT_DIR; shift ;;
+      -c) cfg_add "${2:-}"; shift 2 || return 0 ;;
+      --config-env) cfg_env "${2:-}"; shift 2 || return 0 ;;
+      --config-env=*) cfg_env "${1#--config-env=}"; shift ;;
+      --attr-source|--super-prefix) shift 2 || return 0 ;;
+      -c|--config-env|--work-tree|--namespace|--exec-path) shift 2 || return 0 ;;
       -*) shift ;;
       *) break ;;
     esac
   done
-  if [ "${1:-}" = config ]; then
-    # PARSED LIKE GIT (2.46 and later): the options are only the words BEFORE the first word that is not an option; everything
-    # after it is a positional (a value), whatever it starts with. DEFAULT DENY: a command passes only as a read (exactly one
-    # read mode, or none, then the key words, the count matching that mode) or as the identity write; a word after the key that
-    # starts with '-' is refused (an older git would read it as an option, a newer one as a value: either way it is not a read).
-    shift; mode=""; pos=0; ok=1; wr=0; key=""; seen=0; skip=0
-    for a in "$@"; do
-      if [ "$skip" = 1 ]; then skip=0; continue; fi   # the value of --type or --default (before the key)
-      if [ "$seen" = 1 ]; then
-        case "$a" in -*) ok=0 ;; esac
-        pos=$((pos + 1)); continue
-      fi
-      case "$a" in
-        --rename-section|--remove-section|-e|--edit|--add|--unset|--unset-all|--replace-all) wr=1 ;;
-        --get|--get-all|--get-regexp|--get-urlmatch|--list|-l|--get-color|--get-colorbool) if [ -z "$mode" ]; then mode=$a; else ok=0; fi ;;
-        --global|--local|--system|--worktree|--show-origin|--show-scope|--name-only|-z|--includes|--no-includes) ;;
-        --file|--file=*|-f|--blob|--blob=*) wr=1 ;;
-        --type|--default) skip=1 ;;
-        --type=*|--bool|--int|--bool-or-int|--path|--expiry-date|--no-type|--null|--default=*|--fixed-value) ;;   # read modifiers, before the key only
-        -*) wr=1 ;;   # any other flag: git takes a unique prefix of a long option (--uns is --unset), so it is refused
-        *) seen=1; pos=1
-           key=$(printf '%s' "$a" | tr 'A-Z' 'a-z')
-           case "$key" in
-             edit|set|unset|rename-section|remove-section) wr=1 ;;   # the subcommand forms
-             get|list) if [ -z "$mode" ]; then mode=$key; pos=0; seen=1; fi ;;   # the read subcommands: as --get, --list
-           esac ;;
-      esac
-    done
-    n_ok=0
-    case "$mode" in
-      --get|--get-all|--get-regexp|get) [ "$pos" = 1 ] && n_ok=1 ;;
-      --list|-l|list) [ "$pos" = 0 ] && n_ok=1 ;;
-      --get-urlmatch|--get-color|--get-colorbool) [ "$pos" -ge 1 ] && [ "$pos" -le 2 ] && n_ok=1 ;;
-      "") if [ "$pos" = 1 ]; then n_ok=1; elif [ "$pos" = 2 ]; then case "$key" in user.name|user.email) n_ok=1 ;; esac; fi ;;
-    esac
-    [ "$wr" = 0 ] && [ "$ok" = 1 ] && [ "$n_ok" = 1 ] && return 0
-    set -- config "$@"
-    for a in "$@"; do bad_cfg "$a"; done
-    refuse "changing git configuration"
-  fi
   [ "${1:-}" = push ] || return 0
   shift
-  n=0; cur=""
-  for a in "$@"; do
-    case "$a" in
-      --force|--force-with-lease|--force-with-lease=*|--force-if-includes|--mirror) refuse "force-pushing" ;;
-      --all|--branches) refuse "pushing to the default branch" ;;
-      --*) ;;
-      -*[!a-zA-Z]*) ;;
-      -*f*) refuse "force-pushing" ;;
-    esac
-  done
-  skip=0
+  set -f   # no pathname expansion of the unquoted words below
+  forced=0; wide=0; remote=""; repoopt=""; specs=""; skip=0; rnext=0; first=""; eopt=0
   for a in "$@"; do
     if [ "$skip" = 1 ]; then skip=0; continue; fi
-    case "$a" in
-      --repo) skip=1; n=$((n + 1)); continue ;;   # the remote is given by the option
-      --repo=*) n=$((n + 1)); continue ;;
-      -o|--push-option|--receive-pack|--exec) skip=1; continue ;;
-      -[!-]*o) skip=1; continue ;;   # a short cluster ending in o: the next word is its value
-      --push-option=*|--receive-pack=*|--exec=*) continue ;;
-      -*) continue ;;
-    esac
-    n=$((n + 1))
-    [ "$n" -eq 1 ] && continue   # the remote
-    case "$a" in *\**) refuse "pushing by a glob refspec" ;; esac
-    case "$a" in +*) refuse "force-pushing" ;; esac
-    case "$a" in
-      *:*) dst=${a#*:} ;;
-      *) dst=$a ;;
-    esac
-    dst=${dst#refs/heads/}
-    if [ "$dst" = HEAD ]; then
-      cur=$("$real_git" symbolic-ref --quiet --short HEAD 2>/dev/null || true)
-      [ -n "$cur" ] && is_default "$cur" && refuse "pushing to the default branch"
+    if [ "$rnext" = 1 ]; then rnext=0; repoopt=$a; continue; fi
+    if [ "$eopt" = 1 ]; then   # after `--` every word is a repository or a refspec, even one that starts with a dash
+      [ -z "$first" ] && first=$a
+      specs="$specs
+$a"
       continue
     fi
-    is_default "$dst" && refuse "pushing to the default branch"
+    case "$a" in
+      --) eopt=1; continue ;;
+      --repo) rnext=1; continue ;;
+      --repo=*) repoopt=${a#--repo=}; continue ;;
+      -o|--push-option|--receive-pack|--exec|--recurse-submodules) skip=1; continue ;;
+      --push-option=*|--receive-pack=*|--exec=*) continue ;;
+      --force|--force-with-lease|--force-with-lease=*|--force-if-includes) forced=1; continue ;;
+      --all|--branches|--mirror) wide=1; continue ;;
+      --?*)   # git takes any unambiguous prefix of a long option (--recurse x, --exe x, --rep=U, --al, --force-w)
+        n=${a#--}; eq=0; val=""
+        case "$n" in *=*) eq=1; val=${n#*=}; n=${n%%=*} ;; esac
+        case "$n" in force*) forced=1 ;; esac
+        for w in all mirror branches; do case "$w" in "$n"*) wide=1 ;; esac; done
+        case "repo" in "$n"*) if [ "$eq" = 1 ]; then repoopt=$val; else rnext=1; fi; continue ;; esac
+        if [ "$eq" = 0 ]; then for w in receive-pack exec push-option recurse-submodules; do case "$w" in "$n"*) skip=1 ;; esac; done; fi
+        continue ;;
+      --*) continue ;;
+      -[!-]*)   # a short cluster read letter by letter: f forces; o takes the rest of the cluster, or the next word, as its value
+        rest=${a#-}
+        while [ -n "$rest" ]; do l=${rest%"${rest#?}"}; rest=${rest#?}; case "$l" in f) forced=1 ;; o) [ -z "$rest" ] && skip=1; break ;; esac; done
+        continue ;;
+      -[!-]*) case "$a" in *f*) forced=1 ;; esac; case "$a" in *o) skip=1 ;; esac; continue ;;   # a short cluster; ending in o: the next word is its value
+    esac
+    if [ -z "$first" ]; then first=$a; fi
+    specs="$specs
+$a"
   done
-  if [ "$n" -lt 2 ]; then   # `git push` or `git push <remote>`: the current branch goes
-    cur=$("$real_git" symbolic-ref --quiet --short HEAD 2>/dev/null || true)
-    [ -n "$cur" ] && is_default "$cur" && refuse "pushing to the default branch"
+  cur=$("$real_git" symbolic-ref --quiet --short HEAD 2>/dev/null || true)
+  # git takes the first positional word as the repository, whatever --repo says: with --repo the guard judges both words as remotes and
+  # every positional word as a refspec; without a repository word the branch's remote (else origin) is the remote
+  if [ -n "$repoopt" ]; then
+    net_remote "$repoopt" || { [ -n "$first" ] && net_remote "$first"; } || return 0
+  else
+    if [ -n "$first" ]; then
+      remote=$first
+      specs=${specs#"
+$first"}
+    else
+      remote=$("$real_git" config --get "branch.$cur.pushRemote" 2>/dev/null || "$real_git" config --get "branch.$cur.remote" 2>/dev/null || echo origin)
+    fi
+    net_remote "$remote" || return 0
   fi
-  return 0
+  hit=0; land=""; cnt=0
+  [ "$wide" = 1 ] && hit=1
+  while IFS= read -r a; do
+    [ -n "$a" ] || continue
+    cnt=$((cnt + 1))
+    plus=0; case "$a" in +*) plus=1; a=${a#+} ;; esac
+    case "$a" in *:*) dst=${a#*:}; src=${a%%:*} ;; *) dst=$a; src=$a ;; esac
+    [ "$a" = : ] && hit=1   # the matching push: every branch that exists on both sides
+    rawdst=$dst
+    dst=${dst#refs/}; dst=${dst#heads/}   # git also takes heads/<name> for refs/heads/<name>
+    case "$dst" in
+      *\**|*\?*|*\[*) for d in $(defaults); do case "$d" in $dst) hit=1 ;; esac; case "refs/heads/$d" in $rawdst) hit=1 ;; esac; case "heads/$d" in $rawdst) hit=1 ;; esac; done; continue ;;   # refs/*/main matches the full name
+    esac
+    [ "$dst" = @ ] && dst=HEAD   # @ is HEAD
+    if [ "$dst" = HEAD ]; then
+      [ -n "$cur" ] && is_default "$cur" && hit=1
+      continue
+    fi
+    if is_default "$dst"; then
+      hit=1
+      if [ "$plus" = 0 ] && [ "$a" = "$src:refs/heads/$dst" ]; then land=$src; fi
+    fi
+  done <<EOF
+$specs
+EOF
+  if [ "$cnt" -lt 1 ]; then   # `git push` or `git push <remote>`: the current branch goes
+    [ -n "$cur" ] && is_default "$cur" && hit=1
+  fi
+  [ "$hit" = 1 ] || return 0
+  # the one exception: exactly <40-hex>:refs/heads/<default>, one refspec, no force option, a land record on that commit
+  if [ "$cnt" = 1 ] && [ "$forced" = 0 ] && [ "$wide" = 0 ] && [ -n "$land" ]; then
+    case "$land" in *[!0-9a-f]*) ;; *) [ ${#land} -eq 40 ] && land_record "$land" && return 0 ;; esac
+  fi
+  refuse "pushing to the default branch of a network remote"
 }
 
 api_path() {   # $1: the endpoint as given; prints the path to match: no scheme, host, port, userinfo, query, slashes at the ends

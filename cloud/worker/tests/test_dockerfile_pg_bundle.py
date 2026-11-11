@@ -109,8 +109,8 @@ def problems(t):
     for name, pat in (
         ("bin and lib", r'cp -a /opt/pg/bin /opt/pg/lib "\$l/"'),
         ("the bundle's lib directory", r'l="\$b/usr/lib/postgresql/16"'),
-        ("the bundle root", r"b=/opt/pg-bundle;"),
-        ("the extension directory", r'cp -a [^\n]*vector--\*\.sql[^\n]*pgmq--\*\.sql "\$e/"'),
+        ("the bundle root", r'b="/home/worker/\.cache/\$\{CW_BUNDLE_CACHE_NAME\}";'),
+        ("the extension directory", r'cp -a [^\n]*vector--\*\.sql[^\n]*pgmq--\*\.sql[^\n]*pg_trgm\.control[^\n]*pg_trgm--\*\.sql "\$e/"'),
         ("the extension target", r'e="\$b/usr/share/postgresql/16/extension"'),
         ("the configuration sample", r'cp -a "\$s/postgresql\.conf\.sample" "\$b/usr/share/postgresql/postgresql\.conf\.sample"'),
     ):
@@ -122,8 +122,24 @@ def problems(t):
         out.append("a link line")
     if not re.search(r'chown -R root:root "\$b"', f) or not re.search(r'chmod -R go-w,a\+rX "\$b"', f):
         out.append("the bundle is not root-owned and read-only")
-    if len(re.findall(r"(?m)^ENV PG_BUNDLE=/opt/pg-bundle$", f)) != 1:
-        out.append("ENV PG_BUNDLE must appear once")
+    # ask #2367: the bundle is in the cache directory named by a required build argument; no PG-prefixed variable anywhere
+    if not re.search(r"(?m)^ARG CW_BUNDLE_CACHE_NAME$", f) or not re.search(r'(?m)^RUN test -n "\$CW_BUNDLE_CACHE_NAME"$', f):
+        out.append("the bundle cache name must be a required build argument")
+    if re.search(r"(?m)^ARG CW_BUNDLE_CACHE_NAME=", t):
+        out.append("the bundle cache name has a default")
+    if "PG_BUNDLE" in t or "/opt/pg-bundle" in t:
+        out.append("PG_BUNDLE or /opt/pg-bundle is still named")
+    if not re.search(r'chown worker:worker /home/worker/\.cache(\s|$)', f):
+        out.append("the cache directory is not owned by the run user")
+    for env in re.findall(r"(?m)^ENV\b(?:[^\n]*\\\n)*[^\n]*", t):   # an ENV statement with its continuation lines: no key starts with PG
+        if re.search(r"(?:^ENV|\s)\s*PG\w*[= ]", env.replace("\\\n", " ")):
+            out.append("a PG-prefixed ENV variable")
+    ep = os.path.join(os.path.dirname(DF), "entrypoint.sh")
+    if os.path.exists(ep) and re.search(r"(?m)^\s*export\s+PG\w*", read(ep)):
+        out.append("a PG-prefixed export in the entrypoint")
+    pgb = t[t.find("AS pgbuild"):t.find("FROM worker AS scan")]
+    if not re.search(r"make -C /src/pg/contrib/pg_trgm PG_CONFIG=/opt/pg/bin/pg_config && make -C /src/pg/contrib/pg_trgm PG_CONFIG=/opt/pg/bin/pg_config install", pgb):
+        out.append("pg_trgm is not built from the contrib directory")
     if re.search(r"(?mi)^\s*(CMD|ENTRYPOINT|EXPOSE)\b", f) or starts_server(f):
         out.append("a line starts a server or adds a port")
     users = re.findall(r"(?m)^USER (\S+)$", t)
@@ -155,7 +171,8 @@ class T(unittest.TestCase):
 
     def test_one_env_line_and_user(self):
         t = read(DF)
-        self.assertEqual(len(re.findall(r"(?m)^ENV PG_BUNDLE=/opt/pg-bundle$", final_stage(t))), 1)
+        self.assertEqual(len(re.findall(r"(?m)^ENV\b[^\n]*PG_BUNDLE", t)), 0)
+        self.assertEqual(len(re.findall(r"(?m)^ARG CW_BUNDLE_CACHE_NAME$", final_stage(t))), 1)
         self.assertEqual(re.findall(r"(?m)^USER (\S+)$", t)[-1], "worker")
 
     def test_closure_is_shipped_and_copies_equal(self):
@@ -229,10 +246,11 @@ class T(unittest.TestCase):
         t = read(DF)
         self.assertEqual(problems(t), [])
         for old, new, why in (
-            ("ENV \\\n  PG_BUNDLE=/opt/pg-bundle\n", "", "ENV PG_BUNDLE must appear once"),
+            ("ARG CW_BUNDLE_CACHE_NAME\n", "ARG CW_BUNDLE_CACHE_NAME=dummy\n", "the bundle cache name has a default"),
+            ("ARG CW_BUNDLE_CACHE_NAME\n", "ARG CW_BUNDLE_CACHE_NAME\nENV PG_BUNDLE=/x\n", "a PG-prefixed ENV variable"),
             ("USER worker\n", "USER root\n", None),
             ('cp -a /opt/pg/bin /opt/pg/lib "$l/"', 'ln -s /opt/pg/bin "$l/bin"', None),
-            ("ENV \\\n  PG_BUNDLE=/opt/pg-bundle\n", "ENV \\\n  PG_BUNDLE=/opt/pg-bundle\nRUN apt-get install -y gcc\n", None),
+            (" && chown worker:worker /home/worker/.cache\n", " && chown worker:worker /home/worker/.cache\nRUN apt-get install -y gcc\n", None),
         ):
             if old == "USER worker\n":
                 m = t[: t.rindex(old)] + new

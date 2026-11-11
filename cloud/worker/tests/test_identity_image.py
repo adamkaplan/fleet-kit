@@ -221,11 +221,11 @@ class Identity(unittest.TestCase):
     def guard(self, *args):
         return subprocess.run(["sh", GUARD] + list(args), env={"PATH": "/usr/bin:/bin", "CW_REAL_GIT": "/bin/true"}, capture_output=True, text=True).returncode
 
-    def test_s7_u2_guard_allows_only_the_two_identity_keys(self):
+    def test_s7_u2_guard_lets_every_config_key_through_after_ask_2367(self):
         self.assertEqual(self.guard("git", "config", "user.name", "x"), 0)
         self.assertEqual(self.guard("git", "config", "user.email", "x@example.invalid"), 0)
-        self.assertEqual(self.guard("git", "config", "--" + G, "alias.x", "y"), 3)
-        self.assertEqual(self.guard("git", "config", "push.default", "y"), 3)
+        self.assertEqual(self.guard("git", "config", "--" + G, "alias.x", "y"), 0)
+        self.assertEqual(self.guard("git", "config", "push.default", "y"), 0)
 
     def test_s7_guard_is_unchanged_by_this_change(self):
         digest = hashlib.sha256(open(GUARD, "rb").read()).hexdigest()   # the wrapper's content, not a diff against a branch (ask #1677)

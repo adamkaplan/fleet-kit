@@ -135,6 +135,7 @@ RUN set -eu; git clone --filter=blob:none https://github.com/pgmq/pgmq /src/pgmq
  && cd /src/pgmq && git checkout --detach "${PGMQ_COMMIT}" \
  && test "$(git rev-parse HEAD)" = "${PGMQ_COMMIT}" \
  && cd pgmq-extension && make PG_CONFIG=/opt/pg/bin/pg_config && make PG_CONFIG=/opt/pg/bin/pg_config install
+RUN set -eu; make -C /src/pg/contrib/pg_trgm PG_CONFIG=/opt/pg/bin/pg_config && make -C /src/pg/contrib/pg_trgm PG_CONFIG=/opt/pg/bin/pg_config install
 # ---- end #1353 PostgreSQL build stage ----
 
 # ---- build-time secret scan (the stages below the line "FROM worker AS scan" are reused by cloud/tests/test-cloud) ----
@@ -159,17 +160,20 @@ FROM worker AS final
 COPY --from=scan /scan-ok /usr/local/share/cw/scan-ok
 # #1353: PostgreSQL 16 and the two extensions, installed files only (root-owned, no compiler, nothing starts them): see the pgbuild stage.
 COPY --from=pgbuild /opt/pg /opt/pg
-# ask #2329: /opt/pg-bundle, the Debian-style tree that scripts/dev/ephemeral-pg.sh reads through PG_BUNDLE, built by COPIES (cp -a) of /opt/pg:
+# ask #2329: the bundle, the Debian-style tree that scripts/dev/ephemeral-pg.sh reads (now from the cache directory), built by COPIES (cp -a) of /opt/pg:
 # no download, no build tool, no server started. The relocatable build resolves share beside bin, so /opt/pg/share/postgresql is also
 # copied to usr/lib/postgresql/16/share/postgresql. Root-owned, read-only for others; the run user is unchanged (set again below).
 USER root
-RUN set -eu; b=/opt/pg-bundle; l="$b/usr/lib/postgresql/16"; e="$b/usr/share/postgresql/16/extension"; s=/opt/pg/share/postgresql \
+# ask #2367: the bundle lives in the land tool's bundle cache directory under /home/worker/.cache (the path its bundle script uses when no variable is set),
+# so the image sets no PG* variable. The directory name is a REQUIRED build argument (no default): the operator passes --build-arg CW_BUNDLE_CACHE_NAME=<name>.
+ARG CW_BUNDLE_CACHE_NAME
+RUN test -n "$CW_BUNDLE_CACHE_NAME"
+RUN set -eu; b="/home/worker/.cache/${CW_BUNDLE_CACHE_NAME}"; l="$b/usr/lib/postgresql/16"; e="$b/usr/share/postgresql/16/extension"; s=/opt/pg/share/postgresql \
  && mkdir -p "$l" "$e" \
  && cp -a /opt/pg/bin /opt/pg/lib "$l/" \
  && cp -a /opt/pg/share "$l/share" \
- && cp -a "$s"/extension/vector.control "$s"/extension/vector--*.sql "$s"/extension/pgmq.control "$s"/extension/pgmq--*.sql "$e/" \
+ && cp -a "$s"/extension/vector.control "$s"/extension/vector--*.sql "$s"/extension/pgmq.control "$s"/extension/pgmq--*.sql "$s"/extension/pg_trgm.control "$s"/extension/pg_trgm--*.sql "$e/" \
  && cp -a "$s/postgresql.conf.sample" "$b/usr/share/postgresql/postgresql.conf.sample" \
- && chown -R root:root "$b" && chmod -R go-w,a+rX "$b"
-ENV \
-  PG_BUNDLE=/opt/pg-bundle
+ && chown -R root:root "$b" && chmod -R go-w,a+rX "$b" \
+ && chown worker:worker /home/worker/.cache
 USER worker
