@@ -463,6 +463,7 @@ END_LOG_ENTRIES = 8      # the most run logs posted
 END_POST_CHARS = 40000   # the whole comment
 RUN_JSON_MAX = 1 << 20
 KEY_BEGIN = re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")
+SECRETISH = re.compile(r"sk-|gh[opsu]_|github_pat|AKIA|xox|eyJ|[A-Za-z0-9]{30}")   # as cloud_end_alert's: a name of this shape is not shown
 KEY_END = re.compile(r"-----END [A-Z ]*PRIVATE KEY-----")
 
 
@@ -529,15 +530,22 @@ def run_log_entries(directory, pod):
         info = D["parse_bounded"](raw[:RUN_JSON_MAX].decode("utf-8", "replace")) if len(raw) <= RUN_JSON_MAX else None
         logs = info.get("run_logs") if isinstance(info, dict) else None
         out = []
-        for entry in logs if isinstance(logs, list) else []:
-            tail = entry.get("log_tail") if isinstance(entry, dict) else None
-            if not isinstance(tail, str) or not tail.strip():
-                continue
-            cleaned = _clean_tail(tail)
-            code = entry.get("exit")
-            name = re.sub(r"[^A-Za-z0-9._/-]", "", entry["name"] if isinstance(entry.get("name"), str) else "")[:60] or "unnamed"
+        for entry in (logs if isinstance(logs, list) else [])[:END_LOG_ENTRIES * 4]:   # entries examined are bounded too
+            try:
+                tail = entry.get("log_tail") if isinstance(entry, dict) else None
+                if not isinstance(tail, str) or not tail.strip():
+                    continue
+                cleaned = _clean_tail(tail[-4 * END_LOG_CHARS:])   # the contract says 4000; a longer field is clipped before any work
+                code = entry.get("exit")
+                code = "exit %d" % code if isinstance(code, int) and not isinstance(code, bool) and abs(code) < 10 ** 6 else "still running or no exit file"
+                label = entry["name"] if isinstance(entry.get("name"), str) else ""
+                label = D["redact_command_text"](label)   # the name is untrusted too: redacted, then reduced to one safe token
+                label = os.path.basename(label.replace("\\", "/"))
+                label = label if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,39}", label) and not SECRETISH.search(label) else "unnamed"
+            except Exception:
+                continue   # one bad entry never drops the others
             if cleaned:
-                out.append((name, "exit %d" % code if isinstance(code, int) and not isinstance(code, bool) else "still running or no exit file", cleaned))
+                out.append((label, code, cleaned))
             if len(out) >= END_LOG_ENTRIES:
                 break
         return out

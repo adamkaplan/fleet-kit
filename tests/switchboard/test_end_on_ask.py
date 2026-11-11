@@ -1,4 +1,4 @@
-"""Ask #2393 (S4): a pod's end is posted on its ask: the final message and the last lines of its land log (the run record's `land_log_tail`), scrubbed and cut.
+"""Ask #2393 (S4): a pod's end is posted on its ask: the final message and each run log's tail (the run record's `run_logs`, fleet-cloud's proposed shape), scrubbed and cut.
 Fake pods and a recording comment path (the daemon's own `post_ask_comment`); nothing is stopped and nothing reaches GitHub. The control removes the post (today's end)."""
 import argparse
 import inspect
@@ -84,6 +84,34 @@ class TestEndOnAsk(unittest.TestCase):
         self.assertIn("land.log (still running or no exit file)", body)
         self.assertEqual((body.count("idle.log"), body.count("none.log")), (0, 0))
 
+    def test_a_hostile_name_or_exit_is_neither_shown_nor_trusted(self):
+        logs = [{"name": "ghp_" + "A1b2C3d4E5f6G7h8I9j0" + "@everyone/..", "exit": "0\n```x", "log_tail": "one", "saved": True},
+                {"name": "a`b\nc", "exit": True, "log_tail": "two", "saved": True}, {"name": "ok.log", "exit": 10 ** 7, "log_tail": "three", "saved": True},
+                {"name": "../../etc/passwd", "exit": 3.5, "log_tail": "four", "saved": True}]
+        posts, _ = self.end(run_logs=logs)
+        body = posts[0][1]
+        self.assertNotIn("ghp_", body)
+        self.assertNotIn("@", body)
+        self.assertTrue(all(l == "```" for l in body.split("\n") if l.startswith("```")))
+        self.assertEqual([w for w in ("one", "two", "three", "four") if "\n" + w + "\n" in body + "\n"], ["one", "two", "three", "four"], "one bad entry dropped the others")
+        self.assertIn("[run log ok.log (still running or no exit file)", body)
+        self.assertNotIn("etc/", body)
+        self.assertNotIn("(exit 0", body)
+
+    def test_at_most_the_entry_cap_of_run_logs_is_posted_each_clipped(self):
+        cap = sb.load_module("cloud_worker").bind(sb.__dict__)._retired().END_LOG_ENTRIES
+        logs = [{"name": "r%d.log" % i, "exit": 0, "log_tail": "line\n" * LIMIT, "saved": True} for i in range(cap * 3)]
+        posts, _ = self.end(run_logs=logs)
+        body = posts[0][1]
+        self.assertEqual(body.count("[run log "), cap)
+        self.assertLessEqual(body.count("line"), cap * LIMIT // 5)
+
+    def test_control_the_same_record_without_run_logs_posts_the_message_alone(self):
+        with_logs, _ = self.end(log="land line 1")
+        without, _ = self.end()
+        self.assertEqual(["[run log" in b for _i, b, _r in with_logs], [True])
+        self.assertEqual([("[run log" in b, "my final words" in b) for _i, b, _r in without], [(False, True)])
+
     def test_a_malformed_run_logs_field_posts_the_message_alone(self):
         for bad in ("text", {"a": 1}, 5, [None]):
             posts, _ = self.end(run_logs=bad)
@@ -128,6 +156,7 @@ class TestEndOnAsk(unittest.TestCase):
     def test_a_key_body_whose_first_line_was_clipped_before_the_run_record_is_redacted(self):
         posts, _ = self.end(log="UVJTVFVWV1hZWjAxMjM0NTY3\nQUJDREVGR0hJSktMTU5PUA\n-----END PRIVATE KEY-----\nexit 1")
         self.assertNotIn("QUJDREVGR0hJSktMTU5PUA", posts[0][1])
+        self.assertIn("redacted key body", posts[0][1])
         self.assertIn("exit 1", posts[0][1])
 
     def test_the_pods_endpoint_address_is_removed_from_the_log(self):
@@ -152,7 +181,7 @@ class TestEndOnAsk(unittest.TestCase):
         body = posts[0][1]
         self.assertNotIn("@", body)
         self.assertTrue(all(l == "```" for l in body.split("\n") if l.startswith("```")))   # the log's own ``` cannot end a fence
-        self.assertLess(body.count("x"), 50000)
+        self.assertLessEqual(body.count("x"), LIMIT)
 
     def test_a_kept_pod_posts_nothing_and_a_pod_without_an_ask_posts_nothing(self):
         self.assertEqual(self.end(code=1, log="exit 0")[0], [])
