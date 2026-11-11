@@ -1472,6 +1472,7 @@ def cmd_retire(args, runner, now, record):
         raise LaunchError("%s: the record is kept" % err) from None
     _audit(engine, "cloud.stopped", args.name, {"exit": code, "reason": reason, "runtime_id": record.get("runtime_id"),
                                                 "pushed": (body or {}).get("pushed"), "wip_branch": (body or {}).get("wip_branch")})
+    code, body = (0, {"pod_gone": True}) if code == 1 and _pod_is_gone(runner, record) else (code, body)   # no pod, no end hook: not a failed push (#2404)
     if code == 1:
         save = "%s-save" % args.name
         message = ("Commit the working tree of /work/repo as ONE commit on the new branch %s (a name that does not exist on origin), push it with a plain "
@@ -1562,5 +1563,5 @@ for _name in ("INSPECT_SECONDS", "_inspect_short", "cmd_inspect"):
 # ---------------------------------------------------------------- the shape-M count of a lane (ask #2259, bin/cloud_lane_cap.py)
 
 cloud_lane_cap = _load_part("cloud_lane_cap")
-for _name in ("lane_m_workers", "_ended", "_stopped_ids"):
+for _name in ("lane_m_workers", "_ended", "_stopped_ids", "_pod_is_gone"):
     globals()[_name] = getattr(cloud_lane_cap, _name)
