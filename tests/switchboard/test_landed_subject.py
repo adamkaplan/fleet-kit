@@ -12,16 +12,20 @@ SHA = "9" * 40
 OFF = "b" * 40      # a commit that is not on the default branch
 BARE = "c" * 40     # on the default branch, no trailers
 HALF = "d" * 40     # only one of the two trailers
-LAND_MSG = "Add the thing\n\nbody text\n\nLand-Checks: green\nLand-Council: approved\n"
-MESSAGES = {SHA: LAND_MSG, OFF: LAND_MSG, BARE: "Add it\n\nno trailers here\n", HALF: "Add it\n\nLand-Checks: green\n"}
+T = sb.LAND_PROOF_TRAILERS   # the fixtures are built from the one table the code reads
+LAND_MSG = "Add the thing\n\nbody text\n\n" + "".join("%s: ok\n" % t for t in T)
+MESSAGES = {SHA: LAND_MSG, OFF: LAND_MSG, BARE: "Add it\n\nno trailers here\n", HALF: "Add it\n\n%s: ok\n" % T[0]}
 AHEAD = "8" * 40    # a descendant of the default branch's tip
 MESSAGES[AHEAD] = LAND_MSG
 MINE = "7" * 40     # landed by the agent `tst`, who must not judge it
 MESSAGES[MINE] = LAND_MSG
 SPOOF = "6" * 40    # the trailer lines sit in prose, not in a trailer block
-MESSAGES[SPOOF] = "Add it\n\nThe lines are Land-Checks: x\nand Land-Council: y\n"
-ON_BRANCH = {SHA: "behind", BARE: "identical", HALF: "behind", OFF: "diverged", AHEAD: "ahead", MINE: "behind", SPOOF: "behind"}
+MESSAGES[SPOOF] = "Add it\n\nThe lines are " + " and ".join("%s: x" % t for t in T) + "\n"
+COMMITTED = "5" * 40   # committed by `tst` (the author has no GitHub account)
+MESSAGES[COMMITTED] = LAND_MSG
+ON_BRANCH = {SHA: "behind", BARE: "identical", HALF: "behind", OFF: "diverged", AHEAD: "ahead", MINE: "behind", SPOOF: "behind", COMMITTED: "behind"}
 AUTHORS = {MINE: "tst"}
+COMMITTERS = {COMMITTED: "tst"}
 
 
 def build(LedgerBase):
@@ -51,7 +55,7 @@ def build(LedgerBase):
                 if "/compare/" in path and sha in ON_BRANCH:
                     return subprocess.CompletedProcess(argv, 0, json.dumps({"status": ON_BRANCH[sha]}), "")
                 if "/commits/" in path and sha in MESSAGES:
-                    return subprocess.CompletedProcess(argv, 0, json.dumps({"sha": sha, "commit": {"message": MESSAGES[sha]}, "author": {"login": AUTHORS.get(sha, "someone")}}), "")
+                    return subprocess.CompletedProcess(argv, 0, json.dumps({"sha": sha, "commit": {"message": MESSAGES[sha]}, "author": {"login": AUTHORS[sha]} if sha in AUTHORS else None, "committer": {"login": COMMITTERS.get(sha, "someone")}}), "")
                 return subprocess.CompletedProcess(argv, 1, "", "gh: Not Found (HTTP 404)")
             return self.base_route(argv, **kwargs)
 
@@ -90,11 +94,11 @@ def build(LedgerBase):
             report = json.loads(out)
             rows = {r["gate"]: r["status"] for r in report["gates"]}
             self.assertEqual((rows["G0a"], rows["G1"]), ("ok", "missing"))
-            self.assertTrue(all(status == "n/a" for gate, status in rows.items() if gate not in ("G0a", "G0b", "G0c", "G1")))
+            self.assertTrue(all(status == "n/a" for gate, status in rows.items() if gate not in sb.LANDED_GATES))
+            self.assertEqual(rows["G4"], "n/a")
 
         def test_S3_a_sha_without_a_trailer_or_off_the_default_branch_is_refused_and_nothing_is_recorded(self):
-            T = sb.LAND_PROOF_TRAILERS
-            cases = ((BARE, ["no trailer"] + list(T)), (HALF, ["no trailer", T[1]]), (SPOOF, ["no trailer"] + list(T)), (OFF, ["not on the default branch"]),
+            cases = ((BARE, ["no trailer"] + list(T)), (HALF, ["no trailer"] + list(T[1:])), (SPOOF, ["no trailer"] + list(T)), (OFF, ["not on the default branch"]),
                      (AHEAD, ["not on the default branch"]), ("e" * 40, ["sha unknown"]))
             for sha, words in cases:
                 with self.subTest(sha=sha[:4]):
@@ -114,6 +118,10 @@ def build(LedgerBase):
                     self.assertNotEqual(code, 0)
                     self.assertIn(words, err)
                     self.assertNotIn("sha unknown", err)
+            self.failing = {"/commits/": "gh: Bad Gateway (HTTP 502)\n{\"message\": \"Not Found (HTTP 404) upstream\"}"}
+            code, out, err = self.prove_at(self.landed())
+            self.assertIn("could not be read", err)
+            self.assertNotIn("sha unknown", err)
             self.assertEqual(self.ledger(), [])
 
         def test_S3_a_head_that_is_not_the_sha_and_a_second_plan_are_refused(self):
@@ -139,6 +147,17 @@ def build(LedgerBase):
             code, out, err = self.run_as("rev", "verdict", "--all", "--pr", ref, "--as", "reviewer", "--result", "pass", "--evidence", "ran it", "--head", MINE, *self.PLAN)
             self.assertEqual(code, 0, err)
             self.assertEqual({r["head"] for r in self.ledger()}, {MINE})
+
+        def test_S3_a_committer_with_no_linked_author_may_not_judge_the_commit(self):
+            ref = self.landed(COMMITTED)
+            self.assertEqual(self.prove_at(ref)[0], 0)
+            self.assertNotEqual(self.verdict_at(ref)[0], 0)
+            self.assertEqual([r["kind"] for r in self.ledger()], ["proof"])
+
+        def test_S3_the_repository_is_lower_cased_at_the_reader(self):
+            self.assertEqual(sb.landed_ref("Acme/Land@" + SHA), ("acme/land", SHA))
+            self.assertIsNone(sb.landed_ref("acme/land@" + SHA.upper()[:-1]))
+            self.assertIsNone(sb.landed_ref("../land@" + SHA))
 
         def test_S3_a_repository_that_is_not_on_the_land_path_is_refused_naming_it(self):
             code, out, err = self.prove_at(self.landed(SHA, "acme/app"))
@@ -173,12 +192,13 @@ def build(LedgerBase):
                 for run in (lambda: self.prove_at(ref), lambda: self.run_as("coder", "gates", ref, *self.PLAN)):
                     code, out, err = run()
                     self.assertNotEqual(code, 0)
+                    self.assertIn(ref, err)   # the refusal names the subject it would not take
             self.assertEqual((self.ledger(), [r for r in self.reads if "/commits/" in r]), ([], []))
             self.assertEqual(self.prove_at(ref)[0], 0, "the same call with the landed path records")
             self.assertEqual(len(self.ledger()), 1)
 
         def test_U1_the_trailer_match_is_one_function_with_the_stated_form(self):
-            missing, T = sb.land_trailers_missing, sb.LAND_PROOF_TRAILERS
+            missing = sb.land_trailers_missing
             block = lambda lines: "subject\n\n" + "\n".join(lines) + "\n"
             self.assertEqual(missing(LAND_MSG), [])
             self.assertEqual(missing(block([t.upper() + ": x" for t in T])), [])

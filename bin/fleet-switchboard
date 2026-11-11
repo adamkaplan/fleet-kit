@@ -15239,15 +15239,17 @@ def landed_check(engine, config, runner, repo, sha):
     if not is_land_repo(config, repo):
         raise LedgerCommandError("refused: %s is not a land repository (`land_repos`): its subject is a pull request, nothing was recorded" % repo)
     get = impact_carry_get(engine, runner, repo)
+    absent = False
     try:
         commit = get("repos/%s/commits/%s" % (repo, sha))
         message = commit.get("commit", {}).get("message") if isinstance(commit, dict) else None
-        if not isinstance(commit, dict) or commit.get("sha") != sha or not isinstance(message, str):
-            raise ValueError("no such commit")
+        absent = not isinstance(commit, dict) or commit.get("sha") != sha or not isinstance(message, str)   # an answer that is no such commit
     except Exception as err:
-        if isinstance(err, ValueError) and not isinstance(err, json.JSONDecodeError) or "404" in str(err) or "Not Found" in str(err):
-            raise LedgerCommandError("refused: sha unknown: %s is no commit of %s, nothing was recorded" % (ref, repo)) from None
-        raise LedgerCommandError("refused: the commit %s could not be read (%s), nothing was recorded: try again" % (ref, _one_line(str(err), 100))) from None
+        if not (isinstance(err, IntentError) and err.status == 404):   # only gh's own status line says "not found": any other failure (a 5xx, a timeout, an answer too large) is a read that failed
+            raise LedgerCommandError("refused: the commit %s could not be read (%s), nothing was recorded: try again" % (ref, _one_line(str(err), 100))) from None
+        absent = True
+    if absent:
+        raise LedgerCommandError("refused: sha unknown: %s is no commit of %s, nothing was recorded" % (ref, repo))
     try:
         default = (get("repos/%s" % repo) or {}).get("default_branch")
         if not isinstance(default, str) or not default:
