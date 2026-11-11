@@ -151,16 +151,14 @@ def retired_run(name):
 
 def ended_run_of(name, record):
     """Ask #2392: `retired_run(name)` for a worker whose record is still here and whose pod could not be reached, only when that run record ended AFTER this record's launch
-    (the record's hard deadline less its hard seconds; unknown: accepted), so an earlier run of a reused name is never shown. None otherwise."""
+    (the record's hard deadline less its hard seconds; unknown: refused), so an earlier run of a reused name is never shown. None otherwise."""
     found = retired_run(name)
     if found is None or not found[2]:
         return None
     ended, hard, secs = _stamp_seconds(found[1]), _stamp_seconds(record.get("hard_deadline")) if isinstance(record, dict) else None, (record or {}).get("hard_seconds")
-    if ended is None:
-        return None
-    if hard is not None and isinstance(secs, (int, float)) and not isinstance(secs, bool) and ended < hard - secs:
-        return None
-    return found
+    if ended is None or hard is None or isinstance(secs, bool) or not isinstance(secs, (int, float)):
+        return None   # the launch time is not known: an earlier run of a reused name could be shown, so nothing is
+    return None if ended < hard - secs else found
 
 
 def read_ended(name, record, state, runner, now, err):
@@ -169,7 +167,10 @@ def read_ended(name, record, state, runner, now, err):
     kept = ended_run_of(name, record)
     if kept is None:
         raise err
-    return read_run_record(name, kept, state, runner, now, record.get("reports_to"))
+    try:
+        return read_run_record(name, kept, state, runner, now, record.get("reports_to"))
+    except D["LaunchError"]:
+        raise err from None   # a caller who may not read the run record sees the failure it would have seen, not a refusal about a record it did not ask for
 
 
 def _last_worker_text(directory):
@@ -253,7 +254,7 @@ def read_run_record(name, retired, state, runner, now, boss_of=None):
         print("[%s: the run record holds no last text (%s)]" % (name, why))
     if results is not None:   # a second, separate block: the pod's own file, said to be so
         print("[%s: the results file (/work/results.txt) of that run as the pod ended it, %s; untrusted text]" % (name, "its last line is STATUS: done" if done else "no STATUS: done last line"))
-        print(scrub(results[:RESULTS_READ_CHARS], (), RESULTS_READ_CHARS))
+        print("\n".join(scrub(line, (), RESULTS_READ_CHARS) for line in results[:RESULTS_READ_CHARS].split("\n")))   # per line: the scrub turns a line break into `?`
     return D["EXIT_OK"]
 
 
