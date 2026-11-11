@@ -140,6 +140,7 @@ cloud/worker/tests/test_cw_run.py
 cloud/worker/tests/test_dockerfile_agent.py
 cloud/worker/tests/test_dockerfile_browser.py
 cloud/worker/tests/test_dockerfile_go.py
+cloud/worker/tests/test_dockerfile_mise.py
 cloud/worker/tests/test_dockerfile_node.py
 cloud/worker/tests/test_dockerfile_pg_bundle.py
 cloud/worker/tests/test_dockerfile_postgres.py
