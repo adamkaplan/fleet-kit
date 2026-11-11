@@ -261,7 +261,6 @@ def build():
     import json
     import io
     import os
-    import subprocess
     import tempfile
     from unittest import mock
     from support.loader import captured, sb
@@ -836,6 +835,7 @@ def build_late():
     import io
     import json
     import os
+    import subprocess
     import tempfile
     from unittest import mock
     from support.loader import captured, sb
