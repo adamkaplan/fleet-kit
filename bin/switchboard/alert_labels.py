@@ -244,7 +244,7 @@ def red_ci_runs(engine, repo, runs, now, pr_read=None, lane_read=None):
         agents = discovery.agents if discovery else {}
         newest = None
         runs = red_ci_latest(repo, runs)
-        present = {}
+        present, lanes = {}, {}
         current = {}   # pull request number -> (created_at, head) of its newest run: a red run at an older head is not told
         for run in runs:
             if isinstance(run, dict) and isinstance(run.get("head_sha"), str):
@@ -282,10 +282,12 @@ def red_ci_runs(engine, repo, runs, now, pr_read=None, lane_read=None):
                         if not (isinstance(pr, dict) and pr.get("state") == "open" and not pr.get("merged") and sha == head):
                             engine._note("red_ci.unowned_skipped", repo, {"pr": number, "head": module.clean(head, 64)})
                             continue   # closed, merged, moved on or unreadable: never told on a guess
-                        try:
-                            lane = lane_read(pr) if lane_read else None
-                        except Exception:
-                            lane = None   # a failed owner read keeps today's alert
+                        if number not in lanes:
+                            try:
+                                lanes[number] = lane_read(pr) if lane_read else None   # one owner read per pull request per pass
+                            except Exception:
+                                lanes[number] = None   # a failed owner read keeps today's alert
+                        lane = lanes[number]
                         if lane:
                             engine._note("red_ci.unowned_skipped", repo, {"pr": number, "head": module.clean(head, 64), "owner": module.clean(lane, 40)})
                             continue   # the ask has a live owner: not told (told later, once, if no owner is left at a later pass)

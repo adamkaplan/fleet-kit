@@ -10162,8 +10162,10 @@ def red_ci_lane(hub, repo, pr, now):
     owner = hub.owner_of(item, agents, now) if item is not None else None
     if owner:
         return owner
-    ref = ((pr or {}).get("head") or {}).get("ref") if isinstance(pr, dict) else None
-    for rec in ((getattr(hub.engine, "cloud_watch", None) or {}).get("records") or []) if isinstance(ref, str) else []:
+    head = (pr or {}).get("head") if isinstance(pr, dict) else None
+    ref = (head or {}).get("ref") if isinstance(head, dict) else None
+    same = isinstance(head, dict) and str(((head.get("repo") or {}).get("full_name") if isinstance(head.get("repo"), dict) else "") or "").lower() == repo.lower()   # a fork's branch of the same name is not the worker's
+    for rec in ((getattr(hub.engine, "cloud_watch", None) or {}).get("records") or []) if isinstance(ref, str) and same else []:
         if isinstance(rec, dict) and rec.get("repo") == repo and rec.get("branch") == ref and rec.get("worker") in agents:
             return rec["worker"]
     return None

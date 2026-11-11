@@ -47,7 +47,8 @@ SECRET_FILES_MAX = 10
 RECORD_SECONDS = 90.0            # the default overall deadline of the record phase (less than half of the 600 s stop)
 RECORD_SECONDS_MAX = 240.0       # the hard maximum: CW_RECORD_SECONDS above it is cut to it
 CHUNK = 64 * 1024
-RESULTS_KEEP = 4000              # bytes of the pod's /work/results.txt kept in run.json (ask #2392)
+RESULTS_KEEP = 4000              # characters of the pod's /work/results.txt kept in run.json (ask #2392): the end of the file
+RESULTS_READ = 16000             # bytes read to be scrubbed first
 TIMED_OUT = "record timed out"
 
 
@@ -326,7 +327,7 @@ class Recorder:
         """{"done": bool, "text": the scrubbed last RESULTS_KEEP bytes} of the pod's /work/results.txt, or None when it has none or cannot be read. `done`: the last
         non-empty line is exactly `STATUS: done` (the idle nudge's own test). Never raises an Exception."""
         try:
-            out = self._exec(pod, "tail", "-c", str(RESULTS_KEEP), "/work/results.txt", keep_stdout=True)
+            out = self._exec(pod, "tail", "-c", str(RESULTS_READ), "--", "/work/results.txt", keep_stdout=True)
         except RecordTimeout:
             return None
         except Exception:
@@ -335,10 +336,10 @@ class Recorder:
             return None
         lines = [x.strip() for x in out.splitlines() if x.strip()]
         try:
-            text = self.kube.scrub(out, limit=2 * RESULTS_KEEP * 4)
+            text = self.kube.scrub(out, limit=2 * RESULTS_READ)   # a wider window is scrubbed, then the end is kept: a secret is never cut in half by the cut
         except Exception:
             return None
-        return {"done": bool(lines) and lines[-1] == "STATUS: done", "text": text[:RESULTS_KEEP]}
+        return {"done": bool(lines) and lines[-1] == "STATUS: done", "text": text[-RESULTS_KEEP:]}
 
     def record(self, worker, pod, reason, repo="", started="", root=None, persistent=False):
         """Save the run's record. Returns the record directory ('' when none could be made). Never raises an Exception."""

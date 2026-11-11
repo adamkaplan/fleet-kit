@@ -252,7 +252,7 @@ def own_branch_head(record_dir, repo, record, parse, branch_tip):
     The one proof that needs no push line: a pod whose pushes the push watch did not audit (pushed between two ticks, a sha already told under the wip branch). Any failure is None."""
     run = read_small(os.path.join(record_dir, "run.json"), parse) if record_dir else None
     branch, sha = (record or {}).get("branch"), run.get("head_sha") if isinstance(run, dict) else None
-    if branch_tip is None or not clean_branch(branch) or branch in NOT_OWN or branch == (record or {}).get("default_branch"):
+    if branch_tip is None or not clean_branch(branch) or not ref_shape(branch) or not re.fullmatch(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+", repo if isinstance(repo, str) else "") or branch in NOT_OWN or branch == (record or {}).get("default_branch"):
         return None
     if not (isinstance(sha, str) and FULL_SHA.fullmatch(sha)) or not (isinstance(repo, str) and repo):
         return None
@@ -263,6 +263,12 @@ def own_branch_head(record_dir, repo, record, parse, branch_tip):
 
 
 NOT_OWN = ("main", "master", "integration", "HEAD")
+
+
+def ref_shape(branch):
+    """True for a branch name that is one plain ref path: no empty, `.`-leading or `.lock` segment, no `..`, no edge slash (it is put in a GitHub API path)."""
+    parts = branch.split("/")
+    return ".." not in branch and all(p and not p.startswith(".") and not p.endswith((".lock", ".")) for p in parts)
 
 
 def head_line(record_dir, repo, head_checks, parse, pushed=None, worker=None, record=None, branch_tip=None):
