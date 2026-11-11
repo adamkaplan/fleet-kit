@@ -89,11 +89,11 @@ if [ -n "${CW_LONG_RUN_DENY:-}" ]; then
   done
   IFS=$oldifs; set +f
   rows="$rows,\\n\\1\"cw-run start*\": \"allow\""
-  last='^\( *\)"\*git\*push\*/master\\n\*": "deny"$'
+  last='^\( *\)"\*": "allow"$'
   if [ "$(grep -c "$last" "$cfgdir/opencode/opencode.json")" != 2 ]; then
     echo "worker: the last shell rule was not found twice; refusing to start" >&2; exit 1
   fi
-  sed "s|$last|\\1\"*git*push*/master\\\\n*\": \"deny\"$rows|" "$cfgdir/opencode/opencode.json" > "$cfgdir/opencode/opencode.json.new" \
+  sed "s|$last|\\1\"*\": \"allow\"$rows|" "$cfgdir/opencode/opencode.json" > "$cfgdir/opencode/opencode.json.new" \
     && mv "$cfgdir/opencode/opencode.json.new" "$cfgdir/opencode/opencode.json" && chmod 600 "$cfgdir/opencode/opencode.json"
 fi
 XDG_CONFIG_HOME="$cfgdir"; export XDG_CONFIG_HOME
