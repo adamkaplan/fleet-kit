@@ -58,8 +58,8 @@ def setup_with_land(preamble, config, repo):
     return head + LAND_SETUP_LINE + marker + tail
 
 
-# ---- ask #2373: a landed commit as the subject of prove, verdict and gates. ASSUMPTION: the real trailer forms are not known; a trailer is `Key: <anything non-empty>` in the LAST paragraph of the message
-# (the `git interpret-trailers --parse` form), the key case-insensitive. This is the one place to change when the real form is known.
+# ---- ask #2373: a landed commit as the subject of prove, verdict and gates. The trailer assumption was confirmed by a real landed commit (`Land-Checks:` a line of key=value pairs, `Land-Council:` a `ran: ...` line); a trailer is `Key: <anything non-empty>` in the LAST paragraph of the message
+# (the `git interpret-trailers --parse` form), the key case-insensitive. Only a non-empty value is required (no `ran:` requirement). This is the one place to change the form.
 LAND_PROOF_TRAILERS = ("Land-Checks", "Land-Council")
 
 
