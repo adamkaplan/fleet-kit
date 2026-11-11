@@ -23,6 +23,7 @@ cloud/launcher/tests/test_idle_default_60.py
 cloud/launcher/tests/test_idle_default_note.py
 cloud/launcher/tests/test_idle_nudge.py
 cloud/launcher/tests/test_idle_nudge_skipped.py
+cloud/launcher/tests/test_image_roll.py
 cloud/launcher/tests/test_kept_failed_once.py
 cloud/launcher/tests/test_kept_running_once.py
 cloud/launcher/tests/test_known_forms.py

@@ -365,6 +365,8 @@ executed) from `scan`; that plain `COPY --from` is what makes the registry's leg
 because it has no `RUN --mount`. The Dockerfile uses no BuildKit-only syntax, and `test-cloud` fails if one appears. The
 shipped image holds that marker and no scan script.
 
+`bin/cloud_image_roll.py SOURCE@sha256:DIGEST REGISTRY TAG [--dry-run]` (`cw-image-roll`, the operator's machine only) copies a published image with `crane copy`, checks the destination digest and only then changes the one `CW_CLOUD_IMAGE=` line of the settings file (backup first); a failed copy or a different digest changes nothing.
+
 ```sh
 # the real build: the working directory must be cloud/ (the build context). It fails when the scan finds a secret.
 (cd cloud && az acr build --registry acme-registry --image cw-worker:<tag> --platform linux/amd64 -f worker/Dockerfile .)
