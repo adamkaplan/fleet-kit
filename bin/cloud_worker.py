@@ -1433,13 +1433,13 @@ _BOSS_NAME_RE = re.compile(r"[a-z][a-z0-9_-]{0,31}", re.ASCII)
 def _final_message(engine, state, record, name, reason, body=None):
     """Ask #1788: after a successful retire, ONE message to the boss with the pod's last text (cloud_retired.last_message); never raises."""
     boss = record.get("reports_to")
-    if not isinstance(boss, str) or not _BOSS_NAME_RE.fullmatch(boss):
-        return
+    boss = boss if isinstance(boss, str) and _BOSS_NAME_RE.fullmatch(boss) else None   # ask #2393: a pod without a boss still has its end posted on its ask
     try:
         where = body.get("record") if isinstance(body, dict) else None   # THIS stop's record, as the launcher's answer names it (PC-7); never a lookup by name
         block, why = _retired().last_message(where, state, name) if isinstance(where, str) and where else (None, "no run record")
+        _retired().post_end(engine, state, record, name, reason, body, H["post_ask_comment"], lambda why_: _audit(engine, "cloud.end_post_failed", name, {"why": why_}))   # ask #2393: once, on the pod's ask
         text = "cloud worker %s retired (%s)\n%s" % (name, _one(_scrub_lib()(reason, (), 200), 120), block or "last text not read: %s" % _one((why or "unknown").replace(" ", "_"), 120))
-        engine.send("switchboard", boss, text)
+        boss and engine.send("switchboard", boss, text)
     except Exception as err:
         _audit(engine, "cloud.final_message_failed", name, {"why": _one(type(err).__name__, 60)})
 
@@ -1489,7 +1489,6 @@ def cmd_retire(args, runner, now, record):
     # The run record (slice 3, #638) is written by the launcher's stop; no call is needed here when it lands: this is its hook point (after the
     # end hook, before the endpoint record goes).
     _final_message(engine, state, record, args.name, reason, body)   # ask #1788: once, after a successful stop only
-    _retired().post_end(engine, state, record, args.name, reason, body, H["post_ask_comment"], lambda why: _audit(engine, "cloud.end_post_failed", args.name, {"why": why}))   # ask #2393: once, on the pod's ask
     _registry_note(engine, "retire", state, args.name, reason)
     wip, pushed = (body or {}).get("wip_branch"), (body or {}).get("pushed")
     if isinstance(body, dict) and body.get("pod_gone") is True:   # only the launcher's explicit reply: an unreadable pod never says it

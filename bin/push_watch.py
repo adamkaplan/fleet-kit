@@ -126,7 +126,7 @@ def _login(commit):
 
 
 def _landed(sb, engine, now, gh, name, record, mem, state, full_config, foreign=None):
-    """The completion of a worker of a `spire land` repository: the newest Land-trailer commit on the default branch, made after the launch, not told before,
+    """The completion of a worker of a land repository: the newest Land-trailer commit on the default branch, made after the launch, not told before,
     and the pod's OWN (ask #2393): its patch id equals that of a commit of the pod's own branch head, or its sha is the one the pod reported. Another Land commit is
     put in `foreign` (sha -> (worker, author login)) for the pass to say once that someone else landed; no pod is credited for it.
     Returns the sha told, or None. A read that fails is audited once and retried at the next pass; a send that fails is not marked."""
