@@ -843,6 +843,8 @@ def _launch(args, runner, now, reserve):
             record["agent"] = args.agent   # the local role name, for the operator: the pod runs CLOUD_WORKER_AGENT
             if args.reports_to:
                 record["reports_to"] = args.reports_to
+            if args.issue is not None:
+                record["issue"] = int(args.issue)   # ask #2393: the pod's end is posted on its ask
             if isinstance(args.shape, str) and args.shape:
                 record["shape"] = args.shape
             cloud_pr_labels.record_labels(record, args)   # #2269
@@ -1445,6 +1447,22 @@ def _final_message(engine, state, record, name, reason, body=None):
         _audit(engine, "cloud.final_message_failed", name, {"why": _one(type(err).__name__, 60)})
 
 
+def _post_end_on_ask(engine, state, record, name, reason, body):
+    """Ask #2393: ONCE per end, the pod's final message and the last lines of its land log are posted on its ask issue through the existing comment path
+    (handoff.post_ask_comment), scrubbed and cut (cloud_retired.end_comment); a pod without a log posts the message alone, a pod without an ask posts nothing.
+    Never raises: a failed post is said in the audit and the retire goes on."""
+    issue, repo = record.get("issue"), record.get("repo")
+    if isinstance(issue, bool) or not isinstance(issue, int) or issue < 1 or not isinstance(repo, str) or not repo:
+        return
+    try:
+        where = body.get("record") if isinstance(body, dict) else None
+        block, _why = _retired().last_message(where, state, name) if isinstance(where, str) and where else (None, "no run record")
+        tail = _retired().land_log_tail(where, name) if isinstance(where, str) and where else None
+        H["post_ask_comment"](engine, issue, _retired().end_comment(name, _one(_scrub_lib()(reason, (), 300), 120), block, tail), author=name, repo=repo)
+    except Exception as err:
+        _audit(engine, "cloud.end_post_failed", name, {"why": _one(type(err).__name__, 60)})
+
+
 @refusals
 def cmd_retire(args, runner, now, record):
     """`retire NAME` for a cloud worker: `stop` (the end hook runs, the pod and its scratch volume go), then the record goes. A stop that exits 1
@@ -1490,6 +1508,7 @@ def cmd_retire(args, runner, now, record):
     # The run record (slice 3, #638) is written by the launcher's stop; no call is needed here when it lands: this is its hook point (after the
     # end hook, before the endpoint record goes).
     _final_message(engine, state, record, args.name, reason, body)   # ask #1788: once, after a successful stop only
+    _post_end_on_ask(engine, state, record, args.name, reason, body)   # ask #2393: once, on the pod's ask
     _registry_note(engine, "retire", state, args.name, reason)
     wip, pushed = (body or {}).get("wip_branch"), (body or {}).get("pushed")
     if isinstance(body, dict) and body.get("pod_gone") is True:   # only the launcher's explicit reply: an unreadable pod never says it

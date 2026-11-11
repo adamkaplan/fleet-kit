@@ -455,3 +455,60 @@ def last_message(directory, state, pod, clock=None):
         return None, "cloud last unsafe"
     except Exception as err:
         return None, "%s" % type(err).__name__
+
+
+# ---- ask #2393: the pod's end, posted on its ask: the last text and the last lines of its land log ----
+END_LOG_LINES = 20       # the last lines of /work/land.log that are posted
+END_LOG_CHARS = 2000     # and at most this many characters of them
+END_POST_CHARS = 6000    # the whole comment
+RUN_JSON_MAX = 1 << 20
+
+
+def _run_record_dir(directory, pod):
+    """The run record directory when it is a real child of the run record root named for THIS pod (the checks of last_message), else None."""
+    try:
+        name = os.path.basename(str(directory).rstrip("/"))
+        if not (_LAST_NAME_RE.fullmatch(name) and _name_ok(pod) and re.fullmatch(re.escape(pod) + r"-\d{8}T\d{6}Z-[0-9a-f]{6}", name, re.ASCII)):
+            return None
+        root = os.path.abspath(str(_runs_root()))
+        if os.path.dirname(os.path.abspath(str(directory))) != root or os.path.islink(str(directory)) or not stat.S_ISDIR(os.lstat(str(directory)).st_mode):
+            return None
+        return str(directory) if os.path.dirname(os.path.realpath(str(directory))) == os.path.realpath(root) else None
+    except OSError:
+        return None
+
+
+def land_log_tail(directory, pod):
+    """The pod's land log tail from its run record (`land_log_tail`, a clipped string the launcher put there; ASSUMED field name, ask #2393): the last END_LOG_LINES
+    lines, at most END_LOG_CHARS characters, redacted by shape (the switchboard's redaction, then the launcher's scrub), flattened to printable ASCII with no backtick.
+    None when the pod has no log, the field is absent or the record cannot be read. Never raises."""
+    try:
+        where = _run_record_dir(directory, pod)
+        if where is None:
+            return None
+        fd = os.open(os.path.join(where, "run.json"), os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0))
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                return None
+            raw = os.read(fd, RUN_JSON_MAX + 1)
+        finally:
+            os.close(fd)
+        info = D["parse_bounded"](raw[:RUN_JSON_MAX].decode("utf-8", "replace")) if len(raw) <= RUN_JSON_MAX else None
+        tail = info.get("land_log_tail") if isinstance(info, dict) else None
+        if not isinstance(tail, str) or not tail.strip():
+            return None
+        text = "\n".join(tail[-LAST_SCRUB_MAX:].splitlines()[-END_LOG_LINES:])
+        scrub = D["_scrub_lib"]()
+        lines = [re.sub(r"[^\x20-\x7e]", "?", scrub(D["redact_command_text"](line), (), LAST_SCRUB_MAX)).replace("`", "'") for line in text.splitlines()]   # per line: the scrub flattens a newline
+        return "\n".join(lines)[-END_LOG_CHARS:] or None
+    except Exception:
+        return None
+
+
+def end_comment(pod, reason, block, tail):
+    """The comment for the ask: the pod, the reason, its last text (block: already cut and scrubbed, or None) and the land log tail (or nothing when the pod has none).
+    No mention can fire (no @) and the whole is cut at END_POST_CHARS."""
+    lines = ["cloud worker %s retired (%s)" % (pod, reason), block or "last text not read"]
+    if tail:
+        lines += ["[last lines of /work/land.log, untrusted text]", "```", tail, "```"]
+    return re.sub(r"@", "(at)", "\n".join(lines))[:END_POST_CHARS]
