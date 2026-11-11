@@ -39,7 +39,7 @@ REALERT_SECONDS = 60 * 60          # once per condition per pod per this long
 EVIDENCE_MAX = 300
 CONDITIONS = ("progress-stale", "refusal", "failed-run-idle")
 ALERT_ACTION = "stall-alert"       # the audit action of one alert; the switchboard daemon reads it and sends the messages (bin/cloud_end_alert.py scan_stall)
-REFUSAL_WORDS = re.compile(r"permission denied|refused|not allowed|blocked", re.I)
+REFUSAL_WORDS = re.compile(r"Permission denied: shell|permission\.rejected|^\s*(?:refused:|Blocked:|Blocked at)")
 ERROR_LINE = re.compile(r"error|fail|exception|denied|refused|cannot|unable|not found", re.I)
 
 # Run INSIDE the pod by `kubectl exec python3 -c <this>`. Reads only: the progress file (mtime, last 10 lines), /work/runs (per file name, mtime and the last
