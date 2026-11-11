@@ -8,6 +8,8 @@ non-zero status, with nothing changed:
   1. the settings file must exist, be a regular file owned by you, have no mode bit beyond 0600, and hold one `CW_CLOUD_IMAGE=` line;
   2. `crane copy SOURCE DEST_REGISTRY:TAG` must exit 0;
   3. `crane digest DEST_REGISTRY:TAG` must print exactly the source digest (an empty or a different digest refuses).
+Before any copy the proof gate of ask #2418 (check_gate) refuses an image whose revision label is empty or not reachable from origin/integration, or that has no
+receipt of cw-image-proof with verdict pass for exactly its digest younger than 6 hours; there is no flag that skips it.
 Then (not with --dry-run) the file is copied to a backup in the same directory (name with the time, mode 0600), the one
 `CW_CLOUD_IMAGE=` line is replaced through a temporary file in the same directory and os.replace (mode 0600), the file is read back, and the old and
 new 12-character digests and the backup path are printed. Every other line is byte for byte unchanged.
@@ -16,6 +18,7 @@ The command never logs in: the registry login is the credential store `crane` al
 """
 import argparse
 import datetime
+import json
 import os
 import re
 import shutil
@@ -132,6 +135,69 @@ def apply(path, data, new_bytes, now):
     return backup
 
 
+REVISION_LABEL = "org.opencontainers.image.revision"
+INTEGRATION_REF = "origin/integration"
+RECEIPT_MAX_AGE = datetime.timedelta(hours=6)
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(globals().get("__file__") or os.path.join(os.getcwd(), "bin", "x"))))   # the checkout that holds this file
+
+
+def receipt_dir(env):
+    """Where cw-image-proof writes its receipts (ask #2418): the operator's state directory, the launcher's own `cloud` folder."""
+    base = env.get("XDG_STATE_HOME") or os.environ.get("XDG_STATE_HOME") or os.path.join(env.get("HOME") or os.path.expanduser("~"), ".local", "state")
+    return os.path.join(base, "fl" + "eet-switchboard", "cloud", "image-proof")
+
+
+def read_receipts(directory, want):
+    """The receipts of exactly this digest: a list of dicts (digest, time, revision, verdict). A file that cannot be read is skipped."""
+    found = []
+    try:
+        names = sorted(os.listdir(directory))
+    except OSError:
+        return found
+    for name in names:
+        if not name.endswith(".receipt"):
+            continue
+        try:
+            with open(os.path.join(directory, name), "r", encoding="utf-8") as f:
+                text = f.read(65536)
+        except (OSError, UnicodeDecodeError):
+            continue
+        fields = dict(line.split(": ", 1) for line in text.splitlines() if ": " in line and not line.startswith("item "))
+        if fields.get("digest") == want:
+            found.append(fields)
+    return found
+
+
+def check_gate(tool, source, want, env, now):
+    """Ask #2418: refuse, before any copy, an image with no revision label, a revision that is not reachable from the integration branch's remote tip,
+    or without a receipt of verdict pass for exactly this digest younger than six hours. There is no flag that skips it."""
+    got = run_crane(tool, ["config", source], env, "crane config", 120)
+    try:
+        labels = (json.loads(got.stdout.decode("utf-8", "replace")).get("config") or {}).get("Labels") or {} if got.returncode == 0 else {}
+    except (ValueError, AttributeError):
+        labels = {}
+    revision = labels.get(REVISION_LABEL) if isinstance(labels, dict) else ""
+    if not isinstance(revision, str) or not re.fullmatch(r"[0-9a-f]{40}", revision):
+        raise Refused("the image has no revision label (%s); nothing was changed" % REVISION_LABEL)
+    near = run_crane(env.get("GIT") or "git", ["-C", REPO_ROOT, "merge-base", "--is-ancestor", revision, INTEGRATION_REF], env, "git merge-base", 60)
+    if near.returncode != 0:
+        raise Refused("the image's revision %s is not a commit reachable from %s; nothing was changed" % (revision[:12], INTEGRATION_REF))
+    receipts = read_receipts(receipt_dir(env), want)
+    if not receipts:
+        raise Refused("no proof receipt for %s; run cw-image-proof first; nothing was changed" % want[:19])
+    latest = max(receipts, key=lambda r: r.get("time", ""))
+    if latest.get("verdict") != "pass":
+        raise Refused("the proof receipt for %s has verdict %s, not pass; nothing was changed" % (want[:19], latest.get("verdict", "none")))
+    try:
+        when = datetime.datetime.strptime(latest.get("time", ""), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc)
+    except ValueError:
+        raise Refused("the proof receipt for %s has no readable time; nothing was changed" % want[:19])
+    if not datetime.timedelta(0) <= now - when < RECEIPT_MAX_AGE:
+        raise Refused("the proof receipt for %s is not younger than 6 hours; nothing was changed" % want[:19])
+    if latest.get("revision") != revision:
+        raise Refused("the proof receipt's revision differs from the image's label; nothing was changed")
+
+
 def roll(args, env, now=None):
     m = SOURCE_RE.fullmatch(args.source)
     if not m:
@@ -144,6 +210,7 @@ def roll(args, env, now=None):
     path = args.settings or default_settings(env)
     data = check_settings(path)
     tool = crane_tool(env)
+    check_gate(tool, args.source, want, env, datetime.datetime.now(datetime.timezone.utc))
     dest = "%s:%s" % (args.registry, args.tag)
     copy = run_crane(tool, ["copy", args.source, dest], env, "crane copy", 900)
     if copy.returncode != 0:

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Ask #2391: bin/cloud_image_roll.py (cw-image-roll), offline, with a fake `crane` script and scratch settings files. No network, no real credential."""
 import contextlib
+import datetime
 import io
 import os
 import shutil
@@ -21,6 +22,7 @@ SRC = "src.example/team/cw-worker@sha256:" + HEX_A
 TOKEN = "ghp_FAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKE0000"
 ANCHOR = "the image setting was changed after a failed copy"
 FAKE = """#!/bin/sh
+[ "$1" = config ] && { printf '{"config":{"Labels":{"org.opencontainers.image.revision":"%s"}}}' "1111111111111111111111111111111111111111"; exit 0; }
 echo "$@" >> "$CRANE_LOG"
 case "$1" in
   copy) echo "login failed token=$FAKE_TOKEN" >&2; [ "$FAKE_COPY" = fail ] && exit 1; exit 0;;
@@ -57,6 +59,19 @@ class Base(unittest.TestCase):
         os.mkdir(self.dir, 0o700)
         self.settings = os.path.join(self.dir, "cloud.env")
         self.write_settings(0o600)
+        # ask #2418: the proof gate passes here (a fake git that finds the revision on the integration tip, and a fresh pass receipt for the digest)
+        gitdir = os.path.join(self.tmp, "gitbin")
+        os.mkdir(gitdir)
+        Path(gitdir, "git").write_text("#!/bin/sh\nexit 0\n")
+        os.chmod(os.path.join(gitdir, "git"), 0o755)
+        state = os.path.join(self.tmp, "state")
+        os.makedirs(os.path.join(state, "fl" + "eet-switchboard", "cloud", "image-proof"))
+        stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        Path(state, "fl" + "eet-switchboard", "cloud", "image-proof", "r.receipt").write_text(
+            "digest: sha256:%s\ntime: %s\nrevision: %s\nverdict: pass\n" % (HEX_A, stamp, "1" * 40))
+        patcher = mock.patch.dict(os.environ, {"XDG_STATE_HOME": state, "PATH": gitdir + os.pathsep + os.environ.get("PATH", "")})
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def write_settings(self, mode):
         Path(self.settings).write_text("".join(LINES))

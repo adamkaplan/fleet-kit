@@ -382,6 +382,8 @@ shipped image holds that marker and no scan script.
 
 `bin/cloud_image_roll.py SOURCE@sha256:DIGEST REGISTRY TAG [--dry-run]` (`cw-image-roll`, the operator's machine only) copies a published image with `crane copy`, checks the destination digest and only then changes the one `CW_CLOUD_IMAGE=` line of the settings file (backup first); a failed copy or a different digest changes nothing.
 
+Images are built only from integration's tip after merging, never from a merge of branch heads, and the build passes `--build-arg CW_IMAGE_REVISION=<the commit the tree was taken from>` (`git rev-parse HEAD`), which the image carries as its `org.opencontainers.image.revision` label (ask #2418). `bin/cloud_image_proof.py DIGEST` (cw-image-proof) launches a proof pod on exactly that digest, runs the proof set of `cloud/worker/proof-set.md`, retires the pod and writes a receipt (mode 0600) in the operator's state directory; `cw-image-roll` refuses, before any copy and with no bypass flag, an image with an empty revision label, a revision not reachable from `origin/integration`, or no passing receipt for exactly its digest younger than 6 hours.
+
 ```sh
 # the real build: the working directory must be cloud/ (the build context). It fails when the scan finds a secret.
 (cd cloud && az acr build --registry acme-registry --image cw-worker:<tag> --platform linux/amd64 -f worker/Dockerfile .)
