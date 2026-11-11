@@ -224,7 +224,7 @@ def ask_of(launcher, worker):
         return STALL_ASK
     if isinstance(issue, bool) or not isinstance(issue, (int, str)) or not re.fullmatch(r"[1-9][0-9]{0,9}", str(issue)):
         return STALL_ASK
-    if isinstance(repo, str) and re.fullmatch(r"[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}", repo):
+    if isinstance(repo, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,99}/[A-Za-z0-9][A-Za-z0-9_.-]{0,99}", repo):
         return "%s#%s" % (repo, issue)
     return str(issue)
 

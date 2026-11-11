@@ -322,7 +322,8 @@ class Stall(unittest.TestCase):
         w = World()
         w.add()
         for rec, want in (({"issue": 812, "repo": "own/repo"}, "own/repo#812"), ({"issue": 7}, "7"), ({}, sw.STALL_ASK),
-                          ({"issue": "x; rm", "repo": "own/repo"}, sw.STALL_ASK), ({"issue": True}, sw.STALL_ASK), ({"issue": 0}, sw.STALL_ASK)):
+                          ({"issue": "x; rm", "repo": "own/repo"}, sw.STALL_ASK), ({"issue": True}, sw.STALL_ASK), ({"issue": 0}, sw.STALL_ASK),
+                          ({"issue": 5, "repo": "--x/y"}, "5"), ({"issue": 5, "repo": "a/-y"}, "5")):
             self._record(w, **rec)
             self.assertEqual(sw.ask_of(w.launcher, "w1"), want, rec)
         os.remove(os.path.join(w.dir, "w1.json"))
