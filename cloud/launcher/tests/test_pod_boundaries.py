@@ -4,8 +4,11 @@ Each pin is a checker that returns the list of problems it finds in a spec or a 
 weakened copy (the mutant control) must give some. Offline: no cloud, no network (the mint is run with its network calls stubbed). Values are read from the code and the
 manifests wherever they exist; the few literals (the 61-minute life, the private and metadata ranges, the three rule types) are the
 owner's stated limits, kept on purpose so that a change to the code cannot silently weaken them."""
+import argparse
+import contextlib
 import copy
 import datetime as dt
+import io
 import os
 import re
 import sys
@@ -18,10 +21,6 @@ ROOT = os.path.dirname(os.path.dirname(LAUNCHER))
 sys.path.insert(0, HERE)
 sys.path.insert(0, LAUNCHER)
 import app_token  # noqa: E402
-import argparse
-import contextlib
-import io
-
 import cloud_worker as cw  # noqa: E402
 import preflight  # noqa: E402
 from test_cloud_hub_network import parse as parse_yaml  # noqa: E402
@@ -329,6 +328,7 @@ class TokenPins(unittest.TestCase):
                     app_token.check_permissions(wide)
 
 
+# (the service route of the mint carries its own copies of these checks and is pinned in test_app_token_service.py and test_token_at_limit.py)
 # ---- (4) the egress policy --------------------------------------------------------------------------------------------------
 PRIVATE = ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", "127.0.0.0/8")
 METADATA = ("169.254.0.0/16", "168.63.129.16/32")   # the link-local range (instance metadata) and the platform's wire address
