@@ -135,7 +135,7 @@ class Refusals(Base):          # S2, S3, S5
         code, out, err = self.run_cmd(path=os.path.join(self.dir, "none.env"))
         self.assertNotEqual(code, 0)
         self.assertEqual(len((out + err).strip().splitlines()), 1)
-        self.assertEqual((self.copies(), self.backups()), ([], ["cloud.env"]))
+        self.assertEqual((self.copies(), self.backups()), ([], []))
 
     def test_s5_dry_run_changes_nothing_and_prints_no_token(self):
         before = self.state()
