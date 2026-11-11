@@ -1165,8 +1165,15 @@ def cmd_read(args, runner, now):
     engine, state, config = H["build_engine"](runner, now, "cli", writable=False)
     if record is not None:
         session = _session_of(record)
-        with Cluster() as cluster, tunnel(cluster, record) as live:
-            messages = remote_v2(state, live, config["call_timeout_seconds"]).message_list(session, limit=limit, order="desc") or []
+        try:
+            with Cluster() as cluster, tunnel(cluster, record) as live:
+                messages = remote_v2(state, live, config["call_timeout_seconds"]).message_list(session, limit=limit, order="desc") or []
+        except Exception:
+            # ask #2392: the pod has ended (its record is still here): its own run record answers, when it has one for THIS run; no record keeps the failure
+            kept = _retired().ended_run_of(args.name, record)
+            if kept is None:
+                raise
+            return _retired().read_run_record(args.name, kept, state, runner, now, record.get("reports_to"))
         for message in reversed([m for m in messages if isinstance(m, dict)]):
             print(message_line(message))
         return H["EXIT_OK"]

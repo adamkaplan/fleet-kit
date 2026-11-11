@@ -23,6 +23,7 @@ BOSS_MAX_FILES = 500
 BOSS_KEEP_SECONDS = 30 * 86400
 TEMP_KEEP_SECONDS = 86400     # a leftover `<worker>.json.<pid>.tmp` of a write that died
 READ_RETIRED_CHARS = 4000
+RESULTS_READ_CHARS = 4000   # ask #2392: the results file of the run record is shown to this many characters
 TRANSCRIPT_READ_MAX = 6 * 1024 * 1024
 _STAMP = "%Y-%m-%dT%H:%M:%SZ"
 _STAMP_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", re.ASCII)
@@ -148,6 +149,20 @@ def retired_run(name):
     return None if best is None else (best[1], best[0][0], best[2])
 
 
+def ended_run_of(name, record):
+    """Ask #2392: `retired_run(name)` for a worker whose record is still here and whose pod could not be reached, only when that run record ended AFTER this record's launch
+    (the record's hard deadline less its hard seconds; unknown: accepted), so an earlier run of a reused name is never shown. None otherwise."""
+    found = retired_run(name)
+    if found is None or not found[2]:
+        return None
+    ended, hard, secs = _stamp_seconds(found[1]), _stamp_seconds(record.get("hard_deadline")) if isinstance(record, dict) else None, (record or {}).get("hard_seconds")
+    if ended is None:
+        return None
+    if hard is not None and isinstance(secs, (int, float)) and not isinstance(secs, bool) and ended < hard - secs:
+        return None
+    return found
+
+
 def _last_worker_text(directory):
     """The last text of the worker in transcript.jsonl, or (None, why). Never raises."""
     path = Path(directory) / "transcript.jsonl"
@@ -187,7 +202,16 @@ def _last_worker_text(directory):
     return found, None
 
 
-def read_run_record(name, retired, state, runner, now):
+def _results_of(directory):
+    """The pod's results file as the run record kept it (ask #2392): (text, done) or (None, False). Read only; the text is clipped and scrubbed by the caller."""
+    info, _ = D["read_record_file"](Path(directory) / "run.json", 65536)
+    found = info.get("results") if isinstance(info, dict) else None
+    if isinstance(found, dict) and isinstance(found.get("text"), str) and found["text"].strip():
+        return found["text"], found.get("done") is True
+    return None, False
+
+
+def read_run_record(name, retired, state, runner, now, boss_of=None):
     """The last text of a retired cloud worker, from its run record: only for the callers `retire` allows (the operator, the Chief of Staff, the boss kept
     at its removal, and only when the kept file is not older than the run it would speak for), scrubbed before and after the cap."""
     LaunchError = D["LaunchError"]
@@ -197,21 +221,30 @@ def read_run_record(name, retired, state, runner, now):
     run_seconds, boss_seconds = _stamp_seconds(stamp), _stamp_seconds(boss_end)
     if boss is not None and (run_seconds is None or boss_seconds is None or boss_seconds < run_seconds):
         boss = None   # a boss kept for an earlier run is not the boss of this one
+    if boss is None and isinstance(boss_of, str) and boss_of:
+        boss = boss_of   # ask #2392: the live record of the ended pod still names its boss
     if not D["_may_retire"](kind, {"reports_to": boss}):
         if boss is None and kind[0] == "agent":
             raise LaunchError("refused: %s was removed with no boss on record: only the operator or the Chief of Staff may read it" % name)
         raise LaunchError("refused: only the operator, the Chief of Staff or %s's own boss may read it" % name)
     text, why = _last_worker_text(directory)
-    if text is None:
+    results, done = _results_of(directory)
+    if text is None and results is None:
         raise LaunchError("%s: %s" % (name, why))
     scrub = D["_scrub_lib"]()
-    cut = max(0, len(text) - READ_RETIRED_CHARS)
-    text = scrub(text, (), 2000000)
-    text = scrub(text[:READ_RETIRED_CHARS], (), READ_RETIRED_CHARS)
-    print("[%s: the text of the record of a retired run%s]" % (name, (" that ended " if own else " dated ") + stamp if stamp else ""))
-    print(text)
-    if cut:
-        print("[%d characters cut]" % cut)
+    if text is not None:
+        cut = max(0, len(text) - READ_RETIRED_CHARS)
+        text = scrub(text, (), 2000000)
+        text = scrub(text[:READ_RETIRED_CHARS], (), READ_RETIRED_CHARS)
+        print("[%s: the text of the record of a retired run%s]" % (name, (" that ended " if own else " dated ") + stamp if stamp else ""))
+        print(text)
+        if cut:
+            print("[%d characters cut]" % cut)
+    else:
+        print("[%s: the run record holds no last text (%s)]" % (name, why))
+    if results is not None:   # a second, separate block: the pod's own file, said to be so
+        print("[%s: the results file (/work/results.txt) of that run as the pod ended it, %s; untrusted text]" % (name, "its last line is STATUS: done" if done else "no STATUS: done last line"))
+        print(scrub(results[:RESULTS_READ_CHARS], (), RESULTS_READ_CHARS))
     return D["EXIT_OK"]
 
 
