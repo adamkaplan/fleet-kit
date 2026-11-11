@@ -2,7 +2,7 @@
 
 A body write to an ask must keep the `## Intent` heading line and the `Done when:` line of the body it replaces. `shims/gh` loads this file by path
 (like gh_hold.py, never `import`) and calls `guard` once per write, right after the hold check. The decision is the pure `refusal(current, new)`; the
-rest reads the NEW body out of each form that writes one:
+rest reads the NEW body out of each form that writes one. Also (#2397): a DELETE of repos/O/R/hooks/ID, the one webhook write the shim's allow-list passes, is allowed only for a hook READ first that is named `cli` with config.url the webhook forwarder's url.
 
   gh issue edit N [N...] with --body, -b, --body-file, -F (a file or - for stdin; the joined spellings too),
   gh api to repos/O/R/issues/N (or repositories/ID/issues/N) with -f/-F body=..., -F body=@file, -F body=@-, --input FILE or --input -,
@@ -54,6 +54,10 @@ UNCLASSIFIED = ("gh: refused: this write to an issue cannot be classified (the n
                 "with -f body=..., -F body=@file or --input with a JSON object, or use `fleet-switchboard issue-line`")
 GRAPHQL = ("gh: refused: a GraphQL updateIssue cannot be checked against the body it replaces: use `gh issue edit` with a body that keeps both parts, "
            "or `fleet-switchboard issue-line`")
+FORWARDER_HOOK_URL = "https://webhook-forwarder.github.com/hook"   # the url `gh webhook forward` gives its hook; the same text as GITHUB_FORWARDER_HOOK_URL in bin/fleet-switchboard (a test compares them)
+HOOK_UNREAD = ("gh: refused: the webhook could not be read (%s), so its deletion cannot be checked: retry (only a `cli` hook of the webhook forwarder may be deleted)")
+HOOK_OTHER = ("gh: refused: this webhook is not a `cli` hook of the webhook forwarder (name and url are checked), so it is not deleted: "
+              "only a forwarder's own hook may be deleted")
 FAILED = "gh: refused: the body guard failed, retry (the fleet shim refuses this write rather than let it through)"
 ISSUE_VALUE = {"-R", "--repo", "-t", "--title", "-m", "--milestone", "-a", "--add-assignee", "--remove-assignee", "-l", "--add-label",
                "--remove-label", "-p", "--add-project", "--remove-project", "-b", "--body", "-F", "--body-file"}
@@ -340,6 +344,20 @@ def new_bodies(probe, parsed):
     return found
 
 
+def hook_delete(probe, parsed, segs):
+    """The refusal line for a DELETE of repos/O/R/hooks/ID, else None (the hook was READ first, with the account the delete would use, and is a `cli` hook whose
+    config.url is the forwarder url). A non-numeric id is left to the shim's allow-list, which refuses it. Fail closed: an unreadable hook is refused."""
+    if not segs[4].isdigit() or not segs[4].isascii():
+        return None
+    data = probe.fetch(["api"] + ([] if parsed.hostname is None else ["--hostname", parsed.hostname]) + ["repos/%s/%s/hooks/%s" % (segs[1], segs[2], segs[4])])
+    if data is None:
+        return HOOK_UNREAD % (probe.why or "no reason given")
+    config = data.get("config")
+    if data.get("name") == "cli" and isinstance(config, dict) and config.get("url") == FORWARDER_HOOK_URL:
+        return None
+    return HOOK_OTHER
+
+
 def api_write(probe, args, api_parser):
     parsed = api_parser(args)
     if parsed.effective_method == "GET" or not parsed.positionals:
@@ -353,6 +371,8 @@ def api_write(probe, args, api_parser):
         except Unclassified:
             return None   # an unreadable query or --input is refused by the shim's own GraphQL rule, with its own line
         return GRAPHQL if any(UPDATE_RE.search(t) for t in texts) else None
+    if parsed.effective_method == "DELETE" and low[:1] == ["repos"] and len(segs) == 5 and low[3] == "hooks":
+        return hook_delete(probe, parsed, segs)   # the one webhook write that passes the shim's allow-list: a forwarder's own `cli` hook
     if low[:1] == ["repos"] and len(segs) == 5 and low[3] == "issues":
         number = segs[4]
     elif low[:1] == ["repositories"] and len(segs) == 4 and low[2] == "issues":

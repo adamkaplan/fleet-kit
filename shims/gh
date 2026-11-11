@@ -1819,7 +1819,8 @@ REST_WRITES = (   # (label, path after repos/OWNER/REPO/, methods): the unsigned
     ("issue-create", r"issues", ("POST",)), ("issue-update", r"issues/[^/]+", ("PATCH", "POST")), ("issue-labels", r"issues/[^/]+/labels", ("POST", "PUT", "DELETE")),
     ("issue-label", r"issues/[^/]+/labels/[^/]+", ("DELETE",)), ("sub-issues", r"issues/[^/]+/sub_issues", ("POST",)),
     ("pull-update", r"pulls/[^/]+", ("PATCH", "POST")), ("pull-merge", r"pulls/[^/]+/merge", ("PUT",)), ("label-create", r"labels", ("POST",)), ("label-delete", r"labels/[^/]+", ("DELETE",)),
-    ("deployment-gate", r"actions/runs/[0-9]+/pending_deployments", ("POST",)))   # approving a deployment gate: its 'comment' field is not a comment body
+    ("deployment-gate", r"actions/runs/[0-9]+/pending_deployments", ("POST",)),
+    ("webhook-delete", r"hooks/[0-9]+", ("DELETE",)))   # a forwarder's own hook: shims/gh_body.py reads the hook first and passes only a `cli` hook with the forwarder url   # approving a deployment gate: its 'comment' field is not a comment body
 
 
 def api_scan(args, headers=None):

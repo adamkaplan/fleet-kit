@@ -2749,6 +2749,8 @@ call reads again. Reads are never refused. `fleet-switchboard` checks the key wh
 printable `label`, a one-line `message` and `allowed_removers` as agent names). The shim reads no environment variable to skip it:
 the retired `FLEET_SWITCHBOARD_OWN_GH` does not bypass it, and the switchboard's own calls reach the real gh by path, not through the shim.
 
+**The webhook delete (ask #2397).** The shim's allow-list (`REST_WRITES`, `webhook-delete`) passes exactly `DELETE repos/O/R/hooks/ID` (a numeric id). `shims/gh_body.py` reads that hook FIRST (a GET, the account the delete would use, the same bounded read and strict lookup as the body guard) and lets the delete through only when the hook's name is `cli` and its `config.url` is `https://webhook-forwarder.github.com/hook`; any other hook, a hook that cannot be read, any other method on the path and a delete of any other endpoint stay refused (one line naming the reason, never a token).
+
 **The body guard (ask #1751).** `shims/gh_body.py`, loaded by path beside the shim, is asked once per write, right after the hold check. A body write
 to an issue whose current body holds the `## Intent` heading line and the `Done when:` line is refused (exit 1, nothing passed to `gh`) when the new body
 lacks either; a whole-body write must keep both parts. The forms read are `gh issue edit` with `--body`, `-b`, `--body-file` or `-F` (`-F -` from
