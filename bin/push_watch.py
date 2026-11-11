@@ -78,7 +78,7 @@ def _patch_id(commit):
         return None
     try:   # no repository and no configuration is read: the diff is the whole input
         done = subprocess.run(["git", "patch-id", "--stable"], input=diff, capture_output=True, text=True, timeout=20, cwd="/",
-                              env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": "/nonexistent", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null"})
+                              env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": "/nonexistent", "GIT_CONFIG_NOSYSTEM": "1"})
     except (OSError, subprocess.SubprocessError, ValueError):
         return None
     found = re.match(r"[0-9a-f]{40}", done.stdout or "")
