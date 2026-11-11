@@ -67038,7 +67038,7 @@ TestReminderIdleWake = importlib.import_module("test_reminder_idle_wake").build(
 TestReminderDueSend = importlib.import_module("test_reminder_due_send").build(PR4Base)   # #2243 amendment 2
 TestPlanRehearsal = importlib.import_module("test_plan_rehearsal").build(HandoffCase)   # #1785
 TestMergeRef = importlib.import_module("test_merge_ref").build(HandoffCase)   # #2053
-TestCiRecordProof = importlib.import_module("test_ci_record_proof").build(LedgerBase)   # #2091
+TestCiRecordProof = importlib.import_module("test_ci_record_proof").build(LedgerBase); TestLandedSubject = importlib.import_module("test_landed_subject").build(LedgerBase)   # #2091, #2373
 TestDoneWhenList = importlib.import_module("test_done_when_list").TestDoneWhenList   # #2078
 # The load figure counts cloud workers as busy (#1487).
 _load_cloud = importlib.import_module("test_load_alert_cloud")
