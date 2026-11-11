@@ -45,22 +45,6 @@ def strip_question(cfg):
     return c
 
 
-RECORD_BASH_PATTERNS = ("*CW_PR_RECORD*", "*pr-record*")   # ask 1200: the closed list of what its change adds
-RECORD_EDIT_ENTRY = {"*pr-record*": "deny"}   # the editing tool's entry for the record paths
-
-
-def strip_record_entries(cfg):
-    """A deep copy without ONLY the entries ask 1200 adds (the two bash patterns and the exact edit entry), in both blocks."""
-    c = copy.deepcopy(cfg)
-    blocks = [c["permission"]] + [a.get("permission", {}) for a in c.get("agent", {}).values()]
-    for b in blocks:
-        for pat in RECORD_BASH_PATTERNS:
-            b.get("bash", {}).pop(pat, None)
-        if b.get("edit") == RECORD_EDIT_ENTRY:
-            del b["edit"]
-    return c
-
-
 def _merge_base(ref):
     r = subprocess.run(["git", "merge-base", "HEAD", ref], cwd=ROOT, capture_output=True)
     out = r.stdout.decode().strip() if r.returncode == 0 else ""
@@ -95,15 +79,6 @@ def base_other_keys():
     return None if ref is None else strip_question(json.loads(data))
 
 
-def without_ref_rules(cfg):
-    cfg = copy.deepcopy(cfg)
-    gone = ("git*push*main*", "git*push*master*", "gh api*/issues/comments/*", "gh api*/issues/comments/* *", "gh api*/issues/comments/*?*")
-    for b in (cfg["permission"]["bash"], cfg["agent"]["worker"]["permission"]["bash"]):
-        for k in [k for k in b if k in gone or k.startswith("*git*push*")]:
-            del b[k]
-    return cfg
-
-
 def orch_question(text):
     fm = text.split("---", 2)[1]
     m = re.search(r"^  question: (\S+)", fm, re.M)
@@ -117,27 +92,8 @@ class T(unittest.TestCase):
         self.assertEqual(check_blocks(cfg), {})
 
     def test_s4_no_other_permission_changed(self):
-        base = base_other_keys()
-        if base is None:
-            loud_skip(self, "the base permission file")
-        # pin change of #1549: the push rules for main and master are compared in test_push_rules.py, not here
-        self.assertEqual(without_ref_rules(strip_record_entries(strip_question(load()))), without_ref_rules(base))
-
-    def test_record_entries_strip_only_the_closed_list(self):
-        cfg = load()
-        stripped = strip_record_entries(cfg)
-        self.assertNotEqual(stripped, cfg, "mutation not applied")
-        for b in (stripped["permission"], stripped["agent"]["worker"]["permission"]):
-            self.assertNotIn("edit", b)
-            self.assertFalse(set(RECORD_BASH_PATTERNS) & set(b["bash"]))
-        for mut in ("bash", "edit"):
-            m = copy.deepcopy(cfg)
-            if mut == "bash":
-                m["permission"]["bash"]["gh extra thing*"] = "allow"
-            else:
-                m["agent"]["worker"]["permission"]["edit"]["*other*"] = "deny"
-            self.assertNotEqual(m, cfg, "mutation not applied")
-            self.assertNotEqual(strip_record_entries(m), strip_record_entries(cfg))
+        # ask #2402: the file is compared with its whole expected content, not with the base commit's copy (the base held the rows this change removes)
+        self.assertEqual(strip_question(load()), {"permission": {"bash": {"*": "allow"}}, "agent": {"worker": {"permission": {"bash": {"*": "allow"}}}}})
 
     def test_s4_empty_agent_block_is_not_dropped(self):
         cfg = load()
