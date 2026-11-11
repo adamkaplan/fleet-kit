@@ -146,9 +146,20 @@ def valid_pr_note(hook):
     return None
 
 
-def message_text(worker, label, when, pushed, record_name, kept=False, failure=None):
-    text = ("[cloud worker ended] %s was ended by the launcher: reason %s; at %s; %s; run record: %s."
-            % (worker, label, when, pushed, record_name or "unknown"))
+def reported_done(record_dir, parse):
+    """Ask #2392: True when the run record holds the pod's results file and its last non-empty line was exactly `STATUS: done` (a bool the launcher wrote; nothing of the text is read)."""
+    run = read_small(os.path.join(record_dir, "run.json"), parse) if record_dir else None
+    results = run.get("results") if isinstance(run, dict) else None
+    return isinstance(results, dict) and results.get("done") is True
+
+
+def message_text(worker, label, when, pushed, record_name, kept=False, failure=None, done=False):
+    if done:   # a pod that finished and sat idle is not a failure
+        text = ("[cloud worker ended] %s ended idle after reporting done (its results file says STATUS: done); the launcher stopped it at its %s; at %s; %s; run record: %s."
+                % (worker, label, when, pushed, record_name or "unknown"))
+    else:
+        text = ("[cloud worker ended] %s was ended by the launcher: reason %s; at %s; %s; run record: %s."
+                % (worker, label, when, pushed, record_name or "unknown"))
     if kept:
         text += " The end hook could not push: the pod was kept and the work may be unpushed."
     if failure is not None:
@@ -212,7 +223,7 @@ def push_reader(audit_path, parse):
             os.close(fd)
         found, wip, covered = None, None, False
         for raw in chunk.split(b"\n"):
-            if b"push_watch.sent" not in raw and b"cloud.created" not in raw:
+            if b"push_watch." not in raw and b"cloud.created" not in raw:
                 continue
             try:
                 item = parse(raw.decode("utf-8"))
@@ -224,7 +235,7 @@ def push_reader(audit_path, parse):
                 found, wip, covered = None, None, True
                 continue
             detail = item.get("detail")
-            if item.get("event") != "push_watch.sent" or not isinstance(detail, dict):
+            if item.get("event") not in ("push_watch.sent", "push_watch.seen") or not isinstance(detail, dict):
                 continue
             branch, sha = clean_branch(detail.get("branch")), detail.get("head")
             if branch and isinstance(sha, str) and FULL_SHA.fullmatch(sha):
@@ -236,11 +247,39 @@ def push_reader(audit_path, parse):
     return read
 
 
-def head_line(record_dir, repo, head_checks, parse, pushed=None, worker=None):
+def own_branch_head(record_dir, repo, record, parse, branch_tip):
+    """(branch, full sha) when the pod's task branch (the record's --branch) stands, on GitHub, at the very sha the pod ended on (run.json head_sha), else None.
+    The one proof that needs no push line: a pod whose pushes the push watch did not audit (pushed between two ticks, a sha already told under the wip branch). Any failure is None."""
+    run = read_small(os.path.join(record_dir, "run.json"), parse) if record_dir else None
+    branch, sha = (record or {}).get("branch"), run.get("head_sha") if isinstance(run, dict) else None
+    if branch_tip is None or not clean_branch(branch) or not ref_shape(branch) or not re.fullmatch(r"[A-Za-z0-9_-][A-Za-z0-9._-]*/[A-Za-z0-9_-][A-Za-z0-9._-]*", repo if isinstance(repo, str) else "") or branch in NOT_OWN or branch == (record or {}).get("default_branch"):
+        return None
+    if not (isinstance(sha, str) and FULL_SHA.fullmatch(sha)) or not (isinstance(repo, str) and repo):
+        return None
+    try:
+        return (branch, sha) if branch_tip(repo, branch) == sha else None
+    except Exception:
+        return None
+
+
+NOT_OWN = ("main", "master", "integration", "HEAD")
+
+
+def ref_shape(branch):
+    """True for a branch name that is one plain ref path: no empty, `.`-leading or `.lock` segment, no `..`, no edge slash (it is put in a GitHub API path)."""
+    parts = branch.split("/")
+    return ".." not in branch and all(p and not p.startswith(".") and not p.endswith((".lock", ".")) for p in parts)
+
+
+def head_line(record_dir, repo, head_checks, parse, pushed=None, worker=None, record=None, branch_tip=None):
     """#2267: the last head the pod pushed (branch, short sha) and its check state; `head_checks(repo, sha)` is handed in (this module reads no network).
     `pushed` is the pod's newest own push (branch, sha) from the switchboard audit: used when the end hook found nothing or no head."""
     run = read_small(os.path.join(record_dir, "run.json"), parse) if record_dir else None
     hook = run.get("end_hook") if isinstance(run, dict) else None
+    if not (pushed and pushed != UNPROVEN and pushed[0] != "%s/wip" % worker):   # no audited real push: the task branch standing at the pod's own head is one
+        own = own_branch_head(record_dir, repo, record, parse, branch_tip)
+        if own:
+            return finish_head(repo, own[0], own[1], head_checks)
     if isinstance(hook, dict) and hook.get("head_on") is None and hook.get("wip_branch") is None and not hook.get("error"):
         if not pushed:
             # a PR marked ready proves a push the push watch may not see (a branch of the pod's own choosing): not "nothing pushed"
@@ -271,7 +310,7 @@ def finish_head(repo, branch, sha, head_checks):
     return "Last head: %s@%s, checks %s." % (branch, sha[:8], re.sub(r"[^A-Za-z0-9 :,._/#()-]", "?", state)[:200])
 
 
-def scan_audit(audit_file, state_file, cloud_dir, last_reports, send, parse, audit=None, last_text=None, head_checks=None, last_push=None):
+def scan_audit(audit_file, state_file, cloud_dir, last_reports, send, parse, audit=None, last_text=None, head_checks=None, last_push=None, branch_tip=None):
     """One pass. `send(recipient, text)` is the daemon's own send path. Returns [(recipient, text)] handed to it. `last_text(directory, worker)` (ask #1788)
     gives (block, None) or (None, why): the boss's copy, not the Chief of Staff's, ends with the pod's last text, framed as untrusted.
     `last_push(worker)` gives (branch, full sha) of the pod's newest own push or None (see push_reader)."""
@@ -324,14 +363,15 @@ def scan_audit(audit_file, state_file, cloud_dir, last_reports, send, parse, aud
             boss = retired_boss(cloud_dir, worker, parse)   # the live record is gone: the boss the launcher kept at the removal
         name = record_name_of(worker, record_name)
         pushed = pushed_text(raw_dir(reason), parse) if name else "unknown"
-        text = message_text(worker, label, when_text(line.get("ts")), pushed, name, line["ok"] is False)
+        done = bool(name) and cause in ("idle", "hard") and reported_done(raw_dir(reason), parse)
+        text = message_text(worker, label, when_text(line.get("ts")), pushed, name, line["ok"] is False, None, done)
         text += " " + pr_line(raw_dir(reason), parse) + "."
         if head_checks is not None and cause in ("idle", "hard"):
             try:
                 own = last_push(worker) if last_push is not None else None
             except Exception:
                 own = None   # fail mode: no own push is known, the line says what the end hook shows (as before this reader)
-            text += " " + head_line(raw_dir(reason) if name else "", (record or {}).get("repo"), head_checks, parse, own, worker)
+            text += " " + head_line(raw_dir(reason) if name else "", (record or {}).get("repo"), head_checks, parse, own, worker, record, branch_tip)
         keys.append(key)
         to_list = [CHIEF] + ([boss] if isinstance(boss, str) and AGENT_NAME.fullmatch(boss) and boss != CHIEF else [])
         boss_text = text
