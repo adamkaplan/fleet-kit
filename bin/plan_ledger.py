@@ -1026,7 +1026,7 @@ def evaluate_gates(plan, entries, ledger_problem, facts, pr, now=None):
                                                       % ("; ".join(floor.get("reasons") or []) or "hold")])
             # (#2379) the merge-captain label is the only hold signal: a body line without it is a PR that is not held, so there is no
             # 'marker without a hold' wording any more.
-            elif (facts or {}).get("captain", False) is None:   # the labels were not readable: not "not held" (#2379)
+            elif (facts or {}).get("captain") is None:   # the labels (or the fact itself) were not readable: not "not held" (#2379)
                 row.update(status="waiting", missing=["labels could not be read: whether the PR is held for the owner is not known, so it is NOT READY"])
             elif (facts or {}).get("captain"):
                 row.update(status="waiting", missing=["held for the owner (merge-captain label): the owner decides, through cos"])
@@ -1036,7 +1036,7 @@ def evaluate_gates(plan, entries, ledger_problem, facts, pr, now=None):
             floor = (facts or {}).get("floor")
             # held = the same reading as `pr-explain --check`: a hold label, the merge-captain label or marker, or an uncleared floor hold; a missing
             # `held_check` on a held PR fails closed (missing)
-            held = bool((facts or {}).get("captain")) or bool((facts or {}).get("holds")) or (isinstance(floor, dict) and (bool(floor.get("rehold")) or (floor.get("decision") == "hold" and not floor.get("cleared"))))
+            held = (facts or {}).get("captain", False) is None or bool((facts or {}).get("captain")) or bool((facts or {}).get("holds")) or (isinstance(floor, dict) and (bool(floor.get("rehold")) or (floor.get("decision") == "hold" and not floor.get("cleared"))))
             check = (facts or {}).get("held_check")   # the ONE check (`held_defects` in the switchboard), called only for a held PR
             if not held:
                 row.update(status="n/a", detail="not a held PR")

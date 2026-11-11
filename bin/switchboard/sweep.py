@@ -535,6 +535,8 @@ def sweep_gate_reading(engine, repo, number, now):
             return None, None, None, _one_line("the ledger could not be read: %s" % ctx.problem, 120)
         if ((ctx.facts or {}).get("carries") or {}).get("unreadable"):   # the dependency named by CARRIES: could not be read: not checked
             return None, None, None, "the carried dependency could not be read"
+        if (ctx.facts or {}).get("captain", False) is None:   # (#2379) labels that could not be read: held or not is unknown, G6 would wait: not a ready reading
+            return None, None, None, "the labels could not be read"
         if (ctx.facts or {}).get("body_unreadable"):   # a body that is not text: G5 and the held-body check would say missing
             return None, None, None, "the body could not be read"
         report = plan_ledger.evaluate_gates(ctx.plan, ctx.entries, ctx.problem, ctx.facts if ctx.facts.get("head") or ctx.facts.get("body") else None, ctx.pr, now=now)

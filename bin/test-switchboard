@@ -22864,7 +22864,8 @@ class TestSweep(Base):
         ("body", "the body is empty", {"body": ""}, {}, "not ready"),
         ("body", "the body is None", {"body": None}, {}, "not ready"),
         ("body_unreadable", "the body is not text", {"body_unreadable": True}, {}, "not checked"),
-        ("captain", "captain None and no floor: G6 is not open", {"captain": None}, {}, "not ready"),
+        ("captain", "captain False (readable, not held) and no floor: G6 is open", {"captain": False}, {}, "not ready"),
+        ("captain", "captain None (labels unreadable): G6 waits, the board is not a ready reading", {"captain": None}, {}, "not checked"),
         ("holds", "holds None (only the label of a hold)", {"holds": None}, {}, "ready"),
         ("holds", "holds absent", {"holds": KeyError}, {}, "ready"),
         ("author", "author None: the proof writers still exclude", {"author": None}, {}, "ready"),
@@ -22879,7 +22880,7 @@ class TestSweep(Base):
         ("floor", "floor of the wrong type", {"floor": "hold"}, {}, "not checked"),
         ("floor", "re-hold unreadable", {"floor": {"decision": "hold", "unreadable": "bad json", "rehold": None}}, {}, "not checked"),
         ("floor", "floor absent, the label alone holds", {"floor": KeyError}, {}, "ready"),
-        ("floor", "floor absent and no label", {"floor": KeyError, "captain": None}, {}, "not ready"),
+        ("floor", "floor absent and no label", {"floor": KeyError, "captain": False}, {}, "not ready"),
         ("carries", "the dependency is unreadable", {"carries": {"pr": "acme/api#5", "refusal": "x", "unreadable": True}}, {}, "not checked"),
         ("carries", "the dependency is refused", {"carries": {"pr": "acme/api#5", "refusal": "closed unmerged"}}, {}, "not ready"),
     )
