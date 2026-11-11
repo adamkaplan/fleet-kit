@@ -67087,7 +67087,7 @@ TestStopFinalMessage, TestStopFinalMessageMutants, TestStopFinalMessageTwoRuns, 
     _stop_final.TestStopFinalMessageTwoRunsMutant, _stop_final.TestStopFinalMessageHardening, _stop_final.TestStopFinalMessageHardeningMutant)
 TestStopFinalMessageEdges, TestStopFinalMessageEdgesMutant = _stop_final.TestStopFinalMessageEdges, _stop_final.TestStopFinalMessageEdgesMutant
 TestStopFinalMessageBare, TestStopFinalMessageBareMutant = _stop_final.TestStopFinalMessageBare, _stop_final.TestStopFinalMessageBareMutant
-TestScratchGuard = importlib.import_module("test_scratch_command").TestScratchGuard; _ntt = importlib.import_module("test_notices_truth"); TestEndNoticeLastHead, TestRedCiOwnedByItsAsk, TestReadOfAnEndedWorker, TestRunRecordKeepsTheResultsFile, TestBranchTipRead = _ntt.TestEndNoticeLastHead, _ntt.TestRedCiOwnedByItsAsk, _ntt.TestReadOfAnEndedWorker, _ntt.TestRunRecordKeepsTheResultsFile, _ntt.TestBranchTipRead   # ask #2392
+TestScratchGuard = importlib.import_module("test_scratch_command").TestScratchGuard; _ntt = importlib.import_module("test_notices_truth"); TestEndNoticeLastHead, TestRedCiOwnedByItsAsk, TestReadOfAnEndedWorker, TestRunRecordKeepsTheResultsFile, TestBranchTipRead, TestTheProductionWiring = _ntt.TestEndNoticeLastHead, _ntt.TestRedCiOwnedByItsAsk, _ntt.TestReadOfAnEndedWorker, _ntt.TestRunRecordKeepsTheResultsFile, _ntt.TestBranchTipRead, _ntt.TestTheProductionWiring   # ask #2392
 
 # The host-disk tests of #2081.
 TestHostDisk = importlib.import_module("test_host_disk").TestHostDisk
@@ -80401,7 +80401,7 @@ NOT_ISOLATED_BY_BASE = {
     "TestEveryTestClassIsolates", "BodyRig", "TestDirectReads", "TestGateProbeReads", "TestGhBodyGuard", "TestGhBodyMutants", "TestGhBodyRefusalIsPure",
     "TestImpactEntriesLoader", "TestImpactEntriesMerge", "TestImpactEntriesMissing",   # (#2247) each makes its own private directory (a mkdtemp or a TemporaryDirectory); the files came with #2215, #2219, #2220
     "Case", "HeaderCacheBase", "TestCloudWatchBounds", "TestCloudWatchTick", "TestGatePass", "TestHostDisk", "TestIsolation", "TestSafety",
-    "TestBatchCarry", "TestGhBodyReadHasItsOwnClock", "TestEndNoticeLastHead", "TestReadOfAnEndedWorker", "TestRunRecordKeepsTheResultsFile",   # (#2247, #2392) each makes its own TemporaryDirectory or mkdtemp (removed by addCleanup; TestReadOfAnEndedWorker also patches CW_RUN_RECORD_DIR to it) and reads no real state; TestBatchCarry and TestGhBodyReadHasItsOwnClock came with #1028 and #2257, the last three with #2392
+    "TestBatchCarry", "TestGhBodyReadHasItsOwnClock", "TestEndNoticeLastHead", "TestReadOfAnEndedWorker", "TestRunRecordKeepsTheResultsFile", "TestTheProductionWiring",   # (#2247, #2392) each makes its own TemporaryDirectory or mkdtemp (removed by addCleanup; TestReadOfAnEndedWorker also patches CW_RUN_RECORD_DIR to it) and reads no real state; TestBatchCarry and TestGhBodyReadHasItsOwnClock came with #1028 and #2257, the last three with #2392
     "TestPodReportedLostOnlyWhenSilent",   # (#2247) its Rig makes its own tempfile.mkdtemp for the engine, the launcher log and the memory, and reads no real state; the class came with #2261
     "TestStopFinalMessage", "TestStopFinalMessageBare", "TestStopFinalMessageEdges", "TestStopFinalMessageHardening", "TestStopFinalMessageTwoRuns",
     "TestEndNoticeHeadLine", "TestPodReportedLostOnlyWhenSilent",   # (#2247) each builds its own temp directory through its rig (StopWorld mkdtemp; Rig mkdtemp); the files came with #2267 and #2255
