@@ -3164,8 +3164,17 @@ def _stall_watch():
     """#2399: the stall watch module (cloud/launcher/stall_watch.py), or None where it is not shipped (the token service's image copies only some launcher files)."""
     try:
         return __import__("stall_watch")
-    except ImportError:
+    except Exception:
         return None
+
+
+def _stall_text(launcher):
+    """#2399: the two counts of the pass line (empty when the stall watch is absent or has not run)."""
+    sw = _stall_watch()
+    try:
+        return sw.pass_text(launcher) if sw is not None else ""
+    except Exception:
+        return ""
 
 
 class Launcher:
@@ -6003,7 +6012,7 @@ def _reap_main(env, a, sleep, clock=None, refresher=None, kube=None, ticker_wait
             try:
                 work = L.reap() if L is not None else []   # the pass's own work: the workers' results
             finally:
-                print("cloud-worker: reaper pass line: cpu_seconds=%.3f audit_lines_parsed=%d%s" % (time.thread_time() - cpu0, tail_lines_parsed() - parsed0, step_text(getattr(L, "step_seconds", None)) + (_stall_watch().pass_text(L) if _stall_watch() else "")), file=sys.stderr)
+                print("cloud-worker: reaper pass line: cpu_seconds=%.3f audit_lines_parsed=%d%s" % (time.thread_time() - cpu0, tail_lines_parsed() - parsed0, step_text(getattr(L, "step_seconds", None)) + _stall_text(L)), file=sys.stderr)
             took = (clock() - began).total_seconds()
             if L is not None:
                 L.note_slow_pass(took)

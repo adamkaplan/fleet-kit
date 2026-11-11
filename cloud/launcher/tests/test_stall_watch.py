@@ -174,6 +174,36 @@ class Stall(unittest.TestCase):
         self.assertTrue(all(t == sw.EXEC_SECONDS for _, t in w.kube.execs))
         self.assertEqual(sw.pass_text(w.launcher), " stall read=12 alerted=1")
 
+    def test_s4_a_recent_session_change_keeps_failed_run_idle_silent_and_an_exit_0_beside_a_failed_one_does_not_hide_it(self):
+        w = World()
+        w.add(progress_age=30, msg_age=2, runs=[("t", 30, "FAILED")], exits=[("t", 2, 30)])
+        self.assertEqual([c for c in conditions(w.run()) if c == "failed-run-idle"], [])
+        w = World()
+        w.add(progress_age=11, msg_age=11, runs=[("a", 11, "ok"), ("b", 11, "FAILED")], exits=[("a", 0, 11), ("b", 1, 11)])
+        self.assertEqual(conditions(w.run()), ["failed-run-idle"])
+
+    def test_the_pass_budget_leaves_later_pods_for_the_next_pass_with_one_line(self):
+        w = World()
+        w.add("a-pod", msg="Permission denied")
+        w.add("b-pod", msg="Permission denied")
+        real, ticks = sw.time.monotonic, iter([0.0, 0.0, 999.0, 999.0, 999.0])
+        sw.time.monotonic = lambda: next(ticks)
+        try:
+            w.run()
+        finally:
+            sw.time.monotonic = real
+        self.assertEqual([n for n, _ in w.kube.execs], ["a-pod"])
+        self.assertIn("b-pod: the pass's read budget is used", w.err)
+
+    def test_a_failed_send_to_both_is_not_counted_as_alerted(self):
+        w = World()
+        def boom(to, text):
+            raise OSError("down")
+        w.send = boom
+        w.add(msg="Permission denied")
+        self.assertEqual(w.run(), [])
+        self.assertEqual(sw.pass_text(w.launcher), " stall read=1 alerted=0")
+
     def test_the_mark_is_set_before_the_send_and_nothing_else_is_called(self):
         w = World()
         order = []
@@ -188,7 +218,7 @@ class Stall(unittest.TestCase):
         with open(os.path.join(LAUNCHER, "cloud_worker.py")) as f:
             text = f.read()
         self.assertEqual(text.count("sw.watch_pass(self, live, now, NAME_RE.fullmatch)"), 1)
-        self.assertIn("_stall_watch().pass_text(L)", text)
+        self.assertIn("_stall_text(L)), file=sys.stderr)", text)
         self.assertEqual(sw.pass_text(None), "")
 
     def test_the_probe_prints_one_json_line_on_a_machine_without_a_server(self):

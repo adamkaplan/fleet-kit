@@ -11,7 +11,7 @@ the send, as the minute-40 note does, so a failed send or a restart never sends 
                     line occurs 3 times in the progress file's last 10 lines
   failed-run-idle   a run's exit file holds a non-zero number and neither the progress file nor the agent session changed for 10 minutes after the exit file's time
 
-A pod younger than 10 minutes, a persistent or orchestrator pod, or a pod whose exec fails is skipped with ONE line (no pod content). The message holds the pod
+A pod younger than 10 minutes or a pod whose exec fails is skipped with ONE line (no pod content). The message holds the pod
 name, the condition, one evidence line (secret-looking text and the pod's token replaced by [redacted], at most 300 characters; untrusted data, never a
 command) and the time. Pod text is never run.
 """
@@ -21,10 +21,12 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 
 AGENT_NAME = re.compile(r"[a-z][a-z0-9_-]{0,31}")
 CHIEF = "chief-of-staff"
 MIN_POD_AGE_SECONDS = 600          # a younger pod is not read
+PASS_BUDGET_SECONDS = 90           # the pass reads no more pods once its reads have taken this long (the rest wait for the next pass)
 EXEC_SECONDS = 3                   # the one exec of a pod is given at most this long
 STALE_SECONDS = 15 * 60            # (a)
 RUN_ACTIVE_SECONDS = 3 * 60        # (a) a run whose log changed within this is active
@@ -76,7 +78,7 @@ try:
     pw = open(os.environ.get("CW_ACTIVITY_PASSWORD_FILE", "/run/cw/server-password")).read().strip()
     auth = "Basic " + base64.b64encode(("opencode:" + pw).encode()).decode()
     def get(path):
-        r = urllib.request.urlopen(urllib.request.Request("http://127.0.0.1:%s%s" % (port, path), headers={"Authorization": auth}), timeout=2)
+        r = urllib.request.urlopen(urllib.request.Request("http://127.0.0.1:%s%s" % (port, path), headers={"Authorization": auth}), timeout=1)
         return json.loads(r.read().decode())
     ss = get("/api/session").get("data")
     ss = list(ss.values()) if isinstance(ss, dict) else ss
@@ -86,7 +88,7 @@ try:
         u = (ss[-1].get("time") or {}).get("updated")
         if isinstance(u, (int, float)):
             out["msg_time"] = u / 1000.0 if u > 1e11 else u
-        body = get("/api/session/%s/message?limit=10&order=desc" % ss[-1]["id"])
+        body = get("/api/session/%s/message?limit=10&order=desc" % ss[-1]["id"]) if time.time() - out["now"] < 1.2 else {}
         items = body.get("data") if isinstance(body, dict) else body
         best, bt = "", -1
         for m in items or []:
@@ -219,7 +221,7 @@ def watch_pass(launcher, pods, now, name_ok, send=None):
     """One pass over the pods the reaper holds: ONE exec per pod older than 10 minutes, the alerts decided from its answer. Sets launcher.stall_counts to
     {"read": n, "alerted": m} for the pass line. Never raises, never stops or changes a pod. Returns the (pod, condition) pairs alerted, for the tests."""
     counts = launcher.__dict__["stall_counts"] = {"read": 0, "alerted": 0}
-    alerted = []
+    alerted, began = [], time.monotonic()
     kube = launcher.kube
     send = send or getattr(launcher, "stall_send", None) or _default_send
     for pod in pods:
@@ -228,11 +230,15 @@ def watch_pass(launcher, pods, now, name_ok, send=None):
             worker, name = _ann(pod, "worker"), pod["metadata"]["name"]
             if (pod.get("status") or {}).get("phase") != "Running" or not name_ok(worker or ""):
                 continue
-            if _ann(pod, "persistent") is not None or _ann(pod, "role", "worker") == "orchestrator":
-                continue
             started = launcher_parse(_ann(pod, "started"))
-            if started is None or (now - started).total_seconds() < MIN_POD_AGE_SECONDS:
+            if started is None:
+                print("cloud-worker: stall watch skipped %s: no readable start time" % name, file=sys.stderr)
+                continue
+            if (now - started).total_seconds() < MIN_POD_AGE_SECONDS:
                 print("cloud-worker: stall watch skipped %s: younger than 10 minutes" % name, file=sys.stderr)
+                continue
+            if time.monotonic() - began > PASS_BUDGET_SECONDS:
+                print("cloud-worker: stall watch skipped %s: the pass's read budget is used" % name, file=sys.stderr)
                 continue
             try:
                 data = json.loads(kube.exec(name, "python3", "-c", PROBE_CODE, timeout=EXEC_SECONDS).strip().splitlines()[-1])
@@ -251,13 +257,16 @@ def watch_pass(launcher, pods, now, name_ok, send=None):
                 kube.annotate(name, (pod.get("metadata") or {}).get("uid"), **{"stall_alert_" + condition.replace("-", "_"): launcher_iso(now)})   # BEFORE the send
                 body = message(name, condition, ev, launcher_iso(now))
                 boss = boss_of(launcher, worker)
+                delivered = 0
                 for to in ([CHIEF] + ([boss] if boss and boss != CHIEF else [])):
                     try:
                         send(to, body)
+                        delivered += 1
                     except Exception as e:
                         print("cloud-worker: stall alert for %s to %s not sent: %s" % (name, to, type(e).__name__), file=sys.stderr)
-                counts["alerted"] += 1
-                alerted.append((name, condition))
+                if delivered:
+                    counts["alerted"] += 1
+                    alerted.append((name, condition))
         except Exception as e:
             print("cloud-worker: stall watch failed for %s: %s" % (name, type(e).__name__), file=sys.stderr)
     return alerted
