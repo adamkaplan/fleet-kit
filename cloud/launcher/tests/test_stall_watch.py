@@ -346,12 +346,13 @@ class Stall(unittest.TestCase):
         # the control inside: an unfinished pod stale for 16 minutes is alerted
         if conditions(self._finished(module, tail=("working",))) != ["progress-stale"]:
             raise AssertionError("a stale pod was not alerted")
-        for kw in (dict(tail=("x", "done")), dict(tail=("x", " DONE  ")), dict(tail=("STATUS: done",)), dict(tail=("x",), results="STATUS: done"), dict(tail=("Blocked", "done"))):
+        for kw in (dict(tail=("x", "done")), dict(tail=("x", " DONE  ")), dict(tail=("STATUS: done",)), dict(tail=("x",), results="STATUS: done")):
             if self._finished(module, **kw) != []:
                 raise AssertionError("a finished pod was alerted as stalled: %r" % (kw,))
 
     def test_a_finished_pod_is_not_stalled_and_a_mid_sentence_done_still_fires(self):
         self._finished_cases(sw)   # the control: the unmutated module passes
+        self.assertEqual(conditions(self._finished(sw, tail=("Blocked", "done"))), ["refusal"])   # (b) still fires for a finished pod
         self.assertEqual(conditions(self._finished(sw, tail=("not done yet",))), ["progress-stale"])
         self.assertEqual(conditions(self._finished(sw, tail=("done", "more work"))), ["progress-stale"])
         self.assertEqual(conditions(self._finished(sw, tail=("x",), results="STATUS: running")), ["progress-stale"])
@@ -362,10 +363,10 @@ class Stall(unittest.TestCase):
     def test_a_mutant_that_ignores_the_finished_marker_fails_with_the_anchored_text(self):
         with open(SOURCE) as f:
             text = f.read()
-        old = '    if last_p in ("done", "status: done") or'
+        old = '    finished = last_p in ("done", "status: done") or'
         self.assertEqual(text.count(old), 1, "the mutation did not apply")
         mod = types.ModuleType("stall_watch_mutant2")
-        exec(compile(text.replace(old, "    if False and last_p in () or False and"), "mutant", "exec"), mod.__dict__)
+        exec(compile(text.replace(old, "    finished = False and last_p in () or False and"), "mutant", "exec"), mod.__dict__)
         with self.assertRaises(AssertionError) as caught:
             self._finished_cases(mod)
         self.assertIn("a finished pod was alerted as stalled", str(caught.exception))
