@@ -153,7 +153,7 @@ def write_private(directory, name, text):
 class Recorder:
     def __init__(self, kube, env, clock=time.monotonic):
         self.kube, self.env, self.clock = kube, env, clock
-        self.deadline = None
+        self.deadline, self.secrets_ok = None, False
 
     def left(self):
         """Seconds of the record phase that remain; raises RecordTimeout when none. No deadline set: effectively none."""
@@ -173,6 +173,7 @@ class Recorder:
     def _learn_secrets(self, pod):
         """Register the pod's run secrets (so the scrub knows them) and return the server password."""
         password = ""
+        self.secrets_ok = True   # ask #2392: False once a secret could not be learned: the pod's results file is then not kept (its scrub could miss a plain secret)
         try:
             names = [n for n in self._exec(pod, "ls", "-1", "/run/cw").split()
                      if re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", n)][:SECRET_FILES_MAX]
@@ -181,6 +182,7 @@ class Recorder:
         except Exception:
             self.left()   # a call cut by the deadline is a timeout, not "no secrets"
             names = []
+            self.secrets_ok = False
         for n in names:
             try:
                 text = self._exec(pod, "cat", "/run/cw/" + n)[:1024 * 1024]
@@ -188,6 +190,7 @@ class Recorder:
                 raise
             except Exception:
                 self.left()
+                self.secrets_ok = False
                 continue
             if n == "model-auth":
                 self.kube.add_secrets(text.strip())   # the model entry never leaves (open choice b)
@@ -369,7 +372,7 @@ class Recorder:
                     self._write_transcript(directory, msgs, info)
             finally:
                 info["head_sha"] = self.head_sha(pod)
-                found = self.results_file(pod)   # ask #2392: the pod's /work/results.txt, kept for the end notice and `read` of an ended pod
+                found = self.results_file(pod) if getattr(self, "secrets_ok", False) else None   # ask #2392: the pod's /work/results.txt, kept for the end notice and `read` of an ended pod
                 if found is not None:
                     info["results"] = found
         except Exception as e:   # includes RecursionError and MemoryError; an interrupt (BaseException) passes through

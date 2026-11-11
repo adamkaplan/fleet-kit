@@ -150,6 +150,7 @@ class TestEndNoticeLastHead(unittest.TestCase):
         self.assertIn("ended idle after reporting done", text)
         self.assertNotIn("was ended by the launcher", text)
         self.assertNotIn("all done", text)
+        self.assertIn("Last head:", text, "the head line is not hidden by the done wording")
 
     def test_a_pod_without_that_record_keeps_the_wording(self):
         for results in (None, {"done": False, "text": "working"}, "STATUS: done"):
@@ -368,13 +369,15 @@ class TestRunRecordKeepsTheResultsFile(unittest.TestCase):
         spec.loader.exec_module(module)
         return module
 
-    def recorder(self, answer, module=None):
+    def recorder(self, answer, module=None, secrets_fail=False):
         module = module or self.load()
         calls = []
 
         class Kube:
             def exec(self_, pod, *cmd, **kw):
                 calls.append(cmd)
+                if cmd[0] == "ls" and secrets_fail:
+                    raise OSError("the pod's secrets could not be listed")
                 if cmd[0] == "sh":
                     if isinstance(answer, Exception):
                         raise answer
@@ -439,15 +442,24 @@ class TestRunRecordKeepsTheResultsFile(unittest.TestCase):
         rec, _calls = self.recorder("all good\nSTATUS: done\n", module)
         root = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, root, True)
-        rec.read_messages = lambda pod: (None, "no server in this test")
+        rec.read_messages = lambda pod: (None, rec._learn_secrets(pod) or "no server in this test")
         directory = rec.record("pod-y", "pod-y", "idle", repo="o/r", root=root)
         run = json.loads((Path(directory) / "run.json").read_text())
         self.assertEqual((run["results"]["done"], run["head_sha"]), (True, "c" * 40))
         self.assertTrue(run["results"]["text"].rstrip().endswith("STATUS: done"))
         rec, _calls = self.recorder("", module)
-        rec.read_messages = lambda pod: (None, "no server in this test")
+        rec.read_messages = lambda pod: (None, rec._learn_secrets(pod) or "no server in this test")
         bare = json.loads((Path(rec.record("pod-z", "pod-z", "idle", repo="o/r", root=root)) / "run.json").read_text())
         self.assertNotIn("results", bare, "a pod with no results file leaves the key out")
+
+    def test_a_pod_whose_secrets_could_not_be_learned_keeps_no_results_file(self):
+        module = self.load()
+        rec, _calls = self.recorder("a plain secret value\nSTATUS: done\n", module, secrets_fail=True)
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root, True)
+        rec.read_messages = lambda pod: (None, rec._learn_secrets(pod) or "no server in this test")   # read_messages learns the secrets first, then finds no server
+        run = json.loads((Path(rec.record("pod-y", "pod-y", "idle", repo="o/r", root=root)) / "run.json").read_text())
+        self.assertNotIn("results", run)
 
     def test_control_without_the_line_in_record_the_run_json_has_no_results(self):
         text = (BIN.parent / "cloud" / "launcher" / "run_record.py").read_text()
@@ -458,7 +470,7 @@ class TestRunRecordKeepsTheResultsFile(unittest.TestCase):
         rec, _calls = self.recorder("all good\nSTATUS: done\n", was)
         root = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, root, True)
-        rec.read_messages = lambda pod: (None, "no server in this test")
+        rec.read_messages = lambda pod: (None, rec._learn_secrets(pod) or "no server in this test")
         run = json.loads((Path(rec.record("pod-y", "pod-y", "idle", repo="o/r", root=root)) / "run.json").read_text())
         self.assertNotIn("results", run)
 
