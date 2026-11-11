@@ -278,12 +278,16 @@ def order_problems(keys):
     return [k for k in MOVED_DENY_ORDER if keys.index(k) < last_allow]
 
 
-PINNED = {'guard.sh': '317c68947ba4968d692e6d251a5b7e71db7d41cbc29205bed1f9823a9ea7c73d'}
+PINNED = {'guard.sh': 'b8f86ad11591e3f2a6d22d414d1a4230849efa3be055dbd78c23d105e510e2cd'}
 PINNED_JSON_WITHOUT_ADDED_ROWS = "c14522cff99b9223d881b9f80a3d3397f55ae15a5d6f12a2380b89c9de6fd4be"
 # Rows added to opencode-worker.json, in file order. A pin changes only in the ask whose approved plan names the rows:
 # Lower and capitalised method words after -X or --method are denied too (the glob is case sensitive; a mixed form such as pOsT is not covered here, the client refuses it).
 # asks 1166 and 1200 add their rows to THIS list.
 ADDED_ROWS = [   # ask 1083: DW-6 (read an issue's comments and the two pull request read paths, GET only; write methods and flags stay denied)
+    ('git*push*--no-verify*', 'deny'),   # ask 2371: the pod's pre-push hook is global; these rows refuse the agent's own bypass (a convenience)
+    ('*push*--no-verify*', 'deny'),
+    ('*core.hooksPath*', 'deny'),
+    ('*hooksPath=*', 'deny'),
     ('gh api*/issues/*/comments', 'allow'),
     ('gh api*/issues/*/comments *', 'allow'),
     ('gh api*/issues/*/comments?*', 'allow'),
