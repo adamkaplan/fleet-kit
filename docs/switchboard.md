@@ -548,6 +548,7 @@ SG1 before PR 5 builds on them.
 | "Webhook forwarding is only designed for use during testing and development. It is not supported for use in production environments." | Acceptable for one person's local fleet. If GitHub withdraws it, fall back to the catch-up read on a long interval |
 | "Only one person can use webhook forwarding at a time for each repository and organization." A second forwarder gets `Hook already exists` | The daemon reports the conflict in `status` and a toast, and falls back to catch-up reads for that repo |
 | Creating the hook requires admin on the repo; `--org` needs the `admin:org_hook` scope | `fleet-doctor` checks for admin before a repo is watched. From PR 15, a repo whose forwarder fails for this reason (or because the repo does not exist yet) is read on a poll instead, shown in `status`, with one toast |
+| `gh webhook forward` makes a `cli` hook (url `https://webhook-forwarder.github.com/hook`) and removes it only on a clean exit; a repo holds 20 hooks, and a full repo answers the next forwarder `HTTP 422` (#2397) | Before a start the daemon removes every `cli` hook with that url (a hook of any other name or url is never listed for removal; at a start no forwarder child of this daemon runs for the repo, so all of them are stale; one daemon per repo is the supported setup; after a `Hook already exists` conflict only INACTIVE hooks are removed, because another forwarder's live hook is active). On a stop it removes the one hook the forwarder made (the one forwarder hook that is new since the start; two or none: it removes nothing). A failed list or removal (a token without `admin:repo_hook`) never stops the start: one audit line `github.hooks` per repo and a note in `status` naming the scope |
 | `--secret` is passed on the command line, so other local users can see it in `ps` | A new secret for every forwarder start, never stored. Acceptable on a single-user machine |
 
 | Spike | Passes when |
@@ -2747,6 +2748,8 @@ path, any `gh api graphql` mutation (a node id cannot be tied to a repository, s
 call reads again. Reads are never refused. `fleet-switchboard` checks the key when it loads the config (`hold_labels` entries need a
 printable `label`, a one-line `message` and `allowed_removers` as agent names). The shim reads no environment variable to skip it:
 the retired `FLEET_SWITCHBOARD_OWN_GH` does not bypass it, and the switchboard's own calls reach the real gh by path, not through the shim.
+
+**The webhook delete (ask #2397).** The shim's allow-list (`REST_WRITES`, `webhook-delete`) passes exactly `DELETE repos/O/R/hooks/ID` (a numeric id). `shims/gh_body.py` reads that hook FIRST (a GET, the account the delete would use, the same bounded read and strict lookup as the body guard) and lets the delete through only when the hook's name is `cli` and its `config.url` is `https://webhook-forwarder.github.com/hook`; any other hook, a hook that cannot be read, any other method on the path and a delete of any other endpoint stay refused (one line naming the reason, never a token).
 
 **The body guard (ask #1751).** `shims/gh_body.py`, loaded by path beside the shim, is asked once per write, right after the hold check. A body write
 to an issue whose current body holds the `## Intent` heading line and the `Done when:` line is refused (exit 1, nothing passed to `gh`) when the new body

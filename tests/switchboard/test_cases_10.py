@@ -484,6 +484,7 @@ switchboard/plan_notice.py:__init__
 fleet-switchboard:_api
 switchboard/caches.py:_audit_tail
 fleet-switchboard:_call
+fleet-switchboard:_forwarder_hooks
 switchboard/docker_reaper.py:_docker_inspect
 switchboard/caches.py:_fresh
 switchboard/docker_reaper.py:_last

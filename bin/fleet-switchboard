@@ -9627,6 +9627,8 @@ GITHUB_AUDIT_KEYS = 20         # keys named in one audit line; the rest are only
 SECONDARY_READS = ("reviews", "check suites", "workflow runs", "items")
 GITHUB_REJECT_AUDITS = 20      # bad-signature audit lines per minute; the rest are only counted
 CONFLICT_TEXT = "Hook already exists"
+GITHUB_FORWARDER_HOOK_URL = "https://webhook-forwarder.github.com/hook"   # the url `gh webhook forward` gives the hook it creates (name "cli"): the only hooks the daemon ever lists for removal
+GITHUB_HOOK_REMOVALS = 30      # a safety net only: at most this many hooks are removed in one start (a repository holds 20, and the list reads one page of 100)
 WATCH_FILE = "github-watch.json"
 WATCH_STATES = ("starting", "running", "backoff", "conflict")
 
@@ -10176,7 +10178,11 @@ def red_ci_lane(hub, repo, pr, now):
 
 
 class GitHubUnavailable(Exception):
-    """A `gh api` read that did not answer; the caller tries again later."""
+    """A `gh api` read that did not answer; the caller tries again later. `status` is the HTTP status gh reported (an int), else None."""
+
+    def __init__(self, *args, status=None):
+        super().__init__(*args)
+        self.status = status
 
 
 FORWARDER_HISTORY_SECONDS = 3600
@@ -10227,6 +10233,9 @@ class Watch:
         # PR 15: a repo whose forwarder cannot work (no such repo yet, no right to make a webhook) is read on
         # a poll instead: the existing catch-up read, every github_poll_seconds.
         self.polling, self.poll_reason, self.next_poll, self.last_poll = False, None, 0.0, None
+        # the cli webhook this forwarder made: ids of the forwarder hooks that existed when it started (None: unknown), the id it made (None: not known, so none is removed), the note `status` shows
+        self.hooks_before, self.hook_id, self.hook_claim_tried, self.hook_note = None, None, False, None
+        self.conflicted = False   # someone else's forwarder held the hook at the last conflict, until a child of ours has run past the connect delay
 
     @property
     def mode(self):
@@ -10250,7 +10259,7 @@ class Watch:
                 "next_start": iso(self.next_start) if self.proc is None else None,
                 "last_catch_up": iso(self.last_catch_up), "last_error": self.last_error,
                 "drops": [[t, r] for t, r in self.drops], "down_since": self.down_since,
-                "catch_up_error": self.catch_up_error}
+                "catch_up_error": self.catch_up_error, "hook_note": self.hook_note}
 
 
 def spawn_forwarder(argv, log_path, env=None):
@@ -10262,6 +10271,13 @@ def spawn_forwarder(argv, log_path, env=None):
                                 start_new_session=True, close_fds=True)
     finally:
         os.close(fd)
+
+
+def _alive(proc):
+    try:
+        return proc is not None and proc.poll() is None
+    except Exception:
+        return False
 
 
 def _terminate(proc):
@@ -10332,6 +10348,7 @@ class GitHubHub:
         self._route_until, self._unrouted_batch, self._read_backoff = None, [], {}
         self._notices, self._filtered, self._filtered_batch = {}, set(), []   # PR 52
         self._routed_batch, self._conflicts = [], set()
+        self._hook_audited = set()   # repos whose hook-cleanup failure is already in the audit
         self.markers, self._markers_dirty, self.last_truncated = self._load_markers(), False, {}
         self._cursors, self.last_incomplete, self.last_failed_primary = {}, False, False   # #494: per repo, the steps of an unfinished catch-up window
         self.engine = None
@@ -10443,13 +10460,17 @@ class GitHubHub:
         if server is not None:
             server.shutdown()
             server.server_close()
+        stopped = []
         with self.lock:
             for watch in self.watches.values():
                 if watch.proc is not None:
+                    stopped.append((watch, _alive(watch.proc)))
                     _terminate(watch.proc)
                     watch.proc, watch.secret, watch.state = None, None, "backoff"
             self._save_markers()
             self._write_snapshot(self.now(), stopped=True)
+        for watch, alive in stopped:
+            self._release_hook(watch, alive)   # #2397: its own hook, outside the lock (a bounded call each)
 
     # -- receiving
 
@@ -10760,9 +10781,11 @@ class GitHubHub:
         for repo in joined:
             self._audit("github.watch", repo, {"state": "joined"})
         for repo, watch in gone:
+            alive = _alive(watch.proc)
             if watch.proc is not None:
                 _terminate(watch.proc)
             watch.proc = watch.secret = None
+            self._release_hook(watch, alive)
             self._audit("github.watch", repo, {"state": "left"})
 
     def prune_cursors(self):
@@ -11673,6 +11696,9 @@ class GitHubHub:
             if watch.proc is not None and watch.polling and now - watch.started >= self.catchup_delay:
                 with self.lock:  # the forwarder connected: the repo is no longer polled; one read closes the gap
                     watch.polling, watch.poll_reason, watch.catchup_at = False, None, now
+        if _alive(watch.proc) and not watch.hook_claim_tried and now - (watch.started or now) >= self.catchup_delay:
+            watch.conflicted = False   # it runs past the connect delay: no one else holds the hook
+            self._claim_hook(watch)   # the forwarder has connected: its hook exists
         if watch.proc is None and now >= watch.next_start:
             self._start(watch, now)
         if watch.polling and now >= watch.next_poll:
@@ -11695,12 +11721,126 @@ class GitHubHub:
         directory.mkdir(mode=0o700, exist_ok=True)
         return directory / ("forward-%s.log" % watch.repo.replace("/", "-"))
 
+    # -- the cli webhooks the forwarders make (#2397): `gh webhook forward` creates one and removes it only on a clean exit
+
+    def _hook_api(self, repo, env, args):
+        """One bounded `gh api` call on the repo's hooks, through the repo's account. Returns the stdout; raises GitHubUnavailable with a reason that holds no secret."""
+        extra = {"env": env} if env is not None else {}
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo) or any(part in (".", "..") for part in repo.split("/")):   # the repo is part of the path: no dot segment, no odd character
+            raise GitHubUnavailable("not a repository name")
+        try:
+            done = self.runner([self.config["gh"], "api"] + args, capture_output=True, text=True,
+                               timeout=self.config["call_timeout_seconds"], stdin=subprocess.DEVNULL, **extra)
+        except Exception as err:   # the forwarder starts whatever happens here
+            raise GitHubUnavailable(self.accounts.scrub(_one_line("%s: %s" % (type(err).__name__, err), 200))) from None
+        if done.returncode != 0:
+            raw = done.stderr or done.stdout or "exit %s" % done.returncode
+            said = self.accounts.scrub(_one_line(raw, 200))
+            found = re.search(r"\(HTTP ([0-9]{3})\)|\bHTTP ([0-9]{3})\b", raw)
+            status = int(found.group(1) or found.group(2)) if found else None   # the status, as a number: callers compare it exactly
+            if "admin:repo_hook" in said or status == 403:
+                said = "the token lacks the admin:repo_hook scope (or the right to see hooks): %s" % said
+            raise GitHubUnavailable(said, status=status)
+        return done.stdout or ""
+
+    def _forwarder_hooks(self, repo, env):
+        """{id: active} of the repo's hooks that are name 'cli' AND whose url is the forwarder url, and nothing else: no other hook is ever a candidate."""
+        try:
+            hooks = json.loads(self._hook_api(repo, env, ["repos/%s/hooks?per_page=100" % repo]) or "[]")
+        except GitHubUnavailable as err:
+            if err.status == 404 and "admin:repo_hook" not in str(err):   # GitHub answers 404 to a token that may not see hooks
+                raise GitHubUnavailable("the token lacks the admin:repo_hook scope (or the right to see hooks): %s" % err) from None
+            raise
+        except ValueError:
+            raise GitHubUnavailable("the hook list is not JSON") from None
+        if not isinstance(hooks, list):
+            raise GitHubUnavailable("the hook list is not a list")
+        found = {}
+        for hook in hooks:
+            if not isinstance(hook, dict) or hook.get("name") != "cli" or type(hook.get("id")) is not int:
+                continue
+            config = hook.get("config")
+            if isinstance(config, dict) and config.get("url") == GITHUB_FORWARDER_HOOK_URL:
+                found[hook["id"]] = bool(hook.get("active"))
+        return found
+
+    def _remove_hook(self, repo, env, hook_id):
+        try:
+            self._hook_api(repo, env, ["--method", "DELETE", "repos/%s/hooks/%d" % (repo, hook_id)])
+        except GitHubUnavailable as err:
+            if err.status != 404:
+                raise
+            # 404: most likely gone already (the forwarder removed it itself); a token that may not manage hooks is told by the list call before, which would have failed first
+
+    def _hook_failed(self, watch, reason):
+        """A failed list or removal: a note for `status` and ONE audit line per repo (for as long as the daemon runs). Never an error for the caller."""
+        with self.lock:
+            watch.hook_note = "hook cleanup failed, stale webhooks stay (20 per repo cap; the account needs the admin:repo_hook scope to clear them): %s" % reason
+            first = watch.repo not in self._hook_audited
+            self._hook_audited.add(watch.repo)
+        if first:
+            self._audit("github.hooks", watch.repo, {"error": reason})   # once per repo for as long as the daemon runs (never cleared)
+
+    def _clear_stale_hooks(self, watch, env):
+        """Before a forwarder starts: remove every cli forwarder hook of the repo. At a start no forwarder child of THIS daemon runs for the repo, so none is ours and all
+        of them are stale (a forwarder of another daemon on the same repo cannot be told apart: its hook looks the same; one daemon per repo is the supported setup, and
+        the other forwarder, when it drops, finds that out through its own start). Never raises; a failure is the note and one audit line."""
+        watch.hooks_before, watch.hook_id, watch.hook_claim_tried = None, None, False
+        # after a conflict someone else may forward, by intent: its live hook is active and looks like a stale one, so only INACTIVE hooks (never a live forwarder's) are removed then
+        only_inactive = watch.state == "conflict" or watch.conflicted
+        found = {}
+        try:
+            found = self._forwarder_hooks(watch.repo, env)
+            for hook_id in [h for h in sorted(found) if not (only_inactive and found[h])][:GITHUB_HOOK_REMOVALS]:
+                self._remove_hook(watch.repo, env, hook_id)
+                found.pop(hook_id)
+        except Exception as err:
+            self._hook_failed(watch, _one_line(str(err), 200))
+            if found:   # a removal failed: the hooks still there are known, so the forwarder's own can still be told
+                with self.lock:
+                    watch.hooks_before = set(found)
+            return
+        with self.lock:
+            watch.hooks_before, watch.hook_note = set(found), None
+
+    def _claim_hook(self, watch, found=None):
+        """Learn which hook this forwarder made: the one forwarder hook that is not among those that existed when it started (gh prints no id). Two or none: not claimed,
+        so nothing is removed for it. Never raises."""
+        if watch.hook_id is not None or watch.hooks_before is None or watch.hook_claim_tried:
+            return   # one try per start: a hook that appears later is never claimed
+        watch.hook_claim_tried = True
+        try:
+            new = set(found if found is not None else self._forwarder_hooks(watch.repo, self.child_env(watch.repo))) - watch.hooks_before
+        except Exception as err:
+            self._hook_failed(watch, _one_line(str(err), 200))
+            return
+        if len(new) == 1:
+            watch.hook_id = next(iter(new))
+
+    def _release_hook(self, watch, alive=False):
+        """A forwarder is stopped: remove the hook it made, and no other. `alive`: its child was running up to the stop (only then may a hook be claimed
+        now: a forwarder that already died made no hook that a later one could be taken for). Never raises."""
+        try:
+            connected = alive and self.now() - (watch.started or 0) >= self.catchup_delay   # before the forwarder has connected its hook may not exist yet: a hook seen now could be anyone's
+            if watch.hook_id is None and not (connected and watch.hooks_before is not None and not watch.hook_claim_tried):
+                return   # nothing can be claimed or removed: no call
+            env = self.child_env(watch.repo)
+            found = self._forwarder_hooks(watch.repo, env)   # one fresh list: the claim and the removal both rest on what exists NOW
+            if connected:
+                self._claim_hook(watch, found)
+            if watch.hook_id is not None and watch.hook_id in found:   # an id that is no longer a cli forwarder hook is never deleted
+                self._remove_hook(watch.repo, env, watch.hook_id)
+            watch.hook_id = None
+        except Exception as err:
+            self._hook_failed(watch, _one_line(str(err), 200))
+
     def _start(self, watch, now):
         try:
             env = self.child_env(watch.repo)
         except GitHubUnavailable as err:
             self._failed(watch, now, str(err))
             return
+        self._clear_stale_hooks(watch, env)   # #2397: before the forwarder asks for a new hook (a failure never stops the start)
         secret = secrets.token_hex(32)  # a new one for every start; memory and argv only
         with self.lock:
             watch.secret = secret
@@ -11730,11 +11870,13 @@ class GitHubHub:
         tail = _scrub(self._log_tail(watch), watch.secret)
         with self.lock:
             watch.proc, watch.secret = None, None
+            watch.hooks_before, watch.hook_id = None, None   # a dead forwarder owns nothing: its hook, if any, is cleared by the next start
             ran = max(0.0, now - (watch.started or now))
             watch.drops = [d for d in watch.drops if now - d[0] < FORWARDER_HISTORY_SECONDS] + [(now, ran)]
             watch.down_since = now
         if CONFLICT_TEXT in tail:
             with self.lock:
+                watch.conflicted = True
                 watch.state, watch.next_start = "conflict", now + self.conflict_retry
                 watch.last_error = "someone else is already forwarding %s (%s); catch-up reads continue" % (
                     watch.repo, CONFLICT_TEXT)
@@ -11849,13 +11991,13 @@ def github_status(config, state_dir, fleets=None, now=None):
         why = None
         if watch:
             why = "; ".join(x for x in (watch.get("poll_reason"), watch.get("last_error"),
-                                        watch.get("catch_up_error")) if x) or None
+                                        watch.get("catch_up_error"), watch.get("hook_note")) if x) or None
         marker = parse_iso(watch.get("read_marker")) if watch and watch.get("read_marker") else None
         age = max(0, (time.time() if now is None else now) - marker) if marker is not None else None
         current = time.time() if now is None else now
         health = forwarder_health(watch, current) if watch else None
         if health and health["live"]:
-            why = watch.get("poll_reason") or None  # a recovered drop is history, not an error
+            why = "; ".join(x for x in (watch.get("poll_reason"), watch.get("hook_note")) if x) or None  # a recovered drop is history, not an error
         report["detail"].append({"repo": repo, "how": how, "account": accounts.describe(repo),
                                  "agents": members.get(repo, []), "why": why, "read_age": age, "health": health})
     return report
