@@ -1,9 +1,12 @@
 """Ask #2393 (S4): a pod's end is posted on its ask: the final message and the last lines of its land log (the run record's `land_log_tail`), scrubbed and cut.
 Fake pods and a recording comment path (the daemon's own `post_ask_comment`); nothing is stopped and nothing reaches GitHub. The control removes the post (today's end)."""
 import argparse
+import inspect
+import tempfile
 import json
 import re
 import sys
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -38,7 +41,13 @@ class TestEndOnAsk(unittest.TestCase):
                    mock.patch.object(cloud, "Cluster", lambda *a, **k: cluster), mock.patch.object(cloud, "_audit", lambda eng, event, *a, **k: events.append(event)),
                    mock.patch.object(cloud, "_registry_note"), mock.patch.object(cloud, "_keep_boss"), mock.patch.object(cloud, "remove_record")]
         if mutant:   # today's end: nothing is posted on the ask
-            patches.append(mock.patch.object(cloud._retired(), "post_end", lambda *a, **k: None))
+            real = (Path(__file__).resolve().parents[2] / "bin" / "cloud_retired.py").read_text()
+            old = "        post(engine, issue, end_comment("
+            assert real.count(old) == 1
+            module = types.ModuleType("cloud_retired_today")
+            exec(compile(real.replace(old, "        (lambda *a, **k: None)(engine, issue, end_comment(", 1), "cloud_retired.py", "exec"), module.__dict__)
+            module.D = cloud._retired().D   # today's end: the comment is built and never posted
+            patches.append(mock.patch.object(cloud._retired(), "post_end", module.post_end))
         call = cloud.cmd_retire.__wrapped__ if hasattr(cloud.cmd_retire, "__wrapped__") else cloud.cmd_retire
         for p in patches:
             p.start()
@@ -132,6 +141,25 @@ class TestEndOnAsk(unittest.TestCase):
         posts, events = self.end(log="exit 0", post=RuntimeError("down"))
         self.assertEqual(posts, [])
         self.assertIn("cloud.end_post_failed", events)
+
+
+class TestLaunchRecordsTheAsk(unittest.TestCase):
+    """The launch is what gives the end post its ask: the cloud record carries `issue` (the real `_launch`, stubbed at its edges as test_first_push_notice does)."""
+
+    def launched(self, issue):
+        import test_first_push_notice as fp
+        source = inspect.getsource(fp.drive_launch).replace("save_record=lambda *a: None", "save_record=lambda st, rec: SAVED.append(dict(rec))").replace("issue=None", "issue=%r" % issue)
+        assert "SAVED.append" in source
+        space = dict(vars(fp), SAVED=[])
+        exec(compile(source, "drive_launch_issue", "exec"), space)
+        with tempfile.TemporaryDirectory() as state:
+            space["drive_launch"](fp.CW(), state)
+        return space["SAVED"][0]
+
+    def test_a_launch_with_an_ask_records_its_number_and_one_without_records_none(self):
+        self.assertEqual(self.launched(2393)["issue"], 2393)
+        self.assertIsNone(self.launched(None)["issue"])
+        self.assertEqual(self.launched(2393)["repo"], "acme/widget-api")
 
 
 if __name__ == "__main__":

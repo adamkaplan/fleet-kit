@@ -556,4 +556,7 @@ def post_end(engine, state, record, name, reason, body, post, note):
         tail = land_log_tail(where, name) if isinstance(where, str) and where else None
         post(engine, issue, end_comment(name, D["_scrub_lib"]()(reason, (), 300)[:120], block, tail), author=name, repo=repo)
     except Exception as err:
-        note(type(err).__name__[:60])
+        try:
+            note(type(err).__name__[:60])
+        except Exception:
+            pass   # a failed audit line never breaks the retire
