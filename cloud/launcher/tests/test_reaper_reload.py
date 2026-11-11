@@ -12,6 +12,7 @@ import sys
 import tempfile
 import types
 import unittest
+import unittest.mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 LAUNCHER = os.path.dirname(HERE)
@@ -22,6 +23,8 @@ from test_cloud_settings import GOOD  # noqa: E402  (a complete good settings se
 MODULE_ENV = "CW_TEST_REAPER_RELOAD_MODULE"
 T0 = dt.datetime(2026, 11, 1, 9, 0, 0, tzinfo=dt.timezone.utc)
 NEW = "acme-org/added-later"
+ANCHOR_OWN = "a value of the caller is recorded as applied"
+ANCHOR_LOCK = "the reload ran without the launcher's renew lock"
 ANCHOR = "the reaper kept the settings of its start"
 
 
@@ -53,6 +56,7 @@ class Scene:
         self.mod.apply_settings(self.env)
         self.applied = {n: self.env[n] for n, _, _ in self.mod.SETTINGS if n in self.env}
         self.state = {}
+        self.launchers = []
         self.reads = 0
         orig = self.mod.apply_settings
 
@@ -79,7 +83,7 @@ class Scene:
 
 
 class FakeKube:
-    def __init__(self):
+    def __init__(self, *a, **k):
         self.on_unauthorized = None
 
     def add_secrets(self, *a, **k):
@@ -117,6 +121,7 @@ def run_passes(scene, steps):
 
     def reap(self):
         passes.append(1)
+        scene.launchers.append(self)
         assert self.env is scene.env, "the launcher reads the reaper's own environment"
         try:
             mod.check_repo_allowed(NEW, self.env)
@@ -223,30 +228,98 @@ class Reload(unittest.TestCase):
     def test_the_reload_waits_for_the_renewal_lock(self):
         import threading
         s = self.scene()
-        lock = threading.RLock()
+        tried, done = threading.Event(), threading.Event()
+        inner = threading.RLock()
+
+        class Watched:   # tells when the reload reaches for the lock
+            def __enter__(self):
+                tried.set()
+                return inner.__enter__()
+
+            def __exit__(self, *a):
+                return inner.__exit__(*a)
+        lock = Watched()
         s.write(text(CW_ALLOWED_REPOS=GOOD["CW_ALLOWED_REPOS"] + "," + NEW))
-        done = threading.Event()
 
         def work():
             s.mod.reload_settings(s.env, s.applied, s.state, lock)
             done.set()
-        with lock:   # the renewal thread is mid-renewal
-            th = threading.Thread(target=work)
+        with inner:   # the renewal thread is mid-renewal
+            th = threading.Thread(target=work, daemon=True)
             th.start()
-            self.assertFalse(done.wait(0.3), "the reload did not wait")
+            self.assertTrue(tried.wait(10), "the reload never reached for the lock")
+            self.assertFalse(done.is_set(), "the reload did not wait")
             self.assertNotIn(NEW, s.env["CW_ALLOWED_REPOS"])
-        th.join(5)
+        th.join(10)
         self.assertTrue(done.is_set())
         self.assertIn(NEW, s.env["CW_ALLOWED_REPOS"])
 
+    def test_the_reaper_reloads_under_the_launchers_renew_lock(self):
+        s = self.scene()
+        mod, seen = s.mod, []
+        orig = mod.reload_settings
+
+        def spy(env, applied, state, lock=None):
+            seen.append(lock)
+            return orig(env, applied, state, lock)
+        mod.reload_settings = spy
+        self.addCleanup(setattr, mod, "reload_settings", orig)
+        run_passes(s, [lambda: None])
+        self.assertEqual(len(seen), 2, "one reload per pass")
+        self.assertTrue(s.launchers, "the loop built a launcher")
+        for lock in seen:
+            self.assertIsNotNone(lock, ANCHOR_LOCK)
+            self.assertIs(lock, s.launchers[0].renew_lock, ANCHOR_LOCK)
+
     def test_a_pipe_in_place_of_the_file_never_blocks_the_pass(self):
+        import threading
         s = self.scene()
         os.unlink(s.path)
         os.mkfifo(s.path, 0o600)
-        self.assertIsNone(s.mod._settings_signature(s.path))
-        lines = s.reload()
-        self.assertEqual(len(lines), 1, lines)
+        out = {}
+
+        def work():
+            out["sig"] = s.mod._settings_signature(s.path)
+            out["lines"] = s.reload()
+        th = threading.Thread(target=work, daemon=True)
+        th.start()
+        th.join(10)
+        if th.is_alive():   # a blocking open: free it so the thread ends, then fail
+            fd = os.open(s.path, os.O_RDWR | os.O_NONBLOCK)
+            th.join(5)
+            os.close(fd)
+            self.fail("the pass blocked on a pipe in place of the settings file")
+        self.assertIsNone(out["sig"])
+        self.assertEqual(len(out["lines"]), 1, out["lines"])
         self.assertEqual(s.env["CW_ALLOWED_REPOS"], GOOD["CW_ALLOWED_REPOS"], "the old values are kept")
+
+    def test_main_records_only_what_the_file_gave_as_applied(self):
+        mod = target_module()
+        file_text = text(CW_TOOLING_REPO="acme-org/tooling")
+        captured = {}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "cloud.env")
+            with open(path, "w") as f:
+                f.write(file_text)
+            os.chmod(path, 0o600)
+            saved = (mod.SETTINGS_PATH, mod._reap_main, mod.ClusterTokenRefresher, mod.Kube)
+
+            def fake_reap_main(env, a, sleep, *args, **kw):
+                captured["applied"] = dict(mod._REAP_APPLIED)
+                return 0
+            mod.SETTINGS_PATH, mod._reap_main = path, fake_reap_main
+            mod.ClusterTokenRefresher, mod.Kube = FakeRefresher, FakeKube
+            own = {"CW_ALLOWED_REPOS": GOOD["CW_ALLOWED_REPOS"], "XDG_STATE_HOME": tmp}   # the caller's own value equals the file's
+            try:
+                with unittest.mock.patch.dict(os.environ, own, clear=True), contextlib.redirect_stderr(io.StringIO()):
+                    code = mod.main(["reap"])
+            finally:
+                mod.SETTINGS_PATH, mod._reap_main, mod.ClusterTokenRefresher, mod.Kube = saved
+                mod._REAP_APPLIED = None
+        self.assertEqual(code, 0)
+        self.assertEqual(captured["applied"].get("CW_TOOLING_REPO"), "acme-org/tooling", "what the file gave is recorded: " + ANCHOR_OWN)
+        self.assertEqual(captured["applied"].get("CW_CLOUD_SERVER"), GOOD["CW_CLOUD_SERVER"])
+        self.assertNotIn("CW_ALLOWED_REPOS", captured["applied"], ANCHOR_OWN)
 
     def test_an_unexpected_error_restores_the_environment_and_never_raises(self):
         s = self.scene()
@@ -265,28 +338,40 @@ class Reload(unittest.TestCase):
 
 
 class Mutant(unittest.TestCase):
-    def run_one(self, path):
-        return subprocess.run([sys.executable, "-m", "unittest", "test_reaper_reload.Reload.test_s2_a_repository_added_between_passes_is_accepted_by_the_second_pass"],
+    def run_one(self, path, name):
+        return subprocess.run([sys.executable, "-m", "unittest", "test_reaper_reload.Reload." + name],
                               cwd=HERE, env=dict(os.environ, **{MODULE_ENV: path}), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=90)
 
-    def test_s7_a_reaper_that_reads_the_file_only_at_its_start_fails_with_the_anchored_text(self):
+    def check(self, old, new, name, anchor):
+        """Control first (the unchanged source passes the one test), then the mutant (it fails with the anchored text)."""
         with open(os.path.join(LAUNCHER, "cloud_worker.py")) as f:
             src = f.read()
-        old = "            if _REAP_APPLIED is not None:   # the settings file is read again"
         self.assertEqual(src.count(old), 1)
         with tempfile.TemporaryDirectory() as tmp:
-            control = os.path.join(tmp, "control.py")
-            mutant = os.path.join(tmp, "mutant.py")
+            control, mutant = os.path.join(tmp, "control.py"), os.path.join(tmp, "mutant.py")
             with open(control, "w") as f:
                 f.write(src)
             with open(mutant, "w") as f:
-                f.write(src.replace(old, "            if False and _REAP_APPLIED is not None:   # the settings file is read again"))
-            c = self.run_one(control)   # control first
+                f.write(src.replace(old, new))
+            c = self.run_one(control, name)
             self.assertEqual(c.returncode, 0, c.stdout)
             self.assertIn("Ran 1 test", c.stdout)
-            p = self.run_one(mutant)
+            p = self.run_one(mutant, name)
         self.assertEqual(p.returncode, 1, p.stdout)
-        self.assertIn(ANCHOR, p.stdout)
+        self.assertIn(anchor, p.stdout)
+
+    def test_s7_a_reaper_that_reads_the_file_only_at_its_start_fails_with_the_anchored_text(self):
+        old = "            if _REAP_APPLIED is not None:   # the settings file is read again"
+        self.check(old, "            if False and _REAP_APPLIED is not None:   # the settings file is read again",
+                   "test_s2_a_repository_added_between_passes_is_accepted_by_the_second_pass", ANCHOR)
+
+    def test_s8_a_main_that_records_the_callers_own_values_fails_with_the_anchored_text(self):
+        self.check("n in env and pre.get(n) != env[n]}", "n in env}",
+                   "test_main_records_only_what_the_file_gave_as_applied", ANCHOR_OWN)
+
+    def test_s9_a_reaper_that_drops_the_renew_lock_fails_with_the_anchored_text(self):
+        self.check('getattr(L, "renew_lock", None))', "None)",
+                   "test_the_reaper_reloads_under_the_launchers_renew_lock", ANCHOR_LOCK)
 
 
 if __name__ == "__main__":
