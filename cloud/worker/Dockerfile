@@ -38,8 +38,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends libasound2t64 l
 # The pair below is the ONE constant (line one: name, line two: email). The entrypoint sets user.name and user.email in the worker
 # user's global git configuration from this file, each only when unset. A repository's own configured identity, and a local
 # `git config user.name/user.email`, still win over it (git's own order: system, then global, then local). No identity variable is exported.
-ARG CW_DEFAULT_IDENT_NAME=cloud-worker
-ARG CW_DEFAULT_IDENT_EMAIL=cloud-worker@users.noreply.github.com
+ARG CW_DEFAULT_IDENT_NAME
+ARG CW_DEFAULT_IDENT_EMAIL
+RUN test -n "$CW_DEFAULT_IDENT_NAME" || { echo "the default identity build argument CW_DEFAULT_IDENT_NAME is missing" >&2; exit 1; }; test -n "$CW_DEFAULT_IDENT_EMAIL" || { echo "the default identity build argument CW_DEFAULT_IDENT_EMAIL is missing" >&2; exit 1; }
 RUN printf '%s\n%s\n' "${CW_DEFAULT_IDENT_NAME}" "${CW_DEFAULT_IDENT_EMAIL}" > /etc/cw-default-identity \
  && chown root:root /etc/cw-default-identity && chmod 0444 /etc/cw-default-identity
 # ---- end #1165 identity ----
