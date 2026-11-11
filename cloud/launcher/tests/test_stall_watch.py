@@ -159,9 +159,11 @@ class Stall(unittest.TestCase):
         w.add("broken-pod", exec_fails=True)
         self.assertEqual(w.run(), [])
         self.assertEqual(w.sent, [])
-        lines = [l for l in w.err.splitlines() if "stall watch skipped" in l]
-        self.assertEqual(len(lines), 2, w.err)
-        self.assertTrue(any("young-pod" in l for l in lines) and any("broken-pod" in l for l in lines))
+        line = sw.pass_text(w.launcher)
+        self.assertIn("young-pod:younger-than-10-minutes", line)
+        self.assertIn("broken-pod:the-read-failed", line)
+        self.assertEqual(w.err, "", "a skip adds no line of its own to the log: the pass line carries it")
+        self.assertNotIn("secret-pod-text", line)
         self.assertNotIn("secret-pod-text", w.err)
         self.assertEqual([n for n, _ in w.kube.execs], ["broken-pod"], "a young pod is not read")
 
@@ -193,7 +195,7 @@ class Stall(unittest.TestCase):
         finally:
             sw.time.monotonic = real
         self.assertEqual([n for n, _ in w.kube.execs], ["a-pod"])
-        self.assertIn("b-pod: the pass's read budget is used", w.err)
+        self.assertIn("b-pod:read-budget-used", sw.pass_text(w.launcher))
 
     def test_a_failed_send_to_both_is_not_counted_as_alerted(self):
         w = World()

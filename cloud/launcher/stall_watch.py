@@ -11,7 +11,7 @@ the send, as the minute-40 note does, so a failed send or a restart never sends 
                     line occurs 3 times in the progress file's last 10 lines
   failed-run-idle   a run's exit file holds a non-zero number and neither the progress file nor the agent session changed for 10 minutes after the exit file's time
 
-A pod younger than 10 minutes or a pod whose exec fails is skipped with ONE line (no pod content). The message holds the pod
+A pod younger than 10 minutes or a pod whose exec fails is skipped; the pass line names it (pod and reason, no pod content). The message holds the pod
 name, the condition, one evidence line (secret-looking text and the pod's token replaced by [redacted], at most 300 characters; untrusted data, never a
 command) and the time. Pod text is never run.
 """
@@ -226,7 +226,7 @@ def message(name, condition, ev, now_text):
 def watch_pass(launcher, pods, now, name_ok, send=None):
     """One pass over the pods the reaper holds: ONE exec per pod older than 10 minutes, the alerts decided from its answer. Sets launcher.stall_counts to
     {"read": n, "alerted": m} for the pass line. Never raises, never stops or changes a pod. Returns the (pod, condition) pairs alerted, for the tests."""
-    counts = launcher.__dict__["stall_counts"] = {"read": 0, "alerted": 0}
+    counts = launcher.__dict__["stall_counts"] = {"read": 0, "alerted": 0, "skipped": []}
     alerted, began = [], time.monotonic()
     kube = launcher.kube
     send = send or getattr(launcher, "stall_send", None) or _default_send
@@ -238,20 +238,20 @@ def watch_pass(launcher, pods, now, name_ok, send=None):
                 continue
             started = launcher_parse(_ann(pod, "started"))
             if started is None:
-                print("cloud-worker: stall watch skipped %s: no readable start time" % name, file=sys.stderr)
+                counts["skipped"].append("%s:%s" % (name, "no-readable-start-time"))
                 continue
             if (now - started).total_seconds() < MIN_POD_AGE_SECONDS:
-                print("cloud-worker: stall watch skipped %s: younger than 10 minutes" % name, file=sys.stderr)
+                counts["skipped"].append("%s:%s" % (name, "younger-than-10-minutes"))
                 continue
             if time.monotonic() - began > PASS_BUDGET_SECONDS:
-                print("cloud-worker: stall watch skipped %s: the pass's read budget is used" % name, file=sys.stderr)
+                counts["skipped"].append("%s:%s" % (name, "read-budget-used"))
                 continue
             try:
                 data = json.loads(kube.exec(name, "python3", "-I", "-c", PROBE_CODE, timeout=EXEC_SECONDS).strip().splitlines()[-1])
                 if not isinstance(data, dict):
                     raise ValueError("not an object")
             except Exception:
-                print("cloud-worker: stall watch skipped %s: the read failed" % name, file=sys.stderr)
+                counts["skipped"].append("%s:%s" % (name, "the-read-failed"))
                 continue
             counts["read"] += 1
             for condition, text in decide(data).items():
@@ -295,4 +295,7 @@ def launcher_iso(t):
 def pass_text(launcher):
     """The two counts of the pass line: ' stall read=N alerted=M' (empty when the step did not run)."""
     c = getattr(launcher, "__dict__", {}).get("stall_counts")
-    return " stall read=%d alerted=%d" % (c["read"], c["alerted"]) if c else ""
+    if not c:
+        return ""
+    skipped = " skipped=" + ",".join(re.sub(r"[^A-Za-z0-9._:-]", "", x)[:90] for x in c["skipped"][:10]) + ("+%d" % (len(c["skipped"]) - 10) if len(c["skipped"]) > 10 else "") if c["skipped"] else ""
+    return " stall read=%d alerted=%d%s" % (c["read"], c["alerted"], skipped)
