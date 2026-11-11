@@ -127,9 +127,8 @@ class PlanCheckInPod(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertEqual((sorted(os.listdir(self.tmp.name)), read(p)), before)
 
-    def test_u1_guard_and_permissions_untouched(self):
+    def test_u1_permissions_untouched(self):
         # Pinned hashes of the files at the time of this change (they must not change for the plan check).
-        self.assertEqual(hashlib.sha256(read(os.path.join(WORKER, "guard.sh"))).hexdigest(), PINNED["guard.sh"])
         # opencode-worker.json: a readable pin. The rows that existed before ask 1083 are pinned as one digest of their canonical JSON;
         # every row an ask adds is listed in ADDED_ROWS below, so a later ask shows its rows as a plain diff line, not a new hash.
         import json
@@ -145,7 +144,6 @@ class PlanCheckInPod(unittest.TestCase):
         base.update({"git*push*main*": "deny", "git*push*master*": "deny"})
         rest = dict(conf, permission={"bash": base}, agent={"worker": dict(conf["agent"]["worker"], permission={"bash": base})})
         self.assertEqual(hashlib.sha256(json.dumps(rest, sort_keys=True).encode()).hexdigest(), PINNED_JSON_WITHOUT_ADDED_ROWS)
-        self.assertNotIn(b"cw-plan-check", read(os.path.join(WORKER, "guard.sh")))
         self.assertNotIn(b"cw-plan-check", read(os.path.join(WORKER, "opencode-worker.json")))
 
     def test_m3_the_moved_deny_rows_come_after_every_added_allow_row(self):
@@ -278,7 +276,6 @@ def order_problems(keys):
     return [k for k in MOVED_DENY_ORDER if keys.index(k) < last_allow]
 
 
-PINNED = {'guard.sh': 'ba4d51aa043d450a4832210fb6492295e7bd7c7e61a4abd2a70cc75baea19bca'}
 PINNED_JSON_WITHOUT_ADDED_ROWS = "c14522cff99b9223d881b9f80a3d3397f55ae15a5d6f12a2380b89c9de6fd4be"
 # Rows added to opencode-worker.json, in file order. A pin changes only in the ask whose approved plan names the rows:
 # Lower and capitalised method words after -X or --method are denied too (the glob is case sensitive; a mixed form such as pOsT is not covered here, the client refuses it).

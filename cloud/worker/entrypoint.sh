@@ -129,43 +129,22 @@ if [ -z "\$tok" ]; then echo "worker: the git token file is unreadable or empty"
 printf 'username=x-access-token\\npassword=%s\\n' "\$tok"
 H
   chmod 755 "$bin/git-credential-cw"
-  # No git-token means no wrappers: the OpenCode deny rules are then the only pod-side layer.
-  # The pod-side refusal of merge, force-push, push to the default branch, issue/label writes and settings calls. It is a
-  # convenience and NOT the guard: calling the real binary by its path skips it. The guard is the repository's own rules
-  # and the token's scope. Installed with the wrappers; a missing guard file refuses the start (no wrapper without it).
-  guard="${CW_SHARE_DIR:-/usr/local/share/cw}/guard.sh"
-  if [ ! -r "$guard" ] || [ ! -s "$guard" ]; then
-    echo "worker: the guard file is unreadable or empty; refusing to start" >&2
-    exit 1
-  fi
-  cat "$guard" > "$bin/cw-guard"; chmod 755 "$bin/cw-guard"
+  # No git-token means no gh script. There is no guard step before the client any more: the token's scope, the repository's own rules, the
+  # egress policy and the missing cluster token are the boundaries.
   real_gh="${CW_GH_CLIENT:-/usr/local/bin/cw-gh}"   # the pod's own client: the real gh is not in the image
-  # FAIL CLOSED: a pod with a token but without its client refuses to start (no worker holds the token with no wrapper in front of it).
-  # CW_GH_CLIENT names the client for tests only; the image never sets it.
+  # A pod with a token but without its client refuses to start. CW_GH_CLIENT names the client for tests only; the image never sets it.
   if [ ! -x "$real_gh" ]; then
     echo "worker: the gh client $real_gh is missing or not executable; refusing to start" >&2
     exit 1
   fi
-  real_git=$(command -v git || true)
-  if [ -n "$real_gh" ]; then
-    cat > "$bin/gh" <<H
+  # `gh` is the client itself: it reads the token for this one call and it lives only in the environment of that process. The real git is untouched on PATH.
+  cat > "$bin/gh" <<H
 #!/bin/sh
-# refuse the six (exit 3, one line), then run the pod's GitHub client (cw-gh). The token is read for this one call and lives only in the environment of that process
-"$bin/cw-guard" gh "\$@" || exit \$?
 tok=\$({ tr -d '\\r\\n' < "$tokfile"; } 2>/dev/null) || tok=""
 if [ -z "\$tok" ]; then echo "worker: the git token file is unreadable or empty" >&2; exit 1; fi
 GH_TOKEN=\$tok exec "$real_gh" "\$@"
 H
-    chmod 755 "$bin/gh"
-  fi
-  if [ -n "$real_git" ]; then
-    cat > "$bin/git" <<H
-#!/bin/sh
-CW_REAL_GIT="$real_git" "$bin/cw-guard" git "\$@" || exit \$?
-exec "$real_git" "\$@"
-H
-    chmod 755 "$bin/git"
-  fi
+  chmod 755 "$bin/gh"
   # ~/.gitconfig is read by every process of this user, including a fresh-environment `kubectl exec` (the end hook)
   git config --global credential.helper "$bin/git-credential-cw"
   # the image's default identity (two lines: name, email), each key only when unset in the global file; a value already there is kept
@@ -178,11 +157,10 @@ H
   PATH="$bin:$PATH"; export PATH
 fi
 
-# #1200 (S14): the record of the pull requests this pod creates through its client, one number a line. The directory is private to this
-# user (0700, inside the worker-private $TMP); the client creates the file (0600, never through a symlink) when it records a number, so
-# a pod with no pull request of its own has no file and the guard refuses an edit (pr-edit-no-record). The agent and the client are the
-# same user: the record is not a security boundary (see docs/cloud-worker-interface.md); the shell guard row only refuses a command that
-# names it. Exported before the exec so the agent's command and its shell tool inherit it.
+# #1200 (S14): the record of the pull requests this pod creates through its client, one number a line (a log, never a check: nothing refuses
+# on it; the launcher reads it to find the pod's own pull requests). The directory is private to this user (0700, inside the worker-private
+# $TMP); the client creates the file (0600, never through a symlink) when it records a number. Exported before the exec so the agent's
+# command and its shell tool inherit it.
 if [ -L "$TMP/pr-record" ]; then   # chmod follows a link: never touch what a link points at
   echo "worker: the pr-record path is a symlink; refusing to start" >&2
   exit 1
