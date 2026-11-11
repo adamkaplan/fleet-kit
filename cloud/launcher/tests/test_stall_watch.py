@@ -114,7 +114,6 @@ class Stall(unittest.TestCase):
         sizes = []
         for minute in (0, 1, 2, 61):
             w.at(minute)
-            w.pods["w1-pod"]["progress_age"] = 1 + minute   # the pod's files age with the clock; the refusal text stays
             w.run(module)
             sizes.append(len(w.sent))
             if minute == 2 and sizes[-1] != 2:
