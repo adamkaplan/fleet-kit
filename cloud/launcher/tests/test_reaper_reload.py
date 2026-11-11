@@ -220,6 +220,31 @@ class Reload(unittest.TestCase):
             s.close()
 
 
+    def test_a_pipe_in_place_of_the_file_never_blocks_the_pass(self):
+        s = self.scene()
+        os.unlink(s.path)
+        os.mkfifo(s.path, 0o600)
+        self.assertIsNone(s.mod._settings_signature(s.path))
+        lines = s.reload()
+        self.assertEqual(len(lines), 1, lines)
+        self.assertEqual(s.env["CW_ALLOWED_REPOS"], GOOD["CW_ALLOWED_REPOS"], "the old values are kept")
+
+    def test_an_unexpected_error_restores_the_environment_and_never_raises(self):
+        s = self.scene()
+        before = dict(s.env)
+
+        def boom(env=None, path=None):
+            env.pop("CW_ALLOWED_REPOS", None)
+            raise ValueError("x")
+        s.mod.apply_settings = boom
+        s.write(text(CW_ALLOWED_REPOS=NEW))
+        lines = s.reload()
+        self.assertEqual(s.env, before)
+        self.assertEqual(len(lines), 1, lines)
+
+
+
+
 class Mutant(unittest.TestCase):
     def run_one(self, path):
         return subprocess.run([sys.executable, "-m", "unittest", "test_reaper_reload.Reload.test_s2_a_repository_added_between_passes_is_accepted_by_the_second_pass"],

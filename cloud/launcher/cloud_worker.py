@@ -5415,12 +5415,20 @@ _RELOAD_FIXED = ("CW_CLOUD_NAMESPACE", "CW_CLOUD_SERVER")   # cannot change mid-
 def _settings_signature(path):
     """(size, mtime_ns, sha256) of the file, or None when it cannot be read (apply_settings then names the reason)."""
     try:
-        st = os.stat(path)
-        with open(path, "rb") as f:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0))   # as _read_settings_file: a link or a pipe never blocks the pass
+    except OSError:
+        return None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > SETTINGS_FILE_MAX:
+            return None
+        with os.fdopen(fd, "rb", closefd=False) as f:
             raw = f.read(SETTINGS_FILE_MAX + 1)
         return (st.st_size, st.st_mtime_ns, hashlib.sha256(raw).hexdigest())
     except OSError:
         return None
+    finally:
+        os.close(fd)
 
 
 def reload_settings(env, applied, state):
@@ -5428,13 +5436,13 @@ def reload_settings(env, applied, state):
     the last signature and the last printed reason. Only a table setting whose value still equals the applied one is dropped before the read,
     so apply_settings' clash rule is untouched and a value the caller set itself stays. A failure keeps every old value, prints one line
     (the reason, never a value) when the reason differs from the last one printed, and never raises."""
+    names = [n for n, _, _ in SETTINGS]
+    before = {n: env[n] for n in names + ["AZURE_CONFIG_DIR"] if n in env}
     try:
         path = settings_path(env)
         sig = _settings_signature(path)
         if sig is not None and sig == state.get("sig"):
             return
-        names = [n for n, _, _ in SETTINGS]
-        before = {n: env[n] for n in names + ["AZURE_CONFIG_DIR"] if n in env}
         for n in names:
             if n in applied and env.get(n) == applied[n]:
                 env.pop(n)
@@ -5476,6 +5484,9 @@ def reload_settings(env, applied, state):
             print("cloud-worker: settings file: %s" % line, file=sys.stderr)
             state["reason"] = line
     except Exception as e:   # a failed reload never ends the reaper
+        for n in names + ["AZURE_CONFIG_DIR"]:
+            env.pop(n, None)
+        env.update(before)
         reason = "the reload failed (%s)" % type(e).__name__
         if reason != state.get("reason"):
             state["reason"] = reason
@@ -5907,8 +5918,11 @@ def main(argv=None, env=None, clock=None, sleep=time.sleep):
         a.idle = DEFAULT_ORCHESTRATOR_IDLE if a.agent == "orchestrator" else DEFAULT_IDLE
     if not explicit:   # the real process reads the settings file; a caller that passes its own environment has made its own choice
         try:
-            apply_settings(env)
-            _REAP_APPLIED = {n: env[n] for n, _, _ in SETTINGS if n in env}
+            pre = {n: env[n] for n, _, _ in SETTINGS if n in env}
+            if apply_settings(env) != "environment":   # only what the file gave is the reaper's to drop later; a caller's own value is not
+                _REAP_APPLIED = {n: env[n] for n, _, _ in SETTINGS if n in env and pre.get(n) != env[n]}
+            else:
+                _REAP_APPLIED = {}
         except CloudError as e:
             print("cloud-worker: %s" % e, file=sys.stderr)
             return e.code
