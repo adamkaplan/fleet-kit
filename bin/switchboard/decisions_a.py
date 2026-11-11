@@ -723,15 +723,16 @@ def decisions_from_notices(engine, now):
         tag = repo if len(in_play) > 1 else repo.split("/")[-1]
         entry = decision_core.notice_entry(repo, number, tag, facts or {}, held["stale"], item.get("from"),
                                            item["created"], item.get("note"), hold, engine.config.get("intent_repo"))
-        evidence = captain_evidence(facts, set(notice_senders(item))) if facts and facts.get("captain") else []
+        labels_unread = bool(facts) and facts.get("captain", False) is None   # (#2379) unreadable labels: never a plain notice that loses a hold
+        evidence = captain_evidence(facts, set(notice_senders(item))) if facts and facts.get("captain") else ([] if not labels_unread else None)
         if evidence == [] and now - item["created"] >= CAPTAIN_NO_REVIEW_SECONDS:
             pass  # nothing stalls silently: the notice's own clock (a new head does not restart it) lists it
         elif evidence == []:
             evidence = False
-        if facts and facts.get("captain") and facts.get("head") and evidence is not False:
+        if facts and (facts.get("captain") or labels_unread) and facts.get("head") and evidence is not False:
             # a merge-captain PR is the Chief of Staff's decision, in place of the heads-up (never both)
             captain_key = "captain:%s#%d@%s" % (repo, number, facts["head"])
-            entry = decision_core.captain_entry(entry, facts, captain_key in escalated, evidence)
+            entry = decision_core.captain_entry(entry, facts, captain_key in escalated, evidence, labels_unread)
             if isinstance(engine.request_keys, set):
                 engine.request_keys.add(captain_key)  # keeps its escalation through the daemon's prune
         entries.append((order(item), entry, key))

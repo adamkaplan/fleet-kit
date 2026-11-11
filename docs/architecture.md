@@ -174,12 +174,6 @@ Kinds (the number is exact, except `size`, a ceiling with headroom: see rule 7):
 | `switchboard/decisions_a.py` | `fleet-switchboard` | namespace | 28 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 | `switchboard/decisions_b.py` | `fleet-switchboard` | namespace | 24 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 | `switchboard/import_v1.py` | `fleet-switchboard` | namespace | 14 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
-| `switchboard/judge.py` | `fleet-switchboard` | namespace | 12 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
-| `switchboard/judge_request.py` | `fleet-switchboard` | namespace | 15 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
-| `switchboard/plan_review.py` | `fleet-switchboard` | namespace | 23 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
-| `switchboard/decisions_a.py` | `fleet-switchboard` | namespace | 28 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
-| `switchboard/decisions_b.py` | `fleet-switchboard` | namespace | 24 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
-| `switchboard/import_v1.py` | `fleet-switchboard` | namespace | 14 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 | `switchboard/judge.py` | `fleet-switchboard` | namespace | 11 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 | `switchboard/judge_request.py` | `fleet-switchboard` | namespace | 15 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 | `switchboard/plan_review.py` | `fleet-switchboard` | namespace | 23 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |

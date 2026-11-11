@@ -1026,6 +1026,8 @@ def evaluate_gates(plan, entries, ledger_problem, facts, pr, now=None):
                                                       % ("; ".join(floor.get("reasons") or []) or "hold")])
             # (#2379) the merge-captain label is the only hold signal: a body line without it is a PR that is not held, so there is no
             # 'marker without a hold' wording any more.
+            elif (facts or {}).get("captain", False) is None:   # the labels were not readable: not "not held" (#2379)
+                row.update(status="waiting", missing=["labels could not be read: whether the PR is held for the owner is not known, so it is NOT READY"])
             elif (facts or {}).get("captain"):
                 row.update(status="waiting", missing=["held for the owner (merge-captain label): the owner decides, through cos"])
             else:
