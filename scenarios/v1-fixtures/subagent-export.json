@@ -1,0 +1,71 @@
+{
+  "info": {
+    "id": "ses_fixture00000000000002",
+    "parentID": "ses_fixture00000000000001",
+    "projectID": "fixture-project",
+    "directory": "/work/example-repo",
+    "title": "explore: health (subagent)",
+    "version": "1.0.0",
+    "time": {
+      "created": 1790000061000,
+      "updated": 1790000070000
+    }
+  },
+  "messages": [
+    {
+      "info": {
+        "id": "msg_fixturechild000000001",
+        "sessionID": "ses_fixture00000000000002",
+        "role": "user",
+        "time": {
+          "created": 1790000061000
+        },
+        "agent": "explore",
+        "model": {
+          "providerID": "example",
+          "modelID": "model-small"
+        }
+      },
+      "parts": [
+        {
+          "id": "prt_fixturechild0000001",
+          "type": "text",
+          "text": "Check the health endpoint"
+        }
+      ]
+    },
+    {
+      "info": {
+        "id": "msg_fixturechild000000002",
+        "sessionID": "ses_fixture00000000000002",
+        "role": "assistant",
+        "time": {
+          "created": 1790000061500,
+          "completed": 1790000062000
+        },
+        "modelID": "model-small",
+        "providerID": "example",
+        "mode": "explore",
+        "agent": "explore",
+        "cost": 0.001,
+        "tokens": {
+          "input": 5,
+          "output": 5,
+          "reasoning": 0,
+          "cache": {
+            "read": 0,
+            "write": 0
+          }
+        },
+        "finish": "stop"
+      },
+      "parts": [
+        {
+          "id": "prt_fixturechild0000002",
+          "type": "text",
+          "text": "The endpoint answers 200."
+        }
+      ]
+    }
+  ]
+}

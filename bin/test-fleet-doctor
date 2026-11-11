@@ -1,0 +1,445 @@
+#!/usr/bin/env python3
+"""test-fleet-doctor — offline tests for fleet-doctor's agent-CLI detection.
+
+Runs the real bin/fleet-doctor against stub `opencode` / `copilot` executables
+on a hermetic PATH: no herdr, no gh, no network, no real agent CLI, and a temp
+HOME so no real config is read. The PATH holds only the stubs plus symlinks to
+the ordinary utilities the script needs, so a real `opencode`, `herdr` or `gh`
+installed on this machine cannot leak into a test.
+
+    bin/test-fleet-doctor            # everything
+    bin/test-fleet-doctor Unknown    # only tests whose name contains "Unknown"
+
+Exits non-zero if anything fails.
+"""
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+import unittest
+
+BIN = Path(__file__).resolve().parent
+DOCTOR = BIN / "fleet-doctor"
+
+# What fleet-doctor shells out to, besides the agent CLIs, herdr and gh.
+# systemctl/launchctl are deliberately absent: the heartbeat check is pointed
+# at a config that does not exist, so they are never reached.
+UTILITIES = ("bash", "sh", "env", "mktemp", "rm", "cat", "sed", "awk", "grep",
+             "head", "tr", "python3", "whoami", "uname", "sleep", "kill", "dirname")
+
+STUB = """#!/bin/sh
+printf '%(name)s %%s\\n' "$*" >> "%(log)s"
+if [ "$1" = "--version" ]; then
+%(version)s
+fi
+exit 0
+"""
+
+
+class DoctorRun:
+    """One fleet-doctor run in a scratch HOME with a chosen set of stub CLIs."""
+
+    def __init__(self, tmp, stubs):
+        self.tmp = Path(tmp)
+        self.path_dir = self.tmp / "path"
+        self.path_dir.mkdir()
+        self.log = self.tmp / "calls.log"
+        self.log.touch()
+        self.extra_env = {}
+        for tool in UTILITIES:
+            real = shutil.which(tool)
+            if real:
+                (self.path_dir / tool).symlink_to(real)
+        for name, version_body in stubs.items():
+            stub = self.path_dir / name
+            stub.write_text(STUB % {"name": name, "log": self.log, "version": version_body})
+            stub.chmod(0o755)
+
+    def run(self):
+        home = self.tmp / "home"
+        home.mkdir(exist_ok=True)
+        env = {
+            "PATH": str(self.path_dir),
+            "HOME": str(home),
+            "TMPDIR": str(self.tmp),
+            "FLEET_PREFIX": "tester",
+            "FLEET_HEARTBEAT_CONF": str(self.tmp / "no-such-heartbeat.json"),
+            "HERDR_SOCKET_PATH": str(self.tmp / "no-such.sock"),
+        }
+        env.update(self.extra_env)
+        proc = subprocess.run([str(self.path_dir / "bash"), str(DOCTOR)], env=env,
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                              universal_newlines=True, timeout=60)
+        self.output = proc.stdout
+        return proc
+
+    def lines(self, check):
+        """The output lines for one named check, e.g. 'dispatch'."""
+        out = []
+        for line in self.output.splitlines():
+            parts = line.split(None, 2)
+            if len(parts) >= 2 and parts[1] == check:
+                out.append(line)
+        return out
+
+    def calls(self):
+        return self.log.read_text().splitlines()
+
+
+def echo(text):
+    return "  echo '%s'" % text
+
+
+class DoctorCase(unittest.TestCase):
+
+    def doctor(self, **stubs):
+        tmp = tempfile.mkdtemp(prefix="test-fleet-doctor.")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        run = DoctorRun(tmp, stubs)
+        run.run()
+        return run
+
+    def only(self, run, check):
+        found = run.lines(check)
+        self.assertEqual(len(found), 1, "expected one %r line in:\n%s" % (check, run.output))
+        return found[0]
+
+
+class OpencodeGeneration(DoctorCase):
+
+    def test_v2_version_line_is_classified_v2_with_the_session_route(self):
+        run = self.doctor(opencode=echo("opencode v2.0.11"))
+        line = self.only(run, "dispatch")
+        self.assertTrue(line.startswith("ok "), line)
+        self.assertIn("opencode 2.0.11 = v2", line)
+        self.assertIn("session.create", line)
+        self.assertIn("-s <ses_id>", line)
+        self.assertIn("no TUI --agent", line)
+
+    def test_agent_cli_line_shows_the_bare_version_not_the_squashed_banner(self):
+        run = self.doctor(opencode=echo("opencode v2.0.11"))
+        line = self.only(run, "agent-cli")
+        self.assertIn("opencode 2.0.11", line)
+        self.assertNotIn("opencodev2", line)
+
+    def test_bare_v_prefixed_version_is_still_v2(self):
+        run = self.doctor(opencode=echo("v2.3.0"))
+        self.assertIn("opencode 2.3.0 = v2", self.only(run, "dispatch"))
+
+    def test_v1_bare_version_is_classified_v1_with_the_agent_flag(self):
+        # v1 prints yargs' bare version string, e.g. "1.18.32".
+        run = self.doctor(opencode=echo("1.18.32"))
+        line = self.only(run, "dispatch")
+        self.assertTrue(line.startswith("ok "), line)
+        self.assertIn("opencode 1.18.32 = v1", line)
+        self.assertIn("-- --agent <agent>", line)
+        self.assertNotIn("session.create", line)
+
+    def test_an_unrecognised_major_is_unknown_and_warns_rather_than_guessing(self):
+        run = self.doctor(opencode=echo("opencode v3.0.0"))
+        line = self.only(run, "dispatch")
+        self.assertTrue(line.startswith("WARN "), line)
+        self.assertIn("= unknown", line)
+        self.assertIn("Shift+Tab", line)
+
+    def test_pre_1_versions_are_unknown(self):
+        run = self.doctor(opencode=echo("0.15.4"))
+        self.assertIn("= unknown", self.only(run, "dispatch"))
+
+    def test_garbage_version_output_is_unknown(self):
+        run = self.doctor(opencode=echo("something went wrong"))
+        line = self.only(run, "dispatch")
+        self.assertTrue(line.startswith("WARN "), line)
+        self.assertIn("'something went wrong' = unknown", line)
+
+    def test_a_failing_version_call_is_unknown(self):
+        run = self.doctor(opencode="  exit 3")
+        line = self.only(run, "dispatch")
+        self.assertIn("no --version output", line)
+        self.assertIn("= unknown", line)
+
+    def test_detection_only_ever_asks_for_the_version(self):
+        # fleet-doctor is read-only: it must never start a session or a TUI.
+        run = self.doctor(opencode=echo("opencode v2.0.11"))
+        self.assertEqual(run.calls(), ["opencode --version"])
+
+
+class OtherCLIs(DoctorCase):
+
+    def test_copilot_gets_its_own_agent_flag_route(self):
+        run = self.doctor(copilot=echo("GitHub Copilot CLI 1.0.2."))
+        line = self.only(run, "dispatch")
+        self.assertIn("copilot:", line)
+        self.assertIn("--kind copilot", line)
+        self.assertIn("-- --agent <agent>", line)
+
+    def test_both_clis_get_one_line_each(self):
+        run = self.doctor(copilot=echo("1.0.2"), opencode=echo("opencode v2.0.11"))
+        found = run.lines("dispatch")
+        self.assertEqual(len(found), 2, run.output)
+        self.assertTrue(any("copilot:" in l for l in found))
+        self.assertTrue(any("= v2" in l for l in found))
+
+    def test_no_cli_means_no_dispatch_line_and_agent_cli_fails(self):
+        run = self.doctor()
+        self.assertEqual(run.lines("dispatch"), [], run.output)
+        self.assertTrue(self.only(run, "agent-cli").startswith("FAIL "))
+
+
+class SwitchboardChecks(DoctorCase):
+    """switchboard-path (the stale-link guard) and judge-liveness, against a stub switchboard in a fake HOME."""
+
+    STUB_SB = "#!/bin/sh\n[ \"$1\" = policy-report ] || exit 2\necho '%s'\nexit %d\n"
+
+    def run_with(self, checkout="main", reply=None, code=0, link=True, shims=True):
+        tmp = tempfile.mkdtemp(prefix="test-fleet-doctor.")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        tmp = Path(tmp).resolve()
+        run = DoctorRun(tmp, {})
+        home = tmp / "home"
+        (home / ".local" / "bin").mkdir(parents=True)
+        main = tmp / "main"
+        (main / "bin").mkdir(parents=True)
+        where = tmp / checkout
+        (where / "bin").mkdir(parents=True, exist_ok=True)
+        if shims:
+            (where / "shims").mkdir(exist_ok=True)
+        sb = where / "bin" / "fleet-switchboard"
+        text = self.STUB_SB % (reply or '{"alarm": false, "line": "policy judge  enforcing, 3 call(s) judged"}', code)
+        sb.write_text(text)
+        sb.chmod(0o755)
+        if link:
+            (home / ".local" / "bin" / "fleet-switchboard").symlink_to(sb)
+        run.extra_env = {"FLEET_KIT_MAIN": str(main)}
+        run.run()
+        return run
+
+    def test_the_main_checkout_is_ok(self):
+        run = self.run_with("main")
+        self.assertTrue(self.only(run, "switchboard-path").startswith("ok "), run.output)
+
+    def test_a_stale_worktree_is_named_and_not_silently_used(self):
+        run = self.run_with("old-worktree")
+        line = self.only(run, "switchboard-path")
+        self.assertTrue(line.startswith("WARN "), line)
+        self.assertIn("STALE", line)
+        self.assertIn("old-worktree", line)
+
+    def test_a_main_checkout_without_shims_warns(self):
+        line = self.only(self.run_with("main", shims=False), "switchboard-path")
+        self.assertTrue(line.startswith("WARN "), line)
+        self.assertIn("shims", line)
+
+    def test_no_switchboard_installed_is_not_a_failure(self):
+        run = self.run_with("main", link=False)
+        self.assertTrue(self.only(run, "switchboard-path").startswith("ok "))
+        self.assertEqual(run.lines("judge-liveness"), [])
+
+    def test_a_live_judge_is_ok(self):
+        line = self.only(self.run_with("main"), "judge-liveness")
+        self.assertTrue(line.startswith("ok "), line)
+        self.assertIn("3 call(s)", line)
+
+    def test_an_alarm_fails_the_check(self):
+        reply = '{"alarm": true, "line": "policy judge  ALARM: 2 agent(s) working and no policy.judge in 30 min"}'
+        run = self.run_with("main", reply=reply, code=1)
+        line = self.only(run, "judge-liveness")
+        self.assertTrue(line.startswith("FAIL "), line)
+        self.assertIn("ALARM", line)
+
+    def test_an_older_switchboard_without_the_command_warns(self):
+        line = self.only(self.run_with_old(), "judge-liveness")
+        self.assertTrue(line.startswith("WARN "), line)
+        self.assertIn("policy-report", line)
+
+    def run_with_old(self):
+        run = self.run_with("main")
+        sb = Path(run.tmp) / "main" / "bin" / "fleet-switchboard"
+        sb.write_text("#!/bin/sh\nexit 2\n")
+        run.run()
+        return run
+
+
+# ---------------------------------------------------------------------- runner
+
+def main(argv):
+    loader = unittest.TestLoader()
+    suite = loader.loadTestsFromModule(sys.modules[__name__])
+    if argv:
+        keep = unittest.TestSuite()
+        for group in suite:
+            for case in group:
+                if any(token.lower() in case.id().lower() for token in argv):
+                    keep.addTest(case)
+        suite = keep
+
+    runner = unittest.TextTestRunner(verbosity=2, stream=sys.stdout)
+    result = runner.run(suite)
+
+    passed = result.testsRun - len(result.failures) - len(result.errors) - len(result.skipped)
+    print()
+    print("=" * 70)
+    print("test-fleet-doctor: %d run, %d passed, %d failed, %d errored, %d skipped"
+          % (result.testsRun, passed, len(result.failures), len(result.errors), len(result.skipped)))
+    print("RESULT: %s" % ("PASS" if result.wasSuccessful() else "FAIL"))
+    print("=" * 70)
+    return 0 if result.wasSuccessful() else 1
+
+
+class DelegatedOrderCheck(DoctorCase):
+    """#835: the doctor's `delegated-order` line runs the REAL `fleet-switchboard impact delegated --check` against a configuration in the scratch HOME: an order read from the owner's own file must still be exactly one line of it."""
+
+    LINE = "- The Chief of Staff may clear held pull requests whose rating at the head is Serious or lower, on her own judgement; High stays the owner's."
+
+    def run_with(self, text, line=None, configured=True):
+        import hashlib, json
+        tmp = tempfile.mkdtemp(prefix="test-fleet-doctor.")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        run = DoctorRun(tmp, {})
+        home = Path(tmp) / "home"
+        (home / ".config" / "fleet-switchboard").mkdir(parents=True)
+        orders = Path(tmp) / "standing-orders.md"
+        if text is not None:
+            orders.write_text(text)
+        config = {"cos_orders_file": str(orders)}
+        if configured:
+            config["delegated_clear"] = {"orders": [{"number": 3, "sha256": hashlib.sha256((line or self.LINE).encode()).hexdigest(), "source": "owner-file", "max_level": "Serious"}]}
+        (home / ".config" / "fleet-switchboard" / "config.json").write_text(json.dumps(config))
+        run.run()
+        return run
+
+    def test_the_line_present_exactly_once_passes_and_every_other_state_fails(self):
+        cases = {"exact": ("- a\n" + self.LINE + "\n", "ok"), "deleted": ("- a\n", "FAIL"), "edited": ("- a\n" + self.LINE.replace("Serious", "Serioux") + "\n", "FAIL"),
+                 "duplicated": (self.LINE + "\n" + self.LINE + "\n", "FAIL"), "case changed": (self.LINE.lower() + "\n", "FAIL"), "substring": (self.LINE + " not on Tuesdays\n", "FAIL"),
+                 "file missing": (None, "FAIL"), "too large": ("x" * 9000, "FAIL")}
+        for label, (text, status) in cases.items():
+            with self.subTest(label):
+                run = self.run_with(text)
+                self.assertTrue(self.only(run, "delegated-order").startswith(status + " "), run.output)
+
+    def test_no_owner_file_order_configured_is_ok(self):
+        run = self.run_with("- a\n", configured=False)
+        self.assertTrue(self.only(run, "delegated-order").startswith("ok "), run.output)
+
+
+    def test_a_malformed_delegated_clear_or_an_unloadable_configuration_fails(self):
+        for label, config in (("malformed", {"delegated_clear": {"orders": [{"number": 3, "sha256": "a" * 64, "source": "owner-file", "max_level": "High"}]}}), ("unloadable", None)):
+            with self.subTest(label):
+                tmp = tempfile.mkdtemp(prefix="test-fleet-doctor.")
+                self.addCleanup(shutil.rmtree, tmp, True)
+                run = DoctorRun(tmp, {})
+                home = Path(tmp) / "home"
+                (home / ".config" / "fleet-switchboard").mkdir(parents=True)
+                (home / ".config" / "fleet-switchboard" / "config.json").write_text(__import__("json").dumps(config) if config is not None else "{not json")
+                run.run()
+                self.assertTrue(self.only(run, "delegated-order").startswith("FAIL "), run.output)
+
+class CloudCharter(DoctorCase):
+    """#1181: a charter whose pane line is `cloud:<agent name>` is live when its row's endpoint answers, unknown when not, never a dead pane."""
+
+    def charter_run(self, answer, record=True):
+        import json, socket
+        tmp = tempfile.mkdtemp(prefix="test-fleet-doctor.")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        stub = Path(tmp) / "read-stub"   # THE REUSED CALL (`fleet-switchboard read NAME --limit 1`) stubbed: it answers or fails
+        stub.write_text("import sys\nsys.exit(%d)\n" % (0 if answer else 1))
+        state = Path(tmp) / "state"
+        state.mkdir()
+        xdg = Path(tmp) / "xdg"   # the check needs a CLOUD RECORD: state/cloud/NAME.json under the switchboard's state dir
+        if record:
+            (xdg / "fleet-switchboard" / "cloud").mkdir(parents=True)
+            (xdg / "fleet-switchboard" / "cloud" / "orch-cloud.json").write_text("{}")
+        sys.path.insert(0, str(BIN))
+        import registry
+        registry.upsert(state, "orch-cloud", {"session": "ses_example1", "pane": None, "role": "orchestrator", "kind": "orchestrator",
+                                              "endpoint": "http://orch.acme.svc", "workspace": None, "cwd": None})
+        body = "```yaml\nstatus: active\npane: cloud:orch-cloud\n```"
+        stubs = {
+            "herdr": "  echo '{\"result\": {\"panes\": []}}'",
+            "gh": "  true",
+        }
+        run = DoctorRun(tmp, stubs)
+        (run.path_dir / "herdr").write_text("#!/bin/sh\n[ \"$1\" = \"--version\" ] && echo 'herdr 1.0.0' && exit 0\necho '{\"result\": {\"panes\": []}}'\n")
+        (run.path_dir / "gh").write_text("#!/bin/sh\ncase \"$*\" in\n  *'issue list'*'--label'*) cat \"%s\";;\n  *'api repos'*) echo true;;\n  *) echo 1;;\nesac\nexit 0\n" % (Path(tmp) / "issues.json"))
+        (Path(tmp) / "issues.json").write_text(json.dumps([{"number": 7, "title": "charter", "body": body}]))
+        sock = Path(tmp) / "h.sock"
+        listener = socket.socket(socket.AF_UNIX)
+        listener.bind(str(sock))
+        self.addCleanup(listener.close)
+        run.extra_env.update({"HERDR_SOCKET_PATH": str(sock), "FLEET_REPO": "acme-org/widget-service", "FLEET_REGISTRY_DIR": str(state),
+                              "FLEET_SWITCHBOARD_BIN": str(stub), "XDG_STATE_HOME": str(xdg)})
+        run.run()
+        return run
+
+    def test_an_answering_endpoint_is_live(self):
+        run = self.charter_run(True)
+        text = "\n".join(run.lines("charters"))
+        self.assertIn("cloud charter(s) live", text, run.output)
+        self.assertNotIn("dead pane", text)
+        self.assertNotIn("unknown", text)
+
+    def test_a_failing_endpoint_is_unknown_never_a_dead_pane(self):
+        run = self.charter_run(False)
+        text = "\n".join(run.lines("charters"))
+        self.assertIn("unknown (the endpoint did not answer", text, run.output)
+        self.assertNotIn("name a dead pane", text)
+        self.assertNotIn("live", text)
+
+    def test_an_answering_read_without_a_cloud_record_is_unknown(self):   # e.g. a local agent of that name answers `read`
+        run = self.charter_run(True, record=False)
+        text = "\n".join(run.lines("charters"))
+        self.assertIn("unknown (the endpoint did not answer", text, run.output)
+        self.assertNotIn("live", text)
+class UndecidableAgents(DoctorCase):
+    """S12 (#1884 PC-7): the doctor reads the daemon's record of a listed pane with no recorded session; one WARN line each, none when none."""
+
+    def run_with(self, undecidable):
+        tmp = tempfile.mkdtemp(prefix="test-fleet-doctor.")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        run = DoctorRun(tmp, {})
+        stub = Path(tmp) / "fleet-switchboard"
+        stub.write_text("#!/bin/sh\necho '%s'\n" % json.dumps({"undecidable": undecidable}))
+        stub.chmod(0o755)
+        run.extra_env["FLEET_SWITCHBOARD_BIN"] = str(stub)
+        before = sorted(str(p.relative_to(tmp)) for p in Path(tmp).rglob("*") if p.is_file() and p.name != "calls.log")
+        run.run()
+        after = sorted(str(p.relative_to(tmp)) for p in Path(tmp).rglob("*") if p.is_file() and p.name != "calls.log")
+        self.assertEqual(before, after)   # the doctor changes no file
+        return [line for line in run.output.splitlines() if "undecidable" in line]
+
+    def test_one_warn_line_names_the_agent_and_the_passes(self):
+        agents = {"acme": 4}
+        got = self.run_with(agents)
+        self.assertEqual(len(got), len(agents), got)   # one line per listed agent
+        self.assertTrue(got[0].startswith("WARN"), got)
+        self.assertIn("agent acme: listed pane with no recorded session, undecidable for 4 passes: reattach or retire it", got[0])
+
+    def test_no_line_when_there_is_none(self):
+        self.assertEqual(self.run_with({}), [])
+
+    def test_the_real_collect_status_producer_feeds_the_doctor(self):   # #1884 PC-9 d: no stub of the producer; a key renamed on either side fails this
+        tmp = tempfile.mkdtemp(prefix="test-fleet-doctor.")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        xdg = Path(tmp) / "xdg"
+        state = xdg / "fleet-switchboard"
+        state.mkdir(parents=True)
+        state.chmod(0o700)   # the daemon's state directory must be private
+        (state / "pane-undecidable.json").write_text(json.dumps({"acme": {"pane": "p_1", "passes": 4}}))
+        run = DoctorRun(tmp, {})
+        real = Path(__file__).resolve().parent / "fleet-switchboard"
+        stub = Path(tmp) / "fleet-switchboard"
+        stub.symlink_to(real)   # the doctor resolves it to the main checkout's bin
+        run.extra_env.update({"FLEET_SWITCHBOARD_BIN": str(stub), "FLEET_KIT_MAIN": str(real.parent.parent), "XDG_STATE_HOME": str(xdg)})
+        run.run()
+        got = [line for line in run.output.splitlines() if "undecidable" in line]
+        self.assertEqual(len(got), len(["acme"]), run.output)   # one line per listed agent
+        self.assertIn("agent acme: listed pane with no recorded session, undecidable for 4 passes: reattach or retire it", got[0])
+
+
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
