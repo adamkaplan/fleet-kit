@@ -281,9 +281,9 @@ def watch_pass(launcher, pods, now, name_ok):
                     print("cloud-worker: stall alert for %s goes to the Chief of Staff only: no boss in the record" % name, file=sys.stderr)
                 delivered = 0
                 try:   # ONE audit line; the daemon sends the messages (the reaper has no agent identity and cannot run `send`)
-                    launcher.audit(worker, "pod/" + name, ALERT_ACTION, 0.0, True, "",
-                                   extra={"condition": condition, "recipients": [boss] if boss else [], "ask": ask_of(launcher, worker), "evidence": ev})
-                    delivered = 1
+                    wrote = launcher.audit(worker, "pod/" + name, ALERT_ACTION, 0.0, True, "",
+                                           extra={"condition": condition, "recipients": [boss] if boss else [], "ask": ask_of(launcher, worker), "evidence": ev})
+                    delivered = 0 if wrote is False else 1   # the real writer answers False when the line could not be written
                 except Exception as e:
                     print("cloud-worker: stall alert for %s not recorded: %s" % (name, type(e).__name__), file=sys.stderr)
                 if not delivered:   # not recorded: the mark moves back so the next pass at least RETRY_SECONDS later tries again

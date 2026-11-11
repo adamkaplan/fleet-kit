@@ -228,6 +228,15 @@ class Stall(unittest.TestCase):
         self.assertLessEqual(len(w.audits[0]["evidence"]), 300)
         self.assertNotIn("\n", w.audits[0]["evidence"])
 
+    def test_a_line_the_writer_could_not_write_is_retried_like_a_refused_one(self):
+        w = World()
+        w.add(msg="Permission denied")
+        w.launcher.audit = lambda *a, **k: False   # the real writer's answer when the disk refused the line
+        self.assertEqual(w.run(), [])
+        w.launcher.audit = lambda *a, **k: True
+        w.at(10)
+        self.assertEqual(w.run(), [("w1-pod", "refusal")])
+
     def test_no_boss_in_the_record_leaves_an_empty_recipient_list(self):
         w = World()
         w.add(boss=None, msg="Permission denied")
