@@ -420,6 +420,8 @@ def guard(args, write, api_parser, gh, env_of, stdin=None):
             return issue_edit(probe, args)
         if words[:1] == ["api"]:
             return api_write(probe, args, api_parser)
+        if "api" in args and all(a.startswith("-") or (j > 0 and args[j - 1].startswith("-")) for j, a in enumerate(args[:args.index("api")])):
+            return UNCLASSIFIED   # a flag and its value before `api` (`gh --hostname h api -X DELETE ...`): the allow-list does not see it as `api` either, so it is never passed on unread
         return None
     except Unclassified:
         return UNCLASSIFIED
