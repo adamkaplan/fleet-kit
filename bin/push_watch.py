@@ -4,7 +4,7 @@ The switchboard receives no push event (no handler, no read), so this detector R
 `matching-refs/heads/<worker>` request per live worker per pass. A new tip sha is ONE item to the record's `reports_to` and to nobody else. A worker
 that pushed and then neither sent a message nor pushed again for `quiet_minutes` gets ONE quiet item per sha. Own state: `push-watch.json`.
 Item text: worker, branch, 8-hex sha, the commit SUBJECT, file and line counts, the first three paths: no body, no patch, no author.
-Pure text handling: subjects and paths are untrusted and are put in a quoted data line.
+Text handling: subjects and paths are untrusted and are put in a quoted data line. The one outside call is `git patch-id --stable` on a diff read from the API (ask #2393).
 """
 
 import json
@@ -201,6 +201,7 @@ def _landed(sb, engine, now, gh, name, record, mem, state, repos_live, full_conf
         if not (isinstance(outcome, dict) and outcome.get("sent")):
             return None   # not delivered: not marked, retried at the next pass
         older = [c2["sha"] for c2 in commits if c2["sha"] != sha and land_trailer(((c2.get("commit") or {}).get("message")) if isinstance(c2.get("commit"), dict) else None) and is_own(c2["sha"])[0]]   # ONE completion: an older Land commit of the same read that is also the pod's own is not a second one (another's is not marked)
+        state["land_said"] = (state.get("land_said", []) + older + [sha])[-TOLD_MAX * 4:]   # a credited commit is never told later as someone else's
         mem["landed"] = (mem.get("landed", []) + older + [sha])[-TOLD_MAX:]   # ONE completion: an older Land commit of the same read is not a second one
         state["reported"][name] = max(now, state["reported"].get(name, 0))   # the worker is completed: no quiet item follows
         engine.audit.append(engine.actor, "push_watch.landed", name, {"sha": sha, "repo": _clean(repo, 80), "branch": _clean(default, 60)})

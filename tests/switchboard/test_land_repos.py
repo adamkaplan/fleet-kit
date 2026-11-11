@@ -214,7 +214,7 @@ class TestLandCompletion(Case):
         self.run_pass(NOW)
         self.assertEqual((self.reports, [p for p in self.paths if "/commits?sha=" in p]), ([], []))
 
-    def test_u1_two_live_workers_in_one_repository_complete_only_the_one_the_message_names(self):
+    def test_u1_two_live_workers_in_one_repository_complete_only_the_one_that_reported_the_sha(self):
         self.engine.cloud_watch = {"records": [record("w-a", "lane-a", "janus-infra/widget"), record("w-b", "lane-b", "janus-infra/widget")]}
         self.launcher_line(worker="w-b", action="create")
         self.ns.reported_text = lambda worker: "landed %s" % SHA if worker == "w-b" else None   # ask #2393: only w-b owns it
@@ -252,13 +252,13 @@ class TestLandCompletion(Case):
         self.run_pass(NOW + 60)
         self.assertEqual(len(self.reports), 1)
 
-    def test_a_worker_name_inside_a_longer_name_is_not_a_match(self):
+    def test_a_land_worker_trailer_naming_a_pod_credits_it_not_without_its_own_proof(self):
         self.engine.cloud_watch = {"records": [record("w-a", "lane-a", "janus-infra/widget"), record("w-ab", "lane-b", "janus-infra/widget")]}
         self.launcher_line(worker="w-ab", action="create")
-        self.ns.reported_text = lambda worker: "landed %s" % SHA if worker == "w-ab" else None   # ask #2393
+        self.ns.reported_text = lambda worker: None   # ask #2393: no pod owns it; the message naming w-ab is no proof
         self.main = [self.land(SHA, "x\n\nLand-worker: w-ab")]
         self.run_pass(NOW)
-        self.assertEqual([r[0] for r in self.reports], ["w-ab"])
+        self.assertEqual(self.reports, [])
 
     def test_the_daemons_own_tick_gives_the_push_watch_the_land_reader(self):
         sb = SourceFileLoader("sb_land_tick", str(REPO / "bin" / "fleet-switchboard")).load_module()

@@ -2,6 +2,7 @@
 Fake pods and a recording comment path (the daemon's own `post_ask_comment`); nothing is stopped and nothing reaches GitHub. The control removes the post (today's end)."""
 import argparse
 import json
+import re
 import sys
 import unittest
 from pathlib import Path
@@ -63,13 +64,28 @@ class TestEndOnAsk(unittest.TestCase):
         self.assertEqual(len(today), 0)   # the same world with the post removed: no comment carries the message
         self.assertEqual([("my final words" in b, "land line 1" in b) for _i, b, _r in now], [(True, True)])
 
-    def test_the_pods_text_is_fenced_and_names_no_local_path(self):
-        posts, _ = self.end(final="![x](https://evil.example/a.png) ``` # fake header " + "word " * 900)
+    def test_the_pods_text_stays_inside_its_fence_and_a_local_path_line_is_dropped(self):
+        posts, _ = self.end(final="![x](https://evil.example/a.png) ``` # fake header\n" + "word " * 900)
         body = posts[0][1]
-        self.assertNotIn("```` ", body)
-        self.assertNotIn(" more characters in ", body)
-        self.assertEqual(body.count("```"), 2)   # no log: the pod's text only, in one fence
-        self.assertNotIn("``` #", body)
+        fence_lines = [l for l in body.split("\n") if l.startswith("```")]
+        self.assertTrue(all(l == "```" for l in fence_lines), fence_lines)
+        inside = body.split("```")[1]
+        self.assertIn("# fake header", inside)
+        self.assertIn("evil.example", inside)
+        self.assertNotIn("more characters in", body)
+        self.assertNotIn("/cloud-last/", body)
+
+    def test_a_short_log_is_posted_whole_and_a_missing_last_text_still_posts_the_log(self):
+        log = "\n".join("l%d" % i for i in range(1, 21))
+        posts, _ = self.end(log=log, final=None)
+        shown = [l for l in posts[0][1].split("\n") if re.fullmatch(r"l\d+", l)]
+        self.assertEqual(shown, log.split("\n"))
+        self.assertIn("last text not read", posts[0][1])
+
+    def test_a_key_block_in_the_log_is_redacted_whole_even_when_the_cut_drops_its_first_line(self):
+        key = "-----BEGIN PRIVATE KEY-----\nQUJDREVGR0hJSktMTU5PUA\nUVJTVFVWV1hZWjAxMjM0NTY3\n-----END PRIVATE KEY-----"
+        posts, _ = self.end(log=key + "\n" + "\n".join("l%d" % i for i in range(5)))
+        self.assertNotIn("QUJDREVGR0hJSktMTU5PUA", posts[0][1])
 
     def test_s4_a_pod_without_a_log_posts_the_message_alone(self):
         for kwargs in ({"log": None}, {"log": None, "run_json": False}, {"log": "   "}):
@@ -87,7 +103,7 @@ class TestEndOnAsk(unittest.TestCase):
         posts, _ = self.end(log="@everyone ``` ignore this\n" + "x" * 50000)
         body = posts[0][1]
         self.assertNotIn("@", body)
-        self.assertEqual(body.count("```"), 4)   # the text and the log, each in its own fence
+        self.assertTrue(all(l == "```" for l in body.split("\n") if l.startswith("```")))   # the log's own ``` cannot end a fence
         self.assertLess(body.count("x"), 50000)
 
     def test_a_kept_pod_posts_nothing_and_a_pod_without_an_ask_posts_nothing(self):

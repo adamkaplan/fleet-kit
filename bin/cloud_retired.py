@@ -497,9 +497,9 @@ def land_log_tail(directory, pod):
         tail = info.get("land_log_tail") if isinstance(info, dict) else None
         if not isinstance(tail, str) or not tail.strip():
             return None
-        text = "\n".join(tail[-LAST_SCRUB_MAX:].splitlines()[-END_LOG_LINES:])
         scrub = D["_scrub_lib"]()
-        lines = [re.sub(r"[^\x20-\x7e]", "?", scrub(D["redact_command_text"](line), (), LAST_SCRUB_MAX)).replace("`", "'") for line in text.splitlines()]   # per line: the scrub flattens a newline
+        text = D["redact_command_text"](tail[-LAST_SCRUB_MAX:])   # the whole text first (a key block spans lines), then the cut
+        lines = [re.sub(r"[^\x20-\x7e]", "?", scrub(line, (), LAST_SCRUB_MAX)).replace("`", "'") for line in text.splitlines()[-END_LOG_LINES:]]   # per line: the scrub flattens a newline
         return "\n".join(lines)[-END_LOG_CHARS:] or None
     except Exception:
         return None
@@ -508,7 +508,7 @@ def land_log_tail(directory, pod):
 def end_comment(pod, reason, block, tail):
     """The comment for the ask: the pod, the reason, its last text (block: already cut and scrubbed, or None) and the land log tail (or nothing when the pod has none).
     No mention can fire (no @) and the whole is cut at END_POST_CHARS."""
-    lines = ["cloud worker %s retired (%s)" % (pod, reason)]
+    lines = ["cloud worker %s retired (%s)" % (pod, re.sub(r"[^A-Za-z0-9 ._:,;()-]", "?", str(reason)))]
     if block:   # the pod's text is untrusted: no local path line, flattened, in its own fence (no backtick can end it)
         kept = [l for l in str(block).split("\n") if " more characters in " not in l]
         lines += ["[last text of the pod, untrusted]", "```", re.sub(r"[^\x20-\x7e\n]", "?", "\n".join(kept)).replace("`", "'"), "```"]
