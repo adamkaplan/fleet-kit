@@ -723,7 +723,7 @@ def decisions_from_notices(engine, now):
         tag = repo if len(in_play) > 1 else repo.split("/")[-1]
         entry = decision_core.notice_entry(repo, number, tag, facts or {}, held["stale"], item.get("from"),
                                            item["created"], item.get("note"), hold, engine.config.get("intent_repo"))
-        labels_unread = bool(facts) and plan_ledger.labels_unread(facts)   # (#2379) unreadable labels: never a plain notice that loses a hold
+        labels_unread = bool(facts) and plan_ledger.labels_unread(facts.get("captain"))   # (#2379) unreadable labels: never a plain notice that loses a hold
         evidence = captain_evidence(facts, set(notice_senders(item))) if facts and facts.get("captain") else ([] if not labels_unread else None)
         if evidence == [] and now - item["created"] >= CAPTAIN_NO_REVIEW_SECONDS:
             pass  # nothing stalls silently: the notice's own clock (a new head does not restart it) lists it

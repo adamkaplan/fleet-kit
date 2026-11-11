@@ -1024,7 +1024,7 @@ def evaluate_gates(plan, entries, ledger_problem, facts, pr, now=None):
             elif isinstance(floor, dict) and floor.get("decision") == "hold" and not floor.get("cleared"):
                 row.update(status="waiting", missing=["held for the owner (impact floor, read at this head): %s; the owner clears it for this head"
                                                       % ("; ".join(floor.get("reasons") or []) or "hold")])
-            elif labels_unread(facts):   # the labels (or the fact itself) were not readable: not "not held" (#2379)
+            elif labels_unread((facts or {}).get("captain")):   # the labels (or the fact itself) were not readable: not "not held" (#2379)
                 row.update(status="waiting", missing=["labels could not be read: whether the PR is held for the owner is not known, so it is NOT READY"])
             elif (facts or {}).get("captain"):
                 row.update(status="waiting", missing=["held for the owner (merge-captain label): the owner decides, through cos"])
@@ -1180,7 +1180,7 @@ ENFORCEABLE = ("G0a", "G0c", "G1", "G4", "G6", "G6b")
 EXIT_ALLOW, EXIT_REFUSE, EXIT_FAIL_OPEN = 0, 10, 3   # only EXIT_REFUSE refuses; every other exit is an allow
 
 
-def labels_unread(facts): return (facts or {}).get("captain") is None   # (#2379) no `captain` reading (None or absent): the labels could not be read, so held or not is unknown, never "not held"
+def labels_unread(captain): return captain is None   # (#2379) an absent or None `captain` fact means the labels could not be read: held or not is unknown, never "not held"
 
 
 def normal_repo(name):
