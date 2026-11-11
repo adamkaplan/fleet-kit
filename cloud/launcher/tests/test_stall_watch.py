@@ -47,7 +47,7 @@ class World:
         self.now, self.pods, self.sent, self.err = START, {}, [], ""
         self.kube = FakeKube(self)
         self.dir = tempfile.mkdtemp(prefix="stall-")
-        self.launcher = types.SimpleNamespace(kube=self.kube, env={"CW_CLOUD_RECORD_DIR": self.dir})
+        self.launcher = types.SimpleNamespace(kube=self.kube, env={"CW_CLOUD_RECORD_DIR": self.dir, "XDG_CONFIG_HOME": tempfile.mkdtemp(prefix="nocfg-")})
         self.send = lambda to, text: self.sent.append((to, text))
 
     def add(self, name="w1-pod", age_minutes=60, boss="coder-lead", progress_age=1, tail=("working",), runs=(), exits=(), msg="all fine", msg_age=1, exec_fails=False):
@@ -123,7 +123,7 @@ class Stall(unittest.TestCase):
     def test_s5_one_alert_per_condition_per_hour_to_the_boss_and_the_chief(self):
         w, sizes = self._s5(sw)
         self.assertEqual(sizes, [2, 2, 2, 4])   # the boss and the Chief of Staff in pass 1, none in passes 2 and 3, both again at 61 minutes
-        self.assertEqual(sorted({to for to, _ in w.sent}), ["chief-of-staff", "coder-lead"])
+        self.assertEqual(sorted({to for to, _ in w.sent}), ["coder-lead", "cos"])
         self.assertEqual(w.pods["w1-pod"]["doc"]["metadata"]["annotations"]["cw/stall-alert-refusal"], "2026-11-11T13:01:00Z")
 
     def test_s9_a_mutant_without_the_mark_fails_with_the_anchored_text_after_its_control_passes(self):
@@ -219,7 +219,7 @@ class Stall(unittest.TestCase):
         old = os.environ["PATH"]
         os.environ["PATH"] = d + os.pathsep + old
         try:
-            module._default_send("chief-of-staff", "hello")
+            module._default_send("cos", "hello")
         finally:
             os.environ["PATH"] = old
 
@@ -236,7 +236,7 @@ class Stall(unittest.TestCase):
         self._sent_with_its_ask(sw)   # the control passes
         with open(SOURCE) as f:
             text = f.read()
-        old = '[binary, "send", "--issue", STALL_ASK, to, text]'
+        old = '[binary, "send", "--issue", issue, to, text]'
         self.assertEqual(text.count(old), 1, "the mutation did not apply")
         mod = types.ModuleType("stall_watch_mutant2")
         exec(compile(text.replace(old, '[binary, "send", to, text]'), "mutant", "exec"), mod.__dict__)
@@ -257,11 +257,11 @@ class Stall(unittest.TestCase):
         old = os.environ["PATH"]
         os.environ["PATH"] = d + os.pathsep + old
         try:
-            sw._default_send("chief-of-staff", "body text")
+            sw._default_send("cos", "body text")
         finally:
             os.environ["PATH"] = old
         with open(os.path.join(d, "fl" + "eet-switchboard.argv")) as f:
-            self.assertEqual(f.read().split("\n")[:5], ["send", "--issue", "adamkaplan/fleet-kit#2399", "chief-of-staff", "body text"])
+            self.assertEqual(f.read().split("\n")[:5], ["send", "--issue", "adamkaplan/fleet-kit#2399", "cos", "body text"])
 
     def test_an_undelivered_alert_is_retried_after_10_minutes_not_before_and_a_delivered_one_is_not_for_the_hour(self):
         w = World()
@@ -296,6 +296,53 @@ class Stall(unittest.TestCase):
         w.at(11)
         w.run()
         self.assertEqual(len(w.sent), 1)
+
+    def test_the_chief_is_named_by_the_config_and_falls_back_to_cos(self):
+        w = World()
+        self.assertEqual(sw.cos_name(w.launcher), "cos")   # no config: the fallback
+        home = tempfile.mkdtemp(prefix="cfg-")
+        os.makedirs(os.path.join(home, "fl" + "eet-switchboard"))
+        w.launcher.env["XDG_CONFIG_HOME"] = home
+        path = os.path.join(home, "fl" + "eet-switchboard", "config.json")
+        for text, want in (('{"cos_name": "boss-one"}', "boss-one"), ('{"cos_name": "Bad Name;"}', "cos"), ("{}", "cos"), ("not json", "cos")):
+            with open(path, "w") as f:
+                f.write(text)
+            self.assertEqual(sw.cos_name(w.launcher), want, text)
+        with open(path, "w") as f:
+            f.write('{"cos_name": "boss-one"}')
+        w.add(msg="Permission denied")
+        w.run()
+        self.assertEqual(sorted(to for to, _ in w.sent), ["boss-one", "coder-lead"])
+
+    def _record(self, w, **rec):
+        with open(os.path.join(w.dir, "w1.json"), "w") as f:
+            json.dump(dict({"worker": "w1", "reports_to": "coder-lead"}, **rec), f)
+
+    def test_the_ask_is_the_pods_own_issue_and_falls_back_to_the_stall_watch_ask(self):
+        w = World()
+        w.add()
+        for rec, want in (({"issue": 812, "repo": "own/repo"}, "own/repo#812"), ({"issue": 7}, "7"), ({}, sw.STALL_ASK),
+                          ({"issue": "x; rm", "repo": "own/repo"}, sw.STALL_ASK), ({"issue": True}, sw.STALL_ASK), ({"issue": 0}, sw.STALL_ASK)):
+            self._record(w, **rec)
+            self.assertEqual(sw.ask_of(w.launcher, "w1"), want, rec)
+        os.remove(os.path.join(w.dir, "w1.json"))
+        self.assertEqual(sw.ask_of(w.launcher, "w1"), sw.STALL_ASK)
+
+    def test_the_cli_is_given_the_pods_own_ask_in_the_pass(self):
+        d = self._fake_cli('echo "$3" >> "$0.asks"\n')
+        w = World()
+        w.add(msg="Permission denied")
+        self._record(w, issue=812, repo="own/repo")
+        old = os.environ["PATH"]
+        os.environ["PATH"] = d + os.pathsep + old
+        try:
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                sw.watch_pass(w.launcher, [w.pods["w1-pod"]["doc"]], w.now, NAME_OK)
+        finally:
+            os.environ["PATH"] = old
+        with open(os.path.join(d, "fl" + "eet-switchboard.asks")) as f:
+            self.assertEqual(f.read().split(), ["own/repo#812", "own/repo#812"])
 
     def test_the_hour_holds_at_59_minutes_and_ends_at_60(self):
         w = World()

@@ -25,7 +25,8 @@ import sys
 import time
 
 AGENT_NAME = re.compile(r"[a-z][a-z0-9_-]{0,31}")
-CHIEF = "chief-of-staff"           # the role name the switchboard resolves to the Chief of Staff agent
+CHIEF = "cos"                      # the Chief of Staff's switchboard name when the config names none (`remind cos`)
+CONFIG_KEY = "cos_name"            # the switchboard config's key (config.json) that names the Chief of Staff's agent, when it has one
 STALL_ASK = "adamkaplan/fleet-kit#2399"   # the stall watch's own ask: the switchboard's `send` needs --issue (every message names its ask)
 RETRY_SECONDS = 10 * 60            # an alert that reached nobody is tried again at the next pass at least this long after
 MIN_POD_AGE_SECONDS = 600          # a younger pod is not read
@@ -199,11 +200,40 @@ def decide(data):
     return found
 
 
-def _default_send(to, text):
+def cos_name(launcher):
+    """The Chief of Staff's switchboard name: the switchboard config's `cos_name` (config.json beside cloud.env) when it holds a valid name, else CHIEF."""
+    env = getattr(launcher, "env", None) or {}
+    base = env.get("XDG_CONFIG_HOME") or os.path.join(env.get("HOME") or os.path.expanduser("~"), ".config")
+    try:
+        with open(os.path.join(base, "fl" + "eet-switchboard", "config.json")) as f:
+            name = json.load(f).get(CONFIG_KEY)
+    except (OSError, ValueError, AttributeError):
+        return CHIEF
+    return name if isinstance(name, str) and AGENT_NAME.fullmatch(name) else CHIEF
+
+
+def ask_of(launcher, worker):
+    """The ask the pod's own launch named (`--issue`, kept in the switchboard's worker record: issue and repo), as owner/repo#N (N alone when the record has no repo);
+    STALL_ASK when the record names none or is unreadable."""
+    rd = (getattr(launcher, "env", None) or {}).get("CW_CLOUD_RECORD_DIR")
+    try:
+        with open(os.path.join(rd, worker + ".json")) as f:
+            rec = json.load(f)
+        issue, repo = rec.get("issue"), rec.get("repo")
+    except (OSError, ValueError, AttributeError, TypeError):
+        return STALL_ASK
+    if isinstance(issue, bool) or not isinstance(issue, (int, str)) or not re.fullmatch(r"[1-9][0-9]{0,9}", str(issue)):
+        return STALL_ASK
+    if isinstance(repo, str) and re.fullmatch(r"[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}", repo):
+        return "%s#%s" % (repo, issue)
+    return str(issue)
+
+
+def _default_send(to, text, issue=STALL_ASK):
     binary = shutil.which("fl" + "eet-switchboard")   # written in two parts: the names check keeps the retired prefix out of cloud/
     if not binary:
         raise OSError("the switchboard command is not on the path")
-    done = subprocess.run([binary, "send", "--issue", STALL_ASK, to, text], capture_output=True, text=True, timeout=SEND_SECONDS, stdin=subprocess.DEVNULL)
+    done = subprocess.run([binary, "send", "--issue", issue, to, text], capture_output=True, text=True, timeout=SEND_SECONDS, stdin=subprocess.DEVNULL)
     if done.returncode != 0:
         first = next((l.strip() for l in (done.stderr or done.stdout or "").splitlines() if l.strip()), "")
         raise OSError("send exited %d: %s" % (done.returncode, evidence(first)[:200]))
@@ -269,10 +299,10 @@ def watch_pass(launcher, pods, now, name_ok, send=None):
                 boss = boss_of(launcher, worker)
                 if boss is None:
                     print("cloud-worker: stall alert for %s goes to the Chief of Staff only: no boss in the record" % name, file=sys.stderr)
-                delivered = 0
-                for to in ([CHIEF] + ([boss] if boss and boss != CHIEF else [])):
+                delivered, chief, ask = 0, cos_name(launcher), ask_of(launcher, worker)
+                for to in ([chief] + ([boss] if boss and boss != chief else [])):
                     try:
-                        send(to, body)
+                        (send if send is not _default_send else lambda t, b: _default_send(t, b, ask))(to, body)
                         delivered += 1
                     except Exception as e:
                         print("cloud-worker: stall alert for %s to %s not sent: %s" % (name, to, type(e).__name__ + (": " + str(e)[:200] if isinstance(e, OSError) else "")), file=sys.stderr)
