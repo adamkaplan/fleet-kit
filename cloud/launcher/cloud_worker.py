@@ -5525,6 +5525,99 @@ def apply_settings(env=None, path=None):
     return path
 
 
+_REAP_APPLIED = None   # set by main() when the real process applied the settings file: {name: value} the reaper applied; None means no reload
+_RELOAD_FIXED = ("CW_CLOUD_NAMESPACE", "CW_CLOUD_SERVER")   # cannot change mid-run: the lock, the namespace and the cluster login are made at the start
+
+
+def _settings_signature(path):
+    """(size, mtime_ns, sha256) of the file, or None when it cannot be read (apply_settings then names the reason)."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0))   # as _read_settings_file: a link or a pipe never blocks the pass
+    except OSError:
+        return None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > SETTINGS_FILE_MAX:
+            return None
+        with os.fdopen(fd, "rb", closefd=False) as f:
+            raw = f.read(SETTINGS_FILE_MAX + 1)
+        return (st.st_size, st.st_mtime_ns, hashlib.sha256(raw).hexdigest())
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+
+
+def reload_settings(env, applied, state, lock=None):
+    """With `lock` (the launcher's renew_lock) held, so the renewal thread never reads the environment half changed: see _reload_settings."""
+    if lock is None:
+        return _reload_settings(env, applied, state)
+    with lock:
+        return _reload_settings(env, applied, state)
+
+
+def _reload_settings(env, applied, state):
+    """Read the settings file again between two reaper passes. `applied` ({name: value} the reaper applied) is updated in place; `state` holds
+    the last signature and the last printed reason. Only a table setting whose value still equals the applied one is dropped before the read,
+    so apply_settings' clash rule is untouched and a value the caller set itself stays. A failure keeps every old value, prints one line
+    (the reason, never a value) when the reason differs from the last one printed, and never raises."""
+    names = [n for n, _, _ in SETTINGS]
+    before = {n: env[n] for n in names + ["AZURE_CONFIG_DIR"] if n in env}
+    try:
+        path = settings_path(env)
+        sig = _settings_signature(path)
+        if sig is not None and sig == state.get("sig"):
+            return
+        for n in names:
+            if n in applied and env.get(n) == applied[n]:
+                env.pop(n)
+        if applied.get("CW_AZURE_CONFIG_DIR") and env.get("AZURE_CONFIG_DIR") == applied["CW_AZURE_CONFIG_DIR"]:
+            env.pop("AZURE_CONFIG_DIR")
+        own = {n: env[n] for n in names if n in env}   # the caller's own values: apply_settings clears the table, these are put back
+        def restore():
+            for n in names + ["AZURE_CONFIG_DIR"]:
+                env.pop(n, None)
+            env.update(before)
+        try:
+            source = apply_settings(env, path)
+        except CloudError as e:
+            restore()
+            reason = scrub(e, (), 200)
+            if reason != state.get("reason"):
+                state["reason"] = reason
+                print("cloud-worker: settings file not reloaded: %s" % reason, file=sys.stderr)
+            return
+        if source == "environment":   # no file: the values stay as they were
+            restore()
+            return
+        for n, v in own.items():
+            env.setdefault(n, v)
+        held = []
+        for n in _RELOAD_FIXED:
+            if env.get(n) != before.get(n):
+                held.append(n)
+                if n in before:
+                    env[n] = before[n]
+                else:
+                    env.pop(n, None)
+        new = {n: env[n] for n in names if n in env and n not in own and (n not in held or n in applied)}
+        applied.clear()
+        applied.update(new)
+        state["sig"], state["reason"] = sig, None
+        if held:
+            line = "%s changed in the settings file: not applied until the reaper restarts" % ", ".join(held)
+            print("cloud-worker: settings file: %s" % line, file=sys.stderr)
+            state["reason"] = line
+    except Exception as e:   # a failed reload never ends the reaper
+        for n in names + ["AZURE_CONFIG_DIR"]:
+            env.pop(n, None)
+        env.update(before)
+        reason = "the reload failed (%s)" % type(e).__name__
+        if reason != state.get("reason"):
+            state["reason"] = reason
+            print("cloud-worker: settings file not reloaded: %s" % reason, file=sys.stderr)
+
+
 # -- stack-registry-check (ask #1022): runs on the operator's machine with the operator's own `az` login, BEFORE any pod exists. It only READS
 # (az ... show / list); it never creates or changes an identity, a federated credential or a role. It cannot call the token exchange (that needs a
 # projected token): only the live pod proves the exchange. Exit 0 = OK, 1 = an owner step is missing, 2 = CANNOT TELL (never a pass).
@@ -5856,7 +5949,10 @@ def _reap_main(env, a, sleep, clock=None, refresher=None, kube=None, ticker_wait
         L = Launcher(kube, env, clock, sleep) if kube is not None else None
         ticker = None
         identity = code_identity(tree) if tree else START_IDENTITY
+        reload_state = {}
         while True:
+            if _REAP_APPLIED is not None:   # the settings file is read again at each pass (the same env the launcher and the ticker read)
+                reload_settings(env, _REAP_APPLIED, reload_state, getattr(L, "renew_lock", None))
             blocked = read_vault_block(env)
             if blocked is not None and time.time() < blocked[1]:   # the vault block (ask #1427): no pass, no az process, ONE log line
                 print("cloud-worker: reaper pass skipped: %s" % vault_block_line(blocked), file=sys.stderr)
@@ -5937,6 +6033,8 @@ def _reap_main(env, a, sleep, clock=None, refresher=None, kube=None, ticker_wait
 def main(argv=None, env=None, clock=None, sleep=time.sleep):
     explicit = env is not None
     env = os.environ if env is None else env
+    global _REAP_APPLIED
+    _REAP_APPLIED = None
     try:
         a = build_parser().parse_args(argv)
     except SystemExit as e:
@@ -5945,7 +6043,9 @@ def main(argv=None, env=None, clock=None, sleep=time.sleep):
         a.idle = DEFAULT_ORCHESTRATOR_IDLE if a.agent == "orchestrator" else DEFAULT_IDLE
     if not explicit:   # the real process reads the settings file; a caller that passes its own environment has made its own choice
         try:
+            pre = {n: env[n] for n, _, _ in SETTINGS if n in env}
             apply_settings(env)
+            _REAP_APPLIED = {n: env[n] for n, _, _ in SETTINGS if n in env and pre.get(n) != env[n]}   # only what the file gave is the reaper's to drop later
         except CloudError as e:
             print("cloud-worker: %s" % e, file=sys.stderr)
             return e.code

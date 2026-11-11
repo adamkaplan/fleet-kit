@@ -93,6 +93,7 @@ cloud/launcher/tests/test_readonly_root.py
 cloud/launcher/tests/test_reap_concurrent.py
 cloud/launcher/tests/test_reaper_audit_tail.py
 cloud/launcher/tests/test_reaper_managed.py
+cloud/launcher/tests/test_reaper_reload.py
 cloud/launcher/tests/test_reaper_renewal.py
 cloud/launcher/tests/test_reaper_restart.py
 cloud/launcher/tests/test_reaper_row.py
