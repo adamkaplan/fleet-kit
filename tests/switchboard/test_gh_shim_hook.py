@@ -144,21 +144,28 @@ class TestGhShimHookDelete(unittest.TestCase):
         self.assertEqual(done.returncode, 1)
 
 
-def today(name):
-    return subprocess.run(["git", "show", "origin/integration:shims/" + name], capture_output=True, text=True, cwd=str(SHIM_DIR.parent), check=True).stdout
+def source(name):
+    return (SHIM_DIR / name).read_text()
+
+
+def mutant(name, old, new):
+    text = source(name)
+    assert text.count(old) == 1, old   # the control is a mutant of the CURRENT source: it stays true whatever origin/integration holds
+    return text.replace(old, new)
 
 
 class TestGhShimHookControls(unittest.TestCase):
-    def test_today_s_shim_refuses_the_delete_of_a_forwarder_hook(self):
-        rig = HookRig(shim_source=today("gh"), gh_body_source=today("gh_body.py"))
+    def test_without_the_allow_list_row_the_delete_of_a_forwarder_hook_is_refused(self):
+        rig = HookRig(shim_source=mutant("gh", 'r"hooks/[0-9]+"', 'r"hooks/never-matches"'))
         self.addCleanup(rig.close)
         done, calls, _ = rig.go(delete())
-        self.assertEqual(calls, [], "control: nothing passes on today's shim")
+        self.assertEqual(calls, [], "control: nothing passes without the row")
         self.assertIn("REST_WRITES", done.stderr)
 
-    def test_without_the_pre_read_a_hook_of_another_name_would_pass(self):
-        # the allow-list alone (today's gh_body.py with the new table row) would let any hook go: the pre-read is what narrows it
-        rig = HookRig(gh_body_source=today("gh_body.py"))
+    def test_without_the_hook_check_a_hook_of_another_name_would_pass(self):
+        # the allow-list row alone would let any hook go: the pre-read and the name and url check are what narrow it
+        old = 'if data.get("name") == "cli" and isinstance(config, dict) and config.get("url") == FORWARDER_HOOK_URL:'
+        rig = HookRig(gh_body_source=mutant("gh_body.py", old, "if True:"))
         self.addCleanup(rig.close)
         done, calls, _ = rig.go(delete(), hook_text=hook(name="web"))
-        self.assertEqual(len(calls), 1, "control: no pre-read, no narrowing")
+        self.assertEqual(len(calls), 1, "control: no check, no narrowing")

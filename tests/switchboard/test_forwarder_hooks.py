@@ -30,7 +30,6 @@ class HooksRunner:
 
     def __init__(self, hooks, list_error=None, delete_error=None):
         self.hooks, self.list_error, self.delete_error, self.calls = list(hooks), list_error, delete_error, []
-        self.forwarders_started = 0
 
     def __call__(self, argv, **kwargs):
         self.calls.append(list(argv))
