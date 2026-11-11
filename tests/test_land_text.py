@@ -128,7 +128,7 @@ class TestLandText(unittest.TestCase):
         self.assertIn(("missing", "the detached command"), self.detached_problems(text))
         self.assertIn(("foreground run", ".spire/tool/bin/spire land"), self.detached_problems(".spire/tool/bin/spire land > /work/land.log 2>&1 &"))   # redirected but not under nohup
 
-    def test_no_text_claims_a_acme_org_default_for_land_repos(self):
+    def test_no_text_claims_an_acme_org_default_for_land_repos(self):
         for path in ("docs/switchboard.md", "skills/fleet-coordination/SKILL.md", "skills/fleet-review/SKILL.md", "skills/fleet-explainer/SKILL.md"):
             for line in (ROOT / path).read_text().splitlines():
                 if "land_repos" in line or "spire land" in line:
