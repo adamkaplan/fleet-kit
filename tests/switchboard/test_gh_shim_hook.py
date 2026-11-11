@@ -1,5 +1,5 @@
 """#2397: the gh shim allows ONE webhook write, DELETE repos/O/R/hooks/ID, and only for a `cli` hook whose config.url is the webhook forwarder's url: the shim reads the hook first
-(shims/gh_body.py, the pre-read style of the body guard) with the account the delete would use. Fakes only: no test calls GitHub. The controls are mutants of the current shim."
+(shims/gh_body.py, the pre-read style of the body guard) with the account the delete would use. Fakes only: no test calls GitHub. The controls are mutants of the current shim."""
 import json
 import os
 import subprocess
@@ -138,7 +138,7 @@ class TestGhShimHookDelete(unittest.TestCase):
         self.assertEqual(load_module().FORWARDER_HOOK_URL, URL)
 
     def test_a_flag_and_its_value_before_api_cannot_skip_the_check(self):
-        for lead in (["--hostname", "github.com"], ["-H", "x:y"], ["--jq", "."]):
+        for lead in (["--hostname", "github.com"], ["-H", "x:y"], ["--jq", "."], ["--jq", "search"], ["-q", "auth"], ["--hostname", "help"]):
             with self.subTest(lead=lead):
                 done, calls, _ = self.rig.go(lead + delete(), hook_text=hook(name="web"))
                 self.assertEqual(calls, [], "a hook that is not the forwarder's passed")
