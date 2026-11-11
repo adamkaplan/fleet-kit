@@ -10156,16 +10156,19 @@ def pick_owner(agents, numbers, repo=None, default_repo=None, view=None):
 
 def red_ci_lane(hub, repo, pr, now):
     """Ask #2392: the live owner of a pull request's ask, or None: the router's own links (the issue it closes, a notice, a reference: an orchestrator lane or a worker), else a
-    worker whose record's --branch is the pull request's head branch and that is discovered live. A read that fails raises (the caller keeps the alert)."""
+    worker whose record's --branch is the pull request's head branch and that is discovered live. Only a pull request whose head is in THIS repository counts: a fork's author writes
+    its body and branch name, so neither may name an owner. A read that fails raises (the caller keeps the alert)."""
+    head = (pr or {}).get("head") if isinstance(pr, dict) else None
+    full = ((head.get("repo") or {}).get("full_name") if isinstance(head, dict) and isinstance(head.get("repo"), dict) else "") or ""
+    if not (isinstance(head, dict) and str(full).lower() == repo.lower()):
+        return None
     agents = (getattr(hub.engine, "discovery", None) or types.SimpleNamespace(agents={})).agents
     item = _pr_item(repo, pr, now)
     owner = hub.owner_of(item, agents, now) if item is not None else None
     if owner:
         return owner
-    head = (pr or {}).get("head") if isinstance(pr, dict) else None
-    ref = (head or {}).get("ref") if isinstance(head, dict) else None
-    same = isinstance(head, dict) and str(((head.get("repo") or {}).get("full_name") if isinstance(head.get("repo"), dict) else "") or "").lower() == repo.lower()   # a fork's branch of the same name is not the worker's
-    for rec in ((getattr(hub.engine, "cloud_watch", None) or {}).get("records") or []) if isinstance(ref, str) and same else []:
+    ref = head.get("ref")
+    for rec in ((getattr(hub.engine, "cloud_watch", None) or {}).get("records") or []) if isinstance(ref, str) else []:
         if isinstance(rec, dict) and rec.get("repo") == repo and rec.get("branch") == ref and rec.get("worker") in agents:
             return rec["worker"]
     return None

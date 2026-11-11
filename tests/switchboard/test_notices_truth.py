@@ -219,6 +219,7 @@ class TestRedCiOwnedByItsAsk(Base):
         self.assertEqual(sb.red_ci_lane(hub, self.REPO, pr(6, "feat/own"), 0), "cw-1")
         self.assertIsNone(sb.red_ci_lane(hub, self.REPO, pr(7, "feat/none"), 0))
         self.assertIsNone(sb.red_ci_lane(hub, self.REPO, pr(8, "feat/own", "someone/fork"), 0), "a fork's branch of the same name is not the worker's")
+        self.assertIsNone(sb.red_ci_lane(hub, self.REPO, pr(5, "x", "someone/fork"), 0), "a fork's body that names an owned issue does not silence the alert")
 
 
 class TestReadOfAnEndedWorker(unittest.TestCase):
@@ -374,10 +375,10 @@ class TestRunRecordKeepsTheResultsFile(unittest.TestCase):
         class Kube:
             def exec(self_, pod, *cmd, **kw):
                 calls.append(cmd)
-                if cmd[0] == "tail":
+                if cmd[0] == "sh":
                     if isinstance(answer, Exception):
                         raise answer
-                    return answer
+                    return answer[-int(cmd[-1]):]   # the window of the read
                 if cmd[0] == "git":
                     return "c" * 40 + "\n"
                 return ""
@@ -403,10 +404,29 @@ class TestRunRecordKeepsTheResultsFile(unittest.TestCase):
 
     def test_a_secret_that_straddles_the_cut_leaves_no_piece(self):
         module = self.load()
-        text = "q" * (module.RESULTS_KEEP - 3) + "hunter2" + "\nSTATUS: done"   # the secret begins just before the kept tail
+        secret = "hunter2" * 3   # 21 characters, over the scrub's piece size
+        text = "q" * (module.RESULTS_KEEP - 5) + secret + "\nSTATUS: done"   # the secret begins just before the kept tail
         got = self.recorder(text)[0].results_file("pod-y")
         self.assertNotIn("hunter2", got["text"])
-        self.assertNotIn("ter2", got["text"].replace("[redacted]", ""))
+        self.assertNotIn("ter2h", got["text"])
+
+    def test_the_read_refuses_a_link_and_a_fifo_where_an_unguarded_tail_follows_it(self):
+        import subprocess
+        module = self.load()
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        target, link, fifo, plain = (os.path.join(d, n) for n in ("target", "link", "fifo", "plain"))
+        Path(target).write_text("SECRET-PLACE\nSTATUS: done\n")
+        Path(plain).write_text("fine\nSTATUS: done\n")
+        os.symlink(target, link)
+        os.mkfifo(fifo)
+        run = lambda script, path: subprocess.run(["sh", "-c", script, "sh", path, "100"], capture_output=True, text=True, timeout=20)
+        for path in (link, fifo):
+            with self.subTest(path=os.path.basename(path)):
+                got = run(module.RESULTS_SCRIPT, path)
+                self.assertEqual((got.returncode, got.stdout), (3, ""))
+        self.assertEqual(run(module.RESULTS_SCRIPT, plain).stdout, "fine\nSTATUS: done\n")
+        self.assertIn("SECRET-PLACE", run('tail -c "$2" "$1"', link).stdout, "control: a plain tail follows the link")
 
     def test_no_file_or_a_failed_read_keeps_nothing(self):
         module = self.load()
@@ -424,10 +444,14 @@ class TestRunRecordKeepsTheResultsFile(unittest.TestCase):
         run = json.loads((Path(directory) / "run.json").read_text())
         self.assertEqual((run["results"]["done"], run["head_sha"]), (True, "c" * 40))
         self.assertTrue(run["results"]["text"].rstrip().endswith("STATUS: done"))
+        rec, _calls = self.recorder("", module)
+        rec.read_messages = lambda pod: (None, "no server in this test")
+        bare = json.loads((Path(rec.record("pod-z", "pod-z", "idle", repo="o/r", root=root)) / "run.json").read_text())
+        self.assertNotIn("results", bare, "a pod with no results file leaves the key out")
 
     def test_control_without_the_line_in_record_the_run_json_has_no_results(self):
         text = (BIN.parent / "cloud" / "launcher" / "run_record.py").read_text()
-        old = '                info["results"] = self.results_file(pod)'
+        old = '                if found is not None:\n                    info["results"] = found'
         self.assertIn(old, text)
         was = types.ModuleType("run_record_as_it_was")
         exec(compile(text.replace(old, "                pass", 1), "run_record.py", "exec"), was.__dict__)

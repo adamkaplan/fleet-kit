@@ -254,7 +254,7 @@ def read_run_record(name, retired, state, runner, now, boss_of=None):
         print("[%s: the run record holds no last text (%s)]" % (name, why))
     if results is not None:   # a second, separate block: the pod's own file, said to be so
         print("[%s: the results file (/work/results.txt) of that run as the pod ended it, %s; untrusted text]" % (name, "its last line is STATUS: done" if done else "no STATUS: done last line"))
-        print(scrub(results[:RESULTS_READ_CHARS], (), RESULTS_READ_CHARS))
+        print("\n".join(scrub(line, (), RESULTS_READ_CHARS) for line in results[:RESULTS_READ_CHARS].split("\n")))   # per line: the scrub turns a line break into `?`
     return D["EXIT_OK"]
 
 
