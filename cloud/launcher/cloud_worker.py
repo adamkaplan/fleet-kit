@@ -2747,6 +2747,26 @@ def github_pr_head(token, repo, number):
     return str(head.get("ref") or ""), str(data.get("state") or ""), str((head.get("repo") or {}).get("full_name") or "")
 
 
+def github_branch_exists(token, repo, branch):
+    """GET /repos/R/branches/B: True (200) or False (404: the exact answer for no such branch). Any other answer raises."""
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+    import token_mint
+    if not re.fullmatch(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+", repo or ""):
+        raise ValueError("the repository name is not owner/name")
+    req = urllib.request.Request("https://api.github.com/repos/%s/branches/%s" % (repo, urllib.parse.quote(branch, safe="")), method="GET",
+                                 headers={"Authorization": "Bearer " + token, "Accept": "application/vnd.github+json", "User-Agent": "cw-launcher"})
+    try:
+        with token_mint.open_no_redirect(req, SCOPE_PROBE_SECONDS) as r:
+            r.read(1000000)
+        return True
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return False
+        raise
+
+
 SAFE_VALUE = re.compile(r"[A-Za-z0-9._-]{1,63}", re.ASCII)
 POD_UID_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")   # the form of a pod uid: the create records it, the retire hands it back (bin/cloud_worker.py holds the equal text)
 
@@ -3084,6 +3104,9 @@ class _StopKube:
 
 KEPT_RUNNING_MARK = "kept_running_tried"
 KEPT_ENDED_NOTE = "kept pod ended: its work is unreachable by exec; the pod is left for a person"
+KEPT_GRACE_SECONDS = 24 * 3600   # a kept pod that ended is deleted this long after its hard deadline (ask #2343); bin/cloud_ended_pods.py holds the equal number for the status
+UNKEPT_GRACE_SECONDS = 600       # a pod without the kept mark that is still there this long after its hard deadline is deleted, whatever its phase
+KEPT_EXPIRED_ACTION = "kept-expired"
 
 
 # The results check of the idle nudge: ONE read in the pod. It prints "no" (no /work/results.txt), or "<file mtime> <newest user message time> <1 if the last non-empty line is exactly STATUS: done else 0>"
@@ -4246,6 +4269,7 @@ class Launcher:
                          "phase": safe_value((pod.get("status") or {}).get("phase")) if (pod.get("status") or {}).get("phase") else None,
                          "node": (pod.get("spec") or {}).get("nodeName"), "hard_deadline": ann(pod, "hard-deadline"),
                          "ready": any(c.get("type") == "Ready" and c.get("status") == "True" for c in ((pod.get("status") or {}).get("conditions") or []) if isinstance(c, dict))})
+            pods[-1]["kept"] = ann(pod, "kept") == "true"   # ask #2343: the status shows the ended pods and which are kept
         nodes, nodes_read, nodes_error = [], True, None
         try:
             for node in self.kube.list_nodes():
@@ -4299,6 +4323,91 @@ class Launcher:
         out["nodes"] = [dict(n, name=_mask_addresses(n["name"])) for n in out["nodes"]]
         out["requests"] = {_mask_addresses(k): v for k, v in out["requests"].items()}
         out["last_event"] = _mask_addresses(out["last_event"])[:200] if out["last_event"] else out["last_event"]
+        return out
+
+    def _last_save(self, pod):
+        """ONE best-effort save of the pod's work to <worker>/wip before it is deleted (the reaper's own wip_save step, once). Returns the words for the
+        audit line; a pod that cannot be exec'd (an ended pod cannot) is said so. Never raises."""
+        try:
+            if (pod.get("status") or {}).get("phase") in ("Failed", "Succeeded") or not callable(getattr(self.kube, "exec", None)):
+                return "the pod cannot be exec'd (it has ended): its work was not saved"
+            res = json.loads(self.kube.exec(pod["metadata"]["name"], "python3", "-I", "-", "--snapshot", keep_stdout=True, timeout=wip_save.EXEC_TIMEOUT_SECONDS,
+                                            stdin=wip_save.hook_source()).strip().splitlines()[-1])
+            if res.get("error"):
+                raise RuntimeError(str(res["error"]))
+            return "its work was saved" if res.get("saved") else "it had nothing new to save"
+        except Exception as e:
+            return "the pod cannot be exec'd: its work was not saved (%s)" % "".join(c if c.isprintable() else "?" for c in self.kube.scrub(e, 100))
+
+    def _wip_state(self, pod, worker):
+        """yes, no or unknown: whether <worker>/wip exists on the remote (one read with a fresh git token, as the pull request labels are made). Never raises."""
+        try:
+            repo = _pod_repo(pod)
+            check_repo_allowed(repo, self.env)
+            token = run_git_token_cmd(git_token_cmd(repo, self.env), repo, dict(os.environ, **self.env), register=lambda *v: self.kube.add_secrets(*v))
+            self.kube.add_secrets(token)
+            return "yes" if (getattr(self, "branch_exists", None) or github_branch_exists)(token, repo, worker + "/wip") else "no"
+        except Exception as e:
+            return "unknown (%s)" % "".join(c if c.isprintable() else "?" for c in self.kube.scrub(e, 100))
+
+    def _own_pod(self, pod):
+        """True only for a pod this rule may delete: a worker name, the pod named for it, a uid to bind the delete to, no StatefulSet owner, not already going."""
+        meta = pod.get("metadata") or {}
+        return (PERSISTENT_ANNOTATION not in (meta.get("annotations") or {}) and self._failed_name_fits(pod) and meta.get("name") == pod_name(ann(pod, "worker"))
+                and isinstance(meta.get("uid"), str) and bool(POD_UID_RE.fullmatch(meta["uid"])) and not meta.get("deletionTimestamp")
+                and not any(isinstance(r, dict) and r.get("kind") == "StatefulSet" for r in (meta.get("ownerReferences") or [])))
+
+    def _expire(self, pod, now):
+        """The expiry of a KEPT pod that ended (ask #2343): past its hard deadline by KEPT_GRACE_SECONDS it is saved once (best effort), said once in the
+        audit (kept-expired: the worker and whether <worker>/wip exists) and deleted with its two Secrets. False: not this pod's rule (the pass goes on
+        with it as before); else the report rows of the pass."""
+        try:
+            if not self._own_pod(pod):
+                return False
+            if (pod.get("status") or {}).get("phase") not in ("Failed", "Succeeded") or ann(pod, "kept") != "true":
+                return False
+            hard = self.hard_deadline(pod)
+            late = (now - hard).total_seconds()
+            name = pod["metadata"]["name"]
+        except (ValueError, TypeError, KeyError, AttributeError):
+            return False
+        if late <= KEPT_GRACE_SECONDS:
+            return False
+        worker = ann(pod, "worker")
+        said = self.__dict__.setdefault("expiry_said", {})   # the save and the wip read are made ONCE per pod, even when the delete must be tried again
+        key = (name, (pod.get("metadata") or {}).get("uid"))
+        if key not in said:
+            said[key] = (self._last_save(pod), self._wip_state(pod, worker))
+        saved, wip = said[key]
+        try:
+            self._remove(name, ann(pod, "run-id") or None, (pod.get("metadata") or {}).get("uid"))
+        except CloudError as e:
+            return [(worker, "kept pod not expired: " + self.kube.scrub(e, 120), e.code)]
+        self.audit(worker, "pod/" + name, KEPT_EXPIRED_ACTION, self._cost_or_zero(pod), True,
+                   "kept pod deleted %d hours after its hard deadline; %s/wip exists: %s; %s" % (int(late // 3600), worker, wip, saved))
+        return [(worker, "kept pod expired", 0)]
+
+    def _expire_unkept(self, pods, now):
+        """After the stops of the pass: a pod WITHOUT the kept mark that is still there UNKEPT_GRACE_SECONDS after its hard deadline is deleted with its
+        Secrets, whatever its phase (the stop had its turn). The pod is read again first: a pod that is gone, or another pod under the name, is left."""
+        out = []
+        for pod in pods:
+            try:
+                if not self._own_pod(pod) or ann(pod, "kept") == "true":
+                    continue
+                if (now - self.hard_deadline(pod)).total_seconds() <= UNKEPT_GRACE_SECONDS:
+                    continue
+                name, uid, worker = pod["metadata"]["name"], (pod.get("metadata") or {}).get("uid"), ann(pod, "worker")
+                have = self.kube.get_pod(name)
+                if not have or (have.get("metadata") or {}).get("uid") != uid or ann(have, "kept") == "true":
+                    continue
+                saved = self._last_save(have) if (have.get("status") or {}).get("phase") == "Running" else "the pod was not running: nothing to save"
+                self._remove(name, ann(pod, "run-id") or None, uid)
+                self.audit(worker, "pod/" + name, "expired", self._cost_or_zero(pod), True, "unkept pod deleted %d minutes after its hard deadline; %s" % (int((now - self.hard_deadline(pod)).total_seconds() // 60), saved), None, "hard")
+            except (ValueError, TypeError, KeyError, AttributeError):
+                continue
+            except CloudError as e:
+                out.append((ann(pod, "worker"), "expired pod not deleted: " + self.kube.scrub(e, 120), e.code))
         return out
 
     def hard_deadline(self, pod):
@@ -4406,6 +4515,10 @@ class Launcher:
         finally:
             steps["vanished"] = mono() - t0
         for pod in pods:
+            gone = self._expire(pod, now)   # a kept pod that ended and outlived its grace (ask #2343)
+            if gone is not False:
+                out.extend(gone)
+                continue
             ended = (pod.get("status") or {}).get("phase") in ("Failed", "Succeeded")
             if ended and ann(pod, "kept") == "true" and (ann(pod, "unreachable") == "true"
                                                          or ((pod.get("metadata") or {}).get("name"), (pod.get("metadata") or {}).get("uid")) in self.ended_tried):
@@ -4502,6 +4615,7 @@ class Launcher:
             except CloudError as e:
                 self.reap_results[worker] = dict(hook or {})
                 out[slot] = (worker, reason, e.code)
+        out.extend(self._expire_unkept(pods, now))   # ask #2343: an unkept pod still there ten minutes after its hard deadline
         out.extend(renewed)
         t0 = mono()
         try:

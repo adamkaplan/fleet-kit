@@ -239,6 +239,7 @@ waits for idle, then stops the worker (the end hook pushes the work; the pod and
   `per-run secret NAME-run cleaned` or `per-run secret NAME-run REMAINS: delete it with: <command>`.
 - A worker whose end hook cannot push is kept so the work is not lost; its per-run Secret is still deleted and the
   pod's name and delete command are printed.
+  A kept pod that has ended (Failed or Succeeded) is deleted with its Secrets `KEPT_GRACE_SECONDS` (24 hours) after its hard deadline, after one best-effort save to `<worker>/wip` and one `kept-expired` audit line; an unkept pod still there ten minutes after its hard deadline is deleted whatever its phase (live at the next reaper restart; the status shows the ended pods).
 - Every line it prints passes through the launcher's one `scrub()`. No secret is in an argument, an environment
   variable of a child, a log or a file; the only file is a private temporary directory (`CW_TMPDIR`) holding the
   port-forward's own log, removed at exit. The server password comes back on a pipe and stays in memory.

@@ -12,6 +12,11 @@ D: object   # the names that stayed in bin/cloud_worker.py, set by its loader be
 INSPECT_SECONDS = 60   # the bound of the launcher's one read (one exec, or the fallback's four)
 
 
+def bind(namespace):
+    """Load the ended-pod lines of the status (ask #2343, bin/cloud_ended_pods.py): that part wraps the summary line of bin/cloud_worker.py."""
+    namespace["_load_part"]("cloud_ended_pods")
+
+
 def _inspect_short(body):
     """ONE line for a notice: 'NAME: running TOOL for Ns | last: TOOL STATUS | idle Ns | branch B, N unpushed, dirty D | last push P'."""
     def word(value, limit=60):
