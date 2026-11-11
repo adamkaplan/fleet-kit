@@ -2067,8 +2067,10 @@ def write_audit(path, line):
         fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
         with os.fdopen(fd, "a") as f:   # one short O_APPEND write: atomic enough for one line, the chosen guarantee
             f.write(json.dumps(line, sort_keys=True) + "\n")
+        return True
     except OSError as e:
         print("cloud-worker: WARNING: the action ran but its audit line could not be written: %s" % e, file=sys.stderr)
+        return False   # #2399: the stall watch needs to know (it retries an alert whose line was not written)
 
 
 def last_audit_line(path, action, runtime_id=None):
@@ -3191,7 +3193,7 @@ class Launcher:
             line["refresh"] = refresh
         if cause:   # a stop the launcher made of its own accord names why: idle, hard, pod_gone or pod_failed (a person's stop has none)
             line["cause"] = cause
-        write_audit(self.audit_path, dict(line, **(extra or {})))
+        return write_audit(self.audit_path, dict(line, **(extra or {})))
 
     def cost(self, pod):
         hours = (self.clock() - parse_iso(ann(pod, "started"))).total_seconds() / 3600

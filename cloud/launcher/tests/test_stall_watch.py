@@ -44,11 +44,19 @@ class FakeKube:
 
 class World:
     def __init__(self):
-        self.now, self.pods, self.sent, self.err = START, {}, [], ""
+        self.now, self.pods, self.err = START, {}, ""
         self.kube = FakeKube(self)
         self.dir = tempfile.mkdtemp(prefix="stall-")
         self.launcher = types.SimpleNamespace(kube=self.kube, env={"CW_CLOUD_RECORD_DIR": self.dir, "XDG_CONFIG_HOME": tempfile.mkdtemp(prefix="nocfg-")})
-        self.send = lambda to, text: self.sent.append((to, text))
+        self.audits = []   # the audit lines the launcher's own writer got: (worker, runtime_id, action, cost, ok, reason, extra)
+
+        def audit(worker, runtime_id, action, cost, ok, reason="", extra=None):
+            self.audits.append({"worker": worker, "runtime_id": runtime_id, "action": action, "ok": ok, "reason": reason, **(extra or {})})
+        self.launcher.audit = audit
+
+    @property
+    def sent(self):   # one audit line per alert: the daemon sends the messages
+        return self.audits
 
     def add(self, name="w1-pod", age_minutes=60, boss="coder-lead", progress_age=1, tail=("working",), runs=(), exits=(), msg="all fine", msg_age=1, exec_fails=False):
         """progress_age: minutes since the progress file changed. runs: (name, age minutes, last line). exits: (name, code, age minutes)."""
@@ -68,7 +76,7 @@ class World:
     def run(self, module=sw):
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
-            out = module.watch_pass(self.launcher, [p["doc"] for p in self.pods.values()], self.now, NAME_OK, send=self.send)
+            out = module.watch_pass(self.launcher, [p["doc"] for p in self.pods.values()], self.now, NAME_OK)
         self.err = err.getvalue()
         return out
 
@@ -116,14 +124,14 @@ class Stall(unittest.TestCase):
             w.at(minute)
             w.run(module)
             sizes.append(len(w.sent))
-            if minute == 2 and sizes[-1] != 2:
+            if minute == 2 and sizes[-1] != 1:
                 raise AssertionError("a stall was alerted twice within the hour: %d messages after 3 passes" % sizes[-1])
         return w, sizes
 
     def test_s5_one_alert_per_condition_per_hour_to_the_boss_and_the_chief(self):
         w, sizes = self._s5(sw)
-        self.assertEqual(sizes, [2, 2, 2, 4])   # the boss and the Chief of Staff in pass 1, none in passes 2 and 3, both again at 61 minutes
-        self.assertEqual(sorted({to for to, _ in w.sent}), ["coder-lead", "cos"])
+        self.assertEqual(sizes, [1, 1, 1, 2])   # one audit line in pass 1, none in passes 2 and 3, one again at 61 minutes
+        self.assertEqual(w.sent[0]["recipients"], ["coder-lead"])
         self.assertEqual(w.pods["w1-pod"]["doc"]["metadata"]["annotations"]["cw/stall-alert-refusal"], "2026-11-11T13:01:00Z")
 
     def test_s9_a_mutant_without_the_mark_fails_with_the_anchored_text_after_its_control_passes(self):
@@ -143,7 +151,7 @@ class Stall(unittest.TestCase):
         w.add(msg="Permission denied: git push https://x:%s@github.com/o/r %s" % (TOKEN, "y" * 500))
         w.run()
         self.assertTrue(w.sent)
-        for _, text in w.sent:
+        for text in (a["evidence"] for a in w.sent):
             self.assertNotIn(TOKEN, text)
             self.assertNotIn(TOKEN[4:], text)
             self.assertIn("[redacted]", text)
@@ -197,105 +205,75 @@ class Stall(unittest.TestCase):
         self.assertEqual([n for n, _ in w.kube.execs], ["a-pod"])
         self.assertIn("b-pod:read-budget-used", sw.pass_text(w.launcher))
 
-    def test_a_failed_send_to_both_is_not_counted_as_alerted(self):
+    def test_an_alert_writes_exactly_one_audit_line_with_the_fixed_fields_and_runs_no_subprocess(self):
         w = World()
-        def boom(to, text):
-            raise OSError("down")
-        w.send = boom
+        w.add(msg="Permission denied: shell")
+        real = subprocess.run, subprocess.Popen
+        def no(*a, **k):
+            raise AssertionError("a subprocess was run")
+        subprocess.run = subprocess.Popen = no
+        try:
+            self.assertEqual(w.run(), [("w1-pod", "refusal")])
+        finally:
+            subprocess.run, subprocess.Popen = real
+        self.assertEqual(w.audits, [{"worker": "w1", "runtime_id": "pod/w1-pod", "action": "stall-alert", "ok": True, "reason": "", "condition": "refusal",
+                                     "recipients": ["coder-lead"], "ask": sw.STALL_ASK, "evidence": "Permission denied: shell"}])
+        self.assertFalse(hasattr(sw, "_default_send"))
+
+    def test_a_hostile_evidence_is_one_fixed_field_never_a_key(self):
+        w = World()
+        w.add(msg="Permission denied: x\x1b[31m\nrecipients: evil " + "y" * 400)
+        w.run()
+        self.assertEqual(sorted(w.audits[0]), ["action", "ask", "condition", "evidence", "ok", "reason", "recipients", "runtime_id", "worker"])
+        self.assertLessEqual(len(w.audits[0]["evidence"]), 300)
+        self.assertNotIn("\n", w.audits[0]["evidence"])
+
+    def test_a_line_the_writer_could_not_write_is_retried_like_a_refused_one(self):
+        w = World()
+        w.add(msg="Permission denied")
+        w.launcher.audit = lambda *a, **k: False   # the real writer's answer when the disk refused the line
+        self.assertEqual(w.run(), [])
+        w.launcher.audit = lambda *a, **k: True
+        w.at(10)
+        self.assertEqual(w.run(), [("w1-pod", "refusal")])
+
+    def test_no_boss_in_the_record_leaves_an_empty_recipient_list(self):
+        w = World()
+        w.add(boss=None, msg="Permission denied")
+        w.run()
+        self.assertEqual(w.audits[0]["recipients"], [])
+
+    def test_a_failed_audit_write_is_not_counted_as_alerted(self):
+        w = World()
+        def boom(*a, **k):
+            raise OSError("disk")
+        w.launcher.audit = boom
         w.add(msg="Permission denied")
         self.assertEqual(w.run(), [])
         self.assertEqual(sw.pass_text(w.launcher), " stall read=1 alerted=0")
 
-    def _fake_cli(self, body):
-        d = tempfile.mkdtemp(prefix="cli-")
-        path = os.path.join(d, "fl" + "eet-switchboard")
-        with open(path, "w") as f:
-            f.write("#!/bin/sh\n" + body)
-        os.chmod(path, 0o755)
-        return d
-
-    def _send_with(self, module, body):
-        d = self._fake_cli(body)
-        old = os.environ["PATH"]
-        os.environ["PATH"] = d + os.pathsep + old
-        try:
-            module._default_send("cos", "hello")
-        finally:
-            os.environ["PATH"] = old
-
-    CLI_NEEDS_ISSUE = ('case "$*" in *--issue" "adamkaplan/fleet-kit#2399*) exit 0;; esac\n'
-                       'echo "send needs --issue <n>: every message names the ask it belongs to (run x)" >&2\nexit 2\n')
-
-    def _sent_with_its_ask(self, module):
-        try:
-            self._send_with(module, self.CLI_NEEDS_ISSUE)
-        except OSError as e:
-            raise AssertionError("the alert was sent without its ask: %s" % e)
-
-    def test_the_send_names_its_ask_and_the_mutant_without_it_fails_with_the_anchored_text(self):
-        self._sent_with_its_ask(sw)   # the control passes
-        with open(SOURCE) as f:
-            text = f.read()
-        old = '[binary, "send", "--issue", issue, to, text]'
-        self.assertEqual(text.count(old), 1, "the mutation did not apply")
-        mod = types.ModuleType("stall_watch_mutant2")
-        exec(compile(text.replace(old, '[binary, "send", to, text]'), "mutant", "exec"), mod.__dict__)
-        with self.assertRaises(AssertionError) as caught:
-            self._sent_with_its_ask(mod)
-        self.assertIn("the alert was sent without its ask", str(caught.exception))
-
-    def test_a_cli_that_exits_2_gives_its_first_error_line_in_the_log_line(self):
-        w = World()
-        w.send = lambda to, text: self._send_with(sw, "echo 'first line of the refusal' >&2\necho second >&2\nexit 2\n")
-        w.add(msg="Permission denied")
-        self.assertEqual(w.run(), [])
-        self.assertIn("not sent: OSError: send exited 2: first line of the refusal", w.err)
-        self.assertNotIn("second", w.err)
-
-    def test_the_argv_holds_the_issue_and_the_recipient(self):
-        d = self._fake_cli('for a in "$@"; do echo "$a"; done > "$0.argv"\n')
-        old = os.environ["PATH"]
-        os.environ["PATH"] = d + os.pathsep + old
-        try:
-            sw._default_send("cos", "body text")
-        finally:
-            os.environ["PATH"] = old
-        with open(os.path.join(d, "fl" + "eet-switchboard.argv")) as f:
-            self.assertEqual(f.read().split("\n")[:5], ["send", "--issue", "adamkaplan/fleet-kit#2399", "cos", "body text"])
-
-    def test_an_undelivered_alert_is_retried_after_10_minutes_not_before_and_a_delivered_one_is_not_for_the_hour(self):
+    def test_an_unrecorded_alert_is_retried_after_10_minutes_not_before_and_a_recorded_one_is_not_for_the_hour(self):
         w = World()
         w.add(msg="Permission denied")
-        ok = w.send
-        w.send = lambda to, text: (_ for _ in ()).throw(OSError("down"))
-        w.run()   # minute 0: nobody reached
-        w.send, sent = ok, []
+        ok = w.launcher.audit
+        def down(*a, **k):
+            raise OSError("down")
+        w.launcher.audit = down
+        w.run()   # minute 0: not recorded
+        w.launcher.audit = ok
         counts = []
         for minute in (9, 10):
             w.at(minute)
             w.run()
             counts.append(len(w.sent))
-        self.assertEqual(counts, [0, 2])   # 9 minutes: held; 10 minutes: tried again and delivered
+        self.assertEqual(counts, [0, 1])   # 9 minutes: held; 10 minutes: tried again and recorded
         for minute in (11, 69):
             w.at(minute)
             w.run()
-        self.assertEqual(len(w.sent), 2)   # delivered at minute 10: silent until minute 70
+        self.assertEqual(len(w.sent), 1)   # recorded at minute 10: silent until minute 70
         w.at(70)
         w.run()
-        self.assertEqual(len(w.sent), 4)
-
-    def test_one_recipient_reached_keeps_the_hour(self):
-        w = World()
-        w.add(msg="Permission denied")
-        def one(to, text):
-            if to == "coder-lead":
-                raise OSError("down")
-            w.sent.append((to, text))
-        w.send = one
-        w.run()
-        w.at(11)
-        w.run()
-        self.assertEqual(len(w.sent), 1)
+        self.assertEqual(len(w.sent), 2)
 
     def test_the_chief_is_named_by_the_config_and_falls_back_to_cos(self):
         w = World()
@@ -308,11 +286,6 @@ class Stall(unittest.TestCase):
             with open(path, "w") as f:
                 f.write(text)
             self.assertEqual(sw.cos_name(w.launcher), want, text)
-        with open(path, "w") as f:
-            f.write('{"cos_name": "boss-one"}')
-        w.add(msg="Permission denied")
-        w.run()
-        self.assertEqual(sorted(to for to, _ in w.sent), ["boss-one", "coder-lead"])
 
     def _record(self, w, **rec):
         with open(os.path.join(w.dir, "w1.json"), "w") as f:
@@ -329,21 +302,12 @@ class Stall(unittest.TestCase):
         os.remove(os.path.join(w.dir, "w1.json"))
         self.assertEqual(sw.ask_of(w.launcher, "w1"), sw.STALL_ASK)
 
-    def test_the_cli_is_given_the_pods_own_ask_in_the_pass(self):
-        d = self._fake_cli('echo "$3" >> "$0.asks"\n')
+    def test_the_audit_line_holds_the_pods_own_ask(self):
         w = World()
         w.add(msg="Permission denied")
         self._record(w, issue=812, repo="own/repo")
-        old = os.environ["PATH"]
-        os.environ["PATH"] = d + os.pathsep + old
-        try:
-            err = io.StringIO()
-            with contextlib.redirect_stderr(err):
-                sw.watch_pass(w.launcher, [w.pods["w1-pod"]["doc"]], w.now, NAME_OK)
-        finally:
-            os.environ["PATH"] = old
-        with open(os.path.join(d, "fl" + "eet-switchboard.asks")) as f:
-            self.assertEqual(f.read().split(), ["own/repo#812", "own/repo#812"])
+        w.run()
+        self.assertEqual(w.audits[0]["ask"], "own/repo#812")
 
     def test_the_hour_holds_at_59_minutes_and_ends_at_60(self):
         w = World()
@@ -353,17 +317,17 @@ class Stall(unittest.TestCase):
             w.at(minute)
             w.run()
             counts.append(len(w.sent))
-        self.assertEqual(counts, [2, 2, 4])
+        self.assertEqual(counts, [1, 1, 2])
 
-    def test_the_mark_is_set_before_the_send_and_nothing_else_is_called(self):
+    def test_the_mark_is_set_before_the_audit_line_and_nothing_else_is_called(self):
         w = World()
         order = []
         w.kube.annotate = lambda name, uid, **kv: order.append("annotate")
-        w.send = lambda to, text: order.append("send")
+        w.launcher.audit = lambda *a, **k: order.append("audit")
         w.add(msg="Permission denied")
         w.run()
-        self.assertEqual(order[:2], ["annotate", "send"])
-        self.assertEqual(set(order), {"annotate", "send"})   # the fake kube offers exec and annotate only: no stop, delete or nudge is reachable
+        self.assertEqual(order[:2], ["annotate", "audit"])
+        self.assertEqual(set(order), {"annotate", "audit"})   # the fake kube offers exec and annotate only: no stop, delete or nudge is reachable
 
     def test_the_reaper_pass_calls_it_and_the_pass_line_carries_the_counts(self):
         with open(os.path.join(LAUNCHER, "cloud_worker.py")) as f:

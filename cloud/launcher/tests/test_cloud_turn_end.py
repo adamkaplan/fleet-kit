@@ -107,7 +107,7 @@ class TestTurnEnd(World):
         self.assertEqual(text.count("def save_state("), 1)
         self.assertEqual(text.count("[-SENT_KEEP:]"), 1)   # one bound, in the one save function
         self.assertEqual(text.count("def turn_message_text("), 1)
-        self.assertEqual(text.count("send(to, text)"), 2)   # the alert's own call and the turn pass's: no other sender function
+        self.assertEqual(text.count("send(to, text)"), 3)   # the alert's own call, the turn pass's and the stall pass's (#2399): no other sender function
 
     def test_an_unreadable_activity_sends_nothing(self):
         self.run_pass()
