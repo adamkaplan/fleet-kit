@@ -111,11 +111,18 @@ do_git() {
   [ "${1:-}" = push ] || return 0
   shift
   set -f   # no pathname expansion of the unquoted words below
-  forced=0; wide=0; remote=""; repoopt=""; specs=""; skip=0; rnext=0; first=""
+  forced=0; wide=0; remote=""; repoopt=""; specs=""; skip=0; rnext=0; first=""; eopt=0
   for a in "$@"; do
     if [ "$skip" = 1 ]; then skip=0; continue; fi
     if [ "$rnext" = 1 ]; then rnext=0; repoopt=$a; continue; fi
+    if [ "$eopt" = 1 ]; then   # after `--` every word is a repository or a refspec, even one that starts with a dash
+      [ -z "$first" ] && first=$a
+      specs="$specs
+$a"
+      continue
+    fi
     case "$a" in
+      --) eopt=1; continue ;;
       --repo) rnext=1; continue ;;
       --repo=*) repoopt=${a#--repo=}; continue ;;
       -o|--push-option|--receive-pack|--exec|--recurse-submodules) skip=1; continue ;;
@@ -164,9 +171,10 @@ $first"}
     plus=0; case "$a" in +*) plus=1; a=${a#+} ;; esac
     case "$a" in *:*) dst=${a#*:}; src=${a%%:*} ;; *) dst=$a; src=$a ;; esac
     [ "$a" = : ] && hit=1   # the matching push: every branch that exists on both sides
+    rawdst=$dst
     dst=${dst#refs/}; dst=${dst#heads/}   # git also takes heads/<name> for refs/heads/<name>
     case "$dst" in
-      *\**|*\?*|*\[*) for d in $(defaults); do case "$d" in $dst) hit=1 ;; esac; done; continue ;;
+      *\**|*\?*|*\[*) for d in $(defaults); do case "$d" in $dst) hit=1 ;; esac; case "refs/heads/$d" in $rawdst) hit=1 ;; esac; case "heads/$d" in $rawdst) hit=1 ;; esac; done; continue ;;   # refs/*/main matches the full name
     esac
     [ "$dst" = @ ] && dst=HEAD   # @ is HEAD
     if [ "$dst" = HEAD ]; then

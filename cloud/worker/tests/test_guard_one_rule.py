@@ -267,6 +267,13 @@ class OneRule(unittest.TestCase):
         self.assertEqual(r.returncode, 3)
 
     # S9
+    def test_round4_a_middle_glob_and_the_end_of_options_do_not_hide_the_default_branch(self):
+        for spec in ("refs/*/main:refs/*/main", "refs/h*/main:refs/h*/main"):
+            self.refused(["push", "origin", spec])
+        self.refused(["push", "origin", "--", "-x:main"])   # after `--` a word that starts with a dash is a refspec
+        self.refused(["push", "--", "origin", "-x:main"])
+        self.passed(["push", "origin", "refs/*/feature-x:refs/*/feature-x"])
+
     def test_s9_every_row_of_the_table_is_answered_as_listed_and_the_readme_names_exactly_these_forms(self):
         rows = push_table()
         self.assertEqual(len(rows), 10)
