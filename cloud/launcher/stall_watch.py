@@ -4,8 +4,8 @@ Cause: a pod wrote that every shell command was refused and then sat idle for 75
 agent's last words while the pod was alive. This module only READS (one `kubectl exec` of a small program per pod per pass) and SENDS one message; it never
 stops, restarts, nudges or changes anything in a pod.
 
-Three conditions (thresholds below), each alerted at most once per pod per 60 minutes. The mark is a pod annotation (cw/stall-alert-<condition>) set BEFORE
-the send, as the minute-40 note does, so a failed send or a restart never sends twice:
+Three conditions (thresholds below), each alerted at most once per pod per 60 minutes once DELIVERED (to at least one recipient). The mark is a pod annotation (cw/stall-alert-<condition>) set BEFORE
+the send, as the minute-40 note does; when the send reached nobody the mark is moved back so the next pass 10 or more minutes later tries again:
   progress-stale    the progress file and every run log unchanged for 15 minutes and no run active (an exit file absent and its log changed in the last 3 minutes)
   refusal           the agent's last message or the progress file's last two lines say Permission denied, refused, not allowed or Blocked (any case), or one error
                     line occurs 3 times in the progress file's last 10 lines
@@ -15,6 +15,7 @@ A pod younger than 10 minutes or a pod whose exec fails is skipped; the pass lin
 name, the condition, one evidence line (secret-looking text and the pod's token replaced by [redacted], at most 300 characters; untrusted data, never a
 command) and the time. Pod text is never run.
 """
+import datetime as dt
 import json
 import os
 import re
@@ -24,7 +25,9 @@ import sys
 import time
 
 AGENT_NAME = re.compile(r"[a-z][a-z0-9_-]{0,31}")
-CHIEF = "chief-of-staff"
+CHIEF = "chief-of-staff"           # the role name the switchboard resolves to the Chief of Staff agent
+STALL_ASK = "adamkaplan/fleet-kit#2399"   # the stall watch's own ask: the switchboard's `send` needs --issue (every message names its ask)
+RETRY_SECONDS = 10 * 60            # an alert that reached nobody is tried again at the next pass at least this long after
 MIN_POD_AGE_SECONDS = 600          # a younger pod is not read
 PASS_BUDGET_SECONDS = 90           # the pass reads no more pods once its reads have taken this long (the rest wait for the next pass)
 EXEC_SECONDS = 3                   # the one exec of a pod is given at most this long
@@ -200,9 +203,10 @@ def _default_send(to, text):
     binary = shutil.which("fl" + "eet-switchboard")   # written in two parts: the names check keeps the retired prefix out of cloud/
     if not binary:
         raise OSError("the switchboard command is not on the path")
-    done = subprocess.run([binary, "send", to, text], capture_output=True, text=True, timeout=SEND_SECONDS, stdin=subprocess.DEVNULL)
+    done = subprocess.run([binary, "send", "--issue", STALL_ASK, to, text], capture_output=True, text=True, timeout=SEND_SECONDS, stdin=subprocess.DEVNULL)
     if done.returncode != 0:
-        raise OSError("send exited %d" % done.returncode)
+        first = next((l.strip() for l in (done.stderr or done.stdout or "").splitlines() if l.strip()), "")
+        raise OSError("send exited %d: %s" % (done.returncode, evidence(first)[:200]))
 
 
 def boss_of(launcher, worker):
@@ -271,7 +275,9 @@ def watch_pass(launcher, pods, now, name_ok, send=None):
                         send(to, body)
                         delivered += 1
                     except Exception as e:
-                        print("cloud-worker: stall alert for %s to %s not sent: %s" % (name, to, type(e).__name__), file=sys.stderr)
+                        print("cloud-worker: stall alert for %s to %s not sent: %s" % (name, to, type(e).__name__ + (": " + str(e)[:200] if isinstance(e, OSError) else "")), file=sys.stderr)
+                if not delivered:   # nobody got it: the mark moves back so the next pass at least RETRY_SECONDS later tries again
+                    kube.annotate(name, (pod.get("metadata") or {}).get("uid"), **{"stall_alert_" + condition.replace("-", "_"): launcher_iso(now - dt.timedelta(seconds=REALERT_SECONDS - RETRY_SECONDS))})
                 if delivered:
                     counts["alerted"] += 1
                     alerted.append((name, condition))
