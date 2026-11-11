@@ -45,7 +45,10 @@ class Run(unittest.TestCase):
         r, _ = self.cw("wait", "three", "20")
         self.assertEqual(r.stdout.splitlines()[0], "exited 3"); self.assertIn("err", r.stdout)
         # stdin is closed: a read sees end of input at once
-        self.cw("start", "--name", "rd", "--", "sh", "-c", "read x; echo got=[$x]")
+        # the caller's own stdin stays OPEN (a pipe) while the child reads: a helper that lets the child inherit it would hang here
+        keep = subprocess.Popen([sys.executable, TOOL, "start", "--name", "rd", "--", "sh", "-c", "read x; echo got=[$x]"], env=self.env, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=self.d)
+        self.addCleanup(lambda: keep.stdin.close())
+        keep.wait(timeout=10)
         r, took = self.cw("wait", "rd", "20")
         self.assertIn("exited 0", r.stdout); self.assertIn("got=[]", r.stdout); self.assertLess(took, 10)
         # a child that outlives the command does not hold the start call
@@ -76,7 +79,7 @@ class Run(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
 
     def test_s4_progress_lines(self):
-        self.cw("start", "--name", "tk", "--", "sleep", "2.5", env={"CW_RUN_TICK": "1"})
+        self.cw("start", "--name", "tk", "--", "sleep", "5", env={"CW_RUN_TICK": "2"})   # ticks at 2 s and 4 s, the end at 5 s: 1 s of margin each way
         r, _ = self.cw("wait", "tk", "30")
         self.assertIn("exited 0", r.stdout)
         time.sleep(0.5)
