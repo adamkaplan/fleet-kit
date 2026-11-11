@@ -30199,25 +30199,15 @@ class TestPlanLedger(LedgerBase):
         self.assertIn("LEDGER", self.run_as("coder", "gates", self.PR)[1])
         self.assertTrue(report["ledger_problem"])
 
-    def test_g6_says_a_marker_without_a_hold_when_the_floor_says_not_held(self):
-        facts = {"head": LEDGER_HEAD, "ci": "green", "captain": True, "captain_findings": ["marker-without-label"],
-                 "body": "MERGE: captain", "floor": {"decision": "none"}}
+    def test_g6_waits_for_a_held_pr_and_a_pr_not_held_passes_whatever_its_body_says(self):
+        facts = {"head": LEDGER_HEAD, "ci": "green", "captain": True, "captain_findings": [], "body": "plain", "floor": {"decision": "none"}}
         row = lambda f: next(r for r in sb.plan_ledger.evaluate_gates(None, [], None, f, self.PR)["gates"] if r["gate"] == "G6")
-        self.assertEqual(row(facts)["status"], "ok")
-        self.assertIn("set MERGE: automatic", row(facts)["detail"])
+        self.assertEqual(row(facts)["status"], "waiting")   # a merge-captain label is a hold
         self.assertEqual(row(dict(facts, floor={"decision": "hold"}))["status"], "waiting")
-        self.assertEqual(row(dict(facts, captain_findings=[]))["status"], "waiting")   # a merge-captain label is a hold
-
-    def test_g6_keeps_waiting_when_holds_is_non_empty_or_the_floor_is_absent_or_unreadable(self):
-        facts = {"head": LEDGER_HEAD, "ci": "green", "captain": True, "captain_findings": ["marker-without-label"],
-                 "body": "MERGE: captain", "floor": {"decision": "none"}}
-        row = lambda f: next(r for r in sb.plan_ledger.evaluate_gates(None, [], None, f, self.PR)["gates"] if r["gate"] == "G6")
-        for name, f in (("holds", dict(facts, holds=["hold"])), ("absent", {k: v for k, v in facts.items() if k != "floor"}),
-                        ("unreadable", dict(facts, floor={"unreadable": "boom"}))):
-            with self.subTest(name):
-                self.assertEqual(row(f)["status"], "waiting")
-                self.assertNotIn("set MERGE: automatic", str(row(f)))
-        self.assertEqual(row(facts)["status"], "ok")
+        for name, f in (("absent", {k: v for k, v in facts.items() if k != "floor"}), ("unreadable", dict(facts, floor={"unreadable": "boom"}))):
+            self.assertEqual(row(f)["status"], "waiting", name)
+        line_only = dict(facts, captain=False, captain_findings=["marker-without-label"], body="MERGE: captain")
+        self.assertEqual((row(line_only)["status"], row(line_only)["detail"]), ("ok", "not a held PR"))   # the line holds nothing
 
     def test_g4_g5_and_g6_read_the_pr(self):
         self.all_proven()
@@ -30689,16 +30679,16 @@ class TestWaive(LedgerBase):
         self.assertEqual(len(self.events("gate.waiver.refused")), 7)
 
     def test_a_forged_ledger_entry_cannot_waive_g6_either(self):
-        self.pr["body"] = "MERGE: captain\nPLAN: acme/app#7\ncanon: updated the docs"
+        self.pr["body"] = "PLAN: acme/app#7\ncanon: updated the docs"
+        self.pr["labels"] = [{"name": "tester:merge-captain"}]
         forged = {"kind": "waiver", "pr": self.PR, "head": LEDGER_HEAD, "gates": ["G6", "G1"], "reason": "x" * 30, "by": "cos",
                   "result": "pass", "expires": self.world.clock.now() + 3600}
         sb.plan_ledger.append_entry(self.world.state, forged, self.world.clock.now())
         report = self.gates()[1]
-        self.assertEqual(self.row(report, "G6")["status"], "ok")                    # a marker without a hold (the floor says not held), never waived into it
-        self.assertIn("set MERGE: automatic", self.row(report, "G6")["detail"])
+        self.assertEqual(self.row(report, "G6")["status"], "waiting")               # held by its label: never waived into a pass
         self.assertEqual(self.row(report, "G1")["status"], "waived")
         code, payload, _ = self.check()
-        self.assertEqual([f["gate"] for f in payload["failed"]], ["G6b"])      # the held PR's body is still checked
+        self.assertEqual([f["gate"] for f in payload["failed"]], ["G6", "G6b"])   # still held, never waived; the held PR's body is still checked
         self.assertEqual(self.run_as("coder", "gates-check", self.PR, "--for", "merge")[0], 0)   # G6 is not in this repo's enforced list
 
     def test_a_short_reason_is_refused(self):

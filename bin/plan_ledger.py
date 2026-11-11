@@ -1024,13 +1024,10 @@ def evaluate_gates(plan, entries, ledger_problem, facts, pr, now=None):
             elif isinstance(floor, dict) and floor.get("decision") == "hold" and not floor.get("cleared"):
                 row.update(status="waiting", missing=["held for the owner (impact floor, read at this head): %s; the owner clears it for this head"
                                                       % ("; ".join(floor.get("reasons") or []) or "hold")])
-            # FAIL MODE (#1119): the new wording ONLY when the floor was read and positively says not held, with no hold label. A floor that is
-            # absent or unreadable (handled above or not a dict) and any hold label keep the old behaviour: waiting for the owner.
-            elif (facts or {}).get("captain") and "marker-without-label" in ((facts or {}).get("captain_findings") or ()) \
-                    and isinstance(floor, dict) and not (facts or {}).get("holds"):   # the floor read above says not held
-                row.update(status="ok", detail="a marker without a hold: set MERGE: automatic", missing=[])
+            # (#2379) the merge-captain label is the only hold signal: a body line without it is a PR that is not held, so there is no
+            # 'marker without a hold' wording any more.
             elif (facts or {}).get("captain"):
-                row.update(status="waiting", missing=["held for the owner (MERGE: captain): the owner decides, through cos"])
+                row.update(status="waiting", missing=["held for the owner (merge-captain label): the owner decides, through cos"])
             else:
                 row.update(status="ok", detail="not a held PR")
         elif gid == "G6b":
