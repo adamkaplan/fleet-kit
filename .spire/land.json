@@ -1,0 +1,21 @@
+{
+  "_": "fleet-kit land configuration: documents only for now (the area map is a later step). One area owns every path and has no steps, so a landing runs no checks and is gated by the council only. Add an area with steps here the day the repository gets something to run (a link check, a markdown lint, a script's tests).",
+  "version": 1,
+  "paths": {
+    "tests": [],
+    "prose": ["**/*.md"],
+    "notProd": ["**"]
+  },
+  "sensitive": {
+    "globs": [".spire/**", ".agents/skills/spire-land/**"],
+    "nameGlobs": ["**/*{credential,secret,token}*"],
+    "always": ["plan.md", ".spire/principles.md"]
+  },
+  "areas": [
+    {
+      "name": "all",
+      "paths": ["**"],
+      "steps": []
+    }
+  ]
+}
