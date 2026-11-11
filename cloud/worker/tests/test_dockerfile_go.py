@@ -108,6 +108,10 @@ class T(unittest.TestCase):
             else:
                 self.assertTrue(problems(self.mut(old, new)), old)
 
+    def test_scan_allowlist_names_the_toolchain_test_keys(self):
+        a = read(os.path.join(CLOUD, "worker", "scan-allowlist.txt"))
+        self.assertEqual(len(re.findall(r"^/usr/local/go/src/\S+\.pem [0-9a-f]{64} private-key ", a, re.M)), 2)
+
     def test_docs(self):
         d = read(os.path.join(CLOUD, "README.md"))
         self.assertTrue("Go 1.27.4" in d and "GO_VERSION" in d and "GO_SHA256" in d)

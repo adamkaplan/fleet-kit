@@ -62,6 +62,21 @@ RUN set -eu; case "$(dpkg --print-architecture)" in amd64) a=x64; h="${NODE_SHA2
  && chown -R root:root /opt/node && rm -f "/tmp/${f}"
 # ---- end Node runtime ----
 
+# ask #2383: Go, one pinned release, its sha256 pinned here, checked before it is unpacked (the form of the Node block above).
+# GO_VERSION and GO_SHA256 (of go${GO_VERSION}.linux-amd64.tar.gz) are the only constants; a bump updates both (cloud/README.md).
+# Root-owned /usr/local/go, not writable by others, linked into /usr/local/bin. The two test keys of the toolchain's sources are named in cloud/worker/scan-allowlist.txt.
+ARG GO_VERSION=1.27.4
+ARG GO_SHA256=7226736c2339719cda28fbf3a54d71aa63bcefe376e98cef00034268dab24840
+RUN curl -fsSL https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz -o /tmp/go.tgz \
+ && echo "${GO_SHA256}  /tmp/go.tgz" | sha256sum -c - \
+ && tar -C /usr/local -xzf /tmp/go.tgz \
+ && chown -R root:root /usr/local/go && chmod -R go-w /usr/local/go \
+ && ln -s /usr/local/go/bin/go /usr/local/bin/go && ln -s /usr/local/go/bin/gofmt /usr/local/bin/gofmt \
+ && rm /tmp/go.tgz
+# The pinned toolchain is the only one: no other toolchain is downloaded at run time.
+ENV GOTOOLCHAIN=local
+# ---- end Go ----
+
 # Non-root worker. It may start dockerd (and nothing else) as root: the daemon only
 # runs inside the Sysbox pod's own user namespace.
 RUN userdel -r ubuntu 2>/dev/null || true \
@@ -170,20 +185,6 @@ RUN set -eu; b=/opt/pg-bundle; l="$b/usr/lib/postgresql/16"; e="$b/usr/share/pos
  && cp -a "$s"/extension/vector.control "$s"/extension/vector--*.sql "$s"/extension/pgmq.control "$s"/extension/pgmq--*.sql "$e/" \
  && cp -a "$s/postgresql.conf.sample" "$b/usr/share/postgresql/postgresql.conf.sample" \
  && chown -R root:root "$b" && chmod -R go-w,a+rX "$b"
-# ask #2383: Go, one pinned release, its sha256 pinned here, checked before it is unpacked (the form of the Node block above).
-# GO_VERSION and GO_SHA256 (of go${GO_VERSION}.linux-amd64.tar.gz) are the only constants; a bump updates both (cloud/README.md).
-# Root-owned /usr/local/go, not writable by others, linked into /usr/local/bin. Added in `final`, so the secret scan does not read the toolchain's test data.
-ARG GO_VERSION=1.27.4
-ARG GO_SHA256=7226736c2339719cda28fbf3a54d71aa63bcefe376e98cef00034268dab24840
-RUN curl -fsSL https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz -o /tmp/go.tgz \
- && echo "${GO_SHA256}  /tmp/go.tgz" | sha256sum -c - \
- && tar -C /usr/local -xzf /tmp/go.tgz \
- && chown -R root:root /usr/local/go && chmod -R go-w /usr/local/go \
- && ln -s /usr/local/go/bin/go /usr/local/bin/go && ln -s /usr/local/go/bin/gofmt /usr/local/bin/gofmt \
- && rm /tmp/go.tgz
-# The pinned toolchain is the only one: no other toolchain is downloaded at run time.
-ENV GOTOOLCHAIN=local
-# ---- end Go ----
 ENV \
   PG_BUNDLE=/opt/pg-bundle
 USER worker
