@@ -45,6 +45,8 @@ does not install them.
 
 Go 1.27.4 is also built in (`/usr/local/go`, root-owned, `go` and `gofmt` linked into `/usr/local/bin`, `GOTOOLCHAIN=local` so no other toolchain is downloaded at run time). Its pin lives in `cloud/worker/Dockerfile`: `GO_VERSION` and `GO_SHA256` (the sha256 of `go<version>.linux-amd64.tar.gz`), checked with `sha256sum -c` before the unpack; a bump updates both and the pin test `cloud/worker/tests/test_dockerfile_go.py`.
 
+`mise` v2026.11.6 is built in too (`/usr/local/bin/mise`, root-owned, not writable by others): `MISE_VERSION` and `MISE_SHA256` (the sha256 of `mise-<version>-linux-x64.tar.gz`) in `cloud/worker/Dockerfile`, checked with `sha256sum -c` before the unpack; a bump updates both and the pin test `cloud/worker/tests/test_dockerfile_mise.py`. Other toolchain versions (for example `mise install python@3.11`) install at run time into the run user's home, once per pod; `python3` stays the system Python.
+
 The pinned version is a security floor: Node >= 22.23.4 (the older 22.23.2 carries trust roots that are being withdrawn).
 
 To bump Node: update `NODE_VERSION` (a full 22.x.y release; the only place the version is written) AND both sha256 constants (`NODE_SHA256_X64`,

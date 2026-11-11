@@ -82,6 +82,19 @@ RUN curl -fsSL https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz -o /tmp/go.t
 ENV GOTOOLCHAIN=local
 # ---- end Go ----
 
+# ask #2407: mise, the version manager the land tool calls (`mise install python@3.11`): one pinned release, its sha256 pinned here, checked before it is unpacked.
+# MISE_VERSION and MISE_SHA256 (of mise-${MISE_VERSION}-linux-x64.tar.gz) are the only constants; a bump updates both (cloud/README.md).
+# Only the binary is installed, root-owned at /usr/local/bin/mise, not writable by others. Toolchains install at run time into the run user's own home (mise's default).
+# python3 stays the system Python.
+ARG MISE_VERSION=v2026.11.6
+ARG MISE_SHA256=d6ebb6f5601bdf5a8d1d56028b24fe575f45075b989941ccc920f95161c5fa28
+RUN curl -fsSL https://github.com/jdx/mise/releases/download/${MISE_VERSION}/mise-${MISE_VERSION}-linux-x64.tar.gz -o /tmp/mise.tgz \
+ && echo "${MISE_SHA256}  /tmp/mise.tgz" | sha256sum -c - \
+ && tar -xzf /tmp/mise.tgz -C /tmp \
+ && install -o root -g root -m 0755 /tmp/mise/bin/mise /usr/local/bin/mise \
+ && rm -rf /tmp/mise.tgz /tmp/mise
+# ---- end mise ----
+
 # Non-root worker. It may start dockerd (and nothing else) as root: the daemon only
 # runs inside the Sysbox pod's own user namespace.
 RUN userdel -r ubuntu 2>/dev/null || true \

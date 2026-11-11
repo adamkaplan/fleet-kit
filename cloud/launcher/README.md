@@ -288,6 +288,7 @@ Lane sums after ask #1695 (31 Oct 2026, computed from the macOS seconds above, n
 | `cloud/worker/tests/test_dockerfile_agent.py` | 0 | serial |
 | `cloud/worker/tests/test_dockerfile_node.py` | 0 | serial |
 | `cloud/worker/tests/test_dockerfile_go.py` | 0 | serial |
+| `cloud/worker/tests/test_dockerfile_mise.py` | 0 | serial |
 | `cloud/worker/tests/test_entrypoint_question.py` | 0 | serial |
 | `cloud/worker/tests/test_identity_image.py` | 4 | serial |
 | `cloud/worker/tests/test_question_denied.py` | 0 | serial |
@@ -366,6 +367,7 @@ Lane sums after ask #1695 (31 Oct 2026, computed from the macOS seconds above, n
 | `cloud/worker/tests/test_dockerfile_agent.py` | 0 | serial |
 | `cloud/worker/tests/test_dockerfile_node.py` | 0 | serial |
 | `cloud/worker/tests/test_dockerfile_go.py` | 0 | serial |
+| `cloud/worker/tests/test_dockerfile_mise.py` | 0 | serial |
 | `cloud/worker/tests/test_entrypoint_question.py` | 0 | serial |
 | `cloud/worker/tests/test_identity_image.py` | 1 | serial |
 | `cloud/worker/tests/test_question_denied.py` | 0 | serial |
