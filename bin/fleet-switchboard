@@ -11799,7 +11799,7 @@ class GitHubHub:
         try:
             env = self.child_env(watch.repo)
             found = self._forwarder_hooks(watch.repo, env)   # one fresh list: the claim and the removal both rest on what exists NOW
-            if alive:
+            if alive and self.now() - (watch.started or 0) >= self.catchup_delay:   # before the forwarder has connected its hook may not exist yet: a hook seen now could be anyone's
                 self._claim_hook(watch, found)
             if watch.hook_id is not None and watch.hook_id in found:   # an id that is no longer a cli forwarder hook is never deleted
                 self._remove_hook(watch.repo, env, watch.hook_id)

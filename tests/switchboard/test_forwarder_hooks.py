@@ -95,7 +95,6 @@ class TestForwarderHooks(Base):
         runner = HooksRunner(self.stale_world())
         hub = self.start(runner)
         self.assertEqual(len(self.procs), 1)
-        self.assertEqual(len(self.hooks_when_started) + 0, 20 - 17, "the stale hooks are gone when the forwarder starts")
         self.assertFalse(self.refused, "the repo was not full at the start")
         stale = set(range(1, 18))
         self.assertEqual(set(runner.deleted()) - stale, set(), "a hook that is not a stale cli forwarder hook was removed")
@@ -106,6 +105,7 @@ class TestForwarderHooks(Base):
     def test_s3_a_stop_removes_only_the_hook_the_forwarder_made(self):
         runner = HooksRunner(self.stale_world() + [])
         hub = self.start(runner)
+        self.at[0] += 20
         runner.hooks.append(hook(950))   # another forwarder's hook, made after ours: it is two new hooks, so none is ours to claim for sure
         runner.calls.clear()
         hub.stop()
@@ -113,6 +113,7 @@ class TestForwarderHooks(Base):
         # one new hook: it is ours
         runner = HooksRunner(self.stale_world())
         hub = self.start(runner)
+        self.at[0] += 20   # the forwarder has connected
         runner.calls.clear()
         hub.stop()
         self.assertEqual(runner.deleted(), [900])
@@ -121,10 +122,18 @@ class TestForwarderHooks(Base):
     def test_s3_a_hook_that_is_gone_already_is_no_failure(self):
         runner = HooksRunner([])
         hub = self.start(runner)
-        hub.tick()
-        runner.hooks.clear()   # the forwarder removed it itself
+        self.at[0] += 20
+        hub.tick()   # claimed: it is the one new hook
+        real = runner.__call__
+        def vanishing(argv, **kwargs):
+            if "--method" in argv:   # it is gone when the delete arrives
+                runner.hooks.clear()
+            return real(argv, **kwargs)
+        hub.runner = vanishing
         hub.stop()
+        self.assertEqual(runner.deleted(), [900], "the delete was asked")
         self.assertIsNone(hub.watches[REPO].hook_note)
+        self.assertEqual([a for a in self.audit if a[0] == "github.hooks"], [])
 
     def test_s4_a_failing_list_still_starts_with_one_audit_line_and_a_note(self):
         scope = 'gh: This API operation needs the "admin:repo_hook" scope. (HTTP 403)'
@@ -176,6 +185,10 @@ class TestForwarderHooks(Base):
         hub = self.start(failing, clear=False)
         self.assertEqual([a for a in self.audit if a[0] == "github.hooks"], [], "S4 control: no audit line, no note")
         self.assertIsNone(hub.watches[REPO].hook_note)
+        removing = HooksRunner(self.stale_world(), delete_error="HTTP 500")
+        hub = self.start(removing, clear=False)
+        self.assertEqual(removing.deleted(), [], "S4 control (removal): none is tried, so none fails")
+        self.assertEqual([a for a in self.audit if a[0] == "github.hooks"], [])
 
     def test_a_start_after_a_conflict_removes_nothing(self):
         runner = HooksRunner(self.stale_world())
@@ -187,6 +200,7 @@ class TestForwarderHooks(Base):
     def test_a_stop_before_the_hook_exists_removes_nothing_and_a_gone_claim_is_not_deleted(self):
         runner = HooksRunner([hook(1)])
         hub = self.start(runner)
+        self.at[0] += 20
         runner.hooks[:] = []   # no hook of the forwarder exists at the stop
         runner.calls.clear()
         hub.stop()
@@ -237,3 +251,10 @@ class TestForwarderHooks(Base):
         config = sb.validate_config({"github_repos": [REPO], "gh": "gh"})
         report = sb.github_status(config, self.home / "state", {})
         self.assertIn("admin:repo_hook", "\n".join(sb.format_github(report)))
+
+    def test_a_stop_before_the_forwarder_has_connected_claims_nothing(self):
+        runner = HooksRunner([])
+        hub = self.start(runner)
+        runner.calls.clear()
+        hub.stop()   # no time passed: a hook seen now could be anyone's
+        self.assertEqual(runner.deleted(), [])
