@@ -53,6 +53,8 @@ class Wake(unittest.TestCase):
         self.boss = os.path.join(self.d, "boss.txt")
         self.client = os.path.join(self.d, "client.sh")
         self.set_client(0)
+        with open(os.path.join(self.d, "pw"), "w") as f:
+            f.write("pw\n")
 
     def set_client(self, rc):
         with open(self.client, "w") as f:

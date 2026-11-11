@@ -167,6 +167,8 @@ def wake_send_session(text):
 
 def wake(name, code, secs):
     """After the exit file: at most once per run (marker NAME.woke), tell the agent's session, the progress file and the boss. One failing never blocks the others."""
+    if not os.path.exists(WAKE_PASSWORD_FILE):
+        return   # not a pod with a local server: nothing to wake
     try:
         fd = os.open(path(name, "woke"), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         os.close(fd)
