@@ -10253,6 +10253,13 @@ def spawn_forwarder(argv, log_path, env=None):
         os.close(fd)
 
 
+def _alive(proc):
+    try:
+        return proc.poll() is None
+    except Exception:
+        return False
+
+
 def _terminate(proc):
     """Stop a forwarder and anything it started (it leads its own process group)."""
     try:
@@ -10437,13 +10444,13 @@ class GitHubHub:
         with self.lock:
             for watch in self.watches.values():
                 if watch.proc is not None:
+                    stopped.append((watch, _alive(watch.proc)))
                     _terminate(watch.proc)
                     watch.proc, watch.secret, watch.state = None, None, "backoff"
-                    stopped.append(watch)
             self._save_markers()
             self._write_snapshot(self.now(), stopped=True)
-        for watch in stopped:
-            self._release_hook(watch)   # #2397: its own hook, outside the lock (a bounded call each)
+        for watch, alive in stopped:
+            self._release_hook(watch, alive)   # #2397: its own hook, outside the lock (a bounded call each)
 
     # -- receiving
 
@@ -10754,10 +10761,11 @@ class GitHubHub:
         for repo in joined:
             self._audit("github.watch", repo, {"state": "joined"})
         for repo, watch in gone:
+            alive = watch.proc is not None and _alive(watch.proc)
             if watch.proc is not None:
                 _terminate(watch.proc)
             watch.proc = watch.secret = None
-            self._release_hook(watch)
+            self._release_hook(watch, alive)
             self._audit("github.watch", repo, {"state": "left"})
 
     def prune_cursors(self):
@@ -11668,8 +11676,7 @@ class GitHubHub:
             if watch.proc is not None and watch.polling and now - watch.started >= self.catchup_delay:
                 with self.lock:  # the forwarder connected: the repo is no longer polled; one read closes the gap
                     watch.polling, watch.poll_reason, watch.catchup_at = False, None, now
-        if watch.proc is not None and not watch.hook_claim_tried and now - (watch.started or now) >= self.catchup_delay:
-            watch.hook_claim_tried = True
+        if watch.proc is not None and watch.proc.poll() is None and not watch.hook_claim_tried and now - (watch.started or now) >= self.catchup_delay:
             self._claim_hook(watch)   # the forwarder has connected: its hook exists
         if watch.proc is None and now >= watch.next_start:
             self._start(watch, now)
@@ -11775,8 +11782,9 @@ class GitHubHub:
     def _claim_hook(self, watch, found=None):
         """Learn which hook this forwarder made: the one forwarder hook that is not among those that existed when it started (gh prints no id). Two or none: not claimed,
         so nothing is removed for it. Never raises."""
-        if watch.hook_id is not None or watch.hooks_before is None:
-            return
+        if watch.hook_id is not None or watch.hooks_before is None or watch.hook_claim_tried:
+            return   # one try per start: a hook that appears later is never claimed
+        watch.hook_claim_tried = True
         try:
             new = set(found if found is not None else self._forwarder_hooks(watch.repo, self.child_env(watch.repo))) - watch.hooks_before
         except Exception as err:
@@ -11785,12 +11793,14 @@ class GitHubHub:
         if len(new) == 1:
             watch.hook_id = next(iter(new))
 
-    def _release_hook(self, watch):
-        """A forwarder is stopped: remove the hook it made, and no other. Never raises."""
+    def _release_hook(self, watch, alive=False):
+        """A forwarder is stopped: remove the hook it made, and no other. `alive`: its child was running up to the stop (only then may a hook be claimed
+        now: a forwarder that already died made no hook that a later one could be taken for). Never raises."""
         try:
             env = self.child_env(watch.repo)
             found = self._forwarder_hooks(watch.repo, env)   # one fresh list: the claim and the removal both rest on what exists NOW
-            self._claim_hook(watch, found)
+            if alive:
+                self._claim_hook(watch, found)
             if watch.hook_id is not None and watch.hook_id in found:   # an id that is no longer a cli forwarder hook is never deleted
                 self._remove_hook(watch.repo, env, watch.hook_id)
             watch.hook_id = None
@@ -11833,6 +11843,7 @@ class GitHubHub:
         tail = _scrub(self._log_tail(watch), watch.secret)
         with self.lock:
             watch.proc, watch.secret = None, None
+            watch.hooks_before, watch.hook_id = None, None   # a dead forwarder owns nothing: its hook, if any, is cleared by the next start
             ran = max(0.0, now - (watch.started or now))
             watch.drops = [d for d in watch.drops if now - d[0] < FORWARDER_HISTORY_SECONDS] + [(now, ran)]
             watch.down_since = now

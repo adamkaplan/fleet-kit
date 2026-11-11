@@ -206,3 +206,34 @@ class TestForwarderHooks(Base):
         with self.assertRaises(sb.GitHubUnavailable):
             hub._hook_api("../x", None, ["repos/../x/hooks"])
         self.assertEqual(runner.calls, [])
+
+    def test_a_hook_that_appears_after_the_forwarder_died_is_never_claimed(self):
+        runner = HooksRunner([])
+        hub = self.start(runner)
+        hub.watches[REPO].proc.code = 1
+        hub.tick()   # it exited
+        runner.hooks[:] = [hook(777)]   # another party's forwarder starts on the repo
+        runner.calls.clear()
+        hub.stop()
+        self.assertEqual(runner.deleted(), [])
+
+    def test_a_second_claim_is_never_tried(self):
+        runner = HooksRunner([])
+        hub = self.start(runner)
+        runner.hooks[:] = []   # the connect moment passes with no hook of ours listed
+        self.at[0] += 20
+        hub.tick()
+        runner.hooks.append(hook(778))   # someone else's, later
+        runner.calls.clear()
+        hub.stop()
+        self.assertEqual(runner.deleted(), [])
+
+    def test_s4_the_status_note_reaches_the_status_report(self):
+        runner = HooksRunner(self.stale_world(), list_error='gh: This API operation needs the "admin:repo_hook" scope. (HTTP 403)')
+        hub = self.start(runner)
+        (self.home / "state").mkdir(exist_ok=True)
+        snapshot = json.loads((self.home / "state" / sb.WATCH_FILE).read_text())
+        self.assertIn("admin:repo_hook", snapshot["watches"][0]["hook_note"])
+        config = sb.validate_config({"github_repos": [REPO], "gh": "gh"})
+        report = sb.github_status(config, self.home / "state", {})
+        self.assertIn("admin:repo_hook", "\n".join(sb.format_github(report)))
