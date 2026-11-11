@@ -295,19 +295,12 @@ class Guard(unittest.TestCase):
                 self.assertEqual(r.returncode, 0, r.stderr)
                 self.assertEqual(r.stdout.splitlines()[-1].split(" ran: ")[1], " ".join(cmd[1:]))
 
-    def test_review_round_the_config_denies_what_it_can_express(self):
+    def test_review_round_the_config_holds_no_deny_row(self):
+        # ask #2402: the permission file's deny rows (merge, alias, review, workflow, release, extension, dispatch, ruleset and refs forms) are removed;
+        # the phrase refusals of the wrapper (the test above) stay. The replacement is the property of the file: its bash map holds no deny row.
         glob = self.conf["permission"]["bash"]
         self.assertEqual(glob, self.conf["agent"]["worker"]["permission"]["bash"])
-        denies = self.deny(glob)
-        def match(pat, line):
-            return re.fullmatch(".*".join(re.escape(x) for x in pat.split("*")), line, re.S) is not None
-        for _, cmd, in_config in EXTRA_REFUSED:
-            if in_config:
-                with self.subTest(cmd=" ".join(cmd)):
-                    self.assertTrue(any(match(p, " ".join(cmd)) for p in denies), cmd)
-        for cmd in EXTRA_ALLOWED:   # and a read or an ordinary call is not denied
-            if cmd[:3] in (["gh", "ruleset", "list"], ["gh", "alias", "list"], ["gh", "pr", "create"], ["gh", "pr", "view"], ["git", "push", "-u"]):   # (the config over-refuses a branch named like main; README)
-                self.assertFalse(any(match(p, " ".join(cmd)) for p in denies), cmd)
+        self.assertEqual(self.deny(glob), [])
 
     def test_u1_the_new_refusals_do_not_print_an_argument_value(self):
         for cmd in (["gh", "alias", "set", SECRET, "pr merge"], ["gh", SECRET, "5"], ["gh", "api", "https://" + SECRET + "/repos/o/r/pulls/5/merge", "-X", "PUT"],
@@ -356,29 +349,15 @@ class Guard(unittest.TestCase):
     def deny(self, bash):
         return [p for p, v in bash.items() if v == "deny"]
 
-    def test_s3_the_generated_config_denies_the_six_for_the_shell_tool_in_the_default_agent(self):
+    def test_s3_the_config_has_no_shell_deny_row_for_the_six_in_the_default_agent(self):
+        # ask #2402: the deny rows for the six categories are removed; the wrapper (this class's other tests) refuses them, and the file is the catch-all allow
         self.assertNotIn("default_agent", self.conf)   # a default naming an agent this OpenCode may not register could break the start
         glob = self.conf["permission"]["bash"]
         agent = self.conf["agent"]["worker"]["permission"]["bash"]
         self.assertEqual(glob, agent)   # equality: the same rules, however the agent is chosen
-        self.assertEqual(glob["*"], "allow")   # a deny rule comes AFTER the catch-all: the last matching rule wins
-        self.assertEqual(list(glob).index("*"), 0)
-        denies = self.deny(glob)
-        self.assertTrue(denies)
-        self.assertTrue(all(v in ("allow", "deny") for v in glob.values()))
-        # one table row per category: a command of that category is matched by at least one deny pattern (opencode's `*` matches any text)
-        def match(pat, cmdline):
-            return re.fullmatch(".*".join(re.escape(x) for x in pat.split("*")), cmdline, re.S) is not None
-        for cat, _, cmd in SIX:
-            line = " ".join(cmd)
-            if "trunk" in line:
-                continue   # the configured default is the wrapper's: the config names main and master (README)
-            with self.subTest(cmd=line):
-                self.assertTrue(any(match(p, line) for p in denies), line)
+        self.assertEqual(glob, {"*": "allow"})
+        self.assertEqual(self.deny(glob), [])
         self.assertEqual({c for c, _, _ in SIX}, SIX_CATEGORIES)
-        for cmd in ORDINARY[:4]:   # and the ordinary ones are not denied
-            line = " ".join(cmd)
-            self.assertFalse(any(match(p, line) for p in denies), line)
 
     def test_s3_the_pod_holds_the_worker_agent_definition_with_the_stop_rules_in_prose(self):
         text = read(os.path.join(self.tmpfs, "config", "opencode", "agents", "worker.md"))
@@ -629,21 +608,11 @@ class GuardConfigForms(unittest.TestCase):
         self.assertEqual(self.run_guard(["user.name.x", "v"], p).returncode, 0)   # the mutant passes it ...
         self.assertEqual(self.run_guard(["user.name.x", "v"]).returncode, 3)      # ... the real wrapper does not
 
-    def test_the_agent_definition_and_config_name_the_same_forms(self):
+    def test_the_agent_definition_names_the_forms(self):
         text = read(os.path.join(WORKER, "agents", "worker.md"))
         for phrase in ("--add", "--unset", "--edit", "--rename-section", "--remove-section", "include.path", "user.name", "user.email"):
             self.assertIn(phrase, text)
-        conf = json.loads(read(os.path.join(WORKER, "opencode-worker.json")))
-        denies = [p for p, v in conf["permission"]["bash"].items() if v == "deny"]
-        def match(pat, line):
-            return re.fullmatch(".*".join(re.escape(x) for x in pat.split("*")), line, re.S) is not None
-        for kind, name, args, _ in cfg_table():
-            line = "git config " + " ".join(args)
-            if kind == "refused" and name not in ("KEY VALUE", "an unknown flag or abbreviation", "a value that looks like an option", "a value word after a read mode's key", "an option after the get or list subcommand"):
-                with self.subTest(name=name):
-                    self.assertTrue(any(match(p, line) for p in denies), line)
-            if kind == "allowed":
-                self.assertFalse(any(match(p, line) for p in denies), line)
+        # ask #2402: the file's `git config` deny rows are removed; the table of forms is answered by the wrapper (test_s1_s2 above)
 
 
 if __name__ == "__main__":
