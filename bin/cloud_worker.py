@@ -1165,11 +1165,11 @@ def cmd_read(args, runner, now):
     engine, state, config = H["build_engine"](runner, now, "cli", writable=False)
     if record is not None:
         session = _session_of(record)
-        with Cluster() as cluster, tunnel(cluster, record) as live:
-            messages = remote_v2(state, live, config["call_timeout_seconds"]).message_list(session, limit=limit, order="desc") or []
-        for message in reversed([m for m in messages if isinstance(m, dict)]):
-            print(message_line(message))
-        return H["EXIT_OK"]
+        try:
+            with Cluster() as cluster, tunnel(cluster, record) as live:
+                messages = remote_v2(state, live, config["call_timeout_seconds"]).message_list(session, limit=limit, order="desc") or []
+        except Exception as err:   # ask #2392: an ended pod answers from its run record when it has one; none keeps the failure
+            return _retired().read_ended(args.name, record, state, runner, now, err)
     else:   # a local agent, on the local service
         seen = engine.discover(engine.now()).agents.get(args.name)
         known = {} if seen else H["known_agent"](state, args.name)
@@ -1181,8 +1181,7 @@ def cmd_read(args, runner, now):
             if retired is not None:
                 return _retired().read_run_record(args.name, retired, state, runner, now)
             raise LaunchError("%s is not a fleet agent this switchboard has seen" % args.name)
-        v2 = engine.v2
-    messages = v2.message_list(session, limit=limit, order="desc") or []
+        messages = engine.v2.message_list(session, limit=limit, order="desc") or []
     for message in reversed([m for m in messages if isinstance(m, dict)]):
         print(message_line(message))
     return H["EXIT_OK"]
