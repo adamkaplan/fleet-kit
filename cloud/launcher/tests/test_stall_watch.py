@@ -163,6 +163,19 @@ class Stall(unittest.TestCase):
             self.assertIn("decided from the files", w.audits[0]["evidence"])
             self.assertIn("session", w.audits[0]["evidence"])
 
+    def test_s4_a_failed_run_idle_without_session_fields_says_so_and_a_forged_time_does_not_silence(self):
+        w = World()
+        w.add(progress_age=11, msg_age=11, runs=[("t", 11, "FAILED")], exits=[("t", 2, 11)])
+        self._session(w)
+        self.assertEqual(conditions(w.run()), ["failed-run-idle"])
+        self.assertIn("decided from the files", w.audits[0]["evidence"])
+        for forged in (-10 ** 9, float("inf"), float("nan")):   # a time in the future, infinite or not a number: read as missing, decided from the files
+            w = World()
+            w.add(progress_age=16)
+            self._session(w, updated=forged, activity=forged, running=True)
+            self.assertEqual(conditions(w.run()), ["progress-stale"], forged)
+            self.assertIn("decided from the files", w.audits[0]["evidence"])
+
     def test_s6_mutants_that_ignore_the_session_or_the_30_minute_guard_fail_with_the_anchored_text_after_the_control_passes(self):
         self._s2(sw)   # the control
         with open(SOURCE) as f:

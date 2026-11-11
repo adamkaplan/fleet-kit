@@ -87,7 +87,7 @@ try:
     ss.sort(key=lambda s: (s.get("time") or {}).get("updated") or 0)
     if ss:
         u = (ss[-1].get("time") or {}).get("updated")
-        if isinstance(u, (int, float)):
+        if isinstance(u, (int, float)) and not isinstance(u, bool):
             out["msg_time"] = u / 1000.0 if u > 1e11 else u
             out["updated"] = out["msg_time"]
         try:
@@ -171,9 +171,12 @@ def session_state(data, now, threshold):
     """(working, reason): working is True when the session shows activity that silences a condition of `threshold` seconds (its last message or tool call, else its
     last update, is younger than the threshold; or a turn is running and that time is younger than RUNNING_QUIET_SECONDS), False when it is quiet, None with the
     reason when the server did not answer or the fields are missing (the condition then decides from the files)."""
-    last = _num(data.get("activity"))
+    def ok(v):   # a time that is a finite number not in the future (a pod could write any value)
+        v = _num(v)
+        return v if v is not None and v == v and abs(v) != float("inf") and v <= now + 60 else None
+    last = ok(data.get("activity"))
     if last is None:
-        last = _num(data.get("updated"))
+        last = ok(data.get("updated"))
     running = data.get("running") if isinstance(data.get("running"), bool) else None
     if last is None:
         return None, ("the session's activity was not readable" if running is None and data.get("updated") is None else "the session's last activity time was missing")
@@ -227,9 +230,10 @@ def decide(data):
     if bad:
         e = max(bad, key=lambda x: _num(x["mtime"]))
         moved = max([t for t in (_num(e["mtime"]), ptime, stime) if t is not None])
-        if now - moved >= FAILED_IDLE_SECONDS and not session_state(data, now, FAILED_IDLE_SECONDS)[0]:
+        working, why = session_state(data, now, FAILED_IDLE_SECONDS) if now - moved >= FAILED_IDLE_SECONDS else (True, "")
+        if not working:
             log = next((r.get("last") for r in runs if r.get("name") == e.get("name")), "") or ""
-            found["failed-run-idle"] = "run %s exited %s; no change for %d minutes; last log line: %s" % (str(e.get("name"))[:60], str(e.get("code"))[:6], (now - moved) // 60, log)
+            found["failed-run-idle"] = "run %s exited %s; no change for %d minutes%s; last log line: %s" % (str(e.get("name"))[:60], str(e.get("code"))[:6], (now - moved) // 60, "" if working is False else " (decided from the files: %s)" % why, log)
     return found
 
 
