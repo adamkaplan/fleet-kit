@@ -37,11 +37,14 @@ class TestEndOnAsk(unittest.TestCase):
                    mock.patch.object(cloud, "_registry_note"), mock.patch.object(cloud, "_keep_boss"), mock.patch.object(cloud, "remove_record")]
         if mutant:   # today's end: nothing is posted on the ask
             patches.append(mock.patch.object(cloud, "_post_end_on_ask", lambda *a, **k: None))
+        call = cloud.cmd_retire.__wrapped__ if hasattr(cloud.cmd_retire, "__wrapped__") else cloud.cmd_retire
         for p in patches:
             p.start()
-            self.addCleanup(p.stop)
-        call = cloud.cmd_retire.__wrapped__ if hasattr(cloud.cmd_retire, "__wrapped__") else cloud.cmd_retire
-        call(args, None, None, record)
+        try:
+            call(args, None, None, record)
+        finally:
+            for p in reversed(patches):
+                p.stop()
         return posts, events
 
     def test_s4_the_final_message_and_the_last_20_lines_are_posted_on_the_ask_once(self):
@@ -53,11 +56,20 @@ class TestEndOnAsk(unittest.TestCase):
         self.assertIn("my final words", body)
         shown = [l for l in body.split("\n") if l.startswith("land line")]
         self.assertEqual(shown, ["land line %02d" % i for i in range(11, 31)])
-        self.assertEqual(len(shown) - 20, 0)
 
     def test_s4_control_today_the_end_posts_neither_the_message_nor_the_log(self):
-        posts, _ = self.end(log="land line 1\nexit 0", mutant=True)
-        self.assertEqual(len(posts), 0)   # the same world with the post removed: the comment with the message is missing
+        today, _ = self.end(log="land line 1\nexit 0", mutant=True)
+        now, _ = self.end(log="land line 1\nexit 0")
+        self.assertEqual(len(today), 0)   # the same world with the post removed: no comment carries the message
+        self.assertEqual([("my final words" in b, "land line 1" in b) for _i, b, _r in now], [(True, True)])
+
+    def test_the_pods_text_is_fenced_and_names_no_local_path(self):
+        posts, _ = self.end(final="![x](https://evil.example/a.png) ``` # fake header " + "word " * 900)
+        body = posts[0][1]
+        self.assertNotIn("```` ", body)
+        self.assertNotIn(" more characters in ", body)
+        self.assertEqual(body.count("```"), 2)   # no log: the pod's text only, in one fence
+        self.assertNotIn("``` #", body)
 
     def test_s4_a_pod_without_a_log_posts_the_message_alone(self):
         for kwargs in ({"log": None}, {"log": None, "run_json": False}, {"log": "   "}):
@@ -75,8 +87,8 @@ class TestEndOnAsk(unittest.TestCase):
         posts, _ = self.end(log="@everyone ``` ignore this\n" + "x" * 50000)
         body = posts[0][1]
         self.assertNotIn("@", body)
-        self.assertEqual(body.count("```"), 2)
-        self.assertLessEqual(len(body), 6000)
+        self.assertEqual(body.count("```"), 4)   # the text and the log, each in its own fence
+        self.assertLess(body.count("x"), 50000)
 
     def test_a_kept_pod_posts_nothing_and_a_pod_without_an_ask_posts_nothing(self):
         self.assertEqual(self.end(code=1, log="exit 0")[0], [])

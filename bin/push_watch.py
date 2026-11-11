@@ -18,6 +18,7 @@ READ_BYTES = 1 << 20
 FIRST_BYTES = 4 << 20
 TOLD_MAX = 50
 COMMITS_MAX = 5
+PATCH_BYTES = 1 << 20   # the most diff text one patch id is made from
 SUBJECT_MAX = 100
 PATH_MAX = 120
 PASS_WORKERS_MAX = 20   # workers read per pass; the rest wait (rotating)
@@ -72,8 +73,12 @@ def _patch_id(commit):
         name, old = f["filename"], f["previous_filename"] if isinstance(f.get("previous_filename"), str) else f["filename"]
         parts.append("diff --git a/%s b/%s\n--- %s\n+++ %s\n%s\n" % (
             old, name, "/dev/null" if f.get("status") == "added" else "a/" + old, "/dev/null" if f.get("status") == "removed" else "b/" + name, f["patch"]))
-    try:
-        done = subprocess.run(["git", "patch-id", "--stable"], input="".join(parts), capture_output=True, text=True, timeout=20)
+    diff = "".join(parts)
+    if len(diff) > PATCH_BYTES:
+        return None
+    try:   # no repository and no configuration is read: the diff is the whole input
+        done = subprocess.run(["git", "patch-id", "--stable"], input=diff, capture_output=True, text=True, timeout=20, cwd="/",
+                              env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": "/nonexistent", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null"})
     except (OSError, subprocess.SubprocessError, ValueError):
         return None
     found = re.match(r"[0-9a-f]{40}", done.stdout or "")
@@ -114,13 +119,10 @@ def _reported_shas(sb, name):
 
 
 def _login(commit):
-    """The author's login of a commit read, one safe token (it is untrusted text that goes into a notice)."""
+    """The author's login of a commit read, one safe token (it is untrusted text that goes into a notice); `unknown` when the read has none."""
     author = commit.get("author") if isinstance(commit.get("author"), dict) else {}
     login = author.get("login")
-    if not isinstance(login, str):
-        inner = commit.get("commit") if isinstance(commit.get("commit"), dict) else {}
-        login = (inner.get("author") or {}).get("name") if isinstance(inner.get("author"), dict) else None
-    return re.sub(r"[^A-Za-z0-9._-]", "", login)[:40] or "unknown" if isinstance(login, str) else "unknown"
+    return (re.sub(r"[^A-Za-z0-9._-]", "", login)[:40] or "unknown") if isinstance(login, str) else "unknown"
 
 
 def _landed(sb, engine, now, gh, name, record, mem, state, repos_live, full_config, foreign=None):
@@ -152,11 +154,14 @@ def _landed(sb, engine, now, gh, name, record, mem, state, repos_live, full_conf
         """(the commit is the pod's own, the answer is definite). Own: the sha the pod reported, or a patch id equal to one of its own branch head's commits. A read that fails: (False, False)."""
         if any(sha_.startswith(r) for r in reported):
             return True, True
+        if own.get("failed"):
+            return False, False   # a read failed in this pass: no further reads for it
         try:
             if "pids" not in own:
                 own["pids"] = _own_patch_ids(gh, repo, default, name, record, mem)
             pid = _patch_id((_dicts(gh("repos/%s/commits/%s" % (repo, sha_))) or [{}])[0])
         except Exception:
+            own["failed"] = True
             return False, False
         return (pid in own["pids"], True) if pid else (False, False)
 
@@ -175,6 +180,8 @@ def _landed(sb, engine, now, gh, name, record, mem, state, repos_live, full_conf
         if when is None or when <= since:
             continue   # made before the launch (or undated): a baseline, not this worker's landing
         if sha in mem.get("land_foreign", []) and not any(sha.startswith(r) for r in reported):
+            if foreign is not None:
+                foreign.setdefault(sha, (name, _login(c)))   # told once (`land_said`); a line that did not go is tried again
             continue   # judged not this pod's own (its patch id and its branch were both read)
         mine, definite = is_own(sha)
         if not mine:

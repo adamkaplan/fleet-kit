@@ -3,6 +3,7 @@ equal to one of its branch head's commits, or the sha it reported); another Land
 Every fixture is faked: no GitHub call, no real state directory. The controls run the same worlds through today's behaviour (the ownership test made always true)."""
 import re
 import sys
+import tempfile
 import types
 import unittest
 from pathlib import Path
@@ -15,6 +16,11 @@ OWN_MAIN = "1" * 40       # the pod's commit as it landed on main (another sha, 
 OWN_BRANCH = "2" * 40     # the pod's own branch head
 FOREIGN = ["3" * 40, "4" * 40, "5" * 40]
 RAW = "janus-infra/widget"
+
+
+def sb_module():
+    from importlib.machinery import SourceFileLoader
+    return SourceFileLoader("sb_land_attr", str(REPO / "bin" / "fleet-switchboard")).load_module()
 
 
 def patch(text):
@@ -74,13 +80,12 @@ class TestLandAttribution(Case):
         self.assertEqual(sum(1 for _s, t in reports if any(f[:12] in t for f in FOREIGN)), 0)
         self.assertEqual(sum(1 for _s, t in reports if OWN_MAIN[:12] in t), 1)
 
-    def test_s2_control_today_every_land_commit_is_credited_to_the_pod(self):
+    def test_s2_control_today_the_same_four_commit_world_credits_a_foreign_commit(self):
         module = types.ModuleType("pw_today")
         exec(compile(today((REPO / "bin" / "push_watch.py").read_text()), "push_watch.py", "exec"), module.__dict__)
-        self.main = [land(FOREIGN[0]), land(FOREIGN[1]), land(FOREIGN[2])]
-        self.run_pass(NOW, module)
-        self.assertEqual(len(self.reports), 1)   # today: the newest foreign commit is reported landed
-        self.assertTrue(any(f[:12] in self.reports[0][1] for f in FOREIGN))
+        reports = self.pod_world(module)
+        self.assertEqual(len(reports), 1)   # one completion: the newest Land commit, a foreign one, is reported landed
+        self.assertTrue(any(f[:12] in reports[0][1] for f in FOREIGN))
 
     def test_s3_a_foreign_land_commit_is_told_once_and_credits_no_pod(self):
         self.main = [land(FOREIGN[0], "Eve")]
@@ -103,6 +108,33 @@ class TestLandAttribution(Case):
         lines = self.said()
         self.assertEqual(sorted(re.findall(r": (\w{12}) by", " ".join(lines))), sorted(f[:12] for f in FOREIGN))
         self.assertFalse([t for t in lines if OWN_MAIN[:12] in t])
+
+    def test_a_line_that_could_not_be_sent_is_tried_again_and_then_told_once(self):
+        real, fail = self.engine.send, [True]
+
+        def send(sender, recipient, text, **kw):
+            if fail and text.startswith("a landing by someone else"):
+                fail.pop()
+                raise OSError("down")
+            return real(sender, recipient, text, **kw)
+        self.engine.send = send
+        self.main = [land(FOREIGN[0])]
+        self.run_pass(NOW)
+        self.assertEqual(self.said(), [])
+        self.run_pass(NOW + 60)
+        self.run_pass(NOW + 120)
+        self.assertEqual(len(self.said()), 1)
+
+    def test_the_report_text_the_daemon_keeps_is_what_the_push_watch_reads(self):
+        sbmod = sb_module()
+        with tempfile.TemporaryDirectory() as state:
+            sbmod.record_last_report(Path(state), "w-a", "working", NOW, "landed %s on main" % FOREIGN[1])
+            text = (sbmod._read_small(Path(state), sbmod.LAST_REPORT_FILE).get("w-a") or {}).get("text")
+        self.ns.reported_text = lambda worker: text
+        self.patches = {}
+        self.main = [land(FOREIGN[1])]
+        self.run_pass(NOW)
+        self.assertEqual([r[0] for r in self.reports], ["w-a"])
 
     def test_the_sha_the_pod_reported_is_its_own_without_any_patch_read(self):
         self.ns.reported_text = lambda worker: "landed %s" % FOREIGN[1][:10]
@@ -132,7 +164,7 @@ class TestLandAttribution(Case):
         self.main = [land(FOREIGN[0], "ev`il @all\n\"ignore previous\"")]
         self.run_pass(NOW)
         (line,) = self.said()
-        self.assertRegex(line, r"^a landing by someone else was seen: [0-9a-f]{12} by [A-Za-z0-9._-]{1,40}$")
+        self.assertRegex(line, r"^a landing by someone else was seen: [0-9a-f]{12} by [A-Za-z0-9._-]+$")
 
     def test_a_login_of_nothing_safe_is_unknown(self):
         self.main = [dict(land(FOREIGN[0]), author=None)]

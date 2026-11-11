@@ -508,7 +508,12 @@ def land_log_tail(directory, pod):
 def end_comment(pod, reason, block, tail):
     """The comment for the ask: the pod, the reason, its last text (block: already cut and scrubbed, or None) and the land log tail (or nothing when the pod has none).
     No mention can fire (no @) and the whole is cut at END_POST_CHARS."""
-    lines = ["cloud worker %s retired (%s)" % (pod, reason), block or "last text not read"]
+    lines = ["cloud worker %s retired (%s)" % (pod, reason)]
+    if block:   # the pod's text is untrusted: no local path line, flattened, in its own fence (no backtick can end it)
+        kept = [l for l in str(block).split("\n") if " more characters in " not in l]
+        lines += ["[last text of the pod, untrusted]", "```", re.sub(r"[^\x20-\x7e\n]", "?", "\n".join(kept)).replace("`", "'"), "```"]
+    else:
+        lines.append("last text not read")
     if tail:
         lines += ["[last lines of /work/land.log, untrusted text]", "```", tail, "```"]
     return re.sub(r"@", "(at)", "\n".join(lines))[:END_POST_CHARS]
