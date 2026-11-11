@@ -68,7 +68,7 @@ if [ "$AGENT" = orchestrator ]; then
 fi
 ( umask 077; mkdir -p "$cfgdir/opencode"
   printf '{"model": "%s",\n' "${CW_MODEL:-github-copilot/claude-sonnet-5.5}" > "$cfgdir/opencode/opencode.json"
-  # the worker agent (default) and the shell tool's deny rules: the template's first line is its opening brace
+  # the worker agent (default) and the shell tool's permission (the catch-all allow; the question tool denied): the template's first line is its opening brace
   tail -n +2 "${CW_SHARE_DIR:-/usr/local/share/cw}/opencode-worker.json" >> "$cfgdir/opencode/opencode.json"
   mkdir -p "$cfgdir/opencode/agents"
   if [ "$AGENT" = orchestrator ]; then
@@ -129,7 +129,7 @@ if [ -z "\$tok" ]; then echo "worker: the git token file is unreadable or empty"
 printf 'username=x-access-token\\npassword=%s\\n' "\$tok"
 H
   chmod 755 "$bin/git-credential-cw"
-  # No git-token means no wrappers: the OpenCode deny rules are then the only pod-side layer.
+  # No git-token means no wrappers: the token's scope and the repository's rules are then the only layer (the permission file holds no shell deny row, ask #2402).
   # The pod-side refusal of merge, force-push, push to the default branch, issue/label writes and settings calls. It is a
   # convenience and NOT the guard: calling the real binary by its path skips it. The guard is the repository's own rules
   # and the token's scope. Installed with the wrappers; a missing guard file refuses the start (no wrapper without it).
