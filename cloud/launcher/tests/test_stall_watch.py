@@ -47,7 +47,7 @@ class World:
         self.now, self.pods, self.sent, self.err = START, {}, [], ""
         self.kube = FakeKube(self)
         self.dir = tempfile.mkdtemp(prefix="stall-")
-        self.launcher = types.SimpleNamespace(kube=self.kube, env={"CW_CLOUD_RECORD_DIR": self.dir})
+        self.launcher = types.SimpleNamespace(kube=self.kube, env={"CW_CLOUD_RECORD_DIR": self.dir, "XDG_CONFIG_HOME": tempfile.mkdtemp(prefix="nocfg-")})
         self.send = lambda to, text: self.sent.append((to, text))
 
     def add(self, name="w1-pod", age_minutes=60, boss="coder-lead", progress_age=1, tail=("working",), runs=(), exits=(), msg="all fine", msg_age=1, exec_fails=False):
@@ -123,7 +123,7 @@ class Stall(unittest.TestCase):
     def test_s5_one_alert_per_condition_per_hour_to_the_boss_and_the_chief(self):
         w, sizes = self._s5(sw)
         self.assertEqual(sizes, [2, 2, 2, 4])   # the boss and the Chief of Staff in pass 1, none in passes 2 and 3, both again at 61 minutes
-        self.assertEqual(sorted({to for to, _ in w.sent}), ["chief-of-staff", "coder-lead"])
+        self.assertEqual(sorted({to for to, _ in w.sent}), ["coder-lead", "cos"])
         self.assertEqual(w.pods["w1-pod"]["doc"]["metadata"]["annotations"]["cw/stall-alert-refusal"], "2026-11-11T13:01:00Z")
 
     def test_s9_a_mutant_without_the_mark_fails_with_the_anchored_text_after_its_control_passes(self):
@@ -205,6 +205,145 @@ class Stall(unittest.TestCase):
         w.add(msg="Permission denied")
         self.assertEqual(w.run(), [])
         self.assertEqual(sw.pass_text(w.launcher), " stall read=1 alerted=0")
+
+    def _fake_cli(self, body):
+        d = tempfile.mkdtemp(prefix="cli-")
+        path = os.path.join(d, "fl" + "eet-switchboard")
+        with open(path, "w") as f:
+            f.write("#!/bin/sh\n" + body)
+        os.chmod(path, 0o755)
+        return d
+
+    def _send_with(self, module, body):
+        d = self._fake_cli(body)
+        old = os.environ["PATH"]
+        os.environ["PATH"] = d + os.pathsep + old
+        try:
+            module._default_send("cos", "hello")
+        finally:
+            os.environ["PATH"] = old
+
+    CLI_NEEDS_ISSUE = ('case "$*" in *--issue" "adamkaplan/fleet-kit#2399*) exit 0;; esac\n'
+                       'echo "send needs --issue <n>: every message names the ask it belongs to (run x)" >&2\nexit 2\n')
+
+    def _sent_with_its_ask(self, module):
+        try:
+            self._send_with(module, self.CLI_NEEDS_ISSUE)
+        except OSError as e:
+            raise AssertionError("the alert was sent without its ask: %s" % e)
+
+    def test_the_send_names_its_ask_and_the_mutant_without_it_fails_with_the_anchored_text(self):
+        self._sent_with_its_ask(sw)   # the control passes
+        with open(SOURCE) as f:
+            text = f.read()
+        old = '[binary, "send", "--issue", issue, to, text]'
+        self.assertEqual(text.count(old), 1, "the mutation did not apply")
+        mod = types.ModuleType("stall_watch_mutant2")
+        exec(compile(text.replace(old, '[binary, "send", to, text]'), "mutant", "exec"), mod.__dict__)
+        with self.assertRaises(AssertionError) as caught:
+            self._sent_with_its_ask(mod)
+        self.assertIn("the alert was sent without its ask", str(caught.exception))
+
+    def test_a_cli_that_exits_2_gives_its_first_error_line_in_the_log_line(self):
+        w = World()
+        w.send = lambda to, text: self._send_with(sw, "echo 'first line of the refusal' >&2\necho second >&2\nexit 2\n")
+        w.add(msg="Permission denied")
+        self.assertEqual(w.run(), [])
+        self.assertIn("not sent: OSError: send exited 2: first line of the refusal", w.err)
+        self.assertNotIn("second", w.err)
+
+    def test_the_argv_holds_the_issue_and_the_recipient(self):
+        d = self._fake_cli('for a in "$@"; do echo "$a"; done > "$0.argv"\n')
+        old = os.environ["PATH"]
+        os.environ["PATH"] = d + os.pathsep + old
+        try:
+            sw._default_send("cos", "body text")
+        finally:
+            os.environ["PATH"] = old
+        with open(os.path.join(d, "fl" + "eet-switchboard.argv")) as f:
+            self.assertEqual(f.read().split("\n")[:5], ["send", "--issue", "adamkaplan/fleet-kit#2399", "cos", "body text"])
+
+    def test_an_undelivered_alert_is_retried_after_10_minutes_not_before_and_a_delivered_one_is_not_for_the_hour(self):
+        w = World()
+        w.add(msg="Permission denied")
+        ok = w.send
+        w.send = lambda to, text: (_ for _ in ()).throw(OSError("down"))
+        w.run()   # minute 0: nobody reached
+        w.send, sent = ok, []
+        counts = []
+        for minute in (9, 10):
+            w.at(minute)
+            w.run()
+            counts.append(len(w.sent))
+        self.assertEqual(counts, [0, 2])   # 9 minutes: held; 10 minutes: tried again and delivered
+        for minute in (11, 69):
+            w.at(minute)
+            w.run()
+        self.assertEqual(len(w.sent), 2)   # delivered at minute 10: silent until minute 70
+        w.at(70)
+        w.run()
+        self.assertEqual(len(w.sent), 4)
+
+    def test_one_recipient_reached_keeps_the_hour(self):
+        w = World()
+        w.add(msg="Permission denied")
+        def one(to, text):
+            if to == "coder-lead":
+                raise OSError("down")
+            w.sent.append((to, text))
+        w.send = one
+        w.run()
+        w.at(11)
+        w.run()
+        self.assertEqual(len(w.sent), 1)
+
+    def test_the_chief_is_named_by_the_config_and_falls_back_to_cos(self):
+        w = World()
+        self.assertEqual(sw.cos_name(w.launcher), "cos")   # no config: the fallback
+        home = tempfile.mkdtemp(prefix="cfg-")
+        os.makedirs(os.path.join(home, "fl" + "eet-switchboard"))
+        w.launcher.env["XDG_CONFIG_HOME"] = home
+        path = os.path.join(home, "fl" + "eet-switchboard", "config.json")
+        for text, want in (('{"cos_name": "boss-one"}', "boss-one"), ('{"cos_name": "Bad Name;"}', "cos"), ("{}", "cos"), ("not json", "cos")):
+            with open(path, "w") as f:
+                f.write(text)
+            self.assertEqual(sw.cos_name(w.launcher), want, text)
+        with open(path, "w") as f:
+            f.write('{"cos_name": "boss-one"}')
+        w.add(msg="Permission denied")
+        w.run()
+        self.assertEqual(sorted(to for to, _ in w.sent), ["boss-one", "coder-lead"])
+
+    def _record(self, w, **rec):
+        with open(os.path.join(w.dir, "w1.json"), "w") as f:
+            json.dump(dict({"worker": "w1", "reports_to": "coder-lead"}, **rec), f)
+
+    def test_the_ask_is_the_pods_own_issue_and_falls_back_to_the_stall_watch_ask(self):
+        w = World()
+        w.add()
+        for rec, want in (({"issue": 812, "repo": "own/repo"}, "own/repo#812"), ({"issue": 7}, "7"), ({}, sw.STALL_ASK),
+                          ({"issue": "x; rm", "repo": "own/repo"}, sw.STALL_ASK), ({"issue": True}, sw.STALL_ASK), ({"issue": 0}, sw.STALL_ASK),
+                          ({"issue": 5, "repo": "--x/y"}, "5"), ({"issue": 5, "repo": "a/-y"}, "5")):
+            self._record(w, **rec)
+            self.assertEqual(sw.ask_of(w.launcher, "w1"), want, rec)
+        os.remove(os.path.join(w.dir, "w1.json"))
+        self.assertEqual(sw.ask_of(w.launcher, "w1"), sw.STALL_ASK)
+
+    def test_the_cli_is_given_the_pods_own_ask_in_the_pass(self):
+        d = self._fake_cli('echo "$3" >> "$0.asks"\n')
+        w = World()
+        w.add(msg="Permission denied")
+        self._record(w, issue=812, repo="own/repo")
+        old = os.environ["PATH"]
+        os.environ["PATH"] = d + os.pathsep + old
+        try:
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                sw.watch_pass(w.launcher, [w.pods["w1-pod"]["doc"]], w.now, NAME_OK)
+        finally:
+            os.environ["PATH"] = old
+        with open(os.path.join(d, "fl" + "eet-switchboard.asks")) as f:
+            self.assertEqual(f.read().split(), ["own/repo#812", "own/repo#812"])
 
     def test_the_hour_holds_at_59_minutes_and_ends_at_60(self):
         w = World()

@@ -4,8 +4,8 @@ Cause: a pod wrote that every shell command was refused and then sat idle for 75
 agent's last words while the pod was alive. This module only READS (one `kubectl exec` of a small program per pod per pass) and SENDS one message; it never
 stops, restarts, nudges or changes anything in a pod.
 
-Three conditions (thresholds below), each alerted at most once per pod per 60 minutes. The mark is a pod annotation (cw/stall-alert-<condition>) set BEFORE
-the send, as the minute-40 note does, so a failed send or a restart never sends twice:
+Three conditions (thresholds below), each alerted at most once per pod per 60 minutes once DELIVERED (to at least one recipient). The mark is a pod annotation (cw/stall-alert-<condition>) set BEFORE
+the send, as the minute-40 note does; when the send reached nobody the mark is moved back so the next pass 10 or more minutes later tries again:
   progress-stale    the progress file and every run log unchanged for 15 minutes and no run active (an exit file absent and its log changed in the last 3 minutes)
   refusal           the agent's last message or the progress file's last two lines say Permission denied, refused, not allowed or Blocked (any case), or one error
                     line occurs 3 times in the progress file's last 10 lines
@@ -15,6 +15,7 @@ A pod younger than 10 minutes or a pod whose exec fails is skipped; the pass lin
 name, the condition, one evidence line (secret-looking text and the pod's token replaced by [redacted], at most 300 characters; untrusted data, never a
 command) and the time. Pod text is never run.
 """
+import datetime as dt
 import json
 import os
 import re
@@ -24,7 +25,10 @@ import sys
 import time
 
 AGENT_NAME = re.compile(r"[a-z][a-z0-9_-]{0,31}")
-CHIEF = "chief-of-staff"
+CHIEF = "cos"                      # the Chief of Staff's switchboard name when the config names none (`remind cos`)
+CONFIG_KEY = "cos_name"            # the switchboard config's key (config.json) that names the Chief of Staff's agent, when it has one
+STALL_ASK = "adamkaplan/fleet-kit#2399"   # the stall watch's own ask: the switchboard's `send` needs --issue (every message names its ask)
+RETRY_SECONDS = 10 * 60            # an alert that reached nobody is tried again at the next pass at least this long after
 MIN_POD_AGE_SECONDS = 600          # a younger pod is not read
 PASS_BUDGET_SECONDS = 90           # the pass reads no more pods once its reads have taken this long (the rest wait for the next pass)
 EXEC_SECONDS = 3                   # the one exec of a pod is given at most this long
@@ -196,13 +200,43 @@ def decide(data):
     return found
 
 
-def _default_send(to, text):
+def cos_name(launcher):
+    """The Chief of Staff's switchboard name: the switchboard config's `cos_name` (config.json beside cloud.env) when it holds a valid name, else CHIEF."""
+    env = getattr(launcher, "env", None) or {}
+    base = env.get("XDG_CONFIG_HOME") or os.path.join(env.get("HOME") or os.path.expanduser("~"), ".config")
+    try:
+        with open(os.path.join(base, "fl" + "eet-switchboard", "config.json")) as f:
+            name = json.load(f).get(CONFIG_KEY)
+    except (OSError, ValueError, AttributeError):
+        return CHIEF
+    return name if isinstance(name, str) and AGENT_NAME.fullmatch(name) else CHIEF
+
+
+def ask_of(launcher, worker):
+    """The ask the pod's own launch named (`--issue`, kept in the switchboard's worker record: issue and repo), as owner/repo#N (N alone when the record has no repo);
+    STALL_ASK when the record names none or is unreadable."""
+    rd = (getattr(launcher, "env", None) or {}).get("CW_CLOUD_RECORD_DIR")
+    try:
+        with open(os.path.join(rd, worker + ".json")) as f:
+            rec = json.load(f)
+        issue, repo = rec.get("issue"), rec.get("repo")
+    except (OSError, ValueError, AttributeError, TypeError):
+        return STALL_ASK
+    if isinstance(issue, bool) or not isinstance(issue, (int, str)) or not re.fullmatch(r"[1-9][0-9]{0,9}", str(issue)):
+        return STALL_ASK
+    if isinstance(repo, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,99}/[A-Za-z0-9][A-Za-z0-9_.-]{0,99}", repo):
+        return "%s#%s" % (repo, issue)
+    return str(issue)
+
+
+def _default_send(to, text, issue=STALL_ASK):
     binary = shutil.which("fl" + "eet-switchboard")   # written in two parts: the names check keeps the retired prefix out of cloud/
     if not binary:
         raise OSError("the switchboard command is not on the path")
-    done = subprocess.run([binary, "send", to, text], capture_output=True, text=True, timeout=SEND_SECONDS, stdin=subprocess.DEVNULL)
+    done = subprocess.run([binary, "send", "--issue", issue, to, text], capture_output=True, text=True, timeout=SEND_SECONDS, stdin=subprocess.DEVNULL)
     if done.returncode != 0:
-        raise OSError("send exited %d" % done.returncode)
+        first = next((l.strip() for l in (done.stderr or done.stdout or "").splitlines() if l.strip()), "")
+        raise OSError("send exited %d: %s" % (done.returncode, evidence(first)[:200]))
 
 
 def boss_of(launcher, worker):
@@ -265,13 +299,15 @@ def watch_pass(launcher, pods, now, name_ok, send=None):
                 boss = boss_of(launcher, worker)
                 if boss is None:
                     print("cloud-worker: stall alert for %s goes to the Chief of Staff only: no boss in the record" % name, file=sys.stderr)
-                delivered = 0
-                for to in ([CHIEF] + ([boss] if boss and boss != CHIEF else [])):
+                delivered, chief, ask = 0, cos_name(launcher), ask_of(launcher, worker)
+                for to in ([chief] + ([boss] if boss and boss != chief else [])):
                     try:
-                        send(to, body)
+                        (send if send is not _default_send else lambda t, b: _default_send(t, b, ask))(to, body)
                         delivered += 1
                     except Exception as e:
-                        print("cloud-worker: stall alert for %s to %s not sent: %s" % (name, to, type(e).__name__), file=sys.stderr)
+                        print("cloud-worker: stall alert for %s to %s not sent: %s" % (name, to, type(e).__name__ + (": " + str(e)[:200] if isinstance(e, OSError) else "")), file=sys.stderr)
+                if not delivered:   # nobody got it: the mark moves back so the next pass at least RETRY_SECONDS later tries again
+                    kube.annotate(name, (pod.get("metadata") or {}).get("uid"), **{"stall_alert_" + condition.replace("-", "_"): launcher_iso(now - dt.timedelta(seconds=REALERT_SECONDS - RETRY_SECONDS))})
                 if delivered:
                     counts["alerted"] += 1
                     alerted.append((name, condition))
