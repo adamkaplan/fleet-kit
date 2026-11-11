@@ -15172,11 +15172,13 @@ def ask_subject(engine, repo, number, entries, unreadable, explicit, runner, now
     return {"facts": facts, "plan": plan, "plan_problem": problem}
 
 
-def _ledger_context(args, runner, now, writable, parts=None, floor=False, plan_read=True):
+def _ledger_context(args, runner, now, writable, parts=None, floor=False, plan_read=True, landed=False):
     """Everything `prove`, `verdict` and `gates` share: the engine, state, PR ref, its picture and its checked plan. `parts` is
     (engine, state, config) when the caller already has them (the daemon's pass); else the engine is built. `plan_read=False` skips the read of the plan
     (the relay's link check needs only the PR and the plan's source: one GitHub read)."""
     engine, state, config = parts if parts is not None else build_engine(runner, now, "cli", writable=writable)
+    if landed and (lref := landed_ref(args.pr)):   # ask #2373: a landed commit of a land repository is a subject (prove, verdict and gates only)
+        return _landed_context(args, engine, state, config, lref, runner, now, plan_read)
     repo, number, pr = _ledger_pr(args)
     entries, problem = plan_ledger.read_ledger(state)
     record_step("a GitHub read of %s" % pr)
@@ -15213,6 +15215,93 @@ def _ledger_context(args, runner, now, writable, parts=None, floor=False, plan_r
     return types.SimpleNamespace(engine=engine, state=state, config=config, repo=repo, number=number, pr=pr, entries=entries,
                                  problem=problem, facts=facts, unreadable=unreadable, source=source, plan=plan,
                                  plan_problem=plan_problem)
+
+
+# ---------------------------------------------------------------- a landed commit as the subject of prove, verdict and gates (ask #2373)
+# A repository on the land path (`land_repos`) has no pull request, so `prove`, `verdict` and `gates` (which take a PR) had no subject for it. The subject is `--pr <owner/repo>@<40-hex sha>`:
+# the one argument those commands already take, so no new option is parsed. Reads are GETs through the repository's own account (`impact_carry_get`, as the epic record reads). Every refusal writes nothing.
+
+LANDED_REF = re.compile(r"([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)@([0-9a-f]{40})")
+
+
+def landed_ref(text):
+    """(repo, sha) for `owner/repo@<40 lowercase hex>`, else None (a pull request reference, or anything else, is not a landed subject)."""
+    found = LANDED_REF.fullmatch((text or "").strip())
+    return (found.group(1), found.group(2)) if found else None
+
+
+def landed_check(engine, config, runner, repo, sha):
+    """Raises LedgerCommandError naming what is missing unless `sha` is a commit of the land repository `repo` that is on its default branch and carries the land trailers."""
+    ref = "%s@%s" % (repo, sha)
+    if not uses_spire_land(config, repo):
+        raise LedgerCommandError("refused: %s is not a land repository (`land_repos`): its subject is a pull request, nothing was recorded" % repo)
+    get = impact_carry_get(engine, runner, repo)
+    try:
+        commit = get("repos/%s/commits/%s" % (repo, sha))
+        message = commit.get("commit", {}).get("message") if isinstance(commit, dict) else None
+        if not isinstance(commit, dict) or commit.get("sha") != sha or not isinstance(message, str):
+            raise ValueError("no such commit")
+    except Exception:
+        raise LedgerCommandError("refused: sha unknown: %s could not be read as a commit, nothing was recorded" % ref) from None
+    try:
+        default = (get("repos/%s" % repo) or {}).get("default_branch")
+        if not isinstance(default, str) or not default:
+            raise ValueError("no default branch")
+        answer = get("repos/%s/compare/%s...%s" % (repo, urllib.parse.quote(default, safe=""), sha))   # the commit is on the branch when it is the tip or an ancestor of it
+        on_branch = isinstance(answer, dict) and answer.get("status") in ("identical", "behind")
+    except Exception as err:
+        raise LedgerCommandError("refused: the default branch of %s could not be read (%s), nothing was recorded" % (repo, _one_line(str(err), 100))) from None
+    if not on_branch:
+        raise LedgerCommandError("refused: %s is not on the default branch %s of %s, nothing was recorded" % (sha[:12], default, repo))
+    missing = land_trailers_missing(message)
+    if missing:
+        raise LedgerCommandError("refused: %s has no trailer %s, nothing was recorded" % (sha[:12], ", ".join(missing)))
+
+
+def landed_kind(ctx):
+    """The marker a landed subject's entry carries, so a proof at a sha is never read as a pull request's head; a pull request's entry keeps its shape (no marker)."""
+    return {"subject_kind": "landed"} if getattr(ctx, "landed", False) else {}
+
+
+def _landed_context(args, engine, state, config, lref, runner, now, plan_read):
+    """The context of a landed subject: like a pull request's, with the sha as head, no body, no author, and `landed` True. The plan is `--plan` or the one the subject's entries name."""
+    repo, sha = lref
+    pr = "%s@%s" % (repo, sha)
+    entries, problem = plan_ledger.read_ledger(state)
+    record_step("a GitHub read of the commit %s" % pr)
+    landed_check(engine, config, runner, repo, sha)
+    facts = {"head": sha, "body": "", "notice_senders": [], "author": None, "landed": True}
+    source = plan_source_for(args.plan, entries, pr, "", config.get("intent_repo"))
+    plan, plan_problem = None, None
+    if source and plan_read:
+        record_step("a GitHub read of the plan %s" % source)
+        try:
+            plan = checked_plan(config, source, args.ask, runner, now)
+        except (PlanInputError, ValueError, ConfigError, IntentError) as err:
+            plan_problem = _one_line(str(err), 200)
+    entries = plan_ledger.as_current(entries, (plan or {}).get("plan_hashes"))
+    return types.SimpleNamespace(engine=engine, state=state, config=config, repo=repo, number=None, pr=pr, entries=entries, problem=problem, facts=facts,
+                                 unreadable=None, source=source, plan=plan, plan_problem=plan_problem, landed=True)
+
+
+def _gates_landed(ctx, args, now):
+    """`gates <owner/repo>@<sha>`: the proof gates (G0a plan, G1 proof) of a landed commit; the merge gates G2 to G8 do not apply to a commit that has no pull request."""
+    report = plan_ledger.evaluate_gates(ctx.plan, ctx.entries, ctx.problem, ctx.facts, ctx.pr, now=now())
+    for row in report["gates"]:
+        if row["gate"] not in ("G0a", "G0b", "G0c", "G1"):
+            row.update(status="n/a", missing=[], detail="does not apply to a landed commit")
+    report.update(ready=all(r["status"] in plan_ledger.SATISFIED for r in report["gates"]), subject_kind="landed", plan_problem=ctx.plan_problem,
+                  plan_source=ctx.source, merge_gates="G2-G8 do not apply to a landed commit")
+    report.update(enforced=None, ready_enforced=report["ready"], open_enforced=[], open_not_enforced=[])
+    if args.json:
+        print(json.dumps(report, sort_keys=True))
+    else:
+        lines = plan_ledger.render_gates(report, ctx.pr)
+        lines.append("subject: a landed commit; merge gates G2-G8 do not apply (no pull request)")
+        if ctx.plan_problem:
+            lines.append("plan not read: %s" % ctx.plan_problem)
+        print("\n".join(lines))
+    return EXIT_OK if report["ready"] else EXIT_ERROR
 
 
 def floor_for_carries(floor, state, pr, dep_pr):
@@ -15661,7 +15750,7 @@ def cmd_prove(args, runner, now):
     reason (stderr), then ONE final line (#1049): `recorded #<id> ...`, `already recorded #<id> ...` or, when any was refused, `not recorded: ...`.
     Exit 0 when every named scenario is recorded; EXIT_PARTIAL when any was refused. What applies to the whole
     command (no plan, a failing plan check, no caller, no evidence, an unknown head) stays a usage error: nothing is recorded."""
-    ctx = _ledger_context(args, runner, now, True)
+    ctx = _ledger_context(args, runner, now, True, landed=True)   # ask #2373: landed=True lets the subject be a landed commit
     record_step("the agent registry (who is calling)")
     caller = identify_caller(ctx.engine.herdr, ctx.engine.v2, os.environ)
     _plan_usable(ctx)
@@ -15690,7 +15779,7 @@ def cmd_prove(args, runner, now):
         entry = {"kind": "proof", "pr": ctx.pr, "scenario": sid, "plan_ref": ctx.source,
                  "plan_hash": ctx.plan["plan_hash"], "head": head, "result": args.result, "by": caller,
                  "evidence": evidence, "command": plan_ledger.clip(redact_command_text(args.command or "")),
-                 **({"files": files} if files else {}),
+                 **({"files": files} if files else {}), **landed_kind(ctx),
                  "env": "%s %s" % (sys.platform, "python%d.%d" % sys.version_info[:2])}
         try:
             stored, already = _record(ctx, args, now, entry)
@@ -15744,7 +15833,7 @@ def cmd_verdict(args, runner, now):
     """`verdict <scenario> --pr <repo#N> --as <evaluator> --result ...`: record the evaluator's verdict for a scenario. Only
     the evaluator the scenario names, only by an agent registered for it (`plan_evaluators`), never by a writer of the PR.
     It ends with one line (#1049): `recorded #<id> ...`, `already recorded #<id> ...` (the same record again writes nothing) or `not recorded: <reason>`."""
-    ctx = _ledger_context(args, runner, now, True)
+    ctx = _ledger_context(args, runner, now, True, landed=True)   # ask #2373
     every = bool(getattr(args, "all_scenarios", False))
     if every:   # `--all`: every per-PR scenario this evaluator judges, in one command; never another evaluator's
         if args.scenario:
@@ -15812,7 +15901,7 @@ def cmd_verdict(args, runner, now):
             raise LedgerCommandError("refused: %s: %s; nothing was recorded" % (target["id"], problem))
     entries = [{"kind": "verdict", "pr": ctx.pr, "scenario": target["id"], "plan_ref": ctx.source,
                 "plan_hash": ctx.plan["plan_hash"], "head": head, "result": args.result, "by": caller,
-                "evaluator": named, "evidence": evidence, **({"files": sorted(set(args.file))} if getattr(args, "file", None) else {})} for target in targets]
+                "evaluator": named, "evidence": evidence, **({"files": sorted(set(args.file))} if getattr(args, "file", None) else {}), **landed_kind(ctx)} for target in targets]
     right = load_launch_testers().source_of(caller, ctx.config.get("plan_evaluators"), launch, named) if named in load_launch_testers().LAUNCHABLE else None   # #1869: where the right came from
     for entry in entries:
         if right:
@@ -16048,7 +16137,9 @@ def cmd_gates(args, runner, now):
     if args.pr == "ask-close":   # #1130: the closing rule of a report-only ask
         args.pr = args.rest[0] if args.rest else ""
         return cmd_gates_ask_close(args, runner, now)
-    ctx = _ledger_context(args, runner, now, False, floor=True)
+    ctx = _ledger_context(args, runner, now, False, floor=True, landed=True)   # ask #2373
+    if getattr(ctx, "landed", False):
+        return _gates_landed(ctx, args, now)
     plan = ctx.plan
     report = plan_ledger.evaluate_gates(plan, ctx.entries, ctx.problem, ctx.facts if ctx.facts.get("head") or ctx.facts.get("body") else None, ctx.pr,
                                         now=now())
@@ -19762,7 +19853,7 @@ def add_ledger_parsers(sub):
     def common(p, scenario=True, multi=False):
         if scenario:
             p.add_argument("scenario", nargs="+" if multi else None, help="The scenario id in the plan (S1, U2, ...)")
-            p.add_argument("--pr", required=True, help="The pull request: owner/repo#N or its URL")
+            p.add_argument("--pr", required=True, help="The pull request: owner/repo#N or its URL (a land repository: owner/repo@<40-hex sha> of a landed commit)")
         else:
             p.add_argument("pr", help="The pull request: owner/repo#N or its URL")
         p.add_argument("--plan", help="The plan: owner/repo#N or an issue URL (default: the one the PR's ledger entries "

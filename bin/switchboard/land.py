@@ -56,3 +56,15 @@ def setup_with_land(preamble, config, repo):
         return preamble
     head, _, tail = preamble.rpartition(marker)
     return head + LAND_SETUP_LINE + marker + tail
+
+
+# ---- ask #2373: a landed commit as the subject of prove, verdict and gates. ASSUMPTION: the real trailer forms are not known; a trailer is `Key: <anything non-empty>` in the LAST paragraph of the message
+# (the `git interpret-trailers --parse` form), the key case-insensitive. This is the one place to change when the real form is known.
+LAND_PROOF_TRAILERS = ("Land-Checks", "Land-Council")
+
+def land_trailers_missing(message):
+    """The names of LAND_PROOF_TRAILERS the commit message lacks (an empty list: it has them all). Pure."""
+    paragraphs = [p for p in re.split(r"\n[ \t]*\n", (message or "").strip().replace("\r\n", "\n")) if p.strip()]
+    block = paragraphs[-1].split("\n") if len(paragraphs) > 1 else []   # the subject paragraph alone is never a trailer block
+    found = {m.group(1).lower() for m in (re.fullmatch(r"([A-Za-z0-9-]+)[ \t]*:[ \t]*(\S.*)", line) for line in block) if m}
+    return [name for name in LAND_PROOF_TRAILERS if name.lower() not in found]
