@@ -64,8 +64,6 @@ BoundedFileCache
 CALLER_ENV_NAMES
 CAPTAIN_EVIDENCE_MAX
 CAPTAIN_HOLD_LABELS
-CAPTAIN_MARK
-CAPTAIN_MARKER_UNTIL
 CAPTAIN_MERGE_LABELS
 CAPTAIN_NO_REVIEW_SECONDS
 CARRY_ANSWER_MAX
@@ -2037,7 +2035,6 @@ mark_batch_note
 mark_decisions_read
 mark_escalated
 marker_edit
-marker_window_open
 markers_to_label
 math
 measure_groups
@@ -2162,7 +2159,6 @@ pr_facts_from
 pr_floor_report
 pr_head_time
 pr_hold_reasons
-pr_is_captain
 pr_is_held
 pr_login
 pr_marker

@@ -77,6 +77,25 @@ fi
     cat "$defn" > "$cfgdir/opencode/agents/$AGENT.md"
   fi )
 chmod 600 "$cfgdir/opencode/opencode.json"
+if [ -n "${CW_LONG_RUN_DENY:-}" ]; then
+  # the operator's long-command patterns: after every existing row (the last matching row wins), one deny row per pattern, then the allow row for cw-run start
+  # last, so a command that starts with cw-run start is let through and a foreground one that matches a pattern is refused. Both bash maps (the top one and the
+  # worker agent's) end with the same last row; it must be found twice, and every pattern must be plain, or the start is refused.
+  case "$CW_LONG_RUN_DENY" in ,*|*,|*,,*) echo "worker: CW_LONG_RUN_DENY has an empty pattern; refusing to start" >&2; exit 1 ;; esac
+  rows=""; oldifs=$IFS; IFS=','; set -f
+  for pat in $CW_LONG_RUN_DENY; do
+    case "$pat" in ""|*[!A-Za-z0-9./_*?-]*) IFS=$oldifs; set +f; echo "worker: CW_LONG_RUN_DENY has an empty pattern or a character outside [A-Za-z0-9./_*?-]; refusing to start" >&2; exit 1 ;; esac
+    rows="$rows,\\n\\1\"$pat\": \"deny\""
+  done
+  IFS=$oldifs; set +f
+  rows="$rows,\\n\\1\"cw-run start*\": \"allow\""
+  last='^\( *\)"\*git\*push\*/master\\n\*": "deny"$'
+  if [ "$(grep -c "$last" "$cfgdir/opencode/opencode.json")" != 2 ]; then
+    echo "worker: the last shell rule was not found twice; refusing to start" >&2; exit 1
+  fi
+  sed "s|$last|\\1\"*git*push*/master\\\\n*\": \"deny\"$rows|" "$cfgdir/opencode/opencode.json" > "$cfgdir/opencode/opencode.json.new" \
+    && mv "$cfgdir/opencode/opencode.json.new" "$cfgdir/opencode/opencode.json" && chmod 600 "$cfgdir/opencode/opencode.json"
+fi
 XDG_CONFIG_HOME="$cfgdir"; export XDG_CONFIG_HOME
 
 # a hub pod (any agent; only when the launcher wrote the key): the per-pod channel secret goes from the per-run Secret to the memory-backed file the cloud command reads (a copy, 0400, never printed)
@@ -149,6 +168,14 @@ H
   fi
   # ~/.gitconfig is read by every process of this user, including a fresh-environment `kubectl exec` (the end hook)
   git config --global credential.helper "$bin/git-credential-cw"
+  git config --global core.hooksPath /usr/local/lib/cw-hooks   # the pre-push hook of the image (a convenience, not the guard)
+  # the image's default identity (two lines: name, email), each key only when unset in the global file; a value already there is kept
+  idfile="${CW_IDENTITY_FILE:-/etc/cw-default-identity}"
+  if [ -r "$idfile" ]; then
+    { IFS= read -r id_name; IFS= read -r id_email; } < "$idfile" || true
+    if [ -n "$id_name" ] && [ -z "$(git config --global --get user.name 2>/dev/null)" ]; then git config --global user.name "$id_name"; fi
+    if [ -n "$id_email" ] && [ -z "$(git config --global --get user.email 2>/dev/null)" ]; then git config --global user.email "$id_email"; fi
+  fi
   PATH="$bin:$PATH"; export PATH
 fi
 

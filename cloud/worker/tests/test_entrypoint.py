@@ -161,6 +161,55 @@ class Entrypoint(unittest.TestCase):
             f.write("rotated-token-value")
         self.assertIn("password=rotated-token-value", ask("github.com").stdout)
 
+    # -- #2361: the default identity, set in the global configuration at start, each key only when unset --
+    def identity_start(self, preset):
+        """Start with a fake identity file and a recording git (it logs each config call, then runs the real git); return the recorded writes."""
+        real = shutil.which("git", path="/usr/bin:/bin")
+        log = os.path.join(self.rec, "git-calls")
+        with open(os.path.join(self.bin, "git"), "w") as f:
+            f.write('#!/bin/sh\necho "$*" >> "%s"\nexec "%s" "$@"\n' % (log, real))
+        os.chmod(os.path.join(self.bin, "git"), 0o755)
+        idfile = os.path.join(self.d, "identity")
+        with open(idfile, "w") as f:
+            f.write("default-name\ndefault@example.invalid\n")
+        for key, value in preset.items():
+            subprocess.run([real, "config", "--" + "glo" + "bal", key, value], env={"PATH": "/usr/bin:/bin", "HOME": self.home}, check=True)
+        r = self.start("env", CW_IDENTITY_FILE=idfile)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        calls = read(log).splitlines() if os.path.exists(log) else []
+        writes = [c for c in calls if c.startswith("config") and " user." in c and "--get" not in c]
+        got = lambda k: subprocess.run([real, "config", "--" + "glo" + "bal", "--get", k], env={"PATH": "/usr/bin:/bin", "HOME": self.home},
+                                       capture_output=True, text=True).stdout.strip()
+        return r, writes, got("user.name"), got("user.email")
+
+    def test_2361_neither_key_set_sets_both_and_exports_no_identity(self):
+        r, writes, name, email = self.identity_start({})
+        self.assertEqual((len(writes), name, email), (2, "default-name", "default@example.invalid"))
+        self.assertEqual([l for l in r.stdout.splitlines() if l.startswith(("GIT_AUTHOR", "GIT_COMMITTER"))], [])
+
+    def test_2361_only_the_name_set_sets_the_email_only(self):
+        _, writes, name, email = self.identity_start({"user.name": "kept-name"})
+        self.assertEqual((len(writes), name, email), (1, "kept-name", "default@example.invalid"))
+        self.assertIn("user.email", writes[0])
+
+    def test_2361_both_keys_set_are_kept_and_nothing_is_written(self):
+        _, writes, name, email = self.identity_start({"user.name": "kept-name", "user.email": "kept@example.invalid"})
+        self.assertEqual((len(writes), name, email), (0, "kept-name", "kept@example.invalid"))
+
+    def test_2361_a_fresh_environment_commit_carries_the_default_and_the_repository_identity_wins(self):
+        self.identity_start({})
+        env = {"PATH": "/usr/bin:/bin", "HOME": self.home, "GIT_CONFIG_NOSYSTEM": "1"}
+        for sub, own in (("plain", False), ("owned", True)):
+            repo = os.path.join(self.d, sub)
+            cmds = [["git", "init", "-q", repo]]
+            if own:
+                cmds += [["git", "-C", repo, "config", "user.name", "repo-owner"], ["git", "-C", repo, "config", "user.email", "o@example.invalid"]]
+            cmds += [["git", "-C", repo, "commit", "-q", "--allow-empty", "-m", "x"]]
+            for c in cmds:
+                self.assertEqual(subprocess.run(c, env=env, capture_output=True, text=True).returncode, 0)
+            who = subprocess.run(["git", "-C", repo, "log", "-1", "--format=%an/%ae"], env=env, capture_output=True, text=True).stdout.strip()
+            self.assertEqual(who, "repo-owner/o@example.invalid" if own else "default-name/default@example.invalid")
+
     def test_s4_the_git_helper_reaches_git_itself(self):
         self.assertEqual(self.start().returncode, 0)
         r = subprocess.run(["git", "credential", "fill"], input="protocol=https\nhost=github.com\n\n", capture_output=True, text=True,

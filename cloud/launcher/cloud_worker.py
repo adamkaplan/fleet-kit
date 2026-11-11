@@ -105,6 +105,7 @@ RENEW_CADENCE_SECONDS = 600             # the renewal and the login refresh run 
 RESTART_ACTION = "reaper-restart"       # the audit action of the reaper's exit after the installed code changed (the service manager starts it again)
 CODE_IDENTITY_FILES = ("cloud/launcher/cloud_worker.py", "cloud/launcher/run_record.py", "bin/path_walk.py", "cloud/launcher/token_mint.py", "bin/registry.py", "bin/record_json.py")   # the module and the kit modules it imports
 CODE_IDENTITY_FILES = CODE_IDENTITY_FILES + ("cloud/launcher/wip_save.py",)   # #2304: the save step is part of the reaper's code identity
+CODE_IDENTITY_FILES = CODE_IDENTITY_FILES + ("cloud/launcher/stall_watch.py",)   # #2399
 RENEW_POLL_SECONDS = 15                 # how often that thread looks at the clock
 IGNORED_SETTING_ACTION = "ignored-setting-notice"   # the audit action of the notice that a setting is ignored by the unattended refresh
 IGNORED_SETTINGS = ("CW_KUBECTL", "CW_CLUSTER_ADMIN_CMD", "CW_CLUSTER_TOKEN_CMD")   # the names the strict route ignores
@@ -2747,6 +2748,26 @@ def github_pr_head(token, repo, number):
     return str(head.get("ref") or ""), str(data.get("state") or ""), str((head.get("repo") or {}).get("full_name") or "")
 
 
+def github_branch_exists(token, repo, branch):
+    """GET /repos/R/branches/B: True (200) or False (404: the exact answer for no such branch). Any other answer raises."""
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+    import token_mint
+    if not re.fullmatch(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+", repo or ""):
+        raise ValueError("the repository name is not owner/name")
+    req = urllib.request.Request("https://api.github.com/repos/%s/branches/%s" % (repo, urllib.parse.quote(branch, safe="")), method="GET",
+                                 headers={"Authorization": "Bearer " + token, "Accept": "application/vnd.github+json", "User-Agent": "cw-launcher"})
+    try:
+        with token_mint.open_no_redirect(req, SCOPE_PROBE_SECONDS) as r:
+            r.read(1000000)
+        return True
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return False
+        raise
+
+
 SAFE_VALUE = re.compile(r"[A-Za-z0-9._-]{1,63}", re.ASCII)
 POD_UID_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")   # the form of a pod uid: the create records it, the retire hands it back (bin/cloud_worker.py holds the equal text)
 
@@ -2927,6 +2948,7 @@ def render_pod(a, worker, name, now, hard, env, run_names=()):
     if comment:   # the repository's review comment, posted once by the end hook; none configured = no variable
         e["CW_REVIEW_COMMENT"] = comment
     if (env.get("CW_COUNCIL_URL") or "").strip(): e["COUNCIL_MODEL_URL"] = env["CW_COUNCIL_URL"].strip()   # ask #2341: an address only, never a key; unset adds nothing
+    if (env.get("CW_LONG_RUN_DENY") or "").strip(): e["CW_LONG_RUN_DENY"] = env["CW_LONG_RUN_DENY"].strip()   # ask #2369: patterns only; unset adds nothing
     agent = getattr(a, "agent", None) or "worker"
     if agent not in AGENTS:
         raise CloudError("--agent must be one of %s, got %r; nothing was created" % (" or ".join(AGENTS), str(agent)[:40]), EXIT_USAGE)
@@ -3083,6 +3105,9 @@ class _StopKube:
 
 KEPT_RUNNING_MARK = "kept_running_tried"
 KEPT_ENDED_NOTE = "kept pod ended: its work is unreachable by exec; the pod is left for a person"
+KEPT_GRACE_SECONDS = 24 * 3600   # a kept pod that ended is deleted this long after its hard deadline (ask #2343); bin/cloud_ended_pods.py holds the equal number for the status
+UNKEPT_GRACE_SECONDS = 600       # a pod without the kept mark that is still there this long after its hard deadline is deleted, whatever its phase
+KEPT_EXPIRED_ACTION = "kept-expired"
 
 
 # The results check of the idle nudge: ONE read in the pod. It prints "no" (no /work/results.txt), or "<file mtime> <newest user message time> <1 if the last non-empty line is exactly STATUS: done else 0>"
@@ -3134,6 +3159,12 @@ def results_not_finished(seen):
         return False
     return marker != 1 or mtime <= prompt
 
+
+def _stall(call, *args):   # #2399: a stall_watch function, never raising (the module is loaded by name: the token service's image does not ship it)
+    try:
+        return getattr(__import__("stall_watch"), call)(*args)
+    except Exception as err:
+        return "" if call == "pass_text" else print("cloud-worker: the stall watch failed: %s" % type(err).__name__, file=sys.stderr)
 
 class Launcher:
     def __init__(self, kube, env, clock=None, sleep=time.sleep):
@@ -4245,6 +4276,7 @@ class Launcher:
                          "phase": safe_value((pod.get("status") or {}).get("phase")) if (pod.get("status") or {}).get("phase") else None,
                          "node": (pod.get("spec") or {}).get("nodeName"), "hard_deadline": ann(pod, "hard-deadline"),
                          "ready": any(c.get("type") == "Ready" and c.get("status") == "True" for c in ((pod.get("status") or {}).get("conditions") or []) if isinstance(c, dict))})
+            pods[-1]["kept"] = ann(pod, "kept") == "true"   # ask #2343: the status shows the ended pods and which are kept
         nodes, nodes_read, nodes_error = [], True, None
         try:
             for node in self.kube.list_nodes():
@@ -4298,6 +4330,91 @@ class Launcher:
         out["nodes"] = [dict(n, name=_mask_addresses(n["name"])) for n in out["nodes"]]
         out["requests"] = {_mask_addresses(k): v for k, v in out["requests"].items()}
         out["last_event"] = _mask_addresses(out["last_event"])[:200] if out["last_event"] else out["last_event"]
+        return out
+
+    def _last_save(self, pod):
+        """ONE best-effort save of the pod's work to <worker>/wip before it is deleted (the reaper's own wip_save step, once). Returns the words for the
+        audit line; a pod that cannot be exec'd (an ended pod cannot) is said so. Never raises."""
+        try:
+            if (pod.get("status") or {}).get("phase") in ("Failed", "Succeeded") or not callable(getattr(self.kube, "exec", None)):
+                return "the pod cannot be exec'd (it has ended): its work was not saved"
+            res = json.loads(self.kube.exec(pod["metadata"]["name"], "python3", "-I", "-", "--snapshot", keep_stdout=True, timeout=wip_save.EXEC_TIMEOUT_SECONDS,
+                                            stdin=wip_save.hook_source()).strip().splitlines()[-1])
+            if res.get("error"):
+                raise RuntimeError(str(res["error"]))
+            return "its work was saved" if res.get("saved") else "it had nothing new to save"
+        except Exception as e:
+            return "the pod cannot be exec'd: its work was not saved (%s)" % "".join(c if c.isprintable() else "?" for c in self.kube.scrub(e, 100))
+
+    def _wip_state(self, pod, worker):
+        """yes, no or unknown: whether <worker>/wip exists on the remote (one read with a fresh git token, as the pull request labels are made). Never raises."""
+        try:
+            repo = _pod_repo(pod)
+            check_repo_allowed(repo, self.env)
+            token = run_git_token_cmd(git_token_cmd(repo, self.env), repo, dict(os.environ, **self.env), register=lambda *v: self.kube.add_secrets(*v))
+            self.kube.add_secrets(token)
+            return "yes" if (getattr(self, "branch_exists", None) or github_branch_exists)(token, repo, worker + "/wip") else "no"
+        except Exception as e:
+            return "unknown (%s)" % "".join(c if c.isprintable() else "?" for c in self.kube.scrub(e, 100))
+
+    def _own_pod(self, pod):
+        """True only for a pod this rule may delete: a worker name, the pod named for it, a uid to bind the delete to, no StatefulSet owner, not already going."""
+        meta = pod.get("metadata") or {}
+        return (PERSISTENT_ANNOTATION not in (meta.get("annotations") or {}) and self._failed_name_fits(pod) and meta.get("name") == pod_name(ann(pod, "worker"))
+                and isinstance(meta.get("uid"), str) and bool(POD_UID_RE.fullmatch(meta["uid"])) and not meta.get("deletionTimestamp")
+                and not any(isinstance(r, dict) and r.get("kind") == "StatefulSet" for r in (meta.get("ownerReferences") or [])))
+
+    def _expire(self, pod, now):
+        """The expiry of a KEPT pod that ended (ask #2343): past its hard deadline by KEPT_GRACE_SECONDS it is saved once (best effort), said once in the
+        audit (kept-expired: the worker and whether <worker>/wip exists) and deleted with its two Secrets. False: not this pod's rule (the pass goes on
+        with it as before); else the report rows of the pass."""
+        try:
+            if not self._own_pod(pod):
+                return False
+            if (pod.get("status") or {}).get("phase") not in ("Failed", "Succeeded") or ann(pod, "kept") != "true":
+                return False
+            hard = self.hard_deadline(pod)
+            late = (now - hard).total_seconds()
+            name = pod["metadata"]["name"]
+        except (ValueError, TypeError, KeyError, AttributeError):
+            return False
+        if late <= KEPT_GRACE_SECONDS:
+            return False
+        worker = ann(pod, "worker")
+        said = self.__dict__.setdefault("expiry_said", {})   # the save and the wip read are made ONCE per pod, even when the delete must be tried again
+        key = (name, (pod.get("metadata") or {}).get("uid"))
+        if key not in said:
+            said[key] = (self._last_save(pod), self._wip_state(pod, worker))
+        saved, wip = said[key]
+        try:
+            self._remove(name, ann(pod, "run-id") or None, (pod.get("metadata") or {}).get("uid"))
+        except CloudError as e:
+            return [(worker, "kept pod not expired: " + self.kube.scrub(e, 120), e.code)]
+        self.audit(worker, "pod/" + name, KEPT_EXPIRED_ACTION, self._cost_or_zero(pod), True,
+                   "kept pod deleted %d hours after its hard deadline; %s/wip exists: %s; %s" % (int(late // 3600), worker, wip, saved))
+        return [(worker, "kept pod expired", 0)]
+
+    def _expire_unkept(self, pods, now):
+        """After the stops of the pass: a pod WITHOUT the kept mark that is still there UNKEPT_GRACE_SECONDS after its hard deadline is deleted with its
+        Secrets, whatever its phase (the stop had its turn). The pod is read again first: a pod that is gone, or another pod under the name, is left."""
+        out = []
+        for pod in pods:
+            try:
+                if not self._own_pod(pod) or ann(pod, "kept") == "true":
+                    continue
+                if (now - self.hard_deadline(pod)).total_seconds() <= UNKEPT_GRACE_SECONDS:
+                    continue
+                name, uid, worker = pod["metadata"]["name"], (pod.get("metadata") or {}).get("uid"), ann(pod, "worker")
+                have = self.kube.get_pod(name)
+                if not have or (have.get("metadata") or {}).get("uid") != uid or ann(have, "kept") == "true":
+                    continue
+                saved = self._last_save(have) if (have.get("status") or {}).get("phase") == "Running" else "the pod was not running: nothing to save"
+                self._remove(name, ann(pod, "run-id") or None, uid)
+                self.audit(worker, "pod/" + name, "expired", self._cost_or_zero(pod), True, "unkept pod deleted %d minutes after its hard deadline; %s" % (int((now - self.hard_deadline(pod)).total_seconds() // 60), saved), None, "hard")
+            except (ValueError, TypeError, KeyError, AttributeError):
+                continue
+            except CloudError as e:
+                out.append((ann(pod, "worker"), "expired pod not deleted: " + self.kube.scrub(e, 120), e.code))
         return out
 
     def hard_deadline(self, pod):
@@ -4405,6 +4522,10 @@ class Launcher:
         finally:
             steps["vanished"] = mono() - t0
         for pod in pods:
+            gone = self._expire(pod, now)   # a kept pod that ended and outlived its grace (ask #2343)
+            if gone is not False:
+                out.extend(gone)
+                continue
             ended = (pod.get("status") or {}).get("phase") in ("Failed", "Succeeded")
             if ended and ann(pod, "kept") == "true" and (ann(pod, "unreachable") == "true"
                                                          or ((pod.get("metadata") or {}).get("name"), (pod.get("metadata") or {}).get("uid")) in self.ended_tried):
@@ -4501,6 +4622,7 @@ class Launcher:
             except CloudError as e:
                 self.reap_results[worker] = dict(hook or {})
                 out[slot] = (worker, reason, e.code)
+        out.extend(self._expire_unkept(pods, now))   # ask #2343: an unkept pod still there ten minutes after its hard deadline
         out.extend(renewed)
         t0 = mono()
         try:
@@ -4524,6 +4646,7 @@ class Launcher:
             self.send_idle_nudges(live, now, acts)
         finally:
             steps["notes"] += mono() - t0   # the nudges are counted with the notes: both are the pass's sends
+        _stall("watch_pass", self, live, now, NAME_RE.fullmatch)   # #2399: one read of each pod older than 10 minutes; an alert only, never a stop
         try:
             out.extend(self.label_pod_prs(live, now))   # #2269: the pull requests a pod recorded get the labels its launch named
         except Exception as err:
@@ -5101,6 +5224,7 @@ SETTINGS = (
     ("CW_SECRET_DIR", False, "path"),               # the private directory (0700, under the home) of 0600 files named as the vault's secrets; the vault reads then read the files, no az
     ("CW_AZURE_CONFIG_DIR", False, "path"),        # the az sign-in directory every vault read of a launch uses (replaces the caller's AZURE_CONFIG_DIR); an absolute existing directory
     ("CW_COUNCIL_URL", False, "name"),             # the address of the Copilot bridge front (cloud/k8s/copilot-bridge.yaml) a worker pod is told as COUNCIL_MODEL_URL; an address, never a key
+    ("CW_LONG_RUN_DENY", False, "name"),           # 1 to 8 comma-separated shell patterns (letters, digits . - / _ * ?, each at most 80 characters): a worker pod refuses a foreground shell command matching one and lets it run through cw-run; operator settings only
 )
 SETTING_KINDS = {name: kind for name, _, kind in SETTINGS}
 SETTING_REQUIRED = tuple(name for name, required, _ in SETTINGS if required)
@@ -5275,6 +5399,7 @@ VALIDATORS = {
     "CW_SECRET_DIR": ("an absolute path of a directory under the home directory, with no .. segment", lambda v: _secret_files().dir_ok(v)),
     "CW_AZURE_CONFIG_DIR": ("an absolute path of an existing directory, with no .. segment", _dir_ok),
     "CW_COUNCIL_URL": ("an http or https URL: a host, an optional port, an optional /v1, no user, query or fragment", lambda v: bool(re.fullmatch(r"https?://[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?(?::[0-9]{1,5})?(?:/v1)?", v))),
+    "CW_LONG_RUN_DENY": ("1 to 8 comma-separated patterns of letters, digits, dot, dash, slash, underscore, * and ?, each at most 80 characters", lambda v: 1 <= len(v.split(",")) <= 8 and all(re.fullmatch(r"[A-Za-z0-9./_*?][A-Za-z0-9./_*?-]{0,79}", x) for x in v.split(","))),
 }
 _SETTING_LINE = re.compile(r"([A-Z][A-Z0-9_]*)=(.*)")
 
@@ -5406,6 +5531,99 @@ def apply_settings(env=None, path=None):
     if "CW_AZURE_CONFIG_DIR" in values:   # the settings sign-in replaces the caller's: every later vault read (the clean child environments, mint_env) sees this one
         env["AZURE_CONFIG_DIR"] = values["CW_AZURE_CONFIG_DIR"]
     return path
+
+
+_REAP_APPLIED = None   # set by main() when the real process applied the settings file: {name: value} the reaper applied; None means no reload
+_RELOAD_FIXED = ("CW_CLOUD_NAMESPACE", "CW_CLOUD_SERVER")   # cannot change mid-run: the lock, the namespace and the cluster login are made at the start
+
+
+def _settings_signature(path):
+    """(size, mtime_ns, sha256) of the file, or None when it cannot be read (apply_settings then names the reason)."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0))   # as _read_settings_file: a link or a pipe never blocks the pass
+    except OSError:
+        return None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > SETTINGS_FILE_MAX:
+            return None
+        with os.fdopen(fd, "rb", closefd=False) as f:
+            raw = f.read(SETTINGS_FILE_MAX + 1)
+        return (st.st_size, st.st_mtime_ns, hashlib.sha256(raw).hexdigest())
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+
+
+def reload_settings(env, applied, state, lock=None):
+    """With `lock` (the launcher's renew_lock) held, so the renewal thread never reads the environment half changed: see _reload_settings."""
+    if lock is None:
+        return _reload_settings(env, applied, state)
+    with lock:
+        return _reload_settings(env, applied, state)
+
+
+def _reload_settings(env, applied, state):
+    """Read the settings file again between two reaper passes. `applied` ({name: value} the reaper applied) is updated in place; `state` holds
+    the last signature and the last printed reason. Only a table setting whose value still equals the applied one is dropped before the read,
+    so apply_settings' clash rule is untouched and a value the caller set itself stays. A failure keeps every old value, prints one line
+    (the reason, never a value) when the reason differs from the last one printed, and never raises."""
+    names = [n for n, _, _ in SETTINGS]
+    before = {n: env[n] for n in names + ["AZURE_CONFIG_DIR"] if n in env}
+    try:
+        path = settings_path(env)
+        sig = _settings_signature(path)
+        if sig is not None and sig == state.get("sig"):
+            return
+        for n in names:
+            if n in applied and env.get(n) == applied[n]:
+                env.pop(n)
+        if applied.get("CW_AZURE_CONFIG_DIR") and env.get("AZURE_CONFIG_DIR") == applied["CW_AZURE_CONFIG_DIR"]:
+            env.pop("AZURE_CONFIG_DIR")
+        own = {n: env[n] for n in names if n in env}   # the caller's own values: apply_settings clears the table, these are put back
+        def restore():
+            for n in names + ["AZURE_CONFIG_DIR"]:
+                env.pop(n, None)
+            env.update(before)
+        try:
+            source = apply_settings(env, path)
+        except CloudError as e:
+            restore()
+            reason = scrub(e, (), 200)
+            if reason != state.get("reason"):
+                state["reason"] = reason
+                print("cloud-worker: settings file not reloaded: %s" % reason, file=sys.stderr)
+            return
+        if source == "environment":   # no file: the values stay as they were
+            restore()
+            return
+        for n, v in own.items():
+            env.setdefault(n, v)
+        held = []
+        for n in _RELOAD_FIXED:
+            if env.get(n) != before.get(n):
+                held.append(n)
+                if n in before:
+                    env[n] = before[n]
+                else:
+                    env.pop(n, None)
+        new = {n: env[n] for n in names if n in env and n not in own and (n not in held or n in applied)}
+        applied.clear()
+        applied.update(new)
+        state["sig"], state["reason"] = sig, None
+        if held:
+            line = "%s changed in the settings file: not applied until the reaper restarts" % ", ".join(held)
+            print("cloud-worker: settings file: %s" % line, file=sys.stderr)
+            state["reason"] = line
+    except Exception as e:   # a failed reload never ends the reaper
+        for n in names + ["AZURE_CONFIG_DIR"]:
+            env.pop(n, None)
+        env.update(before)
+        reason = "the reload failed (%s)" % type(e).__name__
+        if reason != state.get("reason"):
+            state["reason"] = reason
+            print("cloud-worker: settings file not reloaded: %s" % reason, file=sys.stderr)
 
 
 # -- stack-registry-check (ask #1022): runs on the operator's machine with the operator's own `az` login, BEFORE any pod exists. It only READS
@@ -5739,7 +5957,10 @@ def _reap_main(env, a, sleep, clock=None, refresher=None, kube=None, ticker_wait
         L = Launcher(kube, env, clock, sleep) if kube is not None else None
         ticker = None
         identity = code_identity(tree) if tree else START_IDENTITY
+        reload_state = {}
         while True:
+            if _REAP_APPLIED is not None:   # the settings file is read again at each pass (the same env the launcher and the ticker read)
+                reload_settings(env, _REAP_APPLIED, reload_state, getattr(L, "renew_lock", None))
             blocked = read_vault_block(env)
             if blocked is not None and time.time() < blocked[1]:   # the vault block (ask #1427): no pass, no az process, ONE log line
                 print("cloud-worker: reaper pass skipped: %s" % vault_block_line(blocked), file=sys.stderr)
@@ -5778,7 +5999,7 @@ def _reap_main(env, a, sleep, clock=None, refresher=None, kube=None, ticker_wait
             try:
                 work = L.reap() if L is not None else []   # the pass's own work: the workers' results
             finally:
-                print("cloud-worker: reaper pass line: cpu_seconds=%.3f audit_lines_parsed=%d%s" % (time.thread_time() - cpu0, tail_lines_parsed() - parsed0, step_text(getattr(L, "step_seconds", None))), file=sys.stderr)
+                print("cloud-worker: reaper pass line: cpu_seconds=%.3f audit_lines_parsed=%d%s" % (time.thread_time() - cpu0, tail_lines_parsed() - parsed0, _stall("pass_text", L) + step_text(getattr(L, "step_seconds", None))), file=sys.stderr)
             took = (clock() - began).total_seconds()
             if L is not None:
                 L.note_slow_pass(took)
@@ -5820,6 +6041,8 @@ def _reap_main(env, a, sleep, clock=None, refresher=None, kube=None, ticker_wait
 def main(argv=None, env=None, clock=None, sleep=time.sleep):
     explicit = env is not None
     env = os.environ if env is None else env
+    global _REAP_APPLIED
+    _REAP_APPLIED = None
     try:
         a = build_parser().parse_args(argv)
     except SystemExit as e:
@@ -5828,7 +6051,9 @@ def main(argv=None, env=None, clock=None, sleep=time.sleep):
         a.idle = DEFAULT_ORCHESTRATOR_IDLE if a.agent == "orchestrator" else DEFAULT_IDLE
     if not explicit:   # the real process reads the settings file; a caller that passes its own environment has made its own choice
         try:
+            pre = {n: env[n] for n, _, _ in SETTINGS if n in env}
             apply_settings(env)
+            _REAP_APPLIED = {n: env[n] for n, _, _ in SETTINGS if n in env and pre.get(n) != env[n]}   # only what the file gave is the reaper's to drop later
         except CloudError as e:
             print("cloud-worker: %s" % e, file=sys.stderr)
             return e.code

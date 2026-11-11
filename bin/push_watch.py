@@ -384,6 +384,8 @@ def run_pass(sb, engine, now, gh, config=None, launcher_audit=None):
             unsent = False
             for csha, c in batch:
                 if csha in b["told"] or csha in mem.get("told", []):   # told once per worker across its branches (ask #2153)
+                    if csha == sha and csha not in b["told"]:   # ask #2392: the tip of ANOTHER branch of the pod (the wip save held it first): said, not told again, so the end notice can name the branch
+                        engine.audit.append(engine.actor, "push_watch.seen", name, {"sha": csha[:8], "branch": _clean(branch, 100), "head": csha})
                     continue
                 b["told"] = (b["told"] + [csha])[-TOLD_MAX:]
                 text = item_text(name, branch, csha, dict(c, files=stats.get("files", c.get("files")), stats=stats.get("stats", c.get("stats"))) if len(batch) > 1 or prev else c)

@@ -689,6 +689,8 @@ def snapshot(workdir, worker, repo, ctx):
         wip = remote_head(net, url, branch, ctx)
         if wip:
             git(net, "fetch", "--no-tags", "-q", url, "refs/heads/" + branch + ":refs/cw/wip", ctx=ctx)
+        if not head and not wip:   # no commit yet and no earlier save: the commit would have no parent (a root); save nothing until the pod has a commit
+            return {"saved": False, "tree": tree, "wip_branch": branch, "note": "no commit yet: nothing saved"}
         parents = [x for x in dict.fromkeys([wip, head]) if x]
         same = bool(wip) and git(net, "rev-parse", "%s^{tree}" % wip, ctx=ctx).stdout.strip() == tree
         commit = wip

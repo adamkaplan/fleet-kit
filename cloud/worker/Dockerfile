@@ -26,17 +26,22 @@ RUN apt-get update && apt-get install -y --no-install-recommends make \
  && rm -rf /var/lib/apt/lists/*
 # ---- end #1165 ----
 
+# ask #2353: an init as the pod's first process (reaps orphans, forwards signals): the distribution's tini, no download.
+RUN apt-get update && apt-get install -y --no-install-recommends tini \
+ && rm -rf /var/lib/apt/lists/*
+
 # #2047: system libraries (and fonts for screenshots) of Playwright's headless Chromium shell, which exits 127 without them.
 RUN apt-get update && apt-get install -y --no-install-recommends libasound2t64 libatk-bridge2.0-0t64 libatk1.0-0t64 libatspi2.0-0t64 libcairo2 libcups2t64 libdbus-1-3 libdrm2 libfontconfig1 libfreetype6 libgbm1 libglib2.0-0t64 libnspr4 libnss3 libpango-1.0-0 libx11-6 libxcb1 libxcomposite1 libxdamage1 libxext6 libxfixes3 libxkbcommon0 libxrandr2 fonts-liberation fonts-noto-color-emoji fonts-unifont fonts-freefont-ttf \
  && rm -rf /var/lib/apt/lists/*
 
-# ---- #1165 identity: ONE system-level git file, written at image build (nothing at run time, nothing in the home directory) ----
-# The pair below is the ONE constant. A repository's own configured identity, and a local `git config user.name/user.email`,
-# still win over it (git's own order: system, then global, then local). The entrypoint exports no identity variable.
+# ---- #1165 identity: ONE root-owned read-only file written at image build; the entrypoint copies it into the global git file ----
+# The pair below is the ONE constant (line one: name, line two: email). The entrypoint sets user.name and user.email in the worker
+# user's global git configuration from this file, each only when unset. A repository's own configured identity, and a local
+# `git config user.name/user.email`, still win over it (git's own order: system, then global, then local). No identity variable is exported.
 ARG CW_DEFAULT_IDENT_NAME=cloud-worker
 ARG CW_DEFAULT_IDENT_EMAIL=cloud-worker@users.noreply.github.com
-RUN printf '[user]\n\tname = %s\n\temail = %s\n' "${CW_DEFAULT_IDENT_NAME}" "${CW_DEFAULT_IDENT_EMAIL}" > /etc/gitconfig \
- && chmod 0644 /etc/gitconfig
+RUN printf '%s\n%s\n' "${CW_DEFAULT_IDENT_NAME}" "${CW_DEFAULT_IDENT_EMAIL}" > /etc/cw-default-identity \
+ && chown root:root /etc/cw-default-identity && chmod 0444 /etc/cw-default-identity
 # ---- end #1165 identity ----
 
 # OpenCode v2: a pinned standalone binary (no node or npm), checked against its sha256 before it is unpacked.
@@ -62,6 +67,21 @@ RUN set -eu; case "$(dpkg --print-architecture)" in amd64) a=x64; h="${NODE_SHA2
  && chown -R root:root /opt/node && rm -f "/tmp/${f}"
 # ---- end Node runtime ----
 
+# ask #2383: Go, one pinned release, its sha256 pinned here, checked before it is unpacked (the form of the Node block above).
+# GO_VERSION and GO_SHA256 (of go${GO_VERSION}.linux-amd64.tar.gz) are the only constants; a bump updates both (cloud/README.md).
+# Root-owned /usr/local/go, not writable by others, linked into /usr/local/bin. The two test keys of the toolchain's sources are named in cloud/worker/scan-allowlist.txt.
+ARG GO_VERSION=1.27.4
+ARG GO_SHA256=7226736c2339719cda28fbf3a54d71aa63bcefe376e98cef00034268dab24840
+RUN curl -fsSL https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz -o /tmp/go.tgz \
+ && echo "${GO_SHA256}  /tmp/go.tgz" | sha256sum -c - \
+ && tar -C /usr/local -xzf /tmp/go.tgz \
+ && chown -R root:root /usr/local/go && chmod -R go-w /usr/local/go \
+ && ln -s /usr/local/go/bin/go /usr/local/bin/go && ln -s /usr/local/go/bin/gofmt /usr/local/bin/gofmt \
+ && rm /tmp/go.tgz
+# The pinned toolchain is the only one: no other toolchain is downloaded at run time.
+ENV GOTOOLCHAIN=local
+# ---- end Go ----
+
 # Non-root worker. It may start dockerd (and nothing else) as root: the daemon only
 # runs inside the Sysbox pod's own user namespace.
 RUN userdel -r ubuntu 2>/dev/null || true \
@@ -86,8 +106,10 @@ COPY worker/bin/cloud_cli.py /usr/local/bin/cw-cloud
 COPY worker/bin/cloud_client.py worker/bin/cloud_hub.py worker/bin/cloud_channel.py worker/bin/cloud_channel_server.py worker/bin/cloud_relay.py /usr/local/bin/
 COPY worker/cw-plan-check worker/plan_check.py /usr/local/bin/
 COPY worker/cw-stack-up /usr/local/bin/
-COPY worker/cw-shell-check /usr/local/bin/
-RUN chmod 0755 /usr/local/bin/cw-shell-check
+COPY worker/pod-hooks/pre-push /usr/local/lib/cw-hooks/pre-push
+RUN chown -R root:root /usr/local/lib/cw-hooks && chmod 0755 /usr/local/lib/cw-hooks /usr/local/lib/cw-hooks/pre-push
+COPY worker/cw-shell-check worker/cw-run /usr/local/bin/
+RUN chmod 0755 /usr/local/bin/cw-shell-check /usr/local/bin/cw-run
 RUN chmod 0755 /usr/local/bin/start-dockerd /usr/local/bin/cw-stack-pull /usr/local/bin/worker-entrypoint \
       /usr/local/bin/cw-end-hook /usr/local/bin/cw-prestop /usr/local/bin/cw-token-mint /usr/local/bin/cw-worker-activity \
       /usr/local/bin/cw-gh /usr/local/bin/cw-probe-reach /usr/local/bin/cw-plan-check /usr/local/bin/cw-cloud \
@@ -105,7 +127,7 @@ RUN chown -R root:root /opt/cloud && chmod 0755 /opt/cloud /opt/cloud/launcher &
 USER worker
 WORKDIR /home/worker
 EXPOSE 4096
-ENTRYPOINT ["/usr/local/bin/worker-entrypoint"]
+ENTRYPOINT ["/usr/bin/tini", "-g", "--", "/usr/local/bin/worker-entrypoint"]
 # The launcher sets OPENCODE_SERVER_PASSWORD at run time; it is never in the image.
 CMD ["opencode", "serve", "--hostname", "0.0.0.0", "--port", "4096"]
 
@@ -120,12 +142,12 @@ ARG PG_VERSION=16.15
 ARG PG_SHA256=c1575341fa7bd40f5274ea465b34390f4dc64cdd0770af327005caaeb9f6b7ed
 ARG PGVECTOR_VERSION=0.8.7
 ARG PGVECTOR_COMMIT=f37c13f68b57d2c3472b2214fbcff699d6d34876
-ARG PGMQ_VERSION=1.13.1
-ARG PGMQ_COMMIT=8eab18272e50077ab9f72d9787296655f2849dcc
+ARG PGMQ_VERSION=1.13.0
+ARG PGMQ_COMMIT=32c075bb6dbed66a303d1a792393c93e36c09a97
 RUN set -eu; curl -fsSL "https://ftp.postgresql.org/pub/source/v${PG_VERSION}/postgresql-${PG_VERSION}.tar.bz2" -o /tmp/pg.tar.bz2 \
  && echo "${PG_SHA256}  /tmp/pg.tar.bz2" | sha256sum -c - \
  && mkdir -p /src/pg && tar -xjf /tmp/pg.tar.bz2 -C /src/pg --strip-components=1 && rm /tmp/pg.tar.bz2 \
- && cd /src/pg && ./configure --prefix=/opt/pg --without-readline --without-icu --without-zlib --without-openssl \
+ && cd /src/pg && ./configure --prefix=/opt/pg --without-readline --without-icu --without-zlib --with-openssl \
  && make -j"$(nproc)" && make install
 RUN set -eu; git clone --filter=blob:none https://github.com/pgvector/pgvector /src/pgvector \
  && cd /src/pgvector && git checkout --detach "${PGVECTOR_COMMIT}" \
@@ -135,6 +157,7 @@ RUN set -eu; git clone --filter=blob:none https://github.com/pgmq/pgmq /src/pgmq
  && cd /src/pgmq && git checkout --detach "${PGMQ_COMMIT}" \
  && test "$(git rev-parse HEAD)" = "${PGMQ_COMMIT}" \
  && cd pgmq-extension && make PG_CONFIG=/opt/pg/bin/pg_config && make PG_CONFIG=/opt/pg/bin/pg_config install
+RUN set -eu; make -C /src/pg/contrib/pg_trgm PG_CONFIG=/opt/pg/bin/pg_config && make -C /src/pg/contrib/pg_trgm PG_CONFIG=/opt/pg/bin/pg_config install
 # ---- end #1353 PostgreSQL build stage ----
 
 # ---- build-time secret scan (the stages below the line "FROM worker AS scan" are reused by cloud/tests/test-cloud) ----
@@ -159,17 +182,20 @@ FROM worker AS final
 COPY --from=scan /scan-ok /usr/local/share/cw/scan-ok
 # #1353: PostgreSQL 16 and the two extensions, installed files only (root-owned, no compiler, nothing starts them): see the pgbuild stage.
 COPY --from=pgbuild /opt/pg /opt/pg
-# ask #2329: /opt/pg-bundle, the Debian-style tree that scripts/dev/ephemeral-pg.sh reads through PG_BUNDLE, built by COPIES (cp -a) of /opt/pg:
+# ask #2329: the bundle, the Debian-style tree that scripts/dev/ephemeral-pg.sh reads (now from the cache directory), built by COPIES (cp -a) of /opt/pg:
 # no download, no build tool, no server started. The relocatable build resolves share beside bin, so /opt/pg/share/postgresql is also
 # copied to usr/lib/postgresql/16/share/postgresql. Root-owned, read-only for others; the run user is unchanged (set again below).
 USER root
-RUN set -eu; b=/opt/pg-bundle; l="$b/usr/lib/postgresql/16"; e="$b/usr/share/postgresql/16/extension"; s=/opt/pg/share/postgresql \
+# ask #2367: the bundle lives in the land tool's bundle cache directory under /home/worker/.cache (the path its bundle script uses when no variable is set),
+# so the image sets no PG* variable. The directory name is a REQUIRED build argument (no default): the operator passes --build-arg CW_BUNDLE_CACHE_NAME=<name>.
+ARG CW_BUNDLE_CACHE_NAME
+RUN test -n "$CW_BUNDLE_CACHE_NAME"
+RUN set -eu; b="/home/worker/.cache/${CW_BUNDLE_CACHE_NAME}"; l="$b/usr/lib/postgresql/16"; e="$b/usr/share/postgresql/16/extension"; s=/opt/pg/share/postgresql \
  && mkdir -p "$l" "$e" \
  && cp -a /opt/pg/bin /opt/pg/lib "$l/" \
  && cp -a /opt/pg/share "$l/share" \
- && cp -a "$s"/extension/vector.control "$s"/extension/vector--*.sql "$s"/extension/pgmq.control "$s"/extension/pgmq--*.sql "$e/" \
+ && cp -a "$s"/extension/vector.control "$s"/extension/vector--*.sql "$s"/extension/pgmq.control "$s"/extension/pgmq--*.sql "$s"/extension/pg_trgm.control "$s"/extension/pg_trgm--*.sql "$e/" \
  && cp -a "$s/postgresql.conf.sample" "$b/usr/share/postgresql/postgresql.conf.sample" \
- && chown -R root:root "$b" && chmod -R go-w,a+rX "$b"
-ENV \
-  PG_BUNDLE=/opt/pg-bundle
+ && chown -R root:root "$b" && chmod -R go-w,a+rX "$b" \
+ && chown worker:worker /home/worker/.cache
 USER worker

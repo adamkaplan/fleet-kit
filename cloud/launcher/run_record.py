@@ -47,6 +47,10 @@ SECRET_FILES_MAX = 10
 RECORD_SECONDS = 90.0            # the default overall deadline of the record phase (less than half of the 600 s stop)
 RECORD_SECONDS_MAX = 240.0       # the hard maximum: CW_RECORD_SECONDS above it is cut to it
 CHUNK = 64 * 1024
+RESULTS_KEEP = 4000              # characters of the pod's /work/results.txt kept in run.json (ask #2392): the end of the file
+RESULTS_READ = 16000             # bytes read to be scrubbed first
+# the worker owns the file, and `tail` follows a link: refuse anything but a regular file BEFORE reading ($1 the path, $2 the byte window; as cloud_worker.REPORT_READ)
+RESULTS_SCRIPT = 'if [ -L "$1" ] || { [ -e "$1" ] && [ ! -f "$1" ]; }; then echo "not a regular file" >&2; exit 3; fi; tail -c "$2" "$1"'
 TIMED_OUT = "record timed out"
 
 
@@ -149,7 +153,7 @@ def write_private(directory, name, text):
 class Recorder:
     def __init__(self, kube, env, clock=time.monotonic):
         self.kube, self.env, self.clock = kube, env, clock
-        self.deadline = None
+        self.deadline, self.secrets_ok = None, False
 
     def left(self):
         """Seconds of the record phase that remain; raises RecordTimeout when none. No deadline set: effectively none."""
@@ -169,21 +173,28 @@ class Recorder:
     def _learn_secrets(self, pod):
         """Register the pod's run secrets (so the scrub knows them) and return the server password."""
         password = ""
+        self.secrets_ok = True   # ask #2392: False once a secret could not be learned: the pod's results file is then not kept (its scrub could miss a plain secret)
         try:
-            names = [n for n in self._exec(pod, "ls", "-1", "/run/cw").split()
-                     if re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", n)][:SECRET_FILES_MAX]
+            listed = self._exec(pod, "ls", "-1", "/run/cw").split()
+            names = [n for n in listed if re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", n)][:SECRET_FILES_MAX]
+            self.secrets_ok = len(names) == len(listed)   # a name skipped (its shape, or over the limit) is a secret not learned
         except RecordTimeout:
             raise
         except Exception:
             self.left()   # a call cut by the deadline is a timeout, not "no secrets"
             names = []
+            self.secrets_ok = False
         for n in names:
             try:
-                text = self._exec(pod, "cat", "/run/cw/" + n)[:1024 * 1024]
+                text = self._exec(pod, "cat", "/run/cw/" + n)
+                if len(text) > 1024 * 1024:
+                    self.secrets_ok = False   # cut below: a secret that long is not learned whole
+                text = text[:1024 * 1024]
             except RecordTimeout:
                 raise
             except Exception:
                 self.left()
+                self.secrets_ok = False
                 continue
             if n == "model-auth":
                 self.kube.add_secrets(text.strip())   # the model entry never leaves (open choice b)
@@ -321,6 +332,28 @@ class Recorder:
         sha = (out.strip().splitlines() or [""])[0]
         return sha if re.fullmatch(r"[0-9a-f]{40}", sha) else None
 
+    def results_file(self, pod):
+        """{"done": bool, "text": the scrubbed last RESULTS_KEEP characters} of the pod's /work/results.txt, or None when it has none, is not a regular file or cannot be read. `done`: the last
+        non-empty line is exactly `STATUS: done` (the idle nudge's own test). Never raises an Exception."""
+        try:   # not keep_stdout: a refused read (a link, a FIFO) is an error, not a result
+            out = self._exec(pod, "sh", "-c", RESULTS_SCRIPT, "sh", "/work/results.txt", str(RESULTS_READ))
+        except RecordTimeout:
+            return None
+        except Exception:
+            return None
+        if not isinstance(out, str) or not out.strip():
+            return None
+        lines = [x.strip() for x in out.splitlines() if x.strip()]
+        try:
+            # the scrub turns every control character to `?`: the line breaks go through it as a printable mark that is not in the text (so a secret spread over lines is still
+            # seen), and come back; the limit is above any growth of the redaction, so the cut that follows keeps the END of the file
+            mark = next(m for m in ("[NL]", "[N1]", "[N2]", "[N3]") if m not in out)
+            marked = out.replace("\n", mark)
+            text = self.kube.scrub(marked, limit=2 * len(marked) + 100).replace(mark, "\n")
+        except Exception:
+            return None
+        return {"done": bool(lines) and lines[-1] == "STATUS: done", "text": text[-RESULTS_KEEP:]}
+
     def record(self, worker, pod, reason, repo="", started="", root=None, persistent=False):
         """Save the run's record. Returns the record directory ('' when none could be made). Never raises an Exception."""
         run_id = "%s-%s-%s" % (worker, time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()), secrets.token_hex(3))
@@ -343,6 +376,9 @@ class Recorder:
                     self._write_transcript(directory, msgs, info)
             finally:
                 info["head_sha"] = self.head_sha(pod)
+                found = self.results_file(pod) if getattr(self, "secrets_ok", False) else None   # ask #2392: the pod's /work/results.txt, kept for the end notice and `read` of an ended pod
+                if found is not None:
+                    info["results"] = found
         except Exception as e:   # includes RecursionError and MemoryError; an interrupt (BaseException) passes through
             try:
                 info["reason"] = "the record could not be written: %s" % self.kube.scrub(e, limit=200)
