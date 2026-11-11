@@ -46,9 +46,15 @@ def default_settings(env):
 def check_settings(path):
     """The file's bytes, or Refused: missing, not a regular file, not owned by the user, mode wider than 0600, linked twice, or no single image line."""
     try:
-        st = os.lstat(path)
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)   # one open: the checks and the read are of the same file
     except OSError:
-        raise Refused("the settings file %s is missing" % path)
+        raise Refused("the settings file %s is missing or is a link" % path)
+    with os.fdopen(fd, "rb") as f:
+        return _checked(path, f)
+
+
+def _checked(path, f):
+    st = os.fstat(f.fileno())
     if not stat.S_ISREG(st.st_mode):
         raise Refused("the settings file %s is not a regular file" % path)
     if st.st_uid != current_uid():
@@ -58,8 +64,7 @@ def check_settings(path):
     if st.st_nlink != 1:
         raise Refused("the settings file %s has more than one hard link" % path)
     try:
-        with open(path, "rb") as f:
-            data = f.read()
+        data = f.read()
     except OSError:
         raise Refused("the settings file %s cannot be read" % path)
     if sum(1 for line in data.split(b"\n") if line.startswith(SETTING)) != 1:
@@ -123,17 +128,17 @@ def apply(path, data, new_bytes, now):
         raise
     with open(path, "rb") as f:
         if f.read() != new_bytes:
-            raise Refused("the settings file did not read back as written; the backup is %s" % backup)
+            raise Refused("the settings file did not read back as written (it was replaced); restore it from the backup %s" % backup)
     return backup
 
 
 def roll(args, env, now=None):
-    m = SOURCE_RE.match(args.source)
+    m = SOURCE_RE.fullmatch(args.source)
     if not m:
         raise Refused("the source must be a reference by digest, NAME@sha256:<64 lowercase hex>")
-    if not REGISTRY_RE.match(args.registry) or "@" in args.registry:
+    if not REGISTRY_RE.fullmatch(args.registry) or "@" in args.registry:
         raise Refused("the destination registry is not a plain registry path")
-    if not TAG_RE.match(args.tag):
+    if not TAG_RE.fullmatch(args.tag):
         raise Refused("the tag is not a valid image tag")
     want = "sha256:" + m.group(1)
     path = args.settings or default_settings(env)
@@ -149,12 +154,14 @@ def roll(args, env, now=None):
     seen = got.stdout.decode("utf-8", "replace").strip()
     if not seen:
         raise Refused("the destination digest is empty; nothing was changed")
-    if not DIGEST_RE.match(seen) or seen != want:
+    if not DIGEST_RE.fullmatch(seen) or seen != want:
         raise Refused("the destination digest differs from the source digest; nothing was changed")
     new_value = "%s@%s" % (args.registry, want)
     old, new = old_digest(data), want[len("sha256:"):][:12]
     if args.dry_run:
         return ["dry run: would change CW_CLOUD_IMAGE in %s from %s to %s (new setting %s); nothing was changed" % (path, old, new, new_value)]
+    if check_settings(path) != data:   # the copy can take minutes: an edit made meanwhile is not overwritten
+        raise Refused("the settings file %s changed during the copy; nothing was changed" % path)
     backup = apply(path, data, replace_line(data, new_value), now or datetime.datetime.now())
     return ["CW_CLOUD_IMAGE changed from %s to %s" % (old, new), "backup: %s" % backup]
 

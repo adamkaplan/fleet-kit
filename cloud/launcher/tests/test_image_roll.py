@@ -151,6 +151,41 @@ class Refusals(Base):          # S2, S3, S5
         self.assertNotEqual(code, 0)
 
 
+class Hardening(Base):
+    def test_newline_ending_arguments_are_refused(self):
+        module = load()
+        before = self.state()
+        for argv in ([SRC + "\n", "dest.example/x", "v1"], [SRC, "dest.example/x\n", "v1"], [SRC, "dest.example/x", "v1\n"]):
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                code = module.main(argv + ["--settings", self.settings], {"CRANE": self.crane, "CRANE_LOG": self.log})
+            self.assertNotEqual(code, 0, argv)
+        self.assertEqual((self.copies(), self.state(), self.backups()), ([], before, []))
+
+    def test_an_edit_made_during_the_copy_is_refused(self):
+        module = load()
+        real = module.run_crane
+
+        def edit_after_copy(tool, args, env, what, timeout):
+            out = real(tool, args, env, what, timeout)
+            if args[0] == "copy":
+                with open(self.settings, "a") as f:
+                    f.write("\nCW_EXTRA=1\n")
+            return out
+        module.run_crane = edit_after_copy
+        code, out, err = self.run_cmd(module)
+        self.assertNotEqual(code, 0)
+        self.assertIn("changed during the copy", err)
+        self.assertEqual(self.backups(), [])
+
+    def test_a_symlinked_settings_file_is_refused(self):
+        link = os.path.join(self.dir, "link.env")
+        os.symlink(self.settings, link)
+        code, out, err = self.run_cmd(path=link)
+        self.assertNotEqual(code, 0)
+        self.assertEqual(self.copies(), [])
+
+
 class Success(Base):           # S4
     def test_s4_only_the_image_line_changes_and_one_backup_exists(self):
         old_bytes = Path(self.settings).read_bytes()
