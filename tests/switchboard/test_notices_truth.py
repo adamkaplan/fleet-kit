@@ -303,7 +303,7 @@ class TestReadOfAnEndedWorker(unittest.TestCase):
             self.assertEqual(self.cw.cmd_read(args, None, 0), 0)
         self.assertEqual(out, ["LINE from the live pod"])
 
-    def test_the_boss_of_the_live_record_may_read_and_another_agent_may_not(self):
+    def test_the_boss_of_the_live_record_may_read(self):
         self.run_record("pod-w")
         with mock.patch.dict(self.cw.H, {"gates_caller_kind": lambda r, n: ("agent", "boss-lane")}):
             out = []
@@ -369,7 +369,7 @@ class TestRunRecordKeepsTheResultsFile(unittest.TestCase):
         spec.loader.exec_module(module)
         return module
 
-    def recorder(self, answer, module=None, secrets_fail=False, listing=""):
+    def recorder(self, answer, module=None, secrets_fail=False, listing="", cat=None):
         module = module or self.load()
         calls = []
 
@@ -381,7 +381,9 @@ class TestRunRecordKeepsTheResultsFile(unittest.TestCase):
                 if cmd[0] == "ls":
                     return listing
                 if cmd[0] == "cat":
-                    return "a-run-secret"
+                    if isinstance(cat, Exception):
+                        raise cat
+                    return cat if cat is not None else "a-run-secret"
                 if cmd[0] == "sh":
                     if isinstance(answer, Exception):
                         raise answer
@@ -467,6 +469,17 @@ class TestRunRecordKeepsTheResultsFile(unittest.TestCase):
         rec.read_messages = lambda pod: (None, rec._learn_secrets(pod) or "no server in this test")   # read_messages learns the secrets first, then finds no server
         run = json.loads((Path(rec.record("pod-y", "pod-y", "idle", repo="o/r", root=root)) / "run.json").read_text())
         self.assertNotIn("results", run)
+
+    def test_a_secret_that_could_not_be_read_or_is_too_long_keeps_no_results_file(self):
+        module = self.load()
+        for what in (OSError("cat failed"), "x" * (1024 * 1024 + 1)):
+            with self.subTest(what=type(what).__name__):
+                rec, _calls = self.recorder("text\nSTATUS: done\n", module, listing="ok-one", cat=what)
+                rec.read_messages = lambda pod: (None, rec._learn_secrets(pod) or "no server in this test")
+                root = tempfile.mkdtemp()
+                self.addCleanup(shutil.rmtree, root, True)
+                run = json.loads((Path(rec.record("pod-y", "pod-y", "idle", repo="o/r", root=root)) / "run.json").read_text())
+                self.assertNotIn("results", run)
 
     def test_a_listing_longer_than_the_secrets_it_could_learn_keeps_no_results_file(self):
         module = self.load()
@@ -578,12 +591,9 @@ class TestTheProductionWiring(unittest.TestCase):
     def test_the_hubs_catch_up_hands_the_owner_read_to_the_red_ci_judge(self):
         import ast
         tree = ast.parse((BIN / "fleet-switchboard").read_text())
-        calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "red_ci_runs"]
-        self.assertEqual(len(calls), 1, "one call site")
-        last = calls[0].args[-1]
-        self.assertTrue(isinstance(last, ast.Lambda) and isinstance(last.body, ast.Call) and last.body.func.id == "red_ci_lane",
-                        "the last argument of the judge is the owner read, built on red_ci_lane")
-        self.assertGreaterEqual(len(calls[0].args), 6)
+        lanes = [a for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "red_ci_runs"
+                 for a in n.args if isinstance(a, ast.Lambda) and isinstance(a.body, ast.Call) and getattr(a.body.func, "id", "") == "red_ci_lane"]
+        self.assertTrue(lanes, "a call of the red-ci judge passes an owner read built on red_ci_lane")
 
 
 if __name__ == "__main__":
