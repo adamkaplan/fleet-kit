@@ -192,12 +192,14 @@ class TestForwarderHooks(Base):
         self.assertEqual(removing.deleted(), [], "S4 control (removal): none is tried, so none fails")
         self.assertEqual([a for a in self.audit if a[0] == "github.hooks"], [])
 
-    def test_a_start_after_a_conflict_removes_nothing(self):
+    def test_a_start_after_a_conflict_removes_inactive_hooks_only(self):
         runner = HooksRunner(self.stale_world())
         hub = self.build(runner)
         hub.watches[REPO].state = "conflict"
         hub.tick()
-        self.assertEqual(runner.deleted(), [], "another forwarder's hook looks stale: a retry after a conflict never removes it")
+        inactive = {h["id"] for h in self.stale_world() if not h["active"] and h["name"] == "cli" and h["config"]["url"] == URL}
+        self.assertTrue(inactive)
+        self.assertEqual(set(runner.deleted()), inactive, "another forwarder's live (active) hook looks stale: after a conflict only inactive hooks go")
 
     def test_a_stop_before_the_hook_exists_removes_nothing_and_a_gone_claim_is_not_deleted(self):
         runner = HooksRunner([hook(1)])
@@ -267,7 +269,8 @@ class TestForwarderHooks(Base):
         watch = hub.watches[REPO]
         watch.state, watch.conflicted = "backoff", True   # a conflict, then a retry that failed for another reason
         hub.tick()
-        self.assertEqual(runner.deleted(), [])
+        self.assertTrue(all(not h["active"] for h in self.stale_world() if h["id"] in runner.deleted()), "no active hook after a conflict")
+        self.assertTrue(runner.deleted())
         hub.tick()
         self.at[0] += sb.GITHUB_CATCHUP_DELAY + 1
         hub.tick()   # our child ran past the connect delay: nobody else holds the hook

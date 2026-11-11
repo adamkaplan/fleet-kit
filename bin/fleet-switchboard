@@ -11764,12 +11764,12 @@ class GitHubHub:
         of them are stale (a forwarder of another daemon on the same repo cannot be told apart: its hook looks the same; one daemon per repo is the supported setup, and
         the other forwarder, when it drops, finds that out through its own start). Never raises; a failure is the note and one audit line."""
         watch.hooks_before, watch.hook_id, watch.hook_claim_tried = None, None, False
-        if watch.state == "conflict" or watch.conflicted:
-            return   # someone else forwards, by intent: its hook looks like a stale one, so a retry after a conflict removes nothing
+        # after a conflict someone else may forward, by intent: its live hook is active and looks like a stale one, so only INACTIVE hooks (never a live forwarder's) are removed then
+        only_inactive = watch.state == "conflict" or watch.conflicted
         found = {}
         try:
             found = self._forwarder_hooks(watch.repo, env)
-            for hook_id in sorted(found)[:GITHUB_HOOK_REMOVALS]:
+            for hook_id in [h for h in sorted(found) if not (only_inactive and found[h])][:GITHUB_HOOK_REMOVALS]:
                 self._remove_hook(watch.repo, env, hook_id)
                 found.pop(hook_id)
         except Exception as err:
