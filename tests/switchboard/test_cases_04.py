@@ -2149,3 +2149,80 @@ class TestEndTickWithoutStateDirectory(unittest.TestCase):
         engine = types.SimpleNamespace(audit=None, actor="daemon", now=time.time)
         self.assertFalse(hasattr(engine, "state_dir"))
         self.assertEqual(sb.cloud_end_tick(engine, None), [])
+
+
+class TestUnreadLabelsAreNotAHeldReading(Base):
+    """(#2379) The labels of a pull request that could not be read are not "not held". The REAL sweep board (`sweep_gate_reading` over the real
+    `_ledger_context` and `pr_picture`; only gh, the gate evaluation and the who-clears answer are faked) says so, and `pr-explain --check` keeps
+    the held-body defects for such a pull request."""
+    HEAD = "c" * 40
+
+    def setUp(self):
+        super().setUp()
+        self.world = World(self, agents=(), config={"github_repos": ["acme/api"]})
+        self.engine = self.world.engine
+        self.engine.discover(self.world.clock.now())
+        self.board = {"gates": [{"gate": "G6", "status": "open"}], "ready": False}
+
+    def reading(self, labels):
+        """sweep_gate_reading of acme/api#600 whose `gh pr view` answers with this `labels` value (an absent key when it is the string "absent")."""
+        pr = dict(json.loads(pr_view_json(headRefOid=self.HEAD, body="no plan line here\n")), labels=labels)
+        if labels == "absent":
+            del pr["labels"]
+
+        def gh(args, **kw):
+            assert args[1:3] == ["pr", "view"], "only the read of the pull request: %r" % (args,)
+            return subprocess.CompletedProcess(args, 0, json.dumps(pr), "")
+        self.engine.gh_runner = gh
+        stack = contextlib.ExitStack()
+        who = {"who": "owner only", "floor_ids": [], "owner_only": [{"why": "x"}], "threshold": None, "min_rating": None}
+        for name, value in (("enforced_gates_of", lambda c: ["G6"]), ("clear_who", lambda *a, **k: who)):
+            stack.enter_context(mock.patch.object(sb, name, value))
+        stack.enter_context(mock.patch.object(sb.plan_ledger, "evaluate_gates", lambda *a, **k: self.board))
+        with stack:
+            return sb.sweep_gate_reading(self.engine, "acme/api", 600, self.world.clock.now())
+
+    def test_the_sweep_board_does_not_read_a_pull_request_whose_labels_could_not_be_read(self):
+        for labels in (None, "absent", "merge-captain"):   # null, no key, and a value that is not a list
+            with self.subTest(labels=labels):
+                self.assertEqual(self.reading(labels), (None, None, None, "the labels could not be read"))
+
+    def test_the_sweep_board_reads_a_pull_request_whose_labels_were_read_even_when_there_are_none(self):
+        opened, head, who, why = self.reading([])   # the control: readable labels, none of them a hold
+        self.assertEqual((opened, head, why), (["G6"], self.HEAD, None))
+        self.assertIn("Who can clear", who)
+        opened, head, who, why = self.reading([{"name": "me:merge-captain"}])
+        self.assertEqual((opened, head, why), (["G6"], self.HEAD, None))
+
+    def test_pr_explain_check_keeps_the_held_body_defects_when_the_labels_are_unreadable(self):
+        body = "PLAN: https://example.test/acme/api/issues/9\n\n" + sb.explainer_block("old", "new") + "\nNothing here is a held top.\n"
+        self.assertTrue(sb.held_defects(body), "the body has no held sections")
+        got = {}
+        for name, labels in (("none", None), ("missing", "absent"), ("empty", []), ("captain", [{"name": "me:merge-captain"}])):
+            got[name] = self.check(body, labels)
+        for name in ("none", "missing", "captain"):
+            self.assertEqual(got[name][0], 1, name)
+            for defect in sb.held_defects(body):
+                self.assertIn("DEFECT: %s" % defect, got[name][1], name)
+        self.assertEqual(got["empty"], (0, "explainer: PASS\n"), "readable labels with no hold: a body that is not held is not judged as held")
+
+    def check(self, body, labels):
+        pr = dict(json.loads(pr_view_json(body=body)), labels=labels, files=[])
+        if labels == "absent":
+            del pr["labels"]
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+
+        def route(args, **kw):
+            if args[0] == FAKE_GH or args[0].endswith("gh"):
+                assert args[1:3] == ["pr", "view"], "pr-explain only reads: %r" % (args,)
+                return subprocess.CompletedProcess(args, 0, json.dumps(pr), "")
+            return self.world.route(args, **kw)
+        with captured() as (out, err):
+            code = sb.main(["pr-explain", "acme/api#7", "--check"], runner=route, now=self.world.clock.now)
+        return code, out.getvalue()
+
+    def test_two_merge_labels_are_held_and_disagree(self):
+        names = [{"name": "me:merge-captain"}, {"name": "me:merge-automatic"}]
+        state = sb.pr_marker_state(names, "x")
+        self.assertEqual((state["captain"], state["findings"]), (True, ["disagree"]))
+        self.assertTrue(sb.is_captain({"labels": names, "body": "x"}))

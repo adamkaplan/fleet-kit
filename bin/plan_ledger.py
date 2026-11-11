@@ -1026,7 +1026,7 @@ def evaluate_gates(plan, entries, ledger_problem, facts, pr, now=None):
                                                       % ("; ".join(floor.get("reasons") or []) or "hold")])
             # (#2379) the merge-captain label is the only hold signal: a body line without it is a PR that is not held, so there is no
             # 'marker without a hold' wording any more.
-            elif (facts or {}).get("captain") is None:   # the labels (or the fact itself) were not readable: not "not held" (#2379)
+            elif labels_unread(facts):   # the labels (or the fact itself) were not readable: not "not held" (#2379)
                 row.update(status="waiting", missing=["labels could not be read: whether the PR is held for the owner is not known, so it is NOT READY"])
             elif (facts or {}).get("captain"):
                 row.update(status="waiting", missing=["held for the owner (merge-captain label): the owner decides, through cos"])
@@ -1180,6 +1180,11 @@ REQUIRED_FOR = {"ready": ("G0a", "G1"), "merge": ("G0a", "G0c", "G1", "G4", "G6"
 DEFAULT_ENFORCED = ("G0a", "G1")   # the gates a repo in `enforce` refuses on unless its `enforce_gates` says otherwise
 ENFORCEABLE = ("G0a", "G0c", "G1", "G4", "G6", "G6b")
 EXIT_ALLOW, EXIT_REFUSE, EXIT_FAIL_OPEN = 0, 10, 3   # only EXIT_REFUSE refuses; every other exit is an allow
+
+
+def labels_unread(facts):
+    """(#2379) True when the labels of a pull request could not be read: its facts carry no `captain` reading (None, or the key absent). Held or not is then unknown, never "not held"."""
+    return (facts or {}).get("captain") is None
 
 
 def normal_repo(name):

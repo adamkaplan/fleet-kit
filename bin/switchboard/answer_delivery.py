@@ -208,7 +208,7 @@ def escalate_notice(engine, runner, decision, reason, name):
             ident, repo, number, _one_line(str(err), 120))) from None
     if facts.get("state") != "open":
         raise DecisionError("%s: the pull request is %s, so there is nothing to escalate (a notice ends then)" % (ident, facts.get("state") or "not open"))
-    if facts.get("captain") is None:   # (#2379) labels unreadable: not "information only"
+    if plan_ledger.labels_unread(facts):   # (#2379) labels unreadable: not "information only"
         raise DecisionReadError("%s: the labels of %s#%d could not be read, so whether it is held is not known: nothing was changed" % (ident, repo, number))
     if not facts.get("captain") or not facts.get("head"):
         raise DecisionError("%s is a PR notice: information only, so nothing was escalated. It becomes a decision when the pull request carries the merge hold "
