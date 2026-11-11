@@ -168,6 +168,7 @@ class TestLandCompletion(Case):
         self.engine.config = {"land_repos": ["janus-infra/*"]}
         self.engine.report = lambda sender, state, text, *a, **k: (self.reports.append((sender, state, text)), {"sent": True})[1]
         self.ns.is_land_repo = land_module().is_land_repo
+        self.ns.reported_text = lambda worker: "landed %s landed %s" % (SHA, "f" * 40)   # ask #2393: a pod's own landing is the sha it reported (or a patch id of its branch)
         self.engine.cloud_watch = {"records": [record("w-a", "lane-a", "janus-infra/widget")]}
         gh = self.world.__call__
         self.paths = []
@@ -216,10 +217,10 @@ class TestLandCompletion(Case):
     def test_u1_two_live_workers_in_one_repository_complete_only_the_one_the_message_names(self):
         self.engine.cloud_watch = {"records": [record("w-a", "lane-a", "janus-infra/widget"), record("w-b", "lane-b", "janus-infra/widget")]}
         self.launcher_line(worker="w-b", action="create")
+        self.ns.reported_text = lambda worker: "landed %s" % SHA if worker == "w-b" else None   # ask #2393: only w-b owns it
         self.main = [self.land(SHA, "Add the widget\n\nLand-worker: w-b")]
         self.run_pass(NOW)
         self.assertEqual([r[0] for r in self.reports], ["w-b"])
-        self.assertTrue([l for l in self.engine.audit.lines if l[0] == "push_watch.land_ambiguous"])
 
     def test_a_failed_report_is_not_marked_and_is_tried_again(self):
         self.engine.report = lambda *a, **k: {"sent": False}
@@ -254,6 +255,7 @@ class TestLandCompletion(Case):
     def test_a_worker_name_inside_a_longer_name_is_not_a_match(self):
         self.engine.cloud_watch = {"records": [record("w-a", "lane-a", "janus-infra/widget"), record("w-ab", "lane-b", "janus-infra/widget")]}
         self.launcher_line(worker="w-ab", action="create")
+        self.ns.reported_text = lambda worker: "landed %s" % SHA if worker == "w-ab" else None   # ask #2393
         self.main = [self.land(SHA, "x\n\nLand-worker: w-ab")]
         self.run_pass(NOW)
         self.assertEqual([r[0] for r in self.reports], ["w-ab"])
