@@ -349,6 +349,9 @@ def hook_delete(probe, parsed, segs):
     config.url is the forwarder url). A non-numeric id is left to the shim's allow-list, which refuses it. Fail closed: an unreadable hook is refused."""
     if not segs[4].isdigit() or not segs[4].isascii():
         return None
+    endpoint = parsed.positionals[0][1]
+    if parsed.hostname is not None and ("://" in endpoint or endpoint.startswith("//")):
+        return HOOK_OTHER   # gh sends a full URL to ITS host and ignores --hostname: the read would be of another host's hook than the one deleted
     data = probe.fetch(["api"] + ([] if parsed.hostname is None else ["--hostname", parsed.hostname]) + ["repos/%s/%s/hooks/%s" % (segs[1], segs[2], segs[4])])
     if data is None:
         return HOOK_UNREAD % (probe.why or "no reason given")
@@ -371,6 +374,17 @@ def api_write(probe, args, api_parser):
         except Unclassified:
             return None   # an unreadable query or --input is refused by the shim's own GraphQL rule, with its own line
         return GRAPHQL if any(UPDATE_RE.search(t) for t in texts) else None
+    if parsed.effective_method == "DELETE":
+        plain = endpoint
+        for prefix in ("https://api.github.com", "http://api.github.com", "//api.github.com"):   # the spellings the shim's allow-list also accepts (its RAW_PREFIXES)
+            if plain.startswith(prefix + "/"):
+                plain = plain[len(prefix):]
+                break
+        hsegs = clean_endpoint(plain)
+        if hsegs[:1] == ["repos"] and len(hsegs) == 5 and hsegs[3].lower() == "hooks":
+            return hook_delete(probe, parsed, hsegs)
+        if any(x[:1] == ["repos"] and len(x) >= 4 and x[3].lower() == "hooks" for x in (segs, hsegs)):
+            return HOOK_OTHER   # a delete under repos/O/R/hooks in any shape but the one exact one is not a forwarder's own hook delete
     if parsed.effective_method == "DELETE" and low[:1] == ["repos"] and len(segs) == 5 and low[3] == "hooks":
         return hook_delete(probe, parsed, segs)   # the one webhook write that passes the shim's allow-list: a forwarder's own `cli` hook
     if low[:1] == ["repos"] and len(segs) == 5 and low[3] == "issues":

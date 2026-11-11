@@ -100,6 +100,27 @@ class TestGhShimHookDelete(unittest.TestCase):
                 self.assertEqual(calls, [], done.stderr)
                 self.assertEqual(done.returncode, 1)
 
+    def test_a_full_url_with_a_hostname_is_refused_so_the_read_is_of_the_hook_deleted(self):
+        for argv in (["api", "--hostname", "ghe.example.com", "-X", "DELETE", "https://api.github.com/" + HOOK],
+                     ["api", "-X", "DELETE", "--hostname", "ghe.example.com", "//api.github.com/" + HOOK]):
+            with self.subTest(argv=argv):
+                done, calls, _ = self.rig.go(argv)
+                self.assertEqual(calls, [])
+                self.assertEqual(done.returncode, 1)
+
+    def test_the_other_spellings_of_the_host_are_read_first_too(self):
+        for path in ("https://api.github.com/" + HOOK, "http://api.github.com/" + HOOK, "//api.github.com/" + HOOK, "/" + HOOK, HOOK + "?x=1"):
+            with self.subTest(path=path):
+                done, calls, seen = self.rig.go(delete(path), hook_text=hook(name="web"))
+                self.assertEqual(calls, [], "a hook that is not the forwarder's passed")
+                self.assertEqual(len(seen), 1, "it was read first")
+                done, calls, seen = self.rig.go(delete(path))
+                self.assertEqual(len(calls), 1, done.stderr)
+
+    def test_a_label_named_hooks_is_still_deleted_as_before(self):
+        done, calls, _ = self.rig.go(delete("repos/o/r/labels/hooks"))
+        self.assertEqual(len(calls), 1, done.stderr)
+
     def test_a_read_of_a_hook_is_not_a_write_and_is_not_guarded(self):
         done, calls, seen = self.rig.go(["api", HOOK], hook_text=hook(name="web"))
         self.assertEqual(done.returncode, 0, done.stderr)
