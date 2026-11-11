@@ -1,7 +1,6 @@
 """Ask #1165: the image installs make (one new apt package) and carries ONE system-level git file written at build with a
 default identity (one named pair in the Dockerfile); the entrypoint exports no identity variable and writes nothing; a
-repository's own identity and a local `git config user.name` still win; Offline; temp dirs only."""
-import hashlib
+repository's own identity and a local `git config user.name` still win. Offline; temp dirs only."""
 import os
 import re
 import shutil

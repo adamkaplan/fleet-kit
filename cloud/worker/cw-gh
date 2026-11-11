@@ -284,7 +284,6 @@ def pr_edit(args):
     print(out.get("html_url", ""))
 
 
-
 def pr_view(args):
     opts, pos = parse(args, COMMON)
     repo = repo_of(opts)

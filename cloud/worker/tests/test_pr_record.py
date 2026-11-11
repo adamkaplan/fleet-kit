@@ -20,7 +20,7 @@ CREATED = 12
 
 
 class Create(P.H):
-    """The stub: a POST to pulls creates number 12 (head: the pod's own branch); """
+    """The stub: a POST to pulls creates number 12 ."""
     def do_POST(self):
         ln = int(self.headers.get("Content-Length") or 0)
         self.rfile.read(ln)
@@ -69,12 +69,6 @@ class T(unittest.TestCase):
         return self.start("python3", self.cw, "pr", "create", "--title", "t", "--body", "b", "--head", P.BRANCH, "--base", "main", entry=entry, **extra)
 
 
-
-    # S14
-
-
-    # mutation: an entrypoint that exports nothing
-
     # the symlink at the record path is not followed
     def test_a_symlink_at_the_record_path_is_not_followed(self):
         outside = os.path.join(self.d, "outside")
@@ -90,10 +84,6 @@ class T(unittest.TestCase):
                 self.assertEqual(open(outside).read(), "")
                 self.assertFalse(os.path.exists(os.path.join(self.d, "missing")))
                 self.assertNotIn(P.TOKEN, r.stdout + r.stderr)
-
-    # S15: a forged number in the record does not make another branch's pull request editable; own branch AND recorded does
-
-
 
     # S16 (a): the file-editing tool is denied for a path holding pr-record, in both agent blocks
     @staticmethod
@@ -180,8 +170,6 @@ class T(unittest.TestCase):
         self.assertNotIn("started", r.stdout)
         self.assertEqual(len(r.stderr.strip().splitlines()), 1, r.stderr)
         self.assertEqual(stat.S_IMODE(os.stat(target).st_mode), 0o755)
-
-    # the interface document says what the client enforces, what an agent can still do, and the false positives
 
     def test_s14_the_entrypoint_exports_the_record_and_a_created_pr_is_logged(self):
         path = self.record_path()

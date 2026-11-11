@@ -102,8 +102,6 @@ class ClientIsGetOnly(unittest.TestCase):
         loader.exec_module(cls.m)
 
 
-
-
     def test_write_forms_refused_by_api_get(self):
         for extra in (["-X", "PATCH"], ["-f", "a=b"]):
             with self.assertRaises(self.m.Fail):
@@ -145,9 +143,6 @@ class ClientIsGetOnly(unittest.TestCase):
 
     def test_refused_hostname(self):
         self.refused_before_request(["--hostname", "example.com"])
-
-
-
 
 
 if __name__ == "__main__":
