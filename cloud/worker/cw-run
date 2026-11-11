@@ -134,7 +134,7 @@ def cmd_start(args):
     if name is None:
         name = "run-%d" % int(time.time())
     check_name(name)
-    # the allow row for `cw-run start*` comes after the pod's hard rules, so the command is held against those rules here (the template's list, without the operator's patterns)
+    # the allow row for `cw-run start*` comes after the rows of the template, so the command is held against the template list here (the rows of the file, without the operator's patterns)
     checker = os.environ.get("CW_SHELL_CHECK") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "cw-shell-check")
     if not os.path.exists(checker):
         checker = "/usr/local/bin/cw-shell-check"
