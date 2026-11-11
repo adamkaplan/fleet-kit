@@ -138,7 +138,7 @@ class TestGhShimHookDelete(unittest.TestCase):
         self.assertEqual(load_module().FORWARDER_HOOK_URL, URL)
 
     def test_a_flag_and_its_value_before_api_cannot_skip_the_check(self):
-        for lead in (["--hostname", "github.com"], ["-H", "x:y"], ["--jq", "."]):
+        for lead in (["--hostname", "github.com"], ["-H", "x:y"], ["--jq", "."], ["--jq", "search"], ["-q", "auth"], ["--hostname", "help"]):
             with self.subTest(lead=lead):
                 done, calls, _ = self.rig.go(lead + delete(), hook_text=hook(name="web"))
                 self.assertEqual(calls, [], "a hook that is not the forwarder's passed")
