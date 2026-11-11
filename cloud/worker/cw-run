@@ -8,7 +8,7 @@
 
 A run lives in /work/runs (NAME.log, NAME.exit, NAME.pid). While it lives one line goes to /work/progress.txt every 5 minutes, and one when it ends.
 """
-import os, re, subprocess, sys, time
+import os, re, shlex, subprocess, sys, time
 
 RUNS = os.environ.get("CW_RUNS_DIR") or "/work/runs"
 PROGRESS = os.environ.get("CW_PROGRESS_FILE") or "/work/progress.txt"
@@ -134,6 +134,15 @@ def cmd_start(args):
     if name is None:
         name = "run-%d" % int(time.time())
     check_name(name)
+    # the allow row for `cw-run start*` comes after the pod's hard rules, so the command is held against those rules here (the template's list, without the operator's patterns)
+    checker = os.environ.get("CW_SHELL_CHECK") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "cw-shell-check")
+    if not os.path.exists(checker):
+        checker = "/usr/local/bin/cw-shell-check"
+    rules = os.environ.get("CW_BASE_RULES") or "/usr/local/share/cw/opencode-worker.json"
+    if os.path.exists(checker) and os.path.exists(rules):
+        r = subprocess.run([sys.executable, checker, "--list", rules, shlex.join(cmd)], capture_output=True, text=True)
+        if r.returncode == 1:
+            die("the pod's shell rules refuse that command; it was not started")
     ensure_dir()
     if state(name)[0] == "running":
         die("a run named %s is still running" % name)

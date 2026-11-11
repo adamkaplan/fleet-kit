@@ -64,6 +64,17 @@ class Run(unittest.TestCase):
         r, _ = self.cw("tail", "three", "1")
         self.assertEqual(len(r.stdout.strip().splitlines()), 1)
 
+    def test_a_hard_rule_is_not_bypassed_by_start(self):
+        rules = os.path.join(HERE, "..", "opencode-worker.json")
+        env = {"CW_BASE_RULES": rules}
+        r, _ = self.cw("start", "--name", "m", "--", "gh", "pr", "merge", "5", env=env)
+        self.assertNotEqual(r.returncode, 0); self.assertIn("refuse", r.stderr); self.assertEqual(len(r.stderr.strip().splitlines()), 1)
+        r, _ = self.cw("start", "--name", "p", "--", "git", "push", "--force", "origin", "x", env=env)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertFalse(os.path.exists(os.path.join(self.runs, "m.pid")))
+        r, _ = self.cw("start", "--name", "ok", "--", "sh", "-c", "sleep 1; echo done", env=env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+
     def test_s4_progress_lines(self):
         self.cw("start", "--name", "tk", "--", "sleep", "2.5", env={"CW_RUN_TICK": "1"})
         r, _ = self.cw("wait", "tk", "30")
