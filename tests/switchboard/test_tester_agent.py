@@ -163,13 +163,12 @@ def build():
             rows = [l.split("\t") for l in (REPO / "agents" / "roles.tsv").read_text().splitlines() if l.strip() and not l.startswith("#")]
             self.assertEqual([r[0] for r in rows if "tester" in r[1].split(",")], ["coder"])
             self.assertEqual(rows, [["coder", "coder,tester"]])
-            import subprocess
-            diff = subprocess.run(["git", "-C", str(REPO), "diff", "--numstat", "origin/integration...HEAD", "--", "agents/opencode", "agents/copilot", "agents/reviewers"],
-                                  capture_output=True, text=True)
-            if diff.returncode == 0:   # a checkout without the base ref cannot measure this
-                self.assertEqual(diff.stdout.strip(), "", "no definition is changed")
+            definitions = sorted(path for folder in ("opencode", "copilot", "reviewers") for path in (REPO / "agents" / folder).rglob("*") if path.is_file())
+            self.assertTrue(definitions)
+            before = {path: path.read_bytes() for path in definitions}   # the property is of the LAUNCH: it changes no tracked definition (a diff against a ref measured the branch, which moves with the base)
             code, out, err = self.launch("coder", "tester", "--terminal", name="realtester")   # the real checkout, no plant
             self.assertEqual(code, 0, err)
+            self.assertEqual({path: path.read_bytes() for path in definitions}, before, "no definition is changed")
 
         def test_s10_control_characters_of_the_agent_name_are_printed_as_question_marks_in_one_line(self):
             self.plant(tester_agent_standard())
