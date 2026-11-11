@@ -59,24 +59,27 @@ class Required(unittest.TestCase):
             self.check_no_default(mutated)
         self.assertIn("the default identity has a built-in value", str(cm.exception))
 
-    def test_s2_the_guard_runs_in_a_scratch_shell(self):
-        text = read(DOCKERFILE)
+    def check_guard(self, text):
+        """The S2 assertions on a Dockerfile text: both set exits 0 silently; each incomplete run exits non-zero with one line naming the missing argument."""
         code, err = run_guard(text, **{N: NAME, E: EMAIL})
-        self.assertEqual((code, err), (0, ""))
-        for args, missing in (({}, N), ({N: NAME}, E), ({E: EMAIL}, N)):
+        self.assertEqual((code, err), (0, ""), "the guard refuses a complete run")
+        for args, missing in (({}, N), ({N: NAME}, E), ({E: EMAIL}, N), ({N: "", E: EMAIL}, N)):
             code, err = run_guard(text, **args)
-            self.assertNotEqual(code, 0, args)
-            self.assertIn(missing + " is missing", err)
-        code, err = run_guard(text, **{N: "", E: EMAIL})
-        self.assertNotEqual(code, 0)   # an empty value is missing too
-        self.assertEqual(len(err.strip().splitlines()), 1)
+            self.assertNotEqual(code, 0, "the guard lets an incomplete run through: %r" % sorted(args))
+            self.assertIn("build argument " + missing + " is missing", err)
+            self.assertEqual(len(err.strip().splitlines()), 1)
+
+    def test_s2_the_guard_runs_in_a_scratch_shell(self):
+        self.check_guard(read(DOCKERFILE))
 
     def test_s2_mutant_guard_checking_only_the_name_is_caught(self):
         text = read(DOCKERFILE)
-        self.assertEqual(run_guard(text, **{N: NAME})[0] != 0, True)   # control: the real guard refuses a name-only run
+        self.check_guard(text)   # control first
         mutated = re.sub(r'; test -n "\$CW_DEFAULT_IDENT_EMAIL".*', "", flat(text))
-        self.assertNotEqual(mutated, flat(text))
-        self.assertEqual(run_guard(mutated, **{N: NAME})[0], 0)   # the weak guard lets it through: the real one differs
+        self.assertNotEqual(mutated, flat(text))   # the mutation applied
+        with self.assertRaises(AssertionError) as cm:
+            self.check_guard(mutated)
+        self.assertIn("the guard lets an incomplete run through", str(cm.exception))
 
 
 class EntrypointWithDummy(unittest.TestCase):
