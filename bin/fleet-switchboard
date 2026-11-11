@@ -10163,7 +10163,11 @@ def red_ci_lane(hub, repo, pr, now):
 
 
 class GitHubUnavailable(Exception):
-    """A `gh api` read that did not answer; the caller tries again later."""
+    """A `gh api` read that did not answer; the caller tries again later. `status` is the HTTP status gh reported (an int), else None."""
+
+    def __init__(self, *args, status=None):
+        super().__init__(*args)
+        self.status = status
 
 
 FORWARDER_HISTORY_SECONDS = 3600
@@ -11715,10 +11719,13 @@ class GitHubHub:
         except Exception as err:   # the forwarder starts whatever happens here
             raise GitHubUnavailable(self.accounts.scrub(_one_line("%s: %s" % (type(err).__name__, err), 200))) from None
         if done.returncode != 0:
-            said = self.accounts.scrub(_one_line((done.stderr or done.stdout or "exit %s" % done.returncode), 200))
-            if "admin:repo_hook" in said or "HTTP 403" in said:
+            raw = done.stderr or done.stdout or "exit %s" % done.returncode
+            said = self.accounts.scrub(_one_line(raw, 200))
+            found = re.search(r"\(HTTP ([0-9]{3})\)|\bHTTP ([0-9]{3})\b", raw)
+            status = int(found.group(1) or found.group(2)) if found else None   # the status, as a number: callers compare it exactly
+            if "admin:repo_hook" in said or status == 403:
                 said = "the token lacks the admin:repo_hook scope (or the right to see hooks): %s" % said
-            raise GitHubUnavailable(said)
+            raise GitHubUnavailable(said, status=status)
         return done.stdout or ""
 
     def _forwarder_hooks(self, repo, env):
@@ -11726,7 +11733,7 @@ class GitHubHub:
         try:
             hooks = json.loads(self._hook_api(repo, env, ["repos/%s/hooks?per_page=100" % repo]) or "[]")
         except GitHubUnavailable as err:
-            if "HTTP 404" in str(err):   # GitHub answers 404 to a token that may not see hooks
+            if err.status == 404:   # GitHub answers 404 to a token that may not see hooks
                 raise GitHubUnavailable("the token lacks the admin:repo_hook scope (or the right to see hooks): %s" % err) from None
             raise
         except ValueError:
@@ -11746,7 +11753,7 @@ class GitHubHub:
         try:
             self._hook_api(repo, env, ["--method", "DELETE", "repos/%s/hooks/%d" % (repo, hook_id)])
         except GitHubUnavailable as err:
-            if "HTTP 404" not in str(err):
+            if err.status != 404:
                 raise
             # 404: it is gone already (the forwarder removed it itself)
 

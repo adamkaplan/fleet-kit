@@ -382,11 +382,9 @@ def api_write(probe, args, api_parser):
                 break
         hsegs = clean_endpoint(plain)
         if hsegs[:1] == ["repos"] and len(hsegs) == 5 and hsegs[3].lower() == "hooks":
-            return hook_delete(probe, parsed, hsegs)
+            return hook_delete(probe, parsed, hsegs)   # the one webhook write that passes the shim's allow-list: a forwarder's own `cli` hook
         if any(x[:1] == ["repos"] and len(x) >= 4 and x[3].lower() == "hooks" for x in (segs, hsegs)):
             return HOOK_OTHER   # a delete under repos/O/R/hooks in any shape but the one exact one is not a forwarder's own hook delete
-    if parsed.effective_method == "DELETE" and low[:1] == ["repos"] and len(segs) == 5 and low[3] == "hooks":
-        return hook_delete(probe, parsed, segs)   # the one webhook write that passes the shim's allow-list: a forwarder's own `cli` hook
     if low[:1] == ["repos"] and len(segs) == 5 and low[3] == "issues":
         number = segs[4]
     elif low[:1] == ["repositories"] and len(segs) == 4 and low[2] == "issues":
