@@ -138,6 +138,7 @@ cloud/worker/tests/test_comment_by_id.py
 cloud/worker/tests/test_cw_gh.py
 cloud/worker/tests/test_cw_gh_comments.py
 cloud/worker/tests/test_cw_run.py
+cloud/worker/tests/test_cw_run_wake.py
 cloud/worker/tests/test_dockerfile_agent.py
 cloud/worker/tests/test_dockerfile_browser.py
 cloud/worker/tests/test_dockerfile_go.py

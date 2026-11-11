@@ -13,6 +13,7 @@ class Run(unittest.TestCase):
         self.d = os.path.realpath(t.name)
         self.runs = os.path.join(self.d, "runs"); self.prog = os.path.join(self.d, "progress.txt")
         self.env = {"PATH": "/usr/bin:/bin", "CW_RUNS_DIR": self.runs, "CW_PROGRESS_FILE": self.prog, "CW_RUN_TICK": "300"}
+        self.env["CW_RUN_SERVER_PASSWORD_FILE"] = os.path.join(self.runs, "no-server-password")   # no local server here: the wake step (ask #2410) stays out of these tests
 
     def cw(self, *a, timeout=60, **kw):
         env = dict(self.env, **kw.pop("env", {}))
