@@ -3,6 +3,7 @@ build(LedgerBase) is called by bin/test-switchboard; the class derives from Ledg
 the repository and the compare; nothing else is read or written."""
 import json
 import subprocess
+from unittest import mock
 
 from support.fake_hubs import LEDGER_HEAD
 from support.loader import sb
@@ -13,7 +14,14 @@ BARE = "c" * 40     # on the default branch, no trailers
 HALF = "d" * 40     # only one of the two trailers
 LAND_MSG = "Add the thing\n\nbody text\n\nLand-Checks: green\nLand-Council: approved\n"
 MESSAGES = {SHA: LAND_MSG, OFF: LAND_MSG, BARE: "Add it\n\nno trailers here\n", HALF: "Add it\n\nLand-Checks: green\n"}
-ON_BRANCH = {SHA: "behind", BARE: "identical", HALF: "behind", OFF: "diverged"}
+AHEAD = "8" * 40    # a descendant of the default branch's tip
+MESSAGES[AHEAD] = LAND_MSG
+MINE = "7" * 40     # landed by the agent `tst`, who must not judge it
+MESSAGES[MINE] = LAND_MSG
+SPOOF = "6" * 40    # the trailer lines sit in prose, not in a trailer block
+MESSAGES[SPOOF] = "Add it\n\nThe lines are Land-Checks: x\nand Land-Council: y\n"
+ON_BRANCH = {SHA: "behind", BARE: "identical", HALF: "behind", OFF: "diverged", AHEAD: "ahead", MINE: "behind", SPOOF: "behind"}
+AUTHORS = {MINE: "tst"}
 
 
 def build(LedgerBase):
@@ -28,18 +36,22 @@ def build(LedgerBase):
             self.base_route = self.route
             self.route = self.land_route
             self.reads = []
+            self.failing = {}      # a path fragment -> the stderr of a failing read
 
         def land_route(self, argv, **kwargs):
             if len(argv) > 2 and argv[1] == "api" and argv[2].startswith("repos/acme/land"):
                 path = argv[2]
                 self.reads.append(path)
+                for fragment, text in self.failing.items():
+                    if (path == fragment) if fragment.startswith("repos/") else (fragment in path):
+                        return subprocess.CompletedProcess(argv, 1, "", text)
                 sha = path.rsplit("/", 1)[-1].split("...")[-1]
                 if path.endswith("repos/acme/land"):
                     return subprocess.CompletedProcess(argv, 0, json.dumps({"default_branch": "main"}), "")
                 if "/compare/" in path and sha in ON_BRANCH:
                     return subprocess.CompletedProcess(argv, 0, json.dumps({"status": ON_BRANCH[sha]}), "")
                 if "/commits/" in path and sha in MESSAGES:
-                    return subprocess.CompletedProcess(argv, 0, json.dumps({"sha": sha, "commit": {"message": MESSAGES[sha]}}), "")
+                    return subprocess.CompletedProcess(argv, 0, json.dumps({"sha": sha, "commit": {"message": MESSAGES[sha]}, "author": {"login": AUTHORS.get(sha, "someone")}}), "")
                 return subprocess.CompletedProcess(argv, 1, "", "gh: Not Found (HTTP 404)")
             return self.base_route(argv, **kwargs)
 
@@ -81,17 +93,52 @@ def build(LedgerBase):
             self.assertTrue(all(status == "n/a" for gate, status in rows.items() if gate not in ("G0a", "G0b", "G0c", "G1")))
 
         def test_S3_a_sha_without_a_trailer_or_off_the_default_branch_is_refused_and_nothing_is_recorded(self):
-            cases = ((BARE, "no trailer Land-Checks, Land-Council"), (HALF, "no trailer Land-Council"), (OFF, "not on the default branch"), ("e" * 40, "sha unknown"))
+            T = sb.LAND_PROOF_TRAILERS
+            cases = ((BARE, ["no trailer"] + list(T)), (HALF, ["no trailer", T[1]]), (SPOOF, ["no trailer"] + list(T)), (OFF, ["not on the default branch"]),
+                     (AHEAD, ["not on the default branch"]), ("e" * 40, ["sha unknown"]))
             for sha, words in cases:
                 with self.subTest(sha=sha[:4]):
-                    code, out, err = self.prove_at(self.landed(sha))
-                    self.assertNotEqual(code, 0)
-                    self.assertIn(words, err)
-                    self.assertIn(sha[:12], err) if "unknown" not in words else self.assertIn(sha, err)
-                    code, out, err = self.verdict_at(self.landed(sha))
-                    self.assertNotEqual(code, 0)
-                    self.assertIn(words, err)
+                    for run in (self.prove_at, self.verdict_at):
+                        code, out, err = run(self.landed(sha))
+                        self.assertNotEqual(code, 0)
+                        for word in words:
+                            self.assertIn(word, err)
+                        self.assertIn(sha[:12], err)
             self.assertEqual(self.ledger(), [])
+
+        def test_S3_a_read_that_fails_is_not_called_an_unknown_sha_and_nothing_is_recorded(self):
+            for fragment, words in (("/commits/", "could not be read"), ("/compare/", "default branch"), ("repos/acme/land", "default branch")):
+                with self.subTest(fragment=fragment):
+                    self.failing = {fragment: "gh: Bad Gateway (HTTP 502)"}
+                    code, out, err = self.prove_at(self.landed())
+                    self.assertNotEqual(code, 0)
+                    self.assertIn(words, err)
+                    self.assertNotIn("sha unknown", err)
+            self.assertEqual(self.ledger(), [])
+
+        def test_S3_a_head_that_is_not_the_sha_and_a_second_plan_are_refused(self):
+            ref = self.landed()
+            code, out, err = self.run_as("coder", "prove", "S1", "--pr", ref, "--evidence", "ran: ok", "--head", SHA[:10], *self.PLAN)
+            self.assertNotEqual(code, 0)
+            self.assertEqual(self.ledger(), [])
+            self.assertEqual(self.prove_at(ref)[0], 0)
+            code, out, err = self.run_as("coder", "prove", "S2", "--pr", ref, "--evidence", "ran: ok", "--plan", "acme/app#8")
+            self.assertNotEqual(code, 0)
+            self.assertEqual([r["scenario"] for r in self.ledger()], ["S1"])
+
+        def test_S3_the_spelling_of_the_repository_does_not_make_another_subject(self):
+            self.assertEqual(self.prove_at("Acme/Land@" + SHA)[0], 0)
+            self.assertEqual({r["pr"] for r in self.ledger()}, {self.landed()})
+
+        def test_S3_the_writer_of_the_commit_may_not_judge_it_and_all_is_at_the_sha(self):
+            ref = self.landed(MINE)
+            self.assertEqual(self.prove_at(ref)[0], 0)
+            code, out, err = self.verdict_at(ref)
+            self.assertNotEqual(code, 0)
+            self.assertEqual([r["kind"] for r in self.ledger()], ["proof"])
+            code, out, err = self.run_as("rev", "verdict", "--all", "--pr", ref, "--as", "reviewer", "--result", "pass", "--evidence", "ran it", "--head", MINE, *self.PLAN)
+            self.assertEqual(code, 0, err)
+            self.assertEqual({r["head"] for r in self.ledger()}, {MINE})
 
         def test_S3_a_repository_that_is_not_on_the_land_path_is_refused_naming_it(self):
             code, out, err = self.prove_at(self.landed(SHA, "acme/app"))
@@ -120,20 +167,25 @@ def build(LedgerBase):
             self.assertEqual((row["pr"], row["head"], "subject_kind" in row), ("acme/land#9", LEDGER_HEAD, False))
             self.assertEqual([r for r in self.reads if "/commits/" in r or "/compare/" in r], [])
 
-        def test_S5_control_without_the_option_the_old_parser_refuses_a_sha_subject(self):
-            # the control: the pull request reader (which every subject took before #2373) refuses a sha reference, so the landed path is what accepts it
-            with self.assertRaises(sb.NoticeError):
-                sb.parse_pr_ref(self.landed())
-            code, out, err = self.run_as("coder", "gates-check", self.landed(), "--for", "merge")
-            self.assertNotEqual(code, 0)
-            self.assertEqual(self.ledger(), [])
+        def test_S5_control_with_the_landed_path_off_today_s_code_refuses_the_sha_subject(self):
+            ref = self.landed()
+            with mock.patch.object(sb, "landed_ref", lambda text: None):   # the code as it was: a subject is a pull request or nothing
+                for run in (lambda: self.prove_at(ref), lambda: self.run_as("coder", "gates", ref, *self.PLAN)):
+                    code, out, err = run()
+                    self.assertNotEqual(code, 0)
+            self.assertEqual((self.ledger(), [r for r in self.reads if "/commits/" in r]), ([], []))
+            self.assertEqual(self.prove_at(ref)[0], 0, "the same call with the landed path records")
+            self.assertEqual(len(self.ledger()), 1)
 
         def test_U1_the_trailer_match_is_one_function_with_the_stated_form(self):
-            missing = sb.land_trailers_missing
+            missing, T = sb.land_trailers_missing, sb.LAND_PROOF_TRAILERS
+            block = lambda lines: "subject\n\n" + "\n".join(lines) + "\n"
             self.assertEqual(missing(LAND_MSG), [])
-            self.assertEqual(missing("s\n\nland-checks: x\nLAND-COUNCIL:y"), [])
-            self.assertEqual(missing("s\n\nLand-Checks:\nLand-Council: ok"), ["Land-Checks"])
-            self.assertEqual(missing("Land-Checks: a\nLand-Council: b"), ["Land-Checks", "Land-Council"], "a subject paragraph alone is no trailer block")
-            self.assertEqual(missing("s\n\nLand-Checks: a\nLand-Council: b\n\ntext after"), ["Land-Checks", "Land-Council"], "only the last paragraph counts")
-            self.assertEqual(missing(None), ["Land-Checks", "Land-Council"])
+            self.assertEqual(missing(block([t.upper() + ": x" for t in T])), [])
+            self.assertEqual(missing(block([t.lower() + ":y" for t in T] + ["Signed-off-by: a <a@b>"])), [])
+            self.assertEqual(missing(block([T[0] + ":"] + [t + ": ok" for t in T[1:]])), [T[0]], "an empty value is no trailer")
+            self.assertEqual(missing(" ".join(T) + "\n" + "\n".join(t + ": a" for t in T)), list(T), "a subject paragraph alone is no trailer block")
+            self.assertEqual(missing(block([t + ": a" for t in T]) + "\ntext after\n"), list(T), "only the last paragraph counts")
+            self.assertEqual(missing(block(["prose"] + [t + ": a" for t in T])), list(T), "prose in the block makes it no block")
+            self.assertEqual(missing(None), list(T))
     return TestLandedSubject

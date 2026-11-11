@@ -15177,6 +15177,8 @@ def _ledger_context(args, runner, now, writable, parts=None, floor=False, plan_r
     (engine, state, config) when the caller already has them (the daemon's pass); else the engine is built. `plan_read=False` skips the read of the plan
     (the relay's link check needs only the PR and the plan's source: one GitHub read)."""
     engine, state, config = parts if parts is not None else build_engine(runner, now, "cli", writable=writable)
+    if landed and "@" in (args.pr or "") and not landed_ref(args.pr):
+        raise LedgerCommandError("refused: a landed subject is `owner/repo@<40 lowercase hex sha>`, got %r: nothing was recorded" % _one_line(args.pr, 80))
     if landed and (lref := landed_ref(args.pr)):   # ask #2373: a landed commit of a land repository is a subject (prove, verdict and gates only)
         return _landed_context(args, engine, state, config, lref, runner, now, plan_read)
     repo, number, pr = _ledger_pr(args)
@@ -15221,13 +15223,14 @@ def _ledger_context(args, runner, now, writable, parts=None, floor=False, plan_r
 # A repository on the land path (`land_repos`) has no pull request, so `prove`, `verdict` and `gates` (which take a PR) had no subject for it. The subject is `--pr <owner/repo>@<40-hex sha>`:
 # the one argument those commands already take, so no new option is parsed. Reads are GETs through the repository's own account (`impact_carry_get`, as the epic record reads). Every refusal writes nothing.
 
-LANDED_REF = re.compile(r"([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)@([0-9a-f]{40})")
+LANDED_REF = re.compile(r"((?!\.\.?/)[A-Za-z0-9_.-]+/(?!\.\.?@)[A-Za-z0-9_.-]+)@([0-9a-f]{40})")
+LANDED_GATES = ("G0a", "G0b", "G0c", "G1")   # the proof gates a landed commit has; every other gate shows n/a
 
 
 def landed_ref(text):
     """(repo, sha) for `owner/repo@<40 lowercase hex>`, else None (a pull request reference, or anything else, is not a landed subject)."""
     found = LANDED_REF.fullmatch((text or "").strip())
-    return (found.group(1), found.group(2)) if found else None
+    return (found.group(1).lower(), found.group(2)) if found else None   # lower case: one repository is one subject whatever its spelling (`land_repos` is case-blind)
 
 
 def landed_check(engine, config, runner, repo, sha):
@@ -15241,8 +15244,10 @@ def landed_check(engine, config, runner, repo, sha):
         message = commit.get("commit", {}).get("message") if isinstance(commit, dict) else None
         if not isinstance(commit, dict) or commit.get("sha") != sha or not isinstance(message, str):
             raise ValueError("no such commit")
-    except Exception:
-        raise LedgerCommandError("refused: sha unknown: %s could not be read as a commit, nothing was recorded" % ref) from None
+    except Exception as err:
+        if isinstance(err, ValueError) and not isinstance(err, json.JSONDecodeError) or "404" in str(err) or "Not Found" in str(err):
+            raise LedgerCommandError("refused: sha unknown: %s is no commit of %s, nothing was recorded" % (ref, repo)) from None
+        raise LedgerCommandError("refused: the commit %s could not be read (%s), nothing was recorded: try again" % (ref, _one_line(str(err), 100))) from None
     try:
         default = (get("repos/%s" % repo) or {}).get("default_branch")
         if not isinstance(default, str) or not default:
@@ -15256,6 +15261,8 @@ def landed_check(engine, config, runner, repo, sha):
     missing = land_trailers_missing(message)
     if missing:
         raise LedgerCommandError("refused: %s has no trailer %s, nothing was recorded" % (sha[:12], ", ".join(missing)))
+    who = lambda key: ((commit.get(key) or {}).get("login") if isinstance(commit.get(key), dict) else None)
+    return [w for w in (who("author"), who("committer")) if isinstance(w, str) and w]   # the writers of the commit: never its judges
 
 
 def landed_kind(ctx):
@@ -15269,8 +15276,8 @@ def _landed_context(args, engine, state, config, lref, runner, now, plan_read):
     pr = "%s@%s" % (repo, sha)
     entries, problem = plan_ledger.read_ledger(state)
     record_step("a GitHub read of the commit %s" % pr)
-    landed_check(engine, config, runner, repo, sha)
-    facts = {"head": sha, "body": "", "notice_senders": [], "author": None, "landed": True}
+    writers = landed_check(engine, config, runner, repo, sha)
+    facts = {"head": sha, "body": "", "notice_senders": writers[1:], "author": writers[0] if writers else None, "landed": True}
     source = plan_source_for(args.plan, entries, pr, "", config.get("intent_repo"))
     plan, plan_problem = None, None
     if source and plan_read:
@@ -15288,11 +15295,11 @@ def _gates_landed(ctx, args, now):
     """`gates <owner/repo>@<sha>`: the proof gates (G0a plan, G1 proof) of a landed commit; the merge gates G2 to G8 do not apply to a commit that has no pull request."""
     report = plan_ledger.evaluate_gates(ctx.plan, ctx.entries, ctx.problem, ctx.facts, ctx.pr, now=now())
     for row in report["gates"]:
-        if row["gate"] not in ("G0a", "G0b", "G0c", "G1"):
+        if row["gate"] not in LANDED_GATES:
             row.update(status="n/a", missing=[], detail="does not apply to a landed commit")
-    report.update(ready=all(r["status"] in plan_ledger.SATISFIED for r in report["gates"]), subject_kind="landed", plan_problem=ctx.plan_problem,
-                  plan_source=ctx.source, merge_gates="G2-G8 do not apply to a landed commit")
-    report.update(enforced=None, ready_enforced=report["ready"], open_enforced=[], open_not_enforced=[])
+    report["ready"] = all(r["status"] in plan_ledger.SATISFIED for r in report["gates"])
+    report.update(subject_kind="landed", plan_problem=ctx.plan_problem, plan_source=ctx.source, merge_gates="G2-G8 do not apply to a landed commit")
+    plan_ledger.enforced_view(report, None)
     if args.json:
         print(json.dumps(report, sort_keys=True))
     else:
@@ -15692,6 +15699,8 @@ def _head_of(ctx, args):
     known = (ctx.facts or {}).get("head")
     if getattr(ctx, "ask_issue", False) and not known:
         raise LedgerCommandError("the plan hash of %s is unknown: nothing was recorded" % ctx.pr)
+    if getattr(ctx, "landed", False) and args.head and args.head != known:   # a landed subject is its whole sha
+        raise LedgerCommandError("--head %s is not the landed sha %s: nothing was recorded" % (args.head[:12], known))
     head = args.head or known
     if known and args.head and not (known.startswith(args.head) or args.head.startswith(known)):
         raise LedgerCommandError("--head %s is not the PR's head (%s): nothing was recorded" % (args.head[:12], known[:12]))
