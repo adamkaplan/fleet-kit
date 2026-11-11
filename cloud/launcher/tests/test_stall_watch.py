@@ -58,20 +58,25 @@ class World:
     def sent(self):   # one audit line per alert: the daemon sends the messages
         return self.audits
 
-    def add(self, name="w1-pod", age_minutes=60, boss="coder-lead", progress_age=1, tail=("working",), runs=(), exits=(), msg="all fine", msg_age=1, exec_fails=False, results=""):
+    def add(self, name="w1-pod", age_minutes=60, boss="coder-lead", progress_age=1, tail=("working",), runs=(), exits=(), msg="all fine", msg_age=1, exec_fails=False):
         """progress_age: minutes since the progress file changed. runs: (name, age minutes, last line). exits: (name, code, age minutes)."""
         def probe(now, n=name):
             t = lambda minutes: now.timestamp() - minutes * 60  # noqa: E731
             p = self.pods[n]
             return {"now": now.timestamp(), "progress": {"mtime": t(p["progress_age"]), "tail": list(p["tail"])},
                     "runs": [{"name": r[0], "mtime": t(r[1]), "last": r[2]} for r in p["runs"]],
-                    "exits": [{"name": e[0], "code": str(e[1]), "mtime": t(e[2])} for e in p["exits"]], "msg": p["msg"], "msg_time": t(p["msg_age"]), "results": p["results"]}
+                    "exits": [{"name": e[0], "code": str(e[1]), "mtime": t(e[2])} for e in p["exits"]], "msg": p["msg"], "msg_time": t(p["msg_age"])}
         started = (self.now - dt.timedelta(minutes=age_minutes)).strftime("%Y-%m-%dT%H:%M:%SZ")
         doc = {"metadata": {"name": name, "uid": "u-" + name, "annotations": {"cw/worker": "w1", "cw/started": started}}, "status": {"phase": "Running"}}
-        self.pods[name] = {"doc": doc, "probe": probe, "progress_age": progress_age, "tail": tail, "runs": runs, "exits": exits, "msg": msg, "msg_age": msg_age, "exec_fails": exec_fails, "results": results}
+        self.pods[name] = {"doc": doc, "probe": probe, "progress_age": progress_age, "tail": tail, "runs": runs, "exits": exits, "msg": msg, "msg_age": msg_age, "exec_fails": exec_fails}
         if boss:
             with open(os.path.join(self.dir, "w1.json"), "w") as f:
                 json.dump({"worker": "w1", "reports_to": boss}, f)
+
+    def set_results(self, name, line):
+        """The pod's /work/results.txt last line, added to the probe's answer (the real probe reads it in the same one exec)."""
+        inner = self.pods[name]["probe"]
+        self.pods[name]["probe"] = lambda now: dict(inner(now), results=line)
 
     def run(self, module=sw):
         err = io.StringIO()
@@ -337,39 +342,59 @@ class Stall(unittest.TestCase):
         self.assertIn("the stall watch failed", text)
         self.assertEqual(sw.pass_text(None), "")
 
-    def _finished(self, module, **kw):
+    def _finished(self, module, results="", **kw):
         w = World()
         w.add(progress_age=16, runs=[("build", 16, "x")], exits=[("build", 0, 16)], **kw)
+        w.set_results("w1-pod", results)
         return w.run(module)
 
     def _finished_cases(self, module):
-        # the control inside: an unfinished pod stale for 16 minutes is alerted
+        # S2 (the control inside: an unfinished pod stale for 16 minutes is alerted)
         if conditions(self._finished(module, tail=("working",))) != ["progress-stale"]:
-            raise AssertionError("a stale pod was not alerted")
+            raise AssertionError("an unfinished pod was called finished: a stale pod was not alerted")
         for kw in (dict(tail=("x", "done")), dict(tail=("x", " DONE  ")), dict(tail=("STATUS: done",)), dict(tail=("x",), results="STATUS: done")):
             if self._finished(module, **kw) != []:
                 raise AssertionError("a finished pod was alerted as stalled: %r" % (kw,))
+        # S3
+        for line in ("not done yet", "All done and pushed"):
+            if conditions(self._finished(module, tail=(line,))) != ["progress-stale"]:
+                raise AssertionError("an unfinished pod was called finished: %r" % line)
 
-    def test_a_finished_pod_is_not_stalled_and_a_mid_sentence_done_still_fires(self):
+    def test_s2_s3_a_finished_pod_is_not_stalled_and_a_sentence_with_done_still_fires(self):
         self._finished_cases(sw)   # the control: the unmutated module passes
-        self.assertEqual(conditions(self._finished(sw, tail=("Blocked", "done"))), ["refusal"])   # (b) still fires for a finished pod
-        self.assertEqual(conditions(self._finished(sw, tail=("not done yet",))), ["progress-stale"])
         self.assertEqual(conditions(self._finished(sw, tail=("done", "more work"))), ["progress-stale"])
         self.assertEqual(conditions(self._finished(sw, tail=("x",), results="STATUS: running")), ["progress-stale"])
-        w = World()   # failed-run-idle is skipped too
+
+    def test_s4_a_finished_pod_still_fires_refusal_and_is_silent_for_failed_run_idle(self):
+        w = World()
+        w.add(progress_age=1, tail=("done",), msg="Permission denied: shell")
+        self.assertEqual(conditions(w.run()), ["refusal"])
+        w = World()
         w.add(progress_age=11, msg_age=11, tail=("done",), runs=[("t", 11, "FAILED")], exits=[("t", 2, 11)])
         self.assertEqual(w.run(), [])
+        w = World()
+        w.add(progress_age=11, msg_age=11, tail=("working",), runs=[("t", 11, "FAILED")], exits=[("t", 2, 11)])
+        self.assertEqual(conditions(w.run()), ["failed-run-idle"])
 
-    def test_a_mutant_that_ignores_the_finished_marker_fails_with_the_anchored_text(self):
+    def test_s5_twelve_pods_one_finished_make_twelve_execs_and_the_other_eleven_alert_as_before(self):
+        w = World()
+        for i in range(12):
+            w.add(name="pod%d-x" % i, progress_age=16, tail=("done",) if i == 0 else ("working",))
+        out = w.run()
+        self.assertEqual(sorted(n for n, _ in w.kube.execs), sorted("pod%d-x" % i for i in range(12)))
+        self.assertEqual(sorted(n for n, _ in out), sorted("pod%d-x" % i for i in range(1, 12)))
+
+    def test_s6_a_mutant_that_treats_every_pod_as_finished_fails_with_an_anchored_text_after_its_control(self):
+        self._finished_cases(sw)   # the control passes first
         with open(SOURCE) as f:
             text = f.read()
         old = '    finished = last_p in ("done", "status: done") or'
         self.assertEqual(text.count(old), 1, "the mutation did not apply")
         mod = types.ModuleType("stall_watch_mutant2")
-        exec(compile(text.replace(old, "    finished = False and last_p in () or False and"), "mutant", "exec"), mod.__dict__)
+        exec(compile(text.replace(old, "    finished = True or"), "mutant", "exec"), mod.__dict__)
         with self.assertRaises(AssertionError) as caught:
             self._finished_cases(mod)
-        self.assertIn("a finished pod was alerted as stalled", str(caught.exception))
+        self.assertIn("an unfinished pod was called finished", str(caught.exception))
 
     def test_the_probe_prints_one_json_line_on_a_machine_without_a_server(self):
         d = tempfile.mkdtemp(prefix="stall-probe-")
