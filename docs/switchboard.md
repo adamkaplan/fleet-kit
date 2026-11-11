@@ -2495,7 +2495,7 @@ fact lists), `realarm_hours` (6, the debounce per item), `person_names` (["the o
 | Kind | Finding |
 |---|---|
 | S1a / S1b | an open issue with a `## Decision required` section and no awaiting label / an awaiting label and no such section |
-| S2 | an open PR whose body or last 5 comments say it is held for, waits on or needs the person (`held for`, `hold for`, `waiting on`, `waits on`, `awaiting`, `blocked on`, `pending`, `needs <name>`, `<name> to review|approve|decide|merge|answer`, `for <name>'s review`; whole phrases, any case; `person_names` may hold a handle such as `@login`) and which is not a captain PR (no `merge-captain` label and, inside the transition window, no first line `MERGE: captain`; see #133) |
+| S2 | an open PR whose body or last 5 comments say it is held for, waits on or needs the person (`held for`, `hold for`, `waiting on`, `waits on`, `awaiting`, `blocked on`, `pending`, `needs <name>`, `<name> to review|approve|decide|merge|answer`, `for <name>'s review`; whole phrases, any case; `person_names` may hold a handle such as `@login`) and which is not a captain PR (no `merge-captain` label; the first line `MERGE: captain` is not read; see #133) |
 | S3 | the same phrases in one of an item's last 5 comments (of the last 7 days), or in a report's text, where no human-tier decision names that issue or PR |
 | S4 | a decision (issue or captain; a report is left, its question may outlive a closed ask) whose issue or PR is closed or merged (an issue that is closed is never listed at all since #570: see below): **withdrawn** from the list when enabled (an external link follows the existing withdraw path), audited once as `sweep.withdrawn` (shadow: `sweep.finding` with `applied: false`) |
 | S5 | a cos-tier decision older than `aged_cos_hours` that is NOT already in the owner's tier: an entry whose issue or PR also has a human-tier decision (a duplicate, or the escalation of the same ref, however the repo or the `pr:` id is spelled: case, `pr:owner/repo#N` or `pr:repo#N`) is not stale for cos and is not raised. A held pull request is judged by its gates, not its age: see "S5 for a held pull request" below. Two more exemptions: a pull request that is a **draft**, and a pull request that is, or closes (or is planned by), an ask labelled `parked` with a `Parked until: YYYY-MM-DD` line in the future (the same reading as the ownerless check) are skipped; the sweep's totals say how many were skipped for each reason (`S5 skipped: N draft, M parked`). Both paths apply it: the legacy aged path (in `sweep_findings`) and the held-pull-request ready path (in `sweep_ready_pass`, before any read: a skipped held pull request is not read, not counted unchecked, and its ready clock restarts only when it is ready and neither draft nor parked). The ask is the one `pr_body_refs` finds (`Closes`, `Part of`, `PLAN`); `Refs #N` is NOT an ask. A passed, unreadable or label-less date, and a ready pull request, are raised as before; no extra GitHub read is made |
@@ -2811,11 +2811,9 @@ label as a person's; a cut label read or an unreadable state adopts nothing. `ho
 whatever the score (an audited `gate.hold_clear_refused` with `owner_hold`); only the owner's plain clear lifts it, and `labels ensure` creates it like the others.
 
 **One rule, one helper.** `is_captain(pr)` (a dict with `labels` and `body`) is the only place that decides it, used by the PR facts
-(and so the captain decision), the sweep's S2 and the triage's T6/T7: a PR is captain when it carries `merge-captain`, **or**, during the
-transition window only, when its body's first non-empty line starts with `MERGE: captain`. **The label wins on disagreement:**
-`merge-captain` holds the PR whatever the line says, `merge-automatic` releases it whatever the line says, and the line is read only when
-there is no merge label. The window is a dated constant, `CAPTAIN_MARKER_UNTIL` (2026-11-10, 30 days after the labels landed on 2026-10-11); the
-one-line way to drop the marker is to set it to `None`, after telling the Chief of Staff. A captain decision lists its hold reasons
+(and so the captain decision), the sweep's S2 and the triage's T6/T7: a PR is captain when it carries `merge-captain`, and only then. **The label is the only signal (#2379):**
+`merge-captain` holds the PR whatever the line says, `merge-automatic` releases it whatever the line says, and a body whose first line says `MERGE: captain`
+with no merge label is NOT held (the transition window ended on 2026-11-10 and its date constant is gone); the sweep's `marker-without-label` finding (S6a) stays as a note that the line is ignored, so the relabelling can finish. A captain decision lists its hold reasons
 (`holds`, from the `hold-*` labels, nothing from prose), and a T6 finding carries them too.
 
 **The sweep finishes the relabelling.** Two findings, both read-only: S6a, a PR of OURS (judged by the rule the triage uses to tell ours from
@@ -5254,7 +5252,7 @@ Every input of `review record` that can change what the clear, the carry or the 
 
 ### The owner's clear also changes the marker line (#522)
 
-The merge gate reads a pull request as held from its merge label, and, with no merge label, from the first non-empty line of the body when it says `MERGE: captain` (until 2026-11-10). The owner's clear lifts the whole hold, so the SAME step (`impact_clear_core`: his `impact clear` and his words in the chat both end there, and only there) changes that one line to `MERGE: automatic`. One function does it, `neutralise_marker`.
+The merge gate reads a pull request as held from its merge label only (the first line `MERGE: captain` is no longer read for the hold). The owner's clear lifts the whole hold, so the SAME step (`impact_clear_core`: his `impact clear` and his words in the chat both end there, and only there) changes that one line to `MERGE: automatic`. One function does it, `neutralise_marker`.
 
 - **Only that line.** Every other byte of the body stays, a later line quoting the marker included. A body whose first line is anything else is not written.
 - **Only his clear, only that head.** The body is read fresh for the head he cleared (any other head: nothing), read again just before the write and written only if it is the same, then read back. A carry of a clear to a new head (#510) never touches the body, and the line stays neutral.

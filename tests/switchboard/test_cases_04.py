@@ -752,9 +752,6 @@ class TestCaptainLabels(Base):
     def labels(self, *kinds):
         return ["%s:%s" % (self.U, k) for k in kinds]
 
-    def window(self, until):
-        return mock.patch.object(sb, "CAPTAIN_MARKER_UNTIL", until)
-
     def test_the_label_makes_a_pr_captain_with_no_first_line_at_all(self):
         self.assertTrue(sb.is_captain({"labels": self.labels("merge-captain"), "body": "Adds the widget."}))
         self.assertTrue(sb.is_captain({"labels": [{"name": self.labels("merge-captain")[0]}], "body": None}))   # label dicts too
@@ -762,26 +759,19 @@ class TestCaptainLabels(Base):
         self.assertFalse(sb.is_captain({"labels": ["bug", "merge-captain-ish", "x:merge-captain-not"], "body": "x"}))
         self.assertFalse(sb.is_captain(None))
 
-    def test_the_first_line_marker_counts_only_inside_the_dated_window_and_only_without_a_merge_label(self):
-        pr = {"labels": [], "body": "\n\nMERGE: captain\nrest"}
-        end = datetime.datetime.strptime(sb.CAPTAIN_MARKER_UNTIL, "%Y-%m-%d").replace(tzinfo=datetime.timezone.utc).timestamp() + 86400
-        self.assertTrue(sb.is_captain(pr, now=end - 60))                      # the last minute of the window
-        self.assertFalse(sb.is_captain(pr, now=end + 60))                     # the day after: the line is no longer read
-        with self.window(None):                                               # the one-line way to drop the marker
-            self.assertFalse(sb.is_captain(pr))
-            self.assertTrue(sb.is_captain(dict(pr, labels=self.labels("merge-captain"))))
-        for body in ("see MERGE: captain", "intro\nMERGE: captain", "MERGE: captainship", "merge: captain"):
-            self.assertFalse(sb.is_captain({"labels": [], "body": body}, now=end - 60), body)
+    def test_the_first_line_marker_holds_nothing_the_label_is_the_only_signal(self):
+        for body in ("\n\nMERGE: captain\nrest", "MERGE: captain", "see MERGE: captain", "intro\nMERGE: captain", "MERGE: captainship", "merge: captain"):
+            self.assertFalse(sb.is_captain({"labels": [], "body": body}), body)
+        self.assertTrue(sb.is_captain({"labels": self.labels("merge-captain"), "body": "no line at all"}))
+        self.assertFalse(sb.is_captain({"labels": self.labels("merge-automatic"), "body": "MERGE: captain\nx"}))
 
-    def test_the_window_ends_30_days_after_the_labels_landed_on_2026_10_11(self):
-        self.assertEqual(sb.CAPTAIN_MARKER_UNTIL, "2026-11-10")           # what the definitions tell agents and the owner approved
-        landed = datetime.datetime(2026, 10, 11, tzinfo=datetime.timezone.utc)
-        end = datetime.datetime.strptime(sb.CAPTAIN_MARKER_UNTIL, "%Y-%m-%d").replace(tzinfo=datetime.timezone.utc)
-        self.assertEqual((end - landed).days, 30)
-        pr = {"labels": [], "body": "MERGE: captain\nx"}
-        day = lambda y, m, d, h=12: datetime.datetime(y, m, d, h, tzinfo=datetime.timezone.utc).timestamp()
-        self.assertTrue(sb.is_captain(pr, now=day(2026, 11, 10)))          # the last day still reads the line
-        self.assertFalse(sb.is_captain(pr, now=day(2026, 11, 11, 1)))      # the day after it does not
+    def test_the_held_rule_reads_no_clock_and_no_date(self):
+        for now in (0, 1767225600, 4102444800):   # before and after the old window's end: one answer
+            with mock.patch.object(sb.time, "time", return_value=now):
+                self.assertFalse(sb.is_captain({"labels": [], "body": "MERGE: captain\nx"}))
+                self.assertTrue(sb.is_captain({"labels": self.labels("merge-captain"), "body": "x"}))
+        self.assertFalse(hasattr(sb, "CAPTAIN_MARKER_UNTIL"))
+        self.assertFalse(hasattr(sb, "marker_window_open"))
 
     def test_the_label_wins_when_it_disagrees_with_the_line(self):
         auto = {"labels": self.labels("merge-automatic"), "body": "MERGE: captain\nx"}
@@ -795,7 +785,7 @@ class TestCaptainLabels(Base):
         agree = sb.pr_marker_state(self.labels("merge-captain"), "MERGE: captain\nx")
         self.assertEqual((agree["captain"], agree["findings"]), (True, []))
         line_only = sb.pr_marker_state([], "MERGE: captain\nx")
-        self.assertEqual((line_only["captain"], line_only["findings"]), (True, ["marker-without-label"]))
+        self.assertEqual((line_only["captain"], line_only["findings"]), (False, ["marker-without-label"]))   # a note: the line is ignored, nothing is held
 
     def test_hold_reasons_come_from_the_hold_labels_only_and_sorted(self):
         self.assertEqual(sb.pr_hold_reasons(self.labels("hold-security", "merge-captain", "hold-contract", "hold-other-area")),
@@ -811,7 +801,7 @@ class TestCaptainLabels(Base):
         self.assertEqual((facts["captain"], facts["holds"], facts["captain_findings"]), (True, ["credential"], []))
         self.assertIn("labels", sb.PR_VIEW_FIELDS)
         old = sb.pr_facts_from(dict(data, labels=[], body="MERGE: captain\nx"))
-        self.assertEqual((old["captain"], old["captain_findings"]), (True, ["marker-without-label"]))     # still works in the window
+        self.assertEqual((old["captain"], old["captain_findings"]), (False, ["marker-without-label"]))     # the line alone holds nothing; the finding notes it
         self.assertFalse(sb.pr_facts_from(dict(data, labels=[], body="plain"))["captain"])
 
     def test_every_caller_reads_the_one_helper(self):

@@ -210,7 +210,7 @@ def escalate_notice(engine, runner, decision, reason, name):
         raise DecisionError("%s: the pull request is %s, so there is nothing to escalate (a notice ends then)" % (ident, facts.get("state") or "not open"))
     if not facts.get("captain") or not facts.get("head"):
         raise DecisionError("%s is a PR notice: information only, so nothing was escalated. It becomes a decision when the pull request carries the merge hold "
-                            "(%s, or `MERGE: captain` first in its body)" % (ident, label_names(engine.config)["merge-captain"]))
+                            "(the %s label; a `MERGE: captain` first line is not read)" % (ident, label_names(engine.config)["merge-captain"]))
     held = {"id": ident, "kind": "captain", "tier": "cos", "repo": repo, "number": number, "head": facts["head"]}
     return escalate_decision(engine, runner, held, reason, name)
 

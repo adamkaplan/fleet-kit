@@ -517,15 +517,10 @@ def apply_notice_effects(engine):
 CAPTAIN_MARK = "MERGE: captain"
 
 
-def pr_is_captain(body):
-    """True when the body's FIRST non-empty line starts with `MERGE: captain`. Nothing else of the body is read."""
-    return pr_marker(body) == "captain"
-
-
-def is_captain(pr, now=None):
+def is_captain(pr):
     """THE one helper: whether a PR is held for the person. `pr` is a dict with `labels` (names or {"name"} dicts) and `body`;
-    see `pr_marker_state` for the rule (label first, the first-line marker only inside the transition window)."""
-    return pr_marker_state((pr or {}).get("labels"), (pr or {}).get("body"), now)["captain"]
+    see `pr_marker_state` for the rule (the label is the only signal)."""
+    return pr_marker_state((pr or {}).get("labels"), (pr or {}).get("body"))["captain"]
 
 
 def sweep_clear_agrees(engine, repo, number, labels, marker):

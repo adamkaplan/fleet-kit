@@ -12735,7 +12735,7 @@ class TestClearMarker(Base):
             self.assertEqual(after, before.replace("MERGE: captain", "MERGE: automatic"))
             self.assertEqual(new.replace("MERGE: automatic", "MERGE: captain", 1), body)
         self.assertIsNone(sb.marker_edit(None))
-        self.assertFalse(sb.pr_marker_state([], sb.marker_edit("MERGE: captain\n")[0], now=0)["captain"])
+        self.assertFalse(sb.pr_marker_state([], sb.marker_edit("MERGE: captain\n")[0])["captain"])
 
 
 
@@ -14672,7 +14672,7 @@ class TestClearCarryInTheDaemon(Base):
         self.assertEqual(self.hold(new), 0)
         self.assertEqual(len(self.events("gate.clear_carried")), 1)
         self.assertEqual(([w for w in self.writes if w[1].endswith("/pulls/7")], self.body), ([], before))
-        self.assertFalse(sb.pr_marker_state([], self.body, now=0)["captain"], "the gate reads no hold from the text")
+        self.assertFalse(sb.pr_marker_state([], self.body)["captain"], "the gate reads no hold from the text")
 
     def test_891_a_carried_clear_touches_no_hold_label_and_a_re_hold_never_writes_the_owners_own_hold(self):
         owner_hold = self.names[sb.OWNER_HOLD_KEY]
@@ -49851,14 +49851,9 @@ class TestCaptainDecisionFromLabels(TestCaptainPrs):
         self.assertEqual((entry["kind"], entry["tier"]), ("captain", "cos"))
         self.assertEqual(entry["holds"], ["contract", "security"])
 
-    def test_a_marker_only_pr_still_works_in_the_window_and_not_after(self):
-        self.answer(self.labelled(body="MERGE: captain\nland it"))
-        self.assertEqual(self.only()["kind"], "captain")
-        self.assertNotIn("holds", self.only())
-        with mock.patch.object(sb, "CAPTAIN_MARKER_UNTIL", None):
-            self.answer(self.labelled(body="MERGE: captain\nland it", head=HEAD_A))
-            self.world.tick(sb.PR_FACTS_TTL + 1)
-            self.assertEqual(self.only()["kind"], "notice")
+    def test_a_marker_only_pr_is_not_held_the_label_is_the_only_signal(self):
+        self.answer(self.labelled(body="MERGE: captain\nland it", head=HEAD_A))
+        self.assertEqual(self.only()["kind"], "notice")
 
     def test_a_merge_automatic_label_beats_the_line(self):
         self.answer(self.labelled("merge-automatic", body="MERGE: captain\nx"))
