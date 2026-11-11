@@ -113,7 +113,7 @@ class TestCheck(Home):
                 self.assertIsInstance(sb.check_worktree_path({}, path), str)
 
 
-class TestLaunch(Home):
+class TestWorktreeLaunch(Home):
     """The real `launch` command of a LOCAL worker, stopped by a stub right after the check (Reached): a refusal never gets there."""
 
     def launch(self, directory, check=True):

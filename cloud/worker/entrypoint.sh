@@ -168,6 +168,14 @@ H
   fi
   # ~/.gitconfig is read by every process of this user, including a fresh-environment `kubectl exec` (the end hook)
   git config --global credential.helper "$bin/git-credential-cw"
+  git config --global core.hooksPath /usr/local/lib/cw-hooks   # the pre-push hook of the image (a convenience, not the guard)
+  # the image's default identity (two lines: name, email), each key only when unset in the global file; a value already there is kept
+  idfile="${CW_IDENTITY_FILE:-/etc/cw-default-identity}"
+  if [ -r "$idfile" ]; then
+    { IFS= read -r id_name; IFS= read -r id_email; } < "$idfile" || true
+    if [ -n "$id_name" ] && [ -z "$(git config --global --get user.name 2>/dev/null)" ]; then git config --global user.name "$id_name"; fi
+    if [ -n "$id_email" ] && [ -z "$(git config --global --get user.email 2>/dev/null)" ]; then git config --global user.email "$id_email"; fi
+  fi
   PATH="$bin:$PATH"; export PATH
 fi
 

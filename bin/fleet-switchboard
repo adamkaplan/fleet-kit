@@ -5637,6 +5637,7 @@ BOSS_READ_SITES = {
     "bin/cloud_end_alert.py:scan_audit": "a cloud worker's own endpoint record (not a discovered agent): its reports_to is read from the record; the message goes to the lane name `send` resolves (the same lookup), with the Chief of Staff as the second recipient",
     "bin/cloud_worker.py:_may_retire": "the one caller rule of `retire` and `cloud-clear`: a cloud worker's own endpoint record (not a discovered agent: out of scope of the boss record)",
     "bin/cloud_retired.py:keep_boss": "keeps the boss of a removed cloud worker from the worker's own endpoint record (not a discovered agent) so `read` can answer for it after the record is gone",
+    "bin/cloud_retired.py:read_ended": "a cloud worker's own endpoint record (not a discovered agent: `boss_name` needs a discovery and an observation, which a pod that could not be reached has none of): its reports_to is read from the record and handed to `read_run_record` as the fallback boss of the ended run, only for the caller rule of `read`",
     "bin/cloud_lane_cap.py:lane_m_workers": "the lane of a record, for the M cap: a cloud worker's own endpoint record (not a discovered agent), read as written",
     "bin/cloud_inspect.py:cmd_inspect": "a cloud worker's own endpoint record (not a discovered agent): its reports_to is read from the record and compared with the caller, the same rule as `_may_retire` but the boss alone",
 }

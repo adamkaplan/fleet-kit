@@ -1,0 +1,91 @@
+#!/bin/sh
+# pre-push <remote name> <remote url>; stdin: one line per ref: <local ref> <local sha> <remote ref> <remote sha> (zeros: a deletion, or a new remote ref).
+# Installed as the global core.hooksPath of the worker user. A push of the default branch to a NETWORK remote needs a land record:
+#   the local object is a full 40-hex commit whose message has non-empty Land-Checks and Land-Council trailers (none "not recorded"),
+#   and the remote's current object is an ancestor of it. A deletion of the default branch is refused. A NEW remote branch (remote sha all zeros) is let
+#   through only when the local commit also carries the record: zeros never skip the trailer check, they only skip the ancestor check.
+# Every other push passes. After the rule passes the repository's own pre-push hook runs with the same arguments and input.
+# HONESTY: a convenience, not the guard (--no-verify, a changed hooks path or another home skip it). The repository's rules and the token's scope are the guard.
+url=${2:-}
+zeros=0000000000000000000000000000000000000000
+
+find_git() {
+  if [ -n "${CW_REAL_GIT:-}" ] && [ -x "$CW_REAL_GIT" ]; then printf '%s\n' "$CW_REAL_GIT"; return 0; fi
+  oldifs=$IFS; IFS=:
+  for d in $PATH; do
+    [ -n "$d" ] || d=.
+    if [ -x "$d/git" ] && ! grep -q 'cw-guard' "$d/git" 2>/dev/null; then IFS=$oldifs; printf '%s\n' "$d/git"; return 0; fi
+  done
+  IFS=$oldifs
+  return 1
+}
+refuse() { echo "refused: pushing the default branch without a land record: the repository's rules are the guard; this hook is only a convenience" >&2; exit 3; }
+
+input=$(cat)
+real_git=$(find_git) || real_git=""
+
+network() {
+  case "$url" in
+    https://*|http://*|ssh://*|git://*) return 0 ;;
+    file://*|/*|./*|../*|"") return 1 ;;
+    *:*) case "${url%%:*}" in */*) return 1 ;; *) return 0 ;; esac ;;   # scp-like [user@]host:path
+  esac
+  return 1
+}
+
+is_default() {   # $1: a branch name
+  case "$1" in main|master) return 0 ;; esac
+  for b in $(printf '%s' "${CW_DEFAULT_BRANCH:-}" | tr ',' ' '); do [ "$b" = "$1" ] && return 0; done
+  [ -n "$real_git" ] || return 1
+  o=$("$real_git" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null | sed 's|^origin/||')
+  [ -n "$o" ] && [ "$o" = "$1" ]
+}
+
+land_record() {   # $1: sha
+  [ -n "$real_git" ] || return 1
+  case "$1" in *[!0-9a-f]*) return 1 ;; esac
+  [ ${#1} -eq 40 ] || return 1
+  [ "$("$real_git" rev-parse --verify --quiet "$1^{commit}" 2>/dev/null)" = "$1" ] || return 1   # a tag object peels to another name
+  tr_out=$("$real_git" log -1 --format=%B "$1" 2>/dev/null | "$real_git" interpret-trailers --parse 2>/dev/null) || return 1
+  for t in Land-Checks Land-Council; do
+    [ -n "$(printf '%s\n' "$tr_out" | grep "^$t:")" ] || return 1
+    [ -z "$(printf '%s\n' "$tr_out" | grep -E "^$t:[[:space:]]*$")" ] || return 1   # an empty duplicate
+    vals=$(printf '%s\n' "$tr_out" | sed -n "s/^$t:[[:space:]]*//p" | sed 's/[[:space:]]*$//')
+    while IFS= read -r v; do
+      [ -n "$v" ] || return 1
+      [ "$(printf '%s' "$v" | tr 'A-Z' 'a-z')" = "not recorded" ] && return 1
+    done <<EOF2
+$vals
+EOF2
+  done
+  return 0
+}
+
+if network; then
+  while IFS=' ' read -r lref lsha rref rsha; do
+    [ -n "$rref" ] || continue
+    case "$rref" in refs/heads/*) ;; *) continue ;; esac
+    is_default "${rref#refs/heads/}" || continue
+    [ "$lsha" != "$zeros" ] || refuse   # a deletion
+    land_record "$lsha" || refuse
+    if [ "$rsha" != "$zeros" ]; then
+      "$real_git" merge-base --is-ancestor "$rsha" "$lsha" 2>/dev/null || refuse   # also when the remote's object is not here
+    fi
+  done <<EOF3
+$input
+EOF3
+fi
+
+# the repository's own hook, if any, after the rule
+own=""
+if [ -n "$real_git" ]; then
+  own=$("$real_git" rev-parse --git-path hooks/pre-push 2>/dev/null) || own=""
+  if [ -n "$own" ] && [ "$own" -ef "$0" ]; then
+    c=$("$real_git" rev-parse --git-common-dir 2>/dev/null) && own="$c/hooks/pre-push" || own=""
+  fi
+fi
+if [ -n "$own" ] && [ -f "$own" ] && [ -x "$own" ] && ! [ "$own" -ef "$0" ]; then
+  { [ -z "$input" ] || printf '%s\n' "$input"; } | "$own" "$@"
+  exit $?
+fi
+exit 0
