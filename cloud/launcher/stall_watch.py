@@ -44,7 +44,7 @@ ERROR_LINE = re.compile(r"error|fail|exception|denied|refused|cannot|unable|not 
 # Run INSIDE the pod by `kubectl exec python3 -c <this>`. Reads only: the progress file (mtime, last 10 lines), /work/runs (per file name, mtime and the last
 # line of a log, the number of an exit file) and the agent session's last non-user message (at most 400 characters) from the pod's own server. Prints ONE JSON line.
 PROBE_CODE = r'''
-import base64, json, os, sys, time, urllib.request
+import base64, json, os, sys, time, urllib.parse, urllib.request
 def tail(p, n):
     try:
         with open(p, "rb") as f:
@@ -88,20 +88,26 @@ try:
         u = (ss[-1].get("time") or {}).get("updated")
         if isinstance(u, (int, float)):
             out["msg_time"] = u / 1000.0 if u > 1e11 else u
-        body = get("/api/session/%s/message?limit=10&order=desc" % ss[-1]["id"]) if time.time() - out["now"] < 1.2 else {}
-        items = body.get("data") if isinstance(body, dict) else body
-        best, bt = "", -1
-        for m in items or []:
-            info = m.get("info") or m
-            if m.get("type") == "user" or info.get("role") == "user":
-                continue
-            text = m.get("text") or info.get("text") or ""
-            if not text and isinstance(m.get("parts"), list):
-                text = " ".join(str(x.get("text") or "") for x in m["parts"] if isinstance(x, dict))
-            t = (info.get("time") or {}).get("created")
-            t = t if isinstance(t, (int, float)) else 0
-            if text and t >= bt:
-                best, bt = text, t
+        best, bt, q = "", -1, ""
+        for _page in range(5):
+            body = get("/api/session/%s/message%s" % (ss[-1]["id"], q)) if time.time() - out["now"] < 1.2 else {}
+            items = body.get("data") if isinstance(body, dict) else body
+            for m in items or []:
+                info = m.get("info") or m
+                if m.get("type") == "user" or info.get("role") == "user":
+                    continue
+                text = m.get("text") or info.get("text") or ""
+                if not text and isinstance(m.get("parts"), list):
+                    text = " ".join(str(x.get("text") or "") for x in m["parts"] if isinstance(x, dict))
+                t = (info.get("time") or {}).get("created")
+                t = t if isinstance(t, (int, float)) else 0
+                if text and t >= bt:
+                    best, bt = text, t
+            cur = body.get("cursor") if isinstance(body, dict) else None
+            nxt = cur.get("next") if isinstance(cur, dict) else None
+            if not nxt:
+                break
+            q = "?cursor=" + urllib.parse.quote(str(nxt))
         out["msg"] = best[-400:]
 except Exception:
     pass
@@ -241,7 +247,7 @@ def watch_pass(launcher, pods, now, name_ok, send=None):
                 print("cloud-worker: stall watch skipped %s: the pass's read budget is used" % name, file=sys.stderr)
                 continue
             try:
-                data = json.loads(kube.exec(name, "python3", "-c", PROBE_CODE, timeout=EXEC_SECONDS).strip().splitlines()[-1])
+                data = json.loads(kube.exec(name, "python3", "-I", "-c", PROBE_CODE, timeout=EXEC_SECONDS).strip().splitlines()[-1])
                 if not isinstance(data, dict):
                     raise ValueError("not an object")
             except Exception:
@@ -253,10 +259,12 @@ def watch_pass(launcher, pods, now, name_ok, send=None):
                 last = launcher_parse(mark)
                 if mark and (last is None or 0 <= (now - last).total_seconds() < REALERT_SECONDS):
                     continue   # alerted within the hour (an unreadable mark counts as alerted)
-                ev = evidence(kube.scrub(text, 600) if callable(getattr(kube, "scrub", None)) else text)
+                ev = evidence(kube.scrub(text, 3000) if callable(getattr(kube, "scrub", None)) else text)
                 kube.annotate(name, (pod.get("metadata") or {}).get("uid"), **{"stall_alert_" + condition.replace("-", "_"): launcher_iso(now)})   # BEFORE the send
                 body = message(name, condition, ev, launcher_iso(now))
                 boss = boss_of(launcher, worker)
+                if boss is None:
+                    print("cloud-worker: stall alert for %s goes to the Chief of Staff only: no boss in the record" % name, file=sys.stderr)
                 delivered = 0
                 for to in ([CHIEF] + ([boss] if boss and boss != CHIEF else [])):
                     try:
