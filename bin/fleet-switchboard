@@ -7513,7 +7513,7 @@ def pr_marker(body):
 def _label_kind(names, kinds):
     """The kinds of `kinds` (`merge-captain`, `hold-security`, ...) among label names written `<prefix>:<kind>`."""
     found = []
-    for name in names if isinstance(names, (list, tuple)) else ():   # labels that are not a list name nothing
+    for name in names if isinstance(names, (list, tuple, set, frozenset)) else ():   # labels that are not a collection name nothing
         text = name.get("name") if isinstance(name, dict) else name
         if isinstance(text, str) and ":" in text and text.rsplit(":", 1)[1] in kinds and text.rsplit(":", 1)[1] not in found:
             found.append(text.rsplit(":", 1)[1])

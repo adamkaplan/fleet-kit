@@ -791,6 +791,8 @@ class TestCaptainLabels(Base):
         self.assertEqual(sb.pr_hold_reasons(self.labels("hold-security", "merge-captain", "hold-contract", "hold-other-area")),
                          ["contract", "other-area", "security"])
         self.assertEqual(sb.pr_hold_reasons(["bug", None, 5]), [])
+        self.assertEqual(sb.pr_hold_reasons(set(self.labels("hold-security"))), ["security"])   # a set of names reads like a list
+        self.assertTrue(sb.is_captain({"labels": set(self.labels("merge-captain")), "body": ""}))
         self.assertEqual(sb.pr_hold_reasons(self.labels("hold-impact", "merge-captain")), ["impact"])   # #179 L4: the same held-PR label set
         self.assertTrue(sb.pr_marker_state(self.labels("merge-captain", "hold-impact"), "")["captain"])
 
@@ -816,6 +818,11 @@ class TestCaptainLabels(Base):
         gate = lambda f: next(r for r in sb.plan_ledger.evaluate_gates(None, [], None, f, "acme/api#1")["gates"] if r["gate"] == "G6")
         self.assertEqual(gate(facts)["status"], "waiting")
         self.assertIn("labels could not be read", " ".join(gate(facts)["missing"]))
+        self.assertEqual(gate({k: v for k, v in facts.items() if k != "captain"})["status"], "waiting")   # an absent fact is not "not held" either
+        self.assertEqual(gate(dict(facts, captain=False, holds=["hold"]))["status"], "ok")   # G6 reads the merge-captain label only; a hold label is G6b's input
+        g6b = lambda f: next(r for r in sb.plan_ledger.evaluate_gates(None, [], None, f, "acme/api#1")["gates"] if r["gate"] == "G6b")
+        self.assertNotEqual(g6b(facts)["status"], "n/a")   # unreadable labels do not skip the held-PR body check
+        self.assertEqual(g6b(dict(facts, captain=False))["status"], "n/a")
         self.assertEqual(gate(dict(facts, captain=False))["status"], "ok")   # control: readable and not held passes
 
 
