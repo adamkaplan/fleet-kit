@@ -26,6 +26,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends make \
  && rm -rf /var/lib/apt/lists/*
 # ---- end #1165 ----
 
+# ask #2353: an init as the pod's first process (reaps orphans, forwards signals): the distribution's tini, no download.
+RUN apt-get update && apt-get install -y --no-install-recommends tini \
+ && rm -rf /var/lib/apt/lists/*
+
 # #2047: system libraries (and fonts for screenshots) of Playwright's headless Chromium shell, which exits 127 without them.
 RUN apt-get update && apt-get install -y --no-install-recommends libasound2t64 libatk-bridge2.0-0t64 libatk1.0-0t64 libatspi2.0-0t64 libcairo2 libcups2t64 libdbus-1-3 libdrm2 libfontconfig1 libfreetype6 libgbm1 libglib2.0-0t64 libnspr4 libnss3 libpango-1.0-0 libx11-6 libxcb1 libxcomposite1 libxdamage1 libxext6 libxfixes3 libxkbcommon0 libxrandr2 fonts-liberation fonts-noto-color-emoji fonts-unifont fonts-freefont-ttf \
  && rm -rf /var/lib/apt/lists/*
@@ -105,7 +109,7 @@ RUN chown -R root:root /opt/cloud && chmod 0755 /opt/cloud /opt/cloud/launcher &
 USER worker
 WORKDIR /home/worker
 EXPOSE 4096
-ENTRYPOINT ["/usr/local/bin/worker-entrypoint"]
+ENTRYPOINT ["/usr/bin/tini", "-g", "--", "/usr/local/bin/worker-entrypoint"]
 # The launcher sets OPENCODE_SERVER_PASSWORD at run time; it is never in the image.
 CMD ["opencode", "serve", "--hostname", "0.0.0.0", "--port", "4096"]
 
@@ -120,12 +124,12 @@ ARG PG_VERSION=16.15
 ARG PG_SHA256=c1575341fa7bd40f5274ea465b34390f4dc64cdd0770af327005caaeb9f6b7ed
 ARG PGVECTOR_VERSION=0.8.7
 ARG PGVECTOR_COMMIT=f37c13f68b57d2c3472b2214fbcff699d6d34876
-ARG PGMQ_VERSION=1.13.1
-ARG PGMQ_COMMIT=8eab18272e50077ab9f72d9787296655f2849dcc
+ARG PGMQ_VERSION=1.13.0
+ARG PGMQ_COMMIT=32c075bb6dbed66a303d1a792393c93e36c09a97
 RUN set -eu; curl -fsSL "https://ftp.postgresql.org/pub/source/v${PG_VERSION}/postgresql-${PG_VERSION}.tar.bz2" -o /tmp/pg.tar.bz2 \
  && echo "${PG_SHA256}  /tmp/pg.tar.bz2" | sha256sum -c - \
  && mkdir -p /src/pg && tar -xjf /tmp/pg.tar.bz2 -C /src/pg --strip-components=1 && rm /tmp/pg.tar.bz2 \
- && cd /src/pg && ./configure --prefix=/opt/pg --without-readline --without-icu --without-zlib --without-openssl \
+ && cd /src/pg && ./configure --prefix=/opt/pg --without-readline --without-icu --without-zlib --with-openssl \
  && make -j"$(nproc)" && make install
 RUN set -eu; git clone --filter=blob:none https://github.com/pgvector/pgvector /src/pgvector \
  && cd /src/pgvector && git checkout --detach "${PGVECTOR_COMMIT}" \
