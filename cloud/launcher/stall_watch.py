@@ -53,7 +53,7 @@ def tail(p, n):
             return [l for l in f.read().decode("utf-8", "replace").splitlines() if l.strip()][-n:]
     except OSError:
         return None
-out = {"now": time.time(), "progress": None, "runs": [], "exits": [], "msg": "", "msg_time": None}
+out = {"now": time.time(), "progress": None, "runs": [], "exits": [], "msg": "", "msg_time": None, "updated": None, "activity": None, "running": None}
 try:
     p = "/work/progress.txt"
     out["progress"] = {"mtime": os.path.getmtime(p), "tail": [l[:400] for l in (tail(p, 10) or [])]}
@@ -89,6 +89,14 @@ try:
         u = (ss[-1].get("time") or {}).get("updated")
         if isinstance(u, (int, float)):
             out["msg_time"] = u / 1000.0 if u > 1e11 else u
+            out["updated"] = out["msg_time"]
+        try:
+            act = get("/api/session/active").get("data")
+            out["running"] = any(not isinstance(v, dict) or v.get("type") in (None, "running") for v in act.values()) if isinstance(act, dict) else bool(act)
+        except Exception:
+            pass
+        def sec(x):
+            return (x / 1000.0 if x > 1e11 else x) if isinstance(x, (int, float)) and not isinstance(x, bool) else None
         best, bt, q = "", -1, ""
         for _page in range(5):
             body = get("/api/session/%s/message%s" % (ss[-1]["id"], q)) if time.time() - out["now"] < 1.2 else {}
@@ -102,6 +110,11 @@ try:
                     text = " ".join(str(x.get("text") or "") for x in m["parts"] if isinstance(x, dict))
                 t = (info.get("time") or {}).get("created")
                 t = t if isinstance(t, (int, float)) else 0
+                for tm in [info.get("time") or {}] + [((x.get("state") or {}).get("time") or x.get("time") or {}) for x in (m.get("parts") if isinstance(m.get("parts"), list) else []) if isinstance(x, dict)]:
+                    for k in ("created", "start", "end", "completed"):
+                        v = sec(tm.get(k)) if isinstance(tm, dict) else None
+                        if v is not None and v <= out["now"] + 60:
+                            out["activity"] = max(out["activity"] or 0, v)
                 if text and t >= bt:
                     best, bt = text, t
             cur = body.get("cursor") if isinstance(body, dict) else None
@@ -151,6 +164,27 @@ def _num(v):
     return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
 
 
+RUNNING_QUIET_SECONDS = 30 * 60    # a running turn with no new message or tool call for this long no longer silences a condition (a turn hung inside one tool call)
+
+
+def session_state(data, now, threshold):
+    """(working, reason): working is True when the session shows activity that silences a condition of `threshold` seconds (its last message or tool call, else its
+    last update, is younger than the threshold; or a turn is running and that time is younger than RUNNING_QUIET_SECONDS), False when it is quiet, None with the
+    reason when the server did not answer or the fields are missing (the condition then decides from the files)."""
+    last = _num(data.get("activity"))
+    if last is None:
+        last = _num(data.get("updated"))
+    running = data.get("running") if isinstance(data.get("running"), bool) else None
+    if last is None:
+        return None, ("the session's activity was not readable" if running is None and data.get("updated") is None else "the session's last activity time was missing")
+    age = now - last
+    if age < threshold:
+        return True, ""
+    if running and age < RUNNING_QUIET_SECONDS:
+        return True, ""
+    return False, ""
+
+
 def decide(data):
     """{condition: evidence text} for the three conditions, from the probe's answer. Pure: times are the pod's own clock (`now` in the answer)."""
     now = _num(data.get("now"))
@@ -168,7 +202,9 @@ def decide(data):
     times = [t for t in [ptime] + [_num(r["mtime"]) for r in runs] if t is not None]
     active = any(r.get("name") not in exited and now - _num(r["mtime"]) < RUN_ACTIVE_SECONDS for r in runs)
     if times and not active and now - max(times) >= STALE_SECONDS:
-        found["progress-stale"] = "no change for %d minutes; last progress line: %s" % ((now - max(times)) // 60, tail[-1] if tail else "(none)")
+        working, why = session_state(data, now, STALE_SECONDS)
+        if not working:
+            found["progress-stale"] = "no change for %d minutes%s; last progress line: %s" % ((now - max(times)) // 60, "" if working is False else " (decided from the files: %s)" % why, tail[-1] if tail else "(none)")
     # (b)
     msg = str(data.get("msg") or "")
     hit = next((l for l in msg.splitlines() + tail[-2:] if REFUSAL_WORDS.search(l)), None)
@@ -191,7 +227,7 @@ def decide(data):
     if bad:
         e = max(bad, key=lambda x: _num(x["mtime"]))
         moved = max([t for t in (_num(e["mtime"]), ptime, stime) if t is not None])
-        if now - moved >= FAILED_IDLE_SECONDS:
+        if now - moved >= FAILED_IDLE_SECONDS and not session_state(data, now, FAILED_IDLE_SECONDS)[0]:
             log = next((r.get("last") for r in runs if r.get("name") == e.get("name")), "") or ""
             found["failed-run-idle"] = "run %s exited %s; no change for %d minutes; last log line: %s" % (str(e.get("name"))[:60], str(e.get("code"))[:6], (now - moved) // 60, log)
     return found

@@ -110,6 +110,72 @@ class Stall(unittest.TestCase):
         w.add(msg="all done, pushing", tail=("compiling", "tests passed"))
         self.assertEqual(w.run(), [])
 
+    def _session(self, w, **fields):
+        """Adds the session read's fields (minutes ago for the times) to the fake pod's answer, without touching the earlier fixtures."""
+        pod = w.pods["w1-pod"]
+        old = pod["probe"]
+
+        def probe(now, f=old):
+            out = f(now)
+            for k in ("activity", "updated"):
+                if k in fields:
+                    out[k] = now.timestamp() - fields[k] * 60
+            if "running" in fields:
+                out["running"] = fields["running"]
+            return out
+        pod["probe"] = probe
+
+    def _s2(self, module):
+        stale = dict(progress_age=16, runs=[("t", 16, "x")], exits=[("t", 0, 16)], msg_age=16)
+        for label, fields, want in (("active 3 minutes ago", dict(activity=3, updated=3, running=False), []),
+                                    ("a turn running, active 5 minutes ago", dict(activity=5, updated=5, running=True), []),
+                                    ("quiet 16 minutes", dict(activity=16, updated=16, running=False), ["progress-stale"])):
+            w = World()
+            w.add(**stale)
+            self._session(w, **fields)
+            self.assertEqual(conditions(w.run(module)), want, "a working agent was called stalled: %s" % label if not want else "a quiet agent was not alerted: %s" % label)
+        w = World()
+        w.add(**stale)
+        self._session(w, activity=31, updated=31, running=True)   # the guard: a running turn quiet for 31 minutes is the old stranding
+        self.assertEqual(conditions(w.run(module)), ["progress-stale"], "a hung turn was called working")
+
+    def test_s2_a_working_session_silences_progress_stale_and_a_quiet_one_does_not(self):
+        self._s2(sw)
+
+    def test_s3_failed_run_idle_follows_the_session_with_its_10_minutes(self):
+        for activity, want in ((4, []), (11, ["failed-run-idle"])):
+            w = World()
+            w.add(progress_age=11, msg_age=11, runs=[("t", 11, "FAILED")], exits=[("t", 2, 11)])
+            self._session(w, activity=activity, updated=activity, running=False)
+            self.assertEqual(conditions(w.run()), want, activity)
+        w = World()   # a running turn quiet for 31 minutes still alerts
+        w.add(progress_age=40, msg_age=40, runs=[("t", 40, "FAILED")], exits=[("t", 2, 40)])
+        self._session(w, activity=31, updated=31, running=True)
+        self.assertEqual(conditions(w.run()), ["failed-run-idle", "progress-stale"])
+
+    def test_s4_a_server_that_does_not_answer_decides_from_the_files_and_says_why(self):
+        for fields in (dict(), dict(running=None), dict(running=True)):
+            w = World()
+            w.add(progress_age=16)
+            self._session(w, **fields)
+            out = w.run()
+            self.assertEqual(conditions(out), ["progress-stale"], fields)
+            self.assertIn("decided from the files", w.audits[0]["evidence"])
+            self.assertIn("session", w.audits[0]["evidence"])
+
+    def test_s6_mutants_that_ignore_the_session_or_the_30_minute_guard_fail_with_the_anchored_text_after_the_control_passes(self):
+        self._s2(sw)   # the control
+        with open(SOURCE) as f:
+            text = f.read()
+        for old, new, anchor in (("working, why = session_state(data, now, STALE_SECONDS)", "working, why = False, ''", "a working agent was called stalled"),
+                                 ("RUNNING_QUIET_SECONDS = 30 * 60", "RUNNING_QUIET_SECONDS = 10 ** 9", "a hung turn was called working")):
+            self.assertEqual(text.count(old), 1, "the mutation did not apply")
+            mod = types.ModuleType("stall_watch_mutant")
+            exec(compile(text.replace(old, new), "mutant", "exec"), mod.__dict__)
+            with self.assertRaises(AssertionError) as caught:
+                self._s2(mod)
+            self.assertIn(anchor, str(caught.exception))
+
     def test_s4_failed_run_idle_at_11_not_9_and_not_for_exit_0(self):
         for idle, code, want in ((9, 2, []), (11, 2, ["failed-run-idle"]), (11, 0, [])):
             w = World()
