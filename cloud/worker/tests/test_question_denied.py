@@ -79,6 +79,14 @@ def base_other_keys():
     return None if ref is None else strip_question(json.loads(data))
 
 
+EXPECTED_STRIPPED = {"permission": {"bash": {"*": "allow"}}, "agent": {"worker": {"permission": {"bash": {"*": "allow"}}}}}
+
+
+def check_pin(cfg):
+    """Ask #2402: the whole content of the file apart from the question entries."""
+    assert strip_question(cfg) == EXPECTED_STRIPPED, "the permission file is not the catch-all allow alone"
+
+
 def orch_question(text):
     fm = text.split("---", 2)[1]
     m = re.search(r"^  question: (\S+)", fm, re.M)
@@ -93,7 +101,7 @@ class T(unittest.TestCase):
 
     def test_s4_no_other_permission_changed(self):
         # ask #2402: the file is compared with its whole expected content, not with the base commit's copy (the base held the rows this change removes)
-        self.assertEqual(strip_question(load()), {"permission": {"bash": {"*": "allow"}}, "agent": {"worker": {"permission": {"bash": {"*": "allow"}}}}})
+        check_pin(load())
 
     def test_s4_empty_agent_block_is_not_dropped(self):
         cfg = load()
@@ -105,15 +113,15 @@ class T(unittest.TestCase):
 
     def test_s4_mutant_with_a_bash_row_is_refused_by_the_whole_content_pin(self):
         # ask #2402: the old test mutated the base commit's copy (which held the deny rows); now the mutant is a copy of the current file
-        expected = {"permission": {"bash": {"*": "allow"}}, "agent": {"worker": {"permission": {"bash": {"*": "allow"}}}}}
-        self.assertEqual(strip_question(load()), expected)   # the control passes
+        check_pin(load())   # the control passes through the same pin the real test uses
         for mutate in (lambda m: m["permission"]["bash"].update({"gh pr merge*": "deny"}),
                        lambda m: m["agent"]["worker"]["permission"]["bash"].update({"*": "deny"}),
                        lambda m: m["permission"].update({"edit": {"*x*": "deny"}})):
             m = copy.deepcopy(load())
             mutate(m)
             self.assertNotEqual(m, load(), "mutation not applied")
-            self.assertNotEqual(strip_question(m), expected, "the pin did not see the mutant")
+            with self.assertRaises(AssertionError):
+                check_pin(m)
 
     def test_s4_check_blocks_flags_missing_blocks(self):
         cfg = load()
