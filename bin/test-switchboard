@@ -52069,7 +52069,7 @@ class TestEscalateANotice(BaselineWorld):
     def setUp(self):
         super().setUp()
         self.hold = {"name": sb.label_names(self.world.config)["merge-captain"]}
-        self.prs[7] = pr_view_json()
+        self.prs[7] = pr_view_json(labels=[])
         got = self.cmd("api-coder", "notice", "pr", "acme/api#7", "look")
         self.assertEqual(got["code"], 0, got)
         self.who("cos")
@@ -52175,7 +52175,7 @@ class TestEscalateALabelsOnlyHeldPullRequest(BaselineWorld):
         self.file(self.row())
         for what, view, said in (("merged", pr_view_json(state="MERGED", labels=[self.hold], headRefOid=HEAD_A), "nothing to escalate"),
                                  ("closed", pr_view_json(state="CLOSED", labels=[self.hold], headRefOid=HEAD_A), "nothing to escalate"),
-                                 ("unlabelled", pr_view_json(headRefOid=HEAD_A, body=""), "information only")):
+                                 ("unlabelled", pr_view_json(headRefOid=HEAD_A, body="", labels=[]), "information only")):
             with self.subTest(what):
                 self.prs[7] = view
                 got = self.cmd("cos", "decisions", "escalate", self.PID)
@@ -52242,7 +52242,7 @@ class TestEscalateALabelsOnlyHeldPullRequest(BaselineWorld):
         self.assertEqual((self.reads, self.marks()), ([], []))
 
     def test_u2_an_id_the_fresh_derivation_finds_never_reads_the_file(self):
-        self.prs[7] = pr_view_json()
+        self.prs[7] = pr_view_json(labels=[])
         self.assertEqual(self.cmd("api-coder", "notice", "pr", "acme/api#7", "look")["code"], 0)
         _, decisions, _ = sb.fresh_engine_decisions(self.route, self.world.clock.now)
         (found,) = [d for d in decisions if d.get("number") == 7]
