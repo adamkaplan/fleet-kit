@@ -1,0 +1,6 @@
+#!/bin/sh
+# spire: the ONE entry point of the tool (.spire/tool/bin/spire). It only starts spire.mjs, beside it, with the Node that is on PATH
+# (every command it dispatches pins the project's own versions itself, see versions.mjs). `spire help` prints the guide.
+here=$(dirname "$(readlink -f "$0")") || exit 1
+command -v node >/dev/null 2>&1 || { echo "spire: node is not on PATH. Install mise (https://mise.jdx.dev), then: mise use -g node@22" >&2; exit 1; }
+exec node "$here/../spire.mjs" "$@"
