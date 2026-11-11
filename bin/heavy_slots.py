@@ -1,0 +1,1183 @@
+"""CPU slots for heavy commands (ask #34): `fleet-switchboard heavy [--slots N] [--wait-max S] -- <command...>`.
+
+Full test suites and browser/e2e runs starve the machine when many agents start them at once. This runs such a command only when one of N slots is free
+(default 3), in the background QoS class, so at most N of them share the machine.
+
+  - A slot is a file `heavy-slot-<i>.lock` in the state directory, held with `flock` by the RUNNING COMMAND: the command inherits the locked descriptor, so
+    a slot is busy exactly while the command (or anything it left running with that descriptor) lives, and the kernel frees it when the last holder dies.
+    No pid file can lie about it. Killing the wrapper alone does not free the slot while its command still runs, which is what a slot is for.
+  - Waiting prints one line every 30 s (`heavy: waiting for a slot (3 of 3 busy: ...)`); past `--wait-max` seconds (default 1800) it exits 75
+    (EX_TEMPFAIL) and the command is not run.
+  - The command runs as `taskpolicy -b <command>` (macOS background class), else `nice -n 10 <command>`; its arguments, environment, working directory and
+    stdin/stdout/stderr are untouched, nothing goes through a shell, its exit status is the wrapper's (128 + n for a signal), and SIGINT/SIGTERM/SIGHUP
+    sent to the wrapper are forwarded to it. The child is always reaped: no zombie.
+  - `holders(state_dir)` says who holds a slot NOW: [{"slot", "name", "pid", "command", "since"}], read from the slot file of a slot whose lock is held.
+
+Pure of the switchboard: the caller hands it the state directory, the clock, the settings and the output. The slots are a courtesy limit among cooperating agents,
+not a boundary: FLEET_HEAVY=off, a CI run or a preset FLEET_HEAVY_SLOT skip them, and a holder's name is whatever its environment says."""
+
+import errno
+import fcntl
+import json
+import os
+import re
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+import threading
+import time
+import unicodedata
+
+DEFAULT_SLOTS = 3
+DEFAULT_WAIT_MAX = 1800
+POLL_SECONDS = 0.5
+WAIT_REPORT_SECONDS = 30
+PROGRESS_EVERY = 60   # one progress line per interval while the command runs; FLEET_HEAVY_PROGRESS_SECONDS shortens it (tests)
+EXIT_TEMPFAIL = 75      # no slot within --wait-max
+EXIT_USAGE = 64
+EXIT_NOT_FOUND = 127
+INFO_MAX = 4096         # bytes of a slot file read
+SLOT_ENV = "FLEET_HEAVY_SLOT"   # set in the command's environment: a command already in a slot does not take a second one
+OFF_ENV = "FLEET_HEAVY"         # "off": bypass (CI never uses slots)
+SLOTS_MAX = 64
+MEM_ENV = "FLEET_HEAVY_MEM_MB"           # memory ceiling of the command's whole process tree, in MB; 0 = off
+TIME_ENV = "FLEET_HEAVY_MAX_SECONDS"     # run-time ceiling, in seconds; 0 = off
+DEFAULT_MEM_MB = 16384
+DEFAULT_MAX_SECONDS = 7200
+WATCH_SECONDS = 5       # how often the watchdog looks
+KILL_GRACE_SECONDS = 10  # between the polite stop and the forced one
+SWEEP_ROUNDS = 5        # forced-stop rounds that look again for what is left
+SWEEP_SECONDS = 0.3     # between them
+PROC_ROOT = "/proc"      # the process directory the slot holders are read from; lsof only when it cannot be listed
+EXIT_TIME = 124
+EXIT_MEMORY = 137
+EXPRESS = "express"                    # the name of the one extra slot a declared-short command may use
+EXPRESS_SECONDS = 120                   # the wrapper's own time ceiling on a command in it
+QUEUE_FILE = "heavy-queue.json"          # the arrival order of the waiters
+QUEUE_LOCK = "heavy-queue.lock"
+QUEUE_MAX = 1000                        # entries read; more reads as a corrupt file
+QUEUE_BYTES = 262144
+LAST_SEEN_MAX = 120                     # characters of the last line a waiter wrote that a lost-waiter record keeps
+TEMPORARY_NAME = re.compile(r"heavy-queue\.json\.([0-9]{1,9})\.tmp", re.ASCII)   # a temporary file of the order, with the pid of the process that wrote it
+HARD_MAX_SECONDS = 14400                # the longest any run may hold a slot (4 h); a request above it, or 0, reads as this: a bound always exists
+ORPHAN_LOCK = "heavy-orphan.lock"       # held (not blocking) by whoever is stopping an orphan, so two checkers never stop and report the same one
+STOP_TOLD = ("sent", "unknown name", "failed")   # what the audit says of the message to the lane
+PID_MAX = 2 ** 22                       # no pid is larger (Linux pid_max at most 4194304)
+FORWARDED = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+
+
+class HeavyError(Exception):
+    """A refusal with a sentence for the caller."""
+
+
+SELECTORS = ("-k", "--filter", "-run", "-c", "-e", "-m")   # options whose NEXT word is a value (a filter, a shell string): the value is never read for a kind
+E2E_WORDS = ("playwright", "chromium", "chrome", "cypress", "puppeteer", "webdriver", "e2e", "--browser", "--headed")   # a WHOLE word of the command, or a part of the program's own name
+
+
+def _split(command):
+    """(program, rest): the program's basename and the words after it, once the wrappers that only start it are skipped (an interpreter given a script or `-m module`,
+    `timeout N`, `env VAR=x`, `taskpolicy -b`, `nice -n N`, `npx`). The kind is read from these and never from a substring of an argument."""
+    words = [str(word) for word in command]
+    while words:
+        base = os.path.basename(words[0])
+        if re.fullmatch(r"python[0-9.]*", base) or base in ("node", "sh", "bash", "zsh", "npx"):
+            if len(words) > 1 and words[1] == "-m":
+                words = words[2:]   # the module is the program
+                break
+            if len(words) > 1 and not words[1].startswith("-"):
+                words = words[1:]
+                continue
+            break
+        elif base == "timeout":
+            words = words[1:]
+            while words and (words[0].startswith("-") or re.fullmatch(r"[0-9.]+[smhd]?", words[0])):
+                words = words[1:]
+        elif base == "env":
+            words = words[1:]
+            while words and (words[0].startswith("-") or "=" in words[0]):
+                words = words[1:]
+        elif base in ("taskpolicy", "nice"):
+            words = words[1:]
+            while words and (words[0].startswith("-") or re.fullmatch(r"[0-9]+", words[0])):
+                words = words[1:]
+        else:
+            break
+    return (os.path.basename(words[0]).lower(), words[1:]) if words else ("", [])
+
+
+def _options(rest, any_option=False):
+    """The words of `rest` that are not the value of an option: always the value of a selector (-k, -c ...), and with `any_option` the word after any option-looking word
+    (`--name chrome`), except after the whole option words that select a kind themselves."""
+    skip, found = False, []
+    for word in rest:
+        if skip:
+            skip = False
+            continue
+        found.append(word)
+        if word in SELECTORS or (any_option and word.startswith("-") and "=" not in word and word not in E2E_WORDS):
+            skip = True
+    return found
+
+
+def _is_e2e(program, rest, short):
+    return any(tool in program for tool in E2E_WORDS if not tool.startswith("-")) or any(word.lower() in E2E_WORDS for word in _options(rest, any_option=True))
+
+
+def _is_focused(program, rest, short):
+    if short or any(word in ("-k", "--filter", "-run") for word in rest):
+        return True
+    named = [program] + [os.path.basename(word) for word in _options(rest)]
+    if any(re.fullmatch(r"(test_[^/]*\.py|[^/]*\.test\.[^/]*)", word) for word in named) or any(re.search(r"\.py::\S", word) for word in _options(rest)):
+        return True
+    chosen = [word for word in rest if not word.startswith("-")]
+    return program == "unittest" and bool(chosen) and chosen[0] != "discover"   # a dotted name is a focused run; bare or `discover` is the whole suite
+
+
+def program_of(command):
+    """The program a command runs once its wrappers are skipped (`timeout 900 bin/test-switchboard` is `test-switchboard`): what a refusal names."""
+    return _split(command)[0]
+
+
+def worktree_of(cwd, run=subprocess.run):
+    """The git top-level of `cwd`, by real path (a subdirectory or a symlink reads as the same worktree), or None when it cannot be told (then nothing is refused)."""
+    try:
+        done = run(["git", "rev-parse", "--show-toplevel"], cwd=cwd, capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if done.returncode != 0 or not done.stdout.strip():
+        return None
+    return os.path.realpath(done.stdout.strip())
+
+
+def _is_full(program, rest, short):
+    return (program.startswith("test-") or program in ("pytest", "unittest") or [program] + rest[:1] in (["make", "test"], ["npm", "test"], ["go", "test"]))
+
+
+# THE kind table: (kind, default ceiling in seconds, matcher(program, rest, short)); the first match wins, "other" matches everything. The defaults come from the
+# measured run times in docs/switchboard.md ("heavy"); e2e has no sample (a judgement).
+KINDS = (
+    ("e2e", 3600, _is_e2e),
+    ("focused", 1800, _is_focused),
+    ("full", 5400, _is_full),
+    ("quick", 600, lambda program, rest, short: False),   # the quick slot's ceiling (#1045): a row of THIS table; classify never returns it, run_quick takes it by name
+    ("other", 3600, lambda program, rest, short: True),
+)
+KIND_DEFAULTS = {kind: seconds for kind, seconds, _match in KINDS}
+
+
+def classify(command, short=False):
+    """The kind of run `command` is, read from the program and its whole option words: "e2e", "focused", "full" or "other". A path, a filter value or a shell
+    string that merely contains a kind's word does not change it."""
+    program, rest = _split(command)
+    for kind, _seconds, match in KINDS:
+        if match(program, rest, short):
+            return kind
+    return "other"
+
+
+def _whole(value, low=1, high=10 ** 9):
+    return isinstance(value, int) and not isinstance(value, bool) and low <= value <= high
+
+
+def settings(raw):
+    """The slot count from the config's `heavy` value (None, or {"slots": n, "ceilings": {...}}); HeavyError for anything else."""
+    if raw is None:
+        return DEFAULT_SLOTS
+    if not isinstance(raw, dict) or set(raw) - {"slots", "ceilings"}:
+        raise HeavyError("'heavy' must be an object with only \"slots\" and \"ceilings\" in it, got %r" % (raw,))
+    slots = raw.get("slots", DEFAULT_SLOTS)
+    if not isinstance(slots, int) or isinstance(slots, bool) or not 1 <= slots <= SLOTS_MAX:
+        raise HeavyError("'heavy.slots' must be a whole number from 1 to %d, got %r" % (SLOTS_MAX, slots))
+    given = raw.get("ceilings", {})
+    if not isinstance(given, dict) or set(given) - set(KIND_DEFAULTS) - {"max"}:
+        raise HeavyError("'heavy.ceilings' must be an object with only %s and \"max\" in it, got %r" % (", ".join('"%s"' % kind for kind in KIND_DEFAULTS), given))
+    for key, value in given.items():
+        if not _whole(value, 1, HARD_MAX_SECONDS):
+            raise HeavyError("'heavy.ceilings.%s' must be a whole number of seconds from 1 to %d (the hard maximum), got %r" % (key, HARD_MAX_SECONDS, value))
+    return slots
+
+
+def ceiling_table(raw):
+    """{kind: seconds, "max": seconds} from the config's `heavy` value, read leniently: a value that is not a whole number of 1 or more is the default (a ceiling is never off)."""
+    given = (raw or {}).get("ceilings") if isinstance(raw, dict) else None
+    given = given if isinstance(given, dict) else {}
+    top = given.get("max") if _whole(given.get("max"), 1, HARD_MAX_SECONDS) else HARD_MAX_SECONDS   # the configuration can only lower the maximum
+    table = {"max": top}
+    for kind, default in KIND_DEFAULTS.items():
+        value = given.get(kind) if _whole(given.get(kind), 1, HARD_MAX_SECONDS) else default
+        table[kind] = min(value, top)
+    return table
+
+
+def resolve_ceiling(kind, environ, request=None, config=None):
+    """The time ceiling in seconds of a run of `kind`: the kind's default (or the configured one), or the run's own request (`request`, i.e. --ceiling, else
+    FLEET_HEAVY_MAX_SECONDS) up to the hard maximum. A request of 0 reads as the maximum (a bound always exists); a request that is not a whole number reads as the default."""
+    table = ceiling_table(config)
+    top, default = table["max"], table.get(kind, table["other"])
+    raw = request if request is not None else environ.get(TIME_ENV)
+    text = "" if raw is None else str(raw).strip()
+    if re.fullmatch(r"[0-9]{1,30}", text):
+        wanted = int(text)
+        return top if wanted == 0 else min(wanted, top)
+    return default
+
+
+def should_take_slot(environ):
+    """"off" when FLEET_HEAVY=off or a CI run (CI never uses slots), "inside" when this process already runs in a slot, else "taken" (it should take one)."""
+    if str(environ.get(OFF_ENV, "")).lower() == "off" or str(environ.get("CI", "")).lower() in ("1", "true"):
+        return "off"
+    if environ.get(SLOT_ENV):
+        return "inside"
+    return "taken"
+
+
+def _plain(text, limit=80):
+    """Printable characters only, cut to `limit`: what is shown to a person never carries a terminal escape (a slot file or an environment variable is not trusted)."""
+    return "".join(c if c.isprintable() and c not in "\x7f" else " " for c in str(text))[:limit]
+
+
+def holder_name(environ):
+    """Who a slot is held for: FLEET_HEAVY_NAME, else the OpenCode session id, else the user. No lookup: a wrapper must not make reads of its own."""
+    for key in ("FLEET_HEAVY_NAME", "OPENCODE_SESSION_ID", "USER", "LOGNAME"):
+        value = environ.get(key)
+        if value:
+            return _plain(value)
+    return "unknown"
+
+
+def slot_path(state_dir, index):
+    return os.path.join(str(state_dir), "heavy-slot-%s.lock" % index)   # index: 0, 1, ... or "express"
+
+
+def _open(state_dir, index):
+    return os.open(slot_path(state_dir, index), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+
+
+def _read_info(fd):
+    try:
+        raw = os.pread(fd, INFO_MAX, 0).decode("utf-8", "replace").strip("\0 \n")
+        info = json.loads(raw) if raw else {}
+    except (OSError, ValueError):
+        info = {}
+    return info if isinstance(info, dict) else {}
+
+
+def holders(state_dir, slots=DEFAULT_SLOTS):
+    """The slots held NOW: [{"slot", "name", "pid", "command", "since"}]. A slot is held when its lock cannot be taken; the probe takes it for an instant and
+    lets go, so a holder that died is simply not listed. A held slot whose file has no readable record is listed as name "?"."""
+    found = []
+    for index in range(slots):
+        try:
+            fd = _open(state_dir, index)
+        except OSError:
+            continue
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(fd, fcntl.LOCK_UN)
+                continue   # free
+            except OSError as err:
+                if err.errno not in (errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES):
+                    continue
+            info = _read_info(fd)
+            found.append({"slot": index, "name": _plain(info.get("name", "?")), "pid": info.get("pid") if isinstance(info.get("pid"), int) else None,
+                          "command": _plain(info.get("command", "?")), "since": info.get("since") if isinstance(info.get("since"), (int, float)) else None})
+        finally:
+            os.close(fd)
+    return found
+
+
+def _process_start(pid):
+    """The start time of `pid` as text ("" when it cannot be read): with the pid it names one process, so a reused pid is never taken for the waiter that died."""
+    try:
+        done = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True, timeout=5)
+    except (subprocess.SubprocessError, OSError):
+        return ""
+    return " ".join(done.stdout.split()) if done.returncode == 0 else ""
+
+
+_POPEN = subprocess.Popen   # the real one, kept at import: start times are read with it (a test that replaces the command's Popen replaces nothing here)
+
+
+def _start_of(pid):
+    """The start time of `pid` for a slot record, "" when it cannot be had (the process is then named by its pid alone and never trusted as a root). Never raises."""
+    try:
+        with _POPEN(["ps", "-o", "lstart=", "-p", str(pid)], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True) as proc:
+            out, _err = proc.communicate(timeout=5)
+        return " ".join(out.split()) if proc.returncode == 0 else ""
+    except Exception:
+        return ""
+
+
+def _own_start():
+    return _start_of(os.getpid())
+
+
+def _is_zombie(pid):
+    """A process that has died and not been reaped: it still has a pid, but it is gone."""
+    try:
+        done = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True, timeout=5)
+    except (subprocess.SubprocessError, OSError):
+        return False
+    return done.returncode == 0 and done.stdout.strip().startswith("Z")
+
+
+def _alive(pid, start):
+    """Is the process (pid, start time) still there? A pid that exists with another start time is another process."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        pass   # exists, not ours to signal
+    if _is_zombie(pid):
+        return False
+    return not start or _process_start(pid) in ("", start)
+
+
+class Refused(HeavyError):
+    """The run is refused (exit 64): a full-suite job of this worktree is already queued or running."""
+
+
+class QueueUnusable(Exception):
+    """The order file cannot be read, written or locked: the caller falls back to taking whatever slot is free."""
+
+
+class Line:
+    """The arrival order of the callers waiting for a slot, kept in `heavy-queue.json` in the state directory (written atomically, read and changed under a lock).
+    An entry is {"pid", "start", "name", "short"}, in arrival order; an entry whose process is gone is dropped at the next look, so a dead waiter never blocks the
+    ones behind it. The waiter at the head of the line is the only one that tries an ordinary slot: a slot that frees goes to the one that has waited longest."""
+
+    def __init__(self, state_dir, name, short=False, pid=None, alive=_alive, start_of=_process_start, lock_tries=50, lock_pause=0.02, slots=DEFAULT_SLOTS, held=None, note=None, meta=None, lost=None, now=time.time):
+        self.lost, self.now = lost, now   # `lost(info)` is told of each waiter whose process died while it was queued (once: the entry is dropped)
+        self.meta = dict(meta or {})   # what a refusal reads of an entry (kind, worktree, program, since); never what decides the order
+        self.dir, self.name, self.short = str(state_dir), name, bool(short)
+        if not os.path.isdir(self.dir):
+            raise OSError(errno.ENOENT, "no state directory")   # the caller takes whatever slot is free, as before
+        self.pid = os.getpid() if pid is None else pid
+        self.start = start_of(self.pid)
+        self.alive, self.lock_tries, self.lock_pause = alive, lock_tries, lock_pause
+        self.path, self.lock_path = os.path.join(self.dir, QUEUE_FILE), os.path.join(self.dir, QUEUE_LOCK)
+        self.joined = False
+        self.held = held if held is not None else (lambda: held_by(self.dir, slots))   # pids that hold a slot now: a ticket never outlives the slot its owner took
+        self.note, self.sweep_noted = note or (lambda text: None), False
+        self.verified = {}   # (pid, start) -> monotonic time its liveness was last checked with `ps`
+
+    def _locked(self):
+        fd = os.open(self.lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        for _ in range(self.lock_tries):
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return fd
+            except OSError as err:
+                if err.errno not in (errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES):
+                    os.close(fd)
+                    raise
+                time.sleep(self.lock_pause)
+        os.close(fd)
+        raise OSError(errno.EAGAIN, "the order file stays locked")   # a deliberate fail-open: after about a second the caller takes whatever slot is free (one note)
+
+    def _read(self):
+        try:
+            fd = os.open(self.path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        except FileNotFoundError:
+            return []
+        try:
+            raw = os.read(fd, QUEUE_BYTES + 1)
+        finally:
+            os.close(fd)
+        if len(raw) > QUEUE_BYTES:
+            raise QueueUnusable("the order file is too large")
+        try:
+            data = json.loads(raw.decode("utf-8")) if raw.strip() else {"entries": []}
+            entries = data["entries"]
+            if not isinstance(entries, list) or len(entries) > QUEUE_MAX:
+                raise ValueError("entries")
+            for entry in entries:
+                if not (isinstance(entry, dict) and isinstance(entry.get("pid"), int) and not isinstance(entry.get("pid"), bool) and isinstance(entry.get("start"), str)):
+                    raise ValueError("entry")
+        except (ValueError, KeyError, TypeError, UnicodeDecodeError):
+            raise QueueUnusable("the order file is corrupt")
+        return entries
+
+    def _write(self, entries):
+        temporary = "%s.%d.tmp" % (self.path, os.getpid())
+        self._sweep_temporaries()
+        data = json.dumps({"entries": entries}).encode("utf-8")
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        try:
+            try:
+                view = memoryview(data)
+                while view:   # a short write is finished, never renamed into place half done
+                    view = view[os.write(fd, view):]
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            os.replace(temporary, self.path)
+        except OSError:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+            raise
+
+    def _sweep_temporaries(self):
+        """Remove the `heavy-queue.json.<pid>.tmp` files of processes that are gone (a kill between the write and the rename leaves one). It can never raise into the
+        wrapper: a name that is not exactly that shape (ASCII digits, a possible pid) is left alone, only a regular file is removed (a directory or a symlink never),
+        and any failure is one note and the command carries on."""
+        try:
+            for name in os.listdir(self.dir):
+                found = TEMPORARY_NAME.fullmatch(name)
+                if found is None:
+                    continue
+                pid = int(found.group(1))
+                if not 2 <= pid <= PID_MAX or pid == os.getpid():
+                    continue
+                path = os.path.join(self.dir, name)
+                try:
+                    os.kill(pid, 0)
+                    continue   # the process is there
+                except ProcessLookupError:
+                    pass
+                except OSError:
+                    continue
+                if stat.S_ISREG(os.lstat(path).st_mode):
+                    os.unlink(path)
+        except Exception as err:   # the guard fails open for the command
+            if not self.sweep_noted:
+                self.sweep_noted = True
+                self.note("heavy: queue sweep failed: %s\n" % type(err).__name__)
+
+    def _mine(self, entry):
+        return entry["pid"] == self.pid and entry["start"] == self.start
+
+    def _update(self, join, second_job_check=None):
+        """Under the lock: drop the entries of processes that are gone, add this caller at the end when `join` and not there yet, write back if changed; the entries.
+        `second_job_check(entries)` is asked under the lock, before this caller joins: a text to refuse with (Refused, nothing written) or None."""
+        try:
+            lock = self._locked()
+        except OSError as err:
+            raise QueueUnusable(err.strerror or str(err))
+        report = []
+        try:
+            entries = self._read()
+            holding = self.held()
+            kept, gone = [], []
+            for entry in entries:
+                if self._mine(entry):
+                    kept.append(entry)
+                elif entry["pid"] in holding:
+                    continue   # it took a slot: its ticket is no place in the line (and it is not lost)
+                elif self._still_there(entry):
+                    kept.append(entry)
+                else:
+                    gone.append(entry)   # its process is gone and it never took a slot: a waiter that was killed
+            if join and not any(self._mine(entry) for entry in kept):
+                reason = second_job_check([entry for entry in kept if not self._mine(entry)]) if second_job_check is not None else None
+                if reason:
+                    raise Refused(reason)
+                kept.append(dict(self.meta, pid=self.pid, start=self.start, name=_plain(self.name, 40), short=self.short))
+            if kept != entries:
+                self._write(kept)
+                report = gone
+            return kept
+        except OSError as err:
+            raise QueueUnusable(err.strerror or str(err))
+        finally:
+            os.close(lock)
+            for entry in report:   # after the lock is let go: a slow audit sink never holds the line
+                self._lost(entry)
+
+    def _lost(self, entry):
+        """Tell `lost` of a waiter that died in the line: its name, the seconds it had waited and the last line it wrote (fixed words and numbers, never an argument). Never raises."""
+        if self.lost is None:
+            return
+        try:
+            now = self.now()
+            since, seen = entry.get("since"), entry.get("seen")
+            number = lambda value: isinstance(value, (int, float)) and not isinstance(value, bool)
+            self.lost({"name": _plain(entry.get("name", "?"), 40), "waited_seconds": max(0, int(now - since)) if number(since) else 0, "last_seen": _plain(entry.get("last", ""), LAST_SEEN_MAX),
+                       "last_seen_age_seconds": max(0, int(now - seen)) if number(seen) else None})
+        except Exception as err:
+            self.note("heavy: could not report a lost waiter (%s)\n" % type(err).__name__)
+
+    def heard(self, text):
+        """Keep the last line this waiter wrote (and when) in its ticket, so that when it dies in the line the record says what it last said. Never raises."""
+        if not self.joined:
+            return
+        try:
+            lock = self._locked()
+        except OSError:
+            return
+        try:
+            entries = self._read()
+            changed = False
+            for entry in entries:
+                if self._mine(entry):
+                    entry["last"], entry["seen"], changed = _plain(text, LAST_SEEN_MAX), int(self.now()), True
+            if changed:
+                self._write(entries)
+        except (OSError, QueueUnusable):
+            pass
+        finally:
+            os.close(lock)
+
+    def _still_there(self, entry):
+        """Is the entry's process alive? What `ps` said is kept for 5 s, so a line of waiters does not run it for every entry at every poll."""
+        key, now = (entry["pid"], entry["start"]), time.monotonic()
+        if self.alive is _alive and key in self.verified and now - self.verified[key] < 5.0:   # (an injected check is asked every time)
+            try:
+                os.kill(entry["pid"], 0)   # the cheap check every time: a pid that is gone is dropped at once
+            except ProcessLookupError:
+                self.verified.pop(key, None)
+                return False
+            except OSError:
+                pass
+            return True
+        if self.alive(entry["pid"], entry["start"]):
+            self.verified[key] = now
+            return True
+        self.verified.pop(key, None)
+        return False
+
+    def place(self, second_job_check=None):
+        """This caller's place in the line (1 is the head), joining at the end the first time. Raises QueueUnusable, and Refused when `second_job_check` says so."""
+        entries = self._update(True, second_job_check)
+        self.joined = True
+        return next(index for index, entry in enumerate(entries, 1) if self._mine(entry))
+
+    def leave(self):
+        """Take this caller out of the line (it got a slot, gave up or was stopped). True when it is out (or never was in); False when the file could not be
+        changed. Never raises."""
+        if not self.joined:
+            return True
+        try:
+            lock = self._locked()
+        except OSError:
+            return False
+        try:
+            entries = self._read()
+            kept = [entry for entry in entries if not self._mine(entry)]
+            if kept != entries:
+                self._write(kept)
+            self.joined = False
+            return True
+        except (OSError, QueueUnusable):
+            return False
+        finally:
+            os.close(lock)
+
+
+def _take_express(state_dir):
+    """The fd of the express slot just locked, or None when it is busy."""
+    fd = os.open(slot_path(state_dir, EXPRESS), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as err:
+        os.close(fd)
+        if err.errno in (errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES):
+            return None
+        raise
+    return fd
+
+
+def held_by(state_dir, slots=DEFAULT_SLOTS):
+    """The pids that hold a slot NOW, the express slot included: the command's and the wrapper's (`pid` and `wrapper` of each held slot's record). Nothing is created."""
+    pids = set()
+    for index in list(range(slots)) + [EXPRESS]:
+        try:
+            fd = os.open(slot_path(state_dir, index), os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        except OSError:
+            continue
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(fd, fcntl.LOCK_UN)
+                continue   # free
+            except OSError as err:
+                if err.errno not in (errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES):
+                    continue
+            info = _read_info(fd)
+            pids |= {value for value in (info.get("pid"), info.get("wrapper")) if isinstance(value, int) and not isinstance(value, bool)}
+        finally:
+            os.close(fd)
+    return pids
+
+
+LIVE_KEYS = (("pid", "cstart"), ("wrapper", "wstart"))   # a held slot's record names a live holder by the command's pid and start time, or the wrapper's
+
+
+def _held_records(state_dir, slots=DEFAULT_SLOTS):
+    """The record of each slot held NOW (the express slot included), as the holder wrote it. Nothing is created."""
+    found = []
+    for index in list(range(slots)) + [EXPRESS]:
+        try:
+            fd = os.open(slot_path(state_dir, index), os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        except OSError:
+            continue
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(fd, fcntl.LOCK_UN)
+                continue   # free
+            except OSError as err:
+                if err.errno not in (errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES):
+                    continue
+            info = _read_info(fd)
+            if any(_pid_alive(info.get(key), info.get(start)) for key, start in LIVE_KEYS):   # a record the last holder left behind, under a lock a new holder has just taken, names nobody who is running
+                found.append(info)
+        finally:
+            os.close(fd)
+    return found
+
+
+def _pid_alive(pid, start=None):
+    """Is the process the record names still there? With its recorded start time a reused pid is another process (the pid alone only when no start time was recorded)."""
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid < 2:
+        return False
+    # (`ps` that cannot be read gives no start time, and the holder then counts as live: the refusal fails closed on that path)
+    return _alive(pid, start if isinstance(start, str) else "")
+
+
+def _since_text(since):
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(since)) if isinstance(since, (int, float)) and not isinstance(since, bool) else "unknown time"
+
+
+def second_job_notice(state_dir, worktree, entries, slots=DEFAULT_SLOTS):
+    """The sentence that refuses a full-suite job in `worktree`, naming the first one already running (a held slot) or else queued (`entries`, in arrival order);
+    None when there is none. Only live ones are read: a held slot is a lock that is held, an entry is dropped when its process is gone."""
+    def one(info):
+        return (info.get("kind") == "full" and info.get("worktree") == worktree)
+    first = next((info for info in _held_records(state_dir, slots) if one(info)), None) or next((entry for entry in entries if one(entry)), None)
+    if first is None:
+        return None
+    pid = first.get("pid")
+    return ("heavy: refused: a full-suite job is already queued or running in this worktree (%s, %s, pid %s, since %s)"
+            % (_plain(first.get("name", "?"), 40), _plain(first.get("program") or first.get("command") or "?", 80), pid if isinstance(pid, int) and not isinstance(pid, bool) else "unknown",
+               _since_text(first.get("since"))))
+
+
+def _describe(held):
+    return ", ".join("%s %s%s" % (h["name"], h["command"], " (pid %d)" % h["pid"] if h["pid"] else "") for h in held) or "unknown holders"
+
+
+def _take(state_dir, slots):
+    """(fd, index) of a slot just locked, or (None, None) when every slot is busy."""
+    for index in range(slots):
+        fd = _open(state_dir, index)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as err:
+            os.close(fd)
+            if err.errno in (errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES):
+                continue
+            raise
+        return fd, index
+    return None, None
+
+
+def _record(fd, name, pid, command, now, extra=None):
+    """Write who holds the slot (truncating what the last holder wrote). Best effort: a slot without a record is still a held slot. `extra`: kind, ceiling, lane and the
+    wrapper's start time (an old record without them reads as kind "other")."""
+    try:
+        os.ftruncate(fd, 0)
+        os.pwrite(fd, json.dumps(dict(extra or {}, name=name, pid=pid, wrapper=os.getpid(), command=os.path.basename(command)[:80], since=int(now))).encode("utf-8"), 0)
+    except OSError:
+        pass
+
+
+def command_prefix(which=shutil.which, environ=None):
+    """["taskpolicy", "-b"] where macOS's taskpolicy exists, else ["nice", "-n", "10"], else [] (no way to lower the priority: said by the caller). In a cloud worker pod
+    (#1794: CW_AUDIT_RUNTIME_ID begins "pod/" and CW_HARD_DEADLINE is set and not empty) it is [] at once: a pod has no person's machine to protect, and the niceness slowed a run 8.8 times."""
+    environ = os.environ if environ is None else environ
+    if str(environ.get("CW_AUDIT_RUNTIME_ID", "")).startswith("pod/") and str(environ.get("CW_HARD_DEADLINE", "")) != "":
+        return []
+    found = which("taskpolicy")
+    if found:
+        return [found, "-b"]
+    found = which("nice")
+    return [found, "-n", "10"] if found else []
+
+
+def _resolve(command, environ):
+    """The command's first word as an executable path, or None: looked up like a shell would (PATH, or a path with a slash)."""
+    word = command[0]
+    if os.sep in word:
+        return word if os.access(word, os.X_OK) and os.path.isfile(word) else None
+    return shutil.which(word, path=environ.get("PATH"))
+
+
+def ceilings(environ):
+    """(memory MB, seconds) the watchdog enforces, each 0 when off: FLEET_HEAVY_MEM_MB (default 16384) and FLEET_HEAVY_MAX_SECONDS (default 7200). Anything that is
+    not a whole number of 0 or more reads as the default: a typo never turns the guard off."""
+    def read(key, default):
+        raw = str(environ.get(key, "")).strip()
+        return int(raw) if re.fullmatch(r"[0-9]{1,12}", raw) else default
+    return read(MEM_ENV, DEFAULT_MEM_MB), read(TIME_ENV, DEFAULT_MAX_SECONDS)
+
+
+def read_process_table():
+    """[(pid, ppid, pgid, rss_kb, start)] from `ps`; `start` is the process's start time as text, so a pid that was reused is told from the process it was. Raises
+    OSError when the table cannot be read."""
+    try:
+        done = subprocess.run(["ps", "-axo", "pid=,ppid=,pgid=,rss=,lstart="], capture_output=True, text=True, timeout=20)
+    except (subprocess.SubprocessError, OSError) as err:
+        raise OSError("ps failed: %s" % err)
+    rows = []
+    for line in done.stdout.splitlines():
+        parts = line.split()
+        if len(parts) >= 5 and all(re.fullmatch(r"[0-9]{1,12}", part) for part in parts[:4]):
+            rows.append(tuple(int(part) for part in parts[:4]) + (" ".join(parts[4:]),))
+    if done.returncode != 0 or not rows:
+        raise OSError("ps gave no process table")
+    return rows
+
+
+def _proc_lock_pids(path, root=None):
+    """The pids of this user that have `path` open, read from the process directory (no lsof); None when that directory cannot be listed."""
+    root = root or PROC_ROOT
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return None
+    try:
+        mark = os.stat(path)
+    except OSError:
+        return set()
+    want, me, found = (mark.st_dev, mark.st_ino), os.getuid(), set()
+    for name in names:
+        if not re.fullmatch(r"[0-9]{1,12}", name):
+            continue
+        try:
+            if os.lstat(os.path.join(root, name)).st_uid != me:
+                continue
+            fds = os.listdir(os.path.join(root, name, "fd"))
+        except OSError:
+            continue
+        for fd in fds:
+            try:
+                seen = os.stat(os.path.join(root, name, "fd", fd))   # follows the link: the open file itself
+                if (seen.st_dev, seen.st_ino) == want:
+                    found.add(int(name))
+                    break
+            except OSError:
+                continue
+    return found
+
+
+def read_lock_holders(path):
+    """The pids that have `path` open, from `lsof -t` (same user only); raises OSError when lsof is missing, fails or is too slow (no holder is then known)."""
+    pids = _proc_lock_pids(path)
+    if pids is not None:
+        return pids
+    try:
+        done = subprocess.run(["lsof", "-a", "-u", str(os.getuid()), "-t", "--", str(path)], capture_output=True, text=True, timeout=10)
+    except (subprocess.SubprocessError, OSError) as err:
+        raise OSError("lsof failed: %s" % err)
+    if done.returncode not in (0, 1):   # 1: nothing has it open
+        raise OSError("lsof exited %d" % done.returncode)
+    return {int(word) for word in done.stdout.split() if re.fullmatch(r"[0-9]{1,12}", word)}
+
+
+def _start(row):
+    return row[4] if len(row) > 4 else ""
+
+
+def tree(rows, roots):
+    """The pids of `roots` and everything below them by parent links."""
+    kids = {}
+    for row in rows:
+        kids.setdefault(row[1], []).append(row[0])
+    found, todo = set(), list(roots)
+    while todo:
+        pid = todo.pop()
+        if pid not in found:
+            found.add(pid)
+            todo.extend(kids.get(pid, ()))
+    return found
+
+
+def _child_cpu_seconds(pid):
+    """CPU seconds (user + system) the process has used, or None when they cannot be read (never raises)."""
+    try:
+        with open("/proc/%d/stat" % pid) as handle:
+            fields = handle.read().rsplit(")", 1)[1].split()
+        return (int(fields[11]) + int(fields[12])) / float(os.sysconf("SC_CLK_TCK"))
+    except Exception:
+        pass
+    try:
+        text = subprocess.run(["ps", "-o", "time=", "-p", str(pid)], capture_output=True, text=True, timeout=5).stdout.strip()
+        days, _, clock_part = text.rpartition("-")
+        parts = [float(x) for x in clock_part.split(":")]
+        total = 0.0
+        for part in parts:
+            total = total * 60 + part
+        return total + (float(days) * 86400 if days else 0)
+    except Exception:
+        return None
+
+_progress_started = None   # tests: an Event the progress thread sets when it has started
+_progress_pause = None   # tests: a function (stop_event, seconds) that pauses in place of the real wait
+
+def _progress_interval(environ, out=None):
+    """The progress interval: FLEET_HEAVY_PROGRESS_SECONDS when it is a number from 0.01 (the tests' knob below 1 s) to 86400, else PROGRESS_EVERY; a non-empty bad value prints one line on `out`."""
+    raw = environ.get("FLEET_HEAVY_PROGRESS_SECONDS") or ""
+    if not raw:
+        return PROGRESS_EVERY
+    try:
+        value = float(raw)
+    except ValueError:
+        value = None
+    if value is not None and 0.01 <= value <= 86400:   # nan, inf, zero, negative and above a day fail here
+        return value
+    if out is not None:
+        raw = "".join("?" if unicodedata.category(c) in ("Cc", "Zl", "Zp") else c for c in raw[:40])   # one line, no escape sequence, no line separator
+        try:
+            out.write("heavy: FLEET_HEAVY_PROGRESS_SECONDS=%s is out of range, using 60\n" % raw[:40])
+        except (OSError, ValueError):
+            pass   # a closed or broken stream: the child still starts
+    return PROGRESS_EVERY
+
+def _progress_loop(pid, program, interval, stop, out, clock, began, lock=None):
+    """One line every `interval` seconds until `stop` is set; a failure of its own ends it quietly. Never signals the child."""
+    try:
+        if _progress_started is not None:
+            _progress_started.set()
+        while True:
+            if _progress_pause is not None:
+                _progress_pause(stop, interval)
+            else:
+                stop.wait(interval)
+            if stop.is_set():
+                return
+            elapsed = max(0.0, clock() - began)
+            text = "heavy: %s still running: %d s since the command started" % (_plain(program), int(elapsed))
+            cpu = _child_cpu_seconds(pid)
+            if cpu is not None:
+                text += ", CPU %d s (%d%%)" % (int(cpu), int(100 * cpu / elapsed) if elapsed > 0 else 0)
+            with (lock or threading.Lock()):   # `run` takes this lock to set `stop`: once it is set no write begins
+                if stop.is_set():   # stopped after the read, before the write
+                    return
+                out.write(text + "\n")
+                try:
+                    out.flush()
+                except Exception:
+                    pass
+    except Exception:
+        return
+
+def run(command, state_dir, slots=DEFAULT_SLOTS, wait_max=DEFAULT_WAIT_MAX, name=None, environ=None, out=None, clock=time.time, sleep=time.sleep,
+        which=shutil.which, watchdog=None, short=False, line=None, ceiling=None, ceiling_config=None, on_stop=None, worktree=None, started_flag=None):
+    """Wait for a slot, run `command` in it, return its exit status. 75 when no slot came within `wait_max` seconds, 127 when the command does not exist.
+    A watchdog stops a runaway: 137 past the memory ceiling, 124 past the time ceiling of the run's KIND (see `classify`, `resolve_ceiling`: `ceiling` is the run's own
+    request, else FLEET_HEAVY_MAX_SECONDS; `ceiling_config` the config's `heavy` value; `on_stop(phase, info, holder, lane)` is called with "decided" before a time stop and "told" after it (also for an orphan this wrapper finds while it waits)); `watchdog` is a dict of Watchdog keyword arguments and `line` one of Line's (tests).
+    A full-suite job (the kind `classify` says, and no other reading) is refused with 64 while another is queued or running in the same worktree (`worktree`: the git top-level
+    of the working directory by real path, or a function that gives it, tests); a focused run, another worktree or a worktree that cannot be told is never refused.
+    Callers wait in arrival order (`Line`); `short` declares the command short: it may use the express slot when the ordinary ones are busy and is stopped after
+    EXPRESS_SECONDS by the watchdog."""
+    environ = os.environ if environ is None else environ
+    out = sys.stderr if out is None else out
+    if _resolve(command, environ) is None:
+        out.write("heavy: %s: command not found\n" % command[0])
+        return EXIT_NOT_FOUND
+    name = name or holder_name(environ)
+    mode = should_take_slot(environ)   # "off": FLEET_HEAVY=off or CI, run it as it is; "inside": already in a slot (a nested heavy), no second one
+    if mode == "inside":
+        out.write("heavy: already inside a slot: running without a second one\n")
+    unslotted = None if mode == "taken" and state_dir is not None else ("" if mode == "off" else "no slot directory" if mode == "taken" else "inside")
+    started = clock()
+    try:
+        every = float(environ.get("FLEET_HEAVY_REPORT_SECONDS") or WAIT_REPORT_SECONDS)   # 30 s; a test shortens it
+    except ValueError:
+        every = WAIT_REPORT_SECONDS
+    next_report = started + every
+    kind = classify(command, short)
+    where = (worktree or worktree_of)(os.getcwd()) if kind == "full" and unslotted is None else None
+    got = {"signal": None}
+    child = {"p": None}
+
+    def on_signal(number, _frame):
+        got["signal"] = number
+        if child["p"] is not None:
+            try:
+                child["p"].send_signal(number)
+            except OSError:
+                pass
+
+    old = {number: signal.signal(number, on_signal) for number in FORWARDED}
+    fd = None
+    queue = None
+    queue_noted = False
+    try:
+        if unslotted is None:
+            try:
+                lost = (lambda info: on_stop("lost", info, info["name"], info["name"])) if on_stop is not None else None
+                queue = Line(state_dir, name, short, **dict({"slots": slots, "note": out.write, "lost": lost, "meta": {"kind": kind, "worktree": where, "program": program_of(command), "since": int(started)}}, **(line or {})))
+            except OSError:
+                queue = None
+        while unslotted is None:
+            place = None
+            if queue is not None:
+                try:
+                    place = queue.place((lambda entries: second_job_notice(state_dir, where, entries, slots))) if where else queue.place()
+                except Refused as err:   # a first full-suite job of this worktree is queued or running: this one is not run
+                    out.write("%s\n" % err)
+                    out.flush()
+                    return EXIT_USAGE
+                except QueueUnusable as err:   # the order cannot be kept: the present behaviour (whoever polls first), said once
+                    if not queue_noted:
+                        queue_noted = True
+                        out.write("heavy: no waiting order (%s): taking whichever slot is free\n" % err)
+                    queue.leave()   # an entry it already wrote must not stay behind it: a head that is not waiting would hold the others back
+                    queue = None
+            try:
+                fd = None
+                if place is None or place == 1:   # only the head of the line tries an ordinary slot
+                    fd, index = _take(state_dir, slots)
+                if fd is None and short:
+                    fd = _take_express(state_dir)
+                    index = EXPRESS
+            except OSError as err:   # a missing, unwritable or locked-out directory never stops the command: one line, and it runs without a slot
+                out.write("heavy: no slot (%s): running without one\n" % (err.strerror or err))
+                unslotted = "unusable"
+                break
+            if fd is not None:
+                break
+            if got["signal"] is not None:
+                return 128 + got["signal"]
+            now = clock()
+            if now - started >= wait_max:
+                out.write("heavy: no slot after %d s (%d of %d busy: %s): the command was not run\n" % (int(now - started), slots, slots, _describe(holders(state_dir, slots))))
+                out.flush()
+                noslot_marker(environ, out)
+                return EXIT_TEMPFAIL
+            if now >= next_report:
+                try:
+                    check_orphans(state_dir, slots, ceiling_config, clock, on_stop, out)   # a run whose wrapper died keeps a slot for nobody: bounded here, where it starves someone
+                except Exception:
+                    pass
+                held = holders(state_dir, slots)
+                where = ", place %d in line (%d ahead)" % (place, place - 1) if place is not None else ""
+                said = "heavy: waiting for a slot (%d of %d busy: %s)%s\n" % (len(held), slots, _describe(held), where)
+                out.write(said)
+                if queue is not None:
+                    queue.heard(said.strip())
+                out.flush()
+                next_report = now + every
+            sleep(POLL_SECONDS)
+        waited = max(0, int(clock() - started)) if fd is not None else 0   # the queue wait: never part of the ceiling (the watchdog starts with the command)
+        if fd is not None and where:   # visible as a slot holder BEFORE it leaves the line, so a second full-suite job never finds it in neither (the full record follows)
+            _record(fd, name, os.getpid(), command[0], clock(), {"kind": kind, "worktree": where, "program": program_of(command)})
+        if queue is not None and not (queue.leave() or queue.leave()):   # it has its slot (or none will come): out of the line at once; one more try before it says so
+            out.write("heavy: could not leave the waiting order: the others pass this caller's ticket once its slot shows as held\n")
+        env = dict(environ, GIT_TERMINAL_PROMPT="0", GCM_INTERACTIVE="never")   # #1050: a suite's git never opens a credential dialog
+        env.pop(NOSLOT_NONCE_ENV, None)   # the wrapper keeps the nonce to itself: a command that prints its environment cannot forge the "not run" marker line
+        mem_mb = ceilings(environ)[0]
+        max_seconds = resolve_ceiling(kind, environ, ceiling, ceiling_config)
+        if fd is not None and short and index == EXPRESS:   # the express slot's own time ceiling (an environment value may only make it shorter)
+            max_seconds = min(max_seconds, EXPRESS_SECONDS)
+        lane = holder_name(environ)
+        extra = {"kind": kind, "ceiling": max_seconds, "lane": lane, "wstart": _own_start() if fd is not None else "", "waited": waited, "worktree": where, "program": program_of(command)}
+        if fd is not None:
+            _record(fd, name, os.getpid(), command[0], clock(), extra)   # at once, so a killed holder's old record is never shown for this one
+            os.set_inheritable(fd, True)   # the command keeps the lock: the slot is busy while it runs, whatever happens to this wrapper
+            env[SLOT_ENV] = str(index)    # and a heavy inside it knows it is in a slot: it takes no second one (nested heavy never deadlocks)
+        argv = (command_prefix(which) if unslotted not in ("", "inside") else []) + list(command)   # off or nested: the command as it is
+        progress_every = _progress_interval(environ, out)   # before the child starts
+        try:
+            child["p"] = subprocess.Popen(argv, env=env, pass_fds=(fd,) if fd is not None else ())
+        except OSError as err:
+            out.write("heavy: cannot run %s: %s\n" % (command[0], err.strerror or err))
+            return EXIT_NOT_FOUND
+        if started_flag is not None:
+            started_flag["started"] = True   # the command was started: whatever status comes back is its own (a 75 is then a real 75, never "no slot")
+        if fd is not None:
+            _record(fd, name, child["p"].pid, command[0], clock(), dict(extra, cstart=_start_of(child["p"].pid)))
+        if got["signal"] is not None:   # it arrived between taking the slot and the start: the command gets it too
+            try:
+                child["p"].send_signal(got["signal"])
+            except OSError:
+                pass
+        lock = slot_path(state_dir, index) if fd is not None else None
+        def stop_info():
+            info = {"kind": kind, "ran_seconds": dog.ran, "ceiling_seconds": max_seconds, "pid": child["p"].pid, "source": "wrapper"}
+            if fd is not None:
+                info.update(slot=index, waited_seconds=waited)
+            return info
+
+        def decided():   # before the first signal: the audit line
+            if on_stop is not None:
+                on_stop("decided", stop_info(), name, lane)
+        dog = Watchdog(child["p"].pid, command, mem_mb, max_seconds, out, clock(), clock=clock,
+                       **dict({"lock_path": lock, "hard_max": ceiling_table(ceiling_config)["max"], "decided": decided}, **(watchdog or {})))
+        dog.start()
+        progress_stop = threading.Event()
+        progress_lock = threading.Lock()
+        progress_thread = threading.Thread(target=_progress_loop, args=(child["p"].pid, os.path.basename(command[0]), progress_every, progress_stop, out, clock, clock(), progress_lock), daemon=True)
+        progress_thread.start()
+        try:
+            while True:
+                try:
+                    status = child["p"].wait()
+                    break
+                except InterruptedError:   # a signal during wait: Python retries; this is belt and braces
+                    continue
+        finally:
+            got_lock = progress_lock.acquire(timeout=2)   # bounded: a write blocked on a full pipe must not hold `run`
+            try:
+                progress_stop.set()   # set anyway when the lock was not obtained: the thread checks it under the lock before it begins a write
+            finally:
+                if got_lock:
+                    progress_lock.release()
+            if progress_thread.is_alive():
+                progress_thread.join(2)   # bounded: no progress line after run returns
+            dog.finish()
+        if dog.reason == "time" and on_stop is not None:   # after the stop; it never changes the exit status
+            try:
+                on_stop("told", stop_info(), name, lane)
+            except Exception as err:
+                out.write("heavy: the stop report failed (%s)\n" % _plain("%s: %s" % (type(err).__name__, err), 120))
+        if dog.exit_status():
+            return dog.exit_status()
+        return 128 - status if status < 0 else status   # a signal: 128 + n, as a shell reports it
+    finally:
+        if queue is not None:
+            queue.leave()
+        for number, handler in old.items():
+            signal.signal(number, handler)
+        if fd is not None:
+            os.close(fd)   # the record stays: `holders` lists only slots whose lock is held, and the next holder overwrites it
+
+
+def wrap_argv(argv, environ, python, switchboard, script, err=None, state_dir=None):
+    """The command line that re-runs `script argv` through `heavy`, or None when it should run as it is (FLEET_HEAVY=off, a CI run, already in a slot, or the
+    state directory cannot be written: then ONE line on `err` and the caller runs unslotted: a missing slot machinery never stops the suite). Used by bin/test-switchboard."""
+    err = sys.stderr if err is None else err
+    if should_take_slot(environ) != "taken":
+        return None
+    try:
+        probe = str(state_dir) if state_dir is not None else os.path.join(environ.get("XDG_STATE_HOME") or os.path.join(os.path.expanduser("~"), ".local", "state"), "fleet-switchboard")
+        os.makedirs(probe, mode=0o700, exist_ok=True)
+        if not os.access(probe, os.W_OK):
+            raise OSError("not writable")
+    except OSError as error:
+        err.write("heavy: no slot machinery here (%s): running without a slot\n" % (error.strerror or error))
+        return None
+    return [python, switchboard, "heavy", "--name", os.path.basename(script), "--", python, script] + list(argv)
+
+
+# ---- the quick slots (#1045): a small separate allowance for ONE focused test file or class, so a one-file check never waits behind a full-suite run.
+QUICK_SLOTS = 4          # the cap: at most this many quick runs at once, on their own locks and their own line (a directory of their own in the state directory)
+QUICK_DIR = "quick"
+
+
+def real_slot_dir(state_dir, name):
+    """A slot directory of ours: made 0700 when absent, and REFUSED (OSError) when the entry there is a symlink or anything but a real directory (lstat, never followed)."""
+    import stat
+    path = os.path.join(str(state_dir), name)
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        os.makedirs(path, mode=0o700, exist_ok=True)
+        info = os.lstat(path)
+    if not stat.S_ISDIR(info.st_mode):
+        raise OSError(errno.ENOTDIR, "%s is not a real directory (a symlink or a file): refused" % path)
+    if info.st_uid != os.getuid():
+        raise OSError(errno.EPERM, "%s is not owned by this user: refused" % path)
+    return path
+
+
+def quick_dir(state_dir):
+    return real_slot_dir(state_dir, QUICK_DIR)
+
+
+def quick_status(state_dir):
+    """`quick slots 1/4 (ceiling 10 min)`: read only (a missing directory reads as none held)."""
+    path = os.path.join(str(state_dir), QUICK_DIR)
+    try:
+        held = len(holders(path, QUICK_SLOTS)) if stat.S_ISDIR(os.lstat(path).st_mode) else 0   # lstat: a symlink reads as none held
+    except OSError:
+        held = 0
+    return "quick slots %d/%d (ceiling %d min)" % (held, QUICK_SLOTS, KIND_DEFAULTS["quick"] // 60)
+
+
+def run_quick(command, state_dir, wait_max=DEFAULT_WAIT_MAX, name=None, environ=None, out=None, **keywords):
+    """Run ONE focused command in a quick slot. A command that is not focused (a whole suite, an e2e run) is refused with 64 and never takes a quick slot. The quick slots
+    have their own locks and their own waiting line, so a run holding every ordinary slot (or queued for one) never delays it; at most QUICK_SLOTS run at once and each is
+    stopped after the "quick" row of KIND_DEFAULTS (10 min)."""
+    out = sys.stderr if out is None else out
+    kind = classify(command)
+    if kind != "focused":
+        out.write("heavy: refused: a quick slot is for ONE focused test file or class; this run is %s (use an ordinary slot: no --quick)\n" % kind)
+        return EXIT_USAGE
+    environ = dict(os.environ if environ is None else environ)
+    environ[TIME_ENV] = str(KIND_DEFAULTS["quick"])
+    try:
+        out.write("heavy: quick slot: %s\n" % quick_status(state_dir))
+    except OSError:
+        pass
+    return run(command, quick_dir(state_dir), QUICK_SLOTS, wait_max, name, environ=environ, out=out, ceiling=KIND_DEFAULTS["quick"],
+               ceiling_config={"slots": QUICK_SLOTS, "ceilings": {"max": KIND_DEFAULTS["quick"]}}, **keywords)
+
+
+# ---- the reserved slots of a `heavy --changed` run (#1045, clause 7): the diff-derived focused run (several classes, several suites) is never queued behind full-suite runs.
+CHANGED_SLOTS = 2        # reserved: on their own locks and their own waiting line (a directory of their own in the state directory), so a queue of full-suite runs never delays it
+CHANGED_DIR = "changed"
+CHANGED_WAIT_MAX = 120   # the bound of the wait for a reserved slot, in seconds; a longer --wait-max is cut to it
+EXIT_NO_FOCUSED_SLOT = 3
+NO_FOCUSED_SLOT = "no focused slot free"
+NOSLOT_NONCE_ENV = "FLEET_HEAVY_NOSLOT_NONCE"   # set by the caller of a --changed slot: the marker line carries it, so only a real refusal reads as "not run" (no exit code does)
+
+
+def noslot_marker(environ, out):
+    """Write the marker line that says THIS command was not run for want of a slot (or was refused): the caller reads the line, never an exit status a command may also exit with."""
+    nonce = environ.get(NOSLOT_NONCE_ENV)
+    if nonce:
+        out.write("heavy: [noslot %s]\n" % nonce)
+        out.flush()
+
+
+def changed_dir(state_dir):
+    return real_slot_dir(state_dir, CHANGED_DIR)
+
+
+def run_changed(command, state_dir, wait_max=CHANGED_WAIT_MAX, name=None, environ=None, out=None, **keywords):
+    """Run one command of a `heavy --changed` run in a reserved slot. At most CHANGED_SLOTS run at once; the wait is at most CHANGED_WAIT_MAX seconds, and when every reserved
+    slot is still taken the run is NOT started: the line `heavy: no focused slot free ...` names it and the status is 3 (never a silent timeout)."""
+    out = sys.stderr if out is None else out
+    environ = dict(os.environ if environ is None else environ)
+    wait = min(CHANGED_WAIT_MAX if wait_max is None else wait_max, CHANGED_WAIT_MAX)
+    ceiling = keywords.pop("ceiling", None) or KIND_DEFAULTS["focused"]   # the focused row of the per-kind table: no ceiling of its own
+    environ[TIME_ENV] = str(ceiling)
+    flag = {}
+    code = run(command, changed_dir(state_dir), CHANGED_SLOTS, wait, name, environ=environ, out=out, ceiling=ceiling,
+               ceiling_config={"slots": CHANGED_SLOTS, "ceilings": {"max": ceiling}}, started_flag=flag, **keywords)
+    if code == EXIT_TEMPFAIL and not flag.get("started"):   # a command that itself exits 75 is a real result
+        noslot_marker(environ, out)
+        out.write("heavy: %s: all %d reserved --changed slots are taken after %d s: the command was not run (exit %d)\n" % (NO_FOCUSED_SLOT, CHANGED_SLOTS, wait, EXIT_NO_FOCUSED_SLOT))
+        out.flush()
+        return EXIT_NO_FOCUSED_SLOT
+    return code
+
+
+_MOVED = ("Watchdog", "record_stop", "record_lost", "tell_lane", "_held_record", "check_orphans", "_marker_path", "_marker_key", "_reported", "_mark_reported", "_stop_orphan")
+_HANDED = ('DEFAULT_SLOTS', 'EXIT_MEMORY', 'EXIT_TIME', 'EXPRESS', 'HARD_MAX_SECONDS', 'KILL_GRACE_SECONDS', 'KIND_DEFAULTS', 'ORPHAN_LOCK', 'PID_MAX', 'STOP_TOLD', 'SWEEP_ROUNDS', 'SWEEP_SECONDS', 'WATCH_SECONDS', '_alive', '_plain', '_read_info', '_start', '_start_of', '_whole', 'ceiling_table', 'read_lock_holders', 'read_process_table', 'slot_path', 'tree')
+
+
+def _load_part():
+    """Load heavy_slots_watch.py from beside this file, hand it the names it reads (copies taken now) and re-export what it defines."""
+    import importlib.util
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "heavy_slots_watch.py")
+    spec = importlib.util.spec_from_file_location("heavy_slots_watch", path)
+    part = importlib.util.module_from_spec(spec)
+    for name in _HANDED:
+        setattr(part, name, globals()[name])
+    spec.loader.exec_module(part)
+    return part
+
+
+_part = _load_part()
+for _name in _MOVED:
+    globals()[_name] = getattr(_part, _name)

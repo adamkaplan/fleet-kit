@@ -1,0 +1,1 @@
+| `cloud_end_alert.py` | 0 | the pass that reads the launcher's audit file and tells a cloud worker's boss and the Chief of Staff, once per run and reason, that the launcher ended it (ask #1480; the send function and the bounded parse are handed in) | |

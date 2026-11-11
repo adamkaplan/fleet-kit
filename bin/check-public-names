@@ -1,0 +1,137 @@
+#!/usr/bin/env python3
+"""check-public-names: fail when a private name appears in this public repository's tracked files.
+
+This repo is public and meant for reuse: no private product names, repos, people, issue numbers or data. The names to
+refuse are NOT kept in the repo. They come from a local list:
+
+  $FLEET_PRIVATE_NAMES_FILE   (default ~/.config/fleet-switchboard/private-names.txt), or
+  $FLEET_PRIVATE_NAMES        the list itself as text (what CI passes from a repository secret)
+
+One entry per line; blank lines and `# comments` are skipped. An entry is a Python regular expression matched
+case-insensitively; `case:<regex>` matches case-sensitively; `ignore:<glob>` excludes paths (for example `ignore:LICENSE`).
+
+  check-public-names [--root DIR] [--names-file FILE] [--stdin LABEL]
+
+It scans every tracked text file (`git ls-files`, else a walk of DIR). With --stdin it scans text from standard input
+instead (a PR title or body), labelled LABEL. A hit prints `path:line: term #N` where N is the entry's number in the list:
+the term itself is never printed, and a path that matches is shown masked. Exit 0 clean, 1 on a hit, 2 on a bad list.
+With no list at all it prints a `skipped` note and exits 0 (a fork's PR has no secret).
+"""
+import argparse
+import fnmatch
+import os
+import re
+import subprocess
+import sys
+
+DEFAULT_LIST = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
+                            "fleet-switchboard", "private-names.txt")
+MAX_BYTES = 2000000
+
+
+def parse_list(text):
+    """([(index, compiled regex)], [ignore globs]); raises ValueError naming the entry NUMBER (never its text)."""
+    terms, ignores, index = [], [], 0
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("ignore:"):
+            ignores.append(line[len("ignore:"):].strip())
+            continue
+        index += 1
+        flags = re.IGNORECASE
+        if line.startswith("case:"):
+            line, flags = line[len("case:"):], 0
+        try:
+            terms.append((index, re.compile(line, flags)))
+        except re.error as err:
+            raise ValueError("entry #%d is not a valid regular expression (%s)" % (index, err)) from None
+    return terms, ignores
+
+
+def tracked_files(root):
+    try:
+        out = subprocess.run(["git", "-C", root, "ls-files", "-z"], capture_output=True, check=True).stdout
+        return [p for p in out.decode("utf-8", "replace").split("\0") if p]
+    except (OSError, subprocess.CalledProcessError):
+        found = []
+        for base, dirs, names in os.walk(root):
+            dirs[:] = [d for d in dirs if d != ".git"]
+            found.extend(os.path.relpath(os.path.join(base, n), root) for n in names)
+        return sorted(found)
+
+
+def scan_text(text, terms):
+    """[(line number, term index)] for every line with a hit (one entry per term per line)."""
+    hits = []
+    for number, line in enumerate(text.splitlines(), 1):
+        for index, regex in terms:
+            if regex.search(line):
+                hits.append((number, index))
+    return hits
+
+
+def scan_tree(root, terms, ignores):
+    found, checked = [], 0
+    for path in tracked_files(root):
+        if any(fnmatch.fnmatch(path, g) for g in ignores):
+            continue
+        full = os.path.join(root, path)
+        try:
+            if not os.path.isfile(full) or os.path.islink(full):
+                continue
+            with open(full, "rb") as handle:
+                data = handle.read(MAX_BYTES)
+        except OSError:
+            continue
+        if b"\0" in data[:8192]:
+            continue  # binary
+        checked += 1
+        shown = path
+        if any(regex.search(path) for _, regex in terms):
+            shown = "<path masked>"
+        for number, index in scan_text(data.decode("utf-8", "replace"), terms):
+            found.append((shown, number, index))
+    return found, checked
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog="check-public-names", description=__doc__.split("\n\n")[0])
+    parser.add_argument("--root", default=None, help="the tree to scan (default: this repo)")
+    parser.add_argument("--names-file", default=None, help="the list (default: $FLEET_PRIVATE_NAMES_FILE or %s)" % DEFAULT_LIST)
+    parser.add_argument("--stdin", metavar="LABEL", help="scan standard input (a PR title or body) instead of the tree")
+    args = parser.parse_args(argv)
+    root = args.root or os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+    text = os.environ.get("FLEET_PRIVATE_NAMES", "")   # the list itself (CI passes a secret this way)
+    if not text.strip() or args.names_file:
+        path = args.names_file or os.environ.get("FLEET_PRIVATE_NAMES_FILE") or DEFAULT_LIST
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                text = handle.read()
+        except OSError:
+            text = text if not args.names_file else ""
+    if not text.strip():
+        print("check-public-names: skipped: no private-names list (set FLEET_PRIVATE_NAMES_FILE, or FLEET_PRIVATE_NAMES)")
+        return 0
+    try:
+        terms, ignores = parse_list(text)
+    except ValueError as err:
+        sys.stderr.write("check-public-names: the list is not usable: %s\n" % err)
+        return 2
+    if not terms:
+        print("check-public-names: skipped: the list has no entries")
+        return 0
+    if args.stdin:
+        found = [(args.stdin, n, i) for n, i in scan_text(sys.stdin.read(MAX_BYTES), terms)]
+        checked = 1
+    else:
+        found, checked = scan_tree(root, terms, ignores)
+    for shown, number, index in found:
+        print("%s:%d: term #%d" % (shown, number, index))
+    print("check-public-names: %d hit(s) in %d file(s) checked, %d term(s)" % (len(found), checked, len(terms)))
+    return 1 if found else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

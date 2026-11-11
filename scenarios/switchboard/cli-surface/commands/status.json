@@ -1,0 +1,4 @@
+{
+ "command": "status",
+ "help": "usage: fleet-switchboard status [-h] [--json] options: -h, --help show this help message and exit --json Emit machine-readable JSON instead"
+}

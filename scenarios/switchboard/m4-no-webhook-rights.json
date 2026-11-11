@@ -1,0 +1,34 @@
+{
+  "id": "M4",
+  "title": "A repo whose account cannot make a webhook is read on a poll, and the status says so",
+  "problem": null,
+  "since_pr": 15,
+  "tiers": ["offline"],
+  "tags": ["multi-repo"],
+  "cast": {
+    "web-orch": {"role": "orchestrator", "charter": 1, "repo": "acme/web"}
+  },
+  "repos": {
+    "acme/web": {"account": "acme-ci", "webhook": false}
+  },
+  "issues": {
+    "acme/web#1": {"intent": null},
+    "acme/web#2": {"intent": "Build the landing page", "done_when": "it renders", "parent": 1}
+  },
+  "config": {"batch_seconds": 10},
+  "steps": [
+    {"at": "40s", "actor": "world", "do": "comment", "repo": "acme/web", "issue": 2, "id": 2001,
+     "body": "please look",
+     "why": "No forwarder can run for the repo: the comment is found by the catch-up read on a poll"},
+    {"at": "6m", "actor": "world", "do": "wait"}
+  ],
+  "expect": [
+    {"name": "polled", "that": "repo_watch", "repo": "acme/web", "how": "polling"},
+    {"name": "toast-once", "that": "toast", "text": "acme/web", "count": 1,
+     "why": "One toast, however many polls and restarts follow"},
+    {"name": "status-says-so", "that": "status_says", "text": "polling every 30s"},
+    {"name": "still-arrives", "that": "delivered", "to": "web-orch", "key": "github.comment:2001", "count": 1}
+  ],
+  "control": {"variant": {"repos": {"acme/web": {"webhook": true}}},
+              "fails": ["polled", "toast-once", "status-says-so"]}
+}

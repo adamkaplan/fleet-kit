@@ -1,0 +1,27 @@
+{
+  "id": "M6",
+  "title": "launch --new-workspace with a label the charter does not name is refused, and nothing is made",
+  "problem": null,
+  "since_pr": 15,
+  "tiers": ["offline"],
+  "tags": ["multi-repo"],
+  "cast": {
+    "web-orch": {"role": "orchestrator", "charter": 1, "repo": "acme/web"}
+  },
+  "repos": {
+    "acme/web": {"account": "acme-ci"}
+  },
+  "issues": {
+    "acme/web#1": {"intent": null, "workspace": "Acme Web"}
+  },
+  "steps": [
+    {"at": "5s", "actor": "world", "do": "launch", "agent": "web-orch", "new_workspace": "Acme Website",
+     "why": "The charter's `workspace:` line says Acme Web; the label must match it exactly"},
+    {"at": "30s", "actor": "world", "do": "wait"}
+  ],
+  "expect": [
+    {"name": "refused", "that": "launch_refused", "agent": "web-orch", "text": "Acme Web",
+     "why": "Exit 1, no herdr workspace created, no session made"}
+  ],
+  "control": {"variant": {"steps": {"0": {"new_workspace": "Acme Web"}}}, "fails": ["refused"]}
+}
