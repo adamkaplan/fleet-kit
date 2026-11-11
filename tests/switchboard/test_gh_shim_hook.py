@@ -149,6 +149,28 @@ class TestGhShimHookDelete(unittest.TestCase):
         self.assertEqual(len(calls), 1, done.stderr)
         self.assertEqual(len(seen), 1, "it was read first")
 
+    def test_the_attached_method_spellings_are_guarded_like_the_separate_one(self):
+        for spelling in (["--method=DELETE"], ["-X=DELETE"], ["-XDELETE"]):
+            with self.subTest(spelling=spelling, hook="web"):
+                done, calls, _ = self.rig.go(["api"] + spelling + [HOOK], hook_text=hook(name="web"))
+                self.assertEqual(calls, [], done.stderr)
+                self.assertNotEqual(done.returncode, 0)
+            with self.subTest(spelling=spelling, hook="forwarder"):
+                done, calls, seen = self.rig.go(["api"] + spelling + [HOOK])
+                self.assertEqual(len(seen), 1, "it was read first")
+                self.assertEqual(len(calls), 1, done.stderr)
+
+    def test_a_read_with_a_repo_pair_and_a_lead_flag_is_classified_a_read(self):
+        gh_body = load_module()
+        parsed = []
+        def parser(args):
+            parsed.append(args)
+            return type("P", (), {"effective_method": "GET", "positionals": [], "hostname": None})()
+        self.assertIsNone(gh_body.guard(["-R", "o/r", "--jq", ".", "api", HOOK], False, parser, None, None))
+        self.assertEqual(parsed, [["api", "--jq", ".", HOOK]], "the -R pair is not handed to the api parser")
+        self.assertIsNone(gh_body.guard(["--repo=o/r", "--jq", ".", "api", HOOK], False, parser, None, None))
+        self.assertEqual(parsed[-1], ["api", "--jq", ".", HOOK])
+
     def test_a_missing_guard_module_refuses_the_delete(self):
         (self.rig.shims / "gh_body.py").unlink()
         done, calls, _ = self.rig.go(delete())
@@ -181,3 +203,24 @@ class TestGhShimHookControls(unittest.TestCase):
         self.addCleanup(rig.close)
         done, calls, _ = rig.go(delete(), hook_text=hook(name="web"))
         self.assertEqual(len(calls), 1, "control: no check, no narrowing")
+
+    def test_without_the_url_refusal_a_full_url_delete_would_read_and_pass(self):
+        old = 'if "://" in endpoint or endpoint.startswith("//"):'
+        rig = HookRig(gh_body_source=mutant("gh_body.py", old, "if False:"))
+        self.addCleanup(rig.close)
+        done, calls, _ = rig.go(delete("https://api.github.com/" + HOOK))
+        self.assertEqual(len(calls), 1, "control: the refusal is what stops it")
+
+    def test_without_the_lead_flag_block_a_flag_before_api_would_pass(self):
+        old = "        if lead and all("
+        rig = HookRig(gh_body_source=mutant("gh_body.py", old, "        if False and all("))
+        self.addCleanup(rig.close)
+        done, calls, _ = rig.go(["--hostname", "github.com"] + delete(), hook_text=hook(name="web"))
+        self.assertEqual(len(calls), 1, "control: the block is what stops it")
+
+    def test_without_the_numeric_id_test_a_non_numeric_id_is_read_not_left_to_the_allow_list(self):
+        # the guard defers a non-numeric id to the allow-list (which refuses); the mutant makes the guard let it through to the shim's row, mutated too
+        rig = HookRig(shim_source=mutant("gh", 'r"hooks/[0-9]+"', 'r"hooks/[0-9a-z]+"'))
+        self.addCleanup(rig.close)
+        done, calls, _ = rig.go(delete("repos/o/r/hooks/abc"), hook_text=hook(name="web"))
+        self.assertEqual(len(calls), 1, "control: only the allow-list row refuses a non-numeric id")
