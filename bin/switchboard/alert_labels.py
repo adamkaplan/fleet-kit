@@ -228,10 +228,11 @@ def red_ci_latest(repo, runs):
     return [r for r in runs if not (isinstance(r, dict) and isinstance(r.get("id"), int)) or r["id"] in kept]
 
 
-def red_ci_runs(engine, repo, runs, now, pr_read=None):
+def red_ci_runs(engine, repo, runs, now, pr_read=None, lane_read=None):
     """Judge the workflow runs the catch-up read of `repo`. Never raises.
     `pr_read(number)` is the pull request's PRESENT record ({"state", "merged", "head": {"sha"}}) or None; the unowned alert (#1378) is told only for an open pull request at the run's head,
-    and never when the record cannot be read."""
+    and never when the record cannot be read. `lane_read(pr record)` (ask #2392) is the live owner of that pull request's ask (a worker or the orchestrator lane, by the router's own links) or None;
+    an owner found by it silences the unowned alert, one that is not found (or a read that fails) keeps it."""
     try:
         if engine is None or engine.state_dir is None:
             return
@@ -281,6 +282,13 @@ def red_ci_runs(engine, repo, runs, now, pr_read=None):
                         if not (isinstance(pr, dict) and pr.get("state") == "open" and not pr.get("merged") and sha == head):
                             engine._note("red_ci.unowned_skipped", repo, {"pr": number, "head": module.clean(head, 64)})
                             continue   # closed, merged, moved on or unreadable: never told on a guess
+                        try:
+                            lane = lane_read(pr) if lane_read else None
+                        except Exception:
+                            lane = None   # a failed owner read keeps today's alert
+                        if lane:
+                            engine._note("red_ci.unowned_skipped", repo, {"pr": number, "head": module.clean(head, 64), "owner": module.clean(lane, 40)})
+                            continue   # the ask has a live owner: not told (told later, once, if no owner is left at a later pass)
                         engine._note("red_ci.unowned", repo, {"pr": number, "head": module.clean(head, 64)})
                         changed |= red_ci_tell(engine, state, ukey, repo,
                                                module.unowned_line(repo, number, name, url, head), red_ci_receivers(engine, repo, True, False), now)
