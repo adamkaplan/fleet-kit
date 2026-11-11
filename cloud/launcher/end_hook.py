@@ -761,6 +761,151 @@ def snapshot_main():
         ctx.close()
 
 
+# ---- the run files (ask #2432): the pod's /work/runs and progress file live outside the checkout and end with the pod; the answer carries their tails ----
+# Cause: the wip save commits only the checkout, and the run record kept only this answer, so a run's exit number, its log and whether the end-of-run
+# wake was delivered (cw-run's files NAME.log, NAME.exit, NAME.pid, NAME.woke and its progress lines `run NAME exited CODE after Ns; ...` and
+# `wake not delivered`) were lost with the pod. The files are an agent's text: read as bytes, never executed, names checked, links skipped, every
+# read bounded, nothing raised. The answer's `runs` and `wake_lines` go to the run record only, never to the wip branch.
+# TEST SEAM: the tests patch RUNS_DIR and PROGRESS_FILE (nothing is read from the environment: the agent cannot move the directory).
+RUNS_DIR = "/work/runs"
+PROGRESS_FILE = "/work/progress.txt"
+RUN_NAME_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")
+RUN_EXTS = (".log", ".exit", ".pid", ".woke")
+MAX_RUNS = 20
+MAX_TAIL = 3000
+MAX_WAKE_LINES = 10
+MAX_WAKE_LINE = 200
+MAX_RUN_ADDITION = 20000
+MAX_RUN_FILE = 50 * 1024 * 1024   # a bigger file is named with an empty tail
+READ_TAIL_BYTES = 32768
+# The same pattern as cw-run's redact (cloud/worker/cw-run), which makes the wake's tail: one redaction path for both.
+RUN_SECRET = re.compile(r"(?i)(gh[pousr]_[A-Za-z0-9_]{8,}|github_pat_[A-Za-z0-9_]{8,}|sk-[A-Za-z0-9_-]{8,}|xox[a-z]-[A-Za-z0-9-]{8,}"
+                        r"|AKIA[0-9A-Z]{12,}|eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(\.[A-Za-z0-9_-]*)?"
+                        r"|(bearer|basic)\s+[A-Za-z0-9._~+/=-]{8,}|-----BEGIN [A-Z ]*PRIVATE KEY-----|://[^/\s:@]+:[^@\s]+@|--(password|token|secret)[= ]\S+"
+                        r"|[A-Za-z0-9_]*(token|secret|password|passwd|api[_-]?key)[A-Za-z0-9_]*[\"']?\s*[=:]\s*(\"[^\"]*\"|'[^']*'|\S+)"
+                        r"|[A-Za-z0-9+/_-]{40,}={0,2})")
+LEAD_TOKEN = re.compile(r"^[A-Za-z0-9+/_=.-]*")
+
+
+def _redact_line(line):
+    """One line, cut to its last MAX_TAIL characters (a cut also drops the token-shaped piece it may have split), control characters out, secrets replaced."""
+    if len(line) > MAX_TAIL:
+        line = line[-MAX_TAIL:]
+        line = line[LEAD_TOKEN.match(line).end():]
+    line = "".join(c if c in "\t" or c.isprintable() else " " for c in line)
+    return RUN_SECRET.sub("[redacted]", line)
+
+
+def _read_tail(path):
+    """(ok, bytes of the end of a regular file, not a link, at most READ_TAIL_BYTES); ok False when absent, a link, special, oversized or unreadable."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    except OSError:
+        return False, b""
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > MAX_RUN_FILE:
+            return False, b""
+        if st.st_size > READ_TAIL_BYTES:
+            os.lseek(fd, st.st_size - READ_TAIL_BYTES, os.SEEK_SET)
+        return True, os.read(fd, READ_TAIL_BYTES)
+    except OSError:
+        return False, b""
+    finally:
+        os.close(fd)
+
+
+def _is_link_or_odd(path):
+    """True when the path exists and is not a regular file (a link, a directory, a special file); False when absent."""
+    try:
+        return not stat.S_ISREG(os.lstat(path).st_mode)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+
+
+def run_tail(path):
+    """The last 20 lines of a log, redacted, at most MAX_TAIL characters; "" for an unreadable one."""
+    ok, data = _read_tail(path)
+    if not ok:
+        return ""
+    lines = data.decode("utf-8", "replace").splitlines()[-20:]
+    return "\n".join(_redact_line(x) for x in lines)[-MAX_TAIL:]
+
+
+def run_exit(path):
+    ok, data = _read_tail(path)
+    text = data.decode("utf-8", "replace").strip() if ok else ""
+    return int(text) if re.fullmatch(r"-?[0-9]{1,6}", text) else None
+
+
+def wake_lines(progress=None):
+    """The last MAX_WAKE_LINES lines of the progress file that start with `run ` and contain ` exited `, or equal `wake not delivered`."""
+    ok, data = _read_tail(PROGRESS_FILE if progress is None else progress)
+    if not ok:
+        return []
+    keep = [x for x in data.decode("utf-8", "replace").splitlines()
+            if (x.startswith("run ") and " exited " in x) or x == "wake not delivered"]
+    return [_redact_line(x)[:MAX_WAKE_LINE] for x in keep[-MAX_WAKE_LINES:]]
+
+
+def run_entries(directory=None):
+    """The `runs` list: at most MAX_RUNS entries, newest first, {name, exit, woke, log_tail}. A name outside RUN_NAME_RE, or one of whose files is a link
+    or not a regular file, is skipped; a missing directory gives []. Never raises."""
+    directory = RUNS_DIR if directory is None else directory
+    try:
+        stems = {}
+        for f in os.listdir(directory):
+            for ext in RUN_EXTS:
+                if f.endswith(ext) and RUN_NAME_RE.fullmatch(f[:-len(ext)]):
+                    stems.setdefault(f[:-len(ext)], []).append(os.path.join(directory, f))
+        found = []
+        for name, paths in stems.items():
+            if any(_is_link_or_odd(os.path.join(directory, name + e)) for e in RUN_EXTS):
+                continue
+            try:
+                newest = max(os.lstat(x).st_mtime for x in paths)
+            except OSError:
+                continue
+            found.append((newest, name))
+        found.sort(reverse=True)
+        out = []
+        for _, name in found[:MAX_RUNS]:
+            base = os.path.join(directory, name)
+            out.append({"name": name, "exit": run_exit(base + ".exit"), "woke": os.path.lexists(base + ".woke"), "log_tail": run_tail(base + ".log")})
+        return out
+    except Exception:
+        return []
+
+
+def run_files(directory=None, progress=None):
+    """({runs, wake_lines}) with the whole addition at most MAX_RUN_ADDITION characters: the tails give way, newest kept longest. Never raises."""
+    try:
+        lines = wake_lines(progress)
+        runs = run_entries(directory)
+        room = MAX_RUN_ADDITION - len(json.dumps(lines)) - 200 - sum(len(json.dumps(dict(r, log_tail=""))) + 2 for r in runs)
+        for r in runs:
+            r["log_tail"] = r["log_tail"][-min(MAX_TAIL, max(0, room)):] if room > 0 else ""
+            room -= len(json.dumps(r["log_tail"])) - 2
+        for r in reversed(runs):   # escapes make a character longer than counted: the oldest tails are emptied until the whole fits
+            if len(json.dumps({"runs": runs, "wake_lines": lines})) <= MAX_RUN_ADDITION:
+                break
+            r["log_tail"] = ""
+        return {"runs": runs, "wake_lines": lines}
+    except Exception:
+        return {"runs": [], "wake_lines": []}
+
+
+def with_runs(res):
+    """The hook's answer with the run files added (see run_files). Never raises."""
+    try:
+        res.update(run_files())
+    except Exception:
+        pass
+    return res
+
+
 def main():
     if "--snapshot" in sys.argv[1:]:
         return snapshot_main()
@@ -771,7 +916,7 @@ def main():
         print(json.dumps({"pushed": False, "wip_branch": None, "error": "CW_WORKER is not set"}))
         return 1
     try:
-        print(json.dumps(with_pr(workdir, run(workdir, worker))))
+        print(json.dumps(with_runs(with_pr(workdir, run(workdir, worker)))))
         return 0
     except TokenEnded as e:
         # ONE word to the stop side: ask for a fresh token and run me once more. The hook holds no credential for the minter and asks no one itself.

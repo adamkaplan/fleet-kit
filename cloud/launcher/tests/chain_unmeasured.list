@@ -13,6 +13,7 @@ cloud/launcher/tests/test_council_url_render.py
 cloud/launcher/tests/test_create_says_why.py
 cloud/launcher/tests/test_end_hook_nothing_to_push.py
 cloud/launcher/tests/test_end_hook_pr_ready.py
+cloud/launcher/tests/test_end_hook_run_files.py
 cloud/launcher/tests/test_failed_pod_record.py
 cloud/launcher/tests/test_final_note.py
 cloud/launcher/tests/test_fixture_root.py
