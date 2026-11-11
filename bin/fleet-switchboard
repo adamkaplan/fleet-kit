@@ -15233,7 +15233,7 @@ def landed_ref(text):
 def landed_check(engine, config, runner, repo, sha):
     """Raises LedgerCommandError naming what is missing unless `sha` is a commit of the land repository `repo` that is on its default branch and carries the land trailers."""
     ref = "%s@%s" % (repo, sha)
-    if not uses_spire_land(config, repo):
+    if not is_land_repo(config, repo):
         raise LedgerCommandError("refused: %s is not a land repository (`land_repos`): its subject is a pull request, nothing was recorded" % repo)
     get = impact_carry_get(engine, runner, repo)
     try:
