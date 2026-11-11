@@ -105,7 +105,7 @@ RENEW_CADENCE_SECONDS = 600             # the renewal and the login refresh run 
 RESTART_ACTION = "reaper-restart"       # the audit action of the reaper's exit after the installed code changed (the service manager starts it again)
 CODE_IDENTITY_FILES = ("cloud/launcher/cloud_worker.py", "cloud/launcher/run_record.py", "bin/path_walk.py", "cloud/launcher/token_mint.py", "bin/registry.py", "bin/record_json.py")   # the module and the kit modules it imports
 CODE_IDENTITY_FILES = CODE_IDENTITY_FILES + ("cloud/launcher/wip_save.py",)   # #2304: the save step is part of the reaper's code identity
-CODE_IDENTITY_FILES = CODE_IDENTITY_FILES + ("cloud/launcher/stall_watch.py",)   # #2399: the stall watch is part of the reaper's code identity
+CODE_IDENTITY_FILES = CODE_IDENTITY_FILES + ("cloud/launcher/stall_watch.py",)   # #2399
 RENEW_POLL_SECONDS = 15                 # how often that thread looks at the clock
 IGNORED_SETTING_ACTION = "ignored-setting-notice"   # the audit action of the notice that a setting is ignored by the unattended refresh
 IGNORED_SETTINGS = ("CW_KUBECTL", "CW_CLUSTER_ADMIN_CMD", "CW_CLUSTER_TOKEN_CMD")   # the names the strict route ignores
@@ -3160,23 +3160,11 @@ def results_not_finished(seen):
     return marker != 1 or mtime <= prompt
 
 
-def _stall_watch():
-    """#2399: the stall watch module (cloud/launcher/stall_watch.py), or None where it is not shipped (the token service's image copies only some launcher files)."""
+def _stall(call, *args):   # #2399: a stall_watch function, never raising (the module is loaded by name: the token service's image does not ship it)
     try:
-        return __import__("stall_watch")
-    except Exception:
-        return None
-
-
-def _stall_text(launcher):
-    """#2399: the two counts of the pass line (empty when the stall watch is absent or has not run)."""
-    sw, text = _stall_watch(), ""
-    try:
-        text = sw.pass_text(launcher) if sw is not None else ""
-    except Exception:
-        text = ""
-    return text
-
+        return getattr(__import__("stall_watch"), call)(*args)
+    except Exception as err:
+        return "" if call == "pass_text" else print("cloud-worker: the stall watch failed: %s" % type(err).__name__, file=sys.stderr)
 
 class Launcher:
     def __init__(self, kube, env, clock=None, sleep=time.sleep):
@@ -4658,12 +4646,7 @@ class Launcher:
             self.send_idle_nudges(live, now, acts)
         finally:
             steps["notes"] += mono() - t0   # the nudges are counted with the notes: both are the pass's sends
-        sw = _stall_watch()
-        try:
-            if sw is not None:
-                sw.watch_pass(self, live, now, NAME_RE.fullmatch)   # #2399: one read of each pod older than 10 minutes; an alert only, never a stop
-        except Exception as err:
-            print("cloud-worker: the stall watch failed: %s" % type(err).__name__, file=sys.stderr)
+        _stall("watch_pass", self, live, now, NAME_RE.fullmatch)   # #2399: one read of each pod older than 10 minutes; an alert only, never a stop
         try:
             out.extend(self.label_pod_prs(live, now))   # #2269: the pull requests a pod recorded get the labels its launch named
         except Exception as err:
@@ -6016,7 +5999,7 @@ def _reap_main(env, a, sleep, clock=None, refresher=None, kube=None, ticker_wait
             try:
                 work = L.reap() if L is not None else []   # the pass's own work: the workers' results
             finally:
-                print("cloud-worker: reaper pass line: cpu_seconds=%.3f audit_lines_parsed=%d%s" % (time.thread_time() - cpu0, tail_lines_parsed() - parsed0, _stall_text(L) + step_text(getattr(L, "step_seconds", None))), file=sys.stderr)
+                print("cloud-worker: reaper pass line: cpu_seconds=%.3f audit_lines_parsed=%d%s" % (time.thread_time() - cpu0, tail_lines_parsed() - parsed0, _stall("pass_text", L) + step_text(getattr(L, "step_seconds", None))), file=sys.stderr)
             took = (clock() - began).total_seconds()
             if L is not None:
                 L.note_slow_pass(took)
