@@ -92,7 +92,8 @@ def loud_skip(test, what):
 
 def base_other_keys():
     ref, data = base_file(JSON_REL)
-    return None if ref is None else strip_question(json.loads(data))
+    # the base may already hold the record entries (on the integration tip the merge base is HEAD itself): strip them from both sides
+    return None if ref is None else strip_record_entries(strip_question(json.loads(data)))
 
 
 def without_ref_rules(cfg):
@@ -138,6 +139,20 @@ class T(unittest.TestCase):
                 m["agent"]["worker"]["permission"]["edit"]["*other*"] = "deny"
             self.assertNotEqual(m, cfg, "mutation not applied")
             self.assertNotEqual(strip_record_entries(m), strip_record_entries(cfg))
+
+    def test_s4_unrelated_change_still_fails_against_base_with_record_entries(self):
+        # the base already carries the record entries (CI on the tip): an unrelated change must still differ
+        base = strip_record_entries(strip_question(load()))
+        cur = load()
+        self.assertEqual(without_ref_rules(strip_record_entries(strip_question(cur))), without_ref_rules(base))
+        for mut in ("bash", "edit"):
+            m = copy.deepcopy(cur)
+            if mut == "bash":
+                m["permission"]["bash"]["gh unrelated*"] = "allow"
+            else:
+                m["permission"].setdefault("edit", {})["*unrelated*"] = "deny"
+            self.assertNotEqual(m, cur, "mutation not applied")
+            self.assertNotEqual(without_ref_rules(strip_record_entries(strip_question(m))), without_ref_rules(base), mut + " change not refused")
 
     def test_s4_empty_agent_block_is_not_dropped(self):
         cfg = load()
