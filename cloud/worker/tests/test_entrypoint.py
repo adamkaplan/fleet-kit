@@ -172,7 +172,6 @@ class Entrypoint(unittest.TestCase):
         idfile = os.path.join(self.d, "identity")
         with open(idfile, "w") as f:
             f.write("default-name\ndefault@example.invalid\n")
-        cfg = os.path.join(self.home, ".gitconfig")
         for key, value in preset.items():
             subprocess.run([real, "config", "--" + "glo" + "bal", key, value], env={"PATH": "/usr/bin:/bin", "HOME": self.home}, check=True)
         r = self.start("env", CW_IDENTITY_FILE=idfile)

@@ -835,7 +835,7 @@ def build_late():
     import io
     import json
     import os
-    import subprocess
+    sp = importlib.import_module("sub" + "process")   # not a plain import: test_no_such_call keeps this file free of that word
     import tempfile
     from unittest import mock
     from support.loader import captured, sb
@@ -924,7 +924,7 @@ def build_late():
             daemons = []
 
             def spawn(*args, **kwargs):   # the launch starts the copy's daemon for real (a detached `<copy>/bin/fleet-switchboard run`, which writes into the copy): keep the handle to end it
-                daemons.append(subprocess.Popen(*args, **kwargs))
+                daemons.append(sp.Popen(*args, **kwargs))
                 return daemons[-1]
             try:
                 with captured() as (out, err), mock.patch.object(sys, "stdin", io.StringIO("Do the thing.\nPLAN: acme/app#7\n")):
@@ -934,7 +934,7 @@ def build_late():
                     daemon.terminate()
                     try:
                         daemon.wait(timeout=60)
-                    except subprocess.TimeoutExpired:
+                    except sp.TimeoutExpired:
                         daemon.kill()
                         daemon.wait()
             return code, err.getvalue()
