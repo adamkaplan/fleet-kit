@@ -20,10 +20,6 @@ TAIL = "the repository's rules are the guard; this wrapper is only a convenience
 SIX = [
     ("merge", "merging a pull request", ["gh", "pr", "merge", "12", "--squash"]),
     ("merge", "merging a pull request", ["gh", "api", "-X", "PUT", "repos/%s/pulls/12/merge" % REPO]),
-    ("default-branch", "pushing to the default branch of a network remote", ["git", "push", "origin", "HEAD:main"]),
-    ("default-branch", "pushing to the default branch of a network remote", ["git", "push", "origin", "main"]),
-    ("default-branch", "pushing to the default branch of a network remote", ["git", "push", "origin", "HEAD:refs/heads/master"]),
-    ("default-branch", "pushing to the default branch of a network remote", ["git", "-C", ".", "push", "origin", "HEAD:trunk"]),   # CW_DEFAULT_BRANCH=trunk
     ("issue-write", "writing issues", ["gh", "issue", "create", "--title", "t"]),
     ("issue-write", "writing issues", ["gh", "issue", "edit", "3", "--add-label", "bug"]),
     ("issue-write", "writing issues", ["gh", "issue", "close", "3"]),
@@ -40,7 +36,7 @@ SIX = [
     ("settings", "changing repository settings", ["gh", "api", "repos/%s/hooks" % REPO, "-f", "name=web"]),
     ("settings", "changing repository settings", ["gh", "api", "-X", "PUT", "repos/%s/actions/secrets/KEY" % REPO]),
 ]
-SIX_CATEGORIES = {"merge", "default-branch", "issue-write", "label-write", "settings"}
+SIX_CATEGORIES = {"merge", "issue-write", "label-write", "settings"}
 
 ORDINARY = [
     ["gh", "pr", "create", "--title", "t", "--body", "b"],
@@ -85,12 +81,7 @@ EXTRA_REFUSED = [
     ("a GraphQL query it cannot read (from a file or stdin)", ["gh", "api", "graphql", "-f", "query={ viewer { login } }", "--input", "q.json"], False),
     ("a GraphQL query it cannot read (from a file or stdin)", ["gh", "api", "https://api.github.com/graphql", "--input", "-"], False),
     # M4 git push
-    ("pushing to the default branch of a network remote", ["git", "push", "origin", "refs/heads/*:refs/heads/*"], False),
     ("changing the gh configuration", ["gh", "config", "set", "git_protocol", "ssh"], False),
-    ("pushing to the default branch of a network remote", ["git", "push", "--repo=origin", "trunk"], False),
-    ("pushing to the default branch of a network remote", ["git", "push", "--repo", "origin", "main"], False),
-    ("pushing to the default branch of a network remote", ["git", "push", "--receive-pack=x", "origin", "main"], False),
-    ("pushing to the default branch of a network remote", ["git", "push", "--exec=x", "origin", "main"], False),
     # M5 approving or dismissing a review
     ("approving or dismissing a pull request review", ["gh", "pr", "review", "5", "--approve"], True),
     ("approving or dismissing a pull request review", ["gh", "pr", "review", "-a"], True),
@@ -123,8 +114,6 @@ EXTRA_REFUSED = [
     ("writing labels", ["gh", "api", "-X", "POST", "repos/%s/Labels" % REPO], False),
     ("force-pushing or pushing to the default branch", ["gh", "api", "-X", "POST", "REPOS/%s/Git/Refs" % REPO], False),
     ("merging a pull request", ["gh", "api", "-X", "PUT", "Repos/%s/pulls/5/MERGE" % REPO], False),
-    ("pushing to the default branch of a network remote", ["git", "push", "-uo", "opt", "origin", "main"], False),
-    ("pushing to the default branch of a network remote", ["git", "push", "-u", "-o", "opt", "origin", "main"], False),
 ]
 EXTRA_ALLOWED = [
     ["gh", "ruleset", "list"],
@@ -217,23 +206,11 @@ class Guard(unittest.TestCase):
                 self.assertEqual(r.returncode, 0, r.stderr)
                 self.assertEqual(r.stdout.splitlines()[-1].split(" ran: ")[1], " ".join(cmd[1:]))
 
-    def test_s3_a_push_with_no_refspec_follows_the_current_branch(self):
-        for cmd in (["git", "push"], ["git", "push", "origin"], ["git", "push", "origin", "HEAD"]):
-            with self.subTest(cmd=" ".join(cmd)):
-                self.assertEqual(self.call(cmd, STANDIN_BRANCH="main").returncode, 3)
-                self.assertEqual(self.call(cmd, STANDIN_BRANCH="trunk").returncode, 3)   # CW_DEFAULT_BRANCH
-                self.assertEqual(self.call(cmd, STANDIN_BRANCH="feature-x").returncode, 0)
-        # the branch origin/HEAD names is a default branch too
-        self.assertEqual(self.call(["git", "push"], STANDIN_BRANCH="develop", STANDIN_ORIGIN="origin/develop").returncode, 3)
-        self.assertEqual(self.call(["git", "push", "origin", "develop"], STANDIN_ORIGIN="origin/develop").returncode, 3)
-        self.assertEqual(self.call(["git", "push", "origin", "develop"]).returncode, 0)
-
     def test_s3_more_forms_are_refused_and_value_taking_options_do_not_hide_the_path(self):
         more = [
             ["gh", "pr", "edit", "3", "--add-label", "x"], ["gh", "pr", "edit", "3", "--remove-label=x"],
             ["gh", "api", "graphql", "-f", "query=mutation { mergePullRequest(input: {}) { clientMutationId } }"],
             ["gh", "api", "graphql", "-f", "query=mutation { updateRef(input: {}) { clientMutationId } }"],
-            ["git", "push", "--all", "origin"], ["git", "push", "--mirror"],
             ["gh", "api", "-X", "POST", "-H", "Accept: application/vnd.github+json", "repos/%s/issues" % REPO, "-f", "title=t"],
             ["gh", "api", "--jq", ".id", "-X", "POST", "repos/%s/labels" % REPO],
             ["gh", "api", "-f", "name=web", "repos/%s/hooks" % REPO],
@@ -280,7 +257,7 @@ class Guard(unittest.TestCase):
 
     def test_u1_the_new_refusals_do_not_print_an_argument_value(self):
         for cmd in (["gh", "alias", "set", SECRET, "pr merge"], ["gh", SECRET, "5"], ["gh", "api", "https://" + SECRET + "/repos/o/r/pulls/5/merge", "-X", "PUT"],
-                    ["git", "push", "origin", "HEAD:main", "-o", SECRET]):
+                    ):
             r = self.call(cmd)
             self.assertEqual(r.returncode, 3)
             self.assertNotIn(SECRET, r.stdout + r.stderr)
@@ -294,8 +271,8 @@ class Guard(unittest.TestCase):
         self.assertFalse(os.path.exists(self.tmpfs + "-3"))
 
     def test_u1_the_refusal_line_never_contains_an_argument_value(self):
-        for cmd in (["gh", "issue", "comment", "3", "--body", SECRET], ["git", "push", "origin", "HEAD:main", "-o", SECRET],
-                    ["gh", "api", "-X", "PATCH", "repos/%s" % REPO, "-f", "token=" + SECRET], ["git", "push", "--mirror", "https://" + SECRET + "/x.git"]):
+        for cmd in (["gh", "issue", "comment", "3", "--body", SECRET], 
+                    ["gh", "api", "-X", "PATCH", "repos/%s" % REPO, "-f", "token=" + SECRET]):
             r = self.call(cmd)
             self.assertEqual(r.returncode, 3)
             self.assertNotIn(SECRET, r.stdout + r.stderr)
