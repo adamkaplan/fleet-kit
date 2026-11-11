@@ -11749,13 +11749,13 @@ class GitHubHub:
             # 404: it is gone already (the forwarder removed it itself)
 
     def _hook_failed(self, watch, reason):
-        """A failed list or removal: a note for `status` and ONE audit line per repo (until a cleanup works again). Never an error for the caller."""
+        """A failed list or removal: a note for `status` and ONE audit line per repo (for as long as the daemon runs). Never an error for the caller."""
         with self.lock:
             watch.hook_note = "hook cleanup failed, stale webhooks stay (20 per repo cap; the account needs the admin:repo_hook scope to clear them): %s" % reason
             first = watch.repo not in self._hook_audited
             self._hook_audited.add(watch.repo)
         if first:
-            self._audit("github.hooks", watch.repo, {"error": reason})   # once per repo for as long as the daemon runs
+            self._audit("github.hooks", watch.repo, {"error": reason})   # once per repo for as long as the daemon runs (never cleared)
 
     def _clear_stale_hooks(self, watch, env):
         """Before a forwarder starts: remove every cli forwarder hook of the repo. At a start no forwarder child of THIS daemon runs for the repo, so none is ours and all
