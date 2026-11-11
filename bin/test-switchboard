@@ -67087,7 +67087,7 @@ TestStopFinalMessage, TestStopFinalMessageMutants, TestStopFinalMessageTwoRuns, 
     _stop_final.TestStopFinalMessageTwoRunsMutant, _stop_final.TestStopFinalMessageHardening, _stop_final.TestStopFinalMessageHardeningMutant)
 TestStopFinalMessageEdges, TestStopFinalMessageEdgesMutant = _stop_final.TestStopFinalMessageEdges, _stop_final.TestStopFinalMessageEdgesMutant
 TestStopFinalMessageBare, TestStopFinalMessageBareMutant = _stop_final.TestStopFinalMessageBare, _stop_final.TestStopFinalMessageBareMutant
-TestScratchGuard = importlib.import_module("test_scratch_command").TestScratchGuard; _ntt = importlib.import_module("test_notices_truth"); TestEndNoticeLastHead, TestRedCiOwnedByItsAsk, TestReadOfAnEndedWorker, TestRunRecordKeepsTheResultsFile = _ntt.TestEndNoticeLastHead, _ntt.TestRedCiOwnedByItsAsk, _ntt.TestReadOfAnEndedWorker, _ntt.TestRunRecordKeepsTheResultsFile   # ask #2392
+TestScratchGuard = importlib.import_module("test_scratch_command").TestScratchGuard; _ntt = importlib.import_module("test_notices_truth"); TestEndNoticeLastHead, TestRedCiOwnedByItsAsk, TestReadOfAnEndedWorker, TestRunRecordKeepsTheResultsFile, TestBranchTipRead = _ntt.TestEndNoticeLastHead, _ntt.TestRedCiOwnedByItsAsk, _ntt.TestReadOfAnEndedWorker, _ntt.TestRunRecordKeepsTheResultsFile, _ntt.TestBranchTipRead   # ask #2392
 
 # The host-disk tests of #2081.
 TestHostDisk = importlib.import_module("test_host_disk").TestHostDisk
@@ -80394,7 +80394,7 @@ NOT_ISOLATED_BY_BASE = {
     "TestTriageHiddenMutants", "TestTwoBranchesAddingATestFile", "TestUnconsumedRecord", "TestUnreadableSummary",
     "TestCloudHeadChecks",   # (#2247) pure: cloud_head_checks over a mock engine and a stubbed _api, no state path; the file came with #2267
     "TestGithubWriteGuard",   # (#2247) pure: reads the repository sources read-only and scans strings in memory, no state path; the file came with #2263
-    "TestAskIsItsOwn", "TestRunRecordKeepsTheResultsFile",   # (#2247) pure: _ask_of on strings and dicts; the file came with #2254; (#2392) the second loads run_record.py and runs results_file over a fake kube: no file, no state
+    "TestAskIsItsOwn", "TestRunRecordKeepsTheResultsFile", "TestBranchTipRead",   # (#2247) pure: _ask_of on strings and dicts; the file came with #2254; (#2392) the second loads run_record.py and runs it over a fake kube and a mkdtemp that it removes; the third runs cloud_branch_tip over a stub _api: no real state
     "TestGateBudget", "TestReader", "TestConfigLoader", "TestSweepSkip",   # (#2247) pure: TestGateBudget reads the shim source text and a number over an in-memory config (#2296); the other three are the land_repos reader, validate_config on dicts and sweep_refresh over stubs (#2323); no state path
     ),
     "makes its own temporary directory or state (a tempfile.mkdtemp, a patched environment or its own isolating setUp) and never reads the real one": (

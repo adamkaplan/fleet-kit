@@ -49,6 +49,7 @@ RECORD_SECONDS_MAX = 240.0       # the hard maximum: CW_RECORD_SECONDS above it 
 CHUNK = 64 * 1024
 RESULTS_KEEP = 4000              # characters of the pod's /work/results.txt kept in run.json (ask #2392): the end of the file
 RESULTS_READ = 16000             # bytes read to be scrubbed first
+NL_MARK = "[NL]"                 # a line break while the scrub runs
 TIMED_OUT = "record timed out"
 
 
@@ -324,7 +325,7 @@ class Recorder:
         return sha if re.fullmatch(r"[0-9a-f]{40}", sha) else None
 
     def results_file(self, pod):
-        """{"done": bool, "text": the scrubbed last RESULTS_KEEP bytes} of the pod's /work/results.txt, or None when it has none or cannot be read. `done`: the last
+        """{"done": bool, "text": the scrubbed last RESULTS_KEEP characters} of the pod's /work/results.txt, or None when it has none or cannot be read. `done`: the last
         non-empty line is exactly `STATUS: done` (the idle nudge's own test). Never raises an Exception."""
         try:
             out = self._exec(pod, "tail", "-c", str(RESULTS_READ), "--", "/work/results.txt", keep_stdout=True)
@@ -336,7 +337,8 @@ class Recorder:
             return None
         lines = [x.strip() for x in out.splitlines() if x.strip()]
         try:
-            text = self.kube.scrub(out, limit=2 * RESULTS_READ)   # a wider window is scrubbed, then the end is kept: a secret is never cut in half by the cut
+            # the scrub turns every control character to `?`: the line breaks go through it as a printable mark (so a secret spread over lines is still seen), and come back
+            text = self.kube.scrub(out.replace("\n", NL_MARK), limit=2 * RESULTS_READ).replace(NL_MARK, "\n")   # a wider window is scrubbed, then the end is kept: a secret is never cut in half by the cut
         except Exception:
             return None
         return {"done": bool(lines) and lines[-1] == "STATUS: done", "text": text[-RESULTS_KEEP:]}

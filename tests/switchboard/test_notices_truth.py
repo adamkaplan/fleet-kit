@@ -280,6 +280,34 @@ class TestReadOfAnEndedWorker(unittest.TestCase):
         self.assertIn("the results file (/work/results.txt)", text)
         self.assertLess(text.index("the last words"), text.index("the results file"))
 
+    def test_a_reachable_pod_still_prints_its_messages_and_not_the_run_record(self):
+        self.run_record("pod-l")
+        out = []
+        args = types.SimpleNamespace(name="pod-l", limit=10, cloud_only=False)
+        engine = types.SimpleNamespace(now=lambda: 0)
+
+        class Up:
+            def __enter__(self_):
+                return "live"
+
+            def __exit__(self_, *a):
+                return False
+        remote = types.SimpleNamespace(message_list=lambda session, limit, order: [{"type": "assistant", "content": [{"type": "text", "text": "from the live pod"}]}])
+        with mock.patch.object(self.cw, "route", lambda n: self.live("pod-l")), mock.patch.object(self.cw, "Cluster", lambda: mock.MagicMock()), \
+                mock.patch.object(self.cw, "tunnel", lambda c, r: Up()), mock.patch.object(self.cw, "remote_v2", lambda *a, **k: remote), \
+                mock.patch.object(self.cw, "message_line", lambda m: "LINE " + m["content"][0]["text"]), \
+                mock.patch.dict(self.cw.H, {"build_engine": lambda *a, **k: (engine, self.tmp, {"call_timeout_seconds": 5})}), \
+                mock.patch("builtins.print", lambda *a, **k: out.append(" ".join(str(x) for x in a))):
+            self.assertEqual(self.cw.cmd_read(args, None, 0), 0)
+        self.assertEqual(out, ["LINE from the live pod"])
+
+    def test_the_boss_of_the_live_record_may_read_and_another_agent_may_not(self):
+        self.run_record("pod-w")
+        with mock.patch.dict(self.cw.H, {"gates_caller_kind": lambda r, n: ("agent", "boss-lane")}):
+            out = []
+            self.assertEqual(self.read("pod-w", self.live("pod-w"), out, keep_caller=True), 0)
+            self.assertIn("the last words", "\n".join(out))
+
     def test_a_worker_with_no_run_record_still_fails_as_before(self):
         with self.assertRaises(self.cw.CloudError):
             self.read("pod-v", self.live("pod-v"), [])
@@ -332,22 +360,30 @@ class TestReadOfAnEndedWorker(unittest.TestCase):
 class TestRunRecordKeepsTheResultsFile(unittest.TestCase):
     """(c) the launcher's run record keeps the pod's results file: its last non-empty line decides `done`; none, or a read that fails, keeps nothing."""
 
-    def recorder(self, answer):
+    def load(self):
         import importlib.util
         spec = importlib.util.spec_from_file_location("run_record_under_test", str(BIN.parent / "cloud" / "launcher" / "run_record.py"))
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
+        return module
+
+    def recorder(self, answer, module=None):
+        module = module or self.load()
         calls = []
 
         class Kube:
             def exec(self_, pod, *cmd, **kw):
                 calls.append(cmd)
-                if isinstance(answer, Exception):
-                    raise answer
-                return answer
+                if cmd[0] == "tail":
+                    if isinstance(answer, Exception):
+                        raise answer
+                    return answer
+                if cmd[0] == "git":
+                    return "c" * 40 + "\n"
+                return ""
 
-            def scrub(self_, text, limit=0):
-                return text.replace("hunter2", "[redacted]")
+            def scrub(self_, text, limit=0):   # as the launcher's: a secret shape goes, every control character (a line break too) becomes `?`
+                return __import__("re").sub(r"[^\x20-\x7e]", "?", text.replace("hunter2", "[redacted]"))[:limit]
         rec = module.Recorder(Kube(), {})
         rec.deadline = rec.clock() + 60
         return rec, calls
@@ -356,6 +392,7 @@ class TestRunRecordKeepsTheResultsFile(unittest.TestCase):
         rec, calls = self.recorder("notes hunter2\nSTATUS: done\n")
         got = rec.results_file("pod-y")
         self.assertEqual((got["done"], "hunter2" in got["text"]), (True, False))
+        self.assertEqual(got["text"].splitlines()[-1], "STATUS: done", "the line breaks survive the scrub")
         self.assertIn("/work/results.txt", calls[0])
         for text in ("STATUS: done\nand then more", "STATUS: done now", "status: done"):
             with self.subTest(text=text):
@@ -364,9 +401,72 @@ class TestRunRecordKeepsTheResultsFile(unittest.TestCase):
         self.assertLess(len(kept), 50000)
         self.assertTrue(self.recorder("A" * 30000 + "\nSTATUS: done")[0].results_file("pod-y")["text"].endswith("STATUS: done"), "the END of the file is kept")
 
+    def test_a_secret_that_straddles_the_cut_leaves_no_piece(self):
+        module = self.load()
+        text = "q" * (module.RESULTS_KEEP - 3) + "hunter2" + "\nSTATUS: done"   # the secret begins just before the kept tail
+        got = self.recorder(text)[0].results_file("pod-y")
+        self.assertNotIn("hunter2", got["text"])
+        self.assertNotIn("ter2", got["text"].replace("[redacted]", ""))
+
     def test_no_file_or_a_failed_read_keeps_nothing(self):
+        module = self.load()
         self.assertIsNone(self.recorder("")[0].results_file("pod-y"))
         self.assertIsNone(self.recorder(OSError("gone"))[0].results_file("pod-y"))
+        self.assertIsNone(self.recorder(module.RecordTimeout("late"), module)[0].results_file("pod-y"))
+
+    def test_the_record_that_stop_writes_holds_it_and_still_holds_the_head(self):
+        module = self.load()
+        rec, _calls = self.recorder("all good\nSTATUS: done\n", module)
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root, True)
+        rec.read_messages = lambda pod: (None, "no server in this test")
+        directory = rec.record("pod-y", "pod-y", "idle", repo="o/r", root=root)
+        run = json.loads((Path(directory) / "run.json").read_text())
+        self.assertEqual((run["results"]["done"], run["head_sha"]), (True, "c" * 40))
+        self.assertTrue(run["results"]["text"].rstrip().endswith("STATUS: done"))
+
+    def test_control_without_the_line_in_record_the_run_json_has_no_results(self):
+        text = (BIN.parent / "cloud" / "launcher" / "run_record.py").read_text()
+        old = '                info["results"] = self.results_file(pod)'
+        self.assertIn(old, text)
+        was = types.ModuleType("run_record_as_it_was")
+        exec(compile(text.replace(old, "                pass", 1), "run_record.py", "exec"), was.__dict__)
+        rec, _calls = self.recorder("all good\nSTATUS: done\n", was)
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root, True)
+        rec.read_messages = lambda pod: (None, "no server in this test")
+        run = json.loads((Path(rec.record("pod-y", "pod-y", "idle", repo="o/r", root=root)) / "run.json").read_text())
+        self.assertNotIn("results", run)
+
+
+class TestBranchTipRead(unittest.TestCase):
+    """The branch-tip read of the end notice (bin/fleet-switchboard cloud_branch_tip): one GET of the exact ref, the sha of the answer, None on any failure."""
+
+    def tip(self, answer, branch="feat/own"):
+        asked = []
+
+        def api(path, repo=None):
+            asked.append((path, repo))
+            if isinstance(answer, Exception):
+                raise answer
+            return answer
+        engine = types.SimpleNamespace(intents=types.SimpleNamespace(_api=api))
+        return sb.cloud_branch_tip(engine, "o/r", branch), asked
+
+    def test_the_exact_ref_is_read_and_its_sha_returned(self):
+        got, asked = self.tip({"object": {"sha": SHA}})
+        self.assertEqual(got, SHA)
+        self.assertEqual(asked, [("repos/o/r/git/ref/heads/feat/own", "o/r")])
+
+    def test_a_failed_read_or_an_odd_answer_is_none(self):
+        for answer in (OSError("down"), None, [], {"object": {}}, {"object": {"sha": 7}}):
+            with self.subTest(answer=repr(answer)):
+                self.assertIsNone(self.tip(answer)[0])
+
+    def test_the_branch_is_quoted_into_the_path(self):
+        _got, asked = self.tip({"object": {"sha": SHA}}, branch="feat/a b?x")
+        self.assertNotIn("?", asked[0][0])
+        self.assertNotIn(" ", asked[0][0])
 
 
 if __name__ == "__main__":
