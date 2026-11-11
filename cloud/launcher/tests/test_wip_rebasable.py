@@ -16,7 +16,7 @@ from test_wip_root import END_HOOK, GIT_ENV, Scratch, git, load_end_hook  # noqa
 
 MODULE_ENV = "CW_TEST_WIP_REBASABLE_MODULE"
 ANCHOR = "the save made a merge commit"
-PARENT_LINE = "        parents = [head] if head else [wip]"
+PARENT_LINE = "        parents = [x for x in (head or wip,) if x]"
 WIP = "refs/heads/coder7/wip"
 
 

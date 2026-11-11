@@ -348,6 +348,7 @@ def run(workdir, worker, prestop=False, repo=None, ctx=None):
     branch = "%s/wip" % worker
     if prestop and ff_over_snapshots(workdir, worker, url, ctx):   # #2304: a running save made wip not an ancestor of HEAD: push a fast-forward instead
         return {"pushed": True, "wip_branch": branch, "skipped": skipped, **extra}
+    # (#2437: ff_over_snapshots above is the one lease push of the pre-stop path, to this one reference)
     # prestop: a plain push to the explicit URL, never forced and no lease: a non-fast-forward answer is a failure, not an overwrite
     if prestop:
         git(workdir, "push", "--no-verify", url, "HEAD:refs/heads/" + branch, ctx=ctx)
@@ -706,6 +707,8 @@ def snapshot(workdir, worker, repo, ctx):
             else:   # the remote tip is not an ancestor (the pod rebased): a lease on the tip fetched in this call, this one reference only, one try
                 try:
                     git(net, "push", "--no-verify", "--force-with-lease=refs/heads/%s:%s" % (branch, wip), url, spec, ctx=ctx)
+                except TokenEnded:
+                    raise
                 except RuntimeError:
                     print("the save of %s was not pushed: the branch moved since it was read" % branch, file=sys.stderr)
                     return {"saved": False, "tree": tree, "wip_branch": branch, "note": "the branch moved: nothing saved"}
