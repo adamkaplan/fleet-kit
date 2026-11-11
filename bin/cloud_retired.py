@@ -163,6 +163,15 @@ def ended_run_of(name, record):
     return found
 
 
+def read_ended(name, record, state, runner, now, err):
+    """Ask #2392: `read NAME` of a worker whose record is here but whose pod could not be reached (`err`): its run record of THIS run answers (the last text and the results file);
+    with none, the failure `err` is raised as it was."""
+    kept = ended_run_of(name, record)
+    if kept is None:
+        raise err
+    return read_run_record(name, kept, state, runner, now, record.get("reports_to"))
+
+
 def _last_worker_text(directory):
     """The last text of the worker in transcript.jsonl, or (None, why). Never raises."""
     path = Path(directory) / "transcript.jsonl"

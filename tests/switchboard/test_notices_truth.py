@@ -280,9 +280,7 @@ class TestReadOfAnEndedWorker(unittest.TestCase):
 
     def test_a_control_the_code_as_it_was_fails_for_the_worker_with_a_record(self):
         self.run_record("pod-u")
-        src = (BIN / "cloud_worker.py").read_text()
-        start = src.index("        try:\n            with Cluster() as cluster, tunnel(cluster, record) as live:")
-        self.assertIn("ended_run_of", src[start:start + 1200], "the fix is in place")
+        self.assertIn("read_ended", (BIN / "cloud_worker.py").read_text(), "the fix is in place")
         with mock.patch.object(self.retired, "ended_run_of", lambda n, r: None):
             with self.assertRaises(self.cw.CloudError):
                 self.read("pod-u", {"worker": "pod-u", "reports_to": "boss-lane", "session": "ses_1"}, [])
