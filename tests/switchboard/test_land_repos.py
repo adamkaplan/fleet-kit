@@ -297,7 +297,7 @@ class TestSweepSkip(unittest.TestCase):
             engine = types.SimpleNamespace(hub=object(), config=config, now=lambda: NOW)
             state = types.SimpleNamespace(repos={}, started=NOW, strong=None)
             sb.sweep_refresh(engine, state, ["acme-org/widget", "acme/other"], NOW, {"comment_window_days": 7}, None, [50])
-            self.assertEqual(sorted(read), expected)
+            self.assertEqual(sorted(read), sorted(expected))
 
 
 if __name__ == "__main__":
