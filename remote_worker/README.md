@@ -49,8 +49,12 @@ environment variable and appears in no log, error or return value.
 `floor.py` follows the service's published transport interface v0. Where the two differ:
 
 - The service takes the repository as a full git URL and a `ref`; this package takes `OWNER/NAME` and a branch, and the transport joins `git_base`.
-- The service keeps its own land command; here it is configuration and goes to the worker in the brief. The service's detection of the end is
-  `state: done` with `landed_sha`, so the brief's land command must be one whose result the worker ends its message with.
+- The service keeps its own land command and does not take one in a launch request; here it is configuration and goes to the worker in the brief.
+  The service detects the end when the worker's message ends with `landed <sha>` (state `done`, `landed_sha` set), so the configured command must be
+  one whose result the worker reports in that form.
+- A repeated `client_key` (the worker name) returns the first session; `send` with a `message_id` is idempotent. Both are used.
+- A send to a finished session is refused by the service (409); it surfaces as a non-retryable `TransportError`. A 429 (busy) is retryable.
+- The service answers 404 for a session that is another caller's, so `stop` cannot tell it from one already gone and treats both as stopped.
 - The service's retire takes no reason; `stop` does not send it.
 - `idle` and `queued` are states of the service; the interface carries them as they are.
 
