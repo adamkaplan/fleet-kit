@@ -429,6 +429,133 @@ class TestKeepFailsRetireDoesNot(Retired):
             self.assertEqual(self.main("retire", "coder7")[0], 0)
 
 
+class TestPodNotesInTheFinalMessage(Retired):
+    @property
+    def part(self):   # the bound part, as the daemon holds it (cloud_worker._retired())
+        return self.cw._retired()
+
+    @part.setter
+    def part(self, value):
+        pass
+
+    """Ask #2426 (S4): the pod's notes file (/work/.pod-notes.log) goes with the final message: the run record keeps it (`pod_notes`, scrubbed, the last 20 lines) and ONE reader
+    (`pod_notes_tail`) clips and redacts it again; a record without it leaves the message as it was. The control is today's reader: the message holds no notes."""
+    NAME = "coder7"
+
+    count = 0
+
+    def record_with(self, notes, last="all done"):
+        type(self).count += 1
+        rec = self.run_record(self.NAME, "2026-11-10T11:00:00Z", [msg("assistant", last)], suffix="abc%03d" % self.count)
+        if notes is not None:
+            info = json.loads((rec / "run.json").read_text())
+            info["pod_notes"] = notes
+            (rec / "run.json").write_text(json.dumps(info) + "\n")
+        return rec
+
+    def last(self, rec):
+        block, why = self.part.last_message(str(rec), str(self.state), self.NAME)
+        self.assertIsNotNone(block, why)
+        return block
+
+    def note_lines(self, n):
+        return "".join("2026-11-10T10:%02d:00Z default-branch-push origin refs/heads/main %010x\n" % (i % 60, i) for i in range(n))
+
+    def test_the_last_twenty_lines_come_with_the_message_clipped_and_redacted(self):
+        secret = "ghp_" + "A1b2C3d4E5f6G7h8I9j0" * 2
+        text = self.note_lines(40) + "2026-11-10T10:59:00Z non-fast-forward origin refs/heads/x %s `tick` \x1b[31m\n" % secret
+        block = self.last(self.record_with(text))
+        self.assertIn("[last lines of /work/.pod-notes.log, untrusted text]", block)
+        tail = block.split("untrusted text]\n")[-1]
+        shown = tail.splitlines()
+        self.assertLessEqual(len(shown), 20, "count of posted note lines above 20")
+        self.assertEqual(len(shown), 20)
+        self.assertIn("non-fast-forward", shown[-1])
+        self.assertNotIn(secret, block)
+        self.assertNotIn("`", tail)
+        self.assertNotIn("\x1b", block)
+        self.assertLessEqual(len(tail), self.part.NOTES_CHARS)
+        self.assertIn("all done", block)
+
+    def test_a_clipped_tail_keeps_whole_lines_and_a_record_without_notes_is_as_before(self):
+        wide = "".join("2026-11-10T10:00:00Z default-branch-push origin refs/heads/%s aaaaaaaaaa\n" % ("m" * 90) for _ in range(20))
+        tail = self.part.pod_notes_tail(self.record_with(wide))
+        self.assertLessEqual(len(tail), self.part.NOTES_CHARS)
+        self.assertTrue(all(l.startswith("2026-11-10") for l in tail.splitlines()))
+        for notes in (None, "", "  \n", 5, ["x"]):
+            rec = self.record_with(notes, last="plain %s" % repr(notes)[:5])
+            self.assertNotIn("pod-notes", self.last(rec), repr(notes))
+            self.assertIsNone(self.part.pod_notes_tail(rec))
+        self.assertIsNone(self.part.pod_notes_tail(self.runs / "nothing"))
+
+    def test_the_control_without_the_reader_call_posts_no_notes(self):
+        src = (BIN / "cloud_retired.py").read_text()
+        call = "        notes = pod_notes_tail(directory)"
+        self.assertEqual(src.count(call), 1)
+        import types
+        mod = types.ModuleType("cloud_retired_today")
+        exec(compile(src.replace(call, "        notes = None", 1), "cloud_retired.py", "exec"), mod.__dict__)
+        mod.D.update(self.part.D)
+        rec = self.record_with(self.note_lines(3))
+        today = mod.last_message(str(rec), str(self.state), self.NAME)[0]
+        self.assertNotIn(".pod-notes.log", today)
+        self.assertIn(".pod-notes.log", self.last(rec))
+
+
+class TestRecorderKeepsThePodNotes(unittest.TestCase):
+    """The launcher's run record keeps the last 20 lines of /work/.pod-notes.log, scrubbed, as `pod_notes`; none, a failed read or unlearnt secrets keep nothing."""
+    def recorder(self, answer, secrets_fail=False):
+        import re
+        module = importlib.util.module_from_spec(importlib.util.spec_from_file_location("rr_notes", str(BIN.parent / "cloud" / "launcher" / "run_record.py")))
+        module.__spec__.loader.exec_module(module)
+        calls = []
+
+        class Kube:
+            def exec(self_, pod, *cmd, **kw):
+                calls.append(cmd)
+                if cmd[0] == "ls":
+                    if secrets_fail:
+                        raise OSError("no listing")
+                    return ""
+                if cmd[0] == "sh":
+                    if "/work/.pod-notes.log" in cmd:
+                        if isinstance(answer, Exception):
+                            raise answer
+                        return answer[-int(cmd[-1]):]
+                    return ""
+                return "c" * 40 + "\n" if cmd[0] == "git" else ""
+
+            def add_secrets(self_, *a, **k):
+                pass
+
+            def scrub(self_, text, limit=0):
+                return re.sub(r"[^\x20-\x7e]", "?", text.replace("hunter2", "[redacted]"))[:limit]
+        rec = module.Recorder(Kube(), {})
+        rec.deadline = rec.clock() + 60
+        return rec, calls, module
+
+    def test_the_file_is_read_by_the_guarded_script_scrubbed_and_cut_to_twenty_lines(self):
+        rec, calls, module = self.recorder("".join("line %d hunter2\n" % i for i in range(50)))
+        got = rec.notes_file("pod-y")
+        self.assertEqual(len(got.splitlines()), module.NOTES_LINES)
+        self.assertTrue(got.endswith("line 49 [redacted]"), got[-40:])
+        self.assertNotIn("hunter2", got)
+        self.assertEqual(calls[0][3:5], ("sh", "/work/.pod-notes.log"))
+        self.assertEqual(calls[0][2], module.RESULTS_SCRIPT, "the read that refuses a link and a FIFO")
+
+    def test_none_for_no_file_or_a_failed_read_and_the_record_holds_the_key_only_when_it_is_kept(self):
+        for answer in ("", OSError("gone")):
+            self.assertIsNone(self.recorder(answer)[0].notes_file("pod-y"))
+        import tempfile, shutil
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root, True)
+        for answer, fail, kept in (("a line\n", False, True), ("", False, False), ("a line\n", True, False)):
+            rec = self.recorder(answer, secrets_fail=fail)[0]
+            rec.read_messages = lambda pod, rec=rec: (None, rec._learn_secrets(pod) or "no server in this test")
+            run = json.loads((Path(rec.record("pod-y", "pod-y", "idle", repo="o/r", root=root)) / "run.json").read_text())
+            self.assertEqual("pod_notes" in run, kept, (answer, fail))
+
+
 if __name__ == "__main__":
     result = unittest.main(exit=False, verbosity=1).result
     print("RESULT: %s" % ("PASS" if result.wasSuccessful() else "FAIL"))
