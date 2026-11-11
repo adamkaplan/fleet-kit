@@ -543,6 +543,8 @@ at a time. A create that lands on a fresh node can hit the "handler sysbox-runc 
 pod (not the Secrets) after a pause of 15 seconds (`STACK_RACE_PAUSE_SECONDS`), for as long as one more pause fits in a
 window of 600 seconds (`STACK_RACE_WINDOW_SECONDS`); there is no attempt count.
 
+Shape requests: the limits are the `SHAPES` rows (S 2 CPU / 4 GiB, M 4 CPU / 8 GiB); the pod's requests are the `SHAPE_REQUESTS` row when the shape has one (S 500m / 2Gi, M 2 CPU / 8Gi: the CPU request is half the limit, the memory request stays at the limit) and equal to the limits otherwise (XS, O). The capacity read counts a node's room for a shape by that request, else by its limit.
+
 The stack pod is pinned whole, like the default pod: `cloud/launcher/tests/fixtures/stack_pod.json` is the pod the stack create
 builds, and `stack_create_objects.json` is every other object the create makes (the password Secret, the run Secret and its
 labels; the run record is written by `stop`, not by `create`). At render time a stack pod must also have exactly one container

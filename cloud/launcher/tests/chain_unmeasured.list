@@ -31,6 +31,7 @@ cloud/launcher/tests/test_launch_idempotent.py
 cloud/launcher/tests/test_load_part.py
 cloud/launcher/tests/test_long_run_setting.py
 cloud/launcher/tests/test_m_cap_stopped.py
+cloud/launcher/tests/test_m_request.py
 cloud/launcher/tests/test_mint_retry.py
 cloud/launcher/tests/test_needs_docker_hermetic.py
 cloud/launcher/tests/test_no_commit_mark.py
