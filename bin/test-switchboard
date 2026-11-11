@@ -42150,7 +42150,7 @@ class TestLaunchRefusedMessage(TestLaunchMemoryGate):
             ' > args.new_workspace > problem|raise LaunchError(problem)': (newws, [P("launch_account_problem", return_value="no account")]),
             ' > use_headless > except > except|raise LaunchError("headless refused (%s)': (no_ws, [P("launch_headless", side_effect=sb.HeadlessRefused("no")), P("caller_workspace", side_effect=RuntimeError("none"))]),
             ' > except > created|raise LaunchError("%s (workspace %s was ': (newws, [P("launch_agent", side_effect=sb.LaunchError("the tab did not open"))]),
-            ' > getattr(args, "persistent", Fa|return EXIT_USAGE': (B + ["--persistent"], []),
+            ' > getattr(args, "persistent", Fa|return EXIT_USAGE': (B + ["--persistent"], []),   ' > made is not None > refusal|raise LaunchError(refusal)': (B, [P("worktree_of_directory", return_value=("/wt/x",)), P("check_worktree_path", return_value="/wt/x would be a new top-level entry of ~/Code")]),   # #2365: a local worker's worktree as a new top-level ~/Code entry
         }
 
     def run_row(self, argv, patches):
@@ -80375,7 +80375,7 @@ NOT_ISOLATED_BY_BASE = {
     "TestCloudHeadChecks",   # (#2247) pure: cloud_head_checks over a mock engine and a stubbed _api, no state path; the file came with #2267
     "TestGithubWriteGuard",   # (#2247) pure: reads the repository sources read-only and scans strings in memory, no state path; the file came with #2263
     "TestAskIsItsOwn", "TestBranchTipRead",   # (#2247) pure: _ask_of on strings and dicts; the file came with #2254; (#2392) the second runs cloud_branch_tip over a stub _api: no file, no state
-    "TestGateBudget", "TestReader", "TestConfigLoader", "TestSweepSkip",   # (#2247) pure: TestGateBudget reads the shim source text and a number over an in-memory config (#2296); the other three are the land_repos reader, validate_config on dicts and sweep_refresh over stubs (#2323); no state path
+    "TestGateBudget", "TestReader", "TestConfigLoader", "TestSweepSkip", "TestText",   # (#2247) pure: TestGateBudget reads the shim source text and a number over an in-memory config (#2296); the other three are the land_repos reader, validate_config on dicts and sweep_refresh over stubs (#2323); no state path; "TestText" (#2365, test_worktree_root.py) is pure too: it reads the skill and agent texts and scans their lines, no state path
     ),
     "makes its own temporary directory or state (a tempfile.mkdtemp, a patched environment or its own isolating setUp) and never reads the real one": (
     "TestEveryTestClassIsolates", "BodyRig", "TestDirectReads", "TestGateProbeReads", "TestGhBodyGuard", "TestGhBodyMutants", "TestGhBodyRefusalIsPure",
@@ -80385,7 +80385,7 @@ NOT_ISOLATED_BY_BASE = {
     "TestPodReportedLostOnlyWhenSilent",   # (#2247) its Rig makes its own tempfile.mkdtemp for the engine, the launcher log and the memory, and reads no real state; the class came with #2261
     "TestStopFinalMessage", "TestStopFinalMessageBare", "TestStopFinalMessageEdges", "TestStopFinalMessageHardening", "TestStopFinalMessageTwoRuns",
     "TestEndNoticeHeadLine", "TestPodReportedLostOnlyWhenSilent",   # (#2247) each builds its own temp directory through its rig (StopWorld mkdtemp; Rig mkdtemp); the files came with #2267 and #2255
-    "TestGithubWriteAudit", "TestGuardSetRun", "TestGatesSkipped", "TestLandCompletion", "TestEndNoticeOwnPushes", "TestRefusedLaunchIsToldToItsLane", "TestGhBodyReadNamesItsStderr", "TestGhBodyReadNamesTheRepositoryOfTheWrite",   # (#2247) each makes its own temp directory (a mkdtemp, a TemporaryDirectory, StopWorld, Rig, FakeGhMixin or BodyRig) and reads no real state; the files came with #2263, #2270, #2313, #2310, #2307, #2309 and #2323
+    "TestGithubWriteAudit", "TestGuardSetRun", "TestGatesSkipped", "TestLandCompletion", "TestEndNoticeOwnPushes", "TestRefusedLaunchIsToldToItsLane", "TestGhBodyReadNamesItsStderr", "TestGhBodyReadNamesTheRepositoryOfTheWrite", "Home", "TestKey", "TestCheck", "TestWorktreeLaunch",   # (#2247) each makes its own temp directory (a mkdtemp, a TemporaryDirectory, StopWorld, Rig, FakeGhMixin or BodyRig) and reads no real state; the files came with #2263, #2270, #2313, #2310, #2307, #2309 and #2323; Home, TestKey, TestCheck and TestWorktreeLaunch (#2365, test_worktree_root.py) each make their own temporary HOME, ~/Code and git repository (Home.setUp patches HOME and tempfile.tempdir) and read no real state
     ),
 }
 
