@@ -10,11 +10,12 @@ from support.loader import sb
 
 SHA = "9" * 40
 OFF = "b" * 40      # a commit that is not on the default branch
+TIP = "4" * 40     # the default branch tip itself, with trailers
 BARE = "c" * 40     # on the default branch, no trailers
 HALF = "d" * 40     # only one of the two trailers
 T = sb.LAND_PROOF_TRAILERS   # the fixtures are built from the one table the code reads
 LAND_MSG = "Add the thing\n\nbody text\n\n" + "".join("%s: ok\n" % t for t in T)
-MESSAGES = {SHA: LAND_MSG, OFF: LAND_MSG, BARE: "Add it\n\nno trailers here\n", HALF: "Add it\n\n%s: ok\n" % T[0]}
+MESSAGES = {SHA: LAND_MSG, TIP: LAND_MSG, OFF: LAND_MSG, BARE: "Add it\n\nno trailers here\n", HALF: "Add it\n\n%s: ok\n" % T[0]}
 AHEAD = "8" * 40    # a descendant of the default branch's tip
 MESSAGES[AHEAD] = LAND_MSG
 MINE = "7" * 40     # landed by the agent `tst`, who must not judge it
@@ -23,7 +24,7 @@ SPOOF = "6" * 40    # the trailer lines sit in prose, not in a trailer block
 MESSAGES[SPOOF] = "Add it\n\nThe lines are " + " and ".join("%s: x" % t for t in T) + "\n"
 COMMITTED = "5" * 40   # committed by `tst` (the author has no GitHub account)
 MESSAGES[COMMITTED] = LAND_MSG
-ON_BRANCH = {SHA: "behind", BARE: "identical", HALF: "behind", OFF: "diverged", AHEAD: "ahead", MINE: "behind", SPOOF: "behind", COMMITTED: "behind"}
+ON_BRANCH = {SHA: "behind", TIP: "identical", BARE: "identical", HALF: "behind", OFF: "diverged", AHEAD: "ahead", MINE: "behind", SPOOF: "behind", COMMITTED: "behind"}
 AUTHORS = {MINE: "tst"}
 COMMITTERS = {COMMITTED: "tst"}
 
@@ -129,11 +130,17 @@ def build(LedgerBase):
             ref = self.landed()
             code, out, err = self.run_as("coder", "prove", "S1", "--pr", ref, "--evidence", "ran: ok", "--head", SHA[:10], *self.PLAN)
             self.assertNotEqual(code, 0)
+            self.assertIn("landed sha", err)
             self.assertEqual(self.ledger(), [])
             self.assertEqual(self.prove_at(ref)[0], 0)
             code, out, err = self.run_as("coder", "prove", "S2", "--pr", ref, "--evidence", "ran: ok", "--plan", "acme/app#8")
             self.assertNotEqual(code, 0)
+            self.assertIn("acme/app#8", err)
             self.assertEqual([r["scenario"] for r in self.ledger()], ["S1"])
+
+        def test_S3_the_default_branch_tip_itself_is_a_subject(self):
+            self.assertEqual(self.prove_at(self.landed(TIP))[0], 0)
+            self.assertEqual([r["head"] for r in self.ledger()], [TIP])
 
         def test_S3_the_spelling_of_the_repository_does_not_make_another_subject(self):
             self.assertEqual(self.prove_at("Acme/Land@" + SHA)[0], 0)

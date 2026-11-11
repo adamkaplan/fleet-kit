@@ -15177,7 +15177,7 @@ def _ledger_context(args, runner, now, writable, parts=None, floor=False, plan_r
     (engine, state, config) when the caller already has them (the daemon's pass); else the engine is built. `plan_read=False` skips the read of the plan
     (the relay's link check needs only the PR and the plan's source: one GitHub read)."""
     engine, state, config = parts if parts is not None else build_engine(runner, now, "cli", writable=writable)
-    if landed and "@" in (args.pr or "") and not landed_ref(args.pr):
+    if landed and re.match(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+@", (args.pr or "").strip()) and not landed_ref(args.pr):   # only the `owner/repo@...` shape: a pull request reference with an `@` elsewhere takes the old path
         raise LedgerCommandError("refused: a landed subject is `owner/repo@<40 lowercase hex sha>`, got %r: nothing was recorded" % _one_line(args.pr, 80))
     if landed and (lref := landed_ref(args.pr)):   # ask #2373: a landed commit of a land repository is a subject (prove, verdict and gates only)
         return _landed_context(args, engine, state, config, lref, runner, now, plan_read)
