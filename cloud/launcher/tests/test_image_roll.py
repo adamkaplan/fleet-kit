@@ -35,6 +35,7 @@ LINES = ["# settings\n", "CW_CLOUD_NAMESPACE=cw\n", "CW_CLOUD_IMAGE=reg.example/
 
 def load(source=SOURCE):
     m = types.ModuleType("cloud_image_roll_under_test")
+    m.__dict__["__file__"] = str(ROOT / "bin" / "cloud_image_roll.py")
     exec(compile(source, "cloud_image_roll.py", "exec"), m.__dict__)
     return m
 
@@ -111,6 +112,7 @@ def check_failed_copy(case, module):
         raise AssertionError(ANCHOR)
     case.assertNotEqual(code, 0)
     case.assertEqual(len((out + err).strip().splitlines()), 1)
+    case.assertTrue(any(l.startswith("copy ") for l in case.copies()), case.copies())   # the control reached the copy
 
 
 class Refusals(Base):          # S2, S3, S5

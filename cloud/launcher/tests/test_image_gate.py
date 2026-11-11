@@ -21,6 +21,7 @@ OTHER = "b" * 64
 REV = "1" * 40
 SRC = "src.example/team/cw-worker@sha256:" + HEX
 ANCHOR = "an image was rolled without a passing proof"
+REASONS = {"empty_label": "no revision label", "not_reachable": "not a commit reachable", "no_receipt": "no proof receipt", "fail_receipt": "verdict fail", "other_digest": "no proof receipt", "old_receipt": "not younger than 6 hours"}
 NOW = datetime.datetime(2026, 11, 11, 12, 0, 0, tzinfo=datetime.timezone.utc)
 ITEMS = ("pg-env", "hook", "python311", "run-wake", "tests", "identity")
 CRANE = """#!/bin/sh
@@ -48,6 +49,7 @@ exit 0
 
 def load(source, name="mod"):
     m = types.ModuleType(name)
+    m.__dict__["__file__"] = str(ROOT / "bin" / ("cloud_image_roll.py" if "roll" in source[:400] else "cloud_image_proof.py"))
     exec(compile(source, name + ".py", "exec"), m.__dict__)
     return m
 
@@ -111,6 +113,8 @@ def s5_case(case, module, setup):
     if code == 0 or [l for l in case.log("crane") if l.startswith("copy ")] or case.snap() != before:
         raise AssertionError(ANCHOR)
     case.assertEqual(len(err.strip().splitlines()), 1, err)
+    if getattr(setup, "__name__", "") in REASONS:
+        case.assertIn(REASONS[setup.__name__], err)
 
 
 class Gate(Base):
@@ -165,6 +169,23 @@ class Gate(Base):
         Path(self.fake, "gitenv").write_text("")
         Path(self.fake, "git").write_text('#!/bin/sh\n[ -n "$GIT_DIR" ] && exit 1\nexit 0\n')
         self.assertEqual(self.roll(module)[0], 0)
+
+    def test_a_refused_candidate_is_refused_under_dry_run_too(self):
+        self.receipt(verdict="fail")
+        before = self.snap()
+        code, out, err = self.roll(load(ROLL), ("--dry-run",))
+        self.assertNotEqual(code, 0)
+        self.assertIn("verdict fail", err)
+        self.assertEqual([l for l in self.log("crane") if l.startswith("copy ")], [])
+        self.assertEqual(self.snap(), before)
+
+    def test_a_receipt_with_an_unreadable_time_is_refused(self):
+        self.receipt()
+        path = os.path.join(self.rdir, "r.receipt")
+        Path(path).write_text(Path(path).read_text().replace("time: ", "time: not-a-time-").replace("not-a-time-", "not-a-time ", 1))
+        code, out, err = self.roll(load(ROLL))
+        self.assertNotEqual(code, 0)
+        self.assertEqual([l for l in self.log("crane") if l.startswith("copy ")], [])
 
     def test_s5_the_revision_is_asked_of_git_against_the_integration_tip(self):
         self.receipt()
@@ -232,6 +253,8 @@ class Receipt(Base):
         self.assertEqual([l for l in self.log("launcher") if l.startswith("stop ")].__len__(), 1)
         create = [l for l in self.log("launcher") if l.startswith("create ")][0]
         self.assertIn("--image " + SRC, create)
+        self.assertIn("--no-commit", create)
+        self.assertTrue(any("rm -f" in l and "proof-results" in l for l in self.log("kubectl")), self.log("kubectl"))
         self.assertEqual(Path(self.settings).read_text().count("CW_CLOUD_IMAGE=reg.example"), 1)   # the settings file is not touched
 
     def test_s4_a_fail_verdict_still_retires_the_pod_and_a_gate_reads_it_as_not_pass(self):
