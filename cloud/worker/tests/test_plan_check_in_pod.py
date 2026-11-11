@@ -284,8 +284,8 @@ PINNED_JSON_WITHOUT_ADDED_ROWS = "c14522cff99b9223d881b9f80a3d3397f55ae15a5d6f12
 # Lower and capitalised method words after -X or --method are denied too (the glob is case sensitive; a mixed form such as pOsT is not covered here, the client refuses it).
 # asks 1166 and 1200 add their rows to THIS list.
 ADDED_ROWS = [   # ask 1083: DW-6 (read an issue's comments and the two pull request read paths, GET only; write methods and flags stay denied)
-    ('git*push*--no-verify*', 'deny'),   # ask 2371: the pod's pre-push hook is global; these rows refuse the agent's own bypass (a convenience)
-    ('*push*--no-verify*', 'deny'),
+    ('git*push*--no-verif*', 'deny'),   # ask 2371: the pod's pre-push hook is global; these rows refuse the agent's own bypass (a convenience)
+    ('*push*--no-verif*', 'deny'),
     ('*core.hooksPath*', 'deny'),
     ('*hooksPath=*', 'deny'),
     ('gh api*/issues/*/comments', 'allow'),

@@ -241,8 +241,8 @@ class Hook(unittest.TestCase):
         self.assertEqual(len(i), 1)
         self.assertTrue(e[i[0] + 1].startswith("  git config --global core.hooksPath /usr/local/lib/cw-hooks"))
         conf = read(os.path.join(WORKER, "opencode-worker.json"))
-        for row in ('"git*push*--no-verify*": "deny"', '"*push*--no-verify*": "deny"', '"*core.hooksPath*": "deny"', '"*hooksPath=*": "deny"'):
-            self.assertEqual(conf.count(row), 1, row)
+        for row in ('"git*push*--no-verif*": "deny"', '"*push*--no-verif*": "deny"', '"*core.hooksPath*": "deny"', '"*hooksPath=*": "deny"'):
+            self.assertEqual(conf.count(row), 2, row)   # the top-level block and the worker agent's copy
 
     def test_the_wrapper_no_longer_parses_a_push(self):
         text = read(GUARD)
