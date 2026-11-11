@@ -326,6 +326,7 @@ class EndHookSnapshot(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertTrue(json.loads(r.stdout)["saved"])
 
+    @unittest.skip("superseded: an unborn HEAD with no earlier save now saves nothing (test_wip_root.py)")
     def test_an_unborn_head_with_no_wip_branch_is_saved_as_a_root_commit(self):
         t = os.path.join(self.tmp.name, "u")
         os.makedirs(t)
