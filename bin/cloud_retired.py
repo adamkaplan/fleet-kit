@@ -488,7 +488,14 @@ def land_log_tail(directory, pod):
         where = _run_record_dir(directory, pod)
         if where is None:
             return None
-        fd = os.open(os.path.join(where, "run.json"), os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0))
+        before = os.lstat(where)   # the directory is opened ONCE, by no link, and must be the one the check saw (as last_message does)
+        dfd = os.open(where, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0))
+        try:
+            if not os.path.samestat(before, os.fstat(dfd)):
+                return None
+            fd = os.open("run.json", os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0), dir_fd=dfd)
+        finally:
+            os.close(dfd)
         try:
             if not stat.S_ISREG(os.fstat(fd).st_mode):
                 return None
@@ -500,11 +507,11 @@ def land_log_tail(directory, pod):
         if not isinstance(tail, str) or not tail.strip():
             return None
         scrub = D["_scrub_lib"]()
-        text = tail[-LAST_SCRUB_MAX:]
+        text = tail[-LAST_SCRUB_MAX:] if len(tail) <= LAST_SCRUB_MAX else tail[-LAST_SCRUB_MAX:].split("\n", 1)[-1]   # our own cut drops its partial first line
         for _ in range(21):   # the pod's own endpoint address is removed as in last_message (a rebuilt one too)
             stripped = _remove_hosts(text)
-            changed, text = stripped != text, stripped
-            if not changed:
+            done_, text = stripped == text, stripped
+            if done_:
                 break
         else:
             return None

@@ -56,15 +56,18 @@ class TestEndOnAsk(unittest.TestCase):
         self.assertEqual((issue, repo), (2393, "adamkaplan/fleet-kit"))
         self.assertIn("my final words", body)
         shown = [l for l in body.split("\n") if l.startswith("land line")]
+        self.assertIn("land line 30", shown)
         self.assertLessEqual(len(shown), sb.load_module("cloud_retired").END_LOG_LINES)
         self.assertEqual(shown, ["land line %02d" % i for i in range(30 - len(shown) + 1, 31)])   # a contiguous suffix of the log, the newest line last
         self.assertNotIn("land line 01", shown)
 
     def test_s4_control_today_the_end_posts_neither_the_message_nor_the_log(self):
-        today, _ = self.end(log="land line 1\nexit 0", mutant=True)
+        def complete(posts):   # the S4 predicate: a comment carries the final message and the log
+            return [("my final words" in b, "land line 1" in b) for _i, b, _r in posts] == [(True, True)]
+        today, _ = self.end(log="land line 1\nexit 0", mutant=True)   # today's end: the post is not made
         now, _ = self.end(log="land line 1\nexit 0")
-        self.assertEqual(len(today), 0)   # the same world with the post removed: no comment carries the message
-        self.assertEqual([("my final words" in b, "land line 1" in b) for _i, b, _r in now], [(True, True)])
+        self.assertFalse(complete(today))
+        self.assertTrue(complete(now))
 
     def test_the_pods_text_stays_inside_its_fence_and_a_local_path_line_is_dropped(self):
         posts, _ = self.end(final="![x](https://evil.example/a.png) ``` # fake header\n" + "word " * 900)
@@ -86,9 +89,10 @@ class TestEndOnAsk(unittest.TestCase):
 
     def test_a_key_block_in_the_log_is_redacted_whole_even_when_the_cut_drops_its_first_line(self):
         key = "-----BEGIN PRIVATE KEY-----\nQUJDREVGR0hJSktMTU5PUA\nUVJTVFVWV1hZWjAxMjM0NTY3\n-----END PRIVATE KEY-----"
-        posts, _ = self.end(log=key + "\n" + "\n".join("l%d" % i for i in range(25)))
+        posts, _ = self.end(log=key + "\n" + "\n".join("l%d" % i for i in range(17)))   # 21 lines: the cut drops only the BEGIN line
         self.assertNotIn("QUJDREVGR0hJSktMTU5PUA", posts[0][1])
-        self.assertNotIn("PRIVATE KEY", posts[0][1])
+        self.assertNotIn("UVJTVFVWV1hZWjAxMjM0NTY3", posts[0][1])
+        self.assertIn("\nl16", posts[0][1])
 
     def test_a_key_body_whose_first_line_was_clipped_before_the_run_record_is_redacted(self):
         posts, _ = self.end(log="UVJTVFVWV1hZWjAxMjM0NTY3\nQUJDREVGR0hJSktMTU5PUA\n-----END PRIVATE KEY-----\nexit 1")

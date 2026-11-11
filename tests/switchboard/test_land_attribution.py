@@ -192,8 +192,7 @@ class TestLandAttribution(Case):
         self.assertRegex(line, r"^a landing by someone else was seen: [0-9a-f]{12} by [A-Za-z0-9._-]+$")
 
     def test_a_login_of_nothing_safe_is_unknown(self):
-        self.main = [dict(land(FOREIGN[0]), author=None)]
-        self.main[0]["commit"]["author"] = {"name": "@@``"}
+        self.main = [dict(land(FOREIGN[0]), author={"login": "@@``"})]
         self.run_pass(NOW)
         self.assertEqual(self.said(), ["a landing by someone else was seen: %s by unknown" % FOREIGN[0][:12]])
 

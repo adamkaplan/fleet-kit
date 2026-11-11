@@ -125,7 +125,7 @@ def _login(commit):
     return (re.sub(r"[^A-Za-z0-9._-]", "", login)[:40] or "unknown") if isinstance(login, str) else "unknown"
 
 
-def _landed(sb, engine, now, gh, name, record, mem, state, repos_live, full_config, foreign=None):
+def _landed(sb, engine, now, gh, name, record, mem, state, full_config, foreign=None):
     """The completion of a worker of a `spire land` repository: the newest Land-trailer commit on the default branch, made after the launch, not told before,
     and the pod's OWN (ask #2393): its patch id equals that of a commit of the pod's own branch head, or its sha is the one the pod reported. Another Land commit is
     put in `foreign` (sha -> (worker, author login)) for the pass to say once that someone else landed; no pod is credited for it.
@@ -405,7 +405,7 @@ def run_pass(sb, engine, now, gh, config=None, launcher_audit=None):
                 mem["noboss"] = True
                 engine.audit.append(engine.actor, "push_watch.read_failed", name, {"why": "no reports_to: tells no lane"})
             continue
-        credited = _landed(sb, engine, now, gh, name, record, mem, state, sum(1 for n in live if records[n].get("repo") == repo), getattr(engine, "config", None), foreign.setdefault(repo, {}))
+        credited = _landed(sb, engine, now, gh, name, record, mem, state, getattr(engine, "config", None), foreign.setdefault(repo, {}))
         if credited:
             owned.add(credited)
             continue   # completed by its landing (#2320): nothing more to tell of its branches
