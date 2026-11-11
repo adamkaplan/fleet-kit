@@ -369,7 +369,7 @@ class TestRunRecordKeepsTheResultsFile(unittest.TestCase):
         spec.loader.exec_module(module)
         return module
 
-    def recorder(self, answer, module=None, secrets_fail=False):
+    def recorder(self, answer, module=None, secrets_fail=False, listing=""):
         module = module or self.load()
         calls = []
 
@@ -378,6 +378,10 @@ class TestRunRecordKeepsTheResultsFile(unittest.TestCase):
                 calls.append(cmd)
                 if cmd[0] == "ls" and secrets_fail:
                     raise OSError("the pod's secrets could not be listed")
+                if cmd[0] == "ls":
+                    return listing
+                if cmd[0] == "cat":
+                    return "a-run-secret"
                 if cmd[0] == "sh":
                     if isinstance(answer, Exception):
                         raise answer
@@ -385,6 +389,9 @@ class TestRunRecordKeepsTheResultsFile(unittest.TestCase):
                 if cmd[0] == "git":
                     return "c" * 40 + "\n"
                 return ""
+
+            def add_secrets(self_, *a, **k):
+                pass
 
             def scrub(self_, text, limit=0):   # as the launcher's: a secret shape goes, every control character (a line break too) becomes `?`
                 return __import__("re").sub(r"[^\x20-\x7e]", "?", text.replace("hunter2", "[redacted]"))[:limit]
@@ -461,6 +468,22 @@ class TestRunRecordKeepsTheResultsFile(unittest.TestCase):
         run = json.loads((Path(rec.record("pod-y", "pod-y", "idle", repo="o/r", root=root)) / "run.json").read_text())
         self.assertNotIn("results", run)
 
+    def test_a_listing_longer_than_the_secrets_it_could_learn_keeps_no_results_file(self):
+        module = self.load()
+        for listing in ("\n".join("s%d" % n for n in range(module.SECRET_FILES_MAX + 2)), "ok-one\nBad_Name"):
+            with self.subTest(listing=listing[:20]):
+                rec, _calls = self.recorder("text\nSTATUS: done\n", module, listing=listing)
+                root = tempfile.mkdtemp()
+                self.addCleanup(shutil.rmtree, root, True)
+                rec.read_messages = lambda pod: (None, rec._learn_secrets(pod) or "no server in this test")
+                run = json.loads((Path(rec.record("pod-y", "pod-y", "idle", repo="o/r", root=root)) / "run.json").read_text())
+                self.assertNotIn("results", run)
+        rec, _calls = self.recorder("text\nSTATUS: done\n", module, listing="ok-one\nok-two")
+        rec.read_messages = lambda pod: (None, rec._learn_secrets(pod) or "no server in this test")
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root, True)
+        self.assertIn("results", json.loads((Path(rec.record("pod-y", "pod-y", "idle", repo="o/r", root=root)) / "run.json").read_text()), "control: every name learned")
+
     def test_control_without_the_line_in_record_the_run_json_has_no_results(self):
         text = (BIN.parent / "cloud" / "launcher" / "run_record.py").read_text()
         old = '                if found is not None:\n                    info["results"] = found'
@@ -503,6 +526,64 @@ class TestBranchTipRead(unittest.TestCase):
         _got, asked = self.tip({"object": {"sha": SHA}}, branch="feat/a b?x")
         self.assertNotIn("?", asked[0][0])
         self.assertNotIn(" ", asked[0][0])
+
+
+class TestTheProductionWiring(unittest.TestCase):
+    """The two call sites in bin/fleet-switchboard that hand the new readers in: `cloud_end_tick` (the branch tip) and the hub's catch-up (the owner of a pull request's ask)."""
+
+    def end_tick(self, tip=None):
+        """The daemon's own `cloud_end_tick` over a launcher audit, a run record and a cloud record; returns (the boss's notice, the ref paths asked)."""
+        d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(d), True)
+        state, runs = d / "state", d / "runs"
+        for sub in ((state / "cloud"), runs):
+            sub.mkdir(parents=True)
+        launcher_audit, own_audit = d / "launcher.jsonl", d / "audit.jsonl"
+        launcher_audit.write_text("")
+        own_audit.write_text(json.dumps({"event": "cloud.created", "subject": "pod-k", "detail": {}}) + "\n")
+        rec = runs / "pod-k-20261101T120000Z-abc123"
+        rec.mkdir()
+        (rec / "transcript.jsonl").write_text(json.dumps({"type": "assistant", "content": [{"type": "text", "text": "words"}]}) + "\n")
+        (rec / "run.json").write_text(json.dumps({"head_sha": SHA, "end_hook": {"pushed": False, "wip_branch": None, "head_on": None}}))
+        (state / "cloud" / "pod-k.json").write_text(json.dumps({"worker": "pod-k", "reports_to": "boss-lane", "repo": "o/r", "branch": "feat/own"}))
+        sent, asked = [], []
+
+        def api(path, repo=None):
+            asked.append(path)
+            if path.startswith("repos/o/r/git/ref/heads/"):
+                return {"object": {"sha": SHA}}
+            raise OSError("not this test")
+        engine = types.SimpleNamespace(state_dir=str(state), audit=FileAudit(own_audit), actor="switchboard", intents=types.SimpleNamespace(_api=api),
+                                       send=lambda sender, to, text, **kw: sent.append((to, text)) or {"sent": True})
+        with mock.patch.dict(os.environ, {"CW_CLOUD_AUDIT": str(launcher_audit), "CW_RUN_RECORD_DIR": str(runs)}):
+            sb.cloud_end_tick(engine, None)   # the first pass only marks the end of the file
+            with open(str(launcher_audit), "a") as handle:
+                handle.write(json.dumps({"ts": "2026-11-01T12:30:00Z", "action": "stop", "worker": "pod-k", "ok": True, "cause": "hard",
+                                         "reason": "hard limit; run-id=podk run record %s" % rec}) + "\n")
+            with mock.patch.object(sb, "cloud_branch_tip", tip) if tip else mock.patch.object(sb, "PROG", sb.PROG):
+                sb.cloud_end_tick(engine, None)
+        boss = [text for to, text in sent if to == "boss-lane"]
+        self.assertEqual(len(boss), 1)
+        return boss[0], [p for p in asked if "/git/ref/" in p]
+
+    def test_the_daemons_end_tick_reads_the_branch_tip_and_names_the_branch(self):
+        text, asked = self.end_tick()
+        self.assertIn("Last head: feat/own@bbbbbbbb", text)
+        self.assertEqual(asked, ["repos/o/r/git/ref/heads/feat/own"])
+
+    def test_control_the_end_tick_without_the_branch_read_says_nothing_pushed(self):
+        text, _asked = self.end_tick(tip=lambda engine, repo, branch: None)
+        self.assertIn("Last head: nothing pushed.", text)
+
+    def test_the_hubs_catch_up_hands_the_owner_read_to_the_red_ci_judge(self):
+        import ast
+        tree = ast.parse((BIN / "fleet-switchboard").read_text())
+        calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "red_ci_runs"]
+        self.assertEqual(len(calls), 1, "one call site")
+        last = calls[0].args[-1]
+        self.assertTrue(isinstance(last, ast.Lambda) and isinstance(last.body, ast.Call) and last.body.func.id == "red_ci_lane",
+                        "the last argument of the judge is the owner read, built on red_ci_lane")
+        self.assertGreaterEqual(len(calls[0].args), 6)
 
 
 if __name__ == "__main__":

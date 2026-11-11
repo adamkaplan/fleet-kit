@@ -175,8 +175,9 @@ class Recorder:
         password = ""
         self.secrets_ok = True   # ask #2392: False once a secret could not be learned: the pod's results file is then not kept (its scrub could miss a plain secret)
         try:
-            names = [n for n in self._exec(pod, "ls", "-1", "/run/cw").split()
-                     if re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", n)][:SECRET_FILES_MAX]
+            listed = self._exec(pod, "ls", "-1", "/run/cw").split()
+            names = [n for n in listed if re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", n)][:SECRET_FILES_MAX]
+            self.secrets_ok = len(names) == len(listed)   # a name skipped (its shape, or over the limit) is a secret not learned
         except RecordTimeout:
             raise
         except Exception:
@@ -185,7 +186,10 @@ class Recorder:
             self.secrets_ok = False
         for n in names:
             try:
-                text = self._exec(pod, "cat", "/run/cw/" + n)[:1024 * 1024]
+                text = self._exec(pod, "cat", "/run/cw/" + n)
+                if len(text) > 1024 * 1024:
+                    self.secrets_ok = False   # cut below: a secret that long is not learned whole
+                text = text[:1024 * 1024]
             except RecordTimeout:
                 raise
             except Exception:
