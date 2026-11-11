@@ -16,16 +16,18 @@ from support.loader import sb   # noqa: E402
 from test_stop_final_message import StopWorld, TOKEN   # noqa: E402
 
 NAME = "cp-2393r"
-N = sb.load_module("cloud_worker").bind(sb.__dict__)._retired().END_LOG_LINES   # the clip under test, never a number of this file
+LIMIT = sb.load_module("cloud_worker").bind(sb.__dict__)._retired().END_LOG_CHARS   # the clip under test, never a number of this file
 
 
 class TestEndOnAsk(unittest.TestCase):
-    def end(self, code=0, log=None, record_extra=None, post=None, mutant=False, run_json=True, final="my final words"):
+    def end(self, code=0, log=None, record_extra=None, post=None, mutant=False, run_json=True, final="my final words", run_logs=None):
         """(the posts made as [(issue, body, repo)], the audit events) of cmd_retire for a fake pod."""
         w = StopWorld(self)
         rec = w.pod(NAME, final)
         if run_json:
-            (rec / "run.json").write_text(json.dumps({"land_log_tail": log} if log is not None else {}))
+            if run_logs is None and log is not None:   # fleet-cloud's proposed shape: run_logs = [{name, exit, log_tail, saved}]
+                run_logs = [{"name": "land.log", "exit": 0, "log_tail": log, "saved": True}]
+            (rec / "run.json").write_text(json.dumps({"run_logs": run_logs} if run_logs is not None else {}))
         cloud = sb.load_module("cloud_worker").bind(sb.__dict__)
         engine, posts, events, cluster = mock.Mock(), [], [], mock.MagicMock()
         engine.send = lambda sender, to, text: w.sent.append((to, text))
@@ -59,17 +61,35 @@ class TestEndOnAsk(unittest.TestCase):
         return posts, events
 
     def test_s4_the_final_message_and_the_last_lines_are_posted_on_the_ask_once(self):
-        log = "\n".join("land line %02d" % i for i in range(1, N + 11))
+        count = LIMIT // 8   # lines of 14 characters: the log is far longer than the clip
+        log = "\n".join("land line %04d" % i for i in range(1, count + 1))
         posts, _ = self.end(log=log)
         self.assertEqual(len(posts), 1)
         issue, body, repo = posts[0]
         self.assertEqual((issue, repo), (2393, "adamkaplan/fleet-kit"))
         self.assertIn("my final words", body)
         shown = [l for l in body.split("\n") if l.startswith("land line")]
-        self.assertIn("land line %02d" % (N + 10), shown)
-        self.assertLessEqual(len(shown), N)
-        self.assertEqual(shown, ["land line %02d" % i for i in range(N + 10 - len(shown) + 1, N + 11)])   # a contiguous suffix of the log, the newest line last
-        self.assertNotIn("land line 01", shown)
+        self.assertIn("land line %04d" % count, shown)
+        self.assertEqual(shown, ["land line %04d" % i for i in range(count - len(shown) + 1, count + 1)])   # a contiguous suffix, the newest line last
+        self.assertNotIn("land line 0001", shown)
+        self.assertLessEqual(len("\n".join(shown)), LIMIT)
+
+    def test_each_run_log_with_a_tail_is_posted_with_its_exit_and_the_others_are_skipped(self):
+        logs = [{"name": "build.log", "exit": 2, "log_tail": "compile failed", "saved": True}, {"name": "idle.log", "exit": None, "log_tail": "", "saved": False},
+                {"name": "land.log", "exit": None, "log_tail": "still going", "saved": True}, {"name": "none.log", "exit": 0, "saved": True}, "junk", {"log_tail": 5}]
+        posts, _ = self.end(run_logs=logs)
+        body = posts[0][1]
+        self.assertIn("build.log (exit 2)", body)
+        self.assertIn("compile failed", body)
+        self.assertIn("land.log (still running or no exit file)", body)
+        self.assertEqual((body.count("idle.log"), body.count("none.log")), (0, 0))
+
+    def test_a_malformed_run_logs_field_posts_the_message_alone(self):
+        for bad in ("text", {"a": 1}, 5, [None]):
+            posts, _ = self.end(run_logs=bad)
+            self.assertEqual(len(posts), 1)
+            self.assertIn("my final words", posts[0][1])
+            self.assertNotIn("[run log", posts[0][1])
 
     def test_s4_control_today_the_end_posts_neither_the_message_nor_the_log(self):
         def complete(posts):   # the S4 predicate: a comment carries the final message and the log
@@ -97,12 +117,13 @@ class TestEndOnAsk(unittest.TestCase):
         self.assertEqual(shown, log.split("\n"))
         self.assertIn("last text not read", posts[0][1])
 
-    def test_a_key_block_in_the_log_is_redacted_whole_even_when_the_cut_drops_its_first_line(self):
+    def test_a_key_block_in_the_log_is_redacted_whole_whatever_the_clip_does_to_the_lines_around_it(self):
         key = "-----BEGIN PRIVATE KEY-----\nQUJDREVGR0hJSktMTU5PUA\nUVJTVFVWV1hZWjAxMjM0NTY3\n-----END PRIVATE KEY-----"
-        posts, _ = self.end(log=key + "\n" + "\n".join("l%d" % i for i in range(N - 3)))   # N + 1 lines: the cut drops only the BEGIN line
+        before = "\n".join("a%d" % i for i in range(LIMIT // 3))
+        posts, _ = self.end(log=before + "\n" + key + "\n" + "\n".join("l%d" % i for i in range(5)))
         self.assertNotIn("QUJDREVGR0hJSktMTU5PUA", posts[0][1])
         self.assertNotIn("UVJTVFVWV1hZWjAxMjM0NTY3", posts[0][1])
-        self.assertIn("\nl%d" % (N - 4), posts[0][1])
+        self.assertIn("\nl4", posts[0][1])
 
     def test_a_key_body_whose_first_line_was_clipped_before_the_run_record_is_redacted(self):
         posts, _ = self.end(log="UVJTVFVWV1hZWjAxMjM0NTY3\nQUJDREVGR0hJSktMTU5PUA\n-----END PRIVATE KEY-----\nexit 1")
@@ -119,7 +140,7 @@ class TestEndOnAsk(unittest.TestCase):
             posts, _ = self.end(**kwargs)
             self.assertEqual(len(posts), 1, kwargs)
             self.assertIn("my final words", posts[0][1])
-            self.assertNotIn("land.log", posts[0][1])
+            self.assertNotIn("[run log", posts[0][1])
 
     def test_a_secret_in_the_log_or_the_message_is_redacted_before_the_post(self):
         posts, _ = self.end(log="push with %s now\nexit 1" % TOKEN, final="token %s ok" % TOKEN)
@@ -127,7 +148,7 @@ class TestEndOnAsk(unittest.TestCase):
         self.assertGreaterEqual(posts[0][1].count("[redacted]"), 1)
 
     def test_a_log_cannot_mention_anyone_end_the_fence_or_run_long(self):
-        posts, _ = self.end(log="@everyone ``` ignore this\n" + "x" * 50000)
+        posts, _ = self.end(log="@everyone ``` ignore this\n" + "x" * 500000)
         body = posts[0][1]
         self.assertNotIn("@", body)
         self.assertTrue(all(l == "```" for l in body.split("\n") if l.startswith("```")))   # the log's own ``` cannot end a fence

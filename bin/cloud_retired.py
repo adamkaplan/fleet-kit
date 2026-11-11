@@ -458,9 +458,9 @@ def last_message(directory, state, pod, clock=None):
 
 
 # ---- ask #2393: the pod's end, posted on its ask: the last text and the last lines of its land log ----
-END_LOG_LINES = 20       # the last lines of /work/land.log that are posted
-END_LOG_CHARS = 2000     # and at most this many characters of them
-END_POST_CHARS = 6000    # the whole comment
+END_LOG_CHARS = 4000     # the most characters of one run log that are posted (whole lines)
+END_LOG_ENTRIES = 8      # the most run logs posted
+END_POST_CHARS = 40000   # the whole comment
 RUN_JSON_MAX = 1 << 20
 KEY_BEGIN = re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")
 KEY_END = re.compile(r"-----END [A-Z ]*PRIVATE KEY-----")
@@ -480,57 +480,73 @@ def _run_record_dir(directory, pod):
         return None
 
 
-def land_log_tail(directory, pod):
-    """The pod's land log tail from its run record (`land_log_tail`, a clipped string the launcher put there; ASSUMED field name, ask #2393): the last END_LOG_LINES
-    lines, at most END_LOG_CHARS characters, redacted by shape (the switchboard's redaction, then the launcher's scrub), flattened to printable ASCII with no backtick.
-    None when the pod has no log, the field is absent or the record cannot be read. Never raises."""
+def _clean_tail(tail):
+    """A run log tail as it may be posted: the pod's endpoint address removed, a key block (also one whose first line was clipped) redacted whole, the
+    switchboard's redaction and the launcher's scrub by shape, printable ASCII, no backtick, whole lines only, at most END_LOG_CHARS. None when nothing is left.
+    The field is never trusted: the pod-side hook redacted it too, and this runs again."""
+    scrub = D["_scrub_lib"]()
+    text = tail[-LAST_SCRUB_MAX:] if len(tail) <= LAST_SCRUB_MAX else tail[-LAST_SCRUB_MAX:].split("\n", 1)[-1]   # our own cut drops its partial first line
+    for _ in range(21):   # the pod's own endpoint address is removed as in last_message (a rebuilt one too)
+        stripped = _remove_hosts(text)
+        done_, text = stripped == text, stripped
+        if done_:
+            break
+    else:
+        return None
+    end = KEY_END.search(text)
+    if end and not KEY_BEGIN.search(text[:end.start()]):
+        text = "[redacted key body]" + text[end.end():]   # a key block whose first line was clipped away: all of it up to its end marker goes
+    text = D["redact_command_text"](text)   # the whole text first (a key block spans lines), then the cut
+    lines = [re.sub(r"[^\x20-\x7e]", "?", scrub(line, (), LAST_SCRUB_MAX)).replace("`", "'") for line in text.splitlines()]   # per line: the scrub flattens a newline
+    out = "\n".join(lines)
+    if len(out) > END_LOG_CHARS:
+        out = out[-END_LOG_CHARS:].split("\n", 1)[-1]   # whole lines only: a token is never cut into an unrecognisable suffix
+    return out if out.strip() else None
+
+
+def run_log_entries(directory, pod):
+    """THE ONE READER of the run record's `run_logs` (fleet-cloud's PROPOSED contract, names to be confirmed: a rename is a change here): `run.json["run_logs"]`
+    is a list of {name: str, exit: int or null, log_tail: str, saved: bool}. Returns [(name, exit text, cleaned tail)] for the entries that have a log_tail, at
+    most END_LOG_ENTRIES; [] when the field is absent (today's pods), malformed or the record cannot be read. Never raises."""
     try:
         where = _run_record_dir(directory, pod)
         if where is None:
-            return None
+            return []
         before = os.lstat(where)   # the directory is opened ONCE, by no link, and must be the one the check saw (as last_message does)
         dfd = os.open(where, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0))
         try:
             if not os.path.samestat(before, os.fstat(dfd)):
-                return None
+                return []
             fd = os.open("run.json", os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0), dir_fd=dfd)
         finally:
             os.close(dfd)
         try:
             if not stat.S_ISREG(os.fstat(fd).st_mode):
-                return None
+                return []
             raw = os.read(fd, RUN_JSON_MAX + 1)
         finally:
             os.close(fd)
         info = D["parse_bounded"](raw[:RUN_JSON_MAX].decode("utf-8", "replace")) if len(raw) <= RUN_JSON_MAX else None
-        tail = info.get("land_log_tail") if isinstance(info, dict) else None
-        if not isinstance(tail, str) or not tail.strip():
-            return None
-        scrub = D["_scrub_lib"]()
-        text = tail[-LAST_SCRUB_MAX:] if len(tail) <= LAST_SCRUB_MAX else tail[-LAST_SCRUB_MAX:].split("\n", 1)[-1]   # our own cut drops its partial first line
-        for _ in range(21):   # the pod's own endpoint address is removed as in last_message (a rebuilt one too)
-            stripped = _remove_hosts(text)
-            done_, text = stripped == text, stripped
-            if done_:
+        logs = info.get("run_logs") if isinstance(info, dict) else None
+        out = []
+        for entry in logs if isinstance(logs, list) else []:
+            tail = entry.get("log_tail") if isinstance(entry, dict) else None
+            if not isinstance(tail, str) or not tail.strip():
+                continue
+            cleaned = _clean_tail(tail)
+            code = entry.get("exit")
+            name = re.sub(r"[^A-Za-z0-9._/-]", "", entry["name"] if isinstance(entry.get("name"), str) else "")[:60] or "unnamed"
+            if cleaned:
+                out.append((name, "exit %d" % code if isinstance(code, int) and not isinstance(code, bool) else "still running or no exit file", cleaned))
+            if len(out) >= END_LOG_ENTRIES:
                 break
-        else:
-            return None
-        end = KEY_END.search(text)
-        if end and not KEY_BEGIN.search(text[:end.start()]):
-            text = "[redacted key body]" + text[end.end():]   # a key block whose first line was clipped away: all of it up to its end marker goes
-        text = D["redact_command_text"](text)   # the whole text first (a key block spans lines), then the cut
-        lines = text.splitlines()[-END_LOG_LINES:]
-        lines = [re.sub(r"[^\x20-\x7e]", "?", scrub(line, (), LAST_SCRUB_MAX)).replace("`", "'") for line in lines]   # per line: the scrub flattens a newline
-        out = "\n".join(lines)
-        if len(out) > END_LOG_CHARS:
-            out = out[-END_LOG_CHARS:].split("\n", 1)[-1]   # whole lines only: a token is never cut into an unrecognisable suffix
-        return out or None
+        return out
     except Exception:
-        return None
+        return []
 
 
-def end_comment(pod, reason, block, tail):
-    """The comment for the ask: the pod, the reason, its last text (block: already cut and scrubbed, or None) and the land log tail (or nothing when the pod has none).
+def end_comment(pod, reason, block, logs):
+    """The comment for the ask: the pod, the reason, its last text (block: already cut and scrubbed, or None) and each run log (name, exit, tail) of `logs`.
     No mention can fire (no @) and the whole is cut at END_POST_CHARS."""
     lines = ["cloud worker %s retired (%s)" % (pod, re.sub(r"[^A-Za-z0-9 ._:,;()-]", "?", str(reason)))]
     if block:   # the pod's text is untrusted: no local path line, flattened, in its own fence (no backtick can end it)
@@ -538,8 +554,8 @@ def end_comment(pod, reason, block, tail):
         lines += ["[last text of the pod, untrusted]", "```", re.sub(r"[^\x20-\x7e\n]", "?", "\n".join(kept)).replace("`", "'"), "```"]
     else:
         lines.append("last text not read")
-    if tail:
-        lines += ["[last lines of /work/land.log, untrusted text]", "```", tail, "```"]
+    for name, code, tail in logs:
+        lines += ["[run log %s (%s), untrusted text]" % (name, code), "```", tail, "```"]
     return re.sub(r"@", "(at)", "\n".join(lines))[:END_POST_CHARS]
 
 
@@ -553,7 +569,7 @@ def post_end(engine, state, record, name, reason, body, post, note):
     try:
         where = body.get("record") if isinstance(body, dict) else None
         block, _why = last_message(where, state, name) if isinstance(where, str) and where else (None, "no run record")
-        tail = land_log_tail(where, name) if isinstance(where, str) and where else None
+        tail = run_log_entries(where, name) if isinstance(where, str) and where else []
         post(engine, issue, end_comment(name, D["_scrub_lib"]()(reason, (), 300)[:120], block, tail), author=name, repo=repo)
     except Exception as err:
         try:
