@@ -808,6 +808,9 @@ def _read_tail(path):
             return False, b""
         if st.st_size > READ_TAIL_BYTES:
             os.lseek(fd, st.st_size - READ_TAIL_BYTES, os.SEEK_SET)
+            data = os.read(fd, READ_TAIL_BYTES)
+            cut = data.find(b"\n")   # the window began mid-line: that partial line (a secret may be split in it) is dropped
+            return True, data[cut + 1:] if cut >= 0 else data   # no newline at all: one long line, which _redact_line cuts and strips
         return True, os.read(fd, READ_TAIL_BYTES)
     except OSError:
         return False, b""

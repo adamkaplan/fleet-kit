@@ -127,6 +127,20 @@ class Fake(unittest.TestCase):
         self.assertFalse(self.h.RUN_NAME_RE.fullmatch("a/b"))
         self.assertFalse(self.h.RUN_NAME_RE.fullmatch("x" * 65))
 
+    def test_a_secret_split_by_the_read_window_is_not_shown(self):
+        window = self.h.READ_TAIL_BYTES
+        head = "word=hunter2hunter2 tail\n"
+        tail_end = "last line\n"
+        fill = window - len(head) - len(tail_end)   # four long lines
+        lines = ["y" * (fill // 4 - 1) + "\n"] * 3
+        lines.append("y" * (fill - 3 * len(lines[0]) - 1) + "\n")
+        with open(os.path.join(self.runs, "w.log"), "w") as f:
+            f.write("A" * 500 + "pass" + head + "".join(lines) + tail_end)   # the window begins right after `pass`
+        self.assertEqual(os.path.getsize(os.path.join(self.runs, "w.log")), 504 + window)
+        tail = self.answer()["runs"][0]["log_tail"]
+        self.assertNotIn("hunter2", tail)
+        self.assertIn("last line", tail)
+
     def test_oversized_and_unreadable_never_raise(self):
         self.put("odd.log", "text\n")
         os.mkdir(os.path.join(self.runs, "dir.log"))
