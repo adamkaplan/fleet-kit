@@ -35,16 +35,16 @@ States: `queued`, `running`, `idle`, `done`, `failed`, `retired`; the last three
 
 | Input or call | Checked by | Test |
 |---|---|---|
-| worker name, `OWNER/NAME` repo, branch, task, idle and hard seconds | `launch.validate_spec`, before any call | `SpecTests.test_each_bad_input_is_refused_before_any_call` |
-| land command (configuration `FLEET_REMOTE_LAND_COMMAND`, no default, one printable line) | `load_config`, `validate_spec` | `ConfigTests` |
-| transport name (`FLEET_REMOTE_TRANSPORT`) | `transport_from_config` | `ConfigTests.test_registry` |
-| storage account, floor id, caller id, git base | `FloorTransport.__init__` | `ConfigurationTests.test_unsafe_settings_are_refused`, `test_names_are_configuration` |
-| the two SAS files (paths are configuration; regular, small, not group or other readable) | `floor.load_sas_file` | `ConfigurationTests.test_sas_file_rules` |
-| `POST` to the command queue (add only, `messagettl=86400` on every message) | `FloorTransport._add_message` | `CarrierTests.test_every_message_carries_the_24_hour_ttl` |
-| `PUT` of a payload blob (a command over 48 KiB) | `FloorTransport._put_blob` | `PayloadTests` |
-| `GET` of `state.json` (conditional) and `msg/<session>.json` | `FloorTransport._get_blob` | `StateTests` |
-| service answers (state, landed sha, JSON, acks) | `FloorTransport.status`, `_read_state` | `StateTests.test_bad_state_answers_are_refused` |
-| handle of another transport, message over 256 KiB | `FloorTransport` | `StopAndSessionTests.test_foreign_handle...`, `PayloadTests.test_over_256_kib...` |
+| worker name, `OWNER/NAME` repo, branch, task, idle and hard seconds | `launch.validate_spec`, before any call | `TestRemoteSpec.test_each_bad_input_is_refused_before_any_call` |
+| land command (configuration `FLEET_REMOTE_LAND_COMMAND`, no default, one printable line) | `load_config`, `validate_spec` | `TestRemoteConfig` |
+| transport name (`FLEET_REMOTE_TRANSPORT`) | `transport_from_config` | `TestRemoteConfig.test_registry` |
+| storage account, floor id, caller id, git base | `FloorTransport.__init__` | `TestRemoteConfiguration.test_unsafe_settings_are_refused`, `test_names_are_configuration` |
+| the two SAS files (paths are configuration; regular, small, not group or other readable) | `floor.load_sas_file` | `TestRemoteConfiguration.test_sas_file_rules` |
+| `POST` to the command queue (add only, `messagettl=86400` on every message) | `FloorTransport._add_message` | `TestRemoteCarrier.test_every_message_carries_the_24_hour_ttl` |
+| `PUT` of a payload blob (a command over 48 KiB) | `FloorTransport._put_blob` | `TestRemotePayload` |
+| `GET` of `state.json` (conditional) and `msg/<session>.json` | `FloorTransport._get_blob` | `TestRemoteState` |
+| service answers (state, landed sha, JSON, acks) | `FloorTransport.status`, `_read_state` | `TestRemoteState.test_bad_state_answers_are_refused` |
+| handle of another transport, message over 256 KiB | `FloorTransport` | `TestRemoteStopAndSession.test_foreign_handle...`, `TestRemotePayload.test_over_256_kib...` |
 
 The land command is text the worker is told to run as its last step; this package never runs it. Neither SAS token appears in a log, error, repr or
 return value; each goes only to its own fixed host (the queue token to the queue, the container token to the blob container).
@@ -75,5 +75,6 @@ Details a caller needs:
 
 ## Tests
 
-`python3 -m unittest remote_worker.tests.test_remote_worker remote_worker.tests.test_floor_carrier` (standard library only, no network, a fake HTTP layer). These
-files are not yet a step of the CI workflow.
+`tests/switchboard/test_remote_worker.py` and `tests/switchboard/test_remote_floor_carrier.py` are registered the way every file of that directory is: the
+runner `bin/test-switchboard` finds their `Test*` classes itself, so CI runs them. Standard library only, no network (a fake HTTP layer).
+Focused: `bin/test-switchboard -k TestRemote`.

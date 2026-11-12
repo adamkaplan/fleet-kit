@@ -1,9 +1,9 @@
 """Unit tests for the remote-worker package. No network: the Floor carrier is tested in test_floor_carrier.py."""
-import os
 import sys
 import unittest
+from pathlib import Path
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))   # the repository, for the remote_worker package
 
 from remote_worker import (Config, ConfigError, SpecError, TransportError, WorkerHandle, launch_remote_worker, load_config,
                            register_transport, transport_from_config, validate_spec, wait_for_end, Transport)
@@ -15,7 +15,7 @@ GOOD = dict(name="widget-1", repo="acme/widget-api", branch="work/widget-1", tas
 SHA = "0" * 39 + "1"
 
 
-class SpecTests(unittest.TestCase):
+class TestRemoteSpec(unittest.TestCase):
     def test_valid_spec_brief_carries_task_and_land_command(self):
         spec = validate_spec(**GOOD)
         self.assertIn("Fix the parser.", spec.brief)
@@ -35,7 +35,7 @@ class SpecTests(unittest.TestCase):
                 self.assertEqual(t.calls, [])
 
 
-class LaunchTests(unittest.TestCase):
+class TestRemoteLaunch(unittest.TestCase):
     def test_launch_starts_and_returns_handle(self):
         t = FakeTransport()
         h = launch_remote_worker(t, **GOOD)
@@ -70,7 +70,7 @@ class LaunchTests(unittest.TestCase):
         self.assertIsInstance(FakeTransport(), Transport)
 
 
-class WaitTests(unittest.TestCase):
+class TestRemoteWait(unittest.TestCase):
     def setUp(self):
         self.t = FakeTransport()
         self.h = launch_remote_worker(self.t, **GOOD)
@@ -104,7 +104,7 @@ class WaitTests(unittest.TestCase):
             self.wait(60)
 
 
-class FakeTests(unittest.TestCase):
+class TestRemoteFake(unittest.TestCase):
     def test_send_dedups_by_message_id_and_refuses_after_end(self):
         t = FakeTransport()
         h = launch_remote_worker(t, **GOOD)
@@ -115,7 +115,7 @@ class FakeTests(unittest.TestCase):
             t.send(h, "late")
 
 
-class ConfigTests(unittest.TestCase):
+class TestRemoteConfig(unittest.TestCase):
     def test_both_settings_required(self):
         with self.assertRaises(ConfigError):
             load_config({})

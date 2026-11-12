@@ -6,10 +6,11 @@ import re
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 import urllib.parse
 from xml.etree import ElementTree
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))   # the repository, for the remote_worker package
 
 from remote_worker import Transport, TransportError, WorkerHandle, launch_remote_worker, wait_for_end
 from remote_worker import floor as floor_mod
@@ -102,7 +103,7 @@ class Base(unittest.TestCase):
         return t, launch_remote_worker(t, **GOOD)
 
 
-class CarrierTests(Base):
+class TestRemoteCarrier(Base):
     def test_satisfies_the_interface(self):
         self.assertIsInstance(self.transport(), Transport)
 
@@ -211,7 +212,7 @@ class CarrierTests(Base):
         self.assertEqual(t.command_result(cid), "rejected:terminal")
 
 
-class PayloadTests(Base):
+class TestRemotePayload(Base):
     def test_a_large_brief_goes_to_a_blob_written_first(self):
         t = self.transport()
         big = "x" * (60 * 1024)
@@ -259,7 +260,7 @@ class PayloadTests(Base):
         self.assertEqual(len(self.store.requests), n)
 
 
-class StateTests(Base):
+class TestRemoteState(Base):
     def test_status_reads_the_session_from_state_json(self):
         t, h = self.launched()
         self.store.publish({h.worker_id: {"state": "done", "busy": False, "last_update": "2026-11-12T09:30:12Z", "landed_sha": SHA}})
@@ -329,7 +330,7 @@ class StateTests(Base):
         self.assertEqual(wait_for_end(t, h, 10, sleep=lambda s: None, clock=self.clock).landed_sha, SHA)
 
 
-class StopAndSessionTests(Base):
+class TestRemoteStopAndSession(Base):
     def test_stop_adds_one_retire_and_a_repeat_adds_none(self):
         t, h = self.launched()
         t.stop(h, "r")
@@ -365,7 +366,7 @@ class StopAndSessionTests(Base):
         self.assertEqual(self.store.requests, [])
 
 
-class SafetyTests(Base):
+class TestRemoteSafety(Base):
     def test_errors_are_classified_and_never_carry_a_token(self):
         cases = [(429, True), (503, True), (500, True), (403, False), (401, False), (400, False)]
         for status, retry in cases:
@@ -434,7 +435,7 @@ class SafetyTests(Base):
                 self.assertIn(".blob.", url)
 
 
-class ConfigurationTests(Base):
+class TestRemoteConfiguration(Base):
     def test_unsafe_settings_are_refused(self):
         bad = [dict(account="X"), dict(account="ab"), dict(account="a.b.c"), dict(floor_id="F1"), dict(caller_id="a/b"), dict(caller_id=""),
                dict(git_base="http://git.example"), dict(git_base="https://u:p@git.example")]
