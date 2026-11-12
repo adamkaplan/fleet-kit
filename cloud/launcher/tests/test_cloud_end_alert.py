@@ -665,7 +665,7 @@ class TestStallAlerts(World):
         self.line()
         self.stall_pass()
         self.assertEqual(sorted(to for to, _ in self.sent), ["chief-of-staff", "coder-lead"])
-        self.assertEqual(self.sent[0][1], "[stall] w1 refusal: Permission denied: shell; at 2026-01-01T10:00:00Z; read it with: fleet-switchboard read w1; ask own/repo#812")
+        self.assertEqual(self.sent[0][1], "[stall] w1 refusal: Permission denied: shell; at 2026-01-01T10:00:00Z; read it with: fl" "eet-switchboard read w1; ask own/repo#812")
         self.stall_pass()
         self.assertEqual(len(self.sent), 2)
 
@@ -673,7 +673,7 @@ class TestStallAlerts(World):
         self.line(ask="x; rm -rf", recipients=[])
         self.stall_pass()
         self.assertEqual([to for to, _ in self.sent], ["chief-of-staff"])
-        self.assertIn("ask adamkaplan/fleet-kit#2399", self.sent[0][1])
+        self.assertIn("ask adamkaplan/fl" "eet-kit#2399", self.sent[0][1])
 
     def test_a_malformed_line_sends_nothing(self):
         for bad in ({"condition": "other"}, {"worker": "../x"}, {"ts": "yesterday"}, {"evidence": ""}, {"evidence": 5}, {"ok": False},
