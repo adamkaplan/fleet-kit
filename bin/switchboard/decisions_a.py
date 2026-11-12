@@ -34,7 +34,7 @@ def read_escalated_checked(state_dir, limit=None):
             os.close(fd)
         if limit is not None and len(data) > limit:
             return {}, "%s is too large to read" % ESCALATED_FILE
-        raw = json.loads(data.decode("utf-8"))
+        raw = load_module("record_json").parse_bounded(data.decode("utf-8"))
     except FileNotFoundError:
         return {}, None   # nothing was ever escalated (the normal state): the same as an empty record, and no note on every list
     except (OSError, ValueError, RecursionError):

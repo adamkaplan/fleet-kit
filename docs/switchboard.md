@@ -6394,6 +6394,7 @@ Now every reader of record JSON uses the shared bounded-depth parse `parse_bound
 | `switchboard/reminders.py:read_record_file` | `reminder-repeats.json` | None | TestRecordJsonReaders s3, s6 | `json.loads` in place of `parse_bounded` |
 | `registry.py:_parse` | `registry.json` (the retirement records `retire --close` judges a retired headless worker from) | not whole: nothing read, nothing acted on | TestRetireCloseHeadless s13 | `json.loads` in place of `parse_bounded` |
 | `registry.py:_old_retired` | `retired.json` | a problem: nothing read | TestRetireCloseHeadless s13 | `json.loads` in place of `parse_bounded` |
+| `switchboard/decisions_a.py:read_escalated_checked` | `escalated-requests.json` (behind `read_escalated`, the daemon's read, and the list's bounded read) | empty, with a note on the list | TestRecordJsonReaders (this table) | `json.loads` in place of `parse_bounded` |
 
 `TestRecordJsonReaders` derives the list of readers from the source (every `json.loads`, `json.load` and `from json import loads` call in `bin/`, found with `ast`) and fails when a reader is in neither the covered set nor its table of exempt sites (daemon-written state, command output, request bodies, log lines), and when a table entry is stale.
 
