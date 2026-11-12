@@ -21,6 +21,7 @@ import os
 import re
 import stat
 import subprocess
+import sys
 import tempfile
 
 RECORD_MAX = 1 << 20          # a run.json over this is not read (the real one is a few KB)
@@ -340,3 +341,11 @@ def daily_pass(env, now, root, state_path, git_dir=None, send=send_message, comm
         except Exception:
             pass
         return "failed"
+
+
+def run(launcher, now):   # #2448: the reaper's one call; loaded by name (the token service's image does not ship this module); never raises
+    try:
+        root = launcher.recorder.root()
+        daily_pass(launcher.env, now, root, os.path.join(root, ".land-report.json"), log=lambda t: print("cloud-worker: " + t, file=sys.stderr))
+    except Exception as err:
+        print("cloud-worker: the land report failed: %s" % type(err).__name__, file=sys.stderr)
