@@ -607,6 +607,7 @@ switchboard/agents_verify.py:agents_found
 switchboard/alert_labels.py:__init__
 switchboard/answer_delivery.py:cmd_decision_batch
 switchboard/decisions_a.py:read_batch_notes
+switchboard/decisions_a.py:read_escalated
 switchboard/decisions_b.py:read_order_notices
 switchboard/decisions_b.py:sync_for
 switchboard/engine.py:load

@@ -20,8 +20,8 @@ ESCALATED_READ_MAX = 1 << 20   # the list reads the record once, at most this ma
 
 
 def read_escalated_checked(state_dir, limit=None):
-    """(found, note): `read_escalated`'s result and, when the record is unreadable, too large (only with a `limit` in bytes: the list's one bounded read) or malformed, one line
-    (a missing record is an empty one, with a note the list shows only when a cos row could move). The daemon passes no limit, so its read is what it was. A record that is not a regular file is unreadable (never opened blocking). Writes nothing."""
+    """(found, note): the record's content and, when the record is unreadable, too large (past `limit` bytes) or malformed, one line
+    (a missing record is an empty one, with a note the list shows only when a cos row could move). This is the LIST's read only (the daemon keeps `read_escalated`, unchanged). A record that is not a regular file is unreadable (never opened blocking). Writes nothing."""
     path = Path(state_dir) / ESCALATED_FILE
     try:
         fd = os.open(str(path), os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
@@ -50,7 +50,12 @@ def read_escalated(state_dir):
     A DISPOSABLE file, not a second source of truth: it only moves a request that is still pending from `cos` to
     `human` a little before the grace period would, and it is pruned to the requests pending now. Missing,
     unreadable or malformed reads as empty: the request is then yours when the grace period has run out."""
-    return read_escalated_checked(state_dir)[0]
+    try:
+        raw = json.loads((Path(state_dir) / ESCALATED_FILE).read_text())
+    except (OSError, ValueError):
+        return {}
+    found = raw.get("requests") if isinstance(raw, dict) else None
+    return {k: v for k, v in found.items() if isinstance(k, str) and isinstance(v, str)} if isinstance(found, dict) else {}
 
 
 def escalation_applied(decisions, state_dir):
