@@ -292,7 +292,7 @@ class Mutants(unittest.TestCase):
 
 
 FAKE_MINT = ("#!%s\nimport json, os, sys\nargv = sys.argv[1:]\nfd = None\nif len(argv) >= 2 and argv[-2] == '--fd':\n    fd = int(argv[-1])\n    argv = argv[:-2]\n"
-             "open(sys.argv[0] + '.argv', 'a').write(json.dumps(argv) + '\\n')\nopen(sys.argv[0] + '.path', 'w').write(os.path.realpath(sys.argv[0]) + '\\n' + os.path.realpath(sys.executable))\n"
+             "open(sys.argv[0] + '.argv', 'a').write(json.dumps(argv) + '\\n')\nopen(sys.argv[0] + '.full', 'a').write(json.dumps(sys.argv[1:]) + '\\n')\nopen(sys.argv[0] + '.path', 'w').write(os.path.realpath(sys.argv[0]) + '\\n' + os.path.realpath(sys.executable))\n"
              "tok = 'tok-' + argv[0].split('/')[-1]\nif fd is None:\n    print(tok)\nelse:\n    os.write(fd, tok.encode())\n" % sys.executable)   # the default mint gives the token through --fd (#1453)
 
 
@@ -355,7 +355,9 @@ class LaunchSideMint(unittest.TestCase):
                     os.remove(self.log)
                 _, calls = self.run_mint(self.load(), *extra)
                 self.assertEqual(calls, [[REPO]])
-        self.assertEqual(pathlib.Path(self.mint + ".path").read_text().split("\n"), [os.path.realpath(self.mint), os.path.realpath(sys.executable)])   # the interpreter and the mint beside the copy   # it ran the mint beside the copy
+        self.assertEqual(pathlib.Path(self.mint + ".path").read_text().split("\n"), [os.path.realpath(self.mint), os.path.realpath(sys.executable)])   # the interpreter and the mint beside the copy
+        full = json.loads(pathlib.Path(self.mint + ".full").read_text().splitlines()[-1])
+        self.assertEqual((full[0], full[-2], full[-1].isdigit()), (REPO, "--fd", True))   # the default mint gets its route as the last two arguments   # it ran the mint beside the copy
 
     def test_a_launch_through_a_symlinked_temporary_directory_compares_resolved_paths(self):
         import tempfile
@@ -373,6 +375,8 @@ class LaunchSideMint(unittest.TestCase):
         tok, calls = self.run_mint(self.load())
         self.assertEqual((tok, calls), ("tok-widget-service", [[REPO]]))   # the default mint was recognised through the link and run once
         self.assertEqual(pathlib.Path(self.mint + ".path").read_text().split("\n"), [os.path.realpath(self.mint), os.path.realpath(sys.executable)])   # the interpreter and the mint beside the copy
+        full = json.loads(pathlib.Path(self.mint + ".full").read_text().splitlines()[-1])
+        self.assertEqual((full[0], full[-2], full[-1].isdigit()), (REPO, "--fd", True))   # the default mint gets its route as the last two arguments
 
     def test_a_custom_command_runs_unchanged(self):
         own = os.path.join(os.path.dirname(self.mint), "own.py")
