@@ -7,12 +7,57 @@ reports only `pass` or `fail`.
 
 | Item | What the pod checks, and writes `pass` only when it holds |
 |---|---|
-| `pg-env` | the count of environment variables whose name starts with `PG` is 0 (`env \| grep -c '^PG'` prints 0) |
-| `hook` | `git config --global core.hooksPath` names a directory and the file `pre-push` is present and executable in it |
-| `python311` | `python3.11 --version` or `mise exec python@3.11 -- python --version` runs and prints `3.11` |
-| `run-wake` | a `cw-run start --name proofwake -- sh -c 'exit 13'` job wakes the agent within 30 seconds with no prompt (the wake arrives, a prompt is `fail`) |
-| `tests` | each of the repository-named test files below, run in a clone of that repository, exits 0 (one line each; any red one is `fail`) |
+| `pg-env` | the count of environment variables whose name starts with `PG` is 0 |
+| `hook` | the global git configuration FILE names a hooks directory and the file `pre-push` is present and executable in it (read as text: no `git config` of the hooks path, which the pod's rules refuse) |
+| `python311` | `mise exec python@3.11 -- python --version` runs and prints `3.11` |
+| `run-wake` | a `cw-run` job that exits 13 wakes the agent within 30 seconds with no prompt (the wake arrives, a prompt is `fail`) |
+| `tests` | each of the repository-named test files below, run alone in the checkout in `/work`, exits 0 (any red one is `fail`) |
 | `identity` | `git config --global user.name` and `user.email` equal the two lines of `/etc/cw-default-identity` (compared, never printed) |
+
+## The commands of each item
+
+Every command line below is one that no deny row of the pod's permission file refuses (a test matches each against every row). Use only these; each prints `pass` for a pass.
+
+### pg-env
+
+```
+[ "$(env | grep -c '^PG')" = 0 ] && echo pass
+```
+
+### hook
+
+```
+d=$(sed -n 's/^[[:space:]]*hooksPath[[:space:]]*=[[:space:]]*//p' ~/.gitconfig | tail -n 1); [ -x "$d/pre-push" ] && echo pass
+```
+
+### python311
+
+```
+mise exec python@3.11 -- python --version | grep -q '^Python 3\.11' && echo pass
+```
+
+### run-wake
+
+```
+cw-run start --name proofwake -- sh -c 'exit 13'
+```
+
+Then END YOUR TURN (no other command, no waiting). The helper's wake message arrives by itself: when it does, and it says `proofwake` exited 13, write the line `run-wake pass`; no wake within 30 seconds, or a prompt, is `run-wake fail`.
+
+### tests
+
+Start the eight files one at a time (each alone), wait for each with `cw-run wait NAME 120` until it prints `exited`, and read its status; `exited 0` is a pass for that file. N is 1 to 8 in the order of the list below.
+
+```
+cw-run start --name proof-test-N -- sh -c 'cd /work && npm test -- tests/<the Nth file of the list>'
+cw-run wait proof-test-N 120
+```
+
+### identity
+
+```
+[ "$(git config --global user.name)" = "$(sed -n 1p /etc/cw-default-identity)" ] && [ "$(git config --global user.email)" = "$(sed -n 2p /etc/cw-default-identity)" ] && echo pass
+```
 
 ## The formerly red test files of the spire-venue repository
 

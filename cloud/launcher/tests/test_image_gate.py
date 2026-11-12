@@ -34,10 +34,17 @@ esac
 exit 9
 """
 GIT = '#!/bin/sh\necho "$@" >> "$FAKE_DIR/git.log"\nexit "$(cat "$FAKE_DIR/gitexit")"\n'
+SB = "fl" + "eet-switchboard"
 LAUNCHER = """#!/bin/sh
 echo "$@" >> "$FAKE_DIR/launcher.log"
-[ "$1" = create ] && echo '{"pod": "proof-pod-1"}'
-exit "$(cat "$FAKE_DIR/launchexit")"
+if [ "$1" = launch ]; then
+  echo "XDG_CONFIG_HOME=$XDG_CONFIG_HOME CW_CLOUD_IMAGE=${CW_CLOUD_IMAGE-unset}" >> "$FAKE_DIR/launcher.env"
+  cp "$XDG_CONFIG_HOME/fl""eet-switchboard/cloud.env" "$FAKE_DIR/seen.env" 2>/dev/null
+  echo "$XDG_CONFIG_HOME" > "$FAKE_DIR/seen.scratch"
+  echo '{"name": "x", "runtime_id": "pod/proof-pod-1", "session": "s", "url": "u", "cloud": true}'
+  exit "$(cat "$FAKE_DIR/launchexit")"
+fi
+exit 0
 """
 KUBECTL = """#!/bin/sh
 echo "$@" >> "$FAKE_DIR/kubectl.log"
@@ -75,14 +82,16 @@ class Base(unittest.TestCase):
         self.state = os.path.join(self.tmp, "state")
         self.rdir = os.path.join(self.state, "fl" + "eet-switchboard", "cloud", "image-proof")
         os.makedirs(self.rdir)
-        self.conf = os.path.join(self.tmp, "cfg")
-        os.mkdir(self.conf, 0o700)
+        self.xdg = os.path.join(self.tmp, "xdg")
+        self.conf = os.path.join(self.xdg, SB)
+        os.makedirs(self.conf, 0o700)
+        os.mkdir(os.path.join(self.xdg, "opencode"))
         self.settings = os.path.join(self.conf, "cloud.env")
         Path(self.settings).write_text("A=1\nCW_CLOUD_IMAGE=reg.example/cw@sha256:%s\nB=2\n" % ("c" * 64))
         os.chmod(self.settings, 0o600)
         os.utime(self.settings, (1_000_000_000, 1_000_000_000))
         self.env = {"CRANE": os.path.join(self.fake, "crane"), "FAKE_DIR": self.fake,
-                    "XDG_STATE_HOME": self.state, "PATH": self.fake + os.pathsep + os.environ.get("PATH", ""), "CW_CLOUD_LAUNCHER": os.path.join(self.fake, "launcher"),
+                    "XDG_STATE_HOME": self.state, "PATH": self.fake + os.pathsep + os.environ.get("PATH", ""), "CW_SWITCHBOARD": os.path.join(self.fake, "launcher"), "XDG_CONFIG_HOME": self.xdg,
                     "CW_KUBECTL": os.path.join(self.fake, "kubectl")}
 
     def receipt(self, digest=HEX, verdict="pass", age_hours=1, revision=REV, name="r.receipt"):
@@ -250,10 +259,10 @@ class Receipt(Base):
         self.assertIn("time: 2026-11-11T12:00:00Z", text)
         self.assertIn("revision: " + REV, text)
         self.assertEqual(len(re.findall(r"^item \S+ pass$", text, re.M)), 6)
-        self.assertEqual([l for l in self.log("launcher") if l.startswith("stop ")].__len__(), 1)
-        create = [l for l in self.log("launcher") if l.startswith("create ")][0]
-        self.assertIn("--image " + SRC, create)
-        self.assertIn("--no-commit", create)
+        self.assertEqual([l for l in self.log("launcher") if l.startswith("retire ") and l.endswith(" --close")].__len__(), 1)
+        launch = [l for l in self.log("launcher") if l.startswith("launch ")][0]
+        self.assertIn(" --cloud ", launch)
+        self.assertIn("--role tester", launch)
         self.assertTrue(any("rm -f" in l and "proof-results" in l for l in self.log("kubectl")), self.log("kubectl"))
         self.assertEqual(Path(self.settings).read_text().count("CW_CLOUD_IMAGE=reg.example"), 1)   # the settings file is not touched
 
@@ -261,7 +270,7 @@ class Receipt(Base):
         Path(self.fake, "results").write_text("pg-env pass\n")
         proof, (verdict, line) = self.prove()
         self.assertEqual(verdict, "fail")
-        self.assertEqual(len([l for l in self.log("launcher") if l.startswith("stop ")]), 1)
+        self.assertEqual(len([l for l in self.log("launcher") if l.startswith("retire ")]), 1)
         self.assertIn("failed: hook", line)
         Path(self.fake, "gitexit").write_text("0")
         # the receipt just written is the one the gate reads: a fail receipt for this digest is refused (it is dated 2026, so it is also old)
@@ -275,7 +284,7 @@ class Receipt(Base):
         with self.assertRaises(proof.Refused):
             proof.prove(args, dict(self.env), now=lambda: NOW, sleep=lambda s: None)
         self.assertEqual(os.listdir(self.rdir), [])
-        self.assertEqual(len([l for l in self.log("launcher") if l.startswith("stop ")]), 1)
+        self.assertEqual(len([l for l in self.log("launcher") if l.startswith("retire ")]), 1)
 
     def test_a_partly_written_results_file_is_read_again(self):
         Path(self.fake, "results").write_text("pg-env pass\n")   # never completes: the deadline ends it and the verdict is fail, with the missing items named
