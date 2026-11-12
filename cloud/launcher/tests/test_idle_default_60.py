@@ -38,8 +38,28 @@ class IdleDefault(base.Base):
     def test_an_orchestrator_launch_keeps_the_older_default(self):
         self.assertEqual(self.idle_of("orch1", "--agent", "orchestrator", "--boss", "boss1"), "1800")
 
-    def test_the_hard_default_is_unchanged(self):
-        self.assertEqual(self.parse_default("hard"), "2h")
+    def hard_seconds_of(self, worker, *extra):
+        self.write_state({"pods": {}, **json.loads(json.dumps(self.hub))})
+        with redirect_stdout(io.StringIO()):
+            code = cw.main(["create", worker, *REPO, *extra], self.env, self.clock, lambda s: self.clock.advance(seconds=s))
+        self.assertEqual(code, 0)
+        ann = self.pod(worker)["metadata"]["annotations"]
+        return int((cw.parse_iso(ann["cw/hard-deadline"]) - cw.parse_iso(ann["cw/started"])).total_seconds())
+
+    def test_the_hard_default_is_unchanged(self):  # a launch without --shape L keeps 2h
+        self.assertEqual(self.hard_seconds_of("coder7"), 7200)
+        self.assertEqual(self.hard_seconds_of("coder8", "--shape", "M"), 7200)
+
+    def test_the_L_shape_default_hard_is_8h(self):  # the one per-shape exception
+        self.assertEqual(self.hard_seconds_of("coder9", "--shape", "L"), 28800)
+
+    def test_the_hard_default_of_a_shape_that_is_not_L_is_2h(self):
+        for shape in ("XS", "S", "M", "O"):
+            self.assertEqual(cw.SHAPE_DEFAULT_HARD.get(shape, cw.DEFAULT_HARD), "2h", shape)
+
+    def test_the_L_shape_is_the_one_exception_with_the_maximum_hard_limit(self):
+        self.assertEqual(cw.SHAPE_DEFAULT_HARD, {"L": cw.DEFAULT_MAX_HARD})
+        self.assertEqual(cw.DEFAULT_MAX_HARD, "8h")
 
     def parse_default(self, name):
         return cw.build_parser().parse_args(["create", "w", *REPO]).__dict__[name]
