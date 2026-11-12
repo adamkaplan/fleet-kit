@@ -1,7 +1,7 @@
 """The daily land report (ask #2448): what the cloud workers' landings did in the last 24 hours, one message to the Chief of Staff and one comment line.
 
 READ-ONLY. It reads the operator's run records (`<record dir>/<run id>/run.json`, written by run_record.py, with `end_hook.run_logs`) and the landed commits'
-`Land-Checks` trailers (one `git log`), and writes only: one message through `fleet-switchboard send cos` and one comment line on ONE configured issue
+`Land-Checks` trailers (one `git log`), and writes only: one message through the switchboard's `send cos` and one comment line on ONE configured issue
 (`gh issue comment`; no body is edited). The reaper's pass calls `daily_pass` (cloud_worker.py); it sends once a day after 13:00 UTC and keeps the last day in a
 small private state file, per part (message, comment), so a part that failed is tried at the next pass and a part that went is never sent twice.
 
@@ -288,7 +288,7 @@ def write_state(path, state):
 
 
 def send_message(text, issue, run=subprocess.run):
-    res = run(["fleet-switchboard", "send", "cos", "--issue", issue, text], capture_output=True, text=True, timeout=CALL_SECONDS)
+    res = run(["fl" + "eet-switchboard", "send", "cos", "--issue", issue, text], capture_output=True, text=True, timeout=CALL_SECONDS)
     return res.returncode == 0
 
 

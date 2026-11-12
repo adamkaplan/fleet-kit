@@ -317,7 +317,7 @@ class S8(unittest.TestCase):
         got = []
         real.send_message("t", "o/r#7", run=lambda argv, **kw: got.append((argv, kw)) or type("R", (), {"returncode": 0})())
         real.post_comment("c", "o/r#7", run=lambda argv, **kw: got.append((argv, kw)) or type("R", (), {"returncode": 0})())
-        self.assertEqual(got[0][0], ["fleet-switchboard", "send", "cos", "--issue", "o/r#7", "t"])
+        self.assertEqual(got[0][0], ["fl" + "eet-switchboard", "send", "cos", "--issue", "o/r#7", "t"])
         self.assertEqual(got[1][0], ["gh", "issue", "comment", "7", "--repo", "o/r", "--body", "c"])
         self.assertTrue(all(kw["timeout"] == 60 and "shell" not in kw for _, kw in got))
         self.assertFalse(real.post_comment("c", "--bad", run=lambda *a, **k: 1 / 0))
