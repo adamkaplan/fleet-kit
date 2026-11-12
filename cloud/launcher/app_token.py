@@ -234,7 +234,7 @@ def vault(env_name, secret):
         try:
             return secret_files.read(directory, secret, MAX_BYTES, trim=secret != "cw-app-key")
         except secret_files.SecretError as err:
-            die(err.line, err.kind)
+            die(err.line, "vault other")  # the one kind a SecretError carries
     if cmd:
         argv = ["sh", "-c", cmd]
     else:
@@ -432,7 +432,7 @@ def caller_token():
     except Exception:  # a failed login of any kind is a passing failure, never a value
         tok = ""
     if not tok or re.search(r"\s", tok):
-        die("the caller's cluster token could not be made", transient=True)
+        die("the caller's cluster token could not be made", "other", transient=True)
     return tok
 
 
@@ -447,7 +447,7 @@ def mint_from_service(target, role, keep=False):
         server = urllib.parse.urlparse((os.environ.get("CW_CLOUD_SERVER") or "").strip())
         exact = "https://%s/api/v1/namespaces/%s/services/token-mint:8080/proxy/mint" % (server.netloc, os.environ.get("CW_CLOUD_NAMESPACE") or "cw")
         if not server.netloc or url != exact:
-            die("CW_TOKEN_SERVICE_URL must be exactly the cluster's service proxy of the token service")
+            die("CW_TOKEN_SERVICE_URL must be exactly the cluster's service proxy of the token service", "other")
     repo = target.split("/", 1)[1]
     bearer = caller_token()
     req = urllib.request.Request(url, data=json.dumps({"repo": target, "role": role}).encode(), method="POST",
@@ -463,33 +463,33 @@ def mint_from_service(target, role, keep=False):
         with urllib.request.build_opener(*handlers).open(req, timeout=60) as r:
             raw = r.read(MAX_BYTES + 1)
         if len(raw) > MAX_BYTES:
-            die("the token service's answer is larger than %d bytes" % MAX_BYTES)
+            die("the token service's answer is larger than %d bytes" % MAX_BYTES, "GitHub error")
         ans = json.loads(raw)
     except urllib.error.HTTPError as e:
         passing = e.code == 429 or 500 <= e.code <= 599
-        die("the token service refused the request (HTTP %d)" % e.code, transient=passing)
+        die("the token service refused the request (HTTP %d)" % e.code, "GitHub error", transient=passing)
     except ValueError:  # status 200 with a body that is not JSON: not retried
-        die("the token service's answer was not JSON")
+        die("the token service's answer was not JSON", "GitHub error")
     except Exception:  # a timeout, a refused connection, a failed TLS check: the service could not be asked
-        die("the token service could not be asked", transient=True)
+        die("the token service could not be asked", "GitHub error", transient=True)
     token = ans.get("token") if isinstance(ans, dict) else None
     repos = ans.get("repositories") if isinstance(ans, dict) else None
     if not isinstance(token, str) or not token:
-        die("the answer has no token")
+        die("the answer has no token", "GitHub error")
     if not re.fullmatch(r"[A-Za-z0-9_.-]+", token):
-        die("refusing: the token holds a character that a token does not")
+        die("refusing: the token holds a character that a token does not", "GitHub error")
     MINTED.append(token)
     if not isinstance(repos, list) or len(repos) != 1 or not isinstance(repos[0], dict) or repos[0].get("name") != repo:
-        die("refusing: the token does not cover exactly the one target repository")
+        die("refusing: the token does not cover exactly the one target repository", "permissions")
     full = repos[0].get("full_name")
     if not (isinstance(full, str) and full.lower() == target.lower()):
-        die("refusing: the token does not cover exactly the one target repository")
+        die("refusing: the token does not cover exactly the one target repository", "permissions")
     try:
         exp = dt.datetime.strptime(ans["expires_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc).timestamp()
     except (KeyError, ValueError, TypeError):
-        die("the answer has no readable expiry")
+        die("the answer has no readable expiry", "GitHub error")
     if exp - dt.datetime.now(dt.timezone.utc).timestamp() > MAX_TOKEN_SECONDS:
-        die("refusing: the token lives longer than 61 minutes")
+        die("refusing: the token lives longer than 61 minutes", "GitHub error")
     check_permissions(ans.get("permissions"), role)
     if not keep:
         MINTED.clear()
