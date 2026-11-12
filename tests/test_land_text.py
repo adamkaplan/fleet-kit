@@ -135,6 +135,15 @@ class TestLandText(unittest.TestCase):
                     self.assertNotRegex(line, r"acme-org/\*`?\s*by default|default `\[\"acme-org", path)
         self.assertEqual(fpn.sb.uses_spire_land({}, "acme-org/widget"), False)   # the code's default: no repository
 
+    def test_a_land_launch_carries_the_rebut_rule_once_and_another_launch_none(self):
+        land = "\n".join(self.lines("acme-org/widget", ON))
+        self.assertEqual(land.count("--rebut 'ROLE=Pn: why'"), 1)
+        self.assertIn("list every rebuttal (finding, principle, accepted or not) in your final report", land)
+        self.assertEqual(land.count("--rebut"), 1)
+        self.assertIn("the same finding rejected twice: stop and report it to the orchestrator", land)
+        self.assertNotIn("--rebut", pod.payload(BRIEF, repo="acme/other"))
+        self.assertNotIn("--rebut", pod.payload(BRIEF, repo="acme-org/widget", config={"land_repos": []}))
+
     def test_the_skills_and_the_brief_header_carry_the_rule(self):
         line = fpn.sb.LAND_SETUP_LINE
         self.assertIn("This repository lands with `spire land`", line)
