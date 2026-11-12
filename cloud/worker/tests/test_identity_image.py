@@ -18,7 +18,7 @@ DOCKERFILE = os.path.join(WORKER, "Dockerfile")
 README = os.path.join(CLOUD, "README.md")
 PREVIOUS = {"ca-certificates", "curl", "gnupg", "git", "openssh-client", "python3", "python3-pip", "python3-venv", "sudo",
             "iptables", "jq", "procps", "docker-ce", "docker-ce-cli", "containerd.io", "docker-compose-plugin", "docker-buildx-plugin", "xz-utils"}
-NAME, EMAIL = "cloud-worker", "cloud-worker@users.noreply.github.com"
+NAME, EMAIL = "Example Bot", "1+example-bot@users.noreply.example.invalid"   # dummy values: the build arguments are passed at build time
 IDFILE = "/etc/cw-default-identity"
 
 
@@ -77,10 +77,10 @@ class Identity(unittest.TestCase):
     def test_u3_the_scan_stage_still_exists(self):
         self.assertEqual(len(re.findall(r"^FROM worker AS scan", read(DOCKERFILE), re.M)), 1)
 
-    def render_system_file(self, dockerfile_text=None):
-        """Run the Dockerfile's identity RUN line (path swapped for a temp file) with the ARG defaults; return the file text."""
+    def render_system_file(self, dockerfile_text=None, args=None):
+        """Run the Dockerfile's identity RUN line (path swapped for a temp file) with the build arguments (the dummy pair unless given); return the file text."""
         text = (dockerfile_text if dockerfile_text is not None else read(DOCKERFILE)).replace("\\\n", " ")
-        args = dict(re.findall(r"^ARG (CW_DEFAULT_IDENT_\w+)=(\S+)$", text, re.M))
+        args = dict(args or {"CW_DEFAULT_IDENT_NAME": NAME, "CW_DEFAULT_IDENT_EMAIL": EMAIL})
         runs = [l for l in text.splitlines() if l.startswith("RUN ") and IDFILE in l]
         self.assertEqual(len(runs), 1)
         with tempfile.TemporaryDirectory() as d:
@@ -104,9 +104,8 @@ class Identity(unittest.TestCase):
 
     def test_s2_the_dockerfile_writes_the_identity_file_with_the_one_constant(self):
         args = self.check_identity_file(read(DOCKERFILE))
-        self.assertEqual(args.get("CW_DEFAULT_IDENT_NAME"), NAME)   # the required ARGs carry the one constant; others may be added
-        self.assertEqual(args.get("CW_DEFAULT_IDENT_EMAIL"), EMAIL)
-        self.assertEqual(len(re.findall(r"^ARG CW_DEFAULT_IDENT_NAME=", read(DOCKERFILE), re.M)), 1)   # the pair is declared once
+        self.assertEqual(args, {"CW_DEFAULT_IDENT_NAME": NAME, "CW_DEFAULT_IDENT_EMAIL": EMAIL})   # the pair is passed at build time
+        self.assertEqual(len(re.findall(r"^ARG CW_DEFAULT_IDENT_NAME$", read(DOCKERFILE), re.M)), 1)   # the pair is declared once
 
     def test_s5_mutant_dockerfile_writing_the_system_file_again_fails_with_the_anchored_text(self):
         src = read(DOCKERFILE)
@@ -185,9 +184,7 @@ class Identity(unittest.TestCase):
 
     def test_s6_mutant_a_system_file_with_another_pair_is_caught(self):
         src = read(DOCKERFILE)
-        mutated = src.replace("ARG CW_DEFAULT_IDENT_NAME=" + NAME, "ARG CW_DEFAULT_IDENT_NAME=someone-else", 1)
-        self.assertNotEqual(mutated, src)
-        text, args = self.render_system_file(mutated)
+        text, args = self.render_system_file(src, {"CW_DEFAULT_IDENT_NAME": "someone-else", "CW_DEFAULT_IDENT_EMAIL": EMAIL})
         self.assertNotEqual(args, {"CW_DEFAULT_IDENT_NAME": NAME, "CW_DEFAULT_IDENT_EMAIL": EMAIL})
         self.assertNotIn("name = " + NAME + "\n", text)
 

@@ -51,6 +51,8 @@ RESULTS_KEEP = 4000              # characters of the pod's /work/results.txt kep
 RESULTS_READ = 16000             # bytes read to be scrubbed first
 # the worker owns the file, and `tail` follows a link: refuse anything but a regular file BEFORE reading ($1 the path, $2 the byte window; as cloud_worker.REPORT_READ)
 RESULTS_SCRIPT = 'if [ -L "$1" ] || { [ -e "$1" ] && [ ! -f "$1" ]; }; then echo "not a regular file" >&2; exit 3; fi; tail -c "$2" "$1"'
+NOTES_LINES = 20                 # ask #2426: the last lines of the pod's /work/.pod-notes.log kept in run.json as `pod_notes`
+NOTES_READ = 16000               # bytes read to be scrubbed first
 TIMED_OUT = "record timed out"
 
 
@@ -354,6 +356,23 @@ class Recorder:
             return None
         return {"done": bool(lines) and lines[-1] == "STATUS: done", "text": text[-RESULTS_KEEP:]}
 
+    def notes_file(self, pod):
+        """The scrubbed last NOTES_LINES lines of the pod's /work/.pod-notes.log (ask #2426: one line per push to the default branch, force-push, merge, issue or ref write), or None when it has
+        none, is not a regular file or cannot be read. Read and scrubbed like `results_file`. Never raises an Exception."""
+        try:
+            out = self._exec(pod, "sh", "-c", RESULTS_SCRIPT, "sh", "/work/.pod-notes.log", str(NOTES_READ))
+        except Exception:   # a timeout too
+            return None
+        if not isinstance(out, str) or not out.strip():
+            return None
+        try:
+            mark = next(m for m in ("[NL]", "[N1]", "[N2]", "[N3]") if m not in out)
+            marked = out.replace("\n", mark)
+            text = self.kube.scrub(marked, limit=2 * len(marked) + 100).replace(mark, "\n")
+        except Exception:
+            return None
+        return "\n".join(text.splitlines()[-NOTES_LINES:]) or None
+
     def record(self, worker, pod, reason, repo="", started="", root=None, persistent=False):
         """Save the run's record. Returns the record directory ('' when none could be made). Never raises an Exception."""
         run_id = "%s-%s-%s" % (worker, time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()), secrets.token_hex(3))
@@ -379,6 +398,9 @@ class Recorder:
                 found = self.results_file(pod) if getattr(self, "secrets_ok", False) else None   # ask #2392: the pod's /work/results.txt, kept for the end notice and `read` of an ended pod
                 if found is not None:
                     info["results"] = found
+                notes = self.notes_file(pod) if getattr(self, "secrets_ok", False) else None   # ask #2426: the pod's notes file, for the final message
+                if notes is not None:
+                    info["pod_notes"] = notes
         except Exception as e:   # includes RecursionError and MemoryError; an interrupt (BaseException) passes through
             try:
                 info["reason"] = "the record could not be written: %s" % self.kube.scrub(e, limit=200)

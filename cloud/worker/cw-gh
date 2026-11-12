@@ -21,6 +21,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -53,6 +54,112 @@ class Fail(Exception):
     def __init__(self, msg, code=1):
         super().__init__(str(msg).replace("\n", "?"))   # one line, always
         self.code = code
+
+
+# Ask #2426: LOG ONLY. A merge of a pull request, or a write to an issue or a ref through `api`, is recorded as one line in the pod's notes file, in the
+# shape the pod's pre-push hook writes: "<UTC time> <kind> <remote> <ref> <short sha>" (remote `github`, no sha: `-`). Nothing is refused because of the record,
+# a failing write is silent, and the call goes on exactly as before (a verb this client does not implement is still answered as before).
+NOTES_LOG = os.environ.get("CW_NOTES_LOG") or "/work/.pod-notes.log"
+NOTES_MAX_BYTES = 65536   # past this the file is cut to its last NOTES_KEEP_LINES lines
+NOTES_KEEP_LINES = 200
+WRITE_FLAGS = ("-f", "-F", "--field", "--raw-field", "--input")
+
+
+def note_kind(argv):
+    """(kind, ref) of a call that is to be recorded, or None. pr-merge: `pr merge [N]`; api-merge: a non-GET call to .../pulls/N/merge; ref-write: a non-GET call
+    to .../git/refs...; issue-write: a non-GET call to .../issues/... (a comment, a label, a state). Only the verb and the path are read, never a body. The forms read:
+    `-X V`, `-XV`, a short-flag cluster ending in X (`-iX V`), `--method V`, `--method=V`, `-f/-F/--field/--raw-field/--input` with a value or `=value` (a body turns GET into POST,
+    as in the real gh), and an endpoint with a scheme and host in front (the host is dropped; the call itself is answered as before)."""
+    args = list(argv)
+    if not args:
+        return None
+    if args[0] != "api":
+        rest, skip = [], False
+        for a in args[1:]:   # a leading -R/--repo and its value come off, as main does; `--repo=V` and `-RV` too
+            if skip:
+                skip = False
+            elif a in ("-R", "--repo") and not rest:
+                skip = True
+            elif not rest and (a.startswith("--repo=") or (a.startswith("-R") and len(a) > 2)):
+                continue
+            else:
+                rest.append(a)
+        if args[0] == "pr" and rest[:1] == ["merge"]:
+            num = next((a for a in rest[1:] if a.isdigit()), "")
+            return "pr-merge", "pull/" + num if num else "pull"
+        return None
+    method, path, i = "", "", 1
+    value_flags = ("-R", "--repo", "--jq", "-q", "-H", "--header", "--hostname", "--cache", "-t", "--template", "-p", "--preview")
+    while i < len(args):
+        a = args[i]
+        nxt = args[i + 1] if i + 1 < len(args) else None
+        if a in ("-X", "--method") and nxt is not None:
+            method, i = nxt.upper(), i + 1
+        elif a.startswith("--method="):
+            method = a.split("=", 1)[1].upper()
+        elif re.fullmatch(r"-[A-Za-z]*X.+", a) and not a.startswith("--"):
+            method = a.split("X", 1)[1].upper()   # -XPUT
+        elif re.fullmatch(r"-[A-Za-z]+X", a) and nxt is not None:
+            method, i = nxt.upper(), i + 1       # -iX PUT
+        elif a in WRITE_FLAGS and nxt is not None:
+            method = method or "POST"
+            i += 1
+        elif a.startswith(("--field=", "--raw-field=", "--input=")) or re.fullmatch(r"-[fF].+", a):
+            method = method or "POST"
+        elif a in value_flags and nxt is not None:
+            i += 1
+        elif not a.startswith("-") and not path:
+            path = a
+        i += 1
+    if not path or method in ("", "GET", "HEAD"):
+        return None
+    path = re.sub(r"^[A-Za-z][A-Za-z0-9+.-]*://[^/]*", "", path)
+    p = "/" + path.split("?")[0].strip("/")
+    if re.fullmatch(r"/repos/[^/]+/[^/]+/pulls/\d+/merge", p, re.I):
+        return "api-merge", p[1:]
+    if re.match(r"/repos/[^/]+/[^/]+/git/refs(/|$)", p, re.I):
+        return "ref-write", p[1:]
+    if re.match(r"/repos/[^/]+/[^/]+/issues(/|$)", p, re.I):
+        return "issue-write", p[1:]
+    return None
+
+
+def _notes_fd(extra=0):
+    """The notes file opened for append by no link and without blocking, only when it is a regular file (a FIFO would block, a link would be followed); else None."""
+    fd = os.open(NOTES_LOG, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0) | extra, 0o644)
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        os.close(fd)
+        return None
+    return fd
+
+
+def note_action(argv):
+    """Append one line to NOTES_LOG for a call `note_kind` names. Never raises, never refuses, never blocks (a link or a FIFO at the path records nothing)."""
+    try:
+        found = note_kind(argv)
+        if found is None:
+            return
+        ref = re.sub(r"[^A-Za-z0-9._/-]", "?", found[1])[:100]
+        line = "%s %s github %s -\n" % (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), found[0], ref)
+        fd = _notes_fd()
+        if fd is None:
+            return
+        try:
+            os.write(fd, line.encode("ascii", "replace"))
+            size = os.fstat(fd).st_size
+        finally:
+            os.close(fd)
+        if size > NOTES_MAX_BYTES:
+            with open(NOTES_LOG, "rb") as f:
+                keep = f.read().splitlines(True)[-NOTES_KEEP_LINES:]
+            fd = _notes_fd(os.O_TRUNC)
+            if fd is not None:
+                try:
+                    os.write(fd, b"".join(keep))
+                finally:
+                    os.close(fd)
+    except Exception:
+        pass
 
 
 def api_base():
@@ -598,6 +705,7 @@ VERBS = {
 
 
 def main(argv):
+    note_action(argv)   # ask #2426: log only
     args = list(argv)
     group = args.pop(0) if args else ""
     verb = ""

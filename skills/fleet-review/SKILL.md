@@ -58,6 +58,6 @@ A reviewer's result reaches GitHub as a review through `fleet-switchboard review
 
 A test never pins an exact set or size (an argument list, environment names, settings, flags, file sizes, line or word counts, or any set a normal change grows): it checks behaviour and real safety properties (no secret in an output, no untrusted interpolation, a required item present). A reviewer flags such a test and never asks for one.
 
-## janus-infra repositories (spire land)
+## acme-org repositories (spire land)
 
 When your setup text says "This repository lands with `spire land`" do not run the reviewer subagents: done = commit, run it DETACHED: `nohup sh -c '.spire/tool/bin/spire land > /work/land.log 2>&1; r=$?; { echo; echo "exit $r"; } >> /work/land.log' > /dev/null 2>&1 &`, then poll with short calls (`sleep 120; tail -n 20 /work/land.log`, each under 5 minutes) and report `fleet-switchboard report working "land step <where it is>"` about every 10 minutes; never one foreground `spire land` call (it is moved to a background shell and your turn ends unwoken). The run is over when the log's last line is `exit <code>`: report `landed <sha>` or the exit code and what stopped it; exit 22 = held for a person: stop and say so. The council is the review there, and no PR body or explainer is written. Without that line, the rules of this skill stay.

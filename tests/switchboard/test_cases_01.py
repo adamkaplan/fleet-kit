@@ -680,6 +680,19 @@ class TestGitShim(Base):
          "the image's default identity (#2361): sets user.name in the global file only when it is unset; a value already there is kept"),
         ("cloud/worker/entrypoint.sh", '    if [ -n "$id_email" ] && [ -z "$(git con' + 'fig --' + _G + ' --get user.email 2>/dev/null)" ]; then git con' + 'fig --' + _G + ' user.email "$id_email"; fi',
          "the image's default identity (#2361): sets user.email in the global file only when it is unset; a value already there is kept"),
+        # #2371/#2372 (the pre-push hook of the image): the entrypoint points the global core.hooksPath at the image's hook directory: exactly this one added line
+        # of that one file, one key and one value; any other key or value stays refused. The hook's own test (cloud/worker/tests/test_pre_push_hook.py) adds
+        # exactly these four lines: two that remove a rewrite rule from its scratch repository's LOCAL file (no scope flag), and two that read the entrypoint's text.
+        ("cloud/worker/entrypoint.sh", "  git con" + "fig --" + _G + " core.hooksPath /usr/local/lib/cw-hooks   # the pre-push hook of the image (a convenience, not the guard)",
+         "the image's pre-push hook directory (#2371): one key, one fixed value; any other key or value stays refused"),
+        ("cloud/worker/tests/test_pre_push_hook.py", " " * 8 + 'self.git("con' + 'fig", "--unset-all", "url.%s.insteadOf" % self.bare, cwd=self.scratch)',
+         "removes a rewrite rule from the scratch repository's own file (no global scope): writes no global git configuration (#2371)"),
+        ("cloud/worker/tests/test_pre_push_hook.py", " " * 8 + 'self.git("con' + 'fig", "--unset-all", "url.%s.insteadOf" % self.sshurl, cwd=self.scratch)',
+         "removes a rewrite rule from the scratch repository's own file (no global scope): writes no global git configuration (#2371)"),
+        ("cloud/worker/tests/test_pre_push_hook.py", " " * 8 + 'i = [n for n, l in enumerate(e) if "git con' + "fig --" + _G + ' credential.helper" in l]',
+         "reads the entrypoint's text for the helper line (#2371): writes no git configuration"),
+        ("cloud/worker/tests/test_pre_push_hook.py", " " * 8 + 'self.assertTrue(e[i[0] + 1].startswith("  git con' + "fig --" + _G + ' core.hooksPath /usr/local/lib/cw-hooks"))',
+         "reads the entrypoint's text for the hooksPath line (#2371): writes no git configuration"),
     )
 
     @classmethod
@@ -707,6 +720,19 @@ class TestGitShim(Base):
         self.assertEqual(self.unallowed_config_write_hits(self.diff_adding(f, text)), [])
         self.assertEqual(len(self.unallowed_config_write_hits(self.diff_adding("tests/switchboard/test_other.py", text))), 1)
         self.assertEqual(len(self.unallowed_config_write_hits(self.diff_adding(f, text + " "))), 1)
+
+    def test_s7_u1_the_hooks_path_row_allows_only_its_one_line_of_the_entrypoint(self):
+        f, text = "cloud/worker/entrypoint.sh", "  git con" + "fig --" + self._G + " core.hooksPath /usr/local/lib/cw-hooks   # the pre-push hook of the image (a convenience, not the guard)"
+        self.assertEqual(self.unallowed_config_write_hits(self.diff_adding(f, text)), [])
+        for name, path, line in (
+            ("another value", f, text.replace("/usr/local/lib/cw-hooks", "/tmp/x")),
+            ("another key", f, text.replace("core.hooksPath", "core.sshCommand")),
+            ("another key with the same value", f, text.replace("core.hooksPath /usr/local/lib/cw-hooks", "credential.helper /tmp/x")),
+            ("another file", "cloud/worker/other.sh", text),
+            ("the system scope", f, text.replace("--" + self._G, "--" + self._S)),
+        ):
+            with self.subTest(name):
+                self.assertEqual(len(self.unallowed_config_write_hits(self.diff_adding(path, line))), 1)
 
     def test_s7_u1_allow_table_widening_mutants_are_caught(self):
         f, text, _ = self.CONFIG_WRITE_ALLOWED[0]

@@ -125,8 +125,8 @@ class WipRoot(unittest.TestCase):
         s.write("b.txt", "bb\n")
         self.assertTrue(s.save(self.mod)["saved"])
         second = s.wip()
-        self.assertEqual((s.count_pushes(), sorted(s.parents(second))), (2, sorted([first, head])))
-        self.assertEqual(len(s.parents(second)), 2)
+        self.assertEqual((s.count_pushes(), sorted(s.parents(second))), (2, [head]))
+        self.assertEqual(len(s.parents(second)), 1)
 
     def test_s3_an_earlier_save_with_an_unborn_head_later_is_a_parent_when_head_is_unreadable(self):
         s = self.s
@@ -178,10 +178,10 @@ class WipRoot(unittest.TestCase):
             rest = c[c.index("commit-tree") + 2:]
             ps = [rest[i + 1] for i, x in enumerate(rest) if x == "-p" and i + 1 < len(rest)]
             self.assertTrue(ps, "%s: %r" % (ANCHOR, c))
-        # the end hook's step: both parents, always
+        # the end hook's step: HEAD as the one parent
         ff = trees[-1]
-        self.assertEqual(ff.count("-p"), 2)
-        self.assertEqual(len(s.parents(s.wip())), 2)
+        self.assertEqual(ff.count("-p"), 1)
+        self.assertEqual(len(s.parents(s.wip())), 1)
         for rev in git(s.remote, "rev-list", "--grep=^WIP:", "refs/heads/coder7/wip").split():   # the saves only (the pod's own first commit is its root)
             self.assertTrue(s.parents(rev), ANCHOR)
 
