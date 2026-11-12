@@ -29,4 +29,3 @@ cloud/launcher/tests/test_cloud_status_summary.py
 cloud/launcher/tests/test_cloud_model_served.py
 cloud/launcher/tests/test_cloud_settings.py
 cloud/launcher/tests/test_cloud_tests_write_tmp.py
-cloud/launcher/tests/test_app_token_route.py

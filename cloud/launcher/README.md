@@ -245,7 +245,7 @@ A change that adds a chain entry adds its name to this line; the next measuremen
 
 Lane sums after ask #1695 (31 Oct 2026, computed from the macOS seconds above, not yet measured on CI): lane 0 785 s, lane 1 822 s, lane 2 773 s (from 696, 665, 596), after `test_cloud_split.py`, `test_m_cap.py`, `test_mint_roles.py` and `test_git_token_retry.py` moved from serial to the end of the parallel list (positions 22, 23, 24, 25 = lanes 0, 1, 2, 0); the Ubuntu seconds of those four are one run on an idle pod, not CI.
 
-Rebalance (ask #2387): eight serial entries moved to the end of the parallel list (positions 25 to 32, lanes 0,1,2,0,1,2,0,1): `test_failed_pod_record.py`, `test_fixture_root.py`, `test_brief_header.py`, `test_cloud_status_summary.py`, `test_cloud_model_served.py`, `test_cloud_settings.py`, `test_cloud_tests_write_tmp.py`, `test_app_token_route.py`. Each uses its own temporary directory and binds no fixed port. `test_no_open_files.py` (335 s in a pod) stays serial: it re-runs 27 chain files, among them ones that list the shared temp directory, so it is not shown safe beside other entries.
+Rebalance (ask #2387): seven serial entries moved to the end of the parallel list (positions 25 to 31, lanes 0,1,2,0,1,2,0): `test_failed_pod_record.py`, `test_fixture_root.py`, `test_brief_header.py`, `test_cloud_status_summary.py`, `test_cloud_model_served.py`, `test_cloud_settings.py`, `test_cloud_tests_write_tmp.py`. `test_app_token_route.py` was tried and stays serial: its test_s17 checks the shared default temp dir and failed beside other entries. Each uses its own temporary directory and binds no fixed port. `test_no_open_files.py` (335 s in a pod) stays serial: it re-runs 27 chain files, among them ones that list the shared temp directory, so it is not shown safe beside other entries.
 
 ### macOS (per entry)
 
@@ -329,7 +329,7 @@ Rebalance (ask #2387): eight serial entries moved to the end of the parallel lis
 | `cloud/launcher/tests/test_brief_header.py` | 62 | parallel |
 | `cloud/launcher/tests/test_cloud_model_served.py` | 20 | parallel |
 | `cloud/launcher/tests/test_cloud_tests_write_tmp.py` | 16 | parallel |
-| `cloud/launcher/tests/test_app_token_route.py` | 15 | parallel |
+| `cloud/launcher/tests/test_app_token_route.py` | 15 | serial |
 
 ### Ubuntu (per entry)
 
@@ -413,7 +413,7 @@ Rebalance (ask #2387): eight serial entries moved to the end of the parallel lis
 | `cloud/launcher/tests/test_brief_header.py` | 62 | parallel |
 | `cloud/launcher/tests/test_cloud_model_served.py` | 20 | parallel |
 | `cloud/launcher/tests/test_cloud_tests_write_tmp.py` | 16 | parallel |
-| `cloud/launcher/tests/test_app_token_route.py` | 15 | parallel |
+| `cloud/launcher/tests/test_app_token_route.py` | 15 | serial |
 
 ## The vault block (ask #1427)
 
