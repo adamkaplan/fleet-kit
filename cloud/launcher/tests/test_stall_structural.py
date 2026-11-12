@@ -26,6 +26,7 @@ from test_stall_watch import World, conditions  # noqa: E402
 ACTIVITY = os.path.join(ROOT, "cloud", "worker", "activity.py")
 with open(os.path.join(HERE, "fixtures", "server_shapes", "turn.json")) as _f:
     FIX = json.load(_f)
+FIX["assistant_bogus_finish"] = dict(FIX["assistant_stop"], finish="finished-ok")   # off the server's enum
 FINISHED = {"turn": "idle", "outcome": "succeeded", "finish": "stop"}
 
 
@@ -111,6 +112,7 @@ def s2_wrong(script=ACTIVITY):
     finally:
         s.close()
     garbled = [dict(idle=None), dict(idle_body={"id": "m", "time": {"created": FIX["idle_succeeded"]["time"]["created"]}, "type": "idle", "outcome": "finished"}), dict(idle_body={"type": "idle"}),
+               dict(assistant="assistant_bogus_finish"),   # an off-schema finish reason
                dict(idle_body={"id": "m", "time": {"created": 1}, "type": "idle", "outcome": "succeeded"}),   # an assistant message newer than the idle one: a turn began after it
                dict(assistant="assistant_in_flight", idle_body={"id": "m", "time": {"created": 1}, "type": "idle", "outcome": "bogus"})]
     for kw in garbled:
@@ -161,7 +163,7 @@ class Structural(unittest.TestCase):
 
     def test_s2_the_probe_reads_the_same_turn_as_the_helper(self):
         for kw in (dict(running=True), dict(), dict(idle="idle_failed"), dict(idle=None), dict(idle_body={"id": "msg_x", "time": {"created": 1}, "type": "idle", "outcome": "succeeded"}),
-                   dict(idle_body={"id": "msg_x", "time": {"created": FIX["idle_succeeded"]["time"]["created"]}, "type": "idle", "outcome": "bogus"}), dict(assistant="assistant_in_flight")):
+                   dict(idle_body={"id": "msg_x", "time": {"created": FIX["idle_succeeded"]["time"]["created"]}, "type": "idle", "outcome": "bogus"}), dict(assistant="assistant_in_flight"), dict(assistant="assistant_bogus_finish")):
             s = Server(**kw)
             try:
                 self.assertEqual(probe_turn(s), helper_turn(s), kw)
@@ -276,6 +278,8 @@ class RecordAndNotice(unittest.TestCase):
         self.assertFalse(said({"results": {"done": True, "text": "STATUS: done"}}), "the text line decides nothing")
         self.assertFalse(said({"turn": dict(FINISHED, outcome="failed"), "results": {"done": True}}))
         self.assertFalse(said({"turn": dict(FINISHED, turn="running")}))
+        for finish in ("error", "length", "tool-calls", "content-filter", None):
+            self.assertFalse(said({"turn": dict(FINISHED, finish=finish)}), finish)   # only finish stop is a succeeded turn
         self.assertIn("ended idle after a succeeded turn", cea.message_text("w", "idle limit", "now", "nothing unpushed", "rec", done=True))
         self.assertNotIn("reporting done", cea.message_text("w", "idle limit", "now", "nothing unpushed", "rec", done=True))
 
