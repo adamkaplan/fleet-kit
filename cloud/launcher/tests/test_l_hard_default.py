@@ -45,6 +45,11 @@ class Create(lbase.Base):
         self.assertEqual(code, cw.EXIT_REFUSED, err)
         self.assertIn("--hard is past --max-hard", err)
 
+    def test_l_default_is_lowered_to_a_smaller_max_hard_but_explicit_hard_is_not(self):
+        self.assertEqual(self.hard_seconds("--shape", "L", "--max-hard", "4h"), 4 * 3600)
+        code, _, err = self.create("--shape", "L", "--max-hard", "4h", "--hard", "5h")
+        self.assertEqual(code, cw.EXIT_REFUSED, err)
+
     def test_a_mutant_that_ignores_the_l_default_is_caught(self):
         good = 'SHAPE_DEFAULT_HARD = {"L": DEFAULT_MAX_HARD}'
         source = open(PATH).read()

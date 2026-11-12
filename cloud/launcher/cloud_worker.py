@@ -3289,7 +3289,10 @@ class Launcher:
             if not NAME_RE.fullmatch(worker):
                 raise CloudError("bad worker name %r" % worker, EXIT_USAGE)
             check_shape(a, self.env)   # resolves an unnamed shape; before any cluster, vault or token call
-            a.hard = a.hard or SHAPE_DEFAULT_HARD.get(a.shape, DEFAULT_HARD)   # an explicit --hard is kept as given
+            if not a.hard:   # only a default is lowered to a smaller --max-hard; an explicit --hard is kept as given
+                a.hard = SHAPE_DEFAULT_HARD.get(a.shape, DEFAULT_HARD)
+                if parse_duration(a.hard) > parse_duration(a.max_hard) and a.shape in SHAPE_DEFAULT_HARD:
+                    a.hard = a.max_hard
             now = self.clock()
             hard = now + dt.timedelta(seconds=parse_duration(a.hard))
             max_hard = now + dt.timedelta(seconds=parse_duration(a.max_hard))
