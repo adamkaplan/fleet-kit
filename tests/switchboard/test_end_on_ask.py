@@ -20,7 +20,7 @@ LIMIT = sb.load_module("cloud_worker").bind(sb.__dict__)._retired().END_LOG_CHAR
 
 
 class TestEndOnAsk(unittest.TestCase):
-    def end(self, code=0, log=None, record_extra=None, post=None, mutant=False, run_json=True, final="my final words", run_logs=None):
+    def end(self, code=0, log=None, record_extra=None, post=None, mutant=False, run_json=True, final="my final words", run_logs=None, notes=None):
         """(the posts made as [(issue, body, repo)], the audit events) of cmd_retire for a fake pod."""
         w = StopWorld(self)
         rec = w.pod(NAME, final)
@@ -28,6 +28,8 @@ class TestEndOnAsk(unittest.TestCase):
             if run_logs is None and log is not None:   # the merged shape (ask #2432): end_hook.run_logs.runs = [{name, exit, woke, log_tail}]
                 run_logs = [{"name": "land.log", "exit": 0, "log_tail": log, "woke": False}]
             shape = {"end_hook": {"run_logs": {"runs": run_logs, "wake_lines": []}}} if isinstance(run_logs, list) else {"end_hook": {"run_logs": run_logs}} if run_logs is not None else {}
+            if notes is not None:   # ask #2426: the launcher keeps the pod's /work/.pod-notes.log as run.json's `pod_notes`
+                shape["pod_notes"] = notes
             (rec / "run.json").write_text(json.dumps(shape))
         cloud = sb.load_module("cloud_worker").bind(sb.__dict__)
         engine, posts, events, cluster = mock.Mock(), [], [], mock.MagicMock()
@@ -222,3 +224,40 @@ class TestLaunchRecordsTheAsk(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestNotesAndRunLogsTogether(unittest.TestCase):
+    """A pod with BOTH a notes tail (#2426/#2435, in the last message) and run logs: each part is posted once."""
+    end = TestEndOnAsk.end   # the same fake pod
+    HEADER = "[last lines of /work/.pod-notes.log, untrusted text]"
+    LOGS = [{"name": "build.log", "exit": 1, "log_tail": "build tail alpha", "woke": False}, {"name": "land.log", "exit": 0, "log_tail": "land tail beta", "woke": False}]
+
+    def parts(self, body):
+        return [body.count(self.HEADER), body.count("build tail alpha"), body.count("land tail beta"), body.count("my final words"), body.count("[run log ")]
+
+    def test_the_notes_header_each_run_log_tail_and_the_final_message_are_posted_once(self):
+        posts, _ = self.end(run_logs=self.LOGS, notes="merged branch x\npushed y")
+        self.assertEqual(len(posts), 1)
+        self.assertEqual(self.parts(posts[0][1]), [1, 1, 1, 1, 2])
+        self.assertIn("merged branch x", posts[0][1])
+
+    def test_control_a_post_that_drops_one_part_fails_the_once_check(self):
+        posts, _ = self.end(run_logs=self.LOGS, notes="merged branch x")
+        body = posts[0][1]
+        self.assertEqual(self.parts(body), [1, 1, 1, 1, 2])
+        for drop in (self.HEADER, "build tail alpha", "land tail beta", "my final words"):
+            self.assertNotEqual(self.parts(body.replace(drop, "")), [1, 1, 1, 1, 2], drop)
+        without, _ = self.end(run_logs=self.LOGS)   # no notes in the record: no notes header
+        self.assertEqual(self.parts(without[0][1])[0], 0)
+
+    def test_a_secret_shaped_string_and_a_backtick_in_the_notes_come_out_cleaned(self):
+        secret = "ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
+        posts, _ = self.end(run_logs=self.LOGS, notes="token " + secret + "\nran `rm -rf x` for @everyone")
+        body = posts[0][1]
+        self.assertNotIn(secret, body)
+        self.assertNotIn("ghp_", body)
+        self.assertNotIn("@", body)
+        self.assertEqual(self.parts(body), [1, 1, 1, 1, 2])
+        notes_part = body.split(self.HEADER, 1)[1]
+        self.assertNotIn("`rm", notes_part)
+        self.assertIn("'rm -rf x'", notes_part)
