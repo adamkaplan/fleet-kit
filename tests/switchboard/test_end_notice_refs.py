@@ -33,7 +33,7 @@ def hook(made, **kw):
     return base
 
 
-class Base(unittest.TestCase):
+class NoticeCase(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, self.tmp, True)
@@ -44,7 +44,7 @@ class Base(unittest.TestCase):
         return MODULE.head_line(self.tmp, "o/r", lambda repo, sha: "passed", PARSE, None, POD, record, tip, heads)
 
 
-class TestEndNoticeNamesWhatThePodPushed(Base):
+class TestEndNoticeNamesWhatThePodPushed(NoticeCase):
     NEW = [("integration", SHA["f"]), ("stall-structural", SHA["a"])]            # the pod's own new branch (the record's branch is the launch branch)
     PRBR = [("cos-issue-comments", SHA["b"]), ("integration", SHA["f"])]         # a pull request's existing branch the pod pushed to
 
@@ -86,7 +86,7 @@ class TestEndNoticeNamesWhatThePodPushed(Base):
         self.assertNotIn("wip", self.line(hook([SHA["a"]]), SHA["a"], "integration", [(POD + "/wip", SHA["a"]), ("feat-x", SHA["a"])]))
 
 
-class TestEndNoticeSaysNothingPushedOnlyWithProof(Base):
+class TestEndNoticeSaysNothingPushedOnlyWithProof(NoticeCase):
     def test_s3_a_pod_that_pushed_nothing_says_nothing_pushed(self):
         self.assertEqual(self.line(hook([]), SHA["f"], "integration", [("integration", SHA["f"])]), "Last head: nothing pushed.")
 
@@ -108,7 +108,7 @@ class TestEndNoticeSaysNothingPushedOnlyWithProof(Base):
         self.assertEqual(self.line(ready, SHA["a"], "integration", None), "Last head: head unknown.")
 
 
-class TestEndNoticeNamesAreBoundedAndSafe(Base):
+class TestEndNoticeNamesAreBoundedAndSafe(NoticeCase):
     def test_s4_the_extra_branches_are_counted(self):
         heads = [("b%d" % n, ("%x" % (n + 1)) * 40) for n in range(7)]
         made = [h for _b, h in heads]
