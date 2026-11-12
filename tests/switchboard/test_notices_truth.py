@@ -76,7 +76,7 @@ class TestEndNoticeLastHead(unittest.TestCase):
         module.run_pass(ns, engine, NOW, world, {"interval": 0, "quiet_minutes": 10}, launcher)
         return engine
 
-    def notice(self, hook, branch=None, head_sha=None, tip=None, results=None, name="pod-q", cause="hard"):
+    def notice(self, hook, branch=None, head_sha=None, tip=None, results=None, name="pod-q", cause="hard", turn=None):
         if not Path(self.audit_path).exists() or '"%s"' % name not in Path(self.audit_path).read_text():
             with open(self.audit_path, "a") as handle:   # the pod's own creation is in view: its pushes (none) are then known
                 handle.write(json.dumps({"event": "cloud.created", "subject": name, "detail": {}}) + "\n")
@@ -85,6 +85,8 @@ class TestEndNoticeLastHead(unittest.TestCase):
         run = {"head_sha": head_sha, "end_hook": hook}
         if results is not None:
             run["results"] = results
+        if turn is not None:
+            run["turn"] = turn   # ask #2443: the server's own turn state, as the launcher's record kept it
         (rec / "run.json").write_text(json.dumps(run))
         (w.cloud / (name + ".json")).write_text(json.dumps({"worker": name, "reports_to": "boss-lane", "repo": "o/r", "branch": branch}))
         w.stop(name, cause, rec)
@@ -145,28 +147,31 @@ class TestEndNoticeLastHead(unittest.TestCase):
         self.assertIn("Last head: nothing pushed.", text)
 
     # ---- (c) a pod that finished and sat idle
-    def test_a_pod_that_wrote_status_done_ended_idle_after_reporting_done(self):
-        text = self.notice(self.NOTHING, results={"done": True, "text": "all done\nSTATUS: done"}, cause="idle")
-        self.assertIn("ended idle after reporting done", text)
+    SUCCEEDED = {"turn": "idle", "outcome": "succeeded", "finish": "stop"}
+
+    def test_a_pod_whose_last_turn_succeeded_ended_idle_after_a_succeeded_turn(self):
+        text = self.notice(self.NOTHING, results={"done": True, "text": "all done\nSTATUS: done"}, cause="idle", turn=self.SUCCEEDED)
+        self.assertIn("ended idle after a succeeded turn", text)
         self.assertNotIn("was ended by the launcher", text)
         self.assertNotIn("all done", text)
         self.assertIn("Last head:", text, "the head line is not hidden by the done wording")
 
     def test_a_pod_without_that_record_keeps_the_wording(self):
-        for results in (None, {"done": False, "text": "working"}, "STATUS: done"):
-            with self.subTest(results=results):
-                text = self.notice(self.NOTHING, results=results, cause="idle", name="pod-s%d" % [None, {"done": False, "text": "working"}, "STATUS: done"].index(results))
+        failed = {"turn": "idle", "outcome": "failed", "finish": "stop"}
+        for n, (results, turn) in enumerate(((None, None), ({"done": False, "text": "working"}, None), ({"done": True, "text": "STATUS: done"}, None), ("STATUS: done", failed), (None, {"turn": "unknown", "outcome": None, "finish": None}))):
+            with self.subTest(results=results, turn=turn):   # the text line STATUS: done alone decides nothing any more
+                text = self.notice(self.NOTHING, results=results, cause="idle", name="pod-s%d" % n, turn=turn)
                 self.assertIn("was ended by the launcher: reason idle limit", text)
-                self.assertNotIn("reporting done", text)
+                self.assertNotIn("a succeeded turn", text)
 
     def test_c_control_the_code_as_it_was_calls_it_a_launcher_end(self):
         old = mutant_text("cloud_end_alert.py", "    if done:   # a pod that finished", "    if False:   # a pod that finished")
         w = StopWorld(self)
         rec = w.pod("pod-t", "x")
-        (rec / "run.json").write_text(json.dumps({"end_hook": self.NOTHING, "results": {"done": True, "text": "STATUS: done"}}))
+        (rec / "run.json").write_text(json.dumps({"end_hook": self.NOTHING, "turn": self.SUCCEEDED, "results": {"done": True, "text": "STATUS: done"}}))
         w.stop("pod-t", "idle", rec)
         old.scan_audit(w.audit, w.state_file, w.cloud, w.reports, lambda to, text: w.sent.append((to, text)), self.parse)
-        self.assertNotIn("ended idle after reporting done", w.to("boss-lane")[0])
+        self.assertNotIn("ended idle after a succeeded turn", w.to("boss-lane")[0])
 
 
 class TestRedCiOwnedByItsAsk(Base):

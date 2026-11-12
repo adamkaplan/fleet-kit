@@ -55,7 +55,8 @@ class Activity(unittest.TestCase):
         p = self.run_script(self.serve())
         self.assertEqual(p.returncode, 0, p.stderr)
         # 1700000500000 ms = 2023-11-14T22:21:40Z; the stub's active list is empty before a prompt
-        self.assertEqual(json.loads(p.stdout), {"busy": False, "last_activity": "2023-11-14T22:21:40Z"})
+        self.assertEqual({k: v for k, v in json.loads(p.stdout).items() if k != "turn"}, {"busy": False, "last_activity": "2023-11-14T22:21:40Z"})   # ask #2443: the `turn` key is asserted on the next line
+        self.assertEqual(json.loads(p.stdout)["turn"], {"turn": "unknown", "outcome": None, "finish": None})   # the stub holds no `idle` message: unknown, never a guess
 
     def test_busy_when_a_session_is_active(self):
         p = self.run_script(self.serve("busy-forever"))
@@ -75,7 +76,7 @@ class Activity(unittest.TestCase):
 
     def test_no_sessions_falls_back_to_pod_start(self):
         p = self.run_script(self.serve("no-sessions"), CW_STARTED="2026-01-02T03:04:05Z")
-        self.assertEqual(json.loads(p.stdout), {"busy": False, "last_activity": "2026-01-02T03:04:05Z"})
+        self.assertEqual(json.loads(p.stdout), {"busy": False, "last_activity": "2026-01-02T03:04:05Z", "turn": {"turn": "unknown", "outcome": None, "finish": None}})   # ask #2443: no session: unknown
 
     def test_unreadable_answer_exits_1_with_no_output(self):
         for port, mode in ((self.serve("bad-list"), "bad-list"), (1, "nothing listening")):

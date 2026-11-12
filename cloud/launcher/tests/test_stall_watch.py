@@ -320,7 +320,7 @@ class Stall(unittest.TestCase):
         self.assertEqual(w.err, "", "a skip adds no line of its own to the log: the pass line carries it")
         self.assertNotIn("secret-pod-text", line)
         self.assertNotIn("secret-pod-text", w.err)
-        self.assertEqual([n for n, _ in w.kube.execs], ["broken-pod"], "a young pod is not read")
+        self.assertEqual([n for n, _ in w.kube.execs], ["young-pod", "broken-pod"], "a young pod is read for the idle notice only (ask #2443): no stall condition fires for it")
 
     def test_s8_twelve_pods_are_read_with_one_exec_each_and_the_pass_line_counts_them(self):
         w = World()
@@ -484,35 +484,43 @@ class Stall(unittest.TestCase):
         self.assertIn("the stall watch failed", text)
         self.assertEqual(sw.pass_text(None), "")
 
-    def _finished(self, module, results="", **kw):
+    def _finished(self, module, results="", turn=None, exists=False, **kw):
+        """Ask #2443: finished is what the server reports (`turn`) plus the results file's existence (`exists`); `results` is only text and decides nothing."""
         w = World()
         w.add(progress_age=16, runs=[("build", 16, "x")], exits=[("build", 0, 16)], **kw)
         w.set_results("w1-pod", results)
+        inner = w.pods["w1-pod"]["probe"]
+        w.pods["w1-pod"]["probe"] = lambda now: dict(inner(now), turn=turn or {"turn": "unknown", "outcome": None, "finish": None}, results_exists=exists)
         return w.run(module)
 
     def _finished_cases(self, module):
         # S2 (the control inside: an unfinished pod stale for 16 minutes is alerted)
         if conditions(self._finished(module, tail=("working",))) != ["progress-stale"]:
             raise AssertionError("an unfinished pod was called finished: a stale pod was not alerted")
-        for kw in (dict(tail=("x", "done")), dict(tail=("x", " DONE  ")), dict(tail=("STATUS: done",)), dict(tail=("x",), results="STATUS: done")):
+        done = {"turn": "idle", "outcome": "succeeded", "finish": "stop"}
+        for kw in (dict(tail=("x",), turn=done, exists=True), dict(tail=("working",), turn=done, exists=True, results="")):
             if self._finished(module, **kw) != []:
                 raise AssertionError("a finished pod was alerted as stalled: %r" % (kw,))
-        # S3
-        for line in ("not done yet", "All done and pushed"):
-            if conditions(self._finished(module, tail=(line,))) != ["progress-stale"]:
+        # S3: the text lines decide nothing
+        for line in ("not done yet", "All done and pushed", "done", "STATUS: done"):
+            if conditions(self._finished(module, tail=(line,), results="STATUS: done")) != ["progress-stale"]:
                 raise AssertionError("an unfinished pod was called finished: %r" % line)
 
     def test_s2_s3_a_finished_pod_is_not_stalled_and_a_sentence_with_done_still_fires(self):
         self._finished_cases(sw)   # the control: the unmutated module passes
         self.assertEqual(conditions(self._finished(sw, tail=("done", "more work"))), ["progress-stale"])
         self.assertEqual(conditions(self._finished(sw, tail=("x",), results="STATUS: running")), ["progress-stale"])
+        self.assertEqual(self._finished(sw, tail=("x",), turn={"turn": "idle", "outcome": "succeeded", "finish": "stop"}, exists=False), [], "idle: the boss got the idle notice; the deliverable is evidence, not a gate")
 
     def test_s4_a_finished_pod_still_fires_refusal_and_is_silent_for_failed_run_idle(self):
+        fin = {"turn": "idle", "outcome": "succeeded", "finish": "stop"}
         w = World()
         w.add(progress_age=1, tail=("done",), msg="Permission denied: shell")
         self.assertEqual(conditions(w.run()), ["refusal"])
         w = World()
         w.add(progress_age=11, msg_age=11, tail=("done",), runs=[("t", 11, "FAILED")], exits=[("t", 2, 11)])
+        inner = w.pods["w1-pod"]["probe"]
+        w.pods["w1-pod"]["probe"] = lambda now: dict(inner(now), turn=fin, results_exists=True)
         self.assertEqual(w.run(), [])
         w = World()
         w.add(progress_age=11, msg_age=11, tail=("working",), runs=[("t", 11, "FAILED")], exits=[("t", 2, 11)])
@@ -521,7 +529,10 @@ class Stall(unittest.TestCase):
     def test_s5_twelve_pods_one_finished_make_twelve_execs_and_the_other_eleven_alert_as_before(self):
         w = World()
         for i in range(12):
-            w.add(name="pod%d-x" % i, progress_age=16, tail=("done",) if i == 0 else ("working",))
+            w.add(name="pod%d-x" % i, progress_age=16, tail=("working",))
+            if i == 0:
+                inner = w.pods["pod0-x"]["probe"]
+                w.pods["pod0-x"]["probe"] = lambda now, inner=inner: dict(inner(now), turn={"turn": "idle", "outcome": "succeeded", "finish": "stop"}, results_exists=True)
         out = w.run()
         self.assertEqual(sorted(n for n, _ in w.kube.execs), sorted("pod%d-x" % i for i in range(12)))
         self.assertEqual(sorted(n for n, _ in out), sorted("pod%d-x" % i for i in range(1, 12)))
@@ -530,10 +541,10 @@ class Stall(unittest.TestCase):
         self._finished_cases(sw)   # the control passes first
         with open(SOURCE) as f:
             text = f.read()
-        old = '    finished = last_p in ("done", "status: done") or'
+        old = '    finished = classify(data) == "idle"'
         self.assertEqual(text.count(old), 1, "the mutation did not apply")
         mod = types.ModuleType("stall_watch_mutant2")
-        exec(compile(text.replace(old, "    finished = True or"), "mutant", "exec"), mod.__dict__)
+        exec(compile(text.replace(old, "    finished = True"), "mutant", "exec"), mod.__dict__)
         with self.assertRaises(AssertionError) as caught:
             self._finished_cases(mod)
         self.assertIn("an unfinished pod was called finished", str(caught.exception))
