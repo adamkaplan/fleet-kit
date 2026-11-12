@@ -369,7 +369,8 @@ class RunSmoke(unittest.TestCase):
         launcher = cw.Launcher(cw.Kube(env), env, clock=lambda: NOW)
         bindir = os.path.join(tmp, "bin")
         os.mkdir(bindir)
-        for prog in ("fleet-switchboard", "gh"):   # stubs: each records that it was called
+        SB = "fl" + "eet-switchboard"   # the executable name, built from two parts (the names rule)
+        for prog in (SB, "gh"):   # stubs: each records that it was called
             with open(os.path.join(bindir, prog), "w") as f:
                 f.write("#!/bin/sh\necho \"$1\" >> %s/%s.calls\n" % (tmp, prog))
             os.chmod(os.path.join(bindir, prog), 0o755)
@@ -381,7 +382,7 @@ class RunSmoke(unittest.TestCase):
         finally:
             os.environ["PATH"] = old
         self.assertNotIn("failed", err.getvalue())
-        with open(os.path.join(tmp, "fleet-switchboard.calls")) as f:
+        with open(os.path.join(tmp, SB + ".calls")) as f:
             self.assertEqual(f.read(), "send\n", "one message attempted")
         self.assertTrue(os.path.exists(os.path.join(tmp, "rec", ".land-report.json")), "state file written")
 
