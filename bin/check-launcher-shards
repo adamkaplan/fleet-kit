@@ -55,14 +55,18 @@ def shard_runs(text):
 
 
 def matrix_ids(text):
-    """The shard ids of the job that runs the launcher shards: the `shard: [..]` line of the job holding the `--shard` line."""
+    """The shard ids the launcher job runs: the `shard: [..]` line of the job holding the shard step, else the shards the `plan` job's `launcher=` rows make
+    (`for k in range(1, M)` gives 1..M-1: a `shard` axis beside an `include` would collapse the legs, so the rows are made by the plan)."""
     jobs = re.split(r"^  (?=[A-Za-z0-9_-]+:\s*$)", text, flags=re.M)
     for job in jobs:
         if re.search(r"%s\s+--shard|CLOUD_LAUNCHER_SHARD:" % re.escape(RUNNER), job):
             m = re.search(r"^\s+shard:\s*\[([^\]]*)\]", job, re.M)
+            if m:
+                return [int(x) for x in m.group(1).split(",") if x.strip()]
+            m = re.search(r"launcher=.*?range\(1,\s*(\d+)\)", text)
             if not m:
-                raise ValueError("the job that runs the launcher shards has no `shard: [..]` matrix line")
-            return [int(x) for x in m.group(1).split(",") if x.strip()]
+                raise ValueError("cannot tell which shards the job that runs the launcher shards makes: no `shard: [..]` line and no `launcher=` rows in the plan")
+            return list(range(1, int(m.group(1))))
     return None
 
 

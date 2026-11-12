@@ -178,6 +178,20 @@ class Coverage(unittest.TestCase):
         self.assertEqual(p.returncode, 1)
         self.assertIn("in no job: " + listing(4, 4)[0], p.stdout)
 
+    def test_s3_the_shards_made_by_the_plan_rows_are_read_and_a_dropped_one_fails(self):
+        d = tempfile.mkdtemp(prefix="wf-"); self.addCleanup(shutil.rmtree, d, True)
+        path = os.path.join(d, "test.yml")
+        text = ("jobs:\n  plan:\n    steps:\n      - run: |\n          python3 - <<'PY'\n          out.write(\"launcher=\" + json.dumps([dict(r, shard=k) for r in rows for k in range(1, %d)]))\n          PY\n"
+                "  launcher:\n    steps:\n      - env:\n          CLOUD_LAUNCHER_SHARD: ${{ matrix.shard }}/4\n        run: |\n          bin/test-cloud-launcher 2>&1 | tee out.txt\n")
+        with open(path, "w") as f:
+            f.write(text % 5)
+        self.assertEqual(self.cli("--workflow", path).returncode, 0)
+        with open(path, "w") as f:
+            f.write(text % 4)
+        p = self.cli("--workflow", path)
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("in no job: " + listing(4, 4)[0], p.stdout)
+
     def test_s3_a_second_step_with_a_fixed_shard_counts_as_a_second_job(self):
         extra = "      - run: bin/test-cloud-launcher --shard 1/4\n"
         p = self.cli("--workflow", self.workflow("[1, 2, 3, 4]", extra=extra))
@@ -206,7 +220,7 @@ class Patch(unittest.TestCase):
         with open(PATCH) as f:
             text = f.read()
         self.assertIn("+  test-cloud-launcher:", text)                                   # (a) the split into a job of shards
-        self.assertIn("+        shard: [1, 2, 3, 4]", text)
+        self.assertIn("+        include: ${{ fromJSON(needs.plan.outputs.launcher) }}", text)
         self.assertIn("-        timeout-minutes: 20", text)                               # (b) the limit 20 -> 45
         self.assertIn("+        timeout-minutes: 45", text)
         self.assertIn("-      - name: bin/test-cloud-launcher\n", text)                   # the whole-suite step is gone

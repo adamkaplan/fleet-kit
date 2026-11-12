@@ -1,8 +1,25 @@
 diff --git a/.github/workflows/test.yml b/.github/workflows/test.yml
-index 0110153c..e8489450 100644
+index 0110153c..24b5fdaa 100644
 --- a/.github/workflows/test.yml
 +++ b/.github/workflows/test.yml
-@@ -234,7 +234,7 @@ jobs:
+@@ -40,6 +40,7 @@ jobs:
+     runs-on: ubuntu-latest
+     outputs:
+       matrix: ${{ steps.plan.outputs.matrix }}
++      launcher: ${{ steps.plan.outputs.launcher }}
+     defaults:
+       run:
+         shell: bash
+@@ -106,6 +107,8 @@ jobs:
+               rows = [dict(os=o, ref="", name="test (%s)" % o, cloud="test-cloud (%s)" % o) for o in oses]
+           with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+               out.write("matrix=" + json.dumps(rows, separators=(",", ":")) + "\n")
++              # The launcher shards (ask #2500): every row x shards 1..4 (the 4 is also in the launcher job's CLOUD_LAUNCHER_SHARD).
++              out.write("launcher=" + json.dumps([dict(r, shard=k, launcher="%s launcher %d/4" % (r["cloud"], k)) for r in rows for k in range(1, 5)], separators=(",", ":")) + "\n")
+           PY
+ 
+   test:
+@@ -234,7 +237,7 @@ jobs:
  
        - name: node --test the other plugin tests
          if: ${{ !cancelled() }}
@@ -11,22 +28,21 @@ index 0110153c..e8489450 100644
  
        - name: bin/fleet-scenario validate
          if: ${{ !cancelled() }}
-@@ -270,6 +270,43 @@ jobs:
+@@ -270,6 +273,42 @@ jobs:
            bin/test-switchboard --shard ${{ matrix.shard }}/8 2>&1 | tee "$RUNNER_TEMP/out.txt"
            grep -qx 'RESULT: PASS' "$RUNNER_TEMP/out.txt"
  
 +  # The cloud launcher suite (bin/test-cloud-launcher.chain) in 4 shards, beside `test-cloud` (needs only `plan`) (ask #2500). One step of the whole chain outgrew its
 +  # 20-minute limit on 12 November 2026 (about 90 of 187 entries done at the limit). `CLOUD_LAUNCHER_SHARD=K/N` (`--shard K/N`) takes every N-th entry of the chain file, so the chain stays the
-+  # one list of files; bin/check-launcher-shards fails when a file is in no job or in two. Check names: `<cloud name> launcher K/4`.
++  # one list of files; bin/check-launcher-shards fails when a file is in no job or in two. Check names: `<cloud name> launcher K/4`. The rows (every runner row x shards 1..4) are made by `plan`: an `include` beside a `shard` axis would overwrite itself row by row.
 +  # timeout-minutes 45 (was 20 on the whole-suite step): the stop-gap value, at least 1.5 times a shard's estimated duration on either system (see the pull request); tighten it once the split run is read.
 +  test-cloud-launcher:
 +    needs: plan
-+    name: ${{ matrix.cloud }} launcher ${{ matrix.shard }}/4
++    name: ${{ matrix.launcher }}
 +    strategy:
 +      fail-fast: false
 +      matrix:
-+        shard: [1, 2, 3, 4]
-+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
++        include: ${{ fromJSON(needs.plan.outputs.launcher) }}
 +    runs-on: ${{ matrix.os }}
 +    defaults:
 +      run:
@@ -55,7 +71,7 @@ index 0110153c..e8489450 100644
    # The cloud suites run beside the job above, not after it (both need only `plan`): the macOS check ends at the slower of the two. Check names:
    # `test-cloud (<os>)` for the two operating systems (`nightly-cloud <ref> (<os>)` in the nightly). Same matrix, runner and shell as `test`.
    test-cloud:
-@@ -300,13 +337,6 @@ jobs:
+@@ -300,13 +339,6 @@ jobs:
            bin/test-cloud-worker 2>&1 | tee "$RUNNER_TEMP/out.txt"
            grep -qx 'RESULT: PASS' "$RUNNER_TEMP/out.txt"
  
@@ -70,7 +86,7 @@ index 0110153c..e8489450 100644
          if: ${{ !cancelled() }}
          timeout-minutes: 10
 diff --git a/bin/test-workflow-split b/bin/test-workflow-split
-index 0c8851c9..54ed51de 100755
+index 0c8851c9..7dd23c59 100755
 --- a/bin/test-workflow-split
 +++ b/bin/test-workflow-split
 @@ -124,8 +124,9 @@ ADDED = [("bin/test-cloud-hub", "10"), ("bin/test-cloud-channel", None), ("bin/t
@@ -85,7 +101,7 @@ index 0c8851c9..54ed51de 100755
  MOVED = [n for n, _, _ in NEW_JOB]
  OLD_CHECKS = ["test (ubuntu-latest)", "test (macos-latest)"]
  CONCURRENCY = {"group": "test-${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}${{ github.event.action == 'reopened' && '-reopened' || '' }}",
-@@ -180,12 +181,15 @@ TEST_STEPS = [CHECKOUT, PYTHON,
+@@ -180,19 +181,22 @@ TEST_STEPS = [CHECKOUT, PYTHON,
                step("bin/test-cloud-neutral-names"),
                step("cloud/tests/test-cloud", **{"timeout-minutes": "10", "env": {"CLOUD_TEST_SKIP_DOCKER": "1"}}),
                plain("node --test plugins/fleet-decisions-tui/health.test.mjs", "node --test plugins/fleet-decisions-tui/health.test.mjs"),
@@ -104,6 +120,25 @@ index 0c8851c9..54ed51de 100755
  # The step schema of GitHub Actions: every key class that can skip, soften, redirect or widen a step.
  STEP_KEYS = {"id": "id: x", "name": "name: x", "if": "if: false", "uses": "uses: x/y@z", "run": "run: echo x", "shell": "shell: sh",
               "with": "with:\n          a: b", "env": "env:\n          A: b", "continue-on-error": "continue-on-error: true",
+              "timeout-minutes": "timeout-minutes: 5", "working-directory": "working-directory: /tmp"}
+ 
+ 
+-def resolved(job, event, base="", draft=False, text=None):
++def resolved(job, event, base="", draft=False, text=None, out_key="matrix"):
+     """The check names a job shows for `event`: the real `plan` script is RUN (in an empty directory: a push, a dispatch and a pull request into main read no
+     history) and the job's name template is filled from each row of the matrix it writes."""
+     text = WORKFLOW.read_text() if text is None else text
+@@ -204,8 +208,8 @@ def resolved(job, event, base="", draft=False, text=None):
+         open(out, "w").close()
+         env = dict(os.environ, EVENT=event, BASE=base, DRAFT="true" if draft else "false", GITHUB_OUTPUT=out)
+         subprocess.run(["bash", "-c", run], cwd=tmp, env=env, check=True, capture_output=True)
+-        line = [l for l in open(out).read().splitlines() if l.startswith("matrix=")][-1]
+-    rows = json.loads(line[len("matrix="):])
++        line = [l for l in open(out).read().splitlines() if l.startswith(out_key + "=")][-1]
++    rows = json.loads(line[len(out_key) + 1:])
+     key = job["name"].replace("${{ matrix.", "").replace(" }}", "")
+     return sorted(r[key] for r in rows)
+ 
 @@ -238,8 +242,7 @@ class Pins(unittest.TestCase):
          self.assertEqual([c for c in commands(jobs["test-cloud"])], NEW_JOB)
          for name in MOVED:
@@ -123,7 +158,7 @@ index 0c8851c9..54ed51de 100755
                  self.assertNotIn("if", job, jid)   # a skipped job would leave a required name unreported (ask #990)
              else:
                  # #2131: a job with a fixed (non-matrix-os) name, like `shards`, may be skipped, on the nightly only
-@@ -303,6 +306,18 @@ class Pins(unittest.TestCase):
+@@ -303,6 +306,22 @@ class Pins(unittest.TestCase):
          self.assertIn("grep -qx 'RESULT: PASS'", runs[0])
  
  
@@ -133,16 +168,20 @@ index 0c8851c9..54ed51de 100755
 +        self.assertEqual(job["needs"], "plan")
 +        self.assertEqual(job["runs-on"], "${{ matrix.os }}")
 +        self.assertEqual(job["defaults"], DEFAULTS)
-+        self.assertEqual(job["name"], "${{ matrix.cloud }} launcher ${{ matrix.shard }}/%d" % LAUNCHER_SHARDS)
-+        self.assertEqual(job["strategy"], {"fail-fast": "false", "matrix": {"shard": [str(i) for i in range(1, LAUNCHER_SHARDS + 1)], "include": "${{ fromJSON(needs.plan.outputs.matrix) }}"}})
++        self.assertEqual(job["name"], "${{ matrix.launcher }}")
++        self.assertEqual(job["strategy"], {"fail-fast": "false", "matrix": {"include": "${{ fromJSON(needs.plan.outputs.launcher) }}"}})   # rows made by `plan`: a `shard` axis beside an `include` would collapse the legs
 +        self.assertEqual(sorted(job), ["defaults", "name", "needs", "runs-on", "steps", "strategy"])
 +        self.assertEqual(job["steps"], LAUNCHER_STEPS)   # the coverage check first, then the shard step with its limit
-+        self.assertEqual(resolved({"name": "${{ matrix.cloud }}"}, "pull_request", "main", text=self.text), ["test-cloud (macos-latest)", "test-cloud (ubuntu-latest)"])
++        names = lambda *a, **k: resolved({"name": "${{ matrix.launcher }}"}, *a, out_key="launcher", text=self.text, **k)
++        both = ["test-cloud (%s) launcher %d/%d" % (o, k, LAUNCHER_SHARDS) for o in ("macos-latest", "ubuntu-latest") for k in range(1, LAUNCHER_SHARDS + 1)]
++        self.assertEqual(names("pull_request", "main"), sorted(both))   # every shard on both systems: 8 checks, no leg collapsed
++        self.assertEqual(names("push"), sorted(both))
++        self.assertEqual(len(names("schedule")), 2 * LAUNCHER_SHARDS)   # the nightly (an empty directory has no integration ref): main x two systems x the shards
 +
      def test_shape_the_workflow_and_both_jobs_have_exactly_the_expected_keys_and_values(self):
          self.assertEqual(sorted(self.wf), WORKFLOW_KEYS)
          self.assertEqual(self.wf["name"], "test")
-@@ -367,8 +382,16 @@ class Mutants(unittest.TestCase):
+@@ -367,8 +386,16 @@ class Mutants(unittest.TestCase):
      def test_s1_the_cloud_job_named_like_the_test_job(self):
          self.fails("    name: ${{ matrix.cloud }}\n", "    name: ${{ matrix.name }}\n", "test_s1_a_second_job_runs_the_cloud_suites_in_parallel_on_both_systems")
  
@@ -152,15 +191,15 @@ index 0c8851c9..54ed51de 100755
 -        self.fails("timeout-minutes: %s" % LAUNCHER_TIMEOUT, "timeout-minutes: 25", "test_s1_a_second_job_runs_the_cloud_suites_in_parallel_on_both_systems", "test_u1_every_suite_command_appears_once_in_its_original_order_with_the_result_grep")
 +        self.fails("timeout-minutes: %s" % LAUNCHER_TIMEOUT, "timeout-minutes: 25", self.LSHARD)
 +
-+    def test_launcher_shard_dropped_from_the_matrix(self):
-+        self.fails("        shard: [1, 2, 3, 4]\n        include", "        shard: [1, 2, 3]\n        include", self.LSHARD)
++    def test_launcher_shard_dropped_from_the_plan_rows(self):
++        self.fails("for k in range(1, 5)]", "for k in range(1, 4)]", self.LSHARD)
 +
 +    def test_launcher_shard_step_count_changed(self):
 +        self.fails("CLOUD_LAUNCHER_SHARD: ${{ matrix.shard }}/4", "CLOUD_LAUNCHER_SHARD: ${{ matrix.shard }}/3", self.LSHARD)
  
      def test_s7_old_job_given_a_name(self):
          self.fails("    name: ${{ matrix.name }}\n", "    name: unit\n", "test_s7_the_old_job_keeps_its_id_and_check_names")
-@@ -407,10 +430,10 @@ class Mutants(unittest.TestCase):
+@@ -407,10 +434,10 @@ class Mutants(unittest.TestCase):
          self.fails("          grep -qx 'RESULT: PASS' \"$RUNNER_TEMP/out.txt\"\n\n      - name: bin/test-health-records", "          true\n\n      - name: bin/test-health-records", "test_u1_every_suite_command_appears_once_in_its_original_order_with_the_result_grep")
  
      def test_u1_launcher_left_in_the_old_job(self):
@@ -174,7 +213,7 @@ index 0c8851c9..54ed51de 100755
          for t in ("test_s1_a_second_job_runs_the_cloud_suites_in_parallel_on_both_systems", "test_u1_every_suite_command_appears_once_in_its_original_order_with_the_result_grep"):
              case = Pins(t)
              case.wf = load(text)
-@@ -485,7 +508,7 @@ class Mutants(unittest.TestCase):
+@@ -485,7 +512,7 @@ class Mutants(unittest.TestCase):
      def test_steps_the_reviewers_named_each_fail(self):
          text = WORKFLOW.read_text()
          i = text.index("  test-cloud:")
