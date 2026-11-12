@@ -435,7 +435,7 @@ def build():
             with mock.patch.dict(LIB.SHAPES, shapes):
                 code, out, err = self.launch_with("--cloud")
             rows = self.rows(self.block(err))
-            self.assertEqual(sorted(rows), ["M", "Q", "S", "XS"], err)
+            self.assertEqual(sorted(rows), sorted(n for n in shapes if n != "O"), err)
             self.assertEqual(rows["Q"], "1")
             self.assertNotIn("shape O", err)
 
