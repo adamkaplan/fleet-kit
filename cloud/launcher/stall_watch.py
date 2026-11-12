@@ -61,6 +61,10 @@ try:
 except OSError:
     pass
 out["results"] = ((tail("/work/results.txt", 1) or [""])[0])[:200]
+try:
+    out["results_mtime"] = os.path.getmtime("/work/results.txt")
+except OSError:
+    pass
 rd = os.environ.get("CW_RUNS_DIR") or "/work/runs"
 try:
     names = sorted(os.listdir(rd))[:200]
@@ -192,6 +196,12 @@ def session_state(data, now, threshold):
     return False, ""
 
 
+def _results_done(data):
+    """Ask #2472: the run record's one rule (last non-empty line, and newer than the pod's start when both times are known)."""
+    from run_record import results_verdict
+    return results_verdict(str(data.get("results") or ""), _num(data.get("results_mtime")), _num(data.get("started")), nocase=True) == "done"
+
+
 def decide(data):
     """{condition: evidence text} for the three conditions, from the probe's answer. Pure: times are the pod's own clock (`now` in the answer)."""
     now = _num(data.get("now"))
@@ -210,7 +220,7 @@ def decide(data):
     # A pod that declared itself finished is not stalled for (a) and (c): its progress file's last line is `done` or `STATUS: done`, or results.txt's last line is `STATUS: done`.
     # (b) refusal is unchanged and still fires for a finished pod.
     last_p = tail[-1].strip().lower() if tail else ""
-    finished = last_p in ("done", "status: done") or str(data.get("results") or "").strip().lower() == "status: done"
+    finished = last_p in ("done", "status: done") or _results_done(data)
     # (a)
     times = [t for t in [ptime] + [_num(r["mtime"]) for r in runs] if t is not None]
     active = any(r.get("name") not in exited and now - _num(r["mtime"]) < RUN_ACTIVE_SECONDS for r in runs)
@@ -319,6 +329,7 @@ def watch_pass(launcher, pods, now, name_ok):
                 counts["skipped"].append("%s:%s" % (name, "the-read-failed"))
                 continue
             counts["read"] += 1
+            data["started"] = started.timestamp()   # ask #2472: results.txt older than this is an earlier run's
             for condition, text in decide(data).items():
                 mark = _ann(pod, "stall-alert-" + condition)
                 last = launcher_parse(mark)

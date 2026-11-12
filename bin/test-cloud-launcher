@@ -87,10 +87,14 @@ pids=""
 for l in 0 1 2; do lane "$l" "$@" & pids="$pids $!"; done
 ran=0
 fail=0
+FAILED=""
+nfail=0
 while IFS= read -r e; do
   [ -n "$(printf %s "$e" | tr -d ' \t')" ] || continue
   is_parallel "$e" && continue
-  run_entry "$e" "$@" || { echo "RESULT: FAIL"; kill $pids 2>/dev/null; exit 1; }
+  # a red entry is recorded and the loop goes on: every entry runs and every red is listed at the end
+  run_entry "$e" "$@" || { FAILED="$FAILED$e
+"; nfail=$((nfail + 1)); }
   ran=$((ran + 1))
 done < "$LIST"
 wait
@@ -98,8 +102,15 @@ while IFS= read -r e; do
   [ -n "$e" ] || continue
   f=$(printf %s "$e" | tr / _)
   cat "$OUT/$f.out"
-  [ "$(cat "$OUT/$f.rc" 2>/dev/null)" = 0 ] || { echo "RESULT: FAIL"; exit 1; }
+  [ "$(cat "$OUT/$f.rc" 2>/dev/null)" = 0 ] || { FAILED="$FAILED$e
+"; nfail=$((nfail + 1)); }
   ran=$((ran + 1))
 done < "$PAR"
 echo "ran $ran entries"
+if [ "$nfail" -gt 0 ]; then
+  echo "FAILED FILES ($nfail):"
+  printf %s "$FAILED"
+  echo "RESULT: FAIL"
+  exit 1
+fi
 echo "RESULT: PASS"
