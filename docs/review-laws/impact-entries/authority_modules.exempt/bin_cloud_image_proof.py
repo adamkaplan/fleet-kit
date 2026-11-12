@@ -1,0 +1,2 @@
+bin/cloud_image_proof.py
+cw-image-proof only launches one proof pod, reads its results file and retires it, then writes a receipt in the operator's state directory; it clears, releases and merges nothing and writes no settings file. Its cluster login is a 30-minute cw-operator token minted from the minter kubeconfig of CW_SECRET_DIR and held in memory only (never printed or stored). Trace: the only reader of its receipt is bin/cloud_image_roll.py, which decides the roll itself.
