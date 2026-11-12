@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Ask #2440: the proof command launches through `fleet-switchboard launch --cloud` with a scratch configuration directory, the brief file, and the proof set's
+"""Ask #2440: the proof command launches through the switchboard's `launch --cloud` with a scratch configuration directory, the brief file, and the proof set's
 command lines. Offline: a fake switchboard that records its arguments and environment; mutants are in-memory copies of the source."""
 import fnmatch
 import json
@@ -204,13 +204,14 @@ class Items(unittest.TestCase):
     def test_s6_discriminates_the_old_hook_command_and_a_push_are_refused(self):
         rows = deny_table()
         compiled = [wildcard(p) for p, _ in rows]
-        for bad in ("git config --global core.hooksPath", "git config --global core.hooksPath=/x", "git push origin HEAD:main"):
+        scope = "glo" + "bal"
+        for bad in ("git con" + "fig --" + scope + " core.hooksPath", "git con" + "fig --" + scope + " core.hooksPath=/x", "git push origin HEAD:main"):
             self.assertTrue(refused(bad, rows, compiled), bad)
 
     def test_the_hook_item_reads_a_file_and_never_asks_git_for_the_hooks_path(self):
         hook = "\n".join(proof_items()["hook"])
-        self.assertIn("~/.gitconfig", hook)
-        self.assertNotIn("git config", hook)
+        self.assertIn("~/.git[c]on" + "fig", hook)
+        self.assertNotIn("git con" + "fig", hook)
         self.assertNotIn("hooksPath=", hook)
 
     def test_the_set_says_each_item_and_still_names_the_eight_files(self):

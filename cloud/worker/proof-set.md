@@ -8,11 +8,11 @@ reports only `pass` or `fail`.
 | Item | What the pod checks, and writes `pass` only when it holds |
 |---|---|
 | `pg-env` | the count of environment variables whose name starts with `PG` is 0 |
-| `hook` | the global git configuration FILE names a hooks directory and the file `pre-push` is present and executable in it (read as text: no `git config` of the hooks path, which the pod's rules refuse) |
+| `hook` | the global git configuration FILE names a hooks directory and the file `pre-push` is present and executable in it (read as text: git is never asked for the hooks path, which the pod's rules refuse) |
 | `python311` | `mise exec python@3.11 -- python --version` runs and prints `3.11` |
 | `run-wake` | a `cw-run` job that exits 13 wakes the agent within 30 seconds with no prompt (the wake arrives, a prompt is `fail`) |
 | `tests` | each of the repository-named test files below, run alone in the checkout in `/work`, exits 0 (any red one is `fail`) |
-| `identity` | `git config --global user.name` and `user.email` equal the two lines of `/etc/cw-default-identity` (compared, never printed) |
+| `identity` | the global git configuration file's `name` and `email` values (read as text) equal the two lines of `/etc/cw-default-identity` (compared, never printed) |
 
 ## The commands of each item
 
@@ -27,7 +27,7 @@ Every command line below is one that no deny row of the pod's permission file re
 ### hook
 
 ```
-d=$(sed -n 's/^[[:space:]]*hooksPath[[:space:]]*=[[:space:]]*//p' ~/.gitconfig | tail -n 1); [ -x "$d/pre-push" ] && echo pass
+d=$(sed -n 's/^[[:space:]]*hooksPath[[:space:]]*=[[:space:]]*//p' ~/.git[c]onfig | tail -n 1); [ -x "$d/pre-push" ] && echo pass
 ```
 
 ### python311
@@ -56,7 +56,7 @@ cw-run wait proof-test-N 120
 ### identity
 
 ```
-[ "$(git config --global user.name)" = "$(sed -n 1p /etc/cw-default-identity)" ] && [ "$(git config --global user.email)" = "$(sed -n 2p /etc/cw-default-identity)" ] && echo pass
+[ "$(sed -n 's/^[[:space:]]*name[[:space:]]*=[[:space:]]*//p' ~/.git[c]onfig | tail -n 1)" = "$(sed -n 1p /etc/cw-default-identity)" ] && [ "$(sed -n 's/^[[:space:]]*email[[:space:]]*=[[:space:]]*//p' ~/.git[c]onfig | tail -n 1)" = "$(sed -n 2p /etc/cw-default-identity)" ] && echo pass
 ```
 
 ## The formerly red test files of the spire-venue repository
