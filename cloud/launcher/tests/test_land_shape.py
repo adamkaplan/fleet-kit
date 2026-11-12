@@ -43,12 +43,18 @@ def room(nodes, used, shape="L", lib=cw):
     return block_lines(body, shape, lib)
 
 
-def load_bin(tag):
-    """A fresh copy of bin/cloud_worker.py (the launcher library stubbed to the one under test by the caller)."""
+def load_bin(tag, edit=None):
+    """A fresh copy of bin/cloud_worker.py (the launcher library stubbed to the one under test by the caller); edit=(old, new) mutates its source."""
     import importlib.util
-    spec = importlib.util.spec_from_file_location("cw_bin_land_shape_" + tag, os.path.join(ROOT, "bin", "cloud_worker.py"))
+    path = os.path.join(ROOT, "bin", "cloud_worker.py")
+    spec = importlib.util.spec_from_file_location("cw_bin_land_shape_" + tag, path)
     mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
+    if edit:
+        text = open(path).read()
+        assert text.count(edit[0]) == 1, edit[0]
+        exec(compile(text.replace(*edit), path, "exec"), mod.__dict__)
+    else:
+        spec.loader.exec_module(mod)
     return mod
 
 
@@ -56,9 +62,9 @@ def block_lines(body, shape, lib=cw):
     return load_bin("block").capacity_block(body, {shape: lib.capacity_shapes()[shape]}, lib._quantity)
 
 
-def print_text(answer_body, code=0):
+def print_text(answer_body, code=0, edit=None):
     """What _print_capacity writes to stderr when the launcher answers (code, body)."""
-    mod = load_bin("print")
+    mod = load_bin("print", edit)
     mod._lib = lambda: cw
     mod.run_launcher = lambda *a, **k: (code, answer_body, "")
     err = io.StringIO()
@@ -179,7 +185,7 @@ class MoreMutants(unittest.TestCase):
                 raise AssertionError("S8: the no-room line is missing")
         check(print_text(body))   # control first
         with self.assertRaises(AssertionError) as cm:
-            check(print_text(body).replace("0 nodes with room", "nodes with room: not counted"))
+            check(print_text(body, edit=('"  shape %s: %d nodes with room" % (shape, room)', '"  shape %s: nodes with room: not counted" % shape')))
         self.assertEqual(str(cm.exception), "S8: the no-room line is missing")
 
     def test_s9_a_capacity_block_that_hides_not_read_is_caught(self):
@@ -189,7 +195,7 @@ class MoreMutants(unittest.TestCase):
         text = print_text(None, code=1)
         check(text)   # control first
         with self.assertRaises(AssertionError) as cm:
-            check(text.replace("nodes: not read", "nodes: 0"))
+            check(print_text(None, code=1, edit=('"read" if nodes else "not read"', '"read"')))
         self.assertEqual(str(cm.exception), "S9: 'nodes: not read' is missing")
 
     def test_s4_a_changed_old_row_is_caught_with_anchored_text(self):

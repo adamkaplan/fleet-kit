@@ -238,6 +238,7 @@ class TestScratch(unittest.TestCase):
         applied, code, out = self.child([('record.get("shape") != shape or ', "")], "test_s4_other_shapes_names_and_lanes_proceed_as_before")
         print("S8: mutant counts-every-shape exit %d, mutations applied %d of 1" % (code, applied))
         self.assertEqual((applied, code), (1, 1), out[-800:])
+        self.assertIn("AssertionError: ", out)   # a failed assertion of the scenario, not a crash
 
 
 if __name__ == "__main__":
