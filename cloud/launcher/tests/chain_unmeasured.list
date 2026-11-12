@@ -1,3 +1,4 @@
+cloud/launcher/tests/test_all_reds.py
 cloud/launcher/tests/test_app_token_route.py
 cloud/launcher/tests/test_app_token_service.py
 cloud/launcher/tests/test_azure_config_dir.py
