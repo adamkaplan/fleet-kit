@@ -110,7 +110,7 @@ def s2_wrong(script=ACTIVITY):
         wrong += helper_turn(s, script) != {}
     finally:
         s.close()
-    garbled = [dict(idle=None), dict(idle_body={"id": "m", "time": {"created": 1}, "type": "idle", "outcome": "finished"}), dict(idle_body={"type": "idle"}),
+    garbled = [dict(idle=None), dict(idle_body={"id": "m", "time": {"created": FIX["idle_succeeded"]["time"]["created"]}, "type": "idle", "outcome": "finished"}), dict(idle_body={"type": "idle"}),
                dict(idle_body={"id": "m", "time": {"created": 1}, "type": "idle", "outcome": "succeeded"}),   # an assistant message newer than the idle one: a turn began after it
                dict(assistant="assistant_in_flight", idle_body={"id": "m", "time": {"created": 1}, "type": "idle", "outcome": "bogus"})]
     for kw in garbled:
@@ -161,7 +161,7 @@ class Structural(unittest.TestCase):
 
     def test_s2_the_probe_reads_the_same_turn_as_the_helper(self):
         for kw in (dict(running=True), dict(), dict(idle="idle_failed"), dict(idle=None), dict(idle_body={"id": "msg_x", "time": {"created": 1}, "type": "idle", "outcome": "succeeded"}),
-                   dict(idle_body={"id": "msg_x", "time": {"created": 1}, "type": "idle", "outcome": "bogus"}), dict(assistant="assistant_in_flight")):
+                   dict(idle_body={"id": "msg_x", "time": {"created": FIX["idle_succeeded"]["time"]["created"]}, "type": "idle", "outcome": "bogus"}), dict(assistant="assistant_in_flight")):
             s = Server(**kw)
             try:
                 self.assertEqual(probe_turn(s), helper_turn(s), kw)

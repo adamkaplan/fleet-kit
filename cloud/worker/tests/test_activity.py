@@ -56,7 +56,7 @@ class Activity(unittest.TestCase):
         self.assertEqual(p.returncode, 0, p.stderr)
         # 1700000500000 ms = 2023-11-14T22:21:40Z; the stub's active list is empty before a prompt
         self.assertEqual({k: v for k, v in json.loads(p.stdout).items() if k != "turn"}, {"busy": False, "last_activity": "2023-11-14T22:21:40Z"})   # ask #2443: the `turn` key is asserted on the next line
-        self.assertIn(json.loads(p.stdout)["turn"]["turn"], ("idle", "unknown"))   # the stub holds no `idle` message: never "running" for an idle stub, never a guess
+        self.assertEqual(json.loads(p.stdout)["turn"], {"turn": "unknown", "outcome": None, "finish": None})   # the stub holds no `idle` message: unknown, never a guess
 
     def test_busy_when_a_session_is_active(self):
         p = self.run_script(self.serve("busy-forever"))
