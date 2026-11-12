@@ -26,8 +26,9 @@ sys.modules["cw_test_cloud_worker_mod"] = tcw
 _loader.exec_module(tcw)
 
 FUTURE, PAST = "2099-01-01T00:00:00Z", "2001-01-01T00:00:00Z"
-CAP = int(re.search(r"^MAX_PER_LANE = .*?\"M\": (\d+)", (ROOT / "bin" / "cloud_worker.py").read_text(), re.M).group(1))   # the cap itself, read from the code
-CAP_L = int(re.search(r'"L": (\d+)', (ROOT / "bin" / "cloud_worker.py").read_text()).group(1))   # the cap of shape L, from the table
+CAP = int(re.search(r"^MAX_M_PER_LANE = (\d+)", (ROOT / "bin" / "cloud_worker.py").read_text(), re.M).group(1))   # the cap itself, read from the code
+CAP_L = int(re.search(r'"L": (\d+)\}\[args.shape\]', (ROOT / "bin" / "cloud_worker.py").read_text()).group(1))   # the cap of shape L, from the table
+HELD_CHECK = '            if len(held) >= {"M": MAX_M_PER_LANE, "L": 2}[args.shape]:'
 OLD_ONLY = "M_CAP_SCRATCH_OLD"   # set only in the scratch copy of the code before the change
 
 
@@ -210,7 +211,7 @@ class TestScratch(unittest.TestCase):
         return applied, code, Path(d, "out.txt").read_text() + Path(d, "err.txt").read_text()
 
     def test_s2_the_old_code_accepts_the_sixth_launch(self):
-        edits = [('    if args.shape in MAX_PER_LANE:   # the per-lane cap', '    if False:   # the per-lane cap'),
+        edits = [('    if args.shape in ("M", "L"):   # the per-lane cap', '    if False:   # the per-lane cap'),
                  ("            if isinstance(args.shape, str) and args.shape:\n                record[\"shape\"]", "            if False:\n                record[\"shape\"]")]
         applied, code, out = self.child(edits, "test_s2_the_code_before_the_change_accepts_a_sixth_launch", old=True)
         print(out.strip().splitlines()[0] if "S2:" in out else out[-300:])
@@ -218,12 +219,12 @@ class TestScratch(unittest.TestCase):
         self.assertIn("S2: launches accepted for a lane holding 5 records 1, written records with a shape key 0", out)
 
     def test_s8_a_mutant_that_never_stops_a_launch_fails_the_cap_scenario(self):
-        applied, code, out = self.child([("            if len(held) >= MAX_PER_LANE[args.shape]:", "            if False:")], "test_s3_a_fifth_shape_m_launch_stops_at_the_cap_with_no_call")
+        applied, code, out = self.child([(HELD_CHECK, "            if False:")], "test_s3_a_fifth_shape_m_launch_stops_at_the_cap_with_no_call")
         print("S8: mutant never-stops exit %d, mutations applied %d of 1" % (code, applied))
         self.assertEqual((applied, code), (1, 1), out[-800:])
 
     def test_l_a_mutant_that_never_stops_shape_l_fails_the_l_cap_test(self):
-        edits = [("            if len(held) >= MAX_PER_LANE[args.shape]:", "            if False:")]
+        edits = [(HELD_CHECK, "            if False:")]
         applied, code, out = self.child(edits, "test_l_a_lane_stops_at_its_own_lower_cap_of_shape_l")
         self.assertEqual((applied, code), (1, 1), out[-800:])
         self.assertIn("AssertionError: 0 != 2", out)   # the launch that should be refused exits 0

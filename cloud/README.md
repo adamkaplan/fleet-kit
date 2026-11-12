@@ -265,7 +265,7 @@ Tests: `bin/test-cloud-launcher` (driver, fake kubectl), `cloud/tests/test-cloud
 
 Cost (list-price estimate, not a billed figure): 0.34 USD per hour (6 of 8 vCPU of a 0.452 USD node). One land of 45 minutes costs about 0.26 USD (0.34 x 0.75); one of 90 minutes about 0.51 USD (0.34 x 1.5).
 
-A lane may hold at most 2 live shape-`L` cloud workers at once (`MAX_PER_LANE` in `bin/cloud_worker.py`, a lower limit than the 10 of `M`, because one `L` pod takes a node and the autoscaler would add one each); the refusal reads `lane LANE already holds 2 shape-L cloud workers (...)`, exits 2 before any token or cluster call, and counts only `L` records. Test: `cloud/launcher/tests/test_m_cap.py` (`test_l_...`, with a mutant that never stops).
+A lane may hold at most 2 live shape-`L` cloud workers at once (the launch check in `bin/cloud_worker.py`, beside `MAX_M_PER_LANE`; a lower limit than the 10 of `M`, because one `L` pod takes a node and the autoscaler would add one each); the refusal reads `lane LANE already holds 2 shape-L cloud workers (...)`, exits 2 before any token or cluster call, and counts only `L` records. Test: `cloud/launcher/tests/test_m_cap.py` (`test_l_...`, with a mutant that never stops).
 
 A dedicated pool of a larger SKU is an option, not part of this change: it needs the owner's word, and no Azure resource is created by it.
 

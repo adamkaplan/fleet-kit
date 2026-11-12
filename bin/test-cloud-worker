@@ -116,9 +116,8 @@ if command == "create":
         sys.stderr.write("error: unrecognized arguments: " + " ".join(unknown) + "\\n")
         sys.exit(2)
     shape = argv[argv.index("--shape") + 1] if "--shape" in argv else "XS"
-    SHAPE_NAMES = ("XS", "O", "S", "M", "L")
-    if shape not in SHAPE_NAMES:
-        sys.stderr.write("error: shape must be " + ", ".join(SHAPE_NAMES) + "\\n")
+    if shape not in ("XS", "O", "S", "M", "L"):
+        sys.stderr.write("error: shape is not one of the launcher's shapes\\n")
         sys.exit(2)
 if command == "create":
     for item in argv:
