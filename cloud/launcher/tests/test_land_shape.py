@@ -43,12 +43,28 @@ def room(nodes, used, shape="L", lib=cw):
     return block_lines(body, shape, lib)
 
 
-def block_lines(body, shape, lib=cw):
+def load_bin(tag):
+    """A fresh copy of bin/cloud_worker.py (the launcher library stubbed to the one under test by the caller)."""
     import importlib.util
-    spec = importlib.util.spec_from_file_location("cw_bin_land_shape", os.path.join(ROOT, "bin", "cloud_worker.py"))
+    spec = importlib.util.spec_from_file_location("cw_bin_land_shape_" + tag, os.path.join(ROOT, "bin", "cloud_worker.py"))
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
-    return mod.capacity_block(body, {shape: lib.capacity_shapes()[shape]}, lib._quantity)
+    return mod
+
+
+def block_lines(body, shape, lib=cw):
+    return load_bin("block").capacity_block(body, {shape: lib.capacity_shapes()[shape]}, lib._quantity)
+
+
+def print_text(answer_body, code=0):
+    """What _print_capacity writes to stderr when the launcher answers (code, body)."""
+    mod = load_bin("print")
+    mod._lib = lambda: cw
+    mod.run_launcher = lambda *a, **k: (code, answer_body, "")
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        mod._print_capacity(None, None)   # must not raise
+    return err.getvalue()
 
 
 def count(lines, shape="L"):
@@ -86,18 +102,15 @@ class Capacity(unittest.TestCase):
         used = {n: {"cpu_m": 6000, "memory_b": 16 * GIB} for n in "abc"}
         lines = room(["a", "b", "c"], used)
         self.assertEqual(count(lines), 0, lines)
-        text = mreq.print_capacity_text(cw)   # the printing path returns normally: the launch goes on
-        self.assertIn("  shape L:", text)
+        body = {"nodes_read": True, "pods_read": True, "nodes": [dict(NODE, name=n) for n in "abc"], "requests": used}
+        self.assertIn("shape L: 0 nodes with room", print_text(body))   # the printing path returns normally: the launch goes on
 
     def test_s9_an_unreadable_node_list_says_not_read_and_proceeds(self):
         body = {"nodes_read": False, "pods_read": False}
         lines = block_lines(body, "L")
         self.assertIn("  nodes: not read", lines)
         self.assertIn("  shape L: nodes with room: not counted", lines)
-        import importlib.util
-        spec = importlib.util.spec_from_file_location("cw_bin_land_shape9", os.path.join(ROOT, "bin", "cloud_worker.py"))
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
+        mod = load_bin("s9")
         mod._lib = lambda: cw
         mod.run_launcher = lambda *a, **k: (1, None, "unreadable")
         err = io.StringIO()
@@ -115,7 +128,7 @@ class NoAzureCreate(unittest.TestCase):
             out = subprocess.run(["git", "diff", "-U0", ref + "...HEAD", "--", ".", ":!cloud/launcher/tests/test_land_shape.py"], cwd=ROOT, capture_output=True, text=True)
             if out.returncode == 0:
                 return [l[1:] for l in out.stdout.splitlines() if l.startswith("+") and not l.startswith("+++")]
-        self.skipTest("no base ref to diff against")
+        self.fail("no base ref to diff against (origin/integration or integration): the scan cannot run")
 
     def test_s7_the_diff_has_no_azure_create_nodepool_or_scale_command(self):
         self.assertEqual([l for l in self.added() if self.PATTERN.search(l)], [])
@@ -135,10 +148,15 @@ class Mutants(unittest.TestCase):
 
     def test_a_request_of_three_cpu_counts_three_nodes_after_one_pod(self):
         original = base.source()
+        def check(lib, used):
+            got = count(room(["a", "b", "c"], used, lib=lib))
+            if got != 2:
+                raise AssertionError("S3: nodes with room after one L pod is %d, not 2" % got)
+        check(cw, {"a": {"cpu_m": 6000, "memory_b": 16 * GIB}})   # the control, first
         mod = base.load(base.mutate(original, L_REQ, '"L": {"cpu": "3", "memory": "8Gi"}'))
-        used = {"a": {"cpu_m": 3000, "memory_b": 8 * GIB}}   # the one pod of the mutant's own row
-        self.assertEqual(count(room(["a", "b", "c"], used, lib=mod)), 3)   # where 2 are required: S3 would fail
-        self.assertEqual(count(room(["a", "b", "c"], {"a": {"cpu_m": 6000, "memory_b": 16 * GIB}})), 2)   # the control
+        with self.assertRaises(AssertionError) as cm:
+            check(mod, {"a": {"cpu_m": 3000, "memory_b": 8 * GIB}})   # the one pod of the mutant's own row
+        self.assertEqual(str(cm.exception), "S3: nodes with room after one L pod is 3, not 2")
 
 
 class MoreMutants(unittest.TestCase):
@@ -153,11 +171,40 @@ class MoreMutants(unittest.TestCase):
             check(base.load(base.mutate(original, row, '"M": {"cpu": "3", "memory": "8Gi"}')))
         self.assertTrue(str(cm.exception).startswith("old row changed"), str(cm.exception))
 
+    def test_s8_a_capacity_block_that_hides_the_zero_is_caught(self):
+        body = {"nodes_read": True, "pods_read": True, "nodes": [dict(NODE, name=n) for n in "abc"],
+                "requests": {n: {"cpu_m": 6000, "memory_b": 16 * GIB} for n in "abc"}}
+        def check(text):
+            if "shape L: 0 nodes with room" not in text:
+                raise AssertionError("S8: the no-room line is missing")
+        check(print_text(body))   # control first
+        with self.assertRaises(AssertionError) as cm:
+            check(print_text(body).replace("0 nodes with room", "nodes with room: not counted"))
+        self.assertEqual(str(cm.exception), "S8: the no-room line is missing")
+
+    def test_s9_a_capacity_block_that_hides_not_read_is_caught(self):
+        def check(text):
+            if "nodes: not read" not in text:
+                raise AssertionError("S9: 'nodes: not read' is missing")
+        text = print_text(None, code=1)
+        check(text)   # control first
+        with self.assertRaises(AssertionError) as cm:
+            check(text.replace("nodes: not read", "nodes: 0"))
+        self.assertEqual(str(cm.exception), "S9: 'nodes: not read' is missing")
+
+    def test_s4_a_changed_old_row_is_caught_with_anchored_text(self):
+        original = base.source()
+        def check(mod):
+            for name, row in OLD_ROWS.items():
+                if mod.SHAPES[name] != row:
+                    raise AssertionError("S4: old row changed: " + name)
+        check(base.load(original))   # control first
+        with self.assertRaises(AssertionError) as cm:
+            check(base.load(base.mutate(original, '"usd_per_hour": 0.20', '"usd_per_hour": 0.21')))
+        self.assertEqual(str(cm.exception), "S4: old row changed: M")
+
     def test_s8_s9_no_room_and_unreadable_never_end_the_launch(self):
-        import importlib.util
-        spec = importlib.util.spec_from_file_location("cw_bin_land_shape_m", os.path.join(ROOT, "bin", "cloud_worker.py"))
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
+        mod = load_bin("m")
         mod._lib = lambda: cw
         full = {n: {"cpu_m": 6000, "memory_b": 16 * GIB} for n in "abc"}
         body = {"nodes_read": True, "pods_read": True, "nodes": [dict(NODE, name=n) for n in "abc"], "requests": full}
