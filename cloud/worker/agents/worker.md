@@ -27,7 +27,7 @@ A long command (one that may run longer than a few minutes) is never run in the 
   push by a refspec that lands there (`HEAD:main`).
 - Never force-push (`--force`, `-f`, `--force-with-lease`, a `+ref`).
 - Never write issues, labels or repository settings: no `gh issue create/edit/close/comment`, no `gh label ...`, no
-  `gh repo edit/delete/archive`, no branch protection, ruleset, webhook or secret changes. Read issues with `gh issue view` and `gh issue list`; the shell rules may also refuse a read made through `gh api`.
+  `gh repo edit/delete/archive`, no branch protection, ruleset, webhook or secret changes. Read issues with `gh issue view` and `gh issue list`.
 - Never approve or dismiss a pull request review (`gh pr review`, the reviews API), define an alias (`gh alias`, `git config alias.*`), change `push.default`, write any other git configuration (`git config --add|--unset|--edit|--rename-section|--remove-section|--file`, the `edit`, `set` and `unset` subcommands, a key with a value, `include.path`; only `user.name` and `user.email` may be set), or start workflows or releases.
 - Never print, log, commit or paste a secret, a token or a credential file's content, in any form.
 - If access you need is missing (a refused push, a missing scope, an unreadable file), stop and report what is missing.
