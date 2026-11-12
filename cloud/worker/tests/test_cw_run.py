@@ -68,15 +68,23 @@ class Run(unittest.TestCase):
         r, _ = self.cw("tail", "three", "1")
         self.assertEqual(len(r.stdout.strip().splitlines()), 1)
 
-    def test_a_hard_rule_is_not_bypassed_by_start(self):
-        rules = os.path.join(HERE, "..", "opencode-worker.json")
+    def test_a_row_of_the_rules_list_is_not_bypassed_by_start(self):
+        # ask #2402: the pod's own file has no deny row any more, so the check is exercised on a rules list the test owns (the same shape as the file)
+        import json, tempfile
+        rows = {"*": "allow", "echo hello*": "deny"}
+        doc = {"agent": {"worker": {"permission": {"bash": rows}}}}
+        rules = os.path.join(tempfile.mkdtemp(), "rules.json")
+        with open(rules, "w") as f:
+            json.dump(doc, f)
         env = {"CW_BASE_RULES": rules}
-        r, _ = self.cw("start", "--name", "m", "--", "gh", "pr", "merge", "5", env=env)
+        r, _ = self.cw("start", "--name", "m", "--", "echo", "hello", env=env)
         self.assertNotEqual(r.returncode, 0); self.assertIn("refuse", r.stderr); self.assertEqual(len(r.stderr.strip().splitlines()), 1)
-        r, _ = self.cw("start", "--name", "p", "--", "git", "push", "--force", "origin", "x", env=env)
-        self.assertNotEqual(r.returncode, 0)
         self.assertFalse(os.path.exists(os.path.join(self.runs, "m.pid")))
         r, _ = self.cw("start", "--name", "ok", "--", "sh", "-c", "sleep 1; echo done", env=env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        # the pod's real file refuses nothing: the same command starts
+        real = {"CW_BASE_RULES": os.path.join(HERE, "..", "opencode-worker.json")}
+        r, _ = self.cw("start", "--name", "real", "--", "echo", "hello", env=real)
         self.assertEqual(r.returncode, 0, r.stderr)
 
     def test_s4_progress_lines(self):

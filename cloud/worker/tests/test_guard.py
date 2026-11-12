@@ -241,19 +241,12 @@ class Guard(unittest.TestCase):
                 self.assertEqual(r.returncode, 0, r.stderr)
                 self.assertEqual(r.stdout.splitlines()[-1].split(" ran: ")[1], " ".join(cmd[1:]))
 
-    def test_review_round_the_config_denies_what_it_can_express(self):
+    def test_review_round_the_config_holds_no_deny_row(self):
+        # ask #2402: the permission file's deny rows (merge, alias, review, workflow, release, extension, dispatch, ruleset and refs forms) are removed;
+        # the phrase refusals of the wrapper (the test above) stay. The replacement is the property of the file: its bash map holds no deny row.
         glob = self.conf["permission"]["bash"]
         self.assertEqual(glob, self.conf["agent"]["worker"]["permission"]["bash"])
-        denies = self.deny(glob)
-        def match(pat, line):
-            return re.fullmatch(".*".join(re.escape(x) for x in pat.split("*")), line, re.S) is not None
-        for _, cmd, in_config in EXTRA_REFUSED:
-            if in_config:
-                with self.subTest(cmd=" ".join(cmd)):
-                    self.assertTrue(any(match(p, " ".join(cmd)) for p in denies), cmd)
-        for cmd in EXTRA_ALLOWED:   # and a read or an ordinary call is not denied
-            if cmd[:3] in (["gh", "ruleset", "list"], ["gh", "alias", "list"], ["gh", "pr", "create"], ["gh", "pr", "view"], ["git", "push", "-u"]):   # (the config over-refuses a branch named like main; README)
-                self.assertFalse(any(match(p, " ".join(cmd)) for p in denies), cmd)
+        self.assertEqual(self.deny(glob), [])
 
     def test_u1_the_new_refusals_do_not_print_an_argument_value(self):
         for cmd in (["gh", "alias", "set", SECRET, "pr merge"], ["gh", SECRET, "5"], ["gh", "api", "https://" + SECRET + "/repos/o/r/pulls/5/merge", "-X", "PUT"],
@@ -302,29 +295,15 @@ class Guard(unittest.TestCase):
     def deny(self, bash):
         return [p for p, v in bash.items() if v == "deny"]
 
-    def test_s3_the_generated_config_denies_the_six_for_the_shell_tool_in_the_default_agent(self):
+    def test_s3_the_config_has_no_shell_deny_row_for_the_six_in_the_default_agent(self):
+        # ask #2402: the deny rows for the six categories are removed; the wrapper (this class's other tests) refuses them, and the file is the catch-all allow
         self.assertNotIn("default_agent", self.conf)   # a default naming an agent this OpenCode may not register could break the start
         glob = self.conf["permission"]["bash"]
         agent = self.conf["agent"]["worker"]["permission"]["bash"]
         self.assertEqual(glob, agent)   # equality: the same rules, however the agent is chosen
-        self.assertEqual(glob["*"], "allow")   # a deny rule comes AFTER the catch-all: the last matching rule wins
-        self.assertEqual(list(glob).index("*"), 0)
-        denies = self.deny(glob)
-        self.assertTrue(denies)
-        self.assertTrue(all(v in ("allow", "deny") for v in glob.values()))
-        # one table row per category: a command of that category is matched by at least one deny pattern (opencode's `*` matches any text)
-        def match(pat, cmdline):
-            return re.fullmatch(".*".join(re.escape(x) for x in pat.split("*")), cmdline, re.S) is not None
-        for cat, _, cmd in SIX:
-            line = " ".join(cmd)
-            if "trunk" in line:
-                continue   # the configured default is the wrapper's: the config names main and master (README)
-            with self.subTest(cmd=line):
-                self.assertTrue(any(match(p, line) for p in denies), line)
+        self.assertEqual(glob, {"*": "allow"})
+        self.assertEqual(self.deny(glob), [])
         self.assertEqual({c for c, _, _ in SIX}, SIX_CATEGORIES)
-        for cmd in ORDINARY[:4]:   # and the ordinary ones are not denied
-            line = " ".join(cmd)
-            self.assertFalse(any(match(p, line) for p in denies), line)
 
     def test_s3_the_pod_holds_the_worker_agent_definition_with_the_stop_rules_in_prose(self):
         text = read(os.path.join(self.tmpfs, "config", "opencode", "agents", "worker.md"))

@@ -45,22 +45,6 @@ def strip_question(cfg):
     return c
 
 
-RECORD_BASH_PATTERNS = ("*CW_PR_RECORD*", "*pr-record*")   # ask 1200: the closed list of what its change adds
-RECORD_EDIT_ENTRY = {"*pr-record*": "deny"}   # the editing tool's entry for the record paths
-
-
-def strip_record_entries(cfg):
-    """A deep copy without ONLY the entries ask 1200 adds (the two bash patterns and the exact edit entry), in both blocks."""
-    c = copy.deepcopy(cfg)
-    blocks = [c["permission"]] + [a.get("permission", {}) for a in c.get("agent", {}).values()]
-    for b in blocks:
-        for pat in RECORD_BASH_PATTERNS:
-            b.get("bash", {}).pop(pat, None)
-        if b.get("edit") == RECORD_EDIT_ENTRY:
-            del b["edit"]
-    return c
-
-
 def _merge_base(ref):
     r = subprocess.run(["git", "merge-base", "HEAD", ref], cwd=ROOT, capture_output=True)
     out = r.stdout.decode().strip() if r.returncode == 0 else ""
@@ -90,19 +74,13 @@ def loud_skip(test, what):
     test.skipTest(msg)
 
 
-def base_other_keys():
-    ref, data = base_file(JSON_REL)
-    # the base may already hold the record entries (on the integration tip the merge base is HEAD itself): strip them from both sides
-    return None if ref is None else strip_record_entries(strip_question(json.loads(data)))
+
+EXPECTED_STRIPPED = {"permission": {"bash": {"*": "allow"}}, "agent": {"worker": {"permission": {"bash": {"*": "allow"}}}}}
 
 
-def without_ref_rules(cfg):
-    cfg = copy.deepcopy(cfg)
-    gone = ("git*push*main*", "git*push*master*", "gh api*/issues/comments/*", "gh api*/issues/comments/* *", "gh api*/issues/comments/*?*")
-    for b in (cfg["permission"]["bash"], cfg["agent"]["worker"]["permission"]["bash"]):
-        for k in [k for k in b if k in gone or k.startswith("*git*push*")]:
-            del b[k]
-    return cfg
+def check_pin(cfg):
+    """Ask #2402: the whole content of the file apart from the question entries."""
+    assert strip_question(cfg) == EXPECTED_STRIPPED, "the permission file is not the catch-all allow alone"
 
 
 def orch_question(text):
@@ -118,33 +96,13 @@ class T(unittest.TestCase):
         self.assertEqual(check_blocks(cfg), {})
 
     def test_s4_no_other_permission_changed(self):
-        base = base_other_keys()
-        if base is None:
-            loud_skip(self, "the base permission file")
-        # pin change of #1549: the push rules for main and master are compared in test_push_rules.py, not here
-        self.assertEqual(without_ref_rules(strip_record_entries(strip_question(load()))), without_ref_rules(base))
+        # ask #2402: the file is compared with its whole expected content, not with the base commit's copy (the base held the rows this change removes)
+        check_pin(load())
 
-    def test_record_entries_strip_only_the_closed_list(self):
-        cfg = load()
-        stripped = strip_record_entries(cfg)
-        self.assertNotEqual(stripped, cfg, "mutation not applied")
-        for b in (stripped["permission"], stripped["agent"]["worker"]["permission"]):
-            self.assertNotIn("edit", b)
-            self.assertFalse(set(RECORD_BASH_PATTERNS) & set(b["bash"]))
-        for mut in ("bash", "edit"):
-            m = copy.deepcopy(cfg)
-            if mut == "bash":
-                m["permission"]["bash"]["gh extra thing*"] = "allow"
-            else:
-                m["agent"]["worker"]["permission"]["edit"]["*other*"] = "deny"
-            self.assertNotEqual(m, cfg, "mutation not applied")
-            self.assertNotEqual(strip_record_entries(m), strip_record_entries(cfg))
-
-    def test_s4_unrelated_change_still_fails_against_base_with_record_entries(self):
-        # the base already carries the record entries (CI on the tip): an unrelated change must still differ
-        base = strip_record_entries(strip_question(load()))
+    def test_s4_unrelated_change_still_fails_the_whole_content_pin(self):
+        # integration's test of the same name idea (an unrelated change must still differ) kept: ask #2402 compares with the whole expected content, so no base copy is needed
         cur = load()
-        self.assertEqual(without_ref_rules(strip_record_entries(strip_question(cur))), without_ref_rules(base))
+        check_pin(cur)
         for mut in ("bash", "edit"):
             m = copy.deepcopy(cur)
             if mut == "bash":
@@ -152,7 +110,8 @@ class T(unittest.TestCase):
             else:
                 m["permission"].setdefault("edit", {})["*unrelated*"] = "deny"
             self.assertNotEqual(m, cur, "mutation not applied")
-            self.assertNotEqual(without_ref_rules(strip_record_entries(strip_question(m))), without_ref_rules(base), mut + " change not refused")
+            with self.assertRaises(AssertionError, msg=mut + " change not refused"):
+                check_pin(m)
 
     def test_s4_empty_agent_block_is_not_dropped(self):
         cfg = load()
@@ -162,16 +121,17 @@ class T(unittest.TestCase):
         m = copy.deepcopy(cfg); m["agent"]["extra"] = {"permission": {"question": "deny"}}
         self.assertNotEqual(strip_question(m), strip_question(cfg))
 
-    def test_s4_mutant_on_real_base_copy(self):
-        ref, data = base_file(JSON_REL)
-        if ref is None:
-            loud_skip(self, "the base permission file")
-        base = json.loads(data)
-        m = copy.deepcopy(base)
-        rule = next(k for k, v in m["permission"]["bash"].items() if v == "deny")
-        m["permission"]["bash"][rule] = "allow"
-        self.assertNotEqual(m, base, "mutation not applied")
-        self.assertNotEqual(strip_question(m), strip_question(load()), "bash rule edit not refused")
+    def test_s4_mutant_with_a_bash_row_is_refused_by_the_whole_content_pin(self):
+        # ask #2402: the old test mutated the base commit's copy (which held the deny rows); now the mutant is a copy of the current file
+        check_pin(load())   # the control passes through the same pin the real test uses
+        for mutate in (lambda m: m["permission"]["bash"].update({"gh pr merge*": "deny"}),
+                       lambda m: m["agent"]["worker"]["permission"]["bash"].update({"*": "deny"}),
+                       lambda m: m["permission"].update({"edit": {"*x*": "deny"}})):
+            m = copy.deepcopy(load())
+            mutate(m)
+            self.assertNotEqual(m, load(), "mutation not applied")
+            with self.assertRaises(AssertionError):
+                check_pin(m)
 
     def test_s4_check_blocks_flags_missing_blocks(self):
         cfg = load()

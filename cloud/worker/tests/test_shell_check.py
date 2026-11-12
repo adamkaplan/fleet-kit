@@ -12,21 +12,24 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 WORKER = os.path.dirname(HERE)
 TOOL = os.path.join(WORKER, "cw-shell-check")
 REAL_LIST = os.path.join(WORKER, "opencode-worker.json")
-BY_ID_ROWS = ("gh api*/issues/comments/*", "gh api*/issues/comments/* *", "gh api*/issues/comments/*?*")
+# ask #2402: the pod's file has no deny row any more, so the simulator is exercised on a fixture list of rows that the test owns (the same shape as the file:
+# both permission blocks, the last matching row decides), with the kind of rows an operator adds (a deny pattern, an allow row for cw-run start) and a few
+# api rows that give the order of rows something to decide.
+FIXTURE_ROWS = {
+    "*": "allow",
+    "gh api*/issues*": "deny",
+    "gh api*/issues/*/comments": "allow",
+    "gh api*/issues/*/comments *": "allow",
+    "gh api* -f*": "deny",
+    "gh api*-X PATCH*": "deny",
+    "sleep 3*": "deny",
+    "cw-run start*": "allow",
+}
 
 
 def _fixture_list():
-    # a copy of the repository's list without the three by-id rows, written once per test process
-    with open(REAL_LIST) as fh:
-        doc = json.load(fh)
-    removed = 0
-    for node in (doc, doc["agent"]["worker"]):
-        bash = node["permission"]["bash"]
-        for row in BY_ID_ROWS:
-            if row in bash:
-                del bash[row]
-                removed += 1
-    assert removed == len(BY_ID_ROWS) * 2, "a by-id row was not found (%d removals, wanted each of %d rows in both permission lists)" % (removed, len(BY_ID_ROWS))
+    doc = {"permission": {"question": "deny", "bash": dict(FIXTURE_ROWS)},
+           "agent": {"worker": {"permission": {"question": "deny", "bash": dict(FIXTURE_ROWS)}}}}
     path = os.path.join(tempfile.mkdtemp(prefix="cw-shell-check-"), "opencode-worker.json")
     with open(path, "w") as fh:
         json.dump(doc, fh, indent=2)
@@ -114,7 +117,7 @@ class ShellCheck(unittest.TestCase):
         bad = disagreements(LIST)
         self.assertEqual(bad, [], "cw-shell-check disagrees with the order check:\n" + "\n".join(bad))
 
-    def test_the_by_id_read_is_denied_and_the_list_route_allowed(self):
+    def test_the_fixture_deny_row_denies_and_the_later_allow_row_allows(self):
         self.assertEqual(run_tool(LIST, PARTS[8])[0], 1)
         self.assertEqual(run_tool(LIST, "gh api repos/o/r/issues/7/comments")[0], 0)
         self.assertEqual(run_tool(LIST, COMPOUND)[0], 1)
@@ -297,15 +300,30 @@ class Mutant(unittest.TestCase):
             # a no-op "mutation" (the text unchanged) must not count as applied
             self.assertTrue(original != original, "the mutation was not applied")
 
-class RealListByIdRead(unittest.TestCase):
-    def test_real_list_allows_the_by_id_read_and_denies_its_write_form(self):
-        read = subprocess.run([sys.executable, TOOL, "--list", REAL_LIST, "gh api repos/o/r/issues/comments/1"],
-                              capture_output=True, text=True)
-        self.assertEqual(read.returncode, 0, read.stdout)
-        write = subprocess.run([sys.executable, TOOL, "--list", REAL_LIST,
-                                "gh api repos/o/r/issues/comments/1 -X PATCH -f body=x"],
-                               capture_output=True, text=True)
-        self.assertEqual(write.returncode, 1, write.stdout)
+class RealList(unittest.TestCase):
+    def run_real(self, command, path=REAL_LIST):
+        p = subprocess.run([sys.executable, TOOL, "--list", path, command], capture_output=True, text=True)
+        return p.returncode, p.stdout
+
+    def test_real_list_allows_what_the_fixture_denied(self):
+        for command in ("gh api repos/o/r/issues/comments/1", "gh api repos/o/r/issues/comments/1 -X PATCH -f body=x", "sleep 300",
+                        "git push origin main", "gh pr merge 5"):
+            code, out = self.run_real(command)
+            self.assertEqual((code, out.split()[0]), (0, "allow"), command)
+
+    def test_real_list_plus_the_operators_long_run_rows_reports_them(self):
+        with open(REAL_LIST) as fh:
+            doc = json.load(fh)
+        for bash in (doc["permission"]["bash"], doc["agent"]["worker"]["permission"]["bash"]):
+            bash["sleep*"] = "deny"          # the rows the entrypoint appends for CW_LONG_RUN_DENY, in its order
+            bash["cw-run start*"] = "allow"
+        path = os.path.join(tempfile.mkdtemp(prefix="cw-shell-check-"), "opencode-worker.json")
+        with open(path, "w") as fh:
+            json.dump(doc, fh, indent=2)
+        code, out = self.run_real("sleep 300", path)
+        self.assertEqual((code, out.strip()), (1, "deny sleep* : sleep 300"))
+        code, out = self.run_real("cw-run start --name x -- sleep 300", path)
+        self.assertEqual((code, out.strip()), (0, "allow cw-run start* : cw-run start --name x -- sleep 300"))
 
 
 if __name__ == "__main__":

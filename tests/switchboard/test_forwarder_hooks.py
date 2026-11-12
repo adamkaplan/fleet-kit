@@ -70,9 +70,13 @@ class TestForwarderHooks(Base):
             return proc
 
         (self.home / "state").mkdir(exist_ok=True)
-        self.audit = []
+        self.audit, self.writes = [], []
         audit = mock.Mock()
-        audit.append = lambda actor, event, subject, detail: self.audit.append((event, subject, detail))
+
+        def append(actor, event, subject, detail, **more):
+            # a GitHub write goes through github_write (#2260): its intent and result lines carry phase=... and are kept apart from the hook notes
+            (self.writes if event == "github.write" else self.audit).append((event, subject, detail, more))
+        audit.append = append
         hub = sb.GitHubHub(sb.validate_config({"github_repos": [REPO], "gh": "gh"}), self.home / "state", audit, runner, spawn, lambda: self.at[0])
         hub.port = 4711
         if not clear:   # today's code: nothing is listed or removed
@@ -101,6 +105,31 @@ class TestForwarderHooks(Base):
         self.assertEqual(stale & set(self.hooks_when_started), set(), "a stale hook was still there when the forwarder started")
         self.assertTrue({100, 101, 102} <= set(self.hooks_when_started))
         self.assertIsNone(hub.watches[REPO].hook_note)
+
+    def test_every_hook_delete_is_audited_as_a_github_write_intent_first(self):
+        runner = HooksRunner(self.stale_world())
+        self.start(runner)
+        deleted = runner.deleted()
+        self.assertTrue(deleted)
+        intents = [w for w in self.writes if w[3].get("phase") == "intent"]
+        results = [w for w in self.writes if w[3].get("phase") == "result"]
+        self.assertEqual([(w[2]["verb"], w[2]["endpoint"]) for w in intents], [("DELETE", "repos/%s/hooks/%d" % (REPO, i)) for i in deleted])
+        self.assertEqual(len(results), len(intents))
+        self.assertTrue(all(w[3].get("ok") for w in results))
+
+    def test_a_hook_delete_whose_audit_line_cannot_be_written_is_not_made(self):
+        runner = HooksRunner(self.stale_world())
+        hub = self.build(runner)
+        good = hub.audit.append
+
+        def append(actor, event, *rest, **more):
+            if event == "github.write":
+                raise OSError("disk full")
+            return good(actor, event, *rest, **more)
+        hub.audit.append = append
+        hub.tick()
+        self.assertEqual(runner.deleted(), [], "no audit line, no write")
+        self.assertEqual(len(self.procs), 1, "the forwarder starts anyway")
 
     def test_s3_a_stop_removes_only_the_hook_the_forwarder_made(self):
         runner = HooksRunner(self.stale_world())
