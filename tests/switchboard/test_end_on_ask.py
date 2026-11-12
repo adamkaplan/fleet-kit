@@ -1,4 +1,4 @@
-"""Ask #2393 (S4): a pod's end is posted on its ask: the final message and each run log's tail (the run record's `run_logs`, fleet-cloud's proposed shape), scrubbed and cut.
+"""Ask #2393 (S4): a pod's end is posted on its ask: the final message and each run log's tail (the run record's `end_hook.run_logs.runs`, ask #2432), scrubbed and cut.
 Fake pods and a recording comment path (the daemon's own `post_ask_comment`); nothing is stopped and nothing reaches GitHub. The control removes the post (today's end)."""
 import argparse
 import inspect
@@ -25,9 +25,10 @@ class TestEndOnAsk(unittest.TestCase):
         w = StopWorld(self)
         rec = w.pod(NAME, final)
         if run_json:
-            if run_logs is None and log is not None:   # fleet-cloud's proposed shape: run_logs = [{name, exit, log_tail, saved}]
-                run_logs = [{"name": "land.log", "exit": 0, "log_tail": log, "saved": True}]
-            (rec / "run.json").write_text(json.dumps({"run_logs": run_logs} if run_logs is not None else {}))
+            if run_logs is None and log is not None:   # the merged shape (ask #2432): end_hook.run_logs.runs = [{name, exit, woke, log_tail}]
+                run_logs = [{"name": "land.log", "exit": 0, "log_tail": log, "woke": False}]
+            shape = {"end_hook": {"run_logs": {"runs": run_logs, "wake_lines": []}}} if isinstance(run_logs, list) else {"end_hook": {"run_logs": run_logs}} if run_logs is not None else {}
+            (rec / "run.json").write_text(json.dumps(shape))
         cloud = sb.load_module("cloud_worker").bind(sb.__dict__)
         engine, posts, events, cluster = mock.Mock(), [], [], mock.MagicMock()
         engine.send = lambda sender, to, text: w.sent.append((to, text))
@@ -75,8 +76,8 @@ class TestEndOnAsk(unittest.TestCase):
         self.assertLessEqual(len("\n".join(shown)), LIMIT)
 
     def test_each_run_log_with_a_tail_is_posted_with_its_exit_and_the_others_are_skipped(self):
-        logs = [{"name": "build.log", "exit": 2, "log_tail": "compile failed", "saved": True}, {"name": "idle.log", "exit": None, "log_tail": "", "saved": False},
-                {"name": "land.log", "exit": None, "log_tail": "still going", "saved": True}, {"name": "none.log", "exit": 0, "saved": True}, "junk", {"log_tail": 5}]
+        logs = [{"name": "build.log", "exit": 2, "log_tail": "compile failed", "woke": False}, {"name": "idle.log", "exit": None, "log_tail": "", "woke": False},
+                {"name": "land.log", "exit": None, "log_tail": "still going", "woke": False}, {"name": "none.log", "exit": 0, "woke": False}, "junk", {"log_tail": 5}]
         posts, _ = self.end(run_logs=logs)
         body = posts[0][1]
         self.assertIn("build.log (exit 2)", body)
@@ -85,9 +86,9 @@ class TestEndOnAsk(unittest.TestCase):
         self.assertEqual((body.count("idle.log"), body.count("none.log")), (0, 0))
 
     def test_a_hostile_name_or_exit_is_neither_shown_nor_trusted(self):
-        logs = [{"name": "ghp_" + "A1b2C3d4E5f6G7h8I9j0" + "@everyone/..", "exit": "0\n```x", "log_tail": "one", "saved": True},
-                {"name": "a`b\nc", "exit": True, "log_tail": "two", "saved": True}, {"name": "ok.log", "exit": 10 ** 7, "log_tail": "three", "saved": True},
-                {"name": "../../etc/passwd", "exit": 3.5, "log_tail": "four", "saved": True}]
+        logs = [{"name": "ghp_" + "A1b2C3d4E5f6G7h8I9j0" + "@everyone/..", "exit": "0\n```x", "log_tail": "one", "woke": False},
+                {"name": "a`b\nc", "exit": True, "log_tail": "two", "woke": False}, {"name": "ok.log", "exit": 10 ** 7, "log_tail": "three", "woke": False},
+                {"name": "../../etc/passwd", "exit": 3.5, "log_tail": "four", "woke": False}]
         posts, _ = self.end(run_logs=logs)
         body = posts[0][1]
         self.assertNotIn("ghp_", body)
@@ -100,7 +101,7 @@ class TestEndOnAsk(unittest.TestCase):
 
     def test_at_most_the_entry_cap_of_run_logs_is_posted_each_clipped(self):
         cap = sb.load_module("cloud_worker").bind(sb.__dict__)._retired().END_LOG_ENTRIES
-        logs = [{"name": "r%d.log" % i, "exit": 0, "log_tail": "line\n" * LIMIT, "saved": True} for i in range(cap * 3)]
+        logs = [{"name": "r%d.log" % i, "exit": 0, "log_tail": "line\n" * LIMIT, "woke": False} for i in range(cap * 3)]
         posts, _ = self.end(run_logs=logs)
         body = posts[0][1]
         self.assertEqual(body.count("[run log "), cap)

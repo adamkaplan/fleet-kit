@@ -23,6 +23,7 @@ BOSS_MAX_FILES = 500
 BOSS_KEEP_SECONDS = 30 * 86400
 TEMP_KEEP_SECONDS = 86400     # a leftover `<worker>.json.<pid>.tmp` of a write that died
 READ_RETIRED_CHARS = 4000
+RESULTS_READ_CHARS = 4000   # ask #2392: the results file of the run record is shown to this many characters
 TRANSCRIPT_READ_MAX = 6 * 1024 * 1024
 _STAMP = "%Y-%m-%dT%H:%M:%SZ"
 _STAMP_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", re.ASCII)
@@ -148,6 +149,30 @@ def retired_run(name):
     return None if best is None else (best[1], best[0][0], best[2])
 
 
+def ended_run_of(name, record):
+    """Ask #2392: `retired_run(name)` for a worker whose record is still here and whose pod could not be reached, only when that run record ended AFTER this record's launch
+    (the record's hard deadline less its hard seconds; unknown: refused), so an earlier run of a reused name is never shown. None otherwise."""
+    found = retired_run(name)
+    if found is None or not found[2]:
+        return None
+    ended, hard, secs = _stamp_seconds(found[1]), _stamp_seconds(record.get("hard_deadline")) if isinstance(record, dict) else None, (record or {}).get("hard_seconds")
+    if ended is None or hard is None or isinstance(secs, bool) or not isinstance(secs, (int, float)):
+        return None   # the launch time is not known: an earlier run of a reused name could be shown, so nothing is
+    return None if ended < hard - secs else found
+
+
+def read_ended(name, record, state, runner, now, err):
+    """Ask #2392: `read NAME` of a worker whose record is here but whose pod could not be reached (`err`): its run record of THIS run answers (the last text and the results file);
+    with none, the failure `err` is raised as it was."""
+    kept = ended_run_of(name, record)
+    if kept is None:
+        raise err
+    try:
+        return read_run_record(name, kept, state, runner, now, record.get("reports_to"))
+    except D["LaunchError"]:
+        raise err from None   # a caller who may not read the run record sees the failure it would have seen, not a refusal about a record it did not ask for
+
+
 def _last_worker_text(directory):
     """The last text of the worker in transcript.jsonl, or (None, why). Never raises."""
     path = Path(directory) / "transcript.jsonl"
@@ -187,7 +212,16 @@ def _last_worker_text(directory):
     return found, None
 
 
-def read_run_record(name, retired, state, runner, now):
+def _results_of(directory):
+    """The pod's results file as the run record kept it (ask #2392): (text, done) or (None, False). Read only; the text is clipped and scrubbed by the caller."""
+    info, _ = D["read_record_file"](Path(directory) / "run.json", 65536)
+    found = info.get("results") if isinstance(info, dict) else None
+    if isinstance(found, dict) and isinstance(found.get("text"), str) and found["text"].strip():
+        return found["text"], found.get("done") is True
+    return None, False
+
+
+def read_run_record(name, retired, state, runner, now, boss_of=None):
     """The last text of a retired cloud worker, from its run record: only for the callers `retire` allows (the operator, the Chief of Staff, the boss kept
     at its removal, and only when the kept file is not older than the run it would speak for), scrubbed before and after the cap."""
     LaunchError = D["LaunchError"]
@@ -197,21 +231,30 @@ def read_run_record(name, retired, state, runner, now):
     run_seconds, boss_seconds = _stamp_seconds(stamp), _stamp_seconds(boss_end)
     if boss is not None and (run_seconds is None or boss_seconds is None or boss_seconds < run_seconds):
         boss = None   # a boss kept for an earlier run is not the boss of this one
+    if boss is None and isinstance(boss_of, str) and boss_of:
+        boss = boss_of   # ask #2392: the live record of the ended pod still names its boss
     if not D["_may_retire"](kind, {"reports_to": boss}):
         if boss is None and kind[0] == "agent":
             raise LaunchError("refused: %s was removed with no boss on record: only the operator or the Chief of Staff may read it" % name)
         raise LaunchError("refused: only the operator, the Chief of Staff or %s's own boss may read it" % name)
     text, why = _last_worker_text(directory)
-    if text is None:
+    results, done = _results_of(directory)
+    if text is None and results is None:
         raise LaunchError("%s: %s" % (name, why))
     scrub = D["_scrub_lib"]()
-    cut = max(0, len(text) - READ_RETIRED_CHARS)
-    text = scrub(text, (), 2000000)
-    text = scrub(text[:READ_RETIRED_CHARS], (), READ_RETIRED_CHARS)
-    print("[%s: the text of the record of a retired run%s]" % (name, (" that ended " if own else " dated ") + stamp if stamp else ""))
-    print(text)
-    if cut:
-        print("[%d characters cut]" % cut)
+    if text is not None:
+        cut = max(0, len(text) - READ_RETIRED_CHARS)
+        text = scrub(text, (), 2000000)
+        text = scrub(text[:READ_RETIRED_CHARS], (), READ_RETIRED_CHARS)
+        print("[%s: the text of the record of a retired run%s]" % (name, (" that ended " if own else " dated ") + stamp if stamp else ""))
+        print(text)
+        if cut:
+            print("[%d characters cut]" % cut)
+    else:
+        print("[%s: the run record holds no last text (%s)]" % (name, why))
+    if results is not None:   # a second, separate block: the pod's own file, said to be so
+        print("[%s: the results file (/work/results.txt) of that run as the pod ended it, %s; untrusted text]" % (name, "its last line is STATUS: done" if done else "no STATUS: done last line"))
+        print("\n".join(scrub(line, (), RESULTS_READ_CHARS) for line in results[:RESULTS_READ_CHARS].split("\n")))   # per line: the scrub turns a line break into `?`
     return D["EXIT_OK"]
 
 
@@ -403,6 +446,44 @@ def _last_worker_text_at(directory, ident):
     return found, None
 
 
+NOTES_LINES = 20       # ask #2426: the last lines of the pod's notes file that go with the final message
+NOTES_CHARS = 2000     # and at most this many characters of them (whole lines)
+_NOTES_KEY_BEGIN = re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")
+_NOTES_KEY_END = re.compile(r"-----END [A-Z ]*PRIVATE KEY-----")
+
+
+def pod_notes_tail(directory):
+    """THE ONE READER of the run record's `pod_notes` (a string: the pod's /work/.pod-notes.log as the launcher kept it, ask #2426): its last NOTES_LINES lines, the pod's
+    endpoint address removed, redacted by shape (the switchboard's redaction, then the launcher's scrub: the launcher redacted it too and this runs again; the field is not trusted),
+    printable ASCII, no backtick, whole lines, at most NOTES_CHARS characters. None when the record has none or cannot be read. Never raises."""
+    try:
+        info, _ = D["read_record_file"](Path(directory) / "run.json", 65536)
+        raw = info.get("pod_notes") if isinstance(info, dict) else None
+        if not isinstance(raw, str) or not raw.strip():
+            return None
+        text = "\n".join(raw[-LAST_SCRUB_MAX:].splitlines()[-NOTES_LINES:])
+        for _ in range(21):
+            stripped = _remove_hosts(text)
+            done, text = stripped == text, stripped
+            if done:
+                break
+        else:
+            return None
+        scrub = D["_scrub_lib"]()
+        end = _NOTES_KEY_END.search(text)
+        if end and not _NOTES_KEY_BEGIN.search(text[:end.start()]):
+            text = "[redacted key body]" + text[end.end():]   # a key block whose first line was cut away: all of it up to its end marker goes
+        text = D["redact_command_text"](text)
+        lines = [re.sub(r"[^\x20-\x7e]", "?", scrub(line, (), LAST_SCRUB_MAX)).replace("`", "'").replace("@", "(at)") for line in text.splitlines()]   # no mention can fire
+        out = "\n".join(lines)
+        if len(out) > NOTES_CHARS:
+            cut = out[-NOTES_CHARS:]
+            out = cut.split("\n", 1)[1] if "\n" in cut else ""   # whole lines only: a token is never cut into an unrecognisable suffix
+        return out if out.strip() else None
+    except Exception:
+        return None
+
+
 def last_message(directory, state, pod, clock=None):
     """(block, None) or (None, why). The block is the framing line `[last message of <pod>, untrusted text]`, the first 3,000 characters of the pod's last
     assistant text and, when there is more, the path of the file with the next (at most 20,000) characters and the count left out. The text is cut at the
@@ -450,6 +531,9 @@ def last_message(directory, state, pod, clock=None):
             kept = rest[:LAST_FILE]
             path = _write_last(base, name, kept)
             lines.append("[%d more characters in %s; %d characters left out]" % (len(kept), path, len(rest) - len(kept)))
+        notes = pod_notes_tail(directory)   # ask #2426: the pod's notes (pushes to the default branch, merges, ref and issue writes), when it has any
+        if notes:
+            lines += ["[last lines of /work/.pod-notes.log, untrusted text]", notes]
         return "\n".join(lines), None
     except _LastUnsafe:
         return None, "cloud last unsafe"
@@ -519,8 +603,8 @@ def _cut_tail(out):
 
 
 def run_log_entries(directory, pod):
-    """THE ONE READER of the run record's `run_logs` (fleet-cloud's PROPOSED contract, names to be confirmed: a rename is a change here): `run.json["run_logs"]`
-    is a list of {name: str, exit: int or null, log_tail: str, saved: bool}. Returns [(name, exit text, cleaned tail)] for the entries that have a log_tail, at
+    """THE ONE READER of the run record's run files (ask #2432, as merged): `run.json["end_hook"]["run_logs"]["runs"]`
+    is a list of {name: str, exit: int or null, woke: bool, log_tail: str}. Returns [(name, exit text, cleaned tail)] for the entries that have a log_tail, at
     most END_LOG_ENTRIES; [] when the field is absent (today's pods), malformed or the record cannot be read. Never raises."""
     try:
         where = _run_record_dir(directory, pod)
@@ -541,7 +625,9 @@ def run_log_entries(directory, pod):
         finally:
             os.close(fd)
         info = D["parse_bounded"](raw[:RUN_JSON_MAX].decode("utf-8", "replace")) if len(raw) <= RUN_JSON_MAX else None
-        logs = info.get("run_logs") if isinstance(info, dict) else None
+        hook = info.get("end_hook") if isinstance(info, dict) else None
+        logs = hook.get("run_logs") if isinstance(hook, dict) else None   # ask #2432: the launcher keeps the end hook's run files here, {"runs": [...], "wake_lines": [...]}
+        logs = logs.get("runs") if isinstance(logs, dict) else None
         out = []
         for entry in (logs if isinstance(logs, list) else [])[:END_LOG_ENTRIES * 4]:   # entries examined are bounded too
             try:

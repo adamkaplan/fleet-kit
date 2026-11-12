@@ -943,7 +943,7 @@ def _print_capacity(runner, cluster):
             body = body if code == 0 else None
         except CloudError:
             body = None
-        lines = capacity_block(body, lib.SHAPES, lib._quantity, skip=(lib.DEFAULT_ORCHESTRATOR_SHAPE,))
+        lines = capacity_block(body, getattr(lib, "capacity_shapes", lambda: lib.SHAPES)(), lib._quantity, skip=(lib.DEFAULT_ORCHESTRATOR_SHAPE,))
         print("\n".join(lines), file=sys.stderr)
     except Exception:
         print("cloud capacity before the create: not read", file=sys.stderr)
@@ -1165,11 +1165,11 @@ def cmd_read(args, runner, now):
     engine, state, config = H["build_engine"](runner, now, "cli", writable=False)
     if record is not None:
         session = _session_of(record)
-        with Cluster() as cluster, tunnel(cluster, record) as live:
-            messages = remote_v2(state, live, config["call_timeout_seconds"]).message_list(session, limit=limit, order="desc") or []
-        for message in reversed([m for m in messages if isinstance(m, dict)]):
-            print(message_line(message))
-        return H["EXIT_OK"]
+        try:
+            with Cluster() as cluster, tunnel(cluster, record) as live:
+                messages = remote_v2(state, live, config["call_timeout_seconds"]).message_list(session, limit=limit, order="desc") or []
+        except Exception as err:   # ask #2392: an ended pod answers from its run record when it has one; none keeps the failure
+            return _retired().read_ended(args.name, record, state, runner, now, err)
     else:   # a local agent, on the local service
         seen = engine.discover(engine.now()).agents.get(args.name)
         known = {} if seen else H["known_agent"](state, args.name)
@@ -1181,8 +1181,7 @@ def cmd_read(args, runner, now):
             if retired is not None:
                 return _retired().read_run_record(args.name, retired, state, runner, now)
             raise LaunchError("%s is not a fleet agent this switchboard has seen" % args.name)
-        v2 = engine.v2
-    messages = v2.message_list(session, limit=limit, order="desc") or []
+        messages = engine.v2.message_list(session, limit=limit, order="desc") or []
     for message in reversed([m for m in messages if isinstance(m, dict)]):
         print(message_line(message))
     return H["EXIT_OK"]
@@ -1472,6 +1471,7 @@ def cmd_retire(args, runner, now, record):
         raise LaunchError("%s: the record is kept" % err) from None
     _audit(engine, "cloud.stopped", args.name, {"exit": code, "reason": reason, "runtime_id": record.get("runtime_id"),
                                                 "pushed": (body or {}).get("pushed"), "wip_branch": (body or {}).get("wip_branch")})
+    code, body = (0, {"pod_gone": True}) if code == 1 and _pod_is_gone(runner, record) else (code, body)   # no pod, no end hook: not a failed push (#2404)
     if code == 1:
         save = "%s-save" % args.name
         message = ("Commit the working tree of /work/repo as ONE commit on the new branch %s (a name that does not exist on origin), push it with a plain "
@@ -1562,5 +1562,5 @@ for _name in ("INSPECT_SECONDS", "_inspect_short", "cmd_inspect"):
 # ---------------------------------------------------------------- the shape-M count of a lane (ask #2259, bin/cloud_lane_cap.py)
 
 cloud_lane_cap = _load_part("cloud_lane_cap")
-for _name in ("lane_m_workers", "_ended", "_stopped_ids"):
+for _name in ("lane_m_workers", "_ended", "_stopped_ids", "_pod_is_gone"):
     globals()[_name] = getattr(cloud_lane_cap, _name)

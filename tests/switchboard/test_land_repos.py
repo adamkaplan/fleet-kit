@@ -33,31 +33,31 @@ class TestReader(unittest.TestCase):
 
     def test_s3_the_default_is_off_no_repository_lands_when_the_key_is_absent_or_null(self):
         for config in ({}, None, {"land_repos": None}):
-            for repo in ("janus-infra/widget", "acme/other", "adamkaplan/fleet-kit"):
+            for repo in ("acme-org/widget", "acme/other", "adamkaplan/fleet-kit"):
                 self.assertFalse(self.land.uses_spire_land(config, repo))
 
-    def test_s3_an_explicit_janus_infra_glob_turns_the_land_path_on_for_that_owner_only(self):
-        config = {"land_repos": ["janus-infra/*"]}
-        self.assertTrue(self.land.uses_spire_land(config, "janus-infra/widget"))
+    def test_s3_an_explicit_acme_org_glob_turns_the_land_path_on_for_that_owner_only(self):
+        config = {"land_repos": ["acme-org/*"]}
+        self.assertTrue(self.land.uses_spire_land(config, "acme-org/widget"))
         self.assertFalse(self.land.uses_spire_land(config, "acme/other"))
         self.assertFalse(self.land.uses_spire_land(config, "adamkaplan/fleet-kit"))
 
     def test_s4_an_empty_list_puts_every_repository_back_on_pull_requests(self):
-        self.assertFalse(self.land.uses_spire_land({"land_repos": []}, "janus-infra/widget"))
+        self.assertFalse(self.land.uses_spire_land({"land_repos": []}, "acme-org/widget"))
 
     def test_a_list_names_repositories_and_owner_globs_case_blind(self):
         config = {"land_repos": ["Acme/one", "beta/*"]}
         self.assertTrue(self.land.uses_spire_land(config, "acme/ONE"))
         self.assertTrue(self.land.uses_spire_land(config, "beta/anything"))
         self.assertFalse(self.land.uses_spire_land(config, "acme/two"))
-        self.assertFalse(self.land.uses_spire_land(config, "janus-infra/widget"), "a repository the list does not name is not on the land path")
+        self.assertFalse(self.land.uses_spire_land(config, "acme-org/widget"), "a repository the list does not name is not on the land path")
 
     def test_a_glob_or_a_malformed_name_is_never_a_repository(self):
-        for repo in ("janus-infra/*", "janus-infra", "janus-infra/widget\n", None, 7, ""):
+        for repo in ("acme-org/*", "acme-org", "acme-org/widget\n", None, 7, ""):
             self.assertFalse(self.land.uses_spire_land({}, repo), repr(repo))
 
     def test_a_bad_value_names_the_key(self):
-        for bad in ("janus-infra/*", ["nowhere"], [3], {"a": 1}, ["a/b"] * 201):
+        for bad in ("acme-org/*", ["nowhere"], [3], {"a": 1}, ["a/b"] * 201):
             with self.assertRaises(self.land.ConfigError) as caught:
                 self.land.validate_land_repos({"land_repos": bad}, "config.json")
             self.assertIn("land_repos", str(caught.exception))
@@ -71,7 +71,7 @@ class TestConfigLoader(unittest.TestCase):
         self.assertEqual(sb.validate_config({"land_repos": []})["land_repos"], [])
         self.assertNotIn("land_repos", sb.validate_config({"land_repos": None}))
         with self.assertRaises(sb.ConfigError) as caught:
-            sb.validate_config({"land_repos": "janus-infra/*"})
+            sb.validate_config({"land_repos": "acme-org/*"})
         self.assertIn("land_repos", str(caught.exception))
 
 
@@ -89,7 +89,7 @@ sys.exit(1)
 """
 
 
-LAND_ON = ["janus-infra/*"]   # the explicit switch: the code default is off
+LAND_ON = ["acme-org/*"]   # the explicit switch: the code default is off
 ABSENT = object()
 
 
@@ -108,7 +108,7 @@ class TestGatesSkipped(unittest.TestCase):
 
     def run_cmd(self, command, repo, land_repos=LAND_ON, *extra):
         config = {"gh": str(self.gh), "opencode": "/bin/true",
-                  "plan_gates": {"repos": {"janus-infra/widget": {"mode": "shadow"}, "acme/other": {"mode": "shadow"}}}}
+                  "plan_gates": {"repos": {"acme-org/widget": {"mode": "shadow"}, "acme/other": {"mode": "shadow"}}}}
         if land_repos is not ABSENT:
             config["land_repos"] = land_repos
         cfg = self.tmp / "config"
@@ -123,7 +123,7 @@ class TestGatesSkipped(unittest.TestCase):
         return done, calls
 
     def test_s3_gates_check_of_a_land_repository_allows_and_reads_nothing(self):
-        done, calls = self.run_cmd("gates-check", "janus-infra/widget", LAND_ON, "--json")
+        done, calls = self.run_cmd("gates-check", "acme-org/widget", LAND_ON, "--json")
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
         self.assertEqual(json.loads(done.stdout)["verdict"], "allow")
         self.assertIn("land_repos", json.loads(done.stdout)["reason"])
@@ -134,27 +134,27 @@ class TestGatesSkipped(unittest.TestCase):
         self.assertTrue(any(c[:2] == ["pr", "view"] for c in calls), (calls, done.stdout, done.stderr))
 
     def test_s3_with_the_key_absent_the_repository_is_on_the_gates(self):
-        done, calls = self.run_cmd("gates-check", "janus-infra/widget", ABSENT, "--json")
+        done, calls = self.run_cmd("gates-check", "acme-org/widget", ABSENT, "--json")
         self.assertTrue(any(c[:2] == ["pr", "view"] for c in calls), (calls, done.stdout, done.stderr))
 
     def test_s3_with_the_key_null_the_repository_is_on_the_gates(self):
-        done, calls = self.run_cmd("gates-check", "janus-infra/widget", None, "--json")
+        done, calls = self.run_cmd("gates-check", "acme-org/widget", None, "--json")
         self.assertTrue(any(c[:2] == ["pr", "view"] for c in calls), (calls, done.stdout, done.stderr))
 
     def test_s4_with_land_repos_empty_the_repository_is_back_on_the_gates(self):
-        done, calls = self.run_cmd("gates-check", "janus-infra/widget", [], "--json")
+        done, calls = self.run_cmd("gates-check", "acme-org/widget", [], "--json")
         self.assertTrue(any(c[:2] == ["pr", "view"] for c in calls), (calls, done.stdout, done.stderr))
 
     def test_s3_the_merge_door_of_a_land_repository_asks_nothing_and_another_repository_still_reads(self):
-        done, calls = self.run_cmd("merge-gate", "janus-infra/widget")
+        done, calls = self.run_cmd("merge-gate", "acme-org/widget")
         self.assertEqual((done.returncode, calls), (0, []), done.stdout + done.stderr)
         done, calls = self.run_cmd("merge-gate", "acme/other")
         self.assertTrue(calls, "the control repository's merge door reads GitHub")
-        done, calls = self.run_cmd("merge-gate", "janus-infra/widget", [])
+        done, calls = self.run_cmd("merge-gate", "acme-org/widget", [])
         self.assertTrue(calls, "land_repos [] puts it back")
 
     def test_merge_gate_pass_of_a_land_repository_is_refused_not_reported_as_done(self):
-        done, calls = self.run_cmd("merge-gate", "janus-infra/widget", LAND_ON, "--pass", "--merge")
+        done, calls = self.run_cmd("merge-gate", "acme-org/widget", LAND_ON, "--pass", "--merge")
         self.assertNotEqual(done.returncode, 0)
         self.assertEqual(calls, [])
 
@@ -165,11 +165,11 @@ class TestLandCompletion(Case):
     def setUp(self):
         super().setUp()
         self.reports, self.main = [], []
-        self.engine.config = {"land_repos": ["janus-infra/*"]}
+        self.engine.config = {"land_repos": ["acme-org/*"]}
         self.engine.report = lambda sender, state, text, *a, **k: (self.reports.append((sender, state, text)), {"sent": True})[1]
         self.ns.is_land_repo = land_module().is_land_repo
         self.ns.reported_text = lambda worker: "landed %s landed %s" % (SHA, "f" * 40)   # ask #2393: a pod's own landing is the sha it reported (or a patch id of its branch)
-        self.engine.cloud_watch = {"records": [record("w-a", "lane-a", "janus-infra/widget")]}
+        self.engine.cloud_watch = {"records": [record("w-a", "lane-a", "acme-org/widget")]}
         gh = self.world.__call__
         self.paths = []
 
@@ -215,7 +215,7 @@ class TestLandCompletion(Case):
         self.assertEqual((self.reports, [p for p in self.paths if "/commits?sha=" in p]), ([], []))
 
     def test_u1_two_live_workers_in_one_repository_complete_only_the_one_that_reported_the_sha(self):
-        self.engine.cloud_watch = {"records": [record("w-a", "lane-a", "janus-infra/widget"), record("w-b", "lane-b", "janus-infra/widget")]}
+        self.engine.cloud_watch = {"records": [record("w-a", "lane-a", "acme-org/widget"), record("w-b", "lane-b", "acme-org/widget")]}
         self.launcher_line(worker="w-b", action="create")
         self.ns.reported_text = lambda worker: "landed %s" % SHA if worker == "w-b" else None   # ask #2393: only w-b owns it
         self.main = [self.land(SHA, "Add the widget\n\nLand-worker: w-b")]
@@ -253,7 +253,7 @@ class TestLandCompletion(Case):
         self.assertEqual(len(self.reports), 1)
 
     def test_a_land_worker_trailer_alone_does_not_credit_a_pod(self):
-        self.engine.cloud_watch = {"records": [record("w-a", "lane-a", "janus-infra/widget"), record("w-ab", "lane-b", "janus-infra/widget")]}
+        self.engine.cloud_watch = {"records": [record("w-a", "lane-a", "acme-org/widget"), record("w-ab", "lane-b", "acme-org/widget")]}
         self.launcher_line(worker="w-ab", action="create")
         self.ns.reported_text = lambda worker: None   # ask #2393: no pod owns it; the message naming w-ab is no proof
         self.main = [self.land(SHA, "x\n\nLand-worker: w-ab")]
@@ -266,7 +266,7 @@ class TestLandCompletion(Case):
     def test_the_daemons_own_tick_gives_the_push_watch_the_land_reader(self):
         sb = SourceFileLoader("sb_land_tick", str(REPO / "bin" / "fleet-switchboard")).load_module()
         seen = []
-        engine = types.SimpleNamespace(state_dir=None, hub=types.SimpleNamespace(gh_api=lambda *a, **k: []), config={"land_repos": ["janus-infra/*"]}, now=lambda: NOW, audit=None, actor="switchboard")
+        engine = types.SimpleNamespace(state_dir=None, hub=types.SimpleNamespace(gh_api=lambda *a, **k: []), config={"land_repos": ["acme-org/*"]}, now=lambda: NOW, audit=None, actor="switchboard")
         real = SourceFileLoader("pw_probe", str(REPO / "bin" / "push_watch.py")).load_module()
         real_run = real.run_pass
         import importlib.util
@@ -288,8 +288,8 @@ class TestLandCompletion(Case):
         finally:
             importlib.util.spec_from_file_location = orig
         self.assertEqual(len(seen), 1)
-        self.assertTrue(seen[0].is_land_repo({"land_repos": ["janus-infra/*"]}, "janus-infra/widget"))
-        self.assertFalse(seen[0].is_land_repo({"land_repos": ["janus-infra/*"]}, "acme/other"))
+        self.assertTrue(seen[0].is_land_repo({"land_repos": ["acme-org/*"]}, "acme-org/widget"))
+        self.assertFalse(seen[0].is_land_repo({"land_repos": ["acme-org/*"]}, "acme/other"))
 
 
 class TestSweepSkip(unittest.TestCase):
@@ -297,12 +297,12 @@ class TestSweepSkip(unittest.TestCase):
         sb = SourceFileLoader("sb_land_sweep", str(REPO / "bin" / "fleet-switchboard")).load_module()
         read = []
         sb.sweep_read_repo = lambda hub, repo, *a, **k: (read.append(repo), {"at": 0, "items": {}, "truncated": False, "error": None})[1]
-        for config, expected in (({"land_repos": ["janus-infra/*"]}, ["acme/other"]), ({"land_repos": []}, ["acme/other", "janus-infra/widget"]), ({}, ["acme/other", "janus-infra/widget"])):
+        for config, expected in (({"land_repos": ["acme-org/*"]}, ["acme/other"]), ({"land_repos": []}, ["acme/other", "acme-org/widget"]), ({}, ["acme/other", "acme-org/widget"])):
             read[:] = []
             engine = types.SimpleNamespace(hub=object(), config=config, now=lambda: NOW)
             state = types.SimpleNamespace(repos={}, started=NOW, strong=None)
-            sb.sweep_refresh(engine, state, ["janus-infra/widget", "acme/other"], NOW, {"comment_window_days": 7}, None, [50])
-            self.assertEqual(sorted(read), expected)
+            sb.sweep_refresh(engine, state, ["acme-org/widget", "acme/other"], NOW, {"comment_window_days": 7}, None, [50])
+            self.assertEqual(sorted(read), sorted(expected))
 
 
 if __name__ == "__main__":

@@ -49,7 +49,7 @@ def _clean(text, limit):   # no @ (no mention can fire) and no double quote (the
 
 # Ask #2320: a repository that lands by `spire land` (config `land_repos`, read by the switchboard's `uses_spire_land`) has no pull request. A push to its default branch
 # whose commit carries a Land trailer is the worker's completion: ONE `done` report from the worker, through the engine's own report path (the path the worker's own
-# `report done` takes), with the sha. ASSUMPTION (the playbook janus-infra/spire-venue#8193 was not readable): a trailer is a line of the commit message that starts
+# `report done` takes), with the sha. ASSUMPTION (the playbook acme-org/widget-service#8193 was not readable): a trailer is a line of the commit message that starts
 # `Landed-by:` or `Land-<key>:`. With more than one live worker in the repository a commit completes only the worker whose name its message holds.
 LAND_TRAILER = re.compile(r"^(?:Landed-by|Land-[A-Za-z0-9-]+)[ \t]*:[ \t]*\S")
 LAND_READ = 20   # the newest commits of the default branch read per worker per pass
@@ -478,6 +478,8 @@ def run_pass(sb, engine, now, gh, config=None, launcher_audit=None):
             unsent = False
             for csha, c in batch:
                 if csha in b["told"] or csha in mem.get("told", []):   # told once per worker across its branches (ask #2153)
+                    if csha == sha and csha not in b["told"]:   # ask #2392: the tip of ANOTHER branch of the pod (the wip save held it first): said, not told again, so the end notice can name the branch
+                        engine.audit.append(engine.actor, "push_watch.seen", name, {"sha": csha[:8], "branch": _clean(branch, 100), "head": csha})
                     continue
                 b["told"] = (b["told"] + [csha])[-TOLD_MAX:]
                 text = item_text(name, branch, csha, dict(c, files=stats.get("files", c.get("files")), stats=stats.get("stats", c.get("stats"))) if len(batch) > 1 or prev else c)

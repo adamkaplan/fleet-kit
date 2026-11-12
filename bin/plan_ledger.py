@@ -1024,20 +1024,17 @@ def evaluate_gates(plan, entries, ledger_problem, facts, pr, now=None):
             elif isinstance(floor, dict) and floor.get("decision") == "hold" and not floor.get("cleared"):
                 row.update(status="waiting", missing=["held for the owner (impact floor, read at this head): %s; the owner clears it for this head"
                                                       % ("; ".join(floor.get("reasons") or []) or "hold")])
-            # FAIL MODE (#1119): the new wording ONLY when the floor was read and positively says not held, with no hold label. A floor that is
-            # absent or unreadable (handled above or not a dict) and any hold label keep the old behaviour: waiting for the owner.
-            elif (facts or {}).get("captain") and "marker-without-label" in ((facts or {}).get("captain_findings") or ()) \
-                    and isinstance(floor, dict) and not (facts or {}).get("holds"):   # the floor read above says not held
-                row.update(status="ok", detail="a marker without a hold: set MERGE: automatic", missing=[])
+            elif labels_unread((facts or {}).get("captain")):   # the labels (or the fact itself) were not readable: not "not held" (#2379)
+                row.update(status="waiting", missing=["labels could not be read: whether the PR is held for the owner is not known, so it is NOT READY"])
             elif (facts or {}).get("captain"):
-                row.update(status="waiting", missing=["held for the owner (MERGE: captain): the owner decides, through cos"])
+                row.update(status="waiting", missing=["held for the owner (merge-captain label): the owner decides, through cos"])
             else:
                 row.update(status="ok", detail="not a held PR")
         elif gid == "G6b":
             floor = (facts or {}).get("floor")
             # held = the same reading as `pr-explain --check`: a hold label, the merge-captain label or marker, or an uncleared floor hold; a missing
             # `held_check` on a held PR fails closed (missing)
-            held = bool((facts or {}).get("captain")) or bool((facts or {}).get("holds")) or (isinstance(floor, dict) and (bool(floor.get("rehold")) or (floor.get("decision") == "hold" and not floor.get("cleared"))))
+            held = labels_unread((facts or {}).get("captain")) or bool((facts or {}).get("captain")) or bool((facts or {}).get("holds")) or (isinstance(floor, dict) and (bool(floor.get("rehold")) or (floor.get("decision") == "hold" and not floor.get("cleared"))))
             check = (facts or {}).get("held_check")   # the ONE check (`held_defects` in the switchboard), called only for a held PR
             if not held:
                 row.update(status="n/a", detail="not a held PR")
@@ -1181,6 +1178,9 @@ REQUIRED_FOR = {"ready": ("G0a", "G1"), "merge": ("G0a", "G0c", "G1", "G4", "G6"
 DEFAULT_ENFORCED = ("G0a", "G1")   # the gates a repo in `enforce` refuses on unless its `enforce_gates` says otherwise
 ENFORCEABLE = ("G0a", "G0c", "G1", "G4", "G6", "G6b")
 EXIT_ALLOW, EXIT_REFUSE, EXIT_FAIL_OPEN = 0, 10, 3   # only EXIT_REFUSE refuses; every other exit is an allow
+
+
+def labels_unread(captain): return captain is None   # (#2379) an absent or None `captain` fact means the labels could not be read: held or not is unknown, never "not held"
 
 
 def normal_repo(name):

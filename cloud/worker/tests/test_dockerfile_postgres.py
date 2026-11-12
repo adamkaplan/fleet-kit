@@ -89,6 +89,11 @@ def problems(t):
             out.append(n + " comparison must come after the checkout and before any build step")
     if "||" in flat:
         out.append("check or chain masked")
+    if not re.search(r"^ARG PGMQ_VERSION=1\.13\.0$", blk, re.M):
+        out.append("the queue extension is not the version the repository creates")
+    cf = re.search(r"\./configure [^\n&]*", flat)
+    if not cf or not re.search(r"(?<![\w-])--with-openssl\b", cf.group(0)) or "--without-openssl" in flat:
+        out.append("the server was built without OpenSSL")
     code = "\n".join(x for x in blk.replace("\\\n", " ").split("\n") if not x.startswith("#"))
     if len(re.findall(r"sha256sum -c", code)) != 1:
         out.append("expected 1 sha256 check (PostgreSQL)")
@@ -136,7 +141,8 @@ class T(unittest.TestCase):
         # recorded from two separate `git ls-remote` calls and the GitHub tag ref (lightweight tags: the tag is the commit)
         s = stage(read(DF))
         self.assertIn("ARG PGVECTOR_COMMIT=f37c13f68b57d2c3472b2214fbcff699d6d34876", s)
-        self.assertIn("ARG PGMQ_COMMIT=8eab18272e50077ab9f72d9787296655f2849dcc", s)
+        self.assertIn("ARG PGMQ_VERSION=1.13.0\n", s)
+        self.assertIn("ARG PGMQ_COMMIT=32c075bb6dbed66a303d1a792393c93e36c09a97", s)
 
     def mut(self, old, new):
         t = read(DF)
@@ -183,6 +189,22 @@ class T(unittest.TestCase):
         for name, m in ms:
             self.assertNotEqual(m, t, name + " not applied")
             self.assertTrue(problems(m), name + " accepted")
+
+    def test_mutant_without_openssl_is_refused(self):
+        t = read(DF)
+        self.assertEqual(problems(t), [])  # control first: the real file is clean
+        self.assertIn("--with-openssl", t)
+        m = self.mut(" --with-openssl", "")
+        self.assertNotIn("--with-openssl", m)
+        self.assertIn("the server was built without OpenSSL", problems(m))
+        m2 = self.mut("--with-openssl", "--without-openssl")
+        self.assertIn("the server was built without OpenSSL", problems(m2))
+
+    def test_mutant_pgmq_version_is_the_repositorys(self):
+        t = read(DF)
+        self.assertEqual(problems(t), [])  # control first: the real file is clean
+        m = self.mut("ARG PGMQ_VERSION=1.13.0", "ARG PGMQ_VERSION=1.13.1")
+        self.assertIn("the queue extension is not the version the repository creates", problems(m))
 
     def test_s12_scan_covers_opt_pg(self):
         t = read(DF)

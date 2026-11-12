@@ -161,7 +161,7 @@ class PrLabel(unittest.TestCase):
     def test_fork_head_is_not_labelled(self):
         with tempfile.TemporaryDirectory() as tmp:
             s = Scene([pod()], {"w1": "51\n52\n"}, tmp)
-            s.heads = {51: ("coder/x", "open", "someone-else/fleet-kit"), 52: ("coder/x", "open")}
+            s.heads = {51: ("coder/x", "open", "someone-else/cw-kit"), 52: ("coder/x", "open")}
             s.reap()
             self.assertEqual([c[1] for c in s.calls], [52])
 

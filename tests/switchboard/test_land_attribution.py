@@ -15,7 +15,7 @@ from test_land_repos import land_module, LAUNCH   # noqa: E402,F401
 OWN_MAIN = "1" * 40       # the pod's commit as it landed on main (another sha, the same patch)
 OWN_BRANCH = "2" * 40     # the pod's own branch head
 FOREIGN = ["3" * 40, "4" * 40, "5" * 40]
-RAW = "janus-infra/widget"
+RAW = "acme-org/widget"
 
 
 def sb_module():
@@ -42,7 +42,7 @@ class TestLandAttribution(Case):
     def setUp(self):
         super().setUp()
         self.reports, self.main, self.fail_commits = [], [], False
-        self.engine.config = {"land_repos": ["janus-infra/*"]}
+        self.engine.config = {"land_repos": ["acme-org/*"]}
         self.engine.report = lambda sender, state, text, *a, **k: (self.reports.append((sender, text)), {"sent": True})[1]
         self.ns.is_land_repo = land_module().is_land_repo
         self.engine.cloud_watch = {"records": [record("w-a", "lane-a", RAW)]}

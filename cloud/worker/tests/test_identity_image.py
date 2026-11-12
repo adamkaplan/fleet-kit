@@ -20,7 +20,8 @@ DOCKERFILE = os.path.join(WORKER, "Dockerfile")
 README = os.path.join(CLOUD, "README.md")
 PREVIOUS = {"ca-certificates", "curl", "gnupg", "git", "openssh-client", "python3", "python3-pip", "python3-venv", "sudo",
             "iptables", "jq", "procps", "docker-ce", "docker-ce-cli", "containerd.io", "docker-compose-plugin", "docker-buildx-plugin", "xz-utils"}
-NAME, EMAIL = "cloud-worker", "cloud-worker@users.noreply.github.com"
+NAME, EMAIL = "Example Bot", "1+example-bot@users.noreply.example.invalid"   # dummy values: the build arguments are passed at build time
+IDFILE = "/etc/cw-default-identity"
 
 
 def guard_diff(base_ref, run, three_dot=True):
@@ -102,37 +103,55 @@ class Identity(unittest.TestCase):
     def test_u3_the_scan_stage_still_exists(self):
         self.assertEqual(len(re.findall(r"^FROM worker AS scan", read(DOCKERFILE), re.M)), 1)
 
-    def render_system_file(self, dockerfile_text=None):
-        """Run the Dockerfile's identity RUN line (path swapped for a temp file) with the ARG defaults; return the file text."""
+    def render_system_file(self, dockerfile_text=None, args=None):
+        """Run the Dockerfile's identity RUN line (path swapped for a temp file) with the build arguments (the dummy pair unless given); return the file text."""
         text = (dockerfile_text if dockerfile_text is not None else read(DOCKERFILE)).replace("\\\n", " ")
-        args = dict(re.findall(r"^ARG (CW_DEFAULT_IDENT_\w+)=(\S+)$", text, re.M))
-        runs = [l for l in text.splitlines() if l.startswith("RUN ") and "/etc/" + "gitconfig" in l]
+        args = dict(args or {"CW_DEFAULT_IDENT_NAME": NAME, "CW_DEFAULT_IDENT_EMAIL": EMAIL})
+        runs = [l for l in text.splitlines() if l.startswith("RUN ") and IDFILE in l]
         self.assertEqual(len(runs), 1)
         with tempfile.TemporaryDirectory() as d:
-            out = os.path.join(d, "etc-file")
-            line = runs[0][4:].split(" && chmod")[0].replace("/etc/" + "gitconfig", out)
+            out = os.path.join(d, "id-file")
+            line = runs[0][4:].split(" && chown")[0].replace(IDFILE, out)
             subprocess.run(["sh", "-c", line], env=dict(args, PATH="/usr/bin:/bin"), check=True)
             return read(out), args
 
-    def test_s3_the_dockerfile_writes_the_system_file_with_the_one_constant(self):
-        text, args = self.render_system_file()
-        self.assertEqual(args.get("CW_DEFAULT_IDENT_NAME"), NAME)   # the required ARGs carry the one constant; others may be added
-        self.assertEqual(args.get("CW_DEFAULT_IDENT_EMAIL"), EMAIL)
-        self.assertEqual(text.split("\n")[0], "[user]")
-        self.assertTrue({"email", "name"} <= set(re.findall(r"^\s*(\S+) = ", text, re.M)))
-        self.assertEqual(re.findall(r"^\s*name = (.*)$", text, re.M), [NAME])
-        self.assertEqual(re.findall(r"^\s*email = (.*)$", text, re.M), [EMAIL])
-        self.assertEqual(len(re.findall(r"^ARG CW_DEFAULT_IDENT_NAME=", read(DOCKERFILE), re.M)), 1)   # the pair is declared once
+    def system_file_write_lines(self, dockerfile_text):
+        return [l for l in dockerfile_text.replace("\\\n", " ").splitlines() if "/etc/" + "gitconfig" in l and not l.lstrip().startswith("#")]
 
-    def git_identity(self, system_text, repo_identity=False, local_name=None):
-        """'git log -1' author and committer in a temp repository, with only a temp system file (and no variables)."""
+    def check_identity_file(self, dockerfile_text):
+        """The S2 assertions: no write to the system git file, then one identity file of two lines from the two ARGs, root-owned, mode 0444."""
+        self.assertEqual(self.system_file_write_lines(dockerfile_text), [], "the default identity is in the system git file")
+        text, args = self.render_system_file(dockerfile_text)
+        self.assertEqual(text, NAME + "\n" + EMAIL + "\n")
+        flat = dockerfile_text.replace("\\\n", " ")
+        self.assertIn("chown root:root " + IDFILE, flat)
+        self.assertIn("chmod 0444 " + IDFILE, flat)
+        return args
+
+    def test_s2_the_dockerfile_writes_the_identity_file_with_the_one_constant(self):
+        args = self.check_identity_file(read(DOCKERFILE))
+        self.assertEqual(args, {"CW_DEFAULT_IDENT_NAME": NAME, "CW_DEFAULT_IDENT_EMAIL": EMAIL})   # the pair is passed at build time
+        self.assertEqual(len(re.findall(r"^ARG CW_DEFAULT_IDENT_NAME$", read(DOCKERFILE), re.M)), 1)   # the pair is declared once
+
+    def test_s5_mutant_dockerfile_writing_the_system_file_again_fails_with_the_anchored_text(self):
+        src = read(DOCKERFILE)
+        self.check_identity_file(src)   # control first: the unmutated file passes
+        mutated = src.replace(" > " + IDFILE, " > /etc/" + "gitconfig", 1)
+        self.assertNotEqual(mutated, src)   # the mutation applied
+        with self.assertRaises(AssertionError) as cm:
+            self.check_identity_file(mutated)
+        self.assertIn("the default identity is in the system git file", str(cm.exception))
+
+    def git_identity(self, default_text, repo_identity=False, local_name=None):
+        """'git log -1' author and committer in a temp repository, with the default identity in a temp global file (and no variables)."""
         with tempfile.TemporaryDirectory() as d:
             home = os.path.join(d, "home")
             os.mkdir(home)
-            sysfile = os.path.join(d, "system-file")
-            with open(sysfile, "w") as f:
-                f.write(system_text)
-            env = {"PATH": "/usr/bin:/bin", "HOME": home, "GIT_CONFIG_" + S.upper(): sysfile, "GIT_CONFIG_GLO" + "BAL": os.devnull}
+            globalfile = os.path.join(d, "global-file")
+            name, email = default_text.split("\n")[:2]
+            with open(globalfile, "w") as f:
+                f.write("[user]\n\tname = %s\n\temail = %s\n" % (name, email))
+            env = {"PATH": "/usr/bin:/bin", "HOME": home, "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLO" + "BAL": globalfile}
             repo = os.path.join(d, "repo")
             cmds = [["git", "init", "-q", repo]]
             if repo_identity:
@@ -145,7 +164,7 @@ class Identity(unittest.TestCase):
                 self.assertEqual(r.returncode, 0, r.stderr)
             return subprocess.run(["git", "-C", repo, "log", "-1", "--format=%an/%cn"], env=env, capture_output=True, text=True).stdout.strip()
 
-    def test_s5_git_precedence_system_then_repository_then_local(self):
+    def test_s5_git_precedence_global_then_repository_then_local(self):
         text, _ = self.render_system_file()
         self.assertEqual(self.git_identity(text), NAME + "/" + NAME)
         self.assertEqual(self.git_identity(text, repo_identity=True), "repo-owner/repo-owner")
@@ -180,20 +199,18 @@ class Identity(unittest.TestCase):
 
     def test_s6_mutant_a_build_that_writes_a_home_file_is_caught(self):
         src = read(DOCKERFILE)
-        mutated = src.replace("/etc/" + "gitconfig", "/home/worker/" + GITCFG)
+        mutated = src.replace(IDFILE, "/home/worker/" + GITCFG)
         self.assertNotEqual(mutated, src)
         self.assertTrue(self.writes_outside_system(mutated))
         self.assertFalse(self.writes_outside_system(src))
 
     def writes_outside_system(self, dockerfile_text):
-        return any(l.startswith("RUN ") and "printf" in l and "> /etc/" + "gitconfig" not in l and GITCFG in l
+        return any(l.startswith("RUN ") and "printf" in l and "> " + IDFILE not in l and GITCFG in l
                    for l in dockerfile_text.replace("\\\n", " ").splitlines())
 
     def test_s6_mutant_a_system_file_with_another_pair_is_caught(self):
         src = read(DOCKERFILE)
-        mutated = src.replace("ARG CW_DEFAULT_IDENT_NAME=" + NAME, "ARG CW_DEFAULT_IDENT_NAME=someone-else", 1)
-        self.assertNotEqual(mutated, src)
-        text, args = self.render_system_file(mutated)
+        text, args = self.render_system_file(src, {"CW_DEFAULT_IDENT_NAME": "someone-else", "CW_DEFAULT_IDENT_EMAIL": EMAIL})
         self.assertNotEqual(args, {"CW_DEFAULT_IDENT_NAME": NAME, "CW_DEFAULT_IDENT_EMAIL": EMAIL})
         self.assertNotIn("name = " + NAME + "\n", text)
 
@@ -221,11 +238,11 @@ class Identity(unittest.TestCase):
     def guard(self, *args):
         return subprocess.run(["sh", GUARD] + list(args), env={"PATH": "/usr/bin:/bin", "CW_REAL_GIT": "/bin/true"}, capture_output=True, text=True).returncode
 
-    def test_s7_u2_guard_allows_only_the_two_identity_keys(self):
+    def test_s7_u2_guard_lets_every_config_key_through_after_ask_2367(self):
         self.assertEqual(self.guard("git", "config", "user.name", "x"), 0)
         self.assertEqual(self.guard("git", "config", "user.email", "x@example.invalid"), 0)
-        self.assertEqual(self.guard("git", "config", "--" + G, "alias.x", "y"), 3)
-        self.assertEqual(self.guard("git", "config", "push.default", "y"), 3)
+        self.assertEqual(self.guard("git", "config", "--" + G, "alias.x", "y"), 0)
+        self.assertEqual(self.guard("git", "config", "push.default", "y"), 0)
 
     def test_s7_guard_is_unchanged_by_this_change(self):
         digest = hashlib.sha256(open(GUARD, "rb").read()).hexdigest()   # the wrapper's content, not a diff against a branch (ask #1677)
@@ -310,7 +327,7 @@ class Identity(unittest.TestCase):
 
     def test_s8_documentation(self):
         doc = read(README)
-        for needle in ("`make`", "CW_DEFAULT_IDENT_NAME", "main or master", "system-level"):
+        for needle in ("`make`", "CW_DEFAULT_IDENT_NAME", "main or master", "/etc/cw-default-identity"):
             self.assertIn(needle, doc)
 
 

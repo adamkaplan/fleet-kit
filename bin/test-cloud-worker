@@ -142,6 +142,10 @@ elif command == "stop":
     print(json.dumps({"worker": worker, "runtime_id": "pod/%%s-7f9c" %% worker, "pushed": True, "wip_branch": worker + "/wip"}))
 elif command == "status":
     print(json.dumps({"worker": worker, "runtime_id": "pod/%%s-7f9c" %% worker, "phase": "running", "cost_estimate_usd": 0.07}))
+elif command == "snapshot" and os.environ.get("STUB_PODS") is not None:   # the cluster's pods, only when a test sets them (JSON list of names)
+    print(json.dumps({"pods": [{"name": n} for n in json.loads(os.environ["STUB_PODS"])]}))
+    if os.environ.get("STUB_SNAPSHOT_FAIL"):
+        sys.exit(1)
 """
 
 
@@ -673,6 +677,32 @@ class TestWiring(Base):
         self.assertNothingKept()
         self.assertIn("create", [c[0] for c in self.stub_calls()])
         self.assertTrue(any("model-auth=" in a for a in self.stub_calls()[0]))
+
+    def test_ask2404_s2_a_gone_pod_is_closed_not_kept(self):
+        self.assertEqual(self.launch()[0], 0)
+        with mock.patch.dict(os.environ, {"STUB_STOP_EXIT": "1", "STUB_PODS": "[]"}):   # the end hook fails because the pod is gone
+            code, out, err = self.main("retire", "coder7", "--close")
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("pod kept", out + err)
+        self.assertIn("its pod was already gone", out)
+        self.assertFalse((self.state / "cloud" / "coder7.json").exists())
+        self.assertFalse((self.state / "cloud" / "coder7.password").exists())
+
+    def test_ask2404_s3_a_live_pod_with_a_failing_hook_is_kept(self):
+        self.assertEqual(self.launch()[0], 0)
+        with mock.patch.dict(os.environ, {"STUB_STOP_EXIT": "1", "STUB_PODS": '["coder7-7f9c"]'}):
+            code, out, err = self.main("retire", "coder7", "--close")
+        self.assertEqual(code, 1)
+        self.assertIn("pod kept", out)
+        self.assertTrue((self.state / "cloud" / "coder7.json").exists())
+
+    def test_ask2404_an_unreadable_cluster_keeps_the_pod_and_the_record(self):
+        self.assertEqual(self.launch()[0], 0)
+        with mock.patch.dict(os.environ, {"STUB_STOP_EXIT": "1", "STUB_PODS": "[]", "STUB_SNAPSHOT_FAIL": "1"}):
+            code, out, err = self.main("retire", "coder7", "--close")
+        self.assertEqual(code, 1)
+        self.assertIn("pod kept", out)
+        self.assertTrue((self.state / "cloud" / "coder7.json").exists())
 
     def test_s2_send_read_and_status_each_open_and_close_their_own_tunnel(self):
         baseline = self.main("status")[0]   # the base status reflects the daemon and herdr (absent here); a cloud worker adds no failure of its own
