@@ -204,6 +204,8 @@ class TestLaunchRecordsTheAsk(unittest.TestCase):
 
     def launched(self, issue):
         import test_first_push_notice as fp
+        if not hasattr(fp.PodSessionStub, "model_list"):   # the launch now verifies its model (#1655): the stub serves the default one, as test_land_text does
+            fp.PodSessionStub.model_list = lambda self: [dict(zip(("providerID", "id"), fp.sb.CLOUD_DEFAULT_MODEL.split("/", 1)))]
         source = inspect.getsource(fp.drive_launch).replace("save_record=lambda *a: None", "save_record=lambda st, rec: SAVED.append(dict(rec))").replace("issue=None", "issue=%r" % issue)
         assert "SAVED.append" in source
         space = dict(vars(fp), SAVED=[])
