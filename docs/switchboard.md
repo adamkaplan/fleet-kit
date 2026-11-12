@@ -507,6 +507,14 @@ polled on a timer.
   cannot be read, or has no readable author, nothing is routed and one `github.comment.chief_unknown` line is audited per comment. Its own comments and pull
   request comments are never routed this way.
 
+  Ask #2484, the same comment is never routed to nobody. Cause: routing decides an owner from the issues a lane registered, and the `from=` marker was read only
+  to tell who wrote an issue; so an outside person's comment on an issue signed `<!-- fleet-switchboard:from=lane-a -->` that the lane never registered was audited
+  as `github.comment.chief_unknown` ("the Chief of Staff lane is not one lane") and reached no one. Now, when the links above find no owner: (`marker`) the
+  `from=` marker of the issue body names a registered agent and the issue's author is a fleet identity (`gh_users` or `github_bot_logins`): that agent gets it; a
+  marker in any other issue, or naming an unknown agent, routes nothing. Otherwise (unreadable issue or author, another author's issue, more than one Chief-of-Staff
+  lane) the Chief of Staff (the first by name when more than one) receives it, with the reason in the summary and one `github.comment.chief_unknown` line per
+  comment. Only when no Chief-of-Staff lane runs is it dropped, with that one audit line. A fleet identity's own comments are never routed.
+
   **Which events reach the agent.** Everything routed by `closing` is delivered as before (a passing check
   included). For an agent found by `notice` or `reference` only these are delivered: a check or workflow run
   that failed, was cancelled or timed out; a review that requests changes; a merge conflict; a comment written
