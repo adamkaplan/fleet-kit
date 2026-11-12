@@ -26,22 +26,21 @@ A PR held for the owner opens, after the opening lines and in this order, with:
 4. Optional: a real screenshot, before and after. Never a box-and-arrow diagram.
 5. `## Questions for you`: a numbered list, each ending `Recommendation: ...`; or the one line `Questions: none (reason)`.
 
-The rest follows. In the top any diagram fails; the summary flowchart fails anywhere in a held body. `pr-explain --check` and gate `G6b` name each missing part and the question that lacks its recommendation.
+Any diagram in the top fails; the summary flowchart fails anywhere in a held body. `pr-explain --check` and gate `G6b` name each missing part and the question that lacks its recommendation.
 
 ## The command
 
-`fleet-switchboard pr-explain <owner/repo#N> --before "..." --after "..."` reads the PR once and PRINTS the block; it writes nothing.
+`fleet-switchboard pr-explain <owner/repo#N> --before "..." --after "..."` reads the PR once and prints the block.
 `--body-file F` (or `-` for the PR's own body) prints the whole new body with the block in **once**: a block already there is replaced.
-Write it with `gh pr edit <n> --body-file ...`. `--check` judges a PR's description: exactly one block, a real before and
-after (no `<placeholder>`), and no generated summary flowchart.
+`--check` judges a description: exactly one block, a real before and after (no `<placeholder>`), no summary flowchart.
 
 ## Diagrams
 
-A Mermaid diagram appears only where it shows data flow, system design or component design, never at the top of a body and never as a summary of the change. It goes below the top sections; the four-box summary flowchart (`Changes:`, `Touches:`, `Irreversible:`, `Risk:`) fails `--check`.
+A Mermaid diagram appears only where it shows data flow, system design or component design, never at the top of a body and never as a summary of the change. It goes below the top sections. The four-box summary flowchart (`Changes:`, `Touches:`, `Irreversible:`, `Risk:`) fails `--check`.
 
 ## What the explainer must not do
 
-No advice, no review findings, no "consider", no restating the PR's text, no second block, no image or link in the block. If the before or after cannot be said in two lines, say what is unclear.
+No advice, no review findings, no "consider", no restating the PR's text, no second block, no image or link in the block.
 
 ## acme-org repositories (spire land)
 
