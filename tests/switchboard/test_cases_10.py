@@ -444,6 +444,7 @@ class TestRecordJsonReaders(unittest.TestCase):
     # every other json.loads / json.load site in bin/: daemon-written state, command output, a socket body or a line of a log, with a reason
     EXEMPT_REASON = "not a record file another process writes: daemon-written state, command output, a request body or a log line"
     # path_suites.py:check_manual and load_manual read the repository's OWN checked-in manual (tools/path-suites.json), a trusted repo file, not untrusted record text
+    # cloud_image_proof.py:prove, read_revision and cloud_image_roll.py:check_gate read the output of a command they ran (`crane config`, the launcher's `--json` answer), not a record file another process writes (#2391, #2418)
     # cloud_lane_cap.py:_stopped_ids is the launcher audit tail, read-only, to free a stopped worker's shape-M slot (#2259)
     EXEMPT = """
 agent_calls.py:_read_json
@@ -460,6 +461,9 @@ cloud_lane_cap.py:_stopped_ids
 cloud_hub.py:_read_json
 cloud_hub.py:_read_json_aged
 cloud_hub.py:kube_http
+cloud_image_proof.py:prove
+cloud_image_proof.py:read_revision
+cloud_image_roll.py:check_gate
 cloud_relay.py:loads_strict
 cloud_relay_daemon.py:_read
 cloud_way_back_check.py:main

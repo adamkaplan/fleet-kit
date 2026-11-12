@@ -409,10 +409,9 @@ def guard(args, write, api_parser, gh, env_of, stdin=None):
         lead, j = [], 0   # a -R/--repo pair is the supported lead (the shim skips it): dropped only where it STARTS a flag; after a flag (`--jq -R api`) it may be that flag's value, so it stays and the parser sees it
         while j < at:
             a = args[j]
-            if a.startswith("--repo=") and (j == 0 or not args[j - 1].startswith("-")):
-                j += 1
-            elif a in REPO_FLAGS and (j == 0 or not args[j - 1].startswith("-")):
-                j += 2
+            named = repo_flag(args, j) if (j == 0 or not args[j - 1].startswith("-")) else None   # -R V, -RV, -R=V, --repo V, --repo=V: every spelling the shim skips as a lead
+            if named is not None:
+                j += named[1]
             else:
                 lead.append(a)
                 j += 1
