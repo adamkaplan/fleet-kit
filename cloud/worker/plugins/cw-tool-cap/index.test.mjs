@@ -3,8 +3,8 @@ import assert from "node:assert/strict";
 import plugin, { clampSpec, noteOf, CAP_MS, NOTE } from "./index.js";
 
 test("S2: six specs", () => {
-  const cases = [[{ timeout: 60000 }, 60000], [{ timeout: 300000 }, 300000], [{ timeout: 300001 }, 300000], [{ timeout: 3600000 }, 300000],
-    [{ background: false }, 300000], [{ background: true }, 300000]];
+  const cases = [[{ timeout: 60000 }, 60000], [{ timeout: CAP_MS }, CAP_MS], [{ timeout: CAP_MS + 1 }, CAP_MS], [{ timeout: 12 * CAP_MS }, CAP_MS],
+    [{ background: false }, CAP_MS], [{ background: true }, CAP_MS]];
   for (const [extra, want] of cases) assert.equal(clampSpec({ command: "x", ...extra }).timeout, want);
 });
 test("S2: odd values and a background spec with a timeout", () => {

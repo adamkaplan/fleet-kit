@@ -1,9 +1,12 @@
 """Ask #2447: the pod's installed opencode.json lists the clamp plugin once and sets no timeout above 300000 ms; the Dockerfile copies it; the plugin's own tests pass."""
-import json, os, re, shutil, subprocess, unittest
+import json, os, re, shutil, subprocess, sys, unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 W = os.path.join(HERE, "..")
-CAP = 300000
+sys.path.insert(0, HERE)
+from test_tool_cap_env import cap  # one definition of CAP_MS reader
+
+CAP = cap()
 
 
 def timeouts(o):
