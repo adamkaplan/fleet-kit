@@ -3,6 +3,8 @@
 import os, subprocess, sys, tempfile, time, unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+import stub_support  # noqa: E402
 TOOL = os.path.join(HERE, "..", "cw-run")
 
 
@@ -47,8 +49,7 @@ class Run(unittest.TestCase):
         self.assertEqual(r.stdout.splitlines()[0], "exited 3"); self.assertIn("err", r.stdout)
         # stdin is closed: a read sees end of input at once
         # the caller's own stdin stays OPEN (a pipe) while the child reads: a helper that lets the child inherit it would hang here
-        keep = subprocess.Popen([sys.executable, TOOL, "start", "--name", "rd", "--", "sh", "-c", "read x; echo got=[$x]"], env=self.env, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=self.d)
-        self.addCleanup(lambda: keep.stdin.close())
+        keep = stub_support.start(self, [sys.executable, TOOL, "start", "--name", "rd", "--", "sh", "-c", "read x; echo got=[$x]"], env=self.env, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=self.d)
         keep.wait(timeout=10)
         r, took = self.cw("wait", "rd", "20")
         self.assertIn("exited 0", r.stdout); self.assertIn("got=[]", r.stdout); self.assertLess(took, 10)
