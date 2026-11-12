@@ -36,8 +36,8 @@ class ToolCap(unittest.TestCase):
             df = f.read()
         self.assertEqual(len(re.findall(r"^COPY worker/plugins/cw-tool-cap/index\.js /usr/local/share/cw/plugins/cw-tool-cap/index\.js$", df, re.M)), 1)
 
-    @unittest.skipUnless(shutil.which("node"), "node missing")
     def test_s2_s4_plugin_tests(self):
+        self.assertTrue(shutil.which("node"), "node is required for the plugin tests")
         r = subprocess.run(["node", "--test", os.path.join(W, "plugins/cw-tool-cap/index.test.mjs")], capture_output=True, text=True, timeout=60)
         self.assertEqual(r.returncode, 0, r.stdout[-800:])
 

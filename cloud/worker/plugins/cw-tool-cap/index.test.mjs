@@ -10,11 +10,21 @@ test("S2: six specs", () => {
     assert.equal(clampSpec(spec).timeout, want);
   }
 });
-test("hook registered through the plugin", async () => {
+test("S2: odd values and a background spec with a timeout", () => {
+  for (const t of [0, -5, NaN, Infinity, "9", null]) assert.equal(clampSpec({ timeout: t }).timeout, CAP_MS);
+  assert.equal(clampSpec({ background: true, timeout: 1000 }).timeout, 1000);
+  assert.equal(clampSpec({ background: true, timeout: 9e9 }).timeout, CAP_MS);
+});
+test("hooks registered through the plugin", async () => {
   const hooks = {};
   await plugin.setup({ shell: { hook: (n, f) => { hooks[n] = f; } } });
   const spec = { timeout: 9e9 }; await hooks["create.before"](spec);
   assert.equal(spec.timeout, CAP_MS);
+  const res = { output: "command timed out" }; await hooks["run.after"](res);
+  assert.ok(res.output.endsWith(NOTE));
+  await plugin.setup({ shell: { hook: (n, f) => { if (n === "run.after") throw new Error("no"); hooks.x = f; } } }); // an unknown hook name never breaks the clamp
+  assert.ok(hooks.x);
+  await plugin.setup({}); // no shell api: no throw
 });
 test("S4: note", () => {
   const out = noteOf("command timed out after 300000 ms");

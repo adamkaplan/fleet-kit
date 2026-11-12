@@ -724,14 +724,14 @@ Tests: `test_copilot_front.py`, `test_copilot_manifest.py`, `test_council_url_re
 
 ## Shell call cap (ask #2447)
 
-A pod plugin (`cloud/worker/plugins/cw-tool-cap`, named in `opencode-worker.json`) sets the `timeout` of every shell spec in `shell.create.before` to at most 300000 ms (absent, zero or larger becomes 300000), and adds one fixed sentence naming the limit and `cw-run` to a timed-out result. Anything longer goes through `cw-run start`.
+A pod plugin (`cloud/worker/plugins/cw-tool-cap`, named in `opencode-worker.json`) sets the `timeout` of every shell spec in `shell.create.before` to at most 300000 ms (absent, zero or larger becomes 300000), and adds one fixed sentence (matched loosely on the words "timeout"/"timed out" of the result, so a result that merely mentions them may carry the sentence too) naming the limit and `cw-run` to a timed-out result. Anything longer goes through `cw-run start`.
 
 Read before building: OpenCode's shell default is 120000 ms and the call takes a per-call `timeout`; the environment variable sets the default only; `mcp.timeout` bounds MCP servers and no key clamps a shell call. UNVERIFIED here (the local build is 2.1.4, no pod): whether 2.2.7 honours a changed spec `timeout`, and the exact timeout text and hook name for the result; the sentence hook is wired only if the build offers it. The tester's pod proof (S5, S6) settles both.
 
 | Input / outside call | Test | Mutant (control first, failure text) |
 |---|---|---|
-| spec `timeout` 60000/300000/300001/3600000/absent/background | index.test.mjs "S2: six specs" | clamp only a present value: deepEqual failure on the absent spec |
+| spec `timeout` 60000/300000/300001/3600000/absent/background | index.test.mjs "S2: six specs" | clamp only a present value: assert.equal failure (undefined !== 300000) on the absent spec |
 | installed `plugin` entry | test_tool_cap test_s3_plugin_listed_once | remove entry: list mismatch |
 | config timeouts | test_s3_no_timeout_above_cap | add `mcp.timeout` 600000: list shows 600000 |
-| result text | index.test.mjs "S4: note" | drop sentence: endsWith(NOTE) fails |
+| result text | index.test.mjs "S4: note" | drop sentence or the run.after hook line: endsWith(NOTE) fails |
 | image copy | test_dockerfile_copies_plugin | remove COPY: count 0 != 1 |
