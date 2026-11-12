@@ -282,6 +282,64 @@ handled. `tests/fixtures/containerd-aks-installer-form.toml` is a copy of such a
 `k8s/runtimeclass.yaml` has no scheduling block: an autoscaler's template node cannot carry a label that is set only
 after install, so a worker pod selects the pool label `sysbox-install=yes` itself. Evidence for the cause: issue #365, probe comment.
 
+## Startup taint (ask #2489)
+
+**Design.** A new node of the workers pool registers with a startup taint, key `startup-taint.cluster-autoscaler.kubernetes.io/sysbox-not-ready`,
+value `true`, effect `NoSchedule` (set by the pool's taint setting). No worker pod tolerates it, so no pod lands on the node while containerd
+does not yet know `sysbox-runc` (the case of 12 November 2026: `FailedCreatePodSandBox ... handler "sysbox-runc" is not known`, about 100 seconds
+after the node joined). `k8s/containerd-fix.yaml` removes the taint from its own node (`TAINT_CMD`, by default `kubectl taint node $NODE_NAME ...-`)
+ONLY after the runtime is verified: the repair succeeded (config dump check passed, containerd restarted and answered `ctr version`), or the node was
+already right and answered. It never removes it when the repair failed, was rolled back, or the fix is off at its cap (`MAX_ATTEMPTS` marker); removing an
+absent taint is not an error. The fix DaemonSet and the stock Sysbox installer DaemonSet tolerate exactly this taint (and no other); the installer's
+manifest comes from upstream, so its toleration is a patch, `k8s/patches/sysbox-install-toleration.yaml`. The label step stays as it was (a record only).
+
+**Why the autoscaler still scales up.** The cluster autoscaler ignores taints with the prefix `startup-taint.cluster-autoscaler.kubernetes.io/` when it
+simulates a new node of the pool, so a pending pod that does not tolerate it is still seen as fitting a new node and scale-up goes on. A label set
+after the node joins is missing from the pool's template, which is why a label cannot do this job.
+
+**Why a gate on `sysbox-runtime=running` is wrong.** The stock installer sets that label before containerd knows the runtime, so a pod gated on it
+starts too early; and a label set after the node joins is not in the pool's template, so the autoscaler would see no node that fits and stop scaling up.
+No pod may be selected or placed by that label (rule test in `launcher/tests/test_cloud_stack.py`; `STACK_NODE_SELECTOR` in `launcher/cloud_worker.py`).
+
+**Not yet known (the proof answers it):** whether the cloud accepts the prefix on a pool update, whether the autoscaler ignores it as documented,
+whether the system DaemonSets tolerate a NoSchedule taint, and what a pool taint update does to existing nodes. If the cloud refuses the taint, the ask
+closes with that evidence and nothing has changed.
+
+**Administrator commands, in this order (HELD for the owner's word; nothing runs before it).** The taint is applied only AFTER the DaemonSet change
+is in place and has removed it from nodes that are already right (a node that never loses the taint takes no pod).
+
+```sh
+# 1. BEFORE state: record it (the rollback uses it)
+az aks nodepool show -g aura-sp-cloud --cluster-name fk-cloud-workers -n workers --query nodeTaints -o tsv | tee /tmp/workers-taints-before.txt
+
+# 2. the DaemonSet change first. The installer's current tolerations (add them to the patch file if any, it replaces the list):
+kubectl -n kube-system get ds sysbox-deploy-k8s -o jsonpath='{.spec.template.spec.tolerations}'
+kubectl apply -f cloud/k8s/containerd-fix.yaml
+kubectl -n kube-system patch ds sysbox-deploy-k8s --patch-file cloud/k8s/patches/sysbox-install-toleration.yaml
+# verify every existing node loses nothing: all pods Running as before, the fix pod on every node, no node with the taint yet
+kubectl -n kube-system rollout status ds/sysbox-containerd-fix ds/sysbox-deploy-k8s
+kubectl get nodes -o custom-columns=NAME:.metadata.name,TAINTS:.spec.taints[*].key
+kubectl -n kube-system logs ds/sysbox-containerd-fix --tail=20     # expect: "startup taint already absent" on each node
+
+# 3. THEN the pool update (applies the taint to new nodes)
+az aks nodepool update -g aura-sp-cloud --cluster-name fk-cloud-workers -n workers --node-taints 'startup-taint.cluster-autoscaler.kubernetes.io/sysbox-not-ready=true:NoSchedule'
+
+# 4. the one-pod proof: one pod that needs a new node (the worker pod spec as usual), print the time of each step
+date -u +%T; kubectl -n cw get pod <pod> -w          # the pod starts Pending
+kubectl -n cw describe pod <pod>                      # read the events: TriggeredScaleUp; NO "didn't match"; NO FailedCreatePodSandBox
+kubectl get nodes -w                                  # the new node registers WITH the taint, then loses it (the fix's removal)
+kubectl -n kube-system logs ds/sysbox-containerd-fix --tail=20   # "startup taint removed"
+date -u +%T                                           # the pod is Running
+
+# 5. rollback: the pool back to the recorded taints, then the DaemonSet from git
+az aks nodepool update -g aura-sp-cloud --cluster-name fk-cloud-workers -n workers --node-taints "$(cat /tmp/workers-taints-before.txt)"   # empty: --node-taints ""
+git checkout <the commit before this change> -- cloud/k8s/containerd-fix.yaml && kubectl apply -f cloud/k8s/containerd-fix.yaml
+# the installer: patch back the toleration list recorded in step 2 (or remove the one toleration)
+# a node that still carries the taint: kubectl taint node <node> startup-taint.cluster-autoscaler.kubernetes.io/sysbox-not-ready=true:NoSchedule-
+```
+
+If the update in step 3 is refused, read the taints back (step 1 command) and post the refusal text on the ask: they must equal the recorded state.
+
 ## The pre-push check (`bin/cloud-prepush`)
 
 The cause: cloud workers push, and then continuous integration finds a failure the worker could have found itself (a test that reads an edited file, a repository-wide scan of added lines). A pod cannot run the whole suite in reasonable time, and each brief used to re-describe by hand which tests to pick. `bin/cloud-prepush <base>` replaces the hand-written rule.
