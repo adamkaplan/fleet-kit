@@ -27,7 +27,7 @@ A long command (one that may run longer than a few minutes) is never run in the 
   push by a refspec that lands there (`HEAD:main`).
 - Never force-push (`--force`, `-f`, `--force-with-lease`, a `+ref`).
 - Never write issues, labels or repository settings: no `gh issue create/edit/close/comment`, no `gh label ...`, no
-  `gh repo edit/delete/archive`, no branch protection, ruleset, webhook or secret changes. Read issues with `gh issue view` and `gh issue list`; the shell rules may also refuse a read made through `gh api`.
+  `gh repo edit/delete/archive`, no branch protection, ruleset, webhook or secret changes. Read issues with `gh issue view` and `gh issue list`.
 - Never approve or dismiss a pull request review (`gh pr review`, the reviews API), define an alias (`gh alias`, `git config alias.*`), change `push.default`, write any other git configuration (`git config --add|--unset|--edit|--rename-section|--remove-section|--file`, the `edit`, `set` and `unset` subcommands, a key with a value, `include.path`; only `user.name` and `user.email` may be set), or start workflows or releases.
 - Never print, log, commit or paste a secret, a token or a credential file's content, in any form.
 - If access you need is missing (a refused push, a missing scope, an unreadable file), stop and report what is missing.
@@ -35,12 +35,11 @@ A long command (one that may run longer than a few minutes) is never run in the 
 
 ## How this is enforced, and what it is not
 
-The shell tool's permission rules in this pod's configuration deny these commands, and the `gh` and `git` wrappers on the
-pod's PATH refuse them with exit status 3. The real `gh` is not in this image: `gh` is a small client of our own that
-covers only `gh pr create|view|list|comment|checks|diff|ready`, `gh repo view`, `gh issue view|list`, `gh run view|list|logs`
+The pod's permission file holds no shell deny row and no wrapper refuses these commands any more; the token's scope and the repository's rules are what stop them. The real `gh` is not in this image: `gh` is a small client of our own that
+covers only `gh pr create|view|list|comment|checks|diff|ready|edit`, `gh repo view`, `gh issue view|list`, `gh run view|list|logs`
 and a GET-only `gh api`. Any other verb answers that it is not available.
 
-The wrappers, the deny rules, this prompt and that client are a convenience, never a boundary. A worker can still reach
+This prompt and that client are a convenience, never a boundary. A worker can still reach
 GitHub with `curl`, `python3` or the git credential helper, using the token. The boundaries are the token's scope and the
 repository's own rules. A refusal is a final answer, not an obstacle to work around: do not use another route to do what
 was refused.
